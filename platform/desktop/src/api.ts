@@ -1349,6 +1349,130 @@ export const appConfig = {
     tauriInvoke<void>('set_service_gpu', { id, gpu }),
 };
 
+// ----- backup and restore (Rust commands; the status is read over HTTP) -----
+
+/** What a backup holds, counted. */
+export interface BackupCounts {
+  files: number;
+  bytes: number;
+  agentProjects: number;
+  agentConversations: number;
+  agentFiles: number;
+}
+
+/** Something a backup leaves out on purpose, why, and what to do about it after a restore. */
+export interface BackupExcluded {
+  pattern: string;
+  reason: string;
+  redo?: string;
+}
+
+/** A backup that was written and read back to check it. */
+export interface BackupCreateResult {
+  path: string;
+  fileName: string;
+  size: number;
+  createdAt: string;
+  counts: BackupCounts;
+  includesKeys: boolean;
+  /** Plain warnings: what could not be included (e.g. the Agent's conversations). */
+  partial: string[];
+  excluded: BackupExcluded[];
+  verified: boolean;
+}
+
+/** What restoring would do to one kind of data. */
+export interface RestoreCategory {
+  id: string;
+  label: string;
+  added: number;
+  replaced: number;
+  unchanged: number;
+  leftAlone: number;
+}
+
+/** The dry run of a restore: what is in the file and what would change. Nothing has changed yet. */
+export interface RestorePreview {
+  inspectId: string;
+  fileName: string;
+  createdAt: string;
+  appVersion: string;
+  platform: string;
+  includesKeys: boolean;
+  categories: RestoreCategory[];
+  /** What the backup does not have. */
+  lacks: string[];
+  /** Warnings recorded when the backup was made. */
+  partial: string[];
+  excluded: BackupExcluded[];
+  /** What the person has to do again afterwards. */
+  redo: string[];
+  totalFiles: number;
+  totalBytes: number;
+}
+
+/** A restore (or an undo) made ready; it is applied at the next start. */
+export interface StagedRestore {
+  id: string;
+  kind: 'restore' | 'undo';
+  files: number;
+  bytes: number;
+  agentStorage: boolean;
+  redo: string[];
+}
+
+export type BackupPhase = 'collecting' | 'agent' | 'packing' | 'encrypting' | 'verifying';
+
+export interface BackupStatus {
+  lastBackupAt: string | null;
+  lastBackupOk: boolean | null;
+  lastBackupSize: number | null;
+  /** A restore that waits for the next start. */
+  pendingRestore: null | {
+    id: string;
+    kind: 'restore' | 'undo';
+    stagedAt: string;
+    files: number;
+    agentStorage: boolean;
+  };
+  /** How the last restore (or undo) went, reported at the start that applied it. */
+  lastRestore: null | {
+    id: string;
+    kind: 'restore' | 'undo';
+    at: string;
+    ok: boolean;
+    error?: string;
+    redo: string[];
+    agentStorage: 'applied' | 'pending' | 'failed' | 'none';
+  };
+  undoAvailable: boolean;
+  /** A backup being made right now. */
+  running: null | { phase: BackupPhase; label: string };
+}
+
+/**
+ * Backup and restore. The commands open the native save and open dialogs themselves (no path ever
+ * passes through here), and take the passphrase as an argument only: it is never stored.
+ */
+export const backup = {
+  status: () => request<BackupStatus>('/api/backup/status'),
+  /** Make a backup; `null` when the person closed the save dialog. */
+  create: (passphrase: string, includeKeys: boolean) =>
+    tauriInvoke<BackupCreateResult | null>('backup_create', { passphrase, includeKeys }),
+  /** Choose a backup and check it (nothing changes); `null` when the person closed the dialog. */
+  inspectRestore: (passphrase: string) =>
+    tauriInvoke<RestorePreview | null>('backup_restore_inspect', { passphrase }),
+  /** Make the checked restore ready: it is applied at the next start. */
+  stageRestore: (inspectId: string, passphrase: string) =>
+    tauriInvoke<StagedRestore>('backup_restore_stage', { inspectId, passphrase }),
+  /** Make "undo the last restore" ready the same way. */
+  undo: () => tauriInvoke<StagedRestore>('backup_undo_stage'),
+  /** Cancel a restore that waits for the next start. */
+  discardPending: () => tauriInvoke<void>('backup_discard_pending'),
+  /** Restart OAIY so the waiting restore is applied; refused while the app is busy. */
+  restartToApply: () => tauriInvoke<void>('backup_restart_to_apply'),
+};
+
 // ----- calendar -----
 
 /** Open from `open` to `close` (`HH:MM`). */

@@ -25,9 +25,11 @@ const linkMock = vi.hoisted(() => vi.fn());
 const modulesMock = vi.hoisted(() => vi.fn());
 const connectorMock = vi.hoisted(() => vi.fn());
 const updateStatusMock = vi.hoisted(() => vi.fn());
+const backupStatusMock = vi.hoisted(() => vi.fn());
 vi.mock('./api', () => ({
   // The update banner: nothing to install unless a test says so.
   updates: { status: (...a: unknown[]) => updateStatusMock(...a) },
+  backup: { status: (...a: unknown[]) => backupStatusMock(...a) },
   modules: { list: (...a: unknown[]) => modulesMock(...a) },
   services: { list: servicesMock },
   plugins: { list: pluginsMock },
@@ -62,6 +64,8 @@ const modulesOn = (phone: boolean, calendar: boolean) => ({
   etag: '"1-x"',
 });
 import { dismissGuide, reopenGuide } from './setupGuide';
+import { describeLastBackup } from './BackupPanel';
+import type { BackupStatus } from './api';
 
 const runtime = (failed: number) => ({
   ready: true,
@@ -110,6 +114,8 @@ beforeEach(() => {
   statusMock.mockResolvedValue(runtime(3));
   calendarMock.mockRejectedValue(new Error('no calendar'));
   syncMock.mockRejectedValue(new Error('no calendar'));
+  // No backup line unless a test asks for one.
+  backupStatusMock.mockRejectedValue(new Error('no backup status'));
   linkMock.mockResolvedValue({ linked: false, attempt: { phase: 'idle' }, available: [] });
   updateStatusMock.mockResolvedValue(noUpdate);
   localStorage.clear();
@@ -361,5 +367,105 @@ describe('The update banner', () => {
     expect(onNavigate).toHaveBeenCalledWith('settings');
     await act(async () => host.querySelector<HTMLButtonElement>('button[aria-label="Dismiss until the next version"]')!.click());
     expect(host.querySelector('.update-banner')).toBeNull();
+  });
+});
+
+// The "Last backup" line. describeLastBackup is pure, so the cases are checked with a fixed clock.
+const NOW = new Date('2026-09-30T12:00:00Z');
+const daysAgo = (n: number) => new Date(NOW.getTime() - n * 86_400_000).toISOString();
+const backupStatus = (over: Partial<BackupStatus> = {}): BackupStatus => ({
+  lastBackupAt: daysAgo(3),
+  lastBackupOk: true,
+  lastBackupSize: 1234,
+  pendingRestore: null,
+  lastRestore: null,
+  undoAvailable: false,
+  running: null,
+  ...over,
+});
+
+describe('describeLastBackup', () => {
+  it('says how long ago the last backup was, plainly', () => {
+    expect(describeLastBackup(backupStatus({ lastBackupAt: daysAgo(0) }), NOW)).toEqual({ text: 'Last backup: today', nudge: false, kind: 'recent' });
+    expect(describeLastBackup(backupStatus({ lastBackupAt: daysAgo(1) }), NOW).text).toBe('Last backup: yesterday');
+    expect(describeLastBackup(backupStatus({ lastBackupAt: daysAgo(3) }), NOW)).toEqual({ text: 'Last backup: 3 days ago', nudge: false, kind: 'recent' });
+  });
+
+  it('is not a nudge at 29 or 30 days, and is one from 31', () => {
+    expect(describeLastBackup(backupStatus({ lastBackupAt: daysAgo(29) }), NOW)).toMatchObject({ text: 'Last backup: 29 days ago', nudge: false, kind: 'recent' });
+    expect(describeLastBackup(backupStatus({ lastBackupAt: daysAgo(30) }), NOW).nudge).toBe(false);
+    const stale = describeLastBackup(backupStatus({ lastBackupAt: daysAgo(31) }), NOW);
+    expect(stale).toMatchObject({ nudge: true, kind: 'stale' });
+    expect(stale.text).toBe('It has been 31 days since your last backup. A backup takes a minute.');
+    expect(describeLastBackup(backupStatus({ lastBackupAt: daysAgo(42) }), NOW).text).toContain('42 days');
+  });
+
+  it('counts months once it has been a while', () => {
+    expect(describeLastBackup(backupStatus({ lastBackupAt: daysAgo(95) }), NOW).text).toBe('It has been 3 months since your last backup. A backup takes a minute.');
+  });
+
+  it('nudges gently when there has never been one, or the date cannot be read', () => {
+    expect(describeLastBackup(backupStatus({ lastBackupAt: null, lastBackupOk: null, lastBackupSize: null }), NOW)).toEqual({
+      text: 'You have not made a backup yet.',
+      nudge: true,
+      kind: 'never',
+    });
+    expect(describeLastBackup(backupStatus({ lastBackupAt: 'not a date' }), NOW).kind).toBe('never');
+  });
+
+  it('says so gently when the last backup did not finish', () => {
+    const line = describeLastBackup(backupStatus({ lastBackupOk: false }), NOW);
+    expect(line).toMatchObject({ nudge: true, kind: 'failed' });
+    expect(line.text).toContain('did not finish');
+  });
+
+  it('puts a restore that waits for a restart first', () => {
+    const line = describeLastBackup(
+      backupStatus({ lastBackupAt: daysAgo(90), pendingRestore: { id: 'r1', kind: 'restore', stagedAt: daysAgo(0), files: 4, agentStorage: false } }),
+      NOW,
+    );
+    expect(line).toEqual({ text: 'A restore is waiting for a restart', nudge: false, kind: 'pending' });
+  });
+
+  it('never shows a date in the future as negative days', () => {
+    expect(describeLastBackup(backupStatus({ lastBackupAt: daysAgo(-2) }), NOW).text).toBe('Last backup: today');
+  });
+});
+
+describe('the Overview line about backups', () => {
+  it('shows the last backup and its button opens Settings', async () => {
+    dismissGuide();
+    backupStatusMock.mockResolvedValue(backupStatus({ lastBackupAt: new Date(Date.now() - 3 * 86_400_000).toISOString() }));
+    await mount();
+    expect(text()).toContain('Last backup: 3 days ago');
+    await act(async () => button('Back up')!.click());
+    expect(onNavigate).toHaveBeenCalledWith('settings');
+  });
+
+  it('turns into a nudge after 30 days, with a button that opens Settings', async () => {
+    dismissGuide();
+    backupStatusMock.mockResolvedValue(backupStatus({ lastBackupAt: new Date(Date.now() - 42 * 86_400_000).toISOString() }));
+    await mount();
+    expect(text()).toContain('It has been 42 days since your last backup');
+    await act(async () => button('Back up now')!.click());
+    expect(onNavigate).toHaveBeenCalledWith('settings');
+  });
+
+  it('says a restore waits for a restart', async () => {
+    dismissGuide();
+    backupStatusMock.mockResolvedValue(backupStatus({ pendingRestore: { id: 'r1', kind: 'restore', stagedAt: new Date().toISOString(), files: 2, agentStorage: false } }));
+    await mount();
+    expect(text()).toContain('A restore is waiting for a restart');
+    await act(async () => button('Open Settings')!.click());
+    expect(onNavigate).toHaveBeenCalledWith('settings');
+  });
+
+  it('shows no line, and does not break the panel, when the status cannot be read', async () => {
+    dismissGuide();
+    backupStatusMock.mockRejectedValue(new Error('404: not found'));
+    await mount();
+    expect(backupStatusMock).toHaveBeenCalled();
+    expect(text()).not.toContain('backup');
+    expect(text()).toContain('This machine');
   });
 });
