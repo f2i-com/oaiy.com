@@ -11,7 +11,7 @@ import os from 'node:os';
 import path from 'node:path';
 import { after, describe, it } from 'node:test';
 import { fileURLToPath } from 'node:url';
-import { buildFeed, checkSignedFile, FeedError, platformAssets, readPubkey, readSignature, signedFileOf, writeFeed } from './make-latest-json.mjs';
+import { buildFeed, checkSignedFile, DEFAULT_REPO, FeedError, platformAssets, readPinnedRepo, readPubkey, readSignature, signedFileOf, writeFeed } from './make-latest-json.mjs';
 import { makeKeys, sign } from './minisign.testing.mjs';
 
 const script = path.join(path.dirname(fileURLToPath(import.meta.url)), 'make-latest-json.mjs');
@@ -286,6 +286,75 @@ describe('as the release job runs it', () => {
   });
 });
 
+const PINNED_ENDPOINT = 'https://github.com/f2i-com/oaiy.com/releases/latest/download/latest.json';
+
+describe('the repository the feed is written for', () => {
+  const desktop = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..', 'desktop', 'src-tauri');
+  const conf = (endpoints) => {
+    const file = path.join(root, `pinned-${++counter}.json`);
+    fs.writeFileSync(file, JSON.stringify({ plugins: { updater: { pubkey: makeKeys(9).pubkey, endpoints } } }));
+    return file;
+  };
+
+  it('is the one the desktop is pinned to: the updater endpoint of the tauri.conf.json this repository ships, and the one the Rust code holds', () => {
+    assert.equal(readPinnedRepo(path.join(desktop, 'tauri.conf.json')), DEFAULT_REPO);
+    // update/mod.rs: pub const REPO, what the address checks of the desktop are made against.
+    const mod = fs.readFileSync(path.join(desktop, 'src', 'update', 'mod.rs'), 'utf8');
+    assert.equal(/pub const REPO: &str = "([^"]+)";/.exec(mod)?.[1], DEFAULT_REPO);
+  });
+
+  it('is read from exactly one https github.com endpoint, and nothing else is taken for a pin', () => {
+    assert.equal(readPinnedRepo(conf([PINNED_ENDPOINT])), 'f2i-com/oaiy.com');
+    assert.equal(readPinnedRepo(conf(['https://github.com/someone/oaiy-fork/releases/latest/download/latest.json'])), 'someone/oaiy-fork');
+    for (const endpoints of [
+      [],
+      undefined,
+      'not a list',
+      [PINNED_ENDPOINT, PINNED_ENDPOINT],
+      ['http://github.com/f2i-com/oaiy.com/releases/latest/download/latest.json'],
+      ['https://evil.example/f2i-com/oaiy.com/releases/latest/download/latest.json'],
+      ['https://github.com/f2i-com/oaiy.com/releases/download/v0.1.0/latest.json'],
+      ['https://github.com/f2i-com/oaiy.com/releases/latest/download/latest.json?x=1'],
+      ['https://github.com/f2i-com/oaiy.com/extra/releases/latest/download/latest.json'],
+    ]) {
+      assert.throws(() => readPinnedRepo(conf(endpoints)), FeedError, JSON.stringify(endpoints));
+    }
+    assert.throws(() => readPinnedRepo(path.join(root, 'nowhere.json')), FeedError);
+  });
+
+  it('is refused when a feed is written for another repository than the pinned one (a fork\u2019s run, a rename)', () => {
+    assert.ok(buildFeed({ dir: release(), version: VERSION, repo: 'f2i-com/oaiy.com', pinnedRepo: 'f2i-com/oaiy.com' }));
+    for (const repo of ['someone/oaiy-fork', 'F2I-COM/oaiy.com', 'f2i-com/oaiy.com.evil']) {
+      assert.throws(() => buildFeed({ dir: release(), version: VERSION, repo, pinnedRepo: 'f2i-com/oaiy.com' }), (e) => e instanceof FeedError && e.message.includes(repo) && /is not the one every installed OAIY reads/.test(e.message), repo);
+    }
+    // With no pin (no --conf) any well-formed repository is written, as a fork's own tests do.
+    assert.ok(buildFeed({ dir: release(), version: VERSION, repo: 'someone/oaiy-fork' }));
+  });
+
+  it('as the release job runs it: --conf pins it, a repository of another name fails the step with nothing written, and the default is the pinned one', () => {
+    const file = conf([PINNED_ENDPOINT]);
+    const dir = release();
+    const other = spawnSync(process.execPath, [script, '--dir', dir, '--version', VERSION, '--repo', 'someone/oaiy-fork', '--conf', file], { encoding: 'utf8' });
+    assert.equal(other.status, 1);
+    assert.match(other.stderr, /::error::update feed \(latest\.json\) NOT written: the repository "someone\/oaiy-fork" is not the one every installed OAIY reads/);
+    assert.equal(fs.existsSync(path.join(dir, 'latest.json')), false);
+    // The release job passes $GITHUB_REPOSITORY: on this repository that is the pinned one. (No public key in this conf: the key is checked apart.)
+    const keys = makeKeys(5);
+    const signed = path.join(root, `pinned-signed-${++counter}`);
+    fs.mkdirSync(signed);
+    for (const { asset, signedName } of platformAssets(VERSION)) {
+      const bytes = Buffer.from(`the bytes of ${asset}`);
+      fs.writeFileSync(path.join(signed, asset), bytes);
+      fs.writeFileSync(path.join(signed, `${asset}.sig`), sign(keys, bytes, { comment: `timestamp:1790000000\tfile:${signedName}` }));
+    }
+    const full = path.join(root, `pinned-full-${++counter}.json`);
+    fs.writeFileSync(full, JSON.stringify({ plugins: { updater: { pubkey: keys.pubkey, endpoints: [PINNED_ENDPOINT] } } }));
+    const ok = spawnSync(process.execPath, [script, '--dir', signed, '--version', VERSION, '--repo', 'f2i-com/oaiy.com', '--conf', full], { encoding: 'utf8' });
+    assert.equal(ok.status, 0, ok.stderr);
+    assert.ok(fs.existsSync(path.join(signed, 'latest.json')));
+  });
+});
+
 describe('the signatures against the public key the desktop carries', () => {
   /** A release whose installers are signed for real by `keys` (the content of each installer is what is signed). */
   function signedRelease(keys, { tamper } = {}) {
@@ -346,7 +415,7 @@ describe('the signatures against the public key the desktop carries', () => {
     const keys = makeKeys(5);
     const dir = signedRelease(keys);
     const conf = path.join(root, `conf-${counter}.json`);
-    fs.writeFileSync(conf, JSON.stringify({ plugins: { updater: { pubkey: keys.pubkey } } }));
+    fs.writeFileSync(conf, JSON.stringify({ plugins: { updater: { pubkey: keys.pubkey, endpoints: [PINNED_ENDPOINT] } } }));
     const ok = spawnSync(process.execPath, [script, '--dir', dir, '--version', VERSION, '--conf', conf], { encoding: 'utf8' });
     assert.equal(ok.status, 0, ok.stderr);
     assert.ok(fs.existsSync(path.join(dir, 'latest.json')));

@@ -140,7 +140,11 @@ pub fn current_platform_key() -> Option<&'static str> {
 
 /// Where an installer may be downloaded from: this project's release assets on github.com.
 const ASSET_HOST: &str = "github.com";
-const ASSET_PATH_PREFIX: &str = "/f2i-com/oaiy.com/releases/download/";
+
+/// The start of the path of a release asset of this project: `/<owner>/<repo>/releases/download/`.
+fn asset_path_prefix() -> String {
+    format!("/{}/releases/download/", super::REPO)
+}
 
 /// Whether `url` is the installer of release `version` of this project on GitHub for `target`: over https, on github.com,
 /// with nothing to redirect the eye (no credentials, no other port, no query), under the release's tag (`v0.2.0` or
@@ -156,7 +160,7 @@ pub fn check_asset_url(url: &str, version: &str, target: Target) -> Result<(), S
     let refuse = || Err(format!("The update points at an address that is not {} of OAIY {version} on GitHub ({url}), so it was refused.", target.what()));
     let Ok(parsed) = url::Url::parse(url) else { return refuse() };
     let plain = parsed.scheme() == "https" && parsed.host_str() == Some(ASSET_HOST) && parsed.port().is_none() && parsed.username().is_empty() && parsed.password().is_none() && parsed.query().is_none() && parsed.fragment().is_none();
-    let Some(rest) = parsed.path().strip_prefix(ASSET_PATH_PREFIX) else { return refuse() };
+    let Some(rest) = parsed.path().strip_prefix(asset_path_prefix().as_str()) else { return refuse() };
     let named = match rest.split_once('/') {
         Some((tag, file)) => (tag == version || tag.strip_prefix('v') == Some(version)) && file == target.asset_name(version),
         None => false,
@@ -413,6 +417,21 @@ mod tests {
         }
         let refusal = check_asset_url("http://evil.example/x.exe", "0.2.0", WINDOWS).unwrap_err();
         assert!(refusal.contains("http://evil.example/x.exe") && refusal.contains("Windows installer"), "{refusal}");
+    }
+
+    #[test]
+    fn the_repository_in_the_address_is_the_one_the_client_pins_and_no_other() {
+        // A release of a fork (or of a repository with a name that starts like ours) is not this project's.
+        for repository in ["someone-else/oaiy.com", "f2i-com/oaiy.com-fork", "f2i-com/oaiy", "F2I-COM/oaiy.com", "f2i-com/OAIY.com", "f2i-com/oaiy.com/extra"] {
+            let url = format!("https://github.com/{repository}/releases/download/v0.2.0/oaiy-desktop-0.2.0-windows-x64-setup.exe");
+            assert!(check_asset_url(&url, "0.2.0", WINDOWS).is_err(), "{repository}");
+        }
+        let url = format!("https://github.com/{}/releases/download/v0.2.0/oaiy-desktop-0.2.0-windows-x64-setup.exe", super::super::REPO);
+        assert!(check_asset_url(&url, "0.2.0", WINDOWS).is_ok());
+        // ...and the repository is the one tauri.conf.json names as the place the feed is read from.
+        let conf: serde_json::Value = serde_json::from_str(include_str!("../../tauri.conf.json")).unwrap();
+        let endpoint = conf["plugins"]["updater"]["endpoints"][0].as_str().unwrap();
+        assert_eq!(endpoint, format!("https://github.com/{}/releases/latest/download/latest.json", super::super::REPO));
     }
 
     #[test]

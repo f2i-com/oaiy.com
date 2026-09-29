@@ -103,6 +103,13 @@ release, and everyone installing that release by hand from the releases page; se
 [UPDATES.md](UPDATES.md#the-key-and-its-custody). Never build a test with this key: make a
 throwaway one (`npx tauri signer generate -w <a folder outside the repository>`).
 
+The release job also holds the feed to the repository the desktop is pinned to: the repository
+it is run in must be the one `tauri.conf.json`'s updater endpoint names (`f2i-com/oaiy.com`), or
+`make-latest-json.mjs` stops the release. The desktop takes installers only from that repository's
+releases (`update::REPO`), so a feed for another one, from a fork's run, say, would be read by no
+installed OAIY. A fork that wants updates of its own changes the endpoint, the public key and
+`REPO`.
+
 The release job checks each signed installer against the public key in `tauri.conf.json`
 before it writes `latest.json` and stops if one does not verify: the Tauri CLI only *warns*
 when the secrets hold a different key from the one in the build, and a release signed with the

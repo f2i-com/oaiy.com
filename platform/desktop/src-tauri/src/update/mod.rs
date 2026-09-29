@@ -48,6 +48,10 @@ mod guards;
 pub use updater::{Updater, UpdaterHandle};
 pub use verify::VerifiedPackage;
 
+/// The GitHub repository every update comes from: the feed, and every installer the feed may name, are this repository's releases and no
+/// other's. (`make-latest-json.mjs` refuses to write a feed for another one, and a test holds this to tauri.conf.json's endpoint.)
+pub const REPO: &str = "f2i-com/oaiy.com";
+
 /// Where the feed is: fixed in the build (tauri.conf.json's `plugins.updater.endpoints` says the same).
 pub const FEED_URL: &str = "https://github.com/f2i-com/oaiy.com/releases/latest/download/latest.json";
 
@@ -91,7 +95,7 @@ mod tests {
     fn the_feed_is_the_release_feed_and_the_same_address_tauri_conf_json_names() {
         let conf: serde_json::Value = serde_json::from_str(include_str!("../../tauri.conf.json")).unwrap();
         assert_eq!(conf["plugins"]["updater"]["endpoints"], serde_json::json!([FEED_URL]));
-        assert!(FEED_URL.starts_with("https://github.com/f2i-com/oaiy.com/releases/latest/download/"));
+        assert_eq!(FEED_URL, format!("https://github.com/{REPO}/releases/latest/download/latest.json"), "the feed is the latest release of REPO");
         assert_eq!(FeedSource::production(), FeedSource { url: FEED_URL.into(), insecure: false });
     }
 

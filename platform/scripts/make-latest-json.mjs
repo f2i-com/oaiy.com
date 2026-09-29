@@ -32,7 +32,13 @@
 // CI and every desktop read as "latest". The release job runs this before it writes
 // SHA256SUMS.txt, so the feed and the signatures are covered by it.
 //
-// With --conf (the release job passes it) each installer is also CHECKED against its signature
+// With --conf (the release job passes it) the repository is also held to the one every installed OAIY
+// is pinned to: the feed's address in that tauri.conf.json (plugins.updater.endpoints) names it, and the
+// desktop refuses any installer that is not one of that repository's releases. A feed written for
+// another repository (a fork's release run, a rename) would name installers no installed OAIY takes
+// and be read by none.
+//
+// With --conf each installer is also CHECKED against its signature
 // with the public key in that tauri.conf.json (plugins.updater.pubkey), the key every installed
 // OAIY carries. The Tauri CLI only warns when the private key in the Actions secrets is not that
 // key's pair, and a release signed with the wrong one installs on nobody: this stops it before
@@ -120,6 +126,24 @@ function checkAgainstKey(installer, asset, signature, pubkey) {
   }
 }
 
+/**
+ * The repository the desktop is pinned to, from its updater endpoint in a tauri.conf.json
+ * (`https://github.com/<owner>/<repo>/releases/latest/download/latest.json`).
+ */
+export function readPinnedRepo(confPath) {
+  let conf;
+  try {
+    conf = JSON.parse(fs.readFileSync(confPath, 'utf8'));
+  } catch {
+    throw new FeedError(`${confPath} cannot be read as tauri.conf.json`);
+  }
+  const endpoints = conf?.plugins?.updater?.endpoints;
+  if (!Array.isArray(endpoints) || endpoints.length !== 1) throw new FeedError(`${confPath} has to have exactly one plugins.updater.endpoints entry: the feed the desktop reads`);
+  const found = /^https:\/\/github\.com\/([A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+)\/releases\/latest\/download\/latest\.json$/.exec(String(endpoints[0]));
+  if (!found) throw new FeedError(`the updater endpoint in ${confPath} (${endpoints[0]}) is not https://github.com/<owner>/<repo>/releases/latest/download/latest.json`);
+  return found[1];
+}
+
 /** The updater's public key in a tauri.conf.json. */
 export function readPubkey(confPath) {
   let conf;
@@ -137,11 +161,14 @@ export function readPubkey(confPath) {
  * The feed for a release whose files are in `dir`. Throws a FeedError, with a message that says
  * what to fix, when anything is missing; returns the feed object otherwise.
  */
-export function buildFeed({ dir, version, tag, repo = DEFAULT_REPO, notes, pubDate, pubkey }) {
+export function buildFeed({ dir, version, tag, repo = DEFAULT_REPO, notes, pubDate, pubkey, pinnedRepo }) {
   if (!VERSION.test(String(version ?? ''))) throw new FeedError(`"${version ?? ''}" is not a version of the form 0.1.0 (three numbers, none with a leading zero)`);
   const releaseTag = tag ?? `v${version}`;
   if (!TAG.test(releaseTag) || releaseTag.replace(/^v/, '') !== version) throw new FeedError(`the tag "${releaseTag}" is not the version ${version} (or v${version})`);
   if (!REPO.test(repo)) throw new FeedError(`"${repo}" is not a repository of the form owner/name`);
+  if (pinnedRepo !== undefined && repo !== pinnedRepo) {
+    throw new FeedError(`the repository "${repo}" is not the one every installed OAIY reads its updates from ("${pinnedRepo}", the updater endpoint in tauri.conf.json): its installers would be refused, and the feed would be read by none`);
+  }
   if (!dir || !fs.existsSync(dir) || !fs.statSync(dir).isDirectory()) throw new FeedError(`the release folder ${dir ?? ''} does not exist`);
   const date = pubDate ?? new Date().toISOString().replace(/\.\d{3}Z$/, 'Z');
   if (!RFC3339.test(date) || Number.isNaN(Date.parse(date))) throw new FeedError(`"${date}" is not an RFC 3339 date`);
@@ -214,6 +241,7 @@ function main() {
       notes,
       pubDate: args['pub-date'],
       pubkey: args.conf ? readPubkey(path.resolve(args.conf)) : undefined,
+      pinnedRepo: args.conf ? readPinnedRepo(path.resolve(args.conf)) : undefined,
       out: args.out ? path.resolve(args.out) : undefined,
     });
     console.log(`wrote ${out}`);
