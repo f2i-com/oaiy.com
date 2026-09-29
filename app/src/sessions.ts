@@ -19,6 +19,17 @@ import { isHidden, localCountry, phoneKey, samePerson } from './phoneNumbers';
 import type { MessageSettings } from './settings';
 import { MAX_FACTS, regroup, threadId, threadOrder, type Way } from './threads';
 import type { CallerNote, OpenProject, SessionInfo } from './vfs/projects';
+import { OUTREACH_AFTER_CALL, type OutreachLink, type OutreachSessions } from './outreach';
+
+/** What the conversations ask of outreach (outreach.ts): who a call or a text thread is about, and a text that asks to stop. */
+export interface OutreachHooks {
+  forCall(callId: string, number: string): OutreachLink | undefined;
+  forText(number: string): OutreachLink | undefined;
+  /** A call of it ended: whether its agent should be asked for the result now. */
+  callEnded(link: OutreachLink, lines: string[]): boolean;
+  /** A text that asks to stop, from someone texted for it: handled (kept, not answered). */
+  stopWord(number: string, body: string): boolean;
+}
 
 /** A number that marks a pretend conversation: its replies are never sent. */
 export const TEST_NUMBER = 'test';
@@ -58,6 +69,10 @@ export interface Session extends SessionInfo {
   held?: string[];
   /** The words of the reply that calls end_call, held back to be its goodbye (so no second goodbye is said). */
   parting?: string;
+  /** The outreach this call or text thread is part of: the person we rang (or who rang in from a list), with its objective and record_result. */
+  outreach?: OutreachLink;
+  /** This outreach call's agent was told once to record the result before ending the call. */
+  endNudged?: boolean;
   /** A flow's tasks waiting for their answers, each by its prompt (one task a run; a message of the person's answers none). */
   answers?: Array<{ prompt: string; settle: (reply: string, error?: string) => void }>;
 }
@@ -653,6 +668,8 @@ export class Sessions {
   callingBack: (number: string) => { missedAt: number } | undefined = () => undefined;
   /** Whether the desktop's calendar is on (a plugin provides it): a text thread's calendar tools only then. */
   calendarOn: () => boolean = () => true;
+  /** Outreach (the runner's lists of people to call or text), while it runs on this page. */
+  outreach: OutreachHooks | null = null;
   /** Conversations with messages waiting, in the order they came. */
   /** Conversations waiting to run, one at a time per lane: calls in their own (a caller never waits behind a text or a flow's task), the rest in another. */
   private queue: Session[] = [];
@@ -810,11 +827,12 @@ export class Sessions {
     if (info.kind === 'call') {
       // The calendar's free times, answered at once (one tool a conversation: its repeat check lasts from call to call).
       const calendar = callCalendarTools(this.desktop);
-      const own = [...this.callTools(session), ...this.personTools(session)];
+      const person = this.personTools(session);
       session.agent = this.makeAgent({
-        instructions: () => this.directed(callInstructions(session.brief ?? '', this.settings().callInstructions, this.calendarOn())),
-        // The calendar's tool only while there is a calendar (a plugin provides it).
-        sessionTools: () => [...own, ...(this.calendarOn() ? calendar : [])],
+        // A call of an outreach (one we placed, or someone on a list who rang in): its objective after the call's own.
+        instructions: () => this.directed([callInstructions(session.brief ?? '', this.settings().callInstructions, this.calendarOn()), session.outreach?.instructions()].filter(Boolean).join('\n')),
+        // The calendar's tool only while there is a calendar (a plugin provides it); record_result on an outreach call.
+        sessionTools: () => [...this.callTools(session), ...person, ...(this.calendarOn() ? calendar : []), ...(session.outreach ? [session.outreach.resultTool()] : [])],
         tools: TOOLS.filter((t) => CALL_TOOLS.has(t.name)),
         // Answer at once: no thinking first.
         reasoning: 'none',
@@ -838,12 +856,17 @@ export class Sessions {
     const own = [this.replyTool(session, test), ...this.personTools(session)];
     // A pretend thread does not put requests in the real calendar.
     const calendar = test ? [] : textCalendarTools(this.desktop, session.key, () => session.title);
+    // Someone texted for an outreach: its objective and record_result, while their replies are its (and a while after).
+    const link = () => this.outreach?.forText(session.key);
     session.agent = this.makeAgent({
-      instructions: () => this.directed(smsInstructions(session.title, session.key, this.settings().instructions, test, knownText(this.callerNote(session.key)))),
+      instructions: () => this.directed([smsInstructions(session.title, session.key, this.settings().instructions, test, knownText(this.callerNote(session.key))), link()?.instructions()].filter(Boolean).join('\n')),
       // A texter reaches the front desk's files, to read (see KNOWLEDGE_TOOLS).
       tools: TOOLS.filter((t) => KNOWLEDGE_TOOLS.has(t.name)),
       // The calendar's tools only while there is a calendar (a plugin provides it).
-      sessionTools: () => [...own, ...(this.calendarOn() ? calendar : [])],
+      sessionTools: () => {
+        const outreach = link();
+        return [...own, ...(this.calendarOn() ? calendar : []), ...(outreach ? [outreach.resultTool()] : [])];
+      },
       conversation: true,
     }, 'sms');
     return session;
@@ -992,7 +1015,14 @@ export class Sessions {
         spec: {
           name: 'end_call',
           description: 'Say a short goodbye, then hang up. Use it when the caller is done, not before. The goodbye is the only thing said: write no other words in that reply (words you do write are said as the goodbye instead of this one), and nothing after it.',
-          parameters: { type: 'object', properties: { goodbye: { type: 'string', description: 'The goodbye, one short sentence' } } },
+          parameters: {
+            type: 'object',
+            properties: {
+              goodbye: { type: 'string', description: 'The goodbye, one short sentence' },
+              // An outreach call that reached a voicemail with no message to leave: hang up without a word.
+              ...(session.outreach && !session.outreach.inbound ? { silent: { type: 'boolean', description: 'Voicemail with no message only (after record_result voicemail): hang up saying nothing' } } : {}),
+            },
+          },
         },
         run: async (input) => {
           const { desktop, callId } = live();
@@ -1002,6 +1032,25 @@ export class Sessions {
           session.parting = undefined;
           const given = String(input.goodbye ?? '').trim();
           const goodbye = parting || given;
+          const link = session.outreach && !session.outreach.inbound ? session.outreach : undefined;
+          if (link) {
+            // An outreach call ends with its result recorded: asked once, then it may end all the same.
+            if (!link.recorded() && !session.endNudged) {
+              session.endNudged = true;
+              // The call goes on: the words held for the goodbye are said now.
+              if (parting) session.speech?.sayNow(parting);
+              return 'Not yet: record_result first (the outcome and what they said), then end_call.';
+            }
+            if (input.silent === true) {
+              if (!link.voicemailRecorded()) throw new Error('silent is only for a voicemail with no message: record_result with outcome voicemail first, or say a short goodbye');
+              link.hangingUp();
+              session.speech?.hush();
+              await desktop.command('aokie', 'call.hangup', { callId: link.phoneCallId() ?? callId }, `oaiy:outreach-hangup:${callId}`);
+              return 'Hung up without a word (a voicemail, no message). Write nothing more.';
+            }
+            // You rang them: a goodbye of your own, not the phone's "Thanks for calling".
+            if (!goodbye) throw new Error('goodbye is needed: a short thank-you (you rang them, so not "thanks for calling")');
+          }
           // What was queued to be said goes first; nothing after the goodbye.
           if (session.speech) await Promise.race([session.speech.done, new Promise((r) => setTimeout(r, 3000))]);
           session.speech?.hush();
@@ -1085,7 +1134,9 @@ export class Sessions {
       // A hidden number ("", "Private", "Withheld"): a conversation of its own for this call (never shared with another hidden caller), named as such.
       const hidden = isHidden(String(event.from ?? ''));
       const from = hidden ? callId : String(event.from);
-      session = await this.conversationWith(from, hidden ? 'Hidden number' : String(event.name ?? ''), 'call', hidden);
+      // A call of an outreach: one we placed (by its id), or someone on a list who rang in. Its person's name names the conversation.
+      const outreach = type === 'call.started' && !hidden ? this.outreach?.forCall(callId, from) : undefined;
+      session = await this.conversationWith(from, hidden ? 'Hidden number' : String(event.name ?? '') || outreach?.person || '', 'call', hidden);
       // Their last contact before this call (their texts, their last call), from what the conversation holds now.
       const history = this.turnsOf(session.thread);
       const lastContact = Math.max(0, ...history.map((t) => t.at ?? 0), ...this.list.filter((s) => s.thread === session!.thread && s !== session && s.agent.turns.length).map((s) => s.lastAt), session.agent.turns.length ? session.lastAt : 0);
@@ -1106,10 +1157,13 @@ export class Sessions {
         session.held = [];
         session.cutAtMs = undefined;
         session.callerSpeaking = false;
+        session.outreach = outreach;
+        session.endNudged = false;
       }
       const who = `${session.title}${session.title !== session.key ? ` (${session.key})` : ''}`;
-      // A call the phone placed (Aokie says so): the agent rang them, and why.
-      const outbound = event.direction === 'outbound' ? { purpose: typeof event.purpose === 'string' ? event.purpose : '' } : undefined;
+      // A call the phone placed (Aokie says so): the agent rang them, and why (an outreach's objective).
+      const link = session.outreach && !session.outreach.inbound ? session.outreach : undefined;
+      const outbound = event.direction === 'outbound' || link ? { purpose: link?.objective ?? (typeof event.purpose === 'string' ? event.purpose : '') } : undefined;
       const note = callStartNote(who, typeof event.greeting === 'string' ? event.greeting : '', knownText(hidden ? undefined : this.callerNote(session.key)), new Date(), this.callingBack(from)?.missedAt, outbound, recent);
       session.agent.turns.push({ role: 'user', text: note, automatic: true, ...(fresh ? { fresh: true } : {}), at: Date.now() });
       await this.save(session);
@@ -1181,7 +1235,52 @@ export class Sessions {
     const failed = /fail|error|lost/i.test(reason) ? reason.trim() : '';
     session.agent.turns.push({ role: 'user', text: failed ? `[OAIY] 📞 The call ended: ${failed}.` : '[OAIY] 📞 The call ended.', automatic: true, at: Date.now() });
     await this.save(session);
+    // An outreach call that ended before its result was recorded: its agent records it now, from what was said (nothing is spoken).
+    const link = session.outreach;
+    if (link && this.outreach?.callEnded(link, conversationLines(session.agent.view()).slice(-8))) this.queueRun(session, OUTREACH_AFTER_CALL);
     this.hooks.changed();
+  }
+
+  /** A run for a lane after the one it has now (never read into that one: a call's run that was stopped as it ended reads nothing more). */
+  private queueRun(session: Session, text: string): void {
+    session.waiting.push(text);
+    session.waitingSince ??= Date.now();
+    const lane = session.kind === 'call' ? this.callQueue : this.queue;
+    if (!lane.includes(session)) lane.push(session);
+    void this.pump(session.kind === 'call');
+  }
+
+  // ---- what outreach (outreach.ts) asks of the conversations ----
+
+  /** The phone's conversations as outreach sees them. */
+  forOutreach(): OutreachSessions {
+    return {
+      openText: async (number, name, note) => {
+        const session = await this.conversationWith(number, name, 'sms');
+        session.agent.turns.push({ role: 'user', text: note, automatic: true, at: Date.now() });
+        session.lastAt = Date.now();
+        this.sort();
+        await this.save(session);
+        await this.saveIndex();
+        this.hooks.changed();
+        return session.thread;
+      },
+      liveCall: (callId) => this.list.some((s) => s.callId === callId),
+      heardSince: (number, at) => {
+        const lane = this.list.find((s) => s.kind !== 'task' && this.isPerson(s, phoneKey(number) || number));
+        if (!lane) return [];
+        return this.turnsOf(lane.thread)
+          .filter((t) => t.role === 'user' && (t.at ?? 0) >= at)
+          .flatMap((t) => (t as { text: string }).text.split('\n').filter((l) => /^Caller\b/.test(l)));
+      },
+      askForResult: (number, link) => {
+        void this.conversationWith(number, '', 'call').then((session) => {
+          if (session.callId) return;
+          session.outreach = link;
+          this.queueRun(session, OUTREACH_AFTER_CALL);
+        });
+      },
+    };
   }
 
   /**
@@ -1321,8 +1420,11 @@ export class Sessions {
     session.unread++;
     const text = textMessage(session.title, session.key, body);
     this.hooks.arrived?.(session, text);
-    // A pretend text is always answered: trying the agent is what it is for.
-    if (this.settings().answer || session.key === TEST_NUMBER) this.deliver(session, text);
+    // STOP from someone texted for an outreach is read by code, first: they are not contacted again, and nothing is sent back.
+    const stopped = this.outreach?.stopWord(session.key, body) ?? false;
+    // A pretend text is always answered: trying the agent is what it is for. Someone texted for an
+    // outreach is answered even while answering is off (only them: the outreach's objective is theirs).
+    if (!stopped && (this.settings().answer || session.key === TEST_NUMBER || !!this.outreach?.forText(session.key))) this.deliver(session, text);
     else {
       // Kept, not answered: it is there when the person looks, or answers it themselves.
       session.agent.turns.push({ role: 'user', text, at: Date.now() });
@@ -1472,7 +1574,7 @@ export class Sessions {
           stopHolding();
           // What it says next is heard, even if the caller spoke over the words before the tool;
           // but nothing after the goodbye (end_call), even when another tool of the same reply answers after it: the call is ending.
-          if (event.result.name === 'end_call') goodbye = true;
+          if (event.result.name === 'end_call' && !event.result.isError && !/^Not yet/.test(event.result.content)) goodbye = true;
           if (!goodbye) session.speech?.begin(true);
         }
         if (session.speech && event.type === 'text') session.speech.push(event.delta);

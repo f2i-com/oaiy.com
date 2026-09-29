@@ -218,7 +218,10 @@ export interface OutreachLink {
   campaignId: string;
   personId: string;
   kind: OutreachKind;
+  /** The campaign's name. */
   name: string;
+  /** The person's name, as the list gave it. */
+  person: string;
   objective: string;
   /** They rang in (not a call we placed). */
   inbound: boolean;
@@ -232,6 +235,8 @@ export interface OutreachLink {
   voicemailRecorded(): boolean;
   /** We are about to hang up on it (voicemail, no message). */
   hangingUp(): void;
+  /** The phone's own id for the call we placed (Aokie's), to hang it up. */
+  phoneCallId(): string | undefined;
 }
 
 /** How often the engine looks. */
@@ -1399,6 +1404,7 @@ export class Outreach {
       personId: p.id,
       kind: c.kind,
       name: c.name,
+      person: p.name,
       objective: c.objective,
       inbound,
       instructions: () => {
@@ -1424,8 +1430,12 @@ export class Outreach {
       },
       hangingUp: () => {
         const hit = find();
-        if (hit?.p.attempt) hit.p.attempt.hungUp = true;
+        if (hit?.p.attempt) {
+          hit.p.attempt.hungUp = true;
+          void this.save(hit.c);
+        }
       },
+      phoneCallId: () => find()?.p.attempt?.callId,
     };
   }
 
