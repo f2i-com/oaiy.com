@@ -297,7 +297,7 @@ cd platform/ui && npm run dev        # the flow editor: http://localhost:5173/ap
 
 | Where | Command | What |
 |---|---|---|
-| root | `cargo test` | the engines' default crates; `--workspace` adds the CUDA and Candle crates, which need CUDA to build |
+| root | `cargo test` | the engines' default crates (without CUDA, `llama-rs`'s tests do not compile yet: see the plan's known issues); `--workspace` adds the CUDA and Candle crates, which need CUDA to build |
 | `app/` | `npm test`, `npm run test:e2e` | unit tests; the app in headless Chrome with a scripted model |
 | `platform/desktop/` | `npm test` | the dashboard (Vitest) |
 | `platform/desktop/src-tauri/` | `cargo test --no-default-features`, `cargo test --features gui` | the desktop's Rust, headless and with the GUI |
