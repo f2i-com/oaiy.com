@@ -431,9 +431,10 @@ async fn main() {
 /// model servers, and one holding hardware should get its graceful shutdown before anything
 /// slow runs), then the services.
 ///
-/// Every exit this server makes on purpose comes through here. On unix a plugin left running
-/// after its server has gone keeps its hardware and its port, and nothing else stops it (a
-/// plugin no longer shares this process's group, so a Ctrl-C at the terminal does not reach it).
+/// Every exit this server makes on purpose comes through here. On unix a plugin that ignores the
+/// close of its stdin (which is what ends one that follows the plugin contract when its server
+/// goes) outlives the server, keeps its hardware and its port, and nothing else stops it: a plugin
+/// no longer shares this process's group, so a Ctrl-C or hangup at the terminal does not reach it.
 /// Windows is left as it was: a plugin is in the server's job object, which ends it with this
 /// process, so it never outlives the server there.
 async fn stop_children(registry: RegistryHandle, plugins: Option<Arc<PluginHost>>) {

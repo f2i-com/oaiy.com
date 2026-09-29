@@ -197,10 +197,17 @@ impl PluginProcess {
         // does (services/runner.rs). `kill` signals the group to take a plugin's
         // helpers with it (`kill_process_tree` sends to the negative pid), and a
         // plugin that shared this process's group had no group of its own to
-        // signal: the shim's real binary survived a stop. The other consequence
-        // is that a Ctrl-C at this process's terminal no longer reaches the
-        // plugin directly, so stopping plugins is the shutdown path's job (the
-        // app's exit and oaiy-server's both do it).
+        // signal: the shim's real binary survived a stop.
+        //
+        // The other consequence is that what a terminal sends to this process's
+        // group (Ctrl-C, or the hangup when the terminal closes) no longer reaches
+        // the plugin, so stopping plugins is the shutdown path's job. Two things do
+        // it: the app's quit (`RunEvent::Exit`) and oaiy-server's SIGINT/SIGTERM
+        // handler. A hangup to oaiy-server, and a Ctrl-C or hangup to the desktop
+        // app, stop nothing here. A plugin that follows the contract still ends by
+        // itself, because its stdin closes with this process (docs/ecosystem/
+        // AOKIE_CONTRACT.md: closing stdin makes it exit); one that ignores that,
+        // and the helpers a plugin leaves behind, are not signalled.
         #[cfg(unix)]
         {
             use std::os::unix::process::CommandExt;
