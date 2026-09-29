@@ -21,6 +21,7 @@ for what OAIY is and how to build it.
 | [OAIY_PLAN.md](OAIY_PLAN.md) | The plan: how the three projects became one app, ports, events and sessions, voice, flows and the agent, and where each step stands. |
 | [AGENT_CONTROL.md](AGENT_CONTROL.md) | The control MCP server the Agent configures OAIY with: sessions, the switch, the audit log, and its fifty tools. |
 | [OAIY Desktop](../platform/desktop/README.md) | The desktop host (Tauri 2 and axum on `127.0.0.1:17972`): its HTTP API, service templates, the headless `oaiy-server`, the data folder. |
+| [UPDATES.md](UPDATES.md) | How OAIY finds, downloads, verifies and installs a newer release, when it will not, the headless server's manual upgrade, and the signing key. |
 | [The bridge protocol](../platform/protocol/README.md) | OAIY Bridge Protocol v1: how apps discover, run and follow flows on a desktop, with its JSON schemas and conformance suite. |
 | [ecosystem/OAIY_PLATFORM.md](ecosystem/OAIY_PLATFORM.md) | A survey of `platform/` (the previous OAIY) as it was when it joined: what it does and where. |
 | [ecosystem/FORMLOGIC_CONTRACT.md](ecosystem/FORMLOGIC_CONTRACT.md) | What OAIY must stay compatible with for FormLogic: the browser and a local OAIY, the FormLogic server's API, automations, and Aokie on the FormLogic side. |
@@ -85,7 +86,7 @@ were added.
 | [CONVENTIONS.md](../CONVENTIONS.md) | The engineering contract for the engine crates: std-only, no `unsafe`, weights read in place. |
 | [crates/VENDORED.md](../crates/VENDORED.md) | Where the vendored GGUF stack comes from, and how local changes are marked. |
 | [platform/TESTING.md](../platform/TESTING.md) | The platform's test suites (desktop, CLI, flow editor, API) and how to run them. |
-| [RELEASING.md](RELEASING.md) | Cutting a release: what one contains and what it does not, how to tag it, the version rule, and what a first install needs. |
+| [RELEASING.md](RELEASING.md) | Cutting a release: what one contains and what it does not, how to tag it, the version rule, the updater key and its secrets, and what a first install needs. |
 | [The API](../platform/api/README.md) | The optional PHP backend for shared flows and remote runs. |
 | [archive/](archive/README.md) | Plans and work records kept for their history. |
 

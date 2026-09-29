@@ -334,8 +334,9 @@ The tag is the version — it is stamped into the desktop app at build time, so 
 | File | What it is |
 |------|------------|
 | `oaiy-web-<v>.zip` / `.tar.gz` | The compiled static site: landing page at `/`, flow builder at `/app.html`, desktop page at `/desktop.html`. Unzip onto any static host, and again with each release: its download buttons name this release's files. |
-| `oaiy-desktop-<v>-windows-x64-setup.exe`, `.msi` | OAIY Desktop for Windows, with the Agent and the flow editor inside |
-| `oaiy-desktop-<v>-linux-x86_64.AppImage`, `-amd64.deb`, `-x86_64.rpm` | OAIY Desktop for Linux |
+| `oaiy-desktop-<v>-windows-x64-setup.exe`, `.msi` | OAIY Desktop for Windows, with the Agent and the flow editor inside. The setup.exe updates itself; the MSI is a manual download |
+| `oaiy-desktop-<v>-linux-x86_64.AppImage`, `-amd64.deb`, `-x86_64.rpm` (when the build made one) | OAIY Desktop for Linux. The AppImage updates itself |
+| `<the setup.exe and the AppImage>.sig`, `latest.json` | Their signatures and the update feed OAIY reads to find a newer release ([docs/UPDATES.md](../docs/UPDATES.md)) |
 | `oaiy-server-<v>-linux-x86_64.tar.gz`, `-windows-x64.zip` | The headless server, no GUI or GTK, for hosts driven by the CLI or a hosted web app |
 | `oaiy-cli-<v>.tar.gz` | The CLI alone, for a product that embeds it |
 | `SHA256SUMS.txt`, `release-evidence-*.json` | Checksums for everything above, and per build the revision, digests and the verification run that passed before publication |

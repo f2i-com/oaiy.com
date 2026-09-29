@@ -28,7 +28,8 @@ OAIY-Desktop-managed services appear, browser nodes become usable.
 | **2** | Service registry (start/stop/install/logs) · bundled install scripts (Python, Playwright) · HF model downloads with pause/resume · embedded Python + reusable venvs · React dashboard with Services / Models / Python tabs | ✅ |
 | **3** | oaiy-web fetches OAIY Desktop services into the palette automatically | ✅ |
 | **4** | Playwright sidecar (managed "Playwright Browser" service) + `browser_*` nodes in oaiy-web | ✅ |
-| **5** | Single-exe productisation, auto-update, settings persistence | next |
+| **5** | Single-exe productisation, settings persistence | next |
+| **5a** | Updates: a newer release found on GitHub, downloaded, signature-checked, and installed when the owner presses Restart to update ([docs/UPDATES.md](../../docs/UPDATES.md)) | ✅ |
 
 ## Built-in templates
 
@@ -58,6 +59,8 @@ is loopback-only.
 
 ### General
 - `GET    /api/health` — `{ status, product, protocol, version }`
+- `GET    /api/update/status` — whether a newer release exists (`state`, `currentVersion`, `latestVersion`, `notes`, `lastCheckedAt`, `blockers`, …). Open like health, and on the headless server too, which only reports ([docs/UPDATES.md](../../docs/UPDATES.md))
+- `POST   /api/update/check` — look at the release feed now (a plain GET, at most once every 30 seconds; privileged). There is no route that downloads or installs: those are commands of the dashboard's own window
 - `GET    /api/config` — `{ activeDir, defaultDir, configuredDir, isCustom, restartRequired }` (read-only; changing the data dir is a desktop-only action — native picker + restart)
 
 ### Services
@@ -215,6 +218,7 @@ Configuration is by environment variable (no pointer file):
 | `OAIY_PLUGIN_DEV_MODE` | debug: `true`, release: `false` | `0`/`false` runs plugins against real hardware; `1`/`true` simulates. Invalid values keep simulation enabled. **`1`/`true` also makes a release build start unsigned plugins** (a debug build always does, whatever this says: `0` there means real hardware); any other value in a release build does not. See [Package trust](../../docs/PLUGINS.md#package-trust). |
 | `OAIY_SERVER_TOKEN` | — | bearer token required for non-public headless APIs |
 | `OAIY_HF_TOKEN` | — | HuggingFace token for gated downloads |
+| `OAIY_UPDATE_FEED` | — | **debug builds only** (a release build ignores it): read the update feed from this address instead of GitHub's, for tests against a local stub |
 
 **Auth:** set `OAIY_SERVER_TOKEN` and send it as `Authorization: Bearer …`.
 Headless APIs require a valid token for reads and writes except health,
@@ -223,6 +227,11 @@ never substitute for credentials. Network binding without a token fails at
 startup, including when launched from the GUI. `SIGTERM`/`Ctrl-C` stops the managed
 services before exit, and on unix the plugins first, and so does a failed bind of the
 port (on Windows a plugin ends with the server's job object).
+
+**Updates:** the server never downloads or replaces itself. `GET /api/update/status` (open,
+like health) and `POST /api/update/check` (needs the token) tell you whether a newer release
+exists; [docs/UPDATES.md](../../docs/UPDATES.md#the-headless-server) has the steps to upgrade
+one by hand, keeping each version in a directory of its own so going back is one command.
 
 **Release contents:** headless archives now include `resources/cli` and a Node
 binary under `resources/node`. Keep these beside the server executable. The
