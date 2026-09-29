@@ -348,8 +348,8 @@ impl Session {
 
     /// The app-server is still there to answer.
     fn alive(&self) -> bool {
-        !lock(&self.routes).closed
-            && lock(&self.child).as_mut().map_or(true, |c| c.try_wait().ok().flatten().is_none())
+        let closed = lock(&self.routes).closed;
+        !closed && lock(&self.child).as_mut().map_or(true, |c| c.try_wait().ok().flatten().is_none())
     }
 }
 
@@ -540,11 +540,12 @@ fn safe_login_url(raw: Option<&str>) -> Option<String> {
 /// refreshes them. The refresh token ROTATES: once one child has refreshed, the
 /// other's copy is spent, and Codex's answer to a spent token is "your refresh
 /// token was already used — please log out and sign in again". Codex 0.144
-/// re-reads `auth.json` before refreshing, which narrows that race but takes no
-/// lock against the other process. Two children would also mean two login
-/// flows to keep apart, and a sign-out through one leaving the other signed in
-/// until it was restarted. One child has one copy of the credentials, one
-/// login flow and one sign-out, and nothing new to stop on shutdown.
+/// re-reads `auth.json` before refreshing, which narrows that race, but no lock
+/// against another process is evident in the shipped binary. Two children
+/// would also mean two login flows to keep apart, and a sign-out through one
+/// leaving the other signed in until it was restarted. One child has one copy
+/// of the credentials, one login flow and one sign-out, and nothing new to stop
+/// on shutdown.
 pub struct CodexAgent {
     codex_home: PathBuf,
     connect: Connect,
