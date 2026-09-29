@@ -5,7 +5,11 @@ import type {
   PluginRecord,
   PluginSetupState,
   ServiceSnapshot,
+  SetupCheckJson,
+  SetupFieldJson,
+  SetupRequirementJson,
   SetupState,
+  SetupStepJson,
 } from './api';
 import { deriveSetupSteps, type SetupInput } from './setupGuide';
 
@@ -25,21 +29,11 @@ import { deriveSetupSteps, type SetupInput } from './setupGuide';
 // A plugin's declared setup (its manifest's `setup` section)
 // ---------------------------------------------------------------------------
 
-export type StepKind = 'permissions' | 'requirements' | 'settings' | 'screen' | 'host';
+export type StepKind = SetupStepJson['kind'];
+export type Requirement = SetupRequirementJson;
+export type SettingsField = SetupFieldJson;
 
-export type Requirement =
-  | { kind: 'service'; id: string; why?: string }
-  /** Met by the model chosen in Engines for `group`: a plugin never names a model. */
-  | { kind: 'engineModel'; group: string; why?: string };
-
-export interface SettingsField {
-  key: string;
-  label: string;
-  type: 'bool' | 'choice' | 'text' | 'number';
-  options?: Array<{ value: string | number | boolean; label: string }>;
-  help?: string;
-}
-
+/** A step as the wizard runs it: the manifest's step, with its settings read and write filled in. */
 export interface DeclaredStep {
   id: string;
   kind: StepKind;
@@ -47,11 +41,12 @@ export interface DeclaredStep {
   description?: string;
   optional: boolean;
   /** Shown only while this check passes. */
-  when?: unknown;
+  when?: SetupCheckJson;
   /** A screen step's done check (run on the desktop). */
-  done?: unknown;
+  done?: SetupCheckJson;
   requires?: Requirement[];
   fields?: SettingsField[];
+  /** Where the settings are in `read`'s answer: '' is the whole answer. */
   read?: { command: string; path: string };
   write?: { command: string };
   screen?: string;
@@ -64,140 +59,57 @@ export interface DeclaredSetup {
   title: string;
   /** The permissions step first, always. */
   steps: DeclaredStep[];
-  /** Steps left out, and why (a newer OAIY, a missing screen...). */
+  /** Steps this dashboard left out, and why (a kind or host step it does not know). */
   dropped: string[];
 }
 
-/** The host's own steps. An unknown one needs a newer OAIY: the step is dropped, the plugin still loads. */
+/** The host's own steps (the desktop's HOST_SETUP_ACTIONS). The desktop leaves out any other, with a warning. */
 export const HOST_ACTIONS = ['phone.answerWithOaiy', 'calendar.business'] as const;
 export type HostAction = (typeof HOST_ACTIONS)[number];
 
-const STEP_ID = /^[a-z][a-z0-9-]{0,39}$/;
-const KINDS: StepKind[] = ['permissions', 'requirements', 'settings', 'screen', 'host'];
-const FIELD_TYPES = ['bool', 'choice', 'text', 'number'] as const;
-
 export const PERMISSIONS_STEP = 'permissions';
 
-type Json = Record<string, unknown>;
-const obj = (v: unknown): Json | null => (v && typeof v === 'object' && !Array.isArray(v) ? (v as Json) : null);
-const str = (v: unknown): string | undefined => (typeof v === 'string' && v.trim() ? v.trim() : undefined);
-
-function readRequirements(v: unknown): Requirement[] {
-  const out: Requirement[] = [];
-  for (const r of Array.isArray(v) ? v : []) {
-    const o = obj(r);
-    if (!o) continue;
-    const why = str(o.why);
-    if (o.kind === 'service' && str(o.id)) out.push({ kind: 'service', id: str(o.id)!, why });
-    else if (o.kind === 'engineModel' && str(o.group)) out.push({ kind: 'engineModel', group: str(o.group)!, why });
-  }
-  return out;
-}
-
-function readFields(v: unknown): SettingsField[] {
-  const out: SettingsField[] = [];
-  for (const f of Array.isArray(v) ? v : []) {
-    const o = obj(f);
-    const key = str(o?.key);
-    const type = o?.type as SettingsField['type'];
-    if (!o || !key || !FIELD_TYPES.includes(type)) continue;
-    const options = Array.isArray(o.options)
-      ? o.options.flatMap((x) => {
-          const opt = obj(x);
-          return opt && opt.value !== undefined ? [{ value: opt.value as string | number | boolean, label: str(opt.label) ?? String(opt.value) }] : [];
-        })
-      : undefined;
-    if (type === 'choice' && !options?.length) continue;
-    out.push({ key, label: str(o.label) ?? key, type, options, help: str(o.help) });
-  }
-  return out;
-}
-
 /**
- * A plugin's `setup` section, read from its record's manifest JSON: the one
- * place that knows where it lives (it becomes a typed section once the
- * manifest parser reads schemaVersion 4). `null` when it declares none.
- * A missing `version` is 1 and a missing `title` is "Set up <name>".
+ * A plugin's setup: the typed section its record carries (schemaVersion 4),
+ * validated by the desktop when the manifest loaded, with its version and
+ * title filled in and host steps this OAIY cannot run already left out.
+ * `null` when it declares none. The permissions step is put first, declared
+ * or not; anything of a kind this dashboard does not know is left out.
  */
 export function readSetup(record: PluginRecord | null | undefined): DeclaredSetup | null {
-  const manifest = obj(record?.manifest);
-  const setup = obj(manifest?.setup);
-  if (!record || !manifest || !setup) return null;
-  const name = str(manifest.name) ?? record.id;
-  const version = typeof setup.version === 'number' && Number.isInteger(setup.version) && setup.version >= 1 ? setup.version : 1;
-  const title = str(setup.title) ?? `Set up ${name}`;
-  const screens = new Set(
-    (Array.isArray(obj(manifest.ui)?.screens) ? (obj(manifest.ui)!.screens as unknown[]) : []).flatMap((s) => (str(obj(s)?.id) ? [str(obj(s)?.id)!] : [])),
-  );
+  const setup = record?.manifest?.setup;
+  if (!record || !setup || !Array.isArray(setup.steps)) return null;
+  const name = record.manifest?.name ?? record.id;
   const dropped: string[] = [];
-  const seen = new Set<string>();
   let permissions: DeclaredStep | null = null;
   const steps: DeclaredStep[] = [];
-  for (const raw of Array.isArray(setup.steps) ? setup.steps : []) {
-    const s = obj(raw);
-    const id = str(s?.id);
-    if (!s || !id || !STEP_ID.test(id)) {
-      dropped.push(`a step with no valid id (${JSON.stringify(s?.id ?? null)})`);
-      continue;
+  for (const s of setup.steps) {
+    const base = { id: s.id, kind: s.kind, title: s.title || s.id, description: s.description, optional: s.optional === true, when: s.when };
+    switch (s.kind) {
+      case 'permissions':
+        permissions = { ...base, optional: false };
+        break;
+      case 'requirements':
+        steps.push({ ...base, requires: s.requires });
+        break;
+      case 'settings':
+        steps.push({
+          ...base,
+          fields: s.fields,
+          read: s.read ? { command: s.read.command, path: s.read.path ?? '' } : { command: 'settings.get', path: 'settings' },
+          write: { command: s.write?.command ?? 'settings.set' },
+        });
+        break;
+      case 'screen':
+        steps.push({ ...base, screen: s.screen, view: s.view, done: s.done });
+        break;
+      case 'host':
+        if ((HOST_ACTIONS as readonly string[]).includes(s.action)) steps.push({ ...base, action: s.action as HostAction });
+        else dropped.push(`${s.id}: the step ${JSON.stringify(s.action)} needs a newer OAIY`);
+        break;
+      default:
+        dropped.push(`${(s as { id?: string }).id ?? '?'}: a kind this OAIY does not know`);
     }
-    if (seen.has(id)) {
-      dropped.push(`${id}: listed twice`);
-      continue;
-    }
-    seen.add(id);
-    const kind = s.kind as StepKind;
-    if (!KINDS.includes(kind)) {
-      dropped.push(`${id}: a kind this OAIY does not know (${String(s.kind)}): it needs a newer OAIY`);
-      continue;
-    }
-    const step: DeclaredStep = {
-      id,
-      kind,
-      title: str(s.title) ?? id,
-      description: str(s.description),
-      optional: s.optional === true,
-      when: s.when ?? undefined,
-      done: s.done ?? undefined,
-    };
-    if (kind === 'permissions') {
-      permissions = step;
-      continue;
-    }
-    if (kind === 'requirements') {
-      step.requires = readRequirements(s.requires);
-      if (!step.requires.length) {
-        dropped.push(`${id}: requires nothing this OAIY knows`);
-        continue;
-      }
-    }
-    if (kind === 'settings') {
-      step.fields = readFields(s.fields);
-      if (!step.fields.length) {
-        dropped.push(`${id}: no fields`);
-        continue;
-      }
-      const read = obj(s.read);
-      const write = obj(s.write);
-      step.read = { command: str(read?.command) ?? 'settings.get', path: typeof read?.path === 'string' ? read.path : 'settings' };
-      step.write = { command: str(write?.command) ?? 'settings.set' };
-    }
-    if (kind === 'screen') {
-      step.screen = str(s.screen);
-      step.view = typeof s.view === 'string' ? s.view : '';
-      if (!step.screen || !screens.has(step.screen)) {
-        dropped.push(`${id}: its screen ${JSON.stringify(s.screen ?? null)} is not one the plugin ships`);
-        continue;
-      }
-    }
-    if (kind === 'host') {
-      const action = str(s.action);
-      if (!action || !(HOST_ACTIONS as readonly string[]).includes(action)) {
-        dropped.push(`${id}: the step ${JSON.stringify(action ?? null)} needs a newer OAIY`);
-        continue;
-      }
-      step.action = action as HostAction;
-    }
-    steps.push(step);
   }
   // The host always puts what the plugin may do first, declared or not.
   const first: DeclaredStep = {
@@ -207,7 +119,7 @@ export function readSetup(record: PluginRecord | null | undefined): DeclaredSetu
     description: permissions?.description,
     optional: false,
   };
-  return { version, title, steps: [first, ...steps], dropped };
+  return { version: setup.version || 1, title: setup.title || `Set up ${name}`, steps: [first, ...steps], dropped };
 }
 
 /** Does `record` need its setup run (its `setup.version` is newer than the one last finished)? */

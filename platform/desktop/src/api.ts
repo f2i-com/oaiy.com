@@ -380,6 +380,16 @@ export interface PluginRecord {
     description?: string;
     connectors?: Array<{ id: string; commands: string[] }>;
     events?: string[];
+    /** Commands with effects a retry must not repeat. */
+    commands?: { journalled?: string[] };
+    /** schemaVersion 4: the built-in modules it provides (the phone, the calendar). */
+    modules?: { provides: string[]; connector?: string };
+    /** schemaVersion 4: its service-definition actions offered to the agent. */
+    agentTools?: Array<{ action: string; name: string; description?: string; audience?: string[]; confirm?: string }>;
+    /** schemaVersion 4: its setup wizard, as the desktop validated it (version and title filled in). */
+    setup?: SetupDeclJson;
+    /** Its screens, pages and cards (presentation only; see sections.ts). */
+    ui?: { screens?: Array<{ id: string; title?: string; entry?: string; files?: string[] }> } & Record<string, unknown>;
   };
   /** Capability names rewritten from a pre-OAIY spelling, for a UI nudge. */
   legacyCapabilities?: Array<[string, string]>;
@@ -392,6 +402,54 @@ export interface PluginRecord {
   lastHealth?: { status: string; detail?: string; components?: Record<string, unknown> };
   lastHealthAt?: string;
   lastHealthError?: string;
+}
+
+/** One test of a command's answer: a dot-separated `path` and exactly one operator. A missing path equals null. */
+export interface SetupConditionJson {
+  path: string;
+  equals?: unknown;
+  present?: boolean;
+  in?: unknown[];
+  notIn?: unknown[];
+}
+
+/** A step's `done` or `when`: a read-only command sent with no payload, and one condition inline or `all` of a list. */
+export type SetupCheckJson = { command: string; all?: SetupConditionJson[] } & Partial<SetupConditionJson>;
+
+export type SetupRequirementJson =
+  | { kind: 'service'; id: string; why?: string }
+  /** Met by the model chosen in Engines for the group: a plugin never names a model. */
+  | { kind: 'engineModel'; group: string; why?: string };
+
+export interface SetupFieldJson {
+  key: string;
+  label: string;
+  type: 'bool' | 'choice' | 'text' | 'number';
+  options?: Array<{ value: string | number | boolean; label: string }>;
+  help?: string;
+}
+
+/** One step of a plugin's setup (the manifest's `setup.steps[]`). */
+export type SetupStepJson = {
+  id: string;
+  title: string;
+  description?: string;
+  optional?: boolean;
+  when?: SetupCheckJson;
+} & (
+  | { kind: 'permissions' }
+  | { kind: 'requirements'; requires: SetupRequirementJson[] }
+  /** `read` absent: `settings.get`, the settings under `settings`; a `read` with no path: the whole answer. */
+  | { kind: 'settings'; fields: SetupFieldJson[]; read?: { command: string; path?: string }; write?: { command: string } }
+  | { kind: 'screen'; screen: string; view: string; done?: SetupCheckJson }
+  | { kind: 'host'; action: string }
+);
+
+/** A plugin's setup (schemaVersion 4), as its record carries it. */
+export interface SetupDeclJson {
+  version: number;
+  title: string;
+  steps: SetupStepJson[];
 }
 
 export interface PluginsSnapshot {
@@ -1467,7 +1525,7 @@ export interface SetupState {
 export interface SetupPluginDetail {
   pluginId: string;
   name: string;
-  setup: { version: number; title: string; steps: unknown[] } | null;
+  setup: SetupDeclJson | null;
   /** Its capabilities, wildcards expanded. */
   capabilities: string[];
   legacyCapabilities?: Array<[string, string]>;

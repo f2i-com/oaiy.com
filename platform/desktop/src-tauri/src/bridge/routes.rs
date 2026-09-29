@@ -1128,7 +1128,7 @@ async fn install_plugin(
             if let Ok(mut reg) = st.plugins.lock() {
                 reg.scan();
                 crate::modules::refresh(&reg);
-                setup = reg.get(&out.id).and_then(crate::setup::declared);
+                setup = reg.get(&out.id).and_then(crate::setup::declared).cloned();
             }
             crate::modules::poke();
             (StatusCode::OK, Json(install_reply(&out, setup.as_ref()))).into_response()
@@ -1141,7 +1141,7 @@ async fn install_plugin(
 /// What an install answers: the plugin installed, and when it declares a
 /// setup, its version and title, so the window that installed it can open
 /// its setup wizard (or, for an update, nudge when the version went up).
-fn install_reply(out: &crate::plugins::install::Installed, setup: Option<&crate::setup::Declared>) -> serde_json::Value {
+fn install_reply(out: &crate::plugins::install::Installed, setup: Option<&crate::plugins::manifest::SetupDecl>) -> serde_json::Value {
     let mut reply = json!({
         "id": out.id,
         "name": out.name,
@@ -1738,7 +1738,7 @@ mod tests {
         };
         let plain = install_reply(&out, None);
         assert_eq!(plain, json!({ "id": "aokie", "name": "Aokie Phone Bridge", "version": "0.1.0", "replaced": false }));
-        let setup = crate::setup::Declared { version: 2, title: "Set up the AI Receptionist".into(), steps: vec![] };
+        let setup = crate::plugins::manifest::SetupDecl { version: 2, title: "Set up the AI Receptionist".into(), steps: vec![] };
         let with = install_reply(&out, Some(&setup));
         assert_eq!(with["setup"], json!({ "version": 2, "title": "Set up the AI Receptionist" }));
         assert!(with.get("dir").is_none(), "the folder (and the OS username in it) stays on the desktop");

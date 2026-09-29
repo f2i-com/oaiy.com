@@ -123,19 +123,29 @@ describe("a plugin's declared setup", () => {
     ]);
   });
 
-  it('drops a step a newer OAIY would need, a missing screen, and a bad id, and says why', () => {
-    const s = readSetup(aokie({ steps: [
+  it('leaves out a step of a kind or host action this OAIY does not know, and says why', () => {
+    // The desktop validates the section when the manifest loads (ids, screens,
+    // checks) and leaves out host steps it cannot run; this only guards a
+    // window older than its desktop.
+    const s = readSetup(aokie({ version: 1, title: 'Set up', steps: [
       { id: 'future', kind: 'host', action: 'phone.teleport', title: 'x' },
-      { id: 'nowhere', kind: 'screen', screen: 'missing', view: 'x' },
-      { id: 'Bad Id', kind: 'screen', screen: 'receptionist-home' },
-      { id: 'odd', kind: 'hologram' },
-      { id: 'pair', kind: 'screen', screen: 'receptionist-home', view: 'phone' },
-      { id: 'pair', kind: 'screen', screen: 'receptionist-home', view: 'phone' },
+      { id: 'odd', kind: 'hologram', title: 'x' },
+      { id: 'pair', kind: 'screen', screen: 'receptionist-home', view: 'phone', title: 'Pair' },
     ] }))!;
     expect(s.steps.map((x) => x.id)).toEqual(['permissions', 'pair']);
     expect(s.dropped.join('\n')).toContain('needs a newer OAIY');
-    expect(s.dropped.join('\n')).toContain('"missing" is not one the plugin ships');
-    expect(s.dropped).toHaveLength(5);
+    expect(s.dropped).toHaveLength(2);
+  });
+
+  it('a settings step reads settings.get’s settings by default, and a read with no path the whole answer', () => {
+    const s = readSetup(aokie({ version: 1, title: 'x', steps: [
+      { id: 'a', kind: 'settings', title: 'A', fields: [{ key: 'k', label: 'K', type: 'bool' }] },
+      { id: 'b', kind: 'settings', title: 'B', fields: [{ key: 'k', label: 'K', type: 'bool' }], read: { command: 'prefs.get' }, write: { command: 'prefs.set' } },
+    ] }))!;
+    expect(s.steps[1].read).toEqual({ command: 'settings.get', path: 'settings' });
+    expect(s.steps[1].write).toEqual({ command: 'settings.set' });
+    expect(s.steps[2].read).toEqual({ command: 'prefs.get', path: '' });
+    expect(s.steps[2].write).toEqual({ command: 'prefs.set' });
   });
 
   it('needs setup while its version is newer than the one last finished', () => {

@@ -31,11 +31,11 @@
 //!
 //! # A plugin's `setup` section
 //!
-//! Read from the plugin record's manifest JSON by [`declared`], the one place
-//! that knows where it lives, so it can switch to the typed manifest section
-//! once the manifest parser reads schemaVersion 4.
+//! The manifest parser's typed section (schemaVersion 4, validated at load),
+//! reached through [`declared`]. The parser checks each `done` and `when`
+//! check; [`judge`] evaluates one against its command's answer.
 
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -46,8 +46,9 @@ use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
 use axum::{Json, Router};
 use serde::{Deserialize, Serialize};
-use serde_json::{json, Map, Value};
+use serde_json::{json, Value};
 
+use crate::plugins::manifest::{Check, Condition, SetupDecl, SetupStep, StepKind};
 use crate::plugins::registry::{PluginRecord, PluginRegistryHandle};
 use crate::plugins::{CallError, ForwardError, PluginHost};
 
@@ -342,59 +343,18 @@ pub fn in_use_signal(data_dir: &Path, plugins_root: &Path, providers: &[crate::a
 /// The step the host always puts first.
 pub const PERMISSIONS: &str = "permissions";
 
-/// A plugin's `setup` section, as far as the host needs it.
-#[derive(Clone, Debug, PartialEq, Serialize)]
-#[serde(rename_all = "camelCase")]
-pub struct Declared {
-    pub version: u32,
-    pub title: String,
-    /// The declared steps with a valid id, as JSON (the dashboard reads their kinds).
-    pub steps: Vec<Value>,
+/// The `setup` section of `record`'s manifest (schemaVersion 4), if it
+/// declares one: the manifest parser's typed section, validated at load (a
+/// check's command declared and not journalled, a screen the plugin ships),
+/// with its version (default 1) and title (default "Set up <name>") filled
+/// in and host steps this OAIY cannot run already left out.
+pub fn declared(record: &PluginRecord) -> Option<&SetupDecl> {
+    record.manifest.as_ref()?.setup.as_ref()
 }
 
-impl Declared {
-    pub fn step(&self, id: &str) -> Option<&Value> {
-        self.steps.iter().find(|s| s.get("id").and_then(Value::as_str) == Some(id))
-    }
-}
-
-/// The `setup` section of `record`'s manifest, if it declares one.
-///
-/// Read from the manifest's JSON until the manifest parser reads schemaVersion
-/// 4 (where `setup` is typed): the only function that knows where it lives.
-/// A missing `version` is 1, a missing `title` is "Set up <name>".
-pub fn declared(record: &PluginRecord) -> Option<Declared> {
-    let manifest = record.manifest.as_ref()?;
-    let setup = manifest.extra.get("setup")?.as_object()?;
-    let version = setup
-        .get("version")
-        .and_then(Value::as_u64)
-        .filter(|v| (1..=u32::MAX as u64).contains(v))
-        .unwrap_or(1) as u32;
-    let title = setup
-        .get("title")
-        .and_then(Value::as_str)
-        .map(str::trim)
-        .filter(|t| !t.is_empty())
-        .map(str::to_string)
-        .unwrap_or_else(|| format!("Set up {}", manifest.name));
-    let mut seen = BTreeSet::new();
-    let steps = setup
-        .get("steps")
-        .and_then(Value::as_array)
-        .map(|steps| {
-            steps
-                .iter()
-                .filter(|s| {
-                    s.get("id")
-                        .and_then(Value::as_str)
-                        .is_some_and(|id| valid_step_id(id) && !id.contains(':') && seen.insert(id.to_string()))
-                })
-                .cloned()
-                .collect()
-        })
-        .unwrap_or_default();
-    Some(Declared { version, title, steps })
+/// Step `id` of a declared setup.
+pub fn find_step<'a>(setup: &'a SetupDecl, id: &str) -> Option<&'a SetupStep> {
+    setup.steps.iter().find(|s| s.id == id)
 }
 
 /// `record`'s capabilities with wildcards expanded: what the permissions step shows and records.
@@ -408,65 +368,16 @@ pub fn accepted_covers(accepted: Option<&Vec<String>>, current: &[String]) -> bo
 }
 
 // ---------------------------------------------------------------------------
-// Checks (`done` and `when`)
+// Checks (`done` and `when`): the manifest parser validates them; this
+// evaluates them against the command's answer.
 // ---------------------------------------------------------------------------
 
-#[derive(Clone, Debug, PartialEq)]
-pub enum Op {
-    Equals(Value),
-    Present(bool),
-    In(Vec<Value>),
-    NotIn(Vec<Value>),
-}
-
-#[derive(Clone, Debug, PartialEq)]
-pub struct Condition {
-    pub path: String,
-    pub op: Op,
-}
-
-/// A check: one command, sent with no payload, and conditions on its answer.
-#[derive(Clone, Debug, PartialEq)]
-pub struct Check {
-    pub command: String,
-    pub conditions: Vec<Condition>,
-}
-
-fn parse_condition(o: &Map<String, Value>) -> Result<Condition, String> {
-    let path = o.get("path").and_then(Value::as_str).map(str::trim).filter(|p| !p.is_empty()).ok_or("a condition needs a path")?;
-    let mut ops = Vec::new();
-    if let Some(v) = o.get("equals") {
-        ops.push(Op::Equals(v.clone()));
+/// A check's conditions: its `all` list, or the one it carries inline.
+pub fn conditions(check: &Check) -> Vec<&Condition> {
+    match &check.all {
+        Some(all) => all.iter().collect(),
+        None => vec![&check.condition],
     }
-    if let Some(v) = o.get("present") {
-        ops.push(Op::Present(v.as_bool().ok_or("present is true or false")?));
-    }
-    if let Some(v) = o.get("in") {
-        ops.push(Op::In(v.as_array().ok_or("in is a list")?.clone()));
-    }
-    if let Some(v) = o.get("notIn") {
-        ops.push(Op::NotIn(v.as_array().ok_or("notIn is a list")?.clone()));
-    }
-    if ops.len() != 1 {
-        return Err(format!("the condition on {path} needs exactly one of equals, present, in, notIn"));
-    }
-    Ok(Condition { path: path.to_string(), op: ops.remove(0) })
-}
-
-pub fn parse_check(v: &Value) -> Result<Check, String> {
-    let o = v.as_object().ok_or("a check is an object")?;
-    let command = o.get("command").and_then(Value::as_str).map(str::trim).filter(|c| !c.is_empty()).ok_or("a check needs a command")?;
-    let conditions = match o.get("all") {
-        Some(all) => {
-            let list = all.as_array().ok_or("all is a list of conditions")?;
-            if list.is_empty() {
-                return Err("all needs at least one condition".into());
-            }
-            list.iter().map(|c| c.as_object().ok_or_else(|| "a condition is an object".to_string()).and_then(parse_condition)).collect::<Result<Vec<_>, _>>()?
-        }
-        None => vec![parse_condition(o)?],
-    };
-    Ok(Check { command: command.to_string(), conditions })
 }
 
 /// The value at a dot-separated `path` (a number steps into a list).
@@ -480,24 +391,35 @@ pub fn lookup<'a>(data: &'a Value, path: &str) -> Option<&'a Value> {
 
 fn show(v: &Value) -> String {
     let s = v.to_string();
-    if s.len() > 60 { format!("{}…", &s[..s.char_indices().take_while(|(i, _)| *i < 60).last().map_or(0, |(i, c)| i + c.len_utf8())]) } else { s }
+    if s.chars().count() > 60 { format!("{}…", s.chars().take(60).collect::<String>()) } else { s }
+}
+
+/// Why `c` fails on `data`, or `None` when it holds. A missing path equals null.
+fn failure(c: &Condition, data: &Value) -> Option<String> {
+    let found = lookup(data, &c.path);
+    let value = found.unwrap_or(&Value::Null);
+    let is = || if found.is_none() { "missing".to_string() } else { show(value) };
+    if let Some(want) = &c.equals {
+        return (value != want).then(|| format!("{} is {}, not {}", c.path, is(), show(want)));
+    }
+    if let Some(want) = c.present {
+        let there = !value.is_null();
+        return (there != want).then(|| if want { format!("{} is missing", c.path) } else { format!("{} is {}", c.path, show(value)) });
+    }
+    if let Some(list) = &c.one_of {
+        return (!list.contains(value)).then(|| format!("{} is {}, not one of {}", c.path, is(), show(&Value::Array(list.clone()))));
+    }
+    if let Some(list) = &c.not_in {
+        return list.contains(value).then(|| format!("{} is {}", c.path, is()));
+    }
+    // No test at all (the parser refuses one): it cannot pass.
+    Some(format!("the condition on {} has no test", c.path))
 }
 
 /// Whether `data` (the command's answer) passes every condition, and a sentence saying so.
 pub fn judge(check: &Check, data: &Value) -> (bool, String) {
-    for c in &check.conditions {
-        let found = lookup(data, &c.path);
-        let value = found.unwrap_or(&Value::Null);
-        let failed = match &c.op {
-            Op::Equals(want) => (value != want).then(|| format!("{} is {}, not {}", c.path, if found.is_none() { "missing".into() } else { show(value) }, show(want))),
-            Op::Present(want) => {
-                let there = !value.is_null();
-                (there != *want).then(|| if *want { format!("{} is missing", c.path) } else { format!("{} is {}", c.path, show(value)) })
-            }
-            Op::In(list) => (!list.contains(value)).then(|| format!("{} is {}, not one of {}", c.path, show(value), show(&Value::Array(list.clone())))),
-            Op::NotIn(list) => list.contains(value).then(|| format!("{} is {}", c.path, show(value))),
-        };
-        if let Some(why) = failed {
+    for c in conditions(check) {
+        if let Some(why) = failure(c, data) {
             return (false, format!("{}: {why}", check.command));
         }
     }
@@ -533,15 +455,6 @@ pub enum Which {
     When,
 }
 
-impl Which {
-    fn key(self) -> &'static str {
-        match self {
-            Which::Done => "done",
-            Which::When => "when",
-        }
-    }
-}
-
 /// The outcome of a check.
 #[derive(Clone, Debug, PartialEq, Serialize)]
 pub struct Outcome {
@@ -551,25 +464,24 @@ pub struct Outcome {
 
 /// How to run `step`'s check of `record`: the connector to send it to, and
 /// the check. `Err` is the outcome without sending anything: no such check,
-/// or a command that is undeclared or journalled (a check must have no side
-/// effects, so a journalled command is never sent).
-pub fn plan_check(record: &PluginRecord, step: &str, which: Which) -> Result<(String, Check), Outcome> {
+/// or a command that is undeclared or journalled. (The parser refuses such a
+/// manifest at load; this holds the line again, as a check must never have a
+/// side effect.)
+pub fn plan_check(record: &PluginRecord, step_id: &str, which: Which) -> Result<(String, Check), Outcome> {
     let not = |detail: String| Outcome { passed: false, detail };
     let manifest = record.manifest.as_ref().ok_or_else(|| not(format!("{} has no manifest that loads", record.id)))?;
-    let declared = declared(record).ok_or_else(|| not(format!("{} declares no setup", record.id)))?;
-    let step_json = declared.step(step).ok_or_else(|| not(format!("{} has no setup step {step:?}", record.id)))?;
-    let Some(raw) = step_json.get(which.key()) else {
-        return Err(match which {
-            // No `when`: the step is always shown.
-            Which::When => Outcome { passed: true, detail: "the step is always shown".into() },
-            Which::Done => not("the step has no done check: it is done when its screen says so".into()),
-        });
+    let setup = declared(record).ok_or_else(|| not(format!("{} declares no setup", record.id)))?;
+    let s = find_step(setup, step_id).ok_or_else(|| not(format!("{} has no setup step {step_id:?}", record.id)))?;
+    let check = match which {
+        // No `when`: the step is always shown.
+        Which::When => s.when.clone().ok_or_else(|| Outcome { passed: true, detail: "the step is always shown".into() })?,
+        Which::Done => match &s.kind {
+            StepKind::Screen { done: Some(done), .. } => done.clone(),
+            _ => return Err(not("the step has no done check: it is done when its screen says so".into())),
+        },
     };
-    let check = parse_check(raw).map_err(|e| not(format!("the step's {} check is not valid: {e}", which.key())))?;
     let connector = manifest
-        .connectors
-        .iter()
-        .find(|c| c.commands.iter().any(|x| x == &check.command))
+        .connector_for(&check.command)
         .map(|c| c.id.clone())
         .ok_or_else(|| not(format!("{} is not one of the plugin's commands", check.command)))?;
     if manifest.is_journalled(&check.command) {
@@ -822,7 +734,7 @@ async fn mark_step(State(ctx): State<Ctx>, UrlPath((id, step)): UrlPath<(String,
         // What is accepted is what the plugin asks for now, worked out here: a caller cannot name a narrower list.
         Some(resolved_capabilities(&record))
     } else {
-        if setup.step(&step).is_none() {
+        if find_step(setup, &step).is_none() {
             return fail(StatusCode::NOT_FOUND, format!("{id} has no setup step {step:?}"));
         }
         None
@@ -905,57 +817,50 @@ mod tests {
         }
     }
 
-    /// The Aokie proposal's setup (`manifest.v4-setup.proposed.json`), with the
-    /// kinds it does not use yet: carried by a schemaVersion 3 manifest, which
-    /// only works on this branch (the v4 parser refuses `setup` below 4).
+    /// Aokie's v4 manifest (the manifest parser's fixture), and the service
+    /// definition its `serviceDefinitions` names.
+    const AOKIE_V4: &str = include_str!("plugins/fixtures/aokie-v4.manifest.json");
+    const AOKIE_PHONE: &str = include_str!("plugins/fixtures/aokie-phone.definition.json");
+
+    /// The fixture's setup (Aokie's screen steps) with the kinds it does not use yet.
     fn aokie_setup() -> Value {
-        json!({
-            "steps": [
-                { "id": "consent", "kind": "screen", "title": "Consent", "screen": "receptionist-home", "view": "consent",
-                  "done": { "command": "consent.get", "all": [
-                      { "path": "mode", "equals": "enforce" },
-                      { "path": "bluetooth.allowed", "equals": true },
-                      { "path": "blocked", "equals": null } ] } },
-                { "id": "dongle", "kind": "screen", "title": "Bluetooth dongle", "screen": "receptionist-home", "view": "dongle",
-                  "when": { "command": "settings.get", "path": "settings.transportMode", "notIn": ["native", "auto"] },
-                  "done": { "command": "dongle.diagnostics", "path": "radio.initialized", "equals": true } },
-                { "id": "pair", "kind": "screen", "title": "Pair your phone", "screen": "receptionist-home", "view": "phone",
-                  "done": { "command": "phone.status", "all": [
-                      { "path": "connected", "equals": true },
-                      { "path": "pairingOpen", "equals": false },
-                      { "path": "pairingConfirm", "equals": null } ] } },
-                { "id": "dial-check", "kind": "screen", "title": "Bad", "screen": "receptionist-home", "view": "phone",
-                  "done": { "command": "call.dial", "path": "ok", "equals": true } },
-                { "id": "Bad Id", "kind": "host", "title": "Dropped" }
-            ]
-        })
+        let mut setup = serde_json::from_str::<Value>(AOKIE_V4).unwrap()["setup"].clone();
+        let steps = setup["steps"].as_array_mut().unwrap();
+        steps.push(json!({ "id": "speech", "kind": "requirements", "title": "Hearing and speaking",
+            "requires": [ { "kind": "service", "id": "oaiy-voice" }, { "kind": "engineModel", "group": "llm" } ] }));
+        steps.push(json!({ "id": "answer", "kind": "host", "action": "phone.answerWithOaiy", "title": "Answer calls and texts with OAIY" }));
+        steps.push(json!({ "id": "later", "kind": "host", "action": "phone.teleport", "title": "Needs a newer OAIY" }));
+        setup
     }
 
+    /// Aokie at schemaVersion 4 in `root/<id>`, with `setup` (or none).
     fn write_plugin(root: &Path, id: &str, setup: Option<Value>) {
         let dir = root.join(id);
-        std::fs::create_dir_all(&dir).unwrap();
-        let mut m = json!({
-            "schemaVersion": 3,
-            "id": id,
-            "name": "Aokie Phone Bridge",
-            "version": "0.1.0",
-            "pluginApiVersion": 1,
-            "entry": { "kind": "process", "command": "plugin.exe" },
-            "capabilities": ["flow.run", "connector.aokie.*"],
-            "connectors": [{ "id": "aokie", "commands": ["consent.get", "settings.get", "dongle.diagnostics", "phone.status", "call.dial"] }],
-            "commands": { "journalled": ["call.dial"] },
-        });
-        if let Some(s) = setup {
-            m["setup"] = s;
+        std::fs::create_dir_all(dir.join("definitions")).unwrap();
+        let mut m: Value = serde_json::from_str(AOKIE_V4).unwrap();
+        m["id"] = json!(id);
+        match setup {
+            Some(s) => m["setup"] = s,
+            None => {
+                m.as_object_mut().unwrap().remove("setup");
+            }
         }
         std::fs::write(dir.join("manifest.json"), m.to_string()).unwrap();
+        std::fs::write(dir.join("definitions").join("phone.json"), AOKIE_PHONE).unwrap();
     }
 
     fn record(root: &Path, id: &str) -> PluginRecord {
         let reg = crate::plugins::registry::new_handle(root.to_path_buf());
         let mut r = reg.lock().unwrap();
         r.scan();
-        r.get(id).cloned().expect("the plugin loads")
+        let rec = r.get(id).cloned().expect("the plugin is listed");
+        assert!(rec.manifest.is_some(), "the plugin loads: {:?}", rec.reason);
+        rec
+    }
+
+    /// A check as the manifest carries it.
+    fn check(v: Value) -> Check {
+        serde_json::from_value(v).unwrap()
     }
 
     #[test]
@@ -1075,60 +980,64 @@ mod tests {
     }
 
     #[test]
-    fn a_plugins_setup_is_read_from_its_manifest_with_defaults() {
+    fn a_plugins_setup_is_the_manifests_typed_section_with_its_defaults() {
         let sb = Sandbox::new("declared");
         write_plugin(&sb.0, "aokie", Some(aokie_setup()));
         write_plugin(&sb.0, "plain", None);
-        let d = declared(&record(&sb.0, "aokie")).expect("declared");
+        let rec = record(&sb.0, "aokie");
+        let d = declared(&rec).expect("declared");
         assert_eq!(d.version, 1, "no version is 1");
         assert_eq!(d.title, "Set up Aokie Phone Bridge");
-        let ids: Vec<&str> = d.steps.iter().filter_map(|s| s["id"].as_str()).collect();
-        assert_eq!(ids, ["consent", "dongle", "pair", "dial-check"], "an invalid id is dropped");
+        let ids: Vec<&str> = d.steps.iter().map(|s| s.id.as_str()).collect();
+        assert_eq!(ids, ["consent", "dongle", "pair", "speech", "answer"], "a host step this OAIY cannot run is left out");
+        assert!(find_step(d, "pair").is_some() && find_step(d, "nope").is_none());
         assert!(declared(&record(&sb.0, "plain")).is_none());
 
-        write_plugin(&sb.0, "titled", Some(json!({ "version": 3, "title": "Set up the AI Receptionist", "steps": [] })));
-        let d = declared(&record(&sb.0, "titled")).unwrap();
+        let mut titled = aokie_setup();
+        titled["version"] = json!(3);
+        titled["title"] = json!("Set up the AI Receptionist");
+        write_plugin(&sb.0, "titled", Some(titled));
+        let rec = record(&sb.0, "titled");
+        let d = declared(&rec).unwrap();
         assert_eq!((d.version, d.title.as_str()), (3, "Set up the AI Receptionist"));
     }
 
     #[test]
-    fn checks_parse_in_both_forms_and_refuse_what_is_not_one() {
-        let single = parse_check(&json!({ "command": "phone.status", "path": "connected", "equals": true })).unwrap();
-        assert_eq!(single.conditions, [Condition { path: "connected".into(), op: Op::Equals(json!(true)) }]);
-        let all = parse_check(&json!({ "command": "phone.status", "all": [ { "path": "a", "equals": null }, { "path": "b", "present": true }, { "path": "c", "in": [1] }, { "path": "d", "notIn": ["x"] } ] })).unwrap();
-        assert_eq!(all.conditions.len(), 4);
-        assert_eq!(all.conditions[0].op, Op::Equals(Value::Null), "equals null is a condition, not a missing one");
-        for bad in [
-            json!({ "path": "a", "equals": 1 }),
-            json!({ "command": "x", "path": "a" }),
-            json!({ "command": "x", "path": "a", "equals": 1, "present": true }),
-            json!({ "command": "x", "all": [] }),
-            json!({ "command": "x", "path": "a", "in": 3 }),
-        ] {
-            assert!(parse_check(&bad).is_err(), "{bad}");
-        }
+    fn a_checks_conditions_are_its_inline_one_or_its_all_list() {
+        let single = check(json!({ "command": "phone.status", "path": "connected", "equals": true }));
+        assert_eq!(conditions(&single).len(), 1);
+        assert_eq!(conditions(&single)[0].equals, Some(json!(true)));
+        let all = check(json!({ "command": "phone.status", "all": [ { "path": "a", "equals": null }, { "path": "b", "present": true }, { "path": "c", "in": [1] }, { "path": "d", "notIn": ["x"] } ] }));
+        let list = conditions(&all);
+        assert_eq!(list.len(), 4);
+        assert_eq!(list[0].equals, Some(Value::Null), "equals null is a test, not a missing one");
+        assert_eq!(list[2].one_of, Some(vec![json!(1)]));
     }
 
     #[test]
     fn a_check_is_judged_on_the_answer_with_a_missing_path_equal_to_null() {
-        let check = parse_check(&json!({ "command": "phone.status", "all": [
+        let c = check(json!({ "command": "phone.status", "all": [
             { "path": "connected", "equals": true },
             { "path": "pairingConfirm", "equals": null },
             { "path": "device.name", "present": true },
             { "path": "mode", "notIn": ["native", "auto"] },
-            { "path": "list.1", "in": ["b"] } ] }))
-        .unwrap();
+            { "path": "list.1", "in": ["b"] } ] }));
         let ok = json!({ "connected": true, "device": { "name": "Pixel" }, "mode": "dongle", "list": ["a", "b"] });
-        assert_eq!(judge(&check, &ok), (true, "phone.status: every condition holds".into()));
-        let (passed, why) = judge(&check, &json!({ "connected": false }));
+        assert_eq!(judge(&c, &ok), (true, "phone.status: every condition holds".into()));
+        let (passed, why) = judge(&c, &json!({ "connected": false }));
         assert!(!passed);
         assert_eq!(why, "phone.status: connected is false, not true");
-        let (passed, why) = judge(&check, &json!({ "connected": true, "pairingConfirm": { "code": "123456" }, "device": { "name": "P" } }));
+        let (passed, why) = judge(&c, &json!({ "connected": true, "pairingConfirm": { "code": "123456" }, "device": { "name": "P" } }));
         assert!(!passed && why.contains("pairingConfirm"), "{why}");
-        let (passed, why) = judge(&check, &json!({ "connected": true }));
+        let (passed, why) = judge(&c, &json!({ "connected": true }));
         assert!(!passed && why.contains("device.name is missing"), "{why}");
-        let (passed, why) = judge(&check, &json!({ "connected": true, "device": { "name": "P" }, "mode": "auto" }));
+        let (passed, why) = judge(&c, &json!({ "connected": true, "device": { "name": "P" }, "mode": "auto" }));
         assert!(!passed && why.contains("mode is \"auto\""), "{why}");
+        // present: false passes when the path is missing or null.
+        assert!(judge(&check(json!({ "command": "x", "path": "gone", "present": false })), &json!({ "gone": null })).0);
+        // A missing path is null: in [null] passes, notIn [null] fails.
+        assert!(judge(&check(json!({ "command": "x", "path": "gone", "in": [null] })), &json!({})).0);
+        assert!(!judge(&check(json!({ "command": "x", "path": "gone", "notIn": [null] })), &json!({})).0);
     }
 
     #[test]
@@ -1136,25 +1045,30 @@ mod tests {
         assert_eq!(unwrap_reply(json!({ "ok": true, "data": { "connected": true } })), Ok(json!({ "connected": true })));
         assert_eq!(unwrap_reply(json!({ "connected": true })), Ok(json!({ "connected": true })));
         assert_eq!(unwrap_reply(json!({ "ok": false, "error": { "message": "no radio" } })), Err("no radio".into()));
-        let check = parse_check(&json!({ "command": "dongle.diagnostics", "path": "radio.initialized", "equals": true })).unwrap();
-        assert_eq!(outcome(&check, Err("no answer within 5 s".into())), Outcome { passed: false, detail: "dongle.diagnostics: no answer within 5 s".into() });
-        assert!(outcome(&check, Ok(json!({ "ok": true, "data": { "radio": { "initialized": true } } }))).passed);
+        let c = check(json!({ "command": "dongle.diagnostics", "path": "radio.initialized", "equals": true }));
+        assert_eq!(outcome(&c, Err("no answer within 5 s".into())), Outcome { passed: false, detail: "dongle.diagnostics: no answer within 5 s".into() });
+        assert!(outcome(&c, Ok(json!({ "ok": true, "data": { "radio": { "initialized": true } } }))).passed);
     }
 
     #[test]
     fn a_check_is_planned_only_for_a_declared_command_that_is_not_journalled() {
         let sb = Sandbox::new("plan");
         write_plugin(&sb.0, "aokie", Some(aokie_setup()));
-        let r = record(&sb.0, "aokie");
-        let (connector, check) = plan_check(&r, "pair", Which::Done).unwrap();
-        assert_eq!((connector.as_str(), check.command.as_str()), ("aokie", "phone.status"));
+        let mut r = record(&sb.0, "aokie");
+        let (connector, c) = plan_check(&r, "pair", Which::Done).unwrap();
+        assert_eq!((connector.as_str(), c.command.as_str()), ("aokie", "phone.status"));
         let (_, when) = plan_check(&r, "dongle", Which::When).unwrap();
         assert_eq!(when.command, "settings.get");
-        // A step with no `when` is always shown; one with no `done` is done when its screen says.
-        assert_eq!(plan_check(&r, "consent", Which::When).unwrap_err().passed, true);
-        let journalled = plan_check(&r, "dial-check", Which::Done).unwrap_err();
-        assert!(!journalled.passed && journalled.detail.contains("journalled"), "{}", journalled.detail);
+        // A step with no `when` is always shown; a step with no `done` is done when its screen says.
+        assert!(plan_check(&r, "consent", Which::When).unwrap_err().passed);
+        assert!(!plan_check(&r, "speech", Which::Done).unwrap_err().passed);
         assert!(plan_check(&r, "nope", Which::Done).unwrap_err().detail.contains("no setup step"));
+        // The parser refuses a journalled check at load; were one there, it is still never sent.
+        let setup = r.manifest.as_mut().unwrap().setup.as_mut().unwrap();
+        setup.steps.push(serde_json::from_value(json!({ "id": "dial", "kind": "screen", "title": "Bad", "screen": "receptionist-home", "view": "phone",
+            "done": { "command": "call.dial", "path": "ok", "equals": true } })).unwrap());
+        let journalled = plan_check(&r, "dial", Which::Done).unwrap_err();
+        assert!(!journalled.passed && journalled.detail.contains("journalled"), "{}", journalled.detail);
     }
 
     #[tokio::test]
