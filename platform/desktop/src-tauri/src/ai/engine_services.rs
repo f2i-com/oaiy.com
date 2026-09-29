@@ -218,7 +218,7 @@ pub fn router(state: AiState) -> Router {
 /// `GET /api/ai/engine/services`.
 async fn list(State(st): State<AiState>) -> Response {
     let voice = voice_installed(&st).then(voice_entry).into_iter().collect::<Vec<_>>();
-    match engine_discovery().await {
+    match engine_discovery(&st).await {
         Ok((_, discovery)) => {
             let mut services = services_from_discovery(&discovery);
             services.extend(voice);
@@ -368,8 +368,8 @@ fn forwardable(discovery: &Value, path: &str) -> bool {
 }
 
 /// `/api/ai/engine/gateway/<gateway path>`: the call, sent on to the gateway and its answer streamed back.
-async fn forward(req: Request) -> Response {
-    match engine_discovery().await {
+async fn forward(State(st): State<AiState>, req: Request) -> Response {
+    match engine_discovery(&st).await {
         Ok((gateway, discovery)) => forward_to(&gateway, &discovery, req).await,
         Err(e) => ai_error(StatusCode::SERVICE_UNAVAILABLE, "engine_unavailable", e),
     }

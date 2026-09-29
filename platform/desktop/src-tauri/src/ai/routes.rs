@@ -33,6 +33,34 @@ pub struct AiState {
     /// The ChatGPT connector: a managed `codex` CLI child that owns its own
     /// OAuth. Not in the provider store — it has no API key to hold.
     pub codex: super::codex::CodexHandle,
+    /// Where the engines are, when a test says (the outer `Option`); otherwise
+    /// `http::engines_ui`, as everywhere else. Same seam as the control API's.
+    engines: Option<Option<String>>,
+}
+
+impl AiState {
+    pub fn new(providers: ProviderStoreHandle, registry: RegistryHandle, codex: super::codex::CodexHandle) -> Self {
+        Self { providers, registry, codex, engines: None }
+    }
+
+    /// Where the engines' control pages are (none: not running). What
+    /// `http::set_engines_ui` recorded, which is set where the engines are
+    /// found or started: the window's own (`engines::start`) or, on a headless
+    /// server, `OAIY_ENGINES_UI`. The gateway asks the same place `/api/engines*`,
+    /// the control API's tools and the Agent's model recommendation do.
+    pub(super) fn engines_ui(&self) -> Option<String> {
+        match &self.engines {
+            Some(own) => own.clone(),
+            None => crate::http::engines_ui(),
+        }
+    }
+
+    /// For tests: the engines are here (none: nowhere), whatever `http` says.
+    #[cfg(test)]
+    pub(crate) fn with_engines_at(mut self, ui: Option<String>) -> Self {
+        self.engines = Some(ui);
+        self
+    }
 }
 
 /// A provider's chat and model list, for the voice gateway on 17872 (behind its token):
@@ -51,15 +79,15 @@ pub const ENGINE_PROVIDER_ID: &str = "oaiy-engine";
 
 /// The engines' gateway and the model chosen in Engines, asked of the engines now
 /// (their control page's state gives the gateway, the gateway's discovery the model).
-async fn engine_now() -> Result<(String, String), String> {
-    let (gateway, discovery) = engine_discovery().await?;
+async fn engine_now(st: &AiState) -> Result<(String, String), String> {
+    let (gateway, discovery) = engine_discovery(st).await?;
     Ok((gateway, chosen_model(&discovery)))
 }
 
 /// The engines' gateway and its discovery document, asked of the engines now. Only
 /// asks: nothing is started (the gateway answers discovery from its configuration).
-pub(super) async fn engine_discovery() -> Result<(String, Value), String> {
-    let ui = engines_ui().ok_or("OAIY's engines are not running")?;
+pub(super) async fn engine_discovery(st: &AiState) -> Result<(String, Value), String> {
+    let ui = st.engines_ui().ok_or("OAIY's engines are not running")?;
     let client = reqwest::Client::builder().timeout(std::time::Duration::from_secs(4)).build().map_err(|e| e.to_string())?;
     let state: Value = client.get(format!("{}/api/state", ui.trim_end_matches('/'))).send().await.map_err(|e| format!("the engines did not answer: {e}"))?.json().await.map_err(|e| e.to_string())?;
     let gateway = state.get("gateway_url").and_then(Value::as_str).filter(|g| !g.is_empty()).ok_or("the engines have no gateway yet")?.trim_end_matches('/').to_string();
@@ -76,16 +104,6 @@ pub(super) fn chosen_model(discovery: &Value) -> String {
         .or_else(|| discovery.pointer("/models/llm").and_then(Value::as_array).and_then(|m| m.iter().find(|m| m.get("default").and_then(Value::as_bool) == Some(true))).and_then(|m| m.get("id")).and_then(Value::as_str))
         .unwrap_or("")
         .to_string()
-}
-
-/// Where the engines' control pages are: the window runs the engines; the headless server has none.
-#[cfg(feature = "gui")]
-fn engines_ui() -> Option<String> {
-    crate::engines::ui_url()
-}
-#[cfg(not(feature = "gui"))]
-fn engines_ui() -> Option<String> {
-    None
 }
 
 /// The engine as a provider record the gateway code can forward to.
@@ -298,7 +316,7 @@ async fn chat_impl(st: &AiState, provider_id: Option<&str>, mut body: Value) -> 
     }
     // Resolve the FULL provider under the lock, drop the guard before await.
     let provider = if provider_id == Some(ENGINE_PROVIDER_ID) {
-        match engine_now().await {
+        match engine_now(st).await {
             // The engine answers with the model chosen in Engines: a model named here would load another.
             Ok((gateway, model)) => {
                 if let Some(obj) = body.as_object_mut() {
@@ -381,7 +399,7 @@ async fn models_for(State(st): State<AiState>, Path(id): Path<String>) -> Respon
         };
     }
     let provider = if id == ENGINE_PROVIDER_ID {
-        match engine_now().await {
+        match engine_now(&st).await {
             Ok((gateway, model)) => Some(engine_provider(gateway, model)),
             Err(e) => return ai_error(StatusCode::SERVICE_UNAVAILABLE, "engine_unavailable", e),
         }
@@ -715,7 +733,7 @@ async fn list_ai_sources(State(st): State<AiState>) -> Response {
     }
 
     // ---- OAIY's own engine: the model chosen in Engines ----
-    if let Ok((gateway, model)) = engine_now().await {
+    if let Ok((gateway, model)) = engine_now(&st).await {
         sources.push(json!({
             "id": format!("provider:{ENGINE_PROVIDER_ID}"),
             "kind": "provider",
@@ -1053,5 +1071,200 @@ mod tests {
         assert!(source.get("destinationOrigin").is_none());
         assert!(source.get("baseUrl").is_none());
         assert!(source.get("apiKey").is_none());
+    }
+
+    // ---- the engines' routes where there is no window: a headless server told OAIY_ENGINES_UI ----
+    //
+    // These are not gated on the `gui` feature, so `cargo test --no-default-features` runs them
+    // against exactly the build that used to answer 503 whatever it was told.
+
+    use std::sync::{Arc, Mutex};
+
+    /// A stand-in for the engines: their control page (`/api/state`, which names the gateway) and
+    /// a gateway behind it (discovery, models, chat and one media route) that records what it is asked.
+    struct FakeEngines {
+        ui: String,
+        asked: Arc<Mutex<Vec<(&'static str, Value)>>>,
+        server: tokio::task::JoinHandle<()>,
+    }
+
+    impl Drop for FakeEngines {
+        fn drop(&mut self) {
+            self.server.abort();
+        }
+    }
+
+    async fn fake_engines() -> FakeEngines {
+        use axum::routing::{get, post};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let ui = format!("http://{}", listener.local_addr().unwrap());
+        let gateway = format!("{ui}/gw");
+        let asked: Arc<Mutex<Vec<(&'static str, Value)>>> = Arc::default();
+        let (chat_log, image_log) = (asked.clone(), asked.clone());
+        let app = Router::new()
+            .route("/api/state", get(move || async move { Json(json!({ "gateway_url": gateway })) }))
+            .route(
+                "/gw/v1/discovery",
+                get(|| async {
+                    Json(json!({
+                        "endpoints": [
+                            { "name": "chat", "path": "/v1/chat/completions", "spec": "openai" },
+                            { "name": "images", "path": "/v1/images/generations", "spec": "openai" },
+                        ],
+                        "models": {
+                            "llm": [{ "id": "flash", "default": true, "files_present": true }],
+                            "image": [{ "id": "qwen", "default": true, "files_present": true }],
+                        },
+                        "defaults": { "llm": "flash", "image": "qwen" },
+                    }))
+                }),
+            )
+            .route("/gw/v1/models", get(|| async { Json(json!({ "object": "list", "data": [{ "id": "flash", "object": "model" }] })) }))
+            .route(
+                "/gw/v1/chat/completions",
+                post(move |Json(body): Json<Value>| async move {
+                    chat_log.lock().unwrap().push(("chat", body));
+                    Json(json!({
+                        "id": "cmpl-1",
+                        "object": "chat.completion",
+                        "choices": [{ "index": 0, "message": { "role": "assistant", "content": "hello from the engine" }, "finish_reason": "stop" }],
+                    }))
+                }),
+            )
+            .route(
+                "/gw/v1/images/generations",
+                post(move |Json(body): Json<Value>| async move {
+                    image_log.lock().unwrap().push(("images", body));
+                    Json(json!({ "data": [{ "b64_json": "aGk=" }] }))
+                }),
+            );
+        let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        FakeEngines { ui, asked, server }
+    }
+
+    /// The AI routes with nothing else around them, told where the engines are (none: nowhere).
+    fn engine_routes(engines: Option<&FakeEngines>) -> (Router, crate::secret_file::testing::TempDir) {
+        let dir = crate::secret_file::testing::TempDir::new("engine-routes");
+        let registry = Arc::new(Mutex::new(crate::services::registry::Registry::empty(dir.0.join("data"), dir.0.join("models"))));
+        let state = AiState::new(crate::ai::providers::new_handle(), registry, crate::ai::codex::absent_for_tests())
+            .with_engines_at(engines.map(|e| e.ui.clone()));
+        (router(state), dir)
+    }
+
+    async fn ask(app: &Router, method: &str, path: &str, body: Option<Value>) -> (StatusCode, Value) {
+        use tower::ServiceExt as _;
+        let mut req = axum::http::Request::builder().method(method).uri(path);
+        let body = match body {
+            Some(b) => {
+                req = req.header("content-type", "application/json");
+                axum::body::Body::from(b.to_string())
+            }
+            None => axum::body::Body::empty(),
+        };
+        let resp = app.clone().oneshot(req.body(body).unwrap()).await.unwrap();
+        let status = resp.status();
+        let bytes = axum::body::to_bytes(resp.into_body(), 1 << 24).await.unwrap();
+        (status, serde_json::from_slice(&bytes).unwrap_or(Value::Null))
+    }
+
+    #[tokio::test]
+    async fn chat_through_the_engine_provider_reaches_the_engines_and_answers_with_the_chosen_model() {
+        let engines = fake_engines().await;
+        let (app, _dir) = engine_routes(Some(&engines));
+        let request = json!({ "model": "a-model-nobody-chose", "messages": [{ "role": "user", "content": "hi" }] });
+        let (status, answer) = ask(&app, "POST", "/api/ai/providers/oaiy-engine/v1/chat/completions", Some(request)).await;
+        assert_eq!(status, StatusCode::OK, "{answer}");
+        assert_eq!(answer["choices"][0]["message"]["content"], "hello from the engine");
+
+        let asked = engines.asked.lock().unwrap();
+        assert_eq!(asked.len(), 1, "one call reached the engines' gateway");
+        assert_eq!(asked[0].1["model"], "flash", "the model chosen in Engines, not the one the caller named");
+        assert_eq!(asked[0].1["messages"][0]["content"], "hi");
+    }
+
+    #[tokio::test]
+    async fn the_engine_provider_lists_the_engines_models() {
+        let engines = fake_engines().await;
+        let (app, _dir) = engine_routes(Some(&engines));
+        let (status, models) = ask(&app, "GET", "/api/ai/providers/oaiy-engine/v1/models", None).await;
+        assert_eq!(status, StatusCode::OK, "{models}");
+        assert_eq!(models["data"][0]["id"], "flash");
+    }
+
+    #[tokio::test]
+    async fn the_engines_models_are_listed_as_flow_services_when_they_run() {
+        let engines = fake_engines().await;
+        let (app, _dir) = engine_routes(Some(&engines));
+        let (status, listed) = ask(&app, "GET", "/api/ai/engine/services", None).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(listed["running"], true, "{listed}");
+        let ids: Vec<&str> = listed["services"].as_array().unwrap().iter().map(|s| s["id"].as_str().unwrap()).collect();
+        assert_eq!(ids, ["engine:llm:flash", "engine:image:qwen"]);
+    }
+
+    #[tokio::test]
+    async fn a_media_call_is_forwarded_to_the_engines_gateway_and_a_chat_call_is_not() {
+        let engines = fake_engines().await;
+        let (app, _dir) = engine_routes(Some(&engines));
+        let (status, made) = ask(&app, "POST", "/api/ai/engine/gateway/v1/images/generations", Some(json!({ "prompt": "a cat" }))).await;
+        assert_eq!(status, StatusCode::OK, "{made}");
+        assert_eq!(made["data"][0]["b64_json"], "aGk=");
+        assert_eq!(engines.asked.lock().unwrap()[0], ("images", json!({ "prompt": "a cat" })));
+
+        // The language model is reached as the `oaiy-engine` provider, never through this route.
+        let (status, refused) = ask(&app, "POST", "/api/ai/engine/gateway/v1/chat/completions", Some(json!({ "messages": [] }))).await;
+        assert_eq!((status, refused["error"]["code"].as_str()), (StatusCode::NOT_FOUND, Some("not_forwarded")), "{refused}");
+        assert_eq!(engines.asked.lock().unwrap().len(), 1, "the chat call went nowhere");
+    }
+
+    #[tokio::test]
+    async fn the_engine_is_one_of_the_sources_a_flow_can_pick() {
+        let engines = fake_engines().await;
+        let (app, _dir) = engine_routes(Some(&engines));
+        let (status, sources) = ask(&app, "GET", "/api/ai/sources", None).await;
+        assert_eq!(status, StatusCode::OK);
+        let engine = sources["sources"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|s| s["providerId"] == ENGINE_PROVIDER_ID)
+            .unwrap_or_else(|| panic!("the engine is not listed: {sources}"));
+        assert_eq!(engine["name"], "OAIY engine (flash)");
+        assert_eq!(engine["status"], "running");
+        assert_eq!(engine["url"], format!("{}/gw/v1", engines.ui));
+    }
+
+    #[tokio::test]
+    async fn with_no_engines_running_every_engine_route_says_so() {
+        let (app, _dir) = engine_routes(None);
+        let request = json!({ "messages": [{ "role": "user", "content": "hi" }] });
+        let (status, refused) = ask(&app, "POST", "/api/ai/providers/oaiy-engine/v1/chat/completions", Some(request)).await;
+        assert_eq!((status, refused["error"]["code"].as_str()), (StatusCode::SERVICE_UNAVAILABLE, Some("engine_unavailable")), "{refused}");
+        let (status, refused) = ask(&app, "GET", "/api/ai/providers/oaiy-engine/v1/models", None).await;
+        assert_eq!((status, refused["error"]["code"].as_str()), (StatusCode::SERVICE_UNAVAILABLE, Some("engine_unavailable")), "{refused}");
+        let (status, refused) = ask(&app, "POST", "/api/ai/engine/gateway/v1/images/generations", Some(json!({}))).await;
+        assert_eq!((status, refused["error"]["code"].as_str()), (StatusCode::SERVICE_UNAVAILABLE, Some("engine_unavailable")), "{refused}");
+
+        let (_, listed) = ask(&app, "GET", "/api/ai/engine/services", None).await;
+        assert_eq!(listed["running"], false, "{listed}");
+        let (_, sources) = ask(&app, "GET", "/api/ai/sources", None).await;
+        assert!(sources["sources"].as_array().unwrap().iter().all(|s| s["providerId"] != ENGINE_PROVIDER_ID), "{sources}");
+    }
+
+    /// The seam the tests above use is not what production goes through. On a headless server
+    /// `oaiy-server` records `OAIY_ENGINES_UI` with `http::set_engines_ui`, and the window
+    /// records its own engines the same way: the gateway asks that, and nothing else.
+    #[test]
+    fn by_default_the_gateway_asks_where_http_recorded_the_engines() {
+        let dir = crate::secret_file::testing::TempDir::new("engines-recorded");
+        let state = AiState::new(
+            crate::ai::providers::new_handle(),
+            Arc::new(Mutex::new(crate::services::registry::Registry::empty(dir.0.join("data"), dir.0.join("models")))),
+            crate::ai::codex::absent_for_tests(),
+        );
+        crate::http::set_engines_ui("http://127.0.0.1:9");
+        let recorded = state.engines_ui();
+        crate::http::clear_engines_ui();
+        assert_eq!(recorded.as_deref(), Some("http://127.0.0.1:9"));
     }
 }

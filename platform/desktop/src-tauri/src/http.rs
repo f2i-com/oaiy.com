@@ -777,6 +777,14 @@ pub fn set_engines_ui(url: &str) {
     }
 }
 
+/// For tests: no engines are recorded again.
+#[cfg(test)]
+pub(crate) fn clear_engines_ui() {
+    if let Ok(mut g) = ENGINES_UI.write() {
+        *g = None;
+    }
+}
+
 /// `GET /api/engines`: the engines' state for the window — the language model
 /// (loaded or not, which one), the GPUs, where their pages are. Their control
 /// port answers only its own origin, so the desktop asks it for the window.
@@ -1499,11 +1507,7 @@ pub async fn serve(
     // The AI gateway is its own sub-router with its own state (provider store +
     // registry clone), merged INSIDE the guard layers like the bridge — provider
     // CRUD and the credential-injecting chat proxy need the same origin/token gate.
-    let ai_state = crate::ai::AiState {
-        providers: ai_providers,
-        registry: registry_for_ai,
-        codex: ai_codex,
-    };
+    let ai_state = crate::ai::AiState::new(ai_providers, registry_for_ai, ai_codex);
     // Aokie's gateway (17872): calls, and a provider's chat for Aokie's own speech lanes.
     tokio::spawn(crate::voice::serve_gateway(voice, crate::ai::provider_chat_router(ai_state.clone())));
     let ai_routes = crate::ai::ai_router(ai_state);

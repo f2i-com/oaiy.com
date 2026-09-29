@@ -564,6 +564,18 @@ pub fn new_handle(data_dir: &Path) -> CodexHandle {
     CodexAgent::with_connect(data_dir.join("ai").join("codex-home"), Arc::new(spawn_codex))
 }
 
+/// For tests of the routes that ask what ChatGPT can do: the CLI is never there,
+/// so nothing is launched (a developer's machine may well have a real one).
+#[cfg(test)]
+pub(crate) fn absent_for_tests() -> CodexHandle {
+    CodexAgent::with_connect(
+        PathBuf::from("no-codex-home"),
+        Arc::new(|_home: &Path| -> Result<Transport, CodexError> {
+            Err(CodexError::Unavailable("the codex CLI is not installed (a test)".into()))
+        }),
+    )
+}
+
 impl CodexAgent {
     fn with_connect(codex_home: PathBuf, connect: Connect) -> CodexHandle {
         Arc::new(CodexAgent {
