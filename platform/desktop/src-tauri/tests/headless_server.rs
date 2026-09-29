@@ -65,12 +65,21 @@ impl Server {
         // Nothing of this environment but what a program needs to run: a developer's shell may
         // hold the real server's token, and the server must not take its port or folders from it.
         command.env_clear();
-        for name in ["PATH", "SystemRoot", "SYSTEMROOT", "windir", "COMSPEC", "PATHEXT", "TEMP", "TMP", "TMPDIR", "LANG"] {
+        for name in ["SystemRoot", "SYSTEMROOT", "windir", "COMSPEC", "PATHEXT", "TEMP", "TMP", "TMPDIR", "LANG"] {
             if let Some(value) = std::env::var_os(name) {
                 command.env(name, value);
             }
         }
+        // The system's own folders and no others: enough for `sh` and `sleep` (the plugin tests)
+        // and `cmd`, and not the developer's `codex` CLI, which the AI sources route would launch.
+        let path = if cfg!(windows) {
+            let root = std::env::var("SystemRoot").unwrap_or_else(|_| r"C:\Windows".into());
+            format!(r"{root}\System32;{root}")
+        } else {
+            "/usr/bin:/bin".to_string()
+        };
         command
+            .env("PATH", path)
             .env("HOME", &scratch.0)
             .env("USERPROFILE", &scratch.0)
             .env("OAIY_DATA_DIR", &data)
