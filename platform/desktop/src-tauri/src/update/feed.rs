@@ -136,6 +136,24 @@ pub fn current_platform_key() -> Option<&'static str> {
     platform_key(std::env::consts::OS, std::env::consts::ARCH)
 }
 
+/// Where an installer may be downloaded from: this project's release assets on github.com.
+const ASSET_HOST: &str = "github.com";
+const ASSET_PATH_PREFIX: &str = "/f2i-com/oaiy.com/releases/download/";
+
+/// Whether `url` is a release asset of this project on GitHub, over https, with nothing to redirect the eye
+/// (no credentials, no other port). The installer is checked against its signature whatever its address; this
+/// is the second door, so that a feed that names another host is refused before anything is fetched from it.
+pub fn check_asset_url(url: &str) -> Result<(), String> {
+    let refuse = || Err(format!("The update points at an address that is not one of OAIY's releases on GitHub ({url}), so it was refused."));
+    let Ok(parsed) = url::Url::parse(url) else { return refuse() };
+    let plain = parsed.scheme() == "https" && parsed.host_str() == Some(ASSET_HOST) && parsed.port().is_none() && parsed.username().is_empty() && parsed.password().is_none() && parsed.query().is_none() && parsed.fragment().is_none();
+    if plain && parsed.path().starts_with(ASSET_PATH_PREFIX) && parsed.path().len() > ASSET_PATH_PREFIX.len() {
+        Ok(())
+    } else {
+        refuse()
+    }
+}
+
 /// A newer release, for this platform.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Release {
@@ -347,6 +365,33 @@ mod tests {
         let feed = parse_json(&feed_json()).unwrap();
         assert_eq!(evaluate(&feed, "0.1.0", None), Verdict::NoUpdateForPlatform { latest: "0.2.0".into() });
         assert_eq!(evaluate(&feed, "0.1.0", Some("darwin-aarch64")), Verdict::NoUpdateForPlatform { latest: "0.2.0".into() });
+    }
+
+    #[test]
+    fn an_installer_may_only_come_from_this_projects_releases_on_github_over_https() {
+        let ok = "https://github.com/f2i-com/oaiy.com/releases/download/v0.2.0/oaiy-desktop-0.2.0-windows-x64-setup.exe";
+        assert!(check_asset_url(ok).is_ok());
+        assert!(check_asset_url("https://GitHub.com/f2i-com/oaiy.com/releases/download/0.2.0/x.AppImage").is_ok());
+        for bad in [
+            "http://github.com/f2i-com/oaiy.com/releases/download/v0.2.0/x.exe",
+            "https://github.com.evil.example/f2i-com/oaiy.com/releases/download/v0.2.0/x.exe",
+            "https://evil.example/f2i-com/oaiy.com/releases/download/v0.2.0/x.exe",
+            "https://github.com@evil.example/f2i-com/oaiy.com/releases/download/v0.2.0/x.exe",
+            "https://user:pw@github.com/f2i-com/oaiy.com/releases/download/v0.2.0/x.exe",
+            "https://github.com:8443/f2i-com/oaiy.com/releases/download/v0.2.0/x.exe",
+            "https://github.com/someone-else/oaiy.com/releases/download/v0.2.0/x.exe",
+            "https://github.com/f2i-com/oaiy.com/archive/main.zip",
+            "https://github.com/f2i-com/oaiy.com/releases/download/",
+            "https://github.com/f2i-com/oaiy.com/releases/download/../../../evil/x.exe",
+            "https://github.com/f2i-com/oaiy.com/releases/download/v0.2.0/x.exe?token=1",
+            "https://github.com/f2i-com/oaiy.com/releases/download/v0.2.0/x.exe#frag",
+            "file:///C:/x.exe",
+            "not a url",
+            "",
+        ] {
+            assert!(check_asset_url(bad).is_err(), "{bad}");
+        }
+        assert!(check_asset_url("http://evil.example/x.exe").unwrap_err().contains("http://evil.example/x.exe"));
     }
 
     #[test]

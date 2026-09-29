@@ -69,7 +69,7 @@ pub enum AutoUpdate {
     No(String),
 }
 
-type BoxFuture<'a, T> = std::pin::Pin<Box<dyn std::future::Future<Output = T> + Send + 'a>>;
+pub type BoxFuture<'a, T> = std::pin::Pin<Box<dyn std::future::Future<Output = T> + Send + 'a>>;
 
 /// What differs between the desktop and the headless server.
 pub trait Platform: Send + Sync {
@@ -408,15 +408,15 @@ impl Updater {
         }
     }
 
-    /// Check the feed: [`begin_check`](Self::begin_check), read it, and record what it says.
-    pub async fn check(&self) -> Result<Status, CheckRefusal> {
+    /// Check the feed: [`begin_check`](Self::begin_check), read it, and record what it says (read it with [`status`](Self::status)).
+    pub async fn check(&self) -> Result<(), CheckRefusal> {
         self.begin_check(Instant::now())?;
         // A check whose future is dropped half way (the app is closing a task) must not leave the state on "checking".
         let mut guard = CheckGuard { updater: self, done: false };
         let outcome = self.read_feed().await;
         guard.done = true;
         self.finish_check(outcome);
-        Ok(self.status())
+        Ok(())
     }
 
     async fn read_feed(&self) -> Result<Verdict, String> {
@@ -425,7 +425,7 @@ impl Updater {
         // A build that cannot install (an MSI, a .deb, a headless server) still tells there is something newer.
         let key = *self.platform_key.read().unwrap_or_else(|e| e.into_inner());
         let verdict = feed::evaluate(&feed, &self.current, key);
-        if let Verdict::Available(release) = &verdict {
+        if let (Verdict::Available(release), AutoUpdate::Yes) = (&verdict, platform.auto_update()) {
             platform.prepare(release).await?;
         }
         Ok(verdict)
@@ -850,6 +850,42 @@ pub(crate) mod tests {
         assert!(s.manual_reason.unwrap().contains("never replaces itself"));
         assert!(matches!(u.begin_download(), Err(DownloadRefusal::NotPossibleHere(_))));
         assert!(matches!(u.begin_install(now + LONG), Err(InstallRefusal::NotPossibleHere(_))));
+    }
+
+    #[tokio::test]
+    async fn a_build_that_cannot_install_is_not_asked_to_get_ready_for_one_and_one_that_can_is() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        struct Counting(AutoUpdate, Arc<AtomicUsize>, Option<String>);
+        impl Platform for Counting {
+            fn auto_update(&self) -> AutoUpdate {
+                self.0.clone()
+            }
+            fn prepare<'a>(&'a self, _release: &'a Release) -> BoxFuture<'a, Result<(), String>> {
+                self.1.fetch_add(1, Ordering::SeqCst);
+                let failure = self.2.clone();
+                Box::pin(async move { failure.map_or(Ok(()), Err) })
+            }
+        }
+        // A one-request server standing in for the release feed.
+        let feed = serde_json::json!({"version": "0.2.0", "platforms": {"windows-x86_64": {"signature": "c2ln", "url": "https://github.com/f2i-com/oaiy.com/releases/download/v0.2.0/x.exe"}}}).to_string();
+        let app = axum::Router::new().route("/latest.json", axum::routing::get(move || { let feed = feed.clone(); async move { feed } }));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}/latest.json", listener.local_addr().unwrap());
+        tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        let source = FeedSource { url, insecure: true };
+        for (auto, prepared, failure, state) in [
+            (AutoUpdate::No("manual".into()), 0, None, State::Available),
+            (AutoUpdate::Yes, 1, None, State::Available),
+            // Not being able to get ready (the plugin found nothing, say) is a failed check, not an available update.
+            (AutoUpdate::Yes, 1, Some("The update information changed. Check again.".to_string()), State::Failed),
+        ] {
+            let count = Arc::new(AtomicUsize::new(0));
+            let u = Updater::new("0.1.0", source.clone(), Instant::now());
+            u.set_platform_key(Some("windows-x86_64"));
+            u.set_platform(Arc::new(Counting(auto, count.clone(), failure)));
+            u.check().await.unwrap();
+            assert_eq!((count.load(Ordering::SeqCst), u.status().state), (prepared, state));
+        }
     }
 
     #[test]

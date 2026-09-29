@@ -15,19 +15,28 @@
 //! - [`check`]: reading it over https, with a size cap and https-only redirects;
 //! - [`verify`]: the signature check that turns downloaded bytes into a [`VerifiedPackage`], the
 //!   only thing that can be installed;
+//! - [`kind`]: whether this install can replace itself (the NSIS setup.exe and the AppImage can; an MSI, a
+//!   .deb, an .rpm and a development build cannot);
 //! - [`blockers`]: what stops an install, in words;
 //! - [`updater`]: the state everything above feeds, and the moves between states;
 //! - [`install`]: the safe order of an install, and the stop it shares with quitting;
 //! - [`routes`]: `GET /api/update/status` and `POST /api/update/check`.
+//!
+//! The desktop adds `update::gui` (the updater plugin: the handle on the release, the download
+//! with progress, the hand-off to the installer, and the commands) behind the `gui` feature.
 
 pub mod blockers;
 pub mod check;
 pub mod feed;
 pub mod install;
+pub mod kind;
 pub mod routes;
 pub mod updater;
 pub mod verify;
 pub mod version;
+
+#[cfg(feature = "gui")]
+pub mod gui;
 
 pub use updater::{Updater, UpdaterHandle};
 pub use verify::VerifiedPackage;

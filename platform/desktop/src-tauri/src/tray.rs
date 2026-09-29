@@ -26,12 +26,29 @@ pub fn show_main(app: &tauri::AppHandle) {
     }
 }
 
+/// "Check for updates": show OAIY on its Settings page, where the answer is, and look. (The check is limited to one
+/// in 30 seconds, like every other way of asking; a refusal only means the page already shows the last answer.)
+fn check_for_updates(app: &tauri::AppHandle) {
+    use tauri::Emitter as _;
+    show_main(app);
+    let _ = app.emit(crate::control::NAVIGATE_EVENT, serde_json::json!({ "view": "settings" }));
+    if let Some(updater) = app.try_state::<crate::update::UpdaterHandle>() {
+        let updater = updater.inner().clone();
+        tauri::async_runtime::spawn(async move {
+            if let Err(refusal) = updater.check().await {
+                log::info!("update: the check from the tray did not run: {refusal}");
+            }
+        });
+    }
+}
+
 pub fn setup(app: &mut App) -> Result<(), Box<dyn std::error::Error>> {
     let handle = app.handle();
 
     let open_item = MenuItem::with_id(handle, "open", "Open OAIY", true, None::<&str>)?;
+    let update_item = MenuItem::with_id(handle, "update-check", "Check for updates", true, None::<&str>)?;
     let quit_item = MenuItem::with_id(handle, "quit", "Quit", true, None::<&str>)?;
-    let menu = Menu::with_items(handle, &[&open_item, &quit_item])?;
+    let menu = Menu::with_items(handle, &[&open_item, &update_item, &quit_item])?;
 
     let mut builder = TrayIconBuilder::with_id("oaiy-desktop")
         .menu(&menu)
@@ -47,6 +64,7 @@ pub fn setup(app: &mut App) -> Result<(), Box<dyn std::error::Error>> {
             "open" => {
                 show_main(app);
             }
+            "update-check" => check_for_updates(app),
             "quit" => {
                 app.exit(0);
             }

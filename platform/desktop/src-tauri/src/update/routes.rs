@@ -42,7 +42,7 @@ async fn status(State(updater): State<UpdaterHandle>) -> axum::response::Respons
 
 async fn check(State(updater): State<UpdaterHandle>) -> axum::response::Response {
     match updater.check().await {
-        Ok(status) => Json(status).into_response(),
+        Ok(()) => status(State(updater)).await,
         Err(refusal) => {
             let (code, http) = match &refusal {
                 CheckRefusal::TooSoon { .. } => ("too_soon", StatusCode::TOO_MANY_REQUESTS),
@@ -53,7 +53,8 @@ async fn check(State(updater): State<UpdaterHandle>) -> axum::response::Response
                 CheckRefusal::TooSoon { retry_in } => Some(*retry_in),
                 _ => None,
             };
-            let mut response = (http, Json(json!({"error": {"code": code, "message": refusal.to_string()}, "retryAfterSeconds": retry, "status": updater.status()}))).into_response();
+            let now = { let updater = updater.clone(); tokio::task::spawn_blocking(move || updater.status()).await.ok() };
+            let mut response = (http, Json(json!({"error": {"code": code, "message": refusal.to_string()}, "retryAfterSeconds": retry, "status": now}))).into_response();
             if let Some(seconds) = retry {
                 if let Ok(value) = axum::http::HeaderValue::from_str(&seconds.to_string()) {
                     response.headers_mut().insert(axum::http::header::RETRY_AFTER, value);

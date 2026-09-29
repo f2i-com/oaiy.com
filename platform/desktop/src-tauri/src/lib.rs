@@ -1071,6 +1071,18 @@ fn restart_app(app: tauri::AppHandle) {
     }
 }
 
+/// Tauri command: whether OAIY looks for a newer release by itself (a little after it starts, then daily). On unless
+/// switched off; a check asked for in Settings works either way. Only the dashboard's own window may change it.
+#[tauri::command]
+fn set_update_auto_check(webview: tauri::Webview, app: tauri::AppHandle, updater: tauri::State<Arc<crate::update::Updater>>, enabled: bool) -> Result<(), String> {
+    if !crate::update::gui::is_dashboard(webview.label()) {
+        return Err("Only OAIY's own window can change that.".into());
+    }
+    write_config_str(&app, "updateCheck", if enabled { None } else { Some("off") })?;
+    updater.set_auto_check(enabled);
+    Ok(())
+}
+
 /// The data dir the *next* launch will use — the configured override, or
 /// the OS default when none/reset. Mirrors `config_snapshot`'s `effective`.
 fn pending_data_dir(app: &tauri::AppHandle) -> PathBuf {
@@ -1167,6 +1179,8 @@ pub fn run() {
         .plugin(tauri_plugin_shell::init())
         .plugin(tauri_plugin_dialog::init())
         .plugin(tauri_plugin_notification::init())
+        // Newer releases. Only its Rust API is used (update::gui): no webview is granted its commands.
+        .plugin(crate::update::gui::plugin())
         // The agent and the flow editor, shown in the window beside the sidebar.
         .register_uri_scheme_protocol(crate::embed::AGENT_SCHEME, |ctx, request| crate::embed::serve(ctx.app_handle(), crate::embed::Page::Agent, &request))
         .register_uri_scheme_protocol(crate::embed::FLOWS_SCHEME, |ctx, request| crate::embed::serve(ctx.app_handle(), crate::embed::Page::Flows, &request))
@@ -1188,6 +1202,10 @@ pub fn run() {
             migration_status,
             get_hf_token_status,
             set_hf_token,
+            crate::update::gui::update_check,
+            crate::update::gui::update_download,
+            crate::update::gui::update_install,
+            set_update_auto_check,
             list_model_dirs,
             add_model_dir,
             remove_model_dir,
@@ -1322,6 +1340,7 @@ pub fn run() {
             app.manage(catalog.clone());
             // Poll-able state for an in-progress data-folder migration.
             let migration: MigrationHandle = Arc::new(Mutex::new(MigrationProgress::default()));
+            let migration_for_updates = migration.clone();
             app.manage(migration);
 
             // Spawn the localhost HTTP server on its own task. Errors here
@@ -1378,8 +1397,15 @@ pub fn run() {
                 log::warn!("lanAccess is on — the API will bind every interface on port {server_port}");
             }
             // What is known of newer releases, shared by the local API's routes, the window's commands and the tray.
-            let updater = crate::update::Updater::new(env!("CARGO_PKG_VERSION"), crate::update::FeedSource::from_env(), std::time::Instant::now());
+            let feed = crate::update::FeedSource::from_env();
+            let strict_assets = !feed.insecure;
+            let updater = crate::update::Updater::new(env!("CARGO_PKG_VERSION"), feed, std::time::Instant::now());
+            // Looking for updates by itself (a little after start, then daily) is on unless the person switched it off.
+            updater.set_auto_check(read_config_str(app.handle(), "updateCheck").as_deref() != Some("off"));
+            let update_store = Arc::new(crate::update::gui::Store::default());
             app.manage(updater.clone());
+            app.manage(update_store.clone());
+            crate::update::gui::spawn_scheduler(updater.clone());
             tauri::async_runtime::spawn(async move {
                 // Bridge state. The plugins root sits under the data dir so a
                 // relocated data folder takes its plugins with it — plugins hold
@@ -1389,6 +1415,21 @@ pub fn run() {
                 // (or the system one) per run.
                 let node_for_http =
                     crate::services::node_runtime::new_handle(data_dir_for_bridge.clone());
+                // What an update looks at before it restarts OAIY: calls, tasks, downloads, installs, the engines' media.
+                crate::update::gui::attach(
+                    &updater,
+                    &app_for_http,
+                    update_store,
+                    strict_assets,
+                    crate::update::blockers::Probes {
+                        downloads: Some(downloads_for_http.clone()),
+                        registry: Some(registry_for_http.clone()),
+                        python: Some(python_for_http.clone()),
+                        node: Some(node_for_http.clone()),
+                        engines: Some(Arc::new(crate::engines::activity)),
+                        migration: Some(Arc::new(move || migration_for_updates.lock().map(|m| m.running).unwrap_or(false))),
+                    },
+                );
                 let bridge_for_http = crate::build_bridge_state(
                     plugins_root_for_http.clone(),
                     data_dir_for_bridge.clone(),
@@ -1609,26 +1650,14 @@ pub fn run() {
                 // processes. Done synchronously — the user just clicked
                 // Quit and is waiting; a few hundred ms is fine.
                 RunEvent::Exit => {
-                    // The engines this desktop started (their model servers are children).
-                    crate::engines::stop();
-                    // The warm script host first of all: it is one Node child
-                    // that exits on a line, and a plugin event arriving during
-                    // the stops below must not start another.
-                    crate::bridge::ScriptHost::global().shutdown();
-                    // Plugins next: they are lighter to stop than model servers,
-                    // and a plugin holding hardware (Aokie's dongle) should get
-                    // its graceful shutdown before anything slow runs.
-                    if let Some(host) = app_handle.try_state::<std::sync::Arc<crate::plugins::PluginHost>>() {
-                        log::info!("stopping all plugins on exit");
-                        host.stop_all();
-                    }
-                    if let Some(reg) = app_handle.try_state::<RegistryHandle>() {
-                        // Recover from a poisoned mutex — stopping services on exit
-                        // matters more than poison-safety (else they're orphaned).
-                        let mut r = reg.lock().unwrap_or_else(|e| e.into_inner());
-                        log::info!("stopping all services on exit");
-                        r.stop_all();
-                    }
+                    // The same stop an update makes before it hands over to the installer
+                    // (update::install), in this order: the engines this desktop started
+                    // (their model servers are children); the warm script host, one Node
+                    // child that exits on a line (a plugin event arriving during the stops
+                    // below must not start another); the plugins, lighter to stop than model
+                    // servers (one holding hardware, Aokie's dongle, should get its graceful
+                    // shutdown before anything slow runs); then the services.
+                    crate::update::gui::stop_on_exit(app_handle);
                 }
                 _ => {}
             }

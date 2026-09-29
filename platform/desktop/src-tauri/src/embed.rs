@@ -50,7 +50,7 @@ impl Page {
         }
     }
 
-    fn label(self) -> &'static str {
+    pub(crate) fn label(self) -> &'static str {
         match self {
             Page::Agent => "embed-agent",
             Page::Flows => "embed-flows",
@@ -302,6 +302,11 @@ pub async fn agent_intent<R: Runtime>(app: AppHandle<R>, intent: String) -> Resu
         .get_webview(Page::Agent.label())
         .ok_or("the Agent is not open: open it once from the sidebar, then try again")?;
     webview.eval(intent_script(&intent)).map_err(|e| e.to_string())
+}
+
+/// The Agent's page, when it exists (hidden or shown): what the desktop asks to save its work before an update.
+pub fn agent_webview<R: Runtime>(app: &AppHandle<R>) -> Option<tauri::Webview<R>> {
+    app.get_webview(Page::Agent.label())
 }
 
 /// A link that leaves an embedded page: to the system browser.
