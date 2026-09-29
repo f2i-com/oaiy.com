@@ -41,9 +41,10 @@ const RUNTIME_TOKENS = new Set([
 /**
  * Tokens set on an element by a rule or an inline style rather than on a theme
  * root: --node on canvas nodes, --tone on landing-page sections (each section
- * sets the signal colour its rail, list markers and chips read).
+ * sets the signal colour its rail, list markers and chips read), --depth on the
+ * Agent's file-tree rows (tree.ts sets each row's nesting inline).
  */
-const LOCAL_TOKENS = new Set(['--node', '--tone']);
+const LOCAL_TOKENS = new Set(['--node', '--tone', '--depth']);
 
 const stripComments = (s) => s.replace(/\/\*[\s\S]*?\*\//g, '');
 
@@ -59,7 +60,7 @@ for (const sheet of SHEETS) {
   }
   const css = stripComments(fs.readFileSync(sheet.file, 'utf8'));
 
-  const declared = new Set([...css.matchAll(/^\s*(--[\w-]+)\s*:/gm)].map((m) => m[1]));
+  const declared = new Set([...css.matchAll(/(?:^|[{;])\s*(--[\w-]+)\s*:/gm)].map((m) => m[1]));
   const referenced = new Set([...css.matchAll(/var\(\s*(--[\w-]+)/g)].map((m) => m[1]));
 
   const missing = [...referenced].filter((t) => !declared.has(t) && !RUNTIME_TOKENS.has(t) && !LOCAL_TOKENS.has(t)).sort();
