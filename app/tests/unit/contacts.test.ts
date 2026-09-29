@@ -363,5 +363,16 @@ describe('a contact kept in the note', () => {
     expect(contactKey('+61491570006')).toBe('491570006');
     expect(contactKey('test')).toBe('');
     expect(contactKey('1234567')).toBe('');
+    // A hidden caller's conversation goes by its call's id, which may hold digits: never a contact.
+    expect(contactKey('3f2a9c4e-1234-5678-9abc-def012345678')).toBe('');
+  });
+
+  it("a hidden caller's remembered facts stay here: nothing is sent to the desktop for them", async () => {
+    const { sessions, desk } = setup();
+    const { note, desk: said } = await sessions.noteCaller('3f2a9c4e-1234-5678-9abc-def012345678', { add: 'Asked about prices' });
+    expect(note.facts).toEqual(['Asked about prices']);
+    expect(note.unsent).toBeUndefined();
+    expect(said).toBe('');
+    expect(desk.requests).toEqual([]);
   });
 });

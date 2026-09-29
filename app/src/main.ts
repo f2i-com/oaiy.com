@@ -703,7 +703,8 @@ async function main(): Promise<void> {
         },
         // The phone greets a caller by the name its agents know (a cleared name is forgotten there too).
         named: (note) => {
-          void desktop?.rememberCaller(note.number, note.name ?? '').catch(() => {});
+          // (Not a hidden caller's: their conversation goes by the call's id, never a number to name.)
+          if (contactKey(note.number)) void desktop?.rememberCaller(note.number, note.name ?? '').catch(() => {});
         },
         event: (session, event) => {
           noteModelEvent(event);
@@ -1952,7 +1953,7 @@ With that done, Settings → Images, video and audio → Find OAIY sets it up.`)
     // Each person once, by their number in E.164 (the desktop matches it to the caller id however the phone writes it).
     const names = new Map<string, string>();
     for (const t of sessions.threads()) if (t.kind === 'person' && !t.hidden && t.key !== TEST_NUMBER && t.title && t.title !== t.key) names.set(t.key, t.title);
-    for (const c of sessions.callers) if (c.name && c.number !== TEST_NUMBER) names.set(c.number, c.name);
+    for (const c of sessions.callers) if (c.name && c.number !== TEST_NUMBER && contactKey(c.number)) names.set(c.number, c.name);
     for (const [number, name] of names) void d.rememberCaller(number, name).catch(() => {});
   }
 

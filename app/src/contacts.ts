@@ -26,6 +26,8 @@ export const TEXT_CONTACT_WAIT_MS = 1_500;
  * (a hidden caller, the pretend conversation, fewer than eight digits).
  */
 export function contactKey(number: string): string {
+  // Only a number written as one: a hidden caller's conversation goes by its call's id, which may hold digits too.
+  if (!/^\+?[\d\s().-]+$/.test(number.trim())) return '';
   const digits = number.replace(/\D/g, '');
   if (digits.length < 8 || /^0+$/.test(digits)) return '';
   return digits.slice(-9);
