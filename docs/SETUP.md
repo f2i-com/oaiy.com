@@ -81,3 +81,12 @@ skipped, and which setup version of each plugin was finished.
   model from ChatGPT's list. Phone calls keep their own fast route either way.
 
 Setup can be run again from **Settings** at any time.
+
+## Settings → Backup and restore
+
+Before you change computers, or before a big change, make a backup here: one encrypted file
+of your contacts, calendar, conversations, flows, triggers, settings and plugin data, protected
+by a passphrase that only you know (a lost passphrase is a lost backup). On a new computer,
+run the first-run wizard, then restore the file from the same place; the credentials (the
+FormLogic link, the phone pairing, the ChatGPT sign-in, your provider keys) are never in a
+backup, so the restore lists what to set up again. See [BACKUP.md](BACKUP.md).
