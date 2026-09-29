@@ -319,6 +319,12 @@ const KEY_A = 'sk-ant-api03-AAAA-secret-value-1';
 const KEY_B = 'sk-proj-BBBB-secret-value-2';
 const bytesOf = (v) => Buffer.from(v.data).toString('latin1') + Buffer.from(v.iv).toString('latin1');
 const plainStored = (w) => w.storage.raw.get(PLAIN) ?? null;
+/** What `promise` settles with, or 'HUNG' if it has not settled in `ms`: a hung call fails a test rather than hanging it. */
+const orHung = (promise, ms = 3000) => {
+  let timer;
+  const hung = new Promise((resolve) => { timer = setTimeout(() => resolve('HUNG'), ms); });
+  return Promise.race([promise, hung]).finally(() => clearTimeout(timer));
+};
 
 // ---------------------------------------------------------------------------
 // Seal and unseal
@@ -762,12 +768,18 @@ await check('a wiped database under a live page: reads and saves go on, on a fre
   assert.deepEqual(w.warns, [], 'not a failure');
 });
 
-await check('a connection closed without a word is replaced once, and the save goes through', async () => {
+await check('a connection closed without a word is replaced once, and the read and the save go through the store', async () => {
   const w = world();
   const vault = w.load();
   await vault.set('A', KEY_A);
   w.idb.closeQuietly();
+  assert.deepEqual(await vault.get(['A']), { A: KEY_A });
+  assert.deepEqual(w.warns, [], 'a read on a closed connection is retried, not given up on');
+  w.idb.closeQuietly();
   await vault.set('B', KEY_B);
+  assert.equal(plainStored(w), null, 'and so is a save: it did not fall back to plaintext');
+  assert.deepEqual([...w.idb.raw('secrets').keys()].sort(), ['A', 'B'], 'B is sealed in the store');
+  assert.deepEqual(w.warns, [], 'and nothing was said');
   assert.deepEqual(await vault.get(['A', 'B']), { A: KEY_A, B: KEY_B });
 });
 
@@ -793,6 +805,36 @@ await check('a store that fails mid-session: reads fall back to what this tab ho
   assert.deepEqual(await vault.get(['A']), { A: KEY_A }, 'from what this tab last saw');
   assert.deepEqual(await vault.get(['A', 'B']), { A: KEY_A });
   assert.equal(w.warns.filter((m) => /could not read/.test(m)).length, 1);
+});
+
+await check('a store that stops answering does not hold a read up for ever: the keys this tab holds are given', async () => {
+  const w = world({ env: { timeoutMs: 150 } });
+  const vault = w.load();
+  await vault.set('A', KEY_A);
+  w.idb.hold('get', { store: 'secrets' }); // the next read of the records never answers
+  const answer = await orHung(vault.get(['A', 'B']));
+  w.idb.release();
+  assert.notEqual(answer, 'HUNG', 'a hung read gives up');
+  assert.deepEqual(answer, { A: KEY_A }, 'and gives what this tab last saw');
+  assert.equal(w.warns.filter((m) => /could not read/.test(m)).length, 1, 'said once');
+});
+
+await check('a store that stops answering does not hold a save up for ever: the key is kept in plaintext, and moved in at the next load', async () => {
+  const w = world({ env: { timeoutMs: 150 } });
+  const vault = w.load();
+  await vault.set('A', KEY_A);
+  w.idb.hold('put', { store: 'secrets' }); // the next write never answers
+  const saved = await orHung(vault.set('B', KEY_B).then(() => 'saved'));
+  w.idb.release(); // it lands late, after the page gave up on it
+  assert.equal(saved, 'saved', 'a hung save gives up');
+  assert.deepEqual(JSON.parse(plainStored(w)), { B: KEY_B }, 'and keeps the key where it can');
+  assert.equal(w.warns.filter((m) => /could not save/.test(m)).length, 1, 'said once');
+  assert.deepEqual(await vault.get(['A', 'B']), { A: KEY_A, B: KEY_B });
+  await tick(50);
+  const next = V.createSecretVault({ ...w.env, timeoutMs: 5000 });
+  assert.equal(await next.ready(), 'sealed');
+  assert.equal(plainStored(w), null);
+  assert.deepEqual(await next.get(['A', 'B']), { A: KEY_A, B: KEY_B });
 });
 
 await check('a save the store refuses is kept in plaintext, said once, and moved in at the next load', async () => {
