@@ -108,6 +108,50 @@ pub fn ui_url() -> Option<String> {
     UI_URL.get().cloned()
 }
 
+/// The engines were started by this desktop (and so stop with it), rather than found already running.
+pub fn started_here() -> bool {
+    RUNNING.lock().unwrap_or_else(|e| e.into_inner()).is_some()
+}
+
+/// What the engines are doing that a restart would end: (media jobs running, catalog model downloads running).
+/// Asked at their control pages, so it covers a studio this desktop found running as well as its own. Nothing
+/// running, or no answer within two seconds, is (0, 0). The answer is kept for three seconds: the window asks often.
+pub fn activity() -> (usize, usize) {
+    static LAST: Mutex<Option<(std::time::Instant, (usize, usize))>> = Mutex::new(None);
+    if let Some((at, answer)) = *LAST.lock().unwrap_or_else(|e| e.into_inner()) {
+        if at.elapsed() < std::time::Duration::from_secs(3) {
+            return answer;
+        }
+    }
+    let Some(ui) = ui_url() else { return (0, 0) };
+    // On a thread of its own: a blocking client must not be made (or dropped) on an async thread.
+    let asked = std::thread::spawn(move || {
+        let get = |path: &str| -> Option<serde_json::Value> {
+            reqwest::blocking::Client::builder().timeout(std::time::Duration::from_secs(2)).build().ok()?.get(format!("{ui}{path}")).send().ok()?.json().ok()
+        };
+        Some(parse_activity(&get("/api/state")?, &get("/api/downloads")?))
+    })
+    .join()
+    .ok()
+    .flatten()
+    .unwrap_or((0, 0));
+    *LAST.lock().unwrap_or_else(|e| e.into_inner()) = Some((std::time::Instant::now(), asked));
+    asked
+}
+
+/// The engines' `/api/state` (its media jobs) and `/api/downloads` (its catalog downloads) as (media jobs running, downloads running).
+fn parse_activity(state: &serde_json::Value, downloads: &serde_json::Value) -> (usize, usize) {
+    let finished = |job: &serde_json::Value| matches!(job.get("status").and_then(|s| s.as_str()), Some("completed" | "failed" | "cancelled"));
+    let media = state.pointer("/media/jobs").and_then(|j| j.as_array()).map_or(0, |jobs| jobs.iter().filter(|job| !finished(job)).count());
+    // `busy` says the same in one word: a running job with no list (an older studio) still counts once.
+    let media = if media == 0 && state.pointer("/media/busy").and_then(|b| b.as_bool()).unwrap_or(false) { 1 } else { media };
+    let running = downloads
+        .get("models")
+        .and_then(|m| m.as_array())
+        .map_or(0, |models| models.iter().filter(|m| m.pointer("/download/status").and_then(|s| s.as_str()).is_some_and(|s| matches!(s, "queued" | "downloading" | "adding"))).count());
+    (media, running)
+}
+
 /// Stop the engines this desktop started (a studio that was already running is left running).
 pub fn stop() {
     if let Some(running) = RUNNING.lock().unwrap_or_else(|e| e.into_inner()).take() {
@@ -156,6 +200,28 @@ mod tests {
         stop();
         assert!(RUNNING.lock().unwrap().is_none());
         let _ = std::fs::remove_dir_all(&data);
+    }
+
+    #[test]
+    fn what_the_engines_are_doing_is_read_from_their_state_and_downloads() {
+        use serde_json::json;
+        let idle = json!({"media": {"busy": false, "jobs": []}});
+        let none = json!({"models": [{"id": "a", "download": null}, {"id": "b"}]});
+        assert_eq!(parse_activity(&idle, &none), (0, 0));
+        // Jobs the studio lists that have not finished.
+        let busy = json!({"media": {"busy": true, "jobs": [{"id": "j1", "status": "running"}, {"id": "j2", "status": "completed"}, {"id": "j3", "status": "queued"}, {"id": "j4", "status": "failed"}, {"id": "j5", "status": "cancelled"}]}});
+        assert_eq!(parse_activity(&busy, &none).0, 2);
+        // busy with no list still counts once; not busy with a list of finished jobs counts none.
+        assert_eq!(parse_activity(&json!({"media": {"busy": true}}), &none).0, 1);
+        assert_eq!(parse_activity(&json!({"media": {"busy": false, "jobs": [{"status": "completed"}]}}), &none).0, 0);
+        // Downloads waiting or running count; finished, paused, failed and cancelled do not.
+        let downloads = json!({"models": [
+            {"download": {"status": "queued"}}, {"download": {"status": "downloading"}}, {"download": {"status": "adding"}},
+            {"download": {"status": "done"}}, {"download": {"status": "paused"}}, {"download": {"status": "failed"}}, {"download": {"status": "cancelled"}}
+        ]});
+        assert_eq!(parse_activity(&idle, &downloads).1, 3);
+        // Whatever else they answer is nothing.
+        assert_eq!(parse_activity(&json!(null), &json!("nope")), (0, 0));
     }
 
     #[test]
