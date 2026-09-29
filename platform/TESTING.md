@@ -68,7 +68,7 @@ pair cleared, because the Agent pins its own ZIPP release.
 
 | Suite | Where | Needs a running service? | Run |
 |---|---|---|---|
-| Rust unit tests | `desktop/src-tauri` | no | `cargo test --no-default-features` (headless server) and `cargo test --features gui` (desktop) |
+| Rust unit tests | `desktop/src-tauri` | no (`tests/headless_server.rs` starts the real `oaiy-server` itself, on a port the system picks and with the voice gateway off) | `cargo test --no-default-features` (headless server) and `cargo test --features gui` (desktop) |
 | CLI engine tests | `cli/` | no | `npm test` |
 | API end-to-end | `api/tests/smoke.php` | **yes** — the API | `composer test` |
 | Web end-to-end | `ui/tests/e2e.mjs` | **yes** — the dev server | `npm run test:e2e` |
