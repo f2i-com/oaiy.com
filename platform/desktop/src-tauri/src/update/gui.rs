@@ -231,9 +231,16 @@ pub async fn update_install(webview: Webview, app: AppHandle, updater: tauri::St
     };
     let (updater, app_for_steps) = (updater.inner().clone(), app.clone());
     // Off the async and main threads: the stops wait on children, and the Agent page answers by way of the local API.
-    let outcome = tauri::async_runtime::spawn_blocking(move || run_install(&app_for_steps, &updater, update))
-        .await
-        .map_err(|e| format!("The update stopped unexpectedly ({e})."))?;
+    let for_panic = updater.clone();
+    let outcome = match tauri::async_runtime::spawn_blocking(move || run_install(&app_for_steps, &updater, update)).await {
+        Ok(outcome) => outcome,
+        Err(e) => {
+            // The sequence undoes itself when it panics (install::Unwind); this is for whatever got past that.
+            let message = format!("The update stopped unexpectedly ({e}).");
+            for_panic.fail_install_if_installing(message.clone());
+            return Err(message);
+        }
+    };
     match outcome {
         Outcome::HandedOff => {
             // Windows never gets here: the plugin started the installer and ended this process. On Linux the AppImage

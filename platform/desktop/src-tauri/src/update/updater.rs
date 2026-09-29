@@ -523,6 +523,14 @@ impl Updater {
         inner.state = State::Failed;
     }
 
+    /// `fail_install`, but only when the update is still `installing` (whatever ended the install by itself has already said how).
+    pub fn fail_install_if_installing(&self, message: String) {
+        let installing = self.lock().state == State::Installing;
+        if installing {
+            self.fail_install(message);
+        }
+    }
+
     /// The blockers appeared between the button and the stop: back to `ready`, with the package, nothing done.
     pub fn return_to_ready(&self, package: VerifiedPackage) {
         let mut inner = self.lock();
@@ -831,6 +839,20 @@ pub(crate) mod tests {
         assert_eq!(u.begin_install(now), Err(InstallRefusal::NotReady));
         // Downloading again is allowed (the release found is still known).
         assert!(u.begin_download().is_ok());
+    }
+
+    #[test]
+    fn the_last_resort_fails_an_install_only_while_it_is_installing_and_keeps_what_was_already_said() {
+        let (u, _, now) = ready();
+        u.fail_install_if_installing("nothing is installing".into());
+        assert_eq!(u.status_at(now).state, State::Ready, "an update that is not installing is left alone");
+        u.begin_install(now).unwrap();
+        u.fail_install_if_installing("it stopped".into());
+        let s = u.status_at(now);
+        assert_eq!((s.state, s.error.as_deref(), s.failed_during), (State::Failed, Some("it stopped"), Some(Stage::Install)));
+        // An install that already failed with its own words keeps them.
+        u.fail_install_if_installing("something else".into());
+        assert_eq!(u.status_at(now).error.as_deref(), Some("it stopped"));
     }
 
     #[test]
