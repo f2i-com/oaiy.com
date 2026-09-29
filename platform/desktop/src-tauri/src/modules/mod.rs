@@ -1184,6 +1184,7 @@ mod tests {
             last_health: None,
             last_health_at: None,
             last_health_error: None,
+            trust: None,
         }
     }
 
@@ -1251,6 +1252,7 @@ mod tests {
             last_health: None,
             last_health_at: None,
             last_health_error: None,
+            trust: None,
         };
         let r = resolve(&[broken]);
         for id in [PHONE, CALENDAR] {

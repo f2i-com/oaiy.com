@@ -1102,8 +1102,8 @@ async fn install_plugin(
     if source.as_os_str().is_empty() {
         return bridge_error(StatusCode::BAD_REQUEST, "invalid_request", "a source path is required".into());
     }
-    let root = match st.plugins.lock() {
-        Ok(reg) => reg.root().to_path_buf(),
+    let (root, trust) = match st.plugins.lock() {
+        Ok(reg) => (reg.root().to_path_buf(), reg.trust()),
         Err(_) => {
             return bridge_error(StatusCode::INTERNAL_SERVER_ERROR, "internal", "plugin registry lock poisoned".into())
         }
@@ -1117,7 +1117,7 @@ async fn install_plugin(
         if let Ok(id) = crate::plugins::install::peek_id(&source) {
             let _ = host.stop(&id);
         }
-        crate::plugins::install::install_from_path(&source, &root)
+        crate::plugins::install::install_from_path(&source, &root, &trust)
     })
     .await;
 
@@ -1141,12 +1141,15 @@ async fn install_plugin(
 /// What an install answers: the plugin installed, and when it declares a
 /// setup, its version and title, so the window that installed it can open
 /// its setup wizard (or, for an update, nudge when the version went up).
+/// And what its package was found to be, so the window can say a plugin that
+/// will not start until it is trusted is not broken.
 fn install_reply(out: &crate::plugins::install::Installed, setup: Option<&crate::plugins::manifest::SetupDecl>) -> serde_json::Value {
     let mut reply = json!({
         "id": out.id,
         "name": out.name,
         "version": out.version,
         "replaced": out.replaced,
+        "trust": out.trust,
     });
     if let Some(setup) = setup {
         reply["setup"] = json!({ "version": setup.version, "title": setup.title });
@@ -1735,9 +1738,23 @@ mod tests {
             version: "0.1.0".into(),
             dir: std::path::PathBuf::from("plugins/aokie"),
             replaced: false,
+            trust: crate::plugins::PackageTrust {
+                state: crate::plugins::TrustState::Verified,
+                publisher: Some("Aokie".into()),
+                key_id: Some("fl-aokie-2026a".into()),
+                version: Some("0.1.0".into()),
+                reason: None,
+                trusted_at: None,
+            },
         };
         let plain = install_reply(&out, None);
-        assert_eq!(plain, json!({ "id": "aokie", "name": "Aokie Phone Bridge", "version": "0.1.0", "replaced": false }));
+        assert_eq!(
+            plain,
+            json!({
+                "id": "aokie", "name": "Aokie Phone Bridge", "version": "0.1.0", "replaced": false,
+                "trust": { "state": "verified", "publisher": "Aokie", "keyId": "fl-aokie-2026a", "version": "0.1.0" },
+            })
+        );
         let setup = crate::plugins::manifest::SetupDecl { version: 2, title: "Set up the AI Receptionist".into(), steps: vec![] };
         let with = install_reply(&out, Some(&setup));
         assert_eq!(with["setup"], json!({ "version": 2, "title": "Set up the AI Receptionist" }));

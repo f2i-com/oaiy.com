@@ -522,9 +522,27 @@ pub struct CompanionBroker {
 }
 
 impl PluginHost {
-    /// Build the host and start its three background threads (events, shed,
-/// supervisor).
+    /// Build the host, start its background threads (events, outbox, shed,
+    /// supervisor) and start the plugins that start at boot.
     pub fn new(
+        registry: PluginRegistryHandle,
+        ledger: LedgerHandle,
+        triggers: TriggerStoreHandle,
+        dead: DeadLetterHandle,
+        desktop_version: String,
+        dev_mode: bool,
+    ) -> Arc<Self> {
+        let host = Self::assemble(registry, ledger, triggers, dead, desktop_version, dev_mode);
+        host.spawn_autostart();
+        host
+    }
+
+    /// The host and its background threads, without the boot autostart.
+    ///
+    /// Apart from `new` only for the tests of what starting a plugin does, which put a
+    /// plugin on disk after the host exists: a boot autostart that scanned a moment late
+    /// would start it (or not) on its own, and race the start the test is about.
+    pub(crate) fn assemble(
         registry: PluginRegistryHandle,
         ledger: LedgerHandle,
         triggers: TriggerStoreHandle,
@@ -633,7 +651,6 @@ impl PluginHost {
             });
         }
 
-        host.spawn_autostart();
         host
     }
 
@@ -693,7 +710,7 @@ impl PluginHost {
         }
         // Copy what spawn needs out of the registry, then release the lock —
         // spawning and handshaking take seconds.
-        let (manifest, dir) = {
+        let (manifest, dir, trust) = {
             let mut reg = self.registry.lock().map_err(|_| "registry lock poisoned")?;
             // Scan first: "drop a folder in plugins/, then POST start" is the
             // documented install flow, and without this it failed with "no plugin
@@ -710,13 +727,19 @@ impl PluginHost {
                     "{id} is turned off. Enable it in OAIY Desktop → Plugins first."
                 ));
             }
-            let m = rec.manifest.clone().ok_or_else(|| {
-                format!(
+            let m = rec.manifest.clone().ok_or_else(|| match &rec.trust {
+                // Held back by its package, not broken: the person needs the trust
+                // verdict itself ("not signed", "digest mismatch: ..."), not "cannot start".
+                Some(t) if !t.allows_launch() => format!(
+                    "{id} was not started: {}",
+                    t.reason.clone().unwrap_or_else(|| "its package is not trusted".into())
+                ),
+                _ => format!(
                     "{id} cannot start: {}",
                     rec.reason.clone().unwrap_or_else(|| "its manifest is invalid".into())
-                )
+                ),
             })?;
-            (m, rec.dir.clone())
+            (m, rec.dir.clone(), reg.trust())
         };
 
         // Claim the start ATOMICALLY. "Check the map, then spawn" is a
@@ -745,6 +768,23 @@ impl PluginHost {
         // From here on, every return path must clear the `starting` claim.
         let claim = StartClaim { host: self, id: id.to_string() };
 
+        // Verify the package again, from its bytes, immediately before the launch.
+        // The scan a moment ago (and the one at boot, and the one on install) only ever
+        // shows a verdict: a file swapped since then must not slip through, and a folder
+        // that scanned as fine may not be any longer. The permit this yields is what
+        // `PluginProcess::spawn` requires, so this is the one way a plugin starts.
+        let permit = match trust.authorize_launch(&dir, id) {
+            Ok(permit) => permit,
+            Err(verdict) => {
+                let why = verdict.reason.clone().unwrap_or_else(|| "its package is not trusted".into());
+                log::warn!("plugin {id} was not started: {why}");
+                if let Ok(mut reg) = self.registry.lock() {
+                    reg.withhold(id, *verdict);
+                }
+                return Err(format!("{id} was not started: {why}"));
+            }
+        };
+
         self.set_state(id, PluginState::Starting, Some("Launching…".into()));
 
         let host_for_events = Arc::downgrade(self);
@@ -758,6 +798,7 @@ impl PluginHost {
             SpawnOptions {
                 desktop_version: self.desktop_version.clone(),
                 dev_mode: self.dev_mode,
+                permit,
                 events: Arc::new(move |_name, envelope| {
                     if let Some(host) = host_for_events.upgrade() {
                         // try_send, not send: this closure runs on the reader
@@ -2732,6 +2773,7 @@ mod tests {
             last_health: None,
             last_health_at: None,
             last_health_error: None,
+            trust: None,
         });
     }
 
@@ -3155,5 +3197,232 @@ mod tests {
         assert!(done);
         assert!(host.dead.lock().unwrap().list(10).is_empty());
         assert_eq!(outbox.status().waiting, 1, "back in line for the account");
+    }
+
+    // ---- package trust -------------------------------------------------------
+    //
+    // The registry and trust tests prove the rules; these prove that a plugin is or
+    // is not started because of them. A stub executable that cannot run stands in
+    // where the test is about a refusal (a start that was attempted would end
+    // `Crashed`, "cannot launch"; a refused one ends `Disabled` and was never
+    // spawned), and a real child (Node behind a `.cmd` shim, as process.rs does) where
+    // the test is about a plugin that does start.
+
+    use crate::plugins::registry::PluginRegistry;
+    use crate::plugins::trust::tests::TestKey;
+    use crate::plugins::trust::{Publishers, TrustPolicy, TrustService, TrustState};
+
+    /// A host whose registry verifies packages under `policy`, with no boot autostart:
+    /// the test puts a plugin on disk after the host exists, and starts it itself.
+    fn trusting_host(tag: &str, policy: TrustPolicy, publishers: Publishers) -> (Sandbox, Arc<PluginHost>, Arc<TrustService>) {
+        let sb = Sandbox::new(tag);
+        let plugins = sb.0.join("plugins");
+        std::fs::create_dir_all(&plugins).unwrap();
+        let trust = TrustService::new(policy, publishers, plugins.join("trusted-plugins.json"));
+        let registry = Arc::new(Mutex::new(PluginRegistry::with_trust(plugins, trust.clone())));
+        let host = PluginHost::assemble(
+            registry,
+            crate::bridge::ledger::new_handle(),
+            Arc::new(Mutex::new(TriggerStore::load(sb.0.join("triggers.json")))),
+            crate::bridge::deadletters::open_handle(sb.0.join("deadletters.jsonl")),
+            "0.0.0-test".into(),
+            true,
+        );
+        (sb, host, trust)
+    }
+
+    fn plugin_manifest(id: &str, command: &str) -> String {
+        json!({
+            "schemaVersion": 3, "id": id, "name": format!("{id} plugin"), "version": "0.1.0",
+            "pluginApiVersion": 1, "entry": { "kind": "process", "command": command },
+            "capabilities": [], "connectors": [], "events": [],
+        })
+        .to_string()
+    }
+
+    /// A plugin folder whose executable cannot run.
+    fn stub_plugin(sb: &Sandbox, id: &str) -> PathBuf {
+        let dir = sb.0.join("plugins").join(id);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("manifest.json"), plugin_manifest(id, "plugin.exe")).unwrap();
+        std::fs::write(dir.join("plugin.exe"), b"not a real executable").unwrap();
+        dir
+    }
+
+    fn trust_of(host: &PluginHost, id: &str) -> Option<TrustState> {
+        host.registry.lock().unwrap().get(id).and_then(|r| r.trust.as_ref().map(|t| t.state))
+    }
+
+    fn state_of(host: &PluginHost, id: &str) -> PluginState {
+        host.registry.lock().unwrap().get(id).unwrap().state
+    }
+
+    /// `start` returns at once when another start of the same plugin is in flight (the
+    /// boot autostart may be), so a test that wants it running waits for it.
+    #[cfg(windows)]
+    fn wait_running(host: &PluginHost, id: &str) {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
+        while state_of(host, id) != PluginState::Running {
+            assert!(std::time::Instant::now() < deadline, "{id} never came up: {:?}", host.registry.lock().unwrap().get(id).map(|r| r.reason.clone()));
+            thread::sleep(std::time::Duration::from_millis(50));
+        }
+    }
+
+    #[test]
+    fn an_unsigned_plugin_is_not_started_in_a_release_build() {
+        let (sb, host, _trust) = trusting_host("rel-unsigned", TrustPolicy::release(), Publishers::default());
+        stub_plugin(&sb, "probe");
+
+        let err = host.start("probe").unwrap_err();
+        assert!(err.contains("Not signed"), "{err}");
+        assert_eq!(state_of(&host, "probe"), PluginState::Disabled, "refused, not crashed");
+        assert_eq!(trust_of(&host, "probe"), Some(TrustState::Unsigned));
+        assert!(host.logs("probe", None).is_none(), "no process was ever spawned");
+    }
+
+    #[test]
+    fn a_signed_plugin_that_fails_its_signature_is_not_started_in_any_build() {
+        for policy in [TrustPolicy::release(), TrustPolicy::developer()] {
+            let key = TestKey::generate("fl-test-2026a");
+            let (sb, host, _trust) = trusting_host("signed-bad", policy, key.pinned_for("Probe Co", &["probe"]));
+            let dir = stub_plugin(&sb, "probe");
+            key.sign(&dir, "probe-plugin", "1.0.0");
+            std::fs::write(dir.join("plugin.exe"), b"tampered after signing").unwrap();
+
+            let err = host.start("probe").unwrap_err();
+            assert!(err.contains("Quarantined: digest mismatch: plugin.exe"), "developer={}: {err}", policy.is_developer());
+            assert_eq!(state_of(&host, "probe"), PluginState::Disabled);
+            assert_eq!(trust_of(&host, "probe"), Some(TrustState::Quarantined));
+            assert!(host.logs("probe", None).is_none(), "no process was ever spawned");
+        }
+    }
+
+    #[test]
+    fn a_file_swapped_between_the_scan_and_the_launch_does_not_slip_through() {
+        let key = TestKey::generate("fl-test-2026a");
+        let (sb, host, _trust) = trusting_host("swap", TrustPolicy::release(), key.pinned_for("Probe Co", &["probe"]));
+        let dir = stub_plugin(&sb, "probe");
+        key.sign(&dir, "probe-plugin", "1.0.0");
+
+        // The scan says verified, and the plugin is loadable.
+        host.registry.lock().unwrap().scan();
+        assert_eq!(trust_of(&host, "probe"), Some(TrustState::Verified));
+        assert!(host.registry.lock().unwrap().get("probe").unwrap().is_loadable());
+
+        // The executable is replaced by one of the same length, its modified time put
+        // back: the folder looks exactly as the scan left it.
+        let exe = dir.join("plugin.exe");
+        let before = std::fs::metadata(&exe).unwrap().modified().unwrap();
+        std::fs::write(&exe, vec![b'!'; b"not a real executable".len()]).unwrap();
+        std::fs::File::options().write(true).open(&exe).unwrap().set_modified(before).unwrap();
+
+        // start() scans first (and is told the same thing), then verifies again from the
+        // bytes, which is what catches it.
+        let err = host.start("probe").unwrap_err();
+        assert!(err.contains("probe was not started") && err.contains("digest mismatch: plugin.exe"), "{err}");
+        assert_eq!(state_of(&host, "probe"), PluginState::Disabled);
+        assert_eq!(trust_of(&host, "probe"), Some(TrustState::Quarantined));
+        assert!(!host.registry.lock().unwrap().get("probe").unwrap().is_loadable(), "and the listing agrees from then on");
+        assert!(host.logs("probe", None).is_none(), "the swapped executable never ran");
+
+        // A crash-restart goes through the same door.
+        assert!(host.start("probe").is_err());
+    }
+
+    /// A plugin that answers the handshake, in a real child process. `None` where there
+    /// is no Node to run it (a missing toolchain is not a defect in the code under test).
+    #[cfg(windows)]
+    fn node_plugin(sb: &Sandbox, id: &str) -> Option<PathBuf> {
+        let has_node = std::process::Command::new("node")
+            .arg("--version")
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .status()
+            .map(|s| s.success())
+            .unwrap_or(false);
+        if !has_node {
+            return None;
+        }
+        let dir = sb.0.join("plugins").join(id);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(
+            dir.join("plugin.mjs"),
+            r#"
+const send = (o) => process.stdout.write(JSON.stringify(o) + "\n");
+let buf = "";
+process.stdin.on("data", (chunk) => {
+  buf += chunk;
+  let i;
+  while ((i = buf.indexOf("\n")) >= 0) {
+    const line = buf.slice(0, i); buf = buf.slice(i + 1);
+    if (!line.trim()) continue;
+    let msg; try { msg = JSON.parse(line); } catch { continue; }
+    if (msg.method === "plugin.init") send({ jsonrpc: "2.0", id: msg.id, result: { ok: true } });
+    else if (msg.method === "plugin.health") send({ jsonrpc: "2.0", id: msg.id, result: { status: "ok" } });
+    else if (msg.method === "plugin.shutdown") process.exit(0);
+    else if (msg.id !== undefined) send({ jsonrpc: "2.0", id: msg.id, error: { code: -32601, message: "unknown method" } });
+  }
+});
+"#,
+        )
+        .unwrap();
+        std::fs::write(dir.join("plugin.cmd"), "@echo off\r\nnode \"%~dp0plugin.mjs\" %*\r\n").unwrap();
+        std::fs::write(dir.join("manifest.json"), plugin_manifest(id, "plugin.cmd")).unwrap();
+        Some(dir)
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn an_unsigned_plugin_still_starts_in_a_developer_build_as_it_always_has() {
+        // The owner's own flow: `tauri dev`, a local build of the plugin with no
+        // signature. It starts, and it reports that it is unsigned and allowed.
+        let (sb, host, _trust) = trusting_host("dev-unsigned", TrustPolicy::developer(), Publishers::default());
+        let Some(_dir) = node_plugin(&sb, "probe") else { return };
+
+        host.start("probe").expect("a developer build starts an unsigned plugin");
+        wait_running(&host, "probe");
+        assert_eq!(trust_of(&host, "probe"), Some(TrustState::UnsignedDev));
+        host.stop("probe").unwrap();
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn a_verified_plugin_starts_and_says_who_signed_it() {
+        let key = TestKey::generate("fl-test-2026a");
+        let (sb, host, _trust) = trusting_host("verified", TrustPolicy::release(), key.pinned_for("Probe Co", &["probe"]));
+        let Some(dir) = node_plugin(&sb, "probe") else { return };
+        key.sign(&dir, "probe-plugin", "1.0.0");
+
+        host.start("probe").expect("a verified plugin starts in a release build");
+        wait_running(&host, "probe");
+        let reg = host.registry.lock().unwrap();
+        let trust = reg.get("probe").unwrap().trust.clone().unwrap();
+        drop(reg);
+        assert_eq!(trust.state, TrustState::Verified);
+        assert_eq!(trust.publisher.as_deref(), Some("Probe Co"));
+        host.stop("probe").unwrap();
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn a_plugin_the_person_trusted_starts_in_a_release_build_until_it_changes() {
+        let (sb, host, trust) = trusting_host("trusted", TrustPolicy::release(), Publishers::default());
+        let Some(dir) = node_plugin(&sb, "probe") else { return };
+
+        assert!(host.start("probe").is_err(), "unsigned, and nobody has trusted it");
+        trust.trust_local(&dir, "probe").unwrap();
+        host.start("probe").expect("trusted, so it starts");
+        wait_running(&host, "probe");
+        assert_eq!(trust_of(&host, "probe"), Some(TrustState::TrustedLocal));
+        host.stop("probe").unwrap();
+
+        // A changed file is a package nobody trusted.
+        let script = dir.join("plugin.mjs");
+        let mut text = std::fs::read_to_string(&script).unwrap();
+        text.push_str("\n// changed\n");
+        std::fs::write(&script, text).unwrap();
+        let err = host.start("probe").unwrap_err();
+        assert!(err.contains("changed since you trusted it"), "{err}");
+        assert_eq!(state_of(&host, "probe"), PluginState::Disabled);
     }
 }

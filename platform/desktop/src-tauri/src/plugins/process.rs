@@ -41,6 +41,7 @@ use super::rpc::{
     RpcMessage,
 };
 use super::runner::{plugin_data_dir, plugin_env, HANDSHAKE_TIMEOUT, HEALTH_TIMEOUT, SHUTDOWN_GRACE};
+use super::trust::LaunchPermit;
 use crate::services::runner::LogBuffer;
 
 /// A failed plugin call, in the terms a caller can act on.
@@ -118,6 +119,10 @@ pub struct PluginProcess {
 pub struct SpawnOptions {
     pub desktop_version: String,
     pub dev_mode: bool,
+    /// Proof that the package was verified a moment ago (see [`super::trust`]). There is
+    /// no other way to make one than to verify it, so there is no way to spawn a plugin
+    /// without the check.
+    pub permit: LaunchPermit,
     /// Receives validated `event.emit` payloads and `log.emit` lines.
     pub events: EventSink,
     /// Answers plugin-initiated requests.
@@ -214,6 +219,7 @@ impl PluginProcess {
             cmd.process_group(0);
         }
 
+        log::info!("starting plugin {} (package: {})", manifest.id, opts.permit.trust().state.as_str());
         let mut child = cmd
             .spawn()
             .map_err(|e| format!("cannot launch {}: {e}", exe.display()))?;
@@ -951,6 +957,7 @@ process.stdin.on("data", (chunk) => {
                 SpawnOptions {
                     desktop_version: "0.1.0".into(),
                     dev_mode: false,
+                    permit: LaunchPermit::unchecked_for_tests(),
                     events: Arc::new(move |name, _payload| {
                         ev.lock().unwrap().push(name.to_string());
                     }),

@@ -30,6 +30,7 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
 use super::manifest::{ManifestError, PluginManifest};
+use super::trust::{PackageTrust, TrustService, PACKAGE_MANIFEST_FILE};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
@@ -178,6 +179,19 @@ pub struct PluginRecord {
     pub last_health_at: Option<chrono::DateTime<chrono::Utc>>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub last_health_error: Option<String>,
+    /// Who made the package and whether it is still what they made (see
+    /// [`super::trust`]). `None` only when the manifest could not be loaded, so there
+    /// was no plugin to judge.
+    ///
+    /// A package that may not run (`quarantined`, or `unsigned` in a release build) has
+    /// NO `manifest` here. The manifest is what everything else reads to decide what a
+    /// plugin brings: its modules, pages, agent tools, setup, service definitions and
+    /// screens. A folder that failed its signature must not contribute any of them, and
+    /// leaving each of those readers to remember to ask would be the way one of them
+    /// forgot. It is listed the way a plugin with a broken manifest is: disabled, with
+    /// the reason.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub trust: Option<PackageTrust>,
 }
 
 impl PluginRecord {
@@ -197,6 +211,7 @@ impl PluginRecord {
             last_health: None,
             last_health_at: None,
             last_health_error: None,
+            trust: None,
         }
     }
 
@@ -214,7 +229,40 @@ impl PluginRecord {
             last_health: None,
             last_health_at: None,
             last_health_error: None,
+            trust: None,
         }
+    }
+
+    /// A plugin whose package may not run: listed as disabled, with why, and without a
+    /// manifest (see [`PluginRecord::trust`]).
+    fn withheld(dir: PathBuf, id: String, trust: PackageTrust) -> Self {
+        Self {
+            id,
+            state: PluginState::Disabled,
+            reason: Some(format!("Not started. {}", trust.reason.as_deref().unwrap_or("Its package is not trusted."))),
+            dir,
+            manifest: None,
+            legacy_capabilities: Vec::new(),
+            unknown_capabilities: Vec::new(),
+            user_disabled: false,
+            restart_attempts: 0,
+            last_health: None,
+            last_health_at: None,
+            last_health_error: None,
+            trust: Some(trust),
+        }
+    }
+
+    fn with_trust(mut self, trust: PackageTrust) -> Self {
+        self.trust = Some(trust);
+        self
+    }
+
+    /// Does its package's trust say it may not be started? (A plugin already running when
+    /// its folder stopped verifying keeps running and keeps its manifest, but says so
+    /// here, and is not started again.)
+    pub fn refused_by_trust(&self) -> bool {
+        self.trust.as_ref().is_some_and(|t| !t.allows_launch())
     }
 
     /// Is this plugin usable at all? A record with no manifest never becomes
@@ -249,9 +297,14 @@ fn health_snapshot(value: &serde_json::Value) -> Result<serde_json::Value, Strin
     Ok(snapshot)
 }
 
-#[derive(Default)]
 pub struct PluginRegistry {
     root: PathBuf,
+    /// Verifies the packages in `root`: at each scan, and (through [`Self::trust`])
+    /// immediately before each launch and at install.
+    trust: Arc<TrustService>,
+    /// Plugins whose legacy `data` folder could not be moved out of a signed bundle,
+    /// said once each rather than on every scan.
+    migration_warned: std::collections::BTreeSet<String>,
     /// Plugin ids the user has explicitly turned off.
     ///
     /// Persisted, because `scan()` rebuilds every `PluginRecord` from its
@@ -297,16 +350,31 @@ impl PluginRegistry {
         }
     }
 
+    /// A registry over `root` under this build's trust policy and pinned publishers.
     pub fn new(root: PathBuf) -> Self {
+        let trust = TrustService::for_root(&root);
+        Self::with_trust(root, trust)
+    }
+
+    /// A registry that verifies packages with `trust`.
+    pub fn with_trust(root: PathBuf, trust: Arc<TrustService>) -> Self {
         Self {
             disabled: Self::load_disabled(&root),
             root,
+            trust,
+            migration_warned: Default::default(),
             plugins: BTreeMap::new(),
         }
     }
 
     pub fn root(&self) -> &Path {
         &self.root
+    }
+
+    /// The package verifier, for the callers that must check outside a scan: a launch,
+    /// an install, the person's decision to trust a package.
+    pub fn trust(&self) -> Arc<TrustService> {
+        self.trust.clone()
     }
 
     /// Rescan the plugins root.
@@ -362,17 +430,45 @@ impl PluginRegistry {
                     }
                     let id = m.id.clone();
                     seen.push(id.clone());
+
+                    // A process that is up holds its folder open. It is left as it is:
+                    // what a scan learns about its package is shown, and is acted on
+                    // when it next starts.
+                    let live = self.plugins.get(&id).is_some_and(|r| {
+                        r.is_loadable()
+                            && matches!(r.state, PluginState::Starting | PluginState::Running | PluginState::Unhealthy)
+                    });
+                    if !live {
+                        self.move_legacy_data_out_of_a_signed_bundle(&id, &dir);
+                    }
+                    let trust = self.trust.assess(&dir, &id);
+
+                    if !trust.allows_launch() && !live {
+                        // Quarantined, or unsigned and not trusted: listed with why, and
+                        // with nothing of its manifest for anyone to build on.
+                        self.plugins.insert(id.clone(), PluginRecord::withheld(dir, id, trust));
+                        report.invalid += 1;
+                        continue;
+                    }
                     match self.plugins.get_mut(&id) {
                         Some(existing) if existing.is_loadable() => {
                             // Refresh the manifest but keep runtime state.
                             existing.legacy_capabilities = m.legacy_capabilities();
                             existing.unknown_capabilities = m.unknown_capabilities();
                             existing.manifest = Some(m);
+                            // Said when it happens, not on every scan after.
+                            if !trust.allows_launch() && existing.trust.as_ref().map(|t| t.state) != Some(trust.state) {
+                                log::warn!(
+                                    "plugin {id} is running but its package no longer verifies, so it will not be started again: {}",
+                                    trust.reason.as_deref().unwrap_or("not trusted")
+                                );
+                            }
+                            existing.trust = Some(trust);
                             report.unchanged += 1;
                         }
                         _ => {
                             self.plugins
-                                .insert(id, PluginRecord::from_manifest(dir, m));
+                                .insert(id, PluginRecord::from_manifest(dir, m).with_trust(trust));
                             report.added += 1;
                         }
                     }
@@ -398,6 +494,25 @@ impl PluginRegistry {
         report
     }
 
+    /// Old installs kept the plugin's own state in `<plugin>/data`, inside the bundle.
+    /// In a signed bundle that folder is a set of files the signature does not list, so
+    /// the package would be quarantined before it ever started and got the chance to move
+    /// it (the move used to be made at start). Made here, before the package is looked at.
+    fn move_legacy_data_out_of_a_signed_bundle(&mut self, id: &str, dir: &Path) {
+        if !dir.join("data").is_dir() || !dir.join(PACKAGE_MANIFEST_FILE).is_file() {
+            return;
+        }
+        match super::runner::migrate_legacy_data_dir(dir) {
+            Ok(true) => log::info!("moved {}/data out of the signed plugin bundle so its signature can verify", dir.display()),
+            Ok(false) => {}
+            Err(e) => {
+                if self.migration_warned.insert(id.to_string()) {
+                    log::warn!("legacy plugin data dir not migrated: {e}");
+                }
+            }
+        }
+    }
+
     pub fn list(&self) -> Vec<PluginRecord> {
         self.plugins.values().cloned().collect()
     }
@@ -410,10 +525,24 @@ impl PluginRegistry {
         self.plugins.insert(record.id.clone(), record);
     }
 
+    /// A launch found the package is not what it was at the last scan (or never was):
+    /// take the plugin's manifest away and say why, exactly as a scan would have.
+    ///
+    /// Only for a plugin that is not running: this is called by a start that has just
+    /// been refused.
+    pub fn withhold(&mut self, id: &str, trust: PackageTrust) {
+        let Some(existing) = self.plugins.get(id) else { return };
+        let record = PluginRecord::withheld(existing.dir.clone(), id.to_string(), trust);
+        self.plugins.insert(id.to_string(), record);
+        self.apply_disabled();
+    }
+
     /// Drop a plugin from the in-memory registry after its directory has been
-    /// removed. `scan()` only ADDS what it finds on disk, so without this an
+    /// removed, and the trust the person gave it: a package installed again is a new
+    /// decision. `scan()` only ADDS what it finds on disk, so without this an
     /// uninstalled plugin would linger in the listing until the next restart.
     pub fn forget(&mut self, id: &str) -> bool {
+        self.trust.forget_local(id);
         self.plugins.remove(id).is_some()
     }
 
@@ -470,7 +599,11 @@ impl PluginRegistry {
                 if rec.state != PluginState::Running {
                     rec.state = PluginState::Disabled;
                     rec.clear_health();
-                    rec.reason = Some("Turned off in OAIY Desktop → Plugins.".into());
+                    // A package that failed its check keeps saying so: that is the fact
+                    // that matters when the person turns the plugin back on.
+                    if !rec.refused_by_trust() {
+                        rec.reason = Some("Turned off in OAIY Desktop → Plugins.".into());
+                    }
                 }
             }
         }
@@ -488,7 +621,9 @@ impl PluginRegistry {
             rec.clear_health();
             if disabled {
                 rec.state = PluginState::Disabled;
-                rec.reason = Some("Turned off in OAIY Desktop → Plugins.".into());
+                if !rec.refused_by_trust() {
+                    rec.reason = Some("Turned off in OAIY Desktop → Plugins.".into());
+                }
             } else if rec.is_loadable() {
                 rec.state = PluginState::Stopped;
                 rec.reason = Some("Turned on, not started yet.".into());
@@ -549,6 +684,18 @@ impl PluginRegistry {
         idempotency_key: Option<&str>,
     ) -> Result<&PluginRecord, GateRefusal> {
         let Some(rec) = self.owner_of(connector_id) else {
+            // A plugin whose package may not run has no manifest here, so it declares no
+            // connector, and "no plugin provides it, install one" would be the wrong thing
+            // to tell a caller of `aokie` when `aokie` is installed and quarantined. A
+            // plugin's connector carries its own name (the screens' `PluginHost.command`
+            // assumes as much), which is enough to say what happened.
+            if let Some(held) = self.plugins.get(connector_id).filter(|r| r.manifest.is_none() && r.refused_by_trust()) {
+                return Err(GateRefusal::ConnectorUnavailable {
+                    connector_id: connector_id.to_string(),
+                    state: held.state,
+                    reason: held.reason.clone(),
+                });
+            }
             return Err(GateRefusal::ConnectorMissing {
                 connector_id: connector_id.to_string(),
             });
@@ -1262,5 +1409,282 @@ mod tests {
             ]
         );
         assert_eq!(rec.unknown_capabilities, vec!["aokie.hardware.seize".to_string()]);
+    }
+
+    // --- package trust ------------------------------------------------------
+
+    use crate::plugins::trust::tests::TestKey;
+    use crate::plugins::trust::{Publishers, TrustPolicy, TrustState};
+
+    fn trust_service(root: &Root, policy: TrustPolicy, publishers: Publishers) -> Arc<TrustService> {
+        TrustService::new(policy, publishers, root.path().join("trusted-plugins.json"))
+    }
+
+    /// A registry under a release build's rules that pins `key` for the plugin `aokie`.
+    fn release_registry(root: &Root, key: &TestKey) -> PluginRegistry {
+        let trust = trust_service(root, TrustPolicy::release(), key.pinned_for("Aokie", &["aokie"]));
+        PluginRegistry::with_trust(root.path().to_path_buf(), trust)
+    }
+
+    fn signed_aokie(root: &Root, key: &TestKey) -> PathBuf {
+        root.plugin("aokie", manifest("aokie"));
+        let dir = root.path().join("aokie");
+        key.sign(&dir, "aokie-plugin", "0.1.0");
+        dir
+    }
+
+    #[test]
+    fn a_signed_plugin_that_verifies_is_listed_with_its_publisher_and_keeps_its_manifest() {
+        let root = Root::new();
+        let key = TestKey::generate("fl-test-2026a");
+        signed_aokie(&root, &key);
+        let mut reg = release_registry(&root, &key);
+        assert_eq!(reg.scan().added, 1);
+
+        let rec = reg.get("aokie").unwrap();
+        assert_eq!(rec.state, PluginState::Installed);
+        assert!(rec.is_loadable(), "a verified plugin's manifest is what everything builds on");
+        let trust = rec.trust.as_ref().unwrap();
+        assert_eq!(trust.state, TrustState::Verified);
+        assert_eq!(trust.publisher.as_deref(), Some("Aokie"));
+        assert_eq!(reg.autostart_ids(), vec!["aokie".to_string()]);
+
+        // As the listing carries it.
+        let wire = serde_json::to_value(reg.list()).unwrap();
+        assert_eq!(wire[0]["trust"]["state"], "verified");
+        assert_eq!(wire[0]["trust"]["publisher"], "Aokie");
+        assert_eq!(wire[0]["trust"]["keyId"], "fl-test-2026a");
+        assert!(wire[0]["trust"].get("reason").is_none());
+    }
+
+    #[test]
+    fn a_tampered_signed_plugin_is_listed_disabled_with_why_and_gives_nothing_to_build_on() {
+        let root = Root::new();
+        let key = TestKey::generate("fl-test-2026a");
+        let dir = signed_aokie(&root, &key);
+        fs::write(dir.join("plugin.exe"), b"tampered").unwrap();
+
+        // Even a developer's build: a package that carries a signature is not waived.
+        let trust = trust_service(&root, TrustPolicy::developer(), key.pinned_for("Aokie", &["aokie"]));
+        let mut reg = PluginRegistry::with_trust(root.path().to_path_buf(), trust);
+        let report = reg.scan();
+        assert_eq!((report.added, report.invalid), (0, 1));
+
+        let rec = reg.get("aokie").expect("it is listed, not dropped");
+        assert_eq!(rec.state, PluginState::Disabled);
+        assert!(!rec.user_disabled, "the person did not turn it off");
+        assert!(!rec.is_loadable(), "no manifest: no module, page, tool, screen or setup step comes from it");
+        assert!(rec.refused_by_trust());
+        let reason = rec.reason.as_deref().unwrap();
+        assert!(reason.starts_with("Not started."), "{reason}");
+        assert!(reason.contains("Quarantined: digest mismatch: plugin.exe"), "{reason}");
+        assert_eq!(rec.trust.as_ref().unwrap().state, TrustState::Quarantined);
+        assert!(reg.autostart_ids().is_empty());
+
+        // Turning it on does not revive it.
+        reg.set_user_disabled("aokie", false);
+        assert_eq!(reg.get("aokie").unwrap().state, PluginState::Disabled);
+        assert!(reg.autostart_ids().is_empty());
+
+        // And what a caller of its connector is told says why, rather than "not installed".
+        let refusal = reg.gate("aokie", "call.answer", None).unwrap_err();
+        assert_eq!(refusal.code(), "capability_unavailable");
+        assert!(refusal.message().contains("Quarantined"), "{}", refusal.message());
+        assert!(!refusal.message().contains("No installed plugin provides"), "{}", refusal.message());
+    }
+
+    #[test]
+    fn what_a_quarantined_plugin_would_have_contributed_is_not_contributed() {
+        // The modules, pages and tools read the manifest; a record without one gives them nothing.
+        let root = Root::new();
+        let key = TestKey::generate("fl-test-2026a");
+        let dir = signed_aokie(&root, &key);
+        let mut reg = release_registry(&root, &key);
+        reg.scan();
+        let before = crate::modules::resolve(&reg.list());
+        assert!(before.modules.iter().any(|m| m.enabled), "a verified aokie provides the phone");
+
+        fs::write(dir.join("plugin.exe"), b"tampered").unwrap();
+        reg.scan();
+        let after = crate::modules::resolve(&reg.list());
+        assert!(after.modules.iter().all(|m| !m.enabled), "a quarantined aokie provides nothing");
+        let why = after.modules.iter().find_map(|m| m.reason.clone()).unwrap();
+        assert!(why.contains("could not be loaded") && why.contains("Quarantined"), "{why}");
+    }
+
+    #[test]
+    fn an_unsigned_plugin_is_held_back_in_a_release_build() {
+        let root = Root::new();
+        root.plugin("aokie", manifest("aokie"));
+        let trust = trust_service(&root, TrustPolicy::release(), Publishers::default());
+        let mut reg = PluginRegistry::with_trust(root.path().to_path_buf(), trust);
+        reg.scan();
+        let rec = reg.get("aokie").unwrap();
+        assert_eq!(rec.state, PluginState::Disabled);
+        assert_eq!(rec.trust.as_ref().unwrap().state, TrustState::Unsigned);
+        assert!(!rec.is_loadable());
+        assert!(reg.autostart_ids().is_empty());
+        assert!(rec.reason.as_deref().unwrap().contains("trust this exact package"));
+    }
+
+    #[test]
+    fn the_owners_unsigned_local_aokie_lists_and_autostarts_exactly_as_before_under_this_build() {
+        // The dev flow: `tauri dev`, an unsigned local Aokie folder. `new` is the
+        // constructor the desktop uses, so this is this build's own policy (a debug build
+        // here, as under `tauri dev`), not one chosen by the test.
+        let root = Root::new();
+        let dir = root.path().join("aokie");
+        fs::create_dir_all(dir.join("definitions")).unwrap();
+        fs::write(dir.join("manifest.json"), include_str!("fixtures/aokie-v4.manifest.json")).unwrap();
+        fs::write(dir.join("definitions").join("phone.json"), include_str!("fixtures/aokie-phone.definition.json")).unwrap();
+        fs::write(dir.join("aokie-plugin.exe"), b"a local build").unwrap();
+
+        let mut reg = PluginRegistry::new(root.path().to_path_buf());
+        reg.scan();
+        let rec = reg.get("aokie").unwrap();
+        assert_eq!(rec.state, PluginState::Installed, "{:?}", rec.reason);
+        assert!(rec.is_loadable(), "its manifest, and so its pages, tools and setup, are there");
+        assert_eq!(rec.trust.as_ref().unwrap().state, TrustState::UnsignedDev);
+        assert_eq!(reg.autostart_ids(), vec!["aokie".to_string()]);
+        // What it brings to the product is there: the phone and the calendar.
+        let resolved = crate::modules::resolve(&reg.list());
+        assert!(resolved.modules.iter().all(|m| m.enabled), "{:?}", resolved.modules.iter().map(|m| (&m.id, &m.reason)).collect::<Vec<_>>());
+        // Not running yet, and not refused for its package either.
+        assert!(matches!(
+            reg.gate("aokie", "phone.status", None),
+            Err(GateRefusal::ConnectorUnavailable { state: PluginState::Installed, .. })
+        ));
+    }
+
+    #[test]
+    fn trusting_an_unsigned_plugin_brings_it_in_and_a_change_takes_it_out_again() {
+        let root = Root::new();
+        root.plugin("aokie", manifest("aokie"));
+        let dir = root.path().join("aokie");
+        let trust = trust_service(&root, TrustPolicy::release(), Publishers::default());
+        let mut reg = PluginRegistry::with_trust(root.path().to_path_buf(), trust.clone());
+        reg.scan();
+        assert!(!reg.get("aokie").unwrap().is_loadable());
+
+        trust.trust_local(&dir, "aokie").unwrap();
+        reg.scan();
+        let rec = reg.get("aokie").unwrap();
+        assert_eq!(rec.trust.as_ref().unwrap().state, TrustState::TrustedLocal);
+        assert_eq!(rec.state, PluginState::Installed, "startable now: {:?}", rec.reason);
+        assert!(rec.is_loadable());
+        assert_eq!(reg.autostart_ids(), vec!["aokie".to_string()]);
+
+        // Any change and it is a package nobody trusted.
+        fs::write(dir.join("plugin.exe"), b"a different build").unwrap();
+        reg.scan();
+        let rec = reg.get("aokie").unwrap();
+        assert_eq!(rec.trust.as_ref().unwrap().state, TrustState::Unsigned);
+        assert!(!rec.is_loadable());
+        assert!(rec.reason.as_deref().unwrap().contains("changed since you trusted it"), "{:?}", rec.reason);
+
+        // Uninstalling forgets the trust too, so the same bytes back again are a new decision.
+        fs::write(dir.join("plugin.exe"), b"stub").unwrap();
+        reg.scan();
+        assert!(reg.get("aokie").unwrap().is_loadable(), "the trusted bytes are back");
+        reg.forget("aokie");
+        reg.scan();
+        assert!(!reg.get("aokie").unwrap().is_loadable());
+    }
+
+    #[test]
+    fn a_running_plugin_whose_package_stops_verifying_keeps_running_and_says_so() {
+        // A file changed under a live phone line must not kill the call, but the plugin
+        // is not started again, and the listing says why.
+        let root = Root::new();
+        let key = TestKey::generate("fl-test-2026a");
+        let dir = signed_aokie(&root, &key);
+        let mut reg = release_registry(&root, &key);
+        reg.scan();
+        reg.set_state("aokie", PluginState::Running, None);
+
+        fs::write(dir.join("ui-extra.txt"), b"dropped in").unwrap();
+        reg.scan();
+        let rec = reg.get("aokie").unwrap();
+        assert_eq!(rec.state, PluginState::Running);
+        assert!(rec.is_loadable(), "the live process still has its commands");
+        assert!(reg.gate("aokie", "call.answer", None).is_ok());
+        assert_eq!(rec.trust.as_ref().unwrap().state, TrustState::Quarantined);
+        assert!(rec.refused_by_trust());
+
+        // When it exits, the next scan (a start begins with one) withholds it.
+        reg.set_state("aokie", PluginState::Crashed, Some("Exited with code 1.".into()));
+        reg.scan();
+        let rec = reg.get("aokie").unwrap();
+        assert_eq!(rec.state, PluginState::Disabled);
+        assert!(!rec.is_loadable());
+        assert!(reg.autostart_ids().is_empty());
+    }
+
+    #[test]
+    fn a_launch_that_finds_the_package_changed_withholds_the_plugin_like_a_scan_would() {
+        let root = Root::new();
+        let key = TestKey::generate("fl-test-2026a");
+        signed_aokie(&root, &key);
+        let mut reg = release_registry(&root, &key);
+        reg.scan();
+        assert!(reg.get("aokie").unwrap().is_loadable());
+
+        let verdict = crate::plugins::trust::PackageTrust {
+            state: TrustState::Quarantined,
+            publisher: None,
+            key_id: None,
+            version: None,
+            reason: Some("Quarantined: digest mismatch: plugin.exe.".into()),
+            trusted_at: None,
+        };
+        reg.withhold("aokie", verdict);
+        let rec = reg.get("aokie").unwrap();
+        assert_eq!(rec.state, PluginState::Disabled);
+        assert!(!rec.is_loadable());
+        assert!(rec.reason.as_deref().unwrap().contains("digest mismatch"));
+    }
+
+    #[test]
+    fn a_turned_off_plugin_that_failed_its_check_keeps_saying_so() {
+        let root = Root::new();
+        root.plugin("aokie", manifest("aokie"));
+        let trust = trust_service(&root, TrustPolicy::release(), Publishers::default());
+        let mut reg = PluginRegistry::with_trust(root.path().to_path_buf(), trust);
+        reg.scan();
+        reg.set_user_disabled("aokie", true);
+        reg.scan();
+        let rec = reg.get("aokie").unwrap();
+        assert!(rec.user_disabled);
+        assert!(rec.reason.as_deref().unwrap().contains("trust this exact package"), "{:?}", rec.reason);
+    }
+
+    #[test]
+    fn a_legacy_data_folder_in_a_signed_bundle_is_moved_out_before_the_bundle_is_checked() {
+        // Older installs kept the plugin's state in <plugin>/data, inside the bundle, and
+        // moved it out when the plugin started. A signed bundle with it still there would
+        // be quarantined before it could start.
+        let base = Root::new();
+        let plugins = base.path().join("plugins");
+        fs::create_dir_all(&plugins).unwrap();
+        let key = TestKey::generate("fl-test-2026a");
+        let dir = plugins.join("aokie");
+        fs::create_dir_all(&dir).unwrap();
+        fs::write(dir.join("manifest.json"), manifest("aokie").to_string()).unwrap();
+        fs::write(dir.join("plugin.exe"), b"stub").unwrap();
+        key.sign(&dir, "aokie-plugin", "0.1.0");
+        fs::create_dir_all(dir.join("data")).unwrap();
+        fs::write(dir.join("data").join("settings.json"), b"{\"paired\":true}").unwrap();
+
+        let trust = TrustService::new(TrustPolicy::release(), key.pinned_for("Aokie", &["aokie"]), plugins.join("trusted-plugins.json"));
+        let mut reg = PluginRegistry::with_trust(plugins.clone(), trust);
+        reg.scan();
+
+        assert_eq!(reg.get("aokie").unwrap().trust.as_ref().unwrap().state, TrustState::Verified);
+        assert!(!dir.join("data").exists());
+        assert_eq!(
+            fs::read(crate::plugins::runner::plugin_data_dir(&dir).join("settings.json")).unwrap(),
+            b"{\"paired\":true}",
+            "the plugin's state moved with it"
+        );
     }
 }

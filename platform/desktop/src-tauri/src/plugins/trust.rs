@@ -183,6 +183,12 @@ impl LaunchPermit {
     pub fn trust(&self) -> &PackageTrust {
         &self.trust
     }
+
+    /// For tests of the process layer, which have nothing to do with trust.
+    #[cfg(test)]
+    pub(crate) fn unchecked_for_tests() -> Self {
+        Self { trust: PackageTrust::bare(TrustState::UnsignedDev, None) }
+    }
 }
 
 // ---------------------------------------------------------------------------------
@@ -852,7 +858,7 @@ impl TrustService {
     }
 
     fn quarantined(&self, detail: impl AsRef<str>) -> PackageTrust {
-        let mut reason = format!("Quarantined: {}. It was not started.", detail.as_ref().trim_end_matches('.'));
+        let mut reason = format!("Quarantined: {}.", detail.as_ref().trim_end_matches('.'));
         if self.policy.developer {
             // Said only to a developer: to anyone else it reads as a way round the check.
             reason.push_str(
@@ -873,7 +879,7 @@ impl TrustService {
             PackageTrust::bare(
                 TrustState::Unsigned,
                 Some(format!(
-                    "{lead}Not signed by a publisher this OAIY trusts, so it was not started. If you built it yourself or know where it came from, you can trust this exact package."
+                    "{lead}Not signed by a publisher this OAIY trusts. If you built it yourself or know where it came from, you can trust this exact package."
                 )),
             )
         }
@@ -995,7 +1001,7 @@ impl TrustService {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use ed25519_dalek::{Signer, SigningKey};
     use std::sync::atomic::{AtomicU32, Ordering};
@@ -1037,24 +1043,24 @@ mod tests {
     }
 
     /// A signing key made for the test, standing in for a publisher's.
-    struct TestKey {
-        key_id: String,
+    pub(crate) struct TestKey {
+        pub(crate) key_id: String,
         signing: SigningKey,
     }
 
     impl TestKey {
-        fn generate(key_id: &str) -> Self {
+        pub(crate) fn generate(key_id: &str) -> Self {
             let mut seed = [0u8; 32];
             getrandom::getrandom(&mut seed).unwrap();
             Self { key_id: key_id.to_string(), signing: SigningKey::from_bytes(&seed) }
         }
 
-        fn public_b64(&self) -> String {
+        pub(crate) fn public_b64(&self) -> String {
             base64::engine::general_purpose::STANDARD.encode(self.signing.verifying_key().to_bytes())
         }
 
         /// The pin list a host would carry for this key, allowed to sign `plugins`.
-        fn pinned_for(&self, name: &str, plugins: &[&str]) -> Publishers {
+        pub(crate) fn pinned_for(&self, name: &str, plugins: &[&str]) -> Publishers {
             let file = serde_json::json!({
                 "version": 1,
                 "publishers": [{ "id": self.key_id, "name": name, "publicKey": self.public_b64(), "plugins": plugins }],
@@ -1064,11 +1070,11 @@ mod tests {
 
         /// Sign a folder as `package-signer sign` does: an entry for every file but the
         /// envelope, sorted, then the detached signature over the payload bytes.
-        fn sign(&self, dir: &Path, name: &str, version: &str) {
+        pub(crate) fn sign(&self, dir: &Path, name: &str, version: &str) {
             self.write_envelope(dir, &self.payload_of(dir, name, version));
         }
 
-        fn payload_of(&self, dir: &Path, name: &str, version: &str) -> Vec<u8> {
+        pub(crate) fn payload_of(&self, dir: &Path, name: &str, version: &str) -> Vec<u8> {
             let mut budget = u64::MAX;
             let files: Vec<serde_json::Value> = list_files(dir)
                 .unwrap()
@@ -1082,7 +1088,7 @@ mod tests {
             serde_json::to_vec(&serde_json::json!({ "name": name, "version": version, "createdAt": "2026-09-29T00:00:00Z", "files": files })).unwrap()
         }
 
-        fn write_envelope(&self, dir: &Path, payload: &[u8]) {
+        pub(crate) fn write_envelope(&self, dir: &Path, payload: &[u8]) {
             let signature = self.signing.sign(payload);
             let envelope = serde_json::json!({
                 "format": 1,
@@ -1095,10 +1101,10 @@ mod tests {
         }
     }
 
-    const MANIFEST: &str = r#"{"schemaVersion":1,"id":"demo","name":"Demo","version":"1.0.0","pluginApiVersion":1,"entry":{"kind":"process","command":"demo-plugin.exe"}}"#;
+    pub(crate) const MANIFEST: &str = r#"{"schemaVersion":1,"id":"demo","name":"Demo","version":"1.0.0","pluginApiVersion":1,"entry":{"kind":"process","command":"demo-plugin.exe"}}"#;
 
     /// The files of a small plugin.
-    fn fill(dir: &Path) {
+    pub(crate) fn fill(dir: &Path) {
         std::fs::write(dir.join("manifest.json"), MANIFEST).unwrap();
         std::fs::write(dir.join("demo-plugin.exe"), b"demo plugin executable bytes").unwrap();
         std::fs::create_dir_all(dir.join("ui")).unwrap();
@@ -1537,7 +1543,6 @@ mod tests {
         let reason = quarantine_reason(&t);
         assert!(reason.contains("digest mismatch: demo-plugin.exe, manifest.json"), "{reason}");
         assert!(reason.contains("unlisted file present:") && reason.contains("and 3 more"), "{reason}");
-        assert!(reason.contains("It was not started."), "{reason}");
     }
 
     #[cfg(unix)]

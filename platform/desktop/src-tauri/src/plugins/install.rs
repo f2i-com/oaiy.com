@@ -13,10 +13,21 @@
 //! temporary directory beside the destination FIRST, and only swapped into place
 //! once it is known good. A half-copied plugin directory would otherwise be
 //! indistinguishable from a corrupt install.
+//!
+//! A package that carries a signature is verified while it is staged (see
+//! [`super::trust`]): one that does not check out is refused, and whatever was installed
+//! stays as it was. A package with no signature installs, whatever the build: what it
+//! may do afterwards is the trust policy's to say, and in a release build the person can
+//! only trust a package that is already installed.
+//!
+//! Nothing here changes what a source may be. It is still a path on this machine and
+//! never a URL: installing native code from the network is not something this route
+//! does, signed or not.
 
 use std::path::{Path, PathBuf};
 
 use super::manifest::PluginManifest;
+use super::trust::{PackageTrust, TrustService, TrustState};
 
 /// Cap on an installed plugin, so a runaway archive cannot fill the disk.
 const MAX_TOTAL_BYTES: u64 = 512 * 1024 * 1024;
@@ -31,6 +42,8 @@ pub struct Installed {
     pub dir: PathBuf,
     /// True when this replaced an existing install of the same id.
     pub replaced: bool,
+    /// What the package was found to be when it was staged.
+    pub trust: PackageTrust,
 }
 
 /// Read + validate the manifest at `dir/manifest.json`.
@@ -209,7 +222,9 @@ pub fn peek_id(source: &Path) -> Result<String, String> {
 /// running instance of the same id first — this function will refuse to replace
 /// a directory it cannot remove, which is what a running executable causes on
 /// Windows.
-pub fn install_from_path(source: &Path, plugins_root: &Path) -> Result<Installed, String> {
+///
+/// A signed package that does not verify under `trust` is an error, not an install.
+pub fn install_from_path(source: &Path, plugins_root: &Path, trust: &TrustService) -> Result<Installed, String> {
     if !source.exists() {
         return Err(format!("{} does not exist", source.display()));
     }
@@ -243,6 +258,16 @@ pub fn install_from_path(source: &Path, plugins_root: &Path) -> Result<Installed
 
         let staged = manifest_root(&staging);
         let manifest = read_manifest(&staged)?;
+        // Before anything is moved: a package that fails its signature must not replace
+        // a working install, or become one.
+        let verdict = trust.assess_staged(&staged, &manifest.id);
+        if verdict.state == TrustState::Quarantined {
+            return Err(format!(
+                "{} was not installed: {}",
+                manifest.id,
+                verdict.reason.as_deref().unwrap_or("its package failed verification")
+            ));
+        }
         let dest = plugins_root.join(&manifest.id);
         let replaced = dest.exists();
         let backup = plugins_root.join(format!(".backup-{}-{}", manifest.id, uuid::Uuid::new_v4()));
@@ -275,6 +300,7 @@ pub fn install_from_path(source: &Path, plugins_root: &Path) -> Result<Installed
             version: manifest.version.clone(),
             dir: dest,
             replaced,
+            trust: verdict,
         })
     })();
 
@@ -307,12 +333,24 @@ pub fn uninstall(id: &str, plugins_root: &Path) -> Result<(), String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::plugins::trust::tests::{fill, TestKey};
+    use crate::plugins::trust::{Publishers, TrustPolicy};
 
     fn tmp(name: &str) -> PathBuf {
         let p = std::env::temp_dir().join(format!("oaiy-inst-{}-{name}", std::process::id()));
         let _ = std::fs::remove_dir_all(&p);
         std::fs::create_dir_all(&p).unwrap();
         p
+    }
+
+    /// The trust of a developer's build, which asks nothing of the plugins these tests
+    /// install (they are unsigned).
+    fn dev_trust(base: &Path) -> std::sync::Arc<TrustService> {
+        trust_with(base, TrustPolicy::developer(), Publishers::default())
+    }
+
+    fn trust_with(base: &Path, policy: TrustPolicy, publishers: Publishers) -> std::sync::Arc<TrustService> {
+        TrustService::new(policy, publishers, base.join("trusted-plugins.json"))
     }
 
     fn write_plugin(dir: &Path, id: &str) {
@@ -335,7 +373,7 @@ mod tests {
         let root = base.join("plugins");
         write_plugin(&src, "demo");
 
-        let out = install_from_path(&src, &root).unwrap();
+        let out = install_from_path(&src, &root, &dev_trust(&base)).unwrap();
         assert_eq!(out.id, "demo");
         assert!(!out.replaced);
         assert!(root.join("demo").join("manifest.json").is_file());
@@ -349,8 +387,8 @@ mod tests {
         let src = base.join("src");
         let root = base.join("plugins");
         write_plugin(&src, "demo");
-        install_from_path(&src, &root).unwrap();
-        let out = install_from_path(&src, &root).unwrap();
+        install_from_path(&src, &root, &dev_trust(&base)).unwrap();
+        let out = install_from_path(&src, &root, &dev_trust(&base)).unwrap();
         assert!(out.replaced);
         let _ = std::fs::remove_dir_all(&base);
     }
@@ -369,14 +407,14 @@ mod tests {
             zip.write_all(&std::fs::read(src.join(name)).unwrap()).unwrap();
         }
         zip.finish().unwrap();
-        assert_eq!(install_from_path(&archive, &root).unwrap().id, "demo");
+        assert_eq!(install_from_path(&archive, &root, &dev_trust(&base)).unwrap().id, "demo");
         let original = std::fs::read(root.join("demo/manifest.json")).unwrap();
 
         let mut zip = zip::ZipWriter::new(std::fs::File::create(&archive).unwrap());
         zip.start_file("../outside.txt", zip::write::SimpleFileOptions::default()).unwrap();
         zip.write_all(b"outside").unwrap();
         zip.finish().unwrap();
-        assert!(install_from_path(&archive, &root).is_err());
+        assert!(install_from_path(&archive, &root, &dev_trust(&base)).is_err());
         assert!(!root.join("outside.txt").exists());
         assert_eq!(std::fs::read(root.join("demo/manifest.json")).unwrap(), original);
         let _ = std::fs::remove_dir_all(base);
@@ -388,23 +426,23 @@ mod tests {
         let src = base.join("src");
         let root = base.join("plugins");
         write_plugin(&src, "demo");
-        install_from_path(&src, &root).unwrap();
+        install_from_path(&src, &root, &dev_trust(&base)).unwrap();
         let original = std::fs::read(root.join("demo/manifest.json")).unwrap();
         let mut manifest: serde_json::Value = serde_json::from_slice(&original).unwrap();
         manifest["serviceDefinitions"] = serde_json::json!([{"definitionFile":"definitions/phone.json"}]);
         std::fs::write(src.join("manifest.json"), manifest.to_string()).unwrap();
-        let err = install_from_path(&src, &root).unwrap_err();
+        let err = install_from_path(&src, &root, &dev_trust(&base)).unwrap_err();
         assert!(err.contains("service definition"), "{err}");
         assert_eq!(std::fs::read(root.join("demo/manifest.json")).unwrap(), original);
         assert_eq!(std::fs::read(root.join("demo/x.exe")).unwrap(), b"binary");
         manifest.as_object_mut().unwrap().remove("serviceDefinitions");
         manifest["pluginApiVersion"] = serde_json::json!(999);
         std::fs::write(src.join("manifest.json"), manifest.to_string()).unwrap();
-        assert!(install_from_path(&src, &root).is_err());
+        assert!(install_from_path(&src, &root, &dev_trust(&base)).is_err());
         assert_eq!(std::fs::read(root.join("demo/manifest.json")).unwrap(), original);
         write_plugin(&src, "demo");
         std::fs::remove_file(src.join("x.exe")).unwrap();
-        assert!(install_from_path(&src, &root).unwrap_err().contains("executable"));
+        assert!(install_from_path(&src, &root, &dev_trust(&base)).unwrap_err().contains("executable"));
         assert_eq!(std::fs::read(root.join("demo/manifest.json")).unwrap(), original);
         let _ = std::fs::remove_dir_all(base);
     }
@@ -415,7 +453,7 @@ mod tests {
         let src = base.join("src");
         std::fs::create_dir_all(&src).unwrap();
         std::fs::write(src.join("readme.txt"), b"nothing here").unwrap();
-        let err = install_from_path(&src, &base.join("plugins")).unwrap_err();
+        let err = install_from_path(&src, &base.join("plugins"), &dev_trust(&base)).unwrap_err();
         assert!(err.contains("manifest.json"), "{err}");
         let _ = std::fs::remove_dir_all(&base);
     }
@@ -446,7 +484,7 @@ mod tests {
         let src = base.join("src");
         let root = base.join("plugins");
         write_plugin(&src, "demo");
-        install_from_path(&src, &root).unwrap();
+        install_from_path(&src, &root, &dev_trust(&base)).unwrap();
 
         let data = super::super::runner::plugin_data_dir(&root.join("demo"));
         std::fs::create_dir_all(&data).unwrap();
@@ -462,10 +500,127 @@ mod tests {
         let src = base.join("src");
         let root = base.join("plugins");
         write_plugin(&src, "demo");
-        install_from_path(&src, &root).unwrap();
+        install_from_path(&src, &root, &dev_trust(&base)).unwrap();
         assert!(uninstall("demo", &root).is_ok());
         assert!(!root.join("demo").exists());
         assert!(uninstall("demo", &root).is_err(), "second removal has nothing to do");
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    // --- package trust ------------------------------------------------------
+
+    /// A signed `demo` package in `src`, and a release build's trust that pins its key.
+    fn signed_source(base: &Path) -> (PathBuf, TestKey, std::sync::Arc<TrustService>) {
+        let src = base.join("src");
+        std::fs::create_dir_all(&src).unwrap();
+        fill(&src);
+        let key = TestKey::generate("test-key-1");
+        key.sign(&src, "demo-plugin", "1.0.0");
+        let trust = trust_with(base, TrustPolicy::release(), key.pinned_for("Demo Co", &["demo"]));
+        (src, key, trust)
+    }
+
+    #[test]
+    fn a_signed_package_is_verified_as_it_is_installed() {
+        let base = tmp("signed");
+        let (src, _key, trust) = signed_source(&base);
+        let out = install_from_path(&src, &base.join("plugins"), &trust).unwrap();
+        assert_eq!(out.trust.state, crate::plugins::trust::TrustState::Verified, "{:?}", out.trust);
+        assert_eq!(out.trust.publisher.as_deref(), Some("Demo Co"));
+        // What was copied is what was signed, so the installed folder verifies too.
+        let installed = trust.assess_fresh(&base.join("plugins").join("demo"), "demo");
+        assert_eq!(installed.state, crate::plugins::trust::TrustState::Verified, "{installed:?}");
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn the_zip_of_a_signed_bundle_verifies_once_unpacked() {
+        // Aokie publishes a zip with the files at its root and the envelope beside them.
+        use std::io::Write;
+        let base = tmp("signed-zip");
+        let (src, _key, trust) = signed_source(&base);
+        let archive = base.join("aokie-plugin-windows-v1.zip");
+        let mut zip = zip::ZipWriter::new(std::fs::File::create(&archive).unwrap());
+        for name in ["manifest.json", "demo-plugin.exe", "ui/index.html", "package-manifest.json"] {
+            zip.start_file(name, zip::write::SimpleFileOptions::default()).unwrap();
+            zip.write_all(&std::fs::read(src.join(name)).unwrap()).unwrap();
+        }
+        zip.finish().unwrap();
+        let out = install_from_path(&archive, &base.join("plugins"), &trust).unwrap();
+        assert_eq!(out.trust.state, crate::plugins::trust::TrustState::Verified, "{:?}", out.trust);
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn a_signed_package_that_fails_is_not_installed_and_the_working_install_stays() {
+        let base = tmp("signed-tampered");
+        let (src, key, trust) = signed_source(&base);
+        let root = base.join("plugins");
+        install_from_path(&src, &root, &trust).unwrap();
+        let installed = std::fs::read(root.join("demo").join("demo-plugin.exe")).unwrap();
+
+        // The next release arrives with a file changed after it was signed.
+        std::fs::write(src.join("demo-plugin.exe"), b"tampered in transit").unwrap();
+        let err = install_from_path(&src, &root, &trust).unwrap_err();
+        assert!(err.contains("demo was not installed"), "{err}");
+        assert!(err.contains("digest mismatch: demo-plugin.exe"), "{err}");
+        assert_eq!(std::fs::read(root.join("demo").join("demo-plugin.exe")).unwrap(), installed, "the working install is untouched");
+
+        // A file added to the package that the signature does not list.
+        key.sign(&src, "demo-plugin", "1.0.1");
+        std::fs::write(src.join("evil.dll"), b"hijack").unwrap();
+        let err = install_from_path(&src, &root, &trust).unwrap_err();
+        assert!(err.contains("unlisted executable present: evil.dll"), "{err}");
+
+        // Nothing is left behind, staged or backed up.
+        let leftovers: Vec<String> = std::fs::read_dir(&root)
+            .unwrap()
+            .flatten()
+            .map(|e| e.file_name().to_string_lossy().to_string())
+            .filter(|n| n.starts_with('.') && n != ".install.lock")
+            .collect();
+        assert!(leftovers.is_empty(), "{leftovers:?}");
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn a_package_signed_by_a_key_that_is_not_pinned_is_not_installed() {
+        let base = tmp("signed-stranger");
+        let (src, _key, _trust) = signed_source(&base);
+        let trust = trust_with(&base, TrustPolicy::developer(), TestKey::generate("test-key-1").pinned_for("Someone Else", &["demo"]));
+        let err = install_from_path(&src, &base.join("plugins"), &trust).unwrap_err();
+        assert!(err.contains("signature does not match"), "even a developer build does not install a package whose signature fails: {err}");
+        assert!(!base.join("plugins").join("demo").exists());
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn an_unsigned_package_installs_in_any_build_and_says_what_the_build_will_do_with_it() {
+        let base = tmp("unsigned");
+        let src = base.join("src");
+        write_plugin(&src, "demo");
+
+        let release = trust_with(&base, TrustPolicy::release(), Publishers::default());
+        let out = install_from_path(&src, &base.join("plugins"), &release).unwrap();
+        assert_eq!(out.trust.state, crate::plugins::trust::TrustState::Unsigned, "so the person can trust it, in a release build");
+
+        let out = install_from_path(&src, &base.join("plugins"), &dev_trust(&base)).unwrap();
+        assert_eq!(out.trust.state, crate::plugins::trust::TrustState::UnsignedDev);
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn a_url_is_still_not_a_source() {
+        // Installing native code from the network is not something this route does, and
+        // the trust check changes nothing about that: a signed package has to be on this
+        // machine first.
+        let base = tmp("url");
+        let trust = dev_trust(&base);
+        for source in ["https://example.com/plugin.zip", "http://example.com/plugin", "file:///C:/plugin.zip", "//server/share/plugin.zip"] {
+            let err = install_from_path(Path::new(source), &base.join("plugins"), &trust).unwrap_err();
+            assert!(err.contains("does not exist"), "{source}: {err}");
+        }
+        assert!(!base.join("plugins").exists(), "nothing was even started");
         let _ = std::fs::remove_dir_all(&base);
     }
 }
