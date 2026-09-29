@@ -80,7 +80,7 @@ pair cleared, because the Agent pins its own ZIPP release.
 ```bash
 (cd desktop/src-tauri && cargo test --no-default-features && cargo test --features gui)   # both shipped configurations
 (cd cli     && npm test && npm run typecheck)   # 4 suites + tsc (needs `npm run build` first: it generates src/generated/)
-(cd ui      && npm test)                 # installs the ZIPP engines if needed, then typecheck, css tokens, contracts, both engines
+(cd ui      && npm test)                 # installs the ZIPP engines if needed, then typecheck, css tokens, contracts, both engines, and the editor's own suites (OAIY's window, services, storage, landing links, engine address, sealed API keys)
 (cd desktop && npm run build)            # tsc --noEmit + vite build
 node --test scripts/fetch-zipp-release.test.mjs   # the ZIPP installer (see "ZIPP engines")
 ```
@@ -150,11 +150,14 @@ npm run test:e2e       # terminal 2
 npm run test:e2e -- http://localhost:4173    # or against `vite preview`
 ```
 
-92 assertions. Checks all three pages in **both themes**: clean console, shell
+144 assertions. Checks all three pages in **both themes**: clean console, shell
 rendered, cross-page nav, flow creation, and that every design token resolves.
 Also holds regression cases for the shell rewrite — the project name staying
 editable alongside an open flow, the flow name being keyboard-reachable, and the
-topbar actions not clipping as the window narrows.
+topbar actions not clipping as the window narrows. The desktop page's links into
+the repository and the three states of its service library are checked, and so is
+that a flow's API keys are sealed in IndexedDB (the real one; `npm test` covers
+the logic against a stand-in) rather than left in plaintext `localStorage`.
 
 Set `VITE_API_BASE` if you want the desktop page's service library populated;
 without it that fetch fails and the suite tolerates it.
