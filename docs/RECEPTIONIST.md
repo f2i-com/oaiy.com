@@ -146,7 +146,7 @@ What it does not cover: a phone plugin that is not running or has lost its conne
 computer, in which case the call is not on this computer to speak to.
 
 **Who rings** is decided by the ring policy, from your settings: this computer rings while you are
-at it (its idle time decides), phones ring when you are away (or always, or never), quiet hours can
+at it (its idle time decides, and a locked screen, Win+L, is away at once, not two minutes later), phones ring when you are away (or always, or never), quiet hours can
 silence everything (with exceptions for the VIP numbers you list and, if you allow it, urgent
 requests), and **away** can be set by hand. A ring lasts 20 to 90 seconds (40 unless you change it;
 30 at most when only this computer rings). The devices are the Companions you approved on the Phone
