@@ -122,6 +122,15 @@ const RECENT_MS = 2 * 24 * 60 * 60_000;
 /** A call heard ringing in later than this after it began ringing is not warmed (see warmCall): it has been answered or missed. */
 const RING_FRESH_MS = 20_000;
 
+/** A call to read ahead (Sessions.warmCall): who, the call's id as it rings in, a dial's purpose and opening line, and its outreach. */
+export interface WarmCall {
+  number: string;
+  name?: string;
+  callId?: string;
+  outbound?: { purpose?: string; opening?: string };
+  link?: OutreachLink;
+}
+
 /** How the app makes an agent for this project, with a conversation's own instructions and tools, for a conversation of `kind`. */
 export type MakeAgent = (extra: Pick<AgentOptions, 'instructions' | 'sessionTools' | 'tools' | 'reasoning' | 'conversation'>, kind: SessionInfo['kind']) => Agent;
 
@@ -1449,7 +1458,16 @@ export class Sessions {
    * its turns come first). Nothing on a model that keeps no prompt (ChatGPT's
    * live-call route): see Agent.warm.
    */
-  warmCall(call: { number: string; name?: string; callId?: string; outbound?: { purpose?: string; opening?: string }; link?: OutreachLink }): void {
+  warmCall(call: WarmCall): void {
+    try {
+      this.warmFor(call);
+    } catch {
+      // Only a head start: one that cannot be made never stops a dial or the phone's events.
+      this.stopWarming();
+    }
+  }
+
+  private warmFor(call: WarmCall): void {
     // A hidden number is often turned away by the phone's screening: not worth the engine's time.
     if (isHidden(call.number)) return;
     const key = phoneKey(call.number) || call.number.trim();
@@ -1468,9 +1486,10 @@ export class Sessions {
     const outbound = call.outbound || link ? { purpose: link?.objective ?? call.outbound?.purpose ?? '' } : undefined;
     const missedAt = this.callingBack(key)?.missedAt;
     probe.agent.turns = [{ role: 'user', text: this.startNote(probe, { greeting: call.outbound?.opening ?? '', hidden: false, began: new Date(), missedAt, outbound, recent: '' }), automatic: true, fresh: true }];
-    void probe.agent.warm(controller.signal).finally(() => {
+    const done = () => {
       if (this.warming === warming) this.warming = null;
-    });
+    };
+    void probe.agent.warm(controller.signal).then(done, done);
   }
 
   /** The warm of a call not begun yet (warmCall) is let go. */

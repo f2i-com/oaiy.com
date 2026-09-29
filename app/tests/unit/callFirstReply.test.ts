@@ -304,6 +304,20 @@ describe('the engine reads a call before it is answered', () => {
     expect(Object.keys(tools.find((t) => t.name === 'end_call')!.parameters.properties)).toEqual(['goodbye', 'silent']);
   });
 
+  it('a warm that cannot be made never stops the dial', async () => {
+    const { sessions, outreach, log } = world();
+    engine(() => ({ text: 'Hi.' }));
+    await sessions.load();
+    (sessions as unknown as { create: () => never }).create = () => {
+      throw new Error('no lane');
+    };
+    const plan = outreach.plan(CAMPAIGN, null);
+    if (typeof plan === 'string') throw new Error(plan);
+    await outreach.create(plan, { kind: 'runner', projectId: 'front-desk', projectName: 'Front desk' });
+    await outreach.tick();
+    expect(log).toEqual(['call.dial']);
+  });
+
   it('as a call back is dialled: the hook is told the number before the dial', async () => {
     let saved: Callback[] = [];
     const order: string[] = [];
