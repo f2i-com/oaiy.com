@@ -19,13 +19,16 @@ const OWNED = ['oaiy-agent-', 'bot.computer-'];
 const SCOPE = new URL(self.registration.scope);
 const PRECACHE = ['./', './index.html', './manifest.webmanifest', './icon.svg', './icon-192.png', './icon-512.png', './zipp/zipp_wasm.js', './zipp/zipp_wasm_bg.wasm'];
 
+// A new version installs beside the running one and waits: the tabs that are open keep the version
+// they started with (their hashed files are still cached), and the page says a new one is ready.
+// The worker takes over when the person chooses to reload (the 'skip-waiting' message below), or
+// when no tab is left. The very first worker has nothing to wait for and starts at once.
 self.addEventListener('install', (event) => {
   event.waitUntil(
     caches
       .open(CACHE)
       .then((cache) => cache.addAll(PRECACHE.map((p) => new URL(p, SCOPE).href)))
-      .catch(() => {})
-      .then(() => self.skipWaiting()),
+      .catch(() => {}),
   );
 });
 
@@ -38,9 +41,14 @@ self.addEventListener('activate', (event) => {
   );
 });
 
-// The page lists what it loaded before this worker controlled it, so the
-// hashed bundles are cached from the first visit.
 self.addEventListener('message', (event) => {
+  // The person chose Reload (pwa/update.ts): take over from the version that is running.
+  if (event.data?.type === 'skip-waiting') {
+    self.skipWaiting();
+    return;
+  }
+  // The page lists what it loaded before this worker controlled it, so the
+  // hashed bundles are cached from the first visit.
   if (event.data?.type !== 'cache' || !Array.isArray(event.data.urls)) return;
   const urls = event.data.urls.filter((u) => {
     try {

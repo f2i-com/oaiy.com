@@ -201,6 +201,10 @@ button:focus-visible, summary:focus-visible, [tabindex]:focus-visible { outline:
 .topbar.menu-open .actions .setup-oaiy, .topbar.menu-open .actions .install-app { margin-bottom: 4px; position: relative; color: var(--accent); font-weight: 650; }
 .topbar.menu-open .actions .setup-oaiy::after, .topbar.menu-open .actions .install-app::after { content: ''; position: absolute; left: 6px; right: 6px; bottom: -3px; border-top: 1px solid var(--border); }
 .actions .setup-oaiy[hidden], .actions .install-app[hidden] { display: none; }
+/* "A new version is ready": a small message in the corner, out of the way (pwa/update.ts). */
+.update-notice { position: fixed; right: 14px; bottom: 14px; z-index: 60; display: flex; align-items: center; gap: 10px; max-width: calc(100vw - 28px); padding: 6px 6px 6px 14px; background: var(--panel); border: 1px solid var(--border); border-radius: var(--r-card); box-shadow: var(--shadow); font-size: 13px; }
+.update-notice button { min-height: 28px; padding: 0 12px; }
+.update-notice .update-later { padding: 0; width: 28px; border-color: transparent; background: transparent; color: var(--muted); font-size: 16px; line-height: 1; }
 /* Status pills, as the dashboard draws them: a soft fill, a 1px edge, and a lit dot. */
 .chip { display: inline-flex; align-items: center; gap: 7px; height: 30px; padding: 0 12px; border-radius: 999px; border: 1px solid var(--border); background: var(--surface-soft); color: var(--muted); font-size: 12px; font-weight: 600; white-space: nowrap; }
 .chip:hover:not(:disabled) { border-color: var(--strong-border); background: var(--panel-2); color: var(--text); }
@@ -815,6 +819,8 @@ dialog h2 { margin: 0 0 4px; }
   .tabs { display: flex; border-top: 1px solid var(--border); background: var(--panel); padding-bottom: env(safe-area-inset-bottom); }
   .tabs button { flex: 1; border: none; border-radius: 0; background: transparent; color: var(--muted); padding: 10px 0; min-height: 44px; }
   .tabs button.active { color: var(--accent); box-shadow: inset 0 2px 0 var(--accent); }
+  /* Above the tab bar. */
+  .update-notice { right: 10px; bottom: calc(58px + env(safe-area-inset-bottom)); }
 
   .tree-row { height: 38px; }
   .tree-row .row-actions { display: inline-flex; }

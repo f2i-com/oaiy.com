@@ -63,6 +63,8 @@ import { isOutreachPath, readView } from './vfs/readView';
 import { mayReloadForIsolation } from './pwa/reloadGuard';
 import { startInstall } from './pwa/install';
 import { installButton } from './ui/installButton';
+import { watchUpdates } from './pwa/update';
+import { showUpdateNotice } from './ui/updateNotice';
 
 const WELCOME: Array<[string, string]> = [
   [
@@ -118,6 +120,8 @@ async function registerServiceWorker(): Promise<boolean> {
   const registration = await navigator.serviceWorker.ready;
   const urls = performance.getEntriesByType('resource').map((e) => e.name);
   registration.active?.postMessage({ type: 'cache', urls: [location.href, ...urls] });
+  // A new version waits for the person to reload (it never reloads the page by itself): say so.
+  showUpdateNotice(watchUpdates(registration));
   if (crossOriginIsolated) return false;
   // At most one automatic reload a minute: if isolation still does not come
   // (a browser that refuses it), the app starts anyway and says why the
