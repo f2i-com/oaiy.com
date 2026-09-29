@@ -57,7 +57,7 @@ struct AgentPage<R: Runtime> {
 
 impl<R: Runtime> AgentExport for AgentPage<R> {
     fn request(&self, id: &str, token: &str, include_keys: bool) -> Result<(), String> {
-        let webview = self.app.get_webview(crate::embed::Page::Agent.label()).ok_or("the Agent's page is not open")?;
+        let webview = crate::embed::agent_webview(&self.app).ok_or("the Agent's page is not open")?;
         webview.eval(export_script(id, token, include_keys)).map_err(|e| e.to_string())
     }
 }

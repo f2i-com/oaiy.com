@@ -3765,6 +3765,11 @@ fn the_window_registers_each_command_plugin_and_item_of_both_features_once() {
     let tray = source_text(include_str!("../tray.rs"));
     let ids: Vec<&str> = tray.split("MenuItem::with_id(handle, \"").skip(1).map(|rest| rest.split('"').next().unwrap()).collect();
     assert_eq!(ids, ["open", "update-check", "quit"], "the tray's items");
+    // The Agent's page is found one way, for the updater's ask to save its work and for the backup's ask for its storage.
+    let commands = source_text(include_str!("commands.rs"));
+    let update = source_text(include_str!("../update/gui.rs"));
+    assert!(commands.contains("crate::embed::agent_webview(&self.app)") && update.contains("crate::embed::agent_webview(app)"));
+    assert!(!commands.contains("get_webview("), "the backup does not look the Agent's page up by its label itself");
     // Both features' routes are merged once each into the local API.
     let http = source_text(include_str!("../http.rs"));
     assert_eq!(http.matches(".merge(crate::update::routes::router(updater))").count(), 1);
