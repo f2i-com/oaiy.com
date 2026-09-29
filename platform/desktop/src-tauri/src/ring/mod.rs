@@ -11,23 +11,30 @@
 //! - [`phrases`]: whether the caller's own words asked for a person.
 //! - [`settings`]: `<data>/ring.json`.
 //! - [`limits`]: how often callers have been put through this hour.
+//! - [`host`]: the ring as this desktop runs it, and where a request is allowed or refused.
 
+pub mod contract;
+pub mod devices;
+pub mod host;
 pub mod limits;
 pub mod phrases;
 pub mod plan;
+pub mod presence;
 pub mod routes;
+pub mod session;
 pub mod settings;
 
 #[cfg(test)]
 mod tests;
 
 use std::path::Path;
-use std::sync::{Arc, Mutex, OnceLock};
+use std::sync::{Arc, OnceLock};
 
 use serde::Serialize;
-use serde_json::Value;
 
+pub use host::{Authorised, CallInfo, CallSource, Clock, DeviceSource, PresenceSource, Ring};
 pub use plan::{plan, Decision, Inputs, PlanReason, Presence, Reason, RingPlan};
+pub use session::{set_global_notifier, ActiveRing, Action, RingError, RingNotifier, TransferPlugin};
 pub use settings::{RingSettings, SettingsError, SettingsStore};
 
 /// What the receptionist may do because of the owner's settings.
@@ -39,32 +46,21 @@ pub struct Features {
     pub messages: bool,
 }
 
-/// The ring, as this desktop runs it: the owner's settings and the tries so far.
-pub struct Ring {
-    pub settings: SettingsStore,
-    pub attempts: Mutex<limits::Attempts>,
-}
-
 impl Ring {
     /// The ring kept in the data folder `dir`.
     pub fn open(dir: &Path) -> Arc<Ring> {
-        Arc::new(Ring { settings: SettingsStore::open(dir), attempts: Mutex::new(limits::Attempts::open(dir)) })
+        Ring::with(SettingsStore::open(dir), limits::Attempts::open(dir))
     }
 
     /// A ring that keeps nothing on disk (tests).
     pub fn in_memory(settings: RingSettings) -> Arc<Ring> {
-        Arc::new(Ring { settings: SettingsStore::in_memory(settings), attempts: Mutex::new(limits::Attempts::in_memory()) })
+        Ring::with(SettingsStore::in_memory(settings), limits::Attempts::in_memory())
     }
 
     /// What the receptionist may do now.
     pub fn features(&self) -> Features {
         let s = self.settings.get();
         Features { transfer: s.enabled, messages: s.messages_on() }
-    }
-
-    /// Change some of the owner's settings (see [`SettingsStore::change`]).
-    pub fn change_settings(&self, change: &Value) -> Result<(), SettingsError> {
-        self.settings.change(change).map(|_| ())
     }
 }
 
@@ -79,4 +75,34 @@ pub fn init(data_dir: &Path) {
 /// This desktop's ring (none before [`init`]: a desktop that never opened one puts nobody through).
 pub fn shared() -> Option<Arc<Ring>> {
     SHARED.get().cloned()
+}
+
+/// The phone plugin's events that matter to a ring: the call ended (whatever rings for it is over, and a call the
+/// owner had is over), and how a request came out (`aokie.call.assistance.resolved`, `data.outcome`).
+pub fn on_plugin_event(name: &str, data: &serde_json::Value, correlation: &str) {
+    let Some(ring) = shared() else { return };
+    let text = |k: &str| data.get(k).and_then(serde_json::Value::as_str).unwrap_or("");
+    match name {
+        "aokie.call.ended" => {
+            let call = if text("callId").is_empty() { correlation } else { text("callId") };
+            if !call.is_empty() {
+                ring.call_finished(call);
+                ring.call_ended_by_phone(call);
+            }
+        }
+        "aokie.call.assistance.resolved" => {
+            use crate::voice::transfer::Outcome;
+            let outcome = match text("outcome") {
+                "transferred" => Outcome::Accepted,
+                "declined" => Outcome::Declined,
+                "unavailable" => Outcome::Unavailable,
+                "expired" => Outcome::Expired,
+                _ => return,
+            };
+            if !text("requestId").is_empty() {
+                ring.resolve(text("requestId"), outcome, "phone");
+            }
+        }
+        _ => {}
+    }
 }

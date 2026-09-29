@@ -7,23 +7,54 @@
 //!                              [`super::settings::RingSettings`]), `quietHours` and `limits`
 //!                              member by member; a name that is not a setting, or a value of
 //!                              the wrong kind, is a 400 `bad_settings` and changes nothing
+//!   GET /api/ring/active    → {rings}: whom the receptionist is trying to reach the owner for now
+//!   POST /api/ring/active/:id/respond {action} → {ok, note}: the owner answers in the dialog
 //!
 //! Gated like `/api/voice/*` (`http.rs`): reading is a restricted read, changing takes the
 //! privileged gate. Nothing here needs the phone: the owner can set this up first.
 
 use std::sync::Arc;
 
-use axum::extract::State;
+use axum::extract::{Path, State};
 use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
-use axum::routing::get;
+use axum::routing::{get, post};
 use axum::{Json, Router};
 use serde_json::{json, Value};
 
 use super::Ring;
 
 pub fn router(ring: Arc<Ring>) -> Router {
-    Router::new().route("/api/ring/settings", get(get_settings).put(put_settings)).with_state(ring)
+    Router::new()
+        .route("/api/ring/settings", get(get_settings).put(put_settings))
+        .route("/api/ring/active", get(active))
+        .route("/api/ring/active/:id/respond", post(respond))
+        .with_state(ring)
+}
+
+/// `GET /api/ring/active` → `{rings}`: the callers the receptionist is trying to reach the owner for now (see
+/// [`super::session::ActiveRing`]); the dashboard's dialog asks every second while it is visible.
+async fn active(State(ring): State<Arc<Ring>>) -> Json<Value> {
+    Json(json!({"rings": ring.active()}))
+}
+
+#[derive(serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct Respond {
+    action: String,
+}
+
+/// `POST /api/ring/active/:id/respond {action}` (`accept`, `decline` or `message`) → `{ok, note}`. Accept asks the
+/// phone plugin to take the call on the owner's behalf, and the ring goes on; decline and message end the ring here
+/// at once and send the caller to the message offer. A ring that is over is a 404 `no_ring` (or 409 `ring_over`).
+async fn respond(State(ring): State<Arc<Ring>>, Path(id): Path<String>, Json(body): Json<Respond>) -> Response {
+    let Some(action) = super::session::Action::parse(&body.action) else {
+        return (StatusCode::BAD_REQUEST, Json(json!({"error": {"code": "bad_action", "message": "the action is accept, decline or message"}}))).into_response();
+    };
+    match ring.respond(&id, action) {
+        Ok(r) => Json(json!({"ok": r.ok, "note": r.note})).into_response(),
+        Err(e) => (StatusCode::from_u16(e.status).unwrap_or(StatusCode::INTERNAL_SERVER_ERROR), Json(json!({"error": {"code": e.code, "message": e.message}}))).into_response(),
+    }
 }
 
 fn shown(ring: &Ring) -> Value {

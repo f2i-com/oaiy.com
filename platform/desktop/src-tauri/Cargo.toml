@@ -172,7 +172,10 @@ regex = "1"
 windows-sys = { version = "0.61", features = [
     "Win32_Foundation",
     "Win32_System_JobObjects",
+    "Win32_System_SystemInformation",
     "Win32_System_Threading",
+    # How long ago the owner last used the computer (ring/presence.rs).
+    "Win32_UI_Input_KeyboardAndMouse",
 ] }
 
 [dev-dependencies]

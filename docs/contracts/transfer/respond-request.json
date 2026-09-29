@@ -1,0 +1,1 @@
+{"method":"connector.request","params":{"command":"call.transfer.respond","connectorId":"aokie","payload":{"action":"decline","requestId":"assist_0123456789abcdef0123456789abcdef"}}}

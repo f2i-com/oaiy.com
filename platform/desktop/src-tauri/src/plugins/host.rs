@@ -1386,6 +1386,11 @@ impl PluginHost {
             origin_run: None,
         };
 
+        // A call ended, or a request to reach the owner came out: whatever rings for it is over.
+        if matches!(name.as_str(), "aokie.call.ended" | "aokie.call.assistance.resolved") {
+            crate::ring::on_plugin_event(&name, &event.data, &event.correlation_id);
+        }
+
         // Recorded in the calendar only while a plugin provides it (turned off, it is not written to).
         if name == "aokie.appointment.requested" && crate::calendar::available() {
             if let Some(cal) = crate::calendar::shared() {
@@ -1590,7 +1595,70 @@ impl PluginHost {
             .map_err(|message| ("upstream_error".to_string(), message))
     }
 
-    /// Answer a plugin-initiated request (`flow.run`, `companion.admission`).
+    /// The phone plugin asks who may be rung for a caller who wants the owner (`oaiy.ring.plan`), and tells the
+    /// desktop the request is out (`oaiy.ring.opened`). Allowed for a plugin that holds `oaiy.companion.admission`
+    /// (already trusted with the device roster). The contract is `docs/contracts/transfer/`: the call is judged on
+    /// this desktop's own record of it, a try that is allowed is counted when it is allowed, and nothing rings for a
+    /// plan this desktop did not allow for the call.
+    pub(crate) fn handle_ring_request(
+        &self,
+        plugin_id: &str,
+        method: &str,
+        params: Value,
+    ) -> Result<Value, (String, String)> {
+        let granted = self
+            .registry
+            .lock()
+            .map(|reg| reg.grants(plugin_id, "oaiy.companion.admission"))
+            .unwrap_or(false);
+        if !granted {
+            return Err((
+                "capability_denied".into(),
+                format!("{plugin_id} does not declare the oaiy.companion.admission capability"),
+            ));
+        }
+        let Some(ring) = crate::ring::shared() else {
+            return Err(("unavailable".into(), "this build has no ring".into()));
+        };
+        let text = |k: &str| params.get(k).and_then(Value::as_str).unwrap_or("").to_string();
+        let number = |k: &str| params.get(k).and_then(Value::as_u64);
+        let bad = |why: &str| ("invalid_request".to_string(), why.to_string());
+        match method {
+            "oaiy.ring.plan" => {
+                let call = text("callId");
+                if call.is_empty() || call.len() > 256 {
+                    return Err(bad("oaiy.ring.plan needs a callId"));
+                }
+                let reason = crate::ring::Reason::parse(&text("reason")).ok_or_else(|| bad("reason is caller_asked, urgent or policy_rule"))?;
+                let turns: Vec<String> = params
+                    .get("recentCallerTurns")
+                    .and_then(Value::as_array)
+                    .map(|a| a.iter().filter_map(Value::as_str).map(str::to_string).collect())
+                    .unwrap_or_default();
+                let fallback = crate::ring::CallInfo { from: text("callerNumber"), name: String::new(), turns: crate::ring::phrases::recent(&turns) };
+                Ok(crate::ring::host::plan_result(&ring.plan_for_plugin(&call, reason, fallback)))
+            }
+            _ => {
+                let (Some(call_epoch), Some(owner_epoch), Some(expires_at)) = (number("callEpoch"), number("ownerEpoch"), number("expiresAt")) else {
+                    return Err(bad("oaiy.ring.opened needs callEpoch, ownerEpoch and expiresAt"));
+                };
+                let opened = crate::ring::contract::OpenedParams {
+                    plan_id: text("planId"),
+                    request_id: text("requestId"),
+                    call_id: text("callId"),
+                    call_epoch,
+                    owner_epoch,
+                    expires_at,
+                };
+                if opened.plan_id.is_empty() || opened.request_id.is_empty() || opened.call_id.is_empty() {
+                    return Err(bad("oaiy.ring.opened needs planId, requestId and callId"));
+                }
+                ring.opened(&opened).map(|_| json!({ "ok": true })).map_err(|e| (e.code.to_string(), e.message))
+            }
+        }
+    }
+
+    /// Answer a plugin-initiated request (`flow.run`, `companion.admission`, `oaiy.ring.plan`, `oaiy.ring.opened`).
     fn handle_plugin_request(
         &self,
         plugin_id: &str,
@@ -1600,11 +1668,14 @@ impl PluginHost {
         if method == "companion.admission" {
             return self.handle_companion_admission(plugin_id, params);
         }
+        if method == "oaiy.ring.plan" || method == "oaiy.ring.opened" {
+            return self.handle_ring_request(plugin_id, method, params);
+        }
         if method != "flow.run" {
             return Err((
                 "invalid_request".into(),
                 format!(
-                    "unknown method {method:?}; this host answers flow.run and companion.admission"
+                    "unknown method {method:?}; this host answers flow.run, companion.admission, oaiy.ring.plan and oaiy.ring.opened"
                 ),
             ));
         }
@@ -2127,6 +2198,30 @@ pub enum ForwardError {
     /// The RPC itself failed.
     Call(CallError),
     Internal(String),
+}
+
+/// The owner's answers in the ring dialog, asked of the phone plugin as its connector command
+/// `call.transfer.respond {requestId, action}` (see `docs/contracts/transfer/`). A plugin that does not declare the
+/// command is refused by the gate, and the dialog says so: nothing is claimed that the plugin did not do.
+pub struct PhoneTransfers(pub Arc<PluginHost>);
+
+impl crate::ring::TransferPlugin for PhoneTransfers {
+    fn respond(&self, request: &str, action: crate::ring::contract::RespondAction) -> Result<(), String> {
+        let action = match action {
+            crate::ring::contract::RespondAction::Accept => "accept",
+            crate::ring::contract::RespondAction::Decline => "decline",
+        };
+        let key = format!("oaiy-ring:{request}:{action}");
+        match self.0.forward_connector("aokie", "call.transfer.respond", Some(json!({ "requestId": request, "action": action })), Some(&key), Duration::from_secs(5)) {
+            Ok(answer) if answer.get("ok").and_then(Value::as_bool) == Some(false) => {
+                Err(answer.pointer("/error/message").and_then(Value::as_str).unwrap_or("the phone refused").to_string())
+            }
+            Ok(_) => Ok(()),
+            Err(ForwardError::Refused(_)) => Err("the phone plugin does not offer that".to_string()),
+            Err(ForwardError::NotRunning { .. }) => Err("the phone plugin is not running".to_string()),
+            Err(other) => Err(format!("{other:?}")),
+        }
+    }
 }
 
 fn now_ms() -> u64 {

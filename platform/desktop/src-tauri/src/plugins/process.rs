@@ -495,7 +495,10 @@ impl PluginProcess {
             "devMode": dev_mode,
             // Advertised host features the plugin may opt into. Absent means
             // a legacy host, so a plugin must tolerate an empty list.
-            "features": ["eventAck"],
+            // `ringPlan`: this host answers `oaiy.ring.plan` and `oaiy.ring.opened` (docs/contracts/transfer/). It is
+            // what this host can do, not what the owner allows: with transfers off the call's `ready` says nothing of
+            // it, so a plugin that offers the tool because of this still never puts it on the wire.
+            "features": ["eventAck", "ringPlan"],
         });
         // Sent only when there is one. An explicit null is accepted by the
         // decoder, but omitting it keeps the handshake of every ordinary plugin

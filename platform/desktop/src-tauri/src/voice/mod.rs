@@ -16,6 +16,7 @@ pub mod call;
 pub mod callers;
 pub mod contacts;
 pub mod engines;
+pub mod transfer;
 pub mod voices;
 
 use std::collections::{HashMap, VecDeque};
@@ -82,6 +83,35 @@ struct Inner {
     messages: RwLock<crate::messages::Store>,
     /// What tells the owner a message arrived, when not the desktop's own (a test's).
     notifier: RwLock<Option<Arc<dyn crate::messages::MessageNotifier>>>,
+    /// Calls the owner has taken: no session of ours carries them, and the caller is with the owner, until
+    /// they hand it back (a new session for the same call) or one of them hangs up.
+    handoffs: Mutex<HashMap<String, Instant>>,
+    /// The clocks of a request to reach the owner (a test runs them fast).
+    timing: RwLock<transfer::Timing>,
+}
+
+/// The hub as the ring sees it: what this desktop heard of a call. Held weakly: the hub holds the ring.
+struct HubCalls(std::sync::Weak<Inner>);
+
+impl crate::ring::CallSource for HubCalls {
+    fn facts(&self, call: &str) -> Option<crate::ring::CallInfo> {
+        let hub = VoiceHub { inner: self.0.upgrade()? };
+        hub.call_facts(call).map(|(from, name)| crate::ring::CallInfo { from, name, turns: hub.caller_turns(call) })
+    }
+
+    fn call_ended_by_phone(&self, call: &str) {
+        if let Some(inner) = self.0.upgrade() {
+            VoiceHub { inner }.end_handoff(call, "ended_during_handoff");
+        }
+    }
+
+    fn local_outcome(&self, call: &str, request: &str, outcome: transfer::Outcome) {
+        if let Some(inner) = self.0.upgrade() {
+            if let Some(tx) = (VoiceHub { inner }).command(call) {
+                let _ = tx.send(CallCommand::Outcome { request: request.to_string(), outcome, source: "desktop" });
+            }
+        }
+    }
 }
 
 /// How long a call's record is kept after it ends: a caller who hangs up as they finish a message still has it kept.
@@ -123,12 +153,27 @@ impl VoiceHub {
             calls: Mutex::new(HashMap::new()),
             caller_of: Box::new(caller_of),
             records: Mutex::new(HashMap::new()),
-            ring: RwLock::new(ring),
+            ring: RwLock::new(ring.clone()),
             messages: RwLock::new(crate::messages::shared()),
             notifier: RwLock::new(None),
+            handoffs: Mutex::new(HashMap::new()),
+            timing: RwLock::new(transfer::Timing::default()),
         });
         HUBS.lock().unwrap_or_else(|e| e.into_inner()).push(Arc::downgrade(&inner));
-        Self { inner }
+        let hub = Self { inner };
+        hub.adopt(&ring);
+        hub
+    }
+
+    /// The ring learns of this hub's calls, and the hub tells the app when the owner's settings change what the receptionist may do.
+    fn adopt(&self, ring: &Arc<crate::ring::Ring>) {
+        ring.set_calls(Arc::new(HubCalls(Arc::downgrade(&self.inner))));
+        let events = std::sync::Arc::downgrade(&self.inner);
+        ring.set_on_features(Arc::new(move |features| {
+            if let Some(inner) = events.upgrade() {
+                VoiceHub { inner }.emit(json!({"type": "voice.features", "transfer": features.transfer, "messages": features.messages}));
+            }
+        }));
     }
 
     /// The ring (the owner's settings for transfers and messages) this hub answers to.
@@ -136,9 +181,49 @@ impl VoiceHub {
         self.inner.ring.read().unwrap_or_else(|e| e.into_inner()).clone()
     }
 
-    /// Use another ring (tests set one with transfers on; a desktop uses the one it opened).
+    /// Use another ring (tests set one with transfers on; a desktop uses the one it opened). It learns of this hub's calls.
     pub fn set_ring(&self, ring: Arc<crate::ring::Ring>) {
+        self.adopt(&ring);
         *self.inner.ring.write().unwrap_or_else(|e| e.into_inner()) = ring;
+    }
+
+    /// The clocks a call's request to reach the owner runs by.
+    pub fn transfer_timing(&self) -> transfer::Timing {
+        *self.inner.timing.read().unwrap_or_else(|e| e.into_inner())
+    }
+
+    /// Run the clocks of calls that begin from now on at `timing` (tests).
+    pub fn set_transfer_timing(&self, timing: transfer::Timing) {
+        *self.inner.timing.write().unwrap_or_else(|e| e.into_inner()) = timing;
+    }
+
+    /// The call goes to the owner: the session that carried it has ended, and the call has not.
+    fn enter_handoff(&self, call: &str, reason: &str) {
+        self.inner.handoffs.lock().unwrap_or_else(|e| e.into_inner()).insert(call.to_string(), Instant::now());
+        self.emit(json!({"type": "call.handoff", "callId": call, "phase": "to_human", "reason": reason}));
+    }
+
+    pub fn in_handoff(&self, call: &str) -> bool {
+        self.inner.handoffs.lock().unwrap_or_else(|e| e.into_inner()).contains_key(call)
+    }
+
+    /// The session that carried `call` ends because the owner takes it: its commands are gone, and the call goes on.
+    fn release_for_handoff(&self, call: &str, reason: &str) {
+        self.inner.calls.lock().unwrap().remove(call);
+        self.enter_handoff(call, reason);
+    }
+
+    /// The call is ours again (a new session for it began).
+    fn leave_handoff(&self, call: &str) -> Option<Duration> {
+        self.inner.handoffs.lock().unwrap_or_else(|e| e.into_inner()).remove(call).map(|since| since.elapsed())
+    }
+
+    /// A call that was with the owner ends: nobody is left to say so (no session), so this says it.
+    fn end_handoff(&self, call: &str, reason: &str) {
+        if self.inner.handoffs.lock().unwrap_or_else(|e| e.into_inner()).remove(call).is_some() {
+            self.note_ended(call);
+            self.emit(json!({"type": "call.ended", "callId": call, "reason": reason}));
+        }
     }
 
     pub fn messages(&self) -> crate::messages::Store {
@@ -270,8 +355,15 @@ impl VoiceHub {
         self.inner.calls.lock().unwrap().get(call).cloned()
     }
 
+    /// The calls going on now: those we answer, and those the owner has taken.
     pub fn live_calls(&self) -> Vec<String> {
-        self.inner.calls.lock().unwrap().keys().cloned().collect()
+        let mut calls: Vec<String> = self.inner.calls.lock().unwrap().keys().cloned().collect();
+        for call in self.inner.handoffs.lock().unwrap_or_else(|e| e.into_inner()).keys() {
+            if !calls.contains(call) {
+                calls.push(call.clone());
+            }
+        }
+        calls
     }
 }
 
@@ -493,7 +585,8 @@ async fn transcribe(State(hub): State<VoiceHub>, body: axum::body::Bytes) -> axu
 }
 
 async fn events(State(hub): State<VoiceHub>) -> impl IntoResponse {
-    let hello = json!({"type": "hello", "calls": hub.live_calls()});
+    // `features`: what the receptionist may do (transfer calls, take messages), for an app that has just connected.
+    let hello = json!({"type": "hello", "calls": hub.live_calls(), "features": hub.ring().features()});
     let rx = hub.inner.events.subscribe();
     let stream = futures_util::stream::unfold((Some(hello), rx), |(first, mut rx)| async move {
         if let Some(h) = first {
