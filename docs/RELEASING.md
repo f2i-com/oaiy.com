@@ -82,12 +82,15 @@ new version instead.
 
 ## What is not in a release
 
-- **The engines.** `oaiy-llm-server` (and its WebGPU build), `oaiy-media` and `oaiy-voice`
-  need CUDA 12.8 and the Visual Studio 2022 C++ tools to build
-  (`tools/qwen-image/build.ps1`) and are built by hand: they are a separate channel, and
-  no workflow here builds them. The desktop finds them beside itself, in an `engines`
-  folder there, or where `OAIY_ENGINES_DIR` points. An install without them has no models
-  of its own on the computer; the Agent can still use ChatGPT or a provider.
+- **The engines.** The programs that run models: `oaiy-llm-server` and `oaiy-media`, built
+  with CUDA 12.8 and the Visual Studio 2022 C++ tools; `oaiy-llm-server-webgpu`, the same
+  server without CUDA, for a computer that lacks it; the `oaiy-studio` host and its tray;
+  and `oaiy-voice`, the speech server for calls. `tools/qwen-image/build.ps1` builds all of
+  them on Windows but `oaiy-voice`, which is a crate of its own (its `cuda` and
+  `flash-attn` features put it on the GPU). They are built by hand: they are a separate
+  channel, and no workflow here builds them. The desktop finds them beside itself, in an
+  `engines` folder there, or where `OAIY_ENGINES_DIR` points. An install without them has
+  no models of its own on the computer; the Agent can still use ChatGPT or a provider.
 - **Aokie**, the phone plugin. It is a separate product: OAIY installs it from a folder or
   an archive, and no release of OAIY contains it.
 - **Signed installers, and updates.** The installers are not signed, and OAIY does not
