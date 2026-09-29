@@ -1134,8 +1134,8 @@ export class Sessions {
       // A hidden number ("", "Private", "Withheld"): a conversation of its own for this call (never shared with another hidden caller), named as such.
       const hidden = isHidden(String(event.from ?? ''));
       const from = hidden ? callId : String(event.from);
-      // A call of an outreach: one we placed (by its id), or someone on a list who rang in. Its person's name names the conversation.
-      const outreach = type === 'call.started' && !hidden ? this.outreach?.forCall(callId, from) : undefined;
+      // A call of an outreach: one we placed (by its id, kept across a reload), or someone on a list who rang in. Its person's name names the conversation.
+      const outreach = !hidden ? this.outreach?.forCall(callId, from) : undefined;
       session = await this.conversationWith(from, hidden ? 'Hidden number' : String(event.name ?? '') || outreach?.person || '', 'call', hidden);
       // Their last contact before this call (their texts, their last call), from what the conversation holds now.
       const history = this.turnsOf(session.thread);
@@ -1157,9 +1157,10 @@ export class Sessions {
         session.held = [];
         session.cutAtMs = undefined;
         session.callerSpeaking = false;
-        session.outreach = outreach;
         session.endNudged = false;
       }
+      // (A call taken up by the caller's words, after a reload, keeps its outreach too; any other has none.)
+      session.outreach = outreach;
       const who = `${session.title}${session.title !== session.key ? ` (${session.key})` : ''}`;
       // A call the phone placed (Aokie says so): the agent rang them, and why (an outreach's objective).
       const link = session.outreach && !session.outreach.inbound ? session.outreach : undefined;
