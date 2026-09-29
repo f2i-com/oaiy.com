@@ -18,6 +18,8 @@ pub mod modules;
 pub mod agent_tasks;
 /// The setup wizard's record (`<data>/setup.json`) and routes.
 pub mod setup;
+/// The Agent's control API: the MCP server it configures OAIY with (`/api/mcp`).
+pub mod control;
 
 /// Port the localhost API binds to. Fixed so oaiy-web's detection probe has a
 /// stable target. Shared by both binaries (the GUI and the headless server).
@@ -1366,6 +1368,16 @@ pub fn run() {
             // user relocates the data folder.
             crate::applog::LOGGER.attach(&data_dir);
             log::info!("OAIY Desktop {} starting (data={})", env!("CARGO_PKG_VERSION"), data_dir.display());
+            // The Agent's control tools show a page in the dashboard (a plugin's
+            // setup step, say) with this event; the dashboard listens for it.
+            {
+                let handle = app.handle().clone();
+                crate::control::set_navigator(Arc::new(move |payload: serde_json::Value| {
+                    use tauri::Emitter as _;
+                    crate::tray::show_main(&handle);
+                    handle.emit(crate::control::NAVIGATE_EVENT, payload).map_err(|e| e.to_string())
+                }));
+            }
             // The engines: started on their own thread (a running studio is found
             // over HTTP, and launching one binds its ports), so the window is not kept waiting.
             {

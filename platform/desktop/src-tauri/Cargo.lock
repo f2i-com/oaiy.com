@@ -2583,6 +2583,7 @@ dependencies = [
  "tauri-plugin-shell",
  "tauri-plugin-single-instance",
  "tokio",
+ "tower",
  "tower-http",
  "url",
  "uuid",

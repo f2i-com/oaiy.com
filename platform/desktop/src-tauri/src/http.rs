@@ -739,11 +739,15 @@ fn is_privileged_path(method: &Method, path: &str) -> bool {
                 || is_bridge_exec_path(path)
                 || is_ai_exec_path(path)
                 || is_personal_path(path)
+                || is_control_path(path)
+                || is_engine_control_path(path)
         }
         Method::PATCH => is_personal_path(path),
         // PUT is only used by the bridge (flow documents). A flow doc is
         // executable code the worker hands to the CLI, so it is exec surface.
-        Method::PUT => is_bridge_exec_path(path) || is_personal_path(path) || is_setup_path(path),
+        Method::PUT => {
+            is_bridge_exec_path(path) || is_personal_path(path) || is_setup_path(path) || is_control_path(path) || is_engine_control_path(path)
+        }
         Method::DELETE => {
             path.starts_with("/api/services/")
                 || path.starts_with("/api/models/")
@@ -753,9 +757,25 @@ fn is_privileged_path(method: &Method, path: &str) -> bool {
                 || is_bridge_exec_path(path)
                 || is_ai_exec_path(path)
                 || is_personal_path(path)
+                || is_control_path(path)
         }
         _ => false,
     }
+}
+
+/// The control API (`control/`): the MCP server the Agent configures OAIY
+/// with, the Agent's switch and the log of what it changed. Its tools reach
+/// everything the other privileged routes do, so every change takes the
+/// privileged gate and every read is a restricted read, like `/api/setup`.
+fn is_control_path(path: &str) -> bool {
+    path == "/api/mcp" || path == "/api/control" || path.starts_with("/api/control/")
+}
+
+/// Choosing the engines' models and starting or stopping their language
+/// model (`control/engines.rs`): the engines' configuration, taken on the
+/// privileged gate like their downloads.
+fn is_engine_control_path(path: &str) -> bool {
+    path == "/api/engines/defaults" || path.starts_with("/api/engines/llm/")
 }
 
 /// Where the engines' control pages are, once the desktop found or started them (see `engines.rs`).
@@ -1116,6 +1136,8 @@ fn is_restricted_read_path(path: &str) -> bool {
         || path.starts_with("/api/engines/")
         // How far setup got, which plugins were chosen, what was accepted.
         || is_setup_path(path)
+        // The MCP server (a GET is 405 behind this), the Agent's switch, and what it changed.
+        || is_control_path(path)
 }
 
 /// Stricter allow-list for privileged endpoints: OAIY Desktop's OWN webview and
@@ -1423,6 +1445,10 @@ pub async fn serve(
         crate::voice::voices::init(&dir);
         crate::voice::callers::init(&dir);
     }
+    // The Agent's control API: its switch and its log live in the data folder too.
+    let control = crate::control::Control::new(
+        &registry.lock().map(|r| r.data_dir().to_path_buf()).unwrap_or_else(|_| std::env::temp_dir().join("oaiy-control-unavailable")),
+    );
     // Which modules (the phone, the calendar) a plugin provides: worked out now, then kept up to date.
     crate::modules::start(bridge.plugins.clone());
     // The setup wizard's record. Made now when there is none, so a desktop
@@ -1538,6 +1564,8 @@ pub async fn serve(
         .merge(companion_routes)
         .merge(link_routes)
         .merge(ai_routes)
+        // The MCP server and the Agent's switch: inside the guard, like everything else.
+        .merge(crate::control::router(control.clone()))
         .layer(middleware::from_fn_with_state(
             // A network listener must never trust a forgeable Origin, even
             // when launched by the GUI. Its clients must present a credential.
@@ -1548,6 +1576,9 @@ pub async fn serve(
         // OUTSIDE the CORS layer so it runs after it and can add to the
         // preflight response CORS produced.
         .layer(axum::middleware::from_fn(allow_private_network));
+    // The control tools call the routes above in-process, through this same
+    // router and its gate (see `control/`).
+    control.set_router(app.clone());
 
     let addr = SocketAddr::from((
         if bind_all { [0, 0, 0, 0] } else { [127, 0, 0, 1] },
@@ -1571,6 +1602,13 @@ fn validate_listener_auth(bind_all: bool, token: Option<&str>) -> Result<(), Box
         return Err("network binding requires a non-empty OAIY_SERVER_TOKEN; use loopback or configure authentication".into());
     }
     Ok(())
+}
+
+/// `router` behind the same gate `serve` puts in front of everything, for the
+/// tests of other modules (the control tools' in-process calls go through it).
+#[cfg(test)]
+pub(crate) fn guarded_for_tests(router: Router, token: Option<String>, gui_mode: bool) -> Router {
+    router.layer(middleware::from_fn_with_state(AuthConfig { token, gui_mode, pairing: None }, origin_guard))
 }
 
 #[cfg(test)]
@@ -1938,6 +1976,69 @@ mod tests {
         // Choosing the Agent's model decides which account its conversations
         // spend: the privileged gate, like setup.
         assert!(is_privileged_path(&Method::PUT, "/api/agent/preferences"));
+    }
+
+    #[test]
+    fn the_control_api_is_restricted_and_its_changes_privileged() {
+        // The MCP server's tools reach everything the other privileged routes
+        // do, so it takes their gate: OAIY's own window or a token holder.
+        for (m, path) in [
+            (Method::POST, "/api/mcp"),
+            (Method::PUT, "/api/control/settings"),
+            (Method::POST, "/api/control/anything"),
+            (Method::DELETE, "/api/control/log"),
+            // Choosing the engines' models, starting and stopping their language model.
+            (Method::PUT, "/api/engines/defaults"),
+            (Method::POST, "/api/engines/llm/start"),
+            (Method::POST, "/api/engines/llm/stop"),
+            (Method::POST, "/api/engines/llm/restart"),
+        ] {
+            assert!(is_privileged_path(&m, path), "{m} {path} must be privileged");
+        }
+        for path in [
+            "/api/mcp",
+            "/api/control/settings",
+            "/api/control/log",
+            "/api/control/desktop-log",
+            "/api/engines/defaults",
+            "/api/engines/logs",
+        ] {
+            assert!(is_restricted_read_path(path), "{path} must be a restricted read");
+        }
+        assert!(!is_restricted_read_path("/api/mcpx"));
+        assert!(!is_restricted_read_path("/api/controls"));
+    }
+
+    #[tokio::test]
+    async fn the_mcp_endpoint_is_closed_to_a_stranger_and_open_to_the_token() {
+        use axum::{middleware, routing::post, Router};
+        let app = Router::new()
+            .route("/api/mcp", post(|| async { "answered" }))
+            .layer(middleware::from_fn_with_state(
+                AuthConfig { token: Some("desk-token".into()), gui_mode: true, pairing: None },
+                super::origin_guard,
+            ));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let base = format!("http://{}", listener.local_addr().unwrap());
+        let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        let client = reqwest::Client::new();
+        // A local page (any loopback origin in a release build) or a plugin's
+        // sandboxed frame (origin null) is refused; so is a native caller
+        // with no credential.
+        for origin in [Some("null"), Some("http://evil.example"), None] {
+            let mut request = client.post(format!("{base}/api/mcp")).body("{}");
+            if let Some(origin) = origin {
+                request = request.header("Origin", origin);
+            }
+            let status = request.send().await.unwrap().status();
+            assert_eq!(status, 403, "{origin:?}");
+        }
+        // The Agent's page (its own scheme) and a token holder get in.
+        let own = client.post(format!("{base}/api/mcp")).header("Origin", "http://oaiy.localhost").body("{}").send().await.unwrap();
+        assert_eq!(own.status(), 200);
+        let token = client.post(format!("{base}/api/mcp")).bearer_auth("desk-token").body("{}").send().await.unwrap();
+        assert_eq!(token.status(), 200);
+        server.abort();
     }
 
     /// A stand-in for the engines' control port: their catalog with one model
