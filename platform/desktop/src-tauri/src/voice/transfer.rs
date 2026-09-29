@@ -678,7 +678,7 @@ mod tests {
 
     #[test]
     fn a_refusal_tells_the_model_what_to_do_and_never_why() {
-        for reason in ["quiet_hours", "no_endpoint", "no_device", "all_do_not_disturb", "disabled", "initiative_off", "not_urgent", "consent"] {
+        for reason in ["quiet_hours", "no_endpoint", "all_do_not_disturb", "disabled", "initiative_off", "not_urgent", "consent"] {
             let r = refused("unavailable", reason);
             assert_eq!((r["ok"].clone(), r["output"]["status"].clone(), r["output"]["reason"].clone()), (json!(false), json!("unavailable"), json!(reason)));
             let instruction = r["output"]["instruction"].as_str().unwrap();

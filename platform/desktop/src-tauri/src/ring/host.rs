@@ -287,8 +287,9 @@ impl Ring {
         Ok(())
     }
 
-    /// The plan for a request on `call`, without counting it: for showing what would happen.
-    fn decide(&self, call: &str, reason: Reason, info: &CallInfo, settings: &RingSettings) -> RingPlan {
+    /// The plan for a request on `call`, without counting it, and whether it was made `no_endpoint` because only this computer's toast
+    /// would have rung (the owner is then told why nobody rang).
+    fn decide(&self, call: &str, reason: Reason, info: &CallInfo, settings: &RingSettings) -> (RingPlan, bool) {
         let now_unix = self.clock().unix();
         let local = self.clock().local();
         let caller_key = caller_key(&info.from);
@@ -319,12 +320,13 @@ impl Ring {
         let plan = plan(&inputs);
         // The reference rings this computer's toast on its own (its vector V01: the owner at the PC). But a toast is not
         // somebody a call can be offered to: the phone plugin offers a transfer only to the devices a plan names, so a plan
-        // that names none opens nothing, and a try counted for it would be spent for a ring that cannot happen. Decided
-        // here, before anything is counted: the caller is offered a message, and the owner is told why nobody rang.
+        // that names none opens nothing (it answers `no_endpoint`), and a try counted for it would be spent for a ring that
+        // cannot happen. Decided here, before anything is counted: the caller is offered a message, and the owner is told why
+        // nobody rang.
         if plan.rings() && plan.targets().is_empty() {
-            return RingPlan::refuse(PlanReason::NoDevice, Decision::MessageOnly);
+            return (RingPlan::refuse(PlanReason::NoEndpoint, Decision::MessageOnly), true);
         }
-        plan
+        (plan, false)
     }
 
     /// Whether a request to reach the owner on `call` is allowed: judged on what this desktop heard
@@ -339,8 +341,8 @@ impl Ring {
     }
 
     fn judge(&self, call: &str, reason: Reason, info: CallInfo, settings: &RingSettings) -> Authorised {
-        let plan = self.decide(call, reason, &info, settings);
-        if plan.reason == PlanReason::NoDevice {
+        let (plan, toast_only) = self.decide(call, reason, &info, settings);
+        if toast_only {
             self.note_no_device(call, &info);
         }
         let reason_allowed = plan.decision == Decision::Ring && vouches_for(reason, settings, &info.turns);

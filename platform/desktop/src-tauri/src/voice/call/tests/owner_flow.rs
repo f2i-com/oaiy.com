@@ -517,12 +517,12 @@ async fn in_the_default_setup_nobody_is_rung_for_want_of_a_device_the_owner_is_t
     let mut f = flow_on(owner_settings(true), None, devices).await;
     f.caller_says(ASKED);
     let answer = answer_of(asking(&f.aokie, transfer::TOOL, json!({"reason": "caller_asked"}))).await.unwrap();
-    assert_eq!((answer["ok"].clone(), answer["output"]["status"].clone(), answer["output"]["reason"].clone()), (json!(false), json!("unavailable"), json!("no_device")), "{answer}");
+    assert_eq!((answer["ok"].clone(), answer["output"]["status"].clone(), answer["output"]["reason"].clone()), (json!(false), json!("unavailable"), json!("no_endpoint")), "{answer}");
     assert!(answer["output"]["instruction"].as_str().unwrap().contains("take a message"), "{answer}");
     assert!(f.aokie.text("formlogic.realtime.tool_call", Duration::from_millis(300)).await.is_none(), "nothing reached the phone");
     // The plugin asking is answered the same way, so it opens nothing.
     let plan = PluginHost::ring_request(&f.ring, "oaiy.ring.plan", json!({"callId": f.aokie.call, "reason": "caller_asked", "recentCallerTurns": [ASKED]})).unwrap();
-    assert_eq!((plan["decision"].as_str(), plan["reason"].as_str()), (Some("message_only"), Some("no_device")), "{plan}");
+    assert_eq!((plan["decision"].as_str(), plan["reason"].as_str()), (Some("message_only"), Some("no_endpoint")), "{plan}");
     assert!(plan["phones"].as_array().unwrap().is_empty() && plan["desktopCompanions"].as_array().unwrap().is_empty());
     // No try was spent, no ring is shown, and the owner is told what happened and why.
     assert_eq!(tries(&f.aokie).global_attempts_last_hour, 0);

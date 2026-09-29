@@ -183,8 +183,13 @@ fn several_endpoints_ring_together_and_only_the_right_ones() {
     desk.devices = vec![phone("pixel"), windows("win1")];
     let p = plan(&desk);
     assert_eq!((p.phones.clone(), p.desktop_companions.clone(), p.desktop_toast, p.ring_seconds), (vec![], vec!["win1".to_string()], true, 30));
-    // A Windows Companion that is not connected cannot take a call from the desktop.
+    // A Windows Companion that is not running is named all the same: the toast starts it, and the phone plugin offers it the request
+    // when it connects inside the ring window. Left out, the owner at the computer would get a plan that names nobody.
     desk.devices[1].online = false;
+    let p = plan(&desk);
+    assert_eq!((p.decision, p.desktop_companions.clone(), p.desktop_toast), (Decision::Ring, vec!["win1".to_string()], true));
+    // Its availability still counts: one set to do not disturb is not named.
+    desk.devices[1].availability = Availability::DoNotDisturb;
     assert!(plan(&desk).desktop_companions.is_empty());
 }
 
@@ -397,7 +402,6 @@ fn a_reason_is_named_as_the_wire_names_it() {
         PlanReason::QuietHours,
         PlanReason::AllDoNotDisturb,
         PlanReason::NoEndpoint,
-        PlanReason::NoDevice,
     ] {
         assert_eq!(serde_json::to_value(reason).unwrap(), json!(reason.as_str()));
     }

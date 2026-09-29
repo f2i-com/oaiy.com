@@ -94,10 +94,10 @@ pub enum PlanReason {
     LimitGlobal,
     QuietHours,
     AllDoNotDisturb,
+    /// Nobody a call can be offered to: no device at all, or only this computer's toast, which is a notification and not
+    /// somebody (see `Ring::decide`). The phone plugin's reason for a plan that names no device is this one, whether or not it
+    /// sets the toast, so it is the one that goes on the wire.
     NoEndpoint,
-    /// The plan would have rung this computer's toast and nothing a call can be offered to: this desktop's own
-    /// reason, not the reference's (see `Ring::decide`). Nothing is rung and no try is counted.
-    NoDevice,
 }
 
 impl PlanReason {
@@ -115,7 +115,6 @@ impl PlanReason {
             PlanReason::QuietHours => "quiet_hours",
             PlanReason::AllDoNotDisturb => "all_do_not_disturb",
             PlanReason::NoEndpoint => "no_endpoint",
-            PlanReason::NoDevice => "no_device",
         }
     }
 }
@@ -360,10 +359,13 @@ pub fn plan(i: &Inputs) -> RingPlan {
     let phone_wanted = s.phone_ring == PhoneRing::Always || (s.phone_ring == PhoneRing::WhenAway && away);
     let phones: Vec<&Device> = if phone_wanted { available.iter().copied().filter(|d| d.kind != DeviceKind::Windows).collect() } else { Vec::new() };
     let desktop_allowed = s.desktop_ring != DesktopRing::Never && s.away != Away::On && p != Presence::Off && (s.desktop_ring == DesktopRing::Always || p == Presence::Active);
+    // Every paired Windows Companion is named, running or not: the toast is what starts one that is not, and the phone plugin offers
+    // it the request when it connects inside the ring window. (The reference names only one that is online; a plan for the owner at
+    // the computer would then name nobody at the very moment it matters, and the plugin answers a plan that names nobody `no_endpoint`.)
     let desktop_companions: Vec<String> = if desktop_allowed {
         i.devices
             .iter()
-            .filter(|d| d.call_authority && d.can_take && d.kind == DeviceKind::Windows && d.online && d.availability == Availability::Available)
+            .filter(|d| d.call_authority && d.can_take && d.kind == DeviceKind::Windows && d.availability == Availability::Available)
             .map(|d| d.id.clone())
             .collect()
     } else {

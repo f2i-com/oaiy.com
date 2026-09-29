@@ -371,12 +371,13 @@ fn a_toast_alone_is_not_a_ring_so_nobody_is_planned_for_and_no_try_is_counted() 
     // The reference plans a ring for the owner at their computer with only the toast, and this desktop does not: a plugin that
     // offers a transfer only to the devices a plan names would open nothing for it.
     let plan = r.ring.authorise(CALL, Reason::CallerAsked);
-    assert_eq!((plan.plan.decision, plan.plan.reason), (Decision::MessageOnly, PlanReason::NoDevice), "{:?}", plan.plan);
+    assert_eq!((plan.plan.decision, plan.plan.reason), (Decision::MessageOnly, PlanReason::NoEndpoint), "{:?}", plan.plan);
+    assert_eq!(crate::ring::host::plan_result(&plan)["reason"], "no_endpoint", "the plugin's word for a plan that names nobody; a reason it does not know it turns into plan_unavailable");
     assert!(!plan.rings() && !plan.plan_id.is_empty(), "a plan that rings nobody has an id all the same");
     assert!(!plan.plan.desktop_toast && plan.plan.targets().is_empty());
     // The plugin asking is answered the same way, and nothing was counted for either.
     let asked = r.ring.plan_for_plugin(CALL, Reason::CallerAsked, CallInfo::default());
-    assert_eq!((asked.plan.decision, asked.plan.reason), (Decision::MessageOnly, PlanReason::NoDevice));
+    assert_eq!((asked.plan.decision, asked.plan.reason), (Decision::MessageOnly, PlanReason::NoEndpoint));
     let counters = r.ring.attempts.lock().unwrap().counters(CALL, "491570006", r.ring.clock().unix());
     assert_eq!((counters.attempts_this_call, counters.global_attempts_last_hour), (0, 0), "no try was spent on a ring that cannot happen");
     assert!(r.ring.active().is_empty() && r.notified.rang.lock().unwrap().is_empty());

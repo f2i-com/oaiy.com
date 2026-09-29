@@ -139,7 +139,7 @@ desktop gates it (all of these, in call.rs, before anything reaches the phone):
     no request is going · the caller's own words asked for a person · quiet hours, presence, devices,
     and the limits (per call, per gap, per caller and overall per hour) allow a ring · and there is a
     device to offer the call to (see below): a plan that would ring only this computer's toast is
-    message_only / no_device, decided before a try is counted
+    message_only / no_endpoint, decided before a try is counted
 phone : oaiy.ring.plan (same plan, counted once) → request → oaiy.ring.opened → tool_result "ringing"
 desktop rings: a native notification and the dialog; the phone offers the call to the Companions the plan
         names, and to no others
@@ -156,10 +156,12 @@ agent : "I'll try to reach them, please stay with me."  (it is trying: it does n
   `desktopCompanions`), and answers a plan that names none `no_endpoint`, opening nothing. This desktop
   therefore never plans a `ring` that names nobody: when the reference policy would ring only the toast
   (the owner at the computer, no Companion ticked as this computer's), the plan is `message_only` with
-  the reason `no_device`, before any try is counted, the model is told to offer a message, and the owner
+  the reason `no_endpoint` (the plugin's own word for it), before any try is counted, the model is told to offer a message, and the owner
   is told what happened (a notice in the dialog and a notification, at most one chime every ten
   minutes). The Companion on this computer is the approved device the owner ticks on the Transfers
-  page; it is named in `desktopCompanions` while the owner is at the computer.
+  page; it is named in `desktopCompanions` while the owner is at the computer, running or not: the
+  notification is what starts a Companion that is not running, and the plugin offers it the request
+  when it connects inside the ring window.
 - **What the model is told.** The instructions and the tool list follow the owner's settings, not the
   call, so they are the same for every call and caller and the engine's prompt cache holds them (with
   the settings off, they are byte for byte what they were). Whether the owner can be rung on *this*
