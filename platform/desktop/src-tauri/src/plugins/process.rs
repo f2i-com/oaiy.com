@@ -158,8 +158,10 @@ impl PluginProcess {
         let data_dir = plugin_data_dir(dir);
         // Created eagerly: a plugin told where its data dir is will write there
         // immediately, and failing on the first write is a worse first run than
-        // failing here where we can name the path.
-        std::fs::create_dir_all(&data_dir)
+        // failing here where we can name the path. Owner-only where this makes
+        // it (unix): Aokie keeps its phone pairing keys in here, and what a
+        // plugin writes is its own business but the folder it writes into is ours.
+        crate::secret_file::create_private_dir(&data_dir)
             .map_err(|e| format!("cannot create plugin data dir {}: {e}", data_dir.display()))?;
 
         let env = plugin_env(
@@ -1273,6 +1275,17 @@ sleep 300
             assert_eq!(group(plugin), plugin.to_string(), "the plugin leads a group of its own");
             assert_ne!(group(plugin), ours, "and it is not this process's group");
             assert_eq!(group(helper), plugin.to_string(), "a helper the plugin starts joins the plugin's group");
+            p.kill();
+        }
+
+        #[test]
+        fn a_plugins_data_folder_is_owner_only_where_oaiy_makes_it() {
+            let f = Fixture::new();
+            let p = f.spawn();
+            f.pid("plugin.pid");
+            let data = plugin_data_dir(&f.dir);
+            crate::secret_file::testing::assert_private_dir(&data);
+            crate::secret_file::testing::assert_private_dir(data.parent().unwrap());
             p.kill();
         }
 
