@@ -25,6 +25,7 @@ gui = [
     "dep:tauri-plugin-dialog",
     "dep:tauri-plugin-notification",
     "dep:tauri-plugin-single-instance",
+    "dep:tauri-plugin-updater",
     "dep:oaiy-studio",
     "dep:tauri-build",
 ]
@@ -53,6 +54,10 @@ tauri-plugin-dialog = { version = "2.0", optional = true }
 tauri-plugin-notification = { version = "2.0", optional = true }
 # One OAIY: launching it again shows the running one's window.
 tauri-plugin-single-instance = { version = "2", optional = true }
+# The desktop's own updates: the release feed, the download and its signature check (minisign,
+# against the public key in tauri.conf.json). Only its Rust API is used: no webview is given its
+# commands.
+tauri-plugin-updater = { version = "2", optional = true }
 # The engines (language models, media), run by the desktop: std-only, no CUDA to build.
 oaiy-studio = { path = "../../../crates/oaiy-studio", optional = true }
 serde = { version = "1.0", features = ["derive"] }
@@ -127,6 +132,15 @@ getrandom = "0.2"
 # every key and nonce here is either derived or counter-based, and the crate's
 # curve25519-dalek unifies with the one ed25519-dalek already pulls in.
 crypto_box = { version = "0.9", default-features = false, features = ["alloc", "salsa20"] }
+
+# Which version is newer (pre-releases ordered as semver orders them): the rule an update is
+# offered by, both binaries. The updater plugin compares with the same crate.
+semver = "1"
+
+# The signature an update is checked against (minisign, the format the release is signed in).
+# The updater plugin checks a download with it; `update::verify` checks it again, with the same
+# key, before a download is ever offered to install.
+minisign-verify = "0.2"
 
 # Content verification for model downloads. HuggingFace serves the file's
 # git-lfs OID — which IS its SHA-256 — in `X-Linked-ETag`, so the overwhelming
