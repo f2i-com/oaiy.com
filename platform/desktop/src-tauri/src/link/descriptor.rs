@@ -1097,7 +1097,11 @@ impl ConnectorDescriptor {
         {
             return Err("desktopFlows requires desktopAi and flows.graphPath".into());
         }
-        for r in self.relay.iter().chain(self.desktop_flows.iter()) {
+        // Two lanes have this shape, and an error names the one it is in.
+        for (lane, r) in [("relay", self.relay.as_ref()), ("desktopFlows", self.desktop_flows.as_ref())]
+            .into_iter()
+            .filter_map(|(lane, r)| Some((lane, r?)))
+        {
             for (label, path) in [
                 ("pendingPath", &r.pending_path),
                 ("claimPath", &r.claim_path),
@@ -1105,7 +1109,7 @@ impl ConnectorDescriptor {
             ] {
                 if !path.starts_with('/') {
                     return Err(format!(
-                        "connector {:?} relay {label} must begin with '/', got {path:?}",
+                        "connector {:?} {lane} {label} must begin with '/', got {path:?}",
                         self.id
                     ));
                 }
@@ -1115,21 +1119,21 @@ impl ConnectorDescriptor {
             for (label, path) in [("claimPath", &r.claim_path), ("completePath", &r.complete_path)] {
                 if !path.contains("{id}") {
                     return Err(format!(
-                        "connector {:?} relay {label} must contain the {{id}} placeholder",
+                        "connector {:?} {lane} {label} must contain the {{id}} placeholder",
                         self.id
                     ));
                 }
             }
             if r.wait_seconds == 0 || r.wait_seconds > 300 {
                 return Err(format!(
-                    "connector {:?} relay wait {} is out of range (1..300s)",
+                    "connector {:?} {lane} wait {} is out of range (1..300s)",
                     self.id, r.wait_seconds
                 ));
             }
             if r.batch_limit == 0 || r.batch_limit > 50 || r.error_backoff_seconds == 0 {
-                return Err("relay batch limit must be 1..50 and backoff must be positive".into());
+                return Err(format!("{lane} batch limit must be 1..50 and backoff must be positive"));
             }
-            check_idle_pause(&self.id, "relay", r.idle_pause_ms)?;
+            check_idle_pause(&self.id, lane, r.idle_pause_ms)?;
         }
         if let Some(a) = &self.desktop_ai {
             for (label, path) in [
@@ -1625,7 +1629,8 @@ mod tests {
                     _ => d.desktop_ai.as_mut().unwrap().idle_pause_ms = bad,
                 }
                 let e = d.validate().expect_err("a pause out of range must be refused");
-                assert!(e.contains("idlePauseMs") && e.contains(&bad.to_string()), "{lane} {bad}: {e}");
+                // …and says which lane's it is (the encrypted flow lane shares the relay's shape).
+                assert!(e.contains(&format!(" {lane} idlePauseMs {bad} ")), "{lane} {bad}: {e}");
             }
         }
         for good in [100u64, 500, 60_000] {
