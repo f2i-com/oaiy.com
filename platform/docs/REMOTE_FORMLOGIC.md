@@ -42,6 +42,93 @@ to FormLogic by those steps is visible to its backend. Linking a computer grants
 scoped access to the account, not unrestricted access to anonymous site visitors.
 Existing app roles, connector permissions and device approvals still apply.
 
+## What the website can and cannot run on this computer
+
+The website queues commands for the linked computer and the desktop runs each
+one it claims. Anyone who acts as the account's owner on the site can queue one,
+whether that is a signed-in browser or a leaked account key, and nothing on this
+side can tell them from the owner. So what the desktop will run for the website
+is decided by the desktop: by a list that ships inside OAIY
+(`desktop/src-tauri/resources/relay-policy.json`), not by the website, and not by
+the plugin's own manifest.
+
+There are two kinds of command.
+
+- **This computer's own** (the `desktop` connector): list, start, stop, restart
+  and repair services, and list, start, stop, restart and check plugins. A closed
+  list; any other op is refused by name.
+- **A plugin's connector**, such as the phone bridge's `call.answer`. It reaches
+  the plugin only if the list says the website may run it, and then still passes
+  the plugin's own gate (declared in its manifest, and keyed if it changes
+  something). A connector with an entry in the list gets exactly the commands the
+  entry names. There is no wildcard: a command is reachable when it is written
+  down. A connector with no entry gets only the commands its plugin declares and
+  does not journal (its reads), and nothing it journals. A list that is missing,
+  unreadable or not understood allows no command for a plugin at all, reads
+  included; the desktop's own ops do not depend on it.
+
+A command that is not allowed is answered as failed at once, with a sentence the
+website can show, and never reaches the plugin: `The "dongle.installDriver"
+command of the "aokie" plugin can only be run from OAIY on this computer, so it
+was refused here and never reached the plugin.` A command with no command id is
+refused too, since the plugin's idempotency key is made from it.
+
+### The phone bridge
+
+| The website may run | Only from OAIY on this computer |
+| --- | --- |
+| `call.current`, `phone.status`, `dongle.list`, `sms.threads` (what the front desk sees) | Drivers and certificates: `dongle.installDriver`, `dongle.restoreDriver`, `dongle.removeCerts`, `dongle.reset`, `dongle.setPreferred` |
+| `call.answer`, `call.reject`, `call.hangup`, `call.operatorSpeak` (the call console) | Pairing and the phone's connection: `phone.startPairing`, `phone.stopPairing`, `phone.confirmPairing`, `phone.removePaired`, `phone.connect`, `phone.disconnect` |
+| `call.dial`, `sms.send`, `call.configureAgent` (what the provider's flows queue) | Consent and settings: `consent.set`, `consent.revoke`, `settings.set` (which can send a call's audio elsewhere) |
+| | The outbox: `outbox.redrive` |
+| | Reads of those, and commands nothing on the provider's side queues: `dongle.getPreferred`, `dongle.diagnostics`, `phone.listPaired`, `settings.get`, `consent.get`, `call.switchboard`, `call.activate`, `sms.thread` |
+
+The left column is what the provider's call console, its flows and its MCP
+`connector_command` tool queue, and what its front-desk role is granted; the
+policy file cites the file and line in the provider's code for each. The right
+column is what the provider gives only its Device Admin role, or does not queue at
+all. Every command on the left that changes something is one the plugin
+journals, so it carries the idempotency key the relay makes from the command's id
+(`relay-command-<id>`), and a redelivery cannot run it twice. The provider keeps
+`call.takeOver`, `call.resumeBot`, `call.endCaller`, `call.declineWaiting`,
+`call.remoteStatus`, `call.assistance.respond` and `remote.*` off its own relay;
+none of them is on the list here either.
+
+Some things on the provider's site therefore stop working when the browser is not
+paired with this computer, because it then reaches OAIY through the relay instead of
+directly: its Device Setup screen's driver install, dongle reset, preferred dongle
+and phone connect and disconnect, and its Receptionist Settings screen's "Save &
+apply now" and live settings readout. They show the refusal instead of running. A
+browser paired with this computer's OAIY reaches it directly and is not asked.
+
+### The record
+
+Every command for a plugin, allowed or refused, is one line of
+`<data>/relay-log.jsonl`: `{at, tool: "relay.command", args: {connector, command,
+commandId, decision, reason?}, session: "relay", ok, summary}`. The line is written
+before the command is forwarded. It never holds the payload (message text, phone
+numbers) or anything the plugin answered. It is its own file, written the way the
+[control log](../../docs/AGENT_CONTROL.md#the-switch-and-the-log) is, because that
+log is the Agent's changes and a call console asks `call.current` every few
+seconds. It rolls at 2 MiB and keeps one previous file. The desktop's own ops are
+not in it.
+
+### What this does not cover
+
+- Callers on this computer are not asked: a plugin's own screens, the Agent's
+  control tools (`plugin_command` reaches any command a plugin declares) and a
+  binding's follow-up actions after a flow this computer ran.
+- The flows, bindings and app scripts the provider serves and this computer runs
+  reach plugins through the plugin's gate alone. Whoever can edit them on the
+  provider can ask for a command that way, and the list does not stop it.
+- For a plugin with no entry the line is only as strict as the plugin's own
+  `journalled` list. Aokie leaves eight commands that change something out of
+  it, which is why it has an entry.
+- The `desktop` connector still lets the website stop and restart plugins and
+  services. That is what its "start service" button is.
+- Commands are not signed or end-to-end encrypted (see the table above), so the
+  provider itself can queue any command the list allows.
+
 ## Reliability and limits
 
 - OAIY claims each request before running it. A lost claim never executes.

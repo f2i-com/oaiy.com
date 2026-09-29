@@ -110,8 +110,10 @@ Two transports, neither a WebSocket.
 | Encrypted flow relay | `link/sealed_flows.rs` | `/api/v1/desktop-flows/{pending,{id}/claim,{id}/complete}` |
 | Queued flow runs | `link/flow_runner.rs` | below |
 
-- The relay's `desktop` connector answers `services.*` and `plugins.*`; any other connector id
-  goes to that plugin with the idempotency key `relay:<commandId>`.
+- The relay's `desktop` connector answers `services.*` and `plugins.*`. A command for any other
+  connector id goes to that plugin, with the idempotency key `relay-command-<commandId>`, only if
+  the relay policy (`desktop/src-tauri/resources/relay-policy.json`) lets the website run it; see
+  `platform/docs/REMOTE_FORMLOGIC.md`.
 - End-to-end encryption: NaCl `crypto_box` (X25519, XSalsa20-Poly1305), a 24-byte nonce of a
   direction byte and a big-endian counter; test vectors in `ai/e2e-envelope-vectors.json`.
 
