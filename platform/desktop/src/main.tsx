@@ -8,6 +8,7 @@ import './workspace.css';
 import './setup.css';
 import './calendar.css';
 import './contacts.css';
+import './messages.css';
 
 // Set the theme class before first paint to avoid a flash of the wrong theme.
 applyTheme(initialTheme());

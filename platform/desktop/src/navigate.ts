@@ -27,6 +27,10 @@ export const NAV_VIEWS = [
   'calendar',
   /** The people who ring and text (under the AI Receptionist while a plugin provides the phone). */
   'contacts',
+  /** What callers left when the receptionist could not put them through (under the AI Receptionist while a plugin provides the phone). */
+  'messages',
+  /** Whether the receptionist may try to reach the owner for a caller who asks, and how. */
+  'transfers',
   /** Hours & Services: the business the receptionist speaks for (under the AI Receptionist while a plugin provides it). */
   'hours',
   'engines',

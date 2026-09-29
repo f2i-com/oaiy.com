@@ -1,0 +1,88 @@
+/* ============================================================================
+ * MESSAGES and TRANSFERS — what callers leave when the owner cannot be reached,
+ * the settings for putting callers through, and the ring dialog. Built from the
+ * dashboard's tokens (styles.css), so it follows both themes and fits a 760px window.
+ * ========================================================================== */
+
+.panel.messages-page,
+.panel.transfers-page { max-width: 980px; gap: 14px; }
+
+/* ---- the toolbar: which messages, and a search ----------------------------------------- */
+
+.messages-toolbar { display: flex; align-items: center; flex-wrap: wrap; gap: 10px 14px; }
+.messages-search { position: relative; display: flex; min-width: 0; max-width: 420px; flex: 1 1 240px; align-items: center; margin-left: auto; }
+.messages-search > svg { position: absolute; left: 11px; color: var(--faint); pointer-events: none; }
+.messages-search input { height: 34px; width: 100%; padding-left: 32px; font-size: 13px; }
+
+.messages-empty { display: flex; align-items: center; gap: 12px; padding: 22px 6px; color: var(--muted); }
+.messages-empty p { margin: 0; max-width: 60ch; font-size: 13.5px; line-height: 1.5; }
+
+/* ---- one message ----------------------------------------------------------------------- */
+
+.message-list { display: flex; flex-direction: column; gap: 10px; margin: 0; padding: 0; list-style: none; }
+.message-card {
+  position: relative;
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  border: 1px solid var(--border);
+  border-radius: var(--r-card);
+  background: var(--surface);
+  box-shadow: var(--shadow-card);
+  padding: 12px 16px;
+}
+.message-card.is-new::before { position: absolute; top: 10px; bottom: 10px; left: 0; width: 3px; border-radius: 0 3px 3px 0; background: var(--primary); content: ''; }
+.message-card.is-urgent { border-color: color-mix(in srgb, var(--danger, #d64545) 55%, var(--border)); }
+.message-card.is-handled { opacity: 0.72; }
+.message-card header { display: flex; align-items: baseline; flex-wrap: wrap; gap: 4px 10px; }
+.message-card header time { margin-left: auto; color: var(--faint); font-family: var(--font-mono); font-size: 11.5px; font-variant-numeric: tabular-nums; }
+.message-who { font-size: 14px; }
+.message-card.is-new .message-who { color: var(--text); }
+.message-flag { border-radius: 999px; background: color-mix(in srgb, var(--danger, #d64545) 16%, transparent); color: var(--danger, #d64545); padding: 1px 8px; font-size: 11px; font-style: normal; font-weight: 600; }
+.message-flag.message-new { background: var(--primary-soft); color: var(--primary); }
+.message-text { margin: 0; max-width: 72ch; font-size: 14px; line-height: 1.5; overflow-wrap: anywhere; white-space: pre-wrap; }
+.message-card footer { display: flex; align-items: center; flex-wrap: wrap; gap: 6px 14px; }
+.message-number { display: inline-flex; align-items: center; gap: 5px; color: var(--primary); font-family: var(--font-mono); font-size: 12.5px; text-decoration: none; }
+.message-number:hover { text-decoration: underline; }
+.message-actions { display: flex; align-items: center; flex-wrap: wrap; gap: 6px; margin-left: auto; }
+
+/* ---- the transfers settings ------------------------------------------------------------ */
+
+.transfers-page .switch-row { display: flex; align-items: flex-start; gap: 12px; padding: 4px 0; }
+.transfers-page .switch-row input { margin-top: 4px; }
+.transfers-page .switch-row small { display: block; color: var(--muted); font-size: 12.5px; line-height: 1.45; }
+.transfers-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(210px, 1fr)); gap: 10px 16px; }
+.transfers-grid label { display: flex; flex-direction: column; gap: 4px; font-size: 12.5px; color: var(--muted); }
+.transfers-grid input, .transfers-grid select, .transfers-grid textarea { font-size: 13px; }
+.transfers-days { display: flex; flex-wrap: wrap; gap: 6px; }
+.transfers-days label { flex-direction: row; align-items: center; gap: 5px; }
+.transfers-devices { display: flex; flex-direction: column; gap: 6px; margin: 0; padding: 0; list-style: none; }
+.transfers-devices li { display: flex; align-items: center; flex-wrap: wrap; gap: 8px 14px; border: 1px solid var(--border); border-radius: var(--r-card); padding: 8px 12px; }
+.transfers-devices li strong { font-size: 13px; }
+.transfers-saved { display: inline-flex; align-items: center; gap: 5px; color: var(--success, #2f9e63); font-size: 12.5px; }
+
+/* ---- the ring dialog: a caller wants to speak to the owner ----------------------------- */
+
+.ring-overlay { position: fixed; inset: 0; z-index: 90; display: flex; align-items: center; justify-content: center; background: color-mix(in srgb, #000 45%, transparent); padding: 16px; }
+.ring-dialog {
+  display: flex;
+  width: min(460px, 100%);
+  flex-direction: column;
+  gap: 12px;
+  border: 1px solid var(--border);
+  border-radius: calc(var(--r-card) + 2px);
+  background: var(--surface);
+  box-shadow: 0 24px 60px rgb(0 0 0 / 0.35);
+  padding: 20px 22px;
+}
+.ring-dialog h2 { margin: 0; font-size: 17px; }
+.ring-dialog .ring-who { display: flex; flex-direction: column; gap: 2px; }
+.ring-dialog .ring-who strong { font-size: 16px; }
+.ring-dialog .ring-who span { color: var(--muted); font-family: var(--font-mono); font-size: 12.5px; }
+.ring-said { margin: 0; border-left: 3px solid var(--border); padding: 2px 0 2px 10px; color: var(--muted); font-size: 13.5px; line-height: 1.5; overflow-wrap: anywhere; }
+.ring-clock { display: flex; align-items: center; gap: 10px; font-size: 12.5px; color: var(--muted); }
+.ring-bar { position: relative; height: 5px; flex: 1; overflow: hidden; border-radius: 999px; background: var(--border); }
+.ring-bar > i { position: absolute; inset: 0 auto 0 0; background: var(--primary); transition: width 0.4s linear; }
+.ring-actions { display: flex; flex-wrap: wrap; gap: 8px; }
+.ring-actions .button { flex: 1 1 auto; justify-content: center; }
+.ring-note { margin: 0; color: var(--muted); font-size: 12.5px; line-height: 1.45; }

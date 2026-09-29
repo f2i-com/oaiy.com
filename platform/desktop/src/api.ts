@@ -1622,6 +1622,124 @@ export const contacts = {
   },
 };
 
+// ----- messages callers leave for the owner -----
+
+export type MessageState = 'new' | 'seen' | 'handled';
+
+/** A message the receptionist took because the owner could not be reached. */
+export interface CallerMessage {
+  id: string;
+  /** When it was taken (RFC 3339). */
+  at: string;
+  callId: string;
+  /** The number the call came from ('' for a hidden number). */
+  from: string;
+  /** The name the caller gave ('' when none). */
+  name: string;
+  /** Where to ring them back. */
+  callback: string;
+  message: string;
+  urgency: 'normal' | 'urgent';
+  wantsCallback: boolean;
+  state: MessageState;
+  seenAt: string | null;
+  handledAt: string | null;
+  handledBy: string | null;
+}
+
+const messagePath = (id: string) => `/api/messages/${encodeURIComponent(id)}`;
+
+export const messages = {
+  /** Newest first: all, or those of one `state`, or those `q` finds in names, numbers and words. */
+  list: (state?: MessageState, q = '') => {
+    const params = new URLSearchParams({ ...(state ? { state } : {}), ...(q.trim() ? { q: q.trim() } : {}) }).toString();
+    return request<{ messages: CallerMessage[]; total: number; unread: number }>(`/api/messages${params ? `?${params}` : ''}`);
+  },
+  /** Mark one `new`, `seen` or `handled`. */
+  mark: (id: string, state: MessageState) => request<CallerMessage>(messagePath(id), { method: 'PATCH', body: JSON.stringify({ state }) }),
+  remove: (id: string) => request<void>(messagePath(id), { method: 'DELETE' }),
+};
+
+// ----- putting callers through to the owner (settings, and the ring that is going now) -----
+
+export type Initiative = 'on_request' | 'on_request_or_urgent';
+export type PhoneRing = 'when_away' | 'always' | 'never';
+export type DesktopRing = 'auto' | 'always' | 'never';
+export type AwayMode = 'auto' | 'on' | 'off';
+
+export interface QuietHours {
+  enabled: boolean;
+  start: string;
+  end: string;
+  /** One bit a day the window starts on, Sunday (bit 0) to Saturday (bit 6). */
+  days: number;
+  allowUrgent: boolean;
+  allowVip: boolean;
+}
+
+/** The owner's settings for transferring calls to them and taking messages (`<data>/ring.json`). */
+export interface RingSettings {
+  /** "Transfer calls to me". */
+  enabled: boolean;
+  /** "Take messages": on whenever transfers are. */
+  takeMessages: boolean;
+  initiative: Initiative;
+  urgentPhrases: string[];
+  ringSeconds: number;
+  phoneRing: PhoneRing;
+  desktopRing: DesktopRing;
+  away: AwayMode;
+  awayUntil: number | null;
+  desktopActiveSeconds: number;
+  quietHours: QuietHours;
+  vipNumbers: string[];
+  limits: { perCall: number; gapSeconds: number; perCallerHour: number; globalHour: number };
+  windowsCompanions: string[];
+  excludedDevices: string[];
+}
+
+export interface RingFeatures {
+  transfer: boolean;
+  messages: boolean;
+}
+
+/** What the owner may do with a ring going now. */
+export type RingAction = 'accept' | 'decline' | 'message';
+
+/** One caller the receptionist is trying to reach the owner for. */
+export interface ActiveRing {
+  /** The transfer request's id. */
+  id: string;
+  callId: string;
+  callerName: string;
+  callerNumber: string;
+  /** What the caller last said (their own words, as the desktop heard them). */
+  said: string[];
+  /** When it began and when it stops ringing (Unix milliseconds). */
+  startedAt: number;
+  expiresAt: number;
+  /** The desktop's clock now, in the same unit: the countdown does not trust the window's clock. */
+  now: number;
+  /** Who else is rung: a phone or Companion (their names), or nobody but this computer. */
+  devices: string[];
+  /** This computer can hand the call to the Companion (the plugin accepts on its behalf). */
+  canAccept: boolean;
+  /** The last thing the owner asked of it here, and what came of it. */
+  note: string;
+}
+
+export const ring = {
+  settings: () => request<{ settings: RingSettings; features: RingFeatures }>('/api/ring/settings'),
+  /** Change some settings (any of them; `quietHours` and `limits` member by member). */
+  save: (change: Partial<Omit<RingSettings, 'quietHours' | 'limits'>> & { quietHours?: Partial<QuietHours>; limits?: Partial<RingSettings['limits']> }) =>
+    request<{ settings: RingSettings; features: RingFeatures }>('/api/ring/settings', { method: 'PUT', body: JSON.stringify(change) }),
+  /** The rings going now (none most of the time). */
+  active: async () => (await request<{ rings: ActiveRing[] }>('/api/ring/active')).rings ?? [],
+  /** Answer one: `accept` asks the plugin to take it on the Companion, `decline` and `message` send the caller to the receptionist's message offer. */
+  respond: (id: string, action: RingAction) =>
+    request<{ ok: boolean; note: string }>(`/api/ring/active/${encodeURIComponent(id)}/respond`, { method: 'POST', body: JSON.stringify({ action }) }),
+};
+
 // ----- the engines and the phone, for Overview -----
 
 export interface EnginesStatus {

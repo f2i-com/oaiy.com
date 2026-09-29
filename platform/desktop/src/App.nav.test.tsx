@@ -15,6 +15,8 @@ const h = vi.hoisted(() => ({
   modulesList: vi.fn(),
   calendarGet: vi.fn(),
   contactsList: vi.fn(),
+  messagesList: vi.fn(),
+  ringSettings: vi.fn(),
 }));
 
 vi.mock('./navigate', () => ({
@@ -48,6 +50,8 @@ vi.mock('./api', async (importOriginal) => {
     },
     voices: { ...real.voices, list: vi.fn().mockResolvedValue({ voices: [], chosen: null }) },
     contacts: { ...real.contacts, list: (...a: unknown[]) => h.contactsList(...a) },
+    messages: { ...real.messages, list: (...a: unknown[]) => h.messagesList(...a) },
+    ring: { ...real.ring, settings: (...a: unknown[]) => h.ringSettings(...a) },
   };
 });
 
@@ -139,6 +143,27 @@ beforeEach(async () => {
     ],
     total: 2,
   });
+  h.messagesList.mockResolvedValue({ messages: [], total: 0, unread: 0 });
+  h.ringSettings.mockResolvedValue({
+    settings: {
+      enabled: false,
+      takeMessages: false,
+      initiative: 'on_request',
+      urgentPhrases: [],
+      ringSeconds: 40,
+      phoneRing: 'when_away',
+      desktopRing: 'auto',
+      away: 'auto',
+      awayUntil: null,
+      desktopActiveSeconds: 120,
+      quietHours: { enabled: false, start: '21:00', end: '07:00', days: 127, allowUrgent: false, allowVip: true },
+      vipNumbers: [],
+      limits: { perCall: 2, gapSeconds: 60, perCallerHour: 3, globalHour: 10 },
+      windowsCompanions: [],
+      excludedDevices: [],
+    },
+    features: { transfer: false, messages: false },
+  });
   h.calendarGet.mockResolvedValue({
     settings: SETTINGS,
     appointments: [request('r1', '2026-10-01T10:00'), request('r2', '2026-10-02T09:00')],
@@ -168,13 +193,46 @@ describe('the AI Receptionist’s sub-menu', () => {
     const sub = nav().querySelector('.nav-sub')!;
     expect(sub.querySelector('.nav-parent')?.getAttribute('aria-label')).toBe('AI Receptionist');
     const children = [...sub.querySelectorAll('.nav-child')].map((b) => b.querySelector('span')?.textContent);
-    expect(children).toEqual(['Phone', 'Calendar', 'Contacts', 'Hours & Services']);
+    expect(children).toEqual(['Phone', 'Calendar', 'Contacts', 'Messages', 'Hours & Services', 'Transfers']);
     // No Calendar or Contacts entry of their own any more.
     expect(nav().querySelector('button[aria-label="Calendar"]')).toBeNull();
     expect(nav().querySelector('button[aria-label="Contacts"]:not(.nav-child)')).toBeNull();
     const calendarLink = [...sub.querySelectorAll('.nav-child')].find((b) => b.textContent?.startsWith('Calendar'))!;
     expect(calendarLink.querySelector('.nav-count')?.textContent).toBe('2');
     expect(calendarLink.getAttribute('aria-label')).toBe('Calendar, 2 requests waiting');
+  });
+
+  it('counts the messages nobody has looked at, and lands `messages` and `transfers` on their pages under the AI Receptionist', async () => {
+    const left = (id: string) => ({ id, at: '2026-09-30T02:15:03Z', callId: 'c', from: '+61491570006', name: 'Alex', callback: '+61491570006', message: 'Ring me.', urgency: 'normal', wantsCallback: true, state: 'new', seenAt: null, handledAt: null, handledBy: null });
+    h.messagesList.mockResolvedValue({ messages: [left('m1'), left('m2')], total: 2, unread: 2 });
+    resetModules();
+    act(() => root.unmount());
+    root = createRoot(host);
+    await act(async () => {
+      root.render(
+        <ToastProvider>
+          <App />
+        </ToastProvider>,
+      );
+    });
+    await settle();
+    const sub = nav().querySelector('.nav-sub')!;
+    const link = [...sub.querySelectorAll('.nav-child')].find((b) => b.textContent?.startsWith('Messages'))!;
+    expect(link.querySelector('.nav-count')?.textContent).toBe('2');
+    expect(link.getAttribute('aria-label')).toBe('Messages, 2 new messages');
+    // With the two requests waiting, the parent adds both up.
+    expect(sub.querySelector('.nav-count-parent')?.textContent).toBe('4');
+    expect(sub.querySelector('.nav-count-parent')?.getAttribute('title')).toBe('4 waiting for you');
+
+    await go('messages');
+    expect(title()).toBe('Messages');
+    expect(kicker()).toBe('AI Receptionist');
+    expect(host.querySelector('.messages-page')).not.toBeNull();
+    await go('transfers');
+    expect(title()).toBe('Transfers');
+    expect(kicker()).toBe('AI Receptionist');
+    expect(text()).toContain('Transfer calls to me');
+    expect(text()).toContain('Take messages');
   });
 
   it('lands the old id `calendar`, and `hours`, on their pages, with the AI Receptionist over them', async () => {
@@ -327,7 +385,7 @@ describe('without the AI Receptionist', () => {
     await settle();
     // Contacts are the phone's: the AI Receptionist keeps them, and its Phone.
     const children = [...nav().querySelectorAll('.nav-sub .nav-child')].map((b) => b.querySelector('span')?.textContent);
-    expect(children).toEqual(['Phone', 'Contacts']);
+    expect(children).toEqual(['Phone', 'Contacts', 'Messages', 'Transfers']);
     expect(text()).not.toContain('Hours & Services');
     await go('hours');
     expect(text()).toContain('The Overview');
