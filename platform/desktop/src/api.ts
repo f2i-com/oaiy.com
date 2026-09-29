@@ -417,11 +417,97 @@ export interface ModuleRecord {
   store?: string[];
 }
 
+/** One plugin screen in the dashboard (`ui.nav[]`). */
+export interface PageContribution {
+  /** `plugin:<pluginId>:<navId>`. */
+  view: string;
+  pluginId: string;
+  pluginName: string;
+  navId: string;
+  label: string;
+  /** The `ui.screens` id it shows. */
+  screen: string;
+  icon?: string;
+  badge?: string;
+  module?: string;
+}
+
+/**
+ * A sidebar section plugins add or extend. `id` is a built-in section's id
+ * (its pages go after that section's own tabs), `plugin-section:<pluginId>:<id>`
+ * for a plugin's own (`ui.sections`), or a lone page's own view id.
+ */
+export interface SectionContribution {
+  id: string;
+  builtin: boolean;
+  pluginId?: string;
+  pluginName?: string;
+  label?: string;
+  icon?: string;
+  /** A plugin's own section only; a built-in keeps its own group. */
+  group?: 'Home' | 'Work' | 'Setup';
+  badge?: string;
+  module?: string;
+  pages: PageContribution[];
+}
+
+/** An Overview card a plugin contributes (`ui.overview[]`). */
+export interface OverviewContribution {
+  pluginId: string;
+  pluginName: string;
+  id: string;
+  kind: 'hero' | 'status' | 'tile';
+  title: string;
+  icon?: string;
+  module?: string;
+  /** Texts by name: plain, `$health.<path>` or `$poll.<statusCardId>.<path>` (looked up by bind.ts, never evaluated). */
+  bind: Record<string, string>;
+  cta?: { label: string; view: string };
+  /** Where a click on a tile goes. */
+  view?: string;
+}
+
+/** A read-only plugin command polled for `$poll` bindings (`ui.statusCards[]`). */
+export interface PollContribution {
+  pluginId: string;
+  /** The status card's id, as `$poll.<id>` names it. */
+  id: string;
+  connector: string;
+  command: string;
+  /** At least 5000. */
+  intervalMs: number;
+}
+
+/** A plugin's service-definition action offered to the agent (`agentTools[]`). */
+export interface AgentToolContribution {
+  pluginId: string;
+  name: string;
+  action: string;
+  definition: string;
+  actionId: string;
+  description: string;
+  inputSchema: Record<string, unknown>;
+  sideEffects?: string;
+  audience: string[];
+  confirm?: string;
+  timeoutMs?: number;
+}
+
+/** What the enabled plugins add (a turned-off plugin's, and a module that is off's, are left out). */
+export interface Contributions {
+  sections: SectionContribution[];
+  overview: OverviewContribution[];
+  polls: PollContribution[];
+  agent: { tools: AgentToolContribution[] };
+  setup: Array<{ pluginId: string; title: string; version: number; steps: number }>;
+}
+
 export interface ModulesSnapshot {
   /** Moves only when something here changes (it is the ETag). */
   revision: number;
   modules: ModuleRecord[];
-  contributions: Record<string, unknown>;
+  /** Partial from an older desktop (step 1's was `{}`): read each list with `?? []`. */
+  contributions: Partial<Contributions>;
   warnings: string[];
 }
 

@@ -1865,3 +1865,24 @@ select:disabled { cursor: not-allowed; opacity: 0.5; }
 .setup-more > summary:hover { color: var(--text); }
 .setup-more[open] > summary { margin-bottom: 8px; }
 .setup-guide .form-hint svg { vertical-align: -2px; }
+
+/* Plugin cards on the Overview (contributions): a hero's headline, status rows, tiles with no page to open. */
+.overview-hero-headline { color: var(--muted); font-size: 12.5px; font-weight: 560; }
+.overview-status-list { display: flex; flex-direction: column; gap: 6px; }
+.overview-status {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 8px;
+  padding: 10px 14px;
+  border: 1px solid var(--border);
+  border-radius: var(--r-ctl);
+  background: var(--surface);
+}
+.overview-status > svg { flex: none; color: var(--muted); }
+.overview-status strong { font-size: 13px; font-weight: 620; }
+.overview-status-value { font-size: 13px; font-weight: 600; font-variant-numeric: tabular-nums; }
+.overview-status small { min-width: 0; flex: 1 1 160px; color: var(--muted); font-size: 12px; overflow-wrap: anywhere; }
+.overview-status .btn-tiny { margin-left: auto; }
+.overview-tile-static { cursor: default; }
+.overview-tile-static:hover { border-color: var(--border); transform: none; }

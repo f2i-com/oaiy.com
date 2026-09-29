@@ -23,6 +23,7 @@ const calendarMock = vi.hoisted(() => vi.fn());
 const syncMock = vi.hoisted(() => vi.fn());
 const linkMock = vi.hoisted(() => vi.fn());
 const modulesMock = vi.hoisted(() => vi.fn());
+const connectorMock = vi.hoisted(() => vi.fn());
 vi.mock('./api', () => ({
   modules: { list: (...a: unknown[]) => modulesMock(...a) },
   services: { list: servicesMock },
@@ -30,7 +31,7 @@ vi.mock('./api', () => ({
   aiProviders: { list: providersMock },
   codex: { status: vi.fn().mockResolvedValue({available:false,connected:false}) },
   pairing: { paired: pairedMock },
-  bridge: { status: statusMock },
+  bridge: { status: statusMock, connectorRequest: (...a: unknown[]) => connectorMock(...a) },
   nodeRuntime: { install: nodeInstallMock },
   openExternal: vi.fn(),
   // Today's tiles (TodayPanel): nothing to show.
@@ -71,10 +72,11 @@ const runtime = (failed: number) => ({
 let host: HTMLDivElement;
 let root: Root;
 const onNavigate = vi.fn();
+const onOpenPluginScreen = vi.fn();
 
 async function mount() {
   await act(async () => {
-    root.render(<OverviewPanel onNavigate={onNavigate} onOpenPluginScreen={vi.fn()} />);
+    root.render(<OverviewPanel onNavigate={onNavigate} onOpenPluginScreen={onOpenPluginScreen} />);
   });
 }
 
@@ -239,5 +241,91 @@ describe('OverviewPanel failure reporting', () => {
     dismissGuide();
     await mount();
     expect(text()).toContain('1 run has failed');
+  });
+});
+
+describe("Plugins' own cards", () => {
+  /** The desktop's snapshot with the phone on and what Aokie contributes to the Overview. */
+  const withCards = () => {
+    const on = modulesOn(true, true);
+    return {
+      ...on,
+      snapshot: {
+        ...on.snapshot,
+        contributions: {
+          sections: [],
+          overview: [
+            {
+              pluginId: 'aokie', pluginName: 'Aokie Phone Bridge', id: 'aokie-hero', kind: 'hero', title: 'Aokie receptionist', icon: 'phone', module: 'phone',
+              bind: { headline: '$health.status', body: '$health.detail' },
+              cta: { label: 'Open AI Receptionist', view: 'plugin:aokie:receptionist' },
+            },
+            {
+              pluginId: 'aokie', pluginName: 'Aokie Phone Bridge', id: 'outbox', kind: 'tile', title: 'Waiting to send', icon: 'cloud',
+              bind: { value: '$poll.data-delivery.outbox.pending' }, view: 'plugin:aokie:receptionist',
+            },
+            {
+              pluginId: 'aokie', pluginName: 'Aokie Phone Bridge', id: 'radio', kind: 'status', title: 'Radio',
+              bind: { value: '$poll.data-delivery.radio.state', detail: 'The Bluetooth adapter' },
+            },
+          ],
+          polls: [{ pluginId: 'aokie', id: 'data-delivery', connector: 'aokie', command: 'dongle.diagnostics', intervalMs: 10000 }],
+          agent: { tools: [] },
+          setup: [],
+        },
+      },
+    };
+  };
+  const aokie = (state: string, extra: Record<string, unknown> = {}) => ({
+    plugins: [{ id: 'aokie', state, dir: 'C:\\p\\aokie', userDisabled: false, restartAttempts: 0, manifest: { name: 'Aokie Phone Bridge', version: '1.0.0' }, lastHealth: { status: 'ok', detail: 'Phone connected' }, ...extra }],
+  });
+  const settle = async () => {
+    for (let i = 0; i < 4; i++) await act(async () => {});
+  };
+
+  it("fills a hero from the plugin's health and a tile from its poll, and opens its page", async () => {
+    dismissGuide();
+    pluginsMock.mockResolvedValue(aokie('running'));
+    modulesMock.mockResolvedValue(withCards());
+    connectorMock.mockResolvedValue({ ok: true, result: { ok: true, data: { outbox: { pending: 4 }, radio: { state: 'ready' } } } });
+    await mount();
+    await settle();
+    expect(text()).toContain('Aokie receptionist');
+    expect(text()).toContain('Phone connected');
+    expect(text()).not.toContain('$health');
+    expect(text()).not.toContain('$poll');
+    // Sent with no payload, through the gated connector route.
+    expect(connectorMock).toHaveBeenCalledWith('aokie', 'dongle.diagnostics', undefined, expect.any(String));
+    const tile = host.querySelector<HTMLButtonElement>('button[aria-label^="Waiting to send"]')!;
+    expect(tile.getAttribute('aria-label')).toBe('Waiting to send: 4');
+    expect(tile.textContent).toContain('4');
+    expect(host.querySelector('.overview-status')?.textContent).toContain('ready');
+    await act(async () => tile.click());
+    expect(onOpenPluginScreen).toHaveBeenCalledWith('aokie', 'receptionist');
+    await act(async () => button('Open AI Receptionist')!.click());
+    expect(onOpenPluginScreen).toHaveBeenCalledTimes(2);
+  });
+
+  it("shows an em dash while its poll fails, and a stopped plugin's reason rather than its old health", async () => {
+    dismissGuide();
+    pluginsMock.mockResolvedValue(aokie('crashed', { reason: 'It stopped: the dongle was unplugged.' }));
+    modulesMock.mockResolvedValue(withCards());
+    connectorMock.mockRejectedValue(new Error('not running'));
+    await mount();
+    await settle();
+    expect(text()).not.toContain('Phone connected');
+    expect(text()).toContain('It stopped: the dongle was unplugged.');
+    const tile = host.querySelector<HTMLButtonElement>('button[aria-label^="Waiting to send"]')!;
+    expect(tile.getAttribute('aria-label')).toBe('Waiting to send: not known');
+    expect(tile.textContent).toContain('—');
+  });
+
+  it('shows no plugin cards when the desktop contributes none', async () => {
+    dismissGuide();
+    pluginsMock.mockResolvedValue(aokie('running'));
+    await mount();
+    await settle();
+    expect(text()).not.toContain('Aokie receptionist');
+    expect(connectorMock).not.toHaveBeenCalled();
   });
 });

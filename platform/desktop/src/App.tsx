@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useRef, useState, type KeyboardEvent } from 'react';
+import { useCallback, useEffect, useMemo, useRef, useState, type KeyboardEvent } from 'react';
 import {
   Bot,
   CalendarDays,
@@ -10,11 +10,8 @@ import {
   History,
   LayoutDashboard,
   LockKeyhole,
-  Mail,
-  MessageSquare,
   Moon,
   Package,
-  Phone,
   Plug,
   Puzzle,
   Server,
@@ -26,8 +23,9 @@ import {
   Workflow,
   type LucideIcon,
 } from 'lucide-react';
-import { API_BASE, openExternal, phone as phoneApi, plugins as pluginsApi } from './api';
+import { API_BASE, openExternal, phone as phoneApi } from './api';
 import { moduleOn, useModules } from './useModules';
+import { buildSections, newBadge, pluginPageOf, sectionOf as findSection, type Group, type NavSection } from './sections';
 import { applyTheme, initialTheme, THEME_LABEL, type ThemeMode } from './theme';
 import ServicesPanel from './ServicesPanel';
 import ModelsPanel from './ModelsPanel';
@@ -84,18 +82,6 @@ type View = BuiltinView | `plugin:${string}:${string}`;
 /** The pages shown in webviews of their own, laid over the page by the desktop. */
 const EMBEDDED = new Set<View>(['agent', 'flows', 'engines']);
 
-/** One nav entry a plugin contributes (`manifest.ui.nav[]`). */
-interface PluginNavEntry {
-  pluginId: string;
-  pluginName: string;
-  navId: string;
-  label: string;
-  icon?: string;
-  badge?: string;
-}
-
-type Group = 'Home' | 'Work' | 'Setup';
-
 interface Section {
   id: string;
   label: string;
@@ -150,15 +136,8 @@ const PAGE: Record<BuiltinView, { tab: string; icon: LucideIcon; copy: string }>
   settings: { tab: 'Settings', icon: Settings2, copy: 'Where OAIY keeps its data and models, and your Hugging Face token.' },
 };
 
-/** The icons a plugin's nav entry may name (`manifest.ui.nav[].icon`); any other gets the plugin piece. */
-const PLUGIN_ICONS: Record<string, LucideIcon> = {
-  phone: Phone,
-  calendar: CalendarDays,
-  chat: MessageSquare,
-  message: MessageSquare,
-  mail: Mail,
-  bot: Bot,
-};
+/** A built-in page's tab name and icon (a plugin page's come from its contribution). */
+const pageTab = (view: string) => PAGE[view as BuiltinView] ?? { tab: view, icon: Puzzle };
 
 /** Plugin screens already opened here: their "New" badge is no longer news. */
 const SEEN_KEY = 'oaiy.pluginNavSeen';
@@ -179,41 +158,38 @@ function writeSeen(seen: Set<string>) {
   }
 }
 
-function sectionOf(view: View): Section | null {
-  if (view === 'settings') return SETTINGS;
-  return SECTIONS.find((s) => (s.tabs as View[]).includes(view)) ?? null;
-}
-
-/** A section's pages as tabs: the dashboard's segmented control, keyboard-driven with the arrow keys. */
-function SectionTabs({ section, view, onSelect }: { section: Section; view: View; onSelect: (v: BuiltinView) => void }) {
+/** A section's pages as tabs (its own, then any a plugin adds): the dashboard's segmented control, keyboard-driven with the arrow keys. */
+function SectionTabs({ section, view, onSelect }: { section: NavSection; view: View; onSelect: (v: View) => void }) {
+  const views = section.tabs.map((t) => t.view);
   const onKey = (e: KeyboardEvent<HTMLDivElement>) => {
-    const i = section.tabs.indexOf(view as BuiltinView);
+    const i = views.indexOf(view);
     const step = e.key === 'ArrowRight' ? 1 : e.key === 'ArrowLeft' ? -1 : 0;
     if (!step || i < 0) return;
     e.preventDefault();
-    const next = section.tabs[(i + step + section.tabs.length) % section.tabs.length];
-    onSelect(next);
+    const next = views[(i + step + views.length) % views.length];
+    onSelect(next as View);
     requestAnimationFrame(() => document.getElementById(`tab-${next}`)?.focus());
   };
   return (
     <div className="section-tabs">
       <div className="seg-tabs" role="tablist" aria-label={`${section.label} pages`} onKeyDown={onKey}>
         {section.tabs.map((t) => {
-          const Icon = PAGE[t].icon;
-          const on = t === view;
+          const Icon = t.icon;
+          const on = t.view === view;
           return (
             <button
               type="button"
               role="tab"
-              id={`tab-${t}`}
-              key={t}
+              id={`tab-${t.view}`}
+              key={t.view}
               aria-selected={on}
               tabIndex={on ? 0 : -1}
               className={on ? 'active' : undefined}
-              onClick={() => onSelect(t)}
+              title={t.page ? `${t.label}, from the ${t.page.pluginName} plugin` : undefined}
+              onClick={() => onSelect(t.view as View)}
             >
               <Icon size={14} />
-              <span>{PAGE[t].tab}</span>
+              <span>{t.label}</span>
             </button>
           );
         })}
@@ -226,18 +202,24 @@ export default function App() {
   const [health, setHealth] = useState<HealthResponse | null>(null);
   const [healthError, setHealthError] = useState<string | null>(null);
   const [view, setView] = useState<View>('overview');
-  /** Nav entries contributed by installed plugins (`manifest.ui.nav[]`). */
-  const [pluginNav, setPluginNav] = useState<PluginNavEntry[]>([]);
-  /** The plugins have been listed once (until then an empty nav says nothing). */
-  const [pluginNavKnown, setPluginNavKnown] = useState(false);
   /** The phone and the calendar are there while a plugin provides them (Aokie, the AI Receptionist). `null` until known. */
   const modules = useModules();
   const phoneOn = moduleOn(modules, 'phone');
   const calendarOn = moduleOn(modules, 'calendar');
+  /**
+   * The sidebar: the built-in sections, with the pages installed plugins add
+   * (`/api/modules` contributions: a tab in a built-in section, a section of a
+   * plugin's own, or a page of its own at the end of Work). A turned-off
+   * plugin, and a module that is off, add nothing (the desktop leaves them out).
+   */
+  const sections = useMemo(
+    () => buildSections([...SECTIONS, SETTINGS], modules?.contributions?.sections, pageTab),
+    [modules],
+  );
   /** Views already opened this session — they skip the entrance animation. */
   const visited = useRef<Set<string>>(new Set()).current;
   /** The tab each section was last on, so the sidebar brings you back to it. */
-  const lastTab = useRef<Record<string, BuiltinView>>({}).current;
+  const lastTab = useRef<Record<string, string>>({}).current;
   const [seen, setSeen] = useState<Set<string>>(readSeen);
   const [theme, setThemeState] = useState<ThemeMode>(initialTheme);
   const [copied, setCopied] = useState(false);
@@ -334,67 +316,32 @@ export default function App() {
     };
   }, [phoneOn]);
 
-  // Plugins can contribute sidebar entries that open a screen they ship. Polled
-  // (not one-shot) so installing or removing a plugin updates the nav without a
-  // restart — the same cadence the Plugins panel uses.
-  useEffect(() => {
-    let cancelled = false;
-    const load = async () => {
-      try {
-        const snap = await pluginsApi.list();
-        if (cancelled) return;
-        const entries: PluginNavEntry[] = [];
-        // A plugin turned off contributes nothing (its screens come back with it).
-        for (const p of snap.plugins.filter((p) => !p.userDisabled)) {
-          const ui = (p.manifest as unknown as { ui?: { nav?: Array<Record<string, string>> } } | undefined)?.ui;
-          for (const n of ui?.nav ?? []) {
-            if (n.id && n.label) {
-              entries.push({
-                pluginId: p.id,
-                pluginName: p.manifest?.name ?? p.id,
-                navId: n.id,
-                label: n.label,
-                icon: n.icon,
-                badge: n.badge,
-              });
-            }
-          }
-        }
-        setPluginNav(entries);
-        setPluginNavKnown(true);
-      } catch {
-        /* the Plugins panel surfaces the error; the nav just stays as it was */
-      }
-    };
-    load();
-    const id = window.setInterval(load, 5000);
-    return () => {
-      cancelled = true;
-      window.clearInterval(id);
-    };
-  }, []);
-
   // The calendar is there while a plugin provides it: on it when it goes, go to Overview.
   useEffect(() => {
     if (view === 'calendar' && calendarOn === false) setView('overview');
   }, [view, calendarOn]);
 
-  // A plugin screen the user is on can disappear (plugin removed/disabled) —
-  // fall back to Overview rather than rendering a dead page.
+  // The sections shown: the Calendar only while a plugin provides it.
+  const shownSections = useMemo(
+    () => sections.filter((s) => s.id !== 'calendar' || calendarOn === true),
+    [sections, calendarOn],
+  );
+
+  // A plugin screen the user is on can disappear (plugin removed or turned
+  // off, or its module went off): fall back to Overview rather than rendering
+  // a dead page. Not before the desktop has said (`modules === null`), so a
+  // plugin screen is never left on a guess.
   useEffect(() => {
-    if (!view.startsWith('plugin:')) return;
-    const [, pluginId, navId] = view.split(':');
-    if (pluginNavKnown && !pluginNav.some((n) => n.pluginId === pluginId && n.navId === navId)) {
-      setView('overview');
-    }
-  }, [view, pluginNav, pluginNavKnown]);
+    if (!view.startsWith('plugin:') || modules === null) return;
+    if (!pluginPageOf(shownSections, view)) setView('overview');
+  }, [view, modules, shownSections]);
 
   // Mark AFTER render: the first open of a view still animates, a return does not.
   // A plugin screen once opened loses its "New" badge.
   useEffect(() => {
     visited.add(view);
-    const section = sectionOf(view);
-    if (section && section.tabs.length > 1) lastTab[section.id] = view as BuiltinView;
+    const section = findSection(sections, view);
+    if (section && section.tabs.length > 1) lastTab[section.id] = view;
     if (view.startsWith('plugin:')) {
       const key = view.slice('plugin:'.length);
       setSeen((prev) => {
@@ -404,24 +351,25 @@ export default function App() {
         return next;
       });
     }
-  }, [view, visited, lastTab]);
+  }, [view, visited, lastTab, sections]);
 
-  const openSection = (s: Section) => setView(lastTab[s.id] ?? s.tabs[0]);
+  const openSection = (s: NavSection) => {
+    const last = lastTab[s.id];
+    setView((last && s.tabs.some((t) => t.view === last) ? last : s.tabs[0].view) as View);
+  };
 
   // One derived state drives the dock (and the topbar's warning when the API is down).
   const link: 'up' | 'down' | 'pending' = health ? 'up' : healthError ? 'down' : 'pending';
-  const section = sectionOf(view);
-  // A plugin screen has no PAGE entry — its heading comes from the nav entry the
-  // plugin contributed.
+  const section = findSection(sections, view);
+  // A plugin screen has no PAGE entry: its line comes from the page the plugin
+  // contributed (a tab in a built-in section keeps that section's heading).
   const pluginView = view.startsWith('plugin:') ? view.split(':') : null;
-  const activePluginNav = pluginView
-    ? pluginNav.find((n) => n.pluginId === pluginView[1] && n.navId === pluginView[2])
-    : undefined;
+  const activePluginPage = pluginView ? pluginPageOf(sections, view) : null;
   const header = pluginView
     ? {
-        kicker: 'Work',
-        title: activePluginNav?.label ?? 'Plugin screen',
-        copy: `From the ${activePluginNav?.pluginName ?? pluginView[1]} plugin.`,
+        kicker: section?.group ?? 'Work',
+        title: section?.label ?? activePluginPage?.label ?? 'Plugin screen',
+        copy: `From the ${activePluginPage?.pluginName ?? pluginView[1]} plugin.`,
       }
     : {
         kicker: section?.group ?? 'Home',
@@ -430,12 +378,13 @@ export default function App() {
       };
   const tabbed = section && section.tabs.length > 1 ? section : null;
   const embedded = EMBEDDED.has(view);
-  const visibleSections = SECTIONS.filter((s) => s.id !== 'calendar' || calendarOn === true);
+  const visibleSections = shownSections.filter((s) => s.id !== SETTINGS.id);
 
-  const navButton = (s: Section) => {
+  const navButton = (s: NavSection) => {
     const Icon = s.icon;
     const active = section?.id === s.id;
     const calling = s.id === 'agent' && onCall;
+    const badge = newBadge(s, seen);
     return (
       <button
         type="button"
@@ -448,7 +397,13 @@ export default function App() {
            call (scripts find the Agent by it); the call is said in its description. */
         aria-label={s.label}
         aria-describedby={calling ? 'nav-on-call' : undefined}
-        title={calling ? 'Agent: on a call now. Open it to see the call.' : s.label}
+        title={
+          calling
+            ? 'Agent: on a call now. Open it to see the call.'
+            : s.pluginName
+              ? `${s.label}, from the ${s.pluginName} plugin`
+              : s.label
+        }
         onClick={() => openSection(s)}
       >
         <Icon size={18} />
@@ -458,6 +413,7 @@ export default function App() {
             On call
           </em>
         )}
+        {badge && <em className="nav-badge">{badge}</em>}
       </button>
     );
   };
@@ -482,44 +438,27 @@ export default function App() {
                 {s.group}
               </span>
             );
-            // Screens installed plugins contribute go at the end of Work, after
-            // the built-ins, so a plugin extends the app without displacing them.
-            const plugins =
-              s.group === 'Setup' && prev?.group === 'Work'
-                ? pluginNav.map((n) => {
-                    const value: View = `plugin:${n.pluginId}:${n.navId}`;
-                    const Icon = (n.icon && PLUGIN_ICONS[n.icon]) || Puzzle;
-                    const isNew = !!n.badge && !seen.has(`${n.pluginId}:${n.navId}`);
-                    return (
-                      <button
-                        type="button"
-                        key={value}
-                        className={view === value ? 'active' : ''}
-                        aria-current={view === value ? 'page' : undefined}
-                        aria-label={n.label}
-                        title={`${n.label}, from the ${n.pluginName} plugin`}
-                        onClick={() => setView(value)}
-                      >
-                        <Icon size={18} />
-                        <span>{n.label}</span>
-                        {isNew && <em className="nav-badge">{n.badge}</em>}
-                      </button>
-                    );
-                  })
-                : null;
-            return [plugins, heading, navButton(s)];
+            // A plugin's own sections are already at the end of their group
+            // (sections.ts), after the built-ins, so a plugin extends the app
+            // without displacing them.
+            return [heading, navButton(s)];
           })}
         </nav>
 
         <div className="sidebar-fill" />
 
         <button
-          className={view === 'settings' ? 'settings active' : 'settings'}
+          className={section?.id === SETTINGS.id ? 'settings active' : 'settings'}
           type="button"
-          aria-current={view === 'settings' ? 'page' : undefined}
+          aria-current={section?.id === SETTINGS.id ? 'page' : undefined}
           aria-label="Settings"
           title="Settings"
-          onClick={() => setView('settings')}
+          onClick={() => {
+            // Settings may have a plugin's tabs after its own: back to the one last open.
+            const settings = sections.find((s) => s.id === SETTINGS.id);
+            if (settings) openSection(settings);
+            else setView('settings');
+          }}
         >
           <Settings2 size={18} />
           <span>Settings</span>
@@ -570,7 +509,7 @@ export default function App() {
         </header>
 
         <section className={`view view-${view}`}>
-          {tabbed && <SectionTabs section={tabbed} view={view} onSelect={setView} />}
+          {tabbed && <SectionTabs section={tabbed} view={view} onSelect={(v) => setView(v)} />}
           {/* A page in a webview of its own: the desktop lays it over this box. */}
           {embedded && <EmbeddedPage page={view as 'agent' | 'flows' | 'engines'} />}
           {/* Keyed so React remounts the scroller on a view change — otherwise

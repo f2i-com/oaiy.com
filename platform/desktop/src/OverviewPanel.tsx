@@ -26,19 +26,26 @@ import {
   plugins,
   services,
   type AiProviderPublic,
+  type OverviewContribution,
   type PairedApp,
   type PluginRecord,
   type ServiceSnapshot,
 } from './api';
+import { bindText, pollsOf, usePluginPolls, type BindContext } from './bind';
+import { PLUGIN_ICONS } from './sections';
+import { useModules } from './useModules';
 
 /**
  * Overview — the control centre. One screen that answers "is this machine ready
  * to run my flows?" without clicking through five panels: what's running, what
  * needs attention, and which apps are connected.
  *
- * Plugins can contribute their own hero card here (`manifest.ui.overview`), so a
+ * Plugins can contribute their own cards here (`ui.overview`, served in
+ * `/api/modules` contributions: a `hero`, a `status` row or a `tile`), so a
  * plugin like the Aokie phone bridge can surface its own status and a deep link
- * into its screen instead of being invisible until you open Plugins.
+ * into its screen instead of being invisible until you open Plugins. Their
+ * texts are looked up by bind.ts: `$health.*` from the plugin's last health
+ * report, `$poll.<card>.*` from its status-card polls.
  */
 
 const POLL_MS = 4000;
@@ -63,34 +70,13 @@ interface Props {
   onOpenPluginScreen: (pluginId: string, navId: string) => void;
 }
 
-interface OverviewCard {
-  id?: string;
-  kind?: string;
-  title?: string;
-  icon?: string;
-  bind?: {
-    headline?: string;
-    body?: string;
-    cta?: { label?: string; nav?: string };
-  };
-}
+/** A card's icon, by the name the plugin gave. */
+const cardIcon = (name?: string) => (name && Object.prototype.hasOwnProperty.call(PLUGIN_ICONS, name) && PLUGIN_ICONS[name]) || Sparkles;
 
-/** The `ui.overview` cards a plugin contributes, paired with the plugin itself (none from one turned off). */
-function overviewCards(list: PluginRecord[]): Array<{ plugin: PluginRecord; card: OverviewCard }> {
-  const out: Array<{ plugin: PluginRecord; card: OverviewCard }> = [];
-  for (const p of list.filter((p) => !p.userDisabled)) {
-    const ui = (p.manifest as unknown as { ui?: { overview?: OverviewCard[] } } | undefined)?.ui;
-    for (const card of ui?.overview ?? []) out.push({ plugin: p, card });
-  }
-  return out;
-}
-
-/** A plugin's `ui.nav` id for a contributed screen, if it declares one. */
-function navIdFor(p: PluginRecord, wanted?: string): string | null {
-  const ui = (p.manifest as unknown as { ui?: { nav?: Array<{ id?: string }> } } | undefined)?.ui;
-  const nav = ui?.nav ?? [];
-  if (wanted && nav.some((n) => n.id === wanted)) return wanted;
-  return nav[0]?.id ?? null;
+/** What a plugin's bindings are looked up in. Its health only while it runs: a stopped plugin's last report is old news. */
+function bindContext(plugin: PluginRecord | undefined, answers: Record<string, unknown>, pluginId: string): BindContext {
+  const live = plugin?.state === 'running' || plugin?.state === 'unhealthy';
+  return { health: live ? plugin?.lastHealth : undefined, polls: pollsOf(answers, pluginId) };
 }
 
 export default function OverviewPanel({ onNavigate, onOpenPluginScreen }: Props) {
@@ -149,7 +135,20 @@ export default function OverviewPanel({ onNavigate, onOpenPluginScreen }: Props)
   const runningPlug = (plug ?? []).filter((p) => p.state === 'running').length;
   const crashedPlug = (plug ?? []).filter((p) => p.state === 'crashed' || p.state === 'unhealthy');
   const readyProv = (provs ?? []).filter((p) => p.enabled && (p.hasKey || p.allowLocal)).length + (codexConnected ? 1 : 0);
-  const cards = overviewCards(plug ?? []);
+  // The plugins' own cards, as the desktop serves them (none from a plugin turned off, or for a module that is off).
+  const modules = useModules();
+  const cards: OverviewContribution[] = modules?.contributions?.overview ?? [];
+  const answers = usePluginPolls(modules?.contributions?.polls);
+  const pluginById = new Map((plug ?? []).map((p) => [p.id, p]));
+  const ctx = (card: OverviewContribution) => bindContext(pluginById.get(card.pluginId), answers, card.pluginId);
+  /** Open a plugin page (`plugin:<pluginId>:<navId>`). */
+  const openView = (view: string) => {
+    const [kind, pluginId, navId] = view.split(':');
+    if (kind === 'plugin' && pluginId && navId) onOpenPluginScreen(pluginId, navId);
+  };
+  const heroes = cards.filter((c) => c.kind === 'hero');
+  const statuses = cards.filter((c) => c.kind === 'status');
+  const tiles = cards.filter((c) => c.kind === 'tile');
 
   // The one-click Node fix — offered wherever the runtime is reported broken.
   const installNode =
@@ -193,39 +192,103 @@ export default function OverviewPanel({ onNavigate, onOpenPluginScreen }: Props)
 
       {/* Plugin-contributed hero cards. A plugin declares these so it can own a
           spot on the control centre rather than hiding under Plugins. */}
-      {cards.map(({ plugin, card }) => {
-        const running = plugin.state === 'running';
-        const navId = navIdFor(plugin, card.bind?.cta?.nav);
+      {heroes.map((card) => {
+        const plugin = pluginById.get(card.pluginId);
+        const running = plugin?.state === 'running';
+        const Icon = cardIcon(card.icon);
+        // The declared bindings (`$health.status`, `$poll.<card>.<path>`) are looked
+        // up by bind.ts: the plugin's last health report while it runs, and its
+        // status-card polls. What cannot be looked up falls back to what the host
+        // itself knows, never to the raw "$health.status" text.
+        const headline = bindText(card.bind.headline, ctx(card));
+        const body = bindText(card.bind.body, ctx(card));
         return (
           <div
-            key={`${plugin.id}-${card.id ?? 'card'}`}
+            key={`${card.pluginId}-${card.id}`}
             className={`service-card overview-hero service-card-${running ? 'running' : 'stopped'}`}
           >
             <span className="overview-hero-icon" aria-hidden>
-              <Sparkles size={16} />
+              <Icon size={16} />
             </span>
             <span className="overview-hero-text">
               <span className="overview-hero-title">
-                <strong>{card.title ?? plugin.manifest?.name ?? plugin.id}</strong>
-                <span className={running ? 'badge badge-ok' : 'badge badge-neutral'}>{plugin.state}</span>
+                <strong>{card.title}</strong>
+                {plugin && <span className={running ? 'badge badge-ok' : 'badge badge-neutral'}>{plugin.state}</span>}
+                {headline && <span className="overview-hero-headline">{headline}</span>}
               </span>
-              {/* The declared bindings reference the plugin's own health feed; until
-                  that is wired, report the state the host actually knows rather than
-                  echoing an unresolved "$health.status" placeholder. */}
               <small>
-                {running
-                  ? `From the ${plugin.manifest?.name ?? plugin.id} plugin.`
-                  : plugin.reason ?? 'Start it from Connections, under Plugins.'}
+                {body ??
+                  (running || !plugin
+                    ? `From the ${card.pluginName} plugin.`
+                    : plugin.reason ?? 'Start it from Connections, under Plugins.')}
               </small>
             </span>
-            {navId && (
-              <button className="btn btn-secondary" onClick={() => onOpenPluginScreen(plugin.id, navId)}>
-                {card.bind?.cta?.label ?? `Open ${card.title ?? plugin.id}`} <ChevronRight size={13} />
+            {card.cta && (
+              <button className="btn btn-secondary" onClick={() => openView(card.cta!.view)}>
+                {card.cta.label} <ChevronRight size={13} />
               </button>
             )}
           </div>
         );
       })}
+
+      {/* Status rows: one line each, the value and what it means. */}
+      {statuses.length > 0 && (
+        <div className="overview-status-list">
+          {statuses.map((card) => {
+            const Icon = cardIcon(card.icon);
+            const value = bindText(card.bind.value ?? card.bind.headline, ctx(card));
+            const detail = bindText(card.bind.detail ?? card.bind.body, ctx(card));
+            const target = card.view ?? card.cta?.view;
+            return (
+              <div key={`${card.pluginId}-${card.id}`} className="overview-status">
+                <Icon size={14} aria-hidden />
+                <strong>{card.title}</strong>
+                <span className="overview-status-value">{value ?? '—'}</span>
+                {detail && <small>{detail}</small>}
+                {target && (
+                  <button className="btn-tiny" onClick={() => openView(target)}>
+                    {card.cta?.label ?? 'Open'} <ChevronRight size={12} />
+                  </button>
+                )}
+              </div>
+            );
+          })}
+        </div>
+      )}
+
+      {/* Tiles: a number or a word, and what it counts. */}
+      {tiles.length > 0 && (
+        <section className="service-section">
+          <div className="section-title-row">
+            <h3 className="section-title">From your plugins</h3>
+          </div>
+          <div className="overview-grid">
+            {tiles.map((card) => {
+              const Icon = cardIcon(card.icon);
+              const value = bindText(card.bind.value ?? card.bind.headline, ctx(card));
+              const inside = (
+                <>
+                  <Icon size={16} aria-hidden />
+                  <strong>{value ?? '—'}</strong>
+                  <small>{card.title}</small>
+                </>
+              );
+              const key = `${card.pluginId}-${card.id}`;
+              const label = `${card.title}: ${value ?? 'not known'}`;
+              return card.view ? (
+                <button key={key} className="overview-tile" aria-label={label} title={`From the ${card.pluginName} plugin`} onClick={() => openView(card.view!)}>
+                  {inside}
+                </button>
+              ) : (
+                <div key={key} role="group" className="overview-tile overview-tile-static" aria-label={label} title={`From the ${card.pluginName} plugin`}>
+                  {inside}
+                </div>
+              );
+            })}
+          </div>
+        </section>
+      )}
 
       {/* Not inside "Next steps": that section yields to the setup guide, and a
           run that has ALREADY failed is not a setup step to work through. On a
