@@ -250,8 +250,10 @@ pub async fn set_theme<R: Runtime>(app: AppHandle<R>, mode: String) -> Result<()
 
 /// What the dashboard may ask the agent's page to do, by name only: the setup
 /// wizard's "Answer calls and texts with OAIY" (the agent's own settings live
-/// in its page's storage, which only the page can change).
-const AGENT_INTENTS: [&str; 1] = ["answerWithOaiy"];
+/// in its page's storage, which only the page can change), and the first-run
+/// wizard's "Continue with the Agent", which opens a "Set up OAIY" conversation
+/// (until the page handles it, the dashboard showing the Agent is all it does).
+const AGENT_INTENTS: [&str; 2] = ["answerWithOaiy", "setupWithAgent"];
 
 /// Hands an intent to the agent's page: its `__oaiyIntent`, or, while the
 /// page is still starting, where it looks when it starts.
@@ -429,7 +431,14 @@ mod tests {
             intent_script("answerWithOaiy"),
             r#"window.__oaiyIntent ? window.__oaiyIntent("answerWithOaiy") : (window.__OAIY_INTENTS__ = (window.__OAIY_INTENTS__ || []).concat(["answerWithOaiy"]));"#
         );
+        assert_eq!(
+            intent_script("setupWithAgent"),
+            r#"window.__oaiyIntent ? window.__oaiyIntent("setupWithAgent") : (window.__OAIY_INTENTS__ = (window.__OAIY_INTENTS__ || []).concat(["setupWithAgent"]));"#
+        );
+        assert!(AGENT_INTENTS.contains(&"answerWithOaiy"));
+        assert!(AGENT_INTENTS.contains(&"setupWithAgent"));
         assert!(!AGENT_INTENTS.contains(&"alert(1)"));
+        assert!(!AGENT_INTENTS.contains(&"setupwithagent"));
     }
 
     #[test]
