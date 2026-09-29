@@ -110,12 +110,15 @@ a release matter here:
   GitHub Release takes the tag's own name, so a release tagged `0.1.0` would have files at
   `.../releases/download/0.1.0/...` and every baked link would answer 404. Push the `v` form, as
   the earlier releases did.
-- **A host must serve `/sw.js` from the root and keep `.html` in `/app.html`.** The flow editor
-  installs a service worker (scope `/app.html`) so it can open offline and be installed as an
-  app; it keeps the shell of this build under a cache named for the build and removes the old
-  build's when the person reloads onto the new one. A host that redirects `/app.html` to `/app`
-  leaves the editor outside the worker's scope, and one that caches `/sw.js` hides a new
-  release from returning visitors (`public/_headers` says `no-cache` for hosts that read it).
+- **A host must serve `/sw.js` from the root, and `/app.html` as itself, not redirected.** The
+  flow editor installs a service worker (scope `/app.html`) so it can open offline and be
+  installed as an app; it keeps the shell of this build under a cache named for the build and
+  removes the old build's when the person reloads onto the new one. The page asks for the worker
+  only when it is at `/app.html`, so on a host that redirects `/app.html` to `/app` (Cloudflare
+  Pages does, unless its pretty URLs are off) the editor registers none and stays online-only.
+  A host that caches `/sw.js` hides a new release from returning visitors (`public/_headers` says
+  `no-cache` for hosts that read it). The `HOSTING.md` the release's web job writes into the zip
+  does not say any of this yet.
 
 ## What is not in a release
 

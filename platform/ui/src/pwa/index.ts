@@ -41,6 +41,7 @@ export function startPwa(): void {
       inOaiyWindow: desktop,
       secureContext: window.isSecureContext,
       hasServiceWorker: 'serviceWorker' in navigator,
+      pathname: window.location.pathname,
     })
   ) {
     return;

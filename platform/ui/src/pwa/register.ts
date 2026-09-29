@@ -6,8 +6,9 @@
  *
  *   - in OAIY's own window (`__OAIY_DESKTOP__`; its page is served from a `.localhost` address
  *     where a worker could otherwise be registered, and the desktop serves the files itself),
- *   - by the dev server (there is no /sw.js there), or
- *   - where the browser has no service workers or the page is not a secure context.
+ *   - by the dev server (there is no /sw.js there),
+ *   - where the browser has no service workers or the page is not a secure context, or
+ *   - when the page is not at /app.html itself (a host that redirected it, for one).
  */
 import type { ContainerLike, RegistrationLike, UpdateController } from './updateController';
 import type { WorkerMessage } from './swCore';
@@ -22,8 +23,14 @@ export const KEEP_LOADED_DELAY_MS = 3000;
 /** How often, at most, a tab that is shown again asks whether there is a new build. */
 export const UPDATE_CHECK_MIN_INTERVAL_MS = 10 * 60 * 1000;
 
-export function shouldRegister(env: { production: boolean; inOaiyWindow: boolean; secureContext: boolean; hasServiceWorker: boolean }): boolean {
-  return env.production && !env.inOaiyWindow && env.secureContext && env.hasServiceWorker;
+/**
+ * Whether this page asks for the worker. Only the editor's own address: on a host that redirects
+ * /app.html to /app (Cloudflare Pages does, to drop the extension) the page is at /app, which the
+ * worker's scope /app.html does not reach, so registering would keep 6 MB of shell for a page it
+ * never controls. There it registers nothing, and the editor works as it did.
+ */
+export function shouldRegister(env: { production: boolean; inOaiyWindow: boolean; secureContext: boolean; hasServiceWorker: boolean; pathname: string }): boolean {
+  return env.production && !env.inOaiyWindow && env.secureContext && env.hasServiceWorker && env.pathname === WORKER_SCOPE;
 }
 
 /**

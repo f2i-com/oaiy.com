@@ -439,6 +439,34 @@ section('a shell file answered with the front page is never kept, and the editor
 }
 
 /* ------------------------------------------------------------------ */
+/* A host that redirects /app.html to /app (pretty URLs)                 */
+/* ------------------------------------------------------------------ */
+section('a page the host moved to /app registers no worker and keeps nothing');
+{
+  // What Cloudflare Pages does by default: /app.html answers a redirect to /app, and /app is the same page.
+  const editor = fs.readFileSync(path.join(DIST, 'app.html'));
+  const site = await startSite(DIST, {
+    override: (request) => {
+      if (request.path === '/app.html') return { status: 308, headers: { location: '/app' }, body: '' };
+      if (request.path === '/app') return { status: 200, headers: { 'content-type': 'text/html; charset=utf-8' }, body: editor };
+      return undefined;
+    },
+  });
+  const browser = await launch({ engine });
+  const page = await browser.context.newPage();
+  const net = watch(page);
+  await page.goto(`${site.origin}/app.html`, { waitUntil: 'networkidle' });
+  await sleep(4000);
+  ok('the editor opens at /app', new URL(page.url()).pathname === '/app' && (await page.locator('.app-shell').count()) === 1, page.url());
+  const state = await workers(page);
+  ok('no worker is registered, and the worker script was never asked for', state.scopes.length === 0 && site.requests((r) => r.path === '/sw.js').length === 0, JSON.stringify(state));
+  ok('and no cache holds 6 MB of shell for a page nothing controls', Object.keys(await cacheReport(page)).length === 0);
+  ok('with no page errors', net.errors.length === 0, net.errors.slice(0, 2).join(' | '));
+  await browser.close();
+  await site.close();
+}
+
+/* ------------------------------------------------------------------ */
 /* The scope is a prefix: /app.html/oops is in it and is not the page    */
 /* ------------------------------------------------------------------ */
 section('an address in scope that is not the page is never made the editor');

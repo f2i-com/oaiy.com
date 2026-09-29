@@ -267,10 +267,18 @@ await check('update: no message for none; subscribers hear each change once', ()
 /* --------------------------------- register ---------------------------------- */
 
 await check('register: only in production, outside OAIY\'s window, in a secure context with service workers', () => {
-  const ok = { production: true, inOaiyWindow: false, secureContext: true, hasServiceWorker: true };
+  const ok = { production: true, inOaiyWindow: false, secureContext: true, hasServiceWorker: true, pathname: '/app.html' };
   assert.equal(R.shouldRegister(ok), true);
   for (const off of ['production', 'secureContext', 'hasServiceWorker']) assert.equal(R.shouldRegister({ ...ok, [off]: false }), false, off);
   assert.equal(R.shouldRegister({ ...ok, inOaiyWindow: true }), false);
+});
+
+await check('register: only at /app.html itself: a page a host moved (/app, where Cloudflare Pages redirects it) or another path asks for no worker', () => {
+  const ok = { production: true, inOaiyWindow: false, secureContext: true, hasServiceWorker: true };
+  assert.equal(R.shouldRegister({ ...ok, pathname: '/app.html' }), true);
+  for (const pathname of ['/app', '/app/', '/app.html/', '/app.html/x', '/app.htmlx', '/', '/index.html', '/desktop.html', '', '/APP.HTML']) {
+    assert.equal(R.shouldRegister({ ...ok, pathname }), false, pathname);
+  }
 });
 
 function registerEnv({ controller = null, loaded = [] } = {}) {

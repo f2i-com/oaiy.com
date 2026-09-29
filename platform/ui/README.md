@@ -40,9 +40,12 @@ OAIY's own window never does, and neither does the dev server (there is no `/sw.
 - **Icons.** `scripts/make-icons.py` makes the 192, 512, maskable and apple-touch icons from the desktop's icon
   (`python scripts/make-icons.py`, `--check` to verify).
 
-A static host has to serve `/sw.js` from the site's root and keep `.html` in the editor's address (`/app.html`): a host that
-redirects it to `/app` would leave the editor outside the worker's scope. `public/_headers` (Netlify, Cloudflare Pages) says
-`/sw.js` is never cached, and sets the CSP of the compiler sandbox worker.
+A static host has to serve `/sw.js` from the site's root, and `/app.html` must be served as itself, not redirected (Cloudflare
+Pages redirects `/app.html` to `/app` unless its pretty-URL behaviour is off). The page asks for the worker only when it is at
+`/app.html`, so on a host that moves it the editor registers no worker and works as it did, online only. Only the page at exactly
+`/app.html` is answered from the shell: another address under the scope (`/app.html/x`) is left to the network, and a redirected or
+wrongly typed answer is never kept. `public/_headers` (Netlify, Cloudflare Pages) says `/sw.js` is never cached, and sets the CSP of
+the compiler sandbox worker.
 
 ## The download buttons
 
