@@ -23,6 +23,8 @@
 //!   OAIY_ENGINES_UI      the engines' control pages, when oaiy-studio runs beside
 //!                       this server (e.g. http://127.0.0.1:7860): /api/engines*
 //!                       reads and relays them                   [none]
+//!   OAIY_VOICE_GATEWAY   `off`: do not serve the voice gateway (17872), for a server
+//!                       tried beside the desktop, whose calls use it [on]
 //!   OAIY_PLUGIN_SOURCES  a folder of plugin folders the setup wizard's catalog
 //!                       offers to install from (<dir>/<plugin id>) [none]
 //!

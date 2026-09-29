@@ -409,8 +409,33 @@ async fn require_gateway_token(request: axum::extract::Request, next: axum::midd
     next.run(request).await
 }
 
+/// Whether this process serves the gateway: not when `OAIY_VOICE_GATEWAY=off`,
+/// which a second OAIY on the same computer (a headless one tried beside the
+/// desktop) sets, so it never takes the port the desktop's phone calls use.
+pub fn gateway_wanted() -> bool {
+    gateway_wanted_by(&std::env::var("OAIY_VOICE_GATEWAY").unwrap_or_default())
+}
+
+fn gateway_wanted_by(setting: &str) -> bool {
+    !matches!(setting.trim().to_ascii_lowercase().as_str(), "off" | "0" | "false")
+}
+
+#[cfg(test)]
+#[test]
+fn the_gateway_is_served_unless_turned_off() {
+    assert!(gateway_wanted_by(""));
+    assert!(gateway_wanted_by("on"));
+    assert!(!gateway_wanted_by("off"));
+    assert!(!gateway_wanted_by(" OFF "));
+    assert!(!gateway_wanted_by("0"));
+}
+
 /// Serve the gateway on 127.0.0.1:17872 until the process ends (a port in use is logged, not fatal).
 pub async fn serve_gateway(hub: VoiceHub, chat: Router) {
+    if !gateway_wanted() {
+        log::info!("OAIY voice gateway off (OAIY_VOICE_GATEWAY=off): calls cannot reach this OAIY");
+        return;
+    }
     let addr = SocketAddr::from(([127, 0, 0, 1], GATEWAY_PORT));
     match tokio::net::TcpListener::bind(addr).await {
         Ok(listener) => {
