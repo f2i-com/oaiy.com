@@ -259,8 +259,8 @@ impl PluginRecord {
     }
 
     /// Does its package's trust say it may not be started? (A plugin already running when
-    /// its folder stopped verifying keeps running and keeps its manifest, but says so
-    /// here, and is not started again.)
+    /// its folder stopped verifying keeps running with the manifest it was started from,
+    /// and reads no other from the folder, but says so here, and is not started again.)
     pub fn refused_by_trust(&self) -> bool {
         self.trust.as_ref().is_some_and(|t| !t.allows_launch())
     }
@@ -452,12 +452,18 @@ impl PluginRegistry {
                     }
                     match self.plugins.get_mut(&id) {
                         Some(existing) if existing.is_loadable() => {
-                            // Refresh the manifest but keep runtime state.
-                            existing.legacy_capabilities = m.legacy_capabilities();
-                            existing.unknown_capabilities = m.unknown_capabilities();
-                            existing.manifest = Some(m);
-                            // Said when it happens, not on every scan after.
-                            if !trust.allows_launch() && existing.trust.as_ref().map(|t| t.state) != Some(trust.state) {
+                            if trust.allows_launch() {
+                                // Refresh the manifest but keep runtime state.
+                                existing.legacy_capabilities = m.legacy_capabilities();
+                                existing.unknown_capabilities = m.unknown_capabilities();
+                                existing.manifest = Some(m);
+                            } else if existing.trust.as_ref().map(|t| t.state) != Some(trust.state) {
+                                // What a live process may do is what it was started with: its
+                                // commands, its events and its capabilities. A manifest read
+                                // from a folder that no longer verifies is not adopted, or an
+                                // edit to manifest.json would widen a running plugin's
+                                // permissions on the strength of a file no signature covers.
+                                // Said when it happens, not on every scan after.
                                 log::warn!(
                                     "plugin {id} is running but its package no longer verifies, so it will not be started again: {}",
                                     trust.reason.as_deref().unwrap_or("not trusted")
@@ -1686,5 +1692,81 @@ mod tests {
             b"{\"paired\":true}",
             "the plugin's state moved with it"
         );
+    }
+
+    // --- a live plugin and a folder that stopped verifying ---------------------
+
+    /// A manifest that declares less than `manifest()`: one command, no flow capability, no event.
+    fn narrow_manifest(id: &str) -> serde_json::Value {
+        serde_json::json!({
+            "schemaVersion": 3,
+            "id": id,
+            "name": format!("{id} plugin"),
+            "version": "0.1.0",
+            "pluginApiVersion": 1,
+            "entry": { "kind": "process", "command": "plugin.exe" },
+            "capabilities": ["connector.aokie.*"],
+            "connectors": [{ "id": "aokie", "commands": ["call.answer"] }],
+            "events": [],
+        })
+    }
+
+    /// What `manifest()` declares and `narrow_manifest()` does not: a journalled command, the
+    /// flow capability, an event.
+    fn widened_by_an_edit(reg: &PluginRegistry) -> (bool, bool, bool) {
+        (
+            reg.gate("aokie", "sms.send", Some("k")).is_ok(),
+            reg.grants("aokie", "oaiy.flow.run"),
+            reg.may_emit("aokie", "aokie.call.incoming"),
+        )
+    }
+
+    #[test]
+    fn a_running_plugin_does_not_adopt_a_manifest_from_a_folder_that_stopped_verifying() {
+        let root = Root::new();
+        let key = TestKey::generate("fl-test-2026a");
+        root.plugin("aokie", narrow_manifest("aokie"));
+        let dir = root.path().join("aokie");
+        key.sign(&dir, "aokie-plugin", "0.1.0");
+        let mut reg = release_registry(&root, &key);
+        reg.scan();
+        reg.set_state("aokie", PluginState::Running, None);
+        assert_eq!(widened_by_an_edit(&reg), (false, false, false), "the signed manifest declares none of them");
+
+        // Somebody edits manifest.json under the running plugin: another command, the flow
+        // capability and an event.
+        fs::write(dir.join("manifest.json"), serde_json::to_string_pretty(&manifest("aokie")).unwrap()).unwrap();
+        reg.scan();
+
+        let rec = reg.get("aokie").unwrap();
+        assert_eq!(rec.state, PluginState::Running, "a live call is not dropped");
+        assert_eq!(rec.trust.as_ref().unwrap().state, TrustState::Quarantined);
+        assert!(rec.refused_by_trust());
+        assert_eq!(widened_by_an_edit(&reg), (false, false, false), "an edit no signature covers widens nothing");
+        assert!(reg.gate("aokie", "call.answer", None).is_ok(), "and it still serves what it started with");
+        assert_eq!(
+            rec.manifest.as_ref().unwrap().connectors[0].commands,
+            vec!["call.answer".to_string()],
+            "the record still holds the manifest the process was started from"
+        );
+    }
+
+    #[test]
+    fn an_unsigned_plugin_edited_while_it_runs_is_refreshed_in_a_developer_build_as_before() {
+        // The owner's flow: `tauri dev`, a plugin folder with no signature. Nothing checks
+        // it, so an edit to its manifest is picked up without a restart, as it always was.
+        let root = Root::new();
+        root.plugin("aokie", narrow_manifest("aokie"));
+        let dir = root.path().join("aokie");
+        let trust = trust_service(&root, TrustPolicy::developer(), Publishers::default());
+        let mut reg = PluginRegistry::with_trust(root.path().to_path_buf(), trust);
+        reg.scan();
+        reg.set_state("aokie", PluginState::Running, None);
+        assert_eq!(widened_by_an_edit(&reg), (false, false, false));
+
+        fs::write(dir.join("manifest.json"), serde_json::to_string_pretty(&manifest("aokie")).unwrap()).unwrap();
+        reg.scan();
+        assert_eq!(reg.get("aokie").unwrap().trust.as_ref().unwrap().state, TrustState::UnsignedDev);
+        assert_eq!(widened_by_an_edit(&reg), (true, true, true), "the edit is adopted");
     }
 }
