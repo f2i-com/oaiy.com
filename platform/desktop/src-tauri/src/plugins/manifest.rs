@@ -104,8 +104,8 @@ impl std::fmt::Display for ManifestError {
 pub struct PluginEntry {
     /// Only `process` today. An unknown kind is refused rather than assumed.
     pub kind: String,
-    /// Executable path, **relative to the plugin directory**. Absolute paths and
-    /// `..` traversal are refused — see [`PluginManifest::resolve_entry`].
+    /// Executable path, **relative to the plugin directory**. Absolute paths, a `:`
+    /// and `..` traversal are refused — see [`PluginManifest::resolve_entry`].
     pub command: String,
     #[serde(default)]
     pub args: Vec<String>,
@@ -1081,7 +1081,8 @@ impl PluginManifest {
 
     /// Absolute path to the executable, confined to the plugin directory.
     ///
-    /// Refuses absolute paths and any `..` component. Without this, a manifest
+    /// Refuses absolute paths, a `:` (a drive, or an alternate data stream of a file)
+    /// and any `..` component. Without this, a manifest
     /// could name `../../../../Windows/System32/cmd.exe`, or an absolute path to
     /// anything on the box, and the host would dutifully launch it — turning
     /// "drop a folder in the plugins dir" into arbitrary code execution with a
@@ -1090,6 +1091,16 @@ impl PluginManifest {
         let raw = self.entry.command.trim();
         if raw.is_empty() {
             return Err(ManifestError::Invalid("entry.command is empty".into()));
+        }
+        // On Windows a colon after a name is an alternate data stream of that file, and a
+        // program can be started from one. A stream is in no directory listing and in no
+        // digest of a package's files, so a signature or a person's trust in the package
+        // would say nothing of what runs; and before the first name a colon is a drive.
+        // The entry is a path inside the folder and nothing else.
+        if raw.contains(':') {
+            return Err(ManifestError::Invalid(format!(
+                "entry.command {raw:?} must not contain ':' (a drive, or an alternate data stream of a file)"
+            )));
         }
         let candidate = Path::new(raw);
         if candidate.is_absolute() {
@@ -1597,6 +1608,26 @@ mod tests {
                 "{bad}: got {err:?}"
             );
         }
+    }
+
+    #[test]
+    fn an_entry_command_cannot_name_an_alternate_data_stream_or_a_drive() {
+        // On Windows a colon after the first component is a stream of a file (a program
+        // can be run from one), and before it a drive. Neither is a path inside the
+        // plugin's folder, and a stream is invisible to a listing of the folder and to a
+        // digest of its files, so the entry is never allowed to name one.
+        for bad in ["plugin.exe:evil.exe", "plugin.exe:evil.exe:$DATA", "bin/plugin.exe::$DATA", "plugin.exe:", "C:plugin.exe"] {
+            let mut v = base();
+            v["entry"]["command"] = serde_json::json!(bad);
+            let d = write_manifest(&v);
+            let err = PluginManifest::load(d.path()).expect_err(&format!("{bad} must be refused"));
+            assert!(matches!(err, ManifestError::Invalid(_)), "{bad}: got {err:?}");
+        }
+        let mut v = base();
+        v["entry"]["command"] = serde_json::json!("plugin.exe:evil.exe");
+        let d = write_manifest(&v);
+        let reason = PluginManifest::load(d.path()).unwrap_err().reason();
+        assert!(reason.contains("':'") && reason.contains("alternate data stream"), "{reason}");
     }
 
     #[test]

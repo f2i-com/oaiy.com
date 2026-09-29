@@ -2060,6 +2060,55 @@ pub(crate) mod tests {
     }
 
     #[test]
+    fn a_manifest_that_names_a_stream_of_a_listed_file_is_not_launched_even_when_it_is_signed() {
+        // A stream of a signed file is in no listing and in no digest, so a program in it
+        // would run under a permit that covers nothing of it. The entry may name only a
+        // path inside the folder, whoever signed the manifest.
+        let scratch = Scratch::new("stream-entry");
+        let dir = scratch.package("demo");
+        fill(&dir);
+        let streamed = MANIFEST.replace("demo-plugin.exe", "demo-plugin.exe:payload.exe");
+        std::fs::write(dir.join("manifest.json"), streamed).unwrap();
+        let key = TestKey::generate("test-key-1");
+        key.sign(&dir, "demo-plugin", "1.0.0");
+        let svc = service(TrustPolicy::release(), key.pinned_for("Demo Co", &["demo"]), &scratch);
+
+        assert_eq!(svc.assess_fresh(&dir, "demo").state, TrustState::Verified, "the package itself is as signed");
+        match svc.authorize_launch(&dir, "demo") {
+            Err(LaunchRefusal::Manifest(ManifestError::Invalid(why))) => assert!(why.contains("':'"), "{why}"),
+            other => panic!("an entry that names a stream must not be launched: {other:?}"),
+        }
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn a_package_whose_files_carry_mark_of_the_web_streams_still_verifies() {
+        // Files unpacked by Explorer from a download carry a `Zone.Identifier` stream, and
+        // `std::fs::copy` (which the installer copies a folder with) takes streams along.
+        // A rule that quarantined any file with a stream would refuse every such package.
+        // What a stream can do is only what something names it to do, and the entry
+        // command may not (see `manifest.rs`), so a stream is left alone.
+        let (scratch, dir, _k, svc) = signed(TrustPolicy::release());
+        let files = ["demo-plugin.exe", "manifest.json", "ui/index.html"];
+        for rel in files {
+            let stream = format!("{}:Zone.Identifier", dir.join(rel).display());
+            if std::fs::write(&stream, b"[ZoneTransfer]\r\nZoneId=3\r\n").is_err() {
+                return; // not NTFS: there are no streams to test
+            }
+        }
+        assert_eq!(svc.assess_fresh(&dir, "demo").state, TrustState::Verified);
+
+        let copy = scratch.package("copy");
+        std::fs::create_dir_all(copy.join("ui")).unwrap();
+        for rel in files.iter().copied().chain([PACKAGE_MANIFEST_FILE]) {
+            std::fs::copy(dir.join(rel), copy.join(rel)).unwrap();
+        }
+        let carried = format!("{}:Zone.Identifier", copy.join("demo-plugin.exe").display());
+        assert!(std::fs::metadata(carried).is_ok(), "the copy took the stream along");
+        assert_eq!(svc.assess_fresh(&copy, "demo").state, TrustState::Verified);
+    }
+
+    #[test]
     fn an_unsigned_package_in_a_developer_build_is_read_at_the_launch_and_a_broken_one_is_refused() {
         let scratch = Scratch::new("dev-launch");
         let dir = scratch.package("demo");
