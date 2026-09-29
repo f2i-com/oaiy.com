@@ -282,6 +282,43 @@ describe('a phone call answered by the agent', () => {
     expect(calls).toEqual([['finish', 'call_g', 'Thanks, bye!']]);
   });
 
+  it('a reply that speaks and ends the call says one goodbye: its own words, then the phone hangs up after them', async () => {
+    // Live 29 Sept 2026: "You're very welcome, Lance." then end_call's "You're welcome, Lance, have a great day!".
+    const fake = fakeProvider('openai', [
+      { text: "You're very welcome, Lance.", calls: [{ name: 'end_call', input: { goodbye: "You're welcome, Lance, have a great day!" } }] },
+      { text: 'Done.' },
+    ]);
+    const { sessions, calls } = setup();
+    const call = await sessions.callEvent({ type: 'call.started', callId: 'call_bye', from: '+61491570006', name: 'Lance' });
+    await sessions.callEvent({ type: 'call.caller', callId: 'call_bye', text: 'Thanks so much, bye.' });
+    await settled(sessions);
+    expect(calls).toEqual([['finish', 'call_bye', "You're very welcome, Lance."]]);
+    expect(fake.bodies).toHaveLength(2);
+    const result = call!.agent.turns.find((t) => t.role === 'tool');
+    expect(JSON.stringify(result)).toContain('was not said (one goodbye, not two)');
+  });
+
+  it('the earlier sentences of that reply are said as it is written, and its last one is the goodbye (a trailing line break too)', async () => {
+    fakeProvider('openai', [{ text: 'No problem at all! You are very welcome, Lance.\n', calls: [{ name: 'end_call', input: { goodbye: 'Bye now!' } }] }, { text: '' }]);
+    const { sessions, calls } = setup();
+    await sessions.callEvent({ type: 'call.started', callId: 'call_bye2', from: '+61400000031' });
+    await sessions.callEvent({ type: 'call.caller', callId: 'call_bye2', text: "That's everything." });
+    await settled(sessions);
+    expect(calls).toEqual([
+      ['say', 'call_bye2', 'No problem at all!'],
+      ['finish', 'call_bye2', 'You are very welcome, Lance.'],
+    ]);
+  });
+
+  it('a reply with only end_call says the goodbye it gives', async () => {
+    fakeProvider('openai', [{ calls: [{ name: 'remember', input: { fact: 'Books monthly' } }, { name: 'end_call', input: { goodbye: 'Thanks, Sam. Bye!' } }] }, { text: '' }]);
+    const { sessions, calls } = setup();
+    await sessions.callEvent({ type: 'call.started', callId: 'call_bye3', from: '+61400000032' });
+    await sessions.callEvent({ type: 'call.caller', callId: 'call_bye3', text: 'Bye.' });
+    await settled(sessions);
+    expect(calls).toEqual([['finish', 'call_bye3', 'Thanks, Sam. Bye!']]);
+  });
+
   it('what the caller said as the call ended is kept, and no reply is written for a call that has ended', async () => {
     let release!: () => void;
     const held = new Promise<void>((r) => (release = r));
@@ -520,7 +557,7 @@ describe('a phone call answered by the agent', () => {
     let sayNow!: () => void;
     const spokenYet = new Promise<void>((r) => (sayNow = r));
     const fake = fakeProvider('openai', [
-      { text: 'We are open from nine. And on Sundays we are open too.', hold: { at: 23, until: spokenYet.then(() => interrupt()) } },
+      { text: 'We are open from nine. And on Sundays we are open too.', hold: { at: 24, until: spokenYet.then(() => interrupt()) } },
       (body) => {
         const sent = JSON.stringify(body.messages);
         expect(sent).toContain('We are open from nine.…');
@@ -677,7 +714,7 @@ describe('a phone call answered by the agent', () => {
     let cut!: () => void;
     const cutNow = new Promise<void>((r) => (cut = r));
     fakeProvider('openai', [
-      { text: 'We are open from nine. We close at five on weekdays. And on Sundays we rest.', hold: { at: 53, until: cutNow } },
+      { text: 'We are open from nine. We close at five on weekdays. And on Sundays we rest.', hold: { at: 54, until: cutNow } },
       { text: 'Sure. We close at five on weekdays.' },
     ]);
     const { sessions, calls } = setup();
@@ -705,7 +742,9 @@ describe('a phone call answered by the agent', () => {
       await speech.done;
       expect(said).toEqual(['One moment, let me check.']);
       speech.begin();
+      // The reply's words end at its tool call: said then, so the line is not.
       speech.push('Let me look. ');
+      speech.flush();
       speech.hold('One moment, let me check.');
       await speech.done;
       expect(said).toEqual(['One moment, let me check.', 'Let me look.']);

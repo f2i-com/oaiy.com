@@ -56,6 +56,8 @@ export interface Session extends SessionInfo {
   speakingTimer?: ReturnType<typeof setTimeout>;
   /** Answers that came in while the caller spoke: given to the agent with their words. */
   held?: string[];
+  /** The words of the reply that calls end_call, held back to be its goodbye (so no second goodbye is said). */
+  parting?: string;
   /** A flow's tasks waiting for their answers, each by its prompt (one task a run; a message of the person's answers none). */
   answers?: Array<{ prompt: string; settle: (reply: string, error?: string) => void }>;
 }
@@ -233,9 +235,31 @@ export class Speech {
         at = comma > 40 ? comma + 1 : this.buffer.lastIndexOf(' ', 220);
       }
       if (at <= 0) return;
+      // Said once the next words have begun: the reply's last sentence waits for its end, so a
+      // goodbye written before end_call is still here to be the goodbye (see take).
+      if (!/\S/.test(this.buffer.slice(at))) return;
       this.speak(this.buffer.slice(0, at));
       this.buffer = this.buffer.slice(at);
     }
+  }
+
+  /**
+   * The reply's words not said yet, taken instead of said: the reply ends the
+   * call, and they are its goodbye (said by the phone, which hangs up after).
+   */
+  take(): string {
+    const rest = this.hushed ? '' : spoken(this.buffer);
+    this.buffer = '';
+    this.repeated = [];
+    // Words are coming (as the goodbye): no "one moment" line over a tool of this reply.
+    if (rest) this.spoke = true;
+    return rest;
+  }
+
+  /** Say `text` now (words held back for a goodbye that did not happen). */
+  sayNow(text: string): void {
+    const clean = spoken(text);
+    if (clean && !this.hushed) this.enqueue(clean);
   }
 
   /** The reply ended: speak what is left. */
@@ -356,7 +380,7 @@ export function callInstructions(brief: string, instructions: string): string {
     'To look something up, do it in the same reply as a few words: say "Let me check." and make the call at once. Never say you will check without doing it: the caller hears you and waits. lookup_business_data answers later, in a message of its own ("[OAIY] The answer to your lookup …"): keep the conversation going meanwhile (answer anything else they say, without guessing the answer), and tell them the answer when it comes. Other tools (a file, remember) answer at once.',
     'Say only what you know: from these instructions, the brief, or what a tool returned. Never make up availability, times, prices or bookings, and never say a time is free or agree to one unless a tool said it is. If you cannot check, say so, and offer to take their preferred time as a request for staff to confirm.',
     'To take a booking request: once you have the service, the day and time they want and their name, call request_appointment in that same reply, and only then tell them it is requested. Saying you have noted it without calling request_appointment records nothing.',
-    'Never repeat something you have already said on this call. When the caller says goodbye or is done, call end_call with a short goodbye, and write nothing else.',
+    'Never repeat something you have already said on this call. When the caller says goodbye or is done, call end_call with a short goodbye, and write nothing else: its goodbye is the one thing said (words written in that reply are said as the goodbye instead), and nothing written after end_call is ever said.',
     'When you know their name, use it now and then, as a receptionist who remembers them would.',
     brief.trim() ? `The receptionist brief:\n${brief.trim()}` : '',
     `The instructions of the person you work for, for calls:\n${instructions.trim() || '(none)'}`,
@@ -963,14 +987,25 @@ export class Sessions {
       {
         spec: {
           name: 'end_call',
-          description: 'Say a short goodbye, then hang up. Use it when the caller is done, not before.',
+          description: 'Say a short goodbye, then hang up. Use it when the caller is done, not before. The goodbye is the only thing said: write no other words in that reply (words you do write are said as the goodbye instead of this one), and nothing after it.',
           parameters: { type: 'object', properties: { goodbye: { type: 'string', description: 'The goodbye, one short sentence' } } },
         },
         run: async (input) => {
           const { desktop, callId } = live();
+          // Words this reply wrote before end_call are its goodbye: said once, then the phone hangs up
+          // after them. The goodbye given is said only when the reply wrote nothing.
+          const parting = session.parting ?? '';
+          session.parting = undefined;
+          const given = String(input.goodbye ?? '').trim();
+          const goodbye = parting || given;
+          // What was queued to be said goes first; nothing after the goodbye.
+          if (session.speech) await Promise.race([session.speech.done, new Promise((r) => setTimeout(r, 3000))]);
           session.speech?.hush();
-          const r = await desktop.finishCall(callId, String(input.goodbye ?? ''));
-          return r.ok ? 'The goodbye is being said, then the call ends. Write nothing more.' : `Could not end the call: ${outcome(r)}`;
+          const r = await desktop.finishCall(callId, goodbye);
+          if (!r.ok) return `Could not end the call: ${outcome(r)}`;
+          return parting && given && parting !== given
+            ? `The words you wrote ("${parting}") are the goodbye, so "${given}" was not said (one goodbye, not two). The call ends once they have played. Write nothing more.`
+            : 'The goodbye is being said, then the call ends. Write nothing more.';
         },
       },
       {
@@ -1403,6 +1438,10 @@ export class Sessions {
     };
     // end_call has run: nothing more is said in this run, whatever tool answers after it.
     let goodbye = false;
+    // The reply being written calls end_call (seen as its calls begin): its words are held back to be the goodbye.
+    let ending = false;
+    let draft = '';
+    session.parting = undefined;
     // When the messages it answers came: the time its first turn is kept with (the rest, as they come).
     let arrived = session.waitingSince;
     session.waitingSince = session.waiting.length ? Date.now() : undefined;
@@ -1412,10 +1451,17 @@ export class Sessions {
         arrived = undefined;
         if (event.type === 'done') said = event.text;
         if (event.type === 'error') failed = event.message;
+        if (event.type === 'tool_start' && event.name === 'end_call') ending = true;
+        // A model that writes its calls as text (OAIY's own format): the name is in the draft.
+        if (event.type === 'tool_draft' && session.speech) {
+          draft = event.start ? event.text : draft + event.text;
+          if (/<function=end_call>|"name"\s*:\s*"end_call"/.test(draft)) ending = true;
+        }
         if (event.type === 'tool_call') {
           session.inTool = true;
           stopHolding();
-          if (session.speech) holding = setTimeout(() => session.speech?.hold(HOLD_LINE), HOLD_AFTER_MS);
+          // Not over a reply that ends the call: its goodbye is coming.
+          if (session.speech && !session.parting) holding = setTimeout(() => session.speech?.hold(HOLD_LINE), HOLD_AFTER_MS);
         }
         if (event.type === 'tool_result') {
           session.inTool = false;
@@ -1426,8 +1472,17 @@ export class Sessions {
           if (!goodbye) session.speech?.begin(true);
         }
         if (session.speech && event.type === 'text') session.speech.push(event.delta);
-        // A reply ends (a tool is called, or the model's turn is over): what it said is complete.
-        if (session.speech && (event.type === 'tool_call' || event.type === 'usage')) session.speech.flush();
+        // A reply ends (a tool is called, or the model's turn is over): what it said is complete. A reply
+        // that ends the call keeps its last words for end_call: they are the goodbye, said once.
+        if (session.speech && event.type === 'usage') {
+          if (!ending) session.speech.flush();
+          else {
+            const rest = session.speech.take();
+            if (rest) session.parting = rest;
+          }
+          ending = false;
+          draft = '';
+        } else if (session.speech && event.type === 'tool_call') session.speech.flush();
         this.hooks.event(session, event);
       }, controller.signal);
       session.speech?.flush();
@@ -1446,6 +1501,7 @@ export class Sessions {
     } finally {
       stopHolding();
       session.inTool = false;
+      session.parting = undefined;
       // The task this run was (none, when it was a message of the person's).
       const task = session.answers?.findIndex((a) => a.prompt === prompt) ?? -1;
       if (task >= 0) session.answers!.splice(task, 1)[0].settle(said.trim(), said.trim() ? undefined : failed || 'the agent finished without an answer');
