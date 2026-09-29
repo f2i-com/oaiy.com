@@ -1097,6 +1097,7 @@ footer.dialog-buttons { flex: none; padding: 12px 22px 16px; border-top: 1px sol
 .outreach-plan-people.skipped { color: var(--muted); }
 .outreach-plan-muted { color: var(--muted); }
 .outreach-plan-rows { display: grid; grid-template-columns: max-content 1fr; gap: 6px 14px; font-size: 13.5px; line-height: 1.4; }
+.outreach-plan-row { display: contents; }
 .outreach-plan-label { color: var(--muted); }
 .outreach-plan-value { min-width: 0; overflow-wrap: anywhere; }
 .outreach-plan-note { display: flex; gap: 8px; align-items: flex-start; margin: 0; padding: 8px 10px; border-radius: var(--r-ctl); background: var(--surface-soft); border: 1px solid var(--border); color: var(--muted); font-size: 12.5px; line-height: 1.4; }
@@ -1117,7 +1118,7 @@ footer.dialog-buttons { flex: none; padding: 12px 22px 16px; border-top: 1px sol
 .outreach-meta { display: flex; flex-wrap: wrap; gap: 4px 12px; font-size: 12px; color: var(--muted); }
 .outreach-meta strong { color: var(--text); font-weight: 650; }
 .outreach-people { list-style: none; margin: 0; padding: 0; display: flex; flex-direction: column; border: 1px solid var(--border); border-radius: var(--r-ctl); overflow: hidden; }
-.outreach-person { display: grid; grid-template-columns: 10px minmax(0, 1.1fr) minmax(0, 1fr) minmax(0, 1.6fr); gap: 10px; align-items: center; padding: 7px 10px; font-size: 12.5px; border-top: 1px solid var(--border); }
+.outreach-person { display: grid; grid-template-columns: 10px minmax(0, 1fr) minmax(0, 1.25fr); gap: 10px; align-items: center; padding: 7px 10px; font-size: 12.5px; border-top: 1px solid var(--border); }
 .outreach-person:first-child { border-top: 0; }
 .outreach-dot { width: 8px; height: 8px; border-radius: 50%; background: var(--faint); }
 .outreach-person[data-tone='live'] .outreach-dot { background: var(--err); box-shadow: var(--glow) var(--err); animation: pulse 1.2s ease-in-out infinite; }
@@ -1125,14 +1126,15 @@ footer.dialog-buttons { flex: none; padding: 12px 22px 16px; border-top: 1px sol
 .outreach-person[data-tone='wait'] .outreach-dot { background: var(--warn); }
 .outreach-person[data-tone='bad'] .outreach-dot { background: var(--err); }
 .outreach-person-name { font-weight: 600; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
-.outreach-person-name small { display: block; font-weight: 400; color: var(--muted); font-size: 11px; }
-.outreach-person-state { color: var(--muted); min-width: 0; }
+.outreach-person-who { display: flex; flex-direction: column; gap: 1px; min-width: 0; }
+.outreach-person-state { color: var(--muted); min-width: 0; font-size: 11.5px; }
 .outreach-person-answers { min-width: 0; color: var(--text); overflow-wrap: anywhere; }
 .outreach-person-answers .outreach-summary { display: block; color: var(--muted); font-style: italic; }
 .outreach-actions { display: flex; gap: 6px; flex-wrap: wrap; align-items: center; }
 .outreach-actions button { padding: 4px 12px; font-size: 12px; }
-.outreach-actions .outreach-path { margin-left: auto; font: 11.5px var(--mono); color: var(--muted); min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
-@media (max-width: 600px) { .outreach-person { grid-template-columns: 10px minmax(0, 1fr) minmax(0, 1fr); } .outreach-person-answers { grid-column: 2 / -1; } }
+.outreach-actions .outreach-path { flex: 1 1 0; min-width: 0; margin-left: auto; padding: 4px 2px; border: 0; background: none; text-align: right; font: 11.5px var(--mono); color: var(--accent); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; cursor: pointer; }
+.outreach-actions .outreach-path:hover { text-decoration: underline; }
+@media (max-width: 600px) { .outreach-person { grid-template-columns: 10px minmax(0, 1fr); } .outreach-person-answers { grid-column: 2 / -1; } }
 
 /* A line after each person, and the report, in the conversation that started it. */
 .outreach-lines { align-self: stretch; display: flex; flex-direction: column; gap: 2px; padding: 6px 10px; border-left: 3px solid color-mix(in srgb, var(--accent) 55%, var(--border)); border-radius: 0 var(--r-ctl) var(--r-ctl) 0; background: color-mix(in srgb, var(--accent) 5%, transparent); font-size: 12.5px; }
@@ -1150,7 +1152,8 @@ footer.dialog-buttons { flex: none; padding: 12px 22px 16px; border-top: 1px sol
 
 .chip.outreach:not(.toggle):not(.on-call) { font-family: inherit; font-size: 12px; font-weight: 650; gap: 6px; color: var(--accent); border-color: color-mix(in srgb, var(--accent) 40%, var(--border)); background: var(--primary-soft); cursor: pointer; }
 .chip.outreach[hidden] { display: none; }
-.chip.outreach[data-state='waiting'] { color: var(--warn); border-color: color-mix(in srgb, var(--warn) 40%, var(--border)); background: var(--warn-soft); }
-.chip.outreach[data-state='report'] { color: var(--ok); border-color: color-mix(in srgb, var(--ok) 45%, var(--border)); background: var(--ok-soft); }
+.chip.outreach:not(.toggle):not(.on-call)[data-state='waiting'] { color: var(--warn); border-color: color-mix(in srgb, var(--warn) 40%, var(--border)); background: var(--warn-soft); }
+.chip.outreach:not(.toggle):not(.on-call)[data-state='report'] { color: var(--ok); border-color: color-mix(in srgb, var(--ok) 45%, var(--border)); background: var(--ok-soft); }
 .chip.outreach .icon { width: 13px; height: 13px; }
 .tool.outreach-sent > .tool-row { display: flex; flex-direction: column; align-items: stretch; gap: 3px; padding: 7px 12px 6px; font-size: 14px; }
+.chip.outreach:not(.toggle):not(.on-call)::before { content: none; }

@@ -22,7 +22,7 @@
     "desktop:portable": "node scripts/desktop-portable.mjs",
     "typecheck": "tsc --noEmit",
     "test": "vitest run",
-    "test:e2e": "node tests/e2e/run.mjs && node tests/e2e/app.mjs && node tests/e2e/files.mjs && node tests/e2e/softn.mjs && node tests/e2e/webpage.mjs && node tests/e2e/csp.mjs && node tests/e2e/oaiy.mjs && node tests/e2e/agentctl.mjs && node tests/e2e/oneperson.mjs && node tests/e2e/static.mjs --build"
+    "test:e2e": "node tests/e2e/run.mjs && node tests/e2e/app.mjs && node tests/e2e/files.mjs && node tests/e2e/softn.mjs && node tests/e2e/webpage.mjs && node tests/e2e/csp.mjs && node tests/e2e/oaiy.mjs && node tests/e2e/agentctl.mjs && node tests/e2e/oneperson.mjs && node tests/e2e/outreach.mjs && node tests/e2e/static.mjs --build"
   },
   "dependencies": {
     "@codemirror/lang-css": "^6.3.1",

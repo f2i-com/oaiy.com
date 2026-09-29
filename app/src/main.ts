@@ -2033,7 +2033,8 @@ With that done, Settings → Images, video and audio → Find OAIY sets it up.`)
               // A call begins: show it (the person sees the conversation as it happens).
               if (session && event.type === 'call.started') {
                 selectSession(session.thread);
-                chat.system(`📞 ${session.title} is calling: the agent is answering.`);
+                const placed = session.outreach && !session.outreach.inbound ? session.outreach : undefined;
+                chat.system(placed ? `📞 ${session.title} answered the call for "${placed.name}": the agent is on it.` : `📞 ${session.title} is calling: the agent is answering.`);
               }
             });
           }, abort.signal);

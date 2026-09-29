@@ -27,7 +27,7 @@ const time = (ms: number) => new Date(ms).toLocaleTimeString(undefined, { hour: 
 export function personState(c: Campaign, p: Person): { words: string; tone: 'live' | 'ok' | 'wait' | 'bad' | 'idle' } {
   switch (p.state) {
     case 'queued': return { words: c.kind === 'call' ? 'to call' : 'to text', tone: 'idle' };
-    case 'waiting': return { words: `again at ${time(p.nextAt)}${p.tries ? ` (tried ${p.tries})` : ''}`, tone: 'wait' };
+    case 'waiting': return { words: `again at ${time(p.nextAt)}`, tone: 'wait' };
     case 'dialling': return { words: 'dialling…', tone: 'live' };
     case 'ringing': return { words: 'ringing…', tone: 'live' };
     case 'on_call': return { words: 'on the call', tone: 'live' };
@@ -80,16 +80,17 @@ export function outreachCard(id: string, host: OutreachHost): { element: HTMLEle
         ...shown.map((p) => {
           const s = personState(c, p);
           const answers = answersOf(c, p);
+          const number = p.number === 'test' ? 'test' : displayNumber(p.number);
+          const tries = p.tries ? `${p.tries} ${c.kind === 'call' ? (p.tries === 1 ? 'dial' : 'dials') : p.tries === 1 ? 'text' : 'texts'}` : '';
           return h(
             'li.outreach-person',
-            { 'data-tone': s.tone, 'data-state': p.state },
+            { 'data-tone': s.tone, 'data-state': p.state, title: [p.name, number, tries].filter(Boolean).join(' · ') },
             h('span.outreach-dot', { 'aria-hidden': 'true' }),
-            h('span.outreach-person-name', p.name || displayNumber(p.number), p.name ? h('small', p.number === 'test' ? 'test' : displayNumber(p.number)) : ''),
-            h('span.outreach-person-state', s.words),
+            h('span.outreach-person-who', h('span.outreach-person-name', p.name || number), h('span.outreach-person-state', p.name ? `${number} · ${s.words}` : s.words)),
             h('span.outreach-person-answers', answers, p.summary && p.state === 'done' ? h('span.outreach-summary', p.summary) : ''),
           );
         }),
-        ...(c.people.length > shown.length ? [h('li.outreach-person', h('span'), h('span.outreach-person-state', `and ${c.people.length - shown.length} more (outreach_status lists them)`))] : []),
+        ...(c.people.length > shown.length ? [h('li.outreach-person', h('span'), h('span.outreach-person-who', h('span.outreach-person-state', `and ${c.people.length - shown.length} more (outreach_status lists them)`)))] : []),
       ),
     );
     const actions = h('div.outreach-actions');
