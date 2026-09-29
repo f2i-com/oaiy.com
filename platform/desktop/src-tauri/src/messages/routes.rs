@@ -1,6 +1,8 @@
 //! The messages over HTTP, for the dashboard's Messages page.
 //!
-//!   GET    /api/messages?state=&q=  → {messages, total, unread}: newest first; `state` is `new`,
+//!   GET    /api/messages?state=&q=  → {messages, total, unread, notice}: newest first; `notice` is a
+//!                                     plain word when new messages are being refused because too many
+//!                                     wait for the owner (else null); `state` is `new`,
 //!                                     `seen` or `handled` (all when left out); `q` finds names,
 //!                                     numbers written any way and words
 //!   GET    /api/messages/:id        → the message; 404 `no_message`
@@ -49,7 +51,7 @@ async fn list(State(s): State<Store>, Query(q): Query<ListQuery>) -> Response {
         },
     };
     let messages = s.list(state, &q.q);
-    Json(json!({"total": messages.len(), "unread": s.unread(), "messages": messages})).into_response()
+    Json(json!({"total": messages.len(), "unread": s.unread(), "notice": s.notice(), "messages": messages})).into_response()
 }
 
 async fn one(State(s): State<Store>, Path(id): Path<String>) -> Response {

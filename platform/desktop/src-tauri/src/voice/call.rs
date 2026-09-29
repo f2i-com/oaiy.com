@@ -1002,9 +1002,15 @@ where
                                 let id = v.get("toolCallId").and_then(Value::as_str).unwrap_or("").to_string();
                                 let (ok, output) = (v.get("ok").and_then(Value::as_bool).unwrap_or(false), v.get("output").cloned().unwrap_or(Value::Null));
                                 // The owner is being rung: the clocks that keep the caller from silence start with the phone's answer.
-                                if tools.answered(&id).as_deref() == Some(transfer::TOOL) && ok && output.get("status").and_then(Value::as_str) == Some("ringing") {
-                                    if let Some(request) = output.get("requestId").and_then(Value::as_str) {
-                                        transfer.ringing(request, output.get("ringSeconds").and_then(Value::as_u64).unwrap_or(40), Instant::now());
+                                if tools.answered(&id).as_deref() == Some(transfer::TOOL) {
+                                    if ok && output.get("status").and_then(Value::as_str) == Some("ringing") {
+                                        if let Some(request) = output.get("requestId").and_then(Value::as_str) {
+                                            transfer.ringing(request, output.get("ringSeconds").and_then(Value::as_u64).unwrap_or(40), Instant::now());
+                                        }
+                                    } else if !ok {
+                                        // The phone refused it itself (consent, a changed call, a plan it could not use) and rang nobody:
+                                        // the try this desktop counted for it is given back, so a refusal does not start the gap or spend the hour.
+                                        hub.ring().request_refused(&ids.call);
                                     }
                                 }
                                 if let Some(reply) = pending_tools.remove(&id) {

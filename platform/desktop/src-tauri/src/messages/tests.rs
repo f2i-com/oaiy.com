@@ -86,16 +86,90 @@ fn twenty_a_number_a_day_by_the_last_nine_digits() {
     assert!(store.add_at(new("call_101", "0491570006", "Tomorrow"), noon() + Duration::hours(25)).is_ok());
 }
 
+/// A message left waiting, put straight in the store (a test of a limit does not need to go through every other one).
+fn waiting(store: &Store, n: usize, from: &str, when: chrono::DateTime<Utc>, state: State) -> String {
+    let id = format!("msg_w{n}");
+    store.lock().messages.push(Message { id: id.clone(), at: when.to_rfc3339(), call_id: format!("call_w{n}"), from: from.into(), name: String::new(), callback: String::new(), message: format!("waiting {n}"), urgency: Urgency::Normal, wants_callback: false, state, seen_at: None, handled_at: (state == State::Handled).then(|| when.to_rfc3339()), handled_by: None });
+    id
+}
+
 #[test]
-fn a_hidden_number_is_limited_by_the_call_not_shared_with_other_hidden_callers() {
+fn every_hidden_number_shares_one_small_allowance_a_call_each_does_not_get_its_own() {
+    let store = Store::in_memory();
+    // Hidden, withheld, made up: none is a number, so all are one caller.
+    let hiding = ["", "Private", "anonymous", "12", "unknown", "-1"];
+    for (n, from) in hiding.iter().enumerate() {
+        store.add_at(new(&format!("call_{n}"), from, &format!("From {n}")), noon() + Duration::minutes(n as i64)).unwrap();
+    }
+    assert_eq!(PER_WITHHELD_DAY, hiding.len());
+    let refused = store.add_at(new("call_new", "", "One more from a new call"), noon() + Duration::hours(1)).unwrap_err();
+    assert_eq!((refused.status, refused.code), (429, "withheld_limit"));
+    // A caller with a number is not counted against them, and they are not counted against a caller with a number.
+    assert!(store.add_at(new("call_known", "+61491570006", "I can be rung"), noon() + Duration::hours(1)).is_ok());
+    // A day later the hidden callers may leave messages again.
+    assert!(store.add_at(new("call_later", "Private", "Tomorrow"), noon() + Duration::hours(25)).is_ok());
+    // The limit of a call still holds inside their share.
     let store = Store::in_memory();
     for n in 0..PER_CALL {
         store.add(new("call_a", "Private", &format!("From a {n}"))).unwrap();
     }
     assert_eq!(store.add(new("call_a", "Private", "Too many")).unwrap_err().code, "call_limit");
-    for n in 0..PER_CALL {
-        assert!(store.add(new("call_b", "Private", &format!("From b {n}"))).is_ok(), "another hidden caller is not counted against the first");
+}
+
+#[test]
+fn hidden_numbers_together_hold_a_small_part_of_the_store_and_only_their_handled_messages_make_room() {
+    let store = Store::in_memory();
+    for n in 0..MAX_WITHHELD {
+        waiting(&store, n, if n % 2 == 0 { "" } else { "Private" }, noon() - Duration::days(2) + Duration::seconds(n as i64), State::New);
     }
+    // A number that is waiting on the owner does not make room for a hidden one, and the page says so.
+    let refused = store.add_at(new("call_x", "", "No room for me"), noon()).unwrap_err();
+    assert_eq!((refused.status, refused.code), (507, "withheld_full"));
+    assert_eq!(store.list(None, "").len(), MAX_WITHHELD, "nothing was dropped");
+    let notice = store.notice().expect("the Messages page is told");
+    assert!(notice.contains("hid their number") && notice.contains("refused") && notice.contains(&MAX_WITHHELD.to_string()), "{notice}");
+    // The store has room for everybody else: a caller with a number is kept.
+    assert!(store.add_at(new("call_known", "+61491570006", "Ring me"), noon()).is_ok());
+    // A handled message of theirs makes room (the oldest handled), and one that is only seen does not.
+    let seen = waiting(&store, 900, "", noon() - Duration::days(3), State::Seen);
+    assert_eq!(store.add_at(new("call_y", "", "Still no room"), noon()).unwrap_err().code, "withheld_full");
+    store.set_state("msg_w4", State::Handled, "owner").unwrap();
+    store.set_state("msg_w8", State::Handled, "owner").unwrap();
+    assert!(store.add_at(new("call_z", "", "Room now"), noon()).is_ok());
+    assert!(store.get("msg_w4").is_none() && store.get("msg_w8").is_some(), "the oldest handled one made room");
+    assert!(store.get(&seen).is_some(), "one waiting for the owner is never dropped");
+    // And a handled message of a caller with a number does not make room for a hidden one.
+    let known = Store::in_memory();
+    for n in 0..MAX_WITHHELD {
+        waiting(&known, n, "", noon() - Duration::days(2) + Duration::seconds(n as i64), State::New);
+    }
+    let k = waiting(&known, 500, "+61491570001", noon() - Duration::days(5), State::Handled);
+    assert_eq!(known.add_at(new("call_q", "", "Nope"), noon()).unwrap_err().code, "withheld_full");
+    assert!(known.get(&k).is_some());
+    // Nothing to say while there is room.
+    assert_eq!(Store::in_memory().notice(), None);
+}
+
+#[test]
+fn a_store_full_of_messages_nobody_has_handled_says_so_and_a_number_may_not_have_too_many_waiting() {
+    let full = Store::in_memory();
+    for n in 0..MAX_STORED {
+        waiting(&full, n, &format!("+6140000{n:04}"), noon() - Duration::days(1) + Duration::seconds(n as i64), State::New);
+    }
+    let notice = full.notice().expect("told");
+    assert!(notice.contains(&MAX_STORED.to_string()) && notice.contains("no more can be kept"), "{notice}");
+    assert_eq!(full.add_at(new("call_x", "+61491570999", "No room"), noon()).unwrap_err().code, "store_full");
+
+    // One number may not have more than so many waiting, however slowly it leaves them.
+    let store = Store::in_memory();
+    for n in 0..PER_NUMBER_WAITING {
+        waiting(&store, n, "+61491570006", noon() - Duration::days(3) - Duration::minutes(n as i64), if n % 2 == 0 { State::New } else { State::Seen });
+    }
+    let refused = store.add_at(new("call_z", "0491 570 006", "One more"), noon()).unwrap_err();
+    assert_eq!((refused.status, refused.code), (429, "caller_waiting"));
+    assert!(store.add_at(new("call_y", "+61491570156", "Someone else"), noon()).is_ok());
+    store.set_state("msg_w0", State::Handled, "owner").unwrap();
+    assert!(store.add_at(new("call_z", "0491 570 006", "Room again"), noon()).is_ok(), "handling one made room for another");
 }
 
 #[test]

@@ -493,6 +493,95 @@ fn no_other_reason_is_vouched_for_however_urgent_the_caller_sounds() {
     assert!(!r.ring.plan_for_plugin(CALL, Reason::Urgent, CallInfo::default()).reason_allowed);
 }
 
+/// Another call the desktop heard, from `from`.
+fn another_call(r: &Rig, call: &str, from: &str) {
+    r.calls.info.lock().unwrap().push((call.into(), caller(from, "Sam", ASKED)));
+}
+
+#[test]
+fn callers_who_hide_their_number_share_one_small_bucket_of_the_hour_a_call_each_is_not_their_own() {
+    let r = rig(Presence::Active);
+    // Three calls, three ways of not giving a number: the owner's own limit is three a caller an hour, theirs is two.
+    for (call, from) in [("call_a", ""), ("call_b", "Private"), ("call_c", "anonymous")] {
+        another_call(&r, call, from);
+    }
+    assert!(r.ring.authorise("call_a", Reason::CallerAsked).rings());
+    assert!(r.ring.authorise("call_b", Reason::CallerAsked).rings());
+    let third = r.ring.authorise("call_c", Reason::CallerAsked);
+    assert_eq!((third.plan.decision, third.plan.reason), (Decision::Refused, PlanReason::LimitCaller), "{:?}", third.plan);
+    // The plugin asking is refused the same way.
+    assert_eq!(r.ring.plan_for_plugin("call_c", Reason::CallerAsked, CallInfo::default()).plan.reason, PlanReason::LimitCaller);
+    // Callers with a number are not counted against the hidden ones (and hidden calls are not spent from the global hour beyond two).
+    another_call(&r, "call_k", "+61491570156");
+    assert!(r.ring.authorise("call_k", Reason::CallerAsked).rings(), "a caller who gives a number still gets through");
+    let counters = r.ring.attempts.lock().unwrap().counters("call_k", "491570156", r.ring.clock().unix());
+    assert_eq!(counters.global_attempts_last_hour, 3);
+    // An owner who allows fewer than two a caller keeps that for everyone, hidden included.
+    let strict = rig(Presence::Active);
+    strict.ring.change_settings(&json!({ "limits": { "perCallerHour": 1 } })).unwrap();
+    another_call(&strict, "call_a", "");
+    another_call(&strict, "call_b", "Private");
+    assert!(strict.ring.authorise("call_a", Reason::CallerAsked).rings());
+    assert_eq!(strict.ring.authorise("call_b", Reason::CallerAsked).plan.reason, PlanReason::LimitCaller);
+}
+
+#[test]
+fn a_number_on_the_vip_list_passes_quiet_hours_but_never_the_limits_a_caller_id_can_be_faked() {
+    let late = chrono::DateTime::parse_from_rfc3339("2026-09-30T23:00:00+10:00").unwrap();
+    struct At(chrono::DateTime<chrono::FixedOffset>);
+    impl Clock for At {
+        fn local(&self) -> chrono::DateTime<chrono::FixedOffset> {
+            self.0
+        }
+    }
+    let r = rig(Presence::Active);
+    r.ring.set_clock(Arc::new(At(late)));
+    r.ring.change_settings(&json!({ "vipNumbers": ["0491 570 006"], "quietHours": { "enabled": true } })).unwrap();
+    // Quiet hours: a caller who is not a VIP is not rung, and a VIP is.
+    another_call(&r, "call_other", "+61491570156");
+    assert_eq!(r.ring.authorise("call_other", Reason::CallerAsked).plan.reason, PlanReason::QuietHours);
+    for n in 0..3 {
+        let call = format!("call_vip{n}");
+        another_call(&r, &call, "+61491570006");
+        let plan = r.ring.authorise(&call, Reason::CallerAsked);
+        assert!(plan.rings(), "try {n}: {:?}", plan.plan);
+    }
+    // The fourth try in the hour from the same number is refused, VIP or not: the number may be anyone's.
+    another_call(&r, "call_vip3", "+61491570006");
+    let fourth = r.ring.authorise("call_vip3", Reason::CallerAsked);
+    assert_eq!((fourth.plan.decision, fourth.plan.reason), (Decision::Refused, PlanReason::LimitCaller), "{:?}", fourth.plan);
+}
+
+#[test]
+fn a_try_the_plugin_refused_before_any_ring_is_given_back_with_its_gap_and_one_that_rang_is_not() {
+    let r = rig(Presence::Active);
+    let counters = |call: &str, key: &str| r.ring.attempts.lock().unwrap().counters(call, key, r.ring.clock().unix());
+    assert!(r.ring.authorise(CALL, Reason::CallerAsked).rings());
+    assert_eq!(counters(CALL, "491570006").attempts_this_call, 1);
+    // Refused at once: the gap between tries would refuse the next.
+    assert_eq!(r.ring.authorise(CALL, Reason::CallerAsked).plan.reason, PlanReason::LimitGap);
+    assert!(r.ring.request_refused(CALL), "a try was given back");
+    let c = counters(CALL, "491570006");
+    assert_eq!((c.attempts_this_call, c.seconds_since_last_attempt, c.caller_attempts_last_hour, c.global_attempts_last_hour), (0, None, 0, 0));
+    assert!(!r.ring.request_refused(CALL), "and only once");
+    assert!(r.ring.authorise(CALL, Reason::CallerAsked).rings(), "the same call may ask again at once");
+    // The plan that was given back is gone: a plugin cannot open a ring for it.
+    let r = rig(Presence::Active);
+    let plan = r.ring.plan_for_plugin(CALL, Reason::CallerAsked, CallInfo::default());
+    assert!(plan.rings() && r.ring.request_refused(CALL));
+    assert_eq!(r.ring.opened(&opened(&plan.plan_id, "assist_1", CALL, 20, &r.ring)).unwrap_err().code, "unknown_plan");
+    // A ring that opened is a try that was used: it is not given back, and another call's tries are its own.
+    let r = rig(Presence::Active);
+    another_call(&r, "call_2", "+61491570156");
+    assert!(r.ring.authorise("call_2", Reason::CallerAsked).rings());
+    let plan = r.ring.plan_for_plugin(CALL, Reason::CallerAsked, CallInfo::default());
+    r.ring.opened(&opened(&plan.plan_id, "assist_1", CALL, 20, &r.ring)).unwrap();
+    assert!(!r.ring.request_refused(CALL), "it rang");
+    assert_eq!(r.ring.attempts.lock().unwrap().counters(CALL, "491570006", r.ring.clock().unix()).attempts_this_call, 1);
+    assert!(r.ring.request_refused("call_2"), "another call's request that never opened is given back");
+    assert_eq!(r.ring.attempts.lock().unwrap().counters(CALL, "491570006", r.ring.clock().unix()).attempts_this_call, 1);
+}
+
 #[test]
 fn a_second_try_on_one_call_straight_after_the_first_is_refused() {
     let r = rig(Presence::Active);

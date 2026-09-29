@@ -189,6 +189,15 @@ pub struct CallFacts {
     /// The caller's words match one of the owner's urgent phrases.
     pub urgent_confirmed: bool,
     pub caller_is_vip: bool,
+    /// A VIP is exempt from the per-caller hourly limit (the reference). This desktop turns it off: a caller ID can be faked,
+    /// so a number on the owner's list is a hint for quiet hours and never a way round the limits. The reference vectors
+    /// leave it out, and it is then on.
+    #[serde(default = "vip_bypass_by_default")]
+    pub vip_bypasses_limits: bool,
+}
+
+fn vip_bypass_by_default() -> bool {
+    true
 }
 
 /// Tries so far, from the attempt ledger ([`super::limits`]).
@@ -327,7 +336,7 @@ pub fn plan(i: &Inputs) -> RingPlan {
     if c.seconds_since_last_attempt.is_some_and(|since| since < l.gap_seconds) {
         return RingPlan::refuse(PlanReason::LimitGap, Decision::Refused);
     }
-    if !i.call.caller_is_vip && c.caller_attempts_last_hour >= l.per_caller_hour {
+    if !(i.call.caller_is_vip && i.call.vip_bypasses_limits) && c.caller_attempts_last_hour >= l.per_caller_hour {
         return RingPlan::refuse(PlanReason::LimitCaller, Decision::Refused);
     }
     if c.global_attempts_last_hour >= l.global_hour {

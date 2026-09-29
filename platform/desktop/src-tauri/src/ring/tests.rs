@@ -318,7 +318,7 @@ fn every_input() -> Vec<Inputs> {
                             i.settings.away = away;
                             i.settings.quiet_hours.enabled = false;
                             i.settings.initiative = settings::Initiative::OnRequestOrUrgent;
-                            i.call = plan::CallFacts { reason, caller_asked_confirmed: true, urgent_confirmed: true, caller_is_vip: false };
+                            i.call = plan::CallFacts { reason, caller_asked_confirmed: true, urgent_confirmed: true, caller_is_vip: false, vip_bypasses_limits: true };
                             all.push(i);
                         }
                     }

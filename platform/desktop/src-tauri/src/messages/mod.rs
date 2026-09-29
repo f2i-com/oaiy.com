@@ -8,10 +8,13 @@
 //! they asked to be rung on (their own when they gave none). `state` is `new`, `seen` or `handled`.
 //!
 //! What is kept is bounded so a caller cannot fill the disk or the owner's screen:
-//! 3 messages a call, 20 a number a day, 600 characters each (control characters removed),
-//! 2 000 in all. A handled message is let go after 90 days, and when the store is full its
-//! oldest handled message makes room; a message nobody has handled is never dropped to make
-//! room (the next is refused instead, and the receptionist says so).
+//! 3 messages a call, 20 a number a day and 40 waiting at once, 600 characters each (control
+//! characters removed), 2 000 in all. Callers who hide their number (or give none that is a
+//! number) share ONE allowance, a small one, so hiding does not give every call a bucket of its
+//! own: 6 a day and 100 kept between them. A handled message is let go after 90 days, and when
+//! the store (or the hidden numbers' share of it) is full its oldest handled message makes room;
+//! a message nobody has handled is never dropped to make room (the next is refused instead, the
+//! receptionist says so, and the Messages page says the store is full: [`Store::notice`]).
 //!
 //! Reading, marking as seen or handled, and deleting are the dashboard's (`routes`); a message
 //! is only ever made by the receptionist's `take_message` tool, through the call's own route
@@ -32,6 +35,12 @@ const VERSION: u64 = 1;
 pub const PER_CALL: usize = 3;
 /// Messages one number may leave in a day, at most.
 pub const PER_CALLER_DAY: usize = 20;
+/// Messages one number may have waiting (new or seen) at once, at most.
+pub const PER_NUMBER_WAITING: usize = 40;
+/// Messages all hidden, withheld or unparseable numbers together may leave in a day, at most.
+pub const PER_WITHHELD_DAY: usize = 6;
+/// Messages all such callers together may have kept, at most (of any state).
+pub const MAX_WITHHELD: usize = 100;
 /// The longest message kept (characters).
 pub const MAX_MESSAGE: usize = 600;
 /// The longest name kept.
@@ -249,10 +258,10 @@ impl Store {
         }
         let key = crate::voice::contacts::key(&new.from);
         let mut inner = self.lock();
-        // Who counts as one caller: their number, or, for a hidden number, the call itself.
+        // Who counts as one caller: their number, or, for every hidden or unparseable number, all of them together.
         let same_caller = |m: &Message| match &key {
             Some(k) => crate::voice::contacts::key(&m.from).as_deref() == Some(k.as_str()),
-            None => m.call_id == new.call_id,
+            None => crate::voice::contacts::key(&m.from).is_none(),
         };
         if let Some(existing) = inner.messages.iter().find(|m| m.call_id == new.call_id && m.message == text) {
             return Ok(existing.clone());
@@ -261,12 +270,30 @@ impl Store {
             return Err(Error::new(429, "call_limit", format!("{PER_CALL} messages have been taken on this call: no more can be kept")));
         }
         let today = inner.messages.iter().filter(|m| same_caller(m) && chrono::DateTime::parse_from_rfc3339(&m.at).map(|at| when.signed_duration_since(at).num_hours() < 24).unwrap_or(false)).count();
-        if today >= PER_CALLER_DAY {
+        if key.is_none() {
+            if today >= PER_WITHHELD_DAY {
+                return Err(Error::new(429, "withheld_limit", "callers who hide their number have left as many messages today as are kept: ask them to ring back with their number showing"));
+            }
+        } else if today >= PER_CALLER_DAY {
             return Err(Error::new(429, "caller_limit", "this number has left as many messages today as are kept"));
+        }
+        if key.is_some() && inner.messages.iter().filter(|m| same_caller(m) && m.state != State::Handled).count() >= PER_NUMBER_WAITING {
+            return Err(Error::new(429, "caller_waiting", format!("{PER_NUMBER_WAITING} messages from this number are waiting for the owner: no more can be kept until some are handled")));
         }
         // Old handled messages go; if it is still full, the oldest handled one makes room, and an unhandled one never does.
         let cutoff = when - chrono::Duration::days(KEEP_HANDLED_DAYS);
         inner.messages.retain(|m| m.state != State::Handled || m.handled_at.as_deref().and_then(|t| chrono::DateTime::parse_from_rfc3339(t).ok()).is_none_or(|t| t >= cutoff));
+        // Hidden numbers share a small part of the store: at its limit their oldest handled message makes room, and if all
+        // of theirs are waiting, this one is refused (and the Messages page says so).
+        if key.is_none() && inner.messages.iter().filter(|m| crate::voice::contacts::key(&m.from).is_none()).count() >= MAX_WITHHELD {
+            let oldest = inner.messages.iter().enumerate().filter(|(_, m)| m.state == State::Handled && crate::voice::contacts::key(&m.from).is_none()).min_by(|a, b| a.1.at.cmp(&b.1.at)).map(|(i, _)| i);
+            match oldest {
+                Some(i) => {
+                    inner.messages.remove(i);
+                }
+                None => return Err(Error::new(507, "withheld_full", "messages from callers who hid their number are waiting for the owner: no more of those can be kept until some are handled")),
+            }
+        }
         if inner.messages.len() >= MAX_STORED {
             let oldest = inner.messages.iter().enumerate().filter(|(_, m)| m.state == State::Handled).min_by(|a, b| a.1.at.cmp(&b.1.at)).map(|(i, _)| i);
             match oldest {
@@ -321,6 +348,22 @@ impl Store {
             .collect();
         found.sort_by(|a, b| b.at.cmp(&a.at).then_with(|| b.id.cmp(&a.id)));
         found
+    }
+
+    /// A plain word for the Messages page when new messages are being refused because the owner has not handled the ones
+    /// waiting (none when there is room).
+    pub fn notice(&self) -> Option<String> {
+        let inner = self.lock();
+        let waiting = inner.messages.iter().filter(|m| m.state != State::Handled).count();
+        let hidden = inner.messages.iter().filter(|m| crate::voice::contacts::key(&m.from).is_none());
+        let (hidden_all, hidden_waiting) = hidden.fold((0, 0), |(all, waiting), m| (all + 1, waiting + usize::from(m.state != State::Handled)));
+        if waiting >= MAX_STORED {
+            Some(format!("{waiting} messages are waiting and no more can be kept: new messages are refused until you mark some as handled or delete them."))
+        } else if hidden_all >= MAX_WITHHELD && hidden_waiting >= MAX_WITHHELD {
+            Some(format!("{hidden_waiting} messages from callers who hid their number are waiting: new ones from hidden numbers are refused until you mark some as handled or delete them."))
+        } else {
+            None
+        }
     }
 
     /// How many messages are new.

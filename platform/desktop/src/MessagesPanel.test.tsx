@@ -193,6 +193,21 @@ describe('Messages', () => {
     expect(text()).toContain('No messages yet.');
   });
 
+  it('says plainly when new messages are being refused because too many wait for the owner', async () => {
+    await mount();
+    expect(host.querySelector('[data-testid=messages-notice]')).toBeNull();
+    await act(async () => root.unmount());
+    root = createRoot(host);
+    api.list.mockImplementation(async () => ({ messages: stored, total: stored.length, unread: 1, notice: '100 messages from callers who hid their number are waiting: new ones from hidden numbers are refused until you mark some as handled or delete them.' }));
+    await mount();
+    const notice = host.querySelector('[data-testid=messages-notice]')!;
+    expect(notice.getAttribute('role')).toBe('status');
+    expect(notice.textContent).toContain('hid their number');
+    expect(notice.textContent).toContain('refused until you mark some as handled');
+    // The messages are still there to handle.
+    expect(ids()).toEqual(['msg_b', 'msg_a']);
+  });
+
   it('cannot write a message, and says so plainly on a desktop that keeps none', async () => {
     await mount();
     expect(host.querySelector('textarea')).toBeNull();

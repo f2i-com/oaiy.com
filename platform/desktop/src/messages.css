@@ -14,6 +14,7 @@
 .messages-search > svg { position: absolute; left: 11px; color: var(--faint); pointer-events: none; }
 .messages-search input { height: 34px; width: 100%; padding-left: 32px; font-size: 13px; }
 
+.messages-notice { margin: 0; border: 1px solid var(--warn, #b7791f); border-radius: var(--r-card); padding: 8px 12px; font-size: 12.5px; line-height: 1.45; }
 .messages-empty { display: flex; align-items: center; gap: 12px; padding: 22px 6px; color: var(--muted); }
 .messages-empty p { margin: 0; max-width: 60ch; font-size: 13.5px; line-height: 1.5; }
 

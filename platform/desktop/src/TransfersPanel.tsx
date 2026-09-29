@@ -287,7 +287,7 @@ export default function TransfersPanel() {
           </>
         )}
         <label className="transfers-grid">
-          <span className="form-hint">VIP numbers, one a line: they ring through quiet hours and the hourly limit</span>
+          <span className="form-hint">VIP numbers, one a line: they ring through quiet hours. A caller ID can be faked, so the limits above still apply to them.</span>
           <textarea rows={3} value={vipText} onChange={(e) => { setJustSaved(false); setVipText(e.target.value); }} placeholder="0491 570 006" aria-label="VIP numbers" />
         </label>
       </section>

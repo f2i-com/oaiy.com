@@ -1653,7 +1653,7 @@ export const messages = {
   /** Newest first: all, or those of one `state`, or those `q` finds in names, numbers and words. */
   list: (state?: MessageState, q = '') => {
     const params = new URLSearchParams({ ...(state ? { state } : {}), ...(q.trim() ? { q: q.trim() } : {}) }).toString();
-    return request<{ messages: CallerMessage[]; total: number; unread: number }>(`/api/messages${params ? `?${params}` : ''}`);
+    return request<{ messages: CallerMessage[]; total: number; unread: number; notice?: string | null }>(`/api/messages${params ? `?${params}` : ''}`);
   },
   /** Mark one `new`, `seen` or `handled`. */
   mark: (id: string, state: MessageState) => request<CallerMessage>(messagePath(id), { method: 'PATCH', body: JSON.stringify({ state }) }),

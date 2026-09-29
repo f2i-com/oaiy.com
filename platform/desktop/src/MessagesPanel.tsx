@@ -49,6 +49,8 @@ export function matchesMessage(m: CallerMessage, q: string): boolean {
 export default function MessagesPanel({ onOpenContact, onOpenAgent }: { onOpenContact?: (key: string) => void; onOpenAgent?: () => void }) {
   const toast = useToast();
   const [list, setList] = useState<CallerMessage[] | null>(null);
+  /** The desktop's word when new messages are being refused for want of room (too many wait for the owner). */
+  const [notice, setNotice] = useState<string | null>(null);
   const [error, setError] = useState<string | null>(null);
   /** This desktop keeps no messages (it is older than them). */
   const [missing, setMissing] = useState(false);
@@ -61,6 +63,7 @@ export default function MessagesPanel({ onOpenContact, onOpenAgent }: { onOpenCo
     try {
       const r = await api.list();
       setList(r.messages ?? []);
+      setNotice(r.notice ?? null);
       setError(null);
       setMissing(false);
     } catch (e) {
@@ -143,6 +146,11 @@ export default function MessagesPanel({ onOpenContact, onOpenAgent }: { onOpenCo
         </label>
       </div>
 
+      {notice && (
+        <p className="messages-notice" role="status" data-testid="messages-notice">
+          {notice}
+        </p>
+      )}
       {error && <p className="form-error" role="alert">Could not read the messages: {error}</p>}
       {list === null && !error && <p className="form-hint">Loading…</p>}
       {list !== null && shown.length === 0 && (

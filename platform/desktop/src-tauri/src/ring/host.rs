@@ -99,6 +99,8 @@ struct Grant {
     reason_allowed: bool,
     at: Instant,
     claimed: bool,
+    /// A ring was opened for it: a try that has become a ring is not given back.
+    opened: bool,
 }
 
 /// What a request to reach the owner came to.
@@ -212,8 +214,22 @@ impl Ring {
 
     /// A plan this desktop allowed and the plugin asked for: what was decided for the call.
     pub(super) fn claimed_plan(&self, plan_id: &str, call: &str) -> Option<RingPlan> {
-        let grants = self.grants.lock().unwrap_or_else(|e| e.into_inner());
-        grants.get(plan_id).filter(|g| g.claimed && g.call_id == call && g.at.elapsed() < PLAN_TTL * 4).map(|g| g.plan.clone())
+        let mut grants = self.grants.lock().unwrap_or_else(|e| e.into_inner());
+        let grant = grants.get_mut(plan_id).filter(|g| g.claimed && g.call_id == call && g.at.elapsed() < PLAN_TTL * 4)?;
+        grant.opened = true;
+        Some(grant.plan.clone())
+    }
+
+    /// The plugin refused a request this desktop allowed (its own checks: consent, a changed call, a plan it could not use)
+    /// before any ring opened for it: the try is given back, so a refusal that rang nobody does not start the gap between tries or
+    /// use up the caller's hour. A request that opened a ring is never given back. Whether a try was.
+    pub fn request_refused(&self, call: &str) -> bool {
+        let refunded = {
+            let mut grants = self.grants.lock().unwrap_or_else(|e| e.into_inner());
+            let newest = grants.iter().filter(|(_, g)| g.call_id == call && !g.opened).max_by_key(|(_, g)| g.at).map(|(id, _)| id.clone());
+            newest.is_some_and(|id| grants.remove(&id).is_some())
+        };
+        refunded && self.attempts.lock().unwrap_or_else(|e| e.into_inner()).forget_last(call)
     }
 
     pub fn set_presence(&self, source: Arc<dyn PresenceSource>) {
@@ -278,10 +294,14 @@ impl Ring {
     fn decide(&self, call: &str, reason: Reason, info: &CallInfo, settings: &RingSettings) -> RingPlan {
         let now_unix = self.clock().unix();
         let local = self.clock().local();
-        let caller_key = crate::voice::contacts::key(&info.from).unwrap_or_else(|| format!("call:{call}"));
+        let caller_key = caller_key(&info.from);
         let counters = self.attempts.lock().unwrap_or_else(|e| e.into_inner()).counters(call, &caller_key, now_unix);
         let mut effective = settings.clone();
         effective.away = settings.away_at(now_unix);
+        // Callers who hide their number share one small bucket of the hour, whatever the owner allows a known caller.
+        if caller_key == super::limits::WITHHELD {
+            effective.limits.per_caller_hour = effective.limits.per_caller_hour.min(super::limits::WITHHELD_PER_HOUR);
+        }
         let inputs = Inputs {
             devices: self.devices(settings),
             presence: self.presence(),
@@ -291,7 +311,9 @@ impl Ring {
                 reason,
                 caller_asked_confirmed: phrases::caller_asked(&info.turns),
                 urgent_confirmed: phrases::urgent(&info.turns, &settings.urgent_phrases),
+                // A number on the owner's list passes quiet hours, and nothing more: a caller ID can be faked.
                 caller_is_vip: settings.is_vip(&info.from),
+                vip_bypasses_limits: false,
             },
             limits: counters,
             now: Now::of(&local),
@@ -328,11 +350,10 @@ impl Ring {
         let id = new_plan_id();
         if plan.decision == Decision::Ring {
             let now_unix = self.clock().unix();
-            let caller_key = crate::voice::contacts::key(&info.from).unwrap_or_else(|| format!("call:{call}"));
-            self.attempts.lock().unwrap_or_else(|e| e.into_inner()).record(call, &caller_key, now_unix);
+            self.attempts.lock().unwrap_or_else(|e| e.into_inner()).record(call, &caller_key(&info.from), now_unix);
             let mut grants = self.grants.lock().unwrap_or_else(|e| e.into_inner());
             grants.retain(|_, g| g.at.elapsed() < PLAN_TTL);
-            grants.insert(id.clone(), Grant { plan_id: id.clone(), call_id: call.to_string(), plan: plan.clone(), reason_allowed, at: Instant::now(), claimed: false });
+            grants.insert(id.clone(), Grant { plan_id: id.clone(), call_id: call.to_string(), plan: plan.clone(), reason_allowed, at: Instant::now(), claimed: false, opened: false });
         }
         Authorised { plan, plan_id: id, reason_allowed, caller_number: info.from, caller_name: info.name }
     }
@@ -365,6 +386,12 @@ impl Ring {
     pub fn plan_is_claimed(&self, plan_id: &str, call: &str) -> bool {
         self.grants.lock().unwrap_or_else(|e| e.into_inner()).get(plan_id).is_some_and(|g| g.claimed && g.call_id == call && g.at.elapsed() < PLAN_TTL * 4)
     }
+}
+
+/// Who a call's limits are counted against: the caller's number (its last nine digits), or, for every hidden, withheld or
+/// unparseable number, one shared bucket ([`super::limits::WITHHELD`]).
+pub(super) fn caller_key(from: &str) -> String {
+    crate::voice::contacts::key(from).unwrap_or_else(|| super::limits::WITHHELD.to_string())
 }
 
 /// A new plan id: letters, digits and an underscore, which the plugin takes as a token.

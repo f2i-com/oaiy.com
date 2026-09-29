@@ -80,9 +80,13 @@ it (after being asked). A message links to the caller's contact. The receptionis
 on a call: there is no way to write one here, and the number a message is kept with is the one
 this desktop saw the call come from, never a number the receptionist's model says.
 
-A call keeps at most 3 messages, one number 20 a day, each at most 600 characters. Messages are
-kept in `<data>/messages/messages.json`, readable by you only; a handled one is let go after 90
-days, and a message nobody has handled is never dropped to make room.
+A call keeps at most 3 messages, one number 20 a day and 40 waiting at once, each at most 600
+characters. Callers who hide their number (or give one that is not a number) share one small
+allowance between them, 6 a day and 100 kept, so hiding does not give every call a limit of its
+own. Messages are kept in `<data>/messages/messages.json`, readable by you only; a handled one is
+let go after 90 days, and a message nobody has handled is never dropped to make room: when the
+store (or the hidden callers' share of it) is full of unhandled ones, new ones are refused and the
+Messages page says so until you handle some.
 
 ### Transfers
 
@@ -139,6 +143,11 @@ rings only when you allowed it and the caller's own words held one of your phras
 then vouches for the reason to the phone plugin, `reasonAllowed` in the plan, which the plugin
 wants for any reason but a caller who asked for a person); and by default a caller
 may be put through twice a call, 60 seconds apart, 3 times an hour, and 10 in an hour for everyone.
+Callers who hide their number (or give one that is not a number) share one bucket of two an hour,
+so hiding or making numbers up cannot use up the ten; a number on your VIP list passes quiet hours
+and nothing else, because a caller ID can be faked. A try is counted when it is allowed, and given
+back when the phone plugin refuses the request itself (consent, a changed call, a plan it could
+not use) before anybody rang, so a refusal that rang nobody does not start the 60 seconds.
 
 **What is not built yet:** push notifications (a phone rings while its Companion is connected, not
 by waking a closed app), showing your screens on a phone, returning the call's audio to the handset

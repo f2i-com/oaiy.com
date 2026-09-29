@@ -475,6 +475,61 @@ async fn a_second_try_at_once_is_refused_and_so_is_a_fourth_call_from_one_number
     }
 }
 
+#[tokio::test]
+async fn callers_who_hide_their_number_get_two_tries_an_hour_between_them_and_a_caller_with_a_number_still_gets_through() {
+    let mut f = flow(owner_settings(true)).await;
+    let (hub, speech, at) = (f.aokie.hub.clone(), f.aokie.speech.clone(), f.aokie.at.clone());
+    // Three calls, none giving a number (each a new call, as a caller who rings back and back would make).
+    for (n, from) in [(1, ""), (2, "Private"), (3, "anonymous")] {
+        let call = format!("call_hidden_{n}");
+        let mut other = Aokie::open(hub.clone(), speech.clone(), at.clone(), call.clone(), json!({"from": from, "callerName": "", "allowTransfer": true})).await;
+        other.begin(json!({}));
+        other.event("call.started", secs(3)).await.expect("the call started");
+        hub.note_turn(&call, ASKED);
+        if n < 3 {
+            let plan = ring_through_on(&mut other, &f.ring, &format!("assist_h{n}"), 30).await;
+            assert_eq!(plan["decision"], "ring", "hidden call {n}");
+            f.ring.resolve(&format!("assist_h{n}"), crate::voice::transfer::Outcome::Cancelled, "call");
+            other.send(outcome(&other, &format!("assist_h{n}"), "declined", None));
+            other.event("call.transfer", secs(3)).await.expect("declined");
+        } else {
+            let answer = answer_of(asking(&other, transfer::TOOL, json!({"reason": "caller_asked"}))).await.unwrap();
+            assert_eq!((answer["output"]["status"].clone(), answer["output"]["reason"].clone()), (json!("refused"), json!("limit_caller")), "the third hidden call in the hour: {answer}");
+            assert!(other.text("formlogic.realtime.tool_call", Duration::from_millis(300)).await.is_none(), "it never reached the phone");
+        }
+    }
+    // The hidden callers held two of the owner's ten tries an hour and no more: a caller who gives a number is not starved.
+    f.caller_says(ASKED);
+    f.ring_through("assist_1", 30).await;
+    assert_eq!(f.dialog().await.len(), 1);
+    assert_eq!(tries(&f.aokie).global_attempts_last_hour, 3);
+}
+
+#[tokio::test]
+async fn a_try_the_phone_refused_at_once_is_given_back_so_the_caller_may_ask_again() {
+    let mut f = flow(owner_settings(true)).await;
+    f.caller_says(ASKED);
+    let asked = asking(&f.aokie, transfer::TOOL, json!({"reason": "caller_asked"}));
+    let call = f.aokie.text("formlogic.realtime.tool_call", secs(3)).await.expect("it reached the phone");
+    assert_eq!(tries(&f.aokie).attempts_this_call, 1, "counted when this desktop allowed it");
+    // The phone refuses it on its own checks (the owner withdrew consent while the call was on): nobody was rung.
+    f.aokie.send(json!({"type": "formlogic.realtime.tool_result", "callId": f.aokie.call, "generation": 1, "toolCallId": call["toolCallId"], "ok": false,
+        "output": {"status": "refused", "reason": "consent", "instruction": "Passing the call to the owner is not permitted right now. Offer to take a message."}}));
+    let answer = answer_of(asked).await.unwrap();
+    assert_eq!((answer["ok"].clone(), answer["output"]["reason"].clone()), (json!(false), json!("consent")));
+    let c = tries(&f.aokie);
+    assert_eq!((c.attempts_this_call, c.seconds_since_last_attempt, c.global_attempts_last_hour), (0, None, 0), "the refusal did not start the gap or spend the hour");
+    // Consent is back: the same call asks again at once, and rings.
+    f.ring_through("assist_1", 30).await;
+    assert_eq!(f.dialog().await.len(), 1);
+    assert_eq!(tries(&f.aokie).attempts_this_call, 1);
+    // A request that rang and was declined stays counted: the gap holds.
+    assert_eq!(f.owner_answers("assist_1", "decline").await.0, 200);
+    f.aokie.event("call.transfer", secs(3)).await.expect("declined");
+    let soon = answer_of(asking(&f.aokie, transfer::TOOL, json!({"reason": "caller_asked"}))).await.unwrap();
+    assert_eq!(soon["output"]["reason"], "limit_gap");
+}
+
 /// [`Flow::ring_through`] for a call of its own on the same desktop.
 async fn ring_through_on(aokie: &mut Aokie, ring: &Arc<Ring>, request: &str, seconds: u64) -> Value {
     let asked = asking(aokie, transfer::TOOL, json!({"reason": "caller_asked"}));
