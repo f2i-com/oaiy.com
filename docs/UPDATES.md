@@ -72,7 +72,12 @@ Each of these keeps "Restart to update" off, by itself, and is shown in words ne
 - **A task the Agent is working on for a flow** (one given to it and not yet answered).
 - **A model or file download** (queued or running, OAIY's or the engines'); a paused one
   resumes after the update.
-- **The engines making media** (a picture, video, song or 3D model).
+- **The engines making media** (a picture, video, song or 3D model). The engines are asked at
+  their control pages, and a studio that is running and does not answer within 2 seconds, or
+  answers something OAIY cannot read, is not taken for idle: the install waits ("can't tell
+  whether the engines are busy"), because a studio too busy to answer is the one whose work a
+  restart would throw away. Nothing listening at all (the studio is not running) is nothing to
+  wait for. The decision to install asks afresh, not from the answer kept for the status.
 - **Something installing**: a service, Python, Node or a plugin.
 - **The data folder being moved.**
 - **OAIY having started less than two minutes ago**, or not yet knowing what it is doing.

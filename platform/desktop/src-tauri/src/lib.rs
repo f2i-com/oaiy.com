@@ -1435,9 +1435,9 @@ pub fn run() {
                         registry: Some(registry_for_http.clone()),
                         python: Some(python_for_http.clone()),
                         node: Some(node_for_http.clone()),
-                        engines: Some(Arc::new(|_fresh| {
-                            let (media, downloads) = crate::engines::activity();
-                            crate::update::blockers::EnginesState::Known { media, downloads }
+                        engines: Some(Arc::new(|fresh| match crate::engines::activity(fresh) {
+                            Ok((media, downloads)) => crate::update::blockers::EnginesState::Known { media, downloads },
+                            Err(why) => crate::update::blockers::EnginesState::Unknown(why),
                         })),
                         migration: Some(Arc::new(move || migration_for_updates.lock().map(|m| m.running).unwrap_or(false))),
                         phone: Some(Arc::new(crate::update::phone::PluginLine::new(bridge_for_http.host.clone()))),

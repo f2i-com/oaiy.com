@@ -27,6 +27,9 @@ fn the_desktops_activity_probes_ask_the_phone_plugin_the_engines_and_the_rest() 
         assert!(probes.contains(field), "the desktop's update Probes no longer has `{field}`: an install would not ask that source\n{probes}");
     }
     assert!(probes.contains("crate::update::phone::PluginLine::new("), "the phone source is not the plugin line");
+    // The engines are asked afresh when an install is decided, and a studio that cannot say is not taken for idle.
+    assert!(probes.contains("crate::engines::activity(fresh)"), "the engines are no longer asked with the fresh flag an install sets");
+    assert!(probes.contains("Err(why) => crate::update::blockers::EnginesState::Unknown(why)"), "engines that cannot say are taken for something else than unknown");
     assert!(!probes.contains("..Default::default()"), "a field left to the default is a source not asked");
 }
 
