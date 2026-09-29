@@ -2889,4 +2889,7 @@ mod tests {
         assert!(aokie.event("call.ended", Duration::from_millis(300)).await.is_none(), "and nobody was told it ended");
         assert!(aokie.hub.call_facts(&aokie.call).is_some());
     }
+
+    // The whole of it in one process: the ring on the desktop, the phone plugin, the messages.
+    mod owner_flow;
 }

@@ -1642,7 +1642,7 @@ impl PluginHost {
     }
 
     /// [`Self::handle_ring_request`] once the plugin is known to hold the capability, for the ring `ring`.
-    fn ring_request(ring: &Arc<crate::ring::Ring>, method: &str, params: Value) -> Result<Value, (String, String)> {
+    pub(crate) fn ring_request(ring: &Arc<crate::ring::Ring>, method: &str, params: Value) -> Result<Value, (String, String)> {
         let text = |k: &str| params.get(k).and_then(Value::as_str).unwrap_or("").to_string();
         let number = |k: &str| params.get(k).and_then(Value::as_u64);
         let bad = |why: &str| ("invalid_request".to_string(), why.to_string());
