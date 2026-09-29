@@ -26,7 +26,8 @@ use std::sync::atomic::{AtomicU64, Ordering};
 /// - It is synced and then renamed over `path`. A reader sees the old file or the new one, never half
 ///   of either, and a crash leaves one of the two: an empty identity key would be a hard failure.
 ///   `rename` replaces an existing file on every platform std supports, so the old file is never
-///   removed first (which would leave a moment with no key at all).
+///   removed first (which would leave a moment with no key at all). On Windows a target that is
+///   busy for the moment (another writer, an indexer or a virus scanner) is retried briefly.
 /// - The staging file is removed on every failure, so the secret never lingers in a second file.
 /// - A missing folder is made first, owner-only too (see [`create_private_dir`]).
 ///
@@ -72,12 +73,44 @@ fn write_with(path: &Path, contents: &[u8], at_creation: impl FnOnce(&File)) -> 
         let _ = std::fs::remove_file(&staging);
         return Err(e);
     }
-    if let Err(e) = std::fs::rename(&staging, path) {
+    if let Err(e) = rename_over(&staging, path) {
         let _ = std::fs::remove_file(&staging);
         return Err(e);
     }
     sync_dir(dir);
     Ok(())
+}
+
+/// `rename`, which replaces `to` if it is there.
+///
+/// On Windows a replace is refused while another handle is in the middle of replacing the same
+/// file or holds it without delete sharing: a second writer of the same file (the GUI and a
+/// headless server share a data folder), a search indexer or a virus scanner that has just looked
+/// at it. Those clear within moments, so it tries a few times before giving up. It does not retry
+/// when a folder stands where the file belongs, which no wait would change.
+#[cfg(windows)]
+fn rename_over(from: &Path, to: &Path) -> io::Result<()> {
+    let mut attempt: u64 = 0;
+    loop {
+        match std::fs::rename(from, to) {
+            Err(e) if attempt < 20 && is_transient(&e) && !to.is_dir() => {
+                attempt += 1;
+                std::thread::sleep(std::time::Duration::from_millis(10 * attempt.min(10)));
+            }
+            done => return done,
+        }
+    }
+}
+
+/// Access denied, sharing violation or lock violation: what Windows answers while a file is busy.
+#[cfg(windows)]
+fn is_transient(e: &io::Error) -> bool {
+    e.kind() == io::ErrorKind::PermissionDenied || matches!(e.raw_os_error(), Some(5 | 32 | 33))
+}
+
+#[cfg(not(windows))]
+fn rename_over(from: &Path, to: &Path) -> io::Result<()> {
+    std::fs::rename(from, to)
 }
 
 /// Make `dir`, and any of its parents that are missing, for a secret to live in: owner-only (unix
