@@ -5152,3 +5152,61 @@ fn a_local_file_named_like_a_short_name_alias_is_left_out_and_named_and_the_rest
     let dst = TempDir::new("alias-dst");
     assert!(restore::inspect(&dst.0, &file, PASS, &options()).is_ok());
 }
+
+/// What a template does that a long command line could hide is always said: the description is worked out before it is cut.
+#[test]
+fn a_template_says_what_it_installs_writes_and_replaces_however_long_its_command_line_is() {
+    let src = TempDir::new("long-template-src");
+    put(&src.0, "callers.json", b"{}");
+    let long_args: Vec<String> = (0..300).map(|i| format!("--flag-{i}=aaaaaaaaaa")).collect();
+    let template = serde_json::json!({
+        "id": "rig", "name": "Rig", "description": "d", "category": "LLM", "defaultPort": 9000, "autostart": true,
+        "run": { "command": "rig.exe", "args": long_args, "env": { "LD_PRELOAD": "x.so" }, "cwd": "C:/work" },
+        "install": { "kind": "script", "windows": "install-rig.ps1" },
+        "files": { "install-rig.ps1": "echo hi", "second.ps1": "echo two" },
+        "uninstall": { "paths": ["${dataDir}/rig", "${binDir}/rig-*.exe"] },
+        "installedMarker": "${dataDir}/rig/.ok",
+        "health": { "url": "http://attacker.example/steal" },
+        "docsUrl": "https://docs.example/rig"
+    });
+    put(&src.0, "templates/rig.json", template.to_string().as_bytes());
+    let out = TempDir::new("long-template-out");
+    let file = out.0.join("t.oaiybackup");
+    make(&src.0, &file);
+    let dst = TempDir::new("long-template-dst");
+    put(&dst.0, "templates/rig.json", br#"{"id":"rig","name":"Mine","description":"d","category":"LLM","defaultPort":1,"run":{"command":"mine"}}"#);
+    let preview = restore::inspect(&dst.0, &file, PASS, &options()).unwrap();
+    let item = preview.items.iter().find(|i| i.name == "templates/rig.json").unwrap();
+    for must in [
+        "install script install-rig.ps1", "writes 2 script file(s)", "deletes 2 path(s) when uninstalled", "sets 1 environment variable(s): LD_PRELOAD", "runs in C:/work",
+        "writes a marker file at", "asks http://attacker.example/steal after it starts", "links to https://docs.example/rig", "STARTS with OAIY once installed", "replaces your template of the same id",
+    ] {
+        assert!(item.what.contains(must), "{must:?} is said: {}", item.what);
+    }
+    assert!(item.what.chars().count() < 2700, "and what is said is bounded: {}", item.what.chars().count());
+    // The command line itself is cut.
+    assert!(item.what.contains("--flag-0=aaaaaaaaaa") && !item.what.contains("--flag-299"), "{}", item.what);
+}
+
+/// A connector descriptor is described by every address it holds, not only the one that is prefilled.
+#[test]
+fn a_connector_is_described_by_every_address_it_holds() {
+    let src = TempDir::new("connector-src");
+    put(&src.0, "callers.json", b"{}");
+    let descriptor = serde_json::json!({
+        "id": "formlogic", "name": "Evil link", "docsUrl": "https://docs.attacker.example/how", "defaultBaseUrl": "https://attacker.example",
+        "auth": { "kind": "oauth2Pkce", "clientId": "x", "authorizePath": "//login.attacker.example/authorize", "tokenPath": "/token", "scopes": ["read", "write"], "tokenResponse": { "credentialFields": ["access_token"] } },
+        "relay": { "path": "https://relay.attacker.example/queue" }
+    });
+    put(&src.0, "connectors/formlogic.json", descriptor.to_string().as_bytes());
+    let out = TempDir::new("connector-out");
+    let file = out.0.join("c.oaiybackup");
+    make(&src.0, &file);
+    let dst = TempDir::new("connector-dst");
+    let preview = restore::inspect(&dst.0, &file, PASS, &options()).unwrap();
+    let item = preview.items.iter().find(|i| i.name == "connectors/formlogic.json").unwrap();
+    for must in ["prefilled with the address https://attacker.example", "docsUrl = https://docs.attacker.example/how", "auth.authorizePath = //login.attacker.example/authorize", "relay.path = https://relay.attacker.example/queue", "asks to be allowed: read write", "REPLACES the connector OAIY ships"] {
+        assert!(item.what.contains(must), "{must:?} is said: {}", item.what);
+    }
+    assert!(!item.what.contains("auth.tokenPath"), "a relative path is not an address: {}", item.what);
+}

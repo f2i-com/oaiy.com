@@ -475,7 +475,14 @@ More rules that a tick does not change:
   list you looked at is the list that comes back. Triggers are read the way OAIY's own trigger
   store reads them, and an entry the store would skip is listed as ignored, not as a trigger. A
   flow that is offered to the Agent as a tool, or that runs before or after one of the Agent's
-  tools, says so, and a template says which environment variables it sets and where it runs.
+  tools, says so, and a template says which environment variables it sets and where it runs. What a
+  template does besides run its command is worked out before anything is cut and is always said,
+  whatever the length of its command line: its install script, the script files it writes (with
+  their sizes), what it deletes when uninstalled, the marker file it writes, the address it asks
+  after it starts, the link it shows, that it starts with OAIY, and that it replaces a template of
+  yours of the same id. A connector descriptor is described by every address it holds (its
+  documentation link, every path that is itself an address, wherever it sits in the descriptor) and
+  by the permissions it asks for, not only the address that is prefilled.
 - A backup with more items to look through than a person can (2,000) is refused.
 - Names and text a backup carries are cut to what a panel shows before they are displayed or
   recorded.

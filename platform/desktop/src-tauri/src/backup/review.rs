@@ -231,6 +231,33 @@ pub fn is_unreadable(item: &ReviewItem) -> bool {
     item.what.starts_with(UNREADABLE) || item.what == TOO_LARGE
 }
 
+/// Every address in a JSON document, with where it is: a value under a key that ends in `Url` or `url`, and a value under a key
+/// that ends in `Path` or `path` when it is itself an address (it names a host, or starts with `//`).
+fn collect_addresses(value: &Value, at: &str, out: &mut Vec<String>) {
+    const MAX: usize = 200;
+    match value {
+        Value::Object(map) => {
+            for (key, v) in map {
+                if out.len() >= MAX {
+                    return;
+                }
+                let here = if at.is_empty() { key.clone() } else { format!("{at}.{key}") };
+                let lower = key.to_lowercase();
+                match v {
+                    Value::String(text) if lower.ends_with("url") || (lower.ends_with("path") && (text.contains("://") || text.starts_with("//"))) => out.push(format!("{here} = {text}")),
+                    _ => collect_addresses(v, &here, out),
+                }
+            }
+        }
+        Value::Array(items) => {
+            for (i, v) in items.iter().enumerate().take(50) {
+                collect_addresses(v, &format!("{at}[{i}]"), out);
+            }
+        }
+        _ => {}
+    }
+}
+
 /// Describe one restorable file of a class that can act.
 pub fn describe(class: RestoreClass, name: &str, bytes: &[u8], local: &Local, backup_templates: &HashSet<String>) -> Vec<ReviewItem> {
     let value = || serde_json::from_slice::<Value>(bytes.strip_prefix(&[0xef, 0xbb, 0xbf][..]).unwrap_or(bytes));
@@ -363,29 +390,43 @@ pub fn describe(class: RestoreClass, name: &str, bytes: &[u8], local: &Local, ba
                 let run = v.get("run");
                 let command = run.and_then(|r| s(r, "command")).unwrap_or("(none)");
                 let args: Vec<String> = run.and_then(|r| r.get("args")).and_then(Value::as_array).map(|a| a.iter().filter_map(Value::as_str).map(str::to_string).collect()).unwrap_or_default();
-                let mut what = format!("Runs \"{}{}\"", command, if args.is_empty() { String::new() } else { format!(" {}", args.join(" ")) });
+                // What it does is said first and cut to a length; every warning about what else it does is a note of its
+                // own, worked out before anything is cut and always shown, so a long command line hides nothing.
+                let runs = format!("Runs \"{}{}\"", clip(command, 120), if args.is_empty() { String::new() } else { format!(" {}", clip(&args.join(" "), 200)) });
+                let mut notes: Vec<String> = Vec::new();
                 if let Some(install) = v.get("install").filter(|i| s(i, "kind") == Some("script")) {
-                    what.push_str(&format!("; install script {}", [s(install, "windows"), s(install, "unix")].into_iter().flatten().collect::<Vec<_>>().join(" / ")));
+                    notes.push(format!("install script {}", clip(&[s(install, "windows"), s(install, "unix")].into_iter().flatten().collect::<Vec<_>>().join(" / "), 160)));
                 }
                 if let Some(files) = v.get("files").and_then(Value::as_object).filter(|f| !f.is_empty()) {
-                    what.push_str(&format!("; writes {} script file(s): {}", files.len(), files.keys().take(6).cloned().collect::<Vec<_>>().join(", ")));
+                    let listed: Vec<String> = files.iter().take(6).map(|(k, body)| format!("{} ({} bytes)", clip(k, 40), body.as_str().map(str::len).unwrap_or(0))).collect();
+                    notes.push(format!("writes {} script file(s): {}", files.len(), clip(&listed.join(", "), 200)));
                 }
                 if let Some(paths) = v.get("uninstall").and_then(|u| u.get("paths")).and_then(Value::as_array).filter(|p| !p.is_empty()) {
-                    what.push_str(&format!("; deletes {} path(s) when uninstalled", paths.len()));
+                    notes.push(format!("deletes {} path(s) when uninstalled: {}", paths.len(), clip(&paths.iter().filter_map(Value::as_str).take(3).collect::<Vec<_>>().join(", "), 160)));
                 }
                 if let Some(env) = run.and_then(|r| r.get("env")).and_then(Value::as_object).filter(|e| !e.is_empty()) {
-                    what.push_str(&format!("; sets {} environment variable(s): {}", env.len(), env.keys().take(6).cloned().collect::<Vec<_>>().join(", ")));
+                    notes.push(format!("sets {} environment variable(s): {}", env.len(), clip(&env.keys().take(6).cloned().collect::<Vec<_>>().join(", "), 160)));
                 }
                 if let Some(cwd) = run.and_then(|r| s(r, "cwd")) {
-                    what.push_str(&format!("; runs in {cwd}"));
+                    notes.push(format!("runs in {}", clip(cwd, 120)));
+                }
+                if let Some(marker) = s(&v, "installedMarker").filter(|m| !m.is_empty()) {
+                    notes.push(format!("writes a marker file at {}", clip(marker, 120)));
+                }
+                if let Some(health) = v.get("health").and_then(|h| s(h, "url")) {
+                    notes.push(format!("asks {} after it starts", clip(health, 120)));
+                }
+                if let Some(docs) = s(&v, "docsUrl").filter(|d| !d.is_empty()) {
+                    notes.push(format!("links to {}", clip(docs, 120)));
                 }
                 if v.get("autostart").and_then(Value::as_bool).unwrap_or(false) {
-                    what.push_str("; STARTS with OAIY once installed");
+                    notes.push("STARTS with OAIY once installed".to_string());
                 }
                 if !id.is_empty() && local.template_ids.contains(id) {
-                    what.push_str("; replaces your template of the same id");
+                    notes.push("replaces your template of the same id".to_string());
                 }
-                vec![ReviewItem { class, name: name.to_string(), title: clip(&format!("{} ({id})", s(&v, "name").unwrap_or(id)), 120), what: clip(&what, 600) }]
+                let what = if notes.is_empty() { runs } else { format!("{runs}; {}", notes.join("; ")) };
+                vec![ReviewItem { class, name: name.to_string(), title: clip(&format!("{} ({id})", s(&v, "name").unwrap_or(id)), 120), what: clip(&what, 2600) }]
             }
             Err(_) => vec![unreadable(class, name, "it is not valid JSON")],
         },
@@ -417,12 +458,22 @@ pub fn describe(class: RestoreClass, name: &str, bytes: &[u8], local: &Local, ba
             Ok(v) => {
                 let id = s(&v, "id").unwrap_or("(no id)");
                 let overrides = if local.builtin_connectors.contains(id) { "; REPLACES the connector OAIY ships with this id" } else { "" };
-                vec![ReviewItem {
-                    class,
-                    name: name.to_string(),
-                    title: clip(&format!("{} ({id})", s(&v, "name").unwrap_or(id)), 120),
-                    what: clip(&format!("A link to a provider, prefilled with the address {}{overrides}.", s(&v, "defaultBaseUrl").unwrap_or("(none)")), 300),
-                }]
+                // Every address it holds, wherever it is in the descriptor: where a link goes, where it signs in, where it sends events.
+                let mut addresses: Vec<String> = Vec::new();
+                collect_addresses(&v, "", &mut addresses);
+                let more = addresses.len().saturating_sub(8);
+                let listed = addresses.iter().take(8).map(|a| clip(a, 120)).collect::<Vec<_>>().join("; ");
+                let scopes = v.pointer("/auth/scopes").and_then(Value::as_array).map(|a| a.iter().filter_map(Value::as_str).collect::<Vec<_>>().join(" ")).filter(|s| !s.is_empty());
+                let mut what = format!("A link to a provider, prefilled with the address {}", clip(s(&v, "defaultBaseUrl").unwrap_or("(none)"), 160));
+                if !listed.is_empty() {
+                    what.push_str(&format!("; every address it holds: {listed}{}", if more > 0 { format!(" and {more} more") } else { String::new() }));
+                }
+                if let Some(scopes) = scopes {
+                    what.push_str(&format!("; asks to be allowed: {}", clip(&scopes, 160)));
+                }
+                what.push_str(overrides);
+                what.push('.');
+                vec![ReviewItem { class, name: name.to_string(), title: clip(&format!("{} ({id})", s(&v, "name").unwrap_or(id)), 120), what: clip(&what, 1500) }]
             }
             Err(_) => vec![unreadable(class, name, "it is not valid JSON")],
         },
