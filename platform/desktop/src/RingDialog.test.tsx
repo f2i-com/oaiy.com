@@ -1,7 +1,8 @@
 // The ring dialog: a caller wants to speak to the owner. It shows nothing until this desktop says someone is being rung
-// for; then who, what they last said (as plain text), which devices ring and a countdown by the desktop's clock; and
-// Accept (a request to the Companion: the ring goes on until the phone says how it came out), Decline and Take a message
-// instead (the ring is over here at once). A ring past its time is not shown. Same convention as the other tests:
+// for; then who, what they last said (as plain text), which devices ring and a countdown by the desktop's clock; that
+// the owner answers on a Companion (there is no Accept: this computer cannot carry the call); "Decline and take a message"
+// (the phone is asked to withdraw the request, and the ring shows as stopping until it answers) and "Not now" (the box is
+// put away and the devices go on ringing). A ring past its time is not shown. Same convention as the other tests:
 // react-dom/client + act.
 import { act } from 'react';
 import { createRoot, type Root } from 'react-dom/client';
@@ -32,7 +33,7 @@ const ringing = (r: Partial<ActiveRing> = {}): ActiveRing => ({
   expiresAt: NOW + SKEW + 30_000,
   now: Date.now() + SKEW + 5_000,
   devices: ['this computer', 'Pixel 6'],
-  canAccept: true,
+  stopping: false,
   note: '',
   ...r,
 });
@@ -123,32 +124,57 @@ describe('the ring dialog', () => {
     expect(api.active.mock.calls.length).toBeGreaterThanOrEqual(before + 3);
   });
 
-  it('Accept asks for the call to be taken, says what it asked, and the ring goes on until the phone says how it came out', async () => {
+  it('says the owner answers on a Companion, and has no Accept: this computer cannot take the call', async () => {
     serve({});
-    api.respond.mockResolvedValue({ ok: true, note: 'Asked the Companion to take the call.' });
     await mount();
-    await click(button('Accept'));
-    expect(api.respond).toHaveBeenCalledWith('assist_1', 'accept');
-    expect(text()).toContain('Asked the Companion to take the call.');
-    expect(host.querySelector('.ring-dialog')).not.toBeNull();
-    expect(button('Accept').disabled).toBe(false);
+    expect(text()).toContain('Answer on your Companion. This computer cannot take the call.');
+    expect(button('Accept')).toBeUndefined();
+    expect([...host.querySelectorAll('button')].map((b) => b.textContent?.trim())).toEqual(['Decline and take a message', 'Not now']);
   });
 
-  it('Decline and Take a message instead end the ring here at once, and each is its own request', async () => {
+  it('Decline and take a message asks the phone to withdraw the request and shows it stopping until the phone answers', async () => {
+    serve({});
+    api.respond.mockResolvedValue({ ok: true, note: 'Asking your Companion to stop ringing. The receptionist will offer the caller a message.' });
+    await mount();
+    await click(button('Decline and take a message'));
+    expect(api.respond).toHaveBeenCalledWith('assist_1', 'decline');
+    // Nothing is decided here: the ring stays, stopping, and the next look says so.
+    serve({ stopping: true, note: 'Asking your Companion to stop ringing. The receptionist will offer the caller a message.' });
+    await act(async () => {
+      vi.advanceTimersByTime(POLL_MS + 10);
+    });
+    await settle();
+    expect(host.querySelector('.ring-dialog')).not.toBeNull();
+    expect(text()).toContain('Asking your Companion to stop ringing.');
+    expect(button('Decline and take a message').disabled).toBe(true);
+    // The phone answered: the ring is gone.
+    api.active.mockResolvedValue({ rings: [], notices: [] });
+    await act(async () => {
+      vi.advanceTimersByTime(POLL_MS + 10);
+    });
+    await settle();
+    expect(host.querySelector('.ring-dialog')).toBeNull();
+  });
+
+  it('Not now only puts the box away: nothing is asked of the phone and the ring is not shown again', async () => {
     serve({});
     await mount();
-    await click(button('Decline'));
-    expect(api.respond).toHaveBeenLastCalledWith('assist_1', 'decline');
+    await click(button('Not now'));
+    expect(api.respond).not.toHaveBeenCalled();
     expect(host.querySelector('.ring-dialog')).toBeNull();
-
+    // The devices go on ringing, and a look that still lists it does not bring the box back.
+    await act(async () => {
+      vi.advanceTimersByTime(POLL_MS * 2 + 10);
+    });
+    await settle();
+    expect(host.querySelector('.ring-dialog')).toBeNull();
+    // A different ring is shown.
     serve({ id: 'assist_2' });
     await act(async () => {
       vi.advanceTimersByTime(POLL_MS + 10);
     });
     await settle();
-    await click(button('Take a message instead'));
-    expect(api.respond).toHaveBeenLastCalledWith('assist_2', 'message');
-    expect(host.querySelector('.ring-dialog')).toBeNull();
+    expect(host.querySelector('.ring-dialog')).not.toBeNull();
   });
 
   it('does not show a ring that has run out, and shows the next while one runs', async () => {
@@ -160,27 +186,17 @@ describe('the ring dialog', () => {
       vi.advanceTimersByTime(POLL_MS + 10);
     });
     await settle();
-    await click(button('Decline'));
+    await click(button('Decline and take a message'));
     expect(api.respond).toHaveBeenLastCalledWith('live', 'decline');
-  });
-
-  it('says, when this computer cannot carry the call, that it is taken on the Companion, and does not once it has said what it asked', async () => {
-    serve({ canAccept: false });
-    await mount();
-    expect(text()).toContain('answer on your Companion');
-    api.respond.mockResolvedValue({ ok: false, note: 'The Phone plugin cannot take a call for you: answer on the Companion.' });
-    await click(button('Accept'));
-    expect(text()).toContain('The Phone plugin cannot take a call for you');
-    expect(text()).not.toContain('This computer cannot carry the call');
   });
 
   it('shows why a request failed, and is not stuck', async () => {
     serve({});
     api.respond.mockRejectedValue(new Error('the ring is over'));
     await mount();
-    await click(button('Decline'));
+    await click(button('Decline and take a message'));
     expect(host.querySelector('[role=alert]')?.textContent).toContain('the ring is over');
-    expect(button('Decline').disabled).toBe(false);
+    expect(button('Decline and take a message').disabled).toBe(false);
   });
 
   it('tells the owner, without a ring, that someone asked for them when no device is set up, and lets them dismiss it or go and set one up', async () => {

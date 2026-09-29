@@ -6,21 +6,29 @@ use std::time::Duration;
 
 use serde_json::json;
 
-use super::contract::{OpenedParams, RespondAction};
+use super::contract::OpenedParams;
 use super::plan::{Availability, Device, DeviceKind, Role};
 use super::session::Action;
 use super::*;
-use crate::voice::transfer::Outcome;
+use crate::voice::transfer::{CancelReason, Outcome};
 
 const CALL: &str = "call_1";
 const ASKED: &str = "Hello, can I speak to the owner please";
 
-/// The desktop's record of one call, and what the ring told it.
-#[derive(Default)]
+/// The desktop's record of one call, and what the ring asked of it.
 struct Calls {
     info: Mutex<Vec<(String, CallInfo)>>,
-    told: Mutex<Vec<(String, String, Outcome)>>,
+    /// The phone was asked to withdraw these requests: (call, request, why).
+    cancels: Mutex<Vec<(String, String, CancelReason)>>,
     ended: Mutex<Vec<String>>,
+    /// The call has a live session that can carry the question to the phone.
+    live: std::sync::atomic::AtomicBool,
+}
+
+impl Default for Calls {
+    fn default() -> Self {
+        Self { info: Mutex::default(), cancels: Mutex::default(), ended: Mutex::default(), live: std::sync::atomic::AtomicBool::new(true) }
+    }
 }
 
 impl CallSource for Calls {
@@ -30,8 +38,9 @@ impl CallSource for Calls {
     fn call_ended_by_phone(&self, call: &str) {
         self.ended.lock().unwrap().push(call.to_string());
     }
-    fn local_outcome(&self, call: &str, request: &str, outcome: Outcome) {
-        self.told.lock().unwrap().push((call.to_string(), request.to_string(), outcome));
+    fn cancel_transfer(&self, call: &str, request: &str, reason: CancelReason) -> bool {
+        self.cancels.lock().unwrap().push((call.to_string(), request.to_string(), reason));
+        self.live.load(std::sync::atomic::Ordering::SeqCst)
     }
 }
 
@@ -51,25 +60,6 @@ impl RingNotifier for Notified {
     }
     fn noticed(&self, notice: &crate::ring::Notice) {
         self.noticed.lock().unwrap().push(notice.clone());
-    }
-}
-
-/// A phone plugin that takes what it is asked, or cannot.
-struct Plugin {
-    asked: Mutex<Vec<(String, RespondAction)>>,
-    answer: Result<(), String>,
-}
-
-impl Plugin {
-    fn taking() -> Arc<Plugin> {
-        Arc::new(Plugin { asked: Mutex::default(), answer: Ok(()) })
-    }
-}
-
-impl TransferPlugin for Plugin {
-    fn respond(&self, request: &str, action: RespondAction) -> Result<(), String> {
-        self.asked.lock().unwrap().push((request.to_string(), action));
-        self.answer.clone()
     }
 }
 
@@ -165,7 +155,7 @@ fn a_ring_shows_who_is_calling_what_they_said_and_who_else_rings() {
     assert_eq!((ring.id.as_str(), ring.call_id.as_str(), ring.caller_name.as_str(), ring.caller_number.as_str()), ("assist_1", CALL, "Alex", "+61491570006"));
     assert_eq!(ring.said, vec!["Hi".to_string(), ASKED.to_string()]);
     assert!(ring.devices.contains(&"this computer".to_string()) && ring.devices.contains(&"phone ab12".to_string()), "{:?}", ring.devices);
-    assert!(!ring.can_accept, "there is no plugin to ask");
+    assert!(!ring.stopping && ring.note.is_empty(), "nothing has been asked of it");
     assert!(ring.expires_at > ring.started_at && ring.expires_at - ring.started_at <= 26_000, "{}", ring.expires_at - ring.started_at);
 
     // The owner is told once, and the dialog lists it.
@@ -206,67 +196,69 @@ fn the_first_word_about_a_ring_ends_it_and_later_words_change_nothing() {
     assert_eq!(ended_as(&r.ring), vec![("accepted", "phone")]);
     // The owner's answer that arrives after: the ring is over, and the call is told nothing.
     assert_eq!(r.ring.respond("assist_1", Action::Decline).unwrap_err().code, "no_ring");
-    assert!(r.calls.told.lock().unwrap().is_empty());
+    assert!(r.calls.cancels.lock().unwrap().is_empty(), "the phone was asked nothing about a ring that was over");
 }
 
 #[test]
-fn accept_asks_the_phone_and_the_ring_goes_on_until_the_phone_says() {
+fn the_owner_takes_a_call_on_a_companion_so_the_dialog_has_no_accept() {
+    assert_eq!(Action::parse("accept"), None, "this computer cannot carry the call's audio and has no command to ask the phone to take it");
+    assert_eq!((Action::parse("decline"), Action::parse("message")), (Some(Action::Decline), Some(Action::Message)));
+    // The phone says a device took it: the ring is over, once.
     let r = rig(Presence::Active);
-    let plugin = Plugin::taking();
-    r.ring.set_plugin(plugin.clone());
-    assert!(open(&r).can_accept);
-    let said = r.ring.respond("assist_1", Action::Accept).unwrap();
-    assert!(said.ok && said.note.contains("Asked the Companion"), "{}", said.note);
-    assert_eq!(plugin.asked.lock().unwrap().as_slice(), [("assist_1".to_string(), RespondAction::Accept)]);
-    assert_eq!(r.ring.active().len(), 1, "the call is not taken until the phone says so");
-    assert_eq!(r.ring.active()[0].note, said.note, "and the dialog keeps what was asked");
-    assert!(r.calls.told.lock().unwrap().is_empty(), "the receptionist is told nothing");
-    // The phone says it took the call.
+    open(&r);
     r.ring.outcome_seen("assist_1", Outcome::Accepted, "phone");
     assert!(r.ring.active().is_empty());
     assert_eq!(ended_as(&r.ring), vec![("accepted", "phone")]);
 }
 
 #[test]
-fn accept_says_plainly_when_the_phone_cannot_be_asked() {
-    // No plugin to ask.
-    let r = rig(Presence::Active);
-    open(&r);
-    let said = r.ring.respond("assist_1", Action::Accept).unwrap();
-    assert!(!said.ok && said.note.contains("answer on your Companion"), "{}", said.note);
-    assert_eq!(r.ring.active().len(), 1, "it still rings");
-
-    // A plugin that refuses (it has no such command).
-    let r = rig(Presence::Active);
-    r.ring.set_plugin(Arc::new(Plugin { asked: Mutex::default(), answer: Err("no such command".into()) }));
-    open(&r);
-    let said = r.ring.respond("assist_1", Action::Accept).unwrap();
-    assert!(!said.ok && said.note.contains("no such command") && said.note.contains("Answer on your Companion"), "{}", said.note);
-    assert_eq!(r.ring.active().len(), 1, "nothing was claimed, and it still rings");
-    assert!(r.calls.told.lock().unwrap().is_empty());
+fn declining_asks_the_phone_to_withdraw_the_request_and_the_ring_stays_until_the_phone_answers() {
+    for (action, why) in [(Action::Decline, CancelReason::OwnerDeclined), (Action::Message, CancelReason::MessageInstead)] {
+        let r = rig(Presence::Active);
+        open(&r);
+        let said = r.ring.respond("assist_1", action).unwrap();
+        assert!(said.ok && said.note.contains("Asking your Companion to stop ringing") && said.note.contains("offer the caller a message"), "{}", said.note);
+        assert_eq!(r.calls.cancels.lock().unwrap().as_slice(), [(CALL.to_string(), "assist_1".to_string(), why)], "{action:?}: the phone is asked, and why");
+        // Nothing is decided here: it is stopping, and shown so, until the phone answers.
+        let shown = r.ring.active();
+        assert_eq!(shown.len(), 1, "{action:?}");
+        assert!(shown[0].stopping && shown[0].note == said.note, "{:?}", shown[0]);
+        assert!(r.notified.ended.lock().unwrap().is_empty());
+        // A second click asks nothing more.
+        let again = r.ring.respond("assist_1", action).unwrap();
+        assert!(again.ok && again.note.contains("Already asking"), "{}", again.note);
+        assert_eq!(r.calls.cancels.lock().unwrap().len(), 1, "{action:?}: once");
+        // The phone answers that it withdrew it: the ring is over.
+        r.ring.outcome_seen("assist_1", Outcome::Cancelled, "phone");
+        assert!(r.ring.active().is_empty(), "{action:?}");
+        assert_eq!(ended_as(&r.ring), vec![("cancelled", "phone")]);
+        assert_eq!(r.notified.ended.lock().unwrap().as_slice(), [("assist_1".to_string(), "cancelled".to_string())]);
+    }
 }
 
 #[test]
-fn declining_or_a_message_instead_ends_the_ring_here_at_once_and_tells_the_call() {
-    for action in [Action::Decline, Action::Message] {
-        let r = rig(Presence::Active);
-        let plugin = Plugin::taking();
-        r.ring.set_plugin(plugin.clone());
-        open(&r);
-        let said = r.ring.respond("assist_1", action).unwrap();
-        assert!(said.ok && said.note.contains("offer to take a message") && !said.note.contains("may still ring"), "{}", said.note);
-        assert!(r.ring.active().is_empty(), "{action:?}: gone from the dialog at once");
-        assert_eq!(r.calls.told.lock().unwrap().as_slice(), [(CALL.to_string(), "assist_1".to_string(), Outcome::Declined)], "{action:?}: the caller is sent to the message offer");
-        assert_eq!(plugin.asked.lock().unwrap().as_slice(), [("assist_1".to_string(), RespondAction::Decline)], "{action:?}: the request is withdrawn");
-        assert_eq!(r.notified.ended.lock().unwrap().len(), 1);
-        assert_eq!(ended_as(&r.ring), vec![("declined", "desktop")]);
-    }
-
-    // With no plugin to withdraw the request the owner is told their devices may still ring, and the caller is still sent on.
+fn too_late_to_withdraw_means_a_device_has_it_the_ring_goes_on_and_the_owner_is_told() {
     let r = rig(Presence::Active);
     open(&r);
-    assert!(r.ring.respond("assist_1", Action::Decline).unwrap().note.contains("may still ring"));
-    assert_eq!(r.calls.told.lock().unwrap().len(), 1);
+    r.ring.respond("assist_1", Action::Decline).unwrap();
+    r.ring.cancel_refused("assist_1");
+    let shown = r.ring.active();
+    assert_eq!(shown.len(), 1, "the ring is not over: the acceptance is coming");
+    assert!(!shown[0].stopping && shown[0].note.contains("took the call just before you declined"), "{:?}", shown[0]);
+    // The acceptance arrives, and is what ends it.
+    r.ring.outcome_seen("assist_1", Outcome::Accepted, "phone");
+    assert_eq!(ended_as(&r.ring), vec![("accepted", "phone")]);
+}
+
+#[test]
+fn a_call_with_no_live_session_has_nobody_to_ask_so_the_ring_is_over_here() {
+    let r = rig(Presence::Active);
+    r.calls.live.store(false, std::sync::atomic::Ordering::SeqCst);
+    open(&r);
+    let said = r.ring.respond("assist_1", Action::Decline).unwrap();
+    assert!(said.ok && said.note.contains("not on this computer any more"), "{}", said.note);
+    assert!(r.ring.active().is_empty());
+    assert_eq!(ended_as(&r.ring), vec![("declined", "desktop")]);
 }
 
 #[test]
@@ -277,7 +269,7 @@ fn a_decline_that_loses_to_the_phone_reaches_nobody() {
     r.ring.outcome_seen("assist_1", Outcome::Accepted, "phone");
     let late = r.ring.respond("assist_1", Action::Decline).unwrap_err();
     assert_eq!((late.status, late.code), (404, "no_ring"));
-    assert!(r.calls.told.lock().unwrap().is_empty(), "the receptionist was not told the owner declined a call they took");
+    assert!(r.calls.cancels.lock().unwrap().is_empty(), "the phone was not asked to withdraw a call an owner device took");
 }
 
 #[test]
@@ -307,6 +299,8 @@ fn a_ring_nobody_reports_the_end_of_is_over_after_its_time_and_a_grace() {
     assert!(r.ring.active().is_empty(), "the dialog does not ring for ever");
     assert_eq!(ended_as(&r.ring), vec![("expired", "timer")]);
     assert_eq!(r.notified.ended.lock().unwrap().as_slice(), [("assist_1".to_string(), "expired".to_string())]);
+    // Nothing was heard of it, so the phone is asked to drop what it may still hold.
+    assert_eq!(r.calls.cancels.lock().unwrap().as_slice(), [(CALL.to_string(), "assist_1".to_string(), CancelReason::GaveUp)]);
 }
 
 #[test]
@@ -319,6 +313,7 @@ fn a_ring_answered_in_time_is_not_ended_again_by_its_timer() {
     std::thread::sleep(Duration::from_millis(1_300));
     assert_eq!(ended_as(&r.ring), vec![("declined", "phone")], "one record: the timer found nothing to end");
     assert_eq!(r.notified.ended.lock().unwrap().len(), 1);
+    assert!(r.calls.cancels.lock().unwrap().is_empty(), "a ring the phone answered is not withdrawn by the timer");
 }
 
 #[test]
@@ -598,7 +593,7 @@ fn a_second_try_on_one_call_straight_after_the_first_is_refused() {
 #[test]
 fn what_the_phone_says_of_a_ring_ends_it() {
     let r = rig(Presence::Active);
-    for (event, name) in [("transferred", "accepted"), ("declined", "declined"), ("unavailable", "unavailable"), ("expired", "expired")] {
+    for (event, name) in [("transferred", "accepted"), ("declined", "declined"), ("unavailable", "unavailable"), ("expired", "expired"), ("cancelled", "cancelled")] {
         let r = rig(Presence::Active);
         open(&r);
         let data = json!({ "requestId": "assist_1", "callId": CALL, "outcome": event });
@@ -639,7 +634,8 @@ async fn the_dialog_reads_the_rings_and_answers_them_over_http() {
     let ring = open(&r);
     let rings = read().await;
     let shown = &rings["rings"][0];
-    assert_eq!((shown["id"].as_str(), shown["callerName"].as_str(), shown["callerNumber"].as_str(), shown["canAccept"].as_bool()), (Some(ring.id.as_str()), Some("Alex"), Some("+61491570006"), Some(false)), "{shown}");
+    assert_eq!((shown["id"].as_str(), shown["callerName"].as_str(), shown["callerNumber"].as_str(), shown["stopping"].as_bool()), (Some(ring.id.as_str()), Some("Alex"), Some("+61491570006"), Some(false)), "{shown}");
+    assert!(shown.get("canAccept").is_none(), "there is nothing to accept here");
     assert!(shown["expiresAt"].as_u64().unwrap() > shown["now"].as_u64().unwrap(), "the countdown runs on this desktop's clock: {shown}");
     assert_eq!(shown["said"][1], ASKED);
 
@@ -657,23 +653,24 @@ async fn the_dialog_reads_the_rings_and_answers_them_over_http() {
     assert_eq!(missing.status(), 404);
     assert_eq!(missing.json::<serde_json::Value>().await.unwrap()["error"]["code"], "no_ring");
     assert_eq!(read().await["rings"].as_array().unwrap().len(), 1, "none of those touched the ring");
-    assert!(r.calls.told.lock().unwrap().is_empty());
-
-    // Accept with nothing to ask is answered, honestly, and the ring goes on.
+    assert!(r.calls.cancels.lock().unwrap().is_empty());
+    // Accepting is not something this computer does.
     let accept = post("assist_1", json!({ "action": "accept" })).await;
-    assert_eq!(accept.status(), 200);
-    let accept: serde_json::Value = accept.json().await.unwrap();
-    assert_eq!(accept["ok"], false);
-    assert_eq!(read().await["rings"][0]["note"], accept["note"]);
+    assert_eq!(accept.status(), 400);
+    assert_eq!(accept.json::<serde_json::Value>().await.unwrap()["error"]["code"], "bad_action");
 
-    // A message instead: the ring ends, the caller is sent on, and asking again finds nothing.
+    // A message instead: the phone is asked to withdraw it, the dialog shows it stopping, and the phone's answer ends it.
     let message = post("assist_1", json!({ "action": "message" })).await;
     assert_eq!(message.status(), 200);
-    assert_eq!(message.json::<serde_json::Value>().await.unwrap()["ok"], true);
+    let message: serde_json::Value = message.json().await.unwrap();
+    assert_eq!(message["ok"], true);
+    let stopping = read().await;
+    assert_eq!((stopping["rings"][0]["stopping"].clone(), stopping["rings"][0]["note"].clone()), (json!(true), message["note"].clone()));
+    assert_eq!(r.calls.cancels.lock().unwrap().as_slice(), [(CALL.to_string(), "assist_1".to_string(), CancelReason::MessageInstead)]);
+    r.ring.outcome_seen("assist_1", Outcome::Cancelled, "phone");
     assert_eq!(read().await, json!({ "rings": [], "notices": [] }));
-    assert_eq!(r.calls.told.lock().unwrap().as_slice(), [(CALL.to_string(), "assist_1".to_string(), Outcome::Declined)]);
     assert_eq!(post("assist_1", json!({ "action": "decline" })).await.status(), 404);
-    assert_eq!(r.calls.told.lock().unwrap().len(), 1, "told once");
+    assert_eq!(r.calls.cancels.lock().unwrap().len(), 1, "asked once");
 }
 
 #[tokio::test]

@@ -8,12 +8,14 @@
 //! wins and later word about it is ignored, so a ring is never ended twice and the dialog never comes
 //! back once it has gone.
 //!
-//! What the owner can do here is only ever a request. **Accept** asks the phone plugin (through the
-//! connector command `call.transfer.respond`, if it has it) to take the call on the owner's behalf: the
-//! ring goes on, and is resolved only when the phone says the call was taken. **Decline** and **Take a
-//! message instead** end the ring here at once and tell the call, so the caller is offered a message
-//! without waiting for the devices; the plugin is asked to withdraw the request too. If a device
-//! accepts after that, the takeover is obeyed.
+//! The owner answers a ring on a Companion, not here: this computer cannot carry the call's audio, and the phone
+//! plugin offers the call to the devices the plan names. What the owner can do here is decline (**Decline and take a
+//! message**): the phone is asked, on the call's own stream, to withdraw the request (`transfer_cancel`), and its
+//! answer decides what happens: `cancelled` and the caller is offered a message, or too late (an owner device had
+//! taken it) and nothing is offered while the acceptance goes on. The dialog shows the ring as stopping until then, at
+//! most a couple of seconds, and if the phone does not answer the request is over here and a message is offered. If
+//! a device accepts after that, the takeover is obeyed. **Not now** is the dialog's own (it puts the box away and
+//! rings on).
 
 use std::collections::VecDeque;
 use std::sync::{Arc, Weak};
@@ -21,10 +23,10 @@ use std::time::Duration;
 
 use serde::Serialize;
 
-use super::contract::{OpenedParams, RespondAction};
+use super::contract::OpenedParams;
 use super::host::Ring;
 use super::plan::RingPlan;
-use crate::voice::transfer::Outcome;
+use crate::voice::transfer::{CancelReason, Outcome};
 
 /// How long past its time a ring waits to hear how it came out before it is over.
 pub const EXPIRY_GRACE: Duration = Duration::from_secs(5);
@@ -41,12 +43,6 @@ pub trait RingNotifier: Send + Sync {
     fn ended(&self, id: &str, outcome: &str);
     /// Somebody asked for the owner and nobody could be rung, because no device is set up to take a transfer.
     fn noticed(&self, _notice: &Notice) {}
-}
-
-/// What asks the phone plugin to take (or drop) a request on the owner's behalf.
-pub trait TransferPlugin: Send + Sync {
-    /// Ask. An error says why the phone could not be asked (it does not have the command, it is off).
-    fn respond(&self, request: &str, action: RespondAction) -> Result<(), String>;
 }
 
 static GLOBAL: std::sync::RwLock<Option<Arc<dyn RingNotifier>>> = std::sync::RwLock::new(None);
@@ -80,8 +76,8 @@ pub struct ActiveRing {
     pub now: u64,
     /// Who else is rung, by name ("this computer", a device).
     pub devices: Vec<String>,
-    /// The phone plugin can be asked to take the call for the owner.
-    pub can_accept: bool,
+    /// The owner declined and the phone is being asked to withdraw the request: the dialog waits for its answer.
+    pub stopping: bool,
     /// What the owner was last told about what they asked here.
     pub note: String,
 }
@@ -130,19 +126,18 @@ pub struct Sessions {
     last_toast: Option<std::time::Instant>,
 }
 
-/// What the owner can do with a ring.
+/// What the owner can do with a ring: end it and have the receptionist take a message. (Taking the call is the Companion's.)
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Action {
-    Accept,
+    /// Decline it.
     Decline,
-    /// Decline, and say the receptionist should take a message.
+    /// Have the receptionist take a message instead.
     Message,
 }
 
 impl Action {
     pub fn parse(s: &str) -> Option<Action> {
         match s {
-            "accept" => Some(Action::Accept),
             "decline" => Some(Action::Decline),
             "message" => Some(Action::Message),
             _ => None,
@@ -205,7 +200,7 @@ impl Ring {
             expires_at,
             now,
             devices,
-            can_accept: self.plugin().is_some(),
+            stopping: false,
             note: String::new(),
         };
         {
@@ -226,12 +221,15 @@ impl Ring {
 
     /// The ring is over when its time and a grace have passed with nobody having said how it came out.
     fn watch_expiry(self: &Arc<Self>, ring: &ActiveRing) {
-        let (weak, id) = (Arc::downgrade(self), ring.id.clone());
+        let (weak, id, call) = (Arc::downgrade(self), ring.id.clone(), ring.call_id.clone());
         let wait = Duration::from_millis(ring.expires_at.saturating_sub(self.now_ms())) + *self.expiry_grace.read().unwrap_or_else(|e| e.into_inner());
         std::thread::spawn(move || {
             std::thread::sleep(wait);
             if let Some(ring) = Weak::upgrade(&weak) {
-                ring.resolve(&id, Outcome::Expired, "timer");
+                // Nothing was heard of how it came out: it is over here, and the phone is asked to drop what it may still hold.
+                if ring.resolve(&id, Outcome::Expired, "timer") {
+                    ring.cancel_on_call(&call, &id, CancelReason::GaveUp);
+                }
             }
         });
     }
@@ -323,10 +321,19 @@ impl Ring {
         self.sessions.lock().unwrap_or_else(|e| e.into_inner()).ended.iter().cloned().collect()
     }
 
-    fn set_note(&self, request: &str, note: &str) {
-        if let Some(l) = self.sessions.lock().unwrap_or_else(|e| e.into_inner()).live.iter_mut().find(|l| l.ring.id == request) {
-            l.ring.note = note.to_string();
-        }
+    /// Set what the owner is told of a ring, and whether it is being stopped. Whether the ring was there and was not already stopping.
+    fn set_stopping(&self, request: &str, stopping: bool, note: &str) -> bool {
+        let mut sessions = self.sessions.lock().unwrap_or_else(|e| e.into_inner());
+        let Some(l) = sessions.live.iter_mut().find(|l| l.ring.id == request) else { return false };
+        let changed = l.ring.stopping != stopping;
+        l.ring.stopping = stopping;
+        l.ring.note = note.to_string();
+        changed
+    }
+
+    /// The phone says it was too late to withdraw the request: an owner device took it. The ring goes on until the phone says so.
+    pub fn cancel_refused(&self, request: &str) {
+        self.set_stopping(request, false, "An owner device took the call just before you declined: it is being connected.");
     }
 
     /// The owner answers a ring in the dialog. See the module docs for what each answer is.
@@ -334,35 +341,21 @@ impl Ring {
         let Some(call) = self.sessions.lock().unwrap_or_else(|e| e.into_inner()).live.iter().find(|l| l.ring.id == request).map(|l| l.ring.call_id.clone()) else {
             return Err(error(404, "no_ring", "that ring is over"));
         };
-        match action {
-            Action::Accept => {
-                let (ok, note) = match self.plugin() {
-                    None => (false, "This computer cannot take the call itself: answer on your Companion (on this computer or your phone).".to_string()),
-                    Some(plugin) => match plugin.respond(request, RespondAction::Accept) {
-                        Ok(()) => (true, "Asked the Companion to take the call. It is yours when the Companion says so.".to_string()),
-                        Err(why) => (false, format!("The phone could not be asked to take the call ({why}). Answer on your Companion.")),
-                    },
-                };
-                self.set_note(request, &note);
-                Ok(Responded { ok, note })
-            }
-            Action::Decline | Action::Message => {
-                // The first answer wins: if the phone has already said how it came out, this is late.
-                if !self.resolve(request, Outcome::Declined, "desktop") {
-                    return Err(error(409, "ring_over", "that ring has just ended"));
-                }
-                // The receptionist offers the caller a message at once; the plugin is asked to withdraw the request
-                // (best effort: a device that accepts before it does is obeyed).
-                self.local_outcome(&call, request, Outcome::Declined);
-                let withdrawn = self.plugin().is_some_and(|p| p.respond(request, RespondAction::Decline).is_ok());
-                let note = match (action, withdrawn) {
-                    (Action::Message, true) => "The receptionist will offer to take a message.",
-                    (Action::Message, false) => "The receptionist will offer to take a message. Your devices may still ring for a moment.",
-                    (_, true) => "Declined. The receptionist will offer to take a message.",
-                    (_, false) => "Declined here. The receptionist will offer to take a message; your devices may still ring for a moment.",
-                };
-                Ok(Responded { ok: true, note: note.to_string() })
-            }
+        let reason = match action {
+            Action::Decline => CancelReason::OwnerDeclined,
+            Action::Message => CancelReason::MessageInstead,
+        };
+        // A second click while the phone is being asked asks nothing more.
+        if !self.set_stopping(request, true, "Asking your Companion to stop ringing. The receptionist will offer the caller a message.") {
+            return Ok(Responded { ok: true, note: "Already asking your Companion to stop ringing.".to_string() });
         }
+        // The phone is asked, on the call's own stream, and its answer decides what the caller hears: cancelled, and a message
+        // is offered; too late, and an owner device has the call. With no live session to carry the question there is no call
+        // to speak to: the ring is over here.
+        if !self.cancel_on_call(&call, request, reason) {
+            self.resolve(request, Outcome::Declined, "desktop");
+            return Ok(Responded { ok: true, note: "Declined. The call is not on this computer any more.".to_string() });
+        }
+        Ok(Responded { ok: true, note: "Asking your Companion to stop ringing. The receptionist will offer the caller a message.".to_string() })
     }
 }

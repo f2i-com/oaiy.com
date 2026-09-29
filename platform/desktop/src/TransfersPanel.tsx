@@ -184,8 +184,9 @@ export default function TransfersPanel() {
           <ol>
             <li>A caller asks for you, or for a person. The receptionist says it will try to reach you: never that they are put through.</li>
             <li>
-              This computer rings (a notification, and a box on this window with Accept, Decline and Take a message instead), and so does the Companion on this computer
-              or on a second phone. Whoever answers first takes the call.
+              This computer tells you (a notification, and a box on this window with who is calling and what they said), and your Companion rings: the one on this computer while
+              you are at it, and one on a second phone when you are away. You answer on the Companion, and whoever answers first takes the call. The box on this window can only
+              decline and have the receptionist take a message, or be put away with Not now.
             </li>
             <li>
               Nothing rings unless a Companion is set up to take the call: tick the one that runs on this computer (below), or approve one on a second phone. With none, callers are

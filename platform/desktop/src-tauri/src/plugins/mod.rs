@@ -45,7 +45,7 @@ pub mod rpc;
 pub mod runner;
 pub mod trust;
 
-pub use host::{CompanionBroker, ForwardError, PhoneTransfers, PluginHost, ReceivedEvent, TriggerStore, TriggerStoreHandle, CONNECTOR_TIMEOUT};
+pub use host::{CompanionBroker, ForwardError, PluginHost, ReceivedEvent, TriggerStore, TriggerStoreHandle, CONNECTOR_TIMEOUT};
 pub use process::{CallError, PluginProcess, SpawnOptions};
 pub use manifest::{ManifestError, PluginManifest, HOST_CAPABILITIES};
 pub use registry::{

@@ -103,7 +103,9 @@ describe('Transfers', () => {
     expect(help!.textContent).toContain('Nothing rings unless a Companion is set up to take the call');
     const said = help!.textContent ?? '';
     expect(said).toContain('never that they are put through');
-    expect(said).toContain('Accept, Decline and Take a message instead');
+    expect(said).toContain('You answer on the Companion');
+    expect(said).toContain('decline and have the receptionist take a message');
+    expect(said).not.toContain('Accept');
     expect(said).toContain('always ends with the caller being spoken to');
     expect(said).toContain('caller’s own words asked for a person');
     // Reading it changes nothing.

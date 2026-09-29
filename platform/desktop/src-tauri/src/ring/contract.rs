@@ -301,36 +301,6 @@ pub struct OpenedParams {
     pub expires_at: u64,
 }
 
-/// What the owner can ask of the plugin from the desktop's dialog (`call.transfer.respond`, a connector command).
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum RespondAction {
-    Accept,
-    Decline,
-}
-
-#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub struct RespondRequest {
-    pub method: String,
-    pub params: RespondParams,
-}
-
-#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase", deny_unknown_fields)]
-pub struct RespondParams {
-    pub connector_id: String,
-    pub command: String,
-    pub payload: RespondPayload,
-}
-
-#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase", deny_unknown_fields)]
-pub struct RespondPayload {
-    pub request_id: String,
-    pub action: RespondAction,
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -497,8 +467,6 @@ mod tests {
         let opened: OpenedRequest = round_trip("ring-opened.json");
         assert_eq!(opened.method, "oaiy.ring.opened");
         assert_eq!(opened.params.plan_id, ring.plan_id);
-        let respond: RespondRequest = round_trip("respond-request.json");
-        assert_eq!((respond.params.command.as_str(), respond.params.payload.action), ("call.transfer.respond", RespondAction::Decline));
     }
 
     #[test]

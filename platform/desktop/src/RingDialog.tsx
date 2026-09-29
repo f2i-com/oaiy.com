@@ -1,5 +1,5 @@
 import { useCallback, useEffect, useRef, useState } from 'react';
-import { MessageSquareText, Phone, PhoneOff } from 'lucide-react';
+import { Phone, PhoneOff } from 'lucide-react';
 import { ring as api, type ActiveRing, type RingAction, type RingNotice } from './api';
 import { readableNumber } from './contactsModel';
 import { openSetup } from './useSetupState';
@@ -8,11 +8,11 @@ import { useVisiblePoll } from './useVisiblePoll';
 /**
  * A caller wants to speak to you. While the receptionist is trying to reach the
  * owner, this desktop rings (a notification, and this dialog): who is calling, what
- * they last said, and how long it rings. The owner can take it (the Companion on this
- * computer or a phone takes the call: this computer cannot carry its audio), decline,
- * or have the receptionist take a message instead. What the owner does here is only
- * ever a request: the receptionist is told nothing until the phone says how it came out,
- * except when the owner declines, which sends the caller to the message offer at once.
+ * they last said, and how long it rings. The owner answers on a Companion (this
+ * computer cannot carry a call's audio, so there is nothing to accept here). What the
+ * dialog offers is to decline and have the receptionist take a message, which asks the
+ * phone to withdraw the request (it shows as stopping until the phone answers, a couple
+ * of seconds at most), and "Not now", which only puts the box away: the devices go on ringing.
  */
 
 /** How often the desktop is asked whether anyone is ringing. */
@@ -34,10 +34,8 @@ export default function RingDialog({ on = true }: { on?: boolean }) {
   const offset = useRef(0);
   const [tick, setTick] = useState(0);
   const [busy, setBusy] = useState<RingAction | null>(null);
-  /** Rings the owner sent away here: not shown again if a look that was already on its way still lists them. */
-  const [sentAway, setSentAway] = useState<string[]>([]);
-  /** What each ring was told when the owner acted on it here. */
-  const [notes, setNotes] = useState<Record<string, string>>({});
+  /** Rings the owner put away with "Not now": not shown again, though they go on ringing on their devices. */
+  const [putAway, setPutAway] = useState<string[]>([]);
   const [error, setError] = useState<string | null>(null);
 
   const look = useCallback(() => {
@@ -69,7 +67,7 @@ export default function RingDialog({ on = true }: { on?: boolean }) {
   }, [rings.length]);
 
   const now = Date.now() + offset.current;
-  const ringing = rings.filter((r) => r.expiresAt > now && !sentAway.includes(r.id));
+  const ringing = rings.filter((r) => r.expiresAt > now && !putAway.includes(r.id));
   const shown = ringing[0];
 
   const act = async (action: RingAction) => {
@@ -77,14 +75,8 @@ export default function RingDialog({ on = true }: { on?: boolean }) {
     setBusy(action);
     setError(null);
     try {
-      const r = await api.respond(shown.id, action);
-      if (action === 'accept') {
-        // Taking it is the Companion's: this says what was asked of it, and the ring goes on until the phone says.
-        setNotes((n) => ({ ...n, [shown.id]: r.note }));
-      } else {
-        setSentAway((ids) => [...ids.slice(-20), shown.id]);
-        setRings((list) => list.filter((x) => x.id !== shown.id));
-      }
+      // The phone is asked to withdraw the request: the ring stays, stopping, until it answers (the next look shows it).
+      await api.respond(shown.id, action);
     } catch (e) {
       setError(errText(e));
     } finally {
@@ -128,7 +120,7 @@ export default function RingDialog({ on = true }: { on?: boolean }) {
   const total = Math.max(1, Math.round((shown.expiresAt - shown.startedAt) / 1000));
   const who = shown.callerName || readableNumber(shown.callerNumber) || 'A caller who hid their number';
   const said = shown.said.filter((s) => s.trim()).slice(-2);
-  const note = notes[shown.id] || shown.note;
+  const note = shown.note;
   return (
     <>
     {noticeStack}
@@ -157,21 +149,20 @@ export default function RingDialog({ on = true }: { on?: boolean }) {
           </div>
           <span aria-label={`${left} seconds left`}>{left}s</span>
         </div>
+        <p className="ring-note">Answer on your Companion. This computer cannot take the call.</p>
         <div className="ring-actions">
-          <button type="button" className="button" disabled={busy !== null} onClick={() => void act('accept')} autoFocus>
-            <Phone size={14} /> Accept
+          <button type="button" className="button secondary" disabled={busy !== null || shown.stopping} onClick={() => void act('decline')}>
+            <PhoneOff size={14} /> Decline and take a message
           </button>
-          <button type="button" className="button secondary" disabled={busy !== null} onClick={() => void act('decline')}>
-            <PhoneOff size={14} /> Decline
-          </button>
-          <button type="button" className="button secondary" disabled={busy !== null} onClick={() => void act('message')}>
-            <MessageSquareText size={14} /> Take a message instead
+          <button type="button" className="button secondary" onClick={() => setPutAway((ids) => [...ids.slice(-20), shown.id])}>
+            Not now
           </button>
         </div>
-        {!shown.canAccept && !note && (
-          <p className="ring-note">This computer cannot carry the call’s audio: to take it, answer on your Companion (on this computer or your phone).</p>
+        {note && (
+          <p className="ring-note" role="status">
+            {note}
+          </p>
         )}
-        {note && <p className="ring-note">{note}</p>}
         {error && (
           <p className="form-error" role="alert">
             {error}

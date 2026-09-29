@@ -38,7 +38,7 @@ use serde::Serialize;
 
 pub use host::{Authorised, CallInfo, CallSource, Clock, DeviceSource, PresenceSource, Ring};
 pub use plan::{plan, Decision, Inputs, PlanReason, Presence, Reason, RingPlan};
-pub use session::{set_global_notifier, ActiveRing, Action, Notice, RingError, RingNotifier, TransferPlugin};
+pub use session::{set_global_notifier, ActiveRing, Action, Notice, RingError, RingNotifier};
 pub use settings::{RingSettings, SettingsError, SettingsStore};
 
 /// What the receptionist may do because of the owner's settings.
@@ -100,6 +100,7 @@ pub fn apply_plugin_event(ring: &Ring, name: &str, data: &serde_json::Value, cor
                 "declined" => Outcome::Declined,
                 "unavailable" => Outcome::Unavailable,
                 "expired" => Outcome::Expired,
+                "cancelled" => Outcome::Cancelled,
                 _ => return,
             };
             if !text("requestId").is_empty() {

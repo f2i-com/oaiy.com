@@ -1618,11 +1618,10 @@ pub async fn serve(
         })
     };
     let voice_routes = crate::voice::app_router(voice.clone());
-    // Putting a caller through to the owner: which Companions could take the call, whether the owner is at the computer
-    // (only where there is a window to ring), and what asks the phone plugin to answer for the owner from the dialog.
+    // Putting a caller through to the owner: which Companions could take the call, and whether the owner is at the computer
+    // (only where there is a window to ring).
     if let Some(ring) = crate::ring::shared() {
         ring.set_devices(std::sync::Arc::new(crate::ring::devices::CompanionDevices::new(companion.clone(), "aokie")));
-        ring.set_plugin(std::sync::Arc::new(crate::plugins::PhoneTransfers(bridge.host.clone())));
         bridge.host.set_ring(ring.clone());
         if gui_mode {
             ring.set_presence(std::sync::Arc::new(crate::ring::presence::IdlePresence::os(ring.settings.clone())));

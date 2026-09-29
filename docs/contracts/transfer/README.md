@@ -29,7 +29,6 @@ level, no whitespace, one trailing line feed (`.gitattributes` keeps that on eve
 | `stop-handoff.json` | the session ends because the owner took the call |
 | `start-resume.json` | the session that follows, for the same call id |
 | `plan-request.json`, `plan-result-ring.json`, `plan-result-message-only.json`, `ring-opened.json` | the two requests to the desktop |
-| `respond-request.json` | the desktop's optional request to the plugin (see [Desktop response](#desktop-response-optional)) |
 | `offer-id.json` | the reserved offer id and its known answers |
 | `phrases.json` | the "caller asked" check: eight requests and eight that are not |
 
@@ -140,23 +139,22 @@ The desktop also reads the plugin's events: `aokie.call.assistance.resolved` (`d
 `transferred`, `declined`, `unavailable`, `expired`) closes the dialog, and `aokie.call.ended` ends the ring
 and a call in handoff.
 
-## Desktop response (optional)
+## Withdrawing a request: `transfer_cancel`
 
-The dialog offers **Accept**, **Decline** and **Take a message instead**. The desktop cannot carry a call's
-audio, so nothing it does can take the call by itself; what it can do is ask the plugin, through a connector
-command (`respond-request.json`, an OAIY proposal outside the design's appendices):
+The owner answers on a Companion; the dialog on this computer cannot take the call (it cannot carry the audio) and
+has no connector command to the plugin. What it offers is **Decline and take a message** (and **Not now**, which
+only puts the box away). Declining, and the desktop giving up on a request that ran out, send the plugin a frame on
+the call's own loopback stream:
 
-`call.transfer.respond {requestId, action: "accept" | "decline"}` on the phone connector.
+`{type: "formlogic.realtime.transfer_cancel", callId, generation, requestId, reason}` with `reason` one of
+`owner_declined`, `message_instead`, `gave_up`.
 
-- `decline`: the plugin resolves the request as declined (the compare-and-swap decides against any device
-  accepting at the same moment) and sends `transfer_outcome declined`.
-- `accept`: the plugin treats it as this computer's Companion accepting (the plugin's own decision).
-
-If the plugin does not declare the command (the connector gate refuses an undeclared command), the dialog says
-so and nothing is lost: **Decline** and **Take a message instead** still send the caller to the message offer at
-once (the request runs out on the owner's devices at its own time, and if one of them accepts later, that
-takeover is obeyed), and **Accept** says to answer on the Companion. The desktop never claims a call was taken
-that the plugin has not said was.
+The plugin answers with `transfer_outcome cancelled` (the request is withdrawn), or, when an owner device has
+already accepted, a notice that it is too late (`{type: "formlogic.realtime.transfer_notice", requestId, notice:
+"too_late"}`). The desktop waits for the answer up to 2 seconds before it offers the caller a message, so that a
+decline racing an accept is decided once, by the plugin: on `cancelled` the caller is offered a message; on too late
+nothing is offered and the acceptance goes on; with no answer the request is over here and a message is offered (a
+device that accepts after that is obeyed). For `gave_up` nothing is waited for.
 
 ## The reserved offer id (`offer-id.json`)
 
@@ -194,4 +192,5 @@ week", "No need to speak to anyone, just book it"). OAIY additionally blocks tal
 3. `oaiy.ring.plan` before the request and `oaiy.ring.opened` after, a 1.5 s fallback to its own default when the
    desktop does not answer, targets limited to the plan, and the reserved offer id (with generations).
 4. `transfer_outcome` frames exactly as above, `stop` reasons starting `handoff:`, and the fresh session with `resume`.
-5. Optionally, `call.transfer.respond`, declared in its manifest, so the dialog's buttons act on its broker.
+5. `transfer_cancel` on the stream: withdraw the request and answer `transfer_outcome cancelled`, or say it is too late
+   when a device has already accepted.

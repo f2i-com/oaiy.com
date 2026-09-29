@@ -176,7 +176,15 @@ agent : "I'll try to reach them, please stay with me."  (it is trying: it does n
 - **Events for the app.** `call.started` carries `allowTransfer` and `takeMessages` (and `resume`),
   `hello` and `voice.features` carry what the owner allows, and `call.transfer`
   `{requestId, outcome, message?, source}` says how a request came out (`source` is `phone`,
-  `watchdog` when the desktop's clock ended it, or `desktop` when the owner answered in the dialog).
+  `watchdog` when the desktop's clock ended it, or `desktop` when the phone did not answer the withdrawal
+  the owner asked for in the dialog).
+- **Withdrawing a request.** The owner declining in the dialog, and this desktop giving up on a request
+  that ran out, send the phone `formlogic.realtime.transfer_cancel {requestId, reason}` on the call's own
+  stream (`owner_declined`, `message_instead`, `gave_up`). For a decline the phone's answer decides what
+  the caller hears, within two seconds: `cancelled` and the caller is offered a message; a notice that it
+  is too late (a device already took the call) and nothing is offered while the acceptance goes on; no
+  answer and the request is over here (a device that accepts later is obeyed). The dialog shows the ring
+  as stopping meanwhile.
 
 The spoken lines of a transfer are the agent's own (it holds the conversation and the voice). They are
 not said in the speak-only mode below: that mode, used on a live call's id, would detach the live call,

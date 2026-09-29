@@ -24,6 +24,12 @@ use std::time::{Duration, Instant};
 use serde_json::{json, Value};
 use tokio::sync::oneshot;
 
+/// The frame this desktop sends the phone to withdraw a request that rings (`{requestId, reason}`).
+pub const CANCEL_FRAME: &str = "formlogic.realtime.transfer_cancel";
+/// The frame the phone answers a withdrawal with when it cannot make it (`{requestId, notice}`).
+pub const NOTICE_FRAME: &str = "formlogic.realtime.transfer_notice";
+/// The notice: an owner device had already taken the call, so the request cannot be withdrawn.
+pub const TOO_LATE: &str = "too_late";
 /// The name of the feature in `ready.features`.
 pub const FEATURE: &str = "transfer_v1";
 /// The call tool.
@@ -47,6 +53,9 @@ pub const OFFER_AFTER: Duration = Duration::from_secs(8);
 pub const GIVE_UP_AFTER: Duration = Duration::from_secs(5);
 /// After the owner accepts, the takeover must have happened by this long (setup 45 s and its grace 10 s).
 pub const SETUP_LIMIT: Duration = Duration::from_secs(55);
+/// After this desktop asks the phone to withdraw a request (`transfer_cancel`), it waits this long for the phone's answer
+/// before it acts as if the request were withdrawn: an accept that races the owner's decline is resolved once, by the phone.
+pub const CANCEL_WAIT: Duration = Duration::from_secs(2);
 
 /// The clocks of a request to reach the owner. The constants above are what a call uses; a test sets faster ones.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -56,11 +65,33 @@ pub struct Timing {
     pub offer_after: Duration,
     pub give_up_after: Duration,
     pub setup_limit: Duration,
+    pub cancel_wait: Duration,
 }
 
 impl Default for Timing {
     fn default() -> Self {
-        Self { hold_after: HOLD_AFTER, hold_silence: HOLD_SILENCE, offer_after: OFFER_AFTER, give_up_after: GIVE_UP_AFTER, setup_limit: SETUP_LIMIT }
+        Self { hold_after: HOLD_AFTER, hold_silence: HOLD_SILENCE, offer_after: OFFER_AFTER, give_up_after: GIVE_UP_AFTER, setup_limit: SETUP_LIMIT, cancel_wait: CANCEL_WAIT }
+    }
+}
+
+/// Why this desktop asks the phone to withdraw a request (`formlogic.realtime.transfer_cancel`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum CancelReason {
+    /// The owner declined in the dialog.
+    OwnerDeclined,
+    /// The owner asked for the receptionist to take a message instead.
+    MessageInstead,
+    /// The request ran out and nothing was heard of how it came out.
+    GaveUp,
+}
+
+impl CancelReason {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            CancelReason::OwnerDeclined => "owner_declined",
+            CancelReason::MessageInstead => "message_instead",
+            CancelReason::GaveUp => "gave_up",
+        }
     }
 }
 
@@ -157,6 +188,8 @@ pub enum Due {
     GiveUp(String),
     /// The owner accepted and the takeover never came: the call is ours again (`unavailable`).
     SetupFailed(String),
+    /// The phone did not answer the request to withdraw `request` in time: it is over here, as if the owner had declined.
+    CancelUnanswered(String),
 }
 
 /// What to do about an outcome.
@@ -173,11 +206,20 @@ struct Ringing {
     give_up_at: Instant,
 }
 
+/// This desktop asked the phone to withdraw a request and is waiting for its answer.
+struct Cancelling {
+    request: String,
+    answer_by: Instant,
+}
+
 /// The state of one call's request to reach the owner, and the clocks that keep the caller from silence.
 #[derive(Default)]
 pub struct Transfer {
     timing: Timing,
     ringing: Option<Ringing>,
+    cancelling: Option<Cancelling>,
+    /// The request the phone was told this desktop gave up on.
+    gave_up_sent: Option<String>,
     accepted: Option<(String, Instant)>,
     hold_at: Option<Instant>,
     offer_at: Option<(Instant, &'static str)>,
@@ -210,6 +252,36 @@ impl Transfer {
         self.offer_at = None;
     }
 
+    /// This desktop asks the phone to withdraw `request` (the owner declined, or it ran out): whether the frame should be sent,
+    /// which it should be for the request that rings and only once. The phone's answer is waited for up to `cancel_wait`.
+    pub fn cancel(&mut self, request: &str, now: Instant) -> bool {
+        if self.ringing.as_ref().is_none_or(|r| r.request != request) || self.cancelling.as_ref().is_some_and(|c| c.request == request) {
+            return false;
+        }
+        self.cancelling = Some(Cancelling { request: request.to_string(), answer_by: now + self.timing.cancel_wait });
+        true
+    }
+
+    /// The phone is told, once, that this desktop gave up on `request`, which is the one that rings (`gave_up`: nothing is
+    /// waited for). Whether the frame should be sent.
+    pub fn gave_up(&mut self, request: &str) -> bool {
+        if self.ringing.as_ref().is_none_or(|r| r.request != request) || self.gave_up_sent.as_deref() == Some(request) {
+            return false;
+        }
+        self.gave_up_sent = Some(request.to_string());
+        true
+    }
+
+    /// The phone says it was too late to withdraw `request` (an owner device had already taken it): nothing is offered, the
+    /// acceptance is coming, and the ring goes on until it says. Whether this was the request being withdrawn.
+    pub fn too_late(&mut self, request: &str) -> bool {
+        let was = self.cancelling.as_ref().is_some_and(|c| c.request == request);
+        if was {
+            self.cancelling = None;
+        }
+        was
+    }
+
     /// The app said something (not a hold word): a silence is not what the caller is hearing.
     pub fn app_said(&mut self, now: Instant) {
         self.last_said = Some(now);
@@ -223,6 +295,8 @@ impl Transfer {
             return Vec::new();
         }
         self.hold_at = None;
+        // Whatever the phone said, it has now answered a request to withdraw this one.
+        let withdrawn = self.cancelling.take().is_some_and(|c| c.request == request);
         match outcome {
             Outcome::Accepted => {
                 if self.accepted.as_ref().is_some_and(|(a, _)| a == request) {
@@ -245,6 +319,15 @@ impl Transfer {
                 self.offer_at = Some((now + self.timing.offer_after, if after_accept { FAILED_LINE } else { OFFER_LINE }));
                 Vec::new()
             }
+            // The phone withdrew a request this desktop asked it to: the owner does not take the call, and the caller is offered a
+            // message like after any other outcome but an acceptance.
+            Outcome::Cancelled if withdrawn => {
+                self.ringing = None;
+                self.accepted = None;
+                self.handing_over = false;
+                self.offer_at = Some((now + self.timing.offer_after, OFFER_LINE));
+                Vec::new()
+            }
             Outcome::Cancelled => {
                 self.ringing = None;
                 self.accepted = None;
@@ -257,7 +340,7 @@ impl Transfer {
 
     /// The next moment [`Transfer::due`] has something to do.
     pub fn next_deadline(&self) -> Option<Instant> {
-        [self.ringing.as_ref().map(|r| r.give_up_at), self.hold_at, self.offer_at.map(|(at, _)| at), self.accepted.as_ref().map(|(_, at)| *at)].into_iter().flatten().min()
+        [self.ringing.as_ref().map(|r| r.give_up_at), self.hold_at, self.offer_at.map(|(at, _)| at), self.accepted.as_ref().map(|(_, at)| *at), self.cancelling.as_ref().map(|c| c.answer_by)].into_iter().flatten().min()
     }
 
     /// What the clocks ask for at `now`. Each thing is asked for once.
@@ -289,6 +372,11 @@ impl Transfer {
         if self.accepted.as_ref().is_some_and(|(_, at)| now >= *at) {
             let request = self.accepted.as_ref().map(|(r, _)| r.clone()).unwrap_or_default();
             due.push(Due::SetupFailed(request));
+        }
+        if self.cancelling.as_ref().is_some_and(|c| now >= c.answer_by) {
+            if let Some(c) = self.cancelling.take() {
+                due.push(Due::CancelUnanswered(c.request));
+            }
         }
         due
     }
@@ -498,6 +586,53 @@ mod tests {
         t.outcome("assist_1", Outcome::Unavailable, at(20));
         assert!(t.may_speak() && !t.busy());
         assert!(t.due(at(20) + OFFER_AFTER).contains(&Due::Say(FAILED_LINE)));
+    }
+
+    #[test]
+    fn a_request_to_withdraw_waits_two_seconds_for_the_phone_and_a_phones_cancel_offers_the_message() {
+        let mut t = Transfer::default();
+        t.ringing("assist_1", 40, at(0));
+        assert!(!t.cancel("assist_9", at(3)), "only the request that rings can be withdrawn");
+        assert!(t.cancel("assist_1", at(3)), "the frame is sent");
+        assert!(!t.cancel("assist_1", at(4)), "once");
+        assert!(t.busy(), "it rings until the phone says");
+        assert_eq!(t.next_deadline(), Some(at(3) + CANCEL_WAIT).min(t.ringing.as_ref().map(|r| r.give_up_at)).min(t.hold_at));
+        // The phone answers in time: cancelled, and the caller is offered a message.
+        assert!(line(&t.outcome("assist_1", Outcome::Cancelled, at(4))).is_empty());
+        assert!(t.may_speak() && !t.busy());
+        assert_eq!(t.due(at(4) + OFFER_AFTER), vec![Due::Say(OFFER_LINE)]);
+        // The phone does not answer: it is over here after the wait, once.
+        let mut t = Transfer::default();
+        t.ringing("assist_1", 40, at(0));
+        t.cancel("assist_1", at(3));
+        assert!(!t.due(at(3) + CANCEL_WAIT - Duration::from_millis(1)).iter().any(|d| matches!(d, Due::CancelUnanswered(_))));
+        assert_eq!(t.due(at(3) + CANCEL_WAIT).into_iter().filter(|d| matches!(d, Due::CancelUnanswered(_))).collect::<Vec<_>>(), vec![Due::CancelUnanswered("assist_1".into())]);
+        assert!(!t.due(at(20)).iter().any(|d| matches!(d, Due::CancelUnanswered(_))), "once");
+    }
+
+    #[test]
+    fn too_late_means_the_owner_has_it_so_nothing_is_offered_and_the_acceptance_goes_on() {
+        let mut t = Transfer::default();
+        t.ringing("assist_1", 40, at(0));
+        t.cancel("assist_1", at(3));
+        assert!(!t.too_late("assist_9"));
+        assert!(t.too_late("assist_1"));
+        assert!(t.busy(), "still ringing: the acceptance is on its way");
+        let later = t.due(at(3) + CANCEL_WAIT + Duration::from_secs(1));
+        assert!(!later.iter().any(|d| matches!(d, Due::CancelUnanswered(_))) && !later.contains(&Due::Say(OFFER_LINE)), "no message offered, no timeout: {later:?}");
+        assert_eq!(t.outcome("assist_1", Outcome::Accepted, at(5)), vec![Effect::Cut, Effect::Say(CONNECTING_LINE)]);
+        assert!(!t.may_speak());
+        // An acceptance that arrives while the withdrawal is waited for is the answer to it.
+        let mut t = Transfer::default();
+        t.ringing("assist_1", 40, at(0));
+        t.cancel("assist_1", at(3));
+        assert_eq!(t.outcome("assist_1", Outcome::Accepted, at(4)), vec![Effect::Cut, Effect::Say(CONNECTING_LINE)]);
+        assert!(!t.due(at(4) + CANCEL_WAIT).iter().any(|d| matches!(d, Due::CancelUnanswered(_))), "not still waiting");
+    }
+
+    #[test]
+    fn the_reasons_for_withdrawing_a_request_are_named_as_the_wire_names_them() {
+        assert_eq!([CancelReason::OwnerDeclined, CancelReason::MessageInstead, CancelReason::GaveUp].map(CancelReason::as_str), ["owner_declined", "message_instead", "gave_up"]);
     }
 
     #[test]

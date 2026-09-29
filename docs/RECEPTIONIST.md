@@ -94,8 +94,9 @@ Whether the receptionist may try to reach you for a caller who asks for a person
 switches are **off** until you turn them on, and with them off the phone answers exactly as before:
 
 - **Transfer calls to me.** When a caller asks for you, the receptionist says it will *try* to
-  reach you, and this computer rings: a notification, and a dialog with the caller's name and
-  number and what they said. The call is taken on your **Companion** (the Companion on this
+  reach you, and this computer tells you: a notification, and a dialog with the caller's name and
+  number and what they said, which can only decline and have the receptionist take a message (or
+  be put away with **Not now**: your devices go on ringing). The call is taken on your **Companion** (the Companion on this
   computer, or one on a second phone: the phone that carries the calls cannot be the one), which
   needs the Companion's consent for taking calls (the Phone page). Until you take it the caller
   is never told they are being put through; once you have, they hear "Connecting you now" and the
@@ -118,7 +119,7 @@ What happens, every way it can go:
 | The owner... | The caller hears |
 |---|---|
 | accepts on the Companion | "Connecting you now, one moment." then you. If it cannot be connected, "I'm sorry, I couldn't connect you. Would you like to leave a message?" |
-| declines (on the Companion or here) | the receptionist, kindly: they cannot come to the phone, and an offer to take a message. If you left words for the caller they are relayed faithfully, with no promise added |
+| declines (on the Companion, or **Decline and take a message** here: the phone is asked to withdraw the request and answers within two seconds) | the receptionist, kindly: they cannot come to the phone, and an offer to take a message. If you left words for the caller they are relayed faithfully, with no promise added. If a device of yours took the call just before, the phone says so and nothing is offered |
 | does not answer in time | the same offer of a message |
 | is not to be rung (quiet hours, nobody at the computer and no phone to ring, every phone on do-not-disturb, no Companion set up to take a call, no consent) | the same offer, and nothing rings |
 | asked again too soon or too often | the same offer; nothing rings |
@@ -151,8 +152,8 @@ not use) before anybody rang, so a refusal that rang nobody does not start the 6
 
 **What is not built yet:** push notifications (a phone rings while its Companion is connected, not
 by waking a closed app), showing your screens on a phone, returning the call's audio to the handset
-that carries it, and answering from OAIY itself (the dialog asks the Companion to take the call: it
-cannot carry the audio). See [Phone calls](CALLS.md) for how a transfer works on the line, and
+that carries it, and answering from OAIY itself (this computer cannot carry the audio, so the
+dialog has no Accept: you answer on a Companion). See [Phone calls](CALLS.md) for how a transfer works on the line, and
 `contracts/transfer/` for the contract with the phone plugin.
 
 ## In the Agent: the Front desk

@@ -105,12 +105,9 @@ impl crate::ring::CallSource for HubCalls {
         }
     }
 
-    fn local_outcome(&self, call: &str, request: &str, outcome: transfer::Outcome) {
-        if let Some(inner) = self.0.upgrade() {
-            if let Some(tx) = (VoiceHub { inner }).command(call) {
-                let _ = tx.send(CallCommand::Outcome { request: request.to_string(), outcome, source: "desktop" });
-            }
-        }
+    fn cancel_transfer(&self, call: &str, request: &str, reason: transfer::CancelReason) -> bool {
+        let Some(inner) = self.0.upgrade() else { return false };
+        (VoiceHub { inner }).command(call).is_some_and(|tx| tx.send(CallCommand::CancelTransfer { request: request.to_string(), reason }).is_ok())
     }
 }
 

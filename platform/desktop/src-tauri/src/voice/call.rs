@@ -74,7 +74,11 @@ pub enum CallCommand {
     Finish { goodbye: String, reply: oneshot::Sender<Result<Value, String>> },
     /// Stop speaking: what plays is cut, what is queued is dropped.
     Hush,
-    /// The owner answered a ring in the dashboard's dialog (a decline): as if the phone had said so.
+    /// The owner declined a ring in the dashboard's dialog (or it ran out here): the phone is asked to withdraw the request
+    /// (`formlogic.realtime.transfer_cancel`), and its answer decides what the caller hears; if it does not answer in a couple of
+    /// seconds the request is over here.
+    CancelTransfer { request: String, reason: transfer::CancelReason },
+    /// A request to reach the owner came out (from a clock or the ring's own end): as if the phone had said so.
     Outcome { request: String, outcome: Outcome, source: &'static str },
 }
 
@@ -1042,6 +1046,13 @@ where
                                     outcomes.push((request, outcome, words, "phone"));
                                 }
                             }
+                            // The phone answers a request to withdraw one: too late, an owner device had already taken it.
+                            transfer::NOTICE_FRAME if allow_transfer => {
+                                let request = v.get("requestId").and_then(Value::as_str).unwrap_or("");
+                                if v.get("notice").and_then(Value::as_str) == Some(transfer::TOO_LATE) && transfer.too_late(request) {
+                                    ring.cancel_refused(request);
+                                }
+                            }
                             "formlogic.realtime.stop" => break v.get("reason").and_then(Value::as_str).unwrap_or("stopped").to_string(),
                             _ => {}
                         }
@@ -1174,6 +1185,18 @@ where
                         cut();
                     }
                     CallCommand::Outcome { request, outcome, source } => outcomes.push((request, outcome, None, source)),
+                    CallCommand::CancelTransfer { request, reason } => {
+                        // Only for the request that rings, and once. The owner declining asks and waits for the phone's answer; this
+                        // desktop giving up only tells the phone, and nothing waits.
+                        let send = allow_transfer
+                            && match reason {
+                                transfer::CancelReason::GaveUp => transfer.gave_up(&request),
+                                _ => transfer.cancel(&request, Instant::now()),
+                            };
+                        if send {
+                            let _ = out_tx.send(ids.event(transfer::CANCEL_FRAME, json!({"requestId": request, "reason": reason.as_str()}))).await;
+                        }
+                    }
                     CallCommand::Tool { name, arguments, reply } => {
                         match name.as_str() {
                             "request_appointment" | "lookup_business_data" => {
@@ -1293,9 +1316,17 @@ where
                         Due::Say(line) => {
                             speak(line.to_string(), false, None);
                         }
-                        // Nothing was heard of how it came out: it is over, as if the phone had said so.
-                        Due::GiveUp(request) => outcomes.push((request, Outcome::Expired, None, "watchdog")),
+                        // Nothing was heard of how it came out: it is over, as if the phone had said so, and the phone is asked to
+                        // drop the request it may still hold (best effort: nothing waits for the answer).
+                        Due::GiveUp(request) => {
+                            if transfer.gave_up(&request) {
+                                let _ = out_tx.send(ids.event(transfer::CANCEL_FRAME, json!({"requestId": request, "reason": transfer::CancelReason::GaveUp.as_str()}))).await;
+                            }
+                            outcomes.push((request, Outcome::Expired, None, "watchdog"));
+                        }
                         Due::SetupFailed(request) => outcomes.push((request, Outcome::Unavailable, None, "watchdog")),
+                        // The phone did not answer the request to withdraw this one: it is over here, as if the owner had declined.
+                        Due::CancelUnanswered(request) => outcomes.push((request, Outcome::Declined, None, "desktop")),
                     }
                 }
             }
@@ -2442,7 +2473,7 @@ mod tests {
 
     /// The clocks of a ring, fast enough for a test.
     fn quick() -> transfer::Timing {
-        transfer::Timing { hold_after: Duration::from_millis(300), hold_silence: Duration::from_millis(300), offer_after: Duration::from_millis(300), give_up_after: Duration::from_millis(200), setup_limit: Duration::from_millis(600) }
+        transfer::Timing { hold_after: Duration::from_millis(300), hold_silence: Duration::from_millis(300), offer_after: Duration::from_millis(300), give_up_after: Duration::from_millis(200), setup_limit: Duration::from_millis(600), cancel_wait: Duration::from_millis(500) }
     }
 
     fn owner_settings(enabled: bool) -> crate::ring::RingSettings {

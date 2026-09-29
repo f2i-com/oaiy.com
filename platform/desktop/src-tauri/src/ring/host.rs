@@ -64,8 +64,10 @@ pub trait CallSource: Send + Sync {
     fn facts(&self, call: &str) -> Option<CallInfo>;
     /// The phone says the call ended (the plugin's own event): the hub ends one that was handed to the owner.
     fn call_ended_by_phone(&self, call: &str);
-    /// The owner answered a ring in the dialog (a decline): the call is told, as it is told what the phone says.
-    fn local_outcome(&self, call: &str, request: &str, outcome: crate::voice::transfer::Outcome);
+    /// The phone is asked to withdraw `request` on `call` (the owner declined in the dialog, or it ran out): the call sends
+    /// `transfer_cancel` on its stream, waits for the phone's answer and acts on it. Whether the call has a live session to
+    /// carry it; if not, nothing can be told and the ring is over here.
+    fn cancel_transfer(&self, call: &str, request: &str, reason: crate::voice::transfer::CancelReason) -> bool;
 }
 
 struct Absent;
@@ -140,7 +142,6 @@ pub struct Ring {
     /// The rings going now, and the last ones that ended (see `session.rs`).
     pub(super) sessions: Mutex<super::session::Sessions>,
     notifier: RwLock<Option<Arc<dyn super::session::RingNotifier>>>,
-    plugin: RwLock<Option<Arc<dyn super::session::TransferPlugin>>>,
     /// How long past its time a ring waits to hear how it came out before it is over.
     pub(super) expiry_grace: RwLock<Duration>,
 }
@@ -166,7 +167,6 @@ impl Ring {
             on_features: RwLock::new(None),
             sessions: Mutex::new(super::session::Sessions::default()),
             notifier: RwLock::new(None),
-            plugin: RwLock::new(None),
             expiry_grace: RwLock::new(super::session::EXPIRY_GRACE),
         })
     }
@@ -181,20 +181,9 @@ impl Ring {
         get(&self.notifier).or_else(super::session::global_notifier)
     }
 
-    /// What asks the phone plugin to accept or decline a request on the owner's behalf.
-    pub fn set_plugin(&self, plugin: Arc<dyn super::session::TransferPlugin>) {
-        put(&self.plugin, Some(plugin));
-    }
-
-    pub(super) fn plugin(&self) -> Option<Arc<dyn super::session::TransferPlugin>> {
-        get(&self.plugin)
-    }
-
-    /// Tell the hub what the owner did in the dialog.
-    pub(super) fn local_outcome(&self, call: &str, request: &str, outcome: crate::voice::transfer::Outcome) {
-        if let Some(calls) = get(&self.calls) {
-            calls.local_outcome(call, request, outcome);
-        }
+    /// Ask the phone, through the call, to withdraw `request` (see [`CallSource::cancel_transfer`]). Whether the call could carry it.
+    pub fn cancel_on_call(&self, call: &str, request: &str, reason: crate::voice::transfer::CancelReason) -> bool {
+        get(&self.calls).is_some_and(|calls| calls.cancel_transfer(call, request, reason))
     }
 
     /// How long a ring waits past its time to hear how it came out (a test shortens it).

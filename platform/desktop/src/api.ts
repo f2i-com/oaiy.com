@@ -1703,8 +1703,8 @@ export interface RingFeatures {
   messages: boolean;
 }
 
-/** What the owner may do with a ring going now. */
-export type RingAction = 'accept' | 'decline' | 'message';
+/** What the owner may do with a ring going now: decline it and have the receptionist take a message. (Taking the call is the Companion's.) */
+export type RingAction = 'decline' | 'message';
 
 /** One caller the receptionist is trying to reach the owner for. */
 export interface ActiveRing {
@@ -1722,8 +1722,8 @@ export interface ActiveRing {
   now: number;
   /** Who else is rung: a phone or Companion (their names), or nobody but this computer. */
   devices: string[];
-  /** This computer can hand the call to the Companion (the plugin accepts on its behalf). */
-  canAccept: boolean;
+  /** The owner declined and the phone is being asked to withdraw the request: the dialog waits for its answer. */
+  stopping: boolean;
   /** The last thing the owner asked of it here, and what came of it. */
   note: string;
 }
@@ -1751,7 +1751,7 @@ export const ring = {
   },
   /** The owner has read a notice. */
   dismissNotice: (id: string) => request<{ ok: boolean }>(`/api/ring/notices/${encodeURIComponent(id)}/dismiss`, { method: 'POST' }),
-  /** Answer one: `accept` asks the plugin to take it on the Companion, `decline` and `message` send the caller to the receptionist's message offer. */
+  /** Decline one: the phone is asked to withdraw the request, and the caller is offered a message. */
   respond: (id: string, action: RingAction) =>
     request<{ ok: boolean; note: string }>(`/api/ring/active/${encodeURIComponent(id)}/respond`, { method: 'POST', body: JSON.stringify({ action }) }),
 };

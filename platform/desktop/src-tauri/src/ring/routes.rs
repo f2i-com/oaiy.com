@@ -55,12 +55,12 @@ struct Respond {
     action: String,
 }
 
-/// `POST /api/ring/active/:id/respond {action}` (`accept`, `decline` or `message`) → `{ok, note}`. Accept asks the
-/// phone plugin to take the call on the owner's behalf, and the ring goes on; decline and message end the ring here
-/// at once and send the caller to the message offer. A ring that is over is a 404 `no_ring` (or 409 `ring_over`).
+/// `POST /api/ring/active/:id/respond {action}` (`decline` or `message`) → `{ok, note}`: the phone is asked, on the call's
+/// own stream, to withdraw the request (`transfer_cancel`), and its answer decides what the caller hears. The ring shows
+/// as stopping until then. Taking the call is the Companion's: there is no accept. A ring that is over is a 404 `no_ring`.
 async fn respond(State(ring): State<Arc<Ring>>, Path(id): Path<String>, Json(body): Json<Respond>) -> Response {
     let Some(action) = super::session::Action::parse(&body.action) else {
-        return (StatusCode::BAD_REQUEST, Json(json!({"error": {"code": "bad_action", "message": "the action is accept, decline or message"}}))).into_response();
+        return (StatusCode::BAD_REQUEST, Json(json!({"error": {"code": "bad_action", "message": "the action is decline or message"}}))).into_response();
     };
     match ring.respond(&id, action) {
         Ok(r) => Json(json!({"ok": r.ok, "note": r.note})).into_response(),

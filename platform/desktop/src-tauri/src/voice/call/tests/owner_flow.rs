@@ -7,8 +7,7 @@
 use super::*;
 use crate::messages::{MessageNotifier, Store};
 use crate::plugins::PluginHost;
-use crate::ring::contract::RespondAction;
-use crate::ring::{ActiveRing, Ring, RingNotifier, RingSettings, TransferPlugin};
+use crate::ring::{ActiveRing, Ring, RingNotifier, RingSettings};
 
 const ASKED: &str = "Can I speak to the owner?";
 const RANG_FROM: &str = "+61491570006";
@@ -44,35 +43,9 @@ impl MessageNotifier for Told {
     }
 }
 
-/// The phone plugin, as the owner's dialog asks it things: it keeps what it was asked, and a device on the
-/// owner's phone (or on this computer) that takes the call says so, on the call's stream and by the plugin's own event.
-struct Companion {
-    asked: Mutex<Vec<(String, RespondAction)>>,
-    /// What happens when the owner accepts: nothing (the phone plugin was asked, and nobody took it), or a device took it.
-    takes: Mutex<Option<Box<dyn Fn(&str) + Send + Sync>>>,
-    /// The plugin cannot be asked at all.
-    cannot: Mutex<Option<String>>,
-}
-
-impl TransferPlugin for Companion {
-    fn respond(&self, request: &str, action: RespondAction) -> Result<(), String> {
-        self.asked.lock().unwrap().push((request.to_string(), action));
-        if let Some(why) = self.cannot.lock().unwrap().clone() {
-            return Err(why);
-        }
-        if action == RespondAction::Accept {
-            if let Some(takes) = self.takes.lock().unwrap().as_ref() {
-                takes(request);
-            }
-        }
-        Ok(())
-    }
-}
-
 struct Flow {
     aokie: Aokie,
     ring: Arc<Ring>,
-    companion: Arc<Companion>,
     bell: Arc<Bell>,
     told: Arc<Told>,
     /// Where the dialog's routes are.
@@ -115,10 +88,8 @@ async fn flow_on(settings: RingSettings, clock: Option<chrono::DateTime<chrono::
     let mut aokie = Aokie::start_with(json!({"from": RANG_FROM, "callerName": "Alex", "allowTransfer": true}), setup).await;
     aokie.begin(json!({}));
     aokie.event("call.started", secs(3)).await.expect("the call started");
-    let companion = Arc::new(Companion { asked: Mutex::default(), takes: Mutex::default(), cannot: Mutex::default() });
-    ring.set_plugin(companion.clone());
     let base = serve(ring.clone()).await;
-    Flow { aokie, ring, companion, bell, told, base }
+    Flow { aokie, ring, bell, told, base }
 }
 
 async fn flow(settings: RingSettings) -> Flow {
@@ -126,18 +97,19 @@ async fn flow(settings: RingSettings) -> Flow {
 }
 
 impl Flow {
-    /// A device on the owner's phone takes the call when the owner says so in the dialog.
-    fn a_device_takes_the_call(&self) {
-        let (to, call, ring) = (self.aokie.to_desktop.clone(), self.aokie.call.clone(), self.ring.clone());
-        *self.companion.takes.lock().unwrap() = Some(Box::new(move |request: &str| {
-            let (to, call, ring, request) = (to.clone(), call.clone(), ring.clone(), request.to_string());
-            std::thread::spawn(move || {
-                std::thread::sleep(Duration::from_millis(50));
-                let frame = json!({"type": "formlogic.realtime.transfer_outcome", "callId": call, "generation": 1, "requestId": request, "outcome": "accepted", "atMs": 4_000});
-                let _ = to.send(Message::Text(frame.to_string()));
-                crate::ring::apply_plugin_event(&ring, "aokie.call.assistance.resolved", &json!({"requestId": request, "callId": call, "outcome": "transferred"}), "");
-            });
-        }));
+    /// The owner answers on their Companion: a device takes the call, and says so, on the call's stream and by the
+    /// plugin's own event (as the phone plugin does when its compare-and-swap is won).
+    fn a_device_takes_the_call(&self, request: &str) {
+        let frame = json!({"type": "formlogic.realtime.transfer_outcome", "callId": self.aokie.call, "generation": 1, "requestId": request, "outcome": "accepted", "atMs": 4_000});
+        self.aokie.send(frame);
+        crate::ring::apply_plugin_event(&self.ring, "aokie.call.assistance.resolved", &json!({"requestId": request, "callId": self.aokie.call, "outcome": "transferred"}), "");
+    }
+
+    /// The phone gets the desktop's request to withdraw `request`: the frame, checked (with why).
+    async fn phone_is_asked_to_withdraw(&mut self, request: &str, why: &str) -> Value {
+        let frame = self.aokie.text(transfer::CANCEL_FRAME, secs(3)).await.expect("the phone was asked to withdraw the request");
+        assert_eq!((frame["requestId"].clone(), frame["reason"].clone(), frame["callId"].clone()), (json!(request), json!(why), json!(self.aokie.call)), "{frame}");
+        frame
     }
 
     fn caller_says(&self, words: &str) {
@@ -192,27 +164,26 @@ impl Flow {
 }
 
 #[tokio::test]
-async fn the_owner_accepts_in_the_dialog_and_the_receptionist_stops_speaking() {
+async fn the_owner_takes_the_call_on_their_companion_and_the_receptionist_stops_speaking() {
     let mut f = flow(owner_settings(true)).await;
-    f.a_device_takes_the_call();
     f.caller_says(ASKED);
     f.ring_through("assist_1", 30).await;
 
-    // The dialog shows who is calling, what they said, and that the phone can be asked. The owner was told once.
+    // The dialog shows who is calling and what they said, and offers to decline: nothing to accept on this computer.
     let rings = f.dialog().await;
     assert_eq!(rings.len(), 1);
-    assert_eq!((rings[0]["id"].as_str(), rings[0]["callerName"].as_str(), rings[0]["callerNumber"].as_str(), rings[0]["canAccept"].as_bool()), (Some("assist_1"), Some("Alex"), Some(RANG_FROM), Some(true)), "{}", rings[0]);
+    assert_eq!((rings[0]["id"].as_str(), rings[0]["callerName"].as_str(), rings[0]["callerNumber"].as_str(), rings[0]["stopping"].as_bool()), (Some("assist_1"), Some("Alex"), Some(RANG_FROM), Some(false)), "{}", rings[0]);
+    assert!(rings[0].get("canAccept").is_none());
     assert!(rings[0]["said"].as_array().unwrap().iter().any(|s| s == ASKED));
     assert_eq!(f.bell.rang.lock().unwrap().as_slice(), ["assist_1".to_string()]);
+    assert_eq!(f.owner_answers("assist_1", "accept").await.0, 400, "this computer cannot take the call");
     // While it rings the caller has heard nothing that promises anything.
     assert!(!f.aokie.speech.spoken().iter().any(|l| l == transfer::CONNECTING_LINE));
 
-    // The owner accepts: the phone plugin is asked, once, and a device takes the call.
-    let (status, said) = f.owner_answers("assist_1", "accept").await;
-    assert_eq!((status, said["ok"].clone()), (200, json!(true)), "{said}");
+    // The owner answers on their Companion: a device takes it.
+    f.a_device_takes_the_call("assist_1");
     let told = f.aokie.event("call.transfer", secs(3)).await.expect("the app is told the owner has it");
     assert_eq!((told["requestId"].clone(), told["outcome"].clone(), told["source"].clone()), (json!("assist_1"), json!("accepted"), json!("phone")));
-    assert_eq!(f.companion.asked.lock().unwrap().as_slice(), [("assist_1".to_string(), RespondAction::Accept)]);
 
     // Only now is the caller told they are being connected, and the receptionist says nothing more.
     assert!(spoken_within(&f.aokie, transfer::CONNECTING_LINE, secs(3)).await, "{:?}", f.aokie.speech.spoken());
@@ -222,25 +193,18 @@ async fn the_owner_accepts_in_the_dialog_and_the_receptionist_stops_speaking() {
     assert!(!f.aokie.speech.spoken().iter().any(|l| l == "They are on their way."));
 
     // The dialog closed, the notification with it, and the record says who answered.
-    for _ in 0..40 {
-        if f.dialog().await.is_empty() {
-            break;
-        }
-        tokio::time::sleep(Duration::from_millis(50)).await;
-    }
     assert!(f.dialog().await.is_empty());
     assert_eq!(f.ended(), vec![("assist_1".to_string(), "accepted", "phone")]);
     assert_eq!(f.bell.ended.lock().unwrap().as_slice(), [("assist_1".to_string(), "accepted".to_string())]);
-    // A decline that arrives after it (a second device, the owner's late click) changes nothing.
-    let late = f.owner_answers("assist_1", "decline").await;
-    assert_eq!(late.0, 404);
-    assert_eq!(f.companion.asked.lock().unwrap().len(), 1, "the plugin was told once");
+    // A decline that arrives after it (a second device, the owner's late click) changes nothing and asks the phone nothing.
+    assert_eq!(f.owner_answers("assist_1", "decline").await.0, 404);
+    assert!(f.aokie.text(transfer::CANCEL_FRAME, Duration::from_millis(300)).await.is_none(), "the phone was not asked to withdraw a call an owner device took");
     assert!(f.kept().is_empty(), "no message was taken from a caller who was put through");
 }
 
 #[tokio::test]
-async fn the_owner_declines_or_asks_for_a_message_and_the_caller_is_offered_one_that_is_kept() {
-    for action in ["decline", "message"] {
+async fn the_owner_declines_or_asks_for_a_message_and_the_phone_withdraws_the_request_and_the_caller_is_offered_one_that_is_kept() {
+    for (action, why) in [("decline", "owner_declined"), ("message", "message_instead")] {
         let mut f = flow(owner_settings(true)).await;
         f.caller_says(ASKED);
         f.ring_through("assist_1", 30).await;
@@ -248,14 +212,20 @@ async fn the_owner_declines_or_asks_for_a_message_and_the_caller_is_offered_one_
 
         let (status, said) = f.owner_answers("assist_1", action).await;
         assert_eq!((status, said["ok"].clone()), (200, json!(true)), "{action}: {said}");
-        // The ring is gone at once, the plugin was asked to withdraw the request, and the app is told the owner declined.
-        assert!(f.dialog().await.is_empty(), "{action}");
-        assert_eq!(f.companion.asked.lock().unwrap().as_slice(), [("assist_1".to_string(), RespondAction::Decline)], "{action}");
+        // The phone is asked, on the call's stream, to withdraw the request; the dialog shows it stopping until the phone answers.
+        f.phone_is_asked_to_withdraw("assist_1", why).await;
+        let shown = f.dialog().await;
+        assert_eq!((shown.len(), shown[0]["stopping"].clone()), (1, json!(true)), "{action}");
+        assert!(f.aokie.event("call.transfer", Duration::from_millis(100)).await.is_none(), "{action}: nothing is decided until the phone answers");
+        assert!(!f.aokie.speech.spoken().iter().any(|l| l == transfer::OFFER_LINE), "{action}: and no message is offered yet");
+        // The phone answers that it withdrew it.
+        f.aokie.send(outcome(&f.aokie, "assist_1", "cancelled", None));
         let told = f.aokie.event("call.transfer", secs(3)).await.expect("the app is told");
-        assert_eq!((told["outcome"].clone(), told["source"].clone()), (json!("declined"), json!("desktop")), "{action}");
+        assert_eq!((told["outcome"].clone(), told["source"].clone()), (json!("cancelled"), json!("phone")), "{action}");
         // The caller is offered a message (by the desktop when the app does not say it first) and never promised a transfer.
         assert!(spoken_within(&f.aokie, transfer::OFFER_LINE, secs(3)).await, "{action}: {:?}", f.aokie.speech.spoken());
         assert!(!f.aokie.speech.spoken().iter().any(|l| l == transfer::CONNECTING_LINE), "{action}");
+        assert!(f.dialog().await.is_empty(), "{action}");
         assert!(f.aokie.say("Anything else?").await.is_ok(), "{action}: the receptionist carries on");
 
         // The caller leaves a message: kept, with the number this desktop saw and not one the model gave.
@@ -265,25 +235,59 @@ async fn the_owner_declines_or_asks_for_a_message_and_the_caller_is_offered_one_
         assert_eq!(kept.len(), 1, "{action}");
         assert_eq!((kept[0].from.as_str(), kept[0].name.as_str(), kept[0].message.as_str(), kept[0].call_id.as_str()), (RANG_FROM, "Alex", "Please ring back about Tuesday.", f.aokie.call.as_str()), "{action}");
         assert_eq!(f.told.0.lock().unwrap().len(), 1, "{action}: the owner was told of it");
-        assert_eq!(f.ended(), vec![("assist_1".to_string(), "declined", "desktop")], "{action}");
+        assert_eq!(f.ended(), vec![("assist_1".to_string(), "cancelled", "phone")], "{action}");
     }
 }
 
 #[tokio::test]
-async fn a_device_that_takes_the_call_after_the_owner_declined_here_is_obeyed() {
+async fn a_decline_that_races_an_accept_is_decided_once_by_the_phone_too_late_offers_no_message() {
+    let mut f = flow(owner_settings(true)).await;
+    f.caller_says(ASKED);
+    f.ring_through("assist_1", 30).await;
+    assert_eq!(f.owner_answers("assist_1", "message").await.0, 200);
+    f.phone_is_asked_to_withdraw("assist_1", "message_instead").await;
+    // An owner device had taken it a moment before: the phone says it is too late.
+    f.aokie.send(json!({"type": transfer::NOTICE_FRAME, "callId": f.aokie.call, "generation": 1, "requestId": "assist_1", "notice": "too_late"}));
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    let shown = f.dialog().await;
+    assert_eq!(shown.len(), 1, "the ring is not over: the acceptance is coming");
+    assert!(shown[0]["stopping"] == json!(false) && shown[0]["note"].as_str().unwrap().contains("took the call just before you declined"), "{}", shown[0]);
+    // Nothing is offered while the phone's acceptance comes, however long the wait would have been.
+    tokio::time::sleep(Duration::from_millis(800)).await;
+    assert!(!f.aokie.speech.spoken().iter().any(|l| l == transfer::OFFER_LINE), "{:?}", f.aokie.speech.spoken());
+    assert!(f.aokie.event("call.transfer", Duration::from_millis(100)).await.is_none(), "the app is told nothing was decided");
+    // Then the acceptance: the call goes to the owner, and the receptionist is quiet.
+    f.a_device_takes_the_call("assist_1");
+    let told = f.aokie.event("call.transfer", secs(3)).await.expect("the takeover is told");
+    assert_eq!((told["outcome"].clone(), told["source"].clone()), (json!("accepted"), json!("phone")));
+    assert!(spoken_within(&f.aokie, transfer::CONNECTING_LINE, secs(3)).await, "{:?}", f.aokie.speech.spoken());
+    assert!(!f.aokie.speech.spoken().iter().any(|l| l == transfer::OFFER_LINE));
+    let (reply, answer) = oneshot::channel();
+    f.aokie.hub.command(&f.aokie.call).unwrap().send(CallCommand::Say { text: "Sorry about that.".into(), hold: false, reply }).unwrap();
+    assert!(answer.await.unwrap().unwrap_err().contains("handed over"), "the receptionist is quiet once the owner has it");
+    assert_eq!(f.ended(), vec![("assist_1".to_string(), "accepted", "phone")]);
+}
+
+#[tokio::test]
+async fn a_phone_that_does_not_answer_the_withdrawal_leaves_it_over_here_after_two_seconds_and_a_late_acceptance_is_obeyed() {
     let mut f = flow(owner_settings(true)).await;
     f.caller_says(ASKED);
     f.ring_through("assist_1", 30).await;
     assert_eq!(f.owner_answers("assist_1", "decline").await.0, 200);
-    f.aokie.event("call.transfer", secs(3)).await.expect("declined");
-    // The plugin had already handed the request to the owner's phone, and the owner answers there.
+    f.phone_is_asked_to_withdraw("assist_1", "owner_declined").await;
+    // The phone says nothing (the test clocks wait half a second, the real ones two): it is over here, as if declined.
+    let told = f.aokie.event("call.transfer", secs(3)).await.expect("the desktop ends it itself");
+    assert_eq!((told["outcome"].clone(), told["source"].clone()), (json!("declined"), json!("desktop")));
+    assert!(spoken_within(&f.aokie, transfer::OFFER_LINE, secs(3)).await, "{:?}", f.aokie.speech.spoken());
+    assert!(f.dialog().await.is_empty());
+    assert_eq!(f.ended(), vec![("assist_1".to_string(), "declined", "desktop")]);
+    // The owner's device takes it after all: the takeover is obeyed.
     f.aokie.send(outcome(&f.aokie, "assist_1", "accepted", None));
     let told = f.aokie.event("call.transfer", secs(3)).await.expect("the takeover is told");
     assert_eq!((told["outcome"].clone(), told["source"].clone()), (json!("accepted"), json!("phone")));
-    assert!(spoken_within(&f.aokie, transfer::CONNECTING_LINE, secs(3)).await, "{:?}", f.aokie.speech.spoken());
     let (reply, answer) = oneshot::channel();
-    f.aokie.hub.command(&f.aokie.call).unwrap().send(CallCommand::Say { text: "Sorry about that.".into(), hold: false, reply }).unwrap();
-    assert!(answer.await.unwrap().unwrap_err().contains("handed over"), "the receptionist is quiet once the owner has it");
+    f.aokie.hub.command(&f.aokie.call).unwrap().send(CallCommand::Say { text: "Anything else?".into(), hold: false, reply }).unwrap();
+    assert!(answer.await.unwrap().unwrap_err().contains("handed over"));
 }
 
 #[tokio::test]
@@ -295,6 +299,9 @@ async fn nobody_answers_and_the_caller_is_offered_a_message_that_is_kept() {
     assert!(spoken_within(&f.aokie, transfer::HOLD_LINE, secs(2)).await, "the caller is not left in silence while it rings: {:?}", f.aokie.speech.spoken());
     let told = f.aokie.event("call.transfer", secs(6)).await.expect("the desktop ends the ring itself");
     assert_eq!((told["outcome"].clone(), told["source"].clone()), (json!("expired"), json!("watchdog")));
+    // The phone is told this desktop gave up, once, and nothing waits for its answer.
+    f.phone_is_asked_to_withdraw("assist_1", "gave_up").await;
+    assert!(f.aokie.text(transfer::CANCEL_FRAME, Duration::from_millis(400)).await.is_none(), "told once");
     assert!(spoken_within(&f.aokie, transfer::OFFER_LINE, secs(3)).await, "{:?}", f.aokie.speech.spoken());
     // The dialog does not go on ringing for a call nobody is going to take.
     for _ in 0..60 {
@@ -305,30 +312,12 @@ async fn nobody_answers_and_the_caller_is_offered_a_message_that_is_kept() {
     }
     assert!(f.dialog().await.is_empty());
     assert_eq!(f.ended(), vec![("assist_1".to_string(), "expired", "timer")]);
-    // A late acceptance from a phone that was slow finds nothing to answer.
-    assert_eq!(f.owner_answers("assist_1", "accept").await.0, 404);
-    assert!(f.companion.asked.lock().unwrap().is_empty());
+    // A decline that arrives after it finds nothing to answer.
+    assert_eq!(f.owner_answers("assist_1", "decline").await.0, 404);
     let taken = f.takes_a_message("I am at the gate.").expect("the message is taken");
     assert!(taken.notified);
     assert_eq!(f.kept().len(), 1);
     assert!(f.aokie.say("Thank you, I will pass that on.").await.is_ok());
-}
-
-#[tokio::test]
-async fn a_phone_that_cannot_be_asked_leaves_the_owner_told_and_the_ring_to_run_out() {
-    let mut f = flow(owner_settings(true)).await;
-    *f.companion.cannot.lock().unwrap() = Some("the phone plugin does not offer that".into());
-    f.caller_says(ASKED);
-    f.ring_through("assist_1", 2).await;
-    let (status, said) = f.owner_answers("assist_1", "accept").await;
-    assert_eq!((status, said["ok"].clone()), (200, json!(false)));
-    assert!(said["note"].as_str().unwrap().contains("does not offer that"), "{said}");
-    assert_eq!(f.dialog().await.len(), 1, "nothing was claimed, and it still rings");
-    assert!(f.aokie.event("call.transfer", Duration::from_millis(500)).await.is_none(), "the call was told nothing");
-    // It runs out, and the caller is offered a message.
-    let told = f.aokie.event("call.transfer", secs(6)).await.expect("it ends");
-    assert_eq!(told["outcome"], "expired");
-    assert!(spoken_within(&f.aokie, transfer::OFFER_LINE, secs(3)).await);
 }
 
 #[tokio::test]
@@ -377,7 +366,8 @@ async fn a_caller_who_talks_the_model_into_it_rings_nobody_even_when_the_plugin_
     }
     let mut f = f;
     assert!(f.aokie.text("formlogic.realtime.tool_call", Duration::from_millis(300)).await.is_none(), "not one reached the phone");
-    assert!(f.dialog().await.is_empty() && f.bell.rang.lock().unwrap().is_empty() && f.companion.asked.lock().unwrap().is_empty());
+    assert!(f.dialog().await.is_empty() && f.bell.rang.lock().unwrap().is_empty());
+    assert!(f.aokie.text(transfer::CANCEL_FRAME, Duration::from_millis(200)).await.is_none(), "nothing to withdraw: nothing was asked");
     // A request nobody planned rings nothing, whatever id it carries.
     let stray = PluginHost::ring_request(&f.ring, "oaiy.ring.opened", json!({"planId": "plan_made_up", "requestId": "assist_1", "callId": f.aokie.call, "callEpoch": 1, "ownerEpoch": 1, "expiresAt": f.ring.clock().unix() + 30}));
     assert_eq!(stray.unwrap_err().0, "unknown_plan");
