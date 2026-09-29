@@ -1744,25 +1744,23 @@ mod tests {
     fn a_junction_named_data_in_a_signed_bundle_is_not_moved_into_the_plugins_data_dir() {
         // `data` as a link to a folder elsewhere: moved, the plugin's data folder would be
         // a pointer to it, and the bundle would then verify with the link gone from it.
-        use crate::plugins::trust::tests::{dir_link, remove_dir_link};
+        use crate::plugins::trust::tests::{dir_link, DirLink};
         let base = Root::new();
         let (dir, mut reg) = signed_bundle(&base, &[]);
         let elsewhere = base.path().join("elsewhere");
         fs::create_dir_all(&elsewhere).unwrap();
         fs::write(elsewhere.join("keep.txt"), b"not the plugin's").unwrap();
-        if !dir_link(&dir.join("data"), &elsewhere) {
+        // Watched, so that whichever way this ends the links (and only they) are removed
+        // before the scratch folder is deleted.
+        let plugin_data = crate::plugins::runner::plugin_data_dir(&dir);
+        let _moved_to = DirLink::guard(&plugin_data);
+        let Some(_link) = dir_link(&dir.join("data"), &elsewhere) else {
             return; // this machine cannot make one
-        }
+        };
 
         reg.scan();
         let trust = reg.get("aokie").unwrap().trust.clone().unwrap();
-        let plugin_data = crate::plugins::runner::plugin_data_dir(&dir);
         let became_a_link = fs::symlink_metadata(&plugin_data).map(|m| m.file_type().is_symlink()).unwrap_or(false);
-        // Only the links are removed, before anything can fail with them in place.
-        remove_dir_link(&dir.join("data"));
-        if became_a_link {
-            remove_dir_link(&plugin_data);
-        }
         assert!(!became_a_link, "the plugin's data folder became a link to a folder outside the plugin");
         assert_eq!(trust.state, TrustState::Quarantined);
         assert!(trust.reason.unwrap().contains("a symbolic link is present: data"));

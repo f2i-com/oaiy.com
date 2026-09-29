@@ -1316,33 +1316,48 @@ pub(crate) mod tests {
         }
     }
 
-    /// Make `link` a directory link to `target` (a junction on Windows, which needs no
-    /// privilege; a symbolic link elsewhere). `false` when it could not be made, and a test
-    /// that needs one then has nothing to test here.
-    pub(crate) fn dir_link(link: &Path, target: &Path) -> bool {
-        #[cfg(windows)]
-        {
-            std::process::Command::new("cmd")
-                .args(["/C", "mklink", "/J"])
-                .arg(link)
-                .arg(target)
-                .output()
-                .map(|out| out.status.success())
-                .unwrap_or(false)
-        }
-        #[cfg(not(windows))]
-        {
-            std::os::unix::fs::symlink(target, link).is_ok()
+    /// A directory link, or a path where one might turn up. When it is dropped (also when a
+    /// test fails on the way) the link, and only the link, is removed: never what it points
+    /// at, and never by a recursive delete that could walk into it, so the delete of the
+    /// scratch folder that follows never meets one.
+    pub(crate) struct DirLink(PathBuf);
+
+    impl DirLink {
+        /// Watch a path that the code under test might turn into a link (a folder it moved a
+        /// link to). A path that is not a link is left alone.
+        pub(crate) fn guard(path: &Path) -> Self {
+            Self(path.to_path_buf())
         }
     }
 
-    /// Remove a link made by [`dir_link`], and only the link: never what it points at, and
-    /// never by a recursive delete that could walk into it.
-    pub(crate) fn remove_dir_link(link: &Path) {
+    impl Drop for DirLink {
+        fn drop(&mut self) {
+            let is_link = std::fs::symlink_metadata(&self.0).map(|m| m.file_type().is_symlink()).unwrap_or(false);
+            if !is_link {
+                return;
+            }
+            #[cfg(windows)]
+            let _ = std::fs::remove_dir(&self.0);
+            #[cfg(not(windows))]
+            let _ = std::fs::remove_file(&self.0);
+        }
+    }
+
+    /// Make `link` a directory link to `target` (a junction on Windows, which needs no
+    /// privilege; a symbolic link elsewhere). `None` when it could not be made, and a test
+    /// that needs one then has nothing to test here.
+    pub(crate) fn dir_link(link: &Path, target: &Path) -> Option<DirLink> {
         #[cfg(windows)]
-        let _ = std::fs::remove_dir(link);
+        let made = std::process::Command::new("cmd")
+            .args(["/C", "mklink", "/J"])
+            .arg(link)
+            .arg(target)
+            .output()
+            .map(|out| out.status.success())
+            .unwrap_or(false);
         #[cfg(not(windows))]
-        let _ = std::fs::remove_file(link);
+        let made = std::os::unix::fs::symlink(target, link).is_ok();
+        made.then(|| DirLink::guard(link))
     }
 
     /// A signing key made for the test, standing in for a publisher's.
@@ -1908,11 +1923,10 @@ pub(crate) mod tests {
         let copy = scratch.package("ui-copy");
         std::fs::write(copy.join("index.html"), b"<p>hello</p>").unwrap();
         std::fs::remove_dir_all(dir.join("ui")).unwrap();
-        if !dir_link(&dir.join("ui"), &copy) {
+        let Some(_link) = dir_link(&dir.join("ui"), &copy) else {
             return; // this machine cannot make one
-        }
+        };
         let t = svc.assess_fresh(&dir, "demo");
-        remove_dir_link(&dir.join("ui"));
         assert!(quarantine_reason(&t).contains("a symbolic link is present: ui"), "{t:?}");
     }
 

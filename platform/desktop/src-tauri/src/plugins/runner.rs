@@ -661,7 +661,7 @@ mod tests {
         // A junction (or symbolic link) called `data` that points at a folder elsewhere.
         // Moved, it would become the plugin's data folder, and everything the plugin
         // writes there would land in that other folder.
-        use crate::plugins::trust::tests::{dir_link, remove_dir_link};
+        use crate::plugins::trust::tests::{dir_link, DirLink};
         let base = std::env::temp_dir().join(format!("oaiy-mig3-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&base);
         let plugin = base.join("plugins").join("aokie");
@@ -669,14 +669,17 @@ mod tests {
         std::fs::create_dir_all(&plugin).unwrap();
         std::fs::create_dir_all(&elsewhere).unwrap();
         std::fs::write(elsewhere.join("keep.txt"), b"not the plugin's").unwrap();
-        if dir_link(&plugin.join("data"), &elsewhere) {
+        // Watched, so that if the code moved the link the link is still removed (and only
+        // it) when this test fails, before the folder is deleted.
+        let _moved_to = DirLink::guard(&plugin_data_dir(&plugin));
+        if let Some(_link) = dir_link(&plugin.join("data"), &elsewhere) {
             let err = migrate_legacy_data_dir(&plugin).unwrap_err();
             assert!(err.contains("is a link"), "{err}");
             assert!(!plugin_data_dir(&plugin).exists(), "nothing was moved");
             assert!(std::fs::symlink_metadata(plugin.join("data")).is_ok(), "the link is where it was");
             assert_eq!(std::fs::read(elsewhere.join("keep.txt")).unwrap(), b"not the plugin's");
-            remove_dir_link(&plugin.join("data"));
         }
+        drop(_moved_to);
         let _ = std::fs::remove_dir_all(&base);
     }
 }
