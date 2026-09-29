@@ -10,13 +10,16 @@
 
 .sidebar nav .nav-sub { display: flex; flex-direction: column; gap: 2px; }
 .sidebar nav .nav-sub-head { position: relative; display: flex; align-items: center; }
-.sidebar nav .nav-sub-head > .nav-parent { padding-right: 38px; }
+.sidebar nav .nav-sub-head > .nav-parent { gap: 11px; padding-right: 28px; }
+.sidebar nav .nav-sub-head > .nav-parent > .nav-count { margin-left: 2px; }
+/* One line, whatever else is in it (the name whole in its title). */
+.sidebar nav .nav-sub-head > .nav-parent > span { white-space: nowrap; }
 .sidebar nav .nav-toggle {
   position: absolute;
   top: 50%;
-  right: 6px;
+  right: 2px;
   display: grid;
-  width: 26px;
+  width: 24px;
   height: 26px;
   min-height: 0;
   place-items: center;
@@ -435,8 +438,8 @@
 .cal-appt-who { overflow: hidden; color: var(--muted); text-overflow: ellipsis; white-space: nowrap; }
 /* Half an hour or less: one line, what it is before when. */
 .cal-appt.is-short { flex-direction: row; align-items: center; gap: 6px; padding-top: 1px; padding-bottom: 1px; }
-.cal-appt.is-short .cal-appt-top { flex: 0 1 auto; order: 1; }
-.cal-appt.is-short strong { flex: 0 1 auto; min-width: 24px; }
+.cal-appt.is-short .cal-appt-top { min-width: 0; flex: 0 1 auto; order: 1; }
+.cal-appt.is-short strong { max-width: 100%; flex: 0 0 auto; }
 .cal-appt.is-short .cal-appt-tag { display: none; }
 .cal-appt.is-short .cal-appt-who { display: none; }
 /* Stacked over the one before: a ring of the surface keeps the two apart. */
@@ -603,8 +606,17 @@
 .cal-tel { display: inline-flex; align-items: center; gap: 5px; }
 .cal-side-more .cal-delete { margin-left: auto; }
 
-/* A booking. */
+/* A booking. Its buttons stay at the foot of the panel while the form scrolls. */
 .cal-booking { display: flex; flex-direction: column; gap: 14px; }
+.cal-side-body > .cal-booking > .cal-side-actions {
+  position: sticky;
+  bottom: -18px;
+  z-index: 1;
+  margin: 0 -16px -18px;
+  border-top: 1px solid var(--border);
+  background: var(--surface-solid);
+  padding: 12px 16px 14px;
+}
 .cal-booking .form-row input,
 .cal-booking .form-row select { font-family: var(--font-body); font-size: 12.5px; }
 .cal-takes { color: var(--muted); font-size: 12px; }
@@ -856,8 +868,9 @@
   .hours-card { padding: 14px 14px 16px; }
   .hours-day { grid-template-columns: minmax(0, 1fr) auto; }
   .hours-spans { grid-column: 1 / -1; grid-row: 2; }
+  .hours-day.is-closed .hours-spans { grid-column: auto; grid-row: auto; }
   .svc-fields { grid-template-columns: minmax(0, 1fr); }
   .voice-add { grid-template-columns: minmax(0, 1fr); }
-  .hours-savebar { flex-wrap: wrap; }
+  .hours-savebar { flex-wrap: wrap; justify-content: flex-end; }
   .hours-savebar-text { flex-basis: 100%; }
 }

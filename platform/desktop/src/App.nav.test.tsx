@@ -216,6 +216,38 @@ describe('the AI Receptionist’s sub-menu', () => {
     expect(sub().classList.contains('is-expanded')).toBe(true);
   });
 
+  it('works from the keyboard: up and down between entries, right to open and step in, left to step out and close', async () => {
+    // jsdom lays nothing out: an entry counts as shown unless it is in a closed sub-menu.
+    const rects = vi.spyOn(HTMLElement.prototype, 'getClientRects').mockImplementation(function (this: HTMLElement) {
+      const hidden = !!this.closest('.nav-sub:not(.is-expanded) .nav-children');
+      return (hidden ? [] : [{}]) as unknown as DOMRectList;
+    });
+    const key = async (el: Element, k: string) => {
+      await act(async () => el.dispatchEvent(new KeyboardEvent('keydown', { key: k, bubbles: true })));
+      await act(async () => new Promise<void>((r) => requestAnimationFrame(() => r())));
+    };
+    const parent = nav().querySelector<HTMLButtonElement>('.nav-parent')!;
+    const flows = nav().querySelector<HTMLButtonElement>('button[aria-label="Flows"]')!;
+    flows.focus();
+    await key(flows, 'ArrowDown');
+    expect(document.activeElement).toBe(parent);
+    await key(parent, 'ArrowLeft');
+    expect(nav().querySelector('.nav-sub')!.classList.contains('is-expanded')).toBe(false);
+    // Closed, down skips its pages.
+    await key(parent, 'ArrowDown');
+    expect(document.activeElement?.getAttribute('aria-label')).toBe('Engines');
+    parent.focus();
+    await key(parent, 'ArrowRight');
+    expect(nav().querySelector('.nav-sub')!.classList.contains('is-expanded')).toBe(true);
+    await key(parent, 'ArrowRight');
+    expect(document.activeElement?.textContent).toBe('Phone');
+    await key(document.activeElement!, 'ArrowDown');
+    expect(document.activeElement?.textContent).toContain('Calendar');
+    await key(document.activeElement!, 'ArrowLeft');
+    expect(document.activeElement).toBe(parent);
+    rects.mockRestore();
+  });
+
   it('keeps working when the stored state cannot be read', async () => {
     window.localStorage.setItem('oaiy.navExpanded', '{not json');
     act(() => root.unmount());

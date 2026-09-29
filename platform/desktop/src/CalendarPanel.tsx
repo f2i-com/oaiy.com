@@ -147,6 +147,28 @@ export default function CalendarPanel({ onOpenHours }: { onOpenHours?: () => voi
     opener.current = null;
     if (back?.isConnected) requestAnimationFrame(() => back.focus());
   }, []);
+  // A panel opened is brought wholly into view (its buttons too), and its heading takes the focus.
+  const sideKey = side ? `${side.kind}:${side.kind === 'details' ? `${side.a.id}:${side.edit ? 'edit' : ''}` : `${side.date}:${side.time}`}` : null;
+  useEffect(() => {
+    if (!sideKey) return;
+    const id = requestAnimationFrame(() => {
+      const heading = document.getElementById('cal-side-title');
+      const aside = heading?.closest('aside');
+      const scroller = aside?.closest('.content-page');
+      if (aside && scroller) {
+        // The panel sticks once the page scrolls to it: scrolling by what hangs below the page shows all of it.
+        // A form grows as its free times arrive, to the panel's full height: make room for that.
+        const r = aside.getBoundingClientRect();
+        const tall = sideKey.startsWith('new:') || sideKey.endsWith(':edit');
+        const height = tall ? Math.max(r.height, parseFloat(getComputedStyle(aside).maxHeight) || 0) : r.height;
+        const below = r.top + height - scroller.getBoundingClientRect().bottom + 16;
+        if (below > 0) scroller.scrollBy?.({ top: below, behavior: 'smooth' });
+      }
+      heading?.focus({ preventScroll: true });
+    });
+    return () => cancelAnimationFrame(id);
+  }, [sideKey]);
+
   // Escape closes the side panel.
   useEffect(() => {
     if (!side) return;

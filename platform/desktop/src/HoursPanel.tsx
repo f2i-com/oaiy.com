@@ -180,7 +180,12 @@ export function SettingsForm({
   const save = async () => {
     if (invalid) {
       setAttempted(true);
-      requestAnimationFrame(() => root.current?.querySelector<HTMLElement>('[aria-invalid="true"]')?.focus());
+      // The first problem, brought into view (clear of the save bar) and focused.
+      requestAnimationFrame(() => {
+        const first = root.current?.querySelector<HTMLElement>('[aria-invalid="true"]');
+        first?.scrollIntoView?.({ block: 'center', behavior: 'smooth' });
+        first?.focus({ preventScroll: true });
+      });
       return;
     }
     setSaving(true);
@@ -505,7 +510,7 @@ export function SettingsForm({
             ) : justSaved ? (
               <strong className="setup-ok">Saved</strong>
             ) : (
-              <small>These are saved. Save them as they are to go on.</small>
+              <small>These are saved. Change anything above, then save it here.</small>
             )}
           </div>
           {dirty && (

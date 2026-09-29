@@ -636,8 +636,9 @@ export default function App() {
                 On call
               </em>
             )}
-            {/* The page's own "New" shows on the page while the sub-menu is open, here while it is closed. */}
-            {badge && <em className="nav-badge nav-badge-parent">{badge}</em>}
+            {/* The page's own "New" shows on the page while the sub-menu is open, here while it is
+                closed; requests waiting come first (both would crowd the name out). */}
+            {badge && count === 0 && <em className="nav-badge nav-badge-parent">{badge}</em>}
             {count > 0 && (
               <em className="nav-count nav-count-parent" title={countText(count)}>
                 {count}
