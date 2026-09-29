@@ -85,3 +85,63 @@ fn the_plugins_part_says_it_holds_the_calls_so_they_are_looked_at_once_more_righ
     let stop = perform.find("part.stop()").expect("perform no longer stops parts");
     assert!(look < stop, "the look for calls comes after the stop it is for");
 }
+
+/// Every Rust file under src/ (but this one, which names what it looks for), with its comments left out: `(path from src/, code)`.
+fn code_of_every_source_file() -> Vec<(String, String)> {
+    fn walk(dir: &std::path::Path, out: &mut Vec<std::path::PathBuf>) {
+        for entry in std::fs::read_dir(dir).expect("src/ is readable").flatten() {
+            let path = entry.path();
+            if path.is_dir() {
+                walk(&path, out);
+            } else if path.extension().is_some_and(|e| e == "rs") {
+                out.push(path);
+            }
+        }
+    }
+    let src = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
+    let mut files = Vec::new();
+    walk(&src, &mut files);
+    files
+        .into_iter()
+        .map(|path| (path.strip_prefix(&src).unwrap().to_string_lossy().replace('\\', "/"), path))
+        .filter(|(name, _)| name != "update/guards.rs")
+        .map(|(name, path)| {
+            let text = source(&std::fs::read_to_string(&path).expect("a source file"));
+            // A line comment is not code: drop it, unless the // is inside a string.
+            let code: Vec<String> = text
+                .lines()
+                .map(|line| match line.find("//") {
+                    Some(at) if line[..at].matches('"').count() % 2 == 0 => line[..at].to_string(),
+                    _ => line.to_string(),
+                })
+                .collect();
+            (name, code.join("\n"))
+        })
+        .collect()
+}
+
+#[test]
+fn nothing_installs_or_downloads_an_update_but_the_two_calls_that_are_held_to_a_verified_package() {
+    let files = code_of_every_source_file();
+    assert!(files.len() > 50, "the source tree was not found: {} files", files.len());
+    // The plugin's download-and-install in one go would skip the check of the bytes and of the moment: it is named nowhere.
+    for (name, code) in &files {
+        assert!(!code.contains("download_and_install"), "{name} names the plugin's download_and_install");
+    }
+    // The plugin's crate is used by one file, and it is this one's sibling that holds the calls.
+    for (name, code) in &files {
+        if name != "update/gui.rs" {
+            assert!(!code.contains("tauri_plugin_updater") && !code.contains("UpdaterExt"), "{name} uses the updater plugin: only update/gui.rs may");
+        }
+    }
+    // An install with bytes is called from one place, and what it is given is a verified package's bytes.
+    let installs: Vec<(&str, usize)> = files.iter().map(|(name, code)| (name.as_str(), code.matches(".install(").count() - code.matches(".install()").count())).filter(|(_, n)| *n > 0).collect();
+    assert_eq!(installs, [("update/gui.rs", 1)], "an install that takes bytes is called from one place only");
+    let gui = &files.iter().find(|(name, _)| name == "update/gui.rs").unwrap().1;
+    assert_eq!(gui.matches("update.install(package.bytes())").count(), 1, "the one install is not given a verified package's bytes");
+    // The download is called from one place, and its bytes go to verify_package before anything else has them.
+    let downloads: Vec<(&str, usize)> = files.iter().map(|(name, code)| (name.as_str(), code.matches(".download(").count())).filter(|(_, n)| *n > 0).collect();
+    assert_eq!(downloads, [("update/gui.rs", 1)], "an update is downloaded from one place only");
+    let download = block(gui, "async fn download(", "\n}\n");
+    assert!(download.find("update.download(").unwrap() < download.find("verify_package(bytes,").expect("the download is verified"), "the bytes are verified after the download and before they go anywhere");
+}
