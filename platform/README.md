@@ -184,6 +184,8 @@ npm run build             # writes ui/dist/
 
 Drop `ui/dist/` behind any static host (S3, Netlify, Cloudflare Pages, nginx, …). No SSR, no server-side rendering.
 
+[`ui/README.md`](ui/README.md) says how the site is built and what is in it: the flow editor as an installable app (a service worker that keeps the shell and never touches `/api/`, another origin or a share link, and nothing over 4 MiB), the OS-aware "Download OAIY Desktop" buttons, whose links are made at build time from the release's version (so the site is redeployed with each release, see [`docs/RELEASING.md`](../docs/RELEASING.md#the-web-site)), and the pictures.
+
 ### Backend (`api/`)
 
 Requires PHP 8.1+, Composer, and one of: **SQLite** (default — zero setup, ships with PHP) or **MySQL 5.7+ / MariaDB 10.3+**.
@@ -308,8 +310,9 @@ workflow) can still be started manually with `workflow_dispatch`.
 | `desktop/` | `npm run build` | CLI resource sync, TypeScript and desktop UI build |
 | `desktop/src-tauri/` | `cargo test --no-default-features --lib` | Runtime, gateway, plugins and account links without GUI dependencies |
 | `cli/` | `npm test` | Headless flow engine and host adapters on ZIPP; the ZIPP process-boundary suite, the engine guards (no host eval, wiring, canary under a tripwire, budget, timeout, `engine_unavailable`) and the boundary measurements (needs `npm run build` first — the guards spawn and read `dist/`) |
-| `ui/` | `npm test` | Installs the ZIPP engines if needed; TypeScript, CSS tokens, node contracts, both ZIPP engines and Zipp sandbox routing |
-| `ui/` | `npm run test:e2e` | Browser checks; needs the web dev server |
+| `ui/` | `npm test` | Installs the ZIPP engines if needed; TypeScript, CSS tokens, node contracts, both ZIPP engines and Zipp sandbox routing, the service worker's rules and build, the install and update controllers, the manifest and icons, the download links and the site's pictures and metadata |
+| `ui/` | `npm run test:e2e` | Browser checks; needs the web dev server or a served build |
+| `ui/` | `npm run test:pwa-e2e` | The installable editor in Chromium against the production build (`npm run build` first): offline after one visit, the size limit, what the worker never touches, installability, updates |
 | `api/` | `composer test` | API smoke tests; needs a running API and migrated development database |
 
 See [`TESTING.md`](TESTING.md) for API and browser test setup. Hardware, model
@@ -330,7 +333,7 @@ The tag is the version — it is stamped into the desktop app at build time, so 
 
 | File | What it is |
 |------|------------|
-| `oaiy-web-<v>.zip` / `.tar.gz` | The compiled static site: landing page at `/`, flow builder at `/app.html`, desktop page at `/desktop.html`. Unzip onto any static host. |
+| `oaiy-web-<v>.zip` / `.tar.gz` | The compiled static site: landing page at `/`, flow builder at `/app.html`, desktop page at `/desktop.html`. Unzip onto any static host, and again with each release: its download buttons name this release's files. |
 | `oaiy-desktop-<v>-windows-x64-setup.exe`, `.msi` | OAIY Desktop for Windows, with the Agent and the flow editor inside |
 | `oaiy-desktop-<v>-linux-x86_64.AppImage`, `-amd64.deb`, `-x86_64.rpm` | OAIY Desktop for Linux |
 | `oaiy-server-<v>-linux-x86_64.tar.gz`, `-windows-x64.zip` | The headless server, no GUI or GTK, for hosts driven by the CLI or a hosted web app |

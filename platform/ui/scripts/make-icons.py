@@ -1,7 +1,7 @@
 """Make the flow editor's app icons from the OAIY icon.
 
     python platform/ui/scripts/make-icons.py          # writes into platform/ui/public
-    python platform/ui/scripts/make-icons.py --check  # exits 1 if the files there are not what this makes
+    python platform/ui/scripts/make-icons.py --check  # exits 1 if the files there do not look like what this makes
 
 The source is the desktop app's 512 px icon (platform/desktop/src-tauri/icons/icon.png): a
 violet tile with rounded corners (transparent outside them) and the mark, the flows joining
@@ -16,13 +16,14 @@ in a hub, well inside it. From it:
                                anything transparent with black, so it is opaque. (The file this
                                replaces was transparent but for a sliver at one edge.)
 
-Needs Pillow (pip install Pillow). The output does not depend on the machine: the same source
-gives the same bytes.
+Needs Pillow (pip install Pillow). The same source gives the same pictures; `--check` compares how they look, so
+a different Pillow (which may encode a PNG to other bytes) does not fail it.
 """
 
 from __future__ import annotations
 
 import sys
+from io import BytesIO
 from pathlib import Path
 
 from PIL import Image
@@ -91,6 +92,21 @@ def encode(image: Image.Image) -> bytes:
     return buffer.getvalue()
 
 
+# --check compares what a picture looks like, not its bytes: another Pillow or libwebp encodes the same
+# picture to different bytes, and that must not fail a check made on another machine.
+TOLERANCE = 1.5  # mean difference, out of 255, per colour channel
+
+
+def same_picture(existing: bytes, fresh: bytes) -> bool:
+    from PIL import ImageChops, ImageStat
+
+    a = Image.open(BytesIO(existing)).convert("RGBA")
+    b = Image.open(BytesIO(fresh)).convert("RGBA")
+    if a.size != b.size:
+        return False
+    return max(ImageStat.Stat(ImageChops.difference(a, b)).mean) <= TOLERANCE
+
+
 def main() -> int:
     check = "--check" in sys.argv[1:]
     stale = []
@@ -98,7 +114,7 @@ def main() -> int:
         data = encode(image)
         target = OUT / name
         if check:
-            if not target.exists() or target.read_bytes() != data:
+            if not target.exists() or not same_picture(target.read_bytes(), data):
                 stale.append(name)
         else:
             target.write_bytes(data)

@@ -14,7 +14,7 @@ by hand on its own, because automatic CI is paused).
 | `oaiy-desktop-<v>-linux-x86_64.AppImage`, `-linux-amd64.deb`, `-linux-x86_64.rpm` | OAIY Desktop for Linux |
 | `oaiy-server-<v>-windows-x64.zip`, `oaiy-server-<v>-linux-x86_64.tar.gz` | The headless server: the same local API with no window, for a host the CLI or a web app drives. It has no Agent or flow editor to show. |
 | `oaiy-cli-<v>.tar.gz` | The CLI alone, for a product that embeds it |
-| `oaiy-web-<v>.zip`, `oaiy-web-<v>.tar.gz` | The flow editor's site (landing page, `/app.html`, `/desktop.html`), for any static host |
+| `oaiy-web-<v>.zip`, `oaiy-web-<v>.tar.gz` | The flow editor's site (landing page, `/app.html`, `/desktop.html`), for any static host, built for this release: its download buttons name this release's files (see [The web site](#the-web-site)) |
 | `SHA256SUMS.txt` | The checksum of every file above |
 | `release-evidence-web.json`, `-linux.json`, `-windows.json` | For each build: the revision, target, toolchain, digests, and the verification run that passed before anything was published |
 
@@ -78,6 +78,9 @@ models, the portable Python and the Node runtime) is downloaded on first use, no
    The `version` input is required but the tag decides the version. GitHub takes manual
    runs only of workflows that are on the default branch, so the workflows have to be
    there. `gh run list --workflow release.yml` shows the run.
+6. **Redeploy the site** from the release's `oaiy-web-<v>.zip`. Nothing in the workflow puts it
+   on a host, and until it is replaced the site's download buttons still offer the previous
+   release (see the next section).
 
 To try the build without publishing, run the same workflow on a branch instead:
 `gh workflow run release.yml --ref <branch> -f version=0.1.0`. It builds everything and
@@ -87,6 +90,32 @@ Do not move, delete or re-create a published tag. Other products take files from
 latest release (FormLogic's CI takes `oaiy-cli-<v>.tar.gz`, `SHA256SUMS.txt` and
 `release-evidence-linux.json`) and check that the evidence names the tag's commit; make a
 new version instead.
+
+## The web site
+
+`oaiy-web-<v>.zip` is the whole site (the landing page, the flow editor at `/app.html`, the
+desktop page), built by the `web` job with `npm run build` in `platform/ui`. How the site is
+built and what is in it is [`platform/ui/README.md`](../platform/ui/README.md). Three things about
+a release matter here:
+
+- **The download links are baked in, so the site must be redeployed with each release.** The
+  installers' names carry the version, so the landing and desktop pages and the flow editor
+  offer `https://github.com/f2i-com/oaiy.com/releases/download/v<v>/oaiy-desktop-<v>-windows-x64-setup.exe`
+  (and the AppImage, `.deb`, `.rpm` and the headless server under "other downloads"). The `web`
+  job gives the build `VITE_OAIY_VERSION`, the tag's version, and the page picks the visitor's
+  system in the browser with no request. Nothing asks GitHub what is newest, so a site that is
+  not redeployed keeps offering the release it was built for. A build made without the variable
+  (a local one) links to the latest release and says only "Download OAIY Desktop".
+- **The links assume the tag is `v<version>`.** The workflow accepts `0.1.0` or `v0.1.0`, and the
+  GitHub Release takes the tag's own name, so a release tagged `0.1.0` would have files at
+  `.../releases/download/0.1.0/...` and every baked link would answer 404. Push the `v` form, as
+  the earlier releases did.
+- **A host must serve `/sw.js` from the root and keep `.html` in `/app.html`.** The flow editor
+  installs a service worker (scope `/app.html`) so it can open offline and be installed as an
+  app; it keeps the shell of this build under a cache named for the build and removes the old
+  build's when the person reloads onto the new one. A host that redirects `/app.html` to `/app`
+  leaves the editor outside the worker's scope, and one that caches `/sw.js` hides a new
+  release from returning visitors (`public/_headers` says `no-cache` for hosts that read it).
 
 ## What is not in a release
 

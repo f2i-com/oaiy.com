@@ -71,7 +71,8 @@ pair cleared, because the Agent pins its own ZIPP release.
 | Rust unit tests | `desktop/src-tauri` | no (`tests/headless_server.rs` starts the real `oaiy-server` itself, on a port the system picks and with the voice gateway off) | `cargo test --no-default-features` (headless server) and `cargo test --features gui` (desktop) |
 | CLI engine tests | `cli/` | no | `npm test` |
 | API end-to-end | `api/tests/smoke.php` | **yes** — the API | `composer test` |
-| Web end-to-end | `ui/tests/e2e.mjs` | **yes** — the dev server | `npm run test:e2e` |
+| Web end-to-end | `ui/tests/e2e.mjs` | **yes** — the dev server, or a served build | `npm run test:e2e` |
+| Installable editor end-to-end | `ui/tests/pwa-e2e.mjs` | no — it serves `ui/dist` itself (`npm run build` first) and starts its own Chromium | `npm run test:pwa-e2e` |
 | CSS token check | `ui/tests/css-tokens.mjs` | no | `npm run test:css` |
 | Node contracts | `ui/tests/node-contracts.mjs` | no | `npm run test:contracts` |
 
@@ -80,7 +81,7 @@ pair cleared, because the Agent pins its own ZIPP release.
 ```bash
 (cd desktop/src-tauri && cargo test --no-default-features && cargo test --features gui)   # both shipped configurations
 (cd cli     && npm test && npm run typecheck)   # 4 suites + tsc (needs `npm run build` first: it generates src/generated/)
-(cd ui      && npm test)                 # installs the ZIPP engines if needed, then typecheck, css tokens, contracts, both engines, and the editor's own suites (OAIY's window, services, storage, landing links, engine address, sealed API keys)
+(cd ui      && npm test)                 # installs the ZIPP engines if needed, then typecheck, css tokens, contracts, both engines, and the editor's own suites (OAIY's window, services, storage, landing links, engine address, sealed API keys, the service worker and its build, install and update, manifest and icons, download links, the site's pictures and metadata)
 (cd desktop && npm run build)            # tsc --noEmit + vite build
 node --test scripts/fetch-zipp-release.test.mjs   # the ZIPP installer (see "ZIPP engines")
 ```
@@ -150,8 +151,16 @@ npm run test:e2e       # terminal 2
 npm run test:e2e -- http://localhost:4173    # or against `vite preview`
 ```
 
-144 assertions. Checks all three pages in **both themes**: clean console, shell
-rendered, cross-page nav, flow creation, and that every design token resolves.
+193 assertions. Checks all three pages in **both themes**: clean console, shell
+rendered, cross-page nav, flow creation, and that every design token resolves. The
+landing page's screenshots load at their own size, its comparison table is readable
+and stacks on a phone, and the "Download OAIY Desktop" button is checked for six
+devices (Windows, Linux, a Mac, an iPhone, an iPad, Android: a file for the first
+two, the plain sentence for the rest), in the editor's sidebar and Settings, and
+absent in OAIY's own window. The marketing pages may ask for nothing beyond their own
+site (no probe of a desktop, no GitHub). Any request to the product's own ports
+(17972, 17872, 17973, 8080, 7860, 8783, 9333) is answered by the test itself with a
+stand-in that is not OAIY Desktop, so it never reaches one running on the machine.
 Also holds regression cases for the shell rewrite — the project name staying
 editable alongside an open flow, the flow name being keyboard-reachable, and the
 topbar actions not clipping as the window narrows. The desktop page's links into

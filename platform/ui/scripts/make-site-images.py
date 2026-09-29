@@ -1,7 +1,7 @@
 """Make the site's pictures: the screenshots on the landing page and the social card.
 
     python platform/ui/scripts/make-site-images.py          # writes into platform/ui/public
-    python platform/ui/scripts/make-site-images.py --check  # exits 1 if the files there are not what this makes
+    python platform/ui/scripts/make-site-images.py --check  # exits 1 if the files there do not look like what this makes
 
 Sources are docs/images (the README's screenshots of a demo setup: the business, the people and their
 numbers are made up, and the numbers are ones the ACMA keeps for fiction) and the desktop's
@@ -15,7 +15,8 @@ numbers are made up, and the numbers are ones the ACMA keeps for fiction) and th
 
 The card's type is Inter (the site's own face), read from the npm package the pages use, so run
 `npm ci` in platform/ui first. Needs Pillow (pip install Pillow), whose FreeType reads WOFF2.
-The same sources give the same bytes.
+The same sources give the same pictures; `--check` compares how they look, not their bytes (another
+Pillow or libwebp encodes to other bytes).
 """
 
 from __future__ import annotations
@@ -152,12 +153,27 @@ def make() -> dict[Path, bytes]:
     return made
 
 
+# --check compares what a picture looks like, not its bytes: another Pillow or libwebp encodes the same
+# picture to different bytes, and that must not fail a check made on another machine.
+TOLERANCE = 1.5  # mean difference, out of 255, per colour channel
+
+
+def same_picture(existing: bytes, fresh: bytes) -> bool:
+    from PIL import ImageChops, ImageStat
+
+    a = Image.open(BytesIO(existing)).convert("RGBA")
+    b = Image.open(BytesIO(fresh)).convert("RGBA")
+    if a.size != b.size:
+        return False
+    return max(ImageStat.Stat(ImageChops.difference(a, b)).mean) <= TOLERANCE
+
+
 def main() -> int:
     check = "--check" in sys.argv[1:]
     stale = []
     for target, data in make().items():
         if check:
-            if not target.exists() or target.read_bytes() != data:
+            if not target.exists() or not same_picture(target.read_bytes(), data):
                 stale.append(target.name)
         else:
             target.parent.mkdir(parents=True, exist_ok=True)
