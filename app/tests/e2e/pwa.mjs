@@ -279,7 +279,10 @@ try {
     same(manifestErrors, [], 'manifest errors');
     const { appId } = await client.send('Page.getAppId').catch(() => ({ appId: null }));
     console.log(`     manifest id: ${manifest.id}; Chrome's app id: ${appId}`);
-    if (appId) expect(appId.endsWith(`/${manifest.id}`), `the app id ${appId} is not made from the manifest id ${manifest.id}`);
+    if (appId) expect(appId === new URL(manifest.id, base).href, `the app id ${appId} is not made from the manifest id ${manifest.id}`);
+    // The manifest had no id before the app was called OAIY, which makes the id the start URL's origin: the same
+    // id keeps a copy that was installed then as the same app, so it takes the new name and icons.
+    expect(appId === base, `the app id ${appId} is not the origin (${base}), where an earlier install has it`);
     await client.detach();
   });
 
