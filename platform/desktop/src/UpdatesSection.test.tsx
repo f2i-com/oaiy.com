@@ -173,7 +173,7 @@ describe('About and updates', () => {
     // The codes the desktop sends besides the first few: a call the plugin knows of (OAIY's own line sees none), and the two "can't tell" reasons.
     const blockers = [
       { code: 'phoneCall', message: 'Aokie Phone Bridge reports a phone call (ringing, in progress or on hold).' },
-      { code: 'callUnknown', message: "OAIY can't tell whether a phone call is live: Aokie Phone Bridge did not give an answer (it did not answer within 3 s). It does not restart while it can't tell; stopping that plugin (Connections, Plugins) lets it." },
+      { code: 'callUnknown', message: "OAIY can't tell whether a phone call is live: Aokie Phone Bridge did not give an answer (it did not answer within 3 s). It does not restart while it can't tell; stopping that plugin (Connections, Plugins, Stop) lets it." },
       { code: 'enginesUnknown', message: "OAIY can't tell whether the engines are busy: no answer within 2 s. It does not restart while it can't tell." },
     ];
     await mount(status({ state: 'ready', latestVersion: '0.2.0', blockers }));

@@ -158,7 +158,7 @@ pub fn call_blockers(r: &CallReadings) -> Vec<Blocker> {
         )),
         LineState::Unknown { plugin, why } => out.push(Blocker::new(
             "callUnknown",
-            format!("OAIY can't tell whether a phone call is live: {plugin} did not give an answer ({why}). It does not restart while it can't tell; stopping that plugin (Connections, Plugins) lets it."),
+            format!("OAIY can't tell whether a phone call is live: {plugin} did not give an answer ({why}). It does not restart while it can't tell; stopping that plugin (Connections, Plugins, Stop) lets it."),
         )),
     }
     out
@@ -356,6 +356,8 @@ mod tests {
         let b = blockers(&a, LONG);
         assert_eq!(b.iter().map(|b| b.code).collect::<Vec<_>>(), ["callUnknown"]);
         assert!(b[0].message.starts_with("OAIY can't tell whether a phone call is live"), "{}", b[0].message);
+        // It names the way out, step by step: the page, the tab, the button (PluginsPanel's Stop).
+        assert!(b[0].message.ends_with("stopping that plugin (Connections, Plugins, Stop) lets it."), "{}", b[0].message);
         assert!(b[0].message.contains("did not answer call.switchboard"), "{}", b[0].message);
     }
 

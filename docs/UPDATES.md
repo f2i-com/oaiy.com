@@ -80,10 +80,13 @@ Each of these keeps "Restart to update" off, by itself, and is shown in words ne
     one of them, so the other cannot be asked), and one that names the phone module but lacks a
     command OAIY needs of a provider (OAIY has switched the module off for it and has no
     connector to ask it through, but it may still hold a call: the message says which command is
-    missing); stopping that plugin (Connections, Plugins) lets
-    it through, as does a plugin that is not running at all. A plugin that is
-    running without its radio attached, or paused, is such a case: it answers with an error, so
-    the install waits until the plugin is stopped or the radio is back.
+    missing); stopping that plugin (Connections, Plugins, Stop: the message says it) lets it
+    through, as does a plugin that is not running at all. **A phone plugin that is running with no
+    radio attached, or paused because consent has not been given, is such a case, and this is kept as
+    designed**: it answers `call.switchboard` (the command OAIY asks first) with an error, since
+    the command needs the radio (`call.current` would answer "no call" with `radio.paused` under
+    consent, but errors with no dongle, and OAIY does not fall back to it once the first has
+    failed), so the install waits until the plugin is stopped, or the radio is back.
   - Not checked: a call the phone plugin does not report through those commands, and a call
     on a phone or line OAIY has no plugin for. OAIY cannot wait for what it cannot see.
 - **A task the Agent is working on for a flow** (one given to it and not yet answered).
@@ -294,6 +297,11 @@ OAIY would accept. Rotate it, and tell people to install the new release by hand
 
 ## Not yet
 
+- **An idle but paused phone plugin holds an update back.** Aokie should answer
+  `call.switchboard` with an empty view when consent pauses it (as `call.current` already does),
+  so an idle paused plugin does not hold an update back. Stopping a plugin is not disabling it:
+  it autostarts again after the relaunch (only a plugin turned off in Plugins does not), so stop
+  it for the update and it is running again afterwards.
 - **A refusal of new calls before the plugins stop.** The last look for a call is followed by the
   plugins' graceful shutdown, up to 5 seconds for each plugin, one after another (above), and a call
   that begins in that time is not looked for again. It needs a command of the phone plugin's
