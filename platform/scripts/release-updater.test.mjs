@@ -210,6 +210,8 @@ describe('the signing step, run for real with a stand-in Tauri CLI', { skip: !ba
         `import crypto from 'node:crypto'; import fs from 'node:fs'; import path from 'node:path';`,
         `import { sign } from ${JSON.stringify(pathToFileURL(path.join(here, 'minisign.testing.mjs')).href)};`,
         `const file = process.argv[process.argv.length - 1];`,
+        // The real CLI decodes the key as base64 and refuses a line ending on it: "failed to decode base64 secret key: Invalid symbol 10".
+        `if (/[\\r\\n]$/.test(process.env.${SECRET})) { console.error('failed to decode base64 secret key: Invalid symbol 10'); process.exit(1); }`,
         `const { pem, id } = JSON.parse(process.env.${SECRET});`,
         `if (process.env.${PASSWORD} !== ${JSON.stringify(PASSWORD_VALUE)}) { console.error('no password'); process.exit(1); }`,
         `const keys = { privateKey: crypto.createPrivateKey(pem), keyId: Buffer.from(id, 'hex') };`,
@@ -260,13 +262,34 @@ describe('the signing step, run for real with a stand-in Tauri CLI', { skip: !ba
     assert.throws(() => buildFeed({ dir: other, version: '9.9.9', pubkey: keys.pubkey }), /is not version 9\.9\.9/);
   });
 
-  it('takes the password without the newline a secret set from a file can end in', () => {
-    // The stand-in signer wants the password exactly: a trailing newline would fail it, as it would fail the real CLI.
-    for (const ending of ['\n', '\r\n']) {
+  it('takes the key and the password without the newline a secret set from a file can end in', () => {
+    // The stand-in signer wants both exactly (a line ending would fail it, as it fails the real CLI: "Invalid symbol 10", "Wrong password"),
+    // so it signs only if the step took the line ending off each.
+    for (const ending of ['\n', '\r\n', '\n\n']) {
+      for (const [what, env] of [
+        ['the key', { [SECRET]: KEY + ending }],
+        ['the password', { [PASSWORD]: PASSWORD_VALUE + ending }],
+        ['both', { [SECRET]: KEY + ending, [PASSWORD]: PASSWORD_VALUE + ending }],
+      ]) {
+        const w = workspace();
+        const result = run(w, env);
+        assert.equal(result.status, 0, `${what} with ${JSON.stringify(ending)}: ${result.stdout}${result.stderr}`);
+        assert.equal(fs.readdirSync(path.join(w.ws, 'signatures')).length, 2);
+        assert.ok(!(result.stdout + result.stderr).includes(PASSWORD_VALUE), 'the password was printed');
+      }
+    }
+  });
+
+  it('does not take a line ending for a value: a secret that is only one is not set', () => {
+    for (const [env, message] of [
+      [{ [SECRET]: '\n' }, /the secret TAURI_SIGNING_PRIVATE_KEY is not set/],
+      [{ [PASSWORD]: '\r\n' }, /the secret TAURI_SIGNING_PRIVATE_KEY_PASSWORD is not set/],
+    ]) {
       const w = workspace();
-      const result = run(w, { [PASSWORD]: PASSWORD_VALUE + ending });
-      assert.equal(result.status, 0, `${JSON.stringify(ending)}: ${result.stdout}${result.stderr}`);
-      assert.equal(fs.readdirSync(path.join(w.ws, 'signatures')).length, 2);
+      const result = run(w, env);
+      assert.equal(result.status, 1);
+      assert.match(result.stdout, message);
+      assert.equal(fs.existsSync(w.log), false, 'nothing was signed');
     }
   });
 

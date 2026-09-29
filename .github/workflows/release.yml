@@ -549,17 +549,21 @@ jobs:
           TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
         run: |
           set -euo pipefail
+          # A secret set from a file can end in a newline (`gh secret set` reads its standard input as it comes), and the Tauri CLI refuses both
+          # values with one ("Invalid symbol 10" for the key, "Wrong password for that key"): each is what is before its line ending. (Parameter
+          # expansion, not command substitution, which strips differently in different shells.)
+          key="$TAURI_SIGNING_PRIVATE_KEY"
+          while [[ "$key" == *$'\n' || "$key" == *$'\r' ]]; do key="${key%$'\n'}"; key="${key%$'\r'}"; done
+          password="$TAURI_SIGNING_PRIVATE_KEY_PASSWORD"
+          while [[ "$password" == *$'\n' || "$password" == *$'\r' ]]; do password="${password%$'\n'}"; password="${password%$'\r'}"; done
           missing=""
-          [[ -n "$TAURI_SIGNING_PRIVATE_KEY" ]] || missing="TAURI_SIGNING_PRIVATE_KEY"
-          [[ -n "$TAURI_SIGNING_PRIVATE_KEY_PASSWORD" ]] || missing="${missing:+$missing and }TAURI_SIGNING_PRIVATE_KEY_PASSWORD"
+          [[ -n "$key" ]] || missing="TAURI_SIGNING_PRIVATE_KEY"
+          [[ -n "$password" ]] || missing="${missing:+$missing and }TAURI_SIGNING_PRIVATE_KEY_PASSWORD"
           if [[ -n "$missing" ]]; then
             echo "::error::a release must be signed for OAIY's updater, and the secret $missing is not set in the release environment (Settings, Environments, release). See docs/RELEASING.md, The updater key."
             exit 1
           fi
-          # A secret set from a file can end in a newline (`gh secret set` reads its standard input as it comes): the password is what is before it.
-          password="$TAURI_SIGNING_PRIVATE_KEY_PASSWORD"
-          password="${password%$'\n'}"; password="${password%$'\r'}"
-          export TAURI_SIGNING_PRIVATE_KEY_PASSWORD="$password"
+          export TAURI_SIGNING_PRIVATE_KEY="$key" TAURI_SIGNING_PRIVATE_KEY_PASSWORD="$password"
           artifacts="$GITHUB_WORKSPACE/artifacts"
           work="$RUNNER_TEMP/signing"; out="$GITHUB_WORKSPACE/signatures"
           mkdir -p "$work" "$out"

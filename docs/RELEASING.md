@@ -102,8 +102,9 @@ way the job does, and `platform/scripts/verify-signature.mjs` checks it) until i
    gh secret set TAURI_SIGNING_PRIVATE_KEY_PASSWORD --env release --repo f2i-com/oaiy.com < ~/.oaiy-signing/oaiy-updater.key.password.txt
    ```
 
-   (The sign step drops a trailing newline from the password, which a value read from a file
-   can carry.)
+   (The sign step drops a line ending from the end of both values, which a value read from a
+   file can carry: the Tauri CLI refuses a key that ends in one, "Invalid symbol 10", and a
+   password that does, "Wrong password for that key".)
 5. **A tag ruleset** (Settings, Rules, Rulesets, New tag ruleset): target the same two tag
    patterns; restrict who may create them to the people who cut releases, and block updates
    and deletions (a published tag is never moved: see below). Whoever can create a matching
