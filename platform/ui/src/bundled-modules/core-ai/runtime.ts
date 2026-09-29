@@ -6,6 +6,7 @@
  */
 
 import type { RuntimeContext, RuntimeModule, RuntimeMethod } from 'oaiy-core/src/module-types';
+import { getEngineBase } from '../../lib/engineEndpoint';
 
 // Per-job method factory: methods close over THIS job's ctx (no module-level singleton).
 function createAIMethods(ctx: RuntimeContext): Record<string, RuntimeMethod> {
@@ -949,9 +950,10 @@ async function chat(
     if (portMatch) {
       const port = parseInt(portMatch[1], 10);
       try {
-        // 17972 is OAIY Desktop's fixed localhost API port (see
-        // ui/src/lib/desktopDetection.ts). Plain fetch is fine — the
-        // companion sets permissive CORS and the bind is loopback-only.
+        // OAIY Desktop's API is at the engine address in Settings
+        // (lib/engineEndpoint.ts; http://127.0.0.1:17972 unless the person
+        // changed it), read now so a change is followed without a reload.
+        // Plain fetch is fine — the companion sets permissive CORS.
         // Hard 2s cap: ensure-by-port returns as soon as the spawn kicks
         // off, so a healthy companion answers in <100ms. The timeout keeps
         // a wedged companion (accepting connections but not responding)
@@ -959,7 +961,7 @@ async function chat(
         // through to the direct request just like OAIY Desktop-absent case.
         const ctrl = new AbortController();
         const abortTimer = setTimeout(() => ctrl.abort(), 2000);
-        const r = await fetch('http://127.0.0.1:17972/api/services/ensure-by-port', {
+        const r = await fetch(`${getEngineBase()}/api/services/ensure-by-port`, {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
           body: JSON.stringify({ port }),

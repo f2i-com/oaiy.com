@@ -35,11 +35,8 @@
  */
 import { invalidateDynamicOptions } from 'oaiy-ui-components';
 import type { CustomService, ServiceNodeTag } from 'oaiy-core/modules/core-service/examples';
-import {
-  DESKTOP_API_BASE,
-  refreshDesktopStatus,
-  subscribeDesktopStatus,
-} from './desktopDetection';
+import { getEngineBase } from './engineEndpoint';
+import { refreshDesktopStatus, subscribeDesktopStatus } from './desktopDetection';
 
 /** Shared contract with the compilers (core-service/contract.ts reads this key). */
 export const DESKTOP_SERVICE_STORAGE_KEY = 'oaiy.desktopServices';
@@ -120,7 +117,8 @@ function desktopAccess(): { origin: string; token: string | null; inOaiy: boolea
   if (given && typeof given.origin === 'string' && given.origin && typeof given.token === 'string' && given.token) {
     return { origin: given.origin.replace(/\/+$/, ''), token: given.token, inOaiy: true };
   }
-  return { origin: DESKTOP_API_BASE.replace(/\/+$/, ''), token: null, inOaiy: false };
+  // A plain browser tab: the engine address in Settings, read now (every poll), not when the page loaded.
+  return { origin: getEngineBase().replace(/\/+$/, ''), token: null, inOaiy: false };
 }
 
 /**

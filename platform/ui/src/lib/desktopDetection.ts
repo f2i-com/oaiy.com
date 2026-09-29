@@ -2,7 +2,8 @@
  * OAIY Desktop detection.
  *
  * OAIY Desktop is a tray-resident Tauri app (see oaiy-web/desktop/) that
- * exposes a localhost HTTP API at http://127.0.0.1:17972. When it's
+ * exposes a localhost HTTP API at http://127.0.0.1:17972 (or wherever the
+ * engine address in Settings points: lib/engineEndpoint.ts). When it's
  * running on the user's machine, oaiy-web can:
  *
  *   - List the user's locally-managed services in the palette (Phase 3)
@@ -17,18 +18,17 @@
  * status changes.
  *
  * Discovery contract:
- *   GET http://127.0.0.1:17972/api/health
+ *   GET <engine address>/api/health   (http://127.0.0.1:17972 by default)
  *     → 200 { status: 'ok', product: 'oaiy-desktop', protocol: 'oaiy-bridge/1', version: 'x.y.z' }
  *     → anything else / no response → assume not running
+ *
+ * The engine address is a setting the person can change, so nothing here (or
+ * anywhere that reaches the desktop) may keep a copy of it: ask
+ * `getEngineBase()` each time, or read `DesktopInfo.baseUrl` from here.
  */
 
-import { DEFAULT_ENGINE_BASE, getEngineBase, subscribeEngineBase } from './engineEndpoint';
+import { getEngineBase, subscribeEngineBase } from './engineEndpoint';
 
-/** The compiled-in default. The LIVE value is whatever `getEngineBase()`
- *  returns, which the user can point at another machine — that is the whole
- *  reason this stopped being a constant. Kept exported-by-proxy below so
- *  existing callers of DESKTOP_API_BASE keep working. */
-const DESKTOP_BASE = DEFAULT_ENGINE_BASE;
 const POLL_INTERVAL_MS = 10_000;
 const FETCH_TIMEOUT_MS = 1500;
 
@@ -57,10 +57,14 @@ let pollTimer: number | null = null;
 let pollPromise: Promise<void> | null = null;
 
 async function probeOnce(): Promise<void> {
+  // The address this probe asks about: the setting as it is now. If the person
+  // changes it while the answer is on its way, that answer is about a desktop
+  // they no longer point at (a probe of the new address is already running, see
+  // subscribeEngineBase below) and must not be published over it.
+  const base = getEngineBase();
   try {
     const controller = new AbortController();
     const timeout = window.setTimeout(() => controller.abort(), FETCH_TIMEOUT_MS);
-    const base = getEngineBase();
     const resp = await fetch(`${base}/api/health`, {
       method: 'GET',
       signal: controller.signal,
@@ -81,6 +85,7 @@ async function probeOnce(): Promise<void> {
       // identity. Reporting a squatter as "available" would silently route
       // desktop-backed nodes at a stranger.
       const isOaiyCompanion = body?.product === 'oaiy-desktop';
+      if (getEngineBase() !== base) return;
       const next: DesktopInfo = {
         available: isOaiyCompanion,
         version: isOaiyCompanion ? body?.version : undefined,
@@ -98,9 +103,10 @@ async function probeOnce(): Promise<void> {
     // available". Don't log to console; this probe runs on a 10s loop
     // and would flood the console otherwise.
   }
+  if (getEngineBase() !== base) return;
   publish({
     available: false,
-    baseUrl: getEngineBase(),
+    baseUrl: base,
     lastChange: current.available ? Date.now() : current.lastChange,
   });
 }
@@ -108,12 +114,16 @@ async function probeOnce(): Promise<void> {
 function publish(next: DesktopInfo): void {
   if (
     next.available === current.available &&
-    next.version === current.version
+    next.version === current.version &&
+    next.baseUrl === current.baseUrl
   ) {
     // No state change — keep the original lastChange.
     current = { ...current };
     return;
   }
+  // A new address is a change even when the desktop there answers just as the
+  // last one did: whoever shows the address (the dock, the settings card) has
+  // to be told, or it keeps showing the old one.
   current = next;
   for (const listener of listeners) {
     try {
@@ -181,15 +191,6 @@ export async function refreshDesktopStatus(): Promise<DesktopInfo> {
   await probeOnce();
   return current;
 }
-
-// Re-export the base URL so other modules building companion API calls
-// can use a single source of truth. Phase 2/3/4 modules will add their
-// own helpers (e.g. `fetchDesktopServices`, `companionBrowserGoto`)
-// that build on this.
-/** @deprecated Prefer `getEngineBase()` — this is a snapshot taken at module
- *  load, so it does not follow a change made in Settings. Kept because several
- *  callers still import it; each should move to the live getter. */
-export const DESKTOP_API_BASE = getEngineBase();
 
 // Re-probe immediately when the endpoint changes, rather than making the user
 // wait out the 10s poll after typing a new address.

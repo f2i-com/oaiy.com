@@ -16,7 +16,7 @@
     "test:e2e": "node tests/e2e.mjs",
     "test:css": "node tests/css-tokens.mjs",
     "pretest": "node ../scripts/fetch-zipp-release.mjs --ensure",
-    "test": "npm run typecheck && npm run test:css && npm run test:contracts && npm run test:zipp && npm run test:zipp-routing && npm run test:zipp-script && npm run test:in-oaiy && npm run test:flow-services && npm run test:persistent-storage && npm run test:landing",
+    "test": "npm run typecheck && npm run test:css && npm run test:contracts && npm run test:zipp && npm run test:zipp-routing && npm run test:zipp-script && npm run test:in-oaiy && npm run test:flow-services && npm run test:persistent-storage && npm run test:landing && npm run test:engine-endpoint",
     "test:contracts": "node tests/node-contracts.mjs",
     "pretest:zipp": "node ../scripts/fetch-zipp-release.mjs --ensure",
     "test:zipp": "node tests/zipp-executor.mjs",
@@ -26,7 +26,8 @@
     "test:in-oaiy": "node tests/in-oaiy.mjs",
     "test:flow-services": "node tests/flow-services.mjs",
     "test:persistent-storage": "node tests/persistent-storage.mjs",
-    "test:landing": "node tests/landing.mjs"
+    "test:landing": "node tests/landing.mjs",
+    "test:engine-endpoint": "node tests/engine-endpoint.mjs"
   },
   "dependencies": {
     "@ffmpeg/core": "^0.12.10",

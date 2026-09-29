@@ -17,6 +17,7 @@
  */
 
 import { pickFileViaInput, pickFolderViaInput, type OpenDialogOptions } from './dialog';
+import { getEngineBase } from '../lib/engineEndpoint';
 
 type InvokeArgs = Record<string, unknown> | undefined;
 
@@ -898,7 +899,9 @@ const handlers: Record<string, (args: InvokeArgs) => Promise<unknown>> = {
     already_running: false,
     error: 'Local service spawn is not available in the browser build',
   }),
-  // The OAIY Desktop (fixed localhost API :17972) may own this port. Ask it to
+  // The OAIY Desktop (its API is at the engine address in Settings, read now,
+  // not when the page loaded: http://127.0.0.1:17972 unless the person changed
+  // it) may own this port. Ask it to
   // start the matching service if stopped, so picking an OAIY Desktop service in a
   // flow and running it "just works" without a manual Start first (Phase 3.5).
   // Fail-safe: any error, a non-OK response, or an absent companion returns
@@ -913,7 +916,7 @@ const handlers: Record<string, (args: InvokeArgs) => Promise<unknown>> = {
     try {
       const ctrl = new AbortController();
       const timer = setTimeout(() => ctrl.abort(), 2000);
-      const r = await fetch('http://127.0.0.1:17972/api/services/ensure-by-port', {
+      const r = await fetch(`${getEngineBase()}/api/services/ensure-by-port`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ port }),

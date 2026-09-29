@@ -6,8 +6,11 @@
  *   2. The call is sent. A service on OAIY Desktop (a URL starting with `/`,
  *      or on the desktop's origin) is called with the desktop's credential:
  *      in OAIY's window `window.__OAIY_DESKTOP__`, in a flow the desktop runs
- *      `OAIY_SERVER_URL` / `OAIY_SERVER_TOKEN`. Anything else goes through the
- *      runtime's own fetch, with its local-network permission.
+ *      `OAIY_SERVER_URL` / `OAIY_SERVER_TOKEN`; in a plain browser tab the
+ *      desktop is at the engine address in Settings (this machine unless the
+ *      person pointed the editor at another), with no credential. Anything
+ *      else goes through the runtime's own fetch, with its local-network
+ *      permission.
  *   3. A job is followed until it is done (its progress logged, and cancelled
  *      if the flow is stopped), then what it made is fetched.
  *   4. The answer becomes what the nodes pass on: a picture as a data: URL;
@@ -20,6 +23,7 @@
 import type { RuntimeContext } from 'oaiy-core/src/module-types';
 import type { CustomService } from './examples';
 import { engineDefault, engineKindOf, extractPath, renderContractBody } from './contract';
+import { getEngineBase } from '../../lib/engineEndpoint';
 
 /** What a contract call gives back. */
 export interface ContractResult {
@@ -47,7 +51,6 @@ interface Desktop {
   token: string | null;
 }
 
-const DEFAULT_DESKTOP = 'http://127.0.0.1:17972';
 /** The desktop routes a contract may call with the desktop's credential. */
 const DESKTOP_ROUTES = ['/api/ai/engine/', '/api/voice/transcribe', '/api/ai/providers/oaiy-engine/'];
 /** How often a job is polled (tests shorten it). */
@@ -58,7 +61,12 @@ function trimSlash(s: string): string {
   return s.replace(/\/+$/, '');
 }
 
-/** OAIY Desktop, as this run reaches it. */
+/**
+ * OAIY Desktop, as this run reaches it: where OAIY's window or the desktop's own
+ * flow run says it is, else the engine address in Settings (this machine's
+ * loopback unless the person pointed the editor elsewhere), with no credential.
+ * Read each time, so a change of address is followed without a reload.
+ */
 export function desktopAccess(): Desktop {
   const given = (globalThis as { __OAIY_DESKTOP__?: { origin?: unknown; token?: unknown } }).__OAIY_DESKTOP__;
   if (given && typeof given.origin === 'string' && given.origin) {
@@ -66,7 +74,7 @@ export function desktopAccess(): Desktop {
   }
   const env = typeof process !== 'undefined' ? (process.env as Record<string, string | undefined> | undefined) : undefined;
   if (env?.OAIY_SERVER_URL) return { origin: trimSlash(env.OAIY_SERVER_URL), token: env.OAIY_SERVER_TOKEN || null };
-  return { origin: DEFAULT_DESKTOP, token: null };
+  return { origin: trimSlash(getEngineBase()), token: null };
 }
 
 /** A contract URL made absolute: `/…` is on the desktop. */

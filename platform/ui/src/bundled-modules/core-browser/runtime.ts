@@ -17,6 +17,7 @@
 
 import type { RuntimeContext, RuntimeModule, RuntimeMethod } from 'oaiy-core/src/module-types';
 import { MODULE_CLEANUP } from 'oaiy-core/src/module-types';
+import { getEngineBase } from '../../lib/engineEndpoint';
 import {
   extractEmailsScript,
   extractPhonesScript,
@@ -1032,12 +1033,14 @@ function requireTauri(op: string): NonNullable<RuntimeContext['tauri']> {
 // ids never cross transports, and no per-session bookkeeping is needed
 // beyond what `v2Sessions` already tracks.
 //
-// OAIY Desktop's HTTP API binds a fixed loopback port (mirrors
-// `desktopDetection` in the app shell — kept inline here so this bundled
-// module stays self-contained). The Playwright server itself runs on a
-// separate port that we discover from `/api/services`.
+// OAIY Desktop's HTTP API is at the engine address in Settings
+// (lib/engineEndpoint.ts; http://127.0.0.1:17972 unless the person changed
+// it), the same one `desktopDetection` in the app shell probes. It is read
+// each time it is used, so a change is followed without a reload. The
+// Playwright server itself runs on a separate port that we discover from
+// `/api/services`.
 
-const DESKTOP_API = 'http://127.0.0.1:17972';
+const desktopApi = (): string => getEngineBase();
 
 /** Resolved base URL of OAIY Desktop's Playwright server; cached per load. */
 let companionBrowserBase: string | null = null;
@@ -1088,7 +1091,7 @@ async function resolveDesktopBrowserBase(): Promise<string> {
   let services: Array<{ id: string; port?: number; defaultPort?: number; status?: string }>;
   try {
     const snap = await companionFetchJson<{ services?: typeof services }>(
-      `${DESKTOP_API}/api/services`,
+      `${desktopApi()}/api/services`,
       { method: 'GET' },
       2500
     );
@@ -1113,7 +1116,7 @@ async function resolveDesktopBrowserBase(): Promise<string> {
   // the readiness poll below is what actually gates us).
   try {
     await companionFetchJson(
-      `${DESKTOP_API}/api/services/ensure-by-port`,
+      `${desktopApi()}/api/services/ensure-by-port`,
       { method: 'POST', body: JSON.stringify({ port }) },
       4000
     );

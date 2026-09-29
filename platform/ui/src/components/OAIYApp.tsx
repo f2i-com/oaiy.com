@@ -24,7 +24,6 @@ import NewFlowDialog from './dialogs/NewFlowDialog';
 import { useTheme } from '../contexts/ThemeContext';
 import { useMediaQuery } from '../hooks/useMediaQuery';
 import {
-  DESKTOP_API_BASE,
   getDesktopInfo,
   subscribeDesktopStatus,
   type DesktopInfo,
@@ -943,9 +942,9 @@ export default function OAIYApp() {
         {!followsOaiy && <ShellDock
           companionOnline={companion.available}
           endpointLabel={companion.available ? 'Local engine ready' : 'Local engine idle'}
-          endpointUrl={backend.share ? backend.share.editUrl : DESKTOP_API_BASE}
+          endpointUrl={backend.share ? backend.share.editUrl : companion.baseUrl}
           onCopyEndpoint={() => {
-            const url = backend.share ? backend.share.editUrl : DESKTOP_API_BASE;
+            const url = backend.share ? backend.share.editUrl : companion.baseUrl;
             void navigator.clipboard
               ?.writeText(url)
               .then(() => addToast('Endpoint URL copied.', 'success'))
