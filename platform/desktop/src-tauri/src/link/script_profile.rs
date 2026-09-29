@@ -674,33 +674,23 @@ fn read_disk(data_dir: &Path) -> Option<Profile> {
     }
 }
 
-/// Keep it across restarts, temp-and-rename.
+/// Keep it across restarts, written owner-only and replaced atomically.
 ///
 /// Worth a file because the alternative is a window on every start in which the
 /// linked lanes refuse and the provider is told this desktop has no engine — the
 /// work goes back to the browser, correctly but pointlessly, for as long as the
 /// first fetch takes.
+///
+/// Owner-only because the prelude is code this desktop runs: the copy on disk is
+/// only checked against the digest it carries itself, so a file another account
+/// could rewrite would be run as long as it agreed with itself. Not removed
+/// before the rename: `rename` replaces an existing file on Windows too, and the
+/// remove left a moment with no profile at all.
 fn write_disk(data_dir: &Path, profile: &Profile) {
     let path = ProfileCache::path(data_dir);
-    if let Some(parent) = path.parent() {
-        if let Err(e) = std::fs::create_dir_all(parent) {
-            log::warn!("script profile: could not create {}: {e}", parent.display());
-            return;
-        }
-    }
-    let tmp = path.with_extension("json.tmp");
-    if let Err(e) = std::fs::write(&tmp, profile.document.to_string()) {
-        log::warn!("script profile: could not write {}: {e}", tmp.display());
-        return;
-    }
-    // Windows will not rename over an existing file.
-    let _ = std::fs::remove_file(&path);
-    if let Err(e) = std::fs::rename(&tmp, &path) {
+    if let Err(e) = crate::secret_file::write(&path, profile.document.to_string()) {
         log::warn!("script profile: could not save {}: {e}", path.display());
-        let _ = std::fs::remove_file(&tmp);
-        return;
     }
-    super::restrict_to_owner(&path);
 }
 
 #[cfg(test)]
@@ -1159,6 +1149,19 @@ mod tests {
             .load(&account("http://127.0.0.1:9".into()), &spec(), &dir)
             .expect("the saved copy answers before the network is touched");
         assert_eq!(held.document(), &d);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn the_saved_copy_is_owner_only_and_a_newer_one_replaces_it_whole() {
+        let dir = scratch("private");
+        write_disk(&dir, &verify(doc("var helper = 1;")).unwrap());
+        crate::secret_file::testing::assert_private(&ProfileCache::path(&dir));
+
+        let newer = verify(doc("var helper = 2;")).unwrap();
+        write_disk(&dir, &newer);
+        crate::secret_file::testing::assert_private(&ProfileCache::path(&dir));
+        assert_eq!(read_disk(&dir).expect("the newer copy reads back").document(), newer.document());
         let _ = std::fs::remove_dir_all(&dir);
     }
 

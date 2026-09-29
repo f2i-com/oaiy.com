@@ -162,20 +162,11 @@ impl E2eIdentity {
         }
 
         let identity = Self::generate()?;
-        // Written to a temporary name and renamed, so an interrupted first boot
-        // cannot leave a half-written key that the branch above then refuses.
-        let mut tmp = path.clone();
-        tmp.set_extension("tmp");
-        std::fs::create_dir_all(dir)
-            .and_then(|()| std::fs::write(&tmp, identity.secret_key_b64().as_bytes()))
-            .and_then(|()| {
-                #[cfg(unix)]
-                {
-                    use std::os::unix::fs::PermissionsExt;
-                    std::fs::set_permissions(&tmp, std::fs::Permissions::from_mode(0o600))?;
-                }
-                std::fs::rename(&tmp, &path)
-            })
+        // Written to a staging file and renamed, so an interrupted first boot
+        // cannot leave a half-written key that the branch above then refuses. The
+        // staging file is created owner-only, not narrowed after the write: a copy
+        // readable by everyone existed until then.
+        crate::secret_file::write(&path, identity.secret_key_b64())
             .map_err(|e| format!("could not persist the e2e identity: {e}"))?;
         Ok(identity)
     }
@@ -686,6 +677,19 @@ mod tests {
         };
         assert!(err.contains("trust it again"), "{err}");
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn the_chat_identity_key_is_written_owner_only_and_whole() {
+        let dir = crate::secret_file::testing::TempDir::new("e2ekey");
+        let identity = E2eIdentity::load_or_create(&dir.0.join("data")).unwrap();
+        let key = dir.0.join("data").join(IDENTITY_KEY_FILE);
+        crate::secret_file::testing::assert_private(&key);
+        crate::secret_file::testing::assert_private_dir(&dir.0.join("data"));
+        let stored = E2eIdentity::decode_secret(std::fs::read_to_string(&key).unwrap().trim()).unwrap();
+        assert_eq!(stored.public_key_b64(), identity.public_key_b64(), "the file holds this identity's whole secret");
+        let names: Vec<_> = std::fs::read_dir(dir.0.join("data")).unwrap().map(|e| e.unwrap().file_name()).collect();
+        assert_eq!(names.len(), 1, "no staging file is left beside the key: {names:?}");
     }
 
     #[test]

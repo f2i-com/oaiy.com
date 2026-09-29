@@ -761,12 +761,14 @@ fn load_or_create_key(dir: &std::path::Path) -> Result<(SigningKey, KeyProtectio
 }
 
 fn mint_key(dir: &std::path::Path) -> Result<(SigningKey, KeyProtection), String> {
-    std::fs::create_dir_all(dir).map_err(|e| format!("mkdir {}: {e}", dir.display()))?;
     let mut seed = [0u8; 32];
     getrandom::getrandom(&mut seed).map_err(|_| "OS randomness is unavailable".to_string())?;
     let key = SigningKey::from_bytes(&seed);
     let path = dir.join("endpoint.key");
-    std::fs::write(&path, URL_SAFE_NO_PAD.encode(seed))
+    // The desktop's Ed25519 seed, written once and never again: owner-only from
+    // its first byte, because nothing later comes back to narrow it, and whole
+    // or not at all, because a half-written seed reads back as a broken key.
+    crate::secret_file::write(&path, URL_SAFE_NO_PAD.encode(seed))
         .map_err(|e| format!("write {}: {e}", path.display()))?;
     Ok((key, KeyProtection::SoftwareFile))
 }
@@ -863,6 +865,21 @@ mod tests {
         let seed = std::fs::read_to_string(dir.0.join("companion/aokie/endpoint.key")).unwrap();
         assert!(!encoded.contains(seed.trim()), "an offer must never carry the private seed");
         assert!(offer.qr_svg.starts_with("<?xml") || offer.qr_svg.contains("<svg"));
+    }
+
+    #[test]
+    fn the_private_seed_is_written_owner_only_and_a_restart_keeps_the_same_identity() {
+        use crate::secret_file::testing::{assert_private, assert_private_dir};
+        let dir = Dir::new("seedfile");
+        let first = EndpointIdentity::open(dir.0.clone(), "aokie");
+        let seed_file = dir.0.join("companion/aokie/endpoint.key");
+        assert_private(&seed_file);
+        assert_private_dir(seed_file.parent().unwrap());
+
+        let seed = std::fs::read_to_string(&seed_file).unwrap();
+        let again = EndpointIdentity::open(dir.0.clone(), "aokie");
+        assert_eq!(std::fs::read_to_string(&seed_file).unwrap(), seed, "a restart does not mint a new seed");
+        assert_eq!(first.status().endpoint_key, again.status().endpoint_key);
     }
 
     #[test]

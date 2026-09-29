@@ -641,9 +641,7 @@ fn execute(
     // Everything travels by file. Values can be large and the connector config
     // carries this desktop's credential — argv is visible to every process
     // lister on the machine.
-    let scratch = std::env::temp_dir().join(format!("oaiy-flow-run-{}", sanitize(&run.id)));
-    let _ = std::fs::remove_dir_all(&scratch);
-    std::fs::create_dir_all(&scratch).map_err(|e| {
+    let scratch = make_scratch(&run.id).map_err(|e| {
         Failure::new(
             FailureCode::RunnerUnavailable,
             format!("could not create a working directory for the run: {e}"),
@@ -654,6 +652,38 @@ fn execute(
     // Removed on every path: the connector config in here holds the credential.
     let _ = std::fs::remove_dir_all(&scratch);
     result
+}
+
+/// The folder a run's files go in, under the system temp folder: new, and
+/// closed to every other account.
+///
+/// The system temp folder is shared, and this folder is named after a run id
+/// the provider chose, so anyone on the machine can guess the name. So it is
+/// never reused: a leftover of a crashed run of the same id is removed first,
+/// and if the name is still taken (somebody made it, or a file in it is locked)
+/// the run takes a name of its own rather than put the credential into a folder
+/// it did not make. The credential is the file `connector.json`; this folder
+/// and that file are removed when the run ends.
+fn make_scratch(run_id: &str) -> std::io::Result<PathBuf> {
+    make_scratch_in(&std::env::temp_dir(), run_id, |leftover| {
+        let _ = std::fs::remove_dir_all(leftover);
+    })
+}
+
+/// [`make_scratch`] under `base`, with `clear` as what is done about a folder
+/// already standing under the name (the tests stand in a leftover it cannot remove).
+fn make_scratch_in(base: &Path, run_id: &str, clear: impl Fn(&Path)) -> std::io::Result<PathBuf> {
+    let named = base.join(scratch_name(run_id));
+    clear(&named);
+    match crate::secret_file::create_new_private_dir(&named) {
+        Ok(()) => Ok(named),
+        Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
+            let own = base.join(format!("{}-{}", scratch_name(run_id), uuid::Uuid::new_v4().simple()));
+            crate::secret_file::create_new_private_dir(&own)?;
+            Ok(own)
+        }
+        Err(e) => Err(e),
+    }
 }
 
 /// What the provider's prelude costs this run on the command line: the file
@@ -705,9 +735,14 @@ fn run_in(
     };
     write_file(&graph_path, &graph.to_string())?;
     write_file(&inputs_path, &inputs.to_string())?;
-    write_file(&connector_path, &connector_config(account, spec).to_string())?;
-    // The credential is in that file. Same treatment as the stored link.
-    super::restrict_to_owner(&connector_path);
+    // The credential is in this file: owner-only from its first byte, the same
+    // treatment as the stored link it is copied from.
+    crate::secret_file::write(&connector_path, connector_config(account, spec).to_string()).map_err(|e| {
+        Failure::new(
+            FailureCode::RunnerUnavailable,
+            format!("could not write {}: {e}", connector_path.display()),
+        )
+    })?;
 
     // Written into the RUN's own directory rather than shared from the cache:
     // a refresh renaming over a file this child has open is a failure on
@@ -1119,10 +1154,15 @@ fn sanitize(id: &str) -> String {
     }
 }
 
+/// What a run's scratch folder is called (see [`make_scratch`]).
+fn scratch_name(id: &str) -> String {
+    format!("oaiy-flow-run-{}", sanitize(id))
+}
+
 /// Where the scratch directory for a run would go, for tests.
 #[cfg(test)]
 fn scratch_for(id: &str) -> std::path::PathBuf {
-    std::env::temp_dir().join(format!("oaiy-flow-run-{}", sanitize(id)))
+    std::env::temp_dir().join(scratch_name(id))
 }
 
 #[cfg(test)]
@@ -1428,6 +1468,54 @@ mod tests {
         assert!(escaped.to_string_lossy().contains("oaiy-flow-run-evil"));
         assert!(!escaped.to_string_lossy().contains(".."));
         assert!(scratch_for("").to_string_lossy().ends_with("oaiy-flow-run-run"));
+    }
+
+    #[test]
+    fn a_runs_scratch_folder_is_new_private_and_holds_the_credential_owner_only() {
+        use crate::secret_file::testing::{assert_private, assert_private_dir, TempDir};
+        let temp = TempDir::new("scratch");
+        let scratch = make_scratch_in(&temp.0, "run-1", |leftover| {
+            let _ = std::fs::remove_dir_all(leftover);
+        })
+        .unwrap();
+        assert_eq!(scratch, temp.0.join("oaiy-flow-run-run-1"));
+        assert_private_dir(&scratch);
+
+        // The credential goes in here the way `run_in` writes it: private from its
+        // first byte, in a folder nobody else can enter, and gone with the folder.
+        let connector = scratch.join("connector.json");
+        crate::secret_file::write(&connector, json!({ "credential": "flk_not_a_real_key" }).to_string()).unwrap();
+        assert_private(&connector);
+        std::fs::remove_dir_all(&scratch).unwrap();
+        assert!(!connector.exists());
+    }
+
+    #[test]
+    fn a_leftover_of_the_same_run_is_cleared_but_a_folder_that_stays_is_never_reused() {
+        use crate::secret_file::testing::{assert_private_dir, TempDir};
+        let temp = TempDir::new("scratch-taken");
+        let taken = temp.0.join("oaiy-flow-run-run-2");
+        std::fs::create_dir_all(&taken).unwrap();
+        std::fs::write(taken.join("planted.txt"), "not ours").unwrap();
+
+        // A crashed run's leftover is removed, and the name is used again.
+        let cleared = make_scratch_in(&temp.0, "run-2", |leftover| {
+            let _ = std::fs::remove_dir_all(leftover);
+        })
+        .unwrap();
+        assert_eq!(cleared, taken);
+        assert!(!taken.join("planted.txt").exists());
+        assert_private_dir(&cleared);
+
+        // One that cannot be removed (somebody else's, or a locked file in it) stays as it
+        // is: the run takes a folder of its own instead of writing a credential into it.
+        std::fs::write(taken.join("theirs.txt"), "not ours").unwrap();
+        let own = make_scratch_in(&temp.0, "run-2", |_| {}).unwrap();
+        assert_ne!(own, taken);
+        assert!(own.file_name().unwrap().to_string_lossy().starts_with("oaiy-flow-run-run-2-"));
+        assert_private_dir(&own);
+        assert_eq!(std::fs::read_dir(&own).unwrap().count(), 0, "a new folder, empty");
+        assert!(taken.join("theirs.txt").exists(), "and the one that was taken is left alone");
     }
 
     // --- the lane must be complete before anything is claimed --------------

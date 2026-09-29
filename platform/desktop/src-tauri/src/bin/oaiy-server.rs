@@ -172,7 +172,10 @@ async fn main() {
         .map(|s| s.trim().to_owned())
         .filter(|s| !s.is_empty());
 
-    if let Err(e) = std::fs::create_dir_all(&data_dir) {
+    // Owner-only when this is what makes it (unix mode 0700): the provider keys,
+    // the account link, paired-app tokens and identity keys all live in here. A
+    // folder that already exists, such as systemd's StateDirectory, is left as it is.
+    if let Err(e) = oaiy_desktop_lib::secret_file::create_private_dir(&data_dir) {
         eprintln!(
             "oaiy-server: cannot create data dir {}: {e}",
             data_dir.display()

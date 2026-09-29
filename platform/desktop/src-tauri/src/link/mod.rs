@@ -494,16 +494,12 @@ impl LinkStore {
     }
 
     fn persist(&self, account: &LinkedAccount) -> Result<(), String> {
-        if let Some(parent) = self.path.parent() {
-            std::fs::create_dir_all(parent)
-                .map_err(|e| format!("could not create the link directory: {e}"))?;
-        }
         let raw = serde_json::to_string_pretty(account)
             .map_err(|e| format!("could not encode the link: {e}"))?;
-        std::fs::write(&self.path, raw)
-            .map_err(|e| format!("could not save the link: {e}"))?;
-        restrict_to_owner(&self.path);
-        Ok(())
+        // The account's key is in this file: owner-only from its first byte, and
+        // replaced whole so a reader on another thread never meets half of it.
+        crate::secret_file::write(&self.path, raw)
+            .map_err(|e| format!("could not save the link: {e}"))
     }
 
     /// Forget the link. Local only — see the note on the route.
@@ -583,19 +579,6 @@ impl LinkStore {
     fn end(&self) {
         self.inner.lock().unwrap_or_else(|e| e.into_inner()).in_flight = false;
     }
-}
-
-/// Keep the credential out of reach of other accounts on a shared machine.
-fn restrict_to_owner(path: &std::path::Path) {
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        let _ = std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600));
-    }
-    // Everywhere the block above did not consume it. `not(windows)` would leave
-    // it unused on Windows, which is the one platform this ships on.
-    #[cfg(not(unix))]
-    let _ = path;
 }
 
 /// Normalise a user-typed base URL, refusing one we should not send a
@@ -782,6 +765,29 @@ mod tests {
         let raw = serde_json::to_string(&status).unwrap();
         assert!(!raw.contains("flk_supersecret"), "{raw}");
         assert!(!raw.contains("credential"), "{raw}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn the_stored_link_is_owner_only_and_a_replacement_stays_so() {
+        use crate::secret_file::testing::{assert_private, assert_private_dir};
+        let (dir, s) = store("private");
+        s.persist(&account()).unwrap();
+        let file = dir.join("link").join("account.json");
+        assert_private(&file);
+        assert_private_dir(file.parent().unwrap());
+
+        let mut renewed = account();
+        renewed.credential = "flk_renewed".into();
+        s.persist(&renewed).unwrap();
+        assert_private(&file);
+        assert_eq!(open_handle(dir.clone()).account().unwrap().credential, "flk_renewed");
+        let staged: Vec<_> = std::fs::read_dir(file.parent().unwrap())
+            .unwrap()
+            .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+            .filter(|n| n.ends_with(".tmp"))
+            .collect();
+        assert!(staged.is_empty(), "no copy of the key is left behind: {staged:?}");
         let _ = std::fs::remove_dir_all(&dir);
     }
 

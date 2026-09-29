@@ -172,8 +172,9 @@ Two transports, neither a WebSocket.
   a curated catalog (`catalog.rs`). Portable Python and venvs (`python.rs`), a pinned Node for
   the CLI (`node_runtime.rs`).
 - Gateway (`ai/providers.rs`, `gateway.rs`, `egress.rs`): `openai` and `anthropic` protocols
-  (Anthropic translated), keys in `<data>/ai/providers.json` (plain text), injected by the
-  server; SSE passes through for OpenAI-style providers. No realtime or WebSocket proxy.
+  (Anthropic translated), keys in `<data>/ai/providers.json` (plain text, in a file only its
+  owner can read: `secret_file.rs`), injected by the server; SSE passes through for
+  OpenAI-style providers. No realtime or WebSocket proxy.
 
 ## Other things users see
 

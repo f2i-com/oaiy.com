@@ -102,18 +102,11 @@ impl NodeIdentity {
         getrandom::getrandom(&mut secret)
             .map_err(|e| format!("could not read OS randomness for the node identity: {e}"))?;
         let identity = Self::from_secret_bytes(secret);
-        let mut tmp = path.clone();
-        tmp.set_extension("tmp");
-        std::fs::create_dir_all(dir)
-            .and_then(|()| std::fs::write(&tmp, B64.encode(secret).as_bytes()))
-            .and_then(|()| {
-                #[cfg(unix)]
-                {
-                    use std::os::unix::fs::PermissionsExt;
-                    std::fs::set_permissions(&tmp, std::fs::Permissions::from_mode(0o600))?;
-                }
-                std::fs::rename(&tmp, &path)
-            })
+        // Owner-only from its first byte (this file was narrowed only AFTER it was
+        // written, and a copy readable by everyone existed until then), written
+        // whole and renamed into place so an interrupted first boot cannot leave a
+        // half-written key that the branch above then refuses.
+        crate::secret_file::write(&path, B64.encode(secret))
             .map_err(|e| format!("could not persist the data-node identity: {e}"))?;
         Ok(identity)
     }
@@ -381,6 +374,22 @@ mod tests {
             Err(e) => assert!(e.contains("approve this desktop again"), "{e}"),
         }
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn the_signing_key_is_written_owner_only_and_whole() {
+        let dir = crate::secret_file::testing::TempDir::new("nodekey");
+        let key = dir.0.join("nested").join(IDENTITY_FILE);
+        let identity = NodeIdentity::load_or_create(&dir.0.join("nested")).unwrap();
+        crate::secret_file::testing::assert_private(&key);
+        let stored = B64.decode(std::fs::read_to_string(&key).unwrap().trim()).unwrap();
+        assert_eq!(stored.len(), 32, "the whole seed, not a fragment");
+        assert_eq!(
+            NodeIdentity::from_secret_bytes(stored.try_into().unwrap()).fingerprint(),
+            identity.fingerprint()
+        );
+        let names: Vec<_> = std::fs::read_dir(dir.0.join("nested")).unwrap().map(|e| e.unwrap().file_name()).collect();
+        assert_eq!(names.len(), 1, "no staging file is left beside the key: {names:?}");
     }
 
     #[test]

@@ -6,6 +6,8 @@
 //! /api/services/* and stop everything cleanly on exit.
 
 pub mod origin;
+/// Writing a secret to disk owner-only from its first byte (every store of a key or token uses it).
+pub mod secret_file;
 pub mod link;
 pub mod ai;
 pub mod http;
@@ -579,12 +581,11 @@ fn read_hf_token(app: &tauri::AppHandle) -> Option<String> {
 fn write_hf_token(app: &tauri::AppHandle, token: Option<&str>) -> Result<(), String> {
     let _guard = pointer_lock().lock().unwrap_or_else(|e| e.into_inner());
     let p = hf_token_path(app).ok_or("cannot resolve config dir")?;
-    if let Some(parent) = p.parent() {
-        std::fs::create_dir_all(parent).map_err(|e| format!("mkdir config dir: {e}"))?;
-    }
     match token {
         Some(t) if !t.trim().is_empty() => {
-            atomic_write(&p, t.trim())?;
+            // A credential: written owner-only from its first byte, and the
+            // config folder is made owner-only too when this is what makes it.
+            crate::secret_file::write(&p, t.trim()).map_err(|e| format!("write hf token: {e}"))?;
         }
         _ => {
             let _ = std::fs::remove_file(&p);

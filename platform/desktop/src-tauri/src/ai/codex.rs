@@ -175,7 +175,9 @@ type Connect = Arc<dyn Fn(&Path) -> Result<Transport, CodexError> + Send + Sync>
 
 /// The real app-server: the `codex` CLI, in `app-server` mode, on stdio.
 fn spawn_codex(codex_home: &Path) -> Result<Transport, CodexError> {
-    std::fs::create_dir_all(codex_home)
+    // The ChatGPT credential file the child writes lives in here, so where this
+    // process makes the folder it makes it owner-only (see `secret_file`).
+    crate::secret_file::create_private_dir(codex_home)
         .map_err(|e| CodexError::Unavailable(format!("cannot create CODEX_HOME: {e}")))?;
 
     let mut cmd = base_command();

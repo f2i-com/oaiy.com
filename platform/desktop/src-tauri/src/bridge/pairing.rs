@@ -263,17 +263,15 @@ impl PairingManager {
             .retain(|r| r.status == PairingStatus::Pending || now.saturating_sub(r.created_at_ms) <= REQUEST_TTL_MS);
     }
 
+    /// The file holds every granted token in the clear, so it is written owner-only
+    /// and replaced atomically ([`crate::secret_file::write`]). A failed save does not
+    /// stop the grant — the consumer is paired for this session — but it is said.
     fn persist(&self) {
         let Some(path) = &self.path else { return };
-        if let Some(dir) = path.parent() {
-            let _ = std::fs::create_dir_all(dir);
-        }
         let shape = PersistShape { tokens: self.tokens.clone() };
-        if let Ok(body) = serde_json::to_string_pretty(&shape) {
-            let tmp = path.with_extension("json.tmp");
-            if std::fs::write(&tmp, &body).is_ok() {
-                let _ = std::fs::rename(&tmp, path);
-            }
+        let Ok(body) = serde_json::to_string_pretty(&shape) else { return };
+        if let Err(e) = crate::secret_file::write(path, body) {
+            log::warn!("paired-app tokens could not be saved to {}: {e}", path.display());
         }
     }
 }
@@ -508,6 +506,24 @@ mod tests {
         assert_eq!(m2.paired()[0].product, "formlogic");
         assert_eq!(m2.paired()[0].origin.as_deref(), Some("http://formlogic.local"));
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn the_tokens_are_stored_owner_only_and_revoking_keeps_them_so() {
+        use crate::secret_file::testing::{assert_private, assert_private_dir, TempDir};
+        let dir = TempDir::new("pairings");
+        let path = dir.0.join("bridge").join("pairings.json");
+        let mut m = PairingManager::open(path.clone());
+        let id = m.request("formlogic", None, None).pairing_id;
+        let token = m.approve(&id).unwrap().token.unwrap();
+        assert_private(&path);
+        assert_private_dir(path.parent().unwrap());
+        assert!(std::fs::read_to_string(&path).unwrap().contains(&token), "the grant is what the file is for");
+
+        let granted = m.paired()[0].id.clone();
+        assert!(m.revoke(&granted));
+        assert_private(&path);
+        assert!(!std::fs::read_to_string(&path).unwrap().contains(&token), "a revoked token is gone from the file");
     }
 
     #[test]

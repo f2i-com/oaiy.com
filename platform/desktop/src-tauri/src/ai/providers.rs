@@ -7,7 +7,7 @@
 //! every API response uses. OAIY has no OS keyring, so the key is a plaintext
 //! field in `providers.json` — the same trust model as the plaintext `hf-token`
 //! file; it is the full/public split, not encryption, that keeps the key out of
-//! responses.
+//! responses. The file itself is written owner-only ([`crate::secret_file`]).
 //!
 //! Deliberately flat vs. the FormLogic reference: no reusable-secret / alias
 //! indirection (a provider holds its own key), no OS keyring, no Codex virtual
@@ -297,8 +297,8 @@ impl ProviderStore {
         self.providers.iter().find(|p| p.id == id)
     }
 
-    /// Atomic tmp + rename. No-op when in-memory; otherwise the io error reaches
-    /// the caller.
+    /// Atomic replace, owner-only from the first byte. No-op when in-memory;
+    /// otherwise the io error reaches the caller.
     ///
     /// This was previously infallible by construction (`if write(..).is_ok() {
     /// let _ = rename(..) }`), which made a failed save indistinguishable from a
@@ -316,25 +316,12 @@ impl ProviderStore {
         let fail = |e: &dyn std::fmt::Display| {
             format!("could not save providers.json ({e}) — the change applies to this session only and is lost on restart")
         };
-        if let Some(dir) = path.parent() {
-            std::fs::create_dir_all(dir).map_err(|e| fail(&e))?;
-        }
         let shape = PersistShape { providers: self.providers.clone() };
         let body = serde_json::to_string_pretty(&shape).map_err(|e| fail(&e))?;
-        let tmp = path.with_extension("json.tmp");
-        // Remove the tmp on either failure: it holds the PLAINTEXT key and
-        // nothing ever reads or cleans `providers.json.tmp` (`open` only ever
-        // reads `path`), so a failed rename would leave the secret sitting in a
-        // second file indefinitely. Same reason as `lib.rs`'s `atomic_write`.
-        if let Err(e) = std::fs::write(&tmp, &body) {
-            let _ = std::fs::remove_file(&tmp);
-            return Err(fail(&e));
-        }
-        if let Err(e) = std::fs::rename(&tmp, path) {
-            let _ = std::fs::remove_file(&tmp);
-            return Err(fail(&e));
-        }
-        Ok(())
+        // The file holds the PLAINTEXT keys, so it is created private and the
+        // staging copy is removed on a failed rename, never left as a second
+        // file nothing reads or cleans (see `secret_file::write`).
+        crate::secret_file::write(path, body).map_err(|e| fail(&e))
     }
 }
 
@@ -507,10 +494,24 @@ mod tests {
         // persist that succeeds still carries it to disk.
         assert!(s.get_full("openai").unwrap().has_key());
         assert!(s.delete("openai").is_err(), "an unsaved delete must not report success");
-        assert!(
-            !path.with_extension("json.tmp").exists(),
-            "the plaintext key must not survive in providers.json.tmp"
-        );
+        let left: Vec<String> = std::fs::read_dir(&dir).unwrap().map(|e| e.unwrap().file_name().to_string_lossy().into_owned()).collect();
+        assert_eq!(left, ["providers.json"], "the plaintext key must not survive in a staging file: {left:?}");
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn the_keys_are_written_owner_only_in_a_folder_that_is_ours_alone() {
+        use crate::secret_file::testing::{assert_private, assert_private_dir, TempDir};
+        let dir = TempDir::new("providers");
+        let path = dir.0.join("ai").join("providers.json");
+        let mut s = ProviderStore::open(path.clone());
+        s.upsert(input("openai")).unwrap();
+        s.set_key("openai", Some("sk-private")).unwrap();
+        assert_private(&path);
+        assert_private_dir(path.parent().unwrap());
+        // Every later save replaces the file whole and keeps it private.
+        s.set_key("openai", Some("sk-rotated")).unwrap();
+        assert_private(&path);
+        assert!(std::fs::read_to_string(&path).unwrap().contains("sk-rotated"));
     }
 }

@@ -111,15 +111,14 @@ impl UpstreamStore {
 
     pub fn set(&self, config: UpstreamConfig) -> Result<UpstreamStatus, String> {
         let config = normalize(config)?;
-        if let Some(parent) = self.path.parent() {
-            std::fs::create_dir_all(parent)
-                .map_err(|e| format!("could not create the companion directory: {e}"))?;
-        }
         let raw = serde_json::to_string_pretty(&config)
             .map_err(|e| format!("could not encode the upstream config: {e}"))?;
-        std::fs::write(&self.path, raw)
+        // The bearer is the credential that makes this desktop this account's,
+        // so the file is owner-only from its first byte: other accounts on a
+        // shared machine never get a moment to read it. (On Windows it inherits
+        // the per-user profile ACL; see `secret_file::write`.)
+        crate::secret_file::write(&self.path, raw)
             .map_err(|e| format!("could not save the upstream config: {e}"))?;
-        restrict_to_owner(&self.path);
         *self.config.lock().unwrap_or_else(|e| e.into_inner()) = Some(config);
         Ok(self.status())
     }
@@ -129,20 +128,6 @@ impl UpstreamStore {
         *self.config.lock().unwrap_or_else(|e| e.into_inner()) = None;
         self.status()
     }
-}
-
-/// Keep the bearer out of reach of other accounts on a shared machine.
-///
-/// Best-effort: on Windows the file already inherits a per-user profile ACL,
-/// and a failure here must not stop the user configuring their relay.
-fn restrict_to_owner(path: &std::path::Path) {
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        let _ = std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600));
-    }
-    #[cfg(not(unix))]
-    let _ = path;
 }
 
 /// Reject an issuer we would be unwise to send a credential to.
@@ -513,5 +498,25 @@ mod tests {
         assert_eq!(reopened.get().unwrap().token, "flk_supersecret");
         assert!(!reopened.clear().configured);
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn the_bearer_file_is_owner_only_and_stays_so_when_it_is_replaced() {
+        use crate::secret_file::testing::{assert_private, assert_private_dir, TempDir};
+        let dir = TempDir::new("upstream");
+        let path = dir.0.join("companion").join("relay.json");
+        let store = UpstreamStore::open(path.clone());
+        let config = |token: &str| UpstreamConfig {
+            base_url: "https://formlogic.com/api/v1".into(),
+            token: token.into(),
+            app_id: None,
+        };
+        store.set(config("flk_first")).unwrap();
+        assert_private(&path);
+        assert_private_dir(path.parent().unwrap());
+
+        store.set(config("flk_second")).unwrap();
+        assert_private(&path);
+        assert_eq!(UpstreamStore::open(path.clone()).get().unwrap().token, "flk_second");
     }
 }
