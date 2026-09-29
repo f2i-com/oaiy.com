@@ -126,7 +126,7 @@ function createFakeIDB() {
     }
     begin() {
       this.state = 'active';
-      setTimeout(() => this.run(), 0);
+      setImmediate(() => this.run());
     }
     run() {
       if (this.state !== 'active' || this.busy) return;
@@ -134,11 +134,11 @@ function createFakeIDB() {
       if (!req) {
         if (this.waiting) return;
         this.waiting = true;
-        setTimeout(() => {
+        setImmediate(() => {
           this.waiting = false;
           if (this.requests.length) return this.run();
           this.finish();
-        }, 0);
+        });
         return;
       }
       this.busy = true;
@@ -147,7 +147,7 @@ function createFakeIDB() {
         error = injected(req.op, this.currentStore(req));
         if (!error) result = req.exec();
       } catch (e) { error = e; }
-      setTimeout(() => {
+      const settle = () => {
         this.busy = false;
         if (this.state !== 'active') return;
         if (error) {
@@ -158,7 +158,10 @@ function createFakeIDB() {
         req.result = result;
         try { req.onsuccess?.({ target: req }); } catch (e) { return this.abort(e); }
         this.run();
-      }, knobs.delay[req.op] ?? 0);
+      };
+      // A store answers in a later task; only a slow one (knobs.delay) takes real time.
+      if (knobs.delay[req.op]) setTimeout(settle, knobs.delay[req.op]);
+      else setImmediate(settle);
     }
     currentStore(req) { return this.names.length === 1 ? this.names[0] : undefined; }
     finish() {
@@ -203,7 +206,7 @@ function createFakeIDB() {
         if (fresh) req.onupgradeneeded?.({ target: req });
         req.onsuccess?.({ target: req });
       };
-      setTimeout(() => (knobs.hangOpen ? knobs.hung.push(go) : go()), 0);
+      setImmediate(() => (knobs.hangOpen ? knobs.hung.push(go) : go()));
       return req;
     }
   };
