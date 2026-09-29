@@ -116,7 +116,7 @@ newline-delimited stdio. Capabilities are declared in the manifest; wildcards
 expand at load against declared commands, and undeclared commands/events are
 refused/dropped before the plugin is involved.
 
-- `GET    /api/plugins` — installed plugins; every non-running state carries a reason, and each carries its package `trust` (`state`, `publisher`, `reason`)
+- `GET    /api/plugins` — installed plugins; every non-running state carries a reason, and each whose manifest loaded carries its package `trust` (`state`, `publisher`, `reason`); one whose manifest did not load has no plugin to judge, so no `trust`
 - `POST   /api/plugins/:id/start` / `POST /api/plugins/:id/stop`
 - `POST   /api/plugins/:id/enabled` — body `{ "enabled": bool }`; disabling stops first
 - `POST   /api/plugins/:id/trust` — trust this exact unsigned package (privileged; takes only the id, reads no body)

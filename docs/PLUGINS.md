@@ -80,8 +80,10 @@ entry; rotating a key is a second entry beside the first; removing an entry revo
 A package that may not run is listed as disabled with the reason, and has no manifest: the
 modules, pages, agent tools, setup steps, service definitions and screens are all built
 from the manifest, and none of them may come from a folder that failed its check. A plugin
-that is already running when its folder stops verifying is left running, says so on its
-card, and is not started again.
+that is already running when its folder stops verifying is left running, so a live call is
+not dropped, and says so on its card. It keeps the manifest it was started from (an edit to
+`manifest.json` under it widens nothing it may do), it serves no screens and offers no
+service definitions, and it is not started again.
 
 **When it is checked.** When the plugins folder is scanned (the listing is polled every
 couple of seconds, so a cheap fingerprint of the folder, with no reading of files, decides
@@ -92,6 +94,30 @@ starts a process is the check made a moment before it, so a file swapped between
 and the launch is caught. (The check and the process creation are still two steps; the
 folder is in your own data directory, so this guards against a tampered download, a
 swapped file or a stale copy, not against malware already running as you.)
+
+**What is built from what was checked.** A scan builds a plugin from `manifest.json`, so it
+hands the check the bytes it read: an answer only stands for a folder whose manifest is
+exactly those bytes, and a manifest rewritten to the same length with its modified time put
+back, which the fingerprint cannot see, is caught there. The launch goes further. Its
+permit carries the folder that was checked and the manifest parsed from the very bytes that
+were hashed, and `PluginProcess::spawn` takes both from it: nothing is started that the
+verified manifest does not name. That entry is a path inside the folder. A `:` in it, which
+on Windows is a drive or an alternate data stream of a file (a stream is in no listing and
+no digest), is refused when the manifest loads, whoever signed it. A file with a stream is
+not refused for having one: Windows marks downloaded files with a `Zone.Identifier` stream.
+The screens a plugin serves to the dashboard are read from a signed package only when their
+bytes are what the signature lists. The fingerprint still cannot see any other file
+rewritten to the same size with its time put back, so between scans the listing can be
+stale for one; the launch check reads every file, and is what decides whether a process
+starts.
+
+**State kept inside a package.** Older versions of a plugin kept their own state in
+`<plugin>/data`. A scan moves it out of a signed bundle, to `<data>/plugin-data/<id>`, only
+when that is what makes the bundle verify: the signature holds, it lists nothing under
+`data/` (a `data` folder a publisher signed is theirs, not the plugin's state), and every
+other file is as signed. A package that fails for any other reason is left as found, and a
+link named `data` is never moved. A launch moves it only for a package nothing verified;
+trusting a package moves it first, so the trust survives the launch.
 
 **Trusting an unsigned plugin.** In a release build a plugin with no signature does not
 start. If you built it yourself or know where it came from, **Trust this plugin** on its
