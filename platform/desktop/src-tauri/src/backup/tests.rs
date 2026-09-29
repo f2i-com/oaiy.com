@@ -5018,3 +5018,50 @@ fn a_finished_campaign_stays_finished_and_any_other_comes_back_paused() {
     assert_eq!(state("half")["state"], "paused", "one with someone left to reach is never left as finished, and never running");
     assert!(entries.keys().filter(|n| n.contains("outreach/") && n.ends_with(".json")).all(|n| n.ends_with("index.json") || serde_json::from_slice::<serde_json::Value>(&entries[n]).unwrap()["state"] != "running"));
 }
+
+/// The dry run describes a plugin's settings by key, by name and by value, never by a count, and says by key what it will not restore.
+#[test]
+fn a_plugins_settings_are_described_by_key_and_value_and_what_is_left_out_is_named() {
+    let long_persona = format!("You are a receptionist. {}", "Be brief. ".repeat(390));
+    let hostile = serde_json::json!({
+        "settings": {
+            "greeting": "Hello, thank you for calling", "persona": long_persona, "autoAnswer": true, "screenMessage": "Please hold",
+            "blockedNumbers": "0411 111 111", "bargeSensitivity": 900,
+            "aiEndpoint": "http://attacker.example/v1", "consentMode": "off", "outboundEnabled": true, "managerNumbers": "0499 999 999",
+            "managerPin": "9271830", "acceptPattern": ".*", "brandNew": "x"
+        },
+        "pairedDevices": [{ "address": "66:66:66:66:66:66", "name": "attacker" }]
+    });
+    let hostile_text = hostile.to_string();
+    let files: Vec<(&str, &[u8])> = vec![("plugin-data/aokie/settings.json", hostile_text.as_bytes()), ("callers.json", b"{}")];
+    let out = TempDir::new("plugin-desc");
+    let file = out.0.join("p.oaiybackup");
+    craft(&file, &manifest_for(&files), &files, true);
+    let dst = TempDir::new("plugin-desc-dst");
+    let preview = restore::inspect(&dst.0, &file, PASS, &options()).unwrap();
+    let plugin: Vec<&review::ReviewItem> = preview.items.iter().filter(|i| i.class == RestoreClass::Plugins).collect();
+    assert!(!plugin.is_empty() && plugin.iter().all(|i| i.name.starts_with("plugin-data/aokie/settings.json#settings.")), "each key is an item of its own: {plugin:?}");
+    assert!(plugin.iter().all(|i| !i.what.contains("setting(s) for the plugin")), "never a count");
+    let item = |key: &str| plugin.iter().find(|i| i.name.ends_with(&format!("#settings.{key}"))).unwrap_or_else(|| panic!("settings.{key} is listed: {:?}", plugin.iter().map(|i| &i.name).collect::<Vec<_>>()));
+    assert!(item("greeting").what.contains("\"Hello, thank you for calling\"") && item("greeting").title == "What the receptionist says first");
+    assert!(item("autoAnswer").what.contains("Sets settings.autoAnswer to true"));
+    assert!(item("blockedNumbers").what.contains("0411 111 111") && item("blockedNumbers").what.contains("none of yours is taken away"));
+    // A long persona is cut, with how long it is.
+    let persona = item("persona");
+    assert!(persona.what.contains(&format!("({} characters in all)", long_persona.chars().count())), "{}", persona.what);
+    assert!(persona.what.chars().count() < 700, "{}", persona.what.chars().count());
+    // A number that cannot act is not offered as something to tick.
+    assert!(!plugin.iter().any(|i| i.name.ends_with("#settings.bargeSensitivity")));
+    // What is not restored is named by key, with why and what to do again, and never with its value.
+    for key in ["aiEndpoint", "consentMode", "outboundEnabled", "managerNumbers", "managerPin", "acceptPattern", "brandNew"] {
+        let gone = preview.not_restored.iter().find(|n| n.name.ends_with(&format!("#settings.{key}"))).unwrap_or_else(|| panic!("settings.{key} is named as not restored"));
+        assert!(gone.why.starts_with("not restored"), "{gone:?}");
+    }
+    assert!(preview.not_restored.iter().find(|n| n.name.ends_with("#settings.managerPin")).unwrap().why.contains("To do again"));
+    assert!(preview.not_restored.iter().any(|n| n.name.ends_with("#pairedDevices")));
+    let json = serde_json::to_string(&preview).unwrap();
+    for never_shown in ["attacker.example", "0499 999 999", "9271830", "66:66:66:66:66:66"] {
+        assert!(!json.contains(never_shown), "the value of a key that is never restored is not echoed: {never_shown}");
+    }
+    assert!(preview.classes.iter().any(|c| c.id == "plugins" && c.count == plugin.len()));
+}
