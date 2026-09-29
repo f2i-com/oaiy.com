@@ -51,7 +51,21 @@ the window's own storage), where they are.
 
 Each of these keeps "Restart to update" off, by itself, and is shown in words next to it:
 
-- **A live phone call.** OAIY never restarts during one.
+- **A live phone call**, from two sources, both asked afresh when the button is pressed:
+  - *OAIY's own line*: a call that reaches OAIY's realtime stream (what the call hub counts).
+  - *The phone plugin*: OAIY asks whichever plugin provides the phone module (the module
+    registry says which; nothing in this check knows a plugin by name), by a read-only
+    connector command (`call.switchboard`, else `call.current`), whether a call is ringing, on
+    the line, waiting or on hold. That is what sees a call the plugin runs through its own
+    speech pipeline, screens or holds, which never reaches OAIY's own line. The plugin has 3
+    seconds to answer. **A phone plugin that is running and does not answer, answers with an
+    error, or answers something OAIY cannot read blocks the install** ("can't tell whether a
+    call is live"), and so does one that declares neither command; stopping that plugin
+    (Connections, Plugins) lets it through, as does a plugin that is not running at all. A plugin that is
+    running without its radio attached, or paused, is such a case: it answers with an error, so
+    the install waits until the plugin is stopped or the radio is back.
+  - Not checked: a call the phone plugin does not report through those commands, and a call
+    on a phone or line OAIY has no plugin for. OAIY cannot wait for what it cannot see.
 - **A task the Agent is working on for a flow** (one given to it and not yet answered).
 - **A model or file download** (queued or running, OAIY's or the engines'); a paused one
   resumes after the update.
@@ -61,7 +75,9 @@ Each of these keeps "Restart to update" off, by itself, and is shown in words ne
 - **OAIY having started less than two minutes ago**, or not yet knowing what it is doing.
 
 The blockers are looked at when the button is pressed, and again right before anything is
-stopped (saving the Agent's work takes a few seconds, and a call may have begun).
+stopped (saving the Agent's work takes a few seconds, and a call may have begun). The
+second look asks every source afresh, the phone plugin included: what the status showed a few
+seconds ago is never the answer to "is it safe now".
 
 What OAIY cannot see, it cannot wait for: a conversation the person is having in the Agent
 page right now is not a task the desktop knows about. "Restart to update" asks the Agent to

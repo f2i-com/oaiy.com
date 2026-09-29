@@ -1414,7 +1414,17 @@ pub fn run() {
                 // (or the system one) per run.
                 let node_for_http =
                     crate::services::node_runtime::new_handle(data_dir_for_bridge.clone());
-                // What an update looks at before it restarts OAIY: calls, tasks, downloads, installs, the engines' media.
+                let bridge_for_http = crate::build_bridge_state(
+                    plugins_root_for_http.clone(),
+                    data_dir_for_bridge.clone(),
+                    device_id_for_http.clone(),
+                    Some(node_for_http.clone()),
+                );
+                // Managed so the Exit arm can stop plugin children alongside
+                // services — an orphaned plugin keeps holding its hardware.
+                app_for_http.manage(bridge_for_http.host.clone());
+                // What an update looks at before it restarts OAIY: calls (on OAIY's own line, and what the phone plugin
+                // says), tasks, downloads, installs, the engines' media.
                 crate::update::gui::attach(
                     &updater,
                     &app_for_http,
@@ -1425,19 +1435,14 @@ pub fn run() {
                         registry: Some(registry_for_http.clone()),
                         python: Some(python_for_http.clone()),
                         node: Some(node_for_http.clone()),
-                        engines: Some(Arc::new(crate::engines::activity)),
+                        engines: Some(Arc::new(|_fresh| {
+                            let (media, downloads) = crate::engines::activity();
+                            crate::update::blockers::EnginesState::Known { media, downloads }
+                        })),
                         migration: Some(Arc::new(move || migration_for_updates.lock().map(|m| m.running).unwrap_or(false))),
+                        phone: Some(Arc::new(crate::update::phone::PluginLine::new(bridge_for_http.host.clone()))),
                     },
                 );
-                let bridge_for_http = crate::build_bridge_state(
-                    plugins_root_for_http.clone(),
-                    data_dir_for_bridge.clone(),
-                    device_id_for_http.clone(),
-                    Some(node_for_http.clone()),
-                );
-                // Managed so the Exit arm can stop plugin children alongside
-                // services — an orphaned plugin keeps holding its hardware.
-                app_for_http.manage(bridge_for_http.host.clone());
                 // AI provider store under <data>/ai so it moves with the data dir
                 // (like bridge/pairings.json). Holds provider API keys plaintext,
                 // guarded by the full/public split — never over the wire.

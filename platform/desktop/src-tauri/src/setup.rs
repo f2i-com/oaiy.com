@@ -491,7 +491,7 @@ pub fn plan_check(record: &PluginRecord, step_id: &str, which: Which) -> Result<
     Ok((connector, check))
 }
 
-fn describe_forward_error(e: ForwardError) -> String {
+pub(crate) fn describe_forward_error(e: ForwardError) -> String {
     match e {
         ForwardError::Refused(r) => r.message(),
         ForwardError::NotRunning { plugin_id } => format!("{plugin_id} is not running"),

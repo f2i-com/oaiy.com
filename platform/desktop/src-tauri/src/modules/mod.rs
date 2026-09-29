@@ -82,6 +82,9 @@ pub struct ModuleDef {
     pub noun: &'static str,
     /// Connector commands a provider's connector must declare.
     pub uses: &'static [&'static str],
+    /// Read-only connector commands that say whether a call is live, best first: the first one the provider's
+    /// connector declares is asked before an update stops the provider (see `update::phone`). Empty: nothing to ask.
+    pub live: &'static [&'static str],
     /// Leases only a page using this module takes; let go when it is turned off.
     pub leases: &'static [&'static str],
     /// What it keeps in the data folder (kept when it is off).
@@ -94,10 +97,11 @@ pub const BUILTIN: &[ModuleDef] = &[
         name: "Phone",
         noun: "the phone",
         uses: &["phone.status", "sms.send", "settings.get", "settings.set", "call.dial"],
+        live: &["call.switchboard", "call.current"],
         leases: &["answer-calls", "answer-texts"],
         store: &["callers.json", "voices/"],
     },
-    ModuleDef { id: CALENDAR, name: "Calendar", noun: "the calendar", uses: &[], leases: &[], store: &["calendar/"] },
+    ModuleDef { id: CALENDAR, name: "Calendar", noun: "the calendar", uses: &[], live: &[], leases: &[], store: &["calendar/"] },
 ];
 
 pub fn def(id: &str) -> Option<&'static ModuleDef> {

@@ -74,7 +74,7 @@ pub fn perform(updater: &Updater, steps: &Steps) -> Outcome {
     // 2. The Agent's work is saved.
     (steps.flush)();
     // 3. Nothing may have begun in the meantime.
-    let blockers: Vec<Blocker> = updater.blockers((steps.clock)());
+    let blockers: Vec<Blocker> = updater.blockers_fresh((steps.clock)());
     if !blockers.is_empty() {
         updater.return_to_ready(package);
         return Outcome::Refused(InstallRefusal::Blocked(blockers));

@@ -284,10 +284,21 @@ impl Updater {
         self.inner.lock().unwrap_or_else(|e| e.into_inner())
     }
 
-    /// What stops an install now.
+    /// What stops an install now, for the status a window polls: a source may answer from what it read a few seconds ago.
     pub fn blockers(&self, now: Instant) -> Vec<Blocker> {
+        self.blockers_with(now, false)
+    }
+
+    /// What stops an install now, for the DECISION to install (and the look just before something is stopped):
+    /// every source is asked again, none answers from a cache.
+    pub fn blockers_fresh(&self, now: Instant) -> Vec<Blocker> {
+        self.blockers_with(now, true)
+    }
+
+    fn blockers_with(&self, now: Instant, fresh: bool) -> Vec<Blocker> {
         let activity = self.activity.read().unwrap_or_else(|e| e.into_inner()).clone();
-        blockers::compute(activity.as_deref(), now.saturating_duration_since(self.started))
+        let readings = activity.as_ref().map(|a| a.read(fresh));
+        blockers::compute(readings.as_ref(), now.saturating_duration_since(self.started))
     }
 
     pub fn status(&self) -> Status {
@@ -489,7 +500,7 @@ impl Updater {
         if let AutoUpdate::No(why) = self.platform().auto_update() {
             return Err(InstallRefusal::NotPossibleHere(why));
         }
-        let blockers = self.blockers(now);
+        let blockers = self.blockers_fresh(now);
         let mut inner = self.lock();
         if inner.state != State::Ready || inner.package.is_none() {
             return Err(InstallRefusal::NotReady);
@@ -769,6 +780,18 @@ pub(crate) mod tests {
         assert_eq!(u.status_at(now).state, State::Installing);
         // The package is taken: there is only one install.
         assert_eq!(u.begin_install(now), Err(InstallRefusal::NotReady));
+    }
+
+    #[test]
+    fn the_status_may_answer_from_a_cache_but_the_decision_to_install_asks_every_source_again() {
+        let (u, fake, now) = ready();
+        let before = (fake.reads.load(std::sync::atomic::Ordering::SeqCst), fake.fresh_reads.load(std::sync::atomic::Ordering::SeqCst));
+        u.status_at(now);
+        u.blockers(now);
+        assert_eq!(fake.fresh_reads.load(std::sync::atomic::Ordering::SeqCst), before.1, "a polled status is not a fresh read");
+        assert!(fake.reads.load(std::sync::atomic::Ordering::SeqCst) > before.0);
+        u.begin_install(now).unwrap();
+        assert_eq!(fake.fresh_reads.load(std::sync::atomic::Ordering::SeqCst), before.1 + 1, "the install decision is");
     }
 
     #[test]

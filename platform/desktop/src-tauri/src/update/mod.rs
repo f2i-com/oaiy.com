@@ -30,6 +30,7 @@ pub mod check;
 pub mod feed;
 pub mod install;
 pub mod kind;
+pub mod phone;
 pub mod routes;
 pub mod updater;
 pub mod verify;
@@ -37,6 +38,9 @@ pub mod version;
 
 #[cfg(feature = "gui")]
 pub mod gui;
+
+#[cfg(test)]
+mod guards;
 
 pub use updater::{Updater, UpdaterHandle};
 pub use verify::VerifiedPackage;
