@@ -10,12 +10,14 @@ by hand on its own, because automatic CI is paused).
 
 | File | What it is |
 |---|---|
-| `oaiy-desktop-<v>-windows-x64-setup.exe`, `oaiy-desktop-<v>-windows-x64.msi` | OAIY Desktop for Windows |
-| `oaiy-desktop-<v>-linux-x86_64.AppImage`, `-linux-amd64.deb`, and `-linux-x86_64.rpm` when the build made one (the workflow copies it only if it is there, so a release may have none) | OAIY Desktop for Linux |
+| `oaiy-desktop-<v>-windows-x64-setup.exe`, `oaiy-desktop-<v>-windows-x64.msi` | OAIY Desktop for Windows. The setup.exe is what OAIY updates itself with; the MSI is a manual download. |
+| `oaiy-desktop-<v>-linux-x86_64.AppImage`, `-linux-amd64.deb`, and `-linux-x86_64.rpm` when the build made one (the workflow copies it only if it is there, so a release may have none) | OAIY Desktop for Linux. The AppImage can update itself; the deb and rpm are manual downloads. |
+| `oaiy-desktop-<v>-windows-x64-setup.exe.sig`, `oaiy-desktop-<v>-linux-x86_64.AppImage.sig` | The signature of each installer an update can install, made with the updater key. |
+| `latest.json` | The update feed: the version, the notes, the date, and for `windows-x86_64` and `linux-x86_64` the installer's URL and signature. OAIY Desktop reads it from `releases/latest/download/latest.json`. |
 | `oaiy-server-<v>-windows-x64.zip`, `oaiy-server-<v>-linux-x86_64.tar.gz` | The headless server: the same local API with no window, for a host the CLI or a web app drives. It has no Agent or flow editor to show. |
 | `oaiy-cli-<v>.tar.gz` | The CLI alone, for a product that embeds it |
 | `oaiy-web-<v>.zip`, `oaiy-web-<v>.tar.gz` | The flow editor's site (landing page, `/app.html`, `/desktop.html`), for any static host, built for this release: its download buttons name this release's files (see [The web site](#the-web-site)) |
-| `SHA256SUMS.txt` | The checksum of every file above |
+| `SHA256SUMS.txt` | The checksum of every file above, `latest.json` and the `.sig` files included |
 | `release-evidence-web.json`, `-linux.json`, `-windows.json` | For each build: the revision, target, toolchain, digests, and the verification run that passed before anything was published |
 
 An OAIY Desktop installer is complete by itself for what it shows. Besides the dashboard
@@ -25,6 +27,38 @@ desktop serves into its own window. Building an installer stops if either page i
 empty or incomplete (`platform/desktop/scripts/stage-pages.mjs`), so there is no installer
 that opens on "the page is not built". What OAIY needs at run time (language and other
 models, the portable Python and the Node runtime) is downloaded on first use, not shipped.
+
+## The updater key
+
+OAIY Desktop updates itself from these releases, and refuses any installer whose signature
+does not match the public key inside it (`plugins.updater.pubkey` in
+`platform/desktop/src-tauri/tauri.conf.json`). The release workflow signs the two
+installers an update can install with the matching private key, which lives in two GitHub
+Actions secrets on this repository (Settings, Secrets and variables, Actions):
+
+| Secret | Value |
+|---|---|
+| `TAURI_SIGNING_PRIVATE_KEY` | the content of the private key file |
+| `TAURI_SIGNING_PRIVATE_KEY_PASSWORD` | its password |
+
+They are read by the desktop build step and by the `meta` job's check, and by nothing else.
+A run on a **tag** without either stops in `meta`, before anything is built, with a message
+naming the missing secret: a release that installed copies of OAIY could not verify would be
+worse than none. A run on a branch (the trial run below) without the key builds without
+signatures and says so.
+
+The key was made once. Its file and its password are kept outside every repository, with a
+README that says this again (`C:\Users\<you>\.oaiy-signing\README.txt` on the machine that
+made it). Keep an offline copy of both in a password manager, and delete the local ones.
+**Losing the private key means no installed OAIY can be updated again**: they trust only the
+old public key. The way out is a new key with its public half in `tauri.conf.json`, a new
+release, and everyone installing that release by hand from the releases page; see
+[UPDATES.md](UPDATES.md#the-key-and-its-custody). Never build a test with this key: make a
+throwaway one (`npx tauri signer generate -w <a folder outside the repository>`).
+
+The base `tauri.conf.json` does not turn the signatures on (`bundle.createUpdaterArtifacts`).
+The release workflow passes that as an override of its own, so `npm run tauri:build` on a
+machine without the key still builds an unsigned installer.
 
 ## Cutting a release
 
@@ -59,7 +93,10 @@ models, the portable Python and the Node runtime) is downloaded on first use, no
 4. **Watch the run** (Actions, "Release", or `gh run watch`). `meta` fixes the version and
    the revision, `verify` runs `ci.yml` at that revision, and the web and desktop builds
    run beside it. `release` publishes only when all of them passed. The GitHub Release then
-   holds the files above, and every `release-evidence-*.json` says `verified`.
+   holds the files above, and every `release-evidence-*.json` says `verified`. The
+   release job writes `latest.json` (`platform/scripts/make-latest-json.mjs`) from the
+   installers and their `.sig` files before it writes the checksums, and stops if an
+   installer or a signature is missing.
 
    The build stops when a page is missing, but nothing lists a finished package, so look
    inside one the first time. `7z l oaiy-desktop-<v>-windows-x64-setup.exe` shows
@@ -86,8 +123,14 @@ To try the build without publishing, run the same workflow on a branch instead:
 `gh workflow run release.yml --ref <branch> -f version=0.1.0`. It builds everything and
 keeps the files as the run's artifacts, and creates no release.
 
-Do not move, delete or re-create a published tag. Other products take files from the
-latest release (FormLogic's CI takes `oaiy-cli-<v>.tar.gz`, `SHA256SUMS.txt` and
+Do not move, delete or re-create a published tag. **A release that is published as the
+latest must always be complete**, because two things read the latest release: every
+installed OAIY asks it for `latest.json`, and FormLogic's CI takes files from it. A later
+release without `latest.json`, or with one that leaves a platform out, breaks the feed or
+tells those desktops there is no update, and one without the CLI files breaks FormLogic.
+Do not publish a partial release (a web-only or desktop-only hotfix) as the latest, and do
+not make an older release the latest again: cut a complete new version instead.
+Other products take files from the latest release (FormLogic's CI takes `oaiy-cli-<v>.tar.gz`, `SHA256SUMS.txt` and
 `release-evidence-linux.json`) and check that the evidence names the tag's commit; make a
 new version instead.
 
@@ -134,8 +177,13 @@ a release matter here:
   no models of its own on the computer; the Agent can still use ChatGPT or a provider.
 - **Aokie**, the phone plugin. It is a separate product: OAIY installs it from a folder or
   an archive, and no release of OAIY contains it.
-- **Signed installers, and updates.** The installers are not signed, and OAIY does not
-  update itself: a new version is a new download.
+- **Windows code signing.** The installers are not signed with a certificate
+  (Authenticode), so Windows SmartScreen warns on a download (below). The update signature
+  above is another thing: OAIY checks it, Windows does not.
+- **Updates of the engines, the plugins and the headless server.** OAIY Desktop updates
+  itself, when its owner presses the button. The engines are a separate channel, plugins
+  are installed from a folder or an archive, and `oaiy-server` only tells you that a newer
+  release exists. See [UPDATES.md](UPDATES.md).
 - **macOS.** Only Windows and Linux are built.
 
 ## Installing a release
