@@ -33,10 +33,17 @@ any tool. (`age` asks for the passphrase.)
    already had that name is left as it was.
 3. The result shows where it is, how big, what it holds, and any warnings.
 
-A backup refuses to start while OAIY is busy: a phone call is live, the Agent is working on a
-task for a flow, a download or an install is running, or an engine is working on a picture,
-video or song. That is checked when you press the button and again after you have chosen where
-to save the file (the dialog can stay open for minutes). Try again when it is finished.
+A backup refuses to start while OAIY is busy, and what "busy" means is decided in one place with
+updates: whatever keeps "Restart to update" off keeps a backup off, for the same reason and in the
+same words (see [UPDATES.md](UPDATES.md#what-blocks-an-install)). A phone call is live on OAIY's
+own line, or in a phone plugin's own pipeline (or a phone plugin that is running cannot say whether
+one is: stopping it in Connections, Plugins lets a backup go on), the Agent is working on a task
+from a flow, a model or file is downloading, the engines are making a picture, video or song (or
+are running and cannot say), something is installing, or the data folder is being moved. On top of
+that a backup is refused while another is being made. (How long OAIY has been up is only the
+update's business: a backup can be made a moment after the start.) That is checked when you press
+the button and again after you have chosen where to save the file (the dialog can stay open for
+minutes), asking every source afresh each time. Try again when it is finished.
 
 It also checks the disk first. The unencrypted copy that is made on the way (the working copy,
 the ZIP, and the copy that is opened again to check it) is about three times your data, and the
@@ -132,7 +139,7 @@ A restore is never done in place. It has three steps, and the first two change n
    back (at once, or at the next start) and the failure is reported in Settings. The marker is
    removed last, so a restore is applied once and only once.
 
-The restart button refuses while OAIY is busy (the same list as for making a backup).
+The restart button refuses while OAIY is busy (the same list as for making a backup, and for updating).
 
 ### What comes back by default, and what needs your tick
 

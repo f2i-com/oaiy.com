@@ -15,14 +15,13 @@ use tauri::{AppHandle, Manager, Runtime, Webview};
 use zeroize::Zeroizing;
 
 use super::agent::AgentExport;
-use super::busy::{local_signals, BusySignals};
+use super::busy::Busy;
 use super::create::{create, CreateOptions, CreateResult};
 use super::restore::{self, Preview, RestoreOptions, Staged};
 use super::review::Ticks;
 use super::EXTENSION;
-use crate::services::downloads::{DownloadStatus, DownloadsHandle};
-use crate::services::python::PythonHandle;
-use crate::services::registry::{RegistryHandle, ServiceStatus};
+use crate::services::registry::RegistryHandle;
+use crate::update::UpdaterHandle;
 
 /// The label of the dashboard's own webview.
 const DASHBOARD_LABEL: &str = "main";
@@ -63,36 +62,12 @@ impl<R: Runtime> AgentExport for AgentPage<R> {
     }
 }
 
-/// What is going on in the app, as far as this window can see.
-async fn gather_busy<R: Runtime>(app: &AppHandle<R>) -> BusySignals {
-    let mut signals = local_signals();
-    if let Some(downloads) = app.try_state::<DownloadsHandle>() {
-        signals.downloads += downloads.snapshot().iter().filter(|d| matches!(d.status, DownloadStatus::Queued | DownloadStatus::Active)).count();
-    }
-    if let Some(python) = app.try_state::<PythonHandle>() {
-        if python.snapshot().current_job.is_some_and(|job| job.finished_at.is_none()) {
-            signals.installs += 1;
-        }
-    }
-    if let Some(registry) = app.try_state::<RegistryHandle>() {
-        if let Ok(r) = registry.lock() {
-            signals.installs += r.snapshot().services.iter().filter(|s| s.status == ServiceStatus::Installing).count();
-        }
-    }
-    // The engines are a program of their own: ask them what they are working on.
-    if let Some(ui) = crate::http::engines_ui() {
-        let status_of = |v: &serde_json::Value| v.get("status").and_then(|s| s.as_str()).map(str::to_string).unwrap_or_default();
-        if let Ok(jobs) = crate::http::studio_json(&ui, reqwest::Method::GET, "/api/jobs", None).await {
-            signals.engine_jobs += jobs.get("jobs").and_then(|j| j.as_array()).map_or(0, |j| j.iter().filter(|job| matches!(status_of(job).as_str(), "queued" | "in_progress")).count());
-        }
-        if let Ok(state) = crate::http::studio_json(&ui, reqwest::Method::GET, "/api/downloads", None).await {
-            signals.downloads += state
-                .get("models")
-                .and_then(|m| m.as_array())
-                .map_or(0, |models| models.iter().filter_map(|m| m.get("download")).filter(|d| !d.is_null()).filter(|d| matches!(status_of(d).as_str(), "queued" | "downloading" | "adding")).count());
-        }
-    }
-    signals
+/// What stands in the way of a backup or a restore now: the updater's own decision (the same source and the
+/// same function, `update::blockers`) and a backup already being made. It can ask a phone plugin and so wait a few
+/// seconds, so it is asked off the async runtime's own thread; a look that fails is not taken for quiet.
+async fn look_busy<R: Runtime>(app: &AppHandle<R>) -> Busy {
+    let activity = app.try_state::<UpdaterHandle>().and_then(|updater| updater.activity());
+    tokio::task::spawn_blocking(move || Busy::look(activity.as_deref())).await.unwrap_or_else(|_| Busy::cannot_tell())
 }
 
 async fn pick_save<R: Runtime>(app: &AppHandle<R>, name: &str) -> Option<PathBuf> {
@@ -132,11 +107,11 @@ pub async fn backup_create<R: Runtime>(app: AppHandle<R>, webview: Webview<R>, p
     let passphrase = Zeroizing::new(passphrase);
     super::check_passphrase(&passphrase).map_err(|e| e.message)?;
     let data_dir = data_dir_of(&app)?;
-    gather_busy(&app).await.refuse_if_busy("making a backup").map_err(|e| e.message)?;
+    look_busy(&app).await.refuse_if_busy("making a backup").map_err(|e| e.message)?;
     let name = format!("oaiy-backup-{}.{EXTENSION}", chrono::Local::now().format("%Y-%m-%d"));
     let Some(dest) = pick_save(&app, &name).await else { return Ok(None) };
     // The save dialog can stay open for minutes: a call may have started, or a download, since it was asked.
-    let busy = gather_busy(&app).await;
+    let busy = look_busy(&app).await;
     busy.refuse_if_busy("making a backup").map_err(|e| e.message)?;
     let page = AgentPage { app: app.clone() };
     let made = tokio::task::spawn_blocking(move || {
@@ -181,13 +156,13 @@ pub async fn backup_restore_inspect<R: Runtime>(app: AppHandle<R>, webview: Webv
     }
     let data_dir = data_dir_of(&app)?;
     // Checking a backup takes a second of computing and up to a gigabyte of memory: not while a call is live.
-    let options = RestoreOptions { busy: gather_busy(&app).await, ..RestoreOptions::default() };
+    let options = RestoreOptions { busy: look_busy(&app).await, ..RestoreOptions::default() };
     options.busy.refuse_if_busy("checking a backup").map_err(|e| e.message)?;
     let Some(path) = pick_open(&app).await else { return Ok(None) };
     let meta = std::fs::metadata(&path).map_err(|_| "That file could not be read.".to_string())?;
     let (len, modified) = (meta.len(), meta.modified().ok());
     let file = path.clone();
-    let options = RestoreOptions { busy: gather_busy(&app).await, ..options };
+    let options = RestoreOptions { busy: look_busy(&app).await, ..options };
     let preview = with_time_limit(tokio::task::spawn_blocking(move || restore::inspect(&data_dir, &file, &passphrase, &options)))
         .await
         .map_err(|e| e.message)?;
@@ -214,7 +189,7 @@ pub async fn backup_restore_stage<R: Runtime>(app: AppHandle<R>, webview: Webvie
         }
         inspected.path.clone()
     };
-    let options = RestoreOptions { busy: gather_busy(&app).await, ..RestoreOptions::default() };
+    let options = RestoreOptions { busy: look_busy(&app).await, ..RestoreOptions::default() };
     let staged = with_time_limit(tokio::task::spawn_blocking(move || restore::stage(&data_dir, &path, &passphrase, &ticks, &options)))
         .await
         .map_err(|e| e.message)?;
@@ -257,7 +232,7 @@ pub async fn backup_restart_to_apply(app: AppHandle, webview: Webview) -> Result
         }
         Some(_) => {}
     }
-    gather_busy(&app).await.refuse_if_busy("restarting to finish the restore").map_err(|e| e.message)?;
+    look_busy(&app).await.refuse_if_busy("restarting to finish the restore").map_err(|e| e.message)?;
     crate::gui::restart_app(app);
     Ok(())
 }

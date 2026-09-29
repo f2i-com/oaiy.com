@@ -19,7 +19,7 @@ use serde::Serialize;
 use sha2::{Digest, Sha256};
 
 use super::agent::{self, AgentExport, AgentWait, MISSING_WARNING};
-use super::busy::BusySignals;
+use super::busy::Busy;
 use super::container::{self, Cost};
 use super::manifest::{AppInfo, Counts, Entry, Manifest, VERSION};
 use super::rules::{self, Excluded, Sanitize};
@@ -48,7 +48,7 @@ pub struct CreateOptions<'a> {
     pub limits: Limits,
     pub app_version: String,
     /// What is going on in the app now (the caller gathers it).
-    pub busy: BusySignals,
+    pub busy: Busy,
     /// How to ask the Agent page for its storage; `None` when there is no page to ask.
     pub agent: Option<&'a dyn AgentExport>,
     pub agent_wait: AgentWait,
@@ -65,7 +65,7 @@ impl<'a> CreateOptions<'a> {
             include_keys: false,
             limits: Limits::default(),
             app_version: env!("CARGO_PKG_VERSION").to_string(),
-            busy: BusySignals::default(),
+            busy: Busy::none(),
             agent: None,
             agent_wait: AgentWait::default(),
             cost: Cost::Default,

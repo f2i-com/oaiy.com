@@ -1,81 +1,85 @@
-//! Whether the app is in the middle of something a restart or a backup should not interrupt.
+//! Whether the app is in the middle of something a backup or a restore should not interrupt or copy under.
 //!
-//! Small and self-contained on purpose: a backup refuses to start, and "Restart to finish
-//! restoring" refuses, while a phone call is live, an Agent task is running, a download is going,
-//! or an engine's media job is working. The numbers come from wherever they are kept (the voice
-//! hub, the Agent task hub, the downloads, the engines); this module only turns them into a
-//! plain refusal. The updater has the same need; when the two are merged, [`BusySignals`] is the
-//! part to share.
+//! There is ONE decision about that, and it is the updater's: `update::blockers` (a call on OAIY's own
+//! line, a call a phone plugin reports or cannot say, an Agent task, a download, an engine's media job,
+//! an install, a move of the data folder). A backup asks the source the updater asks
+//! (`Updater::activity`, the desktop's probes) and the function the updater asks
+//! (`blockers::work_blockers`), so whatever holds an update back holds a backup back, and a new thing
+//! the updater learns to look at holds a backup back too. This module keeps no list of sources of its
+//! own: it asks, adds the reasons that are the backup's alone (a backup is already being made), and
+//! turns the reasons into a refusal in the updater's words.
 
-use std::sync::OnceLock;
+use crate::update::blockers::{self, Activity, Blocker, Readings};
 
-use super::{BackupError, ErrorKind, Result};
+use super::{state, BackupError, ErrorKind, Result};
 
-/// How many of each kind of thing is going on.
+/// What does not happen while the app is busy, for the sentences that say so ("It does not ... while it can't tell").
+pub const WAITS: &str = "start a backup or a restore";
+
+/// What stands in the way of a backup or a restore: the updater's reasons (same sources, same words) and the backup's own.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
-pub struct BusySignals {
-    /// Phone calls that are live.
-    pub live_calls: usize,
-    /// Tasks flows have given the Agent that it has not answered.
-    pub agent_tasks: usize,
-    /// Model, engine and other downloads that are running or waiting.
-    pub downloads: usize,
-    /// Image, video, music and other jobs the engines are working on.
-    pub engine_jobs: usize,
-    /// Installs of services, Python or Node that are running.
-    pub installs: usize,
+pub struct Busy {
+    reasons: Vec<Blocker>,
 }
 
-impl BusySignals {
-    /// What is going on, in words a person reads after "OAIY is busy: ".
-    pub fn reasons(&self) -> Vec<String> {
-        let mut out = Vec::new();
-        let mut add = |n: usize, one: &str, many: &str| {
-            if n == 1 {
-                out.push(format!("1 {one}"));
-            } else if n > 1 {
-                out.push(format!("{n} {many}"));
-            }
+impl Busy {
+    /// Nothing in the way (a caller that has not looked, or a test).
+    pub fn none() -> Self {
+        Self::default()
+    }
+
+    /// The reasons for what the app is doing, as the updater would work them out (without how long it has been up).
+    pub fn from_readings(readings: &Readings) -> Self {
+        Self { reasons: blockers::work_blockers(readings, WAITS) }
+    }
+
+    /// Look at the app now, asking every source afresh (this is a decision, not a status a window polls), and add the
+    /// backup's own reasons. `None`: nothing has said what the app is doing yet, which is still starting up.
+    /// This can ask a phone plugin, and so wait a few seconds: not on an async runtime's own thread.
+    pub fn look(activity: Option<&dyn Activity>) -> Self {
+        let mut busy = match activity {
+            Some(activity) => Self::from_readings(&activity.read(true)),
+            None => Self { reasons: vec![Blocker { code: "starting", message: "OAIY is still starting up. Try again in a minute.".to_string() }] },
         };
-        add(self.live_calls, "phone call is live", "phone calls are live");
-        add(self.agent_tasks, "task for the Agent is running", "tasks for the Agent are running");
-        add(self.downloads, "download is running", "downloads are running");
-        add(self.engine_jobs, "engine job is working", "engine jobs are working");
-        add(self.installs, "install is running", "installs are running");
-        out
+        // A backup is already being made: a second one, or a restart that would end it, waits.
+        if state::in_use() {
+            busy = busy.and("backupRunning", "A backup is being made.");
+        }
+        busy
+    }
+
+    /// The look could not be made: not the same as quiet, so it refuses.
+    pub fn cannot_tell() -> Self {
+        Self { reasons: vec![Blocker { code: "unknown", message: "OAIY could not tell what it is doing, so it does not start a backup or a restore. Try again in a moment.".to_string() }] }
+    }
+
+    /// One more reason, the backup's own.
+    pub fn and(mut self, code: &'static str, message: impl Into<String>) -> Self {
+        self.reasons.push(Blocker { code, message: message.into() });
+        self
+    }
+
+    /// The stable names of the reasons, in the order the updater gives them.
+    pub fn codes(&self) -> Vec<&'static str> {
+        self.reasons.iter().map(|b| b.code).collect()
+    }
+
+    /// What is in the way, in words a person reads.
+    pub fn reasons(&self) -> Vec<String> {
+        self.reasons.iter().map(|b| b.message.clone()).collect()
     }
 
     pub fn is_busy(&self) -> bool {
-        self != &Self::default()
+        !self.reasons.is_empty()
     }
 
-    /// `Ok` when nothing is going on; otherwise a refusal that says what, and that it is worth trying again.
+    /// `Ok` when nothing is in the way; otherwise a refusal that says what, and that it is worth trying again.
     pub fn refuse_if_busy(&self, what: &str) -> Result<()> {
         if !self.is_busy() {
             return Ok(());
         }
-        Err(BackupError::new(
-            ErrorKind::Busy,
-            format!("OAIY is busy ({}), so {what} has to wait. Try again when it is finished.", self.reasons().join("; ")),
-        ))
-    }
-}
-
-type Probe = Box<dyn Fn() -> usize + Send + Sync>;
-
-static LIVE_CALLS: OnceLock<Probe> = OnceLock::new();
-
-/// The voice hub says how many calls are live (set once, when the hub is made).
-pub fn register_live_calls(probe: impl Fn() -> usize + Send + Sync + 'static) {
-    let _ = LIVE_CALLS.set(Box::new(probe));
-}
-
-/// What can be known without the GUI's handles: live calls and Agent tasks. The GUI adds the
-/// downloads, installs and engine jobs it can see.
-pub fn local_signals() -> BusySignals {
-    BusySignals {
-        live_calls: LIVE_CALLS.get().map_or(0, |probe| probe()),
-        agent_tasks: crate::agent_tasks::pending_count(),
-        ..BusySignals::default()
+        let mut first = what.chars();
+        let what = first.next().map(|c| c.to_uppercase().collect::<String>() + first.as_str()).unwrap_or_default();
+        Err(BackupError::new(ErrorKind::Busy, format!("{what} has to wait. {} Try again when it is finished.", self.reasons().join(" "))))
     }
 }

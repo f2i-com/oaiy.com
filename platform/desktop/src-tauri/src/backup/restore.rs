@@ -56,14 +56,14 @@ pub struct RestoreOptions {
     pub time_limit: std::time::Duration,
     /// What is going on in the app now: looking at a backup asks for a second of computing and up to
     /// a gigabyte of memory, and is not done while a call is live.
-    pub busy: super::busy::BusySignals,
+    pub busy: super::busy::Busy,
     /// The largest Agent storage that is left for its page (which takes no more than this).
     pub agent_import_max: u64,
 }
 
 impl Default for RestoreOptions {
     fn default() -> Self {
-        Self { limits: Limits::default(), free_space, time_limit: super::RESTORE_TIME_LIMIT, busy: super::busy::BusySignals::default(), agent_import_max: agent::IMPORT_MAX }
+        Self { limits: Limits::default(), free_space, time_limit: super::RESTORE_TIME_LIMIT, busy: super::busy::Busy::none(), agent_import_max: agent::IMPORT_MAX }
     }
 }
 

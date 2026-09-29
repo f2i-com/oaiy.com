@@ -44,6 +44,11 @@ pub(crate) fn begin_run() -> Option<RunGuard> {
     Some(RunGuard)
 }
 
+/// Whether a backup holds the one place a backup runs in (from the moment it takes it, before its first phase is set).
+pub(crate) fn in_use() -> bool {
+    IN_USE.load(Ordering::SeqCst)
+}
+
 pub(crate) struct RunGuard;
 
 impl Drop for RunGuard {

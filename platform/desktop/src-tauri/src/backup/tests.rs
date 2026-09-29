@@ -13,7 +13,9 @@ use std::sync::{Mutex, Once};
 use sha2::{Digest, Sha256};
 
 use super::agent::{self, AgentExport, DonePayload, PartError, MISSING_WARNING, PART_SIZE};
-use super::busy::BusySignals;
+use super::busy::Busy;
+use crate::update::blockers::{self, fake::Fake, Activity, EnginesState, Readings};
+use crate::update::phone::LineState;
 use super::container::{self, Cost};
 use super::create::{self, create, CreateOptions, CreateResult};
 use super::manifest::{AppInfo, Counts, Entry, Manifest};
@@ -813,36 +815,162 @@ fn not_enough_free_space_refuses_before_anything_is_written() {
     assert_nothing_staged(&dst.0);
 }
 
-// ---- refusing while busy ---------------------------------------------------------------------------
+// ---- refusing while busy: the updater's own decision ---------------------------------------------------------------
+
+/// One thing at a time that is going on, as the updater's activity reports it: what it is, the stable name of the
+/// reason the updater gives for it, and a word its sentence has.
+fn one_thing_going_on() -> Vec<(&'static str, Box<dyn Fn(&Fake)>, &'static str, &'static str)> {
+    fn live() -> LineState {
+        LineState::Live { plugin: "Aokie Phone Bridge".into(), count: 1 }
+    }
+    vec![
+        ("a call on OAIY's own line", Box::new(|f: &Fake| f.set(|s| s.calls = 1)), "call", "phone call"),
+        ("a call a phone plugin reports (Aokie's own pipeline, which OAIY's line never sees)", Box::new(|f: &Fake| f.set(|s| s.phone = Some(live()))), "phoneCall", "Aokie Phone Bridge"),
+        (
+            "a phone plugin that cannot say whether a call is live",
+            Box::new(|f: &Fake| f.set(|s| s.phone = Some(LineState::Unknown { plugin: "Aokie Phone Bridge".into(), why: "no answer".into() }))),
+            "callUnknown",
+            "can't tell whether a phone call is live",
+        ),
+        ("an Agent task from a flow", Box::new(|f: &Fake| f.set(|s| s.tasks = 2)), "agentTask", "2 tasks from flows"),
+        ("a download", Box::new(|f: &Fake| f.set(|s| s.downloads = 1)), "download", "downloading"),
+        ("a download the engines make", Box::new(|f: &Fake| f.state.lock().unwrap().engines = EnginesState::Known { media: 0, downloads: 2 }), "download", "2 models or files"),
+        ("an engine's media job", Box::new(|f: &Fake| f.set(|s| s.media = 1)), "mediaJob", "media"),
+        ("engines that are running and cannot say", Box::new(|f: &Fake| f.set(|s| s.engines_unknown = Some("no answer".into()))), "enginesUnknown", "can't tell whether the engines are busy"),
+        ("an install", Box::new(|f: &Fake| f.set(|s| s.installing = vec!["Python".into()])), "installing", "Something is installing: Python"),
+        ("a move of the data folder", Box::new(|f: &Fake| f.set(|s| s.migrating = true)), "migration", "data folder is being moved"),
+    ]
+}
 
 #[test]
-fn a_busy_app_refuses_to_back_up_and_says_why() {
+fn each_thing_that_stops_an_update_stops_a_backup_a_check_and_a_restore_by_itself_in_the_updaters_words() {
     let data = TempDir::new("busy");
     put(&data.0, "callers.json", b"{}");
     let out = TempDir::new("busy-out");
-    let cases = [
-        (BusySignals { live_calls: 1, ..Default::default() }, "phone call"),
-        (BusySignals { agent_tasks: 2, ..Default::default() }, "tasks for the Agent"),
-        (BusySignals { downloads: 1, ..Default::default() }, "download"),
-        (BusySignals { engine_jobs: 3, ..Default::default() }, "engine jobs"),
-        (BusySignals { installs: 1, ..Default::default() }, "install"),
-    ];
-    for (signals, word) in cases {
+    let file = out.0.join("quiet.oaiybackup");
+    make(&data.0, &file);
+    for (what, make_busy, code, word) in one_thing_going_on() {
+        let activity = Fake::default();
+        make_busy(&activity);
         let _turn = ONE_AT_A_TIME.lock().unwrap_or_else(|e| e.into_inner());
+        let busy = Busy::look(Some(&activity as &dyn Activity));
+        // Every source was asked once, and afresh: this is a decision to go on, not a status a window polls.
+        assert_eq!((activity.reads.load(std::sync::atomic::Ordering::SeqCst), activity.fresh_reads.load(std::sync::atomic::Ordering::SeqCst)), (1, 1), "{what}");
+        // The same reason, and only it, that the updater gives for it: one decision.
+        assert_eq!(busy.codes(), [code], "{what}");
+        let updater = blockers::compute(Some(&activity.read(false)), std::time::Duration::from_secs(3600));
+        assert_eq!(updater.iter().map(|b| b.code).collect::<Vec<_>>(), [code], "{what}: the updater says the same");
+        assert!(busy.reasons()[0].contains(word), "{what}: {:?}", busy.reasons());
+        // It refuses a backup ...
         let mut o = CreateOptions::new(&data.0, out.0.join("b.oaiybackup"), PASS);
         o.cost = Cost::Fixed(8);
-        o.busy = signals.clone();
+        o.busy = busy.clone();
         let err = create(&o).unwrap_err();
-        assert_eq!(err.kind, ErrorKind::Busy);
-        assert!(err.message.contains(word), "{err}");
-        assert!(signals.is_busy());
+        assert_eq!(err.kind, ErrorKind::Busy, "{what}");
+        assert!(err.message.starts_with("Making a backup has to wait.") && err.message.contains(word) && err.message.ends_with("Try again when it is finished."), "{what}: {err}");
+        assert!(!out.0.join("b.oaiybackup").exists(), "{what}: nothing was written");
+        // ... the check of a backup, and preparing a restore.
+        let restoring = RestoreOptions { busy: busy.clone(), ..RestoreOptions::default() };
+        let dst = TempDir::new("busy-dst");
+        assert_eq!(restore::inspect(&dst.0, &file, PASS, &restoring).unwrap_err().kind, ErrorKind::Busy, "{what}");
+        assert_eq!(restore::stage(&dst.0, &file, PASS, &Ticks::all(), &restoring).unwrap_err().kind, ErrorKind::Busy, "{what}");
+        assert_nothing_staged(&dst.0);
     }
-    assert!(!out.0.join("b.oaiybackup").exists());
-    assert!(!BusySignals::default().is_busy());
-    assert!(BusySignals::default().refuse_if_busy("x").is_ok());
-    let all = BusySignals { live_calls: 1, agent_tasks: 1, downloads: 1, engine_jobs: 1, installs: 1 };
-    assert_eq!(all.reasons().len(), 5);
-    assert!(all.refuse_if_busy("restarting").unwrap_err().message.contains("restarting"));
+}
+
+#[test]
+fn a_quiet_app_lets_a_backup_and_a_restore_through_and_an_app_that_has_not_said_yet_does_not() {
+    let data = TempDir::new("busy-quiet");
+    put(&data.0, "callers.json", b"{}");
+    let out = TempDir::new("busy-quiet-out");
+    let file = out.0.join("q.oaiybackup");
+    let _turn = ONE_AT_A_TIME.lock().unwrap_or_else(|e| e.into_inner());
+    // Nothing going on (as the updater's activity reads it, and with no phone plugin): nothing in the way.
+    let quiet = Fake::default();
+    let busy = Busy::look(Some(&quiet as &dyn Activity));
+    assert!(!busy.is_busy() && busy.codes().is_empty() && busy.refuse_if_busy("making a backup").is_ok());
+    assert_eq!(busy, Busy::none());
+    let mut o = CreateOptions::new(&data.0, &file, PASS);
+    o.cost = Cost::Fixed(8);
+    o.busy = busy;
+    create(&o).expect("a quiet app makes a backup");
+    // An idle phone plugin, and an updater that has been up only a moment, do not stand in the way either (the uptime is the update's own).
+    let idle = Fake::default();
+    idle.set(|s| s.phone = Some(LineState::Idle));
+    assert!(!Busy::look(Some(&idle as &dyn Activity)).is_busy());
+    // Nothing has said what the app is doing yet: still starting up, and not taken for quiet.
+    let starting = Busy::look(None);
+    assert_eq!(starting.codes(), ["starting"]);
+    assert_eq!(starting.refuse_if_busy("checking a backup").unwrap_err().kind, ErrorKind::Busy);
+    // A look that could not be made is not quiet either.
+    assert_eq!(Busy::cannot_tell().refuse_if_busy("x").unwrap_err().kind, ErrorKind::Busy);
+}
+
+#[test]
+fn a_backup_that_is_being_made_is_a_reason_of_the_backups_own_on_top_of_the_updaters() {
+    let _turn = ONE_AT_A_TIME.lock().unwrap_or_else(|e| e.into_inner());
+    let activity = Fake::default();
+    activity.set(|s| s.tasks = 1);
+    let running = state::begin_run().expect("free");
+    let busy = Busy::look(Some(&activity as &dyn Activity));
+    // The updater's reason first, then the backup's own.
+    assert_eq!(busy.codes(), ["agentTask", "backupRunning"]);
+    assert!(busy.reasons().join(" ").contains("A backup is being made."));
+    drop(running);
+    assert_eq!(Busy::look(Some(&activity as &dyn Activity)).codes(), ["agentTask"], "gone when the backup is");
+}
+
+#[test]
+fn what_a_backup_waits_for_is_worked_out_in_one_place_and_not_a_second_time() {
+    // The reasons come from `update::blockers` and nowhere else: no list of sources of a backup's own.
+    let sources = [
+        ("backup/busy.rs", include_str!("busy.rs")),
+        ("backup/create.rs", include_str!("create.rs")),
+        ("backup/restore.rs", include_str!("restore.rs")),
+        ("backup/commands.rs", include_str!("commands.rs")),
+        ("backup/routes.rs", include_str!("routes.rs")),
+        ("http.rs", include_str!("../http.rs")),
+    ];
+    for (file, text) in sources {
+        let own_sources: &[&str] = if file == "http.rs" {
+            // (The engines' routes and the like are its own business: only the stub that fed a backup is looked for.)
+            &["BusySignals", "local_signals", "register_live_calls"]
+        } else {
+            &["BusySignals", "local_signals", "register_live_calls", "live_call_count", "live_calls()", "pending_count", "engines_ui", "studio_json", "DownloadsHandle", "PythonHandle", "installing_ids", "job_running", "is_installing"]
+        };
+        for own in own_sources {
+            assert!(!text.contains(own), "{file} has a source of its own ({own}): the reasons come from update::blockers");
+        }
+    }
+    let busy = source_text(include_str!("busy.rs"));
+    assert!(busy.contains("blockers::work_blockers(readings, WAITS)") && busy.contains("activity.read(true)"), "asked afresh, through the updater's function");
+    // The desktop's commands ask the updater's activity, off the runtime's own thread, and take a failed look for busy.
+    let look = command_source_of("look_busy");
+    assert!(look.contains("try_state::<UpdaterHandle>()") && look.contains("updater.activity()") && look.contains("Busy::look(activity.as_deref())") && look.contains("spawn_blocking") && look.contains("Busy::cannot_tell()"), "{look}");
+    // Every command that must not run while the app is busy asks it, and a wait for a dialog does not use an old answer.
+    let commands = source_text(include_str!("commands.rs"));
+    for (name, refusal) in [("backup_create", "making a backup"), ("backup_restore_inspect", "checking a backup"), ("backup_restart_to_apply", "restarting to finish the restore")] {
+        let body = command_source(name);
+        assert!(body.contains("look_busy(&app).await") && (body.contains(&format!("refuse_if_busy(\"{refusal}\")"))), "{name} asks whether the app is busy and refuses with {refusal:?}");
+    }
+    assert!(command_source("backup_restore_stage").contains("busy: look_busy(&app).await"), "preparing a restore takes its own fresh look");
+    assert_eq!(commands.matches("gather_busy").count(), 0);
+    // The stub that told the backup how many calls the hub had is gone from the window's start-up.
+    assert!(!include_str!("../http.rs").contains("backup::busy::register"));
+}
+
+/// A source file as text with `\n` line ends, whatever line endings a checkout gave it (a Windows checkout has CRLF).
+fn source_text(text: &str) -> String {
+    text.replace("\r\n", "\n")
+}
+
+/// The text of a private function of `commands.rs`, from its `fn` line to the end of its body.
+fn command_source_of(name: &str) -> String {
+    let source = source_text(include_str!("commands.rs"));
+    let start = source.find(&format!("async fn {name}")).unwrap_or_else(|| panic!("{name} is in commands.rs"));
+    let rest = &source[start..];
+    let end = rest.find("\n}\n").map(|i| i + 3).unwrap_or(rest.len());
+    rest[..end].to_string()
 }
 
 // ---- restoring: look, stage, apply, undo -----------------------------------------------------------
@@ -1897,7 +2025,7 @@ fn looking_at_a_backup_or_staging_one_waits_while_the_app_is_busy() {
     let file = out.0.join("b.oaiybackup");
     make(&src.0, &file);
     let dst = TempDir::new("busy-restore-dst");
-    let busy = RestoreOptions { busy: BusySignals { live_calls: 1, ..Default::default() }, ..RestoreOptions::default() };
+    let busy = RestoreOptions { busy: Busy::from_readings(&Readings { hub_calls: 1, ..Readings::default() }), ..RestoreOptions::default() };
     assert_eq!(restore::inspect(&dst.0, &file, PASS, &busy).unwrap_err().kind, ErrorKind::Busy);
     assert_eq!(restore::stage(&dst.0, &file, PASS, &Ticks::all(), &busy).unwrap_err().kind, ErrorKind::Busy);
     assert_nothing_staged(&dst.0);
@@ -2989,7 +3117,7 @@ fn what_the_page_says_it_left_out_is_cut_and_limited_before_it_is_recorded() {
 
 /// The text of one command of `commands.rs`, from its `pub async fn` line to the next `#[tauri::command]` (or the end).
 fn command_source(name: &str) -> String {
-    let source = include_str!("commands.rs");
+    let source = source_text(include_str!("commands.rs"));
     let start = source.find(&format!("pub async fn {name}")).unwrap_or_else(|| panic!("{name} is in commands.rs"));
     let rest = &source[start..];
     let end = rest[1..].find("#[tauri::command]").map(|i| i + 1).unwrap_or(rest.len());
@@ -3016,7 +3144,7 @@ fn a_backup_asks_again_whether_the_app_is_busy_after_the_save_dialog() {
     let body = command_source("backup_create");
     let dialog = body.find("pick_save(&app, &name).await").expect("the dialog");
     let after = &body[dialog..];
-    let recheck = after.find("gather_busy(&app).await").expect("the app is looked at again after the dialog");
+    let recheck = after.find("look_busy(&app).await").expect("the app is looked at again after the dialog");
     let refuse = after.find("refuse_if_busy(\"making a backup\")").expect("and refused if busy");
     let start = after.find("spawn_blocking").expect("the work");
     assert!(recheck < refuse && refuse < start, "looked at, refused, and only then started");
@@ -3218,7 +3346,7 @@ fn the_import_secret_is_compared_whole_and_only_the_right_one_passes() {
 
 /// The names of the functions of `commands.rs` that are Tauri commands, in the order they are written.
 fn command_names() -> Vec<String> {
-    let source = include_str!("commands.rs");
+    let source = source_text(include_str!("commands.rs"));
     source
         .match_indices("#[tauri::command]")
         .map(|(at, _)| {
@@ -3242,14 +3370,14 @@ fn every_command_of_the_dashboard_checks_its_caller_before_anything_else() {
         assert!(first.starts_with("dashboard(&webview)?;"), "{name}: the caller is checked before anything else: {:?}", &first[..first.len().min(60)]);
     }
     // And the check is the label test, which lets in the dashboard's window and no other.
-    let source = include_str!("commands.rs");
+    let source = source_text(include_str!("commands.rs"));
     assert!(source.contains("fn dashboard<R: Runtime>(webview: &Webview<R>) -> Result<(), String> {\n    check_label(webview.label())\n}"));
     assert!(source.contains("const DASHBOARD_LABEL: &str = \"main\";") && source.contains("if label == DASHBOARD_LABEL {"));
 }
 
 #[test]
 fn the_window_registers_exactly_the_backup_commands_there_are() {
-    let lib = include_str!("../lib.rs");
+    let lib = source_text(include_str!("../lib.rs"));
     let mut registered: Vec<String> = lib
         .match_indices("crate::backup::commands::")
         .map(|(at, _)| lib[at + "crate::backup::commands::".len()..].chars().take_while(|c| c.is_alphanumeric() || *c == '_').collect::<String>())
@@ -3266,7 +3394,7 @@ fn the_window_registers_exactly_the_backup_commands_there_are() {
 
 #[test]
 fn the_staged_restore_is_applied_before_anything_in_the_start_up_opens_a_store() {
-    let lib = include_str!("../lib.rs");
+    let lib = source_text(include_str!("../lib.rs"));
     let setup = lib.find(".setup(|app| {").expect("the start-up");
     let apply = lib[setup..].find("crate::backup::restore::apply_pending(&data_dir)").expect("the staged restore is applied at the start") + setup;
     // Nothing runs before the builder's setup that could read the data folder: no data folder is even known.

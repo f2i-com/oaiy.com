@@ -1631,11 +1631,6 @@ pub async fn serve(
             crate::voice::caller_from_events(&events, call)
         })
     };
-    // A backup and a restart wait while a call is live.
-    {
-        let hub = voice.clone();
-        crate::backup::busy::register_live_calls(move || hub.live_calls().len());
-    }
     let voice_routes = crate::voice::app_router(voice.clone());
     // Putting a caller through to the owner: which Companions could take the call, and whether the owner is at the computer
     // (only where there is a window to ring).
