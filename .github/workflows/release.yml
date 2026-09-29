@@ -283,6 +283,12 @@ jobs:
     name: Desktop (${{ matrix.label }})
     needs: meta
     runs-on: ${{ matrix.os }}
+    # The digest of the installer an update can install, as this leg made it (the step "Record the installer's digest"). Each leg sets
+    # its own output; the two are merged for the jobs that need this one. The sign job compares what it downloads with them: a job output
+    # travels apart from the artifact store, which is where a swapped or altered installer would be.
+    outputs:
+      windows-setup-sha256: ${{ steps.digests.outputs.windows-setup-sha256 }}
+      linux-appimage-sha256: ${{ steps.digests.outputs.linux-appimage-sha256 }}
     env:
       ZIPP_RELEASE: ${{ needs.meta.outputs.zipp-release }}
       ZIPP_SUMS_SHA256: ${{ needs.meta.outputs.zipp-sums-sha256 }}
@@ -446,6 +452,24 @@ jobs:
           fi
           ls -l "$out"
 
+      # The installer an update can install, as it now sits in release/ (the very file the artifact carries): its digest goes out as a job
+      # output. The sign job signs the bytes that have it, and no others.
+      - name: Record the installer's digest
+        id: digests
+        shell: bash
+        env:
+          VERSION: ${{ needs.meta.outputs.version }}
+          LABEL: ${{ matrix.label }}
+        run: |
+          set -euo pipefail
+          if [[ "$LABEL" == "windows" ]]; then
+            name="windows-setup-sha256"; file="release/oaiy-desktop-$VERSION-windows-x64-setup.exe"
+          else
+            name="linux-appimage-sha256"; file="release/oaiy-desktop-$VERSION-linux-x86_64.AppImage"
+          fi
+          [[ -s "$file" ]] || { echo "::error::$file is not there to record"; exit 1; }
+          echo "$name=$(sha256sum "$file" | cut -d' ' -f1)" >> "$GITHUB_OUTPUT"
+
       # The final ARCHIVE (not the developer tree) starts with an empty profile,
       # no system Node/npm on PATH and no checkout paths: smoke-server.mjs
       # builds that environment itself.
@@ -530,11 +554,16 @@ jobs:
       - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
         with:
           node-version: ${{ env.NODE_VERSION }}
+      # The two desktop builds' artifacts by their exact names (never a pattern that would take whatever else matches), each into a folder
+      # of its own, so that what one leg made cannot stand in for the other's.
       - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
         with:
-          pattern: desktop-*
-          path: artifacts
-          merge-multiple: true
+          name: desktop-windows
+          path: artifacts/windows
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          name: desktop-linux
+          path: artifacts/linux
 
       # The Tauri CLI, from the lockfile, and no install scripts: nothing here needs one.
       - name: Install the Tauri CLI
@@ -545,6 +574,9 @@ jobs:
         shell: bash
         env:
           VERSION: ${{ needs.meta.outputs.version }}
+          # What the desktop legs recorded of the installers they made (job outputs of the build, not of the artifact).
+          WINDOWS_SETUP_SHA256: ${{ needs.desktop.outputs.windows-setup-sha256 }}
+          LINUX_APPIMAGE_SHA256: ${{ needs.desktop.outputs.linux-appimage-sha256 }}
           TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
           TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
         run: |
@@ -567,16 +599,29 @@ jobs:
           artifacts="$GITHUB_WORKSPACE/artifacts"
           work="$RUNNER_TEMP/signing"; out="$GITHUB_WORKSPACE/signatures"
           mkdir -p "$work" "$out"
+          # What is signed is what the desktop build made: the installer is there, its digest is the one the build recorded, and no signature
+          # and no other installer of the kinds this job signs came with it. Anything else stops the job before anything is signed.
+          refuse() { echo "::error::$1"; exit 1; }
+          check_input() {
+            local dir="$1" asset="$2" expected="$3" extra actual
+            [[ "$expected" =~ ^[0-9a-f]{64}$ ]] || refuse "the desktop build recorded no digest for $asset, so it is not signed"
+            [[ -s "$dir/$asset" ]] || refuse "$asset is not among the desktop builds' artifacts"
+            actual="$(sha256sum "$dir/$asset" | cut -d' ' -f1)"
+            [[ "$actual" == "$expected" ]] || refuse "$asset is not what the desktop build made: its digest is $actual and the build recorded $expected"
+            extra="$(find "$dir" -type f \( -name '*.sig' -o -name '*-setup.exe' -o -name '*.AppImage' \) ! -name "$asset")"
+            [[ -z "$extra" ]] || refuse "the desktop build's artifacts hold ${extra%%$'\n'*} beside $asset: nothing but the installer is signed, and no signature comes from a build"
+          }
+          check_input "$artifacts/windows" "oaiy-desktop-$VERSION-windows-x64-setup.exe" "$WINDOWS_SETUP_SHA256"
+          check_input "$artifacts/linux" "oaiy-desktop-$VERSION-linux-x86_64.AppImage" "$LINUX_APPIMAGE_SHA256"
           sign_as() {
-            local asset="$1" bundled="$2"
-            [[ -s "$artifacts/$asset" ]] || { echo "::error::$asset is not among the desktop builds' artifacts"; exit 1; }
-            cp "$artifacts/$asset" "$work/$bundled"
+            local dir="$1" asset="$2" bundled="$3"
+            cp "$dir/$asset" "$work/$bundled"
             "$GITHUB_WORKSPACE/platform/desktop/node_modules/.bin/tauri" signer sign "$work/$bundled" >/dev/null
             [[ -s "$work/$bundled.sig" ]] || { echo "::error::tauri signer sign made no signature for $asset"; exit 1; }
             cp "$work/$bundled.sig" "$out/$asset.sig"
           }
-          sign_as "oaiy-desktop-$VERSION-windows-x64-setup.exe" "OAIY_${VERSION}_x64-setup.exe"
-          sign_as "oaiy-desktop-$VERSION-linux-x86_64.AppImage" "OAIY_${VERSION}_amd64.AppImage"
+          sign_as "$artifacts/windows" "oaiy-desktop-$VERSION-windows-x64-setup.exe" "OAIY_${VERSION}_x64-setup.exe"
+          sign_as "$artifacts/linux" "oaiy-desktop-$VERSION-linux-x86_64.AppImage" "OAIY_${VERSION}_amd64.AppImage"
           ls -l "$out"
 
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4

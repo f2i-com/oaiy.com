@@ -79,6 +79,7 @@ describe('the updater signing key in release.yml', () => {
       'actions/checkout@11d5960a326750d5838078e36cf38b85af677262',
       'actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020',
       'actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093',
+      'actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093',
       'Install the Tauri CLI',
       SIGN_STEP,
       'actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02',
@@ -92,17 +93,20 @@ describe('the updater signing key in release.yml', () => {
     assert.match(signing.run, /"\$GITHUB_WORKSPACE\/platform\/desktop\/node_modules\/\.bin\/tauri" signer sign "\$work\/\$bundled"/);
     assert.ok(!/npx/.test(signing.run), 'nothing is fetched at signing time');
     assert.equal(signing.workingDirectory, undefined);
-    // It is the download of the desktop builds it works on, and it checks out the revision the gate verified.
-    assert.deepEqual(inSign[2].with, { pattern: 'desktop-*', path: 'artifacts', 'merge-multiple': 'true' });
+    // It works on the two desktop builds' artifacts by their exact names, each in a folder of its own (never a pattern that takes what else
+    // matches), and it checks out the revision the gate verified.
+    assert.deepEqual(inSign[2].with, { name: 'desktop-windows', path: 'artifacts/windows' });
+    assert.deepEqual(inSign[3].with, { name: 'desktop-linux', path: 'artifacts/linux' });
     assert.equal(inSign[0].with.ref, '${{ needs.meta.outputs.revision }}');
   });
 
   it('signs each installer under the name the Tauri bundler gives it, the name the feed check and the desktop take', () => {
     const run = stepNamed(SIGN_JOB, SIGN_STEP).run;
-    for (const { asset, signedName } of platformAssets('__V__')) {
+    for (const { key, asset, signedName } of platformAssets('__V__')) {
       const asAsset = asset.replace('__V__', '$VERSION');
       const asBundled = signedName.replace('__V__', '${VERSION}');
-      assert.ok(run.includes(`sign_as "${asAsset}" "${asBundled}"`), `${asAsset} is signed as ${asBundled}`);
+      const folder = key.startsWith('windows') ? 'windows' : 'linux';
+      assert.ok(run.includes(`sign_as "$artifacts/${folder}" "${asAsset}" "${asBundled}"`), `${asAsset} is signed as ${asBundled}, from the ${folder} leg's folder`);
     }
     // The MSI, the .deb and the .rpm are not signed: nothing updates them.
     assert.ok(!/\.msi|\.deb|\.rpm/.test(run));
@@ -195,13 +199,25 @@ describe('the signing step, run for real with a stand-in Tauri CLI', { skip: !ba
   const PASSWORD_VALUE = 'a-password-that-must-not-be-printed';
   let counter = 0;
 
-  /** A workspace as the sign job has it after the download: the desktop builds' installers under artifacts/, and a stand-in Tauri CLI where npm ci puts it. */
+  const sha256 = (data) => crypto.createHash('sha256').update(data).digest('hex');
+  const bytesOf = (asset) => `the bytes of ${asset}`;
+  const [SETUP_ASSET, APPIMAGE_ASSET] = platformAssets(VERSION).map((p) => p.asset);
+  const dirOf = (w, asset) => path.join(w.ws, 'artifacts', asset === SETUP_ASSET ? 'windows' : 'linux');
+  /** What the desktop legs recorded of what they made, as job outputs: the environment the sign step is given. */
+  const recorded = { WINDOWS_SETUP_SHA256: sha256(bytesOf(SETUP_ASSET)), LINUX_APPIMAGE_SHA256: sha256(bytesOf(APPIMAGE_ASSET)) };
+
+  /** A workspace as the sign job has it after the downloads: each desktop leg's artifacts in a folder of its own, and a stand-in Tauri CLI where npm ci puts it. */
   function workspace({ skip = [] } = {}) {
     const root = path.join(scratch, `sign-${++counter}`);
     const dirs = { root, ws: path.join(root, 'ws'), tmp: path.join(root, 'tmp'), bin: path.join(root, 'ws', 'platform', 'desktop', 'node_modules', '.bin'), tools: path.join(root, 'tools') };
     for (const d of Object.values(dirs)) fs.mkdirSync(d, { recursive: true });
-    fs.mkdirSync(path.join(dirs.ws, 'artifacts'), { recursive: true });
-    for (const { asset } of platformAssets(VERSION)) if (!skip.includes(asset)) fs.writeFileSync(path.join(dirs.ws, 'artifacts', asset), `the bytes of ${asset}`);
+    fs.mkdirSync(path.join(dirs.ws, 'artifacts', 'windows'), { recursive: true });
+    fs.mkdirSync(path.join(dirs.ws, 'artifacts', 'linux'), { recursive: true });
+    for (const asset of [SETUP_ASSET, APPIMAGE_ASSET]) if (!skip.includes(asset)) fs.writeFileSync(path.join(dirOf({ ws: dirs.ws }, asset), asset), bytesOf(asset));
+    // What else a leg's artifact holds (the MSI, the server, the evidence) and the sign job does not sign.
+    fs.writeFileSync(path.join(dirs.ws, 'artifacts', 'windows', `oaiy-desktop-${VERSION}-windows-x64.msi`), 'the msi');
+    fs.writeFileSync(path.join(dirs.ws, 'artifacts', 'windows', 'release-evidence-windows.json'), '{}');
+    fs.writeFileSync(path.join(dirs.ws, 'artifacts', 'linux', `oaiy-desktop-${VERSION}-linux-amd64.deb`), 'the deb');
     // The stand-in signer: signs the file it is given, for real, as the Tauri CLI does (a .sig beside it whose trusted comment names the file).
     const signer = path.join(dirs.tools, 'signer.mjs');
     fs.writeFileSync(
@@ -225,7 +241,7 @@ describe('the signing step, run for real with a stand-in Tauri CLI', { skip: !ba
   }
 
   const run = (w, env = {}) =>
-    runBash(step.run, { ...process.env, GITHUB_WORKSPACE: slashes(w.ws), RUNNER_TEMP: slashes(w.tmp), VERSION, [SECRET]: KEY, [PASSWORD]: PASSWORD_VALUE, ...env }, w.ws);
+    runBash(step.run, { ...process.env, GITHUB_WORKSPACE: slashes(w.ws), RUNNER_TEMP: slashes(w.tmp), VERSION, ...recorded, [SECRET]: KEY, [PASSWORD]: PASSWORD_VALUE, ...env }, w.ws);
 
   it('signs the two installers, each as the bundler names it, and writes each signature under the release asset’s name', () => {
     const w = workspace();
@@ -247,7 +263,7 @@ describe('the signing step, run for real with a stand-in Tauri CLI', { skip: !ba
     // What the release job has after it downloads every artifact into one folder.
     const dir = path.join(w.root, 'release');
     fs.mkdirSync(dir);
-    for (const name of fs.readdirSync(path.join(w.ws, 'artifacts'))) fs.copyFileSync(path.join(w.ws, 'artifacts', name), path.join(dir, name));
+    for (const asset of [SETUP_ASSET, APPIMAGE_ASSET]) fs.copyFileSync(path.join(dirOf(w, asset), asset), path.join(dir, asset));
     for (const name of fs.readdirSync(path.join(w.ws, 'signatures'))) fs.copyFileSync(path.join(w.ws, 'signatures', name), path.join(dir, name));
     const feed = buildFeed({ dir, version: VERSION, pubkey: keys.pubkey, pubDate: '2026-10-01T02:03:04Z' });
     assert.deepEqual(Object.keys(feed.platforms).sort(), ['linux-x86_64', 'windows-x86_64']);
@@ -308,6 +324,67 @@ describe('the signing step, run for real with a stand-in Tauri CLI', { skip: !ba
     }
   });
 
+  it('signs only what the desktop build recorded: an installer whose digest is not the recorded one is refused before anything is signed', () => {
+    // Each installer altered after the build recorded it (a swapped or changed artifact), one platform at a time.
+    for (const asset of [SETUP_ASSET, APPIMAGE_ASSET]) {
+      const w = workspace();
+      fs.appendFileSync(path.join(dirOf(w, asset), asset), '!');
+      const result = run(w);
+      assert.equal(result.status, 1, result.stdout + result.stderr);
+      assert.match(result.stdout, new RegExp(`::error::${asset.replace(/\./g, '\\.')} is not what the desktop build made: its digest is [0-9a-f]{64} and the build recorded [0-9a-f]{64}`));
+      assert.equal(fs.existsSync(w.log), false, 'nothing was signed');
+      assert.equal(fs.existsSync(path.join(w.ws, 'signatures')) ? fs.readdirSync(path.join(w.ws, 'signatures')).length : 0, 0);
+    }
+    // One installer the build recorded and one it did not: the second stops it, though the first is fine and comes first.
+    const w = workspace();
+    fs.appendFileSync(path.join(dirOf(w, APPIMAGE_ASSET), APPIMAGE_ASSET), '!');
+    assert.equal(run(w).status, 1);
+    assert.equal(fs.existsSync(w.log), false, 'the good one was not signed either');
+  });
+
+  it('signs nothing for which the build recorded no digest, or one that is not a digest', () => {
+    for (const [env, asset] of [
+      [{ WINDOWS_SETUP_SHA256: '' }, SETUP_ASSET],
+      [{ LINUX_APPIMAGE_SHA256: '' }, APPIMAGE_ASSET],
+      [{ WINDOWS_SETUP_SHA256: 'not a digest' }, SETUP_ASSET],
+      [{ WINDOWS_SETUP_SHA256: recorded.WINDOWS_SETUP_SHA256.toUpperCase() }, SETUP_ASSET],
+      [{ LINUX_APPIMAGE_SHA256: recorded.LINUX_APPIMAGE_SHA256.slice(1) }, APPIMAGE_ASSET],
+    ]) {
+      const w = workspace();
+      const result = run(w, env);
+      assert.equal(result.status, 1, JSON.stringify(env));
+      assert.match(result.stdout, new RegExp(`::error::the desktop build recorded no digest for ${asset.replace(/\./g, '\\.')}, so it is not signed`));
+      assert.equal(fs.existsSync(w.log), false);
+    }
+  });
+
+  it('refuses artifacts that hold a signature, or an installer of a kind this job signs, that the build did not record', () => {
+    for (const [dir, extra] of [
+      ['windows', `${SETUP_ASSET}.sig`],
+      ['linux', `${APPIMAGE_ASSET}.sig`],
+      ['windows', 'evil.sig'],
+      ['windows', `oaiy-desktop-${VERSION}-windows-x64-setup-2.exe.sig`],
+      ['windows', 'other-setup.exe'],
+      ['linux', 'other.AppImage'],
+      // The other platform's installer, in this platform's artifact.
+      ['linux', SETUP_ASSET],
+      ['windows', APPIMAGE_ASSET],
+    ]) {
+      const w = workspace();
+      fs.writeFileSync(path.join(w.ws, 'artifacts', dir, extra), 'planted');
+      const result = run(w);
+      assert.equal(result.status, 1, `${dir}/${extra}: ${result.stdout}${result.stderr}`);
+      assert.match(result.stdout, /::error::the desktop build's artifacts hold .* beside oaiy-desktop-0\.1\.0-/);
+      assert.equal(fs.existsSync(w.log), false, 'nothing was signed');
+    }
+    // A file in a subfolder counts too.
+    const w = workspace();
+    fs.mkdirSync(path.join(w.ws, 'artifacts', 'linux', 'sub'));
+    fs.writeFileSync(path.join(w.ws, 'artifacts', 'linux', 'sub', 'x.sig'), 'planted');
+    assert.equal(run(w).status, 1);
+    // What else a leg's artifact holds is left alone (the MSI, the packages, the evidence): the good case above signed with them there.
+  });
+
   it('fails when an installer is not among the builds’ artifacts, or the signer fails, and publishes nothing', () => {
     const setup = platformAssets(VERSION)[0].asset;
     const missing = workspace({ skip: [setup] });
@@ -324,6 +401,55 @@ describe('the signing step, run for real with a stand-in Tauri CLI', { skip: !ba
     assert.equal(none.status, 1);
     assert.match(none.stdout, /::error::tauri signer sign made no signature for oaiy-desktop-0\.1\.0-windows-x64-setup\.exe/);
     assert.deepEqual(fs.readdirSync(path.join(silent.ws, 'signatures')), []);
+  });
+});
+
+describe('the digest of each installer, from the build to the sign job', () => {
+  it('is a job output of the desktop job, one per leg, which the sign job is given', () => {
+    assert.deepEqual(document.jobs.desktop.outputs, {
+      'windows-setup-sha256': '${{ steps.digests.outputs.windows-setup-sha256 }}',
+      'linux-appimage-sha256': '${{ steps.digests.outputs.linux-appimage-sha256 }}',
+    });
+    const signing = stepNamed(SIGN_JOB, SIGN_STEP);
+    assert.equal(signing.env.WINDOWS_SETUP_SHA256, '${{ needs.desktop.outputs.windows-setup-sha256 }}');
+    assert.equal(signing.env.LINUX_APPIMAGE_SHA256, '${{ needs.desktop.outputs.linux-appimage-sha256 }}');
+    assert.ok(document.jobs[SIGN_JOB].needs.includes('desktop'));
+  });
+
+  it('is recorded from the file the artifact carries: after it is collected, before evidence and upload', () => {
+    const legs = steps.filter((s) => s.job === 'desktop').map((s) => s.name);
+    const record = legs.indexOf("Record the installer's digest");
+    assert.ok(record > legs.indexOf('Collect'), 'after Collect: the file is in release/');
+    assert.ok(record < legs.findIndex((name) => name.startsWith('Release evidence')), 'before the evidence');
+    assert.ok(record < legs.findIndex((name) => name.startsWith('actions/upload-artifact@')), 'before the upload');
+    assert.equal(stepNamed('desktop', "Record the installer's digest").id, 'digests');
+  });
+
+  const record = stepNamed('desktop', "Record the installer's digest");
+  it('is the sha256 of the release file of its own leg, and sets no output of the other leg', { skip: !bash && 'bash is needed' }, () => {
+    for (const [label, asset, name, other] of [
+      ['windows', `oaiy-desktop-${VERSION}-windows-x64-setup.exe`, 'windows-setup-sha256', 'linux-appimage-sha256'],
+      ['linux', `oaiy-desktop-${VERSION}-linux-x86_64.AppImage`, 'linux-appimage-sha256', 'windows-setup-sha256'],
+    ]) {
+      const dir = fs.mkdtempSync(path.join(scratch, `record-${label}-`));
+      fs.mkdirSync(path.join(dir, 'release'));
+      fs.writeFileSync(path.join(dir, 'release', asset), `the ${label} installer`);
+      // Files beside it that must not be hashed for it.
+      fs.writeFileSync(path.join(dir, 'release', `oaiy-desktop-${VERSION}-windows-x64.msi`), 'the msi');
+      const output = path.join(dir, 'output');
+      fs.writeFileSync(output, '');
+      const result = runBash(record.run, { ...process.env, VERSION, LABEL: label, GITHUB_OUTPUT: slashes(output) }, dir);
+      assert.equal(result.status, 0, result.stdout + result.stderr);
+      assert.equal(fs.readFileSync(output, 'utf8'), `${name}=${crypto.createHash('sha256').update(`the ${label} installer`).digest('hex')}\n`);
+      assert.ok(!fs.readFileSync(output, 'utf8').includes(other));
+      // With the installer missing (or empty) it stops, and records nothing.
+      fs.rmSync(path.join(dir, 'release', asset));
+      fs.writeFileSync(output, '');
+      const missing = runBash(record.run, { ...process.env, VERSION, LABEL: label, GITHUB_OUTPUT: slashes(output) }, dir);
+      assert.equal(missing.status, 1);
+      assert.match(missing.stdout, /::error::release\/oaiy-desktop-.* is not there to record/);
+      assert.equal(fs.readFileSync(output, 'utf8'), '');
+    }
   });
 });
 

@@ -52,6 +52,15 @@ What keeps the key from everything that does not need it:
   --ignore-scripts`: `@tauri-apps/cli` has none, and its Linux binding is an optional package
   the lockfile pins; only esbuild's and fsevents' scripts are skipped, and this job needs
   neither), and nothing of the project is built or run there.
+- **It signs only what the desktop builds made.** It downloads the two desktop artifacts by their
+  exact names (`desktop-windows`, `desktop-linux`), each into a folder of its own, and signs an
+  installer only if its sha256 is the one that leg recorded as a JOB OUTPUT of the build ("Record the
+  installer's digest"): a job output travels apart from the artifact store, where a swapped or
+  altered installer would be. A missing or malformed digest, a digest that differs, and a
+  signature or another installer beside the installer in an artifact (the other platform's, say) stop
+  the job before anything is signed. This binds the transfer, not the build: a build that had
+  been compromised would record the digest of what it made, so the reviewer's approval, after
+  the builds and the gate have passed, is still what stands between a bad build and the key.
 - **It runs on a tag only.** `sign` has `if: needs.meta.outputs.is_tag == 'true'`. A run on a
   branch (the trial run below) never starts it, and says in its log that its installers are
   unsigned. The job also waits for the verification gate and for every desktop build, so
