@@ -9,10 +9,15 @@
 //! way for good. [`write`] makes the file private from its first byte instead, and replaces the old
 //! one atomically.
 
+use std::ffi::OsStr;
 use std::fs::{DirBuilder, File, OpenOptions};
 use std::io::{self, Write as _};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
+
+/// How many staging names a write tries before it gives up: leftovers of killed processes are
+/// rare, and a folder with this many of them in the way is not one to keep writing secrets into.
+const STAGING_NAMES: u64 = 32;
 
 /// Write `contents` to `path`, replacing whatever is there, so that the file is private from the
 /// moment it exists.
@@ -22,7 +27,9 @@ use std::sync::atomic::{AtomicU64, Ordering};
 ///   default permissions, and the umask can only take permissions away from that.
 /// - The staging file is unique to this call, so the GUI and a headless server sharing a data folder,
 ///   or two threads, cannot trample each other's. It is created with `create_new`, which refuses a
-///   name that already exists, even as a symlink somebody planted.
+///   name that already exists, even as a symlink somebody planted: such a name is never written
+///   to or followed, and the next one is tried (a process killed between creating its staging file
+///   and renaming it leaves one behind, and a server in a container is often pid 1 every time).
 /// - It is synced and then renamed over `path`. A reader sees the old file or the new one, never half
 ///   of either, and a crash leaves one of the two: an empty identity key would be a hard failure.
 ///   `rename` replaces an existing file on every platform std supports, so the old file is never
@@ -39,13 +46,26 @@ use std::sync::atomic::{AtomicU64, Ordering};
 /// whatever ACL that folder has. Writing ACLs is a later task (with the keystore); this keeps the
 /// behaviour the stores had on Windows and adds the atomic replace.
 pub fn write(path: &Path, contents: impl AsRef<[u8]>) -> io::Result<()> {
-    write_with(path, contents.as_ref(), |_| {})
+    write_with(path, contents.as_ref(), next_staging_number, |_| {})
 }
 
-/// [`write`], calling `at_creation` with the staging file after it exists and before anything is
-/// written to it: the moment a plain `fs::write` would have left it readable by everyone. The tests
-/// look at its permissions there.
-fn write_with(path: &Path, contents: &[u8], at_creation: impl FnOnce(&File)) -> io::Result<()> {
+/// The number in the next staging file's name: this process's, counting up from 0 (so the pid and
+/// the number together are what tells two writers' files apart).
+fn next_staging_number() -> u64 {
+    static STAGED: AtomicU64 = AtomicU64::new(0);
+    STAGED.fetch_add(1, Ordering::Relaxed)
+}
+
+/// [`write`], with the staging numbers from `next`, and calling `at_creation` with the staging file
+/// after it exists and before anything is written to it: the moment a plain `fs::write` would have
+/// left it readable by everyone. The tests look at its permissions there, and choose the numbers so
+/// that the names they plant are the ones in the way.
+fn write_with(
+    path: &Path,
+    contents: &[u8],
+    mut next: impl FnMut() -> u64,
+    at_creation: impl FnOnce(&File),
+) -> io::Result<()> {
     let dir = match path.parent() {
         Some(dir) if !dir.as_os_str().is_empty() => dir,
         _ => Path::new("."),
@@ -55,20 +75,13 @@ fn write_with(path: &Path, contents: &[u8], at_creation: impl FnOnce(&File)) -> 
         .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, format!("{} has no file name", path.display())))?;
     create_private_dir(dir)?;
 
-    static STAGED: AtomicU64 = AtomicU64::new(0);
-    let staging = dir.join(format!(
-        ".{}.{}-{}.tmp",
-        name.to_string_lossy(),
-        std::process::id(),
-        STAGED.fetch_add(1, Ordering::Relaxed)
-    ));
-
+    let (staging, mut file) = create_staging(dir, name, &mut next)?;
     let staged = (|| {
-        let mut file = create_new_owner_only(&staging)?;
         at_creation(&file);
         file.write_all(contents)?;
         file.sync_all()
     })();
+    drop(file);
     if let Err(e) = staged {
         let _ = std::fs::remove_file(&staging);
         return Err(e);
@@ -79,6 +92,26 @@ fn write_with(path: &Path, contents: &[u8], at_creation: impl FnOnce(&File)) -> 
     }
     sync_dir(dir);
     Ok(())
+}
+
+/// Make the staging file for a write of `name` in `dir`: `.<name>.<pid>-<number>.tmp`, new, owner-only.
+///
+/// A name that is taken is skipped, not reused and not followed (`create_new` refuses even a
+/// symlink), and the next number is tried, up to [`STAGING_NAMES`] times. What holds the name is
+/// left alone: it may be somebody else's.
+fn create_staging(dir: &Path, name: &OsStr, next: &mut impl FnMut() -> u64) -> io::Result<(PathBuf, File)> {
+    for _ in 0..STAGING_NAMES {
+        let staging = dir.join(format!(".{}.{}-{}.tmp", name.to_string_lossy(), std::process::id(), next()));
+        match create_new_owner_only(&staging) {
+            Ok(file) => return Ok((staging, file)),
+            Err(e) if e.kind() == io::ErrorKind::AlreadyExists => continue,
+            Err(e) => return Err(e),
+        }
+    }
+    Err(io::Error::new(
+        io::ErrorKind::AlreadyExists,
+        format!("{STAGING_NAMES} staging names for {} are taken in {}", name.to_string_lossy(), dir.display()),
+    ))
 }
 
 /// `rename`, which replaces `to` if it is there.
@@ -297,7 +330,7 @@ mod tests {
         let dir = TempDir::new("window");
         let path = dir.0.join("endpoint.key");
         let mut looked = false;
-        write_with(&path, b"secret", |file| {
+        write_with(&path, b"secret", next_staging_number, |file| {
             let meta = file.metadata().unwrap();
             assert_eq!(meta.len(), 0, "nothing has been written yet");
             let mode = meta.permissions().mode() & 0o777;
@@ -307,6 +340,61 @@ mod tests {
         .unwrap();
         assert!(looked);
         assert_eq!(std::fs::read(&path).unwrap(), b"secret");
+    }
+
+    /// The name of the staging file this process would make for `endpoint.key` at `number`.
+    fn staging_name(number: u64) -> String {
+        format!(".endpoint.key.{}-{number}.tmp", std::process::id())
+    }
+
+    /// A process killed between creating its staging file and renaming it leaves the file behind,
+    /// and the next run of a server that is pid 1 every time asks for the same name. That name is
+    /// skipped, whatever holds it (a leftover, or a symlink somebody planted), and the write lands.
+    #[test]
+    fn a_staging_name_that_is_taken_is_skipped_and_what_holds_it_is_left_alone() {
+        let dir = TempDir::new("taken");
+        let path = dir.0.join("endpoint.key");
+        std::fs::write(dir.0.join(staging_name(100)), "a leftover").unwrap();
+        #[cfg(unix)]
+        {
+            // A planted link to a file the write must not reach.
+            let victim = dir.0.join("victim");
+            std::fs::write(&victim, "not to be overwritten").unwrap();
+            std::os::unix::fs::symlink(&victim, dir.0.join(staging_name(101))).unwrap();
+        }
+        #[cfg(not(unix))]
+        std::fs::write(dir.0.join(staging_name(101)), "another leftover").unwrap();
+
+        let mut numbers = 100..;
+        write_with(&path, b"the seed", || numbers.next().unwrap(), |_| {}).unwrap();
+
+        assert_eq!(std::fs::read(&path).unwrap(), b"the seed");
+        assert_private(&path);
+        assert_eq!(std::fs::read_to_string(dir.0.join(staging_name(100))).unwrap(), "a leftover");
+        #[cfg(unix)]
+        assert_eq!(std::fs::read_to_string(dir.0.join("victim")).unwrap(), "not to be overwritten");
+        let mut expected = vec!["endpoint.key".to_string(), staging_name(100), staging_name(101)];
+        #[cfg(unix)]
+        expected.push("victim".to_string());
+        expected.sort();
+        assert_eq!(names(&dir.0), expected, "the two plants stay as they were, and the write left nothing else");
+    }
+
+    /// The search for a free name is bounded, and giving up is an error with nothing of the
+    /// secret written anywhere.
+    #[test]
+    fn a_folder_with_every_staging_name_taken_fails_the_write_and_writes_nothing() {
+        let dir = TempDir::new("all-taken");
+        let path = dir.0.join("endpoint.key");
+        for number in 0..STAGING_NAMES {
+            std::fs::write(dir.0.join(staging_name(number)), "a leftover").unwrap();
+        }
+        let mut numbers = 0..;
+        let err = write_with(&path, b"the seed", || numbers.next().unwrap(), |_| {}).unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::AlreadyExists, "{err}");
+        assert!(!path.exists(), "the secret was not written");
+        assert_eq!(names(&dir.0).len() as u64, STAGING_NAMES, "only the plants are there");
+        assert_eq!(numbers.next(), Some(STAGING_NAMES), "and no more names were tried than the bound");
     }
 
     /// A key file an older build left world-readable is replaced by a private one, not chmod-ed in place.
