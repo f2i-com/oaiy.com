@@ -270,15 +270,21 @@ async function main(): Promise<void> {
    */
   let streaming: Session | null = null;
   const drawnTo = new Map<Session, number>();
+  /** Lanes held back from the chat in their run: they stay so until it ends (their reply drawn whole then), whatever happens meanwhile. */
+  const buffered = new Set<Session>();
   /** Whether a lane of the conversation shown streams its reply into the chat now. */
   const streams = (lane: Session): boolean => {
+    if (buffered.has(lane)) return false;
     const live = sessions?.list.find((s) => s.thread === lane.thread && s.callId);
     if (live) {
-      if (streaming !== live) streaming = live;
-      return lane === live;
+      streaming = live;
+      if (lane === live) return true;
+    } else {
+      if (!streaming || !streaming.running || streaming.thread !== lane.thread) streaming = lane;
+      if (streaming === lane) return true;
     }
-    if (!streaming || !streaming.running || streaming.thread !== lane.thread) streaming = lane;
-    return streaming === lane;
+    buffered.add(lane);
+    return false;
   };
 
   const chat = new ChatPane({
@@ -557,8 +563,9 @@ async function main(): Promise<void> {
           else chat.user(text, []);
         },
         finished: (session) => {
+          const held = buffered.delete(session);
           if (viewing !== session.thread) return;
-          if (streaming === session) {
+          if (streaming === session && !held) {
             chat.endReply();
             streaming = null;
           } else {
@@ -1459,8 +1466,10 @@ With that done, Settings → Images, video and audio → Find OAIY sets it up.`)
     const live = phoneOn() ? shownThreads.find((t) => t.live) : undefined;
     callChip.hidden = !live;
     if (live) {
-      callChip.textContent = `On a call · ${live.title}`;
-      callChip.title = viewing === live.id ? `On a call with ${live.title}: shown here` : `On a call with ${live.title}: click to show it`;
+      // Someone with no name yet: their number, as it is read.
+      const who = live.title === live.key && !live.hidden ? displayNumber(live.key) : live.title;
+      callChip.textContent = `On a call · ${who}`;
+      callChip.title = viewing === live.id ? `On a call with ${who}: shown here` : `On a call with ${who}: click to show it`;
     }
     const settingUp = project.meta.id === SETUP_PROJECT.id;
     chat.setSessions([
@@ -1472,13 +1481,15 @@ With that done, Settings → Images, video and audio → Find OAIY sets it up.`)
         return {
           id: t.id,
           kind: t.kind,
-          name: t.key === TEST_NUMBER ? 'Test' : t.title,
+          // Someone with no name yet goes by their number, as it is read (0491 570 006).
+          name: t.key === TEST_NUMBER ? 'Test' : t.kind === 'person' && t.title === t.key ? displayNumber(t.key) : t.title,
           key: t.key,
           lastAt: t.lastAt,
           live: !!t.live,
           ways: t.ways,
           ...(t.lastWay ? { lastWay: t.lastWay } : {}),
           ...(t.kind === 'person' ? { to: t.live || t.hidden ? ('call' as const) : ('sms' as const) } : {}),
+          ...(t.hidden ? { hidden: true } : {}),
           status: t.live ? 'On a call now' : t.running ? 'Working…' : `${what} · ${since(t.lastAt)}`,
           label: t.key === TEST_NUMBER ? '💬 Test' : `${t.kind === 'task' ? '🔀' : t.lastWay === 'sms' ? '💬' : '📞'} ${t.title}`,
           title: t.kind === 'task' ? `The tasks your flow "${t.title}" gives the agent` : `${t.live ? 'On a call with' : `${what} with`} ${t.title}${t.title !== t.key && !t.hidden ? ` (${displayNumber(t.key)})` : ''}`,
@@ -1550,6 +1561,7 @@ With that done, Settings → Images, video and audio → Find OAIY sets it up.`)
     viewing = thread ? thread.id : null;
     streaming = null;
     drawnTo.clear();
+    buffered.clear();
     showFiles(thread ? frontDesk : project);
     if (thread) {
       chat.replay(sessions!.turnsOf(thread.id), undefined, chatKind(thread));

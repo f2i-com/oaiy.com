@@ -34,6 +34,8 @@ export interface ConversationTab {
   lastWay?: 'call' | 'sms';
   /** A person's: where a message of the person's goes (their call going on, or their texts). */
   to?: 'call' | 'sms';
+  /** A caller who hid their number: no number, and no initials, to show. */
+  hidden?: boolean;
 }
 
 export type ConversationKind = 'project' | 'runner' | 'setup' | 'person' | 'call' | 'sms' | 'task';
@@ -62,8 +64,8 @@ const KIND_ICON: Record<ConversationKind, string> = { project: 'sparkle', runner
 const WAY_ICON = { call: 'phone', sms: 'message' } as const;
 
 /** A conversation's avatar: the person's initials (with how they were last in touch), or its kind's icon. */
-export function conversationAvatar(kind: ConversationKind, name: string, live = false, lastWay?: 'call' | 'sms'): HTMLElement {
-  const letters = kind === 'call' || kind === 'sms' || kind === 'person' ? initials(name) : '';
+export function conversationAvatar(kind: ConversationKind, name: string, live = false, lastWay?: 'call' | 'sms', hidden = false): HTMLElement {
+  const letters = !hidden && (kind === 'call' || kind === 'sms' || kind === 'person') ? initials(name) : '';
   // A person is drawn as the way they were last in touch (a call going on: a call).
   const shown: ConversationKind = kind === 'person' ? (live ? 'call' : lastWay ?? 'call') : kind;
   return h('span.convo-avatar', { class: `kind-${shown}${kind === 'person' ? ' kind-person' : ''}${live ? ' live' : ''}`, 'aria-hidden': 'true' }, letters ? h('span.convo-initials', letters) : icon(KIND_ICON[shown]), ...(letters ? [h('span.convo-kind', icon(KIND_ICON[shown]))] : []));
@@ -83,7 +85,7 @@ export function conversationDetail(tab: ConversationTab, forButton = false): str
   const key = tab.key ?? '';
   if ((kind === 'sms' || kind === 'person') && key === TEST) return 'Test conversation: replies are shown, not sent';
   if ((kind === 'call' || kind === 'sms' || kind === 'person') && key) {
-    const number = key !== name && /\d{4,}/.test(key) ? formatNumber(key) : '';
+    const number = key !== name && !tab.hidden && /\d{4,}/.test(key) ? formatNumber(key) : '';
     const what = kind === 'person' ? waysText(tab.ways ?? []) : kind === 'call' ? 'Calls' : 'Text messages';
     return number ? `${number} · ${what}` : what;
   }
@@ -123,8 +125,8 @@ export class SessionPicker {
         meta: tab.lastAt ? ago(tab.lastAt) : '',
         group,
         kind,
-        keywords: [tab.key, tab.key ? formatNumber(tab.key) : '', tab.status, tab.title, kind === 'person' ? [ways.includes('call') ? 'call phone' : '', ways.includes('sms') ? 'text sms message' : ''].join(' ') : kind === 'call' ? 'call phone' : kind === 'sms' ? 'text sms message' : kind === 'task' ? 'flow task' : 'mine own'].filter(Boolean).join(' '),
-        icon: () => conversationAvatar(kind, name, !!tab.live, tab.lastWay),
+        keywords: [...(tab.hidden ? ['hidden private'] : [tab.key, tab.key ? formatNumber(tab.key) : '']), tab.status, tab.title, kind === 'person' ? [ways.includes('call') ? 'call phone' : '', ways.includes('sms') ? 'text sms message' : ''].join(' ') : kind === 'call' ? 'call phone' : kind === 'sms' ? 'text sms message' : kind === 'task' ? 'flow task' : 'mine own'].filter(Boolean).join(' '),
+        icon: () => conversationAvatar(kind, name, !!tab.live, tab.lastWay, tab.hidden),
         badge: tab.unread || undefined,
         pulse: tab.live ? 'live' : tab.working ? 'working' : undefined,
         title: tab.title ?? name,
@@ -143,7 +145,7 @@ export class SessionPicker {
     const others = this.tabs.filter((t) => t !== tab);
     const unread = others.reduce((n, t) => n + t.unread, 0);
     return [
-      conversationAvatar(kind, name, !!tab.live, tab.lastWay),
+      conversationAvatar(kind, name, !!tab.live, tab.lastWay, tab.hidden),
       h(
         'span.convo-text',
         h('span.convo-name', { class: tab.working || tab.live ? 'working' : '' }, name, ...(tab.live ? [h('span.convo-live', 'Live')] : [])),

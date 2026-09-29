@@ -431,7 +431,7 @@ try {
       await clearSearch();
       await page.keyboard.type('333 444');
       s = await state();
-      expect(s.options.length === 1 && s.options[0] === '+61400333444', JSON.stringify(s.options));
+      expect(s.options.length === 1 && s.options[0] === '0400 333 444', JSON.stringify(s.options));
       await clearSearch();
       await page.keyboard.type('zebra');
       s = await state();
@@ -490,18 +490,19 @@ try {
     await wait(400);
   }
 
-  await conversation(page, 'call', 'Lance');
+  await conversation(page, 'person', 'Lance');
   await closePicker(page);
-  await verify('a conversation opens at its end, the latest at the bottom and the call in order', async () => {
+  await verify("a person's conversation opens at its end, the latest at the bottom, their calls and then their texts in order", async () => {
     await wait(300);
     const s = await logState(page);
     expect(s.fromBottom <= 2 && !s.jump, JSON.stringify(s));
     const order = await page.evaluate(() => [...document.querySelectorAll('.chat-feed .msg-body, .chat-feed .day-divider, .chat-feed .call-end')].map((e) => e.textContent.trim().slice(0, 24)));
-    expect(order[0].startsWith('Yesterday') && order.at(-1) === 'The call ended' && order.indexOf('Perfect, thanks. Bye!') > order.indexOf('Hi there, I was hoping t'), JSON.stringify(order));
+    const texts = order.indexOf('Texts');
+    expect(order[0].startsWith('Yesterday') && order.indexOf('Perfect, thanks. Bye!') > order.indexOf('Hi there, I was hoping t') && texts > order.lastIndexOf('The call ended') && order.at(-1) === 'Thanks 👍', JSON.stringify(order));
   });
   await shoot(page, 'call');
 
-  await conversation(page, 'sms', 'Lance');
+  await conversation(page, 'person', 'Mia Chen');
   await closePicker(page);
   await shoot(page, 'sms');
 
@@ -684,7 +685,7 @@ try {
     await tab.select('.project-select', 'front-desk');
     await tab.waitForFunction(() => /\d+ others/.test(document.querySelector('.chat [aria-haspopup="listbox"]')?.textContent ?? ''), { timeout: 20_000 }).catch(() => {});
     await wait(800);
-    await conversation(tab, 'call', 'Lance').catch((e) => console.log('  ', e.message));
+    await conversation(tab, 'person', 'Lance').catch((e) => console.log('  ', e.message));
     await closePicker(tab);
     await shoot(tab, 'tab-call', { mode: 'tab', sizes: [[1440, 900]] });
     await tab.close();

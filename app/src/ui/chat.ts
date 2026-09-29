@@ -71,6 +71,11 @@ function pageStart(turns: Turn[], size: number): number {
   return from;
 }
 
+/** Who is on a call, as the chat says it: their name, or their number as it is read ("0491 570 006"). */
+function callerName(name: string): string {
+  return /^\+?[\d\s()-]{6,}$/.test(name.trim()) ? formatNumber(name) : name;
+}
+
 /** The way the last of some turns came (a call or a text), for the dividers that follow them. */
 function lastWay(turns: Turn[]): 'call' | 'sms' | null {
   for (let i = turns.length - 1; i >= 0; i--) {
@@ -1459,7 +1464,7 @@ export class ChatPane {
     for (const t of turns) {
       const start = t.role === 'user' && t.automatic ? parseCallStart(t.text) : null;
       if (start) {
-        this.callName = start.name;
+        this.callName = callerName(start.name);
         this.callStartAt = start.at?.getTime() ?? null;
       }
     }
@@ -1568,9 +1573,10 @@ export class ChatPane {
   /** Where a call began: the day and time, who, and what the phone said first. */
   private callStart(start: CallStart): void {
     this.current = null;
-    this.callName = start.name;
+    const name = callerName(start.name);
+    this.callName = name;
     this.way = 'call';
-    const what = start.direction === 'in' ? `Call from ${start.name}` : start.direction === 'back' ? `Called ${start.name} back` : `Called ${start.name}`;
+    const what = start.direction === 'in' ? `Call from ${name}` : start.direction === 'back' ? `Called ${name} back` : `Called ${name}`;
     const when = start.at ? `${dayLabel(start.at)} · ${timeLabel(start.at)}` : start.when;
     this.add(h('div.day-divider', { title: start.number ? `${start.name} (${formatNumber(start.number)})` : start.name }, h('span.day-divider-text', icon('phone'), h('strong', when), h('span', what))));
     if (start.greeting) {
