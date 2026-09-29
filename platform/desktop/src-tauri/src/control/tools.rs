@@ -187,13 +187,13 @@ pub(crate) fn defs() -> &'static [ToolDef] {
                 "Remove a plugin from this computer, with its data (for the phone plugin, its pairing with the phone).",
                 object(json!({ "id": plugin_id() }), &["id"])),
             def("plugin_settings_set", "Change a plugin's settings", Change,
-                "Change some of a plugin's settings through its own settings command: settings holds only the keys to change ({key: value}); plugin_settings_get shows the keys and allowed values. Answers whether they apply only after plugin_restart.",
+                "Change some of a plugin's settings through its own settings command: settings holds only the keys to change ({key: value}); plugin_settings_get shows the keys and allowed values, and a value it showed as [redacted] is left as it is. Answers whether they apply only after plugin_restart.",
                 object(json!({
                     "pluginId": plugin_id(),
                     "settings": { "type": "object", "description": "The settings to change, by key." }
                 }), &["pluginId", "settings"])),
             def("plugin_command", "Send a plugin a command", Change,
-                "Send one of a plugin's declared connector commands (plugins_list lists them), with an optional payload, through the same gate as the dashboard. Commands with effects in the world (a call, a text) really happen.",
+                "Send one of a plugin's declared connector commands (plugins_list lists them), with an optional payload, through the same gate as the dashboard, and answer what it said (secret-looking values hidden). Commands with effects in the world (a call, a text) really happen.",
                 object(json!({
                     "pluginId": plugin_id(),
                     "command": { "type": "string", "minLength": 1, "description": "A command the plugin declares, e.g. phone.status." },
@@ -590,7 +590,8 @@ async fn run(d: &Desk, control: &Control, name: &str, a: &Args<'_>) -> Result<Do
                 format!("{} has no command {command:?}: its commands are {}.", plugin_name(&record), commands_of(&record).join(", "))
             })?;
             let result = connector_call(d, &connector, command, a.value("payload").cloned()).await?;
-            done(format!("{command} answered."), json!({ "result": trim(&result) }))
+            // Secret-looking values stay hidden here too, as plugin_settings_get hides them.
+            done(format!("{command} answered."), json!({ "result": trim(&audit::redact(&result)) }))
         }
         "plugin_setup_open" => {
             let id = a.req("pluginId");
@@ -1427,9 +1428,34 @@ async fn plugin_settings_get(d: &Desk, id: &str) -> Result<Done, String> {
     data(json!({ "pluginId": id, "fields": fields, "settings": trim(&audit::redact(&bag)) }))
 }
 
-async fn plugin_settings_set(d: &Desk, id: &str, settings: Value) -> Result<Done, String> {
+/// `settings` without the values plugin_settings_get hid: sent back, they
+/// would overwrite the plugin's real secret with the word itself. Answers the
+/// keys left out.
+pub(crate) fn without_hidden(settings: &mut Value) -> Vec<String> {
+    fn go(v: &mut Value, at: &str, out: &mut Vec<String>) {
+        if let Value::Object(o) = v {
+            let hidden: Vec<String> = o.iter().filter(|(_, x)| x.as_str() == Some(audit::REDACTED)).map(|(k, _)| k.clone()).collect();
+            for k in hidden {
+                o.remove(&k);
+                out.push(format!("{at}{k}"));
+            }
+            for (k, x) in o.iter_mut() {
+                go(x, &format!("{at}{k}."), out);
+            }
+        }
+    }
+    let mut out = Vec::new();
+    go(settings, "", &mut out);
+    out
+}
+
+async fn plugin_settings_set(d: &Desk, id: &str, mut settings: Value) -> Result<Done, String> {
+    let kept = without_hidden(&mut settings);
     let n = settings.as_object().map_or(0, Map::len);
     if n == 0 {
+        if !kept.is_empty() {
+            return Err(format!("{} were hidden when read and are left as they are: give a real value to change one.", kept.join(", ")));
+        }
         return Err("settings names no setting to change: give {key: value} for each.".into());
     }
     let record = plugin_record(d, id).await?;
@@ -1446,6 +1472,9 @@ async fn plugin_settings_set(d: &Desk, id: &str, settings: Value) -> Result<Done
     }
     if let Some(blocked) = answer.get("blocked").and_then(Value::as_str) {
         summary.push_str(&format!(" It is paused: {blocked}"));
+    }
+    if !kept.is_empty() {
+        summary.push_str(&format!(" Left as they are (hidden when read): {}.", kept.join(", ")));
     }
     done(summary, json!({ "pluginId": id, "answer": trim(&audit::redact(&answer)) }))
 }

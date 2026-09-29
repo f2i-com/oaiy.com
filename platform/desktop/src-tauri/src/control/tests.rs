@@ -759,6 +759,59 @@ async fn a_plugin_counts_as_set_up_when_its_shown_done_checks_pass_as_the_dashbo
 }
 
 #[tokio::test]
+async fn a_hidden_setting_read_back_is_never_written_over_the_real_one() {
+    use axum::extract::Path;
+    use axum::routing::post;
+    let sb = Sandbox::new("hidden");
+    let sent: Arc<Mutex<Vec<Value>>> = Arc::default();
+    let desk = {
+        let sent = sent.clone();
+        Router::new()
+            .route(
+                "/api/plugins",
+                get(|| async {
+                    Json(json!({ "plugins": [{ "id": "demo", "state": "running", "manifest": { "name": "Demo",
+                        "connectors": [{ "id": "demo", "commands": ["settings.get", "settings.set"] }] } }] }))
+                }),
+            )
+            .route(
+                "/api/bridge/connectors/:id/request",
+                post(move |Path(_id): Path<String>, Json(body): Json<Value>| {
+                    let sent = sent.clone();
+                    async move {
+                        sent.lock().unwrap().push(body.clone());
+                        let settings = json!({ "apiKey": "sk-live-abcdefghijklmnopqrstuvwxyz", "mood": "calm", "relay": { "token": "t0k3n", "host": "h" } });
+                        Json(json!({ "ok": true, "result": { "ok": true, "data": { "settings": settings } } }))
+                    }
+                }),
+            )
+    };
+    let (_, app) = control_with(&sb, Some(desk), None);
+
+    let r = call(&app, None, "plugin_settings_get", json!({ "pluginId": "demo" })).await;
+    let shown = r["structuredContent"]["settings"].clone();
+    assert_eq!(shown, json!({ "apiKey": audit::REDACTED, "mood": "calm", "relay": { "token": audit::REDACTED, "host": "h" } }), "{r}");
+    // A command's answer hides them too.
+    let r = call(&app, None, "plugin_command", json!({ "pluginId": "demo", "command": "settings.get" })).await;
+    assert!(!r.to_string().contains("sk-live") && !r.to_string().contains("t0k3n"), "{r}");
+
+    // What was read, written back whole with one change: the hidden values are left out.
+    let mut back = shown.clone();
+    back["mood"] = json!("cheerful");
+    let before = sent.lock().unwrap().len();
+    let r = call(&app, None, "plugin_settings_set", json!({ "pluginId": "demo", "settings": back })).await;
+    assert!(!is_error(&r) && text(&r).contains("apiKey, relay.token"), "{r}");
+    let payload = sent.lock().unwrap()[before]["payload"].clone();
+    assert_eq!(payload, json!({ "mood": "cheerful", "relay": { "host": "h" } }));
+
+    // Only hidden values: nothing to send, and the model is told why.
+    let before = sent.lock().unwrap().len();
+    let r = call(&app, None, "plugin_settings_set", json!({ "pluginId": "demo", "settings": { "apiKey": audit::REDACTED } })).await;
+    assert!(is_error(&r) && text(&r).contains("hidden"), "{r}");
+    assert_eq!(sent.lock().unwrap().len(), before, "nothing reached the plugin");
+}
+
+#[tokio::test]
 async fn setup_finish_after_the_hand_off_succeeds_without_changing_anything() {
     use axum::routing::put;
     let sb = Sandbox::new("finish");
