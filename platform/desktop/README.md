@@ -116,16 +116,20 @@ newline-delimited stdio. Capabilities are declared in the manifest; wildcards
 expand at load against declared commands, and undeclared commands/events are
 refused/dropped before the plugin is involved.
 
-- `GET    /api/plugins` — installed plugins; every non-running state carries a reason
+- `GET    /api/plugins` — installed plugins; every non-running state carries a reason, and each carries its package `trust` (`state`, `publisher`, `reason`)
 - `POST   /api/plugins/:id/start` / `POST /api/plugins/:id/stop`
 - `POST   /api/plugins/:id/enabled` — body `{ "enabled": bool }`; disabling stops first
+- `POST   /api/plugins/:id/trust` — trust this exact unsigned package (privileged; takes only the id, reads no body)
 - `GET    /api/plugins/:id/logs?tail=N` — stdout/stderr ring (non-protocol output lands here)
 - `POST   /api/bridge/connectors/:id/request` — body `{ command, payload?, idempotencyKey? }`, gated against the manifest **before** forwarding; journalled commands require the key
 
 Supervision: 10s health probes (3 consecutive misses → `unhealthy`, still
 serving), crash detection with bounded 1s/4s/16s restarts, graceful shutdown
 (`plugin.shutdown` → 5s grace → kill). Children get an allow-listed environment
-— no host secrets — and a per-plugin data dir inside the plugin folder.
+— no host secrets — and a per-plugin data dir beside the plugins folder
+(`<data>/plugin-data/<id>`), outside the bundle, which a signed package may not
+change (see [Package trust](../../docs/PLUGINS.md#package-trust)). A package is
+verified when it is scanned and installed and again just before each launch.
 
 ## Dev workflow
 
@@ -208,7 +212,7 @@ Configuration is by environment variable (no pointer file):
 | `OAIY_EXTRA_MODEL_DIRS` | — | extra read-only model roots (`:`/`;`-separated) |
 | `OAIY_SERVER_PORT` | `17972` | listen port (loopback by default) |
 | `OAIY_SERVER_BIND` | — | `lan` enables network binding; requires a token |
-| `OAIY_PLUGIN_DEV_MODE` | debug: `true`, release: `false` | `0`/`false` runs plugins against real hardware; `1`/`true` simulates. Invalid values keep simulation enabled. |
+| `OAIY_PLUGIN_DEV_MODE` | debug: `true`, release: `false` | `0`/`false` runs plugins against real hardware; `1`/`true` simulates. Invalid values keep simulation enabled. **`1`/`true` also makes a release build start unsigned plugins** (a debug build always does, whatever this says: `0` there means real hardware); any other value in a release build does not. See [Package trust](../../docs/PLUGINS.md#package-trust). |
 | `OAIY_SERVER_TOKEN` | — | bearer token required for non-public headless APIs |
 | `OAIY_HF_TOKEN` | — | HuggingFace token for gated downloads |
 

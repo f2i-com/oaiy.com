@@ -181,6 +181,11 @@ Two transports, neither a WebSocket.
 
 - Install `POST /api/plugins/install {source}` (a folder, `.zip` or `.tar.gz`) into
   `<data>/plugins/<id>/`; `DELETE /api/plugins/:id`.
+- Package trust (`trust.rs`): a bundle's `package-manifest.json` (Aokie's `package-signer`
+  format) is verified against publisher keys pinned in `resources/trusted-publishers.json`
+  when a plugin is scanned or installed, and again from its bytes just before every launch. A
+  package that fails is quarantined and never started; an unsigned one is refused in a release
+  build until `POST /api/plugins/:id/trust`. See [Plugins](../PLUGINS.md#package-trust).
 - Manifest (`manifest.rs`, `schemaVersion` 1–3, `pluginApiVersion` 1): `id, name, version,
   publisher, description, entry:{kind:"process", command, args}, capabilities[],
   connectors[{id, commands[]}], events[], commands.journalled[]`, plus `ui.screens`,

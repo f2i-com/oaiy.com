@@ -28,8 +28,8 @@ be a path inside the plugin's folder.
 
 **Installing.** In **Connections → Plugins**, from a folder, `.zip` or `.tar.gz` on this
 computer (or from the setup wizard's catalog). A plugin is native code: install only
-plugins you trust. After an install from the dashboard, the plugin's own setup wizard
-runs.
+plugins you trust, and see [Package trust](#package-trust) for what OAIY checks. After an
+install from the dashboard, the plugin's own setup wizard runs.
 
 **Nothing it did not declare can happen.** The manifest is the plugin's whole
 permission surface: its capabilities, connectors, commands and events. A wildcard such
@@ -41,6 +41,86 @@ with an update.
 OAIY does not support, leaves the plugin disabled with the reason shown, never silently
 missing. A bad `ui` entry is dropped with a warning instead: presentation never stops a
 plugin from loading.
+
+## Package trust
+
+A plugin is native code that runs with your permissions, so its folder is part of what
+you trust. OAIY checks it: a release bundle that carries a publisher's signature is
+verified, and nothing that fails its own signature is ever started. The check is
+`plugins/trust.rs`, a port of the one FormLogic Desktop had, made to read exactly what
+Aokie's `crates/package-signer` writes.
+
+**The signature.** A signed bundle has a `package-manifest.json` at its root: an
+Ed25519 signature over a list of every file in the bundle, each with its SHA-256 and
+size (`package-signer sign --dir <bundle> --name <name> --version <v> --key-id <id>
+--key-file <seed>` makes it; `keygen` makes the key). OAIY verifies the signature under a
+pinned publisher key, then that every listed file is there with exactly that digest, that
+`manifest.json` (which names the command to run) is one of them, and that **no other file
+is in the folder**, executable or not: the bundle is immutable, as `package-signer verify`
+has it. That is why a plugin's writable folder is `<data>/plugin-data/<id>`, outside the
+bundle.
+
+**Who is trusted.** `resources/trusted-publishers.json`, compiled into the app, pins each
+publisher key: its id (the envelope's `keyId`), a name, the public key, and the plugin ids
+it may sign. Today that is Aokie's release key `fl-aokie-2026a`, for `aokie` alone: the
+key that signs Aokie cannot sign a plugin called anything else. A new publisher is a new
+entry; rotating a key is a second entry beside the first; removing an entry revokes it.
+
+**What a package is found to be** (`trust.state`, with `publisher` and `reason`, in
+`GET /api/plugins`, and as a badge on the Plugins page):
+
+| State | Meaning | Starts? |
+|---|---|---|
+| `verified` | Signed by a pinned publisher for this plugin; every file as signed. | yes |
+| `quarantined` | It carries a signature that does not check out: a file changed, missing or added, a bad signature, a key that is not pinned, a publisher that may not sign this plugin. The reason names what. | never, in any build |
+| `unsigned` | No signature, in a release build, and you have not trusted this package. | no, until you trust it |
+| `unsigned-dev` | No signature, in a developer build. | yes |
+| `trusted-local` | No signature, and you trusted this exact package. | yes |
+
+A package that may not run is listed as disabled with the reason, and has no manifest: the
+modules, pages, agent tools, setup steps, service definitions and screens are all built
+from the manifest, and none of them may come from a folder that failed its check. A plugin
+that is already running when its folder stops verifying is left running, says so on its
+card, and is not started again.
+
+**When it is checked.** When the plugins folder is scanned (the listing is polled every
+couple of seconds, so a cheap fingerprint of the folder, with no reading of files, decides
+whether the last answer still stands); when a plugin is installed, on the staged copy,
+before anything is replaced; and **again from the bytes just before every launch**, whether
+by a click, at boot or as a restart after a crash. A scan's answer is only a display: what
+starts a process is the check made a moment before it, so a file swapped between the scan
+and the launch is caught. (The check and the process creation are still two steps; the
+folder is in your own data directory, so this guards against a tampered download, a
+swapped file or a stale copy, not against malware already running as you.)
+
+**Trusting an unsigned plugin.** In a release build a plugin with no signature does not
+start. If you built it yourself or know where it came from, **Trust this plugin** on its
+card (`POST /api/plugins/:id/trust`, which takes only the plugin's id) records a digest of
+every file in its folder. That exact package starts; a change to any file, a new file or a
+missing one is a different package and asks again. Uninstalling the plugin forgets it.
+The decisions are in `<data>/plugins/trusted-plugins.json`. A package that carries a
+signature cannot be trusted this way: its signature decides.
+
+**Developer builds.** A debug build (`tauri dev`) starts unsigned plugins as it always
+has, and shows them as `unsigned-dev`. A release build does too when
+`OAIY_PLUGIN_DEV_MODE` is `1` or `true`. That variable has another job as well, choosing
+whether a plugin simulates its hardware, and there `0` in a debug build means the real
+dongle; it does not turn a debug build into one that refuses your local plugin, and a value
+that means nothing never waives the check in a release build.
+
+A developer build does not waive **quarantine**, though: a package that carries a
+signature is claiming to be a release, and one that has drifted from it is exactly what
+must not start silently. To work on a plugin, install it without `package-manifest.json`.
+Copying a new build over a signed release, without deleting that file, leaves a
+folder that no longer matches its signature; the plugin card lists the files that differ
+and says to delete `package-manifest.json` so the plugin counts as unsigned.
+
+**What it does not do.** It does not sandbox a plugin, and a verified plugin is trusted
+code, not safe code. It checks that files are the ones a pinned publisher signed, not
+that they are the newest: an older signed release verifies too. **Installing from the
+network is still refused.** A plugin installs only from a folder, `.zip` or `.tar.gz` on
+this computer, never a URL, and nothing here changes that: a signed package has to be on
+the machine first, and signing does not make a download safe to fetch and run.
 
 ## The manifest
 
