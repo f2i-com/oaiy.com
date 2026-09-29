@@ -44,7 +44,7 @@ export type AgentEvent =
   | { type: 'compact'; turns: number; before: number; after: number; how: 'summary' | 'trimmed' }
   /** The checklist changed (update_plan). */
   | { type: 'plan'; plan: Plan }
-  /** bot.computer asked the model to carry on (open plan items, a failing app). */
+  /** OAIY asked the model to carry on (open plan items, a failing app). */
   | { type: 'nudge'; message: string }
   /** The automatic check of a SoftN app after the agent changed it: running, then its outcome. */
   | { type: 'check'; id: string; root: string; state: 'running' | 'ok' | 'failed'; text?: string }

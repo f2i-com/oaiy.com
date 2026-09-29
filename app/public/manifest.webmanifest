@@ -1,13 +1,14 @@
 {
-  "name": "bot.computer",
-  "short_name": "bot.computer",
-  "description": "A coding agent that runs entirely in your browser.",
+  "id": "oaiy-agent",
+  "name": "OAIY",
+  "short_name": "OAIY",
+  "description": "The OAIY Agent in the browser: a coding agent with your projects, a code sandbox and any model, working offline.",
   "start_url": "./",
   "scope": "./",
   "display": "standalone",
-  "background_color": "#0f1115",
-  "theme_color": "#0f1115",
+  "background_color": "#080d18",
+  "theme_color": "#080d18",
   "icons": [
-    { "src": "icon.svg", "sizes": "any", "type": "image/svg+xml", "purpose": "any maskable" }
+    { "src": "icon.svg", "sizes": "any", "type": "image/svg+xml", "purpose": "any" }
   ]
 }

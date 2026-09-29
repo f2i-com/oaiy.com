@@ -2,7 +2,7 @@
 /**
  * Install SoftN's hosted app runtime (the sandboxed shell that renders a SoftN
  * app in an opaque-origin iframe) from a published softn.com release into
- * public/softn/. Optional: without it, bot.computer still writes, checks and
+ * public/softn/. Optional: without it, OAIY still writes, checks and
  * exports SoftN apps, and only the live preview is unavailable.
  *
  *   node scripts/fetch-softn.mjs            install the pinned release

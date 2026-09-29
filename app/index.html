@@ -3,8 +3,12 @@
   <head>
     <meta charset="utf-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1" />
-    <meta name="description" content="A coding agent that runs entirely in your browser: local projects, AI-written code sandboxed on the Zipp VM, and any local or cloud model." />
-    <meta name="theme-color" content="#080d18" />
+    <meta name="description" content="OAIY Agent: a coding agent that runs entirely in your browser, with local projects, AI-written code sandboxed on the Zipp VM, and any local or cloud model." />
+    <!-- The app's own backgrounds (styles.css --bg): the dark theme, and the light one when the system is light. -->
+    <meta name="theme-color" content="#080d18" media="(prefers-color-scheme: dark)" />
+    <meta name="theme-color" content="#f8f5ee" media="(prefers-color-scheme: light)" />
+    <meta name="application-name" content="OAIY" />
+    <meta name="apple-mobile-web-app-title" content="OAIY" />
     <!-- Scripts only from OAIY itself (and the Zipp engine's WebAssembly); model servers anywhere; nothing else. -->
     <meta http-equiv="Content-Security-Policy" content="default-src 'self'; script-src 'self' 'wasm-unsafe-eval'; worker-src 'self' blob:; style-src 'self' 'unsafe-inline'; img-src 'self' data: blob:; media-src 'self' data: blob:; font-src 'self' data:; connect-src * data: blob: ws: wss:; frame-src 'self'; object-src 'none'; base-uri 'none'; form-action 'none'" />
     <link rel="icon" href="/icon.svg" type="image/svg+xml" />

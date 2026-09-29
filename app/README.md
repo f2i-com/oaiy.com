@@ -1,4 +1,4 @@
-# bot.computer
+# OAIY Agent
 
 A coding agent that runs entirely in your browser.
 
@@ -80,7 +80,7 @@ They run in the page with the browser's own video and audio codecs (WebCodecs: H
   - If OAIY answers, its image, video, speech, music, sound effects and 3D models, their limits (sizes, edits, seconds), its saved voices and its defaults fill **Settings → Images, video and audio**.
   - OAIY is also added as a chat provider if none points at it yet. It becomes the active one only if nothing else is.
   - Found again later, its model lists are refreshed. Your chosen models and key stay.
-- **OAIY allows bot.computer.** Without an API key, OAIY answers only the origins in `gateway.cors_origins` in its config. Its defaults include `https://bot.computer`, `http://localhost:5317` and the desktop app. Serving bot.computer from anywhere else means adding that address there (the chat says which one), or setting an API key in OAIY and typing it in Settings. Then press **Find OAIY**.
+- **OAIY allows the Agent.** Without an API key, OAIY answers only the origins in `gateway.cors_origins` in its config. Its defaults include `https://bot.computer` (where the Agent was first served), `http://localhost:5317` and the desktop app. Serving the Agent from anywhere else means adding that address there (the chat says which one), or setting an API key in OAIY and typing it in Settings. Then press **Find OAIY**.
 - **Other services.** Type the address of any OpenAI-spec service (for example `https://api.openai.com/v1`) and its key, then **List models** and choose. Images use `/images/generations` and `/images/edits`. Video uses `/videos` and follows the job until it's done. Speech uses `/audio/speech`.
 - **While it works.** The chat shows the progress of a video or a song. Stopping the agent cancels the job. The models' limits are in the tools' descriptions, so the model asks for sizes and lengths the service can make.
 - **Privacy.** These requests go straight from the page to the service you set up, like requests to your AI provider. They are not behind the network gate. Keys are stored encrypted with the provider keys.
@@ -104,7 +104,7 @@ They run in the page with the browser's own video and audio codecs (WebCodecs: H
 Any `.html` file of the project is a web page, with its CSS, images and JavaScript beside it. The **Preview** tab shows it; its picker lists the project's pages, SoftN apps and 3D models, and clicking an `.html` file in the tree shows that page.
 
 - **JavaScript on Zipp.** A page's scripts don't run in the browser's own engine. The preview frame (`public/webpage/`) builds the page from its HTML and CSS, takes out its `<script>` elements and `on*` attributes, and runs them on the Zipp VM instead, against a DOM facade (`src/preview/zippDom.guest.js`). Every node, event, style or canvas the page touches is a proxy that reads, writes and calls the real object in the frame over Zipp's synchronous host channel. Listeners, timers and observers are the page's functions, called back when the real event fires. So the browser renders, lays out and dispatches, and only the page's code runs on Zipp. This follows the live DOM bridge described in zipp-browser's design notes.
-  - Works: classic scripts (several share globals and run in order), the DOM, `addEventListener` and `on*` attributes (including ones added through `innerHTML`), timers and `requestAnimationFrame`, canvas, `localStorage` (kept per page while bot.computer is open), `fetch` and `XMLHttpRequest` for the project's own files, and links between the project's pages.
+  - Works: classic scripts (several share globals and run in order), the DOM, `addEventListener` and `on*` attributes (including ones added through `innerHTML`), timers and `requestAnimationFrame`, canvas, `localStorage` (kept per page while OAIY is open), `fetch` and `XMLHttpRequest` for the project's own files, and links between the project's pages.
   - Doesn't: ES module `import`/`export` between files, JSX or anything that needs a build step, and the internet: the preview is offline, so CDN scripts, web fonts and remote images don't load. The page is told what didn't load.
   - A script that never finishes (an endless loop) is stopped after about two seconds, and the page's scripts stop with it.
   - The frame is sandboxed with an opaque origin and a strict CSP, so nothing of the page runs natively, even HTML it inserts later.
@@ -116,14 +116,14 @@ Any `.html` file of the project is a web page, with its CSS, images and JavaScri
 
 Any `.glb` or `.gltf` file of the project is a 3D model the **Preview** tab can show: pick it in the preview's picker, or click it in the tree.
 
-- **The viewer** is bot.computer's own, with [three.js](https://threejs.org) (MIT), bundled into one script at build time (`scripts/modelview/`, built into `public/modelview/` by the dev server and the build). It runs in a sandboxed opaque-origin frame that gets the model's bytes over `postMessage` and loads nothing else. The model is fitted to the view, in soft studio light (a room environment, a sky-and-ground fill and a key light) over a floor grid, and you turn, move and zoom it with the mouse.
+- **The viewer** is OAIY's own, with [three.js](https://threejs.org) (MIT), bundled into one script at build time (`scripts/modelview/`, built into `public/modelview/` by the dev server and the build). It runs in a sandboxed opaque-origin frame that gets the model's bytes over `postMessage` and loads nothing else. The model is fitted to the view, in soft studio light (a room environment, a sky-and-ground fill and a key light) over a floor grid, and you turn, move and zoom it with the mouse.
 - **For the agent:** `preview_screenshot` with a model's path returns one image with four labelled views (front, right, back and top) at the preview's size, drawn by the viewer itself. `yaw` and `pitch` show it from any other angle. The text gives its triangles, vertices, size and position (and whether it fits the unit cube), vertex colours, textures and materials.
 - **In SoftN apps:** a model in an app's `assets/` folder shows in a `Scene3D` as an object of type `"model"` with `modelUrl: asset("assets/…")`. The runtime's `asset()` only covers images, sounds and fonts, so `scripts/softn-bridge/install.mjs` adds glTF models to it when it installs the bridge, as `blob:` URLs, which `Scene3D` accepts. The bridge answers `fetch` for those and for `data:` URLs from the bytes the frame already holds, since the runtime's CSP lets `fetch` reach only its own folder.
 - A web page can't show 3D: three.js comes as ES modules or from a CDN, and neither runs on Zipp.
 
 ## SoftN apps
 
-bot.computer can build [SoftN](https://github.com/f2i-com/softn.com) apps and show them running while they're being built.
+OAIY can build [SoftN](https://github.com/f2i-com/softn.com) apps and show them running while they're being built.
 
 - **Start one:** use **New SoftN app** (or `/softn new`), or ask the agent for an app. The dialog starts from a small working task list, a blank page, or one of the example apps, in a new project or in a folder of this one. It reads `softn_docs` (SoftN Studio's own writing guide, regenerated with `npm run softn:guide`), writes `manifest.json`, `ui/*.ui` and `logic/*.logic`, and runs `softn_check`.
 - **Reference for the agent:** SoftN is in its tools, so it doesn't have to guess.
@@ -133,7 +133,7 @@ bot.computer can build [SoftN](https://github.com/f2i-com/softn.com) apps and sh
   - All of this is bundled for offline use. Regenerate it with `npm run softn:knowledge`.
 - **Live preview:** the **Preview** tab renders the app with SoftN's hosted runtime, in a sandboxed opaque-origin iframe with its own strict CSP. It re-renders about 0.7 s after edits settle.
 - **Errors the agent sees and fixes:**
-  - After every agent step that changes an app, bot.computer checks it: the files (manifest, listed files, `.logic` syntax compiled on Zipp), then a real render. The outcome goes into that step's result, so the agent fixes what's broken before going on. You see each check as a card in the chat.
+  - After every agent step that changes an app, OAIY checks it: the files (manifest, listed files, `.logic` syntax compiled on Zipp), then a real render. The outcome goes into that step's result, so the agent fixes what's broken before going on. You see each check as a card in the chat.
   - If the same errors come back three times in a row, the run stops rather than loop.
   - A small bridge in the preview frame (`scripts/softn-bridge/`, installed into the runtime by `npm run fetch:softn` and by the dev server and build) reports errors the running app raises, like a handler throwing when you click.
   - If the app raises an error while you're using it, a banner appears over the preview. **Fix with agent** sends the errors to the agent.
@@ -165,7 +165,7 @@ The preview runtime is optional (about 23 MB) and comes from a checksummed softn
 - **Terminal:** Ctrl+C stops a running command.
 - **Long chats:** a long chat opens at its latest turns, with **Show earlier** for the rest.
 - **Security:**
-  - The page has a Content Security Policy (scripts only from bot.computer itself), which also stops script in an SVG opened in a new tab.
+  - The page has a Content Security Policy (scripts only from OAIY itself), which also stops script in an SVG opened in a new tab.
   - The network gate refuses redirects to this machine or its local network, however the address is written.
   - Archives are checked before they're unpacked.
   - Errors reported by a running app are passed to the agent as data, not as your words.
@@ -176,7 +176,7 @@ On a phone or a narrow window, the panes (Files, Editor, Preview, Terminal and A
 
 ## Run it
 
-bot.computer runs three ways. All three use the same build of the same web app.
+The Agent runs three ways. All three use the same build of the same web app.
 
 | | How | Where your projects live |
 |---|---|---|
@@ -197,7 +197,7 @@ npm run desktop:portable  # one portable exe (src-tauri/target/release/bundle/po
 node tests/e2e/desktop.mjs  # Windows: checks the built app in WebView2 (isolation, sandbox, tray, saving on quit)
 ```
 
-bot.computer always uses port 5317 (`strictPort`), so a local server can allow it by origin. OAIY allows it by default.
+The Agent always uses port 5317 (`strictPort`), so a local server can allow it by origin. OAIY allows it by default.
 
 ### The desktop app
 
@@ -226,11 +226,11 @@ Serve the web app over `localhost` or HTTPS. The sandbox needs a cross-origin is
 
 Open **⚙ Settings → Add a provider**, pick the server, then **List models** and **Test**. The browser calls the server directly, so the server must allow the page's origin:
 
-- **Ollama:** start it with `OLLAMA_ORIGINS=*` (or the exact origin you serve bot.computer from).
+- **Ollama:** start it with `OLLAMA_ORIGINS=*` (or the exact origin you serve the Agent from).
 - **LM Studio:** turn on *Enable CORS* in the server settings.
 - **Others:** send `Access-Control-Allow-Origin` for the page's origin.
 
-If you serve bot.computer from a public HTTPS address and the model runs on `localhost`, Chrome's Private Network Access rules apply. Serving bot.computer locally avoids that.
+If you serve the Agent from a public HTTPS address and the model runs on `localhost`, Chrome's Private Network Access rules apply. Serving it locally avoids that.
 
 ### API keys
 

@@ -19,7 +19,7 @@ const isolation = {
 const softnHeaders = {
   name: 'softn-runtime-headers',
   // The runtime in public/softn/ and the web page preview in public/webpage/ get
-  // bot.computer's bridge (errors, inspect, act, screenshot); the 3D model
+  // the Agent's bridge (errors, inspect, act, screenshot); the 3D model
   // preview in public/modelview/ gets its viewer.
   async buildStart() {
     installBridge('public/softn');
@@ -43,6 +43,7 @@ function softnMiddleware(req: { url?: string }, res: { setHeader: (k: string, v:
 
 // The service worker's cache is named after the build, so an update replaces
 // everything it cached (the old cache is deleted when the new worker takes over).
+const CACHE_PLACEHOLDER = "const CACHE = 'oaiy-agent-v1';";
 const stampServiceWorker = {
   name: 'stamp-service-worker',
   apply: 'build' as const,
@@ -59,7 +60,9 @@ const stampServiceWorker = {
     }
     const sw = join(dir, 'sw.js');
     const source = readFileSync(sw, 'utf8');
-    writeFileSync(sw, source.replace("const CACHE = 'bot.computer-v1';", `const CACHE = 'bot.computer-${hash.digest('hex').slice(0, 12)}';`));
+    // Without the placeholder every build would ship the same cache name and an update would never replace the cache.
+    if (!source.includes(CACHE_PLACEHOLDER)) throw new Error(`public/sw.js no longer contains ${CACHE_PLACEHOLDER}: the build cannot stamp its cache name`);
+    writeFileSync(sw, source.replace(CACHE_PLACEHOLDER, `const CACHE = 'oaiy-agent-${hash.digest('hex').slice(0, 12)}';`));
   },
 };
 

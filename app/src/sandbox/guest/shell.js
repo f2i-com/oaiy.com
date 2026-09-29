@@ -1,6 +1,6 @@
-/* bot.computer sandbox shell: a POSIX-flavoured shell emulated in JavaScript on
+/* OAIY sandbox shell: a POSIX-flavoured shell emulated in JavaScript on
  * the Zipp VM. There are no processes: every command is a function here, and
- * every file or network operation is a host call to bot.computer, which keeps
+ * every file or network operation is a host call to OAIY, which keeps
  * paths inside the project ("/" is the project root) and sends network
  * requests through the network gate. Input: __coder_input = {command, cwd,
  * env}. Completion value: JSON {stdout, stderr, exit_code, cwd, env}. */
@@ -1137,7 +1137,7 @@
     const fn = Object.prototype.hasOwnProperty.call(builtins, name) ? builtins[name] : null;
     if (!fn) {
       if (/^\.{0,2}\//.test(name) || /\.(sh|js|mjs|cjs|py)$/.test(name)) return runScriptFile(name, argv.slice(1), stdin);
-      return R("", "sandbox-sh: " + name + ": command not found (this is bot.computer's shell; run `help` for the commands it has)\n", 127);
+      return R("", "sandbox-sh: " + name + ": command not found (this is OAIY's shell; run `help` for the commands it has)\n", 127);
     }
     try {
       const r = fn(argv.slice(1), stdin);
@@ -2436,7 +2436,7 @@
   });
   class TextEncoderLite { encode(s) { const out = []; for (const ch of unescape(encodeURIComponent(s))) out.push(ch.charCodeAt(0)); return new Uint8Array(out); } }
 
-  /* ----- network (through bot.computer's network gate) ----- */
+  /* ----- network (through OAIY's network gate) ----- */
   function fetchVia(url, o) {
     const req = { url: url, method: o.method || "GET", headers: o.headers || {}, body: o.body === undefined ? null : o.body };
     if (o.saveTo) req.save_to = resolve(o.saveTo);
@@ -2518,7 +2518,7 @@
       const o = opts(args, { withValue: lang === "python" ? "cm" : "ep", stopAtOperand: true });
       if (lang === "js" && (o.f.e !== undefined || o.f.p !== undefined)) return runExternal("js", { source: o.f.e !== undefined ? o.f.e : "console.log(" + o.f.p + ")" }, o.a, stdin);
       if (lang === "python" && o.f.c !== undefined) return runExternal("python", { source: o.f.c }, o.a, stdin);
-      if (o.f.v || o.f.V || o.f.version) return R(lang === "js" ? "v22.0.0-zipp (bot.computer sandbox)\n" : "Python 3.13 (zipp, bot.computer sandbox)\n");
+      if (o.f.v || o.f.V || o.f.version) return R(lang === "js" ? "v22.0.0-zipp (OAIY sandbox)\n" : "Python 3.13 (zipp, OAIY sandbox)\n");
       if (lang === "python" && o.f.m) return pythonModule(o.f.m === true ? o.a.shift() : o.f.m, o.a, stdin);
       if (!o.a.length || o.a[0] === "-") {
         if (stdin) return runExternal(lang, { source: stdin }, o.a.slice(1), "");
@@ -2653,7 +2653,7 @@
     builtins[name] = () => R("", name + ": there is no interactive editor here. Write files with cat > file <<'EOF' ... EOF, change them with sed -i or patch, or use the agent's file tools.\n", 127);
   }
   B("help", () => R(
-    "bot.computer sandbox shell — emulated on the Zipp VM, confined to the project folder (/ is the project root).\n" +
+    "OAIY sandbox shell — emulated on the Zipp VM, confined to the project folder (/ is the project root).\n" +
     "Syntax: pipes |, && ||, ;, redirects > >> < 2> 2>&1 &>, heredocs <<EOF, $VAR ${VAR:-x} $(cmd) $((1+2)), globs * ? ** [..],\n" +
     "        if/elif/else/fi, for x in ...; do ...; done, while/until, case, functions, subshells ( ).\n" +
     "Commands:\n  " + helpText.join("\n  ") + "\n" +
@@ -2661,7 +2661,7 @@
     "      rev tac nl seq yes diff cmp base64 whoami uname sleep time rmdir sort uniq cut tr sed awk tee\n" +
     "Programs: node/js FILE (require, ESM, node_modules), python FILE / -m MODULE / -c CODE (stdlib subset), sh FILE.\n" +
     "git works on a local repository in .git/ (no remotes); jq, patch, tar/zip/gzip, checksums and bc are built in.\n" +
-    "Network commands go through bot.computer's network gate (/internet). Package managers and compilers (npm install, cargo, gcc, ...) are not available here.\n"
+    "Network commands go through OAIY's network gate (/internet). Package managers and compilers (npm install, cargo, gcc, ...) are not available here.\n"
   ), "help");
 
   /* ---------------- run ---------------- */

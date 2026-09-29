@@ -1,5 +1,5 @@
 /**
- * SoftN apps in a bot.computer project: finding them, starting one, checking
+ * SoftN apps in an OAIY project: finding them, starting one, checking
  * one, importing a .softn, and bundling one as a .softn file.
  *
  * A SoftN app is a folder of text files — manifest.json, ui/*.ui pages,

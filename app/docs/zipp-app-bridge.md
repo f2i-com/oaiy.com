@@ -1,17 +1,17 @@
 # Zipp's app bridge
 
-bot.computer's sandbox gives guest programs synchronous file and network access (Node's `fs.readFileSync`, the shell's `cat`, `curl`) by blocking the Worker on a `SharedArrayBuffer` while the page answers.
+OAIY's sandbox gives guest programs synchronous file and network access (Node's `fs.readFileSync`, the shell's `cat`, `curl`) by blocking the Worker on a `SharedArrayBuffer` while the page answers.
 
 ## Status
 
 The bridge is implemented in zipp.org on the branch `feature/app-host-bridge` (`crates/zipp-wasm`), with the boundary check `tests/node/app-bridge.cjs`. The full boundary suite passes (27 of 27).
 
-bot.computer already uses it: the sandbox Worker feature-detects `Engine.prototype.setAppBridge`.
+OAIY already uses it: the sandbox Worker feature-detects `Engine.prototype.setAppBridge`.
 
 - **An engine with the bridge** answers `host.callSync(kind, …)` through it, with each of the sandbox's operations granted exactly as `app.<kind>`.
 - **The released engine (v0.0.21)** has no bridge, so the same calls ride the synchronous `localStorage.getItem` bridge with a reserved key prefix. Ordinary `localStorage` keys stay inert.
 
-Both paths pass `tests/e2e/run.mjs`. Once a Zipp release includes the bridge, bumping `RELEASE` in `scripts/fetch-zipp.mjs` switches bot.computer over; the tunnel stays as the fallback for older engines.
+Both paths pass `tests/e2e/run.mjs`. Once a Zipp release includes the bridge, bumping `RELEASE` in `scripts/fetch-zipp.mjs` switches OAIY over; the tunnel stays as the fallback for older engines.
 
 ## The API (zipp-wasm)
 

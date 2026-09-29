@@ -1,4 +1,4 @@
-/* bot.computer sandbox shell: the larger tools, given the shell's internals
+/* OAIY sandbox shell: the larger tools, given the shell's internals
  * (see shell.js, which calls this before registering `help`). Everything
  * here works on the project through the same host calls as the rest of the
  * shell, so it stays inside the project and behind the network gate.
@@ -3400,9 +3400,9 @@
   };
   for (const name of ["push", "pull", "fetch", "clone", "ls-remote", "submodule"]) GIT[name] = () => R("", GIT_NO_REMOTE, 128);
   GIT.rebase = () => R("", "error: git rebase is not available in the sandbox's git; use git cherry-pick <commit>... onto the branch, or git merge\n", 1);
-  GIT.version = () => R("git version 2.45.0 (bot.computer sandbox)\n");
+  GIT.version = () => R("git version 2.45.0 (OAIY sandbox)\n");
   GIT.help = () => R([
-    "usage: git <command> [<args>]   (bot.computer sandbox git: the repository lives in .git/ in the project; no remotes)",
+    "usage: git <command> [<args>]   (OAIY sandbox git: the repository lives in .git/ in the project; no remotes)",
     "",
     "start a working area",
     "   init       Create an empty Git repository",
@@ -3451,7 +3451,7 @@
       const name = args[i];
       if (!name) return GIT.help();
       const rest = args.slice(i + 1);
-      if (rest.includes("--help") || rest.includes("-h")) return R("usage: git " + name + " ... (see `git help`; this is bot.computer's sandbox git)\n");
+      if (rest.includes("--help") || rest.includes("-h")) return R("usage: git " + name + " ... (see `git help`; this is OAIY's sandbox git)\n");
       const fn = Object.prototype.hasOwnProperty.call(GIT, name) ? GIT[name] : null;
       if (!fn) return R("", "git: '" + name + "' is not a git command. See 'git help'.\n", 1);
       S.gitStdin = stdin;

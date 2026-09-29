@@ -3,7 +3,7 @@
   /* Everything here is installed as a configurable property of the global
    * object, never as a binding, so a guest's own `const fs = require("fs")`
    * or `let path = ...` is legal and simply shadows it. Every capability is
-   * a call to the parent bot.computer process, which decides what is allowed:
+   * a call to the parent OAIY process, which decides what is allowed:
    * paths are project-relative (a leading "/" is the project root) and
    * cannot leave the project; network requests go through the network gate. */
   const hostCall = G.__coderHostCall;

@@ -1,7 +1,7 @@
-/* bot.computer's additions to Zipp's Python runtime (compiled into it as a
+/* OAIY's additions to Zipp's Python runtime (compiled into it as a
  * package's runtime JavaScript, ahead of the program; see pystd/package.ts).
  *
- * The program's files are the whole project, "/" its root. bot.computer
+ * The program's files are the whole project, "/" its root. OAIY
  * writes the run's settings into the file map under `.botcomputer/`: the
  * shell's working folder, the environment, stdin, argv[0], and names to keep
  * out of listings (modules beside the script, aliased at the root so
@@ -87,7 +87,7 @@
             if (argv && argv.items && argv.items.length) argv.items[0] = argv0;
         }
         g.set("path", list(["/" + (config().scriptDir || config().cwd)].concat(g.get("path").items || [])));
-        g.set("version", "3.12.0 (zipp, bot.computer sandbox)");
+        g.set("version", "3.12.0 (zipp, OAIY sandbox)");
     });
 
     // input(): a line of stdin, EOFError at its end, as with a pipe.

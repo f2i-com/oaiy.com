@@ -1,5 +1,5 @@
 /*
- * bot.computer's service worker.
+ * The OAIY Agent's service worker.
  *
  * 1. Offline: the app shell and the Zipp engine are cached; everything
  *    same-origin is served from the cache and refreshed in the background.
@@ -12,7 +12,10 @@
  */
 // The build stamps its own name here (vite.config.ts), so a new version gets a
 // fresh cache: the app, the Zipp engine and the rest always come from the same build.
-const CACHE = 'bot.computer-v1';
+const CACHE = 'oaiy-agent-v1';
+// The caches this worker owns: its own, the ones of earlier builds, and the
+// ones the app had before it was called OAIY. Nothing else on the origin is touched.
+const OWNED = ['oaiy-agent-', 'bot.computer-'];
 const SCOPE = new URL(self.registration.scope);
 const PRECACHE = ['./', './index.html', './manifest.webmanifest', './icon.svg', './zipp/zipp_wasm.js', './zipp/zipp_wasm_bg.wasm'];
 
@@ -30,7 +33,7 @@ self.addEventListener('activate', (event) => {
   event.waitUntil(
     caches
       .keys()
-      .then((keys) => Promise.all(keys.filter((k) => k !== CACHE).map((k) => caches.delete(k))))
+      .then((keys) => Promise.all(keys.filter((k) => k !== CACHE && OWNED.some((prefix) => k.startsWith(prefix))).map((k) => caches.delete(k))))
       .then(() => self.clients.claim()),
   );
 });

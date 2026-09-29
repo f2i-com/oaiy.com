@@ -2,7 +2,7 @@
 /**
  * Regenerate src/softn/guide.generated.ts, the SoftN writing guide the agent
  * reads, from softn.com's own Studio guide (apps/softn-studio/src/lib/agent/
- * guide.ts, Apache-2.0), so bot.computer's agent is taught exactly what
+ * guide.ts, Apache-2.0), so OAIY's agent is taught exactly what
  * SoftN Studio's is. The output is committed; run this after a SoftN update:
  *
  *   SOFTN_REPO=../softn.com node scripts/generate-softn-guide.mjs

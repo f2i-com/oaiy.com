@@ -55,7 +55,7 @@ const STREAM_REDRAW_MS = 80;
 function promptText(e: { system: string; turns: Turn[]; tools: string[] }): string {
   const parts = [`━━ SYSTEM PROMPT ━━\n${e.system}`, `━━ TOOLS ━━\n${e.tools.join(', ')}`];
   for (const t of e.turns) {
-    if (t.role === 'user') parts.push(`━━ ${t.automatic ? 'BOT.COMPUTER' : 'USER'} ━━\n${t.text}${t.images?.length ? `\n[${t.images.length} image(s)]` : ''}`);
+    if (t.role === 'user') parts.push(`━━ ${t.automatic ? 'OAIY' : 'USER'} ━━\n${t.text}${t.images?.length ? `\n[${t.images.length} image(s)]` : ''}`);
     else if (t.role === 'assistant') parts.push(`━━ MODEL ━━\n${[t.text, ...t.calls.map((c) => `→ ${c.name} ${JSON.stringify(c.input, null, 2)}`)].filter(Boolean).join('\n')}`);
     else parts.push(...t.results.map((r) => `━━ RESULT of ${r.name}${r.isError ? ' (error)' : ''} ━━\n${r.content}${r.images?.length ? `\n[${r.images.length} image(s)]` : ''}`));
   }

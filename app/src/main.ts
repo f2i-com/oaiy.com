@@ -60,6 +60,7 @@ import { providerEndpoints, providerHeaders } from './agent/providers/providerCo
 import { canPickFolder, downloadZip, exportFolder, importFileList, importFolder, importZip, type Imported } from './vfs/transfer';
 import type { Vfs } from './vfs/vfs';
 import { isOutreachPath, readView } from './vfs/readView';
+import { mayReloadForIsolation } from './pwa/reloadGuard';
 
 const WELCOME: Array<[string, string]> = [
   [
@@ -116,14 +117,9 @@ async function registerServiceWorker(): Promise<boolean> {
   if (crossOriginIsolated) return false;
   // At most one automatic reload a minute: if isolation still does not come
   // (a browser that refuses it), the app starts anyway and says why the
-  // sandbox is unavailable. localStorage, not sessionStorage: switching into
-  // a cross-origin isolated context can start a fresh session store.
-  const KEY = 'bot.computer.isolation-reload';
-  let last = 0;
+  // sandbox is unavailable.
   try {
-    last = Number(localStorage.getItem(KEY)) || 0;
-    if (Date.now() - last < 60_000) return false;
-    localStorage.setItem(KEY, String(Date.now()));
+    if (!mayReloadForIsolation(localStorage, Date.now())) return false;
   } catch {
     return false;
   }

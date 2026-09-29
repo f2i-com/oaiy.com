@@ -1,5 +1,5 @@
 /**
- * Put bot.computer's bridge (bot-bridge.js, beside this file) and its
+ * Put OAIY's bridge (bot-bridge.js, beside this file) and its
  * screenshot library (modern-screenshot's browser build, as bot-capture.js)
  * into a preview frame's folder: the installed SoftN runtime, and the web page
  * preview (public/webpage/). In the SoftN runtime they are also loaded from

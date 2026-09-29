@@ -1,9 +1,9 @@
 /*
- * bot.computer's bridge inside the SoftN preview frame (installed next to the
+ * OAIY's bridge inside the SoftN preview frame (installed next to the
  * hosted runtime's index.html by scripts/softn-bridge/install.mjs, and loaded
  * before the runtime's own scripts).
  *
- * It lets bot.computer see and try the running app the way a person would:
+ * It lets OAIY see and try the running app the way a person would:
  *   - errors the app raises while it runs (uncaught errors, rejected
  *     promises, console.error; console.warn as warnings) go to the parent
  *     page, so the agent sees them and the person can ask for a fix;
@@ -15,7 +15,7 @@
  *     whole page.
  *
  * The frame is sandboxed with an opaque origin, so this reaches nothing of
- * bot.computer's: it only posts messages to its parent, which treats them as
+ * OAIY's: it only posts messages to its parent, which treats them as
  * data from the app.
  */
 (() => {
@@ -299,7 +299,7 @@
   const opaque = (color) => color && color !== 'transparent' && !/rgba\([^)]*,\s*0\)$/.test(color);
   const shoot = async (fullPage) => {
     const lib = window.modernScreenshot;
-    if (!lib) throw new Error('the screenshot library is not installed here (run npm install, then reload bot.computer)');
+    if (!lib) throw new Error('the screenshot library is not installed here (run npm install, then reload OAIY)');
     const root = document.documentElement;
     const width = window.innerWidth;
     const pageHeight = Math.max(root.scrollHeight, document.body ? document.body.scrollHeight : 0, window.innerHeight);

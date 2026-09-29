@@ -1,10 +1,10 @@
 /*
- * bot.computer's 3D model viewer, in the live preview's model frame
+ * OAIY's 3D model viewer, in the live preview's model frame
  * (public/modelview/index.html). scripts/modelview/build.mjs bundles it with
  * three.js (MIT) into one classic script, public/modelview/model-viewer.js.
  *
  * The model (a .glb, or a .gltf with the files it names) arrives from
- * bot.computer over postMessage as bytes. The viewer:
+ * OAIY over postMessage as bytes. The viewer:
  *   - shows it fitted to the view, in soft studio light on a neutral
  *     background, and the person turns it with the mouse (orbit controls);
  *   - answers the same requests as bot-bridge.js does in the other frames:
@@ -14,7 +14,7 @@
  *     rendered here rather than copied off the page.
  *
  * The frame is sandboxed with an opaque origin: it reaches nothing of
- * bot.computer's, and only posts messages to its parent. The model's own
+ * OAIY's, and only posts messages to its parent. The model's own
  * references stay inside the files it was sent with.
  */
 import {
@@ -344,7 +344,7 @@ function quadrants(width, height) {
   return SIDES.map((side, i) => ({ ...side, x: cells[i][0], y: cells[i][1], w: cells[i][2], h: cells[i][3] }));
 }
 
-// --- talking to bot.computer ------------------------------------------------------------
+// --- talking to OAIY ------------------------------------------------------------
 
 let port = null;
 /** Why the model could not be shown, if it could not. */

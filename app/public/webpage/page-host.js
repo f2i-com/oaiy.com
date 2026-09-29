@@ -1,9 +1,9 @@
 /*
- * bot.computer's web page preview frame: shows one HTML page of the project,
+ * OAIY's web page preview frame: shows one HTML page of the project,
  * with its CSS, and runs its JavaScript on the Zipp VM rather than the
  * browser's own engine.
  *
- * The page arrives from bot.computer over postMessage with the project's
+ * The page arrives from OAIY over postMessage with the project's
  * files, the Zipp engine and the DOM facade (src/preview/zippDom.guest.js).
  * This frame:
  *   - builds the page from its HTML: stylesheets, images and fonts come from
@@ -16,11 +16,11 @@
  *     DOM, and calls the page's functions back when a real event, timer or
  *     observer fires.
  * The browser renders, lays out and dispatches; only the page's code runs on
- * Zipp. bot-bridge.js (loaded before this) reports errors to bot.computer and
+ * Zipp. bot-bridge.js (loaded before this) reports errors to OAIY and
  * describes, operates and screenshots the page for the agent.
  *
  * The frame is sandboxed with an opaque origin: it reaches nothing of
- * bot.computer's, and only posts messages to its parent.
+ * OAIY's, and only posts messages to its parent.
  */
 (() => {
   'use strict';
@@ -133,7 +133,7 @@
    * (returned, to become the page's handlers on Zipp), and so do scripts
    * (returned, to run on Zipp, when `scripts` is given).
    */
-  /** The events the page listens for on each element, so bot.computer's bridge can find and click them. */
+  /** The events the page listens for on each element, so OAIY's bridge can find and click them. */
   const listening = new WeakMap();
   window.__botComputerListening = listening;
   const markListener = (el, type) => {

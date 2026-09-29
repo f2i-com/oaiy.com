@@ -3,7 +3,7 @@
  * three.js, bundled into one classic script, public/modelview/model-viewer.js.
  *
  * One classic script, because the viewer runs in an opaque-origin frame: a
- * module script (or an import) from bot.computer's own server would be a
+ * module script (or an import) from OAIY's own server would be a
  * cross-origin request needing CORS headers, which the static build's host and
  * the desktop app do not send for /modelview/; a classic <script src> needs none.
  * vite.config.ts runs this on every dev server start and build; it rebuilds only

@@ -10,11 +10,11 @@
  *   built by public/webpage/page-host.js from the project's files, and its
  *   JavaScript runs on the Zipp VM against the frame's real DOM, through the
  *   facade in zippDom.guest.js.
- * - A 3D model (a .glb or .gltf file) is drawn by bot.computer's own viewer
+ * - A 3D model (a .glb or .gltf file) is drawn by OAIY's own viewer
  *   (public/modelview/, three.js), which the person turns with the mouse and
  *   which screenshots it from four sides for the agent.
  *
- * bot.computer's bridge (scripts/softn-bridge/bot-bridge.js, in both frames)
+ * OAIY's bridge (scripts/softn-bridge/bot-bridge.js, in both frames)
  * reports what goes wrong while the page runs, and describes, operates and
  * screenshots it for the agent. The frame can be given a viewport size
  * (phone, tablet, …) for responsive design; it is then scaled to fit the pane,
@@ -192,7 +192,7 @@ export class Preview {
   private readonly banner = h('div.preview-problem');
   private readonly bannerText = h('span.preview-problem-text');
   private readonly fixButton = h('button.primary', { title: 'Send these errors to the agent and ask it to fix it' }, 'Fix with agent');
-  /** Each page's localStorage, kept while bot.computer is open (the frame starts afresh on every render). */
+  /** Each page's localStorage, kept while OAIY is open (the frame starts afresh on every render). */
   private readonly storage = new Map<string, Record<string, string>>();
   /** Set by the page: ask the agent to fix what is shown. Returns false when the agent is busy. */
   onFix: ((target: PreviewTarget, problems: Problem[]) => boolean) | null = null;
@@ -581,7 +581,7 @@ export class Preview {
   /** A new frame for this render, sized to the viewport. */
   private newFrame(title: string, src: string, sandbox: string): HTMLIFrameElement {
     const frame = h('iframe', { title }) as HTMLIFrameElement;
-    // Opaque origin: the page cannot reach bot.computer's storage, files or keys.
+    // Opaque origin: the page cannot reach OAIY's storage, files or keys.
     frame.setAttribute('sandbox', sandbox);
     // Lets the page embed the frame under its own COEP even where the host
     // cannot add headers to the frame's response.

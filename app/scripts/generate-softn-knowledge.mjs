@@ -13,7 +13,7 @@
  *       apps/<slug>/v1.softn), kept as the .softn bytes, for the agent to
  *       read or copy into the project.
  *
- * The output is committed (bot.computer works offline); run this after a
+ * The output is committed (OAIY works offline); run this after a
  * SoftN update:   SOFTN_REPO=../softn.com node scripts/generate-softn-knowledge.mjs
  */
 import { readFileSync, mkdirSync, writeFileSync } from 'node:fs';
