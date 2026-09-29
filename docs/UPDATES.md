@@ -78,7 +78,10 @@ save, and ends its turn, as quitting does.
    services. The services that were running are written down so the OAIY that opens after
    the update starts them again.
 5. The installer takes the verified bytes. On Windows that starts the installer and ends
-   this process; the installer replaces OAIY and opens it again.
+   this process; the installer replaces OAIY and opens it again (the old tray icon may stay
+   on screen until the mouse passes over it: OAIY does not remove it before the installer is
+   started, so that a failed start leaves OAIY as it was). On Linux the AppImage is replaced
+   and OAIY restarts through its normal exit.
 
 If a part will not stop, or the installer cannot be started, everything that was stopped is
 started again (last stopped, first started) and the update is shown as **failed**, with the
