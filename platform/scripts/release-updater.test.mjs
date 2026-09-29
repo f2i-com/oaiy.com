@@ -260,6 +260,16 @@ describe('the signing step, run for real with a stand-in Tauri CLI', { skip: !ba
     assert.throws(() => buildFeed({ dir: other, version: '9.9.9', pubkey: keys.pubkey }), /is not version 9\.9\.9/);
   });
 
+  it('takes the password without the newline a secret set from a file can end in', () => {
+    // The stand-in signer wants the password exactly: a trailing newline would fail it, as it would fail the real CLI.
+    for (const ending of ['\n', '\r\n']) {
+      const w = workspace();
+      const result = run(w, { [PASSWORD]: PASSWORD_VALUE + ending });
+      assert.equal(result.status, 0, `${JSON.stringify(ending)}: ${result.stdout}${result.stderr}`);
+      assert.equal(fs.readdirSync(path.join(w.ws, 'signatures')).length, 2);
+    }
+  });
+
   it('stops before it signs anything when the key or the password is not there, and names the secret', () => {
     for (const [env, message] of [
       [{ [SECRET]: '' }, /the secret TAURI_SIGNING_PRIVATE_KEY is not set in the release environment/],

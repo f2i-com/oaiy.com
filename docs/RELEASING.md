@@ -83,7 +83,16 @@ pushed, GitHub creates it empty: no reviewer and no tag rule, and the job would 
 4. **Environment secrets**: add the two secrets HERE, under the environment's own secrets, and
    delete any copy of them from the repository's Actions secrets. A repository secret can be
    read by a workflow on any branch, whatever the environment's rules; an environment secret
-   only by a job that has passed them.
+   only by a job that has passed them. From a shell that has `<` (Git Bash, say), the values
+   are read from their files and never appear on a command line or in the history:
+
+   ```sh
+   gh secret set TAURI_SIGNING_PRIVATE_KEY --env release --repo f2i-com/oaiy.com < ~/.oaiy-signing/oaiy-updater.key
+   gh secret set TAURI_SIGNING_PRIVATE_KEY_PASSWORD --env release --repo f2i-com/oaiy.com < ~/.oaiy-signing/oaiy-updater.key.password.txt
+   ```
+
+   (The sign step drops a trailing newline from the password, which a value read from a file
+   can carry.)
 5. **A tag ruleset** (Settings, Rules, Rulesets, New tag ruleset): target the same two tag
    patterns; restrict who may create them to the people who cut releases, and block updates
    and deletions (a published tag is never moved: see below). Whoever can create a matching
@@ -92,7 +101,56 @@ pushed, GitHub creates it empty: no reviewer and no tag rule, and the job would 
 None of this can be enforced from the workflow file: a rule that is missing is a weaker setup,
 not a failing build. A tag run whose environment lacks the secrets fails in the `sign` job,
 after the builds, naming the secret that is missing; try the key once before the first release
-(below) so that is not where it is found.
+(next section) so that is not where it is found.
+
+### Before the first release: try the key
+
+Do this ONCE before the first tag, and again whenever the key or the secrets change. It proves
+that the private key you hold is the pair of the public key inside every installer. The Tauri
+CLI does not check that (it only warns, and a release signed with the wrong key installs on
+nobody), and no installed OAIY can be fixed afterwards. The key is used on a probe file and
+nothing of it is printed: the CLI reads the key from its file and the password from the
+environment, and the check prints only whether the signature verifies.
+
+From the repository's root, in PowerShell (the key and its password are in
+`%USERPROFILE%\.oaiy-signing`, as above):
+
+```powershell
+$dir = Join-Path $env:USERPROFILE '.oaiy-signing'
+$probe = Join-Path $env:TEMP 'oaiy-signing-probe.txt'
+Set-Content -LiteralPath $probe -Value 'probe' -NoNewline
+$env:TAURI_SIGNING_PRIVATE_KEY_PATH = Join-Path $dir 'oaiy-updater.key'
+$env:TAURI_SIGNING_PRIVATE_KEY_PASSWORD = (Get-Content -LiteralPath (Join-Path $dir 'oaiy-updater.key.password.txt') -Raw).Trim()
+Push-Location platform\desktop
+npx tauri signer sign $probe | Out-Null
+Pop-Location
+Remove-Item Env:\TAURI_SIGNING_PRIVATE_KEY_PATH, Env:\TAURI_SIGNING_PRIVATE_KEY_PASSWORD
+node platform\scripts\verify-signature.mjs $probe
+Remove-Item -LiteralPath $probe, "$probe.sig"
+```
+
+Or in a POSIX shell (on Linux or macOS; on Windows use the PowerShell version, since a path
+of Git Bash is not one Node understands):
+
+```sh
+probe="$(mktemp)" && printf probe > "$probe"
+(cd platform/desktop && TAURI_SIGNING_PRIVATE_KEY_PATH="$HOME/.oaiy-signing/oaiy-updater.key" \
+  TAURI_SIGNING_PRIVATE_KEY_PASSWORD="$(tr -d '\r\n' < "$HOME/.oaiy-signing/oaiy-updater.key.password.txt")" \
+  npx tauri signer sign "$probe" > /dev/null)
+node platform/scripts/verify-signature.mjs "$probe"
+rm -f "$probe" "$probe.sig"
+```
+
+It must say `OK: ... verifies against the public key in tauri.conf.json (plugins.updater.pubkey);
+key id ...`. `NOT VERIFIED ... the key ids differ` (or `the file does not match its signature`)
+means the key you hold is not the pair of the public key in `tauri.conf.json`: do NOT release;
+find the right key, or make a new pair and follow "If the private key is lost" in
+[UPDATES.md](UPDATES.md#the-key-and-its-custody). `CANNOT CHECK` means something was missing
+(the key file, the signature the CLI should have written, a wrong path). The password goes
+through the environment and never through `-p`/`--password`, which would put it in the shell's
+history and in the process list; `| Out-Null` and `> /dev/null` discard the CLI's own output
+(it holds the signature, which is public, but nothing here needs it). The script is the same
+check the release job makes before it writes `latest.json` (`platform/scripts/minisign.mjs`).
 
 The key was made once. Its file and its password are kept outside every repository, with a
 README that says this again (`C:\Users\<you>\.oaiy-signing\README.txt` on the machine that
