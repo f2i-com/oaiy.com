@@ -152,9 +152,11 @@ history and in the process list; `| Out-Null` and `> /dev/null` discard the CLI'
 (it holds the signature, which is public, but nothing here needs it). The script is the same
 check the release job makes before it writes `latest.json` (`platform/scripts/minisign.mjs`).
 
-The key was made once. Its file and its password are kept outside every repository, with a
-README that says this again (`C:\Users\<you>\.oaiy-signing\README.txt` on the machine that
-made it). Keep an offline copy of both in a password manager, and delete the local ones.
+The key was made once. Until you delete them, its file and its password sit on the machine that
+made it, in `C:\Users\<you>\.oaiy-signing` (outside every repository, with a README that says
+this again). Keep an offline copy of both in a password manager, and then delete the local ones:
+from then on the private key is in that offline copy and in the `release` environment's two
+secrets, and nowhere else (UPDATES.md, "The key and its custody").
 **Losing the private key means no installed OAIY can be updated again**: they trust only the
 old public key. The way out is a new key with its public half in `tauri.conf.json`, a new
 release, and everyone installing that release by hand from the releases page; see
@@ -316,6 +318,10 @@ a release matter here:
   `SHA256SUMS.txt` (`certutil -hashfile <file> SHA256`), then choose "More info" and "Run
   anyway". The NSIS installer installs for the current user (`%LOCALAPPDATA%\OAIY`) and
   asks for no administrator rights.
+- **The first release with the updater is installed by hand by everyone.** Only a copy that
+  already contains the updater can update itself, and no earlier copy does: 0.1.0 is a download
+  from this page for every owner of OAIY, and from that copy on, updates are offered inside OAIY
+  (UPDATES.md). Say so in the notes of that release.
 - **An install of 0.0.x has to be uninstalled first.** The app's identifier is now
   `com.oaiy.app` (it was `com.oaiy`, and the product was called "OAIY Desktop"), and its
   data lives in `%APPDATA%\com.oaiy.app`, where the old one kept it in

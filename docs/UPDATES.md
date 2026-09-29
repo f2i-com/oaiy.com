@@ -13,9 +13,11 @@ button.** In order:
    30 seconds however it is asked. The daily look can be switched off in Settings; a check
    asked for by hand works either way. It is one small request to
    `github.com/f2i-com/oaiy.com/releases/latest/download/latest.json`, which says which
-   version is current. The request carries no identifier of this computer or its owner
-   (only a user agent that names OAIY); like any request it shows GitHub the computer's
-   network address.
+   version is current. The request OAIY makes itself carries no identifier of this computer
+   or its owner (only a user agent that names OAIY). The updater plugin makes its own request for
+   the feed when a newer version is found, and its own for the installer, and those carry the
+   plugin's user agent, not OAIY's (nothing else is added). Like any request they show GitHub the
+   computer's network address.
 2. If there is a newer version, OAIY **says so**: a banner on the Overview (dismissible until
    the version after that one) and Settings → About and updates, with its notes.
 3. **Download** is a button. OAIY fetches the installer and checks its signature (below). A
@@ -40,6 +42,15 @@ first forgets it and it is downloaded again.
 | A development build (`tauri dev`, `cargo run`) | No: there is no installed copy to replace. |
 | macOS | No release is built. |
 | The headless `oaiy-server` | No: it **only reports** that a newer release exists (see below). |
+
+**The first release that carries the updater has to be installed by hand, by everyone.** Only a
+copy that already contains the updater can update itself, and no copy from before it does: the
+0.0.x releases and every earlier build have no way to look for, let alone install, a newer OAIY.
+So 0.1.0, the first release with the updater in it, is a download from the releases page for
+everyone (the setup.exe on Windows, the AppImage on Linux; an install of 0.0.x has to be
+uninstalled first, see [RELEASING.md](RELEASING.md#installing-a-release)), and only from the copy
+of 0.1.0 on is an update offered. No release can change that: there is no code in an older copy
+to change.
 
 Only what OAIY itself ships is updated. The engines (`oaiy-llm-server`, `oaiy-media`,
 `oaiy-voice`) are a separate channel, plugins are installed from a folder or an archive, and
@@ -116,9 +127,12 @@ save, and ends its turn, as quitting does.
    started, so that a failed start leaves OAIY as it was). On Linux the AppImage is replaced
    and OAIY restarts through its normal exit.
 
-If a part will not stop, or the installer cannot be started, everything that was stopped is
+If a part will not stop, or the installer cannot be STARTED, everything that was stopped is
 started again (last stopped, first started) and the update is shown as **failed**, with the
-reason in words. OAIY is then running as before. So it is after a panic (an internal error) anywhere
+reason in words. OAIY is then running as before. That is all "put back" means. On Windows the
+hand-off starts the installer and the process ends at once, so OAIY never learns how the installer
+went: an installer that starts and then fails, or a version that installs and does not work, is
+NOT undone (there is no rollback yet: see "Not yet"). Put back is also what follows a panic (an internal error) anywhere
 in the sequence: a guard starts again what was stopped, including the part that was in the middle of
 stopping, and fails the update, so OAIY is never left half stopped with the update stuck on
 "installing". If something could not be started again, the message says which and to quit
@@ -238,10 +252,12 @@ stop it, unzip the new one into a new folder beside the old, start that.
 ## The key and its custody
 
 Every update is signed with one minisign key. Its **public** half is in `tauri.conf.json`
-and in every installed OAIY. Its **private** half and password are two GitHub Actions
-secrets (`TAURI_SIGNING_PRIVATE_KEY`, `TAURI_SIGNING_PRIVATE_KEY_PASSWORD`) and an offline
-copy in the owner's password manager, and nowhere else: not in a repository, not in an
-artifact, not in a log. They are read by one job, `sign`, which only signs the two
+and in every installed OAIY. Its **private** half and password are in these places and no
+others: the two secrets of the `release` GitHub environment (`TAURI_SIGNING_PRIVATE_KEY`,
+`TAURI_SIGNING_PRIVATE_KEY_PASSWORD`); an offline copy in the owner's password manager; and,
+until the owner deletes them, the two files on the machine that made the key
+(`C:\Users\<you>\.oaiy-signing`, outside every repository, with a README). Not in a repository,
+not in an artifact, not in a log. The environment's secrets are read by one job, `sign`, which only signs the two
 installers, on a tag, in a protected environment (RELEASING.md); the builds are given none. A
 release without the secrets fails in that job, and a release whose signatures do not verify
 against the public key in `tauri.conf.json` (the secrets belong to another key) stops before it
@@ -268,9 +284,9 @@ OAIY would accept. Rotate it, and tell people to install the new release by hand
   update with it: the sequence does not put a time limit of its own on a part, because giving
   up on one that is still running and starting the others again would race it. If it ever
   happens, quit OAIY from its tray icon.
-
-- **Rollback.** A failed install is put back (above), but an install that finishes and then
-  does not work is not: the previous installer is not kept. The design: keep the last
+- **Rollback.** An install that could not START is put back (above), but an installer that starts
+  and then fails, and a version that installs and does not work, are not: the previous installer is
+  not kept, and on Windows OAIY does not even see how the installer went. The design: keep the last
   installer under `<data>/updates`, mark the first launch after an update, and offer
   "Reinstall the previous version" when that launch does not come up healthy.
 - **A quiet-hours window** to install in. The owner presses the button; nothing picks a time.

@@ -70,22 +70,37 @@ The updater's part of the release is tested the same two ways. `scripts/make-lat
 runs the script that writes the update feed (`latest.json`, in the Tauri updater's format) over
 fixture release folders: the signature is the content of the `.sig` file, the URL is the release
 asset's, Windows is the NSIS installer and never the MSI, and a missing installer or signature is
-an error that writes nothing; and, given the desktop's `tauri.conf.json`, each installer has to
+an error that writes nothing; given the desktop's `tauri.conf.json`, each installer has to
 verify against the public key in it (`scripts/minisign.mjs`, minisign in `node:crypto`, tested with
-a signature the Tauri CLI really made: `scripts/minisign.test.mjs`), because the CLI only warns when
-the Actions secrets hold another key. `scripts/release-updater.test.mjs` reads the workflow: the two
-signing secrets reach only the desktop build and the meta check, a tag run without them stops in
-`meta` (that step's bash is run), a run on a branch builds without signatures, `tauri.conf.json`
-does not turn the signed artifacts on, and every action is still pinned to a commit.
+signatures the Tauri CLI really made: `scripts/minisign.test.mjs`), because the CLI only warns when
+the Actions secrets hold another key; each signature has to have been made for a file of this
+platform's kind and this version (the trusted comment's `file:`), so an old genuinely signed
+installer cannot be published as a new one; and the repository written into the feed has to be the
+one the desktop is pinned to. `scripts/release-updater.test.mjs` reads the workflow: the two signing
+secrets are named by one step of one job (`sign`: tag runs only, in the `release` environment, after
+the gate and the desktop builds) and by no step that builds, a run on a branch builds unsigned and
+never reaches `sign`, the workflow may not write by default, and that step's bash is run for real
+with a stand-in Tauri CLI that signs with a test key (what it signs, under what names, that nothing
+secret is printed, that it stops when a secret or an installer is missing), whose signatures the
+feed script then accepts; `tauri.conf.json` does not turn the signed artifacts on, and every action
+is still pinned to a commit. `scripts/verify-signature.test.mjs` covers the check a maintainer
+makes with the production key before the first release (docs/RELEASING.md).
 
 ```bash
-node --test scripts/make-latest-json.test.mjs scripts/release-updater.test.mjs scripts/minisign.test.mjs
+node --test scripts/make-latest-json.test.mjs scripts/release-updater.test.mjs scripts/minisign.test.mjs scripts/verify-signature.test.mjs
 ```
 
 The desktop's own updater (`src-tauri/src/update`) is covered by its Rust unit tests
 (`cargo test --lib update::`, both with and without the `gui` feature: the routes run against a
-stub feed server on a port the system picks) and by the dashboard's Vitest tests for
-Settings → About and updates and the Overview banner. `docs/UPDATES.md` says what they protect.
+stub feed server on a port the system picks; the phone check runs real Node stand-in plugins under
+a real plugin host and needs Node, and ends quietly where there is none) and by the dashboard's
+Vitest tests for Settings → About and updates and the Overview banner. Where a unit test cannot run
+the code (the desktop's start-up, the plugin's own update handle), `update/guards.rs` reads the
+source: which sources an install asks, that only one call installs and only one downloads, that the
+download is held to its platform and version. `docs/UPDATES.md` says what they protect. The tests
+that build a plugin process use a `.cmd` shim on Windows: run the two cargo suites each in a fresh
+shell, because the Visual Studio developer shell adds to PATH every time it is entered in one
+session, and after a few runs the shim can no longer start.
 
 | Suite | Where | Needs a running service? | Run |
 |---|---|---|---|
