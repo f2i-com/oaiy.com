@@ -2473,7 +2473,7 @@ mod tests {
 
     /// The clocks of a ring, fast enough for a test.
     fn quick() -> transfer::Timing {
-        transfer::Timing { hold_after: Duration::from_millis(300), hold_silence: Duration::from_millis(300), offer_after: Duration::from_millis(300), give_up_after: Duration::from_millis(200), setup_limit: Duration::from_millis(600), cancel_wait: Duration::from_millis(500) }
+        transfer::Timing { hold_after: Duration::from_millis(300), hold_silence: Duration::from_millis(300), hold_every: Duration::from_millis(400), offer_after: Duration::from_millis(300), give_up_after: Duration::from_millis(200), setup_limit: Duration::from_millis(600), cancel_wait: Duration::from_millis(500) }
     }
 
     fn owner_settings(enabled: bool) -> crate::ring::RingSettings {

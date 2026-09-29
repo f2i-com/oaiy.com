@@ -34,7 +34,9 @@ level, no whitespace, one trailing line feed (`.gitattributes` keeps that on eve
 
 ## The rule for everything below
 
-**A caller is never left in silence, and is never told a lie.** The receptionist says it will *try* to reach
+**A caller is never left in silence for long, and is never told a lie.** (OAIY's clocks say a fixed line at
+least every 15 seconds while a request rings and while an acceptance is being connected, and offer a message 4
+seconds after any other ending, whatever the plugin, the app or the model does.) The receptionist says it will *try* to reach
 the owner. Only when an owner device has accepted is the caller told they are being connected. If nobody
 takes the call, or the owner declines, or the time runs out, the caller is offered a message. What the
 owner's devices do (or fail to do) can only add to what the caller hears, never take a line away.

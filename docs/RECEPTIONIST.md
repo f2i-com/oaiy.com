@@ -125,9 +125,20 @@ What happens, every way it can go:
 | asked again too soon or too often | the same offer; nothing rings |
 
 The receptionist never promises a callback time, never says why you are not available, and has no
-number of yours to give. If it says nothing for a few seconds while you are being rung, or after
-nobody took the call, the desktop says a short fixed line itself, so a caller is never left in
-silence whatever the model or the Agent page is doing.
+number of yours to give. What the caller hears does not depend on the model or the Agent page
+working: the desktop says short fixed lines itself, on its own clocks.
+
+- **While you are rung**, if the receptionist has said nothing, a hold line five seconds in and
+  another every 15 seconds after (three wordings in turn, at most six, so a ring of 90 seconds is
+  covered): the longest silence is about 15 seconds. None of them says the call is being put through.
+- **After you accept**, "Connecting you now" at once, then "Still connecting you" every 15 seconds
+  (three wordings, at most four) until the call is yours or the takeover failed. The takeover has 55
+  seconds; after that the desktop says it could not connect the caller and offers a message.
+- **After a decline, a ring nobody took or a takeover that failed**, the offer of a message within
+  4 seconds of the phone's answer, unless the receptionist has already made it.
+
+What it does not cover: a phone plugin that is not running or has lost its connection to this
+computer, in which case the call is not on this computer to speak to.
 
 **Who rings** is decided by the ring policy, from your settings: this computer rings while you are
 at it (its idle time decides), phones ring when you are away (or always, or never), quiet hours can

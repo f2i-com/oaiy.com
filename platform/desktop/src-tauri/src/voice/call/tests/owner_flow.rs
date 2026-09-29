@@ -66,6 +66,11 @@ async fn flow_with(settings: RingSettings, clock: Option<chrono::DateTime<chrono
 
 /// ...with `devices` the Companions the owner approved (the Companion on this computer is what rings the owner at it).
 async fn flow_on(settings: RingSettings, clock: Option<chrono::DateTime<chrono::FixedOffset>>, devices: Arc<crate::ring::testing::Devices>) -> Flow {
+    flow_full(settings, clock, devices, quick()).await
+}
+
+/// ...on the clocks `timing` (a test of what the caller hears over a long ring needs its own).
+async fn flow_full(settings: RingSettings, clock: Option<chrono::DateTime<chrono::FixedOffset>>, devices: Arc<crate::ring::testing::Devices>, timing: transfer::Timing) -> Flow {
     let ring = Ring::in_memory(settings);
     ring.set_presence(Arc::new(Here));
     ring.set_devices(devices);
@@ -80,7 +85,7 @@ async fn flow_on(settings: RingSettings, clock: Option<chrono::DateTime<chrono::
         let (ring, told) = (ring.clone(), told.clone());
         move |hub: &VoiceHub| {
             hub.set_ring(ring);
-            hub.set_transfer_timing(quick());
+            hub.set_transfer_timing(timing);
             hub.set_messages(Store::default());
             hub.set_message_notifier(Some(told));
         }
@@ -266,6 +271,52 @@ async fn a_decline_that_races_an_accept_is_decided_once_by_the_phone_too_late_of
     f.aokie.hub.command(&f.aokie.call).unwrap().send(CallCommand::Say { text: "Sorry about that.".into(), hold: false, reply }).unwrap();
     assert!(answer.await.unwrap().unwrap_err().contains("handed over"), "the receptionist is quiet once the owner has it");
     assert_eq!(f.ended(), vec![("assist_1".to_string(), "accepted", "phone")]);
+}
+
+/// What the desktop said on its own, of the lines it keeps for a ring and an acceptance.
+fn said_of(f: &Flow, lines: &[&str]) -> Vec<String> {
+    f.aokie.speech.spoken().into_iter().filter(|l| lines.contains(&l.as_str())).collect()
+}
+
+#[tokio::test]
+async fn with_no_model_and_no_page_a_caller_hears_a_fixed_line_every_so_often_while_the_owner_is_rung_in_three_wordings_up_to_a_cap() {
+    let mut f = flow(owner_settings(true)).await;
+    f.caller_says(ASKED);
+    f.ring_through("assist_1", 30).await;
+    // Nobody speaks for the receptionist: no page answers, the model is silent. The desktop's own clocks do (here a fraction of a
+    // second, in a call fifteen seconds apart).
+    tokio::time::sleep(secs(4)).await;
+    let holds = said_of(&f, &transfer::HOLD_LINES);
+    assert_eq!(holds, [transfer::HOLD_LINES, transfer::HOLD_LINES].concat(), "three wordings in turn, and no more than the cap: {:?}", f.aokie.speech.spoken());
+    assert_eq!(holds.len() as u32, transfer::HOLD_MAX);
+    assert!(holds.windows(2).all(|w| w[0] != w[1]), "never the same line twice running");
+    // Nothing said promises a transfer, and the ring goes on.
+    assert!(f.aokie.speech.spoken().iter().all(|l| l != transfer::CONNECTING_LINE && !transfer::STILL_CONNECTING_LINES.contains(&l.as_str())), "{:?}", f.aokie.speech.spoken());
+    assert_eq!(f.dialog().await.len(), 1);
+}
+
+#[tokio::test]
+async fn with_no_model_and_no_page_an_acceptance_is_followed_by_still_connecting_until_the_call_is_the_owners_or_the_takeover_fails() {
+    let timing = transfer::Timing { setup_limit: Duration::from_millis(2_500), ..quick() };
+    let mut f = flow_full(owner_settings(true), None, crate::ring::testing::at_the_pc(), timing).await;
+    f.caller_says(ASKED);
+    f.ring_through("assist_1", 30).await;
+    f.a_device_takes_the_call("assist_1");
+    f.aokie.event("call.transfer", secs(3)).await.expect("accepted");
+    assert!(spoken_within(&f.aokie, transfer::CONNECTING_LINE, secs(2)).await, "at once: {:?}", f.aokie.speech.spoken());
+    // The takeover takes its time and nobody speaks: the caller is told, again and again, in other words, up to the cap.
+    let until = Instant::now() + secs(6);
+    while Instant::now() < until && !spoken_within(&f.aokie, transfer::FAILED_LINE, Duration::from_millis(50)).await {}
+    let still = said_of(&f, &transfer::STILL_CONNECTING_LINES);
+    assert!(still.len() >= 3 && still.len() as u32 <= transfer::CONNECT_MAX, "{:?}", f.aokie.speech.spoken());
+    assert_eq!(&still[..3], &transfer::STILL_CONNECTING_LINES[..], "three wordings in turn");
+    // The takeover never came: the desktop says so and the caller is offered a message, and the still-connecting lines stopped.
+    let told = f.aokie.event("call.transfer", secs(4)).await.expect("the desktop gives up on the takeover");
+    assert_eq!((told["outcome"].clone(), told["source"].clone()), (json!("unavailable"), json!("watchdog")));
+    let then = said_of(&f, &transfer::STILL_CONNECTING_LINES).len();
+    tokio::time::sleep(secs(1)).await;
+    assert_eq!(said_of(&f, &transfer::STILL_CONNECTING_LINES).len(), then, "none after it failed");
+    assert!(spoken_within(&f.aokie, transfer::FAILED_LINE, secs(2)).await);
 }
 
 #[tokio::test]
