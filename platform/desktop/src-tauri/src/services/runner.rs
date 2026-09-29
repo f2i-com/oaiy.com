@@ -355,9 +355,9 @@ mod tests {
     }
 
     /// Spawn the env dump through `Runner::spawn`, the one call both the managed
-    /// services and the installers are started with, and return the names of the
-    /// variables the child actually received.
-    fn received_by_a_spawned_child(explicit: &HashMap<String, String>) -> HashSet<String> {
+    /// services and the installers are started with, and return everything the
+    /// child printed of the environment it actually received.
+    fn printed_by_a_spawned_child(explicit: &HashMap<String, String>) -> Vec<LogLine> {
         let (command, args) = env_dump();
         let runner = Runner::spawn(SpawnConfig { command: &command, args: &args, env: explicit, cwd: None })
             .expect("spawn a child that prints its environment");
@@ -365,11 +365,16 @@ mod tests {
         loop {
             let lines = runner.logs.snapshot(None);
             if is_complete(&lines) {
-                return names(&lines);
+                return lines;
             }
             assert!(Instant::now() < deadline, "the child never finished printing its environment");
             std::thread::sleep(Duration::from_millis(50));
         }
+    }
+
+    /// The names of the variables the child received.
+    fn received_by_a_spawned_child(explicit: &HashMap<String, String>) -> HashSet<String> {
+        names(&printed_by_a_spawned_child(explicit))
     }
 
     #[test]
@@ -385,8 +390,8 @@ mod tests {
             ("OAIY_SCRUB_TEST_KEEP", "planted"),
             ("OAIY_SCRUB_TEST_TOKEN_FILE", "planted"),
         ]);
-        // What a template sets for a step, and what the installer is given: a value
-        // a step names on purpose is applied AFTER the scrub, so it arrives.
+        // What a template sets for a step: only what is INHERITED is scrubbed, so a
+        // variable of the step's own that is named like a token still arrives.
         let mut explicit = HashMap::new();
         explicit.insert("OAIY_DATA_DIR".to_string(), "the-data-dir".to_string());
         explicit.insert("OAIY_SCRUB_TEST_STEP_TOKEN".to_string(), "on-purpose".to_string());
@@ -410,5 +415,26 @@ mod tests {
         ] {
             assert!(seen.contains(arrived), "{arrived} should have reached the child (is the probe reading its environment at all?)");
         }
+    }
+
+    /// The order the doc comment promises: the inherited tokens are taken out FIRST and the step's own
+    /// variables applied after, so a template that sets an `OAIY_*TOKEN` on purpose is given it even
+    /// when this process holds a token of the same name. Scrubbing after the step's variables would
+    /// take the step's own value out with the inherited one.
+    #[test]
+    fn a_step_that_names_a_token_this_process_also_holds_gets_its_own_value() {
+        let _planted = Planted::new(&[("OAIY_SCRUB_TEST_OVERLAP_TOKEN", "the-servers-own")]);
+        let mut explicit = HashMap::new();
+        explicit.insert("OAIY_SCRUB_TEST_OVERLAP_TOKEN".to_string(), "the-steps-own".to_string());
+
+        let printed = printed_by_a_spawned_child(&explicit);
+
+        // Both values are made up for the test; neither is anyone's credential.
+        let value = printed
+            .iter()
+            .filter(|l| l.stream == "stdout")
+            .find_map(|l| l.text.trim().strip_prefix("OAIY_SCRUB_TEST_OVERLAP_TOKEN="))
+            .map(str::to_owned);
+        assert_eq!(value.as_deref(), Some("the-steps-own"), "the child should hold the step's own value, and only that");
     }
 }
