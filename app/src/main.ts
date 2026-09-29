@@ -8,9 +8,14 @@ import { sandboxAvailable, zippModule } from './sandbox/runner';
 import { loadSettings, saveAgentSettings, saveDesktop, saveGate, saveLastKeptProject, saveLastProject, saveMedia, saveMessages, saveProviders } from './settings';
 import { Desktop } from './desktop/bridge';
 import { DesktopEvents, Sessions, TEST_NUMBER, callerNotesTool, phoneConversationsTool, tellAgentTool, type Session, type Thread } from './sessions';
-import { displayNumber, setLocalCountry } from './phoneNumbers';
+import { displayNumber, samePerson, setLocalCountry } from './phoneNumbers';
 import { Callbacks, type Screening } from './callbacks';
 import { PhoneLine } from './phoneLine';
+import { Outreach, tally, type Campaign, type OutreachKind, type OutreachPlan, type PhoneRules } from './outreach';
+import { OUTREACH_TOOL_NAMES, outreachTools } from './outreachTools';
+import { confirmOutreach } from './ui/outreach';
+import { personState } from './ui/chat/outreachCard';
+import type { Turn } from './agent/protocol';
 import { UNPAIRED, diffModules, followModules, isOn, readModules, sessionShown, whyOff, type Modules } from './modules';
 import { flowSessionTools, flowToolHooks, readFlowStore } from './desktop/flowTools';
 import { pluginSessionTools, type PluginToolAudience } from './desktop/pluginTools';
@@ -181,6 +186,10 @@ async function main(): Promise<void> {
   let callbacks: Callbacks | null = null;
   /** The phone's one line, as call backs and outreach see it: busy while any call is on it, and a minute after. */
   const line = new PhoneLine();
+  /** Outreach: the lists of people the runner (or a project) calls or texts, by the page that answers the calls. */
+  let outreach: Outreach | null = null;
+  /** How far the tests have moved outreach's clock on (never outside an automated browser). */
+  let outreachSkew = 0;
   // Several OAIY pages may follow the same phone: the one holding this lease answers its texts.
   const pageId = crypto.randomUUID();
   let holdsTexts = false;
@@ -194,7 +203,7 @@ async function main(): Promise<void> {
   /** Flows in front of the agents' tools. */
   let toolHooks: ToolHook[] = [];
   /** The names the agents' own tools go by: a flow or a plugin's tool with one of them gets a prefix. */
-  const builtInToolNames = new Set([...TOOLS.map((t) => t.name), 'send_text_message', 'end_call', 'request_appointment', 'lookup_business_data', 'guide', 'update_plan', 'delegate', TRANSCRIBE_TOOL, 'calendar_free_times', 'calendar_list', 'calendar_book', 'calendar_change', 'flow_nodes', 'flow_list', 'flow_read', 'flow_write', 'flow_run']);
+  const builtInToolNames = new Set([...TOOLS.map((t) => t.name), 'send_text_message', 'end_call', 'request_appointment', 'lookup_business_data', 'guide', 'update_plan', 'delegate', TRANSCRIBE_TOOL, 'calendar_free_times', 'calendar_list', 'calendar_book', 'calendar_change', 'flow_nodes', 'flow_list', 'flow_read', 'flow_write', 'flow_run', ...OUTREACH_TOOL_NAMES]);
   /**
    * The desktop's modules: the phone (calls, texts and the Front desk) and the
    * calendar are there only while a plugin provides them (Aokie, the AI
@@ -303,7 +312,40 @@ async function main(): Promise<void> {
     },
     open: (path, app) => openFromChat(path, app),
     flag: (path, comment) => flagFromChat(path, comment),
+    // Outreach's live card: its state, and pause, resume and stop (asked first), and its results.
+    outreach: {
+      view: (id) => outreach?.get(id),
+      onChange: (fn) => outreach?.onChange(fn) ?? (() => {}),
+      pause: (id) => void outreach?.pause(id),
+      resume: (id) => void outreach?.resume(id),
+      end: (id) => void stopOutreach(id),
+      open: (path) => void openOutreachResults(path),
+    },
   });
+
+  /** Stop an outreach from its card: asked first. */
+  async function stopOutreach(id: string): Promise<void> {
+    const c = outreach?.get(id);
+    if (!c) return;
+    if (!(await confirmAction({ title: `Stop "${c.name}"?`, message: `No one else on the list is ${c.kind === 'call' ? 'called' : 'texted'}; a call going on now goes on. Its report comes to the conversation that started it.`, ok: 'Stop it', danger: true }))) return;
+    await outreach?.end(id);
+  }
+
+  /** An outreach's results, opened in the editor: they are the Front desk's files. */
+  async function openOutreachResults(path: string): Promise<void> {
+    if (!frontDesk.vfs.exists(path)) {
+      chat.system(`${path} is not written yet: it is once the first person is done.`, 'error');
+      return;
+    }
+    if (shownFiles !== frontDesk) {
+      if (!(await mayLeaveRun())) return;
+      await openProject(frontDesk.meta);
+    }
+    showPane('editor');
+    editor.open(path);
+    tree.select(path);
+    if (window.matchMedia('(max-width: 900px)').matches) showView('editor');
+  }
 
   /**
    * The person flagged a picture: it is sent back (it cannot be animated or
@@ -375,6 +417,48 @@ async function main(): Promise<void> {
     const live = sessions?.list.find((s) => s.callId);
     if (live) selectSession(live.thread);
   } }) as HTMLButtonElement;
+  // An outreach going on (or its report waiting): how far it has got, and a click opens the conversation that started it.
+  const outreachChip = h('button.chip.outreach', { hidden: true, onclick: () => void openOutreachOrigin() }) as HTMLButtonElement;
+  /** The campaign the chip is about: the first running, else one whose report waits. */
+  const chipCampaign = (): Campaign | undefined => outreach?.open[0] ?? outreach?.campaigns.find((c) => c.report.pending && !c.report.delivered);
+  function renderOutreachChip(): void {
+    const c = phoneOn() ? chipCampaign() : undefined;
+    outreachChip.hidden = !c;
+    if (!c) return;
+    const t = tally(c);
+    const others = (outreach?.open.length ?? 1) - (c.state === 'running' || c.state === 'paused' ? 1 : 0);
+    const replied = c.people.filter((p) => p.outcome && ['completed', 'partial', 'declined', 'wrong_number', 'opted_out'].includes(p.outcome)).length;
+    const [state, words] = c.report.pending && !c.report.delivered && c.state !== 'running' && c.state !== 'paused'
+      ? ['report', `Report waiting · ${c.name}`]
+      : c.state === 'paused'
+        ? ['waiting', `Paused · ${c.name}`]
+        : c.waitingFor && !c.people.some((p) => p.state === 'dialling' || p.state === 'ringing' || p.state === 'on_call' || p.state === 'sending')
+          ? ['waiting', `Waiting: ${c.waitingFor}`]
+          : ['running', c.kind === 'call' ? `Calling ${t.done}/${t.total}` : `Texting · ${replied} replied`];
+    outreachChip.dataset.state = state;
+    outreachChip.replaceChildren(icon(c.kind === 'call' ? 'phone' : 'message'), document.createTextNode(`${words}${others > 0 ? ` +${others}` : ''}`));
+    outreachChip.title = `Outreach "${c.name}": ${t.done} of ${t.total} done${t.text ? ` (${t.text})` : ''}. Click to open ${c.origin.projectName}, which started it.`;
+  }
+
+  /** The conversation that started the outreach the chip is about. */
+  async function openOutreachOrigin(): Promise<void> {
+    const c = chipCampaign();
+    if (!c) return;
+    if (project?.meta.id === c.origin.projectId) {
+      if (viewing) selectSession(null);
+      showView('agent');
+      return;
+    }
+    if (!(await mayLeaveRun())) return;
+    const meta = c.origin.projectId === FRONT_DESK.id ? frontDesk.meta : (await listProjects()).find((m) => m.id === c.origin.projectId);
+    if (!meta) {
+      chat.system(`${c.origin.projectName}, which started "${c.name}", is gone. outreach_results in the Front desk gives its results.`, 'error');
+      return;
+    }
+    await openProject(meta);
+    showView('agent');
+  }
+
   const renderChips = () => {
     gateChip.textContent = `internet: ${gate.mode === 'open' ? 'on' : gate.mode === 'blocked' ? 'off' : 'allowlist'}`;
     gateChip.dataset.mode = gate.mode;
@@ -482,17 +566,27 @@ async function main(): Promise<void> {
     const runner = () => withPreview && place() === frontDesk && phoneOn();
     /** The person's own conversation here: "Set up OAIY", the Front desk's runner, or a project's. (The phone's conversations say their own kind.) */
     const ownKind = (): AgentKind => (place().meta.id === SETUP_PROJECT.id ? 'setup' : runner() ? 'runner' : 'project');
+    /** Outreach, for the conversations the person is at (the runner's and a project's): its report comes back here. */
+    const outreachSet = (k: AgentKind) => outreachTools({
+      engine: () => outreach,
+      origin: () => ({ kind: k === 'runner' ? 'runner' : 'project', projectId: place().meta.id, projectName: place().meta.name }),
+      ready: (what) => outreachReady(what, place()),
+      screening: readScreening,
+      approve: (plan) => approveOutreach(plan),
+    });
     return (given?: AgentKind): AgentOptions => {
       const kind = (): AgentKind => given ?? ownKind();
       return {
         // Flows made tools, and speech to text: both run on OAIY Desktop.
         // The calendar's tools only while there is one (a plugin provides it).
         // The plugins' tools offered to the project's conversation (or, in the Front desk, to the runner).
+        // Outreach where the person is (never a call, a text, a flow's task or "Set up OAIY").
         // OAIY's own tools (its control API) after them, as this kind of conversation is offered them.
         sessionTools: () => withControl(kind(), [
           ...(desktop ? [...flowTools, transcribe, ...(calendarOn() ? calendar : []), ...flowBuilder] : flowTools),
           ...(runner() ? phone : []),
           ...(withPreview ? pluginTools(runner() ? 'runner' : 'project') : []),
+          ...(withPreview && phoneOn() && (kind() === 'runner' || kind() === 'project') ? outreachSet(kind()) : []),
         ]),
         instructions: () => [runner() ? RUNNER_INSTRUCTIONS : '', controlInstructions(kind())].filter(Boolean).join('\n\n'),
         toolHooks: () => toolHooks,
@@ -529,6 +623,7 @@ async function main(): Promise<void> {
     'You keep that direction. When your person tells you what callers or texters should hear, be offered, or not be promised, update /brief.md: short, current and plain, with anything out of date taken out. Put lasting facts (services explained, prices, areas served, answers to common questions) in files under /knowledge. Files your person attaches are kept in /uploads, where the sub-agents read them too.',
     'Pass on what your person tells you, so the phone\'s agents know it: for everyone, /brief.md (read before every reply, so a call going on now has it at its next reply); about one person (their name, how they like things, what to tell them next time), caller_notes, which the agent of each of their calls reads as the call starts, and of their texts before every reply; for one conversation going on now (a call in progress), tell_agent. Each call starts fresh: its agent has what the brief and that person\'s note say, and looks up their earlier calls and texts itself.',
     'To see what the phone\'s agents said and did, use phone_conversations (the list, or one conversation). Opening hours and services come from the Calendar, not from files.',
+    'To call or text a list of people for your person (confirm, remind, collect details), use start_outreach; it asks them once, then works through the list itself and reports back here. Its results are kept in /outreach, which only you read (the phone\'s agents cannot).',
   ].join('\n');
   const projectOptions = optionsFor(() => project, true);
   const deskOptions = optionsFor(() => frontDesk, false);
@@ -604,10 +699,130 @@ async function main(): Promise<void> {
     own.calendarOn = calendarOn;
     await own.load();
     // Missed calls rung back: by the page that answers the calls, when the line is free (started with the phone).
-    callbacks = new Callbacks(frontDesk, () => messages, () => desktop, () => holdsCalls && line.idle(Date.now(), own.list.some((s) => s.callId)), readScreening, () => {}, callsToOaiy);
+    // (Never anyone on the do-not-contact list: they asked not to be called.)
+    callbacks = new Callbacks(frontDesk, () => messages, () => desktop, () => holdsCalls && line.idle(Date.now(), own.list.some((s) => s.callId)) && !outreach?.busy, readScreening, () => {}, callsToOaiy, (number) => !!outreach?.doNotContact.some((d) => samePerson(d.number, number)));
     await callbacks.load();
     // A call back's call is taken by the agent knowing it rang them, and why.
     own.callingBack = (number) => callbacks?.calling(number);
+    // Outreach: kept beside the Front desk, run by the page that answers the calls (started with the phone).
+    outreach = new Outreach({
+      store: frontDesk,
+      files: () => frontDesk.vfs,
+      desktop: () => desktop,
+      phone: () => ({ holdsCalls, holdsTexts, connected: phoneConnected }),
+      line,
+      callbacks: () => callbacks,
+      screening: readScreening,
+      callsToOaiy,
+      rules: readRules,
+      sessions: () => sessions?.forOutreach() ?? null,
+      post: postOutreach,
+      report: deliverReport,
+      changed: () => {
+        renderOutreachChip();
+        renderSessions();
+      },
+      now: () => Date.now() + outreachSkew,
+    });
+    await outreach.load();
+    own.outreach = outreach;
+  }
+
+  /** What Aokie's settings say about calling (read at most every five minutes). */
+  let rulesRead: { at: number; rules: PhoneRules } | null = null;
+  async function readRules(): Promise<PhoneRules | null> {
+    const d = desktop;
+    if (!d) return null;
+    if (rulesRead && Date.now() - rulesRead.at < 5 * 60_000) return rulesRead.rules;
+    try {
+      const got = (await d.command('aokie', 'settings.get', {}, `oaiy:settings.get:all:${crypto.randomUUID()}`)) as { settings?: Record<string, unknown> } | null;
+      const s = got?.settings ?? {};
+      const int = (v: unknown, fallback: number) => (typeof v === 'number' ? v : typeof v === 'string' && v.trim() && Number.isFinite(Number(v)) ? Number(v) : fallback);
+      const rules = { quietStart: int(s.quietHoursStart, 21), quietEnd: int(s.quietHoursEnd, 8), maxDailyDials: int(s.maxDailyDials, 20), outboundEnabled: s.outboundEnabled === true || s.outboundEnabled === 'true' };
+      rulesRead = { at: Date.now(), rules };
+      return rules;
+    } catch {
+      return null;
+    }
+  }
+
+  /** Why an outreach of `kind` cannot start from `place` now ('' when it can). */
+  async function outreachReady(kind: OutreachKind, place: OpenProject): Promise<string> {
+    if (!desktop || !phoneOn()) return 'The phone is not on here: OAIY Desktop needs its phone plugin running.';
+    if (place.meta.incognito) return 'Outreach cannot start from an incognito project: open the Front desk or a kept project.';
+    if (kind === 'call') {
+      if (!messages.calls) return "Answering calls is off in this page's Phone settings: outreach needs it on, so OAIY's agent is on each call.";
+      if (!holdsCalls) return "Another OAIY page answers the phone (OAIY's own window comes first): start it there.";
+      const route = await callsToOaiy();
+      if (route === false) return "The phone's calls go to Aokie's own voice, so OAIY could not record what each person says: send them to OAIY first.";
+      if (route === null) return 'The phone did not answer just now: try again in a moment.';
+      return '';
+    }
+    if (!holdsTexts) {
+      // The texts' lease, taken for the replies (answering texts may be off).
+      const lease = await desktop.lease('answer-texts', pageId, 30_000, IN_OAIY).catch(() => ({ granted: false, holder: '' }));
+      if (!lease.granted) return "Another OAIY page answers the texts (OAIY's own window comes first): start it there.";
+      holdsTexts = true;
+    }
+    return '';
+  }
+
+  /** Ask the person, once; on a yes, outbound calling is turned on when it is off (as calling back does). */
+  async function approveOutreach(plan: OutreachPlan): Promise<boolean> {
+    const rules = await readRules();
+    const outboundOff = plan.kind === 'call' && !!rules && !rules.outboundEnabled;
+    const ok = await confirmOutreach(plan, { outboundOff, maxDailyDials: rules?.maxDailyDials ?? null });
+    if (ok && outboundOff && desktop) {
+      await desktop.command('aokie', 'settings.set', { outboundEnabled: true }, `oaiy:settings.set:outbound:${crypto.randomUUID()}`);
+      rulesRead = null;
+    }
+    return ok;
+  }
+
+  /** Lines and reports for the conversation that started an outreach, held while its agent works. */
+  const heldOutreach: { lines: string[]; reports: Campaign[] } = { lines: [], reports: [] };
+
+  /** A note in the person's own conversation here (kept with it, drawn when it is shown): the agent reads it with the next message. */
+  function addOwnNote(text: string): void {
+    agent.turns.push({ role: 'user', text, automatic: true, at: Date.now() } as Turn);
+    if (viewing === null) chat.outreachNote(text);
+    void project.saveChat(agent.savedTurns()).catch(() => {});
+  }
+
+  /** A line after each person, for the conversation that started the outreach: now if it is open (after its run, if it is working); else kept for when it is. */
+  function postOutreach(c: Campaign, text: string): boolean {
+    if (!project || project.meta.id !== c.origin.projectId) return false;
+    if (currentRun) heldOutreach.lines.push(text);
+    else addOwnNote(text);
+    return true;
+  }
+
+  /**
+   * An outreach finished: its report goes to the conversation that started it,
+   * as a request its agent acts on (at once, or at its next step); when that
+   * conversation is not open, it waits there, and the chip says so.
+   */
+  function deliverReport(c: Campaign): void {
+    const text = c.report.text;
+    if (project && project.meta.id === c.origin.projectId) {
+      if (!currentRun) {
+        outreach?.reported(c, true);
+        if (viewing === null) chat.outreachNote(text);
+        void submit(text, [], true);
+        return;
+      }
+      if (agent.interject(text)) {
+        outreach?.reported(c, true);
+        if (viewing === null) chat.outreachNote(text);
+        return;
+      }
+      heldOutreach.reports.push(c);
+      return;
+    }
+    outreach?.reported(c, false);
+    const t = tally(c);
+    chat.system(`"${c.name}" finished: ${t.done} of ${t.total} done${t.text ? ` (${t.text})` : ''}. Its report waits in ${c.origin.projectName}: open it to let the agent act on it.`);
+    renderOutreachChip();
   }
 
   /** Aokie's call screening: which calls it answers (null when the phone cannot be asked). */
@@ -696,6 +911,11 @@ async function main(): Promise<void> {
     }
     await renderProjects();
     document.title = `${meta.incognito ? '🕶 ' : ''}${meta.name} — OAIY`;
+    // Outreach this conversation started, while it was not open: the lines after each person as one note, then its report.
+    const pending = outreach?.pendingFor(meta.id);
+    if (pending?.lines.length) addOwnNote(pending.lines.join('\n'));
+    for (const c of pending?.reports ?? []) deliverReport(c);
+    renderOutreachChip();
   };
 
   const newProjectFrom = async (imported: Imported | null) => {
@@ -946,6 +1166,11 @@ async function main(): Promise<void> {
       finish();
       currentRun = null;
       renderSessions();
+      // Outreach's lines and reports that came while it worked: in the conversation now, and a report acted on next.
+      if (project === runProject) {
+        for (const note of heldOutreach.lines.splice(0)) addOwnNote(note);
+        for (const c of heldOutreach.reports.splice(0)) setTimeout(() => deliverReport(c));
+      }
       // Messages that came in as the run ended: the next request (the chat shows them already).
       const unread = runAgent.takeUnread();
       if (unread.length && project === runProject) {
@@ -1223,6 +1448,7 @@ A project can hold several apps, each in its own folder (any folder whose manife
     h('div.spacer'),
     phoneChip,
     callChip,
+    outreachChip,
     gateChip,
     providerChip,
     h('button.settings-button', { title: 'AI providers', 'aria-label': 'Settings', onclick: () => void editSettings() }, '⚙', h('span.label', ' Settings')),
@@ -1491,6 +1717,9 @@ With that done, Settings → Images, video and audio → Find OAIY sets it up.`)
         : { id: null, label: project === frontDesk ? '🧭 The runner' : '💬 Project', title: `${project.meta.name}: your conversation with the agent`, status: project === frontDesk ? "Your conversation: it directs the phone's agents" : `Your conversation in ${project.meta.name}`, unread: 0, working: !!currentRun, kind: project === frontDesk ? 'runner' : 'project', name: project === frontDesk ? 'The runner' : project.meta.name },
       ...shownThreads.map((t) => {
         const what = t.kind === 'task' ? 'Flow tasks' : t.ways.length === 2 ? 'Calls and texts' : t.ways[0] === 'call' ? 'Calls' : 'Texts';
+        // Someone on an outreach list: where they are in it.
+        const listed = t.kind === 'person' && !t.hidden ? outreach?.about(t.key) : null;
+        const onList = listed ? `Outreach · ${listed.c.name} · ${personState(listed.c, listed.p).words}` : '';
         return {
           id: t.id,
           kind: t.kind,
@@ -1503,7 +1732,7 @@ With that done, Settings → Images, video and audio → Find OAIY sets it up.`)
           ...(t.lastWay ? { lastWay: t.lastWay } : {}),
           ...(t.kind === 'person' ? { to: t.live || t.hidden ? ('call' as const) : ('sms' as const) } : {}),
           ...(t.hidden ? { hidden: true } : {}),
-          status: t.live ? 'On a call now' : t.running ? 'Working…' : `${what} · ${since(t.lastAt)}`,
+          status: t.live ? (listed ? `On a call now · Outreach · ${listed.c.name}` : 'On a call now') : t.running ? 'Working…' : onList || `${what} · ${since(t.lastAt)}`,
           label: t.key === TEST_NUMBER ? '💬 Test' : `${t.kind === 'task' ? '🔀' : t.lastWay === 'sms' ? '💬' : '📞'} ${t.title}`,
           title: t.kind === 'task' ? `The tasks your flow "${t.title}" gives the agent` : `${t.live ? 'On a call with' : `${what} with`} ${t.title}${t.title !== t.key && !t.hidden ? ` (${displayNumber(t.key)})` : ''}`,
           unread: t.id === viewing ? 0 : t.unread,
@@ -1682,6 +1911,7 @@ With that done, Settings → Images, video and audio → Find OAIY sets it up.`)
     }
     await sessions?.desktopEvent(event);
     await callbacks?.event(event);
+    await outreach?.event(event);
   }, (problem) => {
     const back = !!desktopProblem && !problem;
     desktopProblem = problem;
@@ -1693,9 +1923,10 @@ With that done, Settings → Images, video and audio → Find OAIY sets it up.`)
       void followAgentModel();
     }
   }, 2000, async (events) => {
-    if (!phoneOn()) return;
-    // What came before this page looked (or while it reloaded): the line learns who is on it.
+    // (Whether or not the phone is known to be on yet: only what was under way is matched.)
+    // What came before this page looked (or while it reloaded): the line learns who is on it, and outreach settles what was under way.
     for (const event of events) line.event(event, Date.parse(event.occurredAt) || Date.now());
+    await outreach?.backlog(events);
   });
 
   /**
@@ -1705,7 +1936,8 @@ With that done, Settings → Images, video and audio → Find OAIY sets it up.`)
   async function keepTextLease(): Promise<void> {
     const was = holdsTexts;
     // Texts and calls are the phone's: no lease for them while there is none (the desktop would refuse it).
-    if (!desktop || !messages.answer || !phoneOn()) {
+    // An outreach waiting on texts' replies keeps it (only its people are answered while answering is off).
+    if (!desktop || !(messages.answer || outreach?.textsOpen()) || !phoneOn()) {
       if (holdsTexts && desktop) void desktop.release('answer-texts', pageId);
       holdsTexts = false;
     } else {
@@ -1717,7 +1949,7 @@ With that done, Settings → Images, video and audio → Find OAIY sets it up.`)
         holdsTexts = false;
       }
     }
-    if (holdsTexts && !was) {
+    if (holdsTexts && !was && messages.answer) {
       const n = sessions?.answerWaiting() ?? 0;
       if (n) chat.system(`Answering ${n} text message${n > 1 ? 's' : ''} that came while this page was not answering.`);
     }
@@ -1821,7 +2053,9 @@ With that done, Settings → Images, video and audio → Find OAIY sets it up.`)
     followCalls();
     void refreshPhone();
     callbacks?.start();
+    outreach?.start();
     void keepTextLease();
+    renderOutreachChip();
   }
 
   /** The phone went off: all of that stops, and its conversations are hidden, kept for when it is back. */
@@ -1829,6 +2063,8 @@ With that done, Settings → Images, video and audio → Find OAIY sets it up.`)
     callsAbort?.abort();
     callsAbort = null;
     callbacks?.stop();
+    outreach?.stop();
+    renderOutreachChip();
     if (holdsCalls && desktop) void desktop.release('answer-calls', pageId);
     if (holdsTexts && desktop) void desktop.release('answer-texts', pageId);
     holdsCalls = holdsTexts = false;
@@ -1887,6 +2123,13 @@ With that done, Settings → Images, video and audio → Find OAIY sets it up.`)
     applyModules(UNPAIRED);
   }
   setInterval(() => void keepTextLease(), 10_000);
+  // The end-to-end tests move outreach's clock on (a retry's gap, a reply's deadline) and look at once, in an automated browser only.
+  if (navigator.webdriver) {
+    (window as unknown as { __oaiyOutreachTick?: (ms?: number) => Promise<void> }).__oaiyOutreachTick = async (ms = 0) => {
+      outreachSkew += ms;
+      await outreach?.tick();
+    };
+  }
   window.addEventListener('pagehide', () => {
     if (holdsTexts && desktop) void desktop.release('answer-texts', pageId);
   });

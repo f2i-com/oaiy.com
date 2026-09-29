@@ -29,12 +29,15 @@ import {
   parseCallEnd,
   parseCallStart,
   parseFlowAsk,
+  parseOutreachNote,
   parsePhoneTurn,
   timeLabel,
   wayOf,
   type CallStart,
+  type OutreachNote,
   type Part,
 } from './chat/transcript';
+import { outreachCard, outreachNoteElement, type OutreachHost } from './chat/outreachCard';
 import { Follow, anchorIndex, anchoredScrollTop } from './chat/scroll';
 
 /** How long a flag waits for a comment before it goes without one. */
@@ -207,6 +210,8 @@ export class ChatPane {
       open: (path: string, app?: string) => void;
       /** The person flagged a picture the agent made, with what is wrong ('' when they did not say). */
       flag?: (path: string, comment: string) => void;
+      /** Outreach (the runner's lists of people to call or text): the live card under start_outreach. */
+      outreach?: OutreachHost;
     },
   ) {
     this.planBox.hidden = true;
@@ -691,7 +696,42 @@ export class ChatPane {
     this.thinking = null;
     this.quiet = null;
     this.callOver = false;
+    for (const dispose of this.disposers.splice(0)) dispose();
     this.updateEmpty();
+  }
+
+  /** What the log's live parts (an outreach card) let go of when it is cleared. */
+  private disposers: Array<() => void> = [];
+
+  /** A note from outreach in the person's own conversation (a line after each person, the report): drawn as it is kept. */
+  outreachNote(text: string): void {
+    const note = parseOutreachNote(text);
+    if (!note) {
+      this.system(text.replace(/^\[OAIY\]\s*/, ''));
+      return;
+    }
+    this.drawOutreach(note);
+    this.scroll();
+  }
+
+  /** An outreach note: the lines and the report on their own; a person's outreach text as a text sent to them. */
+  private drawOutreach(note: OutreachNote): void {
+    this.current = null;
+    if (note.kind !== 'texted') {
+      this.add(outreachNoteElement(note));
+      return;
+    }
+    if (this.way !== 'sms') this.wayDivider('sms', this.replaying ? this.drawingAt : Date.now());
+    this.way = 'sms';
+    const bubble = h(
+      'div.tool.sms-out.ok.outreach-sent',
+      { 'data-tool': 'outreach' },
+      h('div.tool-row',
+        h('span.outreach-tag', `Outreach · ${note.name}`),
+        h('span.sms-body', note.body),
+        h('span.sms-state', h('span.tool-status', { role: 'img', 'aria-label': 'sent' }), h('span.sms-state-text', 'Sent'))),
+    );
+    this.add(bubble, 'agent');
   }
 
   /** The empty conversation's welcome: what it is for, and a few things to ask (they fill the box; nothing is sent). */
@@ -1370,6 +1410,13 @@ export class ChatPane {
       card.querySelector('.sms-state-text')!.textContent = result.isError ? 'Not sent' : test ? 'Shown, not sent (a test)' : 'Sent';
       card.querySelector('.sms-state .tool-status')?.setAttribute('aria-label', result.isError ? 'not sent' : 'sent');
     }
+    // An outreach started: its live card under the row, how far it has got and a row a person.
+    const started = result.name === 'start_outreach' && !result.isError ? /\(outreach (out-[\w-]+)\)/.exec(result.content)?.[1] : undefined;
+    if (started && this.handlers.outreach) {
+      const live = outreachCard(started, this.handlers.outreach);
+      this.disposers.push(live.dispose);
+      this.anchorOf(card).after(live.element);
+    }
     // A delegate card replayed from a saved chat: its tasks' outcomes come from the report.
     if (result.name === 'delegate') {
       for (const m of result.content.matchAll(/### Task (\d+): .*? \((done|not finished)\)\n([\s\S]*?)(?=\n\n### Task |\n\nApps still failing|\n\nCheck the results|$)/g)) {
@@ -1647,6 +1694,12 @@ export class ChatPane {
     this.drawingAt = turn.at;
     if (turn.role === 'user' && turn.summary) {
       this.summaryNote(turn.text, 'Earlier conversation summarized for the model (click to read the summary)');
+      return;
+    }
+    // What outreach wrote here (a line after each person, its report, a person's outreach text): drawn as what it is.
+    const outreach = turn.role === 'user' && /^(\[The user sent this while you[^\]]*\]\n\n)?\[OAIY\] Outreach "/.test(turn.text) ? parseOutreachNote(turn.text) : null;
+    if (outreach) {
+      this.drawOutreach(outreach);
       return;
     }
     if (turn.role === 'user' && turn.automatic) {

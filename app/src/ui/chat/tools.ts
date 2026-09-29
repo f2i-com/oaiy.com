@@ -58,6 +58,13 @@ const TOOLS: Record<string, [string, string]> = {
   phone_conversations: ['Phone conversations', 'phone'],
   caller_notes: ['Caller notes', 'user'],
   tell_agent: ['Told an agent', 'message'],
+  start_outreach: ['Started an outreach', 'phone'],
+  outreach_status: ['Outreach progress', 'list'],
+  outreach_pause: ['Paused an outreach', 'clock'],
+  outreach_resume: ['Resumed an outreach', 'refresh'],
+  outreach_stop: ['Stopped an outreach', 'stop'],
+  outreach_results: ['Outreach results', 'table'],
+  record_result: ['Recorded the result', 'check'],
   calendar_free_times: ['Free times', 'calendar'],
   calendar_list: ['The calendar', 'calendar'],
   calendar_book: ['Booked', 'calendar'],
@@ -155,7 +162,14 @@ export function summarizeCall(call: ToolCall): string {
     case 'request_appointment': return [s('service'), s('date'), s('time')].filter(Boolean).join(' · ');
     case 'remember': return s('name') || s('fact');
     case 'earlier_conversations': return s('words');
-    case 'end_call': return s('goodbye');
+    case 'end_call': return i.silent === true ? 'hung up without a word' : s('goodbye');
+    case 'start_outreach': return [s('kind'), Array.isArray(i.people) ? `${i.people.length} ${i.people.length === 1 ? 'person' : 'people'}` : '', s('name')].filter(Boolean).join(' · ');
+    case 'outreach_status': case 'outreach_pause': case 'outreach_resume': case 'outreach_stop': return s('id');
+    case 'outreach_results': return [s('id'), s('format')].filter(Boolean).join(' · ');
+    case 'record_result': {
+      const answers = i.answers && typeof i.answers === 'object' ? Object.entries(i.answers as Record<string, unknown>).map(([k, v]) => `${k}: ${v === true ? 'yes' : v === false ? 'no' : String(v)}`) : [];
+      return [s('outcome').replace(/_/g, ' '), ...answers].filter(Boolean).join(' · ');
+    }
     case 'calendar_free_times': return s('from');
     case 'generate_image': case 'generate_video': case 'generate_music': case 'generate_sound_effect': case 'generate_3d_model': return s('path') || s('output') || '';
     case 'remove_background': case 'upscale_image': case 'media_info': case 'video_frames': case 'video_split': return s('path') || s('input') || '';

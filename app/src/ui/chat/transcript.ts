@@ -187,6 +187,41 @@ export function parseCallStart(text: string, now = new Date()): CallStart | null
   return { name: who.name ?? who.number, ...(who.name ? { number: who.number } : {}), direction, when, ...(at ? { at } : {}), ...(greeting ? { greeting } : {}) };
 }
 
+/** What outreach (outreach.ts) writes into a conversation, read back to draw it. */
+export type OutreachNote =
+  /** A line after each person (and a campaign paused), one or several. */
+  | { kind: 'lines'; lines: Array<{ name: string; text: string }> }
+  /** The report at the end: the counts, the answers, and what to do now. */
+  | { kind: 'report'; name: string; head: string; lines: string[]; answers: string; afterwards: string }
+  /** A person's text thread: the outreach text they were sent. */
+  | { kind: 'texted'; name: string; when: string; body: string };
+
+const OUTREACH_LINE = /^\[OAIY\] Outreach "([^"\n]+)" (?:· (.+)|is paused: (.+))$/;
+
+/** An outreach note (see OutreachNote), or null when the text is not one. */
+export function parseOutreachNote(text: string): OutreachNote | null {
+  const t = text.replace(/^\[The user sent this while you[^\]]*\]\n\n/, '').trim();
+  const texted = /^\[OAIY\] Outreach "([^"\n]+)": you texted them \(([^)]*)\): "([\s\S]*)"\. Their replies come here\.$/.exec(t);
+  if (texted) return { kind: 'texted', name: texted[1], when: texted[2], body: texted[3] };
+  const finished = /^\[OAIY\] Outreach "([^"\n]+)" is finished/.exec(t);
+  if (finished) {
+    const [head, ...rest] = t.split('\n');
+    const fence = /```text\n([\s\S]*?)\n```/.exec(t);
+    const before = rest.join('\n').split('```text')[0].split('\n').map((l) => l.trim()).filter((l) => l && !/^Their answers, as recorded/.test(l));
+    const after = fence ? t.slice(t.indexOf(fence[0]) + fence[0].length).trim() : '';
+    return { kind: 'report', name: finished[1], head: head.replace(/^\[OAIY\]\s*/, ''), lines: before, answers: fence?.[1] ?? '', afterwards: after };
+  }
+  const rows = t.split('\n').filter((l) => l.trim());
+  if (!rows.length) return null;
+  const lines: Array<{ name: string; text: string }> = [];
+  for (const row of rows) {
+    const m = OUTREACH_LINE.exec(row.trim());
+    if (!m) return null;
+    lines.push({ name: m[1], text: m[2] ?? `Paused: ${m[3]}` });
+  }
+  return { kind: 'lines', lines };
+}
+
 /** `[OAIY] 📞 The call ended.` (or `…ended: why.`): the reason, '' for none; null when it is not one. */
 export function parseCallEnd(text: string): string | null {
   const m = /^\[OAIY\] 📞 The call ended(?:: ([\s\S]*?))?\.?$/.exec(text.trim());

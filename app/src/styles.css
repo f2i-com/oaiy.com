@@ -1085,3 +1085,72 @@ footer.dialog-buttons { flex: none; padding: 12px 22px 16px; border-top: 1px sol
   *, *::before, *::after { animation-duration: 0.001ms !important; animation-iteration-count: 1 !important; transition-duration: 0.001ms !important; scroll-behavior: auto !important; }
   .pending > summary .tool-status, .tool.pending .sms-state .tool-status { border-top-color: color-mix(in srgb, var(--accent) 60%, transparent); }
 }
+
+/* ---- Outreach: the dialog that asks once, its card in the chat, its lines and its chip ---- */
+.outreach-plan-part { display: flex; flex-direction: column; gap: 6px; min-width: 0; }
+.outreach-plan-part h3 { margin: 0; font-size: 11.5px; font-weight: 650; letter-spacing: .04em; text-transform: uppercase; color: var(--muted); }
+.outreach-plan-objective { margin: 0; font-size: 14px; line-height: 1.45; }
+.outreach-plan-sample { display: flex; gap: 8px; align-items: flex-start; padding: 9px 12px; border: 1px solid color-mix(in srgb, var(--accent) 30%, var(--border)); border-radius: 4px 14px 14px 14px; background: color-mix(in srgb, var(--accent) 7%, var(--panel)); font-size: 14px; line-height: 1.45; }
+.outreach-plan-sample .icon { width: 14px; height: 14px; flex: none; margin-top: 3px; color: var(--accent); }
+.outreach-plan-collect, .outreach-plan-people { margin: 0; padding-left: 18px; display: flex; flex-direction: column; gap: 3px; font-size: 13.5px; }
+.outreach-plan-collect code { font: 12px var(--mono); padding: 1px 5px; border-radius: var(--r-sm); background: var(--surface-soft); border: 1px solid var(--border); }
+.outreach-plan-people.skipped { color: var(--muted); }
+.outreach-plan-muted { color: var(--muted); }
+.outreach-plan-rows { display: grid; grid-template-columns: max-content 1fr; gap: 6px 14px; font-size: 13.5px; line-height: 1.4; }
+.outreach-plan-label { color: var(--muted); }
+.outreach-plan-value { min-width: 0; overflow-wrap: anywhere; }
+.outreach-plan-note { display: flex; gap: 8px; align-items: flex-start; margin: 0; padding: 8px 10px; border-radius: var(--r-ctl); background: var(--surface-soft); border: 1px solid var(--border); color: var(--muted); font-size: 12.5px; line-height: 1.4; }
+.outreach-plan-note .icon { width: 14px; height: 14px; flex: none; margin-top: 1px; }
+.outreach-plan-note.warn { color: var(--warn); background: var(--warn-soft); border-color: color-mix(in srgb, var(--warn) 40%, var(--border)); }
+@media (max-width: 600px) { .outreach-plan-rows { grid-template-columns: 1fr; gap: 2px; } .outreach-plan-label { margin-top: 6px; } }
+
+.outreach-card { align-self: stretch; display: flex; flex-direction: column; gap: 10px; padding: 12px 14px; border: 1px solid var(--border); border-radius: var(--r-card); background: var(--panel-2); box-shadow: var(--shadow-card); min-width: 0; }
+.outreach-head { display: flex; align-items: center; gap: 8px; min-width: 0; }
+.outreach-head .icon { width: 15px; height: 15px; flex: none; color: var(--accent); }
+.outreach-title { font-weight: 650; font-size: 14px; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.outreach-state { margin-left: auto; flex: none; font-size: 11px; font-weight: 650; padding: 2px 8px; border-radius: 999px; border: 1px solid var(--border); color: var(--muted); background: var(--surface-soft); }
+.outreach-state[data-state='running'] { color: var(--accent); border-color: color-mix(in srgb, var(--accent) 40%, var(--border)); background: var(--primary-soft); }
+.outreach-state[data-state='paused'] { color: var(--warn); border-color: color-mix(in srgb, var(--warn) 40%, var(--border)); background: var(--warn-soft); }
+.outreach-state[data-state='done'] { color: var(--ok); border-color: color-mix(in srgb, var(--ok) 40%, var(--border)); background: var(--ok-soft); }
+.outreach-progress { height: 6px; border-radius: 999px; background: var(--surface-soft); border: 1px solid var(--border); overflow: hidden; }
+.outreach-progress > span { display: block; height: 100%; background: var(--accent-grad); border-radius: inherit; transition: width .3s ease; }
+.outreach-meta { display: flex; flex-wrap: wrap; gap: 4px 12px; font-size: 12px; color: var(--muted); }
+.outreach-meta strong { color: var(--text); font-weight: 650; }
+.outreach-people { list-style: none; margin: 0; padding: 0; display: flex; flex-direction: column; border: 1px solid var(--border); border-radius: var(--r-ctl); overflow: hidden; }
+.outreach-person { display: grid; grid-template-columns: 10px minmax(0, 1.1fr) minmax(0, 1fr) minmax(0, 1.6fr); gap: 10px; align-items: center; padding: 7px 10px; font-size: 12.5px; border-top: 1px solid var(--border); }
+.outreach-person:first-child { border-top: 0; }
+.outreach-dot { width: 8px; height: 8px; border-radius: 50%; background: var(--faint); }
+.outreach-person[data-tone='live'] .outreach-dot { background: var(--err); box-shadow: var(--glow) var(--err); animation: pulse 1.2s ease-in-out infinite; }
+.outreach-person[data-tone='ok'] .outreach-dot { background: var(--ok); }
+.outreach-person[data-tone='wait'] .outreach-dot { background: var(--warn); }
+.outreach-person[data-tone='bad'] .outreach-dot { background: var(--err); }
+.outreach-person-name { font-weight: 600; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.outreach-person-name small { display: block; font-weight: 400; color: var(--muted); font-size: 11px; }
+.outreach-person-state { color: var(--muted); min-width: 0; }
+.outreach-person-answers { min-width: 0; color: var(--text); overflow-wrap: anywhere; }
+.outreach-person-answers .outreach-summary { display: block; color: var(--muted); font-style: italic; }
+.outreach-actions { display: flex; gap: 6px; flex-wrap: wrap; align-items: center; }
+.outreach-actions button { padding: 4px 12px; font-size: 12px; }
+.outreach-actions .outreach-path { margin-left: auto; font: 11.5px var(--mono); color: var(--muted); min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+@media (max-width: 600px) { .outreach-person { grid-template-columns: 10px minmax(0, 1fr) minmax(0, 1fr); } .outreach-person-answers { grid-column: 2 / -1; } }
+
+/* A line after each person, and the report, in the conversation that started it. */
+.outreach-lines { align-self: stretch; display: flex; flex-direction: column; gap: 2px; padding: 6px 10px; border-left: 3px solid color-mix(in srgb, var(--accent) 55%, var(--border)); border-radius: 0 var(--r-ctl) var(--r-ctl) 0; background: color-mix(in srgb, var(--accent) 5%, transparent); font-size: 12.5px; }
+.outreach-line { display: flex; gap: 6px; align-items: baseline; min-width: 0; }
+.outreach-line .icon { width: 12px; height: 12px; flex: none; color: var(--accent); align-self: center; }
+.outreach-line-name { color: var(--muted); flex: none; }
+.outreach-line-text { min-width: 0; overflow-wrap: anywhere; }
+.outreach-report { align-self: stretch; display: flex; flex-direction: column; gap: 8px; padding: 12px 14px; border: 1px solid color-mix(in srgb, var(--ok) 40%, var(--border)); border-radius: var(--r-card); background: color-mix(in srgb, var(--ok) 6%, var(--panel)); font-size: 13px; }
+.outreach-report-head { display: flex; gap: 8px; align-items: center; font-weight: 650; }
+.outreach-report-head .icon { width: 15px; height: 15px; color: var(--ok); }
+.outreach-report p { margin: 0; line-height: 1.45; }
+.outreach-report details summary { cursor: pointer; color: var(--accent); font-weight: 600; font-size: 12px; }
+.outreach-report pre { margin: 6px 0 0; font: 11.5px/1.5 var(--mono); white-space: pre-wrap; color: var(--text); }
+.tool.sms-out .outreach-tag { align-self: flex-start; font-size: 10.5px; font-weight: 650; letter-spacing: .03em; text-transform: uppercase; color: var(--accent); }
+
+.chip.outreach:not(.toggle):not(.on-call) { font-family: inherit; font-size: 12px; font-weight: 650; gap: 6px; color: var(--accent); border-color: color-mix(in srgb, var(--accent) 40%, var(--border)); background: var(--primary-soft); cursor: pointer; }
+.chip.outreach[hidden] { display: none; }
+.chip.outreach[data-state='waiting'] { color: var(--warn); border-color: color-mix(in srgb, var(--warn) 40%, var(--border)); background: var(--warn-soft); }
+.chip.outreach[data-state='report'] { color: var(--ok); border-color: color-mix(in srgb, var(--ok) 45%, var(--border)); background: var(--ok-soft); }
+.chip.outreach .icon { width: 13px; height: 13px; }
+.tool.outreach-sent > .tool-row { display: flex; flex-direction: column; align-items: stretch; gap: 3px; padding: 7px 12px 6px; font-size: 14px; }

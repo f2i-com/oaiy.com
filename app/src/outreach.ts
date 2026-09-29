@@ -1489,6 +1489,16 @@ export class Outreach {
 
   // ---- what the runner sees -------------------------------------------------------------
 
+  /** The outreach a person is part of now (or was, in the last two hours), for their conversation's status. */
+  about(number: string): { c: Campaign; p: Person } | null {
+    const now = this.now();
+    for (const c of [...this.campaigns].reverse()) {
+      const p = c.people.find((x) => x.number === number || (x.number !== TEST && number !== TEST && samePerson(x.number, number)));
+      if (p && (!FINAL.has(p.state) ? c.state === 'running' || c.state === 'paused' || p.state !== 'queued' : now - (p.doneAt ?? 0) < 2 * 60 * 60_000)) return { c, p };
+    }
+    return null;
+  }
+
   /** One line a campaign, or (with an id) one a person. */
   status(id?: string): string {
     if (!id) {
