@@ -47,5 +47,15 @@
       "resources/flows"
     ]
   },
-  "plugins": {}
+  "plugins": {
+    "updater": {
+      "pubkey": "dW50cnVzdGVkIGNvbW1lbnQ6IG1pbmlzaWduIHB1YmxpYyBrZXk6IDQ5Mjg0M0EzMzFBMUFBNjQKUldSa3FxRXhvME1vU1RqKzlsWFZqNUNyQXgzSjByelFrMkJvaC9lMHFhYVBRZEVOQkNQSDVycGEK",
+      "endpoints": [
+        "https://github.com/f2i-com/oaiy.com/releases/latest/download/latest.json"
+      ],
+      "windows": {
+        "installMode": "passive"
+      }
+    }
+  }
 }
