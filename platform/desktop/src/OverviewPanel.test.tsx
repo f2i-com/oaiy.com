@@ -24,7 +24,10 @@ const syncMock = vi.hoisted(() => vi.fn());
 const linkMock = vi.hoisted(() => vi.fn());
 const modulesMock = vi.hoisted(() => vi.fn());
 const connectorMock = vi.hoisted(() => vi.fn());
+const updateStatusMock = vi.hoisted(() => vi.fn());
 vi.mock('./api', () => ({
+  // The update banner: nothing to install unless a test says so.
+  updates: { status: (...a: unknown[]) => updateStatusMock(...a) },
   modules: { list: (...a: unknown[]) => modulesMock(...a) },
   services: { list: servicesMock },
   plugins: { list: pluginsMock },
@@ -69,6 +72,13 @@ const runtime = (failed: number) => ({
   plugins: { serving: 1, total: 1 },
 });
 
+/** The update status when there is nothing to install. */
+const noUpdate = {
+  state: 'upToDate', currentVersion: '0.1.0', channel: 'stable', latestVersion: '0.1.0', notes: null, publishedAt: null,
+  lastCheckedAt: null, error: null, failedDuring: null, progress: null, note: null, canAutoUpdate: true, manualReason: null,
+  blockers: [], manualUrl: 'https://github.com/f2i-com/oaiy.com/releases/latest', autoCheck: true, nextCheckIn: null,
+};
+
 let host: HTMLDivElement;
 let root: Root;
 const onNavigate = vi.fn();
@@ -101,6 +111,8 @@ beforeEach(() => {
   calendarMock.mockRejectedValue(new Error('no calendar'));
   syncMock.mockRejectedValue(new Error('no calendar'));
   linkMock.mockResolvedValue({ linked: false, attempt: { phase: 'idle' }, available: [] });
+  updateStatusMock.mockResolvedValue(noUpdate);
+  localStorage.clear();
   resetModules();
   modulesMock.mockResolvedValue(modulesOn(true, true));
   host = document.createElement('div');
@@ -330,5 +342,24 @@ describe("Plugins' own cards", () => {
     await settle();
     expect(text()).not.toContain('Aokie receptionist');
     expect(connectorMock).not.toHaveBeenCalled();
+  });
+});
+
+describe('The update banner', () => {
+  it('says nothing when there is nothing to install', async () => {
+    dismissGuide();
+    await mount();
+    expect(host.querySelector('.update-banner')).toBeNull();
+  });
+
+  it('says a newer version is available, opens Settings, and can be dismissed', async () => {
+    dismissGuide();
+    updateStatusMock.mockResolvedValue({ ...noUpdate, state: 'available', latestVersion: '0.2.0' });
+    await mount();
+    expect(host.querySelector('.update-banner')?.textContent).toContain('OAIY 0.2.0 is available.');
+    await act(async () => button('See what is new')!.click());
+    expect(onNavigate).toHaveBeenCalledWith('settings');
+    await act(async () => host.querySelector<HTMLButtonElement>('button[aria-label="Dismiss until the next version"]')!.click());
+    expect(host.querySelector('.update-banner')).toBeNull();
   });
 });

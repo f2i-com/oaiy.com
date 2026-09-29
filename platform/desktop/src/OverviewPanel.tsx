@@ -13,6 +13,7 @@ import {
 } from 'lucide-react';
 import { peek, put } from './useCached';
 import SetupGuidePanel from './SetupGuidePanel';
+import UpdateBanner from './UpdateBanner';
 import TodayPanel from './TodayPanel';
 import { dismissGuide, reopenGuide, shouldAutoOpen } from './setupGuide';
 import type { StepTarget } from './setupGuide';
@@ -191,6 +192,7 @@ export default function OverviewPanel({ onNavigate, onOpenPluginScreen }: Props)
           <button className="btn" onClick={() => void refresh()}>Refresh status</button>
         </div>
       )}
+      <UpdateBanner onOpenSettings={() => onNavigate('settings')} />
       <TodayPanel onNavigate={onNavigate} />
       {guideOpen && (
         <SetupGuidePanel
