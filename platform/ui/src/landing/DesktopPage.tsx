@@ -213,7 +213,7 @@ function Install() {
           <h3 className="lp-mini-h">Linux</h3>
           <ol>
             <li>Download the AppImage, make it executable and run it: <code>chmod +x oaiy-desktop-*.AppImage &amp;&amp; ./oaiy-desktop-*.AppImage</code>.</li>
-            <li>Or install the <code>.deb</code> (<code>sudo apt install ./oaiy-desktop-*.deb</code>) or the <code>.rpm</code> (<code>sudo dnf install ./oaiy-desktop-*.rpm</code>).</li>
+            <li>Or install the <code>.deb</code>: <code>sudo apt install ./oaiy-desktop-*.deb</code>.</li>
             <li>Open OAIY and follow setup, as on Windows.</li>
           </ol>
         </div>

@@ -136,10 +136,10 @@ await check('the same release pushed as the bare tag 0.1.0: the address is the t
   assert.equal(win.caption, D.downloadPlan(WIN, 'v0.1.0').caption, 'the same version either way');
 });
 
-await check('Linux, built for v0.1.0: the AppImage is the button; .deb, .rpm and the server tarball are the other downloads', () => {
+await check('Linux, built for v0.1.0: the AppImage is the button; the .deb and the server tarball are the other downloads (no .rpm: a release may not have one)', () => {
   const plan = D.downloadPlan(LIN, 'v0.1.0');
   assert.deepEqual(plan.primary, { label: 'Download OAIY Desktop for Linux', href: `${releases}/download/v0.1.0/oaiy-desktop-0.1.0-linux-x86_64.AppImage`, file: 'oaiy-desktop-0.1.0-linux-x86_64.AppImage' });
-  assert.deepEqual(plan.others.map((o) => o.file), ['oaiy-desktop-0.1.0-linux-amd64.deb', 'oaiy-desktop-0.1.0-linux-x86_64.rpm', 'oaiy-server-0.1.0-linux-x86_64.tar.gz']);
+  assert.deepEqual(plan.others.map((o) => o.file), ['oaiy-desktop-0.1.0-linux-amd64.deb', 'oaiy-server-0.1.0-linux-x86_64.tar.gz']);
   assert.equal(plan.caption, 'Version 0.1.0.');
   assert.equal(plan.allDownloads, releases);
 });
@@ -303,11 +303,18 @@ await check('the names are the release\'s own: every file offered is one .github
   }
   const made = new Set([...fs.readFileSync(workflow, 'utf8').matchAll(/oaiy-(?:desktop|server)-\$VERSION-[\w.-]+/g)].map((m) => m[0].replace('$VERSION', '9.8.7')));
   const names = Object.values(D.assetNames('9.8.7'));
-  assert.equal(names.length, 7);
+  assert.equal(names.length, 6);
   for (const name of names) assert.ok(made.has(name), `${name} is not made by release.yml (it makes: ${[...made].join(', ')})`);
   // The site is built with the tag as it was pushed, and the release is published under that same name: the two
   // lines the addresses rest on. If either changes, the addresses have to change with it.
   const text = fs.readFileSync(workflow, 'utf8');
+  // The .rpm is copied only if the build made one (release.yml: `[[ -n "$rpm" ]] && cp`), so the site never links to it.
+  assert.match(text, /\[\[ -n "\$rpm" \]\] && cp/, 'the workflow still makes the .rpm optional; if it becomes certain, the site may offer it');
+  assert.ok(Object.values(D.assetNames('9.8.7')).every((name) => !name.endsWith('.rpm')));
+  for (const device of [WIN, LIN, { os: 'linux', arch: 'arm' }, { os: 'windows', arch: 'x86' }, { os: 'other', arch: 'unknown' }]) {
+    const plan = D.downloadPlan(device, 'v0.1.0');
+    for (const link of [plan.primary, ...plan.others].filter(Boolean)) assert.doesNotMatch(`${link.href} ${link.label}`, /rpm/i, link.href);
+  }
   assert.match(text, /VITE_OAIY_RELEASE_TAG: \$\{\{ github\.ref_name \}\}/, 'the web job builds the site with the tag');
   assert.match(text, /tag_name: \$\{\{ github\.ref_name \}\}/, 'the release is published under the tag as pushed');
   assert.doesNotMatch(text, /VITE_OAIY_VERSION/, 'the site works the version out of the tag');

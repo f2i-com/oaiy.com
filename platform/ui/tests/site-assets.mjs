@@ -202,6 +202,7 @@ await check('the pages no longer say what is not true of the product', () => {
     assert.doesNotMatch(both, stale, String(stale));
   }
   assert.doesNotMatch(landing, /No account, no install/, 'the desktop is an install');
+  assert.doesNotMatch(desktop, /\.rpm|dnf install/, 'the release copies the .rpm only if it was made');
 });
 
 await check('what the pages must say plainly is there', () => {
@@ -224,7 +225,7 @@ await check('what the pages must say plainly is there', () => {
     ['Windows and Linux', /For Windows and Linux/],
     ['SmartScreen and how to go on', /Windows protected your PC[\s\S]*More info[\s\S]*Run anyway/],
     ['not code-signed', /not code-signed yet/],
-    ['the AppImage, deb and rpm', /AppImage[\s\S]*apt install[\s\S]*dnf install/],
+    ['the AppImage and the deb, and no rpm (a release may not have one)', /AppImage[\s\S]*apt install/],
     ['the headless server', /headless server[\s\S]*oaiy-server[\s\S]*OAIY_SERVER_TOKEN/],
     ['what the installer does not carry', /engines[^.]*not in the installer yet/],
     ['the receptionist needs a phone', /Bluetooth/],

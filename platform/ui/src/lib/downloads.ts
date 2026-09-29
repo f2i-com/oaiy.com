@@ -141,8 +141,9 @@ export function releaseFromTag(raw: unknown): Release | null {
 }
 
 /**
- * The names of the release's files. Each is written where .github/workflows/release.yml names it
- * (tests/downloads.mjs reads that file and checks every one is there).
+ * The names of the release's files that every release has. Each is written where .github/workflows/release.yml
+ * names it (tests/downloads.mjs reads that file and checks every one is there). The .rpm is left out on purpose:
+ * the workflow copies it only if the build made one, so a release may have none and a link to it could answer 404.
  */
 export function assetNames(version: string) {
   return {
@@ -151,7 +152,6 @@ export function assetNames(version: string) {
     windowsServer: `oaiy-server-${version}-windows-x64.zip`,
     linuxAppImage: `oaiy-desktop-${version}-linux-x86_64.AppImage`,
     linuxDeb: `oaiy-desktop-${version}-linux-amd64.deb`,
-    linuxRpm: `oaiy-desktop-${version}-linux-x86_64.rpm`,
     linuxServer: `oaiy-server-${version}-linux-x86_64.tar.gz`,
   } as const;
 }
@@ -217,7 +217,6 @@ export function downloadPlan(device: Device, tag?: unknown): DownloadPlan {
         : [
             link('AppImage, 64-bit Intel or AMD', names.linuxAppImage),
             link('Debian and Ubuntu (.deb)', names.linuxDeb),
-            link('Fedora and RHEL (.rpm)', names.linuxRpm),
             link('Headless server for Linux hosts (.tar.gz)', names.linuxServer),
           ],
       note,
@@ -244,7 +243,6 @@ export function downloadPlan(device: Device, tag?: unknown): DownloadPlan {
     link('Download OAIY Desktop for Linux', names.linuxAppImage),
     [
       link('Debian and Ubuntu (.deb)', names.linuxDeb),
-      link('Fedora and RHEL (.rpm)', names.linuxRpm),
       link('Headless server for Linux hosts (.tar.gz)', names.linuxServer),
     ],
     null,

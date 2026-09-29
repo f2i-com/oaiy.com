@@ -11,7 +11,7 @@ by hand on its own, because automatic CI is paused).
 | File | What it is |
 |---|---|
 | `oaiy-desktop-<v>-windows-x64-setup.exe`, `oaiy-desktop-<v>-windows-x64.msi` | OAIY Desktop for Windows |
-| `oaiy-desktop-<v>-linux-x86_64.AppImage`, `-linux-amd64.deb`, `-linux-x86_64.rpm` | OAIY Desktop for Linux |
+| `oaiy-desktop-<v>-linux-x86_64.AppImage`, `-linux-amd64.deb`, and `-linux-x86_64.rpm` when the build made one (the workflow copies it only if it is there, so a release may have none) | OAIY Desktop for Linux |
 | `oaiy-server-<v>-windows-x64.zip`, `oaiy-server-<v>-linux-x86_64.tar.gz` | The headless server: the same local API with no window, for a host the CLI or a web app drives. It has no Agent or flow editor to show. |
 | `oaiy-cli-<v>.tar.gz` | The CLI alone, for a product that embeds it |
 | `oaiy-web-<v>.zip`, `oaiy-web-<v>.tar.gz` | The flow editor's site (landing page, `/app.html`, `/desktop.html`), for any static host, built for this release: its download buttons name this release's files (see [The web site](#the-web-site)) |
@@ -101,7 +101,7 @@ a release matter here:
 - **The download links are baked in, so the site must be redeployed with each release.** The
   installers' names carry the version, so the landing and desktop pages and the flow editor
   offer `https://github.com/f2i-com/oaiy.com/releases/download/<tag>/oaiy-desktop-<v>-windows-x64-setup.exe`
-  (and the AppImage, `.deb`, `.rpm` and the headless server under "other downloads"). The `web`
+  (and the AppImage, `.deb` and the headless server under "other downloads"; the site never links the `.rpm`, which a release may not have). The `web`
   job gives the build `VITE_OAIY_RELEASE_TAG`, the tag as it was pushed (`github.ref_name`), and the
   page picks the visitor's system in the browser with no request. Nothing asks GitHub what is
   newest, so a site that is not redeployed keeps offering the release it was built for.

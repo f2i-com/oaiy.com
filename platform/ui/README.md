@@ -50,8 +50,8 @@ the compiler sandbox worker.
 ## The download buttons
 
 `components/DownloadDesktop.tsx` (on the landing and desktop pages, and in the editor's sidebar and Settings while no desktop
-answers) offers the OAIY Desktop file for the visitor's system: the Windows installer, or the Linux AppImage with `.deb`, `.rpm`
-and the headless server under "other downloads". A Mac or a phone is told OAIY Desktop is for Windows and Linux (Linux with a touch screen is a phone, as Android asked for the
+answers) offers the OAIY Desktop file for the visitor's system: the Windows installer, or the Linux AppImage with the `.deb`
+and the headless server under "other downloads" (no `.rpm`: a release may not have one). A Mac or a phone is told OAIY Desktop is for Windows and Linux (Linux with a touch screen is a phone, as Android asked for the
 desktop site is), and a 32-bit or ARM computer, which the files are not built for, is told so and not given an installer button
 (the files stay listed). The system comes from what the browser already says of itself (`lib/downloads.ts`), and the processor is
 asked of the browser after the first draw (`userAgentData.getHighEntropyValues`, a call in the page: the user agent string is
