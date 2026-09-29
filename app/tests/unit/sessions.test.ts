@@ -90,7 +90,7 @@ describe('text-message conversations', () => {
     expect(desktop.commands).toEqual([{ connector: 'aokie', command: 'sms.send', payload: { to: '+61491570006', body: 'Yes, 9 to 1 on Saturday.' } }]);
     expect(fake.bodies).toHaveLength(2);
     // The conversation is kept, and listed with its unread count.
-    expect(store.chats.get(session.id)?.length).toBeGreaterThan(2);
+    expect(store.chats.get(session.thread)?.length).toBeGreaterThan(2);
     expect(store.index).toMatchObject([{ id: 'sms-61491570006', kind: 'sms', key: '+61491570006', title: 'Lance', unread: 1 }]);
     // The same sender's next text continues it.
     fakeProvider('openai', [{ text: 'Nothing to reply to a thank-you.' }]);
@@ -105,7 +105,8 @@ describe('text-message conversations', () => {
     const { sessions, desktop } = setup(messages);
     const session = await sessions.textArrived('+61400000001', '', 'Hello');
     expect(sessions.busy).toBe(false);
-    expect(session.agent.turns).toEqual([{ role: 'user', text: textMessage('+61400000001', '+61400000001', 'Hello') }]);
+    // Kept with when it came, and as a text (a person's calls and texts are one conversation).
+    expect(session.agent.turns).toEqual([{ role: 'user', text: textMessage('+61400000001', '+61400000001', 'Hello'), at: expect.any(Number), via: 'sms' }]);
     fakeProvider('openai', [{ calls: [{ name: 'send_text_message', input: { body: 'Hi! How can I help?' } }] }, { text: 'Replied.' }]);
     messages.answer = true;
     expect(sessions.answerWaiting()).toBe(1);

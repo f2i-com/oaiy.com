@@ -1530,7 +1530,7 @@ ${this.instructions}` : ''}`;
       .map((t): Turn => {
         if (t.role !== 'tool' || !t.results.some((r) => r.images?.length)) return t;
         if (++seen <= KEEP_IMAGE_TURNS) return t;
-        return { role: 'tool', results: t.results.map((r) => (r.images?.length ? { ...r, images: undefined, content: `${r.content}\n[image no longer attached; call view_image again to see it]` } : r)) };
+        return { ...t, results: t.results.map((r) => (r.images?.length ? { ...r, images: undefined, content: `${r.content}\n[image no longer attached; call view_image again to see it]` } : r)) };
       })
       .reverse();
   }

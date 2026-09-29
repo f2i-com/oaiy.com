@@ -1,24 +1,34 @@
 /**
- * The project's conversations besides its own chat: one per person who texts
- * or calls the phone (through Aokie and OAIY Desktop). Each has its own agent,
- * with the person's instructions and a way to answer: a text-message tool, or,
- * on a call, its words spoken as it writes them. They take turns: one works at
- * a time, in the order their messages came (a local model answers one request
- * at a time anyway; a caller goes first), and a message for a conversation that
- * is working reaches it at its next step.
+ * The project's conversations besides its own chat: one per person who calls
+ * or texts the phone (through Aokie and OAIY Desktop), however the phone
+ * writes their number, and one per flow that gives the agent tasks. A
+ * person's calls and texts are one conversation (a thread, threads.ts), each
+ * way with its own agent (a lane): their texts' agent, with the person's
+ * instructions and a text-message tool; and their calls' agent, fresh each
+ * call, whose words are spoken as it writes them. Lanes take turns: one works
+ * at a time, in the order their messages came (a local model answers one
+ * request at a time anyway; a caller goes first, in a lane of their own), and
+ * a message for a lane that is working reaches it at its next step.
  */
 import { Agent, type AgentEvent, type AgentOptions, type SessionTool } from './agent/agent';
 import { TOOLS } from './agent/tools';
 import type { Turn } from './agent/protocol';
 import type { Desktop, DesktopEvent } from './desktop/bridge';
 import { textCalendarTools } from './desktop/calendarTools';
+import { isHidden, localCountry, phoneKey, samePerson } from './phoneNumbers';
 import type { MessageSettings } from './settings';
+import { MAX_FACTS, regroup, threadId, threadOrder, type Way } from './threads';
 import type { CallerNote, OpenProject, SessionInfo } from './vfs/projects';
 
 /** A number that marks a pretend conversation: its replies are never sent. */
 export const TEST_NUMBER = 'test';
 
+/** One lane of a conversation: the agent that answers a person's calls, or their texts, or a flow's tasks. */
 export interface Session extends SessionInfo {
+  /** The conversation it is part of (a person's calls and texts share one). */
+  thread: string;
+  /** When the first of the messages waiting for its next run came (its turn is kept with that time). */
+  waitingSince?: number;
   agent: Agent;
   /** The run in progress. */
   running: Promise<void> | null;
@@ -50,10 +60,38 @@ export interface Session extends SessionInfo {
   answers?: Array<{ prompt: string; settle: (reply: string, error?: string) => void }>;
 }
 
-/** The most facts kept about one person (the oldest go first). */
-const MAX_FACTS = 30;
+/**
+ * One conversation, as it is listed and shown: a person's calls and texts
+ * (their lanes), or a flow's tasks.
+ */
+export interface Thread {
+  id: string;
+  kind: 'person' | 'task';
+  /** Who: their number (E.164), a hidden caller's call, the pretend conversation's "test", or the flow's name. */
+  key: string;
+  title: string;
+  /** When it last heard or said something. */
+  lastAt: number;
+  unread: number;
+  lanes: Session[];
+  call?: Session;
+  sms?: Session;
+  task?: Session;
+  /** The ways they have been in touch, and the latest. */
+  ways: Way[];
+  lastWay?: Way;
+  /** A lane of it is working now. */
+  running: boolean;
+  /** Its call going on now. */
+  live?: Session;
+  /** A caller who hid their number: calls only, never texted. */
+  hidden: boolean;
+}
+
 /** The most turns a conversation keeps (a caller's calls add up): the oldest calls go first. */
 const MAX_KEPT_TURNS = 600;
+/** How far back the note that starts a call looks for the person's last contact. */
+const RECENT_MS = 2 * 24 * 60 * 60_000;
 
 /** How the app makes an agent for this project, with a conversation's own instructions and tools, for a conversation of `kind`. */
 export type MakeAgent = (extra: Pick<AgentOptions, 'instructions' | 'sessionTools' | 'tools' | 'reasoning' | 'conversation'>, kind: SessionInfo['kind']) => Agent;
@@ -87,8 +125,11 @@ export interface SessionHooks {
   named?: (note: CallerNote) => void;
 }
 
-const digits = (number: string) => number.replace(/[^\d+]/g, '');
-/** The same phone number, with or without its country code ("+61491570006", "0491570006"): the last nine digits agree. */
+/**
+ * The same phone number as the phone itself matches numbers (Aokie's blocked
+ * list): the last nine digits agree. A person is matched by samePerson
+ * (phoneNumbers.ts), which reads the number whole.
+ */
 export function sameNumber(a: string, b: string): boolean {
   const [x, y] = [a.replace(/\D/g, ''), b.replace(/\D/g, '')];
   return x.length >= 8 && y.length >= 8 && x.slice(-9) === y.slice(-9);
@@ -372,8 +413,11 @@ export function callerLine(text: string, when: { startMs?: unknown; over?: unkno
 export const LOOKUP_UNAVAILABLE =
   "The business's records could not be checked just now (no business lookup is set up on OAIY Desktop, or it failed). Do not guess times, availability, prices or bookings: tell the caller you can't check right now, and offer to take their preferred time as a request for staff to confirm.";
 
-/** The note that starts a call: who, when, and what is known about them (the model's view of the call starts there). */
-export function callStartNote(who: string, greeting: string, known: string, now = new Date(), returning?: number, outbound?: { purpose?: string }): string {
+/**
+ * The note that starts a call: who, when, what is known about them, and their
+ * last contact when it was recent (the model's view of the call starts there).
+ */
+export function callStartNote(who: string, greeting: string, known: string, now = new Date(), returning?: number, outbound?: { purpose?: string }, recent = ''): string {
   const rang = returning !== undefined || !!outbound;
   const opened = greeting.trim() ? ` You ${rang ? 'opened with' : 'greeted them'}: "${greeting.trim()}"` : '';
   const why = outbound?.purpose?.trim() ? ` Why you rang: ${outbound.purpose.trim()}` : '';
@@ -382,7 +426,46 @@ export function callStartNote(who: string, greeting: string, known: string, now 
     : outbound
       ? `You rang ${who}; they answered ${whenSaid(now.getTime())}.${why}`
       : `A call from ${who} began, ${whenSaid(now.getTime())}.`;
-  return `[OAIY] 📞 ${began}${opened}\nToday is ${today(now)}.\n${known}`;
+  return `[OAIY] 📞 ${began}${opened}\nToday is ${today(now)}.\n${known}${recent ? `\n${recent}` : ''}`;
+}
+
+/** Words for a short summary: on one line, and not too long. */
+const clipLine = (text: string, max = 160) => {
+  const one = text.replace(/\s+/g, ' ').trim();
+  return one.length > max ? `${one.slice(0, max - 1)}…` : one;
+};
+
+/**
+ * The person's last contact, in a few lines, for the note that starts their
+ * call: what they texted and were texted, said and were told, and a booking
+ * asked for, the latest `max` of them, when it was within the last two days.
+ * Empty when there was none (their earlier calls and texts are a tool call
+ * away: earlier_conversations).
+ */
+export function recentContact(turns: readonly Turn[], lastAt: number, now = Date.now(), max = 6): string {
+  if (!turns.length || !lastAt || now - lastAt > RECENT_MS) return '';
+  const lines: string[] = [];
+  for (const t of turns) {
+    if (t.role === 'user') {
+      if (t.automatic && isCallStart(t)) {
+        lines.push(`(${t.text.replace(/^\[OAIY\] 📞\s*/, '').split('\n')[0].split('. ')[0].replace(/\.$/, '')})`);
+        continue;
+      }
+      if (t.automatic || t.text.startsWith('[OAIY]')) continue;
+      const texts = [...t.text.matchAll(/^Text message from [^\n]*:\n([\s\S]*?)(?=\n\nText message from |$)/gm)].map((m) => m[1]);
+      if (texts.length) for (const body of texts) lines.push(`They texted: "${clipLine(body)}"`);
+      else for (const m of t.text.matchAll(/^Caller(?: \[[^\]\n]*\])?: (.+)$/gm)) lines.push(`They said: "${clipLine(m[1])}"`);
+    } else if (t.role === 'assistant') {
+      if (t.text.trim() && t.via === 'call') lines.push(`You said: "${clipLine(t.text)}"`);
+      for (const c of t.calls) {
+        if (c.name === 'send_text_message' && typeof c.input.body === 'string') lines.push(`You texted: "${clipLine(c.input.body)}"`);
+        if (c.name === 'request_appointment') lines.push(`(You asked for an appointment: ${[c.input.service, c.input.date, c.input.time].filter(Boolean).join(', ')})`);
+      }
+    }
+  }
+  const last = lines.slice(-max);
+  if (!last.length) return '';
+  return [`Their last contact, ${whenSaid(lastAt)} (earlier_conversations has more):`, ...last.map((l) => `- ${l}`)].join('\n');
 }
 
 /** A call's first turn: the note that it began (the model's view of the call starts there). */
@@ -392,12 +475,18 @@ export function isCallStart(turn: Turn): boolean {
 
 /**
  * A conversation's turns as its parts: each call on its own (from the note that
- * it began), with that note as its title; a text thread is one part.
+ * it began), with that note as its title; each run of texts between them one
+ * part ("Their text messages").
  */
 export function conversationParts(turns: Turn[]): Array<{ title: string; lines: string[] }> {
-  const parts: Array<{ title: string; turns: Turn[] }> = [];
+  const parts: Array<{ title: string; way?: Way; turns: Turn[] }> = [];
   for (const t of turns) {
-    if (isCallStart(t) || !parts.length) parts.push({ title: isCallStart(t) ? (t as { text: string }).text.replace(/^\[OAIY\]\s*/, '').split('. ')[0] : '', turns: [] });
+    const current = parts[parts.length - 1];
+    const start = isCallStart(t);
+    if (start || !current || (t.via && current.way && t.via !== current.way)) {
+      const title = start ? (t as { text: string }).text.replace(/^\[OAIY\]\s*/, '').split('. ')[0] : t.via === 'sms' ? `Their text messages${typeof t.at === 'number' ? `, from ${whenSaid(t.at)}` : ''}` : t.via === 'call' ? 'The call, going on' : '';
+      parts.push({ title, way: t.via ?? (start ? 'call' : undefined), turns: [] });
+    }
     parts[parts.length - 1].turns.push(t);
   }
   return parts.map((p) => ({ title: p.title, lines: conversationLines(p.turns) })).filter((p) => p.lines.length);
@@ -431,22 +520,24 @@ export function phoneConversationsTool(sessions: () => Sessions | null): Session
     spec: {
       name: 'phone_conversations',
       description:
-        "The phone's conversations, each answered by a sub-agent of yours: calls, text-message threads and flows' tasks. With no id: the list, newest first. With an id: what was said and done in it (its last `last` lines, 40 by default).",
+        "The phone's conversations, each answered by sub-agents of yours: one per person (their calls and their texts together) and one per flow that gives you tasks. With no id: the list, newest first. With an id: what was said and done in it, in order (its last `last` lines, 40 by default).",
       parameters: { type: 'object', properties: { id: { type: 'string', description: "A conversation's id, from the list" }, last: { type: 'number' } } },
     },
     run: async (input) => {
-      const all = sessions()?.list ?? [];
+      const all = sessions();
+      const threads = all?.threads() ?? [];
       const id = typeof input.id === 'string' ? input.id.trim() : '';
+      const who = (t: Thread) => `${t.title}${t.title !== t.key && t.kind === 'person' && !t.hidden ? ` (${t.key})` : ''}`;
+      const what = (t: Thread) => (t.kind === 'task' ? 'flow tasks' : t.ways.length === 2 ? 'calls and texts' : t.ways[0] === 'call' ? 'calls' : 'texts');
       if (id) {
-        const s = all.find((x) => x.id === id);
-        if (!s) return `No conversation ${id}. Call phone_conversations with no id for the list.`;
+        const t = all?.thread(id);
+        if (!t) return `No conversation ${id}. Call phone_conversations with no id for the list.`;
         const last = typeof input.last === 'number' && input.last > 0 ? Math.min(200, Math.floor(input.last)) : 40;
-        return `${s.kind === 'call' ? 'Calls' : s.kind === 'task' ? "Tasks from the flow" : 'Text messages'} with ${s.title}${s.title !== s.key ? ` (${s.key})` : ''}${s.callId ? ', on a call now' : ''}:\n${conversationText(s.agent.turns, last) || '(nothing yet)'}`;
+        const label = t.kind === 'task' ? 'Tasks from the flow' : what(t).replace(/^./, (c) => c.toUpperCase());
+        return `${label} with ${who(t)}${t.live ? ', on a call now' : ''}:\n${conversationText(all!.turnsOf(t.id), last) || '(nothing yet)'}`;
       }
-      if (!all.length) return 'No calls, texts or flow tasks yet.';
-      return all
-        .map((s) => `${s.id}: ${s.kind === 'call' ? 'calls' : s.kind === 'task' ? 'flow task' : 'texts'} with ${s.title}${s.title !== s.key ? ` (${s.key})` : ''}, last ${whenSaid(s.lastAt)}${s.running ? ', working now' : ''}${s.callId ? ', on a call now' : ''}`)
-        .join('\n');
+      if (!threads.length) return 'No calls, texts or flow tasks yet.';
+      return threads.map((t) => `${t.id}: ${what(t)} with ${who(t)}, last ${whenSaid(t.lastAt)}${t.running ? ', working now' : ''}${t.live ? ', on a call now' : ''}`).join('\n');
     },
   };
 }
@@ -506,7 +597,7 @@ export function tellAgentTool(sessions: () => Sessions | null): SessionTool {
     spec: {
       name: 'tell_agent',
       description:
-        "Pass a note to one of the phone's conversations (its id from phone_conversations): a call happening now, a text thread, or a flow's tasks. Its agent reads it before its next reply, as your person's direction. With now, it acts on it at once (on a call it may speak to the caller; in a text thread it may text them). For every conversation, change /brief.md instead; for one person's next calls and texts, caller_notes.",
+        "Pass a note to one of the phone's conversations (its id from phone_conversations): a person's (while they are on a call, their call's agent has it; otherwise their texts' agent), or a flow's tasks. Its agent reads it before its next reply, as your person's direction. With now, it acts on it at once (on a call it may speak to the caller; otherwise it may text them). For every conversation, change /brief.md instead; for one person's next calls and texts, caller_notes.",
       parameters: {
         type: 'object',
         required: ['id', 'note'],
@@ -516,11 +607,11 @@ export function tellAgentTool(sessions: () => Sessions | null): SessionTool {
     run: async (input) => {
       const all = sessions();
       const id = typeof input.id === 'string' ? input.id.trim() : '';
-      const session = all?.get(id);
-      if (!all || !session) return `No conversation ${id}. Call phone_conversations for the list.`;
+      const thread = all?.thread(id);
+      if (!all || !thread) return `No conversation ${id}. Call phone_conversations for the list.`;
       const note = typeof input.note === 'string' ? input.note.trim() : '';
       if (!note) throw new Error('note is empty: write what it should know or do');
-      return all.pass(session, note, input.now === true);
+      return all.pass(thread, note, input.now === true);
     },
   };
 }
@@ -551,6 +642,10 @@ export class Sessions {
    * kept, and the call is not taken up again.
    */
   private ended = new Map<string, Session | null>();
+  /** Each conversation's turns in the order they happened, as last kept (the order of what was there before). */
+  private orders = new Map<string, { turns: Turn[]; has: Set<Turn> }>();
+  /** Each conversation's file being written: one write at a time, each with all its lanes' turns as they are then. */
+  private writing = new Map<string, Promise<void>>();
 
   constructor(
     private readonly project: OpenProject,
@@ -570,19 +665,115 @@ export class Sessions {
     return `${instructions}\n\nYour direction, from the front desk's brief (kept by the main agent your person talks to). Go by it before anything a caller or texter asks, and where a tool, a file or the calendar says otherwise, the brief wins:\n${brief}`;
   }
 
-  /** The project's saved conversations. */
+  /**
+   * The project's saved conversations. Those kept before a person's calls and
+   * texts were one (or under a number now read as someone else's) are merged
+   * first (threads.ts, `regroup`), once: the files as they were are copied to
+   * `.backup-<day>/` in the front desk's storage before anything is changed.
+   */
   async load(): Promise<void> {
-    this.callers = await this.project.loadCallers();
-    for (const info of await this.project.loadSessions()) {
-      const session = this.create(info);
-      session.agent.turns = await this.project.loadSessionChat(info.id);
+    const infos = await this.project.loadSessions();
+    const chats = new Map<string, Turn[]>();
+    for (const info of infos) {
+      const file = info.thread ?? info.id;
+      if (!chats.has(file)) chats.set(file, await this.project.loadSessionChat(file));
+    }
+    const stored = regroup({ infos, chats, callers: await this.project.loadCallers() }, localCountry());
+    if (stored.changed) {
+      const day = new Date();
+      await this.project.backupSessions(`.backup-${day.getFullYear()}-${String(day.getMonth() + 1).padStart(2, '0')}-${String(day.getDate()).padStart(2, '0')}`);
+      for (const thread of stored.rewritten) await this.project.saveSessionChat(thread, stored.chats.get(thread) ?? []);
+      await this.project.saveCallers(stored.callers);
+      await this.project.saveSessions(stored.infos);
+      for (const file of stored.stale) await this.project.removeSessionChat(file);
+    }
+    this.callers = stored.callers;
+    for (const info of stored.infos) {
+      const session = this.create(info as SessionInfo & { thread: string });
+      const turns = stored.chats.get(session.thread) ?? [];
+      session.agent.turns = session.kind === 'task' ? turns : turns.filter((t) => t.via === session.kind);
       this.list.push(session);
     }
+    for (const [thread, turns] of stored.chats) this.orders.set(thread, { turns, has: new Set(turns) });
     this.sort();
   }
 
+  /** A lane, by its id. */
   get(id: string): Session | undefined {
     return this.list.find((s) => s.id === id);
+  }
+
+  /** The conversations, newest first: a person's calls and texts as one, and each flow's tasks. */
+  threads(): Thread[] {
+    const byId = new Map<string, Session[]>();
+    for (const s of this.list) byId.set(s.thread, [...(byId.get(s.thread) ?? []), s]);
+    return [...byId.values()].map((lanes) => this.threadOf(lanes)).sort((a, b) => b.lastAt - a.lastAt);
+  }
+
+  /** A conversation, by its id (or one of its lanes'). */
+  thread(id: string): Thread | undefined {
+    const lanes = this.list.filter((s) => s.thread === id);
+    if (lanes.length) return this.threadOf(lanes);
+    const lane = this.get(id);
+    return lane ? this.thread(lane.thread) : undefined;
+  }
+
+  private threadOf(lanes: Session[]): Thread {
+    const call = lanes.find((s) => s.kind === 'call');
+    const sms = lanes.find((s) => s.kind === 'sms');
+    const task = lanes.find((s) => s.kind === 'task');
+    const newest = [...lanes].sort((a, b) => b.lastAt - a.lastAt);
+    const named = newest.find((s) => s.title && s.title !== s.key);
+    const ways: Way[] = [...(call ? ['call' as const] : []), ...(sms ? ['sms' as const] : [])];
+    const last = newest.find((s) => s.kind !== 'task');
+    return {
+      id: lanes[0].thread,
+      kind: task ? 'task' : 'person',
+      key: (sms ?? call ?? task)!.key,
+      title: named?.title ?? newest[0].title,
+      lastAt: newest[0].lastAt,
+      unread: lanes.reduce((n, s) => n + s.unread, 0),
+      lanes,
+      call,
+      sms,
+      task,
+      ways,
+      ...(last ? { lastWay: last.kind as Way } : {}),
+      running: lanes.some((s) => !!s.running),
+      ...(call?.callId ? { live: call } : {}),
+      hidden: !!call?.hidden && !sms,
+    };
+  }
+
+  /**
+   * A conversation's turns, all its lanes', in the order they happened: as
+   * they were kept, with what its lanes have said since after (see
+   * threadOrder). What is new gets the time it happened.
+   */
+  turnsOf(thread: string): Turn[] {
+    const lanes = this.list.filter((s) => s.thread === thread);
+    if (lanes.length === 1 && lanes[0].kind === 'task') return lanes[0].agent.turns;
+    for (const lane of lanes) this.stamp(lane);
+    const turns = threadOrder(this.orders.get(thread)?.turns ?? [], lanes.map((s) => ({ via: s.kind as Way, turns: s.agent.turns })));
+    this.orders.set(thread, { turns, has: new Set(turns) });
+    return turns;
+  }
+
+  /**
+   * The time a lane's new turns happened (`at`, never earlier than the turn
+   * before it): those at its end, `at` (now, or when the message they answer
+   * came). Turns kept from before times were kept have none, and get none.
+   */
+  private stamp(lane: Session, at = Date.now()): void {
+    const turns = lane.agent.turns;
+    const kept = this.orders.get(lane.thread)?.has;
+    let i = turns.length - 1;
+    while (i >= 0 && typeof turns[i].at !== 'number' && !kept?.has(turns[i])) i--;
+    const floor = i >= 0 ? turns[i].at ?? 0 : 0;
+    for (let k = i + 1; k < turns.length; k++) {
+      turns[k].at = Math.max(floor, at);
+      if (lane.kind !== 'task') turns[k].via ??= lane.kind;
+    }
   }
 
   /** Whether any conversation is working (or waiting to). */
@@ -630,9 +821,9 @@ export class Sessions {
     return session;
   }
 
-  /** What is known about the person at `number` (a call's and a text thread's numbers agree by their last nine digits). */
+  /** What is known about the person at `number`, however it is written ("0491 570 006", "+61491570006"). */
   callerNote(number: string): CallerNote | undefined {
-    return this.callers.find((c) => c.number === number || sameNumber(c.number, number));
+    return this.callers.find((c) => c.number === number || (number !== TEST_NUMBER && c.number !== TEST_NUMBER && samePerson(c.number, number)));
   }
 
   /**
@@ -643,7 +834,7 @@ export class Sessions {
     const clean = (f: string) => f.replace(/\s+/g, ' ').trim().slice(0, 200);
     let note = this.callerNote(number);
     if (!note) {
-      note = { number: number === TEST_NUMBER ? number : digits(number) || number, facts: [], updatedAt: Date.now() };
+      note = { number: number === TEST_NUMBER ? number : phoneKey(number) || number.trim(), facts: [], updatedAt: Date.now() };
       this.callers.push(note);
     }
     if (typeof change.name === 'string') note.name = clean(change.name).slice(0, 80) || undefined;
@@ -656,7 +847,7 @@ export class Sessions {
     note.updatedAt = Date.now();
     // Their conversations take the name; cleared, they go back to the number.
     const renamed = typeof change.name === 'string';
-    for (const s of this.list) if (s.kind !== 'task' && (s.key === note.number || sameNumber(s.key, note.number)) && (note.name || renamed)) s.title = note.name || s.key;
+    for (const s of this.list) if (s.kind !== 'task' && !s.hidden && (s.key === note.number || (s.key !== TEST_NUMBER && samePerson(s.key, note.number))) && (note.name || renamed)) s.title = note.name || s.key;
     await this.project.saveCallers(this.callers);
     await this.saveIndex();
     this.hooks.named?.(note);
@@ -664,15 +855,14 @@ export class Sessions {
     return note;
   }
 
-  /** The person's earlier calls and texts (theirs only, never anyone else's), as their agent reads them. */
+  /**
+   * The person's earlier calls and texts (theirs only, never anyone else's), in
+   * the order they happened, as their agent reads them: what that agent reads
+   * already is left out.
+   */
   earlierWith(session: Session, words = ''): string {
-    const parts: Array<{ title: string; lines: string[] }> = [];
-    for (const s of this.list) {
-      if (s.kind === 'task' || !(s === session || s.key === session.key || sameNumber(s.key, session.key))) continue;
-      // What this conversation's agent reads already is left out.
-      const end = s === session ? s.agent.turns.length - s.agent.view().length : s.agent.turns.length;
-      for (const part of conversationParts(s.agent.turns.slice(0, end))) parts.push({ title: s.kind === 'call' ? part.title || 'A call' : 'Their text messages', lines: part.lines });
-    }
+    const reads = new Set(session.agent.view());
+    const parts = conversationParts(this.turnsOf(session.thread).filter((t) => !reads.has(t))).map((p) => ({ ...p, title: p.title || 'Earlier' }));
     if (!parts.length) return 'Nothing earlier: this is the first time they have been in touch (or what came before was removed).';
     const cut = (text: string) => (text.length > 6000 ? `…${text.slice(-6000)}` : text);
     const wanted = words.toLowerCase().split(/[^\p{L}\p{N}]+/u).filter((w) => w.length >= 3);
@@ -715,18 +905,36 @@ export class Sessions {
     ];
   }
 
-  /** A note from the runner for one conversation: read with its next reply, or (now) acted on at once. */
-  async pass(session: Session, note: string, now = false): Promise<string> {
+  /**
+   * A note from the runner for one conversation: read with its next reply, or
+   * (now) acted on at once. A person's goes to their call's agent while they
+   * are on a call, and otherwise to their texts'.
+   */
+  async pass(target: Thread | Session, note: string, now = false): Promise<string> {
+    const session = 'lanes' in target ? target.live ?? target.sms ?? target.task ?? target.call! : target;
     if (session.kind === 'call' && !session.callId) return `${session.title} is not on a call now. For their next call, save it with caller_notes.`;
     const text = `[OAIY] A note from the runner (the main agent your person talks to): ${note}`;
     if (now || session.running) {
       this.deliver(session, text, true);
       return now ? 'Passed on: it acts on it now.' : 'Passed on: it reads it at its next step.';
     }
-    session.agent.turns.push({ role: 'user', text, automatic: true });
+    session.agent.turns.push({ role: 'user', text, automatic: true, at: Date.now() });
     await this.save(session);
     this.hooks.changed();
     return 'Passed on: it reads it before its next reply.';
+  }
+
+  /**
+   * The lane the person's own message in a conversation goes to: the call
+   * going on now; else their texts' agent (made now if they only ever rang);
+   * a hidden caller's, their calls'; a flow's, its tasks'.
+   */
+  async laneFor(thread: Thread): Promise<Session> {
+    if (thread.live) return thread.live;
+    if (thread.task) return thread.task;
+    if (thread.sms) return thread.sms;
+    if (thread.hidden || !thread.call) return thread.call ?? thread.lanes[0];
+    return this.conversationWith(thread.key, thread.title !== thread.key ? thread.title : '', 'sms');
   }
 
   /** An answer for a call's agent (a lookup's): at once, or with the caller's words when they are speaking. */
@@ -835,10 +1043,14 @@ export class Sessions {
     }
     let session = this.list.find((s) => s.callId === callId) ?? null;
     if (type === 'call.started' || (!session && type === 'call.caller')) {
-      // A hidden number: a conversation of its own for this call (never shared with another hidden caller), named as such.
-      const hidden = !String(event.from ?? '').trim();
+      // A hidden number ("", "Private", "Withheld"): a conversation of its own for this call (never shared with another hidden caller), named as such.
+      const hidden = isHidden(String(event.from ?? ''));
       const from = hidden ? callId : String(event.from);
-      session = await this.conversationWith(from, hidden ? 'Hidden number' : String(event.name ?? ''), 'call');
+      session = await this.conversationWith(from, hidden ? 'Hidden number' : String(event.name ?? ''), 'call', hidden);
+      // Their last contact before this call (their texts, their last call), from what the conversation holds now.
+      const history = this.turnsOf(session.thread);
+      const lastContact = Math.max(0, ...history.map((t) => t.at ?? 0), ...this.list.filter((s) => s.thread === session!.thread && s !== session && s.agent.turns.length).map((s) => s.lastAt), session.agent.turns.length ? session.lastAt : 0);
+      const recent = hidden ? '' : recentContact(history, lastContact);
       session.callId = callId;
       if (typeof event.instructions === 'string') session.brief = event.instructions;
       session.lastAt = Date.now();
@@ -859,8 +1071,8 @@ export class Sessions {
       const who = `${session.title}${session.title !== session.key ? ` (${session.key})` : ''}`;
       // A call the phone placed (Aokie says so): the agent rang them, and why.
       const outbound = event.direction === 'outbound' ? { purpose: typeof event.purpose === 'string' ? event.purpose : '' } : undefined;
-      const note = callStartNote(who, typeof event.greeting === 'string' ? event.greeting : '', knownText(this.callerNote(session.key)), new Date(), this.callingBack(from)?.missedAt, outbound);
-      session.agent.turns.push({ role: 'user', text: note, automatic: true, ...(fresh ? { fresh: true } : {}) });
+      const note = callStartNote(who, typeof event.greeting === 'string' ? event.greeting : '', knownText(hidden ? undefined : this.callerNote(session.key)), new Date(), this.callingBack(from)?.missedAt, outbound, recent);
+      session.agent.turns.push({ role: 'user', text: note, automatic: true, ...(fresh ? { fresh: true } : {}), at: Date.now() });
       await this.save(session);
       await this.saveIndex();
       this.hooks.changed();
@@ -928,7 +1140,7 @@ export class Sessions {
     session.callId = undefined;
     // A call that failed (the phone's voice link broke, say) says why: the person sees it in the call's record.
     const failed = /fail|error|lost/i.test(reason) ? reason.trim() : '';
-    session.agent.turns.push({ role: 'user', text: failed ? `[OAIY] 📞 The call ended: ${failed}.` : '[OAIY] 📞 The call ended.', automatic: true });
+    session.agent.turns.push({ role: 'user', text: failed ? `[OAIY] 📞 The call ended: ${failed}.` : '[OAIY] 📞 The call ended.', automatic: true, at: Date.now() });
     await this.save(session);
     this.hooks.changed();
   }
@@ -965,7 +1177,7 @@ export class Sessions {
     if (!session || !words || session.running || session.callId) return;
     const line = callerLine(words, event);
     this.hooks.arrived?.(session, line);
-    session.agent.turns.push({ role: 'user', text: line });
+    session.agent.turns.push({ role: 'user', text: line, at: Date.now() });
     await this.save(session);
     this.hooks.changed();
   }
@@ -1001,19 +1213,44 @@ export class Sessions {
     };
   }
 
-  /** The conversation with `number` (texts or calls), made when it is the first from them. */
-  async conversationWith(number: string, name: string, kind: 'sms' | 'call' = 'sms'): Promise<Session> {
-    const key = number === TEST_NUMBER ? TEST_NUMBER : digits(number) || number;
-    // No name given (a call's caller id has none): the name another conversation with the same number has.
-    const known = name || this.list.find((s) => s.title !== s.key && sameNumber(s.key, key))?.title || '';
-    // The same number, written with or without its country code, is the same conversation.
-    const existing = this.list.find((s) => s.kind === kind && (s.key === key || sameNumber(s.key, key)));
+  /** Whether a lane is the person at `key` (never a hidden caller's, and the pretend conversation only itself). */
+  private isPerson(s: Session, key: string): boolean {
+    if (s.kind === 'task' || s.hidden) return false;
+    if (s.key === key) return true;
+    return s.key !== TEST_NUMBER && key !== TEST_NUMBER && samePerson(s.key, key);
+  }
+
+  /**
+   * The lane of `kind` (their texts, or their calls) in the conversation with
+   * the person at `number`, however it is written: made when it is the first
+   * of its kind from them, in their conversation when they have one. A hidden
+   * caller's call has one of its own.
+   */
+  async conversationWith(number: string, name: string, kind: 'sms' | 'call' = 'sms', hidden = false): Promise<Session> {
+    const key = hidden || number === TEST_NUMBER ? number : phoneKey(number) || number.trim();
+    const person = (s: Session) => !hidden && this.isPerson(s, key);
+    // No name given (a call's caller id has none): the name their conversation has.
+    const known = name || this.list.find((s) => person(s) && s.title !== s.key)?.title || '';
+    const existing = this.list.find((s) => s.kind === kind && person(s));
     if (existing) {
       if (known && existing.title === existing.key) existing.title = known;
       return existing;
     }
-    const session = this.create({ id: `${kind}-${key.replace(/\W/g, '') || key}`, kind, key, title: known || key, lastAt: Date.now(), unread: 0 });
+    // Their other way in: its conversation, and its key (the number as first kept).
+    const sibling = this.list.find(person);
+    const session = this.create({
+      id: `${kind}-${key.replace(/\W/g, '') || key}`,
+      kind,
+      key: sibling?.key ?? key,
+      title: known || sibling?.title || key,
+      lastAt: Date.now(),
+      unread: 0,
+      thread: sibling?.thread ?? threadId(key),
+      ...(hidden ? { hidden: true } : {}),
+    });
     this.list.push(session);
+    // The other lane takes the name, when this one brings it.
+    if (sibling && known && sibling.title === sibling.key) sibling.title = known;
     await this.saveIndex();
     return session;
   }
@@ -1027,7 +1264,7 @@ export class Sessions {
     // A text the phone delivers again (it does, when it reconnects) is not a new one.
     const handle = String(event.data.handle ?? '');
     if (handle) {
-      const existing = this.list.find((s) => s.kind === 'sms' && s.key === digits(from));
+      const existing = this.list.find((s) => s.kind === 'sms' && this.isPerson(s, phoneKey(from) || from));
       if (existing?.handles?.includes(handle)) return null;
     }
     const session = await this.textArrived(from, String(event.data.name ?? ''), body);
@@ -1049,7 +1286,7 @@ export class Sessions {
     if (this.settings().answer || session.key === TEST_NUMBER) this.deliver(session, text);
     else {
       // Kept, not answered: it is there when the person looks, or answers it themselves.
-      session.agent.turns.push({ role: 'user', text });
+      session.agent.turns.push({ role: 'user', text, at: Date.now() });
       await this.save(session);
     }
     this.sort();
@@ -1071,6 +1308,8 @@ export class Sessions {
       const last = session.agent.turns.at(-1);
       if (last?.role !== 'user' || !last.text.startsWith('Text message from ')) continue;
       session.agent.turns.pop();
+      // Answered now, and kept as it came.
+      if (typeof last.at === 'number') session.waitingSince ??= last.at;
       this.deliver(session, last.text);
       n++;
     }
@@ -1085,7 +1324,8 @@ export class Sessions {
     const key = from.trim() || 'a flow';
     let session = this.list.find((s) => s.kind === 'task' && s.key === key);
     if (!session) {
-      session = this.create({ id: `task-${key.replace(/\W+/g, '-').toLowerCase().slice(0, 40) || 'flow'}-${Date.now().toString(36)}`, kind: 'task', key, title: key, lastAt: Date.now(), unread: 0 });
+      const id = `task-${key.replace(/\W+/g, '-').toLowerCase().slice(0, 40) || 'flow'}-${Date.now().toString(36)}`;
+      session = this.create({ id, kind: 'task', key, title: key, lastAt: Date.now(), unread: 0, thread: id });
       this.list.push(session);
       void this.saveIndex();
     }
@@ -1103,16 +1343,19 @@ export class Sessions {
     });
   }
 
-  /** The person's own message in a conversation: it goes first. */
-  say(session: Session, text: string): void {
+  /** The person's own message in a conversation (to the lane `laneFor` gives), or in one lane: it goes first. */
+  async say(target: Thread | Session, text: string): Promise<Session> {
+    const session = 'lanes' in target ? await this.laneFor(target) : target;
     this.deliver(session, text, true);
+    return session;
   }
 
-  /** A message for a conversation: to its running agent, or its next run. */
+  /** A message for a lane: to its running agent, or its next run. */
   private deliver(session: Session, text: string, first = false): void {
     // A flow's task is its own run (its answer is what that run says), never added to another.
     if (session.kind !== 'task' && session.running && session.agent.interject(text)) return;
     session.waiting.push(text);
+    session.waitingSince ??= Date.now();
     const lane = session.kind === 'call' ? this.callQueue : this.queue;
     if (!lane.includes(session)) {
       if (first) lane.unshift(session);
@@ -1160,8 +1403,13 @@ export class Sessions {
     };
     // end_call has run: nothing more is said in this run, whatever tool answers after it.
     let goodbye = false;
+    // When the messages it answers came: the time its first turn is kept with (the rest, as they come).
+    let arrived = session.waitingSince;
+    session.waitingSince = session.waiting.length ? Date.now() : undefined;
     try {
       await session.agent.run(prompt, (event) => {
+        this.stamp(session, arrived);
+        arrived = undefined;
         if (event.type === 'done') said = event.text;
         if (event.type === 'error') failed = event.message;
         if (event.type === 'tool_call') {
@@ -1205,24 +1453,21 @@ export class Sessions {
       session.controller = null;
       finish();
       session.lastAt = Date.now();
-      await this.save(session);
-      await this.saveIndex();
       // Messages that came as it finished: its next turn.
       const unread = session.agent.takeUnread();
+      // Its call has ended: what came for it (the caller's last words) is kept, and no one is answered
+      // (kept before the save, which has it). A call begun since has its own words.
+      const callOver = !!onCall && session.callId !== onCall;
+      if (callOver && unread.length && !session.callId) session.agent.turns.push({ role: 'user', text: unread.join('\n\n'), at: Date.now() });
+      await this.save(session);
+      await this.saveIndex();
       this.hooks.finished?.(session);
       // A booking promised but not requested: the agent is told once, and requests it.
       if (session.callId && !controller.signal.aborted && !session.bookingNudged && promisesBooking(said) && namesATime(session.agent.view()) && !requested(session)) {
         session.bookingNudged = true;
         unread.push(BOOKING_NUDGE);
       }
-      if (unread.length && onCall && session.callId !== onCall) {
-        // Its call has ended: what came for it (the caller's last words) is kept, and no one is answered.
-        // A call begun since has its own words.
-        if (!session.callId) {
-          session.agent.turns.push({ role: 'user', text: unread.join('\n\n') });
-          await this.save(session);
-        }
-      } else if (unread.length) this.deliver(session, unread.join('\n\n'));
+      if (!callOver && unread.length) this.deliver(session, unread.join('\n\n'));
       this.hooks.changed();
     }
   }
@@ -1241,24 +1486,48 @@ export class Sessions {
     for (const s of this.list) this.stop(s);
   }
 
-  /** The person looked at it. */
-  seen(session: Session): void {
-    if (!session.unread) return;
-    session.unread = 0;
+  /** The person looked at it (a conversation, all its lanes). */
+  seen(target: Thread | Session): void {
+    const lanes = 'lanes' in target ? target.lanes : [target];
+    if (!lanes.some((s) => s.unread)) return;
+    for (const s of lanes) s.unread = 0;
     void this.saveIndex();
     this.hooks.changed();
   }
 
-  async remove(session: Session): Promise<void> {
-    this.stop(session);
-    this.list = this.list.filter((s) => s !== session);
-    await this.project.saveSessionChat(session.id, []);
+  /** A conversation removed: all its lanes, and its turns. */
+  async remove(target: Thread | Session): Promise<void> {
+    const thread = 'lanes' in target ? target.id : target.thread;
+    const lanes = this.list.filter((s) => s.thread === thread);
+    for (const s of lanes) this.stop(s);
+    this.list = this.list.filter((s) => s.thread !== thread);
+    this.orders.delete(thread);
+    await this.project.saveSessionChat(thread, []);
     await this.saveIndex();
     this.hooks.changed();
   }
 
+  /**
+   * Keep a lane's conversation: all its lanes' turns in their order, in its
+   * file. One write at a time for a conversation, each with the turns as they
+   * are when it is written (two lanes of one person can finish at once).
+   */
   async save(session: Session): Promise<void> {
-    await this.project.saveSessionChat(session.id, session.agent.savedTurns());
+    const thread = session.thread;
+    const write = (this.writing.get(thread) ?? Promise.resolve()).then(async () => {
+      const lanes = this.list.filter((s) => s.thread === thread);
+      if (!lanes.length) return;
+      // As each agent keeps its own: pictures its tools showed long ago are left out.
+      const saved = new Map<Turn, Turn>();
+      for (const lane of lanes) {
+        const kept = lane.agent.savedTurns();
+        lane.agent.turns.forEach((t, i) => saved.set(t, kept[i] ?? t));
+      }
+      await this.project.saveSessionChat(thread, this.turnsOf(thread).map((t) => saved.get(t) ?? t));
+    });
+    const settled = write.catch(() => {});
+    this.writing.set(thread, settled);
+    await write;
   }
 
   private sort(): void {
@@ -1266,7 +1535,7 @@ export class Sessions {
   }
 
   private async saveIndex(): Promise<void> {
-    await this.project.saveSessions(this.list.map(({ id, kind, key, title, lastAt, unread, handles }) => ({ id, kind, key, title, lastAt, unread, ...(handles?.length ? { handles } : {}) })));
+    await this.project.saveSessions(this.list.map(({ id, kind, key, title, lastAt, unread, handles, thread, hidden }) => ({ id, kind, key, title, lastAt, unread, ...(handles?.length ? { handles } : {}), thread, ...(hidden ? { hidden } : {}) })));
   }
 }
 

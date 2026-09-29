@@ -86,6 +86,15 @@ export interface SessionInfo {
   unread: number;
   /** The phone's handles of the texts it has had (the phone may deliver one again, when it reconnects). */
   handles?: string[];
+  /**
+   * The conversation it is part of: a person's calls and texts are one (its
+   * turns kept together, in `sessions/<thread>.json`); a flow's tasks are
+   * their own. None: kept before a person's were one (its turns in
+   * `sessions/<id>.json`, merged into their conversation on the next start).
+   */
+  thread?: string;
+  /** A call from a hidden number: its own conversation, never another caller's. */
+  hidden?: boolean;
 }
 
 /**
@@ -426,6 +435,35 @@ export class OpenProject {
 
   async saveSessionChat(id: string, turns: Turn[]): Promise<void> {
     await writeBytes(await dirAt(this.dir, 'sessions', true), `${safeName(id)}.json`, JSON.stringify(turns));
+  }
+
+  /** A conversation's turns gone (kept in a backup first, when they matter). */
+  async removeSessionChat(id: string): Promise<void> {
+    const dir = await dirAt(this.dir, 'sessions', false).catch(() => null);
+    await dir?.removeEntry(`${safeName(id)}.json`).catch(() => {});
+  }
+
+  /**
+   * A copy of the conversations as they are (the list, each one's turns, what
+   * is known about callers, the calls to ring back), in `<name>/` beside them,
+   * before they are changed. A copy made already under that name is kept: the
+   * new one goes under `<name>-2` (and so on). Answers with the name used.
+   */
+  async backupSessions(name: string): Promise<string> {
+    let used = name;
+    for (let n = 2; await this.dir.getDirectoryHandle(used).then(() => true, () => false); n++) used = `${name}-${n}`;
+    const backup = await this.dir.getDirectoryHandle(used, { create: true });
+    const copy = async (from: FileSystemDirectoryHandle, to: FileSystemDirectoryHandle, file: string) => {
+      const handle = await from.getFileHandle(file).catch(() => null);
+      if (handle) await writeBytes(to, file, new Uint8Array(await (await handle.getFile()).arrayBuffer()));
+    };
+    for (const file of ['callers.json', 'callbacks.json']) await copy(this.dir, backup, file);
+    const sessions = await dirAt(this.dir, 'sessions', false).catch(() => null);
+    if (sessions) {
+      const to = await backup.getDirectoryHandle('sessions', { create: true });
+      for await (const [file, handle] of (sessions as unknown as AsyncIterable<[string, FileSystemHandle]>)) if (handle.kind === 'file') await copy(sessions, to, file);
+    }
+    return used;
   }
 
   async close(): Promise<void> {

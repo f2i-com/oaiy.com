@@ -401,13 +401,16 @@ describe('a phone call answered by the agent', () => {
     expect(calls.at(-1)).toEqual(['say', 'call_4', "I can't check the calendar right now."]);
   });
 
-  it("a new call starts afresh: the agent reads only this call, the earlier ones stay, and it can look them up", async () => {
+  it("a new call starts afresh: the agent reads only this call (and a few lines of their last contact), the earlier ones stay, and it can look them up", async () => {
     const fake = fakeProvider('openai', [
       { text: 'We mow on Tuesdays.' },
       (body) => {
         const sent = JSON.stringify(body.messages);
-        expect(sent).not.toContain('Do you mow on Tuesdays?');
-        expect(sent).not.toContain('We mow on Tuesdays.');
+        // Not the earlier call's turns: a short summary of it, in the note that starts this one.
+        expect(sent).not.toContain('Caller: Do you mow on Tuesdays?');
+        expect(sent).not.toContain('"content":"We mow on Tuesdays."');
+        expect(sent).toContain('Their last contact, ');
+        expect(sent).toContain('- They said: \\"Do you mow on Tuesdays?\\"\\n- You said: \\"We mow on Tuesdays.\\"');
         expect(sent).toContain('Caller: Hi again.');
         return { text: '', calls: [{ name: 'earlier_conversations', input: { words: 'tuesdays' } }] };
       },
@@ -428,7 +431,7 @@ describe('a phone call answered by the agent', () => {
     await settled(sessions);
     expect(fake.bodies).toHaveLength(3);
     // Both calls are kept, for the chat.
-    const kept = JSON.stringify(chats.get(first!.id));
+    const kept = JSON.stringify(chats.get(first!.thread));
     expect(kept).toContain('Do you mow on Tuesdays?');
     expect(kept).toContain('Welcome back!');
     // Only another caller's words are never found.

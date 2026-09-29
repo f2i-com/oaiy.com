@@ -64,10 +64,22 @@ export interface Attachment {
   app?: string;
 }
 
+/**
+ * Where a turn of a person's conversation came from, and when (the phone's
+ * conversations keep a person's calls and texts in one order): kept with the
+ * turn, never sent to a model.
+ */
+export interface TurnPlace {
+  /** When it happened (ms). */
+  at?: number;
+  /** Which of the person's agents it belongs to: their calls' or their texts'. */
+  via?: 'call' | 'sms';
+}
+
 export type Turn =
-  | { role: 'user'; text: string; images?: ImagePart[]; attachments?: Attachment[]; /** Written by bot.computer (a nudge to finish), not the person. */ automatic?: boolean; /** A summary of everything before it: the model reads from the latest one on. */ summary?: boolean; /** A fresh start (a new phone call): the model reads from here on, what came before kept for the chat and for searching. */ fresh?: boolean; /** Guides read with this request (it plainly asked for that kind of work). */ guides?: string[] }
-  | { role: 'assistant'; text: string; calls: ToolCall[]; anthropicContent?: unknown[]; /** What the model thought first: shown in the chat, never sent back. */ thinking?: string }
-  | { role: 'tool'; results: ToolResult[] };
+  | ({ role: 'user'; text: string; images?: ImagePart[]; attachments?: Attachment[]; /** Written by bot.computer (a nudge to finish), not the person. */ automatic?: boolean; /** A summary of everything before it: the model reads from the latest one on. */ summary?: boolean; /** A fresh start (a new phone call): the model reads from here on, what came before kept for the chat and for searching. */ fresh?: boolean; /** Guides read with this request (it plainly asked for that kind of work). */ guides?: string[] } & TurnPlace)
+  | ({ role: 'assistant'; text: string; calls: ToolCall[]; anthropicContent?: unknown[]; /** What the model thought first: shown in the chat, never sent back. */ thinking?: string } & TurnPlace)
+  | ({ role: 'tool'; results: ToolResult[] } & TurnPlace);
 
 export interface Usage {
   inputTokens: number;
