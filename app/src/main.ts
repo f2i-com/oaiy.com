@@ -15,6 +15,7 @@ import { pluginSessionTools, type PluginToolAudience } from './desktop/pluginToo
 import { TRANSCRIBE_TOOL, transcribeTool } from './desktop/transcribe';
 import { calendarTools } from './desktop/calendarTools';
 import { flowBuilderTools } from './desktop/flowBuilder';
+import { answeringOn, installIntents } from './desktop/intents';
 import { TOOLS } from './agent/tools';
 import type { SessionTool, ToolHook } from './agent/agent';
 import { editPhone } from './ui/phone';
@@ -1582,6 +1583,17 @@ With that done, Settings → Images, video and audio → Find OAIY sets it up.`)
     applyModules(UNPAIRED);
   }
   setInterval(() => void keepTextLease(), 10_000);
+  // OAIY Desktop's setup wizard ("Answer calls and texts with OAIY"), in OAIY's own window only.
+  if (given) {
+    installIntents({
+      answerWithOaiy: async () => {
+        messages = answeringOn(messages);
+        await saveMessages(messages);
+        await keepTextLease();
+        chat.system('Answering calls and texts is on, from OAIY setup. Phone has the instructions for them.');
+      },
+    });
+  }
   window.addEventListener('pagehide', () => {
     if (holdsTexts && desktop) void desktop.release('answer-texts', pageId);
   });
