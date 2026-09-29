@@ -1,5 +1,5 @@
 {
- "about": "OAIY Desktop's control tools as its MCP server lists them (tools/list), captured from a headless oaiy-server built from main (9aeb3d8): all of them for a project or setup session; the runner session is offered the read tools named in runner.",
+ "about": "OAIY Desktop's control tools as its MCP server lists them (tools/list), captured from a headless oaiy-server built from main (649ccd1): all of them for a project or setup session; the runner session is offered the read tools named in runner.",
  "tools": [
   {
    "annotations": {
@@ -951,7 +951,7 @@
     "readOnlyHint": true,
     "title": "Calendar settings"
    },
-   "description": "The calendar's settings: business (its name), hours (seven days, Monday first, each a list of {open, close} like 09:00), services ({id, name, minutes, description, price}), slotMinutes, noticeMinutes, horizonDays, textConfirmations; available says whether a plugin provides the calendar.",
+   "description": "The calendar's settings: business (its name), receptionist (the name the receptionist calls itself on calls and texts; empty means Aokie, and receptionistName is the name it goes by either way), hours (seven days, Monday first, each a list of {open, close} like 09:00), services ({id, name, minutes, description, price}), slotMinutes, noticeMinutes, horizonDays, textConfirmations; available says whether a plugin provides the calendar.",
    "inputSchema": {
     "additionalProperties": false,
     "properties": {},
@@ -989,6 +989,11 @@
       "description": "How soon from now a time may be offered.",
       "minimum": 0,
       "type": "integer"
+     },
+     "receptionist": {
+      "description": "The name the receptionist calls itself on calls and texts; empty for Aokie's own name (Aokie).",
+      "maxLength": 40,
+      "type": "string"
      },
      "services": {
       "description": "The services booked: {id, name, minutes, description, price}.",
