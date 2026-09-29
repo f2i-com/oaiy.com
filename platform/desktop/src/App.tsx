@@ -177,7 +177,7 @@ const PAGE: Record<BuiltinView, { tab: string; icon: LucideIcon; copy: string }>
   connections: { tab: 'Connections', icon: ShieldCheck, copy: 'Apps and accounts allowed to run flows and call plugins on this machine.' },
   providers: { tab: 'AI providers', icon: Sparkles, copy: 'Cloud or local AI providers your flows can call. Keys stay on this device.' },
   plugins: { tab: 'Plugins', icon: Puzzle, copy: 'Supervised extensions that add connectors and events to your flows.' },
-  settings: { tab: 'Settings', icon: Settings2, copy: 'Where OAIY keeps its data and models, and your Hugging Face token.' },
+  settings: { tab: 'Settings', icon: Settings2, copy: 'Updates to OAIY, where it keeps its data and models, and your Hugging Face token.' },
   'agent-settings': { tab: 'Agent', icon: Bot, copy: 'What the Agent may change in OAIY, the model it thinks with, and every change it made.' },
   setup: { tab: 'Setup', icon: ListChecks, copy: 'Your AI and the Agent; then the Agent, or you step by step, sets up the rest.' },
 };
