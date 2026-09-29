@@ -325,10 +325,10 @@ export function firstRunPosition(steps: FirstRunStep[], position: string | null 
   return open >= 0 ? open : steps.length - 1;
 }
 
-/** "3 of 5": the steps done, over the ones that count (not the welcome or the end). */
+/** "3 of 5": the steps done (a skipped one is not), over the ones that count (not the welcome or the end). */
 export function firstRunProgress(steps: FirstRunStep[]): { done: number; total: number } {
   const counted = steps.filter((s) => s.id !== 'welcome' && s.id !== 'done');
-  return { done: counted.filter((s) => s.state !== 'todo').length, total: counted.length };
+  return { done: counted.filter((s) => s.state === 'done').length, total: counted.length };
 }
 
 // ---------------------------------------------------------------------------
@@ -346,9 +346,11 @@ const COMMAND_GROUPS: Record<string, string> = {
   consent: 'Keep the consent you give for calls and data',
 };
 
-/** Host capabilities, by name. */
+/** Host capabilities (the desktop's HOST_CAPABILITIES), by name, with or without their `oaiy.` prefix. */
 const HOST_WORDS: Record<string, string> = {
   'flow.run': 'Run your flows',
+  'events.publish': 'Send events to your flows',
+  'services.read': 'See the services this computer runs',
   'companion.admission': 'Let the phones you approve join its calls',
 };
 
@@ -367,16 +369,23 @@ export function describeCapabilities(capabilities: string[]): CapabilityGroup[] 
     g.names.push(name);
     groups.set(key, g);
   };
-  for (const cap of capabilities) {
+  // What it may do in OAIY first, then its own commands.
+  const host = capabilities.filter((c) => !c.startsWith('connector.'));
+  const connectors = capabilities.filter((c) => c.startsWith('connector.'));
+  for (const cap of host) {
+    const bare = cap.replace(/^oaiy\./, '');
+    add(`host:${bare}`, HOST_WORDS[bare] ?? `Use OAIY's ${cap}`, cap);
+  }
+  for (const cap of connectors) {
     const m = /^connector\.([^.]+)\.(.+)$/.exec(cap);
-    if (m) {
-      const [, connector, command] = m;
-      const head = command.split('.')[0];
-      const text = COMMAND_GROUPS[head] ?? `Run its ${connector} commands`;
-      add(`connector:${COMMAND_GROUPS[head] ? head : connector}`, text, command);
-    } else {
-      add(`host:${cap}`, HOST_WORDS[cap] ?? `Use OAIY's ${cap}`, cap);
+    if (!m) {
+      add(`host:${cap}`, `Use OAIY's ${cap}`, cap);
+      continue;
     }
+    const [, connector, command] = m;
+    const head = command.split('.')[0];
+    const text = COMMAND_GROUPS[head] ?? `Run its ${connector} commands`;
+    add(`connector:${COMMAND_GROUPS[head] ? head : connector}`, text, command);
   }
   return [...groups.values()];
 }

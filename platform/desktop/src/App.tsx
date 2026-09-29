@@ -413,9 +413,10 @@ export default function App() {
       }
     : view === 'setup'
       ? {
+          // The page names what is being set up; the header says what setup is.
           kicker: 'Setup',
-          title: setupPlugin ? 'Set up a plugin' : 'Set up OAIY',
-          copy: setupPlugin ? 'What it may do, what it needs, and its device, step by step.' : PAGE.setup.copy,
+          title: 'Setup',
+          copy: setupPlugin ? 'A plugin’s own setup: what it may do, what it needs, and its device, step by step.' : PAGE.setup.copy,
         }
       : {
         kicker: section?.group ?? 'Home',

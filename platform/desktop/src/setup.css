@@ -469,17 +469,26 @@ details.setup-more-source > summary:hover { color: var(--text); }
   background: transparent;
 }
 .plugin-setup-frame > .empty-state { margin: 24px; }
-.setup-frame-note {
+
+/* The plugin is not running: a step that talks to it waits, with a way to start it. */
+.setup-run-note {
   display: flex;
+  flex-wrap: wrap;
   align-items: center;
-  gap: 6px;
-  margin: 10px 24px 0;
+  gap: 8px 10px;
+  border: 1px solid color-mix(in srgb, var(--amber) 35%, transparent);
   border-radius: var(--r-ctl);
   background: var(--amber-soft);
   color: var(--amber);
-  padding: 7px 10px;
-  font-size: 12px;
+  padding: 8px 12px;
+  font-size: 12.5px;
+  line-height: 1.5;
 }
+.setup-run-note > svg { flex: none; }
+.setup-run-note > span { display: flex; min-width: 0; flex: 1 1 260px; flex-direction: column; }
+.setup-run-note small { color: var(--danger); font-size: 11.5px; }
+.setup-screen-step > .setup-run-note { margin: 10px 24px 0; }
+.setup-req-body > p.card-warn { color: var(--amber); }
 
 /* A plugin's wizard inside the first-run wizard: its steps as a strip, then the step, then its footer. */
 .setup-embedded { display: flex; min-height: 0; flex: 1 1 auto; flex-direction: column; }
@@ -557,6 +566,7 @@ details.setup-more-source > summary:hover { color: var(--text); }
   .setup-pane,
   .setup-embedded-body { padding: 16px; }
   .setup-screen-step > .setup-step-head { padding: 16px 16px 12px; }
+  .setup-screen-step > .setup-run-note { margin: 8px 16px 0; }
   .setup-screen-status { padding: 8px 16px 0; }
   .setup-req { flex-wrap: wrap; }
   .setup-req-action { width: 100%; justify-content: flex-end; }

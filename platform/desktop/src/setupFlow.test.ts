@@ -279,7 +279,8 @@ describe('the first-run wizard', () => {
     expect(steps[firstRunPosition(steps, 'plugin:gone')].id).toBe('plugins');
     expect(steps.find((s) => s.id === 'connect')!.state).toBe('skipped');
     expect(steps.find((s) => s.id === 'welcome')!.state).toBe('done');
-    expect(firstRunProgress(steps)).toEqual({ done: 2, total: 3 });
+    // The engine is done; connect was skipped, which is not done.
+    expect(firstRunProgress(steps)).toEqual({ done: 1, total: 3 });
   });
 
   it('a connected app or a linked account completes the optional last step', () => {
@@ -290,15 +291,18 @@ describe('the first-run wizard', () => {
 });
 
 describe('capabilities in plain words', () => {
-  it('groups connector commands into what they let the plugin do, and names host ones', () => {
-    const groups = describeCapabilities(['flow.run', 'connector.aokie.call.dial', 'connector.aokie.call.answer', 'connector.aokie.sms.send', 'connector.aokie.weird.thing', 'oaiy.unknown']);
+  it('names what it may do in OAIY first, then groups its commands into what they let it do', () => {
+    // As the desktop resolves them: sorted, host capabilities in their oaiy. spelling.
+    const groups = describeCapabilities(['connector.aokie.call.answer', 'connector.aokie.call.dial', 'connector.aokie.sms.send', 'connector.aokie.weird.thing', 'oaiy.companion.admission', 'oaiy.flow.run', 'oaiy.unknown']);
     expect(groups.map((g) => g.text)).toEqual([
+      'Let the phones you approve join its calls',
       'Run your flows',
+      "Use OAIY's oaiy.unknown",
       'Answer, place, hold and end phone calls',
       'Read your text messages and send texts from your number',
       'Run its aokie commands',
-      "Use OAIY's oaiy.unknown",
     ]);
-    expect(groups[1].names).toEqual(['call.dial', 'call.answer']);
+    expect(groups[3].names).toEqual(['call.answer', 'call.dial']);
+    expect(describeCapabilities(['flow.run'])[0].text).toBe('Run your flows');
   });
 });

@@ -1,5 +1,5 @@
 import { useCallback, useEffect, useMemo, useRef, useState, type ReactNode } from 'react';
-import { Bot, Check, ExternalLink, Loader2, PhoneForwarded, RotateCcw, ShieldCheck, TriangleAlert } from 'lucide-react';
+import { Bot, Check, ExternalLink, Loader2, PhoneForwarded, Play, RotateCcw, ShieldCheck, TriangleAlert } from 'lucide-react';
 import {
   agentIntent,
   bridge,
@@ -280,6 +280,7 @@ export default function PluginWizard({ pluginId, layout, onFinished, onLeave, on
         content = (
           <>
             {head}
+            <PluginRunNote record={record} onStarted={() => void refreshPlugins()} />
             <SettingsStep key={s.id} record={record} step={s} onSaved={() => mark(s.id)} />
           </>
         );
@@ -304,8 +305,13 @@ export default function PluginWizard({ pluginId, layout, onFinished, onLeave, on
                   <TriangleAlert size={12} /> {failure}
                 </span>
               )}
-              {s.done !== undefined && current.state !== 'done' && check && <small className="setup-check">Not done yet{check.detail ? `: ${check.detail}` : ''}</small>}
+              {s.done !== undefined && current.state !== 'done' && check && record.state === 'running' && (
+                <small className="setup-check" title={check.detail}>
+                  Not done yet: this step checks itself every few seconds.
+                </small>
+              )}
             </div>
+            <PluginRunNote record={record} onStarted={() => void refreshPlugins()} />
             <PluginScreenPage
               pluginId={pluginId}
               screenId={s.screen}
@@ -320,6 +326,7 @@ export default function PluginWizard({ pluginId, layout, onFinished, onLeave, on
         content = (
           <>
             {head}
+            {s.action === 'phone.answerWithOaiy' && <PluginRunNote record={record} onStarted={() => void refreshPlugins()} />}
             {s.action === 'phone.answerWithOaiy' ? (
               <AnswerWithOaiyStep record={record} step={s} onRoute={(on) => setHost((h) => (h[s.id] === on ? h : { ...h, [s.id]: on }))} onRecorded={() => mark(s.id)} onNavigate={onNavigate} />
             ) : (
@@ -401,7 +408,7 @@ export default function PluginWizard({ pluginId, layout, onFinished, onLeave, on
     <WizardFrame
       title={declared?.title ?? `Set up ${name}`}
       subtitle={record ? <>From the {name} plugin{record.manifest?.version ? `, v${record.manifest.version}` : ''}. Each step checks itself once it is true.</> : undefined}
-      progress={{ done: steps.filter((x) => x.state !== 'todo').length, total: steps.length }}
+      progress={{ done: steps.filter((x) => x.state === 'done').length, total: steps.length }}
       rail={rail}
       current={index}
       onPick={go}
@@ -415,8 +422,48 @@ export default function PluginWizard({ pluginId, layout, onFinished, onLeave, on
   );
 }
 
+/**
+ * The plugin is not running, so a step that talks to it waits: said once, with
+ * a way to start it. A plugin that restarts mid-step (a driver install) shows
+ * here as starting; the step is not failed and its screen is not reloaded.
+ */
+function PluginRunNote({ record, onStarted }: { record: PluginRecord; onStarted: () => void }) {
+  const [busy, setBusy] = useState(false);
+  const [error, setError] = useState<string | null>(null);
+  if (record.state === 'running' || record.state === 'unhealthy') return null;
+  const name = record.manifest?.name ?? record.id;
+  const reason = (record.reason ?? '').trim().replace(/\.+$/, '');
+  const starting = record.state === 'starting';
+  const start = async () => {
+    setBusy(true);
+    setError(null);
+    try {
+      await pluginsApi.start(record.id);
+      onStarted();
+    } catch (e) {
+      setError(errorText(e));
+    } finally {
+      setBusy(false);
+    }
+  };
+  return (
+    <div className="setup-run-note" role="status">
+      <TriangleAlert size={13} aria-hidden />
+      <span>
+        {starting ? `${name} is starting…` : `${name} is not running${reason ? ` (${reason})` : ''}.`} This step talks to it, and carries on once it runs.
+        {error && <small>{error}</small>}
+      </span>
+      {!starting && !record.userDisabled && (
+        <button type="button" className="btn-tiny" disabled={busy} onClick={() => void start()}>
+          {busy ? <Loader2 size={12} className="spin" /> : <Play size={12} />} Start it
+        </button>
+      )}
+    </div>
+  );
+}
+
 const KIND_HINT: Record<DeclaredStep['kind'], string> = {
-  permissions: 'What it may do',
+  permissions: 'Its permissions',
   requirements: 'What it needs',
   settings: 'Its settings',
   screen: 'In the plugin',

@@ -709,14 +709,10 @@ function PluginScreenContent({ pluginId, navId, screenId, onNavigate, setup }: P
     <div className={setup ? 'panel plugin-setup-frame' : 'panel'}>
       {currentStatus === null ? (
         <div className="banner banner-err" role="alert">This plugin is no longer installed. Its open screen has been kept so you can review the current information.</div>
-      ) : currentStatus.state !== 'running' && setup ? (
-        // A wizard step keeps going while the plugin restarts (a driver
-        // install restarts it): said quietly, and the frame is never reloaded.
-        <p className="setup-frame-note" role="status">
-          <TriangleAlert size={13} /> {record.manifest?.name ?? record.id} is {currentStatus.state}
-          {currentStatus.reason ? `: ${currentStatus.reason}` : ''}. This step carries on once it runs.
-        </p>
-      ) : currentStatus.state !== 'running' && (
+      ) : setup ? // A wizard step keeps going while the plugin restarts (a driver
+        // install restarts it): the wizard says how the plugin stands, and
+        // the frame is never reloaded for it.
+        null : currentStatus.state !== 'running' && (
         <div className="banner banner-err" role="alert">
           <span>
             <TriangleAlert size={13} /> “{record.manifest?.name ?? record.id}” is {currentStatus.state}
