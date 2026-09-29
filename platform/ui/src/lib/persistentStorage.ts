@@ -9,6 +9,14 @@
  * The Agent asks when it starts (app/src/main.ts); the flow editor asks the same
  * way, so a project is not the first thing lost when space runs out.
  *
+ * Asking at startup is a choice, and it has a cost in Firefox: there the request
+ * is a popup, shown on the editor's first load, before the person has done
+ * anything (Firefox 155 left the request pending, waiting on that answer). The
+ * request is made at every load, and a person who has already said yes is not
+ * asked again (`persisted()` is checked first). Asking later, at the first saved
+ * key or the first edit, would be a gentler moment; main.tsx is the one place to
+ * change if that is wanted.
+ *
  * Three rules, all for the page that calls it:
  *   - Once. A second call gets the first call's answer; the browser is not
  *     asked twice in one page load.
