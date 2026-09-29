@@ -14,6 +14,7 @@
 //! posture as OAIY's other on-device secrets. That is a real difference and is
 //! surfaced in the status payload rather than hidden.
 
+use super::chat_tools;
 use serde_json::{json, Value};
 use std::collections::HashMap;
 use std::io::{BufRead, BufReader, Write};
@@ -492,22 +493,32 @@ impl CodexAgent {
     /// itself; the tunnel hands fragments to an async sender and returns.
     /// The buffered completion is still returned, so a caller that ignores the
     /// callback behaves exactly as before.
+    ///
+    /// On the generic route a request's `tools` are honoured by prompted tool
+    /// use (see [`complete_with`]); while the reply could still be a tool call
+    /// its fragments are held back, so a streaming caller never shows the
+    /// machinery. The buffered completion is the authority either way.
     pub fn chat_streaming(
         &self,
         body: &Value,
         alias: Option<LiveCallAlias>,
-        mut on_delta: impl FnMut(&str),
+        on_delta: impl FnMut(&str),
     ) -> Result<Value, CodexError> {
-        let prompt = flatten_prompt(body);
-        if prompt.trim().is_empty() {
-            return Err(CodexError::Rpc("the request carried no message content".into()));
-        }
-        let model = match alias {
-            Some(a) => Some(a.model().to_string()),
-            None => body.get("model").and_then(Value::as_str).map(str::to_string),
-        };
+        complete_with(body, alias, on_delta, |prompt, model, emit| {
+            self.run_turn(prompt, model, alias, emit)
+        })
+    }
 
-        let text = self.with_session(|s| {
+    /// One turn on the child: the prompt in, the agent's whole message out,
+    /// each fragment handed to `on_delta` as it arrives.
+    fn run_turn(
+        &self,
+        prompt: &str,
+        model: Option<&str>,
+        alias: Option<LiveCallAlias>,
+        on_delta: &mut dyn FnMut(&str),
+    ) -> Result<String, CodexError> {
+        self.with_session(|s| {
             // Refuse everything a turn could otherwise reach.
             let mut params = json!({
                 "approvalPolicy": "never",
@@ -516,8 +527,8 @@ impl CodexAgent {
                 "runtimeWorkspaceRoots": [],
                 "allowProviderModelFallback": false,
             });
-            if let Some(m) = &model {
-                params["model"] = Value::String(m.clone());
+            if let Some(m) = model {
+                params["model"] = Value::String(m.to_string());
             }
             let thread = s.call("thread/start", params, RPC_TIMEOUT)?;
             let thread_id = thread_id_of(&thread)
@@ -572,22 +583,187 @@ impl CodexAgent {
                 return Err(CodexError::Rpc("codex returned no output for this turn".into()));
             }
             Ok(out)
-        })?;
+        })
+    }
+}
 
-        let created = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map(|d| d.as_secs())
-            .unwrap_or(0);
-        Ok(json!({
-            "object": "chat.completion",
-            "created": created,
-            "model": model.unwrap_or_else(|| CODEX_PROVIDER_ID.to_string()),
-            "choices": [{
-                "index": 0,
-                "message": { "role": "assistant", "content": text },
-                "finish_reason": "stop",
-            }],
-        }))
+/// What the Agent is told its tools are, ahead of the catalogue.
+const TOOLS_INTRO: &str = "You can use these tools in this conversation.";
+
+/// One turn's worth of work, decided before the child is involved.
+struct TurnPlan {
+    prompt: String,
+    model: Option<String>,
+    /// The tools the prompt offers: empty on a plain turn, and always on a
+    /// live-call alias.
+    tools: Vec<chat_tools::Tool>,
+}
+
+/// A whole chat completion, with the turn itself handed in: `run` takes the
+/// prompt and the model and returns the agent's message, passing fragments to
+/// the callback as they arrive. In production that is the child; in the tests
+/// it is a fake codex. Everything around the turn is here — what the prompt
+/// says, which tools it offers, and whether the reply is an answer or a tool
+/// call — so the tests exercise exactly what ships.
+///
+/// Tools are honoured by PROMPTED tool use, as the tunnel does for FormLogic's
+/// chat: a Codex turn has no place to put a schema, so the catalogue is taught
+/// in [`chat_tools::preamble_with_intro`] and the reply read back with
+/// [`chat_tools::parse_prompted`] — one well-formed fenced call, or the answer.
+pub(super) fn complete_with(
+    body: &Value,
+    alias: Option<LiveCallAlias>,
+    mut on_delta: impl FnMut(&str),
+    run: impl FnOnce(&str, Option<&str>, &mut dyn FnMut(&str)) -> Result<String, CodexError>,
+) -> Result<Value, CodexError> {
+    let plan = plan_turn(body, alias)?;
+    let mut held = HeldDeltas::new(!plan.tools.is_empty());
+    let text = run(&plan.prompt, plan.model.as_deref(), &mut |d: &str| held.pass(d, &mut on_delta))?;
+    Ok(finish_turn(&plan, text))
+}
+
+/// The prompt, model and tools for one request.
+///
+/// A live-call alias keeps exactly the prompt it always had, and no tools: its
+/// callers depend on what it does now. The generic route adds the tool traffic
+/// of an agent loop, and mirrors the tunnel's switch — tools offered, the
+/// preamble goes first; no tools but results already in the conversation, the
+/// instruction to answer from them; neither, the plain prompt unchanged.
+fn plan_turn(body: &Value, alias: Option<LiveCallAlias>) -> Result<TurnPlan, CodexError> {
+    let empty = || CodexError::Rpc("the request carried no message content".into());
+    if let Some(a) = alias {
+        let prompt = flatten_prompt(body);
+        if prompt.trim().is_empty() {
+            return Err(empty());
+        }
+        return Ok(TurnPlan { prompt, model: Some(a.model().to_string()), tools: Vec::new() });
+    }
+    let model = body.get("model").and_then(Value::as_str).map(str::to_string);
+    let conversation = render_messages(body);
+    if conversation.trim().is_empty() {
+        return Err(empty());
+    }
+    let tools = offered_tools(body);
+    let prompt = if !tools.is_empty() {
+        format!("{}\n\n{conversation}", chat_tools::preamble_with_intro(TOOLS_INTRO, &tools))
+    } else if carries_tool_traffic(body) {
+        format!("{}\n\n{conversation}", chat_tools::plain_answer_instruction())
+    } else {
+        conversation
+    };
+    Ok(TurnPlan { prompt, model, tools })
+}
+
+/// The request's OpenAI `tools`, as the catalogue the preamble teaches.
+///
+/// `tool_choice: "none"` offers none. Any other choice is taken as `auto`: a
+/// prompted model cannot be made to call a tool, only offered one. Entries of a
+/// type other than `function` are skipped rather than taught wrongly.
+fn offered_tools(body: &Value) -> Vec<chat_tools::Tool> {
+    if body.get("tool_choice").and_then(Value::as_str) == Some("none") {
+        return Vec::new();
+    }
+    let Some(tools) = body.get("tools").and_then(Value::as_array) else {
+        return Vec::new();
+    };
+    tools
+        .iter()
+        .filter(|t| t.get("type").and_then(Value::as_str).map_or(true, |ty| ty == "function"))
+        .filter_map(|t| {
+            let f = t.get("function")?;
+            let name = f.get("name").and_then(Value::as_str).map(str::trim).filter(|n| !n.is_empty())?;
+            Some(chat_tools::Tool {
+                name: name.to_string(),
+                description: f.get("description").and_then(Value::as_str).unwrap_or_default().to_string(),
+                input_schema: f
+                    .get("parameters")
+                    .filter(|p| p.is_object())
+                    .cloned()
+                    .unwrap_or_else(|| json!({ "type": "object" })),
+            })
+        })
+        .collect()
+}
+
+/// Whether the conversation already holds tool calls or their results.
+fn carries_tool_traffic(body: &Value) -> bool {
+    body.get("messages").and_then(Value::as_array).is_some_and(|messages| {
+        messages.iter().any(|m| {
+            m.get("role").and_then(Value::as_str) == Some("tool")
+                || m.get("tool_calls").and_then(Value::as_array).is_some_and(|c| !c.is_empty())
+        })
+    })
+}
+
+/// The completion for a turn's reply: a tool call when the reply is exactly
+/// the taught fenced block naming an offered tool with an object for its input,
+/// and otherwise the answer, as it has always been.
+///
+/// The call goes out in the OpenAI shape an agent loop reads: an id of its own
+/// (a prompted reply carries none), the arguments as a JSON STRING, no content,
+/// and `finish_reason: "tool_calls"`.
+fn finish_turn(plan: &TurnPlan, text: String) -> Value {
+    let call = if plan.tools.is_empty() {
+        None
+    } else {
+        chat_tools::parse_prompted(&text, &plan.tools).filter(|c| c.input.is_object())
+    };
+    let (message, finish_reason) = match call {
+        Some(call) => (
+            json!({
+                "role": "assistant",
+                "content": null,
+                "tool_calls": [{
+                    "id": format!("call_{}", uuid::Uuid::new_v4().simple()),
+                    "type": "function",
+                    "function": { "name": call.name, "arguments": call.input.to_string() },
+                }],
+            }),
+            "tool_calls",
+        ),
+        None => (json!({ "role": "assistant", "content": text }), "stop"),
+    };
+    let created = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    json!({
+        "object": "chat.completion",
+        "created": created,
+        "model": plan.model.clone().unwrap_or_else(|| CODEX_PROVIDER_ID.to_string()),
+        "choices": [{
+            "index": 0,
+            "message": message,
+            "finish_reason": finish_reason,
+        }],
+    })
+}
+
+/// Passes a reply's fragments on, except while they could still be the start
+/// of a prompted tool call. A call's fenced block shown as it is written would
+/// show the reader the machinery instead of the result; once the reply can
+/// only be an answer, everything held is released and the rest flows. What
+/// was held and never released is still in the buffered completion.
+struct HeldDeltas {
+    holding: bool,
+    held: String,
+}
+
+impl HeldDeltas {
+    fn new(tools_offered: bool) -> Self {
+        Self { holding: tools_offered, held: String::new() }
+    }
+
+    fn pass(&mut self, delta: &str, out: &mut impl FnMut(&str)) {
+        if !self.holding {
+            out(delta);
+            return;
+        }
+        self.held.push_str(delta);
+        if !chat_tools::may_be_prompted_call(&self.held) {
+            self.holding = false;
+            out(&std::mem::take(&mut self.held));
+        }
     }
 }
 
@@ -633,6 +809,11 @@ fn model_catalog(result: &Value) -> Vec<Value> {
                 .filter(|s| !s.is_empty())
             {
                 row["displayName"] = json!(name);
+            }
+            // The model a turn that names none runs on: what "ChatGPT's own
+            // default" means to a picker offering the choice.
+            if m.get("isDefault").and_then(Value::as_bool) == Some(true) {
+                row["isDefault"] = json!(true);
             }
             Some(row)
         })
@@ -693,6 +874,9 @@ fn thread_id_of(result: &Value) -> Option<String> {
 
 /// Collapse an OpenAI `messages` array into the single prompt a turn takes,
 /// keeping role labels so a system instruction still reads as one.
+///
+/// The live-call aliases' prompt, unchanged. The generic route renders with
+/// [`render_messages`], which is this plus the tool traffic of an agent loop.
 fn flatten_prompt(body: &Value) -> String {
     let Some(messages) = body.get("messages").and_then(Value::as_array) else {
         return String::new();
@@ -700,16 +884,7 @@ fn flatten_prompt(body: &Value) -> String {
     let mut out = String::new();
     for m in messages {
         let role = m.get("role").and_then(Value::as_str).unwrap_or("user");
-        let content = match m.get("content") {
-            Some(Value::String(s)) => s.clone(),
-            // The array form SDKs emit: keep the text parts.
-            Some(Value::Array(parts)) => parts
-                .iter()
-                .filter_map(|p| p.get("text").and_then(Value::as_str))
-                .collect::<Vec<_>>()
-                .join(""),
-            _ => String::new(),
-        };
+        let content = content_text(m.get("content"));
         if content.trim().is_empty() {
             continue;
         }
@@ -723,6 +898,92 @@ fn flatten_prompt(body: &Value) -> String {
         }
     }
     out
+}
+
+/// A message's text: a plain string, or the text parts of the array form SDKs
+/// emit.
+fn content_text(content: Option<&Value>) -> String {
+    match content {
+        Some(Value::String(s)) => s.clone(),
+        Some(Value::Array(parts)) => parts
+            .iter()
+            .filter_map(|p| p.get("text").and_then(Value::as_str))
+            .collect::<Vec<_>>()
+            .join(""),
+        _ => String::new(),
+    }
+}
+
+/// The generic route's prompt: [`flatten_prompt`]'s rendering, plus what an
+/// agent loop carries between turns — each call the model made, written as the
+/// very fenced block the preamble teaches, and each result as the
+/// `tool_result` line it is told to expect.
+///
+/// Without them a model that asked for a tool would never learn what came
+/// back, and would ask again. A conversation with neither renders exactly as
+/// [`flatten_prompt`] does, so the tunnel's tool-free turns are unchanged.
+fn render_messages(body: &Value) -> String {
+    let Some(messages) = body.get("messages").and_then(Value::as_array) else {
+        return String::new();
+    };
+    // A `tool` message names its call by id; the name is on the call.
+    let mut names: HashMap<String, String> = HashMap::new();
+    let mut out = String::new();
+    for m in messages {
+        let role = m.get("role").and_then(Value::as_str).unwrap_or("user");
+        let content = content_text(m.get("content"));
+        let block = match role {
+            "assistant" => {
+                let mut parts: Vec<String> = Vec::new();
+                if !content.trim().is_empty() {
+                    parts.push(content);
+                }
+                for call in m.get("tool_calls").and_then(Value::as_array).into_iter().flatten() {
+                    let Some(name) = call.pointer("/function/name").and_then(Value::as_str) else {
+                        continue;
+                    };
+                    if let Some(id) = call.get("id").and_then(Value::as_str) {
+                        names.insert(id.to_string(), name.to_string());
+                    }
+                    parts.push(chat_tools::prompted_call_block(name, &arguments_of(call)));
+                }
+                if parts.is_empty() {
+                    continue;
+                }
+                format!("[assistant]\n{}", parts.join("\n\n"))
+            }
+            // Always kept, even empty: a tool that returned nothing still ran.
+            "tool" => {
+                let name = m
+                    .get("tool_call_id")
+                    .and_then(Value::as_str)
+                    .and_then(|id| names.get(id))
+                    .map(String::as_str)
+                    .or_else(|| m.get("name").and_then(Value::as_str))
+                    .unwrap_or("tool");
+                chat_tools::tool_result_line(name, content)
+            }
+            _ if content.trim().is_empty() => continue,
+            "system" => format!("[instructions]\n{content}"),
+            _ => content,
+        };
+        if !out.is_empty() {
+            out.push_str("\n\n");
+        }
+        out.push_str(&block);
+    }
+    out
+}
+
+/// A call's arguments as a value: OpenAI sends them as a JSON STRING. One that
+/// does not parse is kept as the text it was, so the model sees what it wrote.
+fn arguments_of(call: &Value) -> Value {
+    match call.pointer("/function/arguments") {
+        Some(Value::String(s)) if s.trim().is_empty() => json!({}),
+        Some(Value::String(s)) => serde_json::from_str(s).unwrap_or_else(|_| Value::String(s.clone())),
+        Some(v) if !v.is_null() => v.clone(),
+        _ => json!({}),
+    }
 }
 
 #[cfg(test)]
@@ -750,6 +1011,9 @@ mod tests {
         // sends this string back as the model to run.
         assert_eq!(rows[0]["id"], "gpt-5.5");
         assert_eq!(rows[0]["displayName"], "GPT-5.5");
+        // The model a turn naming none runs on, for a picker offering "ChatGPT's own default".
+        assert_eq!(rows[0]["isDefault"], true);
+        assert!(rows[1].get("isDefault").is_none(), "only the default is marked: {rows:?}");
         assert_eq!(rows[1]["id"], "gpt-5.6-luna");
         // `id` is the fallback for a runtime that names models differently…
         assert_eq!(rows[2]["id"], "legacy-shape");
@@ -920,6 +1184,273 @@ mod tests {
         assert_eq!(LiveCallAlias::ReasoningNone.reasoning_effort(), "none");
         assert_eq!(LiveCallAlias::ReasoningNone.model(), LIVE_CALL_MODEL);
         assert_eq!(LiveCallAlias::LunaReasoningLow.model(), LUNA_LIVE_CALL_MODEL);
+    }
+
+    // ---- ChatGPT with tools, against a fake codex ----
+
+    /// The tools an agent loop sends, in the OpenAI shape.
+    fn weather_tools() -> Value {
+        json!([
+            { "type": "function", "function": {
+                "name": "get_weather",
+                "description": "The weather in a city",
+                "parameters": { "type": "object", "properties": { "city": { "type": "string" } }, "required": ["city"] },
+            } },
+            { "type": "function", "function": { "name": "end_call", "description": "Hang up" } },
+        ])
+    }
+
+    /// What one turn against a fake codex produced: the completion, the
+    /// prompt the fake was handed, and what a streaming caller was shown.
+    struct Faked {
+        completion: Value,
+        prompt: String,
+        model: Option<String>,
+        streamed: String,
+    }
+
+    /// A fake codex: answers the turn with `reply`, cut into small fragments
+    /// and folded through the same notification handling as the real child,
+    /// batch by batch, so a streaming caller sees what it would see live.
+    fn fake_codex(body: &Value, alias: Option<LiveCallAlias>, reply: &str) -> Faked {
+        let mut prompt = String::new();
+        let mut model = None;
+        let mut streamed = String::new();
+        let completion = complete_with(body, alias, |d| streamed.push_str(d), |p, m, emit| {
+            prompt = p.to_string();
+            model = m.map(str::to_string);
+            let chars: Vec<char> = reply.chars().collect();
+            let mut notes: Vec<Value> = chars
+                .chunks(5)
+                .map(|c| json!({ "method": "item/agentMessage/delta", "params": { "delta": c.iter().collect::<String>() } }))
+                .collect();
+            notes.push(json!({ "method": "turn/completed" }));
+            let mut out = String::new();
+            for batch in notes.chunks(2) {
+                let before = out.len();
+                fold_turn_notes(&mut out, batch);
+                if out.len() > before {
+                    emit(&out[before..]);
+                }
+            }
+            Ok(out)
+        })
+        .expect("the fake turn answers");
+        Faked { completion, prompt, model, streamed }
+    }
+
+    fn ask(tools: Value) -> Value {
+        json!({
+            "model": "gpt-5.5",
+            "stream": true,
+            "messages": [
+                { "role": "system", "content": "You are the front desk." },
+                { "role": "user", "content": "What is the weather in Perth?" },
+            ],
+            "tools": tools,
+        })
+    }
+
+    #[test]
+    fn with_tools_offered_a_plain_answer_is_the_answer_and_streams() {
+        let reply = "It is sunny in Perth today.";
+        let f = fake_codex(&ask(weather_tools()), None, reply);
+        let choice = &f.completion["choices"][0];
+        assert_eq!(choice["finish_reason"], "stop");
+        assert_eq!(choice["message"]["content"], reply);
+        assert!(choice["message"].get("tool_calls").is_none());
+        assert_eq!(f.completion["model"], "gpt-5.5");
+        assert_eq!(f.model.as_deref(), Some("gpt-5.5"));
+        // It could not be a call once it began "It is", so it streamed — all of it.
+        assert_eq!(f.streamed, reply);
+        // The preamble went first, teaching the catalogue and the one fence the parser reads.
+        assert!(f.prompt.starts_with(TOOLS_INTRO), "{}", f.prompt);
+        assert!(f.prompt.contains("- get_weather: The weather in a city"), "{}", f.prompt);
+        assert!(f.prompt.contains("\"required\":[\"city\"]"), "the schema is taught: {}", f.prompt);
+        assert!(f.prompt.contains("```tool_call"), "{}", f.prompt);
+        assert!(f.prompt.contains("[instructions]\nYou are the front desk."), "{}", f.prompt);
+        assert!(f.prompt.ends_with("What is the weather in Perth?"), "{}", f.prompt);
+    }
+
+    #[test]
+    fn a_fenced_reply_comes_back_as_an_openai_tool_call() {
+        let reply = "```tool_call\n{\"tool\":\"get_weather\",\"input\":{\"city\":\"Perth\"}}\n```";
+        let f = fake_codex(&ask(weather_tools()), None, reply);
+        let choice = &f.completion["choices"][0];
+        assert_eq!(choice["finish_reason"], "tool_calls");
+        let message = &choice["message"];
+        assert_eq!(message["role"], "assistant");
+        assert!(message["content"].is_null(), "a call carries no text: {message}");
+        let calls = message["tool_calls"].as_array().expect("tool_calls");
+        assert_eq!(calls.len(), 1);
+        let id = calls[0]["id"].as_str().unwrap();
+        assert!(id.starts_with("call_") && id.len() > "call_".len(), "{id}");
+        assert_eq!(calls[0]["type"], "function");
+        assert_eq!(calls[0]["function"]["name"], "get_weather");
+        // Arguments go out as a JSON STRING, as every OpenAI client parses them.
+        let args = calls[0]["function"]["arguments"].as_str().expect("arguments is a string");
+        assert_eq!(serde_json::from_str::<Value>(args).unwrap(), json!({ "city": "Perth" }));
+        // …and nothing of the fenced block reached a streaming caller.
+        assert_eq!(f.streamed, "", "the machinery must not be shown");
+        // Each call gets an id of its own.
+        let again = fake_codex(&ask(weather_tools()), None, reply);
+        assert_ne!(again.completion["choices"][0]["message"]["tool_calls"][0]["id"], calls[0]["id"]);
+        // A call with no input is a call with an empty object.
+        let bare = fake_codex(&ask(weather_tools()), None, "```tool_call\n{\"tool\":\"end_call\"}\n```");
+        assert_eq!(bare.completion["choices"][0]["message"]["tool_calls"][0]["function"]["arguments"], "{}");
+    }
+
+    #[test]
+    fn a_malformed_call_falls_back_to_the_text() {
+        for reply in [
+            "```tool_call\n{\"tool\":\"get_weather\",\"input\":{\"city\":}\n```", // not JSON
+            "```tool_call\n{\"tool\":\"delete_everything\",\"input\":{}}\n```",  // not offered
+            "```tool_call\n{\"tool\":\"get_weather\",\"input\":\"Perth\"}\n```",  // input not an object
+            "```tool_call\n{\"tool\":\"get_weather\",\"input\":{\"city\":\"Perth\"}}", // never closed
+        ] {
+            let f = fake_codex(&ask(weather_tools()), None, reply);
+            let choice = &f.completion["choices"][0];
+            assert_eq!(choice["finish_reason"], "stop", "{reply}");
+            assert!(choice["message"].get("tool_calls").is_none(), "{reply}");
+            // The whole reply is the answer: held back while it looked like a
+            // call, it is in the completion for the caller to show.
+            assert_eq!(choice["message"]["content"], reply);
+            assert_eq!(f.streamed, "", "{reply}");
+        }
+        // Prose before the fence is an answer from its first word, so it streams.
+        let prose = "Sure! ```tool_call\n{\"tool\":\"get_weather\",\"input\":{}}\n```";
+        let f = fake_codex(&ask(weather_tools()), None, prose);
+        assert_eq!(f.completion["choices"][0]["finish_reason"], "stop");
+        assert_eq!(f.streamed, prose);
+    }
+
+    #[test]
+    fn a_tool_result_is_carried_into_the_next_turn() {
+        let body = json!({
+            "messages": [
+                { "role": "system", "content": "You are the front desk." },
+                { "role": "user", "content": "What is the weather in Perth?" },
+                { "role": "assistant", "content": null, "tool_calls": [{
+                    "id": "call_abc", "type": "function",
+                    "function": { "name": "get_weather", "arguments": "{\"city\":\"Perth\"}" },
+                }] },
+                // No name: it is found by the call's id.
+                { "role": "tool", "tool_call_id": "call_abc", "content": "{\"sky\":\"sunny\",\"high\":24}" },
+            ],
+            "tools": weather_tools(),
+        });
+        let f = fake_codex(&body, None, "Sunny, with a high of 24.");
+        assert_eq!(f.completion["choices"][0]["finish_reason"], "stop");
+        assert_eq!(f.completion["choices"][0]["message"]["content"], "Sunny, with a high of 24.");
+        // No model named: Codex's own default runs, and the completion says whose it was.
+        assert_eq!(f.model, None);
+        assert_eq!(f.completion["model"], CODEX_PROVIDER_ID);
+
+        // The model sees what it called, in the form it was taught…
+        let call = "[assistant]\n```tool_call\n{\"tool\":\"get_weather\",\"input\":{\"city\":\"Perth\"}}\n```";
+        let call_at = f.prompt.find(call).unwrap_or_else(|| panic!("the earlier call is replayed: {}", f.prompt));
+        // …and what came back, as the line the preamble told it to expect, after the call.
+        let result = "tool_result get_weather: {\"sky\":\"sunny\",\"high\":24}";
+        let result_at = f.prompt.find(result).unwrap_or_else(|| panic!("the result is carried: {}", f.prompt));
+        assert!(call_at < result_at);
+        assert!(f.prompt.ends_with(result), "the result is the latest thing it reads: {}", f.prompt);
+        // A replayed call parses back as the call it was, so the history agrees with the preamble.
+        let replayed = &call["[assistant]\n".len()..];
+        let tools = offered_tools(&body);
+        assert_eq!(chat_tools::parse_prompted(replayed, &tools).map(|c| c.input), Some(json!({ "city": "Perth" })));
+
+        // A second call, and its result, in a longer loop: each one is carried, in order.
+        let mut longer = body.clone();
+        let messages = longer["messages"].as_array_mut().unwrap();
+        messages.push(json!({ "role": "assistant", "content": "Checking tomorrow too.", "tool_calls": [{
+            "id": "call_def", "type": "function",
+            "function": { "name": "get_weather", "arguments": "{\"city\":\"Perth\",\"day\":\"tomorrow\"}" },
+        }] }));
+        messages.push(json!({ "role": "tool", "tool_call_id": "call_def", "content": "rain" }));
+        let f = fake_codex(&longer, None, "Sunny today, rain tomorrow.");
+        let first = f.prompt.find("tool_result get_weather: {\"sky\"").unwrap();
+        let said = f.prompt.find("[assistant]\nChecking tomorrow too.\n\n```tool_call").unwrap();
+        let second = f.prompt.find("tool_result get_weather: rain").unwrap();
+        assert!(first < said && said < second, "{}", f.prompt);
+    }
+
+    #[test]
+    fn with_tools_withdrawn_the_model_is_asked_to_answer_from_the_results() {
+        // The tunnel's switch: no tools this turn, but results already in the
+        // conversation — the instruction to answer from them, not the preamble.
+        let mut body = ask(weather_tools());
+        body["tool_choice"] = json!("none");
+        body["messages"].as_array_mut().unwrap().push(json!({ "role": "tool", "name": "get_weather", "content": "sunny" }));
+        let plan = plan_turn(&body, None).unwrap();
+        assert!(plan.tools.is_empty());
+        assert!(plan.prompt.starts_with(chat_tools::plain_answer_instruction()), "{}", plan.prompt);
+        assert!(plan.prompt.ends_with("tool_result get_weather: sunny"), "{}", plan.prompt);
+        // A fenced reply with no tools offered is just text.
+        let f = fake_codex(&body, None, "```tool_call\n{\"tool\":\"get_weather\",\"input\":{}}\n```");
+        assert_eq!(f.completion["choices"][0]["finish_reason"], "stop");
+    }
+
+    #[test]
+    fn only_function_tools_with_a_name_are_taught() {
+        let body = json!({ "tools": [
+            { "type": "function", "function": { "name": "a" } },
+            { "function": { "name": "no_type", "parameters": "not a schema" } },
+            { "type": "custom", "custom": { "name": "grammar_tool" } },
+            { "type": "function", "function": { "name": "  " } },
+            { "type": "function" },
+        ]});
+        let tools = offered_tools(&body);
+        let names: Vec<&str> = tools.iter().map(|t| t.name.as_str()).collect();
+        assert_eq!(names, ["a", "no_type"]);
+        assert_eq!(tools[1].input_schema, json!({ "type": "object" }), "a bad schema is replaced, not taught");
+    }
+
+    #[test]
+    fn a_conversation_without_tools_renders_exactly_as_before() {
+        // The tunnel hands tool-free bodies to this route's code (its plain
+        // chat, and its own prompted loop as one user message); a drift here
+        // would change what FormLogic's chat sends ChatGPT.
+        for body in [
+            json!({ "messages": [
+                { "role": "system", "content": "be terse" },
+                { "role": "user", "content": [{ "type": "text", "text": "2+2?" }] },
+                { "role": "assistant", "content": "4" },
+                { "role": "user", "content": "" },
+                { "role": "user", "content": "and 3+3?" },
+            ]}),
+            json!({ "model": "gpt-5.5", "messages": [{ "role": "user", "content": "You can use tools…\n\n```tool_call\n{}\n```\n\nuser: hi\n\ntool_result x: 1" }] }),
+            json!({ "messages": [{ "role": "developer", "content": "d" }, { "role": "function", "content": "f" }] }),
+        ] {
+            assert_eq!(render_messages(&body), flatten_prompt(&body), "{body}");
+            let plan = plan_turn(&body, None).unwrap();
+            assert_eq!(plan.prompt, flatten_prompt(&body));
+            assert!(plan.tools.is_empty());
+        }
+        // …and its completion is the one it always was.
+        let f = fake_codex(&json!({ "messages": [{ "role": "user", "content": "hi" }] }), None, "hello");
+        assert_eq!(f.completion["choices"][0], json!({ "index": 0, "message": { "role": "assistant", "content": "hello" }, "finish_reason": "stop" }));
+        assert_eq!(f.streamed, "hello");
+        assert!(plan_turn(&json!({ "messages": [], "tools": weather_tools() }), None).is_err(), "tools alone are no conversation");
+    }
+
+    #[test]
+    fn a_live_call_alias_is_untouched_by_tools() {
+        // The aliases keep the prompt, the model and the plain answer they
+        // always had: a phone call's callers depend on exactly that.
+        let mut body = ask(weather_tools());
+        body["messages"].as_array_mut().unwrap().push(json!({ "role": "tool", "tool_call_id": "x", "content": "sunny" }));
+        for alias in LiveCallAlias::all() {
+            let plan = plan_turn(&body, Some(alias)).unwrap();
+            assert_eq!(plan.prompt, flatten_prompt(&body), "{alias:?}");
+            assert!(plan.tools.is_empty(), "{alias:?}");
+            assert_eq!(plan.model.as_deref(), Some(alias.model()));
+            let reply = "```tool_call\n{\"tool\":\"end_call\",\"input\":{}}\n```";
+            let f = fake_codex(&body, Some(alias), reply);
+            assert_eq!(f.completion["choices"][0]["finish_reason"], "stop", "{alias:?}");
+            assert_eq!(f.completion["choices"][0]["message"]["content"], reply);
+            assert_eq!(f.completion["model"], alias.model());
+            assert_eq!(f.streamed, reply, "nothing held back on an alias");
+        }
     }
 
     #[test]

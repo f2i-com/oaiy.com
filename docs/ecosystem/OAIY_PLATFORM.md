@@ -49,7 +49,12 @@ Where its README and its code disagree, the code is recorded.
   `/api/ai/providers/:id/v1/chat/completions`, with the aliases `-none`, `-low` (gpt-5.5),
   `-luna-low`, `-luna-low-fast` (gpt-5.6-luna, the fast one with `serviceTier:"priority"`),
   which Aokie recognises by URL.
-- The local HTTP route buffers the answer; deltas stream only through the remote tunnel.
+- The generic route honours `tools` by prompted tool use (`ai/chat_tools.rs`, as the tunnel
+  does): the catalogue is taught in a preamble, earlier `tool_calls` and `tool` results are
+  written into the prompt, and a reply that is exactly one fenced `tool_call` block naming an
+  offered tool comes back as an OpenAI `tool_calls` message (`finish_reason: "tool_calls"`).
+  With `stream: true` it answers in `chat.completion.chunk` events, holding text back only
+  while it could still be a tool call. The aliases answer as before: buffered, no tools.
 
 ## The FormLogic bridge
 

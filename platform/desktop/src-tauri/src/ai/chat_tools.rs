@@ -144,7 +144,14 @@ pub fn as_openai_tools(tools: &[Tool]) -> Vec<Value> {
 /// The preamble that teaches a prompt-only model the catalogue and the one
 /// reply convention the parser accepts.
 pub fn preamble(tools: &[Tool]) -> String {
-    let mut s = String::from("You can use tools from the linked account in this conversation.\n\nAvailable tools:\n");
+    preamble_with_intro("You can use tools from the linked account in this conversation.", tools)
+}
+
+/// [`preamble`], opened with a sentence of the caller's own: the reply
+/// convention and the catalogue are the same whoever offers the tools, but not
+/// every caller's tools come from a linked account.
+pub fn preamble_with_intro(intro: &str, tools: &[Tool]) -> String {
+    let mut s = format!("{intro}\n\nAvailable tools:\n");
     for t in tools {
         s.push_str(&format!(
             "- {}: {}\n  input schema: {}\n",
@@ -198,6 +205,28 @@ pub fn parse_prompted(reply: &str, tools: &[Tool]) -> Option<ToolCall> {
             .cloned()
             .unwrap_or_else(|| json!({})),
     })
+}
+
+/// Whether a reply that has only got as far as `prefix` could still turn out
+/// to be a call [`parse_prompted`] accepts.
+///
+/// For a caller streaming the reply as it arrives: while this is true the text
+/// must be held back, because showing a call's fenced block to the reader
+/// would show them the machinery instead of the result. Once it is false the
+/// reply can only be an answer, and everything can flow. Beside the parser so
+/// the two read the same fence.
+pub fn may_be_prompted_call(prefix: &str) -> bool {
+    let t = prefix.trim_start();
+    t.is_empty() || FENCE.starts_with(t) || t.starts_with(FENCE)
+}
+
+/// The block a prompt-only model writes to call `name` — what
+/// [`parse_prompted`] reads back. For replaying a call the model made earlier
+/// in the form it was taught, so its own history agrees with the preamble.
+pub fn prompted_call_block(name: &str, input: &Value) -> String {
+    // Written out rather than through `json!`, so `tool` comes first as the
+    // preamble shows it, whatever key order this build's serde_json keeps.
+    format!("{FENCE}\n{{\"tool\":{},\"input\":{input}}}\n```", Value::String(name.to_string()))
 }
 
 /// Read an OpenAI-dialect reply's `tool_calls`.
@@ -351,10 +380,18 @@ pub fn proposal_frame(call: &ToolCall, request_id: &str) -> Value {
 
 /// What a tool result looks like fed back to the model.
 pub fn result_for_model(call: &ToolCall, outcome: &Executed) -> String {
-    let mut rendered = match outcome {
+    let rendered = match outcome {
         Executed::Ok(value) => value.to_string(),
         Executed::Failed { error, .. } => json!({ "error": error }).to_string(),
     };
+    tool_result_line(&call.name, rendered)
+}
+
+/// A tool's result as the prompt-only model reads it: the `tool_result` line
+/// the preamble tells it to expect, clipped to what a prompt can carry. For a
+/// caller that already holds the result as text (an OpenAI `tool` message)
+/// rather than as an [`Executed`].
+pub fn tool_result_line(name: &str, mut rendered: String) -> String {
     if rendered.len() > MAX_RESULT_MODEL_BYTES {
         // On a char boundary: slicing mid-codepoint would panic.
         let mut cut = MAX_RESULT_MODEL_BYTES;
@@ -364,7 +401,7 @@ pub fn result_for_model(call: &ToolCall, outcome: &Executed) -> String {
         rendered.truncate(cut);
         rendered.push_str(" … [truncated]");
     }
-    format!("tool_result {}: {rendered}", call.name)
+    format!("tool_result {name}: {rendered}")
 }
 
 /// The outcome of waiting for an approval.
@@ -541,6 +578,40 @@ mod tests {
             &tools(),
         );
         assert_eq!(call.map(|c| c.name).as_deref(), Some("list_apps"));
+    }
+
+    #[test]
+    fn a_stream_is_held_only_while_it_could_still_be_the_taught_call() {
+        // Held: nothing yet, whitespace, any prefix of the fence, the fence and beyond.
+        for held in ["", "  \n", "`", "``", "```", "```tool", "  ```tool_call", "```tool_call\n{\"tool\":"] {
+            assert!(may_be_prompted_call(held), "{held:?}");
+        }
+        // Released: once no call can follow, it is an answer.
+        for answer in ["S", "Sure", "```json", "``x", "  I'll check", "```tool_cal!"] {
+            assert!(!may_be_prompted_call(answer), "{answer:?}");
+        }
+    }
+
+    #[test]
+    fn a_replayed_call_reads_back_as_the_call_it_was() {
+        let block = prompted_call_block("create_form", &json!({ "title": "Contact" }));
+        assert!(block.starts_with("```tool_call\n{\"tool\":\"create_form\",\"input\":"), "{block}");
+        let call = parse_prompted(&block, &tools()).expect("the block is the taught shape");
+        assert_eq!((call.name.as_str(), call.input), ("create_form", json!({ "title": "Contact" })));
+        // A name that needs escaping stays one JSON string.
+        assert!(prompted_call_block("a\"b", &json!({})).contains("\"tool\":\"a\\\"b\""));
+    }
+
+    #[test]
+    fn a_result_held_as_text_reads_as_the_line_the_preamble_promises() {
+        assert_eq!(tool_result_line("list_apps", "[]".into()), "tool_result list_apps: []");
+        let long = tool_result_line("list_apps", "é".repeat(MAX_RESULT_MODEL_BYTES));
+        assert!(long.ends_with(" … [truncated]"));
+        // The preamble's own opening can be the caller's; the convention is the same.
+        let text = preamble_with_intro("You can use these tools in this conversation.", &tools());
+        assert!(text.starts_with("You can use these tools in this conversation.\n\nAvailable tools:\n"));
+        assert!(text.contains(FENCE));
+        assert_eq!(preamble(&tools()).split_once('\n').unwrap().1, text.split_once('\n').unwrap().1);
     }
 
     #[test]

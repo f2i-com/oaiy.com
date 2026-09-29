@@ -291,6 +291,16 @@ async fn chat_impl(st: &AiState, provider_id: Option<&str>, mut body: Value) -> 
             o.remove("provider");
         }
         let codex = st.codex.clone();
+        // The generic route streams when asked, as an agent loop asks. A
+        // live-call alias answers as it always has: one buffered completion.
+        if codex_alias.is_none() && body.get("stream").and_then(Value::as_bool) == Some(true) {
+            let model = body
+                .get("model")
+                .and_then(Value::as_str)
+                .unwrap_or(super::codex::CODEX_PROVIDER_ID)
+                .to_string();
+            return codex_stream(model, move |emit| codex.chat_streaming(&body, None, emit)).await;
+        }
         return match tokio::task::spawn_blocking(move || codex.chat_as(&body, codex_alias)).await {
             Ok(Ok(v)) => (StatusCode::OK, Json(v)).into_response(),
             Ok(Err(e)) => codex_err(e),
@@ -396,6 +406,149 @@ async fn models_for(State(st): State<AiState>, Path(id): Path<String>) -> Respon
         Ok(v) => (StatusCode::OK, Json(v)).into_response(),
         Err(e) => gateway_err(e),
     }
+}
+
+/// What a ChatGPT turn running on its blocking thread hands back.
+enum CodexEvent {
+    Delta(String),
+    Done(Result<Value, super::codex::CodexError>),
+}
+
+/// The generic ChatGPT route's answer as OpenAI chat-completion chunks, for a
+/// caller that asked for `stream: true` (the Agent app always does).
+///
+/// The turn runs on a blocking thread and its fragments come back through a
+/// channel. The response is chosen when the FIRST thing arrives: a failure
+/// before any text is an ordinary error with its own status — signed out stays
+/// a 428 the caller can act on, not a 200 stream carrying an error — and
+/// anything else opens the stream. The buffered completion closes it and is
+/// the authority: a tool call goes out as a `tool_calls` chunk, and text the
+/// stream held back (a reply that began like a tool call and was not one) as a
+/// last content chunk.
+async fn codex_stream<F>(model: String, turn: F) -> Response
+where
+    F: FnOnce(&mut dyn FnMut(&str)) -> Result<Value, super::codex::CodexError> + Send + 'static,
+{
+    let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<CodexEvent>();
+    tokio::task::spawn_blocking(move || {
+        let deltas = tx.clone();
+        let done = turn(&mut |d: &str| {
+            let _ = deltas.send(CodexEvent::Delta(d.to_string()));
+        });
+        let _ = tx.send(CodexEvent::Done(done));
+    });
+    let first = match rx.recv().await {
+        Some(CodexEvent::Done(Err(e))) => return codex_err(e),
+        Some(event) => event,
+        None => {
+            return ai_error(StatusCode::INTERNAL_SERVER_ERROR, "internal", "the ChatGPT turn stopped without an answer".into())
+        }
+    };
+
+    let head = ChunkHead {
+        id: format!("chatcmpl-{}", uuid::Uuid::new_v4().simple()),
+        created: std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0),
+        model,
+    };
+    let (out, out_rx) = tokio::sync::mpsc::unbounded_channel::<String>();
+    tokio::spawn(async move {
+        // A reader that went away makes these sends fail; the turn still ends on its own.
+        let _ = out.send(head.data(json!({ "role": "assistant", "content": "" }), None));
+        let mut streamed = String::new();
+        let mut next = Some(first);
+        loop {
+            let event = match next.take() {
+                Some(e) => e,
+                None => match rx.recv().await {
+                    Some(e) => e,
+                    None => break,
+                },
+            };
+            match event {
+                CodexEvent::Delta(d) => {
+                    streamed.push_str(&d);
+                    let _ = out.send(head.data(json!({ "content": d }), None));
+                }
+                CodexEvent::Done(Ok(completion)) => {
+                    for chunk in closing_chunks(&head, &completion, &streamed) {
+                        let _ = out.send(chunk);
+                    }
+                    break;
+                }
+                CodexEvent::Done(Err(e)) => {
+                    let error = json!({ "error": { "code": e.code(), "message": e.message() } });
+                    let _ = out.send(format!("data: {error}\n\n"));
+                    break;
+                }
+            }
+        }
+        let _ = out.send("data: [DONE]\n\n".to_string());
+    });
+
+    let body = axum::body::Body::from_stream(futures_util::stream::unfold(out_rx, |mut rx| async move {
+        rx.recv().await.map(|chunk| (Ok::<_, std::convert::Infallible>(chunk), rx))
+    }));
+    Response::builder()
+        .status(StatusCode::OK)
+        .header(axum::http::header::CONTENT_TYPE, "text/event-stream")
+        .header(axum::http::header::CACHE_CONTROL, "no-cache")
+        .body(body)
+        .unwrap_or_else(|_| ai_error(StatusCode::INTERNAL_SERVER_ERROR, "internal", "stream build failed".into()))
+}
+
+/// What every chunk of one streamed completion repeats.
+struct ChunkHead {
+    id: String,
+    created: u64,
+    model: String,
+}
+
+impl ChunkHead {
+    /// One `chat.completion.chunk` event.
+    fn data(&self, delta: Value, finish_reason: Option<&str>) -> String {
+        let chunk = json!({
+            "id": self.id,
+            "object": "chat.completion.chunk",
+            "created": self.created,
+            "model": self.model,
+            "choices": [{ "index": 0, "delta": delta, "finish_reason": finish_reason }],
+        });
+        format!("data: {chunk}\n\n")
+    }
+}
+
+/// The chunks that close a streamed turn, from its buffered completion and the
+/// text already streamed (always a prefix of the completion's text: the held
+/// fragments were released whole, or not at all).
+fn closing_chunks(head: &ChunkHead, completion: &Value, streamed: &str) -> Vec<String> {
+    let choice = completion.pointer("/choices/0").cloned().unwrap_or(Value::Null);
+    let finish = choice.get("finish_reason").and_then(Value::as_str).unwrap_or("stop");
+    let message = choice.get("message").cloned().unwrap_or(Value::Null);
+    let mut out = Vec::new();
+    if let Some(calls) = message.get("tool_calls").and_then(Value::as_array).filter(|c| !c.is_empty()) {
+        // A streamed tool call carries its position in the reply's list.
+        let calls: Vec<Value> = calls
+            .iter()
+            .enumerate()
+            .map(|(i, c)| {
+                let mut c = c.clone();
+                c["index"] = json!(i);
+                c
+            })
+            .collect();
+        out.push(head.data(json!({ "tool_calls": calls }), None));
+    } else {
+        let content = message.get("content").and_then(Value::as_str).unwrap_or_default();
+        let rest = content.strip_prefix(streamed).unwrap_or_default();
+        if !rest.is_empty() {
+            out.push(head.data(json!({ "content": rest }), None));
+        }
+    }
+    out.push(head.data(json!({}), Some(finish)));
+    out
 }
 
 /// Pipe an upstream streaming response straight through as `text/event-stream`.
@@ -603,6 +756,112 @@ mod tests {
         assert_eq!(chosen_model(&json!({})), "");
         let p = engine_provider("http://127.0.0.1:8080".into(), "b".into());
         assert_eq!((p.id.as_str(), p.model.as_deref(), p.allow_local), (ENGINE_PROVIDER_ID, Some("b"), true));
+    }
+
+    // ---- ChatGPT's streamed answer, against a fake codex ----
+
+    use crate::ai::codex::CodexError;
+
+    /// A turn as the route runs it, with a fake codex answering `reply` in
+    /// small fragments: the real completion code around a fake child.
+    fn fake_turn(body: Value, reply: &'static str) -> impl FnOnce(&mut dyn FnMut(&str)) -> Result<Value, CodexError> + Send + 'static {
+        move |emit| {
+            crate::ai::codex::complete_with(&body, None, emit, |_prompt, _model, fragment| {
+                let chars: Vec<char> = reply.chars().collect();
+                for piece in chars.chunks(4) {
+                    fragment(&piece.iter().collect::<String>());
+                }
+                Ok(reply.to_string())
+            })
+        }
+    }
+
+    fn with_tools() -> Value {
+        json!({
+            "stream": true,
+            "messages": [{ "role": "user", "content": "Weather in Perth?" }],
+            "tools": [{ "type": "function", "function": { "name": "get_weather", "parameters": { "type": "object" } } }],
+        })
+    }
+
+    /// The events of a streamed answer, and whether it ended with `[DONE]`.
+    async fn events_of(resp: Response) -> (Vec<Value>, bool) {
+        assert_eq!(resp.status(), StatusCode::OK);
+        assert_eq!(resp.headers()[axum::http::header::CONTENT_TYPE], "text/event-stream");
+        let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+        let text = String::from_utf8(bytes.to_vec()).unwrap();
+        let data: Vec<&str> = text.split("\n\n").filter_map(|e| e.strip_prefix("data: ")).collect();
+        let done = data.last() == Some(&"[DONE]");
+        (data.iter().filter(|d| **d != "[DONE]").map(|d| serde_json::from_str(d).unwrap()).collect(), done)
+    }
+
+    fn streamed_text(events: &[Value]) -> String {
+        events.iter().filter_map(|e| e.pointer("/choices/0/delta/content").and_then(Value::as_str)).collect()
+    }
+
+    #[tokio::test]
+    async fn a_streamed_answer_arrives_as_openai_chunks() {
+        let reply = "Sunny, 24 degrees.";
+        let (events, done) = events_of(codex_stream("gpt-5.5".into(), fake_turn(with_tools(), reply)).await).await;
+        assert!(done, "the stream ends with [DONE]");
+        assert_eq!(events[0]["choices"][0]["delta"]["role"], "assistant");
+        for e in &events {
+            assert_eq!(e["object"], "chat.completion.chunk");
+            assert_eq!(e["model"], "gpt-5.5");
+            assert_eq!(e["id"], events[0]["id"], "one id for the whole answer");
+        }
+        assert!(events.len() > 3, "it arrives in pieces, not at once: {events:?}");
+        assert_eq!(streamed_text(&events), reply);
+        let last = events.last().unwrap();
+        assert_eq!(last["choices"][0]["finish_reason"], "stop");
+        assert_eq!(last["choices"][0]["delta"], json!({}));
+    }
+
+    #[tokio::test]
+    async fn a_streamed_tool_call_arrives_as_a_tool_calls_chunk() {
+        let reply = "```tool_call\n{\"tool\":\"get_weather\",\"input\":{\"city\":\"Perth\"}}\n```";
+        let (events, done) = events_of(codex_stream("x".into(), fake_turn(with_tools(), reply)).await).await;
+        assert!(done);
+        assert_eq!(streamed_text(&events), "", "no text of the call is shown");
+        let calls: Vec<&Value> = events.iter().filter_map(|e| e.pointer("/choices/0/delta/tool_calls")).collect();
+        assert_eq!(calls.len(), 1, "{events:?}");
+        let call = &calls[0][0];
+        assert_eq!(call["index"], 0);
+        assert!(call["id"].as_str().unwrap().starts_with("call_"));
+        assert_eq!(call["type"], "function");
+        assert_eq!(call["function"]["name"], "get_weather");
+        assert_eq!(serde_json::from_str::<Value>(call["function"]["arguments"].as_str().unwrap()).unwrap(), json!({ "city": "Perth" }));
+        assert_eq!(events.last().unwrap()["choices"][0]["finish_reason"], "tool_calls");
+    }
+
+    #[tokio::test]
+    async fn a_streamed_reply_that_only_looked_like_a_call_still_arrives_whole() {
+        let reply = "```tool_call\n{\"tool\":\"not_offered\",\"input\":{}}\n```";
+        let (events, _) = events_of(codex_stream("x".into(), fake_turn(with_tools(), reply)).await).await;
+        assert_eq!(streamed_text(&events), reply, "held back, then given as the answer");
+        assert_eq!(events.last().unwrap()["choices"][0]["finish_reason"], "stop");
+        assert!(events.iter().all(|e| e.pointer("/choices/0/delta/tool_calls").is_none()));
+    }
+
+    #[tokio::test]
+    async fn a_failure_before_any_text_keeps_its_status() {
+        // Signed out stays a 428 the caller can act on, not a 200 stream holding an error.
+        let resp = codex_stream("x".into(), |_emit: &mut dyn FnMut(&str)| Err(CodexError::NotAuthenticated)).await;
+        assert_eq!(resp.status(), StatusCode::PRECONDITION_REQUIRED);
+        let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+        let v: Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(v["error"]["code"], "codex_not_authenticated");
+
+        // A failure after text has streamed can only be said in the stream.
+        let resp = codex_stream("x".into(), |emit: &mut dyn FnMut(&str)| {
+            emit("Half an ans");
+            Err(CodexError::Rpc("turn/start timed out".into()))
+        })
+        .await;
+        let (events, done) = events_of(resp).await;
+        assert!(done);
+        assert_eq!(streamed_text(&events), "Half an ans");
+        assert_eq!(events.last().unwrap()["error"]["message"], "turn/start timed out");
     }
 
     #[test]
