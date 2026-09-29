@@ -2269,8 +2269,10 @@ mod tests {
     #[test]
     fn a_redirect_is_followed_as_it_always_was_but_the_credential_does_not_go_with_it() {
         // This lane's redirect policy is the client's default, unchanged. What is
-        // not followed is the bearer, which reqwest drops on the way to another
-        // origin (the sealed flow lane, by contrast, follows no redirect at all).
+        // not followed is the bearer, which reqwest drops on the way to another host
+        // or port (this moves it to another port; it does not drop it for a change
+        // of scheme alone). The sealed flow lane, by contrast, follows no redirect
+        // at all.
         let elsewhere = Provider::start(|_| Reply::ok(r#"{"runs":[]}"#));
         let moved_to = format!("{}/moved", elsewhere.base);
         let origin = Provider::start(move |_| Reply::redirect(307, &moved_to));

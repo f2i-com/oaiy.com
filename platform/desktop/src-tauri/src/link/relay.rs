@@ -947,7 +947,8 @@ mod tests {
     fn a_redirect_is_followed_as_it_always_was_but_the_credential_does_not_go_with_it() {
         // The redirect policy of this lane is the client's default, unchanged: a
         // provider that moves the queue is followed. What is not followed is the
-        // bearer, which reqwest drops on the way to another origin.
+        // bearer, which reqwest drops on the way to another host or port (this
+        // moves it to another port; it does not drop it for a change of scheme alone).
         let elsewhere = Provider::start(|_| Reply::ok(r#"{"commands":[]}"#));
         let moved_to = format!("{}/moved", elsewhere.base);
         let origin = Provider::start(move |_| Reply::redirect(307, &moved_to));
