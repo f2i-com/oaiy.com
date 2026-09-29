@@ -115,6 +115,8 @@ pub struct Status {
     pub pending_restore: Option<restore::PendingInfo>,
     pub last_restore: Option<restore::LastRestore>,
     pub undo_available: bool,
+    /// `restore` or `undo`: what made the newest snapshot (the button undoes a restore, and redoes an undo).
+    pub undo_kind: Option<String>,
     pub running: Option<Running>,
 }
 
@@ -128,6 +130,7 @@ pub fn status(data_dir: &Path) -> Status {
         pending_restore: restore::pending_info(data_dir),
         last_restore: restore::last_restore(data_dir),
         undo_available: restore::undo_available(data_dir),
+        undo_kind: restore::undo_kind(data_dir),
         running: running(),
     }
 }

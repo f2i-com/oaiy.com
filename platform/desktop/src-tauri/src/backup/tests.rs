@@ -959,7 +959,9 @@ fn undo_puts_back_what_was_replaced_and_takes_away_what_was_added() {
     let ApplyOutcome::Applied(done) = restore::apply_pending(&dst.0) else { panic!("the undo should be applied") };
     assert_eq!(done.kind, "undo");
     assert_eq!(snapshot(&dst.0), before, "everything is as it was before the restore");
-    assert!(!restore::undo_available(&dst.0), "an undo uses up its snapshot");
+    // An undo keeps a snapshot of what it replaced and took away, so it can be put back (a redo).
+    assert!(restore::undo_available(&dst.0), "the undo's own snapshot is kept");
+    assert_eq!(restore::undo_kind(&dst.0).as_deref(), Some("undo"));
     assert!(matches!(restore::apply_pending(&dst.0), ApplyOutcome::None));
 }
 
@@ -1764,7 +1766,8 @@ fn what_a_killed_backup_or_restore_leaves_behind_is_swept_at_the_start() {
     put(&dst.0.join("backup").join("scratch").join("aaaaaaaaaaaaaaaa"), "tree/f000001", b"a plaintext copy");
     put(&dst.0.join("backup").join("scratch").join("aaaaaaaaaaaaaaaa"), "plain.zip", b"a decrypted backup");
     put(&dst.0.join("restore").join("pending-bbbbbbbbbbbbbbbb"), "files/callers.json", b"orphan");
-    put(&dst.0.join("restore").join("undone-cccccccccccccccc"), "files/callers.json", b"set aside");
+    fs::create_dir_all(dst.0.join("restore").join("undo-cccccccccccccccc").join("files").join("sub")).unwrap();
+    put(&dst.0.join("restore").join("undo-eeeeeeeeeeeeeeee"), "files/callers.json", b"the only copy of something");
     put(&dst.0.join("restore").join("undo-dddddddddddddddd"), "files/callers.json", b"a snapshot");
     put(&dst.0.join("restore").join("agent-import"), "current.zip", b"waits for the page");
     let restore_dir = dst.0.join("restore");
@@ -1777,7 +1780,7 @@ fn what_a_killed_backup_or_restore_leaves_behind_is_swept_at_the_start() {
     assert!(!dst.0.join("backup").join("scratch").join("aaaaaaaaaaaaaaaa").exists());
     assert!(!restore_dir.join("pending-bbbbbbbbbbbbbbbb").exists());
     assert!(pending.join("files").join("callers.json").is_file(), "what the marker names stays");
-    assert!(restore_dir.join("undone-cccccccccccccccc").exists(), "while a marker waits the set-aside folder may be needed");
+    assert!(restore_dir.join("undo-cccccccccccccccc").exists(), "while a marker waits a set-aside folder may be needed");
     assert!(restore_dir.join("undo-dddddddddddddddd").exists() && restore_dir.join("agent-import").join("current.zip").is_file());
     assert_eq!(restore::sweep_leftovers(&dst.0), 0, "and there is nothing more to sweep");
 
@@ -1785,9 +1788,10 @@ fn what_a_killed_backup_or_restore_leaves_behind_is_swept_at_the_start() {
     assert!(matches!(restore::apply_pending(&dst.0), ApplyOutcome::Applied(_)));
     assert_eq!(get(&dst.0, "callers.json"), get(&src.0, "callers.json"));
 
-    // With no marker the set-aside folder goes too, and the snapshot and the Agent's import do not.
+    // With no marker an empty set-aside folder goes too; one that holds a file, a snapshot and the Agent's import do not.
     assert_eq!(restore::sweep_leftovers(&dst.0), 1);
-    assert!(!restore_dir.join("undone-cccccccccccccccc").exists());
+    assert!(!restore_dir.join("undo-cccccccccccccccc").exists());
+    assert_eq!(fs::read(restore_dir.join("undo-eeeeeeeeeeeeeeee").join("files").join("callers.json")).unwrap(), b"the only copy of something");
     assert!(restore_dir.join("undo-dddddddddddddddd").exists() && restore_dir.join("agent-import").join("current.zip").is_file());
     let _ = before;
 }
@@ -2510,4 +2514,46 @@ fn the_agents_own_settings_are_listed_and_the_page_is_told_only_what_was_ticked(
     assert!(staged.skipped.iter().any(|l| l.contains("Agent") && l.contains("more than")), "{:?}", staged.skipped);
     assert!(matches!(restore::apply_pending(&target.0), ApplyOutcome::Applied(_)));
     assert!(!agent::import_meta(&target.0).pending, "nothing is left pending for a page that would ignore it");
+}
+
+// ---- an undo keeps what it overwrites or removes ---------------------------------------------------
+
+#[test]
+fn an_undo_keeps_a_redo_snapshot_so_work_done_since_the_restore_is_not_lost() {
+    let src = TempDir::new("redo-src");
+    realistic(&src.0, "A");
+    let out = TempDir::new("redo-out");
+    let file = out.0.join("r.oaiybackup");
+    make(&src.0, &file);
+    let dst = TempDir::new("redo-dst");
+    target(&dst.0);
+    let before = snapshot(&dst.0);
+    restore::stage(&dst.0, &file, PASS, &Ticks::all(), &options()).unwrap();
+    assert!(matches!(restore::apply_pending(&dst.0), ApplyOutcome::Applied(_)));
+    assert_eq!(restore::undo_kind(&dst.0).as_deref(), Some("restore"));
+
+    // Work done after the restore: an edit to a file it replaced, an edit to a file it added, and a new file.
+    put(&dst.0, "callers.json", b"{\"contacts\":[{\"name\":\"Added after the restore\"}]}");
+    put(&dst.0, "calendar/calendar.json", b"{\"appointments\":[{\"id\":\"new\",\"title\":\"Booked after the restore\"}]}");
+    put(&dst.0, "flows/mine.json", b"{\"name\":\"made after the restore\"}");
+    let after_work = snapshot(&dst.0);
+
+    // The undo takes away the restore's files, and puts back what it replaced: the work in them is not in the result...
+    let staged = restore::stage_undo(&dst.0, &options()).unwrap();
+    assert_eq!(staged.kind, "undo");
+    assert!(matches!(restore::apply_pending(&dst.0), ApplyOutcome::Applied(_)));
+    let undone = snapshot(&dst.0);
+    assert_eq!(undone.get("callers.json"), before.get("callers.json"));
+    assert!(!undone.contains_key("calendar/calendar.json"), "the calendar the restore added is taken away");
+    assert!(undone.contains_key("flows/mine.json"), "what the person made since, and the restore never touched, stays");
+    // ...but it is kept, and can be put back.
+    assert!(restore::undo_available(&dst.0));
+    assert_eq!(restore::undo_kind(&dst.0).as_deref(), Some("undo"));
+    assert_eq!(state::status(&dst.0).undo_kind.as_deref(), Some("undo"));
+    let kept = fs::read_dir(dst.0.join("restore")).unwrap().flatten().map(|e| e.path()).find(|p| p.join("undo.json").is_file()).unwrap();
+    assert_eq!(fs::read(kept.join("files").join("callers.json")).unwrap(), b"{\"contacts\":[{\"name\":\"Added after the restore\"}]}");
+    assert!(String::from_utf8_lossy(&fs::read(kept.join("files").join("calendar").join("calendar.json")).unwrap()).contains("Booked after the restore"));
+    restore::stage_undo(&dst.0, &options()).unwrap();
+    assert!(matches!(restore::apply_pending(&dst.0), ApplyOutcome::Applied(_)));
+    assert_eq!(snapshot(&dst.0), after_work, "the redo brings back the work that the undo overwrote and removed");
 }

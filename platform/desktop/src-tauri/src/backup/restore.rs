@@ -218,8 +218,16 @@ struct UndoRecord {
     id: String,
     applied_at: String,
     backup_created_at: String,
+    /// What made this snapshot: a `restore` (it holds what the restore replaced) or an `undo` (it holds
+    /// what the undo replaced and took away: the redo).
+    #[serde(default = "restore_kind")]
+    kind: String,
     replaced: Vec<String>,
     added: Vec<String>,
+}
+
+fn restore_kind() -> String {
+    KIND_RESTORE.to_string()
 }
 
 fn marker_path(data_dir: &Path) -> PathBuf {
@@ -749,6 +757,12 @@ pub fn undo_available(data_dir: &Path) -> bool {
     !undo_dirs(data_dir).is_empty()
 }
 
+/// What the newest snapshot was made by: `restore` (the button undoes it) or `undo` (the button redoes
+/// what the undo took away).
+pub fn undo_kind(data_dir: &Path) -> Option<String> {
+    undo_dirs(data_dir).into_iter().next().map(|(_, record)| record.kind)
+}
+
 /// Stage putting back what the last restore replaced (and taking away what it added), to be applied at the next start.
 pub fn stage_undo(data_dir: &Path, opts: &RestoreOptions) -> Result<Staged> {
     let Some((uid, record)) = undo_dirs(data_dir).into_iter().next() else {
@@ -884,11 +898,10 @@ fn roll_back(data_dir: &Path, staged_root: &Path, holding: &Path, lines: &[Journ
     }
 }
 
+/// Where the files an apply replaces or takes away are kept: for a restore, and for an undo too, so
+/// an undo that overwrites or removes work done since the restore keeps a copy of it (the redo).
 fn holding_of(data_dir: &Path, marker: &Marker) -> PathBuf {
-    match marker.kind.as_str() {
-        KIND_RESTORE => restore_dir(data_dir).join(format!("undo-{}", marker.id)).join("files"),
-        _ => restore_dir(data_dir).join(format!("undone-{}", marker.id)).join("files"),
-    }
+    restore_dir(data_dir).join(format!("undo-{}", marker.id)).join("files")
 }
 
 fn record_last(data_dir: &Path, last: &LastRestore) {
@@ -926,8 +939,13 @@ pub fn sweep_leftovers(data_dir: &Path) -> usize {
         for entry in entries.flatten() {
             let name = entry.file_name().to_string_lossy().into_owned();
             let orphan_pending = name.strip_prefix("pending-").is_some_and(is_id) && named.as_deref() != Some(name.as_str());
-            let orphan_undone = name.strip_prefix("undone-").is_some_and(is_id) && !marker_present;
-            if (orphan_pending || orphan_undone) && entry.file_type().map(|t| t.is_dir()).unwrap_or(false) && std::fs::remove_dir_all(entry.path()).is_ok() {
+            // A set-aside folder that no snapshot record names and no waiting restore may need, and that
+            // holds no file (a file in it is the only copy of something, and stays).
+            let orphan_holding = name.strip_prefix("undo-").is_some_and(is_id) && !marker_present && !entry.path().join("undo.json").exists();
+            let is_dir = entry.file_type().map(|t| t.is_dir()).unwrap_or(false);
+            if orphan_pending && is_dir && std::fs::remove_dir_all(entry.path()).is_ok() {
+                removed += 1;
+            } else if orphan_holding && is_dir && remove_empty_tree(&entry.path()) {
                 removed += 1;
             }
         }
@@ -999,7 +1017,7 @@ fn conclude_failed(data_dir: &Path, marker: &Marker, last: LastRestore) -> Apply
     // What was staged is personal data: it does not stay behind after a failure. The folder that
     // held what was set aside goes only if the rollback emptied it: a file still in it is the only
     // copy of something, and stays.
-    let holding_root = if marker.kind == KIND_RESTORE { dir.join(format!("undo-{}", marker.id)) } else { dir.join(format!("undone-{}", marker.id)) };
+    let holding_root = dir.join(format!("undo-{}", marker.id));
     if marker.kind == KIND_RESTORE {
         let _ = std::fs::remove_dir_all(dir.join(&marker.source));
     }
@@ -1124,19 +1142,20 @@ fn inject_at(index: usize) -> std::result::Result<(), String> {
 fn finalize(data_dir: &Path, marker: &Marker, applied: &[(String, bool)]) -> ApplyOutcome {
     let dir = restore_dir(data_dir);
     let source = dir.join(&marker.source);
-    if marker.kind == KIND_RESTORE {
-        let record = UndoRecord {
-            id: marker.id.clone(),
-            applied_at: now(),
-            backup_created_at: marker.backup_created_at.clone(),
-            replaced: applied.iter().filter(|(_, had)| *had).map(|(r, _)| r.clone()).collect(),
-            added: applied.iter().filter(|(_, had)| !*had).map(|(r, _)| r.clone()).collect(),
-        };
-        let undo_root = dir.join(format!("undo-{}", marker.id));
-        if secret_file::create_private_dir(&undo_root).is_ok() {
-            if let Err(e) = write_json(&undo_root.join("undo.json"), &record) {
-                log::warn!("backup: could not record what the restore replaced: {e}");
-            }
+    // What was replaced or taken away is kept, for a restore and for an undo alike: an undo also
+    // overwrites and removes files, and what a person did in them since is nowhere else.
+    let record = UndoRecord {
+        id: marker.id.clone(),
+        applied_at: now(),
+        backup_created_at: marker.backup_created_at.clone(),
+        kind: marker.kind.clone(),
+        replaced: applied.iter().filter(|(_, had)| *had).map(|(r, _)| r.clone()).collect(),
+        added: applied.iter().filter(|(_, had)| !*had).map(|(r, _)| r.clone()).collect(),
+    };
+    let undo_root = dir.join(format!("undo-{}", marker.id));
+    if secret_file::create_private_dir(&undo_root).is_ok() {
+        if let Err(e) = write_json(&undo_root.join("undo.json"), &record) {
+            log::warn!("backup: could not record what the {} replaced: {e}", marker.kind);
         }
     }
     let mut agent_storage = "none";
@@ -1161,14 +1180,10 @@ fn finalize(data_dir: &Path, marker: &Marker, applied: &[(String, bool)]) -> App
         notes: marker.notes.clone(),
     };
     record_last(data_dir, &last);
-    if marker.kind == KIND_RESTORE {
-        let _ = std::fs::remove_dir_all(&source);
-        prune_undo(data_dir);
-    } else {
-        // An undo uses up the snapshot it put back.
-        let _ = std::fs::remove_dir_all(&source);
-        let _ = std::fs::remove_dir_all(dir.join(format!("undone-{}", marker.id)));
-    }
+    // What was staged, or (for an undo) the snapshot that was just put back, is used up; the new
+    // snapshot, of what this apply replaced, stays.
+    let _ = std::fs::remove_dir_all(&source);
+    prune_undo(data_dir);
     let _ = std::fs::remove_file(journal_path(data_dir));
     let _ = std::fs::remove_file(marker_path(data_dir));
     log::info!("backup: a {} was applied ({} files)", marker.kind, applied.len());
