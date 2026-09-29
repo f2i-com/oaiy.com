@@ -3,14 +3,17 @@ import { ArrowDown, ArrowUp, CalendarDays, Coffee, Copy, Plus, Trash2, Undo2, Vo
 import { calendar, isNotFound, optional, voices, type CalendarService, type CalendarSettings, type CalendarSpan, type VoiceClip } from './api';
 import {
   DAY_NAMES,
+  DEFAULT_RECEPTIONIST,
   DURATIONS,
   STEPS,
   checkSettings,
   copyToOpenDays,
   normalSettings,
   openDay,
+  receptionistName,
   sameHoursWeekdays,
   sameSettings,
+  sayGreeting,
   sayHours,
   sayMinutes,
   withBreak,
@@ -21,11 +24,11 @@ import { moduleOn, useModules } from './useModules';
 import { useVisiblePoll } from './useVisiblePoll';
 
 /**
- * Hours & Services: the business the receptionist speaks for. Its name, when
- * it is open, what callers can book and how long each takes, and the rules
- * the free times follow; then how the phone sounds. The phone reads these
- * when a caller asks what is free, and the setup wizard's "Your business"
- * step is this same form.
+ * Hours & Services: the business the receptionist speaks for. Its name and
+ * the receptionist's, when it is open, what callers can book and how long
+ * each takes, and the rules the free times follow; then how the phone
+ * sounds. The phone reads these when a caller asks what is free, and the
+ * setup wizard's "Your business" step is this same form.
  */
 
 const errText = (e: unknown) => (e instanceof Error ? e.message : String(e));
@@ -58,7 +61,7 @@ export default function HoursPanel({ onOpenCalendar }: { onOpenCalendar?: () => 
             setSettings(s);
             toast.push({ kind: 'success', title: 'Saved', body: 'The receptionist offers these hours and services from now on.' });
           }}
-          after={phoneOn ? <CallVoice business={settings.business} /> : null}
+          after={phoneOn ? <CallVoice business={settings.business} receptionist={settings.receptionist} /> : null}
           onOpenCalendar={onOpenCalendar}
         />
       ) : (
@@ -208,21 +211,38 @@ export function SettingsForm({
   const showSvc = (key: string) => attempted || touched.has(key);
   const openDays = s.hours.filter((d) => d.length).length;
   const firstOpen = s.hours.findIndex((d) => d.length > 0);
-  const greeting = s.business.trim() ? `“Thanks for calling ${s.business.trim()}, how can I help?”` : '“Thanks for calling, how can I help?”';
-
   return (
     <div ref={root} className={`hours-form${embedded ? ' is-embedded' : ''}`}>
       <section className="hours-card hours-business" aria-labelledby="hours-business-title">
         <h3 className="section-title" id="hours-business-title">
           Business
         </h3>
-        <label className="form-row">
-          <span>Its name</span>
-          <input className="hours-business-name" value={s.business} placeholder="As the receptionist says it" onChange={(e) => setS({ ...s, business: e.target.value })} />
-        </label>
-        <p className="form-hint">
-          Callers hear: {greeting}
-        </p>
+        <div className="form-row-pair hours-names">
+          <label className="form-row">
+            <span>Its name</span>
+            <input className="hours-business-name" value={s.business} placeholder="As the receptionist says it" onChange={(e) => setS({ ...s, business: e.target.value })} />
+          </label>
+          <label className="form-row">
+            <span>The receptionist’s name</span>
+            <input
+              className="hours-receptionist-name"
+              value={s.receptionist}
+              placeholder={DEFAULT_RECEPTIONIST}
+              aria-invalid={!!problems.receptionist}
+              aria-describedby="hours-receptionist-hint"
+              onChange={(e) => setS({ ...s, receptionist: e.target.value })}
+            />
+            <small className="form-hint" id="hours-receptionist-hint">
+              What the receptionist calls itself on calls and texts.
+            </small>
+            {problems.receptionist && (
+              <small className="hours-error" role="alert">
+                {problems.receptionist}
+              </small>
+            )}
+          </label>
+        </div>
+        <p className="form-hint hours-greeting">Callers hear: “{sayGreeting(s)}”</p>
       </section>
 
       <section className="hours-card hours-open" aria-labelledby="hours-open-title">
@@ -538,7 +558,7 @@ export function SettingsForm({
  * how long the greeting waits after a call connects. Changes here apply at
  * once (not with the form's Save).
  */
-export function CallVoice({ business }: { business: string }) {
+export function CallVoice({ business, receptionist = '' }: { business: string; receptionist?: string }) {
   const toast = useToast();
   const [list, setList] = useState<VoiceClip[]>([]);
   const [chosen, setChosen] = useState<string | null>(null);
@@ -579,7 +599,7 @@ export function CallVoice({ business }: { business: string }) {
   const hear = async (voice: string) => {
     setSpeaking(voice);
     try {
-      const blob = await voices.hear(voice, `Hi, thanks for calling${business.trim() ? ` ${business.trim()}` : ''}! How can I help you today?`);
+      const blob = await voices.hear(voice, `Hi, thanks for calling${business.trim() ? ` ${business.trim()}` : ''}, this is ${receptionistName({ receptionist })}. How can I help you today?`);
       player.current?.pause();
       const audio = new Audio(URL.createObjectURL(blob));
       player.current = audio;

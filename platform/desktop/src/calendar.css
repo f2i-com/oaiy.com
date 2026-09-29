@@ -715,7 +715,10 @@
 .hours-quick { display: flex; flex-wrap: wrap; gap: 6px; }
 /* A field brought into view (a problem to fix) is not left under the save bar. */
 .hours-form :is(input, select) { scroll-margin: 24px 0 96px; }
-.hours-business .form-row input.hours-business-name { height: 40px; font-family: var(--font-body); font-size: 15px; font-weight: 600; }
+.hours-business .form-row input:is(.hours-business-name, .hours-receptionist-name) { height: 40px; font-family: var(--font-body); font-size: 15px; font-weight: 600; }
+/* The business's name and the receptionist's, side by side (stacked on a narrow window). */
+.hours-names { gap: 12px 14px; }
+.hours-names .hours-error { flex-basis: auto; }
 .hours-summary { color: var(--muted); font-size: 12px; }
 
 .hours-days { display: flex; flex-direction: column; margin: 0; padding: 0; list-style: none; }

@@ -1277,6 +1277,8 @@ export interface CalendarService {
 
 export interface CalendarSettings {
   business: string;
+  /** The name the receptionist calls itself on calls and texts; empty: the phone's own (Aokie). */
+  receptionist: string;
   /** Seven days, Monday first; an empty day is closed. */
   hours: CalendarSpan[][];
   services: CalendarService[];
@@ -1339,8 +1341,9 @@ export interface CalendarSync {
 }
 
 export const calendar = {
+  /** The settings and the appointments from `from` to before `to`; `receptionistName` is the name the receptionist goes by (the one set, or Aokie's). */
   get: (from?: string, to?: string) =>
-    request<{ available?: boolean; settings: CalendarSettings; appointments: Appointment[]; now: string }>(
+    request<{ available?: boolean; receptionistName?: string; settings: CalendarSettings; appointments: Appointment[]; now: string }>(
       `/api/calendar${from || to ? `?${new URLSearchParams({ ...(from ? { from } : {}), ...(to ? { to } : {}) })}` : ''}`,
     ),
   saveSettings: (s: CalendarSettings) => request<CalendarSettings>('/api/calendar/settings', { method: 'PUT', body: JSON.stringify(s) }),

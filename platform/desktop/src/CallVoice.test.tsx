@@ -177,3 +177,31 @@ describe('Greet after the call connects', () => {
     root = createRoot(host);
   });
 });
+
+describe('hearing a voice', () => {
+  it('says the business and the receptionist, as callers hear them', async () => {
+    routes['POST /api/voice/voices/Front%20desk/try'] = () => ({ body: {} });
+    // jsdom plays nothing: the sample is taken as played.
+    vi.spyOn(HTMLMediaElement.prototype, 'play').mockResolvedValue(undefined);
+    vi.spyOn(HTMLMediaElement.prototype, 'pause').mockReturnValue(undefined);
+    await act(async () =>
+      root.render(
+        <ToastProvider>
+          <CallVoice business="Green Lawns" receptionist="Sam" />
+        </ToastProvider>,
+      ),
+    );
+    await act(async () => {});
+    await act(async () => {});
+    const hear = [...host.querySelectorAll('button')].find((b) => b.textContent?.includes('Hear it'))!;
+    await act(async () => hear.click());
+    const tried = fetchMock.mock.calls.filter(([url, init]) => init?.method === 'POST' && String(url).endsWith('/try'));
+    expect(tried).toHaveLength(1);
+    expect(JSON.parse(String(tried[0][1]?.body))).toEqual({ text: 'Hi, thanks for calling Green Lawns, this is Sam. How can I help you today?' });
+    expect(text()).not.toContain('Could not speak');
+    // Closed (it stops the sample) while jsdom's player is still stood in for.
+    act(() => root.unmount());
+    root = createRoot(host);
+    vi.restoreAllMocks();
+  });
+});

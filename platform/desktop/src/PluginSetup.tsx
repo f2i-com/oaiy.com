@@ -793,7 +793,7 @@ function BusinessStep({ onNamed, onSaved }: { onNamed: (named: boolean) => void;
   if (!settings) return error ? <RetryLine message={error} onRetry={() => void load()} /> : <p className="form-hint">Reading the calendar…</p>;
   return (
     <div className="setup-business">
-      <p className="form-hint">What callers hear the business called, when it is open, and what they can book. The same settings as Hours &amp; Services, under the AI Receptionist.</p>
+      <p className="form-hint">What callers hear the business and its receptionist called, when it is open, and what they can book. The same settings as Hours &amp; Services, under the AI Receptionist.</p>
       <SettingsForm
         embedded
         settings={settings}

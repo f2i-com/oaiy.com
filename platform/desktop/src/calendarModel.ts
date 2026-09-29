@@ -315,6 +315,22 @@ export function sayHours(hours: Hours): string {
   return parts.join(' · ');
 }
 
+// ---- who answers --------------------------------------------------------------------
+
+/** What the receptionist is called while no name is set: the phone's (Aokie's) own name for it, as on the desktop. */
+export const DEFAULT_RECEPTIONIST = 'Aokie';
+/** The longest name the receptionist may be given, in characters (the desktop's limit). */
+export const RECEPTIONIST_MAX = 40;
+
+/** The name the receptionist goes by: the one set, or Aokie's. */
+export const receptionistName = (s: Pick<CalendarSettings, 'receptionist'>) => s.receptionist?.trim() || DEFAULT_RECEPTIONIST;
+
+/** What a caller hears first: "Thanks for calling Green Lawns, this is Aokie. How can I help?" */
+export function sayGreeting(s: Pick<CalendarSettings, 'business' | 'receptionist'>): string {
+  const business = s.business?.trim();
+  return `Thanks for calling${business ? ` ${business}` : ''}, this is ${receptionistName(s)}. How can I help?`;
+}
+
 // ---- checks ------------------------------------------------------------------------
 
 export interface ServiceProblems {
@@ -341,6 +357,7 @@ export function checkSpan(s: CalendarSpan): string | null {
 }
 
 export interface SettingsProblems {
+  receptionist?: string;
   /** Day index → span index → message. */
   hours: Record<number, Record<number, string>>;
   services: Record<number, ServiceProblems>;
@@ -353,6 +370,11 @@ export interface SettingsProblems {
 
 export function checkSettings(s: CalendarSettings): SettingsProblems {
   const out: SettingsProblems = { hours: {}, services: {}, list: [] };
+  // Counted as the desktop counts it: characters, once trimmed.
+  if ([...(s.receptionist ?? '').trim()].length > RECEPTIONIST_MAX) {
+    out.receptionist = `At most ${RECEPTIONIST_MAX} characters`;
+    out.list.push(`The receptionist’s name: at most ${RECEPTIONIST_MAX} characters`);
+  }
   s.hours.forEach((day, d) =>
     day.forEach((span, k) => {
       const why = checkSpan(span);
@@ -390,6 +412,7 @@ export function normalSettings(s: CalendarSettings): CalendarSettings {
   return {
     ...s,
     business: s.business ?? '',
+    receptionist: s.receptionist ?? '',
     hours: normalHours(s.hours),
     services: (s.services ?? []).map((x) => ({ ...x, description: x.description ?? '', price: x.price ?? '' })),
   };

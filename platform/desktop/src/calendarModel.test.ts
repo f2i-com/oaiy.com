@@ -11,10 +11,13 @@ import {
   groupTimes,
   layoutDay,
   normalHours,
+  normalSettings,
   openDay,
   pickTime,
+  receptionistName,
   sameHoursWeekdays,
   sameSettings,
+  sayGreeting,
   sayHours,
   sayMinutes,
   sayRange,
@@ -37,6 +40,7 @@ const WEEK = (): CalendarSpan[][] => [
 
 const settings = (patch: Partial<CalendarSettings> = {}): CalendarSettings => ({
   business: 'Green Lawns',
+  receptionist: '',
   hours: WEEK(),
   services: [
     { id: 'mow', name: 'Lawn mowing', minutes: 60, price: 'from $60' },
@@ -219,5 +223,33 @@ describe('the week grid', () => {
     expect(sayMinutes(45)).toBe('45 min');
     expect(sayWeek(new Date(2026, 8, 28))).toBe('28 Sep – 4 Oct 2026');
     expect(sayWeek(new Date(2026, 9, 5))).toBe('5 – 11 Oct 2026');
+  });
+});
+
+describe('who answers', () => {
+  it('the receptionist is Aokie until it is given a name', () => {
+    expect(receptionistName(settings())).toBe('Aokie');
+    expect(receptionistName(settings({ receptionist: '   ' }))).toBe('Aokie');
+    expect(receptionistName(settings({ receptionist: ' Sam ' }))).toBe('Sam');
+  });
+
+  it('the greeting says the business and the receptionist, or only the receptionist', () => {
+    expect(sayGreeting(settings())).toBe('Thanks for calling Green Lawns, this is Aokie. How can I help?');
+    expect(sayGreeting(settings({ business: ' ', receptionist: 'Sam' }))).toBe('Thanks for calling, this is Sam. How can I help?');
+  });
+
+  it('a name of more than 40 characters is a problem, listed first as the card is first', () => {
+    expect(checkSettings(settings({ receptionist: 'A'.repeat(40) })).list).toEqual([]);
+    // Characters, as the desktop counts them: not UTF-16 units, and not the spaces around it.
+    expect(checkSettings(settings({ receptionist: ` ${'😀'.repeat(40)} ` })).receptionist).toBeUndefined();
+    const p = checkSettings(settings({ receptionist: 'A'.repeat(41), slotMinutes: 2 }));
+    expect(p.receptionist).toBe('At most 40 characters');
+    expect(p.list).toEqual(['The receptionist’s name: at most 40 characters', 'Times offered: every 5 to 240 minutes']);
+  });
+
+  it('a desktop from before the name was kept reads as no name', () => {
+    const older: Partial<CalendarSettings> = settings();
+    delete older.receptionist;
+    expect(normalSettings(older as CalendarSettings).receptionist).toBe('');
   });
 });

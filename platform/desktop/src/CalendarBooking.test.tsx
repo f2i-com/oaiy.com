@@ -19,6 +19,7 @@ const day = (n: number) => ymd(addDays(new Date(`${MONDAY}T00:00`), n));
 
 const SETTINGS: CalendarSettings = {
   business: 'Green Lawns',
+  receptionist: '',
   hours: [[{ open: '08:00', close: '17:00' }], [{ open: '08:00', close: '17:00' }], [{ open: '08:00', close: '17:00' }], [], [{ open: '08:00', close: '17:00' }], [], []],
   services: [
     { id: 'mow', name: 'Lawn mowing', minutes: 60, price: 'from $60' },

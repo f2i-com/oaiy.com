@@ -15,6 +15,7 @@ import { ToastProvider } from './Toasts';
 
 const SETTINGS = (): CalendarSettings => ({
   business: 'Green Lawns',
+  receptionist: '',
   hours: [
     [{ open: '08:00', close: '17:00' }],
     [{ open: '09:00', close: '15:00' }],
@@ -174,7 +175,7 @@ describe('saving', () => {
     expect(bar()).toBeNull();
     await act(async () => type(host.querySelector<HTMLInputElement>('.hours-business-name')!, 'Green Lawns & Gardens'));
     expect(bar()?.textContent).toContain('Unsaved changes');
-    expect(text()).toContain('“Thanks for calling Green Lawns & Gardens, how can I help?”');
+    expect(text()).toContain('Callers hear: “Thanks for calling Green Lawns & Gardens, this is Aokie. How can I help?”');
     await act(async () => button('Discard').click());
     expect(bar()).toBeNull();
     expect(host.querySelector<HTMLInputElement>('.hours-business-name')!.value).toBe('Green Lawns');
@@ -198,5 +199,67 @@ describe('saving', () => {
     await act(async () => button('Save').click());
     expect(saveSettings).toHaveBeenCalledTimes(1);
     expect(onSaved).toHaveBeenCalled();
+  });
+});
+
+describe('the business card', () => {
+  const receptionist = () => host.querySelector<HTMLInputElement>('.hours-receptionist-name')!;
+  const greeting = () => host.querySelector('.hours-greeting')?.textContent;
+
+  it('has the receptionist’s name beside the business’s: Aokie until it is given one', async () => {
+    await mount();
+    const card = host.querySelector('.hours-business')!;
+    expect([...card.querySelectorAll('.form-row > span')].map((s) => s.textContent)).toEqual(['Its name', 'The receptionist’s name']);
+    expect(receptionist().value).toBe('');
+    expect(receptionist().placeholder).toBe('Aokie');
+    expect(card.textContent).toContain('What the receptionist calls itself on calls and texts.');
+    expect(document.getElementById(receptionist().getAttribute('aria-describedby')!)?.textContent).toContain('calls itself');
+    expect(greeting()).toBe('Callers hear: “Thanks for calling Green Lawns, this is Aokie. How can I help?”');
+  });
+
+  it('says the name as it is typed, and saves it with the page’s Save', async () => {
+    const onSaved = await mount();
+    await act(async () => type(receptionist(), 'Sam'));
+    expect(greeting()).toBe('Callers hear: “Thanks for calling Green Lawns, this is Sam. How can I help?”');
+    expect(bar()?.textContent).toContain('Unsaved changes');
+    await act(async () => button('Save changes').click());
+    expect(saveSettings).toHaveBeenCalledWith(expect.objectContaining({ business: 'Green Lawns', receptionist: 'Sam' }));
+    expect(onSaved).toHaveBeenCalledWith(expect.objectContaining({ receptionist: 'Sam' }));
+    // With no business named yet, the greeting still says who answers.
+    await act(async () => type(host.querySelector<HTMLInputElement>('.hours-business-name')!, ''));
+    expect(greeting()).toBe('Callers hear: “Thanks for calling, this is Sam. How can I help?”');
+    // Emptied, it is Aokie again.
+    await act(async () => type(receptionist(), '  '));
+    expect(greeting()).toBe('Callers hear: “Thanks for calling, this is Aokie. How can I help?”');
+  });
+
+  it('a name longer than 40 characters is said where it is and in the save bar, and is not sent', async () => {
+    await mount();
+    await act(async () => type(receptionist(), 'A'.repeat(41)));
+    expect(receptionist().getAttribute('aria-invalid')).toBe('true');
+    expect(host.querySelector('.hours-business .hours-error')?.textContent).toBe('At most 40 characters');
+    expect(bar()?.textContent).toContain('The receptionist’s name: at most 40 characters');
+    await act(async () => button('Save changes').click());
+    expect(saveSettings).not.toHaveBeenCalled();
+    // Forty is fine (spaces around it are not counted).
+    await act(async () => type(receptionist(), ` ${'A'.repeat(40)} `));
+    expect(receptionist().getAttribute('aria-invalid')).toBe('false');
+    expect(host.querySelector('.hours-business .hours-error')).toBeNull();
+    await act(async () => button('Save changes').click());
+    expect(saveSettings).toHaveBeenCalledTimes(1);
+  });
+
+  it('shows a name set elsewhere (by the Agent), and the setup wizard’s step has the field too', async () => {
+    await mount({ settings: { ...SETTINGS(), receptionist: 'Sam' } });
+    expect(receptionist().value).toBe('Sam');
+    expect(greeting()).toContain('this is Sam.');
+    act(() => root.unmount());
+    root = createRoot(host);
+
+    await mount({ embedded: true });
+    expect(host.querySelector('.hours-form.is-embedded .hours-receptionist-name')).not.toBeNull();
+    await act(async () => type(receptionist(), 'Sam'));
+    await act(async () => button('Save changes').click());
+    expect(saveSettings).toHaveBeenCalledWith(expect.objectContaining({ receptionist: 'Sam' }));
   });
 });
