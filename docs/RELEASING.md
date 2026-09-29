@@ -124,6 +124,13 @@ nobody), and no installed OAIY can be fixed afterwards. The key is used on a pro
 nothing of it is printed: the CLI reads the key from its file and the password from the
 environment, and the check prints only whether the signature verifies.
 
+The CLI is the one `npm ci` installs from the desktop app's lockfile, called by its path (once,
+if `platform/desktop` has no `node_modules`: `npm ci --ignore-scripts` in it, as the `sign` job does).
+**Not `npx tauri`**: when the package is not installed, `npx` fetches whatever the registry
+serves under that name and runs it, and here it would run with the production key and its password
+in its environment. The path can run only what the lockfile pinned, and the `sign` job does the
+same (`npx --no-install` would be as safe; the path needs no PATH lookup either).
+
 From the repository's root, in PowerShell (the key and its password are in
 `%USERPROFILE%\.oaiy-signing`, as above):
 
@@ -133,9 +140,7 @@ $probe = Join-Path $env:TEMP 'oaiy-signing-probe.txt'
 Set-Content -LiteralPath $probe -Value 'probe' -NoNewline
 $env:TAURI_SIGNING_PRIVATE_KEY_PATH = Join-Path $dir 'oaiy-updater.key'
 $env:TAURI_SIGNING_PRIVATE_KEY_PASSWORD = (Get-Content -LiteralPath (Join-Path $dir 'oaiy-updater.key.password.txt') -Raw).Trim()
-Push-Location platform\desktop
-npx tauri signer sign $probe | Out-Null
-Pop-Location
+& platform\desktop\node_modules\.bin\tauri.cmd signer sign $probe | Out-Null
 Remove-Item Env:\TAURI_SIGNING_PRIVATE_KEY_PATH, Env:\TAURI_SIGNING_PRIVATE_KEY_PASSWORD
 node platform\scripts\verify-signature.mjs $probe
 Remove-Item -LiteralPath $probe, "$probe.sig"
@@ -146,9 +151,9 @@ of Git Bash is not one Node understands):
 
 ```sh
 probe="$(mktemp)" && printf probe > "$probe"
-(cd platform/desktop && TAURI_SIGNING_PRIVATE_KEY_PATH="$HOME/.oaiy-signing/oaiy-updater.key" \
+TAURI_SIGNING_PRIVATE_KEY_PATH="$HOME/.oaiy-signing/oaiy-updater.key" \
   TAURI_SIGNING_PRIVATE_KEY_PASSWORD="$(tr -d '\r\n' < "$HOME/.oaiy-signing/oaiy-updater.key.password.txt")" \
-  npx tauri signer sign "$probe" > /dev/null)
+  platform/desktop/node_modules/.bin/tauri signer sign "$probe" > /dev/null
 node platform/scripts/verify-signature.mjs "$probe"
 rm -f "$probe" "$probe.sig"
 ```
