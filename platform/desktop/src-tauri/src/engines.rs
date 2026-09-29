@@ -138,15 +138,19 @@ mod tests {
         let ui = start_with(&data, Mode::Launch).unwrap();
         assert!(ui.starts_with("http://127.0.0.1:") && !ui.ends_with(":0"), "{ui}");
         assert_eq!(ui_url().as_deref(), Some(ui.as_str()));
-        // The control pages answer while it runs.
-        let addr = ui.trim_start_matches("http://");
-        let mut stream = std::net::TcpStream::connect(addr).unwrap();
-        use std::io::{Read, Write};
-        stream.write_all(format!("GET /api/state HTTP/1.1\r\nHost: {addr}\r\nConnection: close\r\n\r\n").as_bytes()).unwrap();
-        let mut reply = String::new();
-        stream.read_to_string(&mut reply).unwrap();
-        assert!(reply.starts_with("HTTP/1.1 200"), "{}", &reply[..reply.len().min(200)]);
-        assert!(reply.contains("config_path"));
+        // The control pages answer while it runs. Read as an HTTP client does, up
+        // to the reply's own length: on Windows the studio may reset the socket
+        // once it has answered, and reading to the end then fails a good reply.
+        let resp = reqwest::blocking::Client::builder()
+            .timeout(std::time::Duration::from_secs(10))
+            .build()
+            .unwrap()
+            .get(format!("{ui}/api/state"))
+            .send()
+            .unwrap();
+        assert_eq!(resp.status().as_u16(), 200);
+        let reply = resp.text().unwrap();
+        assert!(reply.contains("config_path"), "{}", &reply[..reply.len().min(200)]);
         stop();
         assert!(RUNNING.lock().unwrap().is_none());
         let _ = std::fs::remove_dir_all(&data);
