@@ -3541,3 +3541,20 @@ fn a_template_and_a_flow_are_described_by_everything_that_makes_them_act() {
     assert!(what("flows/hook.json").contains("runs before the Agent's \"run_command\" tool"), "{}", what("flows/hook.json"));
     assert!(what("flows/tool.json").contains("offered to the Agent as the tool \"lookup_caller\""), "{}", what("flows/tool.json"));
 }
+
+#[test]
+fn decrypting_stops_at_the_deadline_by_itself_and_does_not_wait_for_the_checks_that_follow() {
+    let src = TempDir::new("deadline-src");
+    realistic(&src.0, "A");
+    let out = TempDir::new("deadline-out");
+    let file = out.0.join("d.oaiybackup");
+    make(&src.0, &file);
+    let scratch = TempDir::new("deadline-scratch");
+    // A deadline that has already passed stops the decryption itself, before any of the ZIP is looked at.
+    let expired = Budget::within(std::time::Duration::ZERO);
+    let err = container::decrypt_to_file(&file, PASS, &scratch.0.join("late.zip"), 1 << 30, &expired).unwrap_err();
+    assert_eq!(err.kind, ErrorKind::Timeout, "{err}");
+    // With time, the same file decrypts.
+    let (_, len) = container::decrypt_to_file(&file, PASS, &scratch.0.join("in-time.zip"), 1 << 30, &Budget::unlimited()).unwrap();
+    assert!(len > 0);
+}
