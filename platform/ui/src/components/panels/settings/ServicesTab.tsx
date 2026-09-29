@@ -13,7 +13,8 @@
  * reads the same key, so saving here makes the preset available to
  * compiled flows immediately.
  */
-import { useEffect, useMemo, useState } from 'react';
+import { useEffect, useMemo, useRef, useState, type ReactNode } from 'react';
+import { Check, ChevronDown, ChevronRight, Plus, Server, Trash2, X } from 'lucide-react';
 import { v4 as uuidv4 } from 'uuid';
 import type { ProjectConstant, ProjectSettings } from 'oaiy-core';
 import {
@@ -26,6 +27,8 @@ import {
 import EngineEndpointCard from './EngineEndpointCard';
 import { useToast } from '../../Toast';
 import { useConfirmDialog } from '../../../hooks/useConfirmDialog';
+import Dialog from '../../ui/Dialog';
+import { Card, EmptyState } from '../../chrome/SectionPage';
 
 interface ServicesTabProps {
   // Same shape the SettingsPanel passes every tab; only `isOpen` is used
@@ -36,11 +39,6 @@ interface ServicesTabProps {
   constants: ProjectConstant[];
   onUpdateSettings: (updates: Partial<ProjectSettings>) => void;
 }
-
-const INPUT =
-  'w-full px-2 py-1 text-sm border border-slate-300 dark:border-slate-600 rounded ' +
-  'bg-white dark:bg-slate-900 text-slate-900 dark:text-slate-100 ' +
-  'focus:outline-none focus:ring-2 focus:ring-blue-500/50';
 
 const BLANK: CustomService = {
   id: '',
@@ -214,7 +212,7 @@ const TEMPLATE_PRESETS: ServiceTemplate[] = [
 export default function ServicesTab({ isOpen }: ServicesTabProps) {
   const [services, setServices] = useState<CustomService[]>(() => listAllServices());
   const [editing, setEditing] = useState<CustomService | null>(null);
-  // `adding` is now optionally a template id to seed the form with —
+  // `adding` is optionally a template id to seed the form with —
   // null = closed, '' = blank, or 'openai-chat'/'image-gen-generic'/etc.
   const [adding, setAdding] = useState<string | null>(null);
   const { addToast } = useToast();
@@ -267,43 +265,67 @@ export default function ServicesTab({ isOpen }: ServicesTabProps) {
     }
   }
 
-  const customCount = services.filter((s) => !s.isBuiltIn).length;
-  const builtInCount = services.filter((s) => s.isBuiltIn).length;
+  // Services are purely user-created now; the bundled examples no longer
+  // surface (the form's templates carry their preconfigured defaults).
+  const mine = services.filter((s) => !s.isBuiltIn);
 
   return (
-    <div className="p-6 space-y-5 overflow-y-auto">
+    <>
       {/* First, because everything below it is reached THROUGH the engine. */}
       <EngineEndpointCard />
-      <div>
-        <h2 className="text-lg font-semibold text-slate-900 dark:text-slate-100">Services</h2>
-        <p className="text-sm text-slate-600 dark:text-slate-400 mt-1">
-          Every node in the <strong>Services</strong> palette is a service you
-          add here. A service is just an HTTP endpoint with a body template,
-          response path, and declared input / output pins. Any shape works —
-          text → text, image + text → image, video → text, audio → text, etc.
-          Inside the form, an optional template dropdown gives you a starting
-          point for common providers (Ollama, OpenAI, ComfyUI, Whisper, …).
-        </p>
-        <p className="text-xs text-slate-500 dark:text-slate-500 mt-2">
-          {customCount} services · stored locally in
-          <code className="ml-1">oaiy.customServices</code>
-        </p>
-      </div>
 
-      {adding === null && !editing && (
-        // Single generic "Add Service" button — the form's template
-        // dropdown (inside ServiceForm) still offers shape-specific
-        // starting points, but the entry point is one button instead of
-        // a wall of per-shape pills. Keeps the panel calm + consistent
-        // with the "everything's just a service" mental model.
-        <button
-          type="button"
-          onClick={() => setAdding('blank')}
-          className="px-3 py-1.5 bg-blue-600 hover:bg-blue-700 text-white text-sm rounded font-medium"
-        >
-          + Add Service
-        </button>
-      )}
+      <Card
+        title="Your services"
+        count={mine.length}
+        flush={mine.length > 0}
+        actions={
+          // One entry point: the form's template dropdown offers the
+          // provider-shaped starting points.
+          <button
+            type="button"
+            onClick={() => setAdding('blank')}
+            className="btn btn-primary btn-sm"
+            disabled={adding !== null || !!editing}
+          >
+            <Plus size={13} /> Add a service
+          </button>
+        }
+      >
+        {mine.length === 0 ? (
+          <>
+            <p className="oaiy-card-text">
+              A service is an HTTP endpoint with a body template, a response path and the pins it
+              takes and gives: text to text, image and text to image, audio to text, anything.
+              Every node in the palette's Services list calls one.
+            </p>
+            <EmptyState icon={<Server size={24} />} title="No services yet">
+              Add one: its form starts from a template for Ollama, OpenAI, ComfyUI, Whisper and others,
+              with the body and response path filled in. They are kept in this browser
+              (<code className="oaiy-code">oaiy.customServices</code>).
+            </EmptyState>
+          </>
+        ) : (
+          <>
+            <p className="oaiy-card-text border-b border-edge-secondary px-4 py-3">
+              HTTP endpoints your nodes call, kept in this browser
+              (<code className="oaiy-code">oaiy.customServices</code>). Each offers the pins it declares
+              on the Service Call node, and on the nodes it is tagged for.
+            </p>
+            <ul className="oaiy-rows m-0 list-none p-0">
+              {mine.map((svc) => (
+                <ServiceRow
+                  key={svc.id}
+                  svc={svc}
+                  onEdit={() => setEditing(svc)}
+                  onDelete={() => handleDelete(svc)}
+                  onAddCopy={() => handleAddCopy(svc)}
+                  disabled={!!editing || adding !== null}
+                />
+              ))}
+            </ul>
+          </>
+        )}
+      </Card>
 
       {adding !== null && (() => {
         const template = TEMPLATE_PRESETS.find((t) => t.id === adding);
@@ -336,87 +358,16 @@ export default function ServicesTab({ isOpen }: ServicesTabProps) {
           onCancel={() => setEditing(null)}
         />
       )}
-
-      {/* Two sections so users see clearly which services they own vs which
-          are bundled examples available out-of-the-box. */}
-      <SectionHeader
-        title="My Services"
-        count={customCount}
-        emptyHint="Click + Add Service to register your first one. The form has a template dropdown for common providers (Ollama, OpenAI, ComfyUI, …) — pick one and the body / response path are pre-filled."
-      />
-      <div className="space-y-2">
-        {services
-          .filter((s) => !s.isBuiltIn)
-          .map((svc) => (
-            <ServiceRow
-              key={svc.id}
-              svc={svc}
-              onEdit={() => setEditing(svc)}
-              onDelete={() => handleDelete(svc)}
-              onAddCopy={() => handleAddCopy(svc)}
-              disabled={!!editing || adding !== null}
-            />
-          ))}
-      </div>
-
-      {/* Built-in services no longer surface — services are now purely
-          user-created. Templates above carry the preconfigured defaults. */}
-      {false && (
-      <>
-      <SectionHeader
-        title="Built-in Services"
-        count={builtInCount}
-        emptyHint=""
-        subtitle="Ready to use as-is — pick from any node's Service dropdown. Click Customize to clone + edit."
-      />
-      <div className="space-y-2">
-        {services
-          .filter((s) => s.isBuiltIn)
-          .map((svc) => (
-            <ServiceRow
-              key={svc.id}
-              svc={svc}
-              onEdit={() => setEditing(svc)}
-              onDelete={() => handleDelete(svc)}
-              onAddCopy={() => handleAddCopy(svc)}
-              disabled={!!editing || adding !== null}
-            />
-          ))}
-      </div>
-      </>
-      )}
-    </div>
+    </>
   );
 }
 
-function SectionHeader({
-  title,
-  count,
-  emptyHint,
-  subtitle,
-}: {
-  title: string;
-  count: number;
-  emptyHint?: string;
-  subtitle?: string;
-}) {
-  return (
-    <div className="pt-2">
-      <div className="flex items-baseline gap-2">
-        <h3 className="text-sm font-semibold text-slate-700 dark:text-slate-300 uppercase tracking-wide">
-          {title}
-        </h3>
-        <span className="text-xs text-slate-500">({count})</span>
-      </div>
-      {subtitle && (
-        <p className="text-xs text-slate-500 dark:text-slate-500 mt-0.5">{subtitle}</p>
-      )}
-      {count === 0 && emptyHint && (
-        <p className="text-xs text-slate-500 dark:text-slate-500 italic mt-1">{emptyHint}</p>
-      )}
-    </div>
-  );
-}
+const TAG_SHORT: Record<string, string> = {
+  ai_llm: 'AI',
+  image_gen: 'Image',
+  video_gen: 'Video',
+  text_to_speech: 'Speech',
+};
 
 function ServiceRow({
   svc,
@@ -534,134 +485,115 @@ function ServiceRow({
   }
 
   return (
-    <div className="border border-slate-200 dark:border-slate-700 rounded-md p-3 bg-white dark:bg-slate-800/50">
-      <div className="flex items-start justify-between gap-3">
-        <div className="flex-1 min-w-0">
-          <div className="flex items-center gap-2 flex-wrap">
-            <span className="font-medium text-slate-900 dark:text-slate-100">{svc.name}</span>
-            {svc.isBuiltIn ? (
-              <span
-                className="text-xs px-1.5 py-0.5 rounded bg-cyan-100 text-cyan-700 dark:bg-cyan-900/40 dark:text-cyan-300"
-                title="Bundled with OAIY — ready to use as-is. Click Customize to clone + edit."
-              >
-                Built-in
-              </span>
-            ) : (
-              <span className="text-xs px-1.5 py-0.5 rounded bg-emerald-100 text-emerald-700 dark:bg-emerald-900/40 dark:text-emerald-300">
-                Custom
-              </span>
-            )}
-            {/* Surface the "Used for" tags inline so users can see at a
-                glance which node types will list this service. */}
-            {(svc.nodeTypes ?? []).map((tag) => (
-              <span
-                key={tag}
-                className="text-[10px] px-1.5 py-0.5 rounded bg-slate-200 dark:bg-slate-700 text-slate-600 dark:text-slate-300"
-                title={`Listed in ${tag} node dropdowns`}
-              >
-                {tag === 'ai_llm' ? 'AI' : tag === 'image_gen' ? 'Image' : tag === 'video_gen' ? 'Video' : tag === 'text_to_speech' ? 'TTS' : 'Generic'}
-              </span>
-            ))}
-            <span className="text-xs text-slate-500 dark:text-slate-400 font-mono truncate">
-              {svc.id}
+    <li className="oaiy-row top flex-wrap">
+      <span className="grid h-8 w-8 shrink-0 place-items-center rounded-[var(--r-sm)] border border-edge-primary bg-surface-tertiary text-[15px] text-content-secondary" aria-hidden="true">
+        {svc.icon || <Server size={15} />}
+      </span>
+      <div className="oaiy-row-main wide">
+        <div className="flex min-w-0 flex-wrap items-center gap-1.5">
+          <span className="oaiy-row-title">{svc.name}</span>
+          {svc.isBuiltIn ? (
+            <span className="oaiy-pill info" title="Bundled with OAIY — ready to use as-is. Customize makes an editable copy.">built-in</span>
+          ) : null}
+          {/* The "Used for" tags: which node types list this service. */}
+          {(svc.nodeTypes ?? []).map((tag) => (
+            <span key={tag} className="oaiy-pill" title={`Listed in ${tag} node dropdowns`}>
+              {TAG_SHORT[tag] ?? 'Generic'}
             </span>
-          </div>
-          {svc.description && (
-            <p className="text-xs text-slate-600 dark:text-slate-400 mt-0.5">{svc.description}</p>
-          )}
-          <p className="text-xs text-slate-500 mt-1 font-mono truncate">
-            <span className="font-semibold">{svc.method}</span>{' '}
-            {svc.endpoint || <em className="text-amber-600">(no endpoint set)</em>}
-          </p>
-          {svc.responsePath && (
-            <p className="text-xs text-slate-500 mt-0.5 font-mono truncate">
-              path: <span className="text-slate-700 dark:text-slate-300">{svc.responsePath}</span>
-            </p>
-          )}
-          {svc.installHint && (
-            <details className="mt-1">
-              <summary className="text-xs text-slate-500 dark:text-slate-400 cursor-pointer hover:text-slate-700 dark:hover:text-slate-300">
-                Install / start
-              </summary>
-              <p className="text-xs text-slate-600 dark:text-slate-400 mt-1 whitespace-pre-wrap pl-4 border-l-2 border-slate-200 dark:border-slate-700">
-                {svc.installHint}
-              </p>
-            </details>
-          )}
+          ))}
         </div>
-        <div className="flex flex-col gap-1 flex-shrink-0 items-end">
-          <div className="flex gap-1">
-            {/* Test = GET-ping the endpoint to confirm reachability +
-                surface CORS errors before the user wires it into a flow. */}
-            {svc.endpoint && (
-              <button
-                onClick={test}
-                disabled={disabled || pingStatus === 'pinging'}
-                className={`px-2 py-1 text-xs rounded disabled:opacity-50 disabled:cursor-not-allowed ${
-                  pingStatus === 'ok'
-                    ? 'bg-emerald-100 hover:bg-emerald-200 dark:bg-emerald-900/40 dark:hover:bg-emerald-900/60 text-emerald-700 dark:text-emerald-300'
-                    : pingStatus === 'err'
-                    ? 'bg-red-50 hover:bg-red-100 dark:bg-red-900/30 dark:hover:bg-red-900/50 text-red-700 dark:text-red-300'
-                    : 'bg-slate-100 hover:bg-slate-200 dark:bg-slate-700 dark:hover:bg-slate-600 text-slate-700 dark:text-slate-200'
-                }`}
-                title={pingStatus === 'err' || pingStatus === 'ok' ? pingMsg : 'GET-ping the endpoint to check reachability + CORS'}
-              >
-                {pingStatus === 'idle' && 'Test'}
-                {pingStatus === 'pinging' && '…'}
-                {pingStatus === 'ok' && `✓ ${pingMsg}`}
-                {pingStatus === 'err' && '✗ Unreachable'}
-              </button>
-            )}
-            {svc.isBuiltIn ? (
-              <button
-                onClick={onAddCopy}
-                disabled={disabled}
-                className="px-2 py-1 text-xs bg-cyan-100 hover:bg-cyan-200 dark:bg-cyan-900/40 dark:hover:bg-cyan-900/60 text-cyan-700 dark:text-cyan-300 rounded disabled:opacity-50 disabled:cursor-not-allowed"
-                title="Clone this built-in into your services so you can edit it"
-              >
-                Customize
-              </button>
-            ) : (
-              <>
-                <button
-                  onClick={onEdit}
-                  disabled={disabled}
-                  className="px-2 py-1 text-xs bg-slate-100 hover:bg-slate-200 dark:bg-slate-700 dark:hover:bg-slate-600 text-slate-700 dark:text-slate-200 rounded disabled:opacity-50 disabled:cursor-not-allowed"
-                >
-                  Edit
-                </button>
-                <button
-                  onClick={onDelete}
-                  disabled={disabled}
-                  className="px-2 py-1 text-xs bg-red-50 hover:bg-red-100 dark:bg-red-900/30 dark:hover:bg-red-900/50 text-red-700 dark:text-red-300 rounded disabled:opacity-50 disabled:cursor-not-allowed"
-                >
-                  Delete
-                </button>
-              </>
-            )}
-          </div>
-          {pingStatus === 'err' && (
-            <p className="text-[10px] text-red-600 dark:text-red-400 max-w-[200px] truncate" title={pingMsg}>
-              {pingMsg}
+        {svc.description && <span className="text-[12px] leading-snug text-content-secondary">{svc.description}</span>}
+        <span className="oaiy-row-meta font-mono">
+          <strong className="font-semibold text-content-secondary">{svc.method}</strong>{' '}
+          {svc.endpoint || <em className="not-italic text-signal-amber">no endpoint set</em>}
+          {svc.responsePath ? ` · ${svc.responsePath}` : ''}
+        </span>
+        {svc.installHint && (
+          <details className="mt-1">
+            <summary className="cursor-pointer text-[12px] text-content-faint hover:text-content-primary">
+              Install / start
+            </summary>
+            <p className="mt-1 whitespace-pre-wrap border-l-2 border-edge-primary pl-3 text-[12px] text-content-secondary">
+              {svc.installHint}
             </p>
-          )}
-        </div>
+          </details>
+        )}
+        {pingStatus === 'ok' && (
+          <span className="oaiy-ok-text truncate" title={pingMsg}>Reached it: {pingMsg}</span>
+        )}
+        {pingStatus === 'err' && (
+          <span className="oaiy-error-text truncate" title={pingMsg}>Unreachable: {pingMsg}</span>
+        )}
       </div>
-    </div>
+      <div className="flex shrink-0 items-center gap-1.5">
+        {/* Test = ping the endpoint to confirm reachability + surface CORS
+            errors before the user wires it into a flow. */}
+        {svc.endpoint && (
+          <button
+            onClick={test}
+            disabled={disabled || pingStatus === 'pinging'}
+            className="btn btn-sm"
+            title={pingStatus === 'err' || pingStatus === 'ok' ? pingMsg : 'Ping the endpoint to check it can be reached (and CORS)'}
+          >
+            {pingStatus === 'pinging' ? 'Testing…' : 'Test'}
+          </button>
+        )}
+        {svc.isBuiltIn ? (
+          <button
+            onClick={onAddCopy}
+            disabled={disabled}
+            className="btn btn-sm"
+            title="Clone this built-in into your services so you can edit it"
+          >
+            Customize
+          </button>
+        ) : (
+          <>
+            <button onClick={onEdit} disabled={disabled} className="btn btn-sm">
+              Edit
+            </button>
+            <button
+              onClick={onDelete}
+              disabled={disabled}
+              className="oaiy-icon-btn"
+              title={`Delete ${svc.name}`}
+              aria-label={`Delete ${svc.name}`}
+            >
+              <Trash2 size={14} />
+            </button>
+          </>
+        )}
+      </div>
+    </li>
   );
 }
 
-/** The service editor (also opened from a node's "Add a service…", lib/addServiceDialog.tsx). */
+/**
+ * The service editor, as a dialog: from Settings → Services (add, edit) and
+ * from any node's "Add a service…" (lib/addServiceDialog.tsx).
+ */
 export function ServiceForm({
   initial,
   isNew,
   onSave,
   onCancel,
+  title,
+  intro,
+  footerStart,
+  error,
 }: {
   initial: CustomService;
   isNew: boolean;
   onSave: (svc: CustomService) => void;
   onCancel: () => void;
+  /** The dialog's title (default: "Add a service" or "Edit <name>"). */
+  title?: ReactNode;
+  /** Shown at the top of the form, above its fields. */
+  intro?: ReactNode;
+  /** The footer's left side (a link, a note), before Cancel and Save. */
+  footerStart?: ReactNode;
+  /** A problem with the last save, said under the fields. */
+  error?: ReactNode;
 }) {
   // Guarantee at least one input + one output row in the editor — the
   // user explicitly asked for visible defaults so it's never an empty
@@ -680,6 +612,7 @@ export function ServiceForm({
   }, [initial]);
   const [draft, setDraft] = useState<CustomService>(seedPins);
   const confirm = useConfirmDialog();
+  const nameRef = useRef<HTMLInputElement>(null);
   // Confirm before discarding edits — Cancel/close throws away the draft, so a
   // mis-click would silently lose a multi-field service definition. Confirms only
   // when actually dirty (matches the app's danger-confirm precedent for delete).
@@ -767,46 +700,48 @@ export function ServiceForm({
     });
   }
 
-  function toggleTag(tag: NonNullable<CustomService['nodeTypes']>[number]) {
-    const cur = new Set(draft.nodeTypes ?? []);
-    if (cur.has(tag)) cur.delete(tag); else cur.add(tag);
-    set('nodeTypes', Array.from(cur) as CustomService['nodeTypes']);
-  }
-
-  const tagLabels: Record<NonNullable<CustomService['nodeTypes']>[number], string> = {
-    ai_llm: 'AI LLM',
-    image_gen: 'Image Gen',
-    video_gen: 'Video Gen',
-    text_to_speech: 'TTS',
-    music_gen: 'Music Gen',
-    speech_to_text: 'Speech to Text',
-    sound_effect: 'Sound Effect',
-    model_3d: '3D Model',
-    background_removal: 'Remove Background',
-    image_upscale: 'Upscale Image',
-    service_call: 'Service Call',
-  };
+  const pinTypeOptions = (
+    <>
+      <option value="any">any</option>
+      <option value="string">string</option>
+      <option value="image">image</option>
+      <option value="audio">audio</option>
+      <option value="video">video</option>
+    </>
+  );
 
   return (
-    <div className="border-2 border-blue-500/40 rounded-md p-4 bg-blue-50/30 dark:bg-blue-900/10 space-y-3">
-      <div className="flex items-center justify-between">
-        <h3 className="font-medium text-slate-900 dark:text-slate-100">
-          {isNew ? 'New Service' : `Edit: ${initial.name}`}
-        </h3>
-        <button
-          onClick={handleCancel}
-          className="text-xs text-slate-500 hover:text-slate-700 dark:text-slate-400 dark:hover:text-slate-200"
-        >
-          ✕ Cancel
-        </button>
-      </div>
+    <Dialog
+      open
+      onClose={() => void handleCancel()}
+      title={title ?? (isNew ? 'Add a service' : `Edit ${initial.name}`)}
+      description={isNew ? 'An HTTP endpoint your nodes can call.' : undefined}
+      icon={<Server size={16} />}
+      tone="accent"
+      size="lg"
+      initialFocusRef={nameRef}
+      testId="service-form"
+      footer={
+        <>
+          {footerStart}
+          {footerStart && <span className="spacer" />}
+          <button type="button" onClick={() => void handleCancel()} className="btn btn-secondary">
+            Cancel
+          </button>
+          <button type="button" onClick={() => onSave(draft)} className="btn btn-primary">
+            {isNew ? 'Create service' : 'Save changes'}
+          </button>
+        </>
+      }
+    >
+      {intro}
 
       {/* Step 1 (new services only): pick a template that pre-fills the
           gnarly fields (body template / response path / nodeTypes). */}
       {isNew && (
         <Row
           label="Start from a template"
-          hint="Pre-fills body + response path + headers. Pick the closest match — you can tweak everything afterwards (Advanced auto-expands so you can see what changed)."
+          hint="Fills in the body, the response path and the headers. Pick the closest; you can change everything after (Advanced opens to show what it filled in)."
         >
           <select
             value={appliedTemplate}
@@ -815,7 +750,7 @@ export function ServiceForm({
               if (v) applyTemplate(v);
               else setAppliedTemplate('');
             }}
-            className={INPUT}
+            className="oaiy-select"
           >
             <option value="">
               {appliedTemplate ? 'Switch template…' : 'Choose a template…'}
@@ -830,9 +765,9 @@ export function ServiceForm({
             const t = TEMPLATE_PRESETS.find((x) => x.id === appliedTemplate);
             if (!t) return null;
             return (
-              <p className="text-xs text-emerald-700 dark:text-emerald-300 mt-1">
-                ✓ Applied <strong>{t.label}</strong> — see Advanced for the body
-                template + response path it filled in.
+              <p className="oaiy-ok-text inline-flex items-center gap-1.5">
+                <Check size={13} /> Applied <strong>{t.label}</strong>: see Advanced for the body
+                template and response path it filled in.
               </p>
             );
           })()}
@@ -840,32 +775,35 @@ export function ServiceForm({
       )}
 
       {/* Always-visible required fields */}
-      <Row label="Name *">
-        <input
-          type="text"
-          value={draft.name}
-          onChange={(e) => setName(e.target.value)}
-          className={INPUT}
-          placeholder="My Local Ollama"
-          autoFocus={isNew}
-        />
-      </Row>
+      <div className="oaiy-form-grid">
+        <Row label="Name (required)">
+          <input
+            ref={nameRef}
+            type="text"
+            value={draft.name}
+            onChange={(e) => setName(e.target.value)}
+            className="oaiy-input"
+            placeholder="My Local Ollama"
+          />
+        </Row>
 
-      <Row label="Endpoint URL *">
-        <input
-          type="text"
-          value={draft.endpoint}
-          onChange={(e) => set('endpoint', e.target.value)}
-          className={INPUT}
-          placeholder="http://localhost:11434/v1/chat/completions"
-        />
-      </Row>
+        <Row label="Endpoint URL (required)">
+          <input
+            type="text"
+            value={draft.endpoint}
+            onChange={(e) => set('endpoint', e.target.value)}
+            className="oaiy-input mono"
+            placeholder="http://localhost:11434/v1/chat/completions"
+          />
+        </Row>
+      </div>
 
       <Row
+        group
         label="Icon"
-        hint="Shown in the palette tile + the dropped node's title bar. Click a suggestion or type any emoji / UTF-8 glyph in the box."
+        hint="Shown on the palette tile and the dropped node's title bar. Pick one, or type any emoji or other character in the box."
       >
-        <div className="space-y-2">
+        <div className="flex flex-col gap-2">
           {/* Quick-pick grid — covers the common service shapes. */}
           <div className="flex flex-wrap gap-1">
             {[
@@ -882,10 +820,11 @@ export function ServiceForm({
                   key={emoji}
                   type="button"
                   onClick={() => set('icon', emoji)}
-                  className={`w-8 h-8 rounded text-lg leading-none flex items-center justify-center transition-colors ${
+                  aria-pressed={active}
+                  className={`flex h-8 w-8 items-center justify-center rounded-[var(--r-sm)] border text-lg leading-none transition-colors ${
                     active
-                      ? 'bg-cyan-100 ring-2 ring-cyan-400 dark:bg-cyan-900/60 dark:ring-cyan-500'
-                      : 'bg-slate-100 hover:bg-slate-200 dark:bg-slate-800 dark:hover:bg-slate-700'
+                      ? 'border-accent bg-accent/15'
+                      : 'border-transparent bg-surface-tertiary hover:border-edge-strong'
                   }`}
                   title={`Use ${emoji}`}
                 >
@@ -897,27 +836,30 @@ export function ServiceForm({
               <button
                 type="button"
                 onClick={() => set('icon', '')}
-                className="w-8 h-8 rounded text-xs leading-none flex items-center justify-center bg-slate-100 hover:bg-red-100 dark:bg-slate-800 dark:hover:bg-red-900/40 text-slate-500 hover:text-red-600 dark:hover:text-red-300"
-                title="Clear icon (use the default server glyph)"
+                className="oaiy-icon-btn"
+                title="Clear the icon (use the default server glyph)"
+                aria-label="Clear the icon"
               >
-                ✕
+                <X size={14} />
               </button>
             )}
           </div>
           {/* Free-text fallback — any emoji / UTF-8 glyph the picker omits. */}
           <div className="flex items-center gap-2">
-            <span className="text-xs text-slate-500 dark:text-slate-400">or custom:</span>
+            <span className="text-[12px] text-content-faint">Or your own:</span>
             <input
               type="text"
               value={draft.icon ?? ''}
               onChange={(e) => set('icon', e.target.value)}
-              className={INPUT + ' w-24'}
+              className="oaiy-input"
+              style={{ width: 96 }}
               placeholder="🪝"
               maxLength={6}
+              aria-label="Icon"
             />
             {draft.icon && (
-              <span className="text-xs text-slate-500 dark:text-slate-400">
-                preview: <span className="text-lg">{draft.icon}</span>
+              <span className="text-[12px] text-content-faint">
+                Preview <span className="text-lg">{draft.icon}</span>
               </span>
             )}
           </div>
@@ -930,48 +872,52 @@ export function ServiceForm({
           this video" use cases, etc. No artificial node-type buckets. */}
 
       {/* Advanced disclosure — everything templates already filled in */}
-      <button
-        type="button"
-        onClick={() => setShowAdvanced((v) => !v)}
-        className="text-xs text-blue-600 dark:text-blue-400 hover:underline self-start"
-      >
-        {showAdvanced
-          ? '▾ Hide advanced'
-          : '▸ Show advanced (body template, response path, headers, API key, install hint, ID, …)'}
-      </button>
+      <div>
+        <button
+          type="button"
+          onClick={() => setShowAdvanced((v) => !v)}
+          className="btn btn-ghost btn-sm"
+          aria-expanded={showAdvanced}
+        >
+          {showAdvanced ? <ChevronDown size={13} /> : <ChevronRight size={13} />}
+          {showAdvanced ? 'Hide advanced' : 'Advanced: body, response path, headers, API key, pins, ID'}
+        </button>
+      </div>
 
       {showAdvanced && (
-        <div className="space-y-3 pt-2 border-t border-slate-200 dark:border-slate-700">
-          <Row label="ID" hint="Auto-derived from Name unless you type one. Letters, numbers, dash, underscore.">
-            <input
-              type="text"
-              value={draft.id}
-              onChange={(e) => set('id', e.target.value)}
-              className={INPUT}
-              disabled={!isNew}
-            />
-          </Row>
+        <div className="flex flex-col gap-3 border-t border-edge-secondary pt-3">
+          <div className="oaiy-form-grid">
+            <Row label="ID" hint="Letters, numbers, dash and underscore. Fixed once the service exists.">
+              <input
+                type="text"
+                value={draft.id}
+                onChange={(e) => set('id', e.target.value)}
+                className="oaiy-input mono"
+                disabled={!isNew}
+              />
+            </Row>
 
-          <Row label="Description">
-            <input
-              type="text"
-              value={draft.description ?? ''}
-              onChange={(e) => set('description', e.target.value)}
-              className={INPUT}
-              placeholder="What this service does"
-            />
-          </Row>
+            <Row label="Description">
+              <input
+                type="text"
+                value={draft.description ?? ''}
+                onChange={(e) => set('description', e.target.value)}
+                className="oaiy-input"
+                placeholder="What this service does"
+              />
+            </Row>
+          </div>
 
           <div className="grid grid-cols-[1fr_auto] gap-3">
             <Row
-              label="Default Model"
-              hint="Auto-syncs into the Body Template — both as the `{{model}}` placeholder at runtime AND as a textual rewrite of any literal `&quot;old-model&quot;` string already in the body."
+              label="Default model"
+              hint="Syncs into the body template: as the {{model}} placeholder when it runs, and by rewriting any literal &quot;old-model&quot; string already in the body."
             >
               <input
                 type="text"
                 value={draft.model ?? ''}
                 onChange={(e) => setModel(e.target.value)}
-                className={INPUT}
+                className="oaiy-input mono"
                 placeholder="llama3"
               />
             </Row>
@@ -979,7 +925,8 @@ export function ServiceForm({
               <select
                 value={draft.method}
                 onChange={(e) => set('method', e.target.value as CustomService['method'])}
-                className={INPUT}
+                className="oaiy-select"
+                style={{ width: 110 }}
               >
                 {(['GET', 'POST', 'PUT', 'DELETE', 'PATCH'] as const).map((m) => (
                   <option key={m} value={m}>{m}</option>
@@ -989,65 +936,67 @@ export function ServiceForm({
           </div>
 
           <Row
-            label="Body Template"
-            hint="Use {{input}} (JSON-escaped) or {{inputRaw}} for raw substitution. {{apiKey}} resolves the API Key Constant."
+            label="Body template"
+            hint="{{input}} is JSON-escaped, {{inputRaw}} raw. {{apiKey}} is the API key constant's value."
           >
             <textarea
               value={draft.bodyTemplate}
               onChange={(e) => set('bodyTemplate', e.target.value)}
-              className={INPUT + ' font-mono text-xs'}
+              className="oaiy-textarea mono"
               rows={5}
               placeholder='{"prompt": {{input}}, "stream": false}'
             />
           </Row>
 
           <div className="grid grid-cols-[auto_1fr] gap-3">
-            <Row label="Response Type">
+            <Row label="Response type">
               <select
                 value={draft.responseType}
                 onChange={(e) => set('responseType', e.target.value as CustomService['responseType'])}
-                className={INPUT}
+                className="oaiy-select"
+                style={{ width: 110 }}
               >
                 <option value="json">JSON</option>
                 <option value="text">Text</option>
               </select>
             </Row>
-            <Row label="Response Path" hint="Dot/bracket path; blank = whole body">
+            <Row label="Response path" hint="A dot or bracket path; blank for the whole body.">
               <input
                 type="text"
                 value={draft.responsePath}
                 onChange={(e) => set('responsePath', e.target.value)}
-                className={INPUT}
+                className="oaiy-input mono"
                 placeholder="choices.0.message.content"
               />
             </Row>
           </div>
 
-          <Row label="Headers (JSON template)" hint="Blank = Content-Type: application/json. Use {{apiKeyRaw}} inside a quoted value (e.g. &quot;Bearer {{apiKeyRaw}}&quot;) — it resolves the API Key Constant.">
+          <Row label="Headers (JSON template)" hint="Blank sends Content-Type: application/json. Put {{apiKeyRaw}} inside a quoted value (e.g. &quot;Bearer {{apiKeyRaw}}&quot;) for the API key constant.">
             <textarea
               value={draft.headers}
               onChange={(e) => set('headers', e.target.value)}
-              className={INPUT + ' font-mono text-xs'}
+              className="oaiy-textarea mono"
+              style={{ minHeight: 56 }}
               rows={2}
               placeholder='{"Authorization": "Bearer {{apiKeyRaw}}"}'
             />
           </Row>
 
-          <div className="grid grid-cols-2 gap-3">
-            <Row label="API Key Constant" hint="Project Constant name; accessible as {{apiKey}}">
+          <div className="oaiy-form-grid">
+            <Row label="API key constant" hint="A constant's name (Settings → API keys); read as {{apiKey}}.">
               <input
                 type="text"
                 value={draft.apiKeyConstant ?? ''}
                 onChange={(e) => set('apiKeyConstant', e.target.value)}
-                className={INPUT}
-                placeholder="e.g. OPENAI_API_KEY"
+                className="oaiy-input mono"
+                placeholder="OPENAI_API_KEY"
               />
             </Row>
-            <Row label="API Format" hint="Body-shape hint for typed nodes">
+            <Row label="API format" hint="The body's shape, for the typed nodes.">
               <select
                 value={draft.apiFormat ?? ''}
                 onChange={(e) => set('apiFormat', (e.target.value || undefined) as CustomService['apiFormat'])}
-                className={INPUT}
+                className="oaiy-select"
               >
                 <option value="">(default for the node)</option>
                 <option value="openai">OpenAI</option>
@@ -1059,12 +1008,13 @@ export function ServiceForm({
           </div>
 
           <Row
+            group
             label="Inputs"
-            hint="Pins this service accepts. Each id becomes a {{var}} placeholder in the body template (so {{prompt}}, {{image}} etc.) and an input handle on the dropped node."
+            hint="The pins it takes. Each id is a {{placeholder}} in the body template ({{prompt}}, {{image}} …) and an input on the dropped node."
           >
-            <div className="space-y-2">
+            <div className="flex flex-col gap-2">
               {(draft.inputs ?? []).map((inp, idx) => (
-                <div key={idx} className="grid grid-cols-[1fr_1fr_auto_auto] gap-2 items-center">
+                <div key={idx} className="grid grid-cols-[1fr_1fr_auto_auto] items-center gap-2">
                   <input
                     type="text"
                     value={inp.id}
@@ -1073,8 +1023,9 @@ export function ServiceForm({
                       next[idx] = { ...next[idx], id: e.target.value };
                       set('inputs', next);
                     }}
-                    className={INPUT + ' font-mono text-xs'}
+                    className="oaiy-input oaiy-input-sm mono"
                     placeholder="id (e.g. prompt)"
+                    aria-label={`Input ${idx + 1} id`}
                   />
                   <input
                     type="text"
@@ -1084,8 +1035,9 @@ export function ServiceForm({
                       next[idx] = { ...next[idx], name: e.target.value };
                       set('inputs', next);
                     }}
-                    className={INPUT}
+                    className="oaiy-input oaiy-input-sm"
                     placeholder="Display name"
+                    aria-label={`Input ${idx + 1} name`}
                   />
                   <select
                     value={inp.type}
@@ -1094,13 +1046,11 @@ export function ServiceForm({
                       next[idx] = { ...next[idx], type: e.target.value as typeof inp.type };
                       set('inputs', next);
                     }}
-                    className={INPUT + ' w-24'}
+                    className="oaiy-select oaiy-input-sm"
+                    style={{ width: 96 }}
+                    aria-label={`Input ${idx + 1} type`}
                   >
-                    <option value="any">any</option>
-                    <option value="string">string</option>
-                    <option value="image">image</option>
-                    <option value="audio">audio</option>
-                    <option value="video">video</option>
+                    {pinTypeOptions}
                   </select>
                   <button
                     type="button"
@@ -1109,42 +1059,45 @@ export function ServiceForm({
                       next.splice(idx, 1);
                       set('inputs', next);
                     }}
-                    className="px-2 py-1 text-xs bg-red-50 hover:bg-red-100 dark:bg-red-900/30 dark:hover:bg-red-900/50 text-red-700 dark:text-red-300 rounded"
+                    className="oaiy-icon-btn sm"
                     title="Remove this input pin"
+                    aria-label={`Remove input ${idx + 1}`}
                   >
-                    ×
+                    <X size={13} />
                   </button>
                 </div>
               ))}
-              <button
-                type="button"
-                onClick={() => {
-                  const next = [...(draft.inputs ?? [])];
-                  const idx = next.length;
-                  next.push({ id: `input_${idx + 1}`, name: `Input ${idx + 1}`, type: 'any' });
-                  set('inputs', next);
-                }}
-                className="px-2 py-1 text-xs bg-slate-100 hover:bg-slate-200 dark:bg-slate-700 dark:hover:bg-slate-600 text-slate-700 dark:text-slate-200 rounded"
-              >
-                + Add Input Pin
-              </button>
+              <div>
+                <button
+                  type="button"
+                  onClick={() => {
+                    const next = [...(draft.inputs ?? [])];
+                    const idx = next.length;
+                    next.push({ id: `input_${idx + 1}`, name: `Input ${idx + 1}`, type: 'any' });
+                    set('inputs', next);
+                  }}
+                  className="btn btn-sm"
+                >
+                  <Plus size={12} /> Add an input pin
+                </button>
+              </div>
               {(draft.inputs ?? []).length === 0 && (
-                <p className="text-xs text-slate-500 dark:text-slate-400">
-                  No inputs declared — the dropped node will use a single generic
-                  <code className="mx-1 px-1 py-0.5 bg-slate-100 dark:bg-slate-800 rounded">input</code>
-                  pin, accessible as <code>{'{{input}}'}</code> / <code>{'{{inputRaw}}'}</code> in the body template.
+                <p className="oaiy-help faint">
+                  None: the dropped node gets one generic <code className="oaiy-code">input</code> pin,
+                  read as <code className="oaiy-code">{'{{input}}'}</code> / <code className="oaiy-code">{'{{inputRaw}}'}</code> in the body template.
                 </p>
               )}
             </div>
           </Row>
 
           <Row
+            group
             label="Outputs"
-            hint="Pins this service produces. Each output handle on the dropped node renders with the declared type — colour-coded + edge-type-validated when wired downstream. Leave empty for a single generic 'response' pin (matches the legacy single-output Service Call shape)."
+            hint="The pins it gives, each typed (coloured and checked when wired). Leave it empty for one generic response pin, like the older single-output Service Call."
           >
-            <div className="space-y-2">
+            <div className="flex flex-col gap-2">
               {(draft.outputs ?? []).map((out, idx) => (
-                <div key={idx} className="grid grid-cols-[1fr_1fr_auto_auto] gap-2 items-center">
+                <div key={idx} className="grid grid-cols-[1fr_1fr_auto_auto] items-center gap-2">
                   <input
                     type="text"
                     value={out.id}
@@ -1153,8 +1106,9 @@ export function ServiceForm({
                       next[idx] = { ...next[idx], id: e.target.value };
                       set('outputs', next);
                     }}
-                    className={INPUT + ' font-mono text-xs'}
+                    className="oaiy-input oaiy-input-sm mono"
                     placeholder="id (e.g. response)"
+                    aria-label={`Output ${idx + 1} id`}
                   />
                   <input
                     type="text"
@@ -1164,8 +1118,9 @@ export function ServiceForm({
                       next[idx] = { ...next[idx], name: e.target.value };
                       set('outputs', next);
                     }}
-                    className={INPUT}
+                    className="oaiy-input oaiy-input-sm"
                     placeholder="Display name"
+                    aria-label={`Output ${idx + 1} name`}
                   />
                   <select
                     value={out.type}
@@ -1174,13 +1129,11 @@ export function ServiceForm({
                       next[idx] = { ...next[idx], type: e.target.value as typeof out.type };
                       set('outputs', next);
                     }}
-                    className={INPUT + ' w-24'}
+                    className="oaiy-select oaiy-input-sm"
+                    style={{ width: 96 }}
+                    aria-label={`Output ${idx + 1} type`}
                   >
-                    <option value="any">any</option>
-                    <option value="string">string</option>
-                    <option value="image">image</option>
-                    <option value="audio">audio</option>
-                    <option value="video">video</option>
+                    {pinTypeOptions}
                   </select>
                   <button
                     type="button"
@@ -1189,40 +1142,43 @@ export function ServiceForm({
                       next.splice(idx, 1);
                       set('outputs', next);
                     }}
-                    className="px-2 py-1 text-xs bg-red-50 hover:bg-red-100 dark:bg-red-900/30 dark:hover:bg-red-900/50 text-red-700 dark:text-red-300 rounded"
+                    className="oaiy-icon-btn sm"
                     title="Remove this output pin"
+                    aria-label={`Remove output ${idx + 1}`}
                   >
-                    ×
+                    <X size={13} />
                   </button>
                 </div>
               ))}
-              <button
-                type="button"
-                onClick={() => {
-                  const next = [...(draft.outputs ?? [])];
-                  const idx = next.length;
-                  next.push({ id: `output_${idx + 1}`, name: `Output ${idx + 1}`, type: 'any' });
-                  set('outputs', next);
-                }}
-                className="px-2 py-1 text-xs bg-slate-100 hover:bg-slate-200 dark:bg-slate-700 dark:hover:bg-slate-600 text-slate-700 dark:text-slate-200 rounded"
-              >
-                + Add Output Pin
-              </button>
+              <div>
+                <button
+                  type="button"
+                  onClick={() => {
+                    const next = [...(draft.outputs ?? [])];
+                    const idx = next.length;
+                    next.push({ id: `output_${idx + 1}`, name: `Output ${idx + 1}`, type: 'any' });
+                    set('outputs', next);
+                  }}
+                  className="btn btn-sm"
+                >
+                  <Plus size={12} /> Add an output pin
+                </button>
+              </div>
               {(draft.outputs ?? []).length === 0 && (
-                <p className="text-xs text-slate-500 dark:text-slate-400">
-                  No outputs declared — the dropped node will use a single generic
-                  <code className="mx-1 px-1 py-0.5 bg-slate-100 dark:bg-slate-800 rounded">response</code>
-                  pin carrying whatever the Response Path extracts.
+                <p className="oaiy-help faint">
+                  None: the dropped node gets one generic <code className="oaiy-code">response</code> pin,
+                  carrying whatever the response path picks out.
                 </p>
               )}
             </div>
           </Row>
 
-          <Row label="Install / Start Hint" hint="Reminder text shown next to this service in the list">
+          <Row label="Install or start hint" hint="A reminder shown with this service in the list.">
             <textarea
               value={draft.installHint ?? ''}
               onChange={(e) => set('installHint', e.target.value)}
-              className={INPUT + ' text-xs'}
+              className="oaiy-textarea"
+              style={{ minHeight: 56 }}
               rows={2}
               placeholder="Run `ollama serve` and `ollama pull llama3`"
             />
@@ -1230,46 +1186,34 @@ export function ServiceForm({
         </div>
       )}
 
-      <div className="flex gap-2 pt-2">
-        <button
-          onClick={() => onSave(draft)}
-          className="px-3 py-1.5 bg-blue-600 hover:bg-blue-700 text-white text-sm rounded font-medium"
-        >
-          {isNew ? 'Create Service' : 'Save Changes'}
-        </button>
-        <button
-          onClick={handleCancel}
-          className="px-3 py-1.5 bg-slate-200 hover:bg-slate-300 dark:bg-slate-700 dark:hover:bg-slate-600 text-slate-700 dark:text-slate-200 text-sm rounded"
-        >
-          Cancel
-        </button>
-      </div>
-    </div>
+      {error && <p className="oaiy-error-text">{error}</p>}
+    </Dialog>
   );
 }
 
+/** One field of the form: its label, the control(s), and a hint under them. */
 function Row({
   label,
   hint,
+  group = false,
   children,
 }: {
   label: string;
   hint?: string;
+  /** More than one control (a picker, a list of pins): a group, not a label. */
+  group?: boolean;
   children: React.ReactNode;
 }) {
-  return (
-    <label className="block">
-      <span className="text-xs font-medium text-slate-700 dark:text-slate-300">{label}</span>
-      <div className="mt-1">{children}</div>
-      {hint && <p className="text-xs text-slate-500 dark:text-slate-400 mt-0.5">{hint}</p>}
-    </label>
+  const body = (
+    <>
+      <span>{label}</span>
+      {children}
+      {hint && <p className="oaiy-help faint">{hint}</p>}
+    </>
+  );
+  return group ? (
+    <div className="oaiy-field" role="group" aria-label={label}>{body}</div>
+  ) : (
+    <label className="oaiy-field">{body}</label>
   );
 }
-
-
-/**
- * Pill button that seeds the Add-Service form with the right template
- * (Removed: QuickAddBtn was the per-node-type pill row. Folded into a
- * single "+ Add Service" entry point — the form's template dropdown
- * still offers concrete provider starters.)
- */

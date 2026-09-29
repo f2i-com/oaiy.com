@@ -6,6 +6,7 @@
  * Extracted from OAIYBuilder.tsx for maintainability.
  */
 
+import { Search, X, Zap } from 'lucide-react';
 import { getNodeColorClasses, getNodeIcon, type ModuleNodeInfo } from '../../hooks/useModuleNodes';
 import type { NodeType } from 'oaiy-core';
 
@@ -75,10 +76,10 @@ export function QuickConnectPopup({
         </svg>
       )}
 
-      {/* Quick-Connect Popup */}
+      {/* Quick-Connect Popup: the palette's rows, in a card at the pointer. */}
       <div
         data-quick-connect-popup
-        className="fixed z-50 bg-white/95 dark:bg-slate-800/95 backdrop-blur-sm border rounded-lg shadow-xl w-72 max-h-80 overflow-hidden"
+        className="fixed z-50 flex max-h-80 w-72 flex-col overflow-hidden rounded-[var(--r-ctl)] border bg-surface-secondary shadow-[var(--shadow-lg)]"
         style={{
           left: Math.min(state.position.x, window.innerWidth - 300),
           top: Math.min(state.position.y, window.innerHeight - 340),
@@ -87,63 +88,61 @@ export function QuickConnectPopup({
         onClick={(e) => e.stopPropagation()}
       >
         {/* Header */}
-        <div className="px-3 py-2 border-b border-slate-300 dark:border-slate-700 bg-slate-100/80 dark:bg-slate-900/50">
-          <div className="flex items-center justify-between mb-1.5">
-            <div className="flex items-center gap-2 text-xs text-blue-400">
-              <svg className="w-3.5 h-3.5" fill="none" stroke="currentColor" viewBox="0 0 24 24">
-                <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M13 10V3L4 14h7v7l9-11h-7z" />
-              </svg>
-              Quick Connect
+        <div className="flex flex-col gap-2 border-b border-edge-secondary px-3 py-2">
+          <div className="flex items-center justify-between">
+            <div className="flex items-center gap-1.5 text-[12px] font-semibold text-accent">
+              <Zap size={13} aria-hidden="true" />
+              Connect a new node
             </div>
-            <button
-              onClick={onClose}
-              className="text-slate-500 dark:text-slate-400 hover:text-slate-700 dark:hover:text-slate-200 transition-colors"
-              title="Close"
-            >
-              <svg className="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24">
-                <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M6 18L18 6M6 6l12 12" />
-              </svg>
+            <button type="button" onClick={onClose} className="oaiy-icon-btn sm" title="Close" aria-label="Close">
+              <X size={13} />
             </button>
           </div>
-          <input
-            type="text"
-            placeholder="Search nodes..."
-            className="w-full px-2 py-1.5 bg-white dark:bg-slate-700 border border-slate-300 dark:border-slate-600 rounded text-sm text-slate-700 dark:text-slate-200 placeholder-slate-400 focus:outline-none focus:border-blue-500"
-            value={state.searchQuery}
-            onChange={(e) => onSearchChange(e.target.value)}
-            autoFocus
-          />
+          <div className="oaiy-search">
+            <Search size={13} />
+            <input
+              type="text"
+              placeholder="Search nodes"
+              aria-label="Search nodes"
+              className="oaiy-input oaiy-input-sm"
+              value={state.searchQuery}
+              onChange={(e) => onSearchChange(e.target.value)}
+              autoFocus
+            />
+          </div>
         </div>
 
         {/* Compatible Nodes List */}
-        <div className="max-h-52 overflow-y-auto">
+        <div className="max-h-52 overflow-y-auto p-1.5">
           {filteredNodes.map(node => {
             const colorClasses = getNodeColorClasses(node.definition.color);
             return (
               <button
+                type="button"
                 key={node.definition.id}
                 onClick={() => onNodeSelect(node.definition.id as NodeType)}
-                className="w-full px-3 py-2 text-left hover:bg-slate-200/50 dark:hover:bg-slate-700/50 flex items-center gap-2 transition-colors"
+                className="oaiy-node-item w-full text-left"
               >
-                <span className={`${colorClasses.text}`}>
+                {/* The node kind's own colour, as on the canvas. */}
+                <span className={`oaiy-node-icon ${colorClasses.bg} ${colorClasses.border} ${colorClasses.text}`}>
                   {getNodeIcon(node.definition.icon)}
                 </span>
-                <div className="flex-1 min-w-0">
-                  <div className="text-sm text-slate-700 dark:text-slate-200 truncate">{node.definition.name}</div>
-                  <div className="text-xs text-slate-500 dark:text-slate-400 truncate">{node.category}</div>
-                </div>
+                <span className="oaiy-node-text">
+                  <strong>{node.definition.name}</strong>
+                  <small>{node.category}</small>
+                </span>
               </button>
             );
           })}
           {filteredNodes.length === 0 && (
-            <div className="px-3 py-4 text-sm text-slate-500 dark:text-slate-400 text-center">
-              {state.searchQuery ? 'No nodes match your search' : 'No compatible nodes found'}
+            <div className="px-3 py-4 text-center text-[12.5px] text-content-faint">
+              {state.searchQuery ? 'No node matches' : 'No node can take this connection'}
             </div>
           )}
         </div>
 
         {/* Footer hint */}
-        <div className="px-3 py-1.5 border-t border-slate-300 dark:border-slate-700 bg-slate-100/50 dark:bg-slate-900/30 text-xs text-slate-500 dark:text-slate-400">
+        <div className="border-t border-edge-secondary px-3 py-1.5 text-[11px] text-content-faint">
           Click outside to cancel
         </div>
       </div>

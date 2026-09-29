@@ -8,8 +8,10 @@
  * here is offered on that node straight away.
  *
  * Opened from a dropdown resolver (outside any React tree), so it mounts its
- * own small root with the providers the form needs.
+ * own small root with the providers the form needs. The form is the editor's
+ * one service dialog (ServiceForm), with this node's notes at its top.
  */
+import { useState } from 'react';
 import { createRoot, type Root } from 'react-dom/client';
 import { v4 as uuidv4 } from 'uuid';
 import type { CustomService, ServiceNodeTag } from 'oaiy-core/modules/core-service/examples';
@@ -54,10 +56,12 @@ export function serviceForNode(draft: CustomService, nodeType: string): CustomSe
   return out;
 }
 
-function Dialog({ nodeType }: { nodeType: string }) {
+function AddServiceDialog({ nodeType }: { nodeType: string }) {
   const inOaiy = oaiyDesktop() !== null;
   const label = NODE_LABEL[nodeType] || 'this node';
-  const initial: CustomService = {
+  // Built once per opening: ServiceForm compares its draft with this to know
+  // whether closing would throw an edit away.
+  const [initial] = useState<CustomService>(() => ({
     id: uuidv4(),
     name: '',
     description: '',
@@ -70,30 +74,26 @@ function Dialog({ nodeType }: { nodeType: string }) {
     apiKeyConstant: '',
     installHint: '',
     nodeTypes: nodeType ? [nodeType as ServiceNodeTag, 'service_call'] : ['service_call'],
-  };
+  }));
+  const [error, setError] = useState<string | null>(null);
   const onSave = (svc: CustomService) => {
     if (!svc.name.trim() || !svc.endpoint.trim()) {
-      window.alert('Give the service a name and its endpoint URL.');
+      setError('Give the service a name and its endpoint URL.');
       return;
     }
     saveService(serviceForNode(svc, nodeType));
     close();
   };
   return (
-    <div
-      className="fixed inset-0 z-[1000] flex items-center justify-center bg-black/50 p-4"
-      onMouseDown={(e) => {
-        if (e.target === e.currentTarget) close();
-      }}
-    >
-      <div className="max-h-[90vh] w-full max-w-xl overflow-y-auto rounded-lg border border-slate-300 bg-white p-4 text-slate-900 shadow-xl dark:border-slate-700 dark:bg-slate-900 dark:text-slate-100">
-        <div className="mb-3 flex items-start justify-between gap-3">
-          <h2 className="text-base font-semibold">Add a service for {label}</h2>
-          <button type="button" onClick={close} className="text-slate-500 hover:text-slate-800 dark:hover:text-slate-200" aria-label="Close">
-            ✕
-          </button>
-        </div>
-        <ul className="mb-3 list-disc space-y-1 pl-5 text-xs text-slate-600 dark:text-slate-300">
+    <ServiceForm
+      initial={initial}
+      isNew
+      onSave={onSave}
+      onCancel={close}
+      title={`Add a service for ${label}`}
+      error={error}
+      intro={
+        <ul className="oaiy-note m-0 flex list-disc flex-col gap-1" style={{ paddingLeft: 28 }}>
           {inOaiy ? (
             <>
               <li>
@@ -103,7 +103,7 @@ function Dialog({ nodeType }: { nodeType: string }) {
               <li>
                 <strong>Your own Python rig or local server</strong> (Ollama, llama.cpp, anything with an HTTP API): add it in
                 OAIY → <strong>Services</strong>. Once installed it is listed under “Your services”; its template's{' '}
-                <code>node</code> block says how a node calls it.
+                <code className="oaiy-code">node</code> block says how a node calls it.
               </li>
             </>
           ) : (
@@ -113,22 +113,19 @@ function Dialog({ nodeType }: { nodeType: string }) {
           )}
           <li>
             <strong>Any HTTP service</strong>: describe it below. It is saved in this editor (Settings → Services) and offered
-            on {label} nodes; its body template gets the node's values as <code>{'{{prompt}}'}</code>,{' '}
-            <code>{'{{image}}'}</code>, <code>{'{{input}}'}</code> and so on.
+            on {label} nodes; its body template gets the node's values as <code className="oaiy-code">{'{{prompt}}'}</code>,{' '}
+            <code className="oaiy-code">{'{{image}}'}</code>, <code className="oaiy-code">{'{{input}}'}</code> and so on.
           </li>
         </ul>
-        <ServiceForm initial={initial} isNew onSave={onSave} onCancel={close} />
-        {inOaiy && (
-          <button
-            type="button"
-            className="mt-3 text-xs text-blue-600 hover:underline dark:text-blue-400"
-            onClick={() => void refreshDesktopServices()}
-          >
+      }
+      footerStart={
+        inOaiy ? (
+          <button type="button" className="btn btn-ghost btn-sm" onClick={() => void refreshDesktopServices()}>
             Added one in OAIY? Look again now
           </button>
-        )}
-      </div>
-    </div>
+        ) : undefined
+      }
+    />
   );
 }
 
@@ -143,7 +140,7 @@ export function openAddServiceDialog(nodeType: string): void {
   open = { root, host };
   root.render(
     <ConfirmDialogProvider>
-      <Dialog nodeType={nodeType} />
+      <AddServiceDialog nodeType={nodeType} />
     </ConfirmDialogProvider>,
   );
 }

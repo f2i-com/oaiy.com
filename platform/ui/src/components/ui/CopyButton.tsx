@@ -1,4 +1,5 @@
 import { useState, useCallback } from 'react';
+import { Check, Copy } from 'lucide-react';
 import { uiLogger as logger } from '../../utils/logger';
 
 interface CopyButtonProps {
@@ -16,7 +17,8 @@ interface CopyButtonProps {
 
 /**
  * A button that copies text to clipboard with visual feedback.
- * Shows a checkmark icon briefly after copying.
+ * Shows a checkmark icon briefly after copying. With a label it is the
+ * editor's ghost button; without one, an icon button.
  */
 export function CopyButton({
   text,
@@ -38,41 +40,30 @@ export function CopyButton({
     }
   }, [text, onCopy]);
 
-  const iconSize = size === 'sm' ? 'w-3.5 h-3.5' : 'w-4 h-4';
-  const padding = size === 'sm' ? 'p-1' : 'p-1.5';
-  const textSize = size === 'sm' ? 'text-xs' : 'text-sm';
+  const iconSize = size === 'sm' ? 13 : 15;
+  const base = label
+    ? `btn btn-ghost${size === 'sm' ? ' btn-sm' : ''}`
+    : `oaiy-icon-btn${size === 'sm' ? ' sm' : ''}`;
 
   return (
     <button
       type="button"
       onClick={handleCopy}
-      className={`
-        inline-flex items-center gap-1 rounded transition-colors
-        ${padding}
-        ${copied
-          ? 'text-green-500 dark:text-green-400'
-          : 'text-slate-500 dark:text-slate-400 hover:text-slate-700 dark:hover:text-slate-200 hover:bg-slate-100 dark:hover:bg-slate-800'
-        }
-        ${className}
-      `}
-      title={copied ? 'Copied!' : 'Copy to clipboard'}
+      className={`${base} ${className}`}
+      // The class above sets the colour (unlayered CSS), so the copied tint is inline.
+      style={copied ? { color: 'rgb(var(--signal-green))' } : undefined}
+      title={copied ? 'Copied' : 'Copy to the clipboard'}
+      aria-label={label ? undefined : copied ? 'Copied' : 'Copy to the clipboard'}
     >
-      {copied ? (
-        <svg className={iconSize} fill="none" stroke="currentColor" viewBox="0 0 24 24">
-          <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M5 13l4 4L19 7" />
-        </svg>
-      ) : (
-        <svg className={iconSize} fill="none" stroke="currentColor" viewBox="0 0 24 24">
-          <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M8 16H6a2 2 0 01-2-2V6a2 2 0 012-2h8a2 2 0 012 2v2m-6 12h8a2 2 0 002-2v-8a2 2 0 00-2-2h-8a2 2 0 00-2 2v8a2 2 0 002 2z" />
-        </svg>
-      )}
-      {label && <span className={textSize}>{copied ? 'Copied!' : label}</span>}
+      {copied ? <Check size={iconSize} aria-hidden="true" /> : <Copy size={iconSize} aria-hidden="true" />}
+      {label && <span>{copied ? 'Copied' : label}</span>}
     </button>
   );
 }
 
 /**
- * Inline copy link for use within text/error messages.
+ * Inline copy link for use within text/error messages. It takes the colour
+ * of the text around it (an error banner's, a note's).
  */
 export function CopyLink({
   text,
@@ -100,15 +91,15 @@ export function CopyLink({
       type="button"
       onClick={handleCopy}
       className={`
-        text-xs underline transition-colors
+        text-xs transition-opacity
         ${copied
-          ? 'text-green-500 dark:text-green-400 no-underline'
-          : 'text-slate-400 dark:text-slate-500 hover:text-slate-600 dark:hover:text-slate-300'
+          ? 'text-signal-green no-underline'
+          : 'underline opacity-75 hover:opacity-100'
         }
         ${className}
       `}
     >
-      {copied ? 'Copied!' : label}
+      {copied ? 'Copied' : label}
     </button>
   );
 }

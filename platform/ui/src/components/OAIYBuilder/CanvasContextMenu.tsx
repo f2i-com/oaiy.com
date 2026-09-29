@@ -5,8 +5,34 @@
  * Provides quick access to copy/paste, grouping, and layout operations.
  */
 
-import { useCallback, useEffect, useRef } from 'react';
+import { useCallback, useEffect, useRef, type ReactNode } from 'react';
+import { ClipboardPaste, Copy, FoldVertical, Group, LayoutGrid, Rows3, UnfoldVertical, Ungroup } from 'lucide-react';
 import type { Node } from '@xyflow/react';
+
+/** One item: the editor's menu row, with its shortcut at the end. */
+function Item({ icon, label, shortcut, onClick, disabled = false }: {
+  icon: ReactNode;
+  label: string;
+  shortcut?: string;
+  onClick: () => void;
+  disabled?: boolean;
+}) {
+  return (
+    <button
+      type="button"
+      role="menuitem"
+      onClick={onClick}
+      disabled={disabled}
+      className="items-center disabled:opacity-40"
+      // The menu's rows set their cursor; a disabled one says so.
+      style={disabled ? { cursor: 'not-allowed' } : undefined}
+    >
+      {icon}
+      <span>{label}</span>
+      {shortcut && <small className="ml-auto pl-3 font-mono">{shortcut}</small>}
+    </button>
+  );
+}
 
 export interface CanvasContextMenuProps {
   /** Current position of the context menu */
@@ -127,165 +153,36 @@ export function CanvasContextMenu({
       {/* Backdrop to close menu when clicking outside */}
       <div className="fixed inset-0 z-40" onClick={onClose} />
 
-      {/* Context Menu */}
+      {/* Context Menu: the editor's menu, at the pointer. */}
       <div
         ref={menuRef}
         role="menu"
         aria-orientation="vertical"
-        className="fixed z-50 bg-white dark:bg-slate-800 border border-slate-200 dark:border-slate-700 rounded-lg shadow-xl min-w-[200px] py-1"
+        aria-label="Canvas"
+        className="oaiy-menu"
         style={{ left: position.x, top: position.y }}
       >
         {/* Copy/Paste Section */}
-        <button
-          role="menuitem"
-          onClick={handleCopy}
-          disabled={!hasSelectedNodes}
-          className={`w-full px-4 py-2 text-left text-sm flex items-center gap-3 ${
-            hasSelectedNodes
-              ? 'text-slate-700 dark:text-slate-300 hover:bg-slate-100 dark:hover:bg-slate-700'
-              : 'text-slate-400 dark:text-slate-500 cursor-not-allowed'
-          }`}
-        >
-          <svg className="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24">
-            <path
-              strokeLinecap="round"
-              strokeLinejoin="round"
-              strokeWidth={2}
-              d="M8 16H6a2 2 0 01-2-2V6a2 2 0 012-2h8a2 2 0 012 2v2m-6 12h8a2 2 0 002-2v-8a2 2 0 00-2-2h-8a2 2 0 00-2 2v8a2 2 0 002 2z"
-            />
-          </svg>
-          Copy
-          <span className="ml-auto text-xs text-slate-400 dark:text-slate-500">Ctrl+C</span>
-        </button>
-        <button
-          role="menuitem"
-          onClick={handlePaste}
-          disabled={!hasClipboard}
-          className={`w-full px-4 py-2 text-left text-sm flex items-center gap-3 ${
-            hasClipboard
-              ? 'text-slate-700 dark:text-slate-300 hover:bg-slate-100 dark:hover:bg-slate-700'
-              : 'text-slate-400 dark:text-slate-500 cursor-not-allowed'
-          }`}
-        >
-          <svg className="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24">
-            <path
-              strokeLinecap="round"
-              strokeLinejoin="round"
-              strokeWidth={2}
-              d="M9 5H7a2 2 0 00-2 2v12a2 2 0 002 2h10a2 2 0 002-2V7a2 2 0 00-2-2h-2M9 5a2 2 0 002 2h2a2 2 0 002-2M9 5a2 2 0 012-2h2a2 2 0 012 2"
-            />
-          </svg>
-          Paste
-          <span className="ml-auto text-xs text-slate-400 dark:text-slate-500">Ctrl+V</span>
-        </button>
+        <Item icon={<Copy size={14} />} label="Copy" shortcut="Ctrl+C" onClick={handleCopy} disabled={!hasSelectedNodes} />
+        <Item icon={<ClipboardPaste size={14} />} label="Paste" shortcut="Ctrl+V" onClick={handlePaste} disabled={!hasClipboard} />
 
-        <div className="border-t border-slate-200 dark:border-slate-700 my-1" />
+        <hr />
 
         {/* Group Section */}
-        <button
-          role="menuitem"
-          onClick={handleGroup}
-          disabled={!canGroup}
-          className={`w-full px-4 py-2 text-left text-sm flex items-center gap-3 ${
-            canGroup
-              ? 'text-slate-700 dark:text-slate-300 hover:bg-slate-100 dark:hover:bg-slate-700'
-              : 'text-slate-400 dark:text-slate-500 cursor-not-allowed'
-          }`}
-        >
-          <svg className="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24">
-            <path
-              strokeLinecap="round"
-              strokeLinejoin="round"
-              strokeWidth={2}
-              d="M4 5a1 1 0 011-1h14a1 1 0 011 1v2a1 1 0 01-1 1H5a1 1 0 01-1-1V5zM4 13a1 1 0 011-1h6a1 1 0 011 1v6a1 1 0 01-1 1H5a1 1 0 01-1-1v-6zM16 13a1 1 0 011-1h2a1 1 0 011 1v6a1 1 0 01-1 1h-2a1 1 0 01-1-1v-6z"
-            />
-          </svg>
-          Group Selected
-          <span className="ml-auto text-xs text-slate-400 dark:text-slate-500">Ctrl+G</span>
-        </button>
-        <button
-          role="menuitem"
-          onClick={handleUngroup}
-          disabled={!canUngroup}
-          className={`w-full px-4 py-2 text-left text-sm flex items-center gap-3 ${
-            canUngroup
-              ? 'text-slate-700 dark:text-slate-300 hover:bg-slate-100 dark:hover:bg-slate-700'
-              : 'text-slate-400 dark:text-slate-500 cursor-not-allowed'
-          }`}
-        >
-          <svg className="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24">
-            <path
-              strokeLinecap="round"
-              strokeLinejoin="round"
-              strokeWidth={2}
-              d="M8 7h12m0 0l-4-4m4 4l-4 4m0 6H4m0 0l4 4m-4-4l4-4"
-            />
-          </svg>
-          Ungroup
-        </button>
+        <Item icon={<Group size={14} />} label="Group the selection" shortcut="Ctrl+G" onClick={handleGroup} disabled={!canGroup} />
+        <Item icon={<Ungroup size={14} />} label="Ungroup" onClick={handleUngroup} disabled={!canUngroup} />
 
-        <div className="border-t border-slate-200 dark:border-slate-700 my-1" />
+        <hr />
 
         {/* Layout Section */}
-        <button
-          role="menuitem"
-          onClick={handleLayoutHorizontal}
-          className="w-full px-4 py-2 text-left text-sm text-slate-700 dark:text-slate-300 hover:bg-slate-100 dark:hover:bg-slate-700 flex items-center gap-3"
-        >
-          <svg className="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24">
-            <path
-              strokeLinecap="round"
-              strokeLinejoin="round"
-              strokeWidth={2}
-              d="M9 17V7m0 10a2 2 0 01-2 2H5a2 2 0 01-2-2V7a2 2 0 012-2h2a2 2 0 012 2m0 10a2 2 0 002 2h2a2 2 0 002-2M9 7a2 2 0 012-2h2a2 2 0 012 2m0 10V7m0 10a2 2 0 002 2h2a2 2 0 002-2V7a2 2 0 00-2-2h-2a2 2 0 00-2 2"
-            />
-          </svg>
-          Auto Layout (Horizontal)
-        </button>
-        <button
-          role="menuitem"
-          onClick={handleLayoutVertical}
-          className="w-full px-4 py-2 text-left text-sm text-slate-700 dark:text-slate-300 hover:bg-slate-100 dark:hover:bg-slate-700 flex items-center gap-3"
-        >
-          <svg className="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24">
-            <path
-              strokeLinecap="round"
-              strokeLinejoin="round"
-              strokeWidth={2}
-              d="M19 11H5m14 0a2 2 0 012 2v6a2 2 0 01-2 2H5a2 2 0 01-2-2v-6a2 2 0 012-2m14 0V9a2 2 0 00-2-2M5 11V9a2 2 0 012-2m0 0V5a2 2 0 012-2h6a2 2 0 012 2v2M7 7h10"
-            />
-          </svg>
-          Auto Layout (Vertical)
-        </button>
+        <Item icon={<LayoutGrid size={14} />} label="Lay out left to right" onClick={handleLayoutHorizontal} />
+        <Item icon={<Rows3 size={14} />} label="Lay out top to bottom" onClick={handleLayoutVertical} />
 
-        <div className="border-t border-slate-200 dark:border-slate-700 my-1" />
+        <hr />
 
         {/* Collapse/Expand Section */}
-        <button
-          role="menuitem"
-          onClick={handleCollapse}
-          className="w-full px-4 py-2 text-left text-sm text-slate-700 dark:text-slate-300 hover:bg-slate-100 dark:hover:bg-slate-700 flex items-center gap-3"
-        >
-          <svg className="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24">
-            <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M20 12H4" />
-          </svg>
-          Collapse All Nodes
-        </button>
-        <button
-          role="menuitem"
-          onClick={handleExpand}
-          className="w-full px-4 py-2 text-left text-sm text-slate-700 dark:text-slate-300 hover:bg-slate-100 dark:hover:bg-slate-700 flex items-center gap-3"
-        >
-          <svg className="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24">
-            <path
-              strokeLinecap="round"
-              strokeLinejoin="round"
-              strokeWidth={2}
-              d="M4 8V4m0 0h4M4 4l5 5m11-1V4m0 0h-4m4 0l-5 5M4 16v4m0 0h4m-4 0l5-5m11 5l-5-5m5 5v-4m0 4h-4"
-            />
-          </svg>
-          Expand All Nodes
-        </button>
+        <Item icon={<FoldVertical size={14} />} label="Collapse every node" onClick={handleCollapse} />
+        <Item icon={<UnfoldVertical size={14} />} label="Expand every node" onClick={handleExpand} />
       </div>
     </>
   );
