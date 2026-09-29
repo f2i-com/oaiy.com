@@ -115,7 +115,19 @@ export class Callbacks {
      * OAIY does not as well, so no one is rung twice.
      */
     private readonly callsToOaiy: () => Promise<boolean | null> = async () => true,
+    /** A number never to be rung (they asked not to be called: the do-not-contact list). */
+    private readonly skip: (number: string) => boolean = () => false,
   ) {}
+
+  /** A call back is ringing now. */
+  ringing(): boolean {
+    return this.list.some((c) => c.state === 'calling');
+  }
+
+  /** A call back is due now (it goes before an outreach list: a missed caller first). */
+  due(now = Date.now()): boolean {
+    return this.settings().callBack && this.list.some((c) => c.state === 'waiting' && c.nextAt <= now && now - c.missedAt <= TOO_OLD_MS && !this.skip(c.number));
+  }
 
   async load(): Promise<void> {
     this.list = await this.project.loadCallbacks();
@@ -202,6 +214,11 @@ export class Callbacks {
       for (const c of this.list) if (c.state === 'waiting' && now - c.missedAt > TOO_OLD_MS) Object.assign(c, { state: 'dropped', note: 'Too long ago to call back.' });
       const next = this.list.filter((c) => c.state === 'waiting' && c.nextAt <= now).sort((a, b) => a.missedAt - b.missedAt)[0];
       if (!next) return;
+      if (this.skip(next.number)) {
+        Object.assign(next, { state: 'dropped', note: 'They asked not to be called.' });
+        await this.save();
+        return;
+      }
       if (!callsBack(next.number, settings.callBackFilter, await this.screening())) {
         Object.assign(next, { state: 'dropped', note: 'Not one of the numbers you call back.' });
         await this.save();

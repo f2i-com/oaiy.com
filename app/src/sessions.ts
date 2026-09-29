@@ -1616,6 +1616,12 @@ export class DesktopEvents {
     private readonly handle: (event: DesktopEvent) => void | Promise<void>,
     private readonly status: (problem: string) => void = () => {},
     private readonly every = 2000,
+    /**
+     * The events the first look passes over (those from before this page
+     * opened, or came while it reloaded), a page at a time: not acted on as
+     * new, but what was under way (an outreach call's end) can be settled.
+     */
+    private readonly backlog: (events: DesktopEvent[]) => void | Promise<void> = () => {},
   ) {}
 
   start(): void {
@@ -1644,6 +1650,11 @@ export class DesktopEvents {
             const page = await desktop.events(since);
             if (!page.events.length || page.next <= since) break;
             since = page.next;
+            try {
+              await this.backlog(page.events);
+            } catch {
+              /* what could not be settled from it is settled later (outreach looks at a lost call itself) */
+            }
           }
           this.since = since;
         } else {

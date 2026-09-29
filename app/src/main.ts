@@ -10,6 +10,7 @@ import { Desktop } from './desktop/bridge';
 import { DesktopEvents, Sessions, TEST_NUMBER, callerNotesTool, phoneConversationsTool, tellAgentTool, type Session, type Thread } from './sessions';
 import { displayNumber, setLocalCountry } from './phoneNumbers';
 import { Callbacks, type Screening } from './callbacks';
+import { PhoneLine } from './phoneLine';
 import { UNPAIRED, diffModules, followModules, isOn, readModules, sessionShown, whyOff, type Modules } from './modules';
 import { flowSessionTools, flowToolHooks, readFlowStore } from './desktop/flowTools';
 import { pluginSessionTools, type PluginToolAudience } from './desktop/pluginTools';
@@ -178,6 +179,8 @@ async function main(): Promise<void> {
   let sessions: Sessions | null = null;
   /** Missed calls rung back (by the page that answers the calls). */
   let callbacks: Callbacks | null = null;
+  /** The phone's one line, as call backs and outreach see it: busy while any call is on it, and a minute after. */
+  const line = new PhoneLine();
   // Several OAIY pages may follow the same phone: the one holding this lease answers its texts.
   const pageId = crypto.randomUUID();
   let holdsTexts = false;
@@ -600,8 +603,8 @@ async function main(): Promise<void> {
     ));
     own.calendarOn = calendarOn;
     await own.load();
-    // Missed calls rung back: by the page that answers the calls, when no call is going on (started with the phone).
-    callbacks = new Callbacks(frontDesk, () => messages, () => desktop, () => holdsCalls && !own.list.some((s) => s.callId), readScreening, () => {}, callsToOaiy);
+    // Missed calls rung back: by the page that answers the calls, when the line is free (started with the phone).
+    callbacks = new Callbacks(frontDesk, () => messages, () => desktop, () => holdsCalls && line.idle(Date.now(), own.list.some((s) => s.callId)), readScreening, () => {}, callsToOaiy);
     await callbacks.load();
     // A call back's call is taken by the agent knowing it rang them, and why.
     own.callingBack = (number) => callbacks?.calling(number);
@@ -1671,6 +1674,8 @@ With that done, Settings → Images, video and audio → Find OAIY sets it up.`)
   // taken only while there is a phone.
   const desktopEvents = new DesktopEvents(() => desktop, async (event) => {
     if (!phoneOn()) return;
+    // The line first: who else is on it decides whether a call back or an outreach dial may go.
+    line.event(event);
     if (event.name === 'aokie.phone.connected' || event.name === 'aokie.phone.disconnected') {
       phoneConnected = event.name === 'aokie.phone.connected';
       renderPhoneChip();
@@ -1687,6 +1692,10 @@ With that done, Settings → Images, video and audio → Find OAIY sets it up.`)
       void refreshControl();
       void followAgentModel();
     }
+  }, 2000, async (events) => {
+    if (!phoneOn()) return;
+    // What came before this page looked (or while it reloaded): the line learns who is on it.
+    for (const event of events) line.event(event, Date.parse(event.occurredAt) || Date.now());
   });
 
   /**

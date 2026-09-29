@@ -222,6 +222,21 @@ describe("following the desktop's events", () => {
     follower.stop();
   });
 
+  it('what the first look passes over is handed on as a backlog, a page at a time, and never acted on as new', async () => {
+    const ring = [event(1), event(2), event(3, 'aokie.call.ended'), event(4), event(5)];
+    const seen: number[] = [];
+    const backlog: number[][] = [];
+    const follower = new DesktopEvents(() => ringOf(ring) as unknown as Desktop, (e) => void seen.push(e.seq), () => {}, 60_000, (events) => void backlog.push(events.map((e) => e.seq)));
+    await follower.tick();
+    expect(backlog).toEqual([[1, 2], [3, 4], [5]]);
+    expect(seen).toEqual([]);
+    ring.push(event(6));
+    await follower.tick();
+    expect(seen).toEqual([6]);
+    expect(backlog).toHaveLength(3);
+    follower.stop();
+  });
+
   it('says when the desktop cannot be reached, and when it can again', async () => {
     const said: string[] = [];
     let down = true;
