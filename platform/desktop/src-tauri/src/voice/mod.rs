@@ -131,7 +131,9 @@ impl VoiceHub {
 /// `call.ended`), `GET /api/voice/calls`, and per call `say`, `tool`, `finish`, `hush`.
 /// `PUT /api/voice/callers` keeps the name a caller is greeted by. These are the
 /// phone's: while no plugin provides the phone they answer `module_disabled`.
-/// Speech to text and the voices are core (the agent's own tools use them).
+/// Speech to text and the voices are core (the agent's own tools use them), and
+/// kept with the voices, `GET`/`PUT /api/voice/settings` is how long a call's
+/// greeting waits after the call connects (`greetingDelayMs`, also in `GET /api/voice/voices`).
 pub fn app_router(hub: VoiceHub) -> Router {
     let phone = Router::new()
         .route("/api/voice/events", get(events))
@@ -153,6 +155,8 @@ pub fn app_router(hub: VoiceHub) -> Router {
         .route("/api/voice/voices/chosen", put(voice_choose))
         .route("/api/voice/voices/:name", delete(voice_remove))
         .route("/api/voice/voices/:name/try", post(voice_try))
+        // How long a call's greeting waits after the call connects (`greetingDelayMs`, 0 to 5000).
+        .route("/api/voice/settings", get(call_settings).put(call_settings_set))
         .merge(phone)
         .with_state(hub)
 }
@@ -184,7 +188,25 @@ fn voice_error(status: StatusCode, code: &str, message: impl Into<String>) -> ax
 }
 
 async fn voices_list() -> Json<Value> {
-    Json(json!({"voices": voices::list(), "chosen": voices::chosen()}))
+    Json(json!({"voices": voices::list(), "chosen": voices::chosen(), "greetingDelayMs": voices::greeting_delay_ms()}))
+}
+
+async fn call_settings() -> Json<Value> {
+    Json(json!({"greetingDelayMs": voices::greeting_delay_ms()}))
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct CallSettings {
+    greeting_delay_ms: f64,
+}
+
+/// `PUT /api/voice/settings {greetingDelayMs}`: kept to 0 to 5000, and answered with what was kept.
+async fn call_settings_set(Json(body): Json<CallSettings>) -> axum::response::Response {
+    match voices::set_greeting_delay_ms(body.greeting_delay_ms) {
+        Ok(ms) => Json(json!({"greetingDelayMs": ms})).into_response(),
+        Err(e) => voice_error(StatusCode::BAD_REQUEST, "bad_settings", e),
+    }
 }
 
 #[derive(Deserialize)]
@@ -517,7 +539,9 @@ mod tests {
             assert_eq!(body["error"]["code"], "module_disabled", "{url}");
         }
         // The voices and speech to text are the agent's too: not the phone's.
-        assert_eq!(client.get(format!("{base}/api/voice/voices")).send().await.unwrap().status(), 200);
+        let listed: Value = client.get(format!("{base}/api/voice/voices")).send().await.unwrap().json().await.unwrap();
+        assert!(listed["greetingDelayMs"].as_u64().is_some_and(|ms| ms <= voices::MAX_GREETING_DELAY_MS), "{listed}");
+        assert_eq!(client.get(format!("{base}/api/voice/settings")).send().await.unwrap().status(), 200);
         assert_eq!(client.post(format!("{base}/api/voice/transcribe")).body("not a wav").send().await.unwrap().status(), 400);
         // An unknown path is still not found.
         assert_eq!(client.get(format!("{base}/api/voice/nothing")).send().await.unwrap().status(), 404);

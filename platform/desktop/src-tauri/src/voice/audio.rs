@@ -177,6 +177,11 @@ impl Detector {
         }
     }
 
+    /// Whether the caller is in an utterance: it has started, and not yet ended.
+    pub fn in_speech(&self) -> bool {
+        self.speaking
+    }
+
     fn ms_frames(&self, ms: u32) -> usize {
         (ms / FRAME_MS) as usize
     }
@@ -291,6 +296,7 @@ mod tests {
         heard.extend(d.push(&tone(900, rate, 6000.0)));
         heard.extend(d.push(&tone(800, rate, 40.0)));
         assert_eq!(heard.len(), 3, "{:?}", names(&heard));
+        assert!(!d.in_speech(), "the pause ended it");
         // It starts where the voice does, not where it was noticed.
         assert_eq!(heard[0], Heard::Started { at_ms: 1000 });
         assert_eq!(heard[1], Heard::Sustained);
@@ -353,6 +359,19 @@ mod tests {
         heard.extend(d.push(&tone(60, rate, 8000.0)));
         heard.extend(d.push(&tone(1000, rate, 40.0)));
         assert!(heard.is_empty(), "{} events", heard.len());
+    }
+
+    #[test]
+    fn a_noise_that_starts_like_speech_ends_without_words() {
+        let rate = 24_000;
+        let mut d = Detector::new(rate);
+        let mut heard = d.push(&tone(1000, rate, 40.0));
+        heard.extend(d.push(&tone(140, rate, 6000.0)));
+        assert_eq!(heard, vec![Heard::Started { at_ms: 1000 }]);
+        assert!(d.in_speech());
+        // Too little voice for words: nothing is heard, and it is over.
+        assert!(d.push(&tone(1000, rate, 40.0)).is_empty());
+        assert!(!d.in_speech());
     }
 
     #[test]

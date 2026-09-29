@@ -18,6 +18,15 @@
 //! reply is dropped. The greeting is not cut off: people say "hello?" as a
 //! call connects; what they say is still heard and answered.
 //!
+//! The greeting is not said the moment the call begins: the phone has
+//! answered, but the caller's handset hears the line a second or two later,
+//! and what is said before then is lost. See [`Opening`]: a call that came in
+//! is greeted after a settle (`greetingDelayMs`, 1.5 s unless set), or as soon
+//! as the caller's own "Hello?" ends; a call we placed opens when the callee's
+//! "Hello?" ends, or after a silence. The caller is heard from the start, but
+//! what they say before the greeting is not answered on its own: the greeting
+//! answers it (the app reads it with their next words).
+//!
 //! The app is told when things were said, in milliseconds since the call began.
 
 use std::collections::HashMap;
@@ -26,13 +35,13 @@ use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
 use axum::extract::ws::{Message, WebSocket};
-use futures_util::{SinkExt, StreamExt};
+use futures_util::{Sink, SinkExt, Stream, StreamExt};
 use serde_json::{json, Value};
 use tokio::sync::{mpsc, oneshot};
 
 use super::audio::{self, Detector, Heard};
 use super::engines::{Engines, WIRE_RATE};
-use super::{VoiceHub, DESTINATION};
+use super::{voices, VoiceHub, DESTINATION};
 
 /// What the app asks of a live call.
 pub enum CallCommand {
@@ -67,6 +76,64 @@ const PLAYOUT_MARGIN: Duration = Duration::from_millis(250);
 
 /// How long the transcriber waits for a cut it asked Aokie for.
 const CUT_WAIT: Duration = Duration::from_millis(500);
+
+/// A caller still speaking when the greeting's settle is over is waited for,
+/// but the greeting is said this long after the call begins at the latest.
+const GREETING_LATEST: Duration = Duration::from_millis(3_000);
+/// A call we placed: the opening line waits for the callee's "Hello?", or this long in silence.
+const OPENING_SILENCE: Duration = Duration::from_millis(2_500);
+/// ...and is said this long after the call begins at the latest, though they still talk.
+const OPENING_LATEST: Duration = Duration::from_millis(6_000);
+
+/// When a call's first words are said: not as it begins, as the caller's
+/// handset hears the line a second or two after the phone answers. A call that
+/// came in is greeted once the settle is over, or as soon as the caller's
+/// "Hello?" ends if they speak first; a call we placed opens as the callee's
+/// "Hello?" ends, or after a silence. Someone still speaking is waited for,
+/// until `latest`.
+#[derive(Clone, Copy, Debug, PartialEq)]
+struct Opening {
+    /// Said from now on, once the caller is not speaking.
+    settle: Instant,
+    /// Said now, though they still speak.
+    latest: Instant,
+    /// The caller has said something: said as soon as they are quiet.
+    heard: bool,
+}
+
+impl Opening {
+    /// The wait for a call begun at `begun`: one we placed, or one that came
+    /// in with a settle of `delay`. None when the greeting is said at once.
+    fn after(begun: Instant, outbound: bool, delay: Duration) -> Option<Self> {
+        if outbound {
+            return Some(Self { settle: begun + OPENING_SILENCE, latest: begun + OPENING_LATEST, heard: false });
+        }
+        (!delay.is_zero()).then(|| Self { settle: begun + delay, latest: begun + delay.max(GREETING_LATEST), heard: false })
+    }
+
+    /// Whether it is said now, with the caller speaking or not.
+    fn due(&self, now: Instant, caller_speaking: bool) -> bool {
+        now >= self.latest || (!caller_speaking && (self.heard || now >= self.settle))
+    }
+
+    /// When to look again, if nothing is heard meanwhile.
+    fn next_look(&self, now: Instant) -> Instant {
+        if now < self.settle {
+            self.settle
+        } else {
+            self.latest
+        }
+    }
+}
+
+/// How long a call's greeting waits after it begins: as the begin or start
+/// event asks (`greetingDelayMs`: a phone that knows its line may say), else
+/// as set on this desktop (`configured`); kept to 0 to 5 s.
+fn greeting_delay(begin: &Value, start: &Value, configured: u64) -> Duration {
+    let asked = |v: &Value| v.get("greetingDelayMs").and_then(Value::as_f64);
+    let ms = asked(begin).or_else(|| asked(start)).map_or(configured.min(voices::MAX_GREETING_DELAY_MS), voices::clamp_greeting_delay);
+    Duration::from_millis(ms)
+}
 
 /// Milliseconds since the call began (`formlogic.realtime.begin`): when things were said, for the app.
 #[derive(Clone, Default)]
@@ -189,6 +256,8 @@ struct Utterance {
     cut: bool,
     /// Said over us, and short: its words decide whether we stop.
     decides: bool,
+    /// Begun before the greeting was said (a "Hello?" as the line opened): the greeting answers it.
+    early: bool,
 }
 
 /// Whether the caller only acknowledged us ("mm-hmm", "yeah, okay"): one to
@@ -266,7 +335,16 @@ fn speaks_only(start: &Value) -> bool {
 
 /// Run one call to its end.
 pub async fn run(socket: WebSocket, hub: VoiceHub, engines: Engines) {
-    let (mut sink, mut stream) = socket.split();
+    let (sink, stream) = socket.split();
+    run_on(sink, stream, hub, engines).await;
+}
+
+/// One call, over the two halves of Aokie's stream: what goes to Aokie (`sink`) and what comes from it.
+async fn run_on<Si, St, E>(mut sink: Si, mut stream: St, hub: VoiceHub, engines: Engines)
+where
+    Si: Sink<Message> + Unpin + Send + 'static,
+    St: Stream<Item = Result<Message, E>> + Unpin,
+{
     // The start, before anything else.
     let (ids, start) = loop {
         match stream.next().await {
@@ -291,6 +369,8 @@ pub async fn run(socket: WebSocket, hub: VoiceHub, engines: Engines) {
     // and on a call it placed, why and its first words. Absent: the plugin's events say who.
     let (direction, start_from, start_name) = (str_of("direction"), str_of("from"), str_of("callerName"));
     let (purpose, opening_line) = (str_of("purpose"), str_of("openingLine"));
+    // A call we placed opens when the callee has said "Hello?" (see `Opening`).
+    let outbound = direction.trim().eq_ignore_ascii_case("outbound");
     let speak_only = speaks_only(&start);
     // The voice chosen for calls (a clip in the voices folder; see `voices`).
     let voice: Option<String> = super::voices::chosen();
@@ -449,7 +529,9 @@ pub async fn run(socket: WebSocket, hub: VoiceHub, engines: Engines) {
                         continue;
                     }
                 };
-                let backchannel = utterance.over && !utterance.cut && is_backchannel(&text);
+                // Said before the greeting: not answered on its own (the greeting answers it), but
+                // read with the caller's next words, as an "mm-hmm" is.
+                let backchannel = utterance.early || (utterance.over && !utterance.cut && is_backchannel(&text));
                 let mut cut = utterance.cut;
                 let still_out = || {
                     let s = speaking.lock().unwrap();
@@ -469,7 +551,10 @@ pub async fn run(socket: WebSocket, hub: VoiceHub, engines: Engines) {
                 }
                 let item = next_item("in");
                 let _ = out_tx.send(ids.event("formlogic.realtime.input_transcript", json!({"itemId": item, "transcript": text, "final": true}))).await;
-                let how = json!({"startMs": utterance.start_ms, "endMs": utterance.end_ms, "over": utterance.over, "cut": cut, "backchannel": backchannel});
+                let mut how = json!({"startMs": utterance.start_ms, "endMs": utterance.end_ms, "over": utterance.over, "cut": cut, "backchannel": backchannel});
+                if utterance.early {
+                    how["beforeGreeting"] = json!(true);
+                }
                 hub.caller_said(&ids.call, &text, how);
             }
         })
@@ -496,6 +581,11 @@ pub async fn run(socket: WebSocket, hub: VoiceHub, engines: Engines) {
 
     let mut detector = Detector::new(WIRE_RATE);
     let mut hearing = Hearing::default();
+    // The utterance being heard began before the greeting was said.
+    let mut early = false;
+    // The greeting, waiting for the line to open (see `Opening`), and what is to be said after it meanwhile.
+    let mut opening: Option<Opening> = None;
+    let mut after_greeting: Vec<SpeakJob> = Vec::new();
     // The goodbye is being said: the call is ending.
     let mut ending = false;
     let mut begun = false;
@@ -551,7 +641,12 @@ pub async fn run(socket: WebSocket, hub: VoiceHub, engines: Engines) {
                                 }
                                 hub.emit(started);
                                 if !greeting.trim().is_empty() {
-                                    speak(greeting.clone(), true, None);
+                                    // Said once the line is open: now, if the call asks for no wait.
+                                    let delay = greeting_delay(&v, &start, voices::greeting_delay_ms());
+                                    opening = Opening::after(Instant::now(), outbound, delay);
+                                    if opening.is_none() {
+                                        speak(greeting.clone(), true, None);
+                                    }
                                 }
                             }
                             "formlogic.realtime.cancel_output" => {
@@ -569,7 +664,12 @@ pub async fn run(socket: WebSocket, hub: VoiceHub, engines: Engines) {
                                     let _ = reply.send(Ok(json!({"ok": ok, "output": output})));
                                 } else if let Some((goodbye, reply)) = finishing.remove(&id) {
                                     if ok {
-                                        speak(goodbye, false, Some(id));
+                                        // Not before the greeting, while it waits for the line to open.
+                                        if opening.is_some() {
+                                            after_greeting.push(SpeakJob { text: goodbye, epoch: epoch.load(Ordering::SeqCst), greeting: false, then_hangup: Some(id) });
+                                        } else {
+                                            speak(goodbye, false, Some(id));
+                                        }
                                         ending = true;
                                     }
                                     let _ = reply.send(Ok(json!({"ok": ok, "output": output})));
@@ -597,6 +697,7 @@ pub async fn run(socket: WebSocket, hub: VoiceHub, engines: Engines) {
                                     // Over the rest of what we say, not yet: it may be an "mm-hmm".
                                     let (next, tell) = Hearing::began(out, quiet, ending);
                                     hearing = next;
+                                    early = opening.is_some();
                                     if tell {
                                         let _ = out_tx.send(ids.event("formlogic.realtime.speech_started", json!({}))).await;
                                     }
@@ -609,7 +710,11 @@ pub async fn run(socket: WebSocket, hub: VoiceHub, engines: Engines) {
                                     }
                                 }
                                 Heard::Utterance { audio, start_ms, end_ms } => {
-                                    let _ = utter_tx.send(Utterance { audio, start_ms, end_ms, over: hearing.over, cut: hearing.cut, decides: hearing.may_cut });
+                                    // Their "Hello?" is over: the greeting waiting for the line is said now.
+                                    if let Some(o) = opening.as_mut() {
+                                        o.heard = true;
+                                    }
+                                    let _ = utter_tx.send(Utterance { audio, start_ms, end_ms, over: hearing.over, cut: hearing.cut, decides: hearing.may_cut, early });
                                 }
                                 Heard::Nothing => {}
                             }
@@ -632,7 +737,18 @@ pub async fn run(socket: WebSocket, hub: VoiceHub, engines: Engines) {
                         if !text.is_empty() {
                             ending = false;
                         }
-                        let _ = reply.send(if text.is_empty() { Err("nothing to say".into()) } else if !begun { Err("the call has not begun".into()) } else { Ok(speak(text, false, None)) });
+                        let said = if text.is_empty() {
+                            Err("nothing to say".into())
+                        } else if !begun {
+                            Err("the call has not begun".into())
+                        } else if opening.is_some() {
+                            // The greeting waits for the line to open: this is said after it.
+                            after_greeting.push(SpeakJob { text, epoch: epoch.load(Ordering::SeqCst), greeting: false, then_hangup: None });
+                            Ok(next_item("say"))
+                        } else {
+                            Ok(speak(text, false, None))
+                        };
+                        let _ = reply.send(said);
                     }
                     CallCommand::Hush => cut(),
                     CallCommand::Tool { name, arguments, reply } => {
@@ -650,6 +766,18 @@ pub async fn run(socket: WebSocket, hub: VoiceHub, engines: Engines) {
                         let _ = out_tx.send(ids.event("formlogic.realtime.tool_call", json!({"toolCallId": id, "name": "finish_call", "arguments": {}}))).await;
                     }
                 }
+            }
+            // The greeting's settle, or its latest: look again (an hour on while nothing waits; it is not polled then).
+            _ = tokio::time::sleep_until(opening.map_or_else(|| Instant::now() + Duration::from_secs(3600), |o| o.next_look(Instant::now())).into()), if opening.is_some() => {}
+        }
+        // The line is open: the greeting, then what waited for it. A call that ends first says nothing.
+        if opening.is_some_and(|o| o.due(Instant::now(), detector.in_speech())) {
+            opening = None;
+            // What the caller says from now on is said over the greeting (the speaker marks it too, once it starts).
+            speaking.lock().unwrap().quiet_until = Some(Instant::now() + Duration::from_secs(60));
+            speak(greeting.clone(), true, None);
+            for job in after_greeting.drain(..) {
+                let _ = speak_tx.send(Speak::Job(job));
             }
         }
     };
@@ -763,5 +891,346 @@ mod tests {
         assert_eq!(item.heard_until, Some(late + Duration::from_secs(1)));
         let clock = Clock::default();
         assert_eq!(clock.ms(late), 0, "before the call begins, all is at 0");
+    }
+
+    #[test]
+    fn the_greeting_delay_is_the_calls_else_this_desktops_and_at_most_five_seconds() {
+        let ms = |begin: Value, start: Value, configured: u64| greeting_delay(&begin, &start, configured).as_millis() as u64;
+        // Nothing asked: as set here.
+        assert_eq!(ms(json!({}), json!({}), 1_500), 1_500);
+        assert_eq!(ms(json!({}), json!({}), 800), 800);
+        assert_eq!(ms(json!({}), json!({}), 60_000), 5_000);
+        // The start's, over this desktop's; the begin's, over both.
+        assert_eq!(ms(json!({}), json!({"greetingDelayMs": 300}), 800), 300);
+        assert_eq!(ms(json!({"greetingDelayMs": 0}), json!({"greetingDelayMs": 300}), 800), 0);
+        // Kept to 0 to 5 s, in whole milliseconds.
+        assert_eq!(ms(json!({"greetingDelayMs": 9_000}), json!({}), 800), 5_000);
+        assert_eq!(ms(json!({"greetingDelayMs": -50}), json!({}), 800), 0);
+        assert_eq!(ms(json!({"greetingDelayMs": 1234.4}), json!({}), 800), 1_234);
+        // Not a number: not asked.
+        assert_eq!(ms(json!({"greetingDelayMs": "soon"}), json!({"greetingDelayMs": null}), 800), 800);
+    }
+
+    #[test]
+    fn a_greeting_waits_for_the_settle_or_the_callers_hello() {
+        let t0 = Instant::now();
+        let at = |ms: u64| t0 + Duration::from_millis(ms);
+        // No wait asked for: said at once.
+        assert_eq!(Opening::after(t0, false, Duration::ZERO), None);
+        // A call that came in: once the settle is over, unless the caller is speaking; then until 3 s at most.
+        let o = Opening::after(t0, false, Duration::from_millis(1_500)).unwrap();
+        assert!(!o.due(at(1_499), false));
+        assert!(o.due(at(1_500), false));
+        assert!(!o.due(at(1_500), true), "not over the caller");
+        assert!(!o.due(at(2_999), true));
+        assert!(o.due(at(3_000), true), "though they still talk");
+        assert_eq!((o.next_look(at(0)), o.next_look(at(1_600))), (at(1_500), at(3_000)));
+        // Their "Hello?" is over: said now, before the settle is.
+        let heard = Opening { heard: true, ..o };
+        assert!(heard.due(at(400), false));
+        assert!(!heard.due(at(400), true), "they speak again");
+        // A longer settle is its own latest.
+        let long = Opening::after(t0, false, Duration::from_millis(4_000)).unwrap();
+        assert!(!long.due(at(3_500), true));
+        assert!(long.due(at(4_000), true));
+        // A call we placed: the callee's "Hello?", else 2.5 s of silence; 6 s at most. Any delay is theirs to break.
+        let o = Opening::after(t0, true, Duration::ZERO).unwrap();
+        assert!(!o.due(at(2_499), false));
+        assert!(o.due(at(2_500), false));
+        assert!(!o.due(at(5_999), true));
+        assert!(o.due(at(6_000), true));
+        assert!(Opening { heard: true, ..o }.due(at(300), false));
+    }
+
+    // ---- A call, with a stand-in for Aokie on the other end of its stream ---------------
+
+    /// How long each line the stand-in speech server speaks lasts.
+    const LINE_MS: usize = 300;
+
+    /// A stand-in for OAIY's speech server: every line is `LINE_MS` of a quiet hum, and every utterance is "Hello?".
+    async fn speech_server() -> String {
+        use axum::routing::post;
+        let line = audio::bytes(&vec![120i16; WIRE_RATE as usize * LINE_MS / 1000]);
+        let app = axum::Router::new()
+            .route(
+                "/v1/audio/speech",
+                post(move || {
+                    let line = line.clone();
+                    async move { ([("x-sample-rate", "24000")], line) }
+                }),
+            )
+            .route("/v1/audio/transcriptions", post(|| async { axum::Json(json!({"text": "Hello?"})) }));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        format!("http://{addr}")
+    }
+
+    /// Phone audio: `ms` of a tone (`amp` 40 is the line's hum, 6000 a voice).
+    fn tone(ms: usize, amp: f32) -> Vec<i16> {
+        (0..WIRE_RATE as usize * ms / 1000).map(|i| (amp * (i as f32 * 0.07).sin()) as i16).collect()
+    }
+
+    /// "Hello?": half a second of voice between the line's hum, and the pause that ends it.
+    fn hello() -> Vec<i16> {
+        [tone(200, 40.0), tone(500, 6_000.0), tone(900, 40.0)].concat()
+    }
+
+    const GREETING: &str = "Hi! Thanks for calling.";
+    const OPENING_LINE: &str = "Hi, it's the lawn crew about Tuesday.";
+
+    /// Aokie's side of one call, over the call's stream (its two halves as channels):
+    /// what it sends the desktop, what it hears back, and what the app is told.
+    struct Aokie {
+        to_desktop: mpsc::UnboundedSender<Message>,
+        from_desktop: mpsc::UnboundedReceiver<Message>,
+        events: tokio::sync::broadcast::Receiver<Value>,
+        hub: VoiceHub,
+        call: String,
+        /// When the call began (the begin was sent).
+        begun: Instant,
+    }
+
+    impl Aokie {
+        /// A call started (with `fields` in its start), up to the desktop's `ready`.
+        async fn start(fields: Value) -> Self {
+            let speech = speech_server().await;
+            let hub = VoiceHub::new(Engines::at(&speech, &speech), |_| None);
+            let events = hub.inner.events.subscribe();
+            let (to_desktop, from_aokie) = mpsc::unbounded_channel::<Message>();
+            let (to_aokie, from_desktop) = mpsc::unbounded_channel::<Message>();
+            let stream = futures_util::stream::unfold(from_aokie, |mut rx| async move { rx.recv().await.map(|m| (Ok::<_, std::convert::Infallible>(m), rx)) });
+            let sink = futures_util::sink::unfold(to_aokie, |tx, m: Message| async move { tx.send(m).map(|()| tx).map_err(|_| "Aokie hung up") });
+            tokio::spawn(run_on(Box::pin(sink), Box::pin(stream), hub.clone(), Engines::at(&speech, &speech)));
+            let call = format!("call_{}", next_item("test"));
+            let mut start = json!({"type": "formlogic.realtime.start", "callId": call, "generation": 1, "destinationOrigin": DESTINATION, "sampleRate": WIRE_RATE, "greeting": GREETING, "direction": "inbound"});
+            for (key, value) in fields.as_object().cloned().unwrap_or_default() {
+                start[key] = value;
+            }
+            to_desktop.send(Message::Text(start.to_string())).unwrap();
+            let mut aokie = Self { to_desktop, from_desktop, events, hub, call, begun: Instant::now() };
+            let ready = aokie.next(Duration::from_secs(5)).await;
+            assert!(matches!(&ready, Some(Message::Text(t)) if t.contains("formlogic.realtime.ready")), "not ready");
+            aokie
+        }
+
+        /// The call connects (with `fields` in the begin).
+        fn begin(&mut self, fields: Value) {
+            let mut begin = json!({"type": "formlogic.realtime.begin", "callId": self.call, "generation": 1});
+            for (key, value) in fields.as_object().cloned().unwrap_or_default() {
+                begin[key] = value;
+            }
+            self.begun = Instant::now();
+            self.to_desktop.send(Message::Text(begin.to_string())).unwrap();
+        }
+
+        /// The caller's audio, all at once (the desktop hears it by its length, as it plays).
+        fn caller(&self, samples: &[i16]) {
+            for frame in samples.chunks(WIRE_RATE as usize / 50) {
+                self.to_desktop.send(Message::Binary(audio::bytes(frame))).unwrap();
+            }
+        }
+
+        /// A text for Aokie (a stop, a tool's result).
+        fn send(&self, event: Value) {
+            self.to_desktop.send(Message::Text(event.to_string())).unwrap();
+        }
+
+        /// What the desktop sends next, within `wait` (None: nothing, or the stream has closed).
+        async fn next(&mut self, wait: Duration) -> Option<Message> {
+            tokio::time::timeout(wait, self.from_desktop.recv()).await.ok().flatten()
+        }
+
+        /// The first of our speech the caller would hear: how long after the call began it
+        /// came, and the events before it.
+        async fn first_audio(&mut self, wait: Duration) -> Option<(Duration, Vec<Value>)> {
+            let until = Instant::now() + wait;
+            let mut before = Vec::new();
+            loop {
+                match self.next(until.saturating_duration_since(Instant::now())).await? {
+                    Message::Binary(_) => return Some((self.begun.elapsed(), before)),
+                    Message::Text(t) => before.push(serde_json::from_str(&t).unwrap()),
+                    _ => {}
+                }
+            }
+        }
+
+        /// The next event of `kind` sent to Aokie, within `wait`.
+        async fn text(&mut self, kind: &str, wait: Duration) -> Option<Value> {
+            let until = Instant::now() + wait;
+            loop {
+                if let Message::Text(t) = self.next(until.saturating_duration_since(Instant::now())).await? {
+                    let v: Value = serde_json::from_str(&t).unwrap();
+                    if v["type"] == kind {
+                        return Some(v);
+                    }
+                }
+            }
+        }
+
+        /// The next event of `kind` the app is told, within `wait`.
+        async fn event(&mut self, kind: &str, wait: Duration) -> Option<Value> {
+            let until = Instant::now() + wait;
+            loop {
+                match tokio::time::timeout(until.saturating_duration_since(Instant::now()), self.events.recv()).await.ok()? {
+                    Ok(v) if v["type"] == kind => return Some(v),
+                    Ok(_) | Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {}
+                    Err(_) => return None,
+                }
+            }
+        }
+
+        /// Ask the call to say `text`, as the app does.
+        async fn say(&self, text: &str) -> Result<String, String> {
+            let (reply, answer) = oneshot::channel();
+            assert!(self.hub.command(&self.call).expect("the call is listed").send(CallCommand::Say { text: text.into(), reply }).is_ok());
+            answer.await.unwrap()
+        }
+    }
+
+    fn secs(s: u64) -> Duration {
+        Duration::from_secs(s)
+    }
+
+    #[tokio::test]
+    async fn a_call_that_came_in_is_greeted_once_the_line_has_settled_not_before() {
+        let mut aokie = Aokie::start(json!({})).await;
+        aokie.begin(json!({}));
+        // The app, asking to say something while the greeting waits: it is said after it.
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        assert!(aokie.say("How can I help?").await.is_ok());
+        let (at, before) = aokie.first_audio(secs(6)).await.expect("the greeting");
+        assert!(at >= Duration::from_millis(1_500), "greeted {at:?} after the call began: before the caller could hear it");
+        assert!(at < Duration::from_millis(3_000), "greeted {at:?} after the call began");
+        assert!(before.iter().any(|v| v["type"] == "formlogic.realtime.output_item_started"), "{before:?}");
+        // Its time is when it was said, not when the call began.
+        let said = aokie.event("call.said", secs(5)).await.expect("the greeting, told to the app");
+        assert_eq!(said["text"], GREETING);
+        assert!(said["startMs"].as_u64().unwrap() >= 1_500, "{said}");
+        let item = aokie.text("formlogic.realtime.output_transcript", secs(5)).await.expect("what the item said");
+        assert_eq!(item["transcript"], format!("{GREETING} How can I help?"));
+    }
+
+    #[tokio::test]
+    async fn a_hello_before_the_greeting_brings_it_forward_and_is_not_answered_on_its_own() {
+        let mut aokie = Aokie::start(json!({})).await;
+        aokie.begin(json!({}));
+        aokie.caller(&hello());
+        let (at, mut sent) = aokie.first_audio(secs(6)).await.expect("the greeting");
+        assert!(at < Duration::from_millis(1_000), "greeted {at:?} after the call began: their hello ended well before the settle");
+        while let Some(m) = aokie.next(Duration::from_millis(1_500)).await {
+            if let Message::Text(t) = m {
+                sent.push(serde_json::from_str(&t).unwrap());
+            }
+        }
+        // Their hello is heard, and Aokie has its words, as ever...
+        assert!(sent.iter().any(|v| v["type"] == "formlogic.realtime.input_transcript" && v["transcript"] == "Hello?"), "{sent:?}");
+        // ...but the app reads it with their next words (as an "mm-hmm"), and does not answer it alone: the greeting did.
+        let heard = aokie.event("call.caller", secs(5)).await.expect("their hello, for the app");
+        assert_eq!((heard["text"].as_str(), heard["beforeGreeting"].as_bool(), heard["backchannel"].as_bool()), (Some("Hello?"), Some(true), Some(true)), "{heard}");
+        assert_eq!(heard["over"], false);
+        // And nothing else is said: one item, the greeting.
+        assert_eq!(sent.iter().filter(|v| v["type"] == "formlogic.realtime.output_item_started").count(), 1, "{sent:?}");
+    }
+
+    #[tokio::test]
+    async fn a_caller_who_talks_on_is_greeted_after_three_seconds_at_most() {
+        let mut aokie = Aokie::start(json!({})).await;
+        aokie.begin(json!({}));
+        // Talking from the start, and not stopping.
+        aokie.caller(&[tone(100, 40.0), tone(5_000, 6_000.0)].concat());
+        let (at, _) = aokie.first_audio(secs(8)).await.expect("the greeting");
+        assert!(at >= Duration::from_millis(3_000), "greeted {at:?} after the call began, over the caller");
+        assert!(at < Duration::from_millis(4_500), "greeted {at:?} after the call began");
+        // What they said, begun before the greeting, is read with their next words too.
+        aokie.caller(&tone(1_000, 40.0));
+        let heard = aokie.event("call.caller", secs(5)).await.expect("their words, for the app");
+        assert_eq!((heard["beforeGreeting"].as_bool(), heard["backchannel"].as_bool()), (Some(true), Some(true)), "{heard}");
+    }
+
+    #[tokio::test]
+    async fn a_call_we_placed_opens_when_the_callee_has_said_hello() {
+        let mut aokie = Aokie::start(json!({"direction": "outbound", "openingLine": OPENING_LINE, "greeting": OPENING_LINE})).await;
+        aokie.begin(json!({}));
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        aokie.caller(&hello());
+        let (at, _) = aokie.first_audio(secs(8)).await.expect("the opening line");
+        assert!(at >= Duration::from_millis(300), "opened {at:?} after the call began, before the callee spoke");
+        assert!(at < Duration::from_millis(1_500), "opened {at:?} after the call began: the callee had said hello");
+        // What the app is told, in whichever order: the opening line, and their hello (not to be answered alone).
+        let (mut said, mut heard) = (None, None);
+        while said.is_none() || heard.is_none() {
+            let v = tokio::time::timeout(secs(5), aokie.events.recv()).await.expect("the app is told").unwrap();
+            match v["type"].as_str() {
+                Some("call.said") => said = Some(v),
+                Some("call.caller") => heard = Some(v),
+                _ => {}
+            }
+        }
+        assert_eq!(said.unwrap()["text"], OPENING_LINE);
+        let heard = heard.unwrap();
+        assert_eq!((heard["beforeGreeting"].as_bool(), heard["backchannel"].as_bool()), (Some(true), Some(true)), "{heard}");
+    }
+
+    #[tokio::test]
+    async fn a_call_we_placed_opens_after_two_and_a_half_seconds_of_silence() {
+        let mut aokie = Aokie::start(json!({"direction": "outbound", "openingLine": OPENING_LINE, "greeting": OPENING_LINE})).await;
+        aokie.begin(json!({}));
+        // The line's hum is not a hello.
+        aokie.caller(&tone(2_000, 40.0));
+        let (at, _) = aokie.first_audio(secs(8)).await.expect("the opening line");
+        assert!(at >= Duration::from_millis(2_500), "opened {at:?} after the call began");
+        assert!(at < Duration::from_millis(4_500), "opened {at:?} after the call began");
+    }
+
+    #[tokio::test]
+    async fn a_line_only_to_say_is_said_at_once() {
+        let mut aokie = Aokie::start(json!({"mode": "speak", "greeting": "Please hold."})).await;
+        // A wait asked for is not for a call already connected.
+        aokie.begin(json!({"greetingDelayMs": 3_000}));
+        let (at, _) = aokie.first_audio(secs(6)).await.expect("the line");
+        assert!(at < Duration::from_millis(1_000), "said {at:?} after it began");
+    }
+
+    #[tokio::test]
+    async fn a_call_that_ends_before_the_greeting_says_nothing() {
+        let mut aokie = Aokie::start(json!({})).await;
+        aokie.begin(json!({}));
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        aokie.send(json!({"type": "formlogic.realtime.stop", "callId": aokie.call, "generation": 1, "reason": "the caller hung up"}));
+        // Everything the desktop sends, until it closes the stream.
+        let mut sent = Vec::new();
+        while let Some(m) = aokie.next(secs(5)).await {
+            sent.push(m);
+        }
+        assert!(aokie.begun.elapsed() < secs(5), "the stream was not closed");
+        assert!(!sent.iter().any(|m| matches!(m, Message::Binary(_))), "spoke after the call ended");
+        assert!(!sent.iter().any(|m| matches!(m, Message::Text(t) if t.contains("output_item_started"))), "{} messages", sent.len());
+        // The settle has passed, and still nothing.
+        tokio::time::sleep_until((aokie.begun + Duration::from_millis(1_800)).into()).await;
+        let ended = aokie.event("call.ended", secs(1)).await.expect("the end, told to the app");
+        assert_eq!(ended["reason"], "the caller hung up");
+        while let Ok(v) = aokie.events.try_recv() {
+            assert_ne!(v["type"], "call.said", "{v}");
+        }
+    }
+
+    #[tokio::test]
+    async fn the_greeting_waits_as_long_as_the_call_asks_kept_to_five_seconds() {
+        // As the begin asks.
+        let mut aokie = Aokie::start(json!({})).await;
+        aokie.begin(json!({"greetingDelayMs": 400}));
+        let (at, _) = aokie.first_audio(secs(6)).await.expect("the greeting");
+        assert!(at >= Duration::from_millis(400) && at < Duration::from_millis(1_400), "greeted {at:?} after the call began");
+        // No wait at all.
+        let mut aokie = Aokie::start(json!({})).await;
+        aokie.begin(json!({"greetingDelayMs": 0}));
+        let (at, _) = aokie.first_audio(secs(6)).await.expect("the greeting");
+        assert!(at < Duration::from_millis(1_000), "greeted {at:?} after the call began");
+        // As the start asks, and at most 5 s.
+        let mut aokie = Aokie::start(json!({"greetingDelayMs": 60_000})).await;
+        aokie.begin(json!({}));
+        let (at, _) = aokie.first_audio(secs(9)).await.expect("the greeting");
+        assert!(at >= Duration::from_millis(5_000) && at < Duration::from_millis(6_500), "greeted {at:?} after the call began");
     }
 }

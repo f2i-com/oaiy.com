@@ -6,9 +6,14 @@
 //! voice from a clip the first time it speaks in it, hearing what the clip
 //! says itself when nothing is written beside it (`NAME.txt`). A folder with
 //! no clips is given OAIY's own receptionist voice.
+//!
+//! How long a call's greeting waits after the call connects is kept beside
+//! them, in `<data>/voices/settings.json` (`greetingDelayMs`).
 
 use std::path::{Path, PathBuf};
 use std::sync::OnceLock;
+
+use serde_json::{json, Value};
 
 /// The audio a clip may be.
 pub const CLIP_EXTENSIONS: [&str; 8] = ["wav", "mp3", "m4a", "ogg", "flac", "webm", "opus", "aac"];
@@ -160,6 +165,56 @@ fn remove_in(dir: &Path, name: &str) {
     }
 }
 
+/// The file the phone's settings are kept in, in the voices folder (not a clip).
+const SETTINGS: &str = "settings.json";
+/// How long a call's greeting waits after the call connects, unless set
+/// otherwise: the phone has answered, but the caller's handset hears the
+/// line a second or two later.
+pub const GREETING_DELAY_MS: u64 = 1_500;
+/// The longest a greeting may be set to wait.
+pub const MAX_GREETING_DELAY_MS: u64 = 5_000;
+
+/// A greeting delay asked for, in milliseconds, kept to 0 to 5 s.
+pub fn clamp_greeting_delay(ms: f64) -> u64 {
+    if ms.is_nan() {
+        return GREETING_DELAY_MS;
+    }
+    ms.round().clamp(0.0, MAX_GREETING_DELAY_MS as f64) as u64
+}
+
+/// How long a call's greeting waits after the call connects (it is said
+/// sooner when the caller speaks first): as set, else 1.5 s.
+pub fn greeting_delay_ms() -> u64 {
+    dir().map_or(GREETING_DELAY_MS, greeting_delay_in)
+}
+
+fn settings_in(dir: &Path) -> Value {
+    std::fs::read_to_string(dir.join(SETTINGS)).ok().and_then(|s| serde_json::from_str::<Value>(&s).ok()).filter(Value::is_object).unwrap_or_else(|| json!({}))
+}
+
+fn greeting_delay_in(dir: &Path) -> u64 {
+    settings_in(dir).get("greetingDelayMs").and_then(Value::as_f64).map_or(GREETING_DELAY_MS, clamp_greeting_delay)
+}
+
+/// Set how long a call's greeting waits (kept to 0 to 5 s). Answers with the delay kept.
+pub fn set_greeting_delay_ms(ms: f64) -> Result<u64, String> {
+    let dir = dir().ok_or("the voices folder is not set up")?;
+    set_greeting_delay_in(dir, ms)
+}
+
+fn set_greeting_delay_in(dir: &Path, ms: f64) -> Result<u64, String> {
+    if !ms.is_finite() {
+        return Err(format!("greetingDelayMs is a number of milliseconds, 0 to {MAX_GREETING_DELAY_MS}"));
+    }
+    let ms = clamp_greeting_delay(ms);
+    let mut settings = settings_in(dir);
+    settings["greetingDelayMs"] = json!(ms);
+    std::fs::create_dir_all(dir).map_err(|e| e.to_string())?;
+    let text = serde_json::to_string_pretty(&settings).map_err(|e| e.to_string())?;
+    std::fs::write(dir.join(SETTINGS), text).map_err(|e| e.to_string())?;
+    Ok(ms)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -203,6 +258,31 @@ mod tests {
         assert!(add_in(&dir, "x", "wav", &[0; 10], None).is_err());
         assert!(add_in(&dir, "../..", "wav", &clip, None).is_err());
         assert!(add_in(&dir, "chosen", "wav", &clip, None).is_err());
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn the_greeting_delay_is_kept_beside_the_voices_and_kept_to_five_seconds() {
+        let dir = folder("delay");
+        // Not set: 1.5 s.
+        assert_eq!(greeting_delay_in(&dir), GREETING_DELAY_MS);
+        assert_eq!(set_greeting_delay_in(&dir, 800.0).unwrap(), 800);
+        assert_eq!(greeting_delay_in(&dir), 800);
+        // Kept to 0 to 5 s, and whole milliseconds.
+        assert_eq!(set_greeting_delay_in(&dir, 9_000.0).unwrap(), MAX_GREETING_DELAY_MS);
+        assert_eq!(greeting_delay_in(&dir), 5_000);
+        assert_eq!(set_greeting_delay_in(&dir, -20.0).unwrap(), 0);
+        assert_eq!(set_greeting_delay_in(&dir, 1234.6).unwrap(), 1235);
+        assert!(set_greeting_delay_in(&dir, f64::INFINITY).is_err());
+        assert_eq!(greeting_delay_in(&dir), 1235, "a refused delay changes nothing");
+        // It is not a voice, and a file set by hand is kept to the same bounds.
+        assert!(list_in(&dir).is_empty());
+        std::fs::write(dir.join(SETTINGS), r#"{"greetingDelayMs": 60000, "other": true}"#).unwrap();
+        assert_eq!(greeting_delay_in(&dir), 5_000);
+        set_greeting_delay_in(&dir, 1_000.0).unwrap();
+        assert_eq!(settings_in(&dir)["other"], true, "the rest of the file is kept");
+        std::fs::write(dir.join(SETTINGS), "not json").unwrap();
+        assert_eq!(greeting_delay_in(&dir), GREETING_DELAY_MS);
         let _ = std::fs::remove_dir_all(dir);
     }
 
