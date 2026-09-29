@@ -8,6 +8,11 @@
 //! took; the rest were never narrowed, and a file written once, like an identity key, stayed that
 //! way for good. [`write`] makes the file private from its first byte instead, and replaces the old
 //! one atomically.
+//!
+//! One store is written elsewhere: the engines studio's configuration (its gateway key and the
+//! Hugging Face token). `oaiy-studio` is std-only and this crate depends on it, so its
+//! `config::save` does the same in a few lines of its own. A change to how a secret is written
+//! here belongs there too.
 
 use std::ffi::OsStr;
 use std::fs::{DirBuilder, File, OpenOptions};
