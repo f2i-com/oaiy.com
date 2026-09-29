@@ -15,6 +15,8 @@ pub mod services;
 pub mod bridge;
 pub mod plugins;
 pub mod voice;
+/// Putting a caller through to the owner: who is rung, and when (the ring policy).
+pub mod ring;
 pub mod calendar;
 pub mod modules;
 pub mod agent_tasks;

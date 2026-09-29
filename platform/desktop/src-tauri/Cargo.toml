@@ -161,6 +161,10 @@ sha2 = "0.10"
 subtle = "2"
 hmac = "0.12"
 
+# The receptionist's check that a caller asked for a person (`ring/phrases.rs`): a few
+# patterns over what they said. Already in the tree (through reqwest and tauri).
+regex = "1"
+
 # Windows-only: the job object that kills child processes when this process
 # dies, however it dies. Already in the tree transitively (tauri, tokio); named
 # here because a crate cannot `use` an undeclared transitive dependency.

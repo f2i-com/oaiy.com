@@ -1046,6 +1046,11 @@ fn is_personal_path(path: &str) -> bool {
         || path.starts_with("/api/calendar/")
         || path == "/api/contacts"
         || path.starts_with("/api/contacts/")
+        // Whom the receptionist may put through and to which devices, and the messages callers leave.
+        || path == "/api/ring"
+        || path.starts_with("/api/ring/")
+        || path == "/api/messages"
+        || path.starts_with("/api/messages/")
         || path.starts_with("/api/agent/")
 }
 
@@ -1557,6 +1562,8 @@ pub async fn serve(
         crate::voice::voices::init(&dir);
         // The contacts (and the names callers are greeted by): the older names file is upgraded now.
         crate::voice::contacts::init(&dir);
+        // Transferring calls to the owner and taking messages: the owner's settings, all off until turned on.
+        crate::ring::init(&dir);
     }
     // The Agent's control API: its switch and its log live in the data folder too.
     let control = crate::control::Control::new(
@@ -1609,6 +1616,7 @@ pub async fn serve(
         })
     };
     let voice_routes = crate::voice::app_router(voice.clone());
+    let ring_routes = crate::ring::routes::router(crate::ring::shared().unwrap_or_else(|| crate::ring::Ring::in_memory(Default::default())));
     let bridge_routes = crate::bridge::bridge_router(bridge);
 
     // The AI gateway is its own sub-router with its own state (provider store +
@@ -1664,6 +1672,7 @@ pub async fn serve(
         .merge(bridge_routes)
         .merge(voice_routes)
         .merge(crate::voice::contacts::routes::router(crate::voice::contacts::shared()))
+        .merge(ring_routes)
         .merge(crate::calendar::routes::router())
         .merge(crate::modules::routes::router())
         .merge(crate::agent_tasks::router())
@@ -1910,6 +1919,26 @@ mod tests {
         }
         assert!(!is_restricted_read_path("/api/contactsx"));
         assert!(!is_privileged_path(&Method::POST, "/api/contacts-elsewhere"));
+    }
+
+    #[test]
+    fn the_rings_settings_and_the_messages_are_restricted_reads_and_their_changes_privileged() {
+        // Whom the receptionist may put through, the owner's VIP numbers, and what callers said to leave.
+        for path in ["/api/ring/settings", "/api/ring/active", "/api/messages", "/api/messages/msg_1"] {
+            assert!(is_restricted_read_path(path), "{path} must be a restricted read");
+        }
+        for (m, path) in [
+            (Method::PUT, "/api/ring/settings"),
+            (Method::POST, "/api/ring/active/assist_1/respond"),
+            (Method::PATCH, "/api/messages/msg_1"),
+            (Method::DELETE, "/api/messages/msg_1"),
+            (Method::POST, "/api/messages"),
+            (Method::POST, "/api/voice/calls/call_1/message"),
+        ] {
+            assert!(is_privileged_path(&m, path), "{m} {path} must be privileged");
+        }
+        assert!(!is_restricted_read_path("/api/ringing") && !is_restricted_read_path("/api/messagesx"));
+        assert!(!is_privileged_path(&Method::POST, "/api/ringing"));
     }
 
     #[test]
