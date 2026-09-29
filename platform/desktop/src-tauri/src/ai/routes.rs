@@ -417,18 +417,40 @@ enum CodexEvent {
     Done(Result<Value, super::codex::CodexError>),
 }
 
+/// How long a streamed ChatGPT turn may stay silent before the stream opens
+/// anyway: long enough for a refusal (signed out, no CLI) to come back as an
+/// ordinary error, short of any reader's patience.
+const CODEX_FIRST_EVENT_WAIT: std::time::Duration = std::time::Duration::from_secs(10);
+/// While the turn is silent — a tool call is written whole before any of it
+/// can be shown — a comment line this often, so a reader's idle clock (the
+/// Agent app's gives up after two minutes of nothing) does not expire.
+const CODEX_KEEPALIVE: std::time::Duration = std::time::Duration::from_secs(15);
+
 /// The generic ChatGPT route's answer as OpenAI chat-completion chunks, for a
 /// caller that asked for `stream: true` (the Agent app always does).
 ///
 /// The turn runs on a blocking thread and its fragments come back through a
-/// channel. The response is chosen when the FIRST thing arrives: a failure
-/// before any text is an ordinary error with its own status — signed out stays
-/// a 428 the caller can act on, not a 200 stream carrying an error — and
-/// anything else opens the stream. The buffered completion closes it and is
-/// the authority: a tool call goes out as a `tool_calls` chunk, and text the
-/// stream held back (a reply that began like a tool call and was not one) as a
-/// last content chunk.
+/// channel. The response waits for the FIRST thing to arrive, briefly: a
+/// failure before any text is an ordinary error with its own status — a
+/// refusal the caller can act on, not a 200 stream carrying an error. Anything
+/// else, or a turn still thinking, opens the stream, which stays alive with
+/// comment lines while the model is silent. The buffered completion closes it
+/// and is the authority: a tool call goes out as a `tool_calls` chunk, and text
+/// the stream held back (a reply that began like a tool call and was not one)
+/// as a last content chunk.
 async fn codex_stream<F>(model: String, turn: F) -> Response
+where
+    F: FnOnce(&mut dyn FnMut(&str)) -> Result<Value, super::codex::CodexError> + Send + 'static,
+{
+    codex_stream_paced(model, turn, CODEX_FIRST_EVENT_WAIT, CODEX_KEEPALIVE).await
+}
+
+async fn codex_stream_paced<F>(
+    model: String,
+    turn: F,
+    first_wait: std::time::Duration,
+    keepalive: std::time::Duration,
+) -> Response
 where
     F: FnOnce(&mut dyn FnMut(&str)) -> Result<Value, super::codex::CodexError> + Send + 'static,
 {
@@ -440,12 +462,14 @@ where
         });
         let _ = tx.send(CodexEvent::Done(done));
     });
-    let first = match rx.recv().await {
-        Some(CodexEvent::Done(Err(e))) => return codex_err(e),
-        Some(event) => event,
-        None => {
+    let first = match tokio::time::timeout(first_wait, rx.recv()).await {
+        Ok(Some(CodexEvent::Done(Err(e)))) => return codex_err(e),
+        Ok(Some(event)) => Some(event),
+        Ok(None) => {
             return ai_error(StatusCode::INTERNAL_SERVER_ERROR, "internal", "the ChatGPT turn stopped without an answer".into())
         }
+        // Still thinking: open the stream and keep it alive.
+        Err(_) => None,
     };
 
     let head = ChunkHead {
@@ -461,13 +485,17 @@ where
         // A reader that went away makes these sends fail; the turn still ends on its own.
         let _ = out.send(head.data(json!({ "role": "assistant", "content": "" }), None));
         let mut streamed = String::new();
-        let mut next = Some(first);
+        let mut next = first;
         loop {
             let event = match next.take() {
                 Some(e) => e,
-                None => match rx.recv().await {
-                    Some(e) => e,
-                    None => break,
+                None => match tokio::time::timeout(keepalive, rx.recv()).await {
+                    Ok(Some(e)) => e,
+                    Ok(None) => break,
+                    Err(_) => {
+                        let _ = out.send(": keep-alive\n\n".to_string());
+                        continue;
+                    }
                 },
             };
             match event {
@@ -864,6 +892,37 @@ mod tests {
         let (events, done) = events_of(resp).await;
         assert!(done);
         assert_eq!(streamed_text(&events), "Half an ans");
+        assert_eq!(events.last().unwrap()["error"]["message"], "turn/start timed out");
+    }
+
+    #[tokio::test]
+    async fn a_turn_that_thinks_a_while_keeps_the_stream_alive() {
+        // A tool call streams nothing until it is whole; a reader with an idle
+        // clock must still hear something in the meantime.
+        let ms = std::time::Duration::from_millis;
+        let slow = |then: Result<&'static str, &'static str>| {
+            move |emit: &mut dyn FnMut(&str)| {
+                std::thread::sleep(std::time::Duration::from_millis(400));
+                match then {
+                    Ok(reply) => fake_turn(with_tools(), reply)(emit),
+                    Err(e) => Err(CodexError::Rpc(e.into())),
+                }
+            }
+        };
+        let call = "```tool_call\n{\"tool\":\"get_weather\",\"input\":{}}\n```";
+        let resp = codex_stream_paced("x".into(), slow(Ok(call)), ms(50), ms(60)).await;
+        assert_eq!(resp.status(), StatusCode::OK, "opened while the turn thought");
+        let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+        let text = String::from_utf8(bytes.to_vec()).unwrap();
+        assert!(text.contains(": keep-alive\n\n"), "{text}");
+        assert!(text.contains("\"finish_reason\":\"tool_calls\""), "{text}");
+        assert!(text.ends_with("data: [DONE]\n\n"));
+
+        // A failure after the stream opened is said in it.
+        let resp = codex_stream_paced("x".into(), slow(Err("turn/start timed out")), ms(50), ms(60)).await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        let (events, done) = events_of(resp).await;
+        assert!(done);
         assert_eq!(events.last().unwrap()["error"]["message"], "turn/start timed out");
     }
 
