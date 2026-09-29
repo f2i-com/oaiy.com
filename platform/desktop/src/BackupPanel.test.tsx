@@ -100,6 +100,7 @@ const preview = (over: Partial<RestorePreview> = {}): RestorePreview => ({
   totalBytes: 2048,
   classes: [],
   items: [],
+  notRestored: [],
   keys: { inBackup: false },
   notes: [],
   ...over,
@@ -588,9 +589,29 @@ describe('restoring: what can run or change settings needs a tick', () => {
     await check();
     for (const c of CLASSES) expect(classBox(c.label).checked).toBe(false);
     expect(keysBox()!.checked).toBe(false);
-    expect(text()).toContain('Nothing is ticked, so only your data comes back: contacts, calendar, conversations, voices and history.');
+    expect(text()).toContain('Nothing is ticked, so only data that cannot act comes back');
+    expect(text()).not.toContain('only your data comes back');
     await click(buttonWith('Prepare restore'));
     expect(h.stage).toHaveBeenCalledWith('insp-1', PASS, { classes: [], keys: false });
+  });
+
+  it('names what is never restored: an item OAIY does not know, and a key of a settings file that is left out', async () => {
+    await check({
+      notRestored: [
+        { name: 'mystery.bin', why: 'not restored: unknown item' },
+        { name: 'plugin-data/aokie/settings.json#settings.aiEndpoint', why: 'not restored: an address that receives callers’ audio' },
+      ],
+    });
+    expect(text()).toContain('Not restored (2)');
+    expect(text()).toContain('mystery.bin');
+    expect(text()).toContain('not restored: unknown item');
+    expect(text()).toContain('plugin-data/aokie/settings.json#settings.aiEndpoint');
+    expect(text()).toContain('an address that receives callers’ audio');
+  });
+
+  it('says nothing about what is not restored when there is nothing of the kind', async () => {
+    await check();
+    expect(text()).not.toContain('Not restored');
   });
 
   it('skips a kind the backup holds none of', async () => {

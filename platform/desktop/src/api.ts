@@ -1395,7 +1395,7 @@ export interface RestoreCategory {
  * The kinds of thing in a backup that can run programs, send messages, point OAIY at another
  * server or change what OAIY and the Agent may do. Each is brought back only when it is ticked.
  */
-export type RestoreClassId = 'settings' | 'templates' | 'flows' | 'providers' | 'connections' | 'plugins' | 'agentSettings';
+export type RestoreClassId = 'settings' | 'templates' | 'flows' | 'providers' | 'connections' | 'plugins' | 'agentSettings' | 'voices' | 'memory' | 'outreach' | 'agentData';
 
 /** One such kind, and how many items of it the backup holds. */
 export interface RestoreClass {
@@ -1411,6 +1411,12 @@ export interface ReviewItem {
   name: string;
   title: string;
   what: string;
+}
+
+/** Something in a backup that is not brought back, and why. */
+export interface NotRestored {
+  name: string;
+  why: string;
 }
 
 /** The dry run of a restore: what is in the file and what would change. Nothing has changed yet. */
@@ -1435,6 +1441,8 @@ export interface RestorePreview {
   classes: RestoreClass[];
   /** Every item of those kinds, by name. */
   items: ReviewItem[];
+  /** What the backup holds that is never restored: a name OAIY does not know ("not restored: unknown item"), or a key of a settings file that is excluded. */
+  notRestored: NotRestored[];
   /** Whether the file holds API keys (the person decides at restore time whether they come back). */
   keys: { inBackup: boolean };
   notes: string[];

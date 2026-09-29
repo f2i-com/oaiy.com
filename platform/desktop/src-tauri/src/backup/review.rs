@@ -14,7 +14,7 @@ use std::path::Path;
 use serde::Serialize;
 use serde_json::Value;
 
-use super::rules::Category;
+use super::table::{filter_json, table, Class, Why};
 use super::{BackupError, ErrorKind, Result};
 
 /// The classes of things that can act, each ticked (or not) on its own.
@@ -35,10 +35,19 @@ pub enum RestoreClass {
     Plugins,
     /// The Agent's own settings: its providers, its network gate, how it answers calls and texts.
     AgentSettings,
+    /// Voice clips and settings: what callers hear.
+    Voices,
+    /// What is remembered about people: read by the AI as facts and instructions before it answers them.
+    Memory,
+    /// Outreach campaigns: texts and calls to a list of people. They come back paused.
+    Outreach,
+    /// The Agent's projects, conversations, brief and knowledge files: read by the Agent as its context
+    /// and instructions.
+    AgentData,
 }
 
 impl RestoreClass {
-    pub const ALL: [RestoreClass; 7] = [
+    pub const ALL: [RestoreClass; 11] = [
         RestoreClass::Settings,
         RestoreClass::Templates,
         RestoreClass::Flows,
@@ -46,6 +55,10 @@ impl RestoreClass {
         RestoreClass::Connections,
         RestoreClass::Plugins,
         RestoreClass::AgentSettings,
+        RestoreClass::Voices,
+        RestoreClass::Memory,
+        RestoreClass::Outreach,
+        RestoreClass::AgentData,
     ];
 
     pub fn id(self) -> &'static str {
@@ -57,6 +70,10 @@ impl RestoreClass {
             RestoreClass::Connections => "connections",
             RestoreClass::Plugins => "plugins",
             RestoreClass::AgentSettings => "agentSettings",
+            RestoreClass::Voices => "voices",
+            RestoreClass::Memory => "memory",
+            RestoreClass::Outreach => "outreach",
+            RestoreClass::AgentData => "agentData",
         }
     }
 
@@ -73,6 +90,10 @@ impl RestoreClass {
             RestoreClass::Connections => "Connector descriptors (where a link to a provider goes)",
             RestoreClass::Plugins => "Plugin settings",
             RestoreClass::AgentSettings => "The Agent's own settings (its providers, network gate, and how it answers calls and texts)",
+            RestoreClass::Voices => "Voices your callers hear",
+            RestoreClass::Memory => "Contacts and what is remembered about people",
+            RestoreClass::Outreach => "Outreach campaigns (texts and calls to a list of people)",
+            RestoreClass::AgentData => "The Agent's projects, conversations, brief and knowledge files",
         }
     }
 
@@ -84,21 +105,12 @@ impl RestoreClass {
             RestoreClass::Providers => "Where your AI requests, and your conversations in them, are sent. Keys come back only if you also tick the keys box.",
             RestoreClass::Connections => "A connector descriptor points OAIY's link at a provider's address.",
             RestoreClass::Plugins => "The settings of a plugin. PINs, keys and values sealed to another computer are never in them.",
-            RestoreClass::AgentSettings => "Which servers the Agent talks to, whether its network gate is open, and whether it answers calls and texts by itself. A provider at another address arrives without a key, beside yours.",
+            RestoreClass::AgentSettings => "Which servers the Agent talks to, whether its network gate is open, whether it answers calls and texts by itself, and the instructions it answers them by. A provider at another address arrives without a key, beside yours.",
+            RestoreClass::Voices => "A voice is what your callers hear. A sample or a setting from a file that was not made by you would speak to them in your name.",
+            RestoreClass::Memory => "The receptionist and the Agent read what is remembered about a person, and the notes for the receptionist, before they answer them. It is read as instructions, so a file that was not made by you could steer what they say.",
+            RestoreClass::Outreach => "A campaign texts or calls the people on its list. A restored campaign is always PAUSED: it is never running and nothing is scheduled. It is listed by name with the number of people, and you start each one yourself.",
+            RestoreClass::AgentData => "The Agent reads its projects, conversations, the front desk's brief and its knowledge files as context and instructions: the brief wins over what the phone's agents would otherwise say. Each project and file is listed by name and size.",
         }
-    }
-}
-
-/// The class a category of restored file belongs to (data has none: it comes back without a tick).
-pub fn class_of(category: Category) -> Option<RestoreClass> {
-    match category {
-        Category::Settings => Some(RestoreClass::Settings),
-        Category::Templates => Some(RestoreClass::Templates),
-        Category::Flows => Some(RestoreClass::Flows),
-        Category::Providers => Some(RestoreClass::Providers),
-        Category::Connectors => Some(RestoreClass::Connections),
-        Category::PluginData => Some(RestoreClass::Plugins),
-        Category::Contacts | Category::Calendar | Category::History | Category::Voices | Category::Agent => None,
     }
 }
 
@@ -220,8 +232,7 @@ pub fn is_unreadable(item: &ReviewItem) -> bool {
 }
 
 /// Describe one restorable file of a class that can act.
-pub fn describe(category: Category, name: &str, bytes: &[u8], local: &Local, backup_templates: &HashSet<String>) -> Vec<ReviewItem> {
-    let Some(class) = class_of(category) else { return Vec::new() };
+pub fn describe(class: RestoreClass, name: &str, bytes: &[u8], local: &Local, backup_templates: &HashSet<String>) -> Vec<ReviewItem> {
     let value = || serde_json::from_slice::<Value>(bytes.strip_prefix(&[0xef, 0xbb, 0xbf][..]).unwrap_or(bytes));
     match name {
         "services-autostart.json" => match serde_json::from_slice::<Vec<String>>(bytes) {
@@ -415,23 +426,105 @@ pub fn describe(category: Category, name: &str, bytes: &[u8], local: &Local, bac
             }
             Err(_) => vec![unreadable(class, name, "it is not valid JSON")],
         },
+        "callers.json" => match value() {
+            Ok(v) => {
+                let entries = v.get("contacts").and_then(Value::as_array).map(Vec::len).or_else(|| v.as_array().map(Vec::len)).or_else(|| v.as_object().map(|o| o.len())).unwrap_or(0);
+                vec![ReviewItem {
+                    class,
+                    name: name.to_string(),
+                    title: "Contacts and what is remembered about callers".to_string(),
+                    what: format!("{entries} entr{}: the names, facts and notes that the receptionist and the Agent read about a person before they answer them.", if entries == 1 { "y" } else { "ies" }),
+                }]
+            }
+            Err(_) => vec![unreadable(class, name, "it is not valid JSON")],
+        },
         _ if name.starts_with("plugin-data/") => {
             let plugin = name.split('/').nth(1).unwrap_or("?");
-            match super::sanitize::plugin_json(bytes) {
-                Ok((_, stripped)) => {
-                    let count = value().ok().and_then(|v| v.as_object().map(|o| o.len())).unwrap_or(0);
-                    vec![ReviewItem {
-                        class,
-                        name: name.to_string(),
-                        title: clip(&format!("Settings of the \"{plugin}\" plugin"), 120),
-                        what: format!("{count} setting(s) for the plugin; {} PIN, key or sealed value(s) in the file are left out.", stripped.len()),
-                    }]
-                }
-                Err(why) => vec![unreadable(class, name, &why)],
+            match table().key_table(&format!("plugin.{plugin}")) {
+                Some(keys) => match value() {
+                    Ok(v) => {
+                        let found = filter_json(keys, &v, &|_| true);
+                        let mut items: Vec<ReviewItem> = found.kept.iter().filter(|k| k.row.class == Class::Runs && !matches!(k.value, Value::Object(_))).map(|k| key_item(name, k)).collect();
+                        if items.is_empty() {
+                            items.push(ReviewItem { class, name: name.to_string(), title: clip(&format!("Settings of the \"{plugin}\" plugin"), 120), what: "Nothing in it acts: only settings that cannot act (or nothing) come back, and those come back without a tick.".to_string() });
+                        }
+                        items
+                    }
+                    Err(_) => vec![unreadable(class, name, "it is not valid JSON")],
+                },
+                None => vec![unreadable(class, name, "OAIY does not know this plugin's settings")],
             }
         }
         _ => Vec::new(),
     }
+}
+
+/// A voice file, by its name and size: it is audio, and is never read.
+pub fn describe_voice(class: RestoreClass, name: &str, size: u64) -> ReviewItem {
+    ReviewItem { class, name: name.to_string(), title: clip(name.rsplit('/').next().unwrap_or(name), 120), what: format!("A voice file ({} KB): what your callers hear.", size.div_ceil(1024)) }
+}
+
+/// A value as a person is shown it: text is cut, with how long it is.
+pub fn show_value(value: &Value) -> String {
+    match value {
+        Value::String(text) => {
+            let length = text.chars().count();
+            if length > 160 {
+                format!("\"{}\" ({length} characters in all)", clip(text, 160))
+            } else {
+                format!("\"{text}\"")
+            }
+        }
+        Value::Array(items) => format!("a list of {}", items.len()),
+        Value::Object(map) => format!("{} entr{}", map.len(), if map.len() == 1 { "y" } else { "ies" }),
+        other => other.to_string(),
+    }
+}
+
+/// What one key that acts is, for the dry run: by its key, its name and its value.
+pub fn key_item(file: &str, kept: &super::table::Kept) -> ReviewItem {
+    let class = kept.row.tick.unwrap_or(RestoreClass::Settings);
+    let mut what = format!("Sets {} to {}.", kept.path, show_value(&kept.value));
+    if !kept.row.reason.is_empty() {
+        what.push(' ');
+        what.push_str(&kept.row.reason);
+    }
+    ReviewItem { class, name: format!("{file}#{}", kept.path), title: clip(&kept.row.what, 120), what: clip(&what, 700) }
+}
+
+/// Something in a backup that is not brought back, and why: for the list of what is not restored.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+pub struct NotRestored {
+    pub name: String,
+    pub why: String,
+}
+
+/// What a settings file holds that is not brought back at all (excluded, or not in the table), by key.
+pub fn keys_not_restored(file: &str, table_name: &str, bytes: &[u8]) -> Vec<NotRestored> {
+    let Some(keys) = table().key_table(table_name) else { return Vec::new() };
+    let Ok(v) = serde_json::from_slice::<Value>(bytes.strip_prefix(&[0xef, 0xbb, 0xbf][..]).unwrap_or(bytes)) else { return Vec::new() };
+    let found = filter_json(keys, &v, &|_| true);
+    let mut out: Vec<NotRestored> = found
+        .left
+        .iter()
+        .map(|l| NotRestored {
+            name: clip(&format!("{file}#{}", l.path), 200),
+            why: clip(
+                &match (&l.why, l.row) {
+                    (Why::Unknown, _) => "not restored: unknown item".to_string(),
+                    (Why::Excluded, Some(row)) => format!("not restored: {}{}", row.reason, row.redo.as_ref().map(|r| format!(" To do again: {r}")).unwrap_or_default()),
+                    (Why::BadValue(why), _) => format!("not restored: its value is not one this version accepts ({why})"),
+                    (Why::NotTicked(class), _) => format!("only with the tick \"{}\"", class.label()),
+                    (Why::Excluded, None) => "not restored".to_string(),
+                },
+                400,
+            ),
+        })
+        .collect();
+    if found.left_more > 0 {
+        out.push(NotRestored { name: clip(file, 200), why: format!("and {} more keys that are not restored", found.left_more) });
+    }
+    out
 }
 
 /// What the Agent's settings in a backup say, for the dry run: its providers and where they point, its

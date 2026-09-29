@@ -10,8 +10,11 @@
 //! This is the core, with no GUI types in it, so a command line tool and the headless server can
 //! use it later. The parts:
 //!
-//! - [`rules`]: what a backup holds, what it leaves out and why (every credential and key is left
-//!   out; the API provider keys are added only when asked).
+//! - [`table`]: THE classification table (`table.json`): every path under the data folder, every name
+//!   in the Agent's storage and every key of a settings file, each excluded, data or runs-things. A
+//!   restore is default-deny: what the table does not list is not restored.
+//! - [`rules`]: what a backup holds, what it leaves out and why, from that table (every credential
+//!   and key is left out; the API provider keys are added only when asked).
 //! - [`manifest`]: the record at the front of the ZIP.
 //! - [`container`]: the ZIP and age plumbing, and the checks every name and size goes through.
 //! - [`create`]: making the file (staged, encrypted to a `.tmp`, checked by decrypting it, then
@@ -42,6 +45,7 @@ pub mod routes;
 pub mod rules;
 pub mod sanitize;
 pub mod state;
+pub mod table;
 
 use std::fmt;
 use std::io;
@@ -278,5 +282,7 @@ pub fn check_passphrase(passphrase: &str) -> Result<()> {
     Ok(())
 }
 
+#[cfg(test)]
+mod table_tests;
 #[cfg(test)]
 mod tests;

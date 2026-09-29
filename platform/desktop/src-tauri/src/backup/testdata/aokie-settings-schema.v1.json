@@ -1,0 +1,330 @@
+{
+  "$comment": "Shared Aokie operational-settings schema (audit AOK-CONFIG-002). Byte-identical copies live in BOTH repos; the plugin's SETTING_SPECS table (connector.rs) is the authority and is test-locked against this file. UIs (Desktop PluginsPanel, FormLogic pack) must render these types/bounds/apply-times. Unknown keys are allowed but must be scalar and <=4000 chars (forward-compatibility policy: preserved, not rejected). appliesLive=true means a running radio applies it immediately via RadioControl::Configure; false means it is read at radio spawn and takes effect at the next connect.",
+  "settingsSchemaVersion": 1,
+  "settings": [
+    {
+      "key": "autoAnswer",
+      "type": "bool",
+      "appliesLive": false
+    },
+    {
+      "key": "aiReceptionist",
+      "type": "bool",
+      "appliesLive": false
+    },
+    {
+      "key": "bargeIn",
+      "type": "bool",
+      "appliesLive": false
+    },
+    {
+      "key": "conversationAcknowledgements",
+      "type": "bool",
+      "appliesLive": false
+    },
+    {
+      "key": "sendAudio",
+      "type": "bool",
+      "appliesLive": false
+    },
+    {
+      "key": "audioTranscript",
+      "type": "bool",
+      "appliesLive": false
+    },
+    {
+      "key": "audioTranscriptEndpoint",
+      "type": "endpointUrl",
+      "appliesLive": false
+    },
+    {
+      "key": "audioTranscriptModel",
+      "type": "string",
+      "maxChars": 200,
+      "appliesLive": false
+    },
+    {
+      "key": "holdAndCallWaiting",
+      "type": "bool",
+      "appliesLive": false
+    },
+    {
+      "key": "autoConnectPhone",
+      "type": "bool",
+      "appliesLive": false
+    },
+    {
+      "key": "autoHoldQueue",
+      "type": "bool",
+      "appliesLive": false
+    },
+    {
+      "key": "blockedNumbers",
+      "type": "string",
+      "maxChars": 4000,
+      "appliesLive": true
+    },
+    {
+      "key": "acceptPattern",
+      "type": "string",
+      "maxChars": 200,
+      "appliesLive": true
+    },
+    {
+      "key": "rejectPrivate",
+      "type": "bool",
+      "appliesLive": true
+    },
+    {
+      "key": "screenMessage",
+      "type": "string",
+      "maxChars": 500,
+      "appliesLive": true
+    },
+    {
+      "key": "blockedMessage",
+      "type": "string",
+      "maxChars": 500,
+      "appliesLive": true
+    },
+    {
+      "key": "autoBlockAbuse",
+      "type": "bool",
+      "appliesLive": true
+    },
+    {
+      "key": "managerNumbers",
+      "type": "string",
+      "maxChars": 2000,
+      "appliesLive": true
+    },
+    {
+      "key": "managerPin",
+      "type": "string",
+      "maxChars": 32,
+      "appliesLive": true
+    },
+    {
+      "key": "outboundEnabled",
+      "type": "bool",
+      "appliesLive": true
+    },
+    {
+      "key": "maxDailyDials",
+      "type": "int",
+      "min": 1,
+      "max": 200,
+      "appliesLive": true
+    },
+    {
+      "key": "quietHoursStart",
+      "type": "int",
+      "min": 0,
+      "max": 23,
+      "appliesLive": true
+    },
+    {
+      "key": "quietHoursEnd",
+      "type": "int",
+      "min": 0,
+      "max": 23,
+      "appliesLive": true
+    },
+    {
+      "key": "agentHangup",
+      "type": "bool",
+      "appliesLive": false
+    },
+    {
+      "key": "reenumerateHwid",
+      "type": "string",
+      "maxChars": 200,
+      "appliesLive": false
+    },
+    {
+      "key": "legacyPairingPin",
+      "type": "bool",
+      "appliesLive": false
+    },
+    {
+      "key": "mockCalls",
+      "type": "bool",
+      "appliesLive": false
+    },
+    {
+      "key": "bargeSensitivity",
+      "type": "int",
+      "min": 50,
+      "max": 5000,
+      "appliesLive": false
+    },
+    {
+      "key": "sttEndpointMs",
+      "type": "int",
+      "min": 100,
+      "max": 5000,
+      "appliesLive": false
+    },
+    {
+      "key": "maxSilenceSecs",
+      "type": "int",
+      "min": 0,
+      "max": 600,
+      "appliesLive": false
+    },
+    {
+      "key": "defaultSpeechRate",
+      "type": "int",
+      "min": 60,
+      "max": 140,
+      "appliesLive": false
+    },
+    {
+      "key": "detailSpeechRate",
+      "type": "int",
+      "min": 50,
+      "max": 100,
+      "appliesLive": false
+    },
+    {
+      "key": "protectedSpeechMaxMs",
+      "type": "int",
+      "min": 500,
+      "max": 5000,
+      "appliesLive": false
+    },
+    {
+      "key": "hfpCodec",
+      "type": "enum",
+      "options": [
+        "auto",
+        "cvsd",
+        "wbs"
+      ],
+      "appliesLive": false
+    },
+    {
+      "key": "transportMode",
+      "type": "enum",
+      "options": [
+        "dongle",
+        "native",
+        "auto"
+      ],
+      "appliesLive": false
+    },
+    {
+      "key": "persona",
+      "type": "string",
+      "maxChars": 4000,
+      "appliesLive": true
+    },
+    {
+      "key": "greeting",
+      "type": "string",
+      "maxChars": 1000,
+      "appliesLive": true
+    },
+    {
+      "key": "ttsVoice",
+      "type": "string",
+      "maxChars": 200,
+      "appliesLive": true
+    },
+    {
+      "key": "aiModel",
+      "type": "string",
+      "maxChars": 200,
+      "appliesLive": true
+    },
+    {
+      "key": "replyMode",
+      "type": "string",
+      "maxChars": 200,
+      "appliesLive": false
+    },
+    {
+      "key": "aiEndpoint",
+      "type": "endpointUrl",
+      "appliesLive": true
+    },
+    {
+      "key": "realtimeVoiceMode",
+      "type": "enum",
+      "options": [
+        "legacy",
+        "desktop_realtime"
+      ],
+      "appliesLive": false
+    },
+    {
+      "key": "realtimeVoiceEndpoint",
+      "type": "endpointUrl",
+      "appliesLive": false
+    },
+    {
+      "key": "realtimeVoiceDestination",
+      "type": "endpointUrl",
+      "appliesLive": false
+    },
+    {
+      "key": "realtimeVoice",
+      "type": "enum",
+      "options": [
+        "marin",
+        "cedar",
+        "alloy",
+        "ash",
+        "ballad",
+        "coral",
+        "echo",
+        "sage",
+        "shimmer",
+        "verse"
+      ],
+      "appliesLive": false
+    },
+    {
+      "key": "realtimeTurnDetection",
+      "type": "enum",
+      "options": [
+        "server_vad",
+        "semantic_vad"
+      ],
+      "appliesLive": false
+    },
+    {
+      "key": "realtimeMaxOutputTokens",
+      "type": "int",
+      "min": 64,
+      "max": 4096,
+      "appliesLive": false
+    },
+    {
+      "key": "sttEndpoint",
+      "type": "endpointUrl",
+      "appliesLive": true
+    },
+    {
+      "key": "ttsEndpoint",
+      "type": "endpointUrl",
+      "appliesLive": true
+    },
+    {
+      "key": "ttsEngine",
+      "type": "enum",
+      "options": [
+        "",
+        "pocket",
+        "sherpa"
+      ],
+      "appliesLive": true
+    },
+    {
+      "key": "ttsModelDir",
+      "type": "string",
+      "maxChars": 400,
+      "appliesLive": true
+    }
+  ]
+}

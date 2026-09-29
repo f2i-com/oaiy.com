@@ -98,6 +98,8 @@ impl Manifest {
                 return Err(BackupError::new(ErrorKind::TooLarge, "An item in this backup is larger than OAIY will restore."));
             }
             total = total.saturating_add(entry.size);
+            // An item the table excludes (a credential, a program) refuses the backup; one it does not know
+            // is left for the restore to list as not restored.
             super::rules::category_of_backup_entry(&entry.name)
                 .map_err(|why| BackupError::new(ErrorKind::Unsafe, format!("This backup is refused: {why}.")))?;
         }

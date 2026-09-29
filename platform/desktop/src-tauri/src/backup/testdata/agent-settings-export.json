@@ -1,0 +1,55 @@
+{
+  "providers": [
+    {
+      "id": "openai",
+      "type": "openai",
+      "name": "OpenAI",
+      "apiKey": "sk-not-a-real-key",
+      "baseUrl": "https://api.openai.com/v1",
+      "modelId": "gpt-x",
+      "followEngine": false,
+      "orgId": "org-1",
+      "serverKind": "other",
+      "contextTokens": 128000,
+      "detectedContext": { "model": "gpt-x", "tokens": 128000, "how": "reported", "at": 1790000000000 },
+      "parallelAgents": 3
+    }
+  ],
+  "activeProviderId": "openai",
+  "gate": { "mode": "allowlist", "allow": ["example.com"], "deny": ["bad.example"] },
+  "lastProjectId": "p1",
+  "lastKeptProjectId": "p1",
+  "agent": { "compactAt": 0.75, "subAgentTokens": 32000 },
+  "media": {
+    "baseUrl": "http://127.0.0.1:8080/v1",
+    "apiKey": "",
+    "enabled": true,
+    "imageModel": "img",
+    "videoModel": "vid",
+    "imageModels": [{ "id": "img" }],
+    "videoModels": [{ "id": "vid" }],
+    "speechModel": "tts",
+    "musicModel": "mus",
+    "soundModel": "snd",
+    "model3dModel": "m3d",
+    "speechModels": [{ "id": "tts" }],
+    "musicModels": [{ "id": "mus" }],
+    "soundModels": [{ "id": "snd" }],
+    "model3dModels": [{ "id": "m3d" }],
+    "backgroundModels": [{ "id": "bg" }],
+    "upscaleModels": [{ "id": "up" }],
+    "voices": [{ "id": "v" }],
+    "openaiVoices": ["alloy"],
+    "endpoints": { "images": "http://127.0.0.1:8080/v1/images", "speech": "http://127.0.0.1:8080/v1/speech" }
+  },
+  "messages": {
+    "answer": false,
+    "instructions": "Reply politely and briefly, as my assistant.",
+    "calls": false,
+    "callInstructions": "",
+    "callBack": false,
+    "callBackFilter": "answered",
+    "callBackLine": "",
+    "country": "AU"
+  }
+}

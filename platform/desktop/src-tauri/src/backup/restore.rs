@@ -109,6 +109,9 @@ pub struct Preview {
     pub classes: Vec<ClassInfo>,
     /// Every item of those classes, by name and by what it does.
     pub items: Vec<ReviewItem>,
+    /// What the backup holds that is never restored: items the table excludes inside a file that comes
+    /// back (a plugin's address for audio), and every item it does not know ("not restored: unknown item").
+    pub not_restored: Vec<review::NotRestored>,
     pub keys: KeysInfo,
     /// What is said about what will be left out or cleaned on the way in.
     pub notes: Vec<String>,
@@ -326,7 +329,12 @@ impl Marker {
         if name == AGENT_ENTRY {
             return Err("the record of the restore is damaged".into());
         }
-        rules::category_of_backup_entry(name).map(|_| ())
+        // Everything that was staged was known to the table when it was staged.
+        match rules::category_of_backup_entry(name) {
+            Ok(Some(_)) => Ok(()),
+            Ok(None) => Err("the record of the restore is damaged".to_string()),
+            Err(why) => Err(why),
+        }
     }
 }
 
@@ -416,6 +424,9 @@ fn redo_of(manifest: &Manifest) -> Vec<String> {
 /// The most of an item's own file that is read to describe it.
 const MAX_REVIEW_BYTES: u64 = 2 << 20;
 
+/// The most items the dry run names as not restored (the rest are counted).
+const MAX_NOT_RESTORED: usize = 300;
+
 /// Cut a hostile string to what a panel can show, and a list to a length.
 fn clipped(lines: &[String], count: usize, each: usize) -> Vec<String> {
     lines.iter().take(count).map(|l| review::clip(l, each)).collect()
@@ -431,8 +442,18 @@ fn preview_of(data_dir: &Path, verified: &container::Verified, scratch: &Path, f
         let p = plans.entry(c).or_insert_with(|| CategoryPlan { id: c.id().to_string(), label: c.label().to_string(), added: 0, replaced: 0, unchanged: 0, left_alone: 0 });
         f(p);
     };
+    let mut not_restored: Vec<review::NotRestored> = Vec::new();
+    let mut unknown_more = 0usize;
     for entry in &manifest.entries {
-        let (category, _) = rules::category_of_backup_entry(&entry.name).map_err(|why| BackupError::new(ErrorKind::Unsafe, why))?;
+        let Some((category, _)) = rules::category_of_backup_entry(&entry.name).map_err(|why| BackupError::new(ErrorKind::Unsafe, why))? else {
+            // The table does not know it, so it is not restored (default-deny), and it is said so.
+            if not_restored.len() < MAX_NOT_RESTORED {
+                not_restored.push(review::NotRestored { name: review::clip(&entry.name, 200), why: "not restored: unknown item".to_string() });
+            } else {
+                unknown_more += 1;
+            }
+            continue;
+        };
         if category == Category::Agent {
             // Merged by the Agent page: files in the backup overwrite files of the same name, nothing is deleted.
             let files = manifest.counts.agent_files;
@@ -466,11 +487,15 @@ fn preview_of(data_dir: &Path, verified: &container::Verified, scratch: &Path, f
     let mut archive = container::open_archive(&verified.plain)?;
     let here = Local::read(data_dir);
     let mut backup_templates: HashSet<String> = HashSet::new();
-    let mut read: Vec<(Category, &str, Option<Vec<u8>>)> = Vec::new();
+    let mut read: Vec<(RestoreClass, &str, Option<Vec<u8>>, Option<&'static str>)> = Vec::new();
+    let mut items: Vec<ReviewItem> = Vec::new();
     for entry in &manifest.entries {
         budget.check()?;
-        let Ok((category, _)) = rules::category_of_backup_entry(&entry.name) else { continue };
-        if review::class_of(category).is_none() {
+        let Ok(Some(standing)) = rules::standing_of_backup_entry(&entry.name) else { continue };
+        let Some(class) = standing.tick else { continue };
+        if standing.category == Category::Voices {
+            // A voice is an audio file: it is listed by name and size, and never read.
+            items.push(review::describe_voice(class, &entry.name, entry.size));
             continue;
         }
         let bytes = container::read_entry(&mut archive, &entry.name, MAX_REVIEW_BYTES)?;
@@ -479,21 +504,26 @@ fn preview_of(data_dir: &Path, verified: &container::Verified, scratch: &Path, f
                 backup_templates.insert(id);
             }
         }
-        read.push((category, entry.name.as_str(), bytes));
+        read.push((class, entry.name.as_str(), bytes, standing.keys()));
     }
-    let mut items: Vec<ReviewItem> = Vec::new();
-    for (category, name, bytes) in &read {
+    for (class, name, bytes, keys) in &read {
         match bytes {
-            Some(bytes) => items.extend(review::describe(*category, name, bytes, &here, &backup_templates)),
-            None => {
-                if let Some(class) = review::class_of(*category) {
-                    items.push(ReviewItem { class, name: (*name).to_string(), title: review::clip(name.rsplit('/').next().unwrap_or(name), 120), what: review::TOO_LARGE.to_string() });
+            Some(bytes) => {
+                items.extend(review::describe(*class, name, bytes, &here, &backup_templates));
+                if let Some(keys) = keys {
+                    not_restored.extend(review::keys_not_restored(name, keys, bytes));
                 }
             }
+            None => items.push(ReviewItem { class: *class, name: (*name).to_string(), title: review::clip(name.rsplit('/').next().unwrap_or(name), 120), what: review::TOO_LARGE.to_string() }),
         }
         if items.len() > review::MAX_REVIEW_ITEMS {
             return Err(BackupError::new(ErrorKind::TooLarge, "This backup holds more things that can run or reconfigure OAIY than can be looked through, so it is refused."));
         }
+    }
+    let more = unknown_more + not_restored.len().saturating_sub(MAX_NOT_RESTORED);
+    not_restored.truncate(MAX_NOT_RESTORED);
+    if more > 0 {
+        not_restored.push(review::NotRestored { name: format!("and {more} more"), why: "not restored".to_string() });
     }
     if manifest.entries.iter().any(|e| e.name == AGENT_ENTRY) {
         let settings = container::read_nested_entry(&mut archive, AGENT_ENTRY, "idb/settings.json", scratch, MAX_REVIEW_BYTES, budget)?;
@@ -536,6 +566,7 @@ fn preview_of(data_dir: &Path, verified: &container::Verified, scratch: &Path, f
         total_bytes: manifest.entries.iter().map(|e| e.size).sum(),
         classes,
         items,
+        not_restored,
         keys: KeysInfo { in_backup: manifest.includes_keys },
         notes,
     })
@@ -566,6 +597,7 @@ pub fn stage(data_dir: &Path, file: &Path, passphrase: &str, ticks: &Ticks, opts
     // What is brought back: data, and the classes that were ticked (and the Agent's storage, if it is small enough for its page).
     let mut selected: Vec<&Entry> = Vec::new();
     let mut left_out: HashMap<RestoreClass, usize> = HashMap::new();
+    let mut unknown = 0usize;
     for entry in &manifest.entries {
         if entry.name == AGENT_ENTRY {
             if entry.size > opts.agent_import_max {
@@ -575,11 +607,18 @@ pub fn stage(data_dir: &Path, file: &Path, passphrase: &str, ticks: &Ticks, opts
             }
             continue;
         }
-        let Ok((category, _)) = rules::category_of_backup_entry(&entry.name) else { continue };
-        match review::class_of(category) {
+        // What the table does not know is not restored; what it excludes cannot be in a backup that got this far.
+        let Ok(Some(standing)) = rules::standing_of_backup_entry(&entry.name) else {
+            unknown += 1;
+            continue;
+        };
+        match standing.file_tick() {
             Some(class) if !ticks.has(class) => *left_out.entry(class).or_default() += 1,
             _ => selected.push(entry),
         }
+    }
+    if unknown > 0 {
+        skipped.push(format!("Not restored: {unknown} item{} that this version of OAIY does not know (unknown items are never restored).", if unknown == 1 { "" } else { "s" }));
     }
     for class in RestoreClass::ALL {
         if let Some(n) = left_out.get(&class) {
@@ -689,12 +728,28 @@ fn clean_staged(data_dir: &Path, files_root: &Path, names: &[String], ticks: &Ti
     let read = |path: &Path| std::fs::read(path).map_err(|e| e.to_string());
     for name in names {
         let path = container::safe_join(files_root, name, limits)?;
-        let category = rules::category_of_backup_entry(name).map(|(c, _)| c).ok();
+        let category = rules::category_of_backup_entry(name).ok().flatten().map(|(c, _)| c);
         let cleaned: Option<std::result::Result<Vec<u8>, String>> = match (category, name.as_str()) {
             (Some(Category::Calendar), _) => Some(read(&path).and_then(|b| super::sanitize::calendar_json(&b))),
-            (Some(Category::PluginData), _) => {
-                let local = std::fs::read(data_dir.join(native(name))).ok();
-                Some(read(&path).and_then(|b| super::sanitize::plugin_json_with_local(&b, local.as_deref()).map(|(c, _)| c)))
+            // A settings file with a key table: what the table lets through (the keys that cannot act, and those
+            // whose tick was ticked) is put into the file this computer has, and everything else stays as it is here.
+            (Some(_), _) if rules::keys_of(name).is_some() => {
+                let keys_name = rules::keys_of(name).unwrap_or_default();
+                let local = std::fs::read(data_dir.join(native(name))).ok().and_then(|b| serde_json::from_slice::<serde_json::Value>(b.strip_prefix(&[0xef, 0xbb, 0xbf][..]).unwrap_or(&b)).ok());
+                Some(read(&path).and_then(|b| {
+                    let staged: serde_json::Value = serde_json::from_slice(b.strip_prefix(&[0xef, 0xbb, 0xbf][..]).unwrap_or(&b)).map_err(|_| "it is not valid JSON".to_string())?;
+                    let table = super::table::table().key_table(keys_name).ok_or_else(|| "OAIY does not know how to read it".to_string())?;
+                    let found = super::table::filter_json(table, &staged, &|row| row.class == super::table::Class::Data || row.tick.is_some_and(|t| ticks.has(t)));
+                    let left = found.left.len() + found.left_more;
+                    if found.kept.is_empty() {
+                        // Nothing in it may come back (as ticked): the file that is here is left exactly as it is.
+                        return Err(format!("nothing in it comes back without its tick ({left} setting{} left out)", if left == 1 { "" } else { "s" }));
+                    }
+                    if left > 0 {
+                        notes.push(format!("{name}: {left} setting{} not brought back (addresses, switches that grant access, PINs and anything not in the table are never restored; the rest need their tick).", if left == 1 { " was" } else { "s were" }));
+                    }
+                    serde_json::to_vec_pretty(&super::table::merge_into_local(local.as_ref(), &found)).map_err(|_| "it could not be written".to_string())
+                }))
             }
             (Some(Category::Providers), _) if !ticks.keys => Some(read(&path).and_then(|b| {
                 super::sanitize::providers_without_keys(&b).map(|(c, removed)| {
@@ -729,8 +784,9 @@ fn clean_staged(data_dir: &Path, files_root: &Path, names: &[String], ticks: &Ti
     // is not brought back: so it is not. (What was not looked at does not come in.)
     let mut readable = Vec::new();
     for name in std::mem::take(&mut kept) {
-        let acting = rules::category_of_backup_entry(&name).map(|(c, _)| c).ok().filter(|c| review::class_of(*c).is_some());
-        let Some(category) = acting else {
+        // Voices are audio: they are never read, so the dry run has nothing to say of them that staging must honour.
+        let acting = rules::standing_of_backup_entry(&name).ok().flatten().filter(|s| s.category != Category::Voices).and_then(|s| s.tick);
+        let Some(class) = acting else {
             readable.push(name);
             continue;
         };
@@ -740,7 +796,7 @@ fn clean_staged(data_dir: &Path, files_root: &Path, names: &[String], ticks: &Ti
             Some(review::TOO_LARGE.to_string())
         } else {
             let bytes = std::fs::read(&path).map_err(|e| BackupError::io("Could not read a staged file", &e))?;
-            review::describe(category, &name, &bytes, &Local::default(), &HashSet::new()).into_iter().find(review::is_unreadable).map(|item| item.what)
+            review::describe(class, &name, &bytes, &Local::default(), &HashSet::new()).into_iter().find(review::is_unreadable).map(|item| item.what)
         };
         match unreadable {
             Some(why) => {

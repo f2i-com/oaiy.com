@@ -74,6 +74,10 @@ const CLASS_LABELS: Record<string, string> = {
   connections: 'Connections',
   plugins: 'Plugin data',
   agentSettings: 'The Agent’s settings',
+  voices: 'Voices your callers hear',
+  memory: 'What is remembered about people',
+  outreach: 'Outreach campaigns',
+  agentData: 'The Agent’s projects, conversations, brief and knowledge',
 };
 
 /** The number of characters as a person counts them (an emoji is one, not two). */
@@ -764,6 +768,18 @@ export function BackupSection() {
               <Sentences items={preview.excluded.map((x) => `${x.pattern}: ${x.reason}`)} />
             </details>
           )}
+          {preview.notRestored.length > 0 && (
+            <details style={{ marginTop: 8 }}>
+              <summary>Not restored ({preview.notRestored.length})</summary>
+              <ul style={{ margin: '4px 0 0', paddingLeft: 18, maxHeight: 220, overflowY: 'auto' }}>
+                {preview.notRestored.map((n, i) => (
+                  <li key={`${n.name}-${i}`}>
+                    <code className="path-code">{n.name}</code>: {n.why}
+                  </li>
+                ))}
+              </ul>
+            </details>
+          )}
           {preview.redo.length > 0 && (
             <div style={{ marginTop: 8 }}>
               <strong>After restoring you will need to:</strong>
@@ -831,7 +847,7 @@ export function BackupSection() {
             </div>
             {ticked.length === 0 && (
               <p style={{ margin: '6px 0 0' }}>
-                Nothing is ticked, so only your data comes back: contacts, calendar, conversations, voices and history.
+                Nothing is ticked, so only data that cannot act comes back (the calendar, the Agent’s change log, numbers not to be contacted, and settings that cannot act). Everything listed above stays behind until you tick it.
               </p>
             )}
             {preview.keys.inBackup && (
