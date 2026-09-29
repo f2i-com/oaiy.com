@@ -134,6 +134,41 @@ these files when a call or a text needs them; callers and texters cannot
 change them. Your hours and services come from the Calendar.
 `;
 
+/**
+ * "Set up OAIY": the person's conversation with the Agent about OAIY itself
+ * (what it should do, and setting that up through OAIY Desktop's control
+ * API). A project among the others, found by its fixed id, so its
+ * conversation is kept like any project's; it is not renamed or deleted.
+ */
+export const SETUP_PROJECT = { id: 'oaiy-setup', name: 'Set up OAIY' } as const;
+/** What the "Set up OAIY" project is for, in its files. */
+export const SETUP_NOTE = '/README.md';
+export const SETUP_README = `# Set up OAIY
+
+Here the Agent sets OAIY up with you: tell it what you want OAIY to do (answer
+your business phone, run flows, make pictures and music…), and it checks what
+this computer has, recommends the next steps and does them, through OAIY
+Desktop's control API.
+
+- What you must do yourself (accept what a plugin may do, pair a phone with a
+  code) it shows you in OAIY's dashboard, then checks it is done.
+- Every change it makes is listed in OAIY's Settings → Agent → What the Agent
+  changed. The switch there ("Let the Agent set up and change OAIY for you")
+  turns its changes off; it can still look.
+`;
+
+/** The "Set up OAIY" project: made on first use. */
+export async function setupProject(): Promise<ProjectMeta> {
+  const dir = await (await root()).getDirectoryHandle(SETUP_PROJECT.id, { create: true });
+  let meta = await readJson<ProjectMeta>(dir, 'project.json');
+  if (!meta) {
+    meta = { ...SETUP_PROJECT, created: Date.now(), updated: Date.now() };
+    await dir.getDirectoryHandle('files', { create: true });
+    await writeBytes(dir, 'project.json', JSON.stringify(meta));
+  }
+  return { ...meta, id: SETUP_PROJECT.id };
+}
+
 export function newId(): string {
   return `${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 8)}`;
 }

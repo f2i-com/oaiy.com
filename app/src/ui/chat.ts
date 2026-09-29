@@ -75,7 +75,10 @@ function pageStart(turns: Turn[], size: number): number {
 type Speaker = 'you' | 'agent' | 'caller' | 'texter' | 'flow';
 
 /** Suggestions for an empty conversation: they fill the message box, and are sent only when the person sends them. */
-const SUGGESTIONS: Record<'runner' | 'project', { title: string; text: string; ideas: string[] }> = {
+/** The person's own conversation: a project's, the Front desk's runner, or "Set up OAIY". */
+type OwnKind = 'project' | 'runner' | 'setup';
+
+const SUGGESTIONS: Record<OwnKind, { title: string; text: string; ideas: string[] }> = {
   runner: {
     title: "Your phone's front desk",
     text: "Tell me what callers and texters should hear: I keep the brief, the knowledge files and each caller's notes up to date, and I can look over what the phone's agents said.",
@@ -91,7 +94,14 @@ const SUGGESTIONS: Record<'runner' | 'project', { title: string; text: string; i
     text: 'Ask for code, a web page or a SoftN app: I write the files here, run them on the Zipp VM, and show you the result.',
     ideas: ['Explain what this project does.', 'Build a one-page site with a contact form.', 'Start a SoftN app that keeps a task list.', 'Find the TODOs and fix the first one.'],
   },
+  setup: {
+    title: 'Set up OAIY',
+    text: "Tell me what you want OAIY to do. I'll check this computer, suggest the next step and do it with you, one step at a time, and show you anything only you can do.",
+    ideas: ['Set up my business phone', 'What can OAIY do on this computer?', 'Use ChatGPT instead of a local model', 'Check that everything in OAIY is working'],
+  },
 };
+
+const OWN_ICON: Record<OwnKind, string> = { project: 'sparkle', runner: 'compass', setup: 'settings' };
 
 export class ChatPane {
   readonly element = h('section.chat');
@@ -137,8 +147,12 @@ export class ChatPane {
   private media: Media[] = [];
   /** What the conversation shown is, read from its words: a call's, a text thread's, a flow's tasks, or the person's own. */
   private kind: 'call' | 'sms' | 'task' | 'own' = 'own';
-  /** The person's own conversation is the Front desk's runner (else a project's). */
-  private runner = false;
+  /** What the person's own conversation is: a project's, the Front desk's runner, or "Set up OAIY". */
+  private own: OwnKind = 'project';
+  /** The person's own conversation is the Front desk's runner. */
+  private get runner(): boolean {
+    return this.own === 'runner';
+  }
   /** The conversation shown is a call going on now. */
   private live = false;
   /** Who is on the call (from the note that began it). */
@@ -323,7 +337,7 @@ export class ChatPane {
   private placeholder(): string {
     if (this.kind === 'call') return this.live ? 'Tell the receptionist something: it reads it before its next reply…' : "Ask about this call, or tell its agent something…";
     if (this.kind === 'sms') return 'Tell the agent what to text…';
-    return this.runner ? 'Tell the runner what the phone should know…' : 'Ask OAIY…';
+    return this.runner ? 'Tell the runner what the phone should know…' : this.own === 'setup' ? 'Tell the Agent what OAIY should do…' : 'Ask OAIY…';
   }
 
   private hasMessage(): boolean {
@@ -469,9 +483,10 @@ export class ChatPane {
     this.sessionPicker.set(tabs, active, select);
     const shown = tabs.find((t) => t.id === active) ?? tabs[0];
     const own = tabs.find((t) => t.id === null);
-    const runner = !!own && tabKind(own) === 'runner';
-    if (runner !== this.runner) {
-      this.runner = runner;
+    const kind = own ? tabKind(own) : 'project';
+    const ownKind: OwnKind = kind === 'runner' || kind === 'setup' ? kind : 'project';
+    if (ownKind !== this.own) {
+      this.own = ownKind;
       this.applyNames();
       if (this.hero.isConnected) this.drawHero();
       if (!this.busy) this.input.placeholder = this.placeholder();
@@ -485,9 +500,9 @@ export class ChatPane {
     for (const el of this.log.querySelectorAll<HTMLElement>('.avatar-agent')) el.replaceChildren(icon(this.agentIcon()));
   }
 
-  /** The agent's avatar: the runner's compass, or a spark. */
+  /** The agent's avatar: the runner's compass, setup's sliders, or a spark. */
   private agentIcon(): string {
-    return this.runner && this.kind === 'own' ? 'compass' : 'sparkle';
+    return this.kind === 'own' ? OWN_ICON[this.own] : 'sparkle';
   }
 
   /** The strip over a call going on now: a pulsing dot, who, and how long. */
@@ -656,10 +671,10 @@ export class ChatPane {
       this.hero.append(h('span.chat-empty-icon', icon(glyph)), h('p', words));
       return;
     }
-    const s = SUGGESTIONS[this.runner ? 'runner' : 'project'];
-    this.hero.className = 'chat-empty';
+    const s = SUGGESTIONS[this.own];
+    this.hero.className = `chat-empty own-${this.own}`;
     this.hero.append(
-      h('span.chat-empty-icon', icon(this.runner ? 'compass' : 'sparkle')),
+      h('span.chat-empty-icon', icon(OWN_ICON[this.own])),
       h('h2', s.title),
       h('p', s.text),
       h('div.chat-suggestions', { role: 'group', 'aria-label': 'Suggestions' }, ...s.ideas.map((idea) => h('button.suggestion', { type: 'button', title: 'Put this in the message box (it is not sent until you send it)', onclick: () => this.suggest(idea) }, idea))),

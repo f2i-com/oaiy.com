@@ -3,6 +3,7 @@
  * Copyright f2i-com, licensed under the Apache License, Version 2.0.
  */
 import { incognitoHeaderFor } from '../../privacy';
+import { CHATGPT_SIGN_IN, signInNeeded } from './chatgpt';
 import type { ProviderConfig, ChatMessage } from './types';
 import {
   describeConnectionError,
@@ -421,6 +422,8 @@ async function providerRequest<T>(
         );
       }
       const detail = providerMessage(text);
+      // OAIY's ChatGPT connector, signed out: where to sign in, said plainly (nothing else is tried instead).
+      if (signInNeeded(text)) throw new AIProviderError('http', CHATGPT_SIGN_IN, { status: resp.status, detail: detail ?? text });
       throw new AIProviderError(
         'http',
         describeConnectionError(kindForStatus(resp.status), { type: provider.type, serverKind: provider.serverKind, url, detail }, resp.status),

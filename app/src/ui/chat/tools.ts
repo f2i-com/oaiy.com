@@ -69,11 +69,58 @@ const TOOLS: Record<string, [string, string]> = {
   flow_run: ['Ran a flow', 'flow'],
   transcribe: ['Transcribed', 'mic'],
   transcribe_audio: ['Transcribed', 'mic'],
+  // OAIY itself, through OAIY Desktop's control API.
+  status: ["Checked OAIY's status", 'activity'],
+  setup_status: ['Checked the setup', 'settings'],
+  setup_finish: ['Finished the setup', 'check'],
+  models_list: ['Looked at the models', 'cpu'],
+  model_download_status: ['Checked the downloads', 'arrow-down'],
+  model_set_default: ['Chose a model', 'cpu'],
+  model_download: ['Started a download', 'arrow-down'],
+  engine_start: ['Started the engine', 'power'],
+  engine_stop: ['Stopped the engine', 'power'],
+  engine_restart: ['Restarted the engine', 'refresh'],
+  ai_sources_list: ['Looked at the AI sources', 'sparkle'],
+  agent_model_set: ["Chose the Agent's model", 'sparkle'],
+  chatgpt_sign_in: ['Started the ChatGPT sign-in', 'user'],
+  chatgpt_sign_out: ['Signed out of ChatGPT', 'user'],
+  services_list: ['Looked at the services', 'server'],
+  service_logs: ["Read a service's log", 'file-text'],
+  service_install: ['Installed a service', 'server'],
+  service_start: ['Started a service', 'power'],
+  service_stop: ['Stopped a service', 'power'],
+  service_uninstall: ['Removed a service', 'trash'],
+  plugins_list: ['Looked at the plugins', 'plug'],
+  plugin_catalog: ['Looked at the plugin catalog', 'plug'],
+  plugin_settings_get: ["Read a plugin's settings", 'settings'],
+  plugin_settings_set: ["Changed a plugin's settings", 'settings'],
+  plugin_setup_status: ["Checked a plugin's setup", 'list'],
+  plugin_setup_open: ['Showed you a setup step', 'eye'],
+  plugin_setup_step_done: ['Marked a setup step done', 'check'],
+  plugin_setup_finish: ["Finished a plugin's setup", 'check'],
+  plugin_install: ['Installed a plugin', 'plug'],
+  plugin_enable: ['Switched a plugin on', 'power'],
+  plugin_disable: ['Switched a plugin off', 'power'],
+  plugin_restart: ['Restarted a plugin', 'refresh'],
+  plugin_uninstall: ['Removed a plugin', 'trash'],
+  plugin_command: ['Sent a plugin a command', 'send'],
+  flows_list: ['Listed flows', 'flow'],
+  flow_get: ['Read a flow', 'flow'],
+  flow_create: ['Made a flow', 'flow'],
+  flow_update: ['Changed a flow', 'flow'],
+  flow_delete: ['Deleted a flow', 'trash'],
+  calendar_settings_get: ['Read the calendar settings', 'calendar'],
+  calendar_settings_set: ['Changed the calendar settings', 'calendar'],
+  link_status: ['Checked the FormLogic link', 'link'],
+  link_sync_now: ['Synced with FormLogic', 'refresh'],
+  ui_open: ['Showed you a page in OAIY', 'eye'],
+  logs_tail: ['Read a log', 'file-text'],
 };
 
 /** A tool's name in plain words ("Read", "Ran code"); a flow's own tool as its name reads. */
 export function toolLabel(name: string): string {
-  const known = TOOLS[name]?.[0];
+  // OAIY's own tool given a prefix (another of the conversation's tools had its name) reads as itself.
+  const known = TOOLS[name]?.[0] ?? (name.startsWith('oaiy_') ? TOOLS[name.slice(5)]?.[0] : undefined);
   if (known) return known;
   const words = name.replace(/[_-]+/g, ' ').trim();
   return words ? words[0].toUpperCase() + words.slice(1) : 'Tool';
@@ -81,7 +128,7 @@ export function toolLabel(name: string): string {
 
 /** A tool's icon's name. */
 export function toolIcon(name: string): string {
-  return TOOLS[name]?.[1] ?? (name.startsWith('flow') ? 'flow' : name.startsWith('softn') ? 'app' : 'wrench');
+  return TOOLS[name]?.[1] ?? (name.startsWith('oaiy_') ? TOOLS[name.slice(5)]?.[1] : undefined) ?? (name.startsWith('flow') ? 'flow' : name.startsWith('softn') ? 'app' : 'wrench');
 }
 
 /** What a call worked on, in a few words: the file, the command, the search. */
@@ -112,6 +159,22 @@ export function summarizeCall(call: ToolCall): string {
     case 'calendar_free_times': return s('from');
     case 'generate_image': case 'generate_video': case 'generate_music': case 'generate_sound_effect': case 'generate_3d_model': return s('path') || s('output') || '';
     case 'remove_background': case 'upscale_image': case 'media_info': case 'video_frames': case 'video_split': return s('path') || s('input') || '';
+    // OAIY itself: which plugin, service, model or page.
+    case 'plugin_setup_open': case 'plugin_setup_step_done': return [s('pluginId'), s('stepId')].filter(Boolean).join(' · ');
+    case 'plugin_setup_status': case 'plugin_settings_get': case 'plugin_setup_finish': return s('pluginId');
+    case 'plugin_settings_set': return [s('pluginId'), i.settings && typeof i.settings === 'object' ? Object.keys(i.settings).join(', ') : ''].filter(Boolean).join(' · ');
+    case 'plugin_command': return [s('pluginId'), s('command')].filter(Boolean).join(' · ');
+    case 'plugin_enable': case 'plugin_disable': case 'plugin_restart': case 'plugin_uninstall':
+    case 'service_install': case 'service_start': case 'service_stop': case 'service_uninstall': case 'service_logs':
+    case 'flow_get': case 'flow_delete': return s('id');
+    case 'plugin_install': return s('source').split(/[\\/]/).filter(Boolean).pop() ?? '';
+    case 'models_list': return s('group');
+    case 'model_set_default': return [s('group'), s('model')].filter(Boolean).join(' → ');
+    case 'model_download': return s('catalogId');
+    case 'agent_model_set': return [s('source') === 'chatgpt' ? 'ChatGPT' : s('source') === 'engine' ? 'the engine' : s('source'), s('model')].filter(Boolean).join(' · ');
+    case 'ui_open': return s('view');
+    case 'logs_tail': return s('source');
+    case 'calendar_settings_set': return Object.keys(i).join(', ');
     default: return '';
   }
 }

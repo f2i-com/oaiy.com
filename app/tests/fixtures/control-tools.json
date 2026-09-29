@@ -1,0 +1,1154 @@
+{
+ "about": "OAIY Desktop's control tools as its MCP server lists them (tools/list), captured from a headless oaiy-server built from main (c98da95): all of them for a project or setup session; the runner session is offered the read tools named in runner.",
+ "tools": [
+  {
+   "annotations": {
+    "destructiveHint": false,
+    "openWorldHint": false,
+    "readOnlyHint": true,
+    "title": "OAIY at a glance"
+   },
+   "description": "Overview of OAIY in one call: the engines (running, the model chosen per group, GPUs and memory), services, plugins (state, whether setup is needed), modules, ChatGPT sign-in, the Agent's model, the FormLogic link and sync, setup, and agentMayChange (whether the person lets the Agent change OAIY). Call it first.",
+   "inputSchema": {
+    "additionalProperties": false,
+    "properties": {},
+    "required": [],
+    "type": "object"
+   },
+   "name": "status",
+   "title": "OAIY at a glance"
+  },
+  {
+   "annotations": {
+    "destructiveHint": false,
+    "openWorldHint": false,
+    "readOnlyHint": true,
+    "title": "Engine models"
+   },
+   "description": "The engine's models per group: the model chosen, the models installed (the names model_set_default takes), and the catalog's entries with size, memory need (vramGb), recommended and installed (the catalog files background removal and upscaling under picture). Give group for one group only.",
+   "inputSchema": {
+    "additionalProperties": false,
+    "properties": {
+     "group": {
+      "description": "One group only.",
+      "enum": [
+       "llm",
+       "image",
+       "video",
+       "speech",
+       "music",
+       "sound",
+       "model3d",
+       "background",
+       "upscale",
+       "picture"
+      ],
+      "type": "string"
+     }
+    },
+    "required": [],
+    "type": "object"
+   },
+   "name": "models_list",
+   "title": "Engine models"
+  },
+  {
+   "annotations": {
+    "destructiveHint": false,
+    "openWorldHint": false,
+    "readOnlyHint": true,
+    "title": "Model downloads"
+   },
+   "description": "How the engine's model downloads stand: each with its status, percent done, speed and any error.",
+   "inputSchema": {
+    "additionalProperties": false,
+    "properties": {},
+    "required": [],
+    "type": "object"
+   },
+   "name": "model_download_status",
+   "title": "Model downloads"
+  },
+  {
+   "annotations": {
+    "destructiveHint": false,
+    "openWorldHint": false,
+    "readOnlyHint": false,
+    "title": "Choose a model"
+   },
+   "description": "Choose the model a group of the engine uses: model is one of the group's installed models from models_list (not a catalog id). The engines refuse a model the group does not have. Restart the language model (engine_restart) for an llm change to take effect now.",
+   "inputSchema": {
+    "additionalProperties": false,
+    "properties": {
+     "group": {
+      "description": "The engine group.",
+      "enum": [
+       "llm",
+       "image",
+       "video",
+       "speech",
+       "music",
+       "sound",
+       "model3d"
+      ],
+      "type": "string"
+     },
+     "model": {
+      "description": "An installed model of that group, by the name models_list shows.",
+      "minLength": 1,
+      "type": "string"
+     }
+    },
+    "required": [
+     "group",
+     "model"
+    ],
+    "type": "object"
+   },
+   "name": "model_set_default",
+   "title": "Choose a model"
+  },
+  {
+   "annotations": {
+    "destructiveHint": false,
+    "openWorldHint": false,
+    "readOnlyHint": false,
+    "title": "Download a model"
+   },
+   "description": "Start downloading a model from the engine's catalog into the engines' own folder (catalogId: a catalog entry's id from models_list); it is added to its group when done, and model_download_status follows it. Downloads are gigabytes: check size and memory need first.",
+   "inputSchema": {
+    "additionalProperties": false,
+    "properties": {
+     "catalogId": {
+      "description": "The catalog entry's id.",
+      "minLength": 1,
+      "type": "string"
+     }
+    },
+    "required": [
+     "catalogId"
+    ],
+    "type": "object"
+   },
+   "name": "model_download",
+   "title": "Download a model"
+  },
+  {
+   "annotations": {
+    "destructiveHint": false,
+    "openWorldHint": false,
+    "readOnlyHint": false,
+    "title": "Start the language model"
+   },
+   "description": "Start the engine's language model (the model chosen for llm). Answers its state; loading takes a while, and status shows when it is ready.",
+   "inputSchema": {
+    "additionalProperties": false,
+    "properties": {},
+    "required": [],
+    "type": "object"
+   },
+   "name": "engine_start",
+   "title": "Start the language model"
+  },
+  {
+   "annotations": {
+    "destructiveHint": false,
+    "openWorldHint": false,
+    "readOnlyHint": false,
+    "title": "Stop the language model"
+   },
+   "description": "Stop the engine's language model, freeing its GPU memory. Calls, texts and flows that need it fail until it starts again.",
+   "inputSchema": {
+    "additionalProperties": false,
+    "properties": {},
+    "required": [],
+    "type": "object"
+   },
+   "name": "engine_stop",
+   "title": "Stop the language model"
+  },
+  {
+   "annotations": {
+    "destructiveHint": false,
+    "openWorldHint": false,
+    "readOnlyHint": false,
+    "title": "Restart the language model"
+   },
+   "description": "Restart the engine's language model, for example to load a model just chosen with model_set_default.",
+   "inputSchema": {
+    "additionalProperties": false,
+    "properties": {},
+    "required": [],
+    "type": "object"
+   },
+   "name": "engine_restart",
+   "title": "Restart the language model"
+  },
+  {
+   "annotations": {
+    "destructiveHint": false,
+    "openWorldHint": false,
+    "readOnlyHint": true,
+    "title": "AI sources"
+   },
+   "description": "The AI sources flows and the Agent can use: OAIY's engine, configured providers and local AI services, ChatGPT (signed in or not, and as whom), and the Agent's own model preference.",
+   "inputSchema": {
+    "additionalProperties": false,
+    "properties": {},
+    "required": [],
+    "type": "object"
+   },
+   "name": "ai_sources_list",
+   "title": "AI sources"
+  },
+  {
+   "annotations": {
+    "destructiveHint": false,
+    "openWorldHint": false,
+    "readOnlyHint": false,
+    "title": "Choose the Agent's model"
+   },
+   "description": "Choose what the Agent itself runs on: source engine (the model chosen in Engines) or chatgpt (the person's ChatGPT sign-in; model is optional, Codex's own default when left out). Live phone calls keep their own fast route either way.",
+   "inputSchema": {
+    "additionalProperties": false,
+    "properties": {
+     "model": {
+      "description": "chatgpt only: a model from Codex's catalogue.",
+      "minLength": 1,
+      "type": "string"
+     },
+     "source": {
+      "description": "engine or chatgpt.",
+      "enum": [
+       "engine",
+       "chatgpt"
+      ],
+      "type": "string"
+     }
+    },
+    "required": [
+     "source"
+    ],
+    "type": "object"
+   },
+   "name": "agent_model_set",
+   "title": "Choose the Agent's model"
+  },
+  {
+   "annotations": {
+    "destructiveHint": false,
+    "openWorldHint": false,
+    "readOnlyHint": false,
+    "title": "Sign in to ChatGPT"
+   },
+   "description": "Start signing OAIY in to ChatGPT (its Codex connector). Answers the address for the person to open and sign in at (with deviceCode, a code for them to type instead); ai_sources_list shows when they have.",
+   "inputSchema": {
+    "additionalProperties": false,
+    "properties": {
+     "deviceCode": {
+      "description": "Use the device-code sign-in (a code to type) instead of a browser redirect.",
+      "type": "boolean"
+     }
+    },
+    "required": [],
+    "type": "object"
+   },
+   "name": "chatgpt_sign_in",
+   "title": "Sign in to ChatGPT"
+  },
+  {
+   "annotations": {
+    "destructiveHint": true,
+    "openWorldHint": false,
+    "readOnlyHint": false,
+    "title": "Sign out of ChatGPT"
+   },
+   "description": "Sign OAIY out of ChatGPT. Flows and an Agent running on ChatGPT stop working until someone signs in again.",
+   "inputSchema": {
+    "additionalProperties": false,
+    "properties": {},
+    "required": [],
+    "type": "object"
+   },
+   "name": "chatgpt_sign_out",
+   "title": "Sign out of ChatGPT"
+  },
+  {
+   "annotations": {
+    "destructiveHint": false,
+    "openWorldHint": false,
+    "readOnlyHint": true,
+    "title": "Services"
+   },
+   "description": "OAIY's services (local programs such as the voice server and model servers): each with its status (running, stopped, installing, starting, errored), whether it is installed, and its port. Use the ids with the service tools.",
+   "inputSchema": {
+    "additionalProperties": false,
+    "properties": {},
+    "required": [],
+    "type": "object"
+   },
+   "name": "services_list",
+   "title": "Services"
+  },
+  {
+   "annotations": {
+    "destructiveHint": false,
+    "openWorldHint": false,
+    "readOnlyHint": true,
+    "title": "A service's log"
+   },
+   "description": "The last lines a service printed, for why an install or a start failed.",
+   "inputSchema": {
+    "additionalProperties": false,
+    "properties": {
+     "id": {
+      "description": "The service's id, as services_list shows it.",
+      "minLength": 1,
+      "type": "string"
+     },
+     "lines": {
+      "description": "How many (default 50).",
+      "maximum": 500,
+      "minimum": 1,
+      "type": "integer"
+     }
+    },
+    "required": [
+     "id"
+    ],
+    "type": "object"
+   },
+   "name": "service_logs",
+   "title": "A service's log"
+  },
+  {
+   "annotations": {
+    "destructiveHint": false,
+    "openWorldHint": false,
+    "readOnlyHint": false,
+    "title": "Install a service"
+   },
+   "description": "Install a service (download and set up its files). It runs in the background: service_logs shows its progress and services_list when it is installed.",
+   "inputSchema": {
+    "additionalProperties": false,
+    "properties": {
+     "id": {
+      "description": "The service's id, as services_list shows it.",
+      "minLength": 1,
+      "type": "string"
+     }
+    },
+    "required": [
+     "id"
+    ],
+    "type": "object"
+   },
+   "name": "service_install",
+   "title": "Install a service"
+  },
+  {
+   "annotations": {
+    "destructiveHint": false,
+    "openWorldHint": false,
+    "readOnlyHint": false,
+    "title": "Start a service"
+   },
+   "description": "Start an installed service.",
+   "inputSchema": {
+    "additionalProperties": false,
+    "properties": {
+     "id": {
+      "description": "The service's id, as services_list shows it.",
+      "minLength": 1,
+      "type": "string"
+     }
+    },
+    "required": [
+     "id"
+    ],
+    "type": "object"
+   },
+   "name": "service_start",
+   "title": "Start a service"
+  },
+  {
+   "annotations": {
+    "destructiveHint": false,
+    "openWorldHint": false,
+    "readOnlyHint": false,
+    "title": "Stop a service"
+   },
+   "description": "Stop a running service.",
+   "inputSchema": {
+    "additionalProperties": false,
+    "properties": {
+     "id": {
+      "description": "The service's id, as services_list shows it.",
+      "minLength": 1,
+      "type": "string"
+     }
+    },
+    "required": [
+     "id"
+    ],
+    "type": "object"
+   },
+   "name": "service_stop",
+   "title": "Stop a service"
+  },
+  {
+   "annotations": {
+    "destructiveHint": true,
+    "openWorldHint": false,
+    "readOnlyHint": false,
+    "title": "Uninstall a service"
+   },
+   "description": "Remove a service's installed files (for a clean reinstall). Its definition stays, so service_install can put it back.",
+   "inputSchema": {
+    "additionalProperties": false,
+    "properties": {
+     "id": {
+      "description": "The service's id, as services_list shows it.",
+      "minLength": 1,
+      "type": "string"
+     }
+    },
+    "required": [
+     "id"
+    ],
+    "type": "object"
+   },
+   "name": "service_uninstall",
+   "title": "Uninstall a service"
+  },
+  {
+   "annotations": {
+    "destructiveHint": false,
+    "openWorldHint": false,
+    "readOnlyHint": true,
+    "title": "Plugins"
+   },
+   "description": "The installed plugins: id, name, version, state (running, stopped, crashed, disabled…), whether it is switched on, whether its setup is needed (setUpBy: record when finished here, checks when its live checks all pass, as the dashboard judges it), and its connectors' commands (for plugin_command).",
+   "inputSchema": {
+    "additionalProperties": false,
+    "properties": {},
+    "required": [],
+    "type": "object"
+   },
+   "name": "plugins_list",
+   "title": "Plugins"
+  },
+  {
+   "annotations": {
+    "destructiveHint": false,
+    "openWorldHint": false,
+    "readOnlyHint": true,
+    "title": "Plugins to install"
+   },
+   "description": "The plugins OAIY knows how to install, each with what it does and needs, whether it is installed, and the folder on this computer it installs from (source; null when the person has to choose the folder). Pass source to plugin_install.",
+   "inputSchema": {
+    "additionalProperties": false,
+    "properties": {},
+    "required": [],
+    "type": "object"
+   },
+   "name": "plugin_catalog",
+   "title": "Plugins to install"
+  },
+  {
+   "annotations": {
+    "destructiveHint": false,
+    "openWorldHint": false,
+    "readOnlyHint": true,
+    "title": "A plugin's settings"
+   },
+   "description": "A plugin's settings, read through its own settings command: the values, and the fields its setup declares (key, label, type, options). Secret-looking values are hidden.",
+   "inputSchema": {
+    "additionalProperties": false,
+    "properties": {
+     "pluginId": {
+      "description": "The plugin's id, as plugins_list shows it.",
+      "minLength": 1,
+      "type": "string"
+     }
+    },
+    "required": [
+     "pluginId"
+    ],
+    "type": "object"
+   },
+   "name": "plugin_settings_get",
+   "title": "A plugin's settings"
+  },
+  {
+   "annotations": {
+    "destructiveHint": false,
+    "openWorldHint": false,
+    "readOnlyHint": true,
+    "title": "A plugin's setup"
+   },
+   "description": "A plugin's setup steps with their live state: recorded done or skipped, a screen step's done check, a requirements step's services and engine models, and whether a step applies; needsSetup as the dashboard judges it, and outstanding lists what is left. Steps of kind permissions, screen and host are the person's to do on screen (plugin_setup_open).",
+   "inputSchema": {
+    "additionalProperties": false,
+    "properties": {
+     "pluginId": {
+      "description": "The plugin's id, as plugins_list shows it.",
+      "minLength": 1,
+      "type": "string"
+     }
+    },
+    "required": [
+     "pluginId"
+    ],
+    "type": "object"
+   },
+   "name": "plugin_setup_status",
+   "title": "A plugin's setup"
+  },
+  {
+   "annotations": {
+    "destructiveHint": false,
+    "openWorldHint": false,
+    "readOnlyHint": false,
+    "title": "Install a plugin"
+   },
+   "description": "Install (or update) a plugin from a folder or .tar.gz on this computer (source: a path, as plugin_catalog gives it; never a URL). A plugin is native code: install only what the person asked for. Then plugin_enable starts it and plugin_setup_status shows its setup.",
+   "inputSchema": {
+    "additionalProperties": false,
+    "properties": {
+     "source": {
+      "description": "A folder or .tar.gz path on this computer.",
+      "minLength": 1,
+      "type": "string"
+     }
+    },
+    "required": [
+     "source"
+    ],
+    "type": "object"
+   },
+   "name": "plugin_install",
+   "title": "Install a plugin"
+  },
+  {
+   "annotations": {
+    "destructiveHint": false,
+    "openWorldHint": false,
+    "readOnlyHint": false,
+    "title": "Switch a plugin on"
+   },
+   "description": "Switch a plugin on and start it. Answers an error, saying why, when it does not start.",
+   "inputSchema": {
+    "additionalProperties": false,
+    "properties": {
+     "id": {
+      "description": "The plugin's id, as plugins_list shows it.",
+      "minLength": 1,
+      "type": "string"
+     }
+    },
+    "required": [
+     "id"
+    ],
+    "type": "object"
+   },
+   "name": "plugin_enable",
+   "title": "Switch a plugin on"
+  },
+  {
+   "annotations": {
+    "destructiveHint": false,
+    "openWorldHint": false,
+    "readOnlyHint": false,
+    "title": "Switch a plugin off"
+   },
+   "description": "Switch a plugin off: it stops, and its commands, modules (such as the phone and the calendar) and events are gone until plugin_enable.",
+   "inputSchema": {
+    "additionalProperties": false,
+    "properties": {
+     "id": {
+      "description": "The plugin's id, as plugins_list shows it.",
+      "minLength": 1,
+      "type": "string"
+     }
+    },
+    "required": [
+     "id"
+    ],
+    "type": "object"
+   },
+   "name": "plugin_disable",
+   "title": "Switch a plugin off"
+  },
+  {
+   "annotations": {
+    "destructiveHint": false,
+    "openWorldHint": false,
+    "readOnlyHint": false,
+    "title": "Restart a plugin"
+   },
+   "description": "Stop and start a plugin, for settings that apply only when it starts (plugin_settings_set says when).",
+   "inputSchema": {
+    "additionalProperties": false,
+    "properties": {
+     "id": {
+      "description": "The plugin's id, as plugins_list shows it.",
+      "minLength": 1,
+      "type": "string"
+     }
+    },
+    "required": [
+     "id"
+    ],
+    "type": "object"
+   },
+   "name": "plugin_restart",
+   "title": "Restart a plugin"
+  },
+  {
+   "annotations": {
+    "destructiveHint": true,
+    "openWorldHint": false,
+    "readOnlyHint": false,
+    "title": "Uninstall a plugin"
+   },
+   "description": "Remove a plugin from this computer, with its data (for the phone plugin, its pairing with the phone).",
+   "inputSchema": {
+    "additionalProperties": false,
+    "properties": {
+     "id": {
+      "description": "The plugin's id, as plugins_list shows it.",
+      "minLength": 1,
+      "type": "string"
+     }
+    },
+    "required": [
+     "id"
+    ],
+    "type": "object"
+   },
+   "name": "plugin_uninstall",
+   "title": "Uninstall a plugin"
+  },
+  {
+   "annotations": {
+    "destructiveHint": false,
+    "openWorldHint": false,
+    "readOnlyHint": false,
+    "title": "Change a plugin's settings"
+   },
+   "description": "Change some of a plugin's settings through its own settings command: settings holds only the keys to change ({key: value}); plugin_settings_get shows the keys and allowed values, and a value it showed as [redacted] is left as it is. Answers whether they apply only after plugin_restart.",
+   "inputSchema": {
+    "additionalProperties": false,
+    "properties": {
+     "pluginId": {
+      "description": "The plugin's id, as plugins_list shows it.",
+      "minLength": 1,
+      "type": "string"
+     },
+     "settings": {
+      "description": "The settings to change, by key.",
+      "type": "object"
+     }
+    },
+    "required": [
+     "pluginId",
+     "settings"
+    ],
+    "type": "object"
+   },
+   "name": "plugin_settings_set",
+   "title": "Change a plugin's settings"
+  },
+  {
+   "annotations": {
+    "destructiveHint": false,
+    "openWorldHint": false,
+    "readOnlyHint": false,
+    "title": "Send a plugin a command"
+   },
+   "description": "Send one of a plugin's declared connector commands (plugins_list lists them), with an optional payload, through the same gate as the dashboard, and answer what it said (secret-looking values hidden). Commands with effects in the world (a call, a text) really happen.",
+   "inputSchema": {
+    "additionalProperties": false,
+    "properties": {
+     "command": {
+      "description": "A command the plugin declares, e.g. phone.status.",
+      "minLength": 1,
+      "type": "string"
+     },
+     "payload": {
+      "description": "The command's payload, when it takes one."
+     },
+     "pluginId": {
+      "description": "The plugin's id, as plugins_list shows it.",
+      "minLength": 1,
+      "type": "string"
+     }
+    },
+    "required": [
+     "pluginId",
+     "command"
+    ],
+    "type": "object"
+   },
+   "name": "plugin_command",
+   "title": "Send a plugin a command"
+  },
+  {
+   "annotations": {
+    "destructiveHint": false,
+    "openWorldHint": false,
+    "readOnlyHint": false,
+    "title": "Show a plugin's setup"
+   },
+   "description": "Show the person a plugin's setup in the OAIY dashboard, at a step if stepId is given: for what they must do on screen, such as accepting what the plugin may do or pairing a device.",
+   "inputSchema": {
+    "additionalProperties": false,
+    "properties": {
+     "pluginId": {
+      "description": "The plugin's id, as plugins_list shows it.",
+      "minLength": 1,
+      "type": "string"
+     },
+     "stepId": {
+      "description": "A step id from plugin_setup_status.",
+      "minLength": 1,
+      "type": "string"
+     }
+    },
+    "required": [
+     "pluginId"
+    ],
+    "type": "object"
+   },
+   "name": "plugin_setup_open",
+   "title": "Show a plugin's setup"
+  },
+  {
+   "annotations": {
+    "destructiveHint": false,
+    "openWorldHint": false,
+    "readOnlyHint": false,
+    "title": "Record a setup step done"
+   },
+   "description": "Record a plugin's setup step as done (not its permissions step, which the person accepts on screen).",
+   "inputSchema": {
+    "additionalProperties": false,
+    "properties": {
+     "pluginId": {
+      "description": "The plugin's id, as plugins_list shows it.",
+      "minLength": 1,
+      "type": "string"
+     },
+     "stepId": {
+      "description": "A step id from plugin_setup_status.",
+      "minLength": 1,
+      "type": "string"
+     }
+    },
+    "required": [
+     "pluginId",
+     "stepId"
+    ],
+    "type": "object"
+   },
+   "name": "plugin_setup_step_done",
+   "title": "Record a setup step done"
+  },
+  {
+   "annotations": {
+    "destructiveHint": false,
+    "openWorldHint": false,
+    "readOnlyHint": false,
+    "title": "Finish a plugin's setup"
+   },
+   "description": "Record a plugin's setup as finished once its steps are done, so OAIY stops asking. Refused until the person has accepted what the plugin may do.",
+   "inputSchema": {
+    "additionalProperties": false,
+    "properties": {
+     "pluginId": {
+      "description": "The plugin's id, as plugins_list shows it.",
+      "minLength": 1,
+      "type": "string"
+     }
+    },
+    "required": [
+     "pluginId"
+    ],
+    "type": "object"
+   },
+   "name": "plugin_setup_finish",
+   "title": "Finish a plugin's setup"
+  },
+  {
+   "annotations": {
+    "destructiveHint": false,
+    "openWorldHint": false,
+    "readOnlyHint": true,
+    "title": "Flows"
+   },
+   "description": "The flows stored on this desktop: id and name.",
+   "inputSchema": {
+    "additionalProperties": false,
+    "properties": {},
+    "required": [],
+    "type": "object"
+   },
+   "name": "flows_list",
+   "title": "Flows"
+  },
+  {
+   "annotations": {
+    "destructiveHint": false,
+    "openWorldHint": false,
+    "readOnlyHint": true,
+    "title": "A flow"
+   },
+   "description": "One flow's document as stored ({name, nodes, edges}). Read one before flow_create or flow_update, to follow its shape.",
+   "inputSchema": {
+    "additionalProperties": false,
+    "properties": {
+     "id": {
+      "description": "The flow's id, as flows_list shows it.",
+      "minLength": 1,
+      "type": "string"
+     }
+    },
+    "required": [
+     "id"
+    ],
+    "type": "object"
+   },
+   "name": "flow_get",
+   "title": "A flow"
+  },
+  {
+   "annotations": {
+    "destructiveHint": false,
+    "openWorldHint": false,
+    "readOnlyHint": false,
+    "title": "Create a flow"
+   },
+   "description": "Store a new flow: flow is its document ({name, nodes, edges}, as flow_get shows); id (letters, digits, - and _) is made from its name when left out. Refuses an id that exists: use flow_update for that.",
+   "inputSchema": {
+    "additionalProperties": false,
+    "properties": {
+     "flow": {
+      "description": "The flow's document.",
+      "type": "object"
+     },
+     "id": {
+      "description": "The id to store it under.",
+      "minLength": 1,
+      "type": "string"
+     }
+    },
+    "required": [
+     "flow"
+    ],
+    "type": "object"
+   },
+   "name": "flow_create",
+   "title": "Create a flow"
+  },
+  {
+   "annotations": {
+    "destructiveHint": false,
+    "openWorldHint": false,
+    "readOnlyHint": false,
+    "title": "Change a flow"
+   },
+   "description": "Replace a stored flow's document with a new one (the whole document, as flow_get shows it).",
+   "inputSchema": {
+    "additionalProperties": false,
+    "properties": {
+     "flow": {
+      "description": "The flow's whole new document.",
+      "type": "object"
+     },
+     "id": {
+      "description": "The flow's id, as flows_list shows it.",
+      "minLength": 1,
+      "type": "string"
+     }
+    },
+    "required": [
+     "id",
+     "flow"
+    ],
+    "type": "object"
+   },
+   "name": "flow_update",
+   "title": "Change a flow"
+  },
+  {
+   "annotations": {
+    "destructiveHint": false,
+    "openWorldHint": false,
+    "readOnlyHint": false,
+    "title": "Run a flow"
+   },
+   "description": "Run a stored flow with an optional input. By default waits for it (up to timeoutSeconds, 60) and answers its status and output; with wait false, answers the run at once.",
+   "inputSchema": {
+    "additionalProperties": false,
+    "properties": {
+     "id": {
+      "description": "The flow's id, as flows_list shows it.",
+      "minLength": 1,
+      "type": "string"
+     },
+     "input": {
+      "description": "The flow's input."
+     },
+     "timeoutSeconds": {
+      "description": "How long the run may take (default 60).",
+      "maximum": 600,
+      "minimum": 1,
+      "type": "integer"
+     },
+     "wait": {
+      "description": "Wait for the result (default true).",
+      "type": "boolean"
+     }
+    },
+    "required": [
+     "id"
+    ],
+    "type": "object"
+   },
+   "name": "flow_run",
+   "title": "Run a flow"
+  },
+  {
+   "annotations": {
+    "destructiveHint": true,
+    "openWorldHint": false,
+    "readOnlyHint": false,
+    "title": "Delete a flow"
+   },
+   "description": "Delete a stored flow.",
+   "inputSchema": {
+    "additionalProperties": false,
+    "properties": {
+     "id": {
+      "description": "The flow's id, as flows_list shows it.",
+      "minLength": 1,
+      "type": "string"
+     }
+    },
+    "required": [
+     "id"
+    ],
+    "type": "object"
+   },
+   "name": "flow_delete",
+   "title": "Delete a flow"
+  },
+  {
+   "annotations": {
+    "destructiveHint": false,
+    "openWorldHint": false,
+    "readOnlyHint": true,
+    "title": "Calendar settings"
+   },
+   "description": "The calendar's settings: business (its name), hours (seven days, Monday first, each a list of {open, close} like 09:00), services ({id, name, minutes, description, price}), slotMinutes, noticeMinutes, horizonDays, textConfirmations; available says whether a plugin provides the calendar.",
+   "inputSchema": {
+    "additionalProperties": false,
+    "properties": {},
+    "required": [],
+    "type": "object"
+   },
+   "name": "calendar_settings_get",
+   "title": "Calendar settings"
+  },
+  {
+   "annotations": {
+    "destructiveHint": false,
+    "openWorldHint": false,
+    "readOnlyHint": false,
+    "title": "Change calendar settings"
+   },
+   "description": "Change the calendar's settings: only the fields given change, in the shapes calendar_settings_get shows (hours: seven days, Monday first). Needs a plugin that provides the calendar.",
+   "inputSchema": {
+    "additionalProperties": false,
+    "properties": {
+     "business": {
+      "description": "The business's name, as the receptionist says it.",
+      "type": "string"
+     },
+     "horizonDays": {
+      "description": "How far ahead times are offered.",
+      "minimum": 1,
+      "type": "integer"
+     },
+     "hours": {
+      "description": "Seven days, Monday first, each a list of {open, close} (HH:MM); an empty list is closed.",
+      "type": "array"
+     },
+     "noticeMinutes": {
+      "description": "How soon from now a time may be offered.",
+      "minimum": 0,
+      "type": "integer"
+     },
+     "services": {
+      "description": "The services booked: {id, name, minutes, description, price}.",
+      "type": "array"
+     },
+     "slotMinutes": {
+      "description": "The step between the times offered.",
+      "minimum": 1,
+      "type": "integer"
+     },
+     "textConfirmations": {
+      "description": "Text the person when their appointment is confirmed.",
+      "type": "boolean"
+     }
+    },
+    "required": [],
+    "type": "object"
+   },
+   "name": "calendar_settings_set",
+   "title": "Change calendar settings"
+  },
+  {
+   "annotations": {
+    "destructiveHint": false,
+    "openWorldHint": false,
+    "readOnlyHint": true,
+    "title": "FormLogic link"
+   },
+   "description": "The FormLogic link (linked or not, the account and address) and how the calendar sync with it stands (state, last success, what is pending, any error).",
+   "inputSchema": {
+    "additionalProperties": false,
+    "properties": {},
+    "required": [],
+    "type": "object"
+   },
+   "name": "link_status",
+   "title": "FormLogic link"
+  },
+  {
+   "annotations": {
+    "destructiveHint": false,
+    "openWorldHint": false,
+    "readOnlyHint": false,
+    "title": "Sync with FormLogic now"
+   },
+   "description": "Sync the calendar with FormLogic now and answer how it went. Needs the link and a plugin that provides the calendar.",
+   "inputSchema": {
+    "additionalProperties": false,
+    "properties": {},
+    "required": [],
+    "type": "object"
+   },
+   "name": "link_sync_now",
+   "title": "Sync with FormLogic now"
+  },
+  {
+   "annotations": {
+    "destructiveHint": false,
+    "openWorldHint": false,
+    "readOnlyHint": true,
+    "title": "Setup"
+   },
+   "description": "The first-run setup (finished or not, where it is, what was skipped and which plugins were chosen) and each installed plugin's setup (finished version, steps recorded, whether it needs setup).",
+   "inputSchema": {
+    "additionalProperties": false,
+    "properties": {},
+    "required": [],
+    "type": "object"
+   },
+   "name": "setup_status",
+   "title": "Setup"
+  },
+  {
+   "annotations": {
+    "destructiveHint": false,
+    "openWorldHint": false,
+    "readOnlyHint": false,
+    "title": "Finish first-run setup"
+   },
+   "description": "Record OAIY's first-run setup as finished, so the dashboard stops offering it.",
+   "inputSchema": {
+    "additionalProperties": false,
+    "properties": {},
+    "required": [],
+    "type": "object"
+   },
+   "name": "setup_finish",
+   "title": "Finish first-run setup"
+  },
+  {
+   "annotations": {
+    "destructiveHint": false,
+    "openWorldHint": false,
+    "readOnlyHint": false,
+    "title": "Show a dashboard page"
+   },
+   "description": "Show the person a page of the OAIY dashboard: overview, agent, flows, calendar, engines, services, plugins, runs, models, python, providers, connections, settings, setup, or a plugin's page as plugin:<pluginId>:<navId>.",
+   "inputSchema": {
+    "additionalProperties": false,
+    "properties": {
+     "view": {
+      "description": "The page.",
+      "minLength": 1,
+      "type": "string"
+     }
+    },
+    "required": [
+     "view"
+    ],
+    "type": "object"
+   },
+   "name": "ui_open",
+   "title": "Show a dashboard page"
+  },
+  {
+   "annotations": {
+    "destructiveHint": false,
+    "openWorldHint": false,
+    "readOnlyHint": true,
+    "title": "Logs"
+   },
+   "description": "The end of a log: source desktop (the default, OAIY's own), service:<id>, plugin:<id>, or engines, llm or media (the engine's); lines default 100.",
+   "inputSchema": {
+    "additionalProperties": false,
+    "properties": {
+     "lines": {
+      "description": "How many (default 100).",
+      "maximum": 1000,
+      "minimum": 1,
+      "type": "integer"
+     },
+     "source": {
+      "description": "desktop, service:<id>, plugin:<id>, engines, llm or media.",
+      "minLength": 1,
+      "type": "string"
+     }
+    },
+    "required": [],
+    "type": "object"
+   },
+   "name": "logs_tail",
+   "title": "Logs"
+  }
+ ],
+ "runner": [
+  "status",
+  "models_list",
+  "model_download_status",
+  "ai_sources_list",
+  "services_list",
+  "service_logs",
+  "plugins_list",
+  "plugin_catalog",
+  "plugin_settings_get",
+  "plugin_setup_status",
+  "flows_list",
+  "flow_get",
+  "calendar_settings_get",
+  "link_status",
+  "setup_status",
+  "logs_tail"
+ ]
+}

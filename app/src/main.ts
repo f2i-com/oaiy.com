@@ -16,6 +16,10 @@ import { TRANSCRIBE_TOOL, transcribeTool } from './desktop/transcribe';
 import { calendarTools } from './desktop/calendarTools';
 import { flowBuilderTools } from './desktop/flowBuilder';
 import { answeringOn, installIntents } from './desktop/intents';
+import { ControlClient, withControlTools } from './desktop/mcp';
+import { ENGINE, codexDefaultModel, modelChipText, providerFor, readAgentModel, sameModel, type AgentKind, type AgentModel } from './desktop/agentModel';
+import { SETUP_INSTRUCTIONS, controlNote } from './desktop/setupAgent';
+import { CHATGPT_SIGN_IN } from './agent/providers/chatgpt';
 import { TOOLS } from './agent/tools';
 import type { SessionTool, ToolHook } from './agent/agent';
 import { editPhone } from './ui/phone';
@@ -40,7 +44,7 @@ import { flagPicture } from './agent/review';
 import { FileTree } from './ui/tree';
 import { ProjectPicker } from './ui/projectPicker';
 import { icon } from './ui/icons';
-import { FRONT_DESK, FRONT_DESK_BRIEF, OpenProject, clearIncognito, createProject, deleteProject, listProjects, renameProject, type ProjectMeta } from './vfs/projects';
+import { FRONT_DESK, FRONT_DESK_BRIEF, OpenProject, SETUP_NOTE, SETUP_PROJECT, SETUP_README, clearIncognito, createProject, deleteProject, listProjects, renameProject, setupProject, type ProjectMeta } from './vfs/projects';
 import { addOaiyOrigin, setIncognito } from './privacy';
 import { providerEndpoints, providerHeaders } from './agent/providers/providerConnection';
 import { canPickFolder, downloadZip, exportFolder, importFileList, importFolder, importZip, type Imported } from './vfs/transfer';
@@ -150,6 +154,22 @@ async function main(): Promise<void> {
   // In OAIY's own window the desktop is given; a page elsewhere pairs with it.
   const given = embeddedDesktop();
   let desktop: Desktop | null = given ? new Desktop(given.origin, given.token) : settings.desktop ? new Desktop(settings.desktop.origin, settings.desktop.token) : null;
+  /**
+   * OAIY Desktop's control API (its MCP server): the Agent checks and changes
+   * OAIY itself through it, with the tools each kind of conversation is
+   * offered (see desktop/mcp.ts).
+   */
+  let control: ControlClient | null = desktop ? new ControlClient(desktop.origin, desktop.token) : null;
+  /** What the Agent runs on, as the desktop says: the engine until it has said (and with no desktop). */
+  let agentModel: AgentModel = ENGINE;
+  /** Whether the desktop has said yet (its first answer is not announced). */
+  let agentModelKnown = false;
+  /** When the desktop last said (ms): a run a while after asks again first. */
+  let agentModelAt = 0;
+  /** Codex's own default model, once looked up (for a ChatGPT choice that names none). */
+  let codexDefault: string | null = null;
+  /** Why ChatGPT cannot be used now, for the model chip ('' when nothing is known against it). */
+  let chatgptProblem = '';
   let messages = settings.messages;
   let sessions: Sessions | null = null;
   /** Missed calls rung back (by the page that answers the calls). */
@@ -187,9 +207,60 @@ async function main(): Promise<void> {
       ? pluginSessionTools(modules.tools, where, {
           desktop: () => desktop,
           approve: (request) => confirmAction(request),
-          taken: new Set([...builtInToolNames, ...flowTools.map((t) => t.spec.name)]),
+          taken: new Set([...builtInToolNames, ...controlNames(), ...flowTools.map((t) => t.spec.name)]),
         })
       : [];
+  /** The names of OAIY's control tools (as the person's own conversations are offered them): a flow or a plugin's tool with one gets a prefix. */
+  const controlNames = (): string[] => (control ? control.listed('project').map((t) => t.name) : []);
+  /**
+   * A conversation's tools with OAIY's control tools after them: all of them
+   * for a project and "Set up OAIY", the read tools for the runner, none for a
+   * call, a text or a flow's task (desktop/mcp.ts). The app's own tools come
+   * first and keep their names; no name reaches the model twice. With none
+   * listed (no desktop, or an older one), the tools are exactly as they were.
+   */
+  const withControl = (kind: AgentKind, own: SessionTool[]): SessionTool[] => withControlTools(own, kind, () => control, builtInToolNames, controlChanged);
+  /** A change the Agent made to OAIY that this page follows: the Agent's own model, or the ChatGPT sign-in. */
+  const controlChanged = (tool: string): void => {
+    if (tool === 'agent_model_set' || tool === 'chatgpt_sign_in' || tool === 'chatgpt_sign_out') {
+      codexDefault = null;
+      void followAgentModel();
+    }
+  };
+  /** The provider a conversation of `kind` runs on: the engine's (as chosen in Settings, followed as always), or ChatGPT's when the desktop says so. */
+  const agentProvider = (kind: AgentKind): ProviderConfig | null => providerFor(kind, agentModel, activeProvider(), desktop, codexDefault);
+  /** What a conversation of `kind` is told besides its own instructions: about OAIY's tools, when it has them. */
+  const controlInstructions = (kind: AgentKind): string => (kind === 'setup' ? SETUP_INSTRUCTIONS : control?.listed(kind).length ? controlNote(kind) : '');
+  /**
+   * Before a run of a conversation of `kind`: on ChatGPT with no model named,
+   * Codex's default is looked up (signed out, the run says where to sign in,
+   * and nothing else is used), except on a call, whose route pins its model;
+   * and OAIY's control tools are listed for it ("Set up OAIY" cannot go on
+   * without them).
+   */
+  const prepareFor = (kind: () => AgentKind) => async (signal?: AbortSignal): Promise<void> => {
+    const k = kind();
+    // The choice may have changed in OAIY since it was last read (a call does not wait for this, nor does
+    // anything while the desktop is away: the minute's read catches up).
+    if (desktop && !desktopProblem && k !== 'call' && Date.now() - agentModelAt > 15_000) await followAgentModel(2000);
+    if (agentModel.source === 'chatgpt' && desktop && k !== 'call') {
+      if (chatgptProblem) {
+        chatgptProblem = '';
+        renderChips();
+      }
+      if (!agentModel.model && !codexDefault) await lookUpCodexDefault(signal);
+    }
+    const c = control;
+    if (!c) {
+      if (k === 'setup') throw new Error('Setting up OAIY needs OAIY Desktop: pair this page with it (the desktop chip), then ask again.');
+      return;
+    }
+    try {
+      await c.tools(k);
+    } catch (error) {
+      if (k === 'setup') throw new Error(`OAIY Desktop's control API did not answer, so OAIY cannot be set up from here: ${(error as Error).message}`);
+    }
+  };
   /** The conversation the chat shows: null for the project's own. */
   let viewing: string | null = null;
 
@@ -270,7 +341,7 @@ async function main(): Promise<void> {
         : 'Internet on: sandboxed code and web_fetch may reach any host not on the deny list.');
     },
   });
-  const providerChip = h('button.chip', { title: 'AI provider', onclick: () => void editSettings() });
+  const providerChip = h('button.chip.model', { title: 'AI provider', onclick: () => void editSettings() });
   const phoneChip = h('button.chip.toggle.phone', { title: 'Phone: OAIY Desktop, Aokie and text messages', onclick: () => void openPhone() });
   // A call going on now: who with, and a click shows it.
   const callChip = h('button.chip.on-call', { hidden: true, onclick: () => {
@@ -281,8 +352,18 @@ async function main(): Promise<void> {
     gateChip.textContent = `internet: ${gate.mode === 'open' ? 'on' : gate.mode === 'blocked' ? 'off' : 'allowlist'}`;
     gateChip.dataset.mode = gate.mode;
     gateChip.setAttribute('aria-checked', String(gate.mode !== 'blocked'));
-    const p = activeProvider();
-    providerChip.textContent = p ? `${p.name}${p.modelId ? ` · ${p.modelId}` : ' · no model'}` : 'Set up AI…';
+    // The model the person's own conversation runs on: the engine's (Settings), or ChatGPT's, as the desktop says.
+    const p = agentProvider('project');
+    const chatgpt = p?.id.startsWith('oaiy-chatgpt') ?? false;
+    providerChip.textContent = chatgpt ? modelChipText(p, chatgptProblem) : p ? `${p.name}${p.modelId ? ` · ${p.modelId}` : ' · no model'}` : 'Set up AI…';
+    providerChip.dataset.source = chatgpt ? 'chatgpt' : 'engine';
+    if (chatgpt && chatgptProblem) providerChip.dataset.state = 'problem';
+    else delete providerChip.dataset.state;
+    providerChip.title = !chatgpt
+      ? 'AI provider'
+      : chatgptProblem
+        ? `${CHATGPT_SIGN_IN} (Calls use a fast ChatGPT route of their own.)`
+        : "The Agent runs on ChatGPT, through OAIY, as chosen in OAIY's Settings → Agent. Calls use a fast ChatGPT route of their own.";
   };
   gate.onChange(() => {
     renderChips();
@@ -297,7 +378,11 @@ async function main(): Promise<void> {
     // The Front desk first: the phone's runner, whose sub-agents answer calls, texts and flows' tasks.
     // Only with a phone to answer: a plugin on OAIY Desktop provides it (and while it is open, as it is left).
     if (frontDesk && (phoneOn() || project === frontDesk)) projectSelect.append(h('option', { value: FRONT_DESK.id, selected: project === frontDesk, title: "The phone's agents: calls, texts and flows' tasks" }, `📞 ${frontDesk.meta.name}`));
-    for (const meta of list) projectSelect.append(h('option', { value: meta.id, selected: meta.id === project?.meta.id }, meta.incognito ? `🕶 ${meta.name} (incognito)` : meta.name));
+    // Then "Set up OAIY", once it has been opened: while there is a desktop to set up (and while it is open).
+    const setup = list.find((m) => m.id === SETUP_PROJECT.id);
+    if (setup && (desktop || project?.meta.id === setup.id)) projectSelect.append(h('option', { value: setup.id, selected: setup.id === project?.meta.id, title: 'Your conversation with the Agent about setting up OAIY' }, `⚙ ${setup.name}`));
+    for (const meta of list) if (meta.id !== SETUP_PROJECT.id) projectSelect.append(h('option', { value: meta.id, selected: meta.id === project?.meta.id }, meta.incognito ? `🕶 ${meta.name} (incognito)` : meta.name));
+    setupButton.hidden = !desktop;
   };
 
   /** Tell OAIY an incognito session has ended: it wipes what it held of it (a model not running is not started for this). */
@@ -368,36 +453,48 @@ async function main(): Promise<void> {
     const phone = [phoneConversationsTool(() => sessions), callerNotesTool(() => sessions), tellAgentTool(() => sessions)];
     // The project's own agent in the Front desk is the phone's runner (while there is a phone).
     const runner = () => withPreview && place() === frontDesk && phoneOn();
-    return (): AgentOptions => ({
-      // Flows made tools, and speech to text: both run on OAIY Desktop.
-      // The calendar's tools only while there is one (a plugin provides it).
-      // The plugins' tools offered to the project's conversation (or, in the Front desk, to the runner).
-      sessionTools: () => [
-        ...(desktop ? [...flowTools, transcribe, ...(calendarOn() ? calendar : []), ...flowBuilder] : flowTools),
-        ...(runner() ? phone : []),
-        ...(withPreview ? pluginTools(runner() ? 'runner' : 'project') : []),
-      ],
-      instructions: () => (runner() ? RUNNER_INSTRUCTIONS : ''),
-      toolHooks: () => toolHooks,
-      vfs: place().vfs,
-      gate,
-      provider: activeProvider,
-      projectSummary: () => summarizeProject(place().meta, place().vfs, gate),
-      ...(withPreview ? { preview } : {}),
-      compactAt: () => agentSettings.compactAt,
-      media: () => media,
-      subAgents: () => {
-        const p = activeProvider();
-        const window = p ? contextWindow(p).tokens : agentSettings.subAgentTokens;
-        return { contextTokens: Math.min(agentSettings.subAgentTokens, window), parallel: p?.parallelAgents ?? (p?.type === 'local' ? 1 : 3) };
-      },
-      onWindow: (tokens) => {
-        const p = activeProvider();
-        if (!p?.modelId) return;
-        p.detectedContext = { model: p.modelId, tokens, how: 'the server, when a prompt was too long', at: Date.now() };
-        void saveProviders(providers, activeId);
-      },
-    });
+    /** The person's own conversation here: "Set up OAIY", the Front desk's runner, or a project's. (The phone's conversations say their own kind.) */
+    const ownKind = (): AgentKind => (place().meta.id === SETUP_PROJECT.id ? 'setup' : runner() ? 'runner' : 'project');
+    return (given?: AgentKind): AgentOptions => {
+      const kind = (): AgentKind => given ?? ownKind();
+      return {
+        // Flows made tools, and speech to text: both run on OAIY Desktop.
+        // The calendar's tools only while there is one (a plugin provides it).
+        // The plugins' tools offered to the project's conversation (or, in the Front desk, to the runner).
+        // OAIY's own tools (its control API) after them, as this kind of conversation is offered them.
+        sessionTools: () => withControl(kind(), [
+          ...(desktop ? [...flowTools, transcribe, ...(calendarOn() ? calendar : []), ...flowBuilder] : flowTools),
+          ...(runner() ? phone : []),
+          ...(withPreview ? pluginTools(runner() ? 'runner' : 'project') : []),
+        ]),
+        instructions: () => [runner() ? RUNNER_INSTRUCTIONS : '', controlInstructions(kind())].filter(Boolean).join('\n\n'),
+        toolHooks: () => toolHooks,
+        vfs: place().vfs,
+        gate,
+        // The engine's provider as chosen in Settings, or ChatGPT when the desktop says the Agent runs on it.
+        provider: () => agentProvider(kind()),
+        prepare: prepareFor(kind),
+        // "Set up OAIY" is a conversation: the Agent stops to ask, or to let the person do a step on screen,
+        // and is not pushed on by an open plan meanwhile.
+        conversation: kind() === 'setup',
+        projectSummary: () => summarizeProject(place().meta, place().vfs, gate),
+        ...(withPreview ? { preview } : {}),
+        compactAt: () => agentSettings.compactAt,
+        media: () => media,
+        subAgents: () => {
+          const p = agentProvider(kind());
+          const window = p ? contextWindow(p).tokens : agentSettings.subAgentTokens;
+          return { contextTokens: Math.min(agentSettings.subAgentTokens, window), parallel: p?.parallelAgents ?? (p?.type === 'local' ? 1 : 3) };
+        },
+        onWindow: (tokens) => {
+          const p = agentProvider(kind());
+          // Only a provider of Settings' is told (ChatGPT's window is set, not learnt).
+          if (!p?.modelId || !providers.includes(p)) return;
+          p.detectedContext = { model: p.modelId, tokens, how: 'the server, when a prompt was too long', at: Date.now() };
+          void saveProviders(providers, activeId);
+        },
+      };
+    };
   };
   /** What the Front desk's own agent is for: it directs the phone's sub-agents. */
   const RUNNER_INSTRUCTIONS = [
@@ -423,11 +520,13 @@ async function main(): Promise<void> {
       frontDesk,
       // A call or a text thread brings its own tools; a flow's task has the desktop's, as the project's agent does.
       // Each also has the plugins' tools offered to its kind of conversation (`session:sms`, `session:call`, `session:task`).
+      // Each runs on the provider its kind takes (on ChatGPT, a call takes its fast live-call route), and none is offered OAIY's control tools.
       (extra, kind) => {
         const tools = extra.sessionTools;
-        const given = tools ? () => [...(typeof tools === 'function' ? tools() : tools), ...flowTools] : deskOptions().sessionTools;
+        const options = deskOptions(kind);
+        const given = tools ? () => [...(typeof tools === 'function' ? tools() : tools), ...flowTools] : options.sessionTools;
         const listed = () => (typeof given === 'function' ? given() : (given ?? []));
-        return new Agent({ ...deskOptions(), ...extra, sessionTools: () => [...listed(), ...pluginTools(`session:${kind}`)] });
+        return new Agent({ ...options, ...extra, sessionTools: () => [...listed(), ...pluginTools(`session:${kind}`)] });
       },
       () => ({ ...messages, answer: messages.answer && holdsTexts }),
       () => desktop,
@@ -445,6 +544,7 @@ async function main(): Promise<void> {
           void desktop?.rememberCaller(note.number, note.name ?? '').catch(() => {});
         },
         event: (session, event) => {
+          if (event.type === 'error') noteModelError(event.message);
           if (viewing === session.id) chat.event(event);
           if (event.type === 'tool_result') void own.save(session).catch(() => {});
         },
@@ -503,8 +603,12 @@ async function main(): Promise<void> {
     }
     project = meta.id === FRONT_DESK.id ? frontDesk : await OpenProject.open(meta);
     if (project !== frontDesk) project.onError = notice;
-    // The Front desk is not renamed or deleted.
-    renameButton.disabled = deleteButton.disabled = project === frontDesk;
+    // The Front desk is not renamed or deleted, nor is "Set up OAIY" (its conversation starts again with /clear).
+    renameButton.disabled = deleteButton.disabled = project === frontDesk || meta.id === SETUP_PROJECT.id;
+    if (meta.id === SETUP_PROJECT.id && !project.vfs.exists(SETUP_NOTE)) {
+      project.vfs.writeFile(SETUP_NOTE, SETUP_README, { parents: true });
+      await project.flush();
+    }
     const agentOptions = projectOptions;
     agent = new Agent(agentOptions());
     agent.turns = await project.loadChat();
@@ -585,7 +689,8 @@ async function main(): Promise<void> {
   /** Models whose window was only guessed (Ollama before the model was loaded): asked again after a reply. */
   const windowsGuessed = new Set<string>();
   async function checkWindow(): Promise<void> {
-    const p = activeProvider();
+    // The provider the conversation runs on: ChatGPT's window is set, so it is not asked.
+    const p = agentProvider('project');
     if (!p?.modelId || p.contextTokens) return;
     const key = `${p.id}|${p.modelId}`;
     if (windowsChecked.has(key)) return;
@@ -774,6 +879,7 @@ async function main(): Promise<void> {
       let previewShown = false;
       await runAgent.run(prompt, (event) => {
         // A run stopped by a project switch finishes quietly: the chat now shows another project.
+        if (event.type === 'error') noteModelError(event.message);
         if (project !== runProject || viewing !== null) return;
         chat.event(event);
         if (event.type === 'tool_result' || event.type === 'compact' || event.type === 'nudge') saveSoon();
@@ -989,7 +1095,7 @@ A project can hold several apps, each in its own folder (any folder whose manife
   }
 
   const renameButton = h('button', { title: 'Rename this project', onclick: async () => {
-    if (project === frontDesk) return;
+    if (project === frontDesk || project.meta.id === SETUP_PROJECT.id) return;
     const name = await askText({ title: 'Rename project', label: 'Project name', value: project.meta.name, ok: 'Rename' });
     if (name && name !== project.meta.name) {
       project.meta = await renameProject(project.meta, name);
@@ -1000,7 +1106,7 @@ A project can hold several apps, each in its own folder (any folder whose manife
   // Delete, or in incognito Clear: the temporary project is wiped and a fresh one opens, incognito staying on.
   const deleteButton = h('button.danger.delete-toggle', { onclick: () => void deleteOrClear() }, 'Delete');
   async function deleteOrClear(): Promise<void> {
-    if (project === frontDesk) return;
+    if (project === frontDesk || project.meta.id === SETUP_PROJECT.id) return;
     if (project.meta.incognito) {
       if (controller && !(await confirmAction({ title: 'Stop the agent?', message: 'The agent is still working. Clearing stops it and deletes what it made.', ok: 'Stop and clear' }))) return;
       if (!(await confirmAction({ title: 'Clear incognito?', message: 'Everything in this incognito project is deleted now: its files, pictures, clips and sounds, and the conversation. Incognito stays on, with a fresh empty project. Export it first to keep anything.', ok: 'Clear', danger: true }))) return;
@@ -1020,9 +1126,12 @@ A project can hold several apps, each in its own folder (any folder whose manife
 
   // Project actions: a row of buttons on a wide screen, a ☰ menu on a phone.
   const closeMenu = () => header.classList.remove('menu-open');
+  // "Set up OAIY": the conversation with the Agent about OAIY itself (while there is a desktop to set up).
+  const setupButton = h('button.setup-oaiy', { title: 'Chat with the Agent to set OAIY up: your phone, flows, models, plugins and services', hidden: !desktop, onclick: () => void openSetup() }, 'Set up OAIY') as HTMLButtonElement;
   const actions = h(
     'div.actions',
     { onclick: (e: Event) => { if ((e.target as HTMLElement).closest('button')) closeMenu(); } },
+    setupButton,
     h('button', { title: 'New empty project', onclick: async () => {
       if (!(await mayLeaveRun())) return;
       const name = await askText({ title: 'New project', message: 'An empty project, kept in this browser.', label: 'Project name', value: 'untitled', ok: 'Create' });
@@ -1218,6 +1327,97 @@ With that done, Settings → Images, video and audio → Find OAIY sets it up.`)
     }).catch(() => {});
   }, 60_000);
 
+  /**
+   * What the Agent runs on, as OAIY Desktop says now (its setup and Settings →
+   * Agent choose it; there is no event for a change): read at start, every
+   * minute, and after the Agent changes it. The engine is the app's providers
+   * as they are; ChatGPT is OAIY's Codex connector.
+   */
+  async function followAgentModel(waitMs = 5000): Promise<void> {
+    const d = desktop;
+    if (!d) {
+      if (agentModel.source !== 'engine') {
+        agentModel = ENGINE;
+        renderChips();
+      }
+      return;
+    }
+    const next = await readAgentModel(d, AbortSignal.timeout(waitMs));
+    if (!next || d !== desktop) return;
+    agentModelAt = Date.now();
+    const changed = !sameModel(next, agentModel);
+    const announce = changed && agentModelKnown;
+    agentModel = next;
+    agentModelKnown = true;
+    if (changed) {
+      codexDefault = null;
+      chatgptProblem = '';
+    }
+    // Codex's default, for a choice that names none (signed out: the chip says so).
+    if (next.source === 'chatgpt' && !next.model && !codexDefault) await lookUpCodexDefault(AbortSignal.timeout(10_000)).catch(() => {});
+    if (!changed) return;
+    renderChips();
+    if (announce) chat.system(next.source === 'chatgpt' ? `The Agent now runs on ChatGPT${next.model ?? codexDefault ? ` (${next.model ?? codexDefault})` : ''}, as chosen in OAIY. Calls use a fast ChatGPT route of their own.` : "The Agent now runs on OAIY's engine, as chosen in OAIY.");
+  }
+  // The Agent's model is looked at again every minute (it may be changed in OAIY at any time).
+  setInterval(() => void followAgentModel(), 60_000);
+
+  /** Codex's own default model, for a ChatGPT choice that names none. Signed out, the chip says so, and the error says where to sign in. */
+  async function lookUpCodexDefault(signal?: AbortSignal): Promise<void> {
+    const d = desktop;
+    if (!d) return;
+    try {
+      codexDefault = await codexDefaultModel(d, signal);
+      if (chatgptProblem) chatgptProblem = '';
+    } catch (error) {
+      if ((error as Error).message === CHATGPT_SIGN_IN) chatgptProblem = 'sign in needed';
+      renderChips();
+      throw error;
+    }
+    renderChips();
+  }
+
+  /** A run that failed because OAIY is not signed in to ChatGPT: the model chip says so until the next try. */
+  function noteModelError(message: string): void {
+    if (message !== CHATGPT_SIGN_IN || agentModel.source !== 'chatgpt' || chatgptProblem) return;
+    chatgptProblem = 'sign in needed';
+    renderChips();
+  }
+
+  /**
+   * OAIY's control tools, listed again for the person's conversations (at
+   * start, when the desktop's modules change, when it comes back, or when
+   * another is paired). Flows made tools then give way to their names.
+   */
+  async function refreshControl(): Promise<void> {
+    const c = control;
+    if (!c) return;
+    c.refresh();
+    const before = controlNames().join();
+    await Promise.all((['project', 'setup', 'runner'] as const).map((session) => c.tools(session).catch(() => [])));
+    if (c === control && controlNames().join() !== before) void refreshFlowTools();
+  }
+
+  /**
+   * "Set up OAIY": the person's conversation with the Agent about OAIY itself,
+   * opened by OAIY's setup wizard ("Continue with the Agent", the intent
+   * `setupWithAgent`) or the project menu. A project of its own (see
+   * SETUP_PROJECT), so it is kept like any conversation and has its own
+   * files, empty state and instructions.
+   */
+  async function openSetup(): Promise<void> {
+    if (!desktop) {
+      chat.system('Setting up OAIY needs OAIY Desktop: pair this page with it first (the desktop chip at the top).', 'error');
+      return;
+    }
+    if (project?.meta.id !== SETUP_PROJECT.id) {
+      if (!(await mayLeaveRun())) return;
+      await openProject(await setupProject());
+    } else if (viewing) selectSession(null);
+    showView('agent');
+    chat.focus();
+  }
+
   // ---- The phone: OAIY Desktop, its events, and the text-message conversations ----
 
   function renderSessions(): void {
@@ -1230,8 +1430,11 @@ With that done, Settings → Images, video and audio → Find OAIY sets it up.`)
       callChip.textContent = `On a call · ${live.title}`;
       callChip.title = viewing === live.id ? `On a call with ${live.title}: shown here` : `On a call with ${live.title}: click to show it`;
     }
+    const settingUp = project.meta.id === SETUP_PROJECT.id;
     chat.setSessions([
-      { id: null, label: project === frontDesk ? '🧭 The runner' : '💬 Project', title: `${project.meta.name}: your conversation with the agent`, status: project === frontDesk ? "Your conversation: it directs the phone's agents" : `Your conversation in ${project.meta.name}`, unread: 0, working: !!currentRun, kind: project === frontDesk ? 'runner' : 'project', name: project === frontDesk ? 'The runner' : project.meta.name },
+      settingUp
+        ? { id: null, label: '⚙ Set up OAIY', title: 'Set up OAIY: your conversation with the Agent about OAIY itself', status: 'Your conversation about setting up OAIY', unread: 0, working: !!currentRun, kind: 'setup', name: project.meta.name }
+        : { id: null, label: project === frontDesk ? '🧭 The runner' : '💬 Project', title: `${project.meta.name}: your conversation with the agent`, status: project === frontDesk ? "Your conversation: it directs the phone's agents" : `Your conversation in ${project.meta.name}`, unread: 0, working: !!currentRun, kind: project === frontDesk ? 'runner' : 'project', name: project === frontDesk ? 'The runner' : project.meta.name },
       ...shownSessions.map((s) => ({
         id: s.id,
         kind: s.kind,
@@ -1400,9 +1603,15 @@ With that done, Settings → Images, video and audio → Find OAIY sets it up.`)
     await sessions?.desktopEvent(event);
     await callbacks?.event(event);
   }, (problem) => {
+    const back = !!desktopProblem && !problem;
     desktopProblem = problem;
     renderPhoneChip();
     if (!problem) void refreshPhone();
+    // The desktop is back (it may have restarted, or been updated): its control tools and the Agent's model are asked again.
+    if (back) {
+      void refreshControl();
+      void followAgentModel();
+    }
   });
 
   /**
@@ -1448,7 +1657,8 @@ With that done, Settings → Images, video and audio → Find OAIY sets it up.`)
       return;
     }
     try {
-      const taken = new Set(builtInToolNames);
+      // OAIY's control tools keep their names too: a flow made a tool with one of them gets `flow_` in front.
+      const taken = new Set([...builtInToolNames, ...controlNames()]);
       const store = await readFlowStore(d, AbortSignal.timeout(10_000));
       flowTools = flowSessionTools(store.tools, () => desktop, taken);
       toolHooks = flowToolHooks(store.hooks, () => desktop);
@@ -1557,7 +1767,10 @@ With that done, Settings → Images, video and audio → Find OAIY sets it up.`)
   /** The modules as the desktop says now: what came on starts, what went off stops. */
   function applyModules(next: Modules): void {
     const changes = diffModules(modules, next);
+    // A new snapshot (a plugin came, went or changed): OAIY's control tools are listed again.
+    const fresh = !modules || modules.revision !== next.revision || modules.source !== next.source;
     modules = next;
+    if (fresh && next !== UNPAIRED) void refreshControl();
     for (const change of changes) {
       if (change.id !== 'phone') continue;
       if (change.on) phoneStarted();
@@ -1590,17 +1803,6 @@ With that done, Settings → Images, video and audio → Find OAIY sets it up.`)
     applyModules(UNPAIRED);
   }
   setInterval(() => void keepTextLease(), 10_000);
-  // OAIY Desktop's setup wizard ("Answer calls and texts with OAIY"), in OAIY's own window only.
-  if (given) {
-    installIntents({
-      answerWithOaiy: async () => {
-        messages = answeringOn(messages);
-        await saveMessages(messages);
-        await keepTextLease();
-        chat.system('Answering calls and texts is on, from OAIY setup. Phone has the instructions for them.');
-      },
-    });
-  }
   window.addEventListener('pagehide', () => {
     if (holdsTexts && desktop) void desktop.release('answer-texts', pageId);
   });
@@ -1617,9 +1819,15 @@ With that done, Settings → Images, video and audio → Find OAIY sets it up.`)
         desktop = d ? new Desktop(d.origin, d.token) : null;
         void saveDesktop(d);
         desktopEvents.stop();
+        // Another desktop (or none): its own control API, and its own choice of the Agent's model.
+        control = desktop ? new ControlClient(desktop.origin, desktop.token) : null;
+        codexDefault = null;
+        chatgptProblem = '';
+        void followAgentModel();
         if (desktop) {
           desktopEvents.start();
           followTasks();
+          void refreshControl();
           void refreshFlowTools();
           // The phone's parts start once this desktop says it has a phone (again, on this desktop, if it was on).
           if (phoneOn()) phoneStarted();
@@ -1677,16 +1885,38 @@ With that done, Settings → Images, video and audio → Find OAIY sets it up.`)
   }
   // What the desktop said already starts its parts now (the runner's role, the calls); the stream keeps them up to date.
   if (firstModules) applyModules(firstModules);
+  // OAIY Desktop's setup wizard asks, in OAIY's own window only: "Answer calls and texts with OAIY", and
+  // "Continue with the Agent" (the "Set up OAIY" conversation). Taken once the first project is open, so an
+  // intent that came while the page started is not undone by the start opening the last project.
+  if (given) {
+    installIntents({
+      answerWithOaiy: async () => {
+        messages = answeringOn(messages);
+        await saveMessages(messages);
+        await keepTextLease();
+        chat.system('Answering calls and texts is on, from OAIY setup. Phone has the instructions for them.');
+      },
+      // The wizard may have just chosen the Agent's model: read it before the conversation starts.
+      setupWithAgent: async () => {
+        await followAgentModel(3000);
+        await openSetup();
+      },
+    });
+  }
 
   const sandbox = sandboxAvailable();
   if (!sandbox.ok) chat.system(`The code sandbox is unavailable: ${sandbox.reason}.`, 'error');
   else void zippModule().catch((error: unknown) => chat.system(`Could not load the Zipp engine: ${(error as Error).message}`, 'error'));
   await lookForOaiy();
   renderPhoneChip();
+  // What the Agent runs on (the desktop's choice: its engine, or ChatGPT), shown on the model chip.
+  void followAgentModel();
   if (desktop) {
     desktopEvents.start();
     void keepTextLease();
     followTasks();
+    // OAIY's control tools, for the person's conversations.
+    void refreshControl();
     void refreshFlowTools();
     // The phone's calls, its chip and call backs start once the desktop says there is a phone.
     startModules();

@@ -331,6 +331,12 @@ export interface AgentOptions {
    * answer, so it is never asked to start work or carry on (on a call those asks were spoken aloud).
    */
   conversation?: boolean;
+  /**
+   * What must be ready before a run's first request (the ChatGPT model the
+   * Agent runs on, looked up; OAIY Desktop's control tools, listed). A failure
+   * is said as the run's error, and nothing is sent.
+   */
+  prepare?: (signal?: AbortSignal) => Promise<void>;
 }
 
 /**
@@ -1715,6 +1721,14 @@ ${this.instructions}` : ''}`;
   }
 
   async run(prompt: string, emit: (e: AgentEvent) => void, signal?: AbortSignal, images: ImagePart[] = [], attachments: Attachment[] = []): Promise<void> {
+    if (this.options.prepare) {
+      try {
+        await this.options.prepare(signal);
+      } catch (error) {
+        if (!signal?.aborted) emit({ type: 'error', message: error instanceof Error ? error.message : String(error) });
+        return;
+      }
+    }
     const provider = this.options.provider();
     if (!provider) {
       emit({ type: 'error', message: 'No AI provider is set up yet. Open Settings to connect a local server (Ollama, LM Studio) or an API.' });

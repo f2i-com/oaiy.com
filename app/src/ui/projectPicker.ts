@@ -10,10 +10,12 @@ import { h } from './dom';
 import { icon } from './icons';
 
 const FRONT_DESK = 'front-desk';
-const GROUPS = ['Phone', 'Projects', 'Incognito'];
+/** "Set up OAIY": the conversation about OAIY itself. */
+const SETUP = 'oaiy-setup';
+const GROUPS = ['Phone', 'OAIY', 'Projects', 'Incognito'];
 
 function iconFor(value: string, incognito: boolean): string {
-  return value === FRONT_DESK ? 'phone' : incognito ? 'glasses' : 'folder';
+  return value === FRONT_DESK ? 'phone' : value === SETUP ? 'settings' : incognito ? 'glasses' : 'folder';
 }
 
 export class ProjectPicker {
@@ -59,12 +61,12 @@ export class ProjectPicker {
       const text = option.textContent ?? option.value;
       const incognito = /^🕶/.test(text) || / \(incognito\)$/.test(text);
       const label = text.replace(/^[^\p{L}\p{N}]+/u, '').replace(/ \(incognito\)$/, '').trim() || option.value;
-      const kind = option.value === FRONT_DESK ? 'phone' : incognito ? 'incognito' : 'project';
+      const kind = option.value === FRONT_DESK ? 'phone' : option.value === SETUP ? 'setup' : incognito ? 'incognito' : 'project';
       return {
         id: option.value,
         label,
-        detail: option.value === FRONT_DESK ? option.title || "The phone's agents" : incognito ? 'Incognito: kept only until you leave it' : undefined,
-        group: option.value === FRONT_DESK ? 'Phone' : incognito ? 'Incognito' : 'Projects',
+        detail: option.value === FRONT_DESK ? option.title || "The phone's agents" : option.value === SETUP ? option.title || 'Set up and change OAIY with the Agent' : incognito ? 'Incognito: kept only until you leave it' : undefined,
+        group: option.value === FRONT_DESK ? 'Phone' : option.value === SETUP ? 'OAIY' : incognito ? 'Incognito' : 'Projects',
         kind,
         title: option.title || label,
         icon: () => icon(iconFor(option.value, incognito)),

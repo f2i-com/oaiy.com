@@ -1,14 +1,16 @@
 /**
  * What OAIY Desktop may ask of this page by name: its setup wizard's "Answer
  * calls and texts with OAIY" (this page's settings live in its own storage,
- * which only it can change). The desktop evaluates `window.__oaiyIntent(name)`
- * into the Agent's page in its window, or, while the page is still starting,
- * leaves the name in `window.__OAIY_INTENTS__` for it to find (embed.rs).
- * Only the names given handlers here are done; anything else is ignored.
+ * which only it can change), and its "Continue with the Agent", which opens
+ * the "Set up OAIY" conversation (`setupWithAgent`). The desktop evaluates
+ * `window.__oaiyIntent(name)` into the Agent's page in its window, or, while
+ * the page is still starting, leaves the name in `window.__OAIY_INTENTS__` for
+ * it to find (embed.rs). Only the names given handlers here are done;
+ * anything else is ignored.
  */
 import type { MessageSettings } from '../settings';
 
-export type IntentName = 'answerWithOaiy';
+export type IntentName = 'answerWithOaiy' | 'setupWithAgent';
 export type IntentHandlers = Partial<Record<IntentName, () => void | Promise<void>>>;
 
 export interface IntentWindow {

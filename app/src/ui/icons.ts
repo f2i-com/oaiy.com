@@ -72,6 +72,13 @@ const ICONS: Record<string, { shapes: Shape[]; fill?: boolean }> = {
   refresh: { shapes: [['path', 'M3 12a9 9 0 0 1 15.5-6.3L21 8'], ['polyline', '21 3 21 8 16 8'], ['path', 'M21 12a9 9 0 0 1-15.5 6.3L3 16'], ['polyline', '3 21 3 16 8 16']] },
   flag: { shapes: [['path', 'M4 15s1-1 4-1 5 2 8 2 4-1 4-1V3s-1 1-4 1-5-2-8-2-4 1-4 1z'], ['line', 4, 22, 4, 15]] },
   'arrow-down': { shapes: [['line', 12, 5, 12, 19], ['polyline', '19 12 12 19 5 12']] },
+  activity: { shapes: [['polyline', '22 12 18 12 15 21 9 3 6 12 2 12']] },
+  settings: { shapes: [['line', 4, 21, 4, 14], ['line', 4, 10, 4, 3], ['line', 12, 21, 12, 12], ['line', 12, 8, 12, 3], ['line', 20, 21, 20, 16], ['line', 20, 12, 20, 3], ['line', 1, 14, 7, 14], ['line', 9, 8, 15, 8], ['line', 17, 16, 23, 16]] },
+  cpu: { shapes: [['rect', 4, 4, 16, 16, 2], ['rect', 9, 9, 6, 6, 1], ['line', 9, 1, 9, 4], ['line', 15, 1, 15, 4], ['line', 9, 20, 9, 23], ['line', 15, 20, 15, 23], ['line', 20, 9, 23, 9], ['line', 20, 14, 23, 14], ['line', 1, 9, 4, 9], ['line', 1, 14, 4, 14]] },
+  power: { shapes: [['path', 'M18.4 6.6a9 9 0 1 1-12.8 0'], ['line', 12, 2, 12, 12]] },
+  server: { shapes: [['rect', 2, 2, 20, 8, 2], ['rect', 2, 14, 20, 8, 2], ['line', 6, 6, 6.01, 6], ['line', 6, 18, 6.01, 18]] },
+  plug: { shapes: [['path', 'M12 22v-5'], ['path', 'M9 8V2'], ['path', 'M15 8V2'], ['path', 'M18 8v5a4 4 0 0 1-4 4h-4a4 4 0 0 1-4-4V8z']] },
+  link: { shapes: [['path', 'M10 13a5 5 0 0 0 7.5.5l3-3a5 5 0 0 0-7.1-7.1l-1.7 1.7'], ['path', 'M14 11a5 5 0 0 0-7.5-.5l-3 3a5 5 0 0 0 7.1 7.1l1.7-1.7']] },
 };
 
 const NS = 'http://www.w3.org/2000/svg';

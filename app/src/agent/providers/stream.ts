@@ -19,6 +19,7 @@
  */
 
 import { AIProviderError, isRecord, type SSEEvent } from './aiProvider';
+import { CHATGPT_SIGN_IN, signInNeeded } from './chatgpt';
 
 /** Where a streamed reply's pieces go as they arrive. */
 export interface StreamSink {
@@ -52,6 +53,7 @@ function streamError(error: unknown): AIProviderError {
   const type = typeof record.type === 'string' ? record.type : typeof record.code === 'string' ? record.code : '';
   const message = typeof record.message === 'string' && record.message ? record.message : typeof error === 'string' ? error : 'The provider reported an error mid-reply.';
   if (/overloaded|rate_limit/i.test(type)) return new AIProviderError('rate-limited', `The provider is overloaded: ${message}`);
+  if (signInNeeded(type)) return new AIProviderError('http', CHATGPT_SIGN_IN, { detail: message });
   return new AIProviderError('http', `The provider stopped its reply with an error: ${message}`, { detail: message });
 }
 

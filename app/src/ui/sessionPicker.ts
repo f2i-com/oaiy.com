@@ -19,7 +19,7 @@ export interface ConversationTab {
   unread: number;
   working: boolean;
   close?: () => void;
-  /** What it is: the person's own (in a project, or the Front desk's runner), a call, a text thread or a flow's tasks. */
+  /** What it is: the person's own (in a project, "Set up OAIY", or the Front desk's runner), a call, a text thread or a flow's tasks. */
   kind?: ConversationKind;
   /** Who it is with (a name, or the number), or the flow's name. */
   name?: string;
@@ -31,7 +31,7 @@ export interface ConversationTab {
   live?: boolean;
 }
 
-export type ConversationKind = 'project' | 'runner' | 'call' | 'sms' | 'task';
+export type ConversationKind = 'project' | 'runner' | 'setup' | 'call' | 'sms' | 'task';
 
 /** The id the person's own conversation (null) goes by in the list. */
 const OWN = '\u0000own';
@@ -52,7 +52,7 @@ export function tabName(tab: ConversationTab): string {
   return tab.name ?? (tab.label.replace(/^[^\p{L}\p{N}+(]+/u, '').trim() || tab.label);
 }
 
-const KIND_ICON: Record<ConversationKind, string> = { project: 'sparkle', runner: 'compass', call: 'phone', sms: 'message', task: 'flow' };
+const KIND_ICON: Record<ConversationKind, string> = { project: 'sparkle', runner: 'compass', setup: 'settings', call: 'phone', sms: 'message', task: 'flow' };
 
 /** A conversation's avatar: the person's initials, or its kind's icon. */
 export function conversationAvatar(kind: ConversationKind, name: string, live = false): HTMLElement {
@@ -98,7 +98,7 @@ export class SessionPicker {
     const items: ComboItem[] = tabs.map((tab) => {
       const kind = tabKind(tab);
       const name = kind === 'sms' && tab.key === TEST ? 'Test' : tabName(tab);
-      const group = kind === 'project' || kind === 'runner' ? 'Yours' : kind === 'call' ? 'Calls' : kind === 'sms' ? 'Texts' : 'Flow tasks';
+      const group = kind === 'project' || kind === 'runner' || kind === 'setup' ? 'Yours' : kind === 'call' ? 'Calls' : kind === 'sms' ? 'Texts' : 'Flow tasks';
       return {
         id: tab.id ?? OWN,
         label: name,

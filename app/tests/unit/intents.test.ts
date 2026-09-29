@@ -37,6 +37,31 @@ describe('intents from OAIY Desktop', () => {
     expect(w.__oaiyIntent).toBeUndefined();
   });
 
+  it('setupWithAgent (the wizard\'s "Continue with the Agent") opens what its handler opens, now or once the page has started', async () => {
+    const w: IntentWindow = {};
+    const setupWithAgent = vi.fn();
+    const answerWithOaiy = vi.fn();
+    installIntents({ answerWithOaiy, setupWithAgent }, w);
+    expect(w.__oaiyIntent!('setupWithAgent')).toBe(true);
+    await settle();
+    expect(setupWithAgent).toHaveBeenCalledTimes(1);
+    expect(answerWithOaiy).not.toHaveBeenCalled();
+
+    // Sent while the page was starting: the desktop left it waiting (embed.rs), and it is done once, when the handlers are in.
+    const starting: IntentWindow = { __OAIY_INTENTS__: ['setupWithAgent', 'answerWithOaiy', 'setupWithAgent'] };
+    const opened = vi.fn();
+    const answered = vi.fn();
+    installIntents({ answerWithOaiy: answered, setupWithAgent: opened }, starting);
+    await settle();
+    expect(opened).toHaveBeenCalledTimes(1);
+    expect(answered).toHaveBeenCalledTimes(1);
+
+    // A page without the handler (an older one) ignores it.
+    const older: IntentWindow = {};
+    installIntents({ answerWithOaiy }, older);
+    expect(older.__oaiyIntent!('setupWithAgent')).toBe(false);
+  });
+
   it('turns on answering texts and calls, keeping the instructions', () => {
     const before = { ...DEFAULT_MESSAGE_SETTINGS, instructions: 'Be brief.', callBack: true };
     expect(answeringOn(before)).toEqual({ ...before, answer: true, calls: true });

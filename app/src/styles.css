@@ -197,6 +197,10 @@ button:focus-visible, summary:focus-visible, [tabindex]:focus-visible { outline:
 .topbar.menu-open .actions button.danger:hover:not(:disabled) { background: var(--err-soft); }
 .topbar.menu-open .actions .delete-toggle { margin-top: 4px; position: relative; }
 .topbar.menu-open .actions .delete-toggle::before { content: ''; position: absolute; left: 6px; right: 6px; top: -3px; border-top: 1px solid var(--border); }
+/* "Set up OAIY" heads the menu, set apart from the project's own actions. */
+.topbar.menu-open .actions .setup-oaiy { margin-bottom: 4px; position: relative; color: var(--accent); font-weight: 650; }
+.topbar.menu-open .actions .setup-oaiy::after { content: ''; position: absolute; left: 6px; right: 6px; bottom: -3px; border-top: 1px solid var(--border); }
+.actions .setup-oaiy[hidden] { display: none; }
 /* Status pills, as the dashboard draws them: a soft fill, a 1px edge, and a lit dot. */
 .chip { display: inline-flex; align-items: center; gap: 7px; height: 30px; padding: 0 12px; border-radius: 999px; border: 1px solid var(--border); background: var(--surface-soft); color: var(--muted); font-size: 12px; font-weight: 600; white-space: nowrap; }
 .chip:hover:not(:disabled) { border-color: var(--strong-border); background: var(--panel-2); color: var(--text); }
@@ -263,6 +267,7 @@ button:focus-visible, summary:focus-visible, [tabindex]:focus-visible { outline:
 .project-icon .icon { width: 14px; height: 14px; }
 .project-icon.kind-phone { background: color-mix(in srgb, var(--magenta) 14%, transparent); color: var(--magenta); }
 .project-icon.kind-incognito { background: color-mix(in srgb, var(--incognito) 18%, transparent); color: var(--incognito); }
+.project-icon.kind-setup { background: color-mix(in srgb, var(--ok) 15%, transparent); color: var(--ok); }
 .project-name { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .project-picker .combo-option .combo-icon { width: 26px; height: 26px; border-radius: var(--r-sm); background: var(--panel-2); color: var(--muted); }
 .project-picker .combo-option[data-kind='phone'] .combo-icon { color: var(--magenta); }
@@ -458,6 +463,7 @@ kbd { display: inline-block; padding: 1px 6px; border: 1px solid var(--border); 
 .convo-avatar.kind-sms { background: color-mix(in srgb, var(--cyan) 15%, transparent); color: var(--cyan); border-radius: 50%; }
 .convo-avatar.kind-task { background: color-mix(in srgb, var(--warn) 15%, transparent); color: var(--warn); }
 .convo-avatar.kind-runner { background: var(--primary-soft); color: var(--accent); }
+.convo-avatar.kind-setup { background: color-mix(in srgb, var(--ok) 15%, transparent); color: var(--ok); }
 .convo-avatar.live { box-shadow: 0 0 0 2px var(--panel), 0 0 0 3.5px var(--err); }
 .convo-kind { position: absolute; right: -3px; bottom: -3px; display: grid; place-items: center; width: 15px; height: 15px; border-radius: 50%; background: var(--panel); border: 1px solid var(--border); color: inherit; }
 .convo-kind .icon { width: 9px; height: 9px; stroke-width: 2.4; }
@@ -1024,6 +1030,8 @@ footer.dialog-buttons { flex: none; padding: 12px 22px 16px; border-top: 1px sol
 /* On a call now: who with (a click shows the call). */
 .chip.on-call { color: var(--err); border-color: color-mix(in srgb, var(--err) 45%, var(--border)); background: var(--err-soft); font-weight: 650; }
 .chip.on-call[hidden] { display: none; }
+/* The Agent's model chip: which AI it runs on; a ChatGPT that needs signing in says so. */
+.chip.model[data-state='problem'] { color: var(--warn); border-color: color-mix(in srgb, var(--warn) 40%, var(--border)); background: var(--warn-soft); }
 .chip.on-call::before { content: ''; flex: none; width: 7px; height: 7px; border-radius: 50%; background: currentColor; box-shadow: var(--glow) currentColor; animation: pulse 1.2s ease-in-out infinite; }
 .phone-form { display: flex; flex-direction: column; gap: 10px; }
 .phone-form textarea { width: 100%; min-height: 90px; resize: vertical; }
