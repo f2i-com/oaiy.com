@@ -89,8 +89,17 @@ impl PluginLine {
         for record in &records {
             let Some(manifest) = record.manifest.as_ref() else { continue };
             let claims = modules::claims(manifest);
-            let Some(claim) = claims.get(PHONE).filter(|c| c.refused.is_none()) else { continue };
+            let Some(claim) = claims.get(PHONE) else { continue };
             let name = manifest.name.clone();
+            if let Some(refused) = &claim.refused {
+                // It names the phone module but OAIY cannot use it as a provider (a command it needs is not declared, or the connector is not
+                // there): the module is off for it, and there is no connector to ask it through. Off is not gone: while its process runs it may
+                // hold a call (an older phone plugin, a broken manifest), so it cannot be taken for quiet.
+                if record.state.accepts_commands() || record.state == PluginState::Starting || alive.contains(&record.id) {
+                    unknown.push((name, format!("it cannot be asked: {refused}")));
+                }
+                continue;
+            }
             match record.state {
                 state if state.accepts_commands() => match self.ask_plugin(&name, manifest, claim.connector.as_deref()) {
                     LineState::Live { count, .. } => live.push((name, count)),
@@ -771,6 +780,71 @@ mod process_tests {
         assert_eq!(asked(&a).len() + asked(&b).len(), 1, "one request, to the plugin the registry routes it to");
         host.stop("a-line").unwrap();
         host.stop("b-line").unwrap();
+    }
+
+    /// The manifest of `id` (installed by `install`) without `command` among what its connector declares: a plugin that names the phone
+    /// module but lacks something OAIY needs of a provider.
+    fn without_command(dir: &Path, command: &str) {
+        let file = dir.join("manifest.json");
+        let mut manifest: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(&file).unwrap()).unwrap();
+        let drop = |list: &mut serde_json::Value, matches: &dyn Fn(&str) -> bool| list.as_array_mut().unwrap().retain(|c| !matches(c.as_str().unwrap()));
+        drop(&mut manifest["connectors"][0]["commands"], &|c| c == command);
+        drop(&mut manifest["capabilities"], &|c| c.ends_with(&format!(".{command}")));
+        std::fs::write(file, manifest.to_string()).unwrap();
+    }
+
+    #[test]
+    fn a_running_plugin_that_names_the_phone_but_lacks_what_a_provider_needs_cannot_be_asked_and_is_not_taken_for_quiet() {
+        if !has_node() {
+            return;
+        }
+        let sb = Sandbox::new("refused");
+        let host = host(&sb);
+        // It claims the phone and declares the live-call command, but not call.dial, which OAIY needs of a phone provider.
+        let dir = install(&sb, &["call.switchboard"], board(Some(call())));
+        without_command(&dir, "call.dial");
+        start(&host);
+        let records = host.registry.lock().unwrap().list();
+        let phone = modules::resolve(&records).modules.into_iter().find(|m| m.id == PHONE).unwrap();
+        assert!(!phone.enabled, "OAIY does not take it for the phone: {phone:?}");
+        assert!(phone.reason.as_deref().is_some_and(|r| r.contains("call.dial")), "{phone:?}");
+        let line = PluginLine::with_timeout(host.clone(), Duration::from_millis(800));
+        match line.ask(true) {
+            LineState::Unknown { plugin, why } => {
+                assert_eq!(plugin, "Line Test Plugin");
+                assert!(why.contains("it cannot be asked") && why.contains("call.dial"), "{why}");
+            }
+            other => panic!("{other:?}"),
+        }
+        assert!(asked(&dir).is_empty(), "it was not asked anything: there is no connector to ask it through");
+        // Through the blockers it is a reason of its own, with the way out.
+        let readings = crate::update::blockers::Readings { phone: line.ask(true), ..Default::default() };
+        let blockers = compute(Some(&readings), Duration::from_secs(3600));
+        assert_eq!(blockers.iter().map(|b| b.code).collect::<Vec<_>>(), ["callUnknown"]);
+        assert!(blockers[0].message.contains("call.dial"), "{}", blockers[0].message);
+        // Its process alive but marked stopped: still not gone.
+        host.registry.lock().unwrap().set_state("line", PluginState::Stopped, None);
+        assert!(matches!(line.ask(true), LineState::Unknown { .. }));
+        // Once it is really stopped it holds nothing.
+        host.stop("line").unwrap();
+        assert_eq!(line.ask(true), LineState::NoPlugin);
+    }
+
+    #[test]
+    fn a_plugin_that_names_the_phone_and_lacks_what_a_provider_needs_holds_nothing_while_it_is_not_running() {
+        let sb = Sandbox::new("refused-stopped");
+        let host = host(&sb);
+        let dir = install(&sb, &["call.switchboard"], board(Some(call())));
+        without_command(&dir, "call.dial");
+        host.registry.lock().unwrap().scan();
+        let line = PluginLine::with_timeout(host.clone(), Duration::from_millis(800));
+        for state in [PluginState::Installed, PluginState::Stopped, PluginState::Crashed, PluginState::Disabled] {
+            host.registry.lock().unwrap().set_state("line", state, None);
+            assert_eq!(line.ask(true), LineState::NoPlugin, "{state:?}");
+        }
+        // Starting: a process that may be picking up a call.
+        host.registry.lock().unwrap().set_state("line", PluginState::Starting, None);
+        assert!(matches!(line.ask(true), LineState::Unknown { .. }));
     }
 
     #[test]

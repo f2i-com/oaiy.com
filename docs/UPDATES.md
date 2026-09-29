@@ -76,8 +76,11 @@ Each of these keeps "Restart to update" off, by itself, and is shown in words ne
     cannot read blocks the install** ("can't tell whether a call is live"), and so does one
     that declares neither command or is still starting, one whose process is alive though the
     registry marks it stopped or turned off (an update stops what has a process, so it is not
-    taken for gone), and one whose connector another plugin also declares (a request reaches only
-    one of them, so the other cannot be asked); stopping that plugin (Connections, Plugins) lets
+    taken for gone), one whose connector another plugin also declares (a request reaches only
+    one of them, so the other cannot be asked), and one that names the phone module but lacks a
+    command OAIY needs of a provider (OAIY has switched the module off for it and has no
+    connector to ask it through, but it may still hold a call: the message says which command is
+    missing); stopping that plugin (Connections, Plugins) lets
     it through, as does a plugin that is not running at all. A plugin that is
     running without its radio attached, or paused, is such a case: it answers with an error, so
     the install waits until the plugin is stopped or the radio is back.
