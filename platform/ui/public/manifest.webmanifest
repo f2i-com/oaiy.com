@@ -1,15 +1,18 @@
 {
-  "name": "OAIY — Orchestrate AI Yourself",
-  "short_name": "OAIY",
-  "description": "A visual, node-based canvas for local AI. Chain LLMs, browser automation, and image, audio & video generation on your own machine.",
+  "id": "/app.html",
+  "name": "OAIY Flows",
+  "short_name": "OAIY Flows",
+  "description": "The OAIY flow editor: draw flows that chain AI models, tools and media, and run them in your browser with your own AI provider. Your keys stay on this device.",
   "start_url": "/app.html",
   "scope": "/",
   "display": "standalone",
   "background_color": "#070a12",
   "theme_color": "#7167ff",
+  "categories": ["productivity", "developer tools"],
   "icons": [
     { "src": "/favicon.svg", "type": "image/svg+xml", "sizes": "any", "purpose": "any" },
-    { "src": "/apple-touch-icon.png", "type": "image/png", "sizes": "180x180" },
-    { "src": "/favicon-32.png", "type": "image/png", "sizes": "32x32" }
+    { "src": "/icon-192.png", "type": "image/png", "sizes": "192x192", "purpose": "any" },
+    { "src": "/icon-512.png", "type": "image/png", "sizes": "512x512", "purpose": "any" },
+    { "src": "/icon-maskable-512.png", "type": "image/png", "sizes": "512x512", "purpose": "maskable" }
   ]
 }

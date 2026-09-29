@@ -3210,6 +3210,27 @@ button.oaiy-row:focus-visible,
 .oaiy-toast.error { --tone: var(--signal-danger); }
 .oaiy-toast.warning { --tone: var(--signal-amber); }
 
+/* ---------- a new version of the editor is waiting (pwa/updateController.ts) ---------- */
+
+.oaiy-update-notice {
+  position: fixed;
+  z-index: 10030;
+  left: 50%;
+  bottom: 18px;
+  display: flex;
+  max-width: calc(100vw - 36px);
+  align-items: center;
+  gap: 10px;
+  border: 1px solid rgb(var(--accent-primary) / 0.4);
+  border-radius: var(--r-card);
+  background: rgb(var(--color-bg-secondary));
+  box-shadow: var(--shadow-lg);
+  color: rgb(var(--color-text-primary));
+  padding: 8px 8px 8px 14px;
+  font-size: 12.5px;
+  transform: translateX(-50%);
+}
+
 /* ---------- data: the table ---------- */
 
 .oaiy-data { display: flex; min-height: 0; flex: 1 1 auto; gap: 14px; }

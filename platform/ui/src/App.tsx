@@ -3,6 +3,7 @@ import { createPortal } from 'react-dom';
 import { ReactFlowProvider } from '@xyflow/react';
 import { invoke } from '@tauri-apps/api/core';
 import OAIYApp from './components/OAIYApp';
+import UpdateNotice from './components/UpdateNotice';
 import ErrorBoundary from './components/ErrorBoundary';
 import { ToastProvider } from './components/Toast';
 import { ThemeProvider } from './contexts/ThemeContext';
@@ -246,6 +247,7 @@ function App() {
           <ReactFlowProvider>
             <OAIYApp />
           </ReactFlowProvider>
+          <UpdateNotice />
         </ToastProvider>
       </ThemeProvider>
     </ErrorBoundary>

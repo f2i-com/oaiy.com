@@ -52,6 +52,12 @@ startDesktopServiceSync();
 import { requestPersistentStorage } from './lib/persistentStorage';
 void requestPersistentStorage();
 
+// The editor as an installable app: the browser's offer to install is caught here, before
+// anything can miss it, and the service worker is registered (in a production build, and
+// not in OAIY's own window). See pwa/index.ts.
+import { startPwa } from './pwa';
+startPwa();
+
 // Seal any API keys still in plaintext localStorage (the first load after this
 // change), in the background: the editor's reads wait for the same promise, and
 // a browser that cannot seal keeps them as before. See tauri-shim/secretVault.ts.

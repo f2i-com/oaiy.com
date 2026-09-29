@@ -29,6 +29,7 @@ import {
   type DesktopInfo,
 } from '../lib/desktopDetection';
 import { subscribeStorageQuota } from '../lib/storageQuota';
+import { installController, useInstallState } from '../pwa';
 import type { WorkflowGraph, GraphNode, Flow, LocalNetworkPermissionRequest, LocalNetworkPermissionResponse } from 'oaiy-core';
 import LocalNetworkPermissionDialog from './dialogs/LocalNetworkPermissionDialog';
 import { TrustDialog, DependencyDialog, PackageBrowser } from './PackageManager';
@@ -107,6 +108,9 @@ export default function OAIYApp() {
   } = useProject();
 
   const { addToast } = useToast();
+
+  // The browser is offering to install the editor as an app (never true in OAIY's own window).
+  const installOffered = useInstallState().available;
 
   // Package nodes management
   const {
@@ -623,6 +627,7 @@ export default function OAIYApp() {
               ? `Desktop v${companion.version ?? '?'}`
               : 'Browser-only execution'
           }
+          onInstall={installOffered ? () => { void installController.prompt(); } : undefined}
         />
       )}
 

@@ -4,6 +4,7 @@ import react from '@vitejs/plugin-react'
 import path from 'path'
 import * as esbuild from 'esbuild'
 import type { IncomingMessage, ServerResponse } from 'node:http'
+import { serviceWorkerPlugin } from './scripts/serviceWorkerPlugin'
 
 // Bundles the custom-node-UI sandbox runner (src/sandbox/sandbox-main.tsx) into a
 // self-contained IIFE string exposed as `virtual:sandbox-runtime`. The host inlines this
@@ -74,7 +75,7 @@ const shim = (p: string) => path.resolve(__dirname, 'src/tauri-shim', p)
 
 // https://vite.dev/config/
 export default defineConfig({
-  plugins: [react(), sandboxRuntimePlugin(), compilerWorkerCspPlugin()],
+  plugins: [react(), sandboxRuntimePlugin(), compilerWorkerCspPlugin(), serviceWorkerPlugin({ root: __dirname })],
   resolve: {
     dedupe: ['react', 'react-dom', '@xyflow/react'],
     // Array form: matched top-to-bottom, so list the most specific finds first.
@@ -162,6 +163,27 @@ export default defineConfig({
         // longer invalidates the whole main bundle.
         manualChunks: (id) => {
           if (id.includes('@monaco-editor/react')) return 'monaco';
+          // The code editor is 4 MB of the app shell: folded into oaiy-modules it made that chunk
+          // 4.5 MB, over the most the service worker keeps (src/pwa/swCore.ts), and a shell with
+          // a file the worker refuses does not start offline. Split by Monaco's own layers
+          // (base and platform below, the editor above; nothing below imports the layer above),
+          // each chunk is well under the limit. The languages and their workers stay lazy, as
+          // they were. The build stops (scripts/serviceWorkerPlugin.ts) if a shell file passes
+          // the limit again.
+          const monaco = /[\\/]node_modules[\\/]monaco-editor[\\/]esm[\\/](.*)$/.exec(id);
+          if (monaco) {
+            const inside = monaco[1].split('\\').join('/');
+            if (inside.startsWith('vs/basic-languages/') || inside.startsWith('vs/language/')) return undefined;
+            // The lower layers go together and everything else with the editor: the LSP client
+            // and vs/common/workers.js import the editor, so they must not sit below it (a
+            // circular chunk).
+            const lower =
+              inside.startsWith('vs/base/') ||
+              inside.startsWith('vs/platform/') ||
+              inside.startsWith('vs/nls') ||
+              (inside.startsWith('external/') && !inside.startsWith('external/monaco-lsp-client/'));
+            return lower ? 'monaco-base' : 'monaco-editor';
+          }
           if (id.includes('@xyflow/react') || id.includes('dagre')) return 'xyflow';
           // Match the exact react/react-dom in node_modules (not e.g. react-dnd).
           // Backslash handles Windows paths.

@@ -44,6 +44,27 @@ const section = (s) => console.log(`\n-- ${s} --`);
 
 const browser = await chromium.launch();
 
+// The editor looks for OAIY Desktop on this machine (127.0.0.1:17972) from the moment it opens, and the
+// browser it runs in is a browser on a machine that may have one running. A test must neither talk to it
+// nor depend on it, so every request to the product's own ports is refused before it leaves, in every
+// context this file opens. What answers instead is something that is not OAIY Desktop (it says another
+// product), so the editor sees what it sees on a machine with no desktop, and a refused connection
+// does not put an error in the console that the "clean console" checks would count.
+const OWN_PORTS = new Set(['17972', '17872', '17973', '8080', '7860', '8783', '9333']);
+const newContext = browser.newContext.bind(browser);
+browser.newContext = async (...args) => {
+  const context = await newContext(...args);
+  await context.route(
+    (url) => ['127.0.0.1', 'localhost', '[::1]'].includes(url.hostname) && OWN_PORTS.has(url.port),
+    (route) => {
+      const headers = { 'access-control-allow-origin': '*', 'access-control-allow-headers': '*', 'access-control-allow-private-network': 'true' };
+      if (route.request().method() === 'OPTIONS') return route.fulfill({ status: 204, headers });
+      return route.fulfill({ status: 200, headers, contentType: 'application/json', body: JSON.stringify({ status: 'ok', product: 'e2e-stand-in' }) });
+    },
+  );
+  return context;
+};
+
 /** A fresh context with the theme pinned and first-run gates pre-dismissed. */
 async function open(theme, { skipBoot = false, width = 1440, height = 900 } = {}) {
   const ctx = await browser.newContext({ viewport: { width, height } });

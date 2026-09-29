@@ -5,6 +5,7 @@ import {
   ChevronRight,
   Copy,
   Database,
+  Download,
   ListChecks,
   LockKeyhole,
   Moon,
@@ -134,6 +135,7 @@ export function ShellSidebar({
   settingsActive,
   companionOnline,
   companionDetail,
+  onInstall,
 }: {
   /** Below md the rail is off-canvas; this slides it in. Ignored above md,
    *  where the rail is part of the grid and always present. */
@@ -147,6 +149,8 @@ export function ShellSidebar({
   settingsActive: boolean;
   companionOnline: boolean;
   companionDetail: string;
+  /** Install the editor as an app. Given only while the browser is offering to: no button otherwise. */
+  onInstall?: () => void;
 }) {
   const sidebarRef = useRef<HTMLElement>(null);
   const closeRef = useRef<HTMLButtonElement>(null);
@@ -228,6 +232,19 @@ export function ShellSidebar({
         </span>
         <i />
       </div>
+
+      {onInstall && (
+        <button
+          className="oaiy-settings-btn oaiy-install-btn"
+          type="button"
+          aria-label="Install app"
+          title="Install OAIY as an app on this device"
+          onClick={andClose(onInstall)}
+        >
+          <Download size={18} />
+          <span>Install app</span>
+        </button>
+      )}
 
       <button
         className={settingsActive ? 'oaiy-settings-btn active' : 'oaiy-settings-btn'}

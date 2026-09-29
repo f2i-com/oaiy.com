@@ -13,6 +13,8 @@ ui/.vite/
 ui/.cache/
 # Vite serves a synthetic deps cache when imports change at runtime.
 ui/.tmp/
+# A test's bundle of a TypeScript module, removed as soon as it is imported (tests/support/loadTs.mjs).
+ui/tests/support/.bundle-*
 
 # --- ZIPP engines ----------------------------------------------------------
 # Installed from a verified zipp.org release by scripts/fetch-zipp-release.mjs

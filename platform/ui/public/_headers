@@ -13,3 +13,8 @@
 # never compiles custom nodes, so this worker doesn't run there.)
 /assets/compiler-sandbox-worker-*.js
   Content-Security-Policy: default-src 'none'; script-src 'self' 'unsafe-eval'; connect-src 'none'; worker-src 'none'
+
+# The service worker's script is never served from a cache: a browser checks it on every visit to find a
+# new build (src/pwa/swCore.ts), and a copy kept by a CDN or the HTTP cache would hide one.
+/sw.js
+  Cache-Control: no-cache
