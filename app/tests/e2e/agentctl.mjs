@@ -386,6 +386,27 @@ try {
     expect(!pageErrors.length, pageErrors.join('; '));
   });
   await page.close();
+
+  await check('on a computer with no AI provider of its own, an Agent that runs on ChatGPT is not told to set one up', async () => {
+    // A fresh browser profile: nothing saved, so no provider in Settings.
+    const context = await browser.createBrowserContext();
+    const fresh = await context.newPage();
+    const errors = [];
+    fresh.on('pageerror', (e) => errors.push(e.message));
+    await fresh.setViewport({ width: 1058, height: 688 });
+    await fresh.evaluateOnNewDocument((origin, token) => {
+      window.__OAIY_DESKTOP__ = { origin, token };
+      window.__OAIY_THEME__ = 'light';
+    }, desktopUrl, TOKEN);
+    await fresh.goto(base);
+    await fresh.waitForSelector('.tree-row', { timeout: 60_000 });
+    await fresh.waitForFunction(() => document.querySelector('.chip.model')?.textContent === 'ChatGPT · gpt-5.5', { timeout: 15_000 });
+    await wait(1500);
+    const log = await fresh.evaluate(() => document.querySelector('.chat-log')?.textContent ?? '');
+    await context.close();
+    expect(!/Set up an AI provider/.test(log), 'the welcome asked for a provider');
+    expect(!errors.length, errors.join('; '));
+  });
 } finally {
   await browser.close();
   await server.close();

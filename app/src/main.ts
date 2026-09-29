@@ -1,5 +1,5 @@
 import './styles.css';
-import { Agent, type AgentOptions } from './agent/agent';
+import { Agent, type AgentEvent, type AgentOptions } from './agent/agent';
 import { planAfter } from './agent/tools';
 import type { ProviderConfig } from './agent/providers/types';
 import { HELP, internetCommand } from './commands';
@@ -242,14 +242,9 @@ async function main(): Promise<void> {
     const k = kind();
     // The choice may have changed in OAIY since it was last read (a call does not wait for this, nor does
     // anything while the desktop is away: the minute's read catches up).
-    if (desktop && !desktopProblem && k !== 'call' && Date.now() - agentModelAt > 15_000) await followAgentModel(2000);
-    if (agentModel.source === 'chatgpt' && desktop && k !== 'call') {
-      if (chatgptProblem) {
-        chatgptProblem = '';
-        renderChips();
-      }
-      if (!agentModel.model && !codexDefault) await lookUpCodexDefault(signal);
-    }
+    // (Codex's default, if it is needed, is looked up just below, once.)
+    if (desktop && !desktopProblem && k !== 'call' && Date.now() - agentModelAt > 15_000) await followAgentModel(2000, false);
+    if (agentModel.source === 'chatgpt' && desktop && k !== 'call' && !agentModel.model && !codexDefault) await lookUpCodexDefault(signal);
     const c = control;
     if (!c) {
       if (k === 'setup') throw new Error('Setting up OAIY needs OAIY Desktop: pair this page with it (the desktop chip), then ask again.');
@@ -544,7 +539,7 @@ async function main(): Promise<void> {
           void desktop?.rememberCaller(note.number, note.name ?? '').catch(() => {});
         },
         event: (session, event) => {
-          if (event.type === 'error') noteModelError(event.message);
+          noteModelEvent(event);
           if (viewing === session.id) chat.event(event);
           if (event.type === 'tool_result') void own.save(session).catch(() => {});
         },
@@ -879,7 +874,7 @@ async function main(): Promise<void> {
       let previewShown = false;
       await runAgent.run(prompt, (event) => {
         // A run stopped by a project switch finishes quietly: the chat now shows another project.
-        if (event.type === 'error') noteModelError(event.message);
+        noteModelEvent(event);
         if (project !== runProject || viewing !== null) return;
         chat.event(event);
         if (event.type === 'tool_result' || event.type === 'compact' || event.type === 'nudge') saveSoon();
@@ -1333,7 +1328,7 @@ With that done, Settings → Images, video and audio → Find OAIY sets it up.`)
    * minute, and after the Agent changes it. The engine is the app's providers
    * as they are; ChatGPT is OAIY's Codex connector.
    */
-  async function followAgentModel(waitMs = 5000): Promise<void> {
+  async function followAgentModel(waitMs = 5000, lookUp = true): Promise<void> {
     const d = desktop;
     if (!d) {
       if (agentModel.source !== 'engine') {
@@ -1354,7 +1349,7 @@ With that done, Settings → Images, video and audio → Find OAIY sets it up.`)
       chatgptProblem = '';
     }
     // Codex's default, for a choice that names none (signed out: the chip says so).
-    if (next.source === 'chatgpt' && !next.model && !codexDefault) await lookUpCodexDefault(AbortSignal.timeout(10_000)).catch(() => {});
+    if (lookUp && next.source === 'chatgpt' && !next.model && !codexDefault) await lookUpCodexDefault(AbortSignal.timeout(10_000)).catch(() => {});
     if (!changed) return;
     renderChips();
     if (announce) chat.system(next.source === 'chatgpt' ? `The Agent now runs on ChatGPT${next.model ?? codexDefault ? ` (${next.model ?? codexDefault})` : ''}, as chosen in OAIY. Calls use a fast ChatGPT route of their own.` : "The Agent now runs on OAIY's engine, as chosen in OAIY.");
@@ -1377,10 +1372,12 @@ With that done, Settings → Images, video and audio → Find OAIY sets it up.`)
     renderChips();
   }
 
-  /** A run that failed because OAIY is not signed in to ChatGPT: the model chip says so until the next try. */
-  function noteModelError(message: string): void {
-    if (message !== CHATGPT_SIGN_IN || agentModel.source !== 'chatgpt' || chatgptProblem) return;
-    chatgptProblem = 'sign in needed';
+  /** A run that failed because OAIY is not signed in to ChatGPT: the model chip says so, until a run gets through. */
+  function noteModelEvent(event: AgentEvent): void {
+    if (agentModel.source !== 'chatgpt') return;
+    const problem = event.type === 'error' && event.message === CHATGPT_SIGN_IN ? 'sign in needed' : event.type === 'done' ? '' : chatgptProblem;
+    if (problem === chatgptProblem) return;
+    chatgptProblem = problem;
     renderChips();
   }
 
@@ -1909,8 +1906,9 @@ With that done, Settings → Images, video and audio → Find OAIY sets it up.`)
   else void zippModule().catch((error: unknown) => chat.system(`Could not load the Zipp engine: ${(error as Error).message}`, 'error'));
   await lookForOaiy();
   renderPhoneChip();
-  // What the Agent runs on (the desktop's choice: its engine, or ChatGPT), shown on the model chip.
-  void followAgentModel();
+  // What the Agent runs on (the desktop's choice: its engine, or ChatGPT), shown on the model chip. The welcome
+  // below waits for it: a person whose Agent runs on ChatGPT has nothing to set up in Settings.
+  const modelKnown = desktop ? followAgentModel(3000).catch(() => {}) : Promise.resolve();
   if (desktop) {
     desktopEvents.start();
     void keepTextLease();
@@ -1921,7 +1919,9 @@ With that done, Settings → Images, video and audio → Find OAIY sets it up.`)
     // The phone's calls, its chip and call backs start once the desktop says there is a phone.
     startModules();
   } else applyModules(UNPAIRED);
-  if (!activeProvider()) chat.system('Welcome! Set up an AI provider in ⚙ Settings to talk to the agent — a local server (Ollama, LM Studio, OAIY) keeps everything on this computer. The editor and terminal work without one.');
+  void modelKnown.then(() => {
+    if (!agentProvider('project')) chat.system('Welcome! Set up an AI provider in ⚙ Settings to talk to the agent — a local server (Ollama, LM Studio, OAIY) keeps everything on this computer. The editor and terminal work without one.');
+  });
   // Leaving the page (closing the tab, reloading, switching away on a phone): save now.
   // pagehide and a hidden page come early enough for the writes to start; the
   // beforeunload prompt covers a run still going.
