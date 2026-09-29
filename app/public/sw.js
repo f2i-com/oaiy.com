@@ -17,7 +17,7 @@ const CACHE = 'oaiy-agent-v1';
 // ones the app had before it was called OAIY. Nothing else on the origin is touched.
 const OWNED = ['oaiy-agent-', 'bot.computer-'];
 const SCOPE = new URL(self.registration.scope);
-const PRECACHE = ['./', './index.html', './manifest.webmanifest', './icon.svg', './zipp/zipp_wasm.js', './zipp/zipp_wasm_bg.wasm'];
+const PRECACHE = ['./', './index.html', './manifest.webmanifest', './icon.svg', './icon-192.png', './icon-512.png', './zipp/zipp_wasm.js', './zipp/zipp_wasm_bg.wasm'];
 
 self.addEventListener('install', (event) => {
   event.waitUntil(
