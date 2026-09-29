@@ -38,7 +38,8 @@
 //! process hands the flow runs it starts, is accepted too; approving a pairing
 //! needs a bearer to begin with.)
 //!
-//! SIGTERM / Ctrl-C stops the plugins and every managed service before exiting.
+//! SIGTERM / Ctrl-C stops every managed service before exiting, and on unix the plugins
+//! first (on Windows a plugin ends with the server's job object).
 
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex, OnceLock};
@@ -284,7 +285,7 @@ async fn main() {
         });
     }
 
-    // Clean shutdown: stop the plugins and every running service on SIGTERM / Ctrl-C.
+    // Clean shutdown: stop the plugins (on unix) and every running service on SIGTERM / Ctrl-C.
     //
     // The plugin host does not exist yet (it is built with the bridge state, below),
     // and the signal is worth hearing from the start, so the task reads it from this
@@ -430,17 +431,22 @@ async fn main() {
 /// model servers, and one holding hardware should get its graceful shutdown before anything
 /// slow runs), then the services.
 ///
-/// Every exit this server makes on purpose comes through here. A plugin left running after
-/// its server has gone keeps its hardware and its port, and on unix nothing else stops it
-/// (a plugin no longer shares this process's group, so a Ctrl-C at the terminal does not reach it).
+/// Every exit this server makes on purpose comes through here. On unix a plugin left running
+/// after its server has gone keeps its hardware and its port, and nothing else stops it (a
+/// plugin no longer shares this process's group, so a Ctrl-C at the terminal does not reach it).
+/// Windows is left as it was: a plugin is in the server's job object, which ends it with this
+/// process, so it never outlives the server there.
 async fn stop_children(registry: RegistryHandle, plugins: Option<Arc<PluginHost>>) {
     // On a blocking thread: each of these waits on a child, and a plugin gets up to
     // its grace period to answer the request to stop.
     let _ = tokio::task::spawn_blocking(move || {
         oaiy_desktop_lib::bridge::ScriptHost::global().shutdown();
+        #[cfg(unix)]
         if let Some(host) = plugins {
             host.stop_all();
         }
+        #[cfg(not(unix))]
+        let _ = plugins;
     })
     .await;
     // Recover from a poisoned mutex: stopping services on exit matters more

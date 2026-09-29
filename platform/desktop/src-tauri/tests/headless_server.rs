@@ -333,7 +333,7 @@ fn walk(dir: &Path) -> Vec<PathBuf> {
 
 /// A plugin that ignores every request to stop, and started a helper of its own: what a wedged
 /// plugin launched through a shim looks like.
-#[cfg(unix)]
+#[cfg(target_os = "linux")]
 const WEDGED_PLUGIN: &str = r#"#!/bin/sh
 sleep 300 &
 echo $! > "$OAIY_PLUGIN_DATA_DIR/helper.pid"
@@ -350,7 +350,7 @@ sleep 300
 "#;
 
 /// A data folder with the wedged plugin installed in it.
-#[cfg(unix)]
+#[cfg(target_os = "linux")]
 fn install_wedged_plugin(scratch: &Scratch) {
     use std::os::unix::fs::PermissionsExt as _;
     let plugin = scratch.0.join("data").join("plugins").join("fake");
@@ -370,7 +370,7 @@ fn install_wedged_plugin(scratch: &Scratch) {
 }
 
 /// The pids the wedged plugin wrote: itself, and the helper it started.
-#[cfg(unix)]
+#[cfg(target_os = "linux")]
 fn wedged_plugin_pids(scratch: &Scratch) -> (u32, u32) {
     let data = scratch.0.join("data").join("plugin-data").join("fake");
     let pid_of = |name: &str| -> u32 { std::fs::read_to_string(data.join(name)).unwrap().trim().parse().unwrap() };
@@ -378,7 +378,7 @@ fn wedged_plugin_pids(scratch: &Scratch) -> (u32, u32) {
 }
 
 /// Running, or as good as gone? A zombie only waits to be reaped.
-#[cfg(unix)]
+#[cfg(target_os = "linux")]
 fn alive(pid: u32) -> bool {
     match std::fs::read_to_string(format!("/proc/{pid}/stat")) {
         Ok(stat) => stat.rsplit(')').next().map(str::trim_start).is_some_and(|rest| !rest.starts_with('Z')),
@@ -387,7 +387,7 @@ fn alive(pid: u32) -> bool {
 }
 
 /// After the server has gone, the kernel may need a moment to finish with what was signalled.
-#[cfg(unix)]
+#[cfg(target_os = "linux")]
 fn gone_within(pids: &[u32], wait: Duration) -> bool {
     let deadline = Instant::now() + wait;
     while pids.iter().any(|p| alive(*p)) && Instant::now() < deadline {
@@ -399,7 +399,7 @@ fn gone_within(pids: &[u32], wait: Duration) -> bool {
 /// A stopped server used to leave its plugins running (the app's own exit stopped them, this
 /// binary's did not), and a plugin's own helpers as well, because a plugin shared the server's
 /// process group and so could not be stopped as a tree.
-#[cfg(unix)]
+#[cfg(target_os = "linux")]
 #[test]
 fn stopping_the_server_stops_its_plugins_and_what_they_started() {
     let scratch = Scratch::new("plugins");
@@ -432,7 +432,7 @@ fn stopping_the_server_stops_its_plugins_and_what_they_started() {
 
 /// A server that cannot take its port used to exit with the plugins it had already started still
 /// running: the port is found taken only when the API binds it, after the plugins are up.
-#[cfg(unix)]
+#[cfg(target_os = "linux")]
 #[test]
 fn a_server_that_cannot_bind_its_port_stops_its_plugins_before_it_exits() {
     let scratch = Scratch::new("bind-fails");
