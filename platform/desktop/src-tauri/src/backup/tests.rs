@@ -3686,3 +3686,110 @@ fn decrypting_stops_at_the_deadline_by_itself_and_does_not_wait_for_the_checks_t
     let (_, len) = container::decrypt_to_file(&file, PASS, &scratch.0.join("in-time.zip"), 1 << 30, &Budget::unlimited()).unwrap();
     assert!(len > 0);
 }
+
+// ---- the backup and the updater live side by side --------------------------------------------------------------
+
+/// The paths of the routes a router file adds (not its tests' stand-ins): what follows each `.route("`.
+fn route_paths(source: &str) -> Vec<String> {
+    source.split("#[cfg(test)]").next().unwrap().split(".route(\"").skip(1).map(|rest| rest.split('"').next().unwrap().to_string()).collect()
+}
+
+#[tokio::test]
+async fn the_backups_routes_and_the_updaters_merge_without_overlapping_and_both_answer() {
+    use tower::ServiceExt as _;
+    let dir = TempDir::new("side-by-side");
+    let updater = crate::update::Updater::new("0.1.0", crate::update::FeedSource::production(), std::time::Instant::now());
+    // Merged in either order (axum refuses two routes for one path and method), each answers where it says.
+    for first_the_updater in [true, false] {
+        let app = if first_the_updater {
+            axum::Router::new().merge(crate::update::routes::router(updater.clone())).merge(routes::router(dir.0.clone()))
+        } else {
+            axum::Router::new().merge(routes::router(dir.0.clone())).merge(crate::update::routes::router(updater.clone()))
+        };
+        for (path, key) in [("/api/update/status", "currentVersion"), ("/api/backup/status", "lastBackupOk")] {
+            let response = app.clone().oneshot(axum::http::Request::builder().uri(path).body(axum::body::Body::empty()).unwrap()).await.unwrap();
+            assert_eq!(response.status().as_u16(), 200, "{path}");
+            let body: serde_json::Value = serde_json::from_slice(&axum::body::to_bytes(response.into_body(), usize::MAX).await.unwrap()).unwrap();
+            assert!(body.get(key).is_some(), "{path} answers with its own status: {body}");
+        }
+    }
+}
+
+#[test]
+fn no_route_belongs_to_both_the_backup_and_the_updater() {
+    let update = route_paths(&source_text(include_str!("../update/routes.rs")));
+    let backup = route_paths(&source_text(include_str!("routes.rs")));
+    assert_eq!(update.len(), 3, "{update:?}");
+    assert_eq!(backup.len(), 8, "{backup:?}");
+    for path in &update {
+        assert!(path.starts_with("/api/update/") && !routes::is_backup_path(path), "{path}");
+        assert!(!backup.contains(path), "{path} is in both");
+    }
+    for path in &backup {
+        assert!(routes::is_backup_path(path) && !path.starts_with("/api/update/"), "{path}");
+    }
+}
+
+#[test]
+fn the_window_registers_each_command_plugin_and_item_of_both_features_once() {
+    let lib = source_text(include_str!("../lib.rs"));
+    // Commands: a name twice in the handler list is a command that is silently the second one.
+    let list = lib[lib.find("generate_handler![").expect("the handler list")..].split("])").next().unwrap();
+    let names: Vec<&str> = list.lines().skip(1).map(|l| l.trim().trim_end_matches(',')).filter(|l| !l.is_empty() && !l.starts_with("//")).collect();
+    let mut seen = std::collections::BTreeSet::new();
+    for name in &names {
+        assert!(seen.insert(name.rsplit("::").next().unwrap()), "{name} is registered twice");
+    }
+    for want in ["backup_create", "backup_restore_inspect", "backup_restore_stage", "backup_undo_stage", "backup_discard_pending", "backup_restart_to_apply", "update_check", "update_download", "update_install", "set_update_auto_check"] {
+        assert!(seen.contains(want), "{want} is registered");
+    }
+    // Plugins, schemes and managed state: each once.
+    let unique = |what: &str, lines: Vec<&str>| {
+        let mut seen = std::collections::BTreeSet::new();
+        for line in &lines {
+            assert!(seen.insert(*line), "{what} {line:?} is there twice");
+        }
+        lines.len()
+    };
+    assert!(unique("plugin", lib.lines().map(str::trim).filter(|l| l.starts_with(".plugin(")).collect()) >= 5, "the plugins are there");
+    assert!(unique("scheme", lib.lines().map(str::trim).filter(|l| l.starts_with(".register_uri_scheme_protocol(")).collect()) >= 2);
+    unique("managed state", lib.lines().map(str::trim).filter(|l| l.contains(".manage(")).collect());
+    // The window's permissions: the dialogs the backup opens are granted once, and nothing of the updater's plugin is granted to a webview.
+    let capabilities: serde_json::Value = serde_json::from_str(include_str!("../../capabilities/default.json")).unwrap();
+    let permissions: Vec<&str> = capabilities["permissions"].as_array().unwrap().iter().map(|p| p.as_str().unwrap()).collect();
+    assert_eq!(unique("permission", permissions.clone()), permissions.len());
+    assert_eq!(permissions.iter().filter(|p| **p == "dialog:default").count(), 1);
+    assert!(permissions.iter().all(|p| !p.starts_with("updater:")), "the updater plugin's own commands answer nobody: {permissions:?}");
+    assert_eq!(capabilities["windows"], serde_json::json!(["main"]));
+    // The tray: each item once.
+    let tray = source_text(include_str!("../tray.rs"));
+    let ids: Vec<&str> = tray.split("MenuItem::with_id(handle, \"").skip(1).map(|rest| rest.split('"').next().unwrap()).collect();
+    assert_eq!(ids, ["open", "update-check", "quit"], "the tray's items");
+    // Both features' routes are merged once each into the local API.
+    let http = source_text(include_str!("../http.rs"));
+    assert_eq!(http.matches(".merge(crate::update::routes::router(updater))").count(), 1);
+    assert_eq!(http.matches(".merge(crate::backup::routes::router(backup_data_dir))").count(), 1);
+}
+
+#[test]
+fn a_backup_asks_the_activity_the_updater_was_given_and_the_two_agree() {
+    let _turn = ONE_AT_A_TIME.lock().unwrap_or_else(|e| e.into_inner());
+    let updater = crate::update::Updater::new("0.1.0", crate::update::FeedSource::production(), std::time::Instant::now());
+    // Nothing has said what the app is doing: still starting, for a backup as for an update.
+    assert!(updater.activity().is_none());
+    assert_eq!(Busy::look(updater.activity().as_deref()).codes(), ["starting"]);
+    // The desktop gives the updater its probes once; a backup sees whatever they see.
+    let probes = std::sync::Arc::new(Fake::default());
+    updater.set_activity(probes.clone());
+    assert!(!Busy::look(updater.activity().as_deref()).is_busy());
+    probes.set(|s| s.tasks = 1);
+    let later = std::time::Instant::now() + std::time::Duration::from_secs(3600);
+    assert_eq!(Busy::look(updater.activity().as_deref()).codes(), ["agentTask"]);
+    assert_eq!(updater.blockers_fresh(later).iter().map(|b| b.code).collect::<Vec<_>>(), ["agentTask"], "and the updater says the same");
+    probes.set(|s| {
+        s.tasks = 0;
+        s.phone = Some(LineState::Live { plugin: "Aokie Phone Bridge".into(), count: 1 });
+    });
+    assert_eq!(Busy::look(updater.activity().as_deref()).codes(), ["phoneCall"]);
+    assert_eq!(updater.blockers_fresh(later).iter().map(|b| b.code).collect::<Vec<_>>(), ["phoneCall"]);
+}
