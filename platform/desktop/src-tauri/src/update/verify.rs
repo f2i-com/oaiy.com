@@ -259,6 +259,84 @@ mod tests {
         }
     }
 
+    const REAL_PAYLOAD: &[u8] = include_bytes!("testdata/installer.bin");
+    const REAL_SIGNATURE: &str = include_str!("testdata/installer.bin.sig");
+    const REAL_PUBKEY: &str = include_str!("testdata/throwaway.key.pub");
+
+    #[test]
+    fn a_signature_made_by_the_tauri_cli_verifies_and_a_changed_byte_or_another_key_does_not() {
+        let (signature, pubkey) = (REAL_SIGNATURE.trim(), REAL_PUBKEY.trim());
+        let package = verify_package(REAL_PAYLOAD.to_vec(), signature, pubkey, "0.1.0", false).expect("what the pipeline signs verifies");
+        assert_eq!(package.bytes(), REAL_PAYLOAD);
+        // The signature is the CLI's: prehashed, made by a key with its own name.
+        let parsed = Signature::decode(&decode_text(signature).unwrap()).unwrap();
+        assert!(parsed.trusted_comment().starts_with("timestamp:") && parsed.trusted_comment().ends_with("file:installer.bin"), "{}", parsed.trusted_comment());
+        for at in [0, REAL_PAYLOAD.len() / 2, REAL_PAYLOAD.len() - 1] {
+            let mut changed = REAL_PAYLOAD.to_vec();
+            changed[at] ^= 1;
+            assert_eq!(verify_package(changed, signature, pubkey, "0.1.0", false).unwrap_err(), VerifyError::DoesNotMatch, "byte {at}");
+        }
+        assert_eq!(verify_package(REAL_PAYLOAD[..REAL_PAYLOAD.len() - 1].to_vec(), signature, pubkey, "0.1.0", false).unwrap_err(), VerifyError::DoesNotMatch);
+        // Not with the key OAIY's updates are really signed with: this signature is the throwaway key's.
+        let conf: serde_json::Value = serde_json::from_str(include_str!("../../tauri.conf.json")).unwrap();
+        let production = conf["plugins"]["updater"]["pubkey"].as_str().unwrap();
+        assert_ne!(production, pubkey);
+        assert_eq!(verify_package(REAL_PAYLOAD.to_vec(), signature, production, "0.1.0", false).unwrap_err(), VerifyError::DoesNotMatch);
+    }
+
+    #[test]
+    fn the_cli_in_use_writes_no_version_into_a_signature_so_requiring_one_would_refuse_every_release() {
+        // This is why plugins.updater.requireSignedVersion is off, and why the installer's address is held to the
+        // announced version instead (feed::check_asset_url). When the Tauri CLI records `version:` in the trusted
+        // comment, regenerate testdata/, flip these two assertions, and turn requireSignedVersion on.
+        let (signature, pubkey) = (REAL_SIGNATURE.trim(), REAL_PUBKEY.trim());
+        assert_eq!(verify_package(REAL_PAYLOAD.to_vec(), signature, pubkey, "0.1.0", true).unwrap_err(), VerifyError::NoSignedVersion);
+        let conf: serde_json::Value = serde_json::from_str(include_str!("../../tauri.conf.json")).unwrap();
+        assert!(!conf["plugins"]["updater"]["requireSignedVersion"].as_bool().unwrap_or(false), "turned on, it would make every update fail: the signatures carry no version");
+    }
+
+    /// The pipeline's real output, verified the way an installed OAIY verifies a download: an installer made by `tauri build`
+    /// with the updater artifacts on, the `.sig` beside it, and the public key of the key that signed it. Run on purpose,
+    /// with the paths in the environment (it needs an installer, so it is not part of a plain `cargo test`):
+    ///
+    /// ```text
+    /// OAIY_TEST_INSTALLER=<...-setup.exe> OAIY_TEST_PUBKEY_FILE=<key>.pub OAIY_TEST_VERSION=0.1.0 \
+    ///   cargo test --locked --lib real_installer -- --ignored --nocapture
+    /// ```
+    #[test]
+    #[ignore = "needs an installer built by the pipeline and its key: see the doc comment"]
+    fn a_real_installer_from_the_pipeline_verifies_with_the_key_that_signed_it_and_with_no_other() {
+        let installer = std::env::var("OAIY_TEST_INSTALLER").expect("OAIY_TEST_INSTALLER is the path of the setup.exe");
+        let pubkey_file = std::env::var("OAIY_TEST_PUBKEY_FILE").expect("OAIY_TEST_PUBKEY_FILE is the path of the .pub file");
+        let version = std::env::var("OAIY_TEST_VERSION").unwrap_or_else(|_| "0.1.0".to_string());
+        let pubkey = std::fs::read_to_string(&pubkey_file).unwrap().trim().to_string();
+        let signature = std::fs::read_to_string(format!("{installer}.sig")).expect("the .sig beside the installer");
+        let bytes = std::fs::read(&installer).unwrap();
+
+        // What the Tauri CLI wrote into the signature besides the signature itself (a comment: nothing secret).
+        let text = decode_text(&signature).expect("the .sig is the base64 of a minisign signature file");
+        let parsed = Signature::decode(&text).expect("a minisign signature");
+        println!("untrusted comment: {}", parsed.untrusted_comment());
+        println!("trusted comment: {}", parsed.trusted_comment());
+        println!("version in the trusted comment: {:?}", signed_version(parsed.trusted_comment()));
+        println!("installer: {} bytes", bytes.len());
+
+        // It verifies with the key that signed it (versions are not required: this CLI does not write one).
+        let package = verify_package(bytes.clone(), &signature, &pubkey, &version, false).expect("the installer verifies with its key");
+        assert_eq!(package.len(), bytes.len());
+        // Not with one byte changed, in the middle or at the end...
+        for at in [bytes.len() / 2, bytes.len() - 1] {
+            let mut changed = bytes.clone();
+            changed[at] ^= 1;
+            assert_eq!(verify_package(changed, &signature, &pubkey, &version, false).unwrap_err(), VerifyError::DoesNotMatch, "byte {at}");
+        }
+        // ...and not with the production key, which did not sign it.
+        let conf: serde_json::Value = serde_json::from_str(include_str!("../../tauri.conf.json")).unwrap();
+        let production = conf["plugins"]["updater"]["pubkey"].as_str().unwrap();
+        assert_ne!(production, pubkey, "this must be run with a throwaway key, never the production one");
+        assert_eq!(verify_package(bytes, &signature, production, &version, false).unwrap_err(), VerifyError::DoesNotMatch);
+    }
+
     #[test]
     fn the_key_this_build_carries_is_a_readable_public_key() {
         // tauri.conf.json's plugins.updater.pubkey: what every installed copy verifies with.
