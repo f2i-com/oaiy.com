@@ -55,8 +55,8 @@ const MAX_FACTS = 30;
 /** The most turns a conversation keeps (a caller's calls add up): the oldest calls go first. */
 const MAX_KEPT_TURNS = 600;
 
-/** How the app makes an agent for this project, with a conversation's own instructions and tools. */
-export type MakeAgent = (extra: Pick<AgentOptions, 'instructions' | 'sessionTools' | 'tools' | 'reasoning' | 'conversation'>) => Agent;
+/** How the app makes an agent for this project, with a conversation's own instructions and tools, for a conversation of `kind`. */
+export type MakeAgent = (extra: Pick<AgentOptions, 'instructions' | 'sessionTools' | 'tools' | 'reasoning' | 'conversation'>, kind: SessionInfo['kind']) => Agent;
 
 /**
  * What an agent on a call may use besides the call's own tools: a short list,
@@ -600,7 +600,7 @@ export class Sessions {
         // Answer at once: no thinking first.
         reasoning: 'none',
         conversation: true,
-      });
+      }, 'call');
       session.speech = new Speech(
         async (text) => {
           const desktop = this.desktop();
@@ -612,7 +612,7 @@ export class Sessions {
     }
     if (info.kind === 'task') {
       session.answers = [];
-      session.agent = this.makeAgent({ instructions: () => this.directed(taskInstructions(session.key)) });
+      session.agent = this.makeAgent({ instructions: () => this.directed(taskInstructions(session.key)) }, 'task');
       return session;
     }
     const test = info.key === TEST_NUMBER;
@@ -626,7 +626,7 @@ export class Sessions {
       // The calendar's tools only while there is a calendar (a plugin provides it).
       sessionTools: () => [...own, ...(this.calendarOn() ? calendar : [])],
       conversation: true,
-    });
+    }, 'sms');
     return session;
   }
 

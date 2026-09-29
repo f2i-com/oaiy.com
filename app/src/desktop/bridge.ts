@@ -136,6 +136,28 @@ export class Desktop {
   }
 
   /**
+   * One of a plugin's service-definition actions (such as `aokie.phone`'s
+   * `sms.threads`), through the desktop's gated route, and what it answered.
+   * `idempotencyKey` makes a repeat harmless (journalled actions need one).
+   */
+  async invokeAction(definition: string, actionId: string, input: Record<string, unknown>, idempotencyKey: string, signal?: AbortSignal): Promise<unknown> {
+    const body = await reply(await fetch(`${this.origin}/api/services/actions/${encodeURIComponent(definition)}/${encodeURIComponent(actionId)}/invoke`, {
+      method: 'POST',
+      headers: this.headers(),
+      body: JSON.stringify({ input, idempotencyKey }),
+      signal,
+    }));
+    // {ok, result: {ok, data}}: the plugin's own answer inside the desktop's.
+    const result = isRecord(body) ? body.result : null;
+    if (isRecord(result) && result.ok === false) {
+      if (typeof result.error === 'string') throw new DesktopError(result.error, 0, 'action_failed');
+      const err = isRecord(result.error) ? result.error : {};
+      throw new DesktopError(String(err.message ?? 'the action failed'), 0, String(err.code ?? 'action_failed'));
+    }
+    return isRecord(result) && 'data' in result ? result.data : result;
+  }
+
+  /**
    * Take (or renew) a lease: one holder at a time for a job several pages
    * could each do, such as answering text messages. `prefer` takes it over.
    */

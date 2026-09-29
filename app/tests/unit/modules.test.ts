@@ -64,6 +64,19 @@ describe("the desktop's modules", () => {
     expect(isOn(null, 'phone')).toBe(false);
   });
 
+  it("reads the plugins' agent tools from the snapshot's contributions (none without a desktop that lists them)", async () => {
+    const tool = {
+      pluginId: 'aokie', name: 'phone_sms_threads', action: 'aokie.phone/sms.threads', definition: 'aokie.phone', actionId: 'sms.threads',
+      description: 'Every conversation on the paired phone.', inputSchema: { type: 'object' }, sideEffects: 'none', audience: ['project', 'runner'],
+    };
+    const withTools = parseModules({ ...snapshot(5, true, true), contributions: { agent: { tools: [tool, { name: 'broken' }] } } })!;
+    expect(withTools.tools.map((t) => [t.pluginId, t.name, t.audience])).toEqual([['aokie', 'phone_sms_threads', ['project', 'runner']]]);
+    expect(parseModules(snapshot(6, true, true))!.tools).toEqual([]);
+    expect(UNPAIRED.tools).toEqual([]);
+    const old = await fallbackModules(fakeDesktop({ plugins: [{ id: 'aokie', state: 'running' }], calendar: {} }).desktop);
+    expect(old.tools).toEqual([]);
+  });
+
   it('says what turned on and off, and nothing went off before it was known', () => {
     const on = parseModules(snapshot(1, true, true))!;
     const phoneOff = parseModules(snapshot(2, false, true))!;
@@ -152,11 +165,14 @@ describe("the desktop's modules", () => {
 
   it("a text thread has the calendar's tools only while the calendar is on", async () => {
     let tools: AgentOptions['sessionTools'];
+    const kinds: string[] = [];
     const project = { loadSessions: async () => [], saveSessions: async () => {}, loadSessionChat: async () => [], saveSessionChat: async () => {}, loadCallers: async () => [], saveCallers: async () => {} };
     const sessions = new Sessions(
       project as never,
-      (extra) => {
+      (extra, kind) => {
         tools = extra.sessionTools;
+        // The app is told which kind of conversation it makes an agent for (the plugins' tools go by it).
+        kinds.push(kind);
         return { turns: [], savedTurns: () => [] } as never;
       },
       () => ({ ...DEFAULT_MESSAGE_SETTINGS, answer: false }),
@@ -166,6 +182,7 @@ describe("the desktop's modules", () => {
     let calendar = true;
     sessions.calendarOn = () => calendar;
     await sessions.textArrived('+61400000001', 'Lance', 'Hi');
+    expect(kinds).toEqual(['sms']);
     const names = () => (typeof tools === 'function' ? tools() : (tools ?? [])).map((t: SessionTool) => t.spec.name);
     expect(names()).toEqual(expect.arrayContaining(['send_text_message', 'calendar_free_times', 'request_appointment']));
     calendar = false;

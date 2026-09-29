@@ -11,6 +11,7 @@ import { DesktopEvents, Sessions, TEST_NUMBER, callerNotesTool, phoneConversatio
 import { Callbacks, type Screening } from './callbacks';
 import { UNPAIRED, diffModules, followModules, isOn, readModules, sessionShown, whyOff, type Modules } from './modules';
 import { flowSessionTools, flowToolHooks, readFlowStore } from './desktop/flowTools';
+import { pluginSessionTools, type PluginToolAudience } from './desktop/pluginTools';
 import { TRANSCRIBE_TOOL, transcribeTool } from './desktop/transcribe';
 import { calendarTools } from './desktop/calendarTools';
 import { flowBuilderTools } from './desktop/flowBuilder';
@@ -162,6 +163,8 @@ async function main(): Promise<void> {
   let flowTools: SessionTool[] = [];
   /** Flows in front of the agents' tools. */
   let toolHooks: ToolHook[] = [];
+  /** The names the agents' own tools go by: a flow or a plugin's tool with one of them gets a prefix. */
+  const builtInToolNames = new Set([...TOOLS.map((t) => t.name), 'send_text_message', 'end_call', 'request_appointment', 'lookup_business_data', 'guide', 'update_plan', 'delegate', TRANSCRIBE_TOOL, 'calendar_free_times', 'calendar_list', 'calendar_book', 'calendar_change', 'flow_nodes', 'flow_list', 'flow_read', 'flow_write', 'flow_run']);
   /**
    * The desktop's modules: the phone (calls, texts and the Front desk) and the
    * calendar are there only while a plugin provides them (Aokie, the AI
@@ -170,6 +173,20 @@ async function main(): Promise<void> {
   let modules: Modules | null = null;
   const phoneOn = () => isOn(modules, 'phone');
   const calendarOn = () => isOn(modules, 'calendar');
+  /**
+   * The plugins' actions offered to the agent in `where`, as the desktop's
+   * modules list them now (so they come and go with the snapshot), while the
+   * desktop is connected. One that changes something asks the person first
+   * where they are (the project's conversation and the runner's).
+   */
+  const pluginTools = (where: PluginToolAudience): SessionTool[] =>
+    desktop && modules?.tools.length
+      ? pluginSessionTools(modules.tools, where, {
+          desktop: () => desktop,
+          approve: (request) => confirmAction(request),
+          taken: new Set([...builtInToolNames, ...flowTools.map((t) => t.spec.name)]),
+        })
+      : [];
   /** The conversation the chat shows: null for the project's own. */
   let viewing: string | null = null;
 
@@ -351,7 +368,12 @@ async function main(): Promise<void> {
     return (): AgentOptions => ({
       // Flows made tools, and speech to text: both run on OAIY Desktop.
       // The calendar's tools only while there is one (a plugin provides it).
-      sessionTools: () => [...(desktop ? [...flowTools, transcribe, ...(calendarOn() ? calendar : []), ...flowBuilder] : flowTools), ...(runner() ? phone : [])],
+      // The plugins' tools offered to the project's conversation (or, in the Front desk, to the runner).
+      sessionTools: () => [
+        ...(desktop ? [...flowTools, transcribe, ...(calendarOn() ? calendar : []), ...flowBuilder] : flowTools),
+        ...(runner() ? phone : []),
+        ...(withPreview ? pluginTools(runner() ? 'runner' : 'project') : []),
+      ],
       instructions: () => (runner() ? RUNNER_INSTRUCTIONS : ''),
       toolHooks: () => toolHooks,
       vfs: place().vfs,
@@ -397,9 +419,12 @@ async function main(): Promise<void> {
     const own = (sessions = new Sessions(
       frontDesk,
       // A call or a text thread brings its own tools; a flow's task has the desktop's, as the project's agent does.
-      (extra) => {
+      // Each also has the plugins' tools offered to its kind of conversation (`session:sms`, `session:call`, `session:task`).
+      (extra, kind) => {
         const tools = extra.sessionTools;
-        return new Agent({ ...deskOptions(), ...extra, sessionTools: tools ? () => [...(typeof tools === 'function' ? tools() : tools), ...flowTools] : deskOptions().sessionTools });
+        const given = tools ? () => [...(typeof tools === 'function' ? tools() : tools), ...flowTools] : deskOptions().sessionTools;
+        const listed = () => (typeof given === 'function' ? given() : (given ?? []));
+        return new Agent({ ...deskOptions(), ...extra, sessionTools: () => [...listed(), ...pluginTools(`session:${kind}`)] });
       },
       () => ({ ...messages, answer: messages.answer && holdsTexts }),
       () => desktop,
@@ -1415,7 +1440,7 @@ With that done, Settings → Images, video and audio → Find OAIY sets it up.`)
       return;
     }
     try {
-      const taken = new Set([...TOOLS.map((t) => t.name), 'send_text_message', 'end_call', 'request_appointment', 'lookup_business_data', 'guide', 'update_plan', 'delegate', TRANSCRIBE_TOOL, 'calendar_free_times', 'calendar_list', 'calendar_book', 'calendar_change', 'flow_nodes', 'flow_list', 'flow_read', 'flow_write', 'flow_run']);
+      const taken = new Set(builtInToolNames);
       const store = await readFlowStore(d, AbortSignal.timeout(10_000));
       flowTools = flowSessionTools(store.tools, () => desktop, taken);
       toolHooks = flowToolHooks(store.hooks, () => desktop);

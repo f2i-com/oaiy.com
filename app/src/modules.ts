@@ -13,6 +13,7 @@
  * files and conversations stay where they are, for when it is back.
  */
 import { DesktopError, type Desktop } from './desktop/bridge';
+import { parsePluginTools, type PluginTool } from './desktop/pluginTools';
 
 export type ModuleId = 'phone' | 'calendar';
 
@@ -39,12 +40,14 @@ export interface Modules {
   revision: number;
   list: ModuleInfo[];
   warnings: string[];
+  /** The plugins' actions offered to the agent (`contributions.agent.tools`; none from an older desktop). */
+  tools: PluginTool[];
   /** The desktop said so; worked out from an older desktop's plugins; or no desktop is paired. */
   source: 'desktop' | 'fallback' | 'unpaired';
 }
 
 /** A page with no desktop: nothing is on. */
-export const UNPAIRED: Modules = { revision: -1, list: [], warnings: [], source: 'unpaired' };
+export const UNPAIRED: Modules = { revision: -1, list: [], warnings: [], tools: [], source: 'unpaired' };
 
 const isRecord = (v: unknown): v is Record<string, unknown> => !!v && typeof v === 'object' && !Array.isArray(v);
 
@@ -83,7 +86,7 @@ export function parseModules(body: unknown): Modules | null {
   }
   const revision = typeof body.revision === 'number' ? body.revision : -1;
   const warnings = Array.isArray(body.warnings) ? body.warnings.filter((w): w is string => typeof w === 'string') : [];
-  return { revision, list, warnings, source: 'desktop' };
+  return { revision, list, warnings, tools: parsePluginTools(body.contributions), source: 'desktop' };
 }
 
 export interface ModuleChange {
@@ -123,6 +126,7 @@ export async function fallbackModules(desktop: Pick<Desktop, 'plugins' | 'calend
       { id: 'calendar', name: 'Calendar', enabled: cal, provider, ...(cal ? {} : { reason: 'No installed plugin provides the calendar.' }) },
     ],
     warnings: [],
+    tools: [],
     source: 'fallback',
   };
 }
