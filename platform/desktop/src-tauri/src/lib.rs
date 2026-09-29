@@ -220,6 +220,8 @@ mod engines;
 #[cfg(feature = "gui")]
 mod migrate;
 #[cfg(feature = "gui")]
+mod notify;
+#[cfg(feature = "gui")]
 mod tray;
 #[cfg(feature = "gui")]
 pub use gui::run;
@@ -1240,6 +1242,10 @@ pub fn run() {
                     handle.emit(crate::control::NAVIGATE_EVENT, payload).map_err(|e| e.to_string())
                 }));
             }
+            // A caller asking for the owner, and a message left, reach them with a native
+            // notification (and, for a call, the window brought up).
+            crate::ring::set_global_notifier(Some(Arc::new(crate::notify::GuiRing(app.handle().clone()))));
+            crate::messages::set_notifier(Some(Arc::new(crate::notify::GuiMessages(app.handle().clone()))));
             // The engines: started on their own thread (a running studio is found
             // over HTTP, and launching one binds its ports), so the window is not kept waiting.
             {

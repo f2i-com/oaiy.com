@@ -25,6 +25,8 @@ pub mod session;
 pub mod settings;
 
 #[cfg(test)]
+mod session_tests;
+#[cfg(test)]
 mod tests;
 
 use std::path::Path;
@@ -79,8 +81,7 @@ pub fn shared() -> Option<Arc<Ring>> {
 
 /// The phone plugin's events that matter to a ring: the call ended (whatever rings for it is over, and a call the
 /// owner had is over), and how a request came out (`aokie.call.assistance.resolved`, `data.outcome`).
-pub fn on_plugin_event(name: &str, data: &serde_json::Value, correlation: &str) {
-    let Some(ring) = shared() else { return };
+pub fn apply_plugin_event(ring: &Ring, name: &str, data: &serde_json::Value, correlation: &str) {
     let text = |k: &str| data.get(k).and_then(serde_json::Value::as_str).unwrap_or("");
     match name {
         "aokie.call.ended" => {

@@ -512,6 +512,9 @@ pub struct PluginHost {
     /// — the engine is the one thing on the event thread that reaches a child
     /// process, and a unit test must be able to answer without one.
     scripts: Mutex<std::sync::Arc<dyn crate::bridge::script_host::ScriptBatch>>,
+    /// The ring a phone plugin's `oaiy.ring.*` requests and call events reach: this one, else the desktop's own
+    /// ([`crate::ring::shared`]). A test gives its own, so it does not share a process-wide one with the others.
+    ring: Mutex<Option<Arc<crate::ring::Ring>>>,
 }
 
 /// What the host needs to answer `companion.admission`: this desktop's own
@@ -575,6 +578,7 @@ impl PluginHost {
             flow_bindings: crate::link::flows::FlowBindings::new(),
             app_logic: crate::link::app_logic::Catalog::new(),
             scripts: Mutex::new(std::sync::Arc::new(crate::bridge::script_host::GlobalHost)),
+            ring: Mutex::new(None),
         });
 
         // Event thread: ring + trigger dispatch + ack.
@@ -1388,7 +1392,9 @@ impl PluginHost {
 
         // A call ended, or a request to reach the owner came out: whatever rings for it is over.
         if matches!(name.as_str(), "aokie.call.ended" | "aokie.call.assistance.resolved") {
-            crate::ring::on_plugin_event(&name, &event.data, &event.correlation_id);
+            if let Some(ring) = self.ring() {
+                crate::ring::apply_plugin_event(&ring, &name, &event.data, &event.correlation_id);
+            }
         }
 
         // Recorded in the calendar only while a plugin provides it (turned off, it is not written to).
@@ -1595,6 +1601,18 @@ impl PluginHost {
             .map_err(|message| ("upstream_error".to_string(), message))
     }
 
+    /// Give this host its own ring (a test's); a host without one uses the desktop's.
+    pub fn set_ring(&self, ring: Arc<crate::ring::Ring>) {
+        if let Ok(mut r) = self.ring.lock() {
+            *r = Some(ring);
+        }
+    }
+
+    /// The ring the phone plugin's requests and events reach.
+    fn ring(&self) -> Option<Arc<crate::ring::Ring>> {
+        self.ring.lock().ok().and_then(|r| r.clone()).or_else(crate::ring::shared)
+    }
+
     /// The phone plugin asks who may be rung for a caller who wants the owner (`oaiy.ring.plan`), and tells the
     /// desktop the request is out (`oaiy.ring.opened`). Allowed for a plugin that holds `oaiy.companion.admission`
     /// (already trusted with the device roster). The contract is `docs/contracts/transfer/`: the call is judged on
@@ -1617,9 +1635,14 @@ impl PluginHost {
                 format!("{plugin_id} does not declare the oaiy.companion.admission capability"),
             ));
         }
-        let Some(ring) = crate::ring::shared() else {
+        let Some(ring) = self.ring() else {
             return Err(("unavailable".into(), "this build has no ring".into()));
         };
+        Self::ring_request(&ring, method, params)
+    }
+
+    /// [`Self::handle_ring_request`] once the plugin is known to hold the capability, for the ring `ring`.
+    fn ring_request(ring: &Arc<crate::ring::Ring>, method: &str, params: Value) -> Result<Value, (String, String)> {
         let text = |k: &str| params.get(k).and_then(Value::as_str).unwrap_or("").to_string();
         let number = |k: &str| params.get(k).and_then(Value::as_u64);
         let bad = |why: &str| ("invalid_request".to_string(), why.to_string());
@@ -2550,6 +2573,88 @@ mod tests {
             .handle_plugin_request("aokie", "companion.admission", serde_json::json!({}))
             .unwrap_err();
         assert_eq!(code, "unavailable");
+    }
+
+    #[test]
+    fn a_ring_request_is_refused_to_a_plugin_that_did_not_declare_the_capability() {
+        let (sb, host) = host_with("ring-nocap", vec![]);
+        install_plugin(&sb, "aokie", &["flow.run"]);
+        host.registry.lock().unwrap().scan();
+        for method in ["oaiy.ring.plan", "oaiy.ring.opened"] {
+            let (code, message) = host.handle_plugin_request("aokie", method, serde_json::json!({"callId": "call_1"})).unwrap_err();
+            assert_eq!(code, "capability_denied", "{method}");
+            assert!(message.contains("oaiy.companion.admission"), "{message}");
+        }
+    }
+
+    /// The desktop's record of one call, for the ring's questions.
+    struct OneCall;
+
+    impl crate::ring::CallSource for OneCall {
+        fn facts(&self, call: &str) -> Option<crate::ring::CallInfo> {
+            let asked = vec!["Can I speak to the owner please".to_string()];
+            match call {
+                "call_1" => Some(crate::ring::CallInfo { from: "+61491570006".into(), name: "Alex".into(), turns: asked }),
+                "call_2" => Some(crate::ring::CallInfo { from: "+61491570156".into(), name: "Sam".into(), turns: asked }),
+                _ => None,
+            }
+        }
+        fn call_ended_by_phone(&self, _: &str) {}
+        fn local_outcome(&self, _: &str, _: &str, _: crate::voice::transfer::Outcome) {}
+    }
+
+    struct Here;
+
+    impl crate::ring::PresenceSource for Here {
+        fn presence(&self) -> crate::ring::Presence {
+            crate::ring::Presence::Active
+        }
+    }
+
+    fn a_ring() -> Arc<crate::ring::Ring> {
+        let ring = crate::ring::Ring::in_memory(crate::ring::RingSettings { enabled: true, ..Default::default() });
+        ring.set_calls(Arc::new(OneCall));
+        ring.set_presence(Arc::new(Here));
+        ring
+    }
+
+    #[test]
+    fn the_plugin_asks_who_may_be_rung_and_says_the_request_is_out() {
+        let ring = a_ring();
+        let asked = |ring: &Arc<crate::ring::Ring>, call: &str| PluginHost::ring_request(ring, "oaiy.ring.plan", json!({"callId": call, "reason": "caller_asked", "recentCallerTurns": ["Can I speak to the owner please"]}));
+        let plan = asked(&ring, "call_1").unwrap();
+        assert_eq!((plan["decision"].as_str(), plan["reason"].as_str(), plan["desktopToast"].as_bool()), (Some("ring"), Some("ok"), Some(true)), "{plan}");
+        let plan_id = plan["planId"].as_str().unwrap().to_string();
+        assert!(!plan_id.is_empty());
+
+        // The request is out: the desktop rings, for that plan and that call only.
+        let opened = |plan: &str, call: &str| PluginHost::ring_request(&ring, "oaiy.ring.opened", json!({"planId": plan, "requestId": "assist_1", "callId": call, "callEpoch": 1, "ownerEpoch": 1, "expiresAt": ring.clock().unix() + 25}));
+        assert_eq!(opened("plan_made_up", "call_1").unwrap_err().0, "unknown_plan");
+        assert_eq!(opened(&plan_id, "call_2").unwrap_err().0, "unknown_plan");
+        assert!(ring.active().is_empty(), "nothing rang for either");
+        assert_eq!(opened(&plan_id, "call_1").unwrap(), json!({"ok": true}));
+        assert_eq!(ring.active().len(), 1);
+        assert_eq!(ring.active()[0].caller_number, "+61491570006");
+
+        // A second question straight away is a second try, and the gap between tries refuses it.
+        let again = asked(&ring, "call_1").unwrap();
+        assert_eq!((again["decision"].as_str(), again["reason"].as_str(), again["planId"].as_str()), (Some("refused"), Some("limit_gap"), Some("")), "{again}");
+    }
+
+    #[test]
+    fn a_ring_request_the_desktop_cannot_make_sense_of_is_refused_and_rings_nothing() {
+        let ring = a_ring();
+        let code = |method: &str, params: Value| PluginHost::ring_request(&ring, method, params).unwrap_err().0;
+        assert_eq!(code("oaiy.ring.plan", json!({})), "invalid_request", "no call");
+        assert_eq!(code("oaiy.ring.plan", json!({"callId": "call_1", "reason": "because"})), "invalid_request");
+        assert_eq!(code("oaiy.ring.opened", json!({"planId": "p", "requestId": "r", "callId": "call_1"})), "invalid_request", "no epochs or time");
+        assert_eq!(code("oaiy.ring.opened", json!({"planId": "", "requestId": "r", "callId": "call_1", "callEpoch": 1, "ownerEpoch": 1, "expiresAt": 1})), "invalid_request");
+        // A call this desktop never heard (the plugin's own): its word for what the caller said is used, and is checked
+        // the same way, so a request the caller did not make rings nobody.
+        let plan = |turns: Value| PluginHost::ring_request(&ring, "oaiy.ring.plan", json!({"callId": "call_9", "reason": "caller_asked", "callerNumber": "+61491570156", "recentCallerTurns": turns})).unwrap();
+        let not_asked = plan(json!(["What are your opening hours?"]));
+        assert_eq!((not_asked["decision"].as_str(), not_asked["reason"].as_str(), not_asked["planId"].as_str()), (Some("refused"), Some("caller_did_not_ask"), Some("")), "{not_asked}");
+        assert_eq!(plan(json!(["Put me through to the owner"]))["decision"], "ring");
     }
 
     #[test]
@@ -3506,6 +3611,130 @@ process.stdin.on("data", (chunk) => {
         std::fs::write(dir.join("plugin.cmd"), "@echo off\r\nnode \"%~dp0plugin.mjs\" %*\r\n").unwrap();
         std::fs::write(dir.join("manifest.json"), plugin_manifest(id, "plugin.cmd")).unwrap();
         Some(dir)
+    }
+
+    /// A stand-in for the phone plugin, in a real child process: on `test.ring` it asks this host who may be rung
+    /// and says the request is out (`oaiy.ring.plan`, `oaiy.ring.opened`) and answers with what it was told; on
+    /// `call.transfer.respond` it keeps what the owner asked in `asked.log`, and when the owner accepted it says, as
+    /// a Companion that took the call would, that the request was transferred. `None` where there is no Node.
+    #[cfg(windows)]
+    fn ring_plugin(sb: &Sandbox) -> Option<PathBuf> {
+        let has_node = std::process::Command::new("node").arg("--version").stdout(std::process::Stdio::null()).stderr(std::process::Stdio::null()).status().map(|s| s.success()).unwrap_or(false);
+        if !has_node {
+            return None;
+        }
+        let dir = sb.0.join("plugins").join("aokie");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(
+            dir.join("plugin.mjs"),
+            r#"
+import fs from "node:fs";
+import path from "node:path";
+import url from "node:url";
+const here = path.dirname(url.fileURLToPath(import.meta.url));
+const send = (o) => process.stdout.write(JSON.stringify(o) + "\n");
+const waiting = new Map();
+let next = 500;
+const ask = (method, params) => new Promise((resolve) => { const id = next++; waiting.set(id, resolve); send({ jsonrpc: "2.0", id, method, params }); });
+async function handle(msg) {
+  if (msg.method === undefined && msg.id !== undefined && waiting.has(msg.id)) { waiting.get(msg.id)(msg); waiting.delete(msg.id); return; }
+  if (msg.method === "plugin.init") send({ jsonrpc: "2.0", id: msg.id, result: { ok: true } });
+  else if (msg.method === "plugin.health") send({ jsonrpc: "2.0", id: msg.id, result: { status: "ok" } });
+  else if (msg.method === "plugin.shutdown") process.exit(0);
+  else if (msg.method === "connector.request") {
+    const { command, payload } = msg.params;
+    if (command === "test.ring") {
+      const plan = await ask("oaiy.ring.plan", payload.plan);
+      let opened = null;
+      if (plan.result && plan.result.planId) {
+        opened = await ask("oaiy.ring.opened", { planId: plan.result.planId, requestId: payload.requestId, callId: payload.plan.callId, callEpoch: 1, ownerEpoch: 1, expiresAt: payload.expiresAt });
+      }
+      send({ jsonrpc: "2.0", id: msg.id, result: { ok: true, plan, opened } });
+    } else if (command === "call.transfer.respond") {
+      fs.appendFileSync(path.join(here, "asked.log"), JSON.stringify(payload) + "\n");
+      send({ jsonrpc: "2.0", id: msg.id, result: { ok: true } });
+      if (payload.action === "accept") {
+        send({ jsonrpc: "2.0", method: "event.emit", params: { event: { schemaVersion: 1, source: "aokie", name: "aokie.call.assistance.resolved", correlationId: payload.requestId, idempotencyKey: "aokie:" + payload.requestId + ":resolved", occurredAt: "2026-09-30T00:00:00Z", data: { requestId: payload.requestId, outcome: "transferred" } } } });
+      }
+    } else send({ jsonrpc: "2.0", id: msg.id, error: { code: -32601, message: "unknown command" } });
+  } else if (msg.id !== undefined) send({ jsonrpc: "2.0", id: msg.id, error: { code: -32601, message: "unknown method" } });
+}
+let buf = "";
+process.stdin.on("data", (chunk) => {
+  buf += chunk;
+  let i;
+  while ((i = buf.indexOf("\n")) >= 0) {
+    const line = buf.slice(0, i); buf = buf.slice(i + 1);
+    if (!line.trim()) continue;
+    let msg; try { msg = JSON.parse(line); } catch { continue; }
+    handle(msg);
+  }
+});
+"#,
+        )
+        .unwrap();
+        std::fs::write(dir.join("plugin.cmd"), "@echo off\r\nnode \"%~dp0plugin.mjs\" %*\r\n").unwrap();
+        let manifest = json!({
+            "schemaVersion": 3, "id": "aokie", "name": "aokie plugin", "version": "0.1.0",
+            "pluginApiVersion": 1, "entry": { "kind": "process", "command": "plugin.cmd" },
+            "capabilities": ["oaiy.companion.admission"],
+            "connectors": [{ "id": "aokie", "commands": ["test.ring", "call.transfer.respond"] }],
+            "events": ["aokie.call.assistance.resolved"],
+        });
+        std::fs::write(dir.join("manifest.json"), manifest.to_string()).unwrap();
+        Some(dir)
+    }
+
+    /// What the stand-in plugin was asked by the owner, one JSON object a line.
+    #[cfg(windows)]
+    fn owner_asked(dir: &std::path::Path) -> Vec<Value> {
+        std::fs::read_to_string(dir.join("asked.log")).unwrap_or_default().lines().filter_map(|l| serde_json::from_str(l).ok()).collect()
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn a_phone_plugin_process_rings_the_owner_and_what_the_owner_answers_reaches_it() {
+        let (sb, host, _trust) = trusting_host("ring-process", TrustPolicy::developer(), Publishers::default());
+        let Some(dir) = ring_plugin(&sb) else { return };
+        let ring = a_ring();
+        host.set_ring(ring.clone());
+        ring.set_plugin(Arc::new(PhoneTransfers(host.clone())));
+        host.start("aokie").expect("the stand-in starts");
+        wait_running(&host, "aokie");
+
+        // The plugin's own process asks who may be rung and says the request is out: this desktop rings.
+        let expires = ring.clock().unix() + 25;
+        let ask = |call: &str, request: &str, key: &str| {
+            host.forward_connector("aokie", "test.ring", Some(json!({"plan": {"callId": call, "reason": "caller_asked", "recentCallerTurns": []}, "requestId": request, "expiresAt": expires})), Some(key), Duration::from_secs(10)).expect("the plugin answered")
+        };
+        let first = ask("call_1", "assist_1", "k1");
+        assert_eq!(first["plan"]["result"]["decision"], "ring", "{first}");
+        assert_eq!(first["opened"]["result"], json!({"ok": true}), "{first}");
+        assert_eq!(ring.active().len(), 1);
+        assert!(ring.active()[0].can_accept && ring.active()[0].caller_name == "Alex");
+
+        // The owner accepts in the dialog: the plugin process is asked, and the ring goes on until it says.
+        let said = ring.respond("assist_1", crate::ring::Action::Accept).unwrap();
+        assert!(said.ok, "{}", said.note);
+        wait_until("the plugin was never asked", || !owner_asked(&dir).is_empty());
+        assert_eq!(owner_asked(&dir), vec![json!({"requestId": "assist_1", "action": "accept"})]);
+        // The plugin says the request was transferred (its own event, over the event thread): the ring is over, once.
+        wait_until("the plugin's word never reached the ring", || ring.active().is_empty());
+        assert_eq!(ring.ended().iter().map(|e| (e.id.as_str(), e.outcome, e.source)).collect::<Vec<_>>(), vec![("assist_1", "accepted", "phone")]);
+
+        // Another caller: the owner declines. It ends here at once, and the plugin is asked to withdraw the request.
+        let second = ask("call_2", "assist_2", "k2");
+        assert_eq!(second["opened"]["result"], json!({"ok": true}), "{second}");
+        assert_eq!(ring.active().len(), 1);
+        assert!(ring.respond("assist_2", crate::ring::Action::Decline).unwrap().ok);
+        assert!(ring.active().is_empty(), "declined here at once");
+        wait_until("the plugin was not asked to withdraw", || owner_asked(&dir).len() == 2);
+        assert_eq!(owner_asked(&dir)[1], json!({"requestId": "assist_2", "action": "decline"}));
+
+        // A plan the plugin never asked for rings nothing, even from a plugin that holds the capability.
+        let stray = host.handle_ring_request("aokie", "oaiy.ring.opened", json!({"planId": "plan_made_up", "requestId": "assist_3", "callId": "call_1", "callEpoch": 1, "ownerEpoch": 1, "expiresAt": expires})).unwrap_err();
+        assert_eq!(stray.0, "unknown_plan");
+        host.stop("aokie").unwrap();
     }
 
     #[cfg(windows)]

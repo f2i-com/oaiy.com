@@ -1623,6 +1623,7 @@ pub async fn serve(
     if let Some(ring) = crate::ring::shared() {
         ring.set_devices(std::sync::Arc::new(crate::ring::devices::CompanionDevices::new(companion.clone(), "aokie")));
         ring.set_plugin(std::sync::Arc::new(crate::plugins::PhoneTransfers(bridge.host.clone())));
+        bridge.host.set_ring(ring.clone());
         if gui_mode {
             ring.set_presence(std::sync::Arc::new(crate::ring::presence::IdlePresence::os(ring.settings.clone())));
         }
