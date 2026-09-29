@@ -2084,9 +2084,15 @@ select,
 .btn-warning:hover:not(:disabled) { border-color: rgb(var(--signal-amber)); background: rgb(var(--signal-amber) / 0.2); }
 /* Done: a choice already made (a preset already added). */
 .btn.done { border-color: rgb(var(--signal-green) / 0.4); background: rgb(var(--signal-green) / 0.1); color: rgb(var(--signal-green)); }
-/* A filled danger, for the one button that deletes. */
-.btn-danger.solid { border-color: rgb(var(--signal-danger)); background: rgb(var(--signal-danger)); color: #fff; }
-.btn-danger.solid:hover:not(:disabled) { filter: brightness(1.06); }
+/* A filled danger, for the one button that deletes (and Stop). White on the
+   signal colour itself is under 4.5:1 in both themes, so the fill is the
+   signal deepened toward black, which keeps the hue and clears it. */
+.btn-danger.solid {
+  border-color: rgb(var(--signal-danger));
+  background: color-mix(in srgb, rgb(var(--signal-danger)) 72%, black);
+  color: #fff;
+}
+.btn-danger.solid:hover:not(:disabled) { background: color-mix(in srgb, rgb(var(--signal-danger)) 80%, black); }
 
 /* ---------- fields ---------- */
 
@@ -2597,6 +2603,23 @@ button.oaiy-row.on { background: rgb(var(--accent-primary) / 0.1); }
 @media (max-height: 560px) {
   .oaiy-dialog-head { padding-top: 11px; padding-bottom: 9px; }
   .oaiy-dialog-body { padding-top: 12px; padding-bottom: 12px; }
+}
+
+/* Items in a list (a menu, the rails, a palette, tabs) show focus as a thin
+   ring inside them rather than the app's thick outer ring, which would spill
+   over their neighbours. */
+.oaiy-menu > button:focus-visible,
+.oaiy-flow-item:focus-visible,
+.oaiy-node-item:focus-visible,
+.oaiy-subnav > button:focus-visible,
+.oaiy-seg > button:focus-visible,
+.oaiy-sections-tabs > button:focus-visible,
+.oaiy-cat > button:focus-visible,
+button.oaiy-row:focus-visible,
+.oaiy-tool:focus-visible {
+  outline: 2px solid transparent;
+  outline-offset: -2px;
+  box-shadow: inset 0 0 0 2px rgb(var(--accent-primary) / 0.65);
 }
 
 /* ---------- a menu: a short list opened from a button ---------- */
@@ -3144,7 +3167,8 @@ button.oaiy-row.on { background: rgb(var(--accent-primary) / 0.1); }
   position: fixed;
   z-index: 10020;
   right: 18px;
-  bottom: 18px;
+  /* Above the canvas's toolbar (and the web editor's dock), not over Run. */
+  bottom: 78px;
   display: flex;
   max-width: min(380px, calc(100vw - 36px));
   flex-direction: column;
