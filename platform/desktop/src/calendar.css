@@ -832,6 +832,65 @@
   .voice-add { grid-template-columns: minmax(0, 1fr) minmax(0, 1fr); }
   .voice-add > .voice-words { grid-column: 1 / -1; }
 }
+/* How long the greeting waits: what it is and why on the left, the slider and its seconds on the right. */
+.voice-delay {
+  display: grid;
+  align-items: center;
+  gap: 10px 24px;
+  grid-template-columns: minmax(0, 1fr) minmax(240px, 360px);
+  border-top: 1px solid var(--border);
+  padding-top: 14px;
+}
+.voice-delay-text { display: flex; min-width: 0; flex-direction: column; gap: 3px; }
+.voice-delay-text > label { color: var(--text); font-size: 13px; font-weight: 620; }
+.voice-delay-control { display: flex; min-width: 0; align-items: center; gap: 12px; }
+/* The slider drawn in the theme's colours (the native one's track is near-white in the dark
+   theme), without the text inputs' box: filled in the primary up to `--fill`, set from its value. */
+.voice-delay-control input[type='range'] {
+  --fill: 0%;
+  min-width: 0;
+  height: 22px;
+  flex: 1;
+  margin: 0;
+  appearance: none;
+  -webkit-appearance: none;
+  border: 0;
+  border-radius: 0;
+  background: none;
+  padding: 0;
+  cursor: pointer;
+}
+.voice-delay-control input[type='range']::-webkit-slider-runnable-track {
+  height: 4px;
+  border-radius: 99px;
+  background: linear-gradient(to right, var(--primary) var(--fill), var(--strong-border) var(--fill));
+}
+.voice-delay-control input[type='range']::-webkit-slider-thumb {
+  width: 16px;
+  height: 16px;
+  margin-top: -6px;
+  appearance: none;
+  -webkit-appearance: none;
+  border: 2px solid var(--primary);
+  border-radius: 50%;
+  background: #fff;
+  transition: transform 0.14s;
+}
+.voice-delay-control input[type='range']:hover::-webkit-slider-thumb { transform: scale(1.12); }
+.voice-delay-control input[type='range']:focus { box-shadow: none; }
+.voice-delay-control input[type='range']:focus-visible::-webkit-slider-thumb { box-shadow: 0 0 0 4px var(--primary-soft); }
+.voice-delay-control input[type='range']:focus-visible { outline: 2px solid var(--focus); outline-offset: 3px; border-radius: var(--r-sm); }
+@media (prefers-reduced-motion: reduce) {
+  .voice-delay-control input[type='range']::-webkit-slider-thumb { transition: none; }
+}
+.voice-delay-value {
+  min-width: 6ch;
+  color: var(--text);
+  font-family: var(--font-mono);
+  font-size: 13px;
+  font-variant-numeric: tabular-nums;
+  text-align: right;
+}
 
 /* Unsaved changes: a bar that stays in view at the foot of the page until saved or discarded. */
 .hours-savebar {
@@ -871,6 +930,7 @@
   .hours-day.is-closed .hours-spans { grid-column: auto; grid-row: auto; }
   .svc-fields { grid-template-columns: minmax(0, 1fr); }
   .voice-add { grid-template-columns: minmax(0, 1fr); }
+  .voice-delay { grid-template-columns: minmax(0, 1fr); }
   .hours-savebar { flex-wrap: wrap; justify-content: flex-end; }
   .hours-savebar-text { flex-basis: 100%; }
 }

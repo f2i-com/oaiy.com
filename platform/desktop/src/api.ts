@@ -1375,9 +1375,24 @@ export interface VoiceClip {
   written: boolean;
 }
 
+/**
+ * How a call is answered, kept with the voices (`/api/voice/settings`).
+ * `greetingDelayMs`: how long the greeting waits after a call connects, 0 to
+ * 5000 (sooner if the caller speaks first; calls the agent places wait for the
+ * other person's hello whatever it is).
+ */
+export interface CallSettings {
+  greetingDelayMs: number;
+}
+
 export const voices = {
-  list: () => request<{ voices: VoiceClip[]; chosen: string | null }>('/api/voice/voices'),
+  /** `greetingDelayMs` is there on a desktop that has `/api/voice/settings`. */
+  list: () => request<{ voices: VoiceClip[]; chosen: string | null; greetingDelayMs?: number }>('/api/voice/voices'),
   choose: (voice: string) => request<{ chosen: string }>('/api/voice/voices/chosen', { method: 'PUT', body: JSON.stringify({ voice }) }),
+  /** A 404 on an older desktop (see `optional`). */
+  settings: () => request<CallSettings>('/api/voice/settings'),
+  /** The desktop keeps it to 0 to 5000 and answers with what it kept; it applies from the next call. */
+  saveSettings: (s: CallSettings) => request<CallSettings>('/api/voice/settings', { method: 'PUT', body: JSON.stringify(s) }),
   /** Keep a clip (MP3, WAV, ...) as the voice `name`; `words` is what it says, when known. */
   add: (name: string, file: File, words?: string, choose?: boolean) =>
     request<{ voice: VoiceClip; chosen: string | null }>(

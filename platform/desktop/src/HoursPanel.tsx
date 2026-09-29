@@ -1,6 +1,6 @@
-import { useCallback, useEffect, useMemo, useRef, useState, type ReactNode } from 'react';
+import { useCallback, useEffect, useMemo, useRef, useState, type CSSProperties, type ReactNode } from 'react';
 import { ArrowDown, ArrowUp, CalendarDays, Coffee, Copy, Plus, Trash2, Undo2, Volume2, X } from 'lucide-react';
-import { calendar, voices, type CalendarService, type CalendarSettings, type CalendarSpan, type VoiceClip } from './api';
+import { calendar, isNotFound, optional, voices, type CalendarService, type CalendarSettings, type CalendarSpan, type VoiceClip } from './api';
 import {
   DAY_NAMES,
   DURATIONS,
@@ -534,8 +534,9 @@ export function SettingsForm({
 /**
  * The voice the phone speaks in: a clip of someone speaking (MP3, WAV...),
  * cloned by OAIY's own speech engine on this machine's GPU. Each can be heard
- * first; a new one needs only its clip (what it says is heard from it).
- * Changes here apply at once (not with the form's Save).
+ * first; a new one needs only its clip (what it says is heard from it). Then
+ * how long the greeting waits after a call connects. Changes here apply at
+ * once (not with the form's Save).
  */
 export function CallVoice({ business }: { business: string }) {
   const toast = useToast();
@@ -547,20 +548,27 @@ export function CallVoice({ business }: { business: string }) {
   const [words, setWords] = useState('');
   const [adding, setAdding] = useState(false);
   const [loaded, setLoaded] = useState(false);
+  /** How long the greeting waits: unread yet, `null` on a desktop without the setting. */
+  const [delay, setDelay] = useState<number | null | undefined>(undefined);
   const player = useRef<HTMLAudioElement | null>(null);
   const fileInput = useRef<HTMLInputElement | null>(null);
   const fail = (title: string, e: unknown) => toast.push({ kind: 'error', title, body: errText(e) });
 
   const load = useCallback(async () => {
+    let delayMs: number | undefined;
     try {
       const r = await voices.list();
       setList(r.voices);
       setChosen(r.chosen);
+      delayMs = r.greetingDelayMs;
     } catch (e) {
       fail('Voices not read', e);
     } finally {
       setLoaded(true);
     }
+    // Not in the list: asked on its own, and a desktop without it (a 404) has the setting hidden.
+    if (!isMs(delayMs)) delayMs = await optional(voices.settings()).then((s) => s?.greetingDelayMs, () => undefined);
+    setDelay(isMs(delayMs) ? delayMs : null);
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
   useEffect(() => {
@@ -675,6 +683,116 @@ export function CallVoice({ business }: { business: string }) {
           <Plus size={14} /> {adding ? 'Adding…' : 'Add and use it'}
         </button>
       </div>
+      {isMs(delay) && <GreetingDelay saved={delay} onSaved={setDelay} onGone={() => setDelay(null)} onFail={(e) => fail('Not saved', e)} />}
     </section>
+  );
+}
+
+const isMs = (v: unknown): v is number => typeof v === 'number' && Number.isFinite(v);
+
+/** The most the desktop keeps (`greetingDelayMs`), and the slider's step. */
+const MAX_GREETING_DELAY_MS = 5000;
+const GREETING_DELAY_STEP_MS = 250;
+/** How long the slider rests before what it says is saved. */
+const SAVE_AFTER_MS = 400;
+
+/** 1500 → "1.5 s", 0 → "0 s", 1250 → "1.25 s". */
+const saySeconds = (ms: number) => `${Number((ms / 1000).toFixed(2))} s`;
+
+/**
+ * How long the greeting waits after a call connects, so the caller's phone
+ * has its audio before "Hi" is said. Saved when the slider rests (the card's
+ * changes apply at once), and shown as the desktop kept it (0 to 5 s).
+ */
+function GreetingDelay({
+  saved,
+  onSaved,
+  onGone,
+  onFail,
+}: {
+  saved: number;
+  onSaved: (ms: number) => void;
+  /** A desktop without the setting (a 404). */
+  onGone: () => void;
+  onFail: (e: unknown) => void;
+}) {
+  const [ms, setMs] = useState(saved);
+  const timer = useRef<number | null>(null);
+  /** The value waiting for the slider to rest. */
+  const waiting = useRef<number | null>(null);
+  /** Each change's number: a save's answer is shown only while no later change came. */
+  const seq = useRef(0);
+  const answered = useRef(0);
+  const savedNow = useRef(saved);
+  savedNow.current = saved;
+
+  // A new reading from the desktop: taken while nothing here is waiting to be saved.
+  useEffect(() => {
+    if (waiting.current === null && answered.current === seq.current) setMs(saved);
+  }, [saved]);
+
+  // Leaving the page with a change still waiting: it is saved anyway.
+  useEffect(
+    () => () => {
+      if (timer.current !== null) window.clearTimeout(timer.current);
+      if (waiting.current !== null) void voices.saveSettings({ greetingDelayMs: waiting.current }).catch(() => undefined);
+    },
+    [],
+  );
+
+  const save = async (value: number, n: number) => {
+    try {
+      const kept = (await voices.saveSettings({ greetingDelayMs: value })).greetingDelayMs;
+      if (n !== seq.current) return;
+      answered.current = n;
+      const shown = isMs(kept) ? kept : value;
+      setMs(shown);
+      onSaved(shown);
+    } catch (e) {
+      if (isNotFound(e)) return onGone();
+      if (n !== seq.current) return;
+      answered.current = n;
+      setMs(savedNow.current);
+      onFail(e);
+    }
+  };
+
+  const change = (value: number) => {
+    const n = ++seq.current;
+    setMs(value);
+    waiting.current = value;
+    if (timer.current !== null) window.clearTimeout(timer.current);
+    timer.current = window.setTimeout(() => {
+      timer.current = null;
+      waiting.current = null;
+      void save(value, n);
+    }, SAVE_AFTER_MS);
+  };
+
+  const seconds = Number((ms / 1000).toFixed(2));
+  return (
+    <div className="voice-delay">
+      <div className="voice-delay-text">
+        <label htmlFor="greeting-delay">Greet after the call connects</label>
+        <p className="form-hint">The greeting starts sooner if the caller speaks first. Calls the agent places wait for the other person’s hello.</p>
+      </div>
+      <div className="voice-delay-control">
+        <input
+          id="greeting-delay"
+          type="range"
+          min={0}
+          max={MAX_GREETING_DELAY_MS}
+          step={GREETING_DELAY_STEP_MS}
+          value={ms}
+          style={{ '--fill': `${(Math.min(Math.max(ms, 0), MAX_GREETING_DELAY_MS) / MAX_GREETING_DELAY_MS) * 100}%` } as CSSProperties}
+          aria-valuetext={`${seconds} ${seconds === 1 ? 'second' : 'seconds'}`}
+          onChange={(e) => change(Number(e.target.value))}
+        />
+        {/* Said by the slider itself (aria-valuetext), so not read twice. */}
+        <span className="voice-delay-value" aria-hidden="true">
+          {saySeconds(ms)}
+        </span>
+      </div>
+    </div>
   );
 }
