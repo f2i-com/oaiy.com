@@ -30,6 +30,9 @@ pub const CANCEL_FRAME: &str = "formlogic.realtime.transfer_cancel";
 pub const NOTICE_FRAME: &str = "formlogic.realtime.transfer_notice";
 /// The notice: an owner device had already taken the call, so the request cannot be withdrawn.
 pub const TOO_LATE: &str = "too_late";
+/// The notice: the phone has no such open request on this call (it ended and the withdrawal crossed its end, or it was never
+/// there), so nothing was changed and there is nothing left to withdraw.
+pub const UNKNOWN_REQUEST: &str = "unknown_request";
 /// The name of the feature in `ready.features`.
 pub const FEATURE: &str = "transfer_v1";
 /// The call tool.
@@ -343,6 +346,17 @@ impl Transfer {
     /// The phone says it was too late to withdraw `request` (an owner device had already taken it): nothing is offered, the
     /// acceptance is coming, and the ring goes on until it says. Whether this was the request being withdrawn.
     pub fn too_late(&mut self, request: &str) -> bool {
+        self.withdrawal_answered(request)
+    }
+
+    /// The phone says it has no open request `request` on this call: it ended (its own outcome is on its way or has been heard) or was
+    /// never there, and nothing is left to withdraw, so the wait for an answer is over now and not after `cancel_wait`. Whether this was
+    /// the request being withdrawn.
+    pub fn unknown_request(&mut self, request: &str) -> bool {
+        self.withdrawal_answered(request)
+    }
+
+    fn withdrawal_answered(&mut self, request: &str) -> bool {
         let was = self.cancelling.as_ref().is_some_and(|c| c.request == request);
         if was {
             self.cancelling = None;
@@ -775,6 +789,19 @@ mod tests {
         t.cancel("assist_1", at(3));
         assert!(!t.too_late("assist_9"));
         assert!(t.too_late("assist_1"));
+        // A request the phone says it has no open request for is answered as soon as it says so, and only the request being withdrawn
+        // counts: a notice about another leaves the wait running until it runs out.
+        let mut other = Transfer::default();
+        other.ringing("assist_1", 40, at(0));
+        assert!(other.cancel("assist_1", at(3)));
+        assert!(!other.unknown_request("assist_9"), "a notice about another request changes nothing");
+        assert!(other.due(at(3) + CANCEL_WAIT).contains(&Due::CancelUnanswered("assist_1".into())), "the wait ran out");
+        let mut u = Transfer::default();
+        u.ringing("assist_1", 40, at(0));
+        assert!(u.cancel("assist_1", at(3)));
+        assert!(u.unknown_request("assist_1"));
+        assert!(!u.unknown_request("assist_1"), "once");
+        assert!(!u.due(at(3) + CANCEL_WAIT).iter().any(|d| matches!(d, Due::CancelUnanswered(_))), "and there is nothing left to wait for");
         assert!(t.busy(), "still ringing: the acceptance is on its way");
         let later = t.due(at(3) + CANCEL_WAIT + Duration::from_secs(1));
         assert!(!later.iter().any(|d| matches!(d, Due::CancelUnanswered(_))) && !later.contains(&Due::Say(OFFER_LINE)), "no message offered, no timeout: {later:?}");

@@ -1054,11 +1054,14 @@ where
                                     outcomes.push((request, outcome, words, "phone"));
                                 }
                             }
-                            // The phone answers a request to withdraw one: too late, an owner device had already taken it.
+                            // The phone answers a request to withdraw one: too late (an owner device had already taken it), or it has no such
+                            // request open (it ended, or never was), which leaves nothing to wait for: it is over here, as if the owner declined.
                             transfer::NOTICE_FRAME if allow_transfer => {
                                 let request = v.get("requestId").and_then(Value::as_str).unwrap_or("");
-                                if v.get("notice").and_then(Value::as_str) == Some(transfer::TOO_LATE) && transfer.too_late(request) {
-                                    ring.cancel_refused(request);
+                                match v.get("notice").and_then(Value::as_str) {
+                                    Some(transfer::TOO_LATE) if transfer.too_late(request) => ring.cancel_refused(request),
+                                    Some(transfer::UNKNOWN_REQUEST) if transfer.unknown_request(request) => outcomes.push((request.to_string(), Outcome::Declined, None, "desktop")),
+                                    _ => {}
                                 }
                             }
                             "formlogic.realtime.stop" => break v.get("reason").and_then(Value::as_str).unwrap_or("stopped").to_string(),

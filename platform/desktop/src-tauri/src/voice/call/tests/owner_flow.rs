@@ -245,6 +245,30 @@ async fn the_owner_declines_or_asks_for_a_message_and_the_phone_withdraws_the_re
 }
 
 #[tokio::test]
+async fn a_withdrawal_the_phone_has_no_open_request_for_ends_the_wait_at_once_and_the_caller_is_offered_a_message() {
+    // The phone is given five seconds to answer here; a notice that there is no such request must not need them.
+    let timing = transfer::Timing { cancel_wait: secs(5), ..quick() };
+    let mut f = flow_full(owner_settings(true), None, crate::ring::testing::at_the_pc(), timing).await;
+    f.caller_says(ASKED);
+    f.ring_through("assist_1", 30).await;
+    assert_eq!(f.owner_answers("assist_1", "decline").await.0, 200);
+    f.phone_is_asked_to_withdraw("assist_1", "owner_declined").await;
+    // A notice about another request is not the answer.
+    f.aokie.send(json!({"type": transfer::NOTICE_FRAME, "callId": f.aokie.call, "generation": 1, "requestId": "assist_9", "notice": "unknown_request", "atMs": 1789000014500u64}));
+    assert!(f.aokie.event("call.transfer", Duration::from_millis(400)).await.is_none(), "nothing is decided by a notice about another request");
+    assert_eq!(f.dialog().await[0]["stopping"], json!(true));
+    // The phone has no such request open (it ended, and the withdrawal crossed its end): nothing is left to wait for.
+    let sent = Instant::now();
+    f.aokie.send(json!({"type": transfer::NOTICE_FRAME, "callId": f.aokie.call, "generation": 1, "requestId": "assist_1", "notice": "unknown_request", "atMs": 1789000014600u64}));
+    let told = f.aokie.event("call.transfer", secs(2)).await.expect("the app is told at once");
+    assert!(sent.elapsed() < secs(2), "{:?}", sent.elapsed());
+    assert_eq!((told["requestId"].clone(), told["outcome"].clone(), told["source"].clone()), (json!("assist_1"), json!("declined"), json!("desktop")));
+    assert!(spoken_within(&f.aokie, transfer::OFFER_LINE, secs(3)).await, "{:?}", f.aokie.speech.spoken());
+    assert!(f.dialog().await.is_empty());
+    assert_eq!(f.ended(), vec![("assist_1".to_string(), "declined", "desktop")]);
+}
+
+#[tokio::test]
 async fn a_decline_that_races_an_accept_is_decided_once_by_the_phone_too_late_offers_no_message() {
     let mut f = flow(owner_settings(true)).await;
     f.caller_says(ASKED);
