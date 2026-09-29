@@ -1,15 +1,38 @@
 /**
  * The chat pane: the conversation with the agent, streamed as it arrives,
- * with a card per tool call; and the prompt box, which also takes slash
+ * with a row per tool call; and the prompt box, which also takes slash
  * commands.
+ *
+ * The log reads newest first. What each person said is grouped under their
+ * name (a run: one speaker, one header), a call's and a text thread's words
+ * are shown without the labels the agent reads them with (transcript.ts), and
+ * tool calls made one after another fold into one "Used N tools" row.
  */
 import type { AgentEvent } from '../agent/agent';
 import type { Attachment, ToolCall, ToolResult, Turn } from '../agent/protocol';
 import { planAfter, planChanges, readPlan, readTasks, settlePlan, type Plan } from '../agent/tools';
 import { formatTokens } from '../agent/context';
 import { clear, h } from './dom';
+import { icon } from './icons';
 import { mediaElement, mediaKind, type Media } from './media';
 import { renderMarkdown } from './markdown';
+import { SessionPicker, tabKind, tabName, type ConversationTab } from './sessionPicker';
+import { argLines, clip, duration, mediaPrompt, prettyResult, summarizeCall, toolIcon, toolLabel } from './chat/tools';
+import {
+  clock,
+  conversationKind,
+  dayLabel,
+  formatNumber,
+  initials,
+  parseCallEnd,
+  parseCallStart,
+  parseCallTurn,
+  parseFlowAsk,
+  parseTextTurn,
+  timeLabel,
+  type CallStart,
+  type Part,
+} from './chat/transcript';
 
 /** How long a flag waits for a comment before it goes without one. */
 const FLAG_WAIT_SECONDS = 10;
@@ -21,14 +44,6 @@ const FLAG_WAIT_SECONDS = 10;
  */
 const STREAM_REDRAW_MS = 80;
 
-/** The prompt a picture, clip or sound is made from, shown on its card without opening it. */
-function mediaPrompt(call: ToolCall): string {
-  if (!/^generate_(image|video|speech|music)$/.test(call.name)) return '';
-  const i = call.input;
-  const text = [i.prompt, call.name === 'generate_speech' ? i.input : null, i.lyrics].filter((v): v is string => typeof v === 'string' && !!v.trim());
-  return text.join('\n\n');
-}
-
 /** What the model was sent for a step, as text to read: the system prompt, the tools, then the conversation. */
 function promptText(e: { system: string; turns: Turn[]; tools: string[] }): string {
   const parts = [`━━ SYSTEM PROMPT ━━\n${e.system}`, `━━ TOOLS ━━\n${e.tools.join(', ')}`];
@@ -38,29 +53,6 @@ function promptText(e: { system: string; turns: Turn[]; tools: string[] }): stri
     else parts.push(...t.results.map((r) => `━━ RESULT of ${r.name}${r.isError ? ' (error)' : ''} ━━\n${r.content}${r.images?.length ? `\n[${r.images.length} image(s)]` : ''}`));
   }
   return parts.join('\n\n');
-}
-
-function summarizeCall(call: ToolCall): string {
-  const i = call.input;
-  const s = (k: string) => (typeof i[k] === 'string' ? String(i[k]) : '');
-  switch (call.name) {
-    case 'read_file': case 'write_file': case 'append_file': case 'edit_file': case 'delete_file': case 'list_files': return s('path') || '/';
-    case 'review_frame': return `${s('path')}${i.accept === true ? ' (accept)' : ''}`;
-    case 'grep': return `${s('pattern')}${s('path') ? ` in ${s('path')}` : ''}`;
-    case 'glob': return s('pattern');
-    case 'sandbox_shell': return s('command').split('\n')[0];
-    case 'code_run': return `${s('language') || 'javascript'}${s('file') ? ` ${s('file')}` : ''}`;
-    case 'web_fetch': return s('url');
-    case 'delegate': return Array.isArray(i.tasks) ? `${i.tasks.length} task${i.tasks.length === 1 ? '' : 's'}` : '';
-    case 'present_file': case 'view_image': case 'file_info': case 'search_file': return s('path');
-    case 'softn_import': return s('path');
-    case 'softn_check': case 'softn_inspect': return s('app');
-    case 'softn_interact': return Array.isArray(i.actions) ? i.actions.map((a) => Object.entries(a as Record<string, unknown>).filter(([k]) => k !== 'nth').map(([k, v]) => (k === 'value' ? `"${v}"` : `${k} ${typeof v === 'string' ? `"${v}"` : v}`)).join(' ')).join(', ') : '';
-    case 'softn_docs': return s('search') ? `search: ${s('search')}` : s('topic') || s('section') || 'map';
-    case 'softn_components': return Array.isArray(i.names) ? i.names.join(', ') : s('names');
-    case 'softn_examples': return [s('name'), s('file'), s('install_to') && `→ ${s('install_to')}`].filter(Boolean).join(' ') || 'list';
-    default: return '';
-  }
 }
 
 /** Steps after the one in progress that the checklist shows before folding the rest into "+N more". */
@@ -76,31 +68,54 @@ function pageStart(turns: Turn[], size: number): number {
   return from;
 }
 
+/** Who said something: the person, the agent, the caller, the one texting, or a flow. */
+type Speaker = 'you' | 'agent' | 'caller' | 'texter' | 'flow';
+
+/** Suggestions for an empty conversation: they fill the message box, and are sent only when the person sends them. */
+const SUGGESTIONS: Record<'runner' | 'project', { title: string; text: string; ideas: string[] }> = {
+  runner: {
+    title: "Your phone's front desk",
+    text: "Tell me what callers and texters should hear: I keep the brief, the knowledge files and each caller's notes up to date, and I can look over what the phone's agents said.",
+    ideas: [
+      'What did callers and texters ask about today?',
+      "This week, tell callers we're booked until Friday.",
+      "Don't quote prices for jobs that take more than a day.",
+      'Add our services and prices to the knowledge files.',
+    ],
+  },
+  project: {
+    title: 'What shall we make?',
+    text: 'Ask for code, a web page or a SoftN app: I write the files here, run them on the Zipp VM, and show you the result.',
+    ideas: ['Explain what this project does.', 'Build a one-page site with a contact form.', 'Start a SoftN app that keeps a task list.', 'Find the TODOs and fix the first one.'],
+  },
+};
+
 export class ChatPane {
   readonly element = h('section.chat');
   private readonly log = h('div.chat-log', { role: 'log', 'aria-live': 'polite', 'aria-relevant': 'additions' });
-  private readonly input = h('textarea.chat-input', { rows: 3, placeholder: 'Ask OAIY…  (/help for commands)', title: 'Enter sends; Shift+Enter starts a new line' });
-  private readonly send = h('button.primary', 'Send');
-  private readonly attachButton = h('button.attach', { title: 'Attach files or images (or drop them here, or paste an image)', 'aria-label': 'Attach files' }, '📎');
+  private readonly input = h('textarea.chat-input', { rows: 1, placeholder: 'Ask OAIY…', 'aria-label': 'Message the agent', title: 'Enter sends; Shift+Enter starts a new line' }) as HTMLTextAreaElement;
+  private readonly send = h('button.send-button', { type: 'button' }) as HTMLButtonElement;
+  private readonly attachButton = h('button.attach', { type: 'button', title: 'Attach files or images (or drop them here, or paste an image)', 'aria-label': 'Attach files' }, icon('paperclip'));
   private readonly picker = h('input', { type: 'file', multiple: true, style: 'display:none' });
   private readonly pending = h('div.attachments');
   private files: File[] = [];
   private readonly status = h('div.chat-status', { role: 'status', 'aria-live': 'polite' });
+  private readonly hint = h('span.composer-hint');
   /** How full the model's context is. */
   private readonly meterFill = h('span.context-fill');
   private readonly meterText = h('span.context-text');
   private readonly meter = h('span.context-meter', { title: 'How much of the model\'s context the conversation uses. Older turns are summarized before it fills up.' }, h('span.context-bar', this.meterFill), this.meterText);
   /** The agent's checklist for the current request, pinned above the log. */
   private readonly planBox = h('section.plan', { 'aria-live': 'polite' });
-  /** The project's conversations: its own chat, and one per person who texts the phone. */
   /**
-   * The conversations: the one shown, in a line of its own, and all of them in
-   * a list that opens below it (one to a row, scrolling down when there are
-   * many: never a strip to scroll sideways).
+   * The conversations: the project's own, and the phone's (each call and text
+   * thread, and flows' tasks), in a picker that searches them.
    */
   private readonly sessionTabs = h('nav.session-switch', { 'aria-label': 'Conversations', hidden: true });
-  private sessionsOpen = false;
-  private closeSessions: () => void = () => {};
+  private readonly sessionPicker = new SessionPicker();
+  /** A call going on now, in the conversation shown: how long it has run. */
+  private readonly liveBar = h('div.call-live', { role: 'status', hidden: true });
+  private liveTimer: ReturnType<typeof setInterval> | null = null;
   /** The person's choice to show or hide the steps; null follows the run (hidden once finished). */
   private planOpen: boolean | null = null;
   /** Every step shown, not only the one in progress and the next few (the finished ones fold into one line). */
@@ -117,6 +132,20 @@ export class ChatPane {
   private busy = false;
   /** Blob URLs behind the media in the log, revoked when it is cleared. */
   private media: Media[] = [];
+  /** What the conversation shown is, read from its words: a call's, a text thread's, a flow's tasks, or the person's own. */
+  private kind: 'call' | 'sms' | 'task' | 'own' = 'own';
+  /** The person's own conversation is the Front desk's runner (else a project's). */
+  private runner = false;
+  /** The conversation shown is a call going on now. */
+  private live = false;
+  /** Who is on the call (from the note that began it). */
+  private callName = 'Caller';
+  /** When the call shown began (ms), as near as its note and the caller's times tell. */
+  private callStartAt: number | null = null;
+  /** Drawing a saved conversation (no times are measured). */
+  private replaying = false;
+  /** The empty conversation's welcome. */
+  private readonly hero = h('div.chat-empty');
 
   constructor(
     private readonly handlers: {
@@ -132,22 +161,36 @@ export class ChatPane {
   ) {
     this.planBox.hidden = true;
     this.meter.hidden = true;
+    this.log.append(this.status);
+    this.sessionTabs.append(this.sessionPicker.element);
     this.log.addEventListener('scroll', () => {
       this.stick = this.log.scrollTop < 60;
       this.toCurrent.hidden = this.log.scrollTop < 300;
       this.maybeLoadOlder();
     }, { passive: true });
-    // The conversations' list closes on a click elsewhere, or Escape.
-    document.addEventListener('pointerdown', (e) => {
-      if (this.sessionsOpen && !this.sessionTabs.contains(e.target as Node)) this.closeSessions();
+    // A code block's Copy button.
+    this.log.addEventListener('click', (e) => {
+      const button = (e.target as Element).closest?.('.code-copy');
+      if (button instanceof HTMLElement) void this.copyCode(button);
     });
-    this.sessionTabs.addEventListener('keydown', (e) => {
-      if (e.key === 'Escape' && this.sessionsOpen) {
-        this.closeSessions();
-        (this.sessionTabs.querySelector('.session-current') as HTMLElement | null)?.focus();
-      }
+    const composer = h(
+      'div.composer',
+      this.pending,
+      this.input,
+      h('div.composer-bar', this.attachButton, this.hint, this.send),
+    );
+    composer.addEventListener('click', (e) => {
+      if (e.target === composer) this.input.focus();
     });
-    this.element.append(h('div.pane-title', 'Agent', this.meter), this.sessionTabs, this.planBox, h('div.chat-log-wrap', this.log, this.toCurrent), this.status, this.pending, h('div.chat-compose', this.attachButton, this.input, this.send), this.picker);
+    this.element.append(
+      h('div.pane-title.chat-head', h('span.pane-kicker', 'Agent'), this.meter),
+      this.sessionTabs,
+      this.liveBar,
+      this.planBox,
+      h('div.chat-log-wrap', this.log, this.toCurrent),
+      h('div.chat-compose', composer),
+      this.picker,
+    );
     this.attachButton.addEventListener('click', () => this.picker.click());
     this.picker.addEventListener('change', () => {
       if (this.picker.files) this.addFiles([...this.picker.files]);
@@ -183,7 +226,12 @@ export class ChatPane {
         this.submit();
       }
     });
-    this.input.addEventListener('input', () => this.updateSend());
+    this.input.addEventListener('input', () => {
+      this.updateSend();
+      this.grow();
+    });
+    this.updateSend();
+    this.updateEmpty();
   }
 
   addFiles(files: File[]): void {
@@ -200,14 +248,14 @@ export class ChatPane {
     this.files.forEach((file, i) => {
       const url = file.type.startsWith('image/') ? URL.createObjectURL(file) : null;
       if (url) this.pendingUrls.push(url);
-      const thumb = url ? h('img', { src: url, alt: '' }) : h('span.file-icon', '📄');
+      const thumb = url ? h('img', { src: url, alt: '' }) : h('span.file-icon', icon('file'));
       this.pending.append(
         h(
           'span.attachment',
           { title: `${file.name} (${file.size.toLocaleString()} bytes)` },
           thumb,
           h('span.attachment-name', file.name),
-          h('button.icon', { title: 'Remove', onclick: () => { this.files.splice(i, 1); this.renderPending(); } }, '✕'),
+          h('button.icon', { type: 'button', title: 'Remove', 'aria-label': `Remove ${file.name}`, onclick: () => { this.files.splice(i, 1); this.renderPending(); } }, icon('x')),
         ),
       );
     });
@@ -219,6 +267,7 @@ export class ChatPane {
     // Slash commands are commands, even with files waiting.
     if (text.startsWith('/') && this.files.length) {
       this.input.value = '';
+      this.grow();
       this.handlers.submit(text, []);
       return;
     }
@@ -226,6 +275,7 @@ export class ChatPane {
     this.files = [];
     this.renderPending();
     this.input.value = '';
+    this.grow();
     this.updateSend();
     this.handlers.submit(text, files);
   }
@@ -234,14 +284,30 @@ export class ChatPane {
     this.input.focus();
   }
 
+  /** The message box grows with what is written, up to a limit, then scrolls. */
+  private grow(): void {
+    this.input.style.height = 'auto';
+    const max = Math.max(96, Math.min(240, Math.round(window.innerHeight * 0.32)));
+    this.input.style.height = `${Math.min(max, this.input.scrollHeight + 2)}px`;
+    this.input.style.overflowY = this.input.scrollHeight + 2 > max ? 'auto' : 'hidden';
+  }
+
   setBusy(busy: boolean): void {
     this.busy = busy;
     // A new run: the last run's last tool is not what the agent does now.
     if (busy) this.setActivity('');
     if (this.currentPlan) this.showPlan(this.currentPlan, busy);
-    this.input.placeholder = busy ? 'Message the agent while it works…  (it reads it at its next step)' : 'Ask OAIY…  (/help for commands)';
+    this.input.placeholder = busy ? 'Message the agent while it works…' : this.placeholder();
+    this.element.classList.toggle('busy', busy);
     this.updateSend();
     if (!busy) this.setStatus('');
+  }
+
+  /** What the message box asks for, in the conversation shown. */
+  private placeholder(): string {
+    if (this.kind === 'call') return this.live ? 'Tell the receptionist something: it reads it before its next reply…' : "Ask about this call, or tell its agent something…";
+    if (this.kind === 'sms') return 'Tell the agent what to text…';
+    return this.runner ? 'Tell the runner what the phone should know…' : 'Ask OAIY…';
   }
 
   private hasMessage(): boolean {
@@ -251,8 +317,14 @@ export class ChatPane {
   /** Stop while the agent works with nothing written; Send otherwise. */
   private updateSend(): void {
     const stop = this.busy && !this.hasMessage();
-    this.send.textContent = stop ? 'Stop' : 'Send';
+    clear(this.send);
+    this.send.append(icon(stop ? 'stop' : 'arrow-up'));
+    this.send.dataset.mode = stop ? 'stop' : 'send';
     this.send.classList.toggle('danger', stop);
+    this.send.title = stop ? 'Stop the agent' : this.busy ? 'Send: the agent reads it at its next step' : 'Send (Enter)';
+    this.send.setAttribute('aria-label', stop ? 'Stop' : 'Send');
+    this.send.disabled = !stop && !this.hasMessage();
+    this.hint.textContent = stop ? 'The agent is working: the square button stops it' : this.busy ? 'Enter sends it: the agent reads it at its next step' : 'Enter to send · Shift+Enter for a new line · /help';
   }
 
   setStatus(text: string): void {
@@ -277,7 +349,7 @@ export class ChatPane {
   }
 
   /** Back to the top, where the agent's current step is. */
-  private readonly toCurrent = h('button.to-current', { hidden: true, title: 'Back to the newest messages and what the agent is doing now', onclick: () => this.toTop() }, '↑ Current');
+  private readonly toCurrent = h('button.to-current', { type: 'button', hidden: true, title: 'Back to the newest messages and what the agent is doing now', onclick: () => this.toTop() }, icon('arrow-up'), h('span', 'Latest'));
 
   /** Straight to the top (the newest), following it from there. */
   private toTop(): void {
@@ -289,68 +361,110 @@ export class ChatPane {
 
   /** Where new entries go: the top of the log, or (drawing older turns) a holder of their own. */
   private sink: HTMLElement | null = null;
-  private add(entry: HTMLElement): void {
-    (this.sink ?? this.log).prepend(entry);
+
+  /**
+   * Put an entry on top: under its speaker's header when the entry on top is
+   * theirs already (a run), in a new run otherwise; an entry of no one's (a
+   * note from the app, a day) on its own.
+   */
+  private add(entry: HTMLElement, speaker: Speaker | null = null, who = ''): void {
+    const box = this.sink ?? this.log;
+    if (!speaker) {
+      box.prepend(entry);
+      return;
+    }
+    if (!this.sink) this.hero.remove();
+    let run = this.topRun(box, speaker, who);
+    if (!run) {
+      run = this.makeRun(speaker, who);
+      box.prepend(run);
+    }
+    run.lastElementChild!.prepend(entry);
+  }
+
+  /** The run on top of `box`, when it is `speaker`'s (and, for someone on the phone, the same someone). */
+  private topRun(box: HTMLElement, speaker: Speaker, who = ''): HTMLElement | null {
+    const top = box.firstElementChild;
+    return top instanceof HTMLElement && top.matches('section.run') && top.dataset.speaker === speaker && (top.dataset.who ?? '') === who ? top : null;
+  }
+
+  /** A speaker's run: their avatar and name over what they said. */
+  private makeRun(speaker: Speaker, who: string): HTMLElement {
+    const name = speaker === 'you' ? 'You' : speaker === 'agent' ? this.agentName() : who || 'Caller';
+    const avatar = h('span.avatar', { class: `avatar-${speaker}`, 'aria-hidden': 'true' });
+    const letters = speaker === 'caller' || speaker === 'texter' ? initials(who) : '';
+    avatar.append(letters ? document.createTextNode(letters) : icon(speaker === 'you' ? 'user' : speaker === 'agent' ? this.agentIcon() : speaker === 'flow' ? 'flow' : speaker === 'caller' ? 'phone' : 'message'));
+    return h(
+      'section.run',
+      { 'data-speaker': speaker, 'data-who': who },
+      h('div.run-head', avatar, h('span.run-name', { 'data-role': speaker }, name)),
+      h('div.run-body'),
+    );
+  }
+
+  /** What the agent is called in the conversation shown. */
+  private agentName(): string {
+    if (this.kind === 'call' || this.kind === 'sms') return 'Receptionist';
+    if (this.kind === 'own' && this.runner) return 'Runner';
+    return 'Agent';
+  }
+
+  /** Take an entry out, and its run with it when that leaves the run empty. */
+  private removeEntry(entry: Element): void {
+    const body = entry.parentElement;
+    entry.remove();
+    if (body?.matches('.run-body') && !body.childElementCount) body.parentElement?.remove();
   }
 
   /**
-   * The conversations to switch between: the project's chat (id null) and the
-   * text-message threads, each with its unread count and whether it is working.
-   * Hidden while the project has only its own chat.
+   * The conversations to switch between: the project's own (id null), the
+   * calls, the text-message threads and the flows' tasks, each with its unread
+   * count and whether it is working. Hidden while there is only the project's own.
    */
-  setSessions(tabs: Array<{ id: string | null; label: string; title?: string; status?: string; unread: number; working: boolean; close?: () => void }>, active: string | null, select: (id: string | null) => void): void {
-    clear(this.sessionTabs);
+  setSessions(tabs: ConversationTab[], active: string | null, select: (id: string | null) => void): void {
     this.sessionTabs.hidden = tabs.length < 2;
-    if (!tabs.length) return;
-    const current = tabs.find((t) => t.id === active) ?? tabs[0];
-    const others = tabs.filter((t) => t !== current);
-    const unread = others.reduce((n, t) => n + t.unread, 0);
-    const list = h('div.session-list', { role: 'listbox', 'aria-label': 'Conversations' });
-    const head = h(
-      'button.session-current',
-      { 'aria-haspopup': 'listbox', title: 'All the conversations: yours, the calls, the texts and the flows\' tasks', onclick: () => toggle(!this.sessionsOpen) },
-      h('span.session-label', { class: current.working ? 'working' : '' }, current.label),
-      h('span.session-more', `${others.length} other${others.length === 1 ? '' : 's'}`),
-      ...(unread ? [h('span.session-unread', { 'aria-label': `${unread} unread elsewhere` }, String(unread))] : []),
-      h('span.session-caret', { 'aria-hidden': 'true' }, '▾'),
-    );
-    const toggle = (open: boolean) => {
-      this.sessionsOpen = open;
-      list.hidden = !open;
-      head.setAttribute('aria-expanded', String(open));
-      this.sessionTabs.classList.toggle('open', open);
-    };
-    const choose = (id: string | null) => {
-      toggle(false);
-      select(id);
-    };
-    for (const tab of tabs) {
-      list.append(h(
-        'div.session-tab.session-row',
-        {
-          class: `${tab.id === active ? 'active' : ''} ${tab.working ? 'working' : ''}`,
-          role: 'option',
-          tabindex: 0,
-          title: tab.title ?? tab.label,
-          'aria-selected': String(tab.id === active),
-          onclick: () => choose(tab.id),
-          onkeydown: (e: KeyboardEvent) => {
-            if (e.key === 'Enter' || e.key === ' ') {
-              e.preventDefault();
-              choose(tab.id);
-            }
-          },
-        },
-        h('span.session-text', h('span.session-label', tab.label), ...(tab.status ? [h('small.session-status', tab.status)] : [])),
-        ...(tab.unread ? [h('span.session-unread', { 'aria-label': `${tab.unread} unread` }, String(tab.unread))] : []),
-        ...(tab.close
-          ? [h('span.session-close', { role: 'button', title: 'Remove this conversation', 'aria-label': 'Remove this conversation', onclick: (e: Event) => { e.stopPropagation(); tab.close!(); } }, '×')]
-          : []),
-      ));
+    this.sessionPicker.set(tabs, active, select);
+    const shown = tabs.find((t) => t.id === active) ?? tabs[0];
+    const own = tabs.find((t) => t.id === null);
+    const runner = !!own && tabKind(own) === 'runner';
+    if (runner !== this.runner) {
+      this.runner = runner;
+      this.applyNames();
+      if (this.hero.isConnected) this.drawHero();
+      if (!this.busy) this.input.placeholder = this.placeholder();
     }
-    this.sessionTabs.append(head, list);
-    this.closeSessions = () => toggle(false);
-    toggle(this.sessionsOpen);
+    this.showLive(!!shown?.live, shown ? tabName(shown) : '');
+  }
+
+  /** Name the agent's runs as the conversation calls it (the runner's is known only once the conversations are listed). */
+  private applyNames(): void {
+    for (const el of this.log.querySelectorAll<HTMLElement>('.run-name[data-role="agent"]')) el.textContent = this.agentName();
+    for (const el of this.log.querySelectorAll<HTMLElement>('.avatar-agent')) el.replaceChildren(icon(this.agentIcon()));
+  }
+
+  /** The agent's avatar: the runner's compass, or a spark. */
+  private agentIcon(): string {
+    return this.runner && this.kind === 'own' ? 'compass' : 'sparkle';
+  }
+
+  /** The strip over a call going on now: a pulsing dot, who, and how long. */
+  private showLive(live: boolean, name: string): void {
+    if (live !== this.live && !this.busy) {
+      this.live = live;
+      this.input.placeholder = this.placeholder();
+    }
+    this.live = live;
+    this.liveBar.hidden = !live;
+    if (this.liveTimer) clearInterval(this.liveTimer);
+    this.liveTimer = null;
+    if (!live) return;
+    const tick = () => {
+      clear(this.liveBar);
+      const time = this.callStartAt ? clock(Date.now() - this.callStartAt) : '';
+      this.liveBar.append(h('span.live-dot', { 'aria-hidden': 'true' }), h('span.live-label', 'Live call'), h('span.live-name', this.callName !== 'Caller' ? this.callName : name), h('span.live-time', { title: 'How long the call has run' }, time));
+    };
+    tick();
+    this.liveTimer = setInterval(tick, 1000);
   }
 
   /** How full the context is: `used` tokens of `window`. */
@@ -366,7 +480,7 @@ export class ChatPane {
   private summaryNote(text: string, heading: string): void {
     this.current = null;
     const body = text.replace(/^\[(?:OAIY|bot\.computer)\][^\n]*\n(<project>[\s\S]*?<\/project>\n\n)?/, '');
-    this.add(h('details.msg.compacted', h('summary', h('span', '⇣'), h('span', ` ${heading}`)), h('pre', body)));
+    this.add(h('details.msg.compacted', h('summary', icon('layers'), h('span', heading)), h('pre', body)));
     this.scroll();
   }
 
@@ -391,16 +505,17 @@ export class ChatPane {
     this.planBox.classList.toggle('collapsed', !open);
     const head = h(
       'button.plan-head',
-      { title: open ? 'Hide the steps' : 'Show the steps', 'aria-expanded': String(open), onclick: () => {
+      { type: 'button', title: open ? 'Hide the steps' : 'Show the steps', 'aria-expanded': String(open), onclick: () => {
         this.planOpen = !open;
         this.showPlan(plan, running);
       } },
       h('span.plan-title', finished ? '✓ Done' : running ? 'Working on' : 'Plan'),
       h('span.plan-goal', plan.goal || plan.items.find((i) => i.status === 'active')?.text || ''),
       h('span.plan-count', `${done}/${total}`),
+      icon('chevron-down', 'plan-caret'),
     );
     const bar = h('div.plan-bar', h('span', { style: `width:${Math.round((done / total) * 100)}%` }));
-    const toggle = (label: string, title: string) => h('li.plan-fold', h('button', { title, onclick: () => {
+    const toggle = (label: string, title: string) => h('li.plan-fold', h('button', { type: 'button', title, onclick: () => {
       this.planAll = !this.planAll;
       this.showPlan(plan, running);
     } }, label));
@@ -445,9 +560,9 @@ export class ChatPane {
     const fresh = !before || (!!after.goal && !!before.goal && after.goal !== before.goal);
     const { done, started } = planChanges(before, after);
     const n = after.items.length;
-    const mark = (cls: string, icon: string, text: string) => {
+    const mark = (cls: string, glyph: string, text: string) => {
       this.current = null;
-      this.add(h(`div.msg.step${cls}`, h('span.step-icon', icon), h('span.step-text', text)));
+      this.add(h(`div.msg.step${cls}`, h('span.step-icon', glyph), h('span.step-text', { title: text }, text)), 'agent');
     };
     if (fresh) mark('.plan-made', '☰', `Plan: ${after.goal || `${n} steps`}${after.goal ? ` (${n} steps)` : ''}`);
     else if (after.items.map((i) => i.text).join('\n') !== before.items.map((i) => i.text).join('\n')) mark('.plan-changed', '✎', `Plan changed: now ${n} steps`);
@@ -468,11 +583,73 @@ export class ChatPane {
     this.showPlan(null);
     for (const m of this.media.splice(0)) m.dispose();
     clear(this.log);
+    // What the agent is doing now shows at the top of the log, where its reply comes (styles.css puts it first).
+    this.log.append(this.status);
     this.older.remove();
     this.stick = true;
     this.cards.clear();
     this.current = null;
     this.thinking = null;
+    this.updateEmpty();
+  }
+
+  /** The empty conversation's welcome: what it is for, and a few things to ask (they fill the box; nothing is sent). */
+  private updateEmpty(): void {
+    if (this.log.querySelector('section.run, details.tool, .msg.user')) {
+      this.hero.remove();
+      return;
+    }
+    this.drawHero();
+    if (!this.hero.isConnected) this.log.append(this.hero);
+  }
+
+  private drawHero(): void {
+    clear(this.hero);
+    if (this.kind !== 'own') {
+      const [glyph, words] = this.kind === 'call' ? ['phone', 'No words on this call yet.'] : this.kind === 'sms' ? ['message', 'No texts in this thread yet.'] : ['flow', 'No tasks from this flow yet.'];
+      this.hero.className = 'chat-empty quiet';
+      this.hero.append(h('span.chat-empty-icon', icon(glyph)), h('p', words));
+      return;
+    }
+    const s = SUGGESTIONS[this.runner ? 'runner' : 'project'];
+    this.hero.className = 'chat-empty';
+    this.hero.append(
+      h('span.chat-empty-icon', icon(this.runner ? 'compass' : 'sparkle')),
+      h('h2', s.title),
+      h('p', s.text),
+      h('div.chat-suggestions', { role: 'group', 'aria-label': 'Suggestions' }, ...s.ideas.map((idea) => h('button.suggestion', { type: 'button', title: 'Put this in the message box (it is not sent until you send it)', onclick: () => this.suggest(idea) }, idea))),
+    );
+  }
+
+  /** A suggestion goes into the message box, to change or send. */
+  private suggest(text: string): void {
+    this.input.value = text;
+    this.grow();
+    this.updateSend();
+    this.input.focus();
+    this.input.setSelectionRange(text.length, text.length);
+  }
+
+  private async copyCode(button: HTMLElement): Promise<void> {
+    const code = button.closest('.code-block')?.querySelector('pre')?.textContent ?? '';
+    let ok = false;
+    try {
+      await navigator.clipboard.writeText(code);
+      ok = true;
+    } catch {
+      // No clipboard access: copy what is selected the old way.
+      const area = h('textarea', { style: 'position:fixed;opacity:0' }, code) as HTMLTextAreaElement;
+      document.body.append(area);
+      area.select();
+      ok = document.execCommand('copy');
+      area.remove();
+    }
+    button.textContent = ok ? 'Copied' : 'Copy failed';
+    button.classList.toggle('copied', ok);
+    setTimeout(() => {
+      button.textContent = 'Copy';
+      button.classList.remove('copied');
+    }, 1600);
   }
 
   /**
@@ -493,8 +670,8 @@ export class ChatPane {
       }
       return media.element;
     }
-    const icon = app || /\.softn$/i.test(name) ? '📦' : mediaKind(path) === 'image' ? '🖼' : '📄';
-    return h('button.attachment', { title: app ? `Unpacked into ${app}/: click to preview it` : `${path}: click to open`, onclick: open }, h('span.file-icon', icon), h('span.attachment-name', name));
+    const glyph = app || /\.softn$/i.test(name) ? 'package' : mediaKind(path) === 'image' ? 'image' : 'file';
+    return h('button.attachment', { type: 'button', title: app ? `Unpacked into ${app}/: click to preview it` : `${path}: click to open`, onclick: open }, h('span.file-icon', icon(glyph)), h('span.attachment-name', name));
   }
 
   /**
@@ -563,7 +740,7 @@ export class ChatPane {
    * below them (it began first), not split around them.
    */
   heard(text: string): void {
-    this.add(h('div.msg.user', h('div.msg-body', text || ' ')));
+    this.words(text, []);
     if (!this.sink) this.toTop();
   }
 
@@ -576,34 +753,92 @@ export class ChatPane {
   /** The person's message: a new request, or (`during`) one sent while the agent works, which keeps its plan. */
   user(text: string, attachments: Attachment[] = [], during = false, note = 'sent while the agent works: it reads it at its next step'): void {
     this.current = null;
-    // Sending a message goes back to the top, where the reply comes.
-    if (during) {
-      const box = h('div.msg.user.during', h('div.msg-body', text || ' '), h('div.msg-note', note));
-      if (attachments.length) box.append(h('div.msg-attachments', ...attachments.map((a) => this.fileView(a.path, a.name, a.app))));
-      this.add(box);
-      if (!this.sink) this.toTop();
-      return;
+    if (!during) {
+      // A new request gets its own plan.
+      this.currentPlan = null;
+      this.planOpen = null;
+      this.showPlan(null);
     }
-    // A new request gets its own plan.
-    this.currentPlan = null;
-    this.planOpen = null;
-    this.showPlan(null);
-    const box = h('div.msg.user', h('div.msg-body', text || (attachments.length ? '' : ' ')));
-    if (attachments.length) box.append(h('div.msg-attachments', ...attachments.map((a) => this.fileView(a.path, a.name, a.app))));
-    this.add(box);
+    this.words(text, attachments, during, note);
+    // Sending a message goes back to the top, where the reply comes.
     if (!this.sink) this.toTop();
+  }
+
+  /**
+   * A message's words, each part under who said it: on a call, the caller's
+   * lines (with when, and how they fell against the agent's speech); in a text
+   * thread, each text; a flow's task; notes from OAIY; and the person's own.
+   */
+  private words(text: string, attachments: Attachment[], during = false, note = ''): void {
+    let parts: Part[];
+    if (this.kind === 'call') parts = parseCallTurn(text);
+    else if (this.kind === 'sms') parts = /^\[OAIY\] /.test(text) ? [{ kind: 'note', text: text.replace(/^\[OAIY\]\s*/, '') }] : parseTextTurn(text);
+    else if (this.kind === 'task') parts = [parseFlowAsk(text) ?? (/^\[OAIY\] /.test(text) ? { kind: 'note', text: text.replace(/^\[OAIY\]\s*/, '') } : { kind: 'plain', text })];
+    else parts = [{ kind: 'plain', text }];
+    let own = false;
+    for (const part of parts) {
+      switch (part.kind) {
+        case 'caller': {
+          // A live call: the caller's time tells when the call began (the note that began it says only its minute).
+          if (!this.replaying && part.atMs !== undefined) this.callStartAt = Date.now() - part.atMs;
+          const tags: HTMLElement[] = [];
+          const said = part.during ? `, as the agent said "${part.during}"` : '';
+          if (part.backchannel) tags.push(h('span.msg-tag.backchannel', { title: `An acknowledgement said over the agent${said}: it talked on` }, 'backchannel'));
+          else if (part.cut) tags.push(h('span.msg-tag.cut', { title: `Cut the agent off${said}` }, 'cut in'));
+          else if (part.over) tags.push(h('span.msg-tag.over', { title: `Said over the agent${said}` }, 'talked over'));
+          const meta = [...(part.atMs !== undefined ? [h('span.msg-time', { title: 'Into the call' }, clock(part.atMs))] : []), ...tags];
+          const bubble = h('div.msg.incoming.caller', { class: part.backchannel ? 'backchannel' : '' }, h('div.msg-body', part.text || ' '), ...(meta.length ? [h('div.msg-meta', ...meta)] : []));
+          this.add(bubble, 'caller', this.callName);
+          break;
+        }
+        case 'text':
+          this.add(h('div.msg.incoming.texter', h('div.msg-body', part.text || ' ')), 'texter', part.name ?? formatNumber(part.number));
+          break;
+        case 'flow':
+          this.add(h('div.msg.incoming.flow-ask', h('div.msg-body', part.text || ' ')), 'flow', part.flow);
+          break;
+        case 'note':
+          this.note(part.text);
+          break;
+        case 'plain':
+          own = true;
+          this.ownBubble(part.text, attachments, during, note);
+          break;
+      }
+    }
+    if (!own && (attachments.length || !parts.length)) this.ownBubble(text && parts.length ? '' : text, attachments, during, note);
+  }
+
+  /** The person's own words, and what they attached. */
+  private ownBubble(text: string, attachments: Attachment[], during: boolean, note: string): void {
+    const box = h('div.msg.user', { class: during ? 'during' : '' }, h('div.msg-body', text || (attachments.length ? '' : ' ')));
+    if (!text && attachments.length) box.classList.add('only-files');
+    if (during) box.append(h('div.msg-note', note));
+    if (attachments.length) box.append(h('div.msg-attachments', ...attachments.map((a) => this.fileView(a.path, a.name, a.app))));
+    this.add(box, 'you');
+  }
+
+  /** A note from OAIY in a conversation (a lookup's answer, the runner's direction): quiet, and set apart. */
+  private note(text: string): void {
+    this.current = null;
+    const [first, ...rest] = text.split('\n');
+    this.add(rest.length
+      ? h('details.msg.oaiy-note', h('summary', icon('info'), h('span', first)), h('pre', rest.join('\n')))
+      : h('div.msg.oaiy-note', icon('info'), h('span', first)));
   }
 
   /** The model's thinking stays shown once the reply moves on: it says why the model did what it did. */
   private doneThinking(): void {
-    if (this.thinking) this.thinking.box.querySelector('summary')!.textContent = '💭 What the model thought';
+    const label = this.thinking?.box.querySelector('.thinking-label');
+    if (label) label.textContent = 'What the model thought';
+    this.thinking?.box.classList.remove('streaming');
     this.thinking = null;
   }
 
   /** A box with the model's thinking, open to read. */
   private thoughtBox(text: string, streaming = false): HTMLElement {
-    const box = h('details.thinking', { open: true }, h('summary', streaming ? '💭 The model is thinking…' : '💭 What the model thought'), h('pre', text));
-    this.add(box);
+    const box = h('details.thinking', { open: true, class: streaming ? 'streaming' : '' }, h('summary', icon('sparkle'), h('span.thinking-label', streaming ? 'Thinking…' : 'What the model thought')), h('pre', text));
+    this.add(box, 'agent');
     return box;
   }
 
@@ -612,11 +847,16 @@ export class ChatPane {
     this.current = null;
     const chars = e.system.length + e.turns.reduce((n, t) => n + (t.role === 'user' ? t.text.length : t.role === 'assistant' ? t.text.length + JSON.stringify(t.calls).length : t.results.reduce((m, r) => m + r.content.length, 0)), 0);
     const pre = h('pre');
-    const box = h('details.prompt-view', h('summary', `📝 The prompt the model was sent: ${e.turns.length} message${e.turns.length === 1 ? '' : 's'}, about ${formatTokens(Math.round(chars / 4))} tokens (click to read)`), pre);
+    const box = h(
+      'details.prompt-view',
+      { title: 'What the model was sent for this step (click to read it)' },
+      h('summary', icon('file-text'), h('span', `Prompt · ${e.turns.length} message${e.turns.length === 1 ? '' : 's'} · about ${formatTokens(Math.round(chars / 4))} tokens`)),
+      pre,
+    );
     box.addEventListener('toggle', () => {
       if ((box as HTMLDetailsElement).open && !pre.textContent) pre.textContent = promptText(e);
     });
-    this.add(box);
+    this.add(box, 'agent');
     this.scroll();
   }
 
@@ -629,12 +869,12 @@ export class ChatPane {
     // OAIY sends the finished call as JSON too: the raw draft already shows it.
     if (json && this.draft && !this.draft.json) return;
     if (!this.draft || start) {
-      this.draft?.box.remove();
+      if (this.draft) this.removeEntry(this.draft.box);
       this.current = null;
       const body = h('pre.tool-result.draft-body');
-      const box = h('details.tool.draft', { open: true }, h('summary', h('span.tool-name', 'writing…')), body);
+      const box = h('details.tool.draft', { open: true }, h('summary.tool-row', h('span.tool-status', { 'aria-hidden': 'true' }), icon('pencil', 'tool-icon'), h('span.tool-name', 'Writing a tool call…')), body);
       box.classList.add('pending');
-      this.add(box);
+      this.add(box, 'agent');
       this.draft = { box, body, raw: '', json };
     }
     this.draft.raw += text;
@@ -642,7 +882,7 @@ export class ChatPane {
     this.redraw(draft.box, () => {
       const raw = draft.raw;
       const name = draft.json ? '' : /<function=([\w.-]+)>/.exec(raw)?.[1] ?? '';
-      if (name) draft.box.querySelector('.tool-name')!.textContent = `writing ${name}…`;
+      if (name) draft.box.querySelector('.tool-name')!.textContent = `Writing ${toolLabel(name).toLowerCase()}…`;
       draft.body.textContent = draft.json
         ? raw.replace(/\\n/g, '\n').replace(/\\"/g, '"').replace(/\\t/g, '\t')
         : raw
@@ -655,10 +895,11 @@ export class ChatPane {
     });
   }
 
-  /** A message from the app itself (commands, errors, notices). */
+  /** A message from the app itself (commands, errors, notices): a short one as a quiet line, a long one as a card. */
   system(text: string, kind: 'info' | 'error' = 'info'): void {
     this.current = null;
-    this.add(h('div.msg.system', { class: kind }, h('pre', text)));
+    const short = !text.includes('\n') && text.length <= 110;
+    this.add(h('div.msg.system', { class: `${kind} ${short ? 'line' : 'card'}${text.includes('\n') ? ' lines' : ''}` }, icon(kind === 'error' ? 'alert' : 'info'), h('pre', text)));
     this.scroll();
   }
 
@@ -682,7 +923,7 @@ export class ChatPane {
     if (!this.current) {
       const body = h('div.msg-body');
       const box = h('div.msg.assistant', body);
-      this.add(box);
+      this.add(box, 'agent');
       this.current = { box, text: '', body };
     }
     this.current.text += delta;
@@ -691,6 +932,154 @@ export class ChatPane {
     this.redraw(target.box, () => {
       target.body.innerHTML = renderMarkdown(target.text);
     });
+  }
+
+  /** A tool call's row: what it did in plain words, on what, and (opened) its arguments and result. */
+  private toolRow(call: ToolCall, extra = ''): HTMLDetailsElement {
+    const prompt = mediaPrompt(call);
+    const args = h('div.tool-args');
+    const card = h(
+      'details.tool',
+      { class: extra, 'data-tool': call.name },
+      h(
+        'summary.tool-row',
+        { title: `${call.name}${summarizeCall(call) ? `: ${summarizeCall(call)}` : ''}` },
+        h('span.tool-status', { role: 'img', 'aria-label': 'running' }),
+        icon(toolIcon(call.name), 'tool-icon'),
+        h('span.tool-name', toolLabel(call.name)),
+        h('span.tool-arg', summarizeCall(call)),
+        h('span.tool-time'),
+        ...(prompt ? [h('span.tool-prompt', { title: prompt }, prompt)] : []),
+      ),
+      h(
+        'div.tool-detail',
+        h('div.tool-section', h('div.tool-section-head', h('span', 'Input'), h('code.tool-raw', call.name)), args),
+        h('div.tool-section.tool-output', h('div.tool-section-head', h('span', 'Result')), h('pre.tool-result', 'running…')),
+      ),
+    ) as HTMLDetailsElement;
+    // The arguments (a whole file, sometimes) are laid out when the row is first opened.
+    card.addEventListener('toggle', () => {
+      if (!card.open || args.childElementCount) return;
+      const lines = argLines(call.input);
+      if (!lines.length) args.append(h('span.tool-empty', 'No arguments'));
+      for (const { key, value, block } of lines) {
+        const { text, more } = clip(value, 40, 4000);
+        const shown = block ? h('pre.tool-arg-value', text) : h('span.tool-arg-value', text);
+        const row = h('div.tool-arg-row', { class: block ? 'block' : '' }, h('span.tool-arg-key', key), shown);
+        if (more > 0) row.append(h('button.tool-more', { type: 'button', onclick: (e: Event) => {
+          shown.textContent = value;
+          (e.currentTarget as HTMLElement).remove();
+        } }, `Show all (${more.toLocaleString()} more characters)`));
+        args.append(row);
+      }
+    });
+    if (!this.replaying) card.dataset.started = String(performance.now());
+    card.classList.add('pending');
+    return card;
+  }
+
+  /** A tool's result in its row: laid out, cut to a readable length with the rest a click away. */
+  private setResult(card: HTMLElement, content: string): void {
+    const pre = card.querySelector('.tool-result');
+    if (!pre) return;
+    const full = prettyResult(content);
+    const { text, more } = clip(full);
+    pre.textContent = text || '(nothing)';
+    pre.parentElement?.querySelector(':scope > .tool-more')?.remove();
+    if (more > 0) pre.after(h('button.tool-more', { type: 'button', onclick: (e: Event) => {
+      pre.textContent = full;
+      (e.currentTarget as HTMLElement).remove();
+    } }, `Show all (${more.toLocaleString()} more characters)`));
+  }
+
+  /** A row's state: running, done or failed (and how long it took, when it ran here). */
+  private settle(card: HTMLElement, failed: boolean): void {
+    card.classList.remove('pending');
+    card.classList.add(failed ? 'failed' : 'ok');
+    card.querySelector('.tool-status')?.setAttribute('aria-label', failed ? 'failed' : 'done');
+    const started = Number(card.dataset.started);
+    const time = card.querySelector('.tool-time');
+    if (started && time) time.textContent = duration(performance.now() - started);
+    const group = card.closest<HTMLElement>('details.tool-group');
+    if (group) this.updateGroup(group);
+  }
+
+  /** Whether a row folds in with the calls around it (the sub-agents', checks, drafts and texts stand alone). */
+  private groupable(el: Element): boolean {
+    return el.matches('details.tool') && !el.matches('.delegate, .auto, .draft, .sms-out');
+  }
+
+  /**
+   * A tool's row, on top: folded in with the calls just before it ("Used 3
+   * tools"), the prompts sent for those steps with them, or on its own when it
+   * is the first.
+   */
+  private addTool(card: HTMLElement): void {
+    const box = this.sink ?? this.log;
+    const run = this.topRun(box, 'agent');
+    const body = run?.lastElementChild as HTMLElement | undefined;
+    if (!body) {
+      this.add(card, 'agent');
+      return;
+    }
+    const prompts: HTMLElement[] = [];
+    let below = body.firstElementChild as HTMLElement | null;
+    while (below?.matches('.prompt-view')) {
+      prompts.push(below);
+      below = below.nextElementSibling as HTMLElement | null;
+    }
+    let group: HTMLElement | null = null;
+    if (below?.matches('details.tool-group')) group = below;
+    else if (below && this.groupable(below)) {
+      group = this.toolGroup();
+      below.before(group);
+      // The lone row, and the prompt sent for its step, go into the group.
+      const older = below.nextElementSibling;
+      group.lastElementChild!.append(below, ...(older?.matches('.prompt-view') ? [older] : []));
+    }
+    if (!group) {
+      this.add(card, 'agent');
+      return;
+    }
+    const list = group.lastElementChild!;
+    list.prepend(...prompts);
+    list.prepend(card);
+    body.prepend(group);
+    this.updateGroup(group);
+  }
+
+  private toolGroup(): HTMLElement {
+    return h(
+      'details.tool-group',
+      h('summary.tool-group-head', h('span.tool-status', { role: 'img', 'aria-label': 'running' }), icon('layers', 'tool-icon'), h('span.tool-group-title'), h('span.tool-group-names')),
+      h('div.tool-group-list'),
+    );
+  }
+
+  /** A group's line: how many tools, which, and whether one is running or failed. */
+  private updateGroup(group: HTMLElement): void {
+    const cards = [...group.lastElementChild!.children].filter((c): c is HTMLElement => c.matches('details.tool'));
+    const running = cards.find((c) => c.classList.contains('pending'));
+    const failed = cards.filter((c) => c.classList.contains('failed')).length;
+    group.classList.toggle('pending', !!running);
+    group.classList.toggle('failed', !running && failed > 0);
+    group.classList.toggle('ok', !running && !failed);
+    group.querySelector('.tool-status')?.setAttribute('aria-label', running ? 'running' : failed ? `${failed} failed` : 'done');
+    const title = group.querySelector('.tool-group-title')!;
+    const names = group.querySelector('.tool-group-names')!;
+    if (running) {
+      title.textContent = `Using ${cards.length} tools`;
+      names.textContent = `${running.querySelector('.tool-name')?.textContent ?? ''} ${running.querySelector('.tool-arg')?.textContent ?? ''}`.trim();
+    } else {
+      title.textContent = `Used ${cards.length} tools`;
+      const labels = [...new Set(cards.slice().reverse().map((c) => c.querySelector('.tool-name')?.textContent ?? ''))].filter(Boolean);
+      names.textContent = `${labels.slice(0, 3).join(' · ')}${labels.length > 3 ? ` · +${labels.length - 3}` : ''}${failed ? ` · ${failed} failed` : ''}`;
+    }
+  }
+
+  /** What a row sits in: its group, when it is in one (what is shown beside it goes beside the group, where it is seen). */
+  private anchorOf(card: HTMLElement): HTMLElement {
+    return card.closest<HTMLElement>('details.tool-group') ?? card;
   }
 
   private toolCard(call: ToolCall): void {
@@ -702,16 +1091,20 @@ export class ChatPane {
       this.delegateCard(call);
       return;
     }
-    const result = h('pre.tool-result', 'running…');
-    const card = h(
-      'details.tool',
-      h('summary', h('span.tool-name', call.name), ' ', h('span.tool-arg', summarizeCall(call)), ...(mediaPrompt(call) ? [h('span.tool-prompt', { title: mediaPrompt(call) }, mediaPrompt(call))] : [])),
-      h('pre.tool-input', JSON.stringify(call.input, null, 2)),
-      result,
-    );
-    card.classList.add('pending');
+    // A text the agent sends in a text thread reads as a text.
+    if (call.name === 'send_text_message' && this.kind === 'sms') {
+      const card = this.toolRow(call, 'sms-out');
+      const summary = card.querySelector('summary')!;
+      clear(summary);
+      summary.append(h('span.sms-body', typeof call.input.body === 'string' ? call.input.body : ''), h('span.sms-state', h('span.tool-status', { role: 'img', 'aria-label': 'sending' }), h('span.sms-state-text', 'Sending…')));
+      this.cards.set(call.id, card);
+      this.add(card, 'agent');
+      this.scroll();
+      return;
+    }
+    const card = this.toolRow(call);
     this.cards.set(call.id, card);
-    this.add(card);
+    this.addTool(card);
     this.scroll();
   }
 
@@ -726,15 +1119,15 @@ export class ChatPane {
     const list = h('ol.agent-tasks');
     const card = h(
       'details.tool.delegate',
-      { open: true },
-      h('summary', h('span.tool-name', 'agents'), ' ', h('span.tool-arg', `${tasks.length} task${tasks.length === 1 ? '' : 's'} for sub-agents`)),
+      { open: true, 'data-tool': 'delegate' },
+      h('summary.tool-row', h('span.tool-status', { role: 'img', 'aria-label': 'running' }), icon('users', 'tool-icon'), h('span.tool-name', 'Sub-agents'), h('span.tool-arg', `${tasks.length} task${tasks.length === 1 ? '' : 's'}`)),
       list,
       h('pre.tool-result', 'waiting for the tasks…'),
     );
     card.classList.add('pending');
     tasks.forEach((task, i) => this.taskRow(`${call.id}#${i}`, task.title, list));
     this.cards.set(call.id, card);
-    this.add(card);
+    this.add(card, 'agent');
     this.scroll();
   }
 
@@ -747,13 +1140,14 @@ export class ChatPane {
     const row = h('li.agent-task.queued', h('div.task-head', h('span.task-mark'), h('span.task-title', title), state), activity, h('details.task-more', h('summary', 'report'), report));
     const card = this.cards.get(id.split('#')[0]);
     let target = list ?? card?.querySelector('.agent-tasks');
-    // A sub-agent under another tool's card (the review of a picture): a list of its own just below the card, seen without opening it.
+    // A sub-agent under another tool's row (the review of a picture): a list of its own just above the row (or its group), seen without opening it.
     if (!target && card) {
-      const next = card.previousElementSibling;
+      const anchor = this.anchorOf(card);
+      const next = anchor.previousElementSibling;
       target = next instanceof HTMLElement && next.matches('ol.agent-tasks.under') ? next : null;
       if (!target) {
         target = h('ol.agent-tasks.under');
-        card.before(target);
+        anchor.before(target);
       }
     }
     target?.append(row);
@@ -774,25 +1168,29 @@ export class ChatPane {
     if (e.state === 'running') this.setStatus(`sub-agent: ${e.title}: ${e.activity ?? ''}`);
   }
 
-  /** The automatic check after the agent changed an app: a card like a tool's. */
+  /** The automatic check after the agent changed an app: a row like a tool's. */
   private checkCard(e: Extract<AgentEvent, { type: 'check' }>): void {
     if (e.state === 'running') {
       this.current = null;
       this.thinking = null;
       this.setStatus(`checking ${e.root || 'the app'}…`);
-      const card = h('details.tool.auto', h('summary', h('span.tool-name', 'automatic check'), ' ', h('span.tool-arg', e.root ? `${e.root}/` : '/')), h('pre.tool-result', 'checking the files and rendering the app…'));
+      const card = h(
+        'details.tool.auto',
+        { 'data-tool': 'check' },
+        h('summary.tool-row', h('span.tool-status', { role: 'img', 'aria-label': 'running' }), icon('app', 'tool-icon'), h('span.tool-name', 'Automatic check'), h('span.tool-arg', e.root ? `${e.root}/` : '/'), h('span.tool-time')),
+        h('div.tool-detail', h('div.tool-section.tool-output', h('pre.tool-result', 'checking the files and rendering the app…'))),
+      );
       card.classList.add('pending');
+      if (!this.replaying) card.dataset.started = String(performance.now());
       this.cards.set(e.id, card);
-      this.add(card);
+      this.add(card, 'agent');
       this.scroll();
       return;
     }
     const card = this.cards.get(e.id);
     if (!card) return;
-    card.classList.remove('pending');
-    card.classList.add(e.state === 'ok' ? 'ok' : 'failed');
-    const pre = card.querySelector('.tool-result');
-    if (pre) pre.textContent = e.text ?? '';
+    this.settle(card, e.state !== 'ok');
+    this.setResult(card, e.text ?? '');
     // A failed check is worth seeing without a click: the agent fixes it next.
     if (e.state === 'failed') (card as HTMLDetailsElement).open = true;
     this.scroll();
@@ -801,10 +1199,13 @@ export class ChatPane {
   private toolResult(result: ToolResult): void {
     const card = this.cards.get(result.id);
     if (!card) return;
-    card.classList.remove('pending');
-    card.classList.add(result.isError ? 'failed' : 'ok');
-    const pre = card.querySelector('.tool-result');
-    if (pre) pre.textContent = result.content;
+    this.settle(card, result.isError);
+    this.setResult(card, result.content);
+    if (card.classList.contains('sms-out')) {
+      const test = /^Not sent \(a test conversation\)/.test(result.content);
+      card.querySelector('.sms-state-text')!.textContent = result.isError ? 'Not sent' : test ? 'Shown, not sent (a test)' : 'Sent';
+      card.querySelector('.sms-state .tool-status')?.setAttribute('aria-label', result.isError ? 'not sent' : 'sent');
+    }
     // A delegate card replayed from a saved chat: its tasks' outcomes come from the report.
     if (result.name === 'delegate') {
       for (const m of result.content.matchAll(/### Task (\d+): .*? \((done|not finished)\)\n([\s\S]*?)(?=\n\n### Task |\n\nApps still failing|\n\nCheck the results|$)/g)) {
@@ -818,14 +1219,15 @@ export class ChatPane {
       const arg = card.querySelector('summary .tool-arg');
       if (arg) arg.textContent = result.content.split('\n')[0];
     }
+    const output = card.querySelector('.tool-output') ?? card;
     for (const image of result.images ?? []) {
-      card.append(h('img.tool-image', { src: `data:${image.mediaType};base64,${image.data}`, alt: image.label ?? 'image shown to the model' }));
+      output.append(h('img.tool-image', { src: `data:${image.mediaType};base64,${image.data}`, alt: image.label ?? 'image shown to the model' }));
     }
-    // A file the agent hands over is shown outside the (collapsed) card.
+    // A file the agent hands over is shown outside the (folded) row.
     if (result.files?.length) {
       // Pictures the agent made can be flagged; files it only shows (uploads, extracted frames) cannot.
       const shown = h('div.msg.presented', ...result.files.map((path) => this.fileView(path, undefined, undefined, result.name === 'generate_image')));
-      card.before(shown);
+      this.anchorOf(card).before(shown);
     }
     this.scroll();
   }
@@ -864,7 +1266,7 @@ export class ChatPane {
         break;
       case 'tool_call':
         this.doneThinking();
-        this.draft?.box.remove();
+        if (this.draft) this.removeEntry(this.draft.box);
         this.draft = null;
         this.setStatus(`running ${e.call.name}…`);
         if (e.call.name !== 'update_plan') this.setActivity(`${e.call.name} ${summarizeCall(e.call)}`.trim());
@@ -900,15 +1302,15 @@ export class ChatPane {
       case 'compact':
         this.current = null;
         this.add(
-          h('div.msg.nudge.compacted', h('span', '⇣'), h('span', e.how === 'summary'
-            ? ` Context compacted: ${e.turns} earlier turns summarized for the model (${formatTokens(e.before)} → ${formatTokens(e.after)} tokens). The chat keeps everything.`
-            : ` Context compacted: the model could not write a summary, so ${e.turns} earlier turns were reduced to their requests and changes (${formatTokens(e.before)} → ${formatTokens(e.after)} tokens).`)),
+          h('div.msg.nudge.compacted', icon('layers'), h('span', e.how === 'summary'
+            ? `Context compacted: ${e.turns} earlier turns summarized for the model (${formatTokens(e.before)} → ${formatTokens(e.after)} tokens). The chat keeps everything.`
+            : `Context compacted: the model could not write a summary, so ${e.turns} earlier turns were reduced to their requests and changes (${formatTokens(e.before)} → ${formatTokens(e.after)} tokens).`)),
         );
         this.scroll();
         break;
       case 'nudge':
         this.current = null;
-        this.add(h('div.msg.nudge', h('span', '↻'), h('span', ` Not finished yet, so the agent carries on: ${e.message}`)));
+        this.add(h('div.msg.nudge', icon('refresh'), h('span', `Not finished yet, so the agent carries on: ${e.message}`)), 'agent');
         this.scroll();
         break;
       case 'done':
@@ -924,7 +1326,7 @@ export class ChatPane {
   /** Turns of a long saved conversation not drawn yet: drawn as the person scrolls down to them. */
   private hiddenTurns: Turn[] = [];
   /** The end of the log while older turns are left: scrolling near it draws them. */
-  private readonly older = h('button.show-earlier', { onclick: () => this.loadOlder() });
+  private readonly older = h('button.show-earlier', { type: 'button', onclick: () => this.loadOlder() });
 
   /**
    * Show a saved conversation, newest first. A long one opens at its latest
@@ -932,6 +1334,18 @@ export class ChatPane {
    * down to them: drawing hundreds of tool cards at once is slow.
    */
   replay(turns: Turn[], latest = REPLAY_PAGE): void {
+    // What the conversation is, from its words (the list of conversations says it only after).
+    this.kind = conversationKind(turns);
+    this.callName = 'Caller';
+    this.callStartAt = null;
+    for (const t of turns) {
+      const start = t.role === 'user' && t.automatic ? parseCallStart(t.text) : null;
+      if (start) {
+        this.callName = start.name;
+        this.callStartAt = start.at?.getTime() ?? null;
+      }
+    }
+    if (!this.busy) this.input.placeholder = this.placeholder();
     this.clearLog();
     const from = pageStart(turns, latest);
     this.hiddenTurns = turns.slice(0, from);
@@ -939,6 +1353,7 @@ export class ChatPane {
     this.currentPlan = planAfter(this.hiddenTurns);
     this.drawTurns(turns.slice(from));
     this.showOlder();
+    this.updateEmpty();
     this.log.scrollTop = 0;
   }
 
@@ -948,7 +1363,7 @@ export class ChatPane {
       this.older.remove();
       return;
     }
-    this.older.textContent = `↓ ${this.hiddenTurns.length} older turns: scroll down, or click, to show them`;
+    this.older.textContent = `${this.hiddenTurns.length} older turns: scroll down, or click, to show them`;
     this.log.append(this.older);
     // A short page does not fill the log: nothing to scroll, so draw on.
     requestAnimationFrame(() => this.maybeLoadOlder());
@@ -964,60 +1379,96 @@ export class ChatPane {
     const from = pageStart(this.hiddenTurns, REPLAY_PAGE);
     const page = this.hiddenTurns.slice(from);
     this.hiddenTurns = this.hiddenTurns.slice(0, from);
-    const live = { current: this.current, thinking: this.thinking, draft: this.draft, plan: this.currentPlan, planOpen: this.planOpen };
+    const live = { current: this.current, thinking: this.thinking, draft: this.draft, plan: this.currentPlan, planOpen: this.planOpen, callName: this.callName };
     // The page's marks follow the plan as it was then, not as it is now.
     this.currentPlan = planAfter(this.hiddenTurns);
     this.sink = h('div');
     try {
       this.drawTurns(page, false);
     } finally {
+      // Where the pages meet, one speaker's run goes on under the header it has.
+      let last = this.older.previousElementSibling;
+      while (last && (last === this.status || last === this.hero)) last = last.previousElementSibling;
+      const first = this.sink.firstElementChild;
+      if (last instanceof HTMLElement && first instanceof HTMLElement && last.matches('section.run') && first.matches('section.run') && last.dataset.speaker === first.dataset.speaker && last.dataset.who === first.dataset.who) {
+        last.lastElementChild!.append(...first.lastElementChild!.children);
+        first.remove();
+      }
       this.older.before(...this.sink.children);
       this.sink = null;
-      ({ current: this.current, thinking: this.thinking, draft: this.draft, plan: this.currentPlan, planOpen: this.planOpen } = live);
+      ({ current: this.current, thinking: this.thinking, draft: this.draft, plan: this.currentPlan, planOpen: this.planOpen, callName: this.callName } = live);
       this.showPlan(this.currentPlan);
       this.showOlder();
     }
   }
 
+  /** Where a call began: the day and time, who, and what the phone said first. */
+  private callStart(start: CallStart): void {
+    this.current = null;
+    this.callName = start.name;
+    const what = start.direction === 'in' ? `Call from ${start.name}` : start.direction === 'back' ? `Called ${start.name} back` : `Called ${start.name}`;
+    const when = start.at ? `${dayLabel(start.at)} · ${timeLabel(start.at)}` : start.when;
+    this.add(h('div.day-divider', { title: start.number ? `${start.name} (${formatNumber(start.number)})` : start.name }, h('span.day-divider-text', icon('phone'), h('strong', when), h('span', what))));
+    if (start.greeting) {
+      this.add(h('div.msg.assistant.greeting', h('div.msg-body', start.greeting), h('div.msg-meta', h('span.msg-time', '0:00'), h('span.msg-tag', { title: 'What the phone said as it answered' }, 'greeting'))), 'agent');
+    }
+  }
+
   /** Draw turns in the order they came (each goes on top of the ones before). */
   private drawTurns(turns: Turn[], showPlan = true): void {
-    for (const turn of turns) {
-      if (turn.role === 'user' && turn.summary) {
-        this.summaryNote(turn.text, 'Earlier conversation summarized for the model (click to read the summary)');
-        continue;
-      }
-      if (turn.role === 'user' && turn.automatic) {
-        this.current = null;
-        this.add(h('div.msg.nudge', h('span', '↻'), h('span', ` ${turn.text.replace(/^\[(?:OAIY|bot\.computer)\] /, '').split('\n')[0]}`)));
-        continue;
-      }
-      if (turn.role === 'user') {
-        // A message sent while the agent worked carries a note for the model: show it as the person wrote it.
-        const during = /^\[The user sent this while you[^\]]*\]\n\n/.exec(turn.text);
-        const text = (during ? turn.text.slice(during[0].length) : turn.text).replace(/^<project>[\s\S]*?<\/project>\n\n/, '');
-        const attached = /\n\n\[Attached and saved in the project: ([\s\S]*)\]$/.exec(text);
-        // Chats saved before attachments were kept on the turn: read them from the note.
-        const fallback = attached ? attached[1].split('; ').map((n) => n.split(/ \(|: /)[0]).filter((p) => /^uploads\/[^\s]+$/.test(p)).map((path) => ({ name: path.split('/').pop()!, path })) : [];
-        this.user(attached ? text.slice(0, attached.index) : text, turn.attachments ?? fallback, !!during);
-      }
-      else if (turn.role === 'assistant') {
-        if (turn.thinking) this.thoughtBox(turn.thinking);
-        if (turn.text) this.assistantText(turn.text);
-        this.current = null;
-        for (const call of turn.calls) {
-          this.toolCard(call);
-          if (call.name === 'update_plan') {
-            try {
-              const next = settlePlan(readPlan(call.input, this.currentPlan));
-              this.planMarks(this.currentPlan, next);
-              this.currentPlan = next;
-            } catch {
-              /* a plan the tool refused */
-            }
-          }
-        }
-      } else for (const r of turn.results) this.toolResult(r);
+    this.replaying = true;
+    try {
+      for (const turn of turns) this.drawTurn(turn);
+    } finally {
+      this.replaying = false;
     }
     if (showPlan) this.showPlan(this.currentPlan, false);
+  }
+
+  private drawTurn(turn: Turn): void {
+    if (turn.role === 'user' && turn.summary) {
+      this.summaryNote(turn.text, 'Earlier conversation summarized for the model (click to read the summary)');
+      return;
+    }
+    if (turn.role === 'user' && turn.automatic) {
+      this.current = null;
+      const start = parseCallStart(turn.text);
+      if (start) {
+        this.callStart(start);
+        return;
+      }
+      const ended = parseCallEnd(turn.text);
+      if (ended !== null) {
+        this.add(h('div.call-end', h('span.call-end-pill', icon('phone-off'), h('span', ended ? `The call ended: ${ended}` : 'The call ended'))));
+        return;
+      }
+      this.add(h('div.msg.nudge', icon('refresh'), h('span', turn.text.replace(/^\[(?:OAIY|bot\.computer)\] /, '').split('\n')[0])), 'agent');
+      return;
+    }
+    if (turn.role === 'user') {
+      // A message sent while the agent worked carries a note for the model: show it as the person wrote it.
+      const during = /^\[The user sent this while you[^\]]*\]\n\n/.exec(turn.text);
+      const text = (during ? turn.text.slice(during[0].length) : turn.text).replace(/^<project>[\s\S]*?<\/project>\n\n/, '');
+      const attached = /\n\n\[Attached and saved in the project: ([\s\S]*)\]$/.exec(text);
+      // Chats saved before attachments were kept on the turn: read them from the note.
+      const fallback = attached ? attached[1].split('; ').map((n) => n.split(/ \(|: /)[0]).filter((p) => /^uploads\/[^\s]+$/.test(p)).map((path) => ({ name: path.split('/').pop()!, path })) : [];
+      this.user(attached ? text.slice(0, attached.index) : text, turn.attachments ?? fallback, !!during);
+    } else if (turn.role === 'assistant') {
+      if (turn.thinking) this.thoughtBox(turn.thinking);
+      if (turn.text) this.assistantText(turn.text);
+      this.current = null;
+      for (const call of turn.calls) {
+        this.toolCard(call);
+        if (call.name === 'update_plan') {
+          try {
+            const next = settlePlan(readPlan(call.input, this.currentPlan));
+            this.planMarks(this.currentPlan, next);
+            this.currentPlan = next;
+          } catch {
+            /* a plan the tool refused */
+          }
+        }
+      }
+    } else for (const r of turn.results) this.toolResult(r);
   }
 }
