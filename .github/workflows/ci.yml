@@ -14,7 +14,8 @@
 # The ZIPP engines are not committed. OAIY follows zipp.org's latest release,
 # resolved ONCE per run (the zipp job) into a release tag and the digest of its
 # SHA256SUMS, and every lane installs exactly that pair with
-# scripts/fetch-zipp-release.mjs. release.yml passes the pair it froze instead.
+# platform/scripts/fetch-zipp-release.mjs. release.yml passes the pair it froze
+# instead.
 
 name: CI
 
@@ -91,9 +92,9 @@ jobs:
             echo "::error::zipp-release and zipp-sums-sha256 are passed together or not at all"; exit 1
           fi
           if [[ -n "$ZIPP_RELEASE" ]]; then
-            resolved="$(node scripts/fetch-zipp-release.mjs --resolve-only)"
+            resolved="$(node platform/scripts/fetch-zipp-release.mjs --resolve-only)"
           else
-            resolved="$(node scripts/fetch-zipp-release.mjs --resolve-only --latest)"
+            resolved="$(node platform/scripts/fetch-zipp-release.mjs --resolve-only --latest)"
           fi
           release="$(node -e 'console.log(JSON.parse(process.argv[1]).release)' "$resolved")"
           sums="$(node -e 'console.log(JSON.parse(process.argv[1]).sumsSha256)' "$resolved")"
@@ -120,20 +121,20 @@ jobs:
         with:
           node-version: ${{ env.NODE_VERSION }}
           cache: npm
-          cache-dependency-path: ui/package-lock.json
-      - working-directory: ui
+          cache-dependency-path: platform/ui/package-lock.json
+      - working-directory: platform/ui
         run: npm ci
       # Both engines, from the run's release. ui's pretest and prebuild hooks
       # would install them as well; a step of its own puts it in the log.
       - name: Install the ZIPP release
-        run: node scripts/fetch-zipp-release.mjs --ensure
+        run: node platform/scripts/fetch-zipp-release.mjs --ensure
       - name: ZIPP release installer tests
-        run: node --test scripts/fetch-zipp-release.test.mjs
+        run: node --test platform/scripts/fetch-zipp-release.test.mjs
       # ECO-04: advisories at high or above fail the lane. An unreachable
       # registry is recorded as UNKNOWN in the run summary, never as clean, and
       # still fails: a release must carry a completed audit.
       - name: Dependency audit (high or above)
-        working-directory: ui
+        working-directory: platform/ui
         shell: bash
         run: |
           set -o pipefail
@@ -151,10 +152,10 @@ jobs:
             fi
             exit "$code"
           fi
-      - working-directory: ui
+      - working-directory: platform/ui
         run: npm test
       - name: Build
-        working-directory: ui
+        working-directory: platform/ui
         run: npm run build
 
   cli:
@@ -173,19 +174,19 @@ jobs:
         with:
           node-version: ${{ env.NODE_VERSION }}
           cache: npm
-          cache-dependency-path: cli/package-lock.json
-      - working-directory: cli
+          cache-dependency-path: platform/cli/package-lock.json
+      - working-directory: platform/cli
         run: npm ci
       # The CLI and Desktop lanes install the run's release too (the installer
       # needs Node built-ins only, no ui dependencies), so both engines are
       # verified on the runners that build the CLI and Desktop, Windows included.
       - name: Install the ZIPP release
-        run: node scripts/fetch-zipp-release.mjs --ensure
+        run: node platform/scripts/fetch-zipp-release.mjs --ensure
       # ECO-04: advisories at high or above fail the lane. An unreachable
       # registry is recorded as UNKNOWN in the run summary, never as clean, and
       # still fails: a release must carry a completed audit.
       - name: Dependency audit (high or above)
-        working-directory: cli
+        working-directory: platform/cli
         shell: bash
         run: |
           set -o pipefail
@@ -203,46 +204,46 @@ jobs:
             fi
             exit "$code"
           fi
-      - working-directory: cli
+      - working-directory: platform/cli
         run: npm run build
       # The COMPLETE CLI test script (module isolation, SSRF guard, connector
       # module, engine suites, the ZIPP process-boundary suite and the four
       # engine guards below) plus the typecheck — release.yml used to run
       # only the HTTPS shutdown check (OAI-01).
-      - working-directory: cli
+      - working-directory: platform/cli
         run: npm test
-      - working-directory: cli
+      - working-directory: platform/cli
         run: npm run typecheck
       - name: Check CLI HTTPS shutdown
-        working-directory: cli
+        working-directory: platform/cli
         run: node test/cli-http-exit.mjs
       # The ZIPP engine guards, each on its own so a failure is named in the
       # log. They are also part of `npm test` above; here they run against the
       # bundle `npm run build` just made, which every one of them spawns or
       # reads (a stale dist/ would pass them for the wrong revision).
       - name: ZIPP guard — the CLI runs flows on the ZIPP VM (process boundary)
-        working-directory: cli
+        working-directory: platform/cli
         run: node test/zipp-cli.mjs
       - name: ZIPP guard A — no host eval in the bundles
-        working-directory: cli
+        working-directory: platform/cli
         run: node test/no-host-eval.mjs
       - name: ZIPP guard — every runtime goes through createCliEngine
-        working-directory: cli
+        working-directory: platform/cli
         run: node test/engine-wiring.mjs
       - name: ZIPP guards B, C, D — canary under the host-eval tripwire, realm, budget, timeout, engine_unavailable
-        working-directory: cli
+        working-directory: platform/cli
         run: node test/zipp-guard.mjs
       - name: ZIPP boundary measurements (recorded, never hang)
-        working-directory: cli
+        working-directory: platform/cli
         run: node test/zipp-limits.mjs
       # PR5: the leaf-script command (`oaiy script --request`, `--serve` and its
       # watchdog/recycle policy, `run --profile`) and the standalone CLI release
       # asset builder release.yml calls (inner SHA256SUMS, oaiy-cli.json).
       - name: ZIPP script command — envelope, --serve protocol, run --profile
-        working-directory: cli
+        working-directory: platform/cli
         run: node test/zipp-script.mjs
       - name: CLI release asset — pack-cli-asset builds from a copy and verifies
-        working-directory: cli
+        working-directory: platform/cli
         run: node test/cli-asset.mjs
 
   desktop:
@@ -269,11 +270,11 @@ jobs:
         with:
           node-version: ${{ env.NODE_VERSION }}
       - name: Install the ZIPP release
-        run: node scripts/fetch-zipp-release.mjs --ensure
+        run: node platform/scripts/fetch-zipp-release.mjs --ensure
       - uses: dtolnay/rust-toolchain@6bed0761d98439e5a578e2877258200ad565ba87 # stable (pinned revision)
       - uses: Swatinem/rust-cache@49a0bdc70d2e1b713ca9e2869b211fcce03d3c1c # v2
         with:
-          workspaces: desktop/src-tauri
+          workspaces: platform/desktop/src-tauri
       - name: Linux build dependencies
         if: matrix.label == 'linux'
         run: |
@@ -281,21 +282,22 @@ jobs:
           sudo apt-get install -y --no-install-recommends \
             libwebkit2gtk-4.1-dev libayatana-appindicator3-dev librsvg2-dev \
             libxdo-dev patchelf build-essential curl wget file libssl-dev
-      # The desktop bundles the headless CLI (scripts/sync-cli.mjs copies its
-      # esbuild output into src-tauri/resources), so the CLI has to exist first.
+      # The desktop bundles the headless CLI (platform/desktop/scripts/sync-cli.mjs
+      # copies its esbuild output into src-tauri/resources), so the CLI has to
+      # exist first.
       - name: Install and build the CLI
-        working-directory: cli
+        working-directory: platform/cli
         run: |
           npm ci
           npm run build
       - name: Install the desktop app's dependencies
-        working-directory: desktop
+        working-directory: platform/desktop
         run: npm ci
       # ECO-04: advisories at high or above fail the lane. An unreachable
       # registry is recorded as UNKNOWN in the run summary, never as clean, and
       # still fails: a release must carry a completed audit.
       - name: Dependency audit (high or above)
-        working-directory: desktop
+        working-directory: platform/desktop
         shell: bash
         run: |
           set -o pipefail
@@ -315,16 +317,16 @@ jobs:
           fi
       # The desktop Vitest suite — never run by the release workflow before.
       - name: Desktop unit tests (Vitest)
-        working-directory: desktop
+        working-directory: platform/desktop
         run: npm test
       - name: Desktop typecheck + web build
-        working-directory: desktop
+        working-directory: platform/desktop
         run: npm run build
       # Native tests in BOTH shipped configurations: the headless server (no
       # default features) and the GUI feature set the desktop installer ships.
       - name: Native tests (headless, no default features)
-        working-directory: desktop/src-tauri
+        working-directory: platform/desktop/src-tauri
         run: cargo test --locked --no-default-features
       - name: Native tests (shipping GUI features)
-        working-directory: desktop/src-tauri
+        working-directory: platform/desktop/src-tauri
         run: cargo test --locked --features gui

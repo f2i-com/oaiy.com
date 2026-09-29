@@ -20,9 +20,10 @@
 #                                            SHA256SUMS and oaiy-cli.json (= `oaiy capabilities --json`)
 #   SHA256SUMS.txt
 #
-# The tag is the version. It is stamped into desktop/src-tauri/tauri.conf.json
-# and Cargo.toml at build time (never committed), so the installers, the app's
-# About box and the file names all agree with the tag without a release commit.
+# The tag is the version. It is stamped into
+# platform/desktop/src-tauri/tauri.conf.json and Cargo.toml at build time
+# (never committed), so the installers, the app's About box and the file names
+# all agree with the tag without a release commit.
 #
 # The web build is made with VITE_API_BASE unset: a fully standalone site with
 # sharing off. To ship a build wired to a backend, set that variable in this
@@ -44,16 +45,18 @@
 # parallel with the gate and write their evidence as `unverified` / audit
 # `pending`, so a workflow artifact from a failed or incomplete run never
 # claims a result the run did not establish. The release job, which depends
-# on the gate, runs scripts/attest-release-evidence.mjs: it requires the
-# gate's explicit success, re-checks every artifact digest against the bytes
-# about to be published, and only then stamps `verified` / `pass` together
-# with the exact verification run (id, attempt, URL, ci.yml jobs).
+# on the gate, runs platform/scripts/attest-release-evidence.mjs: it
+# requires the gate's explicit success, re-checks every artifact digest
+# against the bytes about to be published, and only then stamps `verified` /
+# `pass` together with the exact verification run (id, attempt, URL, ci.yml
+# jobs).
 #
 # One ZIPP per release: meta resolves zipp.org's latest release once, as the
 # tag and the digest of its SHA256SUMS, and every job installs exactly that
-# pair (scripts/fetch-zipp-release.mjs); the verification gate is handed the
-# same pair. The web job re-verifies the engines against the published release
-# before packaging and records the engine the site ships in its evidence.
+# pair (platform/scripts/fetch-zipp-release.mjs); the verification gate is
+# handed the same pair. The web job re-verifies the engines against the
+# published release before packaging and records the engine the site ships
+# in its evidence.
 
 name: Release
 
@@ -101,7 +104,7 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          resolved="$(node scripts/fetch-zipp-release.mjs --resolve-only --latest)"
+          resolved="$(node platform/scripts/fetch-zipp-release.mjs --resolve-only --latest)"
           release="$(node -e 'console.log(JSON.parse(process.argv[1]).release)' "$resolved")"
           sums="$(node -e 'console.log(JSON.parse(process.argv[1]).sumsSha256)' "$resolved")"
           echo "release=$release" >> "$GITHUB_OUTPUT"
@@ -152,21 +155,21 @@ jobs:
         with:
           node-version: ${{ env.NODE_VERSION }}
           cache: npm
-          cache-dependency-path: ui/package-lock.json
+          cache-dependency-path: platform/ui/package-lock.json
 
       - name: Install
-        working-directory: ui
+        working-directory: platform/ui
         run: npm ci
 
       - name: Install the ZIPP release
-        run: node scripts/fetch-zipp-release.mjs --ensure
+        run: node platform/scripts/fetch-zipp-release.mjs --ensure
 
       - name: Test
-        working-directory: ui
+        working-directory: platform/ui
         run: npm test
 
       - name: Build
-        working-directory: ui
+        working-directory: platform/ui
         env:
           VITE_API_BASE: ${{ vars.VITE_API_BASE }}
         run: npm run build
@@ -174,7 +177,7 @@ jobs:
       # The installed bytes against what the release publishes now, right
       # before they are packaged: ZIPP's SHA256SUMS and every file taken.
       - name: Re-verify the ZIPP engines against the published release
-        run: node scripts/fetch-zipp-release.mjs --check --online
+        run: node platform/scripts/fetch-zipp-release.mjs --check --online
 
       - name: Package
         shell: bash
@@ -183,7 +186,7 @@ jobs:
         run: |
           set -euo pipefail
           out="$PWD/release"; mkdir -p "$out"
-          cat > ui/dist/HOSTING.md <<EOF
+          cat > platform/ui/dist/HOSTING.md <<EOF
           # OAIY web site $VERSION
 
           This folder is the complete static site: the landing page (index.html),
@@ -199,8 +202,8 @@ jobs:
           Built with VITE_API_BASE="${VITE_API_BASE:-}". Empty means standalone: no
           sharing backend, everything runs in the browser.
           EOF
-          (cd ui/dist && zip -qr "$out/oaiy-web-$VERSION.zip" .)
-          tar -C ui/dist -czf "$out/oaiy-web-$VERSION.tar.gz" .
+          (cd platform/ui/dist && zip -qr "$out/oaiy-web-$VERSION.zip" .)
+          tar -C platform/ui/dist -czf "$out/oaiy-web-$VERSION.tar.gz" .
           ls -l "$out"
 
       - name: Release evidence (web)
@@ -214,10 +217,10 @@ jobs:
             const files = fs.readdirSync("release").map(name => ({ name, sha256: crypto.createHash("sha256").update(fs.readFileSync(path.join("release", name))).digest("hex") }));
             // The engine the site ships is the installed one, found among the built assets by its digest.
             const digest = file => crypto.createHash("sha256").update(fs.readFileSync(file)).digest("hex");
-            const zipp = JSON.parse(fs.readFileSync("ui/vendor/zipp-wasm/SOURCE.json", "utf8"));
+            const zipp = JSON.parse(fs.readFileSync("platform/ui/vendor/zipp-wasm/SOURCE.json", "utf8"));
             // The release notes name the pair meta froze, so the evidence must describe that very install.
             if (zipp.release !== process.env.ZIPP_RELEASE || zipp.sumsSha256 !== process.env.ZIPP_SUMS_SHA256) { console.error("::error::the installed ZIPP is " + zipp.release + " (SHA256SUMS " + zipp.sumsSha256 + "), not the " + process.env.ZIPP_RELEASE + " (" + process.env.ZIPP_SUMS_SHA256 + ") meta froze"); process.exit(1); }
-            const shipped = fs.readdirSync("ui/dist/assets").filter(name => name.endsWith(".wasm") && digest(path.join("ui/dist/assets", name)) === zipp.sha256);
+            const shipped = fs.readdirSync("platform/ui/dist/assets").filter(name => name.endsWith(".wasm") && digest(path.join("platform/ui/dist/assets", name)) === zipp.sha256);
             if (shipped.length !== 1) { console.error("::error::the built site does not ship the installed ZIPP engine " + zipp.sha256 + " exactly once (found " + shipped.length + ")"); process.exit(1); }
             fs.writeFileSync("release/release-evidence-web.json", JSON.stringify({
               component: "web", version: process.env.VERSION, revision: process.env.REVISION,
@@ -227,10 +230,10 @@ jobs:
                 bundle: zipp.bundle, bundleSha256: zipp.bundleSha256, sumsSha256: zipp.sumsSha256,
                 wasmSha256: zipp.sha256, glueSha256: zipp.glueSha256, asset: "assets/" + shipped[0],
               },
-              tests: { web: "npm test (ui)", zippInstall: "scripts/fetch-zipp-release.mjs --check --online" },
+              tests: { web: "npm test (ui)", zippInstall: "platform/scripts/fetch-zipp-release.mjs --check --online" },
               // This job runs in parallel with the verification gate and cannot know its
               // result: the release job attests these two fields after the gate passed
-              // (scripts/attest-release-evidence.mjs, R3-OAI-01). A build artifact from an
+              // (platform/scripts/attest-release-evidence.mjs, R3-OAI-01). A build artifact from an
               // incomplete or failed run therefore never claims a passing verification.
               // (No apostrophes in these comments: they sit inside a single-quoted shell string.)
               verification: { status: "unverified", gate: ".github/workflows/ci.yml@" + process.env.REVISION },
@@ -273,14 +276,14 @@ jobs:
       # The release's one ZIPP, installed from meta's pair as in every job, so
       # a build of this leg can only ever see that release's engines.
       - name: Install the ZIPP release
-        run: node scripts/fetch-zipp-release.mjs --ensure
+        run: node platform/scripts/fetch-zipp-release.mjs --ensure
 
       # Pinned to a revision of the `stable` branch, upgraded deliberately.
       - uses: dtolnay/rust-toolchain@6bed0761d98439e5a578e2877258200ad565ba87 # stable (pinned revision)
 
       - uses: Swatinem/rust-cache@49a0bdc70d2e1b713ca9e2869b211fcce03d3c1c # v2
         with:
-          workspaces: desktop/src-tauri
+          workspaces: platform/desktop/src-tauri
 
       - name: Linux build dependencies
         if: matrix.label == 'linux'
@@ -297,47 +300,48 @@ jobs:
         run: |
           node -e '
             const fs = require("fs"); const v = process.argv[1];
-            const conf = "desktop/src-tauri/tauri.conf.json";
+            const conf = "platform/desktop/src-tauri/tauri.conf.json";
             const j = JSON.parse(fs.readFileSync(conf, "utf8")); j.version = v;
             fs.writeFileSync(conf, JSON.stringify(j, null, 2) + "\n");
-            const toml = "desktop/src-tauri/Cargo.toml";
+            const toml = "platform/desktop/src-tauri/Cargo.toml";
             fs.writeFileSync(toml, fs.readFileSync(toml, "utf8").replace(/^version = "[^"]+"/m, `version = "${v}"`));
             console.log("stamped", v);
           ' "$VERSION"
 
-      # The desktop bundles the headless CLI (scripts/sync-cli.mjs copies its
-      # esbuild output into src-tauri/resources), so the CLI has to exist first.
+      # The desktop bundles the headless CLI (platform/desktop/scripts/sync-cli.mjs
+      # copies its esbuild output into src-tauri/resources), so the CLI has to
+      # exist first.
       - name: Install and build the CLI
-        working-directory: cli
+        working-directory: platform/cli
         run: |
           npm ci
           npm run build
 
       - name: Check CLI HTTPS shutdown
-        working-directory: cli
+        working-directory: platform/cli
         run: node test/cli-http-exit.mjs
 
       - name: Install the desktop app's dependencies
-        working-directory: desktop
+        working-directory: platform/desktop
         run: npm ci
 
       - name: Build OAIY Desktop
-        working-directory: desktop
+        working-directory: platform/desktop
         run: npm run tauri:build
 
       - name: Build the headless server
-        working-directory: desktop/src-tauri
+        working-directory: platform/desktop/src-tauri
         run: cargo build --release --no-default-features --bin oaiy-server
 
       - name: Stage complete headless distribution
         shell: bash
         run: |
-          server=desktop/src-tauri/target/release/oaiy-server
+          server=platform/desktop/src-tauri/target/release/oaiy-server
           [[ "$RUNNER_OS" == "Windows" ]] && server="$server.exe"
-          node desktop/scripts/package-server.mjs "$server" headless-dist
+          node platform/desktop/scripts/package-server.mjs "$server" headless-dist
 
       - name: Execute a flow from the headless distribution
-        run: node desktop/scripts/smoke-server.mjs headless-dist
+        run: node platform/desktop/scripts/smoke-server.mjs headless-dist
 
       - name: Collect
         shell: bash
@@ -347,7 +351,7 @@ jobs:
         run: |
           set -euo pipefail
           out="$PWD/release"; mkdir -p "$out"
-          bundle="desktop/src-tauri/target/release/bundle"
+          bundle="platform/desktop/src-tauri/target/release/bundle"
           find "$bundle" -type f | sort
           if [[ "$LABEL" == "windows" ]]; then
             cp "$(find "$bundle" -type f -name '*-setup.exe' | head -1)" "$out/oaiy-desktop-$VERSION-windows-x64-setup.exe"
@@ -366,7 +370,7 @@ jobs:
             # `capabilities --json` (protocols, engine, languages), which a
             # consumer embedding the CLI compares against what it speaks. The
             # summary feeds the evidence below; it is not an asset itself.
-            node scripts/pack-cli-asset.mjs desktop/src-tauri/resources/cli "$out/oaiy-cli-$VERSION.tar.gz" --summary cli-asset-summary.json
+            node platform/scripts/pack-cli-asset.mjs platform/desktop/src-tauri/resources/cli "$out/oaiy-cli-$VERSION.tar.gz" --summary cli-asset-summary.json
           fi
           ls -l "$out"
 
@@ -385,7 +389,7 @@ jobs:
           else
             tar -C headless-verified -xzf "release/oaiy-server-$VERSION-linux-x86_64.tar.gz"
           fi
-          node desktop/scripts/smoke-server.mjs headless-verified
+          node platform/desktop/scripts/smoke-server.mjs headless-verified
 
       # Source revision, target, features, toolchain, artifact digests and the
       # tests that ran, recorded TOGETHER per artifact set (OAI-01).
@@ -461,7 +465,7 @@ jobs:
           REVISION: ${{ needs.meta.outputs.revision }}
           VERIFY_WORKFLOW: .github/workflows/ci.yml
           VERIFY_JOBS: revision,zipp,web,cli,desktop (linux),desktop (windows)
-        run: node scripts/attest-release-evidence.mjs --dir artifacts
+        run: node platform/scripts/attest-release-evidence.mjs --dir artifacts
 
       # Every evidence file must name the revision this workflow verified and
       # carry the attested statuses; a file still pending/unverified stops the release.
@@ -516,7 +520,7 @@ jobs:
           - Linux: \`.AppImage\` (portable), \`.deb\` (Debian/Ubuntu) or \`.rpm\` (Fedora/RHEL)
 
           **oaiy-server** — the same local API with no window, tray or GTK, for a Linux or
-          Windows host that the CLI or a hosted web app drives. See \`desktop/README.md\`.
+          Windows host that the CLI or a hosted web app drives. See \`platform/desktop/README.md\`.
 
           **oaiy-cli** — \`oaiy-cli-$VERSION.tar.gz\` is the CLI alone, OS-neutral (JavaScript +
           the ZIPP $ZIPP_RELEASE web-python engine), for a product that embeds it: \`oaiy.mjs\`, both
