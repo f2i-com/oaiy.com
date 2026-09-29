@@ -190,6 +190,9 @@ struct MarkerAgent {
     /// The API keys were ticked.
     #[serde(default)]
     apply_keys: bool,
+    /// An undo: the Agent's files the restore added, to be taken away.
+    #[serde(default)]
+    remove: Vec<String>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -309,6 +312,11 @@ impl Marker {
         }
         for r in &self.removals {
             self.check_name(r, limits)?;
+        }
+        if let Some(agent) = &self.agent {
+            if agent.remove.len() > agent::MAX_ADDED {
+                return Err("the record of the restore is damaged".into());
+            }
         }
         Ok(())
     }
@@ -613,7 +621,7 @@ pub fn stage(data_dir: &Path, file: &Path, passphrase: &str, ticks: &Ticks, opts
                 container::safe_join(&root.join("files"), &entry.name, limits).map(Some)
             }
         }, &budget)?;
-        let agent = selected.iter().find(|e| e.name == AGENT_ENTRY).map(|e| MarkerAgent { size: e.size, sha256: e.sha256.clone(), apply_settings: ticks.has(RestoreClass::AgentSettings), apply_keys: ticks.keys });
+        let agent = selected.iter().find(|e| e.name == AGENT_ENTRY).map(|e| MarkerAgent { size: e.size, sha256: e.sha256.clone(), apply_settings: ticks.has(RestoreClass::AgentSettings), apply_keys: ticks.keys, remove: Vec::new() });
         // What can carry more than data is cleaned as it comes in, and the marker records what is there now.
         let names: Vec<String> = selected.iter().filter(|e| e.name != AGENT_ENTRY).map(|e| e.name.clone()).collect();
         let (kept, notes) = clean_staged(data_dir, &root.join("files"), &names, ticks, limits)?;
@@ -821,7 +829,7 @@ pub fn stage_undo(data_dir: &Path, opts: &RestoreOptions) -> Result<Staged> {
         Ok(m) if m.is_file() => {
             let (sha256, size) = sha256_file(&agent_zip).map_err(|e| BackupError::io("Could not read the saved copy", &e))?;
             // What the page saved is the person's own state: its settings go back, its keys were never in it.
-            Some(MarkerAgent { size, sha256, apply_settings: true, apply_keys: false })
+            Some(MarkerAgent { size, sha256, apply_settings: true, apply_keys: false, remove: agent::read_added(data_dir, &uid) })
         }
         _ => None,
     };
@@ -1001,7 +1009,7 @@ pub fn sweep_leftovers(data_dir: &Path) -> usize {
     }
     // The Agent's part of a restore that its page has not taken for a day: it is not kept for ever.
     if let Some(id) = agent::drop_stale_import(data_dir, std::time::Duration::from_secs(STAGED_LIFETIME_HOURS as u64 * 3600)) {
-        record_agent_result(data_dir, &id, false, Some("its page did not take them within a day, so what was kept for it was deleted"));
+        record_agent_result(data_dir, &id, false, Some("its page did not take them within a day, so what was kept for it was deleted"), &[]);
         removed += 1;
     }
     if removed > 0 {
@@ -1265,7 +1273,7 @@ fn finalize(data_dir: &Path, marker: &Marker, applied: &[(String, bool)]) -> App
     let mut agent_storage = "none";
     if let Some(agent_marker) = &marker.agent {
         let zip = source.join("agent-storage.zip");
-        match agent::leave_for_page(data_dir, &marker.id, &marker.kind, &zip, agent_marker.apply_settings, agent_marker.apply_keys) {
+        match agent::leave_for_page(data_dir, &marker.id, &marker.kind, &zip, agent_marker.apply_settings, agent_marker.apply_keys, &agent_marker.remove) {
             Ok(()) => agent_storage = "pending",
             Err(e) => {
                 log::warn!("backup: the Agent's storage could not be handed over: {e}");
@@ -1327,10 +1335,17 @@ pub fn last_restore(data_dir: &Path) -> Option<LastRestore> {
 }
 
 /// The Agent page said how its part of a restore went.
-pub(crate) fn record_agent_result(data_dir: &Path, id: &str, ok: bool, error: Option<&str>) {
+pub(crate) fn record_agent_result(data_dir: &Path, id: &str, ok: bool, error: Option<&str>, warnings: &[String]) {
     let Some(mut last) = read_json::<LastRestore>(&last_result_path(data_dir)) else { return };
     if last.id != id {
         return;
+    }
+    // What the page left out or could not do goes where the person reads the result, cut to what a panel shows.
+    for warning in warnings.iter().take(20) {
+        let line = format!("Agent: {}", review::clip(warning, 300));
+        if !last.notes.contains(&line) {
+            last.notes.push(line);
+        }
     }
     if ok {
         last.agent_storage = "applied".into();

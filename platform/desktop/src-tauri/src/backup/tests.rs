@@ -1477,7 +1477,7 @@ fn a_restore_hands_the_agents_storage_to_its_page_and_takes_the_undo_snapshot_ba
     assert_private(&snapshot_path);
 
     // It says how it went, and the storage is not offered again.
-    agent::import_done(&dst.0, &id, &token, true, None).unwrap();
+    agent::import_done(&dst.0, &id, &token, &agent::ImportReport { ok: true, ..Default::default() }).unwrap();
     assert!(!agent::import_meta(&dst.0).pending);
     assert_eq!(restore::last_restore(&dst.0).unwrap().agent_storage, "applied");
 
@@ -1488,8 +1488,7 @@ fn a_restore_hands_the_agents_storage_to_its_page_and_takes_the_undo_snapshot_ba
     let meta = agent::import_meta(&dst.0);
     assert_eq!(meta.kind.as_deref(), Some("undo"));
     assert_eq!(agent::import_part(&dst.0, meta.id.as_deref().unwrap(), &token, 0).unwrap(), b"snapshot-part-0;snapshot-part-1");
-    assert_eq!(agent::undo_part(&dst.0, meta.id.as_deref().unwrap(), &token, 0, b"x"), Err(PartError::Closed), "an undo takes no snapshot");
-    agent::import_done(&dst.0, meta.id.as_deref().unwrap(), &token, false, Some("no room")).unwrap();
+    agent::import_done(&dst.0, meta.id.as_deref().unwrap(), &token, &agent::ImportReport { ok: false, error: Some("no room".into()), ..Default::default() }).unwrap();
     let last = restore::last_restore(&dst.0).unwrap();
     assert_eq!(last.agent_storage, "failed");
     assert!(last.redo.iter().any(|r| r.contains("no room")));
@@ -2789,4 +2788,199 @@ async fn an_origin_header_alone_gets_nothing_of_the_agents_import() {
     // And it is a secret of this run: 32 characters or more, made from the system's randomness.
     assert!(secret.len() == 64 && secret.bytes().all(|b| b.is_ascii_hexdigit()), "{}", secret.len());
     assert!(secret.chars().collect::<std::collections::HashSet<_>>().len() >= 6, "not a constant or a pattern");
+}
+
+// ---- the Agent's part of an undo ---------------------------------------------------------------------------
+
+/// The page's half of an import, as far as the desktop sees it: fetch, snapshot, report.
+fn page_takes_import(data: &Path, snapshot: &[u8], added: &[&str]) -> (String, ImportMetaSeen) {
+    let meta = agent::import_meta(data);
+    assert!(meta.pending);
+    let (id, token) = (meta.id.clone().unwrap(), agent::page_token().to_string());
+    let mut fetched = Vec::new();
+    for i in 0..meta.parts.unwrap() {
+        fetched.extend(agent::import_part(data, &id, &token, i).unwrap());
+    }
+    agent::undo_part(data, &id, &token, 0, snapshot).unwrap();
+    agent::undo_done(data, &id, &token, &DonePayload { ok: true, parts: 1, ..Default::default() }).unwrap();
+    let report = agent::ImportReport { ok: true, error: None, added: added.iter().map(|s| s.to_string()).collect(), warnings: vec!["Project p3 was skipped: its project.json could not be read.".into()] };
+    agent::import_done(data, &id, &token, &report).unwrap();
+    (id, ImportMetaSeen { kind: meta.kind.clone().unwrap(), remove: meta.remove.clone(), fetched })
+}
+
+struct ImportMetaSeen {
+    kind: String,
+    remove: Vec<String>,
+    fetched: Vec<u8>,
+}
+
+#[test]
+fn an_undo_takes_away_what_the_agents_import_added_and_keeps_a_copy_of_what_it_takes() {
+    let src = TempDir::new("agent-undo-src");
+    realistic(&src.0, "A");
+    let out = TempDir::new("agent-undo-out");
+    let file = out.0.join("u.oaiybackup");
+    let backed_up = agent_zip();
+    let page = Page { zip: backed_up.clone(), part_size: PART_SIZE, ok: true, warnings: vec![] };
+    make_with(&src.0, &file, PASS, false, Some(&page)).unwrap();
+    let dst = TempDir::new("agent-undo-dst");
+    target(&dst.0);
+    restore::stage(&dst.0, &file, PASS, &Ticks::all(), &options()).unwrap();
+    assert!(matches!(restore::apply_pending(&dst.0), ApplyOutcome::Applied(_)));
+
+    // The page imports: it saves what it held, writes, and says which files it added (and what it left out).
+    let (restore_id, seen) = page_takes_import(&dst.0, b"the page as it was before the restore", &["opfs/projects/p1/notes.md", "opfs/front-desk/greeting.txt"]);
+    assert_eq!(seen.kind, "restore");
+    assert!(seen.remove.is_empty(), "a restore takes nothing away");
+    assert_eq!(seen.fetched, backed_up);
+    let last = restore::last_restore(&dst.0).unwrap();
+    assert!(last.notes.iter().any(|n| n.starts_with("Agent: ") && n.contains("project.json")), "what the page left out reaches the result: {:?}", last.notes);
+    assert_eq!(agent::read_added(&dst.0, &restore_id), ["opfs/projects/p1/notes.md", "opfs/front-desk/greeting.txt"]);
+
+    // The undo hands the page the snapshot and the list of what to take away.
+    restore::stage_undo(&dst.0, &options()).unwrap();
+    assert!(matches!(restore::apply_pending(&dst.0), ApplyOutcome::Applied(_)));
+    let (undo_id, seen) = page_takes_import(&dst.0, b"the page as it was when the undo began", &["opfs/projects/p9/came-back.md"]);
+    assert_eq!(seen.kind, "undo");
+    assert_eq!(seen.remove, ["opfs/projects/p1/notes.md", "opfs/front-desk/greeting.txt"]);
+    assert_eq!(seen.fetched, b"the page as it was before the restore");
+    // The undo took a snapshot of its own (the redo copy), and it is what a redo hands back.
+    assert_eq!(fs::read(agent::undo_agent_path(&dst.0, &undo_id)).unwrap(), b"the page as it was when the undo began");
+    assert_eq!(restore::undo_kind(&dst.0).as_deref(), Some("undo"));
+    let redo = restore::stage_undo(&dst.0, &options()).unwrap();
+    assert!(redo.agent_storage, "the redo has the page's storage to hand back");
+    assert!(matches!(restore::apply_pending(&dst.0), ApplyOutcome::Applied(_)));
+    let (_, seen) = page_takes_import(&dst.0, b"the page after the undo", &[]);
+    assert_eq!(seen.fetched, b"the page as it was when the undo began");
+    assert_eq!(seen.remove, ["opfs/projects/p9/came-back.md"], "the redo takes away what the undo brought back");
+}
+
+#[test]
+fn a_second_try_at_the_undo_copy_never_replaces_the_first() {
+    let src = TempDir::new("agent-twice-src");
+    realistic(&src.0, "A");
+    let out = TempDir::new("agent-twice-out");
+    let file = out.0.join("t.oaiybackup");
+    let page = Page { zip: agent_zip(), part_size: PART_SIZE, ok: true, warnings: vec![] };
+    make_with(&src.0, &file, PASS, false, Some(&page)).unwrap();
+    let dst = TempDir::new("agent-twice-dst");
+    restore::stage(&dst.0, &file, PASS, &Ticks::all(), &options()).unwrap();
+    assert!(matches!(restore::apply_pending(&dst.0), ApplyOutcome::Applied(_)));
+    let meta = agent::import_meta(&dst.0);
+    let (id, token) = (meta.id.unwrap(), agent::page_token().to_string());
+
+    // The first try saves what the page held, and the page is closed before it says it is done.
+    agent::undo_part(&dst.0, &id, &token, 0, b"the true original").unwrap();
+    agent::undo_done(&dst.0, &id, &token, &DonePayload { ok: true, parts: 1, ..Default::default() }).unwrap();
+    let path = agent::undo_agent_path(&dst.0, &id);
+    assert_eq!(fs::read(&path).unwrap(), b"the true original");
+    // The next start, the page tries again over storage that is half restored: its copy is kept out.
+    agent::undo_part(&dst.0, &id, &token, 0, b"half restored").unwrap();
+    agent::undo_part(&dst.0, &id, &token, 1, b" and more").unwrap();
+    agent::undo_done(&dst.0, &id, &token, &DonePayload { ok: true, parts: 2, ..Default::default() }).unwrap();
+    assert_eq!(fs::read(&path).unwrap(), b"the true original", "the first copy stays");
+    assert!(!path.with_file_name("agent-storage.zip.part").exists(), "and the second is not left behind");
+    // A failed second try changes nothing either.
+    agent::undo_part(&dst.0, &id, &token, 0, b"partial").unwrap();
+    agent::undo_done(&dst.0, &id, &token, &DonePayload { ok: false, ..Default::default() }).unwrap();
+    assert_eq!(fs::read(&path).unwrap(), b"the true original");
+}
+
+#[test]
+fn what_the_page_lists_as_added_is_kept_only_if_it_is_plain_and_only_so_many() {
+    let src = TempDir::new("agent-names-src");
+    realistic(&src.0, "A");
+    let out = TempDir::new("agent-names-out");
+    let file = out.0.join("n.oaiybackup");
+    let page = Page { zip: agent_zip(), part_size: PART_SIZE, ok: true, warnings: vec![] };
+    make_with(&src.0, &file, PASS, false, Some(&page)).unwrap();
+    let dst = TempDir::new("agent-names-dst");
+    restore::stage(&dst.0, &file, PASS, &Ticks::all(), &options()).unwrap();
+    assert!(matches!(restore::apply_pending(&dst.0), ApplyOutcome::Applied(_)));
+    let id = agent::import_meta(&dst.0).id.unwrap();
+    let mut added: Vec<String> = vec!["opfs/projects/p1/a.md".into(), "../../callers.json".into(), "/etc/passwd".into(), "opfs\\projects\\p1\\b.md".into(), "opfs/projects//c.md".into(), "opfs/projects/p1/\u{7}bell".into(), "".into(), "x".repeat(2000)];
+    added.extend((0..agent::MAX_ADDED + 50).map(|i| format!("opfs/projects/p2/file-{i}.md")));
+    agent::import_done(&dst.0, &id, agent::page_token(), &agent::ImportReport { ok: true, added, ..Default::default() }).unwrap();
+    let kept = agent::read_added(&dst.0, &id);
+    assert_eq!(kept.len(), agent::MAX_ADDED, "only so many are kept");
+    assert_eq!(kept[0], "opfs/projects/p1/a.md");
+    assert!(kept.iter().all(|n| n.starts_with("opfs/projects/") && !n.contains("..") && !n.contains('\\') && !n.contains("//") && !n.chars().any(char::is_control)), "nothing that leaves the storage or is not a name");
+}
+
+#[test]
+fn a_record_of_a_restore_with_more_files_to_take_away_than_can_be_listed_is_refused() {
+    let src = TempDir::new("agent-long-src");
+    realistic(&src.0, "A");
+    let out = TempDir::new("agent-long-out");
+    let file = out.0.join("l.oaiybackup");
+    let page = Page { zip: agent_zip(), part_size: PART_SIZE, ok: true, warnings: vec![] };
+    make_with(&src.0, &file, PASS, false, Some(&page)).unwrap();
+    let dst = TempDir::new("agent-long-dst");
+    target(&dst.0);
+    let before = snapshot(&dst.0);
+    restore::stage(&dst.0, &file, PASS, &Ticks::all(), &options()).unwrap();
+    let path = dst.0.join("restore").join("pending.json");
+    let mut marker: serde_json::Value = serde_json::from_str(&fs::read_to_string(&path).unwrap()).unwrap();
+    marker["agent"]["remove"] = serde_json::Value::Array((0..agent::MAX_ADDED + 1).map(|i| serde_json::Value::String(format!("opfs/projects/p/{i}.md"))).collect());
+    fs::write(&path, serde_json::to_string(&marker).unwrap()).unwrap();
+    let outcome = restore::apply_pending(&dst.0);
+    let ApplyOutcome::Failed(last) = outcome else { panic!("a record like that is refused: {outcome:?}") };
+    assert!(last.error.as_deref().unwrap().contains("refused") || last.error.as_deref().unwrap().contains("damaged"), "{last:?}");
+    assert_eq!(snapshot(&dst.0), before, "nothing was changed");
+    assert!(!agent::import_meta(&dst.0).pending, "and nothing was left for the page");
+}
+
+#[tokio::test]
+async fn the_pages_report_of_an_import_reaches_the_desktop_over_the_route() {
+    let src = TempDir::new("agent-route-src");
+    realistic(&src.0, "A");
+    let out = TempDir::new("agent-route-out");
+    let file = out.0.join("r.oaiybackup");
+    let page = Page { zip: agent_zip(), part_size: PART_SIZE, ok: true, warnings: vec![] };
+    make_with(&src.0, &file, PASS, false, Some(&page)).unwrap();
+    let dst = TempDir::new("agent-route-dst");
+    restore::stage(&dst.0, &file, PASS, &Ticks::all(), &options()).unwrap();
+    assert!(matches!(restore::apply_pending(&dst.0), ApplyOutcome::Applied(_)));
+    let app = routes::router(dst.0.clone());
+    let secret = agent::page_token().to_string();
+    let id = agent::import_meta(&dst.0).id.unwrap();
+    let body = serde_json::json!({
+        "ok": true,
+        "applied": { "projects": 1, "files": 2, "settings": false, "removed": 0 },
+        "warnings": ["Project p3 was skipped: its project.json could not be read."],
+        "added": ["opfs/projects/p1/notes.md"],
+    })
+    .to_string()
+    .into_bytes();
+    let done = format!("/api/backup/agent-import/{id}/done");
+    // Not from a caller without the secret; then from the page.
+    assert_eq!(call_from(&app, "POST", &done, Some("guess"), Some("oaiy://localhost"), body.clone()).await.0, 403);
+    assert!(agent::import_meta(&dst.0).pending, "still waiting");
+    assert_eq!(call_from(&app, "POST", &done, Some(&secret), Some("oaiy://localhost"), body).await.0, 200);
+    assert!(!agent::import_meta(&dst.0).pending);
+    assert_eq!(agent::read_added(&dst.0, &id), ["opfs/projects/p1/notes.md"]);
+    let last = restore::last_restore(&dst.0).unwrap();
+    assert_eq!(last.agent_storage, "applied");
+    assert!(last.notes.iter().any(|n| n.contains("project.json could not be read")), "{:?}", last.notes);
+}
+
+#[test]
+fn what_the_page_says_it_left_out_is_cut_and_limited_before_it_is_recorded() {
+    let src = TempDir::new("agent-notes-src");
+    realistic(&src.0, "A");
+    let out = TempDir::new("agent-notes-out");
+    let file = out.0.join("n.oaiybackup");
+    let page = Page { zip: agent_zip(), part_size: PART_SIZE, ok: true, warnings: vec![] };
+    make_with(&src.0, &file, PASS, false, Some(&page)).unwrap();
+    let dst = TempDir::new("agent-notes-dst");
+    restore::stage(&dst.0, &file, PASS, &Ticks::all(), &options()).unwrap();
+    assert!(matches!(restore::apply_pending(&dst.0), ApplyOutcome::Applied(_)));
+    let id = agent::import_meta(&dst.0).id.unwrap();
+    let warnings: Vec<String> = (0..500).map(|i| format!("{i}: {}", "long ".repeat(20_000))).collect();
+    agent::import_done(&dst.0, &id, agent::page_token(), &agent::ImportReport { ok: true, warnings, ..Default::default() }).unwrap();
+    let last = restore::last_restore(&dst.0).unwrap();
+    let from_page: Vec<&String> = last.notes.iter().filter(|n| n.starts_with("Agent: ")).collect();
+    assert_eq!(from_page.len(), 20, "only so many");
+    assert!(from_page.iter().all(|n| n.chars().count() <= 320), "each cut to what a panel shows");
+    assert!(fs::metadata(dst.0.join("restore").join("last-result.json")).unwrap().len() < 20_000, "and the result file stays small");
 }

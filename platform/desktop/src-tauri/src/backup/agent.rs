@@ -320,6 +320,52 @@ pub struct PendingImport {
     /// The person ticked the API keys: only then may the page take a key from the backup.
     #[serde(default)]
     pub apply_keys: bool,
+    /// An undo (or a redo): the Agent's files the restore being undone had added, to be taken away
+    /// again (names in the storage archive: `opfs/projects/<id>/...`, `opfs/front-desk/...`).
+    #[serde(default)]
+    pub remove: Vec<String>,
+}
+
+/// The most files the page lists as added by an import, and the longest name of one.
+pub const MAX_ADDED: usize = 20_000;
+const MAX_ADDED_NAME: usize = 1024;
+
+/// A file name the page reports or is told to take away: plain, and inside the storage.
+fn plausible_name(name: &str) -> bool {
+    !name.is_empty() && name.len() <= MAX_ADDED_NAME && !name.chars().any(char::is_control) && !name.starts_with('/') && !name.contains('\\') && !name.split('/').any(|s| s.is_empty() || s == "." || s == "..")
+}
+
+/// What an import did, as the page reports it (camelCase is not needed: these are one word each).
+#[derive(Clone, Debug, Default, Deserialize)]
+#[serde(default)]
+pub struct ImportReport {
+    pub ok: bool,
+    pub error: Option<String>,
+    /// The files the import wrote that were not there before: what an undo takes away.
+    pub added: Vec<String>,
+    /// What the page left out or could not do, in its own words.
+    pub warnings: Vec<String>,
+}
+
+fn added_path(data_dir: &Path, id: &str) -> PathBuf {
+    restore_dir(data_dir).join(format!("undo-{id}")).join("agent-added.json")
+}
+
+/// What the import of restore `id` added, as kept for its undo (only plausible names, and no more than [`MAX_ADDED`]).
+pub(crate) fn read_added(data_dir: &Path, id: &str) -> Vec<String> {
+    let listed: Vec<String> = std::fs::read_to_string(added_path(data_dir, id)).ok().and_then(|t| serde_json::from_str(&t).ok()).unwrap_or_default();
+    listed.into_iter().filter(|n| plausible_name(n)).take(MAX_ADDED).collect()
+}
+
+fn keep_added(data_dir: &Path, id: &str, added: &[String]) {
+    // Only where the restore's undo folder is (it is made when the restore is applied).
+    if !restore_dir(data_dir).join(format!("undo-{id}")).is_dir() {
+        return;
+    }
+    let names: Vec<&String> = added.iter().filter(|n| plausible_name(n)).take(MAX_ADDED).collect();
+    if let Err(e) = secret_file::write(&added_path(data_dir, id), serde_json::to_string(&names).unwrap_or_default()) {
+        log::warn!("backup: could not keep the list of files the Agent's import added: {e}");
+    }
 }
 
 /// What the page applies of the settings in the storage it takes back.
@@ -349,6 +395,9 @@ pub struct ImportMeta {
     pub part_size: Option<u64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub apply: Option<ImportApply>,
+    /// An undo: the files to take away again.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub remove: Vec<String>,
 }
 
 /// The secret the Agent's page uses for the import in this run of the app: a new one each start, so
@@ -367,13 +416,14 @@ pub(crate) fn read_pending_import(data_dir: &Path) -> Option<PendingImport> {
 }
 
 /// Leave `zip` (which is moved) for the page to import, replacing anything left from before.
-pub(crate) fn leave_for_page(data_dir: &Path, id: &str, kind: &str, zip: &Path, apply_settings: bool, apply_keys: bool) -> std::io::Result<()> {
+pub(crate) fn leave_for_page(data_dir: &Path, id: &str, kind: &str, zip: &Path, apply_settings: bool, apply_keys: bool, remove: &[String]) -> std::io::Result<()> {
     let dir = import_dir(data_dir);
     secret_file::create_private_dir(&dir)?;
     let (sha256, size) = sha256_file(zip)?;
     let _ = std::fs::remove_file(dir.join("current.json"));
     secret_file::rename_over(zip, &dir.join("current.zip"))?;
-    let meta = PendingImport { id: id.to_string(), kind: kind.to_string(), size, sha256, apply_settings, apply_keys };
+    let remove = remove.iter().filter(|n| plausible_name(n)).take(MAX_ADDED).cloned().collect();
+    let meta = PendingImport { id: id.to_string(), kind: kind.to_string(), size, sha256, apply_settings, apply_keys, remove };
     secret_file::write(&dir.join("current.json"), serde_json::to_string_pretty(&meta).unwrap_or_default())
 }
 
@@ -400,12 +450,13 @@ pub(crate) fn drop_pending_import(data_dir: &Path) {
 /// `GET /api/backup/agent-import` (the route checks the page's token with [`page_token_matches`]).
 pub fn import_meta(data_dir: &Path) -> ImportMeta {
     match read_pending_import(data_dir) {
-        None => ImportMeta { pending: false, id: None, kind: None, size: None, sha256: None, parts: None, part_size: None, apply: None },
+        None => ImportMeta { pending: false, id: None, kind: None, size: None, sha256: None, parts: None, part_size: None, apply: None, remove: Vec::new() },
         Some(p) => ImportMeta {
             pending: true,
             parts: Some(p.size.div_ceil(PART_SIZE as u64)),
             part_size: Some(PART_SIZE as u64),
             apply: Some(ImportApply { settings: p.apply_settings, keys: p.apply_keys }),
+            remove: p.remove,
             kind: Some(p.kind),
             size: Some(p.size),
             sha256: Some(p.sha256),
@@ -459,10 +510,8 @@ static UNDO_PROGRESS: Mutex<Option<HashMap<String, u32>>> = Mutex::new(None);
 
 /// `POST .../undo-part?seq=n`: one part of the page's snapshot of its storage before it imports.
 pub fn undo_part(data_dir: &Path, id: &str, token: &str, seq: u32, bytes: &[u8]) -> Result<(), PartError> {
-    let pending = check_import(data_dir, id, token)?;
-    if pending.kind != "restore" {
-        return Err(PartError::Closed);
-    }
+    // An undo takes a snapshot too (the redo): what it overwrites and takes away is nowhere else.
+    check_import(data_dir, id, token)?;
     if bytes.len() > PART_SIZE {
         return Err(PartError::TooLarge);
     }
@@ -491,10 +540,7 @@ pub fn undo_part(data_dir: &Path, id: &str, token: &str, seq: u32, bytes: &[u8])
 
 /// `POST .../undo-done`: the snapshot is whole (or the page says it failed, and it is thrown away).
 pub fn undo_done(data_dir: &Path, id: &str, token: &str, done: &DonePayload) -> Result<(), PartError> {
-    let pending = check_import(data_dir, id, token)?;
-    if pending.kind != "restore" {
-        return Err(PartError::Closed);
-    }
+    check_import(data_dir, id, token)?;
     let partial = undo_partial_path(data_dir, id);
     if !done.ok {
         let _ = std::fs::remove_file(&partial);
@@ -508,14 +554,21 @@ pub fn undo_done(data_dir: &Path, id: &str, token: &str, done: &DonePayload) -> 
         let _ = std::fs::remove_file(&partial);
         return Err(PartError::Sequence);
     }
+    // A copy from an earlier try stays: the page that tries again (it was closed part-way through the
+    // import) is looking at storage that is already half restored, and the first copy is the true one.
+    if undo_agent_path(data_dir, id).is_file() {
+        let _ = std::fs::remove_file(&partial);
+        return Ok(());
+    }
     secret_file::rename_over(&partial, &undo_agent_path(data_dir, id)).map_err(|_| PartError::Io)
 }
 
-/// `POST .../done`: the page has imported (or could not).
-pub fn import_done(data_dir: &Path, id: &str, token: &str, ok: bool, error: Option<&str>) -> Result<(), PartError> {
+/// `POST .../done`: the page has imported (or could not), and says which files it added.
+pub fn import_done(data_dir: &Path, id: &str, token: &str, report: &ImportReport) -> Result<(), PartError> {
     check_import(data_dir, id, token)?;
+    keep_added(data_dir, id, &report.added);
     drop_pending_import(data_dir);
-    super::restore::record_agent_result(data_dir, id, ok, error);
+    super::restore::record_agent_result(data_dir, id, report.ok, report.error.as_deref(), &report.warnings);
     Ok(())
 }
 

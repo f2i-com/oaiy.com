@@ -160,20 +160,12 @@ async fn undo_done(State(ctx): State<Ctx>, Path(id): Path<String>, headers: Head
     }
 }
 
-/// What the page says when it has imported (or could not).
-#[derive(Deserialize)]
-struct ImportDone {
-    ok: bool,
-    #[serde(default)]
-    error: Option<String>,
-}
-
-async fn import_done(State(ctx): State<Ctx>, Path(id): Path<String>, headers: HeaderMap, Json(done): Json<ImportDone>) -> Response {
+async fn import_done(State(ctx): State<Ctx>, Path(id): Path<String>, headers: HeaderMap, Json(done): Json<agent::ImportReport>) -> Response {
     if let Some(refused) = agent_page_only(&headers) {
         return refused;
     }
     let (dir, token) = (ctx.data_dir.clone(), token_of(&headers));
-    match tokio::task::spawn_blocking(move || agent::import_done(&dir, &id, &token, done.ok, done.error.as_deref())).await {
+    match tokio::task::spawn_blocking(move || agent::import_done(&dir, &id, &token, &done)).await {
         Ok(Ok(())) => Json(serde_json::json!({ "ok": true })).into_response(),
         Ok(Err(e)) => part_error(e),
         Err(_) => fail(StatusCode::INTERNAL_SERVER_ERROR, "could not finish"),
