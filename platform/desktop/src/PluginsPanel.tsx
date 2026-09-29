@@ -11,6 +11,7 @@ import {
   Trash2,
   Boxes,
   ListChecks,
+  ShieldCheck,
 } from 'lucide-react';
 import {
   appConfig,
@@ -30,6 +31,7 @@ import { openSetup, refetchSetup, useSetupState } from './useSetupState';
 import { peek, put } from './useCached';
 import { useToast } from './Toasts';
 import LogsViewer from './LogsViewer';
+import PackageTrustBadge from './PackageTrustBadge';
 
 /**
  * Plugins panel — install, start/stop, and monitor Bridge-Protocol plugins.
@@ -169,12 +171,21 @@ export default function PluginsPanel() {
       // A new plugin with a setup wizard: its wizard opens now. An update whose
       // setup went up gets a nudge on its card instead (it was set up before).
       const opensSetup = !!out.setup && !out.replaced;
+      // A release build does not start a package nobody signed until the person says so:
+      // not a failure, but "Click Start" would be the wrong thing to tell them.
+      const needsTrust = out.trust?.state === 'unsigned';
       toast.push({
         kind: 'success',
         title: out.replaced
           ? `Updated ${out.name} to v${out.version}`
           : `Installed ${out.name} v${out.version}`,
-        body: opensSetup ? 'Its setup opens now.' : out.setup ? 'If its setup has something new, its card says so.' : 'Click Start to run it.',
+        body: needsTrust
+          ? 'It is not signed, so it will not start until you trust it.'
+          : opensSetup
+            ? 'Its setup opens now.'
+            : out.setup
+              ? 'If its setup has something new, its card says so.'
+              : 'Click Start to run it.',
       });
       setInstallSource('');
       void refetchModules();
@@ -194,6 +205,24 @@ export default function PluginsPanel() {
       await runAction(p.id, async () => {
         await plugins.uninstall(p.id);
         toast.push({ kind: 'success', title: `Removed ${name}` });
+      });
+    },
+    [runAction, toast],
+  );
+
+  const trustPlugin = useCallback(
+    async (p: PluginRecord) => {
+      const name = p.manifest?.name ?? p.id;
+      if (
+        !confirm(
+          `Trust the “${name}” plugin?\n\nIt is not signed, so OAIY cannot tell who made it. Trusting it lets it run as native code with your permissions. ` +
+            'The trust is for this exact package only: if any of its files change, you are asked again.\n\nOnly trust a plugin you built yourself or got from someone you trust.',
+        )
+      )
+        return;
+      await runAction(p.id, async () => {
+        await plugins.trust(p.id);
+        toast.push({ kind: 'success', title: `Trusted ${name}`, body: 'Click Start to run it.' });
       });
     },
     [runAction, toast],
@@ -302,6 +331,7 @@ export default function PluginsPanel() {
                 runAction(p.id, () => plugins.setEnabled(p.id, p.userDisabled))
               }
               onViewLogs={() => setLogsFor(p.id)}
+              onTrust={() => void trustPlugin(p)}
               onUninstall={() => void uninstallPlugin(p)}
             />
           ))}
@@ -365,6 +395,8 @@ interface CardProps {
   onStop: () => void;
   onToggleEnabled: () => void;
   onViewLogs: () => void;
+  /** Trust this exact, unsigned package (offered only when a release build is holding it back). */
+  onTrust: () => void;
   onUninstall: () => void;
 }
 
@@ -378,11 +410,18 @@ function PluginCard({
   onStop,
   onToggleEnabled,
   onViewLogs,
+  onTrust,
   onUninstall,
 }: CardProps) {
   const loadable = isLoadable(p);
   const needsSetup = setupStatus === 'needs-setup';
   const running = p.state === 'running' || p.state === 'unhealthy' || p.state === 'starting';
+  // The host will not start this package: it failed its signature, or it has none and
+  // this is a release build. A quarantined package cannot be trusted by hand; an
+  // unsigned one can, and only this build's policy holds it back.
+  const quarantined = p.trust?.state === 'quarantined';
+  const unsigned = p.trust?.state === 'unsigned';
+  const heldBack = quarantined || unsigned;
   const connectorCount =
     p.manifest?.connectors?.reduce((n, c) => n + c.commands.length, 0) ?? 0;
 
@@ -395,6 +434,7 @@ function PluginCard({
         {p.manifest?.version && (
           <span className="card-note">v{p.manifest.version}</span>
         )}
+        {p.trust && <PackageTrustBadge trust={p.trust} />}
         {p.userDisabled && <span className="badge badge-neutral">disabled by you</span>}
         {setupTitle && setupStatus === 'set-up' && (
           <span className="badge badge-ok" title={`${setupTitle}: done`}>
@@ -422,6 +462,11 @@ function PluginCard({
           because "it won't start" with no cause is the least useful state. */}
       {p.state !== 'running' && p.reason && (
         <p className="card-reason">{p.reason}</p>
+      )}
+      {/* A plugin that is up keeps running when its folder stops verifying, and has no
+          reason of its own to show: say what changed, or it looks fine. */}
+      {p.state === 'running' && heldBack && p.trust?.reason && (
+        <p className="card-reason">{p.trust.reason}</p>
       )}
 
       {loadable && (
@@ -463,14 +508,26 @@ function PluginCard({
             onClick={onStart}
             disabled={!loadable || p.userDisabled}
             title={
-              !loadable
-                ? 'This plugin cannot start — its manifest is invalid.'
-                : p.userDisabled
-                  ? 'Turned off. Enable it first.'
-                  : undefined
+              quarantined
+                ? 'This package failed its signature check, so it will not start.'
+                : unsigned
+                  ? 'This package is not signed. Trust it first to be able to start it.'
+                  : !loadable
+                    ? 'This plugin cannot start — its manifest is invalid.'
+                    : p.userDisabled
+                      ? 'Turned off. Enable it first.'
+                      : undefined
             }
           >
             <Play size={14} /> Start
+          </button>
+        )}
+
+        {/* Only for a package nobody signed, in a build that holds it back. A package
+            that carries a signature is verified or quarantined by that signature alone. */}
+        {unsigned && !pending && (
+          <button className="btn btn-secondary" onClick={onTrust} title="Let this exact package run. A change to any of its files asks again.">
+            <ShieldCheck size={14} /> Trust this plugin
           </button>
         )}
 

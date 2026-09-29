@@ -366,6 +366,32 @@ export type PluginState =
   | 'crashed'
   | 'disabled';
 
+/**
+ * What is known about a plugin's package (`plugins/trust.rs`).
+ *
+ * `verified`: signed by a publisher this OAIY trusts, every file as signed.
+ * `quarantined`: it carries a signature that does not check out; never started.
+ * `unsigned`: no signature, in a release build, and not trusted by the person; never
+ * started until they trust this exact package.
+ * `unsigned-dev`: no signature; it runs because this is a developer build.
+ * `trusted-local`: no signature; the person trusted this exact package.
+ */
+export type PackageTrustState = 'verified' | 'quarantined' | 'unsigned' | 'unsigned-dev' | 'trusted-local';
+
+export interface PackageTrust {
+  state: PackageTrustState;
+  /** Who signed it (`verified` only). */
+  publisher?: string;
+  /** The pinned key that verified it (`verified` only). */
+  keyId?: string;
+  /** The release the signer wrote into the signed payload (`verified` only). */
+  version?: string;
+  /** Why, for every state but `verified`. */
+  reason?: string;
+  /** When the person trusted it (`trusted-local` only). */
+  trustedAt?: string;
+}
+
 /** One plugin as the registry reports it (`GET /api/plugins`). */
 export interface PluginRecord {
   id: string;
@@ -373,6 +399,8 @@ export interface PluginRecord {
   /** Present for every state that is not `running`. */
   reason?: string;
   dir: string;
+  /** Absent only when the manifest could not be loaded. */
+  trust?: PackageTrust;
   manifest?: {
     name: string;
     version: string;
@@ -836,12 +864,18 @@ export const plugins = {
     ),
   /** Install (or replace) a plugin from a path on this machine — a plugin folder
    *  or a .tar.gz of one. Installing native code, so it's Desktop-window only.
-   *  `setup` is there when the plugin declares a setup wizard. */
+   *  `setup` is there when the plugin declares a setup wizard; `trust` is what its
+   *  package was found to be (a signed package that fails is not installed at all). */
   install: (source: string) =>
-    request<{ id: string; name: string; version: string; replaced: boolean; setup?: { version: number; title: string } }>(
+    request<{ id: string; name: string; version: string; replaced: boolean; trust?: PackageTrust; setup?: { version: number; title: string } }>(
       '/api/plugins/install',
       { method: 'POST', body: JSON.stringify({ source }) },
     ),
+  /** Trust this exact, unsigned package (bound to a digest of its files: a change to
+   *  any file needs it again). Takes the plugin's id and nothing else; Desktop-window
+   *  only, like install. */
+  trust: (id: string) =>
+    request<PluginRecord>(`/api/plugins/${encodeURIComponent(id)}/trust`, { method: 'POST' }),
   /** Stop a plugin and remove it from disk. */
   uninstall: (id: string) =>
     request<void>(`/api/plugins/${encodeURIComponent(id)}`, { method: 'DELETE' }),
