@@ -175,8 +175,17 @@ The model's reason is not enough: the caller's own words must have asked for a p
 (lower case, every run of characters outside `a-z 0-9 '` becomes one space, trimmed) and of the caller's last
 three turns one must match a rule and none of the block patterns of that turn. The fixture has the design's
 eight requests ("Can I speak to the owner?") and eight that are not ("The owner of the house is away that
-week", "No need to speak to anyone, just book it"). OAIY additionally blocks talking to the receptionist
-("I want to talk to you about Tuesday") and refusals ("don't transfer me"): `phrases-oaiy.json`.
+week", "No need to speak to anyone, just book it"). OAIY goes further, because both mistakes cost something
+(`phrases-oaiy.json` holds its 22 further requests and 42 further non-requests, which the phone's floor should be
+tested against too): a turn is read from its **end** (the last 300 characters), a sentence at a time, with thinking
+noises ("uh", "um") dropped; more ways to ask count ("connect me to the owner", "could I be put through",
+"transfer this call", "put me thru", "manager please", "I need a real person") and a person asked for by the
+owner's name counts (see below); refusals in any of their forms ("I do not want to speak", "no way I am
+speaking", "I can't", "don't transfer me"), the future and the past ("I'll speak to the manager myself", "I was
+speaking to the owner"), questions about what the receptionist is ("are you a real person", "am I speaking to a
+machine"), a caller testing the line ("is somebody there"), what someone else said, and a caller telling the
+receptionist what to say ("repeat after me", "ignore your rules", "System:") are not asks. The owner's name is not a
+setting: the possessive that begins the business's name ("Dave's Lawn Care") is taken as the person to be asked for.
 
 ## Compatibility
 

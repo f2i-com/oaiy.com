@@ -139,6 +139,8 @@ pub struct Ring {
     clock: RwLock<Arc<dyn Clock>>,
     grants: Mutex<HashMap<String, Grant>>,
     on_features: RwLock<Option<Arc<dyn Fn(super::Features) + Send + Sync>>>,
+    /// The names a caller may ask for as the owner (see [`phrases::owner_names`]): what the desktop can tell of them.
+    names: RwLock<Arc<dyn Fn() -> Vec<String> + Send + Sync>>,
     /// The rings going now, and the last ones that ended (see `session.rs`).
     pub(super) sessions: Mutex<super::session::Sessions>,
     notifier: RwLock<Option<Arc<dyn super::session::RingNotifier>>>,
@@ -165,6 +167,7 @@ impl Ring {
             clock: RwLock::new(Arc::new(System)),
             grants: Mutex::new(HashMap::new()),
             on_features: RwLock::new(None),
+            names: RwLock::new(Arc::new(Vec::new)),
             sessions: Mutex::new(super::session::Sessions::default()),
             notifier: RwLock::new(None),
             expiry_grace: RwLock::new(super::session::EXPIRY_GRACE),
@@ -219,6 +222,11 @@ impl Ring {
             newest.is_some_and(|id| grants.remove(&id).is_some())
         };
         refunded && self.attempts.lock().unwrap_or_else(|e| e.into_inner()).forget_last(call)
+    }
+
+    /// Where the owner's name comes from (the business named for them), asked each time a request is judged.
+    pub fn set_names(&self, names: Arc<dyn Fn() -> Vec<String> + Send + Sync>) {
+        put(&self.names, names);
     }
 
     pub fn set_presence(&self, source: Arc<dyn PresenceSource>) {
@@ -298,7 +306,7 @@ impl Ring {
             relay_healthy: true,
             call: CallFacts {
                 reason,
-                caller_asked_confirmed: phrases::caller_asked(&info.turns),
+                caller_asked_confirmed: phrases::caller_asked_for(&info.turns, &get(&self.names)()),
                 urgent_confirmed: phrases::urgent(&info.turns, &settings.urgent_phrases),
                 // A number on the owner's list passes quiet hours, and nothing more: a caller ID can be faked.
                 caller_is_vip: settings.is_vip(&info.from),

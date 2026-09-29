@@ -1623,6 +1623,8 @@ pub async fn serve(
     if let Some(ring) = crate::ring::shared() {
         ring.set_devices(std::sync::Arc::new(crate::ring::devices::CompanionDevices::new(companion.clone(), "aokie")));
         bridge.host.set_ring(ring.clone());
+        // A caller who asks for the owner by name is asking for the owner: the name is the business's, when it is named for a person.
+        ring.set_names(std::sync::Arc::new(|| crate::calendar::shared().map(|c| crate::ring::phrases::owner_names(&c.settings().business)).unwrap_or_default()));
         if gui_mode {
             ring.set_presence(std::sync::Arc::new(crate::ring::presence::IdlePresence::os(ring.settings.clone())));
         }

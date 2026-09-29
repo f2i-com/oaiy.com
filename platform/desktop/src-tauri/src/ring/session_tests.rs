@@ -578,6 +578,25 @@ fn a_try_the_plugin_refused_before_any_ring_is_given_back_with_its_gap_and_one_t
 }
 
 #[test]
+fn a_caller_who_asks_for_the_owner_by_name_rings_only_when_the_desktop_knows_that_name() {
+    let r = rig(Presence::Active);
+    r.calls.info.lock().unwrap().clear();
+    r.calls.info.lock().unwrap().push((CALL.into(), caller("+61491570006", "Alex", "Can I speak to Dave please")));
+    // Nothing tells the desktop who the owner is: it is not a request for the owner.
+    let plan = r.ring.authorise(CALL, Reason::CallerAsked);
+    assert_eq!((plan.plan.decision, plan.plan.reason), (Decision::Refused, PlanReason::CallerDidNotAsk));
+    // The business is named for them (Dave's Lawn Care): it is.
+    r.ring.set_names(Arc::new(|| super::phrases::owner_names("Dave's Lawn Care")));
+    assert!(r.ring.authorise(CALL, Reason::CallerAsked).rings());
+    // Someone else's name is still not.
+    let other = rig(Presence::Active);
+    other.ring.set_names(Arc::new(|| super::phrases::owner_names("Dave's Lawn Care")));
+    other.calls.info.lock().unwrap().clear();
+    other.calls.info.lock().unwrap().push((CALL.into(), caller("+61491570006", "Alex", "Can I speak to Sam please")));
+    assert_eq!(other.ring.authorise(CALL, Reason::CallerAsked).plan.reason, PlanReason::CallerDidNotAsk);
+}
+
+#[test]
 fn a_second_try_on_one_call_straight_after_the_first_is_refused() {
     let r = rig(Presence::Active);
     let plan = planned(&r.ring, CALL);
