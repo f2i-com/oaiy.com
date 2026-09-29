@@ -50,6 +50,8 @@ function answer(body) {
     asked.push('call');
     if (/Tuesday/i.test(last)) return { text: 'Tuesday at ten is free. Shall I ask the team for it?', hold: 14 };
     if (/please do/i.test(last)) return { text: 'Done, Lance. Anything else?' };
+    // The goodbye, then a word after it that is never said (a model often writes "Done." after end_call).
+    if (/that's all/i.test(last)) return steps === 0 ? { calls: [{ name: 'end_call', input: { goodbye: 'Bye, Lance!' } }] } : { text: 'Done.' };
     return { text: 'Hi Lance! How can I help?' };
   }
   if (/text-message thread/.test(system)) {
@@ -372,6 +374,25 @@ try {
     expect(lance.length >= 1 && lance.every((n) => n.number === '+61491570006'), JSON.stringify(named));
   });
 
+  await check('the call\'s goodbye is said, and "Done." written after end_call is a quiet note, never a line of the receptionist\'s', async () => {
+    const before = spoken.length;
+    voice({ type: 'call.caller', callId: 'live-1', text: "No, that's all. Bye!", startMs: 20_000, endMs: 21_200 });
+    await page.waitForFunction(() => [...document.querySelectorAll('.chat-feed .msg.unsaid')].some((n) => /Done\./.test(n.textContent)), { timeout: 10_000 });
+    await wait(400);
+    const drawn = await page.evaluate(() => ({
+      replies: [...document.querySelectorAll('.chat-feed .msg.assistant .msg-body')].map((e) => e.textContent.trim()),
+      unsaid: [...document.querySelectorAll('.chat-feed .msg.unsaid')].map((e) => ({ label: e.querySelector('.unsaid-label')?.textContent, text: e.querySelector('.unsaid-text')?.textContent, inRun: !!e.closest('.run') })),
+      ended: !!document.querySelector('.chat-feed details.tool[data-tool="end_call"]'),
+    }));
+    expect(!drawn.replies.includes('Done.'), JSON.stringify(drawn.replies.slice(-4)));
+    const done = drawn.unsaid.find((u) => u.text === 'Done.');
+    expect(done && /^Not said/.test(done.label) && !done.inRun && drawn.ended, JSON.stringify(drawn));
+    // Replied. (the texts' agent's own words after send_text_message) is a note too.
+    expect(drawn.unsaid.some((u) => u.text === 'Replied.' && /^Not sent/.test(u.label)), JSON.stringify(drawn.unsaid));
+    expect(!spoken.slice(before).some((s) => /Done/.test(s)), JSON.stringify(spoken.slice(before)));
+  });
+  await shoot(page, 'unsaid');
+
   voice({ type: 'call.ended', callId: 'live-1' });
   liveCalls = [];
   await wait(800);
@@ -400,10 +421,12 @@ try {
     await wait(400);
     const drawn = await page.evaluate(() => ({
       sent: [...document.querySelectorAll('.chat-feed .sms-out .sms-body')].map((e) => e.textContent).filter((t) => /10:15/.test(t)),
-      replies: [...document.querySelectorAll('.chat-feed .msg.assistant .msg-body')].map((e) => e.textContent.trim()).filter((t) => /Told him|that is fine/.test(t)),
+      // The texts' agent's own words (not a text it sent): a quiet note, not a reply.
+      replies: [...document.querySelectorAll('.chat-feed .msg.unsaid .unsaid-text')].map((e) => e.textContent.trim()).filter((t) => /Told him|that is fine/.test(t)),
+      bubbles: [...document.querySelectorAll('.chat-feed .msg.assistant .msg-body')].map((e) => e.textContent.trim()).filter((t) => /Told him|that is fine/.test(t)).length,
       text: [...document.querySelectorAll('.chat-feed .msg.incoming.texter .msg-body')].map((e) => e.textContent).filter((t) => /Running late/.test(t)).length,
     }));
-    expect(drawn.sent.length === 1 && drawn.replies.length === 1 && drawn.replies[0] === 'Told him that is fine.' && drawn.text === 1, JSON.stringify(drawn));
+    expect(drawn.sent.length === 1 && drawn.replies.length === 1 && drawn.replies[0] === 'Told him that is fine.' && drawn.bubbles === 0 && drawn.text === 1, JSON.stringify(drawn));
     await openPicker(page);
     const lance = (await pickerOptions(page)).filter((o) => o.name?.startsWith('Lance'));
     expect(lance.length === 1, JSON.stringify(lance));

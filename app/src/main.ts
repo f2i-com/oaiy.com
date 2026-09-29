@@ -581,7 +581,7 @@ async function main(): Promise<void> {
         },
         event: (session, event) => {
           noteModelEvent(event);
-          if (viewing === session.thread && streams(session)) chat.event(event);
+          if (viewing === session.thread && streams(session)) chat.event(event, session.kind);
           if (event.type === 'tool_result') void own.save(session).catch(() => {});
         },
       },

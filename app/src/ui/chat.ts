@@ -150,6 +150,10 @@ export class ChatPane {
   /** What the agent is doing now, shown under the step in progress. */
   private readonly planActivity = h('span.plan-activity');
   private current: { box: HTMLElement; text: string; body: HTMLElement } | null = null;
+  /** Words the agent wrote that no one on the phone got (see unsaidWhy), shown as a quiet note as they come. */
+  private quiet: { box: HTMLElement; text: string; body: HTMLElement } | null = null;
+  /** A call's goodbye has been said (end_call), or the call ended: its agent's words from here are not said, until the next call. */
+  private callOver: false | 'goodbye' | 'ended' = false;
   private thinking: { box: HTMLElement; text: string } | null = null;
   /** A tool call being written, shown as it streams until the call is whole. */
   private draft: { box: HTMLElement; body: HTMLElement; raw: string; json: boolean } | null = null;
@@ -448,6 +452,8 @@ export class ChatPane {
    */
   private add(entry: HTMLElement, speaker: Speaker | null = null, who = ''): void {
     const box = this.sink ?? this.feed;
+    // Anything else after unsaid words: what the agent writes next is a note of its own.
+    if (this.quiet && entry !== this.quiet.box) this.quiet = null;
     if (!this.sink && !this.replaying) {
       this.follow.arrived(entry.matches('.msg.user, .msg.incoming, .msg.assistant, .msg.system, .sms-out'));
       this.showJump();
@@ -538,6 +544,8 @@ export class ChatPane {
 
   /** The strip over a call going on now: a pulsing dot, who, and how long. */
   private showLive(live: boolean, name: string): void {
+    // The call shown has ended: what its agent writes now is not said.
+    if (this.live && !live) this.callOver = 'ended';
     if (live !== this.live && !this.busy) {
       this.live = live;
       this.input.placeholder = this.placeholder();
@@ -681,6 +689,8 @@ export class ChatPane {
     this.cards.clear();
     this.current = null;
     this.thinking = null;
+    this.quiet = null;
+    this.callOver = false;
     this.updateEmpty();
   }
 
@@ -840,6 +850,7 @@ export class ChatPane {
   /** A run ended (finished, or cut off): what the agent writes next is a new reply. */
   endReply(): void {
     this.current = null;
+    this.quiet = null;
     this.thinking = null;
   }
 
@@ -878,6 +889,8 @@ export class ChatPane {
           // Back on the call after texts that came during it.
           if (this.way === 'sms') this.wayDivider('call');
           this.way = 'call';
+          // They speak: the call goes on (a goodbye refused, or spoken over), and its agent is heard.
+          this.callOver = false;
           // A live call: the caller's time tells when the call began (the note that began it says only its minute).
           if (!this.replaying && part.atMs !== undefined) this.callStartAt = Date.now() - part.atMs;
           const tags: HTMLElement[] = [];
@@ -1054,6 +1067,33 @@ export class ChatPane {
     this.redraw(target.box, () => {
       target.body.innerHTML = renderMarkdown(target.text);
     });
+  }
+
+  /**
+   * Why the agent's words in a person's conversation reached no one, or null
+   * when they did: its texts' agent reaches them only with send_text_message
+   * (anything else it writes is for the person watching), and a call's agent
+   * is not heard once its goodbye is said or the call has ended.
+   */
+  private unsaidWhy(via: string | undefined): string | null {
+    if (this.kind !== 'call' && this.kind !== 'sms') return null;
+    const lane = via ?? (this.kind === 'call' ? 'call' : undefined);
+    if (lane === 'sms') return 'Not sent: a note for you';
+    if (lane === 'call' && this.callOver) return this.callOver === 'goodbye' ? 'Not said: written after the goodbye' : 'Not said: written after the call ended';
+    return null;
+  }
+
+  /** Words no one on the phone got, as they come: a quiet note of no one's (never a line of the receptionist's). */
+  private quietText(delta: string, why: string): void {
+    if (!this.quiet) {
+      const body = h('span.unsaid-text');
+      const box = h('div.msg.unsaid', { title: 'The agent wrote this, but it was neither spoken on the call nor sent as a text' }, icon('eye'), h('span.unsaid-label', why), body);
+      this.add(box);
+      this.quiet = { box, text: '', body };
+    }
+    this.quiet.text += delta;
+    this.quiet.body.textContent = this.quiet.text.trim();
+    if (!this.replaying) this.scroll();
   }
 
   /** A tool call's row: what it did in plain words, on what, and (opened) its arguments and result. */
@@ -1319,6 +1359,8 @@ export class ChatPane {
   }
 
   private toolResult(result: ToolResult): void {
+    // The goodbye is being said: the call's agent is not heard from here.
+    if (result.name === 'end_call' && !result.isError && !/^(Not yet|Could not)/.test(result.content)) this.callOver = 'goodbye';
     const card = this.cards.get(result.id);
     if (!card) return;
     this.settle(card, result.isError);
@@ -1354,12 +1396,16 @@ export class ChatPane {
     this.scroll();
   }
 
-  event(e: AgentEvent): void {
+  /** What an agent is doing; `via`, in a person's conversation, the lane it is (their calls' agent, or their texts'). */
+  event(e: AgentEvent, via?: 'call' | 'sms' | 'task'): void {
     switch (e.type) {
-      case 'text':
+      case 'text': {
         this.doneThinking();
-        this.assistantText(e.delta);
+        const why = this.unsaidWhy(via);
+        if (why) this.quietText(e.delta, why);
+        else this.assistantText(e.delta);
         break;
+      }
       case 'thinking':
         if (!this.thinking) {
           const box = this.thoughtBox('', true);
@@ -1437,6 +1483,7 @@ export class ChatPane {
         break;
       case 'done':
         this.current = null;
+        this.quiet = null;
         this.setActivity('');
         break;
       case 'error':
@@ -1576,6 +1623,7 @@ export class ChatPane {
     const name = callerName(start.name);
     this.callName = name;
     this.way = 'call';
+    this.callOver = false;
     const what = start.direction === 'in' ? `Call from ${name}` : start.direction === 'back' ? `Called ${name} back` : `Called ${name}`;
     const when = start.at ? `${dayLabel(start.at)} · ${timeLabel(start.at)}` : start.when;
     this.add(h('div.day-divider', { title: start.number ? `${start.name} (${formatNumber(start.number)})` : start.name }, h('span.day-divider-text', icon('phone'), h('strong', when), h('span', what))));
@@ -1611,6 +1659,7 @@ export class ChatPane {
       const ended = parseCallEnd(turn.text);
       if (ended !== null) {
         this.add(h('div.call-end', h('span.call-end-pill', icon('phone-off'), h('span', ended ? `The call ended: ${ended}` : 'The call ended'))));
+        this.callOver = 'ended';
         return;
       }
       this.add(h('div.msg.nudge', icon('refresh'), h('span', turn.text.replace(/^\[(?:OAIY|bot\.computer)\] /, '').split('\n')[0])), 'agent');
@@ -1626,8 +1675,12 @@ export class ChatPane {
       this.user(attached ? text.slice(0, attached.index) : text, turn.attachments ?? fallback, !!during);
     } else if (turn.role === 'assistant') {
       if (turn.thinking) this.thoughtBox(turn.thinking);
-      if (turn.text) this.assistantText(turn.text);
+      // Words that reached no one on the phone (kept in the turn as the agent wrote them) read as a quiet note.
+      const why = turn.text ? this.unsaidWhy(turn.via) : null;
+      if (why) this.quietText(turn.text, why);
+      else if (turn.text) this.assistantText(turn.text);
       this.current = null;
+      this.quiet = null;
       for (const call of turn.calls) {
         this.toolCard(call);
         if (call.name === 'update_plan') {
