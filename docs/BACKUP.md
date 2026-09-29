@@ -159,9 +159,11 @@ in parts through internal routes with a secret made for that one backup.
 - Every file the backup writes (the staged copies, the output, the restored files) is created
   private from its first byte. On Windows a file inherits the access rights of its folder, which
   in the default data folder keeps other accounts out.
-- Opening a backup asks for as much memory as its scrypt work factor needs (about 256 MiB at age's
-  default on a typical computer, more on a fast one). OAIY refuses a file that asks for more than
-  age's own command line accepts.
+- Making and opening a backup take about a second of computing and as much memory as the scrypt
+  work factor needs: age picks the factor for about a second on the computer that makes the
+  file, which is about 256 MiB on a typical computer and 1 GiB on a fast one (the file records
+  it, and opening it needs the same on any computer). OAIY refuses a file that asks for more
+  than age's own command line accepts (4 GiB).
 
 ## Known limits
 
