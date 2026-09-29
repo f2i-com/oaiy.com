@@ -38,6 +38,8 @@ import { imageForMessage, imageMimeFor, type ImagePart } from './agent/images';
 import type { Attachment } from './agent/protocol';
 import { flagPicture } from './agent/review';
 import { FileTree } from './ui/tree';
+import { ProjectPicker } from './ui/projectPicker';
+import { icon } from './ui/icons';
 import { FRONT_DESK, FRONT_DESK_BRIEF, OpenProject, clearIncognito, createProject, deleteProject, listProjects, renameProject, type ProjectMeta } from './vfs/projects';
 import { addOaiyOrigin, setIncognito } from './privacy';
 import { providerEndpoints, providerHeaders } from './agent/providers/providerConnection';
@@ -1055,10 +1057,10 @@ A project can hold several apps, each in its own folder (any folder whose manife
   );
   const header = h(
     'header.topbar',
-    h('button.menu-toggle', { title: 'Project menu', 'aria-label': 'Project menu', onclick: () => header.classList.toggle('menu-open') }, IN_OAIY ? 'Project ▾' : '☰'),
     h('div.brand', h('span.logo', '◆'), h('span.brand-name', ' OAIY')),
     incognitoChip,
-    projectSelect,
+    new ProjectPicker(projectSelect).element,
+    h('button.menu-toggle', { title: 'Project menu: new, open, import, export, rename…', 'aria-label': 'Project menu', 'aria-haspopup': 'menu', onclick: () => header.classList.toggle('menu-open') }, icon('more')),
     actions,
     h('div.spacer'),
     phoneChip,
@@ -1229,9 +1231,14 @@ With that done, Settings → Images, video and audio → Find OAIY sets it up.`)
       callChip.title = viewing === live.id ? `On a call with ${live.title}: shown here` : `On a call with ${live.title}: click to show it`;
     }
     chat.setSessions([
-      { id: null, label: project === frontDesk ? '🧭 The runner' : '💬 Project', title: `${project.meta.name}: your conversation with the agent`, status: project === frontDesk ? "Your conversation: it directs the phone's agents" : `Your conversation in ${project.meta.name}`, unread: 0, working: !!currentRun },
+      { id: null, label: project === frontDesk ? '🧭 The runner' : '💬 Project', title: `${project.meta.name}: your conversation with the agent`, status: project === frontDesk ? "Your conversation: it directs the phone's agents" : `Your conversation in ${project.meta.name}`, unread: 0, working: !!currentRun, kind: project === frontDesk ? 'runner' : 'project', name: project === frontDesk ? 'The runner' : project.meta.name },
       ...shownSessions.map((s) => ({
         id: s.id,
+        kind: s.kind,
+        name: s.key === TEST_NUMBER ? 'Test' : s.title,
+        key: s.key,
+        lastAt: s.lastAt,
+        live: !!s.callId,
         status: s.callId ? 'On a call now' : s.running ? 'Working…' : `${s.kind === 'call' ? 'Calls' : s.kind === 'task' ? 'Flow tasks' : 'Texts'} · ${since(s.lastAt)}`,
         label: s.key === TEST_NUMBER ? '💬 Test' : `${s.kind === 'call' ? '📞' : s.kind === 'task' ? '🔀' : '💬'} ${s.title}`,
         title: s.kind === 'task' ? `The tasks your flow "${s.title}" gives the agent` : `${s.kind === 'call' ? (s.callId ? 'On a call with' : 'Calls with') : 'Text messages with'} ${s.title}${s.title !== s.key ? ` (${s.key})` : ''}`,
