@@ -5,12 +5,12 @@
  * Allows the user to browse and load each required package before continuing.
  */
 
-import { useState, useCallback, useEffect, useRef } from 'react';
-import { createPortal } from 'react-dom';
+import { useState, useCallback } from 'react';
 import { open } from '@tauri-apps/plugin-dialog';
 import { invoke } from '@tauri-apps/api/core';
+import { Check, FolderOpen, Layers } from 'lucide-react';
 import type { OAIYPackageManifest } from 'oaiy-core';
-import { useFocusTrap } from '../../hooks/useFocusTrap';
+import Dialog from '../ui/Dialog';
 
 interface PackageDependency {
   id: string;
@@ -118,23 +118,8 @@ export function DependencyDialog({
   onContinueAnyway,
   onCancel,
 }: DependencyDialogProps) {
-  const dialogRef = useRef<HTMLDivElement>(null);
-  useFocusTrap(dialogRef, isOpen);
-
-  // Escape closes — matches the rest of the app's modal convention.
-  // Cancel is the safe default (the package isn't loaded yet, so the
-  // user just bows out without partial state).
-  useEffect(() => {
-    if (!isOpen) return;
-    const onKey = (e: KeyboardEvent) => {
-      if (e.key === 'Escape') {
-        e.preventDefault();
-        onCancel();
-      }
-    };
-    window.addEventListener('keydown', onKey);
-    return () => window.removeEventListener('keydown', onKey);
-  }, [isOpen, onCancel]);
+  // Escape and the overlay cancel — the safe default (the package isn't
+  // loaded yet, so the user just bows out without partial state).
 
   const [statuses, setStatuses] = useState<Map<string, DependencyStatus>>(() => {
     const initial = new Map<string, DependencyStatus>();
@@ -261,146 +246,81 @@ export function DependencyDialog({
 
   if (!isOpen) return null;
 
-  return createPortal(
-    <div className="fixed inset-0 bg-black/70 backdrop-blur-sm z-[9999] flex items-center justify-center p-4">
-      <div
-        ref={dialogRef}
-        className="bg-white dark:bg-slate-900 rounded-2xl border border-slate-200 dark:border-slate-700/50 w-full max-w-lg shadow-2xl"
-        role="dialog"
-        aria-modal="true"
-        aria-labelledby="dep-dialog-title"
-      >
-        {/* Header */}
-        <div className="px-5 py-4 border-b border-slate-200 dark:border-slate-700/50">
-          <div className="flex items-center gap-3">
-            <div className="w-10 h-10 rounded-xl bg-purple-600/20 flex items-center justify-center">
-              <svg className="w-5 h-5 text-purple-400" fill="none" stroke="currentColor" viewBox="0 0 24 24">
-                <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M19 11H5m14 0a2 2 0 012 2v6a2 2 0 01-2 2H5a2 2 0 01-2-2v-6a2 2 0 012-2m14 0V9a2 2 0 00-2-2M5 11V9a2 2 0 012-2m0 0V5a2 2 0 012-2h6a2 2 0 012 2v2M7 7h10" />
-              </svg>
-            </div>
-            <div>
-              <h3 id="dep-dialog-title" className="text-sm font-semibold text-slate-900 dark:text-slate-100">Required Packages</h3>
-              <p className="text-xs text-slate-400">
-                "{packageName}" needs the following packages
-              </p>
-            </div>
-          </div>
-        </div>
+  const pill = (status: DependencyStatus['status']) =>
+    status === 'loaded' ? 'oaiy-pill dot ok'
+      : status === 'loading' ? 'oaiy-pill dot accent live'
+      : status === 'version_mismatch' ? 'oaiy-pill dot warn'
+      : 'oaiy-pill dot';
+  const said = (dep: DependencyStatus) =>
+    dep.status === 'loaded' ? 'loaded'
+      : dep.status === 'loading' ? 'loading'
+      : dep.status === 'version_mismatch' ? 'wrong version'
+      : 'missing';
 
-        {/* Content */}
-        <div className="px-5 py-4">
-          <p className="text-sm text-slate-600 dark:text-slate-300 mb-4">
-            Load the required packages to ensure all features work correctly.
-          </p>
-
-          {/* Dependency list */}
-          <div className="space-y-2 mb-4 max-h-64 overflow-y-auto">
-            {Array.from(statuses.values()).map((dep) => (
-              <div
-                key={dep.id}
-                className={`
-                  flex items-center gap-3 p-3 rounded-lg border
-                  ${dep.status === 'loaded'
-                    ? 'bg-green-50 dark:bg-green-950/30 border-green-500/30'
-                    : dep.status === 'version_mismatch'
-                    ? 'bg-amber-50 dark:bg-amber-950/30 border-amber-500/30'
-                    : dep.status === 'loading'
-                    ? 'bg-blue-50 dark:bg-blue-950/30 border-blue-500/30'
-                    : 'bg-slate-50 dark:bg-slate-800/50 border-slate-200 dark:border-slate-700/30'
-                  }
-                `}
-              >
-                {/* Status indicator */}
-                <div
-                  className={`w-2.5 h-2.5 rounded-full flex-shrink-0 ${
-                    dep.status === 'loaded'
-                      ? 'bg-green-400'
-                      : dep.status === 'loading'
-                      ? 'bg-blue-400 animate-pulse'
-                      : dep.status === 'version_mismatch'
-                      ? 'bg-amber-400'
-                      : 'bg-slate-500'
-                  }`}
-                />
-
-                {/* Package info */}
-                <div className="flex-1 min-w-0">
-                  <div className="text-sm font-medium text-slate-700 dark:text-slate-200">{dep.id}</div>
-                  <div className="text-xs text-slate-500">
-                    {dep.status === 'loaded'
-                      ? `v${dep.loadedVersion} loaded`
-                      : dep.status === 'loading'
-                      ? 'Loading...'
-                      : dep.status === 'version_mismatch'
-                      ? `v${dep.loadedVersion} loaded, needs ${dep.requiredVersion || 'different version'}`
-                      : dep.requiredVersion
-                      ? `Requires ${dep.requiredVersion}`
-                      : 'Not loaded'}
-                  </div>
-                  {dep.error && (
-                    <div className="text-xs text-red-400 mt-1">{dep.error}</div>
-                  )}
-                </div>
-
-                {/* Action button */}
-                {(dep.status === 'missing' || dep.status === 'version_mismatch') && (
-                  <button
-                    onClick={() => handleBrowsePackage(dep.id)}
-                    className="px-3 py-1.5 text-xs font-medium bg-purple-600/20 hover:bg-purple-600/30 text-purple-300 rounded transition-colors"
-                  >
-                    Browse...
-                  </button>
-                )}
-                {dep.status === 'loaded' && (
-                  <svg className="w-5 h-5 text-green-400" fill="none" stroke="currentColor" viewBox="0 0 24 24">
-                    <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M5 13l4 4L19 7" />
-                  </svg>
-                )}
-              </div>
-            ))}
-          </div>
-
-          {/* Success message */}
-          {allSatisfied && (
-            <div className="flex items-center gap-2 p-3 bg-green-50 dark:bg-green-950/30 border border-green-500/30 rounded-lg">
-              <svg className="w-5 h-5 text-green-400" fill="none" stroke="currentColor" viewBox="0 0 24 24">
-                <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M5 13l4 4L19 7" />
-              </svg>
-              <span className="text-sm text-green-300">All dependencies loaded!</span>
-            </div>
-          )}
-        </div>
-
-        {/* Footer */}
-        <div className="px-5 py-4 border-t border-slate-200 dark:border-slate-700/50 flex items-center justify-between">
-          <button
-            onClick={onCancel}
-            className="px-4 py-2 text-sm font-medium text-slate-500 dark:text-slate-400 hover:text-slate-700 dark:hover:text-slate-200 transition-colors"
-          >
+  return (
+    <Dialog
+      open
+      onClose={onCancel}
+      title="It needs other packages"
+      description={`“${packageName}” uses these packages. Load them so all of it works.`}
+      icon={<Layers size={16} />}
+      tone="accent"
+      size="lg"
+      footer={
+        <>
+          <button type="button" onClick={onCancel} className="btn btn-secondary">
             Cancel
           </button>
-
-          <div className="flex items-center justify-end gap-2">
-            {!allSatisfied && (
-              <button
-                onClick={onContinueAnyway}
-                className="px-4 py-2 text-sm font-medium text-slate-500 dark:text-slate-400 hover:text-slate-700 dark:hover:text-slate-200 transition-colors"
-              >
-                Continue Anyway
+          {!allSatisfied && (
+            <button type="button" onClick={onContinueAnyway} className="btn btn-ghost">
+              Continue without them
+            </button>
+          )}
+          <button
+            type="button"
+            onClick={onAllLoaded}
+            disabled={!allSatisfied || someLoading}
+            className="btn btn-primary"
+          >
+            {allSatisfied ? 'Continue' : 'Load all of them first'}
+          </button>
+        </>
+      }
+    >
+      <ul className="oaiy-rows m-0 max-h-72 list-none overflow-y-auto rounded-[var(--r-ctl)] border border-edge-primary p-0">
+        {Array.from(statuses.values()).map((dep) => (
+          <li key={dep.id} className="oaiy-row top">
+            <div className="oaiy-row-main">
+              <span className="oaiy-row-title">{dep.id}</span>
+              <span className="oaiy-row-meta">
+                {dep.status === 'loaded'
+                  ? `v${dep.loadedVersion} loaded`
+                  : dep.status === 'loading'
+                  ? 'Loading…'
+                  : dep.status === 'version_mismatch'
+                  ? `v${dep.loadedVersion} loaded, needs ${dep.requiredVersion || 'a different version'}`
+                  : dep.requiredVersion
+                  ? `Needs ${dep.requiredVersion}`
+                  : 'Not loaded'}
+              </span>
+              {dep.error && <span className="oaiy-error-text">{dep.error}</span>}
+            </div>
+            <span className={pill(dep.status)}>{said(dep)}</span>
+            {(dep.status === 'missing' || dep.status === 'version_mismatch') && (
+              <button type="button" onClick={() => handleBrowsePackage(dep.id)} className="btn btn-sm">
+                <FolderOpen size={12} /> Find it…
               </button>
             )}
+          </li>
+        ))}
+      </ul>
 
-            <button
-              onClick={onAllLoaded}
-              disabled={!allSatisfied || someLoading}
-              className="px-4 py-2 text-sm font-medium bg-purple-600 hover:bg-purple-500 text-white rounded-lg transition-colors disabled:opacity-50 disabled:cursor-not-allowed"
-            >
-              {allSatisfied ? 'Continue' : 'Load All Required'}
-            </button>
-          </div>
+      {allSatisfied && (
+        <div className="oaiy-banner ok">
+          <Check size={15} className="mt-0.5 shrink-0" />
+          <span className="flex-1">Every package it needs is loaded.</span>
         </div>
-      </div>
-    </div>,
-    document.body
+      )}
+    </Dialog>
   );
 }

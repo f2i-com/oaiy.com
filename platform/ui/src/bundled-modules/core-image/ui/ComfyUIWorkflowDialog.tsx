@@ -5,8 +5,10 @@
  * configure which inputs should be exposed as node handles.
  */
 
-import { useState, useCallback, useMemo, useEffect } from 'react';
+import { useState, useCallback, useMemo } from 'react';
+import { Workflow } from 'lucide-react';
 import type { ComfyUIAnalysis, DetectedPromptInput, DetectedImageInput } from '../comfyui-analyzer';
+import Dialog from '../../../components/ui/Dialog';
 
 interface ComfyUIWorkflowDialogProps {
   analysis: ComfyUIAnalysis;
@@ -115,217 +117,160 @@ export function ComfyUIWorkflowDialog({ analysis, onConfirm, onCancel }: ComfyUI
   const positivePrompts = analysis.prompts.filter(p => !p.isNegative);
   const negativePrompts = analysis.prompts.filter(p => p.isNegative);
 
-  // Create a container directly on document.body to escape transform contexts
-  useEffect(() => {
-    // Prevent body scroll while dialog is open
-    document.body.style.overflow = 'hidden';
-    return () => {
-      document.body.style.overflow = '';
-    };
-  }, []);
+  // The editor's Dialog: portaled to <body> (out of React Flow's transform),
+  // with Escape and the overlay as Cancel, and the focus trap.
+  const choice = 'flex cursor-pointer items-center gap-2 rounded-[var(--r-ctl)] border border-edge-primary p-2 hover:border-edge-strong';
 
   return (
-    <div
-      className="bg-black/70 flex items-center justify-center p-4"
-      style={{
-        position: 'fixed',
-        top: 0,
-        left: 0,
-        right: 0,
-        bottom: 0,
-        zIndex: 99999,
-      }}
-    >
-      <div className="bg-white dark:bg-slate-800 rounded-lg shadow-xl border border-slate-300 dark:border-slate-600 overflow-hidden flex flex-col" style={{ width: '800px', maxWidth: '90vw', maxHeight: '80vh' }}>
-        {/* Header */}
-        <div className="px-4 py-3 border-b border-slate-300 dark:border-slate-700 flex items-center justify-between">
-          <h2 className="text-lg font-semibold text-slate-900 dark:text-white">Configure ComfyUI Workflow</h2>
-          <button
-            onClick={onCancel}
-            className="text-slate-500 dark:text-slate-400 hover:text-slate-900 dark:hover:text-white transition-colors"
-          >
-            <svg className="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24">
-              <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M6 18L18 6M6 6l12 12" />
-            </svg>
-          </button>
-        </div>
-
-        {/* Content */}
-        <div className="flex-1 overflow-y-auto p-4 space-y-4">
-          {/* Summary */}
-          <div className="bg-slate-100/50 dark:bg-slate-900/50 rounded p-3 text-sm">
-            <p className="text-slate-300">
-              Detected: <span className="text-green-400">{positivePrompts.length} prompt(s)</span>
-              {negativePrompts.length > 0 && <>, <span className="text-red-400">{negativePrompts.length} negative</span></>}
-              <>, <span className="text-blue-400">{analysis.images.length} image input(s)</span></>
-              {analysis.outputs.length > 0 && <>, <span className="text-purple-400">{analysis.outputs.length} output(s)</span></>}
-            </p>
-          </div>
-
-          {/* Debug: show if no images detected */}
-          {analysis.images.length === 0 && (
-            <div className="bg-amber-900/30 border border-amber-700 rounded p-3 text-sm">
-              <p className="text-amber-400">
-                No LoadImage nodes detected in this workflow. Images can only be overridden if the workflow uses LoadImage, LoadImageMask, or LoadImageBase64 nodes.
-              </p>
-            </div>
-          )}
-
-          {/* Prompt Selection */}
-          {positivePrompts.length > 0 && (
-            <div>
-              <label className="text-sm font-medium text-slate-700 dark:text-slate-300 block mb-2">
-                Primary Prompt Input
-                <span className="text-slate-500 font-normal ml-2">(connected to prompt handle)</span>
-              </label>
-              <div className="space-y-2">
-                {positivePrompts.map((prompt) => (
-                  <PromptOption
-                    key={prompt.nodeId}
-                    prompt={prompt}
-                    isSelected={primaryPromptNodeId === prompt.nodeId}
-                    onSelect={() => setPrimaryPromptNodeId(prompt.nodeId)}
-                  />
-                ))}
-                <label className="flex items-center gap-2 p-2 rounded border border-slate-300 dark:border-slate-700 hover:border-slate-400 dark:hover:border-slate-600 cursor-pointer">
-                  <input
-                    type="radio"
-                    name="primaryPrompt"
-                    checked={primaryPromptNodeId === null}
-                    onChange={() => setPrimaryPromptNodeId(null)}
-                    className="text-pink-500"
-                  />
-                  <span className="text-slate-400 text-sm">None (use workflow's built-in prompt)</span>
-                </label>
-              </div>
-            </div>
-          )}
-
-          {/* Negative prompts info */}
-          {negativePrompts.length > 0 && (
-            <div className="bg-slate-100/30 dark:bg-slate-900/30 rounded p-3">
-              <p className="text-sm text-slate-400">
-                <span className="text-red-400 font-medium">Negative prompts:</span> {negativePrompts.map(p => p.title).join(', ')}
-                <br />
-                <span className="text-slate-500">These will use their built-in values.</span>
-              </p>
-            </div>
-          )}
-
-          {/* Seed Configuration */}
-          {analysis.seeds && analysis.seeds.length > 0 && (
-            <div>
-              <label className="text-sm font-medium text-slate-700 dark:text-slate-300 block mb-2">
-                Seed
-                <span className="text-slate-500 font-normal ml-2">
-                  ({analysis.seeds.length} sampler{analysis.seeds.length > 1 ? 's' : ''} detected)
-                </span>
-              </label>
-              <div className="space-y-2">
-                <label className="flex items-center gap-2 p-2 rounded border border-slate-300 dark:border-slate-700 hover:border-slate-400 dark:hover:border-slate-600 cursor-pointer">
-                  <input
-                    type="radio"
-                    name="seedMode"
-                    checked={seedMode === 'random'}
-                    onChange={() => setSeedMode('random')}
-                    className="text-pink-500"
-                  />
-                  <div>
-                    <span className="text-sm text-slate-900 dark:text-white">Random</span>
-                    <span className="text-xs text-slate-500 ml-2">New seed each run</span>
-                  </div>
-                </label>
-                <label className="flex items-center gap-2 p-2 rounded border border-slate-300 dark:border-slate-700 hover:border-slate-400 dark:hover:border-slate-600 cursor-pointer">
-                  <input
-                    type="radio"
-                    name="seedMode"
-                    checked={seedMode === 'fixed'}
-                    onChange={() => setSeedMode('fixed')}
-                    className="text-pink-500"
-                  />
-                  <div className="flex items-center gap-2">
-                    <span className="text-sm text-slate-900 dark:text-white">Fixed</span>
-                    <input
-                      type="number"
-                      className="nodrag nowheel w-32 bg-white dark:bg-slate-900 border border-slate-300 dark:border-slate-600 rounded px-2 py-1 text-xs text-slate-800 dark:text-slate-200 focus:outline-none focus:border-pink-500"
-                      value={fixedSeed}
-                      onChange={(e) => setFixedSeed(e.target.value)}
-                      onClick={(e) => e.stopPropagation()}
-                      disabled={seedMode !== 'fixed'}
-                    />
-                  </div>
-                </label>
-                <label className="flex items-center gap-2 p-2 rounded border border-slate-300 dark:border-slate-700 hover:border-slate-400 dark:hover:border-slate-600 cursor-pointer">
-                  <input
-                    type="radio"
-                    name="seedMode"
-                    checked={seedMode === 'workflow'}
-                    onChange={() => setSeedMode('workflow')}
-                    className="text-pink-500"
-                  />
-                  <div>
-                    <span className="text-sm text-slate-900 dark:text-white">Use workflow seed</span>
-                    <span className="text-xs text-slate-500 ml-2">
-                      ({analysis.seeds[0]?.currentValue})
-                    </span>
-                  </div>
-                </label>
-              </div>
-            </div>
-          )}
-
-          {/* Image Inputs */}
-          {analysis.images.length > 0 && (
-            <div>
-              <label className="text-sm font-medium text-slate-700 dark:text-slate-300 block mb-2">
-                Image Inputs
-                <span className="text-slate-500 font-normal ml-2">(check to expose as input handle)</span>
-              </label>
-              <p className="text-xs text-slate-500 mb-2">
-                Unchecked images will be bypassed (use workflow default). Check an image to create an input handle that can override it.
-              </p>
-              <div className="space-y-2">
-                {analysis.images.map((image) => {
-                  const config = imageConfigs.get(image.nodeId) || { enabled: false };
-                  return (
-                    <ImageOption
-                      key={image.nodeId}
-                      image={image}
-                      isSelected={config.enabled}
-                      onToggle={() => handleToggleImage(image.nodeId)}
-                    />
-                  );
-                })}
-              </div>
-            </div>
-          )}
-
-          {/* No inputs found */}
-          {positivePrompts.length === 0 && analysis.images.length === 0 && (
-            <div className="text-center py-8 text-slate-400">
-              <p>No configurable inputs detected in this workflow.</p>
-              <p className="text-sm mt-1">The workflow will run with its built-in values.</p>
-            </div>
-          )}
-        </div>
-
-        {/* Footer */}
-        <div className="px-4 py-3 border-t border-slate-300 dark:border-slate-700 flex justify-end gap-2">
-          <button
-            onClick={onCancel}
-            className="px-4 py-2 text-sm text-slate-600 dark:text-slate-300 hover:text-slate-900 dark:hover:text-white transition-colors"
-          >
+    <Dialog
+      open
+      onClose={onCancel}
+      title="Set up the ComfyUI workflow"
+      description="Choose which of the workflow's inputs this node's handles drive."
+      icon={<Workflow size={16} />}
+      tone="accent"
+      size="lg"
+      footer={
+        <>
+          <button type="button" onClick={onCancel} className="btn btn-secondary">
             Cancel
           </button>
-          <button
-            onClick={handleConfirm}
-            className="px-4 py-2 text-sm bg-pink-600 hover:bg-pink-700 text-white rounded transition-colors"
-          >
-            Apply Workflow
+          <button type="button" onClick={handleConfirm} className="btn btn-primary">
+            Apply the workflow
           </button>
-        </div>
+        </>
+      }
+    >
+      {/* Summary */}
+      <div className="flex flex-wrap items-center gap-1.5">
+        <span className="oaiy-label">Found</span>
+        <span className="oaiy-pill ok">{positivePrompts.length} prompt{positivePrompts.length === 1 ? '' : 's'}</span>
+        {negativePrompts.length > 0 && <span className="oaiy-pill err">{negativePrompts.length} negative</span>}
+        <span className="oaiy-pill info">{analysis.images.length} image input{analysis.images.length === 1 ? '' : 's'}</span>
+        {analysis.outputs.length > 0 && <span className="oaiy-pill accent">{analysis.outputs.length} output{analysis.outputs.length === 1 ? '' : 's'}</span>}
       </div>
-    </div>
+
+      {/* Debug: show if no images detected */}
+      {analysis.images.length === 0 && (
+        <div className="oaiy-note warn">
+          No LoadImage nodes in this workflow. Pictures can only be given to it when it uses LoadImage, LoadImageMask or LoadImageBase64 nodes.
+        </div>
+      )}
+
+      {/* Prompt Selection */}
+      {positivePrompts.length > 0 && (
+        <div className="flex flex-col gap-2">
+          <span className="oaiy-label">
+            Prompt input <span className="font-normal normal-case tracking-normal">(what the prompt handle fills)</span>
+          </span>
+          {positivePrompts.map((prompt) => (
+            <PromptOption
+              key={prompt.nodeId}
+              prompt={prompt}
+              isSelected={primaryPromptNodeId === prompt.nodeId}
+              onSelect={() => setPrimaryPromptNodeId(prompt.nodeId)}
+            />
+          ))}
+          <label className={choice}>
+            <input
+              type="radio"
+              name="primaryPrompt"
+              checked={primaryPromptNodeId === null}
+              onChange={() => setPrimaryPromptNodeId(null)}
+            />
+            <span className="text-[13px] text-content-secondary">None (use the workflow's own prompt)</span>
+          </label>
+        </div>
+      )}
+
+      {/* Negative prompts info */}
+      {negativePrompts.length > 0 && (
+        <p className="oaiy-help">
+          <strong className="text-signal-danger">Negative prompts:</strong> {negativePrompts.map(p => p.title).join(', ')}.{' '}
+          <span className="text-content-faint">They keep their own values.</span>
+        </p>
+      )}
+
+      {/* Seed Configuration */}
+      {analysis.seeds && analysis.seeds.length > 0 && (
+        <div className="flex flex-col gap-2">
+          <span className="oaiy-label">
+            Seed <span className="font-normal normal-case tracking-normal">({analysis.seeds.length} sampler{analysis.seeds.length > 1 ? 's' : ''} found)</span>
+          </span>
+          <label className={choice}>
+            <input
+              type="radio"
+              name="seedMode"
+              checked={seedMode === 'random'}
+              onChange={() => setSeedMode('random')}
+            />
+            <span className="text-[13px] text-content-primary">Random</span>
+            <span className="text-[12px] text-content-faint">A new seed each run</span>
+          </label>
+          <label className={choice}>
+            <input
+              type="radio"
+              name="seedMode"
+              checked={seedMode === 'fixed'}
+              onChange={() => setSeedMode('fixed')}
+            />
+            <span className="text-[13px] text-content-primary">Fixed</span>
+            <span style={{ width: 128 }}>
+              <input
+                type="number"
+                className="nodrag nowheel oaiy-input oaiy-input-sm mono"
+                value={fixedSeed}
+                onChange={(e) => setFixedSeed(e.target.value)}
+                onClick={(e) => e.stopPropagation()}
+                disabled={seedMode !== 'fixed'}
+                aria-label="Fixed seed"
+              />
+            </span>
+          </label>
+          <label className={choice}>
+            <input
+              type="radio"
+              name="seedMode"
+              checked={seedMode === 'workflow'}
+              onChange={() => setSeedMode('workflow')}
+            />
+            <span className="text-[13px] text-content-primary">The workflow's seed</span>
+            <span className="font-mono text-[12px] text-content-faint">({analysis.seeds[0]?.currentValue})</span>
+          </label>
+        </div>
+      )}
+
+      {/* Image Inputs */}
+      {analysis.images.length > 0 && (
+        <div className="flex flex-col gap-2">
+          <span className="oaiy-label">
+            Image inputs <span className="font-normal normal-case tracking-normal">(tick one to give the node a handle for it)</span>
+          </span>
+          <p className="oaiy-help faint">
+            An unticked image keeps the workflow's own. A ticked one gets an input handle, and still uses the workflow's image when nothing is connected.
+          </p>
+          {analysis.images.map((image) => {
+            const config = imageConfigs.get(image.nodeId) || { enabled: false };
+            return (
+              <ImageOption
+                key={image.nodeId}
+                image={image}
+                isSelected={config.enabled}
+                onToggle={() => handleToggleImage(image.nodeId)}
+              />
+            );
+          })}
+        </div>
+      )}
+
+      {/* No inputs found */}
+      {positivePrompts.length === 0 && analysis.images.length === 0 && (
+        <div className="oaiy-empty">
+          <p className="oaiy-empty-title">Nothing to set up</p>
+          <p className="oaiy-empty-text">The workflow has no inputs this node can drive. It runs with its own values.</p>
+        </div>
+      )}
+    </Dialog>
   );
 }
 
@@ -341,10 +286,10 @@ function PromptOption({ prompt, isSelected, onSelect }: PromptOptionProps) {
     : prompt.currentValue;
 
   return (
-    <label className={`block p-2 rounded border cursor-pointer transition-colors ${
+    <label className={`block cursor-pointer rounded-[var(--r-ctl)] border p-2 transition-colors ${
       isSelected
-        ? 'border-pink-500 bg-pink-500/10'
-        : 'border-slate-300 dark:border-slate-700 hover:border-slate-400 dark:hover:border-slate-600'
+        ? 'border-accent bg-accent/10'
+        : 'border-edge-primary hover:border-edge-strong'
     }`}>
       <div className="flex items-start gap-2">
         <input
@@ -352,14 +297,14 @@ function PromptOption({ prompt, isSelected, onSelect }: PromptOptionProps) {
           name="primaryPrompt"
           checked={isSelected}
           onChange={onSelect}
-          className="mt-1 text-pink-500"
+          className="mt-1"
         />
-        <div className="flex-1 min-w-0">
+        <div className="min-w-0 flex-1">
           <div className="flex items-center gap-2">
-            <span className="text-sm text-slate-900 dark:text-white font-medium">{prompt.title}</span>
-            <span className="text-xs text-slate-500">({prompt.nodeType})</span>
+            <span className="text-[13px] font-semibold text-content-primary">{prompt.title}</span>
+            <span className="font-mono text-[11px] text-content-faint">{prompt.nodeType}</span>
           </div>
-          <p className="text-xs text-slate-400 mt-1 truncate">{truncatedValue || '(empty)'}</p>
+          <p className="m-0 mt-1 truncate text-[12px] text-content-secondary">{truncatedValue || '(empty)'}</p>
         </div>
       </div>
     </label>
@@ -374,46 +319,46 @@ interface ImageOptionProps {
 
 function ImageOption({ image, isSelected, onToggle }: ImageOptionProps) {
   return (
-    <div className={`block p-3 rounded border transition-colors ${
+    <label className={`block cursor-pointer rounded-[var(--r-ctl)] border p-3 transition-colors ${
       isSelected
-        ? 'border-blue-500 bg-blue-500/10'
-        : 'border-slate-300 dark:border-slate-700'
+        ? 'border-accent bg-accent/10'
+        : 'border-edge-primary hover:border-edge-strong'
     }`}>
       <div className="flex items-start gap-3">
         <input
           type="checkbox"
           checked={isSelected}
           onChange={onToggle}
-          className="text-blue-500 mt-1 cursor-pointer"
+          className="mt-1 cursor-pointer"
         />
-        <div className="flex-1 min-w-0">
+        <div className="min-w-0 flex-1">
           <div className="flex items-center gap-2">
-            <span className="text-sm text-slate-900 dark:text-white font-medium">{image.title}</span>
-            <span className="text-xs text-slate-500">({image.nodeType})</span>
+            <span className="text-[13px] font-semibold text-content-primary">{image.title}</span>
+            <span className="font-mono text-[11px] text-content-faint">{image.nodeType}</span>
           </div>
 
           {/* Show default value */}
           {image.currentValue && (
-            <p className="text-xs text-slate-500 mt-1">
-              Default: <span className="text-slate-400">{image.currentValue}</span>
+            <p className="m-0 mt-1 text-[12px] text-content-faint">
+              Its own image: <span className="font-mono text-content-secondary">{image.currentValue}</span>
             </p>
           )}
 
           {/* Description of what will happen */}
-          <div className="mt-1 text-xs">
+          <p className="m-0 mt-1 text-[12px]">
             {isSelected ? (
-              <span className="text-blue-400">
-                Creates input handle — uses default if not connected
+              <span className="text-accent">
+                Gets an input handle; uses its own image when nothing is connected
               </span>
             ) : (
-              <span className="text-slate-500">
-                Will use workflow's default value
+              <span className="text-content-faint">
+                Keeps the workflow's own image
               </span>
             )}
-          </div>
+          </p>
         </div>
       </div>
-    </div>
+    </label>
   );
 }
 

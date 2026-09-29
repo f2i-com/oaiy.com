@@ -1,9 +1,9 @@
 import { useEffect, useRef, useState, useCallback } from 'react';
-import { createPortal } from 'react-dom';
 import type { Node } from '@xyflow/react';
 import { open } from '@tauri-apps/plugin-dialog';
+import { FolderOpen, Play } from 'lucide-react';
 import { uiLogger as logger } from '../../utils/logger';
-import { useFocusTrap } from '../../hooks/useFocusTrap';
+import Dialog from './Dialog';
 
 // Input node types that should appear in the run modal
 const INPUT_NODE_TYPES = ['input_text', 'input_file', 'input_video', 'input_audio', 'input_folder'];
@@ -29,12 +29,9 @@ export default function RunWorkflowModal({
   onRun,
   onCancel,
 }: RunWorkflowModalProps) {
-  const dialogRef = useRef<HTMLDivElement>(null);
   const firstInputRef = useRef<HTMLTextAreaElement | HTMLInputElement>(null);
   // When there are no input nodes the modal is short-circuited to
-  // null anyway, so the ref-fallback to first focusable inside the
-  // dialog is all we need.
-  useFocusTrap(dialogRef, isOpen, firstInputRef as React.RefObject<HTMLElement | null>);
+  // null anyway; focus starts in the first input (the Dialog's trap).
 
   // Extract input nodes from the workflow
   const inputNodes: InputNodeInfo[] = nodes
@@ -79,20 +76,6 @@ export default function RunWorkflowModal({
     }
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [isOpen]);
-
-  // Handle escape key
-  useEffect(() => {
-    if (!isOpen) return;
-
-    const handleKeyDown = (e: KeyboardEvent) => {
-      if (e.key === 'Escape') {
-        onCancel();
-      }
-    };
-
-    document.addEventListener('keydown', handleKeyDown);
-    return () => document.removeEventListener('keydown', handleKeyDown);
-  }, [isOpen, onCancel]);
 
   const handleValueChange = useCallback((nodeId: string, value: string) => {
     setFormValues(prev => {
@@ -179,8 +162,6 @@ export default function RunWorkflowModal({
     return null;
   }
 
-  const portalContainer = document.body;
-
   const getNodeIcon = (type: string) => {
     switch (type) {
       case 'input_text':
@@ -218,64 +199,48 @@ export default function RunWorkflowModal({
     }
   };
 
+  // The input node kinds' colours, as the theme's signal hues.
   const getNodeColor = (type: string) => {
     switch (type) {
       case 'input_text':
-        return 'text-green-400 bg-green-500/20';
       case 'input_file':
-        return 'text-green-400 bg-green-500/20';
-      case 'input_video':
-        return 'text-orange-400 bg-orange-500/20';
-      case 'input_audio':
-        return 'text-teal-400 bg-teal-500/20';
       case 'input_folder':
-        return 'text-green-400 bg-green-500/20';
+        return 'text-signal-green bg-signal-green/15';
+      case 'input_video':
+        return 'text-signal-amber bg-signal-amber/15';
+      case 'input_audio':
+        return 'text-signal-cyan bg-signal-cyan/15';
       default:
-        return 'text-slate-400 bg-slate-500/20';
+        return 'text-content-secondary bg-surface-tertiary';
     }
   };
 
-  return createPortal(
-    <div className="fixed inset-0 z-[100] flex items-center justify-center">
-      {/* Backdrop */}
-      <div
-        className="absolute inset-0 bg-black/60 backdrop-blur-sm"
-        onClick={onCancel}
-      />
-
-      {/* Dialog */}
-      <div
-        ref={dialogRef}
-        className="relative bg-white dark:bg-slate-800 border border-slate-300 dark:border-slate-600 rounded-xl shadow-2xl w-full max-w-2xl mx-4 max-h-[80vh] short:max-h-[92vh] flex flex-col overflow-hidden animate-scaleIn"
-        role="dialog"
-        aria-modal="true"
-        aria-labelledby="run-workflow-title"
-        aria-describedby="run-workflow-description"
-      >
-        {/* Header */}
-        <div className="flex items-center gap-3 p-5 short:p-3 border-b border-slate-200 dark:border-slate-700">
-          <div className="flex-shrink-0 p-2 rounded-full bg-blue-500/20">
-            <svg className="w-6 h-6 text-blue-400" fill="none" stroke="currentColor" viewBox="0 0 24 24">
-              <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M14.752 11.168l-3.197-2.132A1 1 0 0010 9.87v4.263a1 1 0 001.555.832l3.197-2.132a1 1 0 000-1.664z" />
-              <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M21 12a9 9 0 11-18 0 9 9 0 0118 0z" />
-            </svg>
-          </div>
-          <div>
-            <h2 id="run-workflow-title" className="text-lg font-semibold text-slate-900 dark:text-slate-100">
-              Run Workflow
-            </h2>
-            <p id="run-workflow-description" className="text-sm text-slate-500 dark:text-slate-400">
-              Review and modify inputs before running
-            </p>
-          </div>
-        </div>
-
-        {/* Form Content */}
-        <div className="flex-1 overflow-y-auto p-5 short:p-3 space-y-4 short:space-y-3 custom-scrollbar">
+  return (
+    <Dialog
+      open
+      onClose={onCancel}
+      title="Run this flow"
+      description="Check its inputs, or change them, before it runs."
+      icon={<Play size={16} />}
+      tone="accent"
+      size="lg"
+      initialFocusRef={firstInputRef as React.RefObject<HTMLElement | null>}
+      footer={
+        <>
+          <button type="button" onClick={onCancel} className="btn btn-secondary">
+            Cancel
+          </button>
+          <button type="button" onClick={handleRun} className="btn btn-primary">
+            <Play size={13} fill="currentColor" />
+            Run
+          </button>
+        </>
+      }
+    >
           {inputNodes.map((node, index) => (
-            <div key={node.id} className="space-y-2">
-              <label className="flex items-center gap-2 text-sm font-medium text-slate-700 dark:text-slate-200">
-                <span className={`p-1.5 rounded ${getNodeColor(node.type)}`}>
+            <div key={node.id} className="flex flex-col gap-2">
+              <label className="flex items-center gap-2 text-[13px] font-semibold text-content-primary">
+                <span className={`rounded-[var(--r-sm)] p-1.5 ${getNodeColor(node.type)}`}>
                   {getNodeIcon(node.type)}
                 </span>
                 {node.label}
@@ -286,9 +251,10 @@ export default function RunWorkflowModal({
                   ref={index === 0 ? firstInputRef as React.RefObject<HTMLTextAreaElement> : undefined}
                   value={formValues.get(node.id) ?? node.value}
                   onChange={(e) => handleValueChange(node.id, e.target.value)}
-                  placeholder="Enter text..."
+                  placeholder="Enter text…"
                   rows={3}
-                  className="w-full px-3 py-2 bg-white dark:bg-slate-900 border border-slate-300 dark:border-slate-600 rounded-lg text-slate-900 dark:text-slate-100 placeholder-slate-400 dark:placeholder-slate-500 focus:outline-none focus:ring-2 focus:ring-blue-500 focus:border-transparent resize-y min-h-[80px]"
+                  className="oaiy-textarea"
+                  aria-label={node.label}
                 />
               ) : (
                 <>
@@ -319,7 +285,7 @@ export default function RunWorkflowModal({
                         type="button"
                         onClick={() => handleFilePick(node.id, node.type)}
                         title="Click to change image"
-                        className="group block w-full max-w-sm rounded-lg overflow-hidden border border-slate-300 dark:border-slate-600 bg-slate-100 dark:bg-slate-900 hover:border-blue-400 transition-colors"
+                        className="group block w-full max-w-sm overflow-hidden rounded-[var(--r-ctl)] border border-edge-primary bg-surface-tertiary transition-colors hover:border-accent"
                       >
                         <img
                           src={previewSrc}
@@ -332,7 +298,7 @@ export default function RunWorkflowModal({
                           }}
                         />
                         {typeof node.nodeData.fileName === 'string' && (
-                          <div className="px-2 py-1 text-xs text-slate-600 dark:text-slate-400 truncate text-left">
+                          <div className="truncate px-2 py-1 text-left text-[12px] text-content-secondary">
                             {node.nodeData.fileName as string}
                           </div>
                         )}
@@ -345,18 +311,18 @@ export default function RunWorkflowModal({
                     type="text"
                     value={formValues.get(node.id) ?? node.value}
                     onChange={(e) => handleValueChange(node.id, e.target.value)}
-                    placeholder={node.type === 'input_folder' ? 'Select or enter folder path...' : 'Select or enter file path...'}
-                    className="flex-1 px-3 py-2 bg-white dark:bg-slate-900 border border-slate-300 dark:border-slate-600 rounded-lg text-slate-900 dark:text-slate-100 placeholder-slate-400 dark:placeholder-slate-500 focus:outline-none focus:ring-2 focus:ring-blue-500 focus:border-transparent"
+                    placeholder={node.type === 'input_folder' ? 'Pick or type a folder path…' : 'Pick or type a file path…'}
+                    className="oaiy-input mono flex-1"
+                    aria-label={node.label}
                   />
                   <button
                     type="button"
                     onClick={() => handleFilePick(node.id, node.type)}
-                    className="px-3 py-2 bg-slate-100 dark:bg-slate-700 hover:bg-slate-200 dark:hover:bg-slate-600 border border-slate-300 dark:border-slate-600 rounded-lg text-slate-700 dark:text-slate-200 transition-colors"
-                    title="Browse..."
+                    className="btn"
+                    title="Browse…"
+                    aria-label={`Browse for ${node.label}`}
                   >
-                    <svg className="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24">
-                      <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M5 19a2 2 0 01-2-2V7a2 2 0 012-2h4l2 2h4a2 2 0 012 2v1M5 19h14a2 2 0 002-2v-5a2 2 0 00-2-2H9a2 2 0 00-2 2v5a2 2 0 01-2 2z" />
-                    </svg>
+                    <FolderOpen size={15} />
                   </button>
                 </div>
                 {/* When the saved workflow embedded the file as a data
@@ -376,12 +342,12 @@ export default function RunWorkflowModal({
                       : '';
                   if (currentInput || !fileName) return null;
                   return (
-                    <p className="text-xs text-slate-500 dark:text-slate-400 mt-1">
-                      Using embedded file:{' '}
-                      <span className="font-mono text-slate-700 dark:text-slate-300">
+                    <p className="oaiy-help faint">
+                      Using the embedded file{' '}
+                      <span className="font-mono text-content-primary">
                         {fileName}
-                      </span>{' '}
-                      — type a path above or click Browse to replace it.
+                      </span>
+                      . Type a path above, or browse, to replace it.
                     </p>
                   );
                 })()}
@@ -389,29 +355,7 @@ export default function RunWorkflowModal({
               )}
             </div>
           ))}
-        </div>
-
-        {/* Actions */}
-        <div className="flex justify-end gap-3 px-5 py-4 short:px-4 short:py-2.5 bg-slate-50 dark:bg-slate-900/50 border-t border-slate-200 dark:border-slate-700">
-          <button
-            onClick={onCancel}
-            className="btn btn-secondary btn-md"
-          >
-            Cancel
-          </button>
-          <button
-            onClick={handleRun}
-            className="btn btn-primary btn-md"
-          >
-            <svg className="w-4 h-4 mr-1.5" fill="currentColor" viewBox="0 0 20 20">
-              <path fillRule="evenodd" d="M10 18a8 8 0 100-16 8 8 0 000 16zM9.555 7.168A1 1 0 008 8v4a1 1 0 001.555.832l3-2a1 1 0 000-1.664l-3-2z" clipRule="evenodd" />
-            </svg>
-            Run
-          </button>
-        </div>
-      </div>
-    </div>,
-    portalContainer
+    </Dialog>
   );
 }
 

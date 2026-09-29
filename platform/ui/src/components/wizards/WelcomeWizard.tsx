@@ -18,10 +18,11 @@
  * explicitly clicks Add / Create — closing early is safe.
  */
 import { useState, useEffect, useCallback, useRef } from 'react';
+import { ArrowRight, Check, FileText, Image as ImageIcon, MessageSquare, MousePointerClick, Play, Plug, Plus, Share2, Sparkles, X } from 'lucide-react';
 import type { CustomService } from 'oaiy-core/modules/core-service/examples';
 import { v4 as uuidv4 } from 'uuid';
 import { markWizardCompleted } from '../../lib/wizardPrefs';
-import { useFocusTrap } from '../../hooks/useFocusTrap';
+import Dialog from '../ui/Dialog';
 
 // -------------------------------------------------------------------
 // Service presets the wizard offers. A curated subset of ServicesTab's
@@ -255,12 +256,10 @@ export default function WelcomeWizard(props: WelcomeWizardProps) {
 
   // `undefined` when no preset is selected (the form is hidden / empty).
   const preset = PRESETS.find((p) => p.id === presetId);
-  const dialogRef = useRef<HTMLDivElement>(null);
-  // Focus the primary CTA on open (the wizard always opens on step 1), NOT the
-  // top-right "Skip" — otherwise a reflexive Enter on the auto-opened wizard
+  // Focus the primary CTA on open (the wizard always opens on step 1), NOT
+  // "Skip" — otherwise a reflexive Enter on the auto-opened wizard
   // immediately skips and permanently completes onboarding.
   const primaryCtaRef = useRef<HTMLButtonElement>(null);
-  useFocusTrap(dialogRef, isOpen, primaryCtaRef);
 
   // Key constants that already hold a value — keys configured before this run
   // (Settings / prior session) PLUS ones entered for a service added this run.
@@ -302,18 +301,8 @@ export default function WelcomeWizard(props: WelcomeWizardProps) {
     onClose();
   }, [onClose]);
 
-  // Escape-to-dismiss while open.
-  useEffect(() => {
-    if (!isOpen) return;
-    const onKey = (e: KeyboardEvent) => {
-      if (e.key === 'Escape') {
-        e.preventDefault();
-        close();
-      }
-    };
-    window.addEventListener('keydown', onKey);
-    return () => window.removeEventListener('keydown', onKey);
-  }, [isOpen, close]);
+  // Escape and the overlay close it (and mark it done), as Skip does: the
+  // Dialog calls `close`.
 
   const runTest = useCallback(async () => {
     if (!endpoint) return;
@@ -437,163 +426,195 @@ export default function WelcomeWizard(props: WelcomeWizardProps) {
   if (!isOpen) return null;
 
   const totalSteps = 4;
+  // Step 3's service, for its title and its button.
+  const flowSelected = flowServices.find((x) => x.id === (flowServiceId || flowServices[0]?.id)) ?? flowServices[0];
+  const flowIsImage = flowSelected ? isImageService(flowSelected) : false;
+  const flowServiceName = flowSelected?.name ?? 'your service';
+
+  const head: Record<Step, { title: string; description: React.ReactNode; icon: React.ReactNode }> = {
+    1: {
+      title: 'Welcome to OAIY',
+      description: 'A visual flow builder that talks to whatever AI tools you run, local or cloud.',
+      icon: <Sparkles size={16} />,
+    },
+    2: {
+      title: 'Add your AI services',
+      description: <>Connect as many as you like: local engines, or cloud APIs with your own key. Manage them later in <strong>Settings → Services</strong>.</>,
+      icon: <Plug size={16} />,
+    },
+    3: {
+      title: 'Build a starter flow',
+      description: <>A small <em>Text → {flowServiceName} → {flowIsImage ? 'Image' : 'Reply'}</em> flow, so there is something to run.</>,
+      icon: <Play size={16} />,
+    },
+    4: {
+      title: 'You’re set up',
+      description: 'A few things to know as you go.',
+      icon: <Check size={16} />,
+    },
+  };
+
+  const dots = (
+    <span className="flex items-center gap-1.5" role="img" aria-label={`Step ${step} of ${totalSteps}`}>
+      {Array.from({ length: totalSteps }).map((_, i) => (
+        <span
+          key={i}
+          className={`h-1.5 rounded-full transition-all ${
+            i + 1 === step ? 'w-6 bg-accent' : i + 1 < step ? 'w-1.5 bg-accent/55' : 'w-1.5 bg-edge-strong'
+          }`}
+        />
+      ))}
+    </span>
+  );
+
+  const skip = step < 4 && (
+    <button type="button" onClick={close} className="btn btn-ghost" aria-label="Skip wizard">
+      Skip
+    </button>
+  );
+
+  const footer =
+    step === 1 ? (
+      <>
+        {dots}
+        <span className="spacer" />
+        {skip}
+        <button ref={primaryCtaRef} type="button" onClick={() => setStep(2)} className="btn btn-primary">
+          Let’s go <ArrowRight size={14} />
+        </button>
+      </>
+    ) : step === 2 ? (
+      <>
+        {dots}
+        <span className="spacer" />
+        {skip}
+        <button type="button" onClick={() => setStep(1)} className="btn btn-secondary">
+          Back
+        </button>
+        <button type="button" onClick={addAnother} disabled={!formValid} className="btn btn-secondary">
+          <Plus size={14} /> Add, and add more
+        </button>
+        <button type="button" onClick={continueToFlow} disabled={!canContinue} className="btn btn-primary">
+          Continue <ArrowRight size={14} />
+        </button>
+      </>
+    ) : step === 3 ? (
+      <>
+        {dots}
+        <span className="spacer" />
+        {skip}
+        <button type="button" onClick={() => setStep(2)} className="btn btn-secondary">
+          Back
+        </button>
+        <button type="button" onClick={createFlowAndAdvance} disabled={!flowSelected} className="btn btn-primary">
+          {flowIsImage ? 'Create my image flow' : 'Create my chat flow'} <ArrowRight size={14} />
+        </button>
+      </>
+    ) : (
+      <>
+        {dots}
+        <span className="spacer" />
+        <button type="button" onClick={close} className="btn btn-primary">
+          Open my flow
+        </button>
+      </>
+    );
 
   return (
-    <div
-      className="fixed inset-0 z-[60] flex items-center justify-center bg-slate-900/70 backdrop-blur-sm p-4"
-      onClick={close}
+    <Dialog
+      open
+      onClose={close}
+      title={head[step].title}
+      description={head[step].description}
+      icon={head[step].icon}
+      tone="accent"
+      size="md"
+      hideClose
+      initialFocusRef={primaryCtaRef}
+      testId="welcome-wizard"
+      footer={footer}
     >
-      <div
-        ref={dialogRef}
-        className="relative overflow-hidden bg-white dark:bg-slate-800 rounded-2xl shadow-2xl ring-1 ring-black/5 dark:ring-white/10 w-full max-w-xl p-6 sm:p-8"
-        onClick={(e) => e.stopPropagation()}
-        role="dialog"
-        aria-modal="true"
-        aria-label="Onboarding wizard"
-      >
-        {/* Soft brand glow bleeding from the top edge — purely decorative,
-            clipped by the box's overflow-hidden + rounded corners. */}
-        <div
-          aria-hidden="true"
-          className="pointer-events-none absolute -top-24 left-1/2 -translate-x-1/2 h-56 w-[32rem] rounded-full blur-3xl opacity-40 dark:opacity-25"
-          style={{ background: 'radial-gradient(closest-side, rgb(var(--accent-primary) / 0.5), transparent)' }}
+      {step === 1 && <WelcomeStep hasAnyService={existingServices.length > 0} />}
+      {step === 2 && (
+        <AddServiceStep
+          presets={PRESETS}
+          presetId={presetId}
+          onPresetChange={setPresetId}
+          preset={preset}
+          serviceName={serviceName}
+          onServiceNameChange={setServiceName}
+          endpoint={endpoint}
+          onEndpointChange={setEndpoint}
+          apiKey={apiKey}
+          onApiKeyChange={setApiKey}
+          testState={testState}
+          testMsg={testMsg}
+          onTest={runTest}
+          services={flowServices}
+          savedThisRunIds={savedThisRunIds}
+          providedKeyConstants={providedKeyConstants}
+          onRemoveService={removeService}
         />
-        {/* `relative` lifts the real content above the absolute glow. */}
-        <div className="relative space-y-5">
-          {/* Progress dots + close */}
-          <div className="flex items-center justify-between">
-            <div className="flex items-center gap-1.5" aria-label={`Step ${step} of ${totalSteps}`}>
-              {Array.from({ length: totalSteps }).map((_, i) => (
-                <span
-                  key={i}
-                  className={`h-1.5 rounded-full transition-all ${
-                    i + 1 === step
-                      ? 'w-6 bg-[rgb(var(--accent-primary))]'
-                      : i + 1 < step
-                        ? 'w-1.5'
-                        : 'w-1.5 bg-slate-300 dark:bg-slate-600'
-                  }`}
-                  style={
-                    i + 1 < step
-                      ? { backgroundColor: 'rgb(var(--accent-primary) / 0.55)' }
-                      : undefined
-                  }
-                />
-              ))}
-            </div>
-            <button
-              type="button"
-              onClick={close}
-              className="text-slate-500 hover:text-slate-700 dark:text-slate-400 dark:hover:text-slate-200 text-xs"
-              aria-label="Skip wizard"
-            >
-              Skip
-            </button>
-          </div>
-
-          {/* Step body */}
-          {step === 1 && <WelcomeStep onNext={() => setStep(2)} hasAnyService={existingServices.length > 0} ctaRef={primaryCtaRef} />}
-          {step === 2 && (
-            <AddServiceStep
-              presets={PRESETS}
-              presetId={presetId}
-              onPresetChange={setPresetId}
-              preset={preset}
-              serviceName={serviceName}
-              onServiceNameChange={setServiceName}
-              endpoint={endpoint}
-              onEndpointChange={setEndpoint}
-              apiKey={apiKey}
-              onApiKeyChange={setApiKey}
-              testState={testState}
-              testMsg={testMsg}
-              onTest={runTest}
-              services={flowServices}
-              savedThisRunIds={savedThisRunIds}
-              providedKeyConstants={providedKeyConstants}
-              onRemoveService={removeService}
-              onBack={() => setStep(1)}
-              onAddAnother={addAnother}
-              onContinue={continueToFlow}
-              formValid={formValid}
-              canContinue={canContinue}
-            />
-          )}
-          {step === 3 && (
-            <StarterFlowStep
-              services={flowServices}
-              selectedId={flowServiceId || flowServices[0]?.id || ''}
-              onSelect={setFlowServiceId}
-              onBack={() => setStep(2)}
-              onCreate={createFlowAndAdvance}
-            />
-          )}
-          {step === 4 && <DoneStep onClose={close} />}
-        </div>
-      </div>
-    </div>
+      )}
+      {step === 3 && (
+        <StarterFlowStep
+          services={flowServices}
+          selectedId={flowServiceId || flowServices[0]?.id || ''}
+          onSelect={setFlowServiceId}
+        />
+      )}
+      {step === 4 && <DoneStep />}
+    </Dialog>
   );
 }
 
 // -------------------------------------------------------------------
-// Step components — kept inline; each is small and only used here.
+// Step bodies — kept inline; each is small and only used here. The
+// title, the progress and the buttons are the wizard's Dialog's.
 // -------------------------------------------------------------------
 
-function WelcomeStep({ onNext, hasAnyService, ctaRef }: { onNext: () => void; hasAnyService: boolean; ctaRef?: React.RefObject<HTMLButtonElement | null> }) {
+/** A service's own icon (from its preset), or a plug. */
+function ServiceIcon({ icon }: { icon?: string }) {
+  return icon ? <span aria-hidden="true" className="shrink-0 text-base leading-none">{icon}</span> : <Plug size={15} className="shrink-0 text-content-faint" />;
+}
+
+function WelcomeStep({ hasAnyService }: { hasAnyService: boolean }) {
+  const steps = [
+    'Connect one or more AI services (OpenAI chat, GPT Image, Anthropic, Ollama, or any HTTP endpoint).',
+    'Build a starter flow you can run right away.',
+    'Show you where everything lives.',
+  ];
   return (
     <>
-      <div className="text-center">
-        {/* App mark (same as the favicon) — a branded rounded tile reads more
-            "product" than a generic emoji. Decorative: the heading carries the
+      <div className="flex items-center gap-3">
+        {/* App mark (same as the favicon). Decorative: the title carries the
             meaning, so the image is aria-hidden. */}
         <img
           src="/favicon.svg"
           alt=""
           aria-hidden="true"
-          width={64}
-          height={64}
+          width={44}
+          height={44}
           draggable={false}
-          className="mx-auto mb-3 w-16 h-16 rounded-2xl shadow-lg shadow-indigo-500/30 ring-1 ring-white/20 select-none"
+          className="h-11 w-11 shrink-0 select-none rounded-[var(--r-ctl)]"
         />
-        <h2 className="text-2xl font-semibold text-slate-900 dark:text-slate-100">
-          Welcome to OAIY
-        </h2>
-        <p className="mt-2 text-sm text-slate-600 dark:text-slate-300">
-          A visual flow builder that talks to whatever AI tools you run — local or cloud.
+        <p className="m-0 text-[13px] text-content-primary">In the next few clicks it will:</p>
+      </div>
+      <ol className="m-0 flex list-none flex-col gap-2 p-0">
+        {steps.map((text, i) => (
+          <li key={i} className="flex items-start gap-2.5 text-[13px] text-content-secondary">
+            <span aria-hidden="true" className="mt-0.5 grid h-5 w-5 shrink-0 place-items-center rounded-full bg-accent/12 font-mono text-[10px] font-bold text-accent">
+              {i + 1}
+            </span>
+            <span>{text}</span>
+          </li>
+        ))}
+      </ol>
+      {hasAnyService && (
+        <p className="oaiy-help faint">
+          You already have services set up: add more here, or skip straight to a starter flow.
         </p>
-      </div>
-      <div className="space-y-2 text-sm text-slate-700 dark:text-slate-300">
-        <p>In the next few clicks we'll:</p>
-        <ul className="space-y-1.5 pl-1">
-          <li className="flex items-start gap-2">
-            <span aria-hidden="true" className="inline-flex w-5 h-5 rounded-full items-center justify-center text-[10px] font-bold flex-shrink-0 mt-0.5" style={{ backgroundColor: 'rgb(var(--accent-primary) / 0.12)', color: 'rgb(var(--accent-primary))' }}>1</span>
-            <span>Connect one or more AI services (OpenAI chat, GPT Image, Anthropic, Ollama, or any HTTP endpoint).</span>
-          </li>
-          <li className="flex items-start gap-2">
-            <span aria-hidden="true" className="inline-flex w-5 h-5 rounded-full items-center justify-center text-[10px] font-bold flex-shrink-0 mt-0.5" style={{ backgroundColor: 'rgb(var(--accent-primary) / 0.12)', color: 'rgb(var(--accent-primary))' }}>2</span>
-            <span>Build a starter flow you can run right away.</span>
-          </li>
-          <li className="flex items-start gap-2">
-            <span aria-hidden="true" className="inline-flex w-5 h-5 rounded-full items-center justify-center text-[10px] font-bold flex-shrink-0 mt-0.5" style={{ backgroundColor: 'rgb(var(--accent-primary) / 0.12)', color: 'rgb(var(--accent-primary))' }}>3</span>
-            <span>Show you where everything lives.</span>
-          </li>
-        </ul>
-        {hasAnyService && (
-          <p className="mt-3 text-xs text-slate-500 dark:text-slate-400">
-            You already have services configured — add more here, or skip straight to a starter flow.
-          </p>
-        )}
-      </div>
-      <div className="flex justify-end pt-2">
-        <button
-          ref={ctaRef}
-          type="button"
-          onClick={onNext}
-          className="px-4 py-2 text-sm rounded-md bg-[rgb(var(--accent-primary))] hover:bg-[rgb(var(--accent-hover))] text-white font-medium"
-        >
-          Let's go →
-        </button>
-      </div>
+      )}
     </>
   );
 }
@@ -618,81 +639,64 @@ function AddServiceStep(props: {
   savedThisRunIds: Set<string>;
   providedKeyConstants: Set<string>;
   onRemoveService: (id: string) => void;
-  onBack: () => void;
-  onAddAnother: () => void;
-  onContinue: () => void;
-  formValid: boolean;
-  canContinue: boolean;
 }) {
   const {
     presets, presetId, onPresetChange, preset, serviceName, onServiceNameChange,
     endpoint, onEndpointChange, apiKey, onApiKeyChange, testState, testMsg, onTest,
     services, savedThisRunIds, providedKeyConstants, onRemoveService,
-    onBack, onAddAnother, onContinue, formValid, canContinue,
   } = props;
 
   const keyAlreadyProvided =
     !!preset?.apiKeyConstant && providedKeyConstants.has(preset.apiKeyConstant);
 
+  const choice = (on: boolean) =>
+    `flex min-w-0 items-center gap-2 rounded-[var(--r-ctl)] border p-2.5 text-left transition-colors ${
+      on ? 'border-accent bg-accent/10' : 'border-edge-primary bg-surface-tertiary/40 hover:border-edge-strong'
+    }`;
+
   return (
     <>
-      <div>
-        <h2 className="text-xl font-semibold text-slate-900 dark:text-slate-100">
-          Add your AI services
-        </h2>
-        <p className="mt-1 text-sm text-slate-600 dark:text-slate-300">
-          Connect as many as you like — local engines or cloud APIs with your own key.
-          You can manage them later in <strong>Settings → Services</strong>.
-        </p>
-      </div>
-
       {/* Services you already have — existing ones (detected) + any added this
           run. Reuse any of them in the starter flow; no need to re-add. */}
       {services.length > 0 && (
-        <div
-          className="rounded-lg border border-emerald-200 dark:border-emerald-900/50 bg-emerald-50/60 dark:bg-emerald-900/15 p-3"
-        >
-          <div className="text-[11px] font-medium uppercase tracking-wide text-emerald-700 dark:text-emerald-300 mb-2">
-            Your services · {services.length}
-          </div>
+        <div className="flex flex-col gap-2">
+          <span className="oaiy-label">Your services <span className="font-mono">{services.length}</span></span>
           <div className="flex flex-wrap gap-1.5">
             {services.map((svc) => {
               const removable = savedThisRunIds.has(svc.id);
               return (
                 <span
                   key={svc.id}
-                  className="inline-flex items-center gap-1.5 rounded-full bg-white dark:bg-slate-800 border border-emerald-200 dark:border-emerald-800 pl-2 pr-1.5 py-0.5 text-xs text-slate-700 dark:text-slate-200 shadow-sm"
+                  className="inline-flex items-center gap-1.5 rounded-full border border-edge-primary bg-surface-tertiary/60 py-0.5 pl-2 pr-1 text-[12px] text-content-primary"
                 >
-                  <span aria-hidden="true">{svc.icon ?? '🔌'}</span>
-                  <span className="font-medium max-w-[10rem] truncate">{svc.name}</span>
+                  <ServiceIcon icon={svc.icon} />
+                  <span className="max-w-[10rem] truncate font-medium">{svc.name}</span>
                   {removable ? (
                     <button
                       type="button"
                       onClick={() => onRemoveService(svc.id)}
                       aria-label={`Remove ${svc.name}`}
-                      className="w-4 h-4 inline-flex items-center justify-center rounded-full text-slate-400 hover:text-red-600 hover:bg-red-50 dark:hover:bg-red-900/30"
+                      className="grid h-4 w-4 place-items-center rounded-full text-content-faint hover:bg-signal-danger/10 hover:text-signal-danger"
                     >
-                      ×
+                      <X size={11} />
                     </button>
                   ) : (
-                    <span className="text-[9px] uppercase tracking-wide text-emerald-600/80 dark:text-emerald-400/80" title="Already saved">saved</span>
+                    <span className="oaiy-pill ok" title="Already saved">saved</span>
                   )}
                 </span>
               );
             })}
           </div>
-          <p className="mt-2 text-[11px] text-slate-500 dark:text-slate-400">
-            Reuse any of these in your starter flow — no need to re-add. Or add another below.
+          <p className="oaiy-help faint">
+            Use any of these for your starter flow, no need to add them again. Or add another below.
           </p>
         </div>
       )}
 
       {/* Preset picker */}
-      <div>
-        <div className="text-[11px] font-medium uppercase tracking-wide text-slate-500 dark:text-slate-400 mb-1.5">
-          {services.length > 0 ? 'Add another' : 'Pick a service'}
-        </div>
-        <div className="grid grid-cols-2 sm:grid-cols-3 gap-2">
+      <div className="flex flex-col gap-1.5">
+        <span className="oaiy-label">{services.length > 0 ? 'Add another' : 'Pick a service'}</span>
+        <div className="grid grid-cols-2 gap-2 sm:grid-cols-3">
           {presets.map((p) => {
             const selected = p.id === presetId;
             return (
@@ -701,22 +705,17 @@ function AddServiceStep(props: {
                 type="button"
                 onClick={() => onPresetChange(selected ? '' : p.id)}
                 aria-pressed={selected}
-                className={`flex items-center gap-2 text-left p-2.5 rounded-lg border transition-all ${
-                  selected
-                    ? 'border-[rgb(var(--accent-primary))] shadow-sm'
-                    : 'border-slate-300 dark:border-slate-600 hover:border-slate-400 dark:hover:border-slate-500 bg-white dark:bg-slate-900/40'
-                }`}
-                style={selected ? { backgroundColor: 'rgb(var(--accent-primary) / 0.08)' } : undefined}
+                className={choice(selected)}
                 title={p.hint}
               >
-                <span className="text-lg leading-none flex-shrink-0">{p.icon}</span>
+                <span className="shrink-0 text-lg leading-none" aria-hidden="true">{p.icon}</span>
                 <span className="min-w-0">
-                  <span className="block text-xs font-medium text-slate-800 dark:text-slate-100 truncate">{p.label}</span>
+                  <span className="block truncate text-[12.5px] font-semibold text-content-primary">{p.label}</span>
                   {services.some((s) => s.endpoint === p.endpoint)
-                    ? <span className="block text-[10px] text-emerald-600 dark:text-emerald-400">✓ added</span>
+                    ? <span className="block text-[11px] text-signal-green">added</span>
                     : p.needsApiKey
-                      ? <span className="block text-[10px] text-amber-600 dark:text-amber-400">needs key</span>
-                      : <span className="block text-[10px] text-emerald-600 dark:text-emerald-400">local</span>}
+                      ? <span className="block text-[11px] text-signal-amber">needs a key</span>
+                      : <span className="block text-[11px] text-signal-green">local</span>}
                 </span>
               </button>
             );
@@ -726,21 +725,21 @@ function AddServiceStep(props: {
 
       {/* Form — only when a preset is selected */}
       {preset && (
-        <div className="space-y-3 rounded-lg border border-slate-200 dark:border-slate-700 bg-slate-50/60 dark:bg-slate-900/30 p-3">
-          <p className="text-[11px] text-slate-500 dark:text-slate-400 leading-snug">{preset.hint}</p>
-          <div>
-            <label htmlFor="wizard-service-name" className="block text-xs text-slate-600 dark:text-slate-400 mb-1">Name</label>
+        <div className="flex flex-col gap-3 rounded-[var(--r-ctl)] border border-edge-primary bg-surface-tertiary/40 p-3">
+          <p className="oaiy-help faint">{preset.hint}</p>
+          <label className="oaiy-field" htmlFor="wizard-service-name">
+            <span>Name</span>
             <input
               id="wizard-service-name"
               type="text"
               value={serviceName}
               onChange={(e) => onServiceNameChange(e.target.value)}
               placeholder="My OpenAI"
-              className="w-full bg-white dark:bg-slate-900 border border-slate-300 dark:border-slate-600 rounded px-2 py-1.5 text-sm text-slate-800 dark:text-slate-200 focus:outline-none focus:border-[rgb(var(--accent-primary))]"
+              className="oaiy-input"
             />
-          </div>
-          <div>
-            <label htmlFor="wizard-endpoint" className="block text-xs text-slate-600 dark:text-slate-400 mb-1">Endpoint URL</label>
+          </label>
+          <div className="oaiy-field">
+            <label htmlFor="wizard-endpoint" className="oaiy-label">Endpoint URL</label>
             <div className="flex gap-2">
               <input
                 id="wizard-endpoint"
@@ -748,30 +747,30 @@ function AddServiceStep(props: {
                 value={endpoint}
                 onChange={(e) => onEndpointChange(e.target.value)}
                 placeholder="https://…"
-                className="flex-1 bg-white dark:bg-slate-900 border border-slate-300 dark:border-slate-600 rounded px-2 py-1.5 text-xs font-mono text-slate-800 dark:text-slate-200 focus:outline-none focus:border-[rgb(var(--accent-primary))]"
+                className="oaiy-input mono flex-1"
               />
               <button
                 type="button"
                 onClick={onTest}
                 disabled={!endpoint || testState === 'testing'}
-                className="px-2.5 py-1.5 text-xs rounded bg-slate-100 dark:bg-slate-700 hover:bg-slate-200 dark:hover:bg-slate-600 text-slate-700 dark:text-slate-200 disabled:opacity-50 disabled:cursor-not-allowed"
+                className="btn"
                 title="Probe the URL to confirm it's reachable"
               >
-                {testState === 'testing' ? '…' : 'Test'}
+                {testState === 'testing' ? 'Testing…' : 'Test'}
               </button>
             </div>
             {testMsg && (
-              <p className={`text-[11px] mt-1 ${testState === 'ok' ? 'text-emerald-600 dark:text-emerald-400' : 'text-red-600 dark:text-red-400'}`}>
-                {testState === 'ok' ? '✓ ' : '✗ '}{testMsg}
+              <p className={testState === 'ok' ? 'oaiy-ok-text' : 'oaiy-error-text'}>
+                {testMsg}
               </p>
             )}
           </div>
           {preset.needsApiKey && (
-            <div>
-              <label htmlFor="wizard-api-key" className="block text-xs text-slate-600 dark:text-slate-400 mb-1">
+            <div className="oaiy-field">
+              <label htmlFor="wizard-api-key" className="oaiy-label">
                 API key{' '}
                 {preset.apiKeyDocsUrl && (
-                  <a href={preset.apiKeyDocsUrl} target="_blank" rel="noopener noreferrer" className="text-[rgb(var(--accent-primary))] underline">
+                  <a href={preset.apiKeyDocsUrl} target="_blank" rel="noopener noreferrer" className="normal-case tracking-normal text-accent underline">
                     (get one)
                   </a>
                 )}
@@ -784,47 +783,19 @@ function AddServiceStep(props: {
                 placeholder={keyAlreadyProvided ? 'Already saved — leave blank to reuse it' : 'sk-… (stored locally; never sent to oaiy.com)'}
                 autoComplete="off"
                 spellCheck={false}
-                className="w-full bg-white dark:bg-slate-900 border border-slate-300 dark:border-slate-600 rounded px-2 py-1.5 text-xs font-mono text-slate-800 dark:text-slate-200 focus:outline-none focus:border-[rgb(var(--accent-primary))]"
+                className="oaiy-input mono"
               />
-              <p className="text-[10px] text-slate-500 dark:text-slate-400 mt-1">
+              <p className="oaiy-help faint">
                 {keyAlreadyProvided ? (
-                  <>✓ <code className="font-mono">{preset.apiKeyConstant}</code> is already set from another service — leave blank to reuse it.</>
+                  <><code className="oaiy-code">{preset.apiKeyConstant}</code> is already set from another service: leave this blank to reuse it.</>
                 ) : (
-                  <>Saved as <code className="font-mono">{preset.apiKeyConstant}</code> in your project constants. Change it later in <strong>Settings → API Keys</strong>.</>
+                  <>Saved as <code className="oaiy-code">{preset.apiKeyConstant}</code> in your project. Change it later in <strong>Settings → API keys</strong>.</>
                 )}
               </p>
             </div>
           )}
         </div>
       )}
-
-      <div className="flex items-center justify-between pt-1">
-        <button
-          type="button"
-          onClick={onBack}
-          className="px-3 py-2 text-sm text-slate-600 dark:text-slate-300 hover:text-slate-800 dark:hover:text-slate-100"
-        >
-          ← Back
-        </button>
-        <div className="flex items-center gap-2">
-          <button
-            type="button"
-            onClick={onAddAnother}
-            disabled={!formValid}
-            className="px-3 py-2 text-sm rounded-md border border-slate-300 dark:border-slate-600 text-slate-700 dark:text-slate-200 hover:bg-slate-100 dark:hover:bg-slate-700 disabled:opacity-40 disabled:cursor-not-allowed"
-          >
-            + Add &amp; add more
-          </button>
-          <button
-            type="button"
-            onClick={onContinue}
-            disabled={!canContinue}
-            className="px-4 py-2 text-sm rounded-md bg-[rgb(var(--accent-primary))] hover:bg-[rgb(var(--accent-hover))] text-white font-medium disabled:opacity-50 disabled:cursor-not-allowed"
-          >
-            Continue →
-          </button>
-        </div>
-      </div>
     </>
   );
 }
@@ -833,32 +804,24 @@ function StarterFlowStep(props: {
   services: CustomService[];
   selectedId: string;
   onSelect: (id: string) => void;
-  onBack: () => void;
-  onCreate: () => void;
 }) {
-  const { services, selectedId, onSelect, onBack, onCreate } = props;
+  const { services, selectedId, onSelect } = props;
   const selected = services.find((s) => s.id === selectedId) ?? services[0];
   const image = selected ? isImageService(selected) : false;
   const serviceName = selected?.name ?? 'your service';
 
+  const chain = [
+    { icon: <FileText size={17} />, tone: 'bg-signal-green/15 text-signal-green', name: 'Text input', note: 'Your prompt' },
+    { icon: <Plug size={17} />, tone: 'bg-accent/12 text-accent', name: 'Service call', note: serviceName },
+    { icon: image ? <ImageIcon size={17} /> : <MessageSquare size={17} />, tone: 'bg-signal-cyan/15 text-signal-cyan', name: 'Output', note: image ? 'The image' : 'The response' },
+  ];
+
   return (
     <>
-      <div>
-        <h2 className="text-xl font-semibold text-slate-900 dark:text-slate-100">
-          Build a starter flow
-        </h2>
-        <p className="mt-1 text-sm text-slate-600 dark:text-slate-300">
-          We'll wire a tiny <em>Text&nbsp;→&nbsp;{serviceName}&nbsp;→&nbsp;{image ? 'Image' : 'Reply'}</em> flow
-          so you have something to run.
-        </p>
-      </div>
-
       {/* Service picker — only when there's a choice */}
       {services.length > 1 && (
-        <div>
-          <div className="text-[11px] font-medium uppercase tracking-wide text-slate-500 dark:text-slate-400 mb-1.5">
-            Which service?
-          </div>
+        <div className="flex flex-col gap-1.5">
+          <span className="oaiy-label">Which service?</span>
           <div className="grid grid-cols-2 gap-2">
             {services.map((s) => {
               const sel = s.id === selected?.id;
@@ -868,15 +831,12 @@ function StarterFlowStep(props: {
                   type="button"
                   onClick={() => onSelect(s.id)}
                   aria-pressed={sel}
-                  className={`flex items-center gap-2 text-left p-2 rounded-lg border transition-all ${
-                    sel
-                      ? 'border-[rgb(var(--accent-primary))] shadow-sm'
-                      : 'border-slate-300 dark:border-slate-600 hover:border-slate-400 dark:hover:border-slate-500 bg-white dark:bg-slate-900/40'
+                  className={`flex min-w-0 items-center gap-2 rounded-[var(--r-ctl)] border p-2 text-left transition-colors ${
+                    sel ? 'border-accent bg-accent/10' : 'border-edge-primary bg-surface-tertiary/40 hover:border-edge-strong'
                   }`}
-                  style={sel ? { backgroundColor: 'rgb(var(--accent-primary) / 0.08)' } : undefined}
                 >
-                  <span className="text-base leading-none flex-shrink-0">{s.icon ?? '🔌'}</span>
-                  <span className="text-xs font-medium text-slate-800 dark:text-slate-100 truncate">{s.name}</span>
+                  <ServiceIcon icon={s.icon} />
+                  <span className="truncate text-[12.5px] font-semibold text-content-primary">{s.name}</span>
                 </button>
               );
             })}
@@ -885,102 +845,51 @@ function StarterFlowStep(props: {
       )}
 
       {/* Tiny preview of the chain */}
-      <div className="bg-slate-50 dark:bg-slate-900/50 border border-slate-200 dark:border-slate-700 rounded-lg p-4">
-        <div className="flex items-center justify-between gap-2 text-xs">
-          <div className="flex-1 text-center">
-            <div className="w-10 h-10 mx-auto rounded-md bg-green-100 dark:bg-green-900/30 flex items-center justify-center text-base">📝</div>
-            <div className="mt-1 font-medium text-slate-700 dark:text-slate-200">Text Input</div>
-            <div className="text-[10px] text-slate-500 dark:text-slate-400">Your prompt</div>
+      <div className="flex items-center justify-between gap-2 rounded-[var(--r-ctl)] border border-edge-primary bg-surface-tertiary/40 p-4">
+        {chain.map((c, i) => (
+          <div key={c.name} className="contents">
+            {i > 0 && <ArrowRight size={16} className="shrink-0 text-content-faint" />}
+            <div className="min-w-0 flex-1 text-center">
+              <div className={`mx-auto grid h-10 w-10 place-items-center rounded-[var(--r-ctl)] ${c.tone}`}>{c.icon}</div>
+              <div className="mt-1 text-[12px] font-semibold text-content-primary">{c.name}</div>
+              <div className="truncate text-[11px] text-content-faint" title={c.note}>{c.note}</div>
+            </div>
           </div>
-          <div className="text-slate-400 text-lg">→</div>
-          <div className="flex-1 text-center">
-            <div className="w-10 h-10 mx-auto rounded-md flex items-center justify-center text-base" style={{ backgroundColor: 'rgb(var(--accent-primary) / 0.10)' }}>🔌</div>
-            <div className="mt-1 font-medium text-slate-700 dark:text-slate-200">Service Call</div>
-            <div className="text-[10px] text-slate-500 dark:text-slate-400 truncate" title={serviceName}>{serviceName}</div>
-          </div>
-          <div className="text-slate-400 text-lg">→</div>
-          <div className="flex-1 text-center">
-            <div className="w-10 h-10 mx-auto rounded-md bg-emerald-100 dark:bg-emerald-900/30 flex items-center justify-center text-base">{image ? '🖼️' : '✅'}</div>
-            <div className="mt-1 font-medium text-slate-700 dark:text-slate-200">Output</div>
-            <div className="text-[10px] text-slate-500 dark:text-slate-400">{image ? 'The image' : 'The response'}</div>
-          </div>
-        </div>
+        ))}
       </div>
 
       {services.length === 0 && (
-        <p className="text-xs text-amber-600 dark:text-amber-400">
-          No services yet — go back and add one, or skip for now.
+        <p className="oaiy-warn-text">
+          No services yet: go back and add one, or skip for now.
         </p>
       )}
-
-      <div className="flex justify-between pt-1">
-        <button
-          type="button"
-          onClick={onBack}
-          className="px-3 py-2 text-sm text-slate-600 dark:text-slate-300 hover:text-slate-800 dark:hover:text-slate-100"
-        >
-          ← Back
-        </button>
-        <button
-          type="button"
-          onClick={onCreate}
-          disabled={!selected}
-          className="px-4 py-2 text-sm rounded-md bg-[rgb(var(--accent-primary))] hover:bg-[rgb(var(--accent-hover))] text-white font-medium disabled:opacity-50 disabled:cursor-not-allowed"
-        >
-          {image ? 'Create my image flow →' : 'Create my chat flow →'}
-        </button>
-      </div>
     </>
   );
 }
 
-function DoneStep({ onClose }: { onClose: () => void }) {
+function DoneStep() {
   return (
-    <>
-      <div className="text-center">
-        <div className="mx-auto w-14 h-14 rounded-full bg-emerald-100 dark:bg-emerald-900/30 flex items-center justify-center text-2xl mb-3">
-          🎉
-        </div>
-        <h2 className="text-2xl font-semibold text-slate-900 dark:text-slate-100">
-          You're set up!
-        </h2>
-        <p className="mt-2 text-sm text-slate-600 dark:text-slate-300">
-          A few things to know while you click around:
-        </p>
-      </div>
-
-      <div className="space-y-2">
-        <TipCard icon="🖱️" title="Drag from the palette">
-          Anything on the left can be dragged onto the canvas. Connect handles to wire data through.
-        </TipCard>
-        <TipCard icon="▶️" title="Run the flow">
-          The cyan Run button in the toolbar fires the whole chain. Watch the Execution Log on the right.
-        </TipCard>
-        <TipCard icon="🔗" title="Share + remote AI">
-          Settings → Defaults → <em>Sharing &amp; remote runs</em>. Lets ChatGPT or Claude trigger this flow over HTTP.
-        </TipCard>
-      </div>
-
-      <div className="flex justify-end pt-2">
-        <button
-          type="button"
-          onClick={onClose}
-          className="px-4 py-2 text-sm rounded-md bg-[rgb(var(--accent-primary))] hover:bg-[rgb(var(--accent-hover))] text-white font-medium"
-        >
-          Open my flow
-        </button>
-      </div>
-    </>
+    <div className="flex flex-col gap-2">
+      <TipCard icon={<MousePointerClick size={17} />} title="Add nodes from the palette">
+        Nodes, in the toolbar at the foot of the canvas, opens the palette: click a node to add it, or drag it where it goes. Wire the handles to pass data along.
+      </TipCard>
+      <TipCard icon={<Play size={17} />} title="Run the flow">
+        Run, in the same toolbar, runs the whole chain. Its log is under the node's properties on the right.
+      </TipCard>
+      <TipCard icon={<Share2 size={17} />} title="Share, and run it from another AI">
+        Settings → General → <em>Sharing and remote runs</em> lets ChatGPT or Claude trigger this flow over HTTP.
+      </TipCard>
+    </div>
   );
 }
 
-function TipCard({ icon, title, children }: { icon: string; title: string; children: React.ReactNode }) {
+function TipCard({ icon, title, children }: { icon: React.ReactNode; title: string; children: React.ReactNode }) {
   return (
-    <div className="flex items-start gap-3 p-3 rounded-md bg-slate-50 dark:bg-slate-900/40 border border-slate-200 dark:border-slate-700">
-      <span className="text-xl flex-shrink-0 leading-none">{icon}</span>
+    <div className="flex items-start gap-3 rounded-[var(--r-ctl)] border border-edge-primary bg-surface-tertiary/40 p-3">
+      <span className="mt-0.5 grid h-8 w-8 shrink-0 place-items-center rounded-[var(--r-sm)] bg-accent/12 text-accent">{icon}</span>
       <div className="min-w-0">
-        <div className="text-sm font-medium text-slate-800 dark:text-slate-100">{title}</div>
-        <p className="text-xs text-slate-600 dark:text-slate-300 mt-0.5">{children}</p>
+        <div className="text-[13px] font-semibold text-content-primary">{title}</div>
+        <p className="m-0 mt-0.5 text-[12px] leading-relaxed text-content-secondary">{children}</p>
       </div>
     </div>
   );

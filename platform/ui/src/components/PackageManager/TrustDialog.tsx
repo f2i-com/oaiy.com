@@ -2,9 +2,10 @@
  * TrustDialog - Permission review dialog for installing packages
  */
 
-import { useState, useCallback, useEffect, useRef } from 'react';
+import { useState, useCallback, useRef } from 'react';
+import { Check, Info, Package, ShieldCheck } from 'lucide-react';
 import type { OAIYPackageManifest, PackagePermission } from 'oaiy-core';
-import { useFocusTrap } from '../../hooks/useFocusTrap';
+import Dialog from '../ui/Dialog';
 
 interface TrustDialogProps {
   manifest: OAIYPackageManifest;
@@ -278,25 +279,12 @@ export function TrustDialog({ manifest, onConfirm, onCancel }: TrustDialogProps)
     Set<PackagePermission>
   >(() => new Set(requestedPermissions.filter((p) => !HIGH_RISK_PERMISSIONS.has(p))));
 
-  const dialogRef = useRef<HTMLDivElement>(null);
   const cancelButtonRef = useRef<HTMLButtonElement>(null);
   // Initial focus → Cancel, NOT Install. This dialog hands the
   // package OS-level capabilities (filesystem, process:execute, …);
   // an accidental Enter from the trigger context should not commit
   // them. Matches the danger-variant convention in ConfirmDialog.
-  useFocusTrap(dialogRef, true, cancelButtonRef);
-
-  // Escape = Cancel (same reason: never auto-commit a permission grant).
-  useEffect(() => {
-    const onKey = (e: KeyboardEvent) => {
-      if (e.key === 'Escape') {
-        e.preventDefault();
-        onCancel();
-      }
-    };
-    window.addEventListener('keydown', onKey);
-    return () => window.removeEventListener('keydown', onKey);
-  }, [onCancel]);
+  // Escape and the overlay = Cancel (same reason: never auto-commit a grant).
 
   const togglePermission = useCallback((permission: PackagePermission) => {
     setGrantedPermissions((prev) => {
@@ -324,207 +312,107 @@ export function TrustDialog({ manifest, onConfirm, onCancel }: TrustDialogProps)
   }, [grantedPermissions, onConfirm]);
 
   return (
-    <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/50 backdrop-blur-sm">
-      <div
-        ref={dialogRef}
-        className="bg-white dark:bg-slate-800 rounded-2xl border border-slate-200 dark:border-slate-700 shadow-2xl max-w-md w-full mx-4 overflow-hidden"
-        role="alertdialog"
-        aria-modal="true"
-        aria-labelledby="trust-dialog-title"
-        aria-describedby="trust-dialog-desc"
-      >
-        {/* Header */}
-        <div className="px-6 pt-6 pb-4">
-          <div className="flex items-start gap-4">
-            <div className="w-14 h-14 rounded-2xl bg-gradient-to-br from-purple-500 to-purple-600 flex items-center justify-center shadow-lg shadow-purple-500/20">
-              <svg
-                className="w-7 h-7 text-white"
-                fill="none"
-                stroke="currentColor"
-                viewBox="0 0 24 24"
-              >
-                <path
-                  strokeLinecap="round"
-                  strokeLinejoin="round"
-                  strokeWidth={2}
-                  d="M20 7l-8-4-8 4m16 0l-8 4m8-4v10l-8 4m0-10L4 7m8 4v10M4 7v10l8 4"
-                />
-              </svg>
-            </div>
-            <div className="flex-1 min-w-0">
-              <h2 id="trust-dialog-title" className="text-xl font-semibold text-slate-800 dark:text-slate-100">
-                Install Package
-              </h2>
-              <p id="trust-dialog-desc" className="text-sm text-slate-500 dark:text-slate-400 mt-0.5">Review details before installing</p>
-            </div>
-          </div>
-        </div>
-
-        {/* Package Info Card */}
-        <div className="mx-6 mb-4 p-4 rounded-xl bg-slate-50 dark:bg-slate-700/40 border border-slate-200 dark:border-slate-600/50">
-          <div className="flex items-start justify-between gap-3">
-            <div className="min-w-0 flex-1">
-              <h3 className="font-semibold text-slate-800 dark:text-slate-100 truncate">{manifest.name}</h3>
-              <p className="text-sm text-slate-500 dark:text-slate-400 mt-0.5">
-                v{manifest.version}
-                {manifest.author && <span className="text-slate-400 dark:text-slate-500"> · </span>}
-                {manifest.author && <span>{manifest.author}</span>}
-              </p>
-            </div>
-            <span className="flex-shrink-0 inline-flex items-center gap-1 px-2.5 py-1 text-xs font-medium bg-slate-200 dark:bg-slate-600 text-slate-600 dark:text-slate-300 rounded-full">
-              <svg className="w-3 h-3" fill="none" stroke="currentColor" viewBox="0 0 24 24">
-                <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M8.228 9c.549-1.165 2.03-2 3.772-2 2.21 0 4 1.343 4 3 0 1.4-1.278 2.575-3.006 2.907-.542.104-.994.54-.994 1.093m0 3h.01M21 12a9 9 0 11-18 0 9 9 0 0118 0z" />
-              </svg>
-              Unverified
-            </span>
-          </div>
-          {manifest.description && (
-            <p className="mt-3 text-sm text-slate-600 dark:text-slate-300 leading-relaxed">{manifest.description}</p>
-          )}
-        </div>
-
-        {/* Permissions */}
-        <div className="px-6 pb-4">
-          <h4 className="text-sm font-semibold text-slate-700 dark:text-slate-200 mb-3">
-            Requested Permissions
-          </h4>
-
-          {requestedPermissions.length === 0 ? (
-            <div className="flex items-center gap-3 p-3 rounded-xl bg-green-50 dark:bg-green-500/10 border border-green-200 dark:border-green-500/20">
-              <div className="w-8 h-8 rounded-lg bg-green-100 dark:bg-green-500/20 flex items-center justify-center">
-                <svg className="w-4 h-4 text-green-600 dark:text-green-400" fill="none" stroke="currentColor" viewBox="0 0 24 24">
-                  <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M9 12l2 2 4-4m5.618-4.016A11.955 11.955 0 0112 2.944a11.955 11.955 0 01-8.618 3.04A12.02 12.02 0 003 9c0 5.591 3.824 10.29 9 11.622 5.176-1.332 9-6.03 9-11.622 0-1.042-.133-2.052-.382-3.016z" />
-                </svg>
-              </div>
-              <p className="text-sm text-green-700 dark:text-green-300">
-                No special permissions required
-              </p>
-            </div>
-          ) : (
-            <div className="space-y-2">
-              {requestedPermissions.map((permission) => {
-                const info = PERMISSION_INFO[permission];
-                const granted = grantedPermissions.has(permission);
-
-                return (
-                  <button
-                    key={permission}
-                    type="button"
-                    role="checkbox"
-                    aria-checked={granted}
-                    aria-describedby={`perm-desc-${permission}`}
-                    onClick={() => togglePermission(permission)}
-                    className={`w-full flex items-center gap-3 p-3 rounded-xl border transition-all ${
-                      granted
-                        ? 'bg-purple-50 dark:bg-purple-500/10 border-purple-200 dark:border-purple-500/30 hover:border-purple-300 dark:hover:border-purple-500/50'
-                        : 'bg-slate-50 dark:bg-slate-700/30 border-slate-200 dark:border-slate-600/50 hover:border-slate-300 dark:hover:border-slate-500/50'
-                    }`}
-                  >
-                    <div
-                      className={`w-9 h-9 rounded-lg flex items-center justify-center ${
-                        granted
-                          ? 'bg-purple-100 dark:bg-purple-500/20 text-purple-600 dark:text-purple-400'
-                          : 'bg-slate-200 dark:bg-slate-600 text-slate-500 dark:text-slate-400'
-                      }`}
-                    >
-                      {info?.icon ?? (
-                        <svg
-                          className="w-5 h-5"
-                          fill="none"
-                          stroke="currentColor"
-                          viewBox="0 0 24 24"
-                        >
-                          <path
-                            strokeLinecap="round"
-                            strokeLinejoin="round"
-                            strokeWidth={2}
-                            d="M9 12l2 2 4-4m6 2a9 9 0 11-18 0 9 9 0 0118 0z"
-                          />
-                        </svg>
-                      )}
-                    </div>
-                    <div className="flex-1 text-left">
-                      <p
-                        className={`text-sm font-medium ${
-                          granted ? 'text-slate-800 dark:text-slate-100' : 'text-slate-600 dark:text-slate-300'
-                        }`}
-                      >
-                        {info?.label ?? permission}
-                      </p>
-                      <p id={`perm-desc-${permission}`} className="text-xs text-slate-500 dark:text-slate-400">
-                        {info?.description ?? 'Unknown permission'}
-                      </p>
-                    </div>
-                    <div
-                      className={`w-5 h-5 rounded-md border-2 flex items-center justify-center transition-colors ${
-                        granted
-                          ? 'bg-purple-500 border-purple-500'
-                          : 'border-slate-300 dark:border-slate-500'
-                      }`}
-                    >
-                      {granted && (
-                        <svg
-                          className="w-3 h-3 text-white"
-                          fill="none"
-                          stroke="currentColor"
-                          viewBox="0 0 24 24"
-                        >
-                          <path
-                            strokeLinecap="round"
-                            strokeLinejoin="round"
-                            strokeWidth={3}
-                            d="M5 13l4 4L19 7"
-                          />
-                        </svg>
-                      )}
-                    </div>
-                  </button>
-                );
-              })}
-            </div>
-          )}
-        </div>
-
-        {/* Warning Footer */}
-        <div className="px-6 py-3 bg-slate-100 dark:bg-slate-700/50 border-t border-slate-200 dark:border-slate-600/50">
-          <div className="flex gap-2.5 items-start">
-            <svg
-              className="w-4 h-4 flex-shrink-0 mt-0.5 text-slate-400 dark:text-slate-500"
-              fill="none"
-              stroke="currentColor"
-              viewBox="0 0 24 24"
-            >
-              <path
-                strokeLinecap="round"
-                strokeLinejoin="round"
-                strokeWidth={2}
-                d="M13 16h-1v-4h-1m1-4h.01M21 12a9 9 0 11-18 0 9 9 0 0118 0z"
-              />
-            </svg>
-            <p className="text-xs text-slate-500 dark:text-slate-400 leading-relaxed">
-              Only install packages from sources you trust. Packages can execute code and access resources on your computer.
-            </p>
-          </div>
-        </div>
-
-        {/* Actions */}
-        <div className="px-6 py-4 flex justify-end gap-3 bg-white dark:bg-slate-800 border-t border-slate-200 dark:border-slate-700">
-          <button
-            ref={cancelButtonRef}
-            onClick={onCancel}
-            className="px-4 py-2.5 text-sm font-medium text-slate-600 dark:text-slate-300 hover:text-slate-800 dark:hover:text-slate-100 hover:bg-slate-100 dark:hover:bg-slate-700 rounded-lg transition-colors"
-          >
+    <Dialog
+      open
+      onClose={onCancel}
+      title="Install this package?"
+      description="Review what it may do before it is installed."
+      icon={<Package size={16} />}
+      tone="accent"
+      size="md"
+      role="alertdialog"
+      initialFocusRef={cancelButtonRef}
+      // Once Install is pressed the install runs to its end.
+      dismissible={!submitting}
+      footer={
+        <>
+          <button ref={cancelButtonRef} type="button" onClick={onCancel} disabled={submitting} className="btn btn-secondary">
             Cancel
           </button>
-          <button
-            onClick={handleConfirm}
-            disabled={submitting}
-            className="px-5 py-2.5 text-sm font-medium bg-gradient-to-r from-purple-600 to-purple-500 hover:from-purple-500 hover:to-purple-400 text-white rounded-lg transition-all shadow-md shadow-purple-500/20 hover:shadow-lg hover:shadow-purple-500/30 disabled:opacity-60 disabled:cursor-not-allowed"
-          >
-            {submitting ? 'Installing…' : 'Install Package'}
+          <button type="button" onClick={handleConfirm} disabled={submitting} className="btn btn-primary">
+            {submitting ? 'Installing…' : 'Install package'}
           </button>
+        </>
+      }
+    >
+      {/* The package */}
+      <div className="rounded-[var(--r-ctl)] border border-edge-primary bg-surface-tertiary/50 p-3.5">
+        <div className="flex items-start justify-between gap-3">
+          <div className="min-w-0 flex-1">
+            <h3 className="m-0 truncate text-[14px] font-semibold text-content-primary">{manifest.name}</h3>
+            <p className="m-0 mt-0.5 font-mono text-[11.5px] text-content-faint">
+              v{manifest.version}
+              {manifest.author && <> · {manifest.author}</>}
+            </p>
+          </div>
+          <span className="oaiy-pill warn dot">unverified</span>
         </div>
+        {manifest.description && (
+          <p className="m-0 mt-2.5 text-[12.5px] leading-relaxed text-content-secondary">{manifest.description}</p>
+        )}
       </div>
-    </div>
+
+      {/* Permissions */}
+      <div className="flex flex-col gap-2">
+        <span className="oaiy-label">It asks to</span>
+
+        {requestedPermissions.length === 0 ? (
+          <div className="oaiy-banner ok">
+            <ShieldCheck size={15} className="mt-0.5 shrink-0" />
+            <span className="flex-1">Nothing special: it needs no permissions.</span>
+          </div>
+        ) : (
+          requestedPermissions.map((permission) => {
+            const info = PERMISSION_INFO[permission];
+            const granted = grantedPermissions.has(permission);
+
+            return (
+              <button
+                key={permission}
+                type="button"
+                role="checkbox"
+                aria-checked={granted}
+                aria-describedby={`perm-desc-${permission}`}
+                onClick={() => togglePermission(permission)}
+                className={`flex w-full items-center gap-3 rounded-[var(--r-ctl)] border p-2.5 text-left transition-colors ${
+                  granted
+                    ? 'border-accent/40 bg-accent/10 hover:border-accent/60'
+                    : 'border-edge-primary bg-surface-tertiary/40 hover:border-edge-strong'
+                }`}
+              >
+                <span
+                  className={`grid h-8 w-8 shrink-0 place-items-center rounded-[var(--r-sm)] ${
+                    granted ? 'bg-accent/15 text-accent' : 'bg-surface-tertiary text-content-faint'
+                  }`}
+                >
+                  {info?.icon ?? <Check size={18} />}
+                </span>
+                <span className="min-w-0 flex-1">
+                  <span className={`block text-[13px] font-semibold ${granted ? 'text-content-primary' : 'text-content-secondary'}`}>
+                    {info?.label ?? permission}
+                  </span>
+                  <span id={`perm-desc-${permission}`} className="block text-[12px] leading-snug text-content-faint">
+                    {info?.description ?? 'Unknown permission'}
+                  </span>
+                </span>
+                <span
+                  className={`grid h-5 w-5 shrink-0 place-items-center rounded-[5px] border-2 transition-colors ${
+                    granted ? 'border-accent bg-accent text-white' : 'border-edge-strong'
+                  }`}
+                  aria-hidden="true"
+                >
+                  {granted && <Check size={12} strokeWidth={3} />}
+                </span>
+              </button>
+            );
+          })
+        )}
+      </div>
+
+      <p className="oaiy-help faint flex items-start gap-2">
+        <Info size={14} className="mt-0.5 shrink-0" />
+        Install packages only from sources you trust: a package can run code and reach things on your computer.
+      </p>
+    </Dialog>
   );
 }
