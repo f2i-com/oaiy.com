@@ -722,6 +722,9 @@ fn link_stays_inside(member: &Path, target: &Path) -> bool {
 fn run_logged(program: &Path, args: &[String], logs: &LogBuffer) -> i32 {
     let mut cmd = Command::new(program);
     cmd.args(args).stdout(Stdio::piped()).stderr(Stdio::piped());
+    // This is an installer too: `pip install` runs the setup code of whatever
+    // package it is asked for, so OAIY's tokens are not in what it inherits.
+    super::runner::scrub_inherited_tokens(&mut cmd);
     #[cfg(windows)]
     {
         use std::os::windows::process::CommandExt;
@@ -803,6 +806,32 @@ fn dir_size_shallow(dir: &Path) -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_venv_and_pip_steps_do_not_inherit_oaiy_tokens() {
+        use crate::services::runner::env_probe::{env_dump, is_complete, names, Planted};
+        // `pip install` runs the setup code of whatever package it is asked for,
+        // so this step must not carry the server's bearer or the Hugging Face token.
+        let _planted = Planted::new(&[
+            ("OAIY_SERVER_TOKEN", "planted-server-value"),
+            ("OAIY_HF_TOKEN", "planted-hf-value"),
+            ("OAIY_SCRUB_TEST_PIP_TOKEN", "planted"),
+            ("OAIY_SCRUB_TEST_PIP_KEEP", "planted"),
+        ]);
+        let (program, args) = env_dump();
+        let logs = LogBuffer::new();
+        assert_eq!(run_logged(Path::new(&program), &args, &logs), 0, "the probe should run and exit cleanly");
+        let lines = logs.snapshot(None);
+        assert!(is_complete(&lines), "the probe printed its environment");
+
+        let seen = names(&lines);
+        for gone in ["OAIY_SERVER_TOKEN", "OAIY_HF_TOKEN", "OAIY_SCRUB_TEST_PIP_TOKEN"] {
+            assert!(!seen.contains(gone), "{gone} reached the child");
+        }
+        for arrived in ["OAIY_SCRUB_TEST_PIP_KEEP", "PATH"] {
+            assert!(seen.contains(arrived), "{arrived} should have reached the child");
+        }
+    }
 
     #[test]
     fn rejects_bad_venv_names() {

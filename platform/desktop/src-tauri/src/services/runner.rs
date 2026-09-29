@@ -84,6 +84,39 @@ pub struct SpawnConfig<'a> {
     pub cwd: Option<&'a str>,
 }
 
+/// Is `name` one of OAIY's own credentials: `OAIY_SERVER_TOKEN`, `OAIY_HF_TOKEN`
+/// or any other `OAIY_*TOKEN`?
+///
+/// Compared without regard to case, because environment names on Windows do not
+/// have one.
+pub(crate) fn is_oaiy_token(name: &str) -> bool {
+    let name = name.to_ascii_uppercase();
+    name.starts_with("OAIY_") && name.ends_with("TOKEN")
+}
+
+/// Take OAIY's own tokens out of what `cmd` inherits from this process.
+///
+/// `Command` hands its child the whole environment of this one, and this one
+/// holds the headless server's bearer (`OAIY_SERVER_TOKEN`, which is the key to
+/// every privileged route and so to running code on the machine) and the
+/// Hugging Face token. A model server, a Python service, a custom node or a
+/// browser it installs is code that is not ours, and so is every package a
+/// venv's `pip` fetches: none of them needs either token, and same-user code can
+/// read them from `/proc/<pid>/environ` for as long as the process lives.
+///
+/// Only what is inherited is scrubbed. Call this BEFORE applying a step's own
+/// `env`, so a value a template sets on purpose still arrives. No shipped
+/// install script or template reads a token (the models are public revisions
+/// pinned by SHA-256, and downloads run in this process with the saved token),
+/// so no step is given one.
+pub(crate) fn scrub_inherited_tokens(cmd: &mut Command) {
+    for (name, _) in std::env::vars_os() {
+        if name.to_str().is_some_and(is_oaiy_token) {
+            cmd.env_remove(&name);
+        }
+    }
+}
+
 impl Runner {
     /// Spawn the configured process. Returns the live Runner on success.
     pub fn spawn(cfg: SpawnConfig<'_>) -> std::io::Result<Self> {
@@ -91,6 +124,8 @@ impl Runner {
 
         let mut cmd = Command::new(cfg.command);
         cmd.args(cfg.args);
+        // Managed services and the installers both come through here.
+        scrub_inherited_tokens(&mut cmd);
         for (k, v) in cfg.env {
             cmd.env(k, v);
         }
@@ -197,5 +232,173 @@ impl Runner {
             let _ = child.wait();
         }
         Ok(())
+    }
+}
+
+/// What the tests of the child environment share: a way to plant variables in
+/// THIS process, and a child that prints the environment it actually received.
+///
+/// Nothing here ever prints a value. A test that dumped the environment on
+/// failure would put the developer's real keys in a log, so the tests only ever
+/// name the variables they checked.
+#[cfg(test)]
+pub(crate) mod env_probe {
+    use super::LogLine;
+    use std::collections::HashSet;
+
+    /// Printed after the environment, so a test knows the child has said everything.
+    pub const END: &str = "__END_OF_ENV__";
+
+    /// Variables planted in this process's environment, taken out again on drop
+    /// (assertion or not) so no other test in the binary inherits them. Held one
+    /// at a time, so two of these tests planting the same name cannot take it out
+    /// from under each other.
+    pub struct Planted {
+        names: Vec<String>,
+        _one_at_a_time: std::sync::MutexGuard<'static, ()>,
+    }
+
+    impl Planted {
+        pub fn new(vars: &[(&str, &str)]) -> Self {
+            static PLANTING: std::sync::Mutex<()> = std::sync::Mutex::new(());
+            let one_at_a_time = PLANTING.lock().unwrap_or_else(|e| e.into_inner());
+            for (name, value) in vars {
+                std::env::set_var(name, value);
+            }
+            Planted {
+                names: vars.iter().map(|(name, _)| name.to_string()).collect(),
+                _one_at_a_time: one_at_a_time,
+            }
+        }
+    }
+
+    impl Drop for Planted {
+        fn drop(&mut self) {
+            for name in &self.names {
+                std::env::remove_var(name);
+            }
+        }
+    }
+
+    /// A program and arguments that print every variable of their environment as
+    /// `NAME=value` lines, then [`END`].
+    pub fn env_dump() -> (String, Vec<String>) {
+        if cfg!(windows) {
+            ("cmd.exe".into(), vec!["/C".into(), format!("set & echo {END}")])
+        } else {
+            ("sh".into(), vec!["-c".into(), format!("env; echo {END}")])
+        }
+    }
+
+    /// Has the child said everything?
+    pub fn is_complete(lines: &[LogLine]) -> bool {
+        lines.iter().any(|l| l.text.trim() == END)
+    }
+
+    /// The NAMES the child's environment had, upper-cased (on Windows they have
+    /// no case, and `set` prints them as they were stored).
+    pub fn names(lines: &[LogLine]) -> HashSet<String> {
+        lines
+            .iter()
+            .filter(|l| l.stream == "stdout")
+            .filter_map(|l| l.text.split_once('='))
+            .filter(|(name, _)| !name.is_empty() && !name.starts_with('='))
+            .map(|(name, _)| name.to_ascii_uppercase())
+            .collect()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::env_probe::{env_dump, is_complete, names, Planted};
+    use super::*;
+    use std::collections::{HashMap, HashSet};
+    use std::time::{Duration, Instant};
+
+    #[test]
+    fn oaiy_tokens_are_recognised_by_name_and_only_those() {
+        for token in [
+            "OAIY_SERVER_TOKEN",
+            "OAIY_HF_TOKEN",
+            "OAIY_SOMETHING_NEW_TOKEN",
+            "OAIY_TOKEN",
+            "oaiy_hf_token",
+            "Oaiy_Server_Token",
+        ] {
+            assert!(is_oaiy_token(token), "{token} is one of OAIY's tokens");
+        }
+        for other in [
+            "OAIY_DATA_DIR",
+            "OAIY_BIN_DIR",
+            "OAIY_MODELS_DIR",
+            "OAIY_SERVER_URL",
+            "OAIY_TOKEN_FILE",
+            "HF_TOKEN",
+            "GITHUB_TOKEN",
+            "OPENAI_API_KEY",
+            "MY_OAIY_TOKEN",
+            "PATH",
+            "",
+        ] {
+            assert!(!is_oaiy_token(other), "{other} is not");
+        }
+    }
+
+    /// Spawn the env dump through `Runner::spawn`, the one call both the managed
+    /// services and the installers are started with, and return the names of the
+    /// variables the child actually received.
+    fn received_by_a_spawned_child(explicit: &HashMap<String, String>) -> HashSet<String> {
+        let (command, args) = env_dump();
+        let runner = Runner::spawn(SpawnConfig { command: &command, args: &args, env: explicit, cwd: None })
+            .expect("spawn a child that prints its environment");
+        let deadline = Instant::now() + Duration::from_secs(30);
+        loop {
+            let lines = runner.logs.snapshot(None);
+            if is_complete(&lines) {
+                return names(&lines);
+            }
+            assert!(Instant::now() < deadline, "the child never finished printing its environment");
+            std::thread::sleep(Duration::from_millis(50));
+        }
+    }
+
+    #[test]
+    fn a_spawned_child_does_not_inherit_oaiy_tokens_but_gets_everything_else() {
+        // The headless server carries its real bearer and its Hugging Face token in
+        // its own environment. Plant both, another OAIY_*TOKEN, and variables that
+        // must still arrive: not a token, and not what the child could run without.
+        let _planted = Planted::new(&[
+            ("OAIY_SERVER_TOKEN", "planted-server-value"),
+            ("OAIY_HF_TOKEN", "planted-hf-value"),
+            ("OAIY_SCRUB_TEST_EXTRA_TOKEN", "planted"),
+            ("oaiy_scrub_test_lower_token", "planted"),
+            ("OAIY_SCRUB_TEST_KEEP", "planted"),
+            ("OAIY_SCRUB_TEST_TOKEN_FILE", "planted"),
+        ]);
+        // What a template sets for a step, and what the installer is given: a value
+        // a step names on purpose is applied AFTER the scrub, so it arrives.
+        let mut explicit = HashMap::new();
+        explicit.insert("OAIY_DATA_DIR".to_string(), "the-data-dir".to_string());
+        explicit.insert("OAIY_SCRUB_TEST_STEP_TOKEN".to_string(), "on-purpose".to_string());
+
+        let seen = received_by_a_spawned_child(&explicit);
+
+        for gone in [
+            "OAIY_SERVER_TOKEN",
+            "OAIY_HF_TOKEN",
+            "OAIY_SCRUB_TEST_EXTRA_TOKEN",
+            "OAIY_SCRUB_TEST_LOWER_TOKEN",
+        ] {
+            assert!(!seen.contains(gone), "{gone} reached the child");
+        }
+        for arrived in [
+            "OAIY_SCRUB_TEST_KEEP",
+            "OAIY_SCRUB_TEST_TOKEN_FILE",
+            "OAIY_DATA_DIR",
+            "OAIY_SCRUB_TEST_STEP_TOKEN",
+            "PATH",
+        ] {
+            assert!(seen.contains(arrived), "{arrived} should have reached the child (is the probe reading its environment at all?)");
+        }
     }
 }
