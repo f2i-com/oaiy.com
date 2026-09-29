@@ -928,3 +928,21 @@ fn a_busy_formlogic_is_tried_again_when_it_said() {
     // Anything else backs off as before.
     assert_eq!(retry_wait(&Failure::Offline("away".into()), 1), backoff(1));
 }
+
+#[test]
+fn a_heartbeat_brings_the_sync_forward_only_after_formlogic_was_unreachable() {
+    let failed = Some(Utc::now() - chrono::Duration::seconds(10));
+    let beat_after = Some(Utc::now());
+    let beat_before = Some(Utc::now() - chrono::Duration::seconds(20));
+    // Unreachable, then heard from: sync now.
+    assert!(heartbeat_mends("offline", failed, beat_after));
+    // Told to wait (a 429): the heartbeat's own budget says nothing about the
+    // sync's, so the Retry-After stands.
+    assert!(!heartbeat_mends("busy", failed, beat_after));
+    // Refused outright (a revoked key, no form): a heartbeat does not mend that.
+    assert!(!heartbeat_mends("error", failed, beat_after));
+    // Not heard from since the failure, or nothing failed.
+    assert!(!heartbeat_mends("offline", failed, beat_before));
+    assert!(!heartbeat_mends("offline", None, beat_after));
+    assert!(!heartbeat_mends("offline", failed, None));
+}

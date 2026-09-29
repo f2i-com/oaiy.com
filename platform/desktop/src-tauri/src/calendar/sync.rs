@@ -420,7 +420,7 @@ pub fn spawn(link: LinkHandle) {
                     continue;
                 }
                 let now = Instant::now();
-                let heard = r.failed_at.is_some_and(|failed| link.status().last_heartbeat_at.is_some_and(|beat| beat > failed));
+                let heard = heartbeat_mends(r.report.state, r.failed_at, link.status().last_heartbeat_at);
                 let due = r.nudged_at.is_some_and(|n| now >= n + SETTLE) || heard || r.next_at.map_or(true, |t| now >= t);
                 (std::mem::take(&mut r.asked), due)
             };
@@ -492,6 +492,19 @@ fn run_once(cal: &Calendar, link: &LinkHandle) {
     r.report.next_attempt_at = r.next_at_wall.map(|t| t.to_rfc3339_opts(chrono::SecondsFormat::Secs, true));
     r.runs += 1;
     WAKE.notify_all();
+}
+
+/// Whether the link's heartbeat reaching FormLogic after the last failed sync
+/// means the sync should run now rather than when it was scheduled.
+///
+/// Only after it found FormLogic unreachable (`offline`): a heartbeat answered
+/// since says it is back. Not after it was told to wait (`busy`, a 429): the
+/// heartbeat has its own budget at FormLogic, so its answer says nothing about
+/// the one the sync ran out of, and trying before the Retry-After is over is
+/// refused again (seen live: 429s at +0 s, +5 s and +50 s of a 57 s wait, one
+/// after each heartbeat).
+fn heartbeat_mends(state: &str, failed_at: Option<DateTime<Utc>>, last_beat: Option<DateTime<Utc>>) -> bool {
+    state == "offline" && failed_at.is_some_and(|failed| last_beat.is_some_and(|beat| beat > failed))
 }
 
 /// How long to wait before the next try after `fail`. Busy is not a failure to
