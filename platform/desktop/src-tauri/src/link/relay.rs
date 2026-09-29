@@ -166,13 +166,17 @@ fn poll_once(
 
     let status = resp.status();
     if !status.is_success() {
-        // Asked to slow down: wait as long as the provider said before the lane's own back-off.
-        if status.as_u16() == 429 {
-            if let Some(wait) = super::net::retry_after(resp.headers()) {
-                std::thread::sleep(wait);
-            }
-        }
+        // What the provider said is read BEFORE its `Retry-After` is waited out. The
+        // timeout of this request runs to the last byte of the reply, and a wait
+        // longer than the poll is given (45 seconds against the 40 of a 25 second
+        // hold) would leave no time to read it in, and the panel would say "the relay
+        // refused the poll" in place of the provider's own words.
+        let asked = if status.as_u16() == 429 { super::net::retry_after(resp.headers()) } else { None };
         let body: Value = resp.json().unwrap_or(Value::Null);
+        // Asked to slow down: wait as long as the provider said before the lane's own back-off.
+        if let Some(wait) = asked {
+            std::thread::sleep(wait);
+        }
         let message = body
             .get("message")
             .or_else(|| body.get("error"))
@@ -803,6 +807,20 @@ mod tests {
         for gap in gaps {
             assert!(gap >= Duration::from_millis(1_800) && gap < Duration::from_millis(2_800), "{gap:?}");
         }
+    }
+
+    #[test]
+    fn a_refusal_for_asking_too_often_still_says_why_after_a_wait_longer_than_the_poll_may_take() {
+        // A poll of this spec (a hold of 1 second) is given 16 seconds, from the
+        // request to the last byte of its reply. The provider asks to be left for 17,
+        // and the lane waits that long: what the provider said has to be read before
+        // it does, or the deadline is past by the time it looks, and the panel shows
+        // "the relay refused the poll" in place of the provider's own words.
+        let server = Provider::start(|_| Reply::too_many(17, "API key rate limit exceeded. Try again in 17s."));
+        let started = std::time::Instant::now();
+        let error = poll_once(&account(server.base.clone()), &spec(), "oaiy-test", &working_dispatcher()).unwrap_err();
+        assert_eq!(error, "HTTP 429: API key rate limit exceeded. Try again in 17s.");
+        assert!(started.elapsed() >= Duration::from_secs(17), "{:?}", started.elapsed());
     }
 
     #[test]

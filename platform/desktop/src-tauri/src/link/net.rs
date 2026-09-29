@@ -97,6 +97,14 @@ pub fn idle_pause(polled_for: std::time::Duration, least: std::time::Duration) -
 // the code that makes it, never on a client, so a client that a lane keeps cannot
 // take one lane's credential to another lane or provider, and neither can a
 // connection it reuses (HTTP keeps no login on a connection).
+//
+// Timeouts come in two kinds, and they are not the same. One set on a request is a
+// single deadline for the whole exchange, from the request to the last byte of its
+// reply. One set on a blocking client bounds the wait for the reply and, on a
+// budget of its own that starts when the lane goes to read it, the reading. A lane
+// whose requests differ (a poll waits, a claim does not) has to set them on the
+// requests, and reads a reply as soon as it has it; a lane that waits between the
+// two, out a `Retry-After`, reads first, or keeps its timeout on its client.
 
 /// How long a connection may sit unused before this desktop closes it, rather
 /// than send the next request down it.
@@ -373,6 +381,29 @@ mod client_tests {
             .unwrap_err();
         assert!(e.is_timeout(), "{e}");
         assert!(started.elapsed() < Duration::from_millis(1200), "{:?}", started.elapsed());
+    }
+
+    #[test]
+    fn a_requests_timeout_runs_to_the_end_of_its_reply_and_a_clients_does_not() {
+        // Why a lane that waits between the headers of a reply and its body (out a
+        // `Retry-After`) reads first, or has its timeout on its client: the same
+        // wait, longer than the timeout, is fine to a client's and fatal to a request's.
+        let server = Provider::start(|_| Reply::ok(r#"{"message":"read late"}"#));
+
+        let on_the_client = blocking_builder().timeout(Duration::from_millis(300)).build().unwrap();
+        let reply = on_the_client.get(format!("{}/client", server.base)).send().unwrap();
+        std::thread::sleep(Duration::from_millis(600));
+        assert_eq!(reply.text().unwrap(), r#"{"message":"read late"}"#);
+
+        let on_the_request = blocking_builder().build().unwrap();
+        let reply = on_the_request
+            .get(format!("{}/request", server.base))
+            .timeout(Duration::from_millis(300))
+            .send()
+            .unwrap();
+        std::thread::sleep(Duration::from_millis(600));
+        let read = reply.text();
+        assert!(read.is_err(), "the deadline of the request was past: {read:?}");
     }
 
     #[test]

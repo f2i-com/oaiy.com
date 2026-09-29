@@ -403,14 +403,22 @@ static HTTP: super::net::LaneClient<reqwest::blocking::Client> =
 
 fn build_client() -> Result<reqwest::blocking::Client, String> {
     super::net::blocking_builder()
+        // On the client, where every request of this lane always had it, and not on
+        // each request: a client's timeout bounds the wait for a reply and then, on
+        // a budget of its own, the reading of it, while a request's runs to the last
+        // byte of the reply. This lane reads a refusal after waiting out its
+        // `Retry-After`, and the flow listing it fetches for a run can be long, and
+        // both need the budget of their own.
+        .timeout(REQUEST_TIMEOUT)
         .build()
         .map_err(|e| format!("could not build the flow runner client: {e}"))
 }
 
-/// How long one request to the provider may take.
+/// How long one request to the provider may take (the client's).
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
 
-/// How long telling the provider of a kept outcome may take.
+/// How long telling the provider of a kept outcome may take: set on those requests,
+/// which is one deadline for the whole exchange, and they are read at once.
 const RESEND_TIMEOUT: Duration = Duration::from_secs(15);
 
 /// One look at the queue, and at most one run.
@@ -433,7 +441,6 @@ fn poll_once(
     let http = HTTP.get()?;
     let resp = http
         .get(super::oauth::join(&account.base_url, lane.queued))
-        .timeout(REQUEST_TIMEOUT)
         .bearer_auth(&account.credential)
         .send()
         .map_err(|e| format!("could not reach the flow queue: {e}"))?;
@@ -512,7 +519,6 @@ fn serve(
     let claim_url = super::oauth::join(&account.base_url, &lane.claim.replace("{id}", &run.id));
     let claimed = match http
         .post(&claim_url)
-        .timeout(REQUEST_TIMEOUT)
         .bearer_auth(&account.credential)
         // `runtime` says which kind of runtime took it, `instanceId` says which
         // machine. The provider binds the completion to the same instance, so
@@ -976,7 +982,6 @@ fn fetch_graph(
     })?;
     let resp = http
         .get(super::oauth::join(&account.base_url, lane.graph))
-        .timeout(REQUEST_TIMEOUT)
         .bearer_auth(&account.credential)
         .send()
         .map_err(|e| {
@@ -1106,7 +1111,6 @@ fn report(
         };
         match http
             .patch(&url)
-            .timeout(REQUEST_TIMEOUT)
             .bearer_auth(&account.credential)
             .json(&body)
             .send()
@@ -2262,6 +2266,24 @@ mod tests {
         let followed = elsewhere.requests();
         assert_eq!(followed.len(), 1);
         assert_eq!(followed[0].header("authorization"), None, "the credential stayed with the provider");
+    }
+
+    #[test]
+    fn a_refusal_for_asking_too_often_still_says_why_after_a_wait_longer_than_a_request_may_take() {
+        // The provider asks to be left for 31 seconds, and the lane waits that long
+        // before it reads what the provider said, as it always has. A request is
+        // given 30 seconds; the reply is read on a budget of its own once the wait
+        // is over, which is the client's timeout doing what it did before this lane
+        // kept a client. (A timeout set on the request instead runs to the last byte
+        // of the reply, and had run out by the time the lane came to read it.)
+        let server = Provider::start(|_| Reply::too_many(31, "API key rate limit exceeded. Try again in 31s."));
+        let flows = spec();
+        let lane = Lane::of(&flows).unwrap();
+        let started = Instant::now();
+        let error = poll_once(&account(server.base.clone()), &flows, &lane, "oaiy-test", None, &Held::NotRequired)
+            .unwrap_err();
+        assert_eq!(error, "HTTP 429: API key rate limit exceeded. Try again in 31s.");
+        assert!(started.elapsed() >= Duration::from_secs(31), "{:?}", started.elapsed());
     }
 
     // --- looking at the queue again ----------------------------------------------------

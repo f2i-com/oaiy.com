@@ -388,6 +388,8 @@ static HTTP: super::net::LaneClient<reqwest::blocking::Client> =
 
 fn build_client() -> Result<reqwest::blocking::Client, String> {
     super::net::blocking_builder()
+        // On the client, as it always was: the only request this lane makes.
+        .timeout(BEAT_TIMEOUT)
         .build()
         .map_err(|e| format!("could not build the heartbeat client: {e}"))
 }
@@ -428,7 +430,6 @@ fn send(
 
     let resp = client
         .post(&url)
-        .timeout(BEAT_TIMEOUT)
         .bearer_auth(&account.credential)
         .json(&serde_json::Value::Object(body))
         .send()
