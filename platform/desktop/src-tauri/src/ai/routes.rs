@@ -294,21 +294,7 @@ async fn chat_impl(st: &AiState, provider_id: Option<&str>, mut body: Value) -> 
             o.remove("provider");
         }
         let codex = st.codex.clone();
-        // The generic route streams when asked, as an agent loop asks. A
-        // live-call alias answers as it always has: one buffered completion.
-        if codex_alias.is_none() && body.get("stream").and_then(Value::as_bool) == Some(true) {
-            let model = body
-                .get("model")
-                .and_then(Value::as_str)
-                .unwrap_or(super::codex::CODEX_PROVIDER_ID)
-                .to_string();
-            return codex_stream(model, move |emit| codex.chat_streaming(&body, None, emit)).await;
-        }
-        return match tokio::task::spawn_blocking(move || codex.chat_as(&body, codex_alias)).await {
-            Ok(Ok(v)) => (StatusCode::OK, Json(v)).into_response(),
-            Ok(Err(e)) => codex_err(e),
-            Err(e) => ai_error(StatusCode::INTERNAL_SERVER_ERROR, "internal", e.to_string()),
-        };
+        return codex_answer(body, codex_alias, move |body, alias, emit| codex.chat_streaming(body, alias, emit)).await;
     }
     // Resolve the FULL provider under the lock, drop the guard before await.
     let provider = if provider_id == Some(ENGINE_PROVIDER_ID) {
@@ -408,6 +394,41 @@ async fn models_for(State(st): State<AiState>, Path(id): Path<String>) -> Respon
     match gateway::models(&p).await {
         Ok(v) => (StatusCode::OK, Json(v)).into_response(),
         Err(e) => gateway_err(e),
+    }
+}
+
+/// Whether a ChatGPT request is answered as a stream.
+///
+/// The generic route streams when asked, as an agent loop asks. A live-call
+/// alias streams only when the request also brings tools — an agent loop
+/// taking a call. Aokie never sends tools to the aliases, and gets the one
+/// buffered completion it has always had, even when it asks for a stream.
+fn codex_streams(body: &Value, alias: Option<super::codex::LiveCallAlias>) -> bool {
+    body.get("stream").and_then(Value::as_bool) == Some(true)
+        && (alias.is_none() || super::codex::brings_tools(body))
+}
+
+/// A ChatGPT request answered: streamed or buffered (see [`codex_streams`]),
+/// with `turn` running the whole completion — the Codex child in production,
+/// a fake in the tests.
+async fn codex_answer<F>(body: Value, alias: Option<super::codex::LiveCallAlias>, turn: F) -> Response
+where
+    F: FnOnce(&Value, Option<super::codex::LiveCallAlias>, &mut dyn FnMut(&str)) -> Result<Value, super::codex::CodexError>
+        + Send
+        + 'static,
+{
+    if codex_streams(&body, alias) {
+        // What the chunks name: the model the turn runs on.
+        let model = match alias {
+            Some(a) => a.model().to_string(),
+            None => body.get("model").and_then(Value::as_str).unwrap_or(super::codex::CODEX_PROVIDER_ID).to_string(),
+        };
+        return codex_stream(model, move |emit| turn(&body, alias, emit)).await;
+    }
+    match tokio::task::spawn_blocking(move || turn(&body, alias, &mut |_| {})).await {
+        Ok(Ok(v)) => (StatusCode::OK, Json(v)).into_response(),
+        Ok(Err(e)) => codex_err(e),
+        Err(e) => ai_error(StatusCode::INTERNAL_SERVER_ERROR, "internal", e.to_string()),
     }
 }
 
@@ -796,15 +817,98 @@ mod tests {
     /// A turn as the route runs it, with a fake codex answering `reply` in
     /// small fragments: the real completion code around a fake child.
     fn fake_turn(body: Value, reply: &'static str) -> impl FnOnce(&mut dyn FnMut(&str)) -> Result<Value, CodexError> + Send + 'static {
-        move |emit| {
-            crate::ai::codex::complete_with(&body, None, emit, |_prompt, _model, fragment| {
-                let chars: Vec<char> = reply.chars().collect();
-                for piece in chars.chunks(4) {
-                    fragment(&piece.iter().collect::<String>());
-                }
-                Ok(reply.to_string())
-            })
+        move |emit| fake_codex(&body, None, emit, reply, &Default::default())
+    }
+
+    /// The fake codex itself: the real completion code around a child that
+    /// answers `reply` in small fragments, recording the turn it was sent.
+    fn fake_codex(
+        body: &Value,
+        alias: Option<LiveCallAlias>,
+        emit: &mut dyn FnMut(&str),
+        reply: &str,
+        sent: &std::sync::Mutex<Vec<(Value, Value)>>,
+    ) -> Result<Value, CodexError> {
+        crate::ai::codex::complete_with(body, alias, emit, |request, fragment| {
+            sent.lock().unwrap().push((request.thread.clone(), request.turn.clone()));
+            let chars: Vec<char> = reply.chars().collect();
+            for piece in chars.chunks(4) {
+                fragment(&piece.iter().collect::<String>());
+            }
+            Ok(reply.to_string())
+        })
+    }
+
+    use crate::ai::codex::LiveCallAlias;
+
+    /// The route's answer to `body` on `alias`, from a fake codex, and the
+    /// turns the fake was sent.
+    async fn route_answer(body: Value, alias: Option<LiveCallAlias>, reply: &'static str) -> (Response, Vec<(Value, Value)>) {
+        let sent = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let seen = sent.clone();
+        let resp = codex_answer(body, alias, move |b, a, emit| fake_codex(b, a, emit, reply, &seen)).await;
+        let turns = sent.lock().unwrap().clone();
+        (resp, turns)
+    }
+
+    #[tokio::test]
+    async fn a_live_call_alias_sent_tools_streams_its_tool_call_on_its_pinned_model_and_effort() {
+        let call = "```tool_call\n{\"tool\":\"get_weather\",\"input\":{\"city\":\"Perth\"}}\n```";
+        for alias in LiveCallAlias::all() {
+            let mut body = with_tools();
+            body["model"] = json!("a-reasoning-model");
+            let (resp, turns) = route_answer(body, Some(alias), call).await;
+            let (events, done) = events_of(resp).await;
+            assert!(done, "{alias:?}");
+            assert!(events.iter().all(|e| e["model"] == alias.model()), "{alias:?}: {events:?}");
+            assert_eq!(streamed_text(&events), "", "{alias:?}: the call is not shown");
+            let calls: Vec<&Value> = events.iter().filter_map(|e| e.pointer("/choices/0/delta/tool_calls")).collect();
+            assert_eq!(calls.len(), 1, "{alias:?}");
+            assert_eq!(calls[0][0]["function"]["name"], "get_weather");
+            assert_eq!(events.last().unwrap()["choices"][0]["finish_reason"], "tool_calls");
+            // The turn the child was sent: the alias's model and effort, not the request's.
+            let (thread, turn) = &turns[0];
+            assert_eq!(thread["model"], alias.model(), "{alias:?}");
+            assert_eq!(turn["model"], alias.model(), "{alias:?}");
+            assert_eq!(turn["effort"], alias.reasoning_effort(), "{alias:?}");
+            assert_eq!(turn.get("serviceTier").and_then(Value::as_str), alias.service_tier(), "{alias:?}");
+            assert!(turn["input"][0]["text"].as_str().unwrap().contains("Available tools:"), "{alias:?}");
         }
+    }
+
+    #[tokio::test]
+    async fn a_live_call_alias_sent_no_tools_answers_buffered_json_even_when_asked_to_stream() {
+        // Aokie's agent path asks these routes for `stream: true` without
+        // tools, and relies on one JSON completion coming back.
+        let body = json!({
+            "model": "ignored",
+            "stream": true,
+            "messages": [
+                { "role": "system", "content": "Be brief." },
+                { "role": "user", "content": [{ "type": "text", "text": "Hi there" }] },
+            ],
+        });
+        let before = "[instructions]\nBe brief.\n\nHi there";
+        for alias in LiveCallAlias::all() {
+            for body in [body.clone(), { let mut b = body.clone(); b["tools"] = json!([]); b }] {
+                assert!(!codex_streams(&body, Some(alias)));
+                let (resp, turns) = route_answer(body, Some(alias), "Hello!").await;
+                assert_eq!(resp.status(), StatusCode::OK);
+                assert_eq!(resp.headers()[axum::http::header::CONTENT_TYPE], "application/json", "{alias:?}");
+                let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+                let v: Value = serde_json::from_slice(&bytes).unwrap();
+                assert_eq!(v["object"], "chat.completion");
+                assert_eq!(v["model"], alias.model());
+                assert_eq!(v["choices"], json!([{ "index": 0, "message": { "role": "assistant", "content": "Hello!" }, "finish_reason": "stop" }]));
+                let (thread, turn) = &turns[0];
+                assert_eq!(turn["input"][0]["text"], before, "{alias:?}: the prompt it always sent");
+                assert_eq!((thread["model"].as_str(), turn["effort"].as_str()), (Some(alias.model()), Some(alias.reasoning_effort())));
+            }
+        }
+        // The generic route streams when asked, tools or not.
+        assert!(codex_streams(&body, None));
+        assert!(!codex_streams(&json!({ "stream": false, "tools": [{}] }), None));
+        assert!(!codex_streams(&json!({ "tools": [{}] }), Some(LiveCallAlias::ReasoningNone)), "tools alone do not ask for a stream");
     }
 
     fn with_tools() -> Value {

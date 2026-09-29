@@ -54,7 +54,10 @@ Where its README and its code disagree, the code is recorded.
   written into the prompt, and a reply that is exactly one fenced `tool_call` block naming an
   offered tool comes back as an OpenAI `tool_calls` message (`finish_reason: "tool_calls"`).
   With `stream: true` it answers in `chat.completion.chunk` events, holding text back only
-  while it could still be a tool call. The aliases answer as before: buffered, no tools.
+  while it could still be a tool call (a silent turn is kept open with `: keep-alive` lines).
+  A live-call alias does the same only when the request brings a non-empty `tools` array,
+  keeping its pinned model and effort; without tools (Aokie never sends any) it answers as
+  before: the same prompt, one buffered JSON completion even when `stream: true` is asked.
 
 ## The FormLogic bridge
 

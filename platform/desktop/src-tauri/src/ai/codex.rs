@@ -494,9 +494,10 @@ impl CodexAgent {
     /// The buffered completion is still returned, so a caller that ignores the
     /// callback behaves exactly as before.
     ///
-    /// On the generic route a request's `tools` are honoured by prompted tool
-    /// use (see [`complete_with`]); while the reply could still be a tool call
-    /// its fragments are held back, so a streaming caller never shows the
+    /// A request's `tools` are honoured by prompted tool use (see
+    /// [`complete_with`]) on the generic route, and on a live-call alias when
+    /// the request brings them; while the reply could still be a tool call its
+    /// fragments are held back, so a streaming caller never shows the
     /// machinery. The buffered completion is the authority either way.
     pub fn chat_streaming(
         &self,
@@ -504,54 +505,21 @@ impl CodexAgent {
         alias: Option<LiveCallAlias>,
         on_delta: impl FnMut(&str),
     ) -> Result<Value, CodexError> {
-        complete_with(body, alias, on_delta, |prompt, model, emit| {
-            self.run_turn(prompt, model, alias, emit)
-        })
+        complete_with(body, alias, on_delta, |request, emit| self.run_turn(request, emit))
     }
 
-    /// One turn on the child: the prompt in, the agent's whole message out,
-    /// each fragment handed to `on_delta` as it arrives.
-    fn run_turn(
-        &self,
-        prompt: &str,
-        model: Option<&str>,
-        alias: Option<LiveCallAlias>,
-        on_delta: &mut dyn FnMut(&str),
-    ) -> Result<String, CodexError> {
+    /// One turn on the child: `thread/start` and `turn/start` as `request`
+    /// says, the agent's whole message out, each fragment handed to
+    /// `on_delta` as it arrives.
+    fn run_turn(&self, request: &TurnRequest, on_delta: &mut dyn FnMut(&str)) -> Result<String, CodexError> {
         self.with_session(|s| {
-            // Refuse everything a turn could otherwise reach.
-            let mut params = json!({
-                "approvalPolicy": "never",
-                "dynamicTools": [],
-                "environments": [],
-                "runtimeWorkspaceRoots": [],
-                "allowProviderModelFallback": false,
-            });
-            if let Some(m) = model {
-                params["model"] = Value::String(m.to_string());
-            }
-            let thread = s.call("thread/start", params, RPC_TIMEOUT)?;
+            let thread = s.call("thread/start", request.thread.clone(), RPC_TIMEOUT)?;
             let thread_id = thread_id_of(&thread)
                 .ok_or_else(|| CodexError::Rpc("codex did not return a thread id".into()))?;
 
             let from = s.notes_len();
-            // `input` is a SEQUENCE of typed items, not one map. A map is
-            // refused with "invalid type: map, expected a sequence" — a runtime
-            // message with nothing in it naming this line.
-            let mut turn = json!({
-                "threadId": thread_id,
-                "input": [{ "type": "text", "text": prompt }],
-            });
-            if let Some(a) = alias {
-                // Named on the TURN as well as the thread: the effort is a
-                // per-turn setting, and a thread-level model alone would leave
-                // it at the account default.
-                turn["model"] = Value::String(a.model().to_string());
-                turn["effort"] = Value::String(a.reasoning_effort().to_string());
-                if let Some(tier) = a.service_tier() {
-                    turn["serviceTier"] = Value::String(tier.to_string());
-                }
-            }
+            let mut turn = request.turn.clone();
+            turn["threadId"] = Value::String(thread_id);
             s.call("turn/start", turn, TURN_TIMEOUT)?;
 
             // Collect the agent's message from the notification stream.
@@ -594,17 +562,58 @@ const TOOLS_INTRO: &str = "You can use these tools in this conversation.";
 struct TurnPlan {
     prompt: String,
     model: Option<String>,
-    /// The tools the prompt offers: empty on a plain turn, and always on a
-    /// live-call alias.
+    /// The live-call alias the turn is pinned to, if any.
+    alias: Option<LiveCallAlias>,
+    /// The tools the prompt offers: empty on a plain turn, and on a live-call
+    /// alias whose request brings none.
     tools: Vec<chat_tools::Tool>,
 }
 
+/// What one turn sends the child: `thread/start`'s params, and `turn/start`'s
+/// (the thread id is added once the thread exists).
+pub(super) struct TurnRequest {
+    pub(super) thread: Value,
+    pub(super) turn: Value,
+}
+
+impl TurnRequest {
+    fn for_plan(plan: &TurnPlan) -> Self {
+        // Refuse everything a turn could otherwise reach.
+        let mut thread = json!({
+            "approvalPolicy": "never",
+            "dynamicTools": [],
+            "environments": [],
+            "runtimeWorkspaceRoots": [],
+            "allowProviderModelFallback": false,
+        });
+        if let Some(m) = &plan.model {
+            thread["model"] = Value::String(m.clone());
+        }
+        // `input` is a SEQUENCE of typed items, not one map. A map is
+        // refused with "invalid type: map, expected a sequence" — a runtime
+        // message with nothing in it naming this line.
+        let mut turn = json!({ "input": [{ "type": "text", "text": plan.prompt }] });
+        if let Some(a) = plan.alias {
+            // Named on the TURN as well as the thread: the effort is a
+            // per-turn setting, and a thread-level model alone would leave
+            // it at the account default.
+            turn["model"] = Value::String(a.model().to_string());
+            turn["effort"] = Value::String(a.reasoning_effort().to_string());
+            if let Some(tier) = a.service_tier() {
+                turn["serviceTier"] = Value::String(tier.to_string());
+            }
+        }
+        Self { thread, turn }
+    }
+}
+
 /// A whole chat completion, with the turn itself handed in: `run` takes the
-/// prompt and the model and returns the agent's message, passing fragments to
-/// the callback as they arrive. In production that is the child; in the tests
-/// it is a fake codex. Everything around the turn is here — what the prompt
-/// says, which tools it offers, and whether the reply is an answer or a tool
-/// call — so the tests exercise exactly what ships.
+/// turn's request (thread and turn params, the prompt among them) and returns
+/// the agent's message, passing fragments to the callback as they arrive. In
+/// production that is the child; in the tests it is a fake codex. Everything
+/// around the turn is here — what the prompt says, which tools it offers, the
+/// model and effort it pins, and whether the reply is an answer or a tool call
+/// — so the tests exercise exactly what ships.
 ///
 /// Tools are honoured by PROMPTED tool use, as the tunnel does for FormLogic's
 /// chat: a Codex turn has no place to put a schema, so the catalogue is taught
@@ -614,31 +623,45 @@ pub(super) fn complete_with(
     body: &Value,
     alias: Option<LiveCallAlias>,
     mut on_delta: impl FnMut(&str),
-    run: impl FnOnce(&str, Option<&str>, &mut dyn FnMut(&str)) -> Result<String, CodexError>,
+    run: impl FnOnce(&TurnRequest, &mut dyn FnMut(&str)) -> Result<String, CodexError>,
 ) -> Result<Value, CodexError> {
     let plan = plan_turn(body, alias)?;
     let mut held = HeldDeltas::new(!plan.tools.is_empty());
-    let text = run(&plan.prompt, plan.model.as_deref(), &mut |d: &str| held.pass(d, &mut on_delta))?;
+    let text = run(&TurnRequest::for_plan(&plan), &mut |d: &str| held.pass(d, &mut on_delta))?;
     Ok(finish_turn(&plan, text))
+}
+
+/// Whether a request brings tools: a non-empty `tools` array.
+///
+/// What decides how a live-call alias answers. Aokie, which the aliases exist
+/// for, never sends tools, and gets exactly what it always got; an agent loop
+/// taking a call sends them, and gets prompted tools and a stream.
+pub(super) fn brings_tools(body: &Value) -> bool {
+    body.get("tools").and_then(Value::as_array).is_some_and(|t| !t.is_empty())
 }
 
 /// The prompt, model and tools for one request.
 ///
-/// A live-call alias keeps exactly the prompt it always had, and no tools: its
-/// callers depend on what it does now. The generic route adds the tool traffic
-/// of an agent loop, and mirrors the tunnel's switch — tools offered, the
-/// preamble goes first; no tools but results already in the conversation, the
-/// instruction to answer from them; neither, the plain prompt unchanged.
+/// A live-call alias whose request brings no tools keeps exactly the prompt it
+/// always had: its callers depend on what it does now. Everything else — the
+/// generic route, and an alias an agent loop sends tools to — adds the tool
+/// traffic of an agent loop, and mirrors the tunnel's switch: tools offered,
+/// the preamble goes first; no tools but results already in the conversation,
+/// the instruction to answer from them; neither, the plain prompt unchanged.
+/// An alias pins its model (and its effort, on the turn) either way.
 fn plan_turn(body: &Value, alias: Option<LiveCallAlias>) -> Result<TurnPlan, CodexError> {
     let empty = || CodexError::Rpc("the request carried no message content".into());
-    if let Some(a) = alias {
+    if let Some(a) = alias.filter(|_| !brings_tools(body)) {
         let prompt = flatten_prompt(body);
         if prompt.trim().is_empty() {
             return Err(empty());
         }
-        return Ok(TurnPlan { prompt, model: Some(a.model().to_string()), tools: Vec::new() });
+        return Ok(TurnPlan { prompt, model: Some(a.model().to_string()), alias: Some(a), tools: Vec::new() });
     }
-    let model = body.get("model").and_then(Value::as_str).map(str::to_string);
+    let model = match alias {
+        Some(a) => Some(a.model().to_string()),
+        None => body.get("model").and_then(Value::as_str).map(str::to_string),
+    };
     let conversation = render_messages(body);
     if conversation.trim().is_empty() {
         return Err(empty());
@@ -651,7 +674,7 @@ fn plan_turn(body: &Value, alias: Option<LiveCallAlias>) -> Result<TurnPlan, Cod
     } else {
         conversation
     };
-    Ok(TurnPlan { prompt, model, tools })
+    Ok(TurnPlan { prompt, model, alias, tools })
 }
 
 /// The request's OpenAI `tools`, as the catalogue the preamble teaches.
@@ -875,8 +898,9 @@ fn thread_id_of(result: &Value) -> Option<String> {
 /// Collapse an OpenAI `messages` array into the single prompt a turn takes,
 /// keeping role labels so a system instruction still reads as one.
 ///
-/// The live-call aliases' prompt, unchanged. The generic route renders with
-/// [`render_messages`], which is this plus the tool traffic of an agent loop.
+/// A live-call alias's prompt when its request brings no tools, unchanged.
+/// Every other turn renders with [`render_messages`], which is this plus the
+/// tool traffic of an agent loop.
 fn flatten_prompt(body: &Value) -> String {
     let Some(messages) = body.get("messages").and_then(Value::as_array) else {
         return String::new();
@@ -1077,14 +1101,17 @@ mod tests {
         // Codex refuses a bare map with "invalid type: map, expected a
         // sequence" — a runtime message that names nothing in this file. The
         // shape is pinned here so a rewrite cannot quietly go back to a map.
-        let turn = json!({
-            "threadId": "t1",
-            "input": [{ "type": "text", "text": "hello" }],
-        });
-        let input = turn["input"].as_array().expect("input must be a sequence");
+        let plan = plan_turn(&json!({ "messages": [{ "role": "user", "content": "hello" }] }), None).unwrap();
+        let request = TurnRequest::for_plan(&plan);
+        let input = request.turn["input"].as_array().expect("input must be a sequence");
         assert_eq!(input.len(), 1);
         assert_eq!(input[0]["type"], "text");
         assert_eq!(input[0]["text"], "hello");
+        // The generic route leaves the model and effort to the thread and the account.
+        assert!(request.turn.get("effort").is_none() && request.turn.get("model").is_none());
+        assert_eq!(request.thread["approvalPolicy"], "never");
+        assert_eq!(request.thread["dynamicTools"], json!([]));
+        assert_eq!(request.thread["runtimeWorkspaceRoots"], json!([]));
     }
 
     #[test]
@@ -1200,12 +1227,14 @@ mod tests {
         ])
     }
 
-    /// What one turn against a fake codex produced: the completion, the
-    /// prompt the fake was handed, and what a streaming caller was shown.
+    /// What one turn against a fake codex produced: the completion, what the
+    /// fake was sent (the prompt, the thread's model, the turn's params), and
+    /// what a streaming caller was shown.
     struct Faked {
         completion: Value,
         prompt: String,
         model: Option<String>,
+        turn: Value,
         streamed: String,
     }
 
@@ -1215,10 +1244,12 @@ mod tests {
     fn fake_codex(body: &Value, alias: Option<LiveCallAlias>, reply: &str) -> Faked {
         let mut prompt = String::new();
         let mut model = None;
+        let mut turn = Value::Null;
         let mut streamed = String::new();
-        let completion = complete_with(body, alias, |d| streamed.push_str(d), |p, m, emit| {
-            prompt = p.to_string();
-            model = m.map(str::to_string);
+        let completion = complete_with(body, alias, |d| streamed.push_str(d), |request, emit| {
+            prompt = request.turn.pointer("/input/0/text").and_then(Value::as_str).unwrap_or_default().to_string();
+            model = request.thread.get("model").and_then(Value::as_str).map(str::to_string);
+            turn = request.turn.clone();
             let chars: Vec<char> = reply.chars().collect();
             let mut notes: Vec<Value> = chars
                 .chunks(5)
@@ -1236,7 +1267,7 @@ mod tests {
             Ok(out)
         })
         .expect("the fake turn answers");
-        Faked { completion, prompt, model, streamed }
+        Faked { completion, prompt, model, turn, streamed }
     }
 
     fn ask(tools: Value) -> Value {
@@ -1433,23 +1464,78 @@ mod tests {
         assert!(plan_turn(&json!({ "messages": [], "tools": weather_tools() }), None).is_err(), "tools alone are no conversation");
     }
 
+    /// The turn params an alias pins, whatever the request says.
+    fn assert_pinned(f: &Faked, alias: LiveCallAlias) {
+        assert_eq!(f.model.as_deref(), Some(alias.model()), "{alias:?}: the thread's model");
+        assert_eq!(f.turn["model"], alias.model(), "{alias:?}: the turn's model");
+        assert_eq!(f.turn["effort"], alias.reasoning_effort(), "{alias:?}: the turn's effort");
+        assert_eq!(f.turn.get("serviceTier").and_then(Value::as_str), alias.service_tier(), "{alias:?}");
+        assert_eq!(f.completion["model"], alias.model(), "{alias:?}");
+    }
+
     #[test]
-    fn a_live_call_alias_is_untouched_by_tools() {
-        // The aliases keep the prompt, the model and the plain answer they
-        // always had: a phone call's callers depend on exactly that.
+    fn a_live_call_alias_without_tools_answers_exactly_as_before() {
+        // Aokie, which the aliases exist for, never sends tools: it gets the
+        // prompt, the pinned model and effort and the plain answer it always
+        // had, whatever else the request carries.
+        let conversation = json!([
+            { "role": "system", "content": "You are the front desk." },
+            { "role": "user", "content": "What is the weather in Perth?" },
+            { "role": "assistant", "content": null, "tool_calls": [{ "id": "x", "type": "function", "function": { "name": "get_weather", "arguments": "{}" } }] },
+            { "role": "tool", "tool_call_id": "x", "content": "sunny" },
+        ]);
+        // The prompt the aliases have always sent for it, byte for byte.
+        let before = "[instructions]\nYou are the front desk.\n\nWhat is the weather in Perth?\n\nsunny";
+        for body in [
+            json!({ "model": "anything", "stream": true, "messages": conversation }),
+            json!({ "stream": false, "messages": conversation, "tools": [] }),
+            json!({ "messages": conversation, "tools": null }),
+        ] {
+            assert!(!brings_tools(&body), "{body}");
+            for alias in LiveCallAlias::all() {
+                let plan = plan_turn(&body, Some(alias)).unwrap();
+                assert_eq!(plan.prompt, before, "{alias:?}");
+                assert_eq!(plan.prompt, flatten_prompt(&body));
+                assert!(plan.tools.is_empty(), "{alias:?}");
+                let reply = "```tool_call\n{\"tool\":\"end_call\",\"input\":{}}\n```";
+                let f = fake_codex(&body, Some(alias), reply);
+                assert_eq!(f.prompt, before, "{alias:?}: the prompt sent is the one it always was");
+                assert_pinned(&f, alias);
+                assert_eq!(f.completion["choices"][0], json!({ "index": 0, "message": { "role": "assistant", "content": reply }, "finish_reason": "stop" }));
+                assert_eq!(f.streamed, reply, "nothing held back");
+            }
+        }
+    }
+
+    #[test]
+    fn a_live_call_alias_with_tools_uses_them_and_keeps_its_model_and_effort() {
+        // An agent loop taking a phone call sends tools: prompted tool use as
+        // on the generic route, with the alias's model and effort still pinned
+        // over whatever model the request names.
         let mut body = ask(weather_tools());
-        body["messages"].as_array_mut().unwrap().push(json!({ "role": "tool", "tool_call_id": "x", "content": "sunny" }));
+        body["model"] = json!("a-reasoning-model");
+        assert!(brings_tools(&body));
+        let call = "```tool_call\n{\"tool\":\"get_weather\",\"input\":{\"city\":\"Perth\"}}\n```";
         for alias in LiveCallAlias::all() {
-            let plan = plan_turn(&body, Some(alias)).unwrap();
-            assert_eq!(plan.prompt, flatten_prompt(&body), "{alias:?}");
-            assert!(plan.tools.is_empty(), "{alias:?}");
-            assert_eq!(plan.model.as_deref(), Some(alias.model()));
-            let reply = "```tool_call\n{\"tool\":\"end_call\",\"input\":{}}\n```";
-            let f = fake_codex(&body, Some(alias), reply);
-            assert_eq!(f.completion["choices"][0]["finish_reason"], "stop", "{alias:?}");
-            assert_eq!(f.completion["choices"][0]["message"]["content"], reply);
-            assert_eq!(f.completion["model"], alias.model());
-            assert_eq!(f.streamed, reply, "nothing held back on an alias");
+            let f = fake_codex(&body, Some(alias), call);
+            assert_pinned(&f, alias);
+            assert!(f.prompt.starts_with(TOOLS_INTRO), "{alias:?}: {}", f.prompt);
+            let choice = &f.completion["choices"][0];
+            assert_eq!(choice["finish_reason"], "tool_calls", "{alias:?}");
+            assert_eq!(choice["message"]["tool_calls"][0]["function"]["name"], "get_weather");
+            assert_eq!(choice["message"]["tool_calls"][0]["function"]["arguments"], "{\"city\":\"Perth\"}");
+            assert_eq!(f.streamed, "", "{alias:?}: the call is not shown");
+
+            // …and with the result back, the answer streams as it is written.
+            let mut next = body.clone();
+            let messages = next["messages"].as_array_mut().unwrap();
+            messages.push(json!({ "role": "assistant", "content": null, "tool_calls": choice["message"]["tool_calls"].clone() }));
+            messages.push(json!({ "role": "tool", "tool_call_id": choice["message"]["tool_calls"][0]["id"].clone(), "content": "sunny" }));
+            let f = fake_codex(&next, Some(alias), "Sunny in Perth.");
+            assert_pinned(&f, alias);
+            assert!(f.prompt.ends_with("tool_result get_weather: sunny"), "{}", f.prompt);
+            assert_eq!(f.completion["choices"][0]["finish_reason"], "stop");
+            assert_eq!(f.streamed, "Sunny in Perth.");
         }
     }
 
