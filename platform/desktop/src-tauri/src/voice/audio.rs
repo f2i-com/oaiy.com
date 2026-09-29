@@ -105,6 +105,10 @@ pub enum Heard {
     Started { at_ms: u64 },
     /// They have spoken long enough to mean it (`BARGE_IN_VOICED_MS` of voice): once an utterance.
     Sustained,
+    /// Begun over our voice, they have paused (`SETTLE_MS`): what they have said so
+    /// far, which may be all of it (an "okay, sure" is over by now). Once a pause;
+    /// the utterance goes on, and ends as ever unless they speak again.
+    Paused { audio: Vec<i16>, start_ms: u64, end_ms: u64 },
     /// They finished: the whole utterance, with a little from before it began,
     /// and when they spoke (their first voiced frame to the end of their last).
     Utterance { audio: Vec<i16>, start_ms: u64, end_ms: u64 },
@@ -112,7 +116,9 @@ pub enum Heard {
 
 /// Finds the caller's utterances in phone audio, frame by frame: an energy
 /// threshold over a noise floor that follows the line. Speech starts after
-/// enough voiced frames close together, and ends after a pause.
+/// enough voiced frames close together, and ends after a pause: a shorter one
+/// for an utterance begun over our voice (the caller is mid-conversation, and
+/// answering them sooner matters most then).
 pub struct Detector {
     rate: u32,
     frame: usize,
@@ -133,6 +139,8 @@ pub struct Detector {
     last_voiced: u64,
     /// `Sustained` was said for this utterance.
     sustained: bool,
+    /// This utterance began over our voice.
+    over_us: bool,
     /// While our own voice plays, the threshold rises (what echo is left after Aokie's canceller).
     pub speaking_out: bool,
 }
@@ -144,6 +152,14 @@ const START_VOICED: usize = 5;
 const START_WINDOW: usize = 7;
 /// A pause this long ends the utterance (a breath between two sentences does not).
 const END_QUIET_MS: u32 = 800;
+/// ...or this long, for one begun over our voice: the caller is mid-conversation,
+/// and has either said "mm-hmm, go on" or wants an answer. (OpenAI's realtime
+/// voice waits the same by default.)
+const OVER_END_QUIET_MS: u32 = 500;
+/// Begun over our voice, a pause this long is when what they said so far is heard
+/// (`Heard::Paused`): an acknowledgement is over by then, and the reply they spoke
+/// over can go on without waiting for the utterance to end.
+pub const SETTLE_MS: u32 = 300;
 /// Kept from before the start (a soft first sound, like "that's", is quieter than the threshold).
 const PREROLL_MS: u32 = 500;
 /// An utterance with less voiced audio than this is a noise, not words.
@@ -173,6 +189,7 @@ impl Detector {
             first_voiced: 0,
             last_voiced: 0,
             sustained: false,
+            over_us: false,
             speaking_out: false,
         }
     }
@@ -180,6 +197,25 @@ impl Detector {
     /// Whether the caller is in an utterance: it has started, and not yet ended.
     pub fn in_speech(&self) -> bool {
         self.speaking
+    }
+
+    /// Where the voice of the utterance heard now (or last) ends, in ms of the stream.
+    pub fn voice_end_ms(&self) -> u64 {
+        Self::frame_ms(self.last_voiced + 1)
+    }
+
+    /// End the utterance now, as though its pause had gone on: its words are in
+    /// already, and what the caller says next is a new utterance (with its own
+    /// start, and its own chance to be sustained). The utterance, if it had words.
+    pub fn end_now(&mut self) -> Option<Heard> {
+        if !self.speaking {
+            return None;
+        }
+        self.speaking = false;
+        self.quiet = 0;
+        let audio = std::mem::take(&mut self.utterance);
+        let voiced = std::mem::replace(&mut self.voiced, 0);
+        (voiced >= self.ms_frames(MIN_VOICED_MS)).then(|| Heard::Utterance { audio, start_ms: Self::frame_ms(self.first_voiced), end_ms: self.voice_end_ms() })
     }
 
     fn ms_frames(&self, ms: u32) -> usize {
@@ -232,6 +268,7 @@ impl Detector {
                 self.last_voiced = self.recent.iter().rposition(|&v| v).map_or(at, frame_of);
                 self.speaking = true;
                 self.sustained = false;
+                self.over_us = self.speaking_out;
                 self.utterance = self.preroll.drain(..).collect();
                 self.voiced = START_VOICED;
                 self.quiet = 0;
@@ -249,15 +286,12 @@ impl Detector {
             self.quiet += 1;
         }
         let too_long = self.utterance.len() >= (self.rate * MAX_UTTERANCE_MS / 1000) as usize;
-        if self.quiet >= self.ms_frames(END_QUIET_MS) || too_long {
-            self.speaking = false;
-            self.quiet = 0;
-            let audio = std::mem::take(&mut self.utterance);
-            let voiced = std::mem::replace(&mut self.voiced, 0);
-            if voiced >= self.ms_frames(MIN_VOICED_MS) {
-                return Heard::Utterance { audio, start_ms: Self::frame_ms(self.first_voiced), end_ms: Self::frame_ms(self.last_voiced + 1) };
-            }
-            return Heard::Nothing;
+        let end_quiet = if self.over_us { OVER_END_QUIET_MS } else { END_QUIET_MS };
+        if self.quiet >= self.ms_frames(end_quiet) || too_long {
+            return self.end_now().unwrap_or(Heard::Nothing);
+        }
+        if self.over_us && self.quiet == self.ms_frames(SETTLE_MS) && self.voiced >= self.ms_frames(MIN_VOICED_MS) {
+            return Heard::Paused { audio: self.utterance.clone(), start_ms: Self::frame_ms(self.first_voiced), end_ms: self.voice_end_ms() };
         }
         if !self.sustained && self.voiced >= self.ms_frames(BARGE_IN_VOICED_MS) {
             self.sustained = true;
@@ -284,7 +318,81 @@ mod tests {
     }
 
     fn names<'a>(heard: impl IntoIterator<Item = &'a Heard>) -> Vec<String> {
-        heard.into_iter().map(|h| match h { Heard::Started { at_ms } => format!("start at {at_ms}"), Heard::Sustained => "sustained".into(), Heard::Utterance { audio, start_ms, end_ms } => format!("{} samples, {start_ms} to {end_ms}", audio.len()), Heard::Nothing => "-".into() }).collect()
+        heard
+            .into_iter()
+            .map(|h| match h {
+                Heard::Started { at_ms } => format!("start at {at_ms}"),
+                Heard::Sustained => "sustained".into(),
+                Heard::Paused { start_ms, end_ms, .. } => format!("paused, {start_ms} to {end_ms}"),
+                Heard::Utterance { audio, start_ms, end_ms } => format!("{} samples, {start_ms} to {end_ms}", audio.len()),
+                Heard::Nothing => "-".into(),
+            })
+            .collect()
+    }
+
+    /// Audio fed a frame at a time, and what was heard when (ms of audio fed, the frame's end).
+    fn fed(d: &mut Detector, parts: &[(u32, f32)]) -> Vec<(u64, String)> {
+        let rate = 24_000;
+        let mut heard = Vec::new();
+        let mut at = 0u64;
+        for &(ms, amp) in parts {
+            for frame in tone(ms, rate, amp).chunks((rate / 50) as usize) {
+                at += 20;
+                heard.extend(names(&d.push(frame)).into_iter().map(|h| (at, h)));
+            }
+        }
+        heard
+    }
+
+    #[test]
+    fn begun_over_our_voice_a_pause_is_heard_at_300_ms_and_ends_it_at_500() {
+        let mut d = Detector::new(24_000);
+        d.speaking_out = true;
+        let heard = fed(&mut d, &[(1000, 40.0), (700, 6000.0), (1000, 40.0)]);
+        // Voice from 1000 to 1700: sustained at 600 ms of it; heard at 300 ms of quiet, ended at 500.
+        assert_eq!(
+            heard.iter().map(|(at, h)| format!("{at}: {h}")).collect::<Vec<_>>(),
+            // (Its audio: 500 ms from before, and the voice and quiet after the start was seen.)
+            vec!["1100: start at 1000", "1600: sustained", "2000: paused, 1000 to 1700", "2200: 38400 samples, 1000 to 1700"],
+        );
+        // Not over our voice: no pause is heard, and 800 ms of quiet ends it, as ever.
+        let mut d = Detector::new(24_000);
+        let heard = fed(&mut d, &[(1000, 40.0), (700, 6000.0), (1000, 40.0)]);
+        assert_eq!(heard.iter().map(|(at, h)| format!("{at}: {h}")).collect::<Vec<_>>(), vec!["1100: start at 1000", "1600: sustained", "2500: 45600 samples, 1000 to 1700"]);
+    }
+
+    #[test]
+    fn over_our_voice_each_pause_is_heard_once_and_speaking_again_goes_on() {
+        let mut d = Detector::new(24_000);
+        d.speaking_out = true;
+        let heard = fed(&mut d, &[(1000, 40.0), (400, 6000.0), (400, 40.0), (400, 6000.0), (1000, 40.0)]);
+        let names: Vec<String> = heard.iter().map(|(_, h)| h.clone()).collect();
+        assert_eq!(names, vec!["start at 1000", "paused, 1000 to 1400", "sustained", "paused, 1000 to 2200", "50400 samples, 1000 to 2200"]);
+        // Our voice stopping during it does not change how it ends: it began over us.
+        let mut d = Detector::new(24_000);
+        d.speaking_out = true;
+        let mut heard = fed(&mut d, &[(1000, 40.0), (300, 6000.0)]);
+        d.speaking_out = false;
+        heard.extend(fed(&mut d, &[(600, 40.0)]));
+        assert_eq!(heard.last().map(|(_, h)| h.as_str()), Some("28800 samples, 1000 to 1300"));
+    }
+
+    #[test]
+    fn an_utterance_ended_at_once_leaves_the_next_words_their_own() {
+        let mut d = Detector::new(24_000);
+        d.speaking_out = true;
+        let heard = fed(&mut d, &[(1000, 40.0), (700, 6000.0), (300, 40.0)]);
+        assert_eq!(heard.last().map(|(_, h)| h.as_str()), Some("paused, 1000 to 1700"));
+        assert!(d.in_speech());
+        assert_eq!(d.voice_end_ms(), 1700);
+        // Their words are in: ended now, with what was heard of it.
+        let Some(Heard::Utterance { start_ms, end_ms, .. }) = d.end_now() else { panic!("no utterance") };
+        assert_eq!((start_ms, end_ms), (1000, 1700));
+        assert!(!d.in_speech());
+        assert_eq!(d.end_now(), None, "ended once");
+        // They speak again: a new utterance, which may be sustained in its turn.
+        let heard: Vec<String> = fed(&mut d, &[(700, 6000.0)]).into_iter().map(|(_, h)| h).collect();
+        assert_eq!(heard, vec!["start at 2000", "sustained"]);
     }
 
     #[test]
