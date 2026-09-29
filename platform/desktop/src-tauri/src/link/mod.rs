@@ -293,6 +293,16 @@ pub fn open_handle(data_dir: PathBuf) -> LinkHandle {
     store
 }
 
+#[cfg(test)]
+impl LinkStore {
+    /// Leave the store with no account, and nothing else changed: the loop of a lane
+    /// a test started has nothing to do from then on. Not `unlink`, which also
+    /// clears the trusted origin and the provider's prelude that other tests read.
+    pub(crate) fn drop_account_for_tests(&self) {
+        self.inner.lock().unwrap_or_else(|e| e.into_inner()).account = None;
+    }
+}
+
 /// A store holding `account`, for the tests of a lane's loop: it needs a link to
 /// read and nothing else, so this starts none of the workers `open_handle` starts
 /// and does not touch the trusted origin every other test reads.

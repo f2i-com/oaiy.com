@@ -636,8 +636,9 @@ mod tests {
             lane.wait_seconds = 1;
             lane.idle_pause_ms = 3_000;
         });
-        spawn(store, None);
+        spawn(store.clone(), None);
         let polls = server.wait_for("/api/v1/desktop-flows/pending", 3, Duration::from_secs(30));
+        crate::link::testkit::stop_lane(&store);
         let _ = std::fs::remove_dir_all(dir);
         for pair in polls.windows(2) {
             let gap = pair[1].at - pair[0].at;

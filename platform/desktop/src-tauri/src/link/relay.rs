@@ -773,8 +773,9 @@ mod tests {
     fn gaps_between_empty_polls(tag: &str, edit: impl FnOnce(&mut RelaySpec)) -> Vec<Duration> {
         let server = Provider::start(|_| Reply::ok(r#"{"commands":[]}"#));
         let (store, dir) = crate::link::testkit::linked_to(&server.base, tag, |d| edit(d.relay.as_mut().unwrap()));
-        spawn(store, working_dispatcher());
+        spawn(store.clone(), working_dispatcher());
         let polls = server.wait_for(PENDING, 3, Duration::from_secs(30));
+        crate::link::testkit::stop_lane(&store);
         let _ = std::fs::remove_dir_all(dir);
         polls.windows(2).map(|pair| pair[1].at - pair[0].at).collect()
     }

@@ -140,6 +140,22 @@ impl Provider {
     }
 }
 
+/// Stop a lane's loop that a test started, as far as a loop that never ends can be
+/// stopped: the store loses its account, and the loop, which had nothing left to
+/// wait for, has nothing to do from its next time round.
+///
+/// A loop left running on a link goes on polling a port nobody listens on once its
+/// test is over, and starts its client afresh at every failure: on the client
+/// other tests count connections on, and, for the queue check, with the provider's
+/// prelude the other tests' cache holds. Call it once the requests a test wants
+/// have been seen and before its provider goes.
+pub fn stop_lane(store: &super::LinkHandle) {
+    store.drop_account_for_tests();
+    // The last poll it made was answered at once, so this is time enough for the
+    // loop to be out of its request and into its wait.
+    std::thread::sleep(Duration::from_millis(300));
+}
+
 /// A store linked to `base` with the shipped connector, changed by `edit`, in a
 /// data folder of its own: what a lane's loop reads to know where to poll and how
 /// (a user's connector file replaces the built-in one of the same id).

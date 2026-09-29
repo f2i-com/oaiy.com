@@ -316,6 +316,9 @@ pub fn spawn(
     if let Some(dispatcher) = connector {
         let _ = CONNECTOR.set(dispatcher);
     }
+    // Here and not in the loop, which a test runs on a data folder of its own that is
+    // gone when it ends: the process has one place to keep them.
+    let _ = PENDING_DIR.set(store.data_dir().join("link").join("completions"));
     spawn_inner(store, node, &QUEUE_WAKE)
 }
 
@@ -324,7 +327,6 @@ fn spawn_inner(
     node: Option<crate::services::node_runtime::NodeHandle>,
     wake: &'static Wake,
 ) {
-    let _ = PENDING_DIR.set(store.data_dir().join("link").join("completions"));
     let mut pending_at = std::time::Instant::now();
     std::thread::spawn(move || loop {
         let Some(account) = store.account() else {
@@ -2309,7 +2311,10 @@ mod tests {
 
     /// The queue check's own loop, on a wake of its own so that no other test's
     /// reservation can reach it, against a provider whose queue is empty.
-    fn queue_loop(tag: &str, idle_seconds: u64) -> (Provider, &'static Wake, std::path::PathBuf) {
+    fn queue_loop(
+        tag: &str,
+        idle_seconds: u64,
+    ) -> (Provider, &'static Wake, std::path::PathBuf, LinkHandle) {
         let server = Provider::start(|req| {
             if req.target.starts_with("/api/v1/flow-runs/queued") {
                 Reply::ok(r#"{"runs":[]}"#)
@@ -2323,8 +2328,8 @@ mod tests {
             d.flows.as_mut().unwrap().queued_idle_seconds = idle_seconds;
         });
         let wake: &'static Wake = Box::leak(Box::new(Wake::new()));
-        spawn_inner(store, None, wake);
-        (server, wake, dir)
+        spawn_inner(store.clone(), None, wake);
+        (server, wake, dir, store)
     }
 
     const QUEUED: &str = "/api/v1/flow-runs/queued";
@@ -2334,8 +2339,9 @@ mod tests {
         // The lane's own loop: a provider that asks for five seconds between looks
         // at an empty queue is not asked again for five. (It was three seconds for
         // every provider, from a constant.)
-        let (server, _wake, dir) = queue_loop("queue-idle", 5);
+        let (server, _wake, dir, store) = queue_loop("queue-idle", 5);
         let looks = server.wait_for(QUEUED, 2, Duration::from_secs(30));
+        crate::link::testkit::stop_lane(&store);
         let _ = std::fs::remove_dir_all(dir);
         let gap = looks[1].at - looks[0].at;
         assert!(gap >= Duration::from_millis(4_800) && gap < Duration::from_secs(9), "{gap:?}");
@@ -2345,12 +2351,13 @@ mod tests {
     fn a_run_this_desktop_has_just_reserved_is_looked_for_at_once_however_long_the_idle_time() {
         // The idle time is the longest a run the PROVIDER queued waits; a run this
         // desktop reserved itself is known the moment it is in the queue.
-        let (server, wake, dir) = queue_loop("queue-wake", 300);
+        let (server, wake, dir, store) = queue_loop("queue-wake", 300);
         let first = server.wait_for(QUEUED, 1, Duration::from_secs(30));
         // Give the loop a moment to be waiting, then reserve.
         std::thread::sleep(Duration::from_millis(300));
         wake.wake();
         let looks = server.wait_for(QUEUED, 2, Duration::from_secs(10));
+        crate::link::testkit::stop_lane(&store);
         let _ = std::fs::remove_dir_all(dir);
         let gap = looks[1].at - first[0].at;
         assert!(gap < Duration::from_secs(5), "waited {gap:?} for a run in the queue");
