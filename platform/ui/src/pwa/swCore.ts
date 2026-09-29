@@ -79,7 +79,7 @@ export function cacheNames(buildId: string): CacheNames {
 }
 
 /** Why the worker leaves a request to the browser. */
-export type BypassReason = 'method' | 'range' | 'cross-origin' | 'api' | 'share-link' | 'worker-script' | 'oversize';
+export type BypassReason = 'method' | 'range' | 'cross-origin' | 'api' | 'share-link' | 'worker-script' | 'oversize' | 'other-page';
 
 export type Route = { kind: 'bypass'; reason: BypassReason } | { kind: 'navigation' } | { kind: 'asset' };
 
@@ -112,7 +112,10 @@ export function route(req: RouteRequest, workerOrigin: string, oversize: readonl
   if (url.searchParams.has('flow')) return bypass('share-link');
   if (url.pathname === WORKER_PATH) return bypass('worker-script');
   if (oversize.includes(url.pathname)) return bypass('oversize');
-  if (req.mode === 'navigate') return { kind: 'navigation' };
+  // The scope /app.html is a prefix: /app.html/x and /app.htmlx are in it. Only /app.html is the page, and
+  // only it is answered from the shell or kept as the shell: an address a host answers with its front page
+  // must not become the editor, online or off.
+  if (req.mode === 'navigate') return url.pathname === SHELL_PATH ? { kind: 'navigation' } : bypass('other-page');
   return { kind: 'asset' };
 }
 

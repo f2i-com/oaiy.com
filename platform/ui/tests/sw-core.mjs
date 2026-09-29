@@ -203,6 +203,16 @@ await check('route: what is left to the browser, and why', () => {
   assert.equal(W.route(request('/apis/x.js'), ORIGIN).kind, 'asset', '/apis is not /api/');
 });
 
+await check('route: the scope /app.html also matches /app.html/x and /app.htmlx; only /app.html is the page, and a navigation to anything else is left to the browser', () => {
+  for (const url of ['/app.html/x', '/app.html/', '/app.html/oops?a=1', '/app.htmlx', '/app.html5']) {
+    assert.deepEqual(W.route(request(url, { mode: 'navigate' }), ORIGIN), { kind: 'bypass', reason: 'other-page' }, url);
+  }
+  assert.deepEqual(W.route(request('/app.html', { mode: 'navigate' }), ORIGIN), { kind: 'navigation' });
+  assert.deepEqual(W.route(request('/app.html?x=1#top', { mode: 'navigate' }), ORIGIN), { kind: 'navigation' }, 'a query is still the page');
+  // Only navigations are held to it: the page's own files are asked for by their own names.
+  assert.equal(W.route(request('/app.html/x.js'), ORIGIN).kind, 'asset');
+});
+
 await check('route: other origins are never answered, every engine and provider among them (worker on https://oaiy.com)', () => {
   for (const url of [
     'http://127.0.0.1:17972/api/health',
@@ -765,6 +775,37 @@ await check('message: what the page says it loaded is kept only if it is what it
   await w.message({ type: 'cache-urls', urls: [{ url: '/assets/lazy-a1111111.js' }, { url: '/assets/lazy-b2222222.js' }] });
   const runtime = await w.caches.open(W.cacheNames('b1').runtime);
   assert.deepEqual((await runtime.keys()).map((k) => new URL(k.url).pathname), ['/assets/lazy-b2222222.js']);
+});
+
+/* ---------------- the scope is a prefix: /app.html/x and /app.htmlx are in it and are not the page ---------------- */
+
+await check('navigation: another address in scope, answered 200 with a front page, is neither answered nor kept as the shell (the reviewer\'s /app.html/oops)', async () => {
+  const w = await installedWorker();
+  w.state.routes.set('/app.html/oops', () => new Response('<html>the landing page</html>', { status: 200, headers: { 'content-type': 'text/html' } }));
+  const before = w.state.fetched.length;
+  const out = await w.fetch(request('/app.html/oops', { mode: 'navigate' }));
+  assert.equal(out.answered, false, 'left to the browser');
+  assert.equal(w.state.fetched.length, before, 'and not fetched by the worker');
+  const shell = await w.caches.open(W.cacheNames('b1').shell);
+  assert.equal(await bodyOf(await shell.match(`${ORIGIN}/app.html`)), '<html>shell v1</html>', 'the shell is still the editor');
+  // offline, the page still opens the editor, and /app.html/oops is not given it
+  w.state.online = false;
+  const page = await w.fetch(request('/app.html', { mode: 'navigate' }));
+  assert.equal(await bodyOf(await page.response), '<html>shell v1</html>');
+  const other = await w.fetch(request('/app.html/oops', { mode: 'navigate' }));
+  assert.equal(other.answered, false, 'offline, an address that is not the page gets no editor with a 200');
+  const next = await w.fetch(request('/app.htmlx', { mode: 'navigate' }));
+  assert.equal(next.answered, false);
+});
+
+await check('navigation: a redirected answer is not kept as the shell, and the page is still the kept one offline', async () => {
+  const w = await installedWorker();
+  w.state.routes.set('/app.html', () => Object.defineProperty(new Response('<html>somewhere else</html>', { status: 200, headers: { 'content-type': 'text/html' } }), 'redirected', { value: true }));
+  const out = await w.fetch(request('/app.html', { mode: 'navigate' }));
+  assert.equal(await bodyOf(await out.response), '<html>somewhere else</html>', 'the page gets what the host answered');
+  await out.settled();
+  const shell = await w.caches.open(W.cacheNames('b1').shell);
+  assert.equal(await bodyOf(await shell.match(`${ORIGIN}/app.html`)), '<html>shell v1</html>');
 });
 
 finish();

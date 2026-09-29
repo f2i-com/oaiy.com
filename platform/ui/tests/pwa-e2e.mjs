@@ -439,6 +439,42 @@ section('a shell file answered with the front page is never kept, and the editor
 }
 
 /* ------------------------------------------------------------------ */
+/* The scope is a prefix: /app.html/oops is in it and is not the page    */
+/* ------------------------------------------------------------------ */
+section('an address in scope that is not the page is never made the editor');
+{
+  // A host that answers an unknown path with its front page (a single-page-app fallback).
+  const front = fs.readFileSync(path.join(DIST, 'index.html'));
+  const site = await startSite(DIST, {
+    override: (request) => (request.path === '/app.html/oops' || request.path === '/app.htmlx' ? { status: 200, headers: { 'content-type': 'text/html; charset=utf-8' }, body: front } : undefined),
+  });
+  const browser = await launch({ engine });
+  const page = await browser.context.newPage();
+  await page.goto(`${site.origin}/app.html`, { waitUntil: 'networkidle' });
+  await waitControlled(page);
+  await settleCaches(page);
+  const keptPage = () => page.evaluate(async () => {
+    const name = (await caches.keys()).find((n) => n.endsWith('-shell'));
+    const res = await (await caches.open(name)).match('/app.html');
+    return res.text();
+  });
+  const shellBefore = await keptPage();
+  const oops = await page.goto(`${site.origin}/app.html/oops`, { waitUntil: 'networkidle' });
+  ok('in scope, it is the host\'s answer, from the network and not from the worker', !!oops && oops.status() === 200 && !oops.fromServiceWorker() && (await page.locator('.app-shell').count()) === 0);
+  const shellAfter = await keptPage();
+  ok('and the shell is still the editor\'s page, not the front page', shellAfter === shellBefore && /\/assets\/app-[\w-]+\.js/.test(shellAfter), `${shellBefore.length} -> ${shellAfter.length}`);
+  await site.close();
+  const offlineEditor = await page.goto(`${site.origin}/app.html`, { waitUntil: 'domcontentloaded' }).then((r) => r, () => null);
+  await page.locator('.app-shell').waitFor({ timeout: 20000 }).catch(() => undefined);
+  ok('offline, /app.html opens the editor from the shell', !!offlineEditor && (await page.locator('.app-shell').count()) === 1);
+  for (const other of ['/app.html/oops', '/app.htmlx']) {
+    const answer = await page.goto(`${site.origin}${other}`, { waitUntil: 'domcontentloaded' }).then((r) => r, () => null);
+    ok(`offline, ${other} is not given the editor with a 200 (the browser has no page for it)`, answer === null && (await page.locator('.app-shell').count()) === 0);
+  }
+  await browser.close();
+}
+
+/* ------------------------------------------------------------------ */
 /* An update waits for the person                                       */
 /* ------------------------------------------------------------------ */
 section('a new build waits, says so, and takes over when the person reloads');
