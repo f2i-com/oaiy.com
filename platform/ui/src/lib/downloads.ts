@@ -2,14 +2,18 @@
  * Which OAIY Desktop download suits the person looking at the page, with no request of any kind.
  *
  * Two inputs, both known here: the browser's own account of the device (navigator.userAgentData,
- * or the user agent string where there is none) and the version the site was built for. The
- * installers' file names carry the version (`oaiy-desktop-<version>-windows-x64-setup.exe`), so the
- * links are made when the site is built, from the tag (VITE_OAIY_VERSION, set by the release
- * workflow), and the site is built again for every release. Nothing asks GitHub what is newest: that
- * would be a request to a third party from a page that promises there are none.
+ * or the user agent string where there is none) and the release the site was built for. The
+ * installers' file names carry the release's version (`oaiy-desktop-<version>-windows-x64-setup.exe`),
+ * so the links are made when the site is built, from the tag the release was pushed as
+ * (VITE_OAIY_RELEASE_TAG, which the release workflow's web job sets to `github.ref_name`), and the
+ * site is built again for every release. The tag is `0.1.0` or `v0.1.0` (the workflow takes both, and
+ * the release is published under the tag as pushed): the address uses it as it is and the file names
+ * take the version without the `v`. Nothing asks GitHub what is newest: that would be a request to a
+ * third party from a page that promises there are none.
  *
- * Built without a version (a local build, a manual run) the page offers one button to the latest
- * release, whose page lists the files, and says only "Download OAIY Desktop".
+ * Built for anything that is not a version tag (a local build, a run on a branch, where `github.ref_name`
+ * is the branch's name) the page offers one button to the latest release, whose page lists the files,
+ * and says only "Download OAIY Desktop".
  *
  * This file is pure: `downloadPlan` takes what it needs and returns what to show. The browser and
  * the build's environment are read in one place each (lib/downloadsEnv.ts).
@@ -68,11 +72,24 @@ export function detectDevice(input: DeviceInput = {}): Device {
   return { os: 'other', arch };
 }
 
-/** A version the release workflow can have made: N.N.N, with a leading v tolerated. Anything else is "no version". */
-export function normalizeVersion(raw: unknown): string | null {
+/** The release a build is for: the tag it was pushed as, and the version its files are named by. */
+export interface Release {
+  /** As pushed, and as the release is published: `0.1.0` or `v0.1.0`. */
+  tag: string;
+  /** N.N.N, without the `v`. */
+  version: string;
+}
+
+/**
+ * The release a tag names, or null when it names none: a branch (`main`), an empty string (a build with no
+ * tag) or anything the release workflow would refuse. The tag is N.N.N with an optional lowercase `v`, as the
+ * workflow reads it (`${raw#v}` and a three-number check); nothing else is let into an address.
+ */
+export function releaseFromTag(raw: unknown): Release | null {
   if (typeof raw !== 'string') return null;
-  const version = raw.trim().replace(/^v/i, '');
-  return /^\d+\.\d+\.\d+$/.test(version) ? version : null;
+  const tag = raw.trim();
+  const match = /^v?(\d+\.\d+\.\d+)$/.exec(tag);
+  return match ? { tag, version: match[1] } : null;
 }
 
 /**
@@ -100,8 +117,8 @@ export interface DownloadLink {
 
 export interface DownloadPlan {
   device: Device;
-  /** The version the links are for, or null (one link to the latest release). */
-  version: string | null;
+  /** The release the links are for, or null (one link to the latest release). */
+  release: Release | null;
   /** The button. Null when there is no download for this device. */
   primary: DownloadLink | null;
   /** Under "other downloads": the rest of what suits this device, then the server. */
@@ -122,19 +139,19 @@ export const UNSIGNED_NOTE = 'Not code-signed yet, so Windows will warn you.';
 /** The sentence for a device OAIY Desktop is not built for. */
 export const NOT_FOR_THIS_DEVICE = 'OAIY Desktop is for Windows and Linux. The web app works in your browser.';
 
-/** What to offer the person on `device`, for a site built for `versionInput`. */
-export function downloadPlan(device: Device, versionInput?: unknown): DownloadPlan {
-  const version = normalizeVersion(versionInput);
+/** What to offer the person on `device`, for a site built for the release `tag` names. */
+export function downloadPlan(device: Device, tag?: unknown): DownloadPlan {
+  const release = releaseFromTag(tag);
   const plan = (primary: DownloadLink | null, others: DownloadLink[], note: string | null, caption: string | null = null): DownloadPlan => ({
     device,
-    version,
+    release,
     primary,
     others,
     allDownloads: RELEASES_ALL_URL,
     note,
     caption,
   });
-  const link = (label: string, file: string): DownloadLink => ({ label, href: releaseAssetUrl(version as string, file), file });
+  const link = (label: string, file: string): DownloadLink => ({ label, href: releaseAssetUrl((release as Release).tag, file), file });
   const latest = (label: string): DownloadLink => ({ label, href: RELEASES_URL });
 
   const linuxArm = device.os === 'linux' && device.arch === 'arm';
@@ -148,15 +165,15 @@ export function downloadPlan(device: Device, versionInput?: unknown): DownloadPl
   if (device.os === 'other') return plan(latest(PRIMARY_LABEL_UNVERSIONED), [], 'The files are for Windows and Linux.');
 
   // A local build: one button to the latest release.
-  if (!version) return plan(latest(PRIMARY_LABEL_UNVERSIONED), [], null, device.os === 'windows' ? UNSIGNED_NOTE : null);
+  if (!release) return plan(latest(PRIMARY_LABEL_UNVERSIONED), [], null, device.os === 'windows' ? UNSIGNED_NOTE : null);
 
-  const names = assetNames(version);
+  const names = assetNames(release.version);
   if (device.os === 'windows') {
     return plan(
       link('Download OAIY Desktop for Windows', names.windowsSetup),
       [link('Windows installer (.msi)', names.windowsMsi), link('Headless server for Windows (.zip)', names.windowsServer)],
       null,
-      `Version ${version}. ${UNSIGNED_NOTE}`,
+      `Version ${release.version}. ${UNSIGNED_NOTE}`,
     );
   }
   return plan(
@@ -167,6 +184,6 @@ export function downloadPlan(device: Device, versionInput?: unknown): DownloadPl
       link('Headless server for Linux hosts (.tar.gz)', names.linuxServer),
     ],
     null,
-    `Version ${version}.`,
+    `Version ${release.version}.`,
   );
 }

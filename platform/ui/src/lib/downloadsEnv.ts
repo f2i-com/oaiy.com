@@ -2,11 +2,14 @@
  * The two places the download links read the outside world: the browser's account of the device
  * and the version the site was built for. Everything else is lib/downloads.ts, which is pure.
  */
-import { detectDevice, downloadPlan, normalizeVersion, type Device, type DownloadPlan } from './downloads';
+import { detectDevice, downloadPlan, releaseFromTag, type Device, type DownloadPlan, type Release } from './downloads';
 
-/** The version this site was built for (VITE_OAIY_VERSION, set by the release workflow), or null. */
-export function builtForVersion(): string | null {
-  return normalizeVersion(import.meta.env.VITE_OAIY_VERSION);
+/**
+ * The release this site was built for: VITE_OAIY_RELEASE_TAG, which the release workflow's web job sets to
+ * the tag it was pushed as (`github.ref_name`), or null for a build with no version tag (a local one, a run on a branch).
+ */
+export function builtForRelease(): Release | null {
+  return releaseFromTag(import.meta.env.VITE_OAIY_RELEASE_TAG);
 }
 
 /** The device this page is on. No request is made: this reads what the browser already knows. */
@@ -22,5 +25,5 @@ export function currentDevice(): Device {
 
 /** What to offer this person on this build. */
 export function currentDownloadPlan(): DownloadPlan {
-  return downloadPlan(currentDevice(), builtForVersion());
+  return downloadPlan(currentDevice(), builtForRelease()?.tag);
 }

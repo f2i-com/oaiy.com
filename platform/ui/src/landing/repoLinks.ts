@@ -23,12 +23,13 @@ export const RELEASES_URL = `${REPO_URL}/releases/latest`;
 export const RELEASES_ALL_URL = `${REPO_URL}/releases`;
 
 /**
- * A file of one release. Releases are tagged `v<version>` (docs/RELEASING.md), and the installers'
- * names carry the version (`oaiy-desktop-<version>-windows-x64-setup.exe`), so this needs the version
- * the site was built for (lib/downloads.ts).
+ * A file of one release. A release is published under the name of the tag that was pushed
+ * (`tag_name: ${{ github.ref_name }}` in release.yml), which is `0.1.0` or `v0.1.0` (the workflow takes
+ * both), so the address uses the tag as it is; the installers' names carry the version without the `v`
+ * (`oaiy-desktop-<version>-windows-x64-setup.exe`), which lib/downloads.ts works out from the same tag.
  */
-export function releaseAssetUrl(version: string, file: string): string {
-  return `${REPO_URL}/releases/download/v${version}/${file}`;
+export function releaseAssetUrl(tag: string, file: string): string {
+  return `${REPO_URL}/releases/download/${tag}/${file}`;
 }
 
 /** The folders of the repository the pages link to, as paths from its root. */

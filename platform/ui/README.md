@@ -54,11 +54,13 @@ answers) offers the OAIY Desktop file for the visitor's system: the Windows inst
 and the headless server under "other downloads". A Mac or a phone is told OAIY Desktop is for Windows and Linux. The system comes
 from what the browser already says of itself (`lib/downloads.ts`); there is no request and no probe of a desktop.
 
-The links are **made when the site is built**: the files' names carry the release's version, so `VITE_OAIY_VERSION` (the
-tag's version, set by the release workflow's web job) is baked into the build, and the links are
-`https://github.com/f2i-com/oaiy.com/releases/download/v<version>/<file>`. Built without it, the button links to the latest
-release and says "Download OAIY Desktop". **The site has to be redeployed with each release**, or it keeps offering the
-previous one ([`docs/RELEASING.md`](../../docs/RELEASING.md#the-web-site)).
+The links are **made when the site is built**: the files' names carry the release's version, so `VITE_OAIY_RELEASE_TAG` (the
+tag the release was pushed as, `github.ref_name`, set by the release workflow's web job) is baked into the build. The release is
+published under that tag, `0.1.0` or `v0.1.0`, so the links are
+`https://github.com/f2i-com/oaiy.com/releases/download/<tag>/<file>` with the tag as pushed and the version, without the `v`, in
+the file's name. Built without a version tag (a local build, a run on a branch, where `github.ref_name` is the branch's name) the
+button links to the latest release and says "Download OAIY Desktop". **The site has to be redeployed with each release**, or it
+keeps offering the previous one ([`docs/RELEASING.md`](../../docs/RELEASING.md#the-web-site)).
 
 ## Pictures
 

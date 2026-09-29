@@ -100,16 +100,17 @@ a release matter here:
 
 - **The download links are baked in, so the site must be redeployed with each release.** The
   installers' names carry the version, so the landing and desktop pages and the flow editor
-  offer `https://github.com/f2i-com/oaiy.com/releases/download/v<v>/oaiy-desktop-<v>-windows-x64-setup.exe`
+  offer `https://github.com/f2i-com/oaiy.com/releases/download/<tag>/oaiy-desktop-<v>-windows-x64-setup.exe`
   (and the AppImage, `.deb`, `.rpm` and the headless server under "other downloads"). The `web`
-  job gives the build `VITE_OAIY_VERSION`, the tag's version, and the page picks the visitor's
-  system in the browser with no request. Nothing asks GitHub what is newest, so a site that is
-  not redeployed keeps offering the release it was built for. A build made without the variable
-  (a local one) links to the latest release and says only "Download OAIY Desktop".
-- **The links assume the tag is `v<version>`.** The workflow accepts `0.1.0` or `v0.1.0`, and the
-  GitHub Release takes the tag's own name, so a release tagged `0.1.0` would have files at
-  `.../releases/download/0.1.0/...` and every baked link would answer 404. Push the `v` form, as
-  the earlier releases did.
+  job gives the build `VITE_OAIY_RELEASE_TAG`, the tag as it was pushed (`github.ref_name`), and the
+  page picks the visitor's system in the browser with no request. Nothing asks GitHub what is
+  newest, so a site that is not redeployed keeps offering the release it was built for.
+- **Either form of the tag works.** The workflow accepts `0.1.0` or `v0.1.0` and publishes the
+  release under the tag as pushed, so the site's addresses use the tag as it is
+  (`.../releases/download/0.1.0/...` or `.../download/v0.1.0/...`) and the file names take the
+  version without the `v`. A build that has no version tag (a local one, or a run on a branch,
+  where the tag is the branch's name) links to the latest release and says only "Download OAIY
+  Desktop". The earlier releases were tagged with the `v`; keep to that so there is one form.
 - **A host must serve `/sw.js` from the root, and `/app.html` as itself, not redirected.** The
   flow editor installs a service worker (scope `/app.html`) so it can open offline and be
   installed as an app; it keeps the shell of this build under a cache named for the build and

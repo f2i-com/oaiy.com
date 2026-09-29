@@ -8,9 +8,9 @@
  *   - the device from userAgentData or the user agent, for the shapes browsers really send: Windows,
  *     Linux (and its ARM and 32-bit kinds, which the files are not built for), Mac, iPhone, iPad (which
  *     calls itself a Mac), Android phone and tablet (which say Linux too), Chrome OS, and what it cannot tell;
- *   - the version: N.N.N, a leading v, an empty string (what a GitHub expression with no value gives), garbage;
- *   - the links: with a version, the exact names of the release's files under releases/download/v<version>/,
- *     each checked against the names .github/workflows/release.yml gives them; without one, a single button to the
+ *   - the release: the tag as pushed (0.1.0 or v0.1.0), a branch name, an empty string (what a GitHub expression with no value gives), garbage;
+ *   - the links: for a tag, the exact names of the release's files (the version, without the v) under releases/download/<tag>/,
+ *     each checked against the names .github/workflows/release.yml gives them; for a branch or no tag, a single button to the
  *     latest release saying only "Download OAIY Desktop";
  *   - a Mac or a phone is told what OAIY Desktop is for, and gets no button;
  *   - no link to anywhere but the project's repository, and the source makes no request.
@@ -99,12 +99,12 @@ await check('the device: the browser\'s own word (userAgentData.platform) wins o
   assert.equal(os({ uaPlatform: 'Something New', userAgent: UA.linuxChrome }), 'linux');
 });
 
-await check('the version: N.N.N, with a v tolerated; empty, garbage and anything else is none', () => {
-  assert.equal(D.normalizeVersion('0.1.0'), '0.1.0');
-  assert.equal(D.normalizeVersion('v0.1.0'), '0.1.0');
-  assert.equal(D.normalizeVersion(' 12.30.4 '), '12.30.4');
-  for (const bad of ['', '  ', undefined, null, 5, {}, '0.1', '1.2.3.4', '1.2.3-beta', 'latest', '../../x', '1.2.3/../../evil', 'v', '0.1.0 && x']) {
-    assert.equal(D.normalizeVersion(bad), null, JSON.stringify(bad));
+await check('the release a tag names: N.N.N with or without a v, as pushed; a branch, an empty string and anything the workflow would refuse name none', () => {
+  assert.deepEqual(D.releaseFromTag('0.1.0'), { tag: '0.1.0', version: '0.1.0' });
+  assert.deepEqual(D.releaseFromTag('v0.1.0'), { tag: 'v0.1.0', version: '0.1.0' });
+  assert.deepEqual(D.releaseFromTag(' v12.30.4 '), { tag: 'v12.30.4', version: '12.30.4' });
+  for (const bad of ['', '  ', undefined, null, 5, {}, '0.1', '1.2.3.4', '1.2.3-beta', 'v1.2.3-rc.1', 'latest', 'main', 'landing-pwa', 'release/1.0.0', 'refs/heads/main', 'refs/tags/v0.1.0', 'V0.1.0', 'vv0.1.0', '../../x', '1.2.3/../../evil', 'v', '0.1.0 && x', 'v0.1.0/x']) {
+    assert.equal(D.releaseFromTag(bad), null, JSON.stringify(bad));
   }
 });
 
@@ -112,8 +112,8 @@ const WIN = { os: 'windows', arch: 'x64' };
 const LIN = { os: 'linux', arch: 'x64' };
 const releases = 'https://github.com/f2i-com/oaiy.com/releases';
 
-await check('Windows, built for 0.1.0: the NSIS installer is the button, the MSI and the server are the other downloads', () => {
-  const plan = D.downloadPlan(WIN, '0.1.0');
+await check('Windows, built for tag v0.1.0: the NSIS installer is the button, the MSI and the server are the other downloads', () => {
+  const plan = D.downloadPlan(WIN, 'v0.1.0');
   assert.deepEqual(plan.primary, { label: 'Download OAIY Desktop for Windows', href: `${releases}/download/v0.1.0/oaiy-desktop-0.1.0-windows-x64-setup.exe`, file: 'oaiy-desktop-0.1.0-windows-x64-setup.exe' });
   assert.deepEqual(plan.others.map((o) => o.href), [
     `${releases}/download/v0.1.0/oaiy-desktop-0.1.0-windows-x64.msi`,
@@ -122,10 +122,21 @@ await check('Windows, built for 0.1.0: the NSIS installer is the button, the MSI
   assert.equal(plan.allDownloads, releases);
   assert.equal(plan.note, null);
   assert.match(plan.caption, /^Version 0\.1\.0\. Not code-signed yet, so Windows will warn you\.$/);
-  assert.equal(plan.version, '0.1.0');
+  assert.deepEqual(plan.release, { tag: 'v0.1.0', version: '0.1.0' });
 });
 
-await check('Linux, built for 0.1.0: the AppImage is the button; .deb, .rpm and the server tarball are the other downloads', () => {
+await check('the same release pushed as the bare tag 0.1.0: the address is the tag as pushed, the file names the version (a release is published under the tag, so a v added here would 404)', () => {
+  const win = D.downloadPlan(WIN, '0.1.0');
+  assert.equal(win.primary.href, `${releases}/download/0.1.0/oaiy-desktop-0.1.0-windows-x64-setup.exe`);
+  assert.deepEqual(win.others.map((o) => o.href), [`${releases}/download/0.1.0/oaiy-desktop-0.1.0-windows-x64.msi`, `${releases}/download/0.1.0/oaiy-server-0.1.0-windows-x64.zip`]);
+  const linux = D.downloadPlan(LIN, '0.1.0');
+  assert.equal(linux.primary.href, `${releases}/download/0.1.0/oaiy-desktop-0.1.0-linux-x86_64.AppImage`);
+  for (const link of [win.primary, ...win.others, linux.primary, ...linux.others]) assert.doesNotMatch(link.href, /\/download\/v/, link.href);
+  for (const link of [D.downloadPlan(WIN, 'v0.1.0').primary, ...D.downloadPlan(LIN, 'v0.1.0').others]) assert.match(link.href, /\/download\/v0\.1\.0\/oaiy-/, link.href);
+  assert.equal(win.caption, D.downloadPlan(WIN, 'v0.1.0').caption, 'the same version either way');
+});
+
+await check('Linux, built for v0.1.0: the AppImage is the button; .deb, .rpm and the server tarball are the other downloads', () => {
   const plan = D.downloadPlan(LIN, 'v0.1.0');
   assert.deepEqual(plan.primary, { label: 'Download OAIY Desktop for Linux', href: `${releases}/download/v0.1.0/oaiy-desktop-0.1.0-linux-x86_64.AppImage`, file: 'oaiy-desktop-0.1.0-linux-x86_64.AppImage' });
   assert.deepEqual(plan.others.map((o) => o.file), ['oaiy-desktop-0.1.0-linux-amd64.deb', 'oaiy-desktop-0.1.0-linux-x86_64.rpm', 'oaiy-server-0.1.0-linux-x86_64.tar.gz']);
@@ -133,13 +144,13 @@ await check('Linux, built for 0.1.0: the AppImage is the button; .deb, .rpm and 
   assert.equal(plan.allDownloads, releases);
 });
 
-await check('with no version the button goes to the latest release and says only "Download OAIY Desktop"', () => {
-  for (const version of [undefined, '', null, 'not-a-version']) {
+await check('built for a branch, or with no tag, the button goes to the latest release and says only "Download OAIY Desktop"', () => {
+  for (const tag of [undefined, '', null, 'not-a-version', 'main', 'landing-pwa', 'refs/heads/main', 'release/1.0.0']) {
     for (const device of [WIN, LIN]) {
-      const plan = D.downloadPlan(device, version);
-      assert.deepEqual(plan.primary, { label: 'Download OAIY Desktop', href: 'https://github.com/f2i-com/oaiy.com/releases/latest' }, JSON.stringify([version, device.os]));
+      const plan = D.downloadPlan(device, tag);
+      assert.deepEqual(plan.primary, { label: 'Download OAIY Desktop', href: 'https://github.com/f2i-com/oaiy.com/releases/latest' }, JSON.stringify([tag, device.os]));
       assert.deepEqual(plan.others, []);
-      assert.equal(plan.version, null);
+      assert.equal(plan.release, null);
       assert.equal(plan.allDownloads, releases);
     }
   }
@@ -149,9 +160,9 @@ await check('with no version the button goes to the latest release and says only
 
 await check('a Mac, an iPhone, an iPad and an Android device get the sentence, and no download', () => {
   for (const os of ['mac', 'ios', 'android']) {
-    for (const version of ['0.1.0', undefined]) {
-      const plan = D.downloadPlan({ os, arch: 'unknown' }, version);
-      assert.equal(plan.primary, null, `${os} ${version}`);
+    for (const tag of ['v0.1.0', '0.1.0', undefined]) {
+      const plan = D.downloadPlan({ os, arch: 'unknown' }, tag);
+      assert.equal(plan.primary, null, `${os} ${tag}`);
       assert.deepEqual(plan.others, []);
       assert.equal(plan.note, 'OAIY Desktop is for Windows and Linux. The web app works in your browser.');
       assert.equal(plan.allDownloads, releases);
@@ -196,19 +207,25 @@ await check('the names are the release\'s own: every file offered is one .github
   const names = Object.values(D.assetNames('9.8.7'));
   assert.equal(names.length, 7);
   for (const name of names) assert.ok(made.has(name), `${name} is not made by release.yml (it makes: ${[...made].join(', ')})`);
-  // The tag is the version the workflow builds (release.yml's meta job); the site is built with it.
-  assert.match(fs.readFileSync(workflow, 'utf8'), /VITE_OAIY_VERSION: \$\{\{ needs\.meta\.outputs\.version \}\}/, 'the web job builds the site with the version');
+  // The site is built with the tag as it was pushed, and the release is published under that same name: the two
+  // lines the addresses rest on. If either changes, the addresses have to change with it.
+  const text = fs.readFileSync(workflow, 'utf8');
+  assert.match(text, /VITE_OAIY_RELEASE_TAG: \$\{\{ github\.ref_name \}\}/, 'the web job builds the site with the tag');
+  assert.match(text, /tag_name: \$\{\{ github\.ref_name \}\}/, 'the release is published under the tag as pushed');
+  assert.doesNotMatch(text, /VITE_OAIY_VERSION/, 'the site works the version out of the tag');
+  assert.match(fs.readFileSync(path.join(UI, 'src', 'lib', 'downloadsEnv.ts'), 'utf8'), /import\.meta\.env\.VITE_OAIY_RELEASE_TAG/, 'and the page reads the same variable');
 });
 
 await check('every link goes to the project\'s repository, and only the names of the release\'s files vary', () => {
   for (const device of [WIN, LIN, { os: 'other', arch: 'unknown' }]) {
-    for (const version of ['0.1.0', undefined]) {
-      const plan = D.downloadPlan(device, version);
+    for (const tag of ['v0.1.0', '0.1.0', 'main', undefined]) {
+      const plan = D.downloadPlan(device, tag);
       for (const link of [plan.primary, ...plan.others].filter(Boolean)) assert.ok(link.href.startsWith(`${L.REPO_URL}/releases/`), link.href);
       assert.ok(plan.allDownloads.startsWith(L.REPO_URL));
     }
   }
-  assert.equal(L.releaseAssetUrl('1.2.3', 'x.exe'), 'https://github.com/f2i-com/oaiy.com/releases/download/v1.2.3/x.exe');
+  assert.equal(L.releaseAssetUrl('v1.2.3', 'x.exe'), 'https://github.com/f2i-com/oaiy.com/releases/download/v1.2.3/x.exe');
+  assert.equal(L.releaseAssetUrl('1.2.3', 'x.exe'), 'https://github.com/f2i-com/oaiy.com/releases/download/1.2.3/x.exe', 'the tag as pushed, with no v added');
   assert.equal(L.RELEASES_ALL_URL, 'https://github.com/f2i-com/oaiy.com/releases');
   assert.equal(L.RELEASES_URL, 'https://github.com/f2i-com/oaiy.com/releases/latest');
 });

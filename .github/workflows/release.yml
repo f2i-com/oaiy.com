@@ -191,7 +191,7 @@ jobs:
         working-directory: platform/ui
         env:
           VITE_API_BASE: ${{ vars.VITE_API_BASE }}
-          VITE_OAIY_VERSION: ${{ needs.meta.outputs.version }}
+          VITE_OAIY_RELEASE_TAG: ${{ github.ref_name }}
         run: npm run build
 
       # The installed bytes against what the release publishes now, right

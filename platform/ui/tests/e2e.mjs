@@ -450,10 +450,10 @@ section('download OAIY Desktop');
       const text = ((await box.textContent()) ?? '').replace(/\s+/g, ' ');
       const where = `${d.name} on ${path}`;
       if (d.os === 'windows') {
-        ok(`${where}: the button is the Windows installer (or the latest release)`, /releases\/(latest|download\/v\d+\.\d+\.\d+\/oaiy-desktop-\d+\.\d+\.\d+-windows-x64-setup\.exe)$/.test(href) && /Download OAIY Desktop/.test(await button.textContent()), href);
+        ok(`${where}: the button is the Windows installer (or the latest release)`, /releases\/(latest|download\/v?\d+\.\d+\.\d+\/oaiy-desktop-\d+\.\d+\.\d+-windows-x64-setup\.exe)$/.test(href) && /Download OAIY Desktop/.test(await button.textContent()), href);
         ok(`${where}: it says the installer is not code-signed yet`, /Not code-signed yet/.test(text), text);
       } else if (d.os === 'linux') {
-        ok(`${where}: the button is the AppImage (or the latest release)`, /releases\/(latest|download\/v\d+\.\d+\.\d+\/oaiy-desktop-\d+\.\d+\.\d+-linux-x86_64\.AppImage)$/.test(href) && /Download OAIY Desktop/.test(await button.textContent()), href);
+        ok(`${where}: the button is the AppImage (or the latest release)`, /releases\/(latest|download\/v?\d+\.\d+\.\d+\/oaiy-desktop-\d+\.\d+\.\d+-linux-x86_64\.AppImage)$/.test(href) && /Download OAIY Desktop/.test(await button.textContent()), href);
       } else {
         // The button goes to the desktop page, or on the desktop page itself (where that would go nowhere) to the web app.
         ok(`${where}: no download, the honest sentence, and a way to the web app or the desktop page`, /OAIY Desktop is for Windows and Linux\. The web app works in your browser\./.test(text) && !/releases\/(latest|download)/.test(href) && href === (path === '/' ? 'desktop.html' : 'app.html'), `${href} | ${text}`);
@@ -479,7 +479,7 @@ section('download OAIY Desktop');
   await page.goto(`${BASE}/app.html`, { waitUntil: 'networkidle' });
   await page.waitForTimeout(2500);
   const get = page.locator('.oaiy-engine-get a');
-  ok('the sidebar offers OAIY Desktop under the engine card while none answers', (await get.count()) === 1 && /releases\/(latest|download\/v\d+\.\d+\.\d+\/oaiy-desktop-\d+\.\d+\.\d+-windows-x64-setup\.exe)$/.test((await get.getAttribute('href')) ?? ''));
+  ok('the sidebar offers OAIY Desktop under the engine card while none answers', (await get.count()) === 1 && /releases\/(latest|download\/v?\d+\.\d+\.\d+\/oaiy-desktop-\d+\.\d+\.\d+-windows-x64-setup\.exe)$/.test((await get.getAttribute('href')) ?? ''));
   await page.locator('.oaiy-settings-btn').first().click();
   await page.waitForTimeout(600);
   const card = page.locator('.oaiy-download-card');
