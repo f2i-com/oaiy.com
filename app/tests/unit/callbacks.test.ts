@@ -1,6 +1,7 @@
 import { describe, expect, it } from 'vitest';
-import { AU_PATTERN, Callbacks, callsBack, retryAfter, type Callback, type Screening } from '../../src/callbacks';
+import { AU_PATTERN, Callbacks, callsBack, isBlocked, retryAfter, type Callback, type Screening } from '../../src/callbacks';
 import type { Desktop, DesktopEvent } from '../../src/desktop/bridge';
+import { setLocalCountry } from '../../src/phoneNumbers';
 import { DEFAULT_MESSAGE_SETTINGS, type MessageSettings } from '../../src/settings';
 import { callStartNote, isCallStart } from '../../src/sessions';
 
@@ -100,6 +101,54 @@ describe('missed calls, called back', () => {
     const screening: Screening = { acceptPattern: '', blockedNumbers: '123456, 12345', rejectPrivate: false };
     expect(callsBack('123456', 'any', screening)).toBe(false);
     expect(callsBack('9912345', 'any', screening)).toBe(true);
+  });
+
+  it('a blocked person is blocked however either number is written: as Aokie matches, or as the same person (never less)', () => {
+    setLocalCountry('AU');
+    const blocked = '0491 570 006\n+44 20 7946 0958';
+    for (const number of ['+61491570006', '0491570006', '0011 61 491 570 006', '61491570006', '+442079460958', '0011 44 20 7946 0958', '00442079460958']) {
+      expect(isBlocked(number, blocked), number).toBe(true);
+      expect(callsBack(number, 'any', { acceptPattern: '', blockedNumbers: blocked, rejectPrivate: false }), number).toBe(false);
+    }
+    expect(isBlocked('+61491570157', blocked)).toBe(false);
+    // Aokie's own rule still blocks what it blocked (a number the country's rules cannot read, by its last nine digits).
+    expect(isBlocked('07700 900123', '+44 7700 900123')).toBe(true);
+    // A number whose last nine digits differ from its other form (a New Zealand landline) is blocked too.
+    setLocalCountry('NZ');
+    expect(isBlocked('09 123 4567', '+64 9 123 4567')).toBe(true);
+    setLocalCountry('AU');
+    // A hidden caller is never rung back, however the phone says it.
+    expect(callsBack('Private', 'any', null)).toBe(false);
+  });
+
+  it('the filters read a number as before, and an Australian one however it is written', () => {
+    setLocalCountry('AU');
+    const answered: Screening = { acceptPattern: AU_PATTERN, blockedNumbers: '', rejectPrivate: false };
+    for (const [number, au, asAokie] of [
+      ['0491570006', true, true],
+      ['+61491570006', true, true],
+      ['61491570006', true, true],
+      ['(02) 9876 5432', true, true],
+      // Written with Australia's international prefix: Australian, though Aokie's pattern does not read it so.
+      ['0011 61 491 570 006', true, false],
+      ['+14155550100', false, false],
+      ['+442079460958', false, false],
+    ] as const) {
+      expect(callsBack(number, 'au', null), number).toBe(au);
+      expect(callsBack(number, 'answered', answered), number).toBe(asAokie);
+      expect(callsBack(number, 'any', answered), number).toBe(true);
+    }
+  });
+
+  it('a missed call is the same person as their text or their next call, however each number is written', async () => {
+    setLocalCountry('AU');
+    const { callbacks } = setup();
+    const t0 = Date.now();
+    await callbacks.missed('0491570006', t0);
+    await callbacks.missed('+61 491 570 006', t0 + 1000);
+    expect(callbacks.open).toHaveLength(1);
+    await callbacks.event({ ...ended({ from: '+61491570006', body: 'Sorry I missed you' }), name: 'aokie.sms.received' });
+    expect(callbacks.list[0]).toMatchObject({ state: 'done', note: 'They texted: the text conversation has them.' });
   });
 
   it("calls on Aokie's own voice: its follow-ups ring back, not OAIY; the route unknown, it waits", async () => {

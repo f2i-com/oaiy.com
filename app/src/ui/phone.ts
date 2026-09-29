@@ -7,6 +7,7 @@
  */
 import { DESKTOP_ORIGIN, desktopHealth, pairingStatus, startPairing } from '../desktop/bridge';
 import { AU_PATTERN, DEFAULT_CALL_BACK_LINE, type Callback, type CallBackFilter, type Screening } from '../callbacks';
+import { COUNTRIES, countryOf, detectCountry, displayNumber } from '../phoneNumbers';
 import type { DesktopSettings, MessageSettings } from '../settings';
 import { h } from './dom';
 import { askText, modal } from './modal';
@@ -107,6 +108,22 @@ export async function editPhone(options: PhoneDialog): Promise<MessageSettings |
   const answer = h('input', { type: 'checkbox', checked: options.messages.answer }) as HTMLInputElement;
   const instructions = h('textarea', { placeholder: 'How the agent answers text messages: what it may say, what it should never promise, when to leave it to you…' }) as HTMLTextAreaElement;
   instructions.value = options.messages.instructions;
+  // The country a number written without its own is read for: a person's calls and texts are then one conversation.
+  const automatic = countryOf(detectCountry());
+  const country = h('select', {},
+    h('option', { value: '' }, `Automatic: ${automatic.name} (+${automatic.dial})`),
+    ...[...COUNTRIES].sort((a, b) => a.name.localeCompare(b.name)).map((c) => h('option', { value: c.code }, `${c.name} (+${c.dial})`)),
+  ) as HTMLSelectElement;
+  country.value = options.messages.country ?? '';
+  const countryNote = h('p.muted.phone-note');
+  const samples: Record<string, string> = { AU: '+61491570006', NZ: '+64211234567', GB: '+447700900123', IE: '+353851234567', US: '+14155550132', CA: '+14165550132' };
+  const showCountry = () => {
+    const c = countryOf(country.value || automatic.code);
+    const sample = samples[c.code] ? `, like ${displayNumber(samples[c.code], c)},` : '';
+    countryNote.textContent = `A number written without its country code${sample} is read as ${c.name}'s (+${c.dial}), so each person's calls and texts are one conversation however the phone writes their number.`;
+  };
+  country.addEventListener('change', showCountry);
+  showCountry();
   const calls = h('input', { type: 'checkbox', checked: options.messages.calls }) as HTMLInputElement;
   const callInstructions = h('textarea', { placeholder: 'Added to the receptionist brief Aokie sends with each call: what the agent may say on the phone, when to take a message…' }) as HTMLTextAreaElement;
   callInstructions.value = options.messages.callInstructions;
@@ -196,6 +213,8 @@ export async function editPhone(options: PhoneDialog): Promise<MessageSettings |
       h('div.row', test),
       h('label.row', calls, ' Answer phone calls (the agent talks with the caller, and you see the call here)'),
       h('label', 'Your instructions for calls', callInstructions),
+      h('label', 'Country for local numbers', country),
+      countryNote,
       h('h3.phone-heading', 'Who is answered'),
       screenNote,
       screenFields,
@@ -213,6 +232,7 @@ export async function editPhone(options: PhoneDialog): Promise<MessageSettings |
       callBack: callBack.checked,
       callBackFilter: callBackFilter.value as CallBackFilter,
       callBackLine: callBackLine.value.trim(),
+      country: country.value,
     }) },
     cancel: 'Close',
   });

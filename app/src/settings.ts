@@ -109,6 +109,13 @@ export interface MessageSettings {
   callBackFilter: CallBackFilter;
   /** What the receptionist says first when they answer (empty: the default line). */
   callBackLine: string;
+  /**
+   * The country a number written without its own is read for ("0491 570 006"
+   * is +61 491 570 006 in Australia), so a person's calls and texts are one
+   * conversation however the phone writes their number. '' is the computer's
+   * own (its time zone, then its language's region, else Australia).
+   */
+  country: string;
 }
 
 export const DEFAULT_MESSAGE_SETTINGS: MessageSettings = {
@@ -121,6 +128,7 @@ export const DEFAULT_MESSAGE_SETTINGS: MessageSettings = {
   callBack: false,
   callBackFilter: 'answered',
   callBackLine: '',
+  country: '',
 };
 
 export interface Settings {

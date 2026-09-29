@@ -9,8 +9,8 @@
  * refusal waits and tries again later.
  */
 import type { Desktop, DesktopEvent } from './desktop/bridge';
+import { isHidden, samePerson, toE164 } from './phoneNumbers';
 import type { MessageSettings } from './settings';
-import { sameNumber } from './sessions';
 import type { OpenProject } from './vfs/projects';
 
 export interface Callback {
@@ -55,14 +55,22 @@ const CALLING_MS = 10 * 60_000;
 /** Missed calls older than this are not called back. */
 const TOO_OLD_MS = 24 * 60 * 60_000;
 
-/** Whether `number` is one the filter calls back (given Aokie's screening). */
+/**
+ * Whether a blocked list (one number a line, or with commas) has `number`: as
+ * Aokie matches it (the last nine digits, of six or more), or as the same
+ * person however either is written (phoneNumbers.ts). Either one blocks it.
+ */
+export function isBlocked(number: string, blockedNumbers: string): boolean {
+  const suffix = (n: string) => n.replace(/\D/g, '').slice(-9);
+  const entries = blockedNumbers.split(/[,;\n]/).map((b) => b.trim()).filter(Boolean);
+  return entries.some((b) => (suffix(b).length >= 6 && suffix(b) === suffix(number)) || samePerson(b, number));
+}
+
+/** Whether `number` is one the filter calls back (given Aokie's screening). Never a hidden or blocked one. */
 export function callsBack(number: string, filter: CallBackFilter, screening: Screening | null): boolean {
   const digits = number.replace(/\D/g, '');
-  if (digits.length < 6) return false;
-  // Aokie's rule: a blocked number is its last nine digits, and needs six or more.
-  const suffix = (n: string) => n.replace(/\D/g, '').slice(-9);
-  const blocked = (screening?.blockedNumbers ?? '').split(/[,;\n]/).map(suffix).filter((b) => b.length >= 6);
-  if (blocked.includes(suffix(number))) return false;
+  if (digits.length < 6 || isHidden(number)) return false;
+  if (isBlocked(number, screening?.blockedNumbers ?? '')) return false;
   const matches = (pattern: string) => {
     try {
       return new RegExp(pattern).test(number.trim());
@@ -70,7 +78,8 @@ export function callsBack(number: string, filter: CallBackFilter, screening: Scr
       return true;
     }
   };
-  if (filter === 'au') return matches(AU_PATTERN);
+  // Australian: as Aokie's pattern reads the caller id, or an Australian number however it is written ("0011 61…").
+  if (filter === 'au') return matches(AU_PATTERN) || !!toE164(number, 'AU')?.startsWith('+61');
   if (filter === 'answered' && screening?.acceptPattern.trim()) return matches(screening.acceptPattern.trim());
   return true;
 }
@@ -129,7 +138,7 @@ export class Callbacks {
 
   /** The call back ringing `number` now, if one is. */
   calling(number: string): Callback | undefined {
-    return this.list.find((c) => c.state === 'calling' && sameNumber(c.number, number));
+    return this.list.find((c) => c.state === 'calling' && samePerson(c.number, number));
   }
 
   /** An event from the desktop: a missed call is kept; a call that got through, or a text, settles it; a call back's end is noted. */
@@ -153,7 +162,7 @@ export class Callbacks {
 
   /** A call from `number` was missed: it is called back once the receptionist is free. */
   async missed(number: string, at = Date.now(), queued = false): Promise<void> {
-    const open = this.open.find((c) => sameNumber(c.number, number));
+    const open = this.open.find((c) => samePerson(c.number, number));
     if (open) {
       open.missedAt = at;
       if (queued) open.queued = true;
@@ -164,7 +173,7 @@ export class Callbacks {
 
   /** They got through another way: no call back. */
   async settle(number: string, why: string): Promise<void> {
-    const open = this.open.filter((c) => c.state === 'waiting' && sameNumber(c.number, number));
+    const open = this.open.filter((c) => c.state === 'waiting' && samePerson(c.number, number));
     if (!open.length) return;
     for (const c of open) Object.assign(c, { state: 'done', note: why });
     await this.save();
