@@ -8,7 +8,9 @@
 
 use crate::util::{bool_or, int_or, str_or};
 use oaiy_engine::json::Json;
+use std::io::Write as _;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 
 pub const FILE_NAME: &str = "oaiy-studio.json";
 
@@ -283,11 +285,55 @@ pub fn load(path: &Path) -> Result<Json, String> {
     Ok(v)
 }
 
-/// Write atomically: a temporary file beside it, then a rename.
+/// Write atomically: a new file beside it, then a rename.
+///
+/// The file holds secrets (`gateway.api_key` and `downloads.hf_token`), so on unix the new file is
+/// created owner-only (mode 0600) by the call that creates it, and the rename carries that to the
+/// real file: nothing is written to a file the whole machine can read and narrowed afterwards. On
+/// Windows there is no mode to set, and the file keeps the access rights of the folder it is in.
+///
+/// The name is this process's own (`.<file>.<pid>-<n>.tmp`), so two savers cannot share one. A name
+/// that is taken (the leftover of a killed process) is skipped, never reused, and `create_new` refuses
+/// to follow a link put there. The file is removed again if the save fails.
 pub fn save(path: &Path, v: &Json) -> Result<(), String> {
-    let tmp = path.with_extension("json.tmp");
-    std::fs::write(&tmp, pretty(v, 0)).map_err(|e| format!("{}: {e}", tmp.display()))?;
-    std::fs::rename(&tmp, path).map_err(|e| format!("{}: {e}", path.display()))
+    let dir = path.parent().filter(|d| !d.as_os_str().is_empty()).unwrap_or(Path::new("."));
+    let name = path.file_name().ok_or_else(|| format!("{}: no file name", path.display()))?.to_string_lossy().into_owned();
+    let (tmp, mut file) = create_private(dir, &name)?;
+    let staged = file.write_all(pretty(v, 0).as_bytes()).and_then(|()| file.sync_all());
+    drop(file);
+    let saved = staged
+        .map_err(|e| format!("{}: {e}", tmp.display()))
+        .and_then(|()| std::fs::rename(&tmp, path).map_err(|e| format!("{}: {e}", path.display())));
+    if saved.is_err() {
+        let _ = std::fs::remove_file(&tmp);
+    }
+    saved
+}
+
+/// A new file in `dir` for a save of `name`, readable and writable by its owner only (unix).
+fn create_private(dir: &Path, name: &str) -> Result<(PathBuf, std::fs::File), String> {
+    static STAGED: AtomicU64 = AtomicU64::new(0);
+    create_private_numbered(dir, name, || STAGED.fetch_add(1, Ordering::Relaxed))
+}
+
+/// [`create_private`] with the numbers for the names from `next`, which the tests choose.
+fn create_private_numbered(dir: &Path, name: &str, mut next: impl FnMut() -> u64) -> Result<(PathBuf, std::fs::File), String> {
+    let mut options = std::fs::OpenOptions::new();
+    options.write(true).create_new(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600);
+    }
+    for _ in 0..32 {
+        let tmp = dir.join(format!(".{name}.{}-{}.tmp", std::process::id(), next()));
+        match options.open(&tmp) {
+            Ok(file) => return Ok((tmp, file)),
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => continue,
+            Err(e) => return Err(format!("{}: {e}", tmp.display())),
+        }
+    }
+    Err(format!("{}: every name for a temporary file is taken", dir.display()))
 }
 
 /// Indented JSON, so the file stays pleasant to edit by hand.
@@ -702,5 +748,118 @@ mod tests {
         assert_eq!(resolve(root, abs.to_str().unwrap()), abs);
         assert_eq!(program(root, "bin/worker"), root.join("bin/worker"));
         assert_eq!(program(root, "surely-not-installed"), PathBuf::from("surely-not-installed"));
+    }
+
+    /// A folder of the test's own under the temp folder, removed when the test ends.
+    struct Scratch(PathBuf);
+
+    impl Scratch {
+        fn new(tag: &str) -> Self {
+            static N: AtomicU64 = AtomicU64::new(0);
+            let dir = std::env::temp_dir().join(format!("oaiy-studio-config-{tag}-{}-{}", std::process::id(), N.fetch_add(1, Ordering::Relaxed)));
+            let _ = std::fs::remove_dir_all(&dir);
+            std::fs::create_dir_all(&dir).unwrap();
+            Scratch(dir)
+        }
+    }
+
+    impl Drop for Scratch {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    /// Everything in `dir`, by name.
+    fn names(dir: &Path) -> Vec<String> {
+        let mut names: Vec<String> = std::fs::read_dir(dir).unwrap().map(|e| e.unwrap().file_name().to_string_lossy().into_owned()).collect();
+        names.sort();
+        names
+    }
+
+    /// The permission bits of `path`.
+    #[cfg(unix)]
+    fn mode(path: &Path) -> u32 {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::metadata(path).unwrap().permissions().mode() & 0o777
+    }
+
+    #[test]
+    fn the_configuration_and_the_secrets_in_it_are_saved_whole_and_owner_only() {
+        let dir = Scratch::new("private");
+        let path = dir.0.join(FILE_NAME);
+        // Loading a file that is not there makes it, from the defaults.
+        let mut v = load(&path).unwrap();
+        #[cfg(unix)]
+        assert_eq!(mode(&path), 0o600, "the file made by load");
+
+        *field(&mut v, &["downloads", "hf_token"]) = Json::str("hf_test_token");
+        *field(&mut v, &["gateway", "api_key"]) = Json::str("gateway-test-key");
+        save(&path, &v).unwrap();
+        #[cfg(unix)]
+        assert_eq!(mode(&path), 0o600, "the file made by save");
+
+        let back = load(&path).unwrap();
+        assert_eq!(back.get("downloads").and_then(|d| d.get("hf_token")).and_then(Json::as_str), Some("hf_test_token"));
+        assert_eq!(back.get("gateway").and_then(|g| g.get("api_key")).and_then(Json::as_str), Some("gateway-test-key"));
+        assert_eq!(names(&dir.0), [FILE_NAME], "no temporary file is left beside it");
+    }
+
+    /// A file an older build wrote readable by everyone is replaced by a private one, not changed in place.
+    #[cfg(unix)]
+    #[test]
+    fn a_configuration_left_readable_by_everyone_is_replaced_by_a_private_one() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = Scratch::new("loose");
+        let path = dir.0.join(FILE_NAME);
+        std::fs::write(&path, pretty(&default_json(), 0)).unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644)).unwrap();
+        save(&path, &default_json()).unwrap();
+        assert_eq!(mode(&path), 0o600);
+        assert_eq!(names(&dir.0), [FILE_NAME]);
+    }
+
+    /// The point of it: at the first moment the file exists it is already private.
+    #[cfg(unix)]
+    #[test]
+    fn the_new_file_is_private_from_the_moment_it_exists() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = Scratch::new("window");
+        let (tmp, file) = create_private(&dir.0, FILE_NAME).unwrap();
+        let meta = file.metadata().unwrap();
+        assert_eq!(meta.len(), 0, "nothing has been written to it yet");
+        assert_eq!(meta.permissions().mode() & 0o777, 0o600);
+        assert_eq!(tmp.parent(), Some(dir.0.as_path()), "beside the real file, so the rename stays on one filesystem");
+    }
+
+    /// A leftover of a killed process, or a link somebody put there, is not this save's to use.
+    #[test]
+    fn a_temporary_name_that_is_taken_is_skipped_and_left_alone() {
+        let dir = Scratch::new("taken");
+        let staged = |n: u64| format!(".{FILE_NAME}.{}-{n}.tmp", std::process::id());
+        std::fs::write(dir.0.join(staged(100)), "a leftover").unwrap();
+        #[cfg(unix)]
+        {
+            let victim = dir.0.join("victim");
+            std::fs::write(&victim, "not to be overwritten").unwrap();
+            std::os::unix::fs::symlink(&victim, dir.0.join(staged(101))).unwrap();
+        }
+        #[cfg(not(unix))]
+        std::fs::write(dir.0.join(staged(101)), "another leftover").unwrap();
+
+        let mut numbers = 100..;
+        let (tmp, _file) = create_private_numbered(&dir.0, FILE_NAME, || numbers.next().unwrap()).unwrap();
+        assert_eq!(tmp, dir.0.join(staged(102)));
+        assert_eq!(std::fs::read_to_string(dir.0.join(staged(100))).unwrap(), "a leftover");
+        #[cfg(unix)]
+        assert_eq!(std::fs::read_to_string(dir.0.join("victim")).unwrap(), "not to be overwritten");
+
+        // Every name taken: the save fails rather than write anywhere else.
+        let mut all = 0..;
+        let full = Scratch::new("full");
+        for n in 0..32 {
+            std::fs::write(full.0.join(format!(".{FILE_NAME}.{}-{n}.tmp", std::process::id())), "x").unwrap();
+        }
+        assert!(create_private_numbered(&full.0, FILE_NAME, || all.next().unwrap()).is_err());
+        assert_eq!(all.next(), Some(32), "and it tried no more than 32");
     }
 }

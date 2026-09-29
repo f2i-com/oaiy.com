@@ -75,7 +75,9 @@ fn start_with(data_dir: &Path, m: Mode) -> Result<String, String> {
     }
     let config = config_path(data_dir);
     if let Some(dir) = config.parent() {
-        std::fs::create_dir_all(dir).map_err(|e| format!("could not make {}: {e}", dir.display()))?;
+        // The studio's configuration holds its gateway key and the Hugging Face token: where
+        // this makes the folder it is owner-only (unix), and the studio saves the file the same.
+        crate::secret_file::create_private_dir(dir).map_err(|e| format!("could not make {}: {e}", dir.display()))?;
     }
     if let Some(programs) = programs_dir() {
         if oaiy_studio::use_programs_from(&config, &programs)? {
