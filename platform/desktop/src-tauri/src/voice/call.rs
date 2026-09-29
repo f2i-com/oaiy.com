@@ -630,6 +630,8 @@ where
                                 let (from, name) = hub.caller_of(&ids.call).unwrap_or_default();
                                 let from = if from.trim().is_empty() { start_from.clone() } else { from };
                                 let name = if name.trim().is_empty() { start_name.clone() } else { name };
+                                // A contact from now on, with this as the number last seen (never a hidden caller).
+                                super::contacts::saw(&from);
                                 // Greeted by name when we know it: the name kept for their number, else the phone's.
                                 let known = super::callers::name_of(&from).or_else(|| super::callers::looks_like_name(&name).then(|| name.trim().to_string())).unwrap_or_default();
                                 greeting = super::callers::personal_greeting(&greeting, &known);

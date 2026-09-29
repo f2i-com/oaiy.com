@@ -983,11 +983,18 @@ fn is_setup_path(path: &str) -> bool {
     path == "/api/setup" || path.starts_with("/api/setup/")
 }
 
-/// Calls, the calendar and flows' tasks for the agent: callers' numbers and words, customers' names and
-/// appointments, what a flow asks. Reading them is a restricted read; changing them (speaking on
-/// a live call, booking or deleting an appointment) takes the privileged gate.
+/// Calls, the calendar, the contacts and flows' tasks for the agent: callers' numbers and words,
+/// customers' names and appointments, the person's notes about the people who ring and what the
+/// receptionist remembered, what a flow asks. Reading them is a restricted read; changing them
+/// (speaking on a live call, booking or deleting an appointment, naming or importing contacts)
+/// takes the privileged gate.
 fn is_personal_path(path: &str) -> bool {
-    path.starts_with("/api/voice/") || path == "/api/calendar" || path.starts_with("/api/calendar/") || path.starts_with("/api/agent/")
+    path.starts_with("/api/voice/")
+        || path == "/api/calendar"
+        || path.starts_with("/api/calendar/")
+        || path == "/api/contacts"
+        || path.starts_with("/api/contacts/")
+        || path.starts_with("/api/agent/")
 }
 
 /// Bridge + plugin routes that EXECUTE code, cause physical side effects, or
@@ -1433,7 +1440,8 @@ pub async fn serve(
     if let Ok(dir) = registry.lock().map(|r| r.data_dir().to_path_buf()) {
         crate::calendar::init(&dir);
         crate::voice::voices::init(&dir);
-        crate::voice::callers::init(&dir);
+        // The contacts (and the names callers are greeted by): the older names file is upgraded now.
+        crate::voice::contacts::init(&dir);
     }
     // The Agent's control API: its switch and its log live in the data folder too.
     let control = crate::control::Control::new(
@@ -1544,6 +1552,7 @@ pub async fn serve(
         // would leave them ungated — reachable by any web page the user has open.
         .merge(bridge_routes)
         .merge(voice_routes)
+        .merge(crate::voice::contacts::routes::router(crate::voice::contacts::shared()))
         .merge(crate::calendar::routes::router())
         .merge(crate::modules::routes::router())
         .merge(crate::agent_tasks::router())
@@ -1734,6 +1743,26 @@ mod tests {
         assert!(is_privileged_path(&Method::POST, "/api/bridge/runs"));
         // Reading history stays a restricted read, not a privileged one.
         assert!(is_restricted_read_path("/api/bridge/runs"));
+    }
+
+    #[test]
+    fn the_contacts_are_restricted_reads_and_their_changes_privileged() {
+        // The person's notes about the people who ring, and what the
+        // receptionist remembered: gated like the calls and the calendar.
+        for path in ["/api/contacts", "/api/contacts/0491570006", "/api/contacts/export.csv", "/api/contacts/%2B61491570006"] {
+            assert!(is_restricted_read_path(path), "{path} must be a restricted read");
+        }
+        for (m, path) in [
+            (Method::PUT, "/api/contacts/0491570006"),
+            (Method::DELETE, "/api/contacts/0491570006"),
+            (Method::POST, "/api/contacts/0491570006/facts"),
+            (Method::DELETE, "/api/contacts/0491570006/facts/0"),
+            (Method::POST, "/api/contacts/import"),
+        ] {
+            assert!(is_privileged_path(&m, path), "{m} {path} must be privileged");
+        }
+        assert!(!is_restricted_read_path("/api/contactsx"));
+        assert!(!is_privileged_path(&Method::POST, "/api/contacts-elsewhere"));
     }
 
     #[test]

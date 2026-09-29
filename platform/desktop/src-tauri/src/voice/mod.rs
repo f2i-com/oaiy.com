@@ -14,6 +14,7 @@
 pub mod audio;
 pub mod call;
 pub mod callers;
+pub mod contacts;
 pub mod engines;
 pub mod voices;
 
@@ -129,8 +130,10 @@ impl VoiceHub {
 /// `GET /api/voice/events` (server-sent events: `call.started`, `call.caller`,
 /// `call.said`, `call.speech_started`, `call.interrupted`, `call.error`,
 /// `call.ended`), `GET /api/voice/calls`, and per call `say`, `tool`, `finish`, `hush`.
-/// `PUT /api/voice/callers` keeps the name a caller is greeted by. These are the
-/// phone's: while no plugin provides the phone they answer `module_disabled`.
+/// `PUT /api/voice/callers` keeps the name a caller is greeted by (the
+/// receptionist's: never over a name the person set in Contacts, see
+/// [`contacts`]). These are the phone's: while no plugin provides the phone
+/// they answer `module_disabled`.
 /// Speech to text and the voices are core (the agent's own tools use them), and
 /// kept with the voices, `GET`/`PUT /api/voice/settings` is how long a call's
 /// greeting waits after the call connects (`greetingDelayMs`, also in `GET /api/voice/voices`).
