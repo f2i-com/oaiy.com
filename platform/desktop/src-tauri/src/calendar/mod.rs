@@ -52,6 +52,10 @@ pub struct Settings {
     /// The business's name, as the receptionist says it.
     #[serde(default)]
     pub business: String,
+    /// The name the receptionist calls itself on calls and texts. Empty: the
+    /// phone's own name for it (see `receptionist_name`).
+    #[serde(default)]
+    pub receptionist: String,
     /// Seven days, Monday first, each with its opening spans (none: closed).
     pub hours: Vec<Vec<Span>>,
     pub services: Vec<Service>,
@@ -70,12 +74,30 @@ impl Default for Settings {
         let day = |open: &str, close: &str| vec![Span { open: open.into(), close: close.into() }];
         Self {
             business: String::new(),
+            receptionist: String::new(),
             hours: vec![day("09:00", "17:00"), day("09:00", "17:00"), day("09:00", "17:00"), day("09:00", "17:00"), day("09:00", "17:00"), vec![], vec![]],
             services: vec![Service { id: "appointment".into(), name: "Appointment".into(), minutes: 30, description: String::new(), price: String::new() }],
             slot_minutes: 30,
             notice_minutes: 60,
             horizon_days: 30,
             text_confirmations: true,
+        }
+    }
+}
+
+/// What the receptionist is called while no name is set: the phone's
+/// (Aokie's) own name for it.
+pub const DEFAULT_RECEPTIONIST: &str = "Aokie";
+
+/// The longest name the receptionist may be given, in characters.
+pub const RECEPTIONIST_MAX_CHARS: usize = 40;
+
+impl Settings {
+    /// The name the receptionist calls itself: the one set, or Aokie's.
+    pub fn receptionist_name(&self) -> &str {
+        match self.receptionist.trim() {
+            "" => DEFAULT_RECEPTIONIST,
+            name => name,
         }
     }
 }
@@ -502,8 +524,13 @@ impl Calendar {
         self.book.lock().map(|b| b.settings.clone()).unwrap_or_default()
     }
 
-    /// Replace the settings, checked: seven days of `HH:MM` spans, services with a length.
+    /// Replace the settings, checked: seven days of `HH:MM` spans, services
+    /// with a length, and a receptionist's name of at most 40 characters.
     pub fn set_settings(&self, mut s: Settings) -> Result<Settings, String> {
+        s.receptionist = s.receptionist.trim().to_string();
+        if s.receptionist.chars().count() > RECEPTIONIST_MAX_CHARS {
+            return Err(format!("the receptionist's name is at most {RECEPTIONIST_MAX_CHARS} characters"));
+        }
         if s.hours.len() != 7 {
             return Err("hours needs seven days, Monday first".into());
         }
@@ -690,18 +717,18 @@ impl Calendar {
         self.flows_dir.as_ref().is_some_and(|d| d.join(format!("{id}.json")).is_file())
     }
 
-    /// What the receptionist is told when it looks something up: the hours,
-    /// the services, the free times and the caller's own appointments. Plain
-    /// sentences, since a model reads them and a person may hear them.
+    /// What the receptionist is told when it looks something up: who it is
+    /// and for whom, the hours, the services, the free times and the caller's
+    /// own appointments. Plain sentences, since a model reads them and a
+    /// person may hear them.
     pub fn lookup(&self, question: &str, from: &str, now: NaiveDateTime) -> String {
         let settings = self.settings();
         let mut out = Vec::new();
-        out.push(format!(
-            "{}Now: {}, {}.",
-            if settings.business.trim().is_empty() { String::new() } else { format!("Business: {}. ", settings.business.trim()) },
-            now.date().format("%A %-d %B %Y"),
-            say_time(now.time())
-        ));
+        let who = match settings.business.trim() {
+            "" => format!("You are {}, the receptionist.", settings.receptionist_name()),
+            business => format!("Business: {business}. You are {}, its receptionist.", settings.receptionist_name()),
+        };
+        out.push(format!("{who} Now: {}, {}.", now.date().format("%A %-d %B %Y"), say_time(now.time())));
         const DAYS: [&str; 7] = ["Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun"];
         let hours: Vec<String> = settings
             .hours
@@ -909,8 +936,8 @@ mod tests {
         cal.set_settings(s).unwrap();
         cal.record_request(&json!({"requestId": "r1", "from": "+61491570006", "callerName": "Lance", "service": "Lawn mowing", "date": "2026-10-01", "time": "10:00"})).unwrap();
         let digest = cal.lookup("Any times for lawn mowing this week?", "0491570006", at("2026-09-28T08:00"));
-        assert!(digest.contains("Business: Green Lawns."), "{digest}");
-        assert!(digest.contains("Now: Monday 28 September 2026, 8 am."), "{digest}");
+        // Who it speaks for and who it is, first: no name set, it is Aokie.
+        assert_eq!(digest.lines().next(), Some("Business: Green Lawns. You are Aokie, its receptionist. Now: Monday 28 September 2026, 8 am."), "{digest}");
         assert!(digest.contains("Mon 9 am to 5 pm"), "{digest}");
         assert!(digest.contains("Sat closed"), "{digest}");
         assert!(digest.contains("Lawn mowing (60 min, from $60)"), "{digest}");
@@ -924,6 +951,41 @@ mod tests {
         assert!(digest.contains("Never tell the caller about other bookings"), "{digest}");
         assert!(!digest.contains("and 6 more"), "every free time is in a range, none cut off: {digest}");
         assert!(digest.contains("This caller's appointments: Thu 1 Oct at 10 am, Lawn mowing (requested, not yet confirmed)."), "{digest}");
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn the_receptionist_is_aokie_until_it_is_named() {
+        let (cal, dir) = calendar();
+        assert_eq!(Settings::default().receptionist_name(), "Aokie");
+        let saved = cal.settings();
+        assert_eq!((saved.receptionist.as_str(), saved.receptionist_name()), ("", "Aokie"));
+        // Only spaces is no name.
+        assert_eq!(Settings { receptionist: "   ".into(), ..Settings::default() }.receptionist_name(), "Aokie");
+
+        // Named: kept trimmed, and the lookup says it (with no business named yet).
+        let mut s = cal.settings();
+        s.receptionist = "  Sam  ".into();
+        let saved = cal.set_settings(s).unwrap();
+        assert_eq!((saved.receptionist.as_str(), saved.receptionist_name()), ("Sam", "Sam"));
+        let digest = cal.lookup("", "", at("2026-09-28T08:00"));
+        assert_eq!(digest.lines().next(), Some("You are Sam, the receptionist. Now: Monday 28 September 2026, 8 am."), "{digest}");
+        // It survives a restart.
+        assert_eq!(Calendar::open(&dir, None).settings().receptionist, "Sam");
+
+        // At most 40 characters (counted as characters, not bytes); a longer one is refused and nothing changes.
+        let mut s = cal.settings();
+        s.receptionist = "é".repeat(40);
+        assert_eq!(cal.set_settings(s).unwrap().receptionist.chars().count(), 40);
+        let mut s = cal.settings();
+        s.receptionist = "A".repeat(41);
+        assert_eq!(cal.set_settings(s).unwrap_err(), "the receptionist's name is at most 40 characters");
+        assert_eq!(cal.settings().receptionist, "é".repeat(40));
+
+        // A calendar saved before the name existed loads with none: Aokie.
+        let old: Settings = serde_json::from_value(json!({"business": "Green Lawns", "hours": [[], [], [], [], [], [], []], "services": [], "slotMinutes": 30, "noticeMinutes": 60, "horizonDays": 30, "textConfirmations": true})).unwrap();
+        assert_eq!((old.receptionist.as_str(), old.receptionist_name()), ("", "Aokie"));
+        assert_eq!(serde_json::to_value(&old).unwrap()["receptionist"], "", "sent to the dashboard as receptionist");
         let _ = std::fs::remove_dir_all(dir);
     }
 

@@ -250,12 +250,13 @@ pub(crate) fn defs() -> &'static [ToolDef] {
                 object(json!({ "id": flow_id() }), &["id"])),
             // Calendar
             def("calendar_settings_get", "Calendar settings", Read,
-                "The calendar's settings: business (its name), hours (seven days, Monday first, each a list of {open, close} like 09:00), services ({id, name, minutes, description, price}), slotMinutes, noticeMinutes, horizonDays, textConfirmations; available says whether a plugin provides the calendar.",
+                "The calendar's settings: business (its name), receptionist (the name the receptionist calls itself on calls and texts; empty means Aokie, and receptionistName is the name it goes by either way), hours (seven days, Monday first, each a list of {open, close} like 09:00), services ({id, name, minutes, description, price}), slotMinutes, noticeMinutes, horizonDays, textConfirmations; available says whether a plugin provides the calendar.",
                 none()),
             def("calendar_settings_set", "Change calendar settings", Change,
                 "Change the calendar's settings: only the fields given change, in the shapes calendar_settings_get shows (hours: seven days, Monday first). Needs a plugin that provides the calendar.",
                 object(json!({
                     "business": { "type": "string", "description": "The business's name, as the receptionist says it." },
+                    "receptionist": { "type": "string", "maxLength": 40, "description": "The name the receptionist calls itself on calls and texts; empty for Aokie's own name (Aokie)." },
                     "hours": { "type": "array", "description": "Seven days, Monday first, each a list of {open, close} (HH:MM); an empty list is closed." },
                     "services": { "type": "array", "description": "The services booked: {id, name, minutes, description, price}." },
                     "slotMinutes": { "type": "integer", "minimum": 1, "description": "The step between the times offered." },
@@ -685,7 +686,7 @@ async fn run(d: &Desk, control: &Control, name: &str, a: &Args<'_>) -> Result<Do
         }
         "calendar_settings_get" => {
             let v = d.get("/api/calendar").await?;
-            data(json!({ "available": v.get("available"), "settings": v.get("settings") }))
+            data(json!({ "available": v.get("available"), "receptionistName": v.get("receptionistName"), "settings": v.get("settings") }))
         }
         "calendar_settings_set" => calendar_settings_set(d, a).await,
         "contacts_list" => contacts_list(d, a.str("q")).await,
@@ -1758,7 +1759,7 @@ async fn flow_run(d: &Desk, id: &str, input: Option<Value>, wait: bool, timeout_
 // ---------------------------------------------------------------------------
 
 async fn calendar_settings_set(d: &Desk, a: &Args<'_>) -> Result<Done, String> {
-    const FIELDS: [&str; 7] = ["business", "hours", "services", "slotMinutes", "noticeMinutes", "horizonDays", "textConfirmations"];
+    const FIELDS: [&str; 8] = ["business", "receptionist", "hours", "services", "slotMinutes", "noticeMinutes", "horizonDays", "textConfirmations"];
     let given: Vec<&str> = FIELDS.iter().copied().filter(|k| a.value(k).is_some()).collect();
     if given.is_empty() {
         return Err(format!("Give at least one of {} to change.", FIELDS.join(", ")));

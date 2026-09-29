@@ -608,6 +608,40 @@ async fn the_contact_tools_read_and_change_the_contacts_through_the_desktops_rou
     assert_eq!(log, want);
 }
 
+#[tokio::test]
+async fn the_calendar_settings_tools_carry_the_receptionists_name() {
+    let sb = Sandbox::new("calendar");
+    // The desktop's one calendar (another test may have opened it first: either will do, as only
+    // the receptionist's name is looked at, and it is put back as it was).
+    crate::calendar::init(&sb.0);
+    let _on = crate::modules::test_gate::enable(&[crate::modules::CALENDAR]);
+    let (_, app) = control_with(&sb, Some(crate::calendar::routes::router()), None);
+    let get = || call(&app, None, "calendar_settings_get", json!({}));
+    let before = get().await["structuredContent"]["settings"]["receptionist"].clone();
+
+    // Only the name changes; the calendar keeps it trimmed, and says the name it goes by.
+    let r = call(&app, None, "calendar_settings_set", json!({ "receptionist": "  Sam " })).await;
+    assert!(!is_error(&r), "{r}");
+    assert_eq!(text(&r).lines().next(), Some("Saved the calendar's receptionist."), "{r}");
+    assert_eq!(r["structuredContent"]["settings"]["receptionist"], "Sam", "{r}");
+    let r = get().await;
+    assert_eq!((&r["structuredContent"]["settings"]["receptionist"], &r["structuredContent"]["receptionistName"]), (&json!("Sam"), &json!("Sam")), "{r}");
+
+    // Longer than 40 characters: refused in the calendar's own words, and nothing changes.
+    let r = call(&app, None, "calendar_settings_set", json!({ "receptionist": "A".repeat(41) })).await;
+    assert!(is_error(&r) && text(&r).contains("at most 40 characters"), "{r}");
+    assert_eq!(get().await["structuredContent"]["settings"]["receptionist"], "Sam");
+
+    // Emptied: Aokie again.
+    let r = call(&app, None, "calendar_settings_set", json!({ "receptionist": "" })).await;
+    assert!(!is_error(&r), "{r}");
+    let r = get().await;
+    assert_eq!((&r["structuredContent"]["settings"]["receptionist"], &r["structuredContent"]["receptionistName"]), (&json!(""), &json!("Aokie")), "{r}");
+
+    let r = call(&app, None, "calendar_settings_set", json!({ "receptionist": before })).await;
+    assert!(!is_error(&r), "{r}");
+}
+
 // ---------------------------------------------------------------------------
 // Showing a page
 // ---------------------------------------------------------------------------

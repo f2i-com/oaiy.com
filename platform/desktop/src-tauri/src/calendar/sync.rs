@@ -6,8 +6,9 @@
 //! `appointments` form (answers `caller_name`, `service`, `date`, `time`,
 //! `status`, `phone`, `call_id`, `request_id`, `source`, `notes`), reached with
 //! the link's key: `GET /api/v1/app-logic` names the form, `GET/POST/PUT/DELETE
-//! /api/v1/forms/{form}/responses[/{id}]` read and write its records. Hours,
-//! services and lengths are the desktop's alone (FormLogic has none).
+//! /api/v1/forms/{form}/responses[/{id}]` read and write its records. The
+//! settings (the business's and the receptionist's names, hours, services and
+//! lengths) are the desktop's alone: FormLogic has no place for them.
 //!
 //! A sync runs every minute, a moment after a change here, and when asked
 //! (`POST /api/calendar/sync`):

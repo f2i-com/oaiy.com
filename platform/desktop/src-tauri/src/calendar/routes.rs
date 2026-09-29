@@ -1,7 +1,10 @@
 //! The calendar over HTTP, for the OAIY window (the Calendar page) and the
 //! agent's calendar tools:
 //!
-//!   GET    /api/calendar?from=YYYY-MM-DD&to=YYYY-MM-DD   → {settings, appointments, now}
+//!   GET    /api/calendar?from=YYYY-MM-DD&to=YYYY-MM-DD   → {settings, appointments, now,
+//!                                                            receptionistName}: the name the
+//!                                                            receptionist goes by (settings'
+//!                                                            `receptionist`, or Aokie's when empty)
 //!   PUT    /api/calendar/settings                          → the settings, checked
 //!   GET    /api/calendar/free?from=&days=&service=&minutes= → {days: [{date, times}]}
 //!   POST   /api/calendar/appointments                      → the new appointment (201)
@@ -96,7 +99,15 @@ async fn overview(Query(r): Query<Range>) -> Response {
         (Ok(f), Ok(t)) => (f, t),
         (Err(e), _) | (_, Err(e)) => return e,
     };
-    Json(json!({"available": super::available(), "settings": cal.settings(), "appointments": cal.list(from, to), "now": local_now().format("%Y-%m-%dT%H:%M").to_string()})).into_response()
+    let settings = cal.settings();
+    Json(json!({
+        "available": super::available(),
+        "receptionistName": settings.receptionist_name(),
+        "settings": settings,
+        "appointments": cal.list(from, to),
+        "now": local_now().format("%Y-%m-%dT%H:%M").to_string(),
+    }))
+    .into_response()
 }
 
 async fn set_settings(Json(s): Json<Settings>) -> Response {
