@@ -1732,9 +1732,10 @@ With that done, Settings → Images, video and audio → Find OAIY sets it up.`)
           ...(t.lastWay ? { lastWay: t.lastWay } : {}),
           ...(t.kind === 'person' ? { to: t.live || t.hidden ? ('call' as const) : ('sms' as const) } : {}),
           ...(t.hidden ? { hidden: true } : {}),
+          ...(listed ? { outreach: `Outreach · ${personState(listed.c, listed.p).words}` } : {}),
           status: t.live ? (listed ? `On a call now · Outreach · ${listed.c.name}` : 'On a call now') : t.running ? 'Working…' : onList || `${what} · ${since(t.lastAt)}`,
           label: t.key === TEST_NUMBER ? '💬 Test' : `${t.kind === 'task' ? '🔀' : t.lastWay === 'sms' ? '💬' : '📞'} ${t.title}`,
-          title: t.kind === 'task' ? `The tasks your flow "${t.title}" gives the agent` : `${t.live ? 'On a call with' : `${what} with`} ${t.title}${t.title !== t.key && !t.hidden ? ` (${displayNumber(t.key)})` : ''}`,
+          title: t.kind === 'task' ? `The tasks your flow "${t.title}" gives the agent` : `${t.live ? 'On a call with' : `${what} with`} ${t.title}${t.title !== t.key && !t.hidden ? ` (${displayNumber(t.key)})` : ''}${listed ? `, on the outreach "${listed.c.name}"` : ''}`,
           unread: t.id === viewing ? 0 : t.unread,
           working: t.running,
           // A finished conversation can go (not one that is working, or a live call).

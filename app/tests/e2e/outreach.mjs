@@ -481,6 +481,14 @@ try {
   });
   await shoot(page, 'chip', { clip: header(page) });
 
+  await check('the picker says where each person is on the list', async () => {
+    await page.evaluate(() => document.querySelector('.chat .combo-button')?.click());
+    await wait(250);
+    const people = await page.evaluate(() => [...document.querySelectorAll('.chat .combo-option')].map((o) => `${o.querySelector('.combo-name')?.textContent} | ${o.querySelector('.combo-detail')?.textContent}`));
+    await page.keyboard.press('Escape');
+    expect(people.includes('Jane Smith | 0412 345 678 · Outreach · completed') && people.some((p) => /^Cara Lee \| 0414 222 333 · Outreach · again at/.test(p)), JSON.stringify(people));
+  });
+
   await check('the retries: #2 rung again (key :2) and not answered, #3 a voicemail again; then the report reaches the runner, with the results in the Front desk', async () => {
     await tick(page, 31 * 60_000);
     await until('the retry of #2', () => dials().length === 4);
