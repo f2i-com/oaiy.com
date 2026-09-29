@@ -2470,6 +2470,13 @@ mod tests {
         assert_eq!(own.status(), 404);
         let import = client.get(format!("{base}/api/backup/agent-import")).header("Origin", "http://oaiy.localhost").send().await.unwrap();
         assert_eq!(import.status(), 200);
+        // A paired or configured token, and the linked provider's own site, pass the guard but are not the Agent's page.
+        let token_only = client.get(format!("{base}/api/backup/agent-import")).bearer_auth("desk-token").send().await.unwrap();
+        assert_eq!(token_only.status(), 403, "a token with no origin");
+        let token_post = client.post(format!("{base}/api/backup/agent/abc/part?seq=0")).bearer_auth("desk-token").body("x").send().await.unwrap();
+        assert_eq!(token_post.status(), 403);
+        let provider = client.get(format!("{base}/api/backup/agent-import")).header("Origin", "https://oaiy.com").send().await.unwrap();
+        assert_eq!(provider.status(), 403, "the provider's site");
         // The dashboard reads the status.
         let status = client.get(format!("{base}/api/backup/status")).header("Origin", "http://tauri.localhost").send().await.unwrap();
         assert_eq!(status.status(), 200);

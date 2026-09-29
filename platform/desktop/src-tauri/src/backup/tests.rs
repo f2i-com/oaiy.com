@@ -947,6 +947,55 @@ fn undo_puts_back_what_was_replaced_and_takes_away_what_was_added() {
     assert!(matches!(restore::apply_pending(&dst.0), ApplyOutcome::None));
 }
 
+/// Restore a backup onto a folder that has files of its own, then stage the undo: returns the folder
+/// as it was before, as it is after the restore, and the folder itself.
+fn restored_and_undo_staged() -> (TempDir, BTreeMap<String, Vec<u8>>, BTreeMap<String, Vec<u8>>) {
+    let src = TempDir::new("undo-fail-src");
+    realistic(&src.0, "A");
+    let out = TempDir::new("undo-fail-out");
+    let file = out.0.join("u.oaiybackup");
+    make(&src.0, &file);
+    let dst = TempDir::new("undo-fail-dst");
+    target(&dst.0);
+    let before = snapshot(&dst.0);
+    restore::stage(&dst.0, &file, PASS, &options()).unwrap();
+    assert!(matches!(restore::apply_pending(&dst.0), ApplyOutcome::Applied(_)));
+    let restored = snapshot(&dst.0);
+    restore::stage_undo(&dst.0, &options()).unwrap();
+    (dst, before, restored)
+}
+
+#[test]
+fn an_undo_that_fails_or_crashes_never_loses_the_saved_copies() {
+    // Two files are put back and the rest taken away: fail after the second is set aside, and in the taking away.
+    for (what, inject) in [
+        ("fails after a file was put back", Inject::FailBeforeInstall(1)),
+        ("fails in the first file", Inject::FailBeforeInstall(0)),
+        ("fails while taking away what the restore added", Inject::FailBeforeInstall(2)),
+        ("crashes after a file was put back", Inject::CrashBeforeInstall(1)),
+        ("crashes while taking away what the restore added", Inject::CrashBeforeInstall(3)),
+    ] {
+        let (dst, before, restored) = restored_and_undo_staged();
+        restore::INJECT.with(|c| c.set(Some(inject)));
+        let outcome = restore::apply_pending(&dst.0);
+        restore::INJECT.with(|c| c.set(None));
+        if matches!(inject, Inject::CrashBeforeInstall(_)) {
+            assert!(matches!(outcome, ApplyOutcome::None), "{what}");
+            assert_ne!(snapshot(&dst.0), restored, "{what}: the crash left it half done");
+            assert!(matches!(restore::apply_pending(&dst.0), ApplyOutcome::Failed(_)), "{what}: the next start rolls it back");
+        } else {
+            assert!(matches!(outcome, ApplyOutcome::Failed(_)), "{what}");
+        }
+        assert_eq!(snapshot(&dst.0), restored, "{what}: the folder is exactly as the restore left it");
+        assert!(restore::undo_available(&dst.0), "{what}: the saved copies are still there");
+        assert!(dst.0.join("restore").read_dir().unwrap().flatten().any(|e| e.file_name().to_string_lossy().starts_with("undo-") && e.path().join("files").join("callers.json").is_file()), "{what}: the original callers.json is still in its snapshot");
+        // And the undo still works, whole, the next time.
+        restore::stage_undo(&dst.0, &options()).unwrap();
+        assert!(matches!(restore::apply_pending(&dst.0), ApplyOutcome::Applied(_)), "{what}");
+        assert_eq!(snapshot(&dst.0), before, "{what}: the second undo brings back everything");
+    }
+}
+
 #[test]
 fn only_the_last_two_undo_snapshots_are_kept() {
     let src = TempDir::new("keep-src");
@@ -1086,14 +1135,24 @@ fn a_changed_staged_file_or_marker_is_not_applied() {
     let file = out.0.join("t.oaiybackup");
     make(&src.0, &file);
 
-    // A staged file changed after staging.
+    // A staged file changed after staging: to another length, and to the same length.
     let dst = TempDir::new("tamper-dst");
     target(&dst.0);
     let before = snapshot(&dst.0);
     let staged = restore::stage(&dst.0, &file, PASS, &options()).unwrap();
-    put(&dst.0.join("restore").join(format!("pending-{}", staged.id)).join("files"), "callers.json", b"{\"contacts\":[\"planted\"]}");
+    let files = dst.0.join("restore").join(format!("pending-{}", staged.id)).join("files");
+    put(&files, "callers.json", b"{\"contacts\":[\"planted\"]}");
     let ApplyOutcome::Failed(last) = restore::apply_pending(&dst.0) else { panic!("refused") };
     assert!(last.error.as_deref().unwrap().contains("staged"), "{last:?}");
+    assert_eq!(snapshot(&dst.0), before);
+    let staged = restore::stage(&dst.0, &file, PASS, &options()).unwrap();
+    let files = dst.0.join("restore").join(format!("pending-{}", staged.id)).join("files");
+    let mut same_length = fs::read(files.join("callers.json")).unwrap();
+    let last_byte = same_length.len() - 3;
+    same_length[last_byte] ^= 0x01;
+    fs::write(files.join("callers.json"), same_length).unwrap();
+    let ApplyOutcome::Failed(last) = restore::apply_pending(&dst.0) else { panic!("refused") };
+    assert!(last.error.as_deref().unwrap().contains("does not check out"), "a changed byte at the same length is caught by its hash: {last:?}");
     assert_eq!(snapshot(&dst.0), before);
 
     // A marker that names a place outside the folder.
@@ -1108,13 +1167,27 @@ fn a_changed_staged_file_or_marker_is_not_applied() {
     assert!(!dst.0.parent().unwrap().join("evil.json").exists());
     let _ = staged;
 
-    // A marker that names a credential.
+    // A marker that names a credential, with a staged file there that matches its own hash: only the
+    // marker's own check stands between it and the live folder.
+    let staged = restore::stage(&dst.0, &file, PASS, &options()).unwrap();
+    let files = dst.0.join("restore").join(format!("pending-{}", staged.id)).join("files");
+    let planted = b"{\"credential\":\"an attacker's\"}";
+    put(&files, "link/account.json", planted);
+    let mut marker: serde_json::Value = serde_json::from_str(&fs::read_to_string(&marker_path).unwrap()).unwrap();
+    marker["files"].as_array_mut().unwrap().push(serde_json::json!({ "name": "link/account.json", "size": planted.len(), "sha256": sha(planted) }));
+    fs::write(&marker_path, marker.to_string()).unwrap();
+    let ApplyOutcome::Failed(last) = restore::apply_pending(&dst.0) else { panic!("refused") };
+    assert!(last.error.as_deref().unwrap().contains("refused"), "{last:?}");
+    assert_eq!(snapshot(&dst.0), before, "the credential that was there is untouched");
+    assert_eq!(get(&dst.0, "link/account.json").unwrap(), b"{\"credential\":\"flk_TARGET_OWN\"}");
+
+    // A marker that asks for the removal of a credential (an undo takes away what a restore added).
     restore::stage(&dst.0, &file, PASS, &options()).unwrap();
     let mut marker: serde_json::Value = serde_json::from_str(&fs::read_to_string(&marker_path).unwrap()).unwrap();
-    marker["files"][0]["name"] = serde_json::json!("link/account.json");
+    marker["removals"] = serde_json::json!(["link/account.json", "callers.json"]);
     fs::write(&marker_path, marker.to_string()).unwrap();
     assert!(matches!(restore::apply_pending(&dst.0), ApplyOutcome::Failed(_)));
-    assert_eq!(snapshot(&dst.0), before);
+    assert_eq!(snapshot(&dst.0), before, "nothing was taken away");
 
     // A marker that is not a marker.
     fs::write(&marker_path, b"{ not json").unwrap();
@@ -1406,9 +1479,17 @@ fn a_restore_hands_the_agents_storage_to_its_page_and_takes_the_undo_snapshot_ba
 
 // ---- the routes ------------------------------------------------------------------------------------
 
+/// A request as the Agent's own page makes it.
 async fn call(app: &axum::Router, method: &str, path: &str, token: Option<&str>, body: Vec<u8>) -> (u16, Vec<u8>) {
+    call_from(app, method, path, token, Some("http://oaiy.localhost"), body).await
+}
+
+async fn call_from(app: &axum::Router, method: &str, path: &str, token: Option<&str>, origin: Option<&str>, body: Vec<u8>) -> (u16, Vec<u8>) {
     use tower::ServiceExt as _;
     let mut request = axum::http::Request::builder().method(method).uri(path);
+    if let Some(o) = origin {
+        request = request.header("origin", o);
+    }
     if let Some(t) = token {
         request = request.header("x-backup-token", t);
     }
@@ -1467,6 +1548,39 @@ async fn the_status_route_reports_and_the_hand_over_routes_need_their_tokens() {
     assert_eq!(call(&app, "POST", &format!("/api/backup/agent/{id}/done"), Some("wrong"), done.clone()).await.0, 403);
     assert_eq!(call(&app, "POST", &format!("/api/backup/agent/{id}/done"), Some(&token), done).await.0, 200);
     assert_eq!(fs::metadata(dir.0.join("route.part")).unwrap().len(), PART_SIZE as u64);
+    agent::close_session(&id);
+}
+
+#[tokio::test]
+async fn the_hand_over_routes_are_for_the_agents_own_page_only() {
+    let dir = TempDir::new("routes-origin");
+    let app = routes::router(dir.0.clone());
+    let (id, token) = agent::open_session(&dir.0.join("o.part"), 1 << 20).unwrap();
+    let part = format!("/api/backup/agent/{id}/part?seq=0");
+    let done = serde_json::json!({ "ok": true, "parts": 1 }).to_string().into_bytes();
+    for origin in [None, Some("https://oaiy.com"), Some("https://app.oaiy.com"), Some("tauri://localhost"), Some("http://tauri.localhost"), Some("http://oaiyflows.localhost"), Some("http://oaiy.localhost.evil.example"), Some("http://127.0.0.1:17973"), Some("null")] {
+        // Even with the right session token, and whatever the desktop's guard would have let through.
+        assert_eq!(call_from(&app, "POST", &part, Some(&token), origin, b"abc".to_vec()).await.0, 403, "part from {origin:?}");
+        assert_eq!(call_from(&app, "POST", &format!("/api/backup/agent/{id}/done"), Some(&token), origin, done.clone()).await.0, 403, "done from {origin:?}");
+        assert_eq!(call_from(&app, "GET", "/api/backup/agent-import", Some(&token), origin, Vec::new()).await.0, 403, "import from {origin:?}");
+        assert_eq!(call_from(&app, "GET", "/api/backup/agent-import/x/part/0", Some(&token), origin, Vec::new()).await.0, 403, "import part from {origin:?}");
+        for tail in ["undo-part?seq=0", "undo-part?seq=1"] {
+            assert_eq!(call_from(&app, "POST", &format!("/api/backup/agent-import/x/{tail}"), Some(&token), origin, b"abc".to_vec()).await.0, 403, "{tail} from {origin:?}");
+        }
+        for tail in ["undo-done", "done"] {
+            assert_eq!(call_from(&app, "POST", &format!("/api/backup/agent-import/x/{tail}"), Some(&token), origin, done.clone()).await.0, 403, "{tail} from {origin:?}");
+        }
+    }
+    assert_eq!(fs::metadata(dir.0.join("o.part")).unwrap().len(), 0, "nothing was stored for any of them");
+    // The Agent's page, in each of its forms, is let in.
+    for origin in ["http://oaiy.localhost", "https://oaiy.localhost", "oaiy://localhost"] {
+        assert!(routes::is_agent_origin(origin));
+        assert_eq!(call_from(&app, "GET", "/api/backup/agent-import", None, Some(origin), Vec::new()).await.0, 200, "{origin}");
+    }
+    assert!(!routes::is_agent_origin("http://oaiy.localhost/") && !routes::is_agent_origin(""));
+    // The status is not the Agent's alone: the dashboard reads it.
+    assert_eq!(call_from(&app, "GET", "/api/backup/status", None, Some("tauri://localhost"), Vec::new()).await.0, 200);
+    assert_eq!(call_from(&app, "GET", "/api/backup/status", None, None, Vec::new()).await.0, 200);
     agent::close_session(&id);
 }
 
@@ -1543,6 +1657,9 @@ fn no_passphrase_or_secret_appears_in_a_log_line_or_an_error() {
     messages.push(serde_json::to_string(&state::status(&dst.0)).unwrap());
 
     let logged = CAPTURED.lock().unwrap_or_else(|e| e.into_inner()).join("\n");
+    // The scan below means nothing if nothing was captured: this run must have logged its own lines.
+    assert!(logged.contains("is staged and will be applied at the next start"), "the logger did not capture this run: {logged:?}");
+    assert!(logged.contains("did not finish and was rolled back"), "{logged:?}");
     let everything = format!("{}\n{logged}", messages.join("\n"));
     for canary in [CANARY_PASS, "CANARYshort", LINK_KEY, PROVIDER_KEY, "flk_TARGET_OWN", "sk-TARGET-OWN", "the wrong passphrase CANARY", "CCCCendpoint", "AAAAtunnel"] {
         assert!(!everything.contains(canary), "{canary:?} must not appear in a log line or an error");

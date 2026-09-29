@@ -540,6 +540,9 @@ struct JournalLine {
     rel: String,
     #[serde(default)]
     had: bool,
+    /// A staged file goes in at this step (as opposed to a file being taken away, in an undo).
+    #[serde(default)]
+    install: bool,
 }
 
 struct Journal {
@@ -552,8 +555,8 @@ impl Journal {
         Ok(Self { file: secret_file::create_new_owner_only(path)? })
     }
 
-    fn line(&mut self, op: &str, rel: &str, had: bool) -> std::io::Result<()> {
-        let mut text = serde_json::to_string(&JournalLine { op: op.to_string(), rel: rel.to_string(), had }).unwrap_or_default();
+    fn line(&mut self, op: &str, rel: &str, had: bool, install: bool) -> std::io::Result<()> {
+        let mut text = serde_json::to_string(&JournalLine { op: op.to_string(), rel: rel.to_string(), had, install }).unwrap_or_default();
         text.push('\n');
         self.file.write_all(text.as_bytes())?;
         self.file.sync_data()
@@ -569,18 +572,22 @@ fn native(rel: &str) -> PathBuf {
 }
 
 /// Put back what the journal says was begun, newest first. Safe to run more than once, and after a crash at any point.
+///
+/// Nothing is ever deleted here. What a step put in place goes back to where it came from first (for
+/// an undo, the staged file is the only copy of what the restore replaced), and then the file that
+/// was set aside goes back to its place.
 fn roll_back(data_dir: &Path, staged_root: &Path, holding: &Path, lines: &[JournalLine]) {
     for line in lines.iter().rev().filter(|l| l.op == "begin") {
         let target = data_dir.join(native(&line.rel));
         let kept = holding.join(native(&line.rel));
-        if line.had {
-            // The original is in the holding folder if it was moved: it goes back over whatever is there now.
-            if kept.exists() {
-                let _ = secret_file::rename_over(&kept, &target);
-            }
-        } else if !staged_root.join(native(&line.rel)).exists() && target.is_file() {
-            // Installed (the staged file is gone) but there was nothing before: take it away again.
-            let _ = std::fs::remove_file(&target);
+        let staged = staged_root.join(native(&line.rel));
+        // Installed: the staged file is gone from its place and a plain file stands at the target.
+        if line.install && !staged.exists() && target.is_file() {
+            let _ = secret_file::rename_over(&target, &staged);
+        }
+        // The original is in the holding folder if it was set aside: it goes back over whatever is there now.
+        if line.had && kept.exists() {
+            let _ = secret_file::rename_over(&kept, &target);
         }
     }
 }
@@ -714,7 +721,7 @@ fn apply_files(data_dir: &Path, marker: &Marker, staged_root: &Path, holding: &P
             Target::Absent => false,
             Target::File => true,
         };
-        journal.line("begin", &f.name, had).map_err(|e| format!("Could not write the restore's journal ({e})."))?;
+        journal.line("begin", &f.name, had, true).map_err(|e| format!("Could not write the restore's journal ({e})."))?;
         if had {
             let kept = holding.join(native(&f.name));
             if let Some(parent) = kept.parent() {
@@ -730,20 +737,22 @@ fn apply_files(data_dir: &Path, marker: &Marker, staged_root: &Path, holding: &P
         secret_file::rename_over(&staged, &target).map_err(|e| format!("Could not put a restored file in place ({e})."))?;
         applied.push((f.name.clone(), had));
     }
-    for rel in &marker.removals {
+    for (position, rel) in marker.removals.iter().enumerate() {
         let target = data_dir.join(native(rel));
         if !matches!(target_state(data_dir, rel).map_err(|e| e.message)?, Target::File) {
             continue;
         }
-        journal.line("begin", rel, true).map_err(|e| format!("Could not write the restore's journal ({e})."))?;
+        journal.line("begin", rel, true, false).map_err(|e| format!("Could not write the restore's journal ({e})."))?;
         let kept = holding.join(native(rel));
         if let Some(parent) = kept.parent() {
             secret_file::create_private_dir(parent).map_err(|e| format!("Could not make a folder for the saved copy ({e})."))?;
         }
         secret_file::rename_over(&target, &kept).map_err(|e| format!("Could not take away a file the restore had added ({e})."))?;
+        #[cfg(test)]
+        inject_at(marker.files.len() + position)?;
         applied.push((rel.clone(), true));
     }
-    journal.line("done", "", false).map_err(|e| format!("Could not finish the restore's journal ({e})."))?;
+    journal.line("done", "", false, false).map_err(|e| format!("Could not finish the restore's journal ({e})."))?;
     #[cfg(test)]
     if INJECT.with(|c| c.get()) == Some(Inject::CrashAfterDone) {
         return Err(CRASH.to_string());

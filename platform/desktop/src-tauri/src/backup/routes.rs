@@ -12,8 +12,9 @@
 //! **No route creates or restores a backup.** A backup is made, and a restore staged, applied and
 //! undone, only by the commands of the dashboard's own window; these routes only carry bytes into
 //! or out of a session or an import that such a command has already opened. All of them sit behind
-//! the desktop's origin guard (see `http.rs`), and the ones that carry data also demand the
-//! session's own token in `X-Backup-Token`.
+//! the desktop's origin guard (see `http.rs`); the hand-over routes are also for the Agent's own page
+//! only (its `Origin` must be the scheme the desktop serves it from, so a paired token or a page of
+//! the linked provider gets nothing), and they demand the session's own token in `X-Backup-Token`.
 
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -49,6 +50,23 @@ fn part_error(e: PartError) -> Response {
     }
 }
 
+/// The origins the Agent's own page has, in its window: the scheme this desktop serves it from.
+pub fn is_agent_origin(origin: &str) -> bool {
+    matches!(origin, "oaiy://localhost" | "http://oaiy.localhost" | "https://oaiy.localhost")
+}
+
+/// The hand-over routes are for the Agent's own page and nobody else: a paired token, a page of the
+/// linked provider or the dashboard passes the desktop's guard for other routes, but the Agent's
+/// storage is whole conversations, and none of them has a reason to ask for it.
+fn agent_page_only(headers: &HeaderMap) -> Option<Response> {
+    let origin = headers.get("origin").and_then(|v| v.to_str().ok()).unwrap_or("");
+    if is_agent_origin(origin) {
+        None
+    } else {
+        Some(fail(StatusCode::FORBIDDEN, "only the Agent's own page may use this"))
+    }
+}
+
 fn token_of(headers: &HeaderMap) -> String {
     headers.get("x-backup-token").and_then(|v| v.to_str().ok()).unwrap_or("").to_string()
 }
@@ -67,6 +85,9 @@ async fn status(State(ctx): State<Ctx>) -> Response {
 }
 
 async fn export_part(Path(id): Path<String>, Query(q): Query<PartQuery>, headers: HeaderMap, body: Bytes) -> Response {
+    if let Some(refused) = agent_page_only(&headers) {
+        return refused;
+    }
     let token = token_of(&headers);
     match tokio::task::spawn_blocking(move || agent::receive_part(&id, &token, q.seq, &body)).await {
         Ok(Ok(())) => Json(serde_json::json!({ "ok": true })).into_response(),
@@ -76,6 +97,9 @@ async fn export_part(Path(id): Path<String>, Query(q): Query<PartQuery>, headers
 }
 
 async fn export_done(Path(id): Path<String>, headers: HeaderMap, Json(done): Json<DonePayload>) -> Response {
+    if let Some(refused) = agent_page_only(&headers) {
+        return refused;
+    }
     let token = token_of(&headers);
     match tokio::task::spawn_blocking(move || agent::finish(&id, &token, done)).await {
         Ok(Ok(())) => Json(serde_json::json!({ "ok": true })).into_response(),
@@ -84,7 +108,10 @@ async fn export_done(Path(id): Path<String>, headers: HeaderMap, Json(done): Jso
     }
 }
 
-async fn import_meta(State(ctx): State<Ctx>) -> Response {
+async fn import_meta(State(ctx): State<Ctx>, headers: HeaderMap) -> Response {
+    if let Some(refused) = agent_page_only(&headers) {
+        return refused;
+    }
     let dir = ctx.data_dir.clone();
     match tokio::task::spawn_blocking(move || agent::import_meta(&dir)).await {
         Ok(meta) => Json(meta).into_response(),
@@ -93,6 +120,9 @@ async fn import_meta(State(ctx): State<Ctx>) -> Response {
 }
 
 async fn import_part(State(ctx): State<Ctx>, Path((id, index)): Path<(String, u64)>, headers: HeaderMap) -> Response {
+    if let Some(refused) = agent_page_only(&headers) {
+        return refused;
+    }
     let (dir, token) = (ctx.data_dir.clone(), token_of(&headers));
     match tokio::task::spawn_blocking(move || agent::import_part(&dir, &id, &token, index)).await {
         Ok(Ok(bytes)) => ([(axum::http::header::CONTENT_TYPE, "application/octet-stream")], bytes).into_response(),
@@ -102,6 +132,9 @@ async fn import_part(State(ctx): State<Ctx>, Path((id, index)): Path<(String, u6
 }
 
 async fn undo_part(State(ctx): State<Ctx>, Path(id): Path<String>, Query(q): Query<PartQuery>, headers: HeaderMap, body: Bytes) -> Response {
+    if let Some(refused) = agent_page_only(&headers) {
+        return refused;
+    }
     let (dir, token) = (ctx.data_dir.clone(), token_of(&headers));
     match tokio::task::spawn_blocking(move || agent::undo_part(&dir, &id, &token, q.seq, &body)).await {
         Ok(Ok(())) => Json(serde_json::json!({ "ok": true })).into_response(),
@@ -111,6 +144,9 @@ async fn undo_part(State(ctx): State<Ctx>, Path(id): Path<String>, Query(q): Que
 }
 
 async fn undo_done(State(ctx): State<Ctx>, Path(id): Path<String>, headers: HeaderMap, Json(done): Json<DonePayload>) -> Response {
+    if let Some(refused) = agent_page_only(&headers) {
+        return refused;
+    }
     let (dir, token) = (ctx.data_dir.clone(), token_of(&headers));
     match tokio::task::spawn_blocking(move || agent::undo_done(&dir, &id, &token, &done)).await {
         Ok(Ok(())) => Json(serde_json::json!({ "ok": true })).into_response(),
@@ -128,6 +164,9 @@ struct ImportDone {
 }
 
 async fn import_done(State(ctx): State<Ctx>, Path(id): Path<String>, headers: HeaderMap, Json(done): Json<ImportDone>) -> Response {
+    if let Some(refused) = agent_page_only(&headers) {
+        return refused;
+    }
     let (dir, token) = (ctx.data_dir.clone(), token_of(&headers));
     match tokio::task::spawn_blocking(move || agent::import_done(&dir, &id, &token, done.ok, done.error.as_deref())).await {
         Ok(Ok(())) => Json(serde_json::json!({ "ok": true })).into_response(),
