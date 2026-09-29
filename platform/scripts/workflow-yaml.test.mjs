@@ -150,6 +150,15 @@ describe('the workflows', () => {
     assert.equal(cache.with['cache-dependency-path'], 'platform/ui/package-lock.json');
   });
 
+  it('are run by the gate: every test in platform/scripts is named in ci.yml', () => {
+    // A test that no lane runs protects nothing (two were not run at all until this was written).
+    const ci = workflow('ci.yml');
+    const scripts = path.join(repo, 'platform', 'scripts');
+    const tests = fs.readdirSync(scripts).filter((name) => name.endsWith('.test.mjs'));
+    assert.ok(tests.length >= 10, tests.join(', '));
+    for (const name of tests) assert.ok(ci.includes(`platform/scripts/${name}`), `ci.yml does not run platform/scripts/${name}`);
+  });
+
   it('read the same with either line ending', () => {
     for (const name of ['ci.yml', 'release.yml']) {
       const lf = workflow(name).replace(/\r\n/g, '\n');
