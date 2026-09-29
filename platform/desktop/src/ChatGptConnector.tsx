@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useState } from 'react';
+import { useCallback, useEffect, useRef, useState } from 'react';
 import { Copy, ExternalLink, Loader2, LogOut, MessageSquare } from 'lucide-react';
 import { codex, openExternal, type CodexLogin, type CodexStatus } from './api';
 import { useToast } from './Toasts';
@@ -15,8 +15,17 @@ import { useToast } from './Toasts';
 
 const POLL_MS = 3000;
 
-export default function ChatGptConnector() {
+interface Props {
+  /** A sign-in started here has finished: the account is connected. */
+  onConnected?: (status: CodexStatus) => void;
+  /** Inside a card that already says "ChatGPT": no heading of its own. */
+  bare?: boolean;
+}
+
+export default function ChatGptConnector({ onConnected, bare }: Props = {}) {
   const toast = useToast();
+  const connectedRef = useRef(onConnected);
+  connectedRef.current = onConnected;
   const [status, setStatus] = useState<CodexStatus | null>(null);
   const [login, setLogin] = useState<CodexLogin | null>(null);
   const [busy, setBusy] = useState(false);
@@ -46,6 +55,7 @@ export default function ChatGptConnector() {
         if (s.connected) {
           setLogin(null);
           toast.push({ kind: 'success', title: 'ChatGPT connected', body: s.email ?? undefined });
+          connectedRef.current?.(s);
         }
       } catch {
         /* keep waiting */
@@ -121,20 +131,24 @@ export default function ChatGptConnector() {
   const connected = status?.connected === true;
 
   return (
-    <section className="service-section">
-      <div className="section-title-row">
-        <h3 className="section-title">ChatGPT</h3>
-        {status && (
-          <span className={connected ? 'badge badge-ok' : 'badge badge-neutral'}>
-            {connected ? 'signed in' : 'signed out'}
-          </span>
-        )}
-      </div>
+    <section className={bare ? 'chatgpt-connector is-bare' : 'service-section'}>
+      {!bare && (
+        <div className="section-title-row">
+          <h3 className="section-title">ChatGPT</h3>
+          {status && (
+            <span className={connected ? 'badge badge-ok' : 'badge badge-neutral'}>
+              {connected ? 'signed in' : 'signed out'}
+            </span>
+          )}
+        </div>
+      )}
 
-      <p className="form-hint">
-        Use an eligible ChatGPT account instead of an API key. Your account limits apply. The sign-in is owned by the{' '}
-        <code>codex</code> agent running on this machine — OAIY never receives or stores a token.
-      </p>
+      {!bare && (
+        <p className="form-hint">
+          Use an eligible ChatGPT account instead of an API key. Your account limits apply. The sign-in is owned by the{' '}
+          <code>codex</code> agent running on this machine — OAIY never receives or stores a token.
+        </p>
+      )}
 
       {connected && (
         <p style={{ fontSize: 12.5, opacity: 0.75, margin: 0 }}>

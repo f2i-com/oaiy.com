@@ -43,6 +43,16 @@ export function usePoll<T>(load: () => Promise<T>, ms: number, enabled = true): 
   return [value, refresh, error];
 }
 
+/**
+ * What a route a desktop may not have said, polled as `{ v }` so an answer of
+ * `null` (a 404: an older desktop) differs from not asked yet: `undefined`
+ * while asking, else its answer, `null` for a missing route or a failure.
+ */
+export function answered<T>(value: { v: T | null } | null, error: string | null): T | null | undefined {
+  if (value) return value.v;
+  return error ? null : undefined;
+}
+
 export function errorText(e: unknown): string {
   return e instanceof Error ? e.message.replace(/^\d{3}: /, '') : String(e);
 }

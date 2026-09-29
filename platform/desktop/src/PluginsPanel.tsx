@@ -24,7 +24,8 @@ import {
   type ServiceDefinition,
 } from './api';
 import { refetchModules } from './useModules';
-import { pluginNeedsSetup, readSetup } from './setupFlow';
+import { pluginSetupStatus, readSetup, type PluginSetupStatus } from './setupFlow';
+import { useLiveSetup } from './useLiveSetup';
 import { openSetup, refetchSetup, useSetupState } from './useSetupState';
 import { peek, put } from './useCached';
 import { useToast } from './Toasts';
@@ -156,6 +157,8 @@ export default function PluginsPanel() {
 
   const list = useMemo(() => snapshot?.plugins ?? [], [snapshot]);
   const setupState = useSetupState();
+  // A plugin set up by hand (or before the wizard) counts as set up once its steps' checks all pass.
+  const live = useLiveSetup(snapshot?.plugins ?? null, setupState);
 
   const installPlugin = useCallback(async () => {
     const source = installSource.trim();
@@ -290,7 +293,7 @@ export default function PluginsPanel() {
               key={p.id}
               plugin={p}
               setupTitle={readSetup(p)?.title ?? null}
-              needsSetup={!p.userDisabled && pluginNeedsSetup(p, setupState)}
+              setupStatus={p.userDisabled ? 'none' : pluginSetupStatus(p, setupState, live)}
               onSetup={() => openSetup({ plugin: p.id })}
               pending={pending.has(p.id)}
               onStart={() => runAction(p.id, () => plugins.start(p.id))}
@@ -350,8 +353,12 @@ interface CardProps {
   plugin: PluginRecord;
   /** Its setup wizard's title, when it declares one. */
   setupTitle: string | null;
-  /** Its setup was never finished, or its setup version went up (a nudge, not a forced wizard). */
-  needsSetup: boolean;
+  /**
+   * `needs-setup`: its setup was never finished and its checks do not all
+   * pass, or its setup version went up (a nudge, not a forced wizard);
+   * `set-up`: finished here, or everything its checks look at is true now.
+   */
+  setupStatus: PluginSetupStatus;
   onSetup: () => void;
   pending: boolean;
   onStart: () => void;
@@ -364,7 +371,7 @@ interface CardProps {
 function PluginCard({
   plugin: p,
   setupTitle,
-  needsSetup,
+  setupStatus,
   onSetup,
   pending,
   onStart,
@@ -374,6 +381,7 @@ function PluginCard({
   onUninstall,
 }: CardProps) {
   const loadable = isLoadable(p);
+  const needsSetup = setupStatus === 'needs-setup';
   const running = p.state === 'running' || p.state === 'unhealthy' || p.state === 'starting';
   const connectorCount =
     p.manifest?.connectors?.reduce((n, c) => n + c.commands.length, 0) ?? 0;
@@ -388,6 +396,11 @@ function PluginCard({
           <span className="card-note">v{p.manifest.version}</span>
         )}
         {p.userDisabled && <span className="badge badge-neutral">disabled by you</span>}
+        {setupTitle && setupStatus === 'set-up' && (
+          <span className="badge badge-ok" title={`${setupTitle}: done`}>
+            set up
+          </span>
+        )}
       </div>
 
       {p.manifest?.description && (
@@ -463,7 +476,7 @@ function PluginCard({
 
         {setupTitle && !needsSetup && (
           <button className="btn btn-ghost" onClick={onSetup} title={setupTitle}>
-            <ListChecks size={14} /> Set up…
+            <ListChecks size={14} /> {setupStatus === 'set-up' ? 'Its setup' : 'Set up…'}
           </button>
         )}
 

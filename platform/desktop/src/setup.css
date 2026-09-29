@@ -545,6 +545,137 @@ details.setup-more-source > summary:hover { color: var(--text); }
 .setup-nudge > span small { color: var(--muted); font-size: 11.5px; }
 .service-card .setup-nudge { margin-top: 10px; }
 
+/* ---- your AI: on this computer, or ChatGPT (the wizard, and Settings → Agent) --- */
+
+.ai-choices { display: flex; flex-direction: column; gap: 10px; }
+/* The wizard's two choices side by side, so both show; what the chosen one needs goes below. */
+.ai-choices.is-pair { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); align-items: stretch; }
+.ai-choice {
+  border: 1px solid var(--border);
+  border-radius: var(--r-card);
+  background: var(--surface-soft);
+  transition: border-color 0.14s, background 0.14s, box-shadow 0.14s;
+}
+.ai-choice-icon { display: inline-grid; color: var(--primary); }
+.ai-choices.is-pair .ai-choice-head > input[type='radio'] { margin-top: 3px; }
+.ai-chatgpt .setup-req-body { gap: 8px; }
+.ai-chatgpt .chatgpt-connector .form-actions { margin: 0; }
+.ai-choice.is-selected {
+  border-color: color-mix(in srgb, var(--primary) 55%, var(--border));
+  background: color-mix(in srgb, var(--primary) 5%, var(--surface-soft));
+  box-shadow: 0 0 0 3px var(--primary-soft);
+}
+.ai-choice-head { display: flex; align-items: flex-start; gap: 12px; padding: 14px 16px; cursor: pointer; }
+.ai-choice-head > input[type='radio'] { flex: none; width: 16px; height: 16px; margin: 9px 0 0; cursor: pointer; }
+.ai-choice-text { display: flex; min-width: 0; flex: 1; flex-direction: column; gap: 4px; }
+.ai-choice-text > strong { display: flex; align-items: center; flex-wrap: wrap; gap: 8px; font-size: 14.5px; font-weight: 650; }
+.ai-choice-text > strong .badge { margin-left: 0; }
+.ai-choice-text > strong .badge-pending::before { animation: none; }
+.ai-choice-text > small { max-width: 76ch; color: var(--muted); font-size: 12.5px; line-height: 1.5; }
+.ai-choice-text > small.ai-choice-fact { color: var(--text); }
+.ai-choice-head > .btn-tiny { flex: none; align-self: center; }
+.ai-choice-body { border-top: 1px solid var(--border); padding: 14px 16px 16px 44px; }
+.ai-choice-body .setup-req { background: var(--surface-solid); }
+.chatgpt-connector.is-bare { display: flex; flex-direction: column; gap: 10px; }
+.ai-choices.is-compact .ai-choice-head { padding: 12px 14px; }
+.ai-choices.is-compact .ai-choice-body { padding: 12px 14px 14px 42px; }
+.agent-model-pick { max-width: 440px; }
+
+/* ---- the Agent: one switch ------------------------------------------------------ */
+
+.agent-switch { display: flex; flex-direction: column; gap: 8px; }
+.agent-switch-row {
+  display: flex;
+  align-items: center;
+  gap: 18px;
+  border: 1px solid var(--border);
+  border-radius: var(--r-card);
+  background: var(--surface-soft);
+  padding: 14px 16px;
+  cursor: pointer;
+}
+.agent-switch.is-on .agent-switch-row { border-color: color-mix(in srgb, var(--primary) 45%, var(--border)); }
+.agent-switch-text { display: flex; min-width: 0; flex: 1; flex-direction: column; gap: 4px; }
+.agent-switch-text strong { color: var(--text); font-size: 14.5px; font-weight: 650; }
+.ai-choice-text > strong { color: var(--text); }
+.agent-switch-text small { max-width: 76ch; color: var(--muted); font-size: 12.5px; line-height: 1.55; }
+.agent-switch-control { display: flex; flex: none; align-items: center; gap: 8px; color: var(--muted); }
+.agent-switch-note { margin: 0; }
+
+input[type='checkbox'].switch {
+  position: relative;
+  width: 40px;
+  height: 22px;
+  flex: none;
+  margin: 0;
+  appearance: none;
+  -webkit-appearance: none;
+  border: 1px solid var(--strong-border);
+  border-radius: 99px;
+  background: var(--canvas);
+  padding: 0;
+  cursor: pointer;
+  transition: background 0.16s, border-color 0.16s;
+}
+input[type='checkbox'].switch::before {
+  position: absolute;
+  top: 2px;
+  left: 2px;
+  width: 16px;
+  height: 16px;
+  border-radius: 50%;
+  background: var(--muted);
+  content: '';
+  transition: transform 0.16s, background 0.16s;
+}
+input[type='checkbox'].switch:checked { border-color: var(--primary); background: var(--primary); }
+input[type='checkbox'].switch:checked::before { transform: translateX(18px); background: #fff; }
+input[type='checkbox'].switch:disabled { cursor: not-allowed; opacity: 0.6; }
+input[type='checkbox'].switch:focus-visible { box-shadow: 0 0 0 3px var(--primary-soft); }
+@media (prefers-reduced-motion: reduce) {
+  input[type='checkbox'].switch,
+  input[type='checkbox'].switch::before { transition: none; }
+}
+
+/* ---- continue with the Agent ------------------------------------------------------ */
+
+.setup-handoff { display: flex; flex-direction: column; gap: 16px; }
+.setup-summary li.is-todo .setup-summary-mark {
+  border-color: color-mix(in srgb, var(--amber) 55%, transparent);
+  background: var(--amber-soft);
+  color: var(--amber);
+}
+
+/* ---- Settings → Agent: what it changed ---------------------------------------------- */
+
+.agent-changes { display: flex; flex-direction: column; gap: 6px; margin: 0; padding: 0; list-style: none; }
+.agent-changes li {
+  display: flex;
+  align-items: flex-start;
+  gap: 11px;
+  border: 1px solid var(--border);
+  border-radius: var(--r-ctl);
+  background: var(--surface-soft);
+  padding: 9px 12px;
+}
+.agent-change-mark {
+  display: grid;
+  width: 20px;
+  height: 20px;
+  flex: none;
+  margin-top: 1px;
+  place-items: center;
+  border-radius: 50%;
+  background: var(--green-soft);
+  color: var(--green);
+}
+.agent-changes li.is-failed .agent-change-mark { background: var(--danger-soft); color: var(--danger); }
+.agent-change-text { display: flex; min-width: 0; flex: 1; flex-direction: column; gap: 2px; }
+.agent-change-text strong { display: flex; flex-wrap: wrap; align-items: baseline; gap: 4px 8px; font-size: 13px; font-weight: 620; }
+.agent-change-text strong code { color: var(--muted); font-family: var(--font-mono); font-size: 11.5px; font-weight: 500; }
+.agent-change-text small { color: var(--faint); font-size: 12px; }
+.agent-changes time { flex: none; margin-top: 2px; color: var(--faint); font-family: var(--font-mono); font-size: 11px; white-space: nowrap; }
+
 /* ---- narrow windows ------------------------------------------------------------ */
 
 /* The steps become a strip above the pane. */
@@ -574,4 +705,8 @@ details.setup-more-source > summary:hover { color: var(--text); }
   .setup-foot-status { flex-basis: 100%; order: -1; text-align: left; }
   .setup-foot-status .card-warn { justify-content: flex-start; }
   .setup-foot .btn-primary { margin-left: auto; }
+  .ai-choices.is-pair { grid-template-columns: minmax(0, 1fr); }
+  .ai-choice-body,
+  .ai-choices.is-compact .ai-choice-body { padding-left: 16px; }
+  .agent-switch-row { align-items: flex-start; }
 }

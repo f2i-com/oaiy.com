@@ -89,9 +89,11 @@ interface Props {
   /** Embedded: skip this plugin's setup for now. */
   onSkipOut?: () => void;
   onNavigate: (view: PluginNavTarget | 'providers' | 'plugins') => void;
+  /** Open at this step, when it shows (the Agent asked for it); else the first not done. */
+  initialStep?: string;
 }
 
-export default function PluginWizard({ pluginId, layout, onFinished, onLeave, onBackOut, onSkipOut, onNavigate }: Props) {
+export default function PluginWizard({ pluginId, layout, onFinished, onLeave, onBackOut, onSkipOut, onNavigate, initialStep }: Props) {
   const toast = useToast();
   const setupState = useSetupState();
   const [plugins, refreshPlugins, pluginsError] = usePoll(() => pluginsApi.list().then((s) => s.plugins), 3000);
@@ -134,8 +136,9 @@ export default function PluginWizard({ pluginId, layout, onFinished, onLeave, on
   const [currentId, setCurrentId] = useState<string | null>(null);
   const loaded = !!declared && !!detail;
   useEffect(() => {
-    if (loaded && currentId === null && steps.length) setCurrentId(steps[firstOpenStep(steps)].step.id);
-  }, [loaded, currentId, steps]);
+    if (loaded && currentId === null && steps.length)
+      setCurrentId(initialStep && steps.some((s) => s.step.id === initialStep) ? initialStep : steps[firstOpenStep(steps)].step.id);
+  }, [loaded, currentId, steps, initialStep]);
   const index = Math.max(0, steps.findIndex((s) => s.step.id === currentId));
   const current: PluginStep | undefined = steps[index];
 

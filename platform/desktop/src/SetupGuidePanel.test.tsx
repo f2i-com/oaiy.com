@@ -88,7 +88,8 @@ describe('the setup card', () => {
     render();
     expect(host.querySelector('.setup-guide')).not.toBeNull();
     expect(host.querySelector('.section-title')?.textContent).toMatch(/^Continue setup · 0 of \d$/);
-    expect(host.textContent).toContain('Next: The engine');
+    // Left by an older dashboard at "engine": the essentials' "Your AI" now.
+    expect(host.textContent).toContain('Next: Your AI');
     act(() => button('Continue setup')!.click());
     expect(openSetup).toHaveBeenCalledWith();
   });

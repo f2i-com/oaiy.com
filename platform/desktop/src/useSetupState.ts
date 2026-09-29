@@ -96,6 +96,8 @@ const OPEN_EVENT = 'oaiy:open-setup';
 export interface OpenSetup {
   /** A plugin's own wizard; none: the first-run wizard. */
   plugin?: string;
+  /** Open at this step (the Agent's `plugin_setup_open`); none: where it was left. */
+  step?: string;
 }
 
 /** Open the setup page (App listens). */

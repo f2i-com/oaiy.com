@@ -1,45 +1,54 @@
 import { useCallback, useEffect, useMemo, useState, type ReactNode } from 'react';
-import { Check, Cpu, FolderOpen, Link2, Loader2, Package, Plug, Puzzle, ShieldCheck, Sparkles, TriangleAlert } from 'lucide-react';
+import { Check, FolderOpen, Link2, Loader2, Package, Plug, ShieldCheck, Sparkles } from 'lucide-react';
 import {
-  aiProviders,
+  agentPreferences,
   appConfig,
-  bridge,
   codex,
+  engineRecommendation,
   engines,
   isTauri,
   link,
-  nodeRuntime,
   pairing,
   plugins as pluginsApi,
-  services as servicesApi,
   setup as setupApi,
+  type AgentModelSource,
   type CatalogPlugin,
   type FirstRunState,
   type PluginRecord,
 } from './api';
+import { askAgent, useControlSettings } from './AgentAccess';
 import PluginWizard from './PluginSetup';
 import type { PluginNavTarget } from './PluginScreenPage';
 import {
-  engineReady,
+  aiReady,
+  currentStepId,
   firstRunPosition,
   firstRunProgress,
   firstRunSteps,
+  initialAiChoice,
+  inTheRest,
+  localModelLine,
   readSetup,
+  recommendationOrFallback,
   type FirstRunStep,
 } from './setupFlow';
-import { AiSourceChoice, EngineModelCard, errorText, RetryLine, ServiceCard, StepFooter, StepHeader, usePoll, WizardFrame } from './SetupParts';
+import { AgentStep, HandoffStep, modelLineText, WelcomeStep, YourAiStep } from './SetupEssentials';
+import { answered, errorText, RetryLine, StepFooter, StepHeader, usePoll, WizardFrame } from './SetupParts';
 import { useToast } from './Toasts';
+import { useLiveSetup } from './useLiveSetup';
 import { refetchModules } from './useModules';
 import { setSetupState, useSetupState } from './useSetupState';
 
 /**
  * The setup page: the first-run wizard, or one plugin's own wizard.
  *
- * First run: welcome; the engine (the language model chosen in Engines, or
- * the catalog's recommended one when none is; OAIY Voice; or an AI source
- * instead); plugins to install and set up; each chosen plugin's own setup;
- * connecting an app; done. It keeps its place on the desktop, so it can be
- * left and resumed, and every step can be skipped.
+ * First run is the essentials: welcome; your AI (a language model on this
+ * computer, or ChatGPT, the recommended one first); what the Agent may change
+ * (one switch); then "Continue with the Agent", which hands the person to the
+ * Agent to set up the rest in a chat. "Set up the rest myself" goes on step by
+ * step instead: plugins to install, each chosen plugin's own setup, connecting
+ * an app, done. It keeps its place on the desktop, so it can be left and
+ * resumed, and every step can be skipped.
  */
 
 export type SetupNav = PluginNavTarget | 'connections' | 'settings';
@@ -47,43 +56,59 @@ export type SetupNav = PluginNavTarget | 'connections' | 'settings';
 interface Props {
   /** A plugin's own wizard; null: the first-run wizard. */
   pluginId: string | null;
+  /** Open at this step (a navigation from the desktop asked for it). */
+  step?: string | null;
   /** Leave the page (it keeps its place). */
   onExit: () => void;
   onNavigate: (view: SetupNav) => void;
 }
 
-export default function SetupPage({ pluginId, onExit, onNavigate }: Props) {
+export default function SetupPage({ pluginId, step, onExit, onNavigate }: Props) {
   if (pluginId) {
-    return <PluginWizard key={pluginId} pluginId={pluginId} layout="page" onFinished={onExit} onLeave={onExit} onNavigate={onNavigate} />;
+    return <PluginWizard key={pluginId} pluginId={pluginId} initialStep={step ?? undefined} layout="page" onFinished={onExit} onLeave={onExit} onNavigate={onNavigate} />;
   }
-  return <FirstRunWizard onExit={onExit} onNavigate={onNavigate} />;
+  return <FirstRunWizard initialStep={step ?? null} onExit={onExit} onNavigate={onNavigate} />;
 }
 
-function FirstRunWizard({ onExit, onNavigate }: { onExit: () => void; onNavigate: (view: SetupNav) => void }) {
+function FirstRunWizard({ initialStep, onExit, onNavigate }: { initialStep: string | null; onExit: () => void; onNavigate: (view: SetupNav) => void }) {
   const toast = useToast();
   const state = useSetupState();
   const [plugins, refreshPlugins] = usePoll(() => pluginsApi.list().then((s) => s.plugins), 3000);
-  const [catalog, refreshCatalog] = usePoll(() => engines.catalog(), 3000);
-  const [services, refreshServices] = usePoll(() => servicesApi.list().then((s) => s.services), 3000);
-  const [providers] = usePoll(() => aiProviders.list().then((r) => r.providers), 5000);
-  const [codexOn] = usePoll(() => codex.status().then((s) => s.connected), 5000);
+  const [catalog, refreshCatalog, catalogError] = usePoll(() => engines.catalog(), 3000);
+  const [codexStatus, refreshCodex] = usePoll(() => codex.status(), 5000);
   const [paired] = usePoll(() => pairing.paired().then((p) => p.paired), 4000);
   const [linked] = usePoll(() => link.status().then((l) => l.linked), 8000);
+  const [recAnswer, , recError] = usePoll(() => engineRecommendation().then((v) => ({ v })), 20000);
+  const [prefsAnswer, refreshPrefs, prefsError] = usePoll(() => agentPreferences.get().then((v) => ({ v })), 10000);
+  const control = useControlSettings();
+  const live = useLiveSetup(plugins, state);
+  const codexOn = codexStatus?.connected === true;
+  const prefs = answered(prefsAnswer, prefsError);
 
-  const guide = useMemo(
-    () => ({ codexConnected: codexOn === true, runtime: null, providers, services, plugins, connected: paired }),
-    [codexOn, providers, services, plugins, paired],
-  );
+  // The recommendation, or (a desktop without it) local if Engines has a model chosen.
+  const recommendation = answered(recAnswer, recError);
+  const rec = recommendation ? recommendation : recommendation === null && (catalog || catalogError) ? recommendationOrFallback(null, catalog, codexOn) : null;
+
+  /** "Set up the rest myself" was chosen (or a navigation, or the record's place, is in the rest). */
+  const asked = initialStep ? currentStepId(initialStep) : null;
+  const [rest, setRest] = useState(() => inTheRest(asked));
+  const [aiChoice, setAiChoice] = useState<AgentModelSource | null>(null);
+  const choice = aiChoice ?? (rec && prefs !== undefined ? initialAiChoice(rec, prefs, catalog) : null);
+
+  const guide = useMemo(() => ({ codexConnected: codexOn, runtime: null, providers: null, services: null, plugins, connected: paired }), [codexOn, plugins, paired]);
   const steps = useMemo(
-    () => firstRunSteps({ state, plugins, catalog, guide, linked: linked === true }),
-    [state, plugins, catalog, guide, linked],
+    () => firstRunSteps({ state, plugins, catalog, guide, linked: linked === true, prefs, rest, live }),
+    [state, plugins, catalog, guide, linked, prefs, rest, live],
   );
 
-  // Opens where it was left; after that it follows the person.
+  // Opens where it was left (or where a navigation asked); after that it follows the person.
   const [currentId, setCurrentId] = useState<string | null>(null);
   useEffect(() => {
-    if (currentId === null && state) setCurrentId(steps[firstRunPosition(steps, state.firstRun.position)].id);
-  }, [currentId, state, steps]);
+    if (currentId !== null || !state) return;
+    // Left in the rest: it stays shown when the person goes back to an essential step.
+    if (inTheRest(state.firstRun.position)) setRest(true);
+    setCurrentId(asked && steps.some((s) => s.id === asked) ? asked : steps[firstRunPosition(steps, state.firstRun.position)].id);
+  }, [currentId, state, steps, asked]);
   const index = Math.max(0, steps.findIndex((s) => s.id === currentId));
   const current = steps[index];
 
@@ -100,15 +125,18 @@ function FirstRunWizard({ onExit, onNavigate }: { onExit: () => void; onNavigate
     [state],
   );
 
+  const goTo = (id: string) => {
+    if (inTheRest(id)) setRest(true);
+    setCurrentId(id);
+    setError(null);
+    void save({ position: id }).catch(() => undefined);
+  };
   const go = (i: number) => {
     const target = steps[Math.max(0, Math.min(steps.length - 1, i))];
-    if (!target) return;
-    setCurrentId(target.id);
-    setError(null);
-    void save({ position: target.id }).catch(() => undefined);
+    if (target) goTo(target.id);
   };
   const skip = () => {
-    const skipped = [...new Set([...(state?.firstRun.skipped ?? []), current.id])];
+    const skipped = [...new Set([...(state?.firstRun.skipped ?? []).map(currentStepId), current.id])];
     const target = steps[Math.min(steps.length - 1, index + 1)];
     setCurrentId(target.id);
     void save({ skipped, position: target.id }).catch((e) => setError(errorText(e)));
@@ -124,6 +152,39 @@ function FirstRunWizard({ onExit, onNavigate }: { onExit: () => void; onNavigate
     } finally {
       setBusy(false);
     }
+  };
+
+  /** The Agent's model follows the choice made here (a desktop that keeps none has nothing to set). */
+  const commitAi = async (source: AgentModelSource) => {
+    if (!prefs || prefs.model.source === source) return;
+    await agentPreferences.set({ model: { source } });
+    await refreshPrefs();
+  };
+  const signedIn = () => {
+    void refreshCodex();
+    setAiChoice('chatgpt');
+    // Signed in to ChatGPT here: the Agent thinks with it (Codex's default model).
+    if (prefs && prefs.model.source !== 'chatgpt')
+      void agentPreferences
+        .set({ model: { source: 'chatgpt' } })
+        .then(() => refreshPrefs())
+        .catch((e) => setError(`The Agent is not set to use ChatGPT: ${errorText(e)}`));
+  };
+
+  /** The essentials are done: the Agent sets up the rest, in a "Set up OAIY" conversation. */
+  const continueWithAgent = async () => {
+    setBusy(true);
+    try {
+      await save({ finished: true, position: 'handoff' });
+    } catch (e) {
+      setError(errorText(e));
+      setBusy(false);
+      return;
+    }
+    setBusy(false);
+    toast.push({ kind: 'success', title: 'The essentials are set up', body: 'The Agent takes it from here. Setup is in Settings whenever you want it again.' });
+    onNavigate('agent');
+    void askAgent('setupWithAgent');
   };
 
   const toggleChosen = async (id: string, on: boolean) => {
@@ -150,36 +211,81 @@ function FirstRunWizard({ onExit, onNavigate }: { onExit: () => void; onNavigate
   const isPlugin = current.id.startsWith('plugin:') && !!current.pluginId;
   const kicker = `Step ${index + 1} of ${steps.length}`;
   const nextStep = () => go(index + 1);
+  const ready = aiReady({ catalog, prefs, codexConnected: codexOn });
+  const line = localModelLine(rec, catalog);
 
   let content: ReactNode;
   let footer: ReactNode = null;
   const status = error ? <span className="card-warn">{error}</span> : current.state === 'done' ? <span className="setup-ok"><Check size={13} /> Done</span> : current.optional ? 'Optional' : null;
   switch (current.id) {
     case 'welcome':
-      content = <Welcome kicker={kicker} />;
+      content = <WelcomeStep kicker={kicker} />;
       footer = <StepFooter status={status} onNext={nextStep} nextLabel="Get started" />;
       break;
-    case 'engine': {
-      const ready = engineReady({ catalog, guide });
+    case 'ai': {
+      const chosenReady = choice === 'engine' ? line.kind === 'chosen' : choice === 'chatgpt' ? codexOn : false;
       content = (
-        <>
-          <StepHeader
-            kicker={kicker}
-            title="The engine"
-            state={current.state}
-            description="OAIY runs its models on this computer. The language model is the one you choose in Engines; OAIY Voice hears and speaks on calls."
-          />
-          <div className="setup-reqs">
-            <EngineModelCard group="llm" catalog={catalog} onChanged={() => void refreshCatalog()} onOpenEngines={() => onNavigate('engines')} />
-            <ServiceCard id="oaiy-voice" why="Hears callers and speaks the replies, on this computer. Needed for phone calls; about 4.3 GB." services={services} onChanged={() => void refreshServices()} />
-          </div>
-          <details className="setup-more-source" open={!ready && catalog?.running === false ? true : undefined}>
-            <summary>Or use an AI source instead: ChatGPT, a provider’s API key, or a local model server</summary>
-            <AiSourceChoice onNavigate={(v) => onNavigate(v)} />
-          </details>
-        </>
+        <YourAiStep
+          kicker={kicker}
+          state={current.state}
+          rec={rec}
+          catalog={catalog}
+          codex={codexStatus}
+          choice={choice}
+          onChoose={setAiChoice}
+          onCatalogChanged={() => void refreshCatalog()}
+          onSignedIn={signedIn}
+          onOpenEngines={() => onNavigate('engines')}
+        />
       );
-      footer = <StepFooter onBack={() => go(index - 1)} status={status ?? (ready ? null : 'Waiting for a language model')} onSkip={ready ? undefined : skip} onNext={nextStep} nextDisabled={!ready} />;
+      const waiting = choice === 'chatgpt' ? 'Sign in with ChatGPT to use it' : 'Waiting for a language model in Engines';
+      footer = (
+        <StepFooter
+          onBack={() => go(index - 1)}
+          status={status ?? (chosenReady ? null : waiting)}
+          onSkip={chosenReady ? undefined : skip}
+          onNext={() => {
+            if (!choice) return;
+            setBusy(true);
+            void commitAi(choice)
+              .then(nextStep, (e) => setError(`The Agent’s model was not saved: ${errorText(e)}`))
+              .finally(() => setBusy(false));
+          }}
+          nextDisabled={!chosenReady}
+          busy={busy}
+        />
+      );
+      break;
+    }
+    case 'agent':
+      content = <AgentStep kicker={kicker} state={current.state} control={control} />;
+      footer = <StepFooter onBack={() => go(index - 1)} status={status} onNext={nextStep} />;
+      break;
+    case 'handoff': {
+      const source = prefs?.model.source ?? (line.kind === 'chosen' ? 'engine' : codexOn ? 'chatgpt' : null);
+      const aiLine =
+        source === 'chatgpt' ? `ChatGPT${codexStatus?.email ? `, signed in as ${codexStatus.email}` : ''}.` : line.kind === 'chosen' ? `On this computer: ${line.name}, chosen in Engines.` : modelLineText(line);
+      content = (
+        <HandoffStep
+          kicker={kicker}
+          state={current.state}
+          aiLine={aiLine}
+          aiReady={ready}
+          mayChange={control.settings === undefined ? null : control.settings === null ? true : control.settings.agentMayChange}
+          onPick={(id) => goTo(id)}
+        />
+      );
+      footer = (
+        <StepFooter
+          onBack={() => go(index - 1)}
+          status={status ?? (ready ? null : 'Your AI is not set up yet')}
+          onSkip={() => goTo('plugins')}
+          skipLabel="Set up the rest myself"
+          onNext={() => void continueWithAgent()}
+          nextLabel="Continue with the Agent"
+          busy={busy}
+        />
+      );
       break;
     }
     case 'plugins':
@@ -226,18 +332,22 @@ function FirstRunWizard({ onExit, onNavigate }: { onExit: () => void; onNavigate
       }
   }
 
-  const flush = isPlugin;
+  const inRest = steps.some((s) => s.id === 'plugins');
   return (
     <WizardFrame
       title="Set up OAIY"
-      subtitle="The engine, your plugins and their devices, and the apps that use them. Leave any time: setup keeps its place."
+      subtitle={
+        inRest
+          ? 'Your AI and the Agent, then your plugins, their devices and your apps, step by step. Leave any time: setup keeps its place.'
+          : 'The essentials: your AI, and what the Agent may do. Then the Agent sets up the rest with you. Leave any time: setup keeps its place.'
+      }
       progress={progress}
       rail={steps.map((s) => ({ id: s.id, title: s.title, hint: s.hint, state: s.state, optional: s.optional }))}
       current={index}
       onPick={go}
       railLabel="Setup steps"
       onLeave={onExit}
-      flush={flush}
+      flush={isPlugin}
       footer={footer}
     >
       {content}
@@ -246,59 +356,8 @@ function FirstRunWizard({ onExit, onNavigate }: { onExit: () => void; onNavigate
 }
 
 // ---------------------------------------------------------------------------
-// First-run steps
+// The rest, by hand: plugins, connecting an app, done
 // ---------------------------------------------------------------------------
-
-function Welcome({ kicker }: { kicker: string }) {
-  const [runtime] = usePoll(() => bridge.status(), 5000);
-  const [installing, setInstalling] = useState(false);
-  const node = runtime?.nodeRuntime;
-  const parts: Array<{ icon: ReactNode; title: string; text: string }> = [
-    { icon: <Cpu size={17} />, title: 'The engine', text: 'A language model on this computer, the one you choose in Engines, and OAIY Voice for calls.' },
-    { icon: <Puzzle size={17} />, title: 'Plugins', text: 'An AI receptionist for your phone, and more. Each one sets itself up step by step, down to pairing its device.' },
-    { icon: <Link2 size={17} />, title: 'Your apps', text: 'Let FormLogic, or another app you approve, run flows on this computer.' },
-  ];
-  return (
-    <div className="setup-welcome">
-      <StepHeader kicker={kicker} title="Welcome to OAIY" description="Orchestrate AI Yourself: your models, your devices and your flows, on this computer. A few steps get it going; each one checks itself once it is true, and any can be skipped and done later." />
-      <ul className="setup-welcome-parts">
-        {parts.map((p) => (
-          <li key={p.title}>
-            <span className="setup-req-icon" aria-hidden>
-              {p.icon}
-            </span>
-            <span>
-              <strong>{p.title}</strong>
-              <small>{p.text}</small>
-            </span>
-          </li>
-        ))}
-      </ul>
-      {runtime && !runtime.ready && (
-        <div className="setup-note" role="status">
-          <TriangleAlert size={13} />
-          <span>Flows cannot run on this computer yet: {runtime.flowRuntime.detail ?? 'the flow runtime is not ready.'}</span>
-          {node && !node.available && (
-            <button
-              type="button"
-              className="btn-tiny"
-              disabled={installing || node.installing}
-              onClick={() => {
-                setInstalling(true);
-                void nodeRuntime.install().finally(() => setInstalling(false));
-              }}
-            >
-              {node.installing || installing ? 'Installing Node…' : `Install Node ${node.installsVersion}`}
-            </button>
-          )}
-        </div>
-      )}
-      <p className="setup-trust">
-        <ShieldCheck size={13} /> Everything here stays on this computer. Keys, conversations and recordings are kept on this device.
-      </p>
-    </div>
-  );
-}
 
 function PluginsStep({
   kicker,
@@ -525,7 +584,8 @@ function ConnectStep({ kicker, state, paired, linked, onNavigate }: { kicker: st
 }
 
 function DoneStep({ kicker, steps, onPick }: { kicker: string; steps: FirstRunStep[]; onPick: (i: number) => void }) {
-  const left = steps.filter((s) => s.id !== 'done' && s.id !== 'welcome' && s.state !== 'done');
+  const counted = steps.filter((s) => s.id !== 'done' && s.id !== 'welcome' && s.id !== 'handoff');
+  const left = counted.filter((s) => s.state !== 'done');
   return (
     <div className="setup-done">
       <StepHeader
@@ -534,24 +594,22 @@ function DoneStep({ kicker, steps, onPick }: { kicker: string; steps: FirstRunSt
         description={left.length ? 'Finish now and come back to the rest any time: setup is in Settings, and the Overview keeps a card for what is left.' : 'OAIY is ready. Setup is in Settings whenever you want to run it again.'}
       />
       <ul className="setup-summary">
-        {steps
-          .filter((s) => s.id !== 'done' && s.id !== 'welcome')
-          .map((s) => (
-            <li key={s.id} className={`is-${s.state}`}>
-              <span className="setup-summary-mark" aria-hidden>
-                {s.state === 'done' ? <Check size={13} strokeWidth={2.6} /> : s.id === 'engine' ? <Sparkles size={13} /> : <Package size={13} />}
-              </span>
-              <span>
-                <strong>{s.title}</strong>
-                <small>{s.state === 'done' ? 'Done' : s.state === 'skipped' ? 'Skipped for now' : s.optional ? 'Optional, not done' : 'Not done yet'}</small>
-              </span>
-              {s.state !== 'done' && (
-                <button type="button" className="btn-tiny" onClick={() => onPick(steps.indexOf(s))}>
-                  Go to it
-                </button>
-              )}
-            </li>
-          ))}
+        {counted.map((s) => (
+          <li key={s.id} className={`is-${s.state}`}>
+            <span className="setup-summary-mark" aria-hidden>
+              {s.state === 'done' ? <Check size={13} strokeWidth={2.6} /> : s.id === 'ai' ? <Sparkles size={13} /> : <Package size={13} />}
+            </span>
+            <span>
+              <strong>{s.title}</strong>
+              <small>{s.state === 'done' ? 'Done' : s.state === 'skipped' ? 'Skipped for now' : s.optional ? 'Optional, not done' : 'Not done yet'}</small>
+            </span>
+            {s.state !== 'done' && (
+              <button type="button" className="btn-tiny" onClick={() => onPick(steps.indexOf(s))}>
+                Go to it
+              </button>
+            )}
+          </li>
+        ))}
       </ul>
     </div>
   );

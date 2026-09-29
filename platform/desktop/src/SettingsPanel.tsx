@@ -123,8 +123,8 @@ function SetupSection() {
       <h3 className="section-title">Setup</h3>
       <p className="form-hint">
         {state === null ? '' : state.firstRun.finished ? 'Setup is finished. ' : 'Setup is not finished yet. '}
-        Run it again to choose the engine’s model, add plugins and set them up, step by step, down to their devices. What is
-        already set up is kept, and shows as done.
+        Run it again to choose your AI and what the Agent may change; then the Agent, or you step by step, sets up the rest.
+        What is already set up is kept, and shows as done.
       </p>
       <div className="form-actions">
         <button className="btn" disabled={busy} onClick={() => void runAgain()}>

@@ -11,6 +11,7 @@ import {
 } from './setupGuide';
 import { firstRunProgress, firstRunSteps, pluginsNeedingSetup, readSetup } from './setupFlow';
 import { usePoll } from './SetupParts';
+import { useLiveSetup } from './useLiveSetup';
 import { openSetup, useSetupState } from './useSetupState';
 
 /**
@@ -34,13 +35,15 @@ export default function SetupGuidePanel({ onNavigate, onDismiss, actions, ...sta
   const setup = useSetupState();
   // The model chosen in Engines counts for the engine step (asked now and then; the card is small).
   const [catalog] = usePoll(() => engines.catalog(), 15000, !!setup && !setup.firstRun.finished);
+  // A plugin set up by hand counts as set up once its steps' checks all pass (no nudge while they are asked).
+  const live = useLiveSetup(state.plugins, setup);
   const checks = deriveSetupSteps(state);
   const guide = setupProgress(checks);
   const complete = setupComplete(checks);
-  const nudges = pluginsNeedingSetup(state.plugins, setup);
-  const firstRun = setup && !setup.firstRun.finished ? firstRunSteps({ state: setup, plugins: state.plugins, catalog, guide: state }) : null;
+  const nudges = pluginsNeedingSetup(state.plugins, setup, live);
+  const firstRun = setup && !setup.firstRun.finished ? firstRunSteps({ state: setup, plugins: state.plugins, catalog, guide: state, live }) : null;
   const progress = firstRun ? firstRunProgress(firstRun) : null;
-  const nextUp = firstRun?.find((s) => s.state === 'todo' && s.id !== 'welcome');
+  const nextUp = firstRun?.find((s) => s.state === 'todo' && s.id !== 'welcome' && s.id !== 'handoff') ?? firstRun?.find((s) => s.id === 'handoff' && s.state === 'todo');
 
   const title = firstRun
     ? `Continue setup · ${progress!.done} of ${progress!.total}`

@@ -1,7 +1,12 @@
 import type {
+  AgentModelSource,
+  AgentPreferences,
   CheckOutcome,
+  CodexModel,
+  ControlLogEntry,
   EngineCatalog,
   EngineCatalogModel,
+  EngineRecommendation,
   PluginRecord,
   PluginSetupState,
   ServiceSnapshot,
@@ -10,8 +15,9 @@ import type {
   SetupRequirementJson,
   SetupState,
   SetupStepJson,
+  SuggestedModel,
 } from './api';
-import { deriveSetupSteps, type SetupInput } from './setupGuide';
+import type { SetupInput } from './setupGuide';
 
 /**
  * The setup wizard's steps and their state, worked out from live data.
@@ -122,16 +128,84 @@ export function readSetup(record: PluginRecord | null | undefined): DeclaredSetu
   return { version: setup.version || 1, title: setup.title || `Set up ${name}`, steps: [first, ...steps], dropped };
 }
 
-/** Does `record` need its setup run (its `setup.version` is newer than the one last finished)? */
-export function pluginNeedsSetup(record: PluginRecord, state: SetupState | null | undefined): boolean {
+/** Does its setup have steps with a `done` check (run on the desktop), so it can be judged live? */
+export function hasDoneChecks(setup: DeclaredSetup): boolean {
+  return setup.steps.some((s) => s.done !== undefined);
+}
+
+/** The last `done` and `when` answers of a plugin's steps, by step id. */
+export interface LiveChecks {
+  done: Record<string, CheckOutcome | undefined>;
+  when: Record<string, CheckOutcome | undefined>;
+}
+
+/**
+ * Set up by what is true now: every step with a `done` check that shows (its
+ * `when`, if it has one, passes) passes it, and there is at least one. `null`
+ * while a check it needs has not answered yet.
+ */
+export function setUpByChecks(setup: DeclaredSetup, checks: LiveChecks): boolean | null {
+  let counted = 0;
+  for (const s of setup.steps) {
+    if (s.done === undefined) continue;
+    if (s.when !== undefined) {
+      const shown = checks.when[s.id];
+      if (!shown) return null;
+      if (!shown.passed) continue;
+    }
+    const done = checks.done[s.id];
+    if (!done) return null;
+    if (!done.passed) return false;
+    counted++;
+  }
+  return counted > 0;
+}
+
+/**
+ * A plugin's setup, all told:
+ * - `none`: it declares no setup;
+ * - `set-up`: its setup version was finished here, or (with `live`) its steps'
+ *   `done` checks all pass now, with no clicking through;
+ * - `needs-setup`: neither;
+ * - `checking`: its checks have not answered yet (nothing to nudge about on a guess).
+ *
+ * `live` is what `useLiveSetup` found, by plugin id; without it, only the
+ * recorded version counts.
+ */
+export type PluginSetupStatus = 'none' | 'set-up' | 'needs-setup' | 'checking';
+
+export function pluginSetupStatus(
+  record: PluginRecord,
+  state: SetupState | null | undefined,
+  live?: Record<string, boolean | null | undefined>,
+): PluginSetupStatus {
   const declared = readSetup(record);
-  if (!declared || !state) return false;
-  return declared.version > (state.plugins[record.id]?.version ?? 0);
+  if (!declared) return 'none';
+  if (!state) return 'checking';
+  if (declared.version <= (state.plugins[record.id]?.version ?? 0)) return 'set-up';
+  if (!live || !hasDoneChecks(declared)) return 'needs-setup';
+  const now = live[record.id];
+  return now === true ? 'set-up' : now === false ? 'needs-setup' : 'checking';
+}
+
+/** Does `record` need its setup run? Its setup version is newer than the one last finished, and its live checks (given `live`) do not all pass. */
+export function pluginNeedsSetup(record: PluginRecord, state: SetupState | null | undefined, live?: Record<string, boolean | null | undefined>): boolean {
+  return pluginSetupStatus(record, state, live) === 'needs-setup';
 }
 
 /** The plugins to nudge about: loaded, not turned off, and needing their setup run. */
-export function pluginsNeedingSetup(records: PluginRecord[] | null, state: SetupState | null): PluginRecord[] {
-  return (records ?? []).filter((p) => !p.userDisabled && !!p.manifest && pluginNeedsSetup(p, state));
+export function pluginsNeedingSetup(records: PluginRecord[] | null, state: SetupState | null, live?: Record<string, boolean | null | undefined>): PluginRecord[] {
+  return (records ?? []).filter((p) => !p.userDisabled && !!p.manifest && pluginNeedsSetup(p, state, live));
+}
+
+/** The plugins whose live checks are worth running: loaded, on, with checks, and their setup version not finished here. */
+export function pluginsToCheck(records: PluginRecord[] | null, state: SetupState | null): PluginRecord[] {
+  if (!state) return [];
+  return (records ?? []).filter((p) => {
+    if (p.userDisabled || !p.manifest) return false;
+    const declared = readSetup(p);
+    return !!declared && hasDoneChecks(declared) && declared.version > (state.plugins[p.id]?.version ?? 0);
+  });
 }
 
 /** Where to send a plugin command: the plugin's own connector that declares it. */
@@ -248,10 +322,15 @@ export function canSkip(s: PluginStep): boolean {
 }
 
 // ---------------------------------------------------------------------------
-// The first-run wizard
+// The first-run wizard: the essentials, then the Agent (or the rest by hand)
 // ---------------------------------------------------------------------------
 
-export type FirstRunId = 'welcome' | 'engine' | 'plugins' | `plugin:${string}` | 'connect' | 'done';
+/**
+ * The essentials are `welcome`, `ai` (what the Agent thinks with), `agent`
+ * (what it may change) and `handoff` (continue with the Agent). The rest,
+ * from `plugins` on, shows only once the person chooses to set it up by hand.
+ */
+export type FirstRunId = 'welcome' | 'ai' | 'agent' | 'handoff' | 'plugins' | `plugin:${string}` | 'connect' | 'done';
 
 export interface FirstRunStep {
   id: FirstRunId;
@@ -264,40 +343,87 @@ export interface FirstRunStep {
   pluginId?: string;
 }
 
+/** Steps an older dashboard saved by another name: a record it left resumes at the step it became. */
+const RENAMED: Record<string, FirstRunId> = { engine: 'ai' };
+
+export function currentStepId(id: string): string {
+  return RENAMED[id] ?? id;
+}
+
+const ORDER: Record<string, number> = { welcome: 0, ai: 1, agent: 2, handoff: 3, plugins: 4, connect: 6, done: 7 };
+
+/** Where a step id sits in the whole flow (-1: not one of its steps). */
+function rank(id: string | null | undefined): number {
+  if (!id) return -1;
+  const step = currentStepId(id);
+  if (step.startsWith('plugin:')) return 5;
+  return ORDER[step] ?? -1;
+}
+
+/** Is `position` in the rest of setup (Plugins onward), the part the person chose to do by hand? */
+export function inTheRest(position: string | null | undefined): boolean {
+  return rank(position) >= ORDER.plugins;
+}
+
 export interface FirstRunInput {
   state: SetupState | null;
   plugins: PluginRecord[] | null;
   catalog: EngineCatalog | null;
-  /** What the old guide read: the AI source is ready (ChatGPT, a keyed provider, a local model). */
+  /** What the old guide read: whether ChatGPT is signed in, the apps paired. */
   guide: SetupInput;
   /** A FormLogic account is linked. */
   linked?: boolean;
+  /** The Agent's model (`/api/agent/preferences`): `undefined` not read yet, `null` a desktop that keeps none. */
+  prefs?: AgentPreferences | null;
+  /** The person chose "Set up the rest myself" (the rest also shows while the record's place is in it). */
+  rest?: boolean;
+  /** Plugins found set up by their live checks (`useLiveSetup`). */
+  live?: Record<string, boolean | null | undefined>;
 }
 
-/** The language model is there: one chosen in Engines, or an AI source (the old guide's rule). */
-export function engineReady(input: Pick<FirstRunInput, 'catalog' | 'guide'>): boolean {
-  if (chosenModel(input.catalog, 'llm')) return true;
-  return deriveSetupSteps(input.guide).find((s) => s.id === 'ai')?.done === true;
+/**
+ * The Agent has a model to think with: the one the Agent is set to use is
+ * ready (a language model chosen in Engines, or ChatGPT signed in). A desktop
+ * that keeps no preference is ready with either.
+ */
+export function aiReady(input: { catalog: EngineCatalog | null; prefs?: AgentPreferences | null; codexConnected: boolean }): boolean {
+  const local = !!chosenModel(input.catalog, 'llm');
+  switch (input.prefs?.model?.source) {
+    case 'chatgpt':
+      return input.codexConnected;
+    case 'engine':
+      return local;
+    default:
+      return local || input.codexConnected;
+  }
 }
 
 export function firstRunSteps(input: FirstRunInput): FirstRunStep[] {
   const fr = input.state?.firstRun;
-  const skipped = new Set(fr?.skipped ?? []);
+  const skipped = new Set((fr?.skipped ?? []).map(currentStepId));
   const chosen = fr?.chosenPlugins ?? [];
   const plugins = input.plugins ?? [];
   const installed = (id: string) => plugins.find((p) => p.id === id && !!p.manifest);
   const mark = (id: string, done: boolean): StepState => (done ? 'done' : skipped.has(id) ? 'skipped' : 'todo');
+  const at = rank(fr?.position);
+  /** A step with nothing to do but read or choose (it has a default) is done once passed. */
+  const passed = (id: string) => !!fr && (fr.finished || at > rank(id));
+  const ready = aiReady({ catalog: input.catalog, prefs: input.prefs, codexConnected: input.guide.codexConnected === true });
   const steps: FirstRunStep[] = [
-    { id: 'welcome', title: 'Welcome', hint: 'What OAIY sets up', state: mark('welcome', !!fr && (fr.finished || (!!fr.position && fr.position !== 'welcome'))), optional: false },
-    { id: 'engine', title: 'The engine', hint: 'The language model and voice', state: mark('engine', engineReady(input)), optional: false },
-    {
-      id: 'plugins',
-      title: 'Plugins',
-      hint: chosen.length ? `${chosen.length} chosen` : 'Phone, calendar and more',
-      state: mark('plugins', chosen.length > 0 && chosen.every((id) => !!installed(id))),
-      optional: true,
-    },
+    { id: 'welcome', title: 'Welcome', hint: 'What OAIY sets up', state: mark('welcome', passed('welcome')), optional: false },
+    { id: 'ai', title: 'Your AI', hint: 'On this computer, or ChatGPT', state: mark('ai', ready), optional: false },
+    { id: 'agent', title: 'The Agent', hint: 'What it may change', state: mark('agent', passed('agent')), optional: false },
+    { id: 'handoff', title: 'Continue with the Agent', hint: 'It sets up the rest with you', state: fr?.finished ? 'done' : 'todo', optional: false },
   ];
+  if (!input.rest && !inTheRest(fr?.position)) return steps;
+
+  steps.push({
+    id: 'plugins',
+    title: 'Plugins',
+    hint: chosen.length ? `${chosen.length} chosen` : 'Phone, calendar and more',
+    state: mark('plugins', chosen.length > 0 && chosen.every((id) => !!installed(id))),
+    optional: true,
+  });
   for (const id of chosen) {
     const record = installed(id);
     const declared = readSetup(record);
@@ -306,7 +432,7 @@ export function firstRunSteps(input: FirstRunInput): FirstRunStep[] {
       id: `plugin:${id}`,
       title: declared.title,
       hint: record.manifest?.name ?? id,
-      state: mark(`plugin:${id}`, !pluginNeedsSetup(record, input.state)),
+      state: mark(`plugin:${id}`, pluginSetupStatus(record, input.state, input.live) === 'set-up'),
       optional: true,
       pluginId: id,
     });
@@ -317,18 +443,190 @@ export function firstRunSteps(input: FirstRunInput): FirstRunStep[] {
   return steps;
 }
 
-/** The step to open on: the one recorded, while it is still a step; else the first not done. */
+/**
+ * The step to open on: the one recorded (by its current name), while it is
+ * still a step; else the first not done (from Plugins on, when the record's
+ * place was in the rest, such as a plugin no longer chosen).
+ */
 export function firstRunPosition(steps: FirstRunStep[], position: string | null | undefined): number {
-  const at = position ? steps.findIndex((s) => s.id === position) : -1;
+  const id = position ? currentStepId(position) : null;
+  const at = id ? steps.findIndex((s) => s.id === id) : -1;
   if (at >= 0) return at;
-  const open = steps.findIndex((s) => s.state === 'todo');
+  const from = inTheRest(id) ? Math.max(0, steps.findIndex((s) => s.id === 'plugins')) : 0;
+  const open = steps.findIndex((s, i) => i >= from && s.state === 'todo');
   return open >= 0 ? open : steps.length - 1;
 }
 
-/** "3 of 5": the steps done (a skipped one is not), over the ones that count (not the welcome or the end). */
+/** "1 of 2": the steps done (a skipped one is not), over the ones that count (not the welcome, the hand-off or the end). */
 export function firstRunProgress(steps: FirstRunStep[]): { done: number; total: number } {
-  const counted = steps.filter((s) => s.id !== 'welcome' && s.id !== 'done');
+  const counted = steps.filter((s) => s.id !== 'welcome' && s.id !== 'handoff' && s.id !== 'done');
   return { done: counted.filter((s) => s.state === 'done').length, total: counted.length };
+}
+
+// ---------------------------------------------------------------------------
+// Your AI: on this computer, or ChatGPT
+// ---------------------------------------------------------------------------
+
+/**
+ * The desktop's recommendation, or, from a desktop that gives none (an older
+ * one, or before `/api/engines/recommendation` exists): local if Engines has
+ * a language model chosen, ChatGPT otherwise.
+ */
+export function recommendationOrFallback(rec: EngineRecommendation | null, catalog: EngineCatalog | null, codexConnected: boolean): EngineRecommendation {
+  if (rec) return rec;
+  const chosen = chosenModel(catalog, 'llm');
+  return {
+    recommend: chosen ? 'engine' : 'chatgpt',
+    local: { ok: !!chosen, reason: null, gpus: [], chosen, suggested: null },
+    chatgpt: { signedIn: codexConnected },
+  };
+}
+
+/** The two choices, the recommended one first (the other stays there to choose). */
+export function aiChoices(rec: EngineRecommendation): AgentModelSource[] {
+  return rec.recommend === 'chatgpt' ? ['chatgpt', 'engine'] : ['engine', 'chatgpt'];
+}
+
+/** The choice the step opens on: ChatGPT when the Agent already uses it, local when Engines has a model chosen, else the recommendation. */
+export function initialAiChoice(rec: EngineRecommendation, prefs: AgentPreferences | null | undefined, catalog: EngineCatalog | null): AgentModelSource {
+  if (prefs?.model?.source === 'chatgpt') return 'chatgpt';
+  if (chosenModel(catalog, 'llm') || rec.local.chosen) return 'engine';
+  return rec.recommend;
+}
+
+export interface ModelLine {
+  /** `chosen`: Engines has one; `recommended`: the catalog's to download; `none`: neither. */
+  kind: 'chosen' | 'recommended' | 'none';
+  name: string | null;
+  /** The recommended one's download size and the GPU memory it needs. */
+  detail: string | null;
+}
+
+/**
+ * The line that names the local model: what Engines has chosen, whatever it
+ * is; only when nothing is, the catalog's recommended language model (from
+ * the catalog, or as the recommendation names it). Never a model of its own.
+ */
+export function localModelLine(rec: EngineRecommendation | null, catalog: EngineCatalog | null): ModelLine {
+  const chosen = chosenModel(catalog, 'llm') ?? rec?.local.chosen ?? null;
+  if (chosen) return { kind: 'chosen', name: chosen, detail: null };
+  const offer: SuggestedModel | null = recommendedModel(catalog, 'llm') ?? rec?.local.suggested ?? null;
+  if (!offer) return { kind: 'none', name: null, detail: null };
+  const detail = [offer.sizeGb ? `${offer.sizeGb} GB download` : null, offer.vramGb ? `needs ${offer.vramGb} GB of GPU memory` : null].filter(Boolean).join(' · ');
+  return { kind: 'recommended', name: offer.name || offer.id, detail: detail || null };
+}
+
+// ---------------------------------------------------------------------------
+// Settings → Agent: its model, and what it changed
+// ---------------------------------------------------------------------------
+
+export interface ModelOption {
+  /** What is saved as the model; `''` names none, so Codex uses its own default. */
+  value: string;
+  label: string;
+}
+
+/** Codex's catalogue as a picker: its default first, then each model; one saved earlier stays listed if the catalogue has dropped it. */
+export function codexModelOptions(models: CodexModel[] | null, saved: string | null | undefined): ModelOption[] {
+  const byDefault = models?.find((m) => m.isDefault);
+  const out: ModelOption[] = [{ value: '', label: byDefault ? `Codex’s default (${byDefault.displayName || byDefault.id})` : 'Codex’s default' }];
+  for (const m of models ?? []) if (!out.some((o) => o.value === m.id)) out.push({ value: m.id, label: m.displayName || m.id });
+  if (saved && !out.some((o) => o.value === saved)) out.push({ value: saved, label: `${saved} (no longer offered)` });
+  return out;
+}
+
+/** The change tools (CONTROL_API.md §1), in words. */
+const TOOL_WORDS: Record<string, string> = {
+  model_set_default: 'Chose a model in Engines',
+  model_download: 'Downloaded a model',
+  engine_start: 'Started the engines',
+  engine_stop: 'Stopped the engines',
+  engine_restart: 'Restarted the engines',
+  agent_model_set: 'Changed the Agent’s model',
+  chatgpt_sign_in: 'Started the ChatGPT sign-in',
+  chatgpt_sign_out: 'Signed out of ChatGPT',
+  service_install: 'Installed a service',
+  service_start: 'Started a service',
+  service_stop: 'Stopped a service',
+  service_uninstall: 'Removed a service',
+  plugin_install: 'Installed a plugin',
+  plugin_enable: 'Turned a plugin on',
+  plugin_disable: 'Turned a plugin off',
+  plugin_uninstall: 'Removed a plugin',
+  plugin_settings_set: 'Changed a plugin’s settings',
+  plugin_command: 'Sent a plugin a command',
+  plugin_setup_open: 'Showed a plugin’s setup',
+  plugin_setup_step_done: 'Marked a setup step done',
+  flow_create: 'Made a flow',
+  flow_update: 'Changed a flow',
+  flow_run: 'Ran a flow',
+  flow_delete: 'Deleted a flow',
+  calendar_settings_set: 'Changed the business, its hours or services',
+  link_sync_now: 'Synced with FormLogic',
+  setup_finish: 'Finished setup',
+};
+
+const SESSION_WORDS: Record<string, string> = {
+  project: 'In a chat',
+  setup: 'Setting up OAIY',
+  runner: 'Running a task',
+  call: 'On a call',
+  sms: 'In a text',
+  task: 'In a task',
+};
+
+/** When a change was made: an ISO time, or seconds or milliseconds since 1970. */
+export function changeTime(at: unknown): Date | null {
+  if (typeof at === 'number' && Number.isFinite(at)) return new Date(at < 1e12 ? at * 1000 : at);
+  if (typeof at === 'string' && at.trim()) {
+    if (/^\d+(\.\d+)?$/.test(at.trim())) return changeTime(Number(at));
+    const d = new Date(at);
+    return Number.isNaN(d.getTime()) ? null : d;
+  }
+  return null;
+}
+
+/** What a change was about, from its arguments (a plugin, a model, a service). */
+function changeSubject(args: unknown): string | null {
+  if (!args || typeof args !== 'object') return null;
+  const a = args as Record<string, unknown>;
+  const pick = (k: string) => (typeof a[k] === 'string' && (a[k] as string).trim() ? (a[k] as string).trim() : null);
+  const model = pick('model');
+  const group = pick('group');
+  if (model && group) return `${model} (${group})`;
+  return pick('pluginId') ?? pick('id') ?? model ?? pick('catalogId') ?? pick('source') ?? pick('name') ?? pick('command') ?? null;
+}
+
+export interface ChangeRow {
+  title: string;
+  /** The tool, as the log names it. */
+  tool: string;
+  subject: string | null;
+  session: string | null;
+  when: Date | null;
+  ok: boolean;
+}
+
+/** One change, readable: its own summary when it wrote one, else the tool in words and what it was about. */
+export function describeChange(e: ControlLogEntry): ChangeRow {
+  const words = TOOL_WORDS[e.tool] ?? (e.tool.replace(/[_.]+/g, ' ').replace(/^\w/, (c) => c.toUpperCase()) || 'A change');
+  const subject = changeSubject(e.args);
+  return {
+    title: e.summary?.trim() || words,
+    tool: e.tool,
+    subject: e.summary?.trim() ? null : subject,
+    session: e.session ? SESSION_WORDS[e.session] ?? e.session : null,
+    when: changeTime(e.at),
+    ok: e.ok !== false,
+  };
+}
+
+/** Newest first (the log is served so; this keeps it so whatever came), undated ones last. */
+export function newestFirst(entries: ControlLogEntry[]): ControlLogEntry[] {
+  return entries
+    .map((e, i) => ({ e, i, t: changeTime(e.at)?.getTime() ?? Number.NEGATIVE_INFINITY }))
+    .sort((a, b) => (b.t === a.t ? a.i - b.i : b.t - a.t))
+    .map((x) => x.e);
 }
 
 // ---------------------------------------------------------------------------
