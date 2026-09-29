@@ -1,5 +1,6 @@
 import { useCallback, useEffect, useMemo, useRef, useState, type KeyboardEvent } from 'react';
 import {
+  BookUser,
   Bot,
   CalendarDays,
   Check,
@@ -40,6 +41,7 @@ import OverviewPanel from './OverviewPanel';
 import RunsPanel from './RunsPanel';
 import CalendarPanel from './CalendarPanel';
 import HoursPanel from './HoursPanel';
+import ContactsPanel from './ContactsPanel';
 import PluginScreenPage from './PluginScreenPage';
 import ConnectionsPanel from './ConnectionsPanel';
 import PairingPrompt from './PairingPrompt';
@@ -77,6 +79,8 @@ type BuiltinView =
   | 'calendar'
   /** Hours & Services: the business the receptionist speaks for. */
   | 'hours'
+  /** The people who ring and text: their names, the person's notes, what the receptionist remembered. */
+  | 'contacts'
   | 'engines'
   | 'overview'
   | 'services'
@@ -113,6 +117,7 @@ const SECTIONS: Section[] = [
   { id: 'agent', label: 'Agent', icon: Bot, group: 'Work', tabs: ['agent'] },
   { id: 'flows', label: 'Flows', icon: Workflow, group: 'Work', tabs: ['flows', 'runs'] },
   { id: 'calendar', label: 'Calendar', icon: CalendarDays, group: 'Work', tabs: ['calendar', 'hours'] },
+  { id: 'contacts', label: 'Contacts', icon: BookUser, group: 'Work', tabs: ['contacts'] },
   { id: 'engines', label: 'Engines', icon: Cpu, group: 'Setup', tabs: ['engines', 'models'] },
   { id: 'services', label: 'Services', icon: Server, group: 'Setup', tabs: ['services', 'python'] },
   { id: 'connections', label: 'Connections', icon: Plug, group: 'Setup', tabs: ['connections', 'providers', 'plugins'] },
@@ -122,12 +127,15 @@ const SETTINGS: Section = { id: 'settings', label: 'Settings', icon: Settings2, 
 /**
  * The sections that are there only while a module is (a plugin provides it),
  * by the module: they go under that plugin's own section as a sub-menu when it
- * has one (the Calendar under the AI Receptionist), and stay where they are
- * when it has none (sections.ts `arrangeSections`).
+ * has one (the Calendar and Contacts under the AI Receptionist), and stay where
+ * they are when it has none (sections.ts `arrangeSections`). Contacts are the
+ * phone's: the people who ring and text.
  */
-const MODULE_SECTIONS: Record<string, string> = { calendar: 'calendar' };
+const MODULE_SECTIONS: Record<string, string> = { calendar: 'calendar', contacts: 'phone' };
+/** Their pages' order in the sub-menu, after the plugin's own (Phone): Calendar, Contacts, Hours & Services. */
+const SUB_MENU_ORDER = ['calendar', 'contacts', 'hours'] as const;
 /** The pages of those sections, by module: off with it. */
-const MODULE_VIEWS: Partial<Record<BuiltinView, string>> = { calendar: 'calendar', hours: 'calendar' };
+const MODULE_VIEWS: Partial<Record<BuiltinView, string>> = { calendar: 'calendar', hours: 'calendar', contacts: 'phone' };
 
 /** Each page: its tab's name and icon, and the line under the topbar's title. */
 const PAGE: Record<BuiltinView, { tab: string; icon: LucideIcon; copy: string }> = {
@@ -152,6 +160,11 @@ const PAGE: Record<BuiltinView, { tab: string; icon: LucideIcon; copy: string }>
     tab: 'Hours & Services',
     icon: Clock3,
     copy: 'Your business as the receptionist tells callers: its name, opening hours, services and booking rules.',
+  },
+  contacts: {
+    tab: 'Contacts',
+    icon: BookUser,
+    copy: 'The people who ring and text: their names, your notes for the receptionist, and what it remembered.',
   },
   engines: {
     tab: 'Engines',
@@ -308,7 +321,7 @@ export default function App() {
    * plugin, and a module that is off, add nothing (the desktop leaves them out).
    */
   const sections = useMemo(
-    () => arrangeSections(buildSections([...SECTIONS, SETTINGS], modules?.contributions?.sections, pageTab), modules, MODULE_SECTIONS),
+    () => arrangeSections(buildSections([...SECTIONS, SETTINGS], modules?.contributions?.sections, pageTab), modules, MODULE_SECTIONS, SUB_MENU_ORDER),
     [modules],
   );
   /** The requests waiting to be confirmed: the Calendar's count in the sidebar. */
@@ -337,6 +350,8 @@ export default function App() {
   const [setupStep, setSetupStep] = useState<string | null>(null);
   const [setupOpens, setSetupOpens] = useState(0);
   const [setupReturn, setSetupReturn] = useState<View>('overview');
+  /** The contact the Agent asked to show (its key), until Contacts has opened it. */
+  const [contactToOpen, setContactToOpen] = useState<string | null>(null);
   const viewRef = useRef<View>(view);
   viewRef.current = view;
   const setupState = useSetupState();
@@ -354,12 +369,14 @@ export default function App() {
     [],
   );
 
-  // The desktop may ask for a page (the Agent's plugin_setup_open and ui_open): a setup step, a plugin's page, or one of ours.
+  // The desktop may ask for a page (the Agent's plugin_setup_open and ui_open): a setup step, a plugin's page, or one of ours
+  // (Contacts with one person's contact open).
   useEffect(
     () =>
       onNavigate((target) => {
-        if (target.kind === 'setup') openSetup({ plugin: target.pluginId, step: target.stepId });
-        else setView(target.view as View);
+        if (target.kind === 'setup') return openSetup({ plugin: target.pluginId, step: target.stepId });
+        if (target.contact) setContactToOpen(target.contact);
+        setView(target.view as View);
       }),
     [],
   );
@@ -807,6 +824,7 @@ export default function App() {
             {view === 'runs' && <RunsPanel />}
             {view === 'calendar' && <CalendarPanel onOpenHours={() => setView('hours')} />}
             {view === 'hours' && <HoursPanel onOpenCalendar={() => setView('calendar')} />}
+            {view === 'contacts' && <ContactsPanel open={contactToOpen} onOpened={() => setContactToOpen(null)} />}
             {view === 'models' && <ModelsPanel />}
             {view === 'providers' && <AiProvidersPanel />}
             {view === 'connections' && <ConnectionsPanel />}

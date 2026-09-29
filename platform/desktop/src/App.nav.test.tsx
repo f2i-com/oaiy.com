@@ -11,9 +11,10 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import type { Appointment, ModulesSnapshot } from './api';
 
 const h = vi.hoisted(() => ({
-  navigate: null as null | ((target: { kind: 'view'; view: string } | { kind: 'setup' }) => void),
+  navigate: null as null | ((target: { kind: 'view'; view: string; contact?: string } | { kind: 'setup' }) => void),
   modulesList: vi.fn(),
   calendarGet: vi.fn(),
+  contactsList: vi.fn(),
 }));
 
 vi.mock('./navigate', () => ({
@@ -46,6 +47,7 @@ vi.mock('./api', async (importOriginal) => {
       free: vi.fn().mockResolvedValue({ minutes: 60, days: [] }),
     },
     voices: { ...real.voices, list: vi.fn().mockResolvedValue({ voices: [], chosen: null }) },
+    contacts: { ...real.contacts, list: (...a: unknown[]) => h.contactsList(...a) },
   };
 });
 
@@ -130,6 +132,13 @@ beforeEach(async () => {
     vi.fn(async () => new Response(JSON.stringify({ status: 'ok', product: 'oaiy-desktop', version: '0.1.0' }), { status: 200 })),
   );
   h.modulesList.mockResolvedValue(snapshot(true, true));
+  h.contactsList.mockResolvedValue({
+    contacts: [
+      { key: '491570006', number: '+61491570006', name: 'Lance', nameBy: 'owner', notes: '', facts: [], createdAt: '2026-09-29T00:00:00Z', updatedAt: '2026-09-29T00:00:00Z' },
+      { key: '400000001', number: '', name: 'Sam', nameBy: 'agent', notes: '', facts: [], createdAt: '2026-09-29T00:00:00Z', updatedAt: '2026-09-29T00:00:00Z' },
+    ],
+    total: 2,
+  });
   h.calendarGet.mockResolvedValue({
     settings: SETTINGS,
     appointments: [request('r1', '2026-10-01T10:00'), request('r2', '2026-10-02T09:00')],
@@ -155,13 +164,14 @@ afterEach(() => {
 });
 
 describe('the AI Receptionist’s sub-menu', () => {
-  it('holds its own page, the Calendar and Hours & Services, with the requests waiting counted', () => {
+  it('holds its own page, the Calendar, Contacts and Hours & Services, with the requests waiting counted', () => {
     const sub = nav().querySelector('.nav-sub')!;
     expect(sub.querySelector('.nav-parent')?.getAttribute('aria-label')).toBe('AI Receptionist');
     const children = [...sub.querySelectorAll('.nav-child')].map((b) => b.querySelector('span')?.textContent);
-    expect(children).toEqual(['Phone', 'Calendar', 'Hours & Services']);
-    // No Calendar entry of its own any more.
+    expect(children).toEqual(['Phone', 'Calendar', 'Contacts', 'Hours & Services']);
+    // No Calendar or Contacts entry of their own any more.
     expect(nav().querySelector('button[aria-label="Calendar"]')).toBeNull();
+    expect(nav().querySelector('button[aria-label="Contacts"]:not(.nav-child)')).toBeNull();
     const calendarLink = [...sub.querySelectorAll('.nav-child')].find((b) => b.textContent?.startsWith('Calendar'))!;
     expect(calendarLink.querySelector('.nav-count')?.textContent).toBe('2');
     expect(calendarLink.getAttribute('aria-label')).toBe('Calendar, 2 requests waiting');
@@ -187,6 +197,22 @@ describe('the AI Receptionist’s sub-menu', () => {
     await go('plugin:aokie:receptionist');
     expect(title()).toBe('Phone');
     expect(text()).toContain('Plugin screen receptionist');
+  });
+
+  it('lands `contacts` on Contacts, and the Agent’s contact key opens that person', async () => {
+    await go('contacts');
+    expect(title()).toBe('Contacts');
+    expect(kicker()).toBe('AI Receptionist');
+    expect(nav().querySelector('[aria-current="page"]')?.textContent).toBe('Contacts');
+    expect([...host.querySelectorAll('.contact-row strong')].map((s) => s.textContent)).toEqual(['Lance', 'Sam']);
+    expect(host.querySelector('.contacts-side')).toBeNull();
+
+    await go('overview');
+    await act(async () => h.navigate!({ kind: 'view', view: 'contacts', contact: '400000001' }));
+    await settle();
+    expect(title()).toBe('Contacts');
+    expect(host.querySelector('#contacts-side-title')?.textContent).toBe('Sam');
+    expect(host.querySelector<HTMLInputElement>('.contact-name input')?.value).toBe('Sam');
   });
 
   it('opens a link in it directly, and the entry opens the page last open in it', async () => {
@@ -299,10 +325,32 @@ describe('without the AI Receptionist', () => {
       );
     });
     await settle();
-    expect(nav().querySelector('.nav-sub')).toBeNull();
+    // Contacts are the phone's: the AI Receptionist keeps them, and its Phone.
+    const children = [...nav().querySelectorAll('.nav-sub .nav-child')].map((b) => b.querySelector('span')?.textContent);
+    expect(children).toEqual(['Phone', 'Contacts']);
     expect(text()).not.toContain('Hours & Services');
     await go('hours');
     expect(text()).toContain('The Overview');
     expect(host.querySelector('.hours-form')).toBeNull();
+  });
+
+  it('hides Contacts while the phone is off, and an open one goes to the Overview', async () => {
+    h.modulesList.mockResolvedValue(snapshot(false, true));
+    resetModules();
+    act(() => root.unmount());
+    root = createRoot(host);
+    await act(async () => {
+      root.render(
+        <ToastProvider>
+          <App />
+        </ToastProvider>,
+      );
+    });
+    await settle();
+    expect(nav().querySelector('button[aria-label="Contacts"]')).toBeNull();
+    expect(text()).not.toContain('Contacts');
+    await go('contacts');
+    expect(text()).toContain('The Overview');
+    expect(host.querySelector('.contacts-page')).toBeNull();
   });
 });

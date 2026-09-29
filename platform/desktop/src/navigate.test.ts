@@ -39,6 +39,18 @@ describe('a navigation from the desktop', () => {
     expect(parseNavigate({ view: 'hours' })).toEqual({ kind: 'view', view: 'hours' });
   });
 
+  it('opens Contacts, and one person’s contact by its key', () => {
+    expect(parseNavigate({ view: 'contacts' })).toEqual({ kind: 'view', view: 'contacts' });
+    expect(parseNavigate({ view: 'contacts', contact: '491570006' })).toEqual({ kind: 'view', view: 'contacts', contact: '491570006' });
+    expect(parseNavigate({ view: 'contacts', contact: '98765432' })).toEqual({ kind: 'view', view: 'contacts', contact: '98765432' });
+    // Not a key: Contacts opens, and no one in it.
+    for (const contact of ['+61491570006', '0491 570 006', '1234567', 5, null]) {
+      expect(parseNavigate({ view: 'contacts', contact })).toEqual({ kind: 'view', view: 'contacts' });
+    }
+    // A contact goes with Contacts only.
+    expect(parseNavigate({ view: 'hours', contact: '491570006' })).toEqual({ kind: 'view', view: 'hours' });
+  });
+
   it('ignores anything else, and names it cannot be', () => {
     expect(parseNavigate(null)).toBeNull();
     expect(parseNavigate('setup')).toBeNull();

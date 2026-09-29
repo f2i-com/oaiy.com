@@ -14,10 +14,11 @@ import type { ModulesSnapshot, PageContribution, SectionContribution } from './a
  * - A plugin's entry goes at the end of its group (Work unless it says Home or
  *   Setup), after the built-ins, so a plugin extends the app without
  *   displacing anything.
- * - A built-in section that belongs to a module (the Calendar) shows only
- *   while the module is on; and while the plugin providing the module has a
- *   section of its own, it goes under that section as a sub-menu
- *   (`arrangeSections`): the Calendar under the AI Receptionist.
+ * - A built-in section that belongs to a module (the Calendar; Contacts, the
+ *   phone's) shows only while the module is on; and while the plugin providing
+ *   the module has a section of its own, it goes under that section as a
+ *   sub-menu (`arrangeSections`): the Calendar and Contacts under the AI
+ *   Receptionist.
  *
  * Pure: App.tsx renders what this works out.
  */
@@ -60,6 +61,8 @@ export interface NavSection {
   sub?: boolean;
   /** The built-in sections folded into this one's sub-menu. */
   nested?: string[];
+  /** The pages those sections brought (the rest are the plugin section's own). */
+  nestedViews?: string[];
 }
 
 /** The icons a plugin's nav entry or section may name (`icon`); any other gets the plugin piece. */
@@ -168,28 +171,40 @@ export function pluginPageOf(sections: NavSection[], view: string): PageContribu
 
 /**
  * The sidebar with the modules applied. `moduleSections` names each built-in
- * section that belongs to a module (`{ calendar: 'calendar' }`). Such a section:
+ * section that belongs to a module (`{ calendar: 'calendar', contacts: 'phone' }`).
+ * Such a section:
  *
  * - is left out while its module is off, or not yet known;
  * - goes under the section of the plugin that provides the module, when that
  *   plugin has a section (its own, or its lone page), as that section's
- *   sub-menu: the plugin's pages first, then the built-in's;
+ *   sub-menu: the plugin's pages first, then the built-ins' in `order`
+ *   (Phone, Calendar, Contacts, Hours & Services), any not in it after;
  * - stays where it is otherwise.
  *
  * Under it, the plugin's page named like its section (Aokie's "AI
  * Receptionist" page in its "AI Receptionist" section) is named for what it
  * shows: the page's module ("Phone"), else the section's, else another module
- * the plugin provides, else "Overview".
+ * the plugin provides that has no built-in section of its own name (the
+ * Calendar is shown by the Calendar's pages; the phone, whose section is
+ * Contacts, is not), else "Overview".
  */
 export function arrangeSections(
   sections: NavSection[],
   modules: ModulesSnapshot | null,
   moduleSections: Record<string, string>,
+  order: readonly string[] = [],
 ): NavSection[] {
   let out = sections;
   const records = modules?.modules ?? [];
-  const nestedModules = Object.values(moduleSections);
+  // The modules the dashboard shows with pages of their own name (the Calendar's).
+  const shownModules = Object.entries(moduleSections)
+    .filter(([section, module]) => section === module)
+    .map(([, module]) => module);
   const moduleName = (id?: string) => (id ? records.find((m) => m.id === id)?.name : undefined);
+  const rank = (view: string) => {
+    const i = order.indexOf(view);
+    return i < 0 ? order.length : i;
+  };
   for (const [sectionId, moduleId] of Object.entries(moduleSections)) {
     const own = out.find((s) => s.id === sectionId && s.builtin);
     if (!own) continue;
@@ -202,12 +217,23 @@ export function arrangeSections(
     const theirs = pluginId ? out.filter((s) => !s.builtin && s.pluginId === pluginId) : [];
     const host = theirs.find((s) => s.module === moduleId) ?? theirs.find((s) => s.group === own.group) ?? theirs[0];
     if (!host) continue;
-    const other = records.find((m) => m.enabled && m.provider?.pluginId === pluginId && !nestedModules.includes(m.id));
+    const other = records.find((m) => m.enabled && m.provider?.pluginId === pluginId && !shownModules.includes(m.id));
     const same = (label: string) => label.trim().toLowerCase() === host.label.trim().toLowerCase();
     const tabs = host.tabs.map((t) =>
       t.page && same(t.label) ? { ...t, label: moduleName(t.page.module) ?? moduleName(host.module) ?? other?.name ?? 'Overview' } : t,
     );
-    const merged: NavSection = { ...host, sub: true, nested: [...(host.nested ?? []), own.id], tabs: [...tabs, ...own.tabs] };
+    // The plugin section's own pages first, as it gave them; then the nested sections' pages in their order.
+    const before = new Set(host.nestedViews ?? []);
+    const hostOwn = tabs.filter((t) => !before.has(t.view));
+    const nested = [...tabs.filter((t) => before.has(t.view)), ...own.tabs].map((t, i) => ({ t, i }));
+    nested.sort((a, b) => rank(a.t.view) - rank(b.t.view) || a.i - b.i);
+    const merged: NavSection = {
+      ...host,
+      sub: true,
+      nested: [...(host.nested ?? []), own.id],
+      nestedViews: [...before, ...own.tabs.map((t) => t.view)],
+      tabs: [...hostOwn, ...nested.map((n) => n.t)],
+    };
     out = out.filter((s) => s !== own).map((s) => (s === host ? merged : s));
   }
   return out;

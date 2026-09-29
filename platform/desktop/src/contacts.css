@@ -1,0 +1,285 @@
+/* ============================================================================
+ * CONTACTS — the AI Receptionist's people: a list beside one person's panel
+ * (the Calendar's side panel), their notes for the receptionist and what it
+ * remembered, and a CSV file's import preview. Built from the dashboard's
+ * tokens (styles.css), so it follows Prism Lab and Paper Circuit, and fits a
+ * 760px window.
+ * ========================================================================== */
+
+.panel.contacts-page { max-width: 1400px; gap: 14px; }
+
+/* ---- the toolbar: search, how many, and what to do ------------------------------------ */
+
+.contacts-toolbar { display: flex; align-items: center; flex-wrap: wrap; gap: 10px 12px; }
+.contacts-search { position: relative; display: flex; min-width: 0; max-width: 440px; flex: 1 1 260px; align-items: center; }
+.contacts-search > svg { position: absolute; left: 11px; color: var(--faint); pointer-events: none; }
+.contacts-search input { height: 36px; padding-left: 34px; font-size: 13px; }
+.contacts-search input::-webkit-search-cancel-button { cursor: pointer; }
+.contacts-count { color: var(--faint); font-family: var(--font-mono); font-size: 11.5px; font-variant-numeric: tabular-nums; white-space: nowrap; }
+.contacts-actions { display: flex; align-items: center; flex-wrap: wrap; gap: 8px; margin-left: auto; }
+
+/* ---- the list, and the panel beside it ------------------------------------------------ */
+
+.contacts-main { display: grid; grid-template-columns: minmax(0, 1fr); align-items: start; gap: 16px; }
+.contacts-main.has-side { grid-template-columns: minmax(0, 1fr) minmax(340px, 420px); }
+@media (min-width: 1500px) { .contacts-main.has-side { grid-template-columns: minmax(0, 1fr) 460px; } }
+.contacts-board { display: flex; min-width: 0; flex-direction: column; gap: 10px; }
+
+.contact-list {
+  display: flex;
+  flex-direction: column;
+  margin: 0;
+  overflow: hidden;
+  border: 1px solid var(--border);
+  border-radius: var(--r-card);
+  background: var(--surface);
+  box-shadow: var(--shadow-card);
+  padding: 0;
+  list-style: none;
+}
+.contact-list > li + li { border-top: 1px solid var(--border); }
+.contact-row {
+  position: relative;
+  display: grid;
+  width: 100%;
+  align-items: center;
+  gap: 12px;
+  grid-template-columns: auto minmax(0, 1fr) auto;
+  border: 0;
+  background: transparent;
+  color: var(--text);
+  padding: 10px 14px;
+  text-align: left;
+  transition: background 0.14s;
+}
+.contact-row:hover { background: color-mix(in srgb, var(--primary) 5%, transparent); }
+.contact-row.is-selected { background: var(--primary-soft); }
+.contact-row.is-selected::before { position: absolute; top: 8px; bottom: 8px; left: 0; width: 3px; border-radius: 0 3px 3px 0; background: var(--primary); content: ''; }
+:root:not([data-theme='light']) .contact-row.is-selected::before { box-shadow: 0 0 8px var(--primary); }
+.contact-row:focus-visible { outline-offset: -2px; }
+
+.contact-avatar {
+  display: grid;
+  width: 34px;
+  height: 34px;
+  flex: none;
+  place-items: center;
+  border: 1px solid color-mix(in srgb, var(--primary) 30%, var(--border));
+  border-radius: 50%;
+  background: var(--primary-soft);
+  color: var(--primary);
+  font-size: 12px;
+  font-weight: 700;
+  letter-spacing: 0.03em;
+}
+.contact-avatar.is-unnamed { border-style: dashed; border-color: var(--strong-border); background: var(--surface-soft); color: var(--faint); }
+.contact-text { display: flex; min-width: 0; flex-direction: column; gap: 1px; }
+.contact-text strong { overflow: hidden; font-size: 13.5px; font-weight: 640; text-overflow: ellipsis; white-space: nowrap; }
+.contact-text strong.is-unnamed { color: var(--muted); font-weight: 520; }
+.contact-text small { color: var(--muted); font-family: var(--font-mono); font-size: 11.5px; font-variant-numeric: tabular-nums; }
+.contact-meta { display: flex; align-items: center; flex-wrap: wrap; justify-content: flex-end; gap: 6px; }
+.contact-meta em {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  border: 1px solid var(--border);
+  border-radius: 999px;
+  background: var(--surface-soft);
+  color: var(--muted);
+  padding: 1px 8px;
+  font-size: 11px;
+  font-style: normal;
+  white-space: nowrap;
+}
+
+.contacts-empty { gap: 8px; padding: 34px 26px; }
+.contacts-empty-actions { display: flex; flex-wrap: wrap; justify-content: center; gap: 8px; margin-top: 6px; }
+
+/* ---- one person ---------------------------------------------------------------------------- */
+
+.contacts-side .cal-side-body { display: flex; flex-direction: column; gap: 10px; }
+.contacts-side .form-row { flex: none; }
+.contacts-side .form-row input,
+.contacts-side .form-row select { font-family: var(--font-body); font-size: 13px; }
+.contacts-side .contact-name input { height: 40px; font-size: 15px; font-weight: 600; }
+.contact-name-hint,
+.contact-notes-hint { margin-top: -4px; }
+.contact-name-hint .btn-link { font-size: 11.5px; }
+.contact-number > p {
+  display: flex;
+  min-height: 34px;
+  align-items: center;
+  gap: 8px;
+  margin: 0;
+  border: 1px dashed var(--border);
+  border-radius: var(--r-ctl);
+  color: var(--text);
+  padding: 0 10px;
+  font-family: var(--font-mono);
+  font-size: 13.5px;
+  font-variant-numeric: tabular-nums;
+}
+.contact-number > p > svg { flex: none; color: var(--faint); }
+.contact-notes textarea { min-height: 116px; font-family: var(--font-body); font-size: 13px; }
+.contact-notes-hint { display: flex; align-items: baseline; justify-content: space-between; gap: 10px; }
+.contact-left { flex: none; font-family: var(--font-mono); font-size: 11px; }
+.contact-left.is-low { color: var(--amber); }
+
+.contact-facts { display: flex; flex-direction: column; gap: 8px; margin-top: 8px; border-top: 1px solid var(--border); padding-top: 14px; }
+.fact-list { display: flex; flex-direction: column; gap: 6px; margin: 0; padding: 0; list-style: none; }
+.fact-list > li {
+  display: flex;
+  align-items: flex-start;
+  gap: 8px;
+  border: 1px solid var(--border);
+  border-radius: var(--r-ctl);
+  background: var(--surface-soft);
+  padding: 8px 6px 8px 11px;
+}
+:root[data-theme='light'] .fact-list > li { background: var(--surface-raised); }
+.fact-list > li.is-removed { border-style: dashed; background: transparent; color: var(--muted); }
+.fact-text { display: flex; min-width: 0; flex: 1; flex-direction: column; gap: 2px; font-size: 13px; line-height: 1.45; overflow-wrap: anywhere; }
+.fact-text small { color: var(--faint); font-size: 11px; }
+.fact-list .icon-button { width: 26px; height: 26px; min-height: 0; flex: none; }
+.fact-remove:hover { color: var(--danger); }
+.fact-list .btn-tiny { flex: none; }
+
+.contact-danger { margin-top: 10px; border-top: 1px solid var(--border); padding-top: 12px; }
+.contact-delete { color: var(--danger); }
+.contact-confirm {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+  border: 1px solid color-mix(in srgb, var(--danger) 40%, var(--border));
+  border-radius: var(--r-ctl);
+  background: var(--danger-soft);
+  padding: 12px;
+}
+.contact-confirm > p { margin: 0; color: var(--text); font-size: 12.5px; line-height: 1.5; }
+
+/* Unsaved changes: the bar stays at the foot of the panel while it scrolls. */
+.contacts-side .contacts-savebar {
+  position: sticky;
+  bottom: -18px;
+  z-index: 2;
+  flex-wrap: wrap;
+  margin: 6px -16px -18px;
+  border-width: 1px 0 0;
+  border-radius: 0;
+  background: var(--surface-solid);
+  padding: 10px 14px 12px 16px;
+  box-shadow: none;
+  backdrop-filter: none;
+}
+.contacts-side .contacts-savebar .hours-savebar-text { flex: 1 1 180px; }
+.contacts-savebar.is-nudged { background: linear-gradient(var(--primary-soft), var(--primary-soft)), var(--surface-solid); }
+.contacts-savebar.is-nudged .hours-savebar-text small { color: var(--text); }
+
+/* ---- a new person ------------------------------------------------------------------------ */
+
+.contact-form { display: flex; flex-direction: column; gap: 10px; }
+.contact-form .cal-side-actions { margin-top: 6px; }
+.contact-form input[aria-invalid='true'] { border-color: var(--danger); box-shadow: 0 0 0 3px var(--danger-soft); }
+.contact-already {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 6px 10px;
+  border: 1px solid color-mix(in srgb, var(--amber) 42%, var(--border));
+  border-radius: var(--r-ctl);
+  background: var(--amber-soft);
+  color: var(--text);
+  padding: 9px 11px;
+  font-size: 12.5px;
+}
+
+/* ---- a CSV file ------------------------------------------------------------------------------ */
+
+.contact-import .import-file input[type='file'] { height: auto; padding: 5px 6px; font-family: var(--font-body); }
+.contact-import .import-file input[type='file']::file-selector-button {
+  margin-right: 10px;
+  border: 1px solid var(--strong-border);
+  border-radius: var(--r-sm);
+  background: var(--surface-raised);
+  color: var(--text);
+  padding: 4px 10px;
+  font: inherit;
+  font-size: 12px;
+  cursor: pointer;
+}
+.contact-import .import-file input[type='file']::file-selector-button:hover { border-color: var(--primary); }
+
+.import-stats { display: grid; gap: 6px; grid-template-columns: repeat(4, minmax(0, 1fr)); margin-top: 4px; }
+.import-stat {
+  --tone: var(--muted);
+  display: flex;
+  min-width: 0;
+  flex-direction: column;
+  gap: 1px;
+  border: 1px solid color-mix(in srgb, var(--tone) 35%, var(--border));
+  border-radius: var(--r-ctl);
+  background: color-mix(in srgb, var(--tone) 9%, transparent);
+  padding: 7px 9px 8px;
+}
+.import-stat strong { color: var(--tone); font-family: var(--font-mono); font-size: 19px; font-weight: 650; font-variant-numeric: tabular-nums; line-height: 1.2; }
+.import-stat span { overflow: hidden; color: var(--muted); font-size: 11px; text-overflow: ellipsis; white-space: nowrap; }
+.import-stat.is-add { --tone: var(--green); }
+.import-stat.is-update { --tone: var(--primary); }
+.import-stat.is-skip { --tone: var(--amber); }
+.import-stat.is-zero { --tone: var(--faint); }
+
+.import-reasons { display: flex; flex-direction: column; gap: 2px; margin: 0; padding: 0 0 0 16px; color: var(--muted); font-size: 12px; }
+.import-reasons > li::marker { color: var(--amber); }
+.contacts-switch { display: inline-flex; align-items: center; gap: 10px; margin-top: 4px; color: var(--text); font-size: 13px; cursor: pointer; }
+
+.import-rows { display: flex; flex-direction: column; margin: 0; overflow: hidden; border: 1px solid var(--border); border-radius: var(--r-ctl); padding: 0; list-style: none; }
+.import-rows > li { --tone: var(--muted); display: grid; align-items: center; gap: 8px; grid-template-columns: 26px minmax(0, 1fr) auto; padding: 6px 9px 6px 6px; }
+.import-rows > li + li { border-top: 1px solid var(--border); }
+.import-rows > li.is-add { --tone: var(--green); }
+.import-rows > li.is-update { --tone: var(--primary); }
+.import-rows > li.is-skip { --tone: var(--amber); }
+.import-row-no { color: var(--faint); font-family: var(--font-mono); font-size: 10.5px; text-align: right; }
+.import-row-text { display: flex; min-width: 0; flex-direction: column; }
+.import-row-text strong { overflow: hidden; font-size: 12.5px; font-weight: 620; text-overflow: ellipsis; white-space: nowrap; }
+.import-rows > li.is-skip .import-row-text strong { color: var(--muted); font-weight: 520; }
+.import-row-text small { overflow: hidden; color: var(--muted); font-size: 11px; text-overflow: ellipsis; white-space: nowrap; }
+.import-tag {
+  border: 1px solid color-mix(in srgb, var(--tone) 38%, var(--border));
+  border-radius: 999px;
+  background: color-mix(in srgb, var(--tone) 11%, transparent);
+  color: var(--tone);
+  padding: 1px 8px;
+  font-family: var(--font-mono);
+  font-size: 10px;
+  font-style: normal;
+  font-weight: 650;
+  white-space: nowrap;
+}
+.contacts-side .import-actions {
+  position: sticky;
+  bottom: -18px;
+  z-index: 2;
+  margin: 6px -16px -18px;
+  border-top: 1px solid var(--border);
+  background: var(--surface-solid);
+  padding: 12px 16px 14px;
+}
+
+/* ---- narrower windows ------------------------------------------------------------------ */
+
+/* The panel alone once there is no room for both: its close button goes back to the list. */
+@media (max-width: 1060px) {
+  .contacts-main.has-side { grid-template-columns: minmax(0, 1fr); }
+  .contacts-main.has-side .contacts-board { display: none; }
+  .contacts-page.has-side .contacts-search,
+  .contacts-page.has-side .contacts-count { display: none; }
+  .contacts-side { position: static; max-height: none; }
+}
+@media (max-width: 760px) {
+  .contacts-search { max-width: none; flex-basis: 100%; }
+  .contacts-actions { width: 100%; margin-left: 0; }
+  .contacts-actions > .btn-primary { margin-left: auto; }
+  .contact-row { grid-template-columns: auto minmax(0, 1fr); }
+  .contact-meta { grid-column: 2; justify-content: flex-start; }
+  .import-stats { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+}

@@ -1,6 +1,6 @@
 // Where plugin pages go in the sidebar and in a section's tabs.
 import { describe, expect, it } from 'vitest';
-import { Bot, CalendarDays, Cpu, LayoutDashboard, Phone, Plug, Puzzle, Settings2, Workflow } from 'lucide-react';
+import { BookUser, Bot, CalendarDays, Cpu, LayoutDashboard, Phone, Plug, Puzzle, Settings2, Workflow } from 'lucide-react';
 import type { ModulesSnapshot, PageContribution, SectionContribution } from './api';
 import { arrangeSections, buildSections, newBadge, pluginPageOf, sectionOf, type BuiltinSection } from './sections';
 
@@ -219,5 +219,81 @@ describe('a module’s pages under the plugin that provides it', () => {
     const s = arranged([lone(receptionist)], snapshot({ phone: true, calendar: true }));
     expect(s.filter((x) => x.builtin).map((x) => x.id)).toEqual(ids(BUILTINS));
     expect(s.find((x) => x.id === 'flows')!.tabs.map((t) => t.view)).toEqual(['flows', 'runs']);
+  });
+});
+
+describe('Contacts, the phone’s, under the AI Receptionist', () => {
+  // The dashboard's sidebar as App.tsx has it: the Calendar (Calendar | Hours & Services), then Contacts.
+  const WITH_BOTH: BuiltinSection[] = [
+    ...BUILTINS.slice(0, 3),
+    { id: 'calendar', label: 'Calendar', icon: CalendarDays, group: 'Work', tabs: ['calendar', 'hours'] },
+    { id: 'contacts', label: 'Contacts', icon: BookUser, group: 'Work', tabs: ['contacts'] },
+    ...BUILTINS.slice(3),
+  ];
+  const MODULE_SECTIONS = { calendar: 'calendar', contacts: 'phone' };
+  const ORDER = ['calendar', 'contacts', 'hours'];
+  const aokie = { pluginId: 'aokie', name: 'Aokie Phone Bridge', state: 'running' as const, declared: true };
+  const snapshot = (on: { phone?: boolean; calendar?: boolean }): ModulesSnapshot => ({
+    revision: 1,
+    modules: [
+      { id: 'phone', name: 'Phone', enabled: !!on.phone, builtin: true, provider: aokie },
+      { id: 'calendar', name: 'Calendar', enabled: !!on.calendar, builtin: true, provider: aokie },
+    ],
+    contributions: {},
+    warnings: [],
+  });
+  const receptionist = pageOf('aokie', 'receptionist', { icon: 'phone', label: 'AI Receptionist', module: 'phone' });
+  const arranged = (contributions: SectionContribution[], modules: ModulesSnapshot | null) =>
+    arrangeSections(buildSections(WITH_BOTH, contributions, page), modules, MODULE_SECTIONS, ORDER);
+  const pages = (s: ReturnType<typeof arranged>) => s.find((x) => x.sub)?.tabs.map((t) => [t.view, t.label]);
+
+  it('goes in order: Phone, Calendar, Contacts, Hours & Services', () => {
+    const s = arranged([lone(receptionist, { module: 'phone' })], snapshot({ phone: true, calendar: true }));
+    expect(ids(s)).toEqual(['overview', 'agent', 'flows', 'plugin:aokie:receptionist', 'engines', 'connections', 'settings']);
+    expect(pages(s)).toEqual([
+      ['plugin:aokie:receptionist', 'Phone'],
+      ['calendar', 'CALENDAR'],
+      ['contacts', 'CONTACTS'],
+      ['hours', 'HOURS'],
+    ]);
+    const r = s.find((x) => x.sub)!;
+    expect(r.nested).toEqual(['calendar', 'contacts']);
+    expect(sectionOf(s, 'contacts')).toBe(r);
+  });
+
+  it('is there with the phone alone, and gone with it', () => {
+    let s = arranged([lone(receptionist, { module: 'phone' })], snapshot({ phone: true, calendar: false }));
+    expect(pages(s)).toEqual([
+      ['plugin:aokie:receptionist', 'Phone'],
+      ['contacts', 'CONTACTS'],
+    ]);
+    // The phone off: the desktop leaves out Aokie's page, and Contacts goes too; the Calendar stays top-level.
+    s = arranged([], snapshot({ phone: false, calendar: true }));
+    expect(ids(s)).toEqual(['overview', 'agent', 'flows', 'calendar', 'engines', 'connections', 'settings']);
+    expect(sectionOf(s, 'contacts')).toBeNull();
+    // Not yet known: neither is there.
+    s = arranged([lone(receptionist)], null);
+    expect(sectionOf(s, 'contacts')).toBeNull();
+    expect(sectionOf(s, 'calendar')).toBeNull();
+  });
+
+  it('stays top-level while the phone’s plugin has no section', () => {
+    const s = arranged([], snapshot({ phone: true, calendar: true }));
+    expect(ids(s)).toEqual(['overview', 'agent', 'flows', 'calendar', 'contacts', 'engines', 'connections', 'settings']);
+    expect(s.find((x) => x.id === 'contacts')!.sub).toBeUndefined();
+  });
+
+  it('still names Aokie’s page Phone when its manifest names no module (Contacts is the phone’s, not a page of its own)', () => {
+    const plain = pageOf('aokie', 'receptionist', { icon: 'phone', label: 'AI Receptionist' });
+    const s = arranged([lone(plain)], snapshot({ phone: true, calendar: true }));
+    expect(pages(s)?.map(([, label]) => label)).toEqual(['Phone', 'CALENDAR', 'CONTACTS', 'HOURS']);
+  });
+
+  it('keeps a plugin’s own pages first, and a page it adds to the Calendar after the ordered ones', () => {
+    const calls = pageOf('aokie', 'calls', { label: 'Calls', module: 'phone' });
+    const extra = pageOf('aokie', 'rosters', { label: 'Rosters' });
+    const section: SectionContribution = { id: 'plugin-section:aokie:desk', builtin: false, pluginId: 'aokie', pluginName: 'Aokie Phone Bridge', label: 'AI Receptionist', icon: 'phone', group: 'Work', module: 'phone', pages: [receptionist, calls] };
+    const s = arranged([section, { id: 'calendar', builtin: true, pages: [extra] }], snapshot({ phone: true, calendar: true }));
+    expect(pages(s)?.map(([view]) => view)).toEqual(['plugin:aokie:receptionist', 'plugin:aokie:calls', 'calendar', 'contacts', 'hours', 'plugin:aokie:rosters']);
   });
 });

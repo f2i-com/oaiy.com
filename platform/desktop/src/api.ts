@@ -1422,6 +1422,113 @@ export const voices = {
   },
 };
 
+// ----- contacts: the people who ring and text -----
+
+/** Who named a contact (or wrote a fact): the person (`owner`), or the receptionist on a call (`agent`). */
+export type NamedBy = 'owner' | 'agent';
+
+/** Something the receptionist remembered about a contact. */
+export interface ContactFact {
+  text: string;
+  at: string;
+  by: NamedBy;
+}
+
+export interface Contact {
+  /** The last nine digits of their number: one person however the number is written. */
+  key: string;
+  /** The number last seen for them (a call's, or one given); empty when only the key is known. */
+  number: string;
+  /** One word is a whole name ("Lance"). */
+  name: string;
+  /** Who named them; `null` while they have no name. The receptionist never renames an `owner` name. */
+  nameBy: NamedBy | null;
+  /** The person's notes, which the receptionist reads on every call and text with them. */
+  notes: string;
+  facts: ContactFact[];
+  createdAt: string;
+  updatedAt: string;
+}
+
+/** A change to a contact: only the fields given change; a name given is the person's. */
+export interface ContactChange {
+  name?: string;
+  notes?: string;
+  number?: string;
+}
+
+/** One row of an import's file, as it goes. */
+export interface ImportRow {
+  /** Its line in the file. */
+  row: number;
+  action: 'add' | 'update' | 'unchanged' | 'skip';
+  name: string;
+  number: string;
+  key?: string;
+  /** Why it is skipped: no_number, not_a_phone_number, hidden, duplicate, notes_too_long. */
+  reason?: string;
+  why?: string;
+  /** The person's own name, kept over the file's. */
+  keptName?: string;
+  notes: boolean;
+}
+
+/** What an import did, or (a preview) would do. */
+export interface ImportReport {
+  preview: boolean;
+  country: string;
+  headerRow: number | null;
+  /** The headings read. */
+  columns: string[];
+  rows: number;
+  added: number;
+  updated: number;
+  unchanged: number;
+  skipped: number;
+  reasons: Record<string, number>;
+  skips: ImportRow[];
+  sample: ImportRow[];
+}
+
+export interface ImportRequest {
+  csv: string;
+  /** Whose local numbers they are (`0491 570 006`): AU unless given. */
+  country: string;
+  /** Let the file's names replace the ones the person set. */
+  replaceNames: boolean;
+  preview: boolean;
+}
+
+const contactPath = (number: string) => `/api/contacts/${encodeURIComponent(number)}`;
+
+export const contacts = {
+  /** Everyone, by name (a 404 on a desktop older than contacts, see `isNotFound`). */
+  list: () => request<{ contacts: Contact[]; total: number }>('/api/contacts'),
+  get: (number: string) => request<Contact>(contactPath(number)),
+  /** Made when there is none. */
+  save: (number: string, change: ContactChange) => request<Contact>(contactPath(number), { method: 'PUT', body: JSON.stringify(change) }),
+  remove: (number: string) => request<void>(contactPath(number), { method: 'DELETE' }),
+  /** Forget a fact by its place; refused (409) when the fact there no longer says `text`. */
+  forgetFact: (number: string, index: number, text: string) =>
+    request<{ contact: Contact; forgotten: ContactFact }>(`${contactPath(number)}/facts/${index}?${new URLSearchParams({ text })}`, { method: 'DELETE' }),
+  importCsv: (body: ImportRequest) => request<ImportReport>('/api/contacts/import', { method: 'POST', body: JSON.stringify(body) }),
+  /** The CSV file as the desktop wrote it: its bytes, byte-order mark and all (reading it as text would drop the mark). */
+  exportCsv: async (): Promise<Blob> => {
+    const ac = new AbortController();
+    const timer = setTimeout(() => ac.abort(), 30_000);
+    try {
+      const resp = await fetch(`${API_BASE}/api/contacts/export.csv`, { signal: ac.signal });
+      if (!resp.ok) {
+        const body = await resp.json().catch(() => null);
+        throw new Error(`${resp.status}: ${body?.error?.message ?? resp.statusText}`);
+      }
+      return new Blob([await resp.arrayBuffer()], { type: 'text/csv;charset=utf-8' });
+    } finally {
+      clearTimeout(timer);
+    }
+  },
+};
+
 // ----- the engines and the phone, for Overview -----
 
 export interface EnginesStatus {
