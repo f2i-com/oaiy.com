@@ -73,6 +73,13 @@ struct PendingReply {
 
 /// Poll, claim, run, report — forever, while a link with a relay exists.
 pub fn spawn(store: LinkHandle, dispatch: Dispatcher) {
+    spawn_on(store, dispatch, &HTTP);
+}
+
+/// [`spawn`] on the client `lane`. The lane's client is one for the process, and a
+/// test that starts the loop gives it a client of its own, so that the connections
+/// of the other tests that use the lane's are not the loop's to close.
+fn spawn_on(store: LinkHandle, dispatch: Dispatcher, lane: &'static Lane) {
     std::thread::spawn(move || loop {
         let Some(account) = store.account() else {
             // Not linked. Sleep rather than spin; a link is a human action and
@@ -89,7 +96,7 @@ pub fn spawn(store: LinkHandle, dispatch: Dispatcher) {
         let instance = store.instance_id();
 
         let polled = std::time::Instant::now();
-        match poll_once(&account, &spec, &instance, &dispatch) {
+        match poll_on(lane, &account, &spec, &instance, &dispatch) {
             // `trouble` is a poll that WORKED carrying commands that did not.
             // Recorded as the lane's state because from the provider's side it
             // is indistinguishable from a desktop that never polled at all.
@@ -102,7 +109,7 @@ pub fn spawn(store: LinkHandle, dispatch: Dispatcher) {
                 // A batch that did work is likely followed by more; go straight
                 // back. An empty one already waited server-side.
                 if backoff {
-                    HTTP.start_afresh();
+                    lane.start_afresh();
                     std::thread::sleep(Duration::from_secs(spec.error_backoff_seconds));
                 } else if handled == 0 {
                     std::thread::sleep(spec.idle_pause(polled.elapsed()));
@@ -112,7 +119,7 @@ pub fn spawn(store: LinkHandle, dispatch: Dispatcher) {
                 store.note_relay(Some(e));
                 // The try after a failure is on a new client, not one that has
                 // seen the trouble.
-                HTTP.start_afresh();
+                lane.start_afresh();
                 // Backing off on failure keeps a provider that is down, or a key
                 // that was revoked, from becoming a hot loop against it.
                 std::thread::sleep(Duration::from_secs(spec.error_backoff_seconds));
@@ -123,8 +130,9 @@ pub fn spawn(store: LinkHandle, dispatch: Dispatcher) {
 
 /// The client this lane keeps from poll to poll, so that a poll, the claim it
 /// leads to and the report share a connection instead of each making one.
-static HTTP: super::net::LaneClient<reqwest::blocking::Client> =
-    super::net::LaneClient::new(build_client);
+type Lane = super::net::LaneClient<reqwest::blocking::Client>;
+
+static HTTP: Lane = super::net::LaneClient::new(build_client);
 
 /// How long a claim or a report may take. The poll's is longer, by the wait.
 const ANSWER_TIMEOUT: Duration = Duration::from_secs(20);
@@ -135,12 +143,24 @@ fn build_client() -> Result<reqwest::blocking::Client, String> {
         .map_err(|e| format!("could not build the relay client: {e}"))
 }
 
+/// One long-poll and its work, on the process's client.
+#[cfg(test)]
+fn poll_once(
+    account: &LinkedAccount,
+    spec: &RelaySpec,
+    instance: &str,
+    dispatch: &Dispatcher,
+) -> Result<(usize, Option<String>), String> {
+    poll_on(&HTTP, account, spec, instance, dispatch)
+}
+
 /// One long-poll and its work.
 ///
 /// Returns how many commands were handled, and the first that could not be
 /// served at all — the claim or the report failing, not the work failing, which
 /// is answered rather than swallowed.
-fn poll_once(
+fn poll_on(
+    lane: &Lane,
     account: &LinkedAccount,
     spec: &RelaySpec,
     instance: &str,
@@ -154,7 +174,7 @@ fn poll_once(
         spec.batch_limit,
         urlencode(instance),
     );
-    let http = HTTP.get()?;
+    let http = lane.get()?;
     let resp = http
         .get(&url)
         // Generous over the server's wait so a long-poll that returns exactly on
@@ -199,7 +219,7 @@ fn poll_once(
     for command in reply.commands {
         // One failure must not abandon the rest of the batch: they are
         // independent actions a user is waiting on.
-        if let Err(e) = serve(account, spec, instance, dispatch, &command) {
+        if let Err(e) = serve(lane, account, spec, instance, dispatch, &command) {
             log::warn!("relay command {} could not be served: {e}", command.id);
             // Kept, not just logged. This is the failure that looks like
             // nothing: the poll succeeded so the lane appears healthy, while
@@ -213,13 +233,14 @@ fn poll_once(
 
 /// Claim one command, run it, and report the outcome.
 fn serve(
+    lane: &Lane,
     account: &LinkedAccount,
     spec: &RelaySpec,
     instance: &str,
     dispatch: &Dispatcher,
     command: &Command,
 ) -> Result<(), String> {
-    let http = HTTP.get()?;
+    let http = lane.get()?;
     let body = serde_json::json!({ "instanceId": instance });
 
     // Claim FIRST. It is exactly-once: another desktop under the same account
@@ -772,12 +793,19 @@ mod tests {
 
     const PENDING: &str = "/api/v1/connector-commands/pending";
 
+    /// A client for a loop that a test starts, which no other test uses: the process's
+    /// is used by the tests that count connections on it, and a loop closes them (it
+    /// starts its client afresh after a failure, and lets go of it for a long pause).
+    fn a_client_of_its_own() -> &'static Lane {
+        Box::leak(Box::new(crate::link::net::LaneClient::new(build_client)))
+    }
+
     /// Run the lane's own loop against a provider that has nothing for it, with the
     /// connector as `edit` leaves it, and say how far apart its first polls were.
     fn gaps_between_empty_polls(tag: &str, edit: impl FnOnce(&mut RelaySpec)) -> Vec<Duration> {
         let server = Provider::start(|_| Reply::ok(r#"{"commands":[]}"#));
         let (store, dir) = crate::link::testkit::linked_to(&server.base, tag, |d| edit(d.relay.as_mut().unwrap()));
-        spawn(store.clone(), working_dispatcher());
+        spawn_on(store.clone(), working_dispatcher(), a_client_of_its_own());
         let polls = server.wait_for(PENDING, 3, Duration::from_secs(30));
         crate::link::testkit::stop_lane(&store);
         let _ = std::fs::remove_dir_all(dir);

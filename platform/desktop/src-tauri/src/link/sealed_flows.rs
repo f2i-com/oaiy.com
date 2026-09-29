@@ -227,6 +227,13 @@ fn poll_once(
 }
 
 pub fn spawn(store: LinkHandle, node: Option<NodeHandle>) {
+    spawn_on(store, node, &HTTP);
+}
+
+/// [`spawn`] on the client `lane`. The lane's client is one for the process, and a
+/// test that starts the loop gives it a client of its own, so that the connections
+/// of the other tests that use the lane's are not the loop's to close.
+fn spawn_on(store: LinkHandle, node: Option<NodeHandle>, lane: &'static Lane) {
     std::thread::spawn(move || {
         let identity = match E2eIdentity::load_or_create(store.data_dir()) {
             Ok(identity) => identity,
@@ -251,7 +258,7 @@ pub fn spawn(store: LinkHandle, node: Option<NodeHandle>) {
                 std::thread::sleep(Duration::from_secs(30));
                 continue;
             };
-            let http = match HTTP.get() {
+            let http = match lane.get() {
                 Ok(http) => http,
                 Err(_) => {
                     std::thread::sleep(Duration::from_secs(10));
@@ -300,7 +307,7 @@ pub fn spawn(store: LinkHandle, node: Option<NodeHandle>) {
                     }
                     // The try after a failure is on a new client, not one that
                     // has seen the trouble.
-                    HTTP.start_afresh();
+                    lane.start_afresh();
                     std::thread::sleep(Duration::from_secs(spec.error_backoff_seconds));
                 }
             }
@@ -310,7 +317,9 @@ pub fn spawn(store: LinkHandle, node: Option<NodeHandle>) {
 
 /// The client this lane keeps from poll to poll, so that a poll, its claim and the
 /// completion share a connection instead of each making one.
-static HTTP: super::net::LaneClient<Client> = super::net::LaneClient::new(build_client);
+type Lane = super::net::LaneClient<Client>;
+
+static HTTP: Lane = super::net::LaneClient::new(build_client);
 
 fn build_client() -> Result<Client, String> {
     super::net::blocking_builder(super::net::Keep::Between)
@@ -572,6 +581,13 @@ mod tests {
     use crate::link::testkit::{Provider, Reply};
     use std::sync::atomic::{AtomicBool, Ordering};
 
+    /// A client for a loop that a test starts, which no other test uses: the process's
+    /// is used by the tests that count connections on it, and a loop closes them (it
+    /// starts its client afresh after a failure, and lets go of it for a long pause).
+    fn a_client_of_its_own() -> &'static Lane {
+        Box::leak(Box::new(crate::link::net::LaneClient::new(build_client)))
+    }
+
     #[test]
     fn a_poll_its_claim_the_completion_and_the_next_poll_share_one_connection() {
         let identity = E2eIdentity::from_secret_bytes([17; 32]);
@@ -636,7 +652,7 @@ mod tests {
             lane.wait_seconds = 1;
             lane.idle_pause_ms = 3_000;
         });
-        spawn(store.clone(), None);
+        spawn_on(store.clone(), None, a_client_of_its_own());
         let polls = server.wait_for("/api/v1/desktop-flows/pending", 3, Duration::from_secs(30));
         crate::link::testkit::stop_lane(&store);
         let _ = std::fs::remove_dir_all(dir);
