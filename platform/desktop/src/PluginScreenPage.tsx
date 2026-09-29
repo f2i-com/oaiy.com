@@ -70,12 +70,37 @@ export async function pluginOaiyStatus(): Promise<PluginOaiyStatus> {
   };
 }
 
+/** What a setup wizard's `screen` step hears from the screen (`PluginHost.setup`). */
+export interface SetupScreenCalls {
+  /** `fraction` 0..1 or null, and a short text, shown under the step. */
+  progress: (fraction: number | null, text: string) => void;
+  /** A hint: check the step's `done` now (a step with no check is recorded done). */
+  done: (detail?: string) => void | Promise<void>;
+  /** A message to show on the step. */
+  fail: (message: string) => void;
+  /** The plugin's own wizard is finished. */
+  finish: () => void | Promise<void>;
+}
+
+/** A plugin screen shown as a step of its setup wizard. */
+export interface SetupScreen {
+  /** The step's id (the frame is a fresh document per step). */
+  step: string;
+  /** The view the screen shows (the step's `view`). */
+  view: string;
+  calls: SetupScreenCalls;
+}
+
 interface Props {
   pluginId: string;
   /** The `ui.nav[].id` that was clicked. */
-  navId: string;
+  navId?: string;
+  /** Or the `ui.screens[].id` to show (a setup step names its screen directly). */
+  screenId?: string;
   /** Opens one of the dashboard's own pages for the screen's `navigate`. */
   onNavigate?: (view: PluginNavTarget) => void;
+  /** Setup mode: the screen is a step of the plugin's setup wizard. */
+  setup?: SetupScreen;
 }
 
 interface UiNav {
@@ -162,6 +187,9 @@ export const HOST_BOOTSTRAP = `
   var seq = 0;
   var pending = {};
   var subs = [];
+  // Setup mode: the host stamped the step's context into the document before
+  // this ran (a wizard step). Absent on an ordinary screen.
+  var SETUP = window.__oaiySetup && typeof window.__oaiySetup === 'object' ? window.__oaiySetup : null;
   function call(method, args) {
     return new Promise(function (resolve, reject) {
       var id = 'r' + ++seq;
@@ -191,7 +219,8 @@ export const HOST_BOOTSTRAP = `
     if (!m || !m.__pluginHost) return;
     if (m.theme) { applyTheme(m.theme); return; }
     // The page's gutters: the screen runs edge to edge and draws them itself.
-    if (m.gutter) { document.documentElement.style.setProperty('--host-page-pad', m.gutter); return; }
+    // Not in a wizard step, whose pane draws its own padding (the gutter stays 0).
+    if (m.gutter) { if (!SETUP) document.documentElement.style.setProperty('--host-page-pad', m.gutter); return; }
     if (m.event) { subs.forEach(function (s) { try { s(m.event); } catch (_) {} }); return; }
     var p = pending[m.id];
     if (!p) return;
@@ -257,20 +286,90 @@ export const HOST_BOOTSTRAP = `
       rotateDesktopKey: function () { return call('companion.rotate', []); }
     }
   };
+  // The setup wizard's side of a step, defined only in setup mode, so a
+  // screen can tell a wizard step from its normal page by its presence.
+  // Every call returns a Promise.
+  if (SETUP) {
+    var context = { mode: 'setup', step: String(SETUP.step || ''), view: String(SETUP.view || '') };
+    window.PluginHost.setup = {
+      context: function () { return Promise.resolve({ mode: context.mode, step: context.step, view: context.view }); },
+      progress: function (fraction, text) {
+        var f = fraction == null || isNaN(Number(fraction)) ? null : Math.max(0, Math.min(1, Number(fraction)));
+        return call('setup.progress', [f, text == null ? '' : String(text)]);
+      },
+      done: function (detail) { return call('setup.done', detail == null ? [] : [String(detail)]); },
+      fail: function (message) { return call('setup.fail', [message == null ? '' : String(message)]); },
+      finish: function () { return call('setup.finish', []); }
+    };
+  }
 })();
 `;
 
-export default function PluginScreenPage({ pluginId, navId, onNavigate }: Props) {
-  // Changing screens discards the old document, pending RPCs and event cursor.
-  return <PluginScreenContent key={`${pluginId}:${navId}`} pluginId={pluginId} navId={navId} onNavigate={onNavigate} />;
+/** Escape text for an HTML attribute value. */
+function attr(text: string): string {
+  return text.replace(/&/g, '&amp;').replace(/"/g, '&quot;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
 }
 
-function PluginScreenContent({ pluginId, navId, onNavigate }: Props) {
+/** The pieces of a plugin screen's document. */
+export interface ScreenParts {
+  /** The screen's body fragment. */
+  body: string;
+  /** Its css, then the host's fonts. */
+  css: string;
+  fonts: string;
+  /** Its scripts, one `<script>` each, in manifest order. */
+  scripts: string[];
+  dark: boolean;
+  /** The page's gutters (ignored in setup mode, where the gutter is 0). */
+  gutter: string;
+  /** Setup mode: the wizard step's context, stamped before the bootstrap runs. */
+  setup?: { step: string; view: string };
+}
+
+/**
+ * A plugin screen's whole document, for the iframe's srcdoc (an opaque origin).
+ *
+ * In setup mode it is stamped for the step before first paint: the view on
+ * `<html data-oaiy-setup>` (so the plugin's CSS can hide its own chrome), the
+ * context as `window.__oaiySetup` ahead of the bootstrap (which then defines
+ * `PluginHost.setup`), and a gutter of 0 (the wizard pane draws its own).
+ */
+export function assembleScreenDocument(parts: ScreenParts): string {
+  const theme = parts.dark ? ' class="fl-dark" data-theme="dark"' : ' data-theme="light"';
+  const setupAttr = parts.setup ? ` data-oaiy-setup="${attr(parts.setup.view)}"` : '';
+  const pad = parts.setup ? '0' : parts.gutter;
+  // JSON in a script: `<` escaped so a view can never close the tag.
+  const stamp = parts.setup
+    ? `<script>window.__oaiySetup=${JSON.stringify({ mode: 'setup', step: parts.setup.step, view: parts.setup.view }).replace(/</g, '\\u003c')};</script>`
+    : '';
+  const scripts = parts.scripts.map((s) => `<script>${s.replace(/<\/script/gi, '<\\/script')}</script>`).join('');
+  return (
+    `<!doctype html><html${theme}${setupAttr} style="--host-page-pad: ${attr(pad)}"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">` +
+    // No external anything: the plugin ships inline SVG and its own CSS.
+    `<meta http-equiv="Content-Security-Policy" content="default-src 'none'; style-src 'unsafe-inline'; script-src 'unsafe-inline'; img-src data: blob:; font-src data:; connect-src 'none'">` +
+    `<style>${SCREEN_BASE_CSS}\n${parts.fonts}\n${parts.css}</style>${stamp}</head><body>${parts.body}` +
+    `<script>${HOST_BOOTSTRAP}</script>${scripts}</body></html>`
+  );
+}
+
+export default function PluginScreenPage(props: Props) {
+  // Changing screens discards the old document, pending RPCs and event cursor.
+  // A setup step is a fresh document per step.
+  const key = props.setup ? `${props.pluginId}:setup:${props.setup.step}` : `${props.pluginId}:${props.navId ?? ''}:${props.screenId ?? ''}`;
+  return <PluginScreenContent key={key} {...props} />;
+}
+
+function PluginScreenContent({ pluginId, navId, screenId, onNavigate, setup }: Props) {
   const toast = useToast();
   // Held in a ref so a new callback each render does not re-register the
   // message pump (handleCall depends on nothing that changes per render).
   const navigateRef = useRef(onNavigate);
   navigateRef.current = onNavigate;
+  // The step's context is fixed for this document (it is keyed by step); its
+  // callbacks may change each render, so they are read through a ref.
+  const setupRef = useRef(setup);
+  setupRef.current = setup;
+  const setupContext = useMemo(() => (setup ? { step: setup.step, view: setup.view } : undefined), [setup?.step, setup?.view]);
   // Which pages may be opened depends on the modules on now (the calendar only while there is one).
   const modules = useModules();
   const modulesRef = useRef(modules);
@@ -319,9 +418,9 @@ function PluginScreenContent({ pluginId, navId, onNavigate }: Props) {
   const screen = useMemo(() => {
     const ui = (record?.manifest as unknown as { ui?: { nav?: UiNav[]; screens?: UiScreen[] } } | undefined)?.ui;
     if (!ui) return null;
-    const nav = (ui.nav ?? []).find((n) => n.id === navId);
-    return (ui.screens ?? []).find((s) => s.id === nav?.screen) ?? null;
-  }, [record, navId]);
+    const wanted = screenId ?? (ui.nav ?? []).find((n) => n.id === navId)?.screen;
+    return (ui.screens ?? []).find((s) => s.id === wanted) ?? null;
+  }, [record, navId, screenId]);
 
   // Compose the document: fragment + inlined css + the bootstrap + the plugin's
   // scripts in manifest order. Assembled here (not server-side) so the iframe can
@@ -358,20 +457,13 @@ function PluginScreenContent({ pluginId, navId, onNavigate }: Props) {
         const jsFiles = files.filter((f) => f.endsWith('.js'));
         const [sources, fonts] = await Promise.all([Promise.all(jsFiles.map(fetchText)), pluginFontCss()]);
         if (cancelled) return;
-        const scripts = sources.map((s) => `<script>${s.replace(/<\/script/gi, '<\\/script')}</script>`).join('');
         // Stamped at assembly rather than messaged in after load, so the screen
         // never paints light-then-flips. Read from the live attribute instead of
         // a prop on purpose: this must NOT be a dependency of this effect, or a
         // theme flip would re-assemble srcdoc and remount the plugin — losing a
         // live call console mid-call to change a colour.
         const dark = document.documentElement.getAttribute('data-theme') !== 'light';
-        setDoc(
-          `<!doctype html><html${dark ? ' class="fl-dark" data-theme="dark"' : ' data-theme="light"'} style="--host-page-pad: ${pageGutter()}"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">` +
-            // No external anything: the plugin ships inline SVG and its own CSS.
-            `<meta http-equiv="Content-Security-Policy" content="default-src 'none'; style-src 'unsafe-inline'; script-src 'unsafe-inline'; img-src data: blob:; font-src data:; connect-src 'none'">` +
-            `<style>${SCREEN_BASE_CSS}\n${fonts}\n${css}</style></head><body>${body}` +
-            `<script>${HOST_BOOTSTRAP}</script>${scripts}</body></html>`,
-        );
+        setDoc(assembleScreenDocument({ body, css, fonts, scripts: sources, dark, gutter: pageGutter(), setup: setupContext }));
         setError(null);
       } catch (e) {
         if (!cancelled) setError(controller.signal.aborted ? 'Loading took too long. Check the desktop connection and try again.' : e instanceof Error ? e.message : String(e));
@@ -384,7 +476,7 @@ function PluginScreenContent({ pluginId, navId, onNavigate }: Props) {
       controller.abort();
       window.clearTimeout(timer);
     };
-  }, [screen, pluginId]);
+  }, [screen, pluginId, setupContext]);
 
   /** Service one RPC from the screen. */
   const handleCall = useCallback(
@@ -469,6 +561,26 @@ function PluginScreenContent({ pluginId, navId, onNavigate }: Props) {
           cursor.current = (await bridge.events(0, 1)).next;
           return true;
         }
+        // The setup wizard's calls: only a wizard step answers them.
+        case 'setup.progress':
+        case 'setup.done':
+        case 'setup.fail':
+        case 'setup.finish': {
+          const calls = setupRef.current?.calls;
+          if (!calls) throw new Error('This screen is not a setup step.');
+          if (method === 'setup.progress') {
+            const [fraction, text] = args as [unknown, unknown];
+            const f = typeof fraction === 'number' && Number.isFinite(fraction) ? Math.max(0, Math.min(1, fraction)) : null;
+            calls.progress(f, String(text ?? '').slice(0, 300));
+          } else if (method === 'setup.done') {
+            await calls.done(args[0] == null ? undefined : String(args[0]).slice(0, 300));
+          } else if (method === 'setup.fail') {
+            calls.fail(String(args[0] ?? '').slice(0, 500) || 'This step could not continue.');
+          } else {
+            await calls.finish();
+          }
+          return true;
+        }
         default:
           throw new Error(`unsupported host call "${method}"`);
       }
@@ -495,13 +607,15 @@ function PluginScreenContent({ pluginId, navId, onNavigate }: Props) {
     return () => observer.disconnect();
   }, [doc]);
 
-  // And the page's gutters, which change with the window's width.
+  // And the page's gutters, which change with the window's width. Not for a
+  // wizard step: its pane draws its own padding, and the screen's stays 0.
   useEffect(() => {
+    if (setupContext) return;
     const send = () => frameRef.current?.contentWindow?.postMessage({ __pluginHost: 1, gutter: pageGutter() }, '*');
     window.addEventListener('resize', send);
     send();
     return () => window.removeEventListener('resize', send);
-  }, [doc]);
+  }, [doc, setupContext]);
 
   // RPC pump: only messages from OUR iframe are serviced.
   useEffect(() => {
@@ -583,7 +697,7 @@ function PluginScreenContent({ pluginId, navId, onNavigate }: Props) {
           <TriangleAlert size={22} style={{ opacity: 0.5 }} />
           <p>This plugin doesn't ship that screen.</p>
           <p style={{ fontSize: 13, opacity: 0.7 }}>
-            Its manifest declares no <code>ui.screens</code> entry for “{navId}”.
+            Its manifest declares no <code>ui.screens</code> entry for “{screenId ?? navId}”.
           </p>
         </div>
       </div>
@@ -592,9 +706,16 @@ function PluginScreenContent({ pluginId, navId, onNavigate }: Props) {
 
   const currentStatus = runtimeStatus === undefined ? record : runtimeStatus;
   return (
-    <div className="panel">
+    <div className={setup ? 'panel plugin-setup-frame' : 'panel'}>
       {currentStatus === null ? (
         <div className="banner banner-err" role="alert">This plugin is no longer installed. Its open screen has been kept so you can review the current information.</div>
+      ) : currentStatus.state !== 'running' && setup ? (
+        // A wizard step keeps going while the plugin restarts (a driver
+        // install restarts it): said quietly, and the frame is never reloaded.
+        <p className="setup-frame-note" role="status">
+          <TriangleAlert size={13} /> {record.manifest?.name ?? record.id} is {currentStatus.state}
+          {currentStatus.reason ? `: ${currentStatus.reason}` : ''}. This step carries on once it runs.
+        </p>
       ) : currentStatus.state !== 'running' && (
         <div className="banner banner-err" role="alert">
           <span>
@@ -616,7 +737,7 @@ function PluginScreenContent({ pluginId, navId, onNavigate }: Props) {
           key={attempt}
           ref={frameRef}
           className="plugin-screen"
-          title={screen.title ?? navId}
+          title={screen.title ?? screenId ?? navId}
           srcDoc={doc}
           /* allow-scripts WITHOUT allow-same-origin: the screen runs at an opaque
              origin, so it has no access to the host's storage or the local API

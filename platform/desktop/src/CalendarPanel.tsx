@@ -643,7 +643,7 @@ function CallVoice({ business }: { business: string }) {
   );
 }
 
-function SettingsForm({ settings, onSaved }: { settings: CalendarSettings; onSaved: (s: CalendarSettings) => void }) {
+export function SettingsForm({ settings, onSaved }: { settings: CalendarSettings; onSaved: (s: CalendarSettings) => void }) {
   const toast = useToast();
   const [s, setS] = useState<CalendarSettings>(settings);
   const [saving, setSaving] = useState(false);

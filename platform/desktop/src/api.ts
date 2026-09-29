@@ -777,9 +777,10 @@ export const plugins = {
       `/api/plugins/${encodeURIComponent(id)}/logs?tail=${tail}`,
     ),
   /** Install (or replace) a plugin from a path on this machine — a plugin folder
-   *  or a .tar.gz of one. Installing native code, so it's Desktop-window only. */
+   *  or a .tar.gz of one. Installing native code, so it's Desktop-window only.
+   *  `setup` is there when the plugin declares a setup wizard. */
   install: (source: string) =>
-    request<{ id: string; name: string; version: string; replaced: boolean }>(
+    request<{ id: string; name: string; version: string; replaced: boolean; setup?: { version: number; title: string } }>(
       '/api/plugins/install',
       { method: 'POST', body: JSON.stringify({ source }) },
     ),
@@ -1385,9 +1386,146 @@ export interface EnginesStatus {
   gpus?: Array<{ index: number; name: string; memory_used_mb: number; memory_total_mb: number }> | null;
 }
 
+/** A download from the engines' catalog, as it stands. */
+export interface EngineDownload {
+  id: string;
+  /** `queued`, `downloading`, `adding`, `done`, `paused`, `cancelled`, `failed`. */
+  status: string;
+  done: number;
+  total: number;
+  file?: string;
+  filesDone?: number;
+  filesTotal?: number;
+  /** MB/s. */
+  speed?: number;
+  error?: string | null;
+}
+
+/** One model of the engines' catalog. */
+export interface EngineCatalogModel {
+  id: string;
+  group: string;
+  name: string;
+  about?: string;
+  license?: string;
+  sizeGb?: number;
+  vramGb?: number;
+  recommended: boolean;
+  needs: string[];
+  installed: boolean;
+  partial: boolean;
+  download: EngineDownload | null;
+}
+
+/** The engines' catalog, and the model chosen in Engines for each group (`null`: none). */
+export interface EngineCatalog {
+  running: boolean;
+  error?: string;
+  dir?: string;
+  free?: number | null;
+  groups?: Array<{ id: string; name: string; about?: string }>;
+  models?: EngineCatalogModel[];
+  defaults?: Record<string, string | null>;
+}
+
 export const engines = {
   status: () => request<EnginesStatus>('/api/engines'),
+  /** The catalog and the models chosen in Engines. */
+  catalog: () => request<EngineCatalog>('/api/engines/catalog'),
+  downloads: () => request<{ running: boolean; downloads: EngineDownload[]; error?: string }>('/api/engines/downloads'),
+  /** Download a catalog model into the engines' own folder. */
+  download: (id: string) =>
+    request<{ running: boolean; downloads: EngineDownload[] }>('/api/engines/downloads', { method: 'POST', body: JSON.stringify({ id }) }),
 };
+
+// ----- setup (the wizard's record, on the desktop) -----
+
+export interface FirstRunState {
+  finished: boolean;
+  /** The step it is on. */
+  position?: string | null;
+  skipped: string[];
+  chosenPlugins: string[];
+  /** Why a desktop already in use was recorded as set up. */
+  migrated?: string;
+}
+
+export interface PluginSetupState {
+  /** The setup version last finished (0: never). */
+  version: number;
+  done: string[];
+  skipped: string[];
+  permissionsAccepted?: string[];
+}
+
+export interface SetupState {
+  firstRun: FirstRunState;
+  plugins: Record<string, PluginSetupState>;
+}
+
+/** A plugin's setup as the desktop reads it, its capabilities, and its record. */
+export interface SetupPluginDetail {
+  pluginId: string;
+  name: string;
+  setup: { version: number; title: string; steps: unknown[] } | null;
+  /** Its capabilities, wildcards expanded. */
+  capabilities: string[];
+  legacyCapabilities?: Array<[string, string]>;
+  unknownCapabilities?: string[];
+  /** The person accepted everything it asks for now. */
+  permissionsAccepted: boolean;
+  needsSetup: boolean;
+  state: PluginSetupState;
+}
+
+export interface CheckOutcome {
+  passed: boolean;
+  detail: string;
+}
+
+/** A plugin OAIY knows how to install (the bundled catalog). */
+export interface CatalogPlugin {
+  id: string;
+  name: string;
+  plugin?: string;
+  publisher?: string;
+  description?: string;
+  provides?: string[];
+  needs?: string;
+  /** Installed from a folder on this machine; `path` is where one was found (null: the person chooses). */
+  source: { kind: 'folder'; note?: string; path: string | null };
+  installed: boolean;
+  installedVersion: string | null;
+}
+
+export type StepMark = 'done' | 'skipped' | 'todo';
+
+export const setup = {
+  get: () => request<SetupState>('/api/setup'),
+  /** Replace the first-run part of the record. */
+  putFirstRun: (firstRun: Omit<FirstRunState, 'migrated'>) =>
+    request<SetupState>('/api/setup', { method: 'PUT', body: JSON.stringify({ firstRun }) }),
+  catalog: () => request<{ plugins: CatalogPlugin[] }>('/api/setup/catalog'),
+  plugin: (id: string) => request<SetupPluginDetail>(`/api/setup/plugins/${encodeURIComponent(id)}`),
+  /** Record a step done, skipped, or neither. `permissions` done records what is accepted now. */
+  markStep: (id: string, step: string, status: StepMark = 'done') =>
+    request<SetupState>(`/api/setup/plugins/${encodeURIComponent(id)}/steps/${encodeURIComponent(step)}`, {
+      method: 'POST',
+      body: JSON.stringify({ status }),
+    }),
+  finish: (id: string) => request<SetupState>(`/api/setup/plugins/${encodeURIComponent(id)}/finish`, { method: 'POST' }),
+  /** Run a step's `done` (or `when`) check on the desktop. */
+  check: (id: string, step: string, which: 'done' | 'when' = 'done') =>
+    request<CheckOutcome>(
+      `/api/setup/plugins/${encodeURIComponent(id)}/check/${encodeURIComponent(step)}${which === 'when' ? '?check=when' : ''}`,
+      { method: 'POST' },
+    ),
+};
+
+/** Ask the Agent (its page in OAIY's window) to do something only it can: its settings live in its own storage. */
+export function agentIntent(intent: 'answerWithOaiy'): Promise<void> {
+  return tauriInvoke<void>('agent_intent', { intent });
+}
 
 export const phone = {
   /** Whether Aokie has the phone connected. */

@@ -10,8 +10,11 @@ import {
   FolderOpen,
   Trash2,
   Boxes,
+  ListChecks,
 } from 'lucide-react';
 import {
+  appConfig,
+  isTauri,
   plugins,
   openInExplorer,
   type PluginRecord,
@@ -21,6 +24,8 @@ import {
   type ServiceDefinition,
 } from './api';
 import { refetchModules } from './useModules';
+import { pluginNeedsSetup, readSetup } from './setupFlow';
+import { openSetup, refetchSetup, useSetupState } from './useSetupState';
 import { peek, put } from './useCached';
 import { useToast } from './Toasts';
 import LogsViewer from './LogsViewer';
@@ -150,6 +155,7 @@ export default function PluginsPanel() {
   );
 
   const list = useMemo(() => snapshot?.plugins ?? [], [snapshot]);
+  const setupState = useSetupState();
 
   const installPlugin = useCallback(async () => {
     const source = installSource.trim();
@@ -157,16 +163,20 @@ export default function PluginsPanel() {
     setInstalling(true);
     try {
       const out = await plugins.install(source);
+      // A new plugin with a setup wizard: its wizard opens now. An update whose
+      // setup went up gets a nudge on its card instead (it was set up before).
+      const opensSetup = !!out.setup && !out.replaced;
       toast.push({
         kind: 'success',
         title: out.replaced
           ? `Updated ${out.name} to v${out.version}`
           : `Installed ${out.name} v${out.version}`,
-        body: 'Click Start to run it.',
+        body: opensSetup ? 'Its setup opens now.' : out.setup ? 'If its setup has something new, its card says so.' : 'Click Start to run it.',
       });
       setInstallSource('');
       void refetchModules();
-      await refresh();
+      await Promise.all([refresh(), refetchSetup()]);
+      if (opensSetup) openSetup({ plugin: out.id });
     } catch (e) {
       setError(e instanceof Error ? e.message : String(e));
     } finally {
@@ -227,12 +237,23 @@ export default function PluginsPanel() {
         >
           <label className="form-row">
             <span>Plugin folder, .zip or .tar.gz on this machine</span>
-            <input
-              type="text"
-              placeholder="C:\path\to\my-plugin"
-              value={installSource}
-              onChange={(e) => setInstallSource(e.target.value)}
-            />
+            <span className="setup-folder-row">
+              <input
+                type="text"
+                placeholder="C:\path\to\my-plugin"
+                value={installSource}
+                onChange={(e) => setInstallSource(e.target.value)}
+              />
+              {isTauri() && (
+                <button
+                  type="button"
+                  className="btn"
+                  onClick={() => void appConfig.pickFolder().then((p) => p && setInstallSource(p)).catch(() => {})}
+                >
+                  <FolderOpen size={14} /> Browse
+                </button>
+              )}
+            </span>
           </label>
           <p className="form-hint">
             Installing a plugin installs native code this app will run. Only install plugins you
@@ -268,6 +289,9 @@ export default function PluginsPanel() {
             <PluginCard
               key={p.id}
               plugin={p}
+              setupTitle={readSetup(p)?.title ?? null}
+              needsSetup={!p.userDisabled && pluginNeedsSetup(p, setupState)}
+              onSetup={() => openSetup({ plugin: p.id })}
               pending={pending.has(p.id)}
               onStart={() => runAction(p.id, () => plugins.start(p.id))}
               onStop={() => runAction(p.id, () => plugins.stop(p.id))}
@@ -324,6 +348,11 @@ export default function PluginsPanel() {
 
 interface CardProps {
   plugin: PluginRecord;
+  /** Its setup wizard's title, when it declares one. */
+  setupTitle: string | null;
+  /** Its setup was never finished, or its setup version went up (a nudge, not a forced wizard). */
+  needsSetup: boolean;
+  onSetup: () => void;
   pending: boolean;
   onStart: () => void;
   onStop: () => void;
@@ -334,6 +363,9 @@ interface CardProps {
 
 function PluginCard({
   plugin: p,
+  setupTitle,
+  needsSetup,
+  onSetup,
   pending,
   onStart,
   onStop,
@@ -360,6 +392,17 @@ function PluginCard({
 
       {p.manifest?.description && (
         <p className="card-desc">{p.manifest.description}</p>
+      )}
+
+      {/* Dropped in by hand, or updated with more to set up: a nudge, never a forced wizard. */}
+      {needsSetup && setupTitle && (
+        <div className="setup-nudge">
+          <ListChecks size={14} aria-hidden />
+          <span>Finish setting up {p.manifest?.name ?? p.id}.</span>
+          <button className="btn btn-primary" onClick={onSetup} title={setupTitle}>
+            Set up…
+          </button>
+        </div>
       )}
 
       {/* Every non-running state carries a reason the host wrote — surface it,
@@ -415,6 +458,12 @@ function PluginCard({
             }
           >
             <Play size={14} /> Start
+          </button>
+        )}
+
+        {setupTitle && !needsSetup && (
+          <button className="btn btn-ghost" onClick={onSetup} title={setupTitle}>
+            <ListChecks size={14} /> Set up…
           </button>
         )}
 

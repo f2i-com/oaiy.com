@@ -1653,22 +1653,6 @@ select:disabled { cursor: not-allowed; opacity: 0.5; }
 .link-line.is-live { color: var(--green); }
 .link-line.is-error { color: var(--danger); }
 .pairing-body { overflow-wrap: anywhere; }
-/* Guided setup remains usable in narrow desktop windows. */
-.setup-wizard { margin: 2px 0 0; padding: 16px 18px; border: 1px solid var(--border); border-radius: var(--r-card); background: var(--surface-soft); min-width: 0; }
-.setup-wizard h4 { margin: 16px 0 6px; font-size: 16px; font-weight: 640; letter-spacing: -0.01em; }
-.setup-wizard-nav, .setup-wizard-footer { display: flex; gap: 8px; flex-wrap: wrap; align-items: center; }
-/* The step shown, and the AI choice made: the selected look of the segmented tabs. */
-.setup-wizard-nav [aria-current="step"], .setup-wizard-nav [aria-pressed="true"] {
-  border-color: color-mix(in srgb, var(--primary) 45%, var(--border));
-  background: var(--primary-soft);
-  color: var(--primary);
-}
-.setup-wizard-footer { margin-top: 18px; justify-content: space-between; }
-.setup-wizard-instructions { padding-left: 22px; font-size: 13px; line-height: 1.8; overflow-wrap: anywhere; }
-.setup-wizard-choice { margin-top: 16px; }
-.setup-wizard .service-section { margin-top: 20px; }
-@media (max-width: 480px) { .setup-wizard { padding: 14px; } .setup-wizard .form-actions { flex-wrap: wrap; } .setup-wizard-nav button { flex: 1 1 auto; min-height: 40px; } }
-
 /* The agent, the flow editor and the engines: webviews of their own, laid over this box by the app. */
 .embedded-page { flex: 1 1 auto; min-height: 0; position: relative; background: var(--canvas); }
 .embedded-problem { margin: 24px; color: var(--muted); }

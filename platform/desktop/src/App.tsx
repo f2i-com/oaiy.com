@@ -9,6 +9,7 @@ import {
   HardDrive,
   History,
   LayoutDashboard,
+  ListChecks,
   LockKeyhole,
   Moon,
   Package,
@@ -40,6 +41,8 @@ import ConnectionsPanel from './ConnectionsPanel';
 import PairingPrompt from './PairingPrompt';
 import SettingsPanel from './SettingsPanel';
 import EmbeddedPage from './EmbeddedPage';
+import SetupPage from './SetupPage';
+import { carryGuideDismissal, guideDismissed, onOpenSetup, useSetupState } from './useSetupState';
 
 /**
  * OAIY Desktop: a sidebar of a few sections, and a workspace of topbar / page /
@@ -74,7 +77,9 @@ type BuiltinView =
   | 'python'
   | 'providers'
   | 'connections'
-  | 'settings';
+  | 'settings'
+  /** The setup wizard: first run, or one plugin's own. */
+  | 'setup';
 
 /** A plugin-contributed screen, addressed as `plugin:<pluginId>:<navId>`. */
 type View = BuiltinView | `plugin:${string}:${string}`;
@@ -134,6 +139,7 @@ const PAGE: Record<BuiltinView, { tab: string; icon: LucideIcon; copy: string }>
   providers: { tab: 'AI providers', icon: Sparkles, copy: 'Cloud or local AI providers your flows can call. Keys stay on this device.' },
   plugins: { tab: 'Plugins', icon: Puzzle, copy: 'Supervised extensions that add connectors and events to your flows.' },
   settings: { tab: 'Settings', icon: Settings2, copy: 'Where OAIY keeps its data and models, and your Hugging Face token.' },
+  setup: { tab: 'Setup', icon: ListChecks, copy: 'The engine, your plugins and their devices, step by step.' },
 };
 
 /** A built-in page's tab name and icon (a plugin page's come from its contribution). */
@@ -223,6 +229,40 @@ export default function App() {
   const [seen, setSeen] = useState<Set<string>>(readSeen);
   const [theme, setThemeState] = useState<ThemeMode>(initialTheme);
   const [copied, setCopied] = useState(false);
+  /** The setup page: a plugin's own wizard (its id), or the first-run wizard (null); and where it goes back to. */
+  const [setupPlugin, setSetupPlugin] = useState<string | null>(null);
+  const [setupReturn, setSetupReturn] = useState<View>('overview');
+  const viewRef = useRef<View>(view);
+  viewRef.current = view;
+  const setupState = useSetupState();
+
+  // Anything may open setup (the Overview's card, a plugin card, an install, Settings).
+  useEffect(
+    () =>
+      onOpenSetup((target) => {
+        setSetupPlugin(target.plugin ?? null);
+        if (viewRef.current !== 'setup') setSetupReturn(viewRef.current);
+        setView('setup');
+      }),
+    [],
+  );
+
+  // First run: the wizard opens by itself once, when the desktop says setup is
+  // not finished, and only while the window is still on the Overview. A desktop
+  // already in use was recorded as finished by the desktop; someone who
+  // dismissed the old setup guide is carried over here, once.
+  const autoOpened = useRef(false);
+  useEffect(() => {
+    if (!setupState || autoOpened.current) return;
+    autoOpened.current = true;
+    void (async () => {
+      const carried = await carryGuideDismissal(setupState);
+      if (carried || guideDismissed() || setupState.firstRun.finished) return;
+      setSetupPlugin(null);
+      setSetupReturn('overview');
+      setView((v) => (v === 'overview' ? 'setup' : v));
+    })();
+  }, [setupState]);
 
   const setTheme = useCallback((next: ThemeMode) => {
     setThemeState(next);
@@ -371,7 +411,13 @@ export default function App() {
         title: section?.label ?? activePluginPage?.label ?? 'Plugin screen',
         copy: `From the ${activePluginPage?.pluginName ?? pluginView[1]} plugin.`,
       }
-    : {
+    : view === 'setup'
+      ? {
+          kicker: 'Setup',
+          title: setupPlugin ? 'Set up a plugin' : 'Set up OAIY',
+          copy: setupPlugin ? 'What it may do, what it needs, and its device, step by step.' : PAGE.setup.copy,
+        }
+      : {
         kicker: section?.group ?? 'Home',
         title: section?.label ?? PAGE[view as BuiltinView].tab,
         copy: PAGE[view as BuiltinView].copy,
@@ -520,7 +566,7 @@ export default function App() {
               to the dock and scrolls on its own. */}
           <div
             hidden={embedded}
-            className={`content-page${visited.has(view) ? ' revisit' : ''}${pluginView ? ' page-fill' : ''}`}
+            className={`content-page${visited.has(view) ? ' revisit' : ''}${pluginView || view === 'setup' ? ' page-fill' : ''}`}
             key={view}
           >
             <PairingPrompt />
@@ -542,6 +588,14 @@ export default function App() {
             {view === 'connections' && <ConnectionsPanel />}
             {view === 'python' && <PythonPanel />}
             {view === 'settings' && <SettingsPanel />}
+            {view === 'setup' && (
+              <SetupPage
+                key={setupPlugin ?? 'first-run'}
+                pluginId={setupPlugin}
+                onExit={() => setView(setupReturn === 'setup' ? 'overview' : setupReturn)}
+                onNavigate={(v) => setView(v)}
+              />
+            )}
           </div>
         </section>
 

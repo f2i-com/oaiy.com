@@ -5,6 +5,7 @@ import { ToastProvider } from './Toasts';
 import { applyTheme, initialTheme } from './theme';
 import './styles.css';
 import './workspace.css';
+import './setup.css';
 
 // Set the theme class before first paint to avoid a flash of the wrong theme.
 applyTheme(initialTheme());

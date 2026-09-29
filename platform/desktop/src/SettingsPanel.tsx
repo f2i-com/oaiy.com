@@ -4,12 +4,14 @@ import {
   formatBytes,
   isTauri,
   openInExplorer,
+  setup as setupApi,
   type DesktopConfig,
   type MigratePlan,
   type MigrationProgress,
 } from './api';
-import { FolderOpen, FolderSearch, RotateCcw, X } from 'lucide-react';
+import { FolderOpen, FolderSearch, ListChecks, RotateCcw, X } from 'lucide-react';
 import { useToast } from './Toasts';
+import { forgetGuideDismissal, openSetup, setSetupState, useSetupState } from './useSetupState';
 
 /**
  * Changing a folder, in one row: paste a path and use it, or choose one.
@@ -96,6 +98,43 @@ function OpenButton({ path, onError }: { path: string; onError: (message: string
  * at — point it wherever they like. The choice persists in a tiny
  * pointer file and applies on the next launch.
  */
+/** "Run setup again": the first-run wizard from its start. What is set up already shows as done. */
+function SetupSection() {
+  const state = useSetupState();
+  const toast = useToast();
+  const [busy, setBusy] = useState(false);
+  const runAgain = async () => {
+    setBusy(true);
+    try {
+      // So the old guide's dismissal does not finish it again by itself.
+      forgetGuideDismissal();
+      setSetupState(
+        await setupApi.putFirstRun({ finished: false, position: 'welcome', skipped: [], chosenPlugins: state?.firstRun.chosenPlugins ?? [] }),
+      );
+      openSetup();
+    } catch (e) {
+      toast.push({ kind: 'error', title: 'Setup could not start', body: e instanceof Error ? e.message : String(e) });
+    } finally {
+      setBusy(false);
+    }
+  };
+  return (
+    <section className="model-section">
+      <h3 className="section-title">Setup</h3>
+      <p className="form-hint">
+        {state === null ? '' : state.firstRun.finished ? 'Setup is finished. ' : 'Setup is not finished yet. '}
+        Run it again to choose the engine’s model, add plugins and set them up, step by step, down to their devices. What is
+        already set up is kept, and shows as done.
+      </p>
+      <div className="form-actions">
+        <button className="btn" disabled={busy} onClick={() => void runAgain()}>
+          <ListChecks size={14} /> Run setup again
+        </button>
+      </div>
+    </section>
+  );
+}
+
 export default function SettingsPanel() {
   const [cfg, setCfg] = useState<DesktopConfig | null>(null);
   const [logFile, setLogFile] = useState<string | null>(null);
@@ -401,6 +440,7 @@ export default function SettingsPanel() {
   if (!isTauri()) {
     return (
       <div className="panel">
+        <SetupSection />
         <div className="empty-state">
           Settings are only available inside the OAIY desktop app.
         </div>
@@ -411,6 +451,8 @@ export default function SettingsPanel() {
   return (
     <div className="panel">
       {error && <div className="banner banner-err">⚠ {error}</div>}
+
+      <SetupSection />
 
       <section className="model-section">
         <h3 className="section-title">Data folder</h3>

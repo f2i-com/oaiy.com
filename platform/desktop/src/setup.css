@@ -1,0 +1,567 @@
+/* ============================================================================
+ * SETUP — the first-run wizard, a plugin's own wizard, and the Overview's
+ * "Continue setup" card. Built from the dashboard's tokens (styles.css), so it
+ * follows Prism Lab and Paper Circuit like every page, and fits a 700px window.
+ * ========================================================================== */
+
+.sr-only {
+  position: absolute;
+  width: 1px;
+  height: 1px;
+  margin: -1px;
+  padding: 0;
+  overflow: hidden;
+  clip: rect(0 0 0 0);
+  white-space: nowrap;
+  border: 0;
+}
+
+/* The page fills the content area down to the dock (a plugin screen step fills its pane). */
+.content-page.page-fill > .setup-page { flex: 1 1 auto; }
+.setup-page {
+  display: flex;
+  width: 100%;
+  max-width: 1180px;
+  min-height: 0;
+  flex-direction: column;
+  gap: 16px;
+  margin: 0 auto;
+  animation: rise 0.42s cubic-bezier(0.2, 0.8, 0.2, 1) both;
+}
+.content-page.revisit .setup-page { animation: none; }
+@media (prefers-reduced-motion: reduce) { .setup-page { animation: none; } }
+
+/* ---- heading, with progress --------------------------------------------- */
+
+.setup-hero {
+  display: flex;
+  align-items: flex-end;
+  justify-content: space-between;
+  flex-wrap: wrap;
+  gap: 12px 24px;
+}
+.setup-hero-text { min-width: 0; }
+.setup-hero h1 {
+  margin: 0;
+  font-size: 22px;
+  font-weight: 680;
+  letter-spacing: -0.015em;
+}
+.setup-hero p {
+  max-width: 68ch;
+  margin: 4px 0 0;
+  color: var(--muted);
+  font-size: 13px;
+  line-height: 1.55;
+}
+.setup-hero-side { display: flex; align-items: center; gap: 12px; }
+.setup-progress-label {
+  color: var(--faint);
+  font-family: var(--font-mono);
+  font-size: 11px;
+  white-space: nowrap;
+}
+
+.setup-progress {
+  position: relative;
+  display: block;
+  width: 140px;
+  height: 6px;
+  flex: none;
+  overflow: hidden;
+  border: 1px solid var(--border);
+  border-radius: 99px;
+  background: var(--canvas);
+}
+.setup-progress > i {
+  display: block;
+  height: 100%;
+  border-radius: inherit;
+  background: linear-gradient(90deg, var(--primary), var(--primary-2));
+  transition: width 0.3s ease;
+}
+:root:not([data-theme='light']) .setup-progress > i { box-shadow: 0 0 8px color-mix(in srgb, var(--primary) 60%, transparent); }
+.setup-progress > i.is-indeterminate { width: 34%; animation: setup-slide 1.3s ease-in-out infinite; }
+@keyframes setup-slide { from { transform: translateX(-110%); } to { transform: translateX(310%); } }
+@media (prefers-reduced-motion: reduce) { .setup-progress > i.is-indeterminate { animation: none; width: 100%; opacity: 0.45; } }
+
+/* ---- the steps, and the pane -------------------------------------------- */
+
+.setup-body {
+  display: grid;
+  flex: 1 1 auto;
+  min-height: 0;
+  grid-template-columns: 240px minmax(0, 1fr);
+  gap: 16px;
+}
+
+.setup-rail {
+  position: sticky;
+  top: 0;
+  align-self: start;
+  border: 1px solid var(--border);
+  border-radius: var(--r-card);
+  background: var(--surface);
+  box-shadow: var(--shadow-card);
+  padding: 8px;
+}
+.setup-rail ol { display: flex; flex-direction: column; gap: 2px; margin: 0; padding: 0; list-style: none; }
+.setup-rail-item { position: relative; }
+/* The thread between the marks. */
+.setup-rail-item:not(:last-child)::after {
+  position: absolute;
+  top: 35px;
+  bottom: -7px;
+  left: 19px;
+  width: 1px;
+  background: var(--border);
+  content: '';
+}
+.setup-rail-item.is-done:not(:last-child)::after { background: color-mix(in srgb, var(--green) 45%, var(--border)); }
+.setup-rail-item button {
+  display: flex;
+  width: 100%;
+  align-items: flex-start;
+  gap: 10px;
+  border: 0;
+  border-radius: var(--r-ctl);
+  background: transparent;
+  color: var(--muted);
+  padding: 8px;
+  text-align: left;
+  transition: background 0.14s, color 0.14s;
+}
+.setup-rail-item button:hover:not(:disabled) { background: var(--surface-soft); color: var(--text); }
+.setup-rail-item button:disabled { cursor: default; }
+.setup-rail-item.is-current button { background: var(--primary-soft); color: var(--text); }
+.setup-rail-mark {
+  position: relative;
+  z-index: 1;
+  display: grid;
+  width: 22px;
+  height: 22px;
+  flex: none;
+  margin-top: 1px;
+  place-items: center;
+  border: 1px solid var(--strong-border);
+  border-radius: 50%;
+  background: var(--surface-solid);
+  color: var(--muted);
+}
+.setup-rail-num { font-family: var(--font-mono); font-size: 10.5px; font-weight: 650; }
+.setup-rail-item.is-done .setup-rail-mark {
+  border-color: color-mix(in srgb, var(--green) 55%, transparent);
+  background: var(--green-soft);
+  color: var(--green);
+}
+.setup-rail-item.is-skipped .setup-rail-mark { border-style: dashed; color: var(--faint); }
+.setup-rail-item.is-current .setup-rail-mark {
+  border-color: var(--primary);
+  color: var(--primary);
+  box-shadow: 0 0 0 3px var(--primary-soft);
+}
+.setup-rail-text { display: flex; min-width: 0; flex-direction: column; gap: 1px; }
+.setup-rail-text strong { color: inherit; font-size: 13px; font-weight: 620; line-height: 1.35; }
+.setup-rail-item.is-current .setup-rail-text strong { color: var(--text); }
+.setup-rail-text small {
+  overflow: hidden;
+  color: var(--faint);
+  font-size: 11.5px;
+  line-height: 1.35;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.setup-main {
+  display: flex;
+  min-width: 0;
+  min-height: 0;
+  flex-direction: column;
+  overflow: hidden;
+  border: 1px solid var(--border);
+  border-radius: var(--r-card);
+  background: var(--surface);
+  box-shadow: var(--shadow-card);
+}
+.setup-pane {
+  display: flex;
+  min-height: 0;
+  flex: 1 1 auto;
+  flex-direction: column;
+  gap: 18px;
+  overflow: auto;
+  padding: 22px 24px 22px;
+}
+/* A plugin's screen sits flush in the pane: the pane draws no padding, the screen none (--host-page-pad: 0). */
+.setup-pane.is-flush { gap: 0; overflow: hidden; padding: 0; }
+
+.setup-foot {
+  display: flex;
+  flex: none;
+  align-items: center;
+  gap: 10px;
+  border-top: 1px solid var(--border);
+  background: color-mix(in srgb, var(--surface-solid) 65%, transparent);
+  padding: 12px 16px;
+}
+.setup-foot-status {
+  flex: 1;
+  min-width: 0;
+  color: var(--muted);
+  font-size: 12.5px;
+  text-align: right;
+}
+.setup-foot-status .card-warn { justify-content: flex-end; }
+.setup-ok { display: inline-flex; align-items: center; gap: 5px; color: var(--green); font-weight: 600; }
+
+/* ---- a step's heading ----------------------------------------------------- */
+
+.setup-step-head { display: flex; justify-content: space-between; gap: 16px; }
+.setup-step-titles { min-width: 0; }
+.setup-kicker {
+  display: block;
+  color: var(--primary);
+  font-family: var(--font-mono);
+  font-size: 10.5px;
+  font-weight: 650;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+}
+.setup-step-head h2 {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 10px;
+  margin: 5px 0 0;
+  font-size: 19px;
+  font-weight: 660;
+  letter-spacing: -0.01em;
+}
+.setup-step-head h2 .badge { font-size: 10.5px; }
+.setup-step-head p {
+  max-width: 72ch;
+  margin: 6px 0 0;
+  color: var(--muted);
+  font-size: 13.5px;
+  line-height: 1.55;
+}
+
+/* ---- requirements (the engine step, a plugin's requirements) ------------ */
+
+.setup-reqs { display: flex; flex-direction: column; gap: 12px; }
+.setup-req {
+  display: flex;
+  align-items: flex-start;
+  gap: 14px;
+  border: 1px solid var(--border);
+  border-radius: var(--r-card);
+  background: var(--surface-soft);
+  padding: 14px 16px;
+}
+.setup-req-icon {
+  display: grid;
+  width: 34px;
+  height: 34px;
+  flex: none;
+  place-items: center;
+  border-radius: 9px;
+  background: var(--primary-soft);
+  color: var(--primary);
+}
+.setup-req-body { display: flex; min-width: 0; flex: 1; flex-direction: column; gap: 4px; }
+.setup-req-body > strong { font-size: 14px; font-weight: 640; }
+.setup-req-body > p { margin: 0; color: var(--muted); font-size: 12.5px; line-height: 1.5; }
+.setup-req-status { display: flex; flex-wrap: wrap; align-items: center; gap: 8px; margin-top: 4px; }
+.setup-req-action { display: flex; flex: none; align-self: center; gap: 8px; }
+.setup-req-progress { display: flex; width: 100%; flex-direction: column; gap: 5px; }
+.setup-req-progress .setup-progress { width: 100%; max-width: 440px; }
+.setup-req-progress small { color: var(--muted); font-size: 12px; }
+.setup-mono { color: var(--faint); font-family: var(--font-mono); font-size: 11.5px; overflow-wrap: anywhere; }
+.setup-chosen { display: inline-flex; flex-wrap: wrap; align-items: center; gap: 8px; }
+.setup-chosen strong { font-family: var(--font-mono); font-size: 12.5px; }
+.setup-offer { display: flex; width: 100%; flex-direction: column; gap: 8px; }
+.setup-offer-card {
+  display: flex;
+  max-width: 520px;
+  flex-direction: column;
+  gap: 3px;
+  border: 1px dashed var(--strong-border);
+  border-radius: var(--r-ctl);
+  background: var(--surface-solid);
+  padding: 10px 12px;
+}
+.setup-offer-card strong { display: flex; align-items: center; flex-wrap: wrap; gap: 8px; font-size: 13.5px; }
+.setup-offer-card small { color: var(--muted); font-size: 12px; line-height: 1.5; }
+.setup-offer-card small.setup-mono { color: var(--faint); font-size: 11.5px; }
+.setup-retry { flex-wrap: wrap; margin: 0; }
+
+details.setup-more-source {
+  border: 1px solid var(--border);
+  border-radius: var(--r-card);
+  background: var(--surface-solid);
+  padding: 11px 14px;
+}
+details.setup-more-source > summary {
+  color: var(--muted);
+  cursor: pointer;
+  font-size: 12.5px;
+  font-weight: 600;
+}
+details.setup-more-source > summary:hover { color: var(--text); }
+.setup-source { display: flex; flex-direction: column; gap: 12px; margin-top: 12px; }
+.setup-source-other { display: flex; flex-direction: column; align-items: flex-start; gap: 10px; }
+
+/* ---- welcome ---------------------------------------------------------------- */
+
+.setup-welcome { display: flex; flex-direction: column; gap: 18px; }
+.setup-welcome-parts {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(min(100%, 200px), 1fr));
+  gap: 12px;
+  margin: 0;
+  padding: 0;
+  list-style: none;
+}
+.setup-welcome-parts li {
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+  border: 1px solid var(--border);
+  border-radius: var(--r-card);
+  background: var(--surface-soft);
+  padding: 16px;
+}
+.setup-welcome-parts li > span:last-child { display: flex; flex-direction: column; gap: 4px; }
+.setup-welcome-parts strong { font-size: 14px; font-weight: 650; }
+.setup-welcome-parts small { color: var(--muted); font-size: 12.5px; line-height: 1.55; }
+.setup-note {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 8px;
+  border: 1px solid color-mix(in srgb, var(--amber) 35%, transparent);
+  border-radius: var(--r-ctl);
+  background: var(--amber-soft);
+  color: var(--amber);
+  padding: 10px 12px;
+  font-size: 12.5px;
+}
+.setup-note > span { flex: 1 1 240px; min-width: 0; }
+.setup-trust { display: flex; align-items: center; gap: 6px; margin: 0; color: var(--faint); font-size: 12px; }
+
+/* ---- plugins ---------------------------------------------------------------- */
+
+.setup-plugins { display: flex; flex-direction: column; gap: 16px; }
+.setup-plugin-list { display: flex; flex-direction: column; gap: 10px; }
+.setup-plugin {
+  display: flex;
+  gap: 12px;
+  border: 1px solid var(--border);
+  border-radius: var(--r-card);
+  background: var(--surface-soft);
+  padding: 14px 16px;
+  transition: border-color 0.14s, background 0.14s;
+}
+.setup-plugin.is-chosen {
+  border-color: color-mix(in srgb, var(--primary) 55%, var(--border));
+  background: color-mix(in srgb, var(--primary) 6%, var(--surface-soft));
+}
+.setup-plugin-tick { flex: none; padding-top: 3px; }
+.setup-plugin-tick input { width: 16px; height: 16px; cursor: pointer; }
+.setup-plugin-body { display: flex; min-width: 0; flex: 1; flex-direction: column; gap: 4px; }
+.setup-plugin-body > strong { display: flex; align-items: center; flex-wrap: wrap; gap: 8px; font-size: 14.5px; font-weight: 650; }
+.setup-plugin-body > p { margin: 2px 0 0; color: var(--muted); font-size: 12.5px; line-height: 1.55; }
+.setup-plugin-meta { color: var(--faint); font-family: var(--font-mono); font-size: 11px; }
+.setup-chips { display: flex; flex-wrap: wrap; gap: 6px; margin-top: 4px; }
+.setup-chip {
+  border: 1px solid var(--border);
+  border-radius: 99px;
+  background: var(--surface-solid);
+  color: var(--muted);
+  padding: 2px 9px;
+  font-size: 11.5px;
+}
+.setup-chip.is-need { border-style: dashed; }
+
+.setup-folder { display: flex; flex-direction: column; gap: 8px; }
+.setup-folder.is-compact { margin-top: 8px; }
+.setup-folder-row { display: flex; flex-wrap: wrap; gap: 8px; }
+.setup-folder-row input { min-width: 0; flex: 1 1 240px; font-family: var(--font-mono); }
+
+/* ---- permissions, settings, connect, done -------------------------------- */
+
+.setup-perms { display: flex; flex-direction: column; gap: 12px; }
+.setup-perm-list { display: flex; flex-direction: column; gap: 8px; margin: 0; padding: 0; list-style: none; }
+.setup-perm-list li {
+  display: flex;
+  gap: 11px;
+  border: 1px solid var(--border);
+  border-radius: var(--r-ctl);
+  background: var(--surface-soft);
+  padding: 10px 12px;
+}
+.setup-perm-list li > svg { flex: none; margin-top: 2px; color: var(--green); }
+.setup-perm-list li > span { display: flex; min-width: 0; flex-direction: column; gap: 2px; }
+.setup-perm-list strong { font-size: 13px; font-weight: 620; }
+.setup-perm-list small { color: var(--muted); font-size: 12px; }
+
+.setup-settings { display: flex; max-width: 580px; flex-direction: column; gap: 12px; }
+.setup-toggle {
+  display: flex;
+  align-items: flex-start;
+  gap: 10px;
+  border: 1px solid var(--border);
+  border-radius: var(--r-ctl);
+  background: var(--surface-soft);
+  padding: 12px 14px;
+  cursor: pointer;
+}
+.setup-toggle input { width: 16px; height: 16px; margin-top: 2px; }
+.setup-toggle > span { display: flex; flex-direction: column; gap: 2px; }
+.setup-toggle strong { font-size: 13.5px; font-weight: 620; }
+.setup-toggle small { color: var(--muted); font-size: 12px; }
+
+.setup-manual { display: flex; flex-direction: column; gap: 10px; margin-top: 6px; }
+.setup-business .cal-settings { border: 0; box-shadow: none; background: transparent; padding: 0; }
+
+.setup-connect,
+.setup-done { display: flex; flex-direction: column; gap: 16px; }
+.setup-instructions { display: flex; flex-direction: column; gap: 6px; margin: 0; padding-left: 20px; font-size: 13px; line-height: 1.6; }
+.setup-connected { display: flex; flex-direction: column; gap: 10px; }
+.setup-summary { display: flex; flex-direction: column; gap: 8px; margin: 0; padding: 0; list-style: none; }
+.setup-summary li {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  border: 1px solid var(--border);
+  border-radius: var(--r-ctl);
+  background: var(--surface-soft);
+  padding: 10px 12px;
+}
+.setup-summary li > span:nth-child(2) { display: flex; min-width: 0; flex: 1; flex-direction: column; gap: 1px; }
+.setup-summary strong { font-size: 13px; font-weight: 620; }
+.setup-summary small { color: var(--faint); font-size: 12px; }
+.setup-summary-mark {
+  display: grid;
+  width: 24px;
+  height: 24px;
+  flex: none;
+  place-items: center;
+  border: 1px solid var(--strong-border);
+  border-radius: 50%;
+  color: var(--muted);
+}
+.setup-summary li.is-done .setup-summary-mark { border-color: color-mix(in srgb, var(--green) 55%, transparent); background: var(--green-soft); color: var(--green); }
+
+/* ---- a plugin screen as a step --------------------------------------------- */
+
+.setup-screen-step { display: flex; min-height: 0; flex: 1 1 auto; flex-direction: column; }
+.setup-screen-step > .setup-step-head { border-bottom: 1px solid var(--border); padding: 20px 24px 14px; }
+.setup-screen-status { display: flex; flex-wrap: wrap; align-items: center; gap: 6px 14px; padding: 10px 24px 0; }
+.setup-screen-status:empty { display: none; }
+.setup-check { color: var(--faint); font-family: var(--font-mono); font-size: 11px; overflow-wrap: anywhere; }
+.plugin-setup-frame { display: flex; min-height: 0; max-width: none; flex: 1 1 auto; flex-direction: column; gap: 0; }
+.plugin-setup-frame > .plugin-screen {
+  min-height: 440px;
+  flex: 1 1 auto;
+  border: 0;
+  border-radius: 0;
+  background: transparent;
+}
+.plugin-setup-frame > .empty-state { margin: 24px; }
+.setup-frame-note {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  margin: 10px 24px 0;
+  border-radius: var(--r-ctl);
+  background: var(--amber-soft);
+  color: var(--amber);
+  padding: 7px 10px;
+  font-size: 12px;
+}
+
+/* A plugin's wizard inside the first-run wizard: its steps as a strip, then the step, then its footer. */
+.setup-embedded { display: flex; min-height: 0; flex: 1 1 auto; flex-direction: column; }
+.setup-substeps {
+  display: flex;
+  flex: none;
+  gap: 6px;
+  margin: 0;
+  overflow-x: auto;
+  border-bottom: 1px solid var(--border);
+  background: var(--canvas);
+  padding: 10px 16px;
+  list-style: none;
+  scrollbar-width: thin;
+}
+.setup-substeps button {
+  display: inline-flex;
+  height: 28px;
+  align-items: center;
+  gap: 6px;
+  border: 1px solid var(--border);
+  border-radius: 99px;
+  background: var(--surface-solid);
+  color: var(--muted);
+  padding: 0 11px;
+  font-size: 12px;
+  font-weight: 600;
+  white-space: nowrap;
+}
+.setup-substeps button > span { font-family: var(--font-mono); font-size: 10.5px; }
+.setup-substeps li.is-done button { color: var(--green); }
+.setup-substeps li.is-current button { border-color: var(--primary); background: var(--primary-soft); color: var(--primary); }
+.setup-embedded-body { display: flex; min-height: 0; flex: 1 1 auto; flex-direction: column; gap: 18px; overflow: auto; padding: 22px 24px; }
+.setup-embedded.is-flush .setup-embedded-body { gap: 0; overflow: hidden; padding: 0; }
+
+/* ---- the Overview's card, and a plugin card's nudge -------------------------- */
+
+.setup-continue { display: flex; flex-wrap: wrap; align-items: center; gap: 10px 16px; }
+.setup-continue .setup-progress { width: 120px; }
+.setup-continue p { flex: 1 1 240px; min-width: 0; font-size: 12.5px; }
+.setup-nudge {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 10px;
+  border: 1px solid color-mix(in srgb, var(--primary) 32%, var(--border));
+  border-radius: var(--r-ctl);
+  background: var(--primary-soft);
+  padding: 9px 12px;
+  font-size: 13px;
+}
+.setup-nudge > svg { flex: none; color: var(--primary); }
+.setup-nudge > span { display: flex; min-width: 0; flex: 1 1 200px; flex-direction: column; }
+.setup-nudge > span small { color: var(--muted); font-size: 11.5px; }
+.service-card .setup-nudge { margin-top: 10px; }
+
+/* ---- narrow windows ------------------------------------------------------------ */
+
+/* The steps become a strip above the pane. */
+@media (max-width: 1020px) {
+  .setup-body { grid-template-columns: minmax(0, 1fr); }
+  .setup-rail { position: static; overflow-x: auto; padding: 6px; scrollbar-width: thin; }
+  .setup-rail ol { flex-direction: row; gap: 4px; }
+  .setup-rail-item::after { display: none; }
+  .setup-rail-item button { align-items: center; padding: 6px 10px 6px 6px; white-space: nowrap; }
+  .setup-rail-text small { display: none; }
+  .setup-rail-mark { margin-top: 0; }
+  .setup-pane,
+  .setup-embedded-body { min-height: 0; }
+}
+@media (max-width: 760px) {
+  .setup-hero h1 { font-size: 19px; }
+  .setup-hero-side { width: 100%; }
+  .setup-hero-side .setup-progress { flex: 1; width: auto; }
+  .setup-pane,
+  .setup-embedded-body { padding: 16px; }
+  .setup-screen-step > .setup-step-head { padding: 16px 16px 12px; }
+  .setup-screen-status { padding: 8px 16px 0; }
+  .setup-req { flex-wrap: wrap; }
+  .setup-req-action { width: 100%; justify-content: flex-end; }
+  .setup-foot { flex-wrap: wrap; }
+  .setup-foot-status { flex-basis: 100%; order: -1; text-align: left; }
+  .setup-foot-status .card-warn { justify-content: flex-start; }
+  .setup-foot .btn-primary { margin-left: auto; }
+}
