@@ -26,7 +26,7 @@ pub struct ServiceTemplate {
     /// Lowercase ASCII + hyphens recommended.
     pub id: String,
 
-    /// User-visible name (e.g. "Ollama", "Llama.cpp Server").
+    /// User-visible name (e.g. "OAIY Voice", "Playwright Browser").
     pub name: String,
 
     /// One-line description shown in the UI.
@@ -265,15 +265,15 @@ mod tests {
     #[test]
     fn substitute_replaces_placeholders() {
         let mut ctx: HashMap<&'static str, String> = HashMap::new();
-        ctx.insert("port", "11434".to_string());
+        ctx.insert("port", "8783".to_string());
         ctx.insert("binDir", "C:\\bin".to_string());
         assert_eq!(
             substitute("serve --port ${port}", &ctx),
-            "serve --port 11434"
+            "serve --port 8783"
         );
         assert_eq!(
-            substitute("${binDir}\\ollama.exe", &ctx),
-            "C:\\bin\\ollama.exe"
+            substitute("${binDir}\\my-server.exe", &ctx),
+            "C:\\bin\\my-server.exe"
         );
     }
 }

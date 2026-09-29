@@ -5,7 +5,6 @@ import {
   openExternal,
   openInExplorer,
   services,
-  type DesktopConfig,
   type GpuInfo,
   type RegistrySnapshot,
   type ServiceSnapshot,
@@ -511,8 +510,8 @@ interface CardProps {
   onDelete: () => void;
 }
 
-/** Shared flex-row layout for both Model selectors (keeps them in lockstep). */
-const MODEL_SELECTOR_ROW_STYLE: CSSProperties = {
+/** Shared flex-row layout for the rows inside a service card (GPU, start with the app). */
+const CARD_ROW_STYLE: CSSProperties = {
   display: 'flex',
   alignItems: 'center',
   gap: 8,
@@ -577,7 +576,7 @@ function AutostartToggle({ serviceId, autostart }: { serviceId: string; autostar
     setOn(autostart);
   }, [autostart]);
   return (
-    <div style={MODEL_SELECTOR_ROW_STYLE}>
+    <div style={CARD_ROW_STYLE}>
       {/* Wrapping the input in the <label> associates the two, so the checkbox
           has an accessible name. */}
       <label style={{ opacity: 0.8, display: 'flex', alignItems: 'center', gap: 6 }}>
@@ -615,8 +614,8 @@ function AutostartToggle({ serviceId, autostart }: { serviceId: string; autostar
 
 /**
  * Per-service GPU picker. Pins the service to a CUDA GPU (CUDA_VISIBLE_DEVICES) so heavy
- * services don't all default to GPU 0 and exhaust its VRAM — e.g. put llama.cpp on GPU 1 so
- * krea2 keeps GPU 0. Hidden when fewer than 2 GPUs. Applies on the service's next start.
+ * services don't all default to GPU 0 and exhaust its VRAM — e.g. put OAIY Voice on GPU 1 so
+ * a Python rig keeps GPU 0. Hidden when fewer than 2 GPUs. Applies on the service's next start.
  */
 function GpuSelector({ serviceId, currentGpu }: { serviceId: string; currentGpu: number | null }) {
   const gpus = useGpus();
@@ -635,7 +634,7 @@ function GpuSelector({ serviceId, currentGpu }: { serviceId: string; currentGpu:
   // user can switch back to Auto to clear it.
   const pinnedMissing = currentGpu != null && !gpus.some((g) => g.index === currentGpu);
   return (
-    <div style={MODEL_SELECTOR_ROW_STYLE}>
+    <div style={CARD_ROW_STYLE}>
       {/* Wrapping the control in the <label> associates the two, so the select
           has an accessible name (a bare sibling <label> named nothing). */}
       <label style={{ opacity: 0.8 }} htmlFor={`gpu-${serviceId}`}>
@@ -655,8 +654,8 @@ function GpuSelector({ serviceId, currentGpu }: { serviceId: string; currentGpu:
             await appConfig.setServiceGpu(serviceId, v === '' ? null : Number(v));
           } catch (err) {
             // Persist failed — roll the optimistic value back (the 2s poll won't revert it,
-            // since the backend value is unchanged) and surface the error like the sibling
-            // model selectors do.
+            // since the backend value is unchanged) and surface the error like the
+            // start-with-the-app toggle does.
             setValue(prev);
             setError(err instanceof Error ? err.message : String(err));
           } finally {
@@ -676,353 +675,6 @@ function GpuSelector({ serviceId, currentGpu }: { serviceId: string; currentGpu:
         )}
       </select>
       <span style={{ opacity: 0.6, fontSize: '0.85em' }}>applies on next start</span>
-      {error && <span className="service-error">⚠ {error}</span>}
-    </div>
-  );
-}
-
-/**
- * Model selector for single-model servers (llama.cpp). Lists the GGUFs found
- * across the model folders and lets the user pick one — or type a custom path.
- * The choice persists (desktop-config `llamaModel`) and applies the next time
- * the service starts, so it's safe to change while stopped (the normal
- * "load on flow demand" case). A running service needs a restart to swap models.
- */
-function LlamaModelSelector({ running }: { running: boolean }) {
-  const [models, setModels] = useState<string[]>(() => peek<string[]>('ggufModels') ?? []);
-  // '' = default model.gguf
-  const [current, setCurrent] = useState<string>(
-    () => peek<DesktopConfig>('desktopConfig')?.llamaModel ?? '',
-  );
-  const [customMode, setCustomMode] = useState(false);
-  const [customPath, setCustomPath] = useState('');
-  const [busy, setBusy] = useState(false);
-  const [error, setError] = useState<string | null>(null);
-
-  useEffect(() => {
-    let alive = true;
-    Promise.all([appConfig.listGgufModels(), appConfig.get()])
-      .then(([list, cfg]) => {
-        put('ggufModels', list);
-        put('desktopConfig', cfg);
-        if (!alive) return;
-        setModels(list);
-        const sel = cfg.llamaModel ?? '';
-        setCurrent(sel);
-        if (sel && !list.includes(sel)) {
-          setCustomMode(true);
-          setCustomPath(sel);
-        }
-      })
-      .catch((e) => alive && setError(e instanceof Error ? e.message : String(e)));
-    return () => {
-      alive = false;
-    };
-  }, []);
-
-  const apply = async (path: string) => {
-    setBusy(true);
-    setError(null);
-    try {
-      await appConfig.setLlamaModel(path);
-      setCurrent(path);
-    } catch (e) {
-      setError(e instanceof Error ? e.message : String(e));
-    } finally {
-      setBusy(false);
-    }
-  };
-
-  const onPick = (val: string) => {
-    if (val === '__custom__') {
-      setCustomMode(true);
-      return;
-    }
-    setCustomMode(false);
-    void apply(val); // '' resets to the default model.gguf
-  };
-
-  const baseName = (p: string) => p.split(/[/\\]/).pop() || p;
-
-  return (
-    <div
-      className="llama-model"
-      style={MODEL_SELECTOR_ROW_STYLE}
-    >
-      <span style={{ fontWeight: 600 }}>Model</span>
-      {customMode ? (
-        <>
-          <input
-            type="text"
-            spellCheck={false}
-            placeholder="C:\path\to\model.gguf"
-            value={customPath}
-            onChange={(e) => setCustomPath(e.target.value)}
-            style={{ minWidth: 240 }}
-          />
-          <button
-            className="btn btn-secondary"
-            disabled={busy || !customPath.trim()}
-            onClick={() => void apply(customPath.trim())}
-          >
-            Set
-          </button>
-          <button
-            className="btn btn-ghost"
-            disabled={busy}
-            onClick={() => {
-              setError(null);
-              // Only leave custom mode if a discovered model is selected; a
-              // configured custom path isn't in the dropdown, so falling back to
-              // the disabled placeholder would falsely read "no model selected".
-              setCustomMode(!!current && !models.includes(current));
-            }}
-          >
-            Cancel
-          </button>
-        </>
-      ) : (
-        <select
-          value={models.includes(current) ? current : ''}
-          disabled={busy}
-          onChange={(e) => onPick(e.target.value)}
-        >
-          <option value="" disabled>
-            — Select a model —
-          </option>
-          {models.map((m) => (
-            <option key={m} value={m}>
-              {baseName(m)}
-            </option>
-          ))}
-          <option value="__custom__">Custom path…</option>
-        </select>
-      )}
-      <span style={{ opacity: 0.7 }}>
-        {!current && !customMode
-          ? "Pick a model — the service has no default and won't start without one."
-          : running
-            ? 'Restart the service to load a different model.'
-            : 'Loads when a flow starts the service.'}
-      </span>
-      {error && <span className="service-error">⚠ {error}</span>}
-    </div>
-  );
-}
-
-/**
- * The multimodal projector loaded beside the llama.cpp model.
- *
- * Separate from the Model picker because it is a different KIND of choice: the
- * model list excludes `mmproj*` files (a projector cannot be run on its own),
- * and a projector is optional in a way a model is not — no model means the
- * service refuses to start, no projector just means text-only.
- *
- * Suggests the projector whose filename shares the model's stem, because that
- * is how they ship (`gemma-4-e2b-q4_k_m.gguf` next to
- * `gemma-4-e2b-mmproj-F16.gguf`) and pairing the wrong one produces a server
- * that loads and then answers nonsense.
- */
-function LlamaMmprojSelector({ running }: { running: boolean }) {
-  const [files, setFiles] = useState<string[]>(() => peek<string[]>('mmprojFiles') ?? []);
-  const [current, setCurrent] = useState<string>(
-    () => peek<DesktopConfig>('desktopConfig')?.llamaMmproj ?? '',
-  );
-  const [model, setModel] = useState<string>(
-    () => peek<DesktopConfig>('desktopConfig')?.llamaModel ?? '',
-  );
-  const [busy, setBusy] = useState(false);
-  const [error, setError] = useState<string | null>(null);
-
-  useEffect(() => {
-    let alive = true;
-    Promise.all([appConfig.listMmprojFiles(), appConfig.get()])
-      .then(([list, cfg]) => {
-        put('mmprojFiles', list);
-        put('desktopConfig', cfg);
-        if (!alive) return;
-        setFiles(list);
-        setCurrent(cfg.llamaMmproj ?? '');
-        setModel(cfg.llamaModel ?? '');
-      })
-      .catch(() => {});
-    return () => {
-      alive = false;
-    };
-  }, []);
-
-  const apply = async (path: string) => {
-    setBusy(true);
-    setError(null);
-    try {
-      await appConfig.setLlamaMmproj(path);
-      setCurrent(path);
-    } catch (e) {
-      setError(e instanceof Error ? e.message : String(e));
-    } finally {
-      setBusy(false);
-    }
-  };
-
-  // Same stem as the chosen model, ignoring the quantisation suffix.
-  const stem = (p: string) =>
-    (p.split(/[\\/]/).pop() ?? '').toLowerCase().replace(/\.gguf$/, '');
-  const modelStem = stem(model).replace(/-(q\d[^-]*|f16|bf16|fp16)$/i, '');
-  const suggestion =
-    !current && modelStem
-      ? files.find((f) => stem(f).includes(modelStem.split('-').slice(0, 3).join('-')))
-      : undefined;
-
-  if (files.length === 0) return null;
-
-  return (
-    <div style={MODEL_SELECTOR_ROW_STYLE}>
-      <span style={{ fontWeight: 600 }}>Vision / audio</span>
-      <select value={current} disabled={busy} onChange={(e) => void apply(e.target.value)}>
-        <option value="">— None (text only) —</option>
-        {files.map((f) => (
-          <option key={f} value={f}>
-            {f.split(/[\\/]/).pop()}
-          </option>
-        ))}
-      </select>
-      {suggestion && (
-        <button className="btn-tiny" disabled={busy} onClick={() => void apply(suggestion)}>
-          Use {suggestion.split(/[\\/]/).pop()}
-        </button>
-      )}
-      {current && running && (
-        <span className="warn">restart the service to load it</span>
-      )}
-      {current && !running && (
-        <span className="form-hint">
-          adds image and audio input; costs extra VRAM
-        </span>
-      )}
-      {error && <span className="service-error">⚠ {error}</span>}
-    </div>
-  );
-}
-
-/**
- * Model selector for multi-model servers (Ollama). Lists the models PULLED into
- * the running Ollama server (its /api/tags) and lets the user pick one — or type
- * a name they've pulled. The choice is the model NAME sent in each request,
- * persisted to desktop-config `ollamaModel` and applied on the next flow run
- * (no restart). Empty = the pre-pulled default (qwen2.5:0.5b).
- */
-function OllamaModelSelector({ running }: { running: boolean }) {
-  const [models, setModels] = useState<string[]>([]);
-  const [current, setCurrent] = useState<string>(''); // '' = default
-  const [customMode, setCustomMode] = useState(false);
-  const [customName, setCustomName] = useState('');
-  const [busy, setBusy] = useState(false);
-  const [error, setError] = useState<string | null>(null);
-  const [note, setNote] = useState<string | null>(null);
-
-  useEffect(() => {
-    let alive = true;
-    // A stopped Ollama cannot list its models, so asking is a guaranteed wait
-    // for a connection that will not answer — on every visit to this panel,
-    // collapsed card or not. Read the saved choice, skip the probe.
-    Promise.all([
-      running ? appConfig.listOllamaModels().catch(() => [] as string[]) : Promise.resolve([]),
-      appConfig.get(),
-    ])
-      .then(([list, cfg]) => {
-        if (!alive) return;
-        setModels(list);
-        const sel = cfg.ollamaModel ?? '';
-        setCurrent(sel);
-        if (sel && !list.includes(sel)) {
-          setCustomMode(true);
-          setCustomName(sel);
-        }
-        if (list.length === 0) {
-          setNote('Start Ollama (or pull a model) to list pulled models — or type a name.');
-        }
-      })
-      .catch(() => {});
-    return () => {
-      alive = false;
-    };
-  }, [running]);
-
-  const apply = async (model: string) => {
-    setBusy(true);
-    setError(null);
-    try {
-      await appConfig.setOllamaModel(model);
-      setCurrent(model);
-    } catch (e) {
-      setError(e instanceof Error ? e.message : String(e));
-    } finally {
-      setBusy(false);
-    }
-  };
-
-  const onPick = (val: string) => {
-    if (val === '__custom__') {
-      setCustomMode(true);
-      return;
-    }
-    setCustomMode(false);
-    void apply(val); // '' resets to the default
-  };
-
-  return (
-    <div
-      className="ollama-model"
-      style={MODEL_SELECTOR_ROW_STYLE}
-    >
-      <span style={{ fontWeight: 600 }}>Model</span>
-      {customMode ? (
-        <>
-          <input
-            type="text"
-            spellCheck={false}
-            placeholder="e.g. llama3.1:8b"
-            value={customName}
-            onChange={(e) => setCustomName(e.target.value)}
-            style={{ minWidth: 180 }}
-          />
-          <button
-            className="btn btn-secondary"
-            disabled={busy || !customName.trim()}
-            onClick={() => void apply(customName.trim())}
-          >
-            Set
-          </button>
-          <button
-            className="btn btn-ghost"
-            disabled={busy}
-            onClick={() => {
-              setError(null);
-              setCustomMode(!!current && !models.includes(current));
-            }}
-          >
-            Cancel
-          </button>
-        </>
-      ) : (
-        <select
-          value={models.includes(current) ? current : ''}
-          disabled={busy}
-          onChange={(e) => onPick(e.target.value)}
-        >
-          <option value="">Default (qwen2.5:0.5b)</option>
-          {models.map((m) => (
-            <option key={m} value={m}>
-              {m}
-            </option>
-          ))}
-          <option value="__custom__">Custom name…</option>
-        </select>
-      )}
-      <span style={{ opacity: 0.7 }}>
-        {current ? `Sends model "${current}".` : 'Sends the default qwen2.5:0.5b.'}
-      </span>
-      {note && <span style={{ opacity: 0.7 }}>{note}</span>}
       {error && <span className="service-error">⚠ {error}</span>}
     </div>
   );
@@ -1104,21 +756,6 @@ function ServiceCard({
               {service.lastCrash.detail ? ` — ${service.lastCrash.detail}` : ''}
             </p>
           )}
-          {service.id === 'llama-cpp' && (
-            <>
-              <LlamaModelSelector
-                running={service.status === 'running' || service.status === 'starting'}
-              />
-              <LlamaMmprojSelector
-                running={service.status === 'running' || service.status === 'starting'}
-              />
-            </>
-          )}
-          {service.id === 'ollama' && (
-            <OllamaModelSelector
-              running={service.status === 'running' || service.status === 'starting'}
-            />
-          )}
           <GpuSelector serviceId={service.id} currentGpu={service.gpu} />
           <AutostartToggle serviceId={service.id} autostart={service.autostart === true} />
         </div>
@@ -1147,7 +784,7 @@ function ServiceCard({
 
           {/* A SINGLE install-state button (not separate Install + Uninstall):
               Install when not installed → Uninstall when installed (or Reinstall if the
-              service has no uninstall spec, e.g. the system-installed ollama). */}
+              service has no uninstall spec, e.g. a system-installed tool). */}
           {service.status === 'installing' ? (
             <button onClick={onCancelInstall} disabled={pending} className="btn btn-warn">
               Cancel install

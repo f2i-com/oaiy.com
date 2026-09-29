@@ -376,11 +376,11 @@ mod tests {
     fn a_batch_parses_and_an_absent_payload_defaults() {
         let reply: PendingReply = serde_json::from_value(serde_json::json!({
             "commands": [{ "commandId": "c1", "command": "services.start",
-                           "payload": { "serviceId": "llama-cpp" } }]
+                           "payload": { "serviceId": "oaiy-voice" } }]
         }))
         .unwrap();
         assert_eq!(reply.commands.len(), 1);
-        assert_eq!(reply.commands[0].payload["serviceId"], "llama-cpp");
+        assert_eq!(reply.commands[0].payload["serviceId"], "oaiy-voice");
 
         // An empty batch is the normal long-poll timeout, not an error.
         let empty: PendingReply = serde_json::from_value(serde_json::json!({})).unwrap();

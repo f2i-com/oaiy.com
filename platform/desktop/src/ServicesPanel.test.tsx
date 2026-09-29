@@ -8,10 +8,8 @@ import React, { act } from 'react';
 import { createRoot, type Root } from 'react-dom/client';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
-const { listMock, ollamaMock, ggufMock, configMock, gpusMock, pushMock, autostartMock } = vi.hoisted(() => ({
+const { listMock, configMock, gpusMock, pushMock, autostartMock } = vi.hoisted(() => ({
   listMock: vi.fn(),
-  ollamaMock: vi.fn(),
-  ggufMock: vi.fn(),
   configMock: vi.fn(),
   gpusMock: vi.fn(),
   pushMock: vi.fn(),
@@ -35,13 +33,9 @@ vi.mock('./api', () => ({
     logs: vi.fn(),
   },
   appConfig: {
-    listOllamaModels: ollamaMock,
-    listGgufModels: ggufMock,
     get: configMock,
     listGpus: gpusMock,
     setServiceGpu: vi.fn(),
-    setLlamaModel: vi.fn(),
-    setOllamaModel: vi.fn(),
   },
   openExternal: vi.fn(),
 }));
@@ -52,12 +46,12 @@ import ServicesPanel from './ServicesPanel';
 import { invalidate, put } from './useCached';
 
 const service = (over: Record<string, unknown> = {}) => ({
-  id: 'ollama',
-  name: 'Ollama',
-  category: 'LLM',
+  id: 'playwright-browser',
+  name: 'Playwright Browser',
+  category: 'Browser',
   status: 'stopped',
-  port: 11434,
-  defaultPort: 11434,
+  port: 17880,
+  defaultPort: 17880,
   installed: true,
   gpu: null,
   error: null,
@@ -80,16 +74,12 @@ const text = () => host.textContent ?? '';
 beforeEach(() => {
   invalidate();
   listMock.mockReset();
-  ollamaMock.mockReset();
-  ggufMock.mockReset();
   configMock.mockReset();
   gpusMock.mockReset();
   autostartMock.mockReset();
   autostartMock.mockResolvedValue(undefined);
   listMock.mockResolvedValue(SNAPSHOT);
-  ollamaMock.mockResolvedValue(['qwen2.5:0.5b']);
-  ggufMock.mockResolvedValue([]);
-  configMock.mockResolvedValue({ ollamaModel: null, llamaModel: null });
+  configMock.mockResolvedValue({});
   gpusMock.mockResolvedValue([]);
   host = document.createElement('div');
   document.body.appendChild(host);
@@ -112,7 +102,7 @@ describe('ServicesPanel loading', () => {
     });
 
     expect(text()).not.toContain('Loading services');
-    expect(text()).toContain('Ollama');
+    expect(text()).toContain('Playwright Browser');
   });
 
   it('still shows the loading state on a genuinely cold start', async () => {
@@ -131,18 +121,23 @@ describe('ServicesPanel loading', () => {
     expect(peek('services')).toEqual(SNAPSHOT.services);
   });
 
-  it('does not probe a stopped Ollama for its model list', async () => {
+  it('offers no model picker, even for a template of its own named like a retired one', async () => {
+    // Models are the engine's (OAIY → Engines). A person's own llama.cpp or
+    // Ollama template is still listed, as any service is, but OAIY no longer
+    // picks its model.
+    listMock.mockResolvedValue({
+      ...SNAPSHOT,
+      services: [
+        service({ id: 'llama-cpp', name: 'My llama.cpp', category: 'LLM', status: 'running' }),
+        service({ id: 'ollama', name: 'My Ollama', category: 'LLM' }),
+      ],
+    });
     await mount();
-    // A stopped server cannot answer, so the request is a guaranteed wait for
-    // a connection that never completes usefully — on every visit.
-    expect(ollamaMock).not.toHaveBeenCalled();
-    expect(text()).toContain('Start Ollama');
-  });
-
-  it('does probe Ollama once it is actually running', async () => {
-    listMock.mockResolvedValue({ ...SNAPSHOT, services: [service({ status: 'running' })] });
-    await mount();
-    expect(ollamaMock).toHaveBeenCalled();
+    expect(text()).toContain('My llama.cpp');
+    expect(text()).toContain('My Ollama');
+    expect(host.querySelector('.llama-model, .ollama-model')).toBeNull();
+    expect(text()).not.toContain('Select a model');
+    expect(text()).not.toContain('Custom name');
   });
 });
 
@@ -176,7 +171,7 @@ describe('ServicesPanel start-with-the-app', () => {
     await act(async () => {
       el.click();
     });
-    expect(autostartMock).toHaveBeenCalledWith('ollama', true);
+    expect(autostartMock).toHaveBeenCalledWith('playwright-browser', true);
     // The only lever that starts a service is Start.
     const { services: api } = await import('./api');
     expect(api.start).not.toHaveBeenCalled();

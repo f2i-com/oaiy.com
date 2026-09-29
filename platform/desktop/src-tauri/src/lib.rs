@@ -471,34 +471,9 @@ fn write_models_dir_override(app: &tauri::AppHandle, dir: Option<&str>) -> Resul
     write_config_str(app, "modelsDir", dir)
 }
 
-/// The GGUF a single-model server (llama.cpp) should load, if the user picked
-/// one in its Model selector. Unset ⇒ no model selected (no implicit default).
-fn read_llama_model_override(app: &tauri::AppHandle) -> Option<String> {
-    read_config_str(app, "llamaModel")
-}
-
-/// The multimodal projector chosen beside the model, if any.
-fn read_llama_mmproj_override(app: &tauri::AppHandle) -> Option<String> {
-    read_config_str(app, "llamaMmproj")
-}
-
-fn write_llama_mmproj_override(app: &tauri::AppHandle, path: Option<&str>) -> Result<(), String> {
-    write_config_str(app, "llamaMmproj", path)
-}
-
-fn write_llama_model_override(app: &tauri::AppHandle, model: Option<&str>) -> Result<(), String> {
-    write_config_str(app, "llamaModel", model)
-}
-
-/// The model NAME a multi-model server (Ollama) should use, if the user picked
-/// one in its Model selector. Unset ⇒ the pre-pulled default (qwen2.5:0.5b).
-fn read_ollama_model_override(app: &tauri::AppHandle) -> Option<String> {
-    read_config_str(app, "ollamaModel")
-}
-
-fn write_ollama_model_override(app: &tauri::AppHandle, model: Option<&str>) -> Result<(), String> {
-    write_config_str(app, "ollamaModel", model)
-}
+// (The `llamaModel` / `llamaMmproj` / `ollamaModel` keys an older build wrote
+// here, for the retired llama.cpp and Ollama services' model pickers, are left
+// on disk and never read.)
 
 /// Per-service GPU pins (serviceId → GPU index) the user set in the GPU picker, stored as a
 /// JSON object under `serviceGpus`. Applied as CUDA_VISIBLE_DEVICES at start() so heavy
@@ -694,9 +669,6 @@ pub(crate) fn config_snapshot(app: &tauri::AppHandle, registry: &RegistryHandle)
         models_active_dir,
         models_default_dir,
         models_configured_dir,
-        llama_model: read_llama_model_override(app),
-        llama_mmproj: read_llama_mmproj_override(app),
-        ollama_model: read_ollama_model_override(app),
     }
 }
 
@@ -867,101 +839,6 @@ fn remove_model_dir(
     Ok(apply_and_list_extra_dirs(&registry, dirs))
 }
 
-/// Tauri command: the loadable GGUFs found across the model search roots —
-/// the options for the llama.cpp Model picker.
-/// `async` for the same reason as [`list_gpus`]: this walks the model
-/// directories, which is instant on an empty install and very much not on a
-/// library of 40 GB checkpoints.
-#[tauri::command(async)]
-fn list_gguf_models(registry: tauri::State<RegistryHandle>) -> Vec<String> {
-    // Take the search roots under the lock, then release it and walk. Holding
-    // the registry across the walk blocked every /api/services poll and every
-    // start/stop behind the disk for as long as the scan took.
-    let dirs = registry.lock().map(|r| r.model_dirs().to_vec()).unwrap_or_default();
-    crate::services::registry::scan_gguf_models(&dirs)
-}
-
-/// Tauri command: set (or clear, with '') the GGUF a single-model server
-/// (llama.cpp) loads. Validates the file exists, persists it, and updates the
-/// LIVE registry so the next start loads it via `${llamaModel}` — no restart.
-#[tauri::command]
-fn set_llama_model(
-    app: tauri::AppHandle,
-    registry: tauri::State<RegistryHandle>,
-    path: String,
-) -> Result<(), String> {
-    let trimmed = path.trim();
-    let value = if trimmed.is_empty() { None } else { Some(trimmed) };
-    if let Some(v) = value {
-        if !PathBuf::from(v).is_file() {
-            return Err(format!("not a file: {v}"));
-        }
-    }
-    write_llama_model_override(&app, value)?;
-    if let Ok(mut r) = registry.lock() {
-        r.set_llama_model(value.map(str::to_string));
-    }
-    Ok(())
-}
-
-/// Tauri command: set (or clear, with '') the multimodal projector loaded
-/// beside the llama.cpp model.
-///
-/// Clearing is a first-class action, not an oversight: a projector costs real
-/// VRAM (~1.2 GiB for gemma-4-e2b) and forces llama.cpp's device fitting off,
-/// so a user who only wants text should be able to put the model back to
-/// text-only without re-picking it.
-#[tauri::command]
-fn set_llama_mmproj(
-    app: tauri::AppHandle,
-    registry: tauri::State<RegistryHandle>,
-    path: String,
-) -> Result<(), String> {
-    let trimmed = path.trim();
-    let value = if trimmed.is_empty() { None } else { Some(trimmed) };
-    if let Some(v) = value {
-        if !PathBuf::from(v).is_file() {
-            return Err(format!("not a file: {v}"));
-        }
-    }
-    write_llama_mmproj_override(&app, value)?;
-    if let Ok(mut r) = registry.lock() {
-        r.set_llama_mmproj(value.map(str::to_string));
-    }
-    Ok(())
-}
-
-/// Tauri command: the projector files OAIY can see, for the picker.
-///
-/// The main model list deliberately EXCLUDES `mmproj*` files — a projector is
-/// not a model you can run — so they need their own listing or they would be
-/// invisible everywhere.
-#[tauri::command(async)]
-fn list_mmproj_files(registry: tauri::State<RegistryHandle>) -> Vec<String> {
-    // Same off-lock walk as list_gguf_models — identical traversal, and this
-    // one runs beside it whenever the llama.cpp card is expanded.
-    let dirs = registry.lock().map(|r| r.model_dirs().to_vec()).unwrap_or_default();
-    crate::services::registry::scan_mmproj_files(&dirs)
-}
-
-/// Tauri command: set (or clear, with '') the Ollama model NAME a node uses.
-/// Persists it + updates the LIVE registry so the next /api/services snapshot
-/// resolves `${ollamaModel}` in the node body — no restart.
-#[tauri::command]
-fn set_ollama_model(
-    app: tauri::AppHandle,
-    registry: tauri::State<RegistryHandle>,
-    model: String,
-) -> Result<(), String> {
-    let trimmed = model.trim();
-    let value = if trimmed.is_empty() { None } else { Some(trimmed) };
-    write_ollama_model_override(&app, value)?;
-    if let Ok(mut r) = registry.lock() {
-        r.set_ollama_model(value.map(str::to_string));
-    }
-    Ok(())
-}
-
 #[derive(serde::Serialize)]
 struct GpuInfo {
     index: u32,
@@ -1063,42 +940,6 @@ fn set_service_gpu(
         r.set_service_gpu(&id, gpu);
     }
     Ok(())
-}
-
-/// Tauri command: the models pulled into the running Ollama server (its
-/// `/api/tags`) — the options for the Ollama Model picker. Empty + an error
-/// when Ollama isn't running.
-#[tauri::command]
-async fn list_ollama_models(
-    registry: tauri::State<'_, RegistryHandle>,
-) -> Result<Vec<String>, String> {
-    let port = registry
-        .lock()
-        .ok()
-        .and_then(|r| r.service_port("ollama"))
-        .unwrap_or(11434);
-    let url = format!("http://127.0.0.1:{port}/api/tags");
-    let client = reqwest::Client::builder()
-        .timeout(std::time::Duration::from_secs(3))
-        .build()
-        .map_err(|e| e.to_string())?;
-    let resp = client
-        .get(&url)
-        .send()
-        .await
-        .map_err(|_| "Ollama isn't reachable — start it first, then refresh.".to_string())?;
-    // `.text()` + serde_json avoids needing reqwest's `json` feature.
-    let text = resp.text().await.map_err(|e| e.to_string())?;
-    let body: serde_json::Value = serde_json::from_str(&text).map_err(|e| e.to_string())?;
-    let mut models: Vec<String> = match body["models"].as_array() {
-        Some(arr) => arr
-            .iter()
-            .filter_map(|m| m["name"].as_str().map(String::from))
-            .collect(),
-        None => Vec::new(),
-    };
-    models.sort();
-    Ok(models)
 }
 
 /// Explain a fatal API-server failure to the user, then quit.
@@ -1347,14 +1188,8 @@ pub fn run() {
             list_model_dirs,
             add_model_dir,
             remove_model_dir,
-            list_gguf_models,
-            set_llama_model,
-            set_llama_mmproj,
-            list_mmproj_files,
-            set_ollama_model,
             list_gpus,
-            set_service_gpu,
-            list_ollama_models
+            set_service_gpu
         ])
         .setup(|app| {
             // Build the registry once, share it with both the HTTP server
@@ -1418,12 +1253,7 @@ pub fn run() {
                         Arc::new(Mutex::new(reg))
                     }
                 };
-            // Apply the saved llama.cpp model selection (if any) to the live
-            // registry so the next flow-triggered start loads it — no restart.
             if let Ok(mut r) = registry.lock() {
-                r.set_llama_model(read_llama_model_override(app.handle()));
-                r.set_llama_mmproj(read_llama_mmproj_override(app.handle()));
-                r.set_ollama_model(read_ollama_model_override(app.handle()));
                 // Drop GPU pins to cards that no longer exist (removed / re-imaged box) —
                 // otherwise start() would export CUDA_VISIBLE_DEVICES at a missing index and
                 // CUDA would see ZERO devices (silent CPU fallback / hard crash). Only prune

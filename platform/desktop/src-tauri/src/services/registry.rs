@@ -17,30 +17,14 @@ use super::template::{substitute, InstallSpec, NodeSpec, ServiceTemplate, Uninst
 
 /// Built-in templates embedded at compile time. Seeded to disk on first
 /// run; users can edit the on-disk copies to customise.
+///
+/// Models are not services: OAIY's own engine runs them (Engines), so there is
+/// no built-in LLM, picture or video server here. The ones that used to be are
+/// in [`RETIRED_BUILTINS`], which removes their seeded copies at startup.
 const BUILTIN_TEMPLATES: &[(&str, &str)] = &[
-    (
-        "llama-cpp.json",
-        include_str!("../../resources/templates/llama-cpp.json"),
-    ),
-    (
-        "ollama.json",
-        include_str!("../../resources/templates/ollama.json"),
-    ),
     (
         "playwright-browser.json",
         include_str!("../../resources/templates/playwright-browser.json"),
-    ),
-    (
-        "ltx2-video.json",
-        include_str!("../../resources/templates/ltx2-video.json"),
-    ),
-    (
-        "lance.json",
-        include_str!("../../resources/templates/lance.json"),
-    ),
-    (
-        "krea2.json",
-        include_str!("../../resources/templates/krea2.json"),
     ),
     // The Aokie receptionist's ears and voice. Shipped as ordinary services —
     // installable, startable and visible in the Services panel — because that
@@ -67,10 +51,6 @@ const BUILTIN_TEMPLATES: &[(&str, &str)] = &[
 ];
 
 const BUILTIN_SCRIPTS: &[(&str, &str)] = &[
-    (
-        "install-ollama.ps1",
-        include_str!("../../resources/scripts/install-ollama.ps1"),
-    ),
     // (Python install is now native Rust — see Python::install_runtime in
     // services/python.rs — so there's no install-python.ps1 to seed.)
     (
@@ -83,80 +63,66 @@ const BUILTIN_SCRIPTS: &[(&str, &str)] = &[
         "playwright_server.py",
         include_str!("../../resources/scripts/playwright_server.py"),
     ),
-    // Git-free GitHub-zip fetcher used by the Python-model installers.
-    (
-        "fetch_zip.py",
-        include_str!("../../resources/scripts/fetch_zip.py"),
-    ),
-    // LTX-2.3 video service: one-click .bat installer + its HTTP server.
-    (
-        "install-ltx2.bat",
-        include_str!("../../resources/scripts/install-ltx2.bat"),
-    ),
-    (
-        "ltx2_server.py",
-        include_str!("../../resources/scripts/ltx2_server.py"),
-    ),
-    // Lance (image+video) service: one-click .bat installer. It runs the
-    // repo's own lance_gradio.py; lance_server.py (below) wraps run_task() in a
-    // clean JSON API for oaiy-web while still mounting that Gradio UI.
-    (
-        "install-lance.bat",
-        include_str!("../../resources/scripts/install-lance.bat"),
-    ),
-    // Optional multi-GPU sharding / CPU-offload patch for Lance's gradio
-    // server. install-lance.bat applies it after fetch; inert at runtime
-    // unless OAIY_LANCE_SHARD=1 / OAIY_LANCE_OFFLOAD=1.
-    (
-        "patch_lance_sharding.py",
-        include_str!("../../resources/scripts/patch_lance_sharding.py"),
-    ),
-    // Patch config_factory.get_model_path to honor LANCE_MODEL_BASE_DIR for the
-    // ViT + Wan VAE (their paths come from a relative "downloads/..." yaml, unlike
-    // the main model). Without it, off-repo weights load the LLM but 404 the ViT.
-    (
-        "patch_lance_paths.py",
-        include_str!("../../resources/scripts/patch_lance_paths.py"),
-    ),
-    // SDPA-backed `flash_attn` shim. Lance hard-imports flash_attn_varlen_func;
-    // there's no matching Windows/Blackwell wheel, so install-lance.bat copies
-    // this into the venv's site-packages as flash_attn.py (unless
-    // OAIY_LANCE_FLASH=1, which builds the real thing).
-    (
-        "flash_attn_shim.py",
-        include_str!("../../resources/scripts/flash_attn_shim.py"),
-    ),
-    // Thin JSON API (FastAPI) wrapping lance_gradio.run_task so oaiy-web can
-    // drive Lance over HTTP; also mounts the Gradio UI at /ui.
-    (
-        "lance_server.py",
-        include_str!("../../resources/scripts/lance_server.py"),
-    ),
-    // --- Linux install scripts (.sh) — seeded alongside the .ps1/.bat so
-    // oaiy-server can install services on a headless Linux host. ollama /
-    // playwright / llama-cpp are real installers; ltx2 / lance print manual
-    // setup guidance (their GPU installs need a real Linux+CUDA box to port).
-    (
-        "install-ollama.sh",
-        include_str!("../../resources/scripts/install-ollama.sh"),
-    ),
+    // Linux installer, seeded alongside the .ps1 so oaiy-server can install the
+    // browser on a headless Linux host.
     (
         "install-playwright.sh",
         include_str!("../../resources/scripts/install-playwright.sh"),
     ),
-    (
-        "install-ltx2.sh",
-        include_str!("../../resources/scripts/install-ltx2.sh"),
-    ),
-    (
-        "install-lance.sh",
-        include_str!("../../resources/scripts/install-lance.sh"),
-    ),
-    // NOTE: Krea-2 Turbo and Llama.cpp Server ship as SELF-CONTAINED packages --
-    // their scripts live inline in the `files` map of their own templates
-    // (krea2.json: krea2_server.py / krea2_gguf.py / install-krea2.ps1+.sh;
-    // llama-cpp.json: install-llama-cpp.ps1+.sh) and are materialized on load,
-    // so they are not listed here.
+    // NOTE: the Aokie voices and OAIY Voice ship as SELF-CONTAINED packages --
+    // their installers live inline in the `files` map of their own templates and
+    // are materialized on load, so they are not listed here.
+];
+
+/// A built-in service OAIY used to seed and no longer ships, with every
+/// version of its template OAIY ever wrote.
+struct RetiredBuiltin {
+    /// The file OAIY seeded, in `<data>/templates`.
+    file: &'static str,
+    /// Its service id.
+    id: &'static str,
+    /// SHA-256 of each shipped version, line endings as LF and trimmed (see
+    /// [`template_digest`]). The `.seed` snapshot beside a copy is the first
+    /// test of "OAIY wrote this"; these recognise a copy whose snapshot is gone.
+    shipped: &'static [&'static str],
+}
+
+/// Services the engine does itself now (models in Engines, within Rust), so
+/// OAIY stops listing them. At startup the copies OAIY seeded are removed; a
+/// template the person edited or wrote under the same name is kept.
+const RETIRED_BUILTINS: &[RetiredBuiltin] = &[
+    RetiredBuiltin {
+        file: "krea2.json",
+        id: "krea2",
+        shipped: &[
+            "e15943abef13ee50ca502c7f83a1d76befd89684865638982b0b9a228439fae7",
+            "779cd8b3d451a19d94c5d2e281c07fa9440f5b742e861aeb3696daef7d9fe5ee",
+        ],
+    },
+    RetiredBuiltin {
+        file: "lance.json",
+        id: "lance",
+        shipped: &["4d631c5bef58f487cc96c0367d7e06ca6cb39ee769ccf76b10681532a6031f26"],
+    },
+    RetiredBuiltin {
+        file: "llama-cpp.json",
+        id: "llama-cpp",
+        shipped: &[
+            "40eff1fd81f1460ce629857b2982abe426f1fb468a691585fc78bb18cceca5bf",
+            "87216f4f4cb053339fdec5b75d9605e5eddfeb15193d9415d45afab627f4d078",
+            "4a769b5c732e9f530a35cabdfd5bf4096838c6075b5e22ccc2a970c3a2e3bbde",
+        ],
+    },
+    RetiredBuiltin {
+        file: "ltx2-video.json",
+        id: "ltx2-video",
+        shipped: &["0349c94ef82c377fd0e2ce5bf5b4827794a4ff4d5bf839e0918822c309abd383"],
+    },
+    RetiredBuiltin {
+        file: "ollama.json",
+        id: "ollama",
+        shipped: &["1c099a38bf7789f940b76fd76b5c98afd4f53f27f26609a97c4a2a6d33cee484"],
+    },
 ];
 
 #[derive(Debug, Clone, Copy, Serialize, PartialEq, Eq)]
@@ -277,7 +243,7 @@ pub struct ServiceSnapshot {
 }
 
 /// Result of `ensure_by_port` — surfaced to oaiy-web so it can tell the
-/// user "started Ollama for you" vs "no companion service on that port".
+/// user "started OAIY Voice for you" vs "no companion service on that port".
 #[derive(Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct EnsureByPortResult {
@@ -291,136 +257,6 @@ pub struct EnsureByPortResult {
     pub name: Option<String>,
     /// Set when found but the spawn failed.
     pub error: Option<String>,
-}
-
-/// How deep to look for GGUFs under a model root.
-///
-/// Top level only was the old behaviour, and it made the obvious thing not
-/// work: drop a folder of weights into the models directory — which is how
-/// people organise 22 of them — and llama.cpp's Model picker stayed empty,
-/// with nothing saying why. Model libraries are nested by publisher or by
-/// family, so a flat scan finds the one file somebody left loose and none of
-/// the rest.
-///
-/// Bounded rather than unlimited: a model root can be a whole drive (`E:\`),
-/// and this runs from the picker. Four levels covers
-/// `<root>/<publisher>/<family>/<quant>/model.gguf` with room to spare, while
-/// keeping a mis-pointed root from walking an entire filesystem.
-const GGUF_SCAN_DEPTH: u32 = 4;
-
-/// Every `.gguf` under `dir`, projectors included. The shared traversal behind
-/// both [`Registry::list_gguf_models`] and [`Registry::list_mmproj_files`].
-/// Loadable GGUFs across `dirs` — the options for the llama.cpp model picker.
-///
-/// Free-standing rather than a method so it can run off-lock; see
-/// [`Registry::model_dirs`].
-pub fn scan_gguf_models(dirs: &[PathBuf]) -> Vec<String> {
-    let mut seen = std::collections::HashSet::new();
-    let mut out = Vec::new();
-    for dir in dirs {
-        collect_ggufs(dir, GGUF_SCAN_DEPTH, &mut seen, &mut out);
-    }
-    out.sort();
-    out
-}
-
-/// The multimodal projectors across `dirs`. Same walk as
-/// [`scan_gguf_models`], different filter — a projector is still a `.gguf`,
-/// it just cannot be loaded as a model on its own.
-pub fn scan_mmproj_files(dirs: &[PathBuf]) -> Vec<String> {
-    let mut seen = std::collections::HashSet::new();
-    let mut all = Vec::new();
-    for dir in dirs {
-        collect_ggufs_all(dir, GGUF_SCAN_DEPTH, &mut seen, &mut all);
-    }
-    all.retain(|p| {
-        Path::new(p)
-            .file_name()
-            .and_then(|n| n.to_str())
-            .is_some_and(|n| n.to_ascii_lowercase().contains("mmproj"))
-    });
-    all.sort();
-    all
-}
-
-fn collect_ggufs_all(
-    dir: &Path,
-    depth: u32,
-    seen: &mut std::collections::HashSet<String>,
-    out: &mut Vec<String>,
-) {
-    let Ok(rd) = std::fs::read_dir(dir) else {
-        return;
-    };
-    for entry in rd.flatten() {
-        let p = entry.path();
-        let Ok(ft) = entry.file_type() else { continue };
-        if ft.is_dir() {
-            if depth > 0 {
-                collect_ggufs_all(&p, depth - 1, seen, out);
-            }
-            continue;
-        }
-        let is_gguf = p
-            .extension()
-            .and_then(|e| e.to_str())
-            .map(|e| e.eq_ignore_ascii_case("gguf"))
-            .unwrap_or(false);
-        if !is_gguf {
-            continue;
-        }
-        let s = p.display().to_string();
-        if seen.insert(s.clone()) {
-            out.push(s);
-        }
-    }
-}
-
-/// Recursively collect `.gguf` files under `dir`, skipping multimodal
-/// projectors (`mmproj*`), which are not standalone models.
-fn collect_ggufs(
-    dir: &Path,
-    depth: u32,
-    seen: &mut std::collections::HashSet<String>,
-    out: &mut Vec<String>,
-) {
-    let Ok(rd) = std::fs::read_dir(dir) else {
-        return;
-    };
-    for entry in rd.flatten() {
-        let p = entry.path();
-        // `file_type` rather than `p.is_dir()`: the latter follows symlinks, so
-        // a link pointing back up its own tree would recurse until the depth
-        // budget ran out, doing real work each time.
-        let Ok(ft) = entry.file_type() else { continue };
-        if ft.is_dir() {
-            if depth > 0 {
-                collect_ggufs(&p, depth - 1, seen, out);
-            }
-            continue;
-        }
-        let is_gguf = p
-            .extension()
-            .and_then(|e| e.to_str())
-            .map(|e| e.eq_ignore_ascii_case("gguf"))
-            .unwrap_or(false);
-        if !is_gguf {
-            continue;
-        }
-        // CONTAINS, not starts_with. Both spellings are common in the wild —
-        // `mmproj-gemma-4-e2b-f16.gguf` and `gemma-4-e2b-mmproj-F16.gguf` — and
-        // the prefix-only test let the second through, so the Model picker
-        // offered a projector as a model and llama-server refused to load it
-        // with nothing pointing at the cause.
-        let name = p.file_name().and_then(|n| n.to_str()).unwrap_or("");
-        if name.to_ascii_lowercase().contains("mmproj") {
-            continue;
-        }
-        let s = p.display().to_string();
-        if seen.insert(s.clone()) {
-            out.push(s);
-        }
-    }
 }
 
 /// A `templates/*.json` that is on disk but could not be loaded.
@@ -622,28 +458,10 @@ pub struct Registry {
     /// so a service can scan several drives (e.g. `E:\models` AND `E:\ckpts`)
     /// for its weights. Deduped; primary stays index 0 for back-compat.
     model_dirs: Vec<PathBuf>,
-    /// The GGUF a single-model server (llama.cpp) should load — the
-    /// `${llamaModel}` placeholder. `None` ⇒ no model selected; start() refuses
-    /// to spawn (no implicit default). Set live from the Model picker.
-    llama_model: Option<String>,
-    /// The multimodal projector (`mmproj`) to load beside `llama_model`, if the
-    /// user picked one — the `${llamaMmproj}` placeholder.
-    ///
-    /// Optional in a way `llama_model` is not: a missing model is a refusal to
-    /// start, a missing projector just means a text-only model. That asymmetry
-    /// is why it reaches llama-server through the ENVIRONMENT rather than an
-    /// argument — an unset `${...}` in `args` cannot be removed without also
-    /// removing the `--mmproj` flag in front of it, whereas an env entry that
-    /// did not resolve is simply dropped.
-    llama_mmproj: Option<String>,
-    /// The model NAME a multi-model server (Ollama) should use — substituted
-    /// into the node body template as `${ollamaModel}`. `None` ⇒ the small
-    /// default the installer pre-pulls (qwen2.5:0.5b). Set live from its picker.
-    ollama_model: Option<String>,
     /// Per-service GPU pin: serviceId → GPU index, applied as `CUDA_VISIBLE_DEVICES` at
     /// start() so heavy services don't all default to GPU 0 and thrash. Absent ⇒ the
-    /// service's own default (e.g. krea2 keeps DIT on GPU 0 + encoder on GPU 1). Set live
-    /// from the GPU picker; takes effect on the next start.
+    /// service's own default placement. Set live from the GPU picker; takes effect on the
+    /// next start.
     service_gpus: HashMap<String, u32>,
     /// Services the user explicitly asked to start with the app, by id.
     ///
@@ -733,7 +551,7 @@ fn is_safe_script_name(name: &str) -> bool {
 }
 
 /// Script names OWNED by the built-ins: every `BUILTIN_SCRIPTS` key plus every file a built-in
-/// TEMPLATE bundles (krea2_server.py, install-krea2.ps1, …). An imported package must never be
+/// TEMPLATE bundles (install-oaiy-voice.ps1, …). An imported package must never be
 /// allowed to write any of these — they're seeded from the trusted compiled-in source, and
 /// overwriting one would trojan a DIFFERENT, trusted service (RCE the next time the user
 /// installs/starts it).
@@ -818,6 +636,121 @@ fn materialize_package_files(scripts_dir: &Path, template_id: &str, files: &Hash
     }
 }
 
+/// What the startup cleanup did with the templates of retired services.
+#[derive(Debug, Default, PartialEq, Eq)]
+pub(crate) struct RetireReport {
+    /// Seeded copies it removed (file names in `<data>/templates`).
+    pub removed: Vec<String>,
+    /// Copies it kept because OAIY did not write them as they are: edited, or
+    /// written by the person under the same name.
+    pub kept: Vec<String>,
+}
+
+/// A template body as the retirement check compares it: line endings as LF and
+/// surrounding whitespace trimmed — the leniency `seed_builtin_script` already
+/// allows (`trim()`), plus CRLF, which a checkout with `core.autocrlf` adds.
+fn normalized_template(body: &str) -> String {
+    body.replace("\r\n", "\n").trim().to_string()
+}
+
+/// SHA-256 (hex) of [`normalized_template`], as [`RetiredBuiltin::shipped`] lists them.
+fn template_digest(body: &str) -> String {
+    use sha2::{Digest, Sha256};
+    format!("{:x}", Sha256::digest(normalized_template(body).as_bytes()))
+}
+
+/// Whether `current` is a copy OAIY seeded: it is what OAIY last wrote beside
+/// it (its `.seed` snapshot — the same test `seed_builtin_script` uses to tell
+/// an untouched seed from an edit), or, with the snapshot gone, one of the
+/// versions OAIY shipped.
+fn is_seeded_copy(current: &str, snapshot: Option<&str>, shipped: &[&str]) -> bool {
+    let current = normalized_template(current);
+    if snapshot.is_some_and(|s| normalized_template(s) == current) {
+        return true;
+    }
+    let digest = template_digest(&current);
+    shipped.iter().any(|h| *h == digest)
+}
+
+/// Remove, from `templates_dir`, the copies OAIY seeded of the services in
+/// [`RETIRED_BUILTINS`], with the `.seed` snapshots beside them.
+fn retire_seeded_templates(templates_dir: &Path) -> RetireReport {
+    retire_templates(templates_dir, RETIRED_BUILTINS)
+}
+
+/// [`retire_seeded_templates`] over any list, so a test can bring its own.
+///
+/// A copy OAIY did not write as it is — edited, or written by the person under
+/// the same name — is kept, and the log says so. Nothing outside
+/// `templates_dir` is touched: a retired service's scripts, venv, binaries and
+/// models stay where they are, and no program is uninstalled (a system-wide
+/// Ollama stays installed; OAIY just stops listing it).
+///
+/// Idempotent: once the seeded copies are gone there is nothing left to match,
+/// and a kept copy is kept again.
+fn retire_templates(templates_dir: &Path, retired: &[RetiredBuiltin]) -> RetireReport {
+    let mut report = RetireReport::default();
+    for r in retired {
+        let path = templates_dir.join(r.file);
+        let snap = templates_dir.join(format!(".{}.seed", r.file));
+        let current = match std::fs::read_to_string(&path) {
+            Ok(s) => s,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                // Already gone (an earlier startup, or the person deleted it).
+                // A snapshot left behind is only OAIY's bookkeeping for it.
+                if snap.is_file() {
+                    match std::fs::remove_file(&snap) {
+                        Ok(()) => log::info!("removed templates/.{}.seed: the '{}' service is retired", r.file, r.id),
+                        Err(e) => log::warn!("could not remove templates/.{}.seed: {e}", r.file),
+                    }
+                }
+                continue;
+            }
+            Err(e) => {
+                log::warn!(
+                    "kept templates/{}: could not read it ({e}), so it cannot be shown to be a copy OAIY seeded",
+                    r.file
+                );
+                report.kept.push(r.file.to_string());
+                continue;
+            }
+        };
+        let snapshot = std::fs::read_to_string(&snap).ok();
+        if !is_seeded_copy(&current, snapshot.as_deref(), r.shipped) {
+            log::info!(
+                "kept templates/{}: the '{}' service is retired from OAIY's built-ins, but this copy \
+                 is not one OAIY seeded (edited, or written under the same name), so it stays; \
+                 delete the file to remove it",
+                r.file,
+                r.id
+            );
+            report.kept.push(r.file.to_string());
+            continue;
+        }
+        match std::fs::remove_file(&path) {
+            Ok(()) => {
+                if snap.is_file() {
+                    if let Err(e) = std::fs::remove_file(&snap) {
+                        log::warn!("could not remove templates/.{}.seed: {e}", r.file);
+                    }
+                }
+                log::info!(
+                    "removed templates/{}: the '{}' service is retired (OAIY's engine does this now); \
+                     its scripts, venv and models were left where they are",
+                    r.file,
+                    r.id
+                );
+                report.removed.push(r.file.to_string());
+            }
+            Err(e) => {
+                log::warn!("could not remove the retired templates/{}: {e}", r.file);
+                report.kept.push(r.file.to_string());
+            }
+        }
+    }
+    report
+}
+
 impl Registry {
     /// Seed user dir if empty and load every template. `models_dir` is the
     /// resolved downloads/weights root (override or `<dataDir>/models`);
@@ -839,7 +772,7 @@ impl Registry {
         // templates without clobbering a copy the user has hand-edited. A
         // missing snapshot (older build that used write-if-not-exists) is
         // treated as an untouched auto-seed and refreshed once, then tracked
-        // — so e.g. a corrected lance.json reaches existing installs.
+        // — so e.g. a corrected oaiy-voice.json reaches existing installs.
         for (name, body) in BUILTIN_TEMPLATES {
             let p = data_dir.join("templates").join(name);
             let snap = data_dir.join("templates").join(format!(".{name}.seed"));
@@ -859,10 +792,17 @@ impl Registry {
                 log::warn!("could not seed built-in script {name}: {e}");
             }
         }
-        // Seed built-in TEMPLATES' bundled files (krea2_server.py, install-krea2.ps1, …) from
+        // Seed built-in TEMPLATES' bundled files (install-oaiy-voice.ps1, …) from
         // the trusted compiled-in source, so the reserved-name guard in
         // materialize_package_files refuses any imported package from overwriting them.
         seed_builtin_template_files(&data_dir.join("scripts"));
+
+        // Remove the seeded copies of services OAIY no longer ships BEFORE
+        // loading, so they are never loaded (and their bundled scripts are not
+        // laid down again). Nothing can be running under this registry yet — it
+        // is still being built, and services start later (`autostart_on_boot`)
+        // — so there is nothing to stop first.
+        retire_seeded_templates(&data_dir.join("templates"));
 
         let mut services = HashMap::new();
         let mut template_errors: Vec<TemplateLoadError> = Vec::new();
@@ -900,19 +840,18 @@ impl Registry {
         );
         let model_dirs = combine_model_dirs(&models_dir, extra_model_dirs);
         let autostart = read_autostart_note(&data_dir);
-        Ok(Self {
+        let mut registry = Self {
             services,
             data_dir,
             models_dir,
             model_dirs,
-            llama_model: None,
-            llama_mmproj: None,
-            ollama_model: None,
             service_gpus: HashMap::new(),
             autostart,
             template_errors,
             template_probes: HashMap::new(),
-        })
+        };
+        registry.forget_retired_services();
+        Ok(registry)
     }
 
     /// Last-resort in-memory registry with NO templates and NO filesystem work.
@@ -925,9 +864,6 @@ impl Registry {
             data_dir,
             models_dir,
             model_dirs,
-            llama_model: None,
-            llama_mmproj: None,
-            ollama_model: None,
             service_gpus: HashMap::new(),
             // The degraded registry has no services to start, and its data dir
             // is by definition unwritable — reading the note would only ever
@@ -955,14 +891,11 @@ impl Registry {
     /// All model search roots, primary first. Powers `${modelDirs}`.
     /// (Exposed for completeness alongside `extra_model_dirs()`; the env/ctx
     /// paths read the field directly via `join_model_dirs`.)
-    #[allow(dead_code)]
-    /// The model search roots.
     ///
-    /// Clone these and drop the lock before walking them: the walk is the slow
-    /// half — a library of 40 GB checkpoints on a spinning or network disk —
-    /// and this lock is the same one every `/api/services` poll and every
-    /// start/stop needs, so scanning under it stalled the whole Services view
-    /// rather than just its model picker.
+    /// Clone these and drop the lock before walking them: a walk of a library
+    /// of 40 GB checkpoints is slow, and this lock is the same one every
+    /// `/api/services` poll and every start/stop needs.
+    #[allow(dead_code)]
     pub fn model_dirs(&self) -> &[PathBuf] {
         &self.model_dirs
     }
@@ -981,40 +914,6 @@ impl Registry {
     /// them up via `${modelDirs}` / `OAIY_MODEL_DIRS`). Primary stays index 0.
     pub fn set_extra_model_dirs(&mut self, extra: Vec<PathBuf>) {
         self.model_dirs = combine_model_dirs(&self.models_dir, extra);
-    }
-
-    /// The configured single-model override (`${llamaModel}`), if any. `None`
-    /// means no model is selected (no implicit default; start() refuses to spawn).
-    pub fn llama_model(&self) -> Option<String> {
-        self.llama_model.clone()
-    }
-
-    /// Set (or clear) the GGUF a single-model server loads. Live — the next
-    /// service start reads it via `${llamaModel}`, no restart needed.
-    /// The projector to load beside the model, if any.
-    pub fn llama_mmproj(&self) -> Option<&str> {
-        self.llama_mmproj.as_deref()
-    }
-
-    /// Set it live, like [`Self::set_llama_model`] — the next start picks it up
-    /// with no restart of OAIY itself.
-    pub fn set_llama_mmproj(&mut self, path: Option<String>) {
-        self.llama_mmproj = path.filter(|s| !s.trim().is_empty());
-    }
-
-    pub fn set_llama_model(&mut self, model: Option<String>) {
-        self.llama_model = clean_model_opt(model);
-    }
-
-    /// The configured Ollama model name (`${ollamaModel}`), if any.
-    pub fn ollama_model(&self) -> Option<String> {
-        self.ollama_model.clone()
-    }
-
-    /// Set (or clear) the Ollama model name. Live — the next /api/services
-    /// snapshot resolves `${ollamaModel}` in the node body, no restart needed.
-    pub fn set_ollama_model(&mut self, model: Option<String>) {
-        self.ollama_model = clean_model_opt(model);
     }
 
     /// The GPU index pinned for a service, if any (`None` ⇒ default placement).
@@ -1040,29 +939,9 @@ impl Registry {
         self.service_gpus = map;
     }
 
-    /// The live port of a service by id (e.g. to query Ollama's /api/tags for
-    /// the list of pulled models).
+    /// The live port of a service by id (e.g. to reach OAIY Voice's own API).
     pub fn service_port(&self, id: &str) -> Option<u16> {
         self.services.get(id).map(|s| s.port)
-    }
-
-    /// Every loadable *.gguf at the top level of any model search root
-    /// (primary + extras), deduped + sorted. Excludes multimodal projector
-    /// files (`mmproj*`), which aren't a standalone model. Powers the
-    /// llama.cpp Model picker.
-    /// Multimodal projectors OAIY can see, across every model root.
-    ///
-    /// A separate listing because `list_gguf_models` deliberately EXCLUDES
-    /// `mmproj*` — a projector is not a model you can run, and offering it in
-    /// the model picker would only produce a server that fails to load. It is
-    /// still a `.gguf`, so the same recursive walk finds it; only the filter
-    /// differs.
-    pub fn list_mmproj_files(&self) -> Vec<String> {
-        scan_mmproj_files(&self.model_dirs)
-    }
-
-    pub fn list_gguf_models(&self) -> Vec<String> {
-        scan_gguf_models(&self.model_dirs)
     }
 
     /// True when `p` resolves inside a managed root (`${dataDir}` — which
@@ -1098,7 +977,7 @@ impl Registry {
     /// (`bin`/`venvs`/`services`/`templates`/`scripts`). Uninstall must refuse these: removing
     /// one would wipe EVERY service's files (all venvs, all binaries, all templates), not just
     /// this service's. Paths strictly UNDER them (e.g. `${dataDir}/venvs/<id>`,
-    /// `${binDir}/llama-*.exe`) are fine — this is an equality check, so they pass through.
+    /// `${binDir}/my-server-*.exe`) are fine — this is an equality check, so they pass through.
     fn is_protected_uninstall_root(&self, p: &Path) -> bool {
         if self.is_managed_root(p) {
             return true;
@@ -1111,7 +990,7 @@ impl Registry {
     }
 
     /// Remove the files/dirs a service's `uninstall` spec declares, so the user
-    /// can clean-reinstall (e.g. swap an old llama.cpp build for a new one).
+    /// can clean-reinstall (e.g. swap an old build for a new one).
     /// Each path is placeholder-expanded; a `*` in the final segment globs that
     /// dir. Every path is guarded to stay inside a managed root and to contain
     /// no `..`. The service must be stopped. Returns the count removed.
@@ -1209,7 +1088,7 @@ impl Registry {
 
     /// Whether the service's run executable exists on disk. Mirrors start()'s resolution: a
     /// path command must exist; a bare command resolves to ${binDir} first, then PATH (e.g. a
-    /// system-installed `ollama`). The fallback "is it installed" signal for a service with no
+    /// system-installed tool). The fallback "is it installed" signal for a service with no
     /// install-completion marker.
     fn run_command_exists(&self, run_command: &str, port: u16) -> bool {
         let raw = os_fix_path(substitute(run_command, &self.ctx(port)));
@@ -1294,6 +1173,61 @@ impl Registry {
     /// Where the "what was running" note lives, beside the other registry state.
     fn running_note_path(&self) -> PathBuf {
         self.data_dir.join("services-running.json")
+    }
+
+    /// Drop retired services that are no longer loaded from the two boot lists
+    /// — "start with the app" and "what was running" — so neither asks for a
+    /// service that is gone, and a template later written under the same id
+    /// does not arrive already ticked. An id that IS loaded (a template the
+    /// person kept or wrote under it) is theirs, and its entries stay.
+    ///
+    /// Writes only when something was dropped, so a normal startup writes nothing.
+    fn forget_retired_services(&mut self) {
+        let gone: std::collections::HashSet<&str> = RETIRED_BUILTINS
+            .iter()
+            .map(|r| r.id)
+            .filter(|id| !self.services.contains_key(*id))
+            .collect();
+        if gone.is_empty() {
+            return;
+        }
+        let ticked = self.autostart.len();
+        self.autostart.retain(|id| !gone.contains(id.as_str()));
+        if self.autostart.len() != ticked {
+            match self.persist_autostart() {
+                Ok(()) => log::info!("dropped retired services from the start-with-the-app list"),
+                Err(e) => log::warn!("could not drop retired services from the start-with-the-app list: {e}"),
+            }
+        }
+        // Filtered in place rather than through `remember_running`, which writes
+        // what is running NOW — nothing, this early — and would forget every
+        // other service that was up at the last exit too.
+        let path = self.running_note_path();
+        let Some(ids) = std::fs::read_to_string(&path)
+            .ok()
+            .and_then(|s| serde_json::from_str::<Vec<String>>(&s).ok())
+        else {
+            return;
+        };
+        let kept: Vec<&str> = ids
+            .iter()
+            .map(String::as_str)
+            .filter(|id| !gone.contains(id))
+            .collect();
+        if kept.len() == ids.len() {
+            return;
+        }
+        let written = serde_json::to_string(&kept)
+            .map_err(|e| e.to_string())
+            .and_then(|body| {
+                let tmp = path.with_extension("json.tmp");
+                std::fs::write(&tmp, body).map_err(|e| e.to_string())?;
+                std::fs::rename(&tmp, &path).map_err(|e| e.to_string())
+            });
+        match written {
+            Ok(()) => log::info!("dropped retired services from the running note"),
+            Err(e) => log::warn!("could not drop retired services from the running note: {e}"),
+        }
     }
 
     /// Record which services are up, so a restart can bring them back.
@@ -1525,8 +1459,8 @@ impl Registry {
                 autostart: self.autostart.contains(&s.template.id),
                 node: s.template.node.as_ref().map(|n| {
                     // Resolve companion-side `${...}` placeholders (e.g.
-                    // `${ollamaModel}`) in the node body BEFORE the web app sees
-                    // it — the web compiler only handles `{{...}}` vars.
+                    // `${port}`) in the node body BEFORE the web app sees it —
+                    // the web compiler only handles `{{...}}` vars.
                     let mut n = n.clone();
                     if let Some(bt) = &n.body_template {
                         n.body_template = Some(substitute(bt, &self.ctx(s.port)));
@@ -1621,43 +1555,9 @@ impl Registry {
         // `${scriptsDir}/name` (matches materialize_package_files' target dir).
         m.insert("scriptsDir", self.data_dir.join("scripts").display().to_string());
         // All search roots joined by the OS path separator (`;` on Windows),
-        // so a service env like `"LTX2_MODEL_DIRS": "${modelDirs}"` can scan
+        // so a service env like `"MY_MODEL_DIRS": "${modelDirs}"` can scan
         // several drives. Primary is always first.
         m.insert("modelDirs", join_model_dirs(&self.model_dirs));
-        // Single-model LLM servers (llama.cpp) load ONE gguf via `-m
-        // ${llamaModel}`. Inserted ONLY when the user has explicitly picked a
-        // model — there is NO implicit default. Left unset, `${llamaModel}`
-        // stays unsubstituted and start() refuses to spawn (a clear "pick a
-        // model" error) rather than guessing a `model.gguf` that may not exist.
-        if let Some(model) = self.llama_model.clone().filter(|s| !s.trim().is_empty()) {
-            m.insert("llamaModel", model);
-        }
-        // Multi-model servers (Ollama) take a model NAME per request; the
-        // companion resolves the user's pick into the node body template via
-        // `${ollamaModel}`. ALWAYS set (with the pre-pulled default) so a node
-        // never ships a literal `${ollamaModel}`.
-        // Only when a projector is actually chosen. Left unset, both of these
-        // stay literal and are dropped from the environment below, so the
-        // service runs exactly as it did before multimodal existed.
-        if let Some(mmproj) = self.llama_mmproj.clone().filter(|s| !s.trim().is_empty()) {
-            m.insert("llamaMmproj", mmproj);
-            // llama.cpp's automatic device fitting CRASHES on a multimodal
-            // graph — `GGML_ASSERT(n_inputs < GGML_SCHED_MAX_SPLIT_INPUTS)`,
-            // reproduced here on a two-GPU box with gemma-4-e2b + its audio
-            // projector, and llama.cpp's own log points at `-fit off` when it
-            // dies. Forced off ONLY for multimodal: with fitting disabled the
-            // server no longer sizes layers to VRAM by itself, which is the
-            // right default for every other model.
-            m.insert("llamaMmprojFit", "off".to_string());
-        }
-
-        m.insert(
-            "ollamaModel",
-            self.ollama_model
-                .clone()
-                .filter(|s| !s.trim().is_empty())
-                .unwrap_or_else(|| "qwen2.5:0.5b".to_string()),
-        );
         m
     }
 
@@ -1702,7 +1602,7 @@ impl Registry {
                 .iter()
                 .find(|p| p.exists())
                 .map(|p| p.display().to_string())
-                // Resolve a just-installed system tool (e.g. ollama) to its real path so the
+                // Resolve a just-installed system tool to its real path so the
                 // spawn doesn't fall back to the bare name + OAIY Desktop's stale PATH (which
                 // wouldn't find it until a restart) and Error out.
                 .or_else(|| oaiy_program(&raw_cmd).map(|p| p.display().to_string()))
@@ -1721,10 +1621,10 @@ impl Registry {
             .map(|(k, v)| (k.clone(), substitute(v, &ctx)))
             .collect();
         // Pin to a chosen GPU if the user assigned one in the GPU picker — so e.g.
-        // llama.cpp runs on GPU 1 while krea2 keeps GPU 0, instead of both defaulting to
-        // GPU 0 and exhausting its VRAM. CUDA_VISIBLE_DEVICES re-indexes, so the service
-        // sees the chosen card as cuda:0 (a multi-GPU service like krea2 then runs on the
-        // one card — encoder falls back to CPU; left unset it keeps its dual-GPU default).
+        // OAIY Voice runs on GPU 1 while a Python rig keeps GPU 0, instead of both
+        // defaulting to GPU 0 and exhausting its VRAM. CUDA_VISIBLE_DEVICES re-indexes,
+        // so the service sees the chosen card as cuda:0 (a multi-GPU service then runs
+        // on the one card; left unset it keeps its own default placement).
         if let Some(gpu) = self.service_gpus.get(id).copied() {
             // The picker shows nvidia-smi indices (PCI-bus order), but CUDA defaults to
             // CUDA_DEVICE_ORDER=FASTEST_FIRST — so on a HETEROGENEOUS box "GPU 1" could map
@@ -1736,25 +1636,10 @@ impl Registry {
         }
         let cwd = run_spec.cwd.as_deref().map(|c| os_fix_path(substitute(c, &ctx)));
 
-        // A required, user-chosen value the template references but that's unset
-        // leaves `${llamaModel}` literal (no implicit default) — refuse to spawn
-        // with a bogus path and tell the user exactly what to do.
-        if resolved_cmd.contains("${llamaModel}")
-            || args.iter().any(|a| a.contains("${llamaModel}"))
-            || env.values().any(|v| v.contains("${llamaModel}"))
-            || cwd.as_deref().is_some_and(|c| c.contains("${llamaModel}"))
-        {
-            return Err(format!(
-                "{id}: no model selected — pick one in the service's Model selector first"
-            ));
-        }
-
         // An env entry whose placeholder never resolved is not a value. Passing
-        // `LLAMA_ARG_MMPROJ=${llamaMmproj}` literally would have llama-server
-        // try to open a file by that name and fail; dropping it is what makes
-        // an OPTIONAL template placeholder expressible at all. Done AFTER the
-        // required-value guard above, so a missing `${llamaModel}` still fails
-        // loudly instead of being quietly discarded here.
+        // `SOME_PATH=${unknown}` literally would have the service try to open a
+        // file by that name and fail; dropping it is what makes an OPTIONAL
+        // template placeholder expressible at all.
         env.retain(|_, v| !(v.contains("${") && v.contains('}')));
 
         // Default the working dir to the data dir (not the inherited process CWD) when the
@@ -2024,7 +1909,7 @@ impl Registry {
                     // KEEP the runner (and its LogBuffer) so a crashed service's
                     // stderr/traceback stays visible in the LogsViewer — dropping
                     // it here made crash logs vanish the instant the process died
-                    // (e.g. Lance's "No module named flash_attn"). start() replaces
+                    // (e.g. a Python "No module named …" traceback). start() replaces
                     // it on restart; logs() prefers the runner's output once it has
                     // any, falling back to the installer otherwise.
                     svc.set_status(
@@ -2108,7 +1993,7 @@ impl Registry {
             }
             // Failed probe: only fault a Running service, and only once it's had
             // its health-timeout to come up (the model may still be loading —
-            // llama.cpp doesn't bind its port until after the model loads).
+            // a model server may not bind its port until the model has loaded).
             if svc.status != ServiceStatus::Running {
                 continue;
             }
@@ -2174,7 +2059,7 @@ impl Registry {
     /// flips the status to Stopped or Errored on completion.
     ///
     /// Why streaming instead of blocking `.output()`? Some installs take
-    /// minutes (llama.cpp CUDA zip is ~500 MB), and the user wants to
+    /// minutes (a CUDA build is hundreds of MB), and the user wants to
     /// see "Downloading…" + "Extracting…" lines tick by — same UX as
     /// running the .ps1 in a console themselves.
     pub fn install_streaming(&mut self, id: &str) -> Result<(), String> {
@@ -2704,7 +2589,7 @@ fn wait_exited_bounded(grace: Duration, mut exited: impl FnMut() -> bool) -> boo
 /// that the 2s `/api/services`, `/api/python` and `/api/ai/sources` polls also
 /// need. `Runner::stop` ends in a bare `child.wait()` — i.e.
 /// `WaitForSingleObject(INFINITE)` on Windows — and the direct child here is
-/// typically a multi-GB CUDA server (lance / ltx2 / krea2 run the venv
+/// typically a multi-GB CUDA server (a Python rig runs the venv
 /// `python.exe` itself), exactly the kind of process that can sit unkillable in
 /// a driver call. One of those held the lock for the whole teardown, and each
 /// queued poll then parked its own tokio worker on the mutex until the entire
@@ -2766,15 +2651,9 @@ fn valid_service_id(id: &str) -> bool {
             .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '-' || c == '_')
 }
 
-/// Trim a model selection and treat all-whitespace/empty as "unset" (`None`).
-/// Shared by `set_llama_model` / `set_ollama_model`.
-fn clean_model_opt(model: Option<String>) -> Option<String> {
-    model.map(|s| s.trim().to_string()).filter(|s| !s.is_empty())
-}
-
 /// Extract the venv name from a path-ish string containing a `venvs/<name>`
-/// (or `venvs\<name>`) segment — e.g. `${dataDir}/venvs/ltx2/Scripts/python.exe`
-/// → `Some("ltx2")`. Returns None when there's no such segment.
+/// (or `venvs\<name>`) segment — e.g. `${dataDir}/venvs/my-rig/Scripts/python.exe`
+/// → `Some("my-rig")`. Returns None when there's no such segment.
 fn venv_name_in(s: &str) -> Option<String> {
     let norm = s.replace('\\', "/");
     let idx = norm.find("venvs/")?;
@@ -2835,12 +2714,12 @@ mod tests {
     fn extracts_venv_name_from_run_command() {
         // Forward + back slashes, with the `${dataDir}` placeholder intact.
         assert_eq!(
-            venv_name_in("${dataDir}/venvs/ltx2/Scripts/python.exe").as_deref(),
-            Some("ltx2")
+            venv_name_in("${dataDir}/venvs/my-rig/Scripts/python.exe").as_deref(),
+            Some("my-rig")
         );
         assert_eq!(
-            venv_name_in("${dataDir}\\venvs\\lance\\Scripts\\python.exe").as_deref(),
-            Some("lance")
+            venv_name_in("${dataDir}\\venvs\\comfyui\\Scripts\\python.exe").as_deref(),
+            Some("comfyui")
         );
         assert_eq!(
             venv_name_in("C:/data/venvs/playwright/Scripts/python.exe").as_deref(),
@@ -2850,8 +2729,8 @@ mod tests {
 
     #[test]
     fn no_venv_segment_returns_none() {
-        assert_eq!(venv_name_in("ollama"), None);
-        assert_eq!(venv_name_in("${binDir}/llama-server.exe"), None);
+        assert_eq!(venv_name_in("oaiy-voice"), None);
+        assert_eq!(venv_name_in("${binDir}/my-server.exe"), None);
         // `venvs/` with nothing after it is not a usable name.
         assert_eq!(venv_name_in("x/venvs/"), None);
     }
@@ -3011,32 +2890,6 @@ mod tests {
     }
 
     #[test]
-    fn krea2_has_uninstall_and_central_models() {
-        let (_, body) = super::BUILTIN_TEMPLATES
-            .iter()
-            .find(|(n, _)| *n == "krea2.json")
-            .expect("krea2.json builtin");
-        let t: super::ServiceTemplate = serde_json::from_str(body).expect("krea2 deserializes");
-        // Uninstall removes the venv + repo (program files) so the button appears...
-        let paths = &t.uninstall.expect("krea2 declares an uninstall spec").paths;
-        assert!(
-            paths.iter().any(|p| p == "${dataDir}/venvs/krea2"),
-            "krea2 uninstall should remove its venv, got {paths:?}"
-        );
-        // ...but must NOT delete the central models (matches the "models not touched"
-        // convention in the uninstall confirm dialog + avoids deleting a big download).
-        assert!(
-            !paths.iter().any(|p| p.contains("modelsDir")),
-            "krea2 uninstall should NOT delete the central models dir, got {paths:?}"
-        );
-        // Models centralized: checkpoint + HF cache live under ${modelsDir}.
-        assert!(
-            body.contains("${modelsDir}/krea2/checkpoints"),
-            "krea2 checkpoint should live under the central models dir"
-        );
-    }
-
-    #[test]
     fn uninstall_refuses_managed_roots_and_structural_dirs() {
         use std::path::PathBuf;
         let data = PathBuf::from("C:/oaiy/data");
@@ -3058,14 +2911,14 @@ mod tests {
                 p.display()
             );
         }
-        // Per-service subtrees + the llama-cpp glob target sit STRICTLY under a structural
+        // Per-service subtrees + a bin glob target sit STRICTLY under a structural
         // dir; the guard is an equality check (not a prefix), so they still pass through and
-        // real built-in uninstalls keep working.
+        // real uninstalls keep working.
         for p in [
-            data.join("venvs/krea2"),
-            data.join("services/ltx2"),
-            data.join("bin/llama-server.exe"),
-            models.join("krea2/checkpoints"),
+            data.join("venvs/my-rig"),
+            data.join("services/my-rig"),
+            data.join("bin/my-server.exe"),
+            models.join("my-rig/checkpoints"),
         ] {
             assert!(
                 !reg.is_protected_uninstall_root(&p),
@@ -3275,110 +3128,6 @@ mod tests {
     }
 
     #[test]
-    fn projectors_are_offered_separately_from_models() {
-        // A projector is a .gguf but NOT a model you can run: offering it in the
-        // model picker only produces a server that fails to load, and hiding it
-        // everywhere (which the model filter alone does) makes multimodal
-        // impossible to configure. So: excluded from one list, and the only
-        // thing in the other.
-        let root = std::env::temp_dir().join(format!("oaiy-mmproj-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&root);
-        let models = root.join("models");
-        std::fs::create_dir_all(models.join("gemma")).unwrap();
-        std::fs::write(models.join("gemma/gemma-4-e2b-q4_k_m.gguf"), b"x").unwrap();
-        // Both spellings in the wild — prefix and infix.
-        std::fs::write(models.join("gemma/mmproj-gemma-4-e2b-f16.gguf"), b"x").unwrap();
-        std::fs::write(models.join("gemma/gemma-4-e2b-mmproj-F16.gguf"), b"x").unwrap();
-
-        let reg = super::Registry::empty(root.clone(), models.clone());
-        let name = |p: &String| {
-            std::path::Path::new(p).file_name().unwrap().to_string_lossy().to_string()
-        };
-
-        let models_listed: Vec<String> = reg.list_gguf_models().iter().map(name).collect();
-        assert_eq!(models_listed, vec!["gemma-4-e2b-q4_k_m.gguf".to_string()]);
-
-        let projectors: Vec<String> = reg.list_mmproj_files().iter().map(name).collect();
-        assert_eq!(projectors.len(), 2, "{projectors:?}");
-        assert!(projectors.iter().all(|p| p.to_lowercase().contains("mmproj")));
-
-        let _ = std::fs::remove_dir_all(&root);
-    }
-
-    #[test]
-    fn a_projector_is_optional_and_forces_device_fitting_off() {
-        // The asymmetry that shapes the whole design: no model is a refusal to
-        // start; no projector is simply a text-only model. So the projector
-        // placeholders must be ABSENT until one is chosen, and the env entries
-        // that reference them get dropped at spawn.
-        let root = std::env::temp_dir().join(format!("oaiy-mmctx-{}", std::process::id()));
-        let mut reg = super::Registry::empty(root.clone(), root.join("models"));
-
-        let ctx = reg.ctx(8080);
-        assert!(!ctx.contains_key("llamaMmproj"), "unset until chosen");
-        assert!(!ctx.contains_key("llamaMmprojFit"));
-
-        reg.set_llama_mmproj(Some("E:/models/gemma-4-e2b-mmproj-F16.gguf".into()));
-        let ctx = reg.ctx(8080);
-        assert_eq!(ctx.get("llamaMmproj").map(String::as_str), Some("E:/models/gemma-4-e2b-mmproj-F16.gguf"));
-        // llama.cpp's auto-fit asserts and dies on a multimodal graph, so it is
-        // forced off — but ONLY when a projector is actually loaded.
-        assert_eq!(ctx.get("llamaMmprojFit").map(String::as_str), Some("off"));
-
-        // Blank clears rather than setting an empty path.
-        reg.set_llama_mmproj(Some("   ".into()));
-        assert!(reg.llama_mmproj().is_none());
-        assert!(!reg.ctx(8080).contains_key("llamaMmprojFit"));
-    }
-
-    #[test]
-    fn ggufs_are_found_in_subfolders_of_a_model_root() {
-        // Top-level-only was the old behaviour and it made the obvious thing
-        // fail: drop a folder of weights into the models directory and the
-        // llama.cpp Model picker stayed empty, with nothing explaining why.
-        let root = std::env::temp_dir().join(format!("oaiy-gguf-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&root);
-        let models = root.join("models");
-        std::fs::create_dir_all(models.join("qwen/30b")).unwrap();
-        // Exactly at the depth budget, and one level past it.
-        std::fs::create_dir_all(models.join("a/b/c/d/e")).unwrap();
-
-        std::fs::write(models.join("loose.gguf"), b"x").unwrap();
-        std::fs::write(models.join("qwen/mid.gguf"), b"x").unwrap();
-        std::fs::write(models.join("qwen/30b/nested.gguf"), b"x").unwrap();
-        // A multimodal projector is not a standalone model, at any depth.
-        std::fs::write(models.join("qwen/mmproj-thing.gguf"), b"x").unwrap();
-        std::fs::write(models.join("a/b/c/d/edge.gguf"), b"x").unwrap();
-        // Past the budget, so a mis-pointed root cannot walk a whole drive.
-        std::fs::write(models.join("a/b/c/d/e/way.gguf"), b"x").unwrap();
-        // Not a model.
-        std::fs::write(models.join("qwen/notes.txt"), b"x").unwrap();
-
-        let reg = super::Registry::empty(root.clone(), models.clone());
-        let found: Vec<String> = reg
-            .list_gguf_models()
-            .into_iter()
-            .map(|p| {
-                std::path::Path::new(&p)
-                    .file_name()
-                    .unwrap()
-                    .to_string_lossy()
-                    .to_string()
-            })
-            .collect();
-
-        assert!(found.contains(&"loose.gguf".to_string()), "{found:?}");
-        assert!(found.contains(&"mid.gguf".to_string()), "a subfolder must be searched: {found:?}");
-        assert!(found.contains(&"nested.gguf".to_string()), "two levels down: {found:?}");
-        assert!(!found.iter().any(|f| f.starts_with("mmproj")), "{found:?}");
-        assert!(found.contains(&"edge.gguf".to_string()), "the last allowed level: {found:?}");
-        assert!(!found.contains(&"way.gguf".to_string()), "depth must stay bounded: {found:?}");
-        assert!(!found.iter().any(|f| f.ends_with(".txt")), "{found:?}");
-
-        let _ = std::fs::remove_dir_all(&root);
-    }
-
-    #[test]
     fn a_template_cache_hit_still_reports_and_still_clears() {
         // `reload_new_templates` runs on every /api/services poll and now skips
         // the read+parse for files whose (mtime, len) are unchanged. The two
@@ -3388,8 +3137,8 @@ mod tests {
         let data = std::env::temp_dir().join(format!("oaiy-tplcache-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&data);
         std::fs::create_dir_all(data.join("templates")).unwrap();
-        let bad = data.join("templates/lance.json");
-        std::fs::write(&bad, r#"{ "id": "lance", "name": "Lance", }"#).unwrap();
+        let bad = data.join("templates/my-rig.json");
+        std::fs::write(&bad, r#"{ "id": "my-rig", "name": "My rig", }"#).unwrap();
 
         let mut reg = super::Registry::empty(data.clone(), data.join("models"));
         assert_eq!(reg.reload_new_templates(), 0);
@@ -3409,9 +3158,9 @@ mod tests {
         std::fs::write(
             &bad,
             r#"{
-                "id": "lance", "name": "Lance", "description": "", "category": "test",
+                "id": "my-rig", "name": "My rig", "description": "", "category": "test",
                 "defaultPort": 9997,
-                "run": { "command": "lance.exe", "args": [] }
+                "run": { "command": "my-rig.exe", "args": [] }
             }"#,
         )
         .unwrap();
@@ -3447,8 +3196,8 @@ mod tests {
         // The hand-edit that used to make a service card vanish with no message
         // anywhere: one trailing comma.
         std::fs::write(
-            data.join("templates/lance.json"),
-            r#"{ "id": "lance", "name": "Lance", }"#,
+            data.join("templates/my-rig.json"),
+            r#"{ "id": "my-rig", "name": "My rig", }"#,
         )
         .unwrap();
 
@@ -3457,7 +3206,7 @@ mod tests {
         let snap = reg.snapshot();
         assert_eq!(snap.services.len(), 1);
         assert_eq!(snap.template_errors.len(), 1);
-        assert_eq!(snap.template_errors[0].file, "lance.json");
+        assert_eq!(snap.template_errors[0].file, "my-rig.json");
         assert!(
             !snap.template_errors[0].error.is_empty(),
             "the parse error must come along — it carries the line/column"
@@ -3470,11 +3219,11 @@ mod tests {
         // Fixing the file clears the report on the next poll — nothing has to
         // invalidate anything.
         std::fs::write(
-            data.join("templates/lance.json"),
+            data.join("templates/my-rig.json"),
             r#"{
-                "id": "lance", "name": "Lance", "description": "", "category": "test",
+                "id": "my-rig", "name": "My rig", "description": "", "category": "test",
                 "defaultPort": 9997,
-                "run": { "command": "lance.exe", "args": [] }
+                "run": { "command": "my-rig.exe", "args": [] }
             }"#,
         )
         .unwrap();
@@ -3482,5 +3231,165 @@ mod tests {
         assert!(reg.snapshot().template_errors.is_empty());
 
         let _ = std::fs::remove_dir_all(&data);
+    }
+
+    // --- retired built-ins ------------------------------------------------
+
+    /// A data dir laid out as a real install from before the retirement: one
+    /// retired template exactly as OAIY seeded it (file and `.seed` snapshot).
+    fn install_with_seeded(tag: &str, file: &str, body: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!(
+            "oaiy-retire-{tag}-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(dir.join("templates")).unwrap();
+        std::fs::write(dir.join("templates").join(file), body).unwrap();
+        std::fs::write(dir.join("templates").join(format!(".{file}.seed")), body).unwrap();
+        dir
+    }
+
+    fn retired_template(id: &str, name: &str) -> String {
+        format!(
+            r#"{{ "id": "{id}", "name": "{name}", "description": "", "category": "LLM",
+                "defaultPort": 11434, "run": {{ "command": "{id}", "args": ["serve"] }} }}"#
+        )
+    }
+
+    fn note(dir: &Path, file: &str) -> Vec<String> {
+        let raw = std::fs::read_to_string(dir.join(file)).unwrap();
+        let mut ids: Vec<String> = serde_json::from_str(&raw).unwrap();
+        ids.sort();
+        ids
+    }
+
+    #[test]
+    fn a_seeded_copy_of_a_retired_service_is_removed_with_its_boot_entries() {
+        let dir = install_with_seeded("seeded", "ollama.json", &retired_template("ollama", "Ollama"));
+        std::fs::write(dir.join("services-autostart.json"), r#"["ollama","oaiy-voice"]"#).unwrap();
+        std::fs::write(dir.join("services-running.json"), r#"["oaiy-voice","ollama","krea2"]"#).unwrap();
+        // What the retired service left outside the templates folder.
+        std::fs::create_dir_all(dir.join("scripts")).unwrap();
+        std::fs::write(dir.join("scripts/install-ollama.ps1"), "echo installer").unwrap();
+        std::fs::create_dir_all(dir.join("venvs/krea2")).unwrap();
+        std::fs::write(dir.join("venvs/krea2/.oaiy-installed"), "").unwrap();
+
+        let reg = Registry::init(dir.clone(), dir.join("models"), Vec::new()).unwrap();
+
+        assert!(!dir.join("templates/ollama.json").exists(), "the seeded copy is removed");
+        assert!(!dir.join("templates/.ollama.json.seed").exists(), "and its snapshot");
+        assert!(!reg.services.contains_key("ollama"), "no longer listed");
+        for kept in ["oaiy-voice", "aokie-stt", "aokie-tts", "playwright-browser"] {
+            assert!(reg.services.contains_key(kept), "{kept} is still a built-in");
+        }
+        assert_eq!(reg.services.len(), 4, "only the kept built-ins: {:?}", reg.services.keys());
+        assert_eq!(note(&dir, "services-autostart.json"), vec!["oaiy-voice"]);
+        assert_eq!(note(&dir, "services-running.json"), vec!["oaiy-voice"]);
+        assert_eq!(reg.boot_start_ids(), vec!["oaiy-voice".to_string()]);
+        // Nothing outside the templates folder and the two notes is touched.
+        assert!(dir.join("scripts/install-ollama.ps1").exists());
+        assert!(dir.join("venvs/krea2/.oaiy-installed").exists());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_retired_template_the_person_edited_is_kept_with_its_boot_entries() {
+        let dir = install_with_seeded("edited", "llama-cpp.json", &retired_template("llama-cpp", "Llama.cpp Server"));
+        // Edited after OAIY seeded it: no longer what the snapshot says.
+        let mine = retired_template("llama-cpp", "My llama.cpp");
+        std::fs::write(dir.join("templates/llama-cpp.json"), &mine).unwrap();
+        std::fs::write(dir.join("services-autostart.json"), r#"["llama-cpp"]"#).unwrap();
+        std::fs::write(dir.join("services-running.json"), r#"["llama-cpp"]"#).unwrap();
+
+        let reg = Registry::init(dir.clone(), dir.join("models"), Vec::new()).unwrap();
+
+        assert_eq!(std::fs::read_to_string(dir.join("templates/llama-cpp.json")).unwrap(), mine);
+        assert!(dir.join("templates/.llama-cpp.json.seed").exists(), "its snapshot is left alone too");
+        assert_eq!(reg.services["llama-cpp"].template.name, "My llama.cpp");
+        assert!(reg.is_autostart("llama-cpp"), "a kept service keeps its tick");
+        assert_eq!(note(&dir, "services-running.json"), vec!["llama-cpp"]);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_retired_id_written_under_another_name_is_left_alone() {
+        // The person's own Ollama template, in a file OAIY never seeded.
+        let dir = install_with_seeded("own", "ollama.json", &retired_template("ollama", "Ollama"));
+        let mine = retired_template("ollama", "My Ollama");
+        std::fs::write(dir.join("templates/my-ollama.json"), &mine).unwrap();
+        std::fs::write(dir.join("services-autostart.json"), r#"["ollama"]"#).unwrap();
+
+        let reg = Registry::init(dir.clone(), dir.join("models"), Vec::new()).unwrap();
+
+        assert!(!dir.join("templates/ollama.json").exists(), "the seeded copy still goes");
+        assert_eq!(std::fs::read_to_string(dir.join("templates/my-ollama.json")).unwrap(), mine);
+        assert_eq!(reg.services["ollama"].template.name, "My Ollama");
+        assert!(reg.is_autostart("ollama"), "the id is still a loaded service, so its tick stays");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_copy_matching_a_shipped_version_is_removed_without_its_snapshot() {
+        let dir = install_with_seeded("shipped", "lance.json", "{ \"id\": \"lance\" }\r\n");
+        std::fs::remove_file(dir.join("templates/.lance.json.seed")).unwrap();
+        let digest: &'static str = Box::leak(template_digest("{ \"id\": \"lance\" }").into_boxed_str());
+        let shipped: &'static [&'static str] = Box::leak(vec![digest].into_boxed_slice());
+        let retired = [RetiredBuiltin { file: "lance.json", id: "lance", shipped }];
+
+        let report = retire_templates(&dir.join("templates"), &retired);
+        assert_eq!(report.removed, vec!["lance.json".to_string()], "a trailing CRLF is not an edit");
+        assert!(!dir.join("templates/lance.json").exists());
+
+        // An unknown version with no snapshot cannot be shown to be OAIY's.
+        std::fs::write(dir.join("templates/lance.json"), "{ \"id\": \"lance\", \"name\": \"mine\" }").unwrap();
+        let report = retire_templates(&dir.join("templates"), &retired);
+        assert_eq!(report.kept, vec!["lance.json".to_string()]);
+        assert!(dir.join("templates/lance.json").exists());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn an_orphaned_snapshot_goes_and_a_second_run_changes_nothing() {
+        let dir = install_with_seeded("again", "krea2.json", &retired_template("krea2", "Krea"));
+        std::fs::remove_file(dir.join("templates/krea2.json")).unwrap();
+        std::fs::write(dir.join("services-running.json"), r#"["krea2","oaiy-voice"]"#).unwrap();
+
+        let first = Registry::init(dir.clone(), dir.join("models"), Vec::new()).unwrap();
+        assert!(!dir.join("templates/.krea2.json.seed").exists(), "the orphaned snapshot is removed");
+        assert_eq!(note(&dir, "services-running.json"), vec!["oaiy-voice"]);
+        drop(first);
+
+        let before = std::fs::metadata(dir.join("services-running.json")).unwrap().modified().unwrap();
+        let report = retire_seeded_templates(&dir.join("templates"));
+        assert_eq!(report, RetireReport::default(), "nothing left to retire");
+        let again = Registry::init(dir.clone(), dir.join("models"), Vec::new()).unwrap();
+        assert_eq!(again.services.len(), 4);
+        let after = std::fs::metadata(dir.join("services-running.json")).unwrap().modified().unwrap();
+        assert_eq!(before, after, "a note with nothing to drop is not rewritten");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn the_retired_list_and_the_built_ins_do_not_overlap() {
+        // A retired file still seeded would be written and removed at every start.
+        for r in RETIRED_BUILTINS {
+            assert!(
+                !BUILTIN_TEMPLATES.iter().any(|(name, _)| *name == r.file),
+                "{} is both built in and retired",
+                r.file
+            );
+            assert_eq!(r.file, format!("{}.json", r.id));
+            assert!(!r.shipped.is_empty());
+            for h in r.shipped {
+                assert!(h.len() == 64 && h.bytes().all(|b| b.is_ascii_hexdigit() && !b.is_ascii_uppercase()), "{h}");
+            }
+        }
+        for (_, body) in BUILTIN_TEMPLATES {
+            let t: ServiceTemplate = serde_json::from_str(body).unwrap();
+            assert!(!RETIRED_BUILTINS.iter().any(|r| r.id == t.id), "{} is retired", t.id);
+        }
+        // The digest is of the normalized body.
+        assert_eq!(template_digest("a\r\nb\n"), template_digest("a\nb"));
     }
 }

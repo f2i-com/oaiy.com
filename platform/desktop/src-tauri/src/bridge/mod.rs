@@ -32,7 +32,7 @@
 //!
 //! The cost is a Node sidecar on the box. That is already true — the CLI ships
 //! in the same repo and the desktop already supervises far heavier things
-//! (Python venvs, llama.cpp, a Playwright browser).
+//! (Python venvs, OAIY Voice, a Playwright browser).
 
 pub mod conditions;
 pub mod deadletters;

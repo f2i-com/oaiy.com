@@ -1197,16 +1197,6 @@ export interface DesktopConfig {
   modelsIsCustom: boolean;
   /** A models-dir change is pending — restart to apply. */
   modelsRestartRequired: boolean;
-
-  /** The GGUF a single-model server (llama.cpp) is set to load, if the user
-   * picked one in its Model selector (null = the `model.gguf` default). */
-  llamaModel: string | null;
-  /** Multimodal projector loaded beside the model, if any. */
-  llamaMmproj: string | null;
-
-  /** The model name the Ollama node uses, if the user picked one in its Model
-   * selector (null = the pre-pulled default qwen2.5:0.5b). */
-  ollamaModel: string | null;
 }
 
 /** What a data-folder migration would move (old → pending folder). */
@@ -1257,25 +1247,6 @@ export const appConfig = {
   addModelDir: (path: string) => tauriInvoke<string[]>('add_model_dir', { path }),
   /** Remove a registered extra model folder; returns the updated list. */
   removeModelDir: (path: string) => tauriInvoke<string[]>('remove_model_dir', { path }),
-
-  // ----- single-model server (llama.cpp) model selection -----
-  /** Loadable GGUFs discovered across the model folders — the picker options. */
-  listGgufModels: () => tauriInvoke<string[]>('list_gguf_models'),
-  /** Multimodal projectors, which the model list deliberately excludes. */
-  listMmprojFiles: () => tauriInvoke<string[]>('list_mmproj_files'),
-  /** Set (or reset, with '') which GGUF the llama.cpp server loads. Applies to
-   * the next start of the service — no app restart needed. */
-  setLlamaModel: (path: string) => tauriInvoke<void>('set_llama_model', { path }),
-  /** Load a projector beside the model (''  clears it, back to text-only). */
-  setLlamaMmproj: (path: string) => tauriInvoke<void>('set_llama_mmproj', { path }),
-
-  // ----- multi-model server (Ollama) model selection -----
-  /** Models pulled into the running Ollama server — the Ollama picker options
-   * (empty + throws when Ollama isn't running). */
-  listOllamaModels: () => tauriInvoke<string[]>('list_ollama_models'),
-  /** Set (or reset, with '') the model NAME the Ollama node uses. Applies to
-   * the next flow run — no app restart needed. */
-  setOllamaModel: (model: string) => tauriInvoke<void>('set_ollama_model', { model }),
 
   // ----- per-service GPU pinning -----
   /** CUDA GPUs present (index + name). Empty on a box without an NVIDIA GPU. */

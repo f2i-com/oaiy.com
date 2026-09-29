@@ -16,10 +16,6 @@
 //!   OAIY_SERVER_BIND     `lan` binds 0.0.0.0 instead of loopback  [loopback]
 //!   OAIY_SERVER_TOKEN    bearer token gating privileged routes    [none]
 //!   OAIY_HF_TOKEN        HuggingFace token for gated downloads    [none]
-//!   OAIY_LLAMACPP_MODEL  GGUF the llama-cpp service loads         [none]
-//!   OAIY_LLAMACPP_MMPROJ mmproj projector for vision/audio input  [none]
-//!                       (the headless equivalent of the Model selector)
-//!   OAIY_OLLAMA_MODEL    model the ollama service uses (${ollamaModel}) [qwen2.5:0.5b]
 //!   OAIY_ENGINES_UI      the engines' control pages, when oaiy-studio runs beside
 //!                       this server (e.g. http://127.0.0.1:7860): /api/engines*
 //!                       reads and relays them                   [none]
@@ -68,25 +64,6 @@ impl ConfigProvider for EnvConfig {
             models_configured_dir: None,
             models_is_custom: false,
             models_restart_required: false,
-            // Headless: reflect the OAIY_LLAMACPP_MODEL env (applied to the live
-            // registry at startup) so /api/config reports the active model.
-            llama_model: std::env::var("OAIY_LLAMACPP_MODEL")
-                .ok()
-                .map(|s| s.trim().to_string())
-                .filter(|s| !s.is_empty()),
-            // Same for the multimodal projector, so a headless box can serve a
-            // vision/audio model without a GUI to pick one in.
-            llama_mmproj: std::env::var("OAIY_LLAMACPP_MMPROJ")
-                .ok()
-                .map(|s| s.trim().to_string())
-                .filter(|s| !s.is_empty()),
-            // Reflect OAIY_OLLAMA_MODEL (applied to the registry at startup) so
-            // /api/config reports the active model; falls back to the service's
-            // built-in default (qwen2.5:0.5b) when unset.
-            ollama_model: std::env::var("OAIY_OLLAMA_MODEL")
-                .ok()
-                .map(|s| s.trim().to_string())
-                .filter(|s| !s.is_empty()),
         }
     }
 }
@@ -212,39 +189,6 @@ async fn main() {
                 std::process::exit(1);
             }
         };
-    // Headless has no Model-selector UI; honor OAIY_LLAMACPP_MODEL so the built-in
-    // llama-cpp service (which refuses to start with no model) is usable on a
-    // server. Absent it, llama-cpp stays unstartable — define a custom template
-    // with the gguf baked into run.args instead.
-    if let Ok(m) = std::env::var("OAIY_LLAMACPP_MODEL") {
-        let m = m.trim().to_string();
-        if !m.is_empty() {
-            if let Ok(mut r) = registry.lock() {
-                r.set_llama_model(Some(m));
-            }
-        }
-    }
-    // The projector too, so a headless box can serve a multimodal model. Unset
-    // is the ordinary case and simply leaves the service text-only.
-    if let Ok(m) = std::env::var("OAIY_LLAMACPP_MMPROJ") {
-        let m = m.trim().to_string();
-        if !m.is_empty() {
-            if let Ok(mut r) = registry.lock() {
-                r.set_llama_mmproj(Some(m));
-            }
-        }
-    }
-    // Same for Ollama — OAIY_OLLAMA_MODEL picks the model nodes use via ${ollamaModel}
-    // (the GUI has a selector; headless reads the env). Absent it, the service's
-    // built-in default (qwen2.5:0.5b) applies.
-    if let Ok(m) = std::env::var("OAIY_OLLAMA_MODEL") {
-        let m = m.trim().to_string();
-        if !m.is_empty() {
-            if let Ok(mut r) = registry.lock() {
-                r.set_ollama_model(Some(m));
-            }
-        }
-    }
     // One-time migration of install-completion markers for venv services installed before the
     // marker existed — mirrors the GUI (lib.rs) so headless + GUI hosts report installed-ness
     // identically. Idempotent + sentinel-gated, so safe to call every boot.
@@ -342,7 +286,7 @@ async fn main() {
             .await;
             // Recover from a poisoned mutex: stopping services on exit matters more
             // than poison-safety — `if let Ok` would silently skip it and orphan every
-            // running service (venv-python / llama.cpp / multi-GB loaders).
+            // running service (venv-python / OAIY Voice / multi-GB loaders).
             let mut r = registry.lock().unwrap_or_else(|e| e.into_inner());
             r.stop_all();
             std::process::exit(0);

@@ -80,16 +80,6 @@ pub struct DesktopConfig {
     pub models_is_custom: bool,
     /// True when the configured models dir differs from the active one.
     pub models_restart_required: bool,
-    /// The GGUF a single-model server (llama.cpp) is set to load, if the user
-    /// picked one (else none — there is no implicit default). Shown in the
-    /// service's Model picker.
-    pub llama_model: Option<String>,
-    /// The multimodal projector loaded beside `llama_model`, if the user picked
-    /// one. Surfaced so the picker can show the current choice.
-    pub llama_mmproj: Option<String>,
-    /// The model NAME a multi-model server (Ollama) is set to use, if the user
-    /// picked one (else the pre-pulled default). Shown in its Model picker.
-    pub ollama_model: Option<String>,
 }
 
 /// Supplies the [`DesktopConfig`] snapshot for `GET /api/config` without
@@ -371,7 +361,7 @@ async fn delete_service(
 }
 
 /// Remove a service's installed files (the template's `uninstall` paths) so the
-/// user can clean-reinstall — e.g. swap an old llama.cpp build for a new one.
+/// user can clean-reinstall — e.g. swap an old build for a new one.
 /// Privileged + destructive (gated like delete); leaves the template in place.
 async fn uninstall_service(
     State(state): State<AppState>,
