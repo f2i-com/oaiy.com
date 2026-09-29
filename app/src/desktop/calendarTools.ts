@@ -138,12 +138,82 @@ function freeTool(desktop: () => Desktop | null, audience: Audience): SessionToo
   };
 }
 
-/** A call's calendar tool: what is free, worded for the caller (a call requests its appointment through the phone). */
-export function callCalendarTools(desktop: () => Desktop | null): SessionTool[] {
-  return [freeTool(desktop, 'caller')];
+/**
+ * The last digits of a number, as the desktop's lookup finds a caller's own
+ * appointments (`Calendar::lookup`): the last nine, and none for a number of
+ * fewer than six digits (hidden, or not a number).
+ */
+function numberTail(phone: string): string {
+  const digits = phone.replace(/\D/g, '');
+  return digits.length >= 6 ? digits.slice(-9) : '';
 }
 
-/** A text thread's calendar tools: what is free, and a request for the person texting. */
+/**
+ * cancel_appointment, for the person on the line (`audience`) at `phone`: only
+ * their own appointments are found (by their number, never one the model
+ * names), and none of anyone else's is touched or told of. A request not yet
+ * confirmed is cancelled at once; a confirmed booking is for staff to cancel,
+ * so the cancellation is asked for in a note on it.
+ */
+function cancelTool(desktop: () => Desktop | null, phone: () => string, audience: 'caller' | 'texter'): SessionTool {
+  const who = audience === 'caller' ? 'caller' : 'person texting';
+  const via = audience === 'caller' ? 'on a call' : 'by text';
+  return {
+    spec: {
+      name: 'cancel_appointment',
+      description: `Cancel the ${who}'s own appointment on a day (found by their number; never anyone else's). A request not yet confirmed is cancelled at once; a confirmed booking is passed to staff, who confirm the cancellation. Give time only when they have more than one that day. Then tell them the result plainly, and don't check the calendar again.`,
+      parameters: {
+        type: 'object',
+        required: ['date'],
+        properties: {
+          date: { type: 'string', description: 'YYYY-MM-DD' },
+          time: { type: 'string', description: 'HH:MM, 24-hour: only to pick one of two that day' },
+        },
+      },
+    },
+    run: async (input, signal) => {
+      const date = String(input.date ?? '').trim();
+      if (!/^\d{4}-\d{2}-\d{2}$/.test(date)) throw new Error('date is YYYY-MM-DD');
+      const time = typeof input.time === 'string' ? input.time.trim() : '';
+      const at = time ? parseClock(time) : null;
+      if (time && at === null) throw new Error('time is HH:MM, 24-hour (e.g. 10:00)');
+      const tail = numberTail(phone());
+      if (!tail) return `Their number is hidden, so their appointments can't be found: nothing was cancelled. Offer to take a message for staff.`;
+      const d = connected(desktop);
+      const { appointments } = await d.calendar(date, addDays(date, 1), signal);
+      const startOf = (a: Record<string, unknown>) => String(a.start ?? '');
+      const theirs = appointments.filter(
+        (a) => (a.status === 'requested' || a.status === 'confirmed') && startOf(a).startsWith(date) && String(a.phone ?? '').replace(/\D/g, '').endsWith(tail),
+      );
+      const picked = at === null ? theirs : theirs.filter((a) => parseClock(startOf(a).slice(11, 16)) === at);
+      const named = (a: Record<string, unknown>) => `${String(a.service ?? '') || 'appointment'} on ${sayDate(date)} at ${sayTime(startOf(a).slice(11, 16))}`;
+      if (!theirs.length) return `They have no appointment on ${sayDate(date)} (found by their number): nothing was cancelled. Tell them so, and ask which day they mean.`;
+      if (!picked.length) return `They have none at ${sayClock(at!)} on ${sayDate(date)}: theirs that day ${theirs.length === 1 ? 'is' : 'are'} ${theirs.map(named).join(' and ')}. Nothing was cancelled: ask which they mean.`;
+      if (picked.length > 1) return `They have ${picked.length} that day: ${picked.map(named).join(' and ')}. Nothing was cancelled yet: ask which, then cancel_appointment with its time.`;
+      const a = picked[0];
+      const notes = String(a.notes ?? '').trim();
+      const noted = (line: string) => [notes, line].filter(Boolean).join('\n');
+      const on = sayDate(today());
+      if (a.status === 'requested') {
+        await d.calendarUpdate(String(a.id), { status: 'cancelled', notes: noted(`Cancelled by the ${who} ${via} (${on}).`) }, signal);
+        return `Cancelled: their ${named(a)} (a request, not yet confirmed). Tell them it is cancelled. Don't check the calendar again.`;
+      }
+      // Confirmed: staff cancel it (the calendar keeps it until they do), asked for once.
+      if (!/Cancellation asked for/.test(notes)) await d.calendarUpdate(String(a.id), { notes: noted(`Cancellation asked for by the ${who} ${via} (${on}): staff to cancel it and let them know.`) }, signal);
+      return `Their ${named(a)} is confirmed, so staff cancel it: the cancellation is asked for (noted on it for the team). Tell them the team will confirm the cancellation. Don't check the calendar again.`;
+    },
+  };
+}
+
+/**
+ * A call's calendar tools: what is free, worded for the caller (a call requests its appointment through the
+ * phone), and cancel_appointment for the caller at `phone` ('' for a hidden number: nothing is found).
+ */
+export function callCalendarTools(desktop: () => Desktop | null, phone: () => string = () => ''): SessionTool[] {
+  return [freeTool(desktop, 'caller'), cancelTool(desktop, phone, 'caller')];
+}
+
+/** A text thread's calendar tools: what is free, a request for the person texting, and cancel_appointment for them. */
 export function textCalendarTools(desktop: () => Desktop | null, phone: string, name: () => string): SessionTool[] {
   return [
     freeTool(desktop, 'texter'),
@@ -172,6 +242,7 @@ export function textCalendarTools(desktop: () => Desktop | null, phone: string, 
         return `Requested: ${a.service || 'an appointment'} on ${String(a.start ?? '').replace('T', ' at ')}. Staff will confirm it; tell them so (it is not confirmed yet).`;
       },
     },
+    cancelTool(desktop, () => phone, 'texter'),
   ];
 }
 

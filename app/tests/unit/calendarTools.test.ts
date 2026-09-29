@@ -63,6 +63,13 @@ function calendarDesktop(o: { now: string; appointments?: Appt[]; hours?: Span[]
       appointments.push(made);
       return made;
     },
+    // PATCH /api/calendar/appointments/:id: the fields given.
+    calendarUpdate: async (id: string, change: Record<string, unknown>) => {
+      const a = appointments.find((x) => x.id === id);
+      if (!a) throw new Error(`no appointment ${id}`);
+      Object.assign(a, change);
+      return a;
+    },
   } as unknown as Desktop;
   return { desktop, appointments };
 }
@@ -122,6 +129,83 @@ describe("the calendar as the agent's tools", () => {
     expect(changed[0]).toEqual(['appt_2', { status: 'confirmed' }]);
     expect(out).toBe('Changed: Lawn mowing on 2026-10-01 at 10:00, confirmed.');
     await expect(calendarTools(() => null)[0].run({}, signal)).rejects.toThrow('not connected');
+  });
+});
+
+describe("cancel_appointment: the caller's own, found by their number", () => {
+  /** Lance's request on Thursday and confirmed booking on Friday; Sam's booking on Monday. */
+  const booked = () =>
+    calendarDesktop({
+      now: '2026-09-29T09:00',
+      appointments: [
+        { id: 'a1', start: '2026-10-01T10:00', minutes: 60, status: 'requested', service: 'Lawn mowing', name: 'Lance', phone: '0491570006' },
+        { id: 'a2', start: '2026-10-02T13:00', minutes: 60, status: 'confirmed', service: 'Lawn mowing', name: 'Lance', phone: '+61 491 570 006', notes: 'Side gate' },
+        { id: 'a3', start: '2026-10-05T09:00', minutes: 90, status: 'confirmed', service: 'Hedge trimming', name: 'Sam', phone: '+61411111111' },
+      ],
+    });
+  const cancel = (desktop: Desktop, phone: string) => callCalendarTools(() => desktop, () => phone)[1];
+
+  it('a request not yet confirmed is cancelled at once', async () => {
+    const { desktop, appointments } = booked();
+    const tool = cancel(desktop, '+61491570006');
+    expect(tool.spec.name).toBe('cancel_appointment');
+    expect(tool.spec.description).toContain("don't check the calendar again");
+    const out = await tool.run({ date: '2026-10-01' }, signal);
+    expect(out).toBe("Cancelled: their Lawn mowing on Thu 1 Oct at 10 am (a request, not yet confirmed). Tell them it is cancelled. Don't check the calendar again.");
+    expect(appointments[0].status).toBe('cancelled');
+    expect(appointments[0].notes).toMatch(/^Cancelled by the caller on a call \(\w{3} \d+ \w{3}\)\.$/);
+    expect(appointments.slice(1).map((a) => a.status)).toEqual(['confirmed', 'confirmed']);
+  });
+
+  it('a confirmed booking is passed to staff: the cancellation is asked for in a note on it, once', async () => {
+    const { desktop, appointments } = booked();
+    const tool = cancel(desktop, '0491 570 006');
+    const out = await tool.run({ date: '2026-10-02', time: '13:00' }, signal);
+    expect(out).toBe("Their Lawn mowing on Fri 2 Oct at 1 pm is confirmed, so staff cancel it: the cancellation is asked for (noted on it for the team). Tell them the team will confirm the cancellation. Don't check the calendar again.");
+    expect(appointments[1].status).toBe('confirmed');
+    expect(appointments[1].notes).toMatch(/^Side gate\nCancellation asked for by the caller on a call \(.+\): staff to cancel it and let them know\.$/);
+    await tool.run({ date: '2026-10-02' }, signal);
+    expect(appointments[1].notes!.match(/Cancellation asked for/g)).toHaveLength(1);
+    // The person texting has it too, for their own number.
+    const byText = textCalendarTools(() => desktop, '+61491570006', () => 'Lance')[2];
+    expect(byText.spec.name).toBe('cancel_appointment');
+    expect(byText.spec.description).toContain("person texting's own appointment");
+    expect(await byText.run({ date: '2026-10-01' }, signal)).toContain('Cancelled: their Lawn mowing on Thu 1 Oct at 10 am');
+    expect(appointments[0].notes).toMatch(/^Cancelled by the person texting by text/);
+  });
+
+  it("another person's booking is never touched or told of", async () => {
+    const { desktop, appointments } = booked();
+    const out = await cancel(desktop, '+61491570006').run({ date: '2026-10-05' }, signal);
+    expect(out).toBe('They have no appointment on Mon 5 Oct (found by their number): nothing was cancelled. Tell them so, and ask which day they mean.');
+    for (const secret of ['Sam', 'Hedge', '9 am']) expect(out).not.toContain(secret);
+    expect(appointments[2]).toMatchObject({ status: 'confirmed' });
+    expect(appointments[2].notes).toBeUndefined();
+    // A hidden number finds nothing, whatever the day (a hidden caller's key is their call's id, which has digits).
+    for (const hidden of ['', 'Private', 'call_1bdd37']) expect(await cancel(desktop, hidden).run({ date: '2026-10-01' }, signal)).toContain('Their number is hidden');
+    expect(appointments.map((a) => a.status)).toEqual(['requested', 'confirmed', 'confirmed']);
+  });
+
+  it('no match: none that day, none at that time, or two to choose from', async () => {
+    const { desktop, appointments } = calendarDesktop({
+      now: '2026-09-29T09:00',
+      appointments: [
+        { id: 'b1', start: '2026-10-01T09:00', minutes: 30, status: 'requested', service: 'Quote visit', phone: '0491570006' },
+        { id: 'b2', start: '2026-10-01T14:00', minutes: 60, status: 'confirmed', service: 'Lawn mowing', phone: '0491570006' },
+        { id: 'b3', start: '2026-10-02T10:00', minutes: 60, status: 'cancelled', service: 'Lawn mowing', phone: '0491570006' },
+      ],
+    });
+    const tool = cancel(desktop, '+61491570006');
+    expect(await tool.run({ date: '2026-10-03' }, signal)).toBe('They have no appointment on Sat 3 Oct (found by their number): nothing was cancelled. Tell them so, and ask which day they mean.');
+    // One already cancelled is not theirs to cancel again.
+    expect(await tool.run({ date: '2026-10-02' }, signal)).toContain('They have no appointment on Fri 2 Oct');
+    expect(await tool.run({ date: '2026-10-01' }, signal)).toBe('They have 2 that day: Quote visit on Thu 1 Oct at 9 am and Lawn mowing on Thu 1 Oct at 2 pm. Nothing was cancelled yet: ask which, then cancel_appointment with its time.');
+    expect(await tool.run({ date: '2026-10-01', time: '11:00' }, signal)).toBe('They have none at 11 am on Thu 1 Oct: theirs that day are Quote visit on Thu 1 Oct at 9 am and Lawn mowing on Thu 1 Oct at 2 pm. Nothing was cancelled: ask which they mean.');
+    expect(appointments.map((a) => a.status)).toEqual(['requested', 'confirmed', 'cancelled']);
+    await expect(tool.run({ date: 'Thursday' }, signal)).rejects.toThrow('date is YYYY-MM-DD');
+    // Named by its time: that one.
+    expect(await tool.run({ date: '2026-10-01', time: '9:00' }, signal)).toContain('Cancelled: their Quote visit on Thu 1 Oct at 9 am');
+    expect(appointments.map((a) => a.status)).toEqual(['cancelled', 'confirmed', 'cancelled']);
   });
 });
 
