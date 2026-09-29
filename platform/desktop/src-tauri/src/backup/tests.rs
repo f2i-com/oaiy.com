@@ -1791,3 +1791,162 @@ fn a_backup_run_is_taken_one_at_a_time() {
     drop(guard);
     assert!(state::running().is_none());
 }
+
+// ---- a hostile file must not be able to keep the check busy ----------------------------------------
+
+/// Write a file that starts like an age file and then does what `body` says.
+fn hostile_header(path: &Path, body: &[u8]) {
+    let mut bytes = b"age-encryption.org/v1\n".to_vec();
+    bytes.extend_from_slice(body);
+    fs::write(path, bytes).unwrap();
+}
+
+fn assert_refused_quickly(dst: &Path, file: &Path, what: &str) {
+    let started = std::time::Instant::now();
+    let err = restore::inspect(dst, file, PASS, &options()).unwrap_err();
+    assert!(matches!(err.kind, ErrorKind::Damaged | ErrorKind::Unsupported), "{what}: {err}");
+    assert!(started.elapsed() < std::time::Duration::from_secs(3), "{what} took {:?}: age must never be handed a header this long", started.elapsed());
+    let started = std::time::Instant::now();
+    assert!(restore::stage(dst, file, PASS, &options()).is_err(), "{what}");
+    assert!(started.elapsed() < std::time::Duration::from_secs(3), "{what} (staging) took {:?}", started.elapsed());
+    assert_nothing_staged(dst);
+}
+
+#[test]
+fn an_oversized_or_unterminated_header_is_refused_before_age_reads_it() {
+    let dst = TempDir::new("headers");
+    let file = dst.0.join("h.oaiybackup");
+    // One line that never ends, a megabyte long.
+    let mut body = b"-> scrypt ".to_vec();
+    body.extend(std::iter::repeat(b'A').take(1 << 20));
+    hostile_header(&file, &body);
+    assert_refused_quickly(&dst.0, &file, "a megabyte with no newline");
+    // A megabyte of short stanza lines that does end: what makes age's parser quadratic.
+    let mut body = Vec::new();
+    while body.len() < (1 << 20) {
+        body.extend_from_slice(b"-> x\nQUJD\n");
+    }
+    body.extend_from_slice(b"--- QUJDREVGR0hJSktMTU5PUFFSU1RVVldYWVowMTIzNDU\n");
+    hostile_header(&file, &body);
+    assert_refused_quickly(&dst.0, &file, "a megabyte of stanzas that ends properly");
+    // A terminator just past the cap.
+    let mut body = b"-> scrypt AAAAAAAAAAAAAAAAAAAAAA 8\n".to_vec();
+    body.extend(std::iter::repeat(b'A').take(container::MAX_HEADER_BYTES));
+    body.extend_from_slice(b"\n--- QUJDREVGR0hJSktMTU5PUFFSU1RVVldYWVowMTIzNDU\n");
+    hostile_header(&file, &body);
+    assert_refused_quickly(&dst.0, &file, "a terminator beyond the cap");
+    // Nothing but the version line, and not an age file at all.
+    hostile_header(&file, b"");
+    assert_refused_quickly(&dst.0, &file, "only the version line");
+    fs::write(&file, vec![b'x'; 1 << 20]).unwrap();
+    assert_refused_quickly(&dst.0, &file, "not an age file");
+    // A real header is far under the cap.
+    let src = TempDir::new("headers-src");
+    put(&src.0, "callers.json", b"{}");
+    let real = dst.0.join("real.oaiybackup");
+    make(&src.0, &real);
+    let bytes = fs::read(&real).unwrap();
+    let end = bytes.windows(5).position(|w| w == b"\n--- ").unwrap();
+    assert!(end < 300, "a passphrase header is {end} bytes");
+    assert!(end * 4 < container::MAX_HEADER_BYTES);
+    assert!(restore::inspect(&dst.0, &real, PASS, &options()).is_ok());
+}
+
+#[test]
+fn a_check_that_runs_out_of_time_is_stopped_and_leaves_nothing() {
+    let src = TempDir::new("time-src");
+    realistic(&src.0, "A");
+    let out = TempDir::new("time-out");
+    let file = out.0.join("t.oaiybackup");
+    make(&src.0, &file);
+    let dst = TempDir::new("time-dst");
+    let slow = RestoreOptions { time_limit: std::time::Duration::ZERO, ..RestoreOptions::default() };
+    assert_eq!(restore::inspect(&dst.0, &file, PASS, &slow).unwrap_err().kind, ErrorKind::Timeout);
+    assert_eq!(restore::stage(&dst.0, &file, PASS, &slow).unwrap_err().kind, ErrorKind::Timeout);
+    assert_nothing_staged(&dst.0);
+    // With time it works, and the defaults are minutes, not hours.
+    assert!(restore::inspect(&dst.0, &file, PASS, &options()).is_ok());
+    assert!(RestoreOptions::default().time_limit <= std::time::Duration::from_secs(30 * 60));
+}
+
+#[test]
+fn looking_at_a_backup_or_staging_one_waits_while_the_app_is_busy() {
+    let src = TempDir::new("busy-restore-src");
+    put(&src.0, "callers.json", b"{}");
+    let out = TempDir::new("busy-restore-out");
+    let file = out.0.join("b.oaiybackup");
+    make(&src.0, &file);
+    let dst = TempDir::new("busy-restore-dst");
+    let busy = RestoreOptions { busy: BusySignals { live_calls: 1, ..Default::default() }, ..RestoreOptions::default() };
+    assert_eq!(restore::inspect(&dst.0, &file, PASS, &busy).unwrap_err().kind, ErrorKind::Busy);
+    assert_eq!(restore::stage(&dst.0, &file, PASS, &busy).unwrap_err().kind, ErrorKind::Busy);
+    assert_nothing_staged(&dst.0);
+}
+
+#[test]
+fn scrypt_work_above_the_cap_is_refused_before_any_of_it_is_done() {
+    let src = TempDir::new("cap-src");
+    put(&src.0, "callers.json", b"{}");
+    let out = TempDir::new("cap-out");
+    let file = out.0.join("c.oaiybackup");
+    make(&src.0, &file);
+    let good = fs::read(&file).unwrap();
+    // The header says "-> scrypt <salt> 8": make it ask for more than 2^20.
+    let line_end = good.iter().position(|b| *b == b'\n').unwrap() + 1;
+    let stanza_end = good[line_end..].iter().position(|b| *b == b'\n').unwrap() + line_end;
+    assert_eq!(&good[stanza_end - 2..stanza_end], b" 8", "the test file was written at work factor 8");
+    assert_eq!(container::MAX_READ_WORK_FACTOR, 20);
+    let dst = TempDir::new("cap-dst");
+    for asked in [21u32, 22, 23, 30, 60, 99] {
+        let mut bytes = good[..stanza_end - 1].to_vec();
+        bytes.extend_from_slice(asked.to_string().as_bytes());
+        bytes.extend_from_slice(&good[stanza_end..]);
+        let bad = out.0.join("bad.oaiybackup");
+        fs::write(&bad, bytes).unwrap();
+        let started = std::time::Instant::now();
+        let err = restore::inspect(&dst.0, &bad, PASS, &options()).unwrap_err();
+        assert_eq!(err.kind, ErrorKind::Unsupported, "work factor {asked}: {err}");
+        assert!(started.elapsed() < std::time::Duration::from_secs(2), "work factor {asked} was refused only after {:?}", started.elapsed());
+    }
+    assert_nothing_staged(&dst.0);
+}
+
+#[test]
+fn the_work_factor_a_backup_is_written_with_has_a_floor_and_a_ceiling() {
+    use container::{default_work_factor, pick_work_factor, MAX_WRITE_WORK_FACTOR as MAX, MIN_WRITE_WORK_FACTOR as MIN};
+    assert_eq!((MIN, MAX), (18, 20));
+    assert!(MAX <= container::MAX_READ_WORK_FACTOR, "a file OAIY writes is one OAIY opens");
+    // A slow or busy computer times a weak factor: it is lifted to the floor.
+    for seconds in [10.0, 1.0, 0.5, 0.2, 0.1, 0.06] {
+        assert_eq!(pick_work_factor(seconds), MIN, "{seconds}");
+    }
+    // A fast one is let go higher, never past the ceiling.
+    assert_eq!(pick_work_factor(0.03), 19);
+    assert_eq!(pick_work_factor(0.015), 20);
+    for seconds in [0.005, 0.001, 0.0, -1.0] {
+        assert_eq!(pick_work_factor(seconds), MAX, "{seconds}");
+    }
+    let picked = default_work_factor();
+    assert!((MIN..=MAX).contains(&picked), "{picked}");
+}
+
+/// Run by hand (it takes a second and up to a gigabyte): a backup at the default cost writes a work
+/// factor in range, and opens.
+#[test]
+#[ignore]
+fn a_backup_at_the_default_cost_is_written_within_the_allowed_work_factors() {
+    let src = TempDir::new("default-cost-src");
+    put(&src.0, "callers.json", b"{}");
+    let out = TempDir::new("default-cost-out");
+    let file = out.0.join("d.oaiybackup");
+    {
+        let _turn = ONE_AT_A_TIME.lock().unwrap_or_else(|e| e.into_inner());
+        let o = CreateOptions::new(&src.0, &file, PASS);
+        create(&o).unwrap();
+    }
+    let bytes = fs::read(&file).unwrap();
+    let text = String::from_utf8_lossy(&bytes[..200]).to_string();
+    let factor: u8 = text.lines().nth(1).unwrap().rsplit(' ').next().unwrap().parse().unwrap();
+    assert!((18..=20).contains(&factor), "{factor}");
+    assert!(restore::inspect(&out.0, &file, PASS, &options()).is_ok());
+}

@@ -2756,6 +2756,7 @@ dependencies = [
  "reqwest 0.13.5",
  "rpassword",
  "rustls",
+ "scrypt",
  "semver",
  "serde",
  "serde_json",

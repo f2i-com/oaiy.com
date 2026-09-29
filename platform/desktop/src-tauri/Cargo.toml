@@ -190,6 +190,8 @@ zeroize = { version = "1", optional = true }
 # (https://age-encryption.org/v1), passphrase mode, so any age implementation opens it and
 # nothing here is home-made cryptography. No default features: no armor, no ssh keys, no plugins.
 age = { version = "0.11", default-features = false }
+# The same scrypt age uses, named here to time it: a backup is written at a work factor chosen here (see backup/container.rs).
+scrypt = { version = "0.11", default-features = false }
 
 # Windows-only: the job object that kills child processes when this process
 # dies, however it dies. Already in the tree transitively (tauri, tokio); named

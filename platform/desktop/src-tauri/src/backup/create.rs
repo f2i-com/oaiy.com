@@ -24,7 +24,7 @@ use super::container::{self, Cost};
 use super::manifest::{AppInfo, Counts, Entry, Manifest, VERSION};
 use super::rules::{self, Excluded};
 use super::state::{self, Phase};
-use super::{check_passphrase, free_space, hex, random_id, scratch_dir, BackupError, ErrorKind, Limits, Result, TempFolder, AGENT_ENTRY, EXTENSION};
+use super::{check_passphrase, free_space, Budget, hex, random_id, scratch_dir, BackupError, ErrorKind, Limits, Result, TempFolder, AGENT_ENTRY, EXTENSION};
 use crate::secret_file;
 
 /// Room to leave on a disk beyond what the backup needs.
@@ -253,7 +253,7 @@ fn run(opts: &CreateOptions<'_>) -> Result<CreateResult> {
         state::set_phase(Phase::Verifying, "Checking the backup: opening it again and testing every item");
         let scratch = run_dir.join("verify");
         secret_file::create_private_dir(&scratch).map_err(|e| BackupError::io("Could not make a working folder", &e))?;
-        let verified = container::open_backup(&tmp, opts.passphrase, &scratch, &opts.limits)
+        let verified = container::open_backup(&tmp, opts.passphrase, &scratch, &opts.limits, &Budget::unlimited())
             .map_err(|e| BackupError::new(ErrorKind::Verify, format!("The backup did not check out after it was written, so it was deleted: {e}")))?;
         if verified.manifest != manifest {
             return Err(BackupError::new(ErrorKind::Verify, "The backup did not check out after it was written, so it was deleted: it does not match what was meant to be in it."));

@@ -30,7 +30,7 @@ use serde::{Deserialize, Serialize};
 
 use super::manifest::Manifest;
 use super::rules::{self, Category, Excluded};
-use super::{agent, container, free_space, restore_dir, scratch_dir, sha256_file, BackupError, ErrorKind, Limits, Result, TempFolder, AGENT_ENTRY};
+use super::{agent, container, free_space, restore_dir, Budget, scratch_dir, sha256_file, BackupError, ErrorKind, Limits, Result, TempFolder, AGENT_ENTRY};
 use crate::secret_file;
 
 pub const KIND_RESTORE: &str = "restore";
@@ -46,11 +46,22 @@ const MARGIN: u64 = 32 << 20;
 pub struct RestoreOptions {
     pub limits: Limits,
     pub free_space: fn(&Path) -> u64,
+    /// How long looking at or staging a backup may take.
+    pub time_limit: std::time::Duration,
+    /// What is going on in the app now: looking at a backup asks for a second of computing and up to
+    /// a gigabyte of memory, and is not done while a call is live.
+    pub busy: super::busy::BusySignals,
 }
 
 impl Default for RestoreOptions {
     fn default() -> Self {
-        Self { limits: Limits::default(), free_space }
+        Self { limits: Limits::default(), free_space, time_limit: super::RESTORE_TIME_LIMIT, busy: super::busy::BusySignals::default() }
+    }
+}
+
+impl RestoreOptions {
+    fn budget(&self) -> Budget {
+        Budget::within(self.time_limit)
     }
 }
 
@@ -337,8 +348,9 @@ fn preview_of(data_dir: &Path, manifest: &Manifest, file_name: &str) -> Result<P
 
 /// Step 1: decrypt and check the backup, and say what restoring would do. Changes nothing.
 pub fn inspect(data_dir: &Path, file: &Path, passphrase: &str, opts: &RestoreOptions) -> Result<Preview> {
+    opts.busy.refuse_if_busy("checking a backup")?;
     let scratch = TempFolder::new(&scratch_dir(data_dir))?;
-    let verified = container::open_backup(file, passphrase, &scratch.0, &opts.limits)?;
+    let verified = container::open_backup(file, passphrase, &scratch.0, &opts.limits, &opts.budget())?;
     let name = file.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
     preview_of(data_dir, &verified.manifest, &name)
 }
@@ -348,8 +360,10 @@ pub fn inspect(data_dir: &Path, file: &Path, passphrase: &str, opts: &RestoreOpt
 /// Step 2: unpack the backup into `<data>/restore/pending-<id>/` and write the marker. Nothing
 /// live is changed.
 pub fn stage(data_dir: &Path, file: &Path, passphrase: &str, opts: &RestoreOptions) -> Result<Staged> {
+    opts.busy.refuse_if_busy("preparing a restore")?;
+    let budget = opts.budget();
     let scratch = TempFolder::new(&scratch_dir(data_dir))?;
-    let verified = container::open_backup(file, passphrase, &scratch.0, &opts.limits)?;
+    let verified = container::open_backup(file, passphrase, &scratch.0, &opts.limits, &budget)?;
     let manifest = &verified.manifest;
     let total: u64 = manifest.entries.iter().map(|e| e.size).sum();
     let plain_len = std::fs::metadata(&verified.plain).map(|m| m.len()).unwrap_or(0);
@@ -381,7 +395,7 @@ pub fn stage(data_dir: &Path, file: &Path, passphrase: &str, opts: &RestoreOptio
             } else {
                 container::safe_join(&root.join("files"), &entry.name, limits)
             }
-        })?;
+        }, &budget)?;
         let agent = manifest.entries.iter().find(|e| e.name == AGENT_ENTRY).map(|e| MarkerAgent { size: e.size, sha256: e.sha256.clone() });
         Ok(Marker {
             v: 1,
@@ -751,7 +765,7 @@ fn apply_files(data_dir: &Path, marker: &Marker, staged_root: &Path, holding: &P
     }
     let mut journal = Journal::create(journal_file).map_err(|e| format!("Could not start the restore's journal ({e})."))?;
     let mut applied = Vec::new();
-    for (index, f) in marker.files.iter().enumerate() {
+    for (_index, f) in marker.files.iter().enumerate() {
         let staged = container::safe_join(staged_root, &f.name, limits).map_err(|e| e.message)?;
         let target = data_dir.join(native(&f.name));
         let had = match target_state(data_dir, &f.name).map_err(|e| e.message)? {
@@ -767,14 +781,14 @@ fn apply_files(data_dir: &Path, marker: &Marker, staged_root: &Path, holding: &P
             secret_file::rename_over(&target, &kept).map_err(|e| format!("Could not set aside a file it replaces ({e})."))?;
         }
         #[cfg(test)]
-        inject_at(index)?;
+        inject_at(_index)?;
         if let Some(parent) = target.parent() {
             secret_file::create_private_dir(parent).map_err(|e| format!("Could not make a folder ({e})."))?;
         }
         secret_file::rename_over(&staged, &target).map_err(|e| format!("Could not put a restored file in place ({e})."))?;
         applied.push((f.name.clone(), had));
     }
-    for (position, rel) in marker.removals.iter().enumerate() {
+    for (_position, rel) in marker.removals.iter().enumerate() {
         let target = data_dir.join(native(rel));
         if !matches!(target_state(data_dir, rel).map_err(|e| e.message)?, Target::File) {
             continue;
@@ -786,7 +800,7 @@ fn apply_files(data_dir: &Path, marker: &Marker, staged_root: &Path, holding: &P
         }
         secret_file::rename_over(&target, &kept).map_err(|e| format!("Could not take away a file the restore had added ({e})."))?;
         #[cfg(test)]
-        inject_at(marker.files.len() + position)?;
+        inject_at(marker.files.len() + _position)?;
         applied.push((rel.clone(), true));
     }
     journal.line("done", "", false, false).map_err(|e| format!("Could not finish the restore's journal ({e})."))?;

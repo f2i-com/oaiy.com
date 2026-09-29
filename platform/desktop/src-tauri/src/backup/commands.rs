@@ -111,6 +111,17 @@ async fn pick_open<R: Runtime>(app: &AppHandle<R>) -> Option<PathBuf> {
     rx.await.ok().flatten().and_then(|p| p.as_path().map(Path::to_path_buf))
 }
 
+/// Wait for a check or a staging that runs on its own thread, for a little longer than it is itself
+/// allowed to run: it stops itself at its deadline, and this is the backstop that lets the panel go
+/// on if a thread is stuck somewhere it cannot look at the clock.
+async fn with_time_limit<T: Send + 'static>(work: tokio::task::JoinHandle<super::Result<T>>) -> super::Result<T> {
+    match tokio::time::timeout(super::RESTORE_TIME_LIMIT + std::time::Duration::from_secs(30), work).await {
+        Ok(Ok(result)) => result,
+        Ok(Err(_)) => Err(super::BackupError::new(super::ErrorKind::Io, "That stopped unexpectedly.")),
+        Err(_) => Err(super::BackupError::new(super::ErrorKind::Timeout, "That took too long, so it was stopped. Try again.")),
+    }
+}
+
 /// Make a backup: asks where to save it, then does it. `null` when the person closes the dialog.
 #[tauri::command]
 pub async fn backup_create<R: Runtime>(app: AppHandle<R>, webview: Webview<R>, passphrase: String, include_keys: bool) -> Result<Option<CreateResult>, String> {
@@ -162,13 +173,16 @@ pub async fn backup_restore_inspect<R: Runtime>(app: AppHandle<R>, webview: Webv
         return Err("Type the passphrase the backup was made with.".to_string());
     }
     let data_dir = data_dir_of(&app)?;
+    // Checking a backup takes a second of computing and up to a gigabyte of memory: not while a call is live.
+    let options = RestoreOptions { busy: gather_busy(&app).await, ..RestoreOptions::default() };
+    options.busy.refuse_if_busy("checking a backup").map_err(|e| e.message)?;
     let Some(path) = pick_open(&app).await else { return Ok(None) };
     let meta = std::fs::metadata(&path).map_err(|_| "That file could not be read.".to_string())?;
     let (len, modified) = (meta.len(), meta.modified().ok());
     let file = path.clone();
-    let preview = tokio::task::spawn_blocking(move || restore::inspect(&data_dir, &file, &passphrase, &RestoreOptions::default()))
+    let options = RestoreOptions { busy: gather_busy(&app).await, ..options };
+    let preview = with_time_limit(tokio::task::spawn_blocking(move || restore::inspect(&data_dir, &file, &passphrase, &options)))
         .await
-        .map_err(|_| "Checking the backup stopped unexpectedly.".to_string())?
         .map_err(|e| e.message)?;
     let id = super::random_id();
     *INSPECTED.lock().unwrap_or_else(|e| e.into_inner()) = Some(Inspected { id: id.clone(), path, len, modified });
@@ -190,9 +204,9 @@ pub async fn backup_restore_stage<R: Runtime>(app: AppHandle<R>, webview: Webvie
         }
         inspected.path.clone()
     };
-    let staged = tokio::task::spawn_blocking(move || restore::stage(&data_dir, &path, &passphrase, &RestoreOptions::default()))
+    let options = RestoreOptions { busy: gather_busy(&app).await, ..RestoreOptions::default() };
+    let staged = with_time_limit(tokio::task::spawn_blocking(move || restore::stage(&data_dir, &path, &passphrase, &options)))
         .await
-        .map_err(|_| "Preparing the restore stopped unexpectedly.".to_string())?
         .map_err(|e| e.message)?;
     *INSPECTED.lock().unwrap_or_else(|e| e.into_inner()) = None;
     Ok(staged)

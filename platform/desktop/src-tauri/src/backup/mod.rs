@@ -87,6 +87,35 @@ impl Default for Limits {
     }
 }
 
+/// How long a check or a staging may run: a hostile file must not be able to keep it busy for ever.
+/// Checked between the pieces of every loop that reads or writes a backup.
+#[derive(Clone, Copy, Debug)]
+pub struct Budget {
+    deadline: Option<std::time::Instant>,
+}
+
+impl Budget {
+    /// No limit (a backup being made, which has its own bounds).
+    pub const fn unlimited() -> Self {
+        Self { deadline: None }
+    }
+
+    /// Stop after `limit` from now.
+    pub fn within(limit: std::time::Duration) -> Self {
+        Self { deadline: Some(std::time::Instant::now() + limit) }
+    }
+
+    pub(crate) fn check(&self) -> Result<()> {
+        match self.deadline {
+            Some(t) if std::time::Instant::now() >= t => Err(BackupError::new(ErrorKind::Timeout, "That took too long, so it was stopped. Try again.")),
+            _ => Ok(()),
+        }
+    }
+}
+
+/// The longest an inspect or a staging is let run.
+pub const RESTORE_TIME_LIMIT: std::time::Duration = std::time::Duration::from_secs(15 * 60);
+
 /// Why something failed, so a caller can tell a wrong passphrase from a busy app.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ErrorKind {
@@ -113,6 +142,8 @@ pub enum ErrorKind {
     Conflict,
     /// The check made after writing failed.
     Verify,
+    /// It took longer than it is allowed to, and was stopped.
+    Timeout,
 }
 
 /// A failure with a message a person can read: never a passphrase, never a file's contents.
