@@ -1,5 +1,9 @@
 # Long-context selection optimization (2026-09-22)
 
+> **Historical.** A dated work record of one optimisation in `dsv41::attention`, with the
+> checks run that day. It is kept for its history and is not kept up to date. The
+> DeepSeek port is documented in [DEEPSEEK_V41.md](../DEEPSEEK_V41.md).
+
 `dsv41::attention` now partitions scores to select top-k rather than fully
 sorting every index. It preserves the original descending `f32::total_cmp`
 comparison and lower-index tie break, including NaNs, infinities and signed zero.

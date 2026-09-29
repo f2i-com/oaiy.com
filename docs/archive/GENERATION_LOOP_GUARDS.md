@@ -1,5 +1,10 @@
 # Generation loop guard update (2026-09-23)
 
+> **Historical.** A dated work record of one change to the language-model server's
+> repetition guards, with the checks run that day. It is kept for its history and is not
+> kept up to date: the code in `crates/oaiy-llm-server` is the reference. The engines'
+> documentation is [ENGINES.md](../ENGINES.md).
+
 A coder-cli transcript showed long repeated plans which escaped the previous
 four-identical-block guard (48-256 tokens per block). The server now checks:
 

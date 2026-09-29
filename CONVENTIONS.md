@@ -50,7 +50,8 @@ crates (`oaiy-engine`, `oaiy-llm-cli`, `oaiy-llm-server`, `oaiy-image`, `dsv41`,
   don't leave dead-code noise behind.
 - `cargo test --workspace` passes. Tests you add use `std::env::temp_dir()` and clean
   up after themselves.
-- A change to the DeepSeek path also passes its golden gates (README, "Testing").
+- A change to the DeepSeek path also passes its golden gates
+  ([docs/ENGINES.md](docs/ENGINES.md#testing), "Testing").
 
 ## The tray app
 

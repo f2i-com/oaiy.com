@@ -1,5 +1,9 @@
 # Thinking sections during an answer (2026-09-23)
 
+> **Historical.** A dated work record of one change to how the language-model server
+> reads thinking markers, with the checks run that day. It is kept for its history and is
+> not kept up to date. The engines' documentation is [ENGINES.md](../ENGINES.md).
+
 Requested behavior: allow the model to write, reopen thinking, then continue
 writing. Do not reject later thinking sections merely because an earlier one
 closed. Ternary reasoning and original 4-bit tool arguments remain unchanged.

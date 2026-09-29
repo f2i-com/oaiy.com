@@ -88,7 +88,7 @@ the person talks to), in a conversation of its own:
 - **Remembering the caller.** `remember` saves their name and short facts
   (what they usually book, where the job is). The note is shared by their
   calls and texts (numbers agree by their last nine digits), and the phone
-  greets them by name next time ("Hi Lance! Thanks for calling…").
+  greets them by name next time ("Hi Olivia! Thanks for calling…").
 - **Looking back.** `earlier_conversations` searches that person's own
   earlier calls and texts, never anyone else's.
 - **Direction.** Every reply goes by the Front desk's `/brief.md`; the

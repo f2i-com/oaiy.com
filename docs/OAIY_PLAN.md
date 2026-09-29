@@ -214,7 +214,7 @@ Tried on the Pixel 9a test phone, on the dongle, with the Qwen 27B model on this
 - **A plugin's `flow.run` returned no result** until 28 Sept: the host reserved an async run and
   answered `{runId, status}`, so Aokie's lookups always read "LOOKUP UNAVAILABLE". It now waits
   within the plugin's budget, and `business-lookup` is answered by the calendar.
-- **Names on calls are misheard** by speech-to-text ("Lanes" for "Lance"). The appointment
+- **Names on calls are misheard** by speech-to-text ("Lynn" for "Lin"). The appointment
   request records what was heard.
 
 - `llama-rs` tests do not compile without CUDA (`cuda_backend` in `glm5next/device.rs` is

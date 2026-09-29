@@ -1,5 +1,12 @@
 # OAIY — System Plan
 
+> **Historical.** This was the engine's system plan and phase log, `PLAN.md` at the
+> repository root, from before the engines, the agent and the previous OAIY were joined
+> into one app; its phase log ends on 19 September 2026. It is kept for its history and
+> is no longer kept up to date. The letters in its first line spell the engine's name
+> before the rename (NROB). For the engines today, see [ENGINES.md](../ENGINES.md) and
+> [STUDIO.md](../STUDIO.md); for OAIY as a whole, [the plan](../OAIY_PLAN.md).
+
 **OAIY** (**N**VMe · **R**AM · **O**n-GPU · **B**roker) is a Rust inference engine
 for models far bigger than VRAM, on consumer hardware. The weights stay on disk in the
 files they were published in, **GGUF** or **safetensors**, with no conversion step

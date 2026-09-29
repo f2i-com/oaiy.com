@@ -341,7 +341,7 @@ at the same speed.
 
 ```
 crates/
-  oaiy/          core library (std-only): expert-store seam, LFRU RAM expert cache,
+  oaiy-engine/   core library (std-only): expert-store seam, LFRU RAM expert cache,
                  thread pool, JSON reader
   oaiy-llm-cli/      `oaiy-llm` binary: run / chat / bench / info / tokenize for GGUF models
   dsv41/         DeepSeek-V4.1 from safetensors: in-place expert store, CPU reference
@@ -353,21 +353,27 @@ crates/
   oaiy-llm-server/   OpenAI-compatible HTTP server for DeepSeek-V4.1 (std-only)
   oaiy-studio/   portable host (std-only): supervises oaiy-llm-server and oaiy-media,
                  control UI, configurable OpenAI-style gateway, model detection
-  oaiy-media/ image, video, speech, music, sound and 3D worker (Candle): Qwen Image,
+  oaiy-studio-tray/  the same host as a Windows notification-area app
+  oaiy-media/    image, video, speech, music, sound and 3D worker (Candle): Qwen Image,
                  SDXL, LTX, Qwen3-TTS, Breeze TTS 2, MiniMax Music 3,
                  MOSS-SoundEffect, Pixal3D, BiRefNet, Real-ESRGAN, with
                  SSD/RAM/GPU block residency
+  oaiy-tts/      streaming Qwen3-TTS (Candle), shared with oaiy-media's speech
+  oaiy-voice/    the resident speech server for calls: Parakeet speech-to-text and
+                 Qwen3-TTS, served as OAIY Voice
   ggml-rs-wgpu/  WebGPU backend: quantized GGUF matmuls in WGSL, the rest on the CPU
   gguf, ggml-quants, ggml-rs, ggml-rs-cuda, tokenizer, llama-rs
                  our pure-Rust GGUF stack: reader, quant kernels, CPU and CUDA
                  backends, tokenizers, model architectures, expert streaming
 tools/dsv41/     Python oracle (the reference model, streamed) and helpers
-docs/            DEEPSEEK_V41.md (the port), ROADMAP.md (streaming roadmap)
+docs/            DEEPSEEK_V41.md (the port), ROADMAP.md (streaming roadmap), and the
+                 rest (see docs/README.md)
 ```
 
-`PLAN.md` is the system plan and phase log; `CONVENTIONS.md` is the engineering contract
-(std-only rules, naming, error handling); `crates/VENDORED.md` documents where the GGUF
-stack comes from.
+[`CONVENTIONS.md`](../CONVENTIONS.md) is the engineering contract (std-only rules,
+naming, error handling); [`crates/VENDORED.md`](../crates/VENDORED.md) documents where
+the GGUF stack comes from. The engine's plan and phase log up to September 2026 is in
+the [archive](archive/ENGINE_PLAN.md).
 
 ## Testing
 

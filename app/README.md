@@ -2,6 +2,11 @@
 
 A coding agent that runs entirely in your browser.
 
+> In OAIY this app is the **Agent**: OAIY Desktop shows it as the Agent page, where it
+> also answers the phone (the Front desk) and sets OAIY up. See the
+> [repository's README](../README.md), [the AI Receptionist](../docs/RECEPTIONIST.md) and
+> [the Agent's control of OAIY](../docs/AGENT_CONTROL.md). This page covers the app itself.
+
 - **Your projects stay in the browser.** Files live in the browser's private file system (OPFS). Open a folder from disk, import a `.zip`, export one back, or start from scratch. Everything works offline once the page has loaded (it installs as an app).
 - **AI-written code runs on the [Zipp](https://github.com/f2i-com/zipp.org) VM.** JavaScript and Python run in Zipp's WebAssembly engine inside a Web Worker. The code can reach the project and nothing else, except what the network gate lets through.
 - **A shell, emulated.** The terminal and the agent's `sandbox_shell` are a bash-like shell written in JavaScript on the same sandbox, with `git`, `jq`, `tar`/`zip`, `node` and `python` built in (see [The shell](#the-shell)). There are no real processes, so `npm install` and compilers don't exist here.

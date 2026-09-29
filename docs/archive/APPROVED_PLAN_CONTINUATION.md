@@ -1,5 +1,9 @@
 # Approved-plan continuation and repeated answer prose (2026-09-23)
 
+> **Historical.** A dated work record: one debugging session of the DeepSeek server with
+> an external coding client, and how it was checked. It is kept for its history and is
+> not kept up to date. The engines' documentation is [ENGINES.md](../ENGINES.md).
+
 The reported Enigma session produced a plan, accepted approval, then guessed
 rotor wiring in reasoning and repeatedly promised to inspect the workspace in
 answer text. No tool was dispatched. This is generation failing to make progress,

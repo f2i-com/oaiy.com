@@ -1,5 +1,10 @@
 # OAIY streaming and token-speed improvement roadmap
 
+> **Historical.** A design review of the engine from August 2026, with a status note of
+> 19 September. It is not kept up to date, and it stays at this path because code comments
+> refer to its phases (`docs/ROADMAP.md` Phase 0 to 3). For the engines today, see
+> [ENGINES.md](ENGINES.md) and [DEEPSEEK_V41.md](DEEPSEEK_V41.md).
+
 **Repository:** [`f2i-com/oaiy`](https://github.com/f2i-com/oaiy)  
 **Reviewed revision:** [`1bea44aa0ea01061a1b593c6c58644f68fa7a856`](https://github.com/f2i-com/oaiy/tree/1bea44aa0ea01061a1b593c6c58644f68fa7a856)  
 **Review date:** 2026-08-03  

@@ -7,14 +7,19 @@ device plugins into one workspace. Use a local model, an API provider or your
 ChatGPT account through Codex. Run flows in the browser or through OAIY Desktop,
 and connect apps such as FormLogic to the runtime on your own machine.
 
+> This folder is the part of OAIY that holds OAIY Desktop, the flow editor, the CLI,
+> the bridge protocol and the optional PHP API. For OAIY as a whole (the Agent, the AI
+> Receptionist and the engines too), see the [repository's README](../README.md) and
+> the [documentation index](../docs/README.md).
+
 [Desktop setup](#set-up-your-ai) · [FormLogic and Aokie](#connect-formlogic-and-aokie) ·
 [Develop locally](#quick-start) · [CLI guide](cli/README.md) ·
 [Bridge protocol](protocol/README.md)
 
-![OAIY Desktop overview showing the setup guide, a running Aokie plugin and local runtime status](docs/images/desktop-overview.png)
+![The flow editor in OAIY's window: a flow that cuts out a job photo, upscales it and writes a caption, beside the node palette](../docs/images/flows.png)
 
-*The running desktop workspace. Overview brings setup, service health, plugins
-and connected apps together.*
+*The flow editor in OAIY Desktop, with the engine's models as typed nodes. From a demo
+setup: the business and its flow are made up.*
 
 ## What you can do
 
@@ -32,27 +37,24 @@ and connected apps together.*
 
 ## Set up your AI
 
-Open **Overview** in OAIY Desktop and follow the setup guide: **Runtime → Your
-AI → Plugins → FormLogic**. It derives progress from the current runtime and
-configuration; plugins and app connections are optional.
+On a new desktop the setup wizard opens by itself and asks only for the essentials:
+**Your AI** (the language model chosen in OAIY's engines, or your ChatGPT account) and
+**The Agent** (whether it may set up and change OAIY for you). Then **Continue with the
+Agent** sets up the rest with you in a chat, or **Set up the rest myself** goes on step
+by step: plugins, their own setup, and connecting an app. See
+[Setting up OAIY](../docs/SETUP.md).
 
-![The OAIY setup wizard with Codex, provider API key and local model choices](docs/images/ai-setup.png)
-
-*The actual setup wizard with Local model selected. Choose the connection that
-fits your existing setup.*
+![The setup wizard's Your AI step: the language model on this computer, or ChatGPT](../docs/images/setup-ai.png)
 
 | Connection | How to set it up |
 |---|---|
-| **Codex / ChatGPT** | Select this option and use **Sign in with ChatGPT**. The wizard links to the Codex CLI installation guide if the CLI is missing. OAIY manages a separate Codex session; the CLI owns sign-in and credentials. Your eligible account's limits apply. |
-| **Provider API key** | Open **Providers → Add provider**, choose the protocol, enter the endpoint, model and key, then use **Test**. Provider keys are stored on the desktop and injected into outbound requests by its gateway. Provider charges may apply. |
-| **Local model** | Open **Engines** to add a model to OAIY's own engine, then select it in your flow or connected app. A model server you already run (Ollama, LM Studio, any OpenAI-compatible endpoint) can be added in **Providers**. |
+| **Codex / ChatGPT** | Choose ChatGPT in the wizard, or **Sign in with ChatGPT** in **Connections → AI providers**. OAIY needs the Codex CLI and links to its installation guide if it is missing. OAIY manages a separate Codex session; the CLI owns sign-in and credentials. Your eligible account's limits apply. |
+| **Provider API key** | Open **Connections → AI providers → Add provider**, choose the protocol, enter the endpoint, model and key, then use **Test**. Provider keys are stored on the desktop and injected into outbound requests by its gateway. Provider charges may apply. |
+| **Local model** | Open **Engines** to add a model to OAIY's own engine, then select it in your flow or connected app. A model server you already run (Ollama, LM Studio, any OpenAI-compatible endpoint) can be added in **AI providers**. |
 
-![The Providers screen with the ChatGPT sign-in option and a configured local Qwen model](docs/images/ai-providers.png)
+![Connections → AI providers: sign in with ChatGPT, or add a provider](../docs/images/providers.png)
 
-*A real local configuration using Qwen3.5 9B Q4. The model and endpoint shown are
-an example from the development machine, not a required model or bundled
-download. All screenshots were captured from the running app with live API
-responses; no mock data was substituted.*
+*From a demo setup, with nothing configured yet.*
 
 Use **Test** to check a provider's actual response after configuring it. A saved
 provider or green setup check is not a substitute for an inference test.
@@ -72,19 +74,19 @@ through the [OAIY Bridge protocol](protocol/README.md).
    account** as well. Approval happens in the provider's browser page; OAIY
    receives a scoped key. This account link is separate from granting a browser
    access to the local runtime.
-4. For phone features, install the Aokie plugin through **Plugins**, start it and
-   open **AI Receptionist**. Its setup guides you through the phone connection
-   and speech, model and voice providers.
+4. For phone features, install the Aokie plugin in **Connections → Plugins** (or ask
+   the Agent to). Its setup wizard takes you through consent, hearing and speaking,
+   pairing the phone, your business's hours and services, and answering calls and
+   texts with OAIY. Then **AI Receptionist** in the sidebar has the Phone, Calendar,
+   Contacts and Hours & Services. See [the AI Receptionist](../docs/RECEPTIONIST.md).
 5. In FormLogic, configure the Aokie app's forms and event-to-flow bindings.
    Plugin events can trigger those linked flows, and the configured app records
-   calls, transcripts and appointments in its workspace. Inspect **Runs** and
-   plugin logs in OAIY when a step needs attention.
+   calls, transcripts and appointments in its workspace. Inspect **Flows → Run
+   history** and plugin logs in OAIY when a step needs attention.
 
-Aokie's phone features need compatible phone hardware and configured speech
-services. Its local speech pipeline can combine separate STT, LLM and TTS
-services. OAIY's provider gateway currently exposes chat completions; it does
-not provide a realtime WebSocket proxy. Provider choices report the host's
-supported capabilities.
+Calls are heard and spoken by OAIY Voice (Parakeet and Qwen3-TTS on the GPU) and
+answered by the Agent; see [Phone calls](../docs/CALLS.md). Aokie's own speech
+services remain installable in **Services**.
 
 Review or revoke app access in **Connections**. Linked flows run with the
 permissions granted to their account and plugin; install and approve only the
