@@ -916,3 +916,15 @@ fn times_from_both_sides_compare() {
     assert!(when("2026-09-28 09:21:46") < when("2026-09-28T09:21:47Z"));
     assert!(when("nonsense").is_none());
 }
+
+#[test]
+fn a_busy_formlogic_is_tried_again_when_it_said() {
+    let busy = |asked| Failure::Busy("busy".into(), asked);
+    assert_eq!(retry_wait(&busy(Some(Duration::from_secs(58))), 3), Duration::from_secs(58));
+    // Not said: half a minute, and a busy answer never grows the back-off.
+    assert_eq!(retry_wait(&busy(None), 7), Duration::from_secs(30));
+    // "Now" is not taken literally: a few seconds at least.
+    assert_eq!(retry_wait(&busy(Some(Duration::ZERO)), 1), Duration::from_secs(5));
+    // Anything else backs off as before.
+    assert_eq!(retry_wait(&Failure::Offline("away".into()), 1), backoff(1));
+}

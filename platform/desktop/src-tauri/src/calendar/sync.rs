@@ -472,13 +472,12 @@ fn run_once(cal: &Calendar, link: &LinkHandle) {
         Err(fail) => {
             r.failures += 1;
             r.failed_at = Some(at);
-            // Busy is not a failure to back off from: it is tried again in half a minute.
-            let wait = if matches!(fail, Failure::Busy(_)) { std::time::Duration::from_secs(30) } else { backoff(r.failures) };
+            let wait = retry_wait(&fail, r.failures);
             r.next_at = Some(Instant::now() + wait);
             r.next_at_wall = Some(at + chrono::Duration::from_std(wait).unwrap_or_default());
             let (state, message) = match fail {
                 Failure::Offline(m) => ("offline", m),
-                Failure::Busy(m) => ("busy", m),
+                Failure::Busy(m, _) => ("busy", m),
                 Failure::Refused(m) | Failure::Local(m) => ("error", m),
                 Failure::FormGone => ("error", "FormLogic's appointments form has gone".to_string()),
             };
@@ -493,6 +492,16 @@ fn run_once(cal: &Calendar, link: &LinkHandle) {
     r.report.next_attempt_at = r.next_at_wall.map(|t| t.to_rfc3339_opts(chrono::SecondsFormat::Secs, true));
     r.runs += 1;
     WAKE.notify_all();
+}
+
+/// How long to wait before the next try after `fail`. Busy is not a failure to
+/// back off from: it is tried again when FormLogic said (its Retry-After, at
+/// least a few seconds), or in half a minute when it did not say.
+fn retry_wait(fail: &Failure, failures: u32) -> Duration {
+    match fail {
+        Failure::Busy(_, asked) => asked.map(|d| d.max(Duration::from_secs(5))).unwrap_or(Duration::from_secs(30)),
+        _ => backoff(failures),
+    }
 }
 
 /// The wait after `failures` failed tries in a row: a minute, doubling, at most ten.
@@ -513,8 +522,9 @@ fn waiting_requests() -> HashSet<String> {
 pub(crate) enum Failure {
     /// FormLogic could not be reached, or is not answering properly: tried again later.
     Offline(String),
-    /// FormLogic answered, asking for fewer requests (429): tried again shortly, and not called offline.
-    Busy(String),
+    /// FormLogic answered, asking for fewer requests (429): tried again when it
+    /// said (its Retry-After, when it gave one), and not called offline.
+    Busy(String, Option<Duration>),
     /// It answered and refused (a revoked key, no appointments form).
     Refused(String),
     /// The appointments form is not there any more.
@@ -556,10 +566,12 @@ impl Api {
         }
         let resp = req.send().map_err(|e| Failure::Offline(crate::link::net::unreachable(&e)))?;
         let status = resp.status().as_u16();
+        // Read before the body is: how long FormLogic asks to be left, on a 429.
+        let asked = if status == 429 { crate::link::net::retry_after(resp.headers()) } else { None };
         let body: Value = resp.json().unwrap_or(Value::Null);
         match status {
             401 | 403 => Err(Failure::Refused(format!("FormLogic no longer accepts this desktop's key ({}): link it again", said(&body, status)))),
-            429 => Err(Failure::Busy("FormLogic asked for fewer requests: syncing again shortly".into())),
+            429 => Err(Failure::Busy("FormLogic asked for fewer requests: syncing again shortly".into(), asked)),
             408 | 500..=599 => Err(Failure::Offline(format!("FormLogic is not answering properly (HTTP {status})"))),
             _ => Ok(Reply { status, body }),
         }
