@@ -33,9 +33,10 @@
 //! on loopback.)
 
 use std::path::PathBuf;
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, OnceLock};
 
 use oaiy_desktop_lib::http::{self, DesktopConfig, ConfigProvider};
+use oaiy_desktop_lib::plugins::PluginHost;
 use oaiy_desktop_lib::services::catalog::CatalogHandle;
 use oaiy_desktop_lib::services::downloads::{Downloads, DownloadsHandle};
 use oaiy_desktop_lib::services::python::{Python, PythonHandle};
@@ -275,23 +276,19 @@ async fn main() {
         });
     }
 
-    // Clean shutdown: stop every running service on SIGTERM / Ctrl-C.
+    // Clean shutdown: stop the plugins and every running service on SIGTERM / Ctrl-C.
+    //
+    // The plugin host does not exist yet (it is built with the bridge state, below),
+    // and the signal is worth hearing from the start, so the task reads it from this
+    // slot when the signal comes. Empty means nothing was started to stop.
+    let plugin_host: Arc<OnceLock<Arc<PluginHost>>> = Arc::default();
     {
         let registry = registry.clone();
+        let plugin_host = plugin_host.clone();
         tokio::spawn(async move {
             shutdown_signal().await;
-            log::info!("oaiy-server: shutting down — stopping all services");
-            // The warm script host exits on a line (bounded, then killed);
-            // done on a blocking thread because it waits on a child.
-            let _ = tokio::task::spawn_blocking(|| {
-                oaiy_desktop_lib::bridge::ScriptHost::global().shutdown()
-            })
-            .await;
-            // Recover from a poisoned mutex: stopping services on exit matters more
-            // than poison-safety — `if let Ok` would silently skip it and orphan every
-            // running service (venv-python / OAIY Voice / multi-GB loaders).
-            let mut r = registry.lock().unwrap_or_else(|e| e.into_inner());
-            r.stop_all();
+            log::info!("oaiy-server: shutting down — stopping plugins and all services");
+            stop_children(registry, plugin_host.get().cloned()).await;
             std::process::exit(0);
         });
     }
@@ -319,6 +316,8 @@ async fn main() {
         oaiy_desktop_lib::stable_device_id(&data_dir),
         Some(node_runtime.clone()),
     );
+    // Now the shutdown above has plugins to stop (they start at boot, on the host's own thread).
+    let _ = plugin_host.set(bridge.host.clone());
     // AI provider store under <data>/ai (holds provider API keys plaintext,
     // guarded by the full/public split — never over the wire).
     let ai_providers = oaiy_desktop_lib::ai::open_handle(data_dir.join("ai").join("providers.json"));
@@ -402,6 +401,7 @@ async fn main() {
     }
 
     // gui_mode = false: headless server is token-strict (no webview origin).
+    let registry_for_exit = registry.clone();
     if let Err(e) = http::serve(
         port,
         bind_all, config, auth_token, false, registry, downloads, python, catalog, bridge,
@@ -410,6 +410,34 @@ async fn main() {
     .await
     {
         eprintln!("oaiy-server: HTTP server error: {e}");
+        // A port that is in use is found only here, when serve binds it, after the plugins
+        // and the services ticked "start with the app" are already running.
+        stop_children(registry_for_exit, plugin_host.get().cloned()).await;
         std::process::exit(1);
     }
+}
+
+/// Stop what this process started, in the order the app does on quit: the warm script host
+/// first (one Node child, which exits on a line), then the plugins (lighter to stop than
+/// model servers, and one holding hardware should get its graceful shutdown before anything
+/// slow runs), then the services.
+///
+/// Every exit this server makes on purpose comes through here. A plugin left running after
+/// its server has gone keeps its hardware and its port, and on unix nothing else stops it
+/// (a plugin no longer shares this process's group, so a Ctrl-C at the terminal does not reach it).
+async fn stop_children(registry: RegistryHandle, plugins: Option<Arc<PluginHost>>) {
+    // On a blocking thread: each of these waits on a child, and a plugin gets up to
+    // its grace period to answer the request to stop.
+    let _ = tokio::task::spawn_blocking(move || {
+        oaiy_desktop_lib::bridge::ScriptHost::global().shutdown();
+        if let Some(host) = plugins {
+            host.stop_all();
+        }
+    })
+    .await;
+    // Recover from a poisoned mutex: stopping services on exit matters more
+    // than poison-safety — `if let Ok` would silently skip it and orphan every
+    // running service (venv-python / OAIY Voice / multi-GB loaders).
+    let mut r = registry.lock().unwrap_or_else(|e| e.into_inner());
+    r.stop_all();
 }

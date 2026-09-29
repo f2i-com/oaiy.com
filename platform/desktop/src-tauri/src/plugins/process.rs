@@ -191,6 +191,19 @@ impl PluginProcess {
             use std::os::windows::process::CommandExt;
             cmd.creation_flags(0x0800_0000); // CREATE_NO_WINDOW
         }
+        // On unix a plugin leads a process group of its own, as a managed service
+        // does (services/runner.rs). `kill` signals the group to take a plugin's
+        // helpers with it (`kill_process_tree` sends to the negative pid), and a
+        // plugin that shared this process's group had no group of its own to
+        // signal: the shim's real binary survived a stop. The other consequence
+        // is that a Ctrl-C at this process's terminal no longer reaches the
+        // plugin directly, so stopping plugins is the shutdown path's job (the
+        // app's exit and oaiy-server's both do it).
+        #[cfg(unix)]
+        {
+            use std::os::unix::process::CommandExt;
+            cmd.process_group(0);
+        }
 
         let mut child = cmd
             .spawn()
@@ -533,7 +546,9 @@ impl PluginProcess {
                 // inherited pipe handles. Proven twice in this repo's own test
                 // runs: a killed test plugin's node grandchild survived and held
                 // a pipeline open past a ten-minute timeout. services/registry
-                // learned this lesson first; reuse its taskkill machinery.
+                // learned this lesson first; reuse its taskkill machinery (on
+                // unix, its group kill, which reaches the plugin's helpers
+                // because `spawn` gave the plugin a process group of its own).
                 crate::services::registry::kill_process_tree(child.id());
                 let _ = child.kill();
                 let _ = child.wait();
@@ -1140,6 +1155,142 @@ process.stdin.on("data", (chunk) => {
             );
             assert!(!env.contains_key("OPENAI_API_KEY"));
             assert!(env.contains_key("OAIY_PLUGIN_ID"));
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // Unix: a plugin leads a process group of its own, so stopping it takes its
+    // helpers too. Against a real child (a shell script standing in for a shim
+    // that launches the real binary), and Linux-only because it reads /proc.
+    #[cfg(target_os = "linux")]
+    mod process_group {
+        use super::super::*;
+        use std::fs;
+        use std::os::unix::fs::PermissionsExt;
+        use std::path::{Path, PathBuf};
+        use std::time::Instant;
+
+        /// Starts a helper of its own, then reads its stdin until it closes and
+        /// sleeps on, so nothing but a kill ends it.
+        const PLUGIN_SH: &str = r#"#!/bin/sh
+sleep 300 &
+echo $! > "$OAIY_PLUGIN_DATA_DIR/helper.pid"
+echo $$ > "$OAIY_PLUGIN_DATA_DIR/plugin.pid"
+while IFS= read -r line; do :; done
+sleep 300
+"#;
+
+        /// <root>/plugins/fake, with the layout a real install has (its data folder is
+        /// <root>/plugin-data/fake), removed on drop.
+        struct Fixture {
+            root: PathBuf,
+            dir: PathBuf,
+            manifest: PluginManifest,
+        }
+
+        impl Fixture {
+            fn new() -> Self {
+                use std::sync::atomic::{AtomicU32, Ordering};
+                static N: AtomicU32 = AtomicU32::new(0);
+                let root = std::env::temp_dir()
+                    .join(format!("oaiy-plugpgrp-{}-{}", std::process::id(), N.fetch_add(1, Ordering::Relaxed)));
+                let _ = fs::remove_dir_all(&root);
+                let dir = root.join("plugins").join("fake");
+                fs::create_dir_all(&dir).unwrap();
+                fs::write(dir.join("plugin.sh"), PLUGIN_SH).unwrap();
+                fs::set_permissions(dir.join("plugin.sh"), fs::Permissions::from_mode(0o755)).unwrap();
+                fs::write(
+                    dir.join("manifest.json"),
+                    serde_json::json!({
+                        "schemaVersion": 3, "id": "fake", "name": "Fake plugin", "version": "0.0.1",
+                        "pluginApiVersion": 1,
+                        "entry": { "kind": "process", "command": "plugin.sh" },
+                        "capabilities": ["oaiy.flow.run"], "connectors": [], "events": [],
+                    })
+                    .to_string(),
+                )
+                .unwrap();
+                let manifest = PluginManifest::load(&dir).unwrap();
+                Self { root, dir, manifest }
+            }
+
+            fn spawn(&self) -> PluginProcess {
+                PluginProcess::spawn(
+                    &self.manifest,
+                    &self.dir,
+                    SpawnOptions {
+                        desktop_version: "0.1.0".into(),
+                        dev_mode: false,
+                        events: Arc::new(|_name, _payload| {}),
+                        requests: Arc::new(|_method, _params| Ok(serde_json::json!({}))),
+                    },
+                )
+                .expect("spawn the plugin")
+            }
+
+            /// A pid the plugin wrote into its data folder, once it has.
+            fn pid(&self, name: &str) -> u32 {
+                let file = plugin_data_dir(&self.dir).join(name);
+                let deadline = Instant::now() + Duration::from_secs(10);
+                loop {
+                    if let Some(pid) = fs::read_to_string(&file).ok().and_then(|t| t.trim().parse().ok()) {
+                        return pid;
+                    }
+                    assert!(Instant::now() < deadline, "the plugin never wrote {name}");
+                    thread::sleep(Duration::from_millis(20));
+                }
+            }
+        }
+
+        impl Drop for Fixture {
+            fn drop(&mut self) {
+                let _ = fs::remove_dir_all(&self.root);
+            }
+        }
+
+        /// Field `index` of /proc/<pid>/stat, counted as `proc(5)` does (state is 3, the
+        /// process group 5): the command in field 2 is in brackets and may hold spaces.
+        fn stat_field(pid: u32, index: usize) -> Option<String> {
+            let stat = fs::read_to_string(Path::new("/proc").join(pid.to_string()).join("stat")).ok()?;
+            let after_command = stat.rsplit_once(')')?.1;
+            after_command.split_whitespace().nth(index - 3).map(str::to_string)
+        }
+
+        /// Running, or as good as gone? A zombie only waits to be reaped.
+        fn alive(pid: u32) -> bool {
+            stat_field(pid, 3).is_some_and(|state| state != "Z")
+        }
+
+        #[test]
+        fn a_plugin_leads_its_own_process_group_and_its_helpers_join_it() {
+            let f = Fixture::new();
+            let p = f.spawn();
+            let (plugin, helper) = (f.pid("plugin.pid"), f.pid("helper.pid"));
+            assert_eq!(plugin, p.pid);
+
+            let ours = stat_field(std::process::id(), 5).expect("this process's group");
+            let group = |pid| stat_field(pid, 5).unwrap_or_else(|| panic!("pid {pid} is gone"));
+            assert_eq!(group(plugin), plugin.to_string(), "the plugin leads a group of its own");
+            assert_ne!(group(plugin), ours, "and it is not this process's group");
+            assert_eq!(group(helper), plugin.to_string(), "a helper the plugin starts joins the plugin's group");
+            p.kill();
+        }
+
+        #[test]
+        fn killing_a_plugin_takes_the_helpers_it_started_with_it() {
+            let f = Fixture::new();
+            let p = f.spawn();
+            let (plugin, helper) = (f.pid("plugin.pid"), f.pid("helper.pid"));
+            assert!(alive(plugin) && alive(helper), "both run before the kill");
+
+            p.kill();
+            assert!(!alive(plugin), "the plugin itself is gone at once");
+            // The group is signalled by a detached shell, so give it a moment.
+            let deadline = Instant::now() + Duration::from_secs(10);
+            while alive(helper) && Instant::now() < deadline {
+                thread::sleep(Duration::from_millis(50));
+            }
+            assert!(!alive(helper), "the helper the plugin started outlived the plugin");
         }
     }
 }

@@ -1,8 +1,8 @@
 //! The headless `oaiy-server`, run as the program it is.
 //!
-//! What the unit tests cannot reach is what `main` does with its environment. On this build
-//! `OAIY_ENGINES_UI` was recorded there and the AI gateway ignored it, which no test of the
-//! gateway's routes could see.
+//! What the unit tests cannot reach is what `main` does with its environment and its signals. On
+//! this build `OAIY_ENGINES_UI` was recorded there and the AI gateway ignored it, which no test of
+//! the gateway's routes could see, and a server that was stopped left its plugins running.
 //!
 //! Each test starts its own server on a port the system picks, with a data folder, home folder
 //! and environment of its own, and the voice gateway (a fixed port) switched off, so it can never
@@ -47,9 +47,17 @@ struct Server {
 }
 
 impl Server {
+    /// Start it on a port the system picks, and wait until it answers.
     fn start(scratch: &Scratch, extra_env: &[(&str, String)]) -> Server {
         // A port the system picked, released a moment before the server takes it.
         let port = TcpListener::bind("127.0.0.1:0").unwrap().local_addr().unwrap().port();
+        let mut server = Server::spawn(scratch, extra_env, port);
+        server.wait_until_up();
+        server
+    }
+
+    /// Start it on `port` and leave it to come up (or not) by itself.
+    fn spawn(scratch: &Scratch, extra_env: &[(&str, String)], port: u16) -> Server {
         let data = scratch.0.join("data");
         let stderr = scratch.0.join("server.stderr");
 
@@ -80,9 +88,7 @@ impl Server {
             .stderr(Stdio::from(std::fs::File::create(&stderr).unwrap()))
             .spawn()
             .expect("start oaiy-server");
-        let mut server = Server { child, port, stderr };
-        server.wait_until_up();
-        server
+        Server { child, port, stderr }
     }
 
     fn wait_until_up(&mut self) {
@@ -323,4 +329,133 @@ fn walk(dir: &Path) -> Vec<PathBuf> {
         }
     }
     found
+}
+
+/// A plugin that ignores every request to stop, and started a helper of its own: what a wedged
+/// plugin launched through a shim looks like.
+#[cfg(unix)]
+const WEDGED_PLUGIN: &str = r#"#!/bin/sh
+sleep 300 &
+echo $! > "$OAIY_PLUGIN_DATA_DIR/helper.pid"
+echo $$ > "$OAIY_PLUGIN_DATA_DIR/plugin.pid"
+while IFS= read -r line; do
+  case "$line" in
+    *'"method":"plugin.init"'*|*'"method":"plugin.health"'*)
+      id=${line#*\"id\":}; id=${id%%,*}
+      printf '{"jsonrpc":"2.0","id":%s,"result":{"status":"ok"}}\n' "$id"
+      ;;
+  esac
+done
+sleep 300
+"#;
+
+/// A data folder with the wedged plugin installed in it.
+#[cfg(unix)]
+fn install_wedged_plugin(scratch: &Scratch) {
+    use std::os::unix::fs::PermissionsExt as _;
+    let plugin = scratch.0.join("data").join("plugins").join("fake");
+    std::fs::create_dir_all(&plugin).unwrap();
+    std::fs::write(
+        plugin.join("manifest.json"),
+        json!({
+            "schemaVersion": 3, "id": "fake", "name": "Fake plugin", "version": "0.0.1", "pluginApiVersion": 1,
+            "entry": { "kind": "process", "command": "plugin.sh" },
+            "capabilities": ["oaiy.flow.run"], "connectors": [], "events": [],
+        })
+        .to_string(),
+    )
+    .unwrap();
+    std::fs::write(plugin.join("plugin.sh"), WEDGED_PLUGIN).unwrap();
+    std::fs::set_permissions(plugin.join("plugin.sh"), std::fs::Permissions::from_mode(0o755)).unwrap();
+}
+
+/// The pids the wedged plugin wrote: itself, and the helper it started.
+#[cfg(unix)]
+fn wedged_plugin_pids(scratch: &Scratch) -> (u32, u32) {
+    let data = scratch.0.join("data").join("plugin-data").join("fake");
+    let pid_of = |name: &str| -> u32 { std::fs::read_to_string(data.join(name)).unwrap().trim().parse().unwrap() };
+    (pid_of("plugin.pid"), pid_of("helper.pid"))
+}
+
+/// Running, or as good as gone? A zombie only waits to be reaped.
+#[cfg(unix)]
+fn alive(pid: u32) -> bool {
+    match std::fs::read_to_string(format!("/proc/{pid}/stat")) {
+        Ok(stat) => stat.rsplit(')').next().map(str::trim_start).is_some_and(|rest| !rest.starts_with('Z')),
+        Err(_) => false,
+    }
+}
+
+/// After the server has gone, the kernel may need a moment to finish with what was signalled.
+#[cfg(unix)]
+fn gone_within(pids: &[u32], wait: Duration) -> bool {
+    let deadline = Instant::now() + wait;
+    while pids.iter().any(|p| alive(*p)) && Instant::now() < deadline {
+        std::thread::sleep(Duration::from_millis(100));
+    }
+    !pids.iter().any(|p| alive(*p))
+}
+
+/// A stopped server used to leave its plugins running (the app's own exit stopped them, this
+/// binary's did not), and a plugin's own helpers as well, because a plugin shared the server's
+/// process group and so could not be stopped as a tree.
+#[cfg(unix)]
+#[test]
+fn stopping_the_server_stops_its_plugins_and_what_they_started() {
+    let scratch = Scratch::new("plugins");
+    install_wedged_plugin(&scratch);
+    let mut server = Server::start(&scratch, &[]);
+
+    // Started at boot, and past its handshake.
+    let deadline = Instant::now() + Duration::from_secs(60);
+    loop {
+        let (_, listed) = server.get("/api/plugins", true);
+        if listed["plugins"].as_array().is_some_and(|p| p.iter().any(|p| p["id"] == "fake" && p["state"] == "running")) {
+            break;
+        }
+        assert!(Instant::now() < deadline, "the plugin never came up: {listed} {}", server.stderr_tail());
+        std::thread::sleep(Duration::from_millis(200));
+    }
+    let (plugin, helper) = wedged_plugin_pids(&scratch);
+    assert!(alive(plugin) && alive(helper), "both run before the server is stopped");
+
+    // What `systemctl stop` sends.
+    let sent = Command::new("kill").args(["-TERM", &server.child.id().to_string()]).status().unwrap();
+    assert!(sent.success());
+    let deadline = Instant::now() + Duration::from_secs(60);
+    while server.child.try_wait().unwrap().is_none() {
+        assert!(Instant::now() < deadline, "the server did not stop: {}", server.stderr_tail());
+        std::thread::sleep(Duration::from_millis(100));
+    }
+    assert!(gone_within(&[plugin, helper], Duration::from_secs(15)), "the plugin or its helper outlived the server");
+}
+
+/// A server that cannot take its port used to exit with the plugins it had already started still
+/// running: the port is found taken only when the API binds it, after the plugins are up.
+#[cfg(unix)]
+#[test]
+fn a_server_that_cannot_bind_its_port_stops_its_plugins_before_it_exits() {
+    let scratch = Scratch::new("bind-fails");
+    install_wedged_plugin(&scratch);
+    let taken = TcpListener::bind("127.0.0.1:0").unwrap();
+    let port = taken.local_addr().unwrap().port();
+    let mut server = Server::spawn(&scratch, &[], port);
+
+    let deadline = Instant::now() + Duration::from_secs(90);
+    let status = loop {
+        if let Some(status) = server.child.try_wait().unwrap() {
+            break status;
+        }
+        assert!(Instant::now() < deadline, "the server neither came up nor gave up");
+        std::thread::sleep(Duration::from_millis(100));
+    };
+    assert_eq!(status.code(), Some(1), "it gives up: {}", server.stderr_tail());
+
+    // The plugin starts on a thread of its own while the API is being made ready. It was up
+    // before the bind failed, or this run proved nothing.
+    let pids = std::fs::read_to_string(scratch.0.join("data").join("plugin-data").join("fake").join("plugin.pid"));
+    assert!(pids.is_ok(), "the plugin had not started when the bind failed, so this run proved nothing");
+    let (plugin, helper) = wedged_plugin_pids(&scratch);
+    assert!(gone_within(&[plugin, helper], Duration::from_secs(15)), "the plugin or its helper outlived the server");
+    drop(taken);
 }

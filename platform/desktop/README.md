@@ -216,8 +216,8 @@ Configuration is by environment variable (no pointer file):
 Headless APIs require a valid token for reads and writes except health,
 capability discovery and pairing bootstrap. Missing or forged Origin headers
 never substitute for credentials. Network binding without a token fails at
-startup, including when launched from the GUI. `SIGTERM`/`Ctrl-C` stops managed
-services before exit.
+startup, including when launched from the GUI. `SIGTERM`/`Ctrl-C` stops the plugins
+and the managed services before exit, and so does a failed bind of the port.
 
 **Release contents:** headless archives now include `resources/cli` and a Node
 binary under `resources/node`. Keep these beside the server executable. The
