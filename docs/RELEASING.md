@@ -60,6 +60,14 @@ models, the portable Python and the Node runtime) is downloaded on first use, no
    the revision, `verify` runs `ci.yml` at that revision, and the web and desktop builds
    run beside it. `release` publishes only when all of them passed. The GitHub Release then
    holds the files above, and every `release-evidence-*.json` says `verified`.
+
+   The build stops when a page is missing, but nothing lists a finished package, so look
+   inside one the first time. `7z l oaiy-desktop-<v>-windows-x64-setup.exe` shows
+   `resources\app\index.html` and `resources\flows\app.html`, and
+   `dpkg -c oaiy-desktop-<v>-linux-amd64.deb | grep -E 'resources/(app/index|flows/app)\.html'`
+   should show both in the Debian package. The Windows installers were looked at this way
+   when the pages were added; the Linux packages come from the same configuration but had
+   not been built then, so a first release is their first look.
 5. **If the push started nothing**, run the workflow by hand on the tag's ref. A run on a
    tag publishes, the same as the push would have:
 
