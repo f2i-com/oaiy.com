@@ -475,6 +475,12 @@ pub fn show_value(value: &Value) -> String {
                 format!("\"{text}\"")
             }
         }
+        Value::Array(items) if items.is_empty() => "an empty list".to_string(),
+        Value::Array(items) if items.iter().all(Value::is_string) => {
+            let shown: Vec<String> = items.iter().take(5).filter_map(Value::as_str).map(|s| clip(s, 40)).collect();
+            let more = items.len().saturating_sub(5);
+            format!("{}{}", shown.join(", "), if more > 0 { format!(" and {more} more") } else { String::new() })
+        }
         Value::Array(items) => format!("a list of {}", items.len()),
         Value::Object(map) => format!("{} entr{}", map.len(), if map.len() == 1 { "y" } else { "ies" }),
         other => other.to_string(),
@@ -525,46 +531,4 @@ pub fn keys_not_restored(file: &str, table_name: &str, bytes: &[u8]) -> Vec<NotR
         out.push(NotRestored { name: clip(file, 200), why: format!("and {} more keys that are not restored", found.left_more) });
     }
     out
-}
-
-/// What the Agent's settings in a backup say, for the dry run: its providers and where they point, its
-/// network gate, how it answers calls and texts, its image and video service.
-pub fn describe_agent_settings(settings_json: &[u8]) -> Vec<ReviewItem> {
-    let class = RestoreClass::AgentSettings;
-    let name = "agent/idb/settings.json";
-    let Ok(v) = serde_json::from_slice::<Value>(settings_json) else {
-        return vec![unreadable(class, name, "it is not valid JSON")];
-    };
-    let mut items = Vec::new();
-    for p in v.get("providers").and_then(Value::as_array).into_iter().flatten() {
-        let id = s(p, "id").unwrap_or("(no id)");
-        let key = if s(p, "apiKey").is_some_and(|k| !k.trim().is_empty()) { "; has an API key (brought back only with the keys box, and only where yours has none)" } else { "" };
-        items.push(ReviewItem {
-            class,
-            name: name.to_string(),
-            title: clip(&format!("{} ({id})", s(p, "name").unwrap_or(id)), 120),
-            what: clip(&format!("Agent provider of type {} at {}{key}. If yours of the same id is at another address, this one arrives beside it, without a key.", s(p, "type").unwrap_or("?"), s(p, "baseUrl").or_else(|| s(p, "endpoint")).unwrap_or("(default address)")), 400),
-        });
-    }
-    if let Some(gate) = v.get("gate") {
-        items.push(ReviewItem {
-            class,
-            name: name.to_string(),
-            title: "The network gate".to_string(),
-            what: clip(&format!("Which sites the Agent's code may reach: mode {}, {} allowed, {} denied.", s(gate, "mode").unwrap_or("?"), gate.get("allow").and_then(Value::as_array).map(|a| a.len()).unwrap_or(0), gate.get("deny").and_then(Value::as_array).map(|a| a.len()).unwrap_or(0)), 300),
-        });
-    }
-    if let Some(m) = v.get("messages") {
-        let flag = |k: &str| if m.get(k).and_then(Value::as_bool).unwrap_or(false) { "ON" } else { "off" };
-        items.push(ReviewItem {
-            class,
-            name: name.to_string(),
-            title: "Calls and texts".to_string(),
-            what: format!("The Agent answers texts by itself: {}; answers calls: {}; rings missed calls back: {}.", flag("answer"), flag("calls"), flag("callBack")),
-        });
-    }
-    if let Some(media) = v.get("media").filter(|m| s(m, "baseUrl").is_some_and(|u| !u.is_empty())) {
-        items.push(ReviewItem { class, name: name.to_string(), title: "Images, video and audio".to_string(), what: clip(&format!("The image and video service is at {}.", s(media, "baseUrl").unwrap_or("?")), 300) });
-    }
-    items
 }

@@ -588,7 +588,9 @@ fn every_name_the_agents_page_stores_under_is_classified_or_declared_not_a_store
                 let ident: String = name.chars().rev().take_while(|c| c.is_ascii_alphanumeric() || *c == '_').collect::<Vec<_>>().into_iter().rev().collect();
                 calls.contains(&ident.as_str()) && !before[open..].contains(')')
             });
-            if !plain || !(called || has_extension) || literal.starts_with("../") || literal.starts_with("./") || literal.starts_with("http") {
+            // (A bare extension, ".json", is a piece of a name and not a name.)
+            let bare_extension = literal.strip_prefix('.').is_some_and(|rest| STORE_EXTENSIONS.contains(&rest));
+            if !plain || bare_extension || !(called || has_extension) || literal.starts_with("../") || literal.starts_with("./") || literal.starts_with("http") {
                 continue;
             }
             seen.insert(literal.clone());

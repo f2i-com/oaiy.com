@@ -210,7 +210,7 @@ One outreach campaign. Its run state (running, in flight, retry timers, attempts
 | `people[].outcome` | runs | Only with the tick "Outreach campaigns (texts and calls to a list of people)" | How it ended for a person |
 | `people[].summary` | runs | Only with the tick "Outreach campaigns (texts and calls to a list of people)" | A summary of what they said |
 | `people[].answers` | runs | Only with the tick "Outreach campaigns (texts and calls to a list of people)" | What they answered |
-| `people[].thread` | runs | Only with the tick "Outreach campaigns (texts and calls to a list of people)" | Their conversation's id |
+| `people[].thread` | excluded | Never | Their conversation's id: A conversation is found again by the person's number when the campaign runs: an id from a file could point at another person's conversation. |
 | `people[].doneAt` | runs | Only with the tick "Outreach campaigns (texts and calls to a list of people)" | When they were done |
 | `people[].why` | runs | Only with the tick "Outreach campaigns (texts and calls to a list of people)" | Why they were skipped |
 | `people[].tries` | excluded | Never | How many tries were made: Run state: rebuilt. |
@@ -222,7 +222,7 @@ One outreach campaign. Its run state (running, in flight, retry timers, attempts
 | `people[].unconfirmed` | excluded | Never | A text that was not confirmed: Run state. |
 | `people[].failed` | excluded | Never | A failed call: Run state. |
 | `people[].late` | excluded | Never | A late reply: Run state. |
-| `state` | excluded | Never | Whether the campaign was running: A restored campaign is always paused. |
+| `state` | excluded | Never | Whether the campaign was running: A campaign that was still to be run comes back paused, never running, whatever it was; one that had finished, with no one left to reach, stays finished. |
 | `waitingFor` | excluded | Never | What it waited for: Run state. |
 | `pausedWhy` | excluded | Never | Why it was paused: Run state. |
 | `faults` | excluded | Never | How many calls failed in a row: Run state. |
@@ -518,28 +518,58 @@ in parts through internal routes with a secret made for that one backup.
 - The Agent must be open (OAIY starts it in the background). If it is not there, does not answer
   in time, or fails, **the backup still completes** and says so: *"Agent conversations and
   projects were not included: open the Agent and try again"*. The manifest's `partial` records it.
-- Large files are skipped and named (64 MiB each, 512 MiB in all).
-- On a restore the desktop leaves the Agent's part for its page. At the next start the page
-  fetches it **before it opens anything**, first saves what it holds now as the undo copy (and
-  does nothing at all if it cannot), then writes the files: those in the backup replace files of
-  the same name, and nothing else is deleted. It reports which files it **added**, so an undo can
+- Large files are skipped and named (64 MiB each, 512 MiB in all, and at most 50,000 files).
+- **On a restore the Agent's archive is not handed back as it is.** The desktop reads the archive's
+  own directory (not what the backup says of it) and builds a new archive of only what the table
+  above lets come back, and only what its kind's tick allows. The dry run lists what would come
+  back **by name and size**: each project by its name, the front desk's brief with what it says,
+  each knowledge file, what the phone's agents remember about people, each outreach campaign by
+  name with how many people it would contact and what it says, and the Agent's settings key by
+  key with their values (the instructions with their full length). It says what is not restored
+  and why, and every name it does not know is "not restored: unknown item".
+- **Nothing ticked** brings back only the numbers not to be called or texted again (which are
+  *added* to yours: none of yours is ever taken away, on a restore or an undo) and settings that
+  cannot act. **Agent data** (projects, conversations, the brief and knowledge files) and
+  **Memory** (what the phone's agents remember about people, which they read as instructions) and
+  **Outreach** each need their own tick.
+- **Campaigns never come back running.** With Outreach ticked, a campaign is rebuilt from the keys
+  the table lets through and comes back **paused**, with nothing scheduled: you start it yourself,
+  with Resume on its card (the Agent cannot start one that came from a backup: it is told to ask
+  you). A campaign that had already finished and has no one left to reach stays finished. Anyone
+  who was in the middle of being reached when the backup was made (calling, texting or waiting for
+  a reply) is set aside, not contacted again by a restore. Where a campaign writes its results is
+  cut to a file of its own under `/outreach/`, so it cannot be pointed at the brief. A campaign of the same id
+  that is already there is kept exactly as it is, so an older backup of your own can never bring a
+  campaign back to life that you have since paused or finished. Missed calls waiting to be rung
+  back (`callbacks.json`) are never restored: they are rung back only within 24 hours.
+- The page brings back **only what the archive's own record names**, in the way it names (replace,
+  add to the numbers not to be contacted, paused campaign, list of campaigns); a record it does
+  not find, or an archive that lists a name twice, is refused whole. On a restore the desktop
+  leaves the Agent's part for its page. At the next start the page fetches it **before it opens
+  anything**, first saves what it holds now as the undo copy (and does nothing at all if it
+  cannot), then writes what the record names. It reports which files it **added**, so an undo can
   take exactly those away again, and what it left out. The result appears in Settings. The undo
   copy of a restore is made once: if the page is closed part-way and tries again, its second copy
   (of storage that is already half restored) is thrown away and the first one is kept. What was
   left for the page and not taken within 24 hours, or that the page refused (say, because it is
   bigger than the page restores), is removed and reported.
-- **The Agent's own settings** (its providers and their addresses, whether its network gate is
-  open, how it answers calls and texts) are applied only if you ticked that kind. Even then a
-  provider at a different address or of a different kind from one you have is never merged over
-  yours (which could point your kept key at a different server): it arrives as a new provider
-  without a key. The network gate and the message settings are changed only with the tick, and the
-  dry run lists each of them by name ("The network gate", "Calls and texts") and what it does;
-  without the tick your own stay.
+- **The Agent's own settings** are brought back key by key (see the table of `idb/settings.json`
+  above): the instructions for texts and calls, the answer and call-back switches, the line said to
+  a person who is rung back, the network gate, the providers and the media service's address need
+  the tick of the Agent's settings, and the dry run lists each by its key and value. A number
+  within its limits, the country, and model names come back without one. An address that was read
+  from a service, the project that was last open, and the paired desktop are never restored. Even
+  with the tick a provider at a different address or of a different kind from one you have is never
+  merged over yours (which could point your kept key at a different server): it arrives as a new
+  provider without a key.
 - **The Agent's provider keys** come back only if you ticked the keys, only where the Agent has no
   key for that provider, and only for a provider at the same address. An empty key in a backup
   never replaces a key the Agent has.
 - The undo copy has no API keys (they were sealed with a key the browser will not give up, and
-  the desktop keeps the copy as plain files).
+  the desktop keeps the copy as plain files). An undo puts back the person's own state without a
+  tick, but through the same table: an old campaign is not brought back running, stale callbacks
+  and anything the table does not know are not written, and the numbers not to be contacted only
+  grow.
 - **The page's secret.** Every request the page makes about a restore carries a secret the
   desktop put in the Agent's window when it started (`backupToken`, different at every start).
   No route returns it. A program or a page that only sets the Agent's `Origin` header therefore
@@ -594,8 +624,8 @@ in parts through internal routes with a secret made for that one backup.
   folder while it runs is as before.
 - **Agent storage** needs the Agent's page. It can be missing from a backup (and the backup says
   so), it is restored at the next start of the page, and it holds the whole archive in memory
-  while it does (up to 2 GiB; in practice far less). A larger one is not left for the page: the
-  restore says so.
+  while it does (at most 640 MiB unpacked; in practice far less). A larger one is not left for the
+  page: the restore says so.
 - The flow editor's own browser storage (its projects, flow passwords and secret constants) is not
   in a backup: only the desktop's flows and triggers are.
 - Under `tauri dev` a restart does not relaunch OAIY (the window would lose its development

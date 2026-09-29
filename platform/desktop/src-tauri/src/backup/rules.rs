@@ -182,10 +182,9 @@ impl Standing {
     /// of its own needs none: each key in it has its own class, and the keys that cannot act come back
     /// without a tick.
     pub fn file_tick(&self) -> Option<RestoreClass> {
-        if self.keys().is_some() {
-            None
-        } else {
-            self.tick
+        match self.row {
+            Some(row) => row.file_tick(),
+            None => self.tick,
         }
     }
 

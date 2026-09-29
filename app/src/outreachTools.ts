@@ -127,7 +127,7 @@ export function outreachTools(deps: OutreachToolDeps): SessionTool[] {
     },
     {
       spec: { name: 'outreach_resume', description: 'Resume a paused outreach list (it was approved already: nothing is asked again).', parameters: { type: 'object', required: ['id'], properties: { id: { type: 'string' } } } },
-      run: async (input) => engine().resume(id(input)),
+      run: async (input) => engine().resume(id(input), 'agent'),
     },
     {
       spec: {

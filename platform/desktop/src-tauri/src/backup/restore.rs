@@ -31,7 +31,7 @@ use serde::{Deserialize, Serialize};
 use super::manifest::{Entry, Manifest};
 use super::review::{self, ClassInfo, Local, RestoreClass, ReviewItem, Ticks};
 use super::rules::{self, Category, Excluded};
-use super::{agent, container, free_space, restore_dir, Budget, scratch_dir, sha256_file, BackupError, ErrorKind, Limits, Result, TempFolder, AGENT_ENTRY};
+use super::{agent, agentzip, container, free_space, restore_dir, Budget, scratch_dir, sha256_file, BackupError, ErrorKind, Limits, Result, TempFolder, AGENT_ENTRY};
 use crate::secret_file;
 
 pub const KIND_RESTORE: &str = "restore";
@@ -185,6 +185,10 @@ struct MarkerFile {
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct MarkerAgent {
+    /// The archive left for the page, in the folder the marker names: `agent-storage.zip` (a restore's, rebuilt from
+    /// the backup's) or `agent-undo.zip` (an undo's, rebuilt from the page's own snapshot).
+    #[serde(default = "agent_file")]
+    file: String,
     size: u64,
     sha256: String,
     /// The Agent's own settings were ticked (or, in an undo, they are the person's own).
@@ -243,6 +247,13 @@ struct UndoRecord {
 
 fn restore_kind() -> String {
     KIND_RESTORE.to_string()
+}
+
+const AGENT_RESTORE_FILE: &str = "agent-storage.zip";
+const AGENT_UNDO_FILE: &str = "agent-undo.zip";
+
+fn agent_file() -> String {
+    AGENT_RESTORE_FILE.to_string()
 }
 
 fn marker_path(data_dir: &Path) -> PathBuf {
@@ -317,7 +328,7 @@ impl Marker {
             self.check_name(r, limits)?;
         }
         if let Some(agent) = &self.agent {
-            if agent.remove.len() > agent::MAX_ADDED {
+            if agent.remove.len() > agent::MAX_ADDED || (agent.file != AGENT_RESTORE_FILE && agent.file != AGENT_UNDO_FILE) {
                 return Err("the record of the restore is damaged".into());
             }
         }
@@ -438,9 +449,25 @@ fn clipped(lines: &[String], count: usize, each: usize) -> Vec<String> {
     lines.iter().take(count).map(|l| review::clip(l, each)).collect()
 }
 
-fn preview_of(data_dir: &Path, verified: &container::Verified, scratch: &Path, file_name: &str, budget: &Budget) -> Result<Preview> {
+/// The name an item of the Agent's storage goes by in [`Inspection::restorable`].
+fn agent_item(inner: &str) -> String {
+    format!("{AGENT_ENTRY}#{inner}")
+}
+
+fn preview_of(data_dir: &Path, verified: &container::Verified, scratch: &Path, file_name: &str, limits: &Limits, budget: &Budget) -> Result<(Preview, Vec<String>)> {
     let manifest = &verified.manifest;
     let local = rules::plan(data_dir, true);
+    // The Agent's storage is read from its own directory, not from what the backup says of it.
+    let mut agent_described: Option<agentzip::Described> = None;
+    if manifest.entries.iter().any(|e| e.name == AGENT_ENTRY) {
+        let nested = scratch.join("agent-nested.zip");
+        let mut outer = container::open_archive(&verified.plain)?;
+        agentzip::extract(&mut outer, &nested, budget)?;
+        let listing = agentzip::read_listing(&nested, limits);
+        let described = listing.and_then(|l| agentzip::describe(&nested, &l, limits, budget));
+        let _ = std::fs::remove_file(&nested);
+        agent_described = Some(described?);
+    }
     let in_backup: HashSet<String> = manifest.entries.iter().map(|e| e.name.to_lowercase()).collect();
     let mut targets = Targets::new();
     let mut plans: HashMap<Category, CategoryPlan> = HashMap::new();
@@ -462,7 +489,8 @@ fn preview_of(data_dir: &Path, verified: &container::Verified, scratch: &Path, f
         };
         if category == Category::Agent {
             // Merged by the Agent page: files in the backup overwrite files of the same name, nothing is deleted.
-            let files = manifest.counts.agent_files;
+            // How many is what the archive's own directory lists, not what the backup says of itself.
+            let files = agent_described.as_ref().map(|d| d.restorable as u64).unwrap_or(0);
             bump(category, &|p| p.added += files);
             continue;
         }
@@ -496,18 +524,21 @@ fn preview_of(data_dir: &Path, verified: &container::Verified, scratch: &Path, f
     // many there are. (The service templates are read first for their ids alone, so that a service that starts with
     // OAIY can be said to have its template in this backup.) What is read altogether is bounded too.
     let mut read_total = 0u64;
+    let too_much = || BackupError::new(ErrorKind::TooLarge, "This backup holds more things that can run or reconfigure OAIY than can be looked through, so it is refused.");
     let mut backup_templates: HashSet<String> = HashSet::new();
     for entry in manifest.entries.iter().filter(|e| e.name.to_lowercase().starts_with("templates/")) {
         budget.check()?;
         if let Some(bytes) = container::read_entry(&mut archive, &entry.name, MAX_REVIEW_BYTES)? {
             read_total += bytes.len() as u64;
+            if read_total > MAX_REVIEW_TOTAL {
+                return Err(too_much());
+            }
             if let Some(id) = serde_json::from_slice::<serde_json::Value>(&bytes).ok().and_then(|v| v.get("id").and_then(|i| i.as_str().map(str::to_string))) {
                 backup_templates.insert(id);
             }
         }
     }
     let mut items: Vec<ReviewItem> = Vec::new();
-    let too_much = || BackupError::new(ErrorKind::TooLarge, "This backup holds more things that can run or reconfigure OAIY than can be looked through, so it is refused.");
     for entry in &manifest.entries {
         budget.check()?;
         let Ok(Some(standing)) = rules::standing_of_backup_entry(&entry.name) else { continue };
@@ -540,11 +571,11 @@ fn preview_of(data_dir: &Path, verified: &container::Verified, scratch: &Path, f
     if more > 0 {
         not_restored.push(review::NotRestored { name: format!("and {more} more"), why: "not restored".to_string() });
     }
-    if manifest.entries.iter().any(|e| e.name == AGENT_ENTRY) {
-        let settings = container::read_nested_entry(&mut archive, AGENT_ENTRY, "idb/settings.json", scratch, MAX_REVIEW_BYTES, budget)?;
-        if let Some(settings) = settings {
-            items.extend(review::describe_agent_settings(&settings));
-        }
+    let mut agent_names: Vec<String> = Vec::new();
+    if let Some(described) = agent_described {
+        items.extend(described.items);
+        not_restored.extend(described.not_restored);
+        agent_names = described.names.iter().map(|n| agent_item(n)).collect();
     }
     if items.len() > review::MAX_REVIEW_ITEMS {
         return Err(BackupError::new(ErrorKind::TooLarge, "This backup holds more things that can run or reconfigure OAIY than can be looked through, so it is refused."));
@@ -566,7 +597,13 @@ fn preview_of(data_dir: &Path, verified: &container::Verified, scratch: &Path, f
     if items.iter().any(|i| i.class == RestoreClass::Flows && i.name == "bridge/ledger.jsonl") {
         notes.push("Runs that were waiting or running when the backup was made are never brought back.".to_string());
     }
-    Ok(Preview {
+    if items.iter().any(|i| i.class == RestoreClass::Outreach) {
+        notes.push("Outreach campaigns come back PAUSED, never running and never scheduled: nothing is sent or called until you start one. A campaign of the same id that is here is kept as it is, and anyone who was being reached is set aside, not contacted again.".to_string());
+    }
+    if agent_names.iter().any(|n| n.ends_with("#opfs/front-desk/outreach/do-not-contact.json")) {
+        notes.push("The numbers in the backup that are not to be called or texted again are added to yours; none of yours is ever taken away.".to_string());
+    }
+    let preview = Preview {
         file_name: review::clip(file_name, 200),
         created_at: review::clip(&manifest.created_at, 40),
         app_version: review::clip(&manifest.app.version, 64),
@@ -584,7 +621,8 @@ fn preview_of(data_dir: &Path, verified: &container::Verified, scratch: &Path, f
         not_restored,
         keys: KeysInfo { in_backup: manifest.includes_keys },
         notes,
-    })
+    };
+    Ok((preview, agent_names))
 }
 
 /// What a look at a backup found, kept to hold the restore that follows to it: the SHA-256 of the decrypted
@@ -613,8 +651,10 @@ pub fn inspect_bound(data_dir: &Path, file: &Path, passphrase: &str, opts: &Rest
     let budget = opts.budget();
     let verified = container::open_backup(file, passphrase, &scratch.0, &opts.limits, &budget)?;
     let name = file.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
-    let preview = preview_of(data_dir, &verified, &scratch.0, &name, &budget)?;
-    let inspection = Inspection { plain_sha256: verified.plain_sha256.clone(), restorable: restorable_names(&verified.manifest) };
+    let (preview, agent_names) = preview_of(data_dir, &verified, &scratch.0, &name, &opts.limits, &budget)?;
+    let mut restorable = restorable_names(&verified.manifest);
+    restorable.extend(agent_names);
+    let inspection = Inspection { plain_sha256: verified.plain_sha256.clone(), restorable };
     Ok((preview, inspection))
 }
 
@@ -684,7 +724,9 @@ fn stage_inner(data_dir: &Path, file: &Path, passphrase: &str, ticks: &Ticks, op
     }
     let total: u64 = selected.iter().map(|e| e.size).sum();
     let plain_len = std::fs::metadata(&verified.plain).map(|m| m.len()).unwrap_or(0);
-    let needed = total.saturating_add(plain_len).saturating_add(MARGIN);
+    // (The Agent's archive is copied out of the backup to be read, and rebuilt: two more of its size at the most.)
+    let agent_size = selected.iter().find(|e| e.name == AGENT_ENTRY).map(|e| e.size).unwrap_or(0);
+    let needed = total.saturating_add(plain_len).saturating_add(agent_size).saturating_add(MARGIN);
     let free = (opts.free_space)(data_dir);
     if free < needed {
         return Err(BackupError::new(
@@ -709,18 +751,39 @@ fn stage_inner(data_dir: &Path, file: &Path, passphrase: &str, ticks: &Ticks, op
         secret_file::create_private_dir(&root.join("files")).map_err(|e| BackupError::io("Could not make a folder for the restore", &e))?;
         let limits = &opts.limits;
         container::extract_all(&verified, |entry| {
-            if !wanted.contains(entry.name.as_str()) {
+            if !wanted.contains(entry.name.as_str()) || entry.name == AGENT_ENTRY {
                 Ok(None)
-            } else if entry.name == AGENT_ENTRY {
-                Ok(Some(root.join("agent-storage.zip")))
             } else {
                 container::safe_join(&root.join("files"), &entry.name, limits).map(Some)
             }
         }, &budget)?;
-        let agent = selected.iter().find(|e| e.name == AGENT_ENTRY).map(|e| MarkerAgent { size: e.size, sha256: e.sha256.clone(), apply_settings: ticks.has(RestoreClass::AgentSettings), apply_keys: ticks.keys, remove: Vec::new() });
+        // The Agent's archive is not handed over as it is: it is rebuilt from what the table lets come back (see `agentzip`).
+        let mut agent_notes: Vec<String> = Vec::new();
+        let mut agent = None;
+        if selected.iter().any(|e| e.name == AGENT_ENTRY) {
+            let nested = scratch.0.join("agent-nested.zip");
+            let mut outer = container::open_archive(&verified.plain)?;
+            agentzip::extract(&mut outer, &nested, &budget)?;
+            let built = root.join(AGENT_RESTORE_FILE);
+            let prepared = agentzip::filter(&nested, &built, &scratch.0, ticks, agentzip::Mode::Restore, limits, &budget)?;
+            let _ = std::fs::remove_file(&nested);
+            if let Some(seen) = looked_at {
+                if let Some(unlisted) = prepared.items.iter().find(|i| !seen.restorable.contains(&agent_item(&i.name))) {
+                    return Err(BackupError::new(ErrorKind::Unsafe, format!("\"{}\" in the Agent's storage was not listed when the backup was checked, so nothing was prepared.", review::clip(&unlisted.name, 120))));
+                }
+            }
+            agent_notes = prepared.notes;
+            if prepared.items.is_empty() {
+                let _ = std::fs::remove_file(&built);
+            } else {
+                let (sha256, size) = sha256_file(&built).map_err(|e| BackupError::io("Could not read the Agent's staged storage", &e))?;
+                agent = Some(MarkerAgent { file: AGENT_RESTORE_FILE.to_string(), size, sha256, apply_settings: prepared.settings, apply_keys: ticks.keys, remove: Vec::new() });
+            }
+        }
         // What can carry more than data is cleaned as it comes in, and the marker records what is there now.
         let names: Vec<String> = selected.iter().filter(|e| e.name != AGENT_ENTRY).map(|e| e.name.clone()).collect();
-        let (kept, notes) = clean_staged(data_dir, &root.join("files"), &names, ticks, limits)?;
+        let (kept, mut notes) = clean_staged(data_dir, &root.join("files"), &names, ticks, limits)?;
+        notes.extend(agent_notes);
         let mut files = Vec::new();
         for name in &kept {
             let path = container::safe_join(&root.join("files"), name, limits)?;
@@ -980,9 +1043,23 @@ pub fn stage_undo(data_dir: &Path, opts: &RestoreOptions) -> Result<Staged> {
     let agent_zip = root.join("agent-storage.zip");
     let agent = match std::fs::metadata(&agent_zip) {
         Ok(m) if m.is_file() => {
-            let (sha256, size) = sha256_file(&agent_zip).map_err(|e| BackupError::io("Could not read the saved copy", &e))?;
-            // What the page saved is the person's own state: its settings go back, its keys were never in it.
-            Some(MarkerAgent { size, sha256, apply_settings: true, apply_keys: false, remove: agent::read_added(data_dir, &uid) })
+            // What the page saved is the person's own state, so it is put back without a tick, but through the same
+            // table as a restore: an old campaign is never brought back running, callbacks that are long stale are
+            // not, the list of numbers not to be contacted only grows, and what the table does not know is not
+            // written. Its keys were never in it.
+            let scratch = TempFolder::new(&scratch_dir(data_dir))?;
+            let budget = opts.budget();
+            let built = root.join(AGENT_UNDO_FILE);
+            let _ = std::fs::remove_file(&built);
+            let prepared = agentzip::filter(&agent_zip, &built, &scratch.0, &Ticks::all(), agentzip::Mode::Undo, &opts.limits, &budget)?;
+            let remove = agent::read_added(data_dir, &uid);
+            if prepared.items.is_empty() && remove.is_empty() {
+                let _ = std::fs::remove_file(&built);
+                None
+            } else {
+                let (sha256, size) = sha256_file(&built).map_err(|e| BackupError::io("Could not read the saved copy", &e))?;
+                Some(MarkerAgent { file: AGENT_UNDO_FILE.to_string(), size, sha256, apply_settings: prepared.settings, apply_keys: false, remove })
+            }
         }
         _ => None,
     };
@@ -1429,7 +1506,7 @@ fn finalize(data_dir: &Path, marker: &Marker, applied: &[(String, bool)]) -> App
     }
     let mut agent_storage = "none";
     if let Some(agent_marker) = &marker.agent {
-        let zip = source.join("agent-storage.zip");
+        let zip = source.join(&agent_marker.file);
         match agent::leave_for_page(data_dir, &marker.id, &marker.kind, &zip, agent_marker.apply_settings, agent_marker.apply_keys, &agent_marker.remove) {
             Ok(()) => agent_storage = "pending",
             Err(e) => {

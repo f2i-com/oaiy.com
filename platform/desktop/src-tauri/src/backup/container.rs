@@ -309,6 +309,10 @@ pub(crate) fn verify_zip(plain: &Path, limits: &Limits, budget: &Budget) -> Resu
     }
     let file = File::open(plain).map_err(|e| BackupError::io("Could not read the staged backup", &e))?;
     let mut archive = ZipArchive::new(BufReader::new(file)).map_err(|_| damaged())?;
+    // The reader keeps one entry of a name that is listed twice, so the count its end record gives is the true one.
+    if archive.len() as u64 != directory.entries {
+        return Err(twice());
+    }
     if archive.is_empty() || archive.len() > limits.max_entries {
         return Err(if archive.is_empty() { damaged() } else { BackupError::new(ErrorKind::TooLarge, "This backup holds more items than OAIY will restore.") });
     }
@@ -475,8 +479,18 @@ pub(crate) fn peek_zip_directory(path: &Path) -> Result<ZipDirectory> {
 pub(crate) type Archive = ZipArchive<BufReader<File>>;
 
 pub(crate) fn open_archive(plain: &Path) -> Result<Archive> {
+    let directory = peek_zip_directory(plain)?;
     let file = File::open(plain).map_err(|e| BackupError::io("Could not read the staged backup", &e))?;
-    ZipArchive::new(BufReader::new(file)).map_err(|_| damaged())
+    let archive = ZipArchive::new(BufReader::new(file)).map_err(|_| damaged())?;
+    // A name listed twice is refused: the reader keeps one of them, and other programs may read the other.
+    if archive.len() as u64 != directory.entries {
+        return Err(twice());
+    }
+    Ok(archive)
+}
+
+fn twice() -> BackupError {
+    BackupError::new(ErrorKind::Unsafe, "This backup is refused: it lists the same item twice, or its list of items is damaged.")
 }
 
 /// One entry's bytes, when it is there and no larger than `max` (else `None`).
@@ -491,31 +505,4 @@ pub(crate) fn read_entry(archive: &mut Archive, name: &str, max: u64) -> Result<
     let mut bytes = Vec::new();
     entry.take(max + 1).read_to_end(&mut bytes).map_err(|_| damaged())?;
     Ok((bytes.len() as u64 <= max).then_some(bytes))
-}
-
-/// One entry of a ZIP that is itself an entry of `archive` (the Agent's storage), copied to `scratch`
-/// to be read. `None` when either is not there, or the inner one is larger than `max`.
-pub(crate) fn read_nested_entry(archive: &mut Archive, outer: &str, inner: &str, scratch: &Path, max: u64, budget: &Budget) -> Result<Option<Vec<u8>>> {
-    let path = scratch.join("nested.zip");
-    {
-        let Ok(entry) = archive.by_name(outer) else { return Ok(None) };
-        let mut reader = entry;
-        let mut out = BufWriter::with_capacity(COPY_BUF, secret_file::create_new_owner_only(&path).map_err(|e| BackupError::io("Could not stage the Agent's storage", &e))?);
-        let mut buf = vec![0u8; COPY_BUF];
-        loop {
-            budget.check()?;
-            let n = reader.read(&mut buf).map_err(|_| damaged())?;
-            if n == 0 {
-                break;
-            }
-            out.write_all(&buf[..n]).map_err(|e| BackupError::io("Could not stage the Agent's storage", &e))?;
-        }
-        out.flush().map_err(|e| BackupError::io("Could not stage the Agent's storage", &e))?;
-    }
-    let found = (|| -> Result<Option<Vec<u8>>> {
-        let Ok(mut nested) = open_archive(&path) else { return Ok(None) };
-        read_entry(&mut nested, inner, max)
-    })();
-    let _ = std::fs::remove_file(&path);
-    found
 }

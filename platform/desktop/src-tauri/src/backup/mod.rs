@@ -33,6 +33,7 @@
 //! or the contents of a file.
 
 pub mod agent;
+pub mod agentzip;
 pub mod busy;
 #[cfg(feature = "gui")]
 pub mod commands;
@@ -96,6 +97,17 @@ pub struct Limits {
     /// The Agent's storage archive: 640 MiB (its own export stops at 512 MiB and never adds a file over
     /// 64 MiB, so 576 MiB at most, and a margin for the archive's own records).
     pub max_agent_bytes: u64,
+    /// Files in the Agent's archive: 50,000. Its export adds files until 512 MiB are in, so a very large
+    /// number would be tens of thousands of small ones: a dependency tree in a project, not what the Agent wrote.
+    pub max_agent_entries: usize,
+    /// One file in the Agent's archive, as its own directory declares it: 64 MiB, the most its export puts in.
+    pub max_agent_file_bytes: u64,
+    /// All the files of the Agent's archive together, as its own directory declares them (what they unpack to,
+    /// which a hostile archive can make far more than its size): 640 MiB.
+    pub max_agent_total_bytes: u64,
+    /// The most of one small structured file of the Agent's (a campaign, its settings, what it remembers) that
+    /// is read whole to be described or rebuilt: 8 MiB.
+    pub max_agent_read_bytes: u64,
 }
 
 impl Default for Limits {
@@ -109,6 +121,10 @@ impl Default for Limits {
             max_json_bytes: 16 << 20,
             max_voice_bytes: 128 << 20,
             max_agent_bytes: 640 << 20,
+            max_agent_entries: 50_000,
+            max_agent_file_bytes: 64 << 20,
+            max_agent_total_bytes: 640 << 20,
+            max_agent_read_bytes: 8 << 20,
         }
     }
 }

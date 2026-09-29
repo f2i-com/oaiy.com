@@ -198,6 +198,16 @@ impl Row {
         parts.first() == Some(&under.as_str()) && parts.iter().any(|part| self.words.iter().any(|w| part.contains(w.as_str())))
     }
 
+    /// The tick the whole file needs to come back, when it needs one. A file with a key table that holds keys
+    /// that cannot act (data) has none: each key has its own class, and those come back without a tick. A file
+    /// whose every key acts (a campaign) needs its tick as a file.
+    pub fn file_tick(&self) -> Option<RestoreClass> {
+        match &self.keys {
+            Some(name) if table().key_table(name).is_some_and(|t| t.keys.iter().any(|k| k.class == Class::Data)) => None,
+            _ => self.tick,
+        }
+    }
+
     /// Whether the row could match something inside the folder `dir`.
     pub fn could_match_under(&self, dir: &str, fold: bool) -> bool {
         self.globs.iter().any(|g| g.could_match_under(dir, fold))
@@ -646,7 +656,7 @@ fn looks_secret(text: &str) -> bool {
 }
 
 /// Check a scalar against its type. `Err` says what is wrong, in a few words.
-fn check_value(ty: &ValueType, value: &Value) -> Result<(), String> {
+fn check_value(ty: &ValueType, value: &Value, is_a_key: bool) -> Result<(), String> {
     match (ty, value) {
         (ValueType::Bool, Value::Bool(_)) => Ok(()),
         (ValueType::Int { min, max }, Value::Number(n)) => match n.as_i64() {
@@ -662,7 +672,7 @@ fn check_value(ty: &ValueType, value: &Value) -> Result<(), String> {
                 Err(format!("longer than {max_chars} characters"))
             } else if !plain_text(s) {
                 Err("it has control characters".to_string())
-            } else if looks_secret(s) {
+            } else if looks_secret(s) && !is_a_key {
                 Err("it looks like a key or a sealed value".to_string())
             } else {
                 Ok(())
@@ -736,7 +746,10 @@ impl Walk<'_> {
                 ValueType::Object => match value {
                     Value::Object(inner) => {
                         let filtered = self.object(inner, &child, depth + 1);
-                        out.insert(key.clone(), Value::Object(filtered));
+                        // A container of which nothing comes back is not there at all.
+                        if !filtered.is_empty() {
+                            out.insert(key.clone(), Value::Object(filtered));
+                        }
                     }
                     _ => self.leave(&child, Why::BadValue("an object is expected".to_string()), Some(row)),
                 },
@@ -763,7 +776,9 @@ impl Walk<'_> {
                                 _ => self.leave(&element, Why::BadValue("an object is expected".to_string()), Some(row)),
                             }
                         }
-                        out.insert(key.clone(), Value::Array(list));
+                        if !list.is_empty() {
+                            out.insert(key.clone(), Value::Array(list));
+                        }
                     }
                     _ => self.leave(&child, Why::BadValue("a list is expected".to_string()), Some(row)),
                 },
@@ -811,7 +826,7 @@ impl Walk<'_> {
                     }
                     _ => self.leave(&child, Why::BadValue("an object is expected".to_string()), Some(row)),
                 },
-                scalar => match check_value(scalar, value) {
+                scalar => match check_value(scalar, value, row.secret) {
                     Ok(()) => {
                         self.kept.push(Kept { path: child.clone(), row, value: value.clone(), at: self.at.clone() });
                         out.insert(key.clone(), value.clone());

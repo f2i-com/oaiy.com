@@ -751,12 +751,26 @@ export class Outreach {
     return this.campaigns.some((c) => c.kind === 'call' && c.people.some((p) => p.state === 'dialling' || p.state === 'ringing' || p.state === 'on_call'));
   }
 
-  /** A text campaign is running, or waits for replies: this page takes the texts' lease for it. */
+  /**
+   * A text campaign is running, or someone it texted may still reply: this page takes the texts' lease for it. A campaign
+   * that is only paused holds nothing: nobody it has not texted is answered for it, and nothing is sent by it. One that was
+   * restored from a backup and not started here holds no lease at all, whoever its file says was texted: nothing was sent by
+   * this computer for it, so nobody replying to it is answered for it.
+   */
   textsOpen(): boolean {
     const now = this.now();
     // A person texted keeps it for two days after they are done: a late reply is answered too (never after a STOP).
     const replyMayCome = (p: Person) => p.state === 'awaiting_reply' || p.state === 'sending' || (p.state === 'done' && !!p.attempt && p.outcome !== 'opted_out' && now - (p.doneAt ?? 0) < TEXT_CONTEXT_GRACE);
-    return this.campaigns.some((c) => c.kind === 'text' && (c.state === 'running' || c.state === 'paused' || c.people.some(replyMayCome)));
+    return this.campaigns.some((c) => c.kind === 'text' && (c.state === 'running' || (!this.unstarted(c) && c.people.some(replyMayCome))));
+  }
+
+  /**
+   * A campaign that was restored from a backup and has not been started here (its `approvedAt` is 0). It is paused, and it is
+   * inert until a person resumes it: it is not finished and reported on its own (its report would go to the agent as a
+   * request, with what its author wrote for afterwards), and someone on its list who rings in is not treated as on it.
+   */
+  private unstarted(c: Campaign): boolean {
+    return c.approvedAt === 0;
   }
 
   /** Who a campaign speaks as: as it was approved (one from before: the desktop's now). */
@@ -812,10 +826,17 @@ export class Outreach {
     return `Paused "${c.name}": no one new is contacted until it is resumed${c.people.some((p) => p.state === 'on_call' || p.state === 'ringing' || p.state === 'dialling') ? ' (the call going on now goes on)' : ''}.`;
   }
 
-  resume(id: string): string {
+  /**
+   * Resume a paused campaign. `by` is who asks: the person (its card) or an agent (its tool). A campaign that came from a
+   * backup was never approved here, so only the person may start it: an agent is told to ask them.
+   */
+  resume(id: string, by: 'person' | 'agent' = 'person'): string {
     const c = this.get(id);
     if (!c) return `No outreach ${id}.`;
     if (c.state !== 'paused') return `"${c.name}" is ${c.state}, not paused.`;
+    if (this.unstarted(c) && by === 'agent') return `"${c.name}" came from a backup and has not been approved on this computer, so it is not started by you. Ask your person to look at it and press Resume on its card.`;
+    // Starting a campaign that came from a backup is approving it.
+    if (this.unstarted(c)) c.approvedAt = this.now();
     c.state = 'running';
     c.pausedWhy = undefined;
     c.faults = 0;
@@ -1345,6 +1366,7 @@ export class Outreach {
   /** Everyone is done (or it was stopped with no call going on): the results, and the report once. */
   private async finishIfDone(c: Campaign, now: number, force = false): Promise<void> {
     if (c.endedAt && c.report.text) return;
+    if (this.unstarted(c) && !force) return;
     const live = c.people.some((p) => p.state === 'dialling' || p.state === 'ringing' || p.state === 'on_call' || p.state === 'ended');
     const allDone = c.people.every((p) => FINAL.has(p.state));
     if (!(allDone || (force && !live) || (c.state === 'stopped' && !live))) return;
@@ -1391,7 +1413,7 @@ export class Outreach {
   forRing(number: string): OutreachLink | undefined {
     if (!number) return undefined;
     for (const c of this.campaigns) {
-      if (c.kind !== 'call' || (c.state !== 'running' && c.state !== 'paused')) continue;
+      if (c.kind !== 'call' || (c.state !== 'running' && c.state !== 'paused') || this.unstarted(c)) continue;
       const p = c.people.find((x) => (x.state === 'queued' || x.state === 'waiting') && samePerson(x.number, number));
       if (p) return this.link(c, p, true);
     }
@@ -1403,7 +1425,7 @@ export class Outreach {
     if (!this.deps.phone().holdsTexts) return undefined;
     const now = this.now();
     for (const c of [...this.campaigns].reverse()) {
-      if (c.kind !== 'text') continue;
+      if (c.kind !== 'text' || this.unstarted(c)) continue;
       const p = c.people.find((x) => (x.number === number || (x.number !== TEST && number !== TEST && samePerson(x.number, number))) && x.attempt && (x.state === 'awaiting_reply' || x.state === 'sending' || (x.state === 'done' && now - (x.doneAt ?? 0) < TEXT_CONTEXT_GRACE)));
       if (p && p.outcome !== 'opted_out') return this.link(c, p, false);
     }
