@@ -28,6 +28,8 @@
 import SiteNav, { REPO_URL } from './SiteNav';
 import DownloadDesktop from '../components/DownloadDesktop';
 import { SCREENSHOTS, type Screenshot } from './screenshots';
+import { privacyCopy } from './privacy';
+import { backendBaseUrl } from '../lib/sharingPrefs';
 
 const APP_URL = 'app.html';
 
@@ -590,17 +592,13 @@ function Compare() {
 /* ------------------------------------------------------------------ */
 
 function Privacy() {
-  const points = [
-    { title: 'Your work stays on your device', body: 'Flows, keys and files live in your browser, or on your computer with OAIY Desktop. Nothing is uploaded to OAIY, and there is no account.' },
-    { title: 'Keys stay on your device', body: 'API keys are kept sealed in your browser and used only in the requests your flows make. They are never sent to OAIY.' },
-    { title: 'Prompts go where you point them', body: 'To a model on your own machine, or to the provider whose key you added. They never pass through a server of ours.' },
-    { title: 'Flow code runs in a sandbox', body: 'Code nodes execute inside Zipp, a JavaScript engine compiled to WebAssembly with no network, no storage and hard limits on CPU and memory.' },
-  ];
+  // What is said depends on the build: with a sharing service (VITE_API_BASE) a shared flow does reach it.
+  const { sub, points } = privacyCopy(backendBaseUrl() !== '');
   return (
     <Section
       id="privacy"
       title="Built to keep your data yours"
-      sub="Local-first on purpose. This site serves the page and the editor, and nothing you build or run is sent back to it."
+      sub={sub}
       tone="var(--signal-green)"
     >
       <ul className="lp-checks">

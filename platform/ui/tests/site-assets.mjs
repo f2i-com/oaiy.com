@@ -20,6 +20,7 @@ import path from 'node:path';
 import { loadTs, suite, UI } from './support/loadTs.mjs';
 
 const S = await loadTs('src/landing/screenshots.ts');
+const PRIVACY = await loadTs('src/landing/privacy.ts');
 const { check, finish } = suite('site pictures and pages');
 const publicFile = (rel) => path.join(UI, 'public', rel.replace(/^\//, ''));
 const read = (rel) => fs.readFileSync(path.join(UI, rel), 'utf8');
@@ -103,6 +104,94 @@ await check('every page names the card by an absolute URL, with its size and a d
   assert.equal(new Set(Object.keys(PAGES).map((p) => read(p).match(/<title>([^<]*)<\/title>/)[1])).size, 3, 'a title of its own for each page');
 });
 
+await check('privacy, in a build with no sharing service (the release): nothing is uploaded, and keys are sealed where the browser can', () => {
+  const { sub, points } = PRIVACY.privacyCopy(false);
+  const text = [sub, ...points.flatMap((p) => [p.title, p.body])].join('\n');
+  assert.match(text, /Nothing is uploaded to OAIY/);
+  assert.match(text, /nothing you build or run is sent back to it/);
+  assert.match(text, /sealed where the browser supports it/, 'the sealing is not absolute: secretVault.ts falls back to plain storage where it cannot seal');
+  assert.doesNotMatch(text, /API keys are kept sealed in your browser/, 'no absolute claim');
+  assert.doesNotMatch(text, /sharing service|Share\b/);
+  assert.ok(points.some((p) => p.title === 'Keys stay on your device'), 'test:site and the e2e look for this title');
+});
+
+await check('privacy, in a build with a sharing service (VITE_API_BASE): the flow does reach it when shared, and the page says so plainly', () => {
+  const { sub, points } = PRIVACY.privacyCopy(true);
+  const text = [sub, ...points.flatMap((p) => [p.title, p.body])].join('\n');
+  assert.doesNotMatch(text, /Nothing is uploaded to OAIY/);
+  assert.doesNotMatch(text, /nothing you build or run is sent back/);
+  assert.doesNotMatch(text, /never pass through a server of ours/);
+  assert.match(text, /sent to the sharing service only when you press Share/);
+  assert.match(text, /turn sharing off in Settings/, 'sharing is on by default there (sharingPrefs.ts), and can be turned off');
+  assert.match(text, /encrypted first if you set a password/);
+  assert.match(text, /inputs and its result pass through the service/, 'a run someone queues on a shared flow');
+  assert.match(text, /asks the sharing service for runs that others queue/, 'while a flow is shared the editor polls (backendDispatcher.startBackendDispatcher)');
+  assert.match(text, /Editing it afterwards does not update that copy, and Stop sharing does not delete it/, 'updateFlow and deleteFlow are never called; see the next check');
+  assert.match(text, /A shared flow is sent without them/, 'the keys are taken out of a shared flow (sanitizeProjectForExport)');
+  assert.match(text, /sealed where the browser supports it/);
+  assert.ok(points.some((p) => p.title === 'Keys stay on your device'));
+});
+
+await check('what the sharing-build words rest on is what the code does: only Share sends a flow, nothing pushes an edit, nothing is asked of the service with nothing shared', () => {
+  const src = (rel) => read(path.posix.join('src', rel));
+  const code = (file) => src(file).replace(/\/\*[\s\S]*?\*\//g, '').replace(/^\s*\/\/.*$/gm, '');
+  const files = [];
+  const walk = (dir) => {
+    for (const entry of fs.readdirSync(path.join(UI, 'src', dir), { withFileTypes: true })) {
+      const rel = path.posix.join(dir, entry.name);
+      if (entry.isDirectory()) walk(rel);
+      else if (/\.(ts|tsx)$/.test(entry.name)) files.push(rel);
+    }
+  };
+  walk('');
+  const dispatcher = 'lib/backendDispatcher.ts';
+  const importing = /import\s+(type\s+)?(\{[^}]*\}|\*\s+as\s+\w+|\w+)\s+from\s+'[^']*backendDispatcher'|import\(\s*'[^']*backendDispatcher'/g;
+  // Which files import the dispatcher at all, and which of its functions each one imports as a value (not a type).
+  const imports = {};
+  for (const file of files.filter((f) => f !== dispatcher)) {
+    for (const match of src(file).matchAll(importing)) {
+      const names = /^\{/.test(match[2] ?? '')
+        ? match[2].slice(1, -1).split(',').map((n) => n.trim()).filter((n) => n && !/^type\s/.test(n) && !match[1]).map((n) => n.split(/\s+as\s+/)[0])
+        : ['*'];
+      imports[file] = [...(imports[file] ?? []), ...names];
+    }
+  }
+  assert.deepEqual(Object.keys(imports).sort(), ['components/OAIYApp.tsx', 'components/dialogs/ShareFlowDialog.tsx', 'hooks/useBackendIntegration.ts', 'lib/openSharedFlow.ts'], 'the files that can reach the sharing service');
+  assert.deepEqual(imports['components/OAIYApp.tsx'], [], 'types only');
+  assert.deepEqual(imports['components/dialogs/ShareFlowDialog.tsx'], [], 'types only');
+  const importers = (name) => Object.entries(imports).filter(([, names]) => names.includes(name) || names.includes('*')).map(([file]) => file);
+  assert.deepEqual(importers('createFlow'), ['hooks/useBackendIntegration.ts'], 'the one place a flow is sent');
+  assert.deepEqual(importers('updateFlow'), [], 'no edit is pushed to a shared copy');
+  assert.deepEqual(importers('deleteFlow'), [], 'Stop sharing does not delete the copy');
+  assert.deepEqual(importers('getStatus'), [], 'no status probe');
+  assert.deepEqual(importers('readFlow'), ['lib/openSharedFlow.ts'], 'a ?flow= link is the one other thing that reads from the service');
+  assert.deepEqual(imports['hooks/useBackendIntegration.ts'].sort(), ['createFlow', 'isBackendEnabled', 'startBackendDispatcher'], 'and the gate, which asks nothing of the service');
+  // createFlow is called from createShare only, and only the Share dialog is given createShare.
+  const hook = src('hooks/useBackendIntegration.ts');
+  assert.equal((hook.match(/\bcreateFlow\(/g) ?? []).length, 1);
+  assert.match(hook, /const createShare = async \([\s\S]*?await createFlow\(snapshot, createOpts\)/);
+  assert.deepEqual(files.filter((f) => f !== 'hooks/useBackendIntegration.ts' && /\bcreateShare\b/.test(code(f))), ['components/OAIYApp.tsx']);
+  assert.match(src('components/OAIYApp.tsx'), /onCreate=\{\(snapshot, opts\) => backend\.createShare\(/);
+  // The polling starts only with a share and sharing on, and the share is remembered; forgetting it only forgets it here.
+  assert.match(hook, /if \(!enabled \|\| share === null\) \{[\s\S]{0,160}?return;\s*\}\s*setDispatchState\('idle'\);[\s\S]{0,200}?startBackendDispatcher\(/);
+  assert.match(hook, /localStorage\.setItem\(SHARE_KEY/);
+  assert.match(hook, /const forgetShare = \(\) => \{\s*setShare\(null\);\s*writeShareToStorage\(null\);\s*\};/);
+  assert.match(src('components/dialogs/ShareFlowDialog.tsx'), /the backend copy is NOT deleted/);
+  // Every request to the service goes through one fetch, in apiJson, which refuses when the build has no service or sharing is off.
+  const text = src(dispatcher);
+  assert.equal((code(dispatcher).match(/\bfetch\(/g) ?? []).length, 1, 'one fetch: apiJson');
+  assert.match(text, /if \(!isBackendEnabled\(\)\) \{\s*throw new Error\('backend disabled/);
+  assert.match(text, /return API_BASE !== '' && isSharingEnabled\(\);/);
+});
+
+await check('the page takes its privacy words from the build, not from a fixed list', () => {
+  const page = read('src/landing/LandingPage.tsx');
+  assert.match(page, /privacyCopy\(backendBaseUrl\(\) !== ''\)/);
+  assert.doesNotMatch(page, /Nothing is uploaded to OAIY/, 'the sentence lives in privacy.ts, with its condition');
+  // and the condition is the code\'s own: sharing is on by default exactly when the build has a service
+  assert.match(read('src/lib/sharingPrefs.ts'), /return BUILD_API_BASE !== '';/);
+});
+
 await check('the pages no longer say what is not true of the product', () => {
   const landing = read('src/landing/LandingPage.tsx');
   const desktop = read('src/landing/DesktopPage.tsx');
@@ -128,7 +217,6 @@ await check('what the pages must say plainly is there', () => {
   assert.match(landing, /Aokie/);
   assert.match(landing, /FormLogic/);
   assert.match(landing, /Keys stay on your device/);
-  assert.match(landing, /Nothing is uploaded to OAIY/);
   assert.match(landing, /COMPARISON/, 'the comparison of the browser and the desktop');
   // desktop: what it is now, how to install, what to expect
   for (const [what, pattern] of [

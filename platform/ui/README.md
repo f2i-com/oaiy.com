@@ -72,3 +72,10 @@ demo setup) and the social card (`public/og-image.png`, 1200 x 630). Sizes and d
 `npm test` covers all of the above without a browser (`tests/sw-core.mjs`, `sw-build.mjs`, `pwa-controllers.mjs`, `pwa-assets.mjs`,
 `downloads.mjs`, `site-assets.mjs`). The browser suites need a build or a server: `tests/e2e.mjs` and `tests/pwa-e2e.mjs`
 (see [`../TESTING.md`](../TESTING.md)).
+
+## What the landing page says about privacy
+
+It depends on the build (`src/landing/privacy.ts`). The release is built with no sharing service (`VITE_API_BASE` unset): nothing a
+person builds or runs is uploaded. A build with a service has sharing on by default, so the page says a flow reaches the service only
+when the person presses Share, that a run someone queues on it passes through the service, and that sharing can be turned off. Keys are
+"sealed where the browser supports it": the editor keeps them in plain storage where it cannot seal them.
