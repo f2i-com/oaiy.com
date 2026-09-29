@@ -268,16 +268,20 @@ mod process_tests {
     /// Everything the phone module needs a connector to declare, and the two commands that say whether a call is live.
     const PHONE_COMMANDS: [&str; 5] = ["phone.status", "sms.send", "settings.get", "settings.set", "call.dial"];
 
-    struct Sandbox(PathBuf);
+    /// A folder of one test's own, and the turn to use the machine's process table: these tests start real Node children, and the whole
+    /// suite runs beside them (the voice tests are timed), so at most one of them runs at a time.
+    struct Sandbox(PathBuf, #[allow(dead_code)] std::sync::MutexGuard<'static, ()>);
 
     impl Sandbox {
         fn new(tag: &str) -> Sandbox {
             use std::sync::atomic::{AtomicU32, Ordering};
             static N: AtomicU32 = AtomicU32::new(0);
+            static ONE_AT_A_TIME: Mutex<()> = Mutex::new(());
+            let turn = ONE_AT_A_TIME.lock().unwrap_or_else(|e| e.into_inner());
             let dir = std::env::temp_dir().join(format!("oaiy-phone-{tag}-{}-{}", std::process::id(), N.fetch_add(1, Ordering::Relaxed)));
             let _ = std::fs::remove_dir_all(&dir);
             std::fs::create_dir_all(&dir).unwrap();
-            Sandbox(dir)
+            Sandbox(dir, turn)
         }
     }
 
@@ -288,7 +292,8 @@ mod process_tests {
     }
 
     fn has_node() -> bool {
-        std::process::Command::new("node").arg("--version").stdout(std::process::Stdio::null()).stderr(std::process::Stdio::null()).status().map(|s| s.success()).unwrap_or(false)
+        static HAS: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        *HAS.get_or_init(|| std::process::Command::new("node").arg("--version").stdout(std::process::Stdio::null()).stderr(std::process::Stdio::null()).status().map(|s| s.success()).unwrap_or(false))
     }
 
     /// A plugin host with an unsigned-plugin-friendly registry and nothing started.
@@ -533,11 +538,10 @@ mod process_tests {
         let host = host(&sb);
         let dir = install(&sb, &["call.switchboard"], idle_board());
         start(&host);
-        // A real updater over real probes: the phone line is the plugin.
+        // A real updater over the real phone line: the phone line is the plugin.
         let line: Arc<dyn Line> = Arc::new(PluginLine::with_timeout(host.clone(), Duration::from_millis(800)));
-        let probes = Probes { phone: Some(line), ..Default::default() };
         let (updater, _, now) = crate::update::updater::tests::ready();
-        updater.set_activity(Arc::new(probes));
+        updater.set_activity(Arc::new(OnlyThePhone(line)));
         let dir2 = dir.clone();
         // The Agent's flush takes seconds; a call comes in on the phone meanwhile.
         let flush = move || behave(&dir2, json!({ "mode": "answer", "data": { "foreground": call(), "waiting": null, "parked": null } }));
@@ -563,8 +567,7 @@ mod process_tests {
         let clock = move || now;
         let outcome = crate::update::install::perform(&updater, &crate::update::install::Steps { flush: &flush, parts: &parts, hand_off: &hand_off, clock: &clock });
         match outcome {
-            // (Other tests in this process may add a reason of their own to the list; the plugin's call is in it.)
-            crate::update::install::Outcome::Refused(crate::update::updater::InstallRefusal::Blocked(blockers)) => assert!(blockers.iter().any(|b| b.code == "phoneCall"), "{blockers:?}"),
+            crate::update::install::Outcome::Refused(crate::update::updater::InstallRefusal::Blocked(blockers)) => assert_eq!(blockers.iter().map(|b| b.code).collect::<Vec<_>>(), ["phoneCall"], "{blockers:?}"),
             other => panic!("{other:?}"),
         }
         assert!(stopped.lock().unwrap().is_empty(), "nothing was stopped");
@@ -607,6 +610,20 @@ mod process_tests {
         }
         // The same gate does refuse a journalled command asked without a key: what this test relies on is real.
         assert!(matches!(registry.gate(&connector, "call.answer", None), Err(crate::plugins::GateRefusal::IdempotencyRequired { .. })));
+    }
+
+    /// What an install asks, with the phone line the real one and nothing else read: the real `Probes` also read what the whole
+    /// process shares (the call hub, the agent's tasks, plugin installs), which other tests in this process set and clear.
+    struct OnlyThePhone(Arc<dyn Line>);
+
+    impl crate::update::blockers::Activity for OnlyThePhone {
+        fn read(&self, fresh: bool) -> crate::update::blockers::Readings {
+            crate::update::blockers::Readings { phone: self.0.ask(fresh), ..Default::default() }
+        }
+
+        fn calls(&self) -> crate::update::blockers::CallReadings {
+            crate::update::blockers::CallReadings { hub_calls: 0, phone: self.0.ask(true) }
+        }
     }
 
     fn board(foreground: Option<serde_json::Value>) -> serde_json::Value {
@@ -729,11 +746,11 @@ mod process_tests {
         let host = host(&sb);
         let dir = install(&sb, &["call.switchboard"], idle_board());
         start(&host);
-        // The real updater over the real probes and the real phone line, and two stand-in parts: the first (the engines) takes its time to
-        // stop, and in that time a call reaches the phone plugin; the second is the plugins, which hold the phone.
+        // The real updater over the real phone line, and two stand-in parts: the first (the engines) takes its time to stop, and in that
+        // time a call reaches the phone plugin; the second is the plugins, which hold the phone.
         let line: Arc<dyn Line> = Arc::new(PluginLine::with_timeout(host.clone(), Duration::from_millis(800)));
         let (updater, _, now) = crate::update::updater::tests::ready();
-        updater.set_activity(Arc::new(Probes { phone: Some(line), ..Default::default() }));
+        updater.set_activity(Arc::new(OnlyThePhone(line)));
         let log = Arc::new(Mutex::new(Vec::<String>::new()));
         struct StandIn {
             name: &'static str,
@@ -768,7 +785,7 @@ mod process_tests {
         let (flush, clock) = (|| {}, move || now);
         let outcome = crate::update::install::perform(&updater, &crate::update::install::Steps { flush: &flush, parts: &parts, hand_off: &hand_off, clock: &clock });
         match outcome {
-            crate::update::install::Outcome::Refused(crate::update::updater::InstallRefusal::Blocked(blockers)) => assert!(blockers.iter().any(|b| b.code == "phoneCall"), "{blockers:?}"),
+            crate::update::install::Outcome::Refused(crate::update::updater::InstallRefusal::Blocked(blockers)) => assert_eq!(blockers.iter().map(|b| b.code).collect::<Vec<_>>(), ["phoneCall"], "{blockers:?}"),
             other => panic!("{other:?}"),
         }
         assert_eq!(*log.lock().unwrap(), ["stop the engines", "start the engines"], "the plugins were never stopped, and the engines are running again");
@@ -786,5 +803,9 @@ mod process_tests {
         let readings = probes.read(false);
         assert_eq!(readings.phone, LineState::Live { plugin: "Line Test Plugin".into(), count: 2 });
         assert_eq!(line.asked_cached.load(std::sync::atomic::Ordering::SeqCst), 1);
+        // The look before the plugins stop reads the phone line afresh too (the hub is shared with other tests, so only the line is compared).
+        let calls = probes.calls();
+        assert_eq!(calls.phone, LineState::Live { plugin: "Line Test Plugin".into(), count: 2 });
+        assert_eq!(line.asked_fresh.load(std::sync::atomic::Ordering::SeqCst), 2, "the look asked afresh, whatever was kept");
     }
 }
