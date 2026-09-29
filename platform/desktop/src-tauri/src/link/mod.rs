@@ -25,6 +25,7 @@ pub mod net;
 pub mod oauth;
 pub mod ops;
 pub mod outbox;
+pub mod policy;
 pub mod relay;
 pub mod result_actions;
 pub mod routes;
