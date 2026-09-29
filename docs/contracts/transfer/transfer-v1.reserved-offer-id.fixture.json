@@ -1,0 +1,43 @@
+{
+  "contract": "transfer_v1",
+  "kind": "reserved_offer_id",
+  "about": "The signed transfer offer the plugin publishes to a device on the native call surface (voice_system_ui) has a derived id, so the ring hint the OAIY host posts and the offer the phone later receives name the same offer and the phone upgrades its placeholder in place instead of ringing twice. offerId = \"toffer_\" + lower-case RFC 4648 base32 (no padding) of SHA-256(\"oaiy/transfer-offer/v1\" 0x00 requestId 0x00 holderThumbprint), first 26 characters. holderThumbprint is the device's endpoint-key thumbprint: the base64url SHA-256 of {\"crv\":\"Ed25519\",\"kty\":\"OKP\",\"x\":<base64url public key>}. A retired offer is never published again under the same id, because the phone spends an offer before it answers: generation 0 hashes as above and generation n >= 1 appends 0x00 and the decimal n to the hashed input. The plugin increments a per (request, holder) counter whenever it retires that offer; a refresh of an unanswered offer keeps the id and takes a fresh jti. The ring hint carries generation 0. The id is an identifier, never a credential: the offer's signed token and one-use jti authorise anything. Two devices that present the same key derive the same id; the first keeps it.",
+  "domain": "oaiy/transfer-offer/v1",
+  "prefix": "toffer_",
+  "digestChars": 26,
+  "idLength": 33,
+  "idAlphabet": "abcdefghijklmnopqrstuvwxyz234567",
+  "requestId": "assist_0123456789abcdef0123456789abcdef",
+  "testPhones": [
+    {
+      "name": "first test phone (Ed25519 seed of 32 bytes of 0x55; test only)",
+      "publicKeyHex": "c6822637c7d310ec57627be00ba259d253749f4aaf644470cffbe53a35f73242",
+      "holderThumbprint": "BLZLEktWlEkM8UgeGgeGY7D5ounEiW2ZqRuQkUbEHa8",
+      "offerIds": [
+        "toffer_ertekigjycmj2scu4fikachllm",
+        "toffer_ispwfvmwl7yv7vfn6s673qd64j",
+        "toffer_j4td3x77lmwdaawb5xmi52t6xt"
+      ]
+    },
+    {
+      "name": "second test phone (Ed25519 seed of 32 bytes of 0x66; test only)",
+      "publicKeyHex": "34b4d9043156cb6dcf0beb0a2949b7559c940d2bcb6dbe8c53a9b30278e3a746",
+      "holderThumbprint": "Gec-ct57Gwltw072qu-aed20Ju93h-m8Qv8yjNgvMOM",
+      "offerIds": [
+        "toffer_cqalgrixultpirc3wxjy2jsrpb",
+        "toffer_vn6vxabupbjwhjb7gf372hj73t",
+        "toffer_hvi5j3buwa36hyjpbw5aw6bvuy"
+      ]
+    }
+  ],
+  "offerIdsByGeneration": "offerIds[n] is the id of generation n",
+  "notReservedIds": [
+    "offer_0123456789abcdef0123456789abcdef",
+    "toffer_",
+    "toffer_short",
+    "toffer_ERTEKIGJYCMJ2SCU4FIKACHLLM",
+    "toffer_ertekigjycmj2scu4fikachllm0",
+    "toffer_ertekigjycmj2scu4fikachll1",
+    ""
+  ]
+}

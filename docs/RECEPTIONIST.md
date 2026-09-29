@@ -186,8 +186,9 @@ not use) before anybody rang, so a refusal that rang nobody does not start the 6
 **What is not built yet:** push notifications (a phone rings while its Companion is connected, not
 by waking a closed app), showing your screens on a phone, returning the call's audio to the handset
 that carries it, and answering from OAIY itself (this computer cannot carry the audio, so the
-dialog has no Accept: you answer on a Companion). See [Phone calls](CALLS.md) for how a transfer works on the line, and
-`contracts/transfer/` for the contract with the phone plugin.
+dialog has no Accept: you answer on a Companion). See [Phone calls](CALLS.md) for how a transfer works on the line,
+[the contract with the phone plugin](contracts/transfer/transfer-v1.md) (the plugin's own document and fixtures, copied
+here unchanged) and [what OAIY adds to it](contracts/transfer/oaiy-only/README.md).
 
 ## In the Agent: the Front desk
 

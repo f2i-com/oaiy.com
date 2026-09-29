@@ -44,6 +44,11 @@ use super::runner::{plugin_data_dir, plugin_env, HANDSHAKE_TIMEOUT, HEALTH_TIMEO
 use super::trust::LaunchPermit;
 use crate::services::runner::LogBuffer;
 
+/// The host features `plugin.init` announces, in this order. `eventAck`: events are acknowledged. `ringPlan`: this host answers
+/// `oaiy.ring.plan` and `oaiy.ring.opened` (`docs/contracts/transfer/`). It is what this host can do, not what the owner allows: with
+/// transfers off the call's `ready` says nothing of it, so a plugin that offers the tool because of this still never puts it on the wire.
+pub const HOST_FEATURES: [&str; 2] = ["eventAck", "ringPlan"];
+
 /// A failed plugin call, in the terms a caller can act on.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum CallError {
@@ -495,10 +500,8 @@ impl PluginProcess {
             "devMode": dev_mode,
             // Advertised host features the plugin may opt into. Absent means
             // a legacy host, so a plugin must tolerate an empty list.
-            // `ringPlan`: this host answers `oaiy.ring.plan` and `oaiy.ring.opened` (docs/contracts/transfer/). It is
-            // what this host can do, not what the owner allows: with transfers off the call's `ready` says nothing of
-            // it, so a plugin that offers the tool because of this still never puts it on the wire.
-            "features": ["eventAck", "ringPlan"],
+            // See [`HOST_FEATURES`].
+            "features": HOST_FEATURES,
         });
         // Sent only when there is one. An explicit null is accepted by the
         // decoder, but omitting it keeps the handshake of every ordinary plugin
@@ -1004,8 +1007,9 @@ process.stdin.on("data", (chunk) => {
                 .init(1, &f.dir.join("data"), false, None)
                 .expect("plugin.init must answer");
             assert_eq!(init["ok"], true);
-            // The host advertises eventAck; the fixture echoes what it received.
+            // The host advertises eventAck and ringPlan; the fixture echoes what it received.
             assert_eq!(init["features"][0], "eventAck");
+            assert_eq!(init["features"], json!(HOST_FEATURES));
 
             let health = p.health().expect("plugin.health must answer");
             assert_eq!(health["status"], "ok");

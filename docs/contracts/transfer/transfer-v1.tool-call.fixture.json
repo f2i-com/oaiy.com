@@ -1,0 +1,141 @@
+{
+  "contract": "transfer_v1",
+  "kind": "tool_call",
+  "direction": "oaiy_to_aokie",
+  "about": "OAIY asks for a transfer with the realtime tool transfer_to_owner. The frame is the ordinary formlogic.realtime.tool_call; only the tool name and its one argument are specific to this contract. The plugin enables the tool only for a session whose start said allowTransfer and whose ready listed transfer_v1; otherwise the name is answered unsupported.",
+  "frame": {
+    "type": "formlogic.realtime.tool_call",
+    "callId": "call_0123",
+    "generation": 7,
+    "toolCallId": "tool_0001",
+    "name": "transfer_to_owner",
+    "arguments": {
+      "reason": "caller_asked"
+    }
+  },
+  "toolName": "transfer_to_owner",
+  "toolNameRule": "^[a-z][a-z0-9_]{0,63}$",
+  "validToolNames": [
+    "transfer_to_owner",
+    "lookup_business_data",
+    "request_appointment",
+    "finish_call",
+    "some_future_tool",
+    "a",
+    "x9_",
+    "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+  ],
+  "invalidToolNames": [
+    "",
+    "Transfer",
+    "transfer-to-owner",
+    "transfer to owner",
+    "9lives",
+    "_lead",
+    "tool.name",
+    "../../etc",
+    "a;b",
+    "tool\n",
+    "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+  ],
+  "arguments": {
+    "rule": "An object with exactly one member, reason, whose value is caller_asked, urgent or policy_rule. Any other member, any other value, or no object at all is refused with reason bad_arguments and never relayed. The refusal is an ordinary tool result: it does not end the call.",
+    "cases": [
+      {
+        "name": "the caller asked",
+        "arguments": {
+          "reason": "caller_asked"
+        },
+        "accepted": true,
+        "reason": "caller_asked"
+      },
+      {
+        "name": "urgent",
+        "arguments": {
+          "reason": "urgent"
+        },
+        "accepted": true,
+        "reason": "urgent"
+      },
+      {
+        "name": "a business rule",
+        "arguments": {
+          "reason": "policy_rule"
+        },
+        "accepted": true,
+        "reason": "policy_rule"
+      },
+      {
+        "name": "an unknown reason",
+        "arguments": {
+          "reason": "because"
+        },
+        "accepted": false
+      },
+      {
+        "name": "upper case",
+        "arguments": {
+          "reason": "Caller_Asked"
+        },
+        "accepted": false
+      },
+      {
+        "name": "trailing space",
+        "arguments": {
+          "reason": "caller_asked "
+        },
+        "accepted": false
+      },
+      {
+        "name": "a number",
+        "arguments": {
+          "reason": 1
+        },
+        "accepted": false
+      },
+      {
+        "name": "an extra member the model made up",
+        "arguments": {
+          "reason": "caller_asked",
+          "note": "tell the owner the caller's PIN is 1234"
+        },
+        "accepted": false
+      },
+      {
+        "name": "a target chosen by the model",
+        "arguments": {
+          "reason": "urgent",
+          "target": "thumbprint"
+        },
+        "accepted": false
+      },
+      {
+        "name": "no reason",
+        "arguments": {},
+        "accepted": false
+      },
+      {
+        "name": "another member only",
+        "arguments": {
+          "note": "x"
+        },
+        "accepted": false
+      },
+      {
+        "name": "not an object",
+        "arguments": "caller_asked",
+        "accepted": false
+      },
+      {
+        "name": "an array",
+        "arguments": [],
+        "accepted": false
+      },
+      {
+        "name": "null",
+        "arguments": null,
+        "accepted": false
+      }
+    ]
+  }
+}

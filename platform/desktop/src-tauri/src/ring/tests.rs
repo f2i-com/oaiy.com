@@ -40,6 +40,22 @@ fn windows(id: &str) -> Device {
     Device { kind: DeviceKind::Windows, online: true, pushable: false, ..phone(id) }
 }
 
+/// Every plan the design's vectors make, by vector id: what the plan of each input is, for tests that hold every one to a rule.
+pub(super) fn vector_plans() -> Vec<(String, super::plan::RingPlan)> {
+    let doc: Value = serde_json::from_str(VECTORS).unwrap();
+    doc["vectors"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|v| {
+            let mut input = doc["base"].clone();
+            merge(&mut input, &v["patch"]);
+            let inputs: Inputs = serde_json::from_value(input).unwrap_or_else(|e| panic!("{}: {e}", v["id"]));
+            (v["id"].as_str().unwrap().to_string(), plan(&inputs))
+        })
+        .collect()
+}
+
 #[test]
 fn the_conformance_vectors_give_their_known_answers() {
     let doc: Value = serde_json::from_str(VECTORS).unwrap();

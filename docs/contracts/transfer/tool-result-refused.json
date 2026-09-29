@@ -1,1 +1,0 @@
-{"callId":"call_0123","continueResponse":true,"generation":1,"name":"transfer_to_owner","ok":false,"output":{"instruction":"The caller has not asked for a person. Do not offer to transfer the call; carry on helping.","reason":"caller_did_not_ask","status":"refused"},"toolCallId":"tool_7","type":"formlogic.realtime.tool_result"}

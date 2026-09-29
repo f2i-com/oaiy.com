@@ -1,12 +1,13 @@
 //! The `transfer_v1` contract as types: the frames on the call's stream and the requests between
-//! the desktop and the phone plugin, exactly as `docs/contracts/transfer/` says them.
+//! the desktop and the phone plugin, as `docs/contracts/transfer/` says them.
 //!
 //! Nothing here runs a call. These types are what the fixtures are parsed with, so a change to
-//! what is sent or read that the fixtures do not describe fails a test; the Aokie repository has
-//! the same fixtures and a test of its own, and the two are compared by `SHA256SUMS`.
+//! what is sent or read that the fixtures do not describe fails a test. The folder is the phone
+//! plugin's own, copied byte for byte (its tests parse the same files with its types), and
+//! `scripts/check-transfer-contract.mjs` compares the two.
 //!
-//! The fixtures are canonical JSON: keys sorted at every level, no whitespace, one trailing line
-//! feed ([`canonical`]).
+//! What this desktop reads from the plugin tolerates members it does not know (the plugin adds
+//! members without a new version); what it writes has exactly the members the contract names.
 
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -54,19 +55,6 @@ fn base32_lower(bytes: &[u8]) -> String {
         out.push(char::from(ALPHABET[((acc << (5 - bits)) & 31) as usize]));
     }
     out
-}
-
-/// `value` as canonical JSON: keys sorted at every level, no whitespace (a fixture is this and one line feed).
-pub fn canonical(value: &Value) -> String {
-    match value {
-        Value::Array(items) => format!("[{}]", items.iter().map(canonical).collect::<Vec<_>>().join(",")),
-        Value::Object(map) => {
-            let mut keys: Vec<&String> = map.keys().collect();
-            keys.sort();
-            format!("{{{}}}", keys.iter().map(|k| format!("{}:{}", Value::String((*k).clone()), canonical(&map[*k]))).collect::<Vec<_>>().join(","))
-        }
-        other => other.to_string(),
-    }
 }
 
 fn is_false(b: &bool) -> bool {
@@ -183,7 +171,7 @@ pub struct ToolResult {
 
 /// What a transfer's tool result carries when the owner is being rung.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase", deny_unknown_fields)]
+#[serde(rename_all = "camelCase")]
 pub struct RingingOutput {
     pub status: RingingStatus,
     pub request_id: String,
@@ -199,10 +187,11 @@ pub enum RingingStatus {
 
 /// What it carries when the request is not made: `refused` (do not offer a person at all) or `unavailable` (offer a message).
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase", deny_unknown_fields)]
+#[serde(rename_all = "camelCase")]
 pub struct RefusedOutput {
     pub status: RefusedStatus,
-    /// A plan reason, or `consent`, `pending_request`, `busy`, `bad_arguments`, `not_offered`, `tool_limit`.
+    /// A plan reason, or one of the plugin's (`consent`, `pending_request`, `bad_arguments`, `plan_unavailable`,
+    /// `call_changed`, ...), or one of this desktop's own (`not_offered`, `tool_limit`, `no_answer`).
     pub reason: String,
     pub instruction: String,
 }
@@ -227,6 +216,52 @@ pub struct OutcomeFrame {
     /// The owner's words for the caller (only with `declined`): untrusted text of at most 320 characters.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub message: Option<String>,
+    /// Unix epoch milliseconds.
+    pub at_ms: u64,
+}
+
+/// `formlogic.realtime.transfer_cancel`: this desktop withdraws a request that rings.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CancelFrame {
+    #[serde(rename = "type")]
+    pub kind: String,
+    pub call_id: String,
+    pub generation: u64,
+    pub request_id: String,
+    pub reason: crate::voice::transfer::CancelReason,
+}
+
+/// What a `formlogic.realtime.transfer_notice` says.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum NoticeKind {
+    /// An owner device has already won the request: the takeover goes on.
+    TooLate,
+    /// The call has no open request with that id: nothing was changed.
+    UnknownRequest,
+}
+
+impl NoticeKind {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            NoticeKind::TooLate => crate::voice::transfer::TOO_LATE,
+            NoticeKind::UnknownRequest => crate::voice::transfer::UNKNOWN_REQUEST,
+        }
+    }
+}
+
+/// `formlogic.realtime.transfer_notice`: the plugin's answer to a withdrawal that changed nothing.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct NoticeFrame {
+    #[serde(rename = "type")]
+    pub kind: String,
+    pub call_id: String,
+    pub generation: u64,
+    pub request_id: String,
+    pub notice: NoticeKind,
+    /// Unix epoch milliseconds.
     pub at_ms: u64,
 }
 
@@ -241,16 +276,9 @@ pub struct StopFrame {
     pub reason: String,
 }
 
-/// `oaiy.ring.plan`, the plugin asking the desktop who may be rung.
+/// The params of `oaiy.ring.plan`, the plugin asking the desktop who may be rung.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
-pub struct PlanRequest {
-    pub method: String,
-    pub params: PlanParams,
-}
-
-#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct PlanParams {
     pub call_id: String,
     pub call_epoch: u64,
@@ -262,18 +290,25 @@ pub struct PlanParams {
     pub recent_caller_turns: Vec<String>,
 }
 
-/// The desktop's answer to `oaiy.ring.plan`.
+/// The desktop's answer to `oaiy.ring.plan`. Written in full; read as the plugin reads it, where a member the answer leaves out
+/// (a plan that does not ring names nobody) is empty or false.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase", deny_unknown_fields)]
+#[serde(rename_all = "camelCase")]
 pub struct PlanResult {
-    /// Always a valid id, even when nobody is rung: the plugin refuses a plan without one.
+    /// Always a valid id, even when nobody is rung: the plugin loses the reason of a refusal it cannot tell apart.
+    #[serde(default)]
     pub plan_id: String,
     pub decision: Decision,
     pub reason: PlanReason,
+    #[serde(default)]
     pub ring_seconds: u32,
+    #[serde(default)]
     pub phones: Vec<String>,
+    #[serde(default)]
     pub wake: Vec<String>,
+    #[serde(default)]
     pub desktop_toast: bool,
+    #[serde(default)]
     pub desktop_companions: Vec<String>,
     /// This desktop itself vouches for the request's reason, so the plugin need not see the caller ask for a person. True only
     /// for `urgent`, when the owner allows it and one of their urgent phrases was heard; otherwise false.
@@ -281,16 +316,9 @@ pub struct PlanResult {
     pub reason_allowed: bool,
 }
 
-/// `oaiy.ring.opened`, the plugin telling the desktop the request is out.
+/// The params of `oaiy.ring.opened`, the plugin telling the desktop the request is out.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
-pub struct OpenedRequest {
-    pub method: String,
-    pub params: OpenedParams,
-}
-
-#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct OpenedParams {
     pub plan_id: String,
     pub request_id: String,
@@ -304,58 +332,178 @@ pub struct OpenedParams {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::collections::BTreeMap;
+    use crate::voice::transfer::{self, CancelReason, Outcome};
+    use serde::de::DeserializeOwned;
+    use serde_json::json;
+    use std::collections::{BTreeMap, BTreeSet};
 
     const DIR: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/../../../docs/contracts/transfer");
+
+    /// The shared fixtures, by the name between `transfer-v1.` and `.fixture.json`: every one is handled by a test below, and a
+    /// fixture that is in the folder and not here fails `every_fixture_in_the_folder_is_one_these_tests_handle`.
+    const FIXTURES: [&str; 8] = ["caller-asked", "cancel", "outcome", "reserved-offer-id", "ring-plan", "start-ready", "tool-call", "tool-result"];
 
     fn read(name: &str) -> String {
         std::fs::read_to_string(std::path::Path::new(DIR).join(name)).unwrap_or_else(|e| panic!("{name}: {e}"))
     }
 
-    /// The fixture parses as `T` and writes back as the very same bytes.
-    fn round_trip<T: Serialize + for<'de> Deserialize<'de> + std::fmt::Debug + PartialEq>(name: &str) -> T {
-        let text = read(name);
-        assert!(text.ends_with('\n') && !text[..text.len() - 1].contains('\n') && !text.contains('\r'), "{name}: one line, one line feed");
-        let value: Value = serde_json::from_str(&text).unwrap();
-        assert_eq!(format!("{}\n", canonical(&value)), text, "{name} is canonical JSON");
-        let typed: T = serde_json::from_value(value.clone()).unwrap_or_else(|e| panic!("{name}: {e}"));
-        let again = serde_json::to_value(&typed).unwrap();
-        assert_eq!(format!("{}\n", canonical(&again)), text, "{name}: what the types write is what the fixture says");
-        typed
+    fn fixture(kind: &str) -> Value {
+        let value: Value = serde_json::from_str(&read(&format!("transfer-v1.{kind}.fixture.json"))).unwrap_or_else(|e| panic!("{kind}: {e}"));
+        assert_eq!(value["contract"], "transfer_v1", "{kind}");
+        // The kind is the file's name in words (`transfer_cancel` for `cancel`, `tool_call` for `tool-call`).
+        assert!(value["kind"].as_str().is_some_and(|k| k.ends_with(&kind.replace('-', "_"))), "{kind}: {}", value["kind"]);
+        value
+    }
+
+    fn typed<T: DeserializeOwned>(what: &str, value: &Value) -> T {
+        serde_json::from_value(value.clone()).unwrap_or_else(|e| panic!("{what}: {e}: {value}"))
+    }
+
+    fn strings(value: &Value) -> Vec<String> {
+        value.as_array().unwrap_or_else(|| panic!("not a list: {value}")).iter().map(|v| v.as_str().unwrap_or_else(|| panic!("not a string: {v}")).to_string()).collect()
+    }
+
+    /// What the plugin does with a plan answer, as the fixture states it: a plan that rings needs an id it can use, every device is
+    /// an identifier, and there are at most sixteen. (What it does with the reason is `plan_reason_is_known`.)
+    fn plugin_can_use(result: &Value) -> bool {
+        fn token(s: &str) -> bool {
+            !s.is_empty() && s.len() <= 128 && s.bytes().all(|b| b.is_ascii_alphanumeric() || b"-_.:".contains(&b))
+        }
+        let Some(plan) = result.as_object() else { return false };
+        let decision = plan.get("decision").and_then(Value::as_str);
+        if !matches!(decision, Some("ring" | "message_only" | "refused")) {
+            return false;
+        }
+        if decision == Some("ring") && !plan.get("planId").and_then(Value::as_str).is_some_and(token) {
+            return false;
+        }
+        let mut devices = 0;
+        for key in ["phones", "desktopCompanions"] {
+            match plan.get(key) {
+                None => {}
+                Some(Value::Array(list)) => {
+                    for device in list {
+                        if !device.as_str().is_some_and(token) {
+                            return false;
+                        }
+                        devices += 1;
+                    }
+                }
+                Some(_) => return false,
+            }
+        }
+        devices <= 16
+    }
+
+    /// The reasons a plan may give: the closed set of the tool-result fixture.
+    fn plan_reasons() -> BTreeSet<String> {
+        strings(&fixture("tool-result")["planReasons"]).into_iter().collect()
+    }
+
+    /// The digest the check script and the phone's own check use: SHA-256 with CRLF folded to LF, so a checkout that adds carriage
+    /// returns and the committed blob agree.
+    fn digest(bytes: &[u8]) -> String {
+        let mut folded = Vec::with_capacity(bytes.len());
+        let mut i = 0;
+        while i < bytes.len() {
+            if bytes[i] == b'\r' && bytes.get(i + 1) == Some(&b'\n') {
+                i += 1;
+                continue;
+            }
+            folded.push(bytes[i]);
+            i += 1;
+        }
+        Sha256::digest(&folded).iter().map(|b| format!("{b:02x}")).collect()
+    }
+
+    /// `SHA256SUMS` in `dir` lists exactly the `.json` files there, each with its digest.
+    fn check_sums(dir: &str) {
+        let folder = std::path::Path::new(DIR).join(dir);
+        let sums = std::fs::read_to_string(folder.join("SHA256SUMS")).unwrap_or_else(|e| panic!("{dir}/SHA256SUMS: {e}"));
+        let mut listed = BTreeMap::new();
+        for line in sums.lines() {
+            let (sum, name) = line.split_once("  ").expect("a digest, two spaces, a name");
+            assert_eq!(sum.len(), 64, "{line}");
+            assert!(listed.insert(name.to_string(), sum.to_string()).is_none(), "{name} twice");
+        }
+        let mut on_disk: Vec<String> = std::fs::read_dir(&folder).unwrap().flatten().map(|e| e.file_name().to_string_lossy().into_owned()).filter(|n| n.ends_with(".json")).collect();
+        on_disk.sort();
+        assert_eq!(listed.keys().cloned().collect::<Vec<_>>(), on_disk, "{dir}/SHA256SUMS lists exactly the fixtures");
+        for (name, sum) in &listed {
+            assert_eq!(&digest(&std::fs::read(folder.join(name)).unwrap()), sum, "{dir}/{name}");
+        }
     }
 
     #[test]
-    fn the_offer_ids_of_the_design_are_what_this_computes() {
-        #[derive(Deserialize)]
-        #[serde(rename_all = "camelCase")]
-        struct Vector {
-            generation: u32,
-            holder_thumbprint: String,
-            offer_id: String,
+    fn every_fixture_in_the_folder_is_one_these_tests_handle_and_the_contract_names_them_all() {
+        let mut on_disk: Vec<String> = std::fs::read_dir(DIR).unwrap().flatten().map(|e| e.file_name().to_string_lossy().into_owned()).filter(|n| n.ends_with(".json")).collect();
+        on_disk.sort();
+        let handled: Vec<String> = FIXTURES.iter().map(|k| format!("transfer-v1.{k}.fixture.json")).collect();
+        assert_eq!(on_disk, handled, "a fixture was added or removed: give it a test, and add it to FIXTURES");
+        // The prose contract lists every one of them.
+        let doc = read("transfer-v1.md");
+        for name in &handled {
+            assert!(doc.contains(&format!("[{name}]({name})")), "transfer-v1.md does not name {name}");
         }
-        #[derive(Deserialize)]
-        #[serde(rename_all = "camelCase")]
-        struct File {
-            domain: String,
-            request_id: String,
-            vectors: Vec<Vector>,
+        // And each is its own kind, once.
+        let kinds: BTreeSet<String> = FIXTURES.iter().map(|k| fixture(k)["kind"].as_str().unwrap().to_string()).collect();
+        assert_eq!(kinds.len(), FIXTURES.len());
+    }
+
+    #[test]
+    fn the_sums_list_every_fixture_and_each_sum_is_right() {
+        check_sums("");
+        check_sums("oaiy-only");
+    }
+
+    #[test]
+    fn the_folder_is_lf_only_so_its_digests_are_the_same_on_every_checkout() {
+        for dir in ["", "oaiy-only"] {
+            let folder = std::path::Path::new(DIR).join(dir);
+            let mut checked = 0;
+            for entry in std::fs::read_dir(&folder).unwrap().flatten().filter(|e| e.path().is_file()) {
+                let bytes = std::fs::read(entry.path()).unwrap();
+                assert!(!bytes.contains(&b'\r'), "{:?} has a carriage return: .gitattributes keeps this folder LF", entry.file_name());
+                checked += 1;
+            }
+            assert!(checked >= 4, "{dir}: {checked} files");
         }
-        let file: File = serde_json::from_str(&read("offer-id.json")).unwrap();
-        assert_eq!(file.domain, OFFER_DOMAIN);
-        assert_eq!(file.vectors.len(), 4);
-        for v in &file.vectors {
-            let id = offer_id(&file.request_id, &v.holder_thumbprint, v.generation);
-            assert_eq!(id, v.offer_id, "generation {}", v.generation);
-            assert_eq!(id.len(), 33, "{id}");
-            assert!(id.bytes().all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'_'));
+    }
+
+    #[test]
+    fn the_reserved_offer_ids_of_both_test_phones_are_what_this_computes() {
+        let f = fixture("reserved-offer-id");
+        assert_eq!(f["domain"], OFFER_DOMAIN);
+        assert_eq!(f["prefix"], "toffer_");
+        assert_eq!(f["digestChars"], 26);
+        assert_eq!(f["idLength"], 33);
+        let alphabet = f["idAlphabet"].as_str().unwrap();
+        let request = f["requestId"].as_str().unwrap();
+        let phones = f["testPhones"].as_array().unwrap();
+        assert_eq!(phones.len(), 2);
+        let mut all = BTreeSet::new();
+        for phone in phones {
+            let thumbprint = phone["holderThumbprint"].as_str().unwrap();
+            let ids = strings(&phone["offerIds"]);
+            assert_eq!(ids.len(), 3, "generations 0, 1 and 2");
+            for (generation, expected) in ids.iter().enumerate() {
+                let id = offer_id(request, thumbprint, generation as u32);
+                assert_eq!(&id, expected, "{} generation {generation}", phone["name"]);
+                assert_eq!(id.len(), 33);
+                assert!(id.strip_prefix("toffer_").unwrap().chars().all(|c| alphabet.contains(c)), "{id}");
+                assert!(all.insert(id), "every offer id is its own");
+            }
         }
-        // A different request, holder or generation is a different offer.
-        let base = offer_id(&file.request_id, &file.vectors[0].holder_thumbprint, 0);
-        assert_ne!(base, offer_id("assist_other", &file.vectors[0].holder_thumbprint, 0));
-        assert_ne!(base, offer_id(&file.request_id, &file.vectors[1].holder_thumbprint, 0));
-        assert_ne!(base, offer_id(&file.request_id, &file.vectors[0].holder_thumbprint, 1));
-        assert_ne!(offer_id(&file.request_id, &file.vectors[0].holder_thumbprint, 1), offer_id(&file.request_id, &file.vectors[0].holder_thumbprint, 2));
-        // The parts cannot run into one another: the zero bytes keep "a"+"bc" from being "ab"+"c".
+        // Ids that are not reserved ones are not what this computes.
+        for other in strings(&f["notReservedIds"]) {
+            assert!(!all.contains(&other), "{other}");
+        }
+        // A different request, holder or generation is a different offer, and the parts cannot run into one another.
+        let thumbprint = phones[0]["holderThumbprint"].as_str().unwrap();
+        let base = offer_id(request, thumbprint, 0);
+        assert_ne!(base, offer_id("assist_other", thumbprint, 0));
+        assert_ne!(base, offer_id(request, phones[1]["holderThumbprint"].as_str().unwrap(), 0));
+        assert_ne!(base, offer_id(request, thumbprint, 1));
         assert_ne!(offer_id("a", "bc", 0), offer_id("ab", "c", 0));
     }
 
@@ -371,136 +519,338 @@ mod tests {
     }
 
     #[test]
-    fn a_start_that_allows_transfer_and_one_that_resumes_a_call_round_trip() {
-        let start: StartFrame = round_trip("start-allow-transfer.json");
-        assert!(start.allow_transfer && start.resume.is_none());
-        assert_eq!((start.direction.as_deref(), start.from.as_deref()), (Some("inbound"), Some("+61491570006")));
-        let resume: StartFrame = round_trip("start-resume.json");
-        assert_eq!(resume.resume, Some(Resume { after_handoff: true, handoff_seconds: 42, via: ResumeVia::Return }));
-        assert_eq!(resume.generation, 2);
-        // A start without either (an older phone) is a start as it always was: neither member is written.
-        let mut plain = start.clone();
-        plain.allow_transfer = false;
-        let written = serde_json::to_value(&plain).unwrap();
-        assert!(written.get("allowTransfer").is_none() && written.get("resume").is_none());
+    fn the_starts_the_phone_sends_and_the_ready_this_desktop_answers_are_the_fixtures() {
+        let f = fixture("start-ready");
+        // A whole start as this desktop's types read it (the fixture names only what the contract adds).
+        let whole: Value = serde_json::from_str(&read("oaiy-only/start-allow-transfer.json")).unwrap();
+        for case in f["start"]["cases"].as_array().unwrap() {
+            let name = case["name"].as_str().unwrap();
+            let mut start = whole.clone();
+            for member in ["allowTransfer", "resume"] {
+                start.as_object_mut().unwrap().remove(member);
+            }
+            // What the case says the start has (its `allowTransfer` is the case's own, and `startHas` names the rest).
+            if case["allowTransfer"].as_bool().unwrap() {
+                start["allowTransfer"] = json!(true);
+            }
+            for (member, value) in case.get("startHas").and_then(Value::as_object).into_iter().flatten() {
+                start[member] = value.clone();
+            }
+            for member in case.get("startOmits").map(strings).unwrap_or_default() {
+                assert!(start.get(&member).is_none(), "{name}: {member}");
+            }
+            let parsed: StartFrame = typed(name, &start);
+            assert_eq!(parsed.allow_transfer, case["allowTransfer"].as_bool().unwrap(), "{name}");
+            match case.get("resume") {
+                Some(resume) => {
+                    let resume: Resume = typed(name, resume);
+                    assert_eq!(parsed.resume, Some(resume), "{name}");
+                    assert!(resume.after_handoff && resume.handoff_seconds > 0, "{name}");
+                }
+                None => assert!(parsed.resume.is_none(), "{name}"),
+            }
+            // A start that offers nothing is written as it always was: neither member is there.
+            if !parsed.allow_transfer {
+                let written = serde_json::to_value(&parsed).unwrap();
+                assert!(written.get("allowTransfer").is_none() && written.get("resume").is_none(), "{name}");
+            }
+        }
+        // Both ways to come back are known.
+        let vias: BTreeSet<String> = f["start"]["cases"].as_array().unwrap().iter().filter_map(|c| c["resume"]["via"].as_str().map(String::from)).collect();
+        assert_eq!(vias, BTreeSet::from(["return".to_string(), "failback".to_string()]));
+        assert_eq!(serde_json::to_value(ResumeVia::Return).unwrap(), "return");
+        assert_eq!(serde_json::to_value(ResumeVia::Failback).unwrap(), "failback");
+
+        // ready: this desktop lists transfer_v1 exactly when the fixture says a plugin negotiates it.
+        for case in f["ready"]["cases"].as_array().unwrap() {
+            let name = case["name"].as_str().unwrap();
+            let ready: ReadyFrame = typed(name, &case["frame"]);
+            assert_eq!(ready.features, strings(&case["features"]), "{name}");
+            assert_eq!(ready.features.iter().any(|x| x == transfer::FEATURE), case["negotiatedWhenOffered"].as_bool().unwrap(), "{name}");
+        }
+        let ours = ReadyFrame { kind: "formlogic.realtime.ready".into(), call_id: "call_0123".into(), generation: 7, destination_origin: crate::voice::DESTINATION.into(), features: vec![transfer::FEATURE.into()] };
+        assert_eq!(serde_json::to_value(&ours).unwrap(), f["ready"]["cases"][0]["frame"], "the ready this desktop writes is the first case");
+        assert!(serde_json::to_value(ReadyFrame { features: vec![], ..ours }).unwrap().get("features").is_none(), "an older desktop's ready has no features member: this is the second case's shape");
+
+        // stop: a handoff names itself, and the old free text does not.
+        let stop = &f["stop"];
+        assert_eq!(stop["handoffPrefix"], transfer::HANDOFF_PREFIX);
+        let frame = StopFrame { kind: "formlogic.realtime.stop".into(), call_id: "call_0123".into(), generation: 7, reason: stop["handoffReason"].as_str().unwrap().into() };
+        assert!(frame.reason.starts_with(transfer::HANDOFF_PREFIX));
+        assert!(!stop["legacyReason"].as_str().unwrap().starts_with(transfer::HANDOFF_PREFIX));
+        assert_eq!(typed::<StopFrame>("stop", &serde_json::to_value(&frame).unwrap()), frame);
+        // The whole-frame fixtures of this desktop's own read back as themselves.
+        let resume_start: StartFrame = typed("start-resume", &serde_json::from_str::<Value>(&read("oaiy-only/start-resume.json")).unwrap());
+        assert_eq!(resume_start.resume, Some(Resume { after_handoff: true, handoff_seconds: 42, via: ResumeVia::Return }));
+        assert_eq!(resume_start.generation, 2);
     }
 
     #[test]
-    fn ready_says_transfer_v1_only_when_it_agrees() {
-        let ready: ReadyFrame = round_trip("ready-features.json");
-        assert_eq!(ready.features, vec![crate::voice::transfer::FEATURE.to_string()]);
-        let none = ReadyFrame { features: Vec::new(), ..ready };
-        assert!(serde_json::to_value(none).unwrap().get("features").is_none(), "an older desktop's ready has no features member");
-    }
-
-    #[test]
-    fn the_tool_call_is_exactly_a_reason() {
-        let call: ToolCall = round_trip("tool-call.json");
-        assert_eq!(call.name, crate::voice::transfer::TOOL);
-        let args: TransferArguments = serde_json::from_value(call.arguments.clone()).unwrap();
-        assert_eq!(args.reason, Reason::CallerAsked);
-        assert!(serde_json::from_value::<TransferArguments>(serde_json::json!({"reason": "caller_asked", "note": "x"})).is_err());
-        assert!(serde_json::from_value::<TransferArguments>(serde_json::json!({"reason": "anything"})).is_err());
-        assert!(crate::voice::transfer::parse_arguments(&call.arguments).is_ok());
-    }
-
-    #[test]
-    fn the_tool_results_say_ringing_or_why_not() {
-        let ringing: ToolResult = round_trip("tool-result-ringing.json");
-        assert!(ringing.ok && ringing.continue_response);
-        let out: RingingOutput = serde_json::from_value(ringing.output).unwrap();
-        assert_eq!((out.ring_seconds, out.request_id.as_str()), (40, "assist_0123456789abcdef0123456789abcdef"));
-        for (name, status, reason) in [("tool-result-refused.json", RefusedStatus::Refused, "caller_did_not_ask"), ("tool-result-unavailable.json", RefusedStatus::Unavailable, "quiet_hours")] {
-            let result: ToolResult = round_trip(name);
-            assert!(!result.ok, "{name}");
-            let out: RefusedOutput = serde_json::from_value(result.output).unwrap();
-            assert_eq!((out.status, out.reason.as_str()), (status, reason), "{name}");
-            // This desktop refuses in the same shape and with the same reason, in its own words (the plugin writes its own).
-            let ours = crate::voice::transfer::refused(if status == RefusedStatus::Refused { "refused" } else { "unavailable" }, reason);
-            assert_eq!(ours["output"]["reason"], out.reason, "{name}");
-            assert_eq!(ours["output"]["status"], serde_json::to_value(status).unwrap(), "{name}");
-            let mine: RefusedOutput = serde_json::from_value(ours["output"].clone()).unwrap();
-            assert!(!mine.instruction.is_empty(), "{name}");
+    fn the_tool_call_is_exactly_a_reason_and_this_desktop_is_never_looser_than_the_fixture() {
+        let f = fixture("tool-call");
+        let call: ToolCall = typed("frame", &f["frame"]);
+        assert_eq!(call.name, transfer::TOOL);
+        assert_eq!(f["toolName"], transfer::TOOL);
+        // Every tool name this desktop puts on the wire is one the plugin's rule accepts, and none of the invalid ones is.
+        let rule = regex::Regex::new(f["toolNameRule"].as_str().unwrap()).unwrap();
+        for name in [transfer::TOOL, "lookup_business_data", "request_appointment", "finish_call"] {
+            assert!(rule.is_match(name), "{name}");
+        }
+        for name in strings(&f["validToolNames"]) {
+            assert!(rule.is_match(&name), "{name:?}");
+        }
+        for name in strings(&f["invalidToolNames"]) {
+            assert!(!rule.is_match(&name), "{name:?}");
+        }
+        // The arguments: what the plugin refuses this desktop never sends, and it sends only what it accepts, and no `policy_rule`
+        // (the owner's own rule, which a model may not claim: this desktop is stricter here on purpose).
+        let cases = f["arguments"]["cases"].as_array().unwrap();
+        assert_eq!(cases.len(), 14);
+        for case in cases {
+            let name = case["name"].as_str().unwrap();
+            let arguments = &case["arguments"];
+            let accepted = case["accepted"].as_bool().unwrap();
+            let ours = transfer::parse_arguments(arguments);
+            match (accepted, case["reason"].as_str()) {
+                (false, _) => {
+                    assert!(ours.is_err(), "{name}: the plugin refuses it and this desktop must too");
+                    assert!(serde_json::from_value::<TransferArguments>(arguments.clone()).is_err(), "{name}");
+                }
+                (true, Some("policy_rule")) => {
+                    assert!(ours.is_err(), "{name}: not for a model to claim");
+                    assert_eq!(typed::<TransferArguments>(name, arguments).reason, Reason::PolicyRule);
+                }
+                (true, Some(reason)) => {
+                    assert_eq!(ours.unwrap().as_str(), reason, "{name}");
+                    assert_eq!(typed::<TransferArguments>(name, arguments).reason.as_str(), reason, "{name}");
+                }
+                (true, None) => panic!("{name}: an accepted case names its reason"),
+            }
         }
     }
 
     #[test]
-    fn every_outcome_round_trips_and_is_one_this_desktop_understands() {
-        use crate::voice::transfer::Outcome;
-        let mut seen = Vec::new();
-        for (name, outcome) in [
-            ("transfer-outcome-accepted.json", Outcome::Accepted),
-            ("transfer-outcome-declined.json", Outcome::Declined),
-            ("transfer-outcome-unavailable.json", Outcome::Unavailable),
-            ("transfer-outcome-expired.json", Outcome::Expired),
-            ("transfer-outcome-cancelled.json", Outcome::Cancelled),
-        ] {
-            let frame: OutcomeFrame = round_trip(name);
-            assert_eq!(frame.outcome, outcome, "{name}");
-            assert_eq!(Outcome::parse(outcome.as_str()), Some(outcome));
-            assert_eq!(frame.message.is_some(), outcome == Outcome::Declined, "{name}: the owner's words come with a decline only");
-            seen.push(outcome);
+    fn the_tool_results_say_ringing_or_why_not_in_words_this_desktop_knows() {
+        let f = fixture("tool-result");
+        let result: ToolResult = typed("frame", &f["frame"]);
+        assert!(result.ok && result.continue_response);
+        let out: RingingOutput = typed("ringing", &result.output);
+        assert_eq!((out.ring_seconds, out.request_id.as_str()), (f["ringing"]["ringSeconds"].as_u64().unwrap(), f["ringing"]["requestId"].as_str().unwrap()));
+        // The plan reasons are exactly the reasons a plan of this desktop can give, and no other.
+        let ours: BTreeSet<String> = [
+            PlanReason::Disabled,
+            PlanReason::InitiativeOff,
+            PlanReason::NotUrgent,
+            PlanReason::CallerDidNotAsk,
+            PlanReason::LimitCall,
+            PlanReason::LimitGap,
+            PlanReason::LimitCaller,
+            PlanReason::LimitGlobal,
+            PlanReason::QuietHours,
+            PlanReason::AllDoNotDisturb,
+            PlanReason::NoEndpoint,
+        ]
+        .map(|r| r.as_str().to_string())
+        .into();
+        assert_eq!(ours, plan_reasons(), "a plan reason the plugin does not know becomes plan_unavailable, so this desktop gives none but these");
+        assert_eq!(PlanReason::Ok.as_str(), "ok");
+        // Every refusal reads as a refusal, and this desktop refuses in the same shape with the same status and reason.
+        let plugin_reasons = strings(&f["pluginReasons"]);
+        let mut statuses = BTreeSet::new();
+        for refusal in f["refusals"].as_array().unwrap() {
+            let (status, reason) = (refusal["status"].as_str().unwrap(), refusal["reason"].as_str().unwrap());
+            assert!(plan_reasons().contains(reason) || plugin_reasons.iter().any(|r| r == reason), "{reason}");
+            let read: RefusedOutput = typed(reason, &json!({"status": status, "reason": reason, "instruction": "x", "somethingNew": 1}));
+            assert_eq!((read.status, read.reason.as_str()), (if status == "refused" { RefusedStatus::Refused } else { RefusedStatus::Unavailable }, reason));
+            let mine = transfer::refused(status, reason);
+            assert_eq!((mine["ok"].clone(), mine["output"]["status"].clone(), mine["output"]["reason"].clone()), (json!(false), json!(status), json!(reason)));
+            assert!(typed::<RefusedOutput>(reason, &mine["output"]).instruction.len() > 20, "{reason}: the model is told what to do");
+            statuses.insert(status.to_string());
         }
-        assert_eq!(seen.len(), 5);
-        let declined: OutcomeFrame = round_trip("transfer-outcome-declined.json");
-        assert_eq!(crate::voice::transfer::owner_message(&declined.message.unwrap()).as_deref(), Some("Back after three, please leave a message"));
+        assert_eq!(statuses, BTreeSet::from(["refused".to_string(), "unavailable".to_string()]));
+        // The tool intake errors carry no status: they are not a refusal of a transfer.
+        for case in f["toolRefusals"]["cases"].as_array().unwrap() {
+            assert!(case["output"]["error"].is_string() && case["output"].get("status").is_none(), "{}", case["name"]);
+            assert!(serde_json::from_value::<RefusedOutput>(case["output"].clone()).is_err());
+        }
+        // The words this desktop adds are its own: none is the plugin's, and each says unavailable (offer a message).
+        for own in ["not_offered", "tool_limit", "no_answer"] {
+            assert!(!plan_reasons().contains(own) && !plugin_reasons.iter().any(|r| r == own), "{own}");
+            let mine = transfer::refused("unavailable", own);
+            assert_eq!((mine["output"]["status"].clone(), mine["output"]["reason"].clone()), (json!("unavailable"), json!(own)));
+        }
     }
 
     #[test]
-    fn a_stop_that_hands_the_call_over_names_a_handoff() {
-        let stop: StopFrame = round_trip("stop-handoff.json");
-        assert!(stop.reason.starts_with(crate::voice::transfer::HANDOFF_PREFIX));
+    fn every_outcome_is_read_by_this_desktop_and_the_owners_words_come_only_with_a_decline() {
+        let f = fixture("outcome");
+        assert_eq!(strings(&f["outcomes"]), [Outcome::Accepted, Outcome::Declined, Outcome::Unavailable, Outcome::Expired, Outcome::Cancelled].map(|o| o.as_str().to_string()));
+        assert_eq!(f["maxMessageChars"], transfer::MAX_OWNER_MESSAGE);
+        let mut seen = BTreeSet::new();
+        for case in f["cases"].as_array().unwrap() {
+            let name = case["name"].as_str().unwrap();
+            let frame: OutcomeFrame = typed(name, &case["frame"]);
+            assert_eq!(frame.kind, "formlogic.realtime.transfer_outcome", "{name}");
+            assert_eq!(Outcome::parse(frame.outcome.as_str()), Some(frame.outcome), "{name}");
+            assert!(frame.at_ms > 1_000_000_000_000, "{name}: atMs is Unix epoch milliseconds");
+            if frame.outcome != Outcome::Declined {
+                assert!(frame.message.is_none(), "{name}: the owner's words come with a decline only");
+            }
+            if let Some(words) = &frame.message {
+                assert!(words.chars().count() <= transfer::MAX_OWNER_MESSAGE, "{name}");
+                assert_eq!(transfer::owner_message(words).as_deref(), Some(words.as_str()), "{name}: plain words are kept as they are");
+            }
+            seen.insert(frame.outcome.as_str());
+        }
+        assert_eq!(seen.len(), 5, "a case for every outcome");
+        // The takeover has the plugin's setup time and the grace it takes to record the result before this desktop gives up on it.
+        let t = &f["timings"];
+        assert_eq!(transfer::SETUP_LIMIT.as_secs(), t["mediaSetupSeconds"].as_u64().unwrap() + t["resolutionGraceSeconds"].as_u64().unwrap());
     }
 
     #[test]
-    fn the_desktop_and_the_plugin_ask_and_answer_in_these_shapes() {
-        let request: PlanRequest = round_trip("plan-request.json");
-        assert_eq!(request.method, "oaiy.ring.plan");
-        assert_eq!(request.params.reason, Reason::CallerAsked);
-        assert!(request.params.recent_caller_turns.len() <= 3 && request.params.recent_caller_turns.iter().all(|t| t.chars().count() <= 300));
-        let ring: PlanResult = round_trip("plan-result-ring.json");
-        assert_eq!((ring.decision, ring.reason, ring.ring_seconds, ring.desktop_toast), (Decision::Ring, PlanReason::Ok, 30, true));
-        assert!(!ring.plan_id.is_empty());
-        let message: PlanResult = round_trip("plan-result-message-only.json");
-        assert_eq!((message.decision, message.reason, message.ring_seconds), (Decision::MessageOnly, PlanReason::QuietHours, 0));
-        assert!(!message.plan_id.is_empty() && message.phones.is_empty() && !message.desktop_toast, "a plan that rings nobody still has an id");
-        let opened: OpenedRequest = round_trip("ring-opened.json");
-        assert_eq!(opened.method, "oaiy.ring.opened");
-        assert_eq!(opened.params.plan_id, ring.plan_id);
+    fn the_withdrawal_and_its_notices_are_the_fixtures_and_this_desktop_says_every_reason() {
+        let f = fixture("cancel");
+        let cancel = &f["cancel"];
+        assert_eq!(cancel["frameType"], transfer::CANCEL_FRAME);
+        let ours = [CancelReason::OwnerDeclined, CancelReason::MessageInstead, CancelReason::GaveUp];
+        assert_eq!(strings(&cancel["reasons"]), ours.map(|r| r.as_str().to_string()));
+        let mut seen = BTreeSet::new();
+        for case in cancel["cases"].as_array().unwrap() {
+            let name = case["name"].as_str().unwrap();
+            let frame: CancelFrame = typed(name, &case["frame"]);
+            assert_eq!(frame.kind, transfer::CANCEL_FRAME, "{name}");
+            assert!(seen.insert(frame.reason.as_str()), "{name}");
+            // What this desktop writes for it is this frame, member for member.
+            assert_eq!(serde_json::to_value(&frame).unwrap(), case["frame"], "{name}");
+        }
+        assert_eq!(seen.len(), ours.len(), "a case for every reason");
+        // What the plugin ignores this desktop does not send: a request id it can use, and a reason of the set.
+        for case in cancel["ignored"]["cases"].as_array().unwrap() {
+            assert!(serde_json::from_value::<CancelFrame>(case["frame"].clone()).is_err() || case["frame"]["requestId"].as_str().is_some_and(|id| id.is_empty() || id.len() > 128 || id.contains(|c: char| !(c.is_ascii_alphanumeric() || "-_.:".contains(c)))), "{}: not a frame this desktop's types would write", case["name"]);
+        }
+        // The notices.
+        let notice = &f["notice"];
+        assert_eq!(notice["frameType"], transfer::NOTICE_FRAME);
+        assert_eq!(strings(&notice["notices"]), [NoticeKind::TooLate, NoticeKind::UnknownRequest].map(|n| n.as_str().to_string()));
+        let mut kinds = BTreeSet::new();
+        for case in notice["cases"].as_array().unwrap() {
+            let name = case["name"].as_str().unwrap();
+            let frame: NoticeFrame = typed(name, &case["frame"]);
+            assert_eq!(frame.kind, transfer::NOTICE_FRAME, "{name}");
+            assert!(frame.at_ms > 1_000_000_000_000, "{name}: atMs is Unix epoch milliseconds");
+            kinds.insert(frame.notice.as_str());
+        }
+        assert_eq!(kinds.len(), 2, "a case for each notice");
     }
 
     #[test]
-    fn the_plan_results_this_desktop_makes_have_the_fixtures_shape() {
-        // What `plan_result` writes for a ring and for a refusal has exactly the members of the fixtures.
-        let keys = |v: &Value| v.as_object().unwrap().keys().cloned().collect::<std::collections::BTreeSet<_>>();
-        let fixture: Value = serde_json::from_str(&read("plan-result-ring.json")).unwrap();
-        let ours = super::super::host::plan_result(&super::super::Authorised {
-            plan: super::super::RingPlan { decision: Decision::Ring, reason: PlanReason::Ok, ring_seconds: 30, phones: vec![], wake: vec![], desktop_toast: true, desktop_companions: vec![] },
+    fn the_plan_the_plugin_asks_for_and_the_answers_are_the_fixtures() {
+        let f = fixture("ring-plan");
+        // The host features: this desktop announces ringPlan, exactly as the fixture's host that answers the two requests does.
+        let mut announced = false;
+        for case in f["init"]["cases"].as_array().unwrap() {
+            // A member that is not a string announces nothing (one case has a number in the list).
+            let features: Vec<String> = case["params"].get("features").and_then(Value::as_array).map(|a| a.iter().filter_map(Value::as_str).map(String::from).collect()).unwrap_or_default();
+            assert_eq!(features.iter().any(|x| x == "ringPlan"), case["ringPlan"].as_bool().unwrap(), "{}", case["name"]);
+            if features == crate::plugins::process::HOST_FEATURES {
+                announced = true;
+                assert_eq!(case["ringPlan"], true);
+            }
+        }
+        assert!(announced, "the fixture has this desktop's own plugin.init features");
+
+        // The question: at most the last three caller turns, each cut to 300 characters, as this desktop cuts what it is told.
+        let plan = &f["plan"];
+        assert_eq!(plan["method"], "oaiy.ring.plan");
+        let params: PlanParams = typed("plan params", &plan["params"]);
+        assert_eq!(params.reason, Reason::CallerAsked);
+        assert_eq!(super::super::phrases::recent(&strings(&plan["input"]["recentCallerTurns"])), params.recent_caller_turns, "the turns kept are the last three");
+        assert!(params.recent_caller_turns.len() <= 3 && params.recent_caller_turns.iter().all(|t| t.chars().count() <= 300));
+
+        // The answers: every one reads, and says what the fixture says the plugin makes of it.
+        let known = plan_reasons();
+        for case in plan["results"].as_array().unwrap() {
+            let name = case["name"].as_str().unwrap();
+            let (result, parsed) = (&case["result"], &case["parsed"]);
+            assert!(plugin_can_use(result), "{name}");
+            let read: PlanResult = typed(name, result);
+            assert_eq!(serde_json::to_value(read.decision).unwrap(), parsed["decision"], "{name}");
+            assert_eq!(read.reason_allowed, parsed["reasonAllowed"].as_bool().unwrap_or(false), "{name}");
+            let planned = super::super::RingPlan { decision: read.decision, reason: read.reason, ring_seconds: read.ring_seconds, phones: read.phones, wake: read.wake, desktop_toast: read.desktop_toast, desktop_companions: read.desktop_companions };
+            assert_eq!(planned.targets(), strings(&parsed["targets"]), "{name}: each device once, phones first");
+            if read.decision != Decision::Ring {
+                assert_eq!(parsed["reason"], read.reason.as_str(), "{name}");
+                assert!(known.contains(read.reason.as_str()), "{name}");
+                assert!(planned.targets().is_empty(), "{name}");
+            } else {
+                // A ring that names nobody is what this desktop never plans (it is a message_only / no_endpoint).
+                assert_eq!(parsed["targetRule"], if planned.targets().is_empty() { "nobody" } else { "only" }, "{name}");
+            }
+        }
+        // What the plugin cannot use, this desktop's own plans never are (below), and the fixture says so.
+        for case in plan["unusableResults"].as_array().unwrap() {
+            assert!(!plugin_can_use(&case["result"]), "{}", case["name"]);
+        }
+        // The other request.
+        let opened = &f["opened"];
+        assert_eq!(opened["method"], "oaiy.ring.opened");
+        let params: OpenedParams = typed("opened", &opened["input"]);
+        assert!(params.expires_at > 1_000_000_000 && params.expires_at < 100_000_000_000, "expiresAt is Unix seconds");
+        assert_eq!(opened["result"], json!({"ok": true}));
+    }
+
+    #[test]
+    fn every_plan_this_desktop_makes_is_one_the_plugin_can_use_with_a_reason_it_knows() {
+        let known = plan_reasons();
+        let mut rings = 0;
+        let vectors = super::super::tests::vector_plans();
+        assert_eq!(vectors.len(), 33);
+        for (id, plan) in vectors {
+            // The plan as this desktop answers with it (the reference's V01 rings only the toast, which is not somebody).
+            let (plan, _) = super::super::host::name_somebody(plan);
+            let result = super::super::host::plan_result(&super::super::Authorised { plan: plan.clone(), plan_id: "plan_0123456789abcdef".into(), reason_allowed: false, caller_number: String::new(), caller_name: String::new() });
+            assert!(plugin_can_use(&result), "{id}: {result}");
+            let read: PlanResult = typed(&id, &result);
+            if plan.rings() {
+                rings += 1;
+                assert_eq!(result["reason"], "ok", "{id}");
+                assert!(!plan.targets().is_empty(), "{id}: a plan that rings names somebody");
+                assert!((20..=90).contains(&read.ring_seconds), "{id}: {}", read.ring_seconds);
+            } else {
+                assert!(known.contains(read.reason.as_str()), "{id}: {} is not a reason the plugin knows", read.reason.as_str());
+            }
+        }
+        assert!((5..33).contains(&rings), "the vectors ring in {rings} cases and refuse in the rest");
+        // And the plan of a call that has no record here, and one whose reason this desktop cannot say, is still a plan with an id.
+        let unknown = super::super::host::plan_result(&super::super::Authorised {
+            plan: super::super::RingPlan::refuse(PlanReason::CallerDidNotAsk, Decision::Refused),
             plan_id: "plan_x".into(),
             reason_allowed: false,
             caller_number: String::new(),
             caller_name: String::new(),
         });
-        assert_eq!(keys(&ours), keys(&fixture));
-        let typed: PlanResult = serde_json::from_value(ours).unwrap();
-        assert_eq!((typed.decision, typed.plan_id.as_str()), (Decision::Ring, "plan_x"));
+        assert!(plugin_can_use(&unknown) && known.contains(unknown["reason"].as_str().unwrap()));
     }
 
     #[test]
-    fn the_sums_file_lists_every_fixture_and_each_sum_is_right() {
-        let sums = read("SHA256SUMS");
-        let mut listed = BTreeMap::new();
-        for line in sums.lines() {
-            let (sum, name) = line.split_once("  ").expect("sum, two spaces, name");
-            assert!(listed.insert(name.to_string(), sum.to_string()).is_none(), "{name} twice");
-        }
-        let mut on_disk: Vec<String> = std::fs::read_dir(DIR).unwrap().flatten().map(|e| e.file_name().to_string_lossy().into_owned()).filter(|n| n.ends_with(".json")).collect();
-        on_disk.sort();
-        assert_eq!(listed.keys().cloned().collect::<Vec<_>>(), on_disk, "SHA256SUMS lists exactly the fixtures");
-        for (name, sum) in &listed {
-            let bytes = std::fs::read(std::path::Path::new(DIR).join(name)).unwrap();
-            let got: String = Sha256::digest(&bytes).iter().map(|b| format!("{b:02x}")).collect();
-            assert_eq!(&got, sum, "{name}");
-        }
+    fn the_plan_this_desktop_writes_has_every_member_of_the_fixtures_ring_answer() {
+        let keys = |v: &Value| v.as_object().unwrap().keys().cloned().collect::<BTreeSet<_>>();
+        let f = fixture("ring-plan");
+        let fixture_plan = &f["plan"]["results"][1]["result"];
+        let ours = super::super::host::plan_result(&super::super::Authorised {
+            plan: super::super::RingPlan { decision: Decision::Ring, reason: PlanReason::Ok, ring_seconds: 30, phones: vec![], wake: vec![], desktop_toast: true, desktop_companions: vec!["thumb_windows".into()] },
+            plan_id: "plan_x".into(),
+            reason_allowed: false,
+            caller_number: String::new(),
+            caller_name: String::new(),
+        });
+        // Everything but the member the fixture adds to show the plugin ignores what it does not know.
+        let mut expected = keys(fixture_plan);
+        expected.remove("somethingNew");
+        expected.insert("reasonAllowed".into());
+        assert_eq!(keys(&ours), expected);
+        let read: PlanResult = typed("ours", &ours);
+        assert_eq!((read.decision, read.plan_id.as_str(), read.reason_allowed), (Decision::Ring, "plan_x", false));
     }
 }

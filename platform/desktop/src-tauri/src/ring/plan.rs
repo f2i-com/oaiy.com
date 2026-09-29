@@ -2,9 +2,11 @@
 //!
 //! [`plan`] is a pure function of the owner's settings, whether they are at the
 //! computer, the devices that could take the call, the time and the caller's
-//! record. It follows the reference in `docs/contracts/transfer/` (the design's
-//! Appendix A.8) rule for rule, and the 33 conformance vectors in
-//! `tests/vectors.json` are its known answers.
+//! record. It follows the design's reference (Appendix A.8) rule for rule, and the 33
+//! conformance vectors in `tests/vectors.json` are its known answers, with one change the
+//! phone plugin's contract asks for: a Windows Companion is named whether or not it is
+//! running (see the rule 5 below). What a plan may say is the contract's
+//! (`docs/contracts/transfer/`, `transfer-v1.tool-result.fixture.json`).
 //!
 //! The rules, first match wins:
 //!

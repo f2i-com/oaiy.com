@@ -92,7 +92,8 @@ impl Default for Timing {
 }
 
 /// Why this desktop asks the phone to withdraw a request (`formlogic.realtime.transfer_cancel`).
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub enum CancelReason {
     /// The owner declined in the dialog.
     OwnerDeclined,

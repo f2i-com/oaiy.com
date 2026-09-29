@@ -1,2 +1,3 @@
-# Contract fixtures are byte-exact: their sha256 is compared with the Aokie repository, so they keep LF endings on every checkout.
-docs/contracts/transfer/*.json text eol=lf
+# The transfer contract is byte-exact: the folder is the Aokie repository's, compared with it by sha256, so every file in it keeps LF
+# endings on every checkout (the fixtures, transfer-v1.md, SHA256SUMS, and the OAIY-only ones under oaiy-only/).
+docs/contracts/transfer/** text eol=lf

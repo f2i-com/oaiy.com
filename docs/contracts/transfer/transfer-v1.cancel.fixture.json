@@ -1,0 +1,143 @@
+{
+  "contract": "transfer_v1",
+  "kind": "transfer_cancel",
+  "direction": "oaiy_to_aokie for transfer_cancel, aokie_to_oaiy for transfer_notice",
+  "about": "OAIY withdraws a transfer request it asked for: its ring dialog was declined, the caller was offered a message instead, or it gave up waiting. Both frames ride the call's realtime stream, carry the session's callId and generation like every frame, and exist only on a session that negotiated transfer_v1. A cancel that withdraws a request is answered by the cancelled outcome itself (transfer-v1.outcome.fixture.json), once; a cancel that changes nothing is answered by a transfer_notice. It is not a connector command and is never relayed.",
+  "cancel": {
+    "frameType": "formlogic.realtime.transfer_cancel",
+    "reasons": ["owner_declined", "message_instead", "gave_up"],
+    "requestIdRule": "1 to 128 characters of A-Z a-z 0-9 - _ . :",
+    "reasonMeaning": {
+      "owner_declined": "The person at the desk pressed Decline in OAIY's ring dialog.",
+      "message_instead": "OAIY offered the caller a message instead (Take a message instead).",
+      "gave_up": "OAIY gave up waiting."
+    },
+    "cases": [
+      {
+        "name": "the ring dialog was declined",
+        "frame": {
+          "type": "formlogic.realtime.transfer_cancel",
+          "callId": "call_0123",
+          "generation": 7,
+          "requestId": "assist_0123456789abcdef0123456789abcdef",
+          "reason": "owner_declined"
+        }
+      },
+      {
+        "name": "the caller is being offered a message instead",
+        "frame": {
+          "type": "formlogic.realtime.transfer_cancel",
+          "callId": "call_0123",
+          "generation": 7,
+          "requestId": "assist_0123456789abcdef0123456789abcdef",
+          "reason": "message_instead"
+        }
+      },
+      {
+        "name": "OAIY gave up waiting",
+        "frame": {
+          "type": "formlogic.realtime.transfer_cancel",
+          "callId": "call_0123",
+          "generation": 7,
+          "requestId": "assist_0123456789abcdef0123456789abcdef",
+          "reason": "gave_up"
+        }
+      }
+    ],
+    "ignored": {
+      "about": "A frame with no usable requestId or with a reason outside the closed set changes nothing and gets no reply (there is nothing typed to answer it with). It is never fatal. Members the plugin does not know are ignored.",
+      "cases": [
+        {
+          "name": "a reason outside the closed set",
+          "frame": { "type": "formlogic.realtime.transfer_cancel", "callId": "call_0123", "generation": 7, "requestId": "assist_0123456789abcdef0123456789abcdef", "reason": "because" }
+        },
+        {
+          "name": "no reason",
+          "frame": { "type": "formlogic.realtime.transfer_cancel", "callId": "call_0123", "generation": 7, "requestId": "assist_0123456789abcdef0123456789abcdef" }
+        },
+        {
+          "name": "no requestId",
+          "frame": { "type": "formlogic.realtime.transfer_cancel", "callId": "call_0123", "generation": 7, "reason": "gave_up" }
+        },
+        {
+          "name": "an empty requestId",
+          "frame": { "type": "formlogic.realtime.transfer_cancel", "callId": "call_0123", "generation": 7, "requestId": "", "reason": "gave_up" }
+        },
+        {
+          "name": "a requestId with characters outside the rule",
+          "frame": { "type": "formlogic.realtime.transfer_cancel", "callId": "call_0123", "generation": 7, "requestId": "assist 0123/../", "reason": "gave_up" }
+        },
+        {
+          "name": "a requestId over 128 characters",
+          "frame": { "type": "formlogic.realtime.transfer_cancel", "callId": "call_0123", "generation": 7, "requestId": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", "reason": "gave_up" }
+        },
+        {
+          "name": "a requestId that is not a string",
+          "frame": { "type": "formlogic.realtime.transfer_cancel", "callId": "call_0123", "generation": 7, "requestId": 7, "reason": "gave_up" }
+        }
+      ]
+    }
+  },
+  "notice": {
+    "frameType": "formlogic.realtime.transfer_notice",
+    "notices": ["too_late", "unknown_request"],
+    "noticeMeaning": {
+      "too_late": "An owner device has already won the request: the takeover is under way and is not affected. Expect the stop with handoff:takeover, or an unavailable outcome if the setup fails.",
+      "unknown_request": "This call has no open request with that id: it never existed here, it belongs to another call, or it has already ended (including by an earlier cancel of the same id). Nothing was changed."
+    },
+    "atMs": "Unix epoch milliseconds at which the plugin decided.",
+    "cases": [
+      {
+        "name": "the request was already won",
+        "frame": {
+          "type": "formlogic.realtime.transfer_notice",
+          "callId": "call_0123",
+          "generation": 7,
+          "requestId": "assist_0123456789abcdef0123456789abcdef",
+          "notice": "too_late",
+          "atMs": 1789000014000
+        }
+      },
+      {
+        "name": "no such open request on this call",
+        "frame": {
+          "type": "formlogic.realtime.transfer_notice",
+          "callId": "call_0123",
+          "generation": 7,
+          "requestId": "assist_00000000000000000000000000000000",
+          "notice": "unknown_request",
+          "atMs": 1789000014500
+        }
+      }
+    ]
+  },
+  "behaviour": {
+    "about": "What the plugin does with a well-formed cancel, in the order it decides. It is handled exactly as a request withdrawn because someone took the caller another way: an acceptance since the last turn is seen first and wins.",
+    "cases": [
+      {
+        "name": "the request is ringing and nobody has won it",
+        "result": "withdrawn: the offers stop, the mailbox is freed, one cancelled outcome is sent, the audit event closes as cancelled. No notice."
+      },
+      {
+        "name": "an owner device has won the request (accepted, or already bridged)",
+        "result": "left alone: the takeover continues. A too_late notice. No outcome."
+      },
+      {
+        "name": "the request ended since OAIY last heard (declined, expired, failed) and the cancel crossed it",
+        "result": "the outcome of how it ended is what OAIY hears; the cancel changes nothing and gets an unknown_request notice."
+      },
+      {
+        "name": "an id this call has no open request for (never seen, another call's request, a stale id)",
+        "result": "nothing changes; an unknown_request notice. A request of another call is never withdrawn."
+      },
+      {
+        "name": "the same cancel sent twice",
+        "result": "the first withdraws (or is too_late); every repeat is an unknown_request notice (or too_late again while the request is still accepted). Effects happen once."
+      },
+      {
+        "name": "a session that did not negotiate transfer_v1",
+        "result": "ignored, no reply."
+      }
+    ]
+  }
+}

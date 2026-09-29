@@ -1,1 +1,0 @@
-{"callId":"call_0123","continueResponse":true,"generation":1,"name":"transfer_to_owner","ok":false,"output":{"instruction":"The owner cannot be reached right now. Tell the caller kindly and offer to take a message. Do not say why, and do not promise a callback time.","reason":"quiet_hours","status":"unavailable"},"toolCallId":"tool_7","type":"formlogic.realtime.tool_result"}

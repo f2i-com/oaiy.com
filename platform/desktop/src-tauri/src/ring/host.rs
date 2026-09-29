@@ -317,16 +317,7 @@ impl Ring {
             now: Now::of(&local),
             settings: effective,
         };
-        let plan = plan(&inputs);
-        // The reference rings this computer's toast on its own (its vector V01: the owner at the PC). But a toast is not
-        // somebody a call can be offered to: the phone plugin offers a transfer only to the devices a plan names, so a plan
-        // that names none opens nothing (it answers `no_endpoint`), and a try counted for it would be spent for a ring that
-        // cannot happen. Decided here, before anything is counted: the caller is offered a message, and the owner is told why
-        // nobody rang.
-        if plan.rings() && plan.targets().is_empty() {
-            return (RingPlan::refuse(PlanReason::NoEndpoint, Decision::MessageOnly), true);
-        }
-        (plan, false)
+        name_somebody(plan(&inputs))
     }
 
     /// Whether a request to reach the owner on `call` is allowed: judged on what this desktop heard
@@ -385,6 +376,19 @@ impl Ring {
     pub fn plan_is_claimed(&self, plan_id: &str, call: &str) -> bool {
         self.grants.lock().unwrap_or_else(|e| e.into_inner()).get(plan_id).is_some_and(|g| g.claimed && g.call_id == call && g.at.elapsed() < PLAN_TTL * 4)
     }
+}
+
+/// `plan` as this desktop answers with it, and whether it was made `no_endpoint` because only this computer's toast would have rung.
+///
+/// The reference rings this computer's toast on its own (its vector V01: the owner at the PC). But a toast is not somebody a call can
+/// be offered to: the phone plugin offers a transfer only to the devices a plan names, so a plan that names none opens nothing (it
+/// answers `no_endpoint`), and a try counted for it would be spent for a ring that cannot happen. Decided here, before anything is
+/// counted: the caller is offered a message, and the owner is told why nobody rang.
+pub(super) fn name_somebody(plan: RingPlan) -> (RingPlan, bool) {
+    if plan.rings() && plan.targets().is_empty() {
+        return (RingPlan::refuse(PlanReason::NoEndpoint, Decision::MessageOnly), true);
+    }
+    (plan, false)
 }
 
 /// Who a call's limits are counted against: the caller's number (its last nine digits), or, for every hidden, withheld or

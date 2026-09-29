@@ -117,7 +117,9 @@ model, so the engine answers with its choice (Qwen3.8-Flash-Next now).
 
 Off until the owner turns **Transfer calls to me** on (Transfers page); then, for a caller who asks
 for a person, the agent can try to reach the owner. The contract with the phone plugin is
-`docs/contracts/transfer/` (`transfer_v1`); the code is `voice/transfer.rs`, `voice/call.rs` and
+`docs/contracts/transfer/transfer-v1.md` (`transfer_v1`: the phone plugin's own document and fixtures, copied here
+unchanged and checked by `scripts/check-transfer-contract.mjs`; what only OAIY does is in `oaiy-only/README.md`
+next to it); the code is `voice/transfer.rs`, `voice/call.rs` and
 `ring/`. **Consent is not signed on this computer** (a plugin could flip a scope), so the owner's switch is
 best kept off unless every installed plugin is trusted: the Transfers page and `RECEPTIONIST.md` say so. The rule for
 all of it: **a caller is never left in silence for long, and never told a lie.**

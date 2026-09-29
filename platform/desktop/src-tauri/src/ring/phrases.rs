@@ -3,8 +3,9 @@
 //! caller actually said is checked here, on the words this desktop heard and
 //! transcribed itself.
 //!
-//! The rules start from the design's Appendix A.9 (`docs/contracts/transfer/`), which
-//! the phone plugin runs first as its own floor, and go further, because a caller's own
+//! The rules start from the shared check (`transfer-v1.caller-asked.fixture.json` in
+//! `docs/contracts/transfer/`), which the phone plugin runs first as its own floor and
+//! which this passes in full, and go further, because a caller's own
 //! words are all there is to go on and both mistakes cost something: ringing the owner
 //! for a caller who did not ask, and refusing one who plainly did.
 //!
@@ -229,8 +230,10 @@ mod tests {
     use super::*;
     use serde_json::Value;
 
-    const REFERENCE: &str = include_str!("../../../../../docs/contracts/transfer/phrases.json");
-    const OAIY_EXTRA: &str = include_str!("../../../../../docs/contracts/transfer/phrases-oaiy.json");
+    /// The check both programs are tested against (the phone plugin runs the same rules first, as its floor).
+    const SHARED: &str = include_str!("../../../../../docs/contracts/transfer/transfer-v1.caller-asked.fixture.json");
+    /// What this desktop adds to it.
+    const OAIY_EXTRA: &str = include_str!("../../../../../docs/contracts/transfer/oaiy-only/phrases-oaiy.json");
 
     fn cases(file: &str, key: &str) -> Vec<Vec<String>> {
         let v: Value = serde_json::from_str(file).unwrap();
@@ -238,21 +241,80 @@ mod tests {
     }
 
     #[test]
-    fn the_reference_positives_are_requests_for_a_person() {
-        let positives = cases(REFERENCE, "positive");
-        assert_eq!(positives.len(), 8);
+    fn the_shared_positives_are_requests_for_a_person() {
+        let positives = cases(SHARED, "positive");
+        assert_eq!(positives.len(), 10);
         for turns in positives {
             assert!(caller_asked(&turns), "{turns:?} asks for a person");
         }
     }
 
     #[test]
-    fn the_reference_negatives_are_not() {
-        let negatives = cases(REFERENCE, "negative");
-        assert_eq!(negatives.len(), 8);
+    fn the_shared_negatives_are_not() {
+        let negatives = cases(SHARED, "negative");
+        assert_eq!(negatives.len(), 10);
         for turns in negatives {
             assert!(!caller_asked(&turns), "{turns:?} does not ask for a person");
         }
+    }
+
+    #[test]
+    fn the_shared_windows_are_read_exactly() {
+        let v: Value = serde_json::from_str(SHARED).unwrap();
+        assert_eq!(v["recentTurns"], TURNS_READ);
+        let windows = v["window"].as_array().unwrap();
+        assert_eq!(windows.len(), 4);
+        for case in windows {
+            let turns: Vec<String> = case["turns"].as_array().unwrap().iter().map(|t| t.as_str().unwrap().to_string()).collect();
+            assert_eq!(caller_asked(&turns), case["asked"].as_bool().unwrap(), "{}: {turns:?}", case["name"]);
+        }
+    }
+
+    #[test]
+    fn what_the_shared_check_calls_gaps_this_desktop_does_not_count_as_asking() {
+        // The shared check leaves these through on purpose (it is a floor under the host's own policy). This desktop reads them as what they
+        // mean and does not count them, which is allowed: the plugin's check runs first and this one second, so a caller passes both. What
+        // the shared check refuses (its negatives, and the windows it says are not asks) this desktop refuses too, in the tests above.
+        let v: Value = serde_json::from_str(SHARED).unwrap();
+        let gaps = v["knownGaps"]["cases"].as_array().unwrap();
+        assert_eq!(gaps.len(), 3);
+        for case in gaps {
+            let turns: Vec<String> = case["turns"].as_array().unwrap().iter().map(|t| t.as_str().unwrap().to_string()).collect();
+            assert!(!caller_asked(&turns), "{}: {turns:?}", case["name"]);
+        }
+    }
+
+    #[test]
+    fn the_shared_normaliser_is_the_one_used_here_on_every_turn_of_the_fixture() {
+        let v: Value = serde_json::from_str(SHARED).unwrap();
+        // The apostrophe look-alikes the fixture lists are the ones folded here.
+        let listed: std::collections::BTreeSet<char> = Regex::new(r"U\+([0-9A-F]{4})").unwrap().captures_iter(v["normalise"].as_str().unwrap()).map(|c| char::from_u32(u32::from_str_radix(&c[1], 16).unwrap()).unwrap()).collect();
+        assert_eq!(listed, APOSTROPHES.iter().copied().collect(), "the fixture's list is this desktop's");
+        // The fixture's own algorithm, written out: lower-case, apostrophe look-alikes, every run of characters outside [a-z0-9' ] a space,
+        // every run of spaces one space, trimmed.
+        let outside = Regex::new("[^a-z0-9' ]+").unwrap();
+        let spaces = Regex::new(" +").unwrap();
+        let theirs = |s: &str| -> String {
+            let mut lower = s.to_lowercase();
+            for a in APOSTROPHES {
+                lower = lower.replace(a, "'");
+            }
+            spaces.replace_all(&outside.replace_all(&lower, " "), " ").trim().to_string()
+        };
+        let mut turns: Vec<String> = vec!["speak, to the owner".into(), "I don\u{2019}t want to speak".into(), "  Can   I\tSPEAK, to  the owner?! ".into(), "".into(), "...".into()];
+        for group in ["positive", "negative", "window"] {
+            for case in v[group].as_array().unwrap() {
+                turns.extend(case["turns"].as_array().unwrap().iter().map(|t| t.as_str().unwrap().to_string()));
+            }
+        }
+        for case in v["knownGaps"]["cases"].as_array().unwrap() {
+            turns.extend(case["turns"].as_array().unwrap().iter().map(|t| t.as_str().unwrap().to_string()));
+        }
+        assert!(turns.len() > 30);
+        for turn in &turns {
+            assert_eq!(normalise(turn), theirs(turn), "{turn:?}");
+        }
+        assert_eq!(normalise("speak, to the owner"), "speak to the owner");
     }
 
     #[test]

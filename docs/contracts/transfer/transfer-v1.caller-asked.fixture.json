@@ -1,0 +1,63 @@
+{
+  "contract": "transfer_v1",
+  "kind": "caller_asked",
+  "about": "The phrase check that must hold before the AI may ask for a transfer with the reason caller_asked. It looks at the last three CALLER turns (never the AI's): a turn counts when no block pattern matches it and at least one rule does. The OAIY host runs it on recentCallerTurns when it plans the ring, and the Aokie plugin runs the same rules first, so a model that claims caller_asked after a caller who asked for nothing of the kind is refused with caller_did_not_ask before anything is asked of the host. Both implementations are tested against this file. Rules are the reference implementation of the design's appendix A.9.",
+  "normalise": "Lower-case; the apostrophe look-alikes U+2018, U+2019, U+02BC, U+201B, U+2032, U+FF07, U+0060 and U+00B4 become the ASCII apostrophe; every run of characters outside [a-z0-9' ] becomes one space; every run of spaces becomes one space; trim. So \"speak, to the owner\" normalises to \"speak to the owner\" and matches, and a caller's curly apostrophe (\"I don’t want to speak\") is blocked exactly as the straight one is. In JavaScript: s.toLowerCase().replace(/[\\u2018\\u2019\\u02bc\\u201b\\u2032\\uff07`\\u00b4]/g, \"'\").replace(/[^a-z0-9' ]+/g, ' ').replace(/ +/g, ' ').trim().",
+  "recentTurns": 3,
+  "person": "(?:the |your |a |an )?(?:owner|manager|boss|proprietor|person|human|real person|actual person|someone|somebody|staff|member of staff|representative)",
+  "rules": [
+    "\\b(?:speak|talk|chat)(?:ing)? (?:to|with) <person>\\b",
+    "\\b(?:put|patch) me through\\b",
+    "\\btransfer me\\b",
+    "\\b(?:get|find|fetch) (?:me )?<person>\\b",
+    "\\b(?:is|are) (?:the |your )?(?:owner|manager|boss|anyone|anybody|somebody|someone) (?:there|available|in|around|free)\\b",
+    "\\b(?:real|actual) (?:person|human)\\b",
+    "\\b(?:i )?(?:want|need|would like|d like|wanna) (?:to )?(?:speak|talk) (?:to|with)\\b"
+  ],
+  "blocks": [
+    "\\b(?:my|our|his|her|their) (?:owner|manager|boss)\\b",
+    "\\bowner of\\b",
+    "\\btalk to you later\\b",
+    "\\bspeak to you (?:later|soon)\\b",
+    "\\bdon't (?:want|need) (?:to )?(?:speak|talk)\\b",
+    "\\bno need to (?:speak|talk|transfer)\\b"
+  ],
+  "positive": [
+    { "turns": ["Can I speak to the owner?"] },
+    { "turns": ["I'd like to talk to a real person please"] },
+    { "turns": ["Could you put me through to the manager"] },
+    { "turns": ["Is the owner there?"] },
+    { "turns": ["Transfer me to somebody"] },
+    { "turns": ["Yeah I want to speak with someone about this"] },
+    { "turns": ["um", "get me the boss"] },
+    { "turns": ["I need to talk to a human"] },
+    { "name": "punctuation inside the request leaves no double space", "turns": ["Can I speak, to the owner?"] },
+    { "name": "a curly apostrophe is still an apostrophe", "turns": ["I’d like to talk to a real person please"] }
+  ],
+  "negative": [
+    { "turns": ["I'd like to book a mow for Tuesday"] },
+    { "turns": ["The owner of the house is away that week"] },
+    { "turns": ["My manager said it was fine"] },
+    { "turns": ["I'll talk to you later"] },
+    { "turns": ["Someone is coming on Tuesday to open the gate"] },
+    { "turns": ["No need to speak to anyone, just book it"] },
+    { "turns": ["Is Tuesday free?"] },
+    { "turns": ["I spoke to the owner yesterday"] },
+    { "name": "a curly apostrophe does not defeat the block on a negated request", "turns": ["I don’t want to speak to anyone"] },
+    { "name": "the block holds with a right single quotation mark inside a longer turn", "turns": ["Thanks, but no, I don’t need to talk to a person"] }
+  ],
+  "window": [
+    { "name": "an ask three turns back still counts", "turns": ["Can I speak to the owner?", "no", "sorry"], "asked": true },
+    { "name": "an ask four turns back does not", "turns": ["Can I speak to the owner?", "no", "sorry", "the gate is blue"], "asked": false },
+    { "name": "a blocked turn does not count but another turn can", "turns": ["My manager said no", "transfer me please"], "asked": true },
+    { "name": "no turns", "turns": [], "asked": false }
+  ],
+  "knownGaps": {
+    "about": "Kept so nobody mistakes this check for more than a floor under the host's own policy (initiative setting, limits, quiet hours). They are properties of the reference rules; changing one means changing this file on both sides.",
+    "cases": [
+      { "name": "negation of the request itself is not understood", "turns": ["please don't transfer me"], "asked": true },
+      { "name": "negation of the request itself is not understood (2)", "turns": ["don't put me through to the manager"], "asked": true },
+      { "name": "something said about someone else still matches", "turns": ["they said they would get the owner to call"], "asked": true }
+    ]
+  }
+}
