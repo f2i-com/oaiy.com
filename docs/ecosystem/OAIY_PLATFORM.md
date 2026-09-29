@@ -186,4 +186,5 @@ packages), macros and subflows, an AI flow designer, run history and a welcome w
 
 - Spawned CLIs always get `OAIY_SERVER_URL=http://127.0.0.1:17972`, even when `serverPort`
   changed (`bridge/worker.rs`, `DESKTOP_PORT`).
-- The CI workflows are in `platform/.github/workflows`, where GitHub does not run them.
+- The CI workflows were in `platform/.github/workflows`, where GitHub does not run them; they
+  are in `.github/workflows` at the repository root now (see [RELEASING.md](../RELEASING.md)).

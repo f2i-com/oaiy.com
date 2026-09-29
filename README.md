@@ -243,7 +243,7 @@ The desktop shows the Agent and the flow editor from their builds, and ships the
 that runs flows:
 
 ```sh
-cd app && npm ci && npm run build && cd ..                     # the Agent: app/dist
+cd app && npm ci && npm run build:desktop && cd ..             # the Agent: app/dist (and the SoftN runtime its app preview needs)
 cd platform/ui && npm ci && npm run build && cd ../..          # the flow editor: platform/ui/dist
 cd platform/cli && npm ci && npm run build && cd ../..         # the flow runner
 
@@ -253,6 +253,12 @@ npm run sync-cli       # stages the CLI into src-tauri/resources/cli
 npm run tauri:dev      # the dashboard on Vite (17973) and a debug build of the desktop
 npm run tauri:build    # the installers, under src-tauri/target/release/bundle/
 ```
+
+`tauri:build` first stages the Agent's and the flow editor's builds into
+`src-tauri/resources/app` and `resources/flows` (`npm run stage-pages`), so the installers
+carry both, and it stops if either is missing or incomplete. `tauri:dev` needs none of
+that: it serves them from their build folders. [docs/RELEASING.md](docs/RELEASING.md) says
+what a release contains and how to make one.
 
 The desktop listens on the same ports as an installed OAIY, so run one at a time. A
 debug build uses an `oaiy-studio` that is already running; a release build starts the
@@ -304,8 +310,9 @@ cd platform/ui && npm run dev        # the flow editor: http://localhost:5173/ap
 | `platform/ui/` | `npm test` | the flow editor: types, node contracts, the ZIPP engines |
 | `platform/cli/` | `npm run build && npm test` | the CLI and its ZIPP guards |
 
-`platform/TESTING.md` has the details. The CI workflows in `platform/.github/workflows`
-predate the merge and are not run from the repository root yet.
+`platform/TESTING.md` has the details. The CI and release workflows are in
+`.github/workflows`; automatic CI is paused, so `ci.yml` is started by hand, and a
+release is made by tagging a version: see [docs/RELEASING.md](docs/RELEASING.md).
 
 ## Repository layout
 

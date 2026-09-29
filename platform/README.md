@@ -299,8 +299,8 @@ It costs a one-off ~1.8 MB engine download on the first flow run (lazy — nothi
 
 Run checks manually from the directory shown after installing its dependencies.
 Automatic push and pull-request CI is temporarily paused; the
-[CI workflow](.github/workflows/ci.yml) can still be started manually with
-`workflow_dispatch`.
+[CI workflow](../.github/workflows/ci.yml) (at the repository root, with the release
+workflow) can still be started manually with `workflow_dispatch`.
 
 | Directory | Command | Coverage / requirements |
 |---|---|---|
@@ -318,27 +318,29 @@ services and devices.
 
 ## Releases
 
-Tag a version and GitHub Actions builds the whole release (`.github/workflows/release.yml`):
+Tag a version and GitHub Actions builds the whole release (`release.yml`, in
+[`.github/workflows`](../.github/workflows/release.yml) at the repository root):
 
 ```bash
-git tag 0.0.1
-git push origin 0.0.1
+git tag -a v0.1.0 -m "OAIY 0.1.0"
+git push origin v0.1.0
 ```
 
-The tag is the version — it is stamped into the desktop app at build time, so no release commit is needed. The release for that tag carries:
+The tag is the version — it is stamped into the desktop app at build time, so no release commit is needed — and it cannot be below 0.1.0. [`docs/RELEASING.md`](../docs/RELEASING.md) has the rest: what a release does and does not contain, the tagged commit's message (a `[skip ci]` in it starts nothing), and what a first install needs. The release for that tag carries:
 
 | File | What it is |
 |------|------------|
 | `oaiy-web-<v>.zip` / `.tar.gz` | The compiled static site: landing page at `/`, flow builder at `/app.html`, desktop page at `/desktop.html`. Unzip onto any static host. |
-| `oaiy-desktop-<v>-windows-x64-setup.exe`, `.msi` | OAIY Desktop for Windows |
+| `oaiy-desktop-<v>-windows-x64-setup.exe`, `.msi` | OAIY Desktop for Windows, with the Agent and the flow editor inside |
 | `oaiy-desktop-<v>-linux-x86_64.AppImage`, `-amd64.deb`, `-x86_64.rpm` | OAIY Desktop for Linux |
 | `oaiy-server-<v>-linux-x86_64.tar.gz`, `-windows-x64.zip` | The headless server, no GUI or GTK, for hosts driven by the CLI or a hosted web app |
-| `SHA256SUMS.txt` | Checksums for everything above |
+| `oaiy-cli-<v>.tar.gz` | The CLI alone, for a product that embeds it |
+| `SHA256SUMS.txt`, `release-evidence-*.json` | Checksums for everything above, and per build the revision, digests and the verification run that passed before publication |
 
 The web build is standalone (`VITE_API_BASE` unset) unless a repository Actions
 variable named `VITE_API_BASE` is set. Tag-triggered release publishing remains
 enabled while ordinary CI is paused. The release workflow also supports manual
-builds without publishing a release.
+builds without publishing a release (run on a branch; run on a tag it publishes).
 
 ## License
 

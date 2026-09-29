@@ -221,8 +221,10 @@ Tried on the Pixel 9a test phone, on the dongle, with the Qwen 27B model on this
   defined only under the CUDA test module).
 - Spawned CLIs get `OAIY_SERVER_URL=http://127.0.0.1:17972` even when the port changes
   (`platform/desktop/src-tauri/src/bridge/worker.rs`).
-- The previous OAIY's CI workflows are in `platform/.github/workflows`, where GitHub does not
-  run them; they need moving to the root and their paths updating.
+- The previous OAIY's CI and release workflows were in `platform/.github/workflows`, where
+  GitHub does not read them. They are in `.github/workflows` now, with their paths updated,
+  but no run of them has been seen from the merged layout: the first release is the test
+  ([RELEASING.md](RELEASING.md)).
 - CUDA builds need the Visual Studio 2022 C++ tools loaded (`tools/qwen-image/build.ps1` does
   this); under Windows PowerShell 5.1, redirecting that script's output stops it at cargo's
   first progress line.

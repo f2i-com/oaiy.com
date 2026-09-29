@@ -85,6 +85,7 @@ were added.
 | [CONVENTIONS.md](../CONVENTIONS.md) | The engineering contract for the engine crates: std-only, no `unsafe`, weights read in place. |
 | [crates/VENDORED.md](../crates/VENDORED.md) | Where the vendored GGUF stack comes from, and how local changes are marked. |
 | [platform/TESTING.md](../platform/TESTING.md) | The platform's test suites (desktop, CLI, flow editor, API) and how to run them. |
+| [RELEASING.md](RELEASING.md) | Cutting a release: what one contains and what it does not, how to tag it, the version rule, and what a first install needs. |
 | [The API](../platform/api/README.md) | The optional PHP backend for shared flows and remote runs. |
 | [archive/](archive/README.md) | Plans and work records kept for their history. |
 

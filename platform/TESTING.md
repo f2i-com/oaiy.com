@@ -3,8 +3,9 @@
 Six independent suites. None of them need a fixture database or a mocking
 framework — they drive the real thing.
 
-Release publication runs the reusable verification gate (`.github/workflows/ci.yml`,
-called by `release.yml` at the exact tagged revision) before anything is uploaded:
+Release publication runs the reusable verification gate (`.github/workflows/ci.yml`
+at the repository root, called by `release.yml` there at the exact tagged revision)
+before anything is uploaded:
 the web suite, the complete CLI `npm test` and `npm run typecheck`, the desktop
 Vitest suite, and the native tests in both feature configurations, on Linux and
 Windows. The gate resolves ZIPP's latest release once and every lane installs
@@ -32,6 +33,15 @@ is uploaded. The script's own tests run locally with no GitHub access:
 
 ```bash
 node scripts/attest-release-evidence.test.mjs
+```
+
+The workflow's version rule (no release below 0.1.0, which Aokie's plugin manifest
+needs of the desktop) and its stamping of the tag into `tauri.conf.json` and
+`Cargo.toml` are tested by running the workflow's own steps (bash and node, cut out of
+`release.yml`), against copies of the real files:
+
+```bash
+node --test scripts/release-version.test.mjs
 ```
 
 | Suite | Where | Needs a running service? | Run |
