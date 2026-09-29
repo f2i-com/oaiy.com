@@ -290,6 +290,10 @@ fn spawn_on(store: LinkHandle, node: Option<NodeHandle>, lane: &'static Lane) {
                     )
                 },
             );
+            // This clone of the client shares its pool: kept through the pause below it
+            // would hold the connection the lane lets go of there (and the one it
+            // starts afresh after a failure) open until the next poll.
+            drop(http);
             if store.account().as_ref() == Some(&account) {
                 store.note_sealed_flow(result.as_ref().err().cloned());
             }
@@ -297,7 +301,9 @@ fn spawn_on(store: LinkHandle, node: Option<NodeHandle>, lane: &'static Lane) {
                 Ok(worked) => {
                     last_warned = None;
                     if !worked {
-                        std::thread::sleep(spec.idle_pause(polled.elapsed()));
+                        let pause = spec.idle_pause(polled.elapsed());
+                        lane.rest(pause);
+                        std::thread::sleep(pause);
                     }
                 }
                 Err(error) => {
@@ -660,6 +666,25 @@ mod tests {
             let gap = pair[1].at - pair[0].at;
             assert!(gap >= Duration::from_millis(2_800) && gap < Duration::from_secs(6), "{gap:?}");
         }
+    }
+
+    #[test]
+    fn a_long_pause_after_an_empty_poll_is_not_spent_holding_a_connection_open() {
+        // The pause of a provider that cannot hold polls (a hold of a second, a
+        // pause of five) is time it means to be free of the lane, and a connection
+        // held through it, for four seconds or more, would not be.
+        let server = Provider::start(|_| Reply::ok(&json!({"requests":[]}).to_string()));
+        let (store, dir) = crate::link::testkit::linked_to(&server.base, "sealed-rest", |d| {
+            let lane = d.desktop_flows.as_mut().unwrap();
+            lane.wait_seconds = 1;
+            lane.idle_pause_ms = 5_000;
+        });
+        spawn_on(store.clone(), None, a_client_of_its_own());
+        server.wait_for("/api/v1/desktop-flows/pending", 1, Duration::from_secs(30));
+        let held = server.try_closed_after_reply(0, Duration::from_secs(3));
+        crate::link::testkit::stop_lane(&store);
+        let _ = std::fs::remove_dir_all(dir);
+        assert!(held.is_some_and(|held| held < Duration::from_secs(1)), "the connection was held open: {held:?}");
     }
 
     #[test]

@@ -310,7 +310,9 @@ pub fn spawn(store: LinkHandle, sources: AiSources) {
                             log::info!("AI tunnel poll: working again");
                         }
                         if handled == 0 {
-                            tokio::time::sleep(spec.idle_pause(polled.elapsed())).await;
+                            let pause = spec.idle_pause(polled.elapsed());
+                            tunnel.http.rest(pause);
+                            tokio::time::sleep(pause).await;
                         }
                     }
                     Err(e) => {
@@ -1474,6 +1476,30 @@ mod tests {
             let gap = pair[1].at - pair[0].at;
             assert!(gap >= Duration::from_millis(2_800) && gap < Duration::from_secs(6), "{gap:?}");
         }
+    }
+
+    #[test]
+    fn a_long_pause_after_an_empty_poll_is_not_spent_holding_a_connection_open() {
+        // The pause of a provider that cannot hold polls (a hold of a second, a
+        // pause of five) is time it means to be free of the lane, and a connection
+        // held through it, for four seconds or more, would not be.
+        use crate::link::testkit::{Provider, Reply};
+        let server = Provider::start(|_| Reply::ok(r#"{"requests":[]}"#));
+        let (store, dir) = crate::link::testkit::linked_to(&server.base, "ai-rest", |d| {
+            let lane = d.desktop_ai.as_mut().unwrap();
+            lane.wait_seconds = 1;
+            lane.idle_pause_ms = 5_000;
+        });
+        let sources = AiSources {
+            providers: crate::ai::providers::new_handle(),
+            codex: crate::ai::codex::new_handle(&dir),
+        };
+        spawn(store.clone(), sources);
+        server.wait_for("/api/v1/desktop-ai/pending", 1, Duration::from_secs(30));
+        let held = server.try_closed_after_reply(0, Duration::from_secs(3));
+        crate::link::testkit::stop_lane(&store);
+        let _ = std::fs::remove_dir_all(dir);
+        assert!(held.is_some_and(|held| held < Duration::from_secs(1)), "the connection was held open: {held:?}");
     }
 
     #[tokio::test]

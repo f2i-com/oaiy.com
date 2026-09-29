@@ -137,7 +137,9 @@ Two transports, neither a WebSocket.
   is time in which no poll is open, so work queued then waits for the next poll, up to
   `idlePauseMs` later: the shipped connector leaves it at 500 (its server holds a poll for
   25 seconds, polls its queue every 500 ms while it holds, and keeps a call command for 15
-  seconds). A provider that cannot hold polls can ask for `waitSeconds` 1 with a long pause.
+  seconds). A provider that cannot hold polls can ask for `waitSeconds` 1 with a long pause: a
+  pause of four seconds or more is longer than a connection is kept, so the lane lets go of its
+  connection when the pause begins and holds none through it.
 
 - The relay's `desktop` connector answers `services.*` and `plugins.*`. A command for any other
   connector id goes to that plugin, with the idempotency key `relay-command-<commandId>`, only if

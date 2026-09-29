@@ -162,16 +162,24 @@ impl Provider {
     /// that nothing was using. Waits up to `within` for the close, and fails the
     /// test if it does not come (the client is holding it still).
     pub fn closed_after_reply(&self, conn: usize, within: Duration) -> Duration {
+        self.try_closed_after_reply(conn, within).unwrap_or_else(|| {
+            panic!("connection {conn} was still open {within:?} after this test began waiting for it to close")
+        })
+    }
+
+    /// [`Provider::closed_after_reply`] that says `None` instead of failing when the
+    /// connection is still open after `within`: for a test that has a lane's loop to
+    /// stop before it may fail.
+    pub fn try_closed_after_reply(&self, conn: usize, within: Duration) -> Option<Duration> {
         let deadline = Instant::now() + within;
         loop {
             let life = self.lives.lock().unwrap().get(conn).copied();
             if let Some(Life { last_reply: Some(replied), closed: Some(closed) }) = life {
-                return closed.saturating_duration_since(replied);
+                return Some(closed.saturating_duration_since(replied));
             }
-            assert!(
-                Instant::now() < deadline,
-                "connection {conn} was still open {within:?} after this test began waiting for it to close: {life:?}"
-            );
+            if Instant::now() >= deadline {
+                return None;
+            }
             std::thread::sleep(Duration::from_millis(10));
         }
     }

@@ -112,7 +112,9 @@ fn spawn_on(store: LinkHandle, dispatch: Dispatcher, lane: &'static Lane) {
                     lane.start_afresh();
                     std::thread::sleep(Duration::from_secs(spec.error_backoff_seconds));
                 } else if handled == 0 {
-                    std::thread::sleep(spec.idle_pause(polled.elapsed()));
+                    let pause = spec.idle_pause(polled.elapsed());
+                    lane.rest(pause);
+                    std::thread::sleep(pause);
                 }
             }
             Err(e) => {
@@ -835,6 +837,40 @@ mod tests {
         for gap in gaps {
             assert!(gap >= Duration::from_millis(1_800) && gap < Duration::from_millis(2_800), "{gap:?}");
         }
+    }
+
+    #[test]
+    fn the_default_pause_keeps_the_lanes_connection_from_one_poll_to_the_next() {
+        // Two seconds between polls of a provider that answers at once, well inside
+        // what a connection is kept for.
+        let server = Provider::start(|_| Reply::ok(r#"{"commands":[]}"#));
+        let (store, dir) = crate::link::testkit::linked_to(&server.base, "relay-keeps", |_| {});
+        spawn_on(store.clone(), working_dispatcher(), a_client_of_its_own());
+        let polls = server.wait_for(PENDING, 3, Duration::from_secs(30));
+        crate::link::testkit::stop_lane(&store);
+        let _ = std::fs::remove_dir_all(dir);
+        assert_eq!(polls.iter().map(|p| p.conn).collect::<Vec<_>>(), [0, 0, 0]);
+        assert_eq!(server.connections(), 1);
+    }
+
+    #[test]
+    fn a_long_pause_after_an_empty_poll_is_not_spent_holding_a_connection_open() {
+        // A provider that cannot hold polls asks for a hold of a second and a pause of
+        // five: a request every six seconds, which is what a shared host can bear. A
+        // connection held open through the pause would be a busy worker for most of
+        // the six, and the pool holds one for four seconds or more.
+        let server = Provider::start(|_| Reply::ok(r#"{"commands":[]}"#));
+        let (store, dir) = crate::link::testkit::linked_to(&server.base, "relay-rest", |d| {
+            let relay = d.relay.as_mut().unwrap();
+            relay.wait_seconds = 1;
+            relay.idle_pause_ms = 5_000;
+        });
+        spawn_on(store.clone(), working_dispatcher(), a_client_of_its_own());
+        server.wait_for(PENDING, 1, Duration::from_secs(30));
+        let held = server.try_closed_after_reply(0, Duration::from_secs(3));
+        crate::link::testkit::stop_lane(&store);
+        let _ = std::fs::remove_dir_all(dir);
+        assert!(held.is_some_and(|held| held < Duration::from_secs(1)), "the connection was held open: {held:?}");
     }
 
     #[test]

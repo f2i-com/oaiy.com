@@ -223,6 +223,26 @@ impl<C: Clone> LaneClient<C> {
     pub fn start_afresh(&self) {
         *self.held.lock().unwrap_or_else(|e| e.into_inner()) = None;
     }
+
+    /// The lane is about to wait `pause` before its next request. A pause of
+    /// [`POOL_IDLE`] or more is longer than a connection is kept for, so the next
+    /// request would not use the one this lane has open, and until the pool cleared
+    /// it out it would be a worker of the provider's web server doing nothing: the
+    /// client is let go of now, as it was when every poll made its own.
+    ///
+    /// Only the lane knows the pause, and only a long-poll lane's comes from its
+    /// descriptor (a provider that cannot hold polls asks for a hold of a second and
+    /// a pause of five, to be a request every six seconds), so it is the lane that
+    /// says. Any shorter pause keeps the client and its connection.
+    ///
+    /// Clones of a client share its pool, so a lane that still holds one from its
+    /// last request has to drop it first, or the connection stays open through the
+    /// pause after all.
+    pub fn rest(&self, pause: Duration) {
+        if pause >= POOL_IDLE {
+            self.start_afresh();
+        }
+    }
 }
 
 /// How much of a reply nobody wanted is read to let its connection go on.
@@ -319,6 +339,25 @@ mod client_tests {
         assert_eq!(lane.get(), Ok(2), "after a failed cycle the next try is on a new one");
         assert_eq!(lane.get(), Ok(2));
         assert_eq!(BUILT.load(Ordering::SeqCst), 2);
+    }
+
+    #[test]
+    fn a_lane_that_will_be_quiet_for_longer_than_a_connection_is_kept_lets_go_of_its_client() {
+        static BUILT: AtomicU32 = AtomicU32::new(0);
+        fn build() -> Result<u32, String> {
+            Ok(BUILT.fetch_add(1, Ordering::SeqCst) + 1)
+        }
+        let lane = LaneClient::new(build);
+        assert_eq!(lane.get(), Ok(1));
+        // A pause the connection outlasts: the client, and its connection, are kept.
+        lane.rest(Duration::ZERO);
+        lane.rest(POOL_IDLE - Duration::from_millis(1));
+        assert_eq!(lane.get(), Ok(1));
+        // One it would not: let go now, and the next request is on a new client.
+        lane.rest(POOL_IDLE);
+        assert_eq!(lane.get(), Ok(2));
+        lane.rest(Duration::from_secs(5));
+        assert_eq!(lane.get(), Ok(3));
     }
 
     #[test]

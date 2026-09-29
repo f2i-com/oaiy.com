@@ -850,7 +850,9 @@ pub struct RelaySpec {
     /// this is the only time it does not. A provider that cannot hold a poll
     /// (a shared host, where each held poll is a busy worker) can ask for a short
     /// hold and a long pause instead: `waitSeconds` 1 and `idlePauseMs` 5000 is
-    /// a request every six seconds.
+    /// a request every six seconds. A pause of four seconds or more is longer than
+    /// a connection is kept, so the lane lets go of its connection when the pause
+    /// begins (see [`super::net::LaneClient::rest`]), and holds none through it.
     #[serde(default = "default_idle_pause_ms")]
     pub idle_pause_ms: u64,
 }
