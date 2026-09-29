@@ -1,0 +1,12 @@
+{
+  "version": 1,
+  "publishers": [
+    {
+      "id": "fl-aokie-2026a",
+      "name": "Aokie",
+      "publicKey": "n832sELL2yC6UksKhiz4C4UY7P9//mf8JfeFJRcuk5s=",
+      "plugins": ["aokie"],
+      "note": "Aokie release bundles, minted 2026-07-12 with crates/package-signer in the Aokie repository. The private half is in Aokie's release pipeline (AOKIE_PACKAGE_SIGNING_KEY) and the operator's offline key file, never in a repository. This public half is published in Aokie's SECURITY.md and was pinned by FormLogic Desktop's retired verifier. It verifies the signature of a real Aokie release manifest, kept as plugins/fixtures/aokie-0.1.0.package-manifest.json and checked by a test."
+    }
+  ]
+}

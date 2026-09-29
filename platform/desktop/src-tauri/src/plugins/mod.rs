@@ -6,6 +6,7 @@
 //!
 //! ```text
 //!   manifest  — parse + validate; resolve the capability surface
+//!   trust     — who signed the package, and whether it is still what they signed
 //!   rpc       — the wire: framing, correlation, caps, non-protocol output
 //!   registry  — scan the plugins root, hold state + reasons
 //!   runner    — spawn, handshake, health, bounded restart, shutdown
@@ -42,6 +43,7 @@ pub mod process;
 pub mod registry;
 pub mod rpc;
 pub mod runner;
+pub mod trust;
 
 pub use host::{CompanionBroker, ForwardError, PluginHost, ReceivedEvent, TriggerStore, TriggerStoreHandle, CONNECTOR_TIMEOUT};
 pub use process::{CallError, PluginProcess, SpawnOptions};
@@ -54,3 +56,4 @@ pub use runner::{
     plugin_env, restart_delay, should_restart, HealthTracker, HealthVerdict, HANDSHAKE_TIMEOUT,
     HEALTH_INTERVAL, MAX_RESTART_ATTEMPTS, SHUTDOWN_GRACE,
 };
+pub use trust::{LaunchPermit, PackageTrust, TrustPolicy, TrustService, TrustState};

@@ -51,7 +51,7 @@ fn read_manifest(dir: &Path) -> Result<PluginManifest, String> {
 
 /// The id becomes a directory name, so it must not be able to escape the plugins
 /// root or collide with a shell/OS special name.
-fn valid_plugin_id(id: &str) -> bool {
+pub(crate) fn valid_plugin_id(id: &str) -> bool {
     !id.is_empty()
         && id.len() <= 64
         && id
