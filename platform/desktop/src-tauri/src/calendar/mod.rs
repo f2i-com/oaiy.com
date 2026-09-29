@@ -360,6 +360,86 @@ fn format_start(t: NaiveDateTime) -> String {
     t.format("%Y-%m-%dT%H:%M").to_string()
 }
 
+/// What the receptionist is told about the other bookings it sees in a summary.
+const KEEP_BOOKINGS_PRIVATE: &str = "Offer times inside the free ranges. Never tell the caller about other bookings: not who, not what, not that a time is booked by someone. Say a time isn't available and offer the nearest free one. Say ranges naturally (\"any time in the morning, or after 2 in the afternoon\") rather than listing every half hour.";
+
+/// "8 am to 1 pm".
+fn say_range(from: NaiveTime, to: NaiveTime) -> String {
+    format!("{} to {}", say_time(from), say_time(to))
+}
+
+/// Overlapping or touching ranges joined, in order.
+fn merge_ranges(mut ranges: Vec<(NaiveTime, NaiveTime)>) -> Vec<(NaiveTime, NaiveTime)> {
+    ranges.sort();
+    let mut out: Vec<(NaiveTime, NaiveTime)> = Vec::new();
+    for (a, b) in ranges {
+        match out.last_mut() {
+            Some(last) if a <= last.1 => last.1 = last.1.max(b),
+            _ => out.push((a, b)),
+        }
+    }
+    out
+}
+
+/// One day for the receptionist: its opening hours, the times booked (times
+/// only: never who or what), the free ranges, and when the service can start.
+/// The start windows come from the free start times (`times`, "HH:MM", which
+/// already keep the notice, the booking rules and the clashes), grouped where
+/// they follow one another by the slot step.
+fn day_summary(date: NaiveDate, settings: &Settings, appointments: &[Appointment], times: &[String], minutes: u32, what: &str) -> String {
+    let spans: Vec<(NaiveTime, NaiveTime)> = settings
+        .hours
+        .get(date.weekday().num_days_from_monday() as usize)
+        .map(Vec::as_slice)
+        .unwrap_or(&[])
+        .iter()
+        .filter_map(|sp| Some((parse_time(&sp.open)?, parse_time(&sp.close)?)))
+        .collect();
+    let open = spans.iter().map(|(a, b)| say_range(*a, *b)).collect::<Vec<_>>().join(" and ");
+    // Booked: what holds time that day, clipped to the opening spans.
+    let mut taken = Vec::new();
+    for a in appointments.iter().filter(|a| a.status.holds_time()) {
+        let (Some(start), Some(end)) = (a.starts(), a.ends()) else { continue };
+        if start.date() != date {
+            continue;
+        }
+        for (o, c) in &spans {
+            let (from, to) = (start.time().max(*o), end.time().min(*c));
+            if from < to {
+                taken.push((from, to));
+            }
+        }
+    }
+    let booked = merge_ranges(taken);
+    // When the service can start: runs of start times a step apart.
+    let step = Duration::minutes(settings.slot_minutes.max(5) as i64);
+    let length = Duration::minutes(minutes.max(1) as i64);
+    let mut windows: Vec<(NaiveTime, NaiveTime)> = Vec::new();
+    for t in times.iter().filter_map(|t| parse_time(t)) {
+        match windows.last_mut() {
+            Some(last) if last.1 + step == t => last.1 = t,
+            _ => windows.push((t, t)),
+        }
+    }
+    let free = merge_ranges(windows.iter().map(|(a, b)| (*a, *b + length)).collect());
+    let starts = windows
+        .iter()
+        .map(|(a, b)| if a == b { format!("at {}", say_time(*a)) } else { format!("any time from {}", say_range(*a, *b)) })
+        .collect::<Vec<_>>()
+        .join(", or ");
+    let fits = format!("a {minutes}-min {what} can start {starts}");
+    let all_day = booked.is_empty() && free == spans;
+    if all_day {
+        return format!("{}: free all day, {} ({fits}).", say_date(date), open);
+    }
+    let mut parts = vec![format!("open {open}")];
+    if !booked.is_empty() {
+        parts.push(format!("booked {}", booked.iter().map(|(a, b)| say_range(*a, *b)).collect::<Vec<_>>().join(" and ")));
+    }
+    parts.push(format!("free {}", free.iter().map(|(a, b)| say_range(*a, *b)).collect::<Vec<_>>().join(" and ")));
+    format!("{}: {} ({fits}).", say_date(date), parts.join("; "))
+}
+
 /// "9:30 am", as a receptionist says it.
 pub fn say_time(t: NaiveTime) -> String {
     let (pm, h) = t.hour12();
@@ -664,21 +744,24 @@ impl Calendar {
         let named = settings.services.iter().find(|s| q.contains(&s.name.to_ascii_lowercase()));
         let minutes = named.map(|s| s.minutes).or(settings.services.first().map(|s| s.minutes)).unwrap_or(settings.slot_minutes);
         let free = self.free(now.date(), 14, minutes, now);
+        let what = named.map_or("appointment", |s| s.name.as_str());
+        // Each day as a summary: a model that is handed every start time reads
+        // out the first few and never reaches the afternoon (heard on a call).
+        let booked = self.list(Some(now.date()), None);
         let open_days: Vec<String> = free
             .iter()
             .filter(|d| !d.times.is_empty())
             .take(7)
             .filter_map(|d| {
                 let date = NaiveDate::parse_from_str(&d.date, "%Y-%m-%d").ok()?;
-                let times: Vec<String> = d.times.iter().take(8).filter_map(|t| parse_time(t).map(say_time)).collect();
-                let more = if d.times.len() > 8 { format!(" and {} more", d.times.len() - 8) } else { String::new() };
-                Some(format!("{}: {}{}", say_date(date), times.join(", "), more))
+                Some(day_summary(date, &settings, &booked, &d.times, minutes, what))
             })
             .collect();
         if open_days.is_empty() {
             out.push("Free times: none in the next two weeks.".into());
         } else {
-            out.push(format!("Free times for {} ({} min): {}.", named.map_or("an appointment", |s| s.name.as_str()), minutes, open_days.join(". ")));
+            out.push(format!("Free times for a {minutes}-min {what}, a day a line:\n{}", open_days.join("\n")));
+            out.push(KEEP_BOOKINGS_PRIVATE.into());
         }
         let digits = |s: &str| s.chars().filter(|c| c.is_ascii_digit()).collect::<String>();
         let caller = digits(from);
@@ -831,8 +914,36 @@ mod tests {
         assert!(digest.contains("Mon 9 am to 5 pm"), "{digest}");
         assert!(digest.contains("Sat closed"), "{digest}");
         assert!(digest.contains("Lawn mowing (60 min, from $60)"), "{digest}");
-        assert!(digest.contains("Free times for Lawn mowing (60 min): Mon 28 Sep: 9 am, 9:30 am"), "{digest}");
+        // A day at a time, as ranges: free all day, or its hours, what is booked (times only) and what is free.
+        assert!(digest.contains("Free times for a 60-min Lawn mowing, a day a line:"), "{digest}");
+        assert!(digest.contains("Mon 28 Sep: free all day, 9 am to 5 pm (a 60-min Lawn mowing can start any time from 9 am to 4 pm)."), "{digest}");
+        assert!(
+            digest.contains("Thu 1 Oct: open 9 am to 5 pm; booked 10 am to 11 am; free 9 am to 10 am and 11 am to 5 pm (a 60-min Lawn mowing can start at 9 am, or any time from 11 am to 4 pm)."),
+            "{digest}"
+        );
+        assert!(digest.contains("Never tell the caller about other bookings"), "{digest}");
+        assert!(!digest.contains("and 6 more"), "every free time is in a range, none cut off: {digest}");
         assert!(digest.contains("This caller's appointments: Thu 1 Oct at 10 am, Lawn mowing (requested, not yet confirmed)."), "{digest}");
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn a_days_summary_has_its_breaks_its_bookings_as_times_only_and_the_notice() {
+        let (cal, dir) = calendar();
+        let mut s = cal.settings();
+        s.services = vec![Service { id: String::new(), name: "Lawn mowing".into(), minutes: 60, description: String::new(), price: String::new() }];
+        // Tuesdays: 8 to 12, then 1 to 5.
+        s.hours[1] = vec![Span { open: "08:00".into(), close: "12:00".into() }, Span { open: "13:00".into(), close: "17:00".into() }];
+        cal.set_settings(s).unwrap();
+        cal.record_request(&json!({"requestId": "r1", "from": "+61400000001", "callerName": "Sam", "service": "Lawn mowing", "date": "2026-09-29", "time": "14:00"})).unwrap();
+        // Tuesday 29 Sep, 9:10 am: the hour's notice leaves the morning from 10:30.
+        let digest = cal.lookup("lawn mowing?", "0400000002", at("2026-09-29T09:10"));
+        assert!(
+            digest.contains("Tue 29 Sep: open 8 am to 12 pm and 1 pm to 5 pm; booked 2 pm to 3 pm; free 10:30 am to 12 pm and 1 pm to 2 pm and 3 pm to 5 pm (a 60-min Lawn mowing can start any time from 10:30 am to 11 am, or at 1 pm, or any time from 3 pm to 4 pm)."),
+            "{digest}"
+        );
+        // Who and what are never in it: only the caller's own appointments are named.
+        assert!(!digest.contains("Sam"), "{digest}");
         let _ = std::fs::remove_dir_all(dir);
     }
 
