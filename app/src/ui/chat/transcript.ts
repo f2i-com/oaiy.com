@@ -6,6 +6,7 @@
  * `[OAIY] Your flow "…" asks: …`; the chat shows who said it, and when, and
  * leaves out the label. Anything it does not recognise is shown as it is.
  */
+import { displayNumber } from '../../phoneNumbers';
 
 /** A caller's words on a call. */
 export interface CallerPart {
@@ -238,16 +239,36 @@ export function ago(at: number, now = Date.now()): string {
   return date.toLocaleDateString(undefined, { day: 'numeric', month: 'short' });
 }
 
-/** A phone number, spaced as it is read: "+61 491 570 006", "0491 570 006"; anything else as it is. */
-export function formatNumber(number: string): string {
-  const n = number.replace(/[\s-]/g, '');
-  let m = /^\+61(\d)(\d{4})(\d{4})$/.exec(n);
-  if (m) return m[1] === '4' ? `+61 ${m[1]}${m[2].slice(0, 2)} ${m[2].slice(2)}${m[3].slice(0, 1)} ${m[3].slice(1)}` : `+61 ${m[1]} ${m[2]} ${m[3]}`;
-  m = /^(04\d\d)(\d{3})(\d{3})$/.exec(n);
-  if (m) return `${m[1]} ${m[2]} ${m[3]}`;
-  m = /^\+1(\d{3})(\d{3})(\d{4})$/.exec(n);
-  if (m) return `+1 ${m[1]} ${m[2]} ${m[3]}`;
-  return number;
+/**
+ * A phone number, spaced as it is read: one of the country for local numbers
+ * as it is dialled there ("0491 570 006"), any other with its country
+ * ("+44 20 7946 0958"); anything else as it is.
+ */
+export function formatNumber(number: string, country?: string): string {
+  return displayNumber(number, country);
+}
+
+/**
+ * A phone conversation's words, read by what they are rather than by which
+ * agent has them (a person's calls and texts are one conversation): texts
+ * (`Text message from …:`), a note from OAIY on its own, or a call's lines
+ * (the caller's, OAIY's notes, the person's own).
+ */
+export function parsePhoneTurn(text: string): Part[] {
+  const lines = text.split('\n');
+  if (lines.some((l) => TEXT_HEAD.test(l))) return parseTextTurn(text);
+  if (text.startsWith('[OAIY] ') && !lines.some((l) => CALLER.test(l))) return [{ kind: 'note', text: text.replace(/^\[OAIY\]\s*/, '') }];
+  return parseCallTurn(text);
+}
+
+/** Which way a turn came: a call (its start, a caller's words) or a text; null for anything else. */
+export function wayOf(turn: { role: string; text?: string; automatic?: boolean; via?: string }): 'call' | 'sms' | null {
+  if (turn.role !== 'user' || typeof turn.text !== 'string') return null;
+  if (turn.automatic && /^\[OAIY\] 📞 (?:A call from|You rang)/.test(turn.text)) return 'call';
+  const lines = turn.text.split('\n');
+  if (lines.some((l) => TEXT_HEAD.test(l))) return 'sms';
+  if (lines.some((l) => CALLER.test(l))) return 'call';
+  return null;
 }
 
 /** What kind of conversation some turns are, from their words: a call's, a text thread's, a flow's tasks, or the person's own. */

@@ -7,7 +7,8 @@ import { NetGate } from './gate/netgate';
 import { sandboxAvailable, zippModule } from './sandbox/runner';
 import { loadSettings, saveAgentSettings, saveDesktop, saveGate, saveLastKeptProject, saveLastProject, saveMedia, saveMessages, saveProviders } from './settings';
 import { Desktop } from './desktop/bridge';
-import { DesktopEvents, Sessions, TEST_NUMBER, callerNotesTool, phoneConversationsTool, tellAgentTool } from './sessions';
+import { DesktopEvents, Sessions, TEST_NUMBER, callerNotesTool, phoneConversationsTool, tellAgentTool, type Session, type Thread } from './sessions';
+import { displayNumber, setLocalCountry } from './phoneNumbers';
 import { Callbacks, type Screening } from './callbacks';
 import { UNPAIRED, diffModules, followModules, isOn, readModules, sessionShown, whyOff, type Modules } from './modules';
 import { flowSessionTools, flowToolHooks, readFlowStore } from './desktop/flowTools';
@@ -171,6 +172,8 @@ async function main(): Promise<void> {
   /** Why ChatGPT cannot be used now, for the model chip ('' when nothing is known against it). */
   let chatgptProblem = '';
   let messages = settings.messages;
+  // Numbers written without their country are read as this one's: a person's calls and texts are one conversation.
+  setLocalCountry(messages.country);
   let sessions: Sessions | null = null;
   /** Missed calls rung back (by the page that answers the calls). */
   let callbacks: Callbacks | null = null;
@@ -256,8 +259,27 @@ async function main(): Promise<void> {
       if (k === 'setup') throw new Error(`OAIY Desktop's control API did not answer, so OAIY cannot be set up from here: ${(error as Error).message}`);
     }
   };
-  /** The conversation the chat shows: null for the project's own. */
+  /** The conversation the chat shows (a person's calls and texts, a flow's tasks), by its id: null for the project's own. */
   let viewing: string | null = null;
+  /**
+   * A person's calls and texts are one conversation, each way answered by an
+   * agent of its own, and two can work at once (a text answered during a
+   * call). One streams into the chat: the call going on, else the first to
+   * start. Another's reply is drawn when it is done, from how far that agent's
+   * turns had been drawn.
+   */
+  let streaming: Session | null = null;
+  const drawnTo = new Map<Session, number>();
+  /** Whether a lane of the conversation shown streams its reply into the chat now. */
+  const streams = (lane: Session): boolean => {
+    const live = sessions?.list.find((s) => s.thread === lane.thread && s.callId);
+    if (live) {
+      if (streaming !== live) streaming = live;
+      return lane === live;
+    }
+    if (!streaming || !streaming.running || streaming.thread !== lane.thread) streaming = lane;
+    return streaming === lane;
+  };
 
   const chat = new ChatPane({
     submit: (text, files) => (viewing ? sessionSubmit(text, files) : void submit(text, files)),
@@ -341,7 +363,7 @@ async function main(): Promise<void> {
   // A call going on now: who with, and a click shows it.
   const callChip = h('button.chip.on-call', { hidden: true, onclick: () => {
     const live = sessions?.list.find((s) => s.callId);
-    if (live) selectSession(live.id);
+    if (live) selectSession(live.thread);
   } }) as HTMLButtonElement;
   const renderChips = () => {
     gateChip.textContent = `internet: ${gate.mode === 'open' ? 'on' : gate.mode === 'blocked' ? 'off' : 'allowlist'}`;
@@ -493,7 +515,7 @@ async function main(): Promise<void> {
   };
   /** What the Front desk's own agent is for: it directs the phone's sub-agents. */
   const RUNNER_INSTRUCTIONS = [
-    "This project is the Front desk, and you are the phone's runner. Each call, text-message thread and flow task is answered by a sub-agent of yours, in a conversation of its own (the tabs beside this one): each has its own context, reads this project's files but cannot change them, and takes its direction from /brief.md before every reply.",
+    "This project is the Front desk, and you are the phone's runner. Each person who calls or texts has one conversation (their calls and their texts together, however the phone writes their number), and each flow that gives tasks another (the list beside this one). Sub-agents of yours answer them, one for a person's calls (fresh each call) and one for their texts: each has its own context, reads this project's files but cannot change them, and takes its direction from /brief.md before every reply.",
     'You keep that direction. When your person tells you what callers or texters should hear, be offered, or not be promised, update /brief.md: short, current and plain, with anything out of date taken out. Put lasting facts (services explained, prices, areas served, answers to common questions) in files under /knowledge. Files your person attaches are kept in /uploads, where the sub-agents read them too.',
     'Pass on what your person tells you, so the phone\'s agents know it: for everyone, /brief.md (read before every reply, so a call going on now has it at its next reply); about one person (their name, how they like things, what to tell them next time), caller_notes, which the agent of each of their calls reads as the call starts, and of their texts before every reply; for one conversation going on now (a call in progress), tell_agent. Each call starts fresh: its agent has what the brief and that person\'s note say, and looks up their earlier calls and texts itself.',
     'To see what the phone\'s agents said and did, use phone_conversations (the list, or one conversation). Opening hours and services come from the Calendar, not from files.',
@@ -527,12 +549,24 @@ async function main(): Promise<void> {
       () => desktop,
       {
         changed: () => renderSessions(),
-        // A caller's words while its agent answers go where they came, without splitting the reply being written.
+        // A caller's words, or a text, while an agent of theirs answers go where they came, without splitting the reply being written.
         arrived: (session, text) => {
-          if (viewing === session.id) (session.running ? chat.heard(text) : chat.user(text, []));
+          if (viewing !== session.thread) return;
+          const working = own.list.some((s) => s.thread === session.thread && s.running);
+          if (working) chat.heard(text);
+          else chat.user(text, []);
         },
         finished: (session) => {
-          if (viewing === session.id) chat.endReply();
+          if (viewing !== session.thread) return;
+          if (streaming === session) {
+            chat.endReply();
+            streaming = null;
+          } else {
+            // Another agent of the conversation shown answered while one streamed here: its reply now, whole
+            // (what came to it was drawn as it came).
+            chat.insertTurns(session.agent.turns.slice(drawnTo.get(session) ?? 0).filter((t) => t.role !== 'user'));
+          }
+          drawnTo.set(session, session.agent.turns.length);
         },
         // The phone greets a caller by the name its agents know (a cleared name is forgotten there too).
         named: (note) => {
@@ -540,7 +574,7 @@ async function main(): Promise<void> {
         },
         event: (session, event) => {
           noteModelEvent(event);
-          if (viewing === session.id) chat.event(event);
+          if (viewing === session.thread && streams(session)) chat.event(event);
           if (event.type === 'tool_result') void own.save(session).catch(() => {});
         },
       },
@@ -1420,8 +1454,9 @@ With that done, Settings → Images, video and audio → Find OAIY sets it up.`)
   function renderSessions(): void {
     if (!sessions || !project) return;
     // Calls and texts are the phone's: hidden (and kept) while there is none. Flows' tasks always show.
-    const shownSessions = sessions.list.filter((s) => sessionShown(s.kind, modules));
-    const live = phoneOn() ? shownSessions.find((s) => s.callId) : undefined;
+    // A person's calls and texts: one conversation. Calls and texts show while there is a phone; flows' tasks always.
+    const shownThreads = sessions.threads().filter((t) => sessionShown(t.kind, modules));
+    const live = phoneOn() ? shownThreads.find((t) => t.live) : undefined;
     callChip.hidden = !live;
     if (live) {
       callChip.textContent = `On a call · ${live.title}`;
@@ -1432,24 +1467,30 @@ With that done, Settings → Images, video and audio → Find OAIY sets it up.`)
       settingUp
         ? { id: null, label: '⚙ Set up OAIY', title: 'Set up OAIY: your conversation with the Agent about OAIY itself', status: 'Your conversation about setting up OAIY', unread: 0, working: !!currentRun, kind: 'setup', name: project.meta.name }
         : { id: null, label: project === frontDesk ? '🧭 The runner' : '💬 Project', title: `${project.meta.name}: your conversation with the agent`, status: project === frontDesk ? "Your conversation: it directs the phone's agents" : `Your conversation in ${project.meta.name}`, unread: 0, working: !!currentRun, kind: project === frontDesk ? 'runner' : 'project', name: project === frontDesk ? 'The runner' : project.meta.name },
-      ...shownSessions.map((s) => ({
-        id: s.id,
-        kind: s.kind,
-        name: s.key === TEST_NUMBER ? 'Test' : s.title,
-        key: s.key,
-        lastAt: s.lastAt,
-        live: !!s.callId,
-        status: s.callId ? 'On a call now' : s.running ? 'Working…' : `${s.kind === 'call' ? 'Calls' : s.kind === 'task' ? 'Flow tasks' : 'Texts'} · ${since(s.lastAt)}`,
-        label: s.key === TEST_NUMBER ? '💬 Test' : `${s.kind === 'call' ? '📞' : s.kind === 'task' ? '🔀' : '💬'} ${s.title}`,
-        title: s.kind === 'task' ? `The tasks your flow "${s.title}" gives the agent` : `${s.kind === 'call' ? (s.callId ? 'On a call with' : 'Calls with') : 'Text messages with'} ${s.title}${s.title !== s.key ? ` (${s.key})` : ''}`,
-        unread: s.id === viewing ? 0 : s.unread,
-        working: !!s.running,
-        // A finished conversation can go (not one that is working, or a live call).
-        close: s.running || s.callId ? undefined : () => void closeSession(s.id),
-      })),
+      ...shownThreads.map((t) => {
+        const what = t.kind === 'task' ? 'Flow tasks' : t.ways.length === 2 ? 'Calls and texts' : t.ways[0] === 'call' ? 'Calls' : 'Texts';
+        return {
+          id: t.id,
+          kind: t.kind,
+          name: t.key === TEST_NUMBER ? 'Test' : t.title,
+          key: t.key,
+          lastAt: t.lastAt,
+          live: !!t.live,
+          ways: t.ways,
+          ...(t.lastWay ? { lastWay: t.lastWay } : {}),
+          ...(t.kind === 'person' ? { to: t.live || t.hidden ? ('call' as const) : ('sms' as const) } : {}),
+          status: t.live ? 'On a call now' : t.running ? 'Working…' : `${what} · ${since(t.lastAt)}`,
+          label: t.key === TEST_NUMBER ? '💬 Test' : `${t.kind === 'task' ? '🔀' : t.lastWay === 'sms' ? '💬' : '📞'} ${t.title}`,
+          title: t.kind === 'task' ? `The tasks your flow "${t.title}" gives the agent` : `${t.live ? 'On a call with' : `${what} with`} ${t.title}${t.title !== t.key && !t.hidden ? ` (${displayNumber(t.key)})` : ''}`,
+          unread: t.id === viewing ? 0 : t.unread,
+          working: t.running,
+          // A finished conversation can go (not one that is working, or a live call).
+          close: t.running || t.live ? undefined : () => void closeSession(t.id),
+        };
+      }),
     ], viewing, selectSession);
-    const shown = viewing ? sessions.get(viewing) : null;
-    if (shown) chat.setBusy(!!shown.running);
+    const shown = viewing ? sessions.thread(viewing) : null;
+    if (shown) chat.setBusy(shown.running);
   }
 
   /** When something last happened, as a person says it. */
@@ -1461,16 +1502,19 @@ With that done, Settings → Images, video and audio → Find OAIY sets it up.`)
     return new Date(at).toLocaleDateString(undefined, { weekday: 'short', day: 'numeric', month: 'short' });
   }
 
-  /** Remove a call or text conversation from this project (asked first). */
+  /** Remove a person's conversation (their calls and texts) or a flow's tasks from this project (asked first). */
   async function closeSession(id: string): Promise<void> {
-    const session = sessions?.get(id);
-    if (!session || session.running || session.callId) return;
-    const what = session.kind === 'call' ? `the calls with ${session.title}` : session.kind === 'task' ? `the tasks from the flow "${session.title}"` : `the text messages with ${session.title}`;
+    const thread = sessions?.thread(id);
+    if (!thread || thread.running || thread.live) return;
+    const what = thread.kind === 'task' ? `the tasks from the flow "${thread.title}"` : `the ${thread.ways.length === 2 ? 'calls and texts' : thread.ways[0] === 'call' ? 'calls' : 'text messages'} with ${thread.title}`;
     if (!(await confirmAction({ title: 'Remove this conversation?', message: `Its record of ${what} is deleted from this project. If they call or text again, a new one starts.`, ok: 'Remove', danger: true }))) return;
-    if (viewing === id) selectSession(null);
-    await sessions!.remove(session);
+    if (viewing === thread.id) selectSession(null);
+    await sessions!.remove(thread);
     renderSessions();
   }
+
+  /** How the chat reads a conversation: a person's (their texts', or, a hidden caller's, a call's) or a flow's. */
+  const chatKind = (thread: Thread): 'call' | 'sms' | 'task' => (thread.kind === 'task' ? 'task' : thread.hidden ? 'call' : 'sms');
 
   /** Show a conversation: the project's own (null), or a text-message thread. */
   /** The place whose files the panels show: the open project, or the front desk. */
@@ -1498,16 +1542,20 @@ With that done, Settings → Images, video and audio → Find OAIY sets it up.`)
     });
   }
 
+  /** Show a conversation: the project's own (null), a person's calls and texts, or a flow's tasks (by its id). */
   function selectSession(id: string | null): void {
-    const found = id ? sessions?.get(id) : null;
-    // A call or a text thread is not shown while there is no phone.
-    const session = found && sessionShown(found.kind, modules) ? found : null;
-    viewing = session ? session.id : null;
-    showFiles(session ? frontDesk : project);
-    if (session) {
-      chat.replay(session.agent.turns);
-      chat.setBusy(!!session.running);
-      sessions!.seen(session);
+    const found = id ? sessions?.thread(id) : null;
+    // A person's calls and texts are not shown while there is no phone.
+    const thread = found && sessionShown(found.kind, modules) ? found : null;
+    viewing = thread ? thread.id : null;
+    streaming = null;
+    drawnTo.clear();
+    showFiles(thread ? frontDesk : project);
+    if (thread) {
+      chat.replay(sessions!.turnsOf(thread.id), undefined, chatKind(thread));
+      for (const lane of thread.lanes) drawnTo.set(lane, lane.agent.turns.length);
+      chat.setBusy(thread.running);
+      sessions!.seen(thread);
     } else {
       chat.replay(agent.turns);
       chat.setBusy(!!currentRun);
@@ -1516,27 +1564,34 @@ With that done, Settings → Images, video and audio → Find OAIY sets it up.`)
     chat.focus();
   }
 
-  /** The person's message in a text-message conversation: to its agent, first in line. */
+  /** The person's message in a phone conversation: to its call going on, or their texts' agent (a flow's: its tasks'), first in line. */
   function sessionSubmit(text: string, files: File[]): void {
-    const session = viewing ? sessions?.get(viewing) : null;
-    if (!session || !sessions) return;
-    if (files.length) chat.system('Attach files in the project\'s own conversation; in a text-message conversation, write what the agent should do.', 'error');
+    const thread = viewing ? sessions?.thread(viewing) : null;
+    if (!thread || !sessions) return;
+    if (files.length) chat.system('Attach files in the project\'s own conversation; in a phone conversation, write what the agent should do.', 'error');
     if (!text) return;
     if (text.trim() === '/clear') {
-      sessions.stop(session);
-      session.agent.reset();
-      void sessions.save(session);
+      if (thread.live) {
+        chat.system('Not during a call: clear this conversation once the call has ended.', 'error');
+        return;
+      }
+      for (const lane of thread.lanes) {
+        sessions.stop(lane);
+        lane.agent.reset();
+        drawnTo.set(lane, 0);
+      }
+      void sessions.save(thread.lanes[0]);
       chat.clearLog();
       chat.system('This conversation starts again. The texts it sent stay sent.');
       return;
     }
-    chat.user(text, [], !!session.running);
-    sessions.say(session, text);
+    chat.user(text, [], thread.running);
+    void sessions.say(thread, text).then(() => renderSessions());
   }
 
   function stopViewed(): void {
-    const session = viewing ? sessions?.get(viewing) : null;
-    if (session) sessions?.stop(session);
+    const thread = viewing ? sessions?.thread(viewing) : null;
+    for (const lane of thread?.lanes ?? []) sessions?.stop(lane);
   }
 
   // Whether the phone is there: from Aokie's status, then its events.
@@ -1569,9 +1624,10 @@ With that done, Settings → Images, video and audio → Find OAIY sets it up.`)
     const d = desktop;
     if (!d || !sessions || namesGiven) return;
     namesGiven = true;
+    // Each person once, by their number in E.164 (the desktop matches it to the caller id however the phone writes it).
     const names = new Map<string, string>();
-    for (const s of sessions.list) if (s.kind !== 'task' && s.key !== TEST_NUMBER && s.title && s.title !== s.key) names.set(s.key, s.title);
-    for (const c of sessions.callers) if (c.name) names.set(c.number, c.name);
+    for (const t of sessions.threads()) if (t.kind === 'person' && !t.hidden && t.key !== TEST_NUMBER && t.title && t.title !== t.key) names.set(t.key, t.title);
+    for (const c of sessions.callers) if (c.name && c.number !== TEST_NUMBER) names.set(c.number, c.name);
     for (const [number, name] of names) void d.rememberCaller(number, name).catch(() => {});
   }
 
@@ -1713,7 +1769,7 @@ With that done, Settings → Images, video and audio → Find OAIY sets it up.`)
             void sessions?.callEvent(event).then((session) => {
               // A call begins: show it (the person sees the conversation as it happens).
               if (session && event.type === 'call.started') {
-                selectSession(session.id);
+                selectSession(session.thread);
                 chat.system(`📞 ${session.title} is calling: the agent is answering.`);
               }
             });
@@ -1747,7 +1803,7 @@ With that done, Settings → Images, video and audio → Find OAIY sets it up.`)
     holdsCalls = holdsTexts = false;
     phoneConnected = null;
     for (const s of sessions?.list ?? []) if (s.kind !== 'task' && s.running) sessions?.stop(s);
-    const shown = viewing ? sessions?.get(viewing) : null;
+    const shown = viewing ? sessions?.thread(viewing) : null;
     if (shown && !sessionShown(shown.kind, modules)) selectSession(null);
     if (project === frontDesk) void leaveFrontDesk();
   }
@@ -1836,7 +1892,7 @@ With that done, Settings → Images, video and audio → Find OAIY sets it up.`)
         renderPhoneChip();
       },
       test: (body) => {
-        void sessions?.textArrived(TEST_NUMBER, 'Test', body).then((session) => selectSession(session.id));
+        void sessions?.textArrived(TEST_NUMBER, 'Test', body).then((session) => selectSession(session.thread));
       },
       // The phone refusing who is answered (a pattern it cannot read, or the phone gone) is said, and the rest is still saved.
       screening: desktop && phoneOn() ? { load: readScreening, save: (s) => saveScreening(s).catch((e: unknown) => chat.system(`The phone did not take who is answered: ${(e as Error).message}`, 'error')) } : undefined,
@@ -1851,6 +1907,9 @@ With that done, Settings → Images, video and audio → Find OAIY sets it up.`)
       }
       messages = saved;
       await saveMessages(saved);
+      // Numbers from now on are read for the country chosen (conversations kept under another are merged at the next start).
+      setLocalCountry(saved.country);
+      renderSessions();
       // Turned on: take the lease now (and answer what waits); turned off: give it up.
       await keepTextLease();
     }

@@ -1,9 +1,9 @@
 /**
  * The conversations to switch between, in a searchable picker: the button
  * shows the one on screen (who, and their number or what it is), and the list
- * holds them all by kind (yours, calls, texts, flows' tasks), each with when
- * it last heard or said something, its unread count, and a way to remove a
- * finished one.
+ * holds them all by kind (yours, one per person who calls or texts, flows'
+ * tasks), each with the ways they have been in touch, when they last were,
+ * its unread count, and a way to remove a finished one.
  */
 import { Combobox, type ComboItem } from './combobox';
 import { h } from './dom';
@@ -29,13 +29,19 @@ export interface ConversationTab {
   lastAt?: number;
   /** On a call now. */
   live?: boolean;
+  /** A person's: the ways they have been in touch (calls, texts), and the latest. */
+  ways?: Array<'call' | 'sms'>;
+  lastWay?: 'call' | 'sms';
+  /** A person's: where a message of the person's goes (their call going on, or their texts). */
+  to?: 'call' | 'sms';
 }
 
-export type ConversationKind = 'project' | 'runner' | 'setup' | 'call' | 'sms' | 'task';
+export type ConversationKind = 'project' | 'runner' | 'setup' | 'person' | 'call' | 'sms' | 'task';
 
 /** The id the person's own conversation (null) goes by in the list. */
 const OWN = '\u0000own';
-const GROUPS = ['Yours', 'Calls', 'Texts', 'Flow tasks'];
+const PEOPLE = 'Calls and texts';
+const GROUPS = ['Yours', PEOPLE, 'Calls', 'Texts', 'Flow tasks'];
 const TEST = 'test';
 
 /** A tab's kind: given, or read from its label's mark (a label from before kinds were given). */
@@ -52,12 +58,20 @@ export function tabName(tab: ConversationTab): string {
   return tab.name ?? (tab.label.replace(/^[^\p{L}\p{N}+(]+/u, '').trim() || tab.label);
 }
 
-const KIND_ICON: Record<ConversationKind, string> = { project: 'sparkle', runner: 'compass', setup: 'settings', call: 'phone', sms: 'message', task: 'flow' };
+const KIND_ICON: Record<ConversationKind, string> = { project: 'sparkle', runner: 'compass', setup: 'settings', person: 'phone', call: 'phone', sms: 'message', task: 'flow' };
+const WAY_ICON = { call: 'phone', sms: 'message' } as const;
 
-/** A conversation's avatar: the person's initials, or its kind's icon. */
-export function conversationAvatar(kind: ConversationKind, name: string, live = false): HTMLElement {
-  const letters = kind === 'call' || kind === 'sms' ? initials(name) : '';
-  return h('span.convo-avatar', { class: `kind-${kind}${live ? ' live' : ''}`, 'aria-hidden': 'true' }, letters ? h('span.convo-initials', letters) : icon(KIND_ICON[kind]), ...(letters ? [h('span.convo-kind', icon(KIND_ICON[kind]))] : []));
+/** A conversation's avatar: the person's initials (with how they were last in touch), or its kind's icon. */
+export function conversationAvatar(kind: ConversationKind, name: string, live = false, lastWay?: 'call' | 'sms'): HTMLElement {
+  const letters = kind === 'call' || kind === 'sms' || kind === 'person' ? initials(name) : '';
+  // A person is drawn as the way they were last in touch (a call going on: a call).
+  const shown: ConversationKind = kind === 'person' ? (live ? 'call' : lastWay ?? 'call') : kind;
+  return h('span.convo-avatar', { class: `kind-${shown}${kind === 'person' ? ' kind-person' : ''}${live ? ' live' : ''}`, 'aria-hidden': 'true' }, letters ? h('span.convo-initials', letters) : icon(KIND_ICON[shown]), ...(letters ? [h('span.convo-kind', icon(KIND_ICON[shown]))] : []));
+}
+
+/** The ways a person has been in touch, in words: "Calls and texts", "Calls", "Texts". */
+function waysText(ways: Array<'call' | 'sms'>): string {
+  return ways.includes('call') && ways.includes('sms') ? 'Calls and texts' : ways.includes('call') ? 'Calls' : 'Texts';
 }
 
 /** The line under a conversation's name: its number and kind, or what it is. */
@@ -67,10 +81,10 @@ export function conversationDetail(tab: ConversationTab, forButton = false): str
   if (tab.working && !forButton) return 'Working…';
   const name = tabName(tab);
   const key = tab.key ?? '';
-  if (kind === 'sms' && key === TEST) return 'Test conversation: replies are shown, not sent';
-  if ((kind === 'call' || kind === 'sms') && key) {
+  if ((kind === 'sms' || kind === 'person') && key === TEST) return 'Test conversation: replies are shown, not sent';
+  if ((kind === 'call' || kind === 'sms' || kind === 'person') && key) {
     const number = key !== name && /\d{4,}/.test(key) ? formatNumber(key) : '';
-    const what = kind === 'call' ? 'Calls' : 'Text messages';
+    const what = kind === 'person' ? waysText(tab.ways ?? []) : kind === 'call' ? 'Calls' : 'Text messages';
     return number ? `${number} · ${what}` : what;
   }
   if (kind === 'task') return 'Tasks from a flow';
@@ -97,17 +111,20 @@ export class SessionPicker {
     this.select = select;
     const items: ComboItem[] = tabs.map((tab) => {
       const kind = tabKind(tab);
-      const name = kind === 'sms' && tab.key === TEST ? 'Test' : tabName(tab);
-      const group = kind === 'project' || kind === 'runner' || kind === 'setup' ? 'Yours' : kind === 'call' ? 'Calls' : kind === 'sms' ? 'Texts' : 'Flow tasks';
+      const name = (kind === 'sms' || kind === 'person') && tab.key === TEST ? 'Test' : tabName(tab);
+      const group = kind === 'project' || kind === 'runner' || kind === 'setup' ? 'Yours' : kind === 'person' ? PEOPLE : kind === 'call' ? 'Calls' : kind === 'sms' ? 'Texts' : 'Flow tasks';
+      const ways = kind === 'person' ? tab.ways ?? [] : [];
       return {
         id: tab.id ?? OWN,
         label: name,
         detail: conversationDetail(tab),
+        // The ways they have been in touch, as icons before that line.
+        ...(ways.length && !tab.live && !tab.working ? { detailIcons: ways.map((w) => WAY_ICON[w]) } : {}),
         meta: tab.lastAt ? ago(tab.lastAt) : '',
         group,
         kind,
-        keywords: [tab.key, tab.key ? formatNumber(tab.key) : '', tab.status, tab.title, kind === 'call' ? 'call phone' : kind === 'sms' ? 'text sms message' : kind === 'task' ? 'flow task' : 'mine own'].filter(Boolean).join(' '),
-        icon: () => conversationAvatar(kind, name, !!tab.live),
+        keywords: [tab.key, tab.key ? formatNumber(tab.key) : '', tab.status, tab.title, kind === 'person' ? [ways.includes('call') ? 'call phone' : '', ways.includes('sms') ? 'text sms message' : ''].join(' ') : kind === 'call' ? 'call phone' : kind === 'sms' ? 'text sms message' : kind === 'task' ? 'flow task' : 'mine own'].filter(Boolean).join(' '),
+        icon: () => conversationAvatar(kind, name, !!tab.live, tab.lastWay),
         badge: tab.unread || undefined,
         pulse: tab.live ? 'live' : tab.working ? 'working' : undefined,
         title: tab.title ?? name,
@@ -126,7 +143,7 @@ export class SessionPicker {
     const others = this.tabs.filter((t) => t !== tab);
     const unread = others.reduce((n, t) => n + t.unread, 0);
     return [
-      conversationAvatar(kind, name, !!tab.live),
+      conversationAvatar(kind, name, !!tab.live, tab.lastWay),
       h(
         'span.convo-text',
         h('span.convo-name', { class: tab.working || tab.live ? 'working' : '' }, name, ...(tab.live ? [h('span.convo-live', 'Live')] : [])),

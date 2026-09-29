@@ -16,6 +16,8 @@ export interface ComboItem {
   label: string;
   /** A line under the name. */
   detail?: string;
+  /** Icons at the start of that line (the ways a person has been in touch). */
+  detailIcons?: string[];
   /** Beside the name, at the end (a time). */
   meta?: string;
   /** The group it is listed under. */
@@ -278,7 +280,7 @@ export class Combobox {
       h(
         'span.combo-text',
         h('span.combo-label', h('span.combo-name', item.label), ...(item.pulse ? [h('span.combo-pulse', { 'aria-label': item.pulse === 'live' ? 'on a call now' : 'working' })] : [])),
-        ...(item.detail ? [h('span.combo-detail', item.detail)] : []),
+        ...(item.detail ? [h('span.combo-detail', ...(item.detailIcons?.length ? [h('span.combo-detail-icons', ...item.detailIcons.map((name) => icon(name, `way-${name}`)))] : []), item.detail)] : []),
       ),
       h(
         'span.combo-end',

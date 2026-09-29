@@ -242,6 +242,11 @@ button:focus-visible, summary:focus-visible, [tabindex]:focus-visible { outline:
 .combo-label { display: flex; align-items: center; gap: 6px; min-width: 0; }
 .combo-name { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-size: 13px; font-weight: 600; }
 .combo-detail { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-size: 11.5px; color: var(--muted); }
+/* The ways a person has been in touch, before their number: a call, a text. */
+.combo-detail-icons { display: inline-flex; gap: 3px; margin-right: 5px; vertical-align: -1px; }
+.combo-detail-icons .icon { width: 11px; height: 11px; stroke-width: 2.2; }
+.combo-detail-icons .way-phone { color: var(--magenta); }
+.combo-detail-icons .way-message { color: var(--cyan); }
 .combo-end { flex: none; display: flex; align-items: center; gap: 6px; }
 .combo-meta { font-family: var(--mono); font-size: 10.5px; color: var(--faint); }
 .combo-badge, .convo-unread { min-width: 18px; padding: 0 5px; border-radius: 999px; background: var(--accent); color: var(--on-accent); font-weight: 700; font-size: 10.5px; line-height: 18px; text-align: center; }
@@ -566,6 +571,8 @@ kbd { display: inline-block; padding: 1px 6px; border: 1px solid var(--border); 
 .day-divider-text { display: inline-flex; align-items: center; gap: 6px; white-space: nowrap; max-width: 88%; overflow: hidden; text-overflow: ellipsis; }
 .day-divider-text .icon { width: 12px; height: 12px; color: var(--magenta); }
 .day-divider strong { color: var(--text); font-weight: 650; }
+/* A person's calls and texts in one conversation: a run of texts begins, or a call's words go on after texts. */
+.day-divider.way-sms .day-divider-text .icon { color: var(--cyan); }
 .call-end { display: flex; justify-content: center; }
 .call-end-pill { display: inline-flex; align-items: center; gap: 6px; padding: 3px 12px; border-radius: 999px; border: 1px solid var(--border); background: var(--surface-soft); color: var(--muted); font-size: 11.5px; font-weight: 600; }
 .call-end-pill .icon { width: 12px; height: 12px; }

@@ -28,10 +28,10 @@ import {
   initials,
   parseCallEnd,
   parseCallStart,
-  parseCallTurn,
   parseFlowAsk,
-  parseTextTurn,
+  parsePhoneTurn,
   timeLabel,
+  wayOf,
   type CallStart,
   type Part,
 } from './chat/transcript';
@@ -69,6 +69,15 @@ function pageStart(turns: Turn[], size: number): number {
   let from = Math.max(0, turns.length - size);
   while (from > 0 && turns[from]?.role !== 'user') from--;
   return from;
+}
+
+/** The way the last of some turns came (a call or a text), for the dividers that follow them. */
+function lastWay(turns: Turn[]): 'call' | 'sms' | null {
+  for (let i = turns.length - 1; i >= 0; i--) {
+    const way = wayOf(turns[i]);
+    if (way) return way;
+  }
+  return null;
 }
 
 /** Who said something: the person, the agent, the caller, the one texting, or a flow. */
@@ -161,6 +170,16 @@ export class ChatPane {
   private callStartAt: number | null = null;
   /** Drawing a saved conversation (no times are measured). */
   private replaying = false;
+  /**
+   * In a person's conversation (their calls and texts as one): the way the
+   * last words came, so a run of texts after a call starts under a "Texts"
+   * divider, and a call's words after texts under "On the call".
+   */
+  private way: 'call' | 'sms' | null = null;
+  /** When the turn being drawn happened (a saved one's time; a new one's is now). */
+  private drawingAt: number | undefined;
+  /** Where the person's message goes in the phone conversation shown: its call going on, or their texts. */
+  private to: 'call' | 'sms' | null = null;
   /** The empty conversation's welcome. */
   private readonly hero = h('div.chat-empty');
   /** What the log holds, oldest first; the agent at work (`status`) is always last. */
@@ -335,8 +354,10 @@ export class ChatPane {
 
   /** What the message box asks for, in the conversation shown. */
   private placeholder(): string {
-    if (this.kind === 'call') return this.live ? 'Tell the receptionist something: it reads it before its next reply…' : "Ask about this call, or tell its agent something…";
-    if (this.kind === 'sms') return 'Tell the agent what to text…';
+    if (this.kind === 'call' || this.kind === 'sms') {
+      if (this.live) return 'Tell the receptionist something: it reads it before its next reply…';
+      return (this.to ?? this.kind) === 'sms' ? 'Tell the agent what to text…' : 'Ask about this call, or tell its agent something…';
+    }
     return this.runner ? 'Tell the runner what the phone should know…' : this.own === 'setup' ? 'Tell the Agent what OAIY should do…' : 'Ask OAIY…';
   }
 
@@ -491,6 +512,11 @@ export class ChatPane {
       if (this.hero.isConnected) this.drawHero();
       if (!this.busy) this.input.placeholder = this.placeholder();
     }
+    const to = shown?.to ?? null;
+    if (to !== this.to) {
+      this.to = to;
+      if (!this.busy) this.input.placeholder = this.placeholder();
+    }
     this.showLive(!!shown?.live, shown ? tabName(shown) : '');
   }
 
@@ -634,6 +660,7 @@ export class ChatPane {
   clearLog(): void {
     this.meter.hidden = true;
     this.hiddenTurns = [];
+    this.way = null;
     this.taskRows.clear();
     this.currentPlan = null;
     this.planAll = false;
@@ -666,7 +693,7 @@ export class ChatPane {
   private drawHero(): void {
     clear(this.hero);
     if (this.kind !== 'own') {
-      const [glyph, words] = this.kind === 'call' ? ['phone', 'No words on this call yet.'] : this.kind === 'sms' ? ['message', 'No texts in this thread yet.'] : ['flow', 'No tasks from this flow yet.'];
+      const [glyph, words] = this.kind === 'call' ? ['phone', 'No words on this call yet.'] : this.kind === 'sms' ? ['message', 'No calls or texts with them yet.'] : ['flow', 'No tasks from this flow yet.'];
       this.hero.className = 'chat-empty quiet';
       this.hero.append(h('span.chat-empty-icon', icon(glyph)), h('p', words));
       return;
@@ -835,14 +862,17 @@ export class ChatPane {
    */
   private words(text: string, attachments: Attachment[], during = false, note = ''): boolean {
     let parts: Part[];
-    if (this.kind === 'call') parts = parseCallTurn(text);
-    else if (this.kind === 'sms') parts = /^\[OAIY\] /.test(text) ? [{ kind: 'note', text: text.replace(/^\[OAIY\]\s*/, '') }] : parseTextTurn(text);
+    // A person's calls and texts are one conversation: each turn is read by what it is.
+    if (this.kind === 'call' || this.kind === 'sms') parts = parsePhoneTurn(text);
     else if (this.kind === 'task') parts = [parseFlowAsk(text) ?? (/^\[OAIY\] /.test(text) ? { kind: 'note', text: text.replace(/^\[OAIY\]\s*/, '') } : { kind: 'plain', text })];
     else parts = [{ kind: 'plain', text }];
     let own = false;
     for (const part of parts) {
       switch (part.kind) {
         case 'caller': {
+          // Back on the call after texts that came during it.
+          if (this.way === 'sms') this.wayDivider('call');
+          this.way = 'call';
           // A live call: the caller's time tells when the call began (the note that began it says only its minute).
           if (!this.replaying && part.atMs !== undefined) this.callStartAt = Date.now() - part.atMs;
           const tags: HTMLElement[] = [];
@@ -856,6 +886,9 @@ export class ChatPane {
           break;
         }
         case 'text':
+          // A run of texts (after a call, or the first) starts under a divider that says so, and when.
+          if (this.way !== 'sms') this.wayDivider('sms', this.replaying ? this.drawingAt : Date.now());
+          this.way = 'sms';
           this.add(h('div.msg.incoming.texter', h('div.msg-body', part.text || ' ')), 'texter', part.name ?? formatNumber(part.number));
           break;
         case 'flow':
@@ -875,6 +908,16 @@ export class ChatPane {
       own = true;
     }
     return own;
+  }
+
+  /**
+   * Where the way a person is in touch changes: "Texts" (and when) as a run of
+   * texts begins, "On the call" as a call's words go on after texts.
+   */
+  private wayDivider(way: 'call' | 'sms', at?: number): void {
+    const when = at ? `${dayLabel(new Date(at))} · ${timeLabel(new Date(at))}` : '';
+    const label = way === 'sms' ? 'Texts' : 'On the call';
+    this.add(h('div.day-divider', { class: `way-${way}`, 'data-way': way }, h('span.day-divider-text', icon(way === 'sms' ? 'message' : 'phone'), ...(when ? [h('strong', when), h('span', label)] : [h('strong', label)]))));
   }
 
   /** The person's own words, and what they attached. */
@@ -1164,8 +1207,8 @@ export class ChatPane {
       this.delegateCard(call);
       return;
     }
-    // A text the agent sends in a text thread reads as a text.
-    if (call.name === 'send_text_message' && this.kind === 'sms') {
+    // A text the agent sends to the person reads as a text.
+    if (call.name === 'send_text_message' && (this.kind === 'sms' || this.kind === 'call')) {
       const card = this.toolRow(call, 'sms-out');
       const summary = card.querySelector('summary')!;
       clear(summary);
@@ -1408,9 +1451,9 @@ export class ChatPane {
    * as the person scrolls up to them: drawing hundreds of tool cards at once
    * is slow.
    */
-  replay(turns: Turn[], latest = REPLAY_PAGE): void {
-    // What the conversation is, from its words (the list of conversations says it only after).
-    this.kind = conversationKind(turns);
+  replay(turns: Turn[], latest = REPLAY_PAGE, kind?: 'call' | 'sms' | 'task' | 'own'): void {
+    // What the conversation is: as the app says (a person's calls and texts), or from its words.
+    this.kind = kind ?? conversationKind(turns);
     this.callName = 'Caller';
     this.callStartAt = null;
     for (const t of turns) {
@@ -1426,11 +1469,30 @@ export class ChatPane {
     this.hiddenTurns = turns.slice(0, from);
     // The plan the turns drawn change (one step at a time, maybe) is the one the older turns left.
     this.currentPlan = planAfter(this.hiddenTurns);
+    this.way = lastWay(this.hiddenTurns);
     this.drawTurns(turns.slice(from));
     this.showOlder();
     this.updateEmpty();
     // A conversation opens at its end, following what comes.
     this.toBottom();
+  }
+
+  /**
+   * Turns of another agent of the conversation shown (a person's texts'
+   * agent, answering while their call's streams here): drawn at the end as
+   * they were saved, leaving the reply being written where it is.
+   */
+  insertTurns(turns: Turn[]): void {
+    if (!turns.length) return;
+    const live = { current: this.current, thinking: this.thinking, draft: this.draft };
+    this.current = null;
+    this.thinking = null;
+    this.draft = null;
+    this.drawTurns(turns, false);
+    ({ current: this.current, thinking: this.thinking, draft: this.draft } = live);
+    this.follow.arrived(true);
+    this.showJump();
+    this.scroll();
   }
 
   /** The note at the start of the log: how much older conversation there is. */
@@ -1471,10 +1533,11 @@ export class ChatPane {
     const from = pageStart(this.hiddenTurns, REPLAY_PAGE);
     const page = this.hiddenTurns.slice(from);
     this.hiddenTurns = this.hiddenTurns.slice(0, from);
-    const live = { current: this.current, thinking: this.thinking, draft: this.draft, plan: this.currentPlan, planOpen: this.planOpen, callName: this.callName };
+    const live = { current: this.current, thinking: this.thinking, draft: this.draft, plan: this.currentPlan, planOpen: this.planOpen, callName: this.callName, way: this.way };
     const anchor = this.topAnchor();
-    // The page's marks follow the plan as it was then, not as it is now.
+    // The page's marks follow the plan as it was then, not as it is now; its dividers, the way things came then.
     this.currentPlan = planAfter(this.hiddenTurns);
+    this.way = lastWay(this.hiddenTurns);
     this.sink = h('div');
     try {
       this.drawTurns(page, false);
@@ -1490,7 +1553,7 @@ export class ChatPane {
       if (this.older.isConnected) this.older.after(...this.sink.children);
       else this.feed.prepend(...this.sink.children);
       this.sink = null;
-      ({ current: this.current, thinking: this.thinking, draft: this.draft, plan: this.currentPlan, planOpen: this.planOpen, callName: this.callName } = live);
+      ({ current: this.current, thinking: this.thinking, draft: this.draft, plan: this.currentPlan, planOpen: this.planOpen, callName: this.callName, way: this.way } = live);
       this.showPlan(this.currentPlan);
       this.showOlder();
       // What the reader was looking at stays where it was (at the bottom, the log keeps to it).
@@ -1506,6 +1569,7 @@ export class ChatPane {
   private callStart(start: CallStart): void {
     this.current = null;
     this.callName = start.name;
+    this.way = 'call';
     const what = start.direction === 'in' ? `Call from ${start.name}` : start.direction === 'back' ? `Called ${start.name} back` : `Called ${start.name}`;
     const when = start.at ? `${dayLabel(start.at)} · ${timeLabel(start.at)}` : start.when;
     this.add(h('div.day-divider', { title: start.number ? `${start.name} (${formatNumber(start.number)})` : start.name }, h('span.day-divider-text', icon('phone'), h('strong', when), h('span', what))));
@@ -1526,6 +1590,7 @@ export class ChatPane {
   }
 
   private drawTurn(turn: Turn): void {
+    this.drawingAt = turn.at;
     if (turn.role === 'user' && turn.summary) {
       this.summaryNote(turn.text, 'Earlier conversation summarized for the model (click to read the summary)');
       return;

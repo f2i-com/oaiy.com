@@ -1,5 +1,6 @@
 import { describe, expect, it } from 'vitest';
 import { callStartNote, callerLine, textMessage } from '../../src/sessions';
+import { setLocalCountry } from '../../src/phoneNumbers';
 import {
   ago,
   clock,
@@ -13,9 +14,11 @@ import {
   parseCallTurn,
   parseCallerLine,
   parseFlowAsk,
+  parsePhoneTurn,
   parseTextTurn,
   readWhen,
   splitWho,
+  wayOf,
 } from '../../src/ui/chat/transcript';
 
 describe("a call's words, as the chat shows them", () => {
@@ -130,6 +133,27 @@ describe("a text thread's words, as the chat shows them", () => {
   });
 });
 
+describe("a person's calls and texts in one conversation, as the chat reads them", () => {
+  it('reads each turn by what it is: texts, a call\'s lines, a note from OAIY', () => {
+    expect(parsePhoneTurn(textMessage('Lance', '+61491570006', 'Hello'))).toEqual([{ kind: 'text', name: 'Lance', number: '+61491570006', text: 'Hello' }]);
+    expect(parsePhoneTurn(callerLine('Hi there', { startMs: 4_200 }))).toEqual([{ kind: 'caller', text: 'Hi there', atMs: 4_000 }]);
+    // A note alone, over several paragraphs, stays one note.
+    expect(parsePhoneTurn('[OAIY] A note from the runner: Offer 10% off.\n\nThey are a regular.')).toEqual([{ kind: 'note', text: 'A note from the runner: Offer 10% off.\n\nThey are a regular.' }]);
+    // A note with the caller's words: each its own.
+    expect(parsePhoneTurn('[OAIY] The answer to your lookup "x":\nyes\nCaller [0:30]: Great')).toEqual([{ kind: 'note', text: 'The answer to your lookup "x":\nyes' }, { kind: 'caller', text: 'Great', atMs: 30_000 }]);
+    // The person's own words before a text sent with them.
+    expect(parsePhoneTurn(`Tell him yes\n\n${textMessage('Lance', '+61491570006', 'Well?')}`)).toEqual([{ kind: 'plain', text: 'Tell him yes' }, { kind: 'text', name: 'Lance', number: '+61491570006', text: 'Well?' }]);
+  });
+
+  it('tells which way a turn came', () => {
+    expect(wayOf({ role: 'user', automatic: true, text: callStartNote('Lance (+61491570006)', '', 'x') })).toBe('call');
+    expect(wayOf({ role: 'user', text: callerLine('Hi', {}) })).toBe('call');
+    expect(wayOf({ role: 'user', text: textMessage('Lance', '+61491570006', 'Hi') })).toBe('sms');
+    expect(wayOf({ role: 'user', text: 'Tell him yes' })).toBeNull();
+    expect(wayOf({ role: 'assistant', text: 'Sure' })).toBeNull();
+  });
+});
+
 describe('the rest of what the chat reads from the words', () => {
   it("reads a flow's task", () => {
     expect(parseFlowAsk('[OAIY] Your flow "Morning summary" asks: Sum it up.\nIn three points.')).toEqual({ kind: 'flow', flow: 'Morning summary', text: 'Sum it up.\nIn three points.' });
@@ -150,9 +174,14 @@ describe('the rest of what the chat reads from the words', () => {
     expect(ago(now.getTime() - 20 * 60_000, now.getTime())).toBe('20m');
     expect(ago(now.getTime() - 3 * 60 * 60_000, now.getTime())).toBe('3h');
     expect(ago(now.getTime() - 10_000, now.getTime())).toBe('now');
-    expect(formatNumber('+61491570006')).toBe('+61 491 570 006');
+    // A local number as it is dialled at home; one from elsewhere with its country.
+    setLocalCountry('AU');
+    expect(formatNumber('+61491570006')).toBe('0491 570 006');
     expect(formatNumber('0491570006')).toBe('0491 570 006');
-    expect(formatNumber('+61298765432')).toBe('+61 2 9876 5432');
+    expect(formatNumber('+61298765432')).toBe('02 9876 5432');
+    expect(formatNumber('+442079460958')).toBe('+44 20 7946 0958');
+    expect(formatNumber('+61491570006', 'GB')).toBe('+61 491 570 006');
+    expect(formatNumber('+61298765432', 'US')).toBe('+61 2 9876 5432');
     expect(formatNumber('test')).toBe('test');
     expect(initials('Lance')).toBe('L');
     expect(initials('Priya Shah')).toBe('PS');
