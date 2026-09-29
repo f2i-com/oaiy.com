@@ -6,12 +6,13 @@ import { HELP, internetCommand } from './commands';
 import { NetGate } from './gate/netgate';
 import { sandboxAvailable, zippModule } from './sandbox/runner';
 import { loadSettings, saveAgentSettings, saveDesktop, saveGate, saveLastKeptProject, saveLastProject, saveMedia, saveMessages, saveProviders } from './settings';
-import { Desktop } from './desktop/bridge';
+import { Desktop, type Contact } from './desktop/bridge';
 import { DesktopEvents, Sessions, TEST_NUMBER, callerNotesTool, phoneConversationsTool, tellAgentTool, type Session, type Thread } from './sessions';
 import { displayNumber, samePerson, setLocalCountry } from './phoneNumbers';
 import { Callbacks, type Screening } from './callbacks';
 import { PhoneLine } from './phoneLine';
-import { desktopContacts } from './contacts';
+import { contactKey, desktopContacts } from './contacts';
+import { showContactCard, type ContactCardData } from './ui/contactCard';
 import { IdentityCache, identityNote } from './identity';
 import { Outreach, tally, type Campaign, type OutreachKind, type OutreachPlan, type PhoneRules } from './outreach';
 import { OUTREACH_TOOL_NAMES, outreachTools } from './outreachTools';
@@ -331,6 +332,8 @@ async function main(): Promise<void> {
       end: (id) => void stopOutreach(id),
       open: (path) => void openOutreachResults(path),
     },
+    // A person's contact: the dashboard's Contacts page on them (OAIY's window), or a card here (a browser tab).
+    contact: (tab, anchor) => void openContact(tab.key ?? '', tab.name ?? '', anchor),
   });
 
   /** Stop an outreach from its card: asked first. */
@@ -1764,6 +1767,54 @@ With that done, Settings → Images, video and audio → Find OAIY sets it up.`)
     ], viewing, selectSession);
     const shown = viewing ? sessions.thread(viewing) : null;
     if (shown) chat.setBusy(shown.running);
+  }
+
+  /**
+   * A person's contact, from their conversation's Contact button. In OAIY's
+   * window the dashboard's Contacts page opens on them (the control API's
+   * ui_open, as the person's own conversations are offered it); in a browser
+   * tab, or when the dashboard would not open, a card shows it here, read
+   * only.
+   */
+  async function openContact(number: string, name: string, anchor: HTMLElement): Promise<void> {
+    const key = contactKey(number);
+    if (!key) return;
+    const host = anchor.parentElement ?? anchor;
+    if (IN_OAIY && control) {
+      let why = '';
+      try {
+        const r = await control.call('project', 'ui_open', { view: 'contacts', contact: key }, AbortSignal.timeout(8_000));
+        if (!r.isError) return;
+        why = r.text;
+      } catch (error) {
+        why = (error as Error).message;
+      }
+      showContactCard(host, anchor, () => contactCardData(number, name, `The dashboard did not open on them (${why || 'no answer'}), so here they are.`));
+      return;
+    }
+    showContactCard(host, anchor, () => contactCardData(number, name));
+  }
+
+  /** A person's contact for the card: read from the desktop now, or the Front desk's copy when it cannot be. */
+  async function contactCardData(number: string, name: string, why = ''): Promise<ContactCardData> {
+    let contact: Contact | null | undefined;
+    if (desktop) {
+      try {
+        contact = await desktop.contact(number, AbortSignal.timeout(5_000));
+      } catch {
+        contact = undefined;
+      }
+    }
+    const note = sessions?.callerNote(number);
+    const base = { number, ...(why ? { why } : {}) };
+    if (contact) {
+      const own = contact.facts.filter((f) => f.by === 'owner').map((f) => f.text);
+      const remembered = contact.facts.filter((f) => f.by !== 'owner').map((f) => f.text);
+      return { ...base, name: contact.name, nameBy: contact.nameBy, notes: contact.notes, ownerFacts: own, facts: remembered, source: 'desktop' };
+    }
+    const known = note?.name || (name && !/\d{4,}/.test(name) ? name : '');
+    if (contact === null) return { ...base, name: known, nameBy: null, notes: '', ownerFacts: [], facts: note?.unsent ?? [], source: 'desktop', none: true };
+    return { ...base, name: known, nameBy: note?.nameBy ?? null, notes: note?.notes ?? '', ownerFacts: note?.ownerFacts ?? [], facts: note?.facts ?? [], source: 'copy' };
   }
 
   /** When something last happened, as a person says it. */

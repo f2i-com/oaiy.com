@@ -19,6 +19,7 @@ import { icon } from './icons';
 import { mediaElement, mediaKind, type Media } from './media';
 import { renderMarkdown } from './markdown';
 import { SessionPicker, tabKind, tabName, type ConversationTab } from './sessionPicker';
+import { closeContactCard } from './contactCard';
 import { argLines, clip, duration, mediaPrompt, prettyResult, summarizeCall, toolIcon, toolLabel } from './chat/tools';
 import {
   clock,
@@ -143,6 +144,10 @@ export class ChatPane {
    */
   private readonly sessionTabs = h('nav.session-switch', { 'aria-label': 'Conversations', hidden: true });
   private readonly sessionPicker = new SessionPicker();
+  /** A person's conversation: their contact (their name, the notes for the receptionist, what it remembered). */
+  private readonly contactButton = h('button.convo-contact', { type: 'button', hidden: true, 'aria-haspopup': 'dialog', 'aria-expanded': 'false', title: "Their contact: the name they go by, your notes for the receptionist, and what it remembered" }, icon('user'), h('span', 'Contact'));
+  /** The person whose contact the button opens. */
+  private contactTab: ConversationTab | null = null;
   /** A call going on now, in the conversation shown: how long it has run. */
   private readonly liveBar = h('div.call-live', { role: 'status', hidden: true });
   private liveTimer: ReturnType<typeof setInterval> | null = null;
@@ -212,13 +217,18 @@ export class ChatPane {
       flag?: (path: string, comment: string) => void;
       /** Outreach (the runner's lists of people to call or text): the live card under start_outreach. */
       outreach?: OutreachHost;
+      /** A person's contact, from their conversation's Contact button (`anchor`). */
+      contact?: (tab: ConversationTab, anchor: HTMLElement) => void;
     },
   ) {
     this.planBox.hidden = true;
     this.meter.hidden = true;
     this.log.append(this.feed);
     this.feed.append(this.status);
-    this.sessionTabs.append(this.sessionPicker.element);
+    this.sessionTabs.append(this.sessionPicker.element, this.contactButton);
+    this.contactButton.addEventListener('click', () => {
+      if (this.contactTab) this.handlers.contact?.(this.contactTab, this.contactButton);
+    });
     this.log.addEventListener('scroll', () => {
       this.follow.scrolled(this.log);
       this.showJump();
@@ -519,6 +529,11 @@ export class ChatPane {
     this.sessionTabs.hidden = tabs.length < 2;
     this.sessionPicker.set(tabs, active, select);
     const shown = tabs.find((t) => t.id === active) ?? tabs[0];
+    // A person's conversation (not a hidden caller's, or the pretend one): their contact, a click away.
+    const person = shown && shown.id !== null && tabKind(shown) === 'person' && !shown.hidden && !!shown.key && shown.key !== 'test' ? shown : null;
+    if (person?.id !== this.contactTab?.id) closeContactCard();
+    this.contactTab = person;
+    this.contactButton.hidden = !person || !this.handlers.contact;
     const own = tabs.find((t) => t.id === null);
     const kind = own ? tabKind(own) : 'project';
     const ownKind: OwnKind = kind === 'runner' || kind === 'setup' ? kind : 'project';
