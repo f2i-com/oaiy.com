@@ -14,7 +14,7 @@ import {
   type PluginRecord,
   type SetupPluginDetail,
 } from './api';
-import { SettingsForm } from './CalendarPanel';
+import { SettingsForm } from './HoursPanel';
 import PluginScreenPage, { type PluginNavTarget, type SetupScreenCalls } from './PluginScreenPage';
 import {
   canMoveOn,
@@ -793,8 +793,9 @@ function BusinessStep({ onNamed, onSaved }: { onNamed: (named: boolean) => void;
   if (!settings) return error ? <RetryLine message={error} onRetry={() => void load()} /> : <p className="form-hint">Reading the calendar…</p>;
   return (
     <div className="setup-business">
-      <p className="form-hint">What callers hear the business called, when it is open, and what they can book. The same settings as the Calendar page.</p>
+      <p className="form-hint">What callers hear the business called, when it is open, and what they can book. The same settings as Hours &amp; Services, under the AI Receptionist.</p>
       <SettingsForm
+        embedded
         settings={settings}
         onSaved={(s) => {
           setSettings(s);

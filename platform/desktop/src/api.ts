@@ -1344,9 +1344,10 @@ export const calendar = {
       `/api/calendar${from || to ? `?${new URLSearchParams({ ...(from ? { from } : {}), ...(to ? { to } : {}) })}` : ''}`,
     ),
   saveSettings: (s: CalendarSettings) => request<CalendarSettings>('/api/calendar/settings', { method: 'PUT', body: JSON.stringify(s) }),
-  free: (from: string, days: number, service?: string) =>
+  /** Free times from `from` for `days` days, for `service` (its length) or `minutes` long. */
+  free: (from: string, days: number, service?: string, minutes?: number) =>
     request<{ minutes: number; days: { date: string; times: string[] }[] }>(
-      `/api/calendar/free?${new URLSearchParams({ from, days: String(days), ...(service ? { service } : {}) })}`,
+      `/api/calendar/free?${new URLSearchParams({ from, days: String(days), ...(service ? { service } : {}), ...(minutes ? { minutes: String(minutes) } : {}) })}`,
     ),
   create: (a: NewAppointment) => request<Appointment>('/api/calendar/appointments', { method: 'POST', body: JSON.stringify(a) }),
   update: (id: string, change: Partial<Pick<Appointment, 'status' | 'start' | 'minutes' | 'service' | 'name' | 'phone' | 'notes'>>) =>

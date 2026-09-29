@@ -23,6 +23,8 @@ export const NAV_VIEWS = [
   'flows',
   'runs',
   'calendar',
+  /** Hours & Services: the business the receptionist speaks for (under the AI Receptionist while a plugin provides it). */
+  'hours',
   'engines',
   'models',
   'services',

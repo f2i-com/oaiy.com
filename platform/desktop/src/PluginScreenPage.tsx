@@ -30,7 +30,7 @@ import { moduleOn, useModules } from './useModules';
  */
 
 /** The dashboard pages a plugin screen may open with `PluginHost.navigate`. */
-export const PLUGIN_NAV_TARGETS = ['agent', 'calendar', 'engines', 'services', 'overview', 'plugins', 'providers'] as const;
+export const PLUGIN_NAV_TARGETS = ['agent', 'calendar', 'hours', 'engines', 'services', 'overview', 'plugins', 'providers'] as const;
 export type PluginNavTarget = (typeof PLUGIN_NAV_TARGETS)[number];
 
 export function isPluginNavTarget(value: unknown): value is PluginNavTarget {
@@ -38,7 +38,7 @@ export function isPluginNavTarget(value: unknown): value is PluginNavTarget {
 }
 
 /** The pages that are there only while their module is (a plugin provides it). */
-const TARGET_MODULE: Partial<Record<PluginNavTarget, string>> = { calendar: 'calendar' };
+const TARGET_MODULE: Partial<Record<PluginNavTarget, string>> = { calendar: 'calendar', hours: 'calendar' };
 
 /** May a plugin screen open `value` now: one of the pages, and not one whose module is off (or not yet known)? */
 export function pluginNavAllowed(value: unknown, modules: ModulesSnapshot | null): value is PluginNavTarget {

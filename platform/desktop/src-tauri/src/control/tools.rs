@@ -274,7 +274,7 @@ pub(crate) fn defs() -> &'static [ToolDef] {
                 "Record OAIY's first-run setup as finished, so the dashboard stops offering it.",
                 none()),
             def("ui_open", "Show a dashboard page", Change,
-                "Show the person a page of the OAIY dashboard: overview, agent, flows, calendar, engines, services, plugins, runs, models, python, providers, connections, settings, setup, or a plugin's page as plugin:<pluginId>:<navId>.",
+                "Show the person a page of the OAIY dashboard: overview, agent, flows, calendar, hours (Hours & Services: the business, its opening hours, services and booking rules), engines, services, plugins, runs, models, python, providers, connections, settings, setup, or a plugin's page as plugin:<pluginId>:<navId>.",
                 object(json!({ "view": { "type": "string", "minLength": 1, "description": "The page." } }), &["view"])),
             // Diagnostics
             def("logs_tail", "Logs", Read,
@@ -1770,8 +1770,8 @@ async fn setup_status(d: &Desk) -> Result<Done, String> {
 }
 
 /// The dashboard's own pages, as it names them.
-pub(crate) const VIEWS: [&str; 14] = [
-    "overview", "agent", "flows", "calendar", "engines", "services", "plugins", "runs", "models", "python", "providers", "connections", "settings", "setup",
+pub(crate) const VIEWS: [&str; 15] = [
+    "overview", "agent", "flows", "calendar", "hours", "engines", "services", "plugins", "runs", "models", "python", "providers", "connections", "settings", "setup",
 ];
 
 /// A page the dashboard has: one of [`VIEWS`], or `plugin:<pluginId>:<navId>`.

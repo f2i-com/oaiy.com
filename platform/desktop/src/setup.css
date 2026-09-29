@@ -422,7 +422,7 @@ details.setup-more-source > summary:hover { color: var(--text); }
 .setup-toggle small { color: var(--muted); font-size: 12px; }
 
 .setup-manual { display: flex; flex-direction: column; gap: 10px; margin-top: 6px; }
-.setup-business .cal-settings { border: 0; box-shadow: none; background: transparent; padding: 0; }
+/* Your business: the Hours & Services form, embedded (calendar.css). */
 
 .setup-connect,
 .setup-done { display: flex; flex-direction: column; gap: 16px; }

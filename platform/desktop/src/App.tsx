@@ -3,6 +3,8 @@ import {
   Bot,
   CalendarDays,
   Check,
+  ChevronDown,
+  Clock3,
   Copy,
   Cpu,
   ExternalLink,
@@ -26,7 +28,8 @@ import {
 } from 'lucide-react';
 import { API_BASE, openExternal, phone as phoneApi } from './api';
 import { moduleOn, useModules } from './useModules';
-import { buildSections, newBadge, pluginPageOf, sectionOf as findSection, type Group, type NavSection } from './sections';
+import { arrangeSections, buildSections, newBadge, pluginPageOf, sectionOf as findSection, type Group, type NavSection } from './sections';
+import { useWaitingRequests } from './calendarRequests';
 import { applyTheme, initialTheme, THEME_LABEL, type ThemeMode } from './theme';
 import ServicesPanel from './ServicesPanel';
 import ModelsPanel from './ModelsPanel';
@@ -36,6 +39,7 @@ import AiProvidersPanel from './AiProvidersPanel';
 import OverviewPanel from './OverviewPanel';
 import RunsPanel from './RunsPanel';
 import CalendarPanel from './CalendarPanel';
+import HoursPanel from './HoursPanel';
 import PluginScreenPage from './PluginScreenPage';
 import ConnectionsPanel from './ConnectionsPanel';
 import PairingPrompt from './PairingPrompt';
@@ -69,7 +73,10 @@ interface HealthResponse {
 type BuiltinView =
   | 'agent'
   | 'flows'
+  /** The appointments, and the requests waiting to be confirmed. */
   | 'calendar'
+  /** Hours & Services: the business the receptionist speaks for. */
+  | 'hours'
   | 'engines'
   | 'overview'
   | 'services'
@@ -105,12 +112,22 @@ const SECTIONS: Section[] = [
   { id: 'overview', label: 'Overview', icon: LayoutDashboard, group: 'Home', tabs: ['overview'] },
   { id: 'agent', label: 'Agent', icon: Bot, group: 'Work', tabs: ['agent'] },
   { id: 'flows', label: 'Flows', icon: Workflow, group: 'Work', tabs: ['flows', 'runs'] },
-  { id: 'calendar', label: 'Calendar', icon: CalendarDays, group: 'Work', tabs: ['calendar'] },
+  { id: 'calendar', label: 'Calendar', icon: CalendarDays, group: 'Work', tabs: ['calendar', 'hours'] },
   { id: 'engines', label: 'Engines', icon: Cpu, group: 'Setup', tabs: ['engines', 'models'] },
   { id: 'services', label: 'Services', icon: Server, group: 'Setup', tabs: ['services', 'python'] },
   { id: 'connections', label: 'Connections', icon: Plug, group: 'Setup', tabs: ['connections', 'providers', 'plugins'] },
 ];
 const SETTINGS: Section = { id: 'settings', label: 'Settings', icon: Settings2, group: 'Setup', tabs: ['settings', 'agent-settings'] };
+
+/**
+ * The sections that are there only while a module is (a plugin provides it),
+ * by the module: they go under that plugin's own section as a sub-menu when it
+ * has one (the Calendar under the AI Receptionist), and stay where they are
+ * when it has none (sections.ts `arrangeSections`).
+ */
+const MODULE_SECTIONS: Record<string, string> = { calendar: 'calendar' };
+/** The pages of those sections, by module: off with it. */
+const MODULE_VIEWS: Partial<Record<BuiltinView, string>> = { calendar: 'calendar', hours: 'calendar' };
 
 /** Each page: its tab's name and icon, and the line under the topbar's title. */
 const PAGE: Record<BuiltinView, { tab: string; icon: LucideIcon; copy: string }> = {
@@ -129,7 +146,12 @@ const PAGE: Record<BuiltinView, { tab: string; icon: LucideIcon; copy: string }>
   calendar: {
     tab: 'Calendar',
     icon: CalendarDays,
-    copy: 'Appointments, the requests your calls and texts bring in, and the hours the phone offers.',
+    copy: 'Appointments, and the requests calls and texts bring in for you to confirm.',
+  },
+  hours: {
+    tab: 'Hours & Services',
+    icon: Clock3,
+    copy: 'Your business as the receptionist tells callers: its name, opening hours, services and booking rules.',
   },
   engines: {
     tab: 'Engines',
@@ -166,6 +188,68 @@ function writeSeen(seen: Set<string>) {
     window.localStorage.setItem(SEEN_KEY, JSON.stringify([...seen]));
   } catch {
     /* storage can be unavailable; the badge just shows again next time */
+  }
+}
+
+/** The sub-menus this viewer closed or opened (open unless said otherwise), by section id. */
+const EXPANDED_KEY = 'oaiy.navExpanded';
+function readExpanded(): Record<string, boolean> {
+  try {
+    const raw = window.localStorage.getItem(EXPANDED_KEY);
+    const got: unknown = raw ? JSON.parse(raw) : {};
+    if (!got || typeof got !== 'object' || Array.isArray(got)) return {};
+    return Object.fromEntries(Object.entries(got).filter((e): e is [string, boolean] => typeof e[1] === 'boolean'));
+  } catch {
+    return {};
+  }
+}
+function writeExpanded(expanded: Record<string, boolean>) {
+  try {
+    window.localStorage.setItem(EXPANDED_KEY, JSON.stringify(expanded));
+  } catch {
+    /* storage can be unavailable; the sub-menus just open again next time */
+  }
+}
+
+/**
+ * The sidebar's keys: up and down (and Home and End) move between its
+ * entries; right opens a sub-menu, or steps into it; left closes it, or steps
+ * back out to its parent.
+ */
+function onSidebarKey(e: KeyboardEvent<HTMLElement>, setOpen: (id: string, open: boolean) => void, isOpen: (id: string) => boolean) {
+  const nav = e.currentTarget;
+  const items = [...nav.querySelectorAll<HTMLButtonElement>('button[data-nav]')].filter((b) => b.getClientRects().length > 0);
+  const here = document.activeElement as HTMLButtonElement | null;
+  const i = here ? items.indexOf(here) : -1;
+  if (i < 0) return;
+  const focus = (b?: HTMLElement | null) => {
+    if (!b) return;
+    e.preventDefault();
+    b.focus();
+  };
+  const parent = here?.dataset.parent;
+  const childOf = here?.dataset.childOf;
+  switch (e.key) {
+    case 'ArrowDown':
+      return focus(items[(i + 1) % items.length]);
+    case 'ArrowUp':
+      return focus(items[(i - 1 + items.length) % items.length]);
+    case 'Home':
+      return focus(items[0]);
+    case 'End':
+      return focus(items[items.length - 1]);
+    case 'ArrowRight':
+      if (!parent) return;
+      e.preventDefault();
+      if (!isOpen(parent)) setOpen(parent, true);
+      else requestAnimationFrame(() => nav.querySelector<HTMLButtonElement>(`button[data-child-of="${parent}"]`)?.focus());
+      return;
+    case 'ArrowLeft':
+      if (parent && isOpen(parent)) {
+        e.preventDefault();
+        setOpen(parent, false);
+      } else if (childOf) focus(nav.querySelector<HTMLButtonElement>(`button[data-parent="${childOf}"]`));
+      return;
   }
 }
 
@@ -224,9 +308,22 @@ export default function App() {
    * plugin, and a module that is off, add nothing (the desktop leaves them out).
    */
   const sections = useMemo(
-    () => buildSections([...SECTIONS, SETTINGS], modules?.contributions?.sections, pageTab),
+    () => arrangeSections(buildSections([...SECTIONS, SETTINGS], modules?.contributions?.sections, pageTab), modules, MODULE_SECTIONS),
     [modules],
   );
+  /** The requests waiting to be confirmed: the Calendar's count in the sidebar. */
+  const waiting = useWaitingRequests(calendarOn === true);
+  const countOf = (v: string) => (v === 'calendar' ? (waiting?.length ?? 0) : 0);
+  const [expanded, setExpanded] = useState<Record<string, boolean>>(readExpanded);
+  const isOpen = useCallback((id: string) => expanded[id] !== false, [expanded]);
+  const setOpen = useCallback((id: string, open: boolean) => {
+    setExpanded((prev) => {
+      if ((prev[id] !== false) === open) return prev;
+      const next = { ...prev, [id]: open };
+      writeExpanded(next);
+      return next;
+    });
+  }, []);
   /** Views already opened this session — they skip the entrance animation. */
   const visited = useRef<Set<string>>(new Set()).current;
   /** The tab each section was last on, so the sidebar brings you back to it. */
@@ -376,16 +473,11 @@ export default function App() {
     };
   }, [phoneOn]);
 
-  // The calendar is there while a plugin provides it: on it when it goes, go to Overview.
+  // The calendar's pages are there while a plugin provides it: on one when it goes, go to Overview.
   useEffect(() => {
-    if (view === 'calendar' && calendarOn === false) setView('overview');
-  }, [view, calendarOn]);
-
-  // The sections shown: the Calendar only while a plugin provides it.
-  const shownSections = useMemo(
-    () => sections.filter((s) => s.id !== 'calendar' || calendarOn === true),
-    [sections, calendarOn],
-  );
+    const module = MODULE_VIEWS[view as BuiltinView];
+    if (module && moduleOn(modules, module) === false) setView('overview');
+  }, [view, modules]);
 
   // A plugin screen the user is on can disappear (plugin removed or turned
   // off, or its module went off): fall back to Overview rather than rendering
@@ -393,8 +485,8 @@ export default function App() {
   // plugin screen is never left on a guess.
   useEffect(() => {
     if (!view.startsWith('plugin:') || modules === null) return;
-    if (!pluginPageOf(shownSections, view)) setView('overview');
-  }, [view, modules, shownSections]);
+    if (!pluginPageOf(sections, view)) setView('overview');
+  }, [view, modules, sections]);
 
   // Mark AFTER render: the first open of a view still animates, a return does not.
   // A plugin screen once opened loses its "New" badge.
@@ -418,6 +510,16 @@ export default function App() {
     setView((last && s.tabs.some((t) => t.view === last) ? last : s.tabs[0].view) as View);
   };
 
+  // Opening a page of a closed sub-menu (from the Overview, a plugin, the
+  // Agent) opens the sub-menu, so the page shows where it is.
+  const subOf = findSection(sections, view);
+  const revealId = subOf?.sub ? subOf.id : null;
+  useEffect(() => {
+    if (revealId) setOpen(revealId, true);
+    // Only on arriving at a page: a sub-menu closed while on one of its pages stays closed.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [view, revealId]);
+
   // One derived state drives the dock (and the topbar's warning when the API is down).
   const link: 'up' | 'down' | 'pending' = health ? 'up' : healthError ? 'down' : 'pending';
   const section = findSection(sections, view);
@@ -425,7 +527,15 @@ export default function App() {
   // contributed (a tab in a built-in section keeps that section's heading).
   const pluginView = view.startsWith('plugin:') ? view.split(':') : null;
   const activePluginPage = pluginView ? pluginPageOf(sections, view) : null;
-  const header = pluginView
+  // A page in a sub-menu: its parent is the kicker, the page the title.
+  const subTab = section?.sub ? section.tabs.find((t) => t.view === view) : undefined;
+  const header = subTab
+    ? {
+        kicker: section!.label,
+        title: subTab.label,
+        copy: subTab.page ? `From the ${subTab.page.pluginName} plugin.` : PAGE[view as BuiltinView]?.copy ?? '',
+      }
+    : pluginView
     ? {
         kicker: section?.group ?? 'Work',
         title: section?.label ?? activePluginPage?.label ?? 'Plugin screen',
@@ -443,19 +553,22 @@ export default function App() {
         title: section?.label ?? PAGE[view as BuiltinView].tab,
         copy: PAGE[view as BuiltinView].copy,
       };
-  const tabbed = section && section.tabs.length > 1 ? section : null;
+  // A sub-menu's pages are in the sidebar: no tabs under the header too.
+  const tabbed = section && !section.sub && section.tabs.length > 1 ? section : null;
   const embedded = EMBEDDED.has(view);
-  const visibleSections = shownSections.filter((s) => s.id !== SETTINGS.id);
+  const visibleSections = sections.filter((s) => s.id !== SETTINGS.id);
 
   const navButton = (s: NavSection) => {
     const Icon = s.icon;
     const active = section?.id === s.id;
     const calling = s.id === 'agent' && onCall;
     const badge = newBadge(s, seen);
+    if (s.sub) return navSub(s, calling);
     return (
       <button
         type="button"
         key={s.id}
+        data-nav=""
         className={`${active ? 'active' : ''}${calling ? ' on-call' : ''}`}
         aria-current={active ? 'page' : undefined}
         /* Below 1240px the label <span> is display:none and the icon is
@@ -485,6 +598,94 @@ export default function App() {
     );
   };
 
+  /**
+   * A section with a sub-menu: its entry opens the page last open in it (the
+   * first at first) and opens the sub-menu; the chevron opens and closes the
+   * sub-menu alone, remembered for this viewer. Its pages are links of their
+   * own, indented under it. In the narrow sidebar (icons only) its pages show
+   * while one of them is open.
+   */
+  const navSub = (s: NavSection, calling: boolean) => {
+    const Icon = s.icon;
+    const inside = section?.id === s.id;
+    const open = isOpen(s.id);
+    const badge = newBadge(s, seen);
+    const count = s.tabs.reduce((n, t) => n + countOf(t.view), 0);
+    const countText = (n: number) => `${n} request${n === 1 ? '' : 's'} waiting`;
+    return (
+      <div key={s.id} className={`nav-sub${open ? ' is-expanded' : ''}${inside ? ' has-active' : ''}`}>
+        <div className="nav-sub-head">
+          <button
+            type="button"
+            data-nav=""
+            data-parent={s.id}
+            className={`nav-parent${inside ? ' active' : ''}${calling ? ' on-call' : ''}`}
+            aria-current={inside && !open ? 'page' : undefined}
+            aria-label={s.label}
+            aria-describedby={calling ? 'nav-on-call' : undefined}
+            title={s.pluginName ? `${s.label}, from the ${s.pluginName} plugin` : s.label}
+            onClick={() => {
+              setOpen(s.id, true);
+              if (!inside) openSection(s);
+            }}
+          >
+            <Icon size={18} />
+            <span>{s.label}</span>
+            {calling && (
+              <em className="nav-badge on-call" id="nav-on-call">
+                On call
+              </em>
+            )}
+            {/* The page's own "New" shows on the page while the sub-menu is open, here while it is closed. */}
+            {badge && <em className="nav-badge nav-badge-parent">{badge}</em>}
+            {count > 0 && (
+              <em className="nav-count nav-count-parent" title={countText(count)}>
+                {count}
+              </em>
+            )}
+          </button>
+          <button
+            type="button"
+            className="nav-toggle"
+            aria-expanded={open}
+            aria-controls={`nav-sub-${s.id}`}
+            aria-label={open ? `Close the ${s.label} menu` : `Open the ${s.label} menu`}
+            title={open ? 'Close this menu' : 'Open this menu'}
+            onClick={() => setOpen(s.id, !open)}
+          >
+            <ChevronDown size={15} />
+          </button>
+        </div>
+        <div className="nav-children" id={`nav-sub-${s.id}`} role="group" aria-label={s.label}>
+          {s.tabs.map((t) => {
+            const TabIcon = t.icon;
+            const on = t.view === view;
+            const n = countOf(t.view);
+            const tabBadge = t.page?.badge && !seen.has(`${t.page.pluginId}:${t.page.navId}`) ? t.page.badge : null;
+            return (
+              <button
+                type="button"
+                key={t.view}
+                data-nav=""
+                data-child-of={s.id}
+                className={`nav-child${on ? ' active' : ''}`}
+                aria-current={on ? 'page' : undefined}
+                aria-label={n ? `${t.label}, ${countText(n)}` : t.label}
+                title={t.page ? `${t.label}, from the ${t.page.pluginName} plugin` : n ? `${t.label}: ${countText(n)}` : t.label}
+                onClick={() => setView(t.view as View)}
+              >
+                <TabIcon size={16} />
+                <span>{t.label}</span>
+                {tabBadge && <em className="nav-badge">{tabBadge}</em>}
+                {n > 0 && <em className="nav-count">{n}</em>}
+              </button>
+            );
+          })}
+        </div>
+      </div>
+    );
+  };
+
   return (
     <div className="app-shell">
       <a className="skip" href="#main">
@@ -497,7 +698,7 @@ export default function App() {
           <span>Orchestrate AI Yourself</span>
         </div>
 
-        <nav aria-label="Primary">
+        <nav aria-label="Primary" onKeyDown={(e) => onSidebarKey(e, setOpen, isOpen)}>
           {visibleSections.map((s, i) => {
             const prev = visibleSections[i - 1];
             const heading = s.group !== 'Home' && prev?.group !== s.group && (
@@ -603,7 +804,8 @@ export default function App() {
             {view === 'services' && <ServicesPanel />}
             {view === 'plugins' && <PluginsPanel />}
             {view === 'runs' && <RunsPanel />}
-            {view === 'calendar' && <CalendarPanel />}
+            {view === 'calendar' && <CalendarPanel onOpenHours={() => setView('hours')} />}
+            {view === 'hours' && <HoursPanel onOpenCalendar={() => setView('calendar')} />}
             {view === 'models' && <ModelsPanel />}
             {view === 'providers' && <AiProvidersPanel />}
             {view === 'connections' && <ConnectionsPanel />}

@@ -547,6 +547,9 @@ async fn a_plugins_setup_step_is_shown_with_the_navigate_payload() {
     assert!(is_error(&r) && text(&r).contains("demo"), "{r}");
     let r = call(&app, None, "ui_open", json!({ "view": "plugin:demo:home" })).await;
     assert!(!is_error(&r), "{r}");
+    // Hours & Services is a page of its own (under the AI Receptionist in the dashboard).
+    let r = call(&app, None, "ui_open", json!({ "view": "hours" })).await;
+    assert!(!is_error(&r), "{r}");
     let r = call(&app, None, "ui_open", json!({ "view": "../../etc" })).await;
     assert!(is_error(&r) && text(&r).contains("not a page"), "{r}");
     assert_eq!(
@@ -556,6 +559,7 @@ async fn a_plugins_setup_step_is_shown_with_the_navigate_payload() {
             json!({ "view": "setup", "pluginId": "demo" }),
             json!({ "view": "setup", "pluginId": "demo", "stepId": "permissions" }),
             json!({ "view": "plugin:demo:home" }),
+            json!({ "view": "hours" }),
         ]
     );
     // The person accepts what a plugin may do: the Agent shows it rather than recording it.

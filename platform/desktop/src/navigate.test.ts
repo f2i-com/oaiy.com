@@ -34,6 +34,11 @@ describe('a navigation from the desktop', () => {
     expect(parseNavigate({ view: 'agent-settings' })).toEqual({ kind: 'view', view: 'agent-settings' });
   });
 
+  it('opens the Calendar by its old id, and Hours & Services by its own', () => {
+    expect(parseNavigate({ view: 'calendar' })).toEqual({ kind: 'view', view: 'calendar' });
+    expect(parseNavigate({ view: 'hours' })).toEqual({ kind: 'view', view: 'hours' });
+  });
+
   it('ignores anything else, and names it cannot be', () => {
     expect(parseNavigate(null)).toBeNull();
     expect(parseNavigate('setup')).toBeNull();

@@ -183,6 +183,10 @@ describe('plugin screen navigation and OAIY status', () => {
     expect(pluginNavAllowed('calendar', modules(true))).toBe(true);
     expect(pluginNavAllowed('calendar', modules(false))).toBe(false);
     expect(pluginNavAllowed('calendar', null)).toBe(false);
+    // Hours & Services is the calendar's too.
+    expect(pluginNavAllowed('hours', modules(true))).toBe(true);
+    expect(pluginNavAllowed('hours', modules(false))).toBe(false);
+    expect(pluginNavAllowed('hours', null)).toBe(false);
     // The core pages are there whatever the modules.
     expect(pluginNavAllowed('agent', modules(false))).toBe(true);
     expect(pluginNavAllowed('engines', null)).toBe(true);
