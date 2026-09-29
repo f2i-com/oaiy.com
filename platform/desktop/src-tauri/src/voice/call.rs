@@ -901,6 +901,8 @@ where
                                 let (from, name) = hub.caller_of(&ids.call).unwrap_or_default();
                                 let from = if from.trim().is_empty() { start_from.clone() } else { from };
                                 let name = if name.trim().is_empty() { start_name.clone() } else { name };
+                                // This desktop's own record of who rang (a message is kept with it, never with what the model says).
+                                hub.note_call(&ids.call, &from, &name);
                                 // A contact from now on, with this as the number last seen (never a hidden caller).
                                 super::contacts::saw(&from);
                                 // Greeted by name when we know it: the name kept for their number, else the phone's.

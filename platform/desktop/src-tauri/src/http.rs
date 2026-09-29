@@ -1564,6 +1564,8 @@ pub async fn serve(
         crate::voice::contacts::init(&dir);
         // Transferring calls to the owner and taking messages: the owner's settings, all off until turned on.
         crate::ring::init(&dir);
+        // What callers leave for the owner.
+        crate::messages::init(&dir);
     }
     // The Agent's control API: its switch and its log live in the data folder too.
     let control = crate::control::Control::new(
@@ -1673,6 +1675,7 @@ pub async fn serve(
         .merge(voice_routes)
         .merge(crate::voice::contacts::routes::router(crate::voice::contacts::shared()))
         .merge(ring_routes)
+        .merge(crate::messages::routes::router(crate::messages::shared()))
         .merge(crate::calendar::routes::router())
         .merge(crate::modules::routes::router())
         .merge(crate::agent_tasks::router())

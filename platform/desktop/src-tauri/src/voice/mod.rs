@@ -18,11 +18,11 @@ pub mod contacts;
 pub mod engines;
 pub mod voices;
 
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::convert::Infallible;
 use std::net::SocketAddr;
-use std::sync::{Arc, Mutex, OnceLock};
-use std::time::Duration;
+use std::sync::{Arc, Mutex, OnceLock, RwLock};
+use std::time::{Duration, Instant};
 
 use axum::extract::{Path, Query, State, WebSocketUpgrade};
 use axum::http::{HeaderMap, StatusCode};
@@ -73,6 +73,33 @@ struct Inner {
     events: broadcast::Sender<Value>,
     calls: Mutex<HashMap<String, mpsc::UnboundedSender<CallCommand>>>,
     caller_of: Box<CallerOf>,
+    /// What this desktop itself knows of each call (who rang, what they said), for the calls
+    /// that are live and those that ended lately: it is what a message or a transfer is judged
+    /// by, never what the receptionist's model says.
+    records: Mutex<HashMap<String, CallRecord>>,
+    /// The owner's settings for transfers and messages, and where messages are kept.
+    ring: RwLock<Arc<crate::ring::Ring>>,
+    messages: RwLock<crate::messages::Store>,
+    /// What tells the owner a message arrived, when not the desktop's own (a test's).
+    notifier: RwLock<Option<Arc<dyn crate::messages::MessageNotifier>>>,
+}
+
+/// How long a call's record is kept after it ends: a caller who hangs up as they finish a message still has it kept.
+const RECORD_KEEP: Duration = Duration::from_secs(600);
+/// The most calls' records held.
+const RECORDS_MAX: usize = 64;
+/// The caller's last turns kept per call (the ring policy reads three).
+const TURNS_KEPT: usize = 6;
+
+/// What this desktop knows of one call.
+struct CallRecord {
+    /// The number the phone said the call came from, and the name it gave.
+    from: String,
+    name: String,
+    /// What the caller said, last last: their own words as this desktop heard them.
+    turns: VecDeque<String>,
+    /// When the call ended (None while it is live).
+    ended: Option<Instant>,
 }
 
 /// Every hub made in this process (there is one; a test may make more), so anything that has to know whether
@@ -89,9 +116,115 @@ pub fn live_call_count() -> usize {
 impl VoiceHub {
     pub fn new(engines: Engines, caller_of: impl Fn(&str) -> Option<(String, String)> + Send + Sync + 'static) -> Self {
         let (events, _) = broadcast::channel(512);
-        let inner = Arc::new(Inner { engines, events, calls: Mutex::new(HashMap::new()), caller_of: Box::new(caller_of) });
+        let ring = crate::ring::shared().unwrap_or_else(|| crate::ring::Ring::in_memory(Default::default()));
+        let inner = Arc::new(Inner {
+            engines,
+            events,
+            calls: Mutex::new(HashMap::new()),
+            caller_of: Box::new(caller_of),
+            records: Mutex::new(HashMap::new()),
+            ring: RwLock::new(ring),
+            messages: RwLock::new(crate::messages::shared()),
+            notifier: RwLock::new(None),
+        });
         HUBS.lock().unwrap_or_else(|e| e.into_inner()).push(Arc::downgrade(&inner));
         Self { inner }
+    }
+
+    /// The ring (the owner's settings for transfers and messages) this hub answers to.
+    pub fn ring(&self) -> Arc<crate::ring::Ring> {
+        self.inner.ring.read().unwrap_or_else(|e| e.into_inner()).clone()
+    }
+
+    /// Use another ring (tests set one with transfers on; a desktop uses the one it opened).
+    pub fn set_ring(&self, ring: Arc<crate::ring::Ring>) {
+        *self.inner.ring.write().unwrap_or_else(|e| e.into_inner()) = ring;
+    }
+
+    pub fn messages(&self) -> crate::messages::Store {
+        self.inner.messages.read().unwrap_or_else(|e| e.into_inner()).clone()
+    }
+
+    /// Keep messages in `store` (tests).
+    pub fn set_messages(&self, store: crate::messages::Store) {
+        *self.inner.messages.write().unwrap_or_else(|e| e.into_inner()) = store;
+    }
+
+    /// Tell the owner of a message with `notifier` rather than the desktop's own (tests).
+    pub fn set_message_notifier(&self, notifier: Option<Arc<dyn crate::messages::MessageNotifier>>) {
+        *self.inner.notifier.write().unwrap_or_else(|e| e.into_inner()) = notifier;
+    }
+
+    /// A call began: who it is with, as the phone said.
+    fn note_call(&self, call: &str, from: &str, name: &str) {
+        let mut records = self.inner.records.lock().unwrap_or_else(|e| e.into_inner());
+        prune(&mut records);
+        let record = records.entry(call.to_string()).or_insert_with(|| CallRecord { from: String::new(), name: String::new(), turns: VecDeque::new(), ended: None });
+        record.from = from.trim().to_string();
+        record.name = name.trim().to_string();
+        record.ended = None;
+    }
+
+    /// What the caller said, as this desktop heard it (not an acknowledgement: "mm-hmm" asks for nothing).
+    fn note_turn(&self, call: &str, text: &str) {
+        let mut records = self.inner.records.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(record) = records.get_mut(call) {
+            record.turns.push_back(text.to_string());
+            while record.turns.len() > TURNS_KEPT {
+                record.turns.pop_front();
+            }
+        }
+    }
+
+    /// The call ended (its record is kept a while: see [`RECORD_KEEP`]).
+    fn note_ended(&self, call: &str) {
+        let mut records = self.inner.records.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(record) = records.get_mut(call) {
+            record.ended.get_or_insert_with(Instant::now);
+        }
+        prune(&mut records);
+    }
+
+    /// Who a call is with, by this desktop's own record: for a call that is live or ended within ten minutes.
+    pub fn call_facts(&self, call: &str) -> Option<(String, String)> {
+        let mut records = self.inner.records.lock().unwrap_or_else(|e| e.into_inner());
+        prune(&mut records);
+        records.get(call).map(|r| (r.from.clone(), r.name.clone()))
+    }
+
+    /// What the caller said last on a call, oldest first (at most six).
+    pub fn caller_turns(&self, call: &str) -> Vec<String> {
+        let records = self.inner.records.lock().unwrap_or_else(|e| e.into_inner());
+        records.get(call).map(|r| r.turns.iter().cloned().collect()).unwrap_or_default()
+    }
+
+    /// Keep a message the receptionist took on `call` for the owner, and tell the owner. The number is
+    /// this desktop's own record of who rang (never what the model says), and it is refused when the
+    /// call is not one this desktop knows (live, or ended within ten minutes), when the owner has not
+    /// turned message taking on, or when a limit is reached: the receptionist is told, and says so.
+    pub fn take_message(&self, call: &str, request: MessageRequest) -> Result<TakenMessage, crate::messages::Error> {
+        use crate::messages::{clean, Error, NewMessage, MAX_NAME};
+        let Some((from, phone_name)) = self.call_facts(call) else {
+            return Err(Error::new(404, "no_call", format!("no call {call:?} to take a message on")));
+        };
+        if !self.ring().features().messages {
+            return Err(Error::new(409, "messages_off", "taking messages is switched off: tell the caller you cannot take one"));
+        }
+        let urgent = match request.urgency.trim() {
+            "" | "normal" => false,
+            "urgent" => true,
+            other => return Err(Error::new(400, "bad_urgency", format!("{other:?} is not an urgency: normal or urgent"))),
+        };
+        let given = clean(&request.caller_name, MAX_NAME);
+        let name = if given.is_empty() { callers::name_of(&from).or_else(|| callers::looks_like_name(&phone_name).then(|| phone_name.trim().to_string())).unwrap_or_default() } else { given };
+        let message = self.messages().add(NewMessage { call_id: call.to_string(), from, name, callback: request.callback_number, message: request.message, urgent, wants_callback: request.wants_callback })?;
+        let told = self.inner.notifier.read().unwrap_or_else(|e| e.into_inner()).clone();
+        let notified = match told {
+            Some(notifier) => notifier.message_taken(&message),
+            None => crate::messages::notify(&message),
+        };
+        self.emit(json!({"type": "message.new", "id": message.id, "callId": call, "urgency": message.urgency}));
+        Ok(TakenMessage { message, notified })
     }
 
     /// Tell the app pages following the calls.
@@ -104,6 +237,9 @@ impl VoiceHub {
     /// (when they said it, and whether over us). With no page answering calls,
     /// the caller is told so and the call is finished.
     fn caller_said(&self, call: &str, text: &str, how: Value) {
+        if how.get("backchannel").and_then(Value::as_bool) != Some(true) {
+            self.note_turn(call, text);
+        }
         let mut event = json!({"type": "call.caller", "callId": call, "text": text});
         if let (Some(event), Value::Object(how)) = (event.as_object_mut(), how) {
             event.extend(how);
@@ -127,6 +263,7 @@ impl VoiceHub {
 
     fn unregister(&self, call: &str) {
         self.inner.calls.lock().unwrap().remove(call);
+        self.note_ended(call);
     }
 
     fn command(&self, call: &str) -> Option<mpsc::UnboundedSender<CallCommand>> {
@@ -135,6 +272,44 @@ impl VoiceHub {
 
     pub fn live_calls(&self) -> Vec<String> {
         self.inner.calls.lock().unwrap().keys().cloned().collect()
+    }
+}
+
+/// What the receptionist gives to be recorded as a message.
+#[derive(Deserialize, Default)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct MessageRequest {
+    /// What the caller wants the owner to know.
+    pub message: String,
+    #[serde(default)]
+    pub caller_name: String,
+    /// Digits and an optional leading +: where to ring them, when not the number they rang from.
+    #[serde(default)]
+    pub callback_number: String,
+    /// `normal` (or none) or `urgent`.
+    #[serde(default)]
+    pub urgency: String,
+    #[serde(default)]
+    pub wants_callback: bool,
+}
+
+/// A message kept, and whether the owner could be told of it.
+pub struct TakenMessage {
+    pub message: crate::messages::Message,
+    pub notified: bool,
+}
+
+/// Records that have ended and are no longer to be kept (see [`RECORD_KEEP`]), and the oldest beyond [`RECORDS_MAX`].
+fn prune(records: &mut HashMap<String, CallRecord>) {
+    records.retain(|_, r| r.ended.is_none_or(|t| t.elapsed() < RECORD_KEEP));
+    while records.len() > RECORDS_MAX {
+        let oldest = records.iter().filter(|(_, r)| r.ended.is_some()).min_by_key(|(_, r)| r.ended).map(|(k, _)| k.clone());
+        match oldest {
+            Some(k) => {
+                records.remove(&k);
+            }
+            None => break,
+        }
     }
 }
 
@@ -160,6 +335,8 @@ pub fn app_router(hub: VoiceHub) -> Router {
         .route("/api/voice/calls/:id/tool", post(tool))
         .route("/api/voice/calls/:id/finish", post(finish))
         .route("/api/voice/calls/:id/hush", post(hush))
+        // A message the receptionist takes for the owner, on the call it is answering.
+        .route("/api/voice/calls/:id/message", post(message))
         // A caller's name, for their number (an empty name forgets it).
         .route("/api/voice/callers", put(caller_name))
         // `route_layer`: a path that is not one of these still answers 404.
@@ -403,6 +580,20 @@ async fn finish(State(hub): State<VoiceHub>, Path(id): Path<String>, Json(body):
     })
 }
 
+/// `POST /api/voice/calls/:id/message {message, callerName?, callbackNumber?, urgency?, wantsCallback?}`:
+/// the receptionist's `take_message`. Answers `{ok, result: {recorded, id, notified}}`: `notified` is whether
+/// the owner could be told now (a native notification was raised), and the receptionist says the owner
+/// "will be told" only then, else that the message is kept.
+async fn message(State(hub): State<VoiceHub>, Path(id): Path<String>, Json(body): Json<MessageRequest>) -> axum::response::Response {
+    match hub.take_message(&id, body) {
+        Ok(taken) => answer::<Value>(Ok(json!({"recorded": true, "id": taken.message.id, "notified": taken.notified}))),
+        Err(e) => {
+            let status = StatusCode::from_u16(e.status).unwrap_or(StatusCode::INTERNAL_SERVER_ERROR);
+            (status, Json(json!({"error": {"code": e.code, "message": e.message}}))).into_response()
+        }
+    }
+}
+
 async fn hush(State(hub): State<VoiceHub>, Path(id): Path<String>) -> axum::response::Response {
     let Some(tx) = hub.command(&id) else { return no_call(&id) };
     let _ = tx.send(CallCommand::Hush);
@@ -592,6 +783,148 @@ mod tests {
         assert_eq!(calls["calls"], json!([]));
         let say = client.post(format!("{base}/api/voice/calls/call_1/say")).json(&json!({"text": "hi"})).send().await.unwrap();
         assert_eq!(say.status(), 404, "no such call, but the route answers");
+    }
+
+    // ---- messages the receptionist takes -------------------------------------------------
+
+    struct Told(Mutex<Vec<String>>);
+
+    impl crate::messages::MessageNotifier for Told {
+        fn message_taken(&self, m: &crate::messages::Message) -> bool {
+            self.0.lock().unwrap().push(m.message.clone());
+            true
+        }
+    }
+
+    /// A hub answering with message taking on (or off), its own store and a stand-in for the owner's notification.
+    async fn serve_messages(messages_on: bool) -> (String, VoiceHub, Arc<Told>) {
+        let hub = VoiceHub::new(Engines::at("http://127.0.0.1:9", "http://127.0.0.1:9"), |_| None);
+        hub.set_ring(crate::ring::Ring::in_memory(crate::ring::RingSettings { take_messages: messages_on, ..Default::default() }));
+        hub.set_messages(crate::messages::Store::in_memory());
+        let told = Arc::new(Told(Mutex::new(Vec::new())));
+        hub.set_message_notifier(Some(told.clone()));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let app = app_router(hub.clone());
+        tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        (format!("http://{addr}"), hub, told)
+    }
+
+    #[tokio::test]
+    async fn a_message_is_kept_with_the_number_this_desktop_saw_and_the_owner_is_told() {
+        let _on = crate::modules::test_gate::enable(&[crate::modules::PHONE]);
+        let (base, hub, told) = serve_messages(true).await;
+        let client = reqwest::Client::new();
+        let url = format!("{base}/api/voice/calls/call_1/message");
+        // A call this desktop has not seen: nothing to take a message on.
+        let none = client.post(&url).json(&json!({"message": "Ring me."})).send().await.unwrap();
+        assert_eq!(none.status(), 404);
+        assert_eq!(none.json::<Value>().await.unwrap()["error"]["code"], "no_call");
+
+        hub.note_call("call_1", "+61491570006", "Alex Smith");
+        let body = json!({"message": "Please ring me about Friday.", "callerName": "Sam", "callbackNumber": "0491 570 156", "urgency": "urgent", "wantsCallback": true});
+        let ok = client.post(&url).json(&body).send().await.unwrap();
+        assert_eq!(ok.status(), 200);
+        let ok: Value = ok.json().await.unwrap();
+        assert_eq!((ok["ok"].clone(), ok["result"]["recorded"].clone(), ok["result"]["notified"].clone()), (json!(true), json!(true), json!(true)));
+        let kept = hub.messages().get(ok["result"]["id"].as_str().unwrap()).expect("kept");
+        assert_eq!((kept.from.as_str(), kept.name.as_str(), kept.callback.as_str(), kept.call_id.as_str()), ("+61491570006", "Sam", "0491570156", "call_1"));
+        assert_eq!((kept.urgency, kept.wants_callback), (crate::messages::Urgency::Urgent, true));
+        assert_eq!(told.0.lock().unwrap().as_slice(), ["Please ring me about Friday.".to_string()]);
+
+        // The number is the call's own: a body that names another one is refused, not believed.
+        let spoof = client.post(&url).json(&json!({"message": "Hello", "from": "+61491570999"})).send().await.unwrap();
+        assert_eq!(spoof.status(), 422);
+        assert_eq!(hub.messages().list(None, "").len(), 1);
+        // No name given: the phone's, when it is a name.
+        let unnamed = client.post(&url).json(&json!({"message": "Second one."})).send().await.unwrap().json::<Value>().await.unwrap();
+        assert_eq!(hub.messages().get(unnamed["result"]["id"].as_str().unwrap()).unwrap().name, "Alex Smith");
+        // Unknown urgency, an empty message and unknown members are refused.
+        assert_eq!(client.post(&url).json(&json!({"message": "x", "urgency": "critical"})).send().await.unwrap().status(), 400);
+        assert_eq!(client.post(&url).json(&json!({"message": "  "})).send().await.unwrap().status(), 400);
+        // The third message is the last on a call.
+        assert_eq!(client.post(&url).json(&json!({"message": "Third."})).send().await.unwrap().status(), 200);
+        let fourth = client.post(&url).json(&json!({"message": "Fourth."})).send().await.unwrap();
+        assert_eq!(fourth.status(), 429);
+        assert_eq!(fourth.json::<Value>().await.unwrap()["error"]["code"], "call_limit");
+    }
+
+    #[tokio::test]
+    async fn a_message_can_be_left_as_the_call_ends_and_for_ten_minutes_after() {
+        let _on = crate::modules::test_gate::enable(&[crate::modules::PHONE]);
+        let (base, hub, _) = serve_messages(true).await;
+        let client = reqwest::Client::new();
+        hub.note_call("call_1", "+61491570006", "");
+        hub.unregister("call_1");
+        assert_eq!(hub.call_facts("call_1"), Some(("+61491570006".into(), String::new())), "ended, but lately");
+        assert_eq!(client.post(format!("{base}/api/voice/calls/call_1/message")).json(&json!({"message": "Hung up mid-sentence."})).send().await.unwrap().status(), 200);
+        // Ended more than ten minutes ago: gone.
+        if let Some(long_ago) = Instant::now().checked_sub(RECORD_KEEP + Duration::from_secs(1)) {
+            hub.inner.records.lock().unwrap().get_mut("call_1").unwrap().ended = Some(long_ago);
+            assert_eq!(hub.call_facts("call_1"), None);
+            assert_eq!(client.post(format!("{base}/api/voice/calls/call_1/message")).json(&json!({"message": "Too late."})).send().await.unwrap().status(), 404);
+        }
+    }
+
+    #[tokio::test]
+    async fn with_messages_off_nothing_is_kept_and_the_receptionist_is_told_so() {
+        let _on = crate::modules::test_gate::enable(&[crate::modules::PHONE]);
+        let (base, hub, told) = serve_messages(false).await;
+        hub.note_call("call_1", "+61491570006", "");
+        let resp = reqwest::Client::new().post(format!("{base}/api/voice/calls/call_1/message")).json(&json!({"message": "Ring me."})).send().await.unwrap();
+        assert_eq!(resp.status(), 409);
+        assert_eq!(resp.json::<Value>().await.unwrap()["error"]["code"], "messages_off");
+        assert!(hub.messages().list(None, "").is_empty() && told.0.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn without_anything_to_tell_the_owner_with_the_message_is_kept_and_not_notified() {
+        let _on = crate::modules::test_gate::enable(&[crate::modules::PHONE]);
+        let (base, hub, _) = serve_messages(true).await;
+        hub.set_message_notifier(None);
+        crate::messages::set_notifier(None);
+        hub.note_call("call_1", "+61491570006", "");
+        let ok: Value = reqwest::Client::new().post(format!("{base}/api/voice/calls/call_1/message")).json(&json!({"message": "Ring me."})).send().await.unwrap().json().await.unwrap();
+        assert_eq!((ok["result"]["recorded"].clone(), ok["result"]["notified"].clone()), (json!(true), json!(false)), "kept, but nobody could be told: the receptionist says saved, not that the owner will be told");
+    }
+
+    #[tokio::test]
+    async fn the_message_route_answers_module_disabled_with_the_phone_off() {
+        let _off = crate::modules::test_gate::enable(&[]);
+        let (base, hub, _) = serve_messages(true).await;
+        hub.note_call("call_1", "+61491570006", "");
+        let resp = reqwest::Client::new().post(format!("{base}/api/voice/calls/call_1/message")).json(&json!({"message": "Ring me."})).send().await.unwrap();
+        assert_eq!(resp.status(), 409);
+        assert_eq!(resp.json::<Value>().await.unwrap()["error"]["code"], "module_disabled");
+    }
+
+    #[test]
+    fn what_the_caller_said_is_kept_as_this_desktop_heard_it() {
+        let hub = VoiceHub::new(Engines::at("http://127.0.0.1:9", "http://127.0.0.1:9"), |_| None);
+        // A call this desktop has not seen keeps nothing.
+        hub.note_turn("call_1", "hello");
+        assert!(hub.caller_turns("call_1").is_empty());
+        hub.note_call("call_1", "+61491570006", "Alex");
+        for n in 1..=8 {
+            hub.caller_said("call_1", &format!("turn {n}"), json!({"backchannel": false}));
+        }
+        hub.caller_said("call_1", "mm-hmm", json!({"backchannel": true}));
+        let turns = hub.caller_turns("call_1");
+        assert_eq!(turns.len(), TURNS_KEPT);
+        assert_eq!((turns.first().map(String::as_str), turns.last().map(String::as_str)), (Some("turn 3"), Some("turn 8")), "the last six, and an acknowledgement is not a turn");
+        assert!(hub.caller_turns("call_9").is_empty());
+    }
+
+    #[test]
+    fn the_records_of_ended_calls_are_bounded() {
+        let hub = VoiceHub::new(Engines::at("http://127.0.0.1:9", "http://127.0.0.1:9"), |_| None);
+        for n in 0..(RECORDS_MAX + 20) {
+            hub.note_call(&format!("call_{n}"), "+61491570006", "");
+            hub.note_ended(&format!("call_{n}"));
+        }
+        hub.note_call("live", "+61491570156", "");
+        assert!(hub.inner.records.lock().unwrap().len() <= RECORDS_MAX + 1);
+        assert!(hub.call_facts("live").is_some(), "a live call is never let go");
     }
 
     #[test]

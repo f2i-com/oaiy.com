@@ -17,6 +17,8 @@ pub mod plugins;
 pub mod voice;
 /// Putting a caller through to the owner: who is rung, and when (the ring policy).
 pub mod ring;
+/// What callers leave for the owner when the receptionist cannot put them through.
+pub mod messages;
 pub mod calendar;
 pub mod modules;
 pub mod agent_tasks;

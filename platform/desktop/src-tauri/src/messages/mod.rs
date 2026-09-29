@@ -1,0 +1,426 @@
+//! Messages callers leave for the owner: what the receptionist takes when the owner cannot
+//! be reached, in `<data>/messages/messages.json` (owner-only: it holds numbers and words).
+//!
+//! A message is `{id, at, callId, from, name, callback, message, urgency, wantsCallback, state,
+//! seenAt, handledAt, handledBy}`. `from` is the number the phone said the call came from: this
+//! desktop's own record of the call gives it, never the receptionist's model, so a caller
+//! cannot have a message appear to come from someone else by saying so. `callback` is the number
+//! they asked to be rung on (their own when they gave none). `state` is `new`, `seen` or `handled`.
+//!
+//! What is kept is bounded so a caller cannot fill the disk or the owner's screen:
+//! 3 messages a call, 20 a number a day, 600 characters each (control characters removed),
+//! 2 000 in all. A handled message is let go after 90 days, and when the store is full its
+//! oldest handled message makes room; a message nobody has handled is never dropped to make
+//! room (the next is refused instead, and the receptionist says so).
+//!
+//! Reading, marking as seen or handled, and deleting are the dashboard's (`routes`); a message
+//! is only ever made by the receptionist's `take_message` tool, through the call's own route
+//! (`/api/voice/calls/:id/message`, `voice`).
+
+pub mod routes;
+
+use std::path::{Path, PathBuf};
+use std::sync::{Arc, Mutex, OnceLock, RwLock};
+
+use serde::{Deserialize, Serialize};
+
+/// The messages' file, in `<data>/messages/`.
+pub const FILE_NAME: &str = "messages.json";
+/// The file's shape this desktop writes.
+const VERSION: u64 = 1;
+/// Messages taken on one call, at most.
+pub const PER_CALL: usize = 3;
+/// Messages one number may leave in a day, at most.
+pub const PER_CALLER_DAY: usize = 20;
+/// The longest message kept (characters).
+pub const MAX_MESSAGE: usize = 600;
+/// The longest name kept.
+pub const MAX_NAME: usize = 80;
+/// The longest callback number kept.
+pub const MAX_CALLBACK: usize = 20;
+/// The most messages held.
+pub const MAX_STORED: usize = 2_000;
+/// A handled message is let go after this many days.
+pub const KEEP_HANDLED_DAYS: i64 = 90;
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Urgency {
+    #[default]
+    Normal,
+    Urgent,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum State {
+    #[default]
+    New,
+    Seen,
+    Handled,
+}
+
+impl State {
+    pub fn parse(s: &str) -> Option<State> {
+        match s {
+            "new" => Some(State::New),
+            "seen" => Some(State::Seen),
+            "handled" => Some(State::Handled),
+            _ => None,
+        }
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct Message {
+    pub id: String,
+    /// When it was taken (RFC 3339, UTC).
+    pub at: String,
+    pub call_id: String,
+    /// The number the call came from, as the phone said ("" for a hidden number).
+    pub from: String,
+    /// The name the caller gave ("" when none).
+    #[serde(default)]
+    pub name: String,
+    /// The number to ring back on: the one the caller gave, else the one they rang from ("" for a hidden number they gave none for).
+    #[serde(default)]
+    pub callback: String,
+    pub message: String,
+    #[serde(default)]
+    pub urgency: Urgency,
+    #[serde(default)]
+    pub wants_callback: bool,
+    #[serde(default)]
+    pub state: State,
+    #[serde(default)]
+    pub seen_at: Option<String>,
+    #[serde(default)]
+    pub handled_at: Option<String>,
+    #[serde(default)]
+    pub handled_by: Option<String>,
+}
+
+/// What the receptionist gives to be recorded, with the number and call from this desktop's own record.
+#[derive(Clone, Debug, Default)]
+pub struct NewMessage {
+    pub call_id: String,
+    pub from: String,
+    pub name: String,
+    pub callback: String,
+    pub message: String,
+    pub urgent: bool,
+    pub wants_callback: bool,
+}
+
+/// Why a request about messages was refused: an HTTP status, a code and words for the receptionist or the owner.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Error {
+    pub status: u16,
+    pub code: &'static str,
+    pub message: String,
+}
+
+impl Error {
+    pub(crate) fn new(status: u16, code: &'static str, message: impl Into<String>) -> Self {
+        Self { status, code, message: message.into() }
+    }
+}
+
+impl std::fmt::Display for Error {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.message)
+    }
+}
+
+#[derive(Default, Serialize, Deserialize)]
+struct File {
+    #[serde(default)]
+    version: u64,
+    #[serde(default)]
+    messages: Vec<Message>,
+}
+
+/// The messages, in memory and on disk. Cloning shares them.
+#[derive(Clone, Default)]
+pub struct Store {
+    inner: Arc<Mutex<Inner>>,
+}
+
+#[derive(Default)]
+struct Inner {
+    path: Option<PathBuf>,
+    messages: Vec<Message>,
+    /// The file could not be read as messages and was put aside: nothing is lost by starting empty.
+    quarantined: bool,
+}
+
+/// `text` as it may be shown and kept: control and direction-changing characters removed, tabs and
+/// line breaks made spaces, runs of spaces one, trimmed, and at most `max` characters.
+pub fn clean(text: &str, max: usize) -> String {
+    let mut out = String::new();
+    let mut gap = false;
+    for c in text.chars() {
+        let hidden = matches!(c, '\u{200b}'..='\u{200f}' | '\u{202a}'..='\u{202e}' | '\u{2060}'..='\u{2064}' | '\u{2066}'..='\u{2069}' | '\u{feff}');
+        if c.is_whitespace() || matches!(c, '\t' | '\n' | '\r') {
+            gap = true;
+        } else if c.is_control() || hidden {
+            continue;
+        } else {
+            if gap && !out.is_empty() {
+                out.push(' ');
+            }
+            gap = false;
+            out.push(c);
+        }
+    }
+    out.chars().take(max).collect::<String>().trim_end().to_string()
+}
+
+/// A callback number as it is kept: digits and a leading `+` only, at most [`MAX_CALLBACK`] characters; "" when it has no digits.
+pub fn clean_number(text: &str) -> String {
+    let text = text.trim();
+    let plus = text.starts_with('+');
+    let digits: String = text.chars().filter(char::is_ascii_digit).collect();
+    if digits.is_empty() {
+        return String::new();
+    }
+    let mut out = if plus { format!("+{digits}") } else { digits };
+    out.truncate(MAX_CALLBACK);
+    out
+}
+
+fn now() -> chrono::DateTime<chrono::Utc> {
+    chrono::Utc::now()
+}
+
+impl Store {
+    /// The messages kept in `<data>/messages/messages.json`. A file that is not messages is put aside as
+    /// `messages.json.corrupt` (never written over) and the store starts empty.
+    pub fn open(data_dir: &Path) -> Store {
+        let path = data_dir.join("messages").join(FILE_NAME);
+        let mut inner = Inner { path: Some(path.clone()), ..Inner::default() };
+        match std::fs::read_to_string(&path) {
+            Ok(text) => match serde_json::from_str::<File>(&text) {
+                Ok(file) if file.version <= VERSION => inner.messages = file.messages,
+                _ => {
+                    log::warn!("messages: {} is not usable; it is kept as messages.json.corrupt", path.display());
+                    if std::fs::rename(&path, path.with_extension("json.corrupt")).is_err() {
+                        log::warn!("messages: the original could not be put aside");
+                    }
+                    inner.quarantined = true;
+                }
+            },
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            Err(e) => {
+                log::warn!("messages: {} could not be read ({e})", path.display());
+                inner.quarantined = true;
+            }
+        }
+        Store { inner: Arc::new(Mutex::new(inner)) }
+    }
+
+    /// Messages held in memory only (tests).
+    pub fn in_memory() -> Store {
+        Store::default()
+    }
+
+    fn lock(&self) -> std::sync::MutexGuard<'_, Inner> {
+        self.inner.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+    fn save(inner: &Inner) -> Result<(), Error> {
+        let Some(path) = &inner.path else { return Ok(()) };
+        let body = serde_json::to_string_pretty(&File { version: VERSION, messages: inner.messages.clone() }).map_err(|e| Error::new(500, "save_failed", e.to_string()))?;
+        crate::secret_file::write(path, body).map_err(|e| Error::new(500, "save_failed", format!("the message could not be saved: {e}")))
+    }
+
+    /// Keep a message the receptionist took. The limits, and the words cleaned, are here: the same
+    /// message said again on the same call is the one already kept.
+    pub fn add(&self, new: NewMessage) -> Result<Message, Error> {
+        self.add_at(new, now())
+    }
+
+    /// [`Store::add`] as of `when` (the limits are by the clock: a test sets it).
+    pub(crate) fn add_at(&self, new: NewMessage, when: chrono::DateTime<chrono::Utc>) -> Result<Message, Error> {
+        let text = clean(&new.message, MAX_MESSAGE);
+        if text.is_empty() {
+            return Err(Error::new(400, "empty_message", "there is no message to keep: ask what the caller wants the owner to know"));
+        }
+        let key = crate::voice::contacts::key(&new.from);
+        let mut inner = self.lock();
+        // Who counts as one caller: their number, or, for a hidden number, the call itself.
+        let same_caller = |m: &Message| match &key {
+            Some(k) => crate::voice::contacts::key(&m.from).as_deref() == Some(k.as_str()),
+            None => m.call_id == new.call_id,
+        };
+        if let Some(existing) = inner.messages.iter().find(|m| m.call_id == new.call_id && m.message == text) {
+            return Ok(existing.clone());
+        }
+        if inner.messages.iter().filter(|m| m.call_id == new.call_id).count() >= PER_CALL {
+            return Err(Error::new(429, "call_limit", format!("{PER_CALL} messages have been taken on this call: no more can be kept")));
+        }
+        let today = inner.messages.iter().filter(|m| same_caller(m) && chrono::DateTime::parse_from_rfc3339(&m.at).map(|at| when.signed_duration_since(at).num_hours() < 24).unwrap_or(false)).count();
+        if today >= PER_CALLER_DAY {
+            return Err(Error::new(429, "caller_limit", "this number has left as many messages today as are kept"));
+        }
+        // Old handled messages go; if it is still full, the oldest handled one makes room, and an unhandled one never does.
+        let cutoff = when - chrono::Duration::days(KEEP_HANDLED_DAYS);
+        inner.messages.retain(|m| m.state != State::Handled || m.handled_at.as_deref().and_then(|t| chrono::DateTime::parse_from_rfc3339(t).ok()).is_none_or(|t| t >= cutoff));
+        if inner.messages.len() >= MAX_STORED {
+            let oldest = inner.messages.iter().enumerate().filter(|(_, m)| m.state == State::Handled).min_by(|a, b| a.1.at.cmp(&b.1.at)).map(|(i, _)| i);
+            match oldest {
+                Some(i) => {
+                    inner.messages.remove(i);
+                }
+                None => return Err(Error::new(507, "store_full", "the owner has too many messages waiting to keep another")),
+            }
+        }
+        let callback = clean_number(&new.callback);
+        let message = Message {
+            id: format!("msg_{}", &uuid::Uuid::new_v4().simple().to_string()[..16]),
+            at: when.to_rfc3339_opts(chrono::SecondsFormat::Secs, true),
+            call_id: new.call_id.clone(),
+            from: clean(&new.from, 40),
+            name: clean(&new.name, MAX_NAME),
+            callback: if callback.is_empty() { clean(&new.from, 40) } else { callback },
+            message: text,
+            urgency: if new.urgent { Urgency::Urgent } else { Urgency::Normal },
+            wants_callback: new.wants_callback,
+            state: State::New,
+            seen_at: None,
+            handled_at: None,
+            handled_by: None,
+        };
+        inner.messages.push(message.clone());
+        if let Err(e) = Self::save(&inner) {
+            inner.messages.pop();
+            return Err(e);
+        }
+        Ok(message)
+    }
+
+    /// Every message, newest first, of `state` (all when None), and those whose name, number or words hold `q`.
+    pub fn list(&self, state: Option<State>, q: &str) -> Vec<Message> {
+        let q = q.trim().to_lowercase();
+        let digits: String = q.chars().filter(char::is_ascii_digit).collect();
+        // A number is found written any way: by its last nine digits, as contacts are.
+        let needle = &digits[digits.len().saturating_sub(9)..];
+        let mut found: Vec<Message> = self
+            .lock()
+            .messages
+            .iter()
+            .filter(|m| state.is_none_or(|s| m.state == s))
+            .filter(|m| {
+                q.is_empty()
+                    || m.name.to_lowercase().contains(&q)
+                    || m.message.to_lowercase().contains(&q)
+                    || (digits.len() >= 3 && [&m.from, &m.callback].iter().any(|n| n.chars().filter(char::is_ascii_digit).collect::<String>().contains(needle)))
+            })
+            .cloned()
+            .collect();
+        found.sort_by(|a, b| b.at.cmp(&a.at).then_with(|| b.id.cmp(&a.id)));
+        found
+    }
+
+    /// How many messages are new.
+    pub fn unread(&self) -> usize {
+        self.lock().messages.iter().filter(|m| m.state == State::New).count()
+    }
+
+    pub fn get(&self, id: &str) -> Option<Message> {
+        self.lock().messages.iter().find(|m| m.id == id).cloned()
+    }
+
+    /// Mark a message `seen`, `handled` (by `by`) or `new` again.
+    pub fn set_state(&self, id: &str, state: State, by: &str) -> Result<Message, Error> {
+        let mut inner = self.lock();
+        let at = now().to_rfc3339_opts(chrono::SecondsFormat::Secs, true);
+        let Some(i) = inner.messages.iter().position(|m| m.id == id) else {
+            return Err(Error::new(404, "no_message", format!("no message {id:?}")));
+        };
+        let before = inner.messages[i].clone();
+        {
+            let m = &mut inner.messages[i];
+            m.state = state;
+            match state {
+                State::New => {
+                    m.seen_at = None;
+                    m.handled_at = None;
+                    m.handled_by = None;
+                }
+                State::Seen => {
+                    m.seen_at.get_or_insert(at.clone());
+                    m.handled_at = None;
+                    m.handled_by = None;
+                }
+                State::Handled => {
+                    m.seen_at.get_or_insert(at.clone());
+                    m.handled_at = Some(at);
+                    m.handled_by = Some(clean(by, 40)).filter(|b| !b.is_empty());
+                }
+            }
+        }
+        if let Err(e) = Self::save(&inner) {
+            inner.messages[i] = before;
+            return Err(e);
+        }
+        Ok(inner.messages[i].clone())
+    }
+
+    /// Forget a message.
+    pub fn remove(&self, id: &str) -> Result<(), Error> {
+        let mut inner = self.lock();
+        let Some(i) = inner.messages.iter().position(|m| m.id == id) else {
+            return Err(Error::new(404, "no_message", format!("no message {id:?}")));
+        };
+        let removed = inner.messages.remove(i);
+        if let Err(e) = Self::save(&inner) {
+            inner.messages.insert(i, removed);
+            return Err(e);
+        }
+        Ok(())
+    }
+
+    /// Whether the file could not be read at the start (its bytes are kept beside it).
+    pub fn was_quarantined(&self) -> bool {
+        self.lock().quarantined
+    }
+}
+
+// ---- telling the owner ----------------------------------------------------------
+
+/// What tells the owner a message arrived: on the GUI, a native notification (a stand-in in tests, nothing on the headless server).
+pub trait MessageNotifier: Send + Sync {
+    /// Tell the owner. Whether a person could have been told (a notification was raised).
+    fn message_taken(&self, message: &Message) -> bool;
+}
+
+static NOTIFIER: RwLock<Option<Arc<dyn MessageNotifier>>> = RwLock::new(None);
+
+/// Use `notifier` to tell the owner of a message from now on.
+pub fn set_notifier(notifier: Option<Arc<dyn MessageNotifier>>) {
+    if let Ok(mut n) = NOTIFIER.write() {
+        *n = notifier;
+    }
+}
+
+/// Tell the owner `message` was taken: whether anything could tell them.
+pub fn notify(message: &Message) -> bool {
+    NOTIFIER.read().ok().and_then(|n| n.clone()).is_some_and(|n| n.message_taken(message))
+}
+
+static SHARED: OnceLock<Store> = OnceLock::new();
+
+/// Open this desktop's messages in its data folder.
+pub fn init(data_dir: &Path) {
+    let _ = SHARED.set(Store::open(data_dir));
+}
+
+/// This desktop's messages (empty and unsaved before [`init`]).
+pub fn shared() -> Store {
+    SHARED.get().cloned().unwrap_or_default()
+}
+
+#[cfg(test)]
+mod tests;
