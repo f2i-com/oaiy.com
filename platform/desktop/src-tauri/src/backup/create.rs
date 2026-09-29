@@ -90,6 +90,55 @@ pub struct CreateResult {
     pub verified: bool,
 }
 
+/// Where a backup being written is (the one file that lives outside the data folder while it is made):
+/// noted before it is written and forgotten when it is renamed into place or removed, so that if OAIY
+/// is killed in between, the next start can find the half-written (encrypted) file and remove it.
+fn output_record(data_dir: &Path) -> PathBuf {
+    scratch_dir(data_dir).parent().map(|p| p.join("output.json")).unwrap_or_else(|| data_dir.join("backup").join("output.json"))
+}
+
+fn note_output(data_dir: &Path, tmp: &Path) {
+    let record = serde_json::json!({ "path": tmp.display().to_string() });
+    if let Some(parent) = output_record(data_dir).parent() {
+        let _ = secret_file::create_private_dir(parent);
+    }
+    if let Err(e) = secret_file::write(&output_record(data_dir), record.to_string()) {
+        log::warn!("backup: could not note where the backup is being written: {e}");
+    }
+}
+
+fn forget_output(data_dir: &Path) {
+    let _ = std::fs::remove_file(output_record(data_dir));
+}
+
+/// A name this code gives the file it writes first: `.<name>.<16 hex>.tmp`.
+fn is_partial_name(name: &str) -> bool {
+    let Some(stem) = name.strip_prefix('.').and_then(|n| n.strip_suffix(".tmp")) else { return false };
+    let Some((_, id)) = stem.rsplit_once('.') else { return false };
+    id.len() == 16 && id.bytes().all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+}
+
+/// At the start of the app: remove the half-written (encrypted) file a backup that was killed left
+/// beside where it was going, if it can still be found. Only a file of exactly the name this code gives
+/// it, and never a link. True when a file was removed.
+pub(crate) fn sweep_output(data_dir: &Path) -> bool {
+    let record = output_record(data_dir);
+    let Some(path) = std::fs::read_to_string(&record).ok().and_then(|t| serde_json::from_str::<serde_json::Value>(&t).ok()).and_then(|v| v.get("path").and_then(|p| p.as_str().map(PathBuf::from))) else {
+        let _ = std::fs::remove_file(&record);
+        return false;
+    };
+    let mut removed = false;
+    if path.file_name().and_then(|n| n.to_str()).is_some_and(is_partial_name) {
+        if let Ok(meta) = std::fs::symlink_metadata(&path) {
+            if meta.is_file() && !super::rules::is_link(&meta) {
+                removed = std::fs::remove_file(&path).is_ok();
+            }
+        }
+    }
+    let _ = std::fs::remove_file(&record);
+    removed
+}
+
 fn need(free: u64, needed: u64, what: &str) -> Result<()> {
     if free < needed {
         return Err(BackupError::new(
@@ -263,8 +312,14 @@ fn run(opts: &CreateOptions<'_>) -> Result<CreateResult> {
 
     state::set_phase(Phase::Encrypting, "Encrypting the backup with your passphrase");
     let tmp = dest_dir.join(format!(".{}.{}.tmp", dest.file_name().and_then(|n| n.to_str()).unwrap_or("backup"), random_id()));
+    note_output(opts.data_dir, &tmp);
     let finished = (|| -> Result<u64> {
         container::encrypt_file(&zip_path, &tmp, opts.passphrase, opts.cost)?;
+        #[cfg(test)]
+        if DIE_AFTER_WRITING.with(|c| c.get()) {
+            // A test's stand-in for the process being killed here: nothing is cleaned up.
+            return Err(BackupError::new(ErrorKind::Io, DIED));
+        }
         #[cfg(test)]
         if CORRUPT_OUTPUT.with(|c| c.get()) {
             // A test's stand-in for a disk that wrote something other than it was given.
@@ -285,6 +340,11 @@ fn run(opts: &CreateOptions<'_>) -> Result<CreateResult> {
         secret_file::rename_over(&tmp, &dest).map_err(|e| BackupError::io("Could not put the backup in place", &e))?;
         Ok(std::fs::metadata(&dest).map(|m| m.len()).unwrap_or(0))
     })();
+    #[cfg(test)]
+    if finished.as_ref().err().is_some_and(|e| e.message == DIED) {
+        return Err(finished.unwrap_err());
+    }
+    forget_output(opts.data_dir);
     let size = match finished {
         Ok(size) => size,
         Err(e) => {
@@ -379,3 +439,12 @@ pub(crate) fn short_wait() -> AgentWait {
     use std::time::Duration;
     AgentWait { first_activity: Duration::from_millis(300), idle: Duration::from_millis(300), total: Duration::from_secs(3) }
 }
+
+#[cfg(test)]
+thread_local! {
+    /// A test makes the backup "die" after its output is written, before it is checked or renamed, on this thread only.
+    pub(crate) static DIE_AFTER_WRITING: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+#[cfg(test)]
+const DIED: &str = "__died__";

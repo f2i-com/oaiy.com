@@ -3100,3 +3100,60 @@ fn what_the_agents_page_says_in_its_warnings_is_cut_before_it_goes_into_a_backup
         assert!(partial.iter().any(|w| w.starts_with("Agent: 0: ")), "{what}: what the page said is still there, cut");
     }
 }
+
+// ---- a backup that was killed while writing leaves nothing behind at the next start ------------------------------
+
+fn strays(dir: &Path) -> Vec<String> {
+    fs::read_dir(dir).unwrap().flatten().map(|e| e.file_name().to_string_lossy().into_owned()).filter(|n| n.starts_with('.') && n.ends_with(".tmp")).collect()
+}
+
+#[test]
+fn the_half_written_file_of_a_backup_that_was_killed_is_removed_at_the_next_start() {
+    let data = TempDir::new("killed");
+    realistic(&data.0, "A");
+    let out = TempDir::new("killed-out");
+    let final_path = out.0.join("k.oaiybackup");
+    make(&data.0, &final_path);
+    let before = fs::read(&final_path).unwrap();
+    // A backup to the same name is killed once its output is written and before it is renamed into place.
+    create::DIE_AFTER_WRITING.with(|c| c.set(true));
+    let died = make_with(&data.0, &final_path, PASS, false, None);
+    create::DIE_AFTER_WRITING.with(|c| c.set(false));
+    assert!(died.is_err());
+    assert_eq!(strays(&out.0).len(), 1, "the half-written file is there: {:?}", strays(&out.0));
+    assert!(data.0.join("backup").join("output.json").is_file(), "and where it is was noted");
+    assert_eq!(fs::read(&final_path).unwrap(), before, "the backup that was there is as it was");
+    // The next start removes it, and the note.
+    assert!(restore::sweep_leftovers(&data.0) >= 1);
+    assert!(strays(&out.0).is_empty(), "nothing is left in the folder that was chosen");
+    assert!(!data.0.join("backup").join("output.json").exists());
+    assert_eq!(fs::read(&final_path).unwrap(), before, "and the backup that was there still is");
+    assert_nothing_left_in_scratch(&data.0);
+}
+
+#[test]
+fn a_backup_that_finishes_or_fails_normally_leaves_no_note_and_the_sweep_takes_only_what_it_wrote() {
+    let data = TempDir::new("killed2");
+    realistic(&data.0, "A");
+    let out = TempDir::new("killed2-out");
+    make(&data.0, &out.0.join("n.oaiybackup"));
+    assert!(!data.0.join("backup").join("output.json").exists(), "a finished backup leaves no note");
+    assert!(strays(&out.0).is_empty());
+    // A note that names something else is not followed: only a file of the name this code gives, and never a link.
+    let precious = out.0.join("precious.docx");
+    fs::write(&precious, b"my thesis").unwrap();
+    let lookalike = out.0.join(".precious.docx.tmp");
+    fs::write(&lookalike, b"not made by a backup").unwrap();
+    for named in [&precious, &lookalike, &out.0.join("..").join("callers.json"), &data.0.join("callers.json")] {
+        put(&data.0.join("backup"), "output.json", serde_json::json!({ "path": named.display().to_string() }).to_string());
+        restore::sweep_leftovers(&data.0);
+        assert!(!data.0.join("backup").join("output.json").exists(), "the note is used up");
+    }
+    assert_eq!(fs::read(&precious).unwrap(), b"my thesis");
+    assert_eq!(fs::read(&lookalike).unwrap(), b"not made by a backup");
+    assert!(data.0.join("callers.json").is_file());
+    // A note that is not a note is removed, and nothing else is touched.
+    put(&data.0.join("backup"), "output.json", b"{ not json");
+    restore::sweep_leftovers(&data.0);
+    assert!(!data.0.join("backup").join("output.json").exists());
+}

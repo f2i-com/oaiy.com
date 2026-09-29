@@ -1007,6 +1007,10 @@ pub fn sweep_leftovers(data_dir: &Path) -> usize {
             }
         }
     }
+    // The encrypted file a backup that was killed had begun beside its destination.
+    if super::create::sweep_output(data_dir) {
+        removed += 1;
+    }
     // The Agent's part of a restore that its page has not taken for a day: it is not kept for ever.
     if let Some(id) = agent::drop_stale_import(data_dir, std::time::Duration::from_secs(STAGED_LIFETIME_HOURS as u64 * 3600)) {
         record_agent_result(data_dir, &id, false, Some("its page did not take them within a day, so what was kept for it was deleted"), &[]);
