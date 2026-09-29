@@ -1434,8 +1434,8 @@ A project can hold several apps, each in its own folder (any folder whose manife
   const actions = h(
     'div.actions',
     { onclick: (e: Event) => { if ((e.target as HTMLElement).closest('button')) closeMenu(); } },
-    installButton(install),
     setupButton,
+    installButton(install),
     h('button', { title: 'New empty project', onclick: async () => {
       if (!(await mayLeaveRun())) return;
       const name = await askText({ title: 'New project', message: 'An empty project, kept in this browser.', label: 'Project name', value: 'untitled', ok: 'Create' });

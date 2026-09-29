@@ -201,6 +201,9 @@ button:focus-visible, summary:focus-visible, [tabindex]:focus-visible { outline:
 .topbar.menu-open .actions .setup-oaiy, .topbar.menu-open .actions .install-app { margin-bottom: 4px; position: relative; color: var(--accent); font-weight: 650; }
 .topbar.menu-open .actions .setup-oaiy::after, .topbar.menu-open .actions .install-app::after { content: ''; position: absolute; left: 6px; right: 6px; bottom: -3px; border-top: 1px solid var(--border); }
 .actions .setup-oaiy[hidden], .actions .install-app[hidden] { display: none; }
+/* Both showing: one rule under the pair, not two. */
+.topbar.menu-open .actions .setup-oaiy:has(+ .install-app:not([hidden])) { margin-bottom: 0; }
+.topbar.menu-open .actions .setup-oaiy:has(+ .install-app:not([hidden]))::after { display: none; }
 /* "A new version is ready": a small message in the corner, out of the way (pwa/update.ts). */
 .update-notice { position: fixed; right: 14px; bottom: 14px; z-index: 60; display: flex; align-items: center; gap: 10px; max-width: calc(100vw - 28px); padding: 6px 6px 6px 14px; background: var(--panel); border: 1px solid var(--border); border-radius: var(--r-card); box-shadow: var(--shadow); font-size: 13px; }
 .update-notice button { min-height: 28px; padding: 0 12px; }
