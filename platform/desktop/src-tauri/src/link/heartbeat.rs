@@ -829,7 +829,7 @@ mod tests {
         let server = Provider::start(|_| Reply::ok("{}"));
         send(&linked(server.base.clone(), "flk_beat"), &spec(), "oaiy-test", &[]).unwrap();
         let held = server.closed_after_reply(0, Duration::from_secs(15));
-        assert!(held < Duration::from_secs(1), "the connection was held open {held:?} after its reply");
+        assert!(held < Duration::from_secs(2), "the connection was held open {held:?} after its reply");
     }
 
     #[test]

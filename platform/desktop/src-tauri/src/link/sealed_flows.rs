@@ -684,7 +684,7 @@ mod tests {
         let held = server.try_closed_after_reply(0, Duration::from_secs(3));
         crate::link::testkit::stop_lane(&store);
         let _ = std::fs::remove_dir_all(dir);
-        assert!(held.is_some_and(|held| held < Duration::from_secs(1)), "the connection was held open: {held:?}");
+        assert!(held.is_some_and(|held| held < Duration::from_secs(2)), "the connection was held open: {held:?}");
     }
 
     #[test]

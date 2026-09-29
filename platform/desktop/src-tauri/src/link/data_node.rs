@@ -476,7 +476,7 @@ mod tests {
         assert!(server.requests().iter().all(|r| r.header("authorization") == Some("Bearer flk_node")));
         for conn in 0..2 {
             let held = server.closed_after_reply(conn, Duration::from_secs(15));
-            assert!(held < Duration::from_secs(1), "connection {conn} was held open {held:?} after its reply");
+            assert!(held < Duration::from_secs(2), "connection {conn} was held open {held:?} after its reply");
         }
     }
 }

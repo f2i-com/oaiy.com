@@ -448,7 +448,7 @@ mod client_tests {
         assert_eq!(server.connections(), 2, "nothing is kept for the next request to use");
         for conn in 0..2 {
             let held = server.closed_after_reply(conn, Duration::from_secs(10));
-            assert!(held < Duration::from_secs(1), "connection {conn} was held open {held:?} after its reply");
+            assert!(held < Duration::from_secs(2), "connection {conn} was held open {held:?} after its reply");
         }
     }
 

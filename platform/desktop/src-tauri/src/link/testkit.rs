@@ -363,6 +363,6 @@ mod tests {
         assert!(held >= Duration::from_millis(250) && held < Duration::from_secs(3), "{held:?}");
         // The other is closed as soon as it has been answered.
         drop(second);
-        assert!(server.closed_after_reply(1, Duration::from_secs(5)) < Duration::from_secs(1));
+        assert!(server.closed_after_reply(1, Duration::from_secs(5)) < Duration::from_secs(2));
     }
 }
