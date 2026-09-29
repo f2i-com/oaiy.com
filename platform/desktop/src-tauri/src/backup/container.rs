@@ -93,42 +93,50 @@ pub(crate) fn is_reserved_device_name(stem: &str) -> bool {
 /// backslash, a drive letter (any colon), a NUL, any control character, an empty segment, a
 /// segment Windows would trim or reserve (`CON`, a trailing dot or space), and a name that is too long.
 pub(crate) fn check_entry_name(name: &str, limits: &Limits) -> Result<()> {
-    let unsafe_name = |why: &str| BackupError::new(ErrorKind::Unsafe, format!("This backup is refused: it holds an item with an unsafe name ({why})."));
+    match name_problem(name, limits) {
+        None => Ok(()),
+        Some(why) => Err(BackupError::new(ErrorKind::Unsafe, format!("This backup is refused: it holds an item with an unsafe name ({why})."))),
+    }
+}
+
+/// What is wrong with a name as a name in a backup, in a few words (`None`: nothing). Making a backup asks it of a
+/// person's own files, to leave out (and name) one that a restore would refuse, instead of making a backup that is refused.
+pub(crate) fn name_problem(name: &str, limits: &Limits) -> Option<&'static str> {
     if name.is_empty() || name.len() > limits.max_name_len {
-        return Err(unsafe_name("empty or too long"));
+        return Some("empty or too long");
     }
     if name.contains('\0') {
-        return Err(unsafe_name("it has a NUL"));
+        return Some("it has a NUL");
     }
     if name.contains('\\') || name.starts_with('/') {
-        return Err(unsafe_name("it is not a plain relative path"));
+        return Some("it is not a plain relative path");
     }
     if name.contains(':') {
-        return Err(unsafe_name("it names a drive"));
+        return Some("it names a drive");
     }
     if name.chars().any(|c| c.is_control() || matches!(c, '<' | '>' | '"' | '|' | '?' | '*')) {
-        return Err(unsafe_name("it has a character files cannot have"));
+        return Some("it has a character files cannot have");
     }
     for segment in name.split('/') {
         if segment.is_empty() {
-            return Err(unsafe_name("an empty part or a trailing slash"));
+            return Some("an empty part or a trailing slash");
         }
         if segment == "." || segment == ".." {
-            return Err(unsafe_name("it leaves its folder"));
+            return Some("it leaves its folder");
         }
         if segment.ends_with('.') || segment.ends_with(' ') {
-            return Err(unsafe_name("a part ends with a dot or a space"));
+            return Some("a part ends with a dot or a space");
         }
         // NTFS answers to a short name (PAIRIN~1.JSO) for a file with a long one, and a short name
         // passes every check made on the long one (a word rule, an extension rule).
         if segment.as_bytes().windows(2).any(|w| w[0] == b'~' && w[1].is_ascii_digit()) {
-            return Err(unsafe_name("it is a short-name alias"));
+            return Some("it is a short-name alias");
         }
         if is_reserved_device_name(segment.split('.').next().unwrap_or(segment)) {
-            return Err(unsafe_name("a part is a reserved device name"));
+            return Some("a part is a reserved device name");
         }
     }
-    Ok(())
+    None
 }
 
 /// `root` joined with a checked relative `name`.

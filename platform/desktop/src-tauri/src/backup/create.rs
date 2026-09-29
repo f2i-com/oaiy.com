@@ -202,8 +202,20 @@ fn run(opts: &CreateOptions<'_>) -> Result<CreateResult> {
     let mut total_bytes = 0u64;
     let mut skipped_unreadable = 0usize;
     let mut skipped_large = 0usize;
+    let mut skipped_named = 0usize;
     let mut extra_excluded: Vec<Excluded> = Vec::new();
     for (n, item) in plan.items.iter().enumerate() {
+        // A file whose name a restore would refuse (a short-name alias such as `REPORT~1.JSON`, a reserved device name) is left
+        // out and named, not made into a backup that is refused whole.
+        if let Some(why) = container::name_problem(&item.rel, &opts.limits) {
+            skipped_named += 1;
+            extra_excluded.push(Excluded {
+                pattern: item.rel.clone(),
+                reason: format!("Left out: its name is one a restore refuses ({why}), and a backup that held it could not be restored."),
+                redo: Some("Rename the file if you want it in a backup.".to_string()),
+            });
+            continue;
+        }
         // A file too large for a restore to take is left out and said so, never made into a backup that is refused.
         if item.size > opts.limits.entry_cap(&item.rel) {
             skipped_large += 1;
@@ -231,6 +243,9 @@ fn run(opts: &CreateOptions<'_>) -> Result<CreateResult> {
     }
     if skipped_unreadable > 0 {
         partial.push(format!("{skipped_unreadable} file{} could not be read and {} left out.", plural(skipped_unreadable), were(skipped_unreadable)));
+    }
+    if skipped_named > 0 {
+        partial.push(format!("{skipped_named} file{} {} left out because {} name is one a restore refuses (they are named in what was left out).", plural(skipped_named), were(skipped_named), if skipped_named == 1 { "its" } else { "their" }));
     }
     if skipped_large > 0 {
         partial.push(format!("{skipped_large} file{} too large for a backup and {} left out.", plural(skipped_large), were(skipped_large)));

@@ -5127,3 +5127,28 @@ fn every_reserved_device_name_is_refused_in_every_form() {
         assert_refused(&dst.0, &file, ErrorKind::Unsafe);
     }
 }
+
+/// A person's own file whose name a restore would refuse does not spoil the backup: it is left out, named, and everything else is saved.
+#[test]
+fn a_local_file_named_like_a_short_name_alias_is_left_out_and_named_and_the_rest_is_backed_up() {
+    let data = TempDir::new("alias-src");
+    put(&data.0, "callers.json", b"{}");
+    put(&data.0, "flows/ok.json", b"{\"name\":\"ok\"}");
+    put(&data.0, "flows/REPORT~1.json", b"{\"name\":\"alias\"}");
+    put(&data.0, "flows/tilde~.json", b"{\"name\":\"not an alias\"}");
+    put(&data.0, "voices/LPT0.wav", b"riff");
+    let out = TempDir::new("alias-out");
+    let file = out.0.join("a.oaiybackup");
+    let made = make(&data.0, &file);
+    let names: Vec<String> = manifest_of(&file, PASS).entries.into_iter().map(|e| e.name).collect();
+    assert!(names.contains(&"flows/ok.json".to_string()) && names.contains(&"flows/tilde~.json".to_string()) && names.contains(&"callers.json".to_string()), "{names:?}");
+    assert!(!names.iter().any(|n| n.contains("REPORT~1") || n.contains("LPT0")), "{names:?}");
+    for named in ["flows/REPORT~1.json", "voices/LPT0.wav"] {
+        let record = made.excluded.iter().find(|e| e.pattern == named).unwrap_or_else(|| panic!("{named} is named in what was left out: {:?}", made.excluded));
+        assert!(record.reason.contains("a restore refuses") && record.redo.as_deref().is_some_and(|r| r.contains("Rename")), "{record:?}");
+    }
+    assert!(made.partial.iter().any(|w| w.starts_with("2 files were left out because their name")), "{:?}", made.partial);
+    // The backup that was made restores.
+    let dst = TempDir::new("alias-dst");
+    assert!(restore::inspect(&dst.0, &file, PASS, &options()).is_ok());
+}

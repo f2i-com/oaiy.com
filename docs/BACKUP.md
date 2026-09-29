@@ -361,7 +361,12 @@ Aokie's settings file: a document with a `settings` bag and a few fields of its 
 
 Also left out, and listed in the backup's manifest with the reason: symbolic links and junctions
 (they are never followed, so what they point at is not backed up), and anything under OAIY's data
-folder that the table does not know ("Not recognised as personal data, so it is not backed up").
+folder that the table does not know ("Not recognised as personal data, so it is not backed up"), and
+a file of yours whose name a restore would refuse: an NTFS short-name alias such as `REPORT~1.JSON`, or
+a name Windows keeps for a device (`CON`, `PRN`, `AUX`, `NUL`, `COM0` to `COM9`, `LPT0` to `LPT9`,
+their superscript forms such as `COM¹`, `CONIN$`, `CONOUT$`). Such a file is left out **and named** in what
+was left out (with "Rename the file if you want it in a backup") and the rest is backed up, so one
+badly named file never spoils a backup or makes it one that cannot be restored.
 A file that a rule cleans on the way in (the calendar, a settings file) is listed in the
 manifest's `excluded` with what was taken out, by key, never by value.
 
