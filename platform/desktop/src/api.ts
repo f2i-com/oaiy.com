@@ -1391,6 +1391,28 @@ export interface RestoreCategory {
   leftAlone: number;
 }
 
+/**
+ * The kinds of thing in a backup that can run programs, send messages, point OAIY at another
+ * server or change what OAIY and the Agent may do. Each is brought back only when it is ticked.
+ */
+export type RestoreClassId = 'settings' | 'templates' | 'flows' | 'providers' | 'connections' | 'plugins' | 'agentSettings';
+
+/** One such kind, and how many items of it the backup holds. */
+export interface RestoreClass {
+  id: RestoreClassId;
+  label: string;
+  description: string;
+  count: number;
+}
+
+/** One item of such a kind, by its name in the backup, and what it does. */
+export interface ReviewItem {
+  class: RestoreClassId;
+  name: string;
+  title: string;
+  what: string;
+}
+
 /** The dry run of a restore: what is in the file and what would change. Nothing has changed yet. */
 export interface RestorePreview {
   inspectId: string;
@@ -1409,6 +1431,19 @@ export interface RestorePreview {
   redo: string[];
   totalFiles: number;
   totalBytes: number;
+  /** The kinds of item that can run or reconfigure things: each needs its own tick. */
+  classes: RestoreClass[];
+  /** Every item of those kinds, by name. */
+  items: ReviewItem[];
+  /** Whether the file holds API keys (the person decides at restore time whether they come back). */
+  keys: { inBackup: boolean };
+  notes: string[];
+}
+
+/** What the person ticked when they prepared a restore. */
+export interface RestoreTicks {
+  classes: RestoreClassId[];
+  keys: boolean;
 }
 
 /** A restore (or an undo) made ready; it is applied at the next start. */
@@ -1419,6 +1454,8 @@ export interface StagedRestore {
   bytes: number;
   agentStorage: boolean;
   redo: string[];
+  /** Plain lines: what was left out, stripped or skipped. */
+  skipped: string[];
 }
 
 export type BackupPhase = 'collecting' | 'agent' | 'packing' | 'encrypting' | 'verifying';
@@ -1427,15 +1464,20 @@ export interface BackupStatus {
   lastBackupAt: string | null;
   lastBackupOk: boolean | null;
   lastBackupSize: number | null;
-  /** A restore that waits for the next start. */
+  /** A restore that waits for the next start (and is discarded, unapplied, after `expiresAt`). */
   pendingRestore: null | {
     id: string;
     kind: 'restore' | 'undo';
     stagedAt: string;
+    expiresAt: string;
+    /** It has waited more than a day: the next start discards it unapplied, and restarting for it is pointless. */
+    expired: boolean;
     files: number;
     agentStorage: boolean;
+    /** The kinds of item the person ticked (ids), for a restore. */
+    classes: string[];
   };
-  /** How the last restore (or undo) went, reported at the start that applied it. */
+  /** How the last restore (or undo) went, reported at the start that applied it (or refused to). */
   lastRestore: null | {
     id: string;
     kind: 'restore' | 'undo';
@@ -1443,9 +1485,12 @@ export interface BackupStatus {
     ok: boolean;
     error?: string;
     redo: string[];
+    notes: string[];
     agentStorage: 'applied' | 'pending' | 'failed' | 'none';
   };
   undoAvailable: boolean;
+  /** Whether the snapshot an undo would use came from a restore or from an undo (then it is a redo). */
+  undoKind: 'restore' | 'undo' | null;
   /** A backup being made right now. */
   running: null | { phase: BackupPhase; label: string };
 }
@@ -1462,9 +1507,12 @@ export const backup = {
   /** Choose a backup and check it (nothing changes); `null` when the person closed the dialog. */
   inspectRestore: (passphrase: string) =>
     tauriInvoke<RestorePreview | null>('backup_restore_inspect', { passphrase }),
-  /** Make the checked restore ready: it is applied at the next start. */
-  stageRestore: (inspectId: string, passphrase: string) =>
-    tauriInvoke<StagedRestore>('backup_restore_stage', { inspectId, passphrase }),
+  /**
+   * Make the checked restore ready: it is applied at the next start. Only the kinds of item
+   * ticked (and, with `keys`, the API keys in the backup) are brought back besides the data.
+   */
+  stageRestore: (inspectId: string, passphrase: string, ticks: RestoreTicks) =>
+    tauriInvoke<StagedRestore>('backup_restore_stage', { inspectId, passphrase, classes: ticks.classes, keys: ticks.keys }),
   /** Make "undo the last restore" ready the same way. */
   undo: () => tauriInvoke<StagedRestore>('backup_undo_stage'),
   /** Cancel a restore that waits for the next start. */

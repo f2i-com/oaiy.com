@@ -7,6 +7,7 @@ import {
   openInExplorer,
   type BackupCreateResult,
   type BackupStatus,
+  type RestoreClassId,
   type RestorePreview,
   type StagedRestore,
 } from './api';
@@ -30,7 +31,50 @@ export const NUDGE_AFTER_DAYS = 30;
 
 const DAY_MS = 24 * 60 * 60 * 1000;
 
+/** How long the panel waits for the check or the preparing of a restore before it stops waiting. */
+export const RESTORE_TIMEOUT_MS = 20 * 60 * 1000;
+
 const message = (e: unknown): string => (e instanceof Error ? e.message : String(e));
+
+/** Stops waiting for `pending` after `ms`, so a command that never answers cannot leave the panel stuck. */
+function withTimeout<T>(pending: Promise<T>, ms: number, why: string): Promise<T> {
+  return new Promise<T>((resolve, reject) => {
+    const timer = setTimeout(() => reject(new Error(why)), ms);
+    pending.then(
+      (value) => {
+        clearTimeout(timer);
+        resolve(value);
+      },
+      (error) => {
+        clearTimeout(timer);
+        reject(error);
+      },
+    );
+  });
+}
+
+/** How long ago something was, as a person says it. */
+export function agoWords(iso: string, now: Date | number = new Date()): string {
+  const then = Date.parse(iso);
+  if (!Number.isFinite(then)) return 'a while ago';
+  const minutes = Math.max(0, Math.floor((new Date(now).getTime() - then) / 60_000));
+  if (minutes < 1) return 'just now';
+  if (minutes < 60) return `${minutes} minute${minutes === 1 ? '' : 's'} ago`;
+  const hours = Math.floor(minutes / 60);
+  if (hours < 48) return `${hours} hour${hours === 1 ? '' : 's'} ago`;
+  return `${Math.floor(hours / 24)} days ago`;
+}
+
+/** The kinds of item a restore can bring back on request, by the words the person reads. */
+const CLASS_LABELS: Record<string, string> = {
+  settings: 'Settings that decide what OAIY may do',
+  templates: 'Service templates and what starts with OAIY',
+  flows: 'Flows, triggers and runs',
+  providers: 'AI providers',
+  connections: 'Connections',
+  plugins: 'Plugin data',
+  agentSettings: 'The Agent’s settings',
+};
 
 /** The number of characters as a person counts them (an emoji is one, not two). */
 const length = (text: string): number => Array.from(text).length;
@@ -160,6 +204,26 @@ function Sentences({ items }: { items: string[] }) {
   );
 }
 
+/**
+ * What an undo really does, said before it is done. The snapshot it uses is the last restore's (or,
+ * for a redo, the last undo's): it puts files back AND takes away the ones that restore added, and
+ * whatever the person changed in them since goes with them, though it is saved first.
+ */
+export function undoConfirmText(kind: 'restore' | 'undo' | null): string {
+  if (kind === 'undo') {
+    return (
+      'Redo? This puts back what the last undo took away, and replaces the files the undo put back, ' +
+      'including anything you changed in them since. What it replaces is saved first, so you can undo it again. ' +
+      'It happens when you restart OAIY.'
+    );
+  }
+  return (
+    'Undo the last restore? This puts back the files the last restore replaced and REMOVES the files it added, ' +
+    'including anything you changed or added in them since. What it replaces or removes is saved first, so you can put it back with Redo. ' +
+    'It happens when you restart OAIY.'
+  );
+}
+
 const AGENT_STATE_WORDS: Record<string, string> = {
   applied: 'The Agent’s conversations and projects were restored.',
   pending: 'The Agent’s conversations and projects are restored when the Agent opens.',
@@ -168,9 +232,22 @@ const AGENT_STATE_WORDS: Record<string, string> = {
 
 type PendingRestore = NonNullable<BackupStatus['pendingRestore']>;
 
-/** A restore or undo the desktop has just made ready, as the pending banner reads it. */
-function stagedNow(staged: StagedRestore): PendingRestore {
-  return { id: staged.id, kind: staged.kind, stagedAt: new Date().toISOString(), files: staged.files, agentStorage: staged.agentStorage };
+/**
+ * A restore or undo the desktop has just made ready, as the pending banner reads it (until the
+ * desktop's own status says it). A prepared restore is thrown away after a day.
+ */
+function stagedNow(staged: StagedRestore, classes: string[] = []): PendingRestore {
+  const now = Date.now();
+  return {
+    id: staged.id,
+    kind: staged.kind,
+    stagedAt: new Date(now).toISOString(),
+    expiresAt: new Date(now + DAY_MS).toISOString(),
+    expired: false,
+    files: staged.files,
+    agentStorage: staged.agentStorage,
+    classes,
+  };
 }
 
 const EMPTY_STATUS: BackupStatus = {
@@ -180,6 +257,7 @@ const EMPTY_STATUS: BackupStatus = {
   pendingRestore: null,
   lastRestore: null,
   undoAvailable: false,
+  undoKind: null,
   running: null,
 };
 
@@ -200,6 +278,11 @@ export function BackupSection() {
   const [preview, setPreview] = useState<RestorePreview | null>(null);
   const [staging, setStaging] = useState(false);
   const [restoreError, setRestoreError] = useState<string | null>(null);
+  // What the person ticked to bring back besides the data. Nothing is ticked until they tick it.
+  const [ticked, setTicked] = useState<RestoreClassId[]>([]);
+  const [keysTicked, setKeysTicked] = useState(false);
+  // What the desktop left out of the restore it has just prepared.
+  const [skipped, setSkipped] = useState<string[]>([]);
 
   // ----- what waits for a restart -----
   const [restartError, setRestartError] = useState<string | null>(null);
@@ -269,8 +352,11 @@ export function BackupSection() {
     setChecking(true);
     setRestoreError(null);
     setPreview(null);
+    setTicked([]);
+    setKeysTicked(false);
+    setSkipped([]);
     try {
-      const found = await backup.inspectRestore(restorePass);
+      const found = await withTimeout(backup.inspectRestore(restorePass), RESTORE_TIMEOUT_MS, 'That took too long: the check was stopped, try again.');
       if (mounted.current) {
         setPreview(found);
         // Nothing chosen: the passphrase is not kept for a file that was never opened.
@@ -290,14 +376,33 @@ export function BackupSection() {
     if (!preview || staging) return;
     const pass = restorePass;
     const id = preview.inspectId;
+    // Only what is ticked, and in the order the desktop listed the kinds.
+    const classes = preview.classes.filter((c) => ticked.includes(c.id)).map((c) => c.id);
+    const keys = keysTicked && preview.keys.inBackup;
     setStaging(true);
     setRestoreError(null);
     let staged: PendingRestore | undefined;
     try {
-      staged = stagedNow(await backup.stageRestore(id, pass));
-      if (mounted.current) setPreview(null);
+      const made = await withTimeout(
+        backup.stageRestore(id, pass, { classes, keys }),
+        RESTORE_TIMEOUT_MS,
+        'That took too long: the restore was not prepared, try again.',
+      );
+      staged = stagedNow(made, classes);
+      if (mounted.current) {
+        setPreview(null);
+        setTicked([]);
+        setKeysTicked(false);
+        setSkipped(made.skipped ?? []);
+      }
     } catch (e) {
-      if (mounted.current) setRestoreError(message(e));
+      if (mounted.current) {
+        // The passphrase is gone with the command, so the summary goes too: check the file again to retry.
+        setRestoreError(message(e));
+        setPreview(null);
+        setTicked([]);
+        setKeysTicked(false);
+      }
     } finally {
       if (mounted.current) {
         setRestorePass('');
@@ -311,7 +416,15 @@ export function BackupSection() {
     setPreview(null);
     setRestorePass('');
     setRestoreError(null);
+    setTicked([]);
+    setKeysTicked(false);
   };
+
+  const toggleClass = (id: RestoreClassId) =>
+    setTicked((now) => (now.includes(id) ? now.filter((x) => x !== id) : [...now, id]));
+
+  /** An explicit click: tick every kind listed. It does not tick the keys. */
+  const selectAll = () => setTicked((preview?.classes ?? []).filter((c) => c.count > 0).map((c) => c.id));
 
   const restart = async () => {
     setRestarting(true);
@@ -330,7 +443,10 @@ export function BackupSection() {
     setRestartError(null);
     try {
       await backup.discardPending();
-      if (mounted.current) setStatus((s) => (s ? { ...s, pendingRestore: null } : s));
+      if (mounted.current) {
+        setStatus((s) => (s ? { ...s, pendingRestore: null } : s));
+        setSkipped([]);
+      }
     } catch (e) {
       if (mounted.current) setRestartError(message(e));
     } finally {
@@ -340,12 +456,14 @@ export function BackupSection() {
   };
 
   const undo = async () => {
-    if (!confirm('Undo the last restore? OAIY puts back the files it replaced, when you restart.')) return;
+    if (!confirm(undoConfirmText(status?.undoKind ?? null))) return;
     setPendingBusy(true);
     setUndoError(null);
     let staged: PendingRestore | undefined;
     try {
-      staged = stagedNow(await backup.undo());
+      const made = await backup.undo();
+      staged = stagedNow(made);
+      if (mounted.current) setSkipped(made.skipped ?? []);
     } catch (e) {
       if (mounted.current) setUndoError(message(e));
     } finally {
@@ -363,15 +481,16 @@ export function BackupSection() {
       <h3 className="section-title">Backup and restore</h3>
       <p className="form-hint">
         A backup is one encrypted file with your contacts, calendar, conversations, flows, triggers, settings and
-        plugin data. Keep it somewhere safe, and use it on this computer or a new one to get everything back.
+        plugin data. Plugin data is backed up plugin by plugin, with PINs, keys and sealed values left out. Keep the
+        file somewhere safe, and use it on this computer or a new one to get your data back.
       </p>
       <div className="banner banner-pending" role="note">
         <strong>If you lose the passphrase, the backup is lost.</strong> Nobody, including OAIY, can open it without
         it and nobody can reset it. The passphrase is not stored anywhere.
       </div>
       <p className="form-hint">
-        Sign-ins and keys are never in a backup unless you choose to add your API provider keys below: the FormLogic
-        link, the phone pairing, the ChatGPT sign-in and the Hugging Face token are set up again after a restore.
+        The FormLogic link, the phone pairing, the ChatGPT sign-in and the Hugging Face token are never in a backup:
+        you set them up again after a restore. Your API provider keys are added only if you tick the box below, and even then they come back only if you tick them again when you restore.
       </p>
 
       {/* ---------- a restore waits for a restart ---------- */}
@@ -382,6 +501,30 @@ export function BackupSection() {
               ? `An undo is ready (${pending.files} file${pending.files === 1 ? '' : 's'}). Restart OAIY to finish undoing the last restore.`
               : `A restore is ready (${pending.files} file${pending.files === 1 ? '' : 's'}). Restart OAIY to finish restoring.`}
           </p>
+          {pending.expired ? (
+            <p role="alert" style={{ margin: '6px 0 0' }}>
+              Prepared {agoWords(pending.stagedAt)}: that is more than a day, so it will be discarded, not applied, at the
+              next start. Cancel it and prepare it again if you still want it.
+            </p>
+          ) : (
+            <p style={{ margin: '6px 0 0' }}>
+              Prepared {agoWords(pending.stagedAt)}; it is discarded, not applied, at the next start after{' '}
+              {formatTimestamp(pending.expiresAt)}.
+            </p>
+          )}
+          {pending.kind !== 'undo' && (
+            <p style={{ margin: '6px 0 0' }}>
+              {(pending.classes ?? []).length > 0
+                ? `You ticked: ${(pending.classes ?? []).map((id) => CLASS_LABELS[id] ?? id).join(', ')}.`
+                : 'Only your data is brought back: nothing that can run or change settings was ticked.'}
+            </p>
+          )}
+          {skipped.length > 0 && (
+            <div style={{ margin: '6px 0 0' }}>
+              Left out of it:
+              <Sentences items={skipped} />
+            </div>
+          )}
           {pending.agentStorage && (
             <p style={{ margin: '6px 0 0' }}>
               Your Agent’s conversations and projects are put back when the Agent opens after the restart.
@@ -393,7 +536,7 @@ export function BackupSection() {
             </p>
           )}
           <div className="form-actions" style={{ marginTop: 8 }}>
-            <button className="btn btn-primary" disabled={restarting || pendingBusy} onClick={() => void restart()}>
+            <button className="btn btn-primary" disabled={restarting || pendingBusy || pending.expired} onClick={() => void restart()}>
               {pending.kind === 'undo' ? 'Restart to finish the undo' : 'Restart to finish restoring'}
             </button>
             <button className="btn btn-ghost" disabled={restarting || pendingBusy} onClick={() => void discard()}>
@@ -404,19 +547,27 @@ export function BackupSection() {
       )}
 
       {/* ---------- how the last restore went ---------- */}
+      {/* The reason is the desktop's own words: it says whether everything was put back, or which files were not. */}
       {last && !last.ok && (
         <div className="banner banner-err" role="alert">
           {last.kind === 'undo'
-            ? `The undo did not finish and your files were put back as they were: ${last.error ?? 'no reason was given'}`
-            : `The restore did not finish and your files were put back: ${last.error ?? 'no reason was given'}`}
+            ? `The undo did not finish (${formatTimestamp(last.at)}). ${last.error ?? 'No reason was given.'}`
+            : `The restore did not finish (${formatTimestamp(last.at)}). ${last.error ?? 'No reason was given.'}`}
+          {(last.notes ?? []).length > 0 && <Sentences items={last.notes} />}
         </div>
       )}
       {last && last.ok && (
         <div className="datadir-note" role="status">
           {last.kind === 'undo'
-            ? `The last restore was undone on ${formatTimestamp(last.at)}.`
+            ? `The undo was applied on ${formatTimestamp(last.at)}.`
             : `Restored on ${formatTimestamp(last.at)}.`}
           {AGENT_STATE_WORDS[last.agentStorage] && <div>{AGENT_STATE_WORDS[last.agentStorage]}</div>}
+          {(last.notes ?? []).length > 0 && (
+            <div>
+              Left out or changed:
+              <Sentences items={last.notes} />
+            </div>
+          )}
           {last.redo.length > 0 && (
             <div>
               You still need to:
@@ -433,7 +584,7 @@ export function BackupSection() {
       {status?.undoAvailable && !pending && (
         <div className="form-actions">
           <button className="btn btn-secondary" disabled={pendingBusy} onClick={() => void undo()}>
-            Undo the last restore
+            {status.undoKind === 'undo' ? 'Redo: put back what the last undo took away' : 'Undo the last restore'}
           </button>
         </div>
       )}
@@ -482,10 +633,14 @@ export function BackupSection() {
           />
           <span>Include my API provider keys</span>
         </label>
+        <p className="form-hint">
+          Off unless you tick it. It adds the keys OAIY’s own AI gateway holds and, from the Agent, the keys of its
+          own providers.
+        </p>
         {includeKeys && (
           <p className="form-hint">
             The backup is then as sensitive as the keys themselves: anyone who has the file and the passphrase can
-            use them.
+            use them. When you restore, they come back only if you tick them again.
           </p>
         )}
         <div className="form-actions">
@@ -615,6 +770,89 @@ export function BackupSection() {
               <Sentences items={preview.redo} />
             </div>
           )}
+          {preview.notes.length > 0 && (
+            <div style={{ marginTop: 8 }}>
+              <strong>Notes:</strong>
+              <Sentences items={preview.notes} />
+            </div>
+          )}
+
+          {/* What can run or reconfigure things: every item by name, each kind brought back only if ticked. */}
+          <div className="banner banner-pending" role="group" aria-label="What can run or change settings" style={{ marginTop: 12 }}>
+            <strong>What can run or change settings</strong>
+            <p style={{ margin: '6px 0 0' }}>
+              These can run programs, send messages, point OAIY at other servers, or change what OAIY and the Agent are
+              allowed to do. Nothing here is brought back unless you tick it, so tick only what you recognise as yours.
+              A backup someone else made can hold things you do not want.
+            </p>
+            {preview.classes
+              .filter((c) => c.count > 0)
+              .map((c) => {
+                const items = preview.items.filter((i) => i.class === c.id);
+                return (
+                  <div key={c.id} style={{ marginTop: 10 }}>
+                    <label className="form-row form-row-inline">
+                      <input
+                        type="checkbox"
+                        aria-label={`Bring back: ${c.label}`}
+                        checked={ticked.includes(c.id)}
+                        onChange={() => toggleClass(c.id)}
+                        disabled={staging}
+                      />
+                      <span>
+                        <strong>{c.label}</strong> ({c.count})
+                      </span>
+                    </label>
+                    <p className="form-hint" style={{ margin: '2px 0 0 24px' }}>
+                      {c.description}
+                    </p>
+                    {items.length > 0 && (
+                      <details open style={{ margin: '4px 0 0 24px' }}>
+                        <summary>
+                          The {items.length} item{items.length === 1 ? '' : 's'}
+                        </summary>
+                        <ul style={{ margin: '4px 0 0', paddingLeft: 18, maxHeight: 220, overflowY: 'auto' }}>
+                          {items.map((i, n) => (
+                            <li key={`${i.name}-${n}`}>
+                              <code className="path-code">{i.name}</code> — {i.title}: {i.what}
+                            </li>
+                          ))}
+                        </ul>
+                      </details>
+                    )}
+                  </div>
+                );
+              })}
+            {preview.classes.every((c) => c.count === 0) && <p style={{ margin: '6px 0 0' }}>This backup holds nothing of that kind.</p>}
+            <div className="form-actions" style={{ marginTop: 10 }}>
+              <button className="btn btn-secondary" disabled={staging} onClick={selectAll}>
+                Select all of my own backup
+              </button>
+            </div>
+            {ticked.length === 0 && (
+              <p style={{ margin: '6px 0 0' }}>
+                Nothing is ticked, so only your data comes back: contacts, calendar, conversations, voices and history.
+              </p>
+            )}
+            {preview.keys.inBackup && (
+              <div style={{ marginTop: 10 }}>
+                <label className="form-row form-row-inline">
+                  <input
+                    type="checkbox"
+                    aria-label="Bring back the API keys that are in this backup"
+                    checked={keysTicked}
+                    onChange={(e) => setKeysTicked(e.target.checked)}
+                    disabled={staging}
+                  />
+                  <span>Bring back the API keys that are in this backup</span>
+                </label>
+                <p className="form-hint" style={{ margin: '2px 0 0 24px' }}>
+                  The keys come back only when this is ticked, and only for the provider lists you tick above (OAIY’s AI
+                  providers and the Agent’s settings). Otherwise those come back without keys.
+                </p>
+              </div>
+            )}
+          </div>
           <div className="form-actions" style={{ marginTop: 10 }}>
             <button className="btn btn-primary" disabled={staging} onClick={() => void stage()}>
               Prepare restore

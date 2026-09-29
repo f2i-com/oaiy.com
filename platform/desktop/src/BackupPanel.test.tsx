@@ -35,8 +35,8 @@ vi.mock('./api', () => ({
   openInExplorer: (...a: unknown[]) => h.open(...a),
 }));
 
-import { BackupSection } from './BackupPanel';
-import type { BackupCreateResult, BackupStatus, RestorePreview } from './api';
+import { BackupSection, RESTORE_TIMEOUT_MS, agoWords, undoConfirmText } from './BackupPanel';
+import type { BackupCreateResult, BackupStatus, RestoreClass, RestorePreview, ReviewItem, StagedRestore } from './api';
 
 const PASS = 'correct horse battery';
 const PASS2 = 'another long passphrase';
@@ -48,9 +48,25 @@ const status = (over: Partial<BackupStatus> = {}): BackupStatus => ({
   pendingRestore: null,
   lastRestore: null,
   undoAvailable: false,
+  undoKind: null,
   running: null,
   ...over,
 });
+
+/** A prepared restore, as the status reports it. */
+const pendingOf = (over: Partial<NonNullable<BackupStatus['pendingRestore']>> = {}): NonNullable<BackupStatus['pendingRestore']> => ({
+  id: 'r1',
+  kind: 'restore',
+  stagedAt: '2026-09-30T00:00:00Z',
+  expiresAt: '2026-10-01T00:00:00Z',
+  expired: false,
+  files: 5,
+  agentStorage: false,
+  classes: [],
+  ...over,
+});
+
+const staged = (over: Partial<StagedRestore> = {}): StagedRestore => ({ id: 'r1', kind: 'restore', files: 5, bytes: 100, agentStorage: false, redo: [], skipped: [], ...over });
 
 const created = (over: Partial<BackupCreateResult> = {}): BackupCreateResult => ({
   path: 'C:\\Backups\\oaiy-2026-09-30.oaiybackup',
@@ -82,8 +98,26 @@ const preview = (over: Partial<RestorePreview> = {}): RestorePreview => ({
   redo: ['Link FormLogic again', 'Pair your phone again'],
   totalFiles: 14,
   totalBytes: 2048,
+  classes: [],
+  items: [],
+  keys: { inBackup: false },
+  notes: [],
   ...over,
 });
+
+const CLASSES: RestoreClass[] = [
+  { id: 'templates', label: 'Service templates', description: 'Each one can run a program on this computer.', count: 2 },
+  { id: 'flows', label: 'Flows and triggers', description: 'They can send messages and call your AI providers.', count: 1 },
+  { id: 'providers', label: 'AI providers', description: 'Where OAIY sends your prompts.', count: 1 },
+];
+const ITEMS: ReviewItem[] = [
+  { class: 'templates', name: 'templates/evil.json', title: 'Evil helper', what: 'Runs: cmd.exe /c calc.exe' },
+  { class: 'templates', name: 'templates/oaiy-voice.json', title: 'OAIY Voice', what: 'Runs: oaiy-voice --port 8090' },
+  { class: 'flows', name: 'flows/greeting.json', title: 'Greeting', what: 'A flow with 4 steps' },
+  { class: 'providers', name: 'ai/providers.json#openai', title: 'openai', what: 'https://attacker.example/v1, has a key' },
+];
+/** A backup that holds things that can run. */
+const risky = (over: Partial<RestorePreview> = {}): RestorePreview => preview({ classes: CLASSES, items: ITEMS, keys: { inBackup: true }, ...over });
 
 let host: HTMLDivElement;
 let root: Root;
@@ -141,8 +175,8 @@ beforeEach(() => {
   h.status.mockResolvedValue(status());
   h.create.mockResolvedValue(created());
   h.inspect.mockResolvedValue(preview());
-  h.stage.mockResolvedValue({ id: 'r1', kind: 'restore', files: 5, bytes: 100, agentStorage: false, redo: [] });
-  h.undo.mockResolvedValue({ id: 'u1', kind: 'undo', files: 5, bytes: 100, agentStorage: false, redo: [] });
+  h.stage.mockResolvedValue(staged());
+  h.undo.mockResolvedValue(staged({ id: 'u1', kind: 'undo' }));
   h.discard.mockResolvedValue(undefined);
   h.restart.mockResolvedValue(undefined);
   h.open.mockResolvedValue(undefined);
@@ -154,6 +188,7 @@ beforeEach(() => {
 });
 
 afterEach(() => {
+  vi.useRealTimers();
   act(() => root.unmount());
   host.remove();
   vi.restoreAllMocks();
@@ -168,6 +203,8 @@ describe('the words a person reads first', () => {
     expect(text()).toContain('Nobody, including OAIY, can open it');
     expect(text()).toContain('FormLogic');
     expect(text()).toContain('Hugging Face');
+    expect(text()).toContain('are never in a backup');
+    expect(text()).toContain('with PINs, keys and sealed values left out');
   });
 });
 
@@ -221,6 +258,8 @@ describe('making a backup', () => {
     expect(text()).toContain('Include my API provider keys');
     await act(async () => checkbox().click());
     expect(text()).toContain('as sensitive as the keys themselves');
+    expect(text()).toContain('When you restore, they come back only if you tick them again');
+    expect(text()).toContain('the keys OAIY’s own AI gateway holds');
     await click(buttonWith('Create backup'));
     expect(h.create).toHaveBeenCalledWith(PASS, true);
   });
@@ -383,11 +422,11 @@ describe('restoring: the restart', () => {
   it('stages with the same passphrase, clears it, and then asks for the restart', async () => {
     const s = spies();
     h.status.mockResolvedValueOnce(status()).mockResolvedValue(
-      status({ pendingRestore: { id: 'r1', kind: 'restore', stagedAt: '2026-09-30T00:00:00Z', files: 5, agentStorage: false } }),
+      status({ pendingRestore: pendingOf() }),
     );
     await mount();
     await prepare();
-    expect(h.stage).toHaveBeenCalledWith('insp-1', PASS);
+    expect(h.stage).toHaveBeenCalledWith('insp-1', PASS, { classes: [], keys: false });
     expect(input('Passphrase of the backup to restore').value).toBe('');
     expect(host.innerHTML).not.toContain(PASS);
     expect(JSON.stringify({ ...localStorage })).not.toContain(PASS);
@@ -407,7 +446,7 @@ describe('restoring: the restart', () => {
   });
 
   it('shows why a restart was refused, and keeps the button', async () => {
-    h.status.mockResolvedValue(status({ pendingRestore: { id: 'r1', kind: 'restore', stagedAt: '2026-09-30T00:00:00Z', files: 2, agentStorage: true } }));
+    h.status.mockResolvedValue(status({ pendingRestore: pendingOf({ files: 2, agentStorage: true }) }));
     h.restart.mockRejectedValue('OAIY is busy: a call is in progress. Try again when it has finished.');
     await mount();
     expect(text()).toContain('A restore is ready (2 files)');
@@ -420,7 +459,7 @@ describe('restoring: the restart', () => {
   });
 
   it('cancels a restore that waits', async () => {
-    h.status.mockResolvedValueOnce(status({ pendingRestore: { id: 'r1', kind: 'restore', stagedAt: '2026-09-30T00:00:00Z', files: 2, agentStorage: false } })).mockResolvedValue(status());
+    h.status.mockResolvedValueOnce(status({ pendingRestore: pendingOf({ files: 2 }) })).mockResolvedValue(status());
     await mount();
     expect(text()).toContain('A restore is ready');
     await click(buttonWith('Cancel restore'));
@@ -429,7 +468,7 @@ describe('restoring: the restart', () => {
   });
 
   it('says undo, not restore, for a staged undo', async () => {
-    h.status.mockResolvedValue(status({ pendingRestore: { id: 'u1', kind: 'undo', stagedAt: '2026-09-30T00:00:00Z', files: 3, agentStorage: false } }));
+    h.status.mockResolvedValue(status({ pendingRestore: pendingOf({ id: 'u1', kind: 'undo', files: 3 }) }));
     await mount();
     expect(text()).toContain('An undo is ready (3 files). Restart OAIY to finish undoing the last restore.');
     expect(buttonWith('Restart to finish the undo')).toBeDefined();
@@ -440,7 +479,7 @@ describe('restoring: the restart', () => {
 describe('after the restart', () => {
   it('reports a restore that finished, what to do again and the Agent’s part', async () => {
     h.status.mockResolvedValue(
-      status({ lastRestore: { id: 'r1', kind: 'restore', at: '2026-09-30T01:00:00Z', ok: true, redo: ['Link FormLogic again'], agentStorage: 'pending' } }),
+      status({ lastRestore: { id: 'r1', kind: 'restore', at: '2026-09-30T01:00:00Z', ok: true, redo: ['Link FormLogic again'], notes: [], agentStorage: 'pending' } }),
     );
     await mount();
     expect(text()).toContain('Restored on [2026-09-30T01:00:00Z].');
@@ -451,11 +490,14 @@ describe('after the restart', () => {
 
   it('reports a restore that did not finish, as an error, with its reason', async () => {
     h.status.mockResolvedValue(
-      status({ lastRestore: { id: 'r1', kind: 'restore', at: '2026-09-30T01:00:00Z', ok: false, error: 'contacts: access denied', redo: [], agentStorage: 'none' } }),
+      status({ lastRestore: { id: 'r1', kind: 'restore', at: '2026-09-30T01:00:00Z', ok: false, error: 'contacts: access denied', redo: [], notes: [], agentStorage: 'none' } }),
     );
     await mount();
     const banner = host.querySelector('.banner-err');
-    expect(banner?.textContent).toContain('The restore did not finish and your files were put back: contacts: access denied');
+    expect(banner?.textContent).toContain('The restore did not finish');
+    expect(banner?.textContent).toContain('contacts: access denied');
+    // The reason is the desktop's own: the panel does not claim the files were put back.
+    expect(banner?.textContent).not.toContain('were put back');
     expect(text()).not.toContain('Restored on');
   });
 });
@@ -473,7 +515,7 @@ describe('undo', () => {
 
   it('stages the undo once confirmed, then waits for the restart like a restore', async () => {
     h.status.mockResolvedValueOnce(status({ undoAvailable: true })).mockResolvedValue(
-      status({ undoAvailable: true, pendingRestore: { id: 'u1', kind: 'undo', stagedAt: '2026-09-30T00:00:00Z', files: 5, agentStorage: false } }),
+      status({ undoAvailable: true, undoKind: 'restore', pendingRestore: pendingOf({ id: 'u1', kind: 'undo' }) }),
     );
     vi.stubGlobal('confirm', () => true);
     await mount();
@@ -495,5 +537,329 @@ describe('undo', () => {
     await mount();
     await click(buttonWith('Undo the last restore'));
     expect(host.querySelector('.banner-err')?.textContent).toContain('There is no restore to undo.');
+  });
+});
+
+// ---------------------------------------------------------------------------------------------
+// A hostile backup restored by mistake: what can run or reconfigure things is listed by name and
+// brought back only when it is ticked.
+// ---------------------------------------------------------------------------------------------
+
+describe('restoring: what can run or change settings needs a tick', () => {
+  const classBox = (label: string) => host.querySelector<HTMLInputElement>(`input[aria-label="Bring back: ${label}"]`)!;
+  const keysBox = () => host.querySelector<HTMLInputElement>('input[aria-label="Bring back the API keys that are in this backup"]');
+
+  async function check(over: Partial<RestorePreview> = {}) {
+    h.inspect.mockResolvedValue(risky(over));
+    await mount();
+    await act(async () => setValue(input('Passphrase of the backup to restore'), PASS));
+    await click(buttonWith('Choose backup file and check it'));
+  }
+
+  it('lists every kind and every item by name, with what it does, before anything is ticked', async () => {
+    await check();
+    const group = host.querySelector('[aria-label="What can run or change settings"]')!;
+    expect(group).not.toBeNull();
+    expect(group.textContent).toContain('can run programs, send messages, point OAIY at other servers');
+    expect(group.textContent).toContain('tick only what you recognise as yours');
+    for (const c of CLASSES) {
+      expect(group.textContent).toContain(c.label);
+      expect(group.textContent).toContain(c.description);
+    }
+    for (const i of ITEMS) {
+      expect(group.textContent).toContain(i.name);
+      expect(group.textContent).toContain(i.title);
+      expect(group.textContent).toContain(i.what);
+    }
+    // The reviewer's case: the template that would run cmd.exe is shown with its command.
+    expect(group.textContent).toContain('templates/evil.json');
+    expect(group.textContent).toContain('cmd.exe /c calc.exe');
+    expect(group.textContent).toContain('https://attacker.example/v1');
+  });
+
+  it('shows all of a long list, never a silent part of it', async () => {
+    const many: ReviewItem[] = Array.from({ length: 75 }, (_, n) => ({ class: 'flows', name: `flows/flow-${n}.json`, title: `Flow ${n}`, what: 'A flow' }));
+    await check({ classes: [{ id: 'flows', label: 'Flows and triggers', description: 'They can send messages.', count: 75 }], items: many });
+    for (let n = 0; n < 75; n++) expect(text()).toContain(`flows/flow-${n}.json`);
+    expect(text()).toContain('The 75 items');
+  });
+
+  it('starts with nothing ticked, and says only the data comes back', async () => {
+    await check();
+    for (const c of CLASSES) expect(classBox(c.label).checked).toBe(false);
+    expect(keysBox()!.checked).toBe(false);
+    expect(text()).toContain('Nothing is ticked, so only your data comes back: contacts, calendar, conversations, voices and history.');
+    await click(buttonWith('Prepare restore'));
+    expect(h.stage).toHaveBeenCalledWith('insp-1', PASS, { classes: [], keys: false });
+  });
+
+  it('skips a kind the backup holds none of', async () => {
+    await check({ classes: [...CLASSES, { id: 'connections', label: 'Connections', description: 'Where OAIY is linked.', count: 0 }] });
+    expect(host.querySelector('input[aria-label="Bring back: Connections"]')).toBeNull();
+  });
+
+  it('ticks a kind on its own click, and only that one', async () => {
+    await check();
+    await act(async () => classBox('Flows and triggers').click());
+    expect(classBox('Flows and triggers').checked).toBe(true);
+    expect(classBox('Service templates').checked).toBe(false);
+    expect(classBox('AI providers').checked).toBe(false);
+    expect(text()).not.toContain('Nothing is ticked');
+    await act(async () => classBox('Flows and triggers').click());
+    expect(classBox('Flows and triggers').checked).toBe(false);
+  });
+
+  it('“Select all of my own backup” is an explicit click that ticks every kind but not the keys', async () => {
+    await check();
+    await click(buttonWith('Select all of my own backup'));
+    for (const c of CLASSES) expect(classBox(c.label).checked).toBe(true);
+    expect(keysBox()!.checked).toBe(false);
+    await click(buttonWith('Prepare restore'));
+    expect(h.stage).toHaveBeenCalledWith('insp-1', PASS, { classes: ['templates', 'flows', 'providers'], keys: false });
+  });
+
+  it('offers the keys only when the file has some, unticked, with the words that they come back only if ticked', async () => {
+    await check({ keys: { inBackup: false } });
+    expect(keysBox()).toBeNull();
+    act(() => root.unmount());
+    root = createRoot(host);
+    await check({ keys: { inBackup: true } });
+    expect(keysBox()).not.toBeNull();
+    expect(keysBox()!.checked).toBe(false);
+    expect(text()).toContain('The keys come back only when this is ticked, and only for the provider lists you tick above');
+  });
+
+  it('carries exactly the ticked kinds, in the desktop’s order, and the keys flag, to the desktop', async () => {
+    await check();
+    await act(async () => classBox('AI providers').click());
+    await act(async () => classBox('Service templates').click());
+    await act(async () => keysBox()!.click());
+    await click(buttonWith('Prepare restore'));
+    expect(h.stage).toHaveBeenCalledTimes(1);
+    expect(h.stage).toHaveBeenCalledWith('insp-1', PASS, { classes: ['templates', 'providers'], keys: true });
+  });
+
+  it('brings no keys when the keys box is left alone, whatever else is ticked', async () => {
+    await check();
+    await click(buttonWith('Select all of my own backup'));
+    await click(buttonWith('Prepare restore'));
+    expect(h.stage.mock.calls[0][2].keys).toBe(false);
+  });
+
+  it('forgets the ticks when the panel is cancelled or another file is checked', async () => {
+    await check();
+    await act(async () => classBox('Flows and triggers').click());
+    await act(async () => keysBox()!.click());
+    await click(buttonExact('Cancel'));
+    await act(async () => setValue(input('Passphrase of the backup to restore'), PASS));
+    await click(buttonWith('Choose backup file and check it'));
+    for (const c of CLASSES) expect(classBox(c.label).checked).toBe(false);
+    expect(keysBox()!.checked).toBe(false);
+  });
+
+  it('clears the passphrase after preparing, and shows what the desktop left out', async () => {
+    h.stage.mockResolvedValue(staged({ skipped: ['Autostart entries without a template were skipped: evil', 'Flows were not ticked, so they were left out.'] }));
+    h.status.mockResolvedValue(status());
+    await check();
+    await act(async () => classBox('Service templates').click());
+    await click(buttonWith('Prepare restore'));
+    expect(input('Passphrase of the backup to restore').value).toBe('');
+    expect(host.innerHTML).not.toContain(PASS);
+    expect(text()).toContain('You ticked: Service templates and what starts with OAIY.');
+    expect(text()).toContain('Autostart entries without a template were skipped: evil');
+    expect(text()).toContain('Flows were not ticked, so they were left out.');
+  });
+
+  it('says plainly that only data comes back when nothing was ticked', async () => {
+    h.status.mockResolvedValue(status());
+    await check();
+    await click(buttonWith('Prepare restore'));
+    expect(text()).toContain('Only your data is brought back: nothing that can run or change settings was ticked.');
+  });
+});
+
+describe('a prepared restore', () => {
+  it('says how long ago it was prepared and when it is thrown away', async () => {
+    const stagedAt = new Date(Date.now() - 3 * 3_600_000).toISOString();
+    h.status.mockResolvedValue(status({ pendingRestore: pendingOf({ stagedAt, expiresAt: '2026-10-01T00:00:00Z', classes: ['flows', 'providers'] }) }));
+    await mount();
+    expect(text()).toContain('Prepared 3 hours ago; it is discarded, not applied, at the next start after [2026-10-01T00:00:00Z].');
+    expect(text()).toContain('You ticked: Flows, triggers and runs, AI providers.');
+  });
+
+  it('says it will not be applied when it has waited more than a day, and does not offer the restart', async () => {
+    const stagedAt = new Date(Date.now() - 30 * 3_600_000).toISOString();
+    h.status.mockResolvedValue(status({ pendingRestore: pendingOf({ stagedAt, expired: true }) }));
+    await mount();
+    expect(text()).toContain('that is more than a day, so it will be discarded, not applied, at the next start.');
+    expect(text()).not.toContain('it is discarded, not applied, at the next start after');
+    expect(buttonWith('Restart to finish restoring')!.disabled).toBe(true);
+    expect(buttonWith('Cancel restore')!.disabled).toBe(false);
+  });
+
+  it('offers the restart while it is still good', async () => {
+    h.status.mockResolvedValue(status({ pendingRestore: pendingOf({ stagedAt: new Date(Date.now() - 3_600_000).toISOString() }) }));
+    await mount();
+    expect(buttonWith('Restart to finish restoring')!.disabled).toBe(false);
+  });
+
+  it('does not list ticks for an undo', async () => {
+    h.status.mockResolvedValue(status({ pendingRestore: pendingOf({ kind: 'undo', id: 'u1' }) }));
+    await mount();
+    expect(text()).toContain('An undo is ready');
+    expect(text()).not.toContain('You ticked');
+    expect(text()).not.toContain('Only your data is brought back');
+  });
+
+  it('words how long ago as a person says it', () => {
+    const now = Date.parse('2026-09-30T12:00:00Z');
+    expect(agoWords('2026-09-30T11:59:40Z', now)).toBe('just now');
+    expect(agoWords('2026-09-30T11:59:00Z', now)).toBe('1 minute ago');
+    expect(agoWords('2026-09-30T11:15:00Z', now)).toBe('45 minutes ago');
+    expect(agoWords('2026-09-30T11:00:00Z', now)).toBe('1 hour ago');
+    expect(agoWords('2026-09-30T09:00:00Z', now)).toBe('3 hours ago');
+    expect(agoWords('2026-09-27T12:00:00Z', now)).toBe('3 days ago');
+    expect(agoWords('not a date', now)).toBe('a while ago');
+  });
+});
+
+describe('what the last restore did, said plainly', () => {
+  it('shows a restore that was thrown away because it waited too long, in the desktop’s words', async () => {
+    const error = 'The restore prepared on 2026-09-28 was not applied because it waited more than 24 hours. Prepare it again.';
+    h.status.mockResolvedValue(status({ lastRestore: { id: 'r1', kind: 'restore', at: '2026-09-30T01:00:00Z', ok: false, error, redo: [], notes: [], agentStorage: 'none' } }));
+    await mount();
+    const banner = host.querySelector('.banner-err')!;
+    expect(banner.textContent).toContain(error);
+    expect(banner.textContent).not.toContain('were put back');
+  });
+
+  it('shows the notes of a restore that finished, and of one that did not', async () => {
+    h.status.mockResolvedValue(
+      status({ lastRestore: { id: 'r1', kind: 'restore', at: '2026-09-30T01:00:00Z', ok: true, redo: [], notes: ['Autostart entries without a template were skipped: evil'], agentStorage: 'none' } }),
+    );
+    await mount();
+    expect(text()).toContain('Left out or changed:');
+    expect(text()).toContain('Autostart entries without a template were skipped: evil');
+    act(() => root.unmount());
+    root = createRoot(host);
+    h.status.mockResolvedValue(
+      status({
+        lastRestore: { id: 'r2', kind: 'undo', at: '2026-09-30T02:00:00Z', ok: false, error: 'These files could not be put back: callers.json. Their originals are in restore/undo-1.', redo: [], notes: ['Kept for you to look at'], agentStorage: 'none' },
+      }),
+    );
+    await mount();
+    expect(host.querySelector('.banner-err')!.textContent).toContain('These files could not be put back: callers.json');
+    expect(host.querySelector('.banner-err')!.textContent).toContain('Kept for you to look at');
+  });
+});
+
+describe('undo and redo say what they really do', () => {
+  it('asks first with the plain words: it removes what the restore added, and what was changed since goes too', async () => {
+    h.status.mockResolvedValue(status({ undoAvailable: true, undoKind: 'restore' }));
+    const asked: string[] = [];
+    vi.stubGlobal('confirm', (m: string) => {
+      asked.push(m);
+      return false;
+    });
+    await mount();
+    await click(buttonWith('Undo the last restore'));
+    expect(asked).toHaveLength(1);
+    expect(asked[0]).toBe(undoConfirmText('restore'));
+    expect(asked[0]).toContain('puts back the files the last restore replaced and REMOVES the files it added');
+    expect(asked[0]).toContain('including anything you changed or added in them since');
+    expect(asked[0]).toContain('saved first');
+    expect(asked[0]).toContain('Redo');
+    expect(h.undo).not.toHaveBeenCalled();
+  });
+
+  it('is a redo after an undo: another label, and words that fit', async () => {
+    h.status.mockResolvedValue(status({ undoAvailable: true, undoKind: 'undo' }));
+    const asked: string[] = [];
+    vi.stubGlobal('confirm', (m: string) => {
+      asked.push(m);
+      return true;
+    });
+    await mount();
+    expect(buttonWith('Undo the last restore')).toBeUndefined();
+    await click(buttonWith('Redo: put back what the last undo took away'));
+    expect(asked[0]).toBe(undoConfirmText('undo'));
+    expect(asked[0]).toContain('puts back what the last undo took away');
+    expect(asked[0]).toContain('including anything you changed in them since');
+    expect(h.undo).toHaveBeenCalledTimes(1);
+  });
+});
+
+describe('the panel is never left stuck', () => {
+  async function typeRestorePass() {
+    await act(async () => setValue(input('Passphrase of the backup to restore'), PASS));
+  }
+
+  it('stops waiting for a check that never answers, says so, and can be used again', async () => {
+    h.inspect.mockReturnValue(new Promise(() => undefined));
+    await mount();
+    await typeRestorePass();
+    vi.useFakeTimers({ toFake: ['setTimeout', 'clearTimeout'] });
+    await act(async () => {
+      buttonWith('Choose backup file and check it')!.dispatchEvent(new MouseEvent('click', { bubbles: true }));
+    });
+    expect(input('Passphrase of the backup to restore').disabled).toBe(true);
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(RESTORE_TIMEOUT_MS + 1000);
+    });
+    vi.useRealTimers();
+    expect(text()).toContain('That took too long: the check was stopped, try again');
+    expect(input('Passphrase of the backup to restore').disabled).toBe(false);
+    expect(input('Passphrase of the backup to restore').value).toBe('');
+    await typeRestorePass();
+    expect(buttonWith('Choose backup file and check it')!.disabled).toBe(false);
+  });
+
+  it('stops waiting for a restore that is never prepared, and drops the summary so it can be started again', async () => {
+    h.inspect.mockResolvedValue(risky());
+    h.stage.mockReturnValue(new Promise(() => undefined));
+    await mount();
+    await typeRestorePass();
+    await click(buttonWith('Choose backup file and check it'));
+    vi.useFakeTimers({ toFake: ['setTimeout', 'clearTimeout'] });
+    await act(async () => {
+      buttonWith('Prepare restore')!.dispatchEvent(new MouseEvent('click', { bubbles: true }));
+    });
+    expect(buttonWith('Prepare restore')!.disabled).toBe(true);
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(RESTORE_TIMEOUT_MS + 1000);
+    });
+    vi.useRealTimers();
+    expect(text()).toContain('That took too long: the restore was not prepared, try again');
+    expect(host.querySelector('[aria-label="What restoring would do"]')).toBeNull();
+    expect(input('Passphrase of the backup to restore').value).toBe('');
+    expect(host.innerHTML).not.toContain(PASS);
+    await typeRestorePass();
+    expect(buttonWith('Choose backup file and check it')!.disabled).toBe(false);
+  });
+
+  it('a check that fails leaves the panel ready for another, with the passphrase gone', async () => {
+    h.inspect.mockRejectedValue('The file is damaged.');
+    await mount();
+    await typeRestorePass();
+    await click(buttonWith('Choose backup file and check it'));
+    expect(text()).toContain('The file is damaged.');
+    expect(input('Passphrase of the backup to restore').disabled).toBe(false);
+    expect(input('Passphrase of the backup to restore').value).toBe('');
+    h.inspect.mockResolvedValue(preview());
+    await typeRestorePass();
+    await click(buttonWith('Choose backup file and check it'));
+    expect(text()).toContain('old.oaiybackup');
+  });
+
+  it('a restore that fails to prepare shows why and drops the summary', async () => {
+    h.inspect.mockResolvedValue(risky());
+    h.stage.mockRejectedValue('There is not enough free space to prepare this restore.');
+    await mount();
+    await typeRestorePass();
+    await click(buttonWith('Choose backup file and check it'));
+    await click(buttonWith('Prepare restore'));
+    expect(host.querySelector('.banner-err')!.textContent).toContain('not enough free space');
+    expect(host.querySelector('[aria-label="What restoring would do"]')).toBeNull();
+    expect(input('Passphrase of the backup to restore').value).toBe('');
   });
 });

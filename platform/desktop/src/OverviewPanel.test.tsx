@@ -380,6 +380,7 @@ const backupStatus = (over: Partial<BackupStatus> = {}): BackupStatus => ({
   pendingRestore: null,
   lastRestore: null,
   undoAvailable: false,
+  undoKind: null,
   running: null,
   ...over,
 });
@@ -421,7 +422,7 @@ describe('describeLastBackup', () => {
 
   it('puts a restore that waits for a restart first', () => {
     const line = describeLastBackup(
-      backupStatus({ lastBackupAt: daysAgo(90), pendingRestore: { id: 'r1', kind: 'restore', stagedAt: daysAgo(0), files: 4, agentStorage: false } }),
+      backupStatus({ lastBackupAt: daysAgo(90), pendingRestore: { id: 'r1', kind: 'restore', stagedAt: daysAgo(0), expiresAt: daysAgo(-1), expired: false, files: 4, agentStorage: false, classes: [] } }),
       NOW,
     );
     expect(line).toEqual({ text: 'A restore is waiting for a restart', nudge: false, kind: 'pending' });
@@ -453,7 +454,7 @@ describe('the Overview line about backups', () => {
 
   it('says a restore waits for a restart', async () => {
     dismissGuide();
-    backupStatusMock.mockResolvedValue(backupStatus({ pendingRestore: { id: 'r1', kind: 'restore', stagedAt: new Date().toISOString(), files: 2, agentStorage: false } }));
+    backupStatusMock.mockResolvedValue(backupStatus({ pendingRestore: { id: 'r1', kind: 'restore', stagedAt: new Date().toISOString(), expiresAt: new Date().toISOString(), expired: false, files: 2, agentStorage: false, classes: [] } }));
     await mount();
     expect(text()).toContain('A restore is waiting for a restart');
     await act(async () => button('Open Settings')!.click());
