@@ -20,5 +20,12 @@ The Rust tests (update/verify.rs, update/target.rs) and the Node tests (platform
 make-latest-json.test.mjs) verify these signatures: what they accept is what an installed OAIY accepts.
 
 To make them again: `npx tauri signer generate -w <a folder outside every repository>`, put the two payloads under
-their bundler names beside it, `npx tauri signer sign -f <the key> -p <its password> <file>` for each, copy the
-payloads and the .sig files here under the names above with the new .pub, and delete the private key.
+their bundler names beside it, put the password in TAURI_SIGNING_PRIVATE_KEY_PASSWORD (not on a command line)
+and `npx tauri signer sign -f <the key> <file>` for each, copy the payloads and the .sig files here under the names above with the new .pub, and delete the private key.
+
+aokie-manifest.json     a COPY of the manifest of the phone plugin OAIY is used with (aokie.com,
+                        crates/aokie-plugin/manifest.json, at cb298dd). update/phone.rs runs it through the
+                        plugin gate to show that the two commands an update asks whether a call is live
+                        (call.switchboard, call.current) are declared and not journalled, so they need no key.
+                        Copy it again when that plugin's commands change.
+aokie-phone-definition.json   the service definition that manifest requires (definitions/phone.json), likewise a copy.

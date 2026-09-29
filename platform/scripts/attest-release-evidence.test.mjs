@@ -45,6 +45,15 @@ console.log('attest-release-evidence');
   ok('a different run cannot re-stamp attested evidence', r.refused && r.unchanged, r.message);
 }
 {
+  // The release job downloads the sign job's signatures into the same folder: files no evidence lists are left alone, and evidence is still attested.
+  const dir = fixture();
+  fs.writeFileSync(path.join(dir, 'oaiy-desktop-0.0.1-windows-x64-setup.exe.sig'), 'a signature made after the builds wrote their evidence');
+  fs.writeFileSync(path.join(dir, 'oaiy-desktop-0.0.1-linux-x86_64.AppImage.sig'), 'another');
+  let attested = false;
+  try { attest(dir, env(), () => {}); attested = read(dir).verification.status === 'verified'; } catch { attested = false; }
+  ok('signatures no evidence lists do not stop the attestation and are left as they are', attested && fs.readFileSync(path.join(dir, 'oaiy-desktop-0.0.1-windows-x64-setup.exe.sig'), 'utf8') === 'a signature made after the builds wrote their evidence');
+}
+{
   const r = refuses(fixture(), env({ VERIFY_RESULT: 'failure' }), /not "success"/);
   ok('failed verification refuses and leaves the file pending', r.refused && r.unchanged, r.message);
 }

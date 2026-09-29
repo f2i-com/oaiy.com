@@ -7,7 +7,7 @@
 //!
 //! What is checked for a call is exactly two things (see [`super::phone`]): the calls on OAIY's own
 //! call route (the realtime stream the phone plugin uses when it hands a call's speech to OAIY), and
-//! what the plugin that provides the phone says when it is asked, by a read-only command, whether a
+//! what every running plugin that provides the phone says when it is asked, by a read-only command, whether a
 //! call is ringing, on the line, waiting or on hold. A running phone plugin that cannot be asked, or
 //! answers something unreadable, blocks too: OAIY does not guess that no call is live.
 //!

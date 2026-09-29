@@ -157,7 +157,7 @@ describe('About and updates', () => {
 
   it('turns Restart to update off while anything is in the way, and names each thing beside it', async () => {
     const blockers = [
-      { code: 'call', message: 'A phone call is in progress. OAIY never restarts during a call.' },
+      { code: 'call', message: "A phone call is in progress on OAIY's own line." },
       { code: 'download', message: '2 models or files are downloading.' },
     ];
     await mount(status({ state: 'ready', latestVersion: '0.2.0', blockers }));
@@ -167,6 +167,19 @@ describe('About and updates', () => {
     expect(Array.from(list!.querySelectorAll('li')).map((li) => li.textContent)).toEqual(blockers.map((b) => b.message));
     await click(restart);
     expect(h.install).not.toHaveBeenCalled();
+  });
+
+  it('names a call the phone plugin reports, a plugin that cannot say and engines that cannot say, each as it is worded', async () => {
+    // The codes the desktop sends besides the first few: a call the plugin knows of (OAIY's own line sees none), and the two "can't tell" reasons.
+    const blockers = [
+      { code: 'phoneCall', message: 'Aokie Phone Bridge reports a phone call (ringing, in progress or on hold).' },
+      { code: 'callUnknown', message: "OAIY can't tell whether a phone call is live: Aokie Phone Bridge did not give an answer (it did not answer within 3 s). It does not restart while it can't tell; stopping that plugin (Connections, Plugins) lets it." },
+      { code: 'enginesUnknown', message: "OAIY can't tell whether the engines are busy: no answer within 2 s. It does not restart while it can't tell." },
+    ];
+    await mount(status({ state: 'ready', latestVersion: '0.2.0', blockers }));
+    expect(button('Restart to update')?.disabled).toBe(true);
+    const list = host.querySelector('ul[aria-label="Why OAIY cannot restart now"]');
+    expect(Array.from(list!.querySelectorAll('li')).map((li) => li.textContent)).toEqual(blockers.map((b) => b.message));
   });
 
   it('shows no reasons and an enabled button once nothing is in the way', async () => {

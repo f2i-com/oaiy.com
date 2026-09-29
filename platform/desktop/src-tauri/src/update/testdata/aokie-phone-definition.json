@@ -1,0 +1,142 @@
+{
+  "schemaVersion": 3,
+  "id": "aokie.phone",
+  "name": "Aokie Phone",
+  "version": "1.0.0",
+  "description": "Place and answer calls, speak on a live call, and send or read SMS through the paired phone. Backed by the Aokie plugin's own connector commands, so a flow gets the same surface the receptionist uses.",
+  "category": "Telephony",
+  "actions": [
+    {
+      "id": "call.dial",
+      "title": "Place a call",
+      "description": "Dial a number and speak an opening line verbatim when they answer. Subject to the plugin's own outbound consent, kill switch, quiet hours and daily dial cap — none of which this action can bypass.",
+      "sideEffects": "external-write",
+      "timeoutMs": 30000,
+      "transport": { "kind": "plugin-command", "command": "call.dial" },
+      "inputSchema": {
+        "type": "object",
+        "properties": {
+          "number": {
+            "type": "string",
+            "minLength": 3,
+            "maxLength": 32,
+            "description": "The number to dial, in the account's dialling format."
+          },
+          "openingLine": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 500,
+            "description": "The exact first words spoken when they answer. Spoken verbatim, so write it as speech."
+          },
+          "purpose": {
+            "type": "string",
+            "maxLength": 1000,
+            "description": "What the call is for. Grounds the agent's conversation; never spoken as-is."
+          }
+        },
+        "required": ["number", "openingLine"]
+      },
+      "outputSchema": { "type": "object" }
+    },
+    {
+      "id": "call.speak",
+      "title": "Speak on the live call",
+      "description": "Say something on the call that is currently connected.",
+      "sideEffects": "external-write",
+      "timeoutMs": 20000,
+      "transport": { "kind": "plugin-command", "command": "call.operatorSpeak" },
+      "inputSchema": {
+        "type": "object",
+        "properties": {
+          "text": { "type": "string", "minLength": 1, "maxLength": 2000, "description": "What to say. Spoken verbatim." },
+          "callId": { "type": "string", "maxLength": 64, "description": "Which call. Defaults to the active one." }
+        },
+        "required": ["text"]
+      },
+      "outputSchema": { "type": "object" }
+    },
+    {
+      "id": "call.hangup",
+      "title": "End the call",
+      "description": "Hang up the active call, or a specific one.",
+      "sideEffects": "external-write",
+      "timeoutMs": 15000,
+      "transport": { "kind": "plugin-command", "command": "call.hangup" },
+      "inputSchema": {
+        "type": "object",
+        "properties": {
+          "callId": { "type": "string", "maxLength": 64, "description": "Which call. Defaults to the active one." }
+        }
+      },
+      "outputSchema": { "type": "object" }
+    },
+    {
+      "id": "call.current",
+      "title": "Read the current call",
+      "description": "Who is on the line right now, and for how long. Returns an empty state when nothing is connected.",
+      "sideEffects": "none",
+      "timeoutMs": 10000,
+      "transport": { "kind": "plugin-command", "command": "call.current" },
+      "inputSchema": { "type": "object" },
+      "outputSchema": { "type": "object" }
+    },
+    {
+      "id": "sms.send",
+      "title": "Send an SMS",
+      "description": "Send a text message from the paired phone.",
+      "sideEffects": "external-write",
+      "timeoutMs": 30000,
+      "transport": { "kind": "plugin-command", "command": "sms.send" },
+      "inputSchema": {
+        "type": "object",
+        "properties": {
+          "to": { "type": "string", "minLength": 3, "maxLength": 32, "description": "The recipient number." },
+          "body": { "type": "string", "minLength": 1, "maxLength": 1600, "description": "The message text." },
+          "messageId": {
+            "type": "string",
+            "maxLength": 64,
+            "description": "Your own id for this message. Supplying one makes a retry idempotent instead of sending twice."
+          }
+        },
+        "required": ["to", "body"]
+      },
+      "outputSchema": { "type": "object" }
+    },
+    {
+      "id": "sms.threads",
+      "title": "List SMS conversations",
+      "description": "Every conversation on the paired phone, most recent first.",
+      "sideEffects": "none",
+      "timeoutMs": 20000,
+      "transport": { "kind": "plugin-command", "command": "sms.threads" },
+      "inputSchema": { "type": "object" },
+      "outputSchema": { "type": "object" }
+    },
+    {
+      "id": "sms.thread",
+      "title": "Read one SMS conversation",
+      "description": "The messages in a single conversation.",
+      "sideEffects": "none",
+      "timeoutMs": 20000,
+      "transport": { "kind": "plugin-command", "command": "sms.thread" },
+      "inputSchema": {
+        "type": "object",
+        "properties": {
+          "threadId": { "type": "string", "minLength": 1, "maxLength": 128, "description": "Which conversation, from sms.threads." }
+        },
+        "required": ["threadId"]
+      },
+      "outputSchema": { "type": "object" }
+    },
+    {
+      "id": "phone.status",
+      "title": "Read the phone connection",
+      "description": "Whether the dongle and phone are connected, and what the radio is doing.",
+      "sideEffects": "none",
+      "timeoutMs": 10000,
+      "transport": { "kind": "plugin-command", "command": "phone.status" },
+      "inputSchema": { "type": "object" },
+      "outputSchema": { "type": "object" }
+    }
+  ]
+}

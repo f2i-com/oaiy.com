@@ -1,13 +1,15 @@
-//! Whether a phone call is live, asked of the plugin that provides the phone.
+//! Whether a phone call is live, asked of every running plugin that provides the phone.
 //!
 //! OAIY's own call route (`voice::live_call_count`) sees only the calls that reach it: those
 //! the phone plugin sends through OAIY's realtime stream. A plugin that runs its own speech
 //! pipeline (a "legacy" mode), a call it is screening, or one it is holding for the caller never
 //! touches that route, yet stopping the plugin for an update drops all of them. So before an
-//! install OAIY also asks the plugin that provides the phone module, by a read-only connector
-//! command, whether a call is live. Nothing here knows any plugin by name: the provider is
-//! whichever plugin the module registry says provides `phone`, and the command is the first the
-//! module names ([`crate::modules::ModuleDef::live`]) that the provider's connector declares:
+//! install OAIY also asks EVERY running plugin that provides the phone module (by the module
+//! registry's claims, whether or not OAIY's phone module is on and whether or not the plugin is
+//! the provider OAIY chose: a second claimant, or one turned off in Plugins that still runs, can
+//! hold a call too), by a read-only connector command, whether a call is live. Nothing here knows
+//! any plugin by name: the command is the first the module names
+//! ([`crate::modules::ModuleDef::live`]) that the plugin's connector declares:
 //!
 //! - `call.switchboard`: `{foreground, waiting, parked, ...}`, each `null` or a call: the
 //!   foreground call (ringing or on the line), the caller knocking, and the call on hold;
@@ -15,13 +17,13 @@
 //!
 //! What comes back is one of four things ([`LineState`]):
 //!
-//! - **`NoPlugin`**: nothing provides the phone, or its plugin is not running (stopped, crashed, not
-//!   yet started): it holds no call, and stopping it drops none;
-//! - **`Idle`**: it answered, and no call is live;
-//! - **`Live`**: it answered, and a call is ringing, on the line, waiting or on hold;
-//! - **`Unknown`**: it is running and did not give an answer that can be read: no answer in time, an
-//!   error, something that is not the shape above, or no command that says. An install does not go
-//!   on while OAIY cannot tell.
+//! - **`NoPlugin`**: no plugin that provides the phone is running (stopped, crashed, not yet
+//!   started, turned off): none holds a call, and stopping them drops none;
+//! - **`Idle`**: every plugin that is running answered, and no call is live;
+//! - **`Live`**: one answered that a call is ringing, on the line, waiting or on hold (one is enough);
+//! - **`Unknown`**: a plugin is running and did not give an answer that can be read: no answer in
+//!   time, an error, something that is not the shape above, no command that says, or it is still
+//!   starting. An install does not go on while OAIY cannot tell.
 
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
@@ -29,7 +31,7 @@ use std::time::{Duration, Instant};
 use serde_json::Value;
 
 use crate::modules::{self, PHONE};
-use crate::plugins::{CallError, ForwardError, PluginHost};
+use crate::plugins::{CallError, ForwardError, PluginHost, PluginState};
 
 /// How long the plugin has to answer.
 pub const ASK_TIMEOUT: Duration = Duration::from_secs(3);
@@ -39,12 +41,12 @@ const KEEP: Duration = Duration::from_secs(5);
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum LineState {
-    /// Nothing provides the phone, or its plugin is not running.
+    /// No plugin that provides the phone is running.
     NoPlugin,
     Idle,
-    /// `count` calls (ringing, on the line, waiting or on hold) at the plugin `plugin`.
+    /// `count` calls (ringing, on the line, waiting or on hold) at the plugin `plugin` (the plugins, joined, when more than one has some).
     Live { plugin: String, count: usize },
-    /// The plugin `plugin` is running and did not say, and why.
+    /// The plugin `plugin` is running and did not say, and why (the plugins, joined, when more than one did not).
     Unknown { plugin: String, why: String },
 }
 
@@ -54,7 +56,7 @@ pub trait Line: Send + Sync {
     fn ask(&self, fresh: bool) -> LineState;
 }
 
-/// The phone plugin, asked through the host.
+/// The phone plugins, asked through the host.
 pub struct PluginLine {
     host: Arc<PluginHost>,
     timeout: Duration,
@@ -70,36 +72,62 @@ impl PluginLine {
         PluginLine { host, timeout, last: Mutex::new(None) }
     }
 
-    /// Ask the plugin now.
+    /// Ask the plugins now: EVERY plugin that provides the phone module and is running, whether or not OAIY's phone module is on
+    /// (a plugin turned off in Plugins can still be running) and whether or not it is the provider OAIY chose (a second plugin that
+    /// claims the phone loses the choice but not its calls). Any of them can hold a call the others know nothing of, and stopping
+    /// it for an update drops that call just the same.
     fn look(&self) -> LineState {
-        let records = self.host.registry.lock().unwrap_or_else(|e| e.into_inner()).list();
-        let resolved = modules::resolve(&records);
-        let Some(module) = resolved.modules.iter().find(|m| m.id == PHONE).filter(|m| m.enabled) else { return LineState::NoPlugin };
-        let Some(provider) = module.provider.as_ref() else { return LineState::NoPlugin };
-        // A plugin that is not serving holds no call.
-        if !provider.state.accepts_commands() {
-            return LineState::NoPlugin;
+        let mut records = self.host.registry.lock().unwrap_or_else(|e| e.into_inner()).list();
+        records.sort_by(|a, b| a.id.cmp(&b.id));
+        let mut live: Vec<(String, usize)> = Vec::new();
+        let mut unknown: Vec<(String, String)> = Vec::new();
+        let mut idle = false;
+        for record in &records {
+            let Some(manifest) = record.manifest.as_ref() else { continue };
+            let claims = modules::claims(manifest);
+            let Some(claim) = claims.get(PHONE).filter(|c| c.refused.is_none()) else { continue };
+            let name = manifest.name.clone();
+            match record.state {
+                state if state.accepts_commands() => match self.ask_plugin(&name, manifest, claim.connector.as_deref()) {
+                    LineState::Live { count, .. } => live.push((name, count)),
+                    LineState::Unknown { why, .. } => unknown.push((name, why)),
+                    LineState::Idle => idle = true,
+                    LineState::NoPlugin => {}
+                },
+                // A process that has not answered its start yet: it may be picking up a call, and cannot say.
+                PluginState::Starting => unknown.push((name, "it is still starting".to_string())),
+                // No process (never started, stopped, crashed, turned off): it holds no call.
+                _ => {}
+            }
         }
-        let name = provider.name.clone();
-        let unknown = |why: String| LineState::Unknown { plugin: name.clone(), why };
-        let Some(connector) = provider.connector.clone() else {
+        // Any call blocks; else any plugin that cannot say; else it is quiet, if there is a plugin to be quiet.
+        if !live.is_empty() {
+            let count = live.iter().map(|(_, n)| n).sum();
+            return LineState::Live { plugin: live.into_iter().map(|(n, _)| n).collect::<Vec<_>>().join(" and "), count };
+        }
+        if !unknown.is_empty() {
+            let plugin = unknown.iter().map(|(n, _)| n.as_str()).collect::<Vec<_>>().join(" and ");
+            let why = if unknown.len() == 1 { unknown[0].1.clone() } else { unknown.iter().map(|(n, w)| format!("{n}: {w}")).collect::<Vec<_>>().join("; ") };
+            return LineState::Unknown { plugin, why };
+        }
+        if idle { LineState::Idle } else { LineState::NoPlugin }
+    }
+
+    /// Ask one running plugin (`name`, `manifest`) through the connector that serves its phone claim.
+    fn ask_plugin(&self, name: &str, manifest: &crate::plugins::PluginManifest, connector: Option<&str>) -> LineState {
+        let unknown = |why: String| LineState::Unknown { plugin: name.to_string(), why };
+        let Some(connector) = connector else {
             return unknown("its claim names no connector to ask".to_string());
         };
-        let declared: Vec<String> = records
-            .iter()
-            .find(|r| r.id == provider.plugin_id)
-            .and_then(|r| r.manifest.as_ref())
-            .and_then(|m| m.connectors.iter().find(|c| c.id == connector))
-            .map(|c| c.commands.clone())
-            .unwrap_or_default();
+        let declared: Vec<&String> = manifest.connectors.iter().find(|c| c.id == connector).map(|c| c.commands.iter().collect()).unwrap_or_default();
         let live = modules::def(PHONE).map(|d| d.live).unwrap_or(&[]);
-        let Some(command) = live.iter().copied().find(|c| declared.iter().any(|d| d == c)) else {
+        let Some(command) = live.iter().copied().find(|c| declared.iter().any(|d| d.as_str() == *c)) else {
             return unknown(format!("it declares no command that says whether a call is live ({})", live.join(" or ")));
         };
-        match self.host.forward_connector(&connector, command, None, None, self.timeout) {
+        match self.host.forward_connector(connector, command, None, None, self.timeout) {
             Ok(reply) => match crate::setup::unwrap_reply(reply).map_err(|e| format!("it answered with an error ({e})")).and_then(|data| count_calls(command, &data)) {
                 Ok(0) => LineState::Idle,
-                Ok(count) => LineState::Live { plugin: name, count },
+                Ok(count) => LineState::Live { plugin: name.to_string(), count },
                 Err(why) => unknown(why),
             },
             // (setup's wording names its own 5 s deadline; this look has its own.)
@@ -283,9 +311,19 @@ mod process_tests {
         std::fs::write(dir.join("behavior.json"), behavior.to_string()).unwrap();
     }
 
-    /// Put the stand-in plugin `line` in the sandbox: a phone provider whose connector declares `phone_commands` and `live_commands`.
+    /// Put the stand-in plugin `line` in the sandbox: a phone provider whose connector declares the phone's commands and `live_commands`.
     fn install(sb: &Sandbox, live_commands: &[&str], behavior: serde_json::Value) -> PathBuf {
-        let dir = sb.0.join("plugins").join("line");
+        install_as(sb, "line", live_commands, behavior, Some(claim("line")))
+    }
+
+    /// The `modules` section of a plugin that provides the phone through its connector `connector`.
+    fn claim(connector: &str) -> serde_json::Value {
+        json!({ "provides": ["phone"], "connector": connector })
+    }
+
+    /// The same under another id. `modules` is the manifest's `modules` section (None: it has none, as Aokie's has not).
+    fn install_as(sb: &Sandbox, id: &str, live_commands: &[&str], behavior: serde_json::Value, modules: Option<serde_json::Value>) -> PathBuf {
+        let dir = sb.0.join("plugins").join(id);
         std::fs::create_dir_all(&dir).unwrap();
         std::fs::write(dir.join("plugin.mjs"), SCRIPT).unwrap();
         let shim = if cfg!(windows) { "plugin.cmd" } else { "plugin.sh" };
@@ -300,26 +338,36 @@ mod process_tests {
             }
         }
         let commands: Vec<&str> = PHONE_COMMANDS.iter().copied().chain(live_commands.iter().copied()).collect();
-        let manifest = json!({
-            "schemaVersion": 4, "id": "line", "name": "Line Test Plugin", "version": "0.1.0", "pluginApiVersion": 1,
+        let name = id.chars().next().map(|first| first.to_uppercase().collect::<String>() + &id[first.len_utf8()..]).unwrap_or_default() + " Test Plugin";
+        let mut manifest = json!({
+            "schemaVersion": 4, "id": id, "name": name, "version": "0.1.0", "pluginApiVersion": 1,
             "entry": { "kind": "process", "command": shim },
-            "capabilities": commands.iter().map(|c| format!("connector.line.{c}")).collect::<Vec<_>>(),
-            "connectors": [{ "id": "line", "name": "Line Test", "commands": commands }],
-            "modules": { "provides": ["phone"], "connector": "line" },
+            "capabilities": commands.iter().map(|c| format!("connector.{id}.{c}")).collect::<Vec<_>>(),
+            "connectors": [{ "id": id, "name": "Line Test", "commands": commands }],
             "events": [],
         });
+        if let Some(modules) = modules {
+            manifest["modules"] = modules;
+        }
         std::fs::write(dir.join("manifest.json"), manifest.to_string()).unwrap();
         behave(&dir, behavior);
         dir
     }
 
-    /// Start it and wait until the host says it is running.
+    /// Start `line` and wait until the host says it is running.
     fn start(host: &Arc<PluginHost>) {
-        host.registry.lock().unwrap().scan();
-        host.start("line").unwrap_or_else(|e| panic!("the stand-in plugin does not start: {e}\nits log: {:?}", host.logs("line", Some(20))));
+        start_as(host, "line");
+    }
+
+    fn start_as(host: &Arc<PluginHost>, id: &str) {
+        // A scan makes the records again from the folders: once, when the plugin is not known yet (a running one is left as it is).
+        if host.registry.lock().unwrap().get(id).is_none() {
+            host.registry.lock().unwrap().scan();
+        }
+        host.start(id).unwrap_or_else(|e| panic!("the stand-in plugin {id} does not start: {e}\nits log: {:?}", host.logs(id, Some(20))));
         let deadline = Instant::now() + Duration::from_secs(20);
-        while host.registry.lock().unwrap().get("line").map(|r| r.state) != Some(PluginState::Running) {
-            assert!(Instant::now() < deadline, "the stand-in plugin never came up: {:?}", host.registry.lock().unwrap().get("line").map(|r| r.reason.clone()));
+        while host.registry.lock().unwrap().get(id).map(|r| r.state) != Some(PluginState::Running) {
+            assert!(Instant::now() < deadline, "the stand-in plugin {id} never came up: {:?}", host.registry.lock().unwrap().get(id).map(|r| r.reason.clone()));
             std::thread::sleep(Duration::from_millis(50));
         }
     }
@@ -522,6 +570,154 @@ mod process_tests {
         assert!(stopped.lock().unwrap().is_empty(), "nothing was stopped");
         assert_eq!(updater.status_at(now).state, crate::update::updater::State::Ready, "the download is kept");
         host.stop("line").unwrap();
+    }
+
+    /// The manifest of the phone plugin OAIY is used with, as that plugin's repository has it (a copy: testdata/README.txt).
+    const REAL_MANIFEST: &str = include_str!("testdata/aokie-manifest.json");
+    /// The service definition that manifest requires (the registry refuses a manifest whose definition file is missing).
+    const REAL_DEFINITION: &str = include_str!("testdata/aokie-phone-definition.json");
+
+    #[test]
+    fn the_real_phone_plugins_manifest_lets_the_live_call_commands_through_the_gate_with_no_key() {
+        // A command that is journalled needs an idempotency key, and this asks with none: were either live-call command
+        // journalled (or not declared) in the manifest of the plugin that is really used, every user of it would be told
+        // "can't tell" for ever. The manifest is read the way the registry reads it and the gate is the one connector requests go through.
+        let sb = Sandbox::new("real-manifest");
+        let host = host(&sb);
+        let dir = sb.0.join("plugins").join("aokie");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("manifest.json"), REAL_MANIFEST).unwrap();
+        std::fs::create_dir_all(dir.join("definitions")).unwrap();
+        std::fs::write(dir.join("definitions").join("phone.json"), REAL_DEFINITION).unwrap();
+        std::fs::write(dir.join("aokie-plugin.exe"), "not a program").unwrap();
+        host.registry.lock().unwrap().scan();
+        let why_not = host.registry.lock().unwrap().get("aokie").map(|r| r.reason.clone());
+        host.registry.lock().unwrap().set_state("aokie", PluginState::Running, None);
+        let registry = host.registry.lock().unwrap();
+        let record = registry.get("aokie").expect("the plugin is found");
+        let manifest = record.manifest.as_ref().unwrap_or_else(|| panic!("its manifest loads: {why_not:?}"));
+        let claims = modules::claims(manifest);
+        assert!(claims.provides(PHONE), "{claims:?}");
+        let connector = claims.get(PHONE).and_then(|c| c.connector.clone()).expect("the claim names the connector that serves it");
+        let live = modules::def(PHONE).unwrap().live;
+        // What OAIY would ask: the first command the connector declares.
+        assert_eq!(live.iter().find(|c| manifest.declares_command(&connector, c)), Some(&"call.switchboard"));
+        for command in live {
+            assert!(registry.gate(&connector, command, None).is_ok(), "{command}: {:?}", registry.gate(&connector, command, None).err());
+        }
+        // The same gate does refuse a journalled command asked without a key: what this test relies on is real.
+        assert!(matches!(registry.gate(&connector, "call.answer", None), Err(crate::plugins::GateRefusal::IdempotencyRequired { .. })));
+    }
+
+    fn board(foreground: Option<serde_json::Value>) -> serde_json::Value {
+        json!({ "mode": "answer", "data": { "foreground": foreground, "waiting": null, "parked": null } })
+    }
+
+    #[test]
+    fn a_plugin_turned_off_in_plugins_that_is_still_running_is_still_asked() {
+        if !has_node() {
+            return;
+        }
+        let sb = Sandbox::new("disabled");
+        let host = host(&sb);
+        let dir = install(&sb, &["call.switchboard"], board(Some(call())));
+        start(&host);
+        // Turned off in Plugins while its process runs (a rescan leaves a running plugin running): OAIY's phone module is off, the call is not.
+        {
+            let mut registry = host.registry.lock().unwrap();
+            registry.set_user_disabled("line", true);
+            registry.set_state("line", PluginState::Running, None);
+        }
+        let records = host.registry.lock().unwrap().list();
+        let phone = modules::resolve(&records).modules.into_iter().find(|m| m.id == PHONE).unwrap();
+        assert!(!phone.enabled, "the phone module is off: {phone:?}");
+        let state = PluginLine::with_timeout(host.clone(), Duration::from_millis(800)).ask(true);
+        assert_eq!(state, LineState::Live { plugin: "Line Test Plugin".into(), count: 1 });
+        assert_eq!(asked(&dir), ["call.switchboard"]);
+        host.stop("line").unwrap();
+    }
+
+    #[test]
+    fn every_running_plugin_that_provides_the_phone_is_asked_not_only_the_one_oaiy_chose() {
+        if !has_node() {
+            return;
+        }
+        let sb = Sandbox::new("two");
+        let host = host(&sb);
+        let a = install_as(&sb, "a-line", &["call.switchboard"], idle_board(), Some(claim("a-line")));
+        let b = install_as(&sb, "b-line", &["call.switchboard"], idle_board(), Some(claim("b-line")));
+        start_as(&host, "a-line");
+        start_as(&host, "b-line");
+        let records = host.registry.lock().unwrap().list();
+        let phone = modules::resolve(&records).modules.into_iter().find(|m| m.id == PHONE).unwrap();
+        assert_eq!(phone.provider.as_ref().unwrap().plugin_id, "a-line", "OAIY uses the lowest id");
+        let line = PluginLine::with_timeout(host.clone(), Duration::from_millis(800));
+        assert_eq!(line.ask(true), LineState::Idle);
+        // The one OAIY did not choose holds a call.
+        behave(&b, board(Some(call())));
+        assert_eq!(line.ask(true), LineState::Live { plugin: "B-line Test Plugin".into(), count: 1 });
+        // The one it chose does, and the other does not.
+        behave(&b, idle_board());
+        behave(&a, board(Some(call())));
+        assert_eq!(line.ask(true), LineState::Live { plugin: "A-line Test Plugin".into(), count: 1 });
+        // Both do: both are named and counted.
+        behave(&b, board(Some(call())));
+        assert_eq!(line.ask(true), LineState::Live { plugin: "A-line Test Plugin and B-line Test Plugin".into(), count: 2 });
+        // One cannot say and the other is quiet: that blocks, and names the one that cannot say.
+        behave(&a, idle_board());
+        behave(&b, json!({ "mode": "hang" }));
+        match line.ask(true) {
+            LineState::Unknown { plugin, why } => {
+                assert_eq!(plugin, "B-line Test Plugin");
+                assert!(why.contains("did not answer"), "{why}");
+            }
+            other => panic!("{other:?}"),
+        }
+        // One cannot say and the other has a call: a call is what is said.
+        behave(&a, board(Some(call())));
+        assert!(matches!(line.ask(true), LineState::Live { .. }));
+        host.stop("a-line").unwrap();
+        host.stop("b-line").unwrap();
+    }
+
+    #[test]
+    fn a_plugin_that_does_not_claim_the_phone_is_never_asked_and_aokies_old_rule_still_counts() {
+        if !has_node() {
+            return;
+        }
+        let sb = Sandbox::new("claims");
+        let host = host(&sb);
+        let line = PluginLine::with_timeout(host.clone(), Duration::from_millis(800));
+        let other = install_as(&sb, "other", &["call.switchboard"], board(Some(call())), Some(json!({ "provides": [] })));
+        start_as(&host, "other");
+        assert_eq!(line.ask(true), LineState::NoPlugin);
+        assert!(asked(&other).is_empty(), "a plugin that does not provide the phone is not asked");
+        host.stop("other").unwrap();
+        // Aokie predates the modules section: a plugin with that id and no section provides the phone.
+        let aokie = install_as(&sb, "aokie", &["call.switchboard"], board(Some(call())), None);
+        start_as(&host, "aokie");
+        assert_eq!(line.ask(true), LineState::Live { plugin: "Aokie Test Plugin".into(), count: 1 });
+        assert_eq!(asked(&aokie), ["call.switchboard"]);
+        host.stop("aokie").unwrap();
+    }
+
+    #[test]
+    fn a_plugin_that_is_still_starting_cannot_say_and_one_that_is_not_running_holds_no_call() {
+        let sb = Sandbox::new("states");
+        let host = host(&sb);
+        install(&sb, &["call.switchboard"], board(Some(call())));
+        host.registry.lock().unwrap().scan();
+        let line = PluginLine::with_timeout(host.clone(), Duration::from_millis(800));
+        host.registry.lock().unwrap().set_state("line", PluginState::Starting, None);
+        match line.ask(true) {
+            LineState::Unknown { plugin, why } => assert_eq!((plugin.as_str(), why.as_str()), ("Line Test Plugin", "it is still starting")),
+            other => panic!("{other:?}"),
+        }
+        // The plugin is not asked at all in these: no process, so no call.
+        for state in [PluginState::Stopped, PluginState::Crashed, PluginState::Installed, PluginState::Disabled] {
+            host.registry.lock().unwrap().set_state("line", state, None);
+            assert_eq!(line.ask(true), LineState::NoPlugin, "{state:?}");
+        }
     }
 
     #[test]

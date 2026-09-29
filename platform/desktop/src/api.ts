@@ -1135,7 +1135,10 @@ export type UpdateState = 'idle' | 'checking' | 'upToDate' | 'available' | 'down
 
 /** One reason an update cannot be installed now, in words for a person. */
 export interface UpdateBlocker {
-  /** call, agentTask, download, mediaJob, installing, migration or starting. */
+  /**
+   * call (OAIY's own line), phoneCall (a phone plugin reports one), callUnknown (a phone plugin cannot say), agentTask, download,
+   * mediaJob, enginesUnknown (the engines cannot say), installing, migration or starting. The window shows the message and keys on the code.
+   */
   code: string;
   message: string;
 }
