@@ -141,6 +141,12 @@ A restore is never done in place. It has three steps, and the first two change n
 
 The restart button refuses while OAIY is busy (the same list as for making a backup, and for updating).
 
+**Any restart applies a prepared restore**, not only this button's: the restart that installs an update
+(Settings, About and updates) applies it too, at the start of the updated OAIY, if it is still within its
+24 hours. And a backup can be made while a restore waits: it holds what OAIY has now, before the restore
+replaces it, which is what to keep before applying one, so a waiting restore is not one of the reasons a
+backup waits (the reasons are the update's, plus a backup already being made).
+
 ### What comes back by default, and what needs your tick
 
 **Your data comes back** without asking: contacts, the calendar, conversations and projects,

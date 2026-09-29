@@ -105,7 +105,8 @@ Each of these keeps "Restart to update" off, by itself, and is shown in words ne
 The reasons above other than the last are one decision (`update::blockers::work_blockers`), and a
 backup or a restore asks the same one, from the same sources: whatever keeps "Restart to update" off
 keeps "Create backup" and "Restart to finish restoring" off (see [BACKUP.md](BACKUP.md)). Only the
-last is the update's own.
+last is the update's own. A restore that was prepared in Settings, Backup and restore is applied by whichever
+restart comes first, the one that installs an update included ([BACKUP.md](BACKUP.md#restoring)).
 
 The blockers are looked at when the button is pressed, and again right before anything is
 stopped (saving the Agent's work takes a few seconds, and a call may have begun). The
