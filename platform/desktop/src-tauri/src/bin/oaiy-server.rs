@@ -409,12 +409,21 @@ async fn main() {
         http::set_engines_ui(&ui);
     }
 
+    // Newer releases: this server only REPORTS them (GET /api/update/status, and POST /api/update/check,
+    // which reads the release feed when asked). It never downloads or replaces itself: see docs/UPDATES.md
+    // for how to upgrade it by hand.
+    let updater = oaiy_desktop_lib::update::Updater::new(
+        env!("CARGO_PKG_VERSION"),
+        oaiy_desktop_lib::update::FeedSource::from_env(),
+        std::time::Instant::now(),
+    );
+
     // gui_mode = false: headless server is token-strict (no webview origin).
     let registry_for_exit = registry.clone();
     if let Err(e) = http::serve(
         port,
         bind_all, config, auth_token, false, registry, downloads, python, catalog, bridge,
-        companion, companion_upstream, link, ai_providers, ai_codex, node_runtime,
+        companion, companion_upstream, link, ai_providers, ai_codex, node_runtime, updater,
     )
     .await
     {

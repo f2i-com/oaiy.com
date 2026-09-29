@@ -22,6 +22,8 @@ pub mod agent_tasks;
 pub mod setup;
 /// The Agent's control API: the MCP server it configures OAIY with (`/api/mcp`).
 pub mod control;
+/// Newer releases: found in the release feed, checked, and (in the desktop) installed when the owner says so.
+pub mod update;
 
 /// Port the localhost API binds to. Fixed so oaiy-web's detection probe has a
 /// stable target. Shared by both binaries (the GUI and the headless server).
@@ -1375,6 +1377,9 @@ pub fn run() {
             if lan_access {
                 log::warn!("lanAccess is on — the API will bind every interface on port {server_port}");
             }
+            // What is known of newer releases, shared by the local API's routes, the window's commands and the tray.
+            let updater = crate::update::Updater::new(env!("CARGO_PKG_VERSION"), crate::update::FeedSource::from_env(), std::time::Instant::now());
+            app.manage(updater.clone());
             tauri::async_runtime::spawn(async move {
                 // Bridge state. The plugins root sits under the data dir so a
                 // relocated data folder takes its plugins with it — plugins hold
@@ -1488,6 +1493,7 @@ pub fn run() {
                     ai_providers_for_http,
                     ai_codex_for_http,
                     node_for_http,
+                    updater,
                 )
                 .await
                 {

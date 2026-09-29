@@ -724,6 +724,12 @@ fn is_privileged_path(method: &Method, path: &str) -> bool {
                     | "/api/node/install"
                     // Starts a download of gigabytes into the engines' folder.
                     | "/api/engines/downloads"
+                    // Makes OAIY ask GitHub for a newer release (at most every 30 seconds), and the Agent
+                    // page's answer when it is asked to save its work before an update: a page the owner
+                    // happens to have open must not do either. (Downloading and installing are commands of
+                    // the dashboard's own window, not routes.)
+                    | "/api/update/check"
+                    | "/api/update/agent-flushed"
             ) || (path.starts_with("/api/services/") && path.ends_with("/uninstall"))
                 || is_setup_path(path)
                 || is_bridge_exec_path(path)
@@ -1270,6 +1276,9 @@ async fn origin_guard(
         || (m == Method::POST && path == "/api/bridge/pairing")
         || ((m == Method::GET || m == Method::HEAD)
             && (path == "/api/health"
+                // Which version runs and whether a newer release exists: what health half says already.
+                // Open, so the headless server, which only reports a newer release, can be asked without a token.
+                || path == "/api/update/status"
                 || path == "/api/bridge/capabilities"
                 || path.strip_prefix("/api/bridge/pairing/")
                     .is_some_and(|id| !id.is_empty() && !id.contains('/'))));
@@ -1393,6 +1402,8 @@ pub async fn serve(
     ai_codex: crate::ai::CodexHandle,
     // The Node runtime the bundled CLI runs under.
     node: crate::services::node_runtime::NodeHandle,
+    // What is known of newer releases, shared with whatever else (the desktop's window and tray) asks.
+    updater: crate::update::UpdaterHandle,
 ) -> Result<(), BoxError> {
     validate_listener_auth(bind_all, auth_token.as_deref())?;
     // CORS stays permissive so a hosted oaiy-web at any domain can READ the
@@ -1563,6 +1574,8 @@ pub async fn serve(
         .merge(crate::calendar::routes::router())
         .merge(crate::modules::routes::router())
         .merge(crate::agent_tasks::router())
+        // Whether a newer release exists: read-only status, and a rate-limited check (never a download or an install).
+        .merge(crate::update::routes::router(updater))
         .merge(setup_routes)
         .route("/api/engines", axum::routing::get(engines_status))
         .route("/api/engines/catalog", axum::routing::get(engines_catalog))
@@ -1994,6 +2007,17 @@ mod tests {
             assert!(is_privileged_path(&m, path), "{m} {path} must be privileged");
         }
         assert!(!is_privileged_path(&Method::GET, "/api/setup"));
+    }
+
+    #[test]
+    fn checking_for_an_update_is_privileged_and_its_status_is_a_read_open_like_health() {
+        // The check makes OAIY phone GitHub: the dashboard's own window or a token, never a local page.
+        assert!(is_privileged_path(&Method::POST, "/api/update/check"));
+        assert!(is_privileged_path(&Method::POST, "/api/update/agent-flushed"));
+        // There is no route that downloads or installs: those are commands of the dashboard's window.
+        assert!(!is_privileged_path(&Method::GET, "/api/update/status"));
+        assert!(!is_restricted_read_path("/api/update/status"));
+        // (A headless server answers the status without a token; see the update routes' guard test.)
     }
 
     #[test]
