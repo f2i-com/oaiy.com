@@ -94,24 +94,30 @@ journals, so it carries the idempotency key the relay makes from the command's i
 `call.remoteStatus`, `call.assistance.respond` and `remote.*` off its own relay;
 none of them is on the list here either.
 
-Some things on the provider's site therefore stop working when the browser is not
-paired with this computer, because it then reaches OAIY through the relay instead of
-directly: its Device Setup screen's driver install, dongle reset, preferred dongle
-and phone connect and disconnect, and its Receptionist Settings screen's "Save &
+Some things on the provider's site therefore stop working whenever the browser
+reaches OAIY through the relay instead of directly: its Device Setup screen's driver
+install, dongle reset, preferred dongle (setting and reading it), phone connect and
+disconnect and paired-phones list, and its Receptionist Settings screen's "Save &
 apply now" and live settings readout. They show the refusal instead of running. A
-browser paired with this computer's OAIY reaches it directly and is not asked.
+browser paired with this computer's OAIY usually reaches it directly and is not
+asked; it falls back to the relay when it has not found the local link yet, for
+example just after a restart.
 
 ### The record
 
-Every command for a plugin, allowed or refused, is one line of
+Every relayed command, allowed or refused, is one line of
 `<data>/relay-log.jsonl`: `{at, tool: "relay.command", args: {connector, command,
 commandId, decision, reason?}, session: "relay", ok, summary}`. The line is written
 before the command is forwarded. It never holds the payload (message text, phone
-numbers) or anything the plugin answered. It is its own file, written the way the
+numbers) or anything the plugin answered. The desktop's own ops are in it too, with
+the connector `desktop`: allowed when they are on the closed list, and refused
+(`unknown_op`) when they are not, so stopping the phone plugin from the website
+leaves a line. A command for a plugin that the policy refuses says which rule did
+(`not_listed`, `journalled`, `not_declared`, `policy_unreadable`, `no_command_id`). It
+is its own file, written the way the
 [control log](../../docs/AGENT_CONTROL.md#the-switch-and-the-log) is, because that
 log is the Agent's changes and a call console asks `call.current` every few
-seconds. It rolls at 2 MiB and keeps one previous file. The desktop's own ops are
-not in it.
+seconds. It rolls at 2 MiB and keeps one previous file.
 
 ### What this does not cover
 
@@ -125,7 +131,8 @@ not in it.
   `journalled` list. Aokie leaves eight commands that change something out of
   it, which is why it has an entry.
 - The `desktop` connector still lets the website stop and restart plugins and
-  services. That is what its "start service" button is.
+  services, phone plugin included. That is what its "start service" button is; each
+  one is written to the log.
 - Commands are not signed or end-to-end encrypted (see the table above), so the
   provider itself can queue any command the list allows.
 

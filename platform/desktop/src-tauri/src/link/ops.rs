@@ -16,13 +16,15 @@
 //!   relay policy ([`super::policy`], `resources/relay-policy.json`) says the
 //!   website may run it. What the policy allows is then still checked by the
 //!   plugin's own gate, as for any caller: the gate says what a plugin can do,
-//!   the policy says what a website may ask it to. Every such command, allowed
-//!   or refused, is one line of `<data>/relay-log.jsonl` (connector, verb,
-//!   decision, command id), never its payload.
+//!   the policy says what a website may ask it to.
 //!
-//! [`dispatcher`] is the same code without the policy, for callers on this
-//! computer: a binding's follow-up actions in [`super::flow_runner`]. It must not
-//! be handed to the relay.
+//! Every relayed command, for a plugin or for this app, allowed or refused, is
+//! one line of `<data>/relay-log.jsonl` (connector, verb, decision, command id),
+//! never its payload.
+//!
+//! [`dispatcher`] is the same code without the policy or the log, for callers on
+//! this computer: a binding's follow-up actions in [`super::flow_runner`]. It must
+//! not be handed to the relay.
 
 use serde_json::{json, Value};
 use std::path::{Path, PathBuf};
@@ -83,6 +85,22 @@ fn forward_error_message(
 /// console asks `call.current` every few seconds, and would fill it.
 pub const RELAY_LOG_FILE: &str = "relay-log.jsonl";
 
+/// The ops of the `desktop` connector: the closed list [`dispatcher`] answers, and
+/// so the ones the relay log calls allowed. A test runs each through the
+/// dispatcher, so an op added there and not here cannot go unlogged as unknown.
+pub const DESKTOP_OPS: [&str; 10] = [
+    "services.list",
+    "services.start",
+    "services.stop",
+    "services.restart",
+    "services.repair",
+    "plugins.list",
+    "plugins.start",
+    "plugins.stop",
+    "plugins.restart",
+    "plugins.health",
+];
+
 /// What stands between the relay and the plugins: the rules, and the record.
 pub struct RelayGuard {
     policy: RelayPolicy,
@@ -117,28 +135,37 @@ impl RelayGuard {
         let verdict = self
             .policy
             .check(connector, command, command_id, || declared_by(plugins, connector, command));
-        self.record(connector, command, command_id, &verdict);
+        self.record(connector, command, command_id, verdict.as_ref().err().map(Refusal::reason));
         verdict
     }
 
-    /// One line: which command, on which connector, what was decided and why. Never
-    /// the payload (message text, phone numbers) and never anything the plugin said
-    /// back: the log's redaction only knows secret-looking NAMES.
-    fn record(&self, connector: &str, command: &str, command_id: &str, verdict: &Result<(), Refusal>) {
+    /// An op of this app's own. It is not the policy's to allow (the list of ops is
+    /// closed in [`dispatcher`]) but it is written down all the same: stopping the
+    /// phone plugin from the website is exactly what this log is for.
+    fn note_desktop_op(&self, command: &str, command_id: &str) {
+        let unknown = (!DESKTOP_OPS.contains(&command)).then_some("unknown_op");
+        self.record(DESKTOP_CONNECTOR, command, command_id, unknown);
+    }
+
+    /// One line: which command, on which connector, what was decided and why (`refused`
+    /// is the reason, when it was). Never the payload (message text, phone numbers) and
+    /// never anything the plugin said back: the log's redaction only knows secret-looking
+    /// NAMES.
+    fn record(&self, connector: &str, command: &str, command_id: &str, refused: Option<&str>) {
         let mut args = json!({
             "connector": connector,
             "command": command,
             "commandId": command_id,
-            "decision": if verdict.is_ok() { "allowed" } else { "refused" },
+            "decision": if refused.is_none() { "allowed" } else { "refused" },
         });
-        let summary = match verdict {
-            Ok(()) => "allowed".to_string(),
-            Err(refusal) => {
-                args["reason"] = json!(refusal.reason());
-                format!("refused: {}", refusal.reason())
+        let summary = match refused {
+            None => "allowed".to_string(),
+            Some(reason) => {
+                args["reason"] = json!(reason);
+                format!("refused: {reason}")
             }
         };
-        self.log.append("relay.command", &args, "relay", verdict.is_ok(), &summary);
+        self.log.append("relay.command", &args, "relay", refused.is_none(), &summary);
     }
 }
 
@@ -157,10 +184,11 @@ fn declared_by(plugins: &PluginRegistryHandle, connector: &str, command: &str) -
     }
 }
 
-/// The dispatcher the relay worker calls: [`dispatcher`], behind the relay policy.
+/// The dispatcher the relay worker calls: [`dispatcher`], behind the relay policy
+/// and the relay log.
 ///
 /// The `desktop` connector's ops are this app's own and are not asked about the
-/// policy. Everything else is, first.
+/// policy, only written down. Everything else is asked first.
 pub fn relay_dispatcher(
     registry: RegistryHandle,
     plugins: PluginRegistryHandle,
@@ -171,7 +199,9 @@ pub fn relay_dispatcher(
     let inner = dispatcher(registry, plugins, host);
     std::sync::Arc::new(move |connector: &str, command: &str, payload: &Value, key: &str| {
         // `key` is the relayed command's own id: see `super::relay::Dispatcher`.
-        if connector != DESKTOP_CONNECTOR {
+        if connector == DESKTOP_CONNECTOR {
+            guard.note_desktop_op(command, key);
+        } else {
             guard
                 .admit(&asked, connector, command, key)
                 .map_err(|refusal| refusal.message())?;
@@ -372,6 +402,15 @@ mod tests {
             assert!(!op.starts_with("desktop."), "{op} must be the short verb");
             assert!(op.contains('.'), "{op} should be <area>.<verb>");
         }
+    }
+
+    #[test]
+    fn the_ops_the_relay_log_calls_allowed_are_the_ops_pinned_above() {
+        let mut logged = super::DESKTOP_OPS.to_vec();
+        logged.sort_unstable();
+        let mut pinned = KNOWN_OPS.to_vec();
+        pinned.sort_unstable();
+        assert_eq!(logged, pinned);
     }
 }
 
@@ -703,7 +742,7 @@ mod guard_tests {
     // ---- the record --------------------------------------------------------------------
 
     #[test]
-    fn every_command_for_a_plugin_is_one_line_in_the_relay_log_and_never_its_payload() {
+    fn every_relayed_command_is_one_line_in_the_relay_log_and_never_its_payload() {
         let world = world("log");
         let relay = relay(&world, RelayPolicy::shipped());
         let body = "Your table is ready, Alex";
@@ -711,12 +750,14 @@ mod guard_tests {
         let _ = relay("aokie", "dongle.installDriver", &json!({ "vid": 4660, "pid": 22136 }), "cmd-driver");
         let _ = relay("aokie", "call.dial", &json!({ "number": "0491 570 156", "openingLine": body }), "");
         let _ = relay("notes", "note.add", &json!({ "text": body }), "cmd-note");
-        // Not a command for a plugin: not in this log.
-        let _ = relay("desktop", "plugins.list", &Value::Null, "cmd-list");
+        // This app's own ops are the policy's no business, but they are written down: stopping
+        // the phone plugin from the website is exactly what the log is for.
+        let _ = relay("desktop", "plugins.stop", &json!({ "pluginId": "aokie" }), "cmd-stop");
+        let _ = relay("desktop", "plugins.detonate", &Value::Null, "cmd-boom");
 
         let raw = std::fs::read_to_string(world.root.join(RELAY_LOG_FILE)).expect("the relay log");
         let lines: Vec<Value> = raw.lines().map(|l| serde_json::from_str(l).expect("one JSON line each")).collect();
-        assert_eq!(lines.len(), 4, "{raw}");
+        assert_eq!(lines.len(), 6, "{raw}");
 
         // Nothing of the payload, whatever it was called.
         for secret in ["0491 570 006", "0491 570 156", body, "openingLine", "vid", "pid"] {
@@ -742,6 +783,31 @@ mod guard_tests {
         assert_eq!(lines[1]["ok"], false);
         assert_eq!(lines[2]["args"]["reason"], "no_command_id");
         assert_eq!(lines[3]["args"]["reason"], "journalled");
+        assert_eq!(
+            lines[4]["args"],
+            json!({ "connector": "desktop", "command": "plugins.stop", "commandId": "cmd-stop", "decision": "allowed" })
+        );
+        assert_eq!(lines[4]["ok"], true);
+        assert_eq!(lines[5]["args"]["decision"], "refused");
+        assert_eq!(lines[5]["args"]["reason"], "unknown_op");
+        assert_eq!(lines[5]["ok"], false);
+    }
+
+    #[test]
+    fn every_op_of_the_desktop_connector_is_one_the_dispatcher_answers_and_nothing_else_is() {
+        // The relay log calls an op allowed when it is in `DESKTOP_OPS`, and the dispatcher's own
+        // match decides what it runs: this is what keeps the two the same list.
+        let world = world("ops");
+        let relay = relay(&world, RelayPolicy::shipped());
+        for op in DESKTOP_OPS {
+            // No payload: an op that needs a target says what it needs. What none of them says is
+            // that this desktop does not serve it.
+            if let Err(message) = relay("desktop", op, &Value::Null, "cmd-op") {
+                assert!(!message.contains("does not serve the remote op"), "{op}: {message}");
+            }
+        }
+        let unknown = relay("desktop", "plugins.detonate", &Value::Null, "cmd-boom").unwrap_err();
+        assert!(unknown.contains("does not serve the remote op"), "{unknown}");
     }
 
     // ---- with a real process behind the plugin -----------------------------------------

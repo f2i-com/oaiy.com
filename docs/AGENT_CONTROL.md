@@ -42,8 +42,9 @@ takes OAIY's own window or the desktop's token, and every change takes the privi
 gate. It is not reachable from the voice gateway (17872), from the FormLogic relay's
 commands, or from plugin screens.
 
-The relay's commands for a plugin are a lane of their own. They are checked against the
-relay policy and recorded in `<data>/relay-log.jsonl`, not in the control log; see
+The relay's commands are a lane of their own. Those for a plugin are checked against the
+relay policy, and all of them are recorded in `<data>/relay-log.jsonl`, not in the control
+log; see
 [What the website can and cannot run on this computer](../platform/docs/REMOTE_FORMLOGIC.md#what-the-website-can-and-cannot-run-on-this-computer).
 `plugin_command` is not one of them: it is the Agent asking on this computer, so the relay
 policy does not apply and it reaches any command a plugin declares (the Aokie dongle's driver
