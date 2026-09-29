@@ -574,7 +574,7 @@ pub(crate) mod tests {
 
     pub fn package(version: &str) -> VerifiedPackage {
         let keys = Keys::new(7);
-        let bytes = b"installer".to_vec();
+        let bytes = b"MZ installer".to_vec();
         let sig = keys.sign(&bytes, &comment(version));
         super::super::verify::verify_package(bytes, &sig, &keys.pubkey, &super::super::verify::Expected::new(version, super::super::target::Target::WindowsSetup)).unwrap()
     }

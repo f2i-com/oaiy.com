@@ -132,10 +132,21 @@ the installer it starts would inherit that and be killed with it.
   release job signs the installers under the bundler's names (`OAIY_<v>_x64-setup.exe`,
   `OAIY_<v>_amd64.AppImage`) and makes the same check from each `.sig` before it publishes.
 - **The address.** The installer must be this project's release asset on `github.com`, over
-  https, under the tag `v<version>` (or `<version>`) and named `oaiy-desktop-<version>-...`,
-  and that version is the one the feed announced. That keeps a feed from sending OAIY
-  elsewhere, and it is not what ties the bytes to their version: a release can hold any file
-  under any name, so the version is proven by the signature (above), not by the address.
+  https, under the tag `v<version>` (or `<version>`), and named EXACTLY as the release job
+  names this platform's installer: `oaiy-desktop-<version>-windows-x64-setup.exe` on Windows,
+  `oaiy-desktop-<version>-linux-x86_64.AppImage` on Linux, with `<version>` the one the feed
+  announced. No other file of the release is taken, and not the other platform's: a Linux
+  entry that pointed at the Windows setup would otherwise pass every other check and be written
+  over the AppImage. That keeps a feed from sending OAIY elsewhere; it is not what ties the
+  bytes to their version (a release can hold any file under any name), which the signature
+  does (above).
+- **What the file is.** The bytes must start the way this platform's installer does: `MZ` for
+  the Windows setup, `\x7fELF` for the AppImage. The updater on Windows runs whatever it is
+  given and the one on Linux writes it over the AppImage without looking, so a file of the
+  wrong kind is not a failed update but a program that will not start, put where the working
+  one was. The kind is checked when the download is verified, and again right before the
+  installer is handed the bytes, together with the version and the platform (`update::verify`,
+  `check_for_hand_off`).
 - **The feed.** At most 256 KiB, counted as it arrives; https only, redirects too (GitHub
   sends the request through two); every field checked; a version that is lower or equal is
   never an update, and neither is one that is not a version. A platform the feed has nothing

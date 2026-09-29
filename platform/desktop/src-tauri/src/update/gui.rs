@@ -139,7 +139,8 @@ impl Platform for GuiPlatform {
                 return Err(changed());
             }
             if self.strict_assets {
-                check_asset_url(update.download_url.as_str(), &update.version)?;
+                let target = Target::current().ok_or_else(|| "There is no release of OAIY for this kind of computer, so nothing was fetched.".to_string())?;
+                check_asset_url(update.download_url.as_str(), &update.version, target)?;
             }
             self.store.set(Some(update));
             Ok(())
@@ -252,10 +253,9 @@ fn run_install(app: &AppHandle, updater: &UpdaterHandle, update: Update) -> Outc
     let refs: Vec<&dyn Part> = parts.iter().map(|p| p.as_ref() as &dyn Part).collect();
     let flush = || flush_agent(app, updater);
     let hand_off = |package: &VerifiedPackage| {
-        // The bytes that were verified are for the version the update handle names: never hand over any others.
-        if package.version() != update.version {
-            return Err(format!("the downloaded update is for version {}, not {}", package.version(), update.version));
-        }
+        // The last look, before anything is written or started: the bytes that were verified are for the version the update
+        // handle names and this platform's kind of installer, and start the way that kind of file does.
+        package.check_for_hand_off(&update.version, Target::current())?;
         update.install(package.bytes()).map_err(|e| explain(&e))
     };
     let clock = std::time::Instant::now;

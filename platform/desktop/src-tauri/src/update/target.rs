@@ -1,15 +1,18 @@
-//! What an update installs on each platform: which kind of installer, and which name it may have been signed under.
+//! What an update installs on each platform: which file, under what name, starting how.
 //!
 //! Two installs can update themselves (see [`super::kind`]), and each has exactly one kind of installer:
 //!
-//! | platform key | installer | the bundler's name for it |
-//! |---|---|---|
-//! | `windows-x86_64` | the NSIS setup | `OAIY_<v>_x64-setup.exe` |
-//! | `linux-x86_64` | the AppImage | `OAIY_<v>_amd64.AppImage` |
+//! | platform key | installer | the release asset | the bundler's name for it | starts with |
+//! |---|---|---|---|---|
+//! | `windows-x86_64` | the NSIS setup | `oaiy-desktop-<v>-windows-x64-setup.exe` | `OAIY_<v>_x64-setup.exe` | `MZ` |
+//! | `linux-x86_64` | the AppImage | `oaiy-desktop-<v>-linux-x86_64.AppImage` | `OAIY_<v>_amd64.AppImage` | `\x7fELF` |
 //!
-//! The Tauri CLI writes the name of the file it signed into the signature's trusted comment (`file:<name>`), and the
-//! trusted comment is covered by the signature. That is what ties a signature to a version: the feed's version number is
-//! text anyone who can change the feed can change, but the name inside a genuine signature cannot be changed.
+//! The Windows updater runs whatever it is given as an installer and the Linux updater writes whatever it is given over the
+//! AppImage, so an installer of the wrong kind (a `setup.exe` where the AppImage belongs, a file that is neither) is not
+//! a failed update: it is a program that will not start, put where the working one was. Three checks keep the kinds apart,
+//! each on its own: the address must be this platform's asset by its exact name ([`Target::asset_name`], see
+//! `feed::check_asset_url`), the name the signature was made for must be an installer of this kind for the announced
+//! version ([`Target::signed_name_fits`]), and the bytes must start the way such a file does ([`Target::looks_like`]).
 
 /// The two things an update can install.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -52,6 +55,14 @@ impl Target {
         }
     }
 
+    /// The name the release job gives the asset (exact: no other name is this platform's installer).
+    pub fn asset_name(self, version: &str) -> String {
+        match self {
+            Target::WindowsSetup => format!("oaiy-desktop-{version}-windows-x64-setup.exe"),
+            Target::LinuxAppImage => format!("oaiy-desktop-{version}-linux-x86_64.AppImage"),
+        }
+    }
+
     /// How the name of such a file ends (the bundler's, and the release's).
     pub fn file_suffix(self) -> &'static str {
         match self {
@@ -66,6 +77,19 @@ impl Target {
             Target::WindowsSetup => "the Windows installer (a setup.exe)",
             Target::LinuxAppImage => "the Linux AppImage",
         }
+    }
+
+    /// The first bytes of such a file: `MZ` (a Windows executable), `\x7fELF` (a Linux executable, which an AppImage is).
+    pub fn magic(self) -> &'static [u8] {
+        match self {
+            Target::WindowsSetup => b"MZ",
+            Target::LinuxAppImage => b"\x7fELF",
+        }
+    }
+
+    /// Whether `bytes` start the way a file of this kind does.
+    pub fn looks_like(self, bytes: &[u8]) -> bool {
+        bytes.starts_with(self.magic())
     }
 
     /// Whether the file name a signature says it was made for (the `file:` of its trusted comment: the Tauri CLI writes the
@@ -102,6 +126,27 @@ mod tests {
         }
         for target in [Target::WindowsSetup, Target::LinuxAppImage] {
             assert_eq!(Target::for_platform_key(target.platform_key()), Some(target));
+        }
+    }
+
+    #[test]
+    fn the_asset_names_are_the_ones_the_release_job_gives() {
+        assert_eq!(Target::WindowsSetup.asset_name("0.2.0"), "oaiy-desktop-0.2.0-windows-x64-setup.exe");
+        assert_eq!(Target::LinuxAppImage.asset_name("0.2.0"), "oaiy-desktop-0.2.0-linux-x86_64.AppImage");
+        // release.yml (the Collect step) and make-latest-json.mjs name them the same.
+        let workflow = include_str!("../../../../../.github/workflows/release.yml").replace("\r\n", "\n");
+        assert!(workflow.contains("\"$out/oaiy-desktop-$VERSION-windows-x64-setup.exe\""), "release.yml names the Windows asset differently");
+        assert!(workflow.contains("\"$out/oaiy-desktop-$VERSION-linux-x86_64.AppImage\""), "release.yml names the Linux asset differently");
+    }
+
+    #[test]
+    fn a_setup_starts_with_mz_and_an_appimage_with_elf_and_neither_is_the_other() {
+        let exe = b"MZ\x90\x00\x03\x00\x00\x00";
+        let elf = b"\x7fELF\x02\x01\x01\x00";
+        assert!(Target::WindowsSetup.looks_like(exe) && !Target::WindowsSetup.looks_like(elf));
+        assert!(Target::LinuxAppImage.looks_like(elf) && !Target::LinuxAppImage.looks_like(exe));
+        for junk in [&b""[..], b"M", b"Z", b"\x7fEL", b"<html>", b"PK\x03\x04", b"#!/bin/sh\n"] {
+            assert!(!Target::WindowsSetup.looks_like(junk) && !Target::LinuxAppImage.looks_like(junk), "{junk:?}");
         }
     }
 

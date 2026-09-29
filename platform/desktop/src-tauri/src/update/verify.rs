@@ -56,6 +56,25 @@ impl VerifiedPackage {
     pub fn is_empty(&self) -> bool {
         self.bytes.is_empty()
     }
+
+    /// The last look before the installer is given the bytes (the desktop's hand-off calls it, and nothing goes to the installer
+    /// unless it is Ok): they are for `update_version`, the version of the update handle the installer belongs to, and for the
+    /// kind of installer `current` (this platform's: None when no release is built for it), and they start the way that kind of
+    /// file does. A package that was made by [`verify_package`] passes; this is for the day one does not (a mix-up of
+    /// handles, a package built for another platform, a change made to the bytes in memory).
+    pub fn check_for_hand_off(&self, update_version: &str, current: Option<Target>) -> Result<(), String> {
+        if self.version != update_version {
+            return Err(format!("the downloaded update is for version {}, not {update_version}", self.version));
+        }
+        let Some(current) = current else { return Err("there is no installer of OAIY for this kind of computer".to_string()) };
+        if self.target != current {
+            return Err(format!("the downloaded update is {}, not {}", self.target.what(), current.what()));
+        }
+        if !current.looks_like(&self.bytes) {
+            return Err(format!("the downloaded update does not start like {}", current.what()));
+        }
+        Ok(())
+    }
 }
 
 /// What a signature has to agree with: the version the feed announced, the kind of installer this platform takes,
@@ -92,6 +111,8 @@ pub enum VerifyError {
     SignedFileNotThisKind { file: String, expected: &'static str },
     /// The signature was made for a file of another version than the feed announced (a feed pairing a newer version with an older release).
     SignedFileNotThisVersion { file: String, announced: String },
+    /// The bytes do not start the way this platform's kind of installer does (the signature and its name were right).
+    NotThisKindOfFile { expected: &'static str },
     /// The signature says it was made for another version than the feed announced.
     SignedForOtherVersion { signed: String, announced: String },
     /// Versions must be signed, and this signature does not say which one it is for.
@@ -107,6 +128,7 @@ impl std::fmt::Display for VerifyError {
             VerifyError::NoSignedFile => write!(f, "The update's signature does not say which file it was made for, so the update was refused."),
             VerifyError::SignedFileNotThisKind { file, expected } => write!(f, "The update's signature was made for a file called {file}, which is not {expected}, so the update was refused."),
             VerifyError::SignedFileNotThisVersion { file, announced } => write!(f, "The update's signature was made for a file called {file}, which is not version {announced}, so the update was refused."),
+            VerifyError::NotThisKindOfFile { expected } => write!(f, "The downloaded update is not {expected}, so it was thrown away."),
             VerifyError::SignedForOtherVersion { signed, announced } => write!(f, "The update was signed for version {signed} but the update information named {announced}, so it was refused."),
             VerifyError::NoSignedVersion => write!(f, "The update's signature does not say which version it is for, so it was refused."),
         }
@@ -148,6 +170,8 @@ fn signed_version(trusted_comment: &str) -> Option<&str> {
 /// - the file name in it must be an installer of `expected.target`'s kind (its ending) for `expected.version` (one whole
 ///   underscore-separated part of it): [`Target::signed_name_fits`]. This is what a downgrade meets, since the older
 ///   installer's signature names the older version;
+/// - the bytes must start the way that kind of file does ([`Target::looks_like`]: `MZ` for the Windows setup, `\x7fELF` for the
+///   AppImage), so that a file of the wrong kind cannot come through under the right name;
 /// - a `version:` field, when there is one, must be the announced version, whatever `require_signed_version` says;
 ///   with that on, a signature without one is refused.
 pub fn verify_package(bytes: Vec<u8>, signature: &str, pubkey: &str, expected: &Expected) -> Result<VerifiedPackage, VerifyError> {
@@ -162,6 +186,11 @@ pub fn verify_package(bytes: Vec<u8>, signature: &str, pubkey: &str, expected: &
         NameProblem::NotThisKind => VerifyError::SignedFileNotThisKind { file: file.to_string(), expected: expected.target.what() },
         NameProblem::NotThisVersion => VerifyError::SignedFileNotThisVersion { file: file.to_string(), announced: expected.version.to_string() },
     })?;
+    // The signature can be right for a name and the bytes still not the kind of file that name says (the signer signed what it was
+    // given): the updater on Windows runs whatever it is handed, and the one on Linux writes it over the AppImage.
+    if !expected.target.looks_like(&bytes) {
+        return Err(VerifyError::NotThisKindOfFile { expected: expected.target.what() });
+    }
     match signed_version(comment) {
         Some(signed) => {
             let same = match (super::version::parse(signed), super::version::parse(expected.version)) {
@@ -252,7 +281,9 @@ mod tests {
     use super::testing::{comment, comment_for, comment_with_version, Keys};
     use super::*;
 
-    const INSTALLER: &[u8] = b"pretend this is a 100 MB installer";
+    /// Stand-ins that start the way a Windows executable and a Linux executable do (an update checks that much of what it is given).
+    const INSTALLER: &[u8] = b"MZ pretend this is a 100 MB installer";
+    const APPIMAGE: &[u8] = b"\x7fELF pretend this is a 100 MB AppImage";
 
     fn setup(version: &str) -> Expected<'_> {
         Expected::new(version, Target::WindowsSetup)
@@ -340,19 +371,19 @@ mod tests {
     fn each_platform_takes_only_its_own_kind_of_file() {
         let keys = Keys::new(7);
         let windows = keys.sign(INSTALLER, &comment_for(Target::WindowsSetup, "0.2.0"));
-        let linux = keys.sign(INSTALLER, &comment_for(Target::LinuxAppImage, "0.2.0"));
+        let linux = keys.sign(APPIMAGE, &comment_for(Target::LinuxAppImage, "0.2.0"));
         // Each verifies for its own platform...
         assert!(accepted(&keys, INSTALLER, &windows, &Expected::new("0.2.0", Target::WindowsSetup)).is_ok());
-        assert!(accepted(&keys, INSTALLER, &linux, &Expected::new("0.2.0", Target::LinuxAppImage)).is_ok());
+        assert!(accepted(&keys, APPIMAGE, &linux, &Expected::new("0.2.0", Target::LinuxAppImage)).is_ok());
         // ...and not for the other: the Windows setup where the AppImage belongs, and the AppImage where the setup does.
         assert!(matches!(accepted(&keys, INSTALLER, &windows, &Expected::new("0.2.0", Target::LinuxAppImage)), Err(VerifyError::SignedFileNotThisKind { .. })));
-        assert!(matches!(accepted(&keys, INSTALLER, &linux, &Expected::new("0.2.0", Target::WindowsSetup)), Err(VerifyError::SignedFileNotThisKind { .. })));
+        assert!(matches!(accepted(&keys, APPIMAGE, &linux, &Expected::new("0.2.0", Target::WindowsSetup)), Err(VerifyError::SignedFileNotThisKind { .. })));
         // Other files the pipeline makes, and things that are not file names.
         for file in ["OAIY_0.2.0_x64_en-US.msi", "OAIY_0.2.0_amd64.deb", "OAIY-0.2.0-1.x86_64.rpm", "OAIY_0.2.0_x64-setup.exe.zip", "OAIY_0.2.0", "installer.bin", "../OAIY_0.2.0_x64-setup.exe", "C:\\OAIY_0.2.0_x64-setup.exe"] {
             let sig = keys.sign(INSTALLER, &format!("timestamp:1790000000\tfile:{file}"));
             assert!(matches!(accepted(&keys, INSTALLER, &sig, &setup("0.2.0")), Err(VerifyError::SignedFileNotThisKind { .. })), "{file}");
         }
-        let message = accepted(&keys, INSTALLER, &linux, &setup("0.2.0")).unwrap_err().to_string();
+        let message = accepted(&keys, APPIMAGE, &linux, &setup("0.2.0")).unwrap_err().to_string();
         assert!(message.contains("OAIY_0.2.0_amd64.AppImage") && message.contains("Windows installer"), "{message}");
     }
 
@@ -361,9 +392,54 @@ mod tests {
         // The AppImage's name has changed between Tauri versions (amd64, x86_64, no architecture), so only these two are looked at.
         let keys = Keys::new(7);
         for file in ["OAIY_0.2.0_amd64.AppImage", "OAIY_0.2.0_x86_64.AppImage", "oaiy_0.2.0.AppImage", "OAIY_0.2.0_aarch64.AppImage"] {
-            let sig = keys.sign(INSTALLER, &format!("timestamp:1790000000\tfile:{file}"));
-            assert!(accepted(&keys, INSTALLER, &sig, &Expected::new("0.2.0", Target::LinuxAppImage)).is_ok(), "{file}");
-            assert!(matches!(accepted(&keys, INSTALLER, &sig, &Expected::new("9.9.9", Target::LinuxAppImage)), Err(VerifyError::SignedFileNotThisVersion { .. })), "{file}");
+            let sig = keys.sign(APPIMAGE, &format!("timestamp:1790000000\tfile:{file}"));
+            assert!(accepted(&keys, APPIMAGE, &sig, &Expected::new("0.2.0", Target::LinuxAppImage)).is_ok(), "{file}");
+            assert!(matches!(accepted(&keys, APPIMAGE, &sig, &Expected::new("9.9.9", Target::LinuxAppImage)), Err(VerifyError::SignedFileNotThisVersion { .. })), "{file}");
+        }
+    }
+
+    #[test]
+    fn bytes_that_are_not_this_platforms_kind_of_file_are_refused_though_the_signature_and_its_name_are_right() {
+        // Signed by the right key, under the right name, for the right version: but the file is not that kind of installer
+        // (the signer signed what it was given, or a mix-up put the wrong file under the right name).
+        let keys = Keys::new(7);
+        let wrong: [(Target, &[u8]); 7] = [
+            (Target::WindowsSetup, APPIMAGE),
+            (Target::WindowsSetup, b"<html>404</html>"),
+            (Target::WindowsSetup, b"M"),
+            (Target::WindowsSetup, b""),
+            (Target::LinuxAppImage, INSTALLER),
+            (Target::LinuxAppImage, b"#!/bin/sh\nrm -rf ~\n"),
+            (Target::LinuxAppImage, b"\x7fEL"),
+        ];
+        for (target, bytes) in wrong {
+            let sig = keys.sign(bytes, &comment_for(target, "0.2.0"));
+            assert_eq!(accepted(&keys, bytes, &sig, &Expected::new("0.2.0", target)).unwrap_err(), VerifyError::NotThisKindOfFile { expected: target.what() }, "{target:?} {bytes:?}");
+        }
+        let message = VerifyError::NotThisKindOfFile { expected: Target::LinuxAppImage.what() }.to_string();
+        assert!(message.contains("Linux AppImage") && message.contains("thrown away"), "{message}");
+    }
+
+    #[test]
+    fn the_installer_is_handed_only_bytes_for_its_own_version_and_this_platforms_kind_of_file() {
+        let keys = Keys::new(7);
+        let windows = accepted(&keys, INSTALLER, &keys.sign(INSTALLER, &comment("0.2.0")), &setup("0.2.0")).unwrap();
+        let linux = accepted(&keys, APPIMAGE, &keys.sign(APPIMAGE, &comment_for(Target::LinuxAppImage, "0.2.0")), &Expected::new("0.2.0", Target::LinuxAppImage)).unwrap();
+        assert_eq!(windows.check_for_hand_off("0.2.0", Some(Target::WindowsSetup)), Ok(()));
+        assert_eq!(linux.check_for_hand_off("0.2.0", Some(Target::LinuxAppImage)), Ok(()));
+        // The update handle is for another version than the bytes were verified for.
+        let other = windows.check_for_hand_off("0.3.0", Some(Target::WindowsSetup)).unwrap_err();
+        assert!(other.contains("0.2.0") && other.contains("0.3.0"), "{other}");
+        // No release is built for this kind of computer.
+        assert!(windows.check_for_hand_off("0.2.0", None).unwrap_err().contains("no installer"));
+        // The other platform's installer: the Linux updater writes whatever it is given over the AppImage.
+        let mixed = windows.check_for_hand_off("0.2.0", Some(Target::LinuxAppImage)).unwrap_err();
+        assert!(mixed.contains("Windows installer") && mixed.contains("Linux AppImage"), "{mixed}");
+        assert!(linux.check_for_hand_off("0.2.0", Some(Target::WindowsSetup)).is_err());
+        // Bytes that no longer start the way that kind of file does (built in place: the fields are private to this module).
+        for (target, bytes) in [(Target::WindowsSetup, &b"<html>"[..]), (Target::WindowsSetup, APPIMAGE), (Target::LinuxAppImage, INSTALLER), (Target::LinuxAppImage, b"")] {
+            let altered = VerifiedPackage { version: "0.2.0".into(), target, bytes: bytes.to_vec() };
+            assert!(altered.check_for_hand_off("0.2.0", Some(target)).unwrap_err().contains("does not start like"), "{target:?} {bytes:?}");
         }
     }
 
@@ -417,6 +493,7 @@ mod tests {
     const LINUX_SIGNATURE: &str = include_str!("testdata/linux-appimage.bin.sig");
     const REAL_PUBKEY: &str = include_str!("testdata/throwaway.key.pub");
 
+    // Payloads that are not signed under their own names are not made here: see the real ones below.
     fn real(target: Target, version: &str) -> Result<VerifiedPackage, VerifyError> {
         let (payload, signature) = match target {
             Target::WindowsSetup => (WINDOWS_PAYLOAD, WINDOWS_SIGNATURE),

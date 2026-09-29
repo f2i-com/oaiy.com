@@ -182,7 +182,7 @@ mod tests {
         let parts = parts(&log);
         let outcome = run(&u, now, &parts, &log, move || flush_log.lock().unwrap().push("flush".into()), false);
         assert_eq!(outcome, Outcome::HandedOff);
-        assert_eq!(log_of(&log), ["flush", "stop engines", "stop script host", "stop plugins", "stop services", "hand off 9 bytes"]);
+        assert_eq!(log_of(&log), ["flush", "stop engines", "stop script host", "stop plugins", "stop services", "hand off 12 bytes"]);
         assert_eq!(u.status_at(now).state, State::Installing);
     }
 
@@ -254,7 +254,7 @@ mod tests {
             }
             other => panic!("{other:?}"),
         }
-        assert_eq!(log_of(&log), ["stop engines", "stop script host", "stop plugins", "stop services", "hand off 9 bytes", "start services", "start plugins", "start script host", "start engines"]);
+        assert_eq!(log_of(&log), ["stop engines", "stop script host", "stop plugins", "stop services", "hand off 12 bytes", "start services", "start plugins", "start script host", "start engines"]);
         let s = u.status_at(now);
         assert_eq!(s.state, State::Failed);
         assert!(s.error.unwrap().contains("could not be installed"));

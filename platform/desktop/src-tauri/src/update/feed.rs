@@ -18,6 +18,8 @@ use chrono::{DateTime, FixedOffset};
 use semver::Version;
 use serde::Deserialize;
 
+use super::target::Target;
+
 /// The most a feed may be. The real one is a couple of kilobytes; more is not ours.
 pub const MAX_FEED_BYTES: usize = 256 * 1024;
 
@@ -140,21 +142,23 @@ pub fn current_platform_key() -> Option<&'static str> {
 const ASSET_HOST: &str = "github.com";
 const ASSET_PATH_PREFIX: &str = "/f2i-com/oaiy.com/releases/download/";
 
-/// Whether `url` is the installer of release `version` of this project on GitHub: over https, on github.com, with
-/// nothing to redirect the eye (no credentials, no other port, no query), under the release's tag (`v0.2.0` or
-/// `0.2.0`) and named for that version (`oaiy-desktop-0.2.0-...`).
+/// Whether `url` is the installer of release `version` of this project on GitHub for `target`: over https, on github.com,
+/// with nothing to redirect the eye (no credentials, no other port, no query), under the release's tag (`v0.2.0` or
+/// `0.2.0`) and named EXACTLY as the release job names this platform's installer ([`Target::asset_name`]:
+/// `oaiy-desktop-0.2.0-windows-x64-setup.exe` for the Windows setup, `oaiy-desktop-0.2.0-linux-x86_64.AppImage` for the AppImage).
 ///
-/// Two doors beside the signature. A feed that names another host is refused before anything is fetched from it. And the
-/// announced version has to be the one in the address: a signature made by an older Tauri CLI does not say which
-/// version it was made for, so without this a feed could pair a higher version number with the address (and genuine
-/// signature) of an OLDER release, which would install as a downgrade dressed as an update.
-pub fn check_asset_url(url: &str, version: &str) -> Result<(), String> {
-    let refuse = || Err(format!("The update points at an address that is not the installer of OAIY {version} on GitHub ({url}), so it was refused."));
+/// Doors beside the signature. A feed that names another host is refused before anything is fetched from it. The file has
+/// to be this platform's installer and no other file of the release (the Windows setup where the AppImage belongs would
+/// be written over the AppImage by the Linux updater, which does not look at what it is given, and leave a program that
+/// will not start), and it has to be of the announced version by its name. (What the address cannot prove is that the
+/// bytes behind it ARE that release: a release can hold any file. That is the signature's part: see `verify`.)
+pub fn check_asset_url(url: &str, version: &str, target: Target) -> Result<(), String> {
+    let refuse = || Err(format!("The update points at an address that is not {} of OAIY {version} on GitHub ({url}), so it was refused.", target.what()));
     let Ok(parsed) = url::Url::parse(url) else { return refuse() };
     let plain = parsed.scheme() == "https" && parsed.host_str() == Some(ASSET_HOST) && parsed.port().is_none() && parsed.username().is_empty() && parsed.password().is_none() && parsed.query().is_none() && parsed.fragment().is_none();
     let Some(rest) = parsed.path().strip_prefix(ASSET_PATH_PREFIX) else { return refuse() };
     let named = match rest.split_once('/') {
-        Some((tag, file)) => (tag == version || tag.strip_prefix('v') == Some(version)) && file.starts_with(&format!("oaiy-desktop-{version}-")) && !file.contains('/'),
+        Some((tag, file)) => (tag == version || tag.strip_prefix('v') == Some(version)) && file == target.asset_name(version),
         None => false,
     };
     if plain && named && super::version::parse(version).is_ok() {
@@ -377,11 +381,14 @@ mod tests {
         assert_eq!(evaluate(&feed, "0.1.0", Some("darwin-aarch64")), Verdict::NoUpdateForPlatform { latest: "0.2.0".into() });
     }
 
+    const WINDOWS: Target = Target::WindowsSetup;
+    const LINUX: Target = Target::LinuxAppImage;
+
     #[test]
     fn an_installer_may_only_come_from_this_projects_releases_on_github_over_https() {
         let ok = "https://github.com/f2i-com/oaiy.com/releases/download/v0.2.0/oaiy-desktop-0.2.0-windows-x64-setup.exe";
-        assert!(check_asset_url(ok, "0.2.0").is_ok());
-        assert!(check_asset_url("https://GitHub.com/f2i-com/oaiy.com/releases/download/0.2.0/oaiy-desktop-0.2.0-linux-x86_64.AppImage", "0.2.0").is_ok());
+        assert!(check_asset_url(ok, "0.2.0", WINDOWS).is_ok());
+        assert!(check_asset_url("https://GitHub.com/f2i-com/oaiy.com/releases/download/0.2.0/oaiy-desktop-0.2.0-linux-x86_64.AppImage", "0.2.0", LINUX).is_ok());
         let file = "oaiy-desktop-0.2.0-windows-x64-setup.exe";
         for bad in [
             format!("http://github.com/f2i-com/oaiy.com/releases/download/v0.2.0/{file}"),
@@ -402,24 +409,59 @@ mod tests {
             "not a url".to_string(),
             String::new(),
         ] {
-            assert!(check_asset_url(&bad, "0.2.0").is_err(), "{bad}");
+            assert!(check_asset_url(&bad, "0.2.0", WINDOWS).is_err(), "{bad}");
         }
-        assert!(check_asset_url("http://evil.example/x.exe", "0.2.0").unwrap_err().contains("http://evil.example/x.exe"));
+        let refusal = check_asset_url("http://evil.example/x.exe", "0.2.0", WINDOWS).unwrap_err();
+        assert!(refusal.contains("http://evil.example/x.exe") && refusal.contains("Windows installer"), "{refusal}");
+    }
+
+    #[test]
+    fn each_platform_takes_its_own_installer_by_its_exact_name_and_no_other_file_of_the_release() {
+        let base = "https://github.com/f2i-com/oaiy.com/releases/download/v0.2.0/";
+        let (setup, appimage) = ("oaiy-desktop-0.2.0-windows-x64-setup.exe", "oaiy-desktop-0.2.0-linux-x86_64.AppImage");
+        assert!(check_asset_url(&format!("{base}{setup}"), "0.2.0", WINDOWS).is_ok());
+        assert!(check_asset_url(&format!("{base}{appimage}"), "0.2.0", LINUX).is_ok());
+        // A Linux entry pointing at the Windows setup, and a Windows entry pointing at the AppImage: each is a genuine asset of the release.
+        let mixed = check_asset_url(&format!("{base}{setup}"), "0.2.0", LINUX).unwrap_err();
+        assert!(mixed.contains("Linux AppImage") && mixed.contains("refused"), "{mixed}");
+        assert!(check_asset_url(&format!("{base}{appimage}"), "0.2.0", WINDOWS).is_err());
+        // Nor any other file the release holds, under a name that starts or ends like an installer's.
+        for other in [
+            "oaiy-desktop-0.2.0-windows-x64.msi",
+            "oaiy-desktop-0.2.0-linux-amd64.deb",
+            "oaiy-desktop-0.2.0-linux-x86_64.rpm",
+            "oaiy-desktop-0.2.0-windows-x64-setup.exe.sig",
+            "oaiy-desktop-0.2.0-linux-x86_64.AppImage.sig",
+            "oaiy-desktop-0.2.0-windows-x64-setup.exe.zip",
+            "oaiy-desktop-0.2.0-windows-x64-setup.exe.evil.exe",
+            "oaiy-desktop-0.2.0-rc.1-windows-x64-setup.exe",
+            "oaiy-desktop-0.2.0-windows-x86-setup.exe",
+            "oaiy-desktop-0.2.0-linux-aarch64.AppImage",
+            "oaiy-desktop-0.2.0-.AppImage",
+            "oaiy-server-0.2.0-linux-x86_64.tar.gz",
+            "OAIY_0.2.0_x64-setup.exe",
+            "latest.json",
+            "SHA256SUMS.txt",
+        ] {
+            for target in [WINDOWS, LINUX] {
+                assert!(check_asset_url(&format!("{base}{other}"), "0.2.0", target).is_err(), "{other} as {target:?}");
+            }
+        }
     }
 
     #[test]
     fn the_announced_version_has_to_be_the_one_in_the_installers_address() {
         // A feed pairing a higher number with the address of an older, genuinely signed release: a downgrade dressed as an update.
         let older = "https://github.com/f2i-com/oaiy.com/releases/download/v0.1.5/oaiy-desktop-0.1.5-windows-x64-setup.exe";
-        assert!(check_asset_url(older, "0.1.5").is_ok());
+        assert!(check_asset_url(older, "0.1.5", WINDOWS).is_ok());
         for announced in ["9.9.9", "0.2.0", "0.1.50", "0.1"] {
-            assert!(check_asset_url(older, announced).is_err(), "announced {announced}");
+            assert!(check_asset_url(older, announced, WINDOWS).is_err(), "announced {announced}");
         }
         // The tag and the file each have to say it.
-        assert!(check_asset_url("https://github.com/f2i-com/oaiy.com/releases/download/v0.1.5/oaiy-desktop-9.9.9-windows-x64-setup.exe", "9.9.9").is_err());
-        assert!(check_asset_url("https://github.com/f2i-com/oaiy.com/releases/download/v9.9.9/oaiy-desktop-0.1.5-windows-x64-setup.exe", "9.9.9").is_err());
+        assert!(check_asset_url("https://github.com/f2i-com/oaiy.com/releases/download/v0.1.5/oaiy-desktop-9.9.9-windows-x64-setup.exe", "9.9.9", WINDOWS).is_err());
+        assert!(check_asset_url("https://github.com/f2i-com/oaiy.com/releases/download/v9.9.9/oaiy-desktop-0.1.5-windows-x64-setup.exe", "9.9.9", WINDOWS).is_err());
         // The version itself has to be one.
-        assert!(check_asset_url("https://github.com/f2i-com/oaiy.com/releases/download/vlatest/oaiy-desktop-latest-x.exe", "latest").is_err());
+        assert!(check_asset_url("https://github.com/f2i-com/oaiy.com/releases/download/vlatest/oaiy-desktop-latest-windows-x64-setup.exe", "latest", WINDOWS).is_err());
     }
 
     #[test]
