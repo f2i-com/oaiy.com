@@ -81,9 +81,11 @@ function setup() {
     sessions: () => sessions.forOutreach(),
     post: () => true,
     report: () => {},
+    identity: () => ({ business: 'Greenleaf Lawns', receptionist: 'Aokie' }),
     now: () => T0,
   });
   sessions.outreach = outreach;
+  sessions.identity = () => ({ business: 'Greenleaf Lawns', receptionist: 'Aokie' });
   const start = async (input: Record<string, unknown>) => {
     const plan = outreach.plan(input, null);
     if (typeof plan === 'string') throw new Error(plan);
@@ -112,7 +114,7 @@ const TEXT = {
   kind: 'text',
   name: 'Friday reminders',
   objective: 'Check they are still coming on Friday.',
-  textTemplate: 'Hi {first_name}, still right for Friday? Reply YES or NO.',
+  textTemplate: 'Hi {first_name}, {business} here: still right for Friday? Reply YES or NO.',
   collect: [{ key: 'coming', question: 'Still coming?', type: 'yes_no' }],
   people: [{ name: 'Jane Smith', number: '0412 345 678' }],
 };
@@ -125,7 +127,9 @@ describe('an outreach call', () => {
         expect(tools.map((t) => t.name)).toEqual(expect.arrayContaining(['record_result', 'end_call']));
         expect(Object.keys(tools.find((t) => t.name === 'end_call')!.parameters.properties)).toEqual(['goodbye', 'silent']);
         const sent = JSON.stringify(body);
-        expect(sent).toContain("This is a call YOU placed for your person's outreach \\\"Confirm Friday bookings\\\"");
+        expect(sent).toContain("This is a call YOU placed: you are calling on behalf of Greenleaf Lawns, as Aokie, for your person's outreach \\\"Confirm Friday bookings\\\"");
+        // Every agent a customer talks to says who it is, for whom.
+        expect(sent).toContain('You are Aokie, the receptionist for Greenleaf Lawns.');
         expect(sent).toContain('You rang Jane Smith (+61412345678); they answered');
         expect(sent).toContain('Why you rang: Confirm they are still coming on Friday.');
         return { text: 'Great, see you Friday.', calls: [{ name: 'end_call', input: { goodbye: 'Bye!' } }] };
@@ -214,7 +218,8 @@ describe('an outreach text', () => {
     const fake = fakeProvider('openai', [
       (body) => {
         const sent = JSON.stringify(body);
-        expect(sent).toContain("You texted them for your person's outreach \\\"Friday reminders\\\"");
+        expect(sent).toContain("You texted them on behalf of Greenleaf Lawns, as Aokie, for your person's outreach \\\"Friday reminders\\\"");
+        expect(sent).toContain('You are Aokie, the receptionist for Greenleaf Lawns.');
         expect(sent).toContain('[OAIY] Outreach \\"Friday reminders\\": you texted them');
         expect((body.tools as Array<{ function: { name: string } }>).map((t) => t.function.name)).toContain('record_result');
         return { calls: [{ name: 'record_result', input: { outcome: 'completed', answers: { coming: 'yes' }, summary: 'Yes, Friday.' } }, { name: 'send_text_message', input: { body: 'Thanks Jane, see you Friday!' } }] };
@@ -224,14 +229,14 @@ describe('an outreach text', () => {
     const { sessions, outreach, commands, start } = setup();
     const c = await start(TEXT);
     const texts = () => commands.filter((x) => x.command === 'sms.send').map((x) => x.payload.body);
-    expect(texts()).toEqual(['Hi Jane, still right for Friday? Reply YES or NO.']);
+    expect(texts()).toEqual(['Hi Jane, Greenleaf Lawns here: still right for Friday? Reply YES or NO.']);
     const thread = sessions.threads().find((t) => t.key === '+61412345678')!;
     expect(c.people[0].thread).toBe(thread.id);
     await outreach.event(ev('aokie.sms.sent', { messageId: `oaiy-out.${c.id}.p1.1` }));
     await sessions.textArrived('0412345678', 'Jane', 'Yes, see you then');
     await settled(sessions);
     expect(fake.bodies).toHaveLength(2);
-    expect(texts()).toEqual(['Hi Jane, still right for Friday? Reply YES or NO.', 'Thanks Jane, see you Friday!']);
+    expect(texts()).toEqual(['Hi Jane, Greenleaf Lawns here: still right for Friday? Reply YES or NO.', 'Thanks Jane, see you Friday!']);
     expect(c.people[0]).toMatchObject({ state: 'done', outcome: 'completed', answers: { coming: true } });
     // One conversation for her: the outreach note, her reply and the answer.
     expect(sessions.threads().filter((t) => t.key === '+61412345678')).toHaveLength(1);

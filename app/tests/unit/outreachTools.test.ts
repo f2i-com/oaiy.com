@@ -31,6 +31,7 @@ function setup(o: { approve?: boolean; ready?: string } = {}) {
     sessions: () => null,
     post: () => true,
     report: () => {},
+    identity: () => ({ business: 'Greenleaf Lawns', receptionist: 'Aokie' }),
     // Outside the window: nothing is dialled while the tools are tried.
     now: () => new Date(2026, 8, 29, 22, 0).getTime(),
   });

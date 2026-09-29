@@ -22,6 +22,7 @@ import { callsBack, isBlocked, retryAfter, type Screening } from './callbacks';
 import { displayNumber, samePerson, toE164 } from './phoneNumbers';
 import type { PhoneLine } from './phoneLine';
 import type { Vfs } from './vfs/vfs';
+import { NO_IDENTITY, type Identity } from './identity';
 
 export type OutreachKind = 'call' | 'text';
 export type FieldType = 'text' | 'yes_no' | 'number' | 'date' | 'time' | 'choice';
@@ -135,6 +136,8 @@ export interface Campaign {
   people: Person[];
   /** Skipped at planning, with why (listed in the results). */
   skipped: Array<{ name: string; number: string; why: string }>;
+  /** Who it speaks as ({receptionist} and {business} in its templates), as it was approved (none: one from before, which takes the desktop's now). */
+  identity?: Identity;
 }
 
 /** A campaign as planned, before it is approved. */
@@ -156,6 +159,8 @@ export interface OutreachPlan {
   people: Person[];
   skipped: Array<{ name: string; number: string; why: string }>;
   merged: number;
+  /** Who it speaks as: the templates' {receptionist} and {business}. */
+  identity: Identity;
 }
 
 /** Where the campaigns are kept (the Front desk's storage, beside its files). */
@@ -209,6 +214,8 @@ export interface OutreachDeps {
   post: (campaign: Campaign, text: string) => boolean;
   /** The campaign is finished: its report for that conversation. */
   report: (campaign: Campaign) => void;
+  /** Who the calls and texts speak as: the receptionist and the business (identity.ts). */
+  identity: () => Identity;
   changed?: () => void;
   now?: () => number;
 }
@@ -279,12 +286,16 @@ export function firstName(name: string): string {
   return name.trim().split(/\s+/)[0] ?? '';
 }
 
-/** A template with a person's details put in: {name}, {first_name} and their fields. */
-export function fill(template: string, p: Pick<Person, 'name' | 'fields'>): { text: string; missing: string[] } {
+/**
+ * A template with a person's details put in: {name}, {first_name} and their
+ * fields, and who it speaks as, {receptionist} and {business} (a field of the
+ * same name does not take their place).
+ */
+export function fill(template: string, p: Pick<Person, 'name' | 'fields'>, identity: Identity = NO_IDENTITY): { text: string; missing: string[] } {
   const missing: string[] = [];
   const text = template.replace(/\{\s*([A-Za-z_][\w]*)\s*\}/g, (all, key: string) => {
     const k = key.toLowerCase();
-    const value = k === 'name' ? p.name : k === 'first_name' ? firstName(p.name) : Object.entries(p.fields).find(([f]) => f.toLowerCase() === k)?.[1];
+    const value = k === 'name' ? p.name : k === 'first_name' ? firstName(p.name) : k === 'receptionist' ? identity.receptionist : k === 'business' ? identity.business : Object.entries(p.fields).find(([f]) => f.toLowerCase() === k)?.[1];
     if (!value?.trim()) {
       missing.push(key);
       return all;
@@ -343,7 +354,28 @@ const time = (ms: number) => new Date(ms).toLocaleTimeString('en-AU', { hour: 'n
 const isRecord = (v: unknown): v is Record<string, unknown> => !!v && typeof v === 'object' && !Array.isArray(v);
 const str = (v: unknown, max: number) => (typeof v === 'string' ? v.replace(/\s+/g, ' ').trim().slice(0, max) : '');
 
+/** Words a customer never hears: the app's name, and its own word for the business's owner. */
+const NEVER_SAID = /\bOAIY\b|\byour person\b/i;
+const SAY_WHO = 'say who is calling with {receptionist} and {business} (they are filled in), e.g. "Hi {first_name}, it\'s {receptionist} from {business} about …"';
+
+/**
+ * Why words a customer hears (an opening line, a text, a voicemail message)
+ * will not do ('' when they will): they say "OAIY" or "your person", or
+ * (`naming`) name neither the business nor the receptionist.
+ */
+export function speaksAs(text: string, identity: Identity, what: string, naming = true): string {
+  const bad = NEVER_SAID.exec(text);
+  if (bad) return `The ${what} says "${bad[0]}": customers hear the business and its receptionist, never OAIY or "your person". Instead, ${SAY_WHO}.`;
+  const names = [identity.receptionist, identity.business].filter(Boolean);
+  if (naming && !names.some((n) => text.toLowerCase().includes(n.toLowerCase()))) {
+    return `The ${what} ${names.length === 1 ? `does not say "${names[0]}"` : `names neither "${names[0]}" nor "${names[1]}"`}: ${SAY_WHO}.`;
+  }
+  return '';
+}
+
 export interface PlanContext {
+  /** Who the calls and texts speak as. */
+  identity: Identity;
   screening: Screening | null;
   doNotContact: DoNotContact[];
   /** A text campaign already waiting on this number's reply: its name. */
@@ -383,8 +415,8 @@ export function planOutreach(input: Record<string, unknown>, ctx: PlanContext): 
   }
   const openingLine = str(input.openingLine, 1000);
   const textTemplate = typeof input.textTemplate === 'string' ? input.textTemplate.trim().slice(0, 2000) : '';
-  if (kind === 'call' && !openingLine) return 'openingLine is needed for calls: the exact first words they hear when they answer, e.g. "Hi {first_name}, it\'s Greenleaf Lawns about your mow on {appointment}. Have you got a minute?"';
-  if (kind === 'text' && !textTemplate) return 'textTemplate is needed for texts: the first message, e.g. "Hi {first_name}, it\'s Greenleaf Lawns: are you still right for your mow on {appointment}? Reply YES or NO."';
+  if (kind === 'call' && !openingLine) return 'openingLine is needed for calls: the exact first words they hear when they answer, saying who is calling, e.g. "Hi {first_name}, it\'s {receptionist} from {business} about your mow on {appointment}. Have you got a minute?"';
+  if (kind === 'text' && !textTemplate) return 'textTemplate is needed for texts: the first message, saying who it is from, e.g. "Hi {first_name}, it\'s {receptionist} from {business}: are you still right for your mow on {appointment}? Reply YES or NO."';
   const voicemail = input.voicemail === 'leave_message' ? 'leave_message' : 'no_message';
   const voicemailMessage = str(input.voicemailMessage, 600);
   if (kind === 'call' && voicemail === 'leave_message' && !voicemailMessage) return 'voicemail is leave_message: give voicemailMessage, the words left on their voicemail.';
@@ -452,19 +484,29 @@ export function planOutreach(input: Record<string, unknown>, ctx: PlanContext): 
   // Every placeholder has a value for every person, and each filled message fits.
   const template = kind === 'call' ? openingLine : textTemplate;
   const limit = kind === 'call' ? 500 : 1600;
+  const what = kind === 'call' ? 'opening line' : 'text';
+  const noBusiness = (missing: string[]) => missing.some((m) => m.toLowerCase() === 'business');
+  const businessUnset = "{business} has no value: the business's name is not set in OAIY yet (your person sets it in Hours & Services). Say {receptionist} alone for now, or ask your person to set it.";
   for (const p of people) {
-    const filled = fill(template, p);
+    const filled = fill(template, p, ctx.identity);
     const who = p.name || displayNumber(p.number);
-    if (filled.missing.length) return `{${filled.missing[0]}} has no value for ${who}: give it in their fields (or their name), or leave it out of the ${kind === 'call' ? 'opening line' : 'text'}.`;
-    if (filled.text.length > limit) return `The ${kind === 'call' ? 'opening line' : 'text'} for ${who} is ${filled.text.length} characters: keep it under ${limit}.`;
+    if (noBusiness(filled.missing)) return businessUnset;
+    if (filled.missing.length) return `{${filled.missing[0]}} has no value for ${who}: give it in their fields (or their name), or leave it out of the ${what}.`;
+    if (filled.text.length > limit) return `The ${what} for ${who} is ${filled.text.length} characters: keep it under ${limit}.`;
+    // Customers hear who is calling (the receptionist, for the business), never the app's own words.
+    const wrong = speaksAs(filled.text, ctx.identity, what);
+    if (wrong) return wrong;
     if (kind === 'call' && voicemail === 'leave_message') {
-      const vm = fill(voicemailMessage, p);
+      const vm = fill(voicemailMessage, p, ctx.identity);
+      if (noBusiness(vm.missing)) return businessUnset;
       if (vm.missing.length) return `{${vm.missing[0]}} has no value for ${who} in the voicemail message.`;
+      const said = speaksAs(vm.text, ctx.identity, 'voicemail message', false);
+      if (said) return said;
     }
   }
   // Ids in list order, 1 up.
   people.forEach((p, i) => (p.id = `p${i + 1}`));
-  return { kind, name, slug, objective, collect, openingLine, textTemplate, voicemail, voicemailMessage, retries, replyDeadlineHours, window, afterwards, resultsPath, people, skipped, merged };
+  return { kind, name, slug, objective, collect, openingLine, textTemplate, voicemail, voicemailMessage, retries, replyDeadlineHours, window, afterwards, resultsPath, people, skipped, merged, identity: ctx.identity };
 }
 
 // ---- results ----------------------------------------------------------------------
@@ -564,14 +606,15 @@ export function reportText(c: Campaign): string {
 // ---- the agent's side -------------------------------------------------------------
 
 /** What a call's agent is told about the outreach (kept short: the first reply must be quick). */
-export function outreachCallInstructions(c: Campaign, p: Person, inbound = false): string {
+export function outreachCallInstructions(c: Campaign, p: Person, inbound = false, identity: Identity = c.identity ?? NO_IDENTITY): string {
   const first = firstName(p.name) || 'the person you rang';
   const details = Object.entries(p.fields).map(([k, v]) => `${k.replace(/_/g, ' ')}: ${v}`).join('; ');
-  const vm = fill(c.voicemailMessage, p).text;
+  const vm = fill(c.voicemailMessage, p, identity).text;
+  const business = identity.business || 'the business';
   return [
     inbound
       ? `They rang you, and they are on your person's outreach list "${c.name}". Help with what they rang about first; then, if it fits, the outreach below.`
-      : `This is a call YOU placed for your person's outreach "${c.name}". You already said: "${fill(c.openingLine, p).text}".`,
+      : `This is a call YOU placed: you are calling on behalf of ${business}, as ${identity.receptionist}, for your person's outreach "${c.name}". You already said: "${fill(c.openingLine, p, identity).text}".`,
     `Who: ${p.name || 'no name given'} (${displayNumber(p.number)}).${p.notes ? ` ${p.notes}.` : ''}${details ? ` Their details: ${details}.` : ''}`,
     `Why you rang: ${c.objective}`,
     c.collect.length ? `Find out, one question at a time, in your own words:\n${c.collect.map((f) => `- ${f.key}${typeWords(f)}${f.optional ? ' (only if needed)' : ''}: ${f.question}`).join('\n')}` : '',
@@ -586,10 +629,10 @@ export function outreachCallInstructions(c: Campaign, p: Person, inbound = false
 }
 
 /** What a texts' agent is told about the outreach. */
-export function outreachTextInstructions(c: Campaign, p: Person): string {
+export function outreachTextInstructions(c: Campaign, p: Person, identity: Identity = c.identity ?? NO_IDENTITY): string {
   const first = firstName(p.name) || 'who you texted';
   return [
-    `You texted them for your person's outreach "${c.name}": ${c.objective.replace(/[.!?]*$/, '.')} What was sent is in this conversation (the note "[OAIY] Outreach …").`,
+    `You texted them on behalf of ${identity.business || 'the business'}, as ${identity.receptionist}, for your person's outreach "${c.name}": ${c.objective.replace(/[.!?]*$/, '.')} What was sent is in this conversation (the note "[OAIY] Outreach …").`,
     `Who: ${p.name || 'no name given'}.${p.notes ? ` ${p.notes}.` : ''}`,
     c.collect.length ? `Find out, in as few texts as you can:\n${c.collect.map((f) => `- ${f.key}${typeWords(f)}${f.optional ? ' (only if needed)' : ''}: ${f.question}`).join('\n')}` : '',
     "Keep follow-ups to one short text; don't text again if they don't answer. Call record_result when you have the answers, or when they decline (the last one counts).",
@@ -713,9 +756,15 @@ export class Outreach {
     return this.campaigns.some((c) => c.kind === 'text' && (c.state === 'running' || c.state === 'paused' || c.people.some(replyMayCome)));
   }
 
+  /** Who a campaign speaks as: as it was approved (one from before: the desktop's now). */
+  private identityOf(c: Campaign): Identity {
+    return c.identity ?? this.deps.identity();
+  }
+
   /** start_outreach's input as a plan (or what is wrong with it). */
   plan(input: Record<string, unknown>, screening: Screening | null): OutreachPlan | string {
     return planOutreach(input, {
+      identity: this.deps.identity(),
       screening,
       doNotContact: this.doNotContact,
       slugs: new Set(this.campaigns.map((c) => c.slug)),
@@ -739,7 +788,7 @@ export class Outreach {
       retries: plan.retries, replyDeadlineHours: plan.replyDeadlineHours, window: plan.window, afterwards: plan.afterwards,
       origin, resultsPath: plan.resultsPath, state: 'running', waitingFor: '', faults: 0,
       createdAt: now, approvedAt: now, endedAt: null, report: { text: '', pending: false, delivered: false }, lines: [],
-      people: plan.people.map((p) => ({ ...p, history: [], answers: {} })), skipped: plan.skipped,
+      people: plan.people.map((p) => ({ ...p, history: [], answers: {} })), skipped: plan.skipped, identity: plan.identity,
     };
     this.campaigns.push(c);
     await this.save(c);
@@ -950,7 +999,7 @@ export class Outreach {
     try {
       const reply = (await desktop.command('aokie', 'call.dial', {
         number: p.number,
-        openingLine: fill(c.openingLine, p).text,
+        openingLine: fill(c.openingLine, p, this.identityOf(c)).text,
         purpose: `${c.name}: ${c.objective}`.slice(0, 300),
       }, `oaiy:outreach:${c.id}:${p.id}:${n}`)) as Record<string, unknown> | null;
       const callId = typeof reply?.callId === 'string' ? reply.callId : '';
@@ -1063,7 +1112,7 @@ export class Outreach {
   /** Text them, and note it in their conversation. */
   private async send(c: Campaign, p: Person, desktop: Desktop, now: number): Promise<void> {
     const n = p.tries + 1;
-    const body = fill(c.textTemplate, p).text;
+    const body = fill(c.textTemplate, p, this.identityOf(c)).text;
     const messageId = `oaiy-out.${c.id}.${p.id}.${n}`;
     p.state = 'sending';
     // A text that failed once is tried once more, and no more.
@@ -1415,7 +1464,8 @@ export class Outreach {
       instructions: () => {
         const hit = find();
         if (!hit) return '';
-        return c.kind === 'call' ? outreachCallInstructions(hit.c, hit.p, inbound) : outreachTextInstructions(hit.c, hit.p);
+        const identity = this.identityOf(hit.c);
+        return c.kind === 'call' ? outreachCallInstructions(hit.c, hit.p, inbound, identity) : outreachTextInstructions(hit.c, hit.p, identity);
       },
       resultTool: () => ({
         spec: {

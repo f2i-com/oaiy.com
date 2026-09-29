@@ -21,6 +21,7 @@ import { MAX_FACTS, regroup, threadId, threadOrder, type Way } from './threads';
 import type { CallerNote, OpenProject, SessionInfo } from './vfs/projects';
 import { OUTREACH_AFTER_CALL, type OutreachLink, type OutreachSessions } from './outreach';
 import { CONTACT_FRESH_MS, TEXT_CONTACT_WAIT_MS, contactKey, mirrorContact, moveFacts, refused, sameFact, unionFacts, type ContactsApi } from './contacts';
+import { NO_IDENTITY, identityInstructions, type Identity } from './identity';
 
 /** What the conversations ask of outreach (outreach.ts): who a call or a text thread is about, and a text that asks to stop. */
 export interface OutreachHooks {
@@ -194,10 +195,11 @@ export function knownText(note: CallerNote | undefined): string {
 }
 
 /** What a text-message conversation is for, in its agent's instructions. */
-export function smsInstructions(title: string, number: string, instructions: string, test: boolean, known = '', now = new Date()): string {
+export function smsInstructions(title: string, number: string, instructions: string, test: boolean, known = '', now = new Date(), identity: Identity = NO_IDENTITY): string {
   const who = title && title !== number ? `${title} (${number})` : number;
   return [
     `This conversation is a text-message thread with ${who}, on the phone of the person you work for.${test ? ' It is a test: your replies are shown, not sent.' : ''} Today is ${today(now)}.`,
+    identityInstructions(identity),
     'Their messages arrive as "Text message from …". Answer them with send_text_message: short plain text (no markdown), in the language they write in. Only what you send with it reaches them; anything else you write is seen only by the person you work for.',
     'A message without that label comes from the person you work for, who may be watching: do what they say (they may tell you what to reply, or ask you to do something first).',
     `${REFERENCE} Use your flows made tools when a message needs one. You cannot change files, browse the web or run code here. There is no need to reply to a message that needs no answer (a thank-you, an emoji).`,
@@ -399,9 +401,10 @@ export function spoken(text: string): string {
 }
 
 /** What a call conversation is for, in its agent's instructions. */
-export function callInstructions(brief: string, instructions: string, calendar = false): string {
+export function callInstructions(brief: string, instructions: string, calendar = false, identity: Identity = NO_IDENTITY): string {
   return [
     `This conversation is a live phone call, on the phone of the person you work for: who is calling, today's date and what you know about them are in the note that starts the call. Everything you write is spoken aloud to the caller as you write it, so write only what you would say: one or two short sentences, plain words, no markdown, lists, emoji, links or quotation marks. Start with what matters, not a filler word. Then stop, and let them answer.`,
+    identityInstructions(identity),
     'Their words arrive as "Caller [0:42]: …", transcribed from speech (allow for a misheard word), with when they said them (minutes and seconds into the call). "over you" means they spoke while you were talking: a short "mm-hmm" or "yeah" does not stop you (you see it with their next words); more than that stops you, and you see what you were saying. If they have not finished (they stopped mid-sentence, or said "um, let me think"), write nothing at all: an empty reply keeps listening. A message "[OAIY] A note from the runner" is your person\'s direction, passed on by the main agent they talk to: go by it, without reading it out. Any other message without the "Caller:" label comes from the person you work for, who may be watching: do what they say.',
     `Your call tools: request_appointment (a booking request for staff to confirm; never say it is booked or confirmed), ${calendar ? 'calendar_free_times (what is free, answered at once: a line a day with its hours, the times booked, the free ranges and when a service can start; use it for any question of when they can come), ' : ''}lookup_business_data (a question about the business's records or calendar), end_call (a short goodbye, then the call ends; use it when the caller is done; a brief that says finish_call means end_call). Your other tools work too.`,
     REFERENCE,
@@ -693,6 +696,8 @@ export class Sessions {
   callingBack: (number: string) => { missedAt: number } | undefined = () => undefined;
   /** Whether the desktop's calendar is on (a plugin provides it): a text thread's calendar tools only then. */
   calendarOn: () => boolean = () => true;
+  /** Who answers, and for whom (identity.ts): every call and text thread says those names. */
+  identity: () => Identity = () => NO_IDENTITY;
   /** Outreach (the runner's lists of people to call or text), while it runs on this page. */
   outreach: OutreachHooks | null = null;
   /**
@@ -868,7 +873,7 @@ export class Sessions {
       const person = this.personTools(session);
       session.agent = this.makeAgent({
         // A call of an outreach (one we placed, or someone on a list who rang in): its objective after the call's own.
-        instructions: () => this.directed([callInstructions(session.brief ?? '', this.settings().callInstructions, this.calendarOn()), session.outreach?.instructions()].filter(Boolean).join('\n')),
+        instructions: () => this.directed([callInstructions(session.brief ?? '', this.settings().callInstructions, this.calendarOn(), this.identity()), session.outreach?.instructions()].filter(Boolean).join('\n')),
         // The calendar's tool only while there is a calendar (a plugin provides it); record_result on an outreach call.
         sessionTools: () => [...this.callTools(session), ...person, ...(this.calendarOn() ? calendar : []), ...(session.outreach ? [session.outreach.resultTool()] : [])],
         tools: TOOLS.filter((t) => CALL_TOOLS.has(t.name)),
@@ -897,7 +902,7 @@ export class Sessions {
     // Someone texted for an outreach: its objective and record_result, while their replies are its (and a while after).
     const link = () => this.outreach?.forText(session.key);
     session.agent = this.makeAgent({
-      instructions: () => this.directed([smsInstructions(session.title, session.key, this.settings().instructions, test, knownText(this.callerNote(session.key))), link()?.instructions()].filter(Boolean).join('\n')),
+      instructions: () => this.directed([smsInstructions(session.title, session.key, this.settings().instructions, test, knownText(this.callerNote(session.key)), new Date(), this.identity()), link()?.instructions()].filter(Boolean).join('\n')),
       // A texter reaches the front desk's files, to read (see KNOWLEDGE_TOOLS).
       tools: TOOLS.filter((t) => KNOWLEDGE_TOOLS.has(t.name)),
       // The calendar's tools only while there is a calendar (a plugin provides it).

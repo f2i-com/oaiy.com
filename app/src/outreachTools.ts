@@ -49,7 +49,7 @@ export function outreachTools(deps: OutreachToolDeps): SessionTool[] {
       spec: {
         name: 'start_outreach',
         description:
-          'Call or text a list of people for your person, each with an objective (confirm a booking, remind, collect details): asks your person once, then works through the list by itself (calls one at a time while the phone is free, missed calls rung back first; texts paced), each call or text handled by an agent with the objective, which records the result. You get a line after each person and a report with the results at the end; the results are kept as files under /outreach. Only people who expect to hear from your person.',
+          'Call or text a list of people for your person, each with an objective (confirm a booking, remind, collect details): asks your person once, then works through the list by itself (calls one at a time while the phone is free, missed calls rung back first; texts paced), each call or text handled by an agent with the objective, which records the result. You get a line after each person and a report with the results at the end; the results are kept as files under /outreach. Only people who expect to hear from your person. The calls and texts speak as the business\'s receptionist: open with who is calling, e.g. "Hi {first_name}, it\'s {receptionist} from {business} about …" ({receptionist} and {business} are filled in). Never write "OAIY" or "your person" in what they hear: it is refused.',
         parameters: {
           type: 'object',
           required: ['kind', 'name', 'objective', 'people'],
@@ -87,8 +87,8 @@ export function outreachTools(deps: OutreachToolDeps): SessionTool[] {
                 },
               },
             },
-            openingLine: { type: 'string', description: 'Calls: the exact first words when they answer. {name}, {first_name} and their fields are filled in.' },
-            textTemplate: { type: 'string', description: 'Texts: the first message, filled in the same way.' },
+            openingLine: { type: 'string', description: 'Calls: the exact first words when they answer, saying who is calling. {name}, {first_name}, {receptionist}, {business} and their fields are filled in.' },
+            textTemplate: { type: 'string', description: 'Texts: the first message, saying who it is from, filled in the same way.' },
             voicemail: { type: 'string', enum: ['no_message', 'leave_message'], description: 'Calls: on a voicemail, hang up (default) or leave voicemailMessage' },
             voicemailMessage: { type: 'string' },
             retries: { type: 'object', properties: { times: { type: 'number' }, gapMinutes: { type: 'number' } }, description: 'Calls: tries after the first (default 2, 60 minutes apart)' },

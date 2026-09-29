@@ -14,6 +14,8 @@ beforeAll(() => setLocalCountry('AU'));
 /** Tuesday 29 September 2026, 10:00 local: inside the calling window. */
 const T0 = new Date(2026, 8, 29, 10, 0).getTime();
 const MIN = 60_000;
+/** Who the calls and texts speak as (the desktop's calendar settings). */
+const GREEN = { business: 'Greenleaf Lawns', receptionist: 'Aokie' };
 
 const ev = (name: string, data: Record<string, unknown> = {}, correlationId = ''): DesktopEvent => ({ seq: 1, name, source: 'aokie', correlationId, idempotencyKey: '', occurredAt: '', data });
 
@@ -108,6 +110,7 @@ function rig(o: { screening?: Screening | null; rules?: Partial<PhoneRules>; ref
       return true;
     },
     report: (c: Campaign) => void reports.push(c),
+    identity: () => GREEN,
     now: () => clock,
   };
   const outreach = new Outreach(deps);
@@ -144,6 +147,7 @@ describe('planning an outreach', () => {
         { name: 'Abroad', number: '+1 415 555 0100', fields: { service: 'x', appointment: 'y' } },
       ],
     }, {
+      identity: GREEN,
       screening: { acceptPattern: '^\\s*(\\+?61|\\(?0[1-9])', blockedNumbers: '0400000004', rejectPrivate: false },
       doNotContact: [{ number: '+61400000005', at: 0, why: 'texted STOP' }],
       inTextCampaign: () => null,
@@ -165,7 +169,7 @@ describe('planning an outreach', () => {
   });
 
   it('refuses a placeholder that has no value for someone, an opening line that is too long, and results outside /outreach', () => {
-    const ctx = { screening: null, doNotContact: [], inTextCampaign: () => null, slugs: new Set<string>() };
+    const ctx = { identity: GREEN, screening: null, doNotContact: [], inTextCampaign: () => null, slugs: new Set<string>() };
     expect(planOutreach({ ...CALLS, people: [{ name: 'Jane', number: '0412345678', fields: { service: 'mow' } }] }, ctx)).toMatch(/\{appointment\} has no value for Jane/);
     expect(planOutreach({ ...CALLS, openingLine: `Hi {first_name}, ${'very '.repeat(120)}long.`, people: [{ name: 'Jane', number: '0412345678' }] }, ctx)).toMatch(/under 500/);
     expect(planOutreach({ ...CALLS, resultsPath: '/knowledge/results.md' }, ctx)).toMatch(/under \/outreach/);
@@ -323,7 +327,7 @@ describe('how each call ends', () => {
     await r.outreach.event(ev('aokie.call.answered', { at: '' }, 'call_1'));
     expect(c.people[0].state).toBe('on_call');
     const link = r.outreach.forCall('call_1', '+61412345678')!;
-    expect(link.instructions()).toContain('This is a call YOU placed for your person\'s outreach "Confirm Friday bookings". You already said: "Hi Jane,');
+    expect(link.instructions()).toContain('This is a call YOU placed: you are calling on behalf of Greenleaf Lawns, as Aokie, for your person\'s outreach "Confirm Friday bookings". You already said: "Hi Jane,');
     expect(link.instructions().length).toBeLessThan(1600);
     const saved = await link.resultTool().run({ outcome: 'completed', answers: { coming: 'yes', nope: 'dropped' }, summary: 'Confirmed, will be there at 10:30.' });
     expect(saved).toBe('Saved: completed, coming = yes. Still to find out: nothing.');
@@ -461,7 +465,7 @@ describe('texting down a list', () => {
     await r.outreach.event(ev('aokie.sms.sent', { messageId: `oaiy-out.${c.id}.p1.1` }));
     expect(c.people[0].state).toBe('awaiting_reply');
     const link = r.outreach.forText('+61412345678')!;
-    expect(link.instructions()).toContain('You texted them for your person\'s outreach "Friday reminders"');
+    expect(link.instructions()).toContain('You texted them on behalf of Greenleaf Lawns, as Aokie, for your person\'s outreach "Friday reminders"');
     await link.resultTool().run({ outcome: 'completed', answers: { coming: 'yes' }, summary: 'Yes, see you Friday.' });
     expect(c.people[0]).toMatchObject({ state: 'done', outcome: 'completed', answers: { coming: true } });
     // Their context stays for a while, for a late reply (and the texts stay this page's for it).

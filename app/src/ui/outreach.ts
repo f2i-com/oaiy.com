@@ -30,7 +30,7 @@ export async function confirmOutreach(plan: OutreachPlan, info: { outboundOff: b
   const call = plan.kind === 'call';
   const first = plan.people[0];
   const firstWho = firstName(first.name) || displayNumber(first.number);
-  const sample = fill(call ? plan.openingLine : plan.textTemplate, first).text;
+  const sample = fill(call ? plan.openingLine : plan.textTemplate, first, plan.identity).text;
   const { shown, more } = peopleWords(plan);
   const section = (title: string, ...body: Array<Node | string>) => h('section.outreach-plan-part', h('h3', title), ...body);
   const row = (label: string, value: string) => h('div.outreach-plan-row', h('span.outreach-plan-label', label), h('span.outreach-plan-value', value));
@@ -47,7 +47,7 @@ export async function confirmOutreach(plan: OutreachPlan, info: { outboundOff: b
         row('When', timingWords(plan, info.maxDailyDials)),
         ...(call
           ? [
-              row('Voicemail', plan.voicemail === 'leave_message' ? `Leave this message: "${fill(plan.voicemailMessage, first).text}"` : 'Hang up without a message'),
+              row('Voicemail', plan.voicemail === 'leave_message' ? `Leave this message: "${fill(plan.voicemailMessage, first, plan.identity).text}"` : 'Hang up without a message'),
               row('Retries', plan.retries.times ? `${plan.retries.times} more ${plan.retries.times === 1 ? 'try' : 'tries'}, ${plan.retries.gapMinutes} minutes apart` : 'None'),
             ]
           : [row('Replies', `Answered by the texts' agent; STOP opts them out`)]),

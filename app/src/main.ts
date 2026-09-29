@@ -12,6 +12,7 @@ import { displayNumber, samePerson, setLocalCountry } from './phoneNumbers';
 import { Callbacks, type Screening } from './callbacks';
 import { PhoneLine } from './phoneLine';
 import { desktopContacts } from './contacts';
+import { IdentityCache, identityNote } from './identity';
 import { Outreach, tally, type Campaign, type OutreachKind, type OutreachPlan, type PhoneRules } from './outreach';
 import { OUTREACH_TOOL_NAMES, outreachTools } from './outreachTools';
 import { confirmOutreach } from './ui/outreach';
@@ -169,6 +170,12 @@ async function main(): Promise<void> {
    * offered (see desktop/mcp.ts).
    */
   let control: ControlClient | null = desktop ? new ControlClient(desktop.origin, desktop.token) : null;
+  /**
+   * Who answers the phone, and for whom (the receptionist's name and the
+   * business's, from the desktop's calendar settings): every call, text and
+   * outreach says them, and the runner and a project's agent know them.
+   */
+  const identity = new IdentityCache(() => desktop);
   /** What the Agent runs on, as the desktop says: the engine until it has said (and with no desktop). */
   let agentModel: AgentModel = ENGINE;
   /** Whether the desktop has said yet (its first answer is not announced). */
@@ -243,6 +250,8 @@ async function main(): Promise<void> {
       codexDefault = null;
       void followAgentModel();
     }
+    // The business's name (or the receptionist's) may have changed with the calendar's settings.
+    if (tool === 'calendar_settings_set') void identity.refresh();
   };
   /** The provider a conversation of `kind` runs on: the engine's (as chosen in Settings, followed as always), or ChatGPT's when the desktop says so. */
   const agentProvider = (kind: AgentKind): ProviderConfig | null => providerFor(kind, agentModel, activeProvider(), desktop, codexDefault);
@@ -571,7 +580,11 @@ async function main(): Promise<void> {
     const outreachSet = (k: AgentKind) => outreachTools({
       engine: () => outreach,
       origin: () => ({ kind: k === 'runner' ? 'runner' : 'project', projectId: place().meta.id, projectName: place().meta.name }),
-      ready: (what) => outreachReady(what, place()),
+      // Who the calls and texts speak as, read now: the plan fills and checks the templates with it.
+      ready: async (what) => {
+        await identity.refresh();
+        return outreachReady(what, place());
+      },
       screening: readScreening,
       approve: (plan) => approveOutreach(plan),
     });
@@ -589,7 +602,8 @@ async function main(): Promise<void> {
           ...(withPreview ? pluginTools(runner() ? 'runner' : 'project') : []),
           ...(withPreview && phoneOn() && (kind() === 'runner' || kind() === 'project') ? outreachSet(kind()) : []),
         ]),
-        instructions: () => [runner() ? RUNNER_INSTRUCTIONS : '', controlInstructions(kind())].filter(Boolean).join('\n\n'),
+        // With a phone, the runner and a project's agent know who answers it (what they write for customers says so).
+        instructions: () => [runner() ? RUNNER_INSTRUCTIONS : '', phoneOn() && (kind() === 'runner' || kind() === 'project') ? identityNote(identity.get()) : '', controlInstructions(kind())].filter(Boolean).join('\n\n'),
         toolHooks: () => toolHooks,
         vfs: place().vfs,
         gate,
@@ -700,6 +714,7 @@ async function main(): Promise<void> {
     own.calendarOn = calendarOn;
     // What is known about each person is their contact on the desktop (read, and written as they are remembered).
     own.contacts = desktopContacts(() => desktop);
+    own.identity = () => identity.get();
     await own.load();
     // Missed calls rung back: by the page that answers the calls, when the line is free (started with the phone).
     // (Never anyone on the do-not-contact list: they asked not to be called.)
@@ -721,6 +736,7 @@ async function main(): Promise<void> {
       sessions: () => sessions?.forOutreach() ?? null,
       post: postOutreach,
       report: deliverReport,
+      identity: () => identity.get(),
       changed: () => {
         renderOutreachChip();
         renderSessions();
@@ -2068,6 +2084,7 @@ With that done, Settings → Images, video and audio → Find OAIY sets it up.`)
   /** The phone came on: its calls, the leases for calls and texts, call backs and its chip start. */
   function phoneStarted(): void {
     if (!desktop) return;
+    void identity.refresh();
     followCalls();
     void refreshPhone();
     callbacks?.start();
@@ -2109,6 +2126,8 @@ With that done, Settings → Images, video and audio → Find OAIY sets it up.`)
     const fresh = !modules || modules.revision !== next.revision || modules.source !== next.source;
     modules = next;
     if (fresh && next !== UNPAIRED) void refreshControl();
+    // A plugin came or went (the calendar with it): who answers, and for whom, asked again.
+    if (fresh && next !== UNPAIRED) void identity.refresh();
     for (const change of changes) {
       if (change.id !== 'phone') continue;
       if (change.on) phoneStarted();

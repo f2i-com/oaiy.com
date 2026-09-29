@@ -216,7 +216,8 @@ const desktopServer = createHttpServer(async (req, res) => {
   }
   if (path === '/api/bridge/flows') return json({ flows: [] });
   if (path === '/api/plugins') return json({ plugins: [{ id: 'aokie', state: 'running' }] });
-  if (path.startsWith('/api/calendar')) return json({ available: true, settings: {}, appointments: [], now: new Date().toISOString() });
+  // The business the calls and texts speak for (the receptionist's name left to the default, Aokie).
+  if (path.startsWith('/api/calendar')) return json({ available: true, settings: { business: 'Greenleaf Lawns' }, appointments: [], now: new Date().toISOString() });
   if (path.startsWith('/api/voice/calls/')) {
     const said = JSON.parse(body || '{}');
     if (path.endsWith('/say')) spoken.push(said.text);
@@ -412,7 +413,8 @@ try {
     expect(!spoken.some((s) => /Lovely|welcome|Done/.test(s)), JSON.stringify(spoken));
     const call = asked.call[0];
     expect(call.tools.includes('record_result') && call.tools.includes('end_call') && !call.tools.includes('start_outreach'), JSON.stringify(call.tools));
-    expect(/This is a call YOU placed for your person's outreach "Confirm Friday bookings"/.test(call.system), 'the objective is not in the call\'s instructions');
+    expect(/This is a call YOU placed: you are calling on behalf of Greenleaf Lawns, as Aokie, for your person's outreach "Confirm Friday bookings"/.test(call.system), 'the objective is not in the call\'s instructions');
+    expect(call.system.includes('You are Aokie, the receptionist for Greenleaf Lawns.'), 'the call does not say who it is');
     await page.waitForFunction(() => [...document.querySelectorAll('.chat-feed .msg.unsaid')].some((n) => /Done\./.test(n.textContent)), { timeout: 10_000 });
     hungUp('call_1', 'completed', 'agent_hangup');
     await until('Jane done', async () => (await campaigns(page))[0]?.people[0]?.state === 'done');
@@ -538,7 +540,7 @@ try {
     await until('the reply to Dee', () => texts().length === 3, 20_000);
     expect(texts()[2].payload.to === '+61415000101' && texts()[2].payload.body === 'Thanks Dee, see you Friday!', JSON.stringify(texts()[2]));
     const sms = asked.sms[0];
-    expect(sms.tools.includes('record_result') && !sms.tools.includes('start_outreach') && /You texted them for your person's outreach "Friday reminders"/.test(sms.system), JSON.stringify(sms.tools));
+    expect(sms.tools.includes('record_result') && !sms.tools.includes('start_outreach') && /You texted them on behalf of Greenleaf Lawns, as Aokie, for your person's outreach "Friday reminders"/.test(sms.system), JSON.stringify(sms.tools));
     bridge('aokie.sms.received', { from: '+61415000102', name: 'Eve', body: 'STOP', handle: 'h2' }, 'c-h2');
     await until('Eve opted out', async () => (await campaigns(page)).find((c) => c.name === 'Friday reminders')?.people[1]?.outcome === 'opted_out');
     await wait(1000);

@@ -394,11 +394,16 @@ export class Desktop {
     return list.filter(isRecord).map((p) => ({ id: String(p.id ?? ''), state: String(p.state ?? p.status ?? '') }));
   }
 
-  /** The desktop's calendar: its settings, and the appointments from `from` (YYYY-MM-DD) to before `to`. */
-  async calendar(from?: string, to?: string, signal?: AbortSignal): Promise<{ available?: boolean; settings: Record<string, unknown>; appointments: Array<Record<string, unknown>>; now: string }> {
+  /**
+   * The desktop's calendar: its settings (with `business`, the business's
+   * name), the appointments from `from` (YYYY-MM-DD) to before `to`, and the
+   * receptionist's name (`receptionistName`, filled in: "Aokie" unless the
+   * person set one; none from a desktop before it kept one).
+   */
+  async calendar(from?: string, to?: string, signal?: AbortSignal): Promise<{ available?: boolean; settings: Record<string, unknown>; appointments: Array<Record<string, unknown>>; now: string; receptionistName?: string }> {
     const q = new URLSearchParams({ ...(from ? { from } : {}), ...(to ? { to } : {}) }).toString();
     const body = await reply(await fetch(`${this.origin}/api/calendar${q ? `?${q}` : ''}`, { headers: this.headers(), signal }));
-    return isRecord(body) ? (body as { settings: Record<string, unknown>; appointments: Array<Record<string, unknown>>; now: string }) : { settings: {}, appointments: [], now: '' };
+    return isRecord(body) ? (body as { settings: Record<string, unknown>; appointments: Array<Record<string, unknown>>; now: string; receptionistName?: string }) : { settings: {}, appointments: [], now: '' };
   }
 
   /** Free times from `from` for `days` days, for `service` (a name) or its own length. */
