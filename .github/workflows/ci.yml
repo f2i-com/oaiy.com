@@ -138,7 +138,7 @@ jobs:
       - name: Workflow paths exist
         run: |
           node platform/scripts/check-workflow-paths.mjs
-          node --test platform/scripts/workflow-yaml.test.mjs platform/scripts/check-workflow-paths.test.mjs platform/scripts/release-version.test.mjs platform/scripts/release-pages.test.mjs
+          node --test platform/scripts/workflow-yaml.test.mjs platform/scripts/check-workflow-paths.test.mjs platform/scripts/release-version.test.mjs platform/scripts/release-pages.test.mjs platform/scripts/release-updater.test.mjs platform/scripts/make-latest-json.test.mjs
       # ECO-04: advisories at high or above fail the lane. An unreachable
       # registry is recorded as UNKNOWN in the run summary, never as clean, and
       # still fails: a release must carry a completed audit.

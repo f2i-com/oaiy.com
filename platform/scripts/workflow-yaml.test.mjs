@@ -144,7 +144,7 @@ describe('the workflows', () => {
     assert.ok(version.runLine > version.line);
     const build = steps.find((step) => step.name === 'Build OAIY Desktop');
     assert.equal(build.workingDirectory, 'platform/desktop');
-    assert.equal(build.run, 'npm run tauri:build');
+    assert.match(build.run, /npm run tauri:build -- --config /);
     const cache = steps.find((step) => step.job === 'web' && step.with['cache-dependency-path']);
     assert.equal(cache.with['cache-dependency-path'], 'platform/ui/package-lock.json');
   });

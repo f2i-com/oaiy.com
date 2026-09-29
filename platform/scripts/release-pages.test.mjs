@@ -21,7 +21,7 @@ const at = (predicate) => desktop.findIndex(predicate);
 describe('the desktop legs of the release', () => {
   const agent = at((step) => step.name === 'Install and build the Agent');
   const flows = at((step) => step.name === 'Install and build the flow editor');
-  const tauri = at((step) => step.run === 'npm run tauri:build');
+  const tauri = at((step) => step.name === 'Build OAIY Desktop');
 
   it('build the Agent and the flow editor before tauri build stages them', () => {
     assert.ok(agent >= 0 && flows >= 0 && tauri >= 0, JSON.stringify({ agent, flows, tauri }));

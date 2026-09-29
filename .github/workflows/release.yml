@@ -12,16 +12,23 @@
 #                                            /desktop.html, hashed assets, fonts, _headers.
 #                                            Unzip onto any static host and it works.
 #   oaiy-desktop-<v>-windows-x64-setup.exe   OAIY Desktop, NSIS installer
-#   oaiy-desktop-<v>-windows-x64.msi         OAIY Desktop, MSI installer
+#   oaiy-desktop-<v>-windows-x64.msi         OAIY Desktop, MSI installer (a manual download: no update reaches it)
 #   oaiy-desktop-<v>-linux-x86_64.AppImage   OAIY Desktop, portable
 #   oaiy-desktop-<v>-linux-amd64.deb         OAIY Desktop, Debian/Ubuntu
 #   oaiy-desktop-<v>-linux-x86_64.rpm        OAIY Desktop, Fedora/RHEL
+#   <the setup.exe and the AppImage>.sig     their minisign signatures, made with the updater key
+#   latest.json                              the update feed OAIY Desktop reads to see whether a newer
+#                                            release exists (platform/scripts/make-latest-json.mjs)
 #   oaiy-server-<v>-linux-x86_64.tar.gz      the headless server (no GUI, no GTK) for Linux hosts
 #   oaiy-server-<v>-windows-x64.zip          the headless server for Windows
 #   oaiy-cli-<v>.tar.gz                      the CLI alone (oaiy.mjs, both ZIPP worker shells, zipp/,
 #                                            undici), OS-neutral, for a product that embeds it; carries
 #                                            SHA256SUMS and oaiy-cli.json (= `oaiy capabilities --json`)
-#   SHA256SUMS.txt
+#   SHA256SUMS.txt                           covers every file above, latest.json and the .sig files too
+#
+# The two installers an update can install are signed with the updater key: the
+# secrets TAURI_SIGNING_PRIVATE_KEY and TAURI_SIGNING_PRIVATE_KEY_PASSWORD (see
+# docs/RELEASING.md). A tag run without the key stops in the meta job.
 #
 # The tag is the version. It is stamped into
 # platform/desktop/src-tauri/tauri.conf.json and Cargo.toml at build time
@@ -145,6 +152,25 @@ jobs:
           fi
           echo "version=$version" >> "$GITHUB_OUTPUT"
           echo "Building version $version"
+
+      # A release is what every installed OAIY updates to, so it must be signed:
+      # stop here, before anything is built, when a tag run has no signing key.
+      # (A run on a branch builds without one, and its installers carry no signature.)
+      - name: The updater signing key is set
+        if: steps.v.outputs.is_tag == 'true'
+        shell: bash
+        env:
+          SIGNING_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
+          SIGNING_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
+        run: |
+          missing=""
+          [[ -n "$SIGNING_KEY" ]] || missing="TAURI_SIGNING_PRIVATE_KEY"
+          [[ -n "$SIGNING_KEY_PASSWORD" ]] || missing="${missing:+$missing and }TAURI_SIGNING_PRIVATE_KEY_PASSWORD"
+          if [[ -n "$missing" ]]; then
+            echo "::error::a release must be signed for OAIY's updater, and the Actions secret $missing is not set. Add it under Settings, Secrets and variables, Actions (docs/RELEASING.md, The updater key), then run this again."
+            exit 1
+          fi
+          echo "the updater signing key and its password are set"
 
   # ---------------------------------------------------------------- verification
   # The reusable gate, at the exact revision resolved above (OAI-01).
@@ -372,9 +398,27 @@ jobs:
         working-directory: platform/desktop
         run: npm ci
 
+      # The installers OAIY updates itself with are built with the updater
+      # artifacts on: a signature beside each, made with the updater key, which
+      # is in the environment of this step and no other. tauri.conf.json does not
+      # turn them on, so a build on a developer's machine, which has no key, still
+      # works. The override goes in as a file: JSON on the command line passes
+      # through npm and cmd.exe on Windows with its quotes mangled.
       - name: Build OAIY Desktop
+        shell: bash
         working-directory: platform/desktop
-        run: npm run tauri:build
+        env:
+          TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
+          TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
+        run: |
+          set -euo pipefail
+          if [[ -n "$TAURI_SIGNING_PRIVATE_KEY" ]]; then
+            printf '%s' '{"bundle":{"createUpdaterArtifacts":true}}' > "$RUNNER_TEMP/updater-config.json"
+            npm run tauri:build -- --config "$RUNNER_TEMP/updater-config.json"
+          else
+            echo "::warning::TAURI_SIGNING_PRIVATE_KEY is not set: this build has no updater signatures (a tag run stops earlier, in the meta job, without it)"
+            npm run tauri:build
+          fi
 
       - name: Build the headless server
         working-directory: platform/desktop/src-tauri
@@ -395,17 +439,35 @@ jobs:
         env:
           VERSION: ${{ needs.meta.outputs.version }}
           LABEL: ${{ matrix.label }}
+          IS_TAG: ${{ needs.meta.outputs.is_tag }}
         run: |
           set -euo pipefail
           out="$PWD/release"; mkdir -p "$out"
           bundle="platform/desktop/src-tauri/target/release/bundle"
           find "$bundle" -type f | sort
+          # The signature the build made beside an installer goes beside its renamed copy,
+          # under the same name and .sig. On a tag a missing one stops the release; a run
+          # on a branch, built without the key, has none.
+          collect_signature() {
+            local installer="$1" renamed="$2"
+            if [[ -f "$installer.sig" ]]; then
+              cp "$installer.sig" "$out/$renamed.sig"
+            elif [[ "$IS_TAG" == "true" ]]; then
+              echo "::error::the build made no signature beside $installer: it was built without the updater artifacts"; exit 1
+            else
+              echo "::warning::no signature beside $installer (built without the updater key)"
+            fi
+          }
           if [[ "$LABEL" == "windows" ]]; then
-            cp "$(find "$bundle" -type f -name '*-setup.exe' | head -1)" "$out/oaiy-desktop-$VERSION-windows-x64-setup.exe"
+            setup="$(find "$bundle" -type f -name '*-setup.exe' | head -1)"
+            cp "$setup" "$out/oaiy-desktop-$VERSION-windows-x64-setup.exe"
+            collect_signature "$setup" "oaiy-desktop-$VERSION-windows-x64-setup.exe"
             cp "$(find "$bundle" -type f -name '*.msi' | head -1)"       "$out/oaiy-desktop-$VERSION-windows-x64.msi"
             ( cd headless-dist && 7z a -bd "$out/oaiy-server-$VERSION-windows-x64.zip" . >/dev/null )
           else
-            cp "$(find "$bundle" -type f -name '*.AppImage' | head -1)" "$out/oaiy-desktop-$VERSION-linux-x86_64.AppImage"
+            appimage="$(find "$bundle" -type f -name '*.AppImage' | head -1)"
+            cp "$appimage" "$out/oaiy-desktop-$VERSION-linux-x86_64.AppImage"
+            collect_signature "$appimage" "oaiy-desktop-$VERSION-linux-x86_64.AppImage"
             cp "$(find "$bundle" -type f -name '*.deb' | head -1)"      "$out/oaiy-desktop-$VERSION-linux-amd64.deb"
             rpm="$(find "$bundle" -type f -name '*.rpm' | head -1 || true)"
             [[ -n "$rpm" ]] && cp "$rpm" "$out/oaiy-desktop-$VERSION-linux-x86_64.rpm"
@@ -539,6 +601,18 @@ jobs:
           [[ "$count" -ge 3 ]] || { echo "::error::expected evidence for web, linux and windows; found $count"; exit 1; }
           echo "release evidence verified for $REVISION ($count files, run $GITHUB_RUN_ID attempt ${GITHUB_RUN_ATTEMPT:-1})"
 
+      # The update feed OAIY Desktop reads (releases/latest/download/latest.json):
+      # each platform's installer, its signature (the content of the .sig the build
+      # made) and where the release publishes it. It stops the release when an
+      # installer or a signature is missing, so the release GitHub calls the latest
+      # is never one whose feed is short. Written before the checksums, which then
+      # cover it and the signatures.
+      - name: Update feed (latest.json)
+        env:
+          VERSION: ${{ needs.meta.outputs.version }}
+          TAG: ${{ github.ref_name }}
+        run: node platform/scripts/make-latest-json.mjs --dir artifacts --version "$VERSION" --tag "$TAG" --repo "$GITHUB_REPOSITORY"
+
       - name: Checksums
         working-directory: artifacts
         run: |
@@ -566,6 +640,9 @@ jobs:
           engines are not built here.
           - Windows: \`oaiy-desktop-$VERSION-windows-x64-setup.exe\` (installer) or the \`.msi\`
           - Linux: \`.AppImage\` (portable), \`.deb\` (Debian/Ubuntu) or \`.rpm\` (Fedora/RHEL)
+          - OAIY Desktop looks here for a newer version (\`latest.json\`, with the \`.sig\` signatures of
+            the setup.exe and the AppImage) and installs one only when you press the button in Settings.
+            The \`.msi\`, \`.deb\` and \`.rpm\` are not updated from inside OAIY: download a newer one.
 
           **oaiy-server** — the same local API with no window, tray or GTK, for a Linux or
           Windows host that the CLI or a hosted web app drives. See \`platform/desktop/README.md\`.
