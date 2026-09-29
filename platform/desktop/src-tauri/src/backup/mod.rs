@@ -39,6 +39,7 @@ pub mod manifest;
 pub mod restore;
 pub mod routes;
 pub mod rules;
+pub mod sanitize;
 pub mod state;
 
 use std::fmt;

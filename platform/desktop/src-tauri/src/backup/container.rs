@@ -109,6 +109,11 @@ pub(crate) fn check_entry_name(name: &str, limits: &Limits) -> Result<()> {
         if segment.ends_with('.') || segment.ends_with(' ') {
             return Err(unsafe_name("a part ends with a dot or a space"));
         }
+        // NTFS answers to a short name (PAIRIN~1.JSO) for a file with a long one, and a short name
+        // passes every check made on the long one (a word rule, an extension rule).
+        if segment.as_bytes().windows(2).any(|w| w[0] == b'~' && w[1].is_ascii_digit()) {
+            return Err(unsafe_name("it is a short-name alias"));
+        }
         let stem = segment.split('.').next().unwrap_or(segment).to_lowercase();
         if RESERVED.contains(&stem.as_str()) {
             return Err(unsafe_name("a part is a reserved device name"));

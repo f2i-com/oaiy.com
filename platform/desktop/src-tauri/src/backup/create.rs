@@ -22,7 +22,8 @@ use super::agent::{self, AgentExport, AgentWait, MISSING_WARNING};
 use super::busy::BusySignals;
 use super::container::{self, Cost};
 use super::manifest::{AppInfo, Counts, Entry, Manifest, VERSION};
-use super::rules::{self, Excluded};
+use super::rules::{self, Excluded, Sanitize};
+use super::sanitize;
 use super::state::{self, Phase};
 use super::{check_passphrase, free_space, Budget, hex, random_id, scratch_dir, BackupError, ErrorKind, Limits, Result, TempFolder, AGENT_ENTRY, EXTENSION};
 use crate::secret_file;
@@ -144,6 +145,7 @@ fn run(opts: &CreateOptions<'_>) -> Result<CreateResult> {
     let mut total_bytes = 0u64;
     let mut skipped_unreadable = 0usize;
     let mut skipped_large = 0usize;
+    let mut extra_excluded: Vec<Excluded> = Vec::new();
     for (n, item) in plan.items.iter().enumerate() {
         if item.size > opts.limits.max_entry_bytes {
             skipped_large += 1;
@@ -153,14 +155,20 @@ fn run(opts: &CreateOptions<'_>) -> Result<CreateResult> {
             return Err(BackupError::new(ErrorKind::TooLarge, "The data to back up is larger than a backup can hold."));
         }
         let staged = tree.join(format!("f{n:06}"));
-        match copy_hashing(&item.abs, &staged) {
+        let copied = match item.sanitize {
+            Sanitize::None => copy_hashing(&item.abs, &staged).map_err(|_| None),
+            kind => copy_cleaned(&item.abs, &staged, &item.rel, kind, &mut extra_excluded).map_err(Some),
+        };
+        match copied {
             Ok((sha256, size)) => {
                 total_bytes += size;
                 entries.push(Entry { name: item.rel.clone(), size, sha256 });
                 sources.push((item.rel.clone(), staged));
             }
+            // A file that could not be cleaned is left out, and listed with why.
+            Err(Some(why)) => extra_excluded.push(Excluded { pattern: item.rel.clone(), reason: format!("Left out: {why}."), redo: None }),
             // A file that went away or is locked: the backup goes on without it.
-            Err(_) => skipped_unreadable += 1,
+            Err(None) => skipped_unreadable += 1,
         }
     }
     if skipped_unreadable > 0 {
@@ -209,6 +217,7 @@ fn run(opts: &CreateOptions<'_>) -> Result<CreateResult> {
     counts.files = entries.len() as u64;
     counts.bytes = total_bytes;
     let mut excluded = plan.excluded.clone();
+    excluded.extend(extra_excluded);
     for link in &plan.links {
         excluded.push(Excluded {
             pattern: link.clone(),
@@ -297,6 +306,31 @@ fn were(n: usize) -> &'static str {
     } else {
         "were"
     }
+}
+
+/// Copy a JSON file that is cleaned on the way (see [`sanitize`]) into `to` (a new private file).
+/// What was taken out is added to `excluded`, one record per value. `Err` says why the file is left out.
+fn copy_cleaned(from: &Path, to: &Path, rel: &str, kind: Sanitize, excluded: &mut Vec<Excluded>) -> std::result::Result<(String, u64), String> {
+    let mut bytes = Vec::new();
+    File::open(from).and_then(|f| f.take(sanitize::MAX_JSON_BYTES as u64 + 1).read_to_end(&mut bytes)).map_err(|_| "it could not be read".to_string())?;
+    let cleaned = match kind {
+        Sanitize::Calendar => sanitize::calendar_json(&bytes)?,
+        Sanitize::PluginJson => {
+            let (cleaned, stripped) = sanitize::plugin_json(&bytes)?;
+            for path in stripped.iter().take(50) {
+                excluded.push(Excluded {
+                    pattern: format!("{rel}: {path}"),
+                    reason: "A PIN, key, token or value sealed to this computer inside a settings file: left out (the file's other settings are kept).".to_string(),
+                    redo: Some("Set the plugin's PIN or sign-in again.".to_string()),
+                });
+            }
+            cleaned
+        }
+        Sanitize::None => bytes,
+    };
+    let mut out = secret_file::create_new_owner_only(to).map_err(|_| "it could not be staged".to_string())?;
+    out.write_all(&cleaned).and_then(|_| out.sync_all()).map_err(|_| "it could not be staged".to_string())?;
+    Ok((hex(&Sha256::digest(&cleaned)), cleaned.len() as u64))
 }
 
 /// Copy `from` to `to` (a new private file), hashing as it goes. Returns the SHA-256 and the length copied.

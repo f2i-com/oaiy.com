@@ -40,6 +40,11 @@ fn get(root: &Path, rel: &str) -> Option<Vec<u8>> {
     fs::read(root.join(rel)).ok()
 }
 
+/// A JSON file's content, so cleaned files (pretty-printed on the way) compare by what they say.
+fn json_of(root: &Path, rel: &str) -> serde_json::Value {
+    serde_json::from_slice(&fs::read(root.join(rel)).unwrap_or_else(|_| panic!("{rel} exists"))).unwrap_or_else(|_| panic!("{rel} is JSON"))
+}
+
 /// Every file under `root` (relative name and bytes), except the backup's and restore's own folders.
 fn snapshot(root: &Path) -> BTreeMap<String, Vec<u8>> {
     fn walk(root: &Path, dir: &Path, out: &mut BTreeMap<String, Vec<u8>>) {
@@ -308,7 +313,6 @@ fn personal_data_is_kept_under_its_category() {
         ("voices/receptionist.wav", Category::Voices),
         ("templates/my-rig.json", Category::Templates),
         ("plugin-data/aokie/settings.json", Category::PluginData),
-        ("plugin-data/aokie/sub/deeper.json", Category::PluginData),
     ];
     for (path, category) in table {
         match rules::classify(path, false) {
@@ -318,6 +322,10 @@ fn personal_data_is_kept_under_its_category() {
             }
             _ => panic!("{path} should be kept"),
         }
+    }
+    // A plugin's data is opt-in, plugin by plugin and file by file.
+    for not_kept in ["plugin-data/aokie/notes.txt", "plugin-data/aokie/sub/deeper.json", "plugin-data/aokie/manager-auth.json", "plugin-data/aokie/aokie_radio/pairing_store.json", "plugin-data/unknown/settings.json", "calendar/other.json", "voices/run.exe", "voices/deeper/a.wav"] {
+        assert!(!matches!(rules::classify(not_kept, false), Decision::Include { .. }), "{not_kept} must not be kept");
     }
     // A flow named for a token is the person's own flow, not a key.
     assert!(matches!(rules::classify("flows/token-refund.json", false), Decision::Include { .. }));
@@ -466,6 +474,11 @@ fn the_manifest_records_what_the_brief_says() {
     assert!(names.windows(2).all(|w| w[0] < w[1]), "sorted, so two backups of the same data list alike");
     for entry in &manifest.entries {
         let live = fs::read(data.0.join(&entry.name)).unwrap();
+        // The calendar and a plugin's settings are cleaned as they are copied (see sanitize.rs), so what
+        // the manifest describes is what went into the backup, not the live bytes.
+        if entry.name == "calendar/calendar.json" || entry.name.starts_with("plugin-data/") {
+            continue;
+        }
         assert_eq!(entry.size as usize, live.len());
         assert_eq!(entry.sha256, sha(&live));
     }
@@ -875,12 +888,12 @@ fn a_backup_round_trips_through_the_dry_run_staging_and_the_start_up_apply() {
     let ApplyOutcome::Applied(done) = restore::apply_pending(&dst.0) else { panic!("the restore should be applied") };
     assert!(done.ok && done.kind == "restore");
     assert_eq!(get(&dst.0, "callers.json"), get(&src.0, "callers.json"));
-    assert_eq!(get(&dst.0, "calendar/calendar.json"), get(&src.0, "calendar/calendar.json"));
+    assert_eq!(json_of(&dst.0, "calendar/calendar.json"), json_of(&src.0, "calendar/calendar.json"));
     assert_eq!(get(&dst.0, "flows/greeting.json"), get(&src.0, "flows/greeting.json"));
     assert_eq!(get(&dst.0, "flows/token-refund.json"), get(&src.0, "flows/token-refund.json"));
     assert_eq!(get(&dst.0, "flows/local-only.json").unwrap(), b"{\"name\":\"only here\"}", "what the backup lacks is left alone");
     assert_eq!(get(&dst.0, "voices/receptionist.wav").unwrap().len(), 4000);
-    assert_eq!(get(&dst.0, "plugin-data/aokie/settings.json"), get(&src.0, "plugin-data/aokie/settings.json"));
+    assert_eq!(json_of(&dst.0, "plugin-data/aokie/settings.json"), json_of(&src.0, "plugin-data/aokie/settings.json"));
     assert_eq!(get(&dst.0, "templates/my-rig.json"), get(&src.0, "templates/my-rig.json"));
     // A restore never touches what a backup leaves out.
     assert_eq!(get(&dst.0, "link/account.json").unwrap(), b"{\"credential\":\"flk_TARGET_OWN\"}");
@@ -1949,4 +1962,215 @@ fn a_backup_at_the_default_cost_is_written_within_the_allowed_work_factors() {
     let factor: u8 = text.lines().nth(1).unwrap().rsplit(' ').next().unwrap().parse().unwrap();
     assert!((18..=20).contains(&factor), "{factor}");
     assert!(restore::inspect(&out.0, &file, PASS, &options()).is_ok());
+}
+
+// ---- plugin data is opt-in and never carries a PIN or a key ---------------------------------------
+
+const AOKIE_SETTINGS: &str = r#"{
+  "greeting": "hello",
+  "businessHours": { "open": "09:00", "close": "17:00" },
+  "managerPin": "dpapi1:QUFBQQ==",
+  "managerNumber": "0491 570 156",
+  "nested": { "pinCode": "1234", "ok": true, "sealedNote": "dpapi:zzzz" },
+  "list": ["keep", "dpapi1:qqqq"],
+  "apiToken": "sk-not-a-real-token-0003",
+  "mapping": "kept",
+  "keyword": "kept too"
+}"#;
+
+#[test]
+fn a_sensitive_key_is_recognised_by_its_words() {
+    for key in ["managerPin", "manager_pin", "apiKey", "API_KEY", "sessionToken", "pairingCode", "privateKey", "clientSecret", "PIN", "pin", "authToken", "dpapiBlob", "Password", "manager-auth"] {
+        assert!(sanitize::is_sensitive_key(key), "{key} names something secret");
+    }
+    for key in ["mapping", "typing", "keyword", "keywords", "greeting", "businessHours", "spinner", "pinned", "opening", "author"] {
+        assert!(!sanitize::is_sensitive_key(key), "{key} is an ordinary setting");
+    }
+}
+
+#[test]
+fn the_managers_pin_and_other_sealed_values_never_travel_in_a_backup() {
+    let data = TempDir::new("pin");
+    put(&data.0, "callers.json", b"{}");
+    put(&data.0, "plugin-data/aokie/settings.json", AOKIE_SETTINGS);
+    put(&data.0, "plugin-data/aokie/settings.json.bak", AOKIE_SETTINGS);
+    put(&data.0, "plugin-data/aokie/manager-auth.json", b"{\"failedAttempts\":3,\"lockedUntil\":123}");
+    put(&data.0, "plugin-data/aokie/consent.json", b"{\"consented\":true}");
+    put(&data.0, "plugin-data/aokie/aokie_radio/pairing_store.json", b"{\"phone\":\"AA:BB:CC\"}");
+    put(&data.0, "plugin-data/aokie/outbox.db", b"sealed rows");
+    put(&data.0, "plugin-data/another/settings.json", b"{\"a\":1}");
+    let out = TempDir::new("pin-out");
+    let file = out.0.join("p.oaiybackup");
+    let made = make_with(&data.0, &file, PASS, true, None).unwrap();
+    let manifest = manifest_of(&file, PASS);
+    let plugin_entries: Vec<&str> = manifest.entries.iter().map(|e| e.name.as_str()).filter(|n| n.starts_with("plugin-data/")).collect();
+    assert_eq!(plugin_entries, ["plugin-data/aokie/settings.json"], "only the listed file of the listed plugin");
+    // What is in it is the settings without the PIN, the token and everything sealed.
+    let zip = plain_zip(&file, PASS);
+    let mut archive = zip::ZipArchive::new(Cursor::new(zip.clone())).unwrap();
+    let mut text = String::new();
+    archive.by_name("plugin-data/aokie/settings.json").unwrap().read_to_string(&mut text).unwrap();
+    let kept: serde_json::Value = serde_json::from_str(&text).unwrap();
+    assert_eq!(kept["greeting"], "hello");
+    assert_eq!(kept["businessHours"]["open"], "09:00");
+    assert_eq!(kept["nested"]["ok"], true);
+    assert_eq!(kept["list"], serde_json::json!(["keep"]));
+    assert_eq!(kept["mapping"], "kept");
+    assert_eq!(kept["keyword"], "kept too");
+    for gone in ["managerPin", "managerNumber", "apiToken"] {
+        assert!(kept.get(gone).is_none(), "{gone} is not in the backup");
+    }
+    assert!(kept["nested"].get("pinCode").is_none() && kept["nested"].get("sealedNote").is_none());
+    // No entry holds any of it. (The manifest, entry 0, names what was left out by key, never by value.)
+    for canary in ["dpapi", "1234", "sk-not-a-real-token-0003", "QUFBQQ", "AA:BB:CC", "failedAttempts"] {
+        for i in 1..archive.len() {
+            let mut body = String::new();
+            let _ = archive.by_index(i).unwrap().read_to_string(&mut body);
+            assert!(!body.contains(canary), "{canary} must not be in the backup (entry {i})");
+        }
+    }
+    let manifest_text = serde_json::to_string(&manifest).unwrap();
+    for canary in ["sk-not-a-real-token-0003", "QUFBQQ", "AA:BB:CC", "1234"] {
+        assert!(!manifest_text.contains(canary), "{canary} must not be in the manifest either");
+    }
+    // Each thing left out is listed with a reason.
+    let listed = |pattern: &str| made.excluded.iter().any(|e| e.pattern == pattern);
+    for pattern in ["plugin-data/aokie/settings.json: managerPin", "plugin-data/aokie/settings.json: managerNumber", "plugin-data/aokie/settings.json: nested.pinCode", "plugin-data/aokie/settings.json: apiToken", "plugin-data/aokie/**", "plugin-data/another/"] {
+        assert!(listed(pattern), "{pattern} is listed: {:?}", made.excluded.iter().map(|e| e.pattern.as_str()).collect::<Vec<_>>());
+    }
+    assert!(made.excluded.iter().find(|e| e.pattern.ends_with("managerPin")).unwrap().redo.is_some());
+}
+
+#[test]
+fn a_hostile_settings_file_cannot_plant_a_pin_and_this_computers_own_is_kept() {
+    let out = TempDir::new("plant");
+    let planted = br#"{"greeting":"attacker's","managerPin":"1111","token":"attacker","nested":{"pinCode":"9999","ok":true}}"#;
+    let files: Vec<(&str, &[u8])> = vec![("plugin-data/aokie/settings.json", planted)];
+    let file = out.0.join("plant.oaiybackup");
+    craft(&file, &manifest_for(&files), &files, true);
+    // A computer that has its own sealed PIN keeps it; the rest of the settings come from the backup.
+    let dst = TempDir::new("plant-dst");
+    put(&dst.0, "plugin-data/aokie/settings.json", br#"{"greeting":"mine","managerPin":"dpapi1:LOCALSEALED","nested":{"pinCode":"local-pin"}}"#);
+    restore::stage(&dst.0, &file, PASS, &options()).unwrap();
+    assert!(matches!(restore::apply_pending(&dst.0), ApplyOutcome::Applied(_)));
+    let got = json_of(&dst.0, "plugin-data/aokie/settings.json");
+    assert_eq!(got["greeting"], "attacker's");
+    assert_eq!(got["managerPin"], "dpapi1:LOCALSEALED", "this computer's own PIN is not replaced");
+    assert_eq!(got["nested"]["pinCode"], "local-pin");
+    assert_eq!(got["nested"]["ok"], true);
+    assert!(got.get("token").is_none());
+    // A computer with none gets none.
+    let bare = TempDir::new("plant-bare");
+    restore::stage(&bare.0, &file, PASS, &options()).unwrap();
+    assert!(matches!(restore::apply_pending(&bare.0), ApplyOutcome::Applied(_)));
+    let got = json_of(&bare.0, "plugin-data/aokie/settings.json");
+    assert!(got.get("managerPin").is_none() && got.get("token").is_none() && got["nested"].get("pinCode").is_none());
+    // A settings file that is not JSON is not brought back at all.
+    let files: Vec<(&str, &[u8])> = vec![("plugin-data/aokie/settings.json", b"not json at all"), ("callers.json", b"{}")];
+    let junk = out.0.join("junk.oaiybackup");
+    craft(&junk, &manifest_for(&files), &files, true);
+    let dst = TempDir::new("plant-junk");
+    put(&dst.0, "plugin-data/aokie/settings.json", b"{\"mine\":true}");
+    restore::stage(&dst.0, &junk, PASS, &options()).unwrap();
+    assert!(matches!(restore::apply_pending(&dst.0), ApplyOutcome::Applied(_)));
+    assert_eq!(json_of(&dst.0, "plugin-data/aokie/settings.json"), serde_json::json!({ "mine": true }), "the file that could not be cleaned was left out");
+    assert!(dst.0.join("callers.json").exists());
+}
+
+#[test]
+fn a_plugin_that_is_not_on_the_list_and_a_file_that_is_not_listed_are_refused() {
+    let out = TempDir::new("policy");
+    for name in ["plugin-data/other/settings.json", "plugin-data/aokie/manager-auth.json", "plugin-data/aokie/aokie_radio/pairing_store.json", "plugin-data/aokie/notes.txt", "plugin-data/aokie/settings.json.bak"] {
+        let files: Vec<(&str, &[u8])> = vec![(name, b"{}")];
+        let file = out.0.join("p.oaiybackup");
+        craft(&file, &manifest_for(&files), &files, true);
+        let dst = TempDir::new("policy-dst");
+        assert_refused(&dst.0, &file, ErrorKind::Unsafe);
+        assert!(!dst.0.join(name).exists(), "{name}");
+    }
+}
+
+#[test]
+fn ntfs_short_names_cannot_get_a_file_past_the_word_and_extension_rules() {
+    let limits = Limits::default();
+    for name in [
+        "plugin-data/aokie/aokie_radio/PAIRIN~1.JSO", "plugin-data/aokie/AUTH~1.JSO", "plugin-data/aokie/LINK~1.DPA", "plugin-data/aokie/pairin~1.jso", "flows/A~2", "~1", "a/b~9/c.json",
+        "plugin-data/aokie/SETTIN~1.JSO",
+    ] {
+        assert!(container::check_entry_name(name, &limits).is_err(), "{name} is a short-name alias");
+    }
+    for name in ["a~b.txt", "flows/tilde~.json", "flows/a~.json"] {
+        assert!(container::check_entry_name(name, &limits).is_ok(), "{name} is not one");
+    }
+    // A backup (or a marker) that names one is refused as a whole.
+    let out = TempDir::new("short");
+    for name in ["plugin-data/aokie/aokie_radio/PAIRIN~1.JSO", "plugin-data/aokie/AUTH~1.JSO", "plugin-data/aokie/LINK~1.DPA", "flows/GREETI~1.JSO"] {
+        let files: Vec<(&str, &[u8])> = vec![(name, b"{\"paired\":\"ATTACKER\"}")];
+        let file = out.0.join("s.oaiybackup");
+        craft(&file, &manifest_for(&files), &files, true);
+        let dst = TempDir::new("short-dst");
+        assert_refused(&dst.0, &file, ErrorKind::Unsafe);
+    }
+    // And a place that answers to a short name is not written through: the name a file has in its
+    // folder is compared with the name asked for (where the volume has short names at all).
+    let dir = TempDir::new("short-target");
+    put(&dir.0, "plugin-data/aokie/aokie_radio/pairing_store.json", b"{\"paired\":\"REAL\"}");
+    let alias = dir.0.join("plugin-data/aokie/aokie_radio/PAIRIN~1.JSO");
+    if fs::symlink_metadata(&alias).is_ok() {
+        let err = restore::check_target(&dir.0, "plugin-data/aokie/aokie_radio/PAIRIN~1.JSO").unwrap_err();
+        assert_eq!(err.kind, ErrorKind::Unsafe, "{err}");
+        assert!(err.message.contains("short-name alias"));
+    } else {
+        eprintln!("this volume has no short names: only the name check could be tested");
+    }
+    // The real name is fine, in any case.
+    assert!(restore::check_target(&dir.0, "plugin-data/aokie/aokie_radio/pairing_store.json").is_ok());
+    assert!(restore::check_target(&dir.0, "plugin-data/aokie/aokie_radio/PAIRING_STORE.JSON").is_ok(), "the same name in another case is the same file");
+}
+
+// ---- the calendar's FormLogic sync state stays where it was ----------------------------------------
+
+const CALENDAR_WITH_SYNC: &str = r#"{
+  "settings": { "hours": "9-5" },
+  "appointments": [
+    { "id": "a1", "title": "Check-up", "notes": "bring the form", "formlogic": { "id": "remote-1", "etag": "e1", "syncedAt": "2026-01-01" } },
+    { "id": "a2", "title": "Follow-up" }
+  ],
+  "deleted": [ { "id": "d1", "formlogicId": "remote-9", "requestKey": "oaiy:d1", "deletedAt": "2026-01-02", "checked": false } ],
+  "sync": { "form": "form-123", "cursor": "2026-01-03 00:00:00", "lastSuccessAt": "2026-01-03", "discard": ["r1", "r2"] }
+}"#;
+
+#[test]
+fn the_calendars_formlogic_sync_state_is_not_backed_up_and_not_restored() {
+    let data = TempDir::new("calendar");
+    put(&data.0, "calendar/calendar.json", CALENDAR_WITH_SYNC);
+    let out = TempDir::new("calendar-out");
+    let file = out.0.join("c.oaiybackup");
+    make(&data.0, &file);
+    let zip = plain_zip(&file, PASS);
+    let mut archive = zip::ZipArchive::new(Cursor::new(zip)).unwrap();
+    let mut text = String::new();
+    archive.by_name("calendar/calendar.json").unwrap().read_to_string(&mut text).unwrap();
+    let kept: serde_json::Value = serde_json::from_str(&text).unwrap();
+    assert_eq!(kept["settings"]["hours"], "9-5");
+    assert_eq!(kept["appointments"].as_array().unwrap().len(), 2);
+    assert_eq!(kept["appointments"][0]["title"], "Check-up");
+    assert_eq!(kept["appointments"][0]["notes"], "bring the form");
+    for gone in ["sync", "deleted"] {
+        assert!(kept.get(gone).is_none(), "{gone} is not in the backup");
+    }
+    assert!(kept["appointments"][0].get("formlogic").is_none());
+    for canary in ["form-123", "remote-1", "remote-9", "oaiy:d1", "2026-01-03"] {
+        assert!(!text.contains(canary), "{canary}");
+    }
+    // A hostile backup that carries the state has it removed on the way in.
+    let files: Vec<(&str, &[u8])> = vec![("calendar/calendar.json", CALENDAR_WITH_SYNC.as_bytes())];
+    let hostile = out.0.join("hostile.oaiybackup");
+    craft(&hostile, &manifest_for(&files), &files, true);
+    let dst = TempDir::new("calendar-dst");
+    restore::stage(&dst.0, &hostile, PASS, &options()).unwrap();
+    assert!(matches!(restore::apply_pending(&dst.0), ApplyOutcome::Applied(_)));
+    let got = json_of(&dst.0, "calendar/calendar.json");
+    assert_eq!(got["appointments"].as_array().unwrap().len(), 2);
+    assert!(got.get("sync").is_none() && got.get("deleted").is_none() && got["appointments"][0].get("formlogic").is_none());
 }

@@ -302,6 +302,35 @@ pub fn all_rules() -> impl Iterator<Item = &'static Rule> {
     RULES.iter().chain(std::iter::once(&TEMPLATE_SEED_RULE))
 }
 
+/// Plugins whose data OAIY knows how to back up, and the files of each that are: only these, each
+/// cleaned of PINs, keys, tokens and values sealed to a computer (see [`super::sanitize`]). A plugin
+/// keeps its own pairings, queues and sealed state in its data folder, and none of it can be told
+/// apart from a settings file by name, so a plugin's data is opt-in, plugin by plugin and file by
+/// file. (Aokie's `settings.json` holds its settings and, sealed to the computer, the manager's PIN;
+/// its pairing store, PIN throttle and outbox stay behind.)
+pub const PLUGIN_POLICIES: &[(&str, &[&str])] = &[("aokie", &["settings.json"])];
+
+/// `plugin-data/<id>/<rest>`: the plugin id, and what is inside its folder.
+fn plugin_parts(p: &str) -> Option<(&str, &str)> {
+    let rest = p.strip_prefix("plugin-data/")?;
+    let (id, inside) = rest.split_once('/').unwrap_or((rest, ""));
+    Some((id, inside))
+}
+
+fn plugin_known(id: &str) -> bool {
+    PLUGIN_POLICIES.iter().any(|(known, _)| *known == id)
+}
+
+fn plugin_file_listed(p: &str) -> bool {
+    plugin_parts(p).is_some_and(|(id, inside)| !inside.is_empty() && PLUGIN_POLICIES.iter().any(|(known, files)| *known == id && files.contains(&inside)))
+}
+
+/// Voice clips and the small files that go with them.
+fn voice_file_ok(p: &str) -> bool {
+    let name = file_name(p);
+    name == "chosen" || ["wav", "mp3", "ogg", "flac", "m4a", "opus", "txt", "json"].iter().any(|e| name.rsplit_once('.').is_some_and(|(_, ext)| ext == *e))
+}
+
 /// What the allow-list says about a file that no deny rule caught: the category it is kept under and
 /// whether it is a secret (written private when restored).
 fn include_category(p: &str) -> Option<(Category, bool)> {
@@ -312,13 +341,13 @@ fn include_category(p: &str) -> Option<(Category, bool)> {
         "setup.json" | "agent.json" | "control.json" | "services-autostart.json" => Some((Category::Settings, false)),
         "control-log.jsonl" | "control-log.jsonl.1" | "bridge/ledger.jsonl" | "bridge/deadletters.jsonl" => Some((Category::History, false)),
         "ai/providers.json" => Some((Category::Providers, true)),
-        _ if under(p, "calendar") && p != "calendar" => Some((Category::Calendar, false)),
+        "calendar/calendar.json" => Some((Category::Calendar, false)),
         _ if under(p, "flows") && p != "flows" => Some((Category::Flows, false)),
         _ if under(p, "connectors") && p != "connectors" => Some((Category::Settings, false)),
-        _ if under(p, "voices") && p != "voices" => Some((Category::Voices, false)),
+        _ if under(p, "voices") && p != "voices" && slashes == 1 && voice_file_ok(p) => Some((Category::Voices, false)),
         _ if under(p, "templates") && slashes == 1 && p.ends_with(".json") => Some((Category::Templates, false)),
-        // plugin-data/<id>/<something>
-        _ if under(p, "plugin-data") && slashes >= 2 => Some((Category::PluginData, false)),
+        // plugin-data/<id>/<file>: only the files of a plugin on the list
+        _ if plugin_file_listed(p) => Some((Category::PluginData, false)),
         _ => None,
     }
 }
@@ -385,6 +414,16 @@ pub fn category_of_backup_entry(name: &str, include_keys: bool) -> Result<(Categ
     }
 }
 
+/// How a file is cleaned as it is copied into a backup.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Sanitize {
+    None,
+    /// The calendar, without its FormLogic sync state.
+    Calendar,
+    /// A plugin's settings, without PINs, keys, tokens and sealed values.
+    PluginJson,
+}
+
 /// One file the plan will copy.
 #[derive(Clone, Debug)]
 pub struct PlanItem {
@@ -393,6 +432,7 @@ pub struct PlanItem {
     pub size: u64,
     pub category: Category,
     pub secret: bool,
+    pub sanitize: Sanitize,
 }
 
 /// What a walk of the data folder found.
@@ -453,6 +493,10 @@ pub fn plan(data_dir: &Path, include_keys: bool) -> Plan {
                 continue;
             }
             if meta.is_dir() {
+                if let Some(record) = plugin_folder_exclusion(&rel) {
+                    excluded.entry(record.pattern.clone()).or_insert(record);
+                    continue;
+                }
                 match classify_dir(&rel, include_keys) {
                     Decision::Include { .. } => stack.push((abs, rel)),
                     Decision::Exclude(rule) if rule.descend => stack.push((abs, rel)),
@@ -474,12 +518,22 @@ pub fn plan(data_dir: &Path, include_keys: bool) -> Plan {
                         excluded.entry(TEMPLATE_SEED_RULE.pattern.to_string()).or_insert_with(|| TEMPLATE_SEED_RULE.record());
                         continue;
                     }
-                    plan.items.push(PlanItem { rel, abs, size: meta.len(), category, secret });
+                    let sanitize = match category {
+                        Category::Calendar => Sanitize::Calendar,
+                        Category::PluginData => Sanitize::PluginJson,
+                        _ => Sanitize::None,
+                    };
+                    plan.items.push(PlanItem { rel, abs, size: meta.len(), category, secret, sanitize });
                 }
                 Decision::Exclude(rule) => {
                     excluded.entry(rule.pattern.to_string()).or_insert_with(|| rule.record());
                 }
-                Decision::Unknown => note_unknown(&mut excluded, &rel, false),
+                Decision::Unknown => match plugin_other_files(&rel) {
+                    Some(record) => {
+                        excluded.entry(record.pattern.clone()).or_insert(record);
+                    }
+                    None => note_unknown(&mut excluded, &rel, false),
+                },
             }
         }
     }
@@ -488,6 +542,28 @@ pub fn plan(data_dir: &Path, include_keys: bool) -> Plan {
     plan.unreadable.sort();
     plan.excluded = excluded.into_values().collect();
     plan
+}
+
+/// A plugin's folder that OAIY has no policy for is left out whole, and listed.
+fn plugin_folder_exclusion(rel: &str) -> Option<Excluded> {
+    let lower = rel.to_lowercase();
+    let (id, inside) = plugin_parts(&lower)?;
+    (inside.is_empty() && !plugin_known(id)).then(|| Excluded {
+        pattern: format!("plugin-data/{id}/"),
+        reason: "OAIY does not know how to back up this plugin's data safely: only plugins it knows are backed up, file by file.".to_string(),
+        redo: Some("Set the plugin up again on the new computer.".to_string()),
+    })
+}
+
+/// The files of a known plugin that are not on its list are left out, and listed once.
+fn plugin_other_files(rel: &str) -> Option<Excluded> {
+    let lower = rel.to_lowercase();
+    let (id, inside) = plugin_parts(&lower)?;
+    (plugin_known(id) && !inside.is_empty()).then(|| Excluded {
+        pattern: format!("plugin-data/{id}/**"),
+        reason: "Only this plugin's settings file is backed up: the rest of its data holds pairings, sealed values, queues and other state that belongs to this computer.".to_string(),
+        redo: Some("Pair the plugin's devices and set its PIN again.".to_string()),
+    })
 }
 
 fn note_unknown(excluded: &mut BTreeMap<String, Excluded>, rel: &str, dir: bool) {

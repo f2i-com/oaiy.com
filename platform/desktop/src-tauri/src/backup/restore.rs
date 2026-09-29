@@ -258,33 +258,74 @@ enum Target {
     File,
 }
 
-/// Look at where `rel` would go, refusing when something other than a plain file is there or on the
-/// way: a link is never followed, and a folder is never replaced by a file.
-fn target_state(data_dir: &Path, rel: &str) -> Result<Target> {
-    let mut cur = data_dir.to_path_buf();
-    let parts: Vec<&str> = rel.split('/').collect();
-    for (i, part) in parts.iter().enumerate() {
-        cur.push(part);
-        let meta = match std::fs::symlink_metadata(&cur) {
-            Ok(m) => m,
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Target::Absent),
-            Err(e) => return Err(BackupError::io("Could not look at a place to restore into", &e)),
-        };
-        if rules::is_link(&meta) {
-            return Err(BackupError::new(ErrorKind::Unsafe, "A restore will not go through a symbolic link or junction, and one is in the way."));
-        }
-        let last = i + 1 == parts.len();
-        if last && !meta.is_file() {
-            return Err(BackupError::new(ErrorKind::Conflict, format!("Something other than a file is where \"{rel}\" would be restored.")));
-        }
-        if !last && !meta.is_dir() {
-            return Err(BackupError::new(ErrorKind::Conflict, format!("A file is in the way of where \"{rel}\" would be restored.")));
-        }
-        if last {
-            return Ok(Target::File);
-        }
+/// Looks at where files would be restored to, remembering each folder's listing.
+struct Targets {
+    listed: HashMap<PathBuf, Option<HashSet<String>>>,
+    /// Whether a folder's listing is kept: not while files are being put in place, which changes them.
+    keep: bool,
+}
+
+impl Targets {
+    /// For looking, when nothing changes.
+    fn new() -> Self {
+        Self { listed: HashMap::new(), keep: true }
     }
-    Ok(Target::Absent)
+
+    /// For use while files are being moved: every look lists the folder again.
+    fn fresh() -> Self {
+        Self { listed: HashMap::new(), keep: false }
+    }
+
+    fn names_in(&mut self, dir: &Path) -> Option<&HashSet<String>> {
+        if !self.keep {
+            self.listed.remove(dir);
+        }
+        self.listed
+            .entry(dir.to_path_buf())
+            .or_insert_with(|| std::fs::read_dir(dir).ok().map(|d| d.flatten().map(|e| e.file_name().to_string_lossy().to_lowercase()).collect()))
+            .as_ref()
+    }
+
+    /// Look at where `rel` would go, refusing when something other than a plain file is there or on
+    /// the way: a link is never followed, a folder is never replaced by a file, and a name that
+    /// resolves but is not the name of anything in its folder (an NTFS short name such as
+    /// `PAIRIN~1.JSO`) is an alias for a file the checks on names never saw.
+    fn state(&mut self, data_dir: &Path, rel: &str) -> Result<Target> {
+        let mut cur = data_dir.to_path_buf();
+        let parts: Vec<&str> = rel.split('/').collect();
+        for (i, part) in parts.iter().enumerate() {
+            let parent = cur.clone();
+            cur.push(part);
+            let meta = match std::fs::symlink_metadata(&cur) {
+                Ok(m) => m,
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Target::Absent),
+                Err(e) => return Err(BackupError::io("Could not look at a place to restore into", &e)),
+            };
+            if self.names_in(&parent).is_some_and(|names| !names.contains(&part.to_lowercase())) {
+                return Err(BackupError::new(ErrorKind::Unsafe, format!("\"{part}\" is a short-name alias for another file, and a restore will not write through one.")));
+            }
+            if rules::is_link(&meta) {
+                return Err(BackupError::new(ErrorKind::Unsafe, "A restore will not go through a symbolic link or junction, and one is in the way."));
+            }
+            let last = i + 1 == parts.len();
+            if last && !meta.is_file() {
+                return Err(BackupError::new(ErrorKind::Conflict, format!("Something other than a file is where \"{rel}\" would be restored.")));
+            }
+            if !last && !meta.is_dir() {
+                return Err(BackupError::new(ErrorKind::Conflict, format!("A file is in the way of where \"{rel}\" would be restored.")));
+            }
+            if last {
+                return Ok(Target::File);
+            }
+        }
+        Ok(Target::Absent)
+    }
+}
+
+/// A test's way to ask whether a place could be restored to.
+#[cfg(test)]
+pub(crate) fn check_target(data_dir: &Path, rel: &str) -> Result<()> {
+    Targets::new().state(data_dir, rel).map(|_| ())
 }
 
 fn redo_of(manifest: &Manifest) -> Vec<String> {
@@ -295,6 +336,7 @@ fn redo_of(manifest: &Manifest) -> Vec<String> {
 fn preview_of(data_dir: &Path, manifest: &Manifest, file_name: &str) -> Result<Preview> {
     let local = rules::plan(data_dir, manifest.includes_keys);
     let in_backup: HashSet<String> = manifest.entries.iter().map(|e| e.name.to_lowercase()).collect();
+    let mut targets = Targets::new();
     let mut plans: HashMap<Category, CategoryPlan> = HashMap::new();
     let mut bump = |c: Category, f: &dyn Fn(&mut CategoryPlan)| {
         let p = plans.entry(c).or_insert_with(|| CategoryPlan { id: c.id().to_string(), label: c.label().to_string(), added: 0, replaced: 0, unchanged: 0, left_alone: 0 });
@@ -308,7 +350,7 @@ fn preview_of(data_dir: &Path, manifest: &Manifest, file_name: &str) -> Result<P
             bump(category, &|p| p.added += files);
             continue;
         }
-        match target_state(data_dir, &entry.name)? {
+        match targets.state(data_dir, &entry.name)? {
             Target::Absent => bump(category, &|p| p.added += 1),
             Target::File => {
                 let target = data_dir.join(entry.name.replace('/', std::path::MAIN_SEPARATOR_STR));
@@ -376,9 +418,10 @@ pub fn stage(data_dir: &Path, file: &Path, passphrase: &str, opts: &RestoreOptio
         ));
     }
     // Everything it would replace must be a plain file, and nothing may be behind a link.
+    let mut targets = Targets::new();
     for entry in &manifest.entries {
         if entry.name != AGENT_ENTRY {
-            target_state(data_dir, &entry.name)?;
+            targets.state(data_dir, &entry.name)?;
         }
     }
 
@@ -397,6 +440,15 @@ pub fn stage(data_dir: &Path, file: &Path, passphrase: &str, opts: &RestoreOptio
             }
         }, &budget)?;
         let agent = manifest.entries.iter().find(|e| e.name == AGENT_ENTRY).map(|e| MarkerAgent { size: e.size, sha256: e.sha256.clone() });
+        // What can carry more than data is cleaned as it comes in, and the marker records what is there now.
+        let wanted: Vec<String> = manifest.entries.iter().filter(|e| e.name != AGENT_ENTRY).map(|e| e.name.clone()).collect();
+        let (kept, _notes) = clean_staged(data_dir, &root.join("files"), &wanted, &opts.limits)?;
+        let mut files = Vec::new();
+        for name in &kept {
+            let path = container::safe_join(&root.join("files"), name, limits)?;
+            let (sha256, size) = sha256_file(&path).map_err(|e| BackupError::io("Could not read a staged file", &e))?;
+            files.push(MarkerFile { name: name.clone(), size, sha256 });
+        }
         Ok(Marker {
             v: 1,
             id: id.clone(),
@@ -405,7 +457,7 @@ pub fn stage(data_dir: &Path, file: &Path, passphrase: &str, opts: &RestoreOptio
             backup_created_at: manifest.created_at.clone(),
             includes_keys: manifest.includes_keys,
             source: source.clone(),
-            files: manifest.entries.iter().filter(|e| e.name != AGENT_ENTRY).map(|e| MarkerFile { name: e.name.clone(), size: e.size, sha256: e.sha256.clone() }).collect(),
+            files,
             removals: Vec::new(),
             agent,
             redo: redo_of(manifest),
@@ -433,6 +485,39 @@ pub fn stage(data_dir: &Path, file: &Path, passphrase: &str, opts: &RestoreOptio
         agent_storage: marker.agent.is_some(),
         redo: marker.redo,
     })
+}
+
+/// Clean the staged files that carry more than data: the calendar loses its FormLogic sync state, and
+/// a plugin's settings lose every PIN, key and sealed value the backup holds while keeping the ones
+/// this computer already has. A file that cannot be cleaned is not brought back. Returns the names
+/// that remain and what was said about the rest.
+fn clean_staged(data_dir: &Path, files_root: &Path, names: &[String], limits: &Limits) -> Result<(Vec<String>, Vec<String>)> {
+    let mut kept = Vec::new();
+    let mut notes = Vec::new();
+    for name in names {
+        let path = container::safe_join(files_root, name, limits)?;
+        let category = rules::category_of_backup_entry(name, true).map(|(c, _)| c).ok();
+        let cleaned = match category {
+            Some(Category::Calendar) => Some(std::fs::read(&path).map_err(|e| e.to_string()).and_then(|b| super::sanitize::calendar_json(&b))),
+            Some(Category::PluginData) => {
+                let local = std::fs::read(data_dir.join(native(name))).ok();
+                Some(std::fs::read(&path).map_err(|e| e.to_string()).and_then(|b| super::sanitize::plugin_json_with_local(&b, local.as_deref()).map(|(c, _)| c)))
+            }
+            _ => None,
+        };
+        match cleaned {
+            None => kept.push(name.clone()),
+            Some(Ok(bytes)) => {
+                secret_file::write(&path, bytes).map_err(|e| BackupError::io("Could not clean a staged file", &e))?;
+                kept.push(name.clone());
+            }
+            Some(Err(why)) => {
+                let _ = std::fs::remove_file(&path);
+                notes.push(format!("{name} was not brought back: {why}."));
+            }
+        }
+    }
+    Ok((kept, notes))
 }
 
 /// Cancel a staged restore: the marker and, for a restore, its staged files. An undo snapshot is not touched.
@@ -484,6 +569,7 @@ pub fn stage_undo(data_dir: &Path, opts: &RestoreOptions) -> Result<Staged> {
     let root = restore_dir(data_dir).join(format!("undo-{uid}"));
     let mut files = Vec::new();
     let mut bytes = 0u64;
+    let mut targets = Targets::new();
     for rel in &record.replaced {
         container::check_entry_name(rel, &opts.limits)?;
         let path = container::safe_join(&root.join("files"), rel, &opts.limits)?;
@@ -494,11 +580,11 @@ pub fn stage_undo(data_dir: &Path, opts: &RestoreOptions) -> Result<Staged> {
         let (sha256, size) = sha256_file(&path).map_err(|e| BackupError::io("Could not read the saved copy", &e))?;
         bytes += size;
         files.push(MarkerFile { name: rel.clone(), size, sha256 });
-        target_state(data_dir, rel)?;
+        targets.state(data_dir, rel)?;
     }
     for rel in &record.added {
         container::check_entry_name(rel, &opts.limits)?;
-        target_state(data_dir, rel)?;
+        targets.state(data_dir, rel)?;
     }
     let agent_zip = root.join("agent-storage.zip");
     let agent = match std::fs::metadata(&agent_zip) {
@@ -764,11 +850,12 @@ fn apply_files(data_dir: &Path, marker: &Marker, staged_root: &Path, holding: &P
         }
     }
     let mut journal = Journal::create(journal_file).map_err(|e| format!("Could not start the restore's journal ({e})."))?;
+    let mut targets = Targets::fresh();
     let mut applied = Vec::new();
     for (_index, f) in marker.files.iter().enumerate() {
         let staged = container::safe_join(staged_root, &f.name, limits).map_err(|e| e.message)?;
         let target = data_dir.join(native(&f.name));
-        let had = match target_state(data_dir, &f.name).map_err(|e| e.message)? {
+        let had = match targets.state(data_dir, &f.name).map_err(|e| e.message)? {
             Target::Absent => false,
             Target::File => true,
         };
@@ -790,7 +877,7 @@ fn apply_files(data_dir: &Path, marker: &Marker, staged_root: &Path, holding: &P
     }
     for (_position, rel) in marker.removals.iter().enumerate() {
         let target = data_dir.join(native(rel));
-        if !matches!(target_state(data_dir, rel).map_err(|e| e.message)?, Target::File) {
+        if !matches!(targets.state(data_dir, rel).map_err(|e| e.message)?, Target::File) {
             continue;
         }
         journal.line("begin", rel, true, false).map_err(|e| format!("Could not write the restore's journal ({e})."))?;
