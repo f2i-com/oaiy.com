@@ -748,16 +748,24 @@ fn purge_expired(inner: &mut Inner, now: u64) {
 
 fn load_or_create_key(dir: &std::path::Path) -> Result<(SigningKey, KeyProtection), String> {
     let path = dir.join("endpoint.key");
-    if let Ok(raw) = std::fs::read_to_string(&path) {
-        let bytes = URL_SAFE_NO_PAD
-            .decode(raw.trim())
-            .map_err(|_| "stored endpoint key is not base64url".to_string())?;
-        let bytes: [u8; 32] = bytes
-            .try_into()
-            .map_err(|_| "stored endpoint key must be 32 bytes".to_string())?;
-        return Ok((SigningKey::from_bytes(&bytes), KeyProtection::SoftwareFile));
-    }
-    mint_key(dir)
+    let raw = match std::fs::read_to_string(&path) {
+        Ok(raw) => raw,
+        // Only a key that is not there is made. One that is there and cannot be read (its owner
+        // or label changed under a restore, a disk error, bytes that are not text) is NOT
+        // replaced: `mint_key` ends in a rename, which needs no more than write access to the
+        // folder, so it would succeed, and every phone paired to the old key would stop
+        // verifying with no way back. The identity is unavailable, with the reason, until the
+        // file is fixed or the owner rotates the key on purpose (`rotate`).
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return mint_key(dir),
+        Err(e) => return Err(format!("cannot read the stored endpoint key {}: {e}", path.display())),
+    };
+    let bytes = URL_SAFE_NO_PAD
+        .decode(raw.trim())
+        .map_err(|_| "stored endpoint key is not base64url".to_string())?;
+    let bytes: [u8; 32] = bytes
+        .try_into()
+        .map_err(|_| "stored endpoint key must be 32 bytes".to_string())?;
+    Ok((SigningKey::from_bytes(&bytes), KeyProtection::SoftwareFile))
 }
 
 fn mint_key(dir: &std::path::Path) -> Result<(SigningKey, KeyProtection), String> {
@@ -880,6 +888,62 @@ mod tests {
         let again = EndpointIdentity::open(dir.0.clone(), "aokie");
         assert_eq!(std::fs::read_to_string(&seed_file).unwrap(), seed, "a restart does not mint a new seed");
         assert_eq!(first.status().endpoint_key, again.status().endpoint_key);
+    }
+
+    /// The seed is the desktop's identity, and every paired phone is bound to it. A seed that is
+    /// there but cannot be read is not "no seed": replacing it would strand every pairing.
+    #[cfg(unix)]
+    #[test]
+    fn a_seed_the_owner_cannot_read_is_never_replaced() {
+        use std::os::unix::fs::PermissionsExt as _;
+        let dir = Dir::new("seed-unreadable");
+        let first = EndpointIdentity::open(dir.0.clone(), "aokie");
+        let seed_file = dir.0.join("companion/aokie/endpoint.key");
+        let seed = std::fs::read(&seed_file).unwrap();
+
+        std::fs::set_permissions(&seed_file, std::fs::Permissions::from_mode(0o000)).unwrap();
+        if std::fs::read(&seed_file).is_ok() {
+            // A privileged test runner reads it anyway: there is no unreadable file to test.
+            std::fs::set_permissions(&seed_file, std::fs::Permissions::from_mode(0o600)).unwrap();
+            return;
+        }
+        let blocked = EndpointIdentity::open(dir.0.clone(), "aokie").status();
+        std::fs::set_permissions(&seed_file, std::fs::Permissions::from_mode(0o600)).unwrap();
+
+        assert!(!blocked.available, "no identity is offered on a key that could not be read");
+        let warning = blocked.warning.expect("and the owner is told why");
+        assert!(warning.contains("endpoint.key"), "{warning}");
+        assert_eq!(std::fs::read(&seed_file).unwrap(), seed, "the seed on disk is untouched");
+        assert_eq!(
+            EndpointIdentity::open(dir.0.clone(), "aokie").status().endpoint_key,
+            first.status().endpoint_key,
+            "and once it can be read again it is the same identity"
+        );
+    }
+
+    /// The same on every platform, through a read that fails for another reason: bytes that are
+    /// not text. The seed is refused, not replaced, and only rotating the key on purpose replaces it.
+    #[test]
+    fn a_seed_that_cannot_be_read_as_text_is_refused_and_only_a_rotation_replaces_it() {
+        let dir = Dir::new("seed-not-text");
+        let seed_file = dir.0.join("companion/aokie/endpoint.key");
+        std::fs::create_dir_all(seed_file.parent().unwrap()).unwrap();
+        let damaged = [0xff_u8, 0xfe, 0xfd, 0x00, 0x80];
+        std::fs::write(&seed_file, damaged).unwrap();
+
+        let id = EndpointIdentity::open(dir.0.clone(), "aokie");
+        let status = id.status();
+        assert!(!status.available, "no identity is offered on a damaged seed");
+        assert!(status.warning.as_deref().is_some_and(|w| w.contains("endpoint.key")), "{:?}", status.warning);
+        assert_eq!(std::fs::read(&seed_file).unwrap(), damaged, "opening never replaces the seed");
+        let _again = EndpointIdentity::open(dir.0.clone(), "aokie");
+        assert_eq!(std::fs::read(&seed_file).unwrap(), damaged, "nor does opening it again");
+
+        // The way out is explicit: the owner rotates the key, and pairings start over.
+        let rotated = id.rotate().unwrap();
+        assert!(rotated.available && rotated.warning.is_none());
+        assert_ne!(std::fs::read(&seed_file).unwrap(), damaged, "a rotation does replace it");
+        assert!(EndpointIdentity::open(dir.0.clone(), "aokie").status().available);
     }
 
     #[test]
