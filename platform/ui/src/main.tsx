@@ -52,6 +52,12 @@ startDesktopServiceSync();
 import { requestPersistentStorage } from './lib/persistentStorage';
 void requestPersistentStorage();
 
+// Seal any API keys still in plaintext localStorage (the first load after this
+// change), in the background: the editor's reads wait for the same promise, and
+// a browser that cannot seal keeps them as before. See tauri-shim/secretVault.ts.
+import { secretVault } from './tauri-shim/secretVault';
+void secretVault.ready();
+
 import { StrictMode } from 'react'
 import { createRoot } from 'react-dom/client'
 import './styles/fonts'

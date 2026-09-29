@@ -18,6 +18,7 @@
 
 import { pickFileViaInput, pickFolderViaInput, type OpenDialogOptions } from './dialog';
 import { getEngineBase } from '../lib/engineEndpoint';
+import { secretVault } from './secretVault';
 
 type InvokeArgs = Record<string, unknown> | undefined;
 
@@ -221,36 +222,14 @@ function basename(path: string): string {
 //
 // The desktop build keeps API keys in an OS keyring and small app-state
 // (user macros, built-in-macro overrides) in real files on disk. The browser
-// has neither, so we back both with localStorage under dedicated keys. They
-// are kept OUT of the exportable project blob — useProject redacts secret
-// values before it serialises the project, and app-state lives under its own
-// keys — so exporting or sharing a project never leaks API keys.
+// has neither. Secrets are SEALED in IndexedDB (secretVault.ts: AES-GCM under a
+// non-extractable key, as the Agent seals its provider keys); app-state is
+// kept in localStorage under dedicated keys. Both are kept OUT of the
+// exportable project blob — useProject redacts secret values before it
+// serialises the project, and app-state lives under its own keys — so
+// exporting or sharing a project never leaks API keys.
 // ---------------------------------------------------------------------------
-const SECRETS_KEY = 'oaiy_web_secrets';
 const APPSTATE_PREFIX = 'oaiy_web_appstate:';
-
-function readSecretMap(): Record<string, string> {
-  try {
-    const raw = localStorage.getItem(SECRETS_KEY);
-    if (!raw) return {};
-    const parsed = JSON.parse(raw);
-    // Reject arrays/null — typeof [] is 'object', and a stray array here
-    // would surface as a bogus secret map.
-    return parsed && typeof parsed === 'object' && !Array.isArray(parsed)
-      ? (parsed as Record<string, string>)
-      : {};
-  } catch {
-    return {};
-  }
-}
-
-function writeSecretMap(map: Record<string, string>): void {
-  try {
-    localStorage.setItem(SECRETS_KEY, JSON.stringify(map));
-  } catch (e) {
-    console.warn('[oaiy-web] could not persist secret (storage full?)', e);
-  }
-}
 
 // Known INTERNAL app-state files the app persists under the web app-data root
 // ('/oaiy', from get_app_data_dir). These must survive a reload and must never
@@ -518,33 +497,26 @@ const handlers: Record<string, (args: InvokeArgs) => Promise<unknown>> = {
   get_cli_run_config: async () => ({ isRunMode: false }),
   get_install_config: async () => ({}),
   get_default_app_data_dir: async () => '/oaiy',
-  // Secrets — desktop uses an OS keyring; the web build persists them to
-  // localStorage under a dedicated key so API keys survive a page reload.
-  // Without these handlers `store_secret` was a silent no-op and every
-  // secret constant was blanked by the project autosave's redaction, so
-  // keys vanished on the next refresh.
+  // Secrets — desktop uses an OS keyring; the web build seals them in
+  // IndexedDB (secretVault.ts) so API keys survive a page reload without
+  // sitting in the clear in the browser's profile. Without these handlers
+  // `store_secret` was a silent no-op and every secret constant was blanked by
+  // the project autosave's redaction, so keys vanished on the next refresh.
+  // Where sealing is not possible the vault keeps them as this shim always
+  // did (plaintext localStorage) and says so once.
   get_secrets: async (args) => {
     const a = (args ?? {}) as Record<string, unknown>;
     const keys = Array.isArray(a.keys) ? (a.keys as string[]) : [];
-    const map = readSecretMap();
-    const out: Record<string, string> = {};
-    for (const k of keys) {
-      const v = map[k];
-      if (typeof v === 'string' && v.length > 0) out[k] = v;
-    }
-    return out;
+    return secretVault.get(keys);
   },
   store_secret: async (args) => {
     const a = (args ?? {}) as Record<string, unknown>;
     const key = String(a.key ?? '');
     if (!key) return null;
     const value = a.value == null ? '' : String(a.value);
-    const map = readSecretMap();
     // Empty value = delete (deleteConstant overwrites with '' since there's
     // no delete_secret command).
-    if (value === '') delete map[key];
-    else map[key] = value;
-    writeSecretMap(map);
+    await secretVault.set(key, value);
     return null;
   },
   load_all_macros: async () => [],

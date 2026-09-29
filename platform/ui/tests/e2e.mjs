@@ -9,7 +9,9 @@
  *
  * Asserts the things a typecheck cannot: that all three pages boot with a clean
  * console, that the shell actually renders, that navigation works ACROSS pages,
- * that a flow can be created, and that both themes resolve every token they use.
+ * that a flow can be created, that both themes resolve every token they use,
+ * that the desktop page's links and library states are right, and that a flow's
+ * API keys are sealed in IndexedDB rather than left in plaintext localStorage.
  *
  * Regression cases for defects that reached us once:
  *   - the project name must stay editable when a flow is open (it was moved into
@@ -389,6 +391,81 @@ section('flows rail collapse');
   await page.click('button[aria-label="Expand the flows panel"]');
   await page.waitForTimeout(450);
   ok('the rail button restores the panel', (await state()).panel > 200);
+
+  await ctx.close();
+}
+
+// ---------------------------------------------------------------------------
+// API keys are sealed at rest, and the browser is asked to keep the editor's storage.
+//
+// A flow's API keys were plain text in localStorage (`oaiy_web_secrets`). They are
+// sealed in IndexedDB now (AES-GCM under a key that cannot be exported), and a
+// plaintext map left from before is moved in when the editor first loads. The
+// vault's logic is tests/secret-vault.mjs against a stand-in database; this is
+// the real IndexedDB and WebCrypto. (A page that is not a secure context has no
+// WebCrypto, keeps the keys as it always did, and is skipped here.)
+section('API keys sealed at rest + persistent storage');
+{
+  const ctx = await browser.newContext({ viewport: { width: 1440, height: 900 } });
+  const page = await ctx.newPage();
+  const errors = [];
+  page.on('pageerror', (e) => errors.push(e.message));
+  await page.addInitScript(() => {
+    window.__persistCalls = 0;
+    try {
+      const proto = Object.getPrototypeOf(navigator.storage);
+      const persist = proto.persist;
+      proto.persist = function () { window.__persistCalls++; return persist.call(this); };
+    } catch { /* a browser without it: the editor has to cope */ }
+    try {
+      if (!localStorage.getItem('__e2e_seeded')) {
+        localStorage.setItem('__e2e_seeded', '1');
+        localStorage.setItem('oaiy_web_secrets', JSON.stringify({ E2E_OPENAI_KEY: 'sk-e2e-plain-1', E2E_OTHER_KEY: 'sk-e2e-plain-2' }));
+        localStorage.setItem('skipSplash', 'true');
+        localStorage.setItem('oaiy.wizard.completed', 'true');
+      }
+    } catch { /* blocked storage */ }
+  });
+  await page.goto(`${BASE}/app.html`, { waitUntil: 'networkidle' });
+  await page.waitForTimeout(2200);
+  const invoke = (cmd, args) => page.evaluate(([c, a]) => window.__TAURI__.core.invoke(c, a), [cmd, args]);
+  const plain = () => page.evaluate(() => localStorage.getItem('oaiy_web_secrets'));
+
+  ok('the editor asked the browser to keep its storage, once', (await page.evaluate(() => window.__persistCalls)) === 1);
+  if (!(await page.evaluate(() => window.isSecureContext && !!crypto.subtle))) {
+    console.log('  (not a secure context: keys stay in plaintext here, so the sealing checks are skipped)');
+  } else {
+    await page.waitForFunction(() => localStorage.getItem('oaiy_web_secrets') === null, null, { timeout: 10000 }).catch(() => {});
+    ok('the plaintext key map was moved out of localStorage', (await plain()) === null, String(await plain()));
+    const sealed = await page.evaluate(async () => {
+      const db = await new Promise((resolve, reject) => { const r = indexedDB.open('oaiy-web-secrets'); r.onsuccess = () => resolve(r.result); r.onerror = () => reject(r.error); });
+      const all = (store) => new Promise((resolve) => { const q = db.transaction(store).objectStore(store).getAll(); q.onsuccess = () => resolve(q.result); });
+      const names = await new Promise((resolve) => { const q = db.transaction('secrets').objectStore('secrets').getAllKeys(); q.onsuccess = () => resolve(q.result); });
+      const [key] = await all('keys');
+      const records = await all('secrets');
+      let exportable = true;
+      try { await crypto.subtle.exportKey('raw', key); } catch { exportable = false; }
+      const latin1 = new TextDecoder('latin1');
+      const leaks = records.some((r) => `${latin1.decode(r.data)}${latin1.decode(r.iv)}`.includes('sk-e2e'));
+      db.close();
+      return { names: [...names].sort(), alg: key?.algorithm?.name, extractable: key?.extractable, exportable, leaks, ivBytes: records.map((r) => r.iv.byteLength) };
+    });
+    ok('each key is its own sealed record', JSON.stringify(sealed.names) === JSON.stringify(['E2E_OPENAI_KEY', 'E2E_OTHER_KEY']), JSON.stringify(sealed.names));
+    ok('sealed with an AES-GCM key that cannot be exported', sealed.alg === 'AES-GCM' && sealed.extractable === false && sealed.exportable === false, JSON.stringify(sealed));
+    ok('and the records are ciphertext', !sealed.leaks && sealed.ivBytes.every((n) => n === 12), JSON.stringify(sealed.ivBytes));
+    const got = await invoke('get_secrets', { keys: ['E2E_OPENAI_KEY', 'E2E_OTHER_KEY', 'E2E_NOT_SET'] });
+    ok('the editor still gets the keys it had', got.E2E_OPENAI_KEY === 'sk-e2e-plain-1' && got.E2E_OTHER_KEY === 'sk-e2e-plain-2' && !('E2E_NOT_SET' in got), JSON.stringify(got));
+
+    await invoke('store_secret', { key: 'E2E_NEW_KEY', value: 'sk-e2e-new' });
+    ok('a key saved now is sealed, never plaintext', (await plain()) === null);
+    await page.reload({ waitUntil: 'networkidle' });
+    await page.waitForTimeout(2200);
+    const after = await invoke('get_secrets', { keys: ['E2E_OPENAI_KEY', 'E2E_NEW_KEY'] });
+    ok('after a reload the keys are still there', after.E2E_OPENAI_KEY === 'sk-e2e-plain-1' && after.E2E_NEW_KEY === 'sk-e2e-new', JSON.stringify(after));
+    await invoke('store_secret', { key: 'E2E_NEW_KEY', value: '' });
+    ok('an empty value deletes a key', !('E2E_NEW_KEY' in (await invoke('get_secrets', { keys: ['E2E_NEW_KEY'] }))));
+  }
+  ok('no page errors', errors.length === 0, errors.slice(0, 2).join(' | '));
 
   await ctx.close();
 }
