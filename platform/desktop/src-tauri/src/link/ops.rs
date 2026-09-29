@@ -135,9 +135,13 @@ impl RelayGuard {
         command: &str,
         command_id: &str,
     ) -> Result<(), Refusal> {
+        let declared = || declared_by(plugins, connector, command);
         let verdict = self
             .policy
-            .check(connector, command, command_id, || declared_by(plugins, connector, command));
+            .check(connector, command, command_id, declared)
+            // The decision is made and the plugin had no say in it. What the website is TOLD
+            // does depend on whether the plugin has such a command at all.
+            .map_err(|refusal| refusal.worded_for(declared));
         self.record(connector, command, command_id, verdict.as_ref().err().map(Refusal::reason));
         verdict
     }
@@ -656,6 +660,46 @@ mod guard_tests {
         assert_eq!(relay("notes", "note.zap", &Value::Null, "cmd-3").unwrap_err(), zap.message());
         let ghost = GateRefusal::ConnectorMissing { connector_id: "ghost".into() };
         assert_eq!(relay("ghost", "x.y", &Value::Null, "cmd-4").unwrap_err(), ghost.message());
+    }
+
+    #[test]
+    fn a_command_the_plugin_does_not_declare_is_refused_in_the_gates_words() {
+        // Aokie's entry leaves `call.transfer` off, and Aokie does not declare it either. "Can only
+        // be run from OAIY on this computer" would promise that OAIY can run it; the gate's own
+        // words say there is no such command. A command the plugin declares and the entry leaves
+        // off is still the other sentence.
+        let world = world("undeclared");
+        let relay = relay(&world, RelayPolicy::shipped());
+        let gate = GateRefusal::CapabilityDenied { connector_id: "aokie".into(), command: "call.transfer".into() };
+        let unknown = relay("aokie", "call.transfer", &Value::Null, "cmd-1").unwrap_err();
+        assert_eq!(unknown, gate.message());
+        assert!(!unknown.contains("can only be run from OAIY"), "{unknown}");
+        let kept = relay("aokie", "dongle.installDriver", &Value::Null, "cmd-2").unwrap_err();
+        assert!(kept.contains("can only be run from OAIY on this computer"), "{kept}");
+
+        // The log says which it was.
+        let raw = std::fs::read_to_string(world.root.join(RELAY_LOG_FILE)).expect("the relay log");
+        let reason = |command: &str| -> Value {
+            raw.lines()
+                .map(|l| serde_json::from_str::<Value>(l).unwrap())
+                .find(|l| l["args"]["command"] == command)
+                .map(|l| l["args"]["reason"].clone())
+                .unwrap_or_else(|| panic!("no line for {command}: {raw}"))
+        };
+        assert_eq!(reason("call.transfer"), "not_declared");
+        assert_eq!(reason("dongle.installDriver"), "not_listed");
+    }
+
+    #[test]
+    fn a_command_kept_on_this_computer_says_no_plugin_when_none_serves_the_connector() {
+        // Nothing here serves `aokie`, so it is not something OAIY can run either.
+        let root = sandbox("noaokie");
+        install_notes(&root);
+        let world = world_of(root, &["notes"]);
+        let relay = relay(&world, RelayPolicy::shipped());
+        let ghost = GateRefusal::ConnectorMissing { connector_id: "aokie".into() };
+        let refused = relay("aokie", "dongle.installDriver", &Value::Null, "cmd-1").unwrap_err();
+        assert_eq!(refused, ghost.message());
     }
 
     #[test]

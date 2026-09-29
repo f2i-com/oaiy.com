@@ -236,6 +236,29 @@ impl Refusal {
         }
     }
 
+    /// The refusal to show for a command the policy left off an entry, once the plugin has
+    /// been asked whether it declares the command at all.
+    ///
+    /// If it does not (or nothing serves the connector), the wording is the plugin gate's:
+    /// there is no such command. "Can only be run from OAIY on this computer" would tell the
+    /// website that OAIY can run something nobody offers. Only the wording changes. The
+    /// command is refused either way, the decision was made before the plugin was asked, and
+    /// a refusal of any other kind is returned as it is, without asking.
+    pub fn worded_for(self, declared: impl FnOnce() -> Declared) -> Refusal {
+        match self {
+            Refusal::ThisComputerOnly { connector, command, why: Why::NotListed } => match declared() {
+                Declared::NoPlugin => Refusal::NotOffered { connector, command, plugin_installed: false },
+                Declared::Plugin { declares: false, .. } => {
+                    Refusal::NotOffered { connector, command, plugin_installed: true }
+                }
+                Declared::Plugin { .. } => {
+                    Refusal::ThisComputerOnly { connector, command, why: Why::NotListed }
+                }
+            },
+            other => other,
+        }
+    }
+
     fn gate(&self, connector: &str, command: &str, plugin_installed: bool) -> GateRefusal {
         if plugin_installed {
             GateRefusal::CapabilityDenied {
@@ -793,6 +816,62 @@ mod tests {
         let gate = GateRefusal::CapabilityDenied { connector_id: "aokie".into(), command: "x.y".into() };
         assert_eq!(undeclared.message(), gate.message());
         assert_eq!(undeclared.code(), gate.code());
+    }
+
+    #[test]
+    fn a_command_left_off_an_entry_that_the_plugin_does_not_declare_is_worded_as_the_gate_would() {
+        // Refused as ever: the decision does not ask the plugin (`never` would panic).
+        let refusal = shipped().check("aokie", "call.transfer", "c1", never).unwrap_err();
+        assert_eq!(refusal.reason(), "not_listed");
+
+        let not_declared = || Declared::Plugin { declares: false, journalled: false };
+        let worded = refusal.clone().worded_for(not_declared);
+        assert_eq!(
+            worded,
+            Refusal::NotOffered {
+                connector: "aokie".into(),
+                command: "call.transfer".into(),
+                plugin_installed: true
+            }
+        );
+        assert_eq!(worded.reason(), "not_declared");
+        assert!(!worded.message().contains("can only be run from OAIY"), "{}", worded.message());
+
+        // Nothing serves the connector at all.
+        assert_eq!(
+            refusal.clone().worded_for(|| Declared::NoPlugin),
+            Refusal::NotOffered {
+                connector: "aokie".into(),
+                command: "call.transfer".into(),
+                plugin_installed: false
+            }
+        );
+
+        // A command the plugin does declare stays one kept on this computer, journalled or not.
+        for journalled in [false, true] {
+            let declared = move || Declared::Plugin { declares: true, journalled };
+            assert_eq!(refusal.clone().worded_for(declared), refusal);
+        }
+    }
+
+    #[test]
+    fn no_other_refusal_is_reworded_and_the_plugin_is_not_asked_about_them() {
+        for refusal in [
+            Refusal::ThisComputerOnly {
+                connector: "scanner".into(),
+                command: "scan.start".into(),
+                why: Why::Journalled,
+            },
+            Refusal::NotOffered {
+                connector: "scanner".into(),
+                command: "scan.nothing".into(),
+                plugin_installed: true,
+            },
+            Refusal::PolicyUnreadable { command: "call.answer".into() },
+            Refusal::NoCommandId { command: "call.answer".into() },
+        ] {
+            assert_eq!(refusal.clone().worded_for(never), refusal);
+        }
     }
 
     #[test]

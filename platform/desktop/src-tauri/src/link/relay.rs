@@ -587,12 +587,27 @@ mod tests {
         // The whole path, from the provider's queue to the provider's page: a
         // command that installs a driver is claimed, refused by the relay policy
         // and reported as a completion with status "failed", carrying the sentence
-        // the person is to read. It is answered, so the lane is not blamed, and no
-        // plugin is involved at all (there is none here).
+        // the person is to read. It is answered, so the lane is not blamed, and the
+        // plugin is never contacted (it is installed and not running: only its manifest
+        // is read, to see that it does declare the command it is being refused).
         let dir = std::env::temp_dir().join(format!("oaiy-relay-refusal-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir_all(&dir).unwrap();
+        let plugin_dir = dir.join("plugins").join("aokie");
+        std::fs::create_dir_all(plugin_dir.join("definitions")).unwrap();
+        std::fs::write(
+            plugin_dir.join("definitions/phone.json"),
+            include_str!("../plugins/fixtures/aokie-phone.definition.json"),
+        )
+        .unwrap();
+        std::fs::write(
+            plugin_dir.join("manifest.json"),
+            include_str!("../plugins/fixtures/aokie-v4.manifest.json"),
+        )
+        .unwrap();
+        // Turned off, so the host's own autostart leaves it alone (there is no executable).
+        std::fs::write(dir.join("plugins").join("disabled.json"), r#"["aokie"]"#).unwrap();
         let plugins = crate::plugins::registry::new_handle(dir.join("plugins"));
+        plugins.lock().unwrap().scan();
         let triggers = Arc::new(std::sync::Mutex::new(crate::plugins::TriggerStore::load(
             dir.join("triggers.json"),
         )));

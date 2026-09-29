@@ -70,7 +70,10 @@ There are two kinds of command.
 A command that is not allowed is answered as failed at once, with a sentence the
 website can show, and never reaches the plugin: `The "dongle.installDriver"
 command of the "aokie" plugin can only be run from OAIY on this computer, so it
-was refused here and never reached the plugin.` A command with no command id is
+was refused here and never reached the plugin.` A command the plugin does not
+declare at all gets the plugin gate's own sentence instead (`The "aokie" plugin does
+not declare the command "call.transfer", so it was refused before the plugin was
+contacted.`), since OAIY cannot run it either. A command with no command id is
 refused too, since the plugin's idempotency key is made from it.
 
 ### The phone bridge
