@@ -130,6 +130,15 @@ jobs:
         run: node platform/scripts/fetch-zipp-release.mjs --ensure
       - name: ZIPP release installer tests
         run: node --test platform/scripts/fetch-zipp-release.test.mjs
+      # Every path the workflows name exists in the checkout, or is made by the
+      # build: the workflows moved once with paths written for another root, and a
+      # wrong one is otherwise found only when a release is tagged. The tests are
+      # the checker's own, its reader's, the release version rule's, and what the
+      # release's desktop legs do for the pages the installer carries.
+      - name: Workflow paths exist
+        run: |
+          node platform/scripts/check-workflow-paths.mjs
+          node --test platform/scripts/workflow-yaml.test.mjs platform/scripts/check-workflow-paths.test.mjs platform/scripts/release-version.test.mjs platform/scripts/release-pages.test.mjs
       # ECO-04: advisories at high or above fail the lane. An unreachable
       # registry is recorded as UNKNOWN in the run summary, never as clean, and
       # still fails: a release must carry a completed audit.

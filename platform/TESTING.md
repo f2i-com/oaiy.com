@@ -44,6 +44,27 @@ needs of the desktop) and its stamping of the tag into `tauri.conf.json` and
 node --test scripts/release-version.test.mjs
 ```
 
+The workflows' paths are checked without running them. `scripts/check-workflow-paths.mjs`
+reads every file in `.github/workflows` (a small reader of the YAML they are written in,
+`scripts/workflow-yaml.mjs`, so it needs nothing installed) and proves that each path
+named in a `run:` script, a `working-directory:`, a `path:`, a `cache-dependency-path:`, a
+`workspaces:` (and a `files:`, a `body_path:` and a local `uses:`) exists in the tree,
+taken from the working directory in effect — the step's, the job's default, then any
+`cd` — or is made by the build (`release/`, a `dist`, `target`, the staged resources):
+those need only the folder they are made in to exist, so `platform/ui/dist/x` passes
+and `ui/dist/x`, the old root's spelling, does not. The `web` lane of `ci.yml` runs it and
+the tests of it, which seed every kind of wrong path into fixtures and into the real
+files:
+
+```bash
+node scripts/check-workflow-paths.mjs
+node --test scripts/check-workflow-paths.test.mjs scripts/workflow-yaml.test.mjs
+```
+
+`scripts/release-pages.test.mjs` reads the release's desktop legs the same way: both pages
+are built before `tauri build` stages them, and the Agent's build has the release's ZIPP
+pair cleared, because the Agent pins its own ZIPP release.
+
 | Suite | Where | Needs a running service? | Run |
 |---|---|---|---|
 | Rust unit tests | `desktop/src-tauri` | no | `cargo test --no-default-features` (headless server) and `cargo test --features gui` (desktop) |

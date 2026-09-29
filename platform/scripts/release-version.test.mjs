@@ -16,31 +16,17 @@ import os from 'node:os';
 import path from 'node:path';
 import { after, describe, it } from 'node:test';
 import { fileURLToPath } from 'node:url';
+import { parseYaml, workflowSteps } from './workflow-yaml.mjs';
 
 const repo = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..', '..');
-const release = fs.readFileSync(path.join(repo, '.github', 'workflows', 'release.yml'), 'utf8').replace(/\r\n/g, '\n');
+const steps = workflowSteps(parseYaml(fs.readFileSync(path.join(repo, '.github', 'workflows', 'release.yml'), 'utf8')));
 
-/** The `run: |` script of the step of `job` that has the line `marker`, as the shell gets it (dedented). */
-function stepScript(job, marker) {
-  const lines = release.split('\n');
-  const from = lines.indexOf(`  ${job}:`);
-  assert.ok(from >= 0, `release.yml has no job ${job}`);
-  let to = lines.findIndex((line, i) => i > from && /^ {2}[a-z][\w-]*:\s*$/.test(line));
-  if (to < 0) to = lines.length;
-  const job_lines = lines.slice(from, to);
-  const at = job_lines.indexOf(marker);
-  assert.ok(at >= 0, `the ${job} job has no step with "${marker.trim()}"`);
-  let end = job_lines.findIndex((line, i) => i > at && /^ {6}- /.test(line));
-  if (end < 0) end = job_lines.length;
-  const step = job_lines.slice(at, end);
-  const run = step.findIndex((line) => /^ {8}run: \|\s*$/.test(line) || /^ {6}- run: \|\s*$/.test(line));
-  assert.ok(run >= 0, `the step "${marker.trim()}" has no run block`);
-  const script = [];
-  for (const line of step.slice(run + 1)) {
-    if (line.trim() !== '' && !line.startsWith(' '.repeat(10))) break;
-    script.push(line.slice(10));
-  }
-  return script.join('\n').trimEnd() + '\n';
+/** The script of the step of `job` that `which` picks out (`{ id }` or `{ name }`), as the shell gets it. */
+function stepScript(job, which) {
+  const found = steps.find((s) => s.job === job && Object.entries(which).every(([key, value]) => s[key] === value));
+  assert.ok(found, `the ${job} job of release.yml has no step ${JSON.stringify(which)}`);
+  assert.equal(typeof found.run, 'string', `the step ${JSON.stringify(which)} has no script`);
+  return found.run;
 }
 
 const bash = spawnSync('bash', ['-c', 'true']).status === 0;
@@ -49,7 +35,7 @@ after(() => fs.rmSync(scratch, { recursive: true, force: true }));
 
 /** Run the meta job's version step for a ref (and, off a tag, the dispatch input). */
 function version(ref, input = '') {
-  const script = stepScript('meta', '      - id: v').replace(/\$\{\{\s*github\.event\.inputs\.version\s*\}\}/g, input);
+  const script = stepScript('meta', { id: 'v' }).replace(/\$\{\{\s*github\.event\.inputs\.version\s*\}\}/g, input);
   const output = path.join(scratch, `out-${Math.random().toString(36).slice(2)}`).replace(/\\/g, '/');
   fs.writeFileSync(output, '');
   const run = spawnSync('bash', ['-c', script], { encoding: 'utf8', env: { ...process.env, GITHUB_REF: ref, GITHUB_OUTPUT: output } });
@@ -99,7 +85,7 @@ describe('the version rule', { skip: bash ? false : 'no bash on this machine' },
 describe('the stamp', () => {
   // The node script of the desktop job's stamping step: its regex has to find the
   // version in the real Cargo.toml, and its JSON edit the one in tauri.conf.json.
-  const source = stepScript('desktop', '      - name: Stamp the version from the tag');
+  const source = stepScript('desktop', { name: 'Stamp the version from the tag' });
   const js = /node -e '([\s\S]*)' "\$VERSION"/.exec(source)?.[1];
   const tauri = path.join(repo, 'platform', 'desktop', 'src-tauri');
 
