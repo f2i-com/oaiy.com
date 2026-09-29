@@ -1,10 +1,15 @@
 /**
  * DesktopPage — the dedicated page at `/desktop.html`.
  *
- * Expands the landing page's "Desktop" section into a full page: how OAIY
- * Desktop works, how to run it, the service JSON format, and a live service
- * library of example JSON files you can download (served by the PHP API from
- * a folder — drop a file in and it shows up here).
+ * What OAIY Desktop is (a window and a tray icon, with the Agent, the flow editor, OAIY's engines,
+ * plugins and the receptionist), how it and the flow editor in a browser find each other, how to
+ * install it on Windows and Linux and what the installer does not carry, the headless server, the
+ * service JSON format, and a live service library of example JSON files you can download (served by
+ * the PHP API from a folder — drop a file in and it shows up here).
+ *
+ * The download button is the shared one (components/DownloadDesktop.tsx): the file for the visitor's
+ * system, named at build time, with no request. This page does not look for a desktop either: only the
+ * flow editor does that.
  *
  * Same design language as the landing page — the app's tokens, one grotesque
  * for display and text, JetBrains Mono for machine facts, sections as a
@@ -68,27 +73,27 @@ function Hero() {
             Your machine.<br /><em>Put to work.</em>
           </h1>
           <p className="lp-reveal lp-lede mt-6" style={{ animationDelay: '140ms' }}>
-            Give your workflows a home on your own hardware. Manage models,
-            services and plugins from one desktop app, and connect them to the web canvas over localhost.
+            OAIY Desktop is OAIY as an app: a window and a tray icon, with the Agent, the flow editor, OAIY&apos;s own
+            models and a receptionist for your business phone, all on your own computer.
           </p>
           <div className="lp-reveal mt-8 flex flex-wrap items-start gap-3" style={{ animationDelay: '220ms' }}>
-            <DownloadDesktop variant="primary" />
+            <DownloadDesktop variant="primary" fallback={{ label: 'Open the web app', href: APP_URL }} />
             <a href="#install" className="btn btn-secondary btn-lg">
               Install steps
               <ArrowRight />
             </a>
           </div>
           <p
-            className="lp-reveal mt-5 inline-flex items-center gap-1.5 text-sm"
+            className="lp-reveal mt-5 text-sm"
             style={{ animationDelay: '300ms', color: 'rgb(var(--color-text-tertiary))' }}
           >
-            <WindowsIcon /> Windows desktop app. The browser editor can be opened separately.
+            For Windows and Linux. The flow editor in your browser works on any device.
           </p>
         </div>
-        <div className="oaiy-runtime-strip" aria-label="Desktop capabilities">
-          <div><span>01 / MODELS</span><h2>Choose the intelligence.</h2><p>Download weights and manage local model servers.</p></div>
-          <div><span>02 / SERVICES</span><h2>Connect the tools.</h2><p>Bring Python, browser automation and plugins into your flows.</p></div>
-          <div><span>03 / WORKFLOWS</span><h2>Keep the work moving.</h2><p>Run linked flows locally, with status and logs to inspect.</p></div>
+        <div className="oaiy-runtime-strip" aria-label="What OAIY Desktop does">
+          <div><span>01 / THE AGENT</span><h2>Let it do the work.</h2><p>An agent that plans, runs code and shows a live preview, in projects on your computer.</p></div>
+          <div><span>02 / YOUR MODELS</span><h2>Run them here.</h2><p>Language, image, video and speech models on your own hardware, and flows that use them.</p></div>
+          <div><span>03 / YOUR PHONE</span><h2>Answer the line.</h2><p>An AI receptionist for calls and texts, with a calendar and contacts you keep.</p></div>
         </div>
       </div>
     </section>
@@ -101,16 +106,15 @@ function Hero() {
 
 function HowItWorks() {
   const features = [
-    { title: 'Manages local services', body: 'Install, start, stop and tail logs for Python rigs and your own local servers. Models run in OAIY\'s own engine.' },
-    { title: 'Downloads models', body: 'Pull GGUF and safetensors weights from Hugging Face, with pause and resume and a curated quick-add list.' },
-    { title: 'Bundles Python', body: 'A portable runtime with reusable virtual environments, so two services can share one heavy install.' },
-    { title: 'Runs the browser nodes', body: 'Hosts the headless browser that the web app\'s browser-automation nodes drive.' },
+    { title: 'A window', body: 'Overview, the Agent, Flows, the AI Receptionist, Engines, Services and Connections. The Agent and the flow editor are pages of the window itself.' },
+    { title: 'A tray icon', body: 'Closing the window hides it. OAIY keeps running from the tray, so calls are still answered and services stay up, until you choose Quit.' },
+    { title: 'A local API', body: 'Its API is served on 127.0.0.1:17972, and only there unless you turn network access on. It is how the flow editor in your browser finds the desktop.' },
   ];
   return (
     <Section
       id="how"
-      title="Two processes, one localhost handshake"
-      sub="The web app runs in your browser. OAIY Desktop runs in your tray. When the app loads it probes localhost; if the desktop app answers, its services appear in the palette."
+      title="A window, a tray icon and a local API"
+      sub="OAIY Desktop shows its pages in a window and keeps running from the tray. The same local API serves the flow editor in your browser."
       tone="var(--accent-secondary)"
     >
       <div className="grid gap-8 lg:grid-cols-[1fr_1fr] lg:items-start">
@@ -119,15 +123,15 @@ function HowItWorks() {
             <span className="lp-window-file">how the two halves talk</span>
           </div>
           <div className="lp-canvas lp-procs bg-dotgrid">
-            <ProcessCard tone="var(--accent-primary)" where="In your browser" title="OAIY web app" body="The canvas, the palette, ffmpeg.wasm media, HTTP service calls, the Zipp sandbox." />
+            <ProcessCard tone="var(--accent-primary)" where="In your browser" title="OAIY web app" body="The flow editor: the canvas, the palette, ffmpeg.wasm media, HTTP service calls, the Zipp sandbox." />
             <div className="lp-proc-link" aria-hidden="true">
               <span className="lp-proc-wire" />
               <span className="lp-proc-addr">http://127.0.0.1:17972</span>
               <span className="lp-proc-wire" />
             </div>
-            <ProcessCard tone="var(--accent-secondary)" where="In your system tray" title="OAIY Desktop" body="Model servers, Hugging Face downloads, portable Python, the browser sidecar." />
+            <ProcessCard tone="var(--accent-secondary)" where="On your computer" title="OAIY Desktop" body="The Agent, flows, OAIY's engines, plugins and the receptionist, in a window with a tray icon." />
             <p className="lp-proc-note">
-              The web app probes <code>/api/health</code> when it loads. No desktop app? Everything a browser can do still works.
+              The flow editor looks for <code>/api/health</code> on your own computer when it opens. This page does not. No desktop? Everything a browser can do still works.
             </p>
           </div>
         </div>
@@ -150,18 +154,18 @@ function HowItWorks() {
 
 function Capabilities() {
   const caps = [
-    { title: 'Bundled Python and virtual environments', body: 'A portable Python runtime with reusable venvs. Run Python services without touching your system Python, and let two services share one heavy install.' },
-    { title: 'Runs any local process', body: 'A service is an install script and a run command, so the desktop app can launch a model server, your own script or a whole cloned repo, and own its start, stop and restart.' },
-    { title: 'Uses your GPU directly', body: 'Whatever you install — CUDA, Metal, ROCm, PyTorch, ComfyUI — talks to the GPU itself. Nothing round-trips through a cloud.' },
-    { title: 'Hugging Face downloads', body: 'Pull GGUF and safetensors files with pause and resume into a shared models folder that every service can read as ${modelsDir}.' },
-    { title: 'Logs, health and lifecycle', body: 'Tail each service\'s output live, watch its status, and let a health probe confirm it is up before the web app starts using it.' },
-    { title: 'Localhost only', body: 'Every service is exposed on 127.0.0.1 and nowhere else. The web app discovers them there; your data and compute never leave the machine.' },
+    { title: 'The Agent', body: "Projects with a file tree, an editor, a terminal and a live preview for web pages, apps and 3D models. It plans the work, does it one step at a time and reviews each step. It thinks with a model chosen in OAIY's engines, or with your ChatGPT account." },
+    { title: 'Flows', body: 'The flow editor in the same window, with the history of every run. A flow can be a tool for the Agent, and a flow can hand a task to the Agent. Flows also run without a window, through the oaiy command-line tool.' },
+    { title: "OAIY's engines", body: 'Written in Rust: language models, and pictures, video, speech, music, sound effects, 3D models, background removal and upscaling. Most need an NVIDIA GPU; language models also run on WebGPU or the CPU. The models download on first use, and the engines are not in the installer yet.' },
+    { title: 'The AI Receptionist', body: 'Calls, texts, a calendar, contacts and your opening hours for a business phone line. A booking is a request you confirm. It needs the Aokie plugin and your phone connected over Bluetooth; the plugin is for Windows and is not published for download yet.' },
+    { title: 'Plugins and connections', body: 'Plugins are programs OAIY runs and supervises, like Aokie for the phone. Connections pair apps such as FormLogic with this computer. The Agent can set them up with you.' },
+    { title: 'Services and Python', body: "Install, start, stop and tail the logs of your own local servers and Python rigs, with a portable Python and reusable virtual environments. Download models from Hugging Face with pause and resume. A service is one JSON file (below)." },
   ];
   return (
     <Section
       id="capabilities"
-      title="Local compute, on tap"
-      sub="The desktop app is the bridge between the browser sandbox and the machine's real muscle: Python, arbitrary processes and the GPU."
+      title="What OAIY does on your machine"
+      sub="The desktop app is where the work that needs a real computer happens: models on the GPU, real files, the phone."
       tone="var(--signal-amber)"
     >
       <dl className="lp-defs">
@@ -181,34 +185,62 @@ function Capabilities() {
 /* ------------------------------------------------------------------ */
 
 function Install() {
-  const steps = [
-    { title: 'Download and launch', body: 'Get OAIY Desktop for Windows and run it. It lives in the system tray, so there is no window to keep open.' },
-    { title: 'It binds localhost', body: 'The desktop app serves a small HTTP API on 127.0.0.1:17972 and exposes its services there.' },
-    { title: 'Open the web app', body: 'On load the app probes /api/health. If the desktop app answers, its services appear in the palette.' },
-  ];
   return (
     <Section
       id="install"
-      title="Running OAIY Desktop"
-      sub="Optional and local only. Without it the app still works; a node that needs a desktop service says so and tells you what to start."
+      title="Installing OAIY Desktop"
+      sub="For Windows and Linux. The installers are not code-signed yet, so Windows will warn you; how to go on is below."
       tone="var(--signal-green)"
     >
       <div className="mb-4 flex flex-wrap items-start gap-3">
-        <DownloadDesktop variant="primary" />
+        <DownloadDesktop variant="primary" fallback={{ label: 'Open the web app', href: APP_URL }} />
         <a className="btn btn-secondary btn-lg" href={repoFolderUrl('desktop')}>Installation documentation</a>
       </div>
-      <p className="mb-8 text-sm" style={{ color: 'rgb(var(--color-text-tertiary))', lineHeight: 1.55 }}>
+      <p className="mb-10 text-sm" style={{ color: 'rgb(var(--color-text-tertiary))', lineHeight: 1.55 }}>
         Every file has its SHA-256 in <code>SHA256SUMS.txt</code> on the <a href={RELEASES_URL} target="_blank" rel="noopener noreferrer" className="lp-star-inline">latest release</a>.
       </p>
-      <ol className="lp-steps">
-        {steps.map((s, i) => (
-          <li key={s.title} className="lp-step">
-            <span className="lp-step-n" aria-hidden="true">{i + 1}</span>
-            <h3>{s.title}</h3>
-            <p>{s.body}</p>
-          </li>
-        ))}
-      </ol>
+
+      <div className="lp-install">
+        <div className="lp-install-os">
+          <h3 className="lp-mini-h">Windows</h3>
+          <ol>
+            <li>Download the setup file (<code>.exe</code>) and run it. It installs for your user account and asks for no administrator rights.</li>
+            <li>Windows will say “Windows protected your PC”, because the installer is not code-signed yet: choose “More info”, then “Run anyway”.</li>
+            <li>Open OAIY. Setup asks for the essentials (your AI, and what the Agent may change), then “Continue with the Agent” sets up the rest with you.</li>
+          </ol>
+        </div>
+        <div className="lp-install-os">
+          <h3 className="lp-mini-h">Linux</h3>
+          <ol>
+            <li>Download the AppImage, make it executable and run it: <code>chmod +x oaiy-desktop-*.AppImage &amp;&amp; ./oaiy-desktop-*.AppImage</code>.</li>
+            <li>Or install the <code>.deb</code> (<code>sudo apt install ./oaiy-desktop-*.deb</code>) or the <code>.rpm</code> (<code>sudo dnf install ./oaiy-desktop-*.rpm</code>).</li>
+            <li>Open OAIY and follow setup, as on Windows.</li>
+          </ol>
+        </div>
+      </div>
+
+      <div className="lp-note mt-10">
+        <p>The installer carries the dashboard, the Agent, the flow editor and the flow runner. OAIY&apos;s engines, the models and the Aokie plugin are not in it.</p>
+        <p>An install without the engines has no models of its own; the Agent can still use ChatGPT or an API provider.</p>
+      </div>
+
+      <h3 className="lp-mini-h mt-12">On a Linux host: the headless server</h3>
+      <p className="mb-5 text-sm" style={{ color: 'rgb(var(--color-text-tertiary))', lineHeight: 1.55, maxWidth: '40rem' }}>
+        <code>oaiy-server</code> is the same local API and services with no window, no tray icon and no webview, so nothing graphical needs installing, for a server that the <code>oaiy</code> command line or a web app drives. It has no Agent or flow editor to show. To listen on the network it needs a token.
+      </p>
+      <div className="lp-window">
+        <div className="lp-window-bar">
+          <span className="lp-window-file">oaiy-server-&lt;version&gt;-linux-x86_64.tar.gz</span>
+        </div>
+        <pre className="lp-code" style={{ ['--tone' as string]: 'var(--signal-green)' }}>
+<span className="lp-code-c"># unpack it and start it with a token</span>{'\n'}
+mkdir oaiy-server &amp;&amp; tar -xzf oaiy-server-*-linux-x86_64.tar.gz -C oaiy-server{'\n'}
+cd oaiy-server{'\n'}
+OAIY_SERVER_TOKEN=change-me ./oaiy-server{'\n\n'}
+<span className="lp-code-c"># in another shell</span>{'\n'}
+curl http://127.0.0.1:17972/api/health
+        </pre>
+      </div>
     </Section>
   );
 }
@@ -454,7 +486,4 @@ function ArrowRight() {
 }
 function DownloadIcon() {
   return <svg className="h-4 w-4" fill="none" stroke="currentColor" viewBox="0 0 24 24" aria-hidden="true"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth="2" d="M12 3v12m0 0l-4-4m4 4l4-4M5 21h14" /></svg>;
-}
-function WindowsIcon() {
-  return <svg className="h-3.5 w-3.5" fill="currentColor" viewBox="0 0 24 24" aria-hidden="true"><path d="M3 5.5l8-1.1v7.2H3V5.5zm0 13l8 1.1v-7.1H3v6zm9 1.2l9 1.3v-8.4h-9v7.1zm0-16.4v7.4h9V3.1L12 3.3z" /></svg>;
 }

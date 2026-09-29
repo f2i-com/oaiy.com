@@ -52,3 +52,54 @@
   .oaiy-site .oaiy-runtime-strip { grid-template-columns: 1fr; margin-top: 40px; }
   .oaiy-site .oaiy-runtime-strip > div { padding-bottom: 20px; border-bottom: 1px solid rgb(var(--color-border-primary)); }
 }
+
+/* Screenshots (src/landing/screenshots.ts): WebP at their own size, the width of what holds them. */
+.oaiy-site .oaiy-shot { display: block; width: 100%; height: auto; background: rgb(var(--color-bg-secondary)); }
+.oaiy-site .oaiy-workbench .oaiy-shot { border-bottom: 1px solid rgb(var(--color-border-primary)); }
+.oaiy-site .lp-shots { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 28px; margin-top: 40px; }
+.oaiy-site .lp-shot { margin: 0; }
+.oaiy-site .lp-shot .oaiy-shot { border: 1px solid rgb(var(--color-border-primary)); border-radius: 8px; }
+.oaiy-site .lp-shot figcaption { margin-top: 12px; font-size: 13.5px; line-height: 1.6; color: rgb(var(--color-text-secondary)); }
+.oaiy-site .lp-shot figcaption strong { display: block; margin-bottom: 2px; font-size: 15px; font-weight: 600; letter-spacing: -.01em; color: rgb(var(--color-text-primary)); }
+/* The example flow inside a section, where nothing follows it for it to run into. */
+.oaiy-site .lp-section .oaiy-workbench { border-bottom: 1px solid rgb(var(--color-border-primary)); border-radius: 10px; }
+
+/* What works in the browser and what needs the desktop */
+.oaiy-site .lp-compare-wrap { overflow-x: auto; border: 1px solid rgb(var(--color-border-primary)); border-radius: 10px; background: rgb(var(--color-bg-secondary)); }
+.oaiy-site .lp-compare { width: 100%; border-collapse: collapse; font-size: 14px; line-height: 1.5; }
+.oaiy-site .lp-compare th,
+.oaiy-site .lp-compare td { padding: 13px 16px; text-align: left; vertical-align: top; border-bottom: 1px solid rgb(var(--color-border-primary)); }
+.oaiy-site .lp-compare tbody tr:last-child > * { border-bottom: 0; }
+.oaiy-site .lp-compare thead th { font: 11px var(--font-mono, monospace); letter-spacing: .08em; text-transform: uppercase; color: rgb(var(--accent-primary)); }
+.oaiy-site .lp-compare tbody th { width: 38%; font-weight: 560; color: rgb(var(--color-text-primary)); }
+.oaiy-site .lp-compare td { color: rgb(var(--color-text-secondary)); }
+.oaiy-site .lp-compare td.no { color: rgb(var(--color-text-tertiary)); }
+@media (max-width: 900px) {
+  .oaiy-site .lp-shots { grid-template-columns: 1fr; gap: 32px; }
+}
+/* On a phone each row is a small card: the feature, then what each side does, so nothing needs a sideways scroll. */
+@media (max-width: 640px) {
+  .oaiy-site .lp-compare thead { display: none; }
+  .oaiy-site .lp-compare,
+  .oaiy-site .lp-compare tbody,
+  .oaiy-site .lp-compare tr,
+  .oaiy-site .lp-compare th,
+  .oaiy-site .lp-compare td { display: block; }
+  .oaiy-site .lp-compare tbody tr { padding: 12px 0; border-bottom: 1px solid rgb(var(--color-border-primary)); }
+  .oaiy-site .lp-compare tbody tr:last-child { border-bottom: 0; }
+  .oaiy-site .lp-compare th,
+  .oaiy-site .lp-compare td { padding: 3px 16px; border-bottom: 0; }
+  .oaiy-site .lp-compare tbody th { width: auto; padding-bottom: 6px; }
+  .oaiy-site .lp-compare td::before { content: attr(data-label); display: block; font: 10.5px var(--font-mono, monospace); letter-spacing: .08em; text-transform: uppercase; color: rgb(var(--accent-primary)); }
+  .oaiy-site .lp-compare td { padding-bottom: 8px; }
+}
+
+/* Installing: one numbered list per system */
+.oaiy-site .lp-install { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 32px; }
+.oaiy-site .lp-install-os ol { display: flex; margin: 0; padding: 0; flex-direction: column; gap: 14px; list-style: none; counter-reset: lp-install; }
+.oaiy-site .lp-install-os li { position: relative; padding-left: 34px; counter-increment: lp-install; font-size: 14.5px; line-height: 1.6; color: rgb(var(--color-text-secondary)); }
+.oaiy-site .lp-install-os li::before { content: counter(lp-install); position: absolute; top: 1px; left: 0; display: grid; width: 22px; height: 22px; place-items: center; border-radius: 999px; background: rgb(var(--tone) / .14); color: rgb(var(--tone)); font: 12px var(--font-mono, monospace); }
+.oaiy-site .lp-install-os code { font-family: var(--font-mono, monospace); font-size: .88em; overflow-wrap: anywhere; }
+@media (max-width: 900px) {
+  .oaiy-site .lp-install { grid-template-columns: 1fr; }
+}

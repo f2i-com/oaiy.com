@@ -16,7 +16,7 @@
     "test:e2e": "node tests/e2e.mjs",
     "test:css": "node tests/css-tokens.mjs",
     "pretest": "node ../scripts/fetch-zipp-release.mjs --ensure",
-    "test": "npm run typecheck && npm run test:css && npm run test:contracts && npm run test:zipp && npm run test:zipp-routing && npm run test:zipp-script && npm run test:in-oaiy && npm run test:flow-services && npm run test:persistent-storage && npm run test:landing && npm run test:engine-endpoint && npm run test:secret-vault && npm run test:sw && npm run test:sw-build && npm run test:pwa && npm run test:pwa-assets && npm run test:downloads",
+    "test": "npm run typecheck && npm run test:css && npm run test:contracts && npm run test:zipp && npm run test:zipp-routing && npm run test:zipp-script && npm run test:in-oaiy && npm run test:flow-services && npm run test:persistent-storage && npm run test:landing && npm run test:engine-endpoint && npm run test:secret-vault && npm run test:sw && npm run test:sw-build && npm run test:pwa && npm run test:pwa-assets && npm run test:downloads && npm run test:site",
     "test:contracts": "node tests/node-contracts.mjs",
     "pretest:zipp": "node ../scripts/fetch-zipp-release.mjs --ensure",
     "test:zipp": "node tests/zipp-executor.mjs",
@@ -34,7 +34,8 @@
     "test:pwa": "node tests/pwa-controllers.mjs",
     "test:pwa-assets": "node tests/pwa-assets.mjs",
     "test:pwa-e2e": "node tests/pwa-e2e.mjs",
-    "test:downloads": "node tests/downloads.mjs"
+    "test:downloads": "node tests/downloads.mjs",
+    "test:site": "node tests/site-assets.mjs"
   },
   "dependencies": {
     "@ffmpeg/core": "^0.12.10",

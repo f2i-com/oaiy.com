@@ -8,7 +8,14 @@
  * is keyed the way the app keys it — by node family — so a section about
  * image nodes is magenta because image nodes ARE magenta on the canvas.
  *
- * The one thing allowed to move is the hero flow, and it moves once: on load
+ * What it says is what is true of the product today, and what is not is said
+ * where it matters: the flow editor runs in a browser; the Agent, OAIY's own
+ * engines and the phone receptionist are OAIY Desktop's (Windows and Linux); the
+ * engines and the Aokie plugin are not in the installer yet. The screenshots are of
+ * OAIY Desktop, with demo data. Nothing on the page makes a request, looks for a
+ * desktop, or asks GitHub anything (see components/DownloadDesktop.tsx).
+ *
+ * The one thing allowed to move is the example flow, and it moves once: on load
  * the graph runs exactly like a flow does in the app — each node lights up in
  * turn, the Condition takes its False branch and the graph regenerates, then
  * the second pass passes. That is what the product does, so it is the thing
@@ -20,6 +27,7 @@
  */
 import SiteNav, { REPO_URL } from './SiteNav';
 import DownloadDesktop from '../components/DownloadDesktop';
+import { SCREENSHOTS, type Screenshot } from './screenshots';
 
 const APP_URL = 'app.html';
 
@@ -34,15 +42,32 @@ export default function LandingPage() {
         <Hero />
         <Engines />
         <Why />
+        <Screens />
+        <Flows />
         <Palette />
         <HowItWorks />
+        <Compare />
         <Privacy />
         <Desktop />
-        <RemoteAI />
         <FinalCta />
       </main>
       <Footer />
     </div>
+  );
+}
+
+/** A screenshot, at the size it is, with its description. */
+function Shot({ shot, eager = false }: { shot: Screenshot; eager?: boolean }) {
+  return (
+    <img
+      src={shot.src}
+      width={shot.width}
+      height={shot.height}
+      alt={shot.alt}
+      className="oaiy-shot"
+      loading={eager ? 'eager' : 'lazy'}
+      decoding="async"
+    />
   );
 }
 
@@ -63,8 +88,8 @@ function Hero() {
             className="lp-reveal lp-lede mt-6"
             style={{ animationDelay: '140ms' }}
           >
-            Give your ideas a workflow. Connect models, tools and media on a visual canvas,
-            then run them with the engines you choose — on your machine or through your own endpoints.
+            OAIY is an AI agent and flow builder. Draw flows in your browser with the AI you already use.
+            Install OAIY Desktop to work with an agent, run models on your own machine and answer your business phone.
           </p>
           <div className="lp-reveal mt-8 flex flex-wrap items-start gap-3" style={{ animationDelay: '220ms' }}>
             <a href={APP_URL} className="btn btn-primary btn-lg">
@@ -77,16 +102,16 @@ function Hero() {
             className="lp-reveal mt-5 flex flex-wrap gap-x-5 gap-y-1.5 text-sm"
             style={{ animationDelay: '300ms', color: 'rgb(var(--color-text-tertiary))' }}
           >
-            <li className="inline-flex items-center gap-1.5"><CheckIcon /> Browser-based editor</li>
+            <li className="inline-flex items-center gap-1.5"><CheckIcon /> Flow editor in your browser</li>
             <li className="inline-flex items-center gap-1.5"><CheckIcon /> No sign-up</li>
-            <li className="inline-flex items-center gap-1.5"><CheckIcon /> Bring your own engines</li>
+            <li className="inline-flex items-center gap-1.5"><CheckIcon /> Keys stay on your device</li>
           </ul>
         </div>
 
         <div className="oaiy-workbench lp-reveal mt-12 sm:mt-16" style={{ animationDelay: '380ms' }}>
-          <div className="oaiy-workbench-header"><span>THE CANVAS / 01</span><span>Example workflow</span></div>
-          <div className="oaiy-graph-scroll" role="region" aria-label="Image review workflow diagram, scroll horizontally on small screens" tabIndex={0}><HeroGraph /></div>
-          <div className="oaiy-workbench-footer"><strong>Generate. Review. Refine.</strong><span>An image meets a vision model. A condition decides what happens next.</span><a href={APP_URL}>Build your own ↗</a></div>
+          <div className="oaiy-workbench-header"><span>THE AGENT / 01</span><span>OAIY Desktop</span></div>
+          <Shot shot={SCREENSHOTS.agent} eager />
+          <div className="oaiy-workbench-footer"><strong>Work with an agent.</strong><span>It plans the steps, writes and runs code, and shows a live preview, with your files, an editor and a terminal in one window.</span><a href="desktop.html">About OAIY Desktop ↗</a></div>
         </div>
       </div>
     </section>
@@ -320,7 +345,7 @@ function NodeGlyph({ icon }: { icon: 'image' | 'brain' | 'branch' | 'check' }) {
 /* ------------------------------------------------------------------ */
 
 const ENGINES = [
-  'Ollama', 'LM Studio', 'llama.cpp', 'vLLM', 'ComfyUI', 'Stable Diffusion',
+  "OAIY's own engines (Desktop)", 'Ollama', 'LM Studio', 'llama.cpp', 'vLLM', 'ComfyUI', 'Stable Diffusion',
   'OpenAI', 'Anthropic', 'Any OpenAI-compatible server', 'Any HTTP endpoint',
 ];
 
@@ -328,7 +353,7 @@ function Engines() {
   return (
     <section className="lp-engines" aria-label="Supported AI engines">
       <div className="mx-auto flex max-w-6xl flex-col gap-4 px-5 sm:px-8 lg:flex-row lg:items-center lg:gap-10">
-        <p className="lp-engines-lead">Talks to the engines you already run</p>
+        <p className="lp-engines-lead">Talks to OAIY's engines and the AI you already use</p>
         <ul className="flex flex-wrap gap-2">
           {ENGINES.map((name) => (
             <li key={name} className="lp-engine">{name}</li>
@@ -347,30 +372,30 @@ function Why() {
   const items = [
     {
       tone: 'var(--accent-primary)',
-      title: 'The logic is the diagram',
-      body: 'Drag nodes, wire typed handles, and watch data move through. Conditions, loops, macros and subflows are all things you draw, not things you configure.',
+      title: 'An agent that does the work',
+      body: "Give it a task in a project. It plans the steps, works through them one at a time, checks each one and shows every tool it used. It writes and runs code and builds web pages and apps with a live preview. With OAIY's engines it also makes pictures, video, speech, music and 3D models.",
     },
     {
       tone: 'var(--signal-green)',
-      title: 'Your machine does the work',
-      body: 'The flow lives in your browser and inference runs on your engines. OAIY orchestrates; nothing is proxied through a server.',
+      title: 'Flows you can see',
+      body: 'Draw the logic: models, tools, conditions, loops. Watch data move through, run it, and reuse it as a macro or a subflow. In OAIY Desktop a flow can be a tool the Agent uses, and a flow can hand a task to the Agent.',
     },
     {
       tone: 'var(--signal-cyan)',
-      title: 'Any AI can press Run',
-      body: 'Share a flow as a link and let ChatGPT, Claude or any HTTP client queue runs that execute on your hardware, end-to-end encrypted if you want.',
+      title: 'A receptionist for your phone',
+      body: "The AI Receptionist answers your business's calls and texts, books appointments as requests you confirm, and remembers the people who get in touch. It needs OAIY Desktop and your phone connected over Bluetooth, through the Aokie plugin. The plugin is for Windows and is not published for download yet.",
     },
     {
       tone: 'var(--signal-amber)',
-      title: 'Build once, reuse everywhere',
-      body: 'Capture a subgraph as a macro, nest flows as subflows, and pass whole flows around as JSON or a private link.',
+      title: 'Models on your own machine',
+      body: "OAIY's own engines run language, image, video and speech models on your computer. Most need an NVIDIA GPU; language models also run on WebGPU or the CPU. The engines are not in the installer yet.",
     },
   ];
   return (
     <Section
       id="why"
-      title="The power of code. The clarity of a diagram."
-      sub="Everything you would otherwise script — prompts, branching, retries, media pipelines — laid out as a graph you can read at a glance."
+      title="One app for the work, the flows and the phone"
+      sub="The Agent, the flow editor and the receptionist are parts of one app, and they use the same models."
     >
       <dl className="lp-defs">
         {items.map((it) => (
@@ -385,6 +410,60 @@ function Why() {
 }
 
 /* ------------------------------------------------------------------ */
+/* Screens                                                             */
+/* ------------------------------------------------------------------ */
+
+function Screens() {
+  const shots: { shot: Screenshot; title: string; body: string }[] = [
+    { shot: SCREENSHOTS.flows, title: 'Flows', body: "The flow editor, with OAIY's models as nodes. This one removes a photo's background, upscales it and writes a caption." },
+    { shot: SCREENSHOTS.call, title: 'A call', body: "The receptionist's side of a phone call, as it happens." },
+    { shot: SCREENSHOTS.calendar, title: 'The calendar', body: 'Bookings that calls and texts bring in wait for you to confirm.' },
+  ];
+  return (
+    <section id="see" className="lp-section scroll-mt-20" style={{ ['--tone' as string]: 'var(--signal-magenta)' }}>
+      <div className="mx-auto max-w-6xl px-5 sm:px-8">
+        <div className="lp-rail">
+          <h2 className="lp-h2">The rest of OAIY Desktop</h2>
+          <p className="lp-rail-sub">Screenshots of a demo setup: the business, the people and their numbers are made up.</p>
+        </div>
+        <div className="lp-shots">
+          {shots.map(({ shot, title, body }) => (
+            <figure key={title} className="lp-shot">
+              <Shot shot={shot} />
+              <figcaption><strong>{title}</strong>{body}</figcaption>
+            </figure>
+          ))}
+        </div>
+      </div>
+    </section>
+  );
+}
+
+/* ------------------------------------------------------------------ */
+/* Flows: the example                                                  */
+/* ------------------------------------------------------------------ */
+
+function Flows() {
+  return (
+    <Section
+      id="flows"
+      title="The logic is the diagram"
+      sub="Drag nodes, wire typed handles, and watch data move through. Conditions, loops, macros and subflows are all things you draw, not things you configure."
+      tone="var(--signal-green)"
+    >
+      <div className="oaiy-workbench">
+        <div className="oaiy-workbench-header"><span>THE CANVAS / 02</span><span>Example workflow</span></div>
+        <div className="oaiy-graph-scroll" role="region" aria-label="Image review workflow diagram, scroll horizontally on small screens" tabIndex={0}><HeroGraph /></div>
+        <div className="oaiy-workbench-footer"><strong>Generate. Review. Refine.</strong><span>An image meets a vision model. A condition decides what happens next.</span><a href={APP_URL}>Build your own ↗</a></div>
+      </div>
+      <p className="lp-note mt-5">
+        With OAIY Desktop the image and language models are OAIY's own, as nodes of their own. In the browser the same steps are Service Call nodes pointed at your own provider.
+      </p>
+    </Section>
+  );
+}
+
+/* ------------------------------------------------------------------ */
 /* Palette — the app's node catalogue, drawn the way the app draws it  */
 /* ------------------------------------------------------------------ */
 
@@ -394,10 +473,10 @@ function Why() {
  * system's signal palette exactly as the canvas maps it.
  */
 const FAMILIES: { name: string; tone: string; body: string; nodes: string[] }[] = [
-  { name: 'AI', tone: 'var(--accent-primary)', body: 'Chat, vision and raw requests against local or cloud models. Stream tokens, template prompts, fan out across providers.', nodes: ['ai_llm'] },
-  { name: 'Browser', tone: 'var(--signal-cyan)', body: 'Fetch pages, drive sessions, and extract text, links, contacts, images, JSON-LD and metadata.', nodes: ['browser_page', 'browser_extract', 'browser_action', 'browser_request', 'browser_session'] },
-  { name: 'Image', tone: 'var(--signal-magenta)', body: 'Generate, resize, view and save images, including whole ComfyUI graphs driven from one node.', nodes: ['image_gen', 'image_resize', 'image_view', 'image_save'] },
-  { name: 'Audio', tone: 'var(--signal-green)', body: 'Speech in both directions, music generation, and append and fade edits.', nodes: ['text_to_speech', 'speech_to_text', 'music_gen', 'audio_append', 'audio_fade'] },
+  { name: 'AI', tone: 'var(--accent-primary)', body: 'Chat, vision and raw requests against local or cloud models. Stream tokens, template prompts, fan out across providers. In OAIY Desktop, hand a task to the Agent.', nodes: ['ai_llm', 'ask_agent'] },
+  { name: 'Browser', tone: 'var(--signal-cyan)', body: "Fetch pages, drive sessions, and extract text, links, contacts, images, JSON-LD and metadata. Sessions run in OAIY Desktop's browser.", nodes: ['browser_page', 'browser_extract', 'browser_action', 'browser_request', 'browser_session'] },
+  { name: 'Image and 3D', tone: 'var(--signal-magenta)', body: 'Generate, resize, view and save images, remove backgrounds, upscale, make a 3D model from a picture, and drive whole ComfyUI graphs from one node.', nodes: ['image_gen', 'image_resize', 'image_view', 'image_save', 'background_removal', 'image_upscale', 'model_3d'] },
+  { name: 'Audio', tone: 'var(--signal-green)', body: 'Speech in both directions, music and sound effects, and append and fade edits.', nodes: ['text_to_speech', 'speech_to_text', 'music_gen', 'sound_effect', 'audio_append', 'audio_fade'] },
   { name: 'Video', tone: 'var(--signal-amber)', body: 'Generate, caption, cut, stack and mix video in the browser with ffmpeg.wasm. No uploads.', nodes: ['video_gen', 'video_captions', 'video_append', 'video_pip', 'audio_mixer'] },
   { name: 'Flow control', tone: 'var(--signal-amber)', body: 'Branch on real data, loop over lists, and package subgraphs as macros and subflows.', nodes: ['condition', 'loop_start', 'loop_end', 'macro', 'subflow', 'output'] },
   { name: 'Files and data', tone: 'var(--signal-green)', body: 'Read and write files, chunk long text, and query a built-in SQLite database.', nodes: ['file_read', 'file_write', 'text_chunker', 'database_query'] },
@@ -437,9 +516,9 @@ function Palette() {
 
 function HowItWorks() {
   const steps = [
-    { title: 'Open the canvas', body: 'It runs in your browser, so there is nothing to install. The first-run wizard wires a starter chat flow in three clicks.' },
-    { title: 'Point it at your engines', body: 'Add Ollama, LM Studio, ComfyUI, OpenAI or any HTTP endpoint as a Service and test the connection in place. Keys stay on your device.' },
-    { title: 'Run, then share', body: 'Press Run and watch each node light up. Share the flow as a link, or hand the link to an AI and let it trigger runs on your hardware.' },
+    { title: 'Open the flow editor', body: 'It runs in your browser, so there is nothing to install and no account to make. The first-run wizard wires a starter chat flow in three clicks.' },
+    { title: 'Bring your own AI', body: 'Add Ollama, LM Studio, ComfyUI, OpenAI, Anthropic or any HTTP endpoint as a Service and test the connection in place. Keys stay on your device.' },
+    { title: 'Install OAIY Desktop for the rest', body: "For the Agent, OAIY's own models and the phone receptionist, install OAIY Desktop on Windows or Linux. Flows move between the two as files." },
   ];
   return (
     <Section id="how" title="From a blank canvas to a running flow">
@@ -457,22 +536,71 @@ function HowItWorks() {
 }
 
 /* ------------------------------------------------------------------ */
+/* Browser or Desktop                                                  */
+/* ------------------------------------------------------------------ */
+
+const COMPARISON: { what: string; browser: string; desktop: string }[] = [
+  { what: 'The flow editor', browser: 'Yes', desktop: 'Yes' },
+  { what: 'Your own AI: Ollama, LM Studio, OpenAI, Anthropic, any endpoint', browser: 'Yes, called straight from the page', desktop: 'Yes' },
+  { what: "OAIY's own models: language, image, video and speech", browser: 'No', desktop: 'Yes, on your computer (an NVIDIA GPU for most)' },
+  { what: 'The Agent: projects, code and a live preview', browser: 'No', desktop: 'Yes' },
+  { what: 'The AI Receptionist', browser: 'No', desktop: 'Yes, with the Aokie plugin and your phone' },
+  { what: 'Browser automation and Python services', browser: 'No', desktop: 'Yes' },
+  { what: 'Installing', browser: 'Nothing to install; the editor can be installed as an app', desktop: 'Windows and Linux' },
+];
+
+function Compare() {
+  return (
+    <Section
+      id="compare"
+      title="In your browser, and with OAIY Desktop"
+      sub="The flow editor works anywhere. The rest runs on your computer, so it needs the desktop app."
+      tone="var(--signal-cyan)"
+    >
+      <div className="lp-compare-wrap">
+        <table className="lp-compare">
+          <caption className="sr-only">What works in the browser and what needs OAIY Desktop</caption>
+          <thead>
+            <tr>
+              <th scope="col"><span className="sr-only">Feature</span></th>
+              <th scope="col">In your browser</th>
+              <th scope="col">With OAIY Desktop</th>
+            </tr>
+          </thead>
+          <tbody>
+            {COMPARISON.map((row) => (
+              <tr key={row.what}>
+                <th scope="row">{row.what}</th>
+                <td data-label="In your browser" className={row.browser.startsWith('No') ? 'no' : undefined}>{row.browser}</td>
+                <td data-label="With OAIY Desktop" className={row.desktop.startsWith('No') ? 'no' : undefined}>{row.desktop}</td>
+              </tr>
+            ))}
+          </tbody>
+        </table>
+      </div>
+      <p className="lp-note mt-5">
+        A model server you run yourself has to allow requests from a web page (CORS). The engines and the Aokie plugin are not in the installer yet.
+      </p>
+    </Section>
+  );
+}
+
+/* ------------------------------------------------------------------ */
 /* Privacy                                                             */
 /* ------------------------------------------------------------------ */
 
 function Privacy() {
   const points = [
-    { title: 'The flow stays in your browser', body: 'It lives in local storage and the JSON you export. It reaches a server only if you share it.' },
-    { title: 'Inference runs on your machine', body: 'OAIY orchestrates and your engines compute. No prompt, image or result passes through oaiy.com.' },
-    { title: 'Keys never leave your device', body: 'Secrets resolve against your local constants at run time. The sharing backend cannot see them.' },
+    { title: 'Your work stays on your device', body: 'Flows, keys and files live in your browser, or on your computer with OAIY Desktop. Nothing is uploaded to OAIY, and there is no account.' },
+    { title: 'Keys stay on your device', body: 'API keys are kept sealed in your browser and used only in the requests your flows make. They are never sent to OAIY.' },
+    { title: 'Prompts go where you point them', body: 'To a model on your own machine, or to the provider whose key you added. They never pass through a server of ours.' },
     { title: 'Flow code runs in a sandbox', body: 'Code nodes execute inside Zipp, a JavaScript engine compiled to WebAssembly with no network, no storage and hard limits on CPU and memory.' },
-    { title: 'Shares can be sealed', body: 'Set a password and a shared flow is encrypted with AES-GCM before it leaves the browser. Lose the password, lose the flow — by design.' },
   ];
   return (
     <Section
       id="privacy"
       title="Built to keep your data yours"
-      sub="Local-first on purpose. The optional backend is a meeting point for sharing, never a place your prompts, keys or results pass through in the clear."
+      sub="Local-first on purpose. This site serves the page and the editor, and nothing you build or run is sent back to it."
       tone="var(--signal-green)"
     >
       <ul className="lp-checks">
@@ -496,16 +624,16 @@ function Privacy() {
 
 function Desktop() {
   const features = [
-    { title: 'Manages local services', body: 'Install, start, stop and tail logs for Python rigs and your own local servers. Models run in OAIY\'s own engine.' },
-    { title: 'Downloads models', body: 'Pull GGUF and safetensors weights from Hugging Face, with pause and resume and a curated quick-add list.' },
-    { title: 'Bundles Python', body: 'A portable runtime with reusable virtual environments, so two services can share one heavy install.' },
-    { title: 'Runs the browser nodes', body: 'Hosts the headless browser that the web app\'s browser-automation nodes drive.' },
+    { title: 'The Agent', body: 'Projects with files, an editor, a terminal and a live preview, and an agent that plans the work and shows every step.' },
+    { title: "OAIY's engines", body: 'Language, image, video, speech, music and 3D models on your own hardware, and their nodes in the flow editor. The engines are not in the installer yet.' },
+    { title: 'The AI Receptionist', body: "Calls, texts, a calendar and contacts for your business phone line, through the Aokie plugin, with your phone connected over Bluetooth." },
+    { title: 'Plugins and connections', body: 'Aokie connects a phone. FormLogic connects your apps. Plugins run on your computer, and the Agent can set them up with you.' },
   ];
   return (
     <Section
       id="desktop"
-      title="Optional muscle for the heavy local work"
-      sub="The web app does everything a browser can. For the rest — starting model servers, downloading weights, running Python — there is a small tray companion."
+      title="OAIY Desktop: all of it, on your computer"
+      sub="A window and a tray icon, for Windows and Linux. The flow editor in your browser can use it too."
       tone="var(--accent-secondary)"
     >
       <div className="grid gap-8 lg:grid-cols-[1fr_1fr] lg:items-start">
@@ -514,15 +642,15 @@ function Desktop() {
             <span className="lp-window-file">how the two halves talk</span>
           </div>
           <div className="lp-canvas lp-procs bg-dotgrid">
-            <ProcessCard tone="var(--accent-primary)" where="In your browser" title="OAIY web app" body="The canvas, the palette, ffmpeg.wasm media, HTTP service calls, the Zipp sandbox." />
+            <ProcessCard tone="var(--accent-primary)" where="In your browser" title="OAIY web app" body="The flow editor: the canvas, the palette, ffmpeg.wasm media, HTTP service calls, the Zipp sandbox." />
             <div className="lp-proc-link" aria-hidden="true">
               <span className="lp-proc-wire" />
               <span className="lp-proc-addr">http://127.0.0.1:17972</span>
               <span className="lp-proc-wire" />
             </div>
-            <ProcessCard tone="var(--accent-secondary)" where="In your system tray" title="OAIY Desktop" body="Model servers, Hugging Face downloads, portable Python, the browser sidecar." />
+            <ProcessCard tone="var(--accent-secondary)" where="On your computer" title="OAIY Desktop" body="The Agent, flows, OAIY's engines, plugins and the receptionist, in a window with a tray icon." />
             <p className="lp-proc-note">
-              The web app probes <code>/api/health</code> when it loads. If the desktop app answers, its services appear in the palette.
+              The flow editor looks for <code>/api/health</code> on your own computer when it opens. This page does not. If the desktop answers, its services appear in the palette.
             </p>
           </div>
         </div>
@@ -540,8 +668,8 @@ function Desktop() {
             <a href="desktop.html" className="btn btn-primary btn-md">
               About OAIY Desktop
             </a>
-            <span className="inline-flex items-center gap-1.5 text-sm" style={{ color: 'rgb(var(--color-text-tertiary))' }}>
-              <WindowsIcon /> Windows, optional
+            <span className="text-sm" style={{ color: 'rgb(var(--color-text-tertiary))' }}>
+              For Windows and Linux
             </span>
           </div>
         </div>
@@ -561,41 +689,6 @@ function ProcessCard({ tone, where, title, body }: { tone: string; where: string
 }
 
 /* ------------------------------------------------------------------ */
-/* Remote AI                                                           */
-/* ------------------------------------------------------------------ */
-
-function RemoteAI() {
-  return (
-    <Section
-      id="remote"
-      title="Let an AI run your flows"
-      sub="Share a flow and you get two links: one that can view it and one that can queue runs. Hand the second to ChatGPT or Claude with a one-line prompt. It reads the manifest, fills the inputs and triggers a run; your browser picks it up, runs it on your machine and posts the result back."
-      tone="var(--signal-cyan)"
-    >
-      <div className="lp-window">
-        <div className="lp-window-bar">
-          <span className="lp-window-file">what the AI sends</span>
-        </div>
-        <pre className="lp-code">
-<span className="lp-code-c"># read what the flow accepts</span>{'\n'}
-<span className="lp-code-m">GET</span>  /api/flows/<span className="lp-code-v">{'{hash_edit}'}</span>/manifest{'\n\n'}
-<span className="lp-code-c"># queue a run with inputs</span>{'\n'}
-<span className="lp-code-m">POST</span> /api/flows/<span className="lp-code-v">{'{hash_edit}'}</span>/runs{'\n'}
-{'     '}{'{ "inputs": { "prompt": "summarise this" } }'}{'\n\n'}
-<span className="lp-code-c"># poll until the status is done</span>{'\n'}
-<span className="lp-code-m">GET</span>  /api/flows/<span className="lp-code-v">{'{hash_edit}'}</span>/runs/<span className="lp-code-v">{'{run_id}'}</span>
-        </pre>
-      </div>
-      <ul className="mt-5 flex flex-wrap gap-x-6 gap-y-2 text-sm" style={{ color: 'rgb(var(--color-text-tertiary))' }}>
-        <li className="inline-flex items-center gap-2"><CheckIcon /> 110-bit link secrets</li>
-        <li className="inline-flex items-center gap-2"><CheckIcon /> View and edit access kept apart</li>
-        <li className="inline-flex items-center gap-2"><CheckIcon /> Optional end-to-end encryption</li>
-      </ul>
-    </Section>
-  );
-}
-
-/* ------------------------------------------------------------------ */
 /* Final CTA + footer                                                  */
 /* ------------------------------------------------------------------ */
 
@@ -605,7 +698,7 @@ function FinalCta() {
       <div className="lp-cta bg-dotgrid">
         <h2 className="lp-h2">Wire up your first flow.</h2>
         <p className="lp-lede mt-4 max-w-lg">
-          No account, no install, no cloud bill. Open the canvas and have something running in the next five minutes.
+          No account, no cloud bill. Open the flow editor and have something running in the next five minutes, or install OAIY Desktop for the Agent and models of your own.
         </p>
         <div className="mt-8 flex flex-wrap items-start gap-3">
           <a href={APP_URL} className="btn btn-primary btn-lg">
@@ -637,6 +730,7 @@ function Footer() {
         <nav className="flex items-center gap-5 text-sm" style={{ color: 'rgb(var(--color-text-tertiary))' }} aria-label="Footer">
           <a href={APP_URL}>Open app</a>
           <a href="#capabilities">Palette</a>
+          <a href="#compare">Browser or Desktop</a>
           <a href="#desktop">Desktop</a>
           <a href={REPO_URL} target="_blank" rel="noopener noreferrer">GitHub</a>
         </nav>
@@ -695,13 +789,6 @@ function CheckIcon() {
   return (
     <svg className="h-3.5 w-3.5" fill="none" stroke="currentColor" viewBox="0 0 24 24" aria-hidden="true">
       <path strokeLinecap="round" strokeLinejoin="round" strokeWidth="2.5" d="M5 13l4 4L19 7" />
-    </svg>
-  );
-}
-function WindowsIcon() {
-  return (
-    <svg className="h-3.5 w-3.5" fill="currentColor" viewBox="0 0 24 24" aria-hidden="true">
-      <path d="M3 5.5L10.5 4.4v7.1H3V5.5zM10.5 12.5v7.1L3 18.5v-6h7.5zM11.5 4.2L21 3v8.5h-9.5V4.2zM21 12.5V21l-9.5-1.3v-7.2H21z" />
     </svg>
   );
 }

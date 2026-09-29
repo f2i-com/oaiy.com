@@ -134,12 +134,27 @@ for (const theme of ['dark', 'light']) {
       (await page.locator('.site-nav-star').getAttribute('href'))?.includes('github.com/'),
       await page.locator('.site-nav-star').getAttribute('href'));
 
-    // The hero graph must depict real node ids, not invented ones.
+    // The example flow (the Flows section; the hero is the Agent) must depict real node ids, not invented ones.
     const ids = await page.locator('svg[role="img"] text')
       .filter({ hasText: /^(IMAGE_GEN|AI_LLM|CONDITION|OUTPUT)$/ }).count();
-    ok('hero graph uses the app\'s real node ids', ids === 4, `matched ${ids}/4`);
-    ok('hero graph labels the feedback loop',
+    ok('the example flow uses the app\'s real node ids', ids === 4, `matched ${ids}/4`);
+    ok('the example flow labels the feedback loop',
       (await page.locator('svg[role="img"]').innerHTML()).includes('regenerate'));
+
+    // The screenshots: four, each loaded at its own size and described. (They load as they are scrolled to.)
+    const shots = page.locator('img.oaiy-shot');
+    const count = await shots.count();
+    for (let i = 0; i < count; i++) await shots.nth(i).scrollIntoViewIfNeeded();
+    await page.waitForTimeout(800);
+    const loaded = await shots.evaluateAll((els) => els.map((e) => ({
+      ok: e.complete && e.naturalWidth === Number(e.getAttribute('width')) && e.naturalHeight === Number(e.getAttribute('height')),
+      alt: e.alt.length > 40,
+    })));
+    ok('the four screenshots load at the size the page gives them, and are described', count === 4 && loaded.every((s) => s.ok && s.alt), JSON.stringify(loaded));
+    ok('the page compares the browser and the desktop, in a table a screen reader can read',
+      (await page.locator('table.lp-compare th[scope="col"]').count()) === 3 && (await page.locator('table.lp-compare tbody th[scope="row"]').count()) >= 6);
+    ok('it says what needs the desktop, plainly',
+      /NVIDIA GPU/.test((await page.locator('#why').textContent()) ?? '') && /not published for download yet/.test((await page.locator('#why').textContent()) ?? ''));
 
     ok('every design token it references resolves', await page.evaluate(() => {
       const cs = getComputedStyle(document.documentElement);
@@ -366,6 +381,27 @@ for (const theme of ['dark', 'light']) {
     }
     await ctx.close();
   }
+}
+
+// ---------------------------------------------------------------------------
+// The marketing pages on a phone: nothing scrolls sideways, and the comparison reads as cards, not a wide table.
+section('marketing pages at phone width');
+for (const theme of ['dark', 'light']) {
+  const { ctx, page } = await open(theme, { width: 390, height: 800 });
+  for (const path of ['/', '/desktop.html']) {
+    await page.goto(BASE + path, { waitUntil: 'networkidle' });
+    await page.waitForTimeout(800);
+    ok(`${theme}: ${path} does not scroll sideways at 390px`, await page.evaluate(() => document.documentElement.scrollWidth <= window.innerWidth + 1),
+      String(await page.evaluate(() => document.documentElement.scrollWidth)));
+  }
+  await page.goto(BASE + '/', { waitUntil: 'networkidle' });
+  const wrap = await page.evaluate(() => {
+    const el = document.querySelector('.lp-compare-wrap');
+    const table = document.querySelector('table.lp-compare');
+    return { fits: el.scrollWidth <= el.clientWidth + 1, stacked: getComputedStyle(table.querySelector('tbody tr')).display === 'block' };
+  });
+  ok(`${theme}: the comparison fits a phone, each row a card`, wrap.fits && wrap.stacked, JSON.stringify(wrap));
+  await ctx.close();
 }
 
 // ---------------------------------------------------------------------------
