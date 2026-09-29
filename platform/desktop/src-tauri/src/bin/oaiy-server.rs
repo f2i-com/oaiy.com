@@ -362,9 +362,10 @@ async fn main() {
         link.clone(),
         Some(node_runtime.clone()),
         // A binding's post-run actions may call a connector, through the
-        // plugin's own gate as the relay's commands meet it, but not the relay
-        // policy: this is a flow this computer ran, not a command a website
-        // queued (see `link::ops::dispatcher`).
+        // plugin's own gate as the relay's commands meet it, but NOT the relay
+        // policy: the provider queues these flows and serves the bindings, so
+        // this is a way in the policy does not cover yet (see
+        // `link::ops::dispatcher`).
         Some(oaiy_desktop_lib::link::ops::dispatcher(
             registry.clone(),
             bridge.plugins.clone(),

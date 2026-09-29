@@ -1435,9 +1435,10 @@ pub fn run() {
                     Some(node_for_http.clone()),
                     // A binding may ask for a connector command once its flow
                     // answers — dial, send the SMS. The plugin's own gate, as
-                    // for the relay's commands, but not the relay policy: this
-                    // is a flow this computer ran, not a command a website
-                    // queued (see `link::ops::dispatcher`).
+                    // for the relay's commands, but NOT the relay policy: the
+                    // provider queues these flows and serves the bindings, so
+                    // this is a way in the policy does not cover yet (see
+                    // `link::ops::dispatcher`).
                     Some(crate::link::ops::dispatcher(
                         registry_for_http.clone(),
                         bridge_for_http.plugins.clone(),

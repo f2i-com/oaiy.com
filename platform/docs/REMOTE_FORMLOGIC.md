@@ -147,8 +147,8 @@ There are two files, written the way the
 because that log is the Agent's changes:
 
 - `relay-log.jsonl` has every refusal, every command that changes something
-  (answer, hang up, speak, dial, text) and the desktop's start, stop and repair ops:
-  what somebody comes to the log to find.
+  (answer, hang up, speak, dial, text) and the desktop's start, stop, restart and
+  repair ops: what somebody comes to the log to find.
 - `relay-reads.jsonl` has the reads that were allowed: a command its plugin declares
   and does not journal, and the desktop's list and health ops. A call console asks
   `call.current` every three seconds, a line of about 230 bytes, which fills a 2 MiB
@@ -159,12 +159,20 @@ Each file rolls at 2 MiB and keeps one previous file.
 
 ### What this does not cover
 
-- Callers on this computer are not asked: a plugin's own screens, the Agent's
-  control tools (`plugin_command` reaches any command a plugin declares) and a
-  binding's follow-up actions after a flow this computer ran.
-- The flows, bindings and app scripts the provider serves and this computer runs
-  reach plugins through the plugin's gate alone. Whoever can edit them on the
-  provider can ask for a command that way, and the list does not stop it.
+- Callers on this computer are not asked: a plugin's own screens, and the Agent's
+  control tools (`plugin_command` reaches any command a plugin declares).
+- **What the provider serves and this computer runs is not asked either, and it is
+  the largest gap.** The provider queues flow runs for this computer and serves the
+  graphs, bindings and app scripts they use, and three of those reach a plugin
+  through the plugin's own gate alone: a binding's follow-up actions after a run, an
+  app script's effects, and a `connector_request` node in a flow graph (the CLI the
+  runner starts asks this computer's own bridge, with the desktop's own token, and
+  the bridge does not ask the list). Whoever can save a flow or a binding on the
+  provider, in an owner's session or with a leaked key, can therefore ask for any
+  command a plugin declares this way, `dongle.installDriver` and `consent.set`
+  included. The list closes the relay; these are three more ways in, and closing them
+  is a decision of its own: to ask the list of the provider's flows too, or to have
+  what the provider serves signed.
 - For a plugin with no entry the line is only as strict as the plugin's own
   `journalled` list. Aokie leaves eight commands that change something out of
   it, which is why it has an entry.

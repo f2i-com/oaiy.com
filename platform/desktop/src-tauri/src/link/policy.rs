@@ -15,9 +15,11 @@
 //! * A policy that is missing, cannot be read, or is not understood allows
 //!   nothing at all, reads included.
 //!
-//! Only commands that arrive through the relay are asked. A plugin's own screens,
-//! the Agent's control tools and flows on this computer call the plugin host
-//! directly and never come here.
+//! Only commands that arrive through the relay are asked. A plugin's own screens and
+//! the Agent's control tools call the plugin host directly and never come here. Nor
+//! do the flows, bindings and app scripts the provider serves and this computer
+//! runs: they reach a plugin through its own gate alone, which is a way in this list
+//! does not cover (`platform/docs/REMOTE_FORMLOGIC.md`, "What this does not cover").
 
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -25,8 +27,10 @@ use serde::Deserialize;
 
 use crate::plugins::GateRefusal;
 
-/// The policy this build ships. Embedded, like the provider's descriptor, so a
-/// plugin (which runs as the same user) has no file to rewrite.
+/// The policy this build ships, embedded in the binary. A provider's descriptor is
+/// embedded too, but a file in `<data>/connectors` overrides it by id
+/// (`descriptor::load_all`); nothing overrides this. A plugin, which runs as the
+/// same user, has no file to rewrite.
 const SHIPPED: &str = include_str!("../../resources/relay-policy.json");
 
 /// The one policy version this build reads. A newer file means rules this build

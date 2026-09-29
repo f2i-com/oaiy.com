@@ -23,9 +23,11 @@
 //! never its payload; the reads that were allowed go in `<data>/relay-reads.jsonl`
 //! instead, so that a console polling every few seconds cannot roll the rest out.
 //!
-//! [`dispatcher`] is the same code without the policy or the log, for callers on
-//! this computer: a binding's follow-up actions in [`super::flow_runner`]. It must
-//! not be handed to the relay.
+//! [`dispatcher`] is the same code without the policy or the log, for the flow
+//! runner ([`super::flow_runner`]): a binding's follow-up actions after a run. It
+//! must not be handed to the relay. Those flows are queued and served by the
+//! provider, so leaving them out of the policy is a gap and not a finding that they
+//! are safe: see `platform/docs/REMOTE_FORMLOGIC.md`, "What this does not cover".
 
 use serde_json::{json, Value};
 use std::path::{Path, PathBuf};
@@ -294,14 +296,18 @@ fn guarded(
     })
 }
 
-/// The dispatcher for callers on this computer: a binding's follow-up actions
-/// after a flow it ran (see [`super::flow_runner`]). It takes the `desktop` ops
-/// and forwards any other connector's command to its plugin through the plugin's
-/// own gate, and asks no relay policy: these are not commands a website queued
-/// for this computer, they are the follow-up of a flow this computer ran. (The
-/// flows and bindings are themselves served by the provider. That is a door of
-/// its own, and the relay policy does not cover it.) The relay must be given
-/// [`relay_dispatcher`] instead.
+/// The dispatcher for the flow runner: a binding's follow-up actions after a flow
+/// it ran (see [`super::flow_runner`]). It takes the `desktop` ops and forwards any
+/// other connector's command to its plugin through the plugin's own gate, and asks
+/// no relay policy.
+///
+/// That is not because these are commands from this computer. The provider queues
+/// the flow runs and serves the flows and bindings, so whoever can save a flow or a
+/// binding there can reach any command a plugin declares this way; so can a
+/// `connector_request` node in a flow graph (through the bridge) and an app script's
+/// effects (through the plugin host). It is a way in the policy does not cover yet:
+/// see `platform/docs/REMOTE_FORMLOGIC.md`, "What this does not cover". The relay
+/// must be given [`relay_dispatcher`] instead.
 pub fn dispatcher(
     registry: RegistryHandle,
     plugins: PluginRegistryHandle,
@@ -847,7 +853,8 @@ mod guard_tests {
                 other => panic!("{verb} was stopped on this computer: {other:?}"),
             }
         }
-        // A binding's follow-up after a flow this computer ran.
+        // A binding's follow-up after a flow run: the flow runner's dispatcher, which the policy
+        // does not cover either (a gap the docs name, not a rule).
         let flows = local(&world);
         for verb in KEPT_HERE {
             let outcome = flows("aokie", verb, &json!({}), "run-1#action1");
@@ -877,7 +884,8 @@ mod guard_tests {
     fn the_paths_local_callers_use_know_nothing_about_the_relay_policy() {
         // Plugin screens and the Agent's control tools reach a plugin through the
         // bridge routes and `PluginHost::forward_connector`; a flow's follow-up
-        // actions through `ops::dispatcher`. None of them asks the policy, and that
+        // actions through `ops::dispatcher`. None of them asks the policy (for the
+        // flows, which the provider serves, that is the gap the docs name), and it
         // is a property of the code, so it is read from the code.
         for (name, source) in [
             ("plugins/host.rs", include_str!("../plugins/host.rs")),
@@ -1259,7 +1267,7 @@ process.stdin.on("data", (chunk) => {
                 .expect("a screen may still reset the dongle");
             assert_eq!(reset["answered"], "dongle.reset");
 
-            // A binding's follow-up after a flow this computer ran.
+            // A binding's follow-up after a flow run (not asked either, see the docs).
             let follow_up = local(&world)("aokie", "consent.revoke", &json!({}), "run-1#action1").expect("a flow's follow-up");
             assert_eq!(follow_up["requestId"], "relay-command-run-1#action1");
 
