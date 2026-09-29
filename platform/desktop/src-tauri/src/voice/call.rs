@@ -27,6 +27,14 @@
 //! acknowledgement when we have stopped talking answers us, and goes to the
 //! app to be answered.
 //!
+//! We never start talking over the caller: a new item waits while they speak,
+//! and until their words are in (see [`Caller`]), `HOLD_MAX` at most. When
+//! their words are in (more than an acknowledgement), what the app gave us
+//! and we had not begun to say is dropped: it was written before they spoke,
+//! and the app answers them instead (`call.dropped`, then their words). What
+//! already plays keeps to the rules above; the greeting and a goodbye are
+//! never dropped.
+//!
 //! The greeting is not said the moment the call begins: the phone has
 //! answered, but the caller's handset hears the line a second or two later,
 //! and what is said before then is lost. See [`Opening`]: a call that came in
@@ -39,7 +47,7 @@
 //! The app is told when things were said, in milliseconds since the call began.
 
 use std::collections::HashMap;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
@@ -54,8 +62,10 @@ use super::{voices, VoiceHub, DESTINATION};
 
 /// What the app asks of a live call.
 pub enum CallCommand {
-    /// Speak `text`, after what is queued. Answers with its item's id.
-    Say { text: String, reply: oneshot::Sender<Result<String, String>> },
+    /// Speak `text`, after what is queued. Answers with its item's id. A `hold`
+    /// word ("Okay —", for a silence) is said only while the caller is quiet: over
+    /// them, or while their words are being heard, it is skipped (answered with "").
+    Say { text: String, hold: bool, reply: oneshot::Sender<Result<String, String>> },
     /// One of Aokie's call tools (`request_appointment`, `lookup_business_data`); answers with what it returned.
     Tool { name: String, arguments: Value, reply: oneshot::Sender<Result<Value, String>> },
     /// Say goodbye, then hang up.
@@ -200,6 +210,55 @@ const PLAYOUT_MARGIN: Duration = Duration::from_millis(250);
 
 /// How long the transcriber waits for a cut it asked Aokie for.
 const CUT_WAIT: Duration = Duration::from_millis(500);
+
+/// A new item waits while the caller speaks (and their words are heard), this long at most.
+const HOLD_MAX: Duration = Duration::from_millis(3_000);
+
+/// How the caller stands, for the speaker: speaking, or their last words not
+/// yet in (they may drop what waits to be said). Each utterance that ends is
+/// numbered; the transcriber marks the last it has heard.
+#[derive(Default)]
+struct Caller {
+    speaking: AtomicBool,
+    ended: AtomicU64,
+    heard: AtomicU64,
+}
+
+impl Caller {
+    /// A new item waits.
+    fn busy(&self) -> bool {
+        self.speaking.load(Ordering::SeqCst) || self.heard.load(Ordering::SeqCst) < self.ended.load(Ordering::SeqCst)
+    }
+
+    /// An utterance ended: its number.
+    fn ended(&self) -> u64 {
+        self.ended.fetch_add(1, Ordering::SeqCst) + 1
+    }
+
+    /// Its words are in (or it had none).
+    fn heard(&self, seq: u64) {
+        self.heard.fetch_max(seq, Ordering::SeqCst);
+    }
+}
+
+/// What the app gave us to say and we have not begun (no item open, and lines
+/// of this reply in none yet), taken as the caller's words make it stale: the
+/// reply is cut (its epoch moves on). None when there is none, or it is the
+/// greeting or a goodbye (said all the same: a goodbye ends the call).
+fn drop_unstarted(epoch: &AtomicU64, ledger: &Mutex<Ledger>, current_item: &Mutex<Option<String>>) -> Option<Vec<String>> {
+    let mut ledger = ledger.lock().unwrap();
+    if current_item.lock().unwrap().is_some() {
+        return None;
+    }
+    let now = epoch.load(Ordering::SeqCst);
+    let waiting: Vec<&Line> = ledger.lines.iter().filter(|l| l.epoch == now && l.item.is_none()).collect();
+    if waiting.is_empty() || waiting.iter().any(|l| l.greeting || l.goodbye) {
+        return None;
+    }
+    // The speaker looks at the epoch before it starts an item, and after a hold.
+    let was = epoch.fetch_add(1, Ordering::SeqCst);
+    Some(ledger.take(was).into_iter().map(|l| l.text).collect())
+}
 
 /// A caller still speaking when the greeting's settle is over is waited for,
 /// but the greeting is said this long after the call begins at the latest.
@@ -386,6 +445,8 @@ struct Utterance {
     words: Option<Arc<tokio::sync::OnceCell<String>>>,
     /// Only an acknowledgement of a reply it cut off, which went on.
     resumed: bool,
+    /// Its number among the utterances that ended (see `Caller`).
+    seq: u64,
 }
 
 /// The words an acknowledgement is made of, one at a time...
@@ -544,9 +605,11 @@ where
     let clock = Clock::default();
     // What the speaker has been given and not yet played out (see `Ledger`).
     let ledger = Arc::new(Mutex::new(Ledger::default()));
+    // Whether the caller speaks, or their words are being heard: a new item waits (see `Caller`).
+    let caller = Arc::new(Caller::default());
     let (speak_tx, mut speak_rx) = mpsc::unbounded_channel::<Speak>();
     let speaker = {
-        let (out_tx, ids, hub, engines, epoch, speaking, current_item, voice, clock, ledger) = (out_tx.clone(), ids.clone(), hub.clone(), engines.clone(), epoch.clone(), speaking.clone(), current_item.clone(), voice.clone(), clock.clone(), ledger.clone());
+        let (out_tx, ids, hub, engines, epoch, speaking, current_item, voice, clock, ledger, caller) = (out_tx.clone(), ids.clone(), hub.clone(), engines.clone(), epoch.clone(), speaking.clone(), current_item.clone(), voice.clone(), clock.clone(), ledger.clone(), caller.clone());
         tokio::spawn(async move {
             // Close the open item: what it said, then done (Aokie holds even a cancelled item open until its exact item_done).
             let close = |item: OpenItem, cut: bool| {
@@ -602,6 +665,14 @@ where
                     // Aokie plays one item at a time: a new one waits until the last has played.
                     if let Some(t) = played_by.take() {
                         tokio::time::sleep_until(t.into()).await;
+                    }
+                    // Not over the caller: it waits while they speak and their words are heard (which
+                    // may drop it: see `drop_unstarted`), HOLD_MAX at most. The greeting has its own wait (`Opening`).
+                    if !job.greeting {
+                        let held = Instant::now();
+                        while caller.busy() && held.elapsed() < HOLD_MAX && job.epoch == epoch.load(Ordering::SeqCst) {
+                            tokio::time::sleep(Duration::from_millis(20)).await;
+                        }
                     }
                     if job.epoch != epoch.load(Ordering::SeqCst) {
                         continue;
@@ -680,7 +751,7 @@ where
     // us, and too short to have stopped us, is decided here by its words.
     let (utter_tx, mut utter_rx) = mpsc::unbounded_channel::<Utterance>();
     let transcriber = {
-        let (out_tx, ids, hub, engines, speaking, epoch) = (out_tx.clone(), ids.clone(), hub.clone(), engines.clone(), speaking.clone(), epoch.clone());
+        let (out_tx, ids, hub, engines, speaking, epoch, caller, ledger, current_item, clock) = (out_tx.clone(), ids.clone(), hub.clone(), engines.clone(), speaking.clone(), epoch.clone(), caller.clone(), ledger.clone(), current_item.clone(), clock.clone());
         tokio::spawn(async move {
             while let Some(utterance) = utter_rx.recv().await {
                 // Heard at its pause already (or being heard): those words, not heard again.
@@ -690,8 +761,13 @@ where
                 };
                 let text = match heard {
                     Ok(text) if !text.is_empty() => text,
-                    Ok(_) => continue,
+                    // No words (a cough, the line): what waits to be said goes on.
+                    Ok(_) => {
+                        caller.heard(utterance.seq);
+                        continue;
+                    }
                     Err(e) => {
+                        caller.heard(utterance.seq);
                         hub.emit(json!({"type": "call.error", "callId": ids.call, "message": e}));
                         continue;
                     }
@@ -720,6 +796,14 @@ where
                     }
                     cut = epoch.load(Ordering::SeqCst) != before;
                 }
+                // Their words make what the app gave us and we had not begun stale: it is dropped, and the app
+                // (told first) answers their words instead. An acknowledgement drops nothing (a reply taken up again, too).
+                if !backchannel {
+                    if let Some(sentences) = drop_unstarted(&epoch, &ledger, &current_item) {
+                        hub.emit(json!({"type": "call.dropped", "callId": ids.call, "sentences": sentences, "atMs": clock.ms(Instant::now())}));
+                    }
+                }
+                caller.heard(utterance.seq);
                 let item = next_item("in");
                 let _ = out_tx.send(ids.event("formlogic.realtime.input_transcript", json!({"itemId": item, "transcript": text, "final": true}))).await;
                 let mut how = json!({"startMs": utterance.start_ms, "endMs": utterance.end_ms, "over": utterance.over, "cut": cut, "backchannel": backchannel});
@@ -887,6 +971,8 @@ where
                         for heard in detector.push(&audio::samples(&bytes)) {
                             match heard {
                                 Heard::Started { at_ms } => {
+                                    // No new item starts over them.
+                                    caller.speaking.store(true, Ordering::SeqCst);
                                     // Speaking again before the words they said last were in: those go to the app as they are.
                                     if let Some(held) = settle.take().and_then(|s| s.held) {
                                         resume = None;
@@ -926,7 +1012,7 @@ where
                                     }
                                     let paused = settle.as_mut().filter(|s| (s.start_ms, s.end_ms) == (start_ms, end_ms));
                                     let words = paused.as_ref().map(|s| s.words.clone());
-                                    let utterance = Utterance { audio, start_ms, end_ms, over: hearing.over, cut: hearing.cut, decides: hearing.may_cut, early, words, resumed: false };
+                                    let utterance = Utterance { audio, start_ms, end_ms, over: hearing.over, cut: hearing.cut, decides: hearing.may_cut, early, words, resumed: false, seq: caller.ended() };
                                     match paused {
                                         // It cut off a reply that may yet go on: it waits for its words, heard at its pause.
                                         Some(s) if resume.is_some() => {
@@ -946,6 +1032,7 @@ where
                                 Heard::Nothing => {}
                             }
                         }
+                        caller.speaking.store(detector.in_speech(), Ordering::SeqCst);
                     }
                     Message::Ping(p) => {
                         let _ = out_tx.send(Message::Pong(p)).await;
@@ -957,8 +1044,13 @@ where
             command = cmd_rx.recv() => {
                 let Some(command) = command else { break "the desktop stopped".into() };
                 match command {
-                    CallCommand::Say { text, reply } => {
+                    CallCommand::Say { text, hold, reply } => {
                         let text = text.trim().to_string();
+                        // A hold word is for a silence: not over the caller, nor while their words are heard, nor before the greeting.
+                        if hold && (caller.busy() || opening.is_some()) {
+                            let _ = reply.send(Ok(String::new()));
+                            continue;
+                        }
                         // Speaking again after a goodbye the caller spoke over: the call goes on,
                         // and an "mm-hmm" is talked over again rather than taken as a word to stop for.
                         if !text.is_empty() {
@@ -1022,7 +1114,9 @@ where
                                 _ => Vec::new(),
                             },
                         };
-                        let _ = utter_tx.send(Utterance { audio, start_ms, end_ms, over: hearing.over, cut: false, decides: false, early: false, words: Some(s.words), resumed: true });
+                        let seq = caller.ended();
+                        caller.speaking.store(detector.in_speech(), Ordering::SeqCst);
+                        let _ = utter_tx.send(Utterance { audio, start_ms, end_ms, over: hearing.over, cut: false, decides: false, early: false, words: Some(s.words), resumed: true, seq });
                         hearing = Hearing::default();
                         hub.emit(json!({"type": "call.resumed", "callId": ids.call, "itemId": r.item, "fromSentence": r.from, "sentences": r.lines, "atMs": clock.ms(Instant::now())}));
                         for line in r.lines {
@@ -1542,8 +1636,13 @@ mod tests {
 
         /// Ask the call to say `text`, as the app does.
         async fn say(&self, text: &str) -> Result<String, String> {
+            self.say_as(text, false).await
+        }
+
+        /// ...or as a hold word ("Okay —"): "" when it was skipped.
+        async fn say_as(&self, text: &str, hold: bool) -> Result<String, String> {
             let (reply, answer) = oneshot::channel();
-            assert!(self.hub.command(&self.call).expect("the call is listed").send(CallCommand::Say { text: text.into(), reply }).is_ok());
+            assert!(self.hub.command(&self.call).expect("the call is listed").send(CallCommand::Say { text: text.into(), hold, reply }).is_ok());
             answer.await.unwrap()
         }
     }
@@ -1815,24 +1914,124 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-    async fn a_reply_from_the_app_while_the_caller_settles_wins_over_taking_the_cut_one_up() {
+    async fn a_reply_from_the_app_while_the_caller_settles_stops_the_cut_one_going_on_and_their_words_drop_it() {
         let mut aokie = Aokie::start(json!({})).await;
         let (_, first) = a_reply_playing(&mut aokie, &REPLY).await;
         tokio::time::sleep_until((first + Duration::from_millis(400)).into()).await;
         aokie.speech.hears("Yeah, sure.");
         aokie.caller_live(saying(800));
         aokie.event("call.interrupted", secs(5)).await.expect("the reply was cut");
-        // The app has something new to say before their words are in.
+        // The app has something new to say before their words are in: it waits for them, as they still speak.
         aokie.say("Sorry, go ahead.").await.unwrap();
+        // Their words drop it (the app is told first), and are the app's to answer: not taken as the cut reply's acknowledgement.
+        let dropped = aokie.event("call.dropped", secs(5)).await.expect("the reply the app gave, dropped");
+        assert_eq!(dropped["sentences"], json!(["Sorry, go ahead."]));
         let heard = aokie.event("call.caller", secs(5)).await.expect("their words, for the app");
-        // Not taken as the cut reply's acknowledgement: the app has their words to answer.
         assert_eq!((heard["cut"].as_bool(), heard["backchannel"].as_bool(), heard.get("resumed")), (Some(true), Some(false), None), "{heard}");
         let sent = aokie.sent_within(Duration::from_millis(1_500)).await;
-        assert_eq!(sent.iter().filter(|v| v["type"] == "formlogic.realtime.output_item_started").count(), 1, "only the app's reply: {sent:?}");
-        assert_eq!(aokie.speech.spoken(), [&[GREETING][..], &REPLY, &["Sorry, go ahead."]].concat());
+        assert_eq!(sent.iter().filter(|v| v["type"] == "formlogic.realtime.output_item_started").count(), 0, "nothing more said: {sent:?}");
+        assert_eq!(aokie.speech.spoken(), [&[GREETING][..], &REPLY].concat());
         let told = aokie.events_within(Duration::from_millis(100)).await;
         assert!(!told.iter().any(|v| v["type"] == "call.resumed"), "{told:?}");
         assert!(!aokie.fence_broken.load(Ordering::SeqCst), "an item started before the cancelled one was done");
+    }
+
+    /// The call has begun and its greeting has played out.
+    async fn greeted(aokie: &mut Aokie) {
+        aokie.speech.lines_last(LINE_LONG_MS);
+        aokie.begin(json!({"greetingDelayMs": 0}));
+        let (greeting, _) = aokie.next_item_audio(secs(5)).await.expect("the greeting");
+        while aokie.text("formlogic.realtime.output_item_done", secs(5)).await.expect("the greeting's end")["itemId"] != greeting.as_str() {}
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_reply_never_starts_while_the_caller_speaks_and_their_words_drop_it_for_the_apps_answer() {
+        let mut aokie = Aokie::start(json!({})).await;
+        aokie.speech.hearing_takes(150);
+        greeted(&mut aokie).await;
+        aokie.speech.hears("Okay, thanks. So I've still got Friday booked?");
+        let began = aokie.caller_live(saying(1_500));
+        tokio::time::sleep_until((began + Duration::from_millis(400)).into()).await;
+        // The app's reply to something before (a lookup's answer), while they speak: it waits.
+        aokie.say("The Thursday request is still showing in the calendar.").await.unwrap();
+        aokie.say("Anything else?").await.unwrap();
+        // A hold word over them is skipped, not held.
+        assert_eq!(aokie.say_as("Okay —", true).await, Ok(String::new()));
+        // They stop: the app is told what was dropped, then their words.
+        let mut told = Vec::new();
+        let heard = loop {
+            let v = tokio::time::timeout(secs(6), aokie.events.recv()).await.expect("their words, for the app").unwrap();
+            if v["type"] == "call.caller" {
+                break v;
+            }
+            told.push(v);
+        };
+        let dropped: Vec<&Value> = told.iter().filter(|v| v["type"] == "call.dropped").collect();
+        assert_eq!(dropped.len(), 1, "{told:?}");
+        assert_eq!(dropped[0]["sentences"], json!(["The Thursday request is still showing in the calendar.", "Anything else?"]));
+        assert_eq!((heard["text"].as_str(), heard["over"].as_bool(), heard["cut"].as_bool(), heard["backchannel"].as_bool()), (Some("Okay, thanks. So I've still got Friday booked?"), Some(false), Some(false), Some(false)), "{heard}");
+        // Nothing of it was said: no item started, over them or after.
+        let sent = aokie.sent_within(Duration::from_millis(300)).await;
+        assert!(!sent.iter().any(|v| v["type"] == "formlogic.realtime.output_item_started"), "{sent:?}");
+        assert_eq!(aokie.speech.spoken(), [GREETING]);
+        // The app answers their words: said at once.
+        let asked = Instant::now();
+        aokie.say("Yes, Friday at one is still booked.").await.unwrap();
+        let (_, at) = aokie.next_item_audio(secs(5)).await.expect("the answer");
+        assert!(at.duration_since(asked) < Duration::from_millis(300), "answered {:?} after it was given", at.duration_since(asked));
+        assert_eq!(aokie.speech.spoken(), [GREETING, "Yes, Friday at one is still booked."]);
+        // And a hold word when they are quiet is said.
+        assert!(!aokie.say_as("Okay —", true).await.unwrap().is_empty());
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_reply_waits_for_a_caller_who_talks_on_three_seconds_at_most() {
+        let mut aokie = Aokie::start(json!({})).await;
+        greeted(&mut aokie).await;
+        let began = aokie.caller_live(saying(6_000));
+        tokio::time::sleep_until((began + Duration::from_millis(300)).into()).await;
+        let asked = Instant::now();
+        aokie.say("One moment, let me check.").await.unwrap();
+        let (_, at) = aokie.next_item_audio(secs(6)).await.expect("the reply, in the end");
+        let waited = at.duration_since(asked);
+        assert!(waited >= Duration::from_millis(2_900) && waited < Duration::from_millis(3_600), "said {waited:?} after it was given, over a caller who talked on");
+        assert_eq!(aokie.speech.spoken(), [GREETING, "One moment, let me check."]);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_reply_held_for_a_sound_with_no_words_is_said_once_it_is_over() {
+        let mut aokie = Aokie::start(json!({})).await;
+        greeted(&mut aokie).await;
+        // A cough: heard as nothing.
+        aokie.speech.hears("");
+        let began = aokie.caller_live(saying(800));
+        tokio::time::sleep_until((began + Duration::from_millis(200)).into()).await;
+        aokie.say("We are open from nine.").await.unwrap();
+        let (_, at) = aokie.next_item_audio(secs(5)).await.expect("the reply, after the cough");
+        assert!(at >= began + Duration::from_millis(800), "said over the caller, {:?} after they began", at.duration_since(began));
+        assert_eq!(aokie.speech.spoken(), [GREETING, "We are open from nine."]);
+        let told = aokie.events_within(Duration::from_millis(100)).await;
+        assert!(!told.iter().any(|v| v["type"] == "call.dropped" || v["type"] == "call.caller"), "{told:?}");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_goodbye_waits_for_the_caller_but_is_never_dropped() {
+        let mut aokie = Aokie::start(json!({})).await;
+        greeted(&mut aokie).await;
+        aokie.speech.hears("Oh, and one more thing.");
+        let began = aokie.caller_live(saying(1_200));
+        tokio::time::sleep_until((began + Duration::from_millis(200)).into()).await;
+        let (reply, _answer) = oneshot::channel();
+        assert!(aokie.hub.command(&aokie.call).unwrap().send(CallCommand::Finish { goodbye: "Thanks for calling, bye!".into(), reply }).is_ok());
+        let tool = aokie.text("formlogic.realtime.tool_call", secs(5)).await.expect("finish_call");
+        aokie.send(json!({"type": "formlogic.realtime.tool_result", "callId": aokie.call, "generation": 1, "toolCallId": tool["toolCallId"], "ok": true, "output": {}}));
+        let (_, at) = aokie.next_item_audio(secs(6)).await.expect("the goodbye");
+        assert!(at >= began + Duration::from_millis(1_200), "said over the caller, {:?} after they began", at.duration_since(began));
+        let hangup = aokie.text("formlogic.realtime.hangup_requested", secs(6)).await;
+        assert!(hangup.is_some(), "the goodbye ends the call");
+        assert_eq!(aokie.speech.spoken(), [GREETING, "Thanks for calling, bye!"]);
+        let told = aokie.events_within(Duration::from_millis(100)).await;
+        assert!(!told.iter().any(|v| v["type"] == "call.dropped"), "{told:?}");
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]

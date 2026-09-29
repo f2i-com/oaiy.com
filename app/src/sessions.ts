@@ -77,6 +77,8 @@ export interface Session extends SessionInfo {
   holdWord?: ReturnType<typeof setTimeout>;
   /** Answers that came in while the caller spoke: given to the agent with their words. */
   held?: string[];
+  /** What the agent wrote and the desktop dropped unsaid, as the caller spoke first (call.dropped): given to it with their words. */
+  unsaid?: string[];
   /** The words of the reply that calls end_call, held back to be its goodbye (so no second goodbye is said). */
   parting?: string;
   /** The outreach this call or text thread is part of: the person we rang (or who rang in from a list), with its objective and record_result. */
@@ -251,7 +253,8 @@ export class Speech {
   /** A hold word has been said in this turn (see holdWord). */
   private acknowledged = false;
 
-  constructor(private readonly say: (text: string) => Promise<void>, private readonly failed: (error: string) => void = () => {}) {}
+  /** `say(text, hold)`: `hold` for a hold word, which the desktop says only while the caller is quiet. */
+  constructor(private readonly say: (text: string, hold: boolean) => Promise<void>, private readonly failed: (error: string) => void = () => {}) {}
 
   /** A new reply: speak again (`afterTool`: the same turn goes on, after a tool). */
   begin(afterTool = false): void {
@@ -383,7 +386,7 @@ export class Speech {
       this.spoke = true;
       this.reply.push(clean);
     }
-    this.chain = this.chain.then(() => (this.hushed ? undefined : this.say(clean))).catch((e: unknown) => this.failed((e as Error).message));
+    this.chain = this.chain.then(() => (this.hushed ? undefined : this.say(clean, !words))).catch((e: unknown) => this.failed((e as Error).message));
   }
 }
 
@@ -527,6 +530,15 @@ export function callerLine(text: string, when: { startMs?: unknown; over?: unkno
   const how = when.cut === true ? `cutting in${said}` : when.over === true ? `over you${said}` : '';
   const label = [at, how].filter(Boolean).join(', ');
   return `Caller${label ? ` [${label}]` : ''}: ${text}`;
+}
+
+/**
+ * What the call's agent is told of a reply it wrote that was never said: the
+ * caller spoke first, and it was dropped (their words follow it).
+ */
+export function unsaidNote(lines: string[]): string {
+  const draft = lines.join(' ');
+  return `[OAIY] Not said: the caller spoke before you could say "${draft.length > 400 ? `${draft.slice(0, 400)}…` : draft}", so it was dropped, and they did not hear it. Answer what they said now; say any of it only if it still matters.`;
 }
 
 /** What the call's agent is told when the business's records cannot be checked. */
@@ -966,9 +978,9 @@ export class Sessions {
         conversation: true,
       }, 'call');
       session.speech = new Speech(
-        async (text) => {
+        async (text, hold) => {
           const desktop = this.desktop();
-          if (desktop && session.callId) await desktop.say(session.callId, text);
+          if (desktop && session.callId) await desktop.say(session.callId, text, hold);
         },
         (error) => this.hooks.event(session, { type: 'status', message: `Could not speak on the call: ${error}` }),
       );
@@ -1550,6 +1562,7 @@ export class Sessions {
         session.played = [];
         session.aside = [];
         session.held = [];
+        session.unsaid = undefined;
         session.cutAtMs = undefined;
         session.callerSpeaking = false;
         session.endNudged = false;
@@ -1627,7 +1640,28 @@ export class Sessions {
         const afterGreeting = !!greeting && (typeof event.startMs !== 'number' || event.startMs >= greeting.endMs);
         const ended = typeof event.endMs === 'number' && session.clockZero !== undefined ? Math.min(Date.now(), session.clockZero + event.endMs) : Date.now();
         session.heardAt = afterGreeting ? ended : undefined;
-        this.deliver(session, [...(session.aside ?? []).splice(0), line, ...(session.held ?? []).splice(0)].join('\n'), true);
+        // What the agent was about to say when they spoke (dropped unsaid): its own draft, read before their words.
+        const unsaid = session.unsaid?.length ? unsaidNote(session.unsaid) : '';
+        session.unsaid = undefined;
+        this.deliver(session, [...(session.aside ?? []).splice(0), unsaid, line, ...(session.held ?? []).splice(0)].filter(Boolean).join('\n'), true);
+        break;
+      }
+      case 'call.dropped': {
+        // The desktop held what the agent wrote while the caller spoke, and dropped it when their words came: it was
+        // never said. The agent stops (as at a cut), and reads it as its own unsaid draft, with their words.
+        // (A hold word dropped with it was not the agent's own words.)
+        const sentences = Array.isArray(event.sentences) ? event.sentences.map(String).filter((line) => line && !HOLD_WORDS.some((w) => spoken(w) === line)) : [];
+        const played = session.played ?? [];
+        // Sentences of the reply not yet sent to the desktop are as unsaid.
+        const unsent = (session.speech?.reply ?? []).filter((line) => !sentences.includes(line) && !played.some((p) => p.text === line));
+        const draft = [...sentences, ...unsent];
+        if (draft.length) session.unsaid = [...(session.unsaid ?? []), ...draft];
+        if (typeof event.atMs === 'number') session.cutAtMs = event.atMs;
+        session.speech?.hush();
+        // Never heard: said again, when the agent says it again.
+        session.speech?.unsay(draft);
+        if (!session.inTool) session.controller?.abort();
+        if (!session.running) await this.cutAfterRun(session);
         break;
       }
       case 'call.interrupted':
@@ -1665,6 +1699,7 @@ export class Sessions {
     if (session.callId) this.noteEnded(session.callId, session);
     clearTimeout(session.speakingTimer);
     session.callerSpeaking = false;
+    session.unsaid = undefined;
     session.speech?.hush();
     this.stop(session);
     session.callId = undefined;

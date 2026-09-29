@@ -338,15 +338,18 @@ fn answer<T: serde::Serialize>(result: Result<T, String>) -> axum::response::Res
 #[derive(Deserialize)]
 struct SayBody {
     text: String,
+    /// A hold word ("Okay —"): said only while the caller is quiet, else skipped (`{"skipped": true}`).
+    #[serde(default)]
+    hold: bool,
 }
 
 async fn say(State(hub): State<VoiceHub>, Path(id): Path<String>, Json(body): Json<SayBody>) -> axum::response::Response {
     let Some(tx) = hub.command(&id) else { return no_call(&id) };
     let (reply, rx) = oneshot::channel();
-    if tx.send(CallCommand::Say { text: body.text, reply }).is_err() {
+    if tx.send(CallCommand::Say { text: body.text, hold: body.hold, reply }).is_err() {
         return no_call(&id);
     }
-    answer(rx.await.unwrap_or_else(|_| Err("the call ended".into())).map(|item| json!({"itemId": item})))
+    answer(rx.await.unwrap_or_else(|_| Err("the call ended".into())).map(|item| if item.is_empty() { json!({"skipped": true}) } else { json!({"itemId": item}) }))
 }
 
 #[derive(Deserialize)]

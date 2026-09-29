@@ -289,9 +289,12 @@ export class Desktop {
     return isRecord(reply_) && isRecord(reply_.result) ? reply_.result : {};
   }
 
-  /** Speak `text` on a live call (after what is queued). */
-  async say(callId: string, text: string, signal?: AbortSignal): Promise<void> {
-    await this.voice(callId, 'say', { text }, signal);
+  /**
+   * Speak `text` on a live call (after what is queued). A `hold` word ("Okay —")
+   * is said only while the caller is quiet: the desktop skips it over them.
+   */
+  async say(callId: string, text: string, hold = false, signal?: AbortSignal): Promise<void> {
+    await this.voice(callId, 'say', hold ? { text, hold } : { text }, signal);
   }
 
   /** One of the call's tools (`request_appointment`, `lookup_business_data`): what the phone answered. */

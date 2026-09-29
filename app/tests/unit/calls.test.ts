@@ -832,6 +832,82 @@ describe('a phone call answered by the agent', () => {
     expect(fake.bodies).toHaveLength(2);
   });
 
+  it('what the agent wrote while the caller spoke is dropped by the desktop: the agent reads it as its own unsaid draft with their words, and answers them', async () => {
+    let drop!: () => void;
+    const dropNow = new Promise<void>((r) => (drop = r));
+    const fake = fakeProvider('openai', [
+      // A lookup's answer, written as the caller begins to speak.
+      { text: 'The Thursday request is still showing in the calendar. I will ask the team to confirm.', hold: { at: 60, until: dropNow } },
+      (body) => {
+        const sent = JSON.stringify(body.messages);
+        expect(sent).toContain('[OAIY] Not said: the caller spoke before you could say \\"The Thursday request is still showing in the calendar.\\", so it was dropped, and they did not hear it.');
+        expect(sent).toMatch(/if it still matters\.\\nCaller \[0:40\]: Okay, thanks\. So I've still got Friday booked\?/);
+        // Never said, so not in the conversation as said.
+        expect(sent).not.toContain('still showing in the calendar.…');
+        return { text: 'Yes, Friday at one is still booked.' };
+      },
+    ]);
+    const { sessions, calls } = setup();
+    const said = () => calls.filter((c) => c[0] === 'say').map((c) => c[2]);
+    const call = await sessions.callEvent({ type: 'call.started', callId: 'call_d', from: '+61400000031' });
+    await sessions.callEvent({ type: 'call.said', callId: 'call_d', itemId: 'out_1', text: 'Hi! How can I help?', startMs: 1_500, endMs: 3_000 });
+    await sessions.callEvent({ type: 'call.caller', callId: 'call_d', text: 'Is my Thursday one still there?', startMs: 30_000, endMs: 32_000 });
+    for (let i = 0; i < 100 && !said().length; i++) await new Promise((r) => setTimeout(r, 10));
+    // The caller speaks: the desktop holds the sentence, and drops it when their words come (it tells the app first).
+    await sessions.callEvent({ type: 'call.speech_started', callId: 'call_d', atMs: 40_000, over: false });
+    // (A hold word held with it is dropped too, and is not the agent's own words.)
+    await sessions.callEvent({ type: 'call.dropped', callId: 'call_d', sentences: ['Okay —', 'The Thursday request is still showing in the calendar.'], atMs: 42_900 });
+    drop();
+    await settled(sessions);
+    // The rest of that reply is not written to the phone.
+    expect(said()).toEqual(['The Thursday request is still showing in the calendar.']);
+    expect(fake.bodies).toHaveLength(1);
+    await sessions.callEvent({ type: 'call.caller', callId: 'call_d', text: "Okay, thanks. So I've still got Friday booked?", startMs: 40_000, endMs: 42_880, over: false, cut: false, backchannel: false });
+    await settled(sessions);
+    expect(fake.bodies).toHaveLength(2);
+    expect(said()).toEqual(['The Thursday request is still showing in the calendar.', 'Yes, Friday at one is still booked.']);
+    const replies = call!.agent.view().filter((t) => t.role === 'assistant').map((t) => (t as { text: string }).text);
+    expect(replies.join(' ')).not.toContain('still showing');
+    expect(call!.unsaid).toBeUndefined();
+  });
+
+  it('a reply already written when the desktop dropped it is taken out of the conversation, and may be said later', async () => {
+    const fake = fakeProvider('openai', [
+      { text: 'We are open from nine on weekdays.' },
+      (body) => {
+        const sent = JSON.stringify(body.messages);
+        expect(sent).toContain('Not said: the caller spoke before you could say \\"We are open from nine on weekdays.\\"');
+        expect(sent).not.toMatch(/"role":"assistant","content":"We are open from nine on weekdays\./);
+        return { text: 'Saturday we open at eight. We are open from nine on weekdays.' };
+      },
+    ]);
+    const { sessions, calls } = setup();
+    await sessions.callEvent({ type: 'call.started', callId: 'call_q', from: '+61400000032' });
+    await sessions.callEvent({ type: 'call.said', callId: 'call_q', itemId: 'out_1', text: 'Hi! How can I help?', startMs: 1_500, endMs: 3_000 });
+    await sessions.callEvent({ type: 'call.caller', callId: 'call_q', text: 'When are you open?', startMs: 5_000, endMs: 6_000 });
+    await settled(sessions);
+    await sessions.callEvent({ type: 'call.dropped', callId: 'call_q', sentences: ['We are open from nine on weekdays.'], atMs: 8_000 });
+    await sessions.callEvent({ type: 'call.caller', callId: 'call_q', text: 'And Saturday?', startMs: 6_500, endMs: 7_900, over: false, cut: false, backchannel: false });
+    await settled(sessions);
+    expect(fake.bodies).toHaveLength(2);
+    // Never heard, so not held back as said before.
+    expect(calls.filter((c) => c[0] === 'say').map((c) => c[2])).toEqual(['We are open from nine on weekdays.', 'Saturday we open at eight.', 'We are open from nine on weekdays.']);
+  });
+
+  it('a hold word goes to the desktop as one (it says it only while the caller is quiet); the reply\'s words do not', async () => {
+    const said: Array<[string, boolean]> = [];
+    const speech = new Speech(async (text, hold) => void said.push([text, hold]));
+    speech.begin();
+    expect(speech.holdWord('Okay —')).toBe(true);
+    speech.push('We are open from nine. ');
+    speech.flush();
+    await speech.done;
+    expect(said).toEqual([
+      ['Okay —', true],
+      ['We are open from nine.', false],
+    ]);
+  });
+
   it('a tool that takes a while gets a short line said, once, when nothing has been said', async () => {
     vi.useFakeTimers({ toFake: ['setTimeout', 'clearTimeout'] });
     try {
