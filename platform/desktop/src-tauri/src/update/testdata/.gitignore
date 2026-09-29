@@ -1,0 +1,2 @@
+# The repository ignores *.bin (build outputs); this one is a test fixture: what installer.bin.sig signs.
+!installer.bin
