@@ -10,6 +10,8 @@
 
 use std::io::{Read, Write};
 use std::net::{TcpListener, TcpStream};
+#[cfg(unix)]
+use std::path::Path;
 use std::path::PathBuf;
 use std::process::{Child, Command, Stdio};
 use std::sync::{Arc, Mutex};
@@ -267,4 +269,58 @@ fn a_headless_server_told_nothing_says_the_engines_are_not_running() {
     let request = json!({ "messages": [{ "role": "user", "content": "hi" }] });
     let (status, refused) = server.post("/api/ai/providers/oaiy-engine/v1/chat/completions", request);
     assert_eq!((status, refused["error"]["code"].as_str()), (503, Some("engine_unavailable")), "{refused}");
+}
+
+/// What the server writes is private where the OS lets us say so: the data folder it made
+/// itself, the identity keys it mints on the way up, and a provider key somebody saves.
+#[cfg(unix)]
+#[test]
+fn a_fresh_server_keeps_its_data_folder_keys_and_provider_store_to_its_owner() {
+    use std::os::unix::fs::PermissionsExt as _;
+    let scratch = Scratch::new("private");
+    let server = Server::start(&scratch, &[]);
+    let data = scratch.0.join("data");
+    let mode = |path: &Path| std::fs::metadata(path).unwrap().permissions().mode() & 0o777;
+    assert_eq!(mode(&data), 0o700, "the data folder the server made");
+
+    // A provider's API key, saved over the API as the dashboard does.
+    let (status, saved) = server.post(
+        "/api/ai/providers",
+        json!({ "id": "openai", "name": "OpenAI", "baseUrl": "https://api.openai.com" }),
+    );
+    assert_eq!(status, 200, "{saved}");
+    let (status, _) = server.post("/api/ai/providers/openai/key", json!({ "key": "sk-not-a-real-key" }));
+    assert_eq!(status, 204);
+    let store = data.join("ai").join("providers.json");
+    assert!(std::fs::read_to_string(&store).unwrap().contains("sk-not-a-real-key"), "the key is what the file is for");
+    assert_eq!(mode(&store), 0o600, "providers.json is readable by others");
+    assert_eq!(mode(store.parent().unwrap()), 0o700, "and so is the folder the server made for it");
+
+    // The keys are minted on threads of their own as the server comes up.
+    let keys = |data: &Path| -> Vec<PathBuf> {
+        walk(data).into_iter().filter(|p| p.extension().is_some_and(|e| e == "key")).collect()
+    };
+    let deadline = Instant::now() + Duration::from_secs(15);
+    while keys(&data).is_empty() && Instant::now() < deadline {
+        std::thread::sleep(Duration::from_millis(100));
+    }
+    let keys = keys(&data);
+    assert!(!keys.is_empty(), "the server should have minted at least the node's signing key");
+    for key in keys {
+        assert_eq!(mode(&key), 0o600, "{} is readable by others", key.file_name().unwrap().to_string_lossy());
+    }
+}
+
+#[cfg(unix)]
+fn walk(dir: &Path) -> Vec<PathBuf> {
+    let mut found = Vec::new();
+    for entry in std::fs::read_dir(dir).into_iter().flatten().flatten() {
+        let path = entry.path();
+        if path.is_dir() {
+            found.extend(walk(&path));
+        } else {
+            found.push(path);
+        }
+    }
+    found
 }
