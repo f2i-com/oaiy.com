@@ -2633,6 +2633,44 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn a_call_this_desktop_placed_is_never_offered_transfer_even_when_the_phone_says_it_can_and_the_owner_allows_it() {
+        // An outbound call (an outreach's, a call back's): the person rung did not ask for the owner, and the receptionist is the one calling.
+        let mut aokie = Aokie::start_with(json!({"direction": "outbound", "allowTransfer": true, "from": "+61491570006", "callerName": "Alex"}), |hub| {
+            let ring = crate::ring::Ring::in_memory(owner_settings(true));
+            ring.set_presence(Arc::new(Here));
+            ring.set_devices(crate::ring::testing::at_the_pc());
+            hub.set_ring(ring);
+            hub.set_transfer_timing(quick());
+        })
+        .await;
+        assert!(aokie.ready.get("features").is_none(), "the phone is not told transfers are offered on a call we placed");
+        aokie.begin(json!({}));
+        let started = aokie.event("call.started", secs(3)).await.expect("the call started");
+        assert_eq!((started["allowTransfer"].clone(), started["takeMessages"].clone()), (json!(false), json!(true)), "the app is told there is no transfer (messages are the owner's, and still on)");
+        // Whatever the caller says and the model asks, nothing reaches the phone, and nothing is counted as a try.
+        caller_asks(&aokie);
+        let answer = answer_of(asking(&aokie, transfer::TOOL, json!({"reason": "caller_asked"}))).await.unwrap();
+        assert_eq!((answer["ok"].clone(), answer["output"]["reason"].clone()), (json!(false), json!("not_offered")), "{answer}");
+        assert!(aokie.text("formlogic.realtime.tool_call", Duration::from_millis(300)).await.is_none());
+        assert_eq!(tries(&aokie).global_attempts_last_hour, 0);
+        // An outcome frame the phone sends anyway is not believed.
+        aokie.send(outcome(&aokie, "assist_1", "accepted", None));
+        assert!(aokie.event("call.transfer", Duration::from_millis(300)).await.is_none());
+    }
+
+    #[tokio::test]
+    async fn a_line_only_to_say_is_never_offered_transfer_either() {
+        let aokie = Aokie::start_with(json!({"mode": "speak", "greeting": "Please hold.", "allowTransfer": true}), |hub| {
+            let ring = crate::ring::Ring::in_memory(owner_settings(true));
+            ring.set_presence(Arc::new(Here));
+            ring.set_devices(crate::ring::testing::at_the_pc());
+            hub.set_ring(ring);
+        })
+        .await;
+        assert!(aokie.ready.get("features").is_none(), "a line to say is not a call: {}", aokie.ready);
+    }
+
+    #[tokio::test]
     async fn the_app_is_told_what_the_call_may_do_and_a_call_without_transfer_starts_as_it_always_did() {
         // Off: `ready` is what it always was, and the start tells the app there is no transfer.
         let mut off = Aokie::start(json!({"allowTransfer": true})).await;
