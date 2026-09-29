@@ -107,6 +107,8 @@ fn engine_provider(gateway: String, model: String) -> AiProvider {
 pub fn router(state: AiState) -> Router {
     // OAIY's engine's models as flow services, and the calls to them.
     let engine = super::engine_services::router(state.clone());
+    // The Agent's model (engine or ChatGPT), and what this computer can run.
+    let agent_model = super::agent_model::router(state.clone());
     Router::new()
         // union of local services + configured providers, for the flow pickers
         .route("/api/ai/sources", get(list_ai_sources))
@@ -128,6 +130,7 @@ pub fn router(state: AiState) -> Router {
         .route("/api/ai/codex/logout", post(codex_logout))
         .with_state(state)
         .merge(engine)
+        .merge(agent_model)
     // OUT OF SCOPE v1 (hook here later, same shape as the reference):
     //   POST /api/ai/v1/audio/transcriptions      -> Capability::Transcription
     //   POST /api/ai/v1/audio/chat/completions     -> buffered audio-chat

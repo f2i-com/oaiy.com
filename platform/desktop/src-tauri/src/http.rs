@@ -810,14 +810,14 @@ async fn engines_status() -> axum::response::Response {
 // which the control port serves as `/api/discovery`): nothing here names a
 // model of its own.
 
-fn engines_ui() -> Option<String> {
+pub(crate) fn engines_ui() -> Option<String> {
     ENGINES_UI.read().ok().and_then(|g| g.clone())
 }
 
 /// The message when no engines are there to relay to.
 const ENGINES_NOT_RUNNING: &str = "The engines are not running: they start with OAIY, or run oaiy-studio.";
 
-async fn studio_json(ui: &str, method: reqwest::Method, path: &str, body: Option<serde_json::Value>) -> Result<serde_json::Value, (u16, String)> {
+pub(crate) async fn studio_json(ui: &str, method: reqwest::Method, path: &str, body: Option<serde_json::Value>) -> Result<serde_json::Value, (u16, String)> {
     let mut req = reqwest::Client::new().request(method, format!("{ui}{path}")).timeout(std::time::Duration::from_secs(10));
     if let Some(body) = body {
         req = req.json(&body);
@@ -1107,6 +1107,9 @@ fn is_restricted_read_path(path: &str) -> bool {
         // arbitrary remote page; a paired token or a trusted origin passes.
         || path.starts_with("/api/ai/")
         || is_personal_path(path)
+        // The Agent's model (engine or ChatGPT). Already under `/api/agent/`,
+        // named so it stays gated if that prefix ever narrows.
+        || path == "/api/agent/preferences"
         // Which models are loaded, the GPUs, the engines' address; their
         // catalog, the models chosen and the downloads.
         || path == "/api/engines"
@@ -1925,6 +1928,16 @@ mod tests {
             assert!(is_privileged_path(&m, path), "{m} {path} must be privileged");
         }
         assert!(!is_privileged_path(&Method::GET, "/api/setup"));
+    }
+
+    #[test]
+    fn the_agents_model_and_the_hardware_recommendation_are_restricted() {
+        // Reading them: OAIY's own window or a token, never a remote page.
+        assert!(is_restricted_read_path("/api/agent/preferences"));
+        assert!(is_restricted_read_path("/api/engines/recommendation"));
+        // Choosing the Agent's model decides which account its conversations
+        // spend: the privileged gate, like setup.
+        assert!(is_privileged_path(&Method::PUT, "/api/agent/preferences"));
     }
 
     /// A stand-in for the engines' control port: their catalog with one model
