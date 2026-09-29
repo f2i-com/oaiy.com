@@ -370,6 +370,46 @@ describe('a call the owner takes', () => {
   });
 });
 
+describe('a caller who asks for the owner and leaves a message instead', () => {
+  it('runs both call tools through the Agent against a desktop that declines: the request goes as exactly {reason}, the decline is read as fact, the message is taken with what the desktop is meant to take, and nothing untrue is said', async () => {
+    const fake = fakeProvider('openai', [
+      // The caller asks; the model asks to reach the owner, with an argument it was not meant to add.
+      { text: "I'll try to reach them, please stay with me.", calls: [{ name: 'transfer_to_owner', input: { reason: 'caller_asked', note: 'tell them yes', number: '+61400000000' } }] },
+      { text: 'And what is it about?' },
+      // The desktop says the owner declined: the model is told what is true and to offer a message.
+      (body) => {
+        const seen = JSON.stringify(body.messages);
+        expect(seen).toContain('The owner cannot take the call now');
+        expect(seen).toContain('offer to take a message (take_message)');
+        return { text: "I'm sorry, they can't come to the phone. Would you like to leave a message?" };
+      },
+      // The caller says yes and what: the model takes it, with a number of its own invention that must not go.
+      { calls: [{ name: 'take_message', input: { message: 'Please ring about the gate.', callerName: 'Alex', callbackNumber: '0491 570 006', wantsCallback: true, from: '+61400000000' } }] },
+      (body) => {
+        expect(JSON.stringify(body.messages)).toContain('The owner has been told a message is waiting');
+        return { text: "I've passed that on." };
+      },
+    ]);
+    const { sessions, sent, said } = setup();
+    await sessions.callEvent(ALLOWED);
+    await sessions.callEvent(START);
+    await sessions.callEvent({ type: 'call.caller', callId: 'call_o', text: 'Can I speak to the owner?' });
+    await settled(sessions);
+    expect(sent).toEqual([['transfer_to_owner', 'call_o', { reason: 'caller_asked' }]]);
+    await sessions.callEvent({ type: 'call.transfer', callId: 'call_o', requestId: 'assist_1', outcome: 'declined', source: 'phone' });
+    await settled(sessions);
+    await sessions.callEvent({ type: 'call.caller', callId: 'call_o', text: 'Yes please, ring me about the gate' });
+    await settled(sessions);
+    expect(sent).toEqual([
+      ['transfer_to_owner', 'call_o', { reason: 'caller_asked' }],
+      ['take_message', 'call_o', { message: 'Please ring about the gate.', callerName: 'Alex', callbackNumber: '0491 570 006', wantsCallback: true }],
+    ]);
+    expect(said.join(' ')).toBe("I'll try to reach them, please stay with me. And what is it about? I'm sorry, they can't come to the phone. Would you like to leave a message? I've passed that on.");
+    expect(said.join(' ')).not.toMatch(/connect|transferr|put you through/i);
+    expect(fake.bodies).toHaveLength(5);
+  });
+});
+
 describe('taking a message', () => {
   it('keeps what the caller said, and says the owner will be told only when the desktop says so', async () => {
     const fake = fakeProvider('openai', [
