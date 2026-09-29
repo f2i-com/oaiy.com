@@ -419,6 +419,80 @@ fn a_quiet_hour_or_a_disabled_setting_is_not_a_missing_device() {
     assert!(r.ring.notices().is_empty());
 }
 
+/// The owner allows the receptionist to ask for urgent things, and the caller said one of their phrases.
+fn urgent_call(said: &str, initiative: &str) -> Rig {
+    let r = rig(Presence::Active);
+    r.ring.change_settings(&json!({ "initiative": initiative, "urgentPhrases": ["gas leak"] })).unwrap();
+    r.calls.info.lock().unwrap().clear();
+    r.calls.info.lock().unwrap().push((CALL.into(), caller("+61491570006", "Alex", said)));
+    r
+}
+
+#[test]
+fn this_desktop_vouches_for_an_urgent_reason_only_when_the_owner_allowed_it_and_their_own_phrase_was_heard() {
+    // Allowed, and the caller's own words are the owner's urgent phrase: the plan carries reasonAllowed.
+    let r = urgent_call("There is a gas leak in the shop", "on_request_or_urgent");
+    let plan = r.ring.plan_for_plugin(CALL, Reason::Urgent, CallInfo::default());
+    assert!(plan.rings() && plan.reason_allowed, "{:?}", plan.plan);
+    assert_eq!(super::host::plan_result(&plan)["reasonAllowed"], json!(true));
+    // The gate's plan, which the plugin then asks for, is vouched the same way and the vouching is not lost on the way.
+    let r = urgent_call("There is a gas leak in the shop", "on_request_or_urgent");
+    let gate = r.ring.authorise(CALL, Reason::Urgent);
+    assert!(gate.rings() && gate.reason_allowed);
+    let asked = r.ring.plan_for_plugin(CALL, Reason::Urgent, CallInfo::default());
+    assert_eq!(asked.plan_id, gate.plan_id);
+    assert!(asked.reason_allowed, "the plan the plugin is given is the one that was vouched for");
+}
+
+#[test]
+fn vouching_needs_the_urgent_reason_and_the_owners_permission_and_the_owners_phrase_each_on_its_own() {
+    use super::host::vouches_for;
+    let says = |t: &str| vec![t.to_string()];
+    let allowed = |initiative: &str| {
+        let s = RingSettings { urgent_phrases: vec!["gas leak".into()], ..Default::default() };
+        RingSettings { initiative: if initiative == "urgent" { super::settings::Initiative::OnRequestOrUrgent } else { s.initiative }, ..s }
+    };
+    assert!(vouches_for(Reason::Urgent, &allowed("urgent"), &says("a gas leak in the shop")));
+    assert!(!vouches_for(Reason::Urgent, &allowed("request"), &says("a gas leak in the shop")), "the owner did not allow it");
+    assert!(!vouches_for(Reason::Urgent, &allowed("urgent"), &says("a mow on Tuesday")), "their phrase was not heard");
+    assert!(!vouches_for(Reason::Urgent, &RingSettings { initiative: super::settings::Initiative::OnRequestOrUrgent, ..Default::default() }, &says("a gas leak")), "they named no phrase");
+    assert!(!vouches_for(Reason::CallerAsked, &allowed("urgent"), &says("a gas leak in the shop")));
+    assert!(!vouches_for(Reason::PolicyRule, &allowed("urgent"), &says("a gas leak in the shop")));
+}
+
+#[test]
+fn an_urgent_reason_nobody_confirmed_is_not_vouched_for() {
+    // The owner did not allow the receptionist to ask on its own for urgent things: no ring, and nothing vouched.
+    let r = urgent_call("There is a gas leak in the shop", "on_request");
+    let plan = r.ring.plan_for_plugin(CALL, Reason::Urgent, CallInfo::default());
+    assert_eq!((plan.plan.decision, plan.plan.reason, plan.reason_allowed), (Decision::MessageOnly, PlanReason::InitiativeOff, false));
+    assert_eq!(super::host::plan_result(&plan)["reasonAllowed"], json!(false));
+    // Allowed, but the caller did not say one of the phrases: not urgent, and nothing vouched.
+    let r = urgent_call("Can I book a mow please", "on_request_or_urgent");
+    let plan = r.ring.plan_for_plugin(CALL, Reason::Urgent, CallInfo::default());
+    assert_eq!((plan.plan.decision, plan.plan.reason, plan.reason_allowed), (Decision::MessageOnly, PlanReason::NotUrgent, false));
+    // The model's own word that it is urgent is not the caller's: a phrase in what the model says is nothing.
+    let r = urgent_call("It is urgent, please hurry", "on_request_or_urgent");
+    assert!(!r.ring.plan_for_plugin(CALL, Reason::Urgent, CallInfo::default()).reason_allowed);
+}
+
+#[test]
+fn no_other_reason_is_vouched_for_however_urgent_the_caller_sounds() {
+    let said = "There is a gas leak, can I speak to the owner please";
+    // A caller who asked for a person, with the urgent phrase in it: the reason is caller_asked, and is not vouched.
+    let r = urgent_call(said, "on_request_or_urgent");
+    let plan = r.ring.plan_for_plugin(CALL, Reason::CallerAsked, CallInfo::default());
+    assert!(plan.rings() && !plan.reason_allowed, "{:?}", plan.plan);
+    // The owner's own rule is not something this desktop can see either.
+    let r = urgent_call(said, "on_request_or_urgent");
+    let plan = r.ring.plan_for_plugin(CALL, Reason::PolicyRule, CallInfo::default());
+    assert!(!plan.reason_allowed, "{:?}", plan.plan);
+    // A refused plan vouches for nothing.
+    let r = urgent_call(said, "on_request_or_urgent");
+    r.ring.change_settings(&json!({ "enabled": false })).unwrap();
+    assert!(!r.ring.plan_for_plugin(CALL, Reason::Urgent, CallInfo::default()).reason_allowed);
+}
+
 #[test]
 fn a_second_try_on_one_call_straight_after_the_first_is_refused() {
     let r = rig(Presence::Active);

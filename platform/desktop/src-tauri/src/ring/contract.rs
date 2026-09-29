@@ -275,6 +275,10 @@ pub struct PlanResult {
     pub wake: Vec<String>,
     pub desktop_toast: bool,
     pub desktop_companions: Vec<String>,
+    /// This desktop itself vouches for the request's reason, so the plugin need not see the caller ask for a person. True only
+    /// for `urgent`, when the owner allows it and one of their urgent phrases was heard; otherwise false.
+    #[serde(default)]
+    pub reason_allowed: bool,
 }
 
 /// `oaiy.ring.opened`, the plugin telling the desktop the request is out.
@@ -505,6 +509,7 @@ mod tests {
         let ours = super::super::host::plan_result(&super::super::Authorised {
             plan: super::super::RingPlan { decision: Decision::Ring, reason: PlanReason::Ok, ring_seconds: 30, phones: vec![], wake: vec![], desktop_toast: true, desktop_companions: vec![] },
             plan_id: Some("plan_x".into()),
+            reason_allowed: false,
             caller_number: String::new(),
             caller_name: String::new(),
         });

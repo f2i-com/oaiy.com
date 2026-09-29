@@ -2596,6 +2596,7 @@ mod tests {
             match call {
                 "call_1" => Some(crate::ring::CallInfo { from: "+61491570006".into(), name: "Alex".into(), turns: asked }),
                 "call_2" => Some(crate::ring::CallInfo { from: "+61491570156".into(), name: "Sam".into(), turns: asked }),
+                "call_3" => Some(crate::ring::CallInfo { from: "+61491570157".into(), name: "Kim".into(), turns: vec!["There is a gas leak at the shop".to_string()] }),
                 _ => None,
             }
         }
@@ -2625,6 +2626,7 @@ mod tests {
         let asked = |ring: &Arc<crate::ring::Ring>, call: &str| PluginHost::ring_request(ring, "oaiy.ring.plan", json!({"callId": call, "reason": "caller_asked", "recentCallerTurns": ["Can I speak to the owner please"]}));
         let plan = asked(&ring, "call_1").unwrap();
         assert_eq!((plan["decision"].as_str(), plan["reason"].as_str(), plan["desktopToast"].as_bool()), (Some("ring"), Some("ok"), Some(true)), "{plan}");
+        assert_eq!(plan["reasonAllowed"], json!(false), "a caller who asked for a person needs no vouching");
         let plan_id = plan["planId"].as_str().unwrap().to_string();
         assert!(!plan_id.is_empty());
 
@@ -2640,6 +2642,22 @@ mod tests {
         // A second question straight away is a second try, and the gap between tries refuses it.
         let again = asked(&ring, "call_1").unwrap();
         assert_eq!((again["decision"].as_str(), again["reason"].as_str(), again["planId"].as_str()), (Some("refused"), Some("limit_gap"), Some("")), "{again}");
+    }
+
+    #[test]
+    fn an_urgent_plan_says_this_desktop_vouches_for_the_reason_only_when_it_heard_the_owners_phrase() {
+        let ring = a_ring();
+        let ask = |call: &str, reason: &str| PluginHost::ring_request(&ring, "oaiy.ring.plan", json!({"callId": call, "reason": reason, "recentCallerTurns": []})).unwrap();
+        // Not allowed by the owner: nothing rings, nothing is vouched.
+        let plan = ask("call_3", "urgent");
+        assert_eq!((plan["decision"].as_str(), plan["reason"].as_str(), plan["reasonAllowed"].as_bool()), (Some("message_only"), Some("initiative_off"), Some(false)), "{plan}");
+        // Allowed, with the owner's own phrase: the plan rings and says so.
+        ring.change_settings(&json!({"initiative": "on_request_or_urgent", "urgentPhrases": ["gas leak"]})).unwrap();
+        let plan = ask("call_3", "urgent");
+        assert_eq!((plan["decision"].as_str(), plan["reasonAllowed"].as_bool()), (Some("ring"), Some(true)), "{plan}");
+        // A call that did not say it is not urgent, whatever the plugin says of it in the request.
+        let plan = PluginHost::ring_request(&ring, "oaiy.ring.plan", json!({"callId": "call_1", "reason": "urgent", "recentCallerTurns": ["There is a gas leak"]})).unwrap();
+        assert_eq!((plan["decision"].as_str(), plan["reason"].as_str(), plan["reasonAllowed"].as_bool()), (Some("message_only"), Some("not_urgent"), Some(false)), "{plan}");
     }
 
     #[test]

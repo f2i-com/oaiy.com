@@ -95,6 +95,8 @@ struct Grant {
     plan_id: String,
     call_id: String,
     plan: RingPlan,
+    /// This desktop vouched for the reason (see [`Authorised::reason_allowed`]).
+    reason_allowed: bool,
     at: Instant,
     claimed: bool,
 }
@@ -106,6 +108,11 @@ pub struct Authorised {
     pub plan: RingPlan,
     /// Set when a ring is allowed: the plugin's question about this request is answered with it.
     pub plan_id: Option<String>,
+    /// This desktop itself vouches for the reason of the request, so the plugin need not see the caller ask for a person (the
+    /// plan's `reasonAllowed`). Only for `urgent`: when the owner allows the receptionist to ask on its own for urgent things
+    /// (`initiative`) and this desktop heard, in the caller's own words, one of the owner's urgent phrases. The model's
+    /// word for it, and the plugin's, are never enough; for every other reason this is false.
+    pub reason_allowed: bool,
     pub caller_number: String,
     pub caller_name: String,
 }
@@ -305,7 +312,7 @@ impl Ring {
     pub fn authorise(&self, call: &str, reason: Reason) -> Authorised {
         let settings = self.settings.get();
         let Some(info) = self.call_info(call) else {
-            return Authorised { plan: unknown_call(&settings), plan_id: None, caller_number: String::new(), caller_name: String::new() };
+            return Authorised { plan: unknown_call(&settings), plan_id: None, reason_allowed: false, caller_number: String::new(), caller_name: String::new() };
         };
         self.judge(call, reason, info, &settings)
     }
@@ -315,6 +322,7 @@ impl Ring {
         if plan.reason == PlanReason::NoDevice {
             self.note_no_device(call, &info);
         }
+        let reason_allowed = plan.decision == Decision::Ring && vouches_for(reason, settings, &info.turns);
         let mut plan_id = None;
         if plan.decision == Decision::Ring {
             let now_unix = self.clock().unix();
@@ -323,10 +331,10 @@ impl Ring {
             let id = format!("plan_{}", &uuid::Uuid::new_v4().simple().to_string()[..16]);
             let mut grants = self.grants.lock().unwrap_or_else(|e| e.into_inner());
             grants.retain(|_, g| g.at.elapsed() < PLAN_TTL);
-            grants.insert(id.clone(), Grant { plan_id: id.clone(), call_id: call.to_string(), plan: plan.clone(), at: Instant::now(), claimed: false });
+            grants.insert(id.clone(), Grant { plan_id: id.clone(), call_id: call.to_string(), plan: plan.clone(), reason_allowed, at: Instant::now(), claimed: false });
             plan_id = Some(id);
         }
-        Authorised { plan, plan_id, caller_number: info.from, caller_name: info.name }
+        Authorised { plan, plan_id, reason_allowed, caller_number: info.from, caller_name: info.name }
     }
 
     /// The plugin's question `oaiy.ring.plan` about a request on `call`: the plan this desktop already
@@ -341,7 +349,7 @@ impl Ring {
             grants.retain(|_, g| g.at.elapsed() < PLAN_TTL);
             if let Some(grant) = grants.values_mut().find(|g| g.call_id == call && !g.claimed) {
                 grant.claimed = true;
-                return Authorised { plan: grant.plan.clone(), plan_id: Some(grant.plan_id.clone()), caller_number: info.from, caller_name: info.name };
+                return Authorised { plan: grant.plan.clone(), plan_id: Some(grant.plan_id.clone()), reason_allowed: grant.reason_allowed, caller_number: info.from, caller_name: info.name };
             }
         }
         let authorised = self.judge(call, reason, info, &settings);
@@ -357,6 +365,13 @@ impl Ring {
     pub fn plan_is_claimed(&self, plan_id: &str, call: &str) -> bool {
         self.grants.lock().unwrap_or_else(|e| e.into_inner()).get(plan_id).is_some_and(|g| g.claimed && g.call_id == call && g.at.elapsed() < PLAN_TTL * 4)
     }
+}
+
+/// Whether this desktop vouches for `reason` on a call where the caller said `turns`: for `urgent` only, when the owner
+/// allows the receptionist to ask on its own for urgent things and the caller's own words held one of their urgent phrases.
+/// It is judged here on its own, whatever the plan says, so the two checks are each tested and neither leans on the other.
+pub(super) fn vouches_for(reason: Reason, settings: &RingSettings, turns: &[String]) -> bool {
+    reason == Reason::Urgent && settings.initiative == super::settings::Initiative::OnRequestOrUrgent && phrases::urgent(turns, &settings.urgent_phrases)
 }
 
 /// The plan for a call this desktop has no record of: nobody it heard asked for anyone.
@@ -377,5 +392,6 @@ pub fn plan_result(authorised: &Authorised) -> Value {
         "wake": p.wake,
         "desktopToast": p.desktop_toast,
         "desktopCompanions": p.desktop_companions,
+        "reasonAllowed": authorised.reason_allowed,
     })
 }
