@@ -48,8 +48,10 @@ What keeps the key from everything that does not need it:
   builds the installers UNSIGNED, on a tag and on a branch alike. The `sign` job is the only
   place the two secrets are named, in one step ("Sign the setup.exe and the AppImage"), and
   the job does nothing but `tauri signer sign` on the two installers the builds made: the Tauri
-  CLI is installed from the desktop app's lockfile with no install scripts, and nothing of the
-  project is built or run there.
+  CLI is installed from the desktop app's lockfile with no install scripts (`npm ci
+  --ignore-scripts`: `@tauri-apps/cli` has none, and its Linux binding is an optional package
+  the lockfile pins; only esbuild's and fsevents' scripts are skipped, and this job needs
+  neither), and nothing of the project is built or run there.
 - **It runs on a tag only.** `sign` has `if: needs.meta.outputs.is_tag == 'true'`. A run on a
   branch (the trial run below) never starts it, and says in its log that its installers are
   unsigned. The job also waits for the verification gate and for every desktop build, so
@@ -68,6 +70,15 @@ uploaded as the artifact `signatures` and reach the release next to the installe
 
 Set this up ONCE, before the first tag. **If the environment does not exist when the first tag is
 pushed, GitHub creates it empty: no reviewer and no tag rule, and the job would run unprotected.**
+
+What GitHub gives depends on the repository and its plan. This repository is public (checked with
+`gh repo view`), where environments, their secrets, their deployment rules and required reviewers
+are all available. In a PRIVATE repository they need a paid plan, and required reviewers a higher
+one (check GitHub's current plan table): on a plan without them the `sign` job is handed no
+secrets and stops, naming them. Do not put the secrets under the repository's Actions secrets to
+get round that: any workflow on any branch can read those. Move the repository to a plan that has
+the environment, or sign the release by hand (the commands in the next section sign a file the
+way the job does, and `platform/scripts/verify-signature.mjs` checks it) until it is.
 
 1. Settings, Environments, New environment: `release`.
 2. **Deployment branches and tags**: choose "Selected branches and tags" and add two TAG
