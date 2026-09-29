@@ -38,6 +38,7 @@ pub mod busy;
 pub mod commands;
 pub mod container;
 pub mod create;
+pub mod desk;
 pub mod manifest;
 pub mod restore;
 pub mod review;

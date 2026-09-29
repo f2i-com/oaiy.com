@@ -396,6 +396,13 @@ A restore is never done in place. It has three steps, and the first two change n
    `<data>/restore/pending-<id>/` (after checking the free space and every name: nothing may leave
    its folder, name a drive, appear twice, be a credential or an NTFS short-name alias such as
    `PAIRIN~1.JSO`, or pass the limits of 20,000 items and the size caps below) and writes a marker.
+   **What is prepared is what you looked at.** When you look, OAIY keeps the SHA-256 of the whole
+   decrypted backup (its record and every item, the Agent's storage included) and the names of the
+   items the look listed; when you prepare, the file is decrypted again and must hash the same
+   (a file of the same size and date with other things in it is refused: "This is not the backup
+   that was checked"), and nothing is prepared that the look did not list. The busy check is made
+   before the file dialog and again after it (a dialog can stay open for minutes), and once more
+   when you prepare.
    Still nothing you use is changed. You can **Cancel restore** here. **A prepared restore that
    is not applied within 24 hours is thrown away at the next start**, unapplied, and the result
    says so: what it would replace may have changed, and you may no longer remember choosing it.

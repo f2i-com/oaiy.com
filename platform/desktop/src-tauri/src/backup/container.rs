@@ -292,6 +292,9 @@ pub(crate) fn write_zip(path: &Path, manifest_json: &[u8], files: &[(String, Pat
 pub(crate) struct Verified {
     pub manifest: Manifest,
     pub plain: PathBuf,
+    /// The SHA-256 of the decrypted ZIP, whole: what a restore is bound to. It covers the record and every
+    /// item (the Agent's storage archive included), so two files with this hash are the same backup.
+    pub plain_sha256: String,
 }
 
 /// Read and check the decrypted ZIP at `plain`: the manifest is the first entry and is valid, the
@@ -360,7 +363,7 @@ pub(crate) fn verify_zip(plain: &Path, limits: &Limits, budget: &Budget) -> Resu
     if !expected.is_empty() {
         return Err(BackupError::new(ErrorKind::Damaged, "This backup is missing items its record lists."));
     }
-    Ok(Verified { manifest, plain: plain.to_path_buf() })
+    Ok(Verified { manifest, plain: plain.to_path_buf(), plain_sha256: String::new() })
 }
 
 /// Decrypt `enc`, and check it whole, using `scratch` (a private folder that exists) for the plaintext ZIP.
@@ -369,8 +372,8 @@ pub(crate) fn open_backup(enc: &Path, passphrase: &str, scratch: &Path, limits: 
     let plain = scratch.join("plain.zip");
     // A little more than the entries allow, for the ZIP's own headers and manifest.
     let max_plain = limits.max_total_bytes.saturating_add(limits.max_manifest_bytes).saturating_add(limits.max_entries as u64 * 1024);
-    decrypt_to_file(enc, passphrase, &plain, max_plain, budget)?;
-    verify_zip(&plain, limits, budget)
+    let (plain_sha256, _) = decrypt_to_file(enc, passphrase, &plain, max_plain, budget)?;
+    Ok(Verified { plain_sha256, ..verify_zip(&plain, limits, budget)? })
 }
 
 /// Unpack every entry of a verified backup, each into the path `dest_for` gives it, streaming and

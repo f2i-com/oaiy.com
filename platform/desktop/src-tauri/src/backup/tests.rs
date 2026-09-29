@@ -957,6 +957,7 @@ fn what_a_backup_waits_for_is_worked_out_in_one_place_and_not_a_second_time() {
         ("backup/create.rs", include_str!("create.rs")),
         ("backup/restore.rs", include_str!("restore.rs")),
         ("backup/commands.rs", include_str!("commands.rs")),
+        ("backup/desk.rs", include_str!("desk.rs")),
         ("backup/routes.rs", include_str!("routes.rs")),
         ("http.rs", include_str!("../http.rs")),
     ];
@@ -978,11 +979,19 @@ fn what_a_backup_waits_for_is_worked_out_in_one_place_and_not_a_second_time() {
     assert!(look.contains("try_state::<UpdaterHandle>()") && look.contains("updater.activity()") && look.contains("Busy::look(activity.as_deref())") && look.contains("spawn_blocking") && look.contains("Busy::cannot_tell()"), "{look}");
     // Every command that must not run while the app is busy asks it, and a wait for a dialog does not use an old answer.
     let commands = source_text(include_str!("commands.rs"));
-    for (name, refusal) in [("backup_create", "making a backup"), ("backup_restore_inspect", "checking a backup"), ("backup_restart_to_apply", "restarting to finish the restore")] {
+    for (name, refusal) in [("backup_create", "making a backup"), ("backup_restart_to_apply", "restarting to finish the restore")] {
         let body = command_source(name);
         assert!(body.contains("look_busy(&app).await") && (body.contains(&format!("refuse_if_busy(\"{refusal}\")"))), "{name} asks whether the app is busy and refuses with {refusal:?}");
     }
-    assert!(command_source("backup_restore_stage").contains("busy: look_busy(&app).await"), "preparing a restore takes its own fresh look");
+    // Looking at a backup and preparing one are the restore flow's (`desk.rs`, and tested by driving it); the commands hand over to it.
+    let desk = source_text(include_str!("desk.rs"));
+    assert!(desk.contains("host.busy().await.refuse_if_busy(\"checking a backup\")"), "looking asks whether the app is busy and refuses with \"checking a backup\"");
+    assert!(desk.contains("busy: host.busy().await, ..RestoreOptions::default() };\n    let file = path.clone();"), "and takes a second look after the dialog");
+    assert!(desk[desk.find("pub async fn stage").unwrap()..].contains("busy: host.busy().await"), "preparing a restore takes its own fresh look");
+    for name in ["backup_restore_inspect", "backup_restore_stage"] {
+        assert!(command_source(name).contains("desk::"), "{name} hands over to the restore flow");
+    }
+    assert!(commands.contains("look_busy(&self.app)"), "and the flow's window is asked through the updater's decision");
     assert_eq!(commands.matches("gather_busy").count(), 0);
     // The stub that told the backup how many calls the hub had is gone from the window's start-up.
     assert!(!include_str!("../http.rs").contains("backup::busy::register"));
@@ -3254,7 +3263,7 @@ fn command_source(name: &str) -> String {
 
 #[test]
 fn the_passphrase_is_wiped_from_memory_by_every_command_that_is_given_one() {
-    for name in ["backup_create", "backup_restore_inspect", "backup_restore_stage"] {
+    for name in ["backup_create"] {
         let body = command_source(name);
         assert!(body.contains("let passphrase = Zeroizing::new(passphrase);"), "{name} wraps the passphrase it was given");
         // ... straight after the label check, before anything can return early with the plain String.
@@ -3264,6 +3273,20 @@ fn the_passphrase_is_wiped_from_memory_by_every_command_that_is_given_one() {
         // The plain String is used nowhere after that (only the wrapper, by reference).
         let after = &body[wrapped + "Zeroizing::new(passphrase)".len()..];
         assert!(!after.contains("passphrase.clone()") && !after.contains("passphrase.to_string()") && !after.contains("String::from(passphrase"), "{name} does not copy it into a String that is not wiped");
+    }
+    // The two that hand over to the restore flow give it the plain String, and the flow wraps it before it does anything else.
+    let desk = source_text(include_str!("desk.rs"));
+    for (name, next) in [("pub async fn inspect", "pub async fn stage"), ("pub async fn stage", "\u{0}")] {
+        let start = desk.find(name).unwrap();
+        let body = &desk[start..desk[start + 1..].find(next).map(|i| start + 1 + i).unwrap_or(desk.len())];
+        let wrapped = body.find("let passphrase = Zeroizing::new(passphrase);").unwrap_or_else(|| panic!("{name} wraps the passphrase it was given"));
+        assert!(body[..wrapped].lines().count() <= 2, "{name}: wrapped first thing");
+        let after = &body[wrapped..];
+        assert!(!after.contains("passphrase.clone()") && !after.contains("passphrase.to_string()") && !after.contains("String::from(passphrase"), "{name} does not copy it into a String that is not wiped");
+    }
+    for name in ["backup_restore_inspect", "backup_restore_stage"] {
+        let body = command_source(name);
+        assert!(body.contains("passphrase") && !body.contains("passphrase.clone()") && !body.contains("passphrase.to_string()"), "{name} passes the passphrase on as it is");
     }
 }
 
@@ -4279,4 +4302,183 @@ fn the_count_of_a_zips_entries_is_read_from_its_end_records() {
     assert!(container::peek_zip_directory(&out.0.join("junk.zip")).is_err());
     fs::write(out.0.join("tiny.zip"), b"PK").unwrap();
     assert!(container::peek_zip_directory(&out.0.join("tiny.zip")).is_err());
+}
+
+// ---- the restore flow: what it asks, and in which order, and what prepare is held to ----------------
+
+/// A window that answers as it is told, and remembers what it was asked.
+struct FakeHost {
+    data: std::path::PathBuf,
+    busy: Mutex<std::collections::VecDeque<Busy>>,
+    picks: Mutex<std::collections::VecDeque<Option<std::path::PathBuf>>>,
+    calls: Mutex<Vec<&'static str>>,
+    desk: super::desk::Desk,
+}
+
+impl FakeHost {
+    fn new(data: &Path, busy: Vec<Busy>, picks: Vec<Option<std::path::PathBuf>>) -> Self {
+        Self { data: data.to_path_buf(), busy: Mutex::new(busy.into()), picks: Mutex::new(picks.into()), calls: Mutex::new(Vec::new()), desk: super::desk::Desk::new() }
+    }
+
+    fn calls(&self) -> Vec<&'static str> {
+        self.calls.lock().unwrap().clone()
+    }
+}
+
+impl super::desk::Host for FakeHost {
+    fn busy(&self) -> impl std::future::Future<Output = Busy> + Send {
+        self.calls.lock().unwrap().push("busy");
+        let next = self.busy.lock().unwrap().pop_front().unwrap_or_else(Busy::none);
+        std::future::ready(next)
+    }
+
+    fn pick_open(&self) -> impl std::future::Future<Output = Option<std::path::PathBuf>> + Send {
+        self.calls.lock().unwrap().push("pick");
+        let next = self.picks.lock().unwrap().pop_front().flatten();
+        std::future::ready(next)
+    }
+
+    fn data_dir(&self) -> std::result::Result<std::path::PathBuf, String> {
+        Ok(self.data.clone())
+    }
+
+    fn desk(&self) -> &super::desk::Desk {
+        &self.desk
+    }
+}
+
+/// Something is in the way: a call.
+fn in_a_call() -> Busy {
+    Busy::none().and("call", "A call is live.")
+}
+
+/// A backup of two data items (a calendar and a change log), and its file.
+fn small_backup(dir: &Path, name: &str, note: &str) -> std::path::PathBuf {
+    let calendar = format!("{{\"appointments\":[],\"note\":\"{note}\"}}");
+    let files: Vec<(&str, &[u8])> = vec![("calendar/calendar.json", calendar.as_bytes()), ("control-log.jsonl", b"{\"tool\":\"x\"}\n")];
+    let file = dir.join(name);
+    craft(&file, &manifest_for(&files), &files, true);
+    file
+}
+
+#[tokio::test]
+async fn looking_at_a_backup_asks_what_is_in_the_way_before_the_dialog_and_again_after_it() {
+    use super::desk;
+    let out = TempDir::new("desk-order");
+    let file = small_backup(&out.0, "a.oaiybackup", "one");
+    let data = TempDir::new("desk-order-data");
+
+    // Busy before the dialog: it is never opened.
+    let host = FakeHost::new(&data.0, vec![in_a_call()], vec![Some(file.clone())]);
+    let err = desk::inspect(&host, PASS.to_string()).await.err().expect("refused");
+    assert!(err.contains("A call is live"), "{err}");
+    assert_eq!(host.calls(), ["busy"], "the dialog was not opened for a person who could not go on");
+
+    // Quiet when it opened, busy when it closed: refused, and nothing is kept.
+    let host = FakeHost::new(&data.0, vec![Busy::none(), in_a_call()], vec![Some(file.clone())]);
+    let err = desk::inspect(&host, PASS.to_string()).await.err().expect("refused after the dialog");
+    assert!(err.contains("A call is live"), "{err}");
+    assert_eq!(host.calls(), ["busy", "pick", "busy"], "asked again once the file was chosen");
+    assert!(!host.desk.remembers(), "a look that was refused is not remembered");
+    assert_nothing_staged(&data.0);
+
+    // The dialog is closed: nothing to look at.
+    let host = FakeHost::new(&data.0, vec![], vec![None]);
+    assert!(desk::inspect(&host, PASS.to_string()).await.unwrap().is_none());
+    assert_eq!(host.calls(), ["busy", "pick"]);
+    assert!(!host.desk.remembers());
+
+    // Quiet throughout: it is looked at and remembered.
+    let host = FakeHost::new(&data.0, vec![], vec![Some(file.clone())]);
+    let seen = desk::inspect(&host, PASS.to_string()).await.unwrap().expect("a look");
+    assert_eq!(host.calls(), ["busy", "pick", "busy"]);
+    assert!(host.desk.remembers() && !seen.inspect_id.is_empty());
+    assert!(seen.preview.categories.iter().any(|c| c.id == "calendar"));
+
+    // No passphrase: not even asked.
+    let host = FakeHost::new(&data.0, vec![], vec![Some(file)]);
+    assert!(desk::inspect(&host, String::new()).await.is_err());
+    assert!(host.calls().is_empty());
+}
+
+#[tokio::test]
+async fn preparing_a_restore_is_held_to_the_backup_that_was_looked_at() {
+    use super::desk;
+    let out = TempDir::new("desk-bind");
+    let data = TempDir::new("desk-bind-data");
+    let file = small_backup(&out.0, "a.oaiybackup", "one");
+    let host = FakeHost::new(&data.0, vec![], vec![Some(file.clone())]);
+    let seen = desk::inspect(&host, PASS.to_string()).await.unwrap().unwrap();
+
+    // Not a look that was made, and not one of another passphrase's file.
+    let err = desk::stage(&host, "0000000000000000".to_string(), PASS.to_string(), vec![], false).await.err().unwrap();
+    assert!(err.contains("Choose the backup file again"), "{err}");
+    assert_nothing_staged(&data.0);
+
+    // The file is swapped for another backup of the same size, and its modified time is put back: the two things the
+    // old check looked at are the same, and the contents are not.
+    let original = fs::metadata(&file).unwrap();
+    // (Another backup of the very same size: the compressed size moves by a byte or two with what is in it, so look for one.)
+    let other = (0..400)
+        .map(|i| small_backup(&out.0, "b.oaiybackup", &format!("{i:03}")))
+        .find(|f| fs::metadata(f).unwrap().len() == original.len())
+        .expect("a backup of the same size is found");
+    fs::copy(&other, &file).unwrap();
+    let handle = fs::OpenOptions::new().write(true).open(&file).unwrap();
+    handle.set_modified(original.modified().unwrap()).unwrap();
+    drop(handle);
+    let now = fs::metadata(&file).unwrap();
+    assert_eq!((now.len(), now.modified().unwrap()), (original.len(), original.modified().unwrap()), "size and time are the ones it had");
+    let err = desk::stage(&host, seen.inspect_id.clone(), PASS.to_string(), vec![], false).await.err().expect("refused");
+    assert!(err.contains("not the backup that was checked"), "{err}");
+    assert_nothing_staged(&data.0);
+    assert!(!host.desk.remembers(), "it has to be looked at again");
+    let err = desk::stage(&host, seen.inspect_id, PASS.to_string(), vec![], false).await.err().unwrap();
+    assert!(err.contains("Choose the backup file again"), "{err}");
+
+    // The file that was looked at is prepared, and the look is used up.
+    let file = small_backup(&out.0, "c.oaiybackup", "three");
+    let host = FakeHost::new(&data.0, vec![], vec![Some(file)]);
+    let seen = desk::inspect(&host, PASS.to_string()).await.unwrap().unwrap();
+    let staged = desk::stage(&host, seen.inspect_id.clone(), PASS.to_string(), vec![], false).await.unwrap();
+    assert_eq!(staged.files, 2);
+    assert!(!host.desk.remembers());
+    assert!(desk::stage(&host, seen.inspect_id, PASS.to_string(), vec![], false).await.is_err(), "a look prepares once");
+}
+
+#[test]
+fn preparing_brings_back_only_what_the_look_listed() {
+    let out = TempDir::new("listed");
+    let files: Vec<(&str, &[u8])> = vec![("calendar/calendar.json", b"{\"appointments\":[]}"), ("templates/t.json", br#"{"id":"t","name":"T","run":{"command":"x"}}"#)];
+    let file = out.0.join("l.oaiybackup");
+    craft(&file, &manifest_for(&files), &files, true);
+    let dst = TempDir::new("listed-dst");
+    let (_, seen) = restore::inspect_bound(&dst.0, &file, PASS, &options()).unwrap();
+    assert!(seen.restorable.contains("templates/t.json") && seen.restorable.contains("calendar/calendar.json"));
+    // What the look listed is prepared.
+    let ok = restore::stage_checked(&dst.0, &file, PASS, &Ticks::all(), &options(), &seen).unwrap();
+    assert_eq!(ok.files, 2);
+    restore::discard_pending(&dst.0).unwrap();
+    // An item the look did not list is not prepared, whatever is ticked.
+    let mut narrower = seen.clone();
+    narrower.restorable.remove("templates/t.json");
+    let err = restore::stage_checked(&dst.0, &file, PASS, &Ticks::all(), &options(), &narrower).unwrap_err();
+    assert_eq!(err.kind, ErrorKind::Unsafe, "{err}");
+    assert!(err.message.contains("templates/t.json") && err.message.contains("not listed"), "{err}");
+    assert_nothing_staged(&dst.0);
+    // But one that is not ticked is not asked about: it is not going to be brought back.
+    assert!(restore::stage_checked(&dst.0, &file, PASS, &Ticks::none(), &options(), &narrower).is_ok());
+}
+
+#[test]
+fn the_dashboards_commands_prepare_a_restore_only_through_the_check_that_binds_it_to_what_was_looked_at() {
+    let commands = source_text(include_str!("commands.rs"));
+    let desk = source_text(include_str!("desk.rs"));
+    assert!(!commands.contains("restore::stage(") && !commands.contains("restore::inspect("), "commands.rs goes through the restore flow (desk.rs), which holds prepare to the look");
+    assert!(desk.contains("restore::stage_checked(") && !desk.contains("restore::stage("), "the flow prepares only with the look it made");
+    assert!(desk.contains("restore::inspect_bound("));
+    // The dialog is asked about twice: once before it and once after.
+    let inspect = &desk[desk.find("pub async fn inspect").unwrap()..desk.find("pub async fn stage").unwrap()];
+    assert_eq!(inspect.matches("host.busy().await").count(), 2, "{inspect}");
+    assert!(inspect.find("host.busy().await").unwrap() < inspect.find("host.pick_open().await").unwrap());
 }

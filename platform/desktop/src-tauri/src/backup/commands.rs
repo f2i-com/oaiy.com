@@ -7,18 +7,15 @@
 //! path. The passphrase comes only as an argument, is used and dropped, and is never logged.
 
 use std::path::{Path, PathBuf};
-use std::sync::Mutex;
-use std::time::SystemTime;
 
-use serde::Serialize;
 use tauri::{AppHandle, Manager, Runtime, Webview};
 use zeroize::Zeroizing;
 
 use super::agent::AgentExport;
 use super::busy::Busy;
 use super::create::{create, CreateOptions, CreateResult};
-use super::restore::{self, Preview, RestoreOptions, Staged};
-use super::review::Ticks;
+use super::desk::{self, Desk, Host, InspectOut};
+use super::restore::{self, RestoreOptions, Staged};
 use super::EXTENSION;
 use crate::services::registry::RegistryHandle;
 use crate::update::UpdaterHandle;
@@ -86,14 +83,30 @@ async fn pick_open<R: Runtime>(app: &AppHandle<R>) -> Option<PathBuf> {
     rx.await.ok().flatten().and_then(|p| p.as_path().map(Path::to_path_buf))
 }
 
-/// Wait for a check or a staging that runs on its own thread, for a little longer than it is itself
-/// allowed to run: it stops itself at its deadline, and this is the backstop that lets the panel go
-/// on if a thread is stuck somewhere it cannot look at the clock.
-async fn with_time_limit<T: Send + 'static>(work: tokio::task::JoinHandle<super::Result<T>>) -> super::Result<T> {
-    match tokio::time::timeout(super::RESTORE_TIME_LIMIT + std::time::Duration::from_secs(30), work).await {
-        Ok(Ok(result)) => result,
-        Ok(Err(_)) => Err(super::BackupError::new(super::ErrorKind::Io, "That stopped unexpectedly.")),
-        Err(_) => Err(super::BackupError::new(super::ErrorKind::Timeout, "That took too long, so it was stopped. Try again.")),
+/// The dashboard's own window, as the restore flow (`desk`) sees it: the updater's answer to "what is in the way", the
+/// native open dialog, and where the data folder is.
+struct DashboardHost<R: Runtime> {
+    app: AppHandle<R>,
+}
+
+/// The backup that was looked at last (one, for the one dashboard).
+static DESK: Desk = Desk::new();
+
+impl<R: Runtime> Host for DashboardHost<R> {
+    fn busy(&self) -> impl std::future::Future<Output = Busy> + Send {
+        look_busy(&self.app)
+    }
+
+    fn pick_open(&self) -> impl std::future::Future<Output = Option<PathBuf>> + Send {
+        pick_open(&self.app)
+    }
+
+    fn data_dir(&self) -> Result<PathBuf, String> {
+        data_dir_of(&self.app)
+    }
+
+    fn desk(&self) -> &Desk {
+        &DESK
     }
 }
 
@@ -124,75 +137,20 @@ pub async fn backup_create<R: Runtime>(app: AppHandle<R>, webview: Webview<R>, p
     made.map(Some).map_err(|e| e.message)
 }
 
-/// The file chosen in the last "check this backup", so staging can use it without any page giving a path.
-struct Inspected {
-    id: String,
-    path: PathBuf,
-    len: u64,
-    modified: Option<SystemTime>,
-}
-
-static INSPECTED: Mutex<Option<Inspected>> = Mutex::new(None);
-
-/// What the dashboard is told after it chose a file to restore from.
-#[derive(Serialize)]
-#[serde(rename_all = "camelCase")]
-pub struct InspectOut {
-    inspect_id: String,
-    #[serde(flatten)]
-    preview: Preview,
-}
-
 /// Restore, step 1: asks for the backup file, decrypts and checks it, and says what restoring would do.
-/// Changes nothing.
+/// Changes nothing. (The order of it, and what it remembers for step 2, is `desk::inspect`.)
 #[tauri::command]
 pub async fn backup_restore_inspect<R: Runtime>(app: AppHandle<R>, webview: Webview<R>, passphrase: String) -> Result<Option<InspectOut>, String> {
     dashboard(&webview)?;
-    let passphrase = Zeroizing::new(passphrase);
-    if passphrase.is_empty() {
-        return Err("Type the passphrase the backup was made with.".to_string());
-    }
-    let data_dir = data_dir_of(&app)?;
-    // Checking a backup takes a second of computing and up to a gigabyte of memory: not while a call is live.
-    let options = RestoreOptions { busy: look_busy(&app).await, ..RestoreOptions::default() };
-    options.busy.refuse_if_busy("checking a backup").map_err(|e| e.message)?;
-    let Some(path) = pick_open(&app).await else { return Ok(None) };
-    let meta = std::fs::metadata(&path).map_err(|_| "That file could not be read.".to_string())?;
-    let (len, modified) = (meta.len(), meta.modified().ok());
-    let file = path.clone();
-    let options = RestoreOptions { busy: look_busy(&app).await, ..options };
-    let preview = with_time_limit(tokio::task::spawn_blocking(move || restore::inspect(&data_dir, &file, &passphrase, &options)))
-        .await
-        .map_err(|e| e.message)?;
-    let id = super::random_id();
-    *INSPECTED.lock().unwrap_or_else(|e| e.into_inner()) = Some(Inspected { id: id.clone(), path, len, modified });
-    Ok(Some(InspectOut { inspect_id: id, preview }))
+    desk::inspect(&DashboardHost { app }, passphrase).await
 }
 
 /// Restore, step 2: unpack the backup that was just checked into the staging folder and note that it
-/// is to be applied at the next start. Nothing live changes.
+/// is to be applied at the next start. Nothing live changes. (Held to what was checked: `desk::stage`.)
 #[tauri::command]
 pub async fn backup_restore_stage<R: Runtime>(app: AppHandle<R>, webview: Webview<R>, inspect_id: String, passphrase: String, classes: Vec<String>, keys: bool) -> Result<Staged, String> {
     dashboard(&webview)?;
-    let passphrase = Zeroizing::new(passphrase);
-    // What the person ticked: nothing that can run or reconfigure comes back without it.
-    let ticks = Ticks::from_ids(&classes, keys).map_err(|e| e.message)?;
-    let data_dir = data_dir_of(&app)?;
-    let path = {
-        let guard = INSPECTED.lock().unwrap_or_else(|e| e.into_inner());
-        let inspected = guard.as_ref().filter(|i| i.id == inspect_id).ok_or("Choose the backup file again.".to_string())?;
-        let now = std::fs::metadata(&inspected.path).map_err(|_| "The backup file is no longer there.".to_string())?;
-        if now.len() != inspected.len || now.modified().ok() != inspected.modified {
-            return Err("The backup file has changed since it was checked. Choose it again.".to_string());
-        }
-        inspected.path.clone()
-    };
-    let options = RestoreOptions { busy: look_busy(&app).await, ..RestoreOptions::default() };
-    let staged = with_time_limit(tokio::task::spawn_blocking(move || restore::stage(&data_dir, &path, &passphrase, &ticks, &options)))
-        .await
-        .map_err(|e| e.message)?;
-    *INSPECTED.lock().unwrap_or_else(|e| e.into_inner()) = None;
-    Ok(staged)
+    desk::stage(&DashboardHost { app }, inspect_id, passphrase, classes, keys).await
 }
 
 /// Stage "Undo the last restore": what the last restore replaced is put back at the next start.

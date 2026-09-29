@@ -22,7 +22,7 @@
 //! same three steps. A restore never touches anything a backup does not hold, and never a
 //! credential: those are not in a backup, and a file that says otherwise is refused.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeSet, HashMap, HashSet};
 use std::io::Write;
 use std::path::{Path, PathBuf};
 
@@ -587,14 +587,35 @@ fn preview_of(data_dir: &Path, verified: &container::Verified, scratch: &Path, f
     })
 }
 
+/// What a look at a backup found, kept to hold the restore that follows to it: the SHA-256 of the decrypted
+/// backup, and the names of the items the look listed as able to come back. A restore prepared from it is
+/// of the backup that was looked at, byte for byte, and brings back nothing the look did not list.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Inspection {
+    pub plain_sha256: String,
+    /// The entries the look said could come back (data, and what needs a tick), by their names in the backup.
+    pub restorable: BTreeSet<String>,
+}
+
+fn restorable_names(manifest: &Manifest) -> BTreeSet<String> {
+    manifest.entries.iter().filter(|e| matches!(rules::standing_of_backup_entry(&e.name), Ok(Some(_)))).map(|e| e.name.clone()).collect()
+}
+
 /// Step 1: decrypt and check the backup, and say what restoring would do. Changes nothing.
 pub fn inspect(data_dir: &Path, file: &Path, passphrase: &str, opts: &RestoreOptions) -> Result<Preview> {
+    inspect_bound(data_dir, file, passphrase, opts).map(|(preview, _)| preview)
+}
+
+/// Step 1, with what is needed to hold step 2 to it (see [`Inspection`]).
+pub fn inspect_bound(data_dir: &Path, file: &Path, passphrase: &str, opts: &RestoreOptions) -> Result<(Preview, Inspection)> {
     opts.busy.refuse_if_busy("checking a backup")?;
     let scratch = TempFolder::new(&scratch_dir(data_dir))?;
     let budget = opts.budget();
     let verified = container::open_backup(file, passphrase, &scratch.0, &opts.limits, &budget)?;
     let name = file.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
-    preview_of(data_dir, &verified, &scratch.0, &name, &budget)
+    let preview = preview_of(data_dir, &verified, &scratch.0, &name, &budget)?;
+    let inspection = Inspection { plain_sha256: verified.plain_sha256.clone(), restorable: restorable_names(&verified.manifest) };
+    Ok((preview, inspection))
 }
 
 // ---- staging ---------------------------------------------------------------------------------------
@@ -603,10 +624,26 @@ pub fn inspect(data_dir: &Path, file: &Path, passphrase: &str, opts: &RestoreOpt
 /// is changed. Data comes back as it is; a class that can run things or change settings comes back
 /// only if `ticks` has it (see [`review`]).
 pub fn stage(data_dir: &Path, file: &Path, passphrase: &str, ticks: &Ticks, opts: &RestoreOptions) -> Result<Staged> {
+    stage_inner(data_dir, file, passphrase, ticks, opts, None)
+}
+
+/// Step 2 for the restore of a backup that was looked at: the file is decrypted again, and it must be the
+/// backup that was looked at, byte for byte (its decrypted contents have the hash the look recorded), and
+/// nothing is brought back that the look did not list. What the person saw is what is prepared.
+pub fn stage_checked(data_dir: &Path, file: &Path, passphrase: &str, ticks: &Ticks, opts: &RestoreOptions, looked_at: &Inspection) -> Result<Staged> {
+    stage_inner(data_dir, file, passphrase, ticks, opts, Some(looked_at))
+}
+
+fn stage_inner(data_dir: &Path, file: &Path, passphrase: &str, ticks: &Ticks, opts: &RestoreOptions, looked_at: Option<&Inspection>) -> Result<Staged> {
     opts.busy.refuse_if_busy("preparing a restore")?;
     let budget = opts.budget();
     let scratch = TempFolder::new(&scratch_dir(data_dir))?;
     let verified = container::open_backup(file, passphrase, &scratch.0, &opts.limits, &budget)?;
+    if let Some(seen) = looked_at {
+        if verified.plain_sha256 != seen.plain_sha256 {
+            return Err(BackupError::new(ErrorKind::Conflict, "This is not the backup that was checked: the file has changed since. Choose it again and look at what it holds."));
+        }
+    }
     let manifest = &verified.manifest;
     let mut skipped: Vec<String> = Vec::new();
     // What is brought back: data, and the classes that were ticked (and the Agent's storage, if it is small enough for its page).
@@ -638,6 +675,11 @@ pub fn stage(data_dir: &Path, file: &Path, passphrase: &str, ticks: &Ticks, opts
     for class in RestoreClass::ALL {
         if let Some(n) = left_out.get(&class) {
             skipped.push(format!("Not brought back (not ticked): {} ({n} file{}).", class.label(), if *n == 1 { "" } else { "s" }));
+        }
+    }
+    if let Some(seen) = looked_at {
+        if let Some(unlisted) = selected.iter().find(|e| !seen.restorable.contains(&e.name)) {
+            return Err(BackupError::new(ErrorKind::Unsafe, format!("\"{}\" was not listed when the backup was checked, so nothing was prepared.", review::clip(&unlisted.name, 120))));
         }
     }
     let total: u64 = selected.iter().map(|e| e.size).sum();
