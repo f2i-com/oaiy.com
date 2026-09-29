@@ -67,29 +67,64 @@ pub const AGENT_ENTRY: &str = "agent/agent-storage.zip";
 
 /// What a backup may hold and what a restore accepts, so a damaged or hostile file cannot make
 /// this read or write without bound.
+///
+/// The numbers are what a real backup never reaches, with room to spare, not what a computer could
+/// hold: a hostile file that asks for more is refused from its record, before any of it is read.
+/// A real data folder (leaving out models, programs and logs) is a few hundred files: contacts, the
+/// calendar, flows, templates, a few voices, a plugin's settings and the Agent's storage in one
+/// archive. Its largest single things are the Agent's storage (the Agent's own export stops at
+/// 512 MiB and never adds a file over 64 MiB), a voice sample (tens of megabytes) and the calendar
+/// or the contacts (megabytes of JSON).
 #[derive(Clone, Debug)]
 pub struct Limits {
-    /// Entries in the ZIP, the manifest included.
+    /// Entries in the ZIP, the manifest included: 20,000, about 40 times what a real backup holds.
     pub max_entries: usize,
-    /// One entry's size, uncompressed.
+    /// One entry's size, uncompressed: 1 GiB, more than the largest thing a backup holds (below).
     pub max_entry_bytes: u64,
-    /// All entries together, uncompressed.
+    /// All entries together, uncompressed: 4 GiB.
     pub max_total_bytes: u64,
     /// The length of one entry name.
     pub max_name_len: usize,
-    /// The manifest's size.
+    /// The manifest's size: 16 MiB, about 600 bytes for each of 20,000 entries and more.
     pub max_manifest_bytes: u64,
+    /// One JSON or text item (contacts, the calendar, a flow, the settings): 16 MiB. The calendar of a
+    /// business over many years is a few megabytes; a file that is larger is not a calendar.
+    pub max_json_bytes: u64,
+    /// One voice item: 128 MiB.
+    pub max_voice_bytes: u64,
+    /// The Agent's storage archive: 640 MiB (its own export stops at 512 MiB and never adds a file over
+    /// 64 MiB, so 576 MiB at most, and a margin for the archive's own records).
+    pub max_agent_bytes: u64,
 }
 
 impl Default for Limits {
     fn default() -> Self {
         Self {
-            max_entries: 200_000,
-            max_entry_bytes: 4 << 30,
-            max_total_bytes: 64 << 30,
+            max_entries: 20_000,
+            max_entry_bytes: 1 << 30,
+            max_total_bytes: 4 << 30,
             max_name_len: 512,
-            max_manifest_bytes: 64 << 20,
+            max_manifest_bytes: 16 << 20,
+            max_json_bytes: 16 << 20,
+            max_voice_bytes: 128 << 20,
+            max_agent_bytes: 640 << 20,
         }
+    }
+}
+
+impl Limits {
+    /// The most one item of this name may be: what kind of thing it is decides, and no item is more than
+    /// [`Limits::max_entry_bytes`]. (A name the table does not know is held to the least: it is only ever
+    /// read to be checked, never brought back.)
+    pub fn entry_cap(&self, name: &str) -> u64 {
+        let by_kind = if name == AGENT_ENTRY {
+            self.max_agent_bytes
+        } else if name.to_lowercase().starts_with("voices/") {
+            self.max_voice_bytes
+        } else {
+            self.max_json_bytes
+        };
+        by_kind.min(self.max_entry_bytes)
     }
 }
 
@@ -282,6 +317,8 @@ pub fn check_passphrase(passphrase: &str) -> Result<()> {
     Ok(())
 }
 
+#[cfg(test)]
+mod peak;
 #[cfg(test)]
 mod table_tests;
 #[cfg(test)]

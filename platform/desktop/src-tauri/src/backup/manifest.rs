@@ -94,7 +94,8 @@ impl Manifest {
             if entry.sha256.len() != 64 || !entry.sha256.bytes().all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b)) {
                 return Err(BackupError::new(ErrorKind::Damaged, "This backup's record is damaged."));
             }
-            if entry.size > limits.max_entry_bytes {
+            // What kind of thing it is decides how large it may be: a calendar of 512 MiB is not a calendar.
+            if entry.size > limits.entry_cap(&entry.name) {
                 return Err(BackupError::new(ErrorKind::TooLarge, "An item in this backup is larger than OAIY will restore."));
             }
             total = total.saturating_add(entry.size);

@@ -421,8 +421,14 @@ fn redo_of(manifest: &Manifest) -> Vec<String> {
     manifest.excluded.iter().filter_map(|e| e.redo.clone()).filter(|r| seen.insert(r.clone())).collect()
 }
 
-/// The most of an item's own file that is read to describe it.
+/// The most of an item's own file that is read to describe it: 2 MiB. A flow, a template, a trigger list or a
+/// settings file is a few kilobytes; one that is larger is listed as too large to look at, and is not brought back.
 const MAX_REVIEW_BYTES: u64 = 2 << 20;
+
+/// The most that is read altogether to describe everything in a backup: 128 MiB, where a real backup's flows,
+/// templates, triggers and settings add up to a few megabytes. A backup that would take more to look through is
+/// refused whole, so that looking at a hostile file costs a bounded amount of time and memory.
+const MAX_REVIEW_TOTAL: u64 = 128 << 20;
 
 /// The most items the dry run names as not restored (the rest are counted).
 const MAX_NOT_RESTORED: usize = 300;
@@ -486,9 +492,22 @@ fn preview_of(data_dir: &Path, verified: &container::Verified, scratch: &Path, f
     // ---- everything that can act, by name and by what it does ----
     let mut archive = container::open_archive(&verified.plain)?;
     let here = Local::read(data_dir);
+    // Each item is described the moment it is read and then let go: what is held at any moment is one item, however
+    // many there are. (The service templates are read first for their ids alone, so that a service that starts with
+    // OAIY can be said to have its template in this backup.) What is read altogether is bounded too.
+    let mut read_total = 0u64;
     let mut backup_templates: HashSet<String> = HashSet::new();
-    let mut read: Vec<(RestoreClass, &str, Option<Vec<u8>>, Option<&'static str>)> = Vec::new();
+    for entry in manifest.entries.iter().filter(|e| e.name.to_lowercase().starts_with("templates/")) {
+        budget.check()?;
+        if let Some(bytes) = container::read_entry(&mut archive, &entry.name, MAX_REVIEW_BYTES)? {
+            read_total += bytes.len() as u64;
+            if let Some(id) = serde_json::from_slice::<serde_json::Value>(&bytes).ok().and_then(|v| v.get("id").and_then(|i| i.as_str().map(str::to_string))) {
+                backup_templates.insert(id);
+            }
+        }
+    }
     let mut items: Vec<ReviewItem> = Vec::new();
+    let too_much = || BackupError::new(ErrorKind::TooLarge, "This backup holds more things that can run or reconfigure OAIY than can be looked through, so it is refused.");
     for entry in &manifest.entries {
         budget.check()?;
         let Ok(Some(standing)) = rules::standing_of_backup_entry(&entry.name) else { continue };
@@ -496,28 +515,24 @@ fn preview_of(data_dir: &Path, verified: &container::Verified, scratch: &Path, f
         if standing.category == Category::Voices {
             // A voice is an audio file: it is listed by name and size, and never read.
             items.push(review::describe_voice(class, &entry.name, entry.size));
-            continue;
-        }
-        let bytes = container::read_entry(&mut archive, &entry.name, MAX_REVIEW_BYTES)?;
-        if entry.name.starts_with("templates/") {
-            if let Some(id) = bytes.as_ref().and_then(|b| serde_json::from_slice::<serde_json::Value>(b).ok()).and_then(|v| v.get("id").and_then(|i| i.as_str().map(str::to_string))) {
-                backup_templates.insert(id);
-            }
-        }
-        read.push((class, entry.name.as_str(), bytes, standing.keys()));
-    }
-    for (class, name, bytes, keys) in &read {
-        match bytes {
-            Some(bytes) => {
-                items.extend(review::describe(*class, name, bytes, &here, &backup_templates));
-                if let Some(keys) = keys {
-                    not_restored.extend(review::keys_not_restored(name, keys, bytes));
+        } else {
+            let bytes = container::read_entry(&mut archive, &entry.name, MAX_REVIEW_BYTES)?;
+            match &bytes {
+                Some(bytes) => {
+                    read_total += bytes.len() as u64;
+                    if read_total > MAX_REVIEW_TOTAL {
+                        return Err(too_much());
+                    }
+                    items.extend(review::describe(class, &entry.name, bytes, &here, &backup_templates));
+                    if let Some(keys) = standing.keys() {
+                        not_restored.extend(review::keys_not_restored(&entry.name, keys, bytes));
+                    }
                 }
+                None => items.push(ReviewItem { class, name: entry.name.clone(), title: review::clip(entry.name.rsplit('/').next().unwrap_or(&entry.name), 120), what: review::TOO_LARGE.to_string() }),
             }
-            None => items.push(ReviewItem { class: *class, name: (*name).to_string(), title: review::clip(name.rsplit('/').next().unwrap_or(name), 120), what: review::TOO_LARGE.to_string() }),
         }
         if items.len() > review::MAX_REVIEW_ITEMS {
-            return Err(BackupError::new(ErrorKind::TooLarge, "This backup holds more things that can run or reconfigure OAIY than can be looked through, so it is refused."));
+            return Err(too_much());
         }
     }
     let more = unknown_more + not_restored.len().saturating_sub(MAX_NOT_RESTORED);
@@ -722,10 +737,18 @@ pub fn stage(data_dir: &Path, file: &Path, passphrase: &str, ticks: &Ticks, opts
 /// keeps only runs that finished, and the autostart list keeps only services that have a template
 /// here or in this restore. A file that cannot be cleaned is not brought back. Returns the names that
 /// remain and what was said about the rest.
-fn clean_staged(data_dir: &Path, files_root: &Path, names: &[String], ticks: &Ticks, limits: &Limits) -> Result<(Vec<String>, Vec<String>)> {
+pub(crate) fn clean_staged(data_dir: &Path, files_root: &Path, names: &[String], ticks: &Ticks, limits: &Limits) -> Result<(Vec<String>, Vec<String>)> {
     let mut kept = Vec::new();
     let mut notes = Vec::new();
-    let read = |path: &Path| std::fs::read(path).map_err(|e| e.to_string());
+    // A staged file is measured before it is read: what a backup declares is checked when it is read, but a file
+    // is only ever read whole when it is no larger than the most a file of its kind may be.
+    let read = |path: &Path| {
+        let len = std::fs::metadata(path).map_err(|e| e.to_string())?.len();
+        if len > limits.max_json_bytes {
+            return Err("it is too large to be read".to_string());
+        }
+        std::fs::read(path).map_err(|e| e.to_string())
+    };
     for name in names {
         let path = container::safe_join(files_root, name, limits)?;
         let category = rules::category_of_backup_entry(name).ok().flatten().map(|(c, _)| c);
@@ -735,7 +758,12 @@ fn clean_staged(data_dir: &Path, files_root: &Path, names: &[String], ticks: &Ti
             // whose tick was ticked) is put into the file this computer has, and everything else stays as it is here.
             (Some(_), _) if rules::keys_of(name).is_some() => {
                 let keys_name = rules::keys_of(name).unwrap_or_default();
-                let local = std::fs::read(data_dir.join(native(name))).ok().and_then(|b| serde_json::from_slice::<serde_json::Value>(b.strip_prefix(&[0xef, 0xbb, 0xbf][..]).unwrap_or(&b)).ok());
+                let here = data_dir.join(native(name));
+                let local = std::fs::metadata(&here)
+                    .ok()
+                    .filter(|m| m.len() <= limits.max_json_bytes)
+                    .and_then(|_| std::fs::read(&here).ok())
+                    .and_then(|b| serde_json::from_slice::<serde_json::Value>(b.strip_prefix(&[0xef, 0xbb, 0xbf][..]).unwrap_or(&b)).ok());
                 Some(read(&path).and_then(|b| {
                     let staged: serde_json::Value = serde_json::from_slice(b.strip_prefix(&[0xef, 0xbb, 0xbf][..]).unwrap_or(&b)).map_err(|_| "it is not valid JSON".to_string())?;
                     let table = super::table::table().key_table(keys_name).ok_or_else(|| "OAIY does not know how to read it".to_string())?;

@@ -204,7 +204,8 @@ fn run(opts: &CreateOptions<'_>) -> Result<CreateResult> {
     let mut skipped_large = 0usize;
     let mut extra_excluded: Vec<Excluded> = Vec::new();
     for (n, item) in plan.items.iter().enumerate() {
-        if item.size > opts.limits.max_entry_bytes {
+        // A file too large for a restore to take is left out and said so, never made into a backup that is refused.
+        if item.size > opts.limits.entry_cap(&item.rel) {
             skipped_large += 1;
             continue;
         }
@@ -247,7 +248,7 @@ fn run(opts: &CreateOptions<'_>) -> Result<CreateResult> {
             match agent::collect(exporter, &zip, opts.include_keys, &opts.agent_wait) {
                 Ok(got) => {
                     let (sha256, size) = super::sha256_file(&zip).map_err(|e| BackupError::io("Could not read the Agent's storage", &e))?;
-                    if size > opts.limits.max_entry_bytes || total_bytes.saturating_add(size) > opts.limits.max_total_bytes {
+                    if size > opts.limits.entry_cap(AGENT_ENTRY) || total_bytes.saturating_add(size) > opts.limits.max_total_bytes {
                         partial.push(MISSING_WARNING.to_string());
                     } else {
                         total_bytes += size;

@@ -395,7 +395,7 @@ A restore is never done in place. It has three steps, and the first two change n
 2. **Prepare.** Tick what you want beyond your data, then **Prepare restore**. OAIY unpacks the backup into
    `<data>/restore/pending-<id>/` (after checking the free space and every name: nothing may leave
    its folder, name a drive, appear twice, be a credential or an NTFS short-name alias such as
-   `PAIRIN~1.JSO`, or pass the limits of 200,000 items and the size caps) and writes a marker.
+   `PAIRIN~1.JSO`, or pass the limits of 20,000 items and the size caps below) and writes a marker.
    Still nothing you use is changed. You can **Cancel restore** here. **A prepared restore that
    is not applied within 24 hours is thrown away at the next start**, unapplied, and the result
    says so: what it would replace may have changed, and you may no longer remember choosing it.
@@ -568,6 +568,17 @@ in parts through internal routes with a secret made for that one backup.
   a second on this computer, but never below 2^18 (256 MiB) and never above 2^20 (1 GiB): a
   backup made on a busy computer is not a weak one. Checking and preparing a restore have a
   15-minute limit and the panel goes on after it; a check is refused while OAIY is busy.
+- **What a file may ask is bounded from its own record, before any of it is read.** At most 20,000
+  items (a real backup has a few hundred), a record of 16 MiB, one JSON or text item of 16 MiB (a
+  calendar is a few megabytes; one of 512 MiB is not a calendar), a voice of 128 MiB, the Agent's
+  storage of 640 MiB (its own export stops at 512 MiB and never adds a file over 64 MiB), and 4 GiB
+  in all. The number of items a ZIP claims is read from its end record before its list of items is
+  parsed, and each item is found by its name in one step. The dry run looks at one item at a time
+  and lets it go before the next, and reads at most 128 MiB altogether (a real backup's flows,
+  templates, triggers and settings add up to a few megabytes): a backup that would take more to
+  look through is refused whole. A staged file is measured before it is read to be cleaned. Making
+  a backup leaves out a file too large for these limits and says so, so a backup OAIY makes is one
+  it can restore.
 
 ## Known limits
 

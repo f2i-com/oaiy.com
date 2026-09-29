@@ -797,8 +797,8 @@ fn the_size_and_entry_caps_are_enforced_when_reading() {
         assert!(restore::stage(&dst.0, &file, PASS, &Ticks::all(), &o).is_err(), "{what}");
     }
     assert_nothing_staged(&dst.0);
-    // The defaults are the brief's: 200,000 entries.
-    assert_eq!(Limits::default().max_entries, 200_000);
+    // The defaults are what a real backup never reaches (see `Limits`): 20,000 entries.
+    assert_eq!(Limits::default().max_entries, 20_000);
 }
 
 #[test]
@@ -2696,7 +2696,7 @@ fn a_hostile_manifest_cannot_flood_the_panel_or_the_result_file() {
     let files: Vec<(&str, &[u8])> = vec![("callers.json", b"{}")];
     let mut manifest = manifest_for(&files);
     manifest.partial = (0..200).map(|i| format!("{i}: {}", "P".repeat(20_000))).collect();
-    manifest.excluded = (0..500).map(|i| rules::Excluded { pattern: format!("{i}{}", "x".repeat(2000)), reason: "R".repeat(20_000), redo: Some("D".repeat(20_000)) }).collect();
+    manifest.excluded = (0..500).map(|i| rules::Excluded { pattern: format!("{i}{}", "x".repeat(2000)), reason: "R".repeat(6_000), redo: Some("D".repeat(6_000)) }).collect();
     manifest.platform = "windows".into();
     let file = out.0.join("flood.oaiybackup");
     craft(&file, &manifest, &files, true);
@@ -3994,4 +3994,289 @@ fn every_row_of_the_table_lands_only_with_its_own_tick() {
     // Everything ticked: every sample lands.
     let all: std::collections::BTreeSet<String> = samples.iter().map(|(_, p, _)| p.to_string()).collect();
     assert_eq!(landed(&Ticks::all()), all);
+}
+
+// ---- a hostile file costs a bounded amount of memory and time ---------------------------------------
+
+/// What one entry of a hand-made backup is made of.
+#[derive(Clone, Copy)]
+enum Fill {
+    /// A JSON object with a long string in it.
+    Json,
+    /// Zero bytes.
+    Zeros,
+}
+
+/// Feed the bytes of an entry of `size` bytes to `sink`, a piece at a time (never all at once).
+fn fill_pieces(kind: Fill, size: u64, mut sink: impl FnMut(&[u8])) {
+    const PAD: usize = 1 << 16;
+    let pad = vec![b'a'; PAD];
+    let zeros = vec![0u8; PAD];
+    match kind {
+        Fill::Zeros => {
+            let mut left = size;
+            while left > 0 {
+                let n = left.min(PAD as u64) as usize;
+                sink(&zeros[..n]);
+                left -= n as u64;
+            }
+        }
+        Fill::Json => {
+            let head: &[u8] = b"{\"name\":\"x\",\"pad\":\"";
+            let tail: &[u8] = b"\"}";
+            if size < (head.len() + tail.len()) as u64 {
+                sink(b"{}");
+                return;
+            }
+            sink(head);
+            let mut left = size - (head.len() + tail.len()) as u64;
+            while left > 0 {
+                let n = left.min(PAD as u64) as usize;
+                sink(&pad[..n]);
+                left -= n as u64;
+            }
+            sink(tail);
+        }
+    }
+}
+
+/// Build an encrypted backup from entries that are made as they are written, so a test can have a file that
+/// declares a great deal without the test holding it: `(name, size, kind)`. The manifest is right about
+/// every size and every hash (it is a backup that passes its own record and is refused for what it asks).
+fn craft_streaming(dest: &Path, entries: &[(String, u64, Fill)]) -> Manifest {
+    let mut manifest_entries = Vec::with_capacity(entries.len());
+    for (name, size, kind) in entries {
+        let mut hasher = Sha256::new();
+        fill_pieces(*kind, *size, |piece| hasher.update(piece));
+        manifest_entries.push(Entry { name: name.clone(), size: *size, sha256: hex(&hasher.finalize()) });
+    }
+    let manifest = Manifest {
+        v: 1,
+        created_at: "2026-09-30T01:02:03Z".into(),
+        app: AppInfo { name: "oaiy".into(), version: "0.1.0".into() },
+        platform: "windows".into(),
+        entries: manifest_entries,
+        excluded: Vec::new(),
+        counts: Counts::default(),
+        includes_keys: false,
+        partial: Vec::new(),
+    };
+    let zip_path = dest.with_extension("zip");
+    {
+        let mut writer = zip::ZipWriter::new(std::io::BufWriter::new(File::create(&zip_path).unwrap()));
+        let fast = zip::write::SimpleFileOptions::default().compression_method(zip::CompressionMethod::Deflated).compression_level(Some(1));
+        writer.start_file("manifest.json", fast).unwrap();
+        writer.write_all(&manifest.to_json()).unwrap();
+        for (name, size, kind) in entries {
+            writer.start_file(name.as_str(), fast.large_file(*size >= u32::MAX as u64 - 1)).unwrap();
+            fill_pieces(*kind, *size, |piece| writer.write_all(piece).unwrap());
+        }
+        writer.finish().unwrap();
+    }
+    let _ = fs::remove_file(dest);
+    container::encrypt_file(&zip_path, dest, PASS, Cost::Fixed(8)).unwrap();
+    let _ = fs::remove_file(&zip_path);
+    manifest
+}
+
+const MIB: usize = 1 << 20;
+
+/// The reviewer's first hostile file: a small file whose flows each declare 2 MiB (here 100 of them, a
+/// sixth of what the review used, which is all it takes to see the difference). The dry run used to keep the
+/// bytes of every one until it had read them all: 2,400 MiB of peak memory for 600 of them.
+#[test]
+fn a_backup_of_many_large_flows_is_refused_without_holding_them_all() {
+    let out = TempDir::new("bomb-flows");
+    let entries: Vec<(String, u64, Fill)> = (0..100).map(|i| (format!("flows/f{i:04}.json"), (2 * MIB - 64) as u64, Fill::Json)).collect();
+    let file = out.0.join("flows.oaiybackup");
+    craft_streaming(&file, &entries);
+    let dst = TempDir::new("bomb-flows-dst");
+    let (result, peak, took) = peak::measured(|| restore::inspect(&dst.0, &file, PASS, &options()));
+    let err = result.unwrap_err();
+    assert_eq!(err.kind, ErrorKind::TooLarge, "{err}");
+    assert!(err.message.contains("than can be looked through"), "{err}");
+    assert!(peak < 24 * MIB, "the dry run held {} MiB at once, for a file it refuses", peak / MIB);
+    assert!(took < std::time::Duration::from_secs(120), "{took:?}");
+    assert_nothing_staged(&dst.0);
+    // What is read to describe a real backup's items is still read whole and described, one at a time.
+    let few: Vec<(String, u64, Fill)> = (0..20).map(|i| (format!("flows/f{i:04}.json"), (MIB / 2) as u64, Fill::Json)).collect();
+    let fine = out.0.join("few.oaiybackup");
+    craft_streaming(&fine, &few);
+    let (result, peak, _) = peak::measured(|| restore::inspect(&dst.0, &fine, PASS, &options()));
+    let preview = result.unwrap();
+    assert_eq!(preview.items.len(), 20);
+    assert!(peak < 24 * MIB, "{} MiB", peak / MIB);
+}
+
+/// The reviewer's second: a small file whose calendar declares 512 MiB. It was extracted and then read whole to
+/// be cleaned: 512 MiB of memory. (Here 64 MiB, which is already four times what a calendar may be.)
+#[test]
+fn a_calendar_larger_than_a_calendar_is_refused_from_its_record_and_is_never_read() {
+    let out = TempDir::new("bomb-calendar");
+    let file = out.0.join("calendar.oaiybackup");
+    craft_streaming(&file, &[("calendar/calendar.json".to_string(), 64 * MIB as u64, Fill::Json)]);
+    let dst = TempDir::new("bomb-calendar-dst");
+    let (result, peak, took) = peak::measured(|| restore::inspect(&dst.0, &file, PASS, &options()));
+    assert_eq!(result.unwrap_err().kind, ErrorKind::TooLarge);
+    assert!(peak < 16 * MIB, "{} MiB", peak / MIB);
+    assert!(took < std::time::Duration::from_secs(60), "{took:?}");
+    let (result, peak, _) = peak::measured(|| restore::stage(&dst.0, &file, PASS, &Ticks::all(), &options()));
+    assert_eq!(result.unwrap_err().kind, ErrorKind::TooLarge);
+    assert!(peak < 16 * MIB, "{} MiB", peak / MIB);
+    assert_nothing_staged(&dst.0);
+    // The largest calendar a real business has comes back.
+    let real = out.0.join("real.oaiybackup");
+    craft_streaming(&real, &[("calendar/calendar.json".to_string(), 12 * MIB as u64, Fill::Json)]);
+    let (result, peak, _) = peak::measured(|| restore::stage(&dst.0, &real, PASS, &Ticks::none(), &options()));
+    result.unwrap();
+    assert!(peak < 96 * MIB, "{} MiB", peak / MIB);
+    assert!(matches!(restore::apply_pending(&dst.0), ApplyOutcome::Applied(_)));
+    assert!(fs::metadata(dst.0.join("calendar/calendar.json")).unwrap().len() > 11 * MIB as u64);
+}
+
+/// The reviewer's third: a file of 100,000 entries. Its list was parsed whole and each entry looked for in a list
+/// of 100,000 (73.8 s). Now it is refused from the end record of its ZIP, before its list is parsed.
+#[test]
+fn a_file_of_a_hundred_thousand_entries_is_refused_at_once() {
+    let out = TempDir::new("bomb-entries");
+    let entries: Vec<(String, u64, Fill)> = (0..100_000).map(|i| (format!("unknown/f{i:06}"), 2, Fill::Json)).collect();
+    let file = out.0.join("many.oaiybackup");
+    craft_streaming(&file, &entries);
+    let dst = TempDir::new("bomb-entries-dst");
+    let (result, peak, took) = peak::measured(|| restore::inspect(&dst.0, &file, PASS, &options()));
+    assert_eq!(result.unwrap_err().kind, ErrorKind::TooLarge);
+    assert!(peak < 64 * MIB, "{} MiB", peak / MIB);
+    assert!(took < std::time::Duration::from_secs(30), "{took:?}");
+    assert_nothing_staged(&dst.0);
+    // With the cap lifted the same file is worked through in a time that grows with its size, not with its square.
+    let lifted = RestoreOptions { limits: Limits { max_entries: 120_000, max_manifest_bytes: 64 << 20, ..Limits::default() }, ..options() };
+    let (result, _, took) = peak::measured(|| restore::stage(&dst.0, &file, PASS, &Ticks::all(), &lifted));
+    let staged = result.unwrap();
+    assert_eq!(staged.files, 0, "none of it is known to the table, so none of it is staged");
+    assert!(took < std::time::Duration::from_secs(60), "100,000 entries took {took:?}");
+}
+
+/// The numbers the caps stand at, and why (see `Limits`): a real backup is nowhere near them.
+#[test]
+fn the_caps_are_the_ones_a_real_backup_never_reaches() {
+    let limits = Limits::default();
+    assert_eq!((limits.max_entries, limits.max_manifest_bytes, limits.max_json_bytes), (20_000, 16 << 20, 16 << 20));
+    assert_eq!((limits.max_voice_bytes, limits.max_agent_bytes, limits.max_entry_bytes, limits.max_total_bytes), (128 << 20, 640 << 20, 1 << 30, 4 << 30));
+    assert_eq!(limits.entry_cap("calendar/calendar.json"), 16 << 20);
+    assert_eq!(limits.entry_cap("Voices/a.wav"), 128 << 20);
+    assert_eq!(limits.entry_cap(AGENT_ENTRY), 640 << 20);
+    assert_eq!(Limits { max_entry_bytes: 100, ..Limits::default() }.entry_cap(AGENT_ENTRY), 100);
+    // The Agent's own export stops below its cap: a backup it makes is never refused for its size.
+    assert!(limits.max_agent_bytes >= (512 + 64) << 20);
+}
+
+/// A file that is larger than a file of its kind may be is never read whole to be cleaned, whatever was staged.
+#[test]
+fn a_staged_file_larger_than_its_kind_may_be_is_left_out_without_being_read() {
+    let root = TempDir::new("clean-big");
+    let files = root.0.join("files");
+    fs::create_dir_all(files.join("calendar")).unwrap();
+    {
+        let mut big = File::create(files.join("calendar/calendar.json")).unwrap();
+        fill_pieces(Fill::Json, 20 * MIB as u64, |piece| big.write_all(piece).unwrap());
+    }
+    put(&files, "callers.json", b"{}");
+    let names = vec!["calendar/calendar.json".to_string(), "callers.json".to_string()];
+    let (result, peak, _) = peak::measured(|| restore::clean_staged(&root.0, &files, &names, &Ticks::all(), &Limits::default()));
+    let (kept, notes) = result.unwrap();
+    assert_eq!(kept, ["callers.json"]);
+    assert!(notes.iter().any(|n| n.contains("calendar/calendar.json") && n.contains("too large")), "{notes:?}");
+    assert!(peak < 8 * MIB, "{} MiB", peak / MIB);
+}
+
+/// A ZIP that says in its end record that it holds far more entries than it does is refused for what it claims,
+/// before its list is parsed (parsing is what takes the memory: the count decides how much is set aside).
+#[test]
+fn a_zip_that_claims_more_entries_than_may_be_read_is_refused_before_its_list_is_parsed() {
+    let out = TempDir::new("claims");
+    let files: Vec<(&str, &[u8])> = vec![("calendar/calendar.json", b"{}")];
+    let manifest = manifest_for(&files);
+    let plain = out.0.join("claims.zip");
+    {
+        let mut writer = zip::ZipWriter::new(File::create(&plain).unwrap());
+        let opts = zip::write::SimpleFileOptions::default();
+        writer.start_file("manifest.json", opts).unwrap();
+        writer.write_all(&manifest.to_json()).unwrap();
+        writer.start_file("calendar/calendar.json", opts).unwrap();
+        writer.write_all(b"{}").unwrap();
+        writer.finish().unwrap();
+    }
+    // The end record is the last 22 bytes (there is no comment): its two counts say 60,000.
+    let mut bytes = fs::read(&plain).unwrap();
+    let at = bytes.len() - 22;
+    assert_eq!(&bytes[at..at + 4], b"PK\x05\x06");
+    for count_at in [at + 8, at + 10] {
+        bytes[count_at..count_at + 2].copy_from_slice(&60_000u16.to_le_bytes());
+    }
+    fs::write(&plain, &bytes).unwrap();
+    let file = out.0.join("claims.oaiybackup");
+    container::encrypt_file(&plain, &file, PASS, Cost::Fixed(8)).unwrap();
+    let dst = TempDir::new("claims-dst");
+    let err = restore::inspect(&dst.0, &file, PASS, &options()).unwrap_err();
+    assert_eq!(err.kind, ErrorKind::TooLarge, "refused for what it claims, not for failing to parse: {err}");
+    assert_nothing_staged(&dst.0);
+    // The same bytes with an honest count are an ordinary backup.
+    let mut honest = bytes.clone();
+    for count_at in [at + 8, at + 10] {
+        honest[count_at..count_at + 2].copy_from_slice(&2u16.to_le_bytes());
+    }
+    fs::write(&plain, &honest).unwrap();
+    let fine = out.0.join("honest.oaiybackup");
+    container::encrypt_file(&plain, &fine, PASS, Cost::Fixed(8)).unwrap();
+    assert!(restore::inspect(&dst.0, &fine, PASS, &options()).is_ok());
+}
+
+/// What a restore would refuse for its size is not put into a backup to begin with: it is left out and said so.
+#[test]
+fn a_file_too_large_for_its_kind_is_left_out_when_a_backup_is_made() {
+    let data = TempDir::new("too-big-src");
+    put(&data.0, "callers.json", b"{}");
+    {
+        let path = data.0.join("calendar");
+        fs::create_dir_all(&path).unwrap();
+        let mut big = File::create(path.join("calendar.json")).unwrap();
+        fill_pieces(Fill::Json, 17 * MIB as u64, |piece| big.write_all(piece).unwrap());
+    }
+    let out = TempDir::new("too-big-out");
+    let file = out.0.join("b.oaiybackup");
+    let made = make(&data.0, &file);
+    assert!(made.partial.iter().any(|w| w.contains("too large")), "{:?}", made.partial);
+    let names: Vec<String> = manifest_of(&file, PASS).entries.into_iter().map(|e| e.name).collect();
+    assert!(names.contains(&"callers.json".to_string()) && !names.contains(&"calendar/calendar.json".to_string()), "{names:?}");
+    // And the backup that was made is one that a restore takes.
+    let dst = TempDir::new("too-big-dst");
+    assert!(restore::inspect(&dst.0, &file, PASS, &options()).is_ok());
+}
+
+/// What a ZIP says of its own directory is read from its end record, and from its ZIP64 end record when it
+/// needs one (more than 65,535 entries): so the count decides before the list is parsed, whatever the count.
+#[test]
+fn the_count_of_a_zips_entries_is_read_from_its_end_records() {
+    let out = TempDir::new("peek");
+    let build = |name: &str, n: usize| {
+        let path = out.0.join(name);
+        let mut writer = zip::ZipWriter::new(std::io::BufWriter::new(File::create(&path).unwrap()));
+        let opts = zip::write::SimpleFileOptions::default().compression_method(zip::CompressionMethod::Stored);
+        for i in 0..n {
+            writer.start_file(format!("e{i:06}"), opts).unwrap();
+        }
+        writer.finish().unwrap();
+        path
+    };
+    let small = container::peek_zip_directory(&build("small.zip", 3)).unwrap();
+    assert_eq!(small.entries, 3);
+    assert!(small.bytes >= 3 * 46 && small.bytes < 1024, "{}", small.bytes);
+    let big = container::peek_zip_directory(&build("big.zip", 70_000)).unwrap();
+    assert_eq!(big.entries, 70_000, "the ZIP64 end record is the one that has the true count");
+    assert!(big.bytes >= 70_000 * 46, "{}", big.bytes);
+    // What is not a ZIP at all, or is cut short, is not one.
+    fs::write(out.0.join("junk.zip"), b"this is not a zip file at all, no end record here!").unwrap();
+    assert!(container::peek_zip_directory(&out.0.join("junk.zip")).is_err());
+    fs::write(out.0.join("tiny.zip"), b"PK").unwrap();
+    assert!(container::peek_zip_directory(&out.0.join("tiny.zip")).is_err());
 }

@@ -8,7 +8,7 @@
 
 use std::collections::HashMap;
 use std::fs::File;
-use std::io::{self, BufReader, BufWriter, Read, Write};
+use std::io::{self, BufReader, BufWriter, Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 
 use age::secrecy::SecretString;
@@ -298,6 +298,12 @@ pub(crate) struct Verified {
 /// entries are exactly the manifest's (no extra, none missing, none twice), and every entry has its
 /// size and its SHA-256.
 pub(crate) fn verify_zip(plain: &Path, limits: &Limits, budget: &Budget) -> Result<Verified> {
+    // How many entries it says it has is read from its end record BEFORE its list of them is parsed: parsing
+    // is what costs the memory and the time, and a file can list millions.
+    let directory = peek_zip_directory(plain)?;
+    if directory.entries > limits.max_entries as u64 || directory.bytes > (limits.max_entries as u64).saturating_mul(ENTRY_RECORD_MAX) {
+        return Err(BackupError::new(ErrorKind::TooLarge, "This backup holds more items than OAIY will restore."));
+    }
     let file = File::open(plain).map_err(|e| BackupError::io("Could not read the staged backup", &e))?;
     let mut archive = ZipArchive::new(BufReader::new(file)).map_err(|_| damaged())?;
     if archive.is_empty() || archive.len() > limits.max_entries {
@@ -373,11 +379,13 @@ pub(crate) fn extract_all(verified: &Verified, mut dest_for: impl FnMut(&Entry) 
     let file = File::open(&verified.plain).map_err(|e| BackupError::io("Could not read the staged backup", &e))?;
     let mut archive = ZipArchive::new(BufReader::new(file)).map_err(|_| damaged())?;
     let mut buf = vec![0u8; COPY_BUF];
+    // Found by name in one step each: a scan of the list for every entry is a quadratic amount of work.
+    let listed: HashMap<&str, &Entry> = verified.manifest.entries.iter().map(|e| (e.name.as_str(), e)).collect();
     for i in 1..archive.len() {
         budget.check()?;
         let entry = archive.by_index(i).map_err(|_| damaged())?;
         let name = entry.name().to_string();
-        let Some(wanted) = verified.manifest.entries.iter().find(|e| e.name == name) else {
+        let Some(wanted) = listed.get(name.as_str()).copied() else {
             return Err(damaged());
         };
         // An entry that is not wanted (a class the person did not tick) is not read.
@@ -407,6 +415,57 @@ pub(crate) fn extract_all(verified: &Verified, mut dest_for: impl FnMut(&Entry) 
         }
     }
     Ok(())
+}
+
+/// The most a record of one entry in a ZIP's directory takes: its fixed part, a name of the longest
+/// length and room for its extra fields and comment.
+pub(crate) const ENTRY_RECORD_MAX: u64 = 1024;
+
+/// What a ZIP says of its own directory, read from its end record.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct ZipDirectory {
+    pub entries: u64,
+    /// The size of the list of entries.
+    pub bytes: u64,
+}
+
+/// Read how many entries a ZIP says it holds, and how large its list of them is, from its end record (and its
+/// ZIP64 end record when it has one) without parsing the list. Parsing keeps a record in memory for each entry,
+/// so this comes before it.
+pub(crate) fn peek_zip_directory(path: &Path) -> Result<ZipDirectory> {
+    let mut file = File::open(path).map_err(|e| BackupError::io("Could not read the staged backup", &e))?;
+    let len = file.metadata().map_err(|e| BackupError::io("Could not read the staged backup", &e))?.len();
+    if len < 22 {
+        return Err(damaged());
+    }
+    // The end record is the last thing in the file, followed by a comment of at most 65,535 bytes.
+    let tail_len = len.min(22 + 65_535 + 20);
+    file.seek(SeekFrom::Start(len - tail_len)).map_err(|e| BackupError::io("Could not read the staged backup", &e))?;
+    let mut tail = vec![0u8; tail_len as usize];
+    file.read_exact(&mut tail).map_err(|e| BackupError::io("Could not read the staged backup", &e))?;
+    let at = (0..=tail.len() - 22).rev().find(|&i| tail[i..i + 4] == [0x50, 0x4b, 0x05, 0x06] && i + 22 + u16::from_le_bytes([tail[i + 20], tail[i + 21]]) as usize <= tail.len()).ok_or_else(damaged)?;
+    let u16_at = |i: usize| u16::from_le_bytes([tail[i], tail[i + 1]]) as u64;
+    let u32_at = |i: usize| u32::from_le_bytes([tail[i], tail[i + 1], tail[i + 2], tail[i + 3]]) as u64;
+    let (mut entries, mut bytes, offset) = (u16_at(at + 10), u32_at(at + 12), u32_at(at + 16));
+    if entries == 0xFFFF || bytes == 0xFFFF_FFFF || offset == 0xFFFF_FFFF {
+        // ZIP64: a locator just before the end record says where the larger record is.
+        if at < 20 || tail[at - 20..at - 16] != [0x50, 0x4b, 0x06, 0x07] {
+            return Err(damaged());
+        }
+        let at64 = u64::from_le_bytes(tail[at - 12..at - 4].try_into().expect("eight bytes"));
+        if at64.checked_add(56).is_none_or(|end| end > len) {
+            return Err(damaged());
+        }
+        file.seek(SeekFrom::Start(at64)).map_err(|e| BackupError::io("Could not read the staged backup", &e))?;
+        let mut record = [0u8; 56];
+        file.read_exact(&mut record).map_err(|e| BackupError::io("Could not read the staged backup", &e))?;
+        if record[..4] != [0x50, 0x4b, 0x06, 0x06] {
+            return Err(damaged());
+        }
+        entries = u64::from_le_bytes(record[32..40].try_into().expect("eight bytes"));
+        bytes = u64::from_le_bytes(record[40..48].try_into().expect("eight bytes"));
+    }
+    Ok(ZipDirectory { entries, bytes })
 }
 
 /// A ZIP opened for reading a few of its entries (a verified backup's plaintext).
