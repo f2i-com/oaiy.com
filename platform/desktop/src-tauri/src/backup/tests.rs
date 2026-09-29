@@ -5065,3 +5065,34 @@ fn a_plugins_settings_are_described_by_key_and_value_and_what_is_left_out_is_nam
     }
     assert!(preview.classes.iter().any(|c| c.id == "plugins" && c.count == plugin.len()));
 }
+
+/// Everything the Agent's settings tick changes is listed: the instruction texts with their full length, the filter, the line said to a
+/// person who is rung back; a text of the person's own is not treated as data.
+#[test]
+fn the_agents_instruction_texts_are_listed_with_their_full_length_and_apply_only_with_their_tick() {
+    let long = format!("Always be polite. {}", "And never promise a price. ".repeat(200));
+    let settings = serde_json::json!({ "messages": { "answer": false, "instructions": long, "callInstructions": "Ask for a name", "callBackFilter": "any", "callBackLine": "Sorry we missed you", "country": "NZ" } });
+    let src = TempDir::new("f4-src");
+    let out = TempDir::new("f4-out");
+    let file = backup_with_agent(&src.0, &out.0, "f.oaiybackup", agent_archive(&[("idb/settings.json", settings.to_string().as_bytes())]), false);
+    let dst = TempDir::new("f4-dst");
+    let preview = restore::inspect(&dst.0, &file, PASS, &options()).unwrap();
+    let mine: Vec<&review::ReviewItem> = preview.items.iter().filter(|i| i.class == RestoreClass::AgentSettings).collect();
+    let find = |key: &str| mine.iter().find(|i| i.name.ends_with(&format!("#messages.{key}"))).unwrap_or_else(|| panic!("messages.{key} is listed"));
+    assert!(find("instructions").what.contains(&format!("({} characters in all)", long.chars().count())), "{}", find("instructions").what);
+    assert!(find("instructions").what.chars().count() < 700);
+    assert!(find("callInstructions").what.contains("Ask for a name"));
+    assert!(find("callBackFilter").what.contains("\"any\"") && find("callBackLine").what.contains("Sorry we missed you"));
+    assert!(mine.iter().all(|i| !i.name.ends_with("#messages.country")), "a country only decides how a number is read: not offered as acting");
+    // Without the tick, the country comes and the instructions do not; with it, all of them do.
+    let after = |ticks: Ticks| -> serde_json::Value {
+        let target = TempDir::new("f4-target");
+        restore::stage(&target.0, &file, PASS, &ticks, &options()).unwrap();
+        assert!(matches!(restore::apply_pending(&target.0), ApplyOutcome::Applied(_)));
+        serde_json::from_slice(&zip_entries(&handed_over(&target.0))["idb/settings.json"]).unwrap()
+    };
+    assert_eq!(after(Ticks::none()), serde_json::json!({ "messages": { "country": "NZ" } }));
+    let all = after(ticks_of(&[RestoreClass::AgentSettings], false));
+    assert_eq!(all["messages"]["instructions"], long);
+    assert_eq!((all["messages"]["callBackFilter"].as_str(), all["messages"]["callBackLine"].as_str(), all["messages"]["country"].as_str()), (Some("any"), Some("Sorry we missed you"), Some("NZ")));
+}
