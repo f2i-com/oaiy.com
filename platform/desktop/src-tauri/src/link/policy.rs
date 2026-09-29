@@ -558,6 +558,45 @@ mod tests {
     }
 
     #[test]
+    fn the_docs_table_puts_every_command_aokie_declares_on_the_side_the_policy_does() {
+        // Somebody deciding whether to trust the relay reads `REMOTE_FORMLOGIC.md`, and its
+        // table of the phone bridge has been wrong before (it said flows queue what they do not,
+        // and that nothing queues what the provider's own tool tells an AI to send). So the
+        // table is read: its left column is the policy's allow list, and between the two
+        // columns every command Aokie declares is named, once.
+        const DOCS: &str = include_str!("../../../../docs/REMOTE_FORMLOGIC.md");
+        let start = DOCS.find("### The phone bridge").expect("the docs have a section on the phone bridge");
+        let rows: Vec<&str> = DOCS[start..]
+            .lines()
+            .skip(1)
+            .skip_while(|l| !l.starts_with('|'))
+            .take_while(|l| l.starts_with('|'))
+            .collect();
+        assert!(rows.len() > 2, "the phone bridge section has no table");
+        // The text of a cell between backticks is a command; nothing else in a cell is.
+        let commands = |cell: &str| -> Vec<String> {
+            cell.split('`').skip(1).step_by(2).map(str::to_string).collect()
+        };
+        let (mut left, mut right) = (Vec::new(), Vec::new());
+        for row in &rows[2..] {
+            let cells: Vec<&str> = row.split('|').collect();
+            left.extend(commands(cells[1]));
+            right.extend(commands(cells[2]));
+        }
+
+        let allowed: BTreeSet<&str> = AOKIE_ALLOWED.into_iter().collect();
+        let on_the_left: BTreeSet<&str> = left.iter().map(String::as_str).collect();
+        assert_eq!(on_the_left, allowed, "the left column of the docs table is not the allow list");
+
+        let manifest = aokie();
+        let declared: BTreeSet<&str> = manifest.connectors[0].commands.iter().map(String::as_str).collect();
+        let named: Vec<&str> = left.iter().chain(right.iter()).map(String::as_str).collect();
+        let named_set: BTreeSet<&str> = named.iter().copied().collect();
+        assert_eq!(named.len(), named_set.len(), "a command is named twice in the docs table");
+        assert_eq!(named_set, declared, "the docs table and Aokie's manifest name different commands");
+    }
+
+    #[test]
     fn what_aokie_may_run_and_changes_something_carries_a_key() {
         // The plugin refuses a journalled command that arrives without an
         // idempotency key, so a retried "answer" or "send" cannot happen twice.
