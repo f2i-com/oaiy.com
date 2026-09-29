@@ -701,6 +701,21 @@ await check('a move the page gave up on stops at once: it seals nothing more, no
   assert.equal(plainStored(w), null);
 });
 
+await check('a move the page gave up on while it reads its values back does not remove the plaintext the page has been using', async () => {
+  const w = world({ plain: { K1: 'v1', K2: 'v2' }, env: { timeoutMs: 150 } });
+  w.idb.hold('get', { store: 'secrets' }); // every value is written; the first read back never answers
+  const vault = w.load();
+  assert.equal(await vault.ready(), 'plaintext', 'the move ran out of time');
+  await vault.set('NEW', 'kept-in-plaintext'); // saved here, while the abandoned move is still waiting
+  w.idb.release(); // the browser answers at last: the abandoned move reads its values back, and would then remove the plaintext
+  await tick(150);
+  assert.deepEqual(JSON.parse(plainStored(w)), { K1: 'v1', K2: 'v2', NEW: 'kept-in-plaintext' }, 'the plaintext this page relied on is still there');
+  const next = V.createSecretVault({ ...w.env, timeoutMs: 5000 });
+  assert.equal(await next.ready(), 'sealed');
+  assert.deepEqual(await next.get(['K1', 'K2', 'NEW']), { K1: 'v1', K2: 'v2', NEW: 'kept-in-plaintext' }, 'and nothing was lost');
+  assert.equal(plainStored(w), null);
+});
+
 await check('a store too slow to finish the move in time: what the page kept meanwhile is not removed when the move ends', async () => {
   const w = world({ plain: { K1: 'v1', K2: 'v2', K3: 'v3', K4: 'v4' }, env: { timeoutMs: 250 } });
   w.idb.knobs.delay.put = 80; // five writes: well over the patience
