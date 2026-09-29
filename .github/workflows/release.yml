@@ -1,6 +1,9 @@
 # Release: tag a version, get everything built and attached to one GitHub Release.
 #
-#   git tag 0.0.1 && git push origin 0.0.1        (a leading "v" works too)
+#   git tag 0.1.0 && git push origin 0.1.0        (a leading "v" works too)
+#
+# A version below 0.1.0 is refused (see the version step of meta). docs/RELEASING.md
+# says how to cut a release, and what is not in one.
 #
 # What lands on the release for that tag:
 #
@@ -69,7 +72,7 @@ on:
   workflow_dispatch:
     inputs:
       version:
-        description: 'Version to build (e.g. 0.0.1). Builds and uploads artifacts only; no release is created.'
+        description: 'Version to build (e.g. 0.1.0; not below it). Run on a branch, this builds and uploads artifacts only. Run on a tag, the tag is the version and the release is published.'
         required: true
 
 permissions:
@@ -123,7 +126,14 @@ jobs:
           fi
           version="${raw#v}"
           if [[ ! "$version" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
-            echo "::error::'$raw' is not a version of the form 0.0.1"; exit 1
+            echo "::error::'$raw' is not a version of the form 0.1.0"; exit 1
+          fi
+          # The desktop takes this version as its own (stamped into Cargo.toml),
+          # and refuses a plugin whose manifest asks for a newer desktop. Aokie's
+          # asks for 0.1.0, so a release below it could not run Aokie.
+          IFS=. read -r major minor _ <<< "$version"
+          if (( 10#$major == 0 && 10#$minor == 0 )); then
+            echo "::error::version $version is below 0.1.0: Aokie's plugin manifest needs a desktop of 0.1.0 or later, and the installers are stamped with the tag. Tag 0.1.0 or a later version."; exit 1
           fi
           echo "version=$version" >> "$GITHUB_OUTPUT"
           echo "Building version $version"
