@@ -316,7 +316,8 @@ pub fn in_use_signal(data_dir: &Path, plugins_root: &Path, providers: &[crate::a
     // The engines' configuration (engines.rs): made with no model on a fresh
     // install, so only a model in it says anything.
     if let Ok(text) = std::fs::read_to_string(data_dir.join("engines").join("oaiy-studio.json")) {
-        if let Ok(cfg) = serde_json::from_str::<Value>(&text) {
+        // (A byte-order mark, as some editors write one, is not a reason to miss it.)
+        if let Ok(cfg) = serde_json::from_str::<Value>(text.trim_start_matches('\u{feff}')) {
             let llm = cfg.get("llm");
             let chosen = llm.and_then(|l| l.get("default_model")).and_then(Value::as_str).is_some_and(|m| !m.trim().is_empty());
             let listed = llm.and_then(|l| l.get("models")).and_then(Value::as_array).is_some_and(|m| !m.is_empty());

@@ -86,7 +86,9 @@ export default function SetupGuidePanel({ onNavigate, onDismiss, actions, ...sta
         <div key={p.id} className="setup-nudge">
           <ListChecks size={14} aria-hidden />
           <span>
-            Finish setting up <strong>{p.manifest?.name ?? p.id}</strong>
+            <span>
+              Finish setting up <strong>{p.manifest?.name ?? p.id}</strong>
+            </span>
             <small>{readSetup(p)?.title}</small>
           </span>
           <button className="btn btn-secondary" onClick={() => openSetup({ plugin: p.id })}>
