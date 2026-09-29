@@ -103,11 +103,13 @@ pub struct GuiPlatform {
     store: Arc<Store>,
     /// Installers must come from this project's releases on GitHub. Off only for a debug build reading a stub feed.
     strict_assets: bool,
+    /// The feed a debug build was told to read (OAIY_UPDATE_FEED), so that the plugin reads the same one as the core.
+    feed_override: Option<String>,
 }
 
 impl GuiPlatform {
-    pub fn new(app: AppHandle, store: Arc<Store>, strict_assets: bool) -> GuiPlatform {
-        GuiPlatform { app, store, strict_assets }
+    pub fn new(app: AppHandle, store: Arc<Store>, feed: &super::FeedSource) -> GuiPlatform {
+        GuiPlatform { app, store, strict_assets: !feed.insecure, feed_override: feed.insecure.then(|| feed.url.clone()) }
     }
 }
 
@@ -121,7 +123,12 @@ impl Platform for GuiPlatform {
     fn prepare<'a>(&'a self, release: &'a Release) -> BoxFuture<'a, Result<(), String>> {
         Box::pin(async move {
             let changed = || "The update information changed while it was being read. Check again.".to_string();
-            let updater = self.app.updater_builder().timeout(Duration::from_secs(20)).build().map_err(|e| explain(&e))?;
+            let mut builder = self.app.updater_builder().timeout(Duration::from_secs(20));
+            if let Some(url) = &self.feed_override {
+                let url = url.parse().map_err(|_| "The update address is not a web address.".to_string())?;
+                builder = builder.endpoints(vec![url]).map_err(|e| explain(&e))?;
+            }
+            let updater = builder.build().map_err(|e| explain(&e))?;
             let update = updater.check().await.map_err(|e| explain(&e))?.ok_or_else(changed)?;
             if update.version != release.version {
                 return Err(changed());
@@ -215,10 +222,12 @@ pub async fn update_install(webview: Webview, app: AppHandle, updater: tauri::St
         .map_err(|e| format!("The update stopped unexpectedly ({e})."))?;
     match outcome {
         Outcome::HandedOff => {
-            // Windows never gets here (the installer took over and this process exited). The AppImage was replaced:
-            // start it. Through the normal exit, which stops everything again (already stopped: nothing to do).
-            app.request_restart();
-            Ok(())
+            // Windows never gets here: the plugin started the installer and ended this process. On Linux the AppImage
+            // was replaced, so start it. Everything was stopped before the hand-off, and the same is done as the
+            // plugin does on Windows (clean up, then relaunch and exit) rather than the normal exit, which would stop it
+            // all a second time and empty the note of what was running that the hand-off wrote for the next start.
+            app.cleanup_before_exit();
+            tauri::process::restart(&app.env())
         }
         Outcome::Refused(refusal) => Err(refusal.to_string()),
         Outcome::Failed { message, .. } => Err(message),
@@ -229,7 +238,13 @@ fn run_install(app: &AppHandle, updater: &UpdaterHandle, update: Update) -> Outc
     let parts = install_parts(app);
     let refs: Vec<&dyn Part> = parts.iter().map(|p| p.as_ref() as &dyn Part).collect();
     let flush = || flush_agent(app, updater);
-    let hand_off = |package: &VerifiedPackage| update.install(package.bytes()).map_err(|e| explain(&e));
+    let hand_off = |package: &VerifiedPackage| {
+        // The bytes that were verified are for the version the update handle names: never hand over any others.
+        if package.version() != update.version {
+            return Err(format!("the downloaded update is for version {}, not {}", package.version(), update.version));
+        }
+        update.install(package.bytes()).map_err(|e| explain(&e))
+    };
     let clock = std::time::Instant::now;
     install::perform(updater, &Steps { flush: &flush, parts: &refs, hand_off: &hand_off, clock: &clock })
 }
@@ -411,8 +426,8 @@ pub fn plugin<R: tauri::Runtime>() -> tauri::plugin::TauriPlugin<R, tauri_plugin
 
 /// Tell the updater what this desktop is and what it is doing: it can install, and asks the services, the downloads,
 /// the engines and the rest before it does. Call once, where the handles exist (`node` is made with the local API).
-pub fn attach(updater: &UpdaterHandle, app: &AppHandle, store: Arc<Store>, strict_assets: bool, probes: Probes) {
-    updater.set_platform(Arc::new(GuiPlatform::new(app.clone(), store, strict_assets)));
+pub fn attach(updater: &UpdaterHandle, app: &AppHandle, store: Arc<Store>, feed: &super::FeedSource, probes: Probes) {
+    updater.set_platform(Arc::new(GuiPlatform::new(app.clone(), store, feed)));
     updater.set_activity(Arc::new(probes));
 }
 
@@ -508,6 +523,28 @@ mod tests {
         for inline in ["stop_all()", "engines::stop()", "shutdown()"] {
             assert!(!arm.contains(inline), "the exit arm does not stop things itself: {inline}");
         }
+    }
+
+    #[test]
+    fn the_install_restarts_by_hand_after_the_stop_and_never_by_the_apps_restart_command_or_a_second_stop() {
+        let source = command_source("update_install");
+        assert!(source.contains("tauri::process::restart(&app.env())"));
+        assert!(source.contains("app.cleanup_before_exit();"));
+        // restart_app skips the stop; request_restart runs the exit body again, which empties the running note
+        // the install wrote for the next start.
+        assert!(!source.contains("restart_app") && !source.contains("request_restart(") && !source.contains(".restart()"), "{source}");
+    }
+
+    #[test]
+    fn the_updater_plugins_configuration_in_tauri_conf_json_is_one_it_starts_with() {
+        // A configuration the plugin cannot read makes the app panic at start-up ("error while setting up plugin
+        // updater"): read it here as the plugin does.
+        let conf: serde_json::Value = serde_json::from_str(include_str!("../../tauri.conf.json")).unwrap();
+        let config: tauri_plugin_updater::Config = serde_json::from_value(conf["plugins"]["updater"].clone()).expect("the plugin reads it");
+        assert_eq!(config.endpoints.iter().map(|u| u.as_str()).collect::<Vec<_>>(), [crate::update::FEED_URL]);
+        assert!(!config.pubkey.is_empty() && !config.dangerous_insecure_transport_protocol && !config.dangerous_accept_invalid_certs && !config.dangerous_accept_invalid_hostnames);
+        assert!(!config.allow_downgrades, "an older release is never an update");
+        assert_eq!(config.windows.expect("windows settings").install_mode.to_string(), "passive");
     }
 
     #[test]

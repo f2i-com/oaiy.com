@@ -1398,8 +1398,7 @@ pub fn run() {
             }
             // What is known of newer releases, shared by the local API's routes, the window's commands and the tray.
             let feed = crate::update::FeedSource::from_env();
-            let strict_assets = !feed.insecure;
-            let updater = crate::update::Updater::new(env!("CARGO_PKG_VERSION"), feed, std::time::Instant::now());
+            let updater = crate::update::Updater::new(env!("CARGO_PKG_VERSION"), feed.clone(), std::time::Instant::now());
             // Looking for updates by itself (a little after start, then daily) is on unless the person switched it off.
             updater.set_auto_check(read_config_str(app.handle(), "updateCheck").as_deref() != Some("off"));
             let update_store = Arc::new(crate::update::gui::Store::default());
@@ -1420,7 +1419,7 @@ pub fn run() {
                     &updater,
                     &app_for_http,
                     update_store,
-                    strict_assets,
+                    &feed,
                     crate::update::blockers::Probes {
                         downloads: Some(downloads_for_http.clone()),
                         registry: Some(registry_for_http.clone()),
