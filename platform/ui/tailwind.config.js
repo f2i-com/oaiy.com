@@ -42,10 +42,21 @@ export default {
           secondary: 'rgb(var(--color-text-secondary) / <alpha-value>)',
           tertiary: 'rgb(var(--color-text-tertiary) / <alpha-value>)',
           muted: 'rgb(var(--color-text-muted) / <alpha-value>)',
+          faint: 'rgb(var(--color-text-faint) / <alpha-value>)',
         },
         edge: {
           primary: 'rgb(var(--color-border-primary) / <alpha-value>)',
           secondary: 'rgb(var(--color-border-secondary) / <alpha-value>)',
+          strong: 'rgb(var(--color-border-strong) / <alpha-value>)',
+        },
+        // The fixed signal hues (status, node kinds): they do not follow the
+        // accent, and each theme gives them its own ink weight.
+        signal: {
+          green: 'rgb(var(--signal-green) / <alpha-value>)',
+          amber: 'rgb(var(--signal-amber) / <alpha-value>)',
+          danger: 'rgb(var(--signal-danger) / <alpha-value>)',
+          cyan: 'rgb(var(--signal-cyan) / <alpha-value>)',
+          magenta: 'rgb(var(--signal-magenta) / <alpha-value>)',
         },
       },
       animation: {

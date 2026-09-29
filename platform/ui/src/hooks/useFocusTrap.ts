@@ -49,6 +49,14 @@ const FOCUSABLE_SELECTOR = [
   '[contenteditable]:not([contenteditable="false"])',
 ].join(',');
 
+/**
+ * Whether `container` is the most recently opened trap: the one a key such as
+ * Escape belongs to when dialogs are stacked (a confirm over a form).
+ */
+export function isTopTrap(container: HTMLElement): boolean {
+  return activeTraps.at(-1) === container;
+}
+
 function focusables(container: HTMLElement): HTMLElement[] {
   return Array.from(container.querySelectorAll<HTMLElement>(FOCUSABLE_SELECTOR))
     .filter((el) => !el.hasAttribute('disabled') && el.offsetParent !== null);
