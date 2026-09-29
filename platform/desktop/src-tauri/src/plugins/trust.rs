@@ -1033,7 +1033,13 @@ impl TrustService {
     /// trust) covers. Only a package that nothing was verified for, a developer's, is
     /// read here for the first time.
     pub fn authorize_launch(&self, dir: &Path, id: &str) -> Result<LaunchPermit, LaunchRefusal> {
-        let assessed = self.assess_with(dir, id, Reuse::Fresh);
+        Self::permit_for(dir, self.assess_with(dir, id, Reuse::Fresh))
+    }
+
+    /// The permit for a package that has just been checked: its manifest is parsed from
+    /// the bytes the check kept, and only a package that nothing was verified for is read
+    /// here. A file read now, after the check, is never what the launch is built from.
+    fn permit_for(dir: &Path, assessed: Assessed) -> Result<LaunchPermit, LaunchRefusal> {
         if !assessed.trust.allows_launch() {
             return Err(LaunchRefusal::Untrusted(Box::new(assessed.trust)));
         }
@@ -2259,6 +2265,20 @@ pub(crate) mod tests {
         let remembered = svc.assess_with(&dir, "demo", Reuse::Cached);
         assert!(remembered.manifest_json.is_none());
         assert_eq!(remembered.manifest_sha256, checked.manifest_sha256);
+    }
+
+    #[test]
+    fn the_permit_is_made_from_the_checked_bytes_and_not_from_a_file_read_afterwards() {
+        // The check kept the bytes it hashed. The file on disk is read again only for a
+        // package nothing was verified for; here it says something else, and the permit
+        // must follow the checked bytes.
+        let (_s, dir, _k, svc) = signed(TrustPolicy::release());
+        let checked = svc.assess_with(&dir, "demo", Reuse::Fresh);
+        assert_eq!(checked.trust.state, TrustState::Verified);
+        std::fs::write(dir.join("manifest.json"), same_length_manifest()).unwrap();
+
+        let permit = TrustService::permit_for(&dir, checked).unwrap();
+        assert_eq!(permit.manifest().entry.command, "demo-plugin.exe", "the checked bytes, not the file that is on disk now");
     }
 
     #[test]
