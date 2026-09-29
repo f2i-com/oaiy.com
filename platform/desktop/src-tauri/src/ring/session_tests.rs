@@ -121,7 +121,7 @@ fn rig(presence: Presence) -> Rig {
 fn planned(ring: &Arc<Ring>, call: &str) -> String {
     let authorised = ring.plan_for_plugin(call, Reason::CallerAsked, CallInfo::default());
     assert!(authorised.rings(), "{:?}", authorised.plan);
-    authorised.plan_id.unwrap()
+    authorised.plan_id
 }
 
 fn opened(plan: &str, request: &str, call: &str, seconds_from_now: u64, ring: &Ring) -> OpenedParams {
@@ -151,7 +151,7 @@ fn nothing_rings_for_a_plan_this_desktop_did_not_allow() {
     let r = rig(Presence::Active);
     let gate = r.ring.authorise(CALL, Reason::CallerAsked);
     assert!(gate.rings());
-    assert_eq!(r.ring.opened(&opened(&gate.plan_id.unwrap(), "assist_1", CALL, 20, &r.ring)).unwrap_err().code, "unknown_plan");
+    assert_eq!(r.ring.opened(&opened(&gate.plan_id, "assist_1", CALL, 20, &r.ring)).unwrap_err().code, "unknown_plan");
     assert!(r.ring.active().is_empty() && r.notified.rang.lock().unwrap().is_empty());
 }
 
@@ -191,7 +191,7 @@ fn a_ring_that_does_not_ring_this_computer_shows_in_no_notification() {
     // Nobody to ring at all: not a ring.
     let r = rig(Presence::Idle);
     let plan = r.ring.plan_for_plugin(CALL, Reason::CallerAsked, CallInfo::default());
-    assert!(!plan.rings() && plan.plan_id.is_none());
+    assert!(!plan.rings() && !plan.plan_id.is_empty());
 }
 
 #[test]
@@ -347,7 +347,7 @@ fn a_toast_alone_is_not_a_ring_so_nobody_is_planned_for_and_no_try_is_counted() 
     // offers a transfer only to the devices a plan names would open nothing for it.
     let plan = r.ring.authorise(CALL, Reason::CallerAsked);
     assert_eq!((plan.plan.decision, plan.plan.reason), (Decision::MessageOnly, PlanReason::NoDevice), "{:?}", plan.plan);
-    assert!(!plan.rings() && plan.plan_id.is_none());
+    assert!(!plan.rings() && !plan.plan_id.is_empty(), "a plan that rings nobody has an id all the same");
     assert!(!plan.plan.desktop_toast && plan.plan.targets().is_empty());
     // The plugin asking is answered the same way, and nothing was counted for either.
     let asked = r.ring.plan_for_plugin(CALL, Reason::CallerAsked, CallInfo::default());
@@ -501,7 +501,7 @@ fn a_second_try_on_one_call_straight_after_the_first_is_refused() {
     r.ring.resolve("assist_1", Outcome::Declined, "phone");
     // A try is counted when a plan is allowed (not when a ring opens), so asking again at once meets the gap between tries.
     let again = r.ring.plan_for_plugin(CALL, Reason::CallerAsked, CallInfo::default());
-    assert!(!again.rings() && again.plan_id.is_none(), "{:?}", again.plan);
+    assert!(!again.rings() && !again.plan_id.is_empty(), "{:?}", again.plan);
     assert_eq!(again.plan.reason, PlanReason::LimitGap);
     assert!(r.ring.active().is_empty());
 }

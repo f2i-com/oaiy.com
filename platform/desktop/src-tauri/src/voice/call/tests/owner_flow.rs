@@ -342,9 +342,10 @@ async fn with_transfers_off_nothing_is_offered_or_rung_and_a_message_is_kept_whe
     assert!(f.aokie.text("formlogic.realtime.tool_call", Duration::from_millis(300)).await.is_none(), "nothing reached the phone");
     // The plugin asking anyway is answered with a message and no ring, and nothing can be opened.
     let plan = PluginHost::ring_request(&f.ring, "oaiy.ring.plan", json!({"callId": f.aokie.call, "reason": "caller_asked", "recentCallerTurns": [ASKED]})).unwrap();
-    assert_eq!((plan["decision"].as_str(), plan["reason"].as_str(), plan["planId"].as_str()), (Some("message_only"), Some("disabled"), Some("")), "{plan}");
-    let opened = PluginHost::ring_request(&f.ring, "oaiy.ring.opened", json!({"planId": "", "requestId": "assist_1", "callId": f.aokie.call, "callEpoch": 1, "ownerEpoch": 1, "expiresAt": f.ring.clock().unix() + 30}));
-    assert!(opened.is_err());
+    assert_eq!((plan["decision"].as_str(), plan["reason"].as_str()), (Some("message_only"), Some("disabled")), "{plan}");
+    let given = crate::ring::testing::plan_id_of(&plan);
+    let opened = PluginHost::ring_request(&f.ring, "oaiy.ring.opened", json!({"planId": given, "requestId": "assist_1", "callId": f.aokie.call, "callEpoch": 1, "ownerEpoch": 1, "expiresAt": f.ring.clock().unix() + 30}));
+    assert_eq!(opened.unwrap_err().0, "unknown_plan", "an id given with a refusal opens nothing");
     assert!(f.dialog().await.is_empty() && f.bell.rang.lock().unwrap().is_empty());
     // The message is still taken.
     assert!(f.takes_a_message("Please ring me.").is_ok());
@@ -371,7 +372,8 @@ async fn a_caller_who_talks_the_model_into_it_rings_nobody_even_when_the_plugin_
         assert_eq!((answer["ok"].clone(), answer["output"]["reason"].clone()), (json!(false), json!("caller_did_not_ask")), "{said}");
         // The plugin says the caller asked; this desktop goes by what it heard.
         let plan = PluginHost::ring_request(&f.ring, "oaiy.ring.plan", json!({"callId": f.aokie.call, "reason": "caller_asked", "recentCallerTurns": [ASKED, ASKED, ASKED]})).unwrap();
-        assert_eq!((plan["decision"].as_str(), plan["reason"].as_str(), plan["planId"].as_str()), (Some("refused"), Some("caller_did_not_ask"), Some("")), "{said}: {plan}");
+        assert_eq!((plan["decision"].as_str(), plan["reason"].as_str()), (Some("refused"), Some("caller_did_not_ask")), "{said}: {plan}");
+        crate::ring::testing::plan_id_of(&plan);
     }
     let mut f = f;
     assert!(f.aokie.text("formlogic.realtime.tool_call", Duration::from_millis(300)).await.is_none(), "not one reached the phone");
@@ -445,7 +447,8 @@ async fn a_second_try_at_once_is_refused_and_so_is_a_fourth_call_from_one_number
     let again = answer_of(asking(&f.aokie, transfer::TOOL, json!({"reason": "caller_asked"}))).await.unwrap();
     assert_eq!((again["output"]["status"].clone(), again["output"]["reason"].clone()), (json!("refused"), json!("limit_gap")));
     let plan = PluginHost::ring_request(&f.ring, "oaiy.ring.plan", json!({"callId": f.aokie.call, "reason": "caller_asked", "recentCallerTurns": [ASKED]})).unwrap();
-    assert_eq!((plan["decision"].as_str(), plan["reason"].as_str(), plan["planId"].as_str()), (Some("refused"), Some("limit_gap"), Some("")), "{plan}");
+    assert_eq!((plan["decision"].as_str(), plan["reason"].as_str()), (Some("refused"), Some("limit_gap")), "{plan}");
+    crate::ring::testing::plan_id_of(&plan);
     assert!(f.aokie.text("formlogic.realtime.tool_call", Duration::from_millis(300)).await.is_none(), "neither reached the phone");
     assert_eq!(f.dialog().await.len(), 0);
     assert_eq!(tries(&f.aokie).attempts_this_call, 1, "the refusals were not tries");

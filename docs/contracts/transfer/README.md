@@ -115,16 +115,22 @@ feature by adding `"ringPlan"` to `plugin.init` `features` (after `"eventAck"`).
 `ownerEpoch`, `reason`, `callerNumber?` and `recentCallerTurns` (at most three turns of at most 300
 characters). The desktop judges the request on **its own record of the call** (the words it heard and
 transcribed itself, and who rang); what the plugin sends is used only for a call the desktop has no record of.
-The answer is `{planId, decision, reason, ringSeconds, phones, wake, desktopToast, desktopCompanions}`:
-`decision` is `ring`, `message_only` (offer a message) or `refused` (do not offer a person); `phones`,
-`wake` and `desktopCompanions` are endpoint-key thumbprints, `ringSeconds` is 20 to 90 (at most 30 when only
-this computer rings). The plugin offers the call to `phones` and `desktopCompanions` and to nobody else.
+The answer is `{planId, decision, reason, ringSeconds, phones, wake, desktopToast, desktopCompanions, reasonAllowed}`:
+`planId` is always a valid id, whether the plan rings or not (the plugin loses the real reason of a refusal
+without one); only a plan that rings can be opened. `decision` is `ring`, `message_only` (offer a message) or
+`refused` (do not offer a person); `phones`, `wake` and `desktopCompanions` are endpoint-key thumbprints,
+`ringSeconds` is 20 to 90 (at most 30 when only this computer rings). The plugin offers the call to `phones`
+and `desktopCompanions` and to nobody else, so **a `ring` plan always names at least one device**: this
+desktop plans `message_only` with the reason `no_device` where the reference would ring only the toast.
+`reasonAllowed` is true only for `urgent`, when the owner allowed urgent requests and this desktop heard one of
+their urgent phrases; the plugin skips its own phrase check for a reason other than `caller_asked` only
+when it is true.
 
 A try that is allowed is **counted when it is allowed**, not when it opens, and the plugin's question about a
 request the desktop already allowed (its own gate, on the way to the plugin) is answered with the same plan and
 counts once. A second question about the same call is a second try. `reason` is one of `ok`, `disabled`,
 `initiative_off`, `not_urgent`, `caller_did_not_ask`, `limit_call`, `limit_gap`, `limit_caller`,
-`limit_global`, `quiet_hours`, `all_do_not_disturb`, `no_endpoint`.
+`limit_global`, `quiet_hours`, `all_do_not_disturb`, `no_endpoint`, `no_device`.
 
 **`oaiy.ring.opened`** (`ring-opened.json`). Params `planId`, `requestId`, `callId`, `callEpoch`,
 `ownerEpoch`, `expiresAt` (Unix seconds). The desktop starts to ring: a native notification and the dialog.

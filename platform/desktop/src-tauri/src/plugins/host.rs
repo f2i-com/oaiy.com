@@ -2641,7 +2641,11 @@ mod tests {
 
         // A second question straight away is a second try, and the gap between tries refuses it.
         let again = asked(&ring, "call_1").unwrap();
-        assert_eq!((again["decision"].as_str(), again["reason"].as_str(), again["planId"].as_str()), (Some("refused"), Some("limit_gap"), Some("")), "{again}");
+        assert_eq!((again["decision"].as_str(), again["reason"].as_str()), (Some("refused"), Some("limit_gap")), "{again}");
+        // A refusal has a plan id like any plan (the plugin loses the real reason without one), but nothing can be opened with it.
+        let refused_id = crate::ring::testing::plan_id_of(&again);
+        assert_ne!(refused_id, plan_id);
+        assert_eq!(opened(&refused_id, "call_1").unwrap_err().0, "unknown_plan");
     }
 
     #[test]
@@ -2672,7 +2676,8 @@ mod tests {
         // the same way, so a request the caller did not make rings nobody.
         let plan = |turns: Value| PluginHost::ring_request(&ring, "oaiy.ring.plan", json!({"callId": "call_9", "reason": "caller_asked", "callerNumber": "+61491570156", "recentCallerTurns": turns})).unwrap();
         let not_asked = plan(json!(["What are your opening hours?"]));
-        assert_eq!((not_asked["decision"].as_str(), not_asked["reason"].as_str(), not_asked["planId"].as_str()), (Some("refused"), Some("caller_did_not_ask"), Some("")), "{not_asked}");
+        assert_eq!((not_asked["decision"].as_str(), not_asked["reason"].as_str()), (Some("refused"), Some("caller_did_not_ask")), "{not_asked}");
+        crate::ring::testing::plan_id_of(&not_asked);
         assert_eq!(plan(json!(["Put me through to the owner"]))["decision"], "ring");
     }
 
@@ -3665,7 +3670,7 @@ async function handle(msg) {
     if (command === "test.ring") {
       const plan = await ask("oaiy.ring.plan", payload.plan);
       let opened = null;
-      if (plan.result && plan.result.planId) {
+      if (plan.result && plan.result.decision === "ring") {
         opened = await ask("oaiy.ring.opened", { planId: plan.result.planId, requestId: payload.requestId, callId: payload.plan.callId, callEpoch: 1, ownerEpoch: 1, expiresAt: payload.expiresAt });
       }
       send({ jsonrpc: "2.0", id: msg.id, result: { ok: true, plan, opened } });

@@ -266,7 +266,7 @@ pub struct PlanParams {
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct PlanResult {
-    /// Empty when nobody is rung.
+    /// Always a valid id, even when nobody is rung: the plugin refuses a plan without one.
     pub plan_id: String,
     pub decision: Decision,
     pub reason: PlanReason,
@@ -493,7 +493,7 @@ mod tests {
         assert!(!ring.plan_id.is_empty());
         let message: PlanResult = round_trip("plan-result-message-only.json");
         assert_eq!((message.decision, message.reason, message.ring_seconds), (Decision::MessageOnly, PlanReason::QuietHours, 0));
-        assert!(message.plan_id.is_empty() && message.phones.is_empty() && !message.desktop_toast);
+        assert!(!message.plan_id.is_empty() && message.phones.is_empty() && !message.desktop_toast, "a plan that rings nobody still has an id");
         let opened: OpenedRequest = round_trip("ring-opened.json");
         assert_eq!(opened.method, "oaiy.ring.opened");
         assert_eq!(opened.params.plan_id, ring.plan_id);
@@ -508,7 +508,7 @@ mod tests {
         let fixture: Value = serde_json::from_str(&read("plan-result-ring.json")).unwrap();
         let ours = super::super::host::plan_result(&super::super::Authorised {
             plan: super::super::RingPlan { decision: Decision::Ring, reason: PlanReason::Ok, ring_seconds: 30, phones: vec![], wake: vec![], desktop_toast: true, desktop_companions: vec![] },
-            plan_id: Some("plan_x".into()),
+            plan_id: "plan_x".into(),
             reason_allowed: false,
             caller_number: String::new(),
             caller_name: String::new(),

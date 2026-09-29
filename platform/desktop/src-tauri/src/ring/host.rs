@@ -106,8 +106,10 @@ struct Grant {
 pub struct Authorised {
     /// The plan: a ring, or why not.
     pub plan: RingPlan,
-    /// Set when a ring is allowed: the plugin's question about this request is answered with it.
-    pub plan_id: Option<String>,
+    /// The plan's id, always: the plugin refuses a plan without a valid one and would lose the real reason. Only a plan that
+    /// rings is kept under it (the plugin's question about the same request is answered with that plan, and `oaiy.ring.opened`
+    /// is accepted for it); an id given with a refusal opens nothing.
+    pub plan_id: String,
     /// This desktop itself vouches for the reason of the request, so the plugin need not see the caller ask for a person (the
     /// plan's `reasonAllowed`). Only for `urgent`: when the owner allows the receptionist to ask on its own for urgent things
     /// (`initiative`) and this desktop heard, in the caller's own words, one of the owner's urgent phrases. The model's
@@ -312,7 +314,7 @@ impl Ring {
     pub fn authorise(&self, call: &str, reason: Reason) -> Authorised {
         let settings = self.settings.get();
         let Some(info) = self.call_info(call) else {
-            return Authorised { plan: unknown_call(&settings), plan_id: None, reason_allowed: false, caller_number: String::new(), caller_name: String::new() };
+            return Authorised { plan: unknown_call(&settings), plan_id: new_plan_id(), reason_allowed: false, caller_number: String::new(), caller_name: String::new() };
         };
         self.judge(call, reason, info, &settings)
     }
@@ -323,18 +325,16 @@ impl Ring {
             self.note_no_device(call, &info);
         }
         let reason_allowed = plan.decision == Decision::Ring && vouches_for(reason, settings, &info.turns);
-        let mut plan_id = None;
+        let id = new_plan_id();
         if plan.decision == Decision::Ring {
             let now_unix = self.clock().unix();
             let caller_key = crate::voice::contacts::key(&info.from).unwrap_or_else(|| format!("call:{call}"));
             self.attempts.lock().unwrap_or_else(|e| e.into_inner()).record(call, &caller_key, now_unix);
-            let id = format!("plan_{}", &uuid::Uuid::new_v4().simple().to_string()[..16]);
             let mut grants = self.grants.lock().unwrap_or_else(|e| e.into_inner());
             grants.retain(|_, g| g.at.elapsed() < PLAN_TTL);
             grants.insert(id.clone(), Grant { plan_id: id.clone(), call_id: call.to_string(), plan: plan.clone(), reason_allowed, at: Instant::now(), claimed: false });
-            plan_id = Some(id);
         }
-        Authorised { plan, plan_id, reason_allowed, caller_number: info.from, caller_name: info.name }
+        Authorised { plan, plan_id: id, reason_allowed, caller_number: info.from, caller_name: info.name }
     }
 
     /// The plugin's question `oaiy.ring.plan` about a request on `call`: the plan this desktop already
@@ -349,12 +349,12 @@ impl Ring {
             grants.retain(|_, g| g.at.elapsed() < PLAN_TTL);
             if let Some(grant) = grants.values_mut().find(|g| g.call_id == call && !g.claimed) {
                 grant.claimed = true;
-                return Authorised { plan: grant.plan.clone(), plan_id: Some(grant.plan_id.clone()), reason_allowed: grant.reason_allowed, caller_number: info.from, caller_name: info.name };
+                return Authorised { plan: grant.plan.clone(), plan_id: grant.plan_id.clone(), reason_allowed: grant.reason_allowed, caller_number: info.from, caller_name: info.name };
             }
         }
         let authorised = self.judge(call, reason, info, &settings);
-        if let Some(id) = &authorised.plan_id {
-            if let Some(g) = self.grants.lock().unwrap_or_else(|e| e.into_inner()).get_mut(id) {
+        if authorised.rings() {
+            if let Some(g) = self.grants.lock().unwrap_or_else(|e| e.into_inner()).get_mut(&authorised.plan_id) {
                 g.claimed = true;
             }
         }
@@ -365,6 +365,11 @@ impl Ring {
     pub fn plan_is_claimed(&self, plan_id: &str, call: &str) -> bool {
         self.grants.lock().unwrap_or_else(|e| e.into_inner()).get(plan_id).is_some_and(|g| g.claimed && g.call_id == call && g.at.elapsed() < PLAN_TTL * 4)
     }
+}
+
+/// A new plan id: letters, digits and an underscore, which the plugin takes as a token.
+fn new_plan_id() -> String {
+    format!("plan_{}", &uuid::Uuid::new_v4().simple().to_string()[..16])
 }
 
 /// Whether this desktop vouches for `reason` on a call where the caller said `turns`: for `urgent` only, when the owner
@@ -384,7 +389,7 @@ fn unknown_call(settings: &RingSettings) -> RingPlan {
 pub fn plan_result(authorised: &Authorised) -> Value {
     let p = &authorised.plan;
     json!({
-        "planId": authorised.plan_id.clone().unwrap_or_default(),
+        "planId": authorised.plan_id,
         "decision": p.decision,
         "reason": p.reason,
         "ringSeconds": p.ring_seconds,

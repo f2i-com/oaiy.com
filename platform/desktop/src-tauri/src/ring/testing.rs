@@ -29,6 +29,14 @@ impl DeviceSource for Devices {
     }
 }
 
+/// The plan id of a plan result as the plugin takes it: always there, a token of letters, digits and `_ - . :` (at most 64
+/// characters), whether the plan rings or not. Returned.
+pub fn plan_id_of(plan: &serde_json::Value) -> String {
+    let id = plan["planId"].as_str().unwrap_or_default().to_string();
+    assert!(!id.is_empty() && id.len() <= 64 && id.bytes().all(|b| b.is_ascii_alphanumeric() || matches!(b, b'-' | b'_' | b'.' | b':')), "a plan always has a valid id: {plan}");
+    id
+}
+
 /// The owner has set up the Companion on this computer: what a ring for the owner at their computer needs.
 pub fn at_the_pc() -> Arc<Devices> {
     Arc::new(Devices(vec![windows("pc1")]))
