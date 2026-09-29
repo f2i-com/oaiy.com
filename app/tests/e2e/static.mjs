@@ -1,6 +1,7 @@
 // The production build on a plain static server that sends NO isolation
 // headers: the service worker must add them (one automatic reload), and the
 // app must keep working offline.   node tests/e2e/static.mjs
+// (Installing and updating are in pwa.mjs.) PWA_E2E_PORT: the server's port (default: any free one).
 import { existsSync, readFileSync, statSync } from 'node:fs';
 import { createServer } from 'node:http';
 import { extname, join, normalize } from 'node:path';
@@ -17,11 +18,12 @@ const server = createServer((req, res) => {
   res.setHeader('content-type', types[extname(file)] ?? 'application/octet-stream');
   res.end(readFileSync(file));
 });
-await new Promise((r) => server.listen(0, '127.0.0.1', r));
+await new Promise((r) => server.listen(Number(process.env.PWA_E2E_PORT) || 0, '127.0.0.1', r));
 const base = `http://127.0.0.1:${server.address().port}/`;
 
 const executablePath = [process.env.CHROME, 'C:/Program Files/Google/Chrome/Application/chrome.exe', '/usr/bin/google-chrome', '/usr/bin/chromium', '/Applications/Google Chrome.app/Contents/MacOS/Google Chrome'].filter(Boolean).find((p) => existsSync(p));
-const browser = await puppeteer.launch({ executablePath, headless: true });
+// PWA_E2E_DEBUG_PORT: the browser's remote-debugging port (default: any free one).
+const browser = await puppeteer.launch({ executablePath, headless: true, args: process.env.PWA_E2E_DEBUG_PORT ? [`--remote-debugging-port=${process.env.PWA_E2E_DEBUG_PORT}`] : [] });
 let failures = 0;
 const check = async (name, fn) => {
   try {
