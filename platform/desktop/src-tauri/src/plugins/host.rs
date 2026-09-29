@@ -989,6 +989,20 @@ impl PluginHost {
         }
     }
 
+    /// The ids of the plugins running now (an update notes them before it stops everything).
+    pub fn running_ids(&self) -> Vec<String> {
+        let table = self.procs.lock().unwrap_or_else(|e| e.into_inner());
+        table.running.keys().cloned().collect()
+    }
+
+    /// Let plugins start again after [`Self::stop_all`]: for an update that stopped everything and then could
+    /// not install, so the app carries on as it was. (Quitting never calls it: the process is going away.)
+    pub fn resume(&self) {
+        if let Ok(mut table) = self.procs.lock() {
+            table.shutting_down = false;
+        }
+    }
+
     /// Stop everything. Called on app exit so no child outlives the host.
     pub fn stop_all(&self) {
         let (drained, in_flight): (Vec<(String, Arc<PluginProcess>)>, Vec<(String, Arc<PluginProcess>)>) =
@@ -2763,6 +2777,19 @@ mod tests {
         host.stop_all();
         let err = host.start("aokie").unwrap_err();
         assert!(err.contains("shutting down"), "{err}");
+    }
+
+    #[test]
+    fn a_host_stopped_for_an_update_that_did_not_install_can_start_plugins_again() {
+        // An update stops everything, and if the installer cannot start, the app carries on: its plugins
+        // (Aokie holds the phone dongle) have to be startable again, which stop_all's "shutting down" forbids.
+        let (_sb, host) = host_with("resume", vec![]);
+        assert!(host.running_ids().is_empty());
+        host.stop_all();
+        assert!(host.start("aokie").unwrap_err().contains("shutting down"));
+        host.resume();
+        let err = host.start("aokie").unwrap_err();
+        assert!(!err.contains("shutting down"), "started plugins are refused no longer: {err}");
     }
 
     // --- the restart bound ---------------------------------------------------

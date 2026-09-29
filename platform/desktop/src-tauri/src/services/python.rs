@@ -322,6 +322,11 @@ impl Python {
 
     // ---- helpers ----
 
+    /// A Python install or venv job is running now.
+    pub fn job_running(&self) -> bool {
+        self.current_job_running()
+    }
+
     fn current_job_running(&self) -> bool {
         let g = match self.current.lock() {
             Ok(g) => g,

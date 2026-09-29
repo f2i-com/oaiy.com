@@ -348,6 +348,14 @@ impl Downloads {
         &self.models_dir
     }
 
+    /// Downloads waiting or running now (a paused one is neither: it picks up where it stopped).
+    pub fn active_count(&self) -> usize {
+        match self.progress.lock() {
+            Ok(g) => g.values().filter(|d| matches!(d.status, DownloadStatus::Queued | DownloadStatus::Active)).count(),
+            Err(e) => e.into_inner().values().filter(|d| matches!(d.status, DownloadStatus::Queued | DownloadStatus::Active)).count(),
+        }
+    }
+
     pub fn snapshot(&self) -> Vec<DownloadProgress> {
         match self.progress.lock() {
             Ok(g) => {
@@ -1652,6 +1660,22 @@ mod tests {
         // space, and the query succeeds on this platform.
         let avail = fs2::available_space(&std::env::temp_dir()).unwrap();
         assert!(avail > 0);
+    }
+
+    #[test]
+    fn only_queued_and_running_downloads_count_as_active_for_an_update() {
+        let d = Downloads::new(std::env::temp_dir().join("oaiy-active-count-test"));
+        assert_eq!(d.active_count(), 0);
+        for (i, status) in [DownloadStatus::Queued, DownloadStatus::Active, DownloadStatus::Paused, DownloadStatus::Completed, DownloadStatus::Failed, DownloadStatus::Cancelled].into_iter().enumerate() {
+            let row = DownloadProgress {
+                id: format!("d{i}"), url: format!("https://example.com/{i}.gguf"), filename: format!("{i}.gguf"), subdir: None, dest_path: String::new(),
+                status, bytes_downloaded: 0, bytes_total: None, started_at: Utc::now(), finished_at: None, error: None, resumable: None,
+                speed_bps: None, eta_secs: None, sha256: None, expected_sha256: None, verified: None,
+            };
+            d.progress.lock().unwrap().insert(row.id.clone(), row);
+        }
+        // Queued and running: a restart would end them. Paused resumes; finished, failed and cancelled are over.
+        assert_eq!(d.active_count(), 2);
     }
 
     #[test]

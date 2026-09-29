@@ -1237,13 +1237,28 @@ impl Registry {
     /// path, and "restore what was running" is worth exactly nothing if the note
     /// is only written when we exit cleanly.
     pub fn remember_running(&self) {
-        let ids: Vec<&str> = self
-            .services
+        self.write_running_note(&self.running_ids());
+    }
+
+    /// The ids of the services that are up (running or starting) now.
+    pub fn running_ids(&self) -> Vec<String> {
+        self.services
             .values()
             .filter(|s| matches!(s.status, ServiceStatus::Running | ServiceStatus::Starting))
-            .map(|s| s.template.id.as_str())
-            .collect();
-        if let Ok(body) = serde_json::to_string(&ids) {
+            .map(|s| s.template.id.clone())
+            .collect()
+    }
+
+    /// The ids of the services being installed now.
+    pub fn installing_ids(&self) -> Vec<String> {
+        self.services.values().filter(|s| s.status == ServiceStatus::Installing).map(|s| s.template.id.clone()).collect()
+    }
+
+    /// Write `ids` as the running note: the services the next launch brings back (see [`Self::autostart_on_boot`]).
+    /// An update stops every service before it restarts the app, and the app that starts after it should have
+    /// what was running before, so it writes what it captured before stopping.
+    pub fn write_running_note(&self, ids: &[String]) {
+        if let Ok(body) = serde_json::to_string(ids) {
             let path = self.running_note_path();
             let tmp = path.with_extension("json.tmp");
             if std::fs::write(&tmp, body).is_ok() {
@@ -2780,6 +2795,23 @@ mod tests {
             vec![id],
             "an explicitly ticked service starts even though nothing was running at exit"
         );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn what_an_update_saw_running_is_what_the_next_launch_starts_and_stopping_everything_does_not_lose_it() {
+        // stop_all wipes the running note one stop at a time (a clean quit forgets); an update writes the ids
+        // it captured BEFORE stopping, after stopping, so the relaunched app brings the same services back.
+        let (dir, reg) = scratch_registry("update-note");
+        let id = some_service_id(&reg);
+        assert!(reg.running_ids().is_empty() && reg.installing_ids().is_empty());
+        reg.write_running_note(&[id.clone()]);
+        let reopened = Registry::init(dir.clone(), dir.join("models"), Vec::new()).expect("reopens the same data dir");
+        assert_eq!(reopened.boot_start_ids(), vec![id]);
+        // remember_running still writes what is up now (nothing): a deliberate stop is not brought back.
+        reg.remember_running();
+        let again = Registry::init(dir.clone(), dir.join("models"), Vec::new()).unwrap();
+        assert!(again.boot_start_ids().is_empty());
         let _ = std::fs::remove_dir_all(&dir);
     }
 

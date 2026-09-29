@@ -206,6 +206,11 @@ impl NodeRuntime {
             .and_then(|j| j.as_ref().map(|b| b.snapshot(tail)))
     }
 
+    /// A Node install is running now (asks nothing of `node`, unlike a snapshot).
+    pub fn is_installing(&self) -> bool {
+        *self.installing.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
     /// Download + extract the pinned portable Node, on a background thread.
     pub fn install(self: &Arc<Self>) -> Result<(), String> {
         // A finished install changes what a probe would find, so drop the

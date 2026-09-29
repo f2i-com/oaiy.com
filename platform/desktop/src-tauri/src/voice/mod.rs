@@ -75,10 +75,23 @@ struct Inner {
     caller_of: Box<CallerOf>,
 }
 
+/// Every hub made in this process (there is one; a test may make more), so anything that has to know whether
+/// a call is live (an update, before it restarts the app) can ask without being handed the hub.
+static HUBS: Mutex<Vec<std::sync::Weak<Inner>>> = Mutex::new(Vec::new());
+
+/// Phone calls live now, on every hub of this process.
+pub fn live_call_count() -> usize {
+    let mut hubs = HUBS.lock().unwrap_or_else(|e| e.into_inner());
+    hubs.retain(|hub| hub.strong_count() > 0);
+    hubs.iter().filter_map(std::sync::Weak::upgrade).map(|hub| hub.calls.lock().unwrap_or_else(|e| e.into_inner()).len()).sum()
+}
+
 impl VoiceHub {
     pub fn new(engines: Engines, caller_of: impl Fn(&str) -> Option<(String, String)> + Send + Sync + 'static) -> Self {
         let (events, _) = broadcast::channel(512);
-        Self { inner: Arc::new(Inner { engines, events, calls: Mutex::new(HashMap::new()), caller_of: Box::new(caller_of) }) }
+        let inner = Arc::new(Inner { engines, events, calls: Mutex::new(HashMap::new()), caller_of: Box::new(caller_of) });
+        HUBS.lock().unwrap_or_else(|e| e.into_inner()).push(Arc::downgrade(&inner));
+        Self { inner }
     }
 
     /// Tell the app pages following the calls.
@@ -516,6 +529,21 @@ mod tests {
         let ok = client.get(&url).bearer_auth(gateway_token()).send().await.unwrap();
         assert_eq!(ok.status(), 200);
         assert_eq!(ok.json::<Value>().await.unwrap()["provider"], "studio");
+    }
+
+    #[test]
+    fn a_call_on_any_hub_is_counted_for_an_update_to_see_and_stops_counting_when_it_ends() {
+        // (Other tests hold calls on hubs of their own at the same time, so this asserts only what a call of ours guarantees.)
+        let hub = VoiceHub::new(Engines::at("http://127.0.0.1:9", "http://127.0.0.1:9"), |_| None);
+        let (tx, _rx) = mpsc::unbounded_channel();
+        hub.register("update_test_call", tx);
+        assert_eq!(hub.live_calls(), vec!["update_test_call".to_string()]);
+        assert!(live_call_count() >= 1, "a live call is counted without being handed the hub");
+        hub.unregister("update_test_call");
+        assert!(hub.live_calls().is_empty());
+        // A hub that is gone leaves the count (its calls went with it).
+        drop(hub);
+        let _ = live_call_count();
     }
 
     /// The app's side of the calls, on a port of its own.

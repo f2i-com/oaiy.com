@@ -202,6 +202,30 @@ fn manifest_root(root: &Path) -> PathBuf {
     root.to_path_buf()
 }
 
+/// Plugin installs running in this process now.
+static INSTALLS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+/// Counts an install while it runs, however it ends.
+struct InstallGuard;
+
+impl InstallGuard {
+    fn enter() -> InstallGuard {
+        INSTALLS.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        InstallGuard
+    }
+}
+
+impl Drop for InstallGuard {
+    fn drop(&mut self) {
+        INSTALLS.fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
+    }
+}
+
+/// A plugin is being installed now: an update does not restart the app in the middle of one.
+pub fn in_progress() -> bool {
+    INSTALLS.load(std::sync::atomic::Ordering::SeqCst) > 0
+}
+
 /// Read just the plugin id from a source, WITHOUT installing it.
 ///
 /// The caller needs this before copying: replacing a plugin means removing the
@@ -225,6 +249,7 @@ pub fn peek_id(source: &Path) -> Result<String, String> {
 ///
 /// A signed package that does not verify under `trust` is an error, not an install.
 pub fn install_from_path(source: &Path, plugins_root: &Path, trust: &TrustService) -> Result<Installed, String> {
+    let _installing = InstallGuard::enter();
     if !source.exists() {
         return Err(format!("{} does not exist", source.display()));
     }
@@ -364,6 +389,22 @@ mod tests {
         )
         .unwrap();
         std::fs::write(dir.join("x.exe"), b"binary").unwrap();
+    }
+
+    #[test]
+    fn an_install_in_progress_is_visible_to_an_update_and_however_it_ends_it_stops_counting() {
+        // (Other tests install too, so only what a held guard guarantees is asserted.)
+        {
+            let _running = InstallGuard::enter();
+            assert!(in_progress());
+            let _second = InstallGuard::enter();
+            drop(_second);
+            assert!(in_progress(), "one install ending does not hide another");
+        }
+        // The real function holds the guard on every path, including an early error.
+        let base = tmp("guard");
+        let trust = dev_trust(&base);
+        assert!(install_from_path(&base.join("missing"), &base.join("plugins"), &trust).is_err());
     }
 
     #[test]

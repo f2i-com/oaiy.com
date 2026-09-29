@@ -47,6 +47,8 @@ struct Task {
     task: String,
     state: watch::Sender<State>,
     order: u64,
+    /// When it was given to the agent.
+    since: std::time::Instant,
 }
 
 struct Hub {
@@ -78,7 +80,7 @@ impl Hub {
                 tasks.remove(&k);
             }
         }
-        tasks.insert(id.clone(), Task { from: from.to_string(), task: task.to_string(), state: tx, order });
+        tasks.insert(id.clone(), Task { from: from.to_string(), task: task.to_string(), state: tx, order, since: std::time::Instant::now() });
         drop(tasks);
         let _ = self.events.send(json!({"type": "agent.task", "id": id, "from": from, "task": task, "at": chrono::Utc::now().to_rfc3339()}));
         (id, rx)
@@ -101,6 +103,13 @@ impl Hub {
         self.tasks.lock().unwrap_or_else(|e| e.into_inner()).get(id).map(|t| t.state.borrow().clone())
     }
 
+    /// Tasks given to the agent and not answered, that a flow can still be waiting for: not older than the longest a
+    /// request waits ([`MAX_WAIT`]). (Older ones are kept for `GET /api/agent/tasks/{id}` but no one is waiting on them.)
+    fn open_at(&self, now: std::time::Instant) -> usize {
+        let tasks = self.tasks.lock().unwrap_or_else(|e| e.into_inner());
+        tasks.values().filter(|t| *t.state.borrow() == State::Pending && now.saturating_duration_since(t.since) < Duration::from_secs(MAX_WAIT)).count()
+    }
+
     /// The tasks still waiting (a page that starts late picks them up).
     fn pending(&self) -> Vec<Value> {
         let tasks = self.tasks.lock().unwrap_or_else(|e| e.into_inner());
@@ -108,6 +117,11 @@ impl Hub {
         open.sort_by_key(|(o, _)| **o);
         open.into_iter().map(|(_, v)| v).collect()
     }
+}
+
+/// How many flows' tasks the agent is working on now: an update does not restart the app under them.
+pub fn pending_count() -> usize {
+    hub().open_at(std::time::Instant::now())
 }
 
 fn outcome(id: &str, state: &State) -> Value {
@@ -233,5 +247,20 @@ mod tests {
         drop(rx);
         assert!(h.answer(&id, State::Done("A quiet day.".into())));
         assert_eq!(h.state(&id), Some(State::Done("A quiet day.".into())));
+    }
+
+    #[test]
+    fn a_task_the_agent_has_not_answered_is_open_until_it_is_answered_or_no_flow_can_still_be_waiting() {
+        let h = Hub { tasks: Mutex::new(HashMap::new()), events: broadcast::channel(8).0, next: Mutex::new(0) };
+        let now = std::time::Instant::now();
+        assert_eq!(h.open_at(now), 0);
+        let (first, _rx1) = h.add("Welcome flow", "Write a welcome note");
+        let (_second, _rx2) = h.add("Nightly report", "Summarise the day");
+        assert_eq!(h.open_at(now), 2);
+        assert!(h.answer(&first, State::Done("done".into())));
+        assert_eq!(h.open_at(now), 1, "an answered task is not work in progress");
+        // A request waits an hour at most: an unanswered task older than that has no one waiting on it.
+        assert_eq!(h.open_at(now + Duration::from_secs(MAX_WAIT - 60)), 1);
+        assert_eq!(h.open_at(now + Duration::from_secs(MAX_WAIT + 60)), 0);
     }
 }
