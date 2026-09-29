@@ -523,15 +523,72 @@ await check('a database that will not open: the keys stay in plaintext', async (
   await staysPlaintext(w, w.load(), 'open refused');
 });
 
-await check('a refused write part-way through the move: nothing is removed, and every key is still readable', async () => {
+await check('a write the store refuses part-way through the move: nothing is removed, the vault stays sealed, and every key is readable', async () => {
   const w = world({ plain: OLD });
   w.idb.fail('put', new DOMException('quota', 'QuotaExceededError'), { store: 'secrets', skip: 1 });
-  await staysPlaintext(w, w.load(), 'second write refused');
-  // The next page load has room, and finishes the move: what was written since is the newer.
+  const vault = w.load();
+  assert.equal(await vault.ready(), 'sealed', 'the store was read: what it refused was one write');
+  assert.deepEqual(JSON.parse(plainStored(w)), OLD, 'the plaintext is where it was');
+  assert.deepEqual(await vault.get(['OPENAI_API_KEY', 'ANTHROPIC_API_KEY', 'NOT_SET']), OLD, 'and every key is read: the plaintext is the newer');
+  assert.equal(w.warns.length, 1, 'said once');
+  assert.match(w.warns[0], /plain localStorage/);
+  // The store takes writes again, so saves go to it, and each leaves the plaintext.
+  await vault.set('OPENAI_API_KEY', 'sk-changed');
+  assert.deepEqual(JSON.parse(plainStored(w)), { ANTHROPIC_API_KEY: KEY_B }, 'a name saved in the store is no longer in the plaintext');
+  await vault.set('ANTHROPIC_API_KEY', '');
+  await vault.set('NEW_KEY', 'sk-new');
+  assert.equal(plainStored(w), null, 'and it is gone when it is empty');
+  assert.deepEqual(await vault.get(['OPENAI_API_KEY', 'ANTHROPIC_API_KEY', 'NEW_KEY']), { OPENAI_API_KEY: 'sk-changed', NEW_KEY: 'sk-new' });
+  // The next page load has nothing left to move.
   const next = w.load();
   assert.equal(await next.ready(), 'sealed');
-  assert.equal(plainStored(w), null);
   assert.deepEqual(await next.get(['OPENAI_API_KEY', 'ANTHROPIC_API_KEY', 'NEW_KEY']), { OPENAI_API_KEY: 'sk-changed', NEW_KEY: 'sk-new' });
+  assert.equal(w.warns.length, 1, 'and says nothing more');
+});
+
+await check('a store that refuses every write hides no key that was sealed before, load after load', async () => {
+  // The disk is full: the sealed records can be read, and nothing can be written to them.
+  const w = world();
+  const first = w.load();
+  await first.set('K3', 'k3-sealed');
+  w.idb.fail('put', new DOMException('quota', 'QuotaExceededError'), { store: 'secrets', times: 1000 });
+  await first.set('K2', 'k2-plain');
+  assert.deepEqual(JSON.parse(plainStored(w)), { K2: 'k2-plain' }, 'a refused save is kept in plaintext');
+  for (const load of [1, 2]) {
+    const vault = w.load();
+    assert.equal(await vault.ready(), 'sealed', `load ${load}: the move fails again, and the store is still read`);
+    assert.deepEqual(await vault.get(['K3', 'K2']), { K3: 'k3-sealed', K2: 'k2-plain' }, `load ${load}: the sealed key is not hidden`);
+    await vault.set(`KEPT_${load}`, `kept-${load}`);
+    assert.deepEqual(await vault.get(['K3', `KEPT_${load}`]), { K3: 'k3-sealed', [`KEPT_${load}`]: `kept-${load}` }, `load ${load}: a save is kept, and read`);
+  }
+  // There is room again: the next load moves every kept key in.
+  w.idb.knobs.failures.length = 0;
+  const later = w.load();
+  assert.equal(await later.ready(), 'sealed');
+  assert.equal(plainStored(w), null);
+  const all = { K3: 'k3-sealed', K2: 'k2-plain', KEPT_1: 'kept-1', KEPT_2: 'kept-2' };
+  assert.deepEqual(await later.get(Object.keys(all)), all);
+  assert.deepEqual(await w.load().get(Object.keys(all)), all, 'from the sealed store alone');
+});
+
+await check('a delete the store refuses while the plaintext is moved in is still a delete, and hides no other key', async () => {
+  const w = world();
+  const before = w.load();
+  await before.set('A', KEY_A);
+  await before.set('B', KEY_B);
+  w.idb.fail('delete', new DOMException('locked', 'UnknownError'), { store: 'secrets' });
+  await before.set('A', ''); // refused: kept as an empty value in the plaintext
+  assert.deepEqual(JSON.parse(plainStored(w)), { A: '' });
+  w.idb.fail('delete', new DOMException('locked', 'UnknownError'), { store: 'secrets' }); // and refused again by the move
+  const stuck = w.load();
+  assert.equal(await stuck.ready(), 'sealed');
+  assert.deepEqual(await stuck.get(['A', 'B']), { B: KEY_B }, 'A is gone as far as anyone can tell, and B is not hidden');
+  assert.deepEqual(JSON.parse(plainStored(w)), { A: '' }, 'the delete is still to be made');
+  const next = w.load();
+  assert.equal(await next.ready(), 'sealed');
+  assert.deepEqual(await next.get(['A', 'B']), { B: KEY_B });
+  assert.deepEqual([...w.idb.raw('secrets').keys()], ['B'], 'made at last');
+  assert.equal(plainStored(w), null);
 });
 
 await check('a value that does not read back the same is not trusted: the plaintext stays', async () => {

@@ -49,13 +49,19 @@
  *
  * When sealing is not possible, no key is lost. There is no IndexedDB, no
  * `crypto.subtle` (a page on `http://` at a LAN address is not a secure context),
- * the database will not open, a read back does not match, or the store does not
- * answer in time: the vault stays in `plaintext` mode for this page, reads and
- * writes the plaintext exactly as before, leaves whatever is there where it is,
- * and says so once. The next page load tries again. If the store fails on a
- * single save while the page is running, that secret is kept in the plaintext
- * map instead (a delete as an empty value), said once, and the next load moves
- * it in.
+ * the database will not open or its key or records cannot be read, a value read
+ * back does not match, or the store does not answer in time: the vault stays in
+ * `plaintext` mode for this page, reads and writes the plaintext exactly as
+ * before, leaves whatever is there where it is, and says so once. (Keys sealed
+ * on an earlier load are not shown on such a page, because the store could not
+ * be read. They are untouched, and the next page load tries again.)
+ *
+ * A store that can be read but refuses a WRITE (a full disk, a quota) is not
+ * that. The vault stays `sealed`: what the store holds is shown as usual, the
+ * plaintext that could not be moved stays where it is and is laid over it (it is
+ * the newer), and the next page load tries the move again. Saves go to the store
+ * as usual; one that the store refuses is kept in the plaintext map instead (a
+ * delete as an empty value), said once, and the next load moves it in.
  *
  * A store that was cleared (or a key that is gone while sealed records are
  * left) does not crash anything: what cannot be opened is a key that is not
@@ -111,6 +117,13 @@ interface Plain {
   parsed: boolean;
   map: Map<string, string>;
 }
+
+/** What moving the plaintext into a store that was read came to. `refused` is set when the store refused a write. */
+interface Moved {
+  refused?: { error: unknown };
+}
+
+const reasonOf = (e: unknown): string => (e instanceof Error ? e.message : String(e));
 
 function browserEnv(): VaultEnv {
   const g = globalThis as { indexedDB?: IDBFactory; crypto?: Crypto; localStorage?: Storage };
@@ -407,7 +420,7 @@ export function createSecretVault(env: VaultEnv = browserEnv()): SecretVault {
   // -------------------------------------------------------------------------
   // Opening the store, and moving the plaintext in.
   // -------------------------------------------------------------------------
-  const openSealed = async (cancelled: () => boolean): Promise<void> => {
+  const openSealed = async (cancelled: () => boolean): Promise<Moved> => {
     if (!env.indexedDB) throw new Error('this browser has no IndexedDB');
     if (!env.crypto?.subtle) throw new Error('this page has no WebCrypto (it is not a secure context)');
     const database = await openDb();
@@ -425,50 +438,68 @@ export function createSecretVault(env: VaultEnv = browserEnv()): SecretVault {
       // The key is new, so what was sealed with an earlier one can never open: do not keep it.
       if (created) for (const name of unopened) await deleteSealed(database, name).catch(() => {});
     }
+    // The store has been read. What it holds is known from here on, whatever becomes of the move below.
+    known.clear();
+    for (const [name, value] of values) known.set(name, value);
 
     const plain = readPlain();
     if (plain.present && !plain.parsed) {
       warnOnce('unparsed', 'the old plaintext API key store could not be read as a map; it was left where it is');
-    } else if (plain.present) {
-      // The plaintext is the newer: what it holds replaces what the sealed store holds, and an
-      // empty value (kept when a delete could not be made there) deletes it there.
-      const entries = [...plain.map];
-      if (cancelled()) throw new Error('gave up on the sealed store before moving the plaintext keys');
-      for (const [name, value] of entries) {
-        if (value === '') await deleteSealed(database, name);
-        else await putSealed(database, name, await seal(key, value));
-      }
-      // Plaintext goes only once every value has been read back and opened.
-      for (const [name, value] of entries) {
-        const stored = (await readMany(database, [name])).get(name);
-        if (value === '') {
-          if (stored !== undefined) throw new Error(`"${name}" was not removed`);
-        } else if ((await unseal(key, stored)) !== value) {
-          throw new Error(`"${name}" did not read back after it was sealed`);
-        }
-      }
-      if (cancelled()) throw new Error('gave up on the sealed store before removing the plaintext keys');
-      removePlain();
-      for (const [name, value] of entries) {
-        if (value === '') values.delete(name);
-        else values.set(name, value);
+      return {};
+    }
+    if (!plain.present) return {};
+
+    // The plaintext is the newer: what it holds replaces what the sealed store holds, and an
+    // empty value (kept when a delete could not be made there) deletes it there.
+    const entries = [...plain.map];
+    if (cancelled()) throw new Error('gave up on the sealed store before moving the plaintext keys');
+    for (const [name, value] of entries) {
+      // Sealing is the crypto's; a failure there is not the store refusing a write.
+      const sealed = value === '' ? null : await seal(key, value);
+      try {
+        if (sealed) await putSealed(database, name, sealed);
+        else await deleteSealed(database, name);
+      } catch (error) {
+        // The browser refused a write (a full disk, a quota). The store can be read, so it stays in use;
+        // nothing is removed, and the plaintext, which is the newer, is laid over the store on every read.
+        return { refused: { error } };
       }
     }
-
-    known.clear();
-    for (const [name, value] of values) known.set(name, value);
+    // Plaintext goes only once every value has been read back and opened.
+    for (const [name, value] of entries) {
+      const stored = (await readMany(database, [name])).get(name);
+      if (value === '') {
+        if (stored !== undefined) throw new Error(`"${name}" was not removed`);
+      } else if ((await unseal(key, stored)) !== value) {
+        throw new Error(`"${name}" did not read back after it was sealed`);
+      }
+    }
+    if (cancelled()) throw new Error('gave up on the sealed store before removing the plaintext keys');
+    removePlain();
+    for (const [name, value] of entries) {
+      if (value === '') known.delete(name);
+      else known.set(name, value);
+    }
+    return {};
   };
 
   const start = async (): Promise<VaultMode> => {
     let gaveUp = false;
     try {
-      await within(openSealed(() => gaveUp), patience, 'opening the sealed store');
+      const moved = await within(openSealed(() => gaveUp), patience, 'opening the sealed store');
       mode = 'sealed';
+      if (moved.refused) {
+        warnOnce(
+          'move',
+          `some API keys could not be moved into the sealed store, so they stay in plain localStorage for now (the next load tries again): ${reasonOf(moved.refused.error)}`,
+          moved.refused.error,
+        );
+      }
     } catch (e) {
       // A late finish of the attempt must not touch the plaintext this page now relies on.
       gaveUp = true;
       mode = 'plaintext';
-      why = e instanceof Error ? e.message : String(e);
+      why = reasonOf(e);
       if (readPlain().present) warnOnce('fallback', `API keys stay in plain localStorage, because they could not be sealed: ${why}`, e);
     }
     return mode;
