@@ -45,6 +45,7 @@ import CalendarPanel from './CalendarPanel';
 import HoursPanel from './HoursPanel';
 import ContactsPanel from './ContactsPanel';
 import MessagesPanel from './MessagesPanel';
+import RingDialog from './RingDialog';
 import TransfersPanel from './TransfersPanel';
 import { useUnreadMessages } from './unreadMessages';
 import PluginScreenPage from './PluginScreenPage';
@@ -734,6 +735,8 @@ export default function App() {
       <a className="skip" href="#main">
         Skip to dashboard
       </a>
+      {/* A caller wants to speak to you: over everything, while the receptionist is trying to reach you. */}
+      <RingDialog on={phoneOn === true} />
 
       <aside className="sidebar">
         <div className="brand">
