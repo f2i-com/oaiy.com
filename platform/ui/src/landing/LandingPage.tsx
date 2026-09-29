@@ -497,7 +497,7 @@ function Privacy() {
 
 function Desktop() {
   const features = [
-    { title: 'Manages local services', body: 'Install, start, stop and tail logs for Ollama, llama.cpp and custom Python rigs.' },
+    { title: 'Manages local services', body: 'Install, start, stop and tail logs for Python rigs and your own local servers. Models run in OAIY\'s own engine.' },
     { title: 'Downloads models', body: 'Pull GGUF and safetensors weights from Hugging Face, with pause and resume and a curated quick-add list.' },
     { title: 'Bundles Python', body: 'A portable runtime with reusable virtual environments, so two services can share one heavy install.' },
     { title: 'Runs the browser nodes', body: 'Hosts the headless browser that the web app\'s browser-automation nodes drive.' },

@@ -98,7 +98,7 @@ function Hero() {
 
 function HowItWorks() {
   const features = [
-    { title: 'Manages local services', body: 'Install, start, stop and tail logs for Ollama, llama.cpp and custom Python rigs.' },
+    { title: 'Manages local services', body: 'Install, start, stop and tail logs for Python rigs and your own local servers. Models run in OAIY\'s own engine.' },
     { title: 'Downloads models', body: 'Pull GGUF and safetensors weights from Hugging Face, with pause and resume and a curated quick-add list.' },
     { title: 'Bundles Python', body: 'A portable runtime with reusable virtual environments, so two services can share one heavy install.' },
     { title: 'Runs the browser nodes', body: 'Hosts the headless browser that the web app\'s browser-automation nodes drive.' },
@@ -149,7 +149,7 @@ function Capabilities() {
   const caps = [
     { title: 'Bundled Python and virtual environments', body: 'A portable Python runtime with reusable venvs. Run Python services without touching your system Python, and let two services share one heavy install.' },
     { title: 'Runs any local process', body: 'A service is an install script and a run command, so the desktop app can launch a model server, your own script or a whole cloned repo, and own its start, stop and restart.' },
-    { title: 'Uses your GPU directly', body: 'Whatever you install — CUDA, Metal, ROCm, llama.cpp, ComfyUI — talks to the GPU itself. Nothing round-trips through a cloud.' },
+    { title: 'Uses your GPU directly', body: 'Whatever you install — CUDA, Metal, ROCm, PyTorch, ComfyUI — talks to the GPU itself. Nothing round-trips through a cloud.' },
     { title: 'Hugging Face downloads', body: 'Pull GGUF and safetensors files with pause and resume into a shared models folder that every service can read as ${modelsDir}.' },
     { title: 'Logs, health and lifecycle', body: 'Tail each service\'s output live, watch its status, and let a health probe confirm it is up before the web app starts using it.' },
     { title: 'Localhost only', body: 'Every service is exposed on 127.0.0.1 and nowhere else. The web app discovers them there; your data and compute never leave the machine.' },
@@ -225,26 +225,25 @@ const FORMAT_FIELDS: { field: string; req?: boolean; desc: string }[] = [
 ];
 
 const EXAMPLE_JSON = `{
-  "id": "llama-cpp-server",
-  "name": "llama.cpp server",
-  "description": "OpenAI-compatible local LLM server.",
-  "category": "LLM",
-  "defaultPort": 8080,
+  "id": "comfyui",
+  "name": "ComfyUI",
+  "description": "Local image server with its own node graph.",
+  "category": "Image",
+  "defaultPort": 8188,
 
   "install": {
     "kind": "script",
-    "windows": "py -m venv %OAIY_VENVS_DIR%\\llamacpp && %OAIY_VENVS_DIR%\\llamacpp\\Scripts\\pip install llama-cpp-python[server]"
+    "windows": "git clone --depth 1 https://github.com/comfyanonymous/ComfyUI %OAIY_DATA_DIR%\\comfyui && py -m venv %OAIY_VENVS_DIR%\\comfyui && %OAIY_VENVS_DIR%\\comfyui\\Scripts\\pip install -r %OAIY_DATA_DIR%\\comfyui\\requirements.txt"
   },
 
   "run": {
-    "command": "\${dataDir}/venvs/llamacpp/Scripts/python.exe",
-    "args": ["-m", "llama_cpp.server", "--port", "\${port}",
-             "--model", "\${modelsDir}/model.gguf"],
+    "command": "\${dataDir}/venvs/comfyui/Scripts/python.exe",
+    "args": ["\${dataDir}/comfyui/main.py", "--port", "\${port}"],
     "env": {},
-    "cwd": null
+    "cwd": "\${dataDir}/comfyui"
   },
 
-  "health": { "url": "http://127.0.0.1:\${port}/v1/models", "timeoutSecs": 90 }
+  "health": { "url": "http://127.0.0.1:\${port}/", "timeoutSecs": 120 }
 }`;
 
 function ServiceFormat() {
@@ -258,7 +257,7 @@ function ServiceFormat() {
       <div className="grid gap-6 lg:grid-cols-[1.15fr_0.85fr] lg:items-start">
         <div className="lp-window">
           <div className="lp-window-bar">
-            <span className="lp-window-file">llama-cpp-server.json</span>
+            <span className="lp-window-file">comfyui.json</span>
           </div>
           <pre className="lp-code"><code>{EXAMPLE_JSON}</code></pre>
         </div>

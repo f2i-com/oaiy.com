@@ -101,7 +101,7 @@ function AddServiceDialog({ nodeType }: { nodeType: string }) {
                 OAIY → <strong>Engines</strong>. Once its files are here it is listed under “OAIY engine”.
               </li>
               <li>
-                <strong>Your own Python rig or local server</strong> (Ollama, llama.cpp, anything with an HTTP API): add it in
+                <strong>Your own Python rig or local server</strong> (ComfyUI, anything with an HTTP API): add it in
                 OAIY → <strong>Services</strong>. Once installed it is listed under “Your services”; its template's{' '}
                 <code className="oaiy-code">node</code> block says how a node calls it.
               </li>

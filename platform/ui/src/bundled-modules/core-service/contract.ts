@@ -5,7 +5,7 @@
  * compilers run in the renderer):
  *   - `oaiy.customServices`  — the user's own, from Settings → Services;
  *   - `oaiy.desktopServices` — what OAIY Desktop offers, published by
- *     lib/desktopServices.ts: its services (Python rigs, Ollama, llama.cpp …,
+ *     lib/desktopServices.ts: its services (Python rigs, ComfyUI …,
  *     ids `companion:*`) and OAIY's engine's models and OAIY Voice (ids
  *     `engine:<kind>:<model>`, `voice:*`);
  *   - the built-in examples, for flows saved before the Services registry.

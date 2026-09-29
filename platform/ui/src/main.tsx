@@ -23,7 +23,7 @@ import { serviceOptions } from './lib/serviceOptions';
 import { nodeNotice } from './lib/nodeAvailability';
 import { currentAvailabilityEnv } from './lib/availabilityEnv';
 // Every Service dropdown: OAIY's engine models, the desktop's services (Python
-// rigs, Ollama …) and the user's own, grouped, with "Add a service…" last.
+// rigs, ComfyUI …) and the user's own, grouped, with "Add a service…" last.
 registerDynamicOptionsResolver('service:list', (rest: string) =>
   serviceOptions(rest, currentAvailabilityEnv(), (nodeType) => {
     void import('./lib/addServiceDialog').then((m) => m.openAddServiceDialog(nodeType));

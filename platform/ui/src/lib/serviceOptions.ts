@@ -8,7 +8,7 @@
  *     its kind; Service Call, which takes any kind, lists each kind's default
  *     only;
  *   - "Your services" — what OAIY Desktop runs and is in use (running, or
- *     started with OAIY): Python rigs, Ollama, …;
+ *     started with OAIY): Python rigs, ComfyUI, …;
  *   - "Custom" — HTTP services defined in this editor (Settings → Services);
  * then "Add a service…", which says where more come from and opens the
  * editor's service form for this node.

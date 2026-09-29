@@ -5,7 +5,7 @@
  * In OAIY's window the palette shows a media node (Image Gen, Music Gen, 3D
  * Model, …) only when something installed can run it: an OAIY engine model of
  * its kind whose files are here, an installed desktop service (a Python rig,
- * Ollama …) tagged for it, or one of the user's own services tagged for it.
+ * ComfyUI …) tagged for it, or one of the user's own services tagged for it.
  * No music model and no music service → no Music Gen in the palette. It asks
  * only once the desktop's list has answered, so nothing is hidden on a guess,
  * and it follows the list as it changes (installing a model shows its node).

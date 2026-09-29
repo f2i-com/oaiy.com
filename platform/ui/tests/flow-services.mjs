@@ -127,8 +127,8 @@ const ENGINE = [
   { id: 'voice:transcribe', kind: 'transcription', model: 'parakeet', default: true, name: 'OAIY Voice · Transcription · Parakeet', nodeTypes: ['speech_to_text'], endpoint: '/api/voice/transcribe', method: 'POST', requestFormat: 'wav16k', bodyTemplate: '', responseType: 'json', responsePath: 'text', output: 'text' },
 ];
 const SERVICES = [
-  { id: 'krea2', name: 'Krea 2', description: 'Pictures', category: 'Image Generation', status: 'stopped', port: 17910, defaultPort: 17910, docsUrl: null, installed: false, node: { endpoint: '/generate', bodyTemplate: '{"prompt": {{input}}}', responsePath: 'imageUrl' } },
-  { id: 'ollama', name: 'Ollama', description: 'Local LLMs', category: 'LLM', status: 'stopped', port: 11434, defaultPort: 11434, docsUrl: null, installed: true, node: { apiFormat: 'openai', endpoint: '/v1/chat/completions' } },
+  { id: 'my-image-rig', name: 'My image rig', description: 'Pictures', category: 'Image Generation', status: 'stopped', port: 17910, defaultPort: 17910, docsUrl: null, installed: false, node: { endpoint: '/generate', bodyTemplate: '{"prompt": {{input}}}', responsePath: 'imageUrl' } },
+  { id: 'my-llm', name: 'My LLM server', description: 'Local LLMs', category: 'LLM', status: 'stopped', port: 11434, defaultPort: 11434, docsUrl: null, installed: true, node: { apiFormat: 'openai', endpoint: '/v1/chat/completions' } },
   { id: 'lm', name: 'Local LLM', description: 'Started with OAIY', category: 'LLM', status: 'stopped', port: 1234, defaultPort: 1234, docsUrl: null, installed: true, autostart: true, node: { apiFormat: 'openai', endpoint: '/v1/chat/completions' } },
   { id: 'my-rig', name: 'My Python rig', description: 'A rig', category: 'Audio', status: 'running', port: 9000, defaultPort: 9000, docsUrl: null, installed: true },
 ];
@@ -151,10 +151,10 @@ await check('engine entries are listed with their calls made absolute on the des
 
 await check("a desktop service that is not installed is not listed; a stopped installed one is, after the engine's", () => {
   const ids = desktop.map((s) => s.id);
-  assert.ok(!ids.includes('companion:krea2'), 'krea2 is not installed');
-  assert.ok(ids.includes('companion:ollama') && ids.includes('companion:my-rig'));
+  assert.ok(!ids.includes('companion:my-image-rig'), 'my-image-rig is not installed');
+  assert.ok(ids.includes('companion:my-llm') && ids.includes('companion:my-rig'));
   assert.ok(ids.indexOf('engine:voice') === -1 && ids.indexOf('companion:my-rig') > ids.indexOf('voice:transcribe'), 'engine entries first');
-  assert.ok(ids.indexOf('companion:my-rig') < ids.indexOf('companion:ollama'), 'running ones first');
+  assert.ok(ids.indexOf('companion:my-rig') < ids.indexOf('companion:my-llm'), 'running ones first');
   assert.equal(M.mapToCustomService(SERVICES[0]), null);
   assert.equal(M.mapToCustomService(SERVICES[2]).group, 'desktop');
 });
@@ -189,7 +189,7 @@ await check('a saved flow using a model or service that is not there says what i
   assert.equal(M.nodeNotice('music_gen', { service: 'engine:music' }, env()), null);
   assert.match(M.nodeNotice('music_gen', { service: 'engine:music:gone' }, env()), /music model “gone” is not installed.*Engines/);
   assert.match(M.nodeNotice('model_3d', {}, env()), /no 3D model installed/, 'the new nodes default to the engine');
-  assert.match(M.nodeNotice('service_call', { service: 'companion:krea2' }, env()), /“krea2” is not installed in OAIY.*Services/);
+  assert.match(M.nodeNotice('service_call', { service: 'companion:my-image-rig' }, env()), /“my-image-rig” is not installed in OAIY.*Services/);
   assert.match(M.nodeNotice('text_to_speech', { service: 'deleted-custom' }, env()), /not in this editor's services/);
   assert.match(M.nodeNotice('speech_to_text', { service: 'voice:transcribe' }, env({ desktop: desktop.filter((s) => !s.id.startsWith('voice:')) })), /OAIY Voice is not installed/);
   assert.equal(M.nodeNotice('music_gen', { service: 'ace-step' }, env()), null, "the node's own request code");
@@ -220,18 +220,18 @@ await check('the Service dropdown is grouped: OAIY engine, your services, custom
 
 await check('lists offer only what is in use: a stopped service is left out but still resolves', () => {
   const by = (id) => desktop.find((s) => s.id === id);
-  assert.equal(M.isListed(by('companion:ollama')), false, 'installed, stopped, not started with OAIY');
+  assert.equal(M.isListed(by('companion:my-llm')), false, 'installed, stopped, not started with OAIY');
   assert.equal(M.isListed(by('companion:lm')), true, 'started with OAIY');
   assert.equal(M.isListed(by('companion:my-rig')), true, 'running');
   assert.equal(M.isListed(by('engine:music:song')), true);
   assert.equal(M.isListed(CUSTOM[0]), true, "the user's own");
-  // An AI LLM node offers the engine and Local LLM; Ollama only while a flow already uses it.
+  // An AI LLM node offers the engine and Local LLM; My LLM server only while a flow already uses it.
   const llm = M.serviceOptions('ai_llm', env(), () => {});
-  const ollama = llm.find((o) => o.value === 'companion:ollama');
-  assert.equal(ollama.onlyWhenSelected, true);
+  const myLlm = llm.find((o) => o.value === 'companion:my-llm');
+  assert.equal(myLlm.onlyWhenSelected, true);
   assert.ok(!llm.find((o) => o.value === 'companion:lm').onlyWhenSelected);
   // A flow that uses it still runs on it, with no "not installed" notice.
-  assert.equal(M.nodeNotice('ai_llm', { service: 'companion:ollama' }, env()), null);
+  assert.equal(M.nodeNotice('ai_llm', { service: 'companion:my-llm' }, env()), null);
   // Nothing in use serves music: the palette has no Music Gen from a stopped rig.
   const stoppedRig = { id: 'companion:rig', name: 'Rig', endpoint: 'http://127.0.0.1:9000/music', method: 'POST', headers: '{}', bodyTemplate: '{}', responseType: 'json', responsePath: '', nodeTypes: ['music_gen'], group: 'desktop', inUse: false };
   const noMusic = env({ desktop: [...desktop.filter((s) => s.kind !== 'music'), stoppedRig] });
@@ -255,7 +255,7 @@ await check("Service Call offers each kind's default model, not every model", ()
 await check('a dropped engine entry becomes the node it is for; a service node starts on the engine', () => {
   const registered = () => true;
   assert.equal(M.nodeTypeForService(desktop.find((s) => s.id === 'engine:music:song'), registered), 'music_gen');
-  assert.equal(M.nodeTypeForService(desktop.find((s) => s.id === 'companion:ollama'), registered), 'service_call');
+  assert.equal(M.nodeTypeForService(desktop.find((s) => s.id === 'companion:my-llm'), registered), 'service_call');
   assert.equal(M.nodeTypeForService(desktop.find((s) => s.id === 'engine:music:song'), () => false), 'service_call');
   assert.equal(M.initialServiceFor('music_gen', env()), 'engine:music');
   assert.equal(M.initialServiceFor('speech_to_text', env()), 'voice:transcribe');
@@ -339,7 +339,7 @@ await check('image_gen, video_gen, ai_llm and Service Call resolve engine entrie
   const call = compile(M.ServiceCompiler, 'service_call', { service: 'engine:sound:moss' }, { prompt: 'node_in' });
   assert.match(call, /Service\.callContract\(/);
   assert.match(call, /"prompt": node_in/);
-  assert.match(compile(M.ServiceCompiler, 'service_call', { service: 'companion:ollama' }, { input: 'node_in' }), /Service\.call\(/);
+  assert.match(compile(M.ServiceCompiler, 'service_call', { service: 'companion:my-llm' }, { input: 'node_in' }), /Service\.call\(/);
 });
 
 // ---------------------------------------------------------------------------

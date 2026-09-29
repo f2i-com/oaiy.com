@@ -69,8 +69,8 @@ export type ServiceOutputKind = 'image' | 'video' | 'audio' | 'model3d' | 'text'
 
 /**
  * Where a service comes from, for grouping in the pickers: OAIY's own engine
- * (its models, OAIY Voice), a service OAIY Desktop runs (Python rigs, Ollama,
- * llama.cpp, …), or one the user defined in this editor.
+ * (its models, OAIY Voice), a service OAIY Desktop runs (Python rigs, ComfyUI,
+ * …), or one the user defined in this editor.
  */
 export type ServiceGroup = 'engine' | 'desktop' | 'custom';
 
@@ -360,8 +360,10 @@ export const BUILT_IN_SERVICES: CustomService[] = [
       'Works with InstructPix2Pix servers, SDXL inpaint webhooks, or any custom edit endpoint that accepts JSON {prompt, image}.',
   },
   {
-    // ByteDance Lance, served by the OAIY Desktop's lance_server.py
-    // (JSON API at /generate, Gradio UI at /ui, default port 17900). The
+    // ByteDance Lance, over the JSON API of the Lance server OAIY Desktop used
+    // to install (lance_server.py: /generate, Gradio UI at /ui, port 17900).
+    // Kept so flows saved with it still open and for a server the person runs
+    // themselves; OAIY's own engine makes pictures and video now. The
     // body template carries the gen knobs (edit seconds/seed/steps/size
     // inline on the node); {{prompt}} is the connected text input. The
     // server returns an ABSOLUTE videoUrl, so the video output is a
@@ -370,7 +372,7 @@ export const BUILT_IN_SERVICES: CustomService[] = [
     name: 'Lance — Text → Video',
     icon: '🎬',
     description:
-      "ByteDance Lance text-to-video via the OAIY Desktop's Lance service (port 17900). Connect a text prompt; outputs a playable video URL. Tweak seconds/seed/steps/size in the body template.",
+      "ByteDance Lance text-to-video from a Lance server you run yourself (port 17900). Connect a text prompt; outputs a playable video URL. Tweak seconds/seed/steps/size in the body template.",
     endpoint: 'http://127.0.0.1:17900/generate',
     method: 'POST',
     headers: '{}',
@@ -386,7 +388,7 @@ export const BUILT_IN_SERVICES: CustomService[] = [
     ],
     outputs: [{ id: 'response', name: 'Video', type: 'video' }],
     installHint:
-      "Install + start 'Lance (Image+Video)' in the OAIY Desktop (Services tab). JSON API at http://127.0.0.1:17900/generate, Lance UI at http://127.0.0.1:17900/ui. The first generation loads the model (slow); later ones reuse it. Needs a large GPU (~40GB peak for 480p).",
+      "For a Lance server you run yourself: JSON API at http://127.0.0.1:17900/generate, Lance UI at /ui. Needs a large GPU (~40GB peak for 480p). OAIY no longer installs one — for video from OAIY's own engine, add a video model in OAIY → Engines.",
   },
   {
     // Same Lance service, image task -> returns an absolute imageUrl.
@@ -394,7 +396,7 @@ export const BUILT_IN_SERVICES: CustomService[] = [
     name: 'Lance — Text → Image',
     icon: '🎨',
     description:
-      "ByteDance Lance text-to-image via the OAIY Desktop's Lance service (port 17900). Connect a text prompt; outputs an image URL. Tweak seed/steps/size in the body template.",
+      "ByteDance Lance text-to-image from a Lance server you run yourself (port 17900). Connect a text prompt; outputs an image URL. Tweak seed/steps/size in the body template.",
     endpoint: 'http://127.0.0.1:17900/generate',
     method: 'POST',
     headers: '{}',
@@ -410,11 +412,13 @@ export const BUILT_IN_SERVICES: CustomService[] = [
     ],
     outputs: [{ id: 'response', name: 'Image', type: 'image' }],
     installHint:
-      "Install + start 'Lance (Image+Video)' in the OAIY Desktop (Services tab). JSON API at http://127.0.0.1:17900/generate, Lance UI at http://127.0.0.1:17900/ui. The first generation loads the model (slow); later ones reuse it.",
+      "For a Lance server you run yourself: JSON API at http://127.0.0.1:17900/generate, Lance UI at /ui. OAIY no longer installs one — for pictures from OAIY's own engine, add an image model in OAIY → Engines.",
   },
   {
-    // Lightricks LTX-2.3 distilled (text → video + audio), served by the
-    // OAIY Desktop's ltx2_server.py (JSON /generate, default port 17890).
+    // Lightricks LTX-2.3 distilled (text → video + audio), over the JSON API of
+    // the LTX-2.3 server OAIY Desktop used to install (ltx2_server.py: /generate,
+    // port 17890). Kept for saved flows and a server the person runs themselves;
+    // OAIY's own engine makes LTX video now.
     // The distilled pipeline runs two stages internally (half-res gen → 2×
     // spatial upscale → refine). Body carries the gen knobs; {{prompt}} is
     // the connected text input. Returns an ABSOLUTE videoUrl for direct
@@ -425,7 +429,7 @@ export const BUILT_IN_SERVICES: CustomService[] = [
     name: 'LTX-2.3 — Text → Video',
     icon: '🎬',
     description:
-      "Lightricks LTX-2.3 distilled text-to-video (with audio) via the OAIY Desktop's LTX-2.3 service (port 17890). Connect a text prompt; outputs a playable video URL. Tune size/frames/seed in the body template (dims ÷64, frames = 8k+1).",
+      "Lightricks LTX-2.3 distilled text-to-video (with audio) from an LTX-2.3 server you run yourself (port 17890). Connect a text prompt; outputs a playable video URL. Tune size/frames/seed in the body template (dims ÷64, frames = 8k+1).",
     endpoint: 'http://127.0.0.1:17890/generate',
     method: 'POST',
     headers: '{}',
@@ -441,7 +445,7 @@ export const BUILT_IN_SERVICES: CustomService[] = [
     ],
     outputs: [{ id: 'response', name: 'Video', type: 'video' }],
     installHint:
-      "Install + start 'LTX-2.3 Video' in the OAIY Desktop (Services tab), and add the folder holding the LTX-2.3 weights under Settings → Model Folders (e.g. E:\\ckpts). JSON API at http://127.0.0.1:17890/generate. The first generation loads the 22B model (slow); later ones reuse it. Needs a ~32 GB GPU; the server auto-picks the freest one.",
+      "For an LTX-2.3 server you run yourself: JSON API at http://127.0.0.1:17890/generate. Needs a ~32 GB GPU. OAIY no longer installs one — OAIY's own engine makes LTX video: add the model in OAIY → Engines.",
   },
 ];
 

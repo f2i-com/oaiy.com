@@ -4,8 +4,8 @@
  * When OAIY Desktop is running it offers two kinds of services, and this
  * module polls both while the desktop is available:
  *
- *   - `GET /api/services`: the local services it manages (Ollama, llama.cpp,
- *     Python rigs …), ids `companion:<id>`. Only INSTALLED ones are listed —
+ *   - `GET /api/services`: the local services it manages (Python rigs,
+ *     OAIY Voice, the person's own servers …), ids `companion:<id>`. Only INSTALLED ones are listed —
  *     a stopped one is still pickable (the runtime asks the desktop to start
  *     it), one that is not installed cannot run and is left out.
  *   - `GET /api/ai/engine/services` (in OAIY's window only): OAIY's engine's
@@ -142,8 +142,8 @@ export function mapToCustomService(s: DesktopServiceSnapshot): CustomService | n
   const id = `companion:${s.id}`;
   const running = s.status === 'running';
   const statusTag = running ? 'running' : s.status;
-  // Keep the node/palette description to a tidy one-liner — OAIY Desktop can
-  // report a long paragraph (krea2's is), which overflows the node body.
+  // Keep the node/palette description to a tidy one-liner — a template's
+  // description can be a long paragraph, which overflows the node body.
   const rawDesc = (s.description || `Managed by the OAIY Desktop on port ${port}.`).trim();
   const firstSentence = rawDesc.split('. ')[0];
   const baseDesc =
@@ -210,9 +210,10 @@ export function mapToCustomService(s: DesktopServiceSnapshot): CustomService | n
     };
   }
 
-  // OAIY-managed image/video services expose POST /generate {prompt,...} and
-  // return an image/video URL — wire that contract so a dragged node runs as-is
-  // (otherwise it POSTs to the bare base URL and gets a 405 Method Not Allowed).
+  // An image/video service that declares no contract is taken to speak the
+  // convention OAIY's old picture and video services did: POST /generate
+  // {prompt,...}, answering with an image/video URL. Wire that so a dragged node
+  // runs as-is (otherwise it POSTs to the bare base URL and gets a 405).
   const isVideo = cat === 'video generation';
   if (isVideo || cat === 'image generation') {
     return {
