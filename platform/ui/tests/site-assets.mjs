@@ -70,6 +70,39 @@ await check('the screenshots and the card are what scripts/make-site-images.py m
   assert.equal(run.status, 0, `${run.stdout}${run.stderr}`);
 });
 
+/** Run scripts/make-site-images.py with `flag`; null where there is no Python or Pillow to run it. */
+function siteImages(flag) {
+  const run = spawnSync(process.platform === 'win32' ? 'python' : 'python3', [path.join(UI, 'scripts', 'make-site-images.py'), flag], { encoding: 'utf8' });
+  if (run.error || /No module named|is missing/.test(`${run.stderr}${run.stdout}`)) return null;
+  return run;
+}
+
+await check('the only phone numbers the pictures show are the three fictional ones this project uses (0491 570 006, 156 and 157), and each picture says which it shows', () => {
+  const run = siteImages('--numbers');
+  if (!run) {
+    console.log('    (cannot run the script here: skipped)');
+    return;
+  }
+  const { allowed, shown, pictures } = JSON.parse(run.stdout);
+  assert.deepEqual(allowed, ['0491 570 006', '0491 570 156', '0491 570 157']);
+  assert.deepEqual(Object.keys(shown).sort(), [...pictures].sort(), 'every picture the site shows is accounted for');
+  assert.deepEqual([...pictures].sort(), S.SCREENSHOT_LIST.map((shot) => path.basename(shot.src, '.webp')).sort(), 'and they are the ones the page shows');
+  for (const [picture, numbers] of Object.entries(shown)) {
+    for (const number of numbers) assert.ok(allowed.includes(number), `${picture} shows ${number}`);
+  }
+});
+
+await check('the number that is not one of them (the calendar\'s second request) is covered in the copy the site serves, and nothing else in it differs from its source (skipped where there is no Python or Pillow)', () => {
+  const run = siteImages('--verify-redactions');
+  if (!run) {
+    console.log('    (cannot run the script here: skipped)');
+    return;
+  }
+  assert.equal(run.status, 0, `${run.stdout}${run.stderr}`);
+  assert.match(run.stdout, /redactions ok/);
+  assert.match(fs.readFileSync(path.join(UI, 'scripts', 'make-site-images.py'), 'utf8'), /"calendar": \[\(\d+, \d+, \d+, \d+\)\]/, 'the calendar has a covered box');
+});
+
 await check('the social card is 1200 x 630', () => {
   const data = fs.readFileSync(publicFile('og-image.png'));
   assert.equal(data.subarray(0, 8).toString('hex'), '89504e470d0a1a0a');

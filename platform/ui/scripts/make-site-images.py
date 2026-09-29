@@ -2,6 +2,7 @@
 
     python platform/ui/scripts/make-site-images.py          # writes into platform/ui/public
     python platform/ui/scripts/make-site-images.py --check  # exits 1 if the files there do not look like what this makes
+    python platform/ui/scripts/make-site-images.py --verify-redactions  # exits 1 if a covered number is not covered
 
 Sources are docs/images (the README's screenshots of a demo setup: the business, the people and their
 numbers are made up, and the numbers are ones the ACMA keeps for fiction) and the desktop's
@@ -45,6 +46,27 @@ SCREENSHOTS = {
 WEBP_QUALITY = 80
 MAX_BYTES = 200 * 1024
 
+# The only phone numbers the site shows are the three the ACMA keeps for fiction that this project uses
+# (0491 570 006, 0491 570 156, 0491 570 157). The demo screenshots also show others from the same reserved
+# ranges, so a number that is not one of the three is covered in the site's copy of the picture, with a plain
+# bar over just the number: (left, top, right, bottom) in the picture's own pixels. docs/images is not changed.
+# `--verify-redactions` checks each box really differs from the source and that nothing else does.
+REDACTIONS = {
+    # The number in the second request ("Ella Morgan", asked by text): a phone number that is not one of the three above.
+    "calendar": [(406, 306, 485, 322)],
+}
+
+ALLOWED_NUMBERS = ("0491 570 006", "0491 570 156", "0491 570 157")
+
+# The numbers each of the site's pictures shows once redacted, read off the picture when it was chosen. A picture that
+# is swapped for another has to be looked at again and this updated (tests/site-assets.mjs holds it to ALLOWED_NUMBERS).
+NUMBERS_SHOWN = {
+    "agent": [],
+    "flows": [],
+    "receptionist-call": ["0491 570 006"],
+    "calendar": ["0491 570 006"],
+}
+
 # The marketing site's own palette (src/landing/marketing.css, Prism Lab).
 BG = (14, 21, 23)
 BORDER = (48, 65, 59)
@@ -53,8 +75,22 @@ TEXT_SECONDARY = (172, 190, 182)
 ACCENT = (105, 240, 183)
 
 
+def source(name: str) -> Image.Image:
+    return Image.open(IMAGES / SCREENSHOTS[name]).convert("RGB")
+
+
+def redacted(name: str) -> Image.Image:
+    """The screenshot with the numbers that may not be shown covered by a bar the colour of a darker page."""
+    image = source(name)
+    draw = ImageDraw.Draw(image)
+    for left, top, right, bottom in REDACTIONS.get(name, []):
+        page = image.getpixel((min(right, image.width - 1) - 40, max(top - 4, 0)))
+        draw.rounded_rectangle((left, top, right, bottom), radius=3, fill=tuple(int(c * 0.74) for c in page))
+    return image
+
+
 def screenshot(name: str) -> bytes:
-    image = Image.open(IMAGES / SCREENSHOTS[name]).convert("RGB")
+    image = redacted(name)
     buffer = BytesIO()
     image.save(buffer, "WEBP", quality=WEBP_QUALITY, method=6)
     data = buffer.getvalue()
@@ -168,7 +204,47 @@ def same_picture(existing: bytes, fresh: bytes) -> bool:
     return max(ImageStat.Stat(ImageChops.difference(a, b)).mean) <= TOLERANCE
 
 
+def verify_redactions() -> int:
+    """Each covered box differs from the source (the number is really gone), and the rest of the picture does not."""
+    from PIL import ImageChops, ImageStat
+
+    problems = []
+    for name in SCREENSHOTS:
+        shown = Image.open(PUBLIC / "images" / f"{name}.webp").convert("RGB")  # the file the site serves
+        original = source(name)
+        difference = ImageChops.difference(shown, original)
+        boxes = REDACTIONS.get(name, [])
+        for box in boxes:
+            covered = ImageStat.Stat(difference.crop(box)).mean
+            # A bar is a different colour from the page in every channel (WebP alone changes text by a few levels, and a
+            # channel or two by up to about 12), and it is a flat colour where the number was writing.
+            flat = max(ImageStat.Stat(shown.crop(box)).stddev)
+            if min(covered) < 30 or flat > 10:
+                problems.append(f"{name}: {box} is not covered (it differs by {min(covered):.1f}, and is {flat:.1f} from flat)")
+            # A box has to be over writing in the source: if the screenshot changes and the number moves, this says so.
+            ink = sum(original.crop(box).convert("L").histogram()[:150])
+            if ink < 60:
+                problems.append(f"{name}: {box} has only {ink} dark pixels of the source under it: is the number still there?")
+        mask = Image.new("L", shown.size, 255)
+        for box in boxes:
+            ImageDraw.Draw(mask).rectangle((box[0] - 2, box[1] - 2, box[2] + 2, box[3] + 2), fill=0)
+        elsewhere = ImageStat.Stat(difference, mask).mean
+        if max(elsewhere) > 4:
+            problems.append(f"{name}: the rest of the picture differs from its source by {max(elsewhere):.1f}")
+    for problem in problems:
+        print(problem)
+    print("redactions ok" if not problems else "redactions NOT ok")
+    return 1 if problems else 0
+
+
 def main() -> int:
+    if "--numbers" in sys.argv[1:]:
+        import json
+
+        print(json.dumps({"allowed": ALLOWED_NUMBERS, "shown": NUMBERS_SHOWN, "pictures": list(SCREENSHOTS)}))
+        return 0
+    if "--verify-redactions" in sys.argv[1:]:
+        return verify_redactions()
     check = "--check" in sys.argv[1:]
     stale = []
     for target, data in make().items():

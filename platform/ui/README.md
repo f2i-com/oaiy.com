@@ -69,6 +69,9 @@ keeps offering the previous one ([`docs/RELEASING.md`](../../docs/RELEASING.md#t
 
 `scripts/make-site-images.py` makes the landing page's four screenshots (`public/images/*.webp`, from `docs/images`, the README's
 demo setup) and the social card (`public/og-image.png`, 1200 x 630). Sizes and descriptions are in `src/landing/screenshots.ts`.
+The only phone numbers the site shows are `0491 570 006`, `0491 570 156` and `0491 570 157`: the calendar screenshot also shows
+another number from the same reserved ranges, which the script covers with a bar in the site's copy (`docs/images` is not changed),
+and `tests/site-assets.mjs` checks the bar is there and that each picture's numbers are declared.
 
 ## Tests
 
