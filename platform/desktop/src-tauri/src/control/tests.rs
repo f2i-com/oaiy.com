@@ -120,6 +120,16 @@ async fn tools_list_offers_each_session_its_tools() {
     for s in ["call", "sms", "task", "nobody"] {
         assert!(tool_names(&app, Some(s)).await.is_empty(), "{s} gets no tools");
     }
+    // The contacts: a runner reads them; a caller or a texter is offered none, so no one on the
+    // phone can have the receptionist read out, or change, what the person wrote about others.
+    let runner = tool_names(&app, Some("runner")).await;
+    for read in ["contacts_list", "contact_get"] {
+        assert!(runner.iter().any(|t| t == read), "a runner reads {read}");
+    }
+    for change in ["contact_set", "contact_forget_fact", "ui_open"] {
+        assert!(!runner.iter().any(|t| t == change), "a runner may not {change}");
+        assert!(all.iter().any(|t| t == change), "a project may {change}");
+    }
 }
 
 #[tokio::test]
@@ -369,10 +379,11 @@ fn every_tool_is_declared_for_a_model() {
         "plugin_install", "plugin_enable", "plugin_disable", "plugin_uninstall", "plugin_settings_set", "plugin_command", "plugin_setup_open",
         "plugin_setup_step_done", "flows_list", "flow_get", "flow_create", "flow_update", "flow_run", "flow_delete", "calendar_settings_get",
         "calendar_settings_set", "link_status", "link_sync_now", "setup_status", "setup_finish", "logs_tail",
+        "contacts_list", "contact_get", "contact_set", "contact_forget_fact", "ui_open",
     ] {
         assert!(names.contains(&want), "{want} is declared");
     }
-    let removals = ["chatgpt_sign_out", "service_uninstall", "plugin_uninstall", "flow_delete"];
+    let removals = ["chatgpt_sign_out", "service_uninstall", "plugin_uninstall", "flow_delete", "contact_forget_fact"];
     for d in defs {
         let l = d.listing();
         assert_eq!(l["inputSchema"]["type"], "object", "{}", d.name);
@@ -514,6 +525,89 @@ async fn a_read_and_a_change_go_through_the_desktops_router_and_its_gate() {
     assert_eq!(log, expect);
 }
 
+#[tokio::test]
+async fn the_contact_tools_read_and_change_the_contacts_through_the_desktops_router() {
+    use crate::voice::contacts::{routes, By, Store};
+    let sb = Sandbox::new("contacts");
+    let store = Store::at(sb.0.join("callers.json"));
+    let control = Control::with_navigator(&sb.0, None);
+    let app = crate::http::guarded_for_tests(Router::new().merge(routes::router(store.clone())).merge(super::router(control.clone())), Some("desk-token".into()), false);
+    control.set_router(app.clone());
+    let tool = |session: &'static str, name: &'static str, args: Value| {
+        let app = app.clone();
+        async move {
+            let headers = [("Authorization", "Bearer desk-token"), ("X-OAIY-Session", session)];
+            let (status, v) = send(&app, Method::POST, "/api/mcp", &headers, Some(json!({ "jsonrpc": "2.0", "id": 3, "method": "tools/call", "params": { "name": name, "arguments": args } }).to_string())).await;
+            assert_eq!(status, StatusCode::OK, "{v}");
+            v["result"].clone()
+        }
+    };
+
+    // Named by the person's Agent: theirs, with one word for a name.
+    let r = tool("project", "contact_set", json!({ "number": "+61 491 570 006", "name": "Lance", "notes": "Prefers texts" })).await;
+    assert!(!is_error(&r), "{r}");
+    assert_eq!(text(&r).lines().next(), Some("Saved Lance's name and notes."));
+    let c = store.get("0491570006").unwrap();
+    assert_eq!((c.name.as_str(), c.name_by, c.number.as_str()), ("Lance", Some(By::Owner), "+61 491 570 006"));
+    store.add_fact("0491570006", "Has a dog called Max", By::Agent).unwrap();
+    store.saw("+61400000001").unwrap();
+
+    let r = tool("project", "contacts_list", json!({})).await;
+    assert_eq!(r["structuredContent"]["total"], 2, "{r}");
+    assert_eq!(r["structuredContent"]["contacts"][0], json!({ "key": "491570006", "number": "+61 491 570 006", "name": "Lance", "nameBy": "owner", "notes": "Prefers texts", "facts": 1 }));
+    let r = tool("runner", "contacts_list", json!({ "q": "0491 570" })).await;
+    assert_eq!(r["structuredContent"]["found"], 1, "a runner reads, and finds by a number written the local way: {r}");
+    let r = tool("runner", "contact_get", json!({ "number": "0491570006" })).await;
+    assert_eq!(r["structuredContent"]["facts"], json!([{ "index": 0, "text": "Has a dog called Max", "by": "agent", "at": store.get("0491570006").unwrap().facts[0].at }]));
+    let r = tool("project", "contact_get", json!({ "number": "0499999999" })).await;
+    assert!(is_error(&r) && text(&r).contains("no contact"), "the route's own words: {r}");
+
+    // Forgotten; and a runner, a caller or a texter may not change them.
+    let r = tool("runner", "contact_forget_fact", json!({ "number": "0491570006", "index": 0 })).await;
+    assert!(is_error(&r) && text(&r).contains("runner session may only read"), "{r}");
+    for s in ["call", "sms", "task"] {
+        let r = tool(s, "contact_get", json!({ "number": "0491570006" })).await;
+        assert!(is_error(&r) && text(&r).contains(&format!("not offered in {s} sessions")), "{r}");
+    }
+    let r = tool("project", "contact_forget_fact", json!({ "number": "+61491570006", "index": 0 })).await;
+    assert!(!is_error(&r), "{r}");
+    assert_eq!(text(&r).lines().next(), Some("Forgot \u{201c}Has a dog called Max\u{201d} about Lance."));
+    assert!(store.get("0491570006").unwrap().facts.is_empty());
+    let r = tool("project", "contact_forget_fact", json!({ "number": "0491570006", "index": 0 })).await;
+    assert!(is_error(&r) && text(&r).contains("no fact 0"), "{r}");
+
+    // Nothing to change, or a hidden number: said so.
+    let r = tool("project", "contact_set", json!({ "number": "0491570006" })).await;
+    assert!(is_error(&r) && text(&r).contains("Give name or notes"), "{r}");
+    let r = tool("project", "contact_set", json!({ "number": "Private", "name": "Who" })).await;
+    assert!(is_error(&r) && text(&r).contains("hidden"), "{r}");
+    // An empty name clears it, and the receptionist may learn one again.
+    let r = tool("setup", "contact_set", json!({ "number": "0491570006", "name": "" })).await;
+    assert!(!is_error(&r), "{r}");
+    assert_eq!(store.get("0491570006").unwrap().name_by, None);
+
+    // The changes are in the log; the reads are not.
+    let log: Vec<(String, String, bool)> = control
+        .audit()
+        .read(20)
+        .iter()
+        .map(|e| (e["tool"].as_str().unwrap().to_string(), e["session"].as_str().unwrap().to_string(), e["ok"].as_bool().unwrap()))
+        .collect();
+    let want: Vec<(String, String, bool)> = [
+        ("contact_set", "setup", true),
+        ("contact_set", "project", false),
+        ("contact_set", "project", false),
+        ("contact_forget_fact", "project", false),
+        ("contact_forget_fact", "project", true),
+        ("contact_forget_fact", "runner", false),
+        ("contact_set", "project", true),
+    ]
+    .iter()
+    .map(|(t, s, ok)| (t.to_string(), s.to_string(), *ok))
+    .collect();
+    assert_eq!(log, want);
+}
+
 // ---------------------------------------------------------------------------
 // Showing a page
 // ---------------------------------------------------------------------------
@@ -552,6 +646,15 @@ async fn a_plugins_setup_step_is_shown_with_the_navigate_payload() {
     assert!(!is_error(&r), "{r}");
     let r = call(&app, None, "ui_open", json!({ "view": "../../etc" })).await;
     assert!(is_error(&r) && text(&r).contains("not a page"), "{r}");
+    // Contacts, and one person's: their number written any way, sent as its key.
+    let r = call(&app, None, "ui_open", json!({ "view": "contacts" })).await;
+    assert!(!is_error(&r), "{r}");
+    let r = call(&app, None, "ui_open", json!({ "view": "contacts", "contact": "+61 491 570 006" })).await;
+    assert_eq!(r["structuredContent"], json!({ "view": "contacts", "contact": "491570006" }), "{r}");
+    let r = call(&app, None, "ui_open", json!({ "view": "hours", "contact": "0491570006" })).await;
+    assert!(is_error(&r) && text(&r).contains("goes with view contacts"), "{r}");
+    let r = call(&app, None, "ui_open", json!({ "view": "contacts", "contact": "Private" })).await;
+    assert!(is_error(&r) && text(&r).contains("not a phone number"), "{r}");
     assert_eq!(
         *shown.lock().unwrap(),
         vec![
@@ -560,6 +663,8 @@ async fn a_plugins_setup_step_is_shown_with_the_navigate_payload() {
             json!({ "view": "setup", "pluginId": "demo", "stepId": "permissions" }),
             json!({ "view": "plugin:demo:home" }),
             json!({ "view": "hours" }),
+            json!({ "view": "contacts" }),
+            json!({ "view": "contacts", "contact": "491570006" }),
         ]
     );
     // The person accepts what a plugin may do: the Agent shows it rather than recording it.

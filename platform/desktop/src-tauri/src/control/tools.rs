@@ -77,6 +77,10 @@ fn flow_id() -> Value {
     json!({ "type": "string", "minLength": 1, "description": "The flow's id, as flows_list shows it." })
 }
 
+fn contact_number() -> Value {
+    json!({ "type": "string", "minLength": 1, "description": "Their phone number, written any way (0491 570 006, +61491570006, or the key contacts_list shows)." })
+}
+
 fn def(name: &'static str, title: &'static str, kind: Kind, description: &'static str, schema: Value) -> ToolDef {
     ToolDef { name, title, kind, description, schema }
 }
@@ -259,6 +263,26 @@ pub(crate) fn defs() -> &'static [ToolDef] {
                     "horizonDays": { "type": "integer", "minimum": 1, "description": "How far ahead times are offered." },
                     "textConfirmations": { "type": "boolean", "description": "Text the person when their appointment is confirmed." }
                 }), &[])),
+            // Contacts
+            def("contacts_list", "Contacts", Read,
+                "The people who ring and text, by name: each with key (the last nine digits of their number), number, name (one word is a whole name), nameBy (owner: the person named them; agent: the receptionist did; null: no name), the start of the person's notes for the receptionist, and how many facts the receptionist remembered. q finds names, numbers written any way, notes and facts.",
+                object(json!({ "q": { "type": "string", "description": "Find by name, number, notes or what was remembered." } }), &[])),
+            def("contact_get", "A contact", Read,
+                "One contact by their number: name, nameBy, the person's notes for the receptionist (it reads them on every call and text with them), and facts (what the receptionist remembered, each with its index for contact_forget_fact).",
+                object(json!({ "number": contact_number() }), &["number"])),
+            def("contact_set", "Name a contact or change their notes", Change,
+                "Set a contact's name or the person's notes for the receptionist, by their number; the contact is made when there is none. A name set here is the person's: the receptionist never renames them. Only what is given changes; an empty name clears it; notes (up to 2000 characters) replace the notes there.",
+                object(json!({
+                    "number": contact_number(),
+                    "name": { "type": "string", "description": "Their name as the person wants it; one word is fine (Lance)." },
+                    "notes": { "type": "string", "description": "The person's notes for the receptionist, whole: they replace the notes there." }
+                }), &["number"])),
+            def("contact_forget_fact", "Forget what the receptionist remembered", Remove,
+                "Forget one thing the receptionist remembered about a contact: index is the fact's place in contact_get's facts, from 0.",
+                object(json!({
+                    "number": contact_number(),
+                    "index": { "type": "integer", "minimum": 0, "maximum": 49, "description": "The fact's index in contact_get." }
+                }), &["number", "index"])),
             // FormLogic
             def("link_status", "FormLogic link", Read,
                 "The FormLogic link (linked or not, the account and address) and how the calendar sync with it stands (state, last success, what is pending, any error).",
@@ -274,8 +298,11 @@ pub(crate) fn defs() -> &'static [ToolDef] {
                 "Record OAIY's first-run setup as finished, so the dashboard stops offering it.",
                 none()),
             def("ui_open", "Show a dashboard page", Change,
-                "Show the person a page of the OAIY dashboard: overview, agent, flows, calendar, hours (Hours & Services: the business, its opening hours, services and booking rules), engines, services, plugins, runs, models, python, providers, connections, settings, setup, or a plugin's page as plugin:<pluginId>:<navId>.",
-                object(json!({ "view": { "type": "string", "minLength": 1, "description": "The page." } }), &["view"])),
+                "Show the person a page of the OAIY dashboard: overview, agent, flows, calendar, contacts (the people who ring and text; with contact, that person's own), hours (Hours & Services: the business, its opening hours, services and booking rules), engines, services, plugins, runs, models, python, providers, connections, settings, setup, or a plugin's page as plugin:<pluginId>:<navId>.",
+                object(json!({
+                    "view": { "type": "string", "minLength": 1, "description": "The page." },
+                    "contact": { "type": "string", "minLength": 1, "description": "With view contacts: a person's phone number, written any way, to open their contact." }
+                }), &["view"])),
             // Diagnostics
             def("logs_tail", "Logs", Read,
                 "The end of a log: source desktop (the default, OAIY's own), service:<id>, plugin:<id>, or engines, llm or media (the engine's); lines default 100.",
@@ -661,6 +688,19 @@ async fn run(d: &Desk, control: &Control, name: &str, a: &Args<'_>) -> Result<Do
             data(json!({ "available": v.get("available"), "settings": v.get("settings") }))
         }
         "calendar_settings_set" => calendar_settings_set(d, a).await,
+        "contacts_list" => contacts_list(d, a.str("q")).await,
+        "contact_get" => {
+            let c = d.get(&format!("/api/contacts/{}", seg(a.req("number")))).await?;
+            data(contact_view(&c))
+        }
+        "contact_set" => contact_set(d, a).await,
+        "contact_forget_fact" => {
+            let (number, index) = (a.req("number"), a.int("index").unwrap_or_default());
+            let v = d.delete(&format!("/api/contacts/{}/facts/{index}", seg(number))).await?;
+            let text = v.pointer("/forgotten/text").and_then(Value::as_str).unwrap_or_default();
+            let who = contact_name(&v["contact"]);
+            done(format!("Forgot \u{201c}{text}\u{201d} about {who}."), json!({ "forgotten": v.get("forgotten"), "contact": contact_view(&v["contact"]) }))
+        }
         "link_status" => link_status(d).await,
         "link_sync_now" => {
             let report = d.post_empty("/api/calendar/sync").await?;
@@ -692,8 +732,16 @@ async fn run(d: &Desk, control: &Control, name: &str, a: &Args<'_>) -> Result<Do
             if !view_ok(view) {
                 return Err(format!("{view:?} is not a page: one of {}, or plugin:<pluginId>:<navId>.", VIEWS.join(", ")));
             }
-            control.navigate(json!({ "view": view }))?;
-            done(format!("The dashboard shows {view}."), json!({ "view": view }))
+            let mut payload = json!({ "view": view });
+            if let Some(contact) = a.str("contact") {
+                if view != "contacts" {
+                    return Err(format!("contact goes with view contacts, not {view}."));
+                }
+                let key = crate::voice::contacts::key(contact).ok_or_else(|| format!("{contact:?} is not a phone number, or it is a hidden one."))?;
+                payload["contact"] = json!(key);
+            }
+            control.navigate(payload.clone())?;
+            done(format!("The dashboard shows {view}."), payload)
         }
         "logs_tail" => logs_tail(d, a.str("source").unwrap_or("desktop"), a.int("lines").unwrap_or(100) as usize).await,
         other => Err(format!("{other} has no handler: this is a bug in OAIY.")),
@@ -1770,9 +1818,78 @@ async fn setup_status(d: &Desk) -> Result<Done, String> {
 }
 
 /// The dashboard's own pages, as it names them.
-pub(crate) const VIEWS: [&str; 15] = [
-    "overview", "agent", "flows", "calendar", "hours", "engines", "services", "plugins", "runs", "models", "python", "providers", "connections", "settings", "setup",
+pub(crate) const VIEWS: [&str; 16] = [
+    "overview", "agent", "flows", "calendar", "contacts", "hours", "engines", "services", "plugins", "runs", "models", "python", "providers", "connections", "settings", "setup",
 ];
+
+// ---------------------------------------------------------------------------
+// Contacts
+// ---------------------------------------------------------------------------
+
+/// The most contacts `contacts_list` shows (q finds the rest).
+const MAX_CONTACTS: usize = 200;
+
+/// A contact's name, else their number.
+fn contact_name(c: &Value) -> String {
+    [s(c, "name"), s(c, "number"), s(c, "key")].into_iter().find(|v| !v.is_empty()).unwrap_or_else(|| "them".into())
+}
+
+/// A contact as the tools show it: its facts with their index (for contact_forget_fact).
+fn contact_view(c: &Value) -> Value {
+    let facts: Vec<Value> = arr(c, "facts")
+        .iter()
+        .enumerate()
+        .map(|(i, f)| json!({ "index": i, "text": f.get("text"), "by": f.get("by"), "at": f.get("at") }))
+        .collect();
+    json!({
+        "key": c.get("key"),
+        "number": c.get("number"),
+        "name": c.get("name"),
+        "nameBy": c.get("nameBy"),
+        "notes": c.get("notes"),
+        "facts": facts,
+        "updatedAt": c.get("updatedAt"),
+    })
+}
+
+async fn contacts_list(d: &Desk, q: Option<&str>) -> Result<Done, String> {
+    let v = d.get(&q.map_or_else(|| "/api/contacts".to_string(), |q| format!("/api/contacts?q={}", seg(q)))).await?;
+    let all = arr(&v, "contacts");
+    let rows: Vec<Value> = all
+        .iter()
+        .take(MAX_CONTACTS)
+        .map(|c| {
+            let notes = s(c, "notes");
+            let notes = if notes.chars().count() > 200 { format!("{}\u{2026}", notes.chars().take(200).collect::<String>()) } else { notes };
+            json!({ "key": c.get("key"), "number": c.get("number"), "name": c.get("name"), "nameBy": c.get("nameBy"), "notes": notes, "facts": arr(c, "facts").len() })
+        })
+        .collect();
+    let mut out = json!({ "contacts": rows, "found": all.len(), "total": v.get("total") });
+    if all.len() > MAX_CONTACTS {
+        out["more"] = json!(format!("{} more: give q to find someone.", all.len() - MAX_CONTACTS));
+    }
+    data(out)
+}
+
+async fn contact_set(d: &Desk, a: &Args<'_>) -> Result<Done, String> {
+    let number = a.req("number");
+    let mut body = Map::new();
+    for key in ["name", "notes"] {
+        if let Some(v) = a.value(key).and_then(Value::as_str) {
+            body.insert(key.to_string(), json!(v));
+        }
+    }
+    if body.is_empty() {
+        return Err("Give name or notes to change (an empty name clears it).".into());
+    }
+    let what = body.keys().cloned().collect::<Vec<_>>().join(" and ");
+    // A whole number (more than the key's nine digits) is kept as theirs.
+    if number.chars().filter(char::is_ascii_digit).count() > 9 {
+        body.insert("number".to_string(), json!(number));
+    }
+    let c = d.put(&format!("/api/contacts/{}", seg(number)), Value::Object(body)).await?;
+    done(format!("Saved {}'s {what}.", contact_name(&c)), json!({ "contact": contact_view(&c) }))
+}
 
 /// A page the dashboard has: one of [`VIEWS`], or `plugin:<pluginId>:<navId>`.
 pub(crate) fn view_ok(view: &str) -> bool {

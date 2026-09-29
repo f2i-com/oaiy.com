@@ -61,7 +61,8 @@ pub const SETTINGS_FILE: &str = "control.json";
 pub const LOG_FILE: &str = "control-log.jsonl";
 /// The header the Agent app says who is asking with.
 pub const SESSION_HEADER: &str = "x-oaiy-session";
-/// The Tauri event the dashboard navigates on: `{view, pluginId?, stepId?}`.
+/// The Tauri event the dashboard navigates on: `{view, pluginId?, stepId?, contact?}`
+/// (`contact`: with view `contacts`, the key of the person to open).
 pub const NAVIGATE_EVENT: &str = "oaiy://navigate";
 /// What a change tool answers while the switch is off.
 pub const SWITCHED_OFF: &str = "The Agent may not change OAIY: switch it on in Settings → Agent";
