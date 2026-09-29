@@ -375,6 +375,19 @@ pub(crate) fn leave_for_page(data_dir: &Path, id: &str, kind: &str, zip: &Path, 
     secret_file::write(&dir.join("current.json"), serde_json::to_string_pretty(&meta).unwrap_or_default())
 }
 
+/// Drop a hand-over that has waited longer than `max_age` (the page asks at every start, so one still
+/// there was refused, or cannot be taken). Returns the restore it belonged to.
+pub(crate) fn drop_stale_import(data_dir: &Path, max_age: Duration) -> Option<String> {
+    let dir = import_dir(data_dir);
+    let waiting = std::fs::metadata(dir.join("current.json")).and_then(|m| m.modified()).ok()?;
+    if waiting.elapsed().unwrap_or_default() < max_age {
+        return None;
+    }
+    let id = serde_json::from_str::<PendingImport>(&std::fs::read_to_string(dir.join("current.json")).ok()?).ok().map(|p| p.id)?;
+    drop_pending_import(data_dir);
+    Some(id)
+}
+
 /// Forget an import nobody asked for (a restore that was cancelled or rolled back).
 pub(crate) fn drop_pending_import(data_dir: &Path) {
     let dir = import_dir(data_dir);

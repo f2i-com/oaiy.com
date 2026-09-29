@@ -2629,3 +2629,118 @@ fn a_rollback_at_the_next_start_that_cannot_finish_says_so_too() {
     assert!(restore_dir.join(format!("apply-journal-{}.jsonl", staged.id)).is_file(), "and so is the journal");
     assert!(matches!(restore::apply_pending(&dst.0), ApplyOutcome::None), "it is not tried again behind the person's back");
 }
+
+// ---- a prepared restore does not wait for ever ---------------------------------------------------------
+
+/// Make the waiting restore look as if it was prepared `hours` ago (negative: in the future), or with a time that is no time.
+fn stage_time(data: &Path, at: Option<i64>) {
+    let path = data.join("restore").join("pending.json");
+    let mut marker: serde_json::Value = serde_json::from_str(&fs::read_to_string(&path).unwrap()).unwrap();
+    marker["stagedAt"] = match at {
+        Some(hours) => serde_json::Value::String((chrono::Utc::now() - chrono::Duration::hours(hours)).to_rfc3339_opts(chrono::SecondsFormat::Millis, true)),
+        None => serde_json::Value::String("last Tuesday".into()),
+    };
+    fs::write(&path, serde_json::to_string_pretty(&marker).unwrap()).unwrap();
+}
+
+fn staged_for_age_tests(tag: &str) -> (TempDir, TempDir, BTreeMap<String, Vec<u8>>) {
+    let src = TempDir::new(&format!("{tag}-src"));
+    realistic(&src.0, "A");
+    let out = TempDir::new(&format!("{tag}-out"));
+    let file = out.0.join("age.oaiybackup");
+    make(&src.0, &file);
+    let dst = TempDir::new(&format!("{tag}-dst"));
+    target(&dst.0);
+    let before = snapshot(&dst.0);
+    restore::stage(&dst.0, &file, PASS, &Ticks::all(), &options()).unwrap();
+    (out, dst, before)
+}
+
+#[test]
+fn a_restore_prepared_more_than_a_day_ago_is_not_applied_and_says_so() {
+    for (what, at) in [("25 hours old", Some(25)), ("a week old", Some(24 * 7)), ("dated in the future", Some(-72)), ("dated with no time", None)] {
+        let (_out, dst, before) = staged_for_age_tests("expiry");
+        stage_time(&dst.0, at);
+        let info = restore::pending_info(&dst.0).unwrap();
+        assert!(info.expired, "{what}: the panel is told it will not be applied");
+        let outcome = restore::apply_pending(&dst.0);
+        let ApplyOutcome::Expired(last) = outcome else { panic!("{what}: it should have expired: {outcome:?}") };
+        assert!(!last.ok && last.error.as_deref().unwrap().contains("more than a day old"), "{what}: {last:?}");
+        assert_eq!(snapshot(&dst.0), before, "{what}: nothing changed");
+        assert!(restore::pending_info(&dst.0).is_none() && !dst.0.join("restore").join("pending.json").exists());
+        assert!(fs::read_dir(dst.0.join("restore")).unwrap().flatten().all(|e| !e.file_name().to_string_lossy().starts_with("pending-")), "{what}: the prepared copy was deleted");
+        let reported = restore::last_restore(&dst.0).unwrap();
+        assert!(!reported.ok && reported.error.as_deref().unwrap().contains("Choose the backup again"), "{what}");
+        assert!(matches!(restore::apply_pending(&dst.0), ApplyOutcome::None), "{what}: nothing is applied afterwards");
+    }
+}
+
+#[test]
+fn a_restore_prepared_a_short_while_ago_is_still_applied() {
+    for hours in [0, 1, 23] {
+        let (_out, dst, before) = staged_for_age_tests("fresh");
+        stage_time(&dst.0, Some(hours));
+        let info = restore::pending_info(&dst.0).unwrap();
+        assert!(!info.expired, "{hours} h");
+        let staged = chrono::DateTime::parse_from_rfc3339(&info.staged_at).unwrap();
+        let expires = chrono::DateTime::parse_from_rfc3339(&info.expires_at).unwrap();
+        assert_eq!(expires - staged, chrono::Duration::hours(24), "it says when it lapses");
+        let outcome = restore::apply_pending(&dst.0);
+        assert!(matches!(outcome, ApplyOutcome::Applied(_)), "{hours} h: {outcome:?}");
+        assert_ne!(snapshot(&dst.0), before);
+    }
+}
+
+#[test]
+fn an_undo_prepared_more_than_a_day_ago_expires_and_keeps_its_saved_copy() {
+    let (_out, dst, _before) = staged_for_age_tests("undo-expiry");
+    assert!(matches!(restore::apply_pending(&dst.0), ApplyOutcome::Applied(_)));
+    let after_restore = snapshot(&dst.0);
+    restore::stage_undo(&dst.0, &options()).unwrap();
+    stage_time(&dst.0, Some(30));
+    let outcome = restore::apply_pending(&dst.0);
+    let ApplyOutcome::Expired(last) = outcome else { panic!("the undo should have expired: {outcome:?}") };
+    assert!(last.error.as_deref().unwrap().contains("undo you prepared") && last.error.as_deref().unwrap().contains("saved copy is still there"), "{last:?}");
+    assert!(restore::undo_available(&dst.0), "the saved copy is still there");
+    assert_eq!(snapshot(&dst.0), after_restore, "nothing changed");
+    // And it can be prepared again, and then applied.
+    restore::stage_undo(&dst.0, &options()).unwrap();
+    assert!(matches!(restore::apply_pending(&dst.0), ApplyOutcome::Applied(_)));
+}
+
+#[test]
+fn a_restore_that_was_begun_is_finished_or_rolled_back_however_old_it_is() {
+    let (_out, dst, before) = staged_for_age_tests("begun");
+    restore::INJECT.with(|c| c.set(Some(Inject::CrashBeforeInstall(1))));
+    assert!(matches!(restore::apply_pending(&dst.0), ApplyOutcome::None));
+    restore::INJECT.with(|c| c.set(None));
+    assert!(dst.0.join("restore").join("apply-journal.jsonl").is_file(), "it had begun");
+    stage_time(&dst.0, Some(24 * 30));
+    let outcome = restore::apply_pending(&dst.0);
+    let ApplyOutcome::Failed(last) = outcome else { panic!("a begun restore is rolled back, not expired: {outcome:?}") };
+    assert!(last.error.as_deref().unwrap().contains("put back"), "{last:?}");
+    assert_eq!(snapshot(&dst.0), before, "every file is as it was");
+}
+
+#[test]
+fn the_agents_part_of_a_restore_that_its_page_never_takes_is_dropped_after_a_day() {
+    let (_out, dst, _before) = staged_for_age_tests("import-expiry");
+    assert!(matches!(restore::apply_pending(&dst.0), ApplyOutcome::Applied(_)));
+    // The Agent's part waits for its page (make one, as a restore that carried Agent storage does).
+    let import = dst.0.join("restore").join("agent-import");
+    let last = restore::last_restore(&dst.0).unwrap();
+    fs::create_dir_all(&import).unwrap();
+    fs::write(import.join("current.zip"), b"PK-not-really").unwrap();
+    fs::write(import.join("current.json"), format!("{{\"id\":\"{}\",\"kind\":\"restore\",\"size\":13,\"sha256\":\"{}\"}}", last.id, "0".repeat(64))).unwrap();
+    // Just made: it stays.
+    restore::sweep_leftovers(&dst.0);
+    assert!(import.join("current.zip").exists(), "a hand-over made a moment ago stays");
+    // A day and more old: it goes, and the result says so.
+    let old = std::time::SystemTime::now() - std::time::Duration::from_secs(25 * 3600);
+    fs::OpenOptions::new().write(true).open(import.join("current.json")).unwrap().set_modified(old).unwrap();
+    restore::sweep_leftovers(&dst.0);
+    assert!(!import.join("current.zip").exists() && !import.join("current.json").exists());
+    let reported = restore::last_restore(&dst.0).unwrap();
+    assert_eq!(reported.agent_storage, "failed");
+    assert!(reported.redo.iter().any(|r| r.contains("did not take them within a day")), "{reported:?}");
+}

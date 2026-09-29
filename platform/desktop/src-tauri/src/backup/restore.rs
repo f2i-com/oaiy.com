@@ -39,6 +39,11 @@ pub const KIND_UNDO: &str = "undo";
 
 /// How many undo snapshots are kept.
 const KEEP_UNDO: usize = 2;
+
+/// How long a prepared restore (or undo) waits for its restart. After this it is thrown away at the
+/// next start, unapplied: what it would replace may have changed, and the person may no longer
+/// remember choosing it.
+pub const STAGED_LIFETIME_HOURS: i64 = 24;
 /// Room to leave on the disk beyond what a restore needs.
 const MARGIN: u64 = 32 << 20;
 
@@ -135,6 +140,10 @@ pub struct PendingInfo {
     pub id: String,
     pub kind: String,
     pub staged_at: String,
+    /// When it is thrown away, unapplied, if it has not been applied by then.
+    pub expires_at: String,
+    /// It has waited longer than that: the next start will discard it, and restarting is pointless.
+    pub expired: bool,
     pub files: u64,
     pub agent_storage: bool,
     /// The classes that were ticked.
@@ -257,6 +266,24 @@ fn write_json<T: Serialize>(path: &Path, value: &T) -> std::io::Result<()> {
 /// The time, to the millisecond: two restores in one second still tell which is newer.
 fn now() -> String {
     chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Millis, true)
+}
+
+/// Whether a restore staged at `staged_at` (RFC 3339) has waited too long. A time that cannot be read,
+/// or that is well in the future (a clock that was set back, or a record made by hand), counts as expired.
+fn expired(staged_at: &str) -> bool {
+    match chrono::DateTime::parse_from_rfc3339(staged_at) {
+        Ok(at) => {
+            let age = chrono::Utc::now().signed_duration_since(at);
+            age > chrono::Duration::hours(STAGED_LIFETIME_HOURS) || age < -chrono::Duration::hours(1)
+        }
+        Err(_) => true,
+    }
+}
+
+fn expiry_of(staged_at: &str) -> String {
+    chrono::DateTime::parse_from_rfc3339(staged_at)
+        .map(|at| (at + chrono::Duration::hours(STAGED_LIFETIME_HOURS)).with_timezone(&chrono::Utc).to_rfc3339_opts(chrono::SecondsFormat::Millis, true))
+        .unwrap_or_else(|_| staged_at.to_string())
 }
 
 impl Marker {
@@ -836,6 +863,8 @@ pub enum ApplyOutcome {
     Applied(LastRestore),
     /// It failed and everything was put back.
     Failed(LastRestore),
+    /// It had waited more than a day: it was thrown away unapplied.
+    Expired(LastRestore),
 }
 
 /// One line of the journal, written before its step.
@@ -970,6 +999,11 @@ pub fn sweep_leftovers(data_dir: &Path) -> usize {
             }
         }
     }
+    // The Agent's part of a restore that its page has not taken for a day: it is not kept for ever.
+    if let Some(id) = agent::drop_stale_import(data_dir, std::time::Duration::from_secs(STAGED_LIFETIME_HOURS as u64 * 3600)) {
+        record_agent_result(data_dir, &id, false, Some("its page did not take them within a day, so what was kept for it was deleted"));
+        removed += 1;
+    }
     if removed > 0 {
         log::info!("backup: removed {removed} leftover working folder(s) of a backup or restore that did not finish");
     }
@@ -1004,6 +1038,11 @@ pub fn apply_pending(data_dir: &Path) -> ApplyOutcome {
     let staged_root = dir.join(&marker.source).join("files");
     let holding = holding_of(data_dir, &marker);
     let journal_file = journal_path(data_dir);
+
+    // A restore prepared long ago is not applied. (One that was begun is never expired: it is finished or rolled back, below.)
+    if std::fs::symlink_metadata(&journal_file).is_err() && expired(&marker.staged_at) {
+        return expire(data_dir, &marker);
+    }
 
     // An earlier start began this and did not finish.
     if std::fs::symlink_metadata(&journal_file).is_ok() {
@@ -1059,6 +1098,21 @@ fn conclude_stuck(data_dir: &Path, marker: &Marker, why: &str, stuck: &[(String,
     let _ = std::fs::rename(journal_path(data_dir), dir.join(format!("apply-journal-{}.jsonl", marker.id)));
     log::error!("backup: a restore could not be rolled back completely: {} file(s), {} of them set aside in {}", stuck.len(), set_aside, holding.display());
     ApplyOutcome::Failed(last)
+}
+
+/// A prepared restore that waited too long: its marker and, for a restore, its staged copy are removed
+/// (an undo's saved copy is not touched), and the person is told.
+fn expire(data_dir: &Path, marker: &Marker) -> ApplyOutcome {
+    let _ = discard_pending(data_dir);
+    let message = if marker.kind == KIND_UNDO {
+        "The undo you prepared was more than a day old, so it was not applied. The saved copy is still there: prepare the undo again if you still want it."
+    } else {
+        "The restore you prepared was more than a day old, so it was not applied and the prepared copy was deleted. Choose the backup again if you still want it."
+    };
+    let last = failed(&marker.id, &marker.kind, message);
+    record_last(data_dir, &last);
+    log::warn!("backup: a prepared {} was more than a day old and was thrown away unapplied", marker.kind);
+    ApplyOutcome::Expired(last)
 }
 
 fn conclude_failed(data_dir: &Path, marker: &Marker, last: LastRestore) -> ApplyOutcome {
@@ -1254,6 +1308,8 @@ pub fn pending_info(data_dir: &Path) -> Option<PendingInfo> {
     Some(PendingInfo {
         id: marker.id,
         kind: marker.kind,
+        expires_at: expiry_of(&marker.staged_at),
+        expired: expired(&marker.staged_at),
         staged_at: marker.staged_at,
         files: (marker.files.len() + marker.removals.len()) as u64,
         agent_storage: marker.agent.is_some(),

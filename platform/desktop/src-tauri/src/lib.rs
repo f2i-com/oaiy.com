@@ -1246,7 +1246,7 @@ pub fn run() {
             match crate::backup::restore::apply_pending(&data_dir) {
                 crate::backup::restore::ApplyOutcome::None => {}
                 crate::backup::restore::ApplyOutcome::Applied(done) => log::info!("backup: the staged {} was applied", done.kind),
-                crate::backup::restore::ApplyOutcome::Failed(done) => log::warn!("backup: the staged {} was not applied: {}", done.kind, done.error.unwrap_or_default()),
+                crate::backup::restore::ApplyOutcome::Failed(done) | crate::backup::restore::ApplyOutcome::Expired(done) => log::warn!("backup: the staged {} was not applied: {}", done.kind, done.error.unwrap_or_default()),
             }
             // The Agent's control tools show a page in the dashboard (a plugin's
             // setup step, say) with this event; the dashboard listens for it.

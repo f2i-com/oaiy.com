@@ -242,8 +242,13 @@ pub async fn backup_discard_pending<R: Runtime>(app: AppHandle<R>, webview: Webv
 pub async fn backup_restart_to_apply(app: AppHandle, webview: Webview) -> Result<(), String> {
     dashboard(&webview)?;
     let data_dir = data_dir_of(&app)?;
-    if restore::pending_info(&data_dir).is_none() {
-        return Err("No restore is waiting.".to_string());
+    match restore::pending_info(&data_dir) {
+        None => return Err("No restore is waiting.".to_string()),
+        Some(waiting) if waiting.expired => {
+            let _ = restore::discard_pending(&data_dir);
+            return Err("That restore was prepared more than a day ago, so it will not be applied. Prepare it again.".to_string());
+        }
+        Some(_) => {}
     }
     gather_busy(&app).await.refuse_if_busy("restarting to finish the restore").map_err(|e| e.message)?;
     crate::gui::restart_app(app);
