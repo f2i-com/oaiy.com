@@ -162,6 +162,13 @@ describe('what is free, as a summary per day', () => {
       'Fri 2 Oct (2026-10-02): free all day, 8 am–5 pm (a 60-min Lawn mowing can start any time from 8 am to 4 pm).',
       'Closed: Sat 3 Oct and Sun 4 Oct.',
     ]);
+    // Two weekends are each named (a range would take in the week between).
+    const fortnight = await free.run({ from: '2026-10-02', days: 10, service: 'Lawn mowing' }, signal);
+    expect(fortnight).toContain('\nClosed: Sat 3 Oct, Sun 4 Oct, Sat 10 Oct and Sun 11 Oct.\n');
+    // Days in a row past how far ahead it books are one range.
+    const ahead = calendarDesktop({ now: '2026-09-29T09:00', horizon: 5 }).desktop;
+    const far = await callCalendarTools(() => ahead)[0].run({ from: '2026-10-02', days: 10, service: 'Lawn mowing' }, signal);
+    expect(far).toContain('\nClosed: Sat 3 Oct and Sun 4 Oct.\nToo far ahead to book yet: from Mon 5 Oct to Sun 11 Oct.\n');
     const weekend = await free.run({ from: '2026-10-03', days: 2, service: 'Lawn mowing' }, signal);
     expect(weekend).toContain('Closed: Sat 3 Oct and Sun 4 Oct.\nNothing fits a 60-min Lawn mowing on the days asked. The next day with room: Mon 5 Oct (2026-10-05), when a 60-min Lawn mowing can start any time from 8 am to 4 pm.');
   });

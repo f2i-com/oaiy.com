@@ -268,9 +268,14 @@ export function sayDay(plan: DayPlan, what: string, step: number, today: string,
   return fits ? `${label}: ${parts.join('; ')} (${fits}).` : `${label}: ${parts.join('; ')}; ${none}.`;
 }
 
-/** Days in one line: "Sat 3 Oct and Sun 4 Oct", or "from Sat 31 Oct to Tue 3 Nov" for more than three. */
+/**
+ * Days in one line: "Sat 3 Oct and Sun 4 Oct", or "from Sat 31 Oct to Tue 3 Nov"
+ * for more than three in a row (weekends a week apart are each named: a range
+ * would read as the days between closed too).
+ */
 export function sayDays(dates: string[]): string {
-  return dates.length > 3 ? `from ${sayDate(dates[0])} to ${sayDate(dates[dates.length - 1])}` : sayList(dates.map(sayDate));
+  const inARow = dates.every((d, i) => i === 0 || dayNumber(d) - dayNumber(dates[i - 1]) === 1);
+  return dates.length > 3 && inARow ? `from ${sayDate(dates[0])} to ${sayDate(dates[dates.length - 1])}` : sayList(dates.map(sayDate));
 }
 
 /**
