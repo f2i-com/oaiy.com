@@ -26,6 +26,45 @@ export interface DesktopEvent {
   data: Record<string, unknown>;
 }
 
+/** Who named a contact, or wrote a fact: the person (`owner`) or the receptionist (`agent`). */
+export type ContactBy = 'owner' | 'agent';
+
+/**
+ * A person as OAIY Desktop's Contacts keep them (the dashboard's AI
+ * Receptionist → Contacts): their name (the person's own, `nameBy: owner`,
+ * is never changed by the receptionist), the person's notes for the
+ * receptionist, and what it remembered (`facts`).
+ */
+export interface Contact {
+  /** The last nine digits of their number: the same person however it is written. */
+  key: string;
+  /** The number last seen for them ('' when only the key is known). */
+  number: string;
+  name: string;
+  nameBy: ContactBy | null;
+  notes: string;
+  facts: Array<{ text: string; at: string; by: ContactBy }>;
+  createdAt: string;
+  updatedAt: string;
+}
+
+/** A contact as the desktop answered it (anything missing read as empty), or null when it is not one. */
+export function readContact(value: unknown): Contact | null {
+  if (!isRecord(value) || typeof value.key !== 'string' || !value.key) return null;
+  const by = (v: unknown): ContactBy | null => (v === 'owner' || v === 'agent' ? v : null);
+  const text = (v: unknown) => (typeof v === 'string' ? v : '');
+  return {
+    key: value.key,
+    number: text(value.number),
+    name: text(value.name),
+    nameBy: by(value.nameBy),
+    notes: text(value.notes),
+    facts: (Array.isArray(value.facts) ? value.facts : []).filter(isRecord).filter((f) => typeof f.text === 'string' && f.text.trim()).map((f) => ({ text: String(f.text), at: text(f.at), by: by(f.by) ?? 'agent' })),
+    createdAt: text(value.createdAt),
+    updatedAt: text(value.updatedAt),
+  };
+}
+
 export class DesktopError extends Error {
   constructor(message: string, readonly status = 0, readonly code = '') {
     super(message);
@@ -267,9 +306,51 @@ export class Desktop {
     return { ok: result.ok === true, output: result.output };
   }
 
-  /** The name a caller goes by, so the phone's greeting can use it (an empty name forgets it). */
-  async rememberCaller(number: string, name: string): Promise<void> {
-    await reply(await fetch(`${this.origin}/api/voice/callers`, { method: 'PUT', headers: this.headers(), body: JSON.stringify({ number, name }) }));
+  /**
+   * The name a caller goes by, so the phone's greeting can use it (an empty
+   * name forgets it): the receptionist's, never over a name the person gave
+   * them in Contacts. Answers with the name kept ('' when the desktop did not say).
+   */
+  async rememberCaller(number: string, name: string): Promise<string> {
+    const body = await reply(await fetch(`${this.origin}/api/voice/callers`, { method: 'PUT', headers: this.headers(), body: JSON.stringify({ number, name }) }));
+    return isRecord(body) && typeof body.name === 'string' ? body.name : '';
+  }
+
+  /**
+   * The contact for a number written any way, as OAIY Desktop's Contacts keep
+   * it: null when they have none (`no_contact`). Any other failure (the
+   * desktop out of reach, or one from before it kept contacts) throws.
+   */
+  async contact(number: string, signal?: AbortSignal): Promise<Contact | null> {
+    try {
+      return readContact(await reply(await fetch(`${this.origin}/api/contacts/${encodeURIComponent(number)}`, { headers: this.headers(), signal })));
+    } catch (error) {
+      if (error instanceof DesktopError && error.code === 'no_contact') return null;
+      throw error;
+    }
+  }
+
+  /** Every contact (by name), or those `q` finds in names, numbers, notes and facts. */
+  async contacts(q = '', signal?: AbortSignal): Promise<Contact[]> {
+    const body = await reply(await fetch(`${this.origin}/api/contacts${q ? `?q=${encodeURIComponent(q)}` : ''}`, { headers: this.headers(), signal }));
+    const list = isRecord(body) && Array.isArray(body.contacts) ? body.contacts : [];
+    return list.map(readContact).filter((c): c is Contact => !!c);
+  }
+
+  /**
+   * Something the receptionist remembered about a person (made a contact if
+   * they are not one): kept once (the same words again are not added), the
+   * oldest of the receptionist's let go when the list is full.
+   */
+  async addContactFact(number: string, text: string, by: ContactBy = 'agent', signal?: AbortSignal): Promise<{ contact: Contact | null; added: boolean }> {
+    const body = await reply(await fetch(`${this.origin}/api/contacts/${encodeURIComponent(number)}/facts`, { method: 'POST', headers: this.headers(), body: JSON.stringify({ text, by }), signal }));
+    return { contact: isRecord(body) ? readContact(body.contact) : null, added: isRecord(body) && body.added === true };
+  }
+
+  /** Forget one of a contact's facts, by its place (from 0), only while it still says `text`. */
+  async forgetContactFact(number: string, index: number, text: string, signal?: AbortSignal): Promise<Contact | null> {
+    const body = await reply(await fetch(`${this.origin}/api/contacts/${encodeURIComponent(number)}/facts/${index}?text=${encodeURIComponent(text)}`, { method: 'DELETE', headers: this.headers(), signal }));
+    return isRecord(body) ? readContact(body.contact) : null;
   }
 
   /** Stop speaking on a call. */

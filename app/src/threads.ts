@@ -176,11 +176,19 @@ export function mergeCallers(notes: readonly CallerNote[], country: string): { c
     const same = out.find((c) => c.number === key || (key !== TEST && c.number !== TEST && samePerson(c.number, key, country)));
     if (!same) {
       if (key !== note.number) changed = true;
-      out.push({ ...note, number: key, facts: [...note.facts] });
+      out.push({ ...note, number: key, facts: [...note.facts], ...(note.unsent ? { unsent: [...note.unsent] } : {}) });
       continue;
     }
     changed = true;
-    if (note.name) same.name = note.name;
+    if (note.name) {
+      same.name = note.name;
+      if (note.nameBy) same.nameBy = note.nameBy;
+      else delete same.nameBy;
+    }
+    // Their contact as last read (the newest note's), and what waits to be sent to it (all of it).
+    if (note.notes) same.notes = note.notes;
+    if (note.ownerFacts?.length) same.ownerFacts = [...note.ownerFacts];
+    for (const fact of note.unsent ?? []) if (!(same.unsent ??= []).some((f) => f.toLowerCase() === fact.toLowerCase())) same.unsent.push(fact);
     for (const fact of note.facts) if (!same.facts.some((f) => f.toLowerCase() === fact.toLowerCase())) same.facts.push(fact);
     same.facts = same.facts.slice(-MAX_FACTS);
     same.updatedAt = Math.max(same.updatedAt, note.updatedAt);

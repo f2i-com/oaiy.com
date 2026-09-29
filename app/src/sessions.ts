@@ -13,13 +13,14 @@
 import { Agent, type AgentEvent, type AgentOptions, type SessionTool } from './agent/agent';
 import { TOOLS } from './agent/tools';
 import type { Turn } from './agent/protocol';
-import type { Desktop, DesktopEvent } from './desktop/bridge';
+import type { Contact, Desktop, DesktopEvent } from './desktop/bridge';
 import { callCalendarTools, textCalendarTools } from './desktop/calendarTools';
 import { isHidden, localCountry, phoneKey, samePerson } from './phoneNumbers';
 import type { MessageSettings } from './settings';
 import { MAX_FACTS, regroup, threadId, threadOrder, type Way } from './threads';
 import type { CallerNote, OpenProject, SessionInfo } from './vfs/projects';
 import { OUTREACH_AFTER_CALL, type OutreachLink, type OutreachSessions } from './outreach';
+import { CONTACT_FRESH_MS, TEXT_CONTACT_WAIT_MS, contactKey, mirrorContact, moveFacts, refused, sameFact, unionFacts, type ContactsApi } from './contacts';
 
 /** What the conversations ask of outreach (outreach.ts): who a call or a text thread is about, and a text that asks to stop. */
 export interface OutreachHooks {
@@ -168,16 +169,28 @@ export function whenSaid(ms: number): string {
   return new Date(ms).toLocaleString('en-AU', { weekday: 'short', day: 'numeric', month: 'short', hour: 'numeric', minute: '2-digit' });
 }
 
-/** What a call's or a text thread's agent is told about the person, from their note. */
+/**
+ * What a call's or a text thread's agent is told about the person, from their
+ * note (their contact on OAIY Desktop, as last read): their name, the
+ * business's own notes about them first, then what was remembered. The
+ * business's notes win over anything remembered, and a name the business gave
+ * them is the one to use.
+ */
 export function knownText(note: CallerNote | undefined): string {
   const tools = 'Save their name when they tell you it, and anything worth knowing next time, with remember; earlier_conversations finds what was said in their earlier calls and texts.';
-  if (!note || (!note.name && !note.facts.length)) return `Nothing is saved about them yet. ${tools}`;
+  const notes = note?.notes?.trim() ?? '';
+  const owned = note?.ownerFacts ?? [];
+  if (!note || (!note.name && !note.facts.length && !notes && !owned.length)) return `Nothing is saved about them yet. ${tools}`;
+  const business = !!notes || owned.length > 0;
   return [
-    'What you know about them, saved across their calls and texts (by you, or by the main agent your person talks to):',
-    `Name: ${note.name || 'not known yet'}`,
-    ...note.facts.map((f) => `- ${f}`),
+    'What you know about them, saved across their calls and texts:',
+    `Name: ${note.name || 'not known yet'}${note.name && note.nameBy === 'owner' ? ' (the name the business has them by: use it)' : ''}`,
+    ...(notes ? [`Notes from the business: ${notes}`] : business ? ['Notes from the business:'] : []),
+    ...owned.map((f) => `- ${f}`),
+    ...(note.facts.length ? ['What was remembered about them (by you, or by the main agent your person talks to):', ...note.facts.map((f) => `- ${f}`)] : []),
+    business ? 'The notes from the business come from your person: where anything remembered says otherwise, the notes win.' : '',
     tools,
-  ].join('\n');
+  ].filter(Boolean).join('\n');
 }
 
 /** What a text-message conversation is for, in its agent's instructions. */
@@ -581,21 +594,27 @@ export function phoneConversationsTool(sessions: () => Sessions | null): Session
   };
 }
 
-/** One person's note, as the runner reads it. */
+/** One person's note, as the runner reads it: their name (and who gave it), the business's notes, and what was remembered. */
 function noteText(c: CallerNote): string {
-  return `${c.number}: ${c.name || '(no name yet)'}${c.facts.length ? `\n${c.facts.map((f) => `  - ${f}`).join('\n')}` : ''}`;
+  const lines = [
+    ...(c.notes?.trim() ? [`  Notes from the business: ${c.notes.trim()}`] : []),
+    ...(c.ownerFacts ?? []).map((f) => `  - ${f} (the business's)`),
+    ...c.facts.map((f) => `  - ${f}`),
+  ];
+  return `${c.number}: ${c.name || '(no name yet)'}${c.name && c.nameBy === 'owner' ? ' (named by your person in Contacts)' : ''}${lines.length ? `\n${lines.join('\n')}` : ''}`;
 }
 
 /**
  * The runner's view of what its sub-agents know about each person who calls
- * or texts, and a way to change it: what it knows reaches their next reply.
+ * or texts (their contacts on OAIY Desktop, read afresh), and a way to change
+ * it: what it knows reaches their next reply.
  */
 export function callerNotesTool(sessions: () => Sessions | null): SessionTool {
   return {
     spec: {
       name: 'caller_notes',
       description:
-        "What the phone's agents know about each person who calls or texts: one note a person (their name, and short facts): each of their calls' agents reads it as the call starts, their text thread's agent before every reply. With no number: everyone's. With a number: theirs. To change it, give name, add (one fact), remove (takes out the facts that contain these words) or facts (all of them, replacing the rest).",
+        "What the phone's agents know about each person who calls or texts, from their contact on OAIY Desktop (the dashboard's Contacts): their name, your person's own notes about them, and short facts remembered on their calls and texts. Each of their calls' agents reads it as the call starts, their text thread's agent before every reply. With no number: everyone's who has been in touch. With a number: theirs. To change what was remembered, give name, add (one fact), remove (takes out the remembered facts that contain these words) or facts (all of them, replacing the rest). A name or notes your person set in Contacts are theirs: they stay (your person changes them there).",
       parameters: {
         type: 'object',
         properties: {
@@ -611,7 +630,10 @@ export function callerNotesTool(sessions: () => Sessions | null): SessionTool {
       const all = sessions();
       if (!all) throw new Error('the phone is not set up here (OAIY Desktop has not connected yet)');
       const number = typeof input.number === 'string' ? input.number.trim() : '';
-      if (!number) return all.callers.length ? all.callers.map(noteText).join('\n') : 'Nothing is saved about anyone yet.';
+      if (!number) {
+        const offline = (await all.refreshContacts()) ? '' : '\n(OAIY Desktop could not be reached: this is what was known when it last could.)';
+        return all.callers.length ? `${all.callers.map(noteText).join('\n')}${offline}` : `Nothing is saved about anyone yet.${offline}`;
+      }
       const change = {
         ...(typeof input.name === 'string' ? { name: input.name } : {}),
         ...(typeof input.add === 'string' && input.add.trim() ? { add: input.add } : {}),
@@ -619,10 +641,13 @@ export function callerNotesTool(sessions: () => Sessions | null): SessionTool {
         ...(Array.isArray(input.facts) ? { facts: input.facts.map(String) } : {}),
       };
       if (!Object.keys(change).length) {
+        const read = await all.readContact(number);
         const note = all.callerNote(number);
-        return note ? noteText(note) : `Nothing is saved about ${number}.`;
+        const offline = read === null ? '\n(OAIY Desktop could not be reached: this is what was known when it last could.)' : '';
+        return note ? `${noteText(note)}${offline}` : `Nothing is saved about ${number}.${offline}`;
       }
-      return `Saved. ${noteText(await all.noteCaller(number, change))}`;
+      const { note, desk } = await all.noteCaller(number, change);
+      return `Saved. ${noteText(note)}${desk ? `\n${desk}` : ''}`;
     },
   };
 }
@@ -670,6 +695,19 @@ export class Sessions {
   calendarOn: () => boolean = () => true;
   /** Outreach (the runner's lists of people to call or text), while it runs on this page. */
   outreach: OutreachHooks | null = null;
+  /**
+   * OAIY Desktop's contacts (contacts.ts): what is known about a person is
+   * read from their contact, and what is remembered is written there. Null:
+   * the Front desk's own notes only.
+   */
+  contacts: ContactsApi | null = null;
+  /** The facts kept here before contacts were moved to the desktop: from then on a person's facts are their contact's. */
+  private moved = false;
+  /** When each person's contact was last read (by contact key), and the reads going on. */
+  private contactRead = new Map<string, number>();
+  private contactReading = new Map<string, Promise<boolean | null>>();
+  /** Facts being moved or sent to the desktop now. */
+  private syncing: Promise<void> | null = null;
   /** Conversations with messages waiting, in the order they came. */
   /** Conversations waiting to run, one at a time per lane: calls in their own (a caller never waits behind a text or a flow's task), the rest in another. */
   private queue: Session[] = [];
@@ -878,32 +916,233 @@ export class Sessions {
   }
 
   /**
-   * Change what is known about the person at `number`: their name, a fact added
-   * or taken out, or all the facts at once. Their conversations take the name.
+   * Change what is known about the person at `number`: their name, a fact
+   * remembered or taken out, or all the remembered facts at once. Kept here
+   * and in their contact on the desktop; a name the person gave them in
+   * Contacts stays theirs. Their conversations take the name. `desk` says
+   * what the desktop did not take ('' when it took it all, or there is no
+   * desktop to ask).
    */
-  async noteCaller(number: string, change: { name?: string; add?: string; remove?: string; facts?: string[] }): Promise<CallerNote> {
+  async noteCaller(number: string, change: { name?: string; add?: string; remove?: string; facts?: string[] }): Promise<{ note: CallerNote; desk: string }> {
     const clean = (f: string) => f.replace(/\s+/g, ' ').trim().slice(0, 200);
     let note = this.callerNote(number);
     if (!note) {
       note = { number: number === TEST_NUMBER ? number : phoneKey(number) || number.trim(), facts: [], updatedAt: Date.now() };
       this.callers.push(note);
     }
-    if (typeof change.name === 'string') note.name = clean(change.name).slice(0, 80) || undefined;
+    const said: string[] = [];
+    if (typeof change.name === 'string') {
+      const name = clean(change.name).slice(0, 80) || undefined;
+      if (note.nameBy === 'owner' && note.name) {
+        if (name !== note.name) said.push(`Their name stays ${note.name}: your person gave it to them in Contacts (they change it there).`);
+      } else {
+        note.name = name;
+        if (name) note.nameBy = 'agent';
+        else delete note.nameBy;
+      }
+    }
+    const before = [...note.facts];
     if (change.facts) note.facts = change.facts.map(clean).filter(Boolean);
     const add = clean(change.add ?? '');
-    if (add && !note.facts.some((f) => f.toLowerCase() === add.toLowerCase())) note.facts.push(add);
+    if (add && !note.facts.some((f) => sameFact(f, add))) note.facts.push(add);
     const remove = (change.remove ?? '').trim().toLowerCase();
     if (remove) note.facts = note.facts.filter((f) => !f.toLowerCase().includes(remove));
     note.facts = note.facts.slice(-MAX_FACTS);
     note.updatedAt = Date.now();
-    // Their conversations take the name; cleared, they go back to the number.
-    const renamed = typeof change.name === 'string';
-    for (const s of this.list) if (s.kind !== 'task' && !s.hidden && (s.key === note.number || (s.key !== TEST_NUMBER && samePerson(s.key, note.number))) && (note.name || renamed)) s.title = note.name || s.key;
+    this.titled(note, typeof change.name === 'string');
     await this.project.saveCallers(this.callers);
     await this.saveIndex();
-    this.hooks.named?.(note);
+    // The phone greets them by the name (only when one was given: a note with none would clear the desktop's).
+    if (typeof change.name === 'string') this.hooks.named?.(note);
     this.hooks.changed();
-    return note;
+    const desk = await this.sendFacts(note, before);
+    return { note, desk: [...said, desk].filter(Boolean).join(' ') };
+  }
+
+  /** The person's conversations take the name in their note; one cleared (`renamed`), they go back to the number. */
+  private titled(note: CallerNote, renamed = false): void {
+    for (const s of this.list) if (s.kind !== 'task' && !s.hidden && (s.key === note.number || (s.key !== TEST_NUMBER && samePerson(s.key, note.number))) && (note.name || renamed)) s.title = note.name || s.key;
+  }
+
+  /**
+   * The facts remembered (and taken out) since `before`, written to the
+   * person's contact on the desktop: those it refuses are kept here only; with
+   * the desktop out of reach, what was remembered waits in the note (`unsent`)
+   * for it. Says what the desktop did not take ('' when it took it all).
+   */
+  private async sendFacts(note: CallerNote, before: readonly string[]): Promise<string> {
+    const added = note.facts.filter((f) => !before.some((b) => sameFact(b, f)));
+    const removed = before.filter((b) => !note.facts.some((f) => sameFact(b, f)));
+    if (!this.contacts || !contactKey(note.number) || (!added.length && !removed.length)) return '';
+    const said: string[] = [];
+    let contact: Contact | null | undefined;
+    const waiting = [...added];
+    try {
+      while (waiting.length) {
+        const fact = waiting[0];
+        try {
+          contact = (await this.contacts.addFact(note.number, fact)).contact ?? contact;
+        } catch (error) {
+          if (!refused(error)) throw error;
+          said.push(`"${fact}" is kept here only: OAIY Desktop's contacts refused it (${(error as Error).message}).`);
+        }
+        waiting.shift();
+      }
+      if (removed.length) {
+        const now = await this.contacts.get(note.number);
+        contact ??= now;
+        // From the last down: a fact forgotten does not move the ones before it. The person's own facts stay theirs.
+        for (let i = (now?.facts.length ?? 0) - 1; i >= 0; i--) {
+          const fact = now!.facts[i];
+          if (fact.by === 'agent' && removed.some((r) => sameFact(r, fact.text))) contact = (await this.contacts.forgetFact(note.number, i, fact.text)) ?? contact;
+        }
+      }
+    } catch {
+      // Out of reach: what was remembered is sent when the desktop can be reached (syncContacts).
+      if (waiting.length) note.unsent = unionFacts(note.unsent ?? [], waiting);
+      await this.project.saveCallers(this.callers);
+      return [...said, `OAIY Desktop could not be reached, so ${removed.length && !waiting.length ? 'what was taken out is taken out here only' : 'it is kept here and sent to their contact when the desktop can be reached'}.`].join(' ');
+    }
+    if (contact !== undefined) {
+      this.contactRead.set(contactKey(note.number), Date.now());
+      await this.mirror(note.number, contact);
+    }
+    return said.join(' ');
+  }
+
+  /** Read the person's contact again when the last read is older than CONTACT_FRESH_MS: that read (null when none is needed, or none can be made). */
+  private freshen(number: string): Promise<boolean | null> | null {
+    const key = contactKey(number);
+    if (!this.contacts || !key || number === TEST_NUMBER) return null;
+    if (this.contactReading.has(key)) return this.contactReading.get(key)!;
+    const at = this.contactRead.get(key);
+    if (at !== undefined && Date.now() - at < CONTACT_FRESH_MS) return null;
+    return this.readContact(number);
+  }
+
+  /**
+   * Read the person's contact from the desktop and keep it in their note: true
+   * when what is known about them changed, false when it did not (or there are
+   * no contacts to read), null when the desktop could not be reached (what was
+   * known stays).
+   */
+  readContact(number: string): Promise<boolean | null> {
+    const key = contactKey(number);
+    const contacts = this.contacts;
+    if (!contacts || !key || number === TEST_NUMBER) return Promise.resolve(false);
+    const going = this.contactReading.get(key);
+    if (going) return going;
+    const reading = (async () => {
+      try {
+        const contact = await contacts.get(number);
+        this.contactRead.set(key, Date.now());
+        return await this.mirror(number, contact);
+      } catch {
+        return null;
+      } finally {
+        this.contactReading.delete(key);
+      }
+    })();
+    this.contactReading.set(key, reading);
+    return reading;
+  }
+
+  /**
+   * Every contact read at once (as the desktop connects, and for the runner's
+   * caller_notes): each person who has a note or a conversation here gets
+   * theirs. False when the desktop could not be reached.
+   */
+  async refreshContacts(): Promise<boolean> {
+    if (!this.contacts) return true;
+    let all: Contact[];
+    try {
+      all = await this.contacts.list();
+    } catch {
+      return false;
+    }
+    const byKey = new Map(all.map((c) => [c.key, c]));
+    const people = new Map<string, string>();
+    for (const n of this.callers) if (contactKey(n.number) && n.number !== TEST_NUMBER) people.set(contactKey(n.number), n.number);
+    for (const s of this.list) if (s.kind !== 'task' && !s.hidden && s.key !== TEST_NUMBER && contactKey(s.key)) people.set(contactKey(s.key), people.get(contactKey(s.key)) ?? s.key);
+    const now = Date.now();
+    let changed = false;
+    for (const [key, number] of people) {
+      this.contactRead.set(key, now);
+      if (await this.mirror(number, byKey.get(key) ?? null, false)) changed = true;
+    }
+    if (changed) {
+      await this.project.saveCallers(this.callers);
+      await this.saveIndex();
+      this.hooks.changed();
+    }
+    return true;
+  }
+
+  /** Keep a contact as it was read in the person's note: saved, and their conversations named, when it changed (`save` false: the caller saves). */
+  private async mirror(number: string, contact: Contact | null, save = true): Promise<boolean> {
+    const note = this.callerNote(number);
+    const next = mirrorContact(note, contact, phoneKey(number) || number, this.moved);
+    if (!next.changed || !next.note) return false;
+    const was = note?.name;
+    if (note) {
+      for (const k of Object.keys(note) as Array<keyof CallerNote>) if (!(k in next.note)) delete note[k];
+      Object.assign(note, next.note);
+    } else this.callers.push(next.note);
+    this.titled(note ?? next.note, was !== undefined && next.note.name !== was);
+    if (save) {
+      await this.project.saveCallers(this.callers);
+      await this.saveIndex();
+      this.hooks.changed();
+    }
+    return true;
+  }
+
+  /**
+   * The Front desk's facts moved to the desktop's contacts, once (callers.json
+   * as it was is kept in the mark, `contacts-moved.json`); then any remembered
+   * while the desktop was out of reach sent. Tried again next time when the
+   * desktop cannot be reached; what it already has is not added twice.
+   */
+  syncContacts(): Promise<void> {
+    this.syncing ??= this.sync().finally(() => (this.syncing = null));
+    return this.syncing;
+  }
+
+  private async sync(): Promise<void> {
+    const contacts = this.contacts;
+    if (!contacts) return;
+    const add = async (number: string, text: string) => (await contacts.addFact(number, text)).added;
+    if (!this.moved) {
+      if (await this.project.loadContactsMoved()) this.moved = true;
+      else {
+        const before = structuredClone(this.callers);
+        const moved = await moveFacts(this.callers, add);
+        if (!moved.done) return;
+        for (const note of this.callers) delete note.unsent;
+        await this.project.saveContactsMoved({ at: Date.now(), sent: moved.sent, there: moved.there, skipped: moved.skipped, callers: before });
+        await this.project.saveCallers(this.callers);
+        this.moved = true;
+        return;
+      }
+    }
+    // Remembered while the desktop was out of reach.
+    let changed = false;
+    for (const note of this.callers.filter((n) => n.unsent?.length && contactKey(n.number))) {
+      while (note.unsent?.length) {
+        try {
+          await add(note.number, note.unsent[0]);
+        } catch (error) {
+          if (!refused(error)) {
+            if (changed) await this.project.saveCallers(this.callers);
+            return;
+          }
+        }
+        note.unsent.shift();
+        changed = true;
+      }
+      delete note.unsent;
+    }
+    if (changed) await this.project.saveCallers(this.callers);
   }
 
   /**
@@ -941,8 +1180,9 @@ export class Sessions {
           const name = typeof input.name === 'string' ? input.name.trim() : '';
           const fact = typeof input.fact === 'string' ? input.fact.trim() : '';
           if (!name && !fact) throw new Error('give their name or a fact to save');
-          await this.noteCaller(session.key, { ...(name ? { name } : {}), ...(fact ? { add: fact } : {}) });
-          return 'Saved.';
+          // Kept in their contact on the desktop (a fact as the receptionist's), and here; the name as the phone greets them.
+          const { note } = await this.noteCaller(session.key, { ...(name ? { name } : {}), ...(fact ? { add: fact } : {}) });
+          return name && note.nameBy === 'owner' && note.name !== name ? `Saved. The business has them as ${note.name}: call them that.` : 'Saved.';
         },
       },
       {
@@ -1161,15 +1401,30 @@ export class Sessions {
       }
       // (A call taken up by the caller's words, after a reload, keeps its outreach too; any other has none.)
       session.outreach = outreach;
-      const who = `${session.title}${session.title !== session.key ? ` (${session.key})` : ''}`;
       // A call the phone placed (Aokie says so): the agent rang them, and why (an outreach's objective).
       const link = session.outreach && !session.outreach.inbound ? session.outreach : undefined;
       const outbound = event.direction === 'outbound' || link ? { purpose: link?.objective ?? (typeof event.purpose === 'string' ? event.purpose : '') } : undefined;
-      const note = callStartNote(who, typeof event.greeting === 'string' ? event.greeting : '', knownText(hidden ? undefined : this.callerNote(session.key)), new Date(), this.callingBack(from)?.missedAt, outbound, recent);
-      session.agent.turns.push({ role: 'user', text: note, automatic: true, ...(fresh ? { fresh: true } : {}), at: Date.now() });
+      const s = session;
+      const greeting = typeof event.greeting === 'string' ? event.greeting : '';
+      const began = new Date();
+      const missedAt = this.callingBack(from)?.missedAt;
+      // Who, and what is known about them: their contact as last read, never waited for (the call goes on
+      // at once), and read again meanwhile when that was a while ago.
+      const noteNow = () => callStartNote(`${s.title}${s.title !== s.key ? ` (${s.key})` : ''}`, greeting, knownText(hidden ? undefined : this.callerNote(s.key)), began, missedAt, outbound, recent);
+      const reading = hidden ? null : this.freshen(s.key);
+      const start = { role: 'user' as const, text: noteNow(), automatic: true, ...(fresh ? { fresh: true } : {}), at: Date.now() };
+      session.agent.turns.push(start);
       await this.save(session);
       await this.saveIndex();
       this.hooks.changed();
+      // The contact read afresh before the agent has read the note (it does with the caller's first words): the note says what it brought.
+      if (reading) {
+        void reading.then((changed) => {
+          if (!changed || s.callId !== callId || s.running || s.agent.turns.at(-1) !== start) return;
+          start.text = noteNow();
+          void this.save(s).catch(() => {});
+        });
+      }
       // The model reads the call's prompt while the greeting plays: its first answer comes sooner.
       if (type === 'call.started' && !session.running) void session.agent.warm();
       if (type === 'call.started') return session;
@@ -1368,8 +1623,10 @@ export class Sessions {
   async conversationWith(number: string, name: string, kind: 'sms' | 'call' = 'sms', hidden = false): Promise<Session> {
     const key = hidden || number === TEST_NUMBER ? number : phoneKey(number) || number.trim();
     const person = (s: Session) => !hidden && this.isPerson(s, key);
-    // No name given (a call's caller id has none): the name their conversation has.
-    const known = name || this.list.find((s) => person(s) && s.title !== s.key)?.title || '';
+    // The name the person gave them in Contacts first; else the one given (a call's caller id may have
+    // none), the name their conversation has, or the one the agents learned.
+    const note = hidden ? undefined : this.callerNote(key);
+    const known = (note?.nameBy === 'owner' ? note.name : '') || name || this.list.find((s) => person(s) && s.title !== s.key)?.title || note?.name || '';
     const existing = this.list.find((s) => s.kind === kind && person(s));
     if (existing) {
       if (known && existing.title === existing.key) existing.title = known;
@@ -1531,6 +1788,12 @@ export class Sessions {
     let finish!: () => void;
     session.running = new Promise<void>((resolve) => (finish = resolve));
     this.hooks.changed();
+    // A text thread's agent reads the person's contact as it is now: a moment's wait at most (a text can
+    // wait that long; a call's agent never waits, see callEvent).
+    if (session.kind === 'sms') {
+      const reading = this.freshen(session.key);
+      if (reading) await Promise.race([reading, new Promise((r) => setTimeout(r, TEXT_CONTACT_WAIT_MS))]);
+    }
     session.speech?.begin();
     // The call this run answers, if it is a call's: once that call has ended, what is left for the run is not answered.
     const onCall = session.callId;

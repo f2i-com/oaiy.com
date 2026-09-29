@@ -106,10 +106,34 @@ export interface CallerNote {
   /** Their number, as the phone gave it. */
   number: string;
   name?: string;
-  /** Short facts worth knowing next time, oldest first. */
+  /** Short facts worth knowing next time, oldest first: what the receptionist (or the runner) remembered. */
   facts: string[];
   /** When it last changed (ms). */
   updatedAt: number;
+  /**
+   * The rest is their contact on OAIY Desktop as it was last read (contacts.ts):
+   * who named them there (the person's own name, `owner`, is never replaced
+   * by one the agents learn), the person's notes for the receptionist, and
+   * the facts the person wrote themselves.
+   */
+  nameBy?: 'owner' | 'agent';
+  notes?: string;
+  ownerFacts?: string[];
+  /** Facts remembered while OAIY Desktop could not be reached: sent to it when it can be. */
+  unsent?: string[];
+}
+
+/**
+ * The facts in callers.json moved to OAIY Desktop's contacts, once: when, how
+ * many were sent, how many it had already, those it refused (and why), and
+ * callers.json as it was before.
+ */
+export interface ContactsMoved {
+  at: number;
+  sent: number;
+  there: number;
+  skipped: Array<{ number: string; fact: string; why: string }>;
+  callers: CallerNote[];
 }
 
 /** A session id as a file name. */
@@ -450,6 +474,15 @@ export class OpenProject {
 
   async saveCallers(list: CallerNote[]): Promise<void> {
     await writeBytes(this.dir, 'callers.json', JSON.stringify(list));
+  }
+
+  /** Whether (and how) the facts in callers.json were moved to OAIY Desktop's contacts: null until they were. */
+  async loadContactsMoved(): Promise<ContactsMoved | null> {
+    return readJson<ContactsMoved>(this.dir, 'contacts-moved.json');
+  }
+
+  async saveContactsMoved(mark: ContactsMoved): Promise<void> {
+    await writeBytes(this.dir, 'contacts-moved.json', JSON.stringify(mark));
   }
 
   /** The project's other conversations (a text-message thread, a call): what each is, newest first. */

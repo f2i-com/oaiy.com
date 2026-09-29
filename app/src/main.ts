@@ -11,6 +11,7 @@ import { DesktopEvents, Sessions, TEST_NUMBER, callerNotesTool, phoneConversatio
 import { displayNumber, samePerson, setLocalCountry } from './phoneNumbers';
 import { Callbacks, type Screening } from './callbacks';
 import { PhoneLine } from './phoneLine';
+import { desktopContacts } from './contacts';
 import { Outreach, tally, type Campaign, type OutreachKind, type OutreachPlan, type PhoneRules } from './outreach';
 import { OUTREACH_TOOL_NAMES, outreachTools } from './outreachTools';
 import { confirmOutreach } from './ui/outreach';
@@ -621,7 +622,7 @@ async function main(): Promise<void> {
   const RUNNER_INSTRUCTIONS = [
     "This project is the Front desk, and you are the phone's runner. Each person who calls or texts has one conversation (their calls and their texts together, however the phone writes their number), and each flow that gives tasks another (the list beside this one). Sub-agents of yours answer them, one for a person's calls (fresh each call) and one for their texts: each has its own context, reads this project's files but cannot change them, and takes its direction from /brief.md before every reply.",
     'You keep that direction. When your person tells you what callers or texters should hear, be offered, or not be promised, update /brief.md: short, current and plain, with anything out of date taken out. Put lasting facts (services explained, prices, areas served, answers to common questions) in files under /knowledge. Files your person attaches are kept in /uploads, where the sub-agents read them too.',
-    'Pass on what your person tells you, so the phone\'s agents know it: for everyone, /brief.md (read before every reply, so a call going on now has it at its next reply); about one person (their name, how they like things, what to tell them next time), caller_notes, which the agent of each of their calls reads as the call starts, and of their texts before every reply; for one conversation going on now (a call in progress), tell_agent. Each call starts fresh: its agent has what the brief and that person\'s note say, and looks up their earlier calls and texts itself.',
+    'Pass on what your person tells you, so the phone\'s agents know it: for everyone, /brief.md (read before every reply, so a call going on now has it at its next reply); about one person (their name, how they like things, what to tell them next time), caller_notes, which the agent of each of their calls reads as the call starts, and of their texts before every reply (it is their contact on OAIY Desktop: your person\'s own notes about them there come first and win, and a name your person gave them stays); for one conversation going on now (a call in progress), tell_agent. Each call starts fresh: its agent has what the brief and that person\'s note say, and looks up their earlier calls and texts itself.',
     'To see what the phone\'s agents said and did, use phone_conversations (the list, or one conversation). Opening hours and services come from the Calendar, not from files.',
     'To call or text a list of people for your person (confirm, remind, collect details), use start_outreach; it asks them once, then works through the list itself and reports back here. Its results are kept in /outreach, which only you read (the phone\'s agents cannot).',
   ].join('\n');
@@ -697,6 +698,8 @@ async function main(): Promise<void> {
       () => (phoneOn() && frontDesk.vfs.exists(FRONT_DESK_BRIEF) ? frontDesk.vfs.readText(FRONT_DESK_BRIEF) : ''),
     ));
     own.calendarOn = calendarOn;
+    // What is known about each person is their contact on the desktop (read, and written as they are remembered).
+    own.contacts = desktopContacts(() => desktop);
     await own.load();
     // Missed calls rung back: by the page that answers the calls, when the line is free (started with the phone).
     // (Never anyone on the do-not-contact list: they asked not to be called.)
@@ -1886,6 +1889,18 @@ With that done, Settings → Images, video and audio → Find OAIY sets it up.`)
     for (const [number, name] of names) void d.rememberCaller(number, name).catch(() => {});
   }
 
+  /**
+   * The desktop's contacts, as the phone starts (and when the desktop is back):
+   * the Front desk's facts moved there once, any remembered while it was out
+   * of reach sent, then everyone's contact read, so a call's agent has its
+   * caller's at once.
+   */
+  function followContacts(): void {
+    const s = sessions;
+    if (!desktop || !s) return;
+    void s.syncContacts().then(() => s.refreshContacts());
+  }
+
   async function refreshPhone(): Promise<void> {
     // Asked only while there is a phone (a plugin provides it).
     if (!desktop || !phoneOn()) return;
@@ -1894,6 +1909,7 @@ With that done, Settings → Images, video and audio → Find OAIY sets it up.`)
       phoneConnected = !!status?.connected;
       desktopProblem = '';
       giveCallerNames();
+      followContacts();
     } catch (error) {
       desktopProblem = (error as Error).message;
     }
