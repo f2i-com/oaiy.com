@@ -1477,6 +1477,21 @@ export class Sessions {
         // A reply is written faster than it is spoken: one whose run has ended may still have been playing.
         if (!session.running) await this.cutAfterRun(session);
         break;
+      case 'call.resumed': {
+        // The caller only acknowledged the reply they cut off ("yeah, sure"): the desktop says the rest itself, from
+        // the first line they did not hear whole. It is that reply going on, not a new turn (their words come as a
+        // backchannel): its record has those lines again, the one cut off midway once.
+        const lines = Array.isArray(event.sentences) ? event.sentences.map(String) : [];
+        const last = session.agent.turns.at(-1);
+        if (session.running || !lines.length) break;
+        if (last?.role === 'assistant' && !last.calls.length) {
+          let heard = last.text.replace(/…$/, '').trim();
+          for (const line of [...lines].reverse()) if (heard.endsWith(line)) heard = heard.slice(0, -line.length).trim();
+          last.text = [heard, ...lines].filter(Boolean).join(' ');
+        } else if (last?.role === 'user') session.agent.turns.push({ role: 'assistant', text: lines.join(' '), calls: [], at: Date.now() });
+        await this.save(session);
+        break;
+      }
       case 'call.ended':
         await this.endCall(session, typeof event.reason === 'string' ? event.reason : '');
         break;

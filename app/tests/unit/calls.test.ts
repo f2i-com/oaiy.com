@@ -766,6 +766,68 @@ describe('a phone call answered by the agent', () => {
     expect(calls.filter((c) => c[0] === 'say').map((c) => c[2])).toEqual(['We are open from nine.', 'We close at five on weekdays.', 'Sure.', 'We close at five on weekdays.']);
   });
 
+  it('a reply cut off by a "yeah, sure" and taken up again by the desktop is whole in the conversation, and no turn starts', async () => {
+    let cut!: () => void;
+    const cutNow = new Promise<void>((r) => (cut = r));
+    const fake = fakeProvider('openai', [
+      { text: 'We are open from nine. We close at five. And on Sundays we rest.', hold: { at: 42, until: cutNow } },
+      (body) => {
+        const sent = JSON.stringify(body.messages);
+        expect(sent).toContain('We are open from nine. We close at five. And on Sundays we rest.');
+        expect(sent).not.toContain('We close at five.…');
+        expect(sent).toContain('Caller [0:10, over you as you said \\"We close at five.\\"]: Yeah, sure.\\nCaller [0:14]: Saturday too?');
+        return { text: 'Saturday too.' };
+      },
+    ]);
+    const { sessions, calls } = setup();
+    await sessions.callEvent({ type: 'call.started', callId: 'call_y', from: '+61400000026' });
+    await sessions.callEvent({ type: 'call.caller', callId: 'call_y', text: 'When are you open?' });
+    for (let i = 0; i < 100 && calls.filter((c) => c[0] === 'say').length < 2; i++) await new Promise((r) => setTimeout(r, 10));
+    await sessions.callEvent({ type: 'call.said', callId: 'call_y', itemId: 'out_1', text: 'We are open from nine.', startMs: 8_000, endMs: 9_600 });
+    await sessions.callEvent({ type: 'call.said', callId: 'call_y', itemId: 'out_1', text: 'We close at five.', startMs: 9_600, endMs: 11_000 });
+    // "Yeah, sure" from 0:09.95 stops it in its second line; the run stops with it.
+    await sessions.callEvent({ type: 'call.interrupted', callId: 'call_y', itemId: 'out_1', atMs: 10_550 });
+    cut();
+    await settled(sessions);
+    // Only an acknowledgement: the desktop says the rest itself, from the line cut off midway.
+    await sessions.callEvent({ type: 'call.resumed', callId: 'call_y', itemId: 'out_1', fromSentence: 1, sentences: ['We close at five.', 'And on Sundays we rest.'] });
+    await sessions.callEvent({ type: 'call.caller', callId: 'call_y', text: 'Yeah, sure.', startMs: 9_950, endMs: 10_750, over: true, cut: false, backchannel: true, resumed: true });
+    await sessions.callEvent({ type: 'call.said', callId: 'call_y', itemId: 'out_2', text: 'We close at five.', startMs: 11_100, endMs: 12_500 });
+    await settled(sessions);
+    expect(fake.bodies).toHaveLength(1);
+    await sessions.callEvent({ type: 'call.caller', callId: 'call_y', text: 'Saturday too?', startMs: 14_000, endMs: 15_000, over: false, cut: false, backchannel: false });
+    await settled(sessions);
+    expect(fake.bodies).toHaveLength(2);
+    // The app said its reply as far as it was written; the desktop said the rest again.
+    expect(calls.filter((c) => c[0] === 'say').map((c) => c[2])).toEqual(['We are open from nine.', 'We close at five.', 'Saturday too.']);
+  });
+
+  it('a reply written already, cut off in its first line by an acknowledgement and taken up again, is whole in the conversation', async () => {
+    const fake = fakeProvider('openai', [
+      { text: 'We are open from nine. We close at five on weekdays.' },
+      (body) => {
+        const sent = JSON.stringify(body.messages);
+        expect(sent).toContain('We are open from nine. We close at five on weekdays.');
+        expect(sent).not.toContain('from nine.…');
+        return { text: 'Saturday too.' };
+      },
+    ]);
+    const { sessions } = setup();
+    await sessions.callEvent({ type: 'call.started', callId: 'call_z', from: '+61400000027' });
+    await sessions.callEvent({ type: 'call.caller', callId: 'call_z', text: 'When are you open?' });
+    await settled(sessions);
+    await sessions.callEvent({ type: 'call.said', callId: 'call_z', itemId: 'out_1', text: 'We are open from nine.', startMs: 8_000, endMs: 9_600 });
+    await sessions.callEvent({ type: 'call.said', callId: 'call_z', itemId: 'out_1', text: 'We close at five on weekdays.', startMs: 9_600, endMs: 11_500 });
+    await sessions.callEvent({ type: 'call.interrupted', callId: 'call_z', itemId: 'out_1', atMs: 9_400 });
+    await sessions.callEvent({ type: 'call.resumed', callId: 'call_z', itemId: 'out_1', fromSentence: 0, sentences: ['We are open from nine.', 'We close at five on weekdays.'] });
+    await sessions.callEvent({ type: 'call.caller', callId: 'call_z', text: 'Of course.', startMs: 8_800, endMs: 9_600, over: true, cut: false, backchannel: true, resumed: true });
+    await settled(sessions);
+    expect(fake.bodies).toHaveLength(1);
+    await sessions.callEvent({ type: 'call.caller', callId: 'call_z', text: 'And Saturday?', startMs: 14_000, endMs: 15_000, over: false, cut: false, backchannel: false });
+    await settled(sessions);
+    expect(fake.bodies).toHaveLength(2);
+  });
+
   it('a tool that takes a while gets a short line said, once, when nothing has been said', async () => {
     vi.useFakeTimers({ toFake: ['setTimeout', 'clearTimeout'] });
     try {
