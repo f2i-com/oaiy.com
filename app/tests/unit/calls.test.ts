@@ -310,6 +310,41 @@ describe('a phone call answered by the agent', () => {
     ]);
   });
 
+  it("a call asks the calendar's free times itself, answered at once, and a check the same as one a moment ago says so, turn after turn", async () => {
+    const fake = fakeProvider('openai', [
+      (body) => {
+        const tools = (body.tools as Array<{ function: { name: string } }>).map((t) => t.function.name);
+        expect(tools).toEqual(expect.arrayContaining(['calendar_free_times', 'lookup_business_data', 'end_call']));
+        expect(JSON.stringify(body)).toContain('calendar_free_times (what is free, answered at once');
+        return { calls: [{ name: 'calendar_free_times', input: { from: '2026-10-01', days: 1 } }] };
+      },
+      { text: 'Thursday has room from ten.' },
+      { calls: [{ name: 'calendar_free_times', input: { from: '2026-10-01', days: 1 } }] },
+      (body) => {
+        expect(JSON.stringify(body.messages)).toContain('the same as your check a moment ago');
+        return { text: 'Still from ten on Thursday.' };
+      },
+    ]);
+    const { sessions, calls } = setup();
+    const desktop = (sessions as unknown as { desktop: () => Record<string, unknown> }).desktop();
+    let asked = 0;
+    desktop.calendar = async () => ({ available: true, settings: {}, appointments: [], now: '2026-09-29T09:00' });
+    desktop.calendarFree = async () => {
+      asked++;
+      return { minutes: 60, service: null, days: [{ date: '2026-10-01', times: ['10:00', '11:00'] }] };
+    };
+    await sessions.callEvent({ type: 'call.started', callId: 'call_cal', from: '+61400000033' });
+    await sessions.callEvent({ type: 'call.caller', callId: 'call_cal', text: 'Anything Thursday?' });
+    await settled(sessions);
+    await sessions.callEvent({ type: 'call.caller', callId: 'call_cal', text: 'Sorry, Thursday again?' });
+    await settled(sessions);
+    expect(fake.bodies).toHaveLength(4);
+    expect(asked).toBeGreaterThanOrEqual(2);
+    // Not through the phone's lookup: the calendar answers the agent itself.
+    expect(calls.filter((c) => c[0] === 'lookup_business_data')).toEqual([]);
+    expect(calls.filter((c) => c[0] === 'say').map((c) => c[2])).toEqual(['Thursday has room from ten.', 'Still from ten on Thursday.']);
+  });
+
   it('a reply with only end_call says the goodbye it gives', async () => {
     fakeProvider('openai', [{ calls: [{ name: 'remember', input: { fact: 'Books monthly' } }, { name: 'end_call', input: { goodbye: 'Thanks, Sam. Bye!' } }] }, { text: '' }]);
     const { sessions, calls } = setup();

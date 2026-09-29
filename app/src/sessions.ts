@@ -14,7 +14,7 @@ import { Agent, type AgentEvent, type AgentOptions, type SessionTool } from './a
 import { TOOLS } from './agent/tools';
 import type { Turn } from './agent/protocol';
 import type { Desktop, DesktopEvent } from './desktop/bridge';
-import { textCalendarTools } from './desktop/calendarTools';
+import { callCalendarTools, textCalendarTools } from './desktop/calendarTools';
 import { isHidden, localCountry, phoneKey, samePerson } from './phoneNumbers';
 import type { MessageSettings } from './settings';
 import { MAX_FACTS, regroup, threadId, threadOrder, type Way } from './threads';
@@ -371,13 +371,13 @@ export function spoken(text: string): string {
 }
 
 /** What a call conversation is for, in its agent's instructions. */
-export function callInstructions(brief: string, instructions: string): string {
+export function callInstructions(brief: string, instructions: string, calendar = false): string {
   return [
     `This conversation is a live phone call, on the phone of the person you work for: who is calling, today's date and what you know about them are in the note that starts the call. Everything you write is spoken aloud to the caller as you write it, so write only what you would say: one or two short sentences, plain words, no markdown, lists, emoji, links or quotation marks. Start with what matters, not a filler word. Then stop, and let them answer.`,
     'Their words arrive as "Caller [0:42]: …", transcribed from speech (allow for a misheard word), with when they said them (minutes and seconds into the call). "over you" means they spoke while you were talking: a short "mm-hmm" or "yeah" does not stop you (you see it with their next words); more than that stops you, and you see what you were saying. If they have not finished (they stopped mid-sentence, or said "um, let me think"), write nothing at all: an empty reply keeps listening. A message "[OAIY] A note from the runner" is your person\'s direction, passed on by the main agent they talk to: go by it, without reading it out. Any other message without the "Caller:" label comes from the person you work for, who may be watching: do what they say.',
-    'Your call tools: request_appointment (a booking request for staff to confirm; never say it is booked or confirmed), lookup_business_data (a question about the business\'s records or calendar), end_call (a short goodbye, then the call ends; use it when the caller is done; a brief that says finish_call means end_call). Your other tools work too.',
+    `Your call tools: request_appointment (a booking request for staff to confirm; never say it is booked or confirmed), ${calendar ? 'calendar_free_times (what is free, answered at once: a line a day with its hours, the times booked, the free ranges and when a service can start; use it for any question of when they can come), ' : ''}lookup_business_data (a question about the business's records or calendar), end_call (a short goodbye, then the call ends; use it when the caller is done; a brief that says finish_call means end_call). Your other tools work too.`,
     REFERENCE,
-    'To look something up, do it in the same reply as a few words: say "Let me check." and make the call at once. Never say you will check without doing it: the caller hears you and waits. lookup_business_data answers later, in a message of its own ("[OAIY] The answer to your lookup …"): keep the conversation going meanwhile (answer anything else they say, without guessing the answer), and tell them the answer when it comes. Other tools (a file, remember) answer at once.',
+    `To look something up, do it in the same reply as a few words: say "Let me check." and make the call at once. Never say you will check without doing it: the caller hears you and waits. lookup_business_data answers later, in a message of its own ("[OAIY] The answer to your lookup …"): keep the conversation going meanwhile (answer anything else they say, without guessing the answer), and tell them the answer when it comes. Other tools (${calendar ? 'calendar_free_times, ' : ''}a file, remember) answer at once.`,
     'Say only what you know: from these instructions, the brief, or what a tool returned. Never make up availability, times, prices or bookings, and never say a time is free or agree to one unless a tool said it is. If you cannot check, say so, and offer to take their preferred time as a request for staff to confirm.',
     'To take a booking request: once you have the service, the day and time they want and their name, call request_appointment in that same reply, and only then tell them it is requested. Saying you have noted it without calling request_appointment records nothing.',
     'Never repeat something you have already said on this call. When the caller says goodbye or is done, call end_call with a short goodbye, and write nothing else: its goodbye is the one thing said (words written in that reply are said as the goodbye instead), and nothing written after end_call is ever said.',
@@ -808,9 +808,13 @@ export class Sessions {
   private create(info: SessionInfo): Session {
     const session = { ...info, running: null, controller: null, waiting: [] } as unknown as Session;
     if (info.kind === 'call') {
+      // The calendar's free times, answered at once (one tool a conversation: its repeat check lasts from call to call).
+      const calendar = callCalendarTools(this.desktop);
+      const own = [...this.callTools(session), ...this.personTools(session)];
       session.agent = this.makeAgent({
-        instructions: () => this.directed(callInstructions(session.brief ?? '', this.settings().callInstructions)),
-        sessionTools: [...this.callTools(session), ...this.personTools(session)],
+        instructions: () => this.directed(callInstructions(session.brief ?? '', this.settings().callInstructions, this.calendarOn())),
+        // The calendar's tool only while there is a calendar (a plugin provides it).
+        sessionTools: () => [...own, ...(this.calendarOn() ? calendar : [])],
         tools: TOOLS.filter((t) => CALL_TOOLS.has(t.name)),
         // Answer at once: no thinking first.
         reasoning: 'none',
