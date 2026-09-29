@@ -20,7 +20,8 @@
 //!
 //! Every relayed command, for a plugin or for this app, allowed or refused, is
 //! one line of `<data>/relay-log.jsonl` (connector, verb, decision, command id),
-//! never its payload.
+//! never its payload; the reads that were allowed go in `<data>/relay-reads.jsonl`
+//! instead, so that a console polling every few seconds cannot roll the rest out.
 //!
 //! [`dispatcher`] is the same code without the policy or the log, for callers on
 //! this computer: a binding's follow-up actions in [`super::flow_runner`]. It must
@@ -78,12 +79,18 @@ fn forward_error_message(
     }
 }
 
-/// The log of commands the relay ran or refused, in the data folder.
+/// The log of what the relay refused and what it allowed that changes something, in
+/// the data folder.
 ///
 /// Its own file, written with the same code as the control log. The control log
 /// is the Agent's changes and Settings → Agent shows it as such; a provider's call
 /// console asks `call.current` every few seconds, and would fill it.
 pub const RELAY_LOG_FILE: &str = "relay-log.jsonl";
+
+/// The reads the relay allowed, in a file of their own beside it (see [`RelayGuard`]):
+/// at about 230 bytes a line, a console polling every three seconds fills the 2 MiB a
+/// file holds in about seven hours.
+pub const RELAY_READS_FILE: &str = "relay-reads.jsonl";
 
 /// The ops of the `desktop` connector: the closed list [`dispatcher`] answers.
 ///
@@ -104,14 +111,25 @@ pub const DESKTOP_OPS: [&str; 10] = [
     "plugins.health",
 ];
 
+/// The ops among them that only read: the ones a dashboard asks again and again.
+const DESKTOP_READS: [&str; 3] = ["services.list", "plugins.list", "plugins.health"];
+
 /// What stands between the relay and the plugins: the rules, and the record.
+///
+/// The record is two files. The main one, [`RELAY_LOG_FILE`], has every refusal, every command
+/// that changes something and every op of this app's own that starts or stops something: what
+/// somebody comes to the log to find. The other, [`RELAY_READS_FILE`], has the reads the relay
+/// allowed (a command the plugin declares and does not journal, and the desktop's list and health
+/// ops). A call console asks `call.current` every few seconds; in the main file that would roll
+/// the refusals out within a working day.
 pub struct RelayGuard {
     policy: RelayPolicy,
     log: audit::Log,
+    reads: audit::Log,
 }
 
 impl RelayGuard {
-    /// The policy this build ships, and `<data>/relay-log.jsonl`.
+    /// The policy this build ships, and `<data>/relay-log.jsonl` with `<data>/relay-reads.jsonl`.
     pub fn open(data_dir: &Path) -> RelayGuard {
         let policy = RelayPolicy::shipped();
         if let Some(why) = policy.closed_because() {
@@ -122,8 +140,10 @@ impl RelayGuard {
         RelayGuard::new(policy, data_dir.join(RELAY_LOG_FILE))
     }
 
+    /// The reads file is the main file's neighbour.
     pub fn new(policy: RelayPolicy, log_path: PathBuf) -> RelayGuard {
-        RelayGuard { policy, log: audit::Log::new(log_path) }
+        let reads = log_path.with_file_name(RELAY_READS_FILE);
+        RelayGuard { policy, log: audit::Log::new(log_path), reads: audit::Log::new(reads) }
     }
 
     /// May the website run `command` on `connector`? Either way it is written down,
@@ -142,8 +162,11 @@ impl RelayGuard {
             // The decision is made and the plugin had no say in it. What the website is TOLD
             // does depend on whether the plugin has such a command at all.
             .map_err(|refusal| refusal.worded_for(declared));
+        // A command the plugin declares and does not journal changes nothing: a read. When the
+        // registry cannot say, it is not called one, and the line goes where it will be found.
+        let read = verdict.is_ok() && matches!(declared(), Declared::Plugin { declares: true, journalled: false });
         let line = Line { connector, command, command_id, target: None };
-        self.record(line, verdict.as_ref().err().map(Refusal::reason));
+        self.record(line, verdict.as_ref().err().map(Refusal::reason), read);
         verdict
     }
 
@@ -157,7 +180,7 @@ impl RelayGuard {
         let listed = DESKTOP_OPS.contains(&command);
         let target = if listed { op_target(payload) } else { None };
         let line = Line { connector: DESKTOP_CONNECTOR, command, command_id, target };
-        self.record(line, (!listed).then_some("unknown_op"));
+        self.record(line, (!listed).then_some("unknown_op"), DESKTOP_READS.contains(&command));
         if listed {
             Ok(())
         } else {
@@ -168,8 +191,8 @@ impl RelayGuard {
     /// One line: which command, on which connector, what was decided and why (`refused`
     /// is the reason, when it was). Never the payload (message text, phone numbers) and
     /// never anything the plugin said back: the log's redaction only knows secret-looking
-    /// NAMES.
-    fn record(&self, line: Line<'_>, refused: Option<&str>) {
+    /// NAMES. A `read` that was allowed goes in the reads file; a refusal never does.
+    fn record(&self, line: Line<'_>, refused: Option<&str>, read: bool) {
         let mut args = json!({
             "connector": line.connector,
             "command": line.command,
@@ -186,7 +209,8 @@ impl RelayGuard {
                 format!("refused: {reason}")
             }
         };
-        self.log.append("relay.command", &args, "relay", refused.is_none(), &summary);
+        let log = if read && refused.is_none() { &self.reads } else { &self.log };
+        log.append("relay.command", &args, "relay", refused.is_none(), &summary);
     }
 }
 
@@ -633,6 +657,34 @@ mod guard_tests {
         dispatcher(world.registry.clone(), world.plugins.clone(), world.host.clone())
     }
 
+    /// The lines of one of the relay's log files, oldest first (none, if it was never written).
+    fn lines_of(world: &World, file: &str) -> Vec<Value> {
+        std::fs::read_to_string(world.root.join(file))
+            .unwrap_or_default()
+            .lines()
+            .map(|l| serde_json::from_str(l).expect("one JSON line each"))
+            .collect()
+    }
+
+    /// Both files, as text.
+    fn both_logs(world: &World) -> String {
+        [RELAY_LOG_FILE, RELAY_READS_FILE]
+            .iter()
+            .map(|f| std::fs::read_to_string(world.root.join(f)).unwrap_or_default())
+            .collect()
+    }
+
+    /// The one line, in either file, that was written for the command with this id.
+    fn line_for(world: &World, command_id: &str) -> Value {
+        let mut found: Vec<Value> = [RELAY_LOG_FILE, RELAY_READS_FILE]
+            .iter()
+            .flat_map(|f| lines_of(world, f))
+            .filter(|l| l["args"]["commandId"] == command_id)
+            .collect();
+        assert_eq!(found.len(), 1, "{command_id}: {}", both_logs(world));
+        found.remove(0)
+    }
+
     // ---- what the relay lets through ---------------------------------------------------
 
     #[test]
@@ -993,11 +1045,8 @@ mod guard_tests {
         let _ = relay("desktop", "plugins.detonate", &json!({ "pluginId": "aokie" }), "cmd-6");
         let _ = relay("desktop", "plugins.list", &Value::Null, "cmd-7");
 
-        let raw = std::fs::read_to_string(world.root.join(RELAY_LOG_FILE)).expect("the relay log");
-        let targets: Vec<Value> = raw
-            .lines()
-            .map(|l| serde_json::from_str::<Value>(l).unwrap()["args"]["target"].clone())
-            .collect();
+        let raw = both_logs(&world);
+        let targets: Vec<Value> = (1..=7).map(|n| line_for(&world, &format!("cmd-{n}"))["args"]["target"].clone()).collect();
         assert_eq!(
             targets,
             [json!("aokie"), json!("oaiy-voice"), json!("aokie"), Value::Null, Value::Null, Value::Null, Value::Null],
@@ -1006,6 +1055,51 @@ mod guard_tests {
         for text in ["0491 570 006", "0491 570 156", "Call Alex", long.as_str()] {
             assert!(!raw.contains(text), "the log holds {text:?}: {raw}");
         }
+    }
+
+    #[test]
+    fn routine_reads_have_a_log_of_their_own_so_a_polling_console_cannot_push_the_rest_out() {
+        // The provider's call console asks `call.current` every three seconds, all day. In one
+        // file with the refusals and the commands that did something, that fills the file and
+        // rolls those out within hours. Every command is still written down: an allowed one
+        // that changes nothing goes in the reads file, everything else in the main one.
+        let world = world("reads");
+        let relay = relay(&world, RelayPolicy::shipped());
+        for n in 0..50 {
+            let _ = relay("aokie", "call.current", &Value::Null, &format!("cmd-poll-{n}"));
+        }
+        let _ = relay("aokie", "sms.threads", &Value::Null, "cmd-threads");
+        // A plugin with no entry: a command it declares and does not journal is a read too.
+        let _ = relay("notes", "note.list", &Value::Null, "cmd-notes");
+        let _ = relay("desktop", "plugins.list", &Value::Null, "cmd-plugins");
+        let _ = relay("desktop", "services.list", &Value::Null, "cmd-services");
+        let _ = relay("desktop", "plugins.health", &json!({ "pluginId": "aokie" }), "cmd-health");
+
+        // What somebody comes to the log to find.
+        let _ = relay("aokie", "sms.send", &json!({ "to": "0491 570 157", "body": "Hello" }), "cmd-send");
+        let _ = relay("aokie", "call.hangup", &json!({ "callId": "call-1" }), "cmd-hangup");
+        let _ = relay("aokie", "dongle.installDriver", &json!({ "vid": 1, "pid": 2 }), "cmd-driver");
+        let _ = relay("aokie", "call.transfer", &Value::Null, "cmd-transfer");
+        // A read the policy refuses is a refusal, and goes with them.
+        let _ = relay("aokie", "dongle.getPreferred", &Value::Null, "cmd-preferred");
+        let _ = relay("notes", "note.add", &json!({ "text": "hello" }), "cmd-note");
+        let _ = relay("desktop", "plugins.stop", &json!({ "pluginId": "aokie" }), "cmd-stop");
+        let _ = relay("desktop", "plugins.detonate", &Value::Null, "cmd-boom");
+
+        let ids = |file: &str| -> Vec<String> {
+            lines_of(&world, file).iter().map(|l| l["args"]["commandId"].as_str().unwrap().to_string()).collect()
+        };
+        let mut reads: Vec<String> = (0..50).map(|n| format!("cmd-poll-{n}")).collect();
+        reads.extend(["cmd-threads", "cmd-notes", "cmd-plugins", "cmd-services", "cmd-health"].map(String::from));
+        assert_eq!(ids(RELAY_READS_FILE), reads);
+        assert!(lines_of(&world, RELAY_READS_FILE).iter().all(|l| l["args"]["decision"] == "allowed"));
+        assert_eq!(
+            ids(RELAY_LOG_FILE),
+            [
+                "cmd-send", "cmd-hangup", "cmd-driver", "cmd-transfer", "cmd-preferred", "cmd-note", "cmd-stop",
+                "cmd-boom"
+            ]
+        );
     }
 
     #[test]

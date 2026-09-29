@@ -129,21 +129,33 @@ example just after a restart.
 
 ### The record
 
-Every relayed command, allowed or refused, is one line of
-`<data>/relay-log.jsonl`: `{at, tool: "relay.command", args: {connector, command,
-commandId, decision, reason?, target?}, session: "relay", ok, summary}`. The line is
-written before the command is forwarded. It never holds the payload (message text,
-phone numbers) or anything the plugin answered. The desktop's own ops are in it too,
-with the connector `desktop`: allowed when they are on the closed list, and refused
-(`unknown_op`) when they are not, so stopping the phone plugin from the website
-leaves a line, and the line names the plugin or service it acted on (`target`) when
-the payload gives a plain id (letters, digits, `.`, `_`, `-`) and writes nothing else
-of the payload. A command for a plugin that the policy refuses says which rule did
-(`not_listed`, `journalled`, `not_declared`, `policy_unreadable`, `no_command_id`). It
-is its own file, written the way the
-[control log](../../docs/AGENT_CONTROL.md#the-switch-and-the-log) is, because that
-log is the Agent's changes and a call console asks `call.current` every few
-seconds. It rolls at 2 MiB and keeps one previous file.
+Every relayed command, allowed or refused, is one line in `<data>`: `{at, tool:
+"relay.command", args: {connector, command, commandId, decision, reason?, target?},
+session: "relay", ok, summary}`. The line is written before the command is
+forwarded. `allowed` means the list let it through, not that the plugin then
+succeeded. A line never holds the payload (message text, phone numbers) or anything
+the plugin answered. The desktop's own ops are in it too, with the connector
+`desktop`: allowed when they are on the closed list, and refused (`unknown_op`) when
+they are not, so stopping the phone plugin from the website leaves a line, and the
+line names the plugin or service it acted on (`target`) when the payload gives a
+plain id (letters, digits, `.`, `_`, `-`) and writes nothing else of the payload. A
+command for a plugin that the list refuses says which rule did (`not_listed`,
+`journalled`, `not_declared`, `policy_unreadable`, `no_command_id`).
+
+There are two files, written the way the
+[control log](../../docs/AGENT_CONTROL.md#the-switch-and-the-log) is and not in it,
+because that log is the Agent's changes:
+
+- `relay-log.jsonl` has every refusal, every command that changes something
+  (answer, hang up, speak, dial, text) and the desktop's start, stop and repair ops:
+  what somebody comes to the log to find.
+- `relay-reads.jsonl` has the reads that were allowed: a command its plugin declares
+  and does not journal, and the desktop's list and health ops. A call console asks
+  `call.current` every three seconds, a line of about 230 bytes, which fills a 2 MiB
+  file in about seven hours. In the first file that would roll the refusals out
+  within a working day.
+
+Each file rolls at 2 MiB and keeps one previous file.
 
 ### What this does not cover
 
