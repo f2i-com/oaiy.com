@@ -234,11 +234,12 @@ describe('a request to reach the owner', () => {
     expect(call.aside).toHaveLength(1);
   });
 
-  it('a decline, a timeout and a takeover that failed each tell the model what is true and to offer a message', async () => {
+  it('a decline, a timeout, a takeover that failed and a request withdrawn each tell the model what is true and to offer a message', async () => {
     for (const [outcome, expected] of [
       ['declined', TRANSFER_NOTES.declined],
       ['expired', TRANSFER_NOTES.nobody],
       ['unavailable', TRANSFER_NOTES.nobody],
+      ['cancelled', TRANSFER_NOTES.cancelled],
     ] as const) {
       const fake = fakeProvider('openai', [
         { text: "I'll try.", calls: [{ name: 'transfer_to_owner', input: { reason: 'caller_asked' } }] },

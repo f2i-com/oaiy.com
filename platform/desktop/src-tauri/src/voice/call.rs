@@ -906,7 +906,8 @@ where
     // Tool calls that wait for a transfer (or a transfer that waits for them), and the request to reach the owner
     // with the clocks that keep the caller from silence (see `transfer`).
     let mut tools = Tools::default();
-    let mut transfer = Transfer::new(hub.transfer_timing());
+    let timing = hub.transfer_timing();
+    let mut transfer = Transfer::new(timing);
     // What was heard of a request this turn of the loop (from the phone, or from a clock): (request, outcome, the owner's words, where from).
     let mut outcomes: Vec<(String, Outcome, Option<String>, &'static str)> = Vec::new();
     // A reply the caller cut off, said after all if their words were only an acknowledgement.
@@ -933,7 +934,7 @@ where
     };
     let reason: String = loop {
         // The next moment one of the transfer's clocks has something to do: a caller is not left in silence.
-        let watch = transfer.next_deadline();
+        let watch = [transfer.next_deadline(), tools.next_expiry(timing.tool_answer)].into_iter().flatten().min();
         tokio::select! {
             message = stream.next() => {
                 let Some(Ok(message)) = message else { break "the stream closed".into() };
@@ -1333,6 +1334,18 @@ where
             _ = tokio::time::sleep_until(opening.map_or_else(|| Instant::now() + Duration::from_secs(3600), |o| o.next_look(Instant::now())).into()), if opening.is_some() => {}
             // A request to reach the owner: its clocks. They do not wait for the phone, the app or the model.
             _ = tokio::time::sleep_until(watch.unwrap_or_else(|| Instant::now() + Duration::from_secs(3600)).into()), if watch.is_some() => {
+                // A transfer request the phone never answered: it is answered as unavailable, and what waited behind it goes.
+                let unanswered = tools.expired(Instant::now(), timing.tool_answer);
+                for id in &unanswered {
+                    if let Some(reply) = pending_tools.remove(id) {
+                        let _ = reply.send(Ok(transfer::refused("unavailable", "no_answer")));
+                    }
+                }
+                if !unanswered.is_empty() {
+                    for next in tools.ready() {
+                        send_waiting(next, &mut tools, &mut pending_tools, &mut finishing, &out_tx, &ids).await;
+                    }
+                }
                 for due in transfer.due(Instant::now()) {
                     match due {
                         Due::Say(line) => {
@@ -2495,7 +2508,7 @@ mod tests {
 
     /// The clocks of a ring, fast enough for a test.
     fn quick() -> transfer::Timing {
-        transfer::Timing { hold_after: Duration::from_millis(300), hold_silence: Duration::from_millis(300), hold_every: Duration::from_millis(400), answer_gap: Duration::from_millis(150), offer_after: Duration::from_millis(300), give_up_after: Duration::from_millis(200), setup_limit: Duration::from_millis(600), cancel_wait: Duration::from_millis(500) }
+        transfer::Timing { hold_after: Duration::from_millis(300), hold_silence: Duration::from_millis(300), hold_every: Duration::from_millis(400), answer_gap: Duration::from_millis(150), offer_after: Duration::from_millis(300), give_up_after: Duration::from_millis(200), setup_limit: Duration::from_millis(600), cancel_wait: Duration::from_millis(500), tool_answer: Duration::from_millis(900) }
     }
 
     fn owner_settings(enabled: bool) -> crate::ring::RingSettings {
@@ -2899,6 +2912,31 @@ mod tests {
         assert_eq!(third["name"], "request_appointment");
         aokie.send(json!({"type": "formlogic.realtime.tool_result", "callId": aokie.call, "toolCallId": third["toolCallId"], "ok": true, "output": {"recorded": true}}));
         assert_eq!(answer_of(appointment).await.unwrap()["ok"], true);
+    }
+
+    #[tokio::test]
+    async fn a_transfer_the_phone_never_answers_is_answered_as_unavailable_and_the_goodbye_is_sent() {
+        let mut aokie = transferable(owner_settings(true), true).await;
+        caller_asks(&aokie);
+        let transfer_asked = asking(&aokie, transfer::TOOL, json!({"reason": "caller_asked"}));
+        let sent = aokie.text("formlogic.realtime.tool_call", secs(3)).await.expect("the transfer reached the phone");
+        assert_eq!(sent["name"], transfer::TOOL);
+        // The model ends the call while the phone says nothing to the transfer: the goodbye waits behind it.
+        let (reply, goodbye) = oneshot::channel();
+        aokie.hub.command(&aokie.call).unwrap().send(CallCommand::Finish { goodbye: "Goodbye!".into(), reply }).unwrap();
+        assert!(aokie.text("formlogic.realtime.tool_call", Duration::from_millis(400)).await.is_none(), "waits for the transfer to be answered");
+        // The phone never answers: after the limit (0.9 s here, 25 s in a call) the transfer is answered as unavailable, with a typed reason.
+        let answered = answer_of(transfer_asked).await.expect("the model is answered");
+        assert_eq!((answered["ok"].clone(), answered["output"]["status"].clone(), answered["output"]["reason"].clone()), (json!(false), json!("unavailable"), json!("no_answer")), "{answered}");
+        assert!(answered["output"]["instruction"].as_str().unwrap().contains("take a message"));
+        // ...and the goodbye is sent, so the call can end.
+        let finish = aokie.text("formlogic.realtime.tool_call", secs(2)).await.expect("the goodbye is sent once the transfer is off the wire");
+        assert_eq!(finish["name"], "finish_call");
+        aokie.send(json!({"type": "formlogic.realtime.tool_result", "callId": aokie.call, "toolCallId": finish["toolCallId"], "ok": true, "output": {}}));
+        assert!(goodbye.await.unwrap().is_ok());
+        // The phone's answer to the transfer, far too late, is ignored: it neither rings nor confuses the ledger.
+        aokie.send(ringing(&aokie, sent["toolCallId"].as_str().unwrap(), "assist_late", 30));
+        assert!(aokie.event("call.transfer", Duration::from_millis(300)).await.is_none());
     }
 
     #[tokio::test]

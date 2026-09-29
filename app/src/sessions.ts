@@ -561,7 +561,7 @@ export const TRANSFER_NOTES = {
   declinedWith: (words: string) =>
     `[OAIY] The owner cannot take the call now and left this message for the caller (relay it faithfully and add no promises): "${words}". Then offer to take a message (take_message).`,
   nobody: '[OAIY] Nobody could take the call. Offer to take a message (take_message). Do not promise a callback time.',
-  cancelled: '[OAIY] The transfer request was cancelled.',
+  cancelled: '[OAIY] The transfer request was withdrawn and nobody has the call. Offer to take a message (take_message). Do not promise a callback time.',
   handoff: '[OAIY] The owner took the call. Say nothing more.',
   back: (held: string) => `[OAIY] The owner handed the call back after ${held}. Continue helping, and do not greet the caller again.`,
   /** In the note that starts a call: whether the owner can be rung on it. */
@@ -1626,9 +1626,10 @@ export class Sessions {
       return;
     }
     if (outcome === 'cancelled') {
+      // The request ended without the owner taking the call (this desktop withdrew it, or the phone did) and the caller is still
+      // there: they are offered a message like after any other ending. (If they hung up, the call ends and this is not spoken.)
       session.handingOver = false;
-      session.agent.turns.push({ role: 'user', text: TRANSFER_NOTES.cancelled, automatic: true, at: Date.now() });
-      void this.save(session).catch(() => {});
+      this.answered(session, callId, TRANSFER_NOTES.cancelled);
       return;
     }
     if (!['declined', 'expired', 'unavailable'].includes(outcome)) return;

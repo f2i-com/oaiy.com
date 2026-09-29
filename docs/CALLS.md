@@ -176,7 +176,14 @@ agent : "I'll try to reach them, please stay with me."  (it is trying: it does n
   returns, the phone opens a new session for the same call id with `resume`: the app takes it as the
   same call in the same conversation, does not greet again, and the greeting spoken is the phone's own
   return line. If the phone hangs up meanwhile, the desktop ends the call itself
-  (`call.ended`, `ended_during_handoff`).
+  (`call.ended`, `ended_during_handoff`). If the phone's word that the call ended is lost, the call is
+  let go after 4 hours (`call.ended`, `handoff_expired`), so it does not hold an update back for ever. A
+  call in handoff counts as a live call for the updater.
+- **Nothing waits for ever.** A transfer request the phone never answers is answered to the model as
+  unavailable (`no_answer`) after 25 seconds, and the tools and the goodbye that waited behind it go. A
+  request the phone cancels on its own (consent taken back, say) while the caller is still there ends
+  with the caller offered a message, like any ending but an acceptance. A ring that has ended stays
+  ended if the plugin says again that it is out.
 - **The caller's words are heard here.** What the phone check reads ("did the caller ask?") is this
   desktop's own transcript of the last three turns, never the model's claim or the plugin's.
 - **Take a message.** `take_message` goes to `POST /api/voice/calls/{id}/message`, on the call's own

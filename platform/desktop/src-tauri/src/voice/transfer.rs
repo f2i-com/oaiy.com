@@ -53,6 +53,9 @@ pub const HOLD_EVERY: Duration = Duration::from_secs(15);
 /// When the caller speaks and nothing will answer them (no page answers calls), the desktop answers with a fixed line, and
 /// not more often than this however much they say.
 pub const ANSWER_GAP: Duration = Duration::from_secs(3);
+/// A transfer request the phone has not answered in this long is answered for it, as unavailable, and no longer holds back the
+/// tools and the goodbye behind it (the phone answers it in a second or two: it waits only for the line the model spoke to drain).
+pub const TOOL_ANSWER_LIMIT: Duration = Duration::from_secs(25);
 /// The most hold lines said for one ring (three wordings, twice: a ring lasts up to 90 seconds).
 pub const HOLD_MAX: u32 = 6;
 /// The most "still connecting" lines said after an acceptance (the takeover has 55 seconds).
@@ -78,11 +81,12 @@ pub struct Timing {
     pub give_up_after: Duration,
     pub setup_limit: Duration,
     pub cancel_wait: Duration,
+    pub tool_answer: Duration,
 }
 
 impl Default for Timing {
     fn default() -> Self {
-        Self { hold_after: HOLD_AFTER, hold_silence: HOLD_SILENCE, hold_every: HOLD_EVERY, answer_gap: ANSWER_GAP, offer_after: OFFER_AFTER, give_up_after: GIVE_UP_AFTER, setup_limit: SETUP_LIMIT, cancel_wait: CANCEL_WAIT }
+        Self { hold_after: HOLD_AFTER, hold_silence: HOLD_SILENCE, hold_every: HOLD_EVERY, answer_gap: ANSWER_GAP, offer_after: OFFER_AFTER, give_up_after: GIVE_UP_AFTER, setup_limit: SETUP_LIMIT, cancel_wait: CANCEL_WAIT, tool_answer: TOOL_ANSWER_LIMIT }
     }
 }
 
@@ -344,7 +348,7 @@ impl Transfer {
         }
         self.hold_at = None;
         // Whatever the phone said, it has now answered a request to withdraw this one.
-        let withdrawn = self.cancelling.take().is_some_and(|c| c.request == request);
+        self.cancelling = None;
         match outcome {
             Outcome::Accepted => {
                 if self.accepted.as_ref().is_some_and(|(a, _)| a == request) {
@@ -363,7 +367,9 @@ impl Transfer {
             // request that comes after it (a second device, a slow report) is not the owner giving it back. Only the
             // takeover failing (`unavailable`) or the caller hanging up (`cancelled`) ends what was accepted.
             Outcome::Declined | Outcome::Expired if self.accepted.is_some() => Vec::new(),
-            Outcome::Declined | Outcome::Expired | Outcome::Unavailable => {
+            // Whatever ended the request but an owner device taking the call ends with the caller offered a message, including the
+            // phone saying it was cancelled (which this desktop did not itself ask for): the call is still live and nobody has it.
+            Outcome::Declined | Outcome::Expired | Outcome::Unavailable | Outcome::Cancelled => {
                 let after_accept = self.accepted.take().is_some();
                 self.connect_at = None;
                 self.ringing = None;
@@ -371,24 +377,7 @@ impl Transfer {
                 self.offer_at = Some((now + self.timing.offer_after, if after_accept { FAILED_LINE } else { OFFER_LINE }));
                 Vec::new()
             }
-            // The phone withdrew a request this desktop asked it to: the owner does not take the call, and the caller is offered a
-            // message like after any other outcome but an acceptance.
-            Outcome::Cancelled if withdrawn => {
-                self.ringing = None;
-                self.connect_at = None;
-                self.accepted = None;
-                self.handing_over = false;
-                self.offer_at = Some((now + self.timing.offer_after, OFFER_LINE));
-                Vec::new()
-            }
-            Outcome::Cancelled => {
-                self.ringing = None;
-                self.connect_at = None;
-                self.accepted = None;
-                self.handing_over = false;
-                self.offer_at = None;
-                Vec::new()
-            }
+
         }
     }
 
@@ -482,15 +471,15 @@ impl Waiting {
 #[derive(Default)]
 pub struct Tools {
     waiting: VecDeque<Waiting>,
-    /// Tool call ids on the wire, unanswered, with their names.
-    on_wire: Vec<(String, String)>,
+    /// Tool call ids on the wire, unanswered, with their names and when they were sent.
+    on_wire: Vec<(String, String, Instant)>,
     /// Tool calls sent so far.
     pub sent: u32,
 }
 
 impl Tools {
     fn transfer_on_wire(&self) -> bool {
-        self.on_wire.iter().any(|(_, name)| name == TOOL)
+        self.on_wire.iter().any(|(_, name, _)| name == TOOL)
     }
 
     /// Whether `name` may be sent now.
@@ -504,15 +493,33 @@ impl Tools {
 
     /// Note a tool call as sent.
     pub fn sent_call(&mut self, id: &str, name: &str) {
-        self.on_wire.push((id.to_string(), name.to_string()));
+        self.sent_call_at(id, name, Instant::now());
+    }
+
+    /// ...as of `now`.
+    pub fn sent_call_at(&mut self, id: &str, name: &str, now: Instant) {
+        self.on_wire.push((id.to_string(), name.to_string(), now));
         self.sent += 1;
     }
 
     /// The phone answered `id`: the name of the tool it was.
     pub fn answered(&mut self, id: &str) -> Option<String> {
-        let name = self.on_wire.iter().find(|(i, _)| i == id).map(|(_, name)| name.clone());
-        self.on_wire.retain(|(i, _)| i != id);
+        let name = self.on_wire.iter().find(|(i, _, _)| i == id).map(|(_, name, _)| name.clone());
+        self.on_wire.retain(|(i, _, _)| i != id);
         name
+    }
+
+    /// When the oldest unanswered transfer request on the wire has waited `limit`: the moment to look again.
+    pub fn next_expiry(&self, limit: Duration) -> Option<Instant> {
+        self.on_wire.iter().filter(|(_, name, _)| name == TOOL).map(|(_, _, at)| *at + limit).min()
+    }
+
+    /// The transfer requests unanswered for `limit` at `now`: taken off the wire (a late answer to them is ignored) and their
+    /// ids returned, to be answered as unavailable, so nothing waits behind a request the phone never answers.
+    pub fn expired(&mut self, now: Instant, limit: Duration) -> Vec<String> {
+        let gone: Vec<String> = self.on_wire.iter().filter(|(_, name, at)| name == TOOL && now >= *at + limit).map(|(id, _, _)| id.clone()).collect();
+        self.on_wire.retain(|(id, _, _)| !gone.contains(id));
+        gone
     }
 
     /// Keep a tool call to send when it may be. When too many wait already, it comes back to be refused.
@@ -778,7 +785,7 @@ mod tests {
         assert_eq!((HOLD_MAX, CONNECT_MAX), (6, 4));
         // Six lines fifteen seconds apart cover the longest ring (ninety seconds) from the first at five seconds.
         assert!(HOLD_AFTER + HOLD_EVERY * (HOLD_MAX - 1) + HOLD_EVERY >= Duration::from_secs(90));
-        assert_eq!(Timing::default(), Timing { hold_after: HOLD_AFTER, hold_silence: HOLD_SILENCE, hold_every: HOLD_EVERY, answer_gap: ANSWER_GAP, offer_after: OFFER_AFTER, give_up_after: GIVE_UP_AFTER, setup_limit: SETUP_LIMIT, cancel_wait: CANCEL_WAIT });
+        assert_eq!(Timing::default(), Timing { hold_after: HOLD_AFTER, hold_silence: HOLD_SILENCE, hold_every: HOLD_EVERY, answer_gap: ANSWER_GAP, offer_after: OFFER_AFTER, give_up_after: GIVE_UP_AFTER, setup_limit: SETUP_LIMIT, cancel_wait: CANCEL_WAIT, tool_answer: TOOL_ANSWER_LIMIT });
     }
 
     #[test]
@@ -840,17 +847,38 @@ mod tests {
     }
 
     #[test]
-    fn a_stale_outcome_changes_nothing_and_a_cancel_clears_everything() {
+    fn a_stale_outcome_changes_nothing_and_a_cancel_offers_a_message_to_a_caller_still_on_the_line() {
         let mut t = Transfer::default();
         t.ringing("assist_2", 40, at(0));
         assert!(t.outcome("assist_1", Outcome::Accepted, at(3)).is_empty());
         assert!(t.may_speak() && t.busy(), "an old request's acceptance is not this one's");
         assert!(t.outcome("assist_2", Outcome::Cancelled, at(4)).is_empty());
         assert!(!t.busy() && t.may_speak());
-        assert_eq!(t.next_deadline(), None, "nothing to look at again after a cancel: the caller hung up");
+        // The request was cancelled (not by this desktop) while the call is live: nobody has it, so the caller is offered a message
+        // like after any other ending but an acceptance. (If the caller hung up, the session ends and nothing is said.)
+        assert_eq!(t.next_deadline(), Some(at(4) + OFFER_AFTER));
+        assert_eq!(t.due(at(4) + OFFER_AFTER), vec![Due::Say(OFFER_LINE)]);
         // An outcome for a ring this side never saw begin is believed.
         let mut fresh = Transfer::default();
         assert_eq!(fresh.outcome("assist_9", Outcome::Accepted, at(0)), vec![Effect::Cut, Effect::Say(CONNECTING_LINE)]);
+    }
+
+    #[test]
+    fn a_transfer_request_the_phone_never_answers_is_taken_off_the_wire_so_nothing_waits_behind_it_for_ever() {
+        let mut tools = Tools::default();
+        tools.sent_call_at("lookup_1", "lookup_business_data", at(0));
+        tools.sent_call_at("transfer_1", TOOL, at(0));
+        let limit = TOOL_ANSWER_LIMIT;
+        assert_eq!(tools.next_expiry(limit), Some(at(0) + limit), "only a transfer request has a limit");
+        assert!(tools.expired(at(0) + limit - Duration::from_secs(1), limit).is_empty());
+        assert!(!tools.may_send("finish_call"), "the goodbye waits behind it");
+        assert_eq!(tools.expired(at(0) + limit, limit), vec!["transfer_1".to_string()]);
+        assert_eq!(tools.next_expiry(limit), None);
+        assert!(tools.may_send("finish_call") && tools.may_send("request_appointment"), "the goodbye and the next tool are free to go");
+        assert!(!tools.may_send(TOOL), "a new transfer still waits for the lookup that is on the wire");
+        assert_eq!(tools.answered("transfer_1"), None, "a late answer to it finds nothing");
+        assert_eq!(tools.answered("lookup_1").as_deref(), Some("lookup_business_data"), "another tool's answer is its own");
+        assert!(tools.expired(at(1_000_000), limit).is_empty(), "once");
     }
 
     fn tool(name: &str) -> (Waiting, oneshot::Receiver<Result<Value, String>>) {

@@ -113,6 +113,9 @@ impl crate::ring::CallSource for HubCalls {
     }
 }
 
+/// A call the owner has taken that nobody reported the end of (the phone's `aokie.call.ended` was lost) is over after this long: a
+/// call has a length, and a ledger that never let go would hold every update and backup back for ever.
+pub const HANDOFF_MAX: Duration = Duration::from_secs(4 * 3600);
 /// How long a call's record is kept after it ends: a caller who hangs up as they finish a message still has it kept.
 const RECORD_KEEP: Duration = Duration::from_secs(600);
 /// The most calls' records held.
@@ -224,7 +227,29 @@ impl VoiceHub {
     }
 
     pub fn in_handoff(&self, call: &str) -> bool {
+        self.expire_handoffs();
         self.inner.handoffs.lock().unwrap_or_else(|e| e.into_inner()).contains_key(call)
+    }
+
+    /// Calls the owner has held for [`HANDOFF_MAX`] are over: the app is told, as it is when the phone says so.
+    pub fn expire_handoffs(&self) {
+        self.expire_handoffs_at(Instant::now());
+    }
+
+    /// ...as of `now`.
+    fn expire_handoffs_at(&self, now: Instant) {
+        let gone: Vec<String> = {
+            let mut handoffs = self.inner.handoffs.lock().unwrap_or_else(|e| e.into_inner());
+            let gone: Vec<String> = handoffs.iter().filter(|(_, since)| now.saturating_duration_since(**since) >= HANDOFF_MAX).map(|(call, _)| call.clone()).collect();
+            for call in &gone {
+                handoffs.remove(call);
+            }
+            gone
+        };
+        for call in gone {
+            self.note_ended(&call);
+            self.emit(json!({"type": "call.ended", "callId": call, "reason": "handoff_expired"}));
+        }
     }
 
     /// The session that carried `call` ends because the owner takes it: its commands are gone, and the call goes on.
@@ -379,6 +404,7 @@ impl VoiceHub {
 
     /// The calls going on now: those we answer, and those the owner has taken.
     pub fn live_calls(&self) -> Vec<String> {
+        self.expire_handoffs();
         let mut calls: Vec<String> = self.inner.calls.lock().unwrap().keys().cloned().collect();
         for call in self.inner.handoffs.lock().unwrap_or_else(|e| e.into_inner()).keys() {
             if !calls.contains(call) {
@@ -850,6 +876,34 @@ mod tests {
         // A hub that is gone leaves the count (its calls went with it).
         drop(hub);
         let _ = live_call_count();
+    }
+
+    #[test]
+    fn a_call_the_owner_has_that_nobody_reports_the_end_of_is_over_after_a_calls_length() {
+        let hub = VoiceHub::new(Engines::at("http://127.0.0.1:9", "http://127.0.0.1:9"), |_| None);
+        let mut told = hub.inner.events.subscribe();
+        hub.note_call("call_lost", "+61491570006", "Alex");
+        hub.enter_handoff("call_lost", "handoff:takeover");
+        let start = Instant::now();
+        // Before the cap it is a live call, and the ledger keeps it.
+        hub.expire_handoffs_at(start + HANDOFF_MAX - Duration::from_secs(1));
+        assert!(hub.in_handoff("call_lost"));
+        // At the cap it is over, and the app is told as it is when the phone says so.
+        hub.expire_handoffs_at(start + HANDOFF_MAX + Duration::from_secs(1));
+        assert!(!hub.in_handoff("call_lost") && hub.live_calls().is_empty());
+        let mut events = Vec::new();
+        while let Ok(e) = told.try_recv() {
+            events.push(e);
+        }
+        let ended = events.iter().find(|e| e["type"] == "call.ended").expect("the app is told");
+        assert_eq!((ended["callId"].clone(), ended["reason"].clone()), (json!("call_lost"), json!("handoff_expired")));
+        // Nothing more to expire, and a call that came back is not touched.
+        hub.expire_handoffs_at(start + HANDOFF_MAX * 3);
+        hub.enter_handoff("call_back", "handoff:takeover");
+        assert!(hub.leave_handoff("call_back").is_some());
+        hub.expire_handoffs_at(Instant::now() + HANDOFF_MAX * 3);
+        let more: Vec<Value> = std::iter::from_fn(|| told.try_recv().ok()).filter(|e| e["type"] == "call.ended").collect();
+        assert!(more.is_empty(), "{more:?}");
     }
 
     #[test]

@@ -375,6 +375,20 @@ async fn a_caller_who_speaks_after_the_owner_declined_with_no_page_is_offered_th
 }
 
 #[tokio::test]
+async fn a_request_the_phone_cancels_on_its_own_while_the_caller_is_still_there_ends_with_a_message_offered() {
+    // The phone withdraws the request itself (consent taken back while it rang): this desktop asked for nothing, and the call is live.
+    let mut f = flow(owner_settings(true)).await;
+    f.caller_says(ASKED);
+    f.ring_through("assist_1", 30).await;
+    f.aokie.send(outcome(&f.aokie, "assist_1", "cancelled", None));
+    let told = f.aokie.event("call.transfer", secs(3)).await.expect("the app is told");
+    assert_eq!((told["outcome"].clone(), told["source"].clone()), (json!("cancelled"), json!("phone")));
+    assert!(spoken_within(&f.aokie, transfer::OFFER_LINE, secs(3)).await, "the caller is not left with nothing: {:?}", f.aokie.speech.spoken());
+    assert!(f.dialog().await.is_empty());
+    assert!(f.takes_a_message("Ring me.").is_ok());
+}
+
+#[tokio::test]
 async fn a_phone_that_does_not_answer_the_withdrawal_leaves_it_over_here_after_two_seconds_and_a_late_acceptance_is_obeyed() {
     let mut f = flow(owner_settings(true)).await;
     f.caller_says(ASKED);

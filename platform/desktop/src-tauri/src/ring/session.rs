@@ -31,7 +31,7 @@ use crate::voice::transfer::{CancelReason, Outcome};
 /// How long past its time a ring waits to hear how it came out before it is over.
 pub const EXPIRY_GRACE: Duration = Duration::from_secs(5);
 /// The most rings that ended kept, for the record.
-const KEPT: usize = 30;
+const KEPT: usize = 200;
 /// The most words of what the caller said shown in the dialog.
 const SAID_SHOWN: usize = 2;
 
@@ -189,6 +189,11 @@ impl Ring {
         }
         for id in plan.targets() {
             devices.push(self.device_label(&id));
+        }
+        // A ring that ended stays ended: the plugin saying again that the request is out (a replay, a late duplicate) does not
+        // bring back a dialog the owner has seen go, nor tell them again.
+        if self.sessions.lock().unwrap_or_else(|e| e.into_inner()).ended.iter().any(|e| e.id == params.request_id) {
+            return Err(error(409, "ring_over", "that ring has already ended"));
         }
         let ring = ActiveRing {
             id: params.request_id.clone(),

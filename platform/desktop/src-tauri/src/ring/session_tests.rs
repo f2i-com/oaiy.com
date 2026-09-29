@@ -185,6 +185,20 @@ fn a_ring_that_does_not_ring_this_computer_shows_in_no_notification() {
 }
 
 #[test]
+fn a_ring_that_ended_stays_ended_when_the_plugin_says_again_that_it_is_out() {
+    let r = rig(Presence::Active);
+    let plan = planned(&r.ring, CALL);
+    r.ring.opened(&opened(&plan, "assist_1", CALL, 25, &r.ring)).unwrap();
+    assert!(r.ring.resolve("assist_1", Outcome::Declined, "phone"));
+    // A replay, a duplicate, a late report of the same request: no dialog comes back and nobody is told again.
+    let again = r.ring.opened(&opened(&plan, "assist_1", CALL, 25, &r.ring)).unwrap_err();
+    assert_eq!((again.status, again.code), (409, "ring_over"));
+    assert!(r.ring.active().is_empty());
+    assert_eq!(r.notified.rang.lock().unwrap().len(), 1, "the owner was told once");
+    assert_eq!(ended_as(&r.ring), vec![("declined", "phone")]);
+}
+
+#[test]
 fn the_first_word_about_a_ring_ends_it_and_later_words_change_nothing() {
     let r = rig(Presence::Active);
     open(&r);
