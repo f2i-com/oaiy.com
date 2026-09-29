@@ -197,10 +197,10 @@ button:focus-visible, summary:focus-visible, [tabindex]:focus-visible { outline:
 .topbar.menu-open .actions button.danger:hover:not(:disabled) { background: var(--err-soft); }
 .topbar.menu-open .actions .delete-toggle { margin-top: 4px; position: relative; }
 .topbar.menu-open .actions .delete-toggle::before { content: ''; position: absolute; left: 6px; right: 6px; top: -3px; border-top: 1px solid var(--border); }
-/* "Set up OAIY" heads the menu, set apart from the project's own actions. */
-.topbar.menu-open .actions .setup-oaiy { margin-bottom: 4px; position: relative; color: var(--accent); font-weight: 650; }
-.topbar.menu-open .actions .setup-oaiy::after { content: ''; position: absolute; left: 6px; right: 6px; bottom: -3px; border-top: 1px solid var(--border); }
-.actions .setup-oaiy[hidden] { display: none; }
+/* "Install app" (only where the browser offers it) and "Set up OAIY" head the menu, set apart from the project's own actions. */
+.topbar.menu-open .actions .setup-oaiy, .topbar.menu-open .actions .install-app { margin-bottom: 4px; position: relative; color: var(--accent); font-weight: 650; }
+.topbar.menu-open .actions .setup-oaiy::after, .topbar.menu-open .actions .install-app::after { content: ''; position: absolute; left: 6px; right: 6px; bottom: -3px; border-top: 1px solid var(--border); }
+.actions .setup-oaiy[hidden], .actions .install-app[hidden] { display: none; }
 /* Status pills, as the dashboard draws them: a soft fill, a 1px edge, and a lit dot. */
 .chip { display: inline-flex; align-items: center; gap: 7px; height: 30px; padding: 0 12px; border-radius: 999px; border: 1px solid var(--border); background: var(--surface-soft); color: var(--muted); font-size: 12px; font-weight: 600; white-space: nowrap; }
 .chip:hover:not(:disabled) { border-color: var(--strong-border); background: var(--panel-2); color: var(--text); }

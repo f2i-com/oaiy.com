@@ -61,6 +61,8 @@ import { canPickFolder, downloadZip, exportFolder, importFileList, importFolder,
 import type { Vfs } from './vfs/vfs';
 import { isOutreachPath, readView } from './vfs/readView';
 import { mayReloadForIsolation } from './pwa/reloadGuard';
+import { startInstall } from './pwa/install';
+import { installButton } from './ui/installButton';
 
 const WELCOME: Array<[string, string]> = [
   [
@@ -103,6 +105,8 @@ if (IN_OAIY) document.documentElement.classList.add('in-oaiy');
 // Light or dark: OAIY's (the dashboard's choice), or the system's.
 startTheme(IN_OAIY);
 const DESKTOP = IN_OAIY || location.hostname === 'botcomputer.localhost' || location.protocol === 'botcomputer:' || '__TAURI_INTERNALS__' in window;
+// The browser offers to install the app as the page loads: listened for here, before anything is awaited. Never in OAIY's own window.
+const install = startInstall(window, DESKTOP);
 
 async function registerServiceWorker(): Promise<boolean> {
   if (!('serviceWorker' in navigator) || import.meta.env.DEV || DESKTOP) return false;
@@ -1426,6 +1430,7 @@ A project can hold several apps, each in its own folder (any folder whose manife
   const actions = h(
     'div.actions',
     { onclick: (e: Event) => { if ((e.target as HTMLElement).closest('button')) closeMenu(); } },
+    installButton(install),
     setupButton,
     h('button', { title: 'New empty project', onclick: async () => {
       if (!(await mayLeaveRun())) return;
