@@ -128,8 +128,13 @@ await check('the script is a working worker: run in a scope it wires install, ac
   assert.equal(answered, false);
   // and the shell is the one the build found
   const fetched = [];
-  self.caches = { open: async () => ({ put: async () => {} }) };
-  self.fetch = async (request) => { fetched.push(new URL(request.url).pathname); return new Response('x', { status: 200 }); };
+  self.caches = { open: async () => ({ put: async () => {} }), delete: async () => true };
+  const typeOf = (path) => (path.endsWith('.html') ? 'text/html' : path.endsWith('.css') ? 'text/css' : 'text/javascript');
+  self.fetch = async (request) => {
+    const path = new URL(request.url).pathname;
+    fetched.push(path);
+    return new Response('x', { status: 200, headers: { 'content-type': typeOf(path) } });
+  };
   let work;
   listeners.install({ waitUntil: (p) => { work = p; } });
   await work;

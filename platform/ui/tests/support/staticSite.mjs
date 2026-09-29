@@ -50,7 +50,10 @@ function parseHeaders(text) {
 
 /**
  * @param {string} root the build folder
- * @param {{ transform?: (pathname: string, body: Buffer) => Buffer }} [options]
+ * @param {{
+ *   transform?: (pathname: string, body: Buffer) => Buffer,
+ *   override?: (request: { method: string, path: string, headers: import('node:http').IncomingHttpHeaders }) => ({ status: number, headers?: Record<string, string>, body: Buffer | string } | undefined),
+ * }} [options] `transform` changes a file's bytes; `override` answers a request itself (a host that misbehaves)
  */
 export async function startSite(root, options = {}) {
   const headerRules = fs.existsSync(path.join(root, '_headers')) ? parseHeaders(fs.readFileSync(path.join(root, '_headers'), 'utf8')) : [];
@@ -63,6 +66,10 @@ export async function startSite(root, options = {}) {
       res.writeHead(status, { 'cache-control': 'no-cache', ...headers });
       res.end(body);
     };
+
+    // A host that misbehaves, as the test says.
+    const overridden = options.override?.({ method: req.method, path: url.pathname, headers: req.headers });
+    if (overridden) return send(overridden.status, overridden.headers ?? {}, overridden.body);
 
     // Routes that exist only for the tests.
     if (url.pathname === '/__test__/big-chunked.bin' || url.pathname === '/__test__/small-chunked.bin') {

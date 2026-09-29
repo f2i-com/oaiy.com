@@ -366,6 +366,79 @@ section("OAIY's own window gets no worker and no install button");
 }
 
 /* ------------------------------------------------------------------ */
+/* A host that answers a file it has not deployed yet with its front page */
+/* ------------------------------------------------------------------ */
+section('a shell file answered with the front page is never kept, and the editor still opens');
+{
+  // The worker fetches its shell with fetch() (Sec-Fetch-Dest: empty); the page loads the same files as scripts
+  // (Sec-Fetch-Dest: script). Only the worker's own requests are answered wrongly, once, as the reviewer saw it.
+  const SCRIPT = builtConfig.precache.find((p) => /^\/assets\/oaiy-ui-.*\.js$/.test(p)) ?? builtConfig.precache.find((p) => /\.js$/.test(p) && p !== builtConfig.precache[1]);
+  const front = fs.readFileSync(path.join(DIST, 'index.html'));
+  const wrong = (bad) => (request) => (bad.now && request.path === SCRIPT && request.headers['sec-fetch-dest'] === 'empty'
+    ? { status: 200, headers: { 'content-type': 'text/html; charset=utf-8' }, body: front }
+    : undefined);
+  const scriptBytes = fs.statSync(path.join(DIST, SCRIPT)).size;
+
+  // 1. the first install meets it
+  {
+    const bad = { now: true };
+    const site = await startSite(DIST, { override: (request) => wrong(bad)(request) });
+    const browser = await launch({ engine });
+    const page = await browser.context.newPage();
+    const net = watch(page);
+    await page.goto(`${site.origin}/app.html`, { waitUntil: 'networkidle' });
+    await sleep(4000);
+    ok('the editor opens (the page loaded its own script)', (await page.locator('.app-shell').count()) === 1);
+    const state = await workers(page);
+    ok('no worker took over the page: its install failed', state.controlled === null, JSON.stringify(state));
+    ok('and no half a shell is left in a cache', !Object.keys(await cacheReport(page)).some((n) => n.endsWith('-shell')), Object.keys(await cacheReport(page)).join(', '));
+
+    bad.now = false; // the host has deployed the file
+    await page.reload({ waitUntil: 'networkidle' });
+    await waitControlled(page);
+    await settleCaches(page);
+    const kept = Object.values(await cacheReport(page)).flat().find((e) => new URL(e.url).pathname === SCRIPT);
+    ok('the next visit installs, and keeps the script itself (not the front page)', !!kept && kept.size === scriptBytes, JSON.stringify(kept));
+    for (const reload of [1, 2]) {
+      await page.reload({ waitUntil: 'networkidle' });
+      await page.locator('.app-shell').waitFor({ timeout: 20000 }).catch(() => undefined);
+      ok(`reload ${reload} after it healed opens the editor`, (await page.locator('.app-shell').count()) === 1);
+    }
+    ok('with no page errors (no "Expected a JavaScript-or-Wasm module script")', net.errors.length === 0, net.errors.slice(0, 2).join(' | '));
+    await browser.close();
+    await site.close();
+  }
+
+  // 2. an update meets it while the build in charge is healthy
+  {
+    const bad = { now: false };
+    const deploy = { v2: false };
+    const site = await startSite(DIST, {
+      transform: (pathname, body) => (pathname === '/sw.js' && deploy.v2 ? Buffer.from(body.toString('utf8').replace(/"buildId":"[0-9a-f]+"/, '"buildId":"v2bad0000001"')) : body),
+      override: (request) => wrong(bad)(request),
+    });
+    const browser = await launch({ engine });
+    const page = await browser.context.newPage();
+    await page.goto(`${site.origin}/app.html`, { waitUntil: 'networkidle' });
+    await waitControlled(page);
+    await settleCaches(page);
+    const before = Object.keys(await cacheReport(page)).sort();
+    bad.now = true;
+    deploy.v2 = true;
+    await page.evaluate(async () => { const [reg] = await navigator.serviceWorker.getRegistrations(); await reg.update().catch(() => undefined); });
+    await sleep(4000);
+    const after = Object.keys(await cacheReport(page)).sort();
+    ok('the update did not install: no message, the build in charge keeps its caches and none of the new build is left', (await page.locator('[data-testid="update-notice"]').count()) === 0 && JSON.stringify(after) === JSON.stringify(before), `${before.join(',')} -> ${after.join(',')}`);
+    ok('and the page is still under the build in charge', (await workers(page)).controlled === `${site.origin}/sw.js`);
+    await page.reload({ waitUntil: 'networkidle' });
+    await page.locator('.app-shell').waitFor({ timeout: 20000 }).catch(() => undefined);
+    ok('the editor opens after a reload, from the kept shell', (await page.locator('.app-shell').count()) === 1);
+    await browser.close();
+    await site.close();
+  }
+}
+
+/* ------------------------------------------------------------------ */
 /* An update waits for the person                                       */
 /* ------------------------------------------------------------------ */
 section('a new build waits, says so, and takes over when the person reloads');

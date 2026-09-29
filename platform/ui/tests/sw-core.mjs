@@ -58,6 +58,9 @@ class FakeCache {
   async keys() {
     return [...this.entries.keys()].map((url) => ({ url }));
   }
+  async delete(input) {
+    return this.entries.delete(this.key(input, false));
+  }
 }
 
 class FakeCaches {
@@ -83,8 +86,8 @@ class FakeCaches {
 const noRange = new Headers();
 
 /** A request as the worker's fetch event carries it. (Node cannot build one with mode "navigate".) */
-function request(url, { method = 'GET', mode = 'no-cors', headers } = {}) {
-  return { url: new URL(url, ORIGIN).href, method, mode, headers: new Headers(headers ?? noRange) };
+function request(url, { method = 'GET', mode = 'no-cors', headers, destination = '' } = {}) {
+  return { url: new URL(url, ORIGIN).href, method, mode, destination, headers: new Headers(headers ?? noRange) };
 }
 
 const CONFIG = {
@@ -313,7 +316,7 @@ await check('install: a shell file over the limit fails the install rather than 
   const w = makeWorker();
   w.ok('/app.html', 'x', { 'content-type': 'text/html' });
   w.ok('/assets/app-aaaa1111.js', 'x');
-  w.state.routes.set('/assets/app-bbbb2222.css', () => new Response(bytes(MAX + 1)));
+  w.state.routes.set('/assets/app-bbbb2222.css', () => new Response(bytes(MAX + 1), { headers: { 'content-type': 'text/css' } }));
   await assert.rejects(w.install(), /over 4194304 bytes/);
 });
 
@@ -444,9 +447,9 @@ await check('assets: a file over the limit reaches the page whole and is not kep
   const w = await installedWorker();
   const big = bytes(MAX + 1000, 66);
   const cases = {
-    '/assets/plain-11111111.js': {},
-    '/assets/declared-22222222.wasm': { 'content-length': String(MAX + 1000) },
-    '/assets/compressed-33333333.js': { 'content-encoding': 'gzip', 'content-length': '900000' }, // the wire size of a compressed body
+    '/assets/plain-11111111.js': { 'content-type': 'text/javascript' },
+    '/assets/declared-22222222.wasm': { 'content-type': 'application/wasm', 'content-length': String(MAX + 1000) },
+    '/assets/compressed-33333333.js': { 'content-type': 'text/javascript', 'content-encoding': 'gzip', 'content-length': '900000' }, // the wire size of a compressed body
   };
   for (const [path, headers] of Object.entries(cases)) {
     w.state.routes.set(path, () => new Response(big.slice(), { status: 200, headers }));
@@ -463,7 +466,7 @@ await check('assets: a file over the limit reaches the page whole and is not kep
 
 await check('assets: a file just under the limit is kept', async () => {
   const w = await installedWorker();
-  w.state.routes.set('/assets/edge-44444444.js', () => new Response(bytes(MAX), { status: 200 }));
+  w.state.routes.set('/assets/edge-44444444.js', () => new Response(bytes(MAX), { status: 200, headers: { 'content-type': 'text/javascript' } }));
   const out = await w.fetch(request('/assets/edge-44444444.js'));
   assert.equal((await (await out.response).arrayBuffer()).byteLength, MAX);
   await out.settled();
@@ -520,7 +523,7 @@ await check('a site served from 127.0.0.1 is kept, and the engine on the same ad
   const w = makeWorker({ origin: site });
   w.ok('/app.html', 'shell', { 'content-type': 'text/html' });
   w.ok('/assets/app-aaaa1111.js', 'x');
-  w.ok('/assets/app-bbbb2222.css', 'x');
+  w.ok('/assets/app-bbbb2222.css', 'x', { 'content-type': 'text/css' });
   w.ok('/assets/lazy-12345678.js', 'lazy');
   await w.install();
   const lazy = await w.fetch(request(`${site}/assets/lazy-12345678.js`));
@@ -590,6 +593,178 @@ await check('the limit is one number: 4 MiB, shared with the build and the page'
   assert.equal(W.MAX_CACHED_BYTES, 4 * 1024 * 1024);
   assert.equal(W.CACHE_PREFIX, 'oaiy-web-');
   assert.equal(W.SHELL_PATH, '/app.html');
+});
+
+/* ------------- a shell file that is not what its name says (a host that answers with its front page) ------------- */
+
+const PAGE = '<!doctype html><html><title>the landing page</title></html>';
+const html = () => new Response(PAGE, { status: 200, headers: { 'content-type': 'text/html; charset=utf-8' } });
+const bodyOf = async (res) => new TextDecoder().decode(await res.arrayBuffer());
+
+await check('content: the page is HTML; a script, a style sheet and an image must be what their name and use say; nothing else may be HTML', () => {
+  const type = (t) => new Response('x', { headers: t ? { 'content-type': t } : {} });
+  const fits = (path, t, destination) => W.fitsName(path, W.contentTypeOf(type(t)), destination);
+  assert.equal(fits('/app.html', 'text/html; charset=utf-8'), true);
+  assert.equal(fits('/app.html', 'text/javascript'), false, 'the page is not a script');
+  assert.equal(fits('/assets/a-11111111.js', 'text/javascript; charset=utf-8'), true);
+  assert.equal(fits('/assets/a-11111111.js', 'application/javascript'), true);
+  assert.equal(fits('/assets/a-11111111.mjs', 'application/x-javascript'), true);
+  assert.equal(fits('/assets/a-11111111.js', 'text/html'), false, 'HTML under a script\'s name');
+  assert.equal(fits('/assets/a-11111111.js', 'application/octet-stream'), false);
+  assert.equal(fits('/assets/a-11111111.js', ''), false, 'a script with no type would not run');
+  assert.equal(fits('/assets/a-11111111.css', 'text/css'), true);
+  assert.equal(fits('/assets/a-11111111.css', 'text/html'), false);
+  assert.equal(fits('/assets/a.png', 'image/png'), true);
+  assert.equal(fits('/assets/a.svg', 'image/svg+xml'), true);
+  assert.equal(fits('/assets/a.png', 'text/html'), false);
+  assert.equal(fits('/assets/a.woff2', 'font/woff2'), true);
+  assert.equal(fits('/assets/a.woff2', 'text/html'), false);
+  assert.equal(fits('/assets/a.wasm', 'text/html'), false);
+  assert.equal(fits('/assets/a.wasm', 'application/wasm'), true);
+  assert.equal(fits('/assets/data', 'application/xhtml+xml'), false);
+  assert.equal(fits('/manifest.webmanifest', 'application/manifest+json'), true);
+  // what the request is for counts even when the name says nothing
+  assert.equal(fits('/assets/chunk', 'text/javascript', 'script'), true);
+  assert.equal(fits('/assets/chunk', 'text/plain', 'script'), false);
+  assert.equal(fits('/assets/chunk', 'text/css', 'style'), true);
+  assert.equal(fits('/assets/chunk', 'application/json', 'style'), false);
+  assert.equal(fits('/assets/worker', 'text/javascript', 'worker'), true);
+  assert.equal(fits('/assets/worker', 'text/html', 'worker'), false);
+  assert.equal(fits('/assets/pic', 'image/webp', 'image'), true);
+  assert.equal(fits('/assets/pic', 'text/html', 'image'), false);
+});
+
+await check('install: a shell script answered with the front page fails the install, and no half a shell is left', async () => {
+  const w = makeWorker();
+  w.ok('/app.html', 'shell', { 'content-type': 'text/html' });
+  w.state.routes.set('/assets/app-aaaa1111.js', html); // 200, text/html: what a host does for a file it does not have yet
+  w.ok('/assets/app-bbbb2222.css', 'a{}', { 'content-type': 'text/css' });
+  await assert.rejects(w.install(), /app-aaaa1111\.js.*text\/html/);
+  assert.ok(!(await w.caches.has(W.cacheNames('b1').shell)), 'the shell cache of the build that did not install is removed');
+});
+
+await check('install: the host heals and the next install keeps the right file (the failed one left nothing behind)', async () => {
+  const w = makeWorker();
+  w.ok('/app.html', 'shell', { 'content-type': 'text/html' });
+  w.state.routes.set('/assets/app-aaaa1111.js', html);
+  w.ok('/assets/app-bbbb2222.css', 'a{}', { 'content-type': 'text/css' });
+  await assert.rejects(w.install());
+  w.ok('/assets/app-aaaa1111.js', 'console.log("the script")');
+  await w.install();
+  const shell = await w.caches.open(W.cacheNames('b1').shell);
+  assert.equal(await bodyOf(await shell.match(`${ORIGIN}/assets/app-aaaa1111.js`)), 'console.log("the script")');
+  const served = await w.fetch(request('/assets/app-aaaa1111.js', { destination: 'script' }));
+  assert.equal(await bodyOf(await served.response), 'console.log("the script")');
+});
+
+await check('install: a wrong style sheet, and the page served as something else, fail the install too; so does a redirected answer', async () => {
+  for (const [path, make, why] of [
+    ['/assets/app-bbbb2222.css', () => new Response('x', { headers: { 'content-type': 'text/plain' } }), /text\/plain/],
+    ['/app.html', () => new Response('x', { headers: { 'content-type': 'application/json' } }), /application\/json/],
+    ['/assets/app-aaaa1111.js', () => Object.defineProperty(new Response('x', { headers: { 'content-type': 'text/javascript' } }), 'redirected', { value: true }), /redirect/],
+  ]) {
+    const w = makeWorker();
+    w.ok('/app.html', 'shell', { 'content-type': 'text/html' });
+    w.ok('/assets/app-aaaa1111.js', 'js', { 'content-type': 'text/javascript' });
+    w.ok('/assets/app-bbbb2222.css', 'a{}', { 'content-type': 'text/css' });
+    w.state.routes.set(path, make);
+    await assert.rejects(w.install(), why, path);
+  }
+});
+
+await check('an update whose shell is wrong does not install, and the build in charge keeps its files and its caches', async () => {
+  const old = await installedWorker();
+  const before = (await (await old.caches.open(W.cacheNames('b1').shell)).keys()).length;
+  // a second build (b2) in the same origin's caches
+  const w2 = makeWorker({ config: { ...CONFIG, buildId: 'b2' } });
+  w2.caches.stores = old.caches.stores;
+  w2.ok('/app.html', 'shell v2', { 'content-type': 'text/html' });
+  w2.state.routes.set('/assets/app-aaaa1111.js', html);
+  w2.ok('/assets/app-bbbb2222.css', 'a{}', { 'content-type': 'text/css' });
+  await assert.rejects(w2.install());
+  assert.equal((await (await old.caches.open(W.cacheNames('b1').shell)).keys()).length, before, 'the old build is untouched');
+  assert.ok(!(await w2.caches.has(W.cacheNames('b2').shell)));
+});
+
+await check('assets: the front page is not kept under a script\'s name, and the page still gets what the network said', async () => {
+  const w = await installedWorker();
+  w.state.routes.set('/assets/lazy-a1111111.js', html);
+  const out = await w.fetch(request('/assets/lazy-a1111111.js', { destination: 'script' }));
+  assert.equal(await bodyOf(await out.response), PAGE, 'the worker does not hide what the host answered');
+  await out.settled();
+  const runtime = await w.caches.open(W.cacheNames('b1').runtime);
+  assert.equal((await runtime.keys()).length, 0);
+});
+
+await check('assets: a bad copy in the shell (from whatever cause) is never served, and is replaced by the right file, in the shell', async () => {
+  const w = await installedWorker();
+  const shell = await w.caches.open(W.cacheNames('b1').shell);
+  await shell.put(`${ORIGIN}/assets/app-aaaa1111.js`, html()); // the reviewer's state: HTML under the script's name
+  const runtime = await w.caches.open(W.cacheNames('b1').runtime);
+  const first = await w.fetch(request('/assets/app-aaaa1111.js', { destination: 'script' }));
+  assert.equal(await bodyOf(await first.response), 'console.log(1)', 'the network\'s file, not the bad copy');
+  await first.settled();
+  assert.equal(await bodyOf(await shell.match(`${ORIGIN}/assets/app-aaaa1111.js`)), 'console.log(1)', 'healed where it was');
+  assert.equal((await runtime.keys()).length, 0, 'not moved to the runtime cache');
+  w.state.online = false; // and now it is the kept one, offline
+  const again = await w.fetch(request('/assets/app-aaaa1111.js', { destination: 'script' }));
+  assert.equal(await bodyOf(await again.response), 'console.log(1)');
+});
+
+await check('assets: with no network a bad copy is not served either: the script fails as it would have', async () => {
+  const w = await installedWorker();
+  const shell = await w.caches.open(W.cacheNames('b1').shell);
+  await shell.put(`${ORIGIN}/assets/app-aaaa1111.js`, html());
+  w.state.online = false;
+  const out = await w.fetch(request('/assets/app-aaaa1111.js', { destination: 'script' }));
+  await assert.rejects(out.response, /Failed to fetch/);
+  await out.settled();
+  assert.equal((await shell.keys()).some((k) => k.url.endsWith('/assets/app-aaaa1111.js')), false, 'and it is removed, not left to be found again');
+});
+
+await check('assets: what a request is for counts when its name says nothing (a chunk with no extension asked for as a script)', async () => {
+  const w = await installedWorker();
+  w.ok('/assets/chunk-abcd1234', 'not a script', { 'content-type': 'text/plain' });
+  const asScript = await w.fetch(request('/assets/chunk-abcd1234', { destination: 'script' }));
+  assert.equal(await bodyOf(await asScript.response), 'not a script', 'the page gets it, and decides');
+  await asScript.settled();
+  const runtime = await w.caches.open(W.cacheNames('b1').runtime);
+  assert.equal((await runtime.keys()).length, 0, 'but it is not kept as a script');
+  const asData = await w.fetch(request('/assets/chunk-abcd1234'));
+  await (await asData.response).arrayBuffer();
+  await asData.settled();
+  assert.equal((await runtime.keys()).length, 1, 'asked for as data it is');
+});
+
+await check('assets: a copy is refreshed in the cache it came from (a shell file in the shell, not the runtime cache)', async () => {
+  const w = await installedWorker();
+  w.ok('/assets/app-aaaa1111.js', 'console.log(2)');
+  const out = await w.fetch(request('/assets/app-aaaa1111.js', { destination: 'script' }));
+  assert.equal(await bodyOf(await out.response), 'console.log(1)', 'the copy it had');
+  await out.settled();
+  const shell = await w.caches.open(W.cacheNames('b1').shell);
+  const runtime = await w.caches.open(W.cacheNames('b1').runtime);
+  assert.equal(await bodyOf(await shell.match(`${ORIGIN}/assets/app-aaaa1111.js`)), 'console.log(2)');
+  assert.equal((await runtime.keys()).length, 0);
+});
+
+await check('assets: a good copy is kept when the refresh comes back wrong (the front page)', async () => {
+  const w = await installedWorker();
+  w.state.routes.set('/assets/app-aaaa1111.js', html);
+  const out = await w.fetch(request('/assets/app-aaaa1111.js', { destination: 'script' }));
+  assert.equal(await bodyOf(await out.response), 'console.log(1)');
+  await out.settled();
+  const shell = await w.caches.open(W.cacheNames('b1').shell);
+  assert.equal(await bodyOf(await shell.match(`${ORIGIN}/assets/app-aaaa1111.js`)), 'console.log(1)');
+});
+
+await check('message: what the page says it loaded is kept only if it is what its name says', async () => {
+  const w = await installedWorker();
+  w.state.routes.set('/assets/lazy-a1111111.js', html);
+  w.ok('/assets/lazy-b2222222.js', 'ok', { 'content-type': 'text/javascript' });
+  await w.message({ type: 'cache-urls', urls: [{ url: '/assets/lazy-a1111111.js' }, { url: '/assets/lazy-b2222222.js' }] });
+  const runtime = await w.caches.open(W.cacheNames('b1').runtime);
+  assert.deepEqual((await runtime.keys()).map((k) => new URL(k.url).pathname), ['/assets/lazy-b2222222.js']);
 });
 
 finish();

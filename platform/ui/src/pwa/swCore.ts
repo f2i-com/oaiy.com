@@ -24,7 +24,13 @@
  *     over it: they come from the network every time they are needed. The build lists the
  *     files it knows are over it, and the worker does not even read those.
  *   - HTML is network-first (a new deploy shows at once, and with no network the kept shell
- *     opens); everything else is stale-while-revalidate.
+ *     opens); everything else is stale-while-revalidate, refreshed in the cache it came from.
+ *   - Nothing is kept under a name it does not fit: only the page is HTML, a script is a script,
+ *     a style sheet a style sheet, an image an image. A host that has not deployed a file yet
+ *     may answer its front page for it (a 200 of text/html); kept, that would stand in for the
+ *     file until the next deploy. So a shell file of the wrong type fails the install (the old build
+ *     carries on, the next visit tries again), a copy of the wrong type is never served, and a
+ *     redirected answer is never kept.
  *   - The caches are named for the build. A new build installs beside the old one and waits
  *     until the person says so (a message from the page); the old caches are removed only when
  *     the new worker takes over, and only the ones this worker made (CACHE_PREFIX).
@@ -113,6 +119,53 @@ export function route(req: RouteRequest, workerOrigin: string, oversize: readonl
 /** A response the worker may keep: a plain 200 from its own origin. */
 export function isStorable(res: Response): boolean {
   return res.status === 200 && (res.type === 'basic' || res.type === 'default');
+}
+
+/** The type of a response's body, lower case, without its parameters ("text/html; charset=utf-8" is "text/html"). */
+export function contentTypeOf(res: Response): string {
+  return (res.headers.get('content-type') ?? '').split(';')[0].trim().toLowerCase();
+}
+
+const JAVASCRIPT = /^(text|application)\/(x-)?(java|ecma)script$/;
+
+/**
+ * Whether a body of `type` is what a request for `pathname` (used as `destination`, if the request
+ * says) can be. The page is HTML and nothing else is: a host that answers a file it does not have
+ * with its front page (a 200 of text/html) must not have that kept under the file's name, where it
+ * would be served in place of a script until the next deploy. A script, a style sheet and an
+ * image must be a script, a style sheet and an image (a browser would refuse a module script or a
+ * style sheet of another type anyway, so this loses nothing that worked); everything else must
+ * only not be a page.
+ */
+export function fitsName(pathname: string, type: string, destination = ''): boolean {
+  if (pathname === SHELL_PATH) return type === 'text/html';
+  if (type === 'text/html' || type === 'application/xhtml+xml') return false;
+  if (destination === 'script' || destination === 'worker' || destination === 'sharedworker') return JAVASCRIPT.test(type);
+  if (destination === 'style') return type === 'text/css';
+  if (destination === 'image') return type.startsWith('image/');
+  switch (/\.([a-z0-9]+)$/i.exec(pathname)?.[1]?.toLowerCase()) {
+    case 'js':
+    case 'mjs':
+      return JAVASCRIPT.test(type);
+    case 'css':
+      return type === 'text/css';
+    case 'png':
+    case 'jpg':
+    case 'jpeg':
+    case 'gif':
+    case 'webp':
+    case 'avif':
+    case 'ico':
+    case 'svg':
+      return type.startsWith('image/');
+    default:
+      return true;
+  }
+}
+
+/** A response the worker may keep under `pathname`: a plain 200, not a redirect, and what its name says. */
+export function isKeepable(res: Response, pathname: string, destination = ''): boolean {
+  return isStorable(res) && !res.redirected && fitsName(pathname, contentTypeOf(res), destination);
 }
 
 /**
@@ -233,13 +286,23 @@ export function installWorker(scope: WorkerScopeLike, config: WorkerConfig, deps
    */
   async function precache(): Promise<void> {
     const cache = await scope.caches.open(names.shell);
-    await Promise.all(
-      config.precache.map(async (path) => {
-        const res = await scope.fetch(new Request(absolute(path), path === SHELL_PATH ? { cache: 'reload' } : undefined));
-        if (!isStorable(res)) throw new Error(`the shell file ${path} answered ${res.status}`);
-        if (!(await putWithinLimit(cache, absolute(path), res))) throw new Error(`the shell file ${path} is over ${MAX_CACHED_BYTES} bytes`);
-      }),
-    );
+    try {
+      await Promise.all(
+        config.precache.map(async (path) => {
+          const res = await scope.fetch(new Request(absolute(path), path === SHELL_PATH ? { cache: 'reload' } : undefined));
+          if (!isStorable(res)) throw new Error(`the shell file ${path} answered ${res.status}`);
+          if (res.redirected) throw new Error(`the shell file ${path} answered a redirect`);
+          // A host that has not deployed a file yet may answer its front page for it; kept, that would
+          // be served as the file until the next deploy. The install fails instead, and the next visit tries again.
+          if (!fitsName(path, contentTypeOf(res))) throw new Error(`the shell file ${path} answered ${contentTypeOf(res) || 'no type'}, which is not what its name says`);
+          if (!(await putWithinLimit(cache, absolute(path), res))) throw new Error(`the shell file ${path} is over ${MAX_CACHED_BYTES} bytes`);
+        }),
+      );
+    } catch (error) {
+      // Half a shell is not left behind: a build that did not install has no cache.
+      await scope.caches.delete(names.shell).catch(noop);
+      throw error;
+    }
   }
 
   /** Remove the caches of other builds (only ours, by prefix), then take over the open pages. */
@@ -264,7 +327,7 @@ export function installWorker(scope: WorkerScopeLike, config: WorkerConfig, deps
         if (typeof item.size === 'number' && item.size > MAX_CACHED_BYTES) continue;
         if ((await shell.match(url, MATCH)) || (await runtime.match(url, MATCH))) continue;
         const res = await scope.fetch(url);
-        if (isStorable(res)) await putWithinLimit(runtime, url, res);
+        if (isKeepable(res, new URL(url).pathname)) await putWithinLimit(runtime, url, res);
         void res.body?.cancel().catch(noop);
       } catch {
         /* one that cannot be fetched is not kept; the rest are */
@@ -277,9 +340,7 @@ export function installWorker(scope: WorkerScopeLike, config: WorkerConfig, deps
     const shell = await scope.caches.open(names.shell);
     const kept = await shell.match(absolute(SHELL_PATH), { ignoreSearch: true, ...MATCH });
     const network = scope.fetch(event.request).then((res) => {
-      if (res.ok && (res.headers.get('content-type') ?? '').includes('text/html')) {
-        keepAlive(event, putWithinLimit(shell, absolute(SHELL_PATH), res).catch(() => false));
-      }
+      if (isKeepable(res, SHELL_PATH)) keepAlive(event, putWithinLimit(shell, absolute(SHELL_PATH), res).catch(() => false));
       return res;
     });
     // Keep the worker alive until the network answers, even if the shell was served first.
@@ -296,25 +357,41 @@ export function installWorker(scope: WorkerScopeLike, config: WorkerConfig, deps
     return kept;
   }
 
-  /** Everything else of ours: the kept copy at once, refreshed behind it; the network if there is none. */
+  /**
+   * Everything else of ours: the kept copy at once, refreshed behind it in the cache it came from;
+   * the network if there is none. A kept copy that is not what its name says (HTML under a script's
+   * name) is never served: it is removed, and the right file is fetched and kept where it was.
+   */
   async function asset(event: FetchEventLike): Promise<Response> {
     const request = event.request;
+    const path = new URL(request.url).pathname;
+    const destination = request.destination ?? '';
     const shell = await scope.caches.open(names.shell);
     const runtime = await scope.caches.open(names.runtime);
-    const kept = (await shell.match(request.url, MATCH)) ?? (await runtime.match(request.url, MATCH));
+    let home: Cache = runtime; // where a file is kept: where it already is, otherwise the runtime cache
+    let kept = await shell.match(request.url, MATCH);
+    if (kept) {
+      home = shell;
+    } else {
+      kept = await runtime.match(request.url, MATCH);
+    }
+    if (kept && !fitsName(path, contentTypeOf(kept), destination)) {
+      await home.delete(request.url).catch(noop);
+      kept = undefined;
+    }
     if (kept) {
       keepAlive(
         event,
         (async () => {
           const res = await scope.fetch(request);
-          if (isStorable(res)) await putWithinLimit(runtime, request.url, res);
+          if (isKeepable(res, path, destination)) await putWithinLimit(home, request.url, res);
           void res.body?.cancel().catch(noop);
         })().catch(noop),
       );
       return kept;
     }
     const res = await scope.fetch(request);
-    if (isStorable(res)) keepAlive(event, putWithinLimit(runtime, request.url, res).catch(() => false));
+    if (isKeepable(res, path, destination)) keepAlive(event, putWithinLimit(home, request.url, res).catch(() => false));
     return res;
   }
 
