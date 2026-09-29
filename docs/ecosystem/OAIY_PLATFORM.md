@@ -126,10 +126,11 @@ Two transports, neither a WebSocket.
   redirects.
 - A timeout set on a request is one deadline for the whole exchange, to the last byte of the
   reply; one set on a blocking client bounds the wait for the reply and then, on a budget of its
-  own, the reading of it. The queue check and the heartbeat have theirs on the client (30 and
-  15 seconds); the relay, the encrypted flow lane, the data-node lane and the tunnel's polls on
-  each request (a poll is given its hold and 15 seconds), and the relay reads what the
-  provider said before it waits out a `Retry-After`, which its deadline might not outlast.
+  own, the reading of it. The queue check, the heartbeat and the calendar sync have theirs on
+  the client (30, 15 and 15 seconds); the relay, the encrypted flow lane, the data-node lane
+  and the tunnel's polls on each request (a poll is given its hold and 15 seconds), and the
+  relay reads what the provider said before it waits out a `Retry-After`, which its deadline
+  might not outlast.
 - The three long-poll lanes (`relay`, `desktopFlows`, `desktopAi`) take their timing from the
   descriptor: `waitSeconds` is how long the provider may hold a poll, and `idlePauseMs` (100 to
   60000, 500 unless set) is the least the lane waits after a poll that came back with nothing.

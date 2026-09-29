@@ -321,10 +321,11 @@ fn spawn_on(store: LinkHandle, node: Option<NodeHandle>, lane: &'static Lane) {
     });
 }
 
-/// The client this lane keeps from poll to poll, so that a poll, its claim and the
-/// completion share a connection instead of each making one.
+/// A lane's client, and the connections it keeps.
 type Lane = super::net::LaneClient<Client>;
 
+/// The client this lane keeps from poll to poll, so that a poll, its claim and the
+/// completion share a connection instead of each making one.
 static HTTP: Lane = super::net::LaneClient::new(build_client);
 
 fn build_client() -> Result<Client, String> {

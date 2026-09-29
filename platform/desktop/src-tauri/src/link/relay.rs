@@ -130,10 +130,11 @@ fn spawn_on(store: LinkHandle, dispatch: Dispatcher, lane: &'static Lane) {
     });
 }
 
-/// The client this lane keeps from poll to poll, so that a poll, the claim it
-/// leads to and the report share a connection instead of each making one.
+/// A lane's client, and the connections it keeps.
 type Lane = super::net::LaneClient<reqwest::blocking::Client>;
 
+/// The client this lane keeps from poll to poll, so that a poll, the claim it
+/// leads to and the report share a connection instead of each making one.
 static HTTP: Lane = super::net::LaneClient::new(build_client);
 
 /// How long a claim or a report may take. The poll's is longer, by the wait.
