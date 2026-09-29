@@ -995,6 +995,13 @@ fn collect_definitions(st: &BridgeState) -> Vec<crate::plugins::definitions::Ser
     reg.scan();
     let mut out = Vec::new();
     for rec in reg.list() {
+        // A plugin that is still running when its folder stops verifying keeps its
+        // manifest (its process was started from it), but the definition files are read
+        // from that folder now, and a swapped one could point an action at another of
+        // the plugin's commands. Nothing is offered from a package that does not verify.
+        if rec.refused_by_trust() {
+            continue;
+        }
         if let Some(m) = rec.manifest.as_ref() {
             out.extend(crate::plugins::definitions::load_for_plugin(&rec.dir, m));
         }
@@ -1292,7 +1299,7 @@ async fn plugin_ui_asset(
         return bridge_error(StatusCode::BAD_REQUEST, "invalid_request", "invalid asset path".into());
     }
 
-    let (dir, declared) = {
+    let (dir, declared, trust, signed) = {
         let mut reg = match st.plugins.lock() {
             Ok(r) => r,
             Err(_) => {
@@ -1310,6 +1317,15 @@ async fn plugin_ui_asset(
         let Some(rec) = reg.get(&id) else {
             return bridge_error(StatusCode::NOT_FOUND, "invalid_request", format!("no plugin {id:?}"));
         };
+        // A screen is code the dashboard runs, from a folder on disk. A plugin whose
+        // package does not verify (one that was running when its folder changed keeps its
+        // manifest, and so still names its screens) serves none of it: what it says of
+        // itself is what the listing says, and the two must not disagree.
+        if rec.refused_by_trust() {
+            let why = rec.trust.as_ref().and_then(|t| t.reason.clone()).unwrap_or_else(|| "its package is not trusted".into());
+            return bridge_error(StatusCode::FORBIDDEN, "capability_unavailable", format!("the screens of {id:?} are not served: {why}"));
+        }
+        let signed = rec.trust.as_ref().is_some_and(|t| t.state == crate::plugins::TrustState::Verified);
         // The declared file list for THIS screen, from the manifest's `ui` block
         // (retained verbatim in `extra`, since the host has no other opinion on it).
         let files: Vec<String> = rec
@@ -1327,7 +1343,7 @@ async fn plugin_ui_asset(
             .and_then(|f| f.as_array())
             .map(|f| f.iter().filter_map(|v| v.as_str().map(str::to_string)).collect())
             .unwrap_or_default();
-        (rec.dir.clone(), files)
+        (rec.dir.clone(), files, reg.trust(), signed)
     };
 
     if declared.is_empty() {
@@ -1345,9 +1361,23 @@ async fn plugin_ui_asset(
         );
     }
 
-    let full = dir.join(&asset);
-    match std::fs::read(&full) {
-        Ok(bytes) => (
+    // Read once, off the async threads. From a package that carries a signature the file
+    // is served only if it is exactly what was signed: the scan's answer can be a few
+    // seconds old, and a file swapped since then (with its size and time put back) is
+    // not one it could tell. A package nobody signed has nothing to compare with; it was
+    // let through above by its own verdict (a developer build, or the person's trust).
+    let served = {
+        let (dir, asset, id) = (dir.clone(), asset.clone(), id.clone());
+        tokio::task::spawn_blocking(move || match trust.read_signed_file(&dir, &id, &asset) {
+            Ok(Some(bytes)) => Ok(bytes),
+            Ok(None) if signed => Err((StatusCode::FORBIDDEN, format!("the signature of {id:?} is gone, so {asset:?} cannot be checked"))),
+            Ok(None) => std::fs::read(dir.join(&asset)).map_err(|e| (StatusCode::NOT_FOUND, format!("cannot read {asset:?}: {e}"))),
+            Err(why) => Err((StatusCode::FORBIDDEN, why)),
+        })
+        .await
+    };
+    match served {
+        Ok(Ok(bytes)) => (
             StatusCode::OK,
             [
                 (axum::http::header::CONTENT_TYPE, ui_content_type(&asset)),
@@ -1357,11 +1387,11 @@ async fn plugin_ui_asset(
             bytes,
         )
             .into_response(),
-        Err(e) => bridge_error(
-            StatusCode::NOT_FOUND,
-            "invalid_request",
-            format!("cannot read {asset:?}: {e}"),
-        ),
+        Ok(Err((status, why))) => {
+            let code = if status == StatusCode::FORBIDDEN { "capability_unavailable" } else { "invalid_request" };
+            bridge_error(status, code, why)
+        }
+        Err(e) => bridge_error(StatusCode::INTERNAL_SERVER_ERROR, "internal", e.to_string()),
     }
 }
 
@@ -2154,7 +2184,7 @@ mod tests {
         use std::path::PathBuf;
         use tower::ServiceExt as _;
 
-        struct Sandbox(PathBuf);
+        pub(super) struct Sandbox(pub(super) PathBuf);
         impl Sandbox {
             fn new(tag: &str) -> Self {
                 use std::sync::atomic::{AtomicU32, Ordering};
@@ -2175,11 +2205,16 @@ mod tests {
         /// The bridge over a registry that holds a release build's rules. The host does not
         /// start plugins at boot (as `build_bridge_state`'s would), so a plugin the test puts
         /// on disk is started by the test and by nothing else.
-        fn release_state(tag: &str, publishers: Publishers) -> (Sandbox, BridgeState) {
+        pub(super) fn release_state(tag: &str, publishers: Publishers) -> (Sandbox, BridgeState) {
+            state_under(tag, TrustPolicy::release(), publishers)
+        }
+
+        /// The same under `policy`.
+        pub(super) fn state_under(tag: &str, policy: TrustPolicy, publishers: Publishers) -> (Sandbox, BridgeState) {
             let sb = Sandbox::new(tag);
             let root = sb.0.join("plugins");
             std::fs::create_dir_all(&root).unwrap();
-            let trust = TrustService::new(TrustPolicy::release(), publishers, root.join("trusted-plugins.json"));
+            let trust = TrustService::new(policy, publishers, root.join("trusted-plugins.json"));
             let plugins: PluginRegistryHandle = std::sync::Arc::new(std::sync::Mutex::new(PluginRegistry::with_trust(root, trust)));
             let ledger = crate::bridge::ledger::new_handle();
             let dead = crate::bridge::deadletters::open_handle(sb.0.join("deadletters.jsonl"));
@@ -2359,6 +2394,180 @@ mod tests {
             assert!(by_id("loose")["trust"]["reason"].as_str().unwrap().contains("trust this exact package"));
             assert_eq!(by_id("loose")["state"], "disabled");
             assert!(by_id("loose").get("manifest").is_none(), "a held-back plugin offers no manifest to build on");
+        }
+    }
+
+    // --- what a package's screens and definitions are served from ----------------
+
+    mod screens_and_definitions_under_trust {
+        use super::super::*;
+        use super::trusting_a_plugin::{release_state, state_under, Sandbox};
+        use crate::plugins::registry::PluginState;
+        use crate::plugins::trust::tests::{fill, TestKey};
+        use crate::plugins::trust::{Publishers, TrustPolicy};
+        use serde_json::Value;
+        use std::path::PathBuf;
+
+        /// The page `fill` writes, and another of the same length.
+        const SIGNED_PAGE: &str = "<p>hello</p>";
+        const SWAPPED_PAGE: &str = "<p>evil!</p>";
+
+        /// Plugin `id`, with a screen `main` that declares `ui/index.html`, and the service
+        /// definition `definitions/phone.json` that maps its one action to a command.
+        fn plugin(sb: &Sandbox, id: &str) -> PathBuf {
+            let dir = sb.0.join("plugins").join(id);
+            std::fs::create_dir_all(dir.join("definitions")).unwrap();
+            fill(&dir);
+            let mut manifest: Value = serde_json::from_str(&std::fs::read_to_string(dir.join("manifest.json")).unwrap()).unwrap();
+            manifest["id"] = json!(id);
+            manifest["ui"] = json!({ "screens": [{ "id": "main", "title": "Main", "files": ["ui/index.html"] }] });
+            manifest["serviceDefinitions"] = json!([{ "definitionFile": "definitions/phone.json" }]);
+            std::fs::write(dir.join("manifest.json"), manifest.to_string()).unwrap();
+            std::fs::write(
+                dir.join("definitions").join("phone.json"),
+                json!({
+                    "id": format!("{id}.phone"), "name": "Phone",
+                    "actions": [{ "id": "call.dial", "transport": { "kind": "plugin-command", "command": "call.dial" } }],
+                })
+                .to_string(),
+            )
+            .unwrap();
+            dir
+        }
+
+        async fn get(st: &BridgeState, id: &str, asset: &str) -> (StatusCode, String) {
+            let response = plugin_ui_asset(State(st.clone()), Path((id.to_string(), "main".to_string(), asset.to_string()))).await;
+            let status = response.status();
+            let bytes = axum::body::to_bytes(response.into_body(), 1 << 20).await.unwrap();
+            (status, String::from_utf8_lossy(&bytes).to_string())
+        }
+
+        fn rescan(st: &BridgeState) {
+            st.plugins.lock().unwrap().scan();
+        }
+
+        /// Rewrite a file with other bytes of the same length and put its modified time back.
+        fn swap_keeping_size_and_time(path: &std::path::Path, bytes: &[u8]) {
+            let before = std::fs::metadata(path).unwrap().modified().unwrap();
+            assert_eq!(std::fs::metadata(path).unwrap().len(), bytes.len() as u64);
+            std::fs::write(path, bytes).unwrap();
+            std::fs::File::options().write(true).open(path).unwrap().set_modified(before).unwrap();
+        }
+
+        #[tokio::test]
+        async fn a_verified_plugins_screen_is_served_exactly_as_signed() {
+            let key = TestKey::generate("fl-test-2026a");
+            let (sb, st) = release_state("screen-ok", key.pinned_for("Demo Co", &["demo"]));
+            let dir = plugin(&sb, "demo");
+            key.sign(&dir, "demo-plugin", "1.0.0");
+
+            assert_eq!(get(&st, "demo", "ui/index.html").await, (StatusCode::OK, SIGNED_PAGE.to_string()));
+            // Only what the screen declares, as before.
+            assert_eq!(get(&st, "demo", "demo-plugin.exe").await.0, StatusCode::FORBIDDEN);
+        }
+
+        #[tokio::test]
+        async fn a_screen_file_swapped_behind_the_scans_fingerprint_is_not_served() {
+            // Same length, modified time put back: the scan's stat fingerprint cannot tell,
+            // so the record still says verified. The file is checked against the signature
+            // on the bytes that are served.
+            let key = TestKey::generate("fl-test-2026a");
+            let (sb, st) = release_state("screen-swapped", key.pinned_for("Demo Co", &["demo"]));
+            let dir = plugin(&sb, "demo");
+            key.sign(&dir, "demo-plugin", "1.0.0");
+            assert_eq!(get(&st, "demo", "ui/index.html").await.0, StatusCode::OK);
+
+            swap_keeping_size_and_time(&dir.join("ui").join("index.html"), SWAPPED_PAGE.as_bytes());
+            rescan(&st);
+            let listed = st.plugins.lock().unwrap().get("demo").unwrap().trust.as_ref().unwrap().state;
+            assert_eq!(listed, crate::plugins::TrustState::Verified, "the listing cannot tell");
+
+            let (status, body) = get(&st, "demo", "ui/index.html").await;
+            assert_eq!(status, StatusCode::FORBIDDEN, "{body}");
+            assert!(!body.contains("evil"), "the swapped page was served: {body}");
+            assert!(body.contains("ui/index.html is not what was signed"), "{body}");
+        }
+
+        #[tokio::test]
+        async fn a_running_plugin_whose_folder_stopped_verifying_serves_no_screen() {
+            let key = TestKey::generate("fl-test-2026a");
+            let (sb, st) = release_state("screen-quarantined", key.pinned_for("Demo Co", &["demo"]));
+            let dir = plugin(&sb, "demo");
+            key.sign(&dir, "demo-plugin", "1.0.0");
+            assert_eq!(get(&st, "demo", "ui/index.html").await.0, StatusCode::OK);
+
+            // It is running, and its screen file is replaced (and a file added).
+            st.plugins.lock().unwrap().set_state("demo", PluginState::Running, None);
+            std::fs::write(dir.join("ui").join("index.html"), "<script>/* tampered */</script>").unwrap();
+            std::fs::write(dir.join("note.txt"), "x").unwrap();
+            rescan(&st);
+            let rec = st.plugins.lock().unwrap().get("demo").cloned().unwrap();
+            assert_eq!(rec.state, PluginState::Running, "the live process is left alone");
+            assert_eq!(rec.trust.as_ref().unwrap().state, crate::plugins::TrustState::Quarantined);
+            assert!(rec.manifest.is_some(), "and it still names its screens");
+
+            let response = plugin_ui_asset(State(st.clone()), Path(("demo".into(), "main".into(), "ui/index.html".into()))).await;
+            let status = response.status();
+            let bytes = axum::body::to_bytes(response.into_body(), 1 << 20).await.unwrap();
+            let body: Value = serde_json::from_slice(&bytes).unwrap();
+            assert_eq!(status, StatusCode::FORBIDDEN);
+            assert_eq!(body["error"]["code"], "capability_unavailable");
+            let message = body["error"]["message"].as_str().unwrap();
+            assert!(message.contains("not served") && message.contains("Quarantined"), "{message}");
+            assert!(!String::from_utf8_lossy(&bytes).contains("tampered"));
+        }
+
+        #[tokio::test]
+        async fn a_signature_that_disappears_serves_nothing() {
+            // The record still says verified until the next scan; the signature is gone, so
+            // nothing can be checked, and a swapped page would otherwise go out unchecked.
+            let key = TestKey::generate("fl-test-2026a");
+            let (sb, st) = release_state("screen-unsigned-after", key.pinned_for("Demo Co", &["demo"]));
+            let dir = plugin(&sb, "demo");
+            key.sign(&dir, "demo-plugin", "1.0.0");
+            assert_eq!(get(&st, "demo", "ui/index.html").await.0, StatusCode::OK);
+
+            std::fs::remove_file(dir.join("package-manifest.json")).unwrap();
+            let (status, body) = get(&st, "demo", "ui/index.html").await;
+            assert_eq!(status, StatusCode::FORBIDDEN, "{body}");
+            assert!(body.contains("signature") && body.contains("gone"), "{body}");
+        }
+
+        #[tokio::test]
+        async fn an_unsigned_plugin_serves_its_screens_in_a_developer_build_as_before() {
+            let (sb, st) = state_under("screen-dev", TrustPolicy::developer(), Publishers::default());
+            plugin(&sb, "demo");
+            assert_eq!(get(&st, "demo", "ui/index.html").await, (StatusCode::OK, SIGNED_PAGE.to_string()));
+        }
+
+        #[tokio::test]
+        async fn a_plugin_a_release_build_holds_back_serves_no_screen() {
+            let (sb, st) = release_state("screen-held", Publishers::default());
+            plugin(&sb, "demo");
+            let (status, body) = get(&st, "demo", "ui/index.html").await;
+            assert_eq!(status, StatusCode::FORBIDDEN, "{body}");
+            assert!(body.contains("not served") && body.contains("Not signed"), "it says why, as the listing does: {body}");
+        }
+
+        #[tokio::test]
+        async fn service_definitions_are_not_offered_from_a_package_that_stopped_verifying() {
+            let key = TestKey::generate("fl-test-2026a");
+            let (sb, st) = release_state("defs", key.pinned_for("Demo Co", &["demo"]));
+            let dir = plugin(&sb, "demo");
+            key.sign(&dir, "demo-plugin", "1.0.0");
+            assert_eq!(collect_definitions(&st).len(), 1, "a verified plugin offers its definition");
+
+            // Running, with a definition file that no longer says what was signed.
+            st.plugins.lock().unwrap().set_state("demo", PluginState::Running, None);
+            std::fs::write(
+                dir.join("definitions").join("phone.json"),
+                json!({ "id": "demo.phone", "name": "Phone", "actions": [{ "id": "call.dial", "transport": { "kind": "plugin-command", "command": "sms.send" } }] })
+                    .to_string(),
+            )
+            .unwrap();
+            rescan(&st);
+            assert!(st.plugins.lock().unwrap().get("demo").unwrap().manifest.is_some());
+            assert!(collect_definitions(&st).is_empty(), "nothing is offered from a package that does not verify");
         }
     }
 }

@@ -107,6 +107,10 @@ const MAX_FILES: usize = 20_000;
 /// copied in by hand may be larger, but not without limit: this runs before every launch.
 const MAX_PACKAGE_BYTES: u64 = 2 * 1024 * 1024 * 1024;
 
+/// The most of one file [`TrustService::read_signed_file`] will read: a screen's page,
+/// script or image, not a package's executable.
+const MAX_ASSET_BYTES: u64 = 64 * 1024 * 1024;
+
 /// Extensions that run or load. Used only to say "executable" in a reason: every
 /// unlisted file fails a signed package, whatever it is called.
 const LOADABLE_EXTS: &[&str] = &[
@@ -455,6 +459,18 @@ fn open_envelope<'a>(text: &str, publishers: &'a Publishers, plugin_id: &str) ->
     }
     let payload: Payload = serde_json::from_slice(&payload_bytes).map_err(|e| format!("the signed payload is malformed: {e}"))?;
     Ok(Opened { publisher, payload })
+}
+
+/// `package-manifest.json` as text, at most [`MAX_ENVELOPE_BYTES`] of it.
+fn read_envelope(dir: &Path) -> Result<String, String> {
+    let cannot = |e: std::io::Error| format!("{PACKAGE_MANIFEST_FILE} cannot be read: {e}");
+    let file = std::fs::File::open(dir.join(PACKAGE_MANIFEST_FILE)).map_err(cannot)?;
+    let mut bytes = Vec::new();
+    file.take(MAX_ENVELOPE_BYTES + 1).read_to_end(&mut bytes).map_err(cannot)?;
+    if bytes.len() as u64 > MAX_ENVELOPE_BYTES {
+        return Err(format!("{PACKAGE_MANIFEST_FILE} is too large to be a package manifest"));
+    }
+    String::from_utf8(bytes).map_err(|_| format!("{PACKAGE_MANIFEST_FILE} is not text"))
 }
 
 /// A path the signer could have written and that stays inside the bundle.
@@ -1017,6 +1033,49 @@ impl TrustService {
         Ok(LaunchPermit { trust: assessed.trust, dir: dir.to_path_buf(), manifest })
     }
 
+    /// One file of a package that carries a signature, read once, and handed back only if
+    /// it is exactly what was signed: for what is read from a package while it runs (the
+    /// screens a plugin serves to the dashboard) rather than at a launch. It checks the
+    /// signature again, and the file against the digest the signature lists, on the very
+    /// bytes it returns, so a file swapped after the last scan (which the scan's
+    /// fingerprint cannot see) is never served.
+    ///
+    /// `Ok(None)` when the package has no signature: there is nothing to compare with, and
+    /// the caller decides by the package's verdict whether to read the file. `Err` when
+    /// there is a signature and it does not hold, or the file is not as signed.
+    pub fn read_signed_file(&self, dir: &Path, id: &str, rel: &str) -> Result<Option<Vec<u8>>, String> {
+        match std::fs::symlink_metadata(dir.join(PACKAGE_MANIFEST_FILE)) {
+            Ok(meta) if meta.is_file() => {}
+            Ok(_) => return Err(format!("{PACKAGE_MANIFEST_FILE} is not a regular file")),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+            Err(e) => return Err(format!("{PACKAGE_MANIFEST_FILE} cannot be read: {e}")),
+        }
+        let opened = open_envelope(&read_envelope(dir)?, &self.publishers, id)?;
+        let rel = rel.replace('\\', "/");
+        // The names of a Windows folder are not case-sensitive, so a manifest's spelling
+        // of a file need not be the signer's; the signer's is what is read.
+        let same = |listed: &str| if cfg!(windows) { listed.eq_ignore_ascii_case(&rel) } else { listed == rel };
+        let Some(entry) = opened.payload.files.iter().find(|f| same(&f.path)) else {
+            return Err(format!("{rel} is not part of the signed package"));
+        };
+        safe_listed_path(&entry.path)?;
+        if entry.size > MAX_ASSET_BYTES {
+            return Err(format!("{} is too large to be served", entry.path));
+        }
+        let mut budget = MAX_ASSET_BYTES;
+        let path = dir.join(&entry.path);
+        let (sha, size, bytes) = match hash_regular_keeping(&path, &mut budget, MAX_ASSET_BYTES) {
+            Ok(read) => read,
+            Err(HashFailure::Missing) => return Err(format!("{} is missing from the package", entry.path)),
+            Err(HashFailure::TooLarge) => return Err(format!("{} is too large to be served", entry.path)),
+            Err(HashFailure::Other(e)) => return Err(format!("{} cannot be read ({e})", entry.path)),
+        };
+        if sha != entry.sha256.to_ascii_lowercase() || size != entry.size {
+            return Err(format!("{} is not what was signed", entry.path));
+        }
+        Ok(Some(bytes))
+    }
+
     fn quarantined(&self, detail: impl AsRef<str>) -> PackageTrust {
         let mut reason = format!("Quarantined: {}.", detail.as_ref().trim_end_matches('.'));
         if self.policy.developer {
@@ -1091,16 +1150,9 @@ impl TrustService {
     }
 
     fn verify_signed(&self, dir: &Path, id: &str) -> Assessed {
-        let path = dir.join(PACKAGE_MANIFEST_FILE);
-        let text = match std::fs::metadata(&path) {
-            Ok(m) if m.len() > MAX_ENVELOPE_BYTES => {
-                return Assessed::unverified(self.quarantined(format!("{PACKAGE_MANIFEST_FILE} is too large to be a package manifest")))
-            }
-            Ok(_) => match std::fs::read_to_string(&path) {
-                Ok(t) => t,
-                Err(e) => return Assessed::unverified(self.quarantined(format!("{PACKAGE_MANIFEST_FILE} cannot be read: {e}"))),
-            },
-            Err(e) => return Assessed::unverified(self.quarantined(format!("{PACKAGE_MANIFEST_FILE} cannot be read: {e}"))),
+        let text = match read_envelope(dir) {
+            Ok(text) => text,
+            Err(e) => return Assessed::unverified(self.quarantined(e)),
         };
         let opened = match open_envelope(&text, &self.publishers, id) {
             Ok(o) => o,
@@ -2078,6 +2130,67 @@ pub(crate) mod tests {
             Err(LaunchRefusal::Manifest(ManifestError::Invalid(why))) => assert!(why.contains("':'"), "{why}"),
             other => panic!("an entry that names a stream must not be launched: {other:?}"),
         }
+    }
+
+    // -----------------------------------------------------------------------------
+    // A file read while a plugin runs, held to the signature
+    // -----------------------------------------------------------------------------
+
+    #[test]
+    fn a_file_of_a_signed_package_is_read_only_if_it_is_what_was_signed() {
+        let (_s, dir, _k, svc) = signed(TrustPolicy::release());
+        assert_eq!(svc.read_signed_file(&dir, "demo", "ui/index.html"), Ok(Some(b"<p>hello</p>".to_vec())));
+        // The manifest's spelling of a path may use either slash.
+        assert_eq!(svc.read_signed_file(&dir, "demo", "ui\\index.html"), Ok(Some(b"<p>hello</p>".to_vec())));
+
+        // Swapped for the same length with the time put back: no fingerprint could tell.
+        swap_keeping_size_and_time(&dir.join("ui").join("index.html"), b"<p>evil!</p>");
+        let err = svc.read_signed_file(&dir, "demo", "ui/index.html").unwrap_err();
+        assert!(err.contains("ui/index.html is not what was signed"), "{err}");
+
+        // A file the signature does not list is not part of the package, however it is spelled.
+        std::fs::write(dir.join("extra.txt"), b"x").unwrap();
+        for rel in ["extra.txt", "../demo/extra.txt", "ui/../extra.txt", "C:/Windows/win.ini", "package-manifest.json"] {
+            let err = svc.read_signed_file(&dir, "demo", rel).unwrap_err();
+            assert!(err.contains("is not part of the signed package") || err.contains("unusable path"), "{rel}: {err}");
+        }
+    }
+
+    #[test]
+    fn a_file_is_not_read_when_the_signature_does_not_hold() {
+        let (scratch, dir, key, _svc) = signed(TrustPolicy::release());
+        // Another publisher's pin, or a pin for other plugins: the same refusals as a scan.
+        let stranger = service(TrustPolicy::release(), TestKey::generate(&key.key_id).pinned_for("Someone", &["demo"]), &scratch);
+        assert!(stranger.read_signed_file(&dir, "demo", "ui/index.html").unwrap_err().contains("signature does not match"));
+        let elsewhere = service(TrustPolicy::release(), key.pinned_for("Demo Co", &["other"]), &scratch);
+        assert!(elsewhere.read_signed_file(&dir, "demo", "ui/index.html").unwrap_err().contains("not allowed to sign"));
+        // A missing file, a signature that lists something that is not there.
+        let svc = service(TrustPolicy::release(), key.pinned_for("Demo Co", &["demo"]), &scratch);
+        std::fs::remove_file(dir.join("ui").join("index.html")).unwrap();
+        assert!(svc.read_signed_file(&dir, "demo", "ui/index.html").unwrap_err().contains("missing"));
+    }
+
+    #[test]
+    fn a_package_with_no_signature_has_nothing_to_read_a_file_against() {
+        let (_s, dir, svc) = unsigned_release();
+        assert_eq!(svc.read_signed_file(&dir, "demo", "ui/index.html"), Ok(None), "the caller decides by the verdict");
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn a_manifests_spelling_of_a_file_need_not_match_the_signers_case_on_windows() {
+        let (_s, dir, _k, svc) = signed(TrustPolicy::release());
+        assert_eq!(svc.read_signed_file(&dir, "demo", "UI/Index.HTML"), Ok(Some(b"<p>hello</p>".to_vec())));
+    }
+
+    #[test]
+    fn an_envelope_that_is_huge_or_not_text_quarantines_with_the_reason() {
+        let (_s, dir, _k, svc) = signed(TrustPolicy::release());
+        let path = dir.join(PACKAGE_MANIFEST_FILE);
+        std::fs::write(&path, vec![b' '; MAX_ENVELOPE_BYTES as usize + 1]).unwrap();
+        assert!(quarantine_reason(&svc.assess_fresh(&dir, "demo")).contains("too large to be a package manifest"));
+        std::fs::write(&path, [0xffu8, 0xfe, 0x00]).unwrap();
+        assert!(quarantine_reason(&svc.assess_fresh(&dir, "demo")).contains("is not text"));
     }
 
     #[cfg(windows)]
