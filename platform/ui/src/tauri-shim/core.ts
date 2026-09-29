@@ -222,10 +222,12 @@ function basename(path: string): string {
 //
 // The desktop build keeps API keys in an OS keyring and small app-state
 // (user macros, built-in-macro overrides) in real files on disk. The browser
-// has neither. Secrets are SEALED in IndexedDB (secretVault.ts: AES-GCM under a
-// non-extractable key, as the Agent seals its provider keys); app-state is
-// kept in localStorage under dedicated keys. Both are kept OUT of the
-// exportable project blob — useProject redacts secret values before it
+// has neither. Secrets are sealed in IndexedDB (secretVault.ts: AES-GCM under a
+// non-extractable key, as the Agent seals its provider keys), which keeps them
+// out of localStorage; it is not protection against a copy of the browser
+// profile, whose files hold the key beside the ciphertext (see secretVault.ts).
+// App-state is kept in localStorage under dedicated keys. Both are kept OUT of
+// the exportable project blob — useProject redacts secret values before it
 // serialises the project, and app-state lives under its own keys — so
 // exporting or sharing a project never leaks API keys.
 // ---------------------------------------------------------------------------
@@ -499,7 +501,7 @@ const handlers: Record<string, (args: InvokeArgs) => Promise<unknown>> = {
   get_default_app_data_dir: async () => '/oaiy',
   // Secrets — desktop uses an OS keyring; the web build seals them in
   // IndexedDB (secretVault.ts) so API keys survive a page reload without
-  // sitting in the clear in the browser's profile. Without these handlers
+  // sitting in localStorage as plain text. Without these handlers
   // `store_secret` was a silent no-op and every secret constant was blanked by
   // the project autosave's redaction, so keys vanished on the next refresh.
   // Where sealing is not possible the vault keeps them as this shim always

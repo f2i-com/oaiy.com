@@ -396,15 +396,17 @@ section('flows rail collapse');
 }
 
 // ---------------------------------------------------------------------------
-// API keys are sealed at rest, and the browser is asked to keep the editor's storage.
+// API keys are sealed in IndexedDB, and the browser is asked to keep the editor's storage.
 //
 // A flow's API keys were plain text in localStorage (`oaiy_web_secrets`). They are
 // sealed in IndexedDB now (AES-GCM under a key that cannot be exported), and a
-// plaintext map left from before is moved in when the editor first loads. The
-// vault's logic is tests/secret-vault.mjs against a stand-in database; this is
-// the real IndexedDB and WebCrypto. (A page that is not a secure context has no
-// WebCrypto, keeps the keys as it always did, and is skipped here.)
-section('API keys sealed at rest + persistent storage');
+// plaintext map left from before is moved in when the editor first loads. That
+// keeps them out of localStorage; it is not protection against a copy of the
+// profile (see tauri-shim/secretVault.ts). The vault's logic is
+// tests/secret-vault.mjs against a stand-in database; this is the real IndexedDB
+// and WebCrypto. (A page that is not a secure context has no WebCrypto, keeps
+// the keys as it always did, and is skipped here.)
+section('API keys sealed in IndexedDB + persistent storage');
 {
   const ctx = await browser.newContext({ viewport: { width: 1440, height: 900 } });
   const page = await ctx.newPage();

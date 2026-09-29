@@ -1,15 +1,20 @@
 /**
- * The flow editor's API keys are sealed at rest.
+ * The flow editor's API keys are sealed in IndexedDB, not left in localStorage.
  *
  *     npm run test:secret-vault
  *
  * The web build kept a flow's API keys in plain text in localStorage
  * (`oaiy_web_secrets`). tauri-shim/secretVault.ts seals them the way the Agent
  * seals its provider keys: AES-GCM under a non-extractable key kept in
- * IndexedDB. Node has WebCrypto but no IndexedDB, so the vault is handed a small
- * IndexedDB of this file's own (serial transactions, structured clones, and the
- * failures a browser gives: a refused write, a database that will not open or
- * never answers, a store wiped under a live page). What is checked:
+ * IndexedDB. That keeps them out of localStorage and out of a script's reach to
+ * export; it does not protect a copy of the browser profile, whose files hold the
+ * key beside the ciphertext (the header of secretVault.ts says what it does and
+ * does not do, and nothing here claims more).
+ *
+ * Node has WebCrypto but no IndexedDB, so the vault is handed a small IndexedDB
+ * of this file's own (serial transactions, structured clones, and the failures a
+ * browser gives: a refused write, a database that will not open or never
+ * answers, a store wiped under a live page). What is checked:
  *
  *   - a seal and unseal round trip, across a page load; the stored bytes are
  *     ciphertext, one record per secret, under a key that cannot be exported;

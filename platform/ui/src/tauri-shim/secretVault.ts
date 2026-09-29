@@ -1,21 +1,35 @@
 /**
- * API keys, sealed at rest.
+ * API keys, sealed in IndexedDB instead of left in localStorage.
  *
  * The desktop keeps a flow's API keys in the OS keyring. A browser has none, so
  * the web build's `store_secret` / `get_secrets` (tauri-shim/core.ts) kept them
- * as plain text under one localStorage key (`oaiy_web_secrets`): every key in
- * the clear in the browser's profile folder, in a copy of it, in a sync or a
- * backup of it. An installed web app makes that profile a longer-lived place to
- * keep them. They are sealed now, the way the Agent seals its provider keys
- * (app/src/settings.ts): AES-GCM, with a key made in this browser and kept in
- * IndexedDB as a non-extractable CryptoKey, so its bytes never exist where a
- * script could read them or copy them away.
+ * as plain text under one localStorage key (`oaiy_web_secrets`). They are sealed
+ * now, the way the Agent seals its provider keys (app/src/settings.ts): each
+ * value is encrypted with AES-GCM under a key made in this browser and kept in
+ * IndexedDB as a non-extractable CryptoKey.
  *
- * What that protects, and what it does not. It protects a key AT REST. It does
- * not hide a key from code running on this page, which can ask the browser to
- * decrypt just as the editor does. (A flow's own code cannot ask the vault: the
- * runtime's broker keeps `store_secret` and `get_secrets` on its denylist. A
- * flow is given the constants it may read, as it always was.)
+ * What that does, and what it does not.
+ *   - It keeps a key out of localStorage. What lists or dumps a site's
+ *     localStorage (the browser's storage viewer, an extension, a search of that
+ *     file) no longer shows it, and a script cannot ask the browser for the
+ *     CryptoKey's bytes (`exportKey` is refused).
+ *   - It does NOT protect a key from anyone who has the browser profile's files:
+ *     a copy, a sync, a backup. The browser keeps the CryptoKey in the same
+ *     IndexedDB files as the ciphertext, so whoever holds the files can decrypt
+ *     without running the browser. (Tried in Chromium and in Firefox: every sealed
+ *     value was recovered from the profile's IndexedDB files alone.) Protecting a
+ *     copy of the profile would take a secret that is not in the profile, such as
+ *     a passphrase or a passkey. This has none.
+ *   - It does not hide a key from code running on this page, which can ask the
+ *     browser to decrypt just as the editor does. (A flow's own code cannot ask
+ *     the vault: the runtime's broker keeps `store_secret` and `get_secrets` on
+ *     its denylist. A flow is given the constants it may read, as it always was.)
+ *   - It does not scrub the plaintext it replaces from the disk. Removing the
+ *     localStorage key removes it for the page, but Chromium keeps the old value
+ *     in its storage log until it next tidies that log, which can be a long time.
+ *     A key entered before this change can stay readable in the profile's files;
+ *     replace it if the profile may have been copied. (Seen in Chromium; not
+ *     established for Firefox.)
  *
  * The store. One IndexedDB database (`oaiy-web-secrets`) with two object stores:
  * `keys` holds the CryptoKey, `secrets` holds one record per secret,
