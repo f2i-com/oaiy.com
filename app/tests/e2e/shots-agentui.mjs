@@ -335,6 +335,13 @@ async function conversation(page, kind, name) {
   await wait(400);
 }
 
+/** Where the chat's log is scrolled: how far from its bottom, whether "Latest" shows, and what it says. */
+const logState = (page) => page.evaluate(() => {
+  const log = document.querySelector('.chat-log');
+  const jump = document.querySelector('.to-latest');
+  return { fromBottom: Math.round(log.scrollHeight - log.scrollTop - log.clientHeight), scrollTop: Math.round(log.scrollTop), scrollHeight: log.scrollHeight, jump: !!jump && !jump.hidden, jumpText: jump?.textContent ?? '' };
+});
+
 async function closePicker(page) {
   await page.keyboard.press('Escape');
   await page.evaluate(() => document.activeElement?.blur?.());
@@ -485,6 +492,13 @@ try {
 
   await conversation(page, 'call', 'Lance');
   await closePicker(page);
+  await verify('a conversation opens at its end, the latest at the bottom and the call in order', async () => {
+    await wait(300);
+    const s = await logState(page);
+    expect(s.fromBottom <= 2 && !s.jump, JSON.stringify(s));
+    const order = await page.evaluate(() => [...document.querySelectorAll('.chat-feed .msg-body, .chat-feed .day-divider, .chat-feed .call-end')].map((e) => e.textContent.trim().slice(0, 24)));
+    expect(order[0].startsWith('Yesterday') && order.at(-1) === 'The call ended' && order.indexOf('Perfect, thanks. Bye!') > order.indexOf('Hi there, I was hoping t'), JSON.stringify(order));
+  });
   await shoot(page, 'call');
 
   await conversation(page, 'sms', 'Lance');
@@ -503,6 +517,11 @@ try {
     voice({ type: 'call.caller', callId: 'live-1', text: 'Thursday morning, if you can.', startMs: 9_800, endMs: 11_600 });
     await page.waitForFunction(() => document.querySelector('.chat-log')?.textContent.includes("nine o'clock"), { timeout: 20_000 }).catch(() => console.log('  (no second reply on the call)'));
     await wait(1200);
+    await verify('a live call follows what is said at the bottom', async () => {
+      const s = await logState(page);
+      const last = await page.evaluate(() => [...document.querySelectorAll('.chat-feed .msg-body')].at(-1)?.textContent);
+      expect(s.fromBottom <= 2 && /nine o'clock/.test(last ?? ''), JSON.stringify({ ...s, last }));
+    });
     await shoot(page, 'live');
     voice({ type: 'call.ended', callId: 'live-1' });
     liveCalls = [];
@@ -536,21 +555,52 @@ try {
         if (run) run.open = true;
         const failed = group.querySelector('details.tool.failed');
         if (failed) failed.open = true;
-        group.scrollIntoView({ block: 'start' });
       });
+      // Opened at the bottom, the log keeps to it; then the reader scrolls up to the rows ("Latest" shows).
       await wait(200);
+      await page.evaluate(() => {
+        const log = document.querySelector('.chat-log');
+        const group = [...document.querySelectorAll('details.tool-group')].at(-1);
+        if (group) log.scrollTop += group.getBoundingClientRect().top - log.getBoundingClientRect().top - 8;
+      });
+      await wait(250);
     },
   });
-  await page.evaluate(() => document.querySelector('.chat-log').scrollTo({ top: 0 }));
   if (!only || only.includes('busy')) {
+    // Up the log (the tools opened): sending a message goes back down to where the reply comes.
+    await page.evaluate(() => document.querySelector('.chat-log').scrollTo({ top: 0 }));
     await page.click('.chat-input');
     await page.keyboard.type('Also chart it as an SVG.');
     await page.keyboard.press('Enter');
     for (let i = 0; i < 100 && !held.length; i++) await wait(200);
     await wait(900);
+    await verify('sending goes to the bottom, and the log keeps to it as the reply streams in', async () => {
+      const s = await logState(page);
+      const last = await page.evaluate(() => {
+        const feed = document.querySelector('.chat-feed');
+        const status = feed.lastElementChild;
+        return { status: status.matches('.chat-status') ? status.textContent : 'not last', reply: [...feed.querySelectorAll('.msg.assistant')].at(-1)?.textContent.slice(0, 20) };
+      });
+      expect(s.fromBottom <= 2 && !s.jump && last.reply?.startsWith('Here is the chart'), JSON.stringify({ ...s, ...last }));
+    });
     await shoot(page, 'busy');
-    held.splice(0).forEach((release) => release());
-    await wait(800);
+    await verify('scrolled up, the reader stays put as the reply finishes and more comes, and "Latest" says how much is new', async () => {
+      await page.evaluate(() => document.querySelector('.chat-log').scrollTo({ top: 200 }));
+      await wait(200);
+      const before = await logState(page);
+      held.splice(0).forEach((release) => release());
+      await page.waitForFunction(() => document.querySelector('.chat-log').textContent.includes('Oslo is the shortest bar.'), { timeout: 10_000 });
+      await page.type('.chat-input', '/help');
+      await page.keyboard.press('Enter');
+      await wait(500);
+      const after = await logState(page);
+      expect(before.scrollTop === 200 && after.scrollTop === 200 && after.scrollHeight > before.scrollHeight && after.jump && /1 new/.test(after.jumpText), JSON.stringify({ before, after }));
+      await page.click('.to-latest');
+      await wait(900);
+      const back = await logState(page);
+      expect(back.fromBottom <= 2 && !back.jump, JSON.stringify(back));
+    });
+    await wait(300);
   }
 
   // A file open from the tree, in the editor.
@@ -579,22 +629,39 @@ try {
   // A long conversation: its older turns come a page at a time as it is scrolled, each speaker's run going on across the pages.
   if (!only || only.includes('long')) {
     await page.setViewport({ width: 1440, height: 900 });
-    await verify('a long conversation draws its older turns as it is scrolled, one run per speaker across the pages', async () => {
+    await verify('a long conversation opens at its end, draws older turns as it is scrolled up with the reader held in place, one run per speaker across the pages', async () => {
       const errors = [];
       const onError = (e) => errors.push(e.message);
       page.on('pageerror', onError);
       await page.select('.project-select', long);
       await page.waitForFunction(() => document.querySelector('.chat-log')?.textContent.includes('Added line 30.'), { timeout: 20_000 });
+      await wait(400);
+      const opened = await logState(page);
+      expect(opened.fromBottom <= 2, `opened away from the end: ${JSON.stringify(opened)}`);
+      // Up to the first message drawn: older turns come in above it, and it stays where it was on screen.
+      // (Measured from the log's own top: scrolling it must not move anything else on the page.)
+      const held = await page.evaluate(() => {
+        const log = document.querySelector('.chat-log');
+        const first = document.querySelector('.chat-feed .msg.user');
+        log.scrollTop += first.getBoundingClientRect().top - log.getBoundingClientRect().top - 10;
+        return { text: first.textContent, top: first.getBoundingClientRect().top - log.getBoundingClientRect().top, scrollTop: log.scrollTop };
+      });
+      await wait(400);
+      const moved = await page.evaluate((text) => {
+        const log = document.querySelector('.chat-log');
+        const el = [...document.querySelectorAll('.chat-feed .msg.user')].find((e) => e.textContent === text);
+        return { top: el ? el.getBoundingClientRect().top - log.getBoundingClientRect().top : null, scrollTop: log.scrollTop, older: document.querySelector('.chat-feed .msg.user')?.textContent !== text };
+      }, held.text);
+      expect(moved.older && moved.scrollTop > 0 && Math.abs(moved.top - held.top) <= 2, `the reader's place moved: ${JSON.stringify({ held, moved })}`);
       for (let i = 0; i < 20 && (await page.$('.chat-log .show-earlier')); i++) {
         await page.evaluate(() => {
-          const log = document.querySelector('.chat-log');
-          log.scrollTop = log.scrollHeight;
+          document.querySelector('.chat-log').scrollTop = 0;
         });
         await wait(250);
       }
       page.off('pageerror', onError);
       const found = await page.evaluate(() => {
-        const runs = [...document.querySelectorAll('.chat-log > section.run')];
+        const runs = [...document.querySelectorAll('.chat-feed > section.run')];
         const twice = runs.filter((r, i) => i && runs[i - 1] === r.previousElementSibling && runs[i - 1].dataset.speaker === r.dataset.speaker && runs[i - 1].dataset.who === r.dataset.who).length;
         const yours = runs.filter((r) => r.dataset.speaker === 'you').map((r) => r.querySelectorAll('.msg.user').length);
         return { older: !!document.querySelector('.chat-log .show-earlier'), requests: document.querySelectorAll('.chat-log .msg.user').length, tools: document.querySelectorAll('.chat-log details.tool').length, groups: document.querySelectorAll('.chat-log details.tool-group').length, twice, yours: yours.length, split: yours.filter((n) => n !== 2).length };
