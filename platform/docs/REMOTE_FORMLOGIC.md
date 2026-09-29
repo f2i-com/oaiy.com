@@ -131,12 +131,14 @@ example just after a restart.
 
 Every relayed command, allowed or refused, is one line of
 `<data>/relay-log.jsonl`: `{at, tool: "relay.command", args: {connector, command,
-commandId, decision, reason?}, session: "relay", ok, summary}`. The line is written
-before the command is forwarded. It never holds the payload (message text, phone
-numbers) or anything the plugin answered. The desktop's own ops are in it too, with
-the connector `desktop`: allowed when they are on the closed list, and refused
+commandId, decision, reason?, target?}, session: "relay", ok, summary}`. The line is
+written before the command is forwarded. It never holds the payload (message text,
+phone numbers) or anything the plugin answered. The desktop's own ops are in it too,
+with the connector `desktop`: allowed when they are on the closed list, and refused
 (`unknown_op`) when they are not, so stopping the phone plugin from the website
-leaves a line. A command for a plugin that the policy refuses says which rule did
+leaves a line, and the line names the plugin or service it acted on (`target`) when
+the payload gives a plain id (letters, digits, `.`, `_`, `-`) and writes nothing else
+of the payload. A command for a plugin that the policy refuses says which rule did
 (`not_listed`, `journalled`, `not_declared`, `policy_unreadable`, `no_command_id`). It
 is its own file, written the way the
 [control log](../../docs/AGENT_CONTROL.md#the-switch-and-the-log) is, because that

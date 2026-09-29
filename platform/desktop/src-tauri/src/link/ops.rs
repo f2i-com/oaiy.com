@@ -142,18 +142,22 @@ impl RelayGuard {
             // The decision is made and the plugin had no say in it. What the website is TOLD
             // does depend on whether the plugin has such a command at all.
             .map_err(|refusal| refusal.worded_for(declared));
-        self.record(connector, command, command_id, verdict.as_ref().err().map(Refusal::reason));
+        let line = Line { connector, command, command_id, target: None };
+        self.record(line, verdict.as_ref().err().map(Refusal::reason));
         verdict
     }
 
     /// An op of this app's own. It is not the policy's to allow (the list of ops is
     /// closed, [`DESKTOP_OPS`]) but it is written down all the same: stopping the
-    /// phone plugin from the website is exactly what this log is for. An op that is
-    /// not on the list is refused here, in the dispatcher's own words, and never
-    /// reaches it, so the line written is always the truth about what happened.
-    fn admit_desktop_op(&self, command: &str, command_id: &str) -> Result<(), String> {
+    /// phone plugin from the website is exactly what this log is for, so the line says
+    /// which plugin. An op that is not on the list is refused here, in the dispatcher's
+    /// own words, and never reaches it, so the line written is always the truth about
+    /// what happened.
+    fn admit_desktop_op(&self, command: &str, command_id: &str, payload: &Value) -> Result<(), String> {
         let listed = DESKTOP_OPS.contains(&command);
-        self.record(DESKTOP_CONNECTOR, command, command_id, (!listed).then_some("unknown_op"));
+        let target = if listed { op_target(payload) } else { None };
+        let line = Line { connector: DESKTOP_CONNECTOR, command, command_id, target };
+        self.record(line, (!listed).then_some("unknown_op"));
         if listed {
             Ok(())
         } else {
@@ -165,13 +169,16 @@ impl RelayGuard {
     /// is the reason, when it was). Never the payload (message text, phone numbers) and
     /// never anything the plugin said back: the log's redaction only knows secret-looking
     /// NAMES.
-    fn record(&self, connector: &str, command: &str, command_id: &str, refused: Option<&str>) {
+    fn record(&self, line: Line<'_>, refused: Option<&str>) {
         let mut args = json!({
-            "connector": connector,
-            "command": command,
-            "commandId": command_id,
+            "connector": line.connector,
+            "command": line.command,
+            "commandId": line.command_id,
             "decision": if refused.is_none() { "allowed" } else { "refused" },
         });
+        if let Some(target) = line.target {
+            args["target"] = json!(target);
+        }
         let summary = match refused {
             None => "allowed".to_string(),
             Some(reason) => {
@@ -181,6 +188,28 @@ impl RelayGuard {
         };
         self.log.append("relay.command", &args, "relay", refused.is_none(), &summary);
     }
+}
+
+/// One relayed command as a line of the log names it, and no more than this.
+struct Line<'a> {
+    connector: &'a str,
+    command: &'a str,
+    command_id: &'a str,
+    /// What an op of this app's own acts on: the id of a plugin or a service.
+    target: Option<&'a str>,
+}
+
+/// What an op of this app's own acts on: the id of a plugin or a service.
+///
+/// Only when it is a plain id (letters, digits, `.` `_` `-`, as long as a name is), so that a
+/// line can never hold a sentence, a number or anything else the payload carried. The provider
+/// sends the id as `id`, and this app's dispatcher reads `pluginId` and `serviceId`: the line
+/// names whichever there is.
+fn op_target(payload: &Value) -> Option<&str> {
+    ["pluginId", "serviceId", "id"]
+        .iter()
+        .filter_map(|field| payload.get(*field).and_then(Value::as_str))
+        .find(|id| super::policy::plain(id))
 }
 
 /// What the plugin registry knows about `command` of `connector`, for a connector
@@ -231,7 +260,7 @@ fn guarded(
     std::sync::Arc::new(move |connector: &str, command: &str, payload: &Value, key: &str| {
         // `key` is the relayed command's own id: see `super::relay::Dispatcher`.
         if connector == DESKTOP_CONNECTOR {
-            guard.admit_desktop_op(command, key)?;
+            guard.admit_desktop_op(command, key, payload)?;
         } else {
             guard
                 .admit(&plugins, connector, command, key)
@@ -856,9 +885,13 @@ mod guard_tests {
         assert_eq!(lines[1]["ok"], false);
         assert_eq!(lines[2]["args"]["reason"], "no_command_id");
         assert_eq!(lines[3]["args"]["reason"], "journalled");
+        // …and which plugin it stopped, since the line is the only record that it was stopped.
         assert_eq!(
             lines[4]["args"],
-            json!({ "connector": "desktop", "command": "plugins.stop", "commandId": "cmd-stop", "decision": "allowed" })
+            json!({
+                "connector": "desktop", "command": "plugins.stop", "commandId": "cmd-stop",
+                "decision": "allowed", "target": "aokie"
+            })
         );
         assert_eq!(lines[4]["ok"], true);
         assert_eq!(lines[5]["args"]["decision"], "refused");
@@ -941,6 +974,38 @@ mod guard_tests {
         assert_eq!(refused[0]["args"]["decision"], "refused");
         assert_eq!(refused[0]["args"]["reason"], "unknown_op");
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn an_op_of_this_app_logs_what_it_acts_on_when_that_is_a_plain_id_and_nothing_else_of_its_payload() {
+        let world = world("target");
+        let relay = relay(&world, RelayPolicy::shipped());
+        // The provider puts the id under `id`; this app's dispatcher reads `pluginId` and
+        // `serviceId`. The log names whichever there is.
+        let _ = relay("desktop", "plugins.stop", &json!({ "pluginId": "aokie" }), "cmd-1");
+        let _ = relay("desktop", "services.start", &json!({ "serviceId": "oaiy-voice" }), "cmd-2");
+        let _ = relay("desktop", "plugins.health", &json!({ "id": "aokie", "note": "Call Alex on 0491 570 006" }), "cmd-3");
+        // Not an id: a sentence with a number in it, and one too long to be a name. Not written.
+        let _ = relay("desktop", "plugins.stop", &json!({ "pluginId": "aokie and 0491 570 156" }), "cmd-4");
+        let long = "a".repeat(97);
+        let _ = relay("desktop", "services.stop", &json!({ "serviceId": long }), "cmd-5");
+        // An op nobody lists has nothing to name, and no payload has no target.
+        let _ = relay("desktop", "plugins.detonate", &json!({ "pluginId": "aokie" }), "cmd-6");
+        let _ = relay("desktop", "plugins.list", &Value::Null, "cmd-7");
+
+        let raw = std::fs::read_to_string(world.root.join(RELAY_LOG_FILE)).expect("the relay log");
+        let targets: Vec<Value> = raw
+            .lines()
+            .map(|l| serde_json::from_str::<Value>(l).unwrap()["args"]["target"].clone())
+            .collect();
+        assert_eq!(
+            targets,
+            [json!("aokie"), json!("oaiy-voice"), json!("aokie"), Value::Null, Value::Null, Value::Null, Value::Null],
+            "{raw}"
+        );
+        for text in ["0491 570 006", "0491 570 156", "Call Alex", long.as_str()] {
+            assert!(!raw.contains(text), "the log holds {text:?}: {raw}");
+        }
     }
 
     #[test]

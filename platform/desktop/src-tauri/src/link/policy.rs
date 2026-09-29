@@ -309,7 +309,7 @@ fn parse(text: &str) -> Result<BTreeMap<String, BTreeSet<String>>, String> {
 
 /// A name of letters, digits and `.` `_` `-`: no wildcard, no space, nothing that
 /// looks like a name but is not the one the plugin declares.
-fn plain(name: &str) -> bool {
+pub(crate) fn plain(name: &str) -> bool {
     !name.is_empty()
         && name.len() <= 96
         && name.chars().all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '-'))
