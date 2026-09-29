@@ -27,6 +27,8 @@ pub mod settings;
 #[cfg(test)]
 mod session_tests;
 #[cfg(test)]
+pub(crate) mod testing;
+#[cfg(test)]
 mod tests;
 
 use std::path::Path;
@@ -36,7 +38,7 @@ use serde::Serialize;
 
 pub use host::{Authorised, CallInfo, CallSource, Clock, DeviceSource, PresenceSource, Ring};
 pub use plan::{plan, Decision, Inputs, PlanReason, Presence, Reason, RingPlan};
-pub use session::{set_global_notifier, ActiveRing, Action, RingError, RingNotifier, TransferPlugin};
+pub use session::{set_global_notifier, ActiveRing, Action, Notice, RingError, RingNotifier, TransferPlugin};
 pub use settings::{RingSettings, SettingsError, SettingsStore};
 
 /// What the receptionist may do because of the owner's settings.

@@ -39,6 +39,7 @@ impl CallSource for Calls {
 struct Notified {
     rang: Mutex<Vec<ActiveRing>>,
     ended: Mutex<Vec<(String, String)>>,
+    noticed: Mutex<Vec<crate::ring::Notice>>,
 }
 
 impl RingNotifier for Notified {
@@ -47,6 +48,9 @@ impl RingNotifier for Notified {
     }
     fn ended(&self, id: &str, outcome: &str) {
         self.ended.lock().unwrap().push((id.to_string(), outcome.to_string()));
+    }
+    fn noticed(&self, notice: &crate::ring::Notice) {
+        self.noticed.lock().unwrap().push(notice.clone());
     }
 }
 
@@ -104,6 +108,7 @@ fn caller(from: &str, name: &str, said: &str) -> CallInfo {
 fn rig(presence: Presence) -> Rig {
     let ring = Ring::in_memory(RingSettings { enabled: true, ..Default::default() });
     ring.set_presence(Arc::new(Here(presence)));
+    ring.set_devices(crate::ring::testing::at_the_pc());
     let calls = Arc::new(Calls::default());
     calls.info.lock().unwrap().push((CALL.into(), caller("+61491570006", "Alex", ASKED)));
     ring.set_calls(calls.clone());
@@ -329,6 +334,91 @@ fn the_time_the_phone_gives_is_believed_only_when_it_makes_sense() {
     }
 }
 
+/// The owner at their computer, an approved phone, and nothing ticked as this computer's Companion: the default setup.
+fn nobody_to_offer_a_call_to(r: &Rig) {
+    r.ring.set_devices(Arc::new(crate::ring::testing::Devices(vec![crate::ring::testing::android("ph1")])));
+}
+
+#[test]
+fn a_toast_alone_is_not_a_ring_so_nobody_is_planned_for_and_no_try_is_counted() {
+    let r = rig(Presence::Active);
+    nobody_to_offer_a_call_to(&r);
+    // The reference plans a ring for the owner at their computer with only the toast, and this desktop does not: a plugin that
+    // offers a transfer only to the devices a plan names would open nothing for it.
+    let plan = r.ring.authorise(CALL, Reason::CallerAsked);
+    assert_eq!((plan.plan.decision, plan.plan.reason), (Decision::MessageOnly, PlanReason::NoDevice), "{:?}", plan.plan);
+    assert!(!plan.rings() && plan.plan_id.is_none());
+    assert!(!plan.plan.desktop_toast && plan.plan.targets().is_empty());
+    // The plugin asking is answered the same way, and nothing was counted for either.
+    let asked = r.ring.plan_for_plugin(CALL, Reason::CallerAsked, CallInfo::default());
+    assert_eq!((asked.plan.decision, asked.plan.reason), (Decision::MessageOnly, PlanReason::NoDevice));
+    let counters = r.ring.attempts.lock().unwrap().counters(CALL, "491570006", r.ring.clock().unix());
+    assert_eq!((counters.attempts_this_call, counters.global_attempts_last_hour), (0, 0), "no try was spent on a ring that cannot happen");
+    assert!(r.ring.active().is_empty() && r.notified.rang.lock().unwrap().is_empty());
+    // The same caller can still be put through once a device is set up: nothing was used up.
+    r.ring.set_devices(crate::ring::testing::at_the_pc());
+    assert!(r.ring.authorise(CALL, Reason::CallerAsked).rings());
+}
+
+#[test]
+fn the_owner_away_still_rings_their_phone_and_only_the_toast_needs_the_computers_companion() {
+    let r = rig(Presence::Idle);
+    nobody_to_offer_a_call_to(&r);
+    let plan = r.ring.authorise(CALL, Reason::CallerAsked);
+    assert!(plan.rings(), "{:?}", plan.plan);
+    assert_eq!(plan.plan.phones, vec!["ph1".to_string()]);
+    assert!(!plan.plan.desktop_toast);
+    // At the computer with a phone and the computer's Companion both set up: the Companion on the computer is named.
+    let r = rig(Presence::Active);
+    r.ring.set_devices(Arc::new(crate::ring::testing::Devices(vec![crate::ring::testing::android("ph1"), crate::ring::testing::windows("pc1")])));
+    let plan = r.ring.authorise(CALL, Reason::CallerAsked);
+    assert!(plan.rings() && plan.plan.desktop_toast);
+    assert_eq!((plan.plan.phones.clone(), plan.plan.desktop_companions.clone()), (vec![], vec!["pc1".to_string()]), "a phone rings when the owner is away");
+}
+
+#[test]
+fn the_owner_is_told_once_a_call_that_nobody_could_be_rung_for_want_of_a_device_and_can_dismiss_it() {
+    let r = rig(Presence::Active);
+    nobody_to_offer_a_call_to(&r);
+    r.ring.authorise(CALL, Reason::CallerAsked);
+    r.ring.plan_for_plugin(CALL, Reason::CallerAsked, CallInfo::default());
+    let notices = r.ring.notices();
+    assert_eq!(notices.len(), 1, "once a call, whoever asked");
+    let n = &notices[0];
+    assert_eq!((n.call_id.as_str(), n.caller_name.as_str(), n.caller_number.as_str(), n.text.as_str()), (CALL, "Alex", "+61491570006", crate::ring::session::NO_DEVICE_TEXT));
+    assert!(n.text.contains("No device is set up to take a transfer") && n.text.contains("offered a message"));
+    assert_eq!(r.notified.noticed.lock().unwrap().len(), 1, "and the desktop was asked to tell the owner");
+    // A ring is not what this is: nothing is offered to accept.
+    assert!(r.ring.active().is_empty());
+    // Another call: its own notice, but the native notification is not raised again within ten minutes.
+    r.calls.info.lock().unwrap().push(("call_2".into(), caller("+61491570156", "Sam", ASKED)));
+    r.ring.authorise("call_2", Reason::CallerAsked);
+    assert_eq!(r.ring.notices().len(), 2);
+    assert_eq!(r.notified.noticed.lock().unwrap().len(), 1, "the chime is not repeated for a caller who rings again");
+    // The owner dismisses one.
+    assert!(r.ring.dismiss_notice(&n.id));
+    assert!(!r.ring.dismiss_notice(&n.id), "and it is gone");
+    assert_eq!(r.ring.notices().len(), 1);
+    // Only so many are kept.
+    for k in 3..12 {
+        let call = format!("call_{k}");
+        r.calls.info.lock().unwrap().push((call.clone(), caller("", "Sam", ASKED)));
+        r.ring.authorise(&call, Reason::CallerAsked);
+    }
+    assert_eq!(r.ring.notices().len(), 5);
+}
+
+#[test]
+fn a_quiet_hour_or_a_disabled_setting_is_not_a_missing_device() {
+    // Transfers off: message only for its own reason, and no notice about devices.
+    let r = rig(Presence::Active);
+    nobody_to_offer_a_call_to(&r);
+    r.ring.change_settings(&json!({ "enabled": false })).unwrap();
+    let plan = r.ring.authorise(CALL, Reason::CallerAsked);
+    assert_eq!(plan.plan.reason, PlanReason::Disabled);
+    assert!(r.ring.notices().is_empty());
+}
+
 #[test]
 fn a_second_try_on_one_call_straight_after_the_first_is_refused() {
     let r = rig(Presence::Active);
@@ -381,7 +471,7 @@ async fn the_dialog_reads_the_rings_and_answers_them_over_http() {
     let base = serve(r.ring.clone()).await;
     let client = reqwest::Client::new();
     let read = || async { client.get(format!("{base}/api/ring/active")).send().await.unwrap().json::<serde_json::Value>().await.unwrap() };
-    assert_eq!(read().await, json!({ "rings": [] }));
+    assert_eq!(read().await, json!({ "rings": [], "notices": [] }));
 
     let ring = open(&r);
     let rings = read().await;
@@ -417,8 +507,29 @@ async fn the_dialog_reads_the_rings_and_answers_them_over_http() {
     let message = post("assist_1", json!({ "action": "message" })).await;
     assert_eq!(message.status(), 200);
     assert_eq!(message.json::<serde_json::Value>().await.unwrap()["ok"], true);
-    assert_eq!(read().await, json!({ "rings": [] }));
+    assert_eq!(read().await, json!({ "rings": [], "notices": [] }));
     assert_eq!(r.calls.told.lock().unwrap().as_slice(), [(CALL.to_string(), "assist_1".to_string(), Outcome::Declined)]);
     assert_eq!(post("assist_1", json!({ "action": "decline" })).await.status(), 404);
     assert_eq!(r.calls.told.lock().unwrap().len(), 1, "told once");
+}
+
+#[tokio::test]
+async fn a_notice_that_nobody_could_be_rung_is_read_and_dismissed_over_http() {
+    let r = rig(Presence::Active);
+    nobody_to_offer_a_call_to(&r);
+    let base = serve(r.ring.clone()).await;
+    let client = reqwest::Client::new();
+    r.ring.authorise(CALL, Reason::CallerAsked);
+    let read: serde_json::Value = client.get(format!("{base}/api/ring/active")).send().await.unwrap().json().await.unwrap();
+    assert_eq!(read["rings"], json!([]));
+    let notice = &read["notices"][0];
+    assert_eq!((notice["callerName"].as_str(), notice["callerNumber"].as_str(), notice["callId"].as_str()), (Some("Alex"), Some("+61491570006"), Some(CALL)), "{notice}");
+    assert!(notice["text"].as_str().unwrap().contains("No device is set up"));
+    let id = notice["id"].as_str().unwrap().to_string();
+    let gone = client.post(format!("{base}/api/ring/notices/notice_nope/dismiss")).send().await.unwrap();
+    assert_eq!(gone.status(), 404);
+    let done = client.post(format!("{base}/api/ring/notices/{id}/dismiss")).send().await.unwrap();
+    assert_eq!(done.status(), 200);
+    let read: serde_json::Value = client.get(format!("{base}/api/ring/active")).send().await.unwrap().json().await.unwrap();
+    assert_eq!(read["notices"], json!([]));
 }

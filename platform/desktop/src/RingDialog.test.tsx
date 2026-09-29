@@ -6,13 +6,14 @@
 import { act } from 'react';
 import { createRoot, type Root } from 'react-dom/client';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
-import type { ActiveRing } from './api';
+import type { ActiveRing, RingNotice } from './api';
 
-const api = vi.hoisted(() => ({ active: vi.fn(), respond: vi.fn() }));
+const api = vi.hoisted(() => ({ active: vi.fn(), respond: vi.fn(), dismiss: vi.fn(), openSetup: vi.fn() }));
 vi.mock('./api', async (importOriginal) => {
   const real = await importOriginal<typeof import('./api')>();
-  return { ...real, ring: { ...real.ring, active: (...a: unknown[]) => api.active(...a), respond: (...a: unknown[]) => api.respond(...a) } };
+  return { ...real, ring: { ...real.ring, active: (...a: unknown[]) => api.active(...a), respond: (...a: unknown[]) => api.respond(...a), dismissNotice: (...a: unknown[]) => api.dismiss(...a) } };
 });
+vi.mock('./useSetupState', () => ({ openSetup: (...a: unknown[]) => api.openSetup(...a) }));
 
 import RingDialog, { POLL_MS, secondsLeft } from './RingDialog';
 
@@ -36,7 +37,16 @@ const ringing = (r: Partial<ActiveRing> = {}): ActiveRing => ({
   ...r,
 });
 /** The desktop answers with these rings, and its clock goes on as time passes. */
-const serve = (...rings: Array<Partial<ActiveRing>>) => api.active.mockImplementation(async () => rings.map((r) => ringing(r)));
+const serve = (...rings: Array<Partial<ActiveRing>>) => api.active.mockImplementation(async () => ({ rings: rings.map((r) => ringing(r)), notices: [] }));
+const notice = (n: Partial<RingNotice> = {}): RingNotice => ({
+  id: 'notice_1',
+  callId: 'call_1',
+  callerName: 'Alex',
+  callerNumber: '+61491570006',
+  at: NOW,
+  text: 'Someone asked for you. No device is set up to take a transfer, so they were offered a message.',
+  ...n,
+});
 
 let host: HTMLDivElement;
 let root: Root;
@@ -60,8 +70,9 @@ beforeEach(() => {
   host = document.createElement('div');
   document.body.appendChild(host);
   root = createRoot(host);
-  api.active.mockResolvedValue([]);
+  api.active.mockResolvedValue({ rings: [], notices: [] });
   api.respond.mockResolvedValue({ ok: true, note: '' });
+  api.dismiss.mockResolvedValue({ ok: true });
 });
 afterEach(async () => {
   await act(async () => root.unmount());
@@ -170,6 +181,37 @@ describe('the ring dialog', () => {
     await click(button('Decline'));
     expect(host.querySelector('[role=alert]')?.textContent).toContain('the ring is over');
     expect(button('Decline').disabled).toBe(false);
+  });
+
+  it('tells the owner, without a ring, that someone asked for them when no device is set up, and lets them dismiss it or go and set one up', async () => {
+    api.active.mockResolvedValue({ rings: [], notices: [notice()] });
+    await mount();
+    expect(host.querySelector('.ring-dialog')).toBeNull();
+    const stack = host.querySelector('[role=status].ring-notices')!;
+    expect(stack.textContent).toContain('Alex asked for you.');
+    expect(stack.textContent).toContain('No device is set up to take a transfer, so they were offered a message.');
+    expect(button('Accept')).toBeUndefined();
+    await click(button('Set up a Companion'));
+    expect(api.openSetup).toHaveBeenCalledWith({ plugin: 'aokie', step: 'pair' });
+    await click(button('Dismiss'));
+    expect(api.dismiss).toHaveBeenCalledWith('notice_1');
+    expect(host.querySelector('.ring-notices')).toBeNull();
+    // A look that was already on its way and still lists it does not bring it back.
+    await act(async () => {
+      vi.advanceTimersByTime(POLL_MS + 10);
+    });
+    await settle();
+    expect(host.querySelector('.ring-notices')).toBeNull();
+  });
+
+  it('shows a notice as plain text and a hidden number as such, beside a ring that is going', async () => {
+    api.active.mockResolvedValue({ rings: [ringing({})], notices: [notice({ callerName: '<b>Alex</b>', id: 'n2' }), notice({ callerName: '', callerNumber: '', id: 'n3' })] });
+    await mount();
+    expect(host.querySelector('.ring-dialog')).not.toBeNull();
+    const stack = host.querySelector('.ring-notices')!;
+    expect(stack.querySelector('b')).toBeNull();
+    expect(stack.textContent).toContain('<b>Alex</b> asked for you.');
+    expect(stack.textContent).toContain('A caller who hid their number asked for you.');
   });
 
   it('is nothing at all while there is no phone', async () => {

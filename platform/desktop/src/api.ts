@@ -1728,13 +1728,29 @@ export interface ActiveRing {
   note: string;
 }
 
+/** Somebody asked for the owner and nobody could be rung, for want of a device set up to take a transfer. */
+export interface RingNotice {
+  id: string;
+  callId: string;
+  callerName: string;
+  callerNumber: string;
+  /** Unix milliseconds, by the desktop's clock. */
+  at: number;
+  text: string;
+}
+
 export const ring = {
   settings: () => request<{ settings: RingSettings; features: RingFeatures }>('/api/ring/settings'),
   /** Change some settings (any of them; `quietHours` and `limits` member by member). */
   save: (change: Partial<Omit<RingSettings, 'quietHours' | 'limits'>> & { quietHours?: Partial<QuietHours>; limits?: Partial<RingSettings['limits']> }) =>
     request<{ settings: RingSettings; features: RingFeatures }>('/api/ring/settings', { method: 'PUT', body: JSON.stringify(change) }),
-  /** The rings going now (none most of the time). */
-  active: async () => (await request<{ rings: ActiveRing[] }>('/api/ring/active')).rings ?? [],
+  /** The rings going now (none most of the time), and the callers who asked for the owner when nothing could be rung. */
+  active: async () => {
+    const r = await request<{ rings?: ActiveRing[]; notices?: RingNotice[] }>('/api/ring/active');
+    return { rings: r.rings ?? [], notices: r.notices ?? [] };
+  },
+  /** The owner has read a notice. */
+  dismissNotice: (id: string) => request<{ ok: boolean }>(`/api/ring/notices/${encodeURIComponent(id)}/dismiss`, { method: 'POST' }),
   /** Answer one: `accept` asks the plugin to take it on the Companion, `decline` and `message` send the caller to the receptionist's message offer. */
   respond: (id: string, action: RingAction) =>
     request<{ ok: boolean; note: string }>(`/api/ring/active/${encodeURIComponent(id)}/respond`, { method: 'POST', body: JSON.stringify({ action }) }),

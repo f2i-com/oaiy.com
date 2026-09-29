@@ -18,6 +18,7 @@ const RANG_FROM: &str = "+61491570006";
 struct Bell {
     rang: Mutex<Vec<String>>,
     ended: Mutex<Vec<(String, String)>>,
+    noticed: Mutex<Vec<String>>,
 }
 
 impl RingNotifier for Bell {
@@ -26,6 +27,9 @@ impl RingNotifier for Bell {
     }
     fn ended(&self, id: &str, outcome: &str) {
         self.ended.lock().unwrap().push((id.to_string(), outcome.to_string()));
+    }
+    fn noticed(&self, notice: &crate::ring::Notice) {
+        self.noticed.lock().unwrap().push(notice.id.clone());
     }
 }
 
@@ -84,8 +88,14 @@ async fn serve(ring: Arc<Ring>) -> String {
 
 /// A call from Alex, whose phone says it can transfer, on a desktop whose owner is at the computer and set `settings`.
 async fn flow_with(settings: RingSettings, clock: Option<chrono::DateTime<chrono::FixedOffset>>) -> Flow {
+    flow_on(settings, clock, crate::ring::testing::at_the_pc()).await
+}
+
+/// ...with `devices` the Companions the owner approved (the Companion on this computer is what rings the owner at it).
+async fn flow_on(settings: RingSettings, clock: Option<chrono::DateTime<chrono::FixedOffset>>, devices: Arc<crate::ring::testing::Devices>) -> Flow {
     let ring = Ring::in_memory(settings);
     ring.set_presence(Arc::new(Here));
+    ring.set_devices(devices);
     if let Some(at) = clock {
         ring.set_clock(Arc::new(At(at)));
     }
@@ -149,6 +159,11 @@ impl Flow {
         let opened = PluginHost::ring_request(&self.ring, "oaiy.ring.opened", json!({"planId": plan["planId"], "requestId": request, "callId": self.aokie.call, "callEpoch": 1, "ownerEpoch": 1, "expiresAt": expires}));
         assert_eq!(opened.expect("the ring opened"), json!({"ok": true}));
         plan
+    }
+
+    async fn notices(&self) -> Vec<Value> {
+        let read: Value = reqwest::get(format!("{}/api/ring/active", self.base)).await.unwrap().json().await.unwrap();
+        read["notices"].as_array().unwrap().clone()
     }
 
     async fn dialog(&self) -> Vec<Value> {
@@ -367,6 +382,37 @@ async fn a_caller_who_talks_the_model_into_it_rings_nobody_even_when_the_plugin_
     assert!(f.dialog().await.is_empty());
     // And no try was counted for any of it.
     assert_eq!(tries(&f.aokie).global_attempts_last_hour, 0);
+}
+
+#[tokio::test]
+async fn in_the_default_setup_nobody_is_rung_for_want_of_a_device_the_owner_is_told_and_a_message_is_kept() {
+    // The owner at their computer, a phone approved, and no Companion ticked as this computer's: nothing a call can be offered to.
+    let devices = Arc::new(crate::ring::testing::Devices(vec![crate::ring::testing::android("ph1")]));
+    let mut f = flow_on(owner_settings(true), None, devices).await;
+    f.caller_says(ASKED);
+    let answer = answer_of(asking(&f.aokie, transfer::TOOL, json!({"reason": "caller_asked"}))).await.unwrap();
+    assert_eq!((answer["ok"].clone(), answer["output"]["status"].clone(), answer["output"]["reason"].clone()), (json!(false), json!("unavailable"), json!("no_device")), "{answer}");
+    assert!(answer["output"]["instruction"].as_str().unwrap().contains("take a message"), "{answer}");
+    assert!(f.aokie.text("formlogic.realtime.tool_call", Duration::from_millis(300)).await.is_none(), "nothing reached the phone");
+    // The plugin asking is answered the same way, so it opens nothing.
+    let plan = PluginHost::ring_request(&f.ring, "oaiy.ring.plan", json!({"callId": f.aokie.call, "reason": "caller_asked", "recentCallerTurns": [ASKED]})).unwrap();
+    assert_eq!((plan["decision"].as_str(), plan["reason"].as_str()), (Some("message_only"), Some("no_device")), "{plan}");
+    assert!(plan["phones"].as_array().unwrap().is_empty() && plan["desktopCompanions"].as_array().unwrap().is_empty());
+    // No try was spent, no ring is shown, and the owner is told what happened and why.
+    assert_eq!(tries(&f.aokie).global_attempts_last_hour, 0);
+    assert!(f.dialog().await.is_empty() && f.bell.rang.lock().unwrap().is_empty());
+    let notices = f.notices().await;
+    assert_eq!(notices.len(), 1);
+    assert!(notices[0]["text"].as_str().unwrap().contains("No device is set up to take a transfer"), "{}", notices[0]);
+    assert_eq!((notices[0]["callerName"].as_str(), notices[0]["callerNumber"].as_str()), (Some("Alex"), Some(RANG_FROM)));
+    assert_eq!(f.bell.noticed.lock().unwrap().len(), 1, "a notification was asked for");
+    // The caller is offered a message and it is kept.
+    assert!(f.takes_a_message("Please ring me back.").is_ok());
+    assert_eq!(f.kept().len(), 1);
+    // Setting the Companion on this computer up is all it takes: the same call then rings.
+    f.ring.set_devices(crate::ring::testing::at_the_pc());
+    f.ring_through("assist_1", 30).await;
+    assert_eq!(f.dialog().await.len(), 1);
 }
 
 #[tokio::test]

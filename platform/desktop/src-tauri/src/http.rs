@@ -1943,6 +1943,7 @@ mod tests {
         for (m, path) in [
             (Method::PUT, "/api/ring/settings"),
             (Method::POST, "/api/ring/active/assist_1/respond"),
+            (Method::POST, "/api/ring/notices/notice_1/dismiss"),
             (Method::PATCH, "/api/messages/msg_1"),
             (Method::DELETE, "/api/messages/msg_1"),
             (Method::POST, "/api/messages"),

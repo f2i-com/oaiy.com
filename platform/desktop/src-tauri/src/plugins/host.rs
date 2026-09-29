@@ -2615,6 +2615,7 @@ mod tests {
         let ring = crate::ring::Ring::in_memory(crate::ring::RingSettings { enabled: true, ..Default::default() });
         ring.set_calls(Arc::new(OneCall));
         ring.set_presence(Arc::new(Here));
+        ring.set_devices(crate::ring::testing::at_the_pc());
         ring
     }
 

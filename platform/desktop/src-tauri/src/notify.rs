@@ -35,6 +35,15 @@ impl RingNotifier for GuiRing {
     }
 
     fn ended(&self, _id: &str, _outcome: &str) {}
+
+    /// Somebody asked for the owner and no device was set up to take a transfer: told, without bringing the window up
+    /// (nothing rings, and there is nothing to answer).
+    fn noticed(&self, notice: &crate::ring::Notice) {
+        let body = format!("{} asked for you. No device is set up to take a transfer, so they were offered a message.", who(&notice.caller_name, &notice.caller_number));
+        if let Err(e) = self.0.notification().builder().title("Someone asked for you").body(body).show() {
+            log::warn!("ring: the notification could not be shown: {e}");
+        }
+    }
 }
 
 /// The notification for a message.

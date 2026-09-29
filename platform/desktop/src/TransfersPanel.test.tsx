@@ -7,7 +7,8 @@ import { createRoot, type Root } from 'react-dom/client';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import type { RingSettings } from './api';
 
-const api = vi.hoisted(() => ({ settings: vi.fn(), save: vi.fn(), status: vi.fn() }));
+const api = vi.hoisted(() => ({ settings: vi.fn(), save: vi.fn(), status: vi.fn(), openSetup: vi.fn() }));
+vi.mock('./useSetupState', () => ({ openSetup: (...a: unknown[]) => api.openSetup(...a) }));
 vi.mock('./api', async (importOriginal) => {
   const real = await importOriginal<typeof import('./api')>();
   return {
@@ -98,7 +99,8 @@ describe('Transfers', () => {
     const help = host.querySelector('[aria-label="How a call is put through"]');
     expect(help).not.toBeNull();
     expect(help!.querySelector('summary')?.textContent).toBe('How a call is put through to you');
-    expect(help!.querySelectorAll('li').length).toBe(6);
+    expect(help!.querySelectorAll('li').length).toBe(7);
+    expect(help!.textContent).toContain('Nothing rings unless a Companion is set up to take the call');
     const said = help!.textContent ?? '';
     expect(said).toContain('never that they are put through');
     expect(said).toContain('Accept, Decline and Take a message instead');
@@ -176,6 +178,50 @@ describe('Transfers', () => {
     await click(pixel.querySelectorAll('input')[1]);
     await click(saveButton());
     expect(api.save.mock.calls[0][0]).toMatchObject({ windowsCompanions: ['thumb-pc'], excludedDevices: ['thumb-pixel'] });
+  });
+
+  const PIXEL = { deviceId: 'd1', displayName: 'Pixel 6', endpointKey: { thumbprint: 'thumb-pixel' }, approvedAt: '2026-09-01T00:00:00Z' };
+  const OFFICE = { deviceId: 'd2', displayName: 'Office PC', endpointKey: { thumbprint: 'thumb-pc' }, approvedAt: '2026-09-01T00:00:00Z' };
+  const approve = (...approvedMobiles: unknown[]) =>
+    api.status.mockResolvedValue({ approvedMobiles, pendingApprovals: [], available: true, rosterRevision: 2, rosterHash: 'h', remoteAccessReady: true });
+  const on = (change: Partial<RingSettings> = {}) => {
+    const settings = { ...OFF, enabled: true, takeMessages: true, ...change };
+    api.settings.mockResolvedValue({ settings, features: features(settings) });
+  };
+  const warning = () => host.querySelector('[data-testid=nothing-would-ring]');
+
+  it('warns, with a way to set one up, when transfers are on and no Companion is approved', async () => {
+    on();
+    await mount();
+    expect(warning()?.textContent).toContain('No Companion is approved yet, so nothing can ring and every caller is offered a message.');
+    await click([...warning()!.querySelectorAll('button')].find((b) => b.textContent === 'Set up a Companion')!);
+    expect(api.openSetup).toHaveBeenCalledWith({ plugin: 'aokie', step: 'pair' });
+  });
+
+  it('warns that nothing rings at this computer when a phone is approved and none is ticked as this computer’s, and stops once it is', async () => {
+    on();
+    approve(PIXEL, OFFICE);
+    await mount();
+    expect(warning()?.textContent).toContain('While you are at this computer nothing rings');
+    expect(warning()?.textContent).toContain('Tick “This is the Companion on this computer”');
+    const office = [...host.querySelectorAll('.transfers-devices li')].find((li) => li.textContent?.includes('Office PC'))!;
+    // A choice not yet saved is not what the desktop does: the warning is about what is saved.
+    await click(office.querySelectorAll('input')[0]);
+    expect(warning()).not.toBeNull();
+    await click(saveButton());
+    expect(warning()).toBeNull();
+  });
+
+  it('says nothing while transfers are off, while devices are still being looked for, or when something rings', async () => {
+    approve(PIXEL);
+    await mount();
+    expect(warning()).toBeNull();
+    await act(async () => root.unmount());
+    root = createRoot(host);
+    // A phone that rings whether the owner is at the computer or away.
+    on({ phoneRing: 'always' });
+    await mount();
+    expect(warning()).toBeNull();
   });
 
   it('says how to pair a Companion when there is none', async () => {

@@ -29,13 +29,24 @@ pub fn router(ring: Arc<Ring>) -> Router {
         .route("/api/ring/settings", get(get_settings).put(put_settings))
         .route("/api/ring/active", get(active))
         .route("/api/ring/active/:id/respond", post(respond))
+        .route("/api/ring/notices/:id/dismiss", post(dismiss))
         .with_state(ring)
 }
 
-/// `GET /api/ring/active` → `{rings}`: the callers the receptionist is trying to reach the owner for now (see
-/// [`super::session::ActiveRing`]); the dashboard's dialog asks every second while it is visible.
+/// `GET /api/ring/active` → `{rings, notices}`: the callers the receptionist is trying to reach the owner for now (see
+/// [`super::session::ActiveRing`]), and the callers who asked for the owner when no device was set up to take a
+/// transfer ([`super::session::Notice`]); the dashboard's dialog asks every second while it is visible.
 async fn active(State(ring): State<Arc<Ring>>) -> Json<Value> {
-    Json(json!({"rings": ring.active()}))
+    Json(json!({"rings": ring.active(), "notices": ring.notices()}))
+}
+
+/// `POST /api/ring/notices/:id/dismiss` → `{ok}`: the owner has read a notice. A notice that is gone is a 404.
+async fn dismiss(State(ring): State<Arc<Ring>>, Path(id): Path<String>) -> Response {
+    if ring.dismiss_notice(&id) {
+        Json(json!({"ok": true})).into_response()
+    } else {
+        (StatusCode::NOT_FOUND, Json(json!({"error": {"code": "no_notice", "message": "that notice is gone"}}))).into_response()
+    }
 }
 
 #[derive(serde::Deserialize)]

@@ -397,6 +397,7 @@ fn a_reason_is_named_as_the_wire_names_it() {
         PlanReason::QuietHours,
         PlanReason::AllDoNotDisturb,
         PlanReason::NoEndpoint,
+        PlanReason::NoDevice,
     ] {
         assert_eq!(serde_json::to_value(reason).unwrap(), json!(reason.as_str()));
     }

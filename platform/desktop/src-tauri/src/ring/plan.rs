@@ -95,6 +95,9 @@ pub enum PlanReason {
     QuietHours,
     AllDoNotDisturb,
     NoEndpoint,
+    /// The plan would have rung this computer's toast and nothing a call can be offered to: this desktop's own
+    /// reason, not the reference's (see `Ring::decide`). Nothing is rung and no try is counted.
+    NoDevice,
 }
 
 impl PlanReason {
@@ -112,6 +115,7 @@ impl PlanReason {
             PlanReason::QuietHours => "quiet_hours",
             PlanReason::AllDoNotDisturb => "all_do_not_disturb",
             PlanReason::NoEndpoint => "no_endpoint",
+            PlanReason::NoDevice => "no_device",
         }
     }
 }
@@ -248,7 +252,7 @@ pub struct RingPlan {
 }
 
 impl RingPlan {
-    fn refuse(reason: PlanReason, decision: Decision) -> RingPlan {
+    pub(crate) fn refuse(reason: PlanReason, decision: Decision) -> RingPlan {
         RingPlan { decision, reason, ring_seconds: 0, phones: Vec::new(), wake: Vec::new(), desktop_toast: false, desktop_companions: Vec::new() }
     }
 

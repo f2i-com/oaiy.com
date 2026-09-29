@@ -96,6 +96,15 @@ switches are **off** until you turn them on, and with them off the phone answers
   needs the Companion's consent for taking calls (the Phone page). Until you take it the caller
   is never told they are being put through; once you have, they hear "Connecting you now" and the
   receptionist says nothing more.
+- **It needs a device.** A notification on this computer is not something a call can be offered
+  to: the phone plugin offers a transfer only to the Companions the plan names. So a ring happens
+  only when you have set one up: tick **This is the Companion on this computer** (Transfers page)
+  for the Companion that runs here, which is the one that rings while you are at your computer,
+  and/or approve a Companion on a second phone, which rings when you are away (or always, if you
+  say so). With none, nothing rings: the caller is offered a message, no try is used up, and you are
+  told, by a notification and a note on this window, "Someone asked for you. No device is set up to
+  take a transfer, so they were offered a message." The Transfers page warns you when **Transfer
+  calls to me** is on and nothing would ring.
 - **Take messages.** The receptionist keeps a message from a caller who wants to leave one, or
   when nobody could take the call. It is on whenever transfers are: taking a message is what a
   transfer nobody answers falls back to, always.
@@ -107,7 +116,7 @@ What happens, every way it can go:
 | accepts on the Companion | "Connecting you now, one moment." then you. If it cannot be connected, "I'm sorry, I couldn't connect you. Would you like to leave a message?" |
 | declines (on the Companion or here) | the receptionist, kindly: they cannot come to the phone, and an offer to take a message. If you left words for the caller they are relayed faithfully, with no promise added |
 | does not answer in time | the same offer of a message |
-| is not to be rung (quiet hours, nobody at the computer and no phone to ring, every phone on do-not-disturb, no Companion, no consent) | the same offer, and nothing rings |
+| is not to be rung (quiet hours, nobody at the computer and no phone to ring, every phone on do-not-disturb, no Companion set up to take a call, no consent) | the same offer, and nothing rings |
 | asked again too soon or too often | the same offer; nothing rings |
 
 The receptionist never promises a callback time, never says why you are not available, and has no

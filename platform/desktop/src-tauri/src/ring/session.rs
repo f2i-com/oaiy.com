@@ -39,6 +39,8 @@ pub trait RingNotifier: Send + Sync {
     fn ringing(&self, ring: &ActiveRing);
     /// The ring is over, and how it came out.
     fn ended(&self, id: &str, outcome: &str);
+    /// Somebody asked for the owner and nobody could be rung, because no device is set up to take a transfer.
+    fn noticed(&self, _notice: &Notice) {}
 }
 
 /// What asks the phone plugin to take (or drop) a request on the owner's behalf.
@@ -99,10 +101,33 @@ pub struct Ended {
     pub source: &'static str,
 }
 
+/// What the owner is told when somebody asked for them and no ring could be made for want of a device.
+pub const NO_DEVICE_TEXT: &str = "Someone asked for you. No device is set up to take a transfer, so they were offered a message.";
+/// The most notices kept, and how long each is shown (milliseconds).
+const NOTICES_KEPT: usize = 5;
+const NOTICE_MS: u64 = 15 * 60 * 1000;
+/// The native notification for one is raised at most this often.
+const NOTICE_TOAST_EVERY: Duration = Duration::from_secs(10 * 60);
+
+/// Somebody asked for the owner and nobody could be rung: not a ring, only the owner's word that their setup could not do it.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct Notice {
+    pub id: String,
+    pub call_id: String,
+    pub caller_name: String,
+    pub caller_number: String,
+    /// Unix milliseconds.
+    pub at: u64,
+    pub text: String,
+}
+
 #[derive(Default)]
 pub struct Sessions {
     live: Vec<Live>,
     ended: VecDeque<Ended>,
+    notices: VecDeque<Notice>,
+    last_toast: Option<std::time::Instant>,
 }
 
 /// What the owner can do with a ring.
@@ -244,6 +269,47 @@ impl Ring {
     pub fn outcome_seen(&self, request: &str, outcome: Outcome, source: &'static str) {
         let source = if source == "watchdog" { "timer" } else if source == "desktop" { "desktop" } else { "phone" };
         self.resolve(request, outcome, source);
+    }
+
+    /// Somebody asked for the owner and the plan had nobody to ring: told once a call, and shown until dismissed or a while has
+    /// passed. The native notification is raised at most every ten minutes, so a caller who rings again and again cannot make
+    /// the owner's computer chime for ever; the notice itself is always kept.
+    pub(super) fn note_no_device(&self, call: &str, info: &super::host::CallInfo) {
+        let now = self.now_ms();
+        let notice = {
+            let mut sessions = self.sessions.lock().unwrap_or_else(|e| e.into_inner());
+            sessions.notices.retain(|n| now.saturating_sub(n.at) < NOTICE_MS);
+            if sessions.notices.iter().any(|n| n.call_id == call) {
+                return;
+            }
+            let notice = Notice { id: format!("notice_{}", &uuid::Uuid::new_v4().simple().to_string()[..12]), call_id: call.to_string(), caller_name: info.name.trim().to_string(), caller_number: info.from.trim().to_string(), at: now, text: NO_DEVICE_TEXT.to_string() };
+            sessions.notices.push_back(notice.clone());
+            while sessions.notices.len() > NOTICES_KEPT {
+                sessions.notices.pop_front();
+            }
+            let toast = sessions.last_toast.is_none_or(|at| at.elapsed() >= NOTICE_TOAST_EVERY);
+            if toast {
+                sessions.last_toast = Some(std::time::Instant::now());
+            }
+            toast.then_some(notice)
+        };
+        if let (Some(notice), Some(notifier)) = (notice, self.notifier()) {
+            notifier.noticed(&notice);
+        }
+    }
+
+    /// The notices still shown, oldest first.
+    pub fn notices(&self) -> Vec<Notice> {
+        let now = self.now_ms();
+        self.sessions.lock().unwrap_or_else(|e| e.into_inner()).notices.iter().filter(|n| now.saturating_sub(n.at) < NOTICE_MS).cloned().collect()
+    }
+
+    /// The owner has read a notice. Whether there was one.
+    pub fn dismiss_notice(&self, id: &str) -> bool {
+        let mut sessions = self.sessions.lock().unwrap_or_else(|e| e.into_inner());
+        let before = sessions.notices.len();
+        sessions.notices.retain(|n| n.id != id);
+        sessions.notices.len() != before
     }
 
     /// The rings going now, oldest first.

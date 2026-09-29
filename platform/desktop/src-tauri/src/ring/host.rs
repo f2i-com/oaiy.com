@@ -288,7 +288,15 @@ impl Ring {
             now: Now::of(&local),
             settings: effective,
         };
-        plan(&inputs)
+        let plan = plan(&inputs);
+        // The reference rings this computer's toast on its own (its vector V01: the owner at the PC). But a toast is not
+        // somebody a call can be offered to: the phone plugin offers a transfer only to the devices a plan names, so a plan
+        // that names none opens nothing, and a try counted for it would be spent for a ring that cannot happen. Decided
+        // here, before anything is counted: the caller is offered a message, and the owner is told why nobody rang.
+        if plan.rings() && plan.targets().is_empty() {
+            return RingPlan::refuse(PlanReason::NoDevice, Decision::MessageOnly);
+        }
+        plan
     }
 
     /// Whether a request to reach the owner on `call` is allowed: judged on what this desktop heard
@@ -304,6 +312,9 @@ impl Ring {
 
     fn judge(&self, call: &str, reason: Reason, info: CallInfo, settings: &RingSettings) -> Authorised {
         let plan = self.decide(call, reason, &info, settings);
+        if plan.reason == PlanReason::NoDevice {
+            self.note_no_device(call, &info);
+        }
         let mut plan_id = None;
         if plan.decision == Decision::Ring {
             let now_unix = self.clock().unix();

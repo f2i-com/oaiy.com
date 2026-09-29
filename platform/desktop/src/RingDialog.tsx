@@ -1,7 +1,8 @@
 import { useCallback, useEffect, useRef, useState } from 'react';
 import { MessageSquareText, Phone, PhoneOff } from 'lucide-react';
-import { ring as api, type ActiveRing, type RingAction } from './api';
+import { ring as api, type ActiveRing, type RingAction, type RingNotice } from './api';
 import { readableNumber } from './contactsModel';
+import { openSetup } from './useSetupState';
 import { useVisiblePoll } from './useVisiblePoll';
 
 /**
@@ -26,6 +27,9 @@ export function secondsLeft(ring: Pick<ActiveRing, 'expiresAt'>, now: number): n
 
 export default function RingDialog({ on = true }: { on?: boolean }) {
   const [rings, setRings] = useState<ActiveRing[]>([]);
+  /** Callers who asked for the owner when no device was set up to take a transfer: told, and dismissed by the owner. */
+  const [notices, setNotices] = useState<RingNotice[]>([]);
+  const [dismissed, setDismissed] = useState<string[]>([]);
   /** The desktop's clock less this window's, when it last answered: the countdown does not trust this window's clock. */
   const offset = useRef(0);
   const [tick, setTick] = useState(0);
@@ -39,9 +43,10 @@ export default function RingDialog({ on = true }: { on?: boolean }) {
   const look = useCallback(() => {
     if (!on) return;
     api.active().then(
-      (list) => {
+      ({ rings: list, notices: told }) => {
         if (list.length) offset.current = list[0].now - Date.now();
         setRings(list);
+        setNotices(told);
       },
       () => {
         /* the desktop is away: what was shown stays until it says */
@@ -50,7 +55,10 @@ export default function RingDialog({ on = true }: { on?: boolean }) {
   }, [on]);
   useVisiblePoll(look, POLL_MS);
   useEffect(() => {
-    if (!on) setRings([]);
+    if (!on) {
+      setRings([]);
+      setNotices([]);
+    }
   }, [on]);
 
   // The countdown: twice a second while something rings.
@@ -85,14 +93,45 @@ export default function RingDialog({ on = true }: { on?: boolean }) {
     }
   };
 
+  const told = notices.filter((n) => !dismissed.includes(n.id));
+  const dismiss = (id: string) => {
+    setDismissed((ids) => [...ids.slice(-20), id]);
+    void api.dismissNotice(id).catch(() => {
+      /* it was already gone */
+    });
+  };
+  const noticeStack = told.length > 0 && (
+    <div className="ring-notices" role="status" aria-live="polite">
+      {told.map((n) => (
+        <div className="ring-notice" key={n.id}>
+          <p>
+            <strong>{n.callerName || readableNumber(n.callerNumber) || 'A caller who hid their number'}</strong> asked for you.
+          </p>
+          <p>{n.text}</p>
+          <div className="ring-notice-actions">
+            <button type="button" className="btn-tiny" onClick={() => openSetup({ plugin: 'aokie', step: 'pair' })}>
+              Set up a Companion
+            </button>
+            <button type="button" className="btn-tiny" onClick={() => dismiss(n.id)}>
+              Dismiss
+            </button>
+          </div>
+        </div>
+      ))}
+    </div>
+  );
+
   void tick;
-  if (!on || !shown) return null;
+  if (!on) return null;
+  if (!shown) return noticeStack || null;
   const left = secondsLeft(shown, now);
   const total = Math.max(1, Math.round((shown.expiresAt - shown.startedAt) / 1000));
   const who = shown.callerName || readableNumber(shown.callerNumber) || 'A caller who hid their number';
   const said = shown.said.filter((s) => s.trim()).slice(-2);
   const note = notes[shown.id] || shown.note;
   return (
+    <>
+    {noticeStack}
     <div className="ring-overlay">
       <div className="ring-dialog" role="alertdialog" aria-modal="true" aria-labelledby="ring-title" aria-describedby="ring-who">
         <h2 id="ring-title">
@@ -140,5 +179,6 @@ export default function RingDialog({ on = true }: { on?: boolean }) {
         )}
       </div>
     </div>
+    </>
   );
 }

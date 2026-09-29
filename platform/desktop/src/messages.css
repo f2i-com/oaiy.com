@@ -89,3 +89,9 @@
 .transfers-help details { border: 1px solid var(--border); border-radius: var(--r-card); padding: 8px 12px; }
 .transfers-help summary { cursor: pointer; font-size: 13px; font-weight: 600; }
 .transfers-help ol { margin: 8px 0 2px; padding-left: 20px; display: flex; flex-direction: column; gap: 5px; font-size: 12.5px; line-height: 1.45; color: var(--muted); }
+.ring-notices { position: fixed; right: 16px; bottom: 16px; z-index: 80; display: flex; flex-direction: column; gap: 8px; max-width: 360px; }
+.ring-notice { background: var(--surface, #1f2933); border: 1px solid var(--border); border-radius: var(--r-card); padding: 10px 12px; font-size: 12.5px; line-height: 1.45; box-shadow: 0 6px 24px color-mix(in srgb, #000 30%, transparent); }
+.ring-notice p { margin: 0 0 4px; }
+.ring-notice-actions { display: flex; gap: 8px; margin-top: 6px; }
+.transfers-warning { display: flex; align-items: flex-start; flex-wrap: wrap; gap: 6px 10px; border: 1px solid var(--warn, #b7791f); border-radius: var(--r-card); padding: 8px 12px; font-size: 12.5px; line-height: 1.45; }
+.transfers-warning span { flex: 1 1 260px; }

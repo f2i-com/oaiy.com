@@ -2452,6 +2452,7 @@ mod tests {
         let mut aokie = Aokie::start_with(fields, move |hub| {
             let ring = crate::ring::Ring::in_memory(settings);
             ring.set_presence(Arc::new(Here));
+            ring.set_devices(crate::ring::testing::at_the_pc());
             hub.set_ring(ring);
             hub.set_transfer_timing(quick());
         })
@@ -2628,6 +2629,7 @@ mod tests {
         let mut aokie = Aokie::start_with(json!({"allowTransfer": true, "from": "+61491570006"}), move |hub| {
             let ring = crate::ring::Ring::in_memory(settings);
             ring.set_presence(Arc::new(Here));
+            ring.set_devices(crate::ring::testing::at_the_pc());
             ring.set_clock(Arc::new(At(late)));
             hub.set_ring(ring);
         })

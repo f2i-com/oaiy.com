@@ -1,6 +1,8 @@
 import { useCallback, useEffect, useMemo, useState } from 'react';
 import { Check, Loader2, TriangleAlert } from 'lucide-react';
 import { companion, isNotFound, ring, type CompanionApproved, type RingFeatures, type RingSettings } from './api';
+import { nothingWouldRing } from './transfersModel';
+import { openSetup } from './useSetupState';
 import { useVisiblePoll } from './useVisiblePoll';
 
 /**
@@ -129,6 +131,8 @@ export default function TransfersPanel() {
   }
 
   const on = current.enabled;
+  // What is saved is what rings: a warning about a setting not yet saved would say something the desktop is not doing.
+  const nothingRings = saved ? nothingWouldRing(saved, devices) : null;
   return (
     <div className="panel transfers-page">
       <section className="model-section">
@@ -158,6 +162,15 @@ export default function TransfersPanel() {
             </small>
           </span>
         </label>
+        {nothingRings && (
+          <div className="transfers-warning" data-testid="nothing-would-ring">
+            <TriangleAlert size={14} aria-hidden />
+            <span>{nothingRings}</span>
+            <button type="button" className="btn-tiny" onClick={() => openSetup({ plugin: 'aokie', step: 'pair' })}>
+              Set up a Companion
+            </button>
+          </div>
+        )}
         {features && (
           <p className="form-hint" data-testid="what-it-may-do">
             Now: {features.transfer ? 'the receptionist may try to reach you' : 'it does not try to reach you'}; {features.messages ? 'it takes messages' : 'it takes no messages'}.
@@ -173,6 +186,10 @@ export default function TransfersPanel() {
             <li>
               This computer rings (a notification, and a box on this window with Accept, Decline and Take a message instead), and so does the Companion on this computer
               or on a second phone. Whoever answers first takes the call.
+            </li>
+            <li>
+              Nothing rings unless a Companion is set up to take the call: tick the one that runs on this computer (below), or approve one on a second phone. With none, callers are
+              offered a message and you are told someone asked for you.
             </li>
             <li>The receptionist stops speaking, tells the caller it is connecting them, and you talk to the caller. The receptionist does not come back unless you hand the call back.</li>
             <li>
