@@ -13,24 +13,33 @@
  *
  * Node has WebCrypto but no IndexedDB, so the vault is handed a small IndexedDB
  * of this file's own (serial transactions, structured clones, and the failures a
- * browser gives: a refused write, a database that will not open or never
- * answers, a store wiped under a live page). What is checked:
+ * browser gives: a refused write, a database that will not open, a request that
+ * hangs until it is released, a store wiped under a live page). What is checked:
  *
  *   - a seal and unseal round trip, across a page load; the stored bytes are
  *     ciphertext, one record per secret, under a key that cannot be exported;
  *   - the move from plaintext: every value sealed, read back and opened before
  *     the plaintext is removed, and the plaintext wins where both name a secret;
  *   - sealing that cannot be done (no IndexedDB, no WebCrypto, the database
- *     refusing to open, a refused write, a read back that does not match, a store
- *     that never answers, a plaintext that cannot be removed) loses no key: the
- *     plaintext stays, reads and writes go on through it, and it is said once;
+ *     refusing to open, a read back that does not match, a store that never
+ *     answers, a plaintext that cannot be removed) loses no key: the plaintext
+ *     stays, reads and writes go on through it, and it is said once;
+ *   - a store that can be read but refuses writes (a full disk) stays in use: a
+ *     key sealed before is never hidden, what could not be moved stays in
+ *     plaintext, laid over the store, and the next load moves it;
+ *   - a key deleted while the store could not be used is deleted there at the
+ *     next load, and a move the page gave up on writes nothing more;
+ *   - a store that hangs does not hold a read or a save up for ever, and a
+ *     connection the browser closed is replaced;
  *   - a wiped key store, a wiped database, a damaged record: nothing throws;
  *   - overlapping saves keep every key; two tabs starting together share one key;
+ *   - what the vault says: a warning without a detail is one console argument,
+ *     and no warning carries a key's value;
  *   - the shim's `get_secrets` / `store_secret` (core.ts) are the vault's, and
  *     the editor starts it.
  *
- * The real IndexedDB is a browser's: see the browser check in the commit that
- * added this (Chromium against `vite preview`), which is not part of `npm test`.
+ * The real IndexedDB is a browser's: tests/e2e.mjs checks the sealed store in
+ * Chromium (against `vite preview`), which is not part of `npm test`.
  * The modules are TypeScript with aliases only the bundler resolves, so they are
  * bundled for Node with esbuild (as flow-services.mjs does).
  */
