@@ -1414,13 +1414,16 @@ pub fn run() {
                 let link_for_http = crate::link::open_handle(data_dir_for_bridge.clone());
                 // Serve remote-control commands the linked provider queues for
                 // this machine. Without it every action a user takes on the
-                // provider's website expires as "no desktop picked it up".
+                // provider's website expires as "no desktop picked it up". The
+                // guarded dispatcher: a command for a plugin runs only if the
+                // relay policy lets the website run it (link/policy.rs).
                 crate::link::relay::spawn(
                     link_for_http.clone(),
-                    crate::link::ops::dispatcher(
+                    crate::link::ops::relay_dispatcher(
                         registry_for_http.clone(),
                         bridge_for_http.plugins.clone(),
                         bridge_for_http.host.clone(),
+                        crate::link::ops::RelayGuard::open(&data_dir_for_bridge),
                     ),
                 );
                 // Execute the flow runs the account has queued. The other half
@@ -1431,8 +1434,10 @@ pub fn run() {
                     link_for_http.clone(),
                     Some(node_for_http.clone()),
                     // A binding may ask for a connector command once its flow
-                    // answers — dial, send the SMS. Same dispatcher, same gate
-                    // as the relay's.
+                    // answers — dial, send the SMS. The plugin's own gate, as
+                    // for the relay's commands, but not the relay policy: this
+                    // is a flow this computer ran, not a command a website
+                    // queued (see `link::ops::dispatcher`).
                     Some(crate::link::ops::dispatcher(
                         registry_for_http.clone(),
                         bridge_for_http.plugins.clone(),

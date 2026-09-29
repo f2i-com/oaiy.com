@@ -35,6 +35,10 @@ use super::{LinkHandle, LinkedAccount};
 /// The key is the relayed command's own id. It matters: a plugin refuses any
 /// side-effecting command that arrives without one, precisely so that a
 /// redelivered command cannot answer the call or send the message twice.
+///
+/// What a relayed command may reach is the dispatcher's to decide, so the relay
+/// is always given [`super::ops::relay_dispatcher`], which asks the relay policy
+/// first.
 pub type Dispatcher =
     Arc<dyn Fn(&str, &str, &Value, &str) -> Result<Value, String> + Send + Sync>;
 
@@ -576,5 +580,63 @@ mod tests {
             path.replace("{id}", "cmd_1"),
             "/api/v1/connector-commands/cmd_1/claim"
         );
+    }
+
+    #[test]
+    fn a_command_the_policy_refuses_reaches_the_provider_as_a_failure_in_its_own_words() {
+        // The whole path, from the provider's queue to the provider's page: a
+        // command that installs a driver is claimed, refused by the relay policy
+        // and reported as a completion with status "failed", carrying the sentence
+        // the person is to read. It is answered, so the lane is not blamed, and no
+        // plugin is involved at all (there is none here).
+        let dir = std::env::temp_dir().join(format!("oaiy-relay-refusal-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let plugins = crate::plugins::registry::new_handle(dir.join("plugins"));
+        let triggers = Arc::new(std::sync::Mutex::new(crate::plugins::TriggerStore::load(
+            dir.join("triggers.json"),
+        )));
+        let host = crate::plugins::PluginHost::new(
+            plugins.clone(),
+            crate::bridge::ledger::new_handle(),
+            triggers,
+            crate::bridge::deadletters::open_handle(dir.join("deadletters.jsonl")),
+            "0.0.0-test".into(),
+            true,
+        );
+        let services = Arc::new(std::sync::Mutex::new(crate::services::registry::Registry::empty(
+            dir.join("data"),
+            dir.join("models"),
+        )));
+        let dispatch = crate::link::ops::relay_dispatcher(
+            services,
+            plugins,
+            host,
+            crate::link::ops::RelayGuard::new(
+                crate::link::policy::RelayPolicy::shipped(),
+                dir.join("relay-log.jsonl"),
+            ),
+        );
+
+        let (base, rx) = stub_relay(
+            r#"{"commands":[{"commandId":"c9","connectorId":"aokie","command":"dongle.installDriver","payload":{"vid":4660,"pid":22136}}]}"#,
+            "200 OK",
+        );
+        let (handled, trouble) = poll_once(&account(base), &spec(), "oaiy-test", &dispatch).unwrap();
+        assert_eq!(handled, 1);
+        assert_eq!(trouble, None, "a refused command is an answer, not a failing lane");
+
+        let _ = rx.recv().unwrap(); // the poll
+        let (claim, _) = rx.recv().unwrap();
+        assert!(claim.starts_with("POST /commands/c9/claim "), "{claim}");
+        let (complete, raw) = rx.recv().unwrap();
+        assert!(complete.starts_with("POST /commands/c9/complete "), "{complete}");
+        assert!(raw.contains("\"status\":\"failed\""), "{raw}");
+        assert!(raw.contains("dongle.installDriver"), "the command is named: {raw}");
+        assert!(raw.contains("can only be run from OAIY on this computer"), "{raw}");
+
+        let logged = std::fs::read_to_string(dir.join("relay-log.jsonl")).unwrap();
+        assert!(logged.contains("c9") && logged.contains("refused"), "{logged}");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

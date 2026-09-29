@@ -344,12 +344,15 @@ async fn main() {
         data_dir.join("companion").join("relay.json"),
     );
     let link = oaiy_desktop_lib::link::open_handle(data_dir.clone());
+    // The guarded dispatcher: a command for a plugin runs only if the relay
+    // policy lets the website run it (link/policy.rs).
     oaiy_desktop_lib::link::relay::spawn(
         link.clone(),
-        oaiy_desktop_lib::link::ops::dispatcher(
+        oaiy_desktop_lib::link::ops::relay_dispatcher(
             registry.clone(),
             bridge.plugins.clone(),
             bridge.host.clone(),
+            oaiy_desktop_lib::link::ops::RelayGuard::open(&data_dir),
         ),
     );
     // Execute the flow runs the account has queued. The other half of the flows
@@ -358,8 +361,10 @@ async fn main() {
     oaiy_desktop_lib::link::flow_runner::spawn(
         link.clone(),
         Some(node_runtime.clone()),
-        // A binding's post-run actions may call a connector, through the same
-        // dispatcher and gate the relay uses.
+        // A binding's post-run actions may call a connector, through the
+        // plugin's own gate as the relay's commands meet it, but not the relay
+        // policy: this is a flow this computer ran, not a command a website
+        // queued (see `link::ops::dispatcher`).
         Some(oaiy_desktop_lib::link::ops::dispatcher(
             registry.clone(),
             bridge.plugins.clone(),

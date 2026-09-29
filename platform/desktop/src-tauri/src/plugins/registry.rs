@@ -530,6 +530,12 @@ impl PluginRegistry {
         })
     }
 
+    /// The manifest of the plugin that serves `connector_id`: the one the gate
+    /// reads, so what is declared and journalled here is what the gate will see.
+    pub fn manifest_for_connector(&self, connector_id: &str) -> Option<&PluginManifest> {
+        self.owner_of(connector_id).and_then(|r| r.manifest.as_ref())
+    }
+
     /// Decide whether a connector command may be forwarded.
     ///
     /// Checked **before** the plugin is contacted, in the order the SDK contract
