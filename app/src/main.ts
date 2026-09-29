@@ -50,6 +50,7 @@ import { addOaiyOrigin, setIncognito } from './privacy';
 import { providerEndpoints, providerHeaders } from './agent/providers/providerConnection';
 import { canPickFolder, downloadZip, exportFolder, importFileList, importFolder, importZip, type Imported } from './vfs/transfer';
 import type { Vfs } from './vfs/vfs';
+import { isOutreachPath, readView } from './vfs/readView';
 
 const WELCOME: Array<[string, string]> = [
   [
@@ -539,6 +540,9 @@ async function main(): Promise<void> {
   async function openFrontDesk(): Promise<void> {
     frontDesk = await OpenProject.openFrontDesk();
     frontDesk.onError = notice;
+    // The Front desk's files as its calls, texts and flows' tasks see them: the outreach results (one
+    // customer's answers) are the runner's alone.
+    const deskView = readView(frontDesk.vfs, isOutreachPath);
     const own = (sessions = new Sessions(
       frontDesk,
       // A call or a text thread brings its own tools; a flow's task has the desktop's, as the project's agent does.
@@ -549,7 +553,13 @@ async function main(): Promise<void> {
         const options = deskOptions(kind);
         const given = tools ? () => [...(typeof tools === 'function' ? tools() : tools), ...flowTools] : options.sessionTools;
         const listed = () => (typeof given === 'function' ? given() : (given ?? []));
-        return new Agent({ ...options, ...extra, sessionTools: () => [...listed(), ...pluginTools(`session:${kind}`)] });
+        return new Agent({
+          ...options,
+          ...extra,
+          vfs: deskView,
+          projectSummary: () => summarizeProject(frontDesk.meta, deskView, gate),
+          sessionTools: () => [...listed(), ...pluginTools(`session:${kind}`)],
+        });
       },
       () => ({ ...messages, answer: messages.answer && holdsTexts }),
       () => desktop,
