@@ -223,9 +223,12 @@ pub fn serve<R: Runtime>(app: &AppHandle<R>, page: Page, request: &Request<Vec<u
 }
 
 /// What each embedded page knows from its first line: where the desktop is, a token for it, and the theme.
-fn desktop_script(theme: &str) -> String {
+/// The Agent's page also gets the secret its restore hand-over asks for (`backupToken`): no other page
+/// has it, and no route returns it.
+fn desktop_script(theme: &str, page: Page) -> String {
+    let backup = if page == Page::Agent { format!(", backupToken: {:?}", crate::backup::agent::page_token()) } else { String::new() };
     format!(
-        "window.__OAIY_DESKTOP__ = Object.freeze({{ origin: {origin:?}, token: {token:?}, theme: {theme:?} }});",
+        "window.__OAIY_DESKTOP__ = Object.freeze({{ origin: {origin:?}, token: {token:?}, theme: {theme:?}{backup} }});",
         origin = format!("http://127.0.0.1:{}", crate::DESKTOP_PORT),
         token = crate::internal_token(),
     )
@@ -399,7 +402,7 @@ fn builder<R: Runtime>(app: &AppHandle<R>, page: Page) -> WebviewBuilder<R> {
         url.query_pairs_mut().append_pair("in", "oaiy").append_pair("theme", first);
         WebviewBuilder::new(page.label(), WebviewUrl::External(url))
     } else {
-        WebviewBuilder::new(page.label(), WebviewUrl::CustomProtocol(page.url())).initialization_script(&desktop_script(first))
+        WebviewBuilder::new(page.label(), WebviewUrl::CustomProtocol(page.url())).initialization_script(&desktop_script(first, page))
     };
     made
         .additional_browser_args(BROWSER_ARGS)
@@ -475,8 +478,17 @@ mod tests {
     fn a_page_is_told_its_theme() {
         assert_eq!(parse_theme("light"), Some("light"));
         assert_eq!(parse_theme("sepia"), None);
-        assert!(desktop_script("light").contains(r#"theme: "light""#));
+        assert!(desktop_script("light", Page::Flows).contains(r#"theme: "light""#));
         assert_eq!(theme_script("dark"), r#"window.__oaiySetTheme ? window.__oaiySetTheme("dark") : (window.__OAIY_THEME__ = "dark");"#);
+    }
+
+    #[test]
+    fn only_the_agents_page_is_given_the_restore_secret() {
+        let secret = crate::backup::agent::page_token();
+        assert!(secret.len() >= 32, "a real secret");
+        assert!(desktop_script("dark", Page::Agent).contains(&format!("backupToken: {secret:?}")), "the Agent's page has it");
+        assert!(!desktop_script("dark", Page::Flows).contains("backupToken") && !desktop_script("dark", Page::Flows).contains(secret));
+        assert!(!desktop_script("dark", Page::Engines).contains(secret));
     }
 
     #[test]

@@ -14,7 +14,11 @@
 //! - **Import.** A restore that carries Agent storage leaves it in `<data>/restore/agent-import/`.
 //!   The page asks for it when it starts (before it opens any project), takes a snapshot of its
 //!   current storage for the undo (posted here, into the restore's undo folder), writes what the
-//!   backup holds, and says it is done.
+//!   backup holds, and says it is done. Every request of the import carries the page's own secret
+//!   ([`page_token`]): the desktop puts it in the page's first line (`window.__OAIY_DESKTOP__.backupToken`,
+//!   the Agent's page only) and no route ever returns it, so a caller that merely sets an `Origin`
+//!   header gets nothing. (It keeps out pages and programs that cannot read the Agent's window; a
+//!   program running as the person can read the data folder anyway.)
 //!
 //! No route here starts anything: sessions are opened only by the code that runs a backup.
 
@@ -334,8 +338,6 @@ pub struct ImportMeta {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub id: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub token: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
     pub kind: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub size: Option<u64>,
@@ -349,9 +351,9 @@ pub struct ImportMeta {
     pub apply: Option<ImportApply>,
 }
 
-/// The token the page uses for the import in this run of the app: a new one each start, so a
-/// token from an earlier run opens nothing.
-fn import_token() -> &'static str {
+/// The secret the Agent's page uses for the import in this run of the app: a new one each start, so
+/// one from an earlier run opens nothing. It is handed to the page in its first line and never returned by a route.
+pub(crate) fn page_token() -> &'static str {
     static TOKEN: OnceLock<String> = OnceLock::new();
     TOKEN.get_or_init(random_token)
 }
@@ -395,13 +397,12 @@ pub(crate) fn drop_pending_import(data_dir: &Path) {
     let _ = std::fs::remove_file(dir.join("current.zip"));
 }
 
-/// `GET /api/backup/agent-import`.
+/// `GET /api/backup/agent-import` (the route checks the page's token with [`page_token_matches`]).
 pub fn import_meta(data_dir: &Path) -> ImportMeta {
     match read_pending_import(data_dir) {
-        None => ImportMeta { pending: false, id: None, token: None, kind: None, size: None, sha256: None, parts: None, part_size: None, apply: None },
+        None => ImportMeta { pending: false, id: None, kind: None, size: None, sha256: None, parts: None, part_size: None, apply: None },
         Some(p) => ImportMeta {
             pending: true,
-            token: Some(import_token().to_string()),
             parts: Some(p.size.div_ceil(PART_SIZE as u64)),
             part_size: Some(PART_SIZE as u64),
             apply: Some(ImportApply { settings: p.apply_settings, keys: p.apply_keys }),
@@ -413,8 +414,13 @@ pub fn import_meta(data_dir: &Path) -> ImportMeta {
     }
 }
 
+/// Whether `token` is the secret this run of the app gave the Agent's page.
+pub fn page_token_matches(token: &str) -> bool {
+    token_eq(page_token(), token)
+}
+
 fn check_import(data_dir: &Path, id: &str, token: &str) -> Result<PendingImport, PartError> {
-    if !token_eq(import_token(), token) {
+    if !token_eq(page_token(), token) {
         return Err(PartError::Denied);
     }
     let pending = read_pending_import(data_dir).ok_or(PartError::Unknown)?;

@@ -14,7 +14,9 @@
 //! or out of a session or an import that such a command has already opened. All of them sit behind
 //! the desktop's origin guard (see `http.rs`); the hand-over routes are also for the Agent's own page
 //! only (its `Origin` must be the scheme the desktop serves it from, so a paired token or a page of
-//! the linked provider gets nothing), and they demand the session's own token in `X-Backup-Token`.
+//! the linked provider gets nothing), and they demand a secret in `X-Backup-Token`: the session's own
+//! for an export, and for an import the one the desktop put in the Agent's window (no route returns
+//! it, so setting an `Origin` header is not enough).
 
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -111,6 +113,9 @@ async fn export_done(Path(id): Path<String>, headers: HeaderMap, Json(done): Jso
 async fn import_meta(State(ctx): State<Ctx>, headers: HeaderMap) -> Response {
     if let Some(refused) = agent_page_only(&headers) {
         return refused;
+    }
+    if !agent::page_token_matches(&token_of(&headers)) {
+        return fail(StatusCode::FORBIDDEN, "wrong token");
     }
     let dir = ctx.data_dir.clone();
     match tokio::task::spawn_blocking(move || agent::import_meta(&dir)).await {

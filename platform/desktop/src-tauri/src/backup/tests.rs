@@ -1447,7 +1447,7 @@ fn a_restore_hands_the_agents_storage_to_its_page_and_takes_the_undo_snapshot_ba
     // The page asks, and is told what waits, how to fetch it and its token.
     let meta = agent::import_meta(&dst.0);
     assert!(meta.pending);
-    let (id, token, size) = (meta.id.clone().unwrap(), meta.token.clone().unwrap(), meta.size.unwrap());
+    let (id, token, size) = (meta.id.clone().unwrap(), agent::page_token().to_string(), meta.size.unwrap());
     assert_eq!(id, staged.id);
     assert_eq!(meta.kind.as_deref(), Some("restore"));
     assert_eq!(meta.part_size, Some(PART_SIZE as u64));
@@ -1487,9 +1487,9 @@ fn a_restore_hands_the_agents_storage_to_its_page_and_takes_the_undo_snapshot_ba
     assert!(matches!(restore::apply_pending(&dst.0), ApplyOutcome::Applied(_)));
     let meta = agent::import_meta(&dst.0);
     assert_eq!(meta.kind.as_deref(), Some("undo"));
-    assert_eq!(agent::import_part(&dst.0, meta.id.as_deref().unwrap(), meta.token.as_deref().unwrap(), 0).unwrap(), b"snapshot-part-0;snapshot-part-1");
-    assert_eq!(agent::undo_part(&dst.0, meta.id.as_deref().unwrap(), meta.token.as_deref().unwrap(), 0, b"x"), Err(PartError::Closed), "an undo takes no snapshot");
-    agent::import_done(&dst.0, meta.id.as_deref().unwrap(), meta.token.as_deref().unwrap(), false, Some("no room")).unwrap();
+    assert_eq!(agent::import_part(&dst.0, meta.id.as_deref().unwrap(), &token, 0).unwrap(), b"snapshot-part-0;snapshot-part-1");
+    assert_eq!(agent::undo_part(&dst.0, meta.id.as_deref().unwrap(), &token, 0, b"x"), Err(PartError::Closed), "an undo takes no snapshot");
+    agent::import_done(&dst.0, meta.id.as_deref().unwrap(), &token, false, Some("no room")).unwrap();
     let last = restore::last_restore(&dst.0).unwrap();
     assert_eq!(last.agent_storage, "failed");
     assert!(last.redo.iter().any(|r| r.contains("no room")));
@@ -1548,8 +1548,9 @@ async fn the_status_route_reports_and_the_hand_over_routes_need_their_tokens() {
     let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
     assert!(json["lastBackupAt"].is_null() && json["pendingRestore"].is_null() && json["undoAvailable"] == false);
 
-    // No import waits.
-    let (status, body) = call(&app, "GET", "/api/backup/agent-import", None, Vec::new()).await;
+    // No import waits (the page asks with the secret the desktop gave it; without it, nothing is answered).
+    assert_eq!(call(&app, "GET", "/api/backup/agent-import", None, Vec::new()).await.0, 403);
+    let (status, body) = call(&app, "GET", "/api/backup/agent-import", Some(agent::page_token()), Vec::new()).await;
     assert_eq!(status, 200);
     assert_eq!(serde_json::from_slice::<serde_json::Value>(&body).unwrap(), serde_json::json!({ "pending": false }));
 
@@ -1593,7 +1594,7 @@ async fn the_hand_over_routes_are_for_the_agents_own_page_only() {
     // The Agent's page, in each of its forms, is let in.
     for origin in ["http://oaiy.localhost", "https://oaiy.localhost", "oaiy://localhost"] {
         assert!(routes::is_agent_origin(origin));
-        assert_eq!(call_from(&app, "GET", "/api/backup/agent-import", None, Some(origin), Vec::new()).await.0, 200, "{origin}");
+        assert_eq!(call_from(&app, "GET", "/api/backup/agent-import", Some(agent::page_token()), Some(origin), Vec::new()).await.0, 200, "{origin}");
     }
     assert!(!routes::is_agent_origin("http://oaiy.localhost/") && !routes::is_agent_origin(""));
     // The status is not the Agent's alone: the dashboard reads it.
@@ -2743,4 +2744,49 @@ fn the_agents_part_of_a_restore_that_its_page_never_takes_is_dropped_after_a_day
     let reported = restore::last_restore(&dst.0).unwrap();
     assert_eq!(reported.agent_storage, "failed");
     assert!(reported.redo.iter().any(|r| r.contains("did not take them within a day")), "{reported:?}");
+}
+
+// ---- the import secret is not there for the asking --------------------------------------------------------
+
+#[tokio::test]
+async fn an_origin_header_alone_gets_nothing_of_the_agents_import() {
+    let src = TempDir::new("secret-src");
+    realistic(&src.0, "A");
+    let out = TempDir::new("secret-out");
+    let file = out.0.join("s.oaiybackup");
+    let page = Page { zip: agent_zip(), part_size: PART_SIZE, ok: true, warnings: vec![] };
+    make_with(&src.0, &file, PASS, false, Some(&page)).unwrap();
+    let dst = TempDir::new("secret-dst");
+    restore::stage(&dst.0, &file, PASS, &Ticks::all(), &options()).unwrap();
+    assert!(matches!(restore::apply_pending(&dst.0), ApplyOutcome::Applied(_)));
+    let app = routes::router(dst.0.clone());
+    let secret = agent::page_token().to_string();
+    let wrong = "x".repeat(secret.len());
+
+    // A caller that sets the Agent's origin and nothing else (a local program, or a page that forges it) is refused everywhere.
+    for origin in ["oaiy://localhost", "http://oaiy.localhost"] {
+        for token in [None, Some(""), Some("guess"), Some(wrong.as_str())] {
+            let (status, body) = call_from(&app, "GET", "/api/backup/agent-import", token, Some(origin), Vec::new()).await;
+            assert_eq!(status, 403, "{origin} {token:?}");
+            assert!(!String::from_utf8_lossy(&body).contains("current"), "nothing is described to it");
+            assert_eq!(call_from(&app, "GET", "/api/backup/agent-import/x/part/0", token, Some(origin), Vec::new()).await.0, 403);
+        }
+    }
+    // The description the page is given never carries the secret, nor anything like a token.
+    let (status, body) = call_from(&app, "GET", "/api/backup/agent-import", Some(&secret), Some("oaiy://localhost"), Vec::new()).await;
+    assert_eq!(status, 200);
+    let text = String::from_utf8_lossy(&body).into_owned();
+    assert!(!text.contains(&secret) && !text.to_lowercase().contains("token"), "{text}");
+    let meta: serde_json::Value = serde_json::from_str(&text).unwrap();
+    assert_eq!(meta["pending"], true);
+    // With the secret, the parts come; a session's own token (an export's) is not the import's.
+    let id = meta["id"].as_str().unwrap().to_string();
+    assert_eq!(call_from(&app, "GET", &format!("/api/backup/agent-import/{id}/part/0"), Some(&secret), Some("oaiy://localhost"), Vec::new()).await.0, 200);
+    let (_session, session_token) = agent::open_session(&dst.0.join("other.part"), 1 << 20).unwrap();
+    assert_eq!(call_from(&app, "GET", &format!("/api/backup/agent-import/{id}/part/0"), Some(&session_token), Some("oaiy://localhost"), Vec::new()).await.0, 403, "an export session's token is not the import's");
+    assert_eq!(call_from(&app, "GET", "/api/backup/agent-import", Some(&session_token), Some("oaiy://localhost"), Vec::new()).await.0, 403, "nor does it get the description");
+    assert!(!agent::page_token_matches(&session_token));
+    // And it is a secret of this run: 32 characters or more, made from the system's randomness.
+    assert!(secret.len() == 64 && secret.bytes().all(|b| b.is_ascii_hexdigit()), "{}", secret.len());
+    assert!(secret.chars().collect::<std::collections::HashSet<_>>().len() >= 6, "not a constant or a pattern");
 }
