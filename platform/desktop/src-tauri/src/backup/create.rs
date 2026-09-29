@@ -29,7 +29,14 @@ use super::{check_passphrase, free_space, Budget, hex, random_id, scratch_dir, B
 use crate::secret_file;
 
 /// Room to leave on a disk beyond what the backup needs.
-const MARGIN: u64 = 64 << 20;
+pub(crate) const MARGIN: u64 = 64 << 20;
+
+/// What the drive that holds OAIY's data needs before a backup starts: the working copy of the files,
+/// the ZIP made from them and the copy that is opened again to check it are each about the size of the
+/// data, and the ZIP has some overhead of its own. (The Agent's storage is added when its size is known.)
+pub(crate) fn data_drive_needed(planned: u64) -> u64 {
+    planned.saturating_mul(32) / 10 + MARGIN
+}
 
 /// What to back up, and where.
 pub struct CreateOptions<'a> {
@@ -130,7 +137,7 @@ fn run(opts: &CreateOptions<'_>) -> Result<CreateResult> {
     state::set_phase(Phase::Collecting, "Copying your files");
     let plan = rules::plan(opts.data_dir, opts.include_keys);
     let planned: u64 = plan.items.iter().map(|i| i.size).sum();
-    need((opts.free_space)(opts.data_dir), planned.saturating_mul(2) + MARGIN, "on the drive OAIY keeps its data on")?;
+    need((opts.free_space)(opts.data_dir), data_drive_needed(planned), "on the drive OAIY keeps its data on")?;
     need((opts.free_space)(&dest_dir), planned + MARGIN, "in the folder chosen for the backup")?;
 
     // The staged plaintext lives in here and is removed when this function ends, however it ends.
@@ -199,7 +206,8 @@ fn run(opts: &CreateOptions<'_>) -> Result<CreateResult> {
                         counts.agent_projects = got.done.counts.projects;
                         counts.agent_conversations = got.done.counts.conversations;
                         counts.agent_files = got.done.counts.files;
-                        partial.extend(got.done.warnings.iter().map(|w| format!("Agent: {w}")));
+                        // What the page says is cut to what a panel shows, and there is only so much of it.
+                        partial.extend(got.done.warnings.iter().take(20).map(|w| format!("Agent: {}", super::review::clip(w, 300))));
                     }
                 }
                 Err(why) => {
@@ -210,6 +218,10 @@ fn run(opts: &CreateOptions<'_>) -> Result<CreateResult> {
         }
         None => partial.push("The Agent's conversations and projects are not part of this backup: there was no Agent page to ask.".to_string()),
     }
+
+    // The Agent's storage is on the disk now, and in the count: the ZIP made of everything, and the
+    // copy that is opened again to check it, still have to fit beside it.
+    need((opts.free_space)(opts.data_dir), total_bytes.saturating_mul(2).saturating_add(MARGIN), "on the drive OAIY keeps its data on")?;
 
     // ---- the record ----
     entries.sort_by(|a, b| a.name.cmp(&b.name));
@@ -246,6 +258,8 @@ fn run(opts: &CreateOptions<'_>) -> Result<CreateResult> {
     container::write_zip(&zip_path, &manifest.to_json(), &sources)?;
     let staged_len = std::fs::metadata(&zip_path).map(|m| m.len()).unwrap_or(0);
     need((opts.free_space)(&dest_dir), staged_len + MARGIN, "in the folder chosen for the backup")?;
+    // The copy that is decrypted again to check the file is as big as the ZIP.
+    need((opts.free_space)(opts.data_dir), staged_len.saturating_add(MARGIN), "on the drive OAIY keeps its data on")?;
 
     state::set_phase(Phase::Encrypting, "Encrypting the backup with your passphrase");
     let tmp = dest_dir.join(format!(".{}.{}.tmp", dest.file_name().and_then(|n| n.to_str()).unwrap_or("backup"), random_id()));

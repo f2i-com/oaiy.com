@@ -3022,3 +3022,81 @@ fn a_backup_asks_again_whether_the_app_is_busy_after_the_save_dialog() {
     assert!(recheck < refuse && refuse < start, "looked at, refused, and only then started");
     assert!(after.contains("options.busy = busy;"), "and the fresh look is what the backup itself is given");
 }
+
+// ---- the free-space estimate ---------------------------------------------------------------------------
+
+thread_local! {
+    /// What the disk says, for the next calls of a backup's free-space check on this thread (then plenty).
+    static FREE_SCRIPT: std::cell::RefCell<std::collections::VecDeque<u64>> = const { std::cell::RefCell::new(std::collections::VecDeque::new()) };
+}
+
+fn scripted_free(_: &Path) -> u64 {
+    FREE_SCRIPT.with(|s| s.borrow_mut().pop_front()).unwrap_or(u64::MAX / 2)
+}
+
+fn make_with_disk(data: &Path, dest: &Path, script: &[u64], agent: Option<&dyn AgentExport>) -> Result<CreateResult> {
+    let _turn = ONE_AT_A_TIME.lock().unwrap_or_else(|e| e.into_inner());
+    FREE_SCRIPT.with(|s| *s.borrow_mut() = script.iter().copied().collect());
+    let mut o = CreateOptions::new(data, dest, PASS);
+    o.cost = Cost::Fixed(8);
+    o.free_space = scripted_free;
+    o.agent = agent;
+    o.agent_wait = create::short_wait();
+    let made = create(&o);
+    FREE_SCRIPT.with(|s| s.borrow_mut().clear());
+    made
+}
+
+#[test]
+fn the_drive_holding_the_data_must_have_three_and_a_fifth_times_the_data_and_a_margin() {
+    let data = TempDir::new("space32");
+    realistic(&data.0, "A");
+    put(&data.0, "voices/long.wav", vec![3u8; 200_000]);
+    let planned: u64 = rules::plan(&data.0, false).items.iter().map(|i| i.size).sum();
+    assert!(planned > 200_000);
+    assert_eq!(create::data_drive_needed(planned), planned * 32 / 10 + create::MARGIN);
+    assert!(create::data_drive_needed(planned) > planned * 3 + create::MARGIN, "more than three times");
+    let out = TempDir::new("space32-out");
+    // Room for the old estimate (twice the data) and for three times the data, but not for 3.2 times: refused, nothing written.
+    for free in [planned * 2 + create::MARGIN, planned * 3 + create::MARGIN, create::data_drive_needed(planned) - 1] {
+        let err = make_with_disk(&data.0, &out.0.join("a.oaiybackup"), &[free], None).unwrap_err();
+        assert_eq!(err.kind, ErrorKind::NoSpace, "{free}");
+        assert!(err.message.contains("on the drive OAIY keeps its data on"), "{}", err.message);
+        assert!(fs::read_dir(&out.0).unwrap().next().is_none(), "nothing was made");
+    }
+    // Exactly enough is enough.
+    make_with_disk(&data.0, &out.0.join("b.oaiybackup"), &[create::data_drive_needed(planned)], None).expect("3.2 times and the margin is enough");
+}
+
+#[test]
+fn the_agents_storage_is_counted_once_its_size_is_known_and_the_copy_that_checks_the_file_fits() {
+    let data = TempDir::new("space-agent");
+    realistic(&data.0, "A");
+    let out = TempDir::new("space-agent-out");
+    let page = Page { zip: agent_zip(), part_size: PART_SIZE, ok: true, warnings: vec![] };
+    // Room at the start, none after the Agent's storage has arrived (its zip and the one that checks it come on top).
+    let err = make_with_disk(&data.0, &out.0.join("a.oaiybackup"), &[u64::MAX / 2, u64::MAX / 2, 1024], Some(&page)).unwrap_err();
+    assert_eq!(err.kind, ErrorKind::NoSpace);
+    assert!(err.message.contains("on the drive OAIY keeps its data on"), "{}", err.message);
+    // Room until the ZIP is made, and then not enough for the copy that is opened again to check it.
+    let err = make_with_disk(&data.0, &out.0.join("b.oaiybackup"), &[u64::MAX / 2, u64::MAX / 2, u64::MAX / 2, u64::MAX / 2, 1024], Some(&page)).unwrap_err();
+    assert_eq!(err.kind, ErrorKind::NoSpace);
+    assert!(err.message.contains("on the drive OAIY keeps its data on"), "{}", err.message);
+    assert!(fs::read_dir(&out.0).unwrap().next().is_none(), "nothing was left in the folder chosen");
+    assert_nothing_left_in_scratch(&data.0);
+}
+
+#[test]
+fn what_the_agents_page_says_in_its_warnings_is_cut_before_it_goes_into_a_backup() {
+    let data = TempDir::new("warn-cut");
+    realistic(&data.0, "A");
+    let out = TempDir::new("warn-cut-out");
+    let file = out.0.join("w.oaiybackup");
+    let page = Page { zip: agent_zip(), part_size: 40, ok: true, warnings: (0..100).map(|i| format!("{i}: {}", "W".repeat(30_000))).collect() };
+    let made = make_with(&data.0, &file, PASS, false, Some(&page)).unwrap();
+    for (what, partial) in [("the result", made.partial.clone()), ("the manifest", manifest_of(&file, PASS).partial)] {
+        assert!(partial.len() <= 21, "{what}: {}", partial.len());
+        assert!(partial.iter().all(|w| w.chars().count() <= 320), "{what}: no line is longer than a panel can show");
+        assert!(partial.iter().any(|w| w.starts_with("Agent: 0: ")), "{what}: what the page said is still there, cut");
+    }
+}
