@@ -146,6 +146,22 @@ fn nothing_rings_for_a_plan_this_desktop_did_not_allow() {
 }
 
 #[test]
+fn a_name_and_the_words_a_ring_shows_arrive_cleaned_of_control_and_direction_characters() {
+    let r = rig(Presence::Active);
+    r.calls.info.lock().unwrap().clear();
+    r.calls.info.lock().unwrap().push((CALL.into(), caller("+6149157\u{202e}0006\n", "Alex\u{7}\nURGENT: call now\u{202e}", "Can I speak\u{0} to the\towner?\r\nRing now")));
+    let plan = planned(&r.ring, CALL);
+    let ring = r.ring.opened(&opened(&plan, "assist_1", CALL, 25, &r.ring)).unwrap();
+    assert_eq!((ring.caller_name.as_str(), ring.caller_number.as_str()), ("Alex URGENT: call now", "+61491570006"));
+    assert_eq!(ring.said, vec!["Hi".to_string(), "Can I speak to the owner? Ring now".to_string()]);
+    let long = rig(Presence::Active);
+    long.calls.info.lock().unwrap().clear();
+    long.calls.info.lock().unwrap().push((CALL.into(), caller("", &"N".repeat(500), ASKED)));
+    let plan = planned(&long.ring, CALL);
+    assert_eq!(long.ring.opened(&opened(&plan, "assist_1", CALL, 25, &long.ring)).unwrap().caller_name.chars().count(), 80);
+}
+
+#[test]
 fn a_ring_shows_who_is_calling_what_they_said_and_who_else_rings() {
     let r = rig(Presence::Active);
     r.ring.change_settings(&json!({ "phoneRing": "always" })).unwrap();

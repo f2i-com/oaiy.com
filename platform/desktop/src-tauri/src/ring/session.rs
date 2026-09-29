@@ -198,9 +198,11 @@ impl Ring {
         let ring = ActiveRing {
             id: params.request_id.clone(),
             call_id: params.call_id.clone(),
-            caller_name: info.name.trim().to_string(),
-            caller_number: info.from.trim().to_string(),
-            said: info.turns.iter().rev().take(SAID_SHOWN).rev().map(|t| t.chars().take(300).collect()).collect(),
+            // What a caller's name is, and what they said, arrive from the phone and the caller: cleaned of control and
+            // direction-changing characters before anything shows them.
+            caller_name: crate::messages::clean(&info.name, 80),
+            caller_number: crate::messages::clean(&info.from, 40),
+            said: info.turns.iter().rev().take(SAID_SHOWN).rev().map(|t| crate::messages::clean(t, 300)).collect(),
             started_at: now,
             expires_at,
             now,
@@ -285,7 +287,7 @@ impl Ring {
             if sessions.notices.iter().any(|n| n.call_id == call) {
                 return;
             }
-            let notice = Notice { id: format!("notice_{}", &uuid::Uuid::new_v4().simple().to_string()[..12]), call_id: call.to_string(), caller_name: info.name.trim().to_string(), caller_number: info.from.trim().to_string(), at: now, text: NO_DEVICE_TEXT.to_string() };
+            let notice = Notice { id: format!("notice_{}", &uuid::Uuid::new_v4().simple().to_string()[..12]), call_id: call.to_string(), caller_name: crate::messages::clean(&info.name, 80), caller_number: crate::messages::clean(&info.from, 40), at: now, text: NO_DEVICE_TEXT.to_string() };
             sessions.notices.push_back(notice.clone());
             while sessions.notices.len() > NOTICES_KEPT {
                 sessions.notices.pop_front();

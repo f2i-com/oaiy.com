@@ -124,6 +124,30 @@ describe('the ring dialog', () => {
     expect(api.active.mock.calls.length).toBeGreaterThanOrEqual(before + 3);
   });
 
+  it('takes no focus and no key from the owner: nothing in it is focused for them, and a stray Enter or space does nothing', async () => {
+    // The owner is typing somewhere else when a caller rings.
+    const field = document.createElement('input');
+    document.body.appendChild(field);
+    field.focus();
+    serve({});
+    await mount();
+    expect(host.querySelector('.ring-dialog')).not.toBeNull();
+    expect(document.activeElement).toBe(field);
+    expect(host.querySelector('[autofocus]')).toBeNull();
+    for (const button of host.querySelectorAll('button')) expect(button.getAttribute('autofocus')).toBeNull();
+    // Keys pressed while they type reach their field, not a button of the dialog.
+    await act(async () => {
+      for (const key of ['Enter', ' ']) {
+        field.dispatchEvent(new KeyboardEvent('keydown', { key, bubbles: true }));
+        field.dispatchEvent(new KeyboardEvent('keyup', { key, bubbles: true }));
+      }
+    });
+    await settle();
+    expect(api.respond).not.toHaveBeenCalled();
+    expect(host.querySelector('.ring-dialog')).not.toBeNull();
+    field.remove();
+  });
+
   it('says the owner answers on a Companion, and has no Accept: this computer cannot take the call', async () => {
     serve({});
     await mount();

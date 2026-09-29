@@ -80,6 +80,13 @@ it (after being asked). A message links to the caller's contact. The receptionis
 on a call: there is no way to write one here, and the number a message is kept with is the one
 this desktop saw the call come from, never a number the receptionist's model says.
 
+A message, and a caller who asks for you, reach you by a Windows notification that names the caller
+(as the phone gave it, cleaned of control and direction characters and cut to 40 characters) and
+never says what they said. The receptionist says you "will be told" only when the notification
+plugin accepted the notification; whether Windows then shows it (Focus Assist can hide it) is not
+something the plugin can say, so an unread message is also counted in the sidebar. The ring dialog
+takes no keyboard focus, so a key you press while typing elsewhere never reaches it.
+
 A call keeps at most 3 messages, one number 20 a day and 40 waiting at once, each at most 600
 characters. Callers who hide their number (or give one that is not a number) share one small
 allowance between them, 6 a day and 100 kept, so hiding does not give every call a limit of its
