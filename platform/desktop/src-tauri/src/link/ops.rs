@@ -440,7 +440,8 @@ mod guard_tests {
     const NOT_RUNNING: &str = "the aokie plugin is not running on this desktop";
 
     /// The commands the defect let through, that Aokie's entry keeps on this computer.
-    const KEPT_HERE: [&str; 10] = [
+    /// The last is a flow's verb: FormLogic fires it in the browser or here, never across the relay.
+    const KEPT_HERE: [&str; 11] = [
         "dongle.installDriver",
         "dongle.restoreDriver",
         "dongle.removeCerts",
@@ -451,6 +452,7 @@ mod guard_tests {
         "consent.set",
         "consent.revoke",
         "settings.set",
+        "call.configureAgent",
     ];
 
     struct World {
@@ -598,10 +600,10 @@ mod guard_tests {
             ("call.reject", call.clone()),
             ("call.hangup", call.clone()),
             ("call.operatorSpeak", json!({ "callId": "call-1", "text": "One moment please." })),
-            ("call.configureAgent", json!({ "callId": "call-1", "persona": "Friendly" })),
             ("call.dial", json!({ "number": "0491 570 006", "openingLine": "Hello" })),
             ("sms.send", json!({ "to": "0491 570 157", "body": "Hello" })),
             ("sms.threads", Value::Null),
+            ("sms.thread", json!({ "threadId": "thread-1" })),
             ("phone.status", Value::Null),
             ("dongle.list", Value::Null),
         ] {
@@ -919,9 +921,12 @@ process.stdin.on("data", (chunk) => {
             assert_eq!(hangup["answered"], "call.hangup");
             relay("aokie", "call.answer", &json!({ "callId": "call-1" }), "cmd-answer").expect("call.answer");
             relay("aokie", "sms.send", &json!({ "to": "0491 570 157", "body": "Hello" }), "cmd-sms").expect("sms.send");
+            // The one FormLogic's MCP tool tells an AI client to send, a read like sms.threads.
+            let thread = relay("aokie", "sms.thread", &json!({ "threadId": "thread-1" }), "cmd-thread").expect("sms.thread");
+            assert_eq!(thread["answered"], "sms.thread");
 
             let seen = seen(&world);
-            assert_eq!(verbs(&seen), ["call.current", "call.hangup", "call.answer", "sms.send"]);
+            assert_eq!(verbs(&seen), ["call.current", "call.hangup", "call.answer", "sms.send", "sms.thread"]);
             // A journalled command reaches the plugin with the key the relay made from its id,
             // which is what the plugin's own gate insists on.
             assert_eq!(seen[1]["requestId"], "relay-command-cmd-hangup");

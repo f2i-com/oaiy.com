@@ -3,17 +3,17 @@
   "about": "What the provider's website may run on this computer through the command relay. Anyone who acts as the account's owner on the provider's site can queue a command, so this list is decided here, in the build, and not by what a plugin says about itself. A connector with an entry gets exactly the verbs it lists. A connector with no entry gets only the verbs its plugin declares and does not journal (its reads). Everything else can only be run from OAIY on this computer. Nothing here can be widened by a plugin's manifest, and there is no wildcard: a verb is reachable when it is named.",
   "connectors": {
     "aokie": {
-      "about": "The phone bridge. Allowed: what the provider's call console, its flows and its MCP connector_command queue to run the phone line (answer, reject, hang up, speak, dial, text) and the status reads that front-desk staff are granted. Not allowed, on purpose: everything FormLogic keeps for its Device Admin role, which is set up at the computer (dongle drivers and certificates, the dongle reset and preferred dongle, phone pairing and connecting, settings, consent, the outbox) and every read of them, and the three verbs nothing on FormLogic's side queues (call.switchboard, call.activate, sms.thread). Evidence is the formlogic.com repository at commit 12275d2e, paths from its root; link/policy.rs tests check that every listed verb has evidence and that no evidence is left for a verb that is not listed. FormLogic itself keeps call.remoteStatus, call.assistance.respond, call.takeOver, call.resumeBot, call.endCaller, call.declineWaiting and remote.* off the relay (formlogic/backend/src/Services/DesktopCommandService.php:42-49), and none of them is listed here.",
+      "about": "The phone bridge. Allowed: what FormLogic is seen sending through its relay to run the phone line. That is the call console (answer, reject, hang up, speak), the commands its MCP connector_command tool names to AI clients (formlogic/backend/src/Services/ChatToolsService.php:1241), and what its front-desk role is granted, which FormLogic checks for each command before it queues one (formlogic/backend/src/Controllers/ConnectorCommandController.php:395, and the note at formlogic/ui/src/data/packs/aokie-receptionist/pack.ts:4370). call.dial is allowed on purpose although nothing on FormLogic's side is seen queueing it through the relay: its flows fire it, but in the browser or on this computer, and a flow in FormLogic's cloud could queue it (formlogic/backend/src/Services/CloudFlowRunner.php:827). The plugin's own outbound switch (off by default), quiet hours and daily cap still apply to it, and taking it out of allow and evidence (and out of AOKIE_ALLOWED in link/policy.rs) closes it. Not allowed, on purpose: everything FormLogic keeps for its Device Admin role, which is set up at the computer (dongle drivers and certificates, the dongle reset and preferred dongle, phone pairing and connecting, settings, consent, the outbox) and every read of them. That includes dongle.diagnostics: FormLogic's MCP tool text names it, but FormLogic grants it to Device Admin only (pack.ts:4439), it shows the dongle's and the phone's Bluetooth addresses, and its simulate option plays a scripted call in dev mode, which a list of verbs cannot tell from the plain read. Also not allowed: call.configureAgent, which FormLogic's Personalize Caller flow fires in the browser or on this computer and never through the relay (the flow holds logic and condition nodes, which FormLogic's cloud runner refuses), and call.switchboard and call.activate, which nothing on FormLogic's side queues. Evidence is the formlogic.com repository at commit 12275d2e, paths from its root: where a verb is queued through the relay or granted to a role that may queue it (for call.dial, where a flow fires it). link/policy.rs tests check that every listed verb has evidence and that no evidence is left for a verb that is not listed. FormLogic itself keeps call.remoteStatus, call.assistance.respond, call.takeOver, call.resumeBot, call.endCaller, call.declineWaiting and remote.* off the relay (formlogic/backend/src/Services/DesktopCommandService.php:42-49), and none of them is listed here.",
       "allow": [
         "call.current",
         "call.answer",
         "call.reject",
         "call.hangup",
         "call.operatorSpeak",
-        "call.configureAgent",
         "call.dial",
         "sms.send",
         "sms.threads",
+        "sms.thread",
         "phone.status",
         "dongle.list"
       ],
@@ -21,51 +21,58 @@
         "call.current": [
           "formlogic/ui/src/data/packs/aokie-receptionist/screens/live-call/controller.ts:244",
           "formlogic/ui/src/data/packs/aokie-receptionist/screens/live-call/controller.ts:593",
-          "formlogic/ui/src/data/packs/aokie-receptionist/pack.ts:4413"
+          "formlogic/ui/src/data/packs/aokie-receptionist/pack.ts:4413",
+          "formlogic/backend/src/Services/ChatToolsService.php:1241"
         ],
         "call.answer": [
           "formlogic/ui/src/data/packs/aokie-receptionist/screens/live-call/controller.ts:476",
           "formlogic/ui/src/data/packs/aokie-receptionist/screens/live-call/controller.ts:593",
-          "formlogic/ui/src/data/packs/aokie-receptionist/pack.ts:4414"
+          "formlogic/ui/src/data/packs/aokie-receptionist/pack.ts:4414",
+          "formlogic/backend/src/Services/ChatToolsService.php:1241"
         ],
         "call.reject": [
           "formlogic/ui/src/data/packs/aokie-receptionist/screens/live-call/controller.ts:476",
+          "formlogic/ui/src/data/packs/aokie-receptionist/screens/live-call/controller.ts:593",
           "formlogic/ui/src/data/packs/aokie-receptionist/pack.ts:4415",
-          "formlogic/ui/src/data/packs/aokie-receptionist/pack.ts:4643"
+          "formlogic/backend/src/Services/ChatToolsService.php:1241"
         ],
         "call.hangup": [
           "formlogic/ui/src/data/packs/aokie-receptionist/screens/live-call/controller.ts:476",
           "formlogic/ui/src/data/packs/aokie-receptionist/screens/live-call/controller.ts:593",
-          "formlogic/ui/src/data/packs/aokie-receptionist/pack.ts:4416"
+          "formlogic/ui/src/data/packs/aokie-receptionist/pack.ts:4416",
+          "formlogic/backend/src/Services/ChatToolsService.php:1241"
         ],
         "call.operatorSpeak": [
           "formlogic/ui/src/data/packs/aokie-receptionist/screens/live-call/controller.ts:533",
           "formlogic/ui/src/data/packs/aokie-receptionist/screens/live-call/controller.ts:593",
           "formlogic/ui/src/data/packs/aokie-receptionist/pack.ts:4417",
-          "formlogic/ui/src/data/packs/aokie-receptionist/pack.ts:5291"
-        ],
-        "call.configureAgent": [
-          "formlogic/ui/src/data/packs/aokie-receptionist/pack.ts:4596",
-          "formlogic/ui/src/data/packs/aokie-receptionist/pack.ts:4655"
+          "formlogic/backend/src/Services/ChatToolsService.php:1241"
         ],
         "call.dial": [
           "formlogic/ui/src/data/packs/aokie-receptionist/pack.ts:6037",
-          "formlogic/ui/src/data/packs/aokie-receptionist/pack.ts:6101"
+          "formlogic/ui/src/data/packs/aokie-receptionist/pack.ts:6101",
+          "formlogic/backend/src/Services/CloudFlowRunner.php:827"
         ],
         "sms.send": [
           "formlogic/ui/src/data/packs/aokie-receptionist/pack.ts:4419",
-          "formlogic/ui/src/data/packs/aokie-receptionist/pack.ts:5784",
-          "formlogic/ui/src/data/packs/aokie-receptionist/pack.ts:6059",
+          "formlogic/backend/src/Services/ChatToolsService.php:1241",
           "docs/MCP.md:295"
         ],
         "sms.threads": [
-          "formlogic/ui/src/data/packs/aokie-receptionist/pack.ts:4418"
+          "formlogic/ui/src/data/packs/aokie-receptionist/pack.ts:4418",
+          "formlogic/ui/src/data/packs/aokie-receptionist/pack.ts:4370"
+        ],
+        "sms.thread": [
+          "formlogic/backend/src/Services/ChatToolsService.php:1241",
+          "formlogic/ui/src/data/packs/aokie-receptionist/pack.ts:4346"
         ],
         "phone.status": [
-          "formlogic/ui/src/data/packs/aokie-receptionist/pack.ts:4420"
+          "formlogic/ui/src/data/packs/aokie-receptionist/pack.ts:4420",
+          "formlogic/backend/src/Services/ChatToolsService.php:1241"
         ],
         "dongle.list": [
-          "formlogic/ui/src/data/packs/aokie-receptionist/pack.ts:4421"
+          "formlogic/ui/src/data/packs/aokie-receptionist/pack.ts:4421",
+          "formlogic/backend/src/Services/ChatToolsService.php:1241"
         ]
       }
     }

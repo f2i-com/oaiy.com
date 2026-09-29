@@ -77,18 +77,39 @@ refused too, since the plugin's idempotency key is made from it.
 
 | The website may run | Only from OAIY on this computer |
 | --- | --- |
-| `call.current`, `phone.status`, `dongle.list`, `sms.threads` (what the front desk sees) | Drivers and certificates: `dongle.installDriver`, `dongle.restoreDriver`, `dongle.removeCerts`, `dongle.reset`, `dongle.setPreferred` |
+| `call.current`, `phone.status`, `dongle.list`, `sms.threads`, `sms.thread` (what the front desk sees, and what the provider's MCP tool names) | Drivers and certificates: `dongle.installDriver`, `dongle.restoreDriver`, `dongle.removeCerts`, `dongle.reset`, `dongle.setPreferred` |
 | `call.answer`, `call.reject`, `call.hangup`, `call.operatorSpeak` (the call console) | Pairing and the phone's connection: `phone.startPairing`, `phone.stopPairing`, `phone.confirmPairing`, `phone.removePaired`, `phone.connect`, `phone.disconnect` |
-| `call.dial`, `sms.send`, `call.configureAgent` (what the provider's flows queue) | Consent and settings: `consent.set`, `consent.revoke`, `settings.set` (which can send a call's audio elsewhere) |
+| `sms.send` (the front-desk role and the MCP tool), `call.dial` (see below) | Consent and settings: `consent.set`, `consent.revoke`, `settings.set` (which can send a call's audio elsewhere) |
 | | The outbox: `outbox.redrive` |
-| | Reads of those, and commands nothing on the provider's side queues: `dongle.getPreferred`, `dongle.diagnostics`, `phone.listPaired`, `settings.get`, `consent.get`, `call.switchboard`, `call.activate`, `sms.thread` |
+| | Reads of those: `dongle.getPreferred`, `dongle.diagnostics` (see below), `phone.listPaired`, `settings.get`, `consent.get` |
+| | What the provider's flows fire in the browser or on this computer, or nothing queues: `call.configureAgent`, `call.switchboard`, `call.activate` |
 
-The left column is what the provider's call console, its flows and its MCP
-`connector_command` tool queue, and what its front-desk role is granted; the
-policy file cites the file and line in the provider's code for each. The right
-column is what the provider gives only its Device Admin role, or does not queue at
-all. Every command on the left that changes something is one the plugin
-journals, so it carries the idempotency key the relay makes from the command's id
+The left column is what the provider is seen sending through its relay: its call
+console (the live-call screen), the commands its MCP `connector_command` tool tells
+an AI client to send, and what its front-desk role is granted, which the provider
+checks for each command before it queues one. The policy file cites the file and
+line in the provider's code for each. The right column is what the provider gives
+only its Device Admin role, or does not queue through the relay at all. Three
+choices were made by hand:
+
+- `sms.thread` is on the left because the MCP tool names it. It reads the same
+  thing as `sms.threads`, and the plugin only answers it in its dev mode.
+- `dongle.diagnostics` is on the right although the MCP tool's text names it: the
+  provider grants it to its Device Admin role only, it shows the dongle's and the
+  phone's Bluetooth addresses, and its `simulate` option plays a scripted call in
+  dev mode. A list of commands cannot allow the read and refuse that. An AI client
+  that follows the tool's text is told it can only be run from OAIY on this computer.
+- `call.dial` is on the left although nothing on the provider's side is seen
+  queueing it through the relay: the provider's flows fire it, but in the browser or
+  on this computer, and a flow in the provider's cloud could queue it. It is there on
+  purpose, and the plugin's own outbound switch (off by default), quiet hours and
+  daily cap still apply to it. Taking it out of the policy file closes it.
+  `call.configureAgent`, which the same flows fire, is not on the list: the provider's
+  flow for it holds logic and condition nodes that its cloud cannot run, so it never
+  crosses the relay.
+
+Every command on the left that changes something is one the plugin journals, so it
+carries the idempotency key the relay makes from the command's id
 (`relay-command-<id>`), and a redelivery cannot run it twice. The provider keeps
 `call.takeOver`, `call.resumeBot`, `call.endCaller`, `call.declineWaiting`,
 `call.remoteStatus`, `call.assistance.respond` and `remote.*` off its own relay;

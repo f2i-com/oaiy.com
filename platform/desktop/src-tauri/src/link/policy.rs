@@ -339,17 +339,40 @@ mod tests {
         "call.reject",
         "call.hangup",
         "call.operatorSpeak",
-        "call.configureAgent",
         "call.dial",
         "sms.send",
         "sms.threads",
+        "sms.thread",
         "phone.status",
         "dongle.list",
     ];
 
     /// The reads among them. The rest change something on the phone line, and so
     /// must be journalled, which is what makes the plugin ask for a key.
-    const AOKIE_READS: [&str; 4] = ["call.current", "sms.threads", "phone.status", "dongle.list"];
+    const AOKIE_READS: [&str; 5] =
+        ["call.current", "sms.threads", "sms.thread", "phone.status", "dongle.list"];
+
+    /// The verbs FormLogic's MCP `connector_command` tool tells an AI client to send
+    /// to `aokie`, as its description lists them
+    /// (`formlogic/backend/src/Services/ChatToolsService.php:1241`, FormLogic at
+    /// 12275d2e). An MCP client is one of the three things the brief derives the list
+    /// from, and the tool text is the only place it is written down.
+    const MCP_TOOL_TEXT: [&str; 10] = [
+        "call.answer",
+        "call.reject",
+        "call.hangup",
+        "call.operatorSpeak",
+        "sms.send",
+        "sms.thread",
+        "call.current",
+        "phone.status",
+        "dongle.list",
+        "dongle.diagnostics",
+    ];
+
+    /// What that text names and the policy still leaves on this computer, each on
+    /// purpose (the entry's `about` says why).
+    const MCP_TOOL_TEXT_KEPT_HERE: [&str; 1] = ["dongle.diagnostics"];
 
     #[test]
     fn the_shipped_policy_is_understood() {
@@ -438,15 +461,23 @@ mod tests {
             "settings.set",
             // The outbox.
             "outbox.redrive",
-            // Reads of those, and verbs nothing on the provider's side queues.
+            // Reads of those. `dongle.diagnostics` is one: FormLogic's MCP tool text
+            // names it, but grants it to Device Admin only, it shows the dongle's and
+            // the phone's Bluetooth addresses, and its `simulate` option plays a
+            // scripted call in dev mode, which a list of verbs cannot tell from the
+            // plain read.
             "dongle.getPreferred",
             "dongle.diagnostics",
             "phone.listPaired",
             "settings.get",
             "consent.get",
+            // Verbs nothing on the provider's side queues through the relay.
+            // `call.configureAgent` is FormLogic's Personalize Caller flow, which holds
+            // logic and condition nodes, so it runs in the browser or on this computer
+            // and never crosses the relay (its cloud runner refuses those nodes).
+            "call.configureAgent",
             "call.switchboard",
             "call.activate",
-            "sms.thread",
         ];
         let manifest = aokie();
         let policy = shipped();
@@ -462,6 +493,25 @@ mod tests {
                 },
                 "{verb}"
             );
+        }
+    }
+
+    #[test]
+    fn what_formlogics_mcp_tool_tells_an_ai_to_send_is_allowed_unless_kept_here_on_purpose() {
+        // The list is what FormLogic is seen queueing through its relay, and its MCP
+        // `connector_command` tool is one of the three places it queues from (the call
+        // console and the front-desk role's grants are the others). A verb the tool
+        // text names and the policy refuses is a website feature that breaks with no
+        // reason in sight, unless somebody decided it should: that decision is in
+        // `MCP_TOOL_TEXT_KEPT_HERE`, and in the entry's `about`.
+        let policy = shipped();
+        for verb in MCP_TOOL_TEXT {
+            let allowed = policy.check("aokie", verb, "cmd-1", never).is_ok();
+            let kept = MCP_TOOL_TEXT_KEPT_HERE.contains(&verb);
+            assert_eq!(allowed, !kept, "{verb}: allowed {allowed}, kept here on purpose {kept}");
+        }
+        for verb in MCP_TOOL_TEXT_KEPT_HERE {
+            assert!(MCP_TOOL_TEXT.contains(&verb), "{verb} is kept for a reason the text does not give");
         }
     }
 
