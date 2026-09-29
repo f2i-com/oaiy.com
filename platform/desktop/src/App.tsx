@@ -42,7 +42,9 @@ import PairingPrompt from './PairingPrompt';
 import SettingsPanel from './SettingsPanel';
 import EmbeddedPage from './EmbeddedPage';
 import SetupPage from './SetupPage';
-import { carryGuideDismissal, guideDismissed, onOpenSetup, useSetupState } from './useSetupState';
+import AgentSettingsPanel from './AgentSettingsPanel';
+import { onNavigate } from './navigate';
+import { carryGuideDismissal, guideDismissed, onOpenSetup, openSetup, useSetupState } from './useSetupState';
 
 /**
  * OAIY Desktop: a sidebar of a few sections, and a workspace of topbar / page /
@@ -78,6 +80,8 @@ type BuiltinView =
   | 'providers'
   | 'connections'
   | 'settings'
+  /** Settings → Agent: what it may change, its model, what it changed. */
+  | 'agent-settings'
   /** The setup wizard: first run, or one plugin's own. */
   | 'setup';
 
@@ -106,7 +110,7 @@ const SECTIONS: Section[] = [
   { id: 'services', label: 'Services', icon: Server, group: 'Setup', tabs: ['services', 'python'] },
   { id: 'connections', label: 'Connections', icon: Plug, group: 'Setup', tabs: ['connections', 'providers', 'plugins'] },
 ];
-const SETTINGS: Section = { id: 'settings', label: 'Settings', icon: Settings2, group: 'Setup', tabs: ['settings'] };
+const SETTINGS: Section = { id: 'settings', label: 'Settings', icon: Settings2, group: 'Setup', tabs: ['settings', 'agent-settings'] };
 
 /** Each page: its tab's name and icon, and the line under the topbar's title. */
 const PAGE: Record<BuiltinView, { tab: string; icon: LucideIcon; copy: string }> = {
@@ -139,7 +143,8 @@ const PAGE: Record<BuiltinView, { tab: string; icon: LucideIcon; copy: string }>
   providers: { tab: 'AI providers', icon: Sparkles, copy: 'Cloud or local AI providers your flows can call. Keys stay on this device.' },
   plugins: { tab: 'Plugins', icon: Puzzle, copy: 'Supervised extensions that add connectors and events to your flows.' },
   settings: { tab: 'Settings', icon: Settings2, copy: 'Where OAIY keeps its data and models, and your Hugging Face token.' },
-  setup: { tab: 'Setup', icon: ListChecks, copy: 'The engine, your plugins and their devices, step by step.' },
+  'agent-settings': { tab: 'Agent', icon: Bot, copy: 'What the Agent may change in OAIY, the model it thinks with, and every change it made.' },
+  setup: { tab: 'Setup', icon: ListChecks, copy: 'Your AI and the Agent; then the Agent, or you step by step, sets up the rest.' },
 };
 
 /** A built-in page's tab name and icon (a plugin page's come from its contribution). */
@@ -231,18 +236,33 @@ export default function App() {
   const [copied, setCopied] = useState(false);
   /** The setup page: a plugin's own wizard (its id), or the first-run wizard (null); and where it goes back to. */
   const [setupPlugin, setSetupPlugin] = useState<string | null>(null);
+  /** The step it opens at (the Agent asked for one), and a count of opens so each opens afresh. */
+  const [setupStep, setSetupStep] = useState<string | null>(null);
+  const [setupOpens, setSetupOpens] = useState(0);
   const [setupReturn, setSetupReturn] = useState<View>('overview');
   const viewRef = useRef<View>(view);
   viewRef.current = view;
   const setupState = useSetupState();
 
-  // Anything may open setup (the Overview's card, a plugin card, an install, Settings).
+  // Anything may open setup (the Overview's card, a plugin card, an install, Settings, the Agent).
   useEffect(
     () =>
       onOpenSetup((target) => {
         setSetupPlugin(target.plugin ?? null);
+        setSetupStep(target.step ?? null);
+        setSetupOpens((n) => n + 1);
         if (viewRef.current !== 'setup') setSetupReturn(viewRef.current);
         setView('setup');
+      }),
+    [],
+  );
+
+  // The desktop may ask for a page (the Agent's plugin_setup_open and ui_open): a setup step, a plugin's page, or one of ours.
+  useEffect(
+    () =>
+      onNavigate((target) => {
+        if (target.kind === 'setup') openSetup({ plugin: target.pluginId, step: target.stepId });
+        else setView(target.view as View);
       }),
     [],
   );
@@ -589,10 +609,12 @@ export default function App() {
             {view === 'connections' && <ConnectionsPanel />}
             {view === 'python' && <PythonPanel />}
             {view === 'settings' && <SettingsPanel />}
+            {view === 'agent-settings' && <AgentSettingsPanel onOpenEngines={() => setView('engines')} />}
             {view === 'setup' && (
               <SetupPage
-                key={setupPlugin ?? 'first-run'}
+                key={`${setupPlugin ?? 'first-run'}:${setupOpens}`}
                 pluginId={setupPlugin}
+                step={setupStep}
                 onExit={() => setView(setupReturn === 'setup' ? 'overview' : setupReturn)}
                 onNavigate={(v) => setView(v)}
               />
