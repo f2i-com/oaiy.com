@@ -487,7 +487,7 @@ fn preview_of(data_dir: &Path, verified: &container::Verified, scratch: &Path, f
             Some(bytes) => items.extend(review::describe(*category, name, bytes, &here, &backup_templates)),
             None => {
                 if let Some(class) = review::class_of(*category) {
-                    items.push(ReviewItem { class, name: (*name).to_string(), title: review::clip(name.rsplit('/').next().unwrap_or(name), 120), what: "Too large to look at: it is not brought back.".to_string() });
+                    items.push(ReviewItem { class, name: (*name).to_string(), title: review::clip(name.rsplit('/').next().unwrap_or(name), 120), what: review::TOO_LARGE.to_string() });
                 }
             }
         }
@@ -725,6 +725,33 @@ fn clean_staged(data_dir: &Path, files_root: &Path, names: &[String], ticks: &Ti
             }
         }
     }
+    // The dry run says of a file that can act, and that OAIY could not read or is too large to look at, that it
+    // is not brought back: so it is not. (What was not looked at does not come in.)
+    let mut readable = Vec::new();
+    for name in std::mem::take(&mut kept) {
+        let acting = rules::category_of_backup_entry(&name).map(|(c, _)| c).ok().filter(|c| review::class_of(*c).is_some());
+        let Some(category) = acting else {
+            readable.push(name);
+            continue;
+        };
+        let path = container::safe_join(files_root, &name, limits)?;
+        let too_large = std::fs::metadata(&path).map(|m| m.len() > MAX_REVIEW_BYTES).unwrap_or(false);
+        let unreadable = if too_large {
+            Some(review::TOO_LARGE.to_string())
+        } else {
+            let bytes = std::fs::read(&path).map_err(|e| BackupError::io("Could not read a staged file", &e))?;
+            review::describe(category, &name, &bytes, &Local::default(), &HashSet::new()).into_iter().find(review::is_unreadable).map(|item| item.what)
+        };
+        match unreadable {
+            Some(why) => {
+                let _ = std::fs::remove_file(&path);
+                notes.push(format!("{name} was not brought back. {why}"));
+            }
+            None => readable.push(name),
+        }
+    }
+    kept = readable;
+
     // A service starts with OAIY only if OAIY has a template for it: one here already, or one in this restore.
     if kept.iter().any(|n| n == "services-autostart.json") {
         let mut known = Local::read(data_dir).template_ids;

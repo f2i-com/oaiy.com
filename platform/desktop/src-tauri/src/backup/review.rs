@@ -203,8 +203,20 @@ impl Local {
     }
 }
 
+/// How the description of a file that could not be read begins (see [`is_unreadable`]).
+const UNREADABLE: &str = "Could not be read (";
+
+/// What is said of a file too large to look at.
+pub const TOO_LARGE: &str = "Too large to look at: it is not brought back.";
+
 fn unreadable(class: RestoreClass, name: &str, why: &str) -> ReviewItem {
-    ReviewItem { class, name: name.to_string(), title: clip(name.rsplit('/').next().unwrap_or(name), 120), what: format!("Could not be read ({why}): OAIY would not load it, so it is not brought back.") }
+    ReviewItem { class, name: name.to_string(), title: clip(name.rsplit('/').next().unwrap_or(name), 120), what: format!("{UNREADABLE}{why}): OAIY would not load it, so it is not brought back.") }
+}
+
+/// Whether the description says its file is not brought back because it could not be read (or is too
+/// large to be looked at). The dry run says so, and staging leaves such a file out: the two agree.
+pub fn is_unreadable(item: &ReviewItem) -> bool {
+    item.what.starts_with(UNREADABLE) || item.what == TOO_LARGE
 }
 
 /// Describe one restorable file of a class that can act.
@@ -229,20 +241,41 @@ pub fn describe(category: Category, name: &str, bytes: &[u8], local: &Local, bac
             Err(_) => vec![unreadable(class, name, "it is not a list of services")],
         },
         "triggers.json" => match value() {
-            Ok(Value::Array(rows)) => rows
-                .iter()
-                .map(|r| {
-                    let id = s(r, "id").unwrap_or("(no id)");
-                    let mode = s(r, "mode").unwrap_or("async");
-                    let enabled = if r.get("enabled").and_then(Value::as_bool).unwrap_or(true) { "" } else { ", switched off" };
-                    ReviewItem {
-                        class,
-                        name: name.to_string(),
-                        title: clip(id, 120),
-                        what: clip(&format!("When \"{}\" happens, runs the flow \"{}\" ({mode}{enabled}).", s(r, "event").unwrap_or("?"), s(r, "flowId").unwrap_or("?")), 300),
+            // Read the way OAIY's own trigger store reads it: a list, each entry a binding, and an entry that is not
+            // one is skipped (so it is not described as if it would run).
+            Ok(Value::Array(rows)) => {
+                let mut items = Vec::new();
+                let mut ignored = 0usize;
+                for row in &rows {
+                    match serde_json::from_value::<crate::bridge::triggers::TriggerBinding>(row.clone()) {
+                        Ok(b) => {
+                            let mode = format!("{:?}", b.mode).to_lowercase();
+                            let off = if b.enabled { "" } else { ", switched off" };
+                            let when = b.condition.as_deref().filter(|c| !c.trim().is_empty()).map(|c| format!(" and only if this holds: {}", clip(c, 120))).unwrap_or_default();
+                            items.push(ReviewItem {
+                                class,
+                                name: name.to_string(),
+                                title: clip(&b.id, 120),
+                                what: clip(&format!("When \"{}\" happens{when}, runs the flow \"{}\" ({mode}{off}).", b.event, b.flow_id), 500),
+                            });
+                        }
+                        Err(_) => ignored += 1,
                     }
-                })
-                .collect(),
+                }
+                if items.is_empty() && ignored > 0 {
+                    vec![unreadable(class, name, &format!("none of its {ignored} entries is a trigger OAIY would load"))]
+                } else {
+                    if ignored > 0 {
+                        items.push(ReviewItem {
+                            class,
+                            name: name.to_string(),
+                            title: "Entries that will not load".to_string(),
+                            what: format!("{ignored} entr{} in the file {} not triggers OAIY would load, and {} ignored.", if ignored == 1 { "y" } else { "ies" }, if ignored == 1 { "is" } else { "are" }, if ignored == 1 { "is" } else { "are" }),
+                        });
+                    }
+                    items
+                }
+            }
             _ => vec![unreadable(class, name, "it is not a list of triggers")],
         },
         "bridge/ledger.jsonl" => {
@@ -329,6 +362,12 @@ pub fn describe(category: Category, name: &str, bytes: &[u8], local: &Local, bac
                 if let Some(paths) = v.get("uninstall").and_then(|u| u.get("paths")).and_then(Value::as_array).filter(|p| !p.is_empty()) {
                     what.push_str(&format!("; deletes {} path(s) when uninstalled", paths.len()));
                 }
+                if let Some(env) = run.and_then(|r| r.get("env")).and_then(Value::as_object).filter(|e| !e.is_empty()) {
+                    what.push_str(&format!("; sets {} environment variable(s): {}", env.len(), env.keys().take(6).cloned().collect::<Vec<_>>().join(", ")));
+                }
+                if let Some(cwd) = run.and_then(|r| s(r, "cwd")) {
+                    what.push_str(&format!("; runs in {cwd}"));
+                }
                 if v.get("autostart").and_then(Value::as_bool).unwrap_or(false) {
                     what.push_str("; STARTS with OAIY once installed");
                 }
@@ -346,11 +385,19 @@ pub fn describe(category: Category, name: &str, bytes: &[u8], local: &Local, bac
                 let mut kinds: Vec<String> = v.get("nodes").and_then(Value::as_array).map(|n| n.iter().filter_map(|x| s(x, "type").or_else(|| x.get("data").and_then(|d| s(d, "type"))).map(str::to_string)).collect()).unwrap_or_default();
                 kinds.sort();
                 kinds.dedup();
+                // A flow can also be offered to the Agent as a tool, or run before or after one of the Agent's own tools.
+                let mut extra = String::new();
+                if let Some(tool) = v.get("oaiyTool") {
+                    extra.push_str(&format!(" It is offered to the Agent as the tool \"{}\".", clip(s(tool, "name").unwrap_or("?"), 60)));
+                }
+                if let Some(hook) = v.get("oaiyToolHook") {
+                    extra.push_str(&format!(" It runs {} the Agent's \"{}\" tool.", clip(s(hook, "mode").unwrap_or("around"), 20), clip(s(hook, "tool").unwrap_or("?"), 60)));
+                }
                 vec![ReviewItem {
                     class,
                     name: name.to_string(),
                     title: clip(title, 120),
-                    what: clip(&format!("A flow with {nodes} step(s){}.", if kinds.is_empty() { String::new() } else { format!(": {}", kinds.into_iter().take(8).collect::<Vec<_>>().join(", ")) }), 300),
+                    what: clip(&format!("A flow with {nodes} step(s){}.{extra}", if kinds.is_empty() { String::new() } else { format!(": {}", kinds.into_iter().take(8).collect::<Vec<_>>().join(", ")) }), 500),
                 }]
             }
             Err(_) => vec![unreadable(class, name, "it is not valid JSON")],

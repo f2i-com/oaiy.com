@@ -51,8 +51,8 @@ fn main() {
     put(&source, "callers.json", b"{\"contacts\":[{\"number\":\"0491 570 006\",\"name\":\"Alex\"}]}");
     put(&source, "callers.json.bak", b"{}");
     put(&source, "calendar/calendar.json", b"{\"appointments\":[]}");
-    put(&source, "triggers.json", b"{\"triggers\":[]}");
-    put(&source, "flows/greeting.json", b"{\"name\":\"Greeting\"}");
+    put(&source, "triggers.json", b"[{\"id\":\"call-in\",\"event\":\"aokie.call.incoming\",\"flowId\":\"greeting\",\"mode\":\"async\"}]");
+    put(&source, "flows/greeting.json", b"{\"name\":\"Greeting\",\"nodes\":[{\"id\":\"a\",\"type\":\"logic_block\",\"data\":{}}],\"edges\":[]}");
     put(&source, "setup.json", b"{\"firstRun\":{\"finished\":true}}");
     put(&source, "voices/receptionist.wav", &vec![7u8; 5000]);
     put(&source, "templates/my-rig.json", b"{\"id\":\"my-rig\",\"name\":\"My rig\",\"run\":{\"command\":\"my-rig.exe\",\"args\":[\"--serve\"]},\"autostart\":true}");

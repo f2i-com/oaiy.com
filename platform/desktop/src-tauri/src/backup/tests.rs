@@ -75,7 +75,7 @@ fn realistic(root: &Path, tag: &str) {
     put(root, "callers.json", format!("{{\"contacts\":[{{\"number\":\"0491 570 006\",\"name\":\"Alex ({tag})\",\"facts\":[\"likes email\"]}}]}}"));
     put(root, "callers.json.bak", b"{\"older\":true}");
     put(root, "calendar/calendar.json", format!("{{\"appointments\":[{{\"id\":\"a1\",\"title\":\"Check-up ({tag})\"}}]}}"));
-    put(root, "triggers.json", format!("{{\"triggers\":[{{\"id\":\"t1\",\"note\":\"{tag}\"}}]}}"));
+    put(root, "triggers.json", format!("[{{\"id\":\"t1\",\"event\":\"aokie.call.incoming\",\"flowId\":\"greeting\",\"mode\":\"async\",\"inputMap\":{{\"note\":\"{tag}\"}}}}]"));
     put(root, "flows/greeting.json", format!("{{\"name\":\"Greeting\",\"tag\":\"{tag}\"}}"));
     put(root, "flows/token-refund.json", format!("{{\"name\":\"Refund token flow\",\"tag\":\"{tag}\"}}"));
     put(root, "setup.json", format!("{{\"firstRun\":{{\"finished\":true}},\"tag\":\"{tag}\"}}"));
@@ -3329,7 +3329,7 @@ fn seal(dest: &Path, zip: &[u8]) {
 
 #[test]
 fn a_zip_whose_headers_disagree_about_an_items_size_never_stages_bytes_the_record_does_not_vouch_for() {
-    let listed: Vec<(&str, &[u8])> = vec![("callers.json", b"{\"contacts\":[]}"), ("triggers.json", b"{\"triggers\":[]}")];
+    let listed: Vec<(&str, &[u8])> = vec![("callers.json", b"{\"contacts\":[]}"), ("triggers.json", b"[]")];
     let manifest = manifest_for(&listed);
     let record = manifest.to_json();
     let honest = {
@@ -3390,4 +3390,154 @@ fn a_zip_whose_headers_disagree_about_an_items_size_never_stages_bytes_the_recor
         // (a newer library) is worth a look: the property above holds either way.
         assert_eq!(staged.is_err(), what.starts_with("the central directory"), "{what}");
     }
+}
+
+// ---- the dry run and the staging agree ----------------------------------------------------------------------------
+
+fn restored_names(data: &Path) -> Vec<String> {
+    let marker: serde_json::Value = serde_json::from_str(&fs::read_to_string(data.join("restore").join("pending.json")).unwrap()).unwrap();
+    marker["files"].as_array().unwrap().iter().map(|f| f["name"].as_str().unwrap().to_string()).collect()
+}
+
+#[test]
+fn triggers_written_by_the_real_store_are_listed_by_name_and_read_back_by_it() {
+    use crate::bridge::triggers::{BindingMode, TriggerBinding};
+    let src = TempDir::new("real-triggers-src");
+    realistic(&src.0, "A");
+    fs::remove_file(src.0.join("triggers.json")).unwrap();
+    {
+        // Written by OAIY's own trigger store, not by a fixture.
+        let mut store = crate::plugins::TriggerStore::load(src.0.join("triggers.json"));
+        store
+            .upsert(TriggerBinding {
+                id: "call-in".into(),
+                event: "aokie.call.incoming".into(),
+                flow_id: "greeting".into(),
+                mode: BindingMode::Async,
+                enabled: true,
+                condition: Some("event.data.callerNumber !== ''".into()),
+                input_map: BTreeMap::from([("callerPhone".to_string(), "$event.data.callerNumber".to_string())]),
+                sort_order: 1,
+            })
+            .unwrap();
+        store
+            .upsert(TriggerBinding { id: "after".into(), event: "flow.succeeded".into(), flow_id: "tidy-up".into(), mode: BindingMode::Background, enabled: false, condition: None, input_map: BTreeMap::new(), sort_order: 2 })
+            .unwrap();
+    }
+    let out = TempDir::new("real-triggers-out");
+    let file = out.0.join("t.oaiybackup");
+    make(&src.0, &file);
+    let dst = TempDir::new("real-triggers-dst");
+    let preview = restore::inspect(&dst.0, &file, PASS, &options()).unwrap();
+    let listed: Vec<&review::ReviewItem> = preview.items.iter().filter(|i| i.name == "triggers.json").collect();
+    assert_eq!(listed.iter().map(|i| i.title.as_str()).collect::<Vec<_>>(), ["call-in", "after"], "each binding is listed by name");
+    assert!(listed[0].what.contains("aokie.call.incoming") && listed[0].what.contains("\"greeting\"") && listed[0].what.contains("async") && listed[0].what.contains("event.data.callerNumber"), "{}", listed[0].what);
+    assert!(listed[1].what.contains("flow.succeeded") && listed[1].what.contains("tidy-up") && listed[1].what.contains("background") && listed[1].what.contains("switched off"), "{}", listed[1].what);
+    assert!(listed.iter().all(|i| !review::is_unreadable(i)));
+    // Ticked, they come back byte for byte, and the store reads them back.
+    restore::stage(&dst.0, &file, PASS, &Ticks::all(), &options()).unwrap();
+    assert!(matches!(restore::apply_pending(&dst.0), ApplyOutcome::Applied(_)));
+    assert_eq!(fs::read(dst.0.join("triggers.json")).unwrap(), fs::read(src.0.join("triggers.json")).unwrap());
+    let store = crate::plugins::TriggerStore::load(dst.0.join("triggers.json"));
+    assert_eq!(store.list().iter().map(|b| b.id.as_str()).collect::<Vec<_>>(), ["call-in", "after"]);
+    // Not ticked, they do not.
+    let other = TempDir::new("real-triggers-none");
+    restore::stage(&other.0, &file, PASS, &Ticks::none(), &options()).unwrap();
+    assert!(!restored_names(&other.0).iter().any(|n| n == "triggers.json"));
+}
+
+#[test]
+fn a_trigger_file_with_entries_the_store_would_skip_says_so_and_one_with_none_that_load_is_not_brought_back() {
+    let src = TempDir::new("mixed-triggers-src");
+    realistic(&src.0, "A");
+    put(&src.0, "triggers.json", br#"[{"id":"ok","event":"e.one","flowId":"f1","mode":"sync"},{"id":"junk"},{"id":"also-junk","event":5}]"#);
+    let out = TempDir::new("mixed-triggers-out");
+    let file = out.0.join("m.oaiybackup");
+    make(&src.0, &file);
+    let dst = TempDir::new("mixed-triggers-dst");
+    let preview = restore::inspect(&dst.0, &file, PASS, &options()).unwrap();
+    let listed: Vec<&review::ReviewItem> = preview.items.iter().filter(|i| i.name == "triggers.json").collect();
+    assert_eq!(listed.len(), 2, "{listed:?}");
+    assert_eq!(listed[0].title, "ok");
+    assert!(listed[1].title == "Entries that will not load" && listed[1].what.contains("2 entries") && listed[1].what.contains("ignored"), "{}", listed[1].what);
+    // A list where none of the entries would load is not a set of triggers at all.
+    put(&src.0, "triggers.json", br#"[{"id":"junk"},{"id":"also-junk"}]"#);
+    let file2 = out.0.join("m2.oaiybackup");
+    make(&src.0, &file2);
+    let preview = restore::inspect(&dst.0, &file2, PASS, &options()).unwrap();
+    let item = preview.items.iter().find(|i| i.name == "triggers.json").unwrap();
+    assert!(review::is_unreadable(item) && item.what.contains("none of its 2 entries"), "{}", item.what);
+    let staged = restore::stage(&dst.0, &file2, PASS, &Ticks::all(), &options()).unwrap();
+    assert!(!restored_names(&dst.0).iter().any(|n| n == "triggers.json") && staged.skipped.iter().any(|l| l.contains("triggers.json was not brought back")), "{:?}", staged.skipped);
+}
+
+#[test]
+fn the_dry_run_and_the_staging_agree_about_what_is_not_brought_back() {
+    let src = TempDir::new("agree-src");
+    realistic(&src.0, "A");
+    // Files that can act, in every kind of way OAIY cannot read them.
+    put(&src.0, "flows/broken.json", b"{ not json");
+    put(&src.0, "templates/broken.json", b"[1, 2");
+    put(&src.0, "connectors/broken.json", b"nope");
+    put(&src.0, "triggers.json", br#"{"triggers":[{"id":"x"}]}"#);
+    put(&src.0, "ai/providers.json", b"{ nope");
+    put(&src.0, "setup.json", b"{ nope");
+    put(&src.0, "services-autostart.json", br#"{"not":"a list"}"#);
+    put(&src.0, "flows/big.json", format!("{{\"name\":\"big\",\"pad\":\"{}\"}}", "x".repeat(3 << 20)));
+    let out = TempDir::new("agree-out");
+    let file = out.0.join("a.oaiybackup");
+    make_with(&src.0, &file, PASS, true, None).unwrap();
+    let dst = TempDir::new("agree-dst");
+    let everything = Ticks { keys: true, ..Ticks::all() };
+    let preview = restore::inspect(&dst.0, &file, PASS, &options()).unwrap();
+    let flagged: std::collections::BTreeSet<&str> = preview.items.iter().filter(|i| review::is_unreadable(i)).map(|i| i.name.as_str()).collect();
+    let expected = ["flows/broken.json", "templates/broken.json", "connectors/broken.json", "triggers.json", "ai/providers.json", "setup.json", "services-autostart.json", "flows/big.json"];
+    for name in expected {
+        assert!(flagged.contains(name), "{name} is said not to be brought back: {flagged:?}");
+    }
+    let staged = restore::stage(&dst.0, &file, PASS, &everything, &options()).unwrap();
+    let names = restored_names(&dst.0);
+    for name in expected {
+        assert!(!names.iter().any(|n| n == name), "{name} was said not to be brought back, and was staged");
+        assert!(!dst.0.join("restore").join(format!("pending-{}", staged.id)).join("files").join(name).exists(), "{name} is not in the staged folder either");
+        assert!(staged.skipped.iter().any(|l| l.contains(name) && l.contains("not brought back")), "{name} is said to be left out: {:?}", staged.skipped);
+    }
+    // And what is said to be brought back is: every item that is not flagged is staged.
+    let described: std::collections::BTreeSet<&str> = preview.items.iter().map(|i| i.name.as_str()).collect();
+    for name in described.difference(&flagged) {
+        assert!(names.iter().any(|n| n == name), "{name} is described as coming back but was not staged: {names:?}");
+    }
+    assert!(names.iter().any(|n| n == "flows/greeting.json") && names.iter().any(|n| n == "templates/my-rig.json") && names.iter().any(|n| n == "connectors/formlogic.json"));
+    // Applied, none of them reaches the data folder.
+    assert!(matches!(restore::apply_pending(&dst.0), ApplyOutcome::Applied(_)));
+    for name in expected {
+        assert!(!dst.0.join(name).exists(), "{name} is not in the data folder");
+    }
+    assert!(dst.0.join("flows").join("greeting.json").is_file());
+}
+
+#[test]
+fn a_template_and_a_flow_are_described_by_everything_that_makes_them_act() {
+    let src = TempDir::new("describe-src");
+    realistic(&src.0, "A");
+    put(
+        &src.0,
+        "templates/rig.json",
+        br#"{"id":"rig","name":"Rig","description":"d","category":"LLM","defaultPort":9000,"autostart":true,"run":{"command":"rig.exe","args":["--serve"],"env":{"LD_PRELOAD":"x.so","OTHER":"y"},"cwd":"C:/work"},"install":{"kind":"script","windows":"install-rig.ps1"},"files":{"install-rig.ps1":"echo hi"},"uninstall":{"paths":["${dataDir}/rig"]}}"#,
+    );
+    put(&src.0, "flows/hook.json", br#"{"name":"Watcher","nodes":[{"id":"a","type":"logic_block","data":{}}],"edges":[],"oaiyToolHook":{"tool":"run_command","mode":"before","flowId":"hook"}}"#);
+    put(&src.0, "flows/tool.json", br#"{"name":"Lookup","nodes":[],"edges":[],"oaiyTool":{"name":"lookup_caller","description":"d","flowId":"tool"}}"#);
+    let out = TempDir::new("describe-out");
+    let file = out.0.join("d.oaiybackup");
+    make(&src.0, &file);
+    let dst = TempDir::new("describe-dst");
+    let preview = restore::inspect(&dst.0, &file, PASS, &options()).unwrap();
+    let what = |name: &str| preview.items.iter().find(|i| i.name == name).unwrap_or_else(|| panic!("{name} is listed")).what.clone();
+    let template = what("templates/rig.json");
+    for part in ["rig.exe --serve", "install script install-rig.ps1", "writes 1 script file(s)", "deletes 1 path(s)", "STARTS with OAIY", "sets 2 environment variable(s)", "LD_PRELOAD", "runs in C:/work"] {
+        assert!(template.contains(part), "{part} is said of the template: {template}");
+    }
+    assert!(!template.contains("x.so"), "an environment variable's value is not shown, only its name");
+    assert!(what("flows/hook.json").contains("runs before the Agent's \"run_command\" tool"), "{}", what("flows/hook.json"));
+    assert!(what("flows/tool.json").contains("offered to the Agent as the tool \"lookup_caller\""), "{}", what("flows/tool.json"));
 }

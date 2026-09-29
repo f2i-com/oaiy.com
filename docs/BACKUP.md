@@ -164,6 +164,13 @@ More rules that a tick does not change:
   provider at another address into one of yours that keeps its key: the different one arrives
   beside it, without a key, as a proposal.
 - **Runs that were waiting** in the run journal are never brought back; only finished ones are.
+- **What the dry run says will not come back does not.** A file of one of these kinds that OAIY
+  cannot read (a trigger file that is not a list of triggers, a template that is not JSON) or that
+  is too large to be looked at (2 MiB) is left out of the restore and named in the result, so the
+  list you looked at is the list that comes back. Triggers are read the way OAIY's own trigger
+  store reads them, and an entry the store would skip is listed as ignored, not as a trigger. A
+  flow that is offered to the Agent as a tool, or that runs before or after one of the Agent's
+  tools, says so, and a template says which environment variables it sets and where it runs.
 - A backup with more items to look through than a person can (2,000) is refused.
 - Names and text a backup carries are cut to what a panel shows before they are displayed or
   recorded.
