@@ -101,8 +101,18 @@ pub(crate) fn is_oaiy_token(name: &str) -> bool {
 /// every privileged route and so to running code on the machine) and the
 /// Hugging Face token. A model server, a Python service, a custom node or a
 /// browser it installs is code that is not ours, and so is every package a
-/// venv's `pip` fetches: none of them needs either token, and same-user code can
-/// read them from `/proc/<pid>/environ` for as long as the process lives.
+/// venv's `pip` fetches. None of them needs either token, so none is given one:
+/// a package or service that sends its own environment home, logs it (a
+/// service's output goes into the log buffer the API serves) or passes it on to
+/// what it starts no longer takes them along.
+///
+/// This is NOT a defence against hostile code that goes looking as the same
+/// user. On Linux such code can read this process's own `/proc/<pid>/environ`,
+/// which holds the environment it started with, and the owner-only files (a paired
+/// app's token, which the auth guard accepts like the configured one, and the
+/// providers' keys) are readable by that user by design. Keeping the bearer out
+/// of the environment altogether needs the server to take it from a credential
+/// file, which it does not yet.
 ///
 /// Only what is inherited is scrubbed. Call this BEFORE applying a step's own
 /// `env`, so a value a template sets on purpose still arrives. No shipped
