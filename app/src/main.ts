@@ -97,9 +97,11 @@ A coding agent that lives entirely in this browser tab.
  */
 /** The desktop app (Tauri): it serves the page with the headers itself, and ships its files, so no service worker. */
 /** The desktop OAIY's window gives its pages: where it is, and a token for it. */
-function embeddedDesktop(): { origin: string; token: string } | null {
-  const given = (window as unknown as { __OAIY_DESKTOP__?: { origin?: unknown; token?: unknown } }).__OAIY_DESKTOP__;
-  return given && typeof given.origin === 'string' && typeof given.token === 'string' && given.token ? { origin: given.origin, token: given.token } : null;
+function embeddedDesktop(): { origin: string; token: string; backupToken?: string } | null {
+  const given = (window as unknown as { __OAIY_DESKTOP__?: { origin?: unknown; token?: unknown; backupToken?: unknown } }).__OAIY_DESKTOP__;
+  if (!given || typeof given.origin !== 'string' || typeof given.token !== 'string' || !given.token) return null;
+  // The desktop's own secret for a restore's requests (backup.ts): only this page is given it.
+  return { origin: given.origin, token: given.token, ...(typeof given.backupToken === 'string' && given.backupToken ? { backupToken: given.backupToken } : {}) };
 }
 
 /** OAIY's own window, where the app is a page beside the sidebar (it knows the desktop from its first line). */

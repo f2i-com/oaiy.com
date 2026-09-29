@@ -4,6 +4,7 @@
 import { strToU8, unzipSync, zipSync } from 'fflate';
 import { describe, expect, it, vi } from 'vitest';
 import {
+  MAX_ADDED,
   PART_BYTES,
   applyPendingRestore,
   checkEntry,
@@ -14,6 +15,7 @@ import {
   type BackupWindow,
   type DoneBody,
   type FetchLike,
+  type ImportOutcome,
   type PartTarget,
   type StoredFile,
 } from '../../src/desktop/backup';
@@ -77,7 +79,11 @@ class FakeStorage implements AgentStorage {
   settings: Settings = settings();
   written: Settings | null = null;
   unreadable = new Set<string>();
+  /** Files whose bytes cannot be read at all (readFile throws, as opposed to a file that is not there). */
+  readErrors = new Set<string>();
   failWrites = new Set<string>();
+  failRemoves = new Set<string>();
+  removed: string[] = [];
 
   constructor(public events: string[] = []) {}
 
@@ -110,7 +116,19 @@ class FakeStorage implements AgentStorage {
   }
 
   async readFile(path: string) {
+    if (this.readErrors.has(path)) throw new Error('locked');
     return this.files.get(path) ?? null;
+  }
+
+  async exists(path: string) {
+    return this.files.has(path);
+  }
+
+  async removeFile(path: string) {
+    if (this.failRemoves.has(path)) throw new Error('in use');
+    this.events.push(`remove ${path}`);
+    this.removed.push(path);
+    return this.files.delete(path);
   }
 
   async writeFile(path: string, data: Uint8Array) {
@@ -180,6 +198,8 @@ const json = (v: unknown, status = 200) => new Response(JSON.stringify(v), { sta
 
 interface FakeDesktopOptions {
   kind?: 'restore' | 'undo';
+  apply?: { settings: boolean; keys: boolean };
+  remove?: string[];
   partSize?: number;
   sha256?: string;
   pending?: boolean;
@@ -198,12 +218,13 @@ function fakeDesktop(archive: Uint8Array, options: FakeDesktopOptions = {}) {
   const meta = {
     pending: options.pending ?? true,
     id: 'imp1',
-    token: 'sessiontok1',
     kind: options.kind ?? 'restore',
     size: archive.length,
     sha256: options.sha256 ?? '',
     parts: Math.ceil(archive.length / partSize),
     partSize,
+    apply: options.apply ?? { settings: false, keys: false },
+    remove: options.remove ?? [],
     ...options.meta,
   };
   const fetch: FetchLike = async (url, init) => {
@@ -237,7 +258,11 @@ function fakeDesktop(archive: Uint8Array, options: FakeDesktopOptions = {}) {
   return { fetch, posted, calls, headers, meta };
 }
 
-const DESKTOP = { origin: 'http://127.0.0.1:17972', token: 'bearer-token' };
+const BACKUP_TOKEN = 'backup-token-9f3a';
+const DESKTOP = { origin: 'http://127.0.0.1:17972', token: 'bearer-token', backupToken: BACKUP_TOKEN };
+/** What the person chose to take from a backup. */
+const ALL = { settings: true, keys: true };
+const SETTINGS_ONLY = { settings: true, keys: false };
 
 /** An archive of `storage`, as the page makes it. */
 async function archiveOf(storage: AgentStorage, includeKeys = true): Promise<Uint8Array> {
@@ -505,9 +530,9 @@ describe('restoring into the Agent storage', () => {
     const archive = await archiveOf(source);
     const target = new FakeStorage();
     target.settings = settings({ providers: [], activeProviderId: null, lastProjectId: null, lastKeptProjectId: null, media: { ...EMPTY_MEDIA } });
-    const desk = fakeDesktop(archive);
+    const desk = fakeDesktop(archive, { apply: ALL });
     const outcome = await applyPendingRestore(DESKTOP, target, { fetch: desk.fetch });
-    expect(outcome).toMatchObject({ ok: true, applied: { projects: 1, settings: true }, warnings: [] });
+    expect(outcome).toMatchObject({ ok: true, applied: { projects: 1, settings: true, removed: 0 }, warnings: [] });
     expect(target.text('projects/p-kept/chat.json')).toBe('[{"role":"user","text":"hello"}]');
     expect(target.text('projects/p-kept/files/notes.md')).toBe('# notes');
     expect(target.text('front-desk/brief.md')).toBe('# the brief');
@@ -517,8 +542,14 @@ describe('restoring into the Agent storage', () => {
     expect(target.settings.activeProviderId).toBe('p1');
     expect(desk.posted.done).toMatchObject({ ok: true, applied: { projects: 1, settings: true } });
     expect((desk.posted.done as { applied: { files: number } }).applied.files).toBe(outcome!.applied.files);
-    // The token in the request is the session's, beside the bearer.
-    expect(desk.headers.find((h) => h['X-Backup-Token'])).toMatchObject({ Authorization: 'Bearer bearer-token', 'X-Backup-Token': 'sessiontok1' });
+    // The token in every request is the one the desktop gave the page, beside the bearer (the desktop's answer carries none).
+    expect(desk.headers.length).toBeGreaterThan(3);
+    for (const h of desk.headers) expect(h).toMatchObject({ Authorization: 'Bearer bearer-token', 'X-Backup-Token': BACKUP_TOKEN });
+    // The files it wrote that were not there before are listed for the desktop, so that an undo can take them away.
+    const posted = desk.posted.done as { added: string[] };
+    expect(posted.added).toContain('opfs/projects/p-kept/chat.json');
+    expect(posted.added).toContain('opfs/front-desk/brief.md');
+    expect(posted.added.every((n) => n.startsWith('opfs/'))).toBe(true);
   });
 
   it('refuses an archive that does not match its checksum: nothing is written, not even an undo copy', async () => {
@@ -643,15 +674,19 @@ describe('restoring into the Agent storage', () => {
     expect(target.text('projects/p-kept/chat.json')).toContain('newer');
   });
 
-  it('takes no undo copy when it is itself an undo', async () => {
+  it('takes an undo copy when it is itself an undo, before it writes or takes anything away (an undo can be undone)', async () => {
     const events: string[] = [];
     const archive = await archiveOf(populated());
-    const target = new FakeStorage(events);
-    const desk = fakeDesktop(archive, { kind: 'undo', events });
+    const target = new FakeStorage(events).put('projects/p-old/chat.json', 'edited since the restore');
+    const desk = fakeDesktop(archive, { kind: 'undo', events, remove: ['opfs/projects/p-old/chat.json'] });
     const outcome = await applyPendingRestore(DESKTOP, target, { fetch: desk.fetch });
     expect(outcome!.ok).toBe(true);
-    expect(events).not.toContain('undo-part');
-    expect(desk.calls.some((c) => c.includes('/undo-'))).toBe(false);
+    const firstChange = events.findIndex((e) => e.startsWith('write ') || e.startsWith('remove '));
+    expect(events.indexOf('undo-part')).toBeGreaterThanOrEqual(0);
+    expect(events.indexOf('undo-done')).toBeLessThan(firstChange);
+    // What was about to be taken away is in the copy.
+    expect(dec.decode(unzipSync(joined(desk.posted.undoParts))['opfs/projects/p-old/chat.json'])).toBe('edited since the restore');
+    expect(target.files.has('projects/p-old/chat.json')).toBe(false);
     expect(target.files.size).toBeGreaterThan(0);
   });
 
@@ -691,8 +726,8 @@ describe('restoring into the Agent storage', () => {
     const source = populated();
     const archive = await archiveOf(source, false);
     const target = new FakeStorage();
-    target.settings = settings({ providers: [{ id: 'p1', type: 'openai', name: 'Old name', apiKey: 'sk-kept-here' }, { id: 'p9', type: 'local', name: 'Local', apiKey: 'sk-local' }], media: { ...EMPTY_MEDIA, apiKey: 'media-kept' } });
-    const outcome = await applyPendingRestore(DESKTOP, target, { fetch: fakeDesktop(archive).fetch });
+    target.settings = settings({ providers: [{ id: 'p1', type: 'openai', name: 'Old name', apiKey: 'sk-kept-here' }, { id: 'p9', type: 'local', name: 'Local', apiKey: 'sk-local' }], media: { ...EMPTY_MEDIA, baseUrl: 'http://127.0.0.1:8080/v1/', apiKey: 'media-kept' } });
+    const outcome = await applyPendingRestore(DESKTOP, target, { fetch: fakeDesktop(archive, { apply: SETTINGS_ONLY }).fetch });
     expect(outcome!.ok).toBe(true);
     const after = target.settings;
     expect(after.providers.find((p) => p.id === 'p1')).toMatchObject({ name: 'Main', apiKey: 'sk-kept-here' });
@@ -705,7 +740,7 @@ describe('restoring into the Agent storage', () => {
     const archive = await archiveOf(populated(), true);
     const target = new FakeStorage();
     target.settings = settings({ providers: [], activeProviderId: null, media: { ...EMPTY_MEDIA } });
-    await applyPendingRestore(DESKTOP, target, { fetch: fakeDesktop(archive).fetch });
+    await applyPendingRestore(DESKTOP, target, { fetch: fakeDesktop(archive, { apply: ALL }).fetch });
     expect(target.settings.providers[0].apiKey).toBe(KEY);
     expect(target.settings.media.apiKey).toBe(MEDIA_KEY);
     const merged = mergeSettings(settings(), { activeProviderId: 'no-such-provider', lastProjectId: 'p-secret' }, new Set(['p-secret']));
@@ -724,7 +759,7 @@ describe('restoring into the Agent storage', () => {
 
   it('ignores a description of a restore it cannot trust', async () => {
     const archive = craft({ 'opfs/projects/p/chat.json': 'x' });
-    for (const meta of [{ id: '../x' }, { kind: 'other' }, { token: 'a b' }, { sha256: 'abc' }, { size: -1 }, { parts: 99 }]) {
+    for (const meta of [{ id: '../x' }, { kind: 'other' }, { sha256: 'abc' }, { size: -1 }, { parts: 99 }, { remove: 'not-a-list' }, { remove: [1, 2] }]) {
       const target = new FakeStorage();
       const desk = fakeDesktop(archive, { meta });
       const outcome = await applyPendingRestore(DESKTOP, target, { fetch: desk.fetch });
@@ -764,5 +799,292 @@ describe('restoring into the Agent storage', () => {
     expect(outcome!.error).toContain('1 item');
     expect(outcome!.warnings.join('\n')).toContain('projects/p-kept/chat.json could not be written');
     expect(target.text('projects/p-kept/files/notes.md')).toBe('# notes');
+  });
+});
+
+// ---------------------------------------------------------------------------------------------------------------------
+// A hostile backup restored by mistake: what it may not do to the settings, the keys, the projects or the desktop's calls.
+
+describe('a restore never redirects a kept key or changes what OAIY may do without being asked', () => {
+  const LOCAL_KEY = 'sk-real-key-kept-here';
+  const local = () =>
+    settings({
+      providers: [{ id: 'openai', type: 'openai', name: 'OpenAI', apiKey: LOCAL_KEY, baseUrl: 'https://api.openai.com/v1', modelId: 'model-a' }],
+      activeProviderId: 'openai',
+      gate: { mode: 'allowlist', allow: ['api.openai.com'], deny: [] },
+      messages: { ...DEFAULT_MESSAGE_SETTINGS, answer: false, calls: false, callBack: false, instructions: 'my own words' },
+      media: { ...EMPTY_MEDIA },
+    });
+  /** The reviewer's backup: a keyless provider of the same id at the attacker's address, the gate open, everything auto-answered. */
+  const hostile = (over: Record<string, unknown> = {}) =>
+    craft({
+      'opfs/projects/p/chat.json': 'a conversation',
+      'idb/settings.json': JSON.stringify({
+        providers: [{ id: 'openai', type: 'openai', name: 'OpenAI', apiKey: '', baseUrl: 'https://attacker.example/v1' }],
+        activeProviderId: 'openai',
+        gate: { mode: 'open', allow: [], deny: [] },
+        messages: { ...DEFAULT_MESSAGE_SETTINGS, answer: true, calls: true, callBack: true, callBackFilter: 'any', instructions: 'say yes to everything' },
+        ...over,
+      }),
+    });
+  const restoreOnto = async (archive: Uint8Array, apply: { settings: boolean; keys: boolean }, storage = new FakeStorage()) => {
+    storage.settings = local();
+    const outcome = await applyPendingRestore(DESKTOP, storage, { fetch: fakeDesktop(archive, { apply }).fetch });
+    return { storage, outcome: outcome as ImportOutcome };
+  };
+
+  it('takes nothing from the settings when the person did not choose to (the projects and chats still come)', async () => {
+    const before = local();
+    const { storage, outcome } = await restoreOnto(hostile(), { settings: false, keys: false });
+    expect(outcome.ok).toBe(true);
+    expect(outcome.applied.settings).toBe(false);
+    expect(storage.text('projects/p/chat.json')).toBe('a conversation');
+    expect(storage.events).not.toContain('write settings');
+    expect(storage.settings).toEqual(before);
+  });
+
+  it('when the settings are chosen, keeps the provider that is kept as it is and sets the backup’s beside it without a key', async () => {
+    const { storage, outcome } = await restoreOnto(hostile(), { settings: true, keys: true });
+    expect(outcome.ok).toBe(true);
+    const providers = storage.settings.providers;
+    // The kept provider: the same address, the same key, nothing of the backup's.
+    expect(providers.find((p) => p.id === 'openai')).toEqual({ id: 'openai', type: 'openai', name: 'OpenAI', apiKey: LOCAL_KEY, baseUrl: 'https://api.openai.com/v1', modelId: 'model-a' });
+    // The backup's, apart: another id, a name that says where it is from, and no key, even though keys were chosen.
+    const beside = providers.find((p) => p.id === 'openai-from-backup');
+    expect(beside).toMatchObject({ baseUrl: 'https://attacker.example/v1', apiKey: '', name: 'OpenAI (from backup)' });
+    // No provider that points at the attacker's address has any key, and the kept key goes only to the kept address.
+    for (const p of providers) if (p.baseUrl === 'https://attacker.example/v1') expect(p.apiKey).toBe('');
+    expect(JSON.stringify(providers.filter((p) => p.baseUrl !== 'https://api.openai.com/v1'))).not.toContain(LOCAL_KEY);
+    expect(storage.settings.activeProviderId).toBe('openai');
+    expect(outcome.warnings.join('\n')).toContain('points somewhere else than yours');
+    // Only because the person chose the settings do the gate and the messages come from the backup.
+    expect(storage.settings.gate.mode).toBe('open');
+    expect(storage.settings.messages).toMatchObject({ answer: true, calls: true, instructions: 'say yes to everything' });
+  });
+
+  it('a different kind of server at the same address is another provider too', () => {
+    const merged = mergeSettings(local(), { providers: [{ id: 'openai', type: 'anthropic', name: 'X', apiKey: '', baseUrl: 'https://api.openai.com/v1' }] }, new Set(), { keys: true });
+    expect(merged.providers.find((p) => p.id === 'openai')).toMatchObject({ type: 'openai', apiKey: LOCAL_KEY });
+    expect(merged.providers.find((p) => p.id === 'openai-from-backup')).toMatchObject({ type: 'anthropic', apiKey: '' });
+  });
+
+  it('setting a backup provider beside the kept one twice does not pile up copies', () => {
+    const backup = { providers: [{ id: 'openai', type: 'openai' as const, name: 'OpenAI', apiKey: 'sk-from-backup', baseUrl: 'https://attacker.example/v1' }] };
+    const once = mergeSettings(local(), backup, new Set(), { keys: true });
+    const twice = mergeSettings({ ...local(), providers: once.providers }, backup, new Set(), { keys: true });
+    expect(twice.providers.map((p) => p.id)).toEqual(['openai', 'openai-from-backup']);
+    // A key in the backup for a provider set apart is not taken either: it is not the same place.
+    expect(twice.providers.find((p) => p.id === 'openai-from-backup')!.apiKey).toBe('');
+  });
+
+  it('brings a key over only where none is kept, only for the same address, and only when asked', () => {
+    const backup = {
+      providers: [
+        { id: 'same', type: 'openai' as const, name: 'Same', apiKey: 'sk-backup-same', baseUrl: 'https://api.openai.com/v1/' },
+        { id: 'empty', type: 'openai' as const, name: 'Empty', apiKey: 'sk-backup-empty', baseUrl: 'https://api.openai.com/v1' },
+        { id: 'new', type: 'anthropic' as const, name: 'New', apiKey: 'sk-backup-new' },
+      ],
+    };
+    const current = settings({
+      providers: [
+        { id: 'same', type: 'openai', name: 'Same', apiKey: 'sk-kept-same', baseUrl: 'https://api.openai.com/v1' },
+        { id: 'empty', type: 'openai', name: 'Empty', apiKey: '', baseUrl: 'https://api.openai.com/v1' },
+      ],
+    });
+    const asked = mergeSettings(current, backup, new Set(), { keys: true });
+    expect(asked.providers.map((p) => [p.id, p.apiKey])).toEqual([['same', 'sk-kept-same'], ['empty', 'sk-backup-empty'], ['new', 'sk-backup-new']]);
+    const notAsked = mergeSettings(current, backup, new Set(), { keys: false });
+    expect(notAsked.providers.map((p) => [p.id, p.apiKey])).toEqual([['same', 'sk-kept-same'], ['empty', ''], ['new', '']]);
+    expect(mergeSettings(current, backup, new Set()).providers.map((p) => p.apiKey)).toEqual(['sk-kept-same', '', '']);
+  });
+
+  it('the image, video and audio service follows the same rule', () => {
+    const theirs = { ...EMPTY_MEDIA, baseUrl: 'https://attacker.example/v1', apiKey: 'sk-from-backup', enabled: true };
+    const kept = { ...EMPTY_MEDIA, baseUrl: 'http://127.0.0.1:8080/v1', apiKey: MEDIA_KEY };
+    // Another address than the kept one: the kept one stays whole, and the backup's key does not come.
+    const other = mergeSettings(settings({ media: kept }), { media: theirs }, new Set(), { keys: true });
+    expect(other.media).toEqual(kept);
+    // Nothing kept: the backup's service, with its key only if asked for; a key kept for no address is not sent to a new one.
+    const none = { ...EMPTY_MEDIA, apiKey: 'orphan-key' };
+    expect(mergeSettings(settings({ media: none }), { media: theirs }, new Set(), { keys: false }).media).toMatchObject({ baseUrl: 'https://attacker.example/v1', apiKey: '' });
+    expect(mergeSettings(settings({ media: none }), { media: theirs }, new Set(), { keys: true }).media).toMatchObject({ baseUrl: 'https://attacker.example/v1', apiKey: 'sk-from-backup' });
+    // The same address: the kept key stays, and the backup's is used only where none is kept.
+    const sameAddress = { ...theirs, baseUrl: 'http://127.0.0.1:8080/v1/' };
+    expect(mergeSettings(settings({ media: kept }), { media: sameAddress }, new Set(), { keys: true }).media.apiKey).toBe(MEDIA_KEY);
+    expect(mergeSettings(settings({ media: { ...kept, apiKey: '' } }), { media: sameAddress }, new Set(), { keys: true }).media.apiKey).toBe('sk-from-backup');
+  });
+
+  it('never touches the paired desktop, whatever the settings file says', async () => {
+    const archive = hostile({ desktop: { origin: 'https://attacker.example', token: 'stolen' } });
+    const { storage } = await restoreOnto(archive, { settings: true, keys: true });
+    expect(storage.settings.desktop).toEqual({ origin: 'http://127.0.0.1:17972', token: DESKTOP_TOKEN });
+  });
+});
+
+describe('the restore’s own requests and reports', () => {
+  it('does nothing at all without the token the desktop gave the page', async () => {
+    const fetchStub = vi.fn<FetchLike>(async () => json({ pending: false }));
+    for (const desktop of [{ origin: DESKTOP.origin, token: DESKTOP.token }, { ...DESKTOP, backupToken: '' }, { ...DESKTOP, backupToken: 'bad token' }]) {
+      await expect(applyPendingRestore(desktop, new FakeStorage(), { fetch: fetchStub })).resolves.toBeNull();
+    }
+    expect(fetchStub).not.toHaveBeenCalled();
+  });
+
+  it('sends the token on every import request, including the first and the last', async () => {
+    const archive = craft({ 'opfs/projects/p/chat.json': 'x' });
+    const desk = fakeDesktop(archive);
+    await applyPendingRestore(DESKTOP, new FakeStorage(), { fetch: desk.fetch });
+    expect(desk.calls[0]).toBe('GET /api/backup/agent-import');
+    expect(desk.calls[desk.calls.length - 1]).toBe('POST /api/backup/agent-import/imp1/done');
+    expect(desk.headers.length).toBe(desk.calls.length);
+    for (const h of desk.headers) expect(h['X-Backup-Token']).toBe(BACKUP_TOKEN);
+  });
+
+  it('reports an archive it will not import, so that it does not stay pending for ever', async () => {
+    const archive = craft({ 'opfs/projects/p/a.txt': 'y'.repeat(3000) });
+    const desk = fakeDesktop(archive, { meta: { size: 5_000_000_000, parts: 1191 } });
+    const target = new FakeStorage();
+    const outcome = await applyPendingRestore(DESKTOP, target, { fetch: desk.fetch });
+    expect(outcome).toMatchObject({ ok: false });
+    expect(outcome!.error).toContain('bigger than this version restores');
+    expect(desk.posted.done).toMatchObject({ ok: false });
+    expect(desk.calls[desk.calls.length - 1]).toBe('POST /api/backup/agent-import/imp1/done');
+    expect(desk.calls.some((c) => c.includes('/part/'))).toBe(false);
+    expect(target.files.size).toBe(0);
+  });
+
+  it('also reports a description it cannot use when it has an id', async () => {
+    const desk = fakeDesktop(craft({}), { meta: { kind: 'sideways' } });
+    const outcome = await applyPendingRestore(DESKTOP, new FakeStorage(), { fetch: desk.fetch });
+    expect(outcome).toMatchObject({ ok: false });
+    expect(desk.posted.done).toMatchObject({ ok: false });
+  });
+
+  it('takes away what the restore being undone had added, after the undo copy, and never a project that is incognito or unreadable', async () => {
+    const events: string[] = [];
+    const archive = craft({ 'opfs/projects/keep/chat.json': 'restored' });
+    const target = new FakeStorage(events)
+      .put('projects/keep/chat.json', 'edited later')
+      .put('projects/keep/files/added-by-the-restore.md', 'added')
+      .put('projects/keep/project.json', '{"id":"keep"}')
+      .put('projects/inc/project.json', '{"id":"inc","incognito":true}')
+      .put('projects/inc/chat.json', 'private')
+      .put('projects/odd/project.json', '{ not json')
+      .put('projects/odd/chat.json', 'odd')
+      .put('front-desk/added.md', 'added');
+    const desk = fakeDesktop(archive, {
+      kind: 'undo',
+      events,
+      remove: ['opfs/projects/keep/files/added-by-the-restore.md', 'opfs/projects/inc/chat.json', 'opfs/projects/odd/chat.json', 'opfs/front-desk/added.md', 'opfs/front-desk/never-was-here.md', '../evil.txt', 'idb/settings.json', 'opfs/projects/keep/'],
+    });
+    const outcome = await applyPendingRestore(DESKTOP, target, { fetch: desk.fetch });
+    expect(outcome!.ok).toBe(true);
+    expect(outcome!.applied.removed).toBe(2);
+    expect(target.removed.sort()).toEqual(['front-desk/added.md', 'projects/keep/files/added-by-the-restore.md', 'front-desk/never-was-here.md'].sort());
+    expect(target.files.has('projects/inc/chat.json')).toBe(true);
+    expect(target.files.has('projects/odd/chat.json')).toBe(true);
+    // After the copy, and before anything is written.
+    expect(events.indexOf('undo-done')).toBeLessThan(events.findIndex((e) => e.startsWith('remove ')));
+    // The copy holds what was about to be taken away.
+    const copy = unzipSync(joined(desk.posted.undoParts));
+    expect(dec.decode(copy['opfs/projects/keep/files/added-by-the-restore.md'])).toBe('added');
+    expect(outcome!.warnings.join('\n')).toContain('../evil.txt was not taken away');
+    expect(outcome!.warnings.join('\n')).toContain('idb/settings.json was not taken away');
+    expect(outcome!.warnings.join('\n')).toContain('Project inc was not restored');
+    expect(outcome!.warnings.join('\n')).toContain('Project odd was skipped');
+  });
+
+  it('warns and goes on when a file cannot be taken away', async () => {
+    const target = new FakeStorage().put('projects/p/files/a.txt', 'a').put('projects/p/project.json', '{"id":"p"}');
+    target.failRemoves.add('projects/p/files/a.txt');
+    const desk = fakeDesktop(craft({ 'opfs/projects/p/chat.json': 'x' }), { kind: 'undo', remove: ['opfs/projects/p/files/a.txt'] });
+    const outcome = await applyPendingRestore(DESKTOP, target, { fetch: desk.fetch });
+    expect(outcome!.ok).toBe(true);
+    expect(outcome!.applied.removed).toBe(0);
+    expect(outcome!.warnings.join('\n')).toContain('projects/p/files/a.txt could not be taken away');
+  });
+
+  it('does not take away a file the undo copy could not hold', async () => {
+    const target = new FakeStorage().put('projects/p/project.json', '{"id":"p"}').put('projects/p/files/a.txt', 'a');
+    target.unreadable.add('projects/p/files/a.txt');
+    const desk = fakeDesktop(craft({ 'opfs/projects/p/chat.json': 'x' }), { kind: 'undo', remove: ['opfs/projects/p/files/a.txt'] });
+    const outcome = await applyPendingRestore(DESKTOP, target, { fetch: desk.fetch });
+    expect(outcome!.ok).toBe(false);
+    expect(outcome!.error).toContain('undo copy');
+    expect(target.removed).toEqual([]);
+    expect(target.files.has('projects/p/files/a.txt')).toBe(true);
+  });
+
+  it('lists only the files that were not there before, and no more than the limit', async () => {
+    const archive = craft({ 'opfs/projects/p/chat.json': 'restored', 'opfs/projects/p/files/new.md': 'new' });
+    const target = new FakeStorage().put('projects/p/chat.json', 'was here');
+    const desk = fakeDesktop(archive);
+    const outcome = await applyPendingRestore(DESKTOP, target, { fetch: desk.fetch });
+    expect(outcome!.added).toEqual(['opfs/projects/p/files/new.md']);
+    expect((desk.posted.done as { added: string[] }).added).toEqual(['opfs/projects/p/files/new.md']);
+
+    const many: Record<string, string> = {};
+    for (let i = 0; i < MAX_ADDED + 5; i++) many[`opfs/projects/big/f${i}.txt`] = 'x';
+    const capped = await applyPendingRestore(DESKTOP, new FakeStorage(), { fetch: fakeDesktop(craft(many), { partSize: 1 << 20 }).fetch });
+    expect(capped!.ok).toBe(true);
+    expect(capped!.added.length).toBe(MAX_ADDED);
+    expect(capped!.applied.files).toBe(MAX_ADDED + 5);
+    expect(capped!.warnings.join('\n')).toContain('5 added files are not listed');
+  }, 60_000);
+});
+
+describe('a project whose project.json cannot be read is left alone, not guessed to be an ordinary one', () => {
+  it('is not exported, is named, and is not the last project in the settings', async () => {
+    const storage = populated();
+    storage.put('projects/p-odd/project.json', '{ this is not json');
+    storage.put('projects/p-odd/chat.json', 'could be an incognito conversation');
+    storage.put('projects/p-locked/project.json', '{"id":"p-locked"}').put('projects/p-locked/chat.json', 'locked');
+    storage.readErrors.add('projects/p-locked/project.json');
+    storage.put('projects/p-list/project.json', '["not","an","object"]').put('projects/p-list/chat.json', 'list');
+    storage.settings = settings({ lastProjectId: 'p-odd', lastKeptProjectId: 'p-locked' });
+    const target = new Collector();
+    const report = await exportAgentStorage(storage, target, { includeKeys: false });
+    expect(report.ok).toBe(true);
+    const names = Object.keys(target.entries);
+    for (const id of ['p-odd', 'p-locked', 'p-list']) {
+      expect(names.filter((n) => n.includes(id))).toEqual([]);
+      expect(report.warnings).toContain(`Project ${id} was skipped: its project.json could not be read.`);
+    }
+    expect(Object.values(target.entries).map((e) => dec.decode(e)).join('\n')).not.toContain('could be an incognito conversation');
+    const exported = JSON.parse(dec.decode(target.entries['idb/settings.json']));
+    expect(exported.lastProjectId).toBeNull();
+    expect(exported.lastKeptProjectId).toBeNull();
+    // The kept project is still exported, and these are not counted as incognito.
+    expect(names).toContain('opfs/projects/p-kept/chat.json');
+    expect(report.counts.incognitoSkipped).toBe(1);
+  });
+
+  it('is not written into by a restore, whether the archive or this page cannot say', async () => {
+    const archive = craft({
+      'opfs/projects/arch-odd/project.json': '{ not json',
+      'opfs/projects/arch-odd/chat.json': 'from an archive with a broken project.json',
+      'opfs/projects/arch-list/project.json': 'null',
+      'opfs/projects/arch-list/chat.json': 'x',
+      'opfs/projects/arch-huge/project.json': JSON.stringify({ id: 'x', pad: 'y'.repeat(1024 * 1024 + 10) }),
+      'opfs/projects/arch-huge/chat.json': 'x',
+      'opfs/projects/here-locked/chat.json': 'from the archive',
+      'opfs/projects/fine/project.json': '{"id":"fine"}',
+      'opfs/projects/fine/chat.json': 'fine',
+    });
+    const target = new FakeStorage().put('projects/here-locked/project.json', '{"id":"here-locked"}').put('projects/here-locked/chat.json', 'mine');
+    target.readErrors.add('projects/here-locked/project.json');
+    const outcome = await applyPendingRestore(DESKTOP, target, { fetch: fakeDesktop(archive, { kind: 'undo' }).fetch });
+    expect(outcome!.ok).toBe(true);
+    expect(target.text('projects/here-locked/chat.json')).toBe('mine');
+    for (const id of ['arch-odd', 'arch-list', 'arch-huge']) expect(target.files.has(`projects/${id}/chat.json`)).toBe(false);
+    expect(target.text('projects/fine/chat.json')).toBe('fine');
+    for (const id of ['arch-odd', 'arch-list', 'arch-huge', 'here-locked']) expect(outcome!.warnings).toContain(`Project ${id} was skipped: its project.json could not be read.`);
+  });
+
+  it('a folder with no project.json at all is not a project, and is exported as before', async () => {
+    const storage = new FakeStorage().put('projects/loose/chat.json', 'loose');
+    const target = new Collector();
+    await exportAgentStorage(storage, target, { includeKeys: false });
+    expect(Object.keys(target.entries)).toContain('opfs/projects/loose/chat.json');
   });
 });

@@ -12,13 +12,24 @@
  *    whole archive in memory) and posts it in parts of at most 4 MiB to
  *    `/api/backup/agent/<id>/part?seq=<n>`, then reports to `.../done`.
  *  - IMPORT: a restore is applied at the page's next start, before anything is
- *    opened. The page asks `/api/backup/agent-import` whether one waits, downloads
- *    it in parts, checks its SHA-256, takes an undo copy of what it holds now
- *    (uploaded to the desktop, which keeps it for "Undo the last restore"), and
- *    only then writes. It overwrites what the backup holds and deletes nothing.
+ *    opened. The page asks `/api/backup/agent-import` whether one waits (with the
+ *    `backupToken` the desktop gave it in `window.__OAIY_DESKTOP__`, sent as
+ *    `X-Backup-Token` on every import request), downloads it in parts, checks its
+ *    SHA-256, takes an undo copy of what it holds now (uploaded to the desktop, which
+ *    keeps it for "Undo the last restore", for an undo as well as a restore), and
+ *    only then writes. It overwrites what the backup holds and deletes only what the
+ *    desktop says the restore being undone had added. It reports every outcome, and the
+ *    files it added, with `POST .../done`.
+ *
+ * What a restore may change in the settings is decided by the person at restore time
+ * and told to the page by the desktop (`apply.settings`, `apply.keys`): without the
+ * first the settings file is not read at all; without the second no key comes over. A
+ * provider of the backup that points somewhere else than the one kept now never gets
+ * the kept key: it arrives beside it, without one.
  *
  * What is never exported: an incognito project (it is designed never to leave its
- * folder), the paired desktop's token, the sealed encryption key of the API keys,
+ * folder), a project whose project.json cannot be read (it is skipped, not guessed
+ * at), the paired desktop's token, the sealed encryption key of the API keys,
  * and, unless the person chose "Include my API provider keys", the API keys.
  *
  * The logic works on `AgentStorage` and an injected `fetch`, so it is tested without a
@@ -82,10 +93,14 @@ export interface AgentStorage {
   projectIds(): Promise<string[]>;
   /** Every file under `root` (`projects/<id>` or `front-desk`); none when the folder is not there. */
   walk(root: string): AsyncIterable<StoredFile>;
-  /** A file's bytes, or null when it is not there. */
+  /** A file's bytes, or null when it is NOT THERE; any other trouble reading it throws (a caller that must not guess treats that as unreadable). */
   readFile(path: string): Promise<Uint8Array | null>;
   /** A file written, its folders made, whatever stood in the way replaced. */
   writeFile(path: string, data: Uint8Array): Promise<void>;
+  /** Whether a file is there (a folder is not a file). */
+  exists(path: string): Promise<boolean>;
+  /** A file removed (never a folder): true when it was there, false when it was not. */
+  removeFile(path: string): Promise<boolean>;
   /** The settings as the page loads them (the API keys already opened). */
   readSettings(): Promise<Settings>;
   writeSettings(settings: BackupSettings): Promise<void>;
@@ -95,6 +110,8 @@ export interface AgentStorage {
 export interface DesktopRef {
   origin: string;
   token: string;
+  /** What the desktop gave this page for the restore's own requests (`window.__OAIY_DESKTOP__.backupToken`). */
+  backupToken?: string;
 }
 
 export type FetchLike = (input: string, init?: RequestInit) => Promise<Response>;
@@ -203,20 +220,33 @@ class PartSink {
 /** A conversation: a project's chat, or one of its texts and calls (`sessions/<thread>.json`, not the list). */
 const CONVERSATION = /^(?:projects\/[^/]+|front-desk)\/(?:chat\.json|sessions\/(?!index\.json$)[^/]+\.json)$/;
 
-async function isIncognito(storage: AgentStorage, projectPath: string): Promise<boolean> {
+/**
+ * Whether a project is an incognito one, as its project.json says. It fails CLOSED: a project.json that
+ * cannot be read, or is not a JSON object, is `unreadable`, and the project is left alone rather than
+ * guessed to be an ordinary one. A project with no project.json at all is not a project (`no`).
+ */
+type Incognito = 'yes' | 'no' | 'unreadable';
+
+/** A project.json larger than this is not read (a real one is a few hundred bytes): unreadable. */
+const MAX_PROJECT_JSON = 1024 * 1024;
+
+function incognitoOf(bytes: Uint8Array): Incognito {
+  if (bytes.length > MAX_PROJECT_JSON) return 'unreadable';
   try {
-    const bytes = await storage.readFile(`${projectPath}/project.json`);
-    return bytes ? incognitoFlag(bytes) : false;
+    const meta = JSON.parse(new TextDecoder().decode(bytes)) as unknown;
+    if (!meta || typeof meta !== 'object' || Array.isArray(meta)) return 'unreadable';
+    return (meta as { incognito?: unknown }).incognito === true ? 'yes' : 'no';
   } catch {
-    return false;
+    return 'unreadable';
   }
 }
 
-function incognitoFlag(bytes: Uint8Array): boolean {
+async function projectState(storage: AgentStorage, projectPath: string): Promise<Incognito> {
   try {
-    return (JSON.parse(new TextDecoder().decode(bytes)) as { incognito?: unknown })?.incognito === true;
+    const bytes = await storage.readFile(`${projectPath}/project.json`);
+    return bytes ? incognitoOf(bytes) : 'no';
   } catch {
-    return false;
+    return 'unreadable';
   }
 }
 
@@ -296,11 +326,18 @@ export async function exportAgentStorage(storage: AgentStorage, target: PartTarg
       }
     };
 
+    // Projects that are left out: an incognito one, and one whose project.json cannot be read (never a guess).
     const incognito = new Set<string>();
     for (const id of await storage.projectIds()) {
-      if (await isIncognito(storage, `projects/${id}`)) {
+      const state = await projectState(storage, `projects/${id}`);
+      if (state === 'yes') {
         incognito.add(id);
         counts.incognitoSkipped++;
+        continue;
+      }
+      if (state === 'unreadable') {
+        incognito.add(id);
+        warnings.push(`Project ${id} was skipped: its project.json could not be read.`);
         continue;
       }
       counts.projects++;
@@ -435,18 +472,33 @@ export function installBackupHooks(hooks: BackupHooks, w: BackupWindow = window 
 export interface ImportOutcome {
   ok: boolean;
   error?: string;
-  applied: { projects: number; files: number; settings: boolean };
+  applied: { projects: number; files: number; settings: boolean; removed: number };
   warnings: string[];
+  /** The zip entry names of the files this import wrote that were not there before (at most MAX_ADDED): what an undo takes away. */
+  added: string[];
+}
+
+/** How many added files are listed to the desktop: more are dropped, and the warnings say so. */
+export const MAX_ADDED = 20_000;
+
+/** What the person chose at restore time, as the desktop tells the page (nothing here is the backup's own say-so). */
+export interface RestoreApply {
+  /** Take the settings (the network gate, how calls and texts are answered, the AI providers) from the backup. */
+  settings: boolean;
+  /** Bring API keys over (only ever where none is kept, and only for the same address). */
+  keys: boolean;
 }
 
 interface PendingImport {
   id: string;
-  token: string;
   kind: 'restore' | 'undo';
   size: number;
   sha256: string;
   parts: number;
   partSize: number;
+  apply: RestoreApply;
+  /** Zip entry names of files the restore being undone had added: they are taken away again. */
+  remove: string[];
 }
 
 export interface RestoreOptions {
@@ -486,35 +538,96 @@ async function sha256Hex(bytes: Uint8Array): Promise<string> {
   return Array.from(new Uint8Array(digest), (b) => b.toString(16).padStart(2, '0')).join('');
 }
 
-function pendingFrom(value: unknown, limits: Limits): PendingImport | null {
-  const v = value as Partial<PendingImport> | null;
-  if (!v || typeof v !== 'object') return null;
-  const whole = (n: unknown, max: number) => typeof n === 'number' && Number.isInteger(n) && n >= 0 && n <= max;
-  if (typeof v.id !== 'string' || !SAFE_ID.test(v.id) || typeof v.token !== 'string' || !SAFE_ID.test(v.token)) return null;
-  if (v.kind !== 'restore' && v.kind !== 'undo') return null;
-  if (!whole(v.size, limits.unpacked) || !whole(v.parts, 1_000_000) || !whole(v.partSize, 1024 * 1024 * 1024)) return null;
-  if (typeof v.sha256 !== 'string' || !/^[0-9a-f]{64}$/.test(v.sha256)) return null;
-  return { id: v.id, token: v.token, kind: v.kind, size: v.size as number, sha256: v.sha256, parts: v.parts as number, partSize: v.partSize as number };
+/** What the desktop's description of a waiting restore comes to: something to act on, or (when it has an id) something to refuse aloud. */
+type PendingParse = { ok: true; pending: PendingImport } | { ok: false; id: string | null; why: string };
+
+function pendingFrom(value: unknown, limits: Limits): PendingParse {
+  const v = value as Record<string, unknown> | null;
+  if (!v || typeof v !== 'object') return { ok: false, id: null, why: 'no description' };
+  if (typeof v.id !== 'string' || !SAFE_ID.test(v.id)) return { ok: false, id: null, why: 'no usable id' };
+  const id = v.id;
+  const refuse = (why: string): PendingParse => ({ ok: false, id, why });
+  if (v.kind !== 'restore' && v.kind !== 'undo') return refuse('the desktop described the restore in a way this version does not understand');
+  const whole = (n: unknown, max: number): n is number => typeof n === 'number' && Number.isInteger(n) && n >= 0 && n <= max;
+  if (typeof v.size === 'number' && Number.isInteger(v.size) && v.size > limits.unpacked) {
+    return refuse(`the Agent’s storage in the backup is bigger than this version restores (${Math.round(limits.unpacked / 2 ** 20)} MiB), so it was not restored`);
+  }
+  if (!whole(v.size, limits.unpacked) || !whole(v.parts, 1_000_000) || !whole(v.partSize, 1024 * 1024 * 1024)) return refuse('the desktop described the archive in a way that does not add up');
+  if (typeof v.sha256 !== 'string' || !/^[0-9a-f]{64}$/.test(v.sha256)) return refuse('the desktop described the archive in a way that does not add up');
+  const apply = v.apply as Partial<RestoreApply> | undefined;
+  const flags: RestoreApply = { settings: apply?.settings === true, keys: apply?.keys === true };
+  if (v.remove !== undefined && !Array.isArray(v.remove)) return refuse('the list of files to take away is not one this version accepts');
+  const remove: unknown[] = Array.isArray(v.remove) ? v.remove : [];
+  if (remove.length > limits.entries || remove.some((n) => typeof n !== 'string')) return refuse('the list of files to take away is not one this version accepts');
+  return { ok: true, pending: { id, kind: v.kind, size: v.size, sha256: v.sha256, parts: v.parts, partSize: v.partSize, apply: flags, remove: remove as string[] } };
 }
 
-/** What a restore does with the settings: the backup's, but never an empty key over a key that is kept now. */
-export function mergeSettings(current: Settings, backup: Partial<BackupSettings>, blocked: ReadonlySet<string>): BackupSettings {
+/** How two provider records are told to point at the same place: the same kind of server at the same address. */
+function sameEndpoint(a: { type?: unknown; baseUrl?: unknown }, b: { type?: unknown; baseUrl?: unknown }): boolean {
+  const address = (u: unknown) => (typeof u === 'string' ? u.trim().replace(/\/+$/, '') : '');
+  return a.type === b.type && address(a.baseUrl) === address(b.baseUrl);
+}
+
+export interface MergeOptions {
+  /** Bring API keys over: only where none is kept, only for a provider at the same address. Default: no. */
+  keys?: boolean;
+  /** Where to say what was kept or set apart. */
+  notes?: string[];
+}
+
+/**
+ * What a restore does with the settings, called only when the person chose to take them from the backup.
+ *
+ * A key never moves to another address. A provider of the backup that has the id of one kept now, but
+ * another type or address, does not replace it and never gets its key: the kept one stays as it is, and
+ * the backup's arrives beside it (`<id>-from-backup`) without a key. A key from the backup is used only
+ * where the kept provider (at the same address) has none, and only when the person asked for keys.
+ * The media service follows the same rule. The gate, the messages and the rest come from the backup,
+ * because the person chose that.
+ */
+export function mergeSettings(current: Settings, backup: Partial<BackupSettings>, blocked: ReadonlySet<string>, options: MergeOptions = {}): BackupSettings {
   const object = (v: unknown): v is Record<string, unknown> => !!v && typeof v === 'object' && !Array.isArray(v);
+  const keys = options.keys === true;
+  const notes = options.notes ?? [];
   const providers: ProviderConfig[] = current.providers.map((p) => ({ ...p }));
   for (const incoming of Array.isArray(backup.providers) ? backup.providers : []) {
     if (!object(incoming) || typeof incoming.id !== 'string') continue;
-    const at = providers.findIndex((p) => p.id === incoming.id);
-    const kept = at >= 0 ? providers[at].apiKey : '';
-    const apiKey = typeof incoming.apiKey === 'string' && incoming.apiKey ? incoming.apiKey : kept;
-    const next = { ...(incoming as unknown as ProviderConfig), apiKey };
-    if (at >= 0) providers[at] = next;
-    else providers.push(next);
+    const theirs = incoming as unknown as ProviderConfig;
+    const backupKey = keys && typeof theirs.apiKey === 'string' ? theirs.apiKey : '';
+    const at = providers.findIndex((p) => p.id === theirs.id);
+    if (at < 0) {
+      providers.push({ ...theirs, apiKey: backupKey });
+      continue;
+    }
+    const kept = providers[at];
+    if (sameEndpoint(kept, theirs)) {
+      // The same place: the backup's settings for it, with the key that is kept (or, where there is none, the backup's, if asked for).
+      providers[at] = { ...theirs, apiKey: kept.apiKey || backupKey };
+      continue;
+    }
+    // Another place under the same id: what is kept stays exactly as it is, and this one is set beside it, keyless.
+    const label = typeof theirs.name === 'string' && theirs.name ? theirs.name : theirs.id;
+    let id = `${theirs.id}-from-backup`;
+    for (let n = 2; providers.some((p) => p.id === id && !sameEndpoint(p, theirs)); n++) id = `${theirs.id}-from-backup-${n}`;
+    const beside = providers.findIndex((p) => p.id === id);
+    const record: ProviderConfig = { ...theirs, id, name: `${label} (from backup)`, apiKey: beside >= 0 ? providers[beside].apiKey : '' };
+    if (beside >= 0) providers[beside] = record;
+    else providers.push(record);
+    notes.push(`The backup’s provider “${label}” points somewhere else than yours, so yours was kept as it is and the backup’s was added as “${record.name}”, without a key.`);
   }
   const known = (id: unknown): id is string => typeof id === 'string' && !blocked.has(id);
   let media: MediaSettings = current.media;
-  if (object(backup.media)) {
-    const incoming = backup.media as MediaSettings;
-    media = { ...current.media, ...incoming, apiKey: typeof incoming.apiKey === 'string' && incoming.apiKey ? incoming.apiKey : current.media.apiKey };
+  if (object(backup.media) && typeof backup.media.baseUrl === 'string') {
+    const theirs = backup.media as unknown as MediaSettings;
+    const backupKey = keys && typeof theirs.apiKey === 'string' ? theirs.apiKey : '';
+    if (!current.media.baseUrl.trim()) {
+      // Nothing is kept: the backup's service, and its key only if asked for (a key kept for no address is not sent to a new one).
+      media = { ...current.media, ...theirs, apiKey: backupKey };
+    } else if (sameEndpoint({ baseUrl: current.media.baseUrl }, { baseUrl: theirs.baseUrl })) {
+      media = { ...current.media, ...theirs, apiKey: current.media.apiKey || backupKey };
+    } else {
+      notes.push('The backup’s image, video and audio service points somewhere else than yours, so yours was kept as it is.');
+    }
   }
   return {
     providers,
@@ -528,12 +641,16 @@ export function mergeSettings(current: Settings, backup: Partial<BackupSettings>
   };
 }
 
-/** A restore waiting on the desktop, or null when there is none (or the desktop cannot be reached). */
-async function fetchPending(desktop: DesktopRef, fetchImpl: FetchLike, limits: Limits, retries: number, sleep: (ms: number) => Promise<void>): Promise<PendingImport | null> {
+function refused(why: string): ImportOutcome {
+  return { ok: false, error: why, applied: { projects: 0, files: 0, settings: false, removed: 0 }, warnings: [], added: [] };
+}
+
+/** A restore waiting on the desktop: null when there is none (or the desktop cannot be reached). */
+async function fetchPending(desktop: DesktopRef, token: string, fetchImpl: FetchLike, limits: Limits, retries: number, sleep: (ms: number) => Promise<void>): Promise<PendingParse | null> {
   for (let attempt = 0; ; attempt++) {
     let response: Response;
     try {
-      response = await fetchImpl(`${base(desktop)}/api/backup/agent-import`, { headers: { Authorization: `Bearer ${desktop.token}` }, signal: timeout(5000) });
+      response = await fetchImpl(`${base(desktop)}/api/backup/agent-import`, { headers: bearer(desktop, token), signal: timeout(5000) });
     } catch {
       // The desktop's server may still be starting when this page loads first.
       if (attempt >= retries) return null;
@@ -552,21 +669,27 @@ async function fetchPending(desktop: DesktopRef, fetchImpl: FetchLike, limits: L
 
 /**
  * Put a restore the desktop has staged into this page's storage. Call it early in the start, before
- * anything is opened. Never throws; null when nothing waits (or the desktop is unreachable).
+ * anything is opened. Never throws; null when nothing waits (or the desktop is unreachable, or did not
+ * give this page its `backupToken`). Every restore it does not do is reported to the desktop with a
+ * reason, so nothing is left waiting for ever.
  */
 export async function applyPendingRestore(desktop: DesktopRef, storage: AgentStorage, options: RestoreOptions = {}): Promise<ImportOutcome | null> {
   const fetchImpl: FetchLike = options.fetch ?? ((input, init) => fetch(input, init));
   const limits = { ...DEFAULT_LIMITS, ...options.limits };
   const sleep = options.sleep ?? ((ms: number) => new Promise<void>((resolve) => setTimeout(resolve, ms)));
   try {
-    const pending = await fetchPending(desktop, fetchImpl, limits, options.retries ?? 3, sleep);
-    if (!pending) return null;
-    const url = `${base(desktop)}/api/backup/agent-import/${encodeURIComponent(pending.id)}`;
-    const outcome = await doImport(desktop, storage, pending, url, fetchImpl, limits).catch(
-      (e): ImportOutcome => ({ ok: false, error: message(e), applied: { projects: 0, files: 0, settings: false }, warnings: [] }),
-    );
+    const token = desktop.backupToken;
+    if (!token || !SAFE_ID.test(token)) return null;
+    const found = await fetchPending(desktop, token, fetchImpl, limits, options.retries ?? 3, sleep);
+    if (!found) return null;
+    const id = found.ok ? found.pending.id : found.id;
+    if (!id) return null;
+    const url = `${base(desktop)}/api/backup/agent-import/${encodeURIComponent(id)}`;
+    const outcome = found.ok
+      ? await doImport(desktop, token, storage, found.pending, url, fetchImpl, limits).catch((e): ImportOutcome => refused(message(e)))
+      : refused(found.why);
     try {
-      await fetchImpl(`${url}/done`, { method: 'POST', headers: { ...bearer(desktop, pending.token), 'Content-Type': 'application/json' }, body: JSON.stringify(outcome), signal: timeout(30_000) });
+      await fetchImpl(`${url}/done`, { method: 'POST', headers: { ...bearer(desktop, token), 'Content-Type': 'application/json' }, body: JSON.stringify(outcome), signal: timeout(30_000) });
     } catch {
       /* the desktop keeps the restore pending and asks again at the next start */
     }
@@ -576,13 +699,13 @@ export async function applyPendingRestore(desktop: DesktopRef, storage: AgentSto
   }
 }
 
-async function download(desktop: DesktopRef, pending: PendingImport, url: string, fetchImpl: FetchLike): Promise<Uint8Array> {
+async function download(desktop: DesktopRef, token: string, pending: PendingImport, url: string, fetchImpl: FetchLike): Promise<Uint8Array> {
   const expected = pending.partSize > 0 ? Math.ceil(pending.size / pending.partSize) : 0;
   if (pending.parts !== expected) throw new Error('the desktop described the archive in a way that does not add up');
   const bytes = new Uint8Array(pending.size);
   let at = 0;
   for (let i = 0; i < pending.parts; i++) {
-    const response = await fetchImpl(`${url}/part/${i}`, { headers: bearer(desktop, pending.token), signal: timeout(60_000) });
+    const response = await fetchImpl(`${url}/part/${i}`, { headers: bearer(desktop, token), signal: timeout(60_000) });
     if (!response.ok) throw new Error(`the desktop answered ${response.status} for part ${i}`);
     const part = new Uint8Array(await response.arrayBuffer());
     if (part.length > pending.partSize || at + part.length > pending.size) throw new Error(`part ${i} is bigger than the desktop said`);
@@ -601,10 +724,11 @@ interface Listed {
   size: number;
 }
 
-async function doImport(desktop: DesktopRef, storage: AgentStorage, pending: PendingImport, url: string, fetchImpl: FetchLike, limits: Limits): Promise<ImportOutcome> {
+async function doImport(desktop: DesktopRef, token: string, storage: AgentStorage, pending: PendingImport, url: string, fetchImpl: FetchLike, limits: Limits): Promise<ImportOutcome> {
   const warnings: string[] = [];
-  const applied = { projects: 0, files: 0, settings: false };
-  const archive = await download(desktop, pending, url, fetchImpl);
+  const applied = { projects: 0, files: 0, settings: false, removed: 0 };
+  const added: string[] = [];
+  const archive = await download(desktop, token, pending, url, fetchImpl);
 
   // What is in it, checked before anything is unpacked (fflate reports each entry's sizes first).
   const listed: Listed[] = [];
@@ -650,37 +774,66 @@ async function doImport(desktop: DesktopRef, storage: AgentStorage, pending: Pen
   }
   if (!manifestOk) throw new Error('this is not an archive of the Agent’s storage that this version can restore');
 
-  // Projects that must not be written to: the archive's or this page's own says incognito.
-  const blocked = new Set<string>();
-  const idOf = (path: string) => (path.startsWith('projects/') ? path.split('/')[1] : null);
-  const metaNames = new Set(listed.filter((l) => l.where === 'opfs' && /^projects\/[^/]+\/project\.json$/.test(l.path) && l.size <= 1024 * 1024).map((l) => l.name));
-  if (metaNames.size) {
-    const metas = unzipSync(archive, { filter: (f) => metaNames.has(f.name) });
-    for (const [name, bytes] of Object.entries(metas)) if (incognitoFlag(bytes)) blocked.add(name.split('/')[2]);
+  // Files to take away (what the restore being undone added), checked like an entry that comes in.
+  const removals: Array<{ name: string; path: string }> = [];
+  for (const name of pending.remove) {
+    const check = checkEntry(name);
+    if (check.kind === 'file' && check.where === 'opfs') removals.push({ name, path: check.path });
+    else warnings.push(`${name.slice(0, 120)} was not taken away: ${check.kind === 'skip' ? check.why : 'it is not a file of the Agent’s projects or front desk'}.`);
   }
-  for (const id of new Set(listed.map((l) => idOf(l.path)).filter((id): id is string => id !== null))) {
-    if (!blocked.has(id) && (await isIncognito(storage, `projects/${id}`))) blocked.add(id);
-  }
-  for (const id of blocked) warnings.push(`Project ${id} was not restored: it is (or was) an incognito project, which is never kept.`);
-  const writes = listed.filter((l) => l.where === 'opfs' && !blocked.has(idOf(l.path) ?? ''));
 
-  // The undo copy comes first, so that nothing is replaced before there is a way back.
-  if (pending.kind === 'restore') {
-    const target = uploadTo(desktop, pending.token, `${url}/undo-part`, `${url}/undo-done`, fetchImpl);
+  // Projects that must not be written to or taken from: the archive's or this page's own project.json says incognito, or
+  // cannot be read (never a guess: a project.json that cannot be read, or is too large to be one, keeps its project out).
+  const blocked = new Map<string, Incognito>();
+  const block = (id: string, state: Incognito) => {
+    if (state !== 'no' && !blocked.has(id)) blocked.set(id, state);
+  };
+  const idOf = (path: string) => (path.startsWith('projects/') ? path.split('/')[1] : null);
+  const metaEntries = listed.filter((l) => l.where === 'opfs' && /^projects\/[^/]+\/project\.json$/.test(l.path));
+  const small = metaEntries.filter((l) => l.size <= MAX_PROJECT_JSON);
+  for (const l of metaEntries) if (l.size > MAX_PROJECT_JSON) block(l.path.split('/')[1], 'unreadable');
+  if (small.length) {
+    const names = new Set(small.map((l) => l.name));
+    const metas = unzipSync(archive, { filter: (f) => names.has(f.name) });
+    for (const l of small) block(l.path.split('/')[1], metas[l.name] ? incognitoOf(metas[l.name]) : 'unreadable');
+  }
+  const touched = new Set([...listed.map((l) => idOf(l.path)), ...removals.map((r) => idOf(r.path))].filter((id): id is string => id !== null));
+  for (const id of touched) if (!blocked.has(id)) block(id, await projectState(storage, `projects/${id}`));
+  for (const [id, state] of blocked) {
+    warnings.push(state === 'yes' ? `Project ${id} was not restored: it is (or was) an incognito project, which is never kept.` : `Project ${id} was skipped: its project.json could not be read.`);
+  }
+  const isBlocked = (path: string) => blocked.has(idOf(path) ?? '');
+  const writes = listed.filter((l) => l.where === 'opfs' && !isBlocked(l.path));
+  const takeAway = removals.filter((r) => !isBlocked(r.path));
+
+  // The undo copy comes first, for an undo as well as a restore (an undo can be undone), so that nothing is
+  // replaced or taken away before there is a way back. (If a copy of an earlier try is there, the desktop keeps that one.)
+  {
+    const target = uploadTo(desktop, token, `${url}/undo-part`, `${url}/undo-done`, fetchImpl);
     // Without the API keys: they were sealed here with a key the browser will not let out, and the undo copy is
-    // kept by the desktop as plain files. The merge rule below never replaces a stored key with an empty one, so
+    // kept by the desktop as plain files. The merge rule never replaces a stored key with an empty one, so
     // an undo does not need them (it also does not roll back keys that a restore brought in).
     const copy = await exportAgentStorage(storage, target, { includeKeys: false, limits });
     if (!copy.ok) throw new Error(`the undo copy could not be made, so nothing was restored (${copy.error ?? 'unknown reason'})`);
     const left = new Set(copy.skipped);
-    const clash = writes.filter((w) => left.has(w.path));
-    if (clash.length) throw new Error(`the undo copy could not include ${clash.length} file${clash.length === 1 ? '' : 's'} that this restore would replace, so nothing was restored`);
+    const clash = [...writes, ...takeAway].filter((w) => left.has(w.path));
+    if (clash.length) throw new Error(`the undo copy could not include ${clash.length} file${clash.length === 1 ? '' : 's'} that this would replace or take away, so nothing was changed`);
     if (copy.warnings.length) warnings.push(...copy.warnings.map((w) => `Undo copy: ${w}`));
+  }
+
+  // What the restore had added is taken away (files only, never a folder).
+  for (const item of takeAway) {
+    try {
+      if (await storage.removeFile(item.path)) applied.removed++;
+    } catch (e) {
+      warnings.push(`${item.path} could not be taken away: ${message(e)}.`);
+    }
   }
 
   // Files, a few at a time, so that only a part of the archive is unpacked at once.
   const written = new Set<string>();
   let failed = 0;
+  let unlisted = 0;
   for (let from = 0; from < writes.length; ) {
     let to = from;
     let bytes = 0;
@@ -694,8 +847,13 @@ async function doImport(desktop: DesktopRef, storage: AgentStorage, pending: Pen
         continue;
       }
       try {
+        const existed = await storage.exists(item.path);
         await storage.writeFile(item.path, data);
         applied.files++;
+        if (!existed) {
+          if (added.length < MAX_ADDED) added.push(item.name);
+          else unlisted++;
+        }
         const id = idOf(item.path);
         if (id) written.add(id);
       } catch (e) {
@@ -706,20 +864,23 @@ async function doImport(desktop: DesktopRef, storage: AgentStorage, pending: Pen
     from = to;
   }
   applied.projects = written.size;
+  if (unlisted) warnings.push(`${unlisted} added file${unlisted === 1 ? ' is' : 's are'} not listed, so an undo will not take ${unlisted === 1 ? 'it' : 'them'} away.`);
 
+  // The settings only when the person chose to take them from the backup, and then with the merge rule above.
   const settingsEntry = listed.find((l) => l.where === 'settings');
-  if (settingsEntry) {
+  if (settingsEntry && pending.apply.settings) {
     try {
       const raw = unzipSync(archive, { filter: (f) => f.name === settingsEntry.name })[settingsEntry.name];
       const parsed = JSON.parse(new TextDecoder().decode(raw)) as Partial<BackupSettings>;
-      await storage.writeSettings(mergeSettings(await storage.readSettings(), parsed, blocked));
+      const blockedIds = new Set(blocked.keys());
+      await storage.writeSettings(mergeSettings(await storage.readSettings(), parsed, blockedIds, { keys: pending.apply.keys, notes: warnings }));
       applied.settings = true;
     } catch (e) {
       failed++;
       warnings.push(`The settings could not be restored: ${message(e)}.`);
     }
   }
-  return failed ? { ok: false, error: `${failed} item${failed === 1 ? '' : 's'} could not be restored`, applied, warnings } : { ok: true, applied, warnings };
+  return failed ? { ok: false, error: `${failed} item${failed === 1 ? '' : 's'} could not be restored`, applied, warnings, added } : { ok: true, applied, warnings, added };
 }
 
 // ---------------------------------------------------------------------------
@@ -795,13 +956,45 @@ export function opfsStorage(): AgentStorage {
       yield* walkDir(dir, root);
     },
     async readFile(path) {
+      // Only "not there" is null: a file that cannot be read throws, so a caller that must not guess (the incognito check) does not.
       try {
         const slash = path.lastIndexOf('/');
         const dir = await dirAt(path.slice(0, slash), false);
         return new Uint8Array(await (await (await dir.getFileHandle(path.slice(slash + 1))).getFile()).arrayBuffer());
-      } catch {
-        return null;
+      } catch (error) {
+        if ((error as DOMException | undefined)?.name === 'NotFoundError') return null;
+        throw error;
       }
+    },
+    async exists(path) {
+      try {
+        const slash = path.lastIndexOf('/');
+        const dir = await dirAt(path.slice(0, slash), false);
+        await dir.getFileHandle(path.slice(slash + 1));
+        return true;
+      } catch {
+        return false;
+      }
+    },
+    async removeFile(path) {
+      const slash = path.lastIndexOf('/');
+      let dir: Dir;
+      try {
+        dir = await dirAt(path.slice(0, slash), false);
+      } catch (error) {
+        if ((error as DOMException | undefined)?.name === 'NotFoundError') return false;
+        throw error;
+      }
+      try {
+        await dir.getFileHandle(path.slice(slash + 1));
+      } catch (error) {
+        // Not there, or a folder (never removed): nothing removed.
+        const name = (error as DOMException | undefined)?.name;
+        if (name === 'NotFoundError' || name === 'TypeMismatchError') return false;
+        throw error;
+      }
+      await dir.removeEntry(path.slice(slash + 1));
+      return true;
     },
     async writeFile(path, data) {
       const slash = path.lastIndexOf('/');
