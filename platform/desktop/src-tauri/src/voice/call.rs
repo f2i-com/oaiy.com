@@ -804,6 +804,7 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::atomic::AtomicBool;
 
     #[test]
     fn a_line_to_say_is_asked_for_by_the_start() {
@@ -946,26 +947,135 @@ mod tests {
 
     // ---- A call, with a stand-in for Aokie on the other end of its stream ---------------
 
-    /// How long each line the stand-in speech server speaks lasts.
-    const LINE_MS: usize = 300;
+    /// How long each line the stand-in speech server speaks lasts, unless a test says.
+    const LINE_MS: u64 = 300;
 
-    /// A stand-in for OAIY's speech server: every line is `LINE_MS` of a quiet hum, and every utterance is "Hello?".
-    async fn speech_server() -> String {
-        use axum::routing::post;
-        let line = audio::bytes(&vec![120i16; WIRE_RATE as usize * LINE_MS / 1000]);
-        let app = axum::Router::new()
-            .route(
-                "/v1/audio/speech",
-                post(move || {
-                    let line = line.clone();
-                    async move { ([("x-sample-rate", "24000")], line) }
-                }),
-            )
-            .route("/v1/audio/transcriptions", post(|| async { axum::Json(json!({"text": "Hello?"})) }));
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let addr = listener.local_addr().unwrap();
-        tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
-        format!("http://{addr}")
+    /// A stand-in for OAIY's speech server: every line it speaks is a quiet hum
+    /// (`LINE_MS` long unless a test says), and every utterance is heard as the
+    /// same words ("Hello?" unless a test says), after as long as a test says
+    /// (a real transcriber takes a moment).
+    #[derive(Clone)]
+    struct SpeechServer {
+        heard: Arc<Mutex<String>>,
+        hearing_ms: Arc<AtomicU64>,
+        line_ms: Arc<AtomicU64>,
+        /// What it was asked to speak, in order.
+        spoken: Arc<Mutex<Vec<String>>>,
+    }
+
+    impl SpeechServer {
+        fn new() -> Self {
+            Self { heard: Arc::new(Mutex::new("Hello?".into())), hearing_ms: Arc::new(AtomicU64::new(0)), line_ms: Arc::new(AtomicU64::new(LINE_MS)), spoken: Arc::default() }
+        }
+
+        /// What the caller's utterances are heard as, from now on.
+        fn hears(&self, words: &str) {
+            *self.heard.lock().unwrap() = words.to_string();
+        }
+
+        fn hearing_takes(&self, ms: u64) {
+            self.hearing_ms.store(ms, Ordering::SeqCst);
+        }
+
+        fn lines_last(&self, ms: u64) {
+            self.line_ms.store(ms, Ordering::SeqCst);
+        }
+
+        fn spoken(&self) -> Vec<String> {
+            self.spoken.lock().unwrap().clone()
+        }
+
+        async fn serve(&self) -> String {
+            use axum::routing::post;
+            let (line_ms, spoken) = (self.line_ms.clone(), self.spoken.clone());
+            let (heard, hearing_ms) = (self.heard.clone(), self.hearing_ms.clone());
+            let app = axum::Router::new()
+                .route(
+                    "/v1/audio/speech",
+                    post(move |axum::Json(body): axum::Json<Value>| {
+                        spoken.lock().unwrap().push(body["input"].as_str().unwrap_or("").to_string());
+                        let line = audio::bytes(&vec![120i16; WIRE_RATE as usize * line_ms.load(Ordering::SeqCst) as usize / 1000]);
+                        async move { ([("x-sample-rate", "24000")], line) }
+                    }),
+                )
+                .route(
+                    "/v1/audio/transcriptions",
+                    post(move || {
+                        let (text, wait) = (heard.lock().unwrap().clone(), hearing_ms.load(Ordering::SeqCst));
+                        async move {
+                            tokio::time::sleep(Duration::from_millis(wait)).await;
+                            axum::Json(json!({"text": text}))
+                        }
+                    }),
+                );
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let addr = listener.local_addr().unwrap();
+            tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+            format!("http://{addr}")
+        }
+    }
+
+    /// Aokie's side of the stream as Aokie plays it: one item at a time, from its
+    /// start to its done, as fast as it plays. Told the caller speaks
+    /// (`speech_started`) while an item plays, it cancels it (`cancel_output`, with
+    /// how much of it played: the audio it has had, at most the time since its
+    /// first audio), and plays nothing more of it; a new item started before the
+    /// cancelled one is done breaks Aokie (`fence_broken`). Everything the desktop
+    /// sends is passed on, with when it came.
+    fn plays(mut from_desktop: mpsc::UnboundedReceiver<Message>, to_desktop: mpsc::UnboundedSender<Message>, call: String, fence_broken: Arc<AtomicBool>) -> mpsc::UnboundedReceiver<(Instant, Message)> {
+        let (tx, rx) = mpsc::unbounded_channel();
+        tokio::spawn(async move {
+            // The item playing: its id, when its first audio came, and how much audio it has had.
+            let mut playing: Option<(String, Option<Instant>, u64)> = None;
+            // A cancelled item, until its done.
+            let mut fenced: Option<String> = None;
+            while let Some(m) = from_desktop.recv().await {
+                let now = Instant::now();
+                match &m {
+                    Message::Text(t) => {
+                        let v: Value = serde_json::from_str(t).unwrap_or_default();
+                        let item = v["itemId"].as_str().unwrap_or("").to_string();
+                        match v["type"].as_str().unwrap_or("") {
+                            "formlogic.realtime.output_item_started" => {
+                                if fenced.is_some() {
+                                    fence_broken.store(true, Ordering::SeqCst);
+                                }
+                                playing = Some((item, None, 0));
+                            }
+                            "formlogic.realtime.output_item_done" => {
+                                if fenced.as_deref() == Some(item.as_str()) {
+                                    fenced = None;
+                                }
+                                if playing.as_ref().is_some_and(|(p, ..)| *p == item) {
+                                    playing = None;
+                                }
+                            }
+                            "formlogic.realtime.speech_started" => {
+                                if let Some((item, first, samples)) = playing.take() {
+                                    let had_ms = samples * 1000 / WIRE_RATE as u64;
+                                    let played_ms = first.map_or(0, |t| now.duration_since(t).as_millis() as u64).min(had_ms);
+                                    let cancel = json!({"type": "formlogic.realtime.cancel_output", "callId": call, "generation": 1, "itemId": item, "playedMs": played_ms});
+                                    let _ = to_desktop.send(Message::Text(cancel.to_string()));
+                                    fenced = Some(item);
+                                }
+                            }
+                            _ => {}
+                        }
+                    }
+                    Message::Binary(b) => {
+                        if let Some((_, first, samples)) = playing.as_mut() {
+                            first.get_or_insert(now);
+                            *samples += b.len() as u64 / 2;
+                        }
+                    }
+                    _ => {}
+                }
+                if tx.send((now, m)).is_err() {
+                    break;
+                }
+            }
+        });
+        rx
     }
 
     /// Phone audio: `ms` of a tone (`amp` 40 is the line's hum, 6000 a voice).
@@ -985,35 +1095,98 @@ mod tests {
     /// what it sends the desktop, what it hears back, and what the app is told.
     struct Aokie {
         to_desktop: mpsc::UnboundedSender<Message>,
-        from_desktop: mpsc::UnboundedReceiver<Message>,
+        /// What the desktop sends, as Aokie plays it (see `plays`), with when it came.
+        from_desktop: mpsc::UnboundedReceiver<(Instant, Message)>,
         events: tokio::sync::broadcast::Receiver<Value>,
         hub: VoiceHub,
         call: String,
         /// When the call began (the begin was sent).
         begun: Instant,
+        speech: SpeechServer,
+        /// The desktop started an item before the one Aokie cancelled was done.
+        fence_broken: Arc<AtomicBool>,
     }
 
     impl Aokie {
         /// A call started (with `fields` in its start), up to the desktop's `ready`.
         async fn start(fields: Value) -> Self {
-            let speech = speech_server().await;
-            let hub = VoiceHub::new(Engines::at(&speech, &speech), |_| None);
+            let speech = SpeechServer::new();
+            let at = speech.serve().await;
+            let hub = VoiceHub::new(Engines::at(&at, &at), |_| None);
             let events = hub.inner.events.subscribe();
             let (to_desktop, from_aokie) = mpsc::unbounded_channel::<Message>();
             let (to_aokie, from_desktop) = mpsc::unbounded_channel::<Message>();
             let stream = futures_util::stream::unfold(from_aokie, |mut rx| async move { rx.recv().await.map(|m| (Ok::<_, std::convert::Infallible>(m), rx)) });
             let sink = futures_util::sink::unfold(to_aokie, |tx, m: Message| async move { tx.send(m).map(|()| tx).map_err(|_| "Aokie hung up") });
-            tokio::spawn(run_on(Box::pin(sink), Box::pin(stream), hub.clone(), Engines::at(&speech, &speech)));
+            tokio::spawn(run_on(Box::pin(sink), Box::pin(stream), hub.clone(), Engines::at(&at, &at)));
             let call = format!("call_{}", next_item("test"));
+            let fence_broken = Arc::new(AtomicBool::new(false));
+            let from_desktop = plays(from_desktop, to_desktop.clone(), call.clone(), fence_broken.clone());
             let mut start = json!({"type": "formlogic.realtime.start", "callId": call, "generation": 1, "destinationOrigin": DESTINATION, "sampleRate": WIRE_RATE, "greeting": GREETING, "direction": "inbound"});
             for (key, value) in fields.as_object().cloned().unwrap_or_default() {
                 start[key] = value;
             }
             to_desktop.send(Message::Text(start.to_string())).unwrap();
-            let mut aokie = Self { to_desktop, from_desktop, events, hub, call, begun: Instant::now() };
+            let mut aokie = Self { to_desktop, from_desktop, events, hub, call, begun: Instant::now(), speech, fence_broken };
             let ready = aokie.next(Duration::from_secs(5)).await;
             assert!(matches!(&ready, Some(Message::Text(t)) if t.contains("formlogic.realtime.ready")), "not ready");
             aokie
+        }
+
+        /// The caller's audio as they speak it: 20 ms at a time, each once it has been said
+        /// (the first 20 ms after now). When they began: what they say `ms` into it was heard
+        /// by `began + ms`.
+        fn caller_live(&self, samples: Vec<i16>) -> Instant {
+            let began = Instant::now();
+            let frame = Duration::from_millis(20);
+            let to_desktop = self.to_desktop.clone();
+            tokio::spawn(async move {
+                let mut tick = tokio::time::interval_at((began + frame).into(), frame);
+                for chunk in samples.chunks(WIRE_RATE as usize / 50) {
+                    tick.tick().await;
+                    if to_desktop.send(Message::Binary(audio::bytes(chunk))).is_err() {
+                        break;
+                    }
+                }
+            });
+            began
+        }
+
+        /// The next output item: its id, and when its first audio came (what the desktop sent before it is skipped).
+        async fn next_item_audio(&mut self, wait: Duration) -> Option<(String, Instant)> {
+            let until = Instant::now() + wait;
+            let mut item = None;
+            loop {
+                let (at, m) = tokio::time::timeout(until.saturating_duration_since(Instant::now()), self.from_desktop.recv()).await.ok().flatten()?;
+                match m {
+                    Message::Text(t) => {
+                        let v: Value = serde_json::from_str(&t).unwrap();
+                        if v["type"] == "formlogic.realtime.output_item_started" {
+                            item = v["itemId"].as_str().map(str::to_string);
+                        }
+                    }
+                    Message::Binary(_) => {
+                        if let Some(item) = item.take() {
+                            return Some((item, at));
+                        }
+                    }
+                    _ => {}
+                }
+            }
+        }
+
+        /// Everything the desktop sends within `wait`, as Aokie's texts (audio: `{"audio": bytes}`).
+        async fn sent_within(&mut self, wait: Duration) -> Vec<Value> {
+            let until = Instant::now() + wait;
+            let mut sent = Vec::new();
+            while let Ok(Some((_, m))) = tokio::time::timeout(until.saturating_duration_since(Instant::now()), self.from_desktop.recv()).await {
+                match m {
+                    Message::Text(t) => sent.push(serde_json::from_str(&t).unwrap()),
+                    Message::Binary(b) => sent.push(json!({"audio": b.len()})),
+                    _ => {}
+                }
+            }
+            sent
         }
 
         /// The call connects (with `fields` in the begin).
@@ -1040,7 +1213,7 @@ mod tests {
 
         /// What the desktop sends next, within `wait` (None: nothing, or the stream has closed).
         async fn next(&mut self, wait: Duration) -> Option<Message> {
-            tokio::time::timeout(wait, self.from_desktop.recv()).await.ok().flatten()
+            tokio::time::timeout(wait, self.from_desktop.recv()).await.ok().flatten().map(|(_, m)| m)
         }
 
         /// The first of our speech the caller would hear: how long after the call began it
@@ -1234,5 +1407,76 @@ mod tests {
         aokie.begin(json!({}));
         let (at, _) = aokie.first_audio(secs(9)).await.expect("the greeting");
         assert!(at >= Duration::from_millis(5_000) && at < Duration::from_millis(6_500), "greeted {at:?} after the call began");
+    }
+
+    // ---- Talked over: timed as the caller speaks, 20 ms at a time ----------------------
+
+    /// What the agent says in these calls: three lines, 1.5 s each.
+    const REPLY: [&str; 3] = ["We are open from nine.", "We close at five.", "And on Sundays we rest."];
+    const LINE_LONG_MS: u64 = 1_500;
+
+    /// The call has begun, its greeting has played out, and the reply (`lines`, each
+    /// `LINE_LONG_MS`) has begun to play: its item, and when its first audio came.
+    async fn a_reply_playing(aokie: &mut Aokie, lines: &[&str]) -> (String, Instant) {
+        aokie.speech.lines_last(LINE_LONG_MS);
+        aokie.begin(json!({"greetingDelayMs": 0}));
+        let (greeting, _) = aokie.next_item_audio(secs(5)).await.expect("the greeting");
+        loop {
+            let done = aokie.text("formlogic.realtime.output_item_done", secs(10)).await.expect("the greeting's end");
+            if done["itemId"] == greeting.as_str() {
+                break;
+            }
+        }
+        for line in lines {
+            aokie.say(line).await.unwrap();
+        }
+        aokie.next_item_audio(secs(5)).await.expect("the reply")
+    }
+
+    /// `ms` of the caller's voice, then the line's hum for long enough to end it.
+    fn saying(ms: usize) -> Vec<i16> {
+        [tone(ms, 6_000.0), tone(3_000, 40.0)].concat()
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_caller_who_cuts_in_is_answered_soon_after_they_stop() {
+        let mut aokie = Aokie::start(json!({})).await;
+        // A transcriber that takes a moment, as a real one does.
+        aokie.speech.hearing_takes(150);
+        let (item, first) = a_reply_playing(&mut aokie, &REPLY).await;
+        tokio::time::sleep_until((first + Duration::from_millis(400)).into()).await;
+        aokie.speech.hears("Wait, is Saturday free?");
+        let began = aokie.caller_live(saying(1_200));
+        let stopped = began + Duration::from_millis(1_200);
+        let cut = aokie.event("call.interrupted", secs(5)).await.expect("the reply was cut");
+        assert_eq!(cut["itemId"], item.as_str());
+        let heard = aokie.event("call.caller", secs(5)).await.expect("their words, for the app");
+        let told = stopped.elapsed();
+        assert_eq!((heard["text"].as_str(), heard["cut"].as_bool(), heard["backchannel"].as_bool()), (Some("Wait, is Saturday free?"), Some(true), Some(false)), "{heard}");
+        // The app answers them the moment it hears them.
+        aokie.say("Saturday too, from nine.").await.unwrap();
+        let (_, answer) = aokie.next_item_audio(secs(5)).await.expect("the answer");
+        let answered = answer.duration_since(stopped);
+        eprintln!("TIMING a real interruption: the caller stopped; their words reached the app {} ms later, and its answer was heard {} ms later", told.as_millis(), answered.as_millis());
+        assert!(!aokie.fence_broken.load(Ordering::SeqCst), "an item started before the cancelled one was done");
+        assert!(answered < Duration::from_millis(1_600), "answered {answered:?} after the caller stopped");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_caller_who_only_says_yeah_sure_over_the_reply() {
+        let mut aokie = Aokie::start(json!({})).await;
+        let (item, first) = a_reply_playing(&mut aokie, &REPLY).await;
+        tokio::time::sleep_until((first + Duration::from_millis(400)).into()).await;
+        aokie.speech.hears("Yeah, sure.");
+        // Long enough over the reply to cut it.
+        let began = aokie.caller_live(saying(800));
+        let stopped = began + Duration::from_millis(800);
+        let cut = aokie.event("call.interrupted", secs(5)).await.expect("the reply was cut");
+        assert_eq!(cut["itemId"], item.as_str());
+        let heard = aokie.event("call.caller", secs(5)).await.expect("their words, for the app");
+        let told = stopped.elapsed();
+        let after = aokie.sent_within(Duration::from_millis(1_500)).await;
+        let went_on = after.iter().any(|v| v["type"] == "formlogic.realtime.output_item_started");
+        eprintln!("TIMING yeah sure over the reply: told to the app {} ms after they stopped ({heard}); the reply went on: {went_on}; lines spoken: {:?}", told.as_millis(), aokie.speech.spoken());
     }
 }
