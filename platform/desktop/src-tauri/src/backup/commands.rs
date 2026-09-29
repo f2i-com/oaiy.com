@@ -85,14 +85,14 @@ async fn pick_open<R: Runtime>(app: &AppHandle<R>) -> Option<PathBuf> {
 
 /// The dashboard's own window, as the restore flow (`desk`) sees it: the updater's answer to "what is in the way", the
 /// native open dialog, and where the data folder is.
-struct DashboardHost<R: Runtime> {
-    app: AppHandle<R>,
+struct DashboardHost {
+    app: AppHandle,
 }
 
 /// The backup that was looked at last (one, for the one dashboard).
 static DESK: Desk = Desk::new();
 
-impl<R: Runtime> Host for DashboardHost<R> {
+impl Host for DashboardHost {
     fn busy(&self) -> impl std::future::Future<Output = Busy> + Send {
         look_busy(&self.app)
     }
@@ -107,6 +107,10 @@ impl<R: Runtime> Host for DashboardHost<R> {
 
     fn desk(&self) -> &Desk {
         &DESK
+    }
+
+    fn restart(&self) {
+        crate::gui::restart_app(self.app.clone());
     }
 }
 
@@ -140,7 +144,7 @@ pub async fn backup_create<R: Runtime>(app: AppHandle<R>, webview: Webview<R>, p
 /// Restore, step 1: asks for the backup file, decrypts and checks it, and says what restoring would do.
 /// Changes nothing. (The order of it, and what it remembers for step 2, is `desk::inspect`.)
 #[tauri::command]
-pub async fn backup_restore_inspect<R: Runtime>(app: AppHandle<R>, webview: Webview<R>, passphrase: String) -> Result<Option<InspectOut>, String> {
+pub async fn backup_restore_inspect(app: AppHandle, webview: Webview, passphrase: String) -> Result<Option<InspectOut>, String> {
     dashboard(&webview)?;
     desk::inspect(&DashboardHost { app }, passphrase).await
 }
@@ -148,7 +152,7 @@ pub async fn backup_restore_inspect<R: Runtime>(app: AppHandle<R>, webview: Webv
 /// Restore, step 2: unpack the backup that was just checked into the staging folder and note that it
 /// is to be applied at the next start. Nothing live changes. (Held to what was checked: `desk::stage`.)
 #[tauri::command]
-pub async fn backup_restore_stage<R: Runtime>(app: AppHandle<R>, webview: Webview<R>, inspect_id: String, passphrase: String, classes: Vec<String>, keys: bool) -> Result<Staged, String> {
+pub async fn backup_restore_stage(app: AppHandle, webview: Webview, inspect_id: String, passphrase: String, classes: Vec<String>, keys: bool) -> Result<Staged, String> {
     dashboard(&webview)?;
     desk::stage(&DashboardHost { app }, inspect_id, passphrase, classes, keys).await
 }
@@ -175,20 +179,10 @@ pub async fn backup_discard_pending<R: Runtime>(app: AppHandle<R>, webview: Webv
         .map_err(|e| e.message)
 }
 
-/// Restart OAIY so the staged restore is applied, unless the app is busy.
+/// Restart OAIY so the staged restore is applied, unless the app is busy. (The two looks at what is in the way, and what
+/// is checked first, are `desk::restart_to_apply`.)
 #[tauri::command]
 pub async fn backup_restart_to_apply(app: AppHandle, webview: Webview) -> Result<(), String> {
     dashboard(&webview)?;
-    let data_dir = data_dir_of(&app)?;
-    match restore::pending_info(&data_dir) {
-        None => return Err("No restore is waiting.".to_string()),
-        Some(waiting) if waiting.expired => {
-            let _ = restore::discard_pending(&data_dir);
-            return Err("That restore was prepared more than a day ago, so it will not be applied. Prepare it again.".to_string());
-        }
-        Some(_) => {}
-    }
-    look_busy(&app).await.refuse_if_busy("restarting to finish the restore").map_err(|e| e.message)?;
-    crate::gui::restart_app(app);
-    Ok(())
+    desk::restart_to_apply(&DashboardHost { app }).await
 }

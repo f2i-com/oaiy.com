@@ -979,10 +979,16 @@ fn what_a_backup_waits_for_is_worked_out_in_one_place_and_not_a_second_time() {
     assert!(look.contains("try_state::<UpdaterHandle>()") && look.contains("updater.activity()") && look.contains("Busy::look(activity.as_deref())") && look.contains("spawn_blocking") && look.contains("Busy::cannot_tell()"), "{look}");
     // Every command that must not run while the app is busy asks it, and a wait for a dialog does not use an old answer.
     let commands = source_text(include_str!("commands.rs"));
-    for (name, refusal) in [("backup_create", "making a backup"), ("backup_restart_to_apply", "restarting to finish the restore")] {
+    for (name, refusal) in [("backup_create", "making a backup")] {
         let body = command_source(name);
         assert!(body.contains("look_busy(&app).await") && (body.contains(&format!("refuse_if_busy(\"{refusal}\")"))), "{name} asks whether the app is busy and refuses with {refusal:?}");
     }
+    // The restart is the flow's too, and asks twice (tested by driving it: the_restart_that_applies_a_restore_asks_again_right_before_it_restarts).
+    assert!(command_source("backup_restart_to_apply").contains("desk::restart_to_apply"), "the restart hands over to the restore flow");
+    let restart = source_text(include_str!("desk.rs"));
+    let restart = &restart[restart.find("pub async fn restart_to_apply").unwrap()..];
+    assert_eq!(restart.matches("refuse_if_busy(\"restarting to finish the restore\")").count(), 2, "asked twice: to decide, and again right before restarting");
+    assert!(restart.find("host.restart()").unwrap() > restart.rfind("refuse_if_busy(\"restarting to finish the restore\")").unwrap(), "and the restart comes after the last look");
     // Looking at a backup and preparing one are the restore flow's (`desk.rs`, and tested by driving it); the commands hand over to it.
     let desk = source_text(include_str!("desk.rs"));
     assert!(desk.contains("host.busy().await.refuse_if_busy(\"checking a backup\")"), "looking asks whether the app is busy and refuses with \"checking a backup\"");
@@ -4631,11 +4637,12 @@ struct FakeHost {
     picks: Mutex<std::collections::VecDeque<Option<std::path::PathBuf>>>,
     calls: Mutex<Vec<&'static str>>,
     desk: super::desk::Desk,
+    restarts: Mutex<usize>,
 }
 
 impl FakeHost {
     fn new(data: &Path, busy: Vec<Busy>, picks: Vec<Option<std::path::PathBuf>>) -> Self {
-        Self { data: data.to_path_buf(), busy: Mutex::new(busy.into()), picks: Mutex::new(picks.into()), calls: Mutex::new(Vec::new()), desk: super::desk::Desk::new() }
+        Self { data: data.to_path_buf(), busy: Mutex::new(busy.into()), picks: Mutex::new(picks.into()), calls: Mutex::new(Vec::new()), desk: super::desk::Desk::new(), restarts: Mutex::new(0) }
     }
 
     fn calls(&self) -> Vec<&'static str> {
@@ -4662,6 +4669,11 @@ impl super::desk::Host for FakeHost {
 
     fn desk(&self) -> &super::desk::Desk {
         &self.desk
+    }
+
+    fn restart(&self) {
+        self.calls.lock().unwrap().push("restart");
+        *self.restarts.lock().unwrap() += 1;
     }
 }
 
@@ -5210,3 +5222,46 @@ fn a_connector_is_described_by_every_address_it_holds() {
     }
     assert!(!item.what.contains("auth.tokenPath"), "a relative path is not an address: {}", item.what);
 }
+
+/// The restart that applies a restore asks what is in the way twice, the second time with nothing between it and the restart.
+#[tokio::test]
+async fn the_restart_that_applies_a_restore_asks_again_right_before_it_restarts() {
+    use super::desk;
+    let out = TempDir::new("restart");
+    let data = TempDir::new("restart-data");
+    let file = small_backup(&out.0, "a.oaiybackup", "one");
+    let host = FakeHost::new(&data.0, vec![], vec![Some(file)]);
+    let seen = desk::inspect(&host, PASS.to_string()).await.unwrap().unwrap();
+    desk::stage(&host, seen.inspect_id, PASS.to_string(), vec![], false).await.unwrap();
+    host.calls.lock().unwrap().clear();
+
+    // Nothing waiting is not a restart.
+    let empty = TempDir::new("restart-empty");
+    let nothing = FakeHost::new(&empty.0, vec![], vec![]);
+    assert!(desk::restart_to_apply(&nothing).await.unwrap_err().contains("No restore is waiting"));
+    assert!(nothing.calls().is_empty());
+
+    // Quiet at the first look, busy at the second (a call began while the first was being made): it does not restart.
+    let host2 = FakeHost::new(&data.0, vec![Busy::none(), in_a_call()], vec![]);
+    let err = desk::restart_to_apply(&host2).await.unwrap_err();
+    assert!(err.contains("A call is live"), "{err}");
+    assert_eq!(host2.calls(), ["busy", "busy"], "asked twice, and did not restart");
+    assert_eq!(*host2.restarts.lock().unwrap(), 0);
+    // Busy at the first look: not asked again, not restarted.
+    let host3 = FakeHost::new(&data.0, vec![in_a_call()], vec![]);
+    assert!(desk::restart_to_apply(&host3).await.is_err());
+    assert_eq!(host3.calls(), ["busy"]);
+    // Quiet both times: it restarts, once, and after both looks.
+    let host4 = FakeHost::new(&data.0, vec![], vec![]);
+    desk::restart_to_apply(&host4).await.unwrap();
+    assert_eq!(host4.calls(), ["busy", "busy", "restart"]);
+    // A restore that has waited too long is not applied by a restart, and is thrown away.
+    let marker = data.0.join("restore").join("pending.json");
+    let mut value: serde_json::Value = serde_json::from_str(&fs::read_to_string(&marker).unwrap()).unwrap();
+    value["stagedAt"] = serde_json::Value::String("2020-01-01T00:00:00.000Z".to_string());
+    fs::write(&marker, value.to_string()).unwrap();
+    let host5 = FakeHost::new(&data.0, vec![], vec![]);
+    assert!(desk::restart_to_apply(&host5).await.unwrap_err().contains("more than a day ago"));
+    assert!(host5.calls().is_empty() && !marker.exists());
+}
+

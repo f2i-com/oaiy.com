@@ -420,7 +420,13 @@ A restore is never done in place. It has three steps, and the first two change n
    back (at once, or at the next start) and the failure is reported in Settings. The marker is
    removed last, so a restore is applied once and only once.
 
-The restart button refuses while OAIY is busy (the same list as for making a backup, and for updating).
+The restart button refuses while OAIY is busy (the same list as for making a backup, and for updating). It
+asks twice: once to decide, and again with nothing between that look and the restart, because the first can
+take seconds (it asks a phone plugin whether a call is live) and a restart ends a call.
+**Preparing a restore does not wait for a quiet app**: it only writes the staging folder and changes nothing
+you use, so a phone plugin that cannot say whether a call is live does not leave you unable to go on. What
+needs a quiet app is what touches the running app: looking at a backup (a second of computing and up to a
+gigabyte of memory), making a backup, and the restart.
 
 **Any restart applies a prepared restore**, not only this button's: the restart that installs an update
 (Settings, About and updates) applies it too, at the start of the updated OAIY, if it is still within its

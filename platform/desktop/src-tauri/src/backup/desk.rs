@@ -32,6 +32,8 @@ pub trait Host: Send + Sync {
     fn data_dir(&self) -> Result<PathBuf, String>;
     /// Where the look is remembered for the prepare that follows.
     fn desk(&self) -> &Desk;
+    /// Restart OAIY so that what waits is applied at the start.
+    fn restart(&self);
 }
 
 /// The backup that was looked at last, kept so that preparing can use it without any page giving a path.
@@ -142,4 +144,24 @@ pub async fn stage<H: Host>(host: &H, inspect_id: String, passphrase: String, cl
             Err(e.message)
         }
     }
+}
+
+/// Restart OAIY so the staged restore is applied, unless the app is busy. The look at what is in the way is made twice: once
+/// to decide, and once again right before OAIY is stopped, because the first can take seconds (it asks a phone plugin whether a
+/// call is live) and a call can have started in them. A restart ends a call.
+pub async fn restart_to_apply<H: Host>(host: &H) -> Result<(), String> {
+    let data_dir = host.data_dir()?;
+    match restore::pending_info(&data_dir) {
+        None => return Err("No restore is waiting.".to_string()),
+        Some(waiting) if waiting.expired => {
+            let _ = restore::discard_pending(&data_dir);
+            return Err("That restore was prepared more than a day ago, so it will not be applied. Prepare it again.".to_string());
+        }
+        Some(_) => {}
+    }
+    host.busy().await.refuse_if_busy("restarting to finish the restore").map_err(|e| e.message)?;
+    // The last look, with nothing between it and the restart.
+    host.busy().await.refuse_if_busy("restarting to finish the restore").map_err(|e| e.message)?;
+    host.restart();
+    Ok(())
 }
