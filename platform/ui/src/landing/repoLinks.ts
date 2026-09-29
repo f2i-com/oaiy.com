@@ -19,6 +19,18 @@ export const REPO_BRANCH = 'main';
 /** The newest release: the installers are its files. */
 export const RELEASES_URL = `${REPO_URL}/releases/latest`;
 
+/** Every release, for a file the pages do not offer themselves. */
+export const RELEASES_ALL_URL = `${REPO_URL}/releases`;
+
+/**
+ * A file of one release. Releases are tagged `v<version>` (docs/RELEASING.md), and the installers'
+ * names carry the version (`oaiy-desktop-<version>-windows-x64-setup.exe`), so this needs the version
+ * the site was built for (lib/downloads.ts).
+ */
+export function releaseAssetUrl(version: string, file: string): string {
+  return `${REPO_URL}/releases/download/v${version}/${file}`;
+}
+
 /** The folders of the repository the pages link to, as paths from its root. */
 export const REPO_FOLDERS = {
   /** OAIY Desktop: its README is the installation documentation. */

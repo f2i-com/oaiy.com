@@ -40,6 +40,22 @@ const ok = (name, cond, detail = '') => {
     console.log(`  ✗ ${name}${detail ? `  -> ${detail}` : ''}`);
   }
 };
+
+/**
+ * What a marketing page may ask for beyond its own site: nothing, except the desktop page's one read of the
+ * service library (`/api/service-library`), which goes to the build's API base (another origin when the site is
+ * built with VITE_API_BASE). Anything else (GitHub, a probe of a desktop on a product port, a CDN) is stray.
+ */
+function strayRequests(urls, pagePath, site) {
+  let libraryReads = 0;
+  return urls.filter((u) => {
+    if (/^(data|blob):/.test(u)) return false;
+    const url = new URL(u);
+    if (url.origin === site) return false;
+    if (pagePath === '/desktop.html' && url.pathname === '/api/service-library' && ++libraryReads === 1) return false;
+    return true;
+  });
+}
 const section = (s) => console.log(`\n-- ${s} --`);
 
 const browser = await chromium.launch();
@@ -353,6 +369,101 @@ for (const theme of ['dark', 'light']) {
 }
 
 // ---------------------------------------------------------------------------
+// "Download OAIY Desktop": the device it is for, the link, and what it never does.
+//
+// The button is worked out in the page from what the browser says of itself (no request) and links to
+// the release its build was made for: a versioned build names the file, a local build goes to the
+// latest release. Both are accepted here (this file runs against the dev server too); tests/downloads.mjs
+// has the exact names. A device OAIY Desktop is not built for is told so and is not given a button.
+section('download OAIY Desktop');
+{
+  const ua = {
+    windows: 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/141.0.0.0 Safari/537.36',
+    linux: 'Mozilla/5.0 (X11; Linux x86_64; rv:143.0) Gecko/20100101 Firefox/143.0',
+    mac: 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/18.0 Safari/605.1.15',
+    iphone: 'Mozilla/5.0 (iPhone; CPU iPhone OS 18_0 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/18.0 Mobile/15E148 Safari/604.1',
+    android: 'Mozilla/5.0 (Linux; Android 14; Pixel 8) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/141.0.0.0 Mobile Safari/537.36',
+  };
+  // navigator.userAgentData (Chrome, Edge) or none (Firefox, Safari); maxTouchPoints 5 is what an iPad reports.
+  const devices = [
+    { name: 'Windows in Chrome', userAgent: ua.windows, uaData: 'Windows', touch: 0, os: 'windows' },
+    { name: 'Linux in Firefox', userAgent: ua.linux, uaData: null, touch: 0, os: 'linux' },
+    { name: 'a Mac in Safari', userAgent: ua.mac, uaData: null, touch: 0, os: 'mac' },
+    { name: 'an iPhone', userAgent: ua.iphone, uaData: null, touch: 5, os: 'iphone' },
+    { name: 'an iPad (a Mac that has a touch screen)', userAgent: ua.mac, uaData: null, touch: 5, os: 'ipad' },
+    { name: 'Android in Chrome', userAgent: ua.android, uaData: 'Android', touch: 5, os: 'android' },
+  ];
+  const site = new URL(BASE).origin;
+  for (const d of devices) {
+    const ctx = await browser.newContext({ userAgent: d.userAgent, viewport: { width: 1280, height: 900 } });
+    await ctx.addInitScript(({ uaData, touch }) => {
+      Object.defineProperty(navigator, 'userAgentData', { configurable: true, value: uaData ? { platform: uaData, mobile: false, brands: [] } : undefined });
+      Object.defineProperty(navigator, 'maxTouchPoints', { configurable: true, value: touch });
+      try { localStorage.setItem('oaiy_theme', 'dark'); } catch { /* blocked */ }
+    }, { uaData: d.uaData, touch: d.touch });
+    const page = await ctx.newPage();
+    const requests = [];
+    page.on('request', (r) => requests.push(r.url()));
+    for (const path of ['/', '/desktop.html']) {
+      requests.length = 0;
+      await page.goto(BASE + path, { waitUntil: 'networkidle' });
+      await page.waitForTimeout(600);
+      const box = page.locator('.oaiy-download').first();
+      const button = box.locator('a.btn').first();
+      const href = (await button.getAttribute('href')) ?? '';
+      const text = ((await box.textContent()) ?? '').replace(/\s+/g, ' ');
+      const where = `${d.name} on ${path}`;
+      if (d.os === 'windows') {
+        ok(`${where}: the button is the Windows installer (or the latest release)`, /releases\/(latest|download\/v\d+\.\d+\.\d+\/oaiy-desktop-\d+\.\d+\.\d+-windows-x64-setup\.exe)$/.test(href) && /Download OAIY Desktop/.test(await button.textContent()), href);
+        ok(`${where}: it says the installer is not code-signed yet`, /Not code-signed yet/.test(text), text);
+      } else if (d.os === 'linux') {
+        ok(`${where}: the button is the AppImage (or the latest release)`, /releases\/(latest|download\/v\d+\.\d+\.\d+\/oaiy-desktop-\d+\.\d+\.\d+-linux-x86_64\.AppImage)$/.test(href) && /Download OAIY Desktop/.test(await button.textContent()), href);
+      } else {
+        // The button goes to the desktop page, or on the desktop page itself (where that would go nowhere) to the web app.
+        ok(`${where}: no download, the honest sentence, and a way to the web app or the desktop page`, /OAIY Desktop is for Windows and Linux\. The web app works in your browser\./.test(text) && !/releases\/(latest|download)/.test(href) && href === (path === '/' ? 'desktop.html' : 'app.html'), `${href} | ${text}`);
+      }
+      ok(`${where}: "All downloads" is the releases page`, (await box.locator('a', { hasText: 'All downloads on GitHub' }).count()) >= 1
+        && /github\.com\/f2i-com\/oaiy\.com\/releases$/.test((await box.locator('a', { hasText: 'All downloads on GitHub' }).first().getAttribute('href')) ?? ''));
+      const stray = strayRequests(requests, path, site);
+      ok(`${where}: nothing asked of anyone but its own site (no GitHub, no probe of a desktop; the desktop page's one read of the service library aside)`, stray.length === 0, stray.join(' '));
+    }
+    await ctx.close();
+  }
+
+  // In the editor: under the engine card in the sidebar, and in Settings, while no desktop answers.
+  const ctx = await browser.newContext({ userAgent: ua.windows, viewport: { width: 1440, height: 900 } });
+  await ctx.addInitScript(() => {
+    try {
+      localStorage.setItem('skipSplash', 'true');
+      localStorage.setItem('oaiy.wizard.completed', 'true');
+      localStorage.setItem('oaiy_theme', 'dark');
+    } catch { /* blocked */ }
+  });
+  const page = await ctx.newPage();
+  await page.goto(`${BASE}/app.html`, { waitUntil: 'networkidle' });
+  await page.waitForTimeout(2500);
+  const get = page.locator('.oaiy-engine-get a');
+  ok('the sidebar offers OAIY Desktop under the engine card while none answers', (await get.count()) === 1 && /releases\/(latest|download\/v\d+\.\d+\.\d+\/oaiy-desktop-\d+\.\d+\.\d+-windows-x64-setup\.exe)$/.test((await get.getAttribute('href')) ?? ''));
+  await page.locator('.oaiy-settings-btn').first().click();
+  await page.waitForTimeout(600);
+  const card = page.locator('.oaiy-download-card');
+  ok('Settings offers it in the engine card', (await card.count()) === 1 && (await card.locator('a.btn').count()) === 1 && /Download OAIY Desktop for Windows|Download OAIY Desktop/.test(await card.locator('a.btn').textContent()));
+  await ctx.close();
+
+  // OAIY's own window is a desktop already: no offer.
+  const inOaiy = await browser.newContext({ userAgent: ua.windows, viewport: { width: 1440, height: 900 } });
+  await inOaiy.addInitScript(() => {
+    window.__OAIY_DESKTOP__ = { origin: 'http://127.0.0.1:1', token: 'e2e', theme: 'dark' };
+    try { localStorage.setItem('skipSplash', 'true'); localStorage.setItem('oaiy.wizard.completed', 'true'); } catch { /* blocked */ }
+  });
+  const inPage = await inOaiy.newPage();
+  await inPage.goto(`${BASE}/app.html`, { waitUntil: 'networkidle' });
+  await inPage.waitForTimeout(2000);
+  ok('in OAIY\'s own window there is no offer to download it', (await inPage.locator('.oaiy-engine-get, .oaiy-download').count()) === 0);
+  await inOaiy.close();
+}
+
+// ---------------------------------------------------------------------------
 // The flows rail collapses, stays collapsed, and can be brought back.
 //
 // It used to `return null` when closed, which is a hide rather than a collapse:
@@ -516,10 +627,12 @@ for (const path of ['/', '/desktop.html', '/app.html']) {
   const ctx = await browser.newContext();
   const page = await ctx.newPage();
   const external = [];
+  const asked = [];
   const woff2 = [];
   page.on('request', (r) => {
     const u = r.url();
     if (!/^(https?:\/\/localhost|https?:\/\/127\.0\.0\.1|data:|blob:)/.test(u)) external.push(u);
+    asked.push(u);
   });
   page.on('response', (r) => {
     if (/\.woff2?(\?|$)/.test(r.url())) woff2.push(r.status());
@@ -566,6 +679,13 @@ for (const path of ['/', '/desktop.html', '/app.html']) {
   // The api base is same-origin-ish (127.0.0.1) and allowed above; anything else
   // is a CDN or a tracker that crept back in.
   ok(`${path} makes no third-party requests`, external.length === 0, external.join(' '));
+  // The check above lets loopback through, which is where OAIY Desktop is looked for: the marketing pages
+  // never look (only the editor does), so they may ask for nothing but their own site (and the desktop page's
+  // one read of the service library, which goes to the API base of a build that has one).
+  if (path !== '/app.html') {
+    const stray = strayRequests(asked, path, new URL(BASE).origin);
+    ok(`${path} makes no request beyond its own site (no probe of a desktop)`, stray.length === 0, stray.join(' '));
+  }
 
   await ctx.close();
 }

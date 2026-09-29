@@ -135,6 +135,7 @@ export function ShellSidebar({
   settingsActive,
   companionOnline,
   companionDetail,
+  engineAction,
   onInstall,
 }: {
   /** Below md the rail is off-canvas; this slides it in. Ignored above md,
@@ -149,6 +150,8 @@ export function ShellSidebar({
   settingsActive: boolean;
   companionOnline: boolean;
   companionDetail: string;
+  /** Under the engine card: where to get OAIY Desktop, while none answers. */
+  engineAction?: ReactNode;
   /** Install the editor as an app. Given only while the browser is offering to: no button otherwise. */
   onInstall?: () => void;
 }) {
@@ -232,6 +235,7 @@ export function ShellSidebar({
         </span>
         <i />
       </div>
+      {engineAction}
 
       {onInstall && (
         <button

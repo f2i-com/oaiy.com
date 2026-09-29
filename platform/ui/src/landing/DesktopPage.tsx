@@ -14,6 +14,7 @@
  */
 import { useEffect, useState } from 'react';
 import SiteNav from './SiteNav';
+import DownloadDesktop from '../components/DownloadDesktop';
 import { REPO_URL, RELEASES_URL, repoFolderUrl } from './repoLinks';
 import { loadServiceLibrary, type LibraryItem } from './serviceLibrary';
 
@@ -70,12 +71,12 @@ function Hero() {
             Give your workflows a home on your own hardware. Manage models,
             services and plugins from one desktop app, and connect them to the web canvas over localhost.
           </p>
-          <div className="lp-reveal mt-8 flex flex-wrap items-center gap-3" style={{ animationDelay: '220ms' }}>
-            <a href="#install" className="btn btn-primary btn-lg">
-              Set it up
+          <div className="lp-reveal mt-8 flex flex-wrap items-start gap-3" style={{ animationDelay: '220ms' }}>
+            <DownloadDesktop variant="primary" />
+            <a href="#install" className="btn btn-secondary btn-lg">
+              Install steps
               <ArrowRight />
             </a>
-            <a href="#library" className="btn btn-secondary btn-lg">Browse the service library</a>
           </div>
           <p
             className="lp-reveal mt-5 inline-flex items-center gap-1.5 text-sm"
@@ -192,10 +193,13 @@ function Install() {
       sub="Optional and local only. Without it the app still works; a node that needs a desktop service says so and tells you what to start."
       tone="var(--signal-green)"
     >
-      <div className="mb-8 flex flex-wrap gap-3">
-        <a className="btn btn-primary btn-lg" href={RELEASES_URL}><DownloadIcon /> Get the latest release</a>
+      <div className="mb-4 flex flex-wrap items-start gap-3">
+        <DownloadDesktop variant="primary" />
         <a className="btn btn-secondary btn-lg" href={repoFolderUrl('desktop')}>Installation documentation</a>
       </div>
+      <p className="mb-8 text-sm" style={{ color: 'rgb(var(--color-text-tertiary))', lineHeight: 1.55 }}>
+        Every file has its SHA-256 in <code>SHA256SUMS.txt</code> on the <a href={RELEASES_URL} target="_blank" rel="noopener noreferrer" className="lp-star-inline">latest release</a>.
+      </p>
       <ol className="lp-steps">
         {steps.map((s, i) => (
           <li key={s.title} className="lp-step">

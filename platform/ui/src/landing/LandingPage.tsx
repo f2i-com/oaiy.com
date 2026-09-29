@@ -19,6 +19,7 @@
  * chose. No app boot runs here (see landing/main.tsx).
  */
 import SiteNav, { REPO_URL } from './SiteNav';
+import DownloadDesktop from '../components/DownloadDesktop';
 
 const APP_URL = 'app.html';
 
@@ -65,14 +66,12 @@ function Hero() {
             Give your ideas a workflow. Connect models, tools and media on a visual canvas,
             then run them with the engines you choose — on your machine or through your own endpoints.
           </p>
-          <div className="lp-reveal mt-8 flex flex-wrap items-center gap-3" style={{ animationDelay: '220ms' }}>
+          <div className="lp-reveal mt-8 flex flex-wrap items-start gap-3" style={{ animationDelay: '220ms' }}>
             <a href={APP_URL} className="btn btn-primary btn-lg">
               Open the app
               <ArrowRight />
             </a>
-            <a href="desktop.html" className="btn btn-secondary btn-lg">
-              Get OAIY Desktop
-            </a>
+            <DownloadDesktop variant="hero" />
           </div>
           <ul
             className="lp-reveal mt-5 flex flex-wrap gap-x-5 gap-y-1.5 text-sm"
@@ -608,12 +607,12 @@ function FinalCta() {
         <p className="lp-lede mt-4 max-w-lg">
           No account, no install, no cloud bill. Open the canvas and have something running in the next five minutes.
         </p>
-        <div className="mt-8 flex flex-wrap gap-3">
+        <div className="mt-8 flex flex-wrap items-start gap-3">
           <a href={APP_URL} className="btn btn-primary btn-lg">
             Open the app
             <ArrowRight />
           </a>
-          <a href="#desktop" className="btn btn-secondary btn-lg">About the desktop app</a>
+          <DownloadDesktop variant="hero" />
         </div>
         <p className="mt-8 text-sm" style={{ color: 'rgb(var(--color-text-secondary))' }}>
           OAIY is open source under Apache-2.0.{' '}

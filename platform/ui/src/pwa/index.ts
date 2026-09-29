@@ -7,19 +7,13 @@
  * that cannot have a worker. See installController.ts, updateController.ts, register.ts and swCore.ts.
  */
 import { useSyncExternalStore } from 'react';
+import { inOaiyWindow } from '../lib/oaiyWindow';
 import { createInstallController, type InstallState } from './installController';
 import { registerServiceWorker, shouldRegister, loadedFiles, type WorkerContainer } from './register';
 import { createUpdateController, type UpdateState } from './updateController';
 
-type OaiyWindow = Window & { __OAIY_DESKTOP__?: unknown };
-
 export const installController = createInstallController();
 export const updateController = createUpdateController({ reload: () => window.location.reload() });
-
-/** Whether this window is OAIY's own (the desktop injects __OAIY_DESKTOP__ before the page runs). */
-export function inOaiyWindow(): boolean {
-  return typeof window !== 'undefined' && Boolean((window as OaiyWindow).__OAIY_DESKTOP__);
-}
 
 function standalone(): boolean {
   return (

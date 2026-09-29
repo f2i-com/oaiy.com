@@ -20,6 +20,7 @@ import {
 } from '../../../lib/engineEndpoint';
 import { subscribeDesktopStatus, type DesktopInfo } from '../../../lib/desktopDetection';
 import { Card } from '../../chrome/SectionPage';
+import DownloadDesktop from '../../DownloadDesktop';
 
 export default function EngineEndpointCard() {
   const [value, setValue] = useState(getEngineBase());
@@ -99,6 +100,11 @@ export default function EngineEndpointCard() {
       </p>
       {error && <p className="oaiy-error-text">{error}</p>}
       {saved && !error && <p className="oaiy-ok-text">Saved. Reconnecting…</p>}
+
+      {!status?.available && (
+        /* No desktop answers: where to get one. Nothing in OAIY's own window, which is one. */
+        <DownloadDesktop variant="card" />
+      )}
 
       {remote && (
         /* A correct address against a loopback-only server fails exactly like a

@@ -1,0 +1,229 @@
+/**
+ * Which OAIY Desktop download the site offers, and how it decides.
+ *
+ *     npm run test:downloads
+ *
+ * lib/downloads.ts is pure (the browser and the build's environment are read elsewhere), so it is
+ * given what the browser says and the version the site was built for:
+ *   - the device from userAgentData or the user agent, for the shapes browsers really send: Windows,
+ *     Linux (and its ARM and 32-bit kinds, which the files are not built for), Mac, iPhone, iPad (which
+ *     calls itself a Mac), Android phone and tablet (which say Linux too), Chrome OS, and what it cannot tell;
+ *   - the version: N.N.N, a leading v, an empty string (what a GitHub expression with no value gives), garbage;
+ *   - the links: with a version, the exact names of the release's files under releases/download/v<version>/,
+ *     each checked against the names .github/workflows/release.yml gives them; without one, a single button to the
+ *     latest release saying only "Download OAIY Desktop";
+ *   - a Mac or a phone is told what OAIY Desktop is for, and gets no button;
+ *   - no link to anywhere but the project's repository, and the source makes no request.
+ */
+import assert from 'node:assert/strict';
+import fs from 'node:fs';
+import path from 'node:path';
+import { loadTs, suite, UI } from './support/loadTs.mjs';
+
+const D = await loadTs('src/lib/downloads.ts');
+const L = await loadTs('src/landing/repoLinks.ts');
+const { check, finish } = suite('downloads');
+
+const UA = {
+  windowsChrome: 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/141.0.0.0 Safari/537.36',
+  windowsEdge: 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/141.0.0.0 Safari/537.36 Edg/141.0.0.0',
+  windowsFirefox: 'Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:143.0) Gecko/20100101 Firefox/143.0',
+  windows32on64: 'Mozilla/5.0 (Windows NT 10.0; WOW64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/109.0.0.0 Safari/537.36',
+  windowsPhone: 'Mozilla/5.0 (Windows Phone 10.0; Android 6.0.1; Microsoft; Lumia 950) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/52.0.2743.116 Mobile Safari/537.36 Edge/15.15254',
+  macSafari: 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/18.0 Safari/605.1.15',
+  macChrome: 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/141.0.0.0 Safari/537.36',
+  linuxChrome: 'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/141.0.0.0 Safari/537.36',
+  linuxFirefox: 'Mozilla/5.0 (X11; Linux x86_64; rv:143.0) Gecko/20100101 Firefox/143.0',
+  ubuntuFirefox: 'Mozilla/5.0 (X11; Ubuntu; Linux x86_64; rv:143.0) Gecko/20100101 Firefox/143.0',
+  linuxArm: 'Mozilla/5.0 (X11; Linux aarch64; rv:143.0) Gecko/20100101 Firefox/143.0',
+  linux32: 'Mozilla/5.0 (X11; Linux i686; rv:143.0) Gecko/20100101 Firefox/143.0',
+  androidPhone: 'Mozilla/5.0 (Linux; Android 14; Pixel 8) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/141.0.0.0 Mobile Safari/537.36',
+  androidTablet: 'Mozilla/5.0 (Linux; Android 13; SM-X700) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/141.0.0.0 Safari/537.36',
+  iphone: 'Mozilla/5.0 (iPhone; CPU iPhone OS 18_0 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/18.0 Mobile/15E148 Safari/604.1',
+  iphoneChrome: 'Mozilla/5.0 (iPhone; CPU iPhone OS 18_0 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) CriOS/141.0.0.0 Mobile/15E148 Safari/604.1',
+  ipadOld: 'Mozilla/5.0 (iPad; CPU OS 12_2 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/12.1 Mobile/15E148 Safari/604.1',
+  chromeOs: 'Mozilla/5.0 (X11; CrOS x86_64 14541.0.0) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/141.0.0.0 Safari/537.36',
+  freebsd: 'Mozilla/5.0 (X11; FreeBSD amd64; rv:143.0) Gecko/20100101 Firefox/143.0',
+};
+
+const os = (input) => D.detectDevice(input).os;
+
+await check('the device: Windows, in each browser, and a 32-bit browser on 64-bit Windows', () => {
+  for (const key of ['windowsChrome', 'windowsEdge', 'windowsFirefox', 'windows32on64']) assert.equal(os({ userAgent: UA[key] }), 'windows', key);
+});
+
+await check('the device: Linux, and the kinds of it the files are not built for', () => {
+  for (const key of ['linuxChrome', 'linuxFirefox', 'ubuntuFirefox']) {
+    assert.deepEqual(D.detectDevice({ userAgent: UA[key] }), { os: 'linux', arch: 'x64' }, key);
+  }
+  assert.deepEqual(D.detectDevice({ userAgent: UA.linuxArm }), { os: 'linux', arch: 'arm' });
+  assert.deepEqual(D.detectDevice({ userAgent: UA.linux32 }), { os: 'linux', arch: 'x86' });
+});
+
+await check('the device: Android says Linux too, and is asked about first (phone and tablet)', () => {
+  assert.equal(os({ userAgent: UA.androidPhone }), 'android');
+  assert.equal(os({ userAgent: UA.androidTablet }), 'android');
+  assert.equal(os({ userAgent: UA.windowsPhone }), 'android', 'a phone that also says Windows is a phone');
+  assert.equal(os({ userAgent: UA.androidPhone, uaPlatform: 'Android' }), 'android');
+  assert.equal(os({ userAgent: UA.androidPhone, uaPlatform: 'Linux' }), 'android', 'a browser that says Linux under an Android user agent is on Android');
+});
+
+await check('the device: iPhone, iPad old and new (a tablet that calls itself a Mac), and a Mac with no touch screen', () => {
+  assert.equal(os({ userAgent: UA.iphone, maxTouchPoints: 5 }), 'ios');
+  assert.equal(os({ userAgent: UA.iphoneChrome, maxTouchPoints: 5 }), 'ios');
+  assert.equal(os({ userAgent: UA.ipadOld, maxTouchPoints: 5 }), 'ios');
+  assert.equal(os({ userAgent: UA.macSafari, maxTouchPoints: 5 }), 'ios', 'iPadOS asks for the desktop site as a Mac');
+  assert.equal(os({ userAgent: UA.macSafari, maxTouchPoints: 0 }), 'mac');
+  assert.equal(os({ userAgent: UA.macChrome }), 'mac');
+  assert.equal(os({ userAgent: UA.macChrome, maxTouchPoints: 1 }), 'mac', 'one touch point is a Mac with a touch bar or a stray driver, not a tablet');
+});
+
+await check('the device: what it cannot tell is "other" (Chrome OS, a BSD, nothing at all)', () => {
+  assert.equal(os({ userAgent: UA.chromeOs }), 'other');
+  assert.equal(os({ userAgent: UA.freebsd }), 'other');
+  assert.equal(os({ userAgent: '' }), 'other');
+  assert.equal(os({}), 'other');
+  assert.equal(os(), 'other');
+  assert.equal(os({ userAgent: 'curl/8.4.0' }), 'other');
+});
+
+await check('the device: the browser\'s own word (userAgentData.platform) wins over a user agent string', () => {
+  assert.equal(os({ uaPlatform: 'Windows', userAgent: UA.linuxChrome }), 'windows');
+  assert.equal(os({ uaPlatform: 'Linux', userAgent: UA.windowsChrome }), 'linux');
+  assert.equal(os({ uaPlatform: 'macOS', userAgent: UA.macChrome }), 'mac');
+  assert.equal(os({ uaPlatform: 'macOS', maxTouchPoints: 5 }), 'ios');
+  assert.equal(os({ uaPlatform: 'iOS' }), 'ios');
+  assert.equal(os({ uaPlatform: 'Chrome OS', userAgent: UA.chromeOs }), 'other');
+  assert.equal(os({ uaPlatform: 'ChromeOS' }), 'other');
+  assert.equal(os({ uaPlatform: '', userAgent: UA.windowsChrome }), 'windows', 'an empty platform falls back to the user agent');
+  assert.equal(os({ uaPlatform: 'Something New', userAgent: UA.linuxChrome }), 'linux');
+});
+
+await check('the version: N.N.N, with a v tolerated; empty, garbage and anything else is none', () => {
+  assert.equal(D.normalizeVersion('0.1.0'), '0.1.0');
+  assert.equal(D.normalizeVersion('v0.1.0'), '0.1.0');
+  assert.equal(D.normalizeVersion(' 12.30.4 '), '12.30.4');
+  for (const bad of ['', '  ', undefined, null, 5, {}, '0.1', '1.2.3.4', '1.2.3-beta', 'latest', '../../x', '1.2.3/../../evil', 'v', '0.1.0 && x']) {
+    assert.equal(D.normalizeVersion(bad), null, JSON.stringify(bad));
+  }
+});
+
+const WIN = { os: 'windows', arch: 'x64' };
+const LIN = { os: 'linux', arch: 'x64' };
+const releases = 'https://github.com/f2i-com/oaiy.com/releases';
+
+await check('Windows, built for 0.1.0: the NSIS installer is the button, the MSI and the server are the other downloads', () => {
+  const plan = D.downloadPlan(WIN, '0.1.0');
+  assert.deepEqual(plan.primary, { label: 'Download OAIY Desktop for Windows', href: `${releases}/download/v0.1.0/oaiy-desktop-0.1.0-windows-x64-setup.exe`, file: 'oaiy-desktop-0.1.0-windows-x64-setup.exe' });
+  assert.deepEqual(plan.others.map((o) => o.href), [
+    `${releases}/download/v0.1.0/oaiy-desktop-0.1.0-windows-x64.msi`,
+    `${releases}/download/v0.1.0/oaiy-server-0.1.0-windows-x64.zip`,
+  ]);
+  assert.equal(plan.allDownloads, releases);
+  assert.equal(plan.note, null);
+  assert.match(plan.caption, /^Version 0\.1\.0\. Not code-signed yet, so Windows will warn you\.$/);
+  assert.equal(plan.version, '0.1.0');
+});
+
+await check('Linux, built for 0.1.0: the AppImage is the button; .deb, .rpm and the server tarball are the other downloads', () => {
+  const plan = D.downloadPlan(LIN, 'v0.1.0');
+  assert.deepEqual(plan.primary, { label: 'Download OAIY Desktop for Linux', href: `${releases}/download/v0.1.0/oaiy-desktop-0.1.0-linux-x86_64.AppImage`, file: 'oaiy-desktop-0.1.0-linux-x86_64.AppImage' });
+  assert.deepEqual(plan.others.map((o) => o.file), ['oaiy-desktop-0.1.0-linux-amd64.deb', 'oaiy-desktop-0.1.0-linux-x86_64.rpm', 'oaiy-server-0.1.0-linux-x86_64.tar.gz']);
+  assert.equal(plan.caption, 'Version 0.1.0.');
+  assert.equal(plan.allDownloads, releases);
+});
+
+await check('with no version the button goes to the latest release and says only "Download OAIY Desktop"', () => {
+  for (const version of [undefined, '', null, 'not-a-version']) {
+    for (const device of [WIN, LIN]) {
+      const plan = D.downloadPlan(device, version);
+      assert.deepEqual(plan.primary, { label: 'Download OAIY Desktop', href: 'https://github.com/f2i-com/oaiy.com/releases/latest' }, JSON.stringify([version, device.os]));
+      assert.deepEqual(plan.others, []);
+      assert.equal(plan.version, null);
+      assert.equal(plan.allDownloads, releases);
+    }
+  }
+  assert.equal(D.downloadPlan(WIN, undefined).caption, 'Not code-signed yet, so Windows will warn you.');
+  assert.equal(D.downloadPlan(LIN, undefined).caption, null);
+});
+
+await check('a Mac, an iPhone, an iPad and an Android device get the sentence, and no download', () => {
+  for (const os of ['mac', 'ios', 'android']) {
+    for (const version of ['0.1.0', undefined]) {
+      const plan = D.downloadPlan({ os, arch: 'unknown' }, version);
+      assert.equal(plan.primary, null, `${os} ${version}`);
+      assert.deepEqual(plan.others, []);
+      assert.equal(plan.note, 'OAIY Desktop is for Windows and Linux. The web app works in your browser.');
+      assert.equal(plan.allDownloads, releases);
+    }
+  }
+});
+
+await check('Linux on ARM or 32-bit x86 is not offered files that would not run', () => {
+  for (const arch of ['arm', 'x86']) {
+    const plan = D.downloadPlan({ os: 'linux', arch }, '0.1.0');
+    assert.equal(plan.primary, null);
+    assert.deepEqual(plan.others, []);
+    assert.match(plan.note, /64-bit x86.*web app works in your browser/);
+  }
+  assert.ok(D.downloadPlan({ os: 'linux', arch: 'unknown' }, '0.1.0').primary, 'an architecture the user agent does not give is offered the files');
+});
+
+await check('a device that cannot be told gets the latest release, and is told the files are for Windows and Linux', () => {
+  const plan = D.downloadPlan({ os: 'other', arch: 'unknown' }, '0.1.0');
+  assert.deepEqual(plan.primary, { label: 'Download OAIY Desktop', href: 'https://github.com/f2i-com/oaiy.com/releases/latest' });
+  assert.equal(plan.note, 'The files are for Windows and Linux.');
+});
+
+await check('from the user agent to the link, for each browser above', () => {
+  const link = (ua, extra = {}) => D.downloadPlan(D.detectDevice({ userAgent: ua, ...extra }), '1.2.3').primary?.file ?? null;
+  assert.equal(link(UA.windowsEdge), 'oaiy-desktop-1.2.3-windows-x64-setup.exe');
+  assert.equal(link(UA.windowsFirefox), 'oaiy-desktop-1.2.3-windows-x64-setup.exe');
+  assert.equal(link(UA.ubuntuFirefox), 'oaiy-desktop-1.2.3-linux-x86_64.AppImage');
+  assert.equal(link(UA.linuxArm), null);
+  assert.equal(link(UA.macSafari), null);
+  assert.equal(link(UA.iphone, { maxTouchPoints: 5 }), null);
+  assert.equal(link(UA.androidPhone), null);
+});
+
+await check('the names are the release\'s own: every file offered is one .github/workflows/release.yml makes', () => {
+  const workflow = path.join(UI, '..', '..', '.github', 'workflows', 'release.yml');
+  if (!fs.existsSync(workflow)) {
+    console.log('    (no release.yml here: skipped)');
+    return;
+  }
+  const made = new Set([...fs.readFileSync(workflow, 'utf8').matchAll(/oaiy-(?:desktop|server)-\$VERSION-[\w.-]+/g)].map((m) => m[0].replace('$VERSION', '9.8.7')));
+  const names = Object.values(D.assetNames('9.8.7'));
+  assert.equal(names.length, 7);
+  for (const name of names) assert.ok(made.has(name), `${name} is not made by release.yml (it makes: ${[...made].join(', ')})`);
+  // The tag is the version the workflow builds (release.yml's meta job); the site is built with it.
+  assert.match(fs.readFileSync(workflow, 'utf8'), /VITE_OAIY_VERSION: \$\{\{ needs\.meta\.outputs\.version \}\}/, 'the web job builds the site with the version');
+});
+
+await check('every link goes to the project\'s repository, and only the names of the release\'s files vary', () => {
+  for (const device of [WIN, LIN, { os: 'other', arch: 'unknown' }]) {
+    for (const version of ['0.1.0', undefined]) {
+      const plan = D.downloadPlan(device, version);
+      for (const link of [plan.primary, ...plan.others].filter(Boolean)) assert.ok(link.href.startsWith(`${L.REPO_URL}/releases/`), link.href);
+      assert.ok(plan.allDownloads.startsWith(L.REPO_URL));
+    }
+  }
+  assert.equal(L.releaseAssetUrl('1.2.3', 'x.exe'), 'https://github.com/f2i-com/oaiy.com/releases/download/v1.2.3/x.exe');
+  assert.equal(L.RELEASES_ALL_URL, 'https://github.com/f2i-com/oaiy.com/releases');
+  assert.equal(L.RELEASES_URL, 'https://github.com/f2i-com/oaiy.com/releases/latest');
+});
+
+await check('the helper reads nothing and asks nothing: no fetch, no XMLHttpRequest, no navigator, no import.meta', () => {
+  const source = fs.readFileSync(path.join(UI, 'src', 'lib', 'downloads.ts'), 'utf8');
+  // Comments may talk about them; code may not.
+  const code = source.replace(/\/\*[\s\S]*?\*\//g, '').replace(/\/\/.*$/gm, '');
+  for (const forbidden of [/\bfetch\s*\(/, /XMLHttpRequest/, /\bnavigator\b/, /import\.meta/, /api\.github\.com/, /sendBeacon/, /new WebSocket/]) {
+    assert.doesNotMatch(code, forbidden, String(forbidden));
+  }
+  const env = fs.readFileSync(path.join(UI, 'src', 'lib', 'downloadsEnv.ts'), 'utf8').replace(/\/\*[\s\S]*?\*\//g, '');
+  assert.doesNotMatch(env, /fetch\s*\(|XMLHttpRequest|api\.github\.com/);
+  const component = fs.readFileSync(path.join(UI, 'src', 'components', 'DownloadDesktop.tsx'), 'utf8').replace(/\/\*[\s\S]*?\*\//g, '');
+  assert.doesNotMatch(component, /fetch\s*\(|XMLHttpRequest|api\.github\.com|127\.0\.0\.1|localhost|desktopDetection/, 'no request and no probe of a desktop');
+});
+
+finish();
