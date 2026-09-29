@@ -104,8 +104,17 @@ from their sources alone (OAIY's own line and the phone plugins, asked afresh), 
 the plugins are stopped: the stops before it (the engines, the script host) take seconds, the
 plugins are what holds the phone, and stopping them is what would end a call. If a call has
 begun by then, or a phone plugin can no longer say, what was stopped is started again and
-the update is back to "ready" with its download, nothing installed. The one gap left is the
-instant between that look and the plugin's own stop.
+the update is back to "ready" with its download, nothing installed.
+
+What is left after that look is not an instant but a few seconds: stopping the plugins is
+graceful. OAIY tells each plugin to shut down and waits for it to exit, up to 5 seconds
+(`SHUTDOWN_GRACE`) each and one after another, before it kills one that has not, and the plugin
+keeps running meanwhile. **A call that begins in that window is not looked for again**: a
+plugin can still ring, or accept a call it was asked for a moment before (a dial that was
+accepted just before the look may not yet show as a call in what the plugin reports), and the shutdown
+then ends it. Closing that window needs the plugin's help, a command that makes it refuse new
+calls (and say when the last one has ended) before OAIY stops it; that is a follow-up for the
+phone plugin (see "Not yet").
 
 What OAIY cannot see, it cannot wait for: a conversation the person is having in the Agent
 page right now is not a task the desktop knows about. "Restart to update" asks the Agent to
@@ -282,6 +291,12 @@ OAIY would accept. Rotate it, and tell people to install the new release by hand
 
 ## Not yet
 
+- **A refusal of new calls before the plugins stop.** The last look for a call is followed by the
+  plugins' graceful shutdown, up to 5 seconds for each plugin, one after another (above), and a call
+  that begins in that time is not looked for again. It needs a command of the phone plugin's
+  own that makes it refuse new calls, and answers when the last one has ended; OAIY would send it
+  after the last look and stop the plugin when it says it is idle. Follow-up for the phone plugin
+  (Aokie), and then for OAIY to use it.
 - **A stop that never returns.** Each thing OAIY stops has its own limits (the engines' shutdown,
   the services' kill timeouts), but a part that hangs inside its stop for ever would hang the
   update with it: the sequence does not put a time limit of its own on a part, because giving
