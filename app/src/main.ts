@@ -64,7 +64,8 @@ import { mayReloadForIsolation } from './pwa/reloadGuard';
 import { startInstall } from './pwa/install';
 import { installButton } from './ui/installButton';
 import { watchUpdates } from './pwa/update';
-import { showUpdateNotice } from './ui/updateNotice';
+import { confirmReload, showUpdateNotice } from './ui/updateNotice';
+import { agreedToLeave } from './pwa/leaveGuard';
 
 const WELCOME: Array<[string, string]> = [
   [
@@ -121,7 +122,7 @@ async function registerServiceWorker(): Promise<boolean> {
   const urls = performance.getEntriesByType('resource').map((e) => e.name);
   registration.active?.postMessage({ type: 'cache', urls: [location.href, ...urls] });
   // A new version waits for the person to reload (it never reloads the page by itself): say so.
-  showUpdateNotice(watchUpdates(registration));
+  showUpdateNotice(watchUpdates(registration, confirmReload));
   if (crossOriginIsolated) return false;
   // At most one automatic reload a minute: if isolation still does not come
   // (a browser that refuses it), the app starts anyway and says why the
@@ -2379,7 +2380,8 @@ With that done, Settings → Images, video and audio → Find OAIY sets it up.`)
   }
   window.addEventListener('beforeunload', (e) => {
     saveNow();
-    if (controller || project.dirty) e.preventDefault();
+    // Not when the person just agreed to leave (chose Reload for an update, which asked them, pwa/leaveGuard.ts).
+    if ((controller || project.dirty) && !agreedToLeave()) e.preventDefault();
   });
   chat.focus();
   // The SoftN reference loads on first use; fetch it now so it is cached for offline use.

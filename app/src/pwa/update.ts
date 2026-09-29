@@ -4,8 +4,10 @@
  * A new build brings a new service worker. It installs beside the running one
  * and waits (public/sw.js does not take over by itself), so a tab that is open
  * keeps running the version it started with. The page says a new version is
- * ready; when the person chooses Reload, the waiting worker is told to take
- * over and the page reloads once. Nothing reloads the page by itself.
+ * ready; when the person chooses Reload, the page first asks whether it may be
+ * left (see pwa/leaveGuard.ts), then the waiting worker is told to take over
+ * and the page reloads once when it has. Nothing reloads the page by itself,
+ * and nothing is sent to the worker until the person has agreed to leave.
  *
  * The page also asks the browser whether there is a new worker when it is shown
  * again after more than an hour (the browser checks on every navigation, but an
@@ -42,6 +44,12 @@ export interface UpdateEnvironment {
   container: ContainerLike;
   reload(): void;
   now(): number;
+  /**
+   * Asked before the worker is told to take over: may the page be left now? False
+   * when the person chose to stay (the page's leave guard would have stopped them,
+   * and they said no), in which case nothing is sent and nothing changes.
+   */
+  mayLeave(): boolean | Promise<boolean>;
 }
 
 /** `ready`: a new version is waiting to be used (or another tab already switched to it). */
@@ -52,9 +60,10 @@ export const CHECK_AFTER_MS = 60 * 60 * 1000;
 
 export class UpdateController {
   private ready = false;
-  /** The page asked for the waiting worker to take over, and reloads when it has. */
+  /** A click told the waiting worker to take over, and the page reloads when it has. */
   private asked = false;
-  private reloaded = false;
+  /** The reload for that click was made: a second `controllerchange` for the same click does not make another. */
+  private reloadedForChange = false;
   private controlled: boolean;
   private lastCheck: number;
   private readonly listeners = new Set<(state: UpdateState) => void>();
@@ -83,19 +92,25 @@ export class UpdateController {
   }
 
   /**
-   * The Reload button: the waiting worker takes over, and the page reloads once
-   * it has. Returns false when there is nothing to update to.
+   * The Reload button. The page is asked whether it may be left first; only when it
+   * may, the waiting worker is told to take over, and the page reloads once it has.
+   * Returns false when there is nothing to update to, or the person stayed.
+   *
+   * A click always does something: if the worker has already taken over (an earlier
+   * click whose reload was declined by the browser's own leave prompt, or another
+   * tab), the page is only reloaded.
    */
-  apply(): boolean {
+  async apply(): Promise<boolean> {
     if (!this.ready) return false;
+    if (!(await this.env.mayLeave())) return false;
     const waiting = this.env.registration.waiting;
     if (waiting) {
       this.asked = true;
+      this.reloadedForChange = false;
       waiting.postMessage(SKIP_WAITING);
       return true;
     }
-    // Another tab already switched to the new worker: this page only needs to load it.
-    this.reload();
+    this.env.reload();
     return true;
   }
 
@@ -125,7 +140,10 @@ export class UpdateController {
     const wasControlled = this.controlled;
     this.controlled = true;
     if (this.asked) {
-      this.reload();
+      if (!this.reloadedForChange) {
+        this.reloadedForChange = true;
+        this.env.reload();
+      }
       return;
     }
     // A tab of its own took the new version: this page still runs the old one, and says so.
@@ -137,24 +155,20 @@ export class UpdateController {
     this.ready = true;
     for (const listener of [...this.listeners]) listener('ready');
   }
-
-  private reload(): void {
-    if (this.reloaded) return;
-    this.reloaded = true;
-    this.env.reload();
-  }
 }
 
 /**
- * The controller for this page's registration: reloads with `location.reload()`
- * and looks for a new version whenever the page is shown after more than an hour.
+ * The controller for this page's registration: reloads with `location.reload()`,
+ * asks `mayLeave` before it does anything, and looks for a new version whenever
+ * the page is shown after more than an hour.
  */
-export function watchUpdates(registration: ServiceWorkerRegistration): UpdateController {
+export function watchUpdates(registration: ServiceWorkerRegistration, mayLeave: () => boolean | Promise<boolean>): UpdateController {
   const controller = new UpdateController({
     registration,
     container: navigator.serviceWorker,
     reload: () => location.reload(),
     now: () => Date.now(),
+    mayLeave,
   });
   document.addEventListener('visibilitychange', () => {
     if (document.visibilityState === 'visible') void controller.checkIfDue();

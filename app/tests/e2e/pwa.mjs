@@ -9,8 +9,11 @@
 //    name, and only those;
 //  - "Install app" shows only where the browser offers it (never as an installed app, never in OAIY's window),
 //    and iOS Safari gets one sentence;
-//  - a new version waits: the page says so, does not reload by itself, reloads once when asked, and then runs
-//    the new version;
+//  - a new version waits: the page says so and does not reload by itself; Reload asks first when the page would
+//    object to leaving (the agent is at work) and sends nothing if the person stays; agreeing takes the update and
+//    reloads once with no second prompt; when the browser's own leave prompt stops the reload, the next click works;
+//  - a second tab that has not reloaded still finds its files (one the host deleted) after the first tab took the
+//    update;
 //  - the app still opens, isolated and with its sandbox, with the server gone.
 //
 // Settings (all optional): CHROME (the browser), PWA_E2E_PORT (the static server's port; default: any free
@@ -32,10 +35,35 @@ const types = { '.html': 'text/html', '.js': 'text/javascript', '.mjs': 'text/ja
 // the next), and paths that answer 404.
 const OLD_CHUNK = '/assets/old-chunk-1a2b3c4d.js';
 const serving = { workerVersion: 1, oldChunk: true, missing: new Set() };
-const NEXT_CACHE = 'oaiy-agent-000000000002';
+// The cache of version 1 is the build's own; the later versions (other bytes of sw.js) have made-up names.
+const cacheOf = (version) => (version === 1 ? builtCache : `oaiy-agent-${String(version).padStart(12, '0')}`);
+const NEXT_CACHE = cacheOf(2);
 const stamped = readFileSync(join(root, 'sw.js'), 'utf8');
 const CACHE_LINE = /const CACHE = '(oaiy-agent-[0-9a-f]{12})';/;
 const builtCache = CACHE_LINE.exec(stamped)?.[1];
+
+// A model server that starts an answer and keeps it open: while it does, the agent is at work and the page's
+// leave guard objects to leaving.
+const heldReplies = [];
+const model = createServer((req, res) => {
+  res.setHeader('Access-Control-Allow-Origin', '*');
+  res.setHeader('Access-Control-Allow-Headers', '*');
+  res.setHeader('Access-Control-Allow-Private-Network', 'true');
+  if (req.method === 'OPTIONS') return res.end();
+  if (req.url.endsWith('/models')) {
+    res.setHeader('content-type', 'application/json');
+    return res.end(JSON.stringify({ data: [{ id: 'mock-model', context_length: 131072 }] }));
+  }
+  if (req.method === 'GET') {
+    res.statusCode = 404;
+    return res.end();
+  }
+  res.setHeader('content-type', 'text/event-stream');
+  res.write(`data: ${JSON.stringify({ choices: [{ index: 0, delta: { content: 'Working on it' } }] })}\n\n`);
+  heldReplies.push(res);
+});
+await new Promise((r) => model.listen(0, '127.0.0.1', r));
+const modelUrl = `http://127.0.0.1:${model.address().port}`;
 
 const requests = [];
 const server = createServer((req, res) => {
@@ -65,8 +93,8 @@ const server = createServer((req, res) => {
   if (isPage) file = join(root, 'index.html');
   res.setHeader('content-type', types[extname(file)] ?? 'application/octet-stream');
   if (path === '/sw.js' && serving.workerVersion >= 2) {
-    // The next build: another cache name, so other bytes.
-    res.end(stamped.replace(CACHE_LINE, `const CACHE = '${NEXT_CACHE}';`) + '\n// the next version\n');
+    // A next build: another cache name, so other bytes.
+    res.end(stamped.replace(CACHE_LINE, `const CACHE = '${cacheOf(serving.workerVersion)}';`) + `\n// version ${serving.workerVersion}\n`);
     return;
   }
   res.end(readFileSync(file));
@@ -363,7 +391,34 @@ try {
   });
 
   // ---- an update ----
-  await check('a new version waits: the page says so, does not reload by itself, and reloads once when asked', async () => {
+  const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+  const stateOf = () =>
+    page.evaluate(async () => {
+      const registration = await navigator.serviceWorker.getRegistration();
+      return { active: registration.active?.state, waiting: registration.waiting?.state, notice: !!document.querySelector('.update-notice'), alive: window.__stillHere === true };
+    });
+  // A real click (the browser only asks before leaving a page that has had one).
+  const clickReload = async () => {
+    await page.bringToFront();
+    await page.click('.update-notice button.primary');
+  };
+  const askUpdate = () =>
+    page.evaluate(async () => {
+      const registration = await navigator.serviceWorker.getRegistration();
+      await registration.update().catch(() => {});
+    });
+  const cachesAre = async (wanted, what) => {
+    let keys = [];
+    for (let i = 0; i < 40; i++) {
+      keys = (await cacheKeys(page)).sort();
+      if (JSON.stringify(keys) === JSON.stringify([...wanted].sort())) break;
+      await sleep(250);
+    }
+    same(keys, [...wanted].sort(), what);
+  };
+  let navigationsBefore = 0;
+
+  await check('a new version waits: the page says so, and does not reload by itself', async () => {
     await page.evaluate(() => {
       window.__stillHere = true;
     });
@@ -373,43 +428,79 @@ try {
     await isolated(tabB);
     await tabB.waitForSelector('.tree-row', { timeout: 30_000 });
     same(await tabB.evaluate(async (u) => (await fetch(u)).status, OLD_CHUNK), 200, "the first version's hashed file, before the update");
-    for (let i = 0; i < 40 && !(await tabB.evaluate((u) => caches.match(u).then(Boolean), OLD_CHUNK)); i++) await new Promise((r) => setTimeout(r, 250));
+    for (let i = 0; i < 40 && !(await tabB.evaluate((u) => caches.match(u).then(Boolean), OLD_CHUNK)); i++) await sleep(250);
     // The host deploys the next version, and the first one's hashed file is gone from it.
     serving.oldChunk = false;
-    const navigationsBefore = navigations;
+    navigationsBefore = navigations;
     serving.workerVersion = 2;
-    await page.evaluate(async () => {
-      const registration = await navigator.serviceWorker.getRegistration();
-      await registration.update();
-    });
+    await askUpdate();
     await page.waitForSelector('.update-notice', { timeout: 30_000 });
     const notice = await page.$eval('.update-notice', (n) => n.textContent);
     expect(/A new version is ready/.test(notice) && /Reload/.test(notice), `the notice says: ${notice}`);
     // Left alone, the page stays as it is, and the new worker only waits.
-    await new Promise((r) => setTimeout(r, 2000));
-    same(await page.evaluate(() => [window.__stillHere === true, !!navigator.serviceWorker.controller]), [true, true], 'the page and its worker while a new one waits');
+    await sleep(2000);
+    same(await stateOf(), { active: 'activated', waiting: 'installed', notice: true, alive: true }, 'the page and its workers while a new one waits');
     same(navigations, navigationsBefore, 'navigations before Reload');
-    const waiting = await page.evaluate(async () => (await navigator.serviceWorker.getRegistration()).waiting?.state);
-    same(waiting, 'installed', 'state of the waiting worker');
     same(await page.evaluate(async () => (await caches.keys()).includes('oaiy-agent-000000000002')), true, 'the new version cached its files while waiting');
     same((await cacheKeys(page)).includes(builtCache), true, 'the running version kept its cache while the new one waits');
+  });
 
-    // Reload: the new worker takes over and the page loads once, in the new version.
-    await page.evaluate(() => [...document.querySelectorAll('.update-notice button')].find((b) => b.textContent === 'Reload').click());
+  await check('Reload asks first when the page would object to leaving (the agent is at work), and staying sends nothing', async () => {
+    // A provider, and a question that the model keeps answering: the agent is at work.
+    await page.bringToFront();
+    await page.click('button[title="AI providers"]');
+    await page.waitForSelector('dialog.settings[open]');
+    await page.evaluate(() => [...document.querySelectorAll('dialog.settings button')].find((b) => b.textContent.includes('Add a provider')).click());
+    await page.select('dialog.settings select', 'local-other');
+    await page.evaluate((url) => {
+      const input = [...document.querySelectorAll('dialog.settings label')].find((l) => l.firstChild.textContent === 'Address').querySelector('input');
+      input.value = url;
+      input.dispatchEvent(new Event('input'));
+      [...document.querySelectorAll('dialog.settings button')].find((b) => b.textContent === 'List models').click();
+    }, modelUrl);
+    await page.waitForFunction(() => [...document.querySelectorAll('.model-picker select option')].some((o) => o.value === 'mock-model'), { timeout: 15_000 });
+    await page.select('.model-picker select', 'mock-model');
+    await page.waitForFunction(() => document.querySelector('.provider-row.selected')?.textContent.includes('mock-model'));
+    await page.evaluate(() => [...document.querySelectorAll('dialog.settings button')].find((b) => b.textContent === 'Save').click());
+    await page.waitForFunction(() => document.querySelector('button[title="AI provider"]')?.textContent.includes('mock-model'));
+    await page.type('.chat-input', 'Take your time.');
+    await page.keyboard.press('Enter');
+    for (let i = 0; i < 100 && !heldReplies.length; i++) await sleep(100);
+    expect(heldReplies.length > 0, 'the agent never asked the model');
+
+    await clickReload();
+    await page.waitForSelector('dialog.modal[open]', { timeout: 10_000 });
+    const said = await page.$eval('dialog.modal', (d) => d.textContent);
+    expect(/Reload OAIY\?/.test(said), `the dialog says: ${said}`);
+    // Stay.
+    await page.evaluate(() => [...document.querySelectorAll('dialog.modal button')].find((b) => b.textContent === 'Cancel').click());
+    await sleep(2000);
+    // Nothing was sent to the waiting worker, so it still waits; the page did not move; the button works.
+    same(await stateOf(), { active: 'activated', waiting: 'installed', notice: true, alive: true }, 'the page and its workers after staying');
+    same(navigations, navigationsBefore, 'navigations after staying');
+    same(await page.$eval('.update-notice button.primary', (b) => !b.disabled), true, 'the Reload button is usable');
+  });
+
+  await check('agreeing to leave takes the update and reloads once, with no second question from the browser', async () => {
+    const dialogs = [];
+    const onDialog = (dialog) => {
+      dialogs.push(dialog.type());
+      dialog.accept();
+    };
+    page.on('dialog', onDialog);
+    await clickReload();
+    await page.waitForSelector('dialog.modal[open]', { timeout: 10_000 });
+    await page.evaluate(() => [...document.querySelectorAll('dialog.modal button')].find((b) => b.textContent === 'Reload').click());
     await page.waitForFunction(() => window.__stillHere === undefined, { timeout: 30_000, polling: 100 });
     await isolated(page);
     await page.waitForSelector('.tree-row', { timeout: 30_000 });
-    await new Promise((r) => setTimeout(r, 2000));
+    await sleep(2000);
+    page.off('dialog', onDialog);
+    same(dialogs, [], "the browser's own leave prompts");
     same(navigations - navigationsBefore, 1, 'navigations after Reload');
     same(await page.evaluate(() => !!document.querySelector('.update-notice')), false, 'the notice after reloading');
-    let keys = [];
-    for (let i = 0; i < 40; i++) {
-      keys = (await cacheKeys(page)).sort();
-      if (!keys.includes(builtCache)) break;
-      await new Promise((r) => setTimeout(r, 250));
-    }
-    // The previous version's cache is kept for one more update; the bot.computer one, older than that, is gone.
-    same(keys, [builtCache, NEXT_CACHE, 'unrelated-cache'].sort(), 'the caches after the update');
+    // The version before is kept for one more update; the bot.computer cache, older than that, is gone.
+    await cachesAre([builtCache, NEXT_CACHE, 'unrelated-cache'], 'the caches after the update');
   });
 
   await check('a tab that has not reloaded still finds its files after another tab took the update', async () => {
@@ -419,6 +510,55 @@ try {
     // A file that no version ever had is still a 404: the 200 above came from the cache.
     same(await tabB.evaluate(async () => (await fetch('/assets/never-was-1a2b3c4d.js')).status), 404, 'a file no version has');
     await tabB.close();
+  });
+
+  await check("when the browser's own leave prompt stops the reload, the page goes on and the next click on Reload works", async () => {
+    // A third version, and a page that the browser will not leave once (a guard of its own: only for a real navigation).
+    await page.bringToFront();
+    await page.evaluate(() => {
+      window.__stillHere = true;
+      window.__stay = 1;
+      window.addEventListener('beforeunload', (event) => {
+        if (event.isTrusted && window.__stay > 0) {
+          window.__stay--;
+          event.preventDefault();
+        }
+      });
+    });
+    navigationsBefore = navigations;
+    serving.workerVersion = 3;
+    await askUpdate();
+    await page.waitForSelector('.update-notice', { timeout: 30_000 });
+    const dialogs = [];
+    const onDialog = (dialog) => {
+      dialogs.push(dialog.type());
+      // The person stays the first time, and leaves the next.
+      if (dialogs.length === 1) dialog.dismiss();
+      else dialog.accept();
+    };
+    page.on('dialog', onDialog);
+    try {
+      await clickReload();
+      // The worker takes over, the page tries to reload, the browser asks, the person stays.
+      for (let i = 0; i < 100 && !dialogs.length; i++) await sleep(200);
+      same(dialogs, ['beforeunload'], "the browser's leave prompts after the first click");
+      await sleep(1000);
+      same(await stateOf(), { active: 'activated', notice: true, alive: true }, 'the page and its workers after staying');
+      same(navigations, navigationsBefore, 'navigations after staying');
+      // The Reload button comes back, and works.
+      await page.waitForFunction(() => !document.querySelector('.update-notice button.primary').disabled, { timeout: 30_000, polling: 250 });
+      await clickReload();
+      await page.waitForFunction(() => window.__stillHere === undefined, { timeout: 30_000, polling: 100 });
+      await isolated(page);
+      await page.waitForSelector('.tree-row', { timeout: 30_000 });
+      await sleep(2000);
+    } finally {
+      page.off('dialog', onDialog);
+    }
+    same(dialogs, ['beforeunload'], "the browser's leave prompts in all");
+    same(navigations - navigationsBefore, 1, 'navigations after the second click');
+    same(await page.evaluate(() => !!document.querySelector('.update-notice')), false, 'the notice after reloading');
+    await cachesAre([cacheOf(2), cacheOf(3), 'unrelated-cache'], 'the caches after the second update');
   });
 
   // ---- offline ----
@@ -436,8 +576,10 @@ try {
     await terminal(offline, 'node hello.js', 'warmest: Cairo');
   });
 } finally {
+  for (const reply of heldReplies) reply.end();
   await browser.close().catch(() => {});
   server.close();
+  model.close();
   // The profile is ours (made above, named for this test): remove it.
   if (basename(profile).startsWith(PROFILE_PREFIX) && profile.startsWith(tmpdir())) {
     try {
