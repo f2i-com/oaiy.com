@@ -21,26 +21,41 @@ import { parseYaml, workflowSteps } from './workflow-yaml.mjs';
 const repo = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..', '..');
 const steps = workflowSteps(parseYaml(fs.readFileSync(path.join(repo, '.github', 'workflows', 'release.yml'), 'utf8')));
 
-/** The script of the step of `job` that `which` picks out (`{ id }` or `{ name }`), as the shell gets it. */
-function stepScript(job, which) {
+/** The step of `job` that `which` picks out (`{ id }` or `{ name }`), which has a script. */
+function stepOf(job, which) {
   const found = steps.find((s) => s.job === job && Object.entries(which).every(([key, value]) => s[key] === value));
   assert.ok(found, `the ${job} job of release.yml has no step ${JSON.stringify(which)}`);
   assert.equal(typeof found.run, 'string', `the step ${JSON.stringify(which)} has no script`);
-  return found.run;
+  return found;
 }
+
+/** The script of that step, as the shell gets it. */
+const stepScript = (job, which) => stepOf(job, which).run;
 
 const bash = spawnSync('bash', ['-c', 'true']).status === 0;
 const scratch = fs.mkdtempSync(path.join(os.tmpdir(), 'oaiy-release-version-test-'));
 after(() => fs.rmSync(scratch, { recursive: true, force: true }));
 
-/** Run the meta job's version step for a ref (and, off a tag, the dispatch input). */
+const inputExpression = /\$\{\{\s*github\.event\.inputs\.version\s*\}\}/g;
+
+/**
+ * Run the meta job's version step for a ref (and, off a tag, the dispatch input) as GitHub does:
+ * an expression in the text of the script is replaced by its value before the shell reads it (so
+ * what it says is shell), one in the value of an `env` entry before the step starts (so it is
+ * data), and the shell is `bash -eo pipefail`. `lines` are the lines the step wrote to
+ * GITHUB_OUTPUT, all of them: the last of a name is what GitHub keeps, and a rule that could be
+ * talked into writing another would show here.
+ */
 function version(ref, input = '') {
-  const script = stepScript('meta', { id: 'v' }).replace(/\$\{\{\s*github\.event\.inputs\.version\s*\}\}/g, input);
+  const found = stepOf('meta', { id: 'v' });
+  const script = found.run.replace(inputExpression, () => input);
+  const env = Object.fromEntries(Object.entries(found.env).map(([name, value]) => [name, String(value).replace(inputExpression, () => input)]));
   const output = path.join(scratch, `out-${Math.random().toString(36).slice(2)}`).replace(/\\/g, '/');
   fs.writeFileSync(output, '');
-  const run = spawnSync('bash', ['-c', script], { encoding: 'utf8', env: { ...process.env, GITHUB_REF: ref, GITHUB_OUTPUT: output } });
-  const outputs = Object.fromEntries(fs.readFileSync(output, 'utf8').split('\n').filter(Boolean).map((line) => line.split(/=(.*)/s).slice(0, 2)));
-  return { status: run.status, stdout: run.stdout, stderr: run.stderr, outputs };
+  const run = spawnSync('bash', ['--noprofile', '--norc', '-eo', 'pipefail', '-c', script], { encoding: 'utf8', env: { ...process.env, ...env, GITHUB_REF: ref, GITHUB_OUTPUT: output } });
+  const lines = fs.readFileSync(output, 'utf8').split('\n').filter(Boolean);
+  const outputs = Object.fromEntries(lines.map((line) => line.split(/=(.*)/s).slice(0, 2)));
+  return { status: run.status, stdout: run.stdout, stderr: run.stderr, lines, outputs };
 }
 
 describe('the version rule', { skip: bash ? false : 'no bash on this machine' }, () => {
@@ -49,7 +64,7 @@ describe('the version rule', { skip: bash ? false : 'no bash on this machine' },
       const r = version(`refs/tags/${tag}`);
       assert.equal(r.status, 0, r.stdout);
       assert.equal(r.stderr, '', 'a leading zero (0.09.0) is a decimal number, not an octal one');
-      assert.deepEqual(r.outputs, { is_tag: 'true', version: want });
+      assert.deepEqual(r.lines, ['is_tag=true', `version=${want}`]);
     });
   }
 
@@ -74,11 +89,59 @@ describe('the version rule', { skip: bash ? false : 'no bash on this machine' },
   it('holds a manual run of a branch to the same rule, and publishes nothing from it', () => {
     const ok = version('refs/heads/main', '0.1.0');
     assert.equal(ok.status, 0, ok.stdout);
-    assert.deepEqual(ok.outputs, { is_tag: 'false', version: '0.1.0' });
+    assert.deepEqual(ok.lines, ['is_tag=false', 'version=0.1.0']);
     const low = version('refs/heads/main', '0.0.6');
     assert.equal(low.status, 1);
     assert.match(low.stdout, /is below 0\.1\.0/);
     assert.equal(low.outputs.version, undefined);
+  });
+
+  it('takes the tag as the version on a tag, whatever a manual run says', () => {
+    const same = version('refs/tags/v0.1.5', '0.1.5');
+    assert.deepEqual(same.lines, ['is_tag=true', 'version=0.1.5']);
+    const other = version('refs/tags/v0.1.5', '0.9.9');
+    assert.deepEqual(other.lines, ['is_tag=true', 'version=0.1.5'], 'the input is not read');
+    const rescue = version('refs/tags/v0.0.5', '0.1.0');
+    assert.equal(rescue.status, 1, 'a version typed for a tag below 0.1.0 does not lift it');
+    assert.match(rescue.stdout, /version 0\.0\.5 is below 0\.1\.0/);
+  });
+});
+
+// The dispatch input is typed by whoever starts the run. Pasted into the script (`${{ … }}` in it) it is
+// shell text: it can close the quote, rewrite `raw` and the outputs, and so the tag that is being released
+// and the version it is built with stop being the same, and the rule above does not hold. It has to reach
+// the script as data, through the step's env.
+describe('what a manual run can type', { skip: bash ? false : 'no bash on this machine' }, () => {
+  const marker = path.join(scratch, 'marker').replace(/\\/g, '/');
+  const hostile = [
+    ['closes the quote and rewrites the version', 'x"; fi; raw=9.9.9; if false; then echo "'],
+    ['writes the output itself', '0.1.0"; echo "version=0.0.7" >> "$GITHUB_OUTPUT"; raw="0.1.0'],
+    ['is a command substitution', `0.1.0$(echo hacked > "${marker}")`],
+    ['is a pair of backticks', `0.1.0\`echo hacked > "${marker}"\``],
+  ];
+
+  for (const [what, input] of hostile) {
+    it(`does not run an input that ${what}: on a tag it is not read, off one it is text that is not a version`, () => {
+      fs.rmSync(marker, { force: true });
+      const onTag = version('refs/tags/v0.0.5', input);
+      assert.equal(onTag.status, 1, `the tag 0.0.5 is below the rule, whatever the input says: ${onTag.stdout}`);
+      assert.match(onTag.stdout, /version 0\.0\.5 is below 0\.1\.0/);
+      assert.deepEqual(onTag.lines, ['is_tag=true']);
+      const onBranch = version('refs/heads/main', input);
+      assert.equal(onBranch.status, 1, onBranch.stdout);
+      assert.match(onBranch.stdout, /is not a version of the form 0\.1\.0/);
+      assert.deepEqual(onBranch.lines, ['is_tag=false']);
+      assert.equal(fs.existsSync(marker), false, 'nothing the input said was run');
+    });
+  }
+
+  it('reaches the version step as INPUT_VERSION, and nothing is pasted into the text of any script', () => {
+    assert.deepEqual({ ...stepOf('meta', { id: 'v' }).env }, { INPUT_VERSION: '${{ github.event.inputs.version }}' });
+    for (const name of ['ci.yml', 'release.yml']) {
+      const all = workflowSteps(parseYaml(fs.readFileSync(path.join(repo, '.github', 'workflows', name), 'utf8')));
+      const pasted = all.filter((s) => typeof s.run === 'string' && s.run.includes('${{')).map((s) => `${name}: job ${s.job}, step ${JSON.stringify(s.name)}`);
+      assert.deepEqual(pasted, [], 'a value goes to a script through env: (a script that has it pasted in is shell text)');
+    }
   });
 });
 

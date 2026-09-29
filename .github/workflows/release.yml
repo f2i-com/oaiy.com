@@ -116,12 +116,17 @@ jobs:
           echo "Building with ZIPP $release (SHA256SUMS $sums)"
       - id: v
         shell: bash
+        # A manual run's version is typed by whoever starts it, so it reaches the
+        # script as data. Pasted into the script (${{ }} in its text) it would be
+        # shell, and could rewrite the version this step checks.
+        env:
+          INPUT_VERSION: ${{ github.event.inputs.version }}
         run: |
           if [[ "${GITHUB_REF}" == refs/tags/* ]]; then
             raw="${GITHUB_REF#refs/tags/}"
             echo "is_tag=true" >> "$GITHUB_OUTPUT"
           else
-            raw="${{ github.event.inputs.version }}"
+            raw="$INPUT_VERSION"
             echo "is_tag=false" >> "$GITHUB_OUTPUT"
           fi
           version="${raw#v}"
