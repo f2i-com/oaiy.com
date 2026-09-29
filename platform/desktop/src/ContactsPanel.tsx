@@ -91,13 +91,13 @@ export default function ContactsPanel({ open = null, onOpened }: { open?: string
     return () => window.removeEventListener('keydown', onKey);
   }, [side, dirty]);
 
-  // A panel opened is brought into view, and its heading takes the focus.
+  // A panel opened has its heading brought into view (a narrow window shows the panel alone), and focused.
   const sideKey = side ? (side.kind === 'contact' ? `contact:${side.key}` : side.kind) : null;
   useEffect(() => {
     if (!sideKey) return;
     const id = requestAnimationFrame(() => {
       const heading = document.getElementById('contacts-side-title');
-      heading?.closest('aside')?.scrollIntoView?.({ block: 'nearest', behavior: 'smooth' });
+      heading?.scrollIntoView?.({ block: 'nearest', behavior: 'smooth' });
       heading?.focus({ preventScroll: true });
     });
     return () => cancelAnimationFrame(id);

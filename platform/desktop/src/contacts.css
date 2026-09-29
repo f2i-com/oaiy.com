@@ -97,7 +97,11 @@
 
 /* ---- one person ---------------------------------------------------------------------------- */
 
+/* The panel fits the window below the toolbar, so its buttons are in view without scrolling the page. */
+.contacts-side { max-height: calc(100dvh - 78px - 54px - var(--page-pad-t) - 66px); }
 .contacts-side .cal-side-body { display: flex; flex-direction: column; gap: 10px; }
+/* The body scrolls; what is in it keeps its height. */
+.contacts-side .cal-side-body > * { flex-shrink: 0; }
 .contacts-side .form-row { flex: none; }
 .contacts-side .form-row input,
 .contacts-side .form-row select { font-family: var(--font-body); font-size: 13px; }
@@ -273,7 +277,19 @@
   .contacts-main.has-side .contacts-board { display: none; }
   .contacts-page.has-side .contacts-search,
   .contacts-page.has-side .contacts-count { display: none; }
-  .contacts-side { position: static; max-height: none; }
+  /* The panel scrolls with the page, so nothing in it may be a scroller of its own... */
+  .contacts-side { position: static; max-height: none; overflow: visible; }
+  .contacts-side .cal-side-body { overflow: visible; }
+  /* ...and its bars stay in view at the foot of the page as it scrolls, as on Hours & Services. */
+  .contacts-side .contacts-savebar,
+  .contacts-side .import-actions {
+    bottom: calc(-1 * var(--page-pad-b) + 14px);
+    margin: 6px 0 0;
+    border: 1px solid var(--strong-border);
+    border-radius: var(--r-card);
+    box-shadow: var(--shadow);
+  }
+  .contacts-side .contacts-savebar.is-dirty { border-color: color-mix(in srgb, var(--primary) 55%, var(--border)); }
 }
 @media (max-width: 760px) {
   .contacts-search { max-width: none; flex-basis: 100%; }
