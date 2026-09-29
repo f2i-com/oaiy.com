@@ -505,9 +505,16 @@ impl PluginRegistry {
     /// Old installs kept the plugin's own state in `<plugin>/data`, inside the bundle.
     /// In a signed bundle that folder is a set of files the signature does not list, so
     /// the package would be quarantined before it ever started and got the chance to move
-    /// it (the move used to be made at start). Made here, before the package is looked at.
+    /// it (the move used to be made at start). Made here, before the package is looked at,
+    /// and only when the move is what makes the package verify (see
+    /// [`TrustService::legacy_data_may_move`]): a package that fails its check for another
+    /// reason, or whose signature lists a `data` folder of its own, is left exactly as
+    /// found, and a link named `data` is never moved (see `migrate_legacy_data_dir`).
     fn move_legacy_data_out_of_a_signed_bundle(&mut self, id: &str, dir: &Path) {
         if !dir.join("data").is_dir() || !dir.join(PACKAGE_MANIFEST_FILE).is_file() {
+            return;
+        }
+        if !self.trust.legacy_data_may_move(dir, id) {
             return;
         }
         match super::runner::migrate_legacy_data_dir(dir) {
@@ -1710,6 +1717,82 @@ mod tests {
             b"{\"paired\":true}",
             "the plugin's state moved with it"
         );
+    }
+
+    // --- the state older versions kept in `<plugin>/data` ------------------------
+
+    /// A signed `aokie` bundle at `<base>/plugins/aokie` (so the plugin's state moves to
+    /// `<base>/plugin-data/aokie`, inside the scratch), with `files` written before it is
+    /// signed, and a registry that pins the key for it under a release build's rules.
+    fn signed_bundle(base: &Root, files: &[(&str, &[u8])]) -> (PathBuf, PluginRegistry) {
+        let plugins = base.path().join("plugins");
+        let dir = plugins.join("aokie");
+        fs::create_dir_all(&dir).unwrap();
+        fs::write(dir.join("manifest.json"), manifest("aokie").to_string()).unwrap();
+        fs::write(dir.join("plugin.exe"), b"stub").unwrap();
+        for (rel, bytes) in files {
+            fs::create_dir_all(dir.join(rel).parent().unwrap()).unwrap();
+            fs::write(dir.join(rel), bytes).unwrap();
+        }
+        let key = TestKey::generate("fl-test-2026a");
+        key.sign(&dir, "aokie-plugin", "0.1.0");
+        let trust = TrustService::new(TrustPolicy::release(), key.pinned_for("Aokie", &["aokie"]), plugins.join("trusted-plugins.json"));
+        (dir, PluginRegistry::with_trust(plugins, trust))
+    }
+
+    #[test]
+    fn a_junction_named_data_in_a_signed_bundle_is_not_moved_into_the_plugins_data_dir() {
+        // `data` as a link to a folder elsewhere: moved, the plugin's data folder would be
+        // a pointer to it, and the bundle would then verify with the link gone from it.
+        use crate::plugins::trust::tests::{dir_link, remove_dir_link};
+        let base = Root::new();
+        let (dir, mut reg) = signed_bundle(&base, &[]);
+        let elsewhere = base.path().join("elsewhere");
+        fs::create_dir_all(&elsewhere).unwrap();
+        fs::write(elsewhere.join("keep.txt"), b"not the plugin's").unwrap();
+        if !dir_link(&dir.join("data"), &elsewhere) {
+            return; // this machine cannot make one
+        }
+
+        reg.scan();
+        let trust = reg.get("aokie").unwrap().trust.clone().unwrap();
+        let plugin_data = crate::plugins::runner::plugin_data_dir(&dir);
+        let became_a_link = fs::symlink_metadata(&plugin_data).map(|m| m.file_type().is_symlink()).unwrap_or(false);
+        // Only the links are removed, before anything can fail with them in place.
+        remove_dir_link(&dir.join("data"));
+        if became_a_link {
+            remove_dir_link(&plugin_data);
+        }
+        assert!(!became_a_link, "the plugin's data folder became a link to a folder outside the plugin");
+        assert_eq!(trust.state, TrustState::Quarantined);
+        assert!(trust.reason.unwrap().contains("a symbolic link is present: data"));
+        assert_eq!(fs::read(elsewhere.join("keep.txt")).unwrap(), b"not the plugin's");
+    }
+
+    #[test]
+    fn a_data_folder_the_signature_lists_stays_in_the_bundle_and_verifies() {
+        let base = Root::new();
+        let (dir, mut reg) = signed_bundle(&base, &[("data/models.bin", b"model bytes" as &[u8])]);
+        reg.scan();
+        assert_eq!(reg.get("aokie").unwrap().trust.as_ref().unwrap().state, TrustState::Verified);
+        assert!(dir.join("data").join("models.bin").exists(), "signed content is not the plugin's state");
+        assert!(!crate::plugins::runner::plugin_data_dir(&dir).exists());
+    }
+
+    #[test]
+    fn a_package_that_fails_its_check_is_left_as_found_including_its_data_folder() {
+        // Moving the state out is what makes a package verify; it is not done to one that
+        // will be quarantined anyway.
+        let base = Root::new();
+        let (dir, mut reg) = signed_bundle(&base, &[]);
+        fs::create_dir_all(dir.join("data")).unwrap();
+        fs::write(dir.join("data").join("settings.json"), b"{\"paired\":true}").unwrap();
+        fs::write(dir.join("plugin.exe"), b"tampered").unwrap();
+
+        reg.scan();
+        assert_eq!(reg.get("aokie").unwrap().trust.as_ref().unwrap().state, TrustState::Quarantined);
+        assert!(dir.join("data").join("settings.json").exists(), "nothing was moved");
+        assert!(!crate::plugins::runner::plugin_data_dir(&dir).exists());
     }
 
     // --- a live plugin and a folder that stopped verifying ---------------------

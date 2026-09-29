@@ -275,8 +275,16 @@ pub fn plugin_data_dir(plugin_dir: &Path) -> std::path::PathBuf {
 /// state can be inspected instead of silently reconciled.
 pub fn migrate_legacy_data_dir(plugin_dir: &Path) -> Result<bool, String> {
     let legacy = plugin_dir.join("data");
-    if !legacy.is_dir() {
-        return Ok(false);
+    // A plain folder or nothing. `is_dir` follows links, and a junction or symbolic link
+    // named `data` is not the plugin's own state: moving it would make the plugin's data
+    // folder a pointer to wherever it points, and everything the plugin writes there
+    // would land in that other folder.
+    match std::fs::symlink_metadata(&legacy) {
+        Ok(meta) if meta.file_type().is_symlink() => {
+            return Err(format!("{} is a link, not the plugin's own data folder — leaving it in place", legacy.display()));
+        }
+        Ok(meta) if meta.is_dir() => {}
+        _ => return Ok(false),
     }
     let target = plugin_data_dir(plugin_dir);
     if target == legacy {
@@ -645,6 +653,30 @@ mod tests {
         let err = migrate_legacy_data_dir(&plugin).unwrap_err();
         assert!(err.contains("both"), "{err}");
         assert!(plugin.join("data").exists(), "legacy dir must be preserved");
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn a_link_named_data_is_not_moved_into_the_plugins_data_dir() {
+        // A junction (or symbolic link) called `data` that points at a folder elsewhere.
+        // Moved, it would become the plugin's data folder, and everything the plugin
+        // writes there would land in that other folder.
+        use crate::plugins::trust::tests::{dir_link, remove_dir_link};
+        let base = std::env::temp_dir().join(format!("oaiy-mig3-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        let plugin = base.join("plugins").join("aokie");
+        let elsewhere = base.join("elsewhere");
+        std::fs::create_dir_all(&plugin).unwrap();
+        std::fs::create_dir_all(&elsewhere).unwrap();
+        std::fs::write(elsewhere.join("keep.txt"), b"not the plugin's").unwrap();
+        if dir_link(&plugin.join("data"), &elsewhere) {
+            let err = migrate_legacy_data_dir(&plugin).unwrap_err();
+            assert!(err.contains("is a link"), "{err}");
+            assert!(!plugin_data_dir(&plugin).exists(), "nothing was moved");
+            assert!(std::fs::symlink_metadata(plugin.join("data")).is_ok(), "the link is where it was");
+            assert_eq!(std::fs::read(elsewhere.join("keep.txt")).unwrap(), b"not the plugin's");
+            remove_dir_link(&plugin.join("data"));
+        }
         let _ = std::fs::remove_dir_all(&base);
     }
 }

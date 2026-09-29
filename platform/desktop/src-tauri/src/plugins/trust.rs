@@ -706,10 +706,22 @@ fn list_some(names: &[String]) -> String {
     }
 }
 
+/// Is `rel` (a forward-slash path inside a package) `data` or something in it? On Windows
+/// the names of a folder are not case-sensitive, so neither is this.
+fn is_under_data(rel: &str) -> bool {
+    let rel = rel.to_ascii_lowercase();
+    rel == "data" || rel.starts_with("data/")
+}
+
 /// Every listed file must be there as signed, and no other file may be. Gives back the
 /// bytes of `manifest.json` exactly as they were hashed, so what is started from the
 /// package is the file that was checked and not a second read of it.
-fn check_files(dir: &Path, payload: &Payload) -> Result<Vec<u8>, String> {
+///
+/// `tolerate_legacy_data` leaves out of the count of unlisted files whatever is under
+/// `data/`, the state older versions of a plugin kept inside their folder. It is only for
+/// asking whether moving that out would make the package verify
+/// ([`TrustService::legacy_data_may_move`]); a verdict never tolerates it.
+fn check_files(dir: &Path, payload: &Payload, tolerate_legacy_data: bool) -> Result<Vec<u8>, String> {
     if payload.files.is_empty() {
         return Err("the signature lists no files".into());
     }
@@ -757,7 +769,7 @@ fn check_files(dir: &Path, payload: &Payload) -> Result<Vec<u8>, String> {
     let mut executables: Vec<String> = Vec::new();
     let mut others: Vec<String> = Vec::new();
     for rel in list_files(dir)? {
-        if rel == PACKAGE_MANIFEST_FILE || listed.contains(rel.as_str()) {
+        if rel == PACKAGE_MANIFEST_FILE || listed.contains(rel.as_str()) || (tolerate_legacy_data && is_under_data(&rel)) {
             continue;
         }
         if is_loadable(&rel) {
@@ -1033,6 +1045,23 @@ impl TrustService {
         Ok(LaunchPermit { trust: assessed.trust, dir: dir.to_path_buf(), manifest })
     }
 
+    /// May a `data` folder found in a signed package be moved out, as the state an older
+    /// version of the plugin kept there (`runner::migrate_legacy_data_dir`)?
+    ///
+    /// Only when that move is what makes the package verify: the signature holds for this
+    /// plugin, it lists nothing under `data/` (a folder the publisher signed is theirs, not
+    /// the plugin's state, and moving it would leave the package missing files it lists),
+    /// and every other file is as signed. A package that fails its check for any other
+    /// reason is left exactly as it was found, and is quarantined as it stands.
+    pub fn legacy_data_may_move(&self, dir: &Path, id: &str) -> bool {
+        let Ok(text) = read_envelope(dir) else { return false };
+        let Ok(opened) = open_envelope(&text, &self.publishers, id) else { return false };
+        if opened.payload.files.iter().any(|f| is_under_data(&f.path)) {
+            return false;
+        }
+        check_files(dir, &opened.payload, true).is_ok()
+    }
+
     /// One file of a package that carries a signature, read once, and handed back only if
     /// it is exactly what was signed: for what is read from a package while it runs (the
     /// screens a plugin serves to the dashboard) rather than at a launch. It checks the
@@ -1158,7 +1187,7 @@ impl TrustService {
             Ok(o) => o,
             Err(e) => return Assessed::unverified(self.quarantined(e)),
         };
-        match check_files(dir, &opened.payload) {
+        match check_files(dir, &opened.payload, false) {
             Ok(manifest_json) => Assessed {
                 trust: PackageTrust {
                     state: TrustState::Verified,
@@ -1216,6 +1245,15 @@ impl TrustService {
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
             Err(e) => return Err(format!("cannot look at {PACKAGE_MANIFEST_FILE}: {e}")),
         }
+        // An older install kept the plugin's own state in `<plugin>/data`, and a launch
+        // moves it out (`runner::migrate_legacy_data_dir`). That would change the very
+        // folder this decision is about, so it is moved first: what is trusted is what
+        // will be left. A failure is only logged, as it is at a launch.
+        match super::runner::migrate_legacy_data_dir(dir) {
+            Ok(true) => log::info!("moved {}/data out of the plugin's folder before it was trusted", dir.display()),
+            Ok(false) => {}
+            Err(e) => log::warn!("legacy plugin data dir not migrated: {e}"),
+        }
         let digest = package_digest(dir).map_err(|e| format!("{id} cannot be trusted: {e}"))?;
         let trusted_at = chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, true);
         self.local.put(id, LocalTrust { digest, trusted_at })?;
@@ -1270,6 +1308,35 @@ pub(crate) mod tests {
         fn drop(&mut self) {
             let _ = std::fs::remove_dir_all(&self.0);
         }
+    }
+
+    /// Make `link` a directory link to `target` (a junction on Windows, which needs no
+    /// privilege; a symbolic link elsewhere). `false` when it could not be made, and a test
+    /// that needs one then has nothing to test here.
+    pub(crate) fn dir_link(link: &Path, target: &Path) -> bool {
+        #[cfg(windows)]
+        {
+            std::process::Command::new("cmd")
+                .args(["/C", "mklink", "/J"])
+                .arg(link)
+                .arg(target)
+                .output()
+                .map(|out| out.status.success())
+                .unwrap_or(false)
+        }
+        #[cfg(not(windows))]
+        {
+            std::os::unix::fs::symlink(target, link).is_ok()
+        }
+    }
+
+    /// Remove a link made by [`dir_link`], and only the link: never what it points at, and
+    /// never by a recursive delete that could walk into it.
+    pub(crate) fn remove_dir_link(link: &Path) {
+        #[cfg(windows)]
+        let _ = std::fs::remove_dir(link);
+        #[cfg(not(windows))]
+        let _ = std::fs::remove_file(link);
     }
 
     /// A signing key made for the test, standing in for a publisher's.
@@ -2191,6 +2258,85 @@ pub(crate) mod tests {
         assert!(quarantine_reason(&svc.assess_fresh(&dir, "demo")).contains("too large to be a package manifest"));
         std::fs::write(&path, [0xffu8, 0xfe, 0x00]).unwrap();
         assert!(quarantine_reason(&svc.assess_fresh(&dir, "demo")).contains("is not text"));
+    }
+
+    // -----------------------------------------------------------------------------
+    // The state an older plugin kept in `<plugin>/data`
+    // -----------------------------------------------------------------------------
+
+    /// A signed `demo` package at `<scratch>/plugins/demo`, so that the folder a plugin's
+    /// state moves to (`<scratch>/plugin-data/demo`) is inside the scratch too.
+    fn signed_in_a_data_dir(tag: &str) -> (Scratch, PathBuf, TestKey, Arc<TrustService>) {
+        let scratch = Scratch::new(tag);
+        let dir = scratch.path().join("plugins").join("demo");
+        std::fs::create_dir_all(&dir).unwrap();
+        fill(&dir);
+        let key = TestKey::generate("test-key-1");
+        key.sign(&dir, "demo-plugin", "1.0.0");
+        let svc = service(TrustPolicy::release(), key.pinned_for("Demo Co", &["demo"]), &scratch);
+        (scratch, dir, key, svc)
+    }
+
+    #[test]
+    fn legacy_data_is_moved_out_only_when_that_is_what_makes_the_package_verify() {
+        let (scratch, dir, key, svc) = signed_in_a_data_dir("legacy-may-move");
+        std::fs::create_dir_all(dir.join("data")).unwrap();
+        std::fs::write(dir.join("data").join("settings.json"), b"{}").unwrap();
+        assert!(svc.legacy_data_may_move(&dir, "demo"), "state the signature does not list, in a package that is otherwise as signed");
+
+        // The package fails its check for another reason: it is left exactly as found.
+        std::fs::write(dir.join("demo-plugin.exe"), b"tampered").unwrap();
+        assert!(!svc.legacy_data_may_move(&dir, "demo"), "a changed file");
+        std::fs::write(dir.join("demo-plugin.exe"), b"demo plugin executable bytes").unwrap();
+        assert!(svc.legacy_data_may_move(&dir, "demo"));
+        std::fs::write(dir.join("extra.dll"), b"x").unwrap();
+        assert!(!svc.legacy_data_may_move(&dir, "demo"), "an unlisted file outside data");
+        std::fs::remove_file(dir.join("extra.dll")).unwrap();
+
+        // The signature does not hold for this plugin.
+        let impostor = service(TrustPolicy::release(), TestKey::generate("test-key-1").pinned_for("Demo Co", &["demo"]), &scratch);
+        assert!(!impostor.legacy_data_may_move(&dir, "demo"), "another key");
+        let elsewhere = service(TrustPolicy::release(), key.pinned_for("Demo Co", &["other"]), &scratch);
+        assert!(!elsewhere.legacy_data_may_move(&dir, "demo"), "a key pinned for other plugins");
+        std::fs::remove_file(dir.join(PACKAGE_MANIFEST_FILE)).unwrap();
+        assert!(!svc.legacy_data_may_move(&dir, "demo"), "no signature at all");
+    }
+
+    #[test]
+    fn a_folder_the_signature_lists_is_the_publishers_and_is_never_moved_out_as_state() {
+        // A release that ships its own `data/` folder: it is signed content, and moving it
+        // out would leave the package missing files it lists.
+        let scratch = Scratch::new("legacy-signed-data");
+        let dir = scratch.path().join("plugins").join("demo");
+        std::fs::create_dir_all(dir.join("data")).unwrap();
+        fill(&dir);
+        std::fs::write(dir.join("data").join("models.bin"), b"model bytes").unwrap();
+        let key = TestKey::generate("test-key-1");
+        key.sign(&dir, "demo-plugin", "1.0.0");
+        let svc = service(TrustPolicy::release(), key.pinned_for("Demo Co", &["demo"]), &scratch);
+
+        assert_eq!(svc.assess_fresh(&dir, "demo").state, TrustState::Verified);
+        assert!(!svc.legacy_data_may_move(&dir, "demo"));
+    }
+
+    #[test]
+    fn trusting_a_package_moves_its_legacy_data_out_first_so_the_trust_survives_a_launch() {
+        // A launch moves `<plugin>/data` out (runner::migrate_legacy_data_dir). If the
+        // person's trust were bound to a folder that still held it, the move would change
+        // the digest and the next start would be refused.
+        let scratch = Scratch::new("trust-legacy-data");
+        let dir = scratch.path().join("plugins").join("demo");
+        std::fs::create_dir_all(dir.join("data")).unwrap();
+        fill(&dir);
+        std::fs::write(dir.join("data").join("settings.json"), b"paired").unwrap();
+        let svc = service(TrustPolicy::release(), Publishers::default(), &scratch);
+
+        let t = svc.trust_local(&dir, "demo").unwrap();
+        assert_eq!(t.state, TrustState::TrustedLocal, "{t:?}");
+        assert!(!dir.join("data").exists(), "the state is out of the package that was trusted");
+        let moved = crate::plugins::runner::plugin_data_dir(&dir);
+        assert_eq!(std::fs::read(moved.join("settings.json")).unwrap(), b"paired", "and it is where the plugin will look");
+        assert!(svc.authorize_launch(&dir, "demo").is_ok());
     }
 
     #[cfg(windows)]

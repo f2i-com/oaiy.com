@@ -116,6 +116,18 @@ pub struct PluginProcess {
     next_id: Arc<Mutex<i64>>,
 }
 
+/// Does a launch move a legacy `<plugin>/data` folder out of a package in this state?
+///
+/// Only when nothing was verified about the folder's files. A verified bundle is exactly
+/// what was signed and the host does not change it: a `data` folder in one is either
+/// content the publisher signed, or state the scan already moved out because moving it
+/// was what made the bundle verify. And the person's trust in a package is bound to a
+/// digest of its files, which a move would change (`TrustService::trust_local` moves
+/// the state out before it takes the digest).
+fn migrates_legacy_data(state: super::trust::TrustState) -> bool {
+    matches!(state, super::trust::TrustState::UnsignedDev)
+}
+
 pub struct SpawnOptions {
     pub desktop_version: String,
     pub dev_mode: bool,
@@ -152,13 +164,15 @@ impl PluginProcess {
         // Older installs kept this inside the bundle; move it before the plugin
         // is told where to write. A failure here is logged rather than fatal —
         // see migrate_legacy_data_dir.
-        match super::runner::migrate_legacy_data_dir(dir) {
-            Ok(true) => log::info!(
-                "moved {}/data out of the plugin bundle so its signature can verify",
-                dir.display()
-            ),
-            Ok(false) => {}
-            Err(e) => log::warn!("legacy plugin data dir not migrated: {e}"),
+        if migrates_legacy_data(opts.permit.trust().state) {
+            match super::runner::migrate_legacy_data_dir(dir) {
+                Ok(true) => log::info!(
+                    "moved {}/data out of the plugin bundle so its signature can verify",
+                    dir.display()
+                ),
+                Ok(false) => {}
+                Err(e) => log::warn!("legacy plugin data dir not migrated: {e}"),
+            }
         }
         let data_dir = plugin_data_dir(dir);
         // Created eagerly: a plugin told where its data dir is will write there
@@ -725,6 +739,15 @@ mod tests {
             "occurredAt": "2026-07-30T04:12:09Z",
             "data": { "callerNumber": "+61400000000" }
         })
+    }
+
+    #[test]
+    fn a_launch_moves_a_legacy_data_folder_only_out_of_a_package_nothing_verified() {
+        use crate::plugins::trust::TrustState::*;
+        assert!(migrates_legacy_data(UnsignedDev));
+        for state in [Verified, TrustedLocal, Quarantined, Unsigned] {
+            assert!(!migrates_legacy_data(state), "{state:?}: the host does not change a folder that was verified or trusted");
+        }
     }
 
     #[test]
