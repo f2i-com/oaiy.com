@@ -127,7 +127,7 @@ impl Platform for GuiPlatform {
                 return Err(changed());
             }
             if self.strict_assets {
-                check_asset_url(update.download_url.as_str())?;
+                check_asset_url(update.download_url.as_str(), &update.version)?;
             }
             self.store.set(Some(update));
             Ok(())

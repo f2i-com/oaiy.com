@@ -140,14 +140,24 @@ pub fn current_platform_key() -> Option<&'static str> {
 const ASSET_HOST: &str = "github.com";
 const ASSET_PATH_PREFIX: &str = "/f2i-com/oaiy.com/releases/download/";
 
-/// Whether `url` is a release asset of this project on GitHub, over https, with nothing to redirect the eye
-/// (no credentials, no other port). The installer is checked against its signature whatever its address; this
-/// is the second door, so that a feed that names another host is refused before anything is fetched from it.
-pub fn check_asset_url(url: &str) -> Result<(), String> {
-    let refuse = || Err(format!("The update points at an address that is not one of OAIY's releases on GitHub ({url}), so it was refused."));
+/// Whether `url` is the installer of release `version` of this project on GitHub: over https, on github.com, with
+/// nothing to redirect the eye (no credentials, no other port, no query), under the release's tag (`v0.2.0` or
+/// `0.2.0`) and named for that version (`oaiy-desktop-0.2.0-...`).
+///
+/// Two doors beside the signature. A feed that names another host is refused before anything is fetched from it. And the
+/// announced version has to be the one in the address: a signature made by an older Tauri CLI does not say which
+/// version it was made for, so without this a feed could pair a higher version number with the address (and genuine
+/// signature) of an OLDER release, which would install as a downgrade dressed as an update.
+pub fn check_asset_url(url: &str, version: &str) -> Result<(), String> {
+    let refuse = || Err(format!("The update points at an address that is not the installer of OAIY {version} on GitHub ({url}), so it was refused."));
     let Ok(parsed) = url::Url::parse(url) else { return refuse() };
     let plain = parsed.scheme() == "https" && parsed.host_str() == Some(ASSET_HOST) && parsed.port().is_none() && parsed.username().is_empty() && parsed.password().is_none() && parsed.query().is_none() && parsed.fragment().is_none();
-    if plain && parsed.path().starts_with(ASSET_PATH_PREFIX) && parsed.path().len() > ASSET_PATH_PREFIX.len() {
+    let Some(rest) = parsed.path().strip_prefix(ASSET_PATH_PREFIX) else { return refuse() };
+    let named = match rest.split_once('/') {
+        Some((tag, file)) => (tag == version || tag.strip_prefix('v') == Some(version)) && file.starts_with(&format!("oaiy-desktop-{version}-")) && !file.contains('/'),
+        None => false,
+    };
+    if plain && named && super::version::parse(version).is_ok() {
         Ok(())
     } else {
         refuse()
@@ -370,28 +380,46 @@ mod tests {
     #[test]
     fn an_installer_may_only_come_from_this_projects_releases_on_github_over_https() {
         let ok = "https://github.com/f2i-com/oaiy.com/releases/download/v0.2.0/oaiy-desktop-0.2.0-windows-x64-setup.exe";
-        assert!(check_asset_url(ok).is_ok());
-        assert!(check_asset_url("https://GitHub.com/f2i-com/oaiy.com/releases/download/0.2.0/x.AppImage").is_ok());
+        assert!(check_asset_url(ok, "0.2.0").is_ok());
+        assert!(check_asset_url("https://GitHub.com/f2i-com/oaiy.com/releases/download/0.2.0/oaiy-desktop-0.2.0-linux-x86_64.AppImage", "0.2.0").is_ok());
+        let file = "oaiy-desktop-0.2.0-windows-x64-setup.exe";
         for bad in [
-            "http://github.com/f2i-com/oaiy.com/releases/download/v0.2.0/x.exe",
-            "https://github.com.evil.example/f2i-com/oaiy.com/releases/download/v0.2.0/x.exe",
-            "https://evil.example/f2i-com/oaiy.com/releases/download/v0.2.0/x.exe",
-            "https://github.com@evil.example/f2i-com/oaiy.com/releases/download/v0.2.0/x.exe",
-            "https://user:pw@github.com/f2i-com/oaiy.com/releases/download/v0.2.0/x.exe",
-            "https://github.com:8443/f2i-com/oaiy.com/releases/download/v0.2.0/x.exe",
-            "https://github.com/someone-else/oaiy.com/releases/download/v0.2.0/x.exe",
-            "https://github.com/f2i-com/oaiy.com/archive/main.zip",
-            "https://github.com/f2i-com/oaiy.com/releases/download/",
-            "https://github.com/f2i-com/oaiy.com/releases/download/../../../evil/x.exe",
-            "https://github.com/f2i-com/oaiy.com/releases/download/v0.2.0/x.exe?token=1",
-            "https://github.com/f2i-com/oaiy.com/releases/download/v0.2.0/x.exe#frag",
-            "file:///C:/x.exe",
-            "not a url",
-            "",
+            format!("http://github.com/f2i-com/oaiy.com/releases/download/v0.2.0/{file}"),
+            format!("https://github.com.evil.example/f2i-com/oaiy.com/releases/download/v0.2.0/{file}"),
+            format!("https://evil.example/f2i-com/oaiy.com/releases/download/v0.2.0/{file}"),
+            format!("https://github.com@evil.example/f2i-com/oaiy.com/releases/download/v0.2.0/{file}"),
+            format!("https://user:pw@github.com/f2i-com/oaiy.com/releases/download/v0.2.0/{file}"),
+            format!("https://github.com:8443/f2i-com/oaiy.com/releases/download/v0.2.0/{file}"),
+            format!("https://github.com/someone-else/oaiy.com/releases/download/v0.2.0/{file}"),
+            "https://github.com/f2i-com/oaiy.com/archive/main.zip".to_string(),
+            "https://github.com/f2i-com/oaiy.com/releases/download/".to_string(),
+            "https://github.com/f2i-com/oaiy.com/releases/download/v0.2.0/".to_string(),
+            "https://github.com/f2i-com/oaiy.com/releases/download/../../../evil/x.exe".to_string(),
+            format!("https://github.com/f2i-com/oaiy.com/releases/download/v0.2.0/{file}?token=1"),
+            format!("https://github.com/f2i-com/oaiy.com/releases/download/v0.2.0/{file}#frag"),
+            format!("https://github.com/f2i-com/oaiy.com/releases/download/v0.2.0/sub/{file}"),
+            "file:///C:/x.exe".to_string(),
+            "not a url".to_string(),
+            String::new(),
         ] {
-            assert!(check_asset_url(bad).is_err(), "{bad}");
+            assert!(check_asset_url(&bad, "0.2.0").is_err(), "{bad}");
         }
-        assert!(check_asset_url("http://evil.example/x.exe").unwrap_err().contains("http://evil.example/x.exe"));
+        assert!(check_asset_url("http://evil.example/x.exe", "0.2.0").unwrap_err().contains("http://evil.example/x.exe"));
+    }
+
+    #[test]
+    fn the_announced_version_has_to_be_the_one_in_the_installers_address() {
+        // A feed pairing a higher number with the address of an older, genuinely signed release: a downgrade dressed as an update.
+        let older = "https://github.com/f2i-com/oaiy.com/releases/download/v0.1.5/oaiy-desktop-0.1.5-windows-x64-setup.exe";
+        assert!(check_asset_url(older, "0.1.5").is_ok());
+        for announced in ["9.9.9", "0.2.0", "0.1.50", "0.1"] {
+            assert!(check_asset_url(older, announced).is_err(), "announced {announced}");
+        }
+        // The tag and the file each have to say it.
+        assert!(check_asset_url("https://github.com/f2i-com/oaiy.com/releases/download/v0.1.5/oaiy-desktop-9.9.9-windows-x64-setup.exe", "9.9.9").is_err());
+        assert!(check_asset_url("https://github.com/f2i-com/oaiy.com/releases/download/v9.9.9/oaiy-desktop-0.1.5-windows-x64-setup.exe", "9.9.9").is_err());
+        // The version itself has to be one.
+        assert!(check_asset_url("https://github.com/f2i-com/oaiy.com/releases/download/vlatest/oaiy-desktop-latest-x.exe", "latest").is_err());
     }
 
     #[test]
