@@ -1,4 +1,5 @@
 import { createContext, useContext, useState, useCallback, useEffect, useRef, type ReactNode } from 'react';
+import { AlertTriangle, Check, Info, X, XCircle } from 'lucide-react';
 
 export type ToastType = 'success' | 'error' | 'info' | 'warning';
 
@@ -56,7 +57,7 @@ interface ToastContainerProps {
 
 function ToastContainer({ toasts, removeToast }: ToastContainerProps) {
   return (
-    <div className="fixed bottom-4 right-4 z-[100] flex flex-col gap-2 pointer-events-none">
+    <div className="oaiy-toasts">
       {toasts.map(toast => (
         <ToastItem key={toast.id} toast={toast} onRemove={removeToast} />
       ))}
@@ -104,60 +105,12 @@ function ToastItem({ toast, onRemove }: ToastItemProps) {
     closeTimerRef.current = setTimeout(() => onRemove(toast.id), 300);
   }, [toast.id, onRemove]);
 
-  const getColors = () => {
-    switch (toast.type) {
-      case 'success':
-        return 'bg-green-600 border-green-500';
-      case 'error':
-        return 'bg-red-600 border-red-500';
-      case 'warning':
-        // amber-700 (#b45309), matching .btn-warning — white text clears
-        // WCAG AA (~4.8:1). yellow-600 was ~2.1:1 and failed.
-        return 'bg-amber-700 border-amber-600';
-      case 'info':
-      default:
-        return 'bg-blue-600 border-blue-500';
-    }
-  };
-
-  const getIcon = () => {
-    switch (toast.type) {
-      case 'success':
-        return (
-          <svg className="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24">
-            <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M5 13l4 4L19 7" />
-          </svg>
-        );
-      case 'error':
-        return (
-          <svg className="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24">
-            <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M6 18L18 6M6 6l12 12" />
-          </svg>
-        );
-      case 'warning':
-        return (
-          <svg className="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24">
-            <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M12 9v2m0 4h.01m-6.938 4h13.856c1.54 0 2.502-1.667 1.732-3L13.732 4c-.77-1.333-2.694-1.333-3.464 0L3.34 16c-.77 1.333.192 3 1.732 3z" />
-          </svg>
-        );
-      case 'info':
-      default:
-        return (
-          <svg className="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24">
-            <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M13 16h-1v-4h-1m1-4h.01M21 12a9 9 0 11-18 0 9 9 0 0118 0z" />
-          </svg>
-        );
-    }
-  };
+  // The dashboard's toast: a card with a rail and an icon in the kind's colour.
+  const Icon = toast.type === 'success' ? Check : toast.type === 'error' ? XCircle : toast.type === 'warning' ? AlertTriangle : Info;
 
   return (
     <div
-      className={`
-        pointer-events-auto flex items-center gap-3 px-4 py-3 rounded-lg shadow-lg border
-        text-white text-sm font-medium min-w-[280px] max-w-[400px]
-        ${getColors()}
-        ${isExiting ? 'animate-toast-exit' : 'animate-toast-enter'}
-      `}
+      className={`oaiy-toast ${toast.type} ${isExiting ? 'animate-toast-exit' : 'animate-toast-enter'}`}
       // role="alert" + aria-live="assertive" interrupts the screen
       // reader — appropriate for errors, but too aggressive for
       // info/success notifications. Use the polite "status" role for
@@ -165,16 +118,10 @@ function ToastItem({ toast, onRemove }: ToastItemProps) {
       role={toast.type === 'error' ? 'alert' : 'status'}
       aria-live={toast.type === 'error' ? 'assertive' : 'polite'}
     >
-      <span className="flex-shrink-0" aria-hidden="true">{getIcon()}</span>
-      <span className="flex-1">{toast.message}</span>
-      <button
-        onClick={handleClose}
-        className="flex-shrink-0 p-1 hover:bg-white/20 rounded transition-colors"
-        aria-label="Dismiss"
-      >
-        <svg className="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24" aria-hidden="true">
-          <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M6 18L18 6M6 6l12 12" />
-        </svg>
+      <Icon size={16} aria-hidden="true" />
+      <span>{toast.message}</span>
+      <button onClick={handleClose} aria-label="Dismiss" type="button">
+        <X size={14} aria-hidden="true" />
       </button>
     </div>
   );

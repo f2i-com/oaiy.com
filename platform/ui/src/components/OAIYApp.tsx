@@ -5,8 +5,8 @@ import { createLogger } from '../utils/logger';
 
 const logger = createLogger('OAIYApp');
 import DataViewer from './panels/DataViewer';
-import SettingsPanel from './panels/SettingsPanel';
-import QueuePanel from './panels/QueuePanel';
+import SettingsPanel, { type SettingsPage } from './panels/SettingsPanel';
+import QueuePanel, { QueueCount } from './panels/QueuePanel';
 import ConfirmDialog from './ui/ConfirmDialog';
 import MacroRunnerModal from './ui/MacroRunnerModal';
 import { useProject } from '../hooks/useProject';
@@ -16,10 +16,11 @@ import { usePackageNodes } from '../hooks/usePackageNodes';
 import { usePackageManager, type LoadedPackage, type ActivePackageFlow } from '../hooks/usePackageManager';
 import { JobQueueProvider, useJobQueue } from '../contexts/JobQueueContext';
 import { ConfirmDialogProvider } from '../hooks/useConfirmDialog';
-import ProjectImportButton from './ProjectImportButton';
-import { ShellSidebar, ShellTopbar, ShellIconAction, ShellDock, ShellSections, shellNavItems, type ShellSectionsState } from './chrome/ShellChrome';
-import { Activity, Bot, HelpCircle, PanelLeft, Settings2, Share2 } from 'lucide-react';
+import ImportMenu from './ImportMenu';
+import { ShellSidebar, ShellTopbar, ShellIconAction, ShellDock, ShellSections, shellNavItems, type EditorSection } from './chrome/ShellChrome';
+import { Bot, HelpCircle, PanelLeft, Plus, Share2 } from 'lucide-react';
 import AgentToolDialog from './dialogs/AgentToolDialog';
+import NewFlowDialog from './dialogs/NewFlowDialog';
 import { useTheme } from '../contexts/ThemeContext';
 import { useMediaQuery } from '../hooks/useMediaQuery';
 import {
@@ -41,8 +42,6 @@ import { saveService, listAllServices } from '../utils/serviceRegistry';
 import { sanitizeProjectForExport } from '../utils/ProjectIO';
 import type { CustomService } from 'oaiy-core/modules/core-service/examples';
 import { v4 as uuidv4 } from 'uuid';
-
-type MainTab = 'builder' | 'data';
 
 // Re-export types for backward compatibility
 export type { LoadedPackage, ActivePackageFlow };
@@ -144,22 +143,18 @@ export default function OAIYApp() {
       // Quota or a blocked store: losing the preference is survivable.
     }
   }, [flowsSidebarOpen]);
-  const [settingsPanelOpen, setSettingsPanelOpen] = useState(false);
   // Below md the left rail is off-canvas (see index.css "phone: the rail
   // becomes a drawer"). Above md it is a grid column and this stays false.
   const [navOpen, setNavOpen] = useState(false);
   const isPhone = useMediaQuery('(width < 760px)');
   useEffect(() => { if (!isPhone) setNavOpen(false); }, [isPhone]);
-  // Track which Settings tab to land on. The agent panel's "Manage in
-  // Settings…" affordance deep-links to 'models'; the toolbar gear
-  // leaves it `undefined` so the panel restores the user's last tab.
-  // SettingsPanel's web SettingsTab union — the desktop-only tabs
-  // (plugins / api / models) were removed in the web build, so this
-  // narrowed to match.
-  const [settingsInitialTab, setSettingsInitialTab] = useState<
-    'appearance' | 'defaults' | 'apikeys' | 'constants' | 'security' | 'services' | undefined
-  >(undefined);
-  const [queuePanelOpen, setQueuePanelOpen] = useState(false);
+  // The section showing in the main area (Workflows, Data, Queue, Packages,
+  // Settings) and, in Settings, its page. Each is a view, not a popup: the
+  // canvas stays mounted beneath the others, so coming back to Workflows finds
+  // the same flow, viewport and selection.
+  const [section, setSection] = useState<EditorSection>('workflows');
+  const [settingsPage, setSettingsPage] = useState<SettingsPage>('services');
+  const [newFlowOpen, setNewFlowOpen] = useState(false);
   const [shareDialogOpen, setShareDialogOpen] = useState(false);
   // In OAIY's window: the open flow given to the agent (a tool of its own, or before or instead of one of its tools).
   const [agentToolOpen, setAgentToolOpen] = useState(false);
@@ -171,7 +166,6 @@ export default function OAIYApp() {
   const [editingFlowName, setEditingFlowName] = useState(false);
   const [flowNameValue, setFlowNameValue] = useState('');
   const flowNameInputRef = useRef<HTMLInputElement>(null);
-  const [activeTab, setActiveTab] = useState<MainTab>('builder');
   // Theme lives in ThemeContext; the topbar toggle just drives it.
   const { resolvedTheme, setTheme, followsOaiy } = useTheme();
   // OAIY Desktop presence feeds the sidebar's engine card AND the dock's LED, so
@@ -190,12 +184,10 @@ export default function OAIYApp() {
     pendingPackage,
     pendingDependencies,
     changedPackage,
-    showPackageBrowser,
     getPackagePermissionContext,
     setActivePackageFlow,
     setPendingPackage,
     setPendingDependencies,
-    setShowPackageBrowser,
     clearChangedPackage,
     handleLoadPackage,
     handleLoadPackageFromPath,
@@ -288,10 +280,17 @@ export default function OAIYApp() {
     }
   }, [activeFlowId, updateFlowGraph, project.flows, saveMacroChanges]);
 
-  // Handle creating a new flow
+  // A new flow opens on the canvas, whichever section was showing.
   const handleCreateFlow = useCallback((name: string) => {
     createFlow(name);
-  }, [createFlow]);
+    setActivePackageFlow(null);
+    setSection('workflows');
+  }, [createFlow, setActivePackageFlow]);
+
+  // Loading a package's flow (from Packages, or its trust dialog) shows it.
+  useEffect(() => {
+    if (activePackageFlow) setSection((s) => (s === 'packages' ? 'workflows' : s));
+  }, [activePackageFlow]);
 
   // Handle saving a flow as a macro
   const handleSaveAsMacro = useCallback((flowId: string) => {
@@ -565,50 +564,24 @@ export default function OAIYApp() {
   useEffect(() => {
     return subscribeStorageQuota(({ area }) => {
       addToast(
-        `Browser storage is full (autosave hit its quota while saving ${area}). Recent edits may not survive a refresh — export the project (Ctrl/⌘+S), then clear run history in Settings → Defaults to make room.`,
+        `Browser storage is full (autosave hit its quota while saving ${area}). Recent edits may not survive a refresh — export the project (Ctrl/⌘+S), then delete flows you no longer need to make room.`,
         'warning',
         0,
       );
     });
   }, [addToast]);
 
-  // The editor's sections (the rail's, or in OAIY's window the topbar's tabs).
-  // Picking a VIEW dismisses whatever overlay is up. Without this, tapping
-  // Workflows while Providers is open left Providers covering the workflow you
-  // had just asked to see, and the rail highlighted one thing while the screen
-  // showed another.
-  const sectionsState: ShellSectionsState = {
-    view: activeTab,
-    providersOpen: settingsPanelOpen && settingsInitialTab === 'services',
-    runsOpen: queuePanelOpen,
-    pluginsOpen: showPackageBrowser,
-    onSelectView: (v) => {
-      setQueuePanelOpen(false);
-      setShowPackageBrowser(false);
-      setSettingsPanelOpen(false);
-      setActiveTab(v);
-    },
-    onOpenQueue: () => {
-      if (queuePanelOpen) { setQueuePanelOpen(false); return; }
-      setSettingsPanelOpen(false); setShowPackageBrowser(false); setQueuePanelOpen(true);
-    },
-    onOpenPlugins: () => {
-      if (showPackageBrowser) { setShowPackageBrowser(false); return; }
-      setSettingsPanelOpen(false); setQueuePanelOpen(false); setShowPackageBrowser(true);
-    },
-    onOpenServices: () => {
-      if (settingsPanelOpen && settingsInitialTab === 'services') { setSettingsPanelOpen(false); return; }
-      setQueuePanelOpen(false);
-      setShowPackageBrowser(false);
-      setSettingsInitialTab('services');
-      setSettingsPanelOpen(true);
-    },
+  // The editor's sections: the web rail's entries, or in OAIY's window the
+  // tabs at the top. One of them shows at a time, in the main area.
+  const navItems = shellNavItems(section, setSection, { queue: <QueueCount /> });
+  const newFlow = () => setNewFlowOpen(true);
+  const openSettings = (page?: SettingsPage) => {
+    if (page) setSettingsPage(page);
+    setSection('settings');
   };
-  const newFlow = () => handleCreateFlow('Untitled flow');
-  const openSettings = () => {
-    if (settingsPanelOpen && settingsInitialTab !== 'services') { setSettingsPanelOpen(false); return; }
-    setQueuePanelOpen(false); setShowPackageBrowser(false); setSettingsInitialTab('appearance'); setSettingsPanelOpen(true);
-  };
+  // The rail lists flows: it is there for the canvas and a flow's data.
+  const railSection = section === 'workflows' || section === 'data';
+  const SECTION_LABEL: Record<EditorSection, string> = { workflows: 'Workflows', data: 'Data', queue: 'Queue', packages: 'Packages', settings: 'Settings' };
 
   return (
     <JobQueueProvider
@@ -638,13 +611,13 @@ export default function OAIYApp() {
       {/* In OAIY's window its own sidebar is beside the editor: the sections are tabs in the topbar instead. */}
       {!followsOaiy && (
         <ShellSidebar
-          {...sectionsState}
+          items={navItems}
           navOpen={navOpen}
           isPhone={isPhone}
           onCloseNav={() => setNavOpen(false)}
           onNewFlow={newFlow}
-          onOpenSettings={openSettings}
-          settingsActive={settingsPanelOpen}
+          onOpenSettings={() => openSettings()}
+          settingsActive={section === 'settings'}
           companionOnline={companion.available}
           companionDetail={
             companion.available
@@ -660,15 +633,15 @@ export default function OAIYApp() {
           onOpenNav={followsOaiy ? undefined : () => setNavOpen(true)}
           sections={
             followsOaiy ? (
-              <ShellSections items={shellNavItems(sectionsState)} onNewFlow={newFlow} onOpenSettings={openSettings} settingsActive={settingsPanelOpen && settingsInitialTab !== 'services'} />
+              <ShellSections items={navItems} onNewFlow={newFlow} onOpenSettings={() => openSettings()} settingsActive={section === 'settings'} />
             ) : undefined
           }
-          crumb={activeTab === 'data' ? 'Data' : 'Workflows'}
+          crumb={SECTION_LABEL[section]}
           theme={resolvedTheme}
           onSetTheme={followsOaiy ? undefined : setTheme}
-          savedLabel={activeTab === 'builder' ? 'Saved locally' : undefined}
+          savedLabel={section === 'workflows' ? 'Saved locally' : undefined}
           chips={
-            activeTab === 'builder' ? (
+            section === 'workflows' ? (
               <>
                 {activePackageFlowData && activePackage ? (
                   <em className="oaiy-chip accent">{activePackage.manifest.name}</em>
@@ -682,14 +655,17 @@ export default function OAIYApp() {
           }
           actions={
             <>
-              <ShellIconAction
-                label="Toggle the flows rail"
-                on={flowsSidebarOpen}
-                onClick={() => setFlowsSidebarOpen(!flowsSidebarOpen)}
-              >
-                <PanelLeft size={16} />
-              </ShellIconAction>
-              {followsOaiy && activeTab === 'builder' && activeFlow && (
+              {railSection && (
+                <ShellIconAction
+                  label="Toggle the flows rail"
+                  title="Show or hide the flows (Ctrl+B)"
+                  on={flowsSidebarOpen}
+                  onClick={() => setFlowsSidebarOpen(!flowsSidebarOpen)}
+                >
+                  <PanelLeft size={16} />
+                </ShellIconAction>
+              )}
+              {followsOaiy && section === 'workflows' && activeFlow && (
                 <ShellIconAction
                   label="Give this flow to the agent"
                   title={`Give "${activeFlow.name}" to OAIY's agent: as a tool of its own, or before or instead of one of its tools`}
@@ -699,7 +675,7 @@ export default function OAIYApp() {
                   <Bot size={16} />
                 </ShellIconAction>
               )}
-              {activeTab === 'builder' && backend.enabled && (
+              {section === 'workflows' && backend.enabled && (
                 <ShellIconAction
                   label={backend.share ? 'Manage share' : 'Share this flow'}
                   title={
@@ -715,17 +691,13 @@ export default function OAIYApp() {
                   <Share2 size={16} />
                 </ShellIconAction>
               )}
-              {!followsOaiy && (
-                <ShellIconAction
-                  label="Toggle the job queue"
-                  on={queuePanelOpen}
-                  onClick={() => setQueuePanelOpen(!queuePanelOpen)}
-                >
-                  <Activity size={16} />
-                </ShellIconAction>
-              )}
-              <ProjectImportButton
+              <ImportMenu
                 importProject={importProject}
+                onImportFlows={() => { setSection('workflows'); void handleLoadPackage(); }}
+                onExportProject={() => {
+                  exportProject();
+                  addToast(`Project "${project.name}" exported as JSON`, 'success');
+                }}
                 projectName={project.name}
                 onShowToast={addToast}
               />
@@ -736,11 +708,6 @@ export default function OAIYApp() {
               >
                 <HelpCircle size={16} />
               </ShellIconAction>
-              {!followsOaiy && (
-                <ShellIconAction label="Settings" onClick={() => setSettingsPanelOpen(true)}>
-                  <Settings2 size={16} />
-                </ShellIconAction>
-              )}
             </>
           }
         >
@@ -758,7 +725,7 @@ export default function OAIYApp() {
                 onChange={(e) => renameProject(e.target.value)}
                 aria-label="Project name"
               />
-              {activeFlow && (
+              {activeFlow && railSection && (
                 <>
                   <span className="oaiy-name-sep" aria-hidden="true">
                     /
@@ -796,11 +763,10 @@ export default function OAIYApp() {
 
         <section className="oaiy-view">
           <div className="flex h-full w-full min-w-0 min-h-0">
-            <ConnectedFlowsSidebar
+            {railSection && <ConnectedFlowsSidebar
               flows={project.flows}
               activeFlowId={activePackageFlow ? null : activeFlowId}
               onSelectFlow={handleSelectUserFlow}
-              onCreateFlow={handleCreateFlow}
               onDeleteFlow={deleteFlow}
               onDuplicateFlow={duplicateFlow}
               onRenameFlow={renameFlow}
@@ -817,10 +783,12 @@ export default function OAIYApp() {
               activePackageFlow={activePackageFlow}
               onSelectPackageFlow={handleSelectPackageFlow}
               onClosePackage={handleClosePackage}
-              onLoadPackage={handleLoadPackage}
-              onOpenBrowser={() => setShowPackageBrowser(true)}
-            />
-            <div className="flex-1 relative min-h-0 oaiy-canvas-wrap">
+            />}
+            <div className="flex-1 relative min-h-0 min-w-0 oaiy-canvas-wrap">
+            {/* The canvas: laid out and mounted under whichever section shows,
+                so its flow, viewport and selection are there on the way back;
+                not seen, and not reachable by keyboard, meanwhile. */}
+            <div className={`oaiy-canvas-layer${section === 'workflows' ? '' : ' away'}`} inert={section !== 'workflows'} aria-hidden={section !== 'workflows' ? true : undefined}>
 
           {activePackageFlowData && activePackage ? (
             // Package flow view - show package flow with navigation
@@ -836,14 +804,7 @@ export default function OAIYApp() {
               onUpdateSettings={updateSettings}
               flowId={activePackageFlowData.id}
               flowName={activePackageFlowData.name}
-              showDataViewer={activeTab === 'data'}
-              dataViewerComponent={
-                <DataViewer
-                  activeFlowId={activePackageFlowData.id}
-                  packageId={activePackage.manifest.id}
-                  flowName={activePackageFlowData.name}
-                />
-              }
+              active={section === 'workflows'}
               onShowToast={addToast}
               // Package mode props - pass the active package info
               packageMode={{
@@ -864,27 +825,14 @@ export default function OAIYApp() {
             />
           ) : activePackageFlow && !activePackageFlowData ? (
             // Package is selected but flow data not found - show error
-            <div className="h-full flex items-center justify-center bg-slate-50 dark:bg-transparent">
-              <div className="text-center max-w-md">
-                <div className="w-16 h-16 mx-auto mb-4 rounded-full bg-red-100 dark:bg-red-900/30 flex items-center justify-center">
-                  <svg className="w-8 h-8 text-red-500 dark:text-red-400" fill="none" stroke="currentColor" viewBox="0 0 24 24">
-                    <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M12 9v2m0 4h.01m-6.938 4h13.856c1.54 0 2.502-1.667 1.732-3L13.732 4c-.77-1.333-2.694-1.333-3.464 0L3.34 16c-.77 1.333.192 3 1.732 3z" />
-                  </svg>
-                </div>
-                <h2 className="text-xl font-medium text-slate-700 dark:text-slate-300 mb-2">Flow Not Found</h2>
-                <p className="text-slate-500 dark:text-slate-400 mb-4">
-                  The selected flow "{activePackageFlow.flowId}" could not be found in the package.
-                  {activePackage ? ` The package "${activePackage.manifest.name}" contains ${activePackage.flows.length} flow(s).` : ''}
+            <div className="grid h-full w-full place-items-center p-6">
+              <div className="oaiy-card max-w-md items-center text-center">
+                <h2 className="m-0 text-[15px] font-semibold text-content-primary">That flow is not in the package</h2>
+                <p className="oaiy-card-text">
+                  The package has no flow "{activePackageFlow.flowId}".
+                  {activePackage ? ` "${activePackage.manifest.name}" has ${activePackage.flows.length} flow(s).` : ''}
                 </p>
-                <div className="flex gap-2 justify-center">
-                  {activePackage && activePackage.flows.length > 0 && (
-                    <button
-                      onClick={() => setActivePackageFlow({ packageId: activePackageFlow.packageId, flowId: activePackage.flows[0].id })}
-                      className="px-4 py-2 bg-blue-600 text-white rounded-lg hover:bg-blue-500 transition-colors"
-                    >
-                      View First Flow
-                    </button>
-                  )}
+                <div className="flex justify-center gap-2">
                   <button
                     onClick={() => {
                       setActivePackageFlow(null);
@@ -892,10 +840,18 @@ export default function OAIYApp() {
                         setActiveFlowId(project.flows[0].id);
                       }
                     }}
-                    className="px-4 py-2 bg-slate-200 dark:bg-slate-700 text-slate-700 dark:text-slate-200 rounded-lg hover:bg-slate-300 dark:hover:bg-slate-600 transition-colors"
+                    className="btn"
                   >
-                    Close Package
+                    Close the package
                   </button>
+                  {activePackage && activePackage.flows.length > 0 && (
+                    <button
+                      onClick={() => setActivePackageFlow({ packageId: activePackageFlow.packageId, flowId: activePackage.flows[0].id })}
+                      className="btn btn-primary"
+                    >
+                      Open its first flow
+                    </button>
+                  )}
                 </div>
               </div>
             </div>
@@ -919,36 +875,67 @@ export default function OAIYApp() {
                  so showing it just errored — gate on isBuiltIn. */
               onRevertMacro={activeFlow.isMacro && activeFlow.isBuiltIn ? () => handleRevertMacro(activeFlow.id) : undefined}
               onRunMacro={activeFlow.isMacro ? () => setMacroRunnerFlow(activeFlow) : undefined}
-              showDataViewer={activeTab === 'data'}
-              dataViewerComponent={
-                <DataViewer
-                  activeFlowId={activeFlow.id}
-                  flowName={activeFlow.name}
-                />
-              }
+              active={section === 'workflows'}
               onShowToast={addToast}
               onLoadPackage={handleLoadPackage}
             />
           ) : (
-            <div className="h-full flex items-center justify-center bg-dotgrid p-6" style={{ backgroundColor: 'rgb(var(--color-bg-canvas))' }}>
-              <div className="text-center max-w-sm">
-                <h2 className="font-display text-4xl mb-3" style={{ fontWeight: 400, letterSpacing: '-0.025em', color: 'rgb(var(--color-text-primary))' }}>
-                  An empty canvas
-                </h2>
-                <p className="mb-6 text-sm" style={{ color: 'rgb(var(--color-text-tertiary))' }}>
-                  {project.flows.length === 0
-                    ? 'Start by creating your first flow — then drag nodes from the palette to build it.'
-                    : 'Pick a flow from the sidebar, or start a new one.'}
-                </p>
-                <button
-                  onClick={() => createFlow('New Flow')}
-                  className="btn btn-primary btn-md"
-                >
-                  {project.flows.length === 0 ? 'Create your first flow' : 'Create Flow'}
-                </button>
+            <div className="bg-dotgrid grid h-full w-full place-items-center p-6">
+              <div className="oaiy-canvas-hint static">
+                <div>
+                  <i><Plus size={18} /></i>
+                  <p>{project.flows.length === 0 ? 'No flows yet' : 'No flow open'}</p>
+                  <small>
+                    {project.flows.length === 0
+                      ? 'Make your first flow, then add nodes to it from the palette.'
+                      : 'Pick a flow from the rail, or make a new one.'}
+                  </small>
+                  <button onClick={newFlow} className="btn btn-primary mt-2 pointer-events-auto">
+                    <Plus size={14} /> New flow
+                  </button>
+                </div>
               </div>
             </div>
           )}
+            </div>
+            {section === 'data' && (
+              <DataViewer
+                activeFlowId={activePackageFlowData && activePackage ? activePackageFlowData.id : activeFlow?.id}
+                packageId={activePackageFlowData && activePackage ? activePackage.manifest.id : undefined}
+                flowName={activePackageFlowData && activePackage ? activePackageFlowData.name : activeFlow?.name}
+              />
+            )}
+            {section === 'queue' && (
+              <QueuePanel
+                onNavigateToFlow={(flowId) => {
+                  setActivePackageFlow(null);
+                  setActiveFlowId(flowId);
+                  setSection('workflows');
+                }}
+              />
+            )}
+            {section === 'packages' && (
+              <PackageBrowser
+                onLoadPackage={handleLoadPackageFromPath}
+                loadedPackageIds={new Set(loadedPackages.keys())}
+                loaded={Array.from(loadedPackages.values()).map((p) => ({ id: p.manifest.id, name: p.manifest.name, version: p.manifest.version, flows: p.flows.length }))}
+                onClosePackage={handleClosePackage}
+                onLoadFile={() => void handleLoadPackage()}
+              />
+            )}
+            {section === 'settings' && (
+              <SettingsPanel
+                page={settingsPage}
+                onPageChange={setSettingsPage}
+                settings={getSettings()}
+                constants={project.constants || []}
+                onUpdateSettings={updateSettings}
+                onUpdateConstant={updateConstant}
+                onCreateConstant={createConstant}
+                onDeleteConstant={deleteConstant}
+                onShowToast={addToast}
+              />
+            )}
             </div>
           </div>
         </section>
@@ -965,7 +952,7 @@ export default function OAIYApp() {
               .catch(() => addToast('Could not access the clipboard.', 'error'));
           }}
           shared={!!backend.share}
-          onManage={() => (backend.enabled ? setShareDialogOpen(true) : setSettingsPanelOpen(true))}
+          onManage={() => (backend.enabled ? setShareDialogOpen(true) : openSettings('general'))}
           manageLabel={backend.share ? 'Manage share' : 'Share'}
         />}
       </main>
@@ -974,21 +961,13 @@ export default function OAIYApp() {
         <AgentToolDialog flow={activeFlow} onClose={() => setAgentToolOpen(false)} onDone={(message) => addToast(message, 'success')} />
       )}
 
-      {/* Settings Panel */}
-      <SettingsPanel
-        isOpen={settingsPanelOpen}
-        onClose={() => {
-          setSettingsPanelOpen(false);
-          setSettingsInitialTab(undefined);
+      <NewFlowDialog
+        open={newFlowOpen}
+        onClose={() => setNewFlowOpen(false)}
+        onCreate={(name) => {
+          setNewFlowOpen(false);
+          handleCreateFlow(name);
         }}
-        settings={getSettings()}
-        constants={project.constants || []}
-        onUpdateSettings={updateSettings}
-        onUpdateConstant={updateConstant}
-        onCreateConstant={createConstant}
-        onDeleteConstant={deleteConstant}
-        onShowToast={addToast}
-        initialTab={settingsInitialTab}
       />
 
       {/* New project confirmation dialog */}
@@ -1005,16 +984,6 @@ export default function OAIYApp() {
           addToast('New project created', 'success');
         }}
         onCancel={() => setShowNewProjectDialog(false)}
-      />
-
-      {/* Queue Panel */}
-      <QueuePanel
-        isOpen={queuePanelOpen}
-        onClose={() => setQueuePanelOpen(false)}
-        onNavigateToFlow={(flowId) => {
-          setActiveFlowId(flowId);
-          setQueuePanelOpen(false);
-        }}
       />
 
       {/* The OAIY Agent panel lived here in the desktop build — removed
@@ -1133,10 +1102,9 @@ export default function OAIYApp() {
 
           const starterFlow = createFlow(flowName, starterGraph);
           setActiveFlowId(starterFlow.id);
-          // Switch to Builder if the user is sitting on the Data Viewer when
-          // the wizard opens — they'd otherwise just see a toast and wonder
-          // where the flow went.
-          setActiveTab('builder');
+          // Show the canvas, whichever section was open when the wizard
+          // was — otherwise there is just a toast and no flow in sight.
+          setSection('workflows');
           addToast(`Created "${starterFlow.name}" — click Run to try it`, 'success');
         }}
       />
@@ -1189,14 +1157,6 @@ export default function OAIYApp() {
           }
         }}
         onCancel={() => clearChangedPackage()}
-      />
-
-      {/* Package Browser Dialog */}
-      <PackageBrowser
-        isOpen={showPackageBrowser}
-        onClose={() => setShowPackageBrowser(false)}
-        onLoadPackage={handleLoadPackageFromPath}
-        loadedPackageIds={new Set(loadedPackages.keys())}
       />
 
       {/* Macro Runner Modal */}

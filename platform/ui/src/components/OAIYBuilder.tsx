@@ -1,4 +1,5 @@
-import { useCallback, useRef, useMemo, useState, useEffect } from 'react';
+import { useCallback, useRef, useMemo, useState, useEffect, useLayoutEffect } from 'react';
+import { Layers, Map as MapIcon, Package as PackageIcon, Play, Plus, RefreshCw, RotateCcw, Save, ScrollText, SlidersHorizontal, Square, X } from 'lucide-react';
 import {
   ReactFlow,
   Background,
@@ -18,7 +19,8 @@ import { getNodeTypes, getRegistryVersion } from 'oaiy-ui-components';
 import { edgeTypes } from './edges';
 import NodePalette, { type MacroNodeData } from './panels/NodePalette';
 import LogConsole from './panels/LogConsole';
-import PropertiesPanel, { SWATCH_CLASS } from './panels/PropertiesPanel';
+import PropertiesPanel from './panels/PropertiesPanel';
+import { SWATCH_CLASS } from './panels/nodeSwatches';
 import { useWorkflow } from '../hooks/useWorkflow';
 import { useStableHandlers } from '../hooks/useStableHandlers';
 import { useQuickConnect } from '../hooks/useQuickConnect';
@@ -29,15 +31,11 @@ import { useNodeGrouping } from '../hooks/useNodeGrouping';
 import { QuickConnectPopup } from './OAIYBuilder/QuickConnectPopup';
 import type { PackageNodeInfo } from '../hooks/usePackageNodes';
 import type { NodeType, WorkflowGraph, Flow, LLMEndpoint, ProjectConstant, ProjectSettings, ComfyUIAnalysis, OAIYPackageManifest } from 'oaiy-core';
-import ConfirmDialog from './ui/ConfirmDialog';
 import RunWorkflowModal, { hasInputNodes } from './ui/RunWorkflowModal';
 import ComfyUIWorkflowDialog, { type ComfyUIWorkflowConfig } from 'oaiy-core/modules/core-image/ui/ComfyUIWorkflowDialog';
 import { ServiceStartupDialog } from './PackageManager/ServiceStartupDialog';
 import { CanvasContextMenu } from './OAIYBuilder/CanvasContextMenu';
 import { makeIsValidConnection } from '../utils/edgeTypeValidation';
-import { useTheme } from '../contexts/ThemeContext';
-import { useFocusTrap } from '../hooks/useFocusTrap';
-import { useMediaQuery } from '../hooks/useMediaQuery';
 import TypedConnectionLine from './OAIYBuilder/TypedConnectionLine';
 
 // Render-invariant literals hoisted to module scope so they keep a stable
@@ -51,8 +49,10 @@ const DEFAULT_EDGE_OPTIONS = {
   selectable: true,
   focusable: true,
 } as const;
-const CONNECTION_LINE_STYLE = { stroke: '#3b82f6', strokeWidth: 3 } as const;
+const CONNECTION_LINE_STYLE = { stroke: 'rgb(var(--accent-primary))', strokeWidth: 3 } as const;
 const PRO_OPTIONS = { hideAttribution: true } as const;
+// A small map, so it leaves the toolbar its room at the canvas's foot.
+const MINIMAP_STYLE = { width: 168, height: 112 } as const;
 const BACKGROUND_STYLE = { backgroundColor: 'rgb(var(--bg-primary))', color: 'rgb(var(--bg-tertiary))' } as const;
 
 // Shared (non-per-node) dependencies that get spread into every node's data
@@ -86,6 +86,34 @@ const miniMapNodeColor = (node: Node): string => {
   }
 };
 
+/**
+ * The builder's own width (the canvas and its side panels, without the flows
+ * rail or OAIY's sidebar) decides how the side panels behave, not the
+ * window's: the same 1440px window leaves the canvas far less room beside the
+ * web editor's sidebar than in OAIY's window.
+ *
+ * Under COMPACT_WIDTH the panels start closed and only one side is open at a
+ * time; under NARROW_WIDTH a panel lies over the canvas's edge instead of
+ * pushing it, so the canvas keeps its width.
+ */
+const COMPACT_WIDTH = 1100;
+const NARROW_WIDTH = 640;
+/** A first guess before the builder is measured (it is, before the first paint). */
+const isCompactNow = (): boolean => typeof window !== 'undefined' && window.innerWidth < 1240;
+
+// Per-panel open state on a wide window, persisted across reloads.
+const loadBoolPref = (key: string, fallback: boolean): boolean => {
+  try {
+    const raw = localStorage.getItem(key);
+    if (raw === 'true') return true;
+    if (raw === 'false') return false;
+  } catch { /* SSR/private-mode — fall through */ }
+  return fallback;
+};
+const saveBoolPref = (key: string, val: boolean): void => {
+  try { localStorage.setItem(key, val ? 'true' : 'false'); } catch { /* ignore quota */ }
+};
+
 // Props for integrated mode (with OAIYApp)
 interface OAIYBuilderProps {
   initialGraph?: WorkflowGraph;
@@ -110,9 +138,12 @@ interface OAIYBuilderProps {
   onRevertMacro?: () => void;
   /** Run macro callback - opens the macro runner modal */
   onRunMacro?: () => void;
-  // For showing DataViewer within the builder frame
-  showDataViewer?: boolean;
-  dataViewerComponent?: React.ReactNode;
+  /**
+   * False while another section of the editor (Data, Queue, Settings…) is
+   * showing over the canvas: it stays mounted, but keys meant for that page
+   * (Backspace in a list, Ctrl+Shift+R) must not reach the flow.
+   */
+  active?: boolean;
   // Toast notifications
   onShowToast?: (message: string, type?: 'success' | 'error' | 'info' | 'warning') => void;
   // Package mode props
@@ -155,8 +186,7 @@ export default function OAIYBuilder({
   onSaveMacro,
   onRevertMacro,
   onRunMacro,
-  showDataViewer = false,
-  dataViewerComponent,
+  active = true,
   onShowToast,
   packageMode,
   packagePermissionContext,
@@ -211,7 +241,7 @@ export default function OAIYBuilder({
 
   // Keyboard shortcut for package reload (Ctrl+Shift+R)
   useEffect(() => {
-    if (!packageMode || !onReloadPackage) return;
+    if (!packageMode || !onReloadPackage || !active) return;
 
     const handleKeyDown = (e: KeyboardEvent) => {
       if ((e.ctrlKey || e.metaKey) && e.shiftKey && e.key === 'R') {
@@ -222,7 +252,7 @@ export default function OAIYBuilder({
 
     window.addEventListener('keydown', handleKeyDown);
     return () => window.removeEventListener('keydown', handleKeyDown);
-  }, [packageMode, onReloadPackage]);
+  }, [packageMode, onReloadPackage, active]);
 
 
   const {
@@ -338,59 +368,78 @@ export default function OAIYBuilder({
     }
   }, [flowTransitioning, nodes, finishFlowTransition]);
 
-  const [paletteOpen, setPaletteOpen] = useState(false);
-  // Below lg the properties panel is undocked, and until now it had NO mobile
-  // counterpart at all -- `hidden lg:flex` and nothing else -- so a phone user
-  // could add a node and run a flow but could never set an endpoint, a prompt
-  // or a model on it. This is that counterpart: the same panel in a sheet.
-  const [propsSheetOpen, setPropsSheetOpen] = useState(false);
-  const propsSheetRef = useRef<HTMLDivElement>(null);
-  const propsCloseRef = useRef<HTMLButtonElement>(null);
-  const compact = useMediaQuery('(width < 1280px)');
-  useFocusTrap(propsSheetRef, propsSheetOpen && compact && !showDataViewer, propsCloseRef);
+  // The canvas's two side panels, one family: the node palette on the left,
+  // and the inspector on the right (the selected node's properties above the
+  // execution log). On a wide window they are docked and remember whether
+  // they were open. Below the xl width (1240px: Tailwind's xl and the shell's
+  // rail rule) they start closed and only one side is open at a time, so the
+  // canvas keeps its room; under 760px a panel lies over the canvas's edge.
+  // The toolbar at the foot of the canvas opens and closes all three.
+  const builderRef = useRef<HTMLDivElement>(null);
+  const [builderWidth, setBuilderWidth] = useState(0);
+  const compact = builderWidth > 0 ? builderWidth < COMPACT_WIDTH : isCompactNow();
+  const narrow = builderWidth > 0 && builderWidth < NARROW_WIDTH;
+  const [paletteOpen, setPaletteOpen] = useState<boolean>(() => !isCompactNow() && !loadBoolPref('oaiy.ui.paletteCollapsed', false));
+  const [propsOpen, setPropsOpen] = useState<boolean>(() => !isCompactNow() && loadBoolPref('oaiy.ui.propertiesVisible', true));
+  const [logOpen, setLogOpen] = useState<boolean>(() => !isCompactNow() && loadBoolPref('oaiy.ui.logPanelVisible', true));
+  // Measured before the first paint: a compact builder opens with its panels
+  // closed, a wide one as it was left.
+  useLayoutEffect(() => {
+    const el = builderRef.current;
+    if (!el) return;
+    const w = el.getBoundingClientRect().width;
+    setBuilderWidth(w);
+    if (w > 0) {
+      const wide = w >= COMPACT_WIDTH;
+      // An empty flow's first step is a node, so it opens with the palette.
+      const empty = nodes.length === 0;
+      setPaletteOpen(empty || (wide && !loadBoolPref('oaiy.ui.paletteCollapsed', false)));
+      setPropsOpen(wide && loadBoolPref('oaiy.ui.propertiesVisible', true));
+      setLogOpen(wide && loadBoolPref('oaiy.ui.logPanelVisible', true));
+    }
+    if (typeof ResizeObserver === 'undefined') return;
+    const ro = new ResizeObserver((entries) => setBuilderWidth(entries[0]?.contentRect.width ?? 0));
+    ro.observe(el);
+    return () => ro.disconnect();
+    // Once, when the flow opens (the builder remounts per flow).
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
+  // Growing narrow with both sides open (the rail opened, the window
+  // shrank): the palette gives way, so one side is open at a time.
   useEffect(() => {
-    if (!propsSheetOpen) return;
-    if (!compact) { setPropsSheetOpen(false); return; }
-    const onKey = (event: KeyboardEvent) => { if (event.key === 'Escape') setPropsSheetOpen(false); };
-    document.addEventListener('keydown', onKey);
-    return () => document.removeEventListener('keydown', onKey);
-  }, [compact, propsSheetOpen]);
-  const [logsOpen, setLogsOpen] = useState(false);
-  // Per-panel collapse state, persisted across reloads. The three
-  // builder side-panels (palette, properties, execution log) each have
-  // an independent visibility flag so power users can reclaim screen
-  // real-estate without going full-screen. Defaults: palette + props
-  // visible, log visible. Reads happen once at mount via the lazy
-  // initializer; toggles write through to localStorage.
-  const loadBoolPref = (key: string, fallback: boolean): boolean => {
-    try {
-      const raw = localStorage.getItem(key);
-      if (raw === 'true') return true;
-      if (raw === 'false') return false;
-    } catch { /* SSR/private-mode — fall through */ }
-    return fallback;
-  };
-  const saveBoolPref = (key: string, val: boolean): void => {
-    try { localStorage.setItem(key, val ? 'true' : 'false'); } catch { /* ignore quota */ }
-  };
-  const [paletteCollapsed, setPaletteCollapsed] = useState<boolean>(() =>
-    loadBoolPref('oaiy.ui.paletteCollapsed', false));
-  const togglePaletteCollapsed = useCallback(() =>
-    setPaletteCollapsed((p) => { saveBoolPref('oaiy.ui.paletteCollapsed', !p); return !p; }), []);
-  const [propertiesVisible, setPropertiesVisible] = useState<boolean>(() =>
-    loadBoolPref('oaiy.ui.propertiesVisible', true));
-  const togglePropertiesVisible = useCallback(() =>
-    setPropertiesVisible((p) => { saveBoolPref('oaiy.ui.propertiesVisible', !p); return !p; }), []);
-  const [logPanelVisible, setLogPanelVisible] = useState<boolean>(() =>
-    loadBoolPref('oaiy.ui.logPanelVisible', true));
-  // Mirror the log toggle through the same persistence helper so the
-  // existing close button updates localStorage too.
-  useEffect(() => { saveBoolPref('oaiy.ui.logPanelVisible', logPanelVisible); }, [logPanelVisible]);
+    if (compact && paletteOpen && (propsOpen || logOpen)) setPaletteOpen(false);
+    // Only on crossing into compact, not on every toggle (the toggles keep it true).
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [compact]);
+  const setPalette = useCallback((open: boolean) => {
+    setPaletteOpen(open);
+    if (compact) {
+      if (open) { setPropsOpen(false); setLogOpen(false); }
+    } else {
+      saveBoolPref('oaiy.ui.paletteCollapsed', !open);
+    }
+  }, [compact]);
+  const setProps = useCallback((open: boolean) => {
+    setPropsOpen(open);
+    if (compact) {
+      if (open) setPaletteOpen(false);
+    } else {
+      saveBoolPref('oaiy.ui.propertiesVisible', open);
+    }
+  }, [compact]);
+  const setLog = useCallback((open: boolean) => {
+    setLogOpen(open);
+    if (compact) {
+      if (open) setPaletteOpen(false);
+    } else {
+      saveBoolPref('oaiy.ui.logPanelVisible', open);
+    }
+  }, [compact]);
   const [contextMenu, setContextMenu] = useState<{ x: number; y: number } | null>(null);
   const [showMiniMap, setShowMiniMap] = useState(true); // Toggle minimap visibility
-  // The minimap mask must follow the theme — a hardcoded dark mask reads as
-  // a heavy navy block over the white canvas in light mode.
-  const { resolvedTheme } = useTheme();
+  // The canvas's own width: the map gives way to the toolbar when it is
+  // narrow, and the toolbar drops its words when narrower still.
+  const [canvasWidth, setCanvasWidth] = useState(0);
 
   // Get module nodes for quick-connect filtering
   const { nodes: moduleNodes } = useModuleNodes();
@@ -972,285 +1021,174 @@ export default function OAIYBuilder({
     setComfyWorkflowDialogState(null);
   }, []);
 
-  // MiniMap mask must follow the theme; memoize so the string only changes
-  // when the resolved theme does (recreated inline it churned MiniMap props).
-  const miniMapMaskColor = useMemo(
-    () => (resolvedTheme === 'dark' ? 'rgba(15, 23, 42, 0.8)' : 'rgba(226, 232, 240, 0.7)'),
-    [resolvedTheme],
-  );
+  // Watch the canvas's width (the side panels and the window both change it).
+  useEffect(() => {
+    const el = reactFlowWrapper.current;
+    if (!el || typeof ResizeObserver === 'undefined') return;
+    const ro = new ResizeObserver((entries) => setCanvasWidth(entries[0]?.contentRect.width ?? 0));
+    ro.observe(el);
+    return () => ro.disconnect();
+  }, []);
+
+  // Drawn over the canvas's foot: the map only while there is room beside the toolbar.
+  const mapRoom = canvasWidth === 0 || canvasWidth >= 520;
+  const tightToolbar = canvasWidth > 0 && canvasWidth < 560;
+  const inspectorOpen = propsOpen || logOpen;
 
   return (
-    <div className="flex h-full w-full overflow-hidden" style={{ backgroundColor: 'rgb(var(--bg-primary))' }} onKeyDown={onKeyDown} tabIndex={0}>
-      {/* Left Panel - Node Palette (hidden on mobile by default, and hidden when showing DataViewer)
-          When collapsed, only a thin rail with an expand chevron remains
-          so the user can recover the canvas width and still get back. */}
-      {!showDataViewer && (
-        paletteCollapsed ? (
-          <div className="hidden xl:flex xl:h-full xl:w-8 xl:flex-shrink-0 border-r border-[rgb(var(--color-border-primary))] bg-white/30 dark:bg-slate-900/30">
-            <button
-              type="button"
-              onClick={togglePaletteCollapsed}
-              className="w-full h-full flex flex-col items-center justify-start pt-3 gap-2 text-slate-400 dark:text-slate-500 hover:text-slate-700 dark:hover:text-slate-200 hover:bg-slate-100 dark:hover:bg-slate-800 transition-colors"
-              title="Show node palette"
-              aria-label="Show node palette"
-            >
-              <svg className="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24">
-                <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M9 5l7 7-7 7" />
-              </svg>
-              <span className="text-[10px] [writing-mode:vertical-rl] tracking-wider uppercase select-none">Palette</span>
-            </button>
-          </div>
-        ) : (
-          <div className="hidden xl:flex xl:h-full xl:flex-shrink-0 relative">
-            <NodePalette
-              onAddNode={handleAddNode}
-              onAddNodeAtPosition={handleAddNodeAtPosition}
-              isOpen={true}
-              docked
-              onClose={() => { }}
-              macros={macros}
-              onAddMacro={handleAddMacro}
-              onAddMacroAtPosition={handleAddMacroAtPosition}
-              activePackageId={activePackageId}
-              packageNodes={packageNodes}
-            />
-            <button
-              type="button"
-              onClick={togglePaletteCollapsed}
-              className="absolute top-2 right-1 z-10 p-1 rounded hover:bg-slate-200 dark:hover:bg-slate-700 text-slate-400 dark:text-slate-500 hover:text-slate-700 dark:hover:text-slate-200 transition-colors"
-              title="Collapse node palette"
-              aria-label="Collapse node palette"
-            >
-              <svg className="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24">
-                <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M15 19l-7-7 7-7" />
-              </svg>
-            </button>
-          </div>
-        )
+    <div
+      ref={builderRef}
+      className={`oaiy-builder${narrow ? ' narrow' : ''}${paletteOpen ? ' left-open' : ''}${propsOpen || logOpen ? ' right-open' : ''}`}
+      style={{ backgroundColor: 'rgb(var(--bg-primary))' }}
+      onKeyDown={onKeyDown}
+      tabIndex={0}
+    >
+      {/* Left: the node palette, docked beside the canvas. */}
+      {paletteOpen && (
+        <NodePalette
+          onAddNode={handleAddNode}
+          onAddNodeAtPosition={handleAddNodeAtPosition}
+          onClose={() => setPalette(false)}
+          closeOnAdd={narrow}
+          macros={macros}
+          onAddMacro={handleAddMacro}
+          onAddMacroAtPosition={handleAddMacroAtPosition}
+          activePackageId={activePackageId}
+          packageNodes={packageNodes}
+        />
       )}
 
-      {/* Mobile Properties sheet — the counterpart to the `hidden lg:flex`
-          dock on the right. A bottom sheet rather than a side drawer: a side
-          drawer at 390px covers two thirds of the canvas, and the thing being
-          configured is the node you just tapped, which you want to keep seeing.
-          dvh, not vh, so iOS's collapsing URL bar cannot push the actions off
-          the bottom. */}
-      {!showDataViewer && propsSheetOpen && (
-        <div className="xl:hidden">
-          <div
-            className="fixed inset-0 bg-black/50 z-40"
-            onClick={() => setPropsSheetOpen(false)}
-            aria-hidden="true"
-          />
-          <div
-            className="fixed inset-x-0 bottom-0 z-50 flex flex-col max-h-[70dvh] rounded-t-2xl border-t border-slate-300 dark:border-slate-700 bg-white dark:bg-slate-900 shadow-2xl"
-            role="dialog"
-            aria-label="Node properties"
-            aria-modal="true"
-            ref={propsSheetRef}
-          >
-            <div className="flex items-center justify-between px-3 py-2 border-b border-slate-200 dark:border-slate-800 flex-shrink-0">
-              <div className="flex items-center gap-2 min-w-0">
-                <span className="h-1 w-8 rounded-full bg-slate-300 dark:bg-slate-600" aria-hidden="true" />
-                <span className="text-sm font-medium truncate">Properties</span>
-              </div>
-              <button
-                type="button"
-                onClick={() => setPropsSheetOpen(false)}
-                className="btn btn-ghost btn-icon"
-                aria-label="Close properties"
-                ref={propsCloseRef}
-              >
-                <svg className="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24">
-                  <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M6 18L18 6M6 6l12 12" />
-                </svg>
-              </button>
-            </div>
-            {/* The panel is position-agnostic (`flex flex-col h-full`), so it
-                needs no change to live here — only somewhere to scroll. */}
-            <div className="flex-1 min-h-0 overflow-y-auto overscroll-contain">
-              <PropertiesPanel
-                selectedNode={selectedNodes[0] || null}
-                updateNodeData={updateNodeData}
-              />
-            </div>
-          </div>
-        </div>
-      )}
-
-      {/* Mobile Node Palette (drawer) */}
-      {!showDataViewer && (
-        <div className="xl:hidden">
-          <NodePalette
-            onAddNode={handleAddNode}
-            onAddNodeAtPosition={handleAddNodeAtPosition}
-            isOpen={paletteOpen}
-            onClose={() => setPaletteOpen(false)}
-            macros={macros}
-            onAddMacro={handleAddMacro}
-            onAddMacroAtPosition={handleAddMacroAtPosition}
-            activePackageId={activePackageId}
-            packageNodes={packageNodes}
-          />
-        </div>
-      )}
-
-      {/* Center - Canvas or Data Viewer */}
+      {/* Center - Canvas */}
       <div
         ref={reactFlowWrapper}
-        className="flex-1 h-full relative"
+        className="relative h-full min-w-0 flex-1"
         onClick={handleCanvasClick}
         onContextMenu={(e) => e.preventDefault()}
       >
         {/* Loading overlay for flow transitions */}
         {flowTransitioning && (
-          <div className="absolute inset-0 bg-white/80 dark:bg-slate-900/80 backdrop-blur-sm z-50 flex items-center justify-center animate-fadeIn">
-            <div className="flex flex-col items-center gap-4">
-              <div className="w-12 h-12 border-4 rounded-full animate-spin" style={{ borderColor: 'rgb(var(--accent-primary) / 0.3)', borderTopColor: 'rgb(var(--accent-primary))' }} />
-              <div className="text-slate-600 dark:text-slate-300 text-sm font-medium">
-                Loading {flowName}...
-              </div>
+          <div className="oaiy-canvas-busy">
+            <div>
+              <span className="oaiy-spinner" aria-hidden="true" />
+              <span>Opening {flowName}…</span>
             </div>
           </div>
         )}
 
-        {showDataViewer && dataViewerComponent ? (
-          <div className="h-full w-full overflow-hidden" style={{ backgroundColor: 'rgb(var(--bg-primary))' }}>
-            {dataViewerComponent}
-          </div>
-        ) : (
-          <ReactFlow
-            nodes={nodesWithHandlers}
-            edges={edgesWithOptions}
-            onNodesChange={onNodesChange}
-            onEdgesChange={onEdgesChange}
-            onConnect={onConnect}
-            isValidConnection={isValidConnection}
-            onEdgeClick={handleEdgeClick}
-            onInit={(instance) => {
-              reactFlowInstance.current = instance;
-              // Restore saved viewport or fit view on first load
-              if (!hasInitializedViewport.current) {
-                hasInitializedViewport.current = true;
-                if (savedViewportRef.current) {
-                  // Restore the saved viewport (preserves zoom level)
-                  instance.setViewport(savedViewportRef.current, { duration: 0 });
-                } else if (nodes.length > 0) {
-                  // First time: fit view to show all nodes
-                  instance.fitView({ padding: 0.2, duration: 0, maxZoom: 1 });
-                } else {
-                  // Fitting empty bounds can zoom to the maximum before the first node exists.
-                  instance.setViewport({ x: 0, y: 0, zoom: 1 }, { duration: 0 });
-                }
+        <ReactFlow
+          nodes={nodesWithHandlers}
+          edges={edgesWithOptions}
+          onNodesChange={onNodesChange}
+          onEdgesChange={onEdgesChange}
+          onConnect={onConnect}
+          isValidConnection={isValidConnection}
+          onEdgeClick={handleEdgeClick}
+          onInit={(instance) => {
+            reactFlowInstance.current = instance;
+            // Restore saved viewport or fit view on first load
+            if (!hasInitializedViewport.current) {
+              hasInitializedViewport.current = true;
+              if (savedViewportRef.current) {
+                // Restore the saved viewport (preserves zoom level)
+                instance.setViewport(savedViewportRef.current, { duration: 0 });
+              } else if (nodes.length > 0) {
+                // First time: fit view to show all nodes
+                instance.fitView({ padding: 0.2, duration: 0, maxZoom: 1 });
+              } else {
+                // Fitting empty bounds can zoom to the maximum before the first node exists.
+                instance.setViewport({ x: 0, y: 0, zoom: 1 }, { duration: 0 });
               }
-              // Clear transitioning state after viewport is set - use RAF to ensure paint
-              if (flowTransitioning) {
-                requestAnimationFrame(() => finishFlowTransition());
-              }
-            }}
-            onViewportChange={handleViewportChange}
-            nodeTypes={nodeTypes}
-            edgeTypes={edgeTypes}
-            className={`touch-manipulation transition-opacity duration-100 ${flowTransitioning ? 'opacity-0' : 'opacity-100'}`}
-            style={CANVAS_STYLE}
-            defaultEdgeOptions={DEFAULT_EDGE_OPTIONS}
-            edgesReconnectable
-            connectOnClick={true}
-            connectionLineStyle={CONNECTION_LINE_STYLE}
-            connectionLineComponent={TypedConnectionLine}
-            proOptions={PRO_OPTIONS}
-            onPaneClick={handlePaneClick}
-            onPaneContextMenu={handlePaneContextMenu}
-            onConnectStart={handleConnectStart}
-            onConnectEnd={handleConnectEnd}
-            // Navigation: scroll wheel zooms, left/middle/right-drag to pan
-            panOnScroll={false}
-            panOnDrag
-            zoomOnPinch
-            zoomOnScroll
-            zoomActivationKeyCode={null}
-            preventScrolling
-            // Multi-select: Ctrl+drag creates selection box (overrides pan when Ctrl held)
-            selectionOnDrag
-            selectionKeyCode="Control"
-            multiSelectionKeyCode="Control"
-            elementsSelectable
-            selectNodesOnDrag={false}
-            // Auto-pan when dragging nodes or connections near edges
-            autoPanOnNodeDrag
-            autoPanOnConnect
-            autoPanSpeed={8}
-            // Require minimum movement before starting drag (prevents accidental drags)
-            nodeDragThreshold={3}
-            // Allow connections even when not perfectly aligned
-            connectionMode={ConnectionMode.Loose}
-            // Zoom settings
-            minZoom={0.1}
-            maxZoom={2}
-          // No pan limits - allow free panning in any direction
-          >
-            <Background color="currentColor" style={BACKGROUND_STYLE} gap={20} size={1} />
-            {/* Empty-flow hint — only on a brand-new flow with no nodes.
-                Pointer-events-none so it never gets in the way of the
-                canvas; the palette + right-click menu both stay usable
-                through it. Mobile gets a tap-friendly variant since the
-                drag-and-drop instruction doesn't apply on touch. */}
-            {nodes.length === 0 && !flowTransitioning && (
-              <div className="pointer-events-none absolute inset-0 z-[5] flex items-center justify-center p-6 select-none">
-                <div className="text-center max-w-xs">
-                  <div className="mx-auto mb-3 w-10 h-10 rounded-full flex items-center justify-center" style={{ backgroundColor: 'rgb(var(--color-bg-tertiary) / 0.6)' }}>
-                    <svg className="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24" style={{ color: 'rgb(var(--color-text-tertiary))' }}>
-                      <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M12 4v16m8-8H4" />
-                    </svg>
-                  </div>
-                  <p className="text-sm font-medium" style={{ color: 'rgb(var(--color-text-secondary))' }}>
-                    This flow is empty
-                  </p>
-                  <p className="text-xs mt-1" style={{ color: 'rgb(var(--color-text-tertiary))' }}>
-                    <span className="hidden xl:inline">Drag a node from the palette on the left, or right-click to add one.</span>
-                    <span className="xl:hidden">Tap the + button below to add your first node.</span>
-                  </p>
-                </div>
+            }
+            // Clear transitioning state after viewport is set - use RAF to ensure paint
+            if (flowTransitioning) {
+              requestAnimationFrame(() => finishFlowTransition());
+            }
+          }}
+          onViewportChange={handleViewportChange}
+          nodeTypes={nodeTypes}
+          edgeTypes={edgeTypes}
+          className={`touch-manipulation transition-opacity duration-100 ${flowTransitioning ? 'opacity-0' : 'opacity-100'}`}
+          style={CANVAS_STYLE}
+          defaultEdgeOptions={DEFAULT_EDGE_OPTIONS}
+          edgesReconnectable
+          connectOnClick={true}
+          connectionLineStyle={CONNECTION_LINE_STYLE}
+          connectionLineComponent={TypedConnectionLine}
+          proOptions={PRO_OPTIONS}
+          onPaneClick={handlePaneClick}
+          onPaneContextMenu={handlePaneContextMenu}
+          onConnectStart={handleConnectStart}
+          onConnectEnd={handleConnectEnd}
+          // Backspace deletes the selection only while the canvas is the page
+          // showing: React Flow listens on the whole document.
+          deleteKeyCode={active ? 'Backspace' : null}
+          // Navigation: scroll wheel zooms, left/middle/right-drag to pan
+          panOnScroll={false}
+          panOnDrag
+          zoomOnPinch
+          zoomOnScroll
+          zoomActivationKeyCode={null}
+          preventScrolling
+          // Multi-select: Ctrl+drag creates selection box (overrides pan when Ctrl held)
+          selectionOnDrag
+          selectionKeyCode="Control"
+          multiSelectionKeyCode="Control"
+          elementsSelectable
+          selectNodesOnDrag={false}
+          // Auto-pan when dragging nodes or connections near edges
+          autoPanOnNodeDrag
+          autoPanOnConnect
+          autoPanSpeed={8}
+          // Require minimum movement before starting drag (prevents accidental drags)
+          nodeDragThreshold={3}
+          // Allow connections even when not perfectly aligned
+          connectionMode={ConnectionMode.Loose}
+          // Zoom settings
+          minZoom={0.1}
+          maxZoom={2}
+        // No pan limits - allow free panning in any direction
+        >
+          <Background color="currentColor" style={BACKGROUND_STYLE} gap={20} size={1} />
+          {/* A new flow's hint. Pointer-events none, so it never blocks the
+              canvas; it points at the toolbar's Nodes and the right-click menu. */}
+          {nodes.length === 0 && !flowTransitioning && (
+            <div className="oaiy-canvas-hint">
+              <div>
+                <i><Plus size={18} /></i>
+                <p>This flow is empty</p>
+                <small>
+                  {narrow
+                    ? 'Tap Nodes below to add the first one.'
+                    : 'Add a node from Nodes below: click it, or drag it onto the canvas. Right-click the canvas for more.'}
+                </small>
               </div>
-            )}
-            <Controls
-              className="!bg-white dark:!bg-slate-800 !border-slate-300 dark:!border-slate-700 !rounded-lg [&>button]:!bg-white dark:[&>button]:!bg-slate-800 [&>button]:!border-slate-300 dark:[&>button]:!border-slate-700 [&>button]:!text-slate-500 dark:[&>button]:!text-slate-300 [&>button:hover]:!bg-slate-100 dark:[&>button:hover]:!bg-slate-700"
-              position="bottom-left"
-            />
-            {/* MiniMap with toggle */}
-            <div className="hidden sm:block absolute bottom-4 right-4 z-10">
+            </div>
+          )}
+          <Controls position="bottom-left" />
+          {/* The map, while there is room for it beside the toolbar. */}
+          {mapRoom && (
+            <div className="oaiy-minimap">
               {showMiniMap ? (
-                <div className="relative">
+                <>
                   <button
+                    type="button"
                     onClick={() => setShowMiniMap(false)}
-                    className="absolute -top-1 -right-1 z-20 bg-slate-200 dark:bg-slate-700 hover:bg-slate-300 dark:hover:bg-slate-600 text-slate-500 dark:text-slate-400 hover:text-slate-700 dark:hover:text-slate-200 rounded-full p-0.5 transition-colors"
-                    title="Hide minimap"
+                    className="oaiy-icon-btn"
+                    title="Hide the map"
+                    aria-label="Hide the map"
                   >
-                    <svg className="w-3.5 h-3.5" fill="none" stroke="currentColor" viewBox="0 0 24 24">
-                      <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M6 18L18 6M6 6l12 12" />
-                    </svg>
+                    <X size={12} />
                   </button>
-                  <MiniMap
-                    className="!bg-white dark:!bg-slate-800 !border-slate-300 dark:!border-slate-700 !relative !m-0"
-                    nodeColor={miniMapNodeColor}
-                    maskColor={miniMapMaskColor}
-                  />
-                </div>
+                  <MiniMap nodeColor={miniMapNodeColor} style={MINIMAP_STYLE} />
+                </>
               ) : (
-                <button
-                  onClick={() => setShowMiniMap(true)}
-                  className="bg-white dark:bg-slate-800 hover:bg-slate-100 dark:hover:bg-slate-700 border border-slate-300 dark:border-slate-700 text-slate-500 dark:text-slate-400 hover:text-slate-700 dark:hover:text-slate-200 rounded-lg px-2 py-1.5 text-xs flex items-center gap-1.5 transition-colors"
-                  title="Show minimap"
-                >
-                  <svg className="w-3.5 h-3.5" fill="none" stroke="currentColor" viewBox="0 0 24 24">
-                    <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M9 20l-5.447-2.724A1 1 0 013 16.382V5.618a1 1 0 011.447-.894L9 7m0 13l6-3m-6 3V7m6 10l4.553 2.276A1 1 0 0021 18.382V7.618a1 1 0 00-.553-.894L15 4m0 13V4m0 0L9 7" />
-                  </svg>
-                  Map
+                <button type="button" onClick={() => setShowMiniMap(true)} className="oaiy-map-toggle" title="Show the map">
+                  <MapIcon size={14} /> Map
                 </button>
               )}
             </div>
-          </ReactFlow>
-        )}
+          )}
+        </ReactFlow>
 
         {/* Right-click Context Menu */}
         {contextMenu && (
@@ -1283,374 +1221,177 @@ export default function OAIYBuilder({
           />
         )}
 
-        {/* Mobile Bottom Toolbar - only show when not in data viewer */}
-        {!showDataViewer && (
-          <div className="xl:hidden absolute bottom-4 left-1/2 -translate-x-1/2 z-10 flex items-center gap-2 bg-white/95 dark:bg-slate-800/95 backdrop-blur-sm rounded-full px-2 py-1.5 border border-slate-300 dark:border-slate-700 shadow-lg" role="toolbar" aria-label="Mobile workflow controls">
-            {/* Nodes Button */}
-            <button
-              onClick={() => setPaletteOpen(true)}
-              className="btn btn-ghost btn-icon"
-              title="Add Nodes"
-              aria-label="Add Nodes"
-            >
-              <svg className="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24">
-                <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M12 4v16m8-8H4" />
-              </svg>
+        {/* The canvas's toolbar, the same at every width: the palette, the
+            properties, Run (or Stop), and the log. A macro's own actions join
+            it while one is open. */}
+        <div className={`oaiy-toolbar${tightToolbar ? ' tight' : ''}`} role="toolbar" aria-label="Canvas">
+          <button
+            type="button"
+            onClick={() => setPalette(!paletteOpen)}
+            className={`oaiy-tool${paletteOpen ? ' on' : ''}`}
+            aria-pressed={paletteOpen}
+            aria-label={paletteOpen ? 'Hide the node palette' : 'Show the node palette'}
+            title={paletteOpen ? 'Hide the nodes' : 'Add a node: click one, or drag it onto the canvas'}
+          >
+            <Plus size={16} />
+            <span>Nodes</span>
+          </button>
+          <button
+            type="button"
+            onClick={() => setProps(!propsOpen)}
+            className={`oaiy-tool${propsOpen ? ' on' : ''}`}
+            aria-pressed={propsOpen}
+            aria-label={propsOpen ? 'Hide the properties' : 'Show the properties'}
+            title={selectedNodes.length === 0 ? 'Properties: select a node to set it up' : 'The selected node’s properties'}
+          >
+            <SlidersHorizontal size={16} />
+            <span>Properties</span>
+          </button>
+          <span className="sep" aria-hidden="true" />
+
+          {isMacro && (
+            <span className="oaiy-pill accent" title="This flow is a macro: other flows use it as a node">
+              <Layers size={11} /> macro
+            </span>
+          )}
+          {isMacro && isMacroModified && onSaveMacro && (
+            <button type="button" onClick={onSaveMacro} className="btn" title="Save the macro's changes" aria-label="Save macro changes">
+              <Save size={14} /> Save
             </button>
-            {/* Properties — the only route to a node's settings below lg.
-                Disabled rather than hidden when nothing is selected, so the
-                control does not appear and vanish as selection changes. */}
-            <button
-              onClick={() => setPropsSheetOpen(true)}
-              disabled={selectedNodes.length === 0}
-              className="btn btn-ghost btn-icon disabled:opacity-40"
-              title={selectedNodes.length === 0 ? 'Select a node first' : 'Node properties'}
-              aria-label="Node properties"
-            >
-              <svg className="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24">
-                <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M10.325 4.317c.426-1.756 2.924-1.756 3.35 0a1.724 1.724 0 002.573 1.066c1.543-.94 3.31.826 2.37 2.37a1.724 1.724 0 001.065 2.572c1.756.426 1.756 2.924 0 3.35a1.724 1.724 0 00-1.066 2.573c.94 1.543-.826 3.31-2.37 2.37a1.724 1.724 0 00-2.572 1.065c-.426 1.756-2.924 1.756-3.35 0a1.724 1.724 0 00-2.573-1.066c-1.543.94-3.31-.826-2.37-2.37a1.724 1.724 0 00-1.065-2.572c-1.756-.426-1.756-2.924 0-3.35a1.724 1.724 0 001.066-2.573c-.94-1.543.826-3.31 2.37-2.37.996.608 2.296.07 2.572-1.065z" />
-                <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M15 12a3 3 0 11-6 0 3 3 0 016 0z" />
-              </svg>
+          )}
+          {isMacro && isMacroModified && onRevertMacro && (
+            <button type="button" onClick={onRevertMacro} className="btn btn-warning" title="Go back to the original macro" aria-label="Revert to original macro">
+              <RotateCcw size={14} /> Revert
             </button>
+          )}
 
-            {/* Macro indicator for mobile */}
-            {isMacro && (
-              <div className="flex items-center justify-center w-8 h-8 bg-violet-100 dark:bg-violet-900/50 border border-violet-400 dark:border-violet-600 rounded-full" title="This is a macro">
-                <svg className="w-4 h-4 text-violet-700 dark:text-violet-400" fill="none" stroke="currentColor" viewBox="0 0 24 24">
-                  <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M20 7l-8-4-8 4m16 0l-8 4m8-4v10l-8 4m0-10L4 7m8 4v10M4 7v10l8 4" />
-                </svg>
-              </div>
-            )}
-
-            {/* Run/Stop Button */}
-            {isRunning ? (
-              <button
-                onClick={stopWorkflow}
-                className="btn btn-danger btn-icon rounded-full"
-                title="Stop Workflow"
-                aria-label="Stop Workflow"
-              >
-                <svg className="w-5 h-5" fill="currentColor" viewBox="0 0 20 20">
-                  <path fillRule="evenodd" d="M10 18a8 8 0 100-16 8 8 0 000 16zM8 7a1 1 0 00-1 1v4a1 1 0 001 1h4a1 1 0 001-1V8a1 1 0 00-1-1H8z" clipRule="evenodd" />
-                </svg>
-              </button>
-            ) : isMacro ? (
-              <button
-                onClick={runWorkflow}
-                className="btn btn-icon rounded-full bg-slate-300 dark:bg-slate-700 text-slate-500 dark:text-slate-400 cursor-not-allowed"
-                title="Macros cannot be run directly"
-                aria-label="Macros cannot be run directly"
-              >
-                <svg className="w-5 h-5" fill="currentColor" viewBox="0 0 20 20">
-                  <path fillRule="evenodd" d="M10 18a8 8 0 100-16 8 8 0 000 16zM9.555 7.168A1 1 0 008 8v4a1 1 0 001.555.832l3-2a1 1 0 000-1.664l-3-2z" clipRule="evenodd" />
-                </svg>
-              </button>
-            ) : nodes.length === 0 ? (
-              // Empty flow → disabled button with a tooltip explaining why,
-              // saves the user a click+toast roundtrip vs the "Cannot run
-              // empty workflow" warning that fires inside runWorkflow.
-              <button
-                disabled
-                className="btn btn-icon rounded-full bg-slate-300 dark:bg-slate-700 text-slate-500 dark:text-slate-400 cursor-not-allowed"
-                title="Add at least one node before running"
-                aria-label="Run Workflow (disabled — empty flow)"
-              >
-                <svg className="w-5 h-5" fill="currentColor" viewBox="0 0 20 20">
-                  <path fillRule="evenodd" d="M10 18a8 8 0 100-16 8 8 0 000 16zM9.555 7.168A1 1 0 008 8v4a1 1 0 001.555.832l3-2a1 1 0 000-1.664l-3-2z" clipRule="evenodd" />
-                </svg>
-              </button>
-            ) : (
-              <button
-                onClick={runWorkflow}
-                className="btn btn-primary btn-icon rounded-full"
-                title="Run Workflow"
-                aria-label="Run Workflow"
-              >
-                <svg className="w-5 h-5" fill="currentColor" viewBox="0 0 20 20">
-                  <path fillRule="evenodd" d="M10 18a8 8 0 100-16 8 8 0 000 16zM9.555 7.168A1 1 0 008 8v4a1 1 0 001.555.832l3-2a1 1 0 000-1.664l-3-2z" clipRule="evenodd" />
-                </svg>
-              </button>
-            )}
-
-            {/* Logs Button */}
-            <button
-              onClick={() => setLogsOpen(true)}
-              className="btn btn-ghost btn-icon relative"
-              title="View Logs"
-              aria-label="View Logs"
-            >
-              <svg className="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24">
-                <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M9 5H7a2 2 0 00-2 2v12a2 2 0 002 2h10a2 2 0 002-2V7a2 2 0 00-2-2h-2M9 5a2 2 0 002 2h2a2 2 0 002-2M9 5a2 2 0 012-2h2a2 2 0 012 2" />
-              </svg>
-              {logs.length > 0 && (
-                <span className="absolute -top-1 -right-1 badge badge-blue text-[9px] min-w-4 h-4 justify-center">
-                  {logs.length > 9 ? '9+' : logs.length}
-                </span>
-              )}
+          {isRunning ? (
+            <button type="button" onClick={stopWorkflow} className="btn btn-danger solid" aria-label="Stop Workflow" title="Stop the flow">
+              <Square size={13} fill="currentColor" /> Stop
             </button>
-          </div>
-        )}
-
-        {/* Desktop Floating Action Bar - only show when not in data viewer */}
-        {!showDataViewer && (
-          <div className={`hidden xl:flex absolute right-4 z-10 items-center gap-3 ${packageMode ? 'top-8' : 'top-4'}`} role="toolbar" aria-label="Workflow controls">
-            {/* Macro controls - only show when modified */}
-            {isMacro && isMacroModified && (
-              <div className="flex items-center gap-2">
-                {/* Save Changes button */}
-                {onSaveMacro && (
-                  <button
-                    onClick={onSaveMacro}
-                    className="flex items-center gap-2 bg-green-600 hover:bg-green-500 text-white px-3 py-2 rounded-lg shadow-lg text-sm font-medium"
-                    title="Save macro changes"
-                    aria-label="Save macro changes"
-                  >
-                    <svg className="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24">
-                      <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M8 7H5a2 2 0 00-2 2v9a2 2 0 002 2h14a2 2 0 002-2V9a2 2 0 00-2-2h-3m-1 4l-3 3m0 0l-3-3m3 3V4" />
-                    </svg>
-                    Save
-                  </button>
-                )}
-                {/* Revert button */}
-                {onRevertMacro && (
-                  <button
-                    onClick={onRevertMacro}
-                    className="flex items-center gap-2 bg-amber-600 hover:bg-amber-500 text-white px-3 py-2 rounded-lg shadow-lg text-sm font-medium"
-                    title="Revert to original macro"
-                    aria-label="Revert to original macro"
-                  >
-                    <svg className="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24">
-                      <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M4 4v5h.582m15.356 2A8.001 8.001 0 004.582 9m0 0H9m11 11v-5h-.581m0 0a8.003 8.003 0 01-15.357-2m15.357 2H15" />
-                    </svg>
-                    Revert
-                  </button>
-                )}
-              </div>
-            )}
-            {/* Run/Stop Button */}
-            {isRunning ? (
-              <button
-                onClick={stopWorkflow}
-                className="btn btn-danger btn-lg shadow-lg hover:shadow-red-500/25"
-                aria-label="Stop Workflow"
-              >
-                <svg className="w-4 h-4" fill="currentColor" viewBox="0 0 20 20">
-                  <path fillRule="evenodd" d="M10 18a8 8 0 100-16 8 8 0 000 16zM8 7a1 1 0 00-1 1v4a1 1 0 001 1h4a1 1 0 001-1V8a1 1 0 00-1-1H8z" clipRule="evenodd" />
-                </svg>
-                Stop
-              </button>
-            ) : isMacro ? (
-              <button
-                onClick={onRunMacro}
-                className="btn btn-lg shadow-lg bg-violet-600 hover:bg-violet-500 text-white hover:shadow-violet-500/25"
-                aria-label="Run Macro"
-                title="Run this macro with custom inputs"
-              >
-                <svg className="w-4 h-4" fill="currentColor" viewBox="0 0 20 20">
-                  <path fillRule="evenodd" d="M10 18a8 8 0 100-16 8 8 0 000 16zM9.555 7.168A1 1 0 008 8v4a1 1 0 001.555.832l3-2a1 1 0 000-1.664l-3-2z" clipRule="evenodd" />
-                </svg>
-                Run Macro
-              </button>
-            ) : nodes.length === 0 ? (
-              <button
-                disabled
-                className="btn btn-lg bg-slate-300 dark:bg-slate-700 text-slate-500 dark:text-slate-400 cursor-not-allowed"
-                title="Add at least one node before running"
-                aria-label="Run Workflow (disabled — empty flow)"
-              >
-                <svg className="w-4 h-4" fill="currentColor" viewBox="0 0 20 20">
-                  <path fillRule="evenodd" d="M10 18a8 8 0 100-16 8 8 0 000 16zM9.555 7.168A1 1 0 008 8v4a1 1 0 001.555.832l3-2a1 1 0 000-1.664l-3-2z" clipRule="evenodd" />
-                </svg>
-                Run
-              </button>
-            ) : (
-              <button
-                onClick={runWorkflow}
-                className="btn btn-primary btn-lg shadow-lg hover:shadow-blue-500/25"
-                aria-label="Run Workflow"
-              >
-                <svg className="w-4 h-4" fill="currentColor" viewBox="0 0 20 20">
-                  <path fillRule="evenodd" d="M10 18a8 8 0 100-16 8 8 0 000 16zM9.555 7.168A1 1 0 008 8v4a1 1 0 001.555.832l3-2a1 1 0 000-1.664l-3-2z" clipRule="evenodd" />
-                </svg>
-                Run
-              </button>
-            )}
-          </div>
-        )}
-
-        {/* Package Mode Banner - thin bar at top */}
-        {packageMode && (
-          <div className="absolute top-0 left-0 right-0 z-20 flex justify-center pointer-events-none">
-            <div className="bg-purple-600/95 backdrop-blur-sm rounded-b-md shadow-lg px-3 py-1 flex items-center gap-2 pointer-events-auto">
-              <svg className="w-3.5 h-3.5 text-purple-200 flex-shrink-0" fill="none" stroke="currentColor" viewBox="0 0 24 24">
-                <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M20 7l-8-4-8 4m16 0l-8 4m8-4v10l-8 4m0-10L4 7m8 4v10M4 7v10l8 4" />
-              </svg>
-              <span className="text-white text-xs font-medium">{packageMode.manifest.name}</span>
-              <span className="text-purple-200 text-[10px]">v{packageMode.manifest.version}</span>
-              {onReloadPackage && (
-                <button
-                  onClick={onReloadPackage}
-                  className="p-0.5 hover:bg-purple-500 rounded transition-colors text-purple-200 hover:text-white"
-                  title="Reload package (Ctrl+Shift+R)"
-                >
-                  <svg className="w-3 h-3" fill="none" stroke="currentColor" viewBox="0 0 24 24">
-                    <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M4 4v5h.582m15.356 2A8.001 8.001 0 004.582 9m0 0H9m11 11v-5h-.581m0 0a8.003 8.003 0 01-15.357-2m15.357 2H15" />
-                  </svg>
-                </button>
-              )}
-              {onClosePackage && (
-                <button
-                  onClick={onClosePackage}
-                  className="p-0.5 hover:bg-purple-500 rounded transition-colors text-purple-200 hover:text-white"
-                  title="Close package"
-                >
-                  <svg className="w-3 h-3" fill="none" stroke="currentColor" viewBox="0 0 24 24">
-                    <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M6 18L18 6M6 6l12 12" />
-                  </svg>
-                </button>
-              )}
-            </div>
-          </div>
-        )}
-
-      </div>
-
-      {/* Right Panel - Properties & Log Console (stacked) */}
-      {!showDataViewer && (
-        <div className="hidden xl:flex flex-col h-full border-l border-[rgb(var(--color-border-primary))] w-72 2xl:w-80 bg-white/50 dark:bg-slate-900/50 backdrop-blur-sm z-20 transition-all duration-300">
-
-          {/* Properties Panel or Selection List (Top, Flex-Grow)
-              The collapse button lives in a thin header bar that's
-              visible in both states so you always have a target to
-              click. When collapsed, only the header remains and the
-              log console takes the freed vertical space. */}
-          {propertiesVisible ? (
-            <div className="flex-1 min-h-0 overflow-hidden flex flex-col">
-              <div className="flex items-center justify-between px-2 py-1 bg-slate-100/50 dark:bg-slate-800/30 border-b border-slate-200 dark:border-slate-700/50 flex-shrink-0">
-                <span className="text-[11px] font-medium text-slate-500 dark:text-slate-400 uppercase tracking-wider px-1">
-                  Properties
-                </span>
-                <button
-                  type="button"
-                  onClick={togglePropertiesVisible}
-                  className="p-1 rounded hover:bg-slate-200 dark:hover:bg-slate-700 text-slate-400 dark:text-slate-500 hover:text-slate-700 dark:hover:text-slate-200 transition-colors"
-                  title="Collapse properties"
-                  aria-label="Collapse properties"
-                >
-                  <svg className="w-3.5 h-3.5" fill="none" stroke="currentColor" viewBox="0 0 24 24">
-                    <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M19 9l-7 7-7-7" />
-                  </svg>
-                </button>
-              </div>
-              <div className="flex-1 min-h-0 overflow-hidden">
-            {selectedNodes.length > 1 ? (
-              // Multi-selection list
-              <div className="flex flex-col h-full bg-white/50 dark:bg-slate-900/50 backdrop-blur-sm">
-                {/* Header */}
-                <div className="p-3 border-b border-slate-200 dark:border-slate-700/50 flex items-center gap-2 bg-slate-100/50 dark:bg-slate-800/30">
-                  <svg className="w-5 h-5 text-blue-400" fill="none" stroke="currentColor" viewBox="0 0 24 24">
-                    <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M4 6h16M4 10h16M4 14h16M4 18h16" />
-                  </svg>
-                  <div>
-                    <h2 className="font-bold text-slate-700 dark:text-slate-100 text-sm">{selectedNodes.length} Nodes Selected</h2>
-                    <div className="text-[10px] text-slate-500 dark:text-slate-400">Ctrl+C to copy, Delete to remove</div>
-                  </div>
-                </div>
-                {/* Node list */}
-                <div className="flex-1 overflow-y-auto p-2 space-y-1 custom-scrollbar">
-                  {selectedNodes.map((node) => {
-                    const def = node.data.__definition as { name?: string; color?: string; icon?: string } | undefined;
-                    const nodeName = def?.name || node.type || 'Unknown';
-                    const nodeColor = def?.color || 'slate';
-                    return (
-                      <div
-                        key={node.id}
-                        className="flex items-center gap-2 px-3 py-2 rounded-md bg-slate-100 dark:bg-slate-800/50 hover:bg-slate-200 dark:hover:bg-slate-700/50 transition-colors cursor-pointer"
-                        onClick={() => {
-                          // Deselect all others and select just this one
-                          setNodes(nds => nds.map(n => ({ ...n, selected: n.id === node.id })));
-                        }}
-                      >
-                        <div className={`w-2 h-6 rounded-full ${SWATCH_CLASS[nodeColor] ?? 'bg-slate-500'}`} />
-                        <div className="flex-1 min-w-0">
-                          <div className="text-sm text-slate-700 dark:text-slate-200 truncate">{nodeName}</div>
-                          <div className="text-[10px] text-slate-500 dark:text-slate-400 font-mono truncate">{node.id}</div>
-                        </div>
-                      </div>
-                    );
-                  })}
-                </div>
-              </div>
-            ) : (
-              <PropertiesPanel
-                selectedNode={selectedNodes[0] || null}
-                updateNodeData={updateNodeData}
-              />
-            )}
-              </div>
-            </div>
+          ) : isMacro ? (
+            <button
+              type="button"
+              onClick={onRunMacro}
+              disabled={!onRunMacro}
+              className="btn btn-primary"
+              aria-label="Run Macro"
+              title="Run this macro with inputs of your own"
+            >
+              <Play size={13} fill="currentColor" /> Run macro
+            </button>
           ) : (
             <button
               type="button"
-              onClick={togglePropertiesVisible}
-              className="flex items-center justify-between px-3 py-1.5 bg-white dark:bg-slate-900 border-b border-slate-200 dark:border-slate-700 text-slate-500 dark:text-slate-400 hover:text-slate-700 dark:hover:text-slate-200 hover:bg-slate-100 dark:hover:bg-slate-800 transition-colors text-xs flex-shrink-0"
-              title="Show properties"
+              onClick={runWorkflow}
+              disabled={nodes.length === 0}
+              className="btn btn-primary"
+              aria-label={nodes.length === 0 ? 'Run Workflow (disabled — empty flow)' : 'Run Workflow'}
+              title={nodes.length === 0 ? 'Add at least one node before running' : 'Run the flow'}
             >
-              <span className="flex items-center gap-2">
-                <svg className="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24">
-                  <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M9 5l7 7-7 7" />
-                </svg>
-                <span>Properties</span>
-              </span>
-              {selectedNodes.length > 0 && (
-                <span className="text-[10px] text-slate-400 dark:text-slate-500">
-                  ({selectedNodes.length} selected)
-                </span>
-              )}
+              <Play size={13} fill="currentColor" /> Run
             </button>
           )}
 
-          {/* Log Console (Bottom, Fixed or Flex)
-              When properties is also collapsed, drop the h-1/3 cap
-              and let the log flex into the freed space. */}
-          {logPanelVisible ? (
-            <div className={`${propertiesVisible ? 'h-1/3 min-h-[200px]' : 'flex-1 min-h-0'} flex flex-col border-t border-slate-300 dark:border-slate-700 shadow-[0_-4px_6px_-1px_rgba(0,0,0,0.1)] dark:shadow-[0_-4px_6px_-1px_rgba(0,0,0,0.3)]`}>
-              {/* Re-using existing LogConsole component but embedded */}
-              <LogConsole
-                logs={logs}
-                onClear={clearLogs}
-                isOpen={true}
-                onClose={() => setLogPanelVisible(false)}
-                className="h-full !border-0 !rounded-none" // Override generic modal/panel styles if needed
-              />
-            </div>
-          ) : (
-            /* Collapsed log panel - small expand button */
-            <button
-              onClick={() => setLogPanelVisible(true)}
-              className="flex items-center gap-2 px-3 py-1.5 bg-white dark:bg-slate-900 border-t border-slate-200 dark:border-slate-700 text-slate-500 dark:text-slate-400 hover:text-slate-700 dark:hover:text-slate-200 hover:bg-slate-100 dark:hover:bg-slate-800 transition-colors text-xs"
-              title="Show execution log"
-            >
-              <svg className="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24">
-                <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M5 15l7-7 7 7" />
-              </svg>
-              <span>Execution Log</span>
-              <span className="text-slate-500 dark:text-slate-400">({logs.length})</span>
-            </button>
-          )}
+          <span className="sep" aria-hidden="true" />
+          <button
+            type="button"
+            onClick={() => setLog(!logOpen)}
+            className={`oaiy-tool${logOpen ? ' on' : ''}`}
+            aria-pressed={logOpen}
+            aria-label={logOpen ? 'Hide the log' : 'Show the log'}
+            title="The execution log"
+          >
+            <ScrollText size={16} />
+            <span>Log</span>
+            {logs.length > 0 && !logOpen && <em>{logs.length > 99 ? '99+' : logs.length}</em>}
+          </button>
         </div>
-      )}
 
-      {/* Mobile Log Console (drawer) */}
-      {!showDataViewer && (
-        <div className="xl:hidden">
-          <LogConsole
-            logs={logs}
-            onClear={clearLogs}
-            isOpen={logsOpen}
-            onClose={() => setLogsOpen(false)}
-          />
-        </div>
+        {/* A package's flow: which package, and its reload and close. */}
+        {packageMode && (
+          <div className="oaiy-canvas-banner">
+            <PackageIcon size={14} />
+            <span>{packageMode.manifest.name}</span>
+            <small>v{packageMode.manifest.version}</small>
+            {onReloadPackage && (
+              <button type="button" onClick={onReloadPackage} className="oaiy-icon-btn sm" title="Reload package (Ctrl+Shift+R)" aria-label="Reload package">
+                <RefreshCw size={13} />
+              </button>
+            )}
+            {onClosePackage && (
+              <button type="button" onClick={onClosePackage} className="oaiy-icon-btn sm" title="Close package" aria-label="Close package">
+                <X size={13} />
+              </button>
+            )}
+          </div>
+        )}
+      </div>
+
+      {/* Right: the inspector, the palette's sibling — the selected node's
+          properties above the execution log. */}
+      {inspectorOpen && (
+        <aside className="oaiy-side right" aria-label="Inspector">
+          <div className="oaiy-side-split">
+            {propsOpen && (
+              <section className="grow">
+                <div className="oaiy-side-head">
+                  <h2>
+                    Properties
+                    {selectedNodes.length > 1 && <small>{selectedNodes.length} selected</small>}
+                  </h2>
+                  <div className="oaiy-side-tools">
+                    <button type="button" onClick={() => setProps(false)} className="oaiy-icon-btn" title="Hide the properties" aria-label="Hide the properties">
+                      <X size={15} />
+                    </button>
+                  </div>
+                </div>
+                <div className="oaiy-side-body">
+                  {selectedNodes.length > 1 ? (
+                    <div className="flex flex-col gap-2 p-3">
+                      <p className="oaiy-help faint px-1">Ctrl+C copies them, Delete removes them. Pick one to set it up.</p>
+                      <ul className="m-0 flex list-none flex-col gap-1 p-0">
+                        {selectedNodes.map((node) => {
+                          const def = node.data.__definition as { name?: string; color?: string; icon?: string } | undefined;
+                          const nodeName = def?.name || node.type || 'Unknown';
+                          const nodeColor = def?.color || 'slate';
+                          return (
+                            <li key={node.id}>
+                              <button
+                                type="button"
+                                className="oaiy-node-item w-full text-left"
+                                onClick={() => {
+                                  // Deselect all others and select just this one
+                                  setNodes(nds => nds.map(n => ({ ...n, selected: n.id === node.id })));
+                                }}
+                              >
+                                <span className={`h-6 w-1.5 shrink-0 rounded-full ${SWATCH_CLASS[nodeColor] ?? SWATCH_CLASS.slate}`} />
+                                <span className="oaiy-node-text">
+                                  <strong>{nodeName}</strong>
+                                  <small className="font-mono">{node.id}</small>
+                                </span>
+                              </button>
+                            </li>
+                          );
+                        })}
+                      </ul>
+                    </div>
+                  ) : (
+                    <PropertiesPanel
+                      selectedNode={selectedNodes[0] || null}
+                      updateNodeData={updateNodeData}
+                    />
+                  )}
+                </div>
+              </section>
+            )}
+            {logOpen && (
+              <section className={`log${propsOpen ? '' : ' alone'}`}>
+                <LogConsole logs={logs} onClear={clearLogs} onClose={() => setLog(false)} />
+              </section>
+            )}
+          </div>
+        </aside>
       )}
 
       {/* ComfyUI Workflow Configuration Dialog (rendered here to escape React Flow transform context) */}

@@ -1,7 +1,6 @@
 import { memo, useState, useEffect, useCallback, useRef, useMemo } from 'react';
 import { createPortal } from 'react-dom';
-import { useFocusTrap } from '../../hooks/useFocusTrap';
-import { useMediaQuery } from '../../hooks/useMediaQuery';
+import { ChevronRight, ChevronsDownUp, ChevronsUpDown, Layers, Package, Search, X } from 'lucide-react';
 import type { NodeType, Flow } from 'oaiy-core';
 import { useModuleNodes, getNodeColorClasses, getNodeIcon } from '../../hooks/useModuleNodes';
 import type { PackageNodeInfo } from '../../hooks/usePackageNodes';
@@ -15,12 +14,19 @@ export interface MacroNodeData {
   _macroOutputs: Array<{ id: string; name: string; type: string }>;
 }
 
+/**
+ * The node palette: a side panel docked beside the canvas (the inspector's
+ * sibling on the left), with a search, and the node kinds in collapsible
+ * categories with their counts. Click a node to add it at the middle of the
+ * canvas, or drag it to where it goes.
+ */
 interface NodePaletteProps {
-  docked?: boolean;
   onAddNode: (type: NodeType) => void;
   onAddNodeAtPosition?: (type: NodeType, x: number, y: number) => void;
-  isOpen: boolean;
+  /** Hide the palette (its close button). */
   onClose: () => void;
+  /** Close after a click adds a node: on a phone, where the panel lies over the canvas. */
+  closeOnAdd?: boolean;
   // Macro support
   macros?: Flow[];
   onAddMacro?: (macroData: MacroNodeData) => void;
@@ -49,20 +55,7 @@ export function clearGlobalDragState() {
   globalDragState = { isDragging: false, nodeType: null, macroData: null };
 }
 
-function NodePalette({ docked = false, onAddNode, onAddNodeAtPosition, isOpen, onClose, macros, onAddMacro, onAddMacroAtPosition, activePackageId, packageNodes }: NodePaletteProps) {
-  const panelRef = useRef<HTMLDivElement>(null);
-  const closeRef = useRef<HTMLButtonElement>(null);
-  const compact = useMediaQuery('(width < 1280px)');
-  useFocusTrap(panelRef, !docked && compact && isOpen, closeRef);
-  useEffect(() => {
-    if (docked || !isOpen) return;
-    if (!compact) { onClose(); return; }
-    const onKey = (event: KeyboardEvent) => {
-      if (event.key === 'Escape') { event.preventDefault(); onClose(); }
-    };
-    document.addEventListener('keydown', onKey);
-    return () => document.removeEventListener('keydown', onKey);
-  }, [docked, compact, isOpen, onClose]);
+function NodePalette({ onAddNode, onAddNodeAtPosition, onClose, closeOnAdd = false, macros, onAddMacro, onAddMacroAtPosition, activePackageId, packageNodes }: NodePaletteProps) {
   const { groupedNodes, isLoading, error, nodes } = useModuleNodes({
     activePackageId,
     packageNodes,
@@ -250,11 +243,8 @@ function NodePalette({ docked = false, onAddNode, onAddNodeAtPosition, isOpen, o
       return;
     }
     onAddNode(type);
-    // Close on mobile after adding
-    if (!docked && compact) {
-      onClose();
-    }
-  }, [draggingType, onAddNode, onClose, docked, compact]);
+    if (closeOnAdd) onClose();
+  }, [draggingType, onAddNode, onClose, closeOnAdd]);
 
   // Get the label for the dragging type
   const getDragLabel = useCallback((type: NodeType) => {
@@ -444,198 +434,95 @@ function NodePalette({ docked = false, onAddNode, onAddNodeAtPosition, isOpen, o
     if (onAddMacro) {
       onAddMacro(createMacroNodeData(macro));
     }
-    if (!docked && compact) {
-      onClose();
-    }
-  }, [draggingMacro, onAddMacro, createMacroNodeData, onClose, docked, compact]);
+    if (closeOnAdd) onClose();
+  }, [draggingMacro, onAddMacro, createMacroNodeData, onClose, closeOnAdd]);
+
+  const total = filteredGroupedNodes.reduce((n, g) => n + g.nodes.length, 0) + filteredMacros.length;
 
   return (
-    <>
-      {/* Mobile overlay */}
-      {isOpen && (
-        <div
-          className="xl:hidden fixed inset-0 bg-black/50 z-40"
-          onClick={onClose}
-        />
-      )}
-
-      {/* Palette panel */}
-      <div
-        ref={panelRef}
-        inert={!docked && !isOpen}
-        aria-hidden={!docked && !isOpen ? true : undefined}
-        role={!docked ? 'dialog' : undefined}
-        aria-modal={!docked && isOpen ? true : undefined}
-        aria-label="Node palette"
-        className={`
-          fixed xl:relative z-50 xl:z-auto left-0 xl:left-auto inset-y-0 xl:inset-y-auto
-          h-full bg-white dark:bg-slate-900 border-r border-[rgb(var(--color-border-primary))] flex flex-col
-          transition-transform duration-300 ease-in-out
-          w-full xl:w-56 2xl:w-64
-          ${isOpen ? 'translate-x-0' : '-translate-x-full xl:translate-x-0'}
-        `}
-      >
-        {/* Header */}
-        <div className="p-3 border-b border-slate-200 dark:border-slate-800">
-          <div className="flex items-center justify-between mb-2">
-            <div>
-              <h2 className="text-slate-700 dark:text-slate-200 font-semibold text-sm">Node Palette</h2>
-            </div>
-            {/* Close button for mobile */}
-            <button
-              ref={closeRef}
-              onClick={onClose}
-              className="xl:hidden min-h-11 min-w-11 inline-flex items-center justify-center hover:bg-slate-100 dark:hover:bg-slate-800 rounded transition-colors"
-              aria-label="Close node palette"
-            >
-              <svg className="w-5 h-5 text-slate-500 dark:text-slate-400" fill="none" stroke="currentColor" viewBox="0 0 24 24">
-                <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M6 18L18 6M6 6l12 12" />
-              </svg>
-            </button>
-          </div>
-
-          {/* Search box */}
-          <div className="relative mb-2">
-            <svg className="absolute left-3 top-1/2 -translate-y-1/2 w-4 h-4 text-slate-500 transition-colors" fill="none" stroke="currentColor" viewBox="0 0 24 24">
-              <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M21 21l-6-6m2-5a7 7 0 11-14 0 7 7 0 0114 0z" />
-            </svg>
-            <input
-              ref={searchInputRef}
-              type="text"
-              value={searchQuery}
-              onChange={(e) => setSearchQuery(e.target.value)}
-              placeholder="Search nodes..."
-              aria-label="Search nodes"
-              className="input pl-9 pr-9 py-2"
-            />
-            {searchQuery && (
-              <button
-                onClick={() => setSearchQuery('')}
-                className="absolute right-2 top-1/2 -translate-y-1/2 p-1 text-slate-400 dark:text-slate-500 hover:text-slate-600 dark:hover:text-slate-300 hover:bg-slate-200 dark:hover:bg-slate-700 rounded transition-all"
-                aria-label="Clear search"
-              >
-                <svg className="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24">
-                  <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M6 18L18 6M6 6l12 12" />
-                </svg>
-              </button>
-            )}
-          </div>
-
-          {/* Expand/Collapse buttons */}
-          <div className="flex gap-1.5">
-            <button
-              onClick={expandAll}
-              className="btn btn-ghost btn-sm flex-1"
-              title="Expand all categories"
-            >
-              Expand All
-            </button>
-            <button
-              onClick={collapseAll}
-              className="btn btn-ghost btn-sm flex-1"
-              title="Collapse all categories"
-            >
-              Collapse All
-            </button>
-          </div>
+    <aside className="oaiy-side left" aria-label="Node palette" data-testid="node-palette">
+      <div className="oaiy-side-head">
+        <h2>
+          Nodes <small>{total}</small>
+        </h2>
+        <div className="oaiy-side-tools">
+          <button type="button" onClick={expandAll} className="oaiy-icon-btn" title="Open every category" aria-label="Expand all categories">
+            <ChevronsUpDown size={15} />
+          </button>
+          <button type="button" onClick={collapseAll} className="oaiy-icon-btn" title="Close every category" aria-label="Collapse all categories">
+            <ChevronsDownUp size={15} />
+          </button>
+          <button type="button" onClick={onClose} className="oaiy-icon-btn" title="Hide the nodes" aria-label="Close node palette">
+            <X size={15} />
+          </button>
         </div>
+      </div>
 
-        {/* Node List */}
-        <div className="flex-1 overflow-y-auto p-2 sm:p-3 space-y-2">
-          {isLoading ? (
-            <div className="empty-state py-12">
-              <div className="animate-spin rounded-full h-8 w-8 border-2 border-slate-600" style={{ borderTopColor: 'rgb(var(--accent-primary))' }}></div>
-              <p className="text-slate-500 text-sm mt-3">Loading nodes...</p>
-            </div>
-          ) : error ? (
-            <div className="empty-state py-8">
-              <svg className="empty-state-icon text-red-400" fill="none" stroke="currentColor" viewBox="0 0 24 24">
-                <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M12 9v2m0 4h.01m-6.938 4h13.856c1.54 0 2.502-1.667 1.732-3L13.732 4c-.77-1.333-2.694-1.333-3.464 0L3.34 16c-.77 1.333.192 3 1.732 3z" />
-              </svg>
-              <p className="empty-state-title text-red-400">Failed to load nodes</p>
-              <p className="empty-state-description">{error}</p>
-            </div>
-          ) : filteredGroupedNodes.length === 0 ? (
-            <div className="empty-state py-8 animate-fadeIn">
-              <svg className="empty-state-icon" fill="none" stroke="currentColor" viewBox="0 0 24 24">
-                <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M21 21l-6-6m2-5a7 7 0 11-14 0 7 7 0 0114 0z" />
-              </svg>
-              <p className="empty-state-title">
-                {searchQuery ? 'No matches found' : 'No nodes available'}
-              </p>
-              <p className="empty-state-description">
-                {searchQuery ? `Try searching for something else` : 'Check your module configuration'}
-              </p>
-            </div>
-          ) : (
-            filteredGroupedNodes.map((group) => {
-              const isExpanded = expandedCategories.has(group.category);
-              const isPackageCategory = group.category === 'Package';
-              const hasPackageNodes = group.nodes.some(n => n.isPackageNode);
-              return (
-                <div key={group.category} className={`space-y-1 ${isPackageCategory ? 'mb-3' : ''}`}>
-                  {/* Special header for Package category */}
-                  {isPackageCategory ? (
-                    <div className="bg-gradient-to-r from-purple-100 to-purple-50 dark:from-purple-900/40 dark:to-purple-900/20 rounded-lg p-2 mb-2 border border-purple-200 dark:border-purple-500/30">
-                      <button
-                        onClick={() => toggleCategory(group.category)}
-                        className="w-full flex items-center gap-2 text-purple-700 dark:text-purple-300 hover:text-purple-800 dark:hover:text-purple-200 transition-colors"
-                        aria-expanded={isExpanded}
-                        aria-label={`${isExpanded ? 'Collapse' : 'Expand'} ${group.label} category`}
-                      >
-                        <svg
-                          className={`w-3 h-3 transition-transform ${isExpanded ? 'rotate-90' : ''}`}
-                          fill="none"
-                          stroke="currentColor"
-                          viewBox="0 0 24 24"
-                          aria-hidden="true"
-                        >
-                          <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M9 5l7 7-7 7" />
-                        </svg>
-                        <div className="w-6 h-6 rounded-md bg-purple-500/20 flex items-center justify-center">
-                          <svg className="w-3.5 h-3.5" fill="none" stroke="currentColor" viewBox="0 0 24 24">
-                            <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M20 7l-8-4-8 4m16 0l-8 4m8-4v10l-8 4m0-10L4 7m8 4v10M4 7v10l8 4" />
-                          </svg>
-                        </div>
-                        <span className="text-xs font-semibold uppercase tracking-wide whitespace-nowrap truncate min-w-0" title={group.label}>{group.label}</span>
-                        <span className="text-[10px] px-1.5 py-0.5 rounded-full bg-purple-200 dark:bg-purple-500/30 text-purple-600 dark:text-purple-300 font-medium">{group.nodes.length}</span>
-                      </button>
-                    </div>
-                  ) : (
-                  /* Category Header */
-                  <button
-                    onClick={() => toggleCategory(group.category)}
-                    className={`w-full flex items-center gap-2 px-2 py-1.5 text-left transition-colors ${
-                      hasPackageNodes
-                        ? 'text-purple-600 dark:text-purple-400 hover:text-purple-700 dark:hover:text-purple-200'
-                        : 'text-slate-500 dark:text-slate-400 hover:text-slate-700 dark:hover:text-slate-200'
-                    }`}
-                    aria-expanded={isExpanded}
-                    aria-label={`${isExpanded ? 'Collapse' : 'Expand'} ${group.label} category`}
-                  >
-                    <svg
-                      className={`w-3 h-3 transition-transform ${isExpanded ? 'rotate-90' : ''}`}
-                      fill="none"
-                      stroke="currentColor"
-                      viewBox="0 0 24 24"
-                      aria-hidden="true"
-                    >
-                      <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M9 5l7 7-7 7" />
-                    </svg>
-                    <span className="text-xs font-medium uppercase tracking-wide whitespace-nowrap truncate min-w-0" title={group.label}>{group.label}</span>
-                    <span className="text-slate-500 dark:text-slate-600 text-xs flex-shrink-0">({group.nodes.length})</span>
-                  </button>
-                  )}
+      <div className="oaiy-side-sub">
+        <div className="oaiy-search">
+          <Search size={14} />
+          <input
+            ref={searchInputRef}
+            type="search"
+            value={searchQuery}
+            onChange={(e) => setSearchQuery(e.target.value)}
+            onKeyDown={(e) => { if (e.key === 'Escape' && searchQuery) { e.stopPropagation(); setSearchQuery(''); } }}
+            placeholder="Search nodes"
+            aria-label="Search nodes"
+            className="oaiy-input"
+          />
+          {searchQuery && (
+            <button type="button" onClick={() => setSearchQuery('')} aria-label="Clear search">
+              <X size={13} />
+            </button>
+          )}
+        </div>
+      </div>
 
-                  {/* Category Nodes */}
-                  {isExpanded && (
-                    <div className="space-y-2 pl-1 animate-slideDown">
-                      {group.nodes.map((node, index) => {
-                        const colors = getNodeColorClasses(node.definition.color);
-                        const nodeType = node.definition.id as NodeType;
-                        return (
+      {/* Node List */}
+      <div className="oaiy-side-body py-1">
+        {isLoading ? (
+          <div className="oaiy-empty bare">
+            <span className="oaiy-spinner" aria-hidden="true" />
+            <p className="oaiy-empty-text">Loading nodes…</p>
+          </div>
+        ) : error ? (
+          <div className="oaiy-empty bare">
+            <p className="oaiy-empty-title">The nodes did not load</p>
+            <p className="oaiy-empty-text">{error}</p>
+          </div>
+        ) : filteredGroupedNodes.length === 0 && filteredMacros.length === 0 ? (
+          <div className="oaiy-empty bare">
+            <Search size={22} />
+            <p className="oaiy-empty-title">{searchQuery ? 'No node matches' : 'No nodes'}</p>
+            <p className="oaiy-empty-text">{searchQuery ? 'Try another word.' : 'None of the modules offers a node.'}</p>
+          </div>
+        ) : (
+          filteredGroupedNodes.map((group) => {
+            const isExpanded = expandedCategories.has(group.category);
+            const isPackageCategory = group.category === 'Package' || group.nodes.some(n => n.isPackageNode);
+            return (
+              <div key={group.category} className={`oaiy-cat${isPackageCategory ? ' pkg' : ''}`}>
+                <button
+                  type="button"
+                  onClick={() => toggleCategory(group.category)}
+                  aria-expanded={isExpanded}
+                  aria-label={`${isExpanded ? 'Collapse' : 'Expand'} ${group.label} category`}
+                >
+                  <ChevronRight size={13} aria-hidden="true" />
+                  {group.category === 'Package' && <Package size={13} aria-hidden="true" />}
+                  <span title={group.label}>{group.label}</span>
+                  <small>{group.nodes.length}</small>
+                </button>
+
+                {isExpanded && (
+                  <ul>
+                    {group.nodes.map((node) => {
+                      const colors = getNodeColorClasses(node.definition.color);
+                      const nodeType = node.definition.id as NodeType;
+                      return (
+                        <li key={node.definition.id}>
                           <div
-                            key={node.definition.id}
                             ref={(el) => {
                               if (el) nodeElementRefs.current.set(node.definition.id, el);
                             }}
@@ -655,77 +542,50 @@ function NodePalette({ docked = false, onAddNode, onAddNodeAtPosition, isOpen, o
                             onFocus={(e) => handleNodeMouseEnter(node, e.currentTarget)}
                             onBlur={handleNodeMouseLeave}
                             aria-label={`Add ${node.definition.name} node`}
-                            className={`
-                              ${colors.bg} ${colors.border}
-                              border rounded-lg p-3 cursor-grab active:cursor-grabbing
-                              hover:brightness-110 active:scale-[0.98] transition-all duration-150
-                              flex items-center gap-3
-                              select-none group
-                              focus:outline-none focus:ring-2 focus:ring-blue-500 focus:ring-offset-2 focus:ring-offset-white dark:focus:ring-offset-slate-900
-                            `}
-                            style={{ animationDelay: `${index * 30}ms` }}
+                            className="oaiy-node-item"
                           >
-                            <div className={`w-9 h-9 rounded-lg ${colors.bg} ${colors.border} border flex items-center justify-center ${colors.text} flex-shrink-0 transition-transform group-hover:scale-105 relative`}>
+                            {/* The node kind's own colour, as on the canvas. */}
+                            <span className={`oaiy-node-icon ${colors.bg} ${colors.border} ${colors.text}`}>
                               {getNodeIcon(node.definition.icon)}
-                              {/* Package node indicator */}
-                              {node.isPackageNode && (
-                                <div className="absolute -top-1 -right-1 w-3 h-3 bg-purple-500 rounded-full border border-slate-900" title="Package node" />
-                              )}
-                            </div>
-                            <div className="min-w-0 flex-1">
-                              <div className={`${colors.text} font-medium text-sm truncate flex items-center gap-1.5`}>
-                                {node.definition.name}
-                                {node.isPackageNode && (
-                                  <span className="text-[9px] px-1 py-0.5 bg-purple-100 dark:bg-purple-500/20 text-purple-600 dark:text-purple-400 rounded font-normal">PKG</span>
-                                )}
-                              </div>
-                              <div className="text-slate-500 dark:text-slate-400 text-xs truncate hidden sm:block leading-relaxed">{node.definition.description}</div>
-                            </div>
+                            </span>
+                            <span className="oaiy-node-text">
+                              <strong>{node.definition.name}</strong>
+                              <small>{node.definition.description}</small>
+                            </span>
+                            {node.isPackageNode && <span className="oaiy-node-tag" title="From a package">PKG</span>}
                           </div>
-                        );
-                      })}
-                    </div>
-                  )}
-                </div>
-              );
-            })
-          )}
+                        </li>
+                      );
+                    })}
+                  </ul>
+                )}
+              </div>
+            );
+          })
+        )}
 
-          {/* Macros Category */}
-          {filteredMacros.length > 0 && (
-            <div className="space-y-1">
-              {/* Macros Category Header */}
-              <button
-                onClick={() => toggleCategory('Macros')}
-                className="w-full flex items-center gap-2 px-2 py-1.5 text-violet-600 dark:text-violet-400 hover:text-violet-700 dark:hover:text-violet-200 transition-colors"
-                aria-expanded={expandedCategories.has('Macros')}
-                aria-label={`${expandedCategories.has('Macros') ? 'Collapse' : 'Expand'} Macros category`}
-              >
-                <svg
-                  className={`w-3 h-3 transition-transform ${expandedCategories.has('Macros') ? 'rotate-90' : ''}`}
-                  fill="none"
-                  stroke="currentColor"
-                  viewBox="0 0 24 24"
-                  aria-hidden="true"
-                >
-                  <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M9 5l7 7-7 7" />
-                </svg>
-                <svg className="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24">
-                  <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M20 7l-8-4-8 4m16 0l-8 4m8-4v10l-8 4m0-10L4 7m8 4v10M4 7v10l8 4" />
-                </svg>
-                <span className="text-xs font-medium uppercase tracking-wide">Macros</span>
-                <span className="text-slate-500 dark:text-slate-600 text-xs">({filteredMacros.length})</span>
-              </button>
+        {/* Macros: flows saved to be used as nodes. */}
+        {filteredMacros.length > 0 && (
+          <div className="oaiy-cat">
+            <button
+              type="button"
+              onClick={() => toggleCategory('Macros')}
+              aria-expanded={expandedCategories.has('Macros')}
+              aria-label={`${expandedCategories.has('Macros') ? 'Collapse' : 'Expand'} Macros category`}
+            >
+              <ChevronRight size={13} aria-hidden="true" />
+              <span>Macros</span>
+              <small>{filteredMacros.length}</small>
+            </button>
 
-              {/* Macros List */}
-              {expandedCategories.has('Macros') && (
-                <div className="space-y-2 pl-1 animate-slideDown">
-                  {filteredMacros.map((macro, index) => {
-                    const inputCount = macro.macroMetadata?.inputs.length || 0;
-                    const outputCount = macro.macroMetadata?.outputs.length || 0;
-                    return (
+            {expandedCategories.has('Macros') && (
+              <ul>
+                {filteredMacros.map((macro) => {
+                  const inputCount = macro.macroMetadata?.inputs.length || 0;
+                  const outputCount = macro.macroMetadata?.outputs.length || 0;
+                  return (
+                    <li key={macro.id}>
                       <div
-                        key={macro.id}
                         role="button"
                         tabIndex={0}
                         onMouseDown={(e) => handleMacroMouseDown(e, macro)}
@@ -738,133 +598,88 @@ function NodePalette({ docked = false, onAddNode, onAddNodeAtPosition, isOpen, o
                           }
                         }}
                         aria-label={`Add ${macro.name} macro`}
-                        className={`
-                          bg-violet-100 dark:bg-violet-900/30 border-violet-300 dark:border-violet-600
-                          border rounded-lg p-3 cursor-grab active:cursor-grabbing
-                          hover:brightness-110 active:scale-[0.98] transition-all duration-150
-                          flex items-center gap-3
-                          select-none group
-                          focus:outline-none focus:ring-2 focus:ring-violet-500 focus:ring-offset-2 focus:ring-offset-white dark:focus:ring-offset-slate-900
-                        `}
-                        style={{ animationDelay: `${index * 30}ms` }}
+                        className="oaiy-node-item"
                       >
-                        <div className="w-9 h-9 rounded-lg bg-violet-200 dark:bg-violet-900/30 border-violet-300 dark:border-violet-600 border flex items-center justify-center text-violet-600 dark:text-violet-400 flex-shrink-0 transition-transform group-hover:scale-105">
-                          <svg className="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24">
-                            <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M20 7l-8-4-8 4m16 0l-8 4m8-4v10l-8 4m0-10L4 7m8 4v10M4 7v10l8 4" />
-                          </svg>
-                        </div>
-                        <div className="min-w-0 flex-1">
-                          <div className="text-violet-700 dark:text-violet-400 font-medium text-sm truncate">{macro.name}</div>
-                          <div className="text-slate-500 dark:text-slate-500 text-xs truncate hidden sm:block leading-relaxed">
+                        <span className="oaiy-node-icon border-signal-magenta/40 bg-signal-magenta/10 text-signal-magenta">
+                          <Layers size={15} />
+                        </span>
+                        <span className="oaiy-node-text">
+                          <strong>{macro.name}</strong>
+                          <small>
                             {inputCount} input{inputCount !== 1 ? 's' : ''}, {outputCount} output{outputCount !== 1 ? 's' : ''}
-                          </div>
-                        </div>
+                          </small>
+                        </span>
                       </div>
-                    );
-                  })}
-                </div>
-              )}
-            </div>
-          )}
-        </div>
-
-        {/* Drag preview - rendered via portal to avoid transform issues */}
-        {(draggingType || draggingMacro) && dragPosition && createPortal(
-          <div
-            className={`fixed z-[9999] pointer-events-none rounded-lg px-3 py-2 shadow-xl ${
-              draggingMacro
-                ? 'bg-violet-100 dark:bg-violet-900/80 border border-violet-400 dark:border-violet-600'
-                : 'bg-white dark:bg-slate-800 border border-slate-300 dark:border-slate-600'
-            }`}
-            style={{
-              left: dragPosition.x + 12,
-              top: dragPosition.y + 12,
-            }}
-          >
-            <span className={`text-sm font-medium ${draggingMacro ? 'text-violet-700 dark:text-violet-200' : 'text-slate-700 dark:text-slate-200'}`}>
-              {draggingMacro ? draggingMacro._macroName : (draggingType ? getDragLabel(draggingType) : '')}
-            </span>
-          </div>,
-          document.body
+                    </li>
+                  );
+                })}
+              </ul>
+            )}
+          </div>
         )}
-
-        {/* Documentation popover - rendered via portal */}
-        {hoveredNode && popoverPosition && !draggingType && createPortal(
-          <div
-            ref={popoverRef}
-            className="fixed z-[9998] bg-white dark:bg-slate-800 border border-slate-300 dark:border-slate-600 rounded-lg shadow-xl max-w-sm animate-fadeIn"
-            style={{
-              left: popoverPosition.showLeft ? 'auto' : popoverPosition.x,
-              right: popoverPosition.showLeft ? window.innerWidth - popoverPosition.x : 'auto',
-              top: popoverPosition.y,
-              maxHeight: 'calc(100vh - 20px)',
-              overflowY: 'auto',
-            }}
-            onMouseEnter={() => {
-              // Keep popover open when hovering over it
-              if (hoverTimeoutRef.current) {
-                clearTimeout(hoverTimeoutRef.current);
-                hoverTimeoutRef.current = null;
-              }
-            }}
-            onMouseLeave={handleNodeMouseLeave}
-          >
-            <div className="p-3">
-              <div className="flex items-center gap-2 mb-2">
-                <div className={`w-6 h-6 rounded flex items-center justify-center ${getNodeColorClasses(hoveredNode.definition.color).bg} ${getNodeColorClasses(hoveredNode.definition.color).text}`}>
-                  {getNodeIcon(hoveredNode.definition.icon)}
-                </div>
-                <h4 className="text-slate-700 dark:text-slate-200 font-semibold text-sm">{hoveredNode.definition.name}</h4>
-              </div>
-              {hoveredNode.definition.doc ? (
-                <p className="text-slate-600 dark:text-slate-400 text-xs leading-relaxed whitespace-pre-wrap">
-                  {hoveredNode.definition.doc}
-                </p>
-              ) : hoveredNode.definition.description ? (
-                <p className="text-slate-600 dark:text-slate-400 text-xs leading-relaxed">
-                  {hoveredNode.definition.description}
-                </p>
-              ) : null}
-              {hoveredNode.definition.inputs.length > 0 && (
-                <div className="mt-2 pt-2 border-t border-slate-300 dark:border-slate-700">
-                  <span className="text-slate-500 text-[10px] uppercase tracking-wide">Inputs</span>
-                  <div className="flex flex-wrap gap-1 mt-1">
-                    {hoveredNode.definition.inputs.map(inp => (
-                      <span key={inp.id} className="text-[10px] px-1.5 py-0.5 bg-slate-200 dark:bg-slate-700 text-slate-600 dark:text-slate-300 rounded">
-                        {inp.name}
-                      </span>
-                    ))}
-                  </div>
-                </div>
-              )}
-              {hoveredNode.definition.outputs.length > 0 && (
-                <div className="mt-2 pt-2 border-t border-slate-300 dark:border-slate-700">
-                  <span className="text-slate-500 text-[10px] uppercase tracking-wide">Outputs</span>
-                  <div className="flex flex-wrap gap-1 mt-1">
-                    {hoveredNode.definition.outputs.map(out => (
-                      <span key={out.id} className="text-[10px] px-1.5 py-0.5 bg-slate-200 dark:bg-slate-700 text-slate-600 dark:text-slate-300 rounded">
-                        {out.name}
-                      </span>
-                    ))}
-                  </div>
-                </div>
-              )}
-            </div>
-          </div>,
-          document.body
-        )}
-
-        {/* Footer */}
-        <div className="p-2 sm:p-3 border-t border-[rgb(var(--color-border-primary))]">
-          <p className="text-slate-600 text-[10px] text-center hidden sm:block">
-            Click or drag to add nodes
-          </p>
-          <p className="text-slate-600 text-[10px] text-center sm:hidden">
-            Tap to add nodes
-          </p>
-        </div>
       </div>
-    </>
+
+      <div className="oaiy-side-foot">Click a node to add it, or drag it onto the canvas.</div>
+
+      {/* Drag preview - rendered via portal to avoid transform issues */}
+      {(draggingType || draggingMacro) && dragPosition && createPortal(
+        <div className="oaiy-drag-ghost" style={{ left: dragPosition.x + 12, top: dragPosition.y + 12 }}>
+          {draggingMacro ? draggingMacro._macroName : (draggingType ? getDragLabel(draggingType) : '')}
+        </div>,
+        document.body
+      )}
+
+      {/* Documentation popover - rendered via portal */}
+      {hoveredNode && popoverPosition && !draggingType && createPortal(
+        <div
+          ref={popoverRef}
+          className="oaiy-popover"
+          style={{
+            left: popoverPosition.showLeft ? 'auto' : popoverPosition.x,
+            right: popoverPosition.showLeft ? window.innerWidth - popoverPosition.x : 'auto',
+            top: popoverPosition.y,
+            maxHeight: 'calc(100vh - 20px)',
+          }}
+          onMouseEnter={() => {
+            // Keep popover open when hovering over it
+            if (hoverTimeoutRef.current) {
+              clearTimeout(hoverTimeoutRef.current);
+              hoverTimeoutRef.current = null;
+            }
+          }}
+          onMouseLeave={handleNodeMouseLeave}
+        >
+          <div className="mb-1.5 flex items-center gap-2">
+            <span className={`oaiy-node-icon grid h-6 w-6 place-items-center rounded-[var(--r-sm)] border ${getNodeColorClasses(hoveredNode.definition.color).bg} ${getNodeColorClasses(hoveredNode.definition.color).border} ${getNodeColorClasses(hoveredNode.definition.color).text}`}>
+              {getNodeIcon(hoveredNode.definition.icon)}
+            </span>
+            <h4 className="m-0">{hoveredNode.definition.name}</h4>
+          </div>
+          {hoveredNode.definition.doc ? (
+            <p className="m-0 whitespace-pre-wrap">{hoveredNode.definition.doc}</p>
+          ) : hoveredNode.definition.description ? (
+            <p className="m-0">{hoveredNode.definition.description}</p>
+          ) : null}
+          {hoveredNode.definition.inputs.length > 0 && (
+            <>
+              <span className="oaiy-label">Inputs</span>
+              <div className="oaiy-chips">
+                {hoveredNode.definition.inputs.map(inp => <span key={inp.id}>{inp.name}</span>)}
+              </div>
+            </>
+          )}
+          {hoveredNode.definition.outputs.length > 0 && (
+            <>
+              <span className="oaiy-label">Outputs</span>
+              <div className="oaiy-chips">
+                {hoveredNode.definition.outputs.map(out => <span key={out.id}>{out.name}</span>)}
+              </div>
+            </>
+          )}
+        </div>,
+        document.body
+      )}
+    </aside>
   );
 }
 

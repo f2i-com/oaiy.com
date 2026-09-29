@@ -152,7 +152,9 @@ for (const theme of ['dark', 'light']) {
 
     ok('boots with a clean console', errors.length === 0, errors.slice(0, 2).join(' | '));
     ok('app shell renders', (await page.locator('.app-shell').count()) === 1);
-    ok('sidebar has the full primary nav', (await page.locator('.oaiy-nav button').count()) === 5);
+    // Workflows, Data, Queue, Packages; Settings sits at the foot of the rail.
+    ok('sidebar has the full primary nav', (await page.locator('.oaiy-nav button').count()) === 4);
+    ok('Settings is in the rail too', (await page.locator('.oaiy-settings-btn').count()) === 1);
     ok('endpoint dock renders', (await page.locator('.oaiy-dock').count()) === 1);
     ok('engine card reports companion state',
       ((await page.locator('.oaiy-engine small').first().textContent()) ?? '').length > 0);
@@ -166,13 +168,23 @@ for (const theme of ['dark', 'light']) {
     ok('project name accepts edits', (await proj.inputValue()) === 'renamed by e2e');
     await proj.fill(originalName);
 
-    const create = page.getByRole('button', { name: /Create your first flow/i }).first();
+    // New flow asks for a name in the one dialog, then opens the canvas.
+    const create = page.locator('.oaiy-new').first();
     if (await create.count()) {
       await create.click();
+      await page.waitForTimeout(400);
+      ok('New flow opens the dialog', (await page.locator('[data-testid="new-flow-dialog"]').count()) === 1);
+      await page.getByRole('button', { name: /Create flow/i }).click();
       await page.waitForTimeout(2200);
     }
-    ok('creating a flow reveals the node palette', (await page.getByText('Node Palette').count()) > 0);
-    ok('creating a flow reveals the inspector', (await page.getByText(/PROPERTIES/i).count()) > 0);
+    // An empty flow opens with the palette; the inspector is a toolbar button
+    // away (docked from the start only where the canvas has room for both).
+    ok('creating a flow reveals the node palette', (await page.locator('[data-testid="node-palette"]').count()) > 0);
+    const propsButton = page.locator('.oaiy-toolbar button[aria-label$="the properties"]');
+    ok('the canvas toolbar offers the properties', (await propsButton.count()) === 1);
+    if ((await page.locator('aside[aria-label="Inspector"]').count()) === 0) await propsButton.click();
+    await page.waitForTimeout(300);
+    ok('the properties open beside the canvas', (await page.locator('aside[aria-label="Inspector"]').count()) === 1);
     ok('canvas wrapper is mounted', (await page.locator('.oaiy-canvas-wrap').count()) === 1);
     ok('project name survives opening a flow', (await proj.count()) === 1);
 
@@ -284,10 +296,7 @@ section('flows rail collapse');
 
   const state = () =>
     page.evaluate(() => {
-      const h = [...document.querySelectorAll('h2')].find((e) =>
-        /^(Flows|Your Flows)$/.test(e.textContent.trim()),
-      );
-      const panel = h?.closest('div.flex.flex-col');
+      const panel = document.querySelector('[data-testid="flows-rail"]');
       const railBtn = document.querySelector('button[aria-label="Expand the flows panel"]');
       const canvas = document.querySelector('.oaiy-canvas-wrap');
       return {

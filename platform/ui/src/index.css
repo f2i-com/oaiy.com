@@ -1570,6 +1570,8 @@ select,
   text-overflow: ellipsis;
   white-space: nowrap;
 }
+/* As wide as the name, so the flow's name sits right after the project's. */
+.oaiy-title input.oaiy-name { field-sizing: content; min-width: 6ch; }
 .oaiy-title input.oaiy-name:hover { border-color: rgb(var(--color-border-primary)); }
 .oaiy-title input.oaiy-name:focus {
   border-color: rgb(var(--accent-primary));
@@ -2044,12 +2046,14 @@ select,
   font-weight: 600;
   line-height: 1;
 }
-:root.oaiy-app .btn:not([class*='btn-']) {
+/* A plain .btn (any size) is the dashboard's secondary button; the colour
+   variants below restyle it. */
+:root.oaiy-app .btn:not(.btn-primary):not(.btn-secondary):not(.btn-ghost):not(.btn-danger):not(.btn-warning) {
   border-color: rgb(var(--color-border-strong));
   background: rgb(var(--color-bg-tertiary) / 0.7);
   color: rgb(var(--color-text-primary));
 }
-:root.oaiy-app .btn:not([class*='btn-']):hover:not(:disabled) {
+:root.oaiy-app .btn:not(.btn-primary):not(.btn-secondary):not(.btn-ghost):not(.btn-danger):not(.btn-warning):hover:not(:disabled) {
   border-color: rgb(var(--accent-primary));
   background: rgb(var(--accent-primary) / 0.14);
 }
@@ -2078,6 +2082,8 @@ select,
   color: rgb(var(--signal-amber));
 }
 .btn-warning:hover:not(:disabled) { border-color: rgb(var(--signal-amber)); background: rgb(var(--signal-amber) / 0.2); }
+/* Done: a choice already made (a preset already added). */
+.btn.done { border-color: rgb(var(--signal-green) / 0.4); background: rgb(var(--signal-green) / 0.1); color: rgb(var(--signal-green)); }
 /* A filled danger, for the one button that deletes. */
 .btn-danger.solid { border-color: rgb(var(--signal-danger)); background: rgb(var(--signal-danger)); color: #fff; }
 .btn-danger.solid:hover:not(:disabled) { filter: brightness(1.06); }
@@ -2130,6 +2136,7 @@ select,
 .oaiy-error-text { margin: 0; color: rgb(var(--signal-danger)); font-size: 12px; line-height: 1.5; }
 .oaiy-ok-text { margin: 0; color: rgb(var(--signal-green)); font-size: 12px; line-height: 1.5; }
 .oaiy-warn-text { margin: 0; color: rgb(var(--signal-amber)); font-size: 12px; line-height: 1.5; }
+.oaiy-form-grid.narrow { max-width: 440px; }
 .oaiy-form-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(min(100%, 180px), 1fr)); gap: 10px; }
 .oaiy-check { display: flex; align-items: flex-start; gap: 10px; cursor: pointer; }
 .oaiy-check > input { margin-top: 3px; flex: none; width: 15px; height: 15px; accent-color: rgb(var(--accent-primary)); }
@@ -2197,6 +2204,9 @@ select,
 .oaiy-note.warn { border-left-color: rgb(var(--signal-amber)); }
 .oaiy-note.danger { border-left-color: rgb(var(--signal-danger)); }
 .oaiy-note strong { color: rgb(var(--color-text-primary)); }
+.oaiy-note ul,
+.oaiy-note ol { margin: 4px 0 0; padding-left: 18px; }
+.oaiy-note li + li { margin-top: 3px; }
 .oaiy-banner {
   display: flex;
   align-items: flex-start;
@@ -2210,6 +2220,7 @@ select,
   font-size: 12px;
   line-height: 1.5;
 }
+.oaiy-banner.center { align-items: center; }
 .oaiy-banner.ok { border-color: rgb(var(--signal-green) / 0.35); background: rgb(var(--signal-green) / 0.08); color: rgb(var(--signal-green)); }
 
 .oaiy-code,
@@ -2622,6 +2633,8 @@ button.oaiy-row.on { background: rgb(var(--accent-primary) / 0.1); }
 .oaiy-menu > button small { color: rgb(var(--color-text-faint)); font-size: 11.5px; line-height: 1.4; }
 .oaiy-menu > button:hover,
 .oaiy-menu > button:focus-visible { background: rgb(var(--accent-primary) / 0.1); outline: 0; }
+.oaiy-menu > button:disabled { cursor: not-allowed; opacity: 0.45; }
+.oaiy-menu > button:disabled:hover { background: transparent; }
 .oaiy-menu > button.danger { color: rgb(var(--signal-danger)); }
 .oaiy-menu > button.danger > svg { color: currentColor; }
 .oaiy-menu > hr { margin: 4px 2px; border: 0; border-top: 1px solid rgb(var(--color-border-secondary)); }
@@ -2822,19 +2835,34 @@ button.oaiy-row.on { background: rgb(var(--accent-primary) / 0.1); }
 .oaiy-side-bar:hover { background: rgb(var(--color-bg-tertiary) / 0.6); color: rgb(var(--color-text-primary)); }
 .oaiy-side-bar small { margin-left: auto; color: rgb(var(--color-text-faint)); font-family: var(--font-mono); font-size: 11px; font-weight: 500; }
 
-/* Under the phone width a side panel lies over the canvas's edge, not beside it. */
-@media (width < 760px) {
-  .oaiy-side {
-    position: absolute;
-    z-index: 40;
-    top: 0;
-    bottom: 0;
-    width: min(320px, 88%);
-    box-shadow: var(--shadow-lg);
-  }
-  .oaiy-side.left { left: 0; }
-  .oaiy-side.right { right: 0; width: min(320px, 88%); }
+/* The builder: the canvas between its side panels. */
+.oaiy-builder { position: relative; display: flex; width: 100%; height: 100%; min-width: 0; overflow: hidden; }
+.oaiy-builder:focus { outline: none; }
+
+/* A narrow builder: a side panel lies over the canvas's edge, not beside it,
+   so the canvas keeps its width (OAIYBuilder sets .narrow from its own width). */
+.oaiy-builder.narrow .oaiy-side {
+  position: absolute;
+  z-index: 40;
+  top: 0;
+  bottom: 0;
+  width: min(300px, 88%);
+  box-shadow: var(--shadow-lg);
 }
+.oaiy-builder.narrow .oaiy-side.left { left: 0; }
+.oaiy-builder.narrow .oaiy-side.right { right: 0; }
+
+/* A narrow builder with a panel open over the canvas: the toolbar moves to
+   the side left clear, and stays above the panel so it can close it. */
+.oaiy-builder.narrow.left-open .oaiy-toolbar { right: 10px; left: auto; z-index: 45; transform: none; }
+.oaiy-builder.narrow.right-open .oaiy-toolbar { left: 58px; z-index: 45; transform: none; }
+
+/* A tight canvas: the toolbar keeps its icons and says its words in titles. */
+.oaiy-toolbar.tight .oaiy-tool > span { display: none; }
+.oaiy-toolbar.tight .oaiy-pill { display: none; }
+
+/* The log's empty state speaks in the body type, not the log's mono. */
+.oaiy-log .oaiy-empty { font-family: var(--font-body); }
 
 /* The palette's categories and nodes. */
 .oaiy-cat { margin: 0; }
@@ -3011,7 +3039,8 @@ button.oaiy-row.on { background: rgb(var(--accent-primary) / 0.1); }
 .oaiy-canvas-wrap .react-flow__controls button:hover { background: rgb(var(--color-bg-tertiary)) !important; }
 .oaiy-canvas-wrap .react-flow__controls button svg { fill: rgb(var(--color-text-secondary)) !important; }
 .oaiy-canvas-wrap .react-flow__minimap { border-radius: var(--r-ctl) !important; box-shadow: var(--shadow-card) !important; }
-.oaiy-minimap { position: absolute; z-index: 10; right: 16px; bottom: 16px; }
+/* Top right, clear of the toolbar and the zoom controls at the canvas's foot. */
+.oaiy-minimap { position: absolute; z-index: 10; top: 12px; right: 12px; }
 .oaiy-minimap .react-flow__minimap { position: relative !important; margin: 0 !important; }
 .oaiy-minimap > .oaiy-icon-btn {
   position: absolute;
@@ -3082,15 +3111,17 @@ button.oaiy-row.on { background: rgb(var(--accent-primary) / 0.1); }
   border-radius: 50%;
   animation: spin 0.8s linear infinite;
 }
+.oaiy-spinner.sm { width: 14px; height: 14px; border-width: 2px; }
+.btn-primary .oaiy-spinner { border-color: rgb(255 255 255 / 0.35); border-top-color: #fff; }
 .oaiy-canvas-banner {
   position: absolute;
   z-index: 20;
-  top: 10px;
-  left: 50%;
+  top: 12px;
+  left: 12px;
   display: flex;
+  max-width: calc(100% - 210px);
   align-items: center;
   gap: 8px;
-  transform: translateX(-50%);
   border: 1px solid rgb(var(--signal-magenta) / 0.4);
   border-radius: 999px;
   background: rgb(var(--color-bg-secondary));

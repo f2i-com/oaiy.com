@@ -1,5 +1,7 @@
 /**
- * Data Viewer - Browse stored JSON data from workflows
+ * Data — what a flow's Database nodes stored, as a page in the editor's main
+ * area: its collections down the left, the chosen one's records as a table,
+ * and SQL for anything the table cannot show.
  *
  * Architecture:
  * - When activeFlowId is provided, shows data from that flow's dedicated database
@@ -7,21 +9,18 @@
  * - Supports both user flows and package flows
  */
 import { useState, useEffect, useCallback, useRef } from 'react';
+import { Database, Package, RefreshCw, TerminalSquare, Trash2, X } from 'lucide-react';
 import * as db from '../../services/database';
 import { getFlowDatabaseManager, type FlowDatabaseInfo } from '../../services/database';
 import { CopyLink } from '../ui/CopyButton';
+import SectionPage, { Card, EmptyState } from '../chrome/SectionPage';
+import { useConfirmDialog } from '../../hooks/useConfirmDialog';
 
 type ExportFormat = 'json' | 'csv';
 
 interface CollectionInfo {
   name: string;
   count: number;
-}
-
-// Confirmation dialog state
-interface ConfirmDialog {
-  message: string;
-  onConfirm: () => void;
 }
 
 /**
@@ -46,7 +45,7 @@ export default function DataViewer({ activeFlowId, packageId, flowName }: DataVi
   const [selectedRows, setSelectedRows] = useState<Set<string>>(new Set());
   const [rawSql, setRawSql] = useState('');
   const [showRawQuery, setShowRawQuery] = useState(false);
-  const [confirmDialog, setConfirmDialog] = useState<ConfirmDialog | null>(null);
+  const confirm = useConfirmDialog();
 
   // Flow database browser state (when no activeFlowId)
   const [flowDatabases, setFlowDatabases] = useState<FlowDatabaseInfo[]>([]);
@@ -226,11 +225,14 @@ export default function DataViewer({ activeFlowId, packageId, flowName }: DataVi
         );
         return;
       }
-      const confirmed = window.confirm(
-        `Run this destructive SQL against ${targetLabel}?\n\n` +
-          `${rawSql.trim().slice(0, 800)}\n\n` +
-          'This may modify or delete data and cannot be undone.'
-      );
+      const confirmed = await confirm({
+        title: 'Run this SQL?',
+        message:
+          `It runs against ${targetLabel} and may change or delete data, which cannot be undone.\n\n` +
+          rawSql.trim().slice(0, 800),
+        confirmLabel: 'Run it',
+        variant: 'danger',
+      });
       if (!confirmed) return;
     }
 
@@ -263,7 +265,7 @@ export default function DataViewer({ activeFlowId, packageId, flowName }: DataVi
     } finally {
       if (myReq === requestIdRef.current) setLoading(false);
     }
-  }, [rawSql, activeFlowId, packageId, selectedFlowDb, loadCollections, developerMode, isReadOnlySql]);
+  }, [rawSql, activeFlowId, packageId, selectedFlowDb, loadCollections, developerMode, isReadOnlySql, confirm]);
 
   // Export data
   const exportData = useCallback(async (format: ExportFormat) => {
@@ -313,27 +315,25 @@ export default function DataViewer({ activeFlowId, packageId, flowName }: DataVi
     const flowId = activeFlowId || selectedFlowDb?.flowId;
     const pkgId = packageId || selectedFlowDb?.packageId;
 
-    setConfirmDialog({
-      message: 'Delete this record?',
-      onConfirm: async () => {
-        try {
-          if (flowId) {
-            await getFlowDatabaseManager().deleteDocument(flowId, id, pkgId);
-          } else {
-            await db.deleteDocument(id);
-          }
-          setData(prev => prev.filter(row => row._id !== id));
-          setCollections(prev => prev.map(c =>
-            c.name === selectedCollection ? { ...c, count: c.count - 1 } : c
-          ));
-          setSuccessMessage('Record deleted');
-        } catch (err) {
-          setError(`Failed to delete: ${err instanceof Error ? err.message : String(err)}`);
+    void (async () => {
+      const ok = await confirm({ title: 'Delete this record?', message: 'It is removed from the collection for good.', confirmLabel: 'Delete', variant: 'danger' });
+      if (!ok) return;
+      try {
+        if (flowId) {
+          await getFlowDatabaseManager().deleteDocument(flowId, id, pkgId);
+        } else {
+          await db.deleteDocument(id);
         }
-        setConfirmDialog(null);
+        setData(prev => prev.filter(row => row._id !== id));
+        setCollections(prev => prev.map(c =>
+          c.name === selectedCollection ? { ...c, count: c.count - 1 } : c
+        ));
+        setSuccessMessage('Record deleted');
+      } catch (err) {
+        setError(`Failed to delete: ${err instanceof Error ? err.message : String(err)}`);
       }
-    });
-  }, [activeFlowId, packageId, selectedFlowDb, selectedCollection]);
+    })();
+  }, [activeFlowId, packageId, selectedFlowDb, selectedCollection, confirm]);
 
   // Delete selected records
   const deleteSelectedRecords = useCallback(() => {
@@ -341,30 +341,33 @@ export default function DataViewer({ activeFlowId, packageId, flowName }: DataVi
     const flowId = activeFlowId || selectedFlowDb?.flowId;
     const pkgId = packageId || selectedFlowDb?.packageId;
 
-    setConfirmDialog({
-      message: `Delete ${selectedRows.size} record(s)?`,
-      onConfirm: async () => {
-        try {
-          for (const id of selectedRows) {
-            if (flowId) {
-              await getFlowDatabaseManager().deleteDocument(flowId, id, pkgId);
-            } else {
-              await db.deleteDocument(id);
-            }
+    void (async () => {
+      const ok = await confirm({
+        title: `Delete ${selectedRows.size} record${selectedRows.size === 1 ? '' : 's'}?`,
+        message: 'They are removed from the collection for good.',
+        confirmLabel: 'Delete',
+        variant: 'danger',
+      });
+      if (!ok) return;
+      try {
+        for (const id of selectedRows) {
+          if (flowId) {
+            await getFlowDatabaseManager().deleteDocument(flowId, id, pkgId);
+          } else {
+            await db.deleteDocument(id);
           }
-          setData(prev => prev.filter(row => !selectedRows.has(row._id as string)));
-          setCollections(prev => prev.map(c =>
-            c.name === selectedCollection ? { ...c, count: c.count - selectedRows.size } : c
-          ));
-          setSelectedRows(new Set());
-          setSuccessMessage(`Deleted ${selectedRows.size} record(s)`);
-        } catch (err) {
-          setError(`Failed to delete: ${err instanceof Error ? err.message : String(err)}`);
         }
-        setConfirmDialog(null);
+        setData(prev => prev.filter(row => !selectedRows.has(row._id as string)));
+        setCollections(prev => prev.map(c =>
+          c.name === selectedCollection ? { ...c, count: c.count - selectedRows.size } : c
+        ));
+        setSelectedRows(new Set());
+        setSuccessMessage(`Deleted ${selectedRows.size} record(s)`);
+      } catch (err) {
+        setError(`Failed to delete: ${err instanceof Error ? err.message : String(err)}`);
       }
-    });
-  }, [selectedRows, activeFlowId, packageId, selectedFlowDb, selectedCollection]);
+    })();
+  }, [selectedRows, activeFlowId, packageId, selectedFlowDb, selectedCollection, confirm]);
 
   // Clear all records
   const clearAllRecords = useCallback(() => {
@@ -372,26 +375,29 @@ export default function DataViewer({ activeFlowId, packageId, flowName }: DataVi
     const flowId = activeFlowId || selectedFlowDb?.flowId;
     const pkgId = packageId || selectedFlowDb?.packageId;
 
-    setConfirmDialog({
-      message: `Delete ALL records in "${selectedCollection}"?`,
-      onConfirm: async () => {
-        try {
-          if (flowId) {
-            await getFlowDatabaseManager().dropCollection(flowId, selectedCollection, pkgId);
-          } else {
-            await db.dropCollection(selectedCollection);
-          }
-          setData([]);
-          setCollections(prev => prev.filter(c => c.name !== selectedCollection));
-          setSelectedCollection(null);
-          setSuccessMessage('All records cleared');
-        } catch (err) {
-          setError(`Failed to clear: ${err instanceof Error ? err.message : String(err)}`);
+    void (async () => {
+      const ok = await confirm({
+        title: `Delete every record in “${selectedCollection}”?`,
+        message: 'The whole collection is removed for good.',
+        confirmLabel: 'Delete all',
+        variant: 'danger',
+      });
+      if (!ok) return;
+      try {
+        if (flowId) {
+          await getFlowDatabaseManager().dropCollection(flowId, selectedCollection, pkgId);
+        } else {
+          await db.dropCollection(selectedCollection);
         }
-        setConfirmDialog(null);
+        setData([]);
+        setCollections(prev => prev.filter(c => c.name !== selectedCollection));
+        setSelectedCollection(null);
+        setSuccessMessage('All records cleared');
+      } catch (err) {
+        setError(`Failed to clear: ${err instanceof Error ? err.message : String(err)}`);
       }
-    });
-  }, [selectedCollection, activeFlowId, packageId, selectedFlowDb]);
+    })();
+  }, [selectedCollection, activeFlowId, packageId, selectedFlowDb, confirm]);
 
   // Toggle row selection
   const toggleRowSelection = useCallback((id: string) => {
@@ -432,337 +438,263 @@ export default function DataViewer({ activeFlowId, packageId, flowName }: DataVi
   const currentFlowId = activeFlowId || selectedFlowDb?.flowId;
   const currentPackageId = packageId || selectedFlowDb?.packageId;
   const displayName = flowName || selectedFlowDb?.flowId?.substring(0, 8) || 'No Flow Selected';
+  const destructive = developerMode && !isReadOnlySql(rawSql);
 
   return (
-    <div className="flex h-full bg-slate-100 dark:bg-slate-900 overflow-hidden">
-      {/* Sidebar */}
-      <div className="w-56 flex-shrink-0 border-r border-slate-200 dark:border-slate-700 flex flex-col overflow-hidden">
-        {/* Flow Context Header */}
-        <div className="px-3 py-2 border-b border-slate-200 dark:border-slate-700 bg-white dark:bg-slate-800/50">
-          <div className="flex items-center gap-2">
-            {currentPackageId && (
-              <svg className="w-4 h-4 text-purple-400 flex-shrink-0" fill="none" stroke="currentColor" viewBox="0 0 24 24">
-                <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M20 7l-8-4-8 4m16 0l-8 4m8-4v10l-8 4m0-10L4 7m8 4v10M4 7v10l8 4" />
-              </svg>
-            )}
-            <h3 className="text-sm font-medium text-slate-700 dark:text-slate-200 truncate" title={displayName}>
-              {currentFlowId ? displayName : 'All Databases'}
-            </h3>
-          </div>
-          <p className="text-xs text-slate-500 mt-0.5">
-            {currentFlowId
-              ? `Flow: ${currentFlowId.substring(0, 8)}...`
-              : 'Select a flow to view its data'}
-          </p>
-        </div>
-
-        <div className="flex-1 overflow-y-auto">
-          {/* Show database browser when no flow is selected */}
-          {!currentFlowId && flowDatabases.length > 0 && (
-            <div className="border-b border-slate-200 dark:border-slate-700">
-              <div className="px-3 py-1 text-xs font-medium text-slate-500 dark:text-slate-400 uppercase tracking-wider bg-slate-50 dark:bg-slate-800/30">
-                Flow Databases
-              </div>
-              {flowDatabases.map(dbInfo => (
-                <div
-                  key={`${dbInfo.packageId || 'user'}-${dbInfo.flowId}`}
-                  onClick={() => setSelectedFlowDb(dbInfo)}
-                  className={`px-3 py-2 cursor-pointer flex items-center justify-between ${
-                    selectedFlowDb?.flowId === dbInfo.flowId && selectedFlowDb?.packageId === dbInfo.packageId
-                      ? 'bg-blue-600/20 text-blue-700 dark:text-blue-300 border-l-2 border-blue-500'
-                      : 'hover:bg-slate-200 dark:hover:bg-slate-800 text-slate-700 dark:text-slate-300'
-                  }`}
-                >
-                  <div className="flex items-center gap-2 min-w-0">
-                    {dbInfo.packageId && (
-                      <svg className="w-3 h-3 text-purple-400 flex-shrink-0" fill="none" stroke="currentColor" viewBox="0 0 24 24">
-                        <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M20 7l-8-4-8 4m16 0l-8 4m8-4v10l-8 4m0-10L4 7m8 4v10M4 7v10l8 4" />
-                      </svg>
-                    )}
-                    <span className="text-sm truncate">{dbInfo.flowId.substring(0, 12)}...</span>
-                  </div>
-                  <span className="text-xs text-slate-500">{dbInfo.collections.length}c</span>
-                </div>
-              ))}
-            </div>
-          )}
-
-          {/* Collections list */}
-          {currentFlowId && (
-            <>
-              <div className="px-3 py-1 text-xs font-medium text-slate-500 dark:text-slate-400 uppercase tracking-wider bg-slate-50 dark:bg-slate-800/30">
-                Collections
-              </div>
-              {collections.length === 0 ? (
-                <div className="empty-state py-8">
-                  <svg className="empty-state-icon" fill="none" stroke="currentColor" viewBox="0 0 24 24">
-                    <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M4 7v10c0 2.21 3.582 4 8 4s8-1.79 8-4V7M4 7c0 2.21 3.582 4 8 4s8-1.79 8-4M4 7c0-2.21 3.582-4 8-4s8 1.79 8 4" />
-                  </svg>
-                  <p className="empty-state-title">No data yet</p>
-                  <p className="empty-state-description">Run a workflow with a Database node</p>
-                </div>
-              ) : (
-                collections.map(col => (
-                  <div
-                    key={col.name}
-                    onClick={() => loadCollection(col.name)}
-                    className={`px-3 py-2 cursor-pointer flex items-center justify-between ${
-                      selectedCollection === col.name
-                        ? 'bg-emerald-600/20 text-emerald-700 dark:text-emerald-300 border-l-2 border-emerald-500'
-                        : 'hover:bg-slate-200 dark:hover:bg-slate-800 text-slate-700 dark:text-slate-300'
-                    }`}
-                  >
-                    <span className="text-sm truncate">{col.name}</span>
-                    <span className="text-xs text-slate-500">{col.count}</span>
-                  </div>
-                ))
-              )}
-            </>
-          )}
-
-          {/* Empty state when no flow and no databases */}
-          {!currentFlowId && flowDatabases.length === 0 && (
-            <div className="empty-state py-8">
-              <svg className="empty-state-icon" fill="none" stroke="currentColor" viewBox="0 0 24 24">
-                <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M4 7v10c0 2.21 3.582 4 8 4s8-1.79 8-4V7M4 7c0 2.21 3.582 4 8 4s8-1.79 8-4M4 7c0-2.21 3.582-4 8-4s8 1.79 8 4" />
-              </svg>
-              <p className="empty-state-title">No databases</p>
-              <p className="empty-state-description">Run a workflow with a Database node to create data</p>
-            </div>
-          )}
-        </div>
-
-        <div className="p-2 border-t border-slate-200 dark:border-slate-700">
+    <SectionPage
+      kicker="Flows"
+      title="Data"
+      description={
+        currentFlowId
+          ? <>What the Database nodes in <strong className="text-content-primary">{displayName}</strong> have stored.</>
+          : 'What the Database nodes in your flows have stored. Pick a flow’s database.'
+      }
+      fill
+      actions={
+        <>
           <button
-            onClick={loadCollections}
-            disabled={loading}
-            className="btn btn-ghost btn-sm w-full"
+            onClick={() => setShowRawQuery(!showRawQuery)}
+            className={showRawQuery ? 'btn btn-secondary' : 'btn'}
+            aria-pressed={showRawQuery}
+            title="Query the database with SQL"
           >
-            {loading ? 'Loading...' : 'Refresh'}
+            <TerminalSquare size={14} /> SQL
           </button>
-        </div>
-      </div>
-
-      {/* Main Content */}
-      <div className="flex-1 flex flex-col min-w-0 overflow-hidden">
-        {/* Toolbar */}
-        <div className="flex items-center justify-between px-4 py-2 border-b border-slate-200 dark:border-slate-700 bg-white dark:bg-slate-800/30">
-          <div className="flex items-center gap-2">
-            <h2 className="text-sm font-medium text-slate-700 dark:text-slate-200">
-              {selectedCollection || 'Select a collection'}
-            </h2>
-            {data.length > 0 && (
-              <span className="text-xs text-slate-500">({data.length} records)</span>
-            )}
-          </div>
-
-          <div className="flex items-center gap-2">
-            {selectedRows.size > 0 && (
-              <button
-                onClick={deleteSelectedRecords}
-                className="btn btn-sm bg-red-100 dark:bg-red-600/30 text-red-600 dark:text-red-300 hover:bg-red-200 dark:hover:bg-red-600/50"
-              >
-                Delete ({selectedRows.size})
-              </button>
-            )}
-            {selectedCollection && data.length > 0 && (
-              <button
-                onClick={clearAllRecords}
-                className="btn btn-sm bg-red-100 dark:bg-red-900/30 text-red-600 dark:text-red-400 hover:bg-red-200 dark:hover:bg-red-900/50"
-              >
-                Clear All
-              </button>
-            )}
-            <button
-              onClick={() => setShowRawQuery(!showRawQuery)}
-              className={`btn btn-sm ${
-                showRawQuery ? 'bg-purple-100 dark:bg-purple-600/30 text-purple-600 dark:text-purple-300' : 'btn-ghost'
-              }`}
-            >
-              SQL
-            </button>
-            {data.length > 0 && (
-              <>
-                <button
-                  onClick={() => exportData('json')}
-                  className="btn btn-ghost btn-sm"
-                >
-                  JSON
-                </button>
-                <button
-                  onClick={() => exportData('csv')}
-                  className="btn btn-ghost btn-sm"
-                >
-                  CSV
-                </button>
-              </>
-            )}
-          </div>
-        </div>
-
-        {/* SQL Query */}
-        {showRawQuery && (
-          <div className="px-4 py-2 border-b border-slate-200 dark:border-slate-700 bg-white dark:bg-slate-800/50 space-y-2">
-            <div className="flex items-center justify-between gap-2 text-xs text-slate-500 dark:text-slate-400">
-              <span>
-                Target:&nbsp;
-                <span className="font-mono">
-                  {(activeFlowId || selectedFlowDb?.flowId)
-                    ? `flow ${activeFlowId || selectedFlowDb?.flowId}${(packageId || selectedFlowDb?.packageId) ? ` · package ${packageId || selectedFlowDb?.packageId}` : ''}`
-                    : 'workspace database'}
-                </span>
-              </span>
-              <label className="flex items-center gap-1 cursor-pointer select-none">
-                <input
-                  type="checkbox"
-                  checked={developerMode}
-                  onChange={toggleDeveloperMode}
-                />
-                <span>
-                  Developer mode {developerMode && <span className="text-amber-600 dark:text-amber-400">(destructive SQL allowed)</span>}
-                </span>
-              </label>
-            </div>
-            <div className="flex gap-2">
-              <input
-                type="text"
-                value={rawSql}
-                onChange={(e) => setRawSql(e.target.value)}
-                placeholder={developerMode ? 'SQL query (developer mode — anything goes)' : 'SELECT-only by default'}
-                className="input flex-1 font-mono"
-                onKeyDown={(e) => e.key === 'Enter' && executeRawSql()}
-              />
-              <button
-                onClick={executeRawSql}
-                disabled={loading || !rawSql.trim()}
-                className={`btn btn-md ${developerMode && !isReadOnlySql(rawSql) ? 'bg-red-600 hover:bg-red-500' : 'bg-purple-600 hover:bg-purple-500'} text-white`}
-              >
-                {developerMode && !isReadOnlySql(rawSql) ? 'Run (destructive)' : 'Run'}
-              </button>
-            </div>
-          </div>
-        )}
-
-        {/* Messages */}
-        {error && (
-          <div
-            className="px-4 py-2 bg-red-100 dark:bg-red-900/30 border-b border-red-300 dark:border-red-800 text-red-800 dark:text-red-300 text-sm flex items-center justify-between gap-2"
-            role="alert"
-          >
-            <span className="flex-1">{error}</span>
-            <CopyLink text={error} label="Copy" />
-            <button
-              onClick={() => setError(null)}
-              className="text-red-700 dark:text-red-400 hover:text-red-900 dark:hover:text-red-200 px-1"
-              aria-label="Dismiss error"
-            >×</button>
-          </div>
-        )}
-        {successMessage && (
-          <div
-            className="px-4 py-2 bg-green-100 dark:bg-green-900/30 border-b border-green-300 dark:border-green-800 text-green-800 dark:text-green-300 text-sm"
-            role="status"
-          >
-            {successMessage}
-          </div>
-        )}
-
-        {/* Data Table */}
-        <div className="flex-1 overflow-auto">
-          {loading ? (
-            <div className="flex items-center justify-center h-full text-slate-500">Loading...</div>
-          ) : data.length === 0 ? (
-            <div className="flex items-center justify-center h-full text-slate-500">
-              <div className="text-center">
-                <svg className="w-12 h-12 mx-auto mb-2 text-slate-400 dark:text-slate-600" fill="none" stroke="currentColor" viewBox="0 0 24 24">
-                  <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={1} d="M4 7v10c0 2.21 3.582 4 8 4s8-1.79 8-4V7M4 7c0 2.21 3.582 4 8 4s8-1.79 8-4M4 7c0-2.21 3.582-4 8-4s8 1.79 8 4" />
-                </svg>
-                <p>No data</p>
-              </div>
-            </div>
-          ) : (
-            <table className="min-w-max w-full text-sm">
-              <thead className="sticky top-0 bg-white dark:bg-slate-800 z-10">
-                <tr>
-                  <th className="px-2 py-2 text-left border-b border-slate-200 dark:border-slate-700 w-8">
-                    <input
-                      type="checkbox"
-                      checked={selectedRows.size === data.length && data.length > 0}
-                      onChange={toggleSelectAll}
-                      className="w-4 h-4 rounded border-slate-300 dark:border-slate-600 bg-white dark:bg-slate-700"
-                    />
-                  </th>
-                  {columns.map(col => (
-                    <th key={col} className="px-3 py-2 text-left text-xs font-medium text-slate-500 dark:text-slate-400 uppercase border-b border-slate-200 dark:border-slate-700 whitespace-nowrap">
-                      {col}
-                    </th>
-                  ))}
-                  <th className="px-2 py-2 border-b border-slate-200 dark:border-slate-700 w-10"></th>
-                </tr>
-              </thead>
-              <tbody className="divide-y divide-slate-200 dark:divide-slate-800">
-                {data.map((row, i) => {
-                  const id = row._id as string;
-                  const isSelected = selectedRows.has(id);
+          <button onClick={loadCollections} disabled={loading} className="btn" title="Read the database again">
+            <RefreshCw size={14} className={loading ? 'animate-spin' : undefined} /> Refresh
+          </button>
+        </>
+      }
+      testId="data-page"
+    >
+      <div className="oaiy-data">
+        <Card
+          className="oaiy-data-side"
+          title={currentFlowId ? 'Collections' : 'Flow databases'}
+          count={currentFlowId ? collections.length : flowDatabases.length}
+          flush
+        >
+          <div className="min-h-0 flex-1 overflow-y-auto">
+            {/* Show database browser when no flow is selected */}
+            {!currentFlowId && flowDatabases.length > 0 && (
+              <div className="oaiy-rows">
+                {flowDatabases.map(dbInfo => {
+                  const on = selectedFlowDb?.flowId === dbInfo.flowId && selectedFlowDb?.packageId === dbInfo.packageId;
                   return (
-                    <tr key={i} className={`hover:bg-slate-100 dark:hover:bg-slate-800/50 ${isSelected ? 'bg-emerald-100 dark:bg-emerald-900/20' : ''}`}>
-                      <td className="px-2 py-2">
-                        <input
-                          type="checkbox"
-                          checked={isSelected}
-                          onChange={() => toggleRowSelection(id)}
-                          className="w-4 h-4 rounded border-slate-300 dark:border-slate-600 bg-white dark:bg-slate-700"
-                        />
-                      </td>
-                      {columns.map(col => (
-                        <td key={col} className="px-3 py-2 text-slate-700 dark:text-slate-300 max-w-md whitespace-nowrap overflow-hidden text-ellipsis" title={formatValue(row[col])}>
-                          {formatValue(row[col])}
-                        </td>
-                      ))}
-                      <td className="px-2 py-2">
-                        <button
-                          onClick={() => deleteRecord(id)}
-                          className="p-1 text-slate-500 hover:text-red-600 dark:hover:text-red-400"
-                          title="Delete"
-                          aria-label="Delete record"
-                        >
-                          <svg className="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24">
-                            <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M19 7l-.867 12.142A2 2 0 0116.138 21H7.862a2 2 0 01-1.995-1.858L5 7m5 4v6m4-6v6m1-10V4a1 1 0 00-1-1h-4a1 1 0 00-1 1v3M4 7h16" />
-                          </svg>
-                        </button>
-                      </td>
-                    </tr>
+                    <button
+                      key={`${dbInfo.packageId || 'user'}-${dbInfo.flowId}`}
+                      type="button"
+                      onClick={() => setSelectedFlowDb(dbInfo)}
+                      className={`oaiy-row${on ? ' on' : ''}`}
+                      aria-pressed={on}
+                    >
+                      {dbInfo.packageId ? <Package size={14} className="shrink-0 text-signal-magenta" /> : <Database size={14} className="shrink-0 text-content-faint" />}
+                      <span className="oaiy-row-main">
+                        <span className="oaiy-row-title mono">{dbInfo.flowId.substring(0, 12)}…</span>
+                      </span>
+                      <span className="font-mono text-[11px] text-content-faint">{dbInfo.collections.length}</span>
+                    </button>
                   );
                 })}
-              </tbody>
-            </table>
-          )}
-        </div>
-      </div>
+              </div>
+            )}
 
-      {/* Confirmation Dialog */}
-      {confirmDialog && (
-        <div className="fixed inset-0 bg-black/50 backdrop-blur-sm flex items-center justify-center z-50">
-          <div className="bg-white dark:bg-slate-800 border border-slate-200 dark:border-slate-700 rounded-lg shadow-xl p-5 max-w-sm mx-4 animate-scaleIn">
-            <p className="text-slate-700 dark:text-slate-200 mb-4">{confirmDialog.message}</p>
-            <div className="flex justify-end gap-2">
-              <button
-                onClick={() => setConfirmDialog(null)}
-                className="btn btn-secondary btn-md"
-              >
-                Cancel
-              </button>
-              <button
-                onClick={confirmDialog.onConfirm}
-                className="btn btn-danger btn-md"
-              >
-                Delete
-              </button>
-            </div>
+            {/* Collections list */}
+            {currentFlowId && (
+              collections.length === 0 ? (
+                <div className="p-3">
+                  <EmptyState icon={<Database size={22} />} title="No data yet">
+                    Run a flow with a Database node, and what it stores is listed here.
+                  </EmptyState>
+                </div>
+              ) : (
+                <div className="oaiy-rows">
+                  {collections.map(col => {
+                    const on = selectedCollection === col.name;
+                    return (
+                      <button
+                        key={col.name}
+                        type="button"
+                        onClick={() => loadCollection(col.name)}
+                        className={`oaiy-row${on ? ' on' : ''}`}
+                        aria-pressed={on}
+                      >
+                        <span className="oaiy-row-main">
+                          <span className="oaiy-row-title">{col.name}</span>
+                        </span>
+                        <span className="font-mono text-[11px] text-content-faint">{col.count}</span>
+                      </button>
+                    );
+                  })}
+                </div>
+              )
+            )}
+
+            {/* Empty state when no flow and no databases */}
+            {!currentFlowId && flowDatabases.length === 0 && (
+              <div className="p-3">
+                <EmptyState icon={<Database size={22} />} title="No databases">
+                  Run a flow with a Database node to make one.
+                </EmptyState>
+              </div>
+            )}
           </div>
-        </div>
-      )}
-    </div>
+          {currentPackageId && (
+            <p className="oaiy-help faint border-t border-edge-secondary px-4 py-2">From package {currentPackageId}</p>
+          )}
+        </Card>
+
+        <Card
+          className="oaiy-data-main"
+          title={selectedCollection || 'No collection chosen'}
+          count={data.length > 0 ? `${data.length} record${data.length === 1 ? '' : 's'}` : undefined}
+          flush
+          actions={
+            <>
+              {selectedRows.size > 0 && (
+                <button onClick={deleteSelectedRecords} className="btn btn-danger btn-sm">
+                  <Trash2 size={12} /> Delete {selectedRows.size}
+                </button>
+              )}
+              {selectedCollection && data.length > 0 && (
+                <button onClick={clearAllRecords} className="btn btn-danger btn-sm" title="Delete every record in this collection">
+                  Delete all
+                </button>
+              )}
+              {data.length > 0 && (
+                <>
+                  <button onClick={() => exportData('json')} className="btn btn-sm" title="Download these records as JSON">JSON</button>
+                  <button onClick={() => exportData('csv')} className="btn btn-sm" title="Download these records as CSV">CSV</button>
+                </>
+              )}
+            </>
+          }
+        >
+          {/* SQL Query */}
+          {showRawQuery && (
+            <div className="flex flex-col gap-2 border-b border-edge-secondary px-4 py-3">
+              <div className="flex flex-wrap items-center justify-between gap-2 text-[12px] text-content-secondary">
+                <span>
+                  Runs against{' '}
+                  <span className="font-mono text-content-primary">
+                    {currentFlowId
+                      ? `flow ${currentFlowId}${currentPackageId ? ` · package ${currentPackageId}` : ''}`
+                      : 'the workspace database'}
+                  </span>
+                </span>
+                <label className="flex cursor-pointer select-none items-center gap-1.5">
+                  <input type="checkbox" checked={developerMode} onChange={toggleDeveloperMode} />
+                  <span>
+                    Developer mode {developerMode && <span className="text-signal-amber">(changes allowed)</span>}
+                  </span>
+                </label>
+              </div>
+              <div className="flex gap-2">
+                <input
+                  type="text"
+                  value={rawSql}
+                  onChange={(e) => setRawSql(e.target.value)}
+                  placeholder={developerMode ? 'Any SQL (developer mode)' : 'SELECT … (read-only unless developer mode is on)'}
+                  className="oaiy-input mono flex-1"
+                  onKeyDown={(e) => e.key === 'Enter' && executeRawSql()}
+                  aria-label="SQL query"
+                />
+                <button
+                  onClick={executeRawSql}
+                  disabled={loading || !rawSql.trim()}
+                  className={destructive ? 'btn btn-danger' : 'btn btn-primary'}
+                >
+                  {destructive ? 'Run (changes data)' : 'Run'}
+                </button>
+              </div>
+            </div>
+          )}
+
+          {/* Messages */}
+          {error && (
+            <div className="px-4 pt-3" role="alert">
+              <div className="oaiy-banner">
+                <span className="min-w-0 flex-1 break-words">{error}</span>
+                <CopyLink text={error} label="Copy" />
+                <button onClick={() => setError(null)} className="oaiy-icon-btn sm" aria-label="Dismiss error">
+                  <X size={13} />
+                </button>
+              </div>
+            </div>
+          )}
+          {successMessage && (
+            <div className="px-4 pt-3" role="status">
+              <div className="oaiy-banner ok">{successMessage}</div>
+            </div>
+          )}
+
+          {/* Data Table */}
+          <div className="oaiy-table-wrap">
+            {loading ? (
+              <div className="grid h-full min-h-[160px] place-items-center text-[13px] text-content-secondary">Reading…</div>
+            ) : data.length === 0 ? (
+              <div className="p-4">
+                <EmptyState icon={<Database size={24} />} title="No records">
+                  {selectedCollection ? 'This collection is empty.' : 'Pick a collection on the left, or query with SQL.'}
+                </EmptyState>
+              </div>
+            ) : (
+              <table className="oaiy-table min-w-max">
+                <thead>
+                  <tr>
+                    <th className="w-8">
+                      <input
+                        type="checkbox"
+                        checked={selectedRows.size === data.length && data.length > 0}
+                        onChange={toggleSelectAll}
+                        aria-label="Select every record"
+                      />
+                    </th>
+                    {columns.map(col => (
+                      <th key={col}>{col}</th>
+                    ))}
+                    <th className="w-10" aria-label="Actions"></th>
+                  </tr>
+                </thead>
+                <tbody>
+                  {data.map((row, i) => {
+                    const id = row._id as string;
+                    const isSelected = selectedRows.has(id);
+                    return (
+                      <tr key={i} className={isSelected ? 'selected' : undefined}>
+                        <td>
+                          <input
+                            type="checkbox"
+                            checked={isSelected}
+                            onChange={() => toggleRowSelection(id)}
+                            aria-label="Select this record"
+                          />
+                        </td>
+                        {columns.map(col => (
+                          <td key={col} title={formatValue(row[col])}>
+                            {formatValue(row[col])}
+                          </td>
+                        ))}
+                        <td>
+                          <button
+                            onClick={() => deleteRecord(id)}
+                            className="oaiy-icon-btn sm"
+                            title="Delete this record"
+                            aria-label="Delete record"
+                          >
+                            <Trash2 size={13} />
+                          </button>
+                        </td>
+                      </tr>
+                    );
+                  })}
+                </tbody>
+              </table>
+            )}
+          </div>
+        </Card>
+      </div>
+    </SectionPage>
   );
 }
 

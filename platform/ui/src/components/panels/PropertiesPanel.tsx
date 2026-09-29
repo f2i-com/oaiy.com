@@ -1,4 +1,5 @@
 import { memo, useMemo } from 'react';
+import { MousePointerClick } from 'lucide-react';
 import type { Node } from '@xyflow/react';
 import { PropertyField } from 'oaiy-ui-components/nodes/fields/PropertyField';
 import type { NodeDefinition } from 'oaiy-core';
@@ -7,18 +8,9 @@ import { getCustomNodeDefinition } from '../../services/customNodeRegistry';
 import { getService, listAllServices } from '../../utils/serviceRegistry';
 import { listDesktopServices } from '../../lib/desktopServices';
 
-// Static Tailwind literals for the node accent swatch, keyed by the node
-// definition's `color`. Tailwind only emits classes it sees as whole literal
-// strings during its content scan, so an interpolated `bg-${color}-500` purges
-// to an invisible zero-width swatch for any color not statically present
-// elsewhere. Listing the full literals here guarantees every node color paints.
-export const SWATCH_CLASS: Record<string, string> = {
-    amber: 'bg-amber-500', blue: 'bg-blue-500', cyan: 'bg-cyan-500',
-    emerald: 'bg-emerald-500', gray: 'bg-gray-500', green: 'bg-green-500',
-    indigo: 'bg-indigo-500', orange: 'bg-orange-500', pink: 'bg-pink-500',
-    purple: 'bg-purple-500', red: 'bg-red-500', slate: 'bg-slate-500',
-    teal: 'bg-teal-500', violet: 'bg-violet-500',
-};
+import { SWATCH_CLASS } from './nodeSwatches';
+
+export { SWATCH_CLASS };
 
 interface PropertiesPanelProps {
     selectedNode: Node | null;
@@ -111,33 +103,29 @@ const PropertiesPanel = memo(({ selectedNode, updateNodeData, className = '' }: 
         return values;
     }, [definition, selectedNode, serviceFallbacks]);
 
-    // If no node selected, show placeholder
+    // If no node selected, say how to pick one.
     if (!selectedNode) {
         return (
-            <div className={`flex flex-col items-center justify-center h-full text-slate-500 p-4 ${className}`}>
-                <svg className="w-12 h-12 mb-2 opacity-20" fill="none" stroke="currentColor" viewBox="0 0 24 24">
-                    <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={1.5} d="M15 15l-2 5L9 9l11 4-5 2zm0 0l5 5M7.188 2.239l.777 2.897M5.136 7.965l-2.898-.777M13.95 4.05l-2.122 2.122m-5.657 5.656l-2.12 2.122" />
-                </svg>
-                <p className="text-sm font-medium">Select a node to view properties</p>
-                <p className="text-xs mt-1">Click on any node in the canvas to edit its configuration.</p>
+            <div className={`p-3 ${className}`}>
+                <div className="oaiy-empty bare">
+                    <MousePointerClick size={22} />
+                    <p className="oaiy-empty-title">No node selected</p>
+                    <p className="oaiy-empty-text">Click a node on the canvas to set it up here.</p>
+                </div>
             </div>
         );
     }
 
     if (!definition) {
         return (
-            <div className={`p-4 ${className}`}>
-                <div className="bg-amber-100 dark:bg-amber-900/20 border border-amber-400 dark:border-amber-700/50 rounded-lg p-4 text-amber-900 dark:text-amber-200">
-                    <h3 className="font-bold mb-1">Unknown Node Type</h3>
-                    <p className="text-sm opacity-80">
-                        Could not find definition for node type:{' '}
-                        <code className="bg-amber-200/60 dark:bg-black/30 px-1 rounded">{selectedNode.type}</code>
-                    </p>
-                    <p className="text-xs opacity-70 mt-2">
-                        This usually means the flow was saved with a node from a plugin
-                        that is no longer installed, or the node id was renamed in an
-                        update. Select the node on the canvas and press Delete to
-                        remove it, or replace it with a current equivalent.
+            <div className={`p-3 ${className}`}>
+                <div className="oaiy-note warn">
+                    <strong>Unknown node type</strong>
+                    <p className="mt-1 mb-0">
+                        No definition for <code className="oaiy-code">{selectedNode.type}</code>. The flow was
+                        likely saved with a node from a plugin that is no longer installed, or the node's id
+                        was renamed in an update. Select it on the canvas and press Delete to remove it, or
+                        replace it with a current one.
                     </p>
                 </div>
             </div>
@@ -222,20 +210,20 @@ const PropertiesPanel = memo(({ selectedNode, updateNodeData, className = '' }: 
     };
 
     return (
-        <div className={`flex flex-col h-full bg-white/50 dark:bg-slate-900/50 backdrop-blur-sm ${className}`}>
-            {/* Header */}
-            <div className="p-3 border-b border-slate-200/50 dark:border-slate-700/50 flex items-center gap-2 bg-slate-100/30 dark:bg-slate-800/30">
-                <div className={`w-2 h-8 rounded-full ${SWATCH_CLASS[definition.color || 'slate'] ?? 'bg-slate-500'}`} />
-                <div>
-                    <h2 className="font-bold text-slate-800 dark:text-slate-100 text-sm">{definition.name}</h2>
-                    <div className="text-[10px] text-slate-500 dark:text-slate-400 font-mono">{selectedNode.id}</div>
+        <div className={`flex flex-col ${className}`}>
+            {/* Which node: its kind's colour, its name, its id. */}
+            <div className="flex items-center gap-2.5 border-b border-edge-secondary px-3.5 py-3">
+                <span className={`h-8 w-1.5 shrink-0 rounded-full ${SWATCH_CLASS[definition.color || 'slate'] ?? SWATCH_CLASS.slate}`} />
+                <div className="min-w-0">
+                    <h3 className="m-0 truncate text-[13.5px] font-semibold text-content-primary">{definition.name}</h3>
+                    <div className="truncate font-mono text-[11px] text-content-faint">{selectedNode.id}</div>
                 </div>
             </div>
 
-            {/* Properties Scroll Area */}
-            <div className="flex-1 overflow-y-auto p-4 space-y-4 custom-scrollbar">
+            {/* The node's settings. */}
+            <div className="flex flex-col gap-4 p-3.5">
                 {(!definition.properties || definition.properties.length === 0) && (
-                    <p className="text-slate-400 dark:text-slate-500 text-sm italic">No properties to configure.</p>
+                    <p className="oaiy-help faint">This node has nothing to set.</p>
                 )}
 
                 {(definition.properties || [])

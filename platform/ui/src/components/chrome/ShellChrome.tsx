@@ -1,16 +1,15 @@
 import {
   Menu,
   X,
-  Activity,
   Check,
   ChevronRight,
-  Cloud,
   Copy,
   Database,
+  ListChecks,
   LockKeyhole,
   Moon,
+  Package,
   Plus,
-  Puzzle,
   Server,
   Settings2,
   Share2,
@@ -34,46 +33,51 @@ import { useFocusTrap } from '../../hooks/useFocusTrap';
  * index.css — a 222px sidebar plus a 72px topbar / canvas / 64px dock grid.
  */
 
-export type ShellView = 'builder' | 'data';
+/**
+ * The editor's sections. Each is a view in its main area, never a popup:
+ *
+ *   Workflows  the flows rail and the canvas
+ *   Data       what a flow's Database nodes stored
+ *   Queue      flows running in this editor, and what they returned this session
+ *   Packages   .oaiy flow packages: their sources, and loading one
+ *   Settings   services, API keys, constants, security, general, appearance
+ *
+ * In OAIY's window the dashboard's own "Run history" tab (beside "Editor")
+ * lists every run on the machine; Queue is only this editor's.
+ */
+export type EditorSection = 'workflows' | 'data' | 'queue' | 'packages' | 'settings';
 
 export interface ShellNavItem {
-  id: string;
+  id: EditorSection;
   label: string;
   icon: LucideIcon;
+  /** Shown in the tooltip: what the section is. */
+  hint: string;
   active: boolean;
   onClick: () => void;
+  /** A count beside the label (the queue's running flows). */
+  badge?: ReactNode;
 }
 
-/** What the sections do, and which is showing: the same for the rail and for the tabs. */
-export interface ShellSectionsState {
-  view: ShellView;
-  providersOpen?: boolean;
-  runsOpen?: boolean;
-  pluginsOpen?: boolean;
-  onSelectView: (v: ShellView) => void;
-  onOpenQueue: () => void;
-  onOpenPlugins: () => void;
-  onOpenServices: () => void;
-}
+const SECTIONS: Array<{ id: EditorSection; label: string; icon: LucideIcon; hint: string }> = [
+  { id: 'workflows', label: 'Workflows', icon: Workflow, hint: 'Your flows, on the canvas' },
+  { id: 'data', label: 'Data', icon: Database, hint: "What the open flow's Database nodes stored" },
+  { id: 'queue', label: 'Queue', icon: ListChecks, hint: 'Flows running in this editor, and their results this session' },
+  { id: 'packages', label: 'Packages', icon: Package, hint: 'Flow packages (.oaiy): flows, macros and nodes to load' },
+];
+export const SETTINGS_ITEM = { id: 'settings' as const, label: 'Settings', icon: Settings2, hint: 'Services, API keys, constants, security' };
 
-/** The editor's sections: its flows, their data, and the panels (providers, runs, plugins). */
-export function shellNavItems({ view, providersOpen = false, runsOpen = false, pluginsOpen = false, onSelectView, onOpenQueue, onOpenPlugins, onOpenServices }: ShellSectionsState): ShellNavItem[] {
-  const panel = providersOpen || runsOpen || pluginsOpen;
-  return [
-    { id: 'builder', label: 'Workflows', icon: Workflow, active: view === 'builder' && !panel, onClick: () => onSelectView('builder') },
-    { id: 'data', label: 'Data', icon: Database, active: view === 'data' && !panel, onClick: () => onSelectView('data') },
-    { id: 'runs', label: 'Runs', icon: Activity, active: runsOpen, onClick: onOpenQueue },
-    { id: 'providers', label: 'Providers', icon: Cloud, active: providersOpen, onClick: onOpenServices },
-    { id: 'plugins', label: 'Plugins', icon: Puzzle, active: pluginsOpen, onClick: onOpenPlugins },
-  ];
+/** The sections, and which is showing: the same for the web rail and for the tabs in OAIY's window. */
+export function shellNavItems(section: EditorSection, onSelect: (s: EditorSection) => void, badges: Partial<Record<EditorSection, ReactNode>> = {}): ShellNavItem[] {
+  return SECTIONS.map((s) => ({ ...s, active: section === s.id, onClick: () => onSelect(s.id), badge: badges[s.id] }));
 }
 
 /* --------------------------------------------------------------- sections */
 
 /**
  * In OAIY's window the editor has no rail of its own (OAIY's sidebar is beside
- * it): its sections are a row of tabs at the top of the page, like the
- * dashboard's own pages, with New flow first.
+ * it): its sections are the dashboard's segmented tabs at the top of the page,
+ * with New flow first and Settings last.
  */
 export function ShellSections({
   items,
@@ -86,6 +90,7 @@ export function ShellSections({
   onOpenSettings: () => void;
   settingsActive: boolean;
 }) {
+  const all = [...items, { ...SETTINGS_ITEM, active: settingsActive, onClick: onOpenSettings, badge: undefined }];
   return (
     <nav className="oaiy-sections" aria-label="Flow editor">
       <button type="button" className="oaiy-sections-new" onClick={onNewFlow} title="Make a new flow">
@@ -93,7 +98,7 @@ export function ShellSections({
         <span>New flow</span>
       </button>
       <div className="oaiy-sections-tabs" role="tablist" aria-label="Sections">
-        {items.map((item) => {
+        {all.map((item) => {
           const Icon = item.icon;
           return (
             <button
@@ -102,25 +107,16 @@ export function ShellSections({
               key={item.id}
               className={item.active ? 'active' : ''}
               aria-selected={item.active}
-              title={item.label}
+              aria-label={item.label}
+              title={`${item.label}: ${item.hint}`}
               onClick={item.onClick}
             >
               <Icon size={14} />
               <span>{item.label}</span>
+              {item.badge}
             </button>
           );
         })}
-        <button
-          type="button"
-          role="tab"
-          className={settingsActive ? 'active' : ''}
-          aria-selected={settingsActive}
-          title="Settings"
-          onClick={onOpenSettings}
-        >
-          <Settings2 size={14} />
-          <span>Settings</span>
-        </button>
       </div>
     </nav>
   );
@@ -129,41 +125,24 @@ export function ShellSections({
 /* ------------------------------------------------------------------ sidebar */
 
 export function ShellSidebar({
-  providersOpen = false,
-  runsOpen = false,
-  pluginsOpen = false,
   navOpen = false,
   isPhone = false,
   onCloseNav,
-  view,
-  onSelectView,
+  items,
   onNewFlow,
-  onOpenQueue,
-  onOpenPlugins,
-  onOpenServices,
   onOpenSettings,
   settingsActive,
   companionOnline,
   companionDetail,
 }: {
-  /** Which overlay is on screen. The rail is the only place that shows where
-   *  you are, and these three entries open a panel rather than switch view --
-   *  so without them the rail says "Workflows" while you are looking at
-   *  Providers. */
-  providersOpen?: boolean;
-  runsOpen?: boolean;
-  pluginsOpen?: boolean;
   /** Below md the rail is off-canvas; this slides it in. Ignored above md,
    *  where the rail is part of the grid and always present. */
   navOpen?: boolean;
   isPhone?: boolean;
   onCloseNav?: () => void;
-  view: ShellView;
-  onSelectView: (v: ShellView) => void;
+  /** The sections (shellNavItems), the one showing marked. */
+  items: ShellNavItem[];
   onNewFlow: () => void;
-  onOpenQueue: () => void;
-  onOpenPlugins: () => void;
-  onOpenServices: () => void;
   onOpenSettings: () => void;
   settingsActive: boolean;
   companionOnline: boolean;
@@ -184,7 +163,7 @@ export function ShellSidebar({
     document.addEventListener('keydown', onKey, true);
     return () => document.removeEventListener('keydown', onKey, true);
   }, [isPhone, navOpen, onCloseNav]);
-  const nav = shellNavItems({ view, providersOpen, runsOpen, pluginsOpen, onSelectView, onOpenQueue, onOpenPlugins, onOpenServices });
+  const nav = items;
 
   // Every control in the rail dismisses the drawer as well as doing its job.
   // Wrapped once here rather than at each call site: half of these open a panel
@@ -225,11 +204,12 @@ export function ShellSidebar({
               className={item.active ? 'active' : ''}
               aria-current={item.active ? 'page' : undefined}
               aria-label={item.label}
-              title={item.label}
+              title={`${item.label}: ${item.hint}`}
               onClick={andClose(item.onClick)}
             >
               <Icon size={18} />
               <span>{item.label}</span>
+              {item.badge}
             </button>
           );
         })}
@@ -253,6 +233,8 @@ export function ShellSidebar({
         className={settingsActive ? 'oaiy-settings-btn active' : 'oaiy-settings-btn'}
         type="button"
         aria-label="Settings"
+        aria-current={settingsActive ? 'page' : undefined}
+        title={`${SETTINGS_ITEM.label}: ${SETTINGS_ITEM.hint}`}
         onClick={andClose(onOpenSettings)}
       >
         <Settings2 size={18} />
