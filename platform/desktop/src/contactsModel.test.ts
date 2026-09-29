@@ -23,10 +23,10 @@ describe('a number, readable', () => {
 });
 
 describe('the search', () => {
-  const lance = c({ name: 'Lance', number: '+61491570006', notes: 'Owns the café', facts: [{ text: 'Has a dog', at: '', by: 'agent' }] });
+  const liam = c({ name: 'Liam', number: '+61491570006', notes: 'Owns the café', facts: [{ text: 'Has a dog', at: '', by: 'agent' }] });
   it('finds a name, notes or a fact in any case, and a number typed any way', () => {
-    for (const q of ['', 'lance', 'CAFÉ', 'dog', '0491 570', '491570', '+61 491', '(04) 91']) expect(matchesContact(lance, q)).toBe(true);
-    for (const q of ['sam', '0499', 'cat']) expect(matchesContact(lance, q)).toBe(false);
+    for (const q of ['', 'liam', 'CAFÉ', 'dog', '0491 570', '491570', '+61 491', '(04) 91']) expect(matchesContact(liam, q)).toBe(true);
+    for (const q of ['sam', '0499', 'cat']) expect(matchesContact(liam, q)).toBe(false);
     // A contact with only its key is found by its number too.
     expect(matchesContact(c({ name: 'Sam', key: '400000001' }), '0400 000')).toBe(true);
   });
@@ -34,10 +34,10 @@ describe('the search', () => {
 
 describe('words', () => {
   it('names a contact, and gives their badge one or two letters', () => {
-    expect(contactLabel(c({ name: 'Lance' }))).toBe('Lance');
+    expect(contactLabel(c({ name: 'Liam' }))).toBe('Liam');
     expect(contactLabel(c({ number: '+61491570006' }))).toBe('0491 570 006');
-    expect(initials('Lance')).toBe('L');
-    expect(initials('lance smith')).toBe('LS');
+    expect(initials('Liam')).toBe('L');
+    expect(initials('liam smith')).toBe('LS');
     expect(initials('Zoë Anne O’Brien')).toBe('ZO');
     expect(initials('')).toBe('');
   });

@@ -544,17 +544,17 @@ async fn the_contact_tools_read_and_change_the_contacts_through_the_desktops_rou
     };
 
     // Named by the person's Agent: theirs, with one word for a name.
-    let r = tool("project", "contact_set", json!({ "number": "+61 491 570 006", "name": "Lance", "notes": "Prefers texts" })).await;
+    let r = tool("project", "contact_set", json!({ "number": "+61 491 570 006", "name": "Liam", "notes": "Prefers texts" })).await;
     assert!(!is_error(&r), "{r}");
-    assert_eq!(text(&r).lines().next(), Some("Saved Lance's name and notes."));
+    assert_eq!(text(&r).lines().next(), Some("Saved Liam's name and notes."));
     let c = store.get("0491570006").unwrap();
-    assert_eq!((c.name.as_str(), c.name_by, c.number.as_str()), ("Lance", Some(By::Owner), "+61 491 570 006"));
+    assert_eq!((c.name.as_str(), c.name_by, c.number.as_str()), ("Liam", Some(By::Owner), "+61 491 570 006"));
     store.add_fact("0491570006", "Has a dog called Max", By::Agent).unwrap();
     store.saw("+61400000001").unwrap();
 
     let r = tool("project", "contacts_list", json!({})).await;
     assert_eq!(r["structuredContent"]["total"], 2, "{r}");
-    assert_eq!(r["structuredContent"]["contacts"][0], json!({ "key": "491570006", "number": "+61 491 570 006", "name": "Lance", "nameBy": "owner", "notes": "Prefers texts", "facts": 1 }));
+    assert_eq!(r["structuredContent"]["contacts"][0], json!({ "key": "491570006", "number": "+61 491 570 006", "name": "Liam", "nameBy": "owner", "notes": "Prefers texts", "facts": 1 }));
     let r = tool("runner", "contacts_list", json!({ "q": "0491 570" })).await;
     assert_eq!(r["structuredContent"]["found"], 1, "a runner reads, and finds by a number written the local way: {r}");
     let r = tool("runner", "contact_get", json!({ "number": "0491570006" })).await;
@@ -571,7 +571,7 @@ async fn the_contact_tools_read_and_change_the_contacts_through_the_desktops_rou
     }
     let r = tool("project", "contact_forget_fact", json!({ "number": "+61491570006", "index": 0 })).await;
     assert!(!is_error(&r), "{r}");
-    assert_eq!(text(&r).lines().next(), Some("Forgot \u{201c}Has a dog called Max\u{201d} about Lance."));
+    assert_eq!(text(&r).lines().next(), Some("Forgot \u{201c}Has a dog called Max\u{201d} about Liam."));
     assert!(store.get("0491570006").unwrap().facts.is_empty());
     let r = tool("project", "contact_forget_fact", json!({ "number": "0491570006", "index": 0 })).await;
     assert!(is_error(&r) && text(&r).contains("no fact 0"), "{r}");

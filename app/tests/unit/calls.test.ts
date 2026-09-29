@@ -116,7 +116,7 @@ describe('speaking what the agent writes', () => {
   });
 
   it('a booking counts as promised only when told as done or doing, not offered on a condition', () => {
-    expect(promisesBooking("Sure! I'll request Tuesday 29 September at 1 p.m. under Lance.")).toBe(true);
+    expect(promisesBooking("Sure! I'll request Tuesday 29 September at 1 p.m. under Liam.")).toBe(true);
     expect(promisesBooking("I've noted that down for Tuesday.")).toBe(true);
     expect(promisesBooking("I can't check right now, so tell me the day and time you'd like and I'll take it as a request.")).toBe(false);
     expect(promisesBooking("I'll request that. What name should I use?")).toBe(false);
@@ -145,7 +145,7 @@ describe('speaking what the agent writes', () => {
     expect(text).toContain('This conversation is a live phone call');
     // Nothing in them changes during a call or from call to call (the model's prompt cache keeps them):
     // the brief the phone sends with a call is in the note that starts it.
-    expect(text).not.toMatch(/\d{4}|Lance/);
+    expect(text).not.toMatch(/\d{4}|Liam/);
     expect(text).toContain('Everything you write is spoken aloud');
     expect(text).toContain('end_call');
     expect(text).not.toContain('The receptionist brief:');
@@ -209,7 +209,7 @@ describe('a phone call answered by the agent', () => {
     const fake = fakeProvider('openai', [
       (body) => {
         const said = JSON.stringify(body.messages);
-        expect(said).toMatch(/A call from Lance \(\+61491570006\) began, [^.]+\. You greeted them: \\"Thanks for calling!\\"\\nToday is \w+ \d+ \w+ \d{4}\.\\nNothing is saved about them yet/);
+        expect(said).toMatch(/A call from Liam \(\+61491570006\) began, [^.]+\. You greeted them: \\"Thanks for calling!\\"\\nToday is \w+ \d+ \w+ \d{4}\.\\nNothing is saved about them yet/);
         expect(said).toContain('Caller: Are you open on Saturday?');
         expect(JSON.stringify(body)).toContain('The receptionist brief:\\nYou are Aokie.');
         return { text: 'Yes, we are open on Saturday from nine. Anything else?' };
@@ -218,7 +218,7 @@ describe('a phone call answered by the agent', () => {
       { text: 'Done.' },
     ]);
     const { sessions, calls } = setup();
-    const call = await sessions.callEvent({ type: 'call.started', callId: 'call_1', from: '+61 491 570 006', name: 'Lance', instructions: 'You are Aokie.', greeting: 'Thanks for calling!' });
+    const call = await sessions.callEvent({ type: 'call.started', callId: 'call_1', from: '+61 491 570 006', name: 'Liam', instructions: 'You are Aokie.', greeting: 'Thanks for calling!' });
     expect(call?.kind).toBe('call');
     await sessions.callEvent({ type: 'call.caller', callId: 'call_1', text: 'Are you open on Saturday?' });
     await settled(sessions);
@@ -235,7 +235,7 @@ describe('a phone call answered by the agent', () => {
     expect(call?.agent.turns.at(-1)).toMatchObject({ text: '[OAIY] 📞 The call ended.' });
     expect(fake.bodies.length).toBeGreaterThanOrEqual(2);
     // The same caller's next call continues the conversation.
-    const again = await sessions.callEvent({ type: 'call.started', callId: 'call_2', from: '+61491570006', name: 'Lance' });
+    const again = await sessions.callEvent({ type: 'call.started', callId: 'call_2', from: '+61491570006', name: 'Liam' });
     expect(again).toBe(call);
     expect(sessions.list.filter((s) => s.kind === 'call')).toHaveLength(1);
   });
@@ -287,30 +287,30 @@ describe('a phone call answered by the agent', () => {
   });
 
   it('a reply that speaks and ends the call says one goodbye: its own words, then the phone hangs up after them', async () => {
-    // Live 29 Sept 2026: "You're very welcome, Lance." then end_call's "You're welcome, Lance, have a great day!".
+    // Live 29 Sept 2026: "You're very welcome, Liam." then end_call's "You're welcome, Liam, have a great day!".
     const fake = fakeProvider('openai', [
-      { text: "You're very welcome, Lance.", calls: [{ name: 'end_call', input: { goodbye: "You're welcome, Lance, have a great day!" } }] },
+      { text: "You're very welcome, Liam.", calls: [{ name: 'end_call', input: { goodbye: "You're welcome, Liam, have a great day!" } }] },
       { text: 'Done.' },
     ]);
     const { sessions, calls } = setup();
-    const call = await sessions.callEvent({ type: 'call.started', callId: 'call_bye', from: '+61491570006', name: 'Lance' });
+    const call = await sessions.callEvent({ type: 'call.started', callId: 'call_bye', from: '+61491570006', name: 'Liam' });
     await sessions.callEvent({ type: 'call.caller', callId: 'call_bye', text: 'Thanks so much, bye.' });
     await settled(sessions);
-    expect(calls).toEqual([['finish', 'call_bye', "You're very welcome, Lance."]]);
+    expect(calls).toEqual([['finish', 'call_bye', "You're very welcome, Liam."]]);
     expect(fake.bodies).toHaveLength(2);
     const result = call!.agent.turns.find((t) => t.role === 'tool');
     expect(JSON.stringify(result)).toContain('was not said (one goodbye, not two)');
   });
 
   it('the earlier sentences of that reply are said as it is written, and its last one is the goodbye (a trailing line break too)', async () => {
-    fakeProvider('openai', [{ text: 'No problem at all! You are very welcome, Lance.\n', calls: [{ name: 'end_call', input: { goodbye: 'Bye now!' } }] }, { text: '' }]);
+    fakeProvider('openai', [{ text: 'No problem at all! You are very welcome, Liam.\n', calls: [{ name: 'end_call', input: { goodbye: 'Bye now!' } }] }, { text: '' }]);
     const { sessions, calls } = setup();
     await sessions.callEvent({ type: 'call.started', callId: 'call_bye2', from: '+61400000031' });
     await sessions.callEvent({ type: 'call.caller', callId: 'call_bye2', text: "That's everything." });
     await settled(sessions);
     expect(calls).toEqual([
       ['say', 'call_bye2', 'No problem at all!'],
-      ['finish', 'call_bye2', 'You are very welcome, Lance.'],
+      ['finish', 'call_bye2', 'You are very welcome, Liam.'],
     ]);
   });
 
@@ -431,10 +431,10 @@ describe('a phone call answered by the agent', () => {
 
   it("a call takes the name the caller's text conversation has (the caller id gives none)", async () => {
     const { sessions } = setup();
-    const texts = await sessions.conversationWith('+61491570006', 'Lance', 'sms');
-    expect(texts.title).toBe('Lance');
+    const texts = await sessions.conversationWith('+61491570006', 'Liam', 'sms');
+    expect(texts.title).toBe('Liam');
     const call = await sessions.callEvent({ type: 'call.started', callId: 'call_n', from: '0491570006' });
-    expect(call?.title).toBe('Lance');
+    expect(call?.title).toBe('Liam');
     expect(sameNumber('+61 491 570 006', '0491570006')).toBe(true);
     expect(sameNumber('0491570006', '0491570157')).toBe(false);
     expect(sameNumber('110', '110')).toBe(false);
@@ -517,23 +517,23 @@ describe('a phone call answered by the agent', () => {
 
   it("what the agent learns about a caller reaches their next call and texts, and the phone learns their name", async () => {
     const fake = fakeProvider('openai', [
-      { text: '', calls: [{ name: 'remember', input: { name: 'Lance', fact: 'Has a big back lawn' } }] },
-      { text: 'Thanks, Lance!' },
+      { text: '', calls: [{ name: 'remember', input: { name: 'Liam', fact: 'Has a big back lawn' } }] },
+      { text: 'Thanks, Liam!' },
       (body) => {
         const sent = JSON.stringify(body.messages);
-        expect(sent).toContain('Name: Lance');
+        expect(sent).toContain('Name: Liam');
         expect(sent).toContain('- Has a big back lawn');
-        return { text: 'Hi Lance!' };
+        return { text: 'Hi Liam!' };
       },
     ]);
     const named: CallerNote[] = [];
     const { sessions, project } = setup();
     (sessions as unknown as { hooks: { named: (n: CallerNote) => void } }).hooks.named = (n) => void named.push({ ...n });
     const call = await sessions.callEvent({ type: 'call.started', callId: 'call_n', from: '+61400000011' });
-    await sessions.callEvent({ type: 'call.caller', callId: 'call_n', text: "It's Lance, I've got a big back lawn." });
+    await sessions.callEvent({ type: 'call.caller', callId: 'call_n', text: "It's Liam, I've got a big back lawn." });
     await settled(sessions);
-    expect(call?.title).toBe('Lance');
-    expect(named.at(-1)).toMatchObject({ number: '+61400000011', name: 'Lance', facts: ['Has a big back lawn'] });
+    expect(call?.title).toBe('Liam');
+    expect(named.at(-1)).toMatchObject({ number: '+61400000011', name: 'Liam', facts: ['Has a big back lawn'] });
     expect(project.callers).toHaveLength(1);
     await sessions.callEvent({ type: 'call.ended', callId: 'call_n' });
     await sessions.callEvent({ type: 'call.started', callId: 'call_o', from: '0400000011' });
@@ -542,7 +542,7 @@ describe('a phone call answered by the agent', () => {
     expect(fake.bodies).toHaveLength(3);
     // The runner reads and changes the same note.
     const notes = callerNotesTool(() => sessions);
-    expect(await notes.run({}, new AbortController().signal)).toContain('Lance');
+    expect(await notes.run({}, new AbortController().signal)).toContain('Liam');
     expect(await notes.run({ number: '0400000011', remove: 'lawn', add: 'Prefers mornings' }, new AbortController().signal)).toContain('- Prefers mornings');
     expect(sessions.callerNote('+61400000011')?.facts).toEqual(['Prefers mornings']);
     // A name cleared: the phone forgets it, and the conversations go back to the number.
@@ -954,20 +954,20 @@ describe('a phone call answered by the agent', () => {
 
   it('a booking promised but not requested: the agent is told once, and requests it', async () => {
     const fake = fakeProvider('openai', [
-      { text: "Thanks, Lance! I'll request Tuesday at one for a mow." },
+      { text: "Thanks, Liam! I'll request Tuesday at one for a mow." },
       (body) => {
         expect(JSON.stringify(body.messages)).toContain('request_appointment was not called');
-        return { text: '', calls: [{ name: 'request_appointment', input: { callerName: 'Lance', service: 'mowing', date: '2026-09-29', time: '13:00', agreementPhrase: 'Tuesday at one' } }] };
+        return { text: '', calls: [{ name: 'request_appointment', input: { callerName: 'Liam', service: 'mowing', date: '2026-09-29', time: '13:00', agreementPhrase: 'Tuesday at one' } }] };
       },
       { text: "It's requested." },
       { text: "Sure, I'll note that too." },
     ]);
     const { sessions, calls } = setup();
     await sessions.callEvent({ type: 'call.started', callId: 'call_b1', from: '+61400000013' });
-    await sessions.callEvent({ type: 'call.caller', callId: 'call_b1', text: "It's Lance, Tuesday at one is great." });
+    await sessions.callEvent({ type: 'call.caller', callId: 'call_b1', text: "It's Liam, Tuesday at one is great." });
     await settled(sessions);
     expect(calls.map((c) => c[0])).toContain('request_appointment');
-    expect(calls.filter((c) => c[0] === 'say').map((c) => c[2])).toEqual(["Thanks, Lance!", "I'll request Tuesday at one for a mow.", "It's requested."]);
+    expect(calls.filter((c) => c[0] === 'say').map((c) => c[2])).toEqual(["Thanks, Liam!", "I'll request Tuesday at one for a mow.", "It's requested."]);
     // Once a call: the next promise is left alone.
     await sessions.callEvent({ type: 'call.caller', callId: 'call_b1', text: 'And my gate code is 1234.' });
     await settled(sessions);

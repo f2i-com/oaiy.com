@@ -852,7 +852,7 @@ mod tests {
         let client = reqwest::Client::new();
         let _off = crate::modules::test_gate::enable(&[]);
         let writes = [
-            client.post(format!("{base}/api/calendar/appointments")).json(&json!({"date": "2026-10-01", "time": "10:00", "name": "Lance"})),
+            client.post(format!("{base}/api/calendar/appointments")).json(&json!({"date": "2026-10-01", "time": "10:00", "name": "Liam"})),
             client.patch(format!("{base}/api/calendar/appointments/a1")).json(&json!({"status": "confirmed"})),
             client.delete(format!("{base}/api/calendar/appointments/a1")),
             client.put(format!("{base}/api/calendar/settings")).json(&json!({})),
@@ -916,7 +916,7 @@ mod tests {
         let mut s = cal.settings();
         s.services = vec![Service { id: String::new(), name: "Lawn mowing".into(), minutes: 60, description: String::new(), price: "from $60".into() }];
         cal.set_settings(s).unwrap();
-        let event = json!({"requestId": "appt_1", "callId": "call_1", "from": "0491570006", "callerName": "Lance", "service": "Lawnmowing", "date": "2026-10-01", "time": "10:00"});
+        let event = json!({"requestId": "appt_1", "callId": "call_1", "from": "0491570006", "callerName": "Liam", "service": "Lawnmowing", "date": "2026-10-01", "time": "10:00"});
         let a = cal.record_request(&event).unwrap();
         assert_eq!((a.status, a.service.as_str(), a.minutes, a.start.as_str(), a.source.as_str()), (Status::Requested, "Lawn mowing", 60, "2026-10-01T10:00", "call"));
         assert_eq!(a.request_id.as_deref(), Some("appt_1"));
@@ -934,7 +934,7 @@ mod tests {
         s.business = "Green Lawns".into();
         s.services = vec![Service { id: String::new(), name: "Lawn mowing".into(), minutes: 60, description: String::new(), price: "from $60".into() }];
         cal.set_settings(s).unwrap();
-        cal.record_request(&json!({"requestId": "r1", "from": "+61491570006", "callerName": "Lance", "service": "Lawn mowing", "date": "2026-10-01", "time": "10:00"})).unwrap();
+        cal.record_request(&json!({"requestId": "r1", "from": "+61491570006", "callerName": "Liam", "service": "Lawn mowing", "date": "2026-10-01", "time": "10:00"})).unwrap();
         let digest = cal.lookup("Any times for lawn mowing this week?", "0491570006", at("2026-09-28T08:00"));
         // Who it speaks for and who it is, first: no name set, it is Aokie.
         assert_eq!(digest.lines().next(), Some("Business: Green Lawns. You are Aokie, its receptionist. Now: Monday 28 September 2026, 8 am."), "{digest}");

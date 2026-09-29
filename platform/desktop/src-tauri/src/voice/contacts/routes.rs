@@ -177,13 +177,13 @@ mod tests {
         assert_eq!((status, v), (StatusCode::OK, json!({"contacts": [], "total": 0})));
 
         // Made by the person, with one name: theirs.
-        let (status, v, ..) = send(&app, Method::PUT, "/api/contacts/0491%20570%20006", &[], Some(json!({"name": "Lance", "notes": "Prefers texts"}))).await;
+        let (status, v, ..) = send(&app, Method::PUT, "/api/contacts/0491%20570%20006", &[], Some(json!({"name": "Liam", "notes": "Prefers texts"}))).await;
         assert_eq!(status, StatusCode::OK, "{v}");
-        assert_eq!((v["key"].as_str(), v["name"].as_str(), v["nameBy"].as_str(), v["notes"].as_str()), (Some("491570006"), Some("Lance"), Some("owner"), Some("Prefers texts")));
+        assert_eq!((v["key"].as_str(), v["name"].as_str(), v["nameBy"].as_str(), v["notes"].as_str()), (Some("491570006"), Some("Liam"), Some("owner"), Some("Prefers texts")));
         // Read by any way of writing the number.
         for path in ["/api/contacts/%2B61491570006", "/api/contacts/491570006", "/api/contacts/0491570006"] {
             let (status, v, ..) = send(&app, Method::GET, path, &[], None).await;
-            assert_eq!((status, v["name"].as_str()), (StatusCode::OK, Some("Lance")), "{path}");
+            assert_eq!((status, v["name"].as_str()), (StatusCode::OK, Some("Liam")), "{path}");
         }
         let (status, v, ..) = send(&app, Method::GET, "/api/contacts/0400000001", &[], None).await;
         assert_eq!((status, v["error"]["code"].as_str()), (StatusCode::NOT_FOUND, Some("no_contact")));
@@ -216,7 +216,7 @@ mod tests {
         // The list, searched.
         send(&app, Method::PUT, "/api/contacts/0400000001", &[], Some(json!({"name": "Sam"}))).await;
         let (_, v, ..) = send(&app, Method::GET, "/api/contacts?q=texts", &[], None).await;
-        assert_eq!((v["contacts"].as_array().unwrap().len(), v["contacts"][0]["name"].as_str(), v["total"].as_u64()), (1, Some("Lance"), Some(2)));
+        assert_eq!((v["contacts"].as_array().unwrap().len(), v["contacts"][0]["name"].as_str(), v["total"].as_u64()), (1, Some("Liam"), Some(2)));
 
         // The export: a file, not a contact called "export.csv".
         let (status, _, head, bytes) = send(&app, Method::GET, "/api/contacts/export.csv", &[], None).await;
@@ -225,7 +225,7 @@ mod tests {
         let disposition = head[header::CONTENT_DISPOSITION].to_str().unwrap();
         assert!(disposition.starts_with("attachment; filename=\"oaiy-contacts-") && disposition.ends_with(".csv\""), "{disposition}");
         assert_eq!(&bytes[..3], [0xEF, 0xBB, 0xBF], "UTF-8 with a byte-order mark");
-        assert!(String::from_utf8(bytes).unwrap().contains("Lance,491570006,Prefers texts,Likes tea\r\n"));
+        assert!(String::from_utf8(bytes).unwrap().contains("Liam,491570006,Prefers texts,Likes tea\r\n"));
 
         // The import: a preview first, then the one write.
         let csv = "name,mobile\nKim,0411 222 333\nNo number,\n";
@@ -252,7 +252,7 @@ mod tests {
     #[tokio::test]
     async fn the_contacts_are_closed_to_a_stranger_and_open_to_the_token_and_the_window() {
         let d = Dir::new("gate");
-        d.store().set("0491570006", Change { name: Some("Lance".into()), ..Change::default() }).unwrap();
+        d.store().set("0491570006", Change { name: Some("Liam".into()), ..Change::default() }).unwrap();
         let body = || Some(json!({"name": "Mallory"}));
         // A headless server: the token or nothing.
         let headless = crate::http::guarded_for_tests(router(d.store()), Some("desk-token".into()), false);
@@ -278,9 +278,9 @@ mod tests {
         let (status, ..) = send(&gui, Method::DELETE, "/api/contacts/0491570006", &[], None).await;
         assert_eq!(status, StatusCode::FORBIDDEN, "a change fails closed with no origin");
         let (status, v, ..) = send(&gui, Method::GET, "/api/contacts/0491570006", &[("Origin", "tauri://localhost")], None).await;
-        assert_eq!((status, v["name"].as_str()), (StatusCode::OK, Some("Lance")));
+        assert_eq!((status, v["name"].as_str()), (StatusCode::OK, Some("Liam")));
         let (status, v, ..) = send(&gui, Method::PUT, "/api/contacts/0491570006", &[("Origin", "tauri://localhost")], Some(json!({"notes": "From the window"}))).await;
         assert_eq!((status, v["notes"].as_str()), (StatusCode::OK, Some("From the window")));
-        assert_eq!(d.store().get("0491570006").unwrap().name, "Lance", "Mallory never got in");
+        assert_eq!(d.store().get("0491570006").unwrap().name, "Liam", "Mallory never got in");
     }
 }

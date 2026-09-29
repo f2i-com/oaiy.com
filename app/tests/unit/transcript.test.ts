@@ -78,8 +78,8 @@ describe("a call's words, as the chat shows them", () => {
 
   it("reads the note that opens a call: who, when, which way, and the phone's greeting", () => {
     const now = new Date(2026, 8, 29, 18, 0);
-    const start = parseCallStart(callStartNote('Lance (+61491570006)', 'Hi, thanks for calling Greenline Gardens.', 'Nothing is saved about them yet.', new Date(2026, 8, 29, 10, 17)), now);
-    expect(start).toMatchObject({ name: 'Lance', number: '+61491570006', direction: 'in', greeting: 'Hi, thanks for calling Greenline Gardens.' });
+    const start = parseCallStart(callStartNote('Liam (+61491570006)', 'Hi, thanks for calling Greenline Gardens.', 'Nothing is saved about them yet.', new Date(2026, 8, 29, 10, 17)), now);
+    expect(start).toMatchObject({ name: 'Liam', number: '+61491570006', direction: 'in', greeting: 'Hi, thanks for calling Greenline Gardens.' });
     expect(start?.at?.getTime()).toBe(new Date(2026, 8, 29, 10, 17).getTime());
     const unknown = parseCallStart(callStartNote('+61400111222', '', 'x', new Date(2026, 8, 28, 9, 5)), now);
     expect(unknown).toMatchObject({ name: '+61400111222', direction: 'in' });
@@ -112,43 +112,43 @@ describe("a call's words, as the chat shows them", () => {
 
 describe("a text thread's words, as the chat shows them", () => {
   it('drops the "Text message from" label: the name and number are said once, in the header', () => {
-    expect(parseTextTurn(textMessage('Lance', '+61491570006', 'Hello'))).toEqual([{ kind: 'text', name: 'Lance', number: '+61491570006', text: 'Hello' }]);
+    expect(parseTextTurn(textMessage('Liam', '+61491570006', 'Hello'))).toEqual([{ kind: 'text', name: 'Liam', number: '+61491570006', text: 'Hello' }]);
     expect(parseTextTurn(textMessage('+61400333444', '+61400333444', 'Is this Greenline?'))).toEqual([{ kind: 'text', number: '+61400333444', text: 'Is this Greenline?' }]);
     expect(parseTextTurn(textMessage('Test', 'test', 'Hi'))).toEqual([{ kind: 'text', name: 'Test', number: 'test', text: 'Hi' }]);
   });
 
   it('splits texts answered together, and keeps a text of several paragraphs whole', () => {
-    const joined = [textMessage('Lance', '+61491570006', 'Yes please'), textMessage('Lance', '+61491570006', 'First line\n\nSecond paragraph')].join('\n\n');
+    const joined = [textMessage('Liam', '+61491570006', 'Yes please'), textMessage('Liam', '+61491570006', 'First line\n\nSecond paragraph')].join('\n\n');
     expect(parseTextTurn(joined)).toEqual([
-      { kind: 'text', name: 'Lance', number: '+61491570006', text: 'Yes please' },
-      { kind: 'text', name: 'Lance', number: '+61491570006', text: 'First line\n\nSecond paragraph' },
+      { kind: 'text', name: 'Liam', number: '+61491570006', text: 'Yes please' },
+      { kind: 'text', name: 'Liam', number: '+61491570006', text: 'First line\n\nSecond paragraph' },
     ]);
   });
 
   it("keeps the person's own words, and a name with brackets, as they are", () => {
     expect(parseTextTurn('Tell him the invoice is attached.')).toEqual([{ kind: 'plain', text: 'Tell him the invoice is attached.' }]);
-    expect(splitWho('Lance (work) (+61491570006)')).toEqual({ name: 'Lance (work)', number: '+61491570006' });
+    expect(splitWho('Liam (work) (+61491570006)')).toEqual({ name: 'Liam (work)', number: '+61491570006' });
     expect(splitWho('+61491570006')).toEqual({ number: '+61491570006' });
-    expect(parseTextTurn('Text message from Lance: hi')).toEqual([{ kind: 'plain', text: 'Text message from Lance: hi' }]);
+    expect(parseTextTurn('Text message from Liam: hi')).toEqual([{ kind: 'plain', text: 'Text message from Liam: hi' }]);
   });
 });
 
 describe("a person's calls and texts in one conversation, as the chat reads them", () => {
   it('reads each turn by what it is: texts, a call\'s lines, a note from OAIY', () => {
-    expect(parsePhoneTurn(textMessage('Lance', '+61491570006', 'Hello'))).toEqual([{ kind: 'text', name: 'Lance', number: '+61491570006', text: 'Hello' }]);
+    expect(parsePhoneTurn(textMessage('Liam', '+61491570006', 'Hello'))).toEqual([{ kind: 'text', name: 'Liam', number: '+61491570006', text: 'Hello' }]);
     expect(parsePhoneTurn(callerLine('Hi there', { startMs: 4_200 }))).toEqual([{ kind: 'caller', text: 'Hi there', atMs: 4_000 }]);
     // A note alone, over several paragraphs, stays one note.
     expect(parsePhoneTurn('[OAIY] A note from the runner: Offer 10% off.\n\nThey are a regular.')).toEqual([{ kind: 'note', text: 'A note from the runner: Offer 10% off.\n\nThey are a regular.' }]);
     // A note with the caller's words: each its own.
     expect(parsePhoneTurn('[OAIY] The answer to your lookup "x":\nyes\nCaller [0:30]: Great')).toEqual([{ kind: 'note', text: 'The answer to your lookup "x":\nyes' }, { kind: 'caller', text: 'Great', atMs: 30_000 }]);
     // The person's own words before a text sent with them.
-    expect(parsePhoneTurn(`Tell him yes\n\n${textMessage('Lance', '+61491570006', 'Well?')}`)).toEqual([{ kind: 'plain', text: 'Tell him yes' }, { kind: 'text', name: 'Lance', number: '+61491570006', text: 'Well?' }]);
+    expect(parsePhoneTurn(`Tell him yes\n\n${textMessage('Liam', '+61491570006', 'Well?')}`)).toEqual([{ kind: 'plain', text: 'Tell him yes' }, { kind: 'text', name: 'Liam', number: '+61491570006', text: 'Well?' }]);
   });
 
   it('tells which way a turn came', () => {
-    expect(wayOf({ role: 'user', automatic: true, text: callStartNote('Lance (+61491570006)', '', 'x') })).toBe('call');
+    expect(wayOf({ role: 'user', automatic: true, text: callStartNote('Liam (+61491570006)', '', 'x') })).toBe('call');
     expect(wayOf({ role: 'user', text: callerLine('Hi', {}) })).toBe('call');
-    expect(wayOf({ role: 'user', text: textMessage('Lance', '+61491570006', 'Hi') })).toBe('sms');
+    expect(wayOf({ role: 'user', text: textMessage('Liam', '+61491570006', 'Hi') })).toBe('sms');
     expect(wayOf({ role: 'user', text: 'Tell him yes' })).toBeNull();
     expect(wayOf({ role: 'assistant', text: 'Sure' })).toBeNull();
   });
@@ -161,8 +161,8 @@ describe('the rest of what the chat reads from the words', () => {
   });
 
   it("tells a conversation's kind from its words", () => {
-    expect(conversationKind([{ role: 'user', automatic: true, text: callStartNote('Lance (+61491570006)', '', 'x') }])).toBe('call');
-    expect(conversationKind([{ role: 'user', text: textMessage('Lance', '+61491570006', 'Hi') }])).toBe('sms');
+    expect(conversationKind([{ role: 'user', automatic: true, text: callStartNote('Liam (+61491570006)', '', 'x') }])).toBe('call');
+    expect(conversationKind([{ role: 'user', text: textMessage('Liam', '+61491570006', 'Hi') }])).toBe('sms');
     expect(conversationKind([{ role: 'user', text: '[OAIY] Your flow "X" asks: y' }])).toBe('task');
     expect(conversationKind([{ role: 'user', text: 'Build me a site' }, { role: 'assistant' }])).toBe('own');
   });
@@ -183,7 +183,7 @@ describe('the rest of what the chat reads from the words', () => {
     expect(formatNumber('+61491570006', 'GB')).toBe('+61 491 570 006');
     expect(formatNumber('+61298765432', 'US')).toBe('+61 2 9876 5432');
     expect(formatNumber('test')).toBe('test');
-    expect(initials('Lance')).toBe('L');
+    expect(initials('Liam')).toBe('L');
     expect(initials('Priya Shah')).toBe('PS');
     expect(initials('+61400333444')).toBe('');
   });

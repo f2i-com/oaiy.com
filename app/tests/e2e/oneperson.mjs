@@ -1,6 +1,6 @@
 // One conversation per person, in the browser: OAIY's window with a fake OAIY
 // Desktop (the phone on, calls and texts on demand) and a scripted model, and
-// the Front desk seeded as the live one was kept before (Lance's calls under
+// the Front desk seeded as the live one was kept before (Liam's calls under
 // 0491570006, his texts under +61491570006). The app merges them on its first
 // start (keeping a backup), shows one conversation for him in order, and a
 // call from 0491570006 then a text from +61491570006 land in it, the call's
@@ -50,16 +50,16 @@ function answer(body) {
   if (/live phone call/.test(system)) {
     asked.push('call');
     if (/Tuesday/i.test(last)) return { text: 'Tuesday at ten is free. Shall I ask the team for it?', hold: 14 };
-    if (/please do/i.test(last)) return { text: 'Done, Lance. Anything else?' };
+    if (/please do/i.test(last)) return { text: 'Done, Liam. Anything else?' };
     // The goodbye, then a word after it that is never said (a model often writes "Done." after end_call).
-    if (/that's all/i.test(last)) return steps === 0 ? { calls: [{ name: 'end_call', input: { goodbye: 'Bye, Lance!' } }] } : { text: 'Done.' };
-    return { text: 'Hi Lance! How can I help?' };
+    if (/that's all/i.test(last)) return steps === 0 ? { calls: [{ name: 'end_call', input: { goodbye: 'Bye, Liam!' } }] } : { text: 'Done.' };
+    return { text: 'Hi Liam! How can I help?' };
   }
   if (/text-message thread/.test(system)) {
     asked.push('sms');
     // A text that comes as a short call ends: its agent is still at work when the call is over.
     if (/Running late/.test(last)) return steps === 0 ? { calls: [{ name: 'send_text_message', input: { body: 'No worries, see you at 10:15.' } }] } : { text: 'Told him that is fine.', hold: 5 };
-    if (steps === 0) return { calls: [{ name: 'send_text_message', input: { body: 'Thanks Lance, got the gate code. See you Tuesday!' } }] };
+    if (steps === 0) return { calls: [{ name: 'send_text_message', input: { body: 'Thanks Liam, got the gate code. See you Tuesday!' } }] };
     return { text: 'Replied.' };
   }
   asked.push('other');
@@ -251,7 +251,7 @@ try {
   await page.waitForFunction(() => /\d+ others/.test(document.querySelector('.chat .combo-button')?.textContent ?? ''), { timeout: 20_000 });
   await wait(800);
 
-  await check('the Calls (0491570006) and Texts (+61491570006) kept for Lance are merged on the first start: one conversation, the files kept in a backup', async () => {
+  await check('the Calls (0491570006) and Texts (+61491570006) kept for Liam are merged on the first start: one conversation, the files kept in a backup', async () => {
     const stored = await page.evaluate(async () => {
       const desk = await (await navigator.storage.getDirectory()).getDirectoryHandle('front-desk');
       const names = async (dir) => {
@@ -273,12 +273,12 @@ try {
     expect(stored.index.filter(([, key]) => key === '+61491570006').every(([, , thread]) => thread === 'person-61491570006') && stored.index.filter(([, key]) => key === '+61491570006').length === 2, JSON.stringify(stored.index));
   });
 
-  await check('the picker lists Lance once, under Calls and texts, with both ways, his number as it is dialled here, and when he was last in touch', async () => {
+  await check('the picker lists Liam once, under Calls and texts, with both ways, his number as it is dialled here, and when he was last in touch', async () => {
     await openPicker(page);
     const options = await pickerOptions(page);
-    const lance = options.filter((o) => o.name?.startsWith('Lance'));
-    expect(lance.length === 1, JSON.stringify(options));
-    expect(lance[0].kind === 'person' && lance[0].icons === 2 && lance[0].detail === '0491 570 006 · Calls and texts' && !!lance[0].meta, JSON.stringify(lance[0]));
+    const liam = options.filter((o) => o.name?.startsWith('Liam'));
+    expect(liam.length === 1, JSON.stringify(options));
+    expect(liam[0].kind === 'person' && liam[0].icons === 2 && liam[0].detail === '0491 570 006 · Calls and texts' && !!liam[0].meta, JSON.stringify(liam[0]));
     const groups = await page.evaluate(() => [...document.querySelectorAll('.chat .combo-group-label, .chat [role="presentation"]')].map((g) => g.textContent.trim()).filter(Boolean));
     expect(groups.some((g) => g.startsWith('Calls and texts')), JSON.stringify(groups));
     expect(!options.some((o) => o.kind === 'call' || o.kind === 'sms'), JSON.stringify(options));
@@ -286,14 +286,14 @@ try {
   await shoot(page, 'picker', async () => openPicker(page));
   await closePicker(page);
 
-  await check("Lance's conversation shows his calls and texts in the order they happened: yesterday's call, this morning's texts, the call after them", async () => {
+  await check("Liam's conversation shows his calls and texts in the order they happened: yesterday's call, this morning's texts, the call after them", async () => {
     await openPicker(page);
-    await page.evaluate(() => [...document.querySelectorAll('.chat .combo-option')].find((o) => o.querySelector('.combo-name')?.textContent.startsWith('Lance'))?.click());
+    await page.evaluate(() => [...document.querySelectorAll('.chat .combo-option')].find((o) => o.querySelector('.combo-name')?.textContent.startsWith('Liam'))?.click());
     await wait(600);
     const shown = await feed(page);
     const dividers = shown.filter((l) => l.startsWith('['));
     expect(dividers.length >= 4, JSON.stringify(dividers));
-    expect(dividers[0].startsWith('[call]') && /Call from Lance/.test(dividers[0]), JSON.stringify(dividers));
+    expect(dividers[0].startsWith('[call]') && /Call from Liam/.test(dividers[0]), JSON.stringify(dividers));
     expect(dividers[1] === '[ended]' && dividers[2].startsWith('[sms]') && /Texts/.test(dividers[2]) && dividers[3].startsWith('[call]'), JSON.stringify(dividers));
     const texts = shown.filter((l) => l.startsWith('texter: '));
     expect(texts.join('|') === 'texter: Testing|texter: Hello|texter: Hello|texter: Hello|texter: Hello', JSON.stringify(texts));
@@ -321,14 +321,14 @@ try {
     expect(held.length === 1, `the call's reply did not begin: ${asked.join(',')}`);
     await page.waitForFunction(() => document.querySelector('.chat-log')?.textContent.includes('Tuesday at te'), { timeout: 10_000 });
     const state = await page.evaluate(() => ({ live: document.querySelector('.call-live')?.textContent ?? '', button: document.querySelector('.chat .combo-button')?.textContent ?? '', conversations: document.querySelectorAll('.chat .combo-option').length }));
-    expect(/Live call/.test(state.live) && /Lance/.test(state.live), JSON.stringify(state));
-    expect(/Lance/.test(state.button) && /Live/.test(state.button), JSON.stringify(state));
+    expect(/Live call/.test(state.live) && /Liam/.test(state.live), JSON.stringify(state));
+    expect(/Liam/.test(state.button) && /Live/.test(state.button), JSON.stringify(state));
     const s = await logState(page);
     expect(s.fromBottom <= 2, JSON.stringify(s));
   });
 
   await check('a text from +61491570006 during the call lands in the same conversation, is answered, and the call goes on', async () => {
-    bridgeEvents.push({ name: 'aokie.sms.received', source: 'aokie', correlationId: 'c1', idempotencyKey: 'k1', occurredAt: new Date().toISOString(), data: { from: '+61491570006', name: 'Lance', body: 'The gate code is 4821', handle: '0400000000000040' } });
+    bridgeEvents.push({ name: 'aokie.sms.received', source: 'aokie', correlationId: 'c1', idempotencyKey: 'k1', occurredAt: new Date().toISOString(), data: { from: '+61491570006', name: 'Liam', body: 'The gate code is 4821', handle: '0400000000000040' } });
     for (let i = 0; i < 100 && !sent.length; i++) await wait(100);
     expect(sent.length === 1 && sent[0].to === '+61491570006' && /gate code/.test(sent[0].body), JSON.stringify(sent));
     await page.waitForFunction(() => document.querySelector('.chat-log')?.textContent.includes('The gate code is 4821') && document.querySelector('.chat-log .sms-out'), { timeout: 10_000 });
@@ -340,13 +340,13 @@ try {
     const replies = await page.evaluate(() => [...document.querySelectorAll('.chat-feed .msg.assistant .msg-body')].map((e) => e.textContent.trim()).filter((t) => /Tuesday at ten/.test(t)));
     expect(replies.length === 1 && replies[0] === 'Tuesday at ten is free. Shall I ask the team for it?', JSON.stringify(replies));
     voice({ type: 'call.caller', callId: 'live-1', text: 'Yes please do.', startMs: 14_000, endMs: 15_200 });
-    await page.waitForFunction(() => document.querySelector('.chat-log')?.textContent.includes('Done, Lance. Anything else?'), { timeout: 10_000 });
+    await page.waitForFunction(() => document.querySelector('.chat-log')?.textContent.includes('Done, Liam. Anything else?'), { timeout: 10_000 });
     await wait(500);
     const shown = await feed(page);
     const tail = shown.slice(shown.lastIndexOf(shown.find((l) => l.startsWith('[call]') && /Today|Call from/.test(l) && shown.indexOf(l) > shown.indexOf('texter: Hello'))));
     const at = (pattern) => tail.findIndex((l) => pattern.test(l));
-    expect(at(/^caller: Hi, can you come Tuesday/) < at(/^\[sms\] /) && at(/^\[sms\] /) < at(/^texter: The gate code is 4821/) && at(/^texter: The gate code/) < at(/^agent texted: Thanks Lance/) && at(/^agent texted: Thanks Lance/) < at(/^\[call\] .*On the call/) && at(/On the call/) < at(/^caller: Yes please do\./) && at(/^caller: Yes please do\./) < at(/^agent: Done, Lance/), JSON.stringify(tail));
-    const state = await page.evaluate(() => ({ live: !document.querySelector('.call-live')?.hidden, people: [...document.querySelectorAll('.chat .combo-option')].filter((o) => o.querySelector('.combo-name')?.textContent.startsWith('Lance')).length }));
+    expect(at(/^caller: Hi, can you come Tuesday/) < at(/^\[sms\] /) && at(/^\[sms\] /) < at(/^texter: The gate code is 4821/) && at(/^texter: The gate code/) < at(/^agent texted: Thanks Liam/) && at(/^agent texted: Thanks Liam/) < at(/^\[call\] .*On the call/) && at(/On the call/) < at(/^caller: Yes please do\./) && at(/^caller: Yes please do\./) < at(/^agent: Done, Liam/), JSON.stringify(tail));
+    const state = await page.evaluate(() => ({ live: !document.querySelector('.call-live')?.hidden, people: [...document.querySelectorAll('.chat .combo-option')].filter((o) => o.querySelector('.combo-name')?.textContent.startsWith('Liam')).length }));
     expect(state.live, 'the live header went');
     const s = await logState(page);
     expect(s.fromBottom <= 2, JSON.stringify(s));
@@ -363,16 +363,16 @@ try {
   await page.evaluate(() => document.querySelector('.to-latest')?.click());
   await wait(400);
   await openPicker(page);
-  await check('the picker still has one conversation for Lance, live', async () => {
-    const lance = (await pickerOptions(page)).filter((o) => o.name?.startsWith('Lance'));
-    expect(lance.length === 1 && lance[0].detail === 'On a call now', JSON.stringify(lance));
+  await check('the picker still has one conversation for Liam, live', async () => {
+    const liam = (await pickerOptions(page)).filter((o) => o.name?.startsWith('Liam'));
+    expect(liam.length === 1 && liam[0].detail === 'On a call now', JSON.stringify(liam));
   });
   await shoot(page, 'picker-live', async () => openPicker(page));
   await closePicker(page);
 
   await check('the desktop is given each name once, under the E.164 number', async () => {
-    const lance = named.filter((n) => /Lance/.test(n.name));
-    expect(lance.length >= 1 && lance.every((n) => n.number === '+61491570006'), JSON.stringify(named));
+    const liam = named.filter((n) => /Liam/.test(n.name));
+    expect(liam.length >= 1 && liam.every((n) => n.number === '+61491570006'), JSON.stringify(named));
   });
 
   await check('the call\'s goodbye is said, and "Done." written after end_call is a quiet note, never a line of the receptionist\'s', async () => {
@@ -401,8 +401,8 @@ try {
     const state = await page.evaluate(() => ({ live: !document.querySelector('.call-live')?.hidden }));
     expect(!state.live, JSON.stringify(state));
     await openPicker(page);
-    const lance = (await pickerOptions(page)).filter((o) => o.name?.startsWith('Lance'));
-    expect(lance.length === 1 && /Calls and texts/.test(lance[0].detail), JSON.stringify(lance));
+    const liam = (await pickerOptions(page)).filter((o) => o.name?.startsWith('Liam'));
+    expect(liam.length === 1 && /Calls and texts/.test(liam[0].detail), JSON.stringify(liam));
     await closePicker(page);
   });
 
@@ -410,7 +410,7 @@ try {
     liveCalls = ['live-2'];
     voice({ type: 'call.started', callId: 'live-2', from: '0491570006', name: '' });
     await page.waitForFunction(() => !document.querySelector('.call-live')?.hidden, { timeout: 10_000 });
-    bridgeEvents.push({ name: 'aokie.sms.received', source: 'aokie', correlationId: 'c2', idempotencyKey: 'k2', occurredAt: new Date().toISOString(), data: { from: '+61491570006', name: 'Lance', body: 'Running late, there at 10:15', handle: '0400000000000041' } });
+    bridgeEvents.push({ name: 'aokie.sms.received', source: 'aokie', correlationId: 'c2', idempotencyKey: 'k2', occurredAt: new Date().toISOString(), data: { from: '+61491570006', name: 'Liam', body: 'Running late, there at 10:15', handle: '0400000000000041' } });
     for (let i = 0; i < 100 && (sent.length < 2 || !held.length); i++) await wait(100);
     expect(sent.length === 2 && sent[1].body === 'No worries, see you at 10:15.' && held.length === 1, JSON.stringify({ sent, held: held.length }));
     // The call ends while the texts' agent is still writing.
@@ -429,8 +429,8 @@ try {
     }));
     expect(drawn.sent.length === 1 && drawn.replies.length === 1 && drawn.replies[0] === 'Told him that is fine.' && drawn.bubbles === 0 && drawn.text === 1, JSON.stringify(drawn));
     await openPicker(page);
-    const lance = (await pickerOptions(page)).filter((o) => o.name?.startsWith('Lance'));
-    expect(lance.length === 1, JSON.stringify(lance));
+    const liam = (await pickerOptions(page)).filter((o) => o.name?.startsWith('Liam'));
+    expect(liam.length === 1, JSON.stringify(liam));
     await closePicker(page);
   });
 

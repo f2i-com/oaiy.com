@@ -1,9 +1,9 @@
-// Contacts, in the browser: a fake OAIY Desktop that keeps contacts (Lance,
+// Contacts, in the browser: a fake OAIY Desktop that keeps contacts (Liam,
 // named by the person, with their notes for the receptionist and what it
 // remembered), its control API (recording what the Agent's page asks), and a
 // scripted model; the Front desk seeded as the live one was kept (its own
-// facts about Lance in callers.json). In OAIY's window: the facts are moved to
-// the desktop once, the runner knows who answers the phone, a call from Lance
+// facts about Liam in callers.json). In OAIY's window: the facts are moved to
+// the desktop once, the runner knows who answers the phone, a call from Liam
 // has his contact in its context (the business's notes first) and says who it
 // is, what the call's agent remembers is written to his contact, and his
 // conversation's "Contact" opens the dashboard on him (ui_open). In a browser
@@ -53,7 +53,7 @@ function answer(body) {
   const steps = body.messages.slice(lastUser + 1).filter((m) => m.role === 'assistant').length;
   const kind = /live phone call/.test(system) ? 'call' : /text-message thread/.test(system) ? 'sms' : 'other';
   asked.push({ kind, system, messages: JSON.stringify(body.messages) });
-  if (kind === 'call') return steps === 0 ? { calls: [{ name: 'remember', input: { fact: 'Gate code 4821' } }] } : { text: 'Hi Lance! How can I help?' };
+  if (kind === 'call') return steps === 0 ? { calls: [{ name: 'remember', input: { fact: 'Gate code 4821' } }] } : { text: 'Hi Liam! How can I help?' };
   return { text: 'Done.' };
 }
 const model = createHttpServer(async (req, res) => {
@@ -88,10 +88,10 @@ const keyOf = (number) => {
   const digits = String(number).replace(/\D/g, '');
   return digits.length >= 8 ? digits.slice(-9) : '';
 };
-const NOTES = 'Call him Lance, never Mr Smith. Always offer the loyalty discount.';
-/** The desktop's contacts, by key: Lance, named by the person, with their notes and what the receptionist remembered. */
+const NOTES = 'Call him Liam, never Mr Smith. Always offer the loyalty discount.';
+/** The desktop's contacts, by key: Liam, named by the person, with their notes and what the receptionist remembered. */
 const contacts = new Map([
-  ['491570006', { key: '491570006', number: '+61491570006', name: 'Lance', nameBy: 'owner', notes: NOTES, facts: [{ text: 'Invoices go to the body corporate', at: '2026-09-28T00:00:00Z', by: 'owner' }, { text: 'Has a dog called Max', at: '2026-09-28T00:00:00Z', by: 'agent' }], createdAt: '2026-09-28T00:00:00Z', updatedAt: '2026-09-28T00:00:00Z' }],
+  ['491570006', { key: '491570006', number: '+61491570006', name: 'Liam', nameBy: 'owner', notes: NOTES, facts: [{ text: 'Invoices go to the body corporate', at: '2026-09-28T00:00:00Z', by: 'owner' }, { text: 'Has a dog called Max', at: '2026-09-28T00:00:00Z', by: 'agent' }], createdAt: '2026-09-28T00:00:00Z', updatedAt: '2026-09-28T00:00:00Z' }],
 ]);
 /** Every fact posted to a contact: its number, words and who wrote it. */
 const posted = [];
@@ -226,7 +226,7 @@ async function shoot(page, scene, before) {
   await page.evaluate(() => window.__oaiySetTheme?.('light'));
 }
 
-/** The Front desk as the live one was kept (Lance's own facts in callers.json), the model, and the phone on. */
+/** The Front desk as the live one was kept (Liam's own facts in callers.json), the model, and the phone on. */
 async function seed(page, paired) {
   await page.goto(`${base}/tests/e2e/harness.html`);
   await page.evaluate(async (modelUrl, paired) => {
@@ -293,11 +293,11 @@ try {
   });
 
   await check("his contact is read into the Front desk's copy: the business's name for him, its notes, what was remembered", async () => {
-    await page.waitForFunction(() => [...document.querySelectorAll('.chat .combo-option .combo-name')].some((n) => n.textContent === 'Lance') || document.querySelector('.chat .combo-button')?.textContent.includes('Lance'), { timeout: 10_000 }).catch(() => {});
+    await page.waitForFunction(() => [...document.querySelectorAll('.chat .combo-option .combo-name')].some((n) => n.textContent === 'Liam') || document.querySelector('.chat .combo-button')?.textContent.includes('Liam'), { timeout: 10_000 }).catch(() => {});
     const kept = await stored(page);
-    const lance = kept.callers.find((c) => c.number === '+61491570006');
-    expect(lance?.name === 'Lance' && lance.nameBy === 'owner' && lance.notes === 'Call him Lance, never Mr Smith. Always offer the loyalty discount.', JSON.stringify(lance));
-    expect(lance.ownerFacts?.join() === 'Invoices go to the body corporate' && lance.facts.includes('Has a dog called Max') && lance.facts.includes('Prefers afternoons'), JSON.stringify(lance));
+    const liam = kept.callers.find((c) => c.number === '+61491570006');
+    expect(liam?.name === 'Liam' && liam.nameBy === 'owner' && liam.notes === 'Call him Liam, never Mr Smith. Always offer the loyalty discount.', JSON.stringify(liam));
+    expect(liam.ownerFacts?.join() === 'Invoices go to the body corporate' && liam.facts.includes('Has a dog called Max') && liam.facts.includes('Prefers afternoons'), JSON.stringify(liam));
   });
 
   await check('the runner knows who answers the phone, and for whom', async () => {
@@ -311,23 +311,23 @@ try {
     await page.waitForFunction(() => document.querySelector('.chat-log')?.textContent.includes('Done.'), { timeout: 10_000 });
   });
 
-  await check("a call from Lance has his contact in the call's context (the business's notes first, and winning) and says who it is", async () => {
+  await check("a call from Liam has his contact in the call's context (the business's notes first, and winning) and says who it is", async () => {
     liveCalls = ['live-1'];
     voice({ type: 'call.started', callId: 'live-1', from: '0491570006', name: '', greeting: 'Hi, thanks for calling Green Lawns. How can I help?' });
     await page.waitForFunction(() => !document.querySelector('.call-live')?.hidden, { timeout: 10_000 });
     await wait(500);
-    voice({ type: 'call.caller', callId: 'live-1', text: "Hi, it's Lance. The gate code is 4821.", startMs: 3_100, endMs: 5_400 });
+    voice({ type: 'call.caller', callId: 'live-1', text: "Hi, it's Liam. The gate code is 4821.", startMs: 3_100, endMs: 5_400 });
     for (let i = 0; i < 100 && !asked.some((a) => a.kind === 'call'); i++) await wait(100);
     const call = asked.find((a) => a.kind === 'call');
     expect(call, 'the call was not answered');
-    expect(call.messages.includes('Notes from the business: Call him Lance, never Mr Smith. Always offer the loyalty discount.'), call.messages.slice(0, 1500));
+    expect(call.messages.includes('Notes from the business: Call him Liam, never Mr Smith. Always offer the loyalty discount.'), call.messages.slice(0, 1500));
     expect(call.messages.includes('- Invoices go to the body corporate') && call.messages.includes('- Has a dog called Max'), call.messages.slice(0, 1500));
     expect(call.messages.includes('the notes win'), 'the call is not told the notes win');
-    expect(call.messages.includes('Name: Lance (the name the business has them by: use it)'), call.messages.slice(0, 1500));
+    expect(call.messages.includes('Name: Liam (the name the business has them by: use it)'), call.messages.slice(0, 1500));
     expect(call.system.includes('You are Aokie, the receptionist for Green Lawns.') && call.system.includes('never "OAIY", never "your person"'), call.system.slice(0, 1200));
-    await page.waitForFunction(() => document.querySelector('.chat-log')?.textContent.includes('Hi Lance! How can I help?'), { timeout: 10_000 });
+    await page.waitForFunction(() => document.querySelector('.chat-log')?.textContent.includes('Hi Liam! How can I help?'), { timeout: 10_000 });
     const title = await page.evaluate(() => document.querySelector('.chat .combo-button .convo-name')?.textContent ?? '');
-    expect(/^Lance/.test(title), title);
+    expect(/^Liam/.test(title), title);
   });
 
   await check("what the call's agent remembers is written to his contact, as the receptionist's", async () => {
@@ -388,16 +388,16 @@ try {
 
   await check('in another page the facts are moved again: nothing the desktop has is added twice', async () => {
     for (let i = 0; i < 50 && !(await stored(tab)).moved; i++) await wait(100);
-    const lance = contacts.get('491570006').facts.map((f) => f.text.toLowerCase());
-    expect(new Set(lance).size === lance.length, JSON.stringify(lance));
+    const liam = contacts.get('491570006').facts.map((f) => f.text.toLowerCase());
+    expect(new Set(liam).size === liam.length, JSON.stringify(liam));
     expect(posted.length - postedBefore === 2 && (await stored(tab)).moved?.there === 2, JSON.stringify(posted.slice(postedBefore)));
   });
 
   await check('"Contact" in a browser tab shows his contact read only: the name, the notes for the receptionist, what it remembered', async () => {
     // His conversation takes the name the business has him by, once his contact is read.
     await openPicker(tab);
-    await tab.waitForFunction(() => [...document.querySelectorAll('.chat .combo-option .combo-name')].some((n) => n.textContent === 'Lance'), { timeout: 10_000 });
-    await tab.evaluate(() => [...document.querySelectorAll('.chat .combo-option')].find((o) => o.querySelector('.combo-name')?.textContent === 'Lance')?.click());
+    await tab.waitForFunction(() => [...document.querySelectorAll('.chat .combo-option .combo-name')].some((n) => n.textContent === 'Liam'), { timeout: 10_000 });
+    await tab.evaluate(() => [...document.querySelectorAll('.chat .combo-option')].find((o) => o.querySelector('.combo-name')?.textContent === 'Liam')?.click());
     await wait(500);
     const before = mcp.length;
     await tab.click('.chat .convo-contact');
@@ -413,8 +413,8 @@ try {
         inputs: pop.querySelectorAll('input, textarea, [contenteditable]').length,
       };
     });
-    expect(card.name === 'Lance' && /0491 570 006/.test(card.number) && /named by you/.test(card.number), JSON.stringify(card));
-    expect(card.heads.join('|') === 'Notes for the receptionist|What the receptionist remembered' && card.notes === 'Call him Lance, never Mr Smith. Always offer the loyalty discount.', JSON.stringify(card));
+    expect(card.name === 'Liam' && /0491 570 006/.test(card.number) && /named by you/.test(card.number), JSON.stringify(card));
+    expect(card.heads.join('|') === 'Notes for the receptionist|What the receptionist remembered' && card.notes === 'Call him Liam, never Mr Smith. Always offer the loyalty discount.', JSON.stringify(card));
     expect(['Invoices go to the body corporate', 'Has a dog called Max', 'Gate code 4821'].every((f) => card.facts.includes(f)) && card.inputs === 0, JSON.stringify(card));
     expect(!mcp.slice(before).some((m) => m.method === 'tools/call'), 'the tab asked the control API');
   });

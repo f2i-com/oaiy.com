@@ -3,8 +3,8 @@ import { filterItems, groupItems, keyAction, moveActive } from '../../src/ui/com
 
 const items = [
   { id: 'own', label: 'The runner', detail: "Your conversation: it directs the phone's agents", group: 'Yours' },
-  { id: 'call-lance', label: 'Lance', detail: '+61 491 570 006', keywords: '+61491570006 calls', group: 'Calls' },
-  { id: 'sms-lance', label: 'Lance', detail: '+61 491 570 006', keywords: '+61491570006 texts', group: 'Texts' },
+  { id: 'call-liam', label: 'Liam', detail: '+61 491 570 006', keywords: '+61491570006 calls', group: 'Calls' },
+  { id: 'sms-liam', label: 'Liam', detail: '+61 491 570 006', keywords: '+61491570006 texts', group: 'Texts' },
   { id: 'call-priya', label: 'Priya Shah', detail: '+61 400 111 222', keywords: '+61400111222', group: 'Calls' },
   { id: 'sms-unknown', label: '+61400333444', keywords: 'texts', group: 'Texts' },
   { id: 'task', label: 'Morning summary', detail: 'Flow tasks', group: 'Flow tasks' },
@@ -19,7 +19,7 @@ describe('the picker finds what is typed', () => {
   });
 
   it('finds by name, any case, names starting with the search first', () => {
-    expect(ids(filterItems(items, 'lan'))).toEqual(['call-lance', 'sms-lance']);
+    expect(ids(filterItems(items, 'lia'))).toEqual(['call-liam', 'sms-liam']);
     expect(ids(filterItems(items, 'SHAH'))).toEqual(['call-priya']);
     // "sum" starts a word of one name, and is inside nothing else.
     expect(ids(filterItems(items, 'sum'))).toEqual(['task']);
@@ -29,7 +29,7 @@ describe('the picker finds what is typed', () => {
 
   it('finds by number, however it is spaced, and by the line under the name', () => {
     expect(ids(filterItems(items, '0491 570'))).toEqual([]);
-    expect(ids(filterItems(items, '491 570'))).toEqual(['call-lance', 'sms-lance']);
+    expect(ids(filterItems(items, '491 570'))).toEqual(['call-liam', 'sms-liam']);
     // A name that starts with it (a number as the name) comes first.
     expect(ids(filterItems(items, '+61400'))).toEqual(['sms-unknown', 'call-priya']);
     expect(ids(filterItems(items, '333444'))).toEqual(['sms-unknown']);
@@ -37,9 +37,9 @@ describe('the picker finds what is typed', () => {
   });
 
   it('needs every word, and finds by group and status words too', () => {
-    expect(ids(filterItems(items, 'lance texts'))).toEqual(['sms-lance']);
-    expect(ids(filterItems(items, 'calls lance'))).toEqual(['call-lance']);
-    expect(ids(filterItems(items, 'lance zebra'))).toEqual([]);
+    expect(ids(filterItems(items, 'liam texts'))).toEqual(['sms-liam']);
+    expect(ids(filterItems(items, 'calls liam'))).toEqual(['call-liam']);
+    expect(ids(filterItems(items, 'liam zebra'))).toEqual([]);
   });
 
   it('says nothing matched with an empty list', () => {
@@ -55,7 +55,7 @@ describe("the picker's groups", () => {
   });
 
   it("while searching, the best match's group leads", () => {
-    const found = filterItems(items, 'lance texts');
+    const found = filterItems(items, 'liam texts');
     expect(groupItems(found, ['Yours', 'Calls', 'Texts'], true).map((g) => g.group)).toEqual(['Texts']);
     const both = filterItems(items, '+61400');
     expect(groupItems(both, ['Yours', 'Calls', 'Texts'], true).map((g) => g.group)).toEqual(['Texts', 'Calls']);

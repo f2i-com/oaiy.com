@@ -134,7 +134,7 @@ beforeEach(async () => {
   h.modulesList.mockResolvedValue(snapshot(true, true));
   h.contactsList.mockResolvedValue({
     contacts: [
-      { key: '491570006', number: '+61491570006', name: 'Lance', nameBy: 'owner', notes: '', facts: [], createdAt: '2026-09-29T00:00:00Z', updatedAt: '2026-09-29T00:00:00Z' },
+      { key: '491570006', number: '+61491570006', name: 'Liam', nameBy: 'owner', notes: '', facts: [], createdAt: '2026-09-29T00:00:00Z', updatedAt: '2026-09-29T00:00:00Z' },
       { key: '400000001', number: '', name: 'Sam', nameBy: 'agent', notes: '', facts: [], createdAt: '2026-09-29T00:00:00Z', updatedAt: '2026-09-29T00:00:00Z' },
     ],
     total: 2,
@@ -204,7 +204,7 @@ describe('the AI Receptionist’s sub-menu', () => {
     expect(title()).toBe('Contacts');
     expect(kicker()).toBe('AI Receptionist');
     expect(nav().querySelector('[aria-current="page"]')?.textContent).toBe('Contacts');
-    expect([...host.querySelectorAll('.contact-row strong')].map((s) => s.textContent)).toEqual(['Lance', 'Sam']);
+    expect([...host.querySelectorAll('.contact-row strong')].map((s) => s.textContent)).toEqual(['Liam', 'Sam']);
     expect(host.querySelector('.contacts-side')).toBeNull();
 
     await go('overview');

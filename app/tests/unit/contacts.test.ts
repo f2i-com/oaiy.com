@@ -121,25 +121,25 @@ async function settled(sessions: Sessions): Promise<void> {
   expect(sessions.busy).toBe(false);
 }
 
-const LANCE = contact('+61491570006', {
-  name: 'Lance',
+const LIAM = contact('+61491570006', {
+  name: 'Liam',
   nameBy: 'owner',
-  notes: 'Call him Lance, never Mr Smith. Always offer the loyalty discount.',
+  notes: 'Call him Liam, never Mr Smith. Always offer the loyalty discount.',
   facts: [fact('Invoices go to the body corporate', 'owner'), fact('Has a dog called Max'), fact('Likes to be called Mr Smith')],
 });
 
 describe('what a call and a text know about the person', () => {
   it("the note that starts a call has their name, the business's notes and what was remembered", () => {
-    const { note } = mirrorContact(undefined, LANCE, '+61491570006', true);
-    const start = callStartNote('Lance (+61491570006)', 'Hi, Green Lawns.', knownText(note), new Date(2026, 8, 29, 10, 5));
-    expect(start).toContain('Name: Lance (the name the business has them by: use it)');
-    expect(start).toContain('Notes from the business: Call him Lance, never Mr Smith. Always offer the loyalty discount.');
+    const { note } = mirrorContact(undefined, LIAM, '+61491570006', true);
+    const start = callStartNote('Liam (+61491570006)', 'Hi, Green Lawns.', knownText(note), new Date(2026, 8, 29, 10, 5));
+    expect(start).toContain('Name: Liam (the name the business has them by: use it)');
+    expect(start).toContain('Notes from the business: Call him Liam, never Mr Smith. Always offer the loyalty discount.');
     expect(start).toContain('- Invoices go to the body corporate');
     expect(start).toContain('- Has a dog called Max');
   });
 
   it("the business's notes win: they come before what was remembered, and the agent is told they win", () => {
-    const text = knownText(mirrorContact(undefined, LANCE, '+61491570006', true).note);
+    const text = knownText(mirrorContact(undefined, LIAM, '+61491570006', true).note);
     const at = (s: string) => text.indexOf(s);
     expect(at('Notes from the business:')).toBeGreaterThan(-1);
     // The business's own facts sit with its notes; the receptionist's after, under their own heading.
@@ -152,31 +152,31 @@ describe('what a call and a text know about the person', () => {
   });
 
   it('a name the business gave them wins over one the agents learned, here and on the call', async () => {
-    const { sessions, named } = setup(fakeDesk([LANCE]), [{ number: '+61491570006', name: 'Lanky', nameBy: 'agent', facts: [], updatedAt: 1 }]);
+    const { sessions, named } = setup(fakeDesk([LIAM]), [{ number: '+61491570006', name: 'Lanky', nameBy: 'agent', facts: [], updatedAt: 1 }]);
     await sessions.load();
     await sessions.refreshContacts();
-    expect(sessions.callerNote('0491570006')).toMatchObject({ name: 'Lance', nameBy: 'owner' });
+    expect(sessions.callerNote('0491570006')).toMatchObject({ name: 'Liam', nameBy: 'owner' });
     // The receptionist hears another name: the business's stays, and it is told to use it.
     const call = await sessions.callEvent({ type: 'call.started', callId: 'c1', from: '0491570006' });
-    expect(call?.title).toBe('Lance');
+    expect(call?.title).toBe('Liam');
     const remember = (await (sessions as unknown as { personTools(s: unknown): Array<{ spec: { name: string }; run: (i: Record<string, unknown>, s: AbortSignal) => Promise<string> }> }).personTools(call)).find((t) => t.spec.name === 'remember')!;
-    expect(await remember.run({ name: 'Lanky' }, signal)).toBe('Saved. The business has them as Lance: call them that.');
-    expect(sessions.callerNote('0491570006')?.name).toBe('Lance');
-    expect(call?.title).toBe('Lance');
+    expect(await remember.run({ name: 'Lanky' }, signal)).toBe('Saved. The business has them as Liam: call them that.');
+    expect(sessions.callerNote('0491570006')?.name).toBe('Liam');
+    expect(call?.title).toBe('Liam');
     // The phone is still told (it keeps the business's name itself).
-    expect(named.at(-1)?.name).toBe('Lance');
+    expect(named.at(-1)?.name).toBe('Liam');
   });
 
   it("a call's first words never wait for the desktop: the note uses what was read before, and says what a read brings before the agent reads it", async () => {
-    const desk = fakeDesk([LANCE]);
+    const desk = fakeDesk([LIAM]);
     let release!: () => void;
     desk.state.hold = new Promise<void>((r) => (release = r));
     const fake = fakeProvider('openai', [
       (body) => {
         const sent = JSON.stringify(body.messages);
-        expect(sent).toContain('Notes from the business: Call him Lance, never Mr Smith.');
+        expect(sent).toContain('Notes from the business: Call him Liam, never Mr Smith.');
         expect(sent).toContain('- Has a dog called Max');
-        return { text: 'Hi Lance! How can I help?' };
+        return { text: 'Hi Liam! How can I help?' };
       },
     ]);
     const { sessions } = setup(desk);
@@ -189,8 +189,8 @@ describe('what a call and a text know about the person', () => {
     release();
     desk.state.hold = null;
     await vi.waitFor(() => expect((session.agent.turns.at(-1) as { text: string }).text).toContain('Notes from the business'));
-    expect(session.title).toBe('Lance');
-    await sessions.callEvent({ type: 'call.caller', callId: 'c2', text: 'Hi, it is Lance.' });
+    expect(session.title).toBe('Liam');
+    await sessions.callEvent({ type: 'call.caller', callId: 'c2', text: 'Hi, it is Liam.' });
     await settled(sessions);
     expect(fake.bodies).toHaveLength(1);
   });
@@ -199,12 +199,12 @@ describe('what a call and a text know about the person', () => {
     const fake = fakeProvider('openai', [
       (body) => {
         const sent = JSON.stringify(body.messages);
-        expect(sent).toContain('Notes from the business: Call him Lance, never Mr Smith.');
-        return { calls: [{ name: 'send_text_message', input: { body: 'Hi Lance, yes we can.' } }] };
+        expect(sent).toContain('Notes from the business: Call him Liam, never Mr Smith.');
+        return { calls: [{ name: 'send_text_message', input: { body: 'Hi Liam, yes we can.' } }] };
       },
       { text: '' },
     ]);
-    const { sessions, desk } = setup(fakeDesk([LANCE]));
+    const { sessions, desk } = setup(fakeDesk([LIAM]));
     await sessions.textArrived('0491 570 006', '', 'Can you come Friday?');
     await settled(sessions);
     expect(fake.bodies).toHaveLength(2);
@@ -228,11 +228,11 @@ describe('what the agents remember goes to the contact', () => {
   });
 
   it("the runner's caller_notes reads the contact, adds and takes out facts there, and leaves the business's own", async () => {
-    const { sessions, desk } = setup(fakeDesk([LANCE]));
+    const { sessions, desk } = setup(fakeDesk([LIAM]));
     const notes = callerNotesTool(() => sessions);
     const read = await notes.run({ number: '0491570006' }, signal);
-    expect(read).toContain('Lance (named by your person in Contacts)');
-    expect(read).toContain('Notes from the business: Call him Lance');
+    expect(read).toContain('Liam (named by your person in Contacts)');
+    expect(read).toContain('Notes from the business: Call him Liam');
     expect(read).toContain("- Invoices go to the body corporate (the business's)");
     const changed = await notes.run({ number: '0491570006', add: 'Prefers mornings', remove: 'mr smith' }, signal);
     expect(changed).toContain('- Prefers mornings');
@@ -241,13 +241,13 @@ describe('what the agents remember goes to the contact', () => {
     await notes.run({ number: '0491570006', remove: 'invoices' }, signal);
     expect(desk.book.get('491570006')?.facts.map((f) => f.text)).toContain('Invoices go to the body corporate');
     // The name is the business's.
-    expect(await notes.run({ number: '0491570006', name: 'L' }, signal)).toContain('Their name stays Lance');
+    expect(await notes.run({ number: '0491570006', name: 'L' }, signal)).toContain('Their name stays Liam');
   });
 });
 
 describe("the Front desk's facts, moved to the desktop once", () => {
   const OLD: CallerNote[] = [
-    { number: '+61491570006', name: 'Lance', facts: ['Has a big back lawn', 'Prefers mornings'], updatedAt: 1 },
+    { number: '+61491570006', name: 'Liam', facts: ['Has a big back lawn', 'Prefers mornings'], updatedAt: 1 },
     { number: '+61400000022', facts: ['Mows fortnightly'], updatedAt: 2 },
     { number: 'test', name: 'Test', facts: ['A pretend fact'], updatedAt: 3 },
   ];
@@ -300,8 +300,8 @@ describe("the Front desk's facts, moved to the desktop once", () => {
 
 describe('the desktop out of reach', () => {
   it('a call knows what was known when it last could read the contact, and what is remembered waits, then is sent', async () => {
-    const desk = fakeDesk([LANCE]);
-    // Lance has been in touch before (a note here); the facts were moved already.
+    const desk = fakeDesk([LIAM]);
+    // Liam has been in touch before (a note here); the facts were moved already.
     const { sessions, project } = setup(desk, [{ number: '+61491570006', facts: [], updatedAt: 1 }], { at: 1, sent: 0, there: 0, skipped: [], callers: [] });
     await sessions.load();
     await sessions.syncContacts();
@@ -313,9 +313,9 @@ describe('the desktop out of reach', () => {
     await later.sessions.syncContacts();
     const call = await later.sessions.callEvent({ type: 'call.started', callId: 'c4', from: '0491570006' });
     const start = (call!.agent.turns.at(-1) as { text: string }).text;
-    expect(start).toContain('Notes from the business: Call him Lance, never Mr Smith.');
+    expect(start).toContain('Notes from the business: Call him Liam, never Mr Smith.');
     expect(start).toContain('- Has a dog called Max');
-    expect(call!.title).toBe('Lance');
+    expect(call!.title).toBe('Liam');
     // Remembered while it is out of reach: kept here, marked to send.
     const { note, desk: said } = await later.sessions.noteCaller('0491570006', { add: 'Gate code 4821' });
     expect(note.facts).toContain('Gate code 4821');
@@ -343,14 +343,14 @@ describe('the desktop out of reach', () => {
 
 describe('a contact kept in the note', () => {
   it('before the move nothing known here is dropped; after, the facts are the desktop\'s with those not sent yet', () => {
-    const note: CallerNote = { number: '+61491570006', name: 'Lance', facts: ['Old fact'], unsent: ['Not sent yet'], updatedAt: 1 };
+    const note: CallerNote = { number: '+61491570006', name: 'Liam', facts: ['Old fact'], unsent: ['Not sent yet'], updatedAt: 1 };
     const c = contact('+61491570006', { facts: [fact('New fact')], notes: 'VIP' });
     expect(mirrorContact(note, c, '+61491570006', false).note?.facts).toEqual(['Old fact', 'New fact']);
     const after = mirrorContact(note, c, '+61491570006', true).note!;
     expect(after.facts).toEqual(['New fact', 'Not sent yet']);
     expect(after.notes).toBe('VIP');
     // The person's own name taken away in Contacts: it goes here too.
-    const owned: CallerNote = { number: '+61491570006', name: 'Lance', nameBy: 'owner', facts: [], updatedAt: 1 };
+    const owned: CallerNote = { number: '+61491570006', name: 'Liam', nameBy: 'owner', facts: [], updatedAt: 1 };
     expect(mirrorContact(owned, contact('+61491570006'), '+61491570006', true).note?.name).toBeUndefined();
     // Nothing changed: the same note back.
     const same = mirrorContact(after, c, '+61491570006', true);

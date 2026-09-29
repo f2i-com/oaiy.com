@@ -299,9 +299,9 @@ describe("the control tools each kind of conversation is given", () => {
     expect(names.every((n) => hasIcon(toolIcon(n)))).toBe(true);
     expect(toolLabel('oaiy_contact_get')).toBe('Read a contact');
     const call = (name: string, input: Record<string, unknown>) => summarizeCall({ id: 'c', name, input });
-    expect(call('contacts_list', { q: 'Lance' })).toBe('Lance');
+    expect(call('contacts_list', { q: 'Liam' })).toBe('Liam');
     expect(call('contact_get', { number: '0491 570 006' })).toBe('0491 570 006');
-    expect(call('contact_set', { number: '0491570006', name: 'Lance', notes: 'Prefers texts' })).toBe('0491570006 · Lance · notes');
+    expect(call('contact_set', { number: '0491570006', name: 'Liam', notes: 'Prefers texts' })).toBe('0491570006 · Liam · notes');
     expect(call('contact_forget_fact', { number: '0491570006', index: 2 })).toBe('0491570006 · #2');
     expect(call('ui_open', { view: 'contacts', contact: '491570006' })).toBe('contacts · 491570006');
     expect(call('ui_open', { view: 'calendar' })).toBe('calendar');

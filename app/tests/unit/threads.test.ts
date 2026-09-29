@@ -86,22 +86,22 @@ const today = () => {
 const textOf = (t: Turn) => (t.role === 'tool' ? t.results.map((r) => r.content).join('|') : t.text);
 
 describe("the live desk's calls and texts with one person, merged once", () => {
-  it('Lance\'s Calls (0491570006) and Texts (+61491570006) become one conversation, in the order they happened, keeping every turn', async () => {
+  it('Liam\'s Calls (0491570006) and Texts (+61491570006) become one conversation, in the order they happened, keeping every turn', async () => {
     const desk = liveFrontDesk();
     const store = fakeDesk(desk);
     const sessions = sessionsOn(store.project);
     await sessions.load();
 
-    const lance = sessions.threads().find((t) => t.title.startsWith('Lance'))!;
-    expect(sessions.threads().filter((t) => t.title.startsWith('Lance'))).toHaveLength(1);
-    expect(lance).toMatchObject({ id: 'person-61491570006', kind: 'person', key: '+61491570006', ways: ['call', 'sms'], unread: 8 });
+    const liam = sessions.threads().find((t) => t.title.startsWith('Liam'))!;
+    expect(sessions.threads().filter((t) => t.title.startsWith('Liam'))).toHaveLength(1);
+    expect(liam).toMatchObject({ id: 'person-61491570006', kind: 'person', key: '+61491570006', ways: ['call', 'sms'], unread: 8 });
     // Named by them: the newest name they were given.
-    expect(lance.title).toBe('Lance Smith');
-    expect(lance.call).toMatchObject({ id: 'call-0491570006', key: '+61491570006', thread: 'person-61491570006' });
-    expect(lance.sms).toMatchObject({ id: 'sms-61491570006', key: '+61491570006', thread: 'person-61491570006', handles: desk.index[1].handles });
+    expect(liam.title).toBe('Liam Smith');
+    expect(liam.call).toMatchObject({ id: 'call-0491570006', key: '+61491570006', thread: 'person-61491570006' });
+    expect(liam.sms).toMatchObject({ id: 'sms-61491570006', key: '+61491570006', thread: 'person-61491570006', handles: desk.index[1].handles });
 
     // Yesterday's call, this morning's texts, then the call after them: each lane's own order kept.
-    const turns = sessions.turnsOf(lance.id);
+    const turns = sessions.turnsOf(liam.id);
     const calls = desk.chats['call-0491570006'];
     const texts = desk.chats['sms-61491570006'];
     expect(turns).toHaveLength(calls.length + texts.length);
@@ -109,11 +109,11 @@ describe("the live desk's calls and texts with one person, merged once", () => {
     expect(turns.map((t) => t.via)).toEqual([...Array(7).fill('call'), ...Array(5).fill('sms'), ...Array(14).fill('call')]);
 
     // Each agent still has its own: the call's starts fresh at the last call, the texts' reads its texts.
-    expect(lance.call!.agent.turns.map(textOf)).toEqual(calls.map(textOf));
-    expect(lance.call!.agent.view()[0]).toMatchObject({ fresh: true });
-    expect(isCallStart(lance.call!.agent.view()[0])).toBe(true);
-    expect(lance.call!.agent.view()).toHaveLength(14);
-    expect(lance.sms!.agent.turns.map(textOf)).toEqual(texts.map(textOf));
+    expect(liam.call!.agent.turns.map(textOf)).toEqual(calls.map(textOf));
+    expect(liam.call!.agent.view()[0]).toMatchObject({ fresh: true });
+    expect(isCallStart(liam.call!.agent.view()[0])).toBe(true);
+    expect(liam.call!.agent.view()).toHaveLength(14);
+    expect(liam.sms!.agent.turns.map(textOf)).toEqual(texts.map(textOf));
 
     // One file for the conversation; the two it came from are gone from the list, and kept in the backup.
     const backup = `.backup-${today()}`;
@@ -127,10 +127,10 @@ describe("the live desk's calls and texts with one person, merged once", () => {
     expect(JSON.parse(store.files.get(`${backup}/callers.json`)!)).toEqual(desk.callers);
 
     // What was known about him, as one note under his E.164 number: the newer name, every fact once.
-    expect(sessions.callers.filter((c) => c.name?.startsWith('Lance'))).toEqual([
-      { number: '+61491570006', name: 'Lance Smith', facts: ['Lawn mowing, fortnightly', 'Prefers afternoons'], updatedAt: desk.callers[1].updatedAt },
+    expect(sessions.callers.filter((c) => c.name?.startsWith('Liam'))).toEqual([
+      { number: '+61491570006', name: 'Liam Smith', facts: ['Lawn mowing, fortnightly', 'Prefers afternoons'], updatedAt: desk.callers[1].updatedAt },
     ]);
-    expect(sessions.callerNote('0491 570 006')?.name).toBe('Lance Smith');
+    expect(sessions.callerNote('0491 570 006')?.name).toBe('Liam Smith');
 
     // The others: Priya's calls are hers (a conversation of one lane), a hidden caller's stays its own, a flow's tasks are as they were.
     const index = JSON.parse(store.files.get('sessions/index.json')!) as SessionInfo[];
@@ -149,8 +149,8 @@ describe("the live desk's calls and texts with one person, merged once", () => {
     await again.load();
     expect(store.backups).toHaveLength(1);
     expect(store.files).toEqual(after);
-    const lance = again.thread('person-61491570006')!;
-    expect(again.turnsOf(lance.id).map((t) => t.via)).toEqual([...Array(7).fill('call'), ...Array(5).fill('sms'), ...Array(14).fill('call')]);
+    const liam = again.thread('person-61491570006')!;
+    expect(again.turnsOf(liam.id).map((t) => t.via)).toEqual([...Array(7).fill('call'), ...Array(5).fill('sms'), ...Array(14).fill('call')]);
     // The rule itself, on what it returned: no change.
     const stored = { infos: JSON.parse(after.get('sessions/index.json')!), chats: new Map([...after].filter(([k]) => k.startsWith('sessions/') && k !== 'sessions/index.json').map(([k, v]) => [k.slice(9, -5), JSON.parse(v)])), callers: JSON.parse(after.get('callers.json')!) };
     expect(regroup(stored, 'AU')).toMatchObject({ changed: false, rewritten: [], stale: [] });
@@ -160,7 +160,7 @@ describe("the live desk's calls and texts with one person, merged once", () => {
     const store = fakeDesk(liveFrontDesk());
     const sessions = sessionsOn(store.project);
     await sessions.load();
-    await sessions.textArrived('+61491570006', 'Lance', 'Are you still coming Tuesday?');
+    await sessions.textArrived('+61491570006', 'Liam', 'Are you still coming Tuesday?');
     const turns = sessionsOn(store.project);
     await turns.load();
     const order = turns.turnsOf('person-61491570006').map((t) => t.via);
@@ -173,14 +173,14 @@ describe('the merge rule', () => {
 
   it("orders by the times turns carry: a call's start, its caller's words (from the start), a turn's own time, and a lane's last turn by when it was last heard", () => {
     const call: Turn[] = [
-      { role: 'user', automatic: true, text: '[OAIY] 📞 A call from Lance (0491570006) began, Tue 29 Sep, 10:17 am.\nToday is Tuesday 29 September 2026.' },
+      { role: 'user', automatic: true, text: '[OAIY] 📞 A call from Liam (0491570006) began, Tue 29 Sep, 10:17 am.\nToday is Tuesday 29 September 2026.' },
       { role: 'user', text: 'Caller [0:04]: Hi.' },
       { role: 'assistant', text: 'Hello!', calls: [] },
       { role: 'user', text: 'Caller [1:10]: Bye.' },
     ];
     const sms: Turn[] = [
-      { role: 'user', text: 'Text message from Lance (+61491570006):\nOn my way', at: at(10, 17, 30) },
-      { role: 'user', text: 'Text message from Lance (+61491570006):\nHello' },
+      { role: 'user', text: 'Text message from Liam (+61491570006):\nOn my way', at: at(10, 17, 30) },
+      { role: 'user', text: 'Text message from Liam (+61491570006):\nHello' },
     ];
     expect(laneTimes({ turns: call, lastAt: at(10, 19) })).toEqual([at(10, 17), at(10, 17, 4), at(10, 17, 4), at(10, 18, 10)]);
     // The last text has no time of its own: the lane's last-heard time.
@@ -214,8 +214,8 @@ describe('the merge rule', () => {
 
   it("notes for one person, in any format, become one: the newest name, every fact once, the newest time", () => {
     const { callers, changed } = mergeCallers([
-      { number: '+61491570006', name: 'Lance Smith', facts: ['Prefers afternoons'], updatedAt: 20 },
-      { number: '0491 570 006', name: 'Lance', facts: ['Big back lawn', 'prefers afternoons'], updatedAt: 10 },
+      { number: '+61491570006', name: 'Liam Smith', facts: ['Prefers afternoons'], updatedAt: 20 },
+      { number: '0491 570 006', name: 'Liam', facts: ['Big back lawn', 'prefers afternoons'], updatedAt: 10 },
       { number: '+61400000001', facts: [], updatedAt: 5 },
       { number: 'test', name: 'Test', facts: [], updatedAt: 1 },
     ], 'AU');
@@ -223,10 +223,10 @@ describe('the merge rule', () => {
     expect(callers).toEqual([
       { number: 'test', name: 'Test', facts: [], updatedAt: 1 },
       { number: '+61400000001', facts: [], updatedAt: 5 },
-      { number: '+61491570006', name: 'Lance Smith', facts: ['Big back lawn', 'prefers afternoons'], updatedAt: 20 },
+      { number: '+61491570006', name: 'Liam Smith', facts: ['Big back lawn', 'prefers afternoons'], updatedAt: 20 },
     ]);
     // A newer note without a name keeps the older name.
-    expect(mergeCallers([{ number: '0491570006', name: 'Lance', facts: [], updatedAt: 1 }, { number: '+61491570006', facts: ['x'], updatedAt: 2 }], 'AU').callers).toEqual([{ number: '+61491570006', name: 'Lance', facts: ['x'], updatedAt: 2 }]);
+    expect(mergeCallers([{ number: '0491570006', name: 'Liam', facts: [], updatedAt: 1 }, { number: '+61491570006', facts: ['x'], updatedAt: 2 }], 'AU').callers).toEqual([{ number: '+61491570006', name: 'Liam', facts: ['x'], updatedAt: 2 }]);
     expect(mergeCallers(callers, 'AU').changed).toBe(false);
   });
 });
@@ -241,18 +241,18 @@ describe('one conversation per person, however the phone writes their number', (
     await sessions.callEvent({ type: 'call.caller', callId: 'call_1', text: 'Is Tuesday at ten free?' });
     await settled(sessions);
     await sessions.callEvent({ type: 'call.ended', callId: 'call_1' });
-    const text = await sessions.textArrived('+61491570006', 'Lance', 'Thanks, see you then');
+    const text = await sessions.textArrived('+61491570006', 'Liam', 'Thanks, see you then');
     expect(fake.bodies).toHaveLength(1);
     expect(text.thread).toBe(call!.thread);
     expect(call).toMatchObject({ id: 'call-61491570006', key: '+61491570006', thread: 'person-61491570006' });
     expect(text).toMatchObject({ id: 'sms-61491570006', key: '+61491570006' });
     const threads = sessions.threads();
     expect(threads).toHaveLength(1);
-    expect(threads[0]).toMatchObject({ title: 'Lance', ways: ['call', 'sms'], lastWay: 'sms' });
+    expect(threads[0]).toMatchObject({ title: 'Liam', ways: ['call', 'sms'], lastWay: 'sms' });
     // The call took the name the texts brought.
-    expect(call!.title).toBe('Lance');
+    expect(call!.title).toBe('Liam');
     const turns = sessions.turnsOf(threads[0].id);
-    expect(turns.map((t) => (t.role !== 'user' ? t.role : isCallStart(t) ? 'the call began' : t.text.split('\n')[0]))).toEqual(['the call began', 'Caller: Is Tuesday at ten free?', 'assistant', '[OAIY] 📞 The call ended.', 'Text message from Lance (+61491570006):']);
+    expect(turns.map((t) => (t.role !== 'user' ? t.role : isCallStart(t) ? 'the call began' : t.text.split('\n')[0]))).toEqual(['the call began', 'Caller: Is Tuesday at ten free?', 'assistant', '[OAIY] 📞 The call ended.', 'Text message from Liam (+61491570006):']);
     expect(turns[0].role === 'user' && turns[0].text).toContain('A call from +61491570006 began');
     expect(turns.every((t) => typeof t.at === 'number')).toBe(true);
     // Kept in one file, the conversation's.
@@ -268,14 +268,14 @@ describe('one conversation per person, however the phone writes their number', (
   });
 
   it("a caller who texted first: the call's agent starts fresh, and its note has what they texted", async () => {
-    const fake = fakeProvider('openai', [{ text: 'Hi Lance, yes we got your text.' }]);
+    const fake = fakeProvider('openai', [{ text: 'Hi Liam, yes we got your text.' }]);
     const sessions = sessionsOn(fakeDesk().project, { answer: false });
-    await sessions.textArrived('+61491570006', 'Lance', 'Can you come a bit earlier on Tuesday?');
+    await sessions.textArrived('+61491570006', 'Liam', 'Can you come a bit earlier on Tuesday?');
     const call = await sessions.callEvent({ type: 'call.started', callId: 'call_1', from: '0491570006' });
     await sessions.callEvent({ type: 'call.caller', callId: 'call_1', text: 'Did you get my text?' });
     await settled(sessions);
     const sent = JSON.stringify(fake.bodies[0]);
-    expect(sent).toContain('A call from Lance (+61491570006) began');
+    expect(sent).toContain('A call from Liam (+61491570006) began');
     expect(sent).toContain('Their last contact, ');
     expect(sent).toContain('- They texted: \\"Can you come a bit earlier on Tuesday?\\"');
     // Only its own turns (the text is not a turn of the call's).
@@ -301,11 +301,11 @@ describe('one conversation per person, however the phone writes their number', (
     fakeProvider('openai', [route, route, route, route]);
     const phone = fakePhone();
     const sessions = sessionsOn(fakeDesk().project, { answer: true }, phone);
-    const call = await sessions.callEvent({ type: 'call.started', callId: 'call_1', from: '0491570006', name: 'Lance' });
+    const call = await sessions.callEvent({ type: 'call.started', callId: 'call_1', from: '0491570006', name: 'Liam' });
     await sessions.callEvent({ type: 'call.caller', callId: 'call_1', text: 'Can you do Tuesday at ten?' });
     for (let i = 0; i < 100 && !asked.length; i++) await new Promise((r) => setTimeout(r, 5));
     // The call's reply is being written: a text comes, and is answered at once by the texts' agent.
-    const text = await sessions.textArrived('+61491570006', 'Lance', "I'll send the gate code by text");
+    const text = await sessions.textArrived('+61491570006', 'Liam', "I'll send the gate code by text");
     for (let i = 0; i < 200 && !phone.sent.length; i++) await new Promise((r) => setTimeout(r, 5));
     expect(phone.sent).toEqual([{ to: '+61491570006', body: 'Got it, thanks!' }]);
     expect(call!.callId).toBe('call_1');
@@ -326,13 +326,13 @@ describe('one conversation per person, however the phone writes their number', (
 
   it("the runner's note and the person's own message go to the call going on, else to the texts", async () => {
     const sessions = sessionsOn(fakeDesk().project, { answer: false });
-    const call = await sessions.callEvent({ type: 'call.started', callId: 'call_1', from: '0491570006', name: 'Lance' });
+    const call = await sessions.callEvent({ type: 'call.started', callId: 'call_1', from: '0491570006', name: 'Liam' });
     const thread = sessions.thread(call!.thread)!;
     expect(await sessions.laneFor(thread)).toBe(call);
     await sessions.callEvent({ type: 'call.ended', callId: 'call_1' });
     // They only ever rang: their texts' agent is made for it (and texts them).
     const texts = await sessions.laneFor(sessions.thread(call!.thread)!);
-    expect(texts).toMatchObject({ kind: 'sms', key: '+61491570006', thread: call!.thread, title: 'Lance' });
+    expect(texts).toMatchObject({ kind: 'sms', key: '+61491570006', thread: call!.thread, title: 'Liam' });
     expect(sessions.threads()).toHaveLength(1);
   });
 });

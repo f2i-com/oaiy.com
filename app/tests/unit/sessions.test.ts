@@ -76,25 +76,25 @@ describe('text-message conversations', () => {
     const fake = fakeProvider('openai', [
       (body) => {
         const said = JSON.stringify(body.messages);
-        expect(said).toContain('Text message from Lance (+61491570006):\\nAre you open Saturday?');
-        expect(said).toContain('text-message thread with Lance (+61491570006)');
+        expect(said).toContain('Text message from Liam (+61491570006):\\nAre you open Saturday?');
+        expect(said).toContain('text-message thread with Liam (+61491570006)');
         expect(said).toContain('Be brief.');
         return { calls: [{ name: 'send_text_message', input: { body: 'Yes, 9 to 1 on Saturday.' } }] };
       },
       { text: 'Told them our Saturday hours.' },
     ]);
     const { sessions, desktop, store } = setup({ answer: true, instructions: 'Be brief.' });
-    const session = await sessions.textArrived('+61 491 570 006', 'Lance', 'Are you open Saturday?');
+    const session = await sessions.textArrived('+61 491 570 006', 'Liam', 'Are you open Saturday?');
     await settled(sessions);
     expect(session.id).toBe('sms-61491570006');
     expect(desktop.commands).toEqual([{ connector: 'aokie', command: 'sms.send', payload: { to: '+61491570006', body: 'Yes, 9 to 1 on Saturday.' } }]);
     expect(fake.bodies).toHaveLength(2);
     // The conversation is kept, and listed with its unread count.
     expect(store.chats.get(session.thread)?.length).toBeGreaterThan(2);
-    expect(store.index).toMatchObject([{ id: 'sms-61491570006', kind: 'sms', key: '+61491570006', title: 'Lance', unread: 1 }]);
+    expect(store.index).toMatchObject([{ id: 'sms-61491570006', kind: 'sms', key: '+61491570006', title: 'Liam', unread: 1 }]);
     // The same sender's next text continues it.
     fakeProvider('openai', [{ text: 'Nothing to reply to a thank-you.' }]);
-    const again = await sessions.textArrived('+61491570006', 'Lance', 'Thanks!');
+    const again = await sessions.textArrived('+61491570006', 'Liam', 'Thanks!');
     await settled(sessions);
     expect(again).toBe(session);
     expect(sessions.list).toHaveLength(1);
@@ -188,7 +188,7 @@ describe('a text the phone delivers again', () => {
   it("is not answered twice: the phone's handle says it is the same text", async () => {
     fakeProvider('openai', [{ calls: [{ name: 'send_text_message', input: { body: 'Hi!' } }] }, { text: 'done' }]);
     const { sessions, desktop, store } = setup({ answer: true, instructions: '' });
-    const hello = { seq: 1, name: 'aokie.sms.received', source: 'aokie', correlationId: 'c1', idempotencyKey: 'k1', occurredAt: '', data: { from: '+61491570006', name: 'Lance', body: 'Hello', handle: '040000000000002F' } };
+    const hello = { seq: 1, name: 'aokie.sms.received', source: 'aokie', correlationId: 'c1', idempotencyKey: 'k1', occurredAt: '', data: { from: '+61491570006', name: 'Liam', body: 'Hello', handle: '040000000000002F' } };
     await sessions.desktopEvent(hello);
     await settled(sessions);
     // The phone reconnects and delivers it again, under a new correlation.

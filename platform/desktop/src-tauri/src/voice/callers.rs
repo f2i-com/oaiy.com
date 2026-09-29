@@ -71,29 +71,29 @@ mod tests {
 
     #[test]
     fn a_greeting_says_the_first_name() {
-        assert_eq!(personal_greeting("Hi! Thanks for calling", "Lance Smith"), "Hi Lance! Thanks for calling");
-        assert_eq!(personal_greeting("Hello, thanks for calling", "Lance"), "Hello Lance, thanks for calling");
-        assert_eq!(personal_greeting("hey there, how can I help?", "Lance"), "hey Lance, how can I help?");
-        assert_eq!(personal_greeting("G'day! OAIY here.", "Lance"), "G'day Lance! OAIY here.");
-        assert_eq!(personal_greeting("Hi", "Lance"), "Hi Lance");
-        assert_eq!(personal_greeting("Thanks for calling OAIY.", "Lance"), "Hi Lance! Thanks for calling OAIY.");
+        assert_eq!(personal_greeting("Hi! Thanks for calling", "Liam Smith"), "Hi Liam! Thanks for calling");
+        assert_eq!(personal_greeting("Hello, thanks for calling", "Liam"), "Hello Liam, thanks for calling");
+        assert_eq!(personal_greeting("hey there, how can I help?", "Liam"), "hey Liam, how can I help?");
+        assert_eq!(personal_greeting("G'day! OAIY here.", "Liam"), "G'day Liam! OAIY here.");
+        assert_eq!(personal_greeting("Hi", "Liam"), "Hi Liam");
+        assert_eq!(personal_greeting("Thanks for calling OAIY.", "Liam"), "Hi Liam! Thanks for calling OAIY.");
         // "Hiya" and "Hello" in the middle are not a "Hi" it starts with.
-        assert_eq!(personal_greeting("Hiya, OAIY here.", "Lance"), "Hi Lance! Hiya, OAIY here.");
-        assert_eq!(personal_greeting("Thanks for calling, hello!", "Lance"), "Hi Lance! Thanks for calling, hello!");
+        assert_eq!(personal_greeting("Hiya, OAIY here.", "Liam"), "Hi Liam! Hiya, OAIY here.");
+        assert_eq!(personal_greeting("Thanks for calling, hello!", "Liam"), "Hi Liam! Thanks for calling, hello!");
         // Already said: kept as it is.
-        assert_eq!(personal_greeting("Hi Lance, thanks for calling", "Lance Smith"), "Hi Lance, thanks for calling");
-        assert_eq!(personal_greeting("Welcome back, lance!", "Lance"), "Welcome back, lance!");
+        assert_eq!(personal_greeting("Hi Liam, thanks for calling", "Liam Smith"), "Hi Liam, thanks for calling");
+        assert_eq!(personal_greeting("Welcome back, liam!", "Liam"), "Welcome back, liam!");
         // No name, or no greeting: nothing changes.
         assert_eq!(personal_greeting("Hi! Thanks for calling", ""), "Hi! Thanks for calling");
-        assert_eq!(personal_greeting("", "Lance"), "");
+        assert_eq!(personal_greeting("", "Liam"), "");
     }
 
     #[test]
     fn a_name_from_the_phone_is_a_name_only_when_it_looks_like_one() {
-        assert!(looks_like_name("Lance Smith"));
+        assert!(looks_like_name("Liam Smith"));
         // One word is a whole name.
-        assert!(looks_like_name("Lance"));
-        assert!(looks_like_name("lance"));
+        assert!(looks_like_name("Liam"));
+        assert!(looks_like_name("liam"));
         assert!(looks_like_name("Zoë"));
         assert!(!looks_like_name("+61491570006"));
         assert!(!looks_like_name("0491 570 006"));

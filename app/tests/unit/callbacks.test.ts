@@ -189,8 +189,8 @@ describe('missed calls, called back', () => {
   });
 
   it("a call back's agent is told it rang them back, and why", () => {
-    const note = callStartNote('Lance (0491570006)', "Hi, it's the receptionist, returning your call.", 'Name: Lance', new Date(2026, 8, 29, 10, 5), new Date(2026, 8, 29, 9, 40).getTime());
-    expect(note).toMatch(/^\[OAIY\] 📞 You rang Lance \(0491570006\) back, returning their missed call from .+; they answered .+\. You opened with: "Hi, it's the receptionist, returning your call\."/);
+    const note = callStartNote('Liam (0491570006)', "Hi, it's the receptionist, returning your call.", 'Name: Liam', new Date(2026, 8, 29, 10, 5), new Date(2026, 8, 29, 9, 40).getTime());
+    expect(note).toMatch(/^\[OAIY\] 📞 You rang Liam \(0491570006\) back, returning their missed call from .+; they answered .+\. You opened with: "Hi, it's the receptionist, returning your call\."/);
     expect(isCallStart({ role: 'user', text: note, automatic: true })).toBe(true);
     // A call the phone placed for another reason (a flow's call.dial): the agent is told it rang, and why.
     const placed = callStartNote('Sam (0400000009)', 'Hi Sam, it is the receptionist.', '', new Date(2026, 8, 29, 10, 5), undefined, { purpose: 'Remind them of tomorrow at 9.' });

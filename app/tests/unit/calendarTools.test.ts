@@ -90,14 +90,14 @@ describe("the calendar as the agent's tools", () => {
 
   it("a text thread sees what is free, and asks for an appointment for the person texting (a request, never confirmed)", async () => {
     const { desktop, appointments } = calendarDesktop({ now: '2026-09-29T09:00' });
-    const [free, request] = textCalendarTools(() => desktop, '+61491570006', () => 'Lance');
+    const [free, request] = textCalendarTools(() => desktop, '+61491570006', () => 'Liam');
     expect(free.spec.name).toBe('calendar_free_times');
     const times = await free.run({ from: '2026-10-02', days: 1, service: 'Lawn mowing' }, signal);
     expect(times).toContain('Fri 2 Oct (2026-10-02): free all day, 8 am–5 pm (a 60-min Lawn mowing can start any time from 8 am to 4 pm).');
     expect(request.spec.name).toBe('request_appointment');
     expect(request.spec.description).toContain('never say it is booked or confirmed');
     const out = await request.run({ service: 'Lawn mowing', date: '2026-10-02', time: '09:30' }, signal);
-    expect(appointments[0]).toMatchObject({ service: 'Lawn mowing', start: '2026-10-02T09:30', name: 'Lance', status: 'requested' });
+    expect(appointments[0]).toMatchObject({ service: 'Lawn mowing', start: '2026-10-02T09:30', name: 'Liam', status: 'requested' });
     expect(out).toContain('Staff will confirm it');
   });
 
@@ -116,13 +116,13 @@ describe("the calendar as the agent's tools", () => {
       calendar: async () => ({
         settings: {},
         now: '',
-        appointments: [{ id: 'appt_2', start: '2026-10-01T10:30', service: 'Quote visit', minutes: 30, name: 'Lance', phone: '+61491570006', status: 'requested', notes: '' }],
+        appointments: [{ id: 'appt_2', start: '2026-10-01T10:30', service: 'Quote visit', minutes: 30, name: 'Liam', phone: '+61491570006', status: 'requested', notes: '' }],
       }),
     } as unknown as Desktop;
     const tools = calendarTools(() => desktop);
     expect(tools.map((t) => t.spec.name)).toEqual(['calendar_free_times', 'calendar_list', 'calendar_book', 'calendar_change']);
     const list = await tools[1].run({ from: '2026-09-28', days: 7 }, signal);
-    expect(list).toBe('Thu 1 Oct 10:30 am · Quote visit (30 min) · Lance, +61491570006 · requested · id appt_2');
+    expect(list).toBe('Thu 1 Oct 10:30 am · Quote visit (30 min) · Liam, +61491570006 · requested · id appt_2');
     await tools[2].run({ date: '2026-10-02', time: '11:00', service: 'Lawn mowing', name: 'Sam' }, signal);
     expect(created[0]).toMatchObject({ date: '2026-10-02', time: '11:00', source: 'agent' });
     const out = await tools[3].run({ id: 'appt_2', status: 'confirmed' }, signal);
@@ -133,13 +133,13 @@ describe("the calendar as the agent's tools", () => {
 });
 
 describe("cancel_appointment: the caller's own, found by their number", () => {
-  /** Lance's request on Thursday and confirmed booking on Friday; Sam's booking on Monday. */
+  /** Liam's request on Thursday and confirmed booking on Friday; Sam's booking on Monday. */
   const booked = () =>
     calendarDesktop({
       now: '2026-09-29T09:00',
       appointments: [
-        { id: 'a1', start: '2026-10-01T10:00', minutes: 60, status: 'requested', service: 'Lawn mowing', name: 'Lance', phone: '0491570006' },
-        { id: 'a2', start: '2026-10-02T13:00', minutes: 60, status: 'confirmed', service: 'Lawn mowing', name: 'Lance', phone: '+61 491 570 006', notes: 'Side gate' },
+        { id: 'a1', start: '2026-10-01T10:00', minutes: 60, status: 'requested', service: 'Lawn mowing', name: 'Liam', phone: '0491570006' },
+        { id: 'a2', start: '2026-10-02T13:00', minutes: 60, status: 'confirmed', service: 'Lawn mowing', name: 'Liam', phone: '+61 491 570 006', notes: 'Side gate' },
         { id: 'a3', start: '2026-10-05T09:00', minutes: 90, status: 'confirmed', service: 'Hedge trimming', name: 'Sam', phone: '+61411111111' },
       ],
     });
@@ -167,7 +167,7 @@ describe("cancel_appointment: the caller's own, found by their number", () => {
     await tool.run({ date: '2026-10-02' }, signal);
     expect(appointments[1].notes!.match(/Cancellation asked for/g)).toHaveLength(1);
     // The person texting has it too, for their own number.
-    const byText = textCalendarTools(() => desktop, '+61491570006', () => 'Lance')[2];
+    const byText = textCalendarTools(() => desktop, '+61491570006', () => 'Liam')[2];
     expect(byText.spec.name).toBe('cancel_appointment');
     expect(byText.spec.description).toContain("person texting's own appointment");
     expect(await byText.run({ date: '2026-10-01' }, signal)).toContain('Cancelled: their Lawn mowing on Thu 1 Oct at 10 am');
@@ -314,7 +314,7 @@ describe('what is free, as a summary per day', () => {
   });
 
   it('a specific time: yes, or no with the nearest free starts before and after', async () => {
-    const { desktop } = calendarDesktop({ now: '2026-09-29T13:02', appointments: [{ start: '2026-10-02T13:00', minutes: 60, status: 'requested', service: 'Quote visit', name: 'Lance' }] });
+    const { desktop } = calendarDesktop({ now: '2026-09-29T13:02', appointments: [{ start: '2026-10-02T13:00', minutes: 60, status: 'requested', service: 'Quote visit', name: 'Liam' }] });
     const [caller] = callCalendarTools(() => desktop);
     const yes = await caller.run({ from: '2026-10-02', time: '10:00', service: 'Lawn mowing' }, signal);
     expect(yes.split('\n')[0]).toBe('Yes: 10 am on Fri 2 Oct (2026-10-02) is free for a 60-min Lawn mowing.');
@@ -360,7 +360,7 @@ describe('what is free, as a summary per day', () => {
       now: '2026-09-29T09:00',
       appointments: [
         { start: '2026-10-01T10:00', minutes: 90, status: 'confirmed', service: 'Hedge trimming', name: 'Sam Smith', phone: '+61411111111', notes: 'gate code 4321' },
-        { start: '2026-10-02T13:00', minutes: 30, status: 'requested', service: 'Quote visit', name: 'Lance', phone: '0491570006' },
+        { start: '2026-10-02T13:00', minutes: 30, status: 'requested', service: 'Quote visit', name: 'Liam', phone: '0491570006' },
       ],
     });
     const tools = [callCalendarTools(() => desktop)[0], textCalendarTools(() => desktop, '+61400000000', () => 'Lee')[0]];
@@ -371,7 +371,7 @@ describe('what is free, as a summary per day', () => {
         await tool.run({ from: '2026-10-02', time: '13:00', service: 'Lawn mowing' }, signal),
         await tool.run({ from: '2026-10-01', time: '10:30' }, signal),
       ].join('\n');
-      for (const secret of ['Sam', 'Smith', 'Lance', 'Hedge', 'Quote', 'gate', '4321', '61411111111', '0491570006', 'calendar_list', 'overlaps']) expect(said).not.toContain(secret);
+      for (const secret of ['Sam', 'Smith', 'Liam', 'Hedge', 'Quote', 'gate', '4321', '61411111111', '0491570006', 'calendar_list', 'overlaps']) expect(said).not.toContain(secret);
       expect(said).toContain("Never tell the");
       expect(said).toContain("not that a time is 'booked by someone'");
       expect(said).toContain('Say ranges naturally');
@@ -384,8 +384,8 @@ describe('what is free, as a summary per day', () => {
     const { desktop } = calendarDesktop({
       now: '2026-09-29T13:02',
       appointments: [
-        { start: '2026-10-01T10:00', minutes: 60, status: 'requested', service: 'Lawn mowing', name: 'Lance' },
-        { start: '2026-10-02T13:00', minutes: 60, status: 'requested', service: 'Lawn mowing', name: 'Lance' },
+        { start: '2026-10-01T10:00', minutes: 60, status: 'requested', service: 'Lawn mowing', name: 'Liam' },
+        { start: '2026-10-02T13:00', minutes: 60, status: 'requested', service: 'Lawn mowing', name: 'Liam' },
       ],
     });
     const out = await callCalendarTools(() => desktop)[0].run({ from: '2026-10-02', days: 1, service: 'Lawn mowing' }, signal);

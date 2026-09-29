@@ -216,7 +216,7 @@ async function seed(page) {
     await desk.flush();
     await desk.saveChat([]);
     const note = (number, name, facts = []) => ({ number, name, facts, updatedAt: now });
-    const callers = [note('+61491570006', 'Lance', ['Prefers afternoons', 'Lawn mowing, fortnightly']), note('+61400111222', 'Priya Shah'), note('+61455666777', 'Dave'), note('+61488999000', 'Mia Chen')];
+    const callers = [note('+61491570006', 'Liam', ['Prefers afternoons', 'Lawn mowing, fortnightly']), note('+61400111222', 'Priya Shah'), note('+61455666777', 'Dave'), note('+61488999000', 'Mia Chen')];
     await desk.saveCallers(callers);
     const greeting = 'Hi, thanks for calling Greenline Gardens. How can I help?';
     const start = (who, at, number) => ({ role: 'user', automatic: true, fresh: true, text: S.callStartNote(who, greeting, S.knownText(callers.find((c) => c.number === number)), new Date(at)) });
@@ -227,18 +227,18 @@ async function seed(page) {
     const text = (title, number, body) => ({ role: 'user', text: S.textMessage(title, number, body) });
     const sms = (id, body) => [said('', [{ id, name: 'send_text_message', input: { body } }]), results([id, 'send_text_message', `Sent to them (message m_${id}).`])];
 
-    const lanceYesterday = now - day - 2 * hour;
-    const lanceToday = now - 2 * hour;
+    const liamYesterday = now - day - 2 * hour;
+    const liamToday = now - 2 * hour;
     const sessions = [
-      { info: { id: 'call-61491570006', kind: 'call', key: '+61491570006', title: 'Lance', lastAt: lanceToday + 50_000, unread: 0 }, turns: [
-        start('Lance (+61491570006)', lanceYesterday, '+61491570006'),
+      { info: { id: 'call-61491570006', kind: 'call', key: '+61491570006', title: 'Liam', lastAt: liamToday + 50_000, unread: 0 }, turns: [
+        start('Liam (+61491570006)', liamYesterday, '+61491570006'),
         caller('Hi, just checking you got my message about the mowing?', { startMs: 3_400 }),
         said('Yes, we did. The team has you down for next week.'),
         caller('Great, thanks. Bye.', { startMs: 11_900 }),
-        said('', [{ id: 'y1', name: 'end_call', input: { goodbye: 'Bye Lance!' } }]),
+        said('', [{ id: 'y1', name: 'end_call', input: { goodbye: 'Bye Liam!' } }]),
         results(['y1', 'end_call', 'The goodbye is being said, then the call ends. Write nothing more.']),
         ended,
-        start('Lance (+61491570006)', lanceToday, '+61491570006'),
+        start('Liam (+61491570006)', liamToday, '+61491570006'),
         caller('Hi there, I was hoping to book a lawn mow.', { startMs: 4_200 }),
         said('Sure thing. What day suits you best?'),
         { role: 'user', text: [S.callerLine('mm-hmm', { startMs: 9_100, over: true }, 'Sure thing.'), S.callerLine('Next Tuesday, maybe in the afternoon?', { startMs: 11_800 })].join('\n') },
@@ -246,26 +246,26 @@ async function seed(page) {
         results(['l1', 'lookup_business_data', S.LOOKUP_ASKED]),
         { role: 'user', text: '[OAIY] The answer to your lookup "Free times next Tuesday afternoon":\n{"free": ["13:00", "15:30"]}' },
         said('Tuesday at 1 pm or 3:30 pm are free. Which would you like?'),
-        caller("One o'clock is great. Oh, and it's Lance, by the way.", { startMs: 24_000, cut: true }, 'Which would you like?'),
-        said('', [{ id: 'l2', name: 'remember', input: { name: 'Lance' } }, { id: 'l3', name: 'request_appointment', input: { callerName: 'Lance', service: 'Lawn mowing', date: '2026-10-06', time: '13:00', agreementPhrase: "One o'clock is great" } }]),
+        caller("One o'clock is great. Oh, and it's Liam, by the way.", { startMs: 24_000, cut: true }, 'Which would you like?'),
+        said('', [{ id: 'l2', name: 'remember', input: { name: 'Liam' } }, { id: 'l3', name: 'request_appointment', input: { callerName: 'Liam', service: 'Lawn mowing', date: '2026-10-06', time: '13:00', agreementPhrase: "One o'clock is great" } }]),
         results(['l2', 'remember', 'Saved.'], ['l3', 'request_appointment', '{\n "requestId": "apt_31",\n "status": "requested"\n}']),
-        said("Thanks, Lance. I've requested Tuesday the 6th at 1 pm for a lawn mow; the team will confirm by text."),
+        said("Thanks, Liam. I've requested Tuesday the 6th at 1 pm for a lawn mow; the team will confirm by text."),
         caller('Perfect, thanks. Bye!', { startMs: 41_000 }),
-        said('', [{ id: 'l4', name: 'end_call', input: { goodbye: 'Bye Lance, have a great day!' } }]),
+        said('', [{ id: 'l4', name: 'end_call', input: { goodbye: 'Bye Liam, have a great day!' } }]),
         results(['l4', 'end_call', 'The goodbye is being said, then the call ends. Write nothing more.']),
         ended,
       ] },
-      { info: { id: 'sms-61491570006', kind: 'sms', key: '+61491570006', title: 'Lance', lastAt: now - 20 * min, unread: 2 }, turns: [
-        text('Lance', '+61491570006', 'Hi! Can you come a bit earlier on Tuesday?'),
+      { info: { id: 'sms-61491570006', kind: 'sms', key: '+61491570006', title: 'Liam', lastAt: now - 20 * min, unread: 2 }, turns: [
+        text('Liam', '+61491570006', 'Hi! Can you come a bit earlier on Tuesday?'),
         said('', [{ id: 's0', name: 'calendar_free_times', input: { from: '2026-10-06', days: 1 } }]),
         results(['s0', 'calendar_free_times', '2026-10-06: 10:30, 13:00, 15:30']),
-        ...sms('s1', 'Hi Lance, 10:30 am on Tuesday is free. Shall I request that instead of 1 pm?'),
-        text('Lance', '+61491570006', 'Yes please'),
-        text('Lance', '+61491570006', 'And can they do the edges too?'),
+        ...sms('s1', 'Hi Liam, 10:30 am on Tuesday is free. Shall I request that instead of 1 pm?'),
+        text('Liam', '+61491570006', 'Yes please'),
+        text('Liam', '+61491570006', 'And can they do the edges too?'),
         ...sms('s2', "Done: I've asked for 10:30 on Tuesday, edges included. The team will confirm by text."),
         { role: 'user', text: 'Tell him the invoice goes to his email as well.' },
-        ...sms('s3', 'Also, the invoice will come to your email as usual. Thanks Lance!'),
-        text('Lance', '+61491570006', 'Thanks 👍'),
+        ...sms('s3', 'Also, the invoice will come to your email as usual. Thanks Liam!'),
+        text('Liam', '+61491570006', 'Thanks 👍'),
       ] },
       { info: { id: 'call-61400111222', kind: 'call', key: '+61400111222', title: 'Priya Shah', lastAt: now - day - 5 * hour, unread: 0 }, turns: [
         start('Priya Shah (+61400111222)', now - day - 5 * hour, '+61400111222'),
@@ -278,7 +278,7 @@ async function seed(page) {
       { info: { id: 'sms-test', kind: 'sms', key: 'test', title: 'Test', lastAt: now - 5 * day, unread: 0 }, turns: [text('Test', 'test', 'What are your hours?'), ...sms('t1', "We're open 8 am to 5 pm, Monday to Saturday.")] },
       { info: { id: 'task-morning-summary-1', kind: 'task', key: 'Morning summary', title: 'Morning summary', lastAt: now - 6 * hour, unread: 0 }, turns: [
         { role: 'user', text: '[OAIY] Your flow "Morning summary" asks: Summarise yesterday\'s calls and texts in three short bullet points.' },
-        said('- Lance booked a lawn mow for Tuesday at 1 pm\n- Priya asked about hedges on the north shore\n- One new text asks about green waste'),
+        said('- Liam booked a lawn mow for Tuesday at 1 pm\n- Priya asked about hedges on the north shore\n- One new text asks about green waste'),
       ] },
       { info: { id: 'call-61455666777', kind: 'call', key: '+61455666777', title: 'Dave', lastAt: now - 4 * day, unread: 0 }, turns: [
         start('Dave (+61455666777)', now - 4 * day, '+61455666777'),
@@ -491,7 +491,7 @@ try {
     await wait(400);
   }
 
-  await conversation(page, 'person', 'Lance');
+  await conversation(page, 'person', 'Liam');
   await closePicker(page);
   await verify("a person's conversation opens at its end, the latest at the bottom, their calls and then their texts in order", async () => {
     await wait(300);
@@ -686,7 +686,7 @@ try {
     await tab.select('.project-select', 'front-desk');
     await tab.waitForFunction(() => /\d+ others/.test(document.querySelector('.chat [aria-haspopup="listbox"]')?.textContent ?? ''), { timeout: 20_000 }).catch(() => {});
     await wait(800);
-    await conversation(tab, 'person', 'Lance').catch((e) => console.log('  ', e.message));
+    await conversation(tab, 'person', 'Liam').catch((e) => console.log('  ', e.message));
     await closePicker(tab);
     await shoot(tab, 'tab-call', { mode: 'tab', sizes: [[1440, 900]] });
     await tab.close();

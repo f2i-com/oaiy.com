@@ -572,17 +572,17 @@ mod tests {
         assert_eq!(cell("=SUM(A1:A9)"), "'=SUM(A1:A9)");
         assert_eq!(cell("+61491570006"), "'+61491570006");
         assert_eq!(cell("-5"), "'-5");
-        assert_eq!(cell("@lance"), "'@lance");
+        assert_eq!(cell("@liam"), "'@liam");
         assert_eq!(cell("\tx"), "'\tx");
-        assert_eq!(cell("Lance"), "Lance");
-        assert_eq!(cell("Smith, Lance"), "\"Smith, Lance\"");
+        assert_eq!(cell("Liam"), "Liam");
+        assert_eq!(cell("Smith, Liam"), "\"Smith, Liam\"");
         assert_eq!(cell("say \"hi\""), "\"say \"\"hi\"\"\"");
         assert_eq!(cell("two\nlines"), "\"two\nlines\"");
         assert_eq!(cell("a;b"), "\"a;b\"", "safe for a spreadsheet that splits on semicolons");
         assert_eq!(cell("=1,2"), "\"'=1,2\"", "guarded, then quoted");
         assert_eq!(cell(""), "");
         // Read back as it was.
-        for v in ["=SUM(A1:A9)", "+61491570006", "-5", "@lance", "Smith, Lance", "say \"hi\"", "two\nlines", "=1,2", "it's", "'quoted'"] {
+        for v in ["=SUM(A1:A9)", "+61491570006", "-5", "@liam", "Smith, Liam", "say \"hi\"", "two\nlines", "=1,2", "it's", "'quoted'"] {
             let line = format!("{}\r\n", cell(v));
             let parsed = parse(&line);
             assert_eq!(unguarded(&parsed[0].1[0]), v, "{v:?} as {line:?}");
@@ -593,7 +593,7 @@ mod tests {
     fn the_export_is_utf8_with_a_bom_and_a_row_a_contact() {
         let d = Dir::new("export");
         let s = d.store();
-        s.set("+61491570006", Change { name: Some("Lance".into()), number: Some("+61491570006".into()), notes: Some("Gate code: 1234, round the back".into()) }).unwrap();
+        s.set("+61491570006", Change { name: Some("Liam".into()), number: Some("+61491570006".into()), notes: Some("Gate code: 1234, round the back".into()) }).unwrap();
         s.add_fact("0491570006", "Has a dog", By::Agent).unwrap();
         s.add_fact("0491570006", "Prefers mornings", By::Agent).unwrap();
         s.remember_name("0400000001", "Zoë").unwrap();
@@ -603,7 +603,7 @@ mod tests {
         assert!(csv.starts_with("\u{feff}name,number,notes,remembered\r\n"), "{csv:?}");
         let lines: Vec<&str> = csv.trim_start_matches('\u{feff}').split("\r\n").collect();
         assert_eq!(lines[1], "Anna,298765432,,", "no whole number known: the key");
-        assert_eq!(lines[2], "Lance,'+61491570006,\"Gate code: 1234, round the back\",Has a dog | Prefers mornings");
+        assert_eq!(lines[2], "Liam,'+61491570006,\"Gate code: 1234, round the back\",Has a dog | Prefers mornings");
         assert_eq!(lines[3], "Zoë,0400000001,,");
         assert_eq!(lines[4], "");
     }
@@ -613,7 +613,7 @@ mod tests {
         let a = Dir::new("roundtrip-a");
         let sa = a.store();
         let tricky = "Line one, with a comma\n\"Quoted\" and =not a formula\n-dash first";
-        sa.set("+61491570006", Change { name: Some("Lance".into()), number: Some("+61491570006".into()), notes: Some(tricky.into()) }).unwrap();
+        sa.set("+61491570006", Change { name: Some("Liam".into()), number: Some("+61491570006".into()), notes: Some(tricky.into()) }).unwrap();
         sa.add_fact("+61491570006", "Has a dog, called Max", By::Agent).unwrap();
         sa.add_fact("+61491570006", "=2+2 is not run", By::Agent).unwrap();
         sa.set("+61298765432", Change { name: Some("=Anna; Bee".into()), number: Some("+61298765432".into()), ..Change::default() }).unwrap();
@@ -642,26 +642,26 @@ mod tests {
         let d = Dir::new("shapes");
         let s = d.store();
         let files = [
-            ("Name,Phone,Notes\r\nLance,0491 570 006,Friend\r\n", "Lance"),
-            ("first name,Last Name,MOBILE\nLance,Smith,0491570006\n", "Lance Smith"),
-            ("First Name,Last Name,Mobile\nLance,,0491570006\n", "Lance"),
-            ("\u{feff}Full Name;Phone Number;Notes\nLance;0491 570 006;Friend\n", "Lance"),
-            ("full name\tmobile number\nLance\t0491570006\n", "Lance"),
-            ("My contacts, exported\n\nName,Number\nLance,+61 491 570 006\n", "Lance"),
-            ("Lance,0491570006\nSam,0400000001\n", "Lance"),
+            ("Name,Phone,Notes\r\nLiam,0491 570 006,Friend\r\n", "Liam"),
+            ("first name,Last Name,MOBILE\nLiam,Smith,0491570006\n", "Liam Smith"),
+            ("First Name,Last Name,Mobile\nLiam,,0491570006\n", "Liam"),
+            ("\u{feff}Full Name;Phone Number;Notes\nLiam;0491 570 006;Friend\n", "Liam"),
+            ("full name\tmobile number\nLiam\t0491570006\n", "Liam"),
+            ("My contacts, exported\n\nName,Number\nLiam,+61 491 570 006\n", "Liam"),
+            ("Liam,0491570006\nSam,0400000001\n", "Liam"),
         ];
         for (csv, want) in files {
             let _ = std::fs::remove_file(d.file());
             let r = import(&s, csv, false, false);
-            assert_eq!(r.added, if csv.starts_with("Lance,") { 2 } else { 1 }, "{csv:?}: {r:?}");
+            assert_eq!(r.added, if csv.starts_with("Liam,") { 2 } else { 1 }, "{csv:?}: {r:?}");
             let c = s.get("0491570006").unwrap();
             assert_eq!((c.name.as_str(), c.number.as_str()), (want, "+61491570006"), "{csv:?}");
         }
-        let r = import(&s, "My contacts, exported\n\nName,Number\nLance,0491570006\n", false, true);
+        let r = import(&s, "My contacts, exported\n\nName,Number\nLiam,0491570006\n", false, true);
         assert_eq!(r.header_row, Some(3));
         assert_eq!(r.columns, ["Name", "Number"]);
         // A file with no numbers at all says so.
-        let e = s.import(&ImportRequest { csv: "Name,Email\nLance,l@x.au\n".into(), country: None, replace_names: false, preview: true }).unwrap_err();
+        let e = s.import(&ImportRequest { csv: "Name,Email\nLiam,l@x.au\n".into(), country: None, replace_names: false, preview: true }).unwrap_err();
         assert_eq!((e.status, e.code), (400, "bad_csv"));
         let e = s.import(&ImportRequest { csv: "Name,Phone\n".into(), country: Some("XX".into()), replace_names: false, preview: true }).unwrap_err();
         assert_eq!(e.code, "bad_country");
@@ -673,13 +673,13 @@ mod tests {
         let s = d.store();
         // Google's older export: Name, Given Name..., Phone N - Type / Value, several numbers joined with :::.
         let older = "Name,Given Name,Additional Name,Family Name,Notes,Group Membership,Phone 1 - Type,Phone 1 - Value,Phone 2 - Type,Phone 2 - Value\n\
-            Lance Smith,Lance,,Smith,\"Owns the café,\nopen Sundays\",* myContacts,Home,(02) 9876 5432,Mobile,0491 570 006 ::: 0400 000 009\n\
+            Liam Smith,Liam,,Smith,\"Owns the café,\nopen Sundays\",* myContacts,Home,(02) 9876 5432,Mobile,0491 570 006 ::: 0400 000 009\n\
             ,Sam,,,,* myContacts,Mobile,,Work,0400 000 001\n";
         let r = import(&s, older, false, false);
         assert_eq!((r.added, r.skipped), (2, 0), "{r:?}");
-        let lance = s.get("0491570006").unwrap();
-        assert_eq!((lance.name.as_str(), lance.number.as_str()), ("Lance Smith", "+61491570006"), "the mobile, not the first number");
-        assert_eq!(lance.notes, "Owns the café,\nopen Sundays");
+        let liam = s.get("0491570006").unwrap();
+        assert_eq!((liam.name.as_str(), liam.number.as_str()), ("Liam Smith", "+61491570006"), "the mobile, not the first number");
+        assert_eq!(liam.notes, "Owns the café,\nopen Sundays");
         assert_eq!(s.get("0400000001").unwrap().name, "Sam", "Given Name when Name is empty");
         assert!(s.get("0298765432").is_err(), "one contact a row");
 
@@ -696,12 +696,12 @@ mod tests {
     fn the_preview_counts_every_row_and_writes_nothing() {
         let d = Dir::new("preview");
         let s = d.store();
-        s.set("0491570006", Change { name: Some("Lance".into()), notes: Some("Friend".into()), ..Change::default() }).unwrap();
+        s.set("0491570006", Change { name: Some("Liam".into()), notes: Some("Friend".into()), ..Change::default() }).unwrap();
         s.remember_name("0400000001", "Sam").unwrap();
         s.set("0400000002", Change { name: Some("Kim".into()), notes: Some("Tuesdays".into()), number: Some("+61400000002".into()) }).unwrap();
         let before = std::fs::read(d.file()).unwrap();
         let csv = "name,number,notes\n\
-            Lance Smith,0491 570 006,Has a dog\n\
+            Liam Smith,0491 570 006,Has a dog\n\
             Samuel,0400000001,\n\
             Kim,0400000002,Tuesdays\n\
             Jo,0400000003,\n\
@@ -720,15 +720,15 @@ mod tests {
         assert_eq!(why, [(6, "duplicate"), (7, "no_number"), (8, "not_a_phone_number"), (9, "hidden")]);
         assert_eq!(r.skips[0].why.as_deref(), Some("the same number as row 5"));
         let actions: Vec<(&str, &str)> = r.sample.iter().map(|x| (x.name.as_str(), x.action)).collect();
-        assert_eq!(actions[..5], [("Lance Smith", "update"), ("Samuel", "update"), ("Kim", "unchanged"), ("Jo", "add"), ("Jo again", "skip")]);
-        assert_eq!(r.sample[0].kept_name.as_deref(), Some("Lance"), "the person's name is kept");
+        assert_eq!(actions[..5], [("Liam Smith", "update"), ("Samuel", "update"), ("Kim", "unchanged"), ("Jo", "add"), ("Jo again", "skip")]);
+        assert_eq!(r.sample[0].kept_name.as_deref(), Some("Liam"), "the person's name is kept");
         assert_eq!(std::fs::read(d.file()).unwrap(), before, "a preview writes nothing");
 
         // Imported: one write, the rules as the preview said.
         let r = import(&s, csv, false, false);
         assert_eq!((r.added, r.updated, r.unchanged, r.skipped), (2, 2, 1, 4));
-        let lance = s.get("0491570006").unwrap();
-        assert_eq!((lance.name.as_str(), lance.notes.as_str()), ("Lance", "Friend\nHas a dog"), "the name kept, the notes added after");
+        let liam = s.get("0491570006").unwrap();
+        assert_eq!((liam.name.as_str(), liam.notes.as_str()), ("Liam", "Friend\nHas a dog"), "the name kept, the notes added after");
         let sam = s.get("0400000001").unwrap();
         assert_eq!((sam.name.as_str(), sam.name_by), ("Samuel", Some(By::Owner)), "the receptionist's name replaced, and the person's now");
         assert_eq!(s.get("0400000002").unwrap().notes, "Tuesdays", "the same notes are not added twice");
@@ -740,15 +740,15 @@ mod tests {
     fn replace_names_lets_the_file_rename_the_persons_contacts() {
         let d = Dir::new("replace");
         let s = d.store();
-        s.set("0491570006", Change { name: Some("Lance".into()), ..Change::default() }).unwrap();
-        let r = import(&s, "name,phone\nLance Smith,0491570006\n", true, false);
+        s.set("0491570006", Change { name: Some("Liam".into()), ..Change::default() }).unwrap();
+        let r = import(&s, "name,phone\nLiam Smith,0491570006\n", true, false);
         assert_eq!(r.updated, 1);
-        assert_eq!(s.get("0491570006").unwrap().name, "Lance Smith");
+        assert_eq!(s.get("0491570006").unwrap().name, "Liam Smith");
         // Notes that would pass the limit together skip the row, leaving the contact as it was.
         s.set("0491570006", Change { notes: Some("n".repeat(MAX_NOTES - 5)), ..Change::default() }).unwrap();
-        let r = import(&s, "name,phone,notes\nLance Jones,0491570006,more than five\n", true, false);
+        let r = import(&s, "name,phone,notes\nLiam Jones,0491570006,more than five\n", true, false);
         assert_eq!((r.skipped, r.reasons.get("notes_too_long")), (1, Some(&1)));
-        assert_eq!(s.get("0491570006").unwrap().name, "Lance Smith");
+        assert_eq!(s.get("0491570006").unwrap().name, "Liam Smith");
     }
 
     #[test]
@@ -759,7 +759,7 @@ mod tests {
         assert_eq!(r.country, "US");
         assert_eq!(s.get("4155550100").unwrap().number, "+14155550100");
         // Without a country: Australian.
-        import(&s, "name,phone\nLance,0491 570 006\n", false, false);
+        import(&s, "name,phone\nLiam,0491 570 006\n", false, false);
         assert_eq!(s.get("0491570006").unwrap().number, "+61491570006");
     }
 

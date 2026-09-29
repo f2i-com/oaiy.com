@@ -2,7 +2,7 @@
 //!
 //! Kept in `<data>/callers.json` (where the names callers were greeted by were
 //! kept before), by each number's key: its last nine digits, so +61 491 570
-//! 110 and 0491 570 006 are one person. The file is
+//! 006 and 0491 570 006 are one person. The file is
 //! `{"version": 2, "contacts": {key: contact}}`, and a contact is
 //!
 //! ```json
@@ -797,19 +797,19 @@ mod tests {
     #[test]
     fn the_older_names_file_is_upgraded_in_place_and_kept_once_as_bak() {
         let d = Dir::new("upgrade");
-        let old = "{\n  \"491570006\": \"Lance\",\n  \"400000001\": \"  Sam   Lee \"\n}";
+        let old = "{\n  \"491570006\": \"Liam\",\n  \"400000001\": \"  Sam   Lee \"\n}";
         std::fs::write(d.file(), old).unwrap();
         let s = d.store();
         let (all, total) = s.list("").unwrap();
         assert_eq!(total, 2);
-        assert_eq!(all.iter().map(|c| c.name.as_str()).collect::<Vec<_>>(), ["Lance", "Sam Lee"]);
-        let lance = s.get("0491 570 006").unwrap();
-        assert_eq!((lance.key.as_str(), lance.number.as_str(), lance.name_by), ("491570006", "", Some(By::Agent)), "the receptionist wrote the older names");
-        assert!(lance.notes.is_empty() && lance.facts.is_empty());
+        assert_eq!(all.iter().map(|c| c.name.as_str()).collect::<Vec<_>>(), ["Liam", "Sam Lee"]);
+        let liam = s.get("0491 570 006").unwrap();
+        assert_eq!((liam.key.as_str(), liam.number.as_str(), liam.name_by), ("491570006", "", Some(By::Agent)), "the receptionist wrote the older names");
+        assert!(liam.notes.is_empty() && liam.facts.is_empty());
         // Upgraded in place, with the older bytes beside it.
         let v = saved(&d);
         assert_eq!(v["version"], 2);
-        assert_eq!(v["contacts"]["491570006"]["name"], "Lance");
+        assert_eq!(v["contacts"]["491570006"]["name"], "Liam");
         assert_eq!(v["contacts"]["491570006"]["nameBy"], "agent");
         let bak = d.0.join("callers.json.bak");
         assert_eq!(std::fs::read_to_string(&bak).unwrap(), old);
@@ -830,7 +830,7 @@ mod tests {
         let s = d.store();
         let e = s.list("").unwrap_err();
         assert_eq!((e.status, e.code), (500, "contacts_unreadable"));
-        assert!(s.set("0491570006", Change { name: Some("Lance".into()), ..Change::default() }).is_err());
+        assert!(s.set("0491570006", Change { name: Some("Liam".into()), ..Change::default() }).is_err());
         assert!(s.saw("0491570006").is_err());
         assert_eq!(s.name_of("0491570006"), None, "the greeting goes on without it");
         assert_eq!(std::fs::read_to_string(d.file()).unwrap(), "{ not json");
@@ -850,9 +850,9 @@ mod tests {
         assert_eq!(check_number("N/A"), Err(NotANumber::Missing));
         let d = Dir::new("keys");
         let s = d.store();
-        s.set("+61 491 570 006", Change { name: Some("Lance".into()), ..Change::default() }).unwrap();
+        s.set("+61 491 570 006", Change { name: Some("Liam".into()), ..Change::default() }).unwrap();
         for n in ["0491570006", "491570006", "+61491570006", "0061 491 570 006"] {
-            assert_eq!(s.get(n).unwrap().name, "Lance", "{n}");
+            assert_eq!(s.get(n).unwrap().name, "Liam", "{n}");
         }
         assert_eq!(s.get("0491570157").unwrap_err().code, "no_contact");
         assert_eq!(s.get("12345").unwrap_err().code, "not_a_phone_number");
@@ -893,38 +893,38 @@ mod tests {
     fn single_names_are_names_and_are_never_corrected() {
         let d = Dir::new("single");
         let s = d.store();
-        assert_eq!(s.remember_name("+61491570006", "Lance").unwrap(), "Lance");
-        assert_eq!(s.name_of("0491570006").as_deref(), Some("Lance"));
-        s.set("0400000001", Change { name: Some("  lance ".into()), ..Change::default() }).unwrap();
-        assert_eq!(s.get("0400000001").unwrap().name, "lance", "not capitalised");
+        assert_eq!(s.remember_name("+61491570006", "Liam").unwrap(), "Liam");
+        assert_eq!(s.name_of("0491570006").as_deref(), Some("Liam"));
+        s.set("0400000001", Change { name: Some("  liam ".into()), ..Change::default() }).unwrap();
+        assert_eq!(s.get("0400000001").unwrap().name, "liam", "not capitalised");
         s.set("0400000002", Change { name: Some("Zoë  O'Brien-Smith".into()), ..Change::default() }).unwrap();
         assert_eq!(s.get("0400000002").unwrap().name, "Zoë O'Brien-Smith");
         // A name past the limit is cut, not refused (the older route did the same).
         let long = "A".repeat(200);
         assert_eq!(s.remember_name("0400000003", &long).unwrap().chars().count(), MAX_NAME);
-        assert!(crate::voice::callers::looks_like_name("Lance"));
+        assert!(crate::voice::callers::looks_like_name("Liam"));
     }
 
     #[test]
     fn a_name_the_person_set_is_never_overwritten_by_the_receptionist() {
         let d = Dir::new("owner");
         let s = d.store();
-        // The receptionist learned "Lance Smith" on a call...
-        assert_eq!(s.remember_name("+61491570006", "Lance Smith").unwrap(), "Lance Smith");
+        // The receptionist learned "Liam Smith" on a call...
+        assert_eq!(s.remember_name("+61491570006", "Liam Smith").unwrap(), "Liam Smith");
         assert_eq!(s.get("0491570006").unwrap().name_by, Some(By::Agent));
-        // ...and the person says it is "Lance".
-        let c = s.set("0491570006", Change { name: Some("Lance".into()), ..Change::default() }).unwrap();
-        assert_eq!((c.name.as_str(), c.name_by), ("Lance", Some(By::Owner)));
-        // The receptionist hears "Lance Smith" again: the person's name stays, and is the answer.
-        assert_eq!(s.remember_name("+61491570006", "Lance Smith").unwrap(), "Lance");
-        assert_eq!(s.remember_name("+61491570006", "").unwrap(), "Lance", "nor can it clear it");
+        // ...and the person says it is "Liam".
+        let c = s.set("0491570006", Change { name: Some("Liam".into()), ..Change::default() }).unwrap();
+        assert_eq!((c.name.as_str(), c.name_by), ("Liam", Some(By::Owner)));
+        // The receptionist hears "Liam Smith" again: the person's name stays, and is the answer.
+        assert_eq!(s.remember_name("+61491570006", "Liam Smith").unwrap(), "Liam");
+        assert_eq!(s.remember_name("+61491570006", "").unwrap(), "Liam", "nor can it clear it");
         let c = s.get("0491570006").unwrap();
-        assert_eq!((c.name.as_str(), c.name_by), ("Lance", Some(By::Owner)));
-        assert_eq!(s.name_of("+61491570006").as_deref(), Some("Lance"));
+        assert_eq!((c.name.as_str(), c.name_by), ("Liam", Some(By::Owner)));
+        assert_eq!(s.name_of("+61491570006").as_deref(), Some("Liam"));
         // The person clearing their name lets the receptionist learn one again.
         let c = s.set("0491570006", Change { name: Some(" ".into()), ..Change::default() }).unwrap();
         assert_eq!((c.name.as_str(), c.name_by), ("", None));
-        assert_eq!(s.remember_name("0491570006", "Lance").unwrap(), "Lance");
+        assert_eq!(s.remember_name("0491570006", "Liam").unwrap(), "Liam");
         assert_eq!(s.get("0491570006").unwrap().name_by, Some(By::Agent));
     }
 
@@ -932,7 +932,7 @@ mod tests {
     fn the_receptionist_clearing_its_name_keeps_the_contact() {
         let d = Dir::new("forget");
         let s = d.store();
-        s.remember_name("0491570006", "Lance").unwrap();
+        s.remember_name("0491570006", "Liam").unwrap();
         s.set("0491570006", Change { notes: Some("Prefers texts".into()), ..Change::default() }).unwrap();
         s.remember_name("0400000001", "Sam").unwrap();
         assert_eq!(s.remember_name("+61491570006", "  ").unwrap(), "");
@@ -1019,19 +1019,19 @@ mod tests {
     fn search_finds_names_notes_facts_and_numbers_typed_any_way() {
         let d = Dir::new("search");
         let s = d.store();
-        s.set("0491570006", Change { name: Some("Lance".into()), notes: Some("Owns the café on Smith St".into()), ..Change::default() }).unwrap();
+        s.set("0491570006", Change { name: Some("Liam".into()), notes: Some("Owns the café on Smith St".into()), ..Change::default() }).unwrap();
         s.set("0400000001", Change { name: Some("sam".into()), number: Some("+61400000001".into()), ..Change::default() }).unwrap();
         s.set("0298765432", Change { name: Some("Anna".into()), ..Change::default() }).unwrap();
         s.add_fact("0298765432", "Has two border collies", By::Agent).unwrap();
         s.saw("0411222333").unwrap();
         let names = |q: &str| s.list(q).unwrap().0.into_iter().map(|c| if c.name.is_empty() { c.key } else { c.name }).collect::<Vec<_>>();
         // By name, in any case; the nameless after.
-        assert_eq!(names(""), ["Anna", "Lance", "sam", "411222333"]);
-        assert_eq!(names("LANCE"), ["Lance"]);
-        assert_eq!(names("café"), ["Lance"], "the notes");
+        assert_eq!(names(""), ["Anna", "Liam", "sam", "411222333"]);
+        assert_eq!(names("LIAM"), ["Liam"]);
+        assert_eq!(names("café"), ["Liam"], "the notes");
         assert_eq!(names("collies"), ["Anna"], "what was remembered");
-        assert_eq!(names("0491 570"), ["Lance"], "a number the local way, with its 0");
-        assert_eq!(names("491570"), ["Lance"]);
+        assert_eq!(names("0491 570"), ["Liam"], "a number the local way, with its 0");
+        assert_eq!(names("491570"), ["Liam"]);
         assert_eq!(names("+61 400"), ["sam"]);
         assert_eq!(names("(02) 9876"), ["Anna"]);
         assert_eq!(names("zzz"), Vec::<String>::new());

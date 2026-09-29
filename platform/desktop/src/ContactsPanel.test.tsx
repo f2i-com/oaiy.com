@@ -46,11 +46,11 @@ const contact = (c: Partial<Contact> & Pick<Contact, 'key'>): Contact => ({
   updatedAt: AT,
   ...c,
 });
-const LANCE = () =>
+const LIAM = () =>
   contact({
     key: '491570006',
     number: '+61491570006',
-    name: 'Lance',
+    name: 'Liam',
     nameBy: 'owner',
     notes: 'Prefers texts',
     facts: [
@@ -97,7 +97,7 @@ async function mount(props: { open?: string | null; onOpened?: () => void } = {}
 
 beforeEach(() => {
   vi.clearAllMocks();
-  people = [LANCE(), SAM(), NEW_CALLER()];
+  people = [LIAM(), SAM(), NEW_CALLER()];
   api.list.mockImplementation(async () => ({ contacts: people, total: people.length }));
   api.save.mockImplementation(async (key: string, change: Partial<Contact>) => {
     const was = people.find((c) => c.key === key.replace(/\D/g, '').slice(-9)) ?? contact({ key: key.replace(/\D/g, '').slice(-9) });
@@ -127,10 +127,10 @@ afterEach(() => {
 describe('the list', () => {
   it('shows everyone by name with their number readable, the nameless after', async () => {
     await mount();
-    expect(rowNames()).toEqual(['Lance', 'Sam', 'No name yet']);
+    expect(rowNames()).toEqual(['Liam', 'Sam', 'No name yet']);
     expect([...host.querySelectorAll('.contact-row small')].map((s) => s.textContent)).toEqual(['0491 570 006', '0400 000 001', '0411 222 333']);
-    expect(row('Lance').textContent).toContain('Notes');
-    expect(row('Lance').textContent).toContain('2 remembered');
+    expect(row('Liam').textContent).toContain('Notes');
+    expect(row('Liam').textContent).toContain('2 remembered');
     expect(host.querySelector('.contacts-count')?.textContent).toBe('3 contacts');
   });
 
@@ -142,10 +142,10 @@ describe('the list', () => {
       return rowNames();
     };
     expect(await find('sam')).toEqual(['Sam']);
-    expect(await find('0491 570')).toEqual(['Lance']);
+    expect(await find('0491 570')).toEqual(['Liam']);
     expect(await find('+61 411')).toEqual(['No name yet']);
-    expect(await find('texts')).toEqual(['Lance']);
-    expect(await find('dog')).toEqual(['Lance']);
+    expect(await find('texts')).toEqual(['Liam']);
+    expect(await find('dog')).toEqual(['Liam']);
     expect(host.querySelector('.contacts-count')?.textContent).toBe('1 of 3');
     expect(await find('zzz')).toEqual([]);
     expect(text()).toContain('No contact matches “zzz”.');
@@ -197,7 +197,7 @@ describe('one person', () => {
     await click(button('Save changes'));
     expect(api.save).toHaveBeenCalledWith('400000001', { name: 'Sam' });
 
-    await click(row('Lance'));
+    await click(row('Liam'));
     await act(async () => type(host.querySelector<HTMLTextAreaElement>('.contact-notes textarea')!, 'Prefers texts. Not before 9.'));
     await click(button('Save changes'));
     expect(api.save).toHaveBeenLastCalledWith('491570006', { notes: 'Prefers texts. Not before 9.' });
@@ -205,7 +205,7 @@ describe('one person', () => {
 
   it('forgets what the receptionist remembered when saved, the last first, and Discard puts it back', async () => {
     await mount();
-    await click(row('Lance'));
+    await click(row('Liam'));
     expect(host.querySelector('#contact-facts-title')?.textContent).toContain('What the receptionist remembered');
     const facts = () => [...host.querySelectorAll('.fact-list > li')].map((li) => [li.querySelector('.fact-text > span')?.textContent, li.classList.contains('is-removed')]);
     expect(facts()).toEqual([
@@ -232,11 +232,11 @@ describe('one person', () => {
 
   it('is not left with changes unsaved: another person waits until they are saved or discarded', async () => {
     await mount();
-    await click(row('Lance'));
+    await click(row('Liam'));
     await act(async () => type(host.querySelector<HTMLTextAreaElement>('.contact-notes textarea')!, 'Changed'));
     await click(row('Sam'));
-    expect(heading()).toBe('Lance');
-    expect(bar()?.textContent).toContain('Save or discard the changes to Lance first.');
+    expect(heading()).toBe('Liam');
+    expect(bar()?.textContent).toContain('Save or discard the changes to Liam first.');
     await click(button('Discard'));
     await click(row('Sam'));
     expect(heading()).toBe('Sam');
@@ -244,9 +244,9 @@ describe('one person', () => {
 
   it('is deleted after asking', async () => {
     await mount();
-    await click(row('Lance'));
+    await click(row('Liam'));
     await click(button('Delete contact'));
-    expect(text()).toContain('Delete Lance? Their name, your notes and what the receptionist remembered all go.');
+    expect(text()).toContain('Delete Liam? Their name, your notes and what the receptionist remembered all go.');
     await click(button('Cancel'));
     expect(api.remove).not.toHaveBeenCalled();
     await click(button('Delete contact'));
@@ -254,7 +254,7 @@ describe('one person', () => {
     expect(api.remove).toHaveBeenCalledWith('491570006');
     expect(rowNames()).toEqual(['Sam', 'No name yet']);
     expect(host.querySelector('.contacts-side')).toBeNull();
-    expect(text()).toContain('Lance is no longer a contact.');
+    expect(text()).toContain('Liam is no longer a contact.');
   });
 
   it('opens by its key when the Agent asks, or offers to add them', async () => {
@@ -281,7 +281,7 @@ describe('adding someone', () => {
     expect(api.save).not.toHaveBeenCalled();
 
     await act(async () => type(number, '0491 570 006'));
-    expect(text()).toContain('Already a contact: Lance.');
+    expect(text()).toContain('Already a contact: Liam.');
     expect(host.querySelector<HTMLButtonElement>('.contact-form button[type="submit"]')!.disabled).toBe(true);
 
     await act(async () => type(name, '  Kim '));
@@ -307,7 +307,7 @@ describe('a CSV file', () => {
     reasons: { no_number: 1 },
     skips: [{ row: 6, action: 'skip', name: 'Nobody', number: '', reason: 'no_number', why: 'no number', notes: false }],
     sample: [
-      { row: 2, action: 'update', name: 'Lance Smith', number: '0491 570 006', key: '491570006', keptName: 'Lance', notes: true },
+      { row: 2, action: 'update', name: 'Liam Smith', number: '0491 570 006', key: '491570006', keptName: 'Liam', notes: true },
       { row: 3, action: 'add', name: 'Kim', number: '0411 999 888', key: '411999888', notes: false },
       { row: 6, action: 'skip', name: 'Nobody', number: '', reason: 'no_number', why: 'no number', notes: false },
     ],
@@ -319,7 +319,7 @@ describe('a CSV file', () => {
     await mount();
     await click(button('Import CSV'));
     expect(heading()).toBe('Contacts from a CSV file');
-    const csv = 'Name,Phone 1 - Value,Notes\nLance Smith,0491 570 006,Has a dog\n';
+    const csv = 'Name,Phone 1 - Value,Notes\nLiam Smith,0491 570 006,Has a dog\n';
     const input = host.querySelector<HTMLInputElement>('input[type="file"]')!;
     Object.defineProperty(input, 'files', { value: [new File([csv], 'contacts.csv', { type: 'text/csv' })] });
     await act(async () => input.dispatchEvent(new Event('change', { bubbles: true })));
@@ -328,7 +328,7 @@ describe('a CSV file', () => {
     const stats = [...host.querySelectorAll('.import-stat')].map((s) => s.textContent);
     expect(stats).toEqual(['2new', '1to update', '1already here', '1skipped']);
     expect(text()).toContain('1 with no number');
-    expect(text()).toContain('keeps “Lance”');
+    expect(text()).toContain('keeps “Liam”');
     expect(text()).toContain('Read from Name, Phone 1 - Value, Notes, the header on line 1.');
 
     // Replace names I've set: previewed again.
@@ -356,7 +356,7 @@ describe('a CSV file', () => {
     await mount();
     await click(button('Import CSV'));
     const input = host.querySelector<HTMLInputElement>('input[type="file"]')!;
-    Object.defineProperty(input, 'files', { value: [new File(['Name,Email\nLance,l@x.au\n'], 'people.csv')] });
+    Object.defineProperty(input, 'files', { value: [new File(['Name,Email\nLiam,l@x.au\n'], 'people.csv')] });
     await act(async () => input.dispatchEvent(new Event('change', { bubbles: true })));
     await settle();
     expect(host.querySelector('.contact-import .banner-err')?.textContent).toContain('no column of phone numbers was found');

@@ -654,11 +654,11 @@ fn a_create_whose_answer_was_lost_is_found_again_not_made_twice() {
 }
 
 fn call(request: &str) -> Value {
-    json!({"requestId": request, "callId": "call-1", "from": "0491570006", "callerName": "Lance", "service": "Lawn mowing", "date": "2026-10-01", "time": "10:00"})
+    json!({"requestId": request, "callId": "call-1", "from": "0491570006", "callerName": "Liam", "service": "Lawn mowing", "date": "2026-10-01", "time": "10:00"})
 }
 
 fn flow_record(request: &str) -> Value {
-    json!({"caller_name": "Lance", "service": "Lawn mowing", "date": "2026-10-01", "time": "10:00", "status": "requested", "phone": "0491570006", "notes": "Asked on the call for a Thursday morning.", "source": "call", "call_id": "call-1", "request_id": request})
+    json!({"caller_name": "Liam", "service": "Lawn mowing", "date": "2026-10-01", "time": "10:00", "status": "requested", "phone": "0491570006", "notes": "Asked on the call for a Thursday morning.", "source": "call", "call_id": "call-1", "request_id": request})
 }
 
 #[test]
