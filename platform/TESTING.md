@@ -50,7 +50,8 @@ reads every file in `.github/workflows` (a small reader of the YAML they are wri
 named in a `run:` script, a `working-directory:`, a `path:`, a `cache-dependency-path:`, a
 `workspaces:` (and a `files:`, a `body_path:` and a local `uses:`) exists in the tree,
 taken from the working directory in effect — the step's, the job's default, then any
-`cd` — or is made by the build (`release/`, a `dist`, `target`, the staged resources):
+`cd`, and what a `$( … )` command substitution runs is read as a line of its own — or is
+made by the build (`release/`, a `dist`, `target`, the staged resources):
 those need only the folder they are made in to exist, so `platform/ui/dist/x` passes
 and `ui/dist/x`, the old root's spelling, does not. The `web` lane of `ci.yml` runs it and
 the tests of it, which seed every kind of wrong path into fixtures and into the real

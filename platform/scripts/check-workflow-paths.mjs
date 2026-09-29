@@ -25,7 +25,11 @@
 // spelling) does not. What is read as a path in a script is a word with a slash
 // that names something in the tree or ends like a file of it, the argument of a
 // `cd` or `tar -C`, and the script `node` runs; words that hold a variable, URLs,
-// heredoc bodies and comments are left alone.
+// heredoc bodies and comments are left alone. What a command substitution
+// `$( … )` runs is read as a line of its own, in the folder in effect where it
+// stands (a `cd` in it stays in it): `resolved="$(node platform/scripts/x.mjs)"`
+// names a script, and the ZIPP release every job waits for is resolved in one. A
+// pair of backticks is not read: in a `node -e` script it is a template literal.
 import fs from 'node:fs';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -33,6 +37,8 @@ import { parseYaml, workflowSteps } from './workflow-yaml.mjs';
 
 const posix = path.posix;
 const DYNAMIC = '\u0001';
+/** As many DYNAMIC as `text` has characters: what is not read is blanked to the same length, so a position in the blanked line is a position in the line. */
+const blank = (text) => DYNAMIC.repeat(text.length);
 
 /** `with:` inputs that name paths, and are read from the repository's root whatever the step's working directory. */
 export const WITH_PATHS = ['path', 'cache-dependency-path', 'workspaces', 'files', 'body_path'];
@@ -79,26 +85,90 @@ function quoted(line, index) {
 }
 
 /**
+ * The index of the `)` that closes a `(` whose text starts at `from` (a `$(` or a
+ * bare one); quoted strings and parentheses inside it are passed over. -1 when the
+ * line ends first.
+ */
+function closing(line, from) {
+  let depth = 1;
+  for (let i = from; i < line.length; i++) {
+    const c = line[i];
+    if (c === '\\') i++;
+    else if (c === "'") {
+      i = line.indexOf("'", i + 1);
+      if (i < 0) return -1;
+    } else if (c === '"') {
+      i = endOfString(line, i + 1);
+      if (i < 0) return -1;
+    } else if (c === '(') depth++;
+    else if (c === ')' && --depth === 0) return i;
+  }
+  return -1;
+}
+
+/** The index of the `"` that ends a double-quoted string whose text starts at `from`; a `$( … )` in it may hold quotes of its own. -1 when the line ends first. */
+function endOfString(line, from) {
+  for (let i = from; i < line.length; i++) {
+    if (line[i] === '\\') i++;
+    else if (line[i] === '"') return i;
+    else if (line[i] === '$' && line[i + 1] === '(') {
+      i = closing(line, i + 2);
+      if (i < 0) return -1;
+    }
+  }
+  return -1;
+}
+
+/**
+ * The command substitutions `$( … )` in one line, the outermost of each, as
+ * `{ start, end, inner }` (`end` is after the closing parenthesis). One inside
+ * single quotes, or escaped, is text and not found; nor is one that does not end on
+ * the line (it goes on to the next, and those lines are read as they come).
+ */
+export function substitutions(line) {
+  const spans = [];
+  let quote = null;
+  for (let i = 0; i < line.length; i++) {
+    const c = line[i];
+    if (c === '\\' && quote !== "'") i++;
+    else if (quote === "'") {
+      if (c === "'") quote = null;
+    } else if (c === '"') quote = quote === '"' ? null : '"';
+    else if (c === "'" && quote === null) quote = "'";
+    else if (c === '$' && line[i + 1] === '(') {
+      const end = closing(line, i + 2);
+      if (end < 0) continue;
+      spans.push({ start: i, end: end + 1, inner: line.slice(i + 2, end) });
+      i = end;
+    }
+  }
+  return spans;
+}
+
+/**
  * Words with a slash in one line of a script, and the arguments of cd, tar -C and
- * node, as `{ text, explicit, at }`. What is not written out (expansions, URLs) and
- * what is prose (a string with a space in it, an echo, a label) is left alone.
+ * node, as `{ text, explicit, at, scope }`: `at` is where it stands in the line, and
+ * `scope` is '' for the line itself and names the command substitution a word is in
+ * (`12` for the one at index 12, `12/5` for one inside that), which is read as a
+ * line of its own. What is not written out (expansions, URLs) and what is prose (a
+ * string with a space in it, an echo, a label) is left alone.
  */
 export function wordsOf(rawLine) {
-  let line = rawLine;
-  line = line.replace(/\$\{\{[\s\S]*?\}\}/g, DYNAMIC);
-  line = line.replace(/\$\((?:[^()]|\((?:[^()]|\([^()]*\))*\))*\)/g, DYNAMIC);
-  line = line.replace(/`[^`]*`/g, DYNAMIC);
-  line = line.replace(/\$\{[^}]*\}/g, DYNAMIC);
-  line = line.replace(/\$[A-Za-z_][A-Za-z0-9_]*|\$[0-9@#?!*$-]/g, DYNAMIC);
-  line = line.replace(/\b[A-Za-z][A-Za-z0-9+.-]*:\/\/[^\s"'`)>]*/g, DYNAMIC);
-  line = line.replace(/"(?:[^"\\]|\\.)*"|'(?:[^'\\]|\\.)*'/g, (string) => (/\s/.test(string) ? DYNAMIC : string));
+  let line = rawLine.replace(/\$\{\{[\s\S]*?\}\}/g, blank);
+  const inner = substitutions(line);
+  for (const span of inner) line = line.slice(0, span.start) + blank(line.slice(span.start, span.end)) + line.slice(span.end);
+  line = line.replace(/`[^`]*`/g, blank);
+  line = line.replace(/\$\{[^}]*\}/g, blank);
+  line = line.replace(/\$[A-Za-z_][A-Za-z0-9_]*|\$[0-9@#?!*$-]/g, blank);
+  line = line.replace(/\b[A-Za-z][A-Za-z0-9+.-]*:\/\/[^\s"'`)>]*/g, blank);
+  line = line.replace(/"(?:[^"\\]|\\.)*"|'(?:[^'\\]|\\.)*'/g, (string) => (/\s/.test(string) ? blank(string) : string));
 
   const words = [];
   const argument = (word) => word.replace(/^["']|["',;]+$/g, '');
   const command = (pattern, explicit) => {
     for (const match of line.matchAll(pattern)) {
       if (quoted(line, match.index)) continue;
-      words.push({ text: argument(match[match.length - 1]), explicit, at: match.index });
+      words.push({ text: argument(match[match.length - 1]), explicit, at: match.index, scope: '' });
     }
   };
   command(/(?<![\w.-])cd\s+("[^"]*"|'[^']*'|[^\s;&|()]+)/g, 'cd');
@@ -110,9 +180,15 @@ export function wordsOf(rawLine) {
     if (line[match.index - 1] === DYNAMIC) continue;
     const text = match[0].replace(/[.,:;@]+$/, '');
     if (text === '' || seen.has(text)) continue;
-    words.push({ text, explicit: null, at: match.index });
+    words.push({ text, explicit: null, at: match.index, scope: '' });
   }
-  return words.filter((word) => word.text !== '' && !word.text.includes(DYNAMIC));
+  const own = words.filter((word) => word.text !== '' && !word.text.includes(DYNAMIC));
+  for (const span of inner) {
+    for (const word of wordsOf(span.inner)) {
+      own.push({ ...word, at: span.start + 2 + word.at, scope: word.scope === '' ? String(span.start) : `${span.start}/${word.scope}` });
+    }
+  }
+  return own;
 }
 
 /**
@@ -136,14 +212,21 @@ export function scriptPaths(script, cwd) {
     if (/^\s*#/.test(text)) continue;
     const start = /(?<!<)<<(?!<)-?\s*(["']?)([A-Za-z_]\w*)\1/.exec(text);
     if (start) heredoc = start[2];
-    let there = here;
+    // Where the line, and each command substitution in it, has got to: a `cd` moves only its own,
+    // and what a substitution runs starts where the one around it stands.
+    const dirs = new Map([['', here]]);
+    const dirOf = (scope) => {
+      if (!dirs.has(scope)) dirs.set(scope, dirOf(scope.includes('/') ? scope.slice(0, scope.lastIndexOf('/')) : ''));
+      return dirs.get(scope);
+    };
     const words = wordsOf(start ? text.slice(0, start.index) : text).sort((a, b) => a.at - b.at);
     for (const word of words) {
+      const there = dirOf(word.scope);
       found.push({ text: word.text, explicit: word.explicit, cwd: there, line: first });
       if (word.explicit === 'cd') {
-        there = posix.normalize(posix.join(there || '.', word.text));
-        // A subshell — (cd x && …) — ends with the line; a bare cd carries on.
-        if (!/\(\s*cd\b/.test(text)) here = there;
+        dirs.set(word.scope, posix.normalize(posix.join(there || '.', word.text)));
+        // A subshell — (cd x && …) — ends with the line; a bare cd carries on. One in a substitution ends with it.
+        if (word.scope === '' && !/\(\s*cd\b/.test(text)) here = dirs.get('');
       }
     }
   }

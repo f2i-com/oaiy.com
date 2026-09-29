@@ -14,7 +14,7 @@ import os from 'node:os';
 import path from 'node:path';
 import { after, describe, it } from 'node:test';
 import { fileURLToPath } from 'node:url';
-import { checkWorkflowFiles, scriptPaths, wordsOf } from './check-workflow-paths.mjs';
+import { checkWorkflowFiles, scriptPaths, substitutions, wordsOf } from './check-workflow-paths.mjs';
 
 const here = path.dirname(fileURLToPath(import.meta.url));
 const repo = path.resolve(here, '..', '..');
@@ -75,6 +75,7 @@ jobs:
           node test/cli-http-exit.mjs
       - run: node platform/scripts/fetch-zipp-release.mjs --ensure
       - run: (cd platform/cli && node test/cli-http-exit.mjs)
+      - run: resolved="$(node platform/scripts/fetch-zipp-release.mjs --resolve-only --latest)"
       - run: tar -C platform/ui -czf out.tar.gz .
       - uses: actions/upload-artifact@abc
         with:
@@ -92,6 +93,7 @@ jobs:
         ['run (node)', 'platform/scripts/fetch-zipp-release.mjs', ''],
         ['run (cd)', 'platform/cli', ''],
         ['run (node)', 'test/cli-http-exit.mjs', 'platform/cli'],
+        ['run (node)', 'platform/scripts/fetch-zipp-release.mjs', ''],
         ['run (tar -C)', 'platform/ui', ''],
         ['path', 'release/*', ''],
       ],
@@ -112,6 +114,10 @@ jobs:
     ['a tar -C', step('        run: tar -C ui/dist -czf out.tar.gz .'), 8, /run \(tar -C\) "ui\/dist" is made by the build in ui/],
     ['a redirection', step('        run: |\n          set -e\n          cat > ui/dist/HOSTING.md <<EOF\n          the body\n          EOF'), 10, /run "ui\/dist\/HOSTING\.md" is made by the build in ui/],
     ['a script named as an argument', step('        run: node --test scripts/fetch-zipp-release.test.mjs'), 8, /run \(node\) "scripts\/fetch-zipp-release\.test\.mjs" does not exist/],
+    // The ZIPP release is resolved inside a substitution (ci.yml's zipp job, release.yml's meta job): the paths there have to be read too.
+    ['a script run inside a command substitution', step('        run: resolved="$(node scripts/fetch-zipp-release.mjs --resolve-only --latest)"'), 8, /run \(node\) "scripts\/fetch-zipp-release\.mjs" does not exist; platform\/scripts exists/],
+    ['a script run inside a substitution in a string in a substitution', step('        run: echo "$(echo "$(node scripts/fetch-zipp-release.mjs)")"'), 8, /run \(node\) "scripts\/fetch-zipp-release\.mjs" does not exist/],
+    ['a cd inside a command substitution', step('        run: files="$(cd ui/dist && ls)"'), 8, /run \(cd\) "ui\/dist" is made by the build in ui, which does not exist/],
     ['a path inside code', step("        run: |\n          node -e '\n            const conf = \"desktop/src-tauri/tauri.conf.json\";\n          '"), 10, /run "desktop\/src-tauri\/tauri\.conf\.json" does not exist; platform\/desktop exists/],
     ['a working directory of the whole job', step('        run: node test/cli-http-exit.mjs', '    defaults:\n      run:\n        working-directory: cli\n'), 7, /defaults\.run\.working-directory "cli" does not exist/],
   ]) {
@@ -191,11 +197,13 @@ describe('what the build makes', () => {
 describe('what is not a path', () => {
   const found = (script) => check(step(`        run: |\n${script.split('\n').map((l) => `          ${l}`).join('\n')}`));
 
-  it('is left alone: URLs, variables, expressions, substitutions, comments, heredoc bodies and prose', () => {
+  it('is left alone: URLs, variables, expressions, backticks, comments, heredoc bodies and prose, and substitutions that name no path', () => {
     const { entries, problems } = found(
       [
         'curl https://github.com/f2i-com/zipp.org/releases/download/v1/x.zip',
         'cp "$(find "$bundle" -type f -name "*.msi" | head -1)" "$out/oaiy-desktop-$VERSION.msi"',
+        'echo "sha=$(git rev-parse HEAD)" "at $(date -u +%FT%TZ)" >> "$GITHUB_OUTPUT"; RUSTC="$(rustc --version)"; n=$((count+1))',
+        'echo `cat nowhere/in/backticks.md`',
         'cp ${{ matrix.dir }}/x.json ${OUT}/y.json $HOME/z.json',
         'echo "::error::verified revision differs from the tagged commit web/linux/windows"',
         '# platform/nowhere/comment.md',
@@ -244,6 +252,51 @@ describe('the words of a script', () => {
   it('are the arguments of cd, tar -C and node, and words with a slash', () => {
     const words = wordsOf('cd platform/ui && tar -C dist -czf x.tgz . && node --test test/a.mjs b.mjs > out/c.json').map((w) => [w.text, w.explicit]);
     assert.deepEqual(words, [['platform/ui', 'cd'], ['dist', 'tar -C'], ['test/a.mjs', 'node'], ['out/c.json', null]]);
+  });
+
+  it('include what a command substitution runs, read as a line of its own', () => {
+    const words = (line) => wordsOf(line).sort((a, b) => a.at - b.at).map((w) => [w.text, w.explicit]);
+    assert.deepEqual(words('resolved="$(node platform/scripts/x.mjs --resolve-only --latest)"'), [['platform/scripts/x.mjs', 'node']]);
+    // Inside and outside it, in the order they stand.
+    assert.deepEqual(words('rpm=$(cd platform/ui && ls dist/assets | head -1) && cat out/y.json'), [['platform/ui', 'cd'], ['dist/assets', null], ['out/y.json', null]]);
+    // In a string in a substitution in a string, and beside another substitution that names nothing.
+    assert.deepEqual(words('echo "$(echo "$(node b/c.mjs)" "$(date)")"'), [['b/c.mjs', 'node']]);
+    assert.deepEqual(words('x=$(echo $(node b/c.mjs) $(git rev-parse HEAD))'), [['b/c.mjs', 'node']]);
+    // A parenthesis in a quoted string is not the end of the substitution.
+    assert.deepEqual(words('x=$(echo ")" && node b/c.mjs)'), [['b/c.mjs', 'node']]);
+    assert.deepEqual(words("x=$(echo ')' \"(\" && node b/c.mjs)"), [['b/c.mjs', 'node']]);
+  });
+
+  it('find the outermost substitutions of a line, and what is inside them', () => {
+    const line = 'a="$(b "c)" $(d))" e=$(f) g=`h`';
+    assert.deepEqual(substitutions(line).map((s) => [s.start, s.end, s.inner]), [[3, 17, 'b "c)" $(d)'], [21, 25, 'f']]);
+    assert.deepEqual(substitutions('n=$((count+1))').map((s) => s.inner), ['(count+1)']);
+  });
+
+  it('leave a substitution that is text, or that does not end on the line, alone', () => {
+    const words = (line) => wordsOf(line).map((w) => w.text);
+    assert.deepEqual(words("echo '$(node b/c.mjs)'"), [], 'inside single quotes it is text');
+    assert.deepEqual(words('echo "it\'s $(node b/c.mjs)"'), ['b/c.mjs'], 'an apostrophe in a double-quoted string is not a single quote');
+    assert.deepEqual(substitutions('echo \\$(x) "\\$(y)" $(z)').map((s) => s.inner), ['z'], 'escaped, it is text');
+    assert.deepEqual(words('x="$('), [], 'a substitution that goes on to the next line is not found on this one');
+    assert.deepEqual(words('n=$((count+1))'), []);
+    // ...its lines are read as lines of their own.
+    assert.deepEqual(scriptPaths('x="$(\n  node platform/scripts/x.mjs\n)"', '').map((f) => f.text), ['platform/scripts/x.mjs']);
+  });
+
+  it('read a line whose quotes and parentheses do not balance without failing', () => {
+    for (const line of ['x="$(', "x='$(", 'x=$(echo "a', "x=$(echo 'a)", ')(', '$(()', '"$("$(', 'a\\', '$', '$(', "'", '"', 'x=$(echo $(echo $(']) {
+      assert.doesNotThrow(() => scriptPaths(line, ''), line);
+    }
+  });
+
+  it('keep a cd in a substitution inside it, and give what it runs the folder in effect where it stands', () => {
+    const at = (script, cwd = '') => scriptPaths(script, cwd).map((f) => [f.text, f.cwd]);
+    assert.deepEqual(at('cd platform/cli && x="$(node test/a.mjs)"'), [['platform/cli', ''], ['test/a.mjs', 'platform/cli']]);
+    assert.deepEqual(at('x="$(cd platform/cli && node test/a.mjs)"\nnode test/b.mjs'), [['platform/cli', ''], ['test/a.mjs', 'platform/cli'], ['test/b.mjs', '']]);
+    assert.deepEqual(at('y="$(cd platform/cli && true)"; node test/b.mjs'), [['platform/cli', ''], ['test/b.mjs', '']], 'nor does it carry on to the rest of its line');
+    assert.deepEqual(at('x="$(node test/a.mjs)"', 'platform/cli'), [['test/a.mjs', 'platform/cli']], 'the step’s working directory is the substitution’s');
+    assert.deepEqual(at('x="$(cd platform && echo "$(cd cli && node test/a.mjs)")"'), [['platform', ''], ['cli', 'platform'], ['test/a.mjs', 'platform/cli']], 'and a substitution in one is in the folder that one has got to');
   });
 
   it('skip a heredoc’s body and a line that only comments, and join a line that goes on', () => {
@@ -319,6 +372,34 @@ describe('the real workflows', () => {
   it('fail on a script that is not where the step says', () => {
     const result = old('release.yml', (t) => t.replace('node platform/desktop/scripts/package-server.mjs', 'node desktop/scripts/package-server.mjs'));
     assert.deepEqual(result.problems.map((p) => [p.kind, p.text]), [['run (node)', 'desktop/scripts/package-server.mjs']]);
+  });
+
+  // ci.yml's zipp job and release.yml's meta job resolve the ZIPP release inside a command substitution, and every other job waits for them.
+  const resolving = files.flatMap((file) =>
+    fs
+      .readFileSync(file, 'utf8')
+      .split(/\r?\n/)
+      .map((text, index) => ({ file: path.relative(repo, file).replace(/\\/g, '/'), line: index + 1, text }))
+      .filter(({ text }) => text.includes('$(node platform/scripts/fetch-zipp-release.mjs')),
+  );
+
+  it('are read inside command substitutions: every place the ZIPP release is resolved', () => {
+    assert.deepEqual(
+      resolving.map((r) => `${r.file}:${r.line}`),
+      ['.github/workflows/ci.yml:95', '.github/workflows/ci.yml:97', '.github/workflows/release.yml:111'],
+    );
+    for (const { file, line } of resolving) {
+      assert.ok(real.entries.some((e) => e.file === file && e.line === line && e.kind === 'run (node)' && e.text === 'platform/scripts/fetch-zipp-release.mjs'), `${file}:${line} was not read`);
+    }
+  });
+
+  it('fail on a script that is run inside a command substitution, on that line only', () => {
+    for (const { file, line, text } of resolving) {
+      const name = path.basename(file);
+      const wrong = text.trim().replace('node platform/scripts/', 'node scripts/');
+      const result = old(name, (t) => t.replace(text.trim(), wrong));
+      assert.deepEqual(result.problems.map((p) => [p.line, p.kind, p.text]), [[line, 'run (node)', 'scripts/fetch-zipp-release.mjs']], `${file}:${line}`);
+    }
   });
 });
 
