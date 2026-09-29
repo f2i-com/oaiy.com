@@ -1129,6 +1129,59 @@ export const aiProviders = {
     request<{ ok: boolean }>(`/api/ai/providers/${encodeURIComponent(id)}/test`, { method: 'POST' }),
 };
 
+// ----- updates -----
+
+export type UpdateState = 'idle' | 'checking' | 'upToDate' | 'available' | 'downloading' | 'ready' | 'installing' | 'failed';
+
+/** One reason an update cannot be installed now, in words for a person. */
+export interface UpdateBlocker {
+  /** call, agentTask, download, mediaJob, installing, migration or starting. */
+  code: string;
+  message: string;
+}
+
+/** `GET /api/update/status`: what OAIY knows about a newer release. */
+export interface UpdateStatus {
+  state: UpdateState;
+  currentVersion: string;
+  /** Always the stable releases. */
+  channel: string;
+  latestVersion: string | null;
+  notes: string | null;
+  publishedAt: string | null;
+  lastCheckedAt: string | null;
+  /** The last thing that went wrong, in words for a person. */
+  error: string | null;
+  failedDuring: 'check' | 'download' | 'install' | null;
+  progress: { downloaded: number; total: number | null } | null;
+  /** Something to say beside the state (no release for this platform, say). */
+  note: string | null;
+  /** This copy can download and install an update itself. */
+  canAutoUpdate: boolean;
+  /** When it cannot, why. */
+  manualReason: string | null;
+  /** What stops an install now; empty when nothing does. */
+  blockers: UpdateBlocker[];
+  /** The releases page, for a manual download. */
+  manualUrl: string;
+  /** Whether OAIY looks for updates by itself (a little after it starts, then daily). */
+  autoCheck: boolean;
+  /** Seconds until a check is allowed again; null when now. */
+  nextCheckIn: number | null;
+}
+
+export const updates = {
+  status: () => request<UpdateStatus>('/api/update/status'),
+  /** Look for a newer release now (at most once every 30 seconds). Inside the desktop app it is the window's own command. */
+  check: () => (isTauri() ? tauriInvoke<UpdateStatus>('update_check') : request<UpdateStatus>('/api/update/check', { method: 'POST' })),
+  /** Download and verify the release the last check found. Answers the status; follow the progress in `status`. */
+  download: () => tauriInvoke<UpdateStatus>('update_download'),
+  /** Restart to update: stops OAIY, hands over to the installer, and OAIY starts again. Takes no argument. */
+  install: () => tauriInvoke<void>('update_install'),
+  /** Whether OAIY looks for updates by itself. A check asked for here works either way. */
+  setAutoCheck: (enabled: boolean) => tauriInvoke<void>('set_update_auto_check', { enabled }),
+};
+
 // ----- formatting helpers used by multiple components -----
 
 export function formatBytes(n: number | null | undefined): string {

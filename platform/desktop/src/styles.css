@@ -837,6 +837,28 @@ code {
 .banner-dismiss:hover { opacity: 1; background: color-mix(in srgb, currentColor 12%, transparent); }
 .banner-dismiss:focus-visible { outline: 2px solid currentColor; outline-offset: 1px; opacity: 1; }
 
+/* Settings, About and updates; and the Overview banner that says a newer OAIY exists. */
+.update-state { margin: 10px 0 6px; font-size: 13px; font-weight: 600; }
+.update-progress { display: flex; flex-direction: column; gap: 4px; margin-bottom: 8px; }
+.update-notes-block, .update-blockers-block { display: flex; flex-direction: column; gap: 4px; margin: 8px 0; }
+.update-notes {
+  margin: 0;
+  max-height: 160px;
+  overflow: auto;
+  padding: 8px 10px;
+  border: 1px solid var(--border);
+  border-radius: var(--r-ctl);
+  background: var(--canvas);
+  color: var(--muted);
+  font: inherit;
+  font-size: 12px;
+  white-space: pre-wrap;
+  word-break: break-word;
+}
+.update-blockers { margin: 0; padding-left: 18px; color: var(--muted); font-size: 12px; line-height: 1.6; }
+.update-auto { display: flex; align-items: center; gap: 8px; margin-top: 10px; font-size: 12px; color: var(--muted); }
+.update-banner { margin-bottom: 4px; }
+
 /* Nothing here yet (or still loading): an icon, a line, and what to do about it. */
 .empty-state {
   display: flex;

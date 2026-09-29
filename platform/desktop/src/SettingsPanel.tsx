@@ -11,6 +11,7 @@ import {
 } from './api';
 import { FolderOpen, FolderSearch, ListChecks, RotateCcw, X } from 'lucide-react';
 import { useToast } from './Toasts';
+import UpdatesSection from './UpdatesSection';
 import { forgetGuideDismissal, openSetup, setSetupState, useSetupState } from './useSetupState';
 
 /**
@@ -453,6 +454,8 @@ export default function SettingsPanel() {
       {error && <div className="banner banner-err">⚠ {error}</div>}
 
       <SetupSection />
+
+      <UpdatesSection />
 
       <section className="model-section">
         <h3 className="section-title">Data folder</h3>
