@@ -52,17 +52,25 @@
 //!   the plugin may contribute. A cheap fingerprint of the folder (paths, sizes and
 //!   times, no reads) decides whether the answer of the last scan still stands, so the
 //!   listing that is polled every couple of seconds does not hash a hundred megabytes
-//!   each time;
+//!   each time. The fingerprint cannot see a file rewritten to the same size with its
+//!   time put back, so the one file a scan builds everything from, `manifest.json`, is
+//!   held to the answer another way: the scan hands over the bytes it parsed
+//!   ([`TrustService::assess_read`]) and the verdict only stands for a folder whose
+//!   `manifest.json` has exactly those bytes;
 //! - when a plugin is **installed**, on the staged copy, before it replaces anything;
 //! - **immediately before each launch**, in full and never from the cache. A scan's
 //!   answer is only ever a display: what decides whether a process starts is the
 //!   [`LaunchPermit`] that [`TrustService::authorize_launch`] hands out, and
-//!   `PluginProcess::spawn` cannot be called without one.
+//!   `PluginProcess::spawn` cannot be called without one. The permit carries the folder
+//!   that was checked and the manifest parsed from the very bytes that were hashed, and
+//!   `spawn` starts that manifest's entry and no other: a second read of `manifest.json`
+//!   could hand the launch a different file from the one the signature covers.
 //!
-//! The launch check and the process creation are two steps, so a process that can write
-//! to the plugin folder can in principle win a race between them. The folder is in the
-//! person's own data directory: this guards against a tampered download, a swapped file
-//! and a stale copy, not against malware already running as the person.
+//! The launch check and the process creation are still two steps, so a process that can
+//! write to the plugin folder can in principle win a race between them (by swapping the
+//! entry executable itself). The folder is in the person's own data directory: this
+//! guards against a tampered download, a swapped file and a stale copy, not against
+//! malware already running as the person.
 
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::io::Read;
@@ -75,8 +83,13 @@ use ed25519_dalek::{Signature, VerifyingKey};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
+use super::manifest::{ManifestError, PluginManifest, MAX_MANIFEST_BYTES};
+
 /// The envelope Aokie's `package-signer` writes at the root of a bundle.
 pub const PACKAGE_MANIFEST_FILE: &str = "package-manifest.json";
+
+/// The file the plugin is described in, and which a launch is built from.
+const MANIFEST_FILE: &str = "manifest.json";
 
 /// Where the person's "trust this exact package" decisions are kept, in the plugins root
 /// beside `disabled.json`.
@@ -173,9 +186,16 @@ impl PackageTrust {
 /// What lets a process start. Only [`TrustService::authorize_launch`] makes one, and
 /// `PluginProcess::spawn` takes one, so a new way to start a plugin cannot skip the
 /// check by forgetting it.
+///
+/// It carries what was checked and `spawn` uses that and nothing else: the folder, and
+/// the manifest parsed from the very bytes of `manifest.json` that were hashed. A launch
+/// that read `manifest.json` again for itself, or was handed a manifest read at some
+/// earlier scan, could start an entry the verified manifest never named.
 #[derive(Debug)]
 pub struct LaunchPermit {
     trust: PackageTrust,
+    dir: PathBuf,
+    manifest: PluginManifest,
 }
 
 impl LaunchPermit {
@@ -184,11 +204,31 @@ impl LaunchPermit {
         &self.trust
     }
 
+    /// The folder that was checked: the only one a process is started from.
+    pub fn dir(&self) -> &Path {
+        &self.dir
+    }
+
+    /// The manifest of what was checked, parsed from the bytes that were hashed.
+    pub fn manifest(&self) -> &PluginManifest {
+        &self.manifest
+    }
+
     /// For tests of the process layer, which have nothing to do with trust.
     #[cfg(test)]
-    pub(crate) fn unchecked_for_tests() -> Self {
-        Self { trust: PackageTrust::bare(TrustState::UnsignedDev, None) }
+    pub(crate) fn unchecked_for_tests(dir: &Path, manifest: PluginManifest) -> Self {
+        Self { trust: PackageTrust::bare(TrustState::UnsignedDev, None), dir: dir.to_path_buf(), manifest }
     }
+}
+
+/// Why a launch was not authorised.
+#[derive(Debug)]
+pub enum LaunchRefusal {
+    /// The package may not run. The verdict is what the plugin's record should show.
+    Untrusted(Box<PackageTrust>),
+    /// The package may run, but its `manifest.json` does not load now (it changed since
+    /// the scan, or was never valid).
+    Manifest(ManifestError),
 }
 
 // ---------------------------------------------------------------------------------
@@ -462,10 +502,9 @@ enum HashFailure {
     Other(String),
 }
 
-/// SHA-256 and size of a regular file, spending `budget` bytes.
-///
-/// Refuses a symbolic link or junction: the bytes it leads to are not in the package.
-fn hash_regular(path: &Path, budget: &mut u64) -> Result<(String, u64), HashFailure> {
+/// What `path` is, if it is a regular file. A symbolic link or junction is refused: the
+/// bytes it leads to are not in the package.
+fn regular_file_metadata(path: &Path) -> Result<std::fs::Metadata, HashFailure> {
     let meta = std::fs::symlink_metadata(path).map_err(|e| match e.kind() {
         std::io::ErrorKind::NotFound => HashFailure::Missing,
         _ => HashFailure::Other(e.to_string()),
@@ -476,6 +515,38 @@ fn hash_regular(path: &Path, budget: &mut u64) -> Result<(String, u64), HashFail
     if !meta.is_file() {
         return Err(HashFailure::Other("it is not a regular file".into()));
     }
+    Ok(meta)
+}
+
+/// SHA-256 of some bytes, as lowercase hex.
+fn sha256_hex(bytes: &[u8]) -> String {
+    hex(&Sha256::digest(bytes))
+}
+
+/// Like [`hash_regular`], but reads the file whole into memory (at most `cap` bytes) and
+/// gives the bytes back with their digest and size. What was hashed is then exactly what
+/// the caller goes on to use: there is no second read for a swap to slip into.
+fn hash_regular_keeping(path: &Path, budget: &mut u64, cap: u64) -> Result<(String, u64, Vec<u8>), HashFailure> {
+    let too_large = || HashFailure::Other(format!("it is larger than the {cap} bytes allowed here"));
+    let meta = regular_file_metadata(path)?;
+    if meta.len() > cap {
+        return Err(too_large());
+    }
+    *budget = budget.checked_sub(meta.len()).ok_or(HashFailure::TooLarge)?;
+    let file = std::fs::File::open(path).map_err(|e| HashFailure::Other(e.to_string()))?;
+    let mut bytes = Vec::new();
+    file.take(cap + 1).read_to_end(&mut bytes).map_err(|e| HashFailure::Other(e.to_string()))?;
+    if bytes.len() as u64 > cap {
+        return Err(too_large());
+    }
+    Ok((sha256_hex(&bytes), bytes.len() as u64, bytes))
+}
+
+/// SHA-256 and size of a regular file, spending `budget` bytes.
+///
+/// Refuses a symbolic link or junction: the bytes it leads to are not in the package.
+fn hash_regular(path: &Path, budget: &mut u64) -> Result<(String, u64), HashFailure> {
+    let meta = regular_file_metadata(path)?;
     *budget = budget.checked_sub(meta.len()).ok_or(HashFailure::TooLarge)?;
     let mut file = std::fs::File::open(path).map_err(|e| HashFailure::Other(e.to_string()))?;
     let mut hasher = Sha256::new();
@@ -566,17 +637,33 @@ fn fingerprint(dir: &Path) -> Result<String, String> {
 /// path, size and SHA-256, so a change to any file, a new file or a missing one is a
 /// different package.
 pub fn package_digest(dir: &Path) -> Result<String, String> {
+    digest_walk(dir).map(|(digest, _)| digest)
+}
+
+/// [`package_digest`], and the bytes of the folder's `manifest.json` exactly as they were
+/// hashed into it (`None` when there is none).
+fn digest_walk(dir: &Path) -> Result<(String, Option<Vec<u8>>), String> {
     let files = list_files(dir)?;
     let mut budget = MAX_PACKAGE_BYTES;
     let mut hasher = Sha256::new();
+    let mut manifest_json = None;
     hasher.update(b"oaiy-package-digest-v1\n");
     for rel in &files {
-        let (sha, size) = match hash_regular(&dir.join(rel), &mut budget) {
+        let path = dir.join(rel);
+        let hashed = if rel == MANIFEST_FILE {
+            hash_regular_keeping(&path, &mut budget, MAX_MANIFEST_BYTES).map(|(sha, size, bytes)| (sha, size, Some(bytes)))
+        } else {
+            hash_regular(&path, &mut budget).map(|(sha, size)| (sha, size, None))
+        };
+        let (sha, size, bytes) = match hashed {
             Ok(v) => v,
             Err(HashFailure::Missing) => return Err(format!("{rel} vanished while it was read")),
             Err(HashFailure::TooLarge) => return Err("the package is too large to hash".into()),
             Err(HashFailure::Other(e)) => return Err(format!("cannot read {rel}: {e}")),
         };
+        if bytes.is_some() {
+            manifest_json = bytes;
+        }
         hasher.update(rel.as_bytes());
         hasher.update([0]);
         hasher.update(size.to_string().as_bytes());
@@ -584,7 +671,7 @@ pub fn package_digest(dir: &Path) -> Result<String, String> {
         hasher.update(sha.as_bytes());
         hasher.update(b"\n");
     }
-    Ok(format!("sha256:{}", hex(&hasher.finalize())))
+    Ok((format!("sha256:{}", hex(&hasher.finalize())), manifest_json))
 }
 
 fn is_loadable(rel: &str) -> bool {
@@ -603,8 +690,10 @@ fn list_some(names: &[String]) -> String {
     }
 }
 
-/// Every listed file must be there as signed, and no other file may be.
-fn check_files(dir: &Path, payload: &Payload) -> Result<(), String> {
+/// Every listed file must be there as signed, and no other file may be. Gives back the
+/// bytes of `manifest.json` exactly as they were hashed, so what is started from the
+/// package is the file that was checked and not a second read of it.
+fn check_files(dir: &Path, payload: &Payload) -> Result<Vec<u8>, String> {
     if payload.files.is_empty() {
         return Err("the signature lists no files".into());
     }
@@ -620,18 +709,27 @@ fn check_files(dir: &Path, payload: &Payload) -> Result<(), String> {
     }
     // Every file already has to match its digest, so this is about the entry command: a
     // manifest.json the signature does not cover could point at anything.
-    if !listed.contains("manifest.json") {
+    if !listed.contains(MANIFEST_FILE) {
         return Err("the signature does not cover manifest.json, so the command it starts is not pinned".into());
     }
 
     let mut budget = MAX_PACKAGE_BYTES;
     let mut changed: Vec<String> = Vec::new();
     let mut missing: Vec<String> = Vec::new();
+    let mut manifest_json: Option<Vec<u8>> = None;
     for file in &payload.files {
-        match hash_regular(&dir.join(&file.path), &mut budget) {
-            Ok((sha, size)) => {
+        let path = dir.join(&file.path);
+        let hashed = if file.path == MANIFEST_FILE {
+            hash_regular_keeping(&path, &mut budget, MAX_MANIFEST_BYTES).map(|(sha, size, bytes)| (sha, size, Some(bytes)))
+        } else {
+            hash_regular(&path, &mut budget).map(|(sha, size)| (sha, size, None))
+        };
+        match hashed {
+            Ok((sha, size, bytes)) => {
                 if sha != file.sha256.to_ascii_lowercase() || size != file.size {
                     changed.push(file.path.clone());
+                } else if bytes.is_some() {
+                    manifest_json = bytes;
                 }
             }
             Err(HashFailure::Missing) => missing.push(file.path.clone()),
@@ -666,11 +764,11 @@ fn check_files(dir: &Path, payload: &Payload) -> Result<(), String> {
     if !others.is_empty() {
         problems.push(format!("unlisted file present: {}", list_some(&others)));
     }
-    if problems.is_empty() {
-        Ok(())
-    } else {
-        Err(problems.join("; "))
+    if !problems.is_empty() {
+        return Err(problems.join("; "));
     }
+    // Listed, and neither changed nor missing, so it was read above.
+    manifest_json.ok_or_else(|| "manifest.json could not be read".to_string())
 }
 
 // ---------------------------------------------------------------------------------
@@ -803,6 +901,33 @@ struct Remembered {
     /// The local trust record the answer was made under (its digest).
     local: Option<String>,
     verdict: PackageTrust,
+    /// See [`Assessed::manifest_sha256`].
+    manifest_sha256: Option<String>,
+}
+
+/// A verdict, and what the check behind it saw of `manifest.json`.
+struct Assessed {
+    trust: PackageTrust,
+    /// SHA-256 of the `manifest.json` the check hashed, for a package that was verified
+    /// (a signature that held, or the person's trust in a digest): the verdict is about
+    /// a folder whose manifest is exactly that file. `None` when nothing was verified.
+    manifest_sha256: Option<String>,
+    /// The bytes that were hashed. Kept only by a check that ran just now, never by the
+    /// cache, so that a launch can start what was verified rather than read it again.
+    manifest_json: Option<Vec<u8>>,
+}
+
+impl Assessed {
+    /// A verdict that rests on no verification of the folder's files.
+    fn unverified(trust: PackageTrust) -> Self {
+        Self { trust, manifest_sha256: None, manifest_json: None }
+    }
+
+    /// Is `manifest_json` (bytes a caller parsed) the manifest this verdict was made for?
+    /// A verdict that verified nothing has no manifest to disagree with.
+    fn covers(&self, manifest_json: &[u8]) -> bool {
+        self.manifest_sha256.as_deref().map_or(true, |sha| sha == sha256_hex(manifest_json))
+    }
 }
 
 /// Verifies plugin packages under one policy and one set of pinned keys.
@@ -828,33 +953,68 @@ impl TrustService {
         self.remembered.lock().unwrap_or_else(|e| e.into_inner())
     }
 
-    /// What a scan shows: as recent as the folder's fingerprint allows. Cheap for a
+    /// What a listing shows: as recent as the folder's fingerprint allows. Cheap for a
     /// package that has not changed, and for an unsigned one it is a single `stat`.
+    ///
+    /// The fingerprint cannot see a file rewritten to the same size with its time put
+    /// back, so this is only a display. A scan that builds a plugin from `manifest.json`
+    /// asks [`TrustService::assess_read`] instead.
     pub fn assess(&self, dir: &Path, id: &str) -> PackageTrust {
-        self.assess_with(dir, id, Reuse::Cached)
+        self.assess_with(dir, id, Reuse::Cached).trust
+    }
+
+    /// What a scan shows for a package whose `manifest.json` it has just read (the bytes
+    /// it parsed the plugin from). The answer of the last check stands while the folder
+    /// looks the same and that manifest is the one the check verified. If it is not (a
+    /// swap the fingerprint could not see, or a change between the scan's read and the
+    /// check) the package is looked at again from its bytes, and one whose manifest
+    /// still differs from what was verified is not trusted: the scan must not build a
+    /// plugin, its commands or its screens from a file the verdict is not about.
+    pub fn assess_read(&self, dir: &Path, id: &str, manifest_json: &[u8]) -> PackageTrust {
+        let remembered = self.assess_with(dir, id, Reuse::Cached);
+        if remembered.covers(manifest_json) {
+            return remembered.trust;
+        }
+        let fresh = self.assess_with(dir, id, Reuse::Fresh);
+        if fresh.covers(manifest_json) {
+            return fresh.trust;
+        }
+        match fresh.trust.state {
+            TrustState::TrustedLocal => self.unsigned(Some("It changed while it was being checked.")),
+            _ => self.quarantined("manifest.json changed while it was being read"),
+        }
     }
 
     /// The whole check again, from the bytes, whatever was remembered. What a launch
     /// stands on; also forgets a stale answer, so the listing agrees with it.
     pub fn assess_fresh(&self, dir: &Path, id: &str) -> PackageTrust {
-        self.assess_with(dir, id, Reuse::Fresh)
+        self.assess_with(dir, id, Reuse::Fresh).trust
     }
 
     /// The check on a copy that is not (yet) where the plugin lives, at install. Uses and
     /// leaves no memory, since the folder it will end up in is another path.
     pub fn assess_staged(&self, dir: &Path, id: &str) -> PackageTrust {
-        self.assess_with(dir, id, Reuse::Never)
+        self.assess_with(dir, id, Reuse::Never).trust
     }
 
     /// Verify immediately before a launch and, if the package may run, say so with a
     /// permit. The failure is what the record should show.
-    pub fn authorize_launch(&self, dir: &Path, id: &str) -> Result<LaunchPermit, Box<PackageTrust>> {
-        let verdict = self.assess_fresh(dir, id);
-        if verdict.allows_launch() {
-            Ok(LaunchPermit { trust: verdict })
-        } else {
-            Err(Box::new(verdict))
+    ///
+    /// The permit's manifest is parsed from the bytes of `manifest.json` that this check
+    /// hashed, so the entry that is started is the one the signature (or the person's
+    /// trust) covers. Only a package that nothing was verified for, a developer's, is
+    /// read here for the first time.
+    pub fn authorize_launch(&self, dir: &Path, id: &str) -> Result<LaunchPermit, LaunchRefusal> {
+        let assessed = self.assess_with(dir, id, Reuse::Fresh);
+        if !assessed.trust.allows_launch() {
+            return Err(LaunchRefusal::Untrusted(Box::new(assessed.trust)));
         }
+        let manifest = match &assessed.manifest_json {
+            Some(bytes) => PluginManifest::parse(bytes, dir),
+            None => PluginManifest::read(dir).map(|(manifest, _)| manifest),
+        }
+        .map_err(LaunchRefusal::Manifest)?;
+        Ok(LaunchPermit { trust: assessed.trust, dir: dir.to_path_buf(), manifest })
     }
 
     fn quarantined(&self, detail: impl AsRef<str>) -> PackageTrust {
@@ -885,85 +1045,103 @@ impl TrustService {
         }
     }
 
-    fn assess_with(&self, dir: &Path, id: &str, reuse: Reuse) -> PackageTrust {
+    fn assess_with(&self, dir: &Path, id: &str, reuse: Reuse) -> Assessed {
         let signed = match std::fs::symlink_metadata(dir.join(PACKAGE_MANIFEST_FILE)) {
             Ok(meta) if meta.is_file() => true,
-            Ok(_) => return self.quarantined(format!("{PACKAGE_MANIFEST_FILE} is not a regular file")),
+            Ok(_) => return Assessed::unverified(self.quarantined(format!("{PACKAGE_MANIFEST_FILE} is not a regular file"))),
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => false,
             // Present or not, it could not be looked at: not a reason to call it unsigned.
-            Err(e) => return self.quarantined(format!("{PACKAGE_MANIFEST_FILE} cannot be read: {e}")),
+            Err(e) => return Assessed::unverified(self.quarantined(format!("{PACKAGE_MANIFEST_FILE} cannot be read: {e}"))),
         };
         let local = if signed { None } else { self.local.get(id) };
         if !signed && local.is_none() {
-            return self.unsigned(None);
+            return Assessed::unverified(self.unsigned(None));
         }
 
         let print = match fingerprint(dir) {
             Ok(p) => p,
-            Err(e) if signed => return self.quarantined(format!("the package folder cannot be read: {e}")),
-            Err(e) => return self.unsigned(Some(format!("The package folder cannot be read ({e}).").as_str())),
+            Err(e) if signed => return Assessed::unverified(self.quarantined(format!("the package folder cannot be read: {e}"))),
+            Err(e) => return Assessed::unverified(self.unsigned(Some(format!("The package folder cannot be read ({e}).").as_str()))),
         };
         let local_digest = local.as_ref().map(|l| l.digest.clone());
         if reuse == Reuse::Cached {
             if let Some(hit) = self.remembered().get(id) {
                 if hit.fingerprint == print && hit.local == local_digest {
-                    return hit.verdict.clone();
+                    return Assessed { trust: hit.verdict.clone(), manifest_sha256: hit.manifest_sha256.clone(), manifest_json: None };
                 }
             }
         }
 
-        let verdict = match &local {
+        let assessed = match &local {
             None => self.verify_signed(dir, id),
             Some(record) => self.check_local(dir, record),
         };
         if reuse != Reuse::Never {
-            self.remembered().insert(id.to_string(), Remembered { fingerprint: print, local: local_digest, verdict: verdict.clone() });
+            self.remembered().insert(
+                id.to_string(),
+                Remembered {
+                    fingerprint: print,
+                    local: local_digest,
+                    verdict: assessed.trust.clone(),
+                    manifest_sha256: assessed.manifest_sha256.clone(),
+                },
+            );
         }
-        verdict
+        assessed
     }
 
-    fn verify_signed(&self, dir: &Path, id: &str) -> PackageTrust {
+    fn verify_signed(&self, dir: &Path, id: &str) -> Assessed {
         let path = dir.join(PACKAGE_MANIFEST_FILE);
         let text = match std::fs::metadata(&path) {
-            Ok(m) if m.len() > MAX_ENVELOPE_BYTES => return self.quarantined(format!("{PACKAGE_MANIFEST_FILE} is too large to be a package manifest")),
+            Ok(m) if m.len() > MAX_ENVELOPE_BYTES => {
+                return Assessed::unverified(self.quarantined(format!("{PACKAGE_MANIFEST_FILE} is too large to be a package manifest")))
+            }
             Ok(_) => match std::fs::read_to_string(&path) {
                 Ok(t) => t,
-                Err(e) => return self.quarantined(format!("{PACKAGE_MANIFEST_FILE} cannot be read: {e}")),
+                Err(e) => return Assessed::unverified(self.quarantined(format!("{PACKAGE_MANIFEST_FILE} cannot be read: {e}"))),
             },
-            Err(e) => return self.quarantined(format!("{PACKAGE_MANIFEST_FILE} cannot be read: {e}")),
+            Err(e) => return Assessed::unverified(self.quarantined(format!("{PACKAGE_MANIFEST_FILE} cannot be read: {e}"))),
         };
         let opened = match open_envelope(&text, &self.publishers, id) {
             Ok(o) => o,
-            Err(e) => return self.quarantined(e),
+            Err(e) => return Assessed::unverified(self.quarantined(e)),
         };
         match check_files(dir, &opened.payload) {
-            Ok(()) => PackageTrust {
-                state: TrustState::Verified,
-                publisher: Some(opened.publisher.name.clone()),
-                key_id: Some(opened.publisher.key_id.clone()),
-                version: Some(opened.payload.version.clone()),
-                reason: None,
-                trusted_at: None,
+            Ok(manifest_json) => Assessed {
+                trust: PackageTrust {
+                    state: TrustState::Verified,
+                    publisher: Some(opened.publisher.name.clone()),
+                    key_id: Some(opened.publisher.key_id.clone()),
+                    version: Some(opened.payload.version.clone()),
+                    reason: None,
+                    trusted_at: None,
+                },
+                manifest_sha256: Some(sha256_hex(&manifest_json)),
+                manifest_json: Some(manifest_json),
             },
-            Err(e) => self.quarantined(e),
+            Err(e) => Assessed::unverified(self.quarantined(e)),
         }
     }
 
-    fn check_local(&self, dir: &Path, record: &LocalTrust) -> PackageTrust {
-        match package_digest(dir) {
-            Ok(digest) if digest == record.digest => PackageTrust {
-                state: TrustState::TrustedLocal,
-                publisher: None,
-                key_id: None,
-                version: None,
-                reason: Some(format!(
-                    "You trusted this exact package on {}. A change to any of its files ends that.",
-                    record.trusted_at.get(..10).unwrap_or(&record.trusted_at)
-                )),
-                trusted_at: Some(record.trusted_at.clone()),
+    fn check_local(&self, dir: &Path, record: &LocalTrust) -> Assessed {
+        match digest_walk(dir) {
+            Ok((digest, manifest_json)) if digest == record.digest => Assessed {
+                trust: PackageTrust {
+                    state: TrustState::TrustedLocal,
+                    publisher: None,
+                    key_id: None,
+                    version: None,
+                    reason: Some(format!(
+                        "You trusted this exact package on {}. A change to any of its files ends that.",
+                        record.trusted_at.get(..10).unwrap_or(&record.trusted_at)
+                    )),
+                    trusted_at: Some(record.trusted_at.clone()),
+                },
+                manifest_sha256: manifest_json.as_deref().map(sha256_hex),
+                manifest_json,
             },
-            Ok(_) => self.unsigned(Some("It changed since you trusted it.")),
-            Err(e) => self.unsigned(Some(format!("It cannot be compared with what you trusted ({e}).").as_str())),
+            Ok(_) => Assessed::unverified(self.unsigned(Some("It changed since you trusted it."))),
+            Err(e) => Assessed::unverified(self.unsigned(Some(format!("It cannot be compared with what you trusted ({e}).").as_str()))),
         }
     }
 
@@ -1780,10 +1958,18 @@ pub(crate) mod tests {
         assert_eq!(svc.assess(&dir, "demo").state, TrustState::Verified, "a listing can be stale: it is only ever a display");
 
         // The launch does not ask the listing.
-        let refused = svc.authorize_launch(&dir, "demo").expect_err("the launch must hash the bytes again");
+        let refused = refused_launch(svc.authorize_launch(&dir, "demo"));
         assert!(quarantine_reason(&refused).contains("digest mismatch: demo-plugin.exe"), "{refused:?}");
         // And what it found is what the listing shows from then on.
         assert_eq!(svc.assess(&dir, "demo").state, TrustState::Quarantined);
+    }
+
+    /// The verdict of a launch that was refused because of the package.
+    fn refused_launch(outcome: Result<LaunchPermit, LaunchRefusal>) -> PackageTrust {
+        match outcome {
+            Err(LaunchRefusal::Untrusted(verdict)) => *verdict,
+            other => panic!("the launch should have been refused for its package: {other:?}"),
+        }
     }
 
     #[test]
@@ -1793,6 +1979,101 @@ pub(crate) mod tests {
         assert_eq!(permit.trust().state, TrustState::Verified);
         std::fs::write(dir.join("manifest.json"), b"{}").unwrap();
         assert!(svc.authorize_launch(&dir, "demo").is_err());
+    }
+
+    // -----------------------------------------------------------------------------
+    // What a scan and a launch build a plugin from is what was verified
+    // -----------------------------------------------------------------------------
+
+    /// `MANIFEST` with another entry command of the same length.
+    fn same_length_manifest() -> String {
+        let swapped = MANIFEST.replace("demo-plugin.exe", "demo-plugin.cmd");
+        assert_eq!(swapped.len(), MANIFEST.len());
+        swapped
+    }
+
+    /// Rewrite a file with other bytes of the same length and put its modified time back:
+    /// the folder's fingerprint (paths, sizes, times) does not move.
+    fn swap_keeping_size_and_time(path: &Path, bytes: &[u8]) {
+        let before = std::fs::metadata(path).unwrap().modified().unwrap();
+        assert_eq!(std::fs::metadata(path).unwrap().len(), bytes.len() as u64);
+        std::fs::write(path, bytes).unwrap();
+        std::fs::File::options().write(true).open(path).unwrap().set_modified(before).unwrap();
+    }
+
+    #[test]
+    fn a_manifest_swapped_behind_the_fingerprint_is_not_trusted_by_the_scan() {
+        let (_s, dir, _k, svc) = signed(TrustPolicy::release());
+        assert_eq!(svc.assess_read(&dir, "demo", MANIFEST.as_bytes()).state, TrustState::Verified);
+
+        let swapped = same_length_manifest();
+        swap_keeping_size_and_time(&dir.join("manifest.json"), swapped.as_bytes());
+        // The fingerprint cannot tell, so a plain listing still says verified...
+        assert_eq!(svc.assess(&dir, "demo").state, TrustState::Verified);
+        // ...but a scan that has just parsed that manifest is told the verdict is not about it.
+        let t = svc.assess_read(&dir, "demo", swapped.as_bytes());
+        assert!(quarantine_reason(&t).contains("digest mismatch: manifest.json"), "{t:?}");
+        assert!(!t.allows_launch());
+    }
+
+    #[test]
+    fn a_verdict_is_only_ever_about_the_manifest_that_was_verified() {
+        let (_s, dir, _k, svc) = signed(TrustPolicy::release());
+        // The folder is untouched, but the bytes the scan parsed are not the signed ones
+        // (they were read a moment before a swap was put back, say).
+        let t = svc.assess_read(&dir, "demo", same_length_manifest().as_bytes());
+        assert!(quarantine_reason(&t).contains("manifest.json changed while it was being read"), "{t:?}");
+        // The signed bytes are what it is about.
+        assert_eq!(svc.assess_read(&dir, "demo", MANIFEST.as_bytes()).state, TrustState::Verified);
+    }
+
+    #[test]
+    fn a_trusted_package_is_trusted_for_the_manifest_that_was_hashed() {
+        let (_s, dir, svc) = unsigned_release();
+        svc.trust_local(&dir, "demo").unwrap();
+        assert_eq!(svc.assess_read(&dir, "demo", MANIFEST.as_bytes()).state, TrustState::TrustedLocal);
+
+        let swapped = same_length_manifest();
+        swap_keeping_size_and_time(&dir.join("manifest.json"), swapped.as_bytes());
+        let t = svc.assess_read(&dir, "demo", swapped.as_bytes());
+        assert_eq!(t.state, TrustState::Unsigned, "{t:?}");
+        assert!(t.reason.as_deref().unwrap().contains("changed since you trusted it"), "{t:?}");
+        // And the bytes of the trusted manifest, offered for the folder that now holds another.
+        assert_ne!(svc.assess_read(&dir, "demo", MANIFEST.as_bytes()).state, TrustState::TrustedLocal);
+    }
+
+    #[test]
+    fn the_permit_carries_the_folder_and_the_manifest_that_were_hashed() {
+        let (_s, dir, _k, svc) = signed(TrustPolicy::release());
+        let permit = svc.authorize_launch(&dir, "demo").unwrap();
+        assert_eq!(permit.dir(), dir.as_path());
+        assert_eq!(permit.manifest().id, "demo");
+        assert_eq!(permit.manifest().entry.command, "demo-plugin.exe");
+
+        // What the check kept is the bytes it hashed, and the cache never hands them out.
+        let checked = svc.assess_with(&dir, "demo", Reuse::Fresh);
+        assert_eq!(checked.manifest_json.as_deref(), Some(MANIFEST.as_bytes()));
+        assert_eq!(checked.manifest_sha256.as_deref(), Some(sha256_hex(MANIFEST.as_bytes()).as_str()));
+        let remembered = svc.assess_with(&dir, "demo", Reuse::Cached);
+        assert!(remembered.manifest_json.is_none());
+        assert_eq!(remembered.manifest_sha256, checked.manifest_sha256);
+    }
+
+    #[test]
+    fn an_unsigned_package_in_a_developer_build_is_read_at_the_launch_and_a_broken_one_is_refused() {
+        let scratch = Scratch::new("dev-launch");
+        let dir = scratch.package("demo");
+        fill(&dir);
+        let svc = service(TrustPolicy::developer(), Publishers::default(), &scratch);
+        let permit = svc.authorize_launch(&dir, "demo").unwrap();
+        assert_eq!(permit.trust().state, TrustState::UnsignedDev);
+        assert_eq!(permit.manifest().entry.command, "demo-plugin.exe");
+
+        std::fs::write(dir.join("manifest.json"), b"{ not json").unwrap();
+        match svc.authorize_launch(&dir, "demo") {
+            Err(LaunchRefusal::Manifest(ManifestError::Malformed(_))) => {}
+            other => panic!("a manifest that does not load is a refusal of its own: {other:?}"),
+        }
     }
 
     #[test]

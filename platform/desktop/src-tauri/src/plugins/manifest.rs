@@ -617,6 +617,28 @@ fn semver_cmp(a: &(u64, u64, u64, Vec<String>), b: &(u64, u64, u64, Vec<String>)
     a.3.len().cmp(&b.3.len())
 }
 
+/// The most a `manifest.json` may hold. It is a hand-written description of a plugin,
+/// a few kilobytes; a file this large is not one, and it is read whole into memory
+/// (and hashed) by the package check, so it is bounded.
+pub const MAX_MANIFEST_BYTES: u64 = 2 * 1024 * 1024;
+
+/// `manifest.json`, whole, at most [`MAX_MANIFEST_BYTES`].
+fn read_manifest_bytes(path: &Path) -> Result<Vec<u8>, ManifestError> {
+    use std::io::Read as _;
+    let file = std::fs::File::open(path).map_err(|e| ManifestError::Unreadable(e.to_string()))?;
+    let mut raw = Vec::new();
+    file.take(MAX_MANIFEST_BYTES + 1)
+        .read_to_end(&mut raw)
+        .map_err(|e| ManifestError::Unreadable(e.to_string()))?;
+    if raw.len() as u64 > MAX_MANIFEST_BYTES {
+        return Err(ManifestError::Invalid(format!(
+            "it is larger than {} MiB, which no manifest is",
+            MAX_MANIFEST_BYTES / (1024 * 1024)
+        )));
+    }
+    Ok(raw)
+}
+
 /// Is `wanted` (a manifest's `minDesktopVersion`) newer than `have`?
 /// `Err` when either is not a semantic version.
 pub fn needs_newer_desktop(wanted: &str, have: &str) -> Result<bool, String> {
@@ -628,10 +650,27 @@ pub fn needs_newer_desktop(wanted: &str, have: &str) -> Result<bool, String> {
 impl PluginManifest {
     /// Read and validate `<dir>/manifest.json`.
     pub fn load(dir: &Path) -> Result<Self, ManifestError> {
-        let path = dir.join("manifest.json");
-        let raw = std::fs::read_to_string(&path)
-            .map_err(|e| ManifestError::Unreadable(e.to_string()))?;
-        let value: Value = serde_json::from_str(&raw).map_err(|e| ManifestError::Malformed(e.to_string()))?;
+        Self::read(dir).map(|(manifest, _)| manifest)
+    }
+
+    /// Read and validate `<dir>/manifest.json`, and give back the bytes that were parsed.
+    ///
+    /// For a caller that must know the manifest it holds is the one a package check
+    /// verified (see [`super::trust`]): it compares those bytes, instead of reading the
+    /// file a second time and trusting that it did not change in between.
+    pub fn read(dir: &Path) -> Result<(Self, Vec<u8>), ManifestError> {
+        let raw = read_manifest_bytes(&dir.join("manifest.json"))?;
+        let manifest = Self::parse(&raw, dir)?;
+        Ok((manifest, raw))
+    }
+
+    /// Validate the bytes of a `manifest.json` that has already been read. `dir` is the
+    /// plugin's folder, for what the manifest points at (its entry, its service
+    /// definitions).
+    pub fn parse(raw: &[u8], dir: &Path) -> Result<Self, ManifestError> {
+        let raw = std::str::from_utf8(raw)
+            .map_err(|_| ManifestError::Unreadable("stream did not contain valid UTF-8".into()))?;
+        let value: Value = serde_json::from_str(raw).map_err(|e| ManifestError::Malformed(e.to_string()))?;
         // Before the sections are read: under an older schemaVersion the
         // reason is the version, even when the section is malformed too.
         refuse_newer_sections(&value)?;
@@ -1320,6 +1359,30 @@ mod tests {
         assert_eq!(m.id, "aokie");
         assert_eq!(m.plugin_api_version, 1);
         assert_eq!(m.connectors.len(), 1);
+    }
+
+    #[test]
+    fn a_manifest_is_read_and_parsed_from_the_same_bytes() {
+        // What a package check hashes is what is parsed: `read` gives back the bytes it
+        // parsed, and parsing those bytes again needs no second look at the file.
+        let d = write_manifest(&base());
+        let (m, raw) = PluginManifest::read(d.path()).expect("should read");
+        assert_eq!(raw, fs::read(d.path().join("manifest.json")).unwrap());
+        fs::remove_file(d.path().join("manifest.json")).unwrap();
+        let again = PluginManifest::parse(&raw, d.path()).expect("the bytes are the manifest");
+        assert_eq!((again.id, again.entry.command), (m.id, m.entry.command));
+    }
+
+    #[test]
+    fn a_manifest_that_is_not_text_or_is_far_too_large_does_not_load() {
+        let d = tempdir::TempPluginDir::new();
+        fs::write(d.path().join("manifest.json"), [0xff, 0xfe, 0x00]).unwrap();
+        assert!(matches!(PluginManifest::load(d.path()), Err(ManifestError::Unreadable(_))));
+
+        fs::write(d.path().join("manifest.json"), vec![b' '; MAX_MANIFEST_BYTES as usize + 1]).unwrap();
+        let err = PluginManifest::load(d.path()).unwrap_err();
+        assert!(matches!(err, ManifestError::Invalid(_)), "{err:?}");
+        assert!(err.reason().contains("larger than"), "{err:?}");
     }
 
     // --- wildcard expansion: the security-relevant part -------------------

@@ -30,7 +30,7 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
 use super::manifest::{ManifestError, PluginManifest};
-use super::trust::{PackageTrust, TrustService, PACKAGE_MANIFEST_FILE};
+use super::trust::{LaunchPermit, PackageTrust, TrustService, PACKAGE_MANIFEST_FILE};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
@@ -407,8 +407,10 @@ impl PluginRegistry {
                 continue;
             }
 
-            match PluginManifest::load(&dir) {
-                Ok(m) => {
+            // The bytes are kept: the trust check is told which manifest.json this scan
+            // built the plugin from, so a verdict is never applied to a file it is not about.
+            match PluginManifest::read(&dir) {
+                Ok((m, manifest_json)) => {
                     // The manifest's own id wins over the directory name, but a
                     // mismatch is worth refusing: two directories both claiming
                     // `aokie` would silently shadow each other, and which one won
@@ -441,7 +443,7 @@ impl PluginRegistry {
                     if !live {
                         self.move_legacy_data_out_of_a_signed_bundle(&id, &dir);
                     }
-                    let trust = self.trust.assess(&dir, &id);
+                    let trust = self.trust.assess_read(&dir, &id, &manifest_json);
 
                     if !trust.allows_launch() && !live {
                         // Quarantined, or unsigned and not trusted: listed with why, and
@@ -541,6 +543,22 @@ impl PluginRegistry {
         let record = PluginRecord::withheld(existing.dir.clone(), id.to_string(), trust);
         self.plugins.insert(id.to_string(), record);
         self.apply_disabled();
+    }
+
+    /// A launch has verified the package and parsed its manifest from the bytes it hashed:
+    /// the record follows what is about to run. What its gate, its events and its
+    /// capabilities allow is then what the process was started from, and not an earlier
+    /// scan's reading of the file; and a record a scan had withheld on a verdict that
+    /// was stale (the launch checks the bytes, the scan may only have looked at the
+    /// folder's sizes and times) is a plugin again, with the verdict that was just made.
+    pub fn adopt_launch(&mut self, id: &str, permit: &LaunchPermit) {
+        if let Some(rec) = self.plugins.get_mut(id) {
+            let manifest = permit.manifest().clone();
+            rec.legacy_capabilities = manifest.legacy_capabilities();
+            rec.unknown_capabilities = manifest.unknown_capabilities();
+            rec.manifest = Some(manifest);
+            rec.trust = Some(permit.trust().clone());
+        }
     }
 
     /// Drop a plugin from the in-memory registry after its directory has been
@@ -1749,6 +1767,64 @@ mod tests {
             vec!["call.answer".to_string()],
             "the record still holds the manifest the process was started from"
         );
+    }
+
+    /// Rewrite a file with other bytes of the same length and put its modified time back:
+    /// the folder's stat fingerprint does not move.
+    fn swap_keeping_size_and_time(path: &Path, bytes: &[u8]) {
+        let before = fs::metadata(path).unwrap().modified().unwrap();
+        assert_eq!(fs::metadata(path).unwrap().len(), bytes.len() as u64);
+        fs::write(path, bytes).unwrap();
+        fs::File::options().write(true).open(path).unwrap().set_modified(before).unwrap();
+    }
+
+    #[test]
+    fn a_manifest_swapped_behind_the_fingerprint_is_not_built_into_a_plugin() {
+        // The same command name, spelled differently but at the same length: a manifest
+        // that declares another command, swapped in with its time put back. A scan that
+        // took the folder's fingerprint for proof would list it verified and let it be
+        // called.
+        let root = Root::new();
+        let key = TestKey::generate("fl-test-2026a");
+        let signed = serde_json::to_string_pretty(&narrow_manifest("aokie")).unwrap();
+        let swapped = signed.replace("call.answer", "sms.sendnow");
+        assert_eq!(signed.len(), swapped.len());
+        root.plugin("aokie", narrow_manifest("aokie"));
+        let dir = root.path().join("aokie");
+        key.sign(&dir, "aokie-plugin", "0.1.0");
+        let mut reg = release_registry(&root, &key);
+        reg.scan();
+        assert_eq!(reg.get("aokie").unwrap().trust.as_ref().unwrap().state, TrustState::Verified);
+
+        swap_keeping_size_and_time(&dir.join("manifest.json"), swapped.as_bytes());
+        reg.scan();
+        let rec = reg.get("aokie").unwrap();
+        assert_eq!(rec.trust.as_ref().unwrap().state, TrustState::Quarantined, "{:?}", rec.trust);
+        assert!(!rec.is_loadable(), "nothing is built from the swapped manifest");
+        assert!(reg.gate("aokie", "sms.sendnow", Some("k")).is_err());
+    }
+
+    #[test]
+    fn a_launch_makes_the_record_follow_the_manifest_it_was_started_from() {
+        let root = Root::new();
+        let key = TestKey::generate("fl-test-2026a");
+        root.plugin("aokie", narrow_manifest("aokie"));
+        let dir = root.path().join("aokie");
+        key.sign(&dir, "aokie-plugin", "0.1.0");
+        let mut reg = release_registry(&root, &key);
+        reg.scan();
+        assert_eq!(widened_by_an_edit(&reg), (false, false, false));
+
+        // A newer signed release is put in place after the scan; the launch verifies it
+        // and starts from it, and the record follows.
+        fs::write(dir.join("manifest.json"), serde_json::to_string_pretty(&manifest("aokie")).unwrap()).unwrap();
+        key.sign(&dir, "aokie-plugin", "0.2.0");
+        let permit = reg.trust().authorize_launch(&dir, "aokie").expect("the new release verifies");
+        reg.adopt_launch("aokie", &permit);
+        let rec = reg.get("aokie").unwrap();
+        assert_eq!(rec.trust.as_ref().unwrap().version.as_deref(), Some("0.2.0"));
+        reg.set_state("aokie", PluginState::Running, None);
+        assert_eq!(widened_by_an_edit(&reg), (true, true, true), "what the process was started from is what the gate allows");
     }
 
     #[test]

@@ -56,4 +56,4 @@ pub use runner::{
     plugin_env, restart_delay, should_restart, HealthTracker, HealthVerdict, HANDSHAKE_TIMEOUT,
     HEALTH_INTERVAL, MAX_RESTART_ATTEMPTS, SHUTDOWN_GRACE,
 };
-pub use trust::{LaunchPermit, PackageTrust, TrustPolicy, TrustService, TrustState};
+pub use trust::{LaunchPermit, LaunchRefusal, PackageTrust, TrustPolicy, TrustService, TrustState};

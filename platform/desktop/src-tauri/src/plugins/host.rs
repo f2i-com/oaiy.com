@@ -50,6 +50,7 @@ use serde_json::{json, Value};
 use super::process::{CallError, PluginProcess, SpawnOptions};
 use super::registry::{GateRefusal, PluginRegistryHandle, PluginState};
 use super::runner::{restart_delay, should_restart, HealthTracker, HealthVerdict, HEALTH_INTERVAL};
+use super::trust::LaunchRefusal;
 use crate::bridge::deadletters::{DeadLetterHandle, DeadReason};
 use crate::bridge::ledger::{LedgerHandle, LineageRef, ReserveOutcome, RunRequest, RunStatus};
 use crate::bridge::triggers::{dispatch, DispatchOutcome, Event, SkipReason, TriggerBinding};
@@ -710,7 +711,7 @@ impl PluginHost {
         }
         // Copy what spawn needs out of the registry, then release the lock —
         // spawning and handshaking take seconds.
-        let (manifest, dir, trust) = {
+        let (dir, trust) = {
             let mut reg = self.registry.lock().map_err(|_| "registry lock poisoned")?;
             // Scan first: "drop a folder in plugins/, then POST start" is the
             // documented install flow, and without this it failed with "no plugin
@@ -727,19 +728,19 @@ impl PluginHost {
                     "{id} is turned off. Enable it in OAIY Desktop → Plugins first."
                 ));
             }
-            let m = rec.manifest.clone().ok_or_else(|| match &rec.trust {
-                // Held back by its package, not broken: the person needs the trust
-                // verdict itself ("not signed", "digest mismatch: ..."), not "cannot start".
-                Some(t) if !t.allows_launch() => format!(
-                    "{id} was not started: {}",
-                    t.reason.clone().unwrap_or_else(|| "its package is not trusted".into())
-                ),
-                _ => format!(
+            // The manifest it is started from is not this one: that comes from the bytes
+            // the launch verifies (below). A plugin held back by its package is not turned
+            // away here on the scan's word either: a scan may only have looked at the
+            // folder's sizes and times, and the launch check, which reads the bytes, is the
+            // one that decides (it gives the person the same verdict when it agrees).
+            // Only a plugin with no manifest for any other reason stops here.
+            if rec.manifest.is_none() && !rec.refused_by_trust() {
+                return Err(format!(
                     "{id} cannot start: {}",
                     rec.reason.clone().unwrap_or_else(|| "its manifest is invalid".into())
-                ),
-            })?;
-            (m, rec.dir.clone(), reg.trust())
+                ));
+            }
+            (rec.dir.clone(), reg.trust())
         };
 
         // Claim the start ATOMICALLY. "Check the map, then spawn" is a
@@ -772,10 +773,12 @@ impl PluginHost {
         // The scan a moment ago (and the one at boot, and the one on install) only ever
         // shows a verdict: a file swapped since then must not slip through, and a folder
         // that scanned as fine may not be any longer. The permit this yields is what
-        // `PluginProcess::spawn` requires, so this is the one way a plugin starts.
+        // `PluginProcess::spawn` requires, so this is the one way a plugin starts, and it
+        // carries the manifest parsed from the very bytes that were hashed: what is
+        // started is what was verified, not a later read of the file.
         let permit = match trust.authorize_launch(&dir, id) {
             Ok(permit) => permit,
-            Err(verdict) => {
+            Err(LaunchRefusal::Untrusted(verdict)) => {
                 let why = verdict.reason.clone().unwrap_or_else(|| "its package is not trusted".into());
                 log::warn!("plugin {id} was not started: {why}");
                 if let Ok(mut reg) = self.registry.lock() {
@@ -783,7 +786,21 @@ impl PluginHost {
                 }
                 return Err(format!("{id} was not started: {why}"));
             }
+            Err(LaunchRefusal::Manifest(e)) => {
+                // It scanned as loadable a moment ago and does not now: the next scan
+                // lists it with the reason, as it does any plugin whose manifest is broken.
+                let why = e.reason();
+                log::warn!("plugin {id} was not started: {why}");
+                return Err(format!("{id} cannot start: {why}"));
+            }
         };
+        // The record follows what is about to run: what its gate, its events and its
+        // capabilities allow (and the companion seed below is handed on) is what this
+        // process was started from.
+        if let Ok(mut reg) = self.registry.lock() {
+            reg.adopt_launch(id, &permit);
+        }
+        let plugin_api_version = permit.manifest().plugin_api_version;
 
         self.set_state(id, PluginState::Starting, Some("Launching…".into()));
 
@@ -793,8 +810,6 @@ impl PluginHost {
         let plugin_for_requests = id.to_string();
 
         let spawn_result = PluginProcess::spawn(
-            &manifest,
-            &dir,
             SpawnOptions {
                 desktop_version: self.desktop_version.clone(),
                 dev_mode: self.dev_mode,
@@ -895,9 +910,9 @@ impl PluginHost {
                     .unwrap_or(false)
             })
             .and_then(|b| b.companion.identity_for(id).ok())
-            .and_then(|identity| identity.private_bootstrap(manifest.plugin_api_version as u16));
+            .and_then(|identity| identity.private_bootstrap(plugin_api_version as u16));
         match process.init(
-            manifest.plugin_api_version,
+            plugin_api_version,
             &super::runner::plugin_data_dir(&dir),
             self.dev_mode,
             companion_bootstrap,
@@ -3424,5 +3439,50 @@ process.stdin.on("data", (chunk) => {
         let err = host.start("probe").unwrap_err();
         assert!(err.contains("changed since you trusted it"), "{err}");
         assert_eq!(state_of(&host, "probe"), PluginState::Disabled);
+    }
+
+    /// Rewrite a file with other bytes of the same length and put its modified time back.
+    #[cfg(windows)]
+    fn swap_keeping_size_and_time(path: &std::path::Path, bytes: &[u8]) {
+        let before = std::fs::metadata(path).unwrap().modified().unwrap();
+        assert_eq!(std::fs::metadata(path).unwrap().len(), bytes.len() as u64);
+        std::fs::write(path, bytes).unwrap();
+        std::fs::File::options().write(true).open(path).unwrap().set_modified(before).unwrap();
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn a_manifest_swapped_behind_the_scan_does_not_choose_what_is_started() {
+        // manifest.json decides which file is started. Swapped for another of the same
+        // length with its time put back, the folder looks as the last scan left it, and a
+        // scan that trusted the stat cache would have built the plugin from the swapped
+        // file; a launch that read it again would have started what the signature does
+        // not name. Neither does: the scan and the launch are about the signed bytes.
+        let key = TestKey::generate("fl-test-2026a");
+        let (sb, host, _trust) = trusting_host("swap-manifest", TrustPolicy::release(), key.pinned_for("Probe Co", &["probe"]));
+        let Some(dir) = node_plugin(&sb, "probe") else { return };
+        std::fs::write(dir.join("xother.cmd"), "@echo off\r\necho other> \"%~dp0..\\marker.txt\"\r\n").unwrap();
+        key.sign(&dir, "probe-plugin", "1.0.0");
+        let marker = sb.0.join("plugins").join("marker.txt");
+
+        host.registry.lock().unwrap().scan();
+        assert_eq!(trust_of(&host, "probe"), Some(TrustState::Verified));
+
+        let signed_manifest = std::fs::read(dir.join("manifest.json")).unwrap();
+        let swapped = String::from_utf8(signed_manifest.clone()).unwrap().replace("plugin.cmd", "xother.cmd");
+        swap_keeping_size_and_time(&dir.join("manifest.json"), swapped.as_bytes());
+        let err = host.start("probe").unwrap_err();
+        assert!(err.contains("probe was not started") && err.contains("digest mismatch: manifest.json"), "{err}");
+        assert_eq!(state_of(&host, "probe"), PluginState::Disabled);
+        assert!(!marker.exists(), "the file the swapped manifest names never ran");
+
+        // Put right, it starts, from the entry the signature names.
+        swap_keeping_size_and_time(&dir.join("manifest.json"), &signed_manifest);
+        host.start("probe").expect("the signed manifest is back");
+        wait_running(&host, "probe");
+        let entry = host.registry.lock().unwrap().get("probe").unwrap().manifest.as_ref().unwrap().entry.command.clone();
+        assert_eq!(entry, "plugin.cmd");
+        assert!(!marker.exists());
+        host.stop("probe").unwrap();
     }
 }

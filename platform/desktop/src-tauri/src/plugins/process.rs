@@ -121,7 +121,9 @@ pub struct SpawnOptions {
     pub dev_mode: bool,
     /// Proof that the package was verified a moment ago (see [`super::trust`]). There is
     /// no other way to make one than to verify it, so there is no way to spawn a plugin
-    /// without the check.
+    /// without the check. It also names what is started: the folder that was checked and
+    /// the manifest parsed from the bytes that were hashed, so a caller cannot start
+    /// anything else with it.
     pub permit: LaunchPermit,
     /// Receives validated `event.emit` payloads and `log.emit` lines.
     pub events: EventSink,
@@ -130,13 +132,11 @@ pub struct SpawnOptions {
 }
 
 impl PluginProcess {
-    /// Spawn the plugin. Does **not** perform the handshake — call
-    /// [`PluginProcess::init`] next, so the caller controls the state machine.
-    pub fn spawn(
-        manifest: &PluginManifest,
-        dir: &std::path::Path,
-        opts: SpawnOptions,
-    ) -> Result<Self, String> {
+    /// Spawn the plugin the permit was given for. Does **not** perform the handshake —
+    /// call [`PluginProcess::init`] next, so the caller controls the state machine.
+    pub fn spawn(opts: SpawnOptions) -> Result<Self, String> {
+        let manifest: &PluginManifest = opts.permit.manifest();
+        let dir: &std::path::Path = opts.permit.dir();
         let exe = manifest
             .resolve_entry(dir)
             .map_err(|e| format!("cannot launch plugin: {}", e.reason()))?;
@@ -952,12 +952,10 @@ process.stdin.on("data", (chunk) => {
             let ev = events.clone();
             let ak = asked.clone();
             let p = PluginProcess::spawn(
-                &f.manifest,
-                &f.dir,
                 SpawnOptions {
                     desktop_version: "0.1.0".into(),
                     dev_mode: false,
-                    permit: LaunchPermit::unchecked_for_tests(),
+                    permit: LaunchPermit::unchecked_for_tests(&f.dir, f.manifest.clone()),
                     events: Arc::new(move |name, _payload| {
                         ev.lock().unwrap().push(name.to_string());
                     }),
