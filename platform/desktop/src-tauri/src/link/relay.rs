@@ -102,6 +102,7 @@ pub fn spawn(store: LinkHandle, dispatch: Dispatcher) {
                 // A batch that did work is likely followed by more; go straight
                 // back. An empty one already waited server-side.
                 if backoff {
+                    HTTP.start_afresh();
                     std::thread::sleep(Duration::from_secs(spec.error_backoff_seconds));
                 } else if handled == 0 {
                     std::thread::sleep(super::net::idle_pause(polled.elapsed()));
@@ -109,6 +110,9 @@ pub fn spawn(store: LinkHandle, dispatch: Dispatcher) {
             }
             Err(e) => {
                 store.note_relay(Some(e));
+                // The try after a failure is on a new client, not one that has
+                // seen the trouble.
+                HTTP.start_afresh();
                 // Backing off on failure keeps a provider that is down, or a key
                 // that was revoked, from becoming a hot loop against it.
                 std::thread::sleep(Duration::from_secs(spec.error_backoff_seconds));
@@ -117,9 +121,16 @@ pub fn spawn(store: LinkHandle, dispatch: Dispatcher) {
     });
 }
 
-fn client(timeout: Duration) -> Result<reqwest::blocking::Client, String> {
-    reqwest::blocking::Client::builder()
-        .timeout(timeout)
+/// The client this lane keeps from poll to poll, so that a poll, the claim it
+/// leads to and the report share a connection instead of each making one.
+static HTTP: super::net::LaneClient<reqwest::blocking::Client> =
+    super::net::LaneClient::new(build_client);
+
+/// How long a claim or a report may take. The poll's is longer, by the wait.
+const ANSWER_TIMEOUT: Duration = Duration::from_secs(20);
+
+fn build_client() -> Result<reqwest::blocking::Client, String> {
+    super::net::blocking_builder()
         .build()
         .map_err(|e| format!("could not build the relay client: {e}"))
 }
@@ -143,11 +154,12 @@ fn poll_once(
         spec.batch_limit,
         urlencode(instance),
     );
-    // Generous over the server's wait so a long-poll that returns exactly on
-    // time is not cut off by our own client and retried needlessly.
-    let http = client(Duration::from_secs(spec.wait_seconds + 15))?;
+    let http = HTTP.get()?;
     let resp = http
         .get(&url)
+        // Generous over the server's wait so a long-poll that returns exactly on
+        // time is not cut off by our own client and retried needlessly.
+        .timeout(Duration::from_secs(spec.wait_seconds + 15))
         .bearer_auth(&account.credential)
         .send()
         .map_err(|e| format!("could not reach the relay: {}", super::net::unreachable(&e)))?;
@@ -203,7 +215,7 @@ fn serve(
     dispatch: &Dispatcher,
     command: &Command,
 ) -> Result<(), String> {
-    let http = client(Duration::from_secs(20))?;
+    let http = HTTP.get()?;
     let body = serde_json::json!({ "instanceId": instance });
 
     // Claim FIRST. It is exactly-once: another desktop under the same account
@@ -216,17 +228,22 @@ fn serve(
     );
     let claimed = http
         .post(&claim_url)
+        .timeout(ANSWER_TIMEOUT)
         .bearer_auth(&account.credential)
         .json(&body)
         .send()
         .map_err(|e| format!("could not claim: {e}"))?;
-    if !claimed.status().is_success() {
+    // Only the status is wanted; the rest is read out so the connection can
+    // carry the report.
+    let claim_status = claimed.status();
+    super::net::drain(claimed);
+    if !claim_status.is_success() {
         // 409 is the ordinary "someone else got it" and not worth reporting as
         // an error anywhere a user would see.
-        return if claimed.status().as_u16() == 409 {
+        return if claim_status.as_u16() == 409 {
             Ok(())
         } else {
-            Err(format!("claim refused: HTTP {}", claimed.status().as_u16()))
+            Err(format!("claim refused: HTTP {}", claim_status.as_u16()))
         };
     }
 
@@ -271,17 +288,29 @@ fn serve(
     let mut last = String::new();
     for wait in [0u64, 1, 3] {
         std::thread::sleep(Duration::from_secs(wait));
-        match http.post(&complete_url).bearer_auth(&account.credential).json(&report).send() {
-            // Ok even when the WORK failed. The command was answered, so the
-            // user reads "no plugin named ghost" on the provider's page; calling
-            // that a lane failure would put a red "not receiving commands" on
-            // this panel every time somebody asks for something that does not exist.
-            Ok(done) if done.status().is_success() => return Ok(()),
-            // Refused outright: another try says the same.
-            Ok(done) if done.status().is_client_error() => {
-                return Err(format!("the relay refused the outcome: HTTP {}", done.status().as_u16()));
+        match http
+            .post(&complete_url)
+            .timeout(ANSWER_TIMEOUT)
+            .bearer_auth(&account.credential)
+            .json(&report)
+            .send()
+        {
+            Ok(done) => {
+                let status = done.status();
+                super::net::drain(done);
+                // Ok even when the WORK failed. The command was answered, so the
+                // user reads "no plugin named ghost" on the provider's page; calling
+                // that a lane failure would put a red "not receiving commands" on
+                // this panel every time somebody asks for something that does not exist.
+                if status.is_success() {
+                    return Ok(());
+                }
+                // Refused outright: another try says the same.
+                if status.is_client_error() {
+                    return Err(format!("the relay refused the outcome: HTTP {}", status.as_u16()));
+                }
+                last = format!("the relay refused the outcome: HTTP {}", status.as_u16());
             }
-            Ok(done) => last = format!("the relay refused the outcome: HTTP {}", done.status().as_u16()),
             Err(e) => last = format!("could not report the outcome: {}", super::net::unreachable(&e)),
         }
     }
@@ -653,5 +682,104 @@ mod tests {
         let logged = std::fs::read_to_string(dir.join("relay-log.jsonl")).unwrap();
         assert!(logged.contains("c9") && logged.contains("refused"), "{logged}");
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // --- the connections it makes ---------------------------------------------------
+
+    use crate::link::testkit::{Provider, Reply};
+    use std::sync::atomic::{AtomicBool, Ordering};
+
+    /// A relay that keeps its connections: one batch of work, once, then nothing.
+    /// Its answer to a claim is padded, as a command's can be (a payload up to 16 KiB).
+    fn keeping_relay(claim_padding: usize) -> Provider {
+        let served = AtomicBool::new(false);
+        Provider::start(move |req| {
+            if req.target.starts_with("/pending") {
+                if served.swap(true, Ordering::SeqCst) {
+                    Reply::ok(r#"{"commands":[]}"#)
+                } else {
+                    Reply::ok(ONE_COMMAND)
+                }
+            } else if req.target.ends_with("/claim") {
+                Reply::ok(&format!(r#"{{"claimed":true,"pad":"{}"}}"#, "x".repeat(claim_padding)))
+            } else {
+                Reply::ok("{}")
+            }
+        })
+    }
+
+    fn working_dispatcher() -> Dispatcher {
+        Arc::new(|_: &str, _: &str, _: &Value, _: &str| -> Result<Value, String> {
+            Ok(serde_json::json!({ "ok": true }))
+        })
+    }
+
+    const POLL: &str = "GET /pending?wait=1000&limit=5&instanceId=oaiy-test";
+
+    #[test]
+    fn a_poll_the_claim_it_leads_to_the_report_and_the_next_poll_share_one_connection() {
+        // A connection to the provider used to be made, and a TLS handshake done, for
+        // each of these four requests.
+        let server = keeping_relay(200_000);
+        let linked = account(server.base.clone());
+        let dispatch = working_dispatcher();
+
+        let (handled, trouble) = poll_once(&linked, &spec(), "oaiy-test", &dispatch).unwrap();
+        assert_eq!((handled, trouble), (1, None));
+        let (handled, trouble) = poll_once(&linked, &spec(), "oaiy-test", &dispatch).unwrap();
+        assert_eq!((handled, trouble), (0, None));
+
+        assert_eq!(
+            server.lines(),
+            [POLL, "POST /commands/c1/claim", "POST /commands/c1/complete", POLL]
+        );
+        assert_eq!(server.connections(), 1, "{:?}", server.lines());
+    }
+
+    #[test]
+    fn a_lane_that_keeps_its_client_still_gives_each_account_only_its_own_credential() {
+        // The credential is on the request, not on the client. So the connection
+        // one account's poll leaves behind carries the next request, from another
+        // account or to another provider, with that one's credential and no other.
+        let (a, b) = (
+            Provider::start(|_| Reply::ok(r#"{"commands":[]}"#)),
+            Provider::start(|_| Reply::ok(r#"{"commands":[]}"#)),
+        );
+        let with = |server: &Provider, credential: &str| {
+            let mut linked = account(server.base.clone());
+            linked.credential = credential.into();
+            poll_once(&linked, &spec(), "oaiy-test", &working_dispatcher()).unwrap();
+        };
+        with(&a, "flk_alpha");
+        with(&b, "flk_beta");
+        with(&a, "flk_gamma");
+        with(&a, "flk_alpha");
+
+        let bearers = |server: &Provider| -> Vec<String> {
+            server.requests().iter().map(|r| r.header("authorization").unwrap_or("none").to_string()).collect()
+        };
+        assert_eq!(bearers(&a), ["Bearer flk_alpha", "Bearer flk_gamma", "Bearer flk_alpha"]);
+        assert_eq!(bearers(&b), ["Bearer flk_beta"]);
+        assert_eq!((a.connections(), b.connections()), (1, 1), "each provider's requests shared its connection");
+    }
+
+    #[test]
+    fn a_redirect_is_followed_as_it_always_was_but_the_credential_does_not_go_with_it() {
+        // The redirect policy of this lane is the client's default, unchanged: a
+        // provider that moves the queue is followed. What is not followed is the
+        // bearer, which reqwest drops on the way to another origin.
+        let elsewhere = Provider::start(|_| Reply::ok(r#"{"commands":[]}"#));
+        let moved_to = format!("{}/moved", elsewhere.base);
+        let origin = Provider::start(move |_| Reply::redirect(307, &moved_to));
+
+        let (handled, trouble) =
+            poll_once(&account(origin.base.clone()), &spec(), "oaiy-test", &working_dispatcher()).unwrap();
+        assert_eq!((handled, trouble), (0, None), "the answer from where it was sent");
+
+        assert_eq!(origin.requests()[0].header("authorization"), Some("Bearer flk_secret"));
+        let followed = elsewhere.requests();
+        assert_eq!(followed.len(), 1);
+        assert!(followed[0].target.starts_with("/moved"), "{}", followed[0].target);
+        assert_eq!(followed[0].header("authorization"), None, "the credential stayed with the provider");
     }
 }

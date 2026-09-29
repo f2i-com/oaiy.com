@@ -1,9 +1,13 @@
-//! Saying why a request to the provider did not get there.
+//! Talking to the provider: saying why a request did not get there, and the
+//! clients the lanes keep between their requests.
 //!
 //! reqwest's own message is "error sending request for url (...)" whatever
 //! happened, which reads the same for a computer with no internet, a server
 //! that is down and one that is slow. The cause is further down the error's
 //! chain; this finds it and says it in words a person can act on.
+
+use std::sync::Mutex;
+use std::time::{Duration, Instant};
 
 /// Why `e` did not reach the other end: "formlogic.com can't be reached: it
 /// refused the connection".
@@ -80,6 +84,124 @@ pub fn idle_pause(polled_for: std::time::Duration) -> std::time::Duration {
     CYCLE.saturating_sub(polled_for).max(LEAST)
 }
 
+// ---- the clients the lanes keep -------------------------------------------------
+//
+// A lane used to build a client for every poll or beat: a thread, a TLS
+// configuration and, with them, a new connection and a new TLS handshake to the
+// provider each time. A long-poll lane did that every 25 seconds, the queued-run
+// check every 3. Each lane now keeps ONE client between its requests, so the
+// requests that follow one another (a poll, the claim it leads to, the report)
+// share a connection.
+//
+// What a client may not carry: a credential. The bearer is put on each request by
+// the code that makes it, never on a client, so a client that a lane keeps cannot
+// take one lane's credential to another lane or provider, and neither can a
+// connection it reuses (HTTP keeps no login on a connection).
+
+/// How long a connection may sit unused before this desktop closes it, rather
+/// than send the next request down it.
+///
+/// A provider's web server closes a connection nobody has used for a few
+/// seconds (Apache's default is five), and a request sent in the moment one is
+/// being closed fails with no way to tell whether the provider saw it. Closing
+/// our side first, sooner than any common server closes theirs, means a
+/// connection is only reused while it is certainly still open. The long-poll
+/// lanes come back within a couple of seconds of a poll and a claim and its
+/// report follow their poll at once, so they reuse it; a beat a minute apart
+/// opens a new connection, as it always did.
+pub const POOL_IDLE: Duration = Duration::from_secs(4);
+
+/// How long a lane goes on with one client before it builds another.
+///
+/// A client reads the computer's proxy settings when it is built (a lane that
+/// built one for every poll noticed a change within a poll), so a lane that
+/// keeps one would go on with the old settings for good. Five minutes bounds
+/// that on a lane that never fails; one that does start afresh at once.
+const CLIENT_LIFETIME: Duration = Duration::from_secs(300);
+
+/// A blocking client as every lane starts it: the settings any lane shares, and
+/// nothing that belongs to a credential. A lane adds its own (the sealed flows
+/// lane turns redirects off) and gives each request its own timeout.
+pub fn blocking_builder() -> reqwest::blocking::ClientBuilder {
+    reqwest::blocking::Client::builder().pool_idle_timeout(POOL_IDLE)
+}
+
+/// [`blocking_builder`] for the async client of the AI tunnel.
+pub fn async_builder() -> reqwest::ClientBuilder {
+    reqwest::Client::builder().pool_idle_timeout(POOL_IDLE)
+}
+
+/// The client one lane keeps between its requests.
+///
+/// Cloning a client shares its connections, so [`LaneClient::get`] hands out a
+/// clone and the lane's requests go down the same ones. A new client is built
+/// when there is none, when the one held has served [`CLIENT_LIFETIME`], and
+/// after [`LaneClient::start_afresh`] (a lane calls it when a cycle failed, so the
+/// try after a failure is on a client that has not seen the trouble: as it was
+/// when every try built its own).
+pub struct LaneClient<C> {
+    build: fn() -> Result<C, String>,
+    lifetime: Duration,
+    held: Mutex<Option<(Instant, C)>>,
+}
+
+impl<C: Clone> LaneClient<C> {
+    /// A lane's client, built by `build` (which says in its error which lane
+    /// could not build one).
+    pub const fn new(build: fn() -> Result<C, String>) -> Self {
+        Self::lasting(build, CLIENT_LIFETIME)
+    }
+
+    /// As [`LaneClient::new`], for a lifetime of its own (a test's).
+    pub const fn lasting(build: fn() -> Result<C, String>, lifetime: Duration) -> Self {
+        Self { build, lifetime, held: Mutex::new(None) }
+    }
+
+    /// The client to use now.
+    pub fn get(&self) -> Result<C, String> {
+        let mut held = self.held.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some((built, client)) = held.as_ref() {
+            if built.elapsed() < self.lifetime {
+                return Ok(client.clone());
+            }
+        }
+        let client = (self.build)()?;
+        *held = Some((Instant::now(), client.clone()));
+        Ok(client)
+    }
+
+    /// Let go of the client held: the next [`LaneClient::get`] builds another.
+    pub fn start_afresh(&self) {
+        *self.held.lock().unwrap_or_else(|e| e.into_inner()) = None;
+    }
+}
+
+/// How much of a reply nobody wanted is read to let its connection go on.
+const DRAIN_AT_MOST: u64 = 1024 * 1024;
+
+/// Finish with a reply whose body the caller has no use for.
+///
+/// A connection goes back to be reused only once its reply has been read to the
+/// end; one dropped part way is closed. The replies a lane ignores are small
+/// (a claim, a completion, an empty acknowledgement), but not always small enough
+/// to have come in with their headers, so they are read out here rather than left
+/// to chance.
+pub fn drain(mut response: reqwest::blocking::Response) {
+    use std::io::Read;
+    let _ = std::io::copy(&mut (&mut response).take(DRAIN_AT_MOST), &mut std::io::sink());
+}
+
+/// [`drain`] for the async client.
+pub async fn drain_async(mut response: reqwest::Response) {
+    let mut read = 0u64;
+    while let Ok(Some(chunk)) = response.chunk().await {
+        read += chunk.len() as u64;
+        if read > DRAIN_AT_MOST {
+            break;
+        }
+    }
+}
+
 #[cfg(test)]
 mod idle_tests {
     use super::idle_pause;
@@ -105,5 +227,155 @@ mod idle_tests {
         // One cut short at a second: the rest of the two seconds.
         assert_eq!(idle_pause(Duration::from_secs(1)), Duration::from_secs(1));
         assert_eq!(idle_pause(Duration::ZERO), Duration::from_secs(2));
+    }
+}
+
+#[cfg(test)]
+mod client_tests {
+    use super::*;
+    use crate::link::testkit::{Provider, Reply};
+    use std::sync::atomic::{AtomicU32, Ordering};
+
+    #[test]
+    fn a_lane_keeps_its_client_until_it_is_old_or_it_starts_afresh() {
+        static BUILT: AtomicU32 = AtomicU32::new(0);
+        fn build() -> Result<u32, String> {
+            Ok(BUILT.fetch_add(1, Ordering::SeqCst) + 1)
+        }
+        let lane = LaneClient::new(build);
+        assert_eq!(lane.get(), Ok(1));
+        assert_eq!(lane.get(), Ok(1), "the client is kept, not built for each request");
+        assert_eq!(lane.get(), Ok(1));
+        lane.start_afresh();
+        assert_eq!(lane.get(), Ok(2), "after a failed cycle the next try is on a new one");
+        assert_eq!(lane.get(), Ok(2));
+        assert_eq!(BUILT.load(Ordering::SeqCst), 2);
+    }
+
+    #[test]
+    fn a_client_that_has_served_its_time_is_replaced() {
+        static BUILT: AtomicU32 = AtomicU32::new(0);
+        fn build() -> Result<u32, String> {
+            Ok(BUILT.fetch_add(1, Ordering::SeqCst) + 1)
+        }
+        // The proxy settings a client read when it was built are the reason for a
+        // limit: a lane that keeps one for good would never see them change.
+        let lane = LaneClient::lasting(build, Duration::from_millis(60));
+        assert_eq!(lane.get(), Ok(1));
+        assert_eq!(lane.get(), Ok(1));
+        std::thread::sleep(Duration::from_millis(120));
+        assert_eq!(lane.get(), Ok(2));
+        assert_eq!(lane.get(), Ok(2));
+    }
+
+    #[test]
+    fn a_client_that_cannot_be_built_says_so_each_time_and_is_built_once_it_can() {
+        static TRIES: AtomicU32 = AtomicU32::new(0);
+        fn build() -> Result<u32, String> {
+            match TRIES.fetch_add(1, Ordering::SeqCst) {
+                0 | 1 => Err("could not build the test client: no TLS".into()),
+                n => Ok(n),
+            }
+        }
+        let lane = LaneClient::new(build);
+        assert_eq!(lane.get(), Err("could not build the test client: no TLS".into()));
+        assert_eq!(lane.get(), Err("could not build the test client: no TLS".into()));
+        assert_eq!(lane.get(), Ok(2));
+        assert_eq!(lane.get(), Ok(2), "and once built it is kept");
+    }
+
+    #[test]
+    fn requests_one_after_another_share_a_connection_even_when_their_replies_are_not_read() {
+        // A reply nobody reads is what a claim or a completion is to the lane that
+        // makes it. Dropped part way, it would close the connection under the next
+        // request; this one is too big to have come in with its headers.
+        let server = Provider::start(|req| {
+            if req.target == "/big" {
+                Reply::ok(&format!(r#"{{"pad":"{}"}}"#, "x".repeat(300_000)))
+            } else {
+                Reply::ok("{}")
+            }
+        });
+        let http = blocking_builder().build().unwrap();
+        drain(http.get(format!("{}/big", server.base)).send().unwrap());
+        drain(http.post(format!("{}/claim", server.base)).body("{}").send().unwrap());
+        assert_eq!(http.get(format!("{}/small", server.base)).send().unwrap().text().unwrap(), "{}");
+        assert_eq!(server.connections(), 1, "{:?}", server.lines());
+        assert_eq!(server.lines(), ["GET /big", "POST /claim", "GET /small"]);
+    }
+
+    #[test]
+    fn a_connection_left_unused_for_longer_than_the_pool_allows_is_not_sent_a_request() {
+        // A provider's web server closes a connection nobody has used for a few
+        // seconds, and a request sent in the moment it does fails with no telling
+        // whether it was seen. Our side lets go first.
+        let server = Provider::start(|_| Reply::ok("{}"));
+        let http = blocking_builder().build().unwrap();
+        drain(http.get(format!("{}/a", server.base)).send().unwrap());
+        drain(http.get(format!("{}/b", server.base)).send().unwrap());
+        assert_eq!(server.connections(), 1, "a request straight after one uses its connection");
+        std::thread::sleep(POOL_IDLE + Duration::from_millis(700));
+        drain(http.get(format!("{}/c", server.base)).send().unwrap());
+        assert_eq!(server.connections(), 2, "one idle for {POOL_IDLE:?} is let go, not reused");
+    }
+
+    #[test]
+    fn a_client_carries_no_credential_and_a_request_carries_only_what_it_was_given() {
+        // The bearer is put on each request by the code that makes it. A client
+        // that held one would take it to whichever lane, or provider, next used it.
+        let server = Provider::start(|_| Reply::ok("{}"));
+        let http = blocking_builder().build().unwrap();
+        drain(http.get(format!("{}/bare", server.base)).send().unwrap());
+        drain(http.get(format!("{}/first", server.base)).bearer_auth("flk_first").send().unwrap());
+        drain(http.get(format!("{}/second", server.base)).bearer_auth("flk_second").send().unwrap());
+        drain(http.get(format!("{}/bare-again", server.base)).send().unwrap());
+        let seen = server.requests();
+        let bearers: Vec<Option<&str>> = seen.iter().map(|r| r.header("authorization")).collect();
+        assert_eq!(bearers, [None, Some("Bearer flk_first"), Some("Bearer flk_second"), None]);
+        assert!(seen.iter().all(|r| r.header("cookie").is_none()), "no cookie jar either");
+        assert_eq!(server.connections(), 1, "all four rode one connection, each with its own credential");
+    }
+
+    #[test]
+    fn a_request_has_the_timeout_it_was_given_not_the_clients() {
+        // Every lane gives each request its own timeout (a poll waits longer than a
+        // claim), which is what lets one client serve them all.
+        let server = Provider::start(|_| {
+            std::thread::sleep(Duration::from_millis(1500));
+            Reply::ok("{}")
+        });
+        let http = blocking_builder().build().unwrap();
+        let started = Instant::now();
+        let e = http
+            .get(format!("{}/slow", server.base))
+            .timeout(Duration::from_millis(250))
+            .send()
+            .unwrap_err();
+        assert!(e.is_timeout(), "{e}");
+        assert!(started.elapsed() < Duration::from_millis(1200), "{:?}", started.elapsed());
+    }
+
+    #[test]
+    fn no_lane_builds_a_client_of_its_own_for_each_poll() {
+        // What this replaced, kept from coming back: a `Client::builder()` in a
+        // lane is a thread, a TLS configuration and a new connection per request.
+        // The lanes' clients come from `LaneClient`, which builds them from
+        // `blocking_builder` / `async_builder` here.
+        for (name, source) in [
+            ("relay.rs", include_str!("relay.rs")),
+            ("sealed_flows.rs", include_str!("sealed_flows.rs")),
+            ("flow_runner.rs", include_str!("flow_runner.rs")),
+            ("heartbeat.rs", include_str!("heartbeat.rs")),
+            ("data_node.rs", include_str!("data_node.rs")),
+            ("ai/tunnel.rs", include_str!("../ai/tunnel.rs")),
+            ("calendar/sync.rs", include_str!("../calendar/sync.rs")),
+        ] {
+            let code = source.split("#[cfg(test)]").next().unwrap();
+            for forbidden in ["Client::builder()", "Client::new()"] {
+                assert!(!code.contains(forbidden), "{name} builds its own client with {forbidden}");
+            }
+            assert!(code.contains("LaneClient"), "{name} keeps no client between its requests");
+            assert!(code.contains("start_afresh"), "{name} does not start afresh after a failed cycle");
+        }
     }
 }

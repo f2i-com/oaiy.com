@@ -946,3 +946,26 @@ fn a_heartbeat_brings_the_sync_forward_only_after_formlogic_was_unreachable() {
     assert!(!heartbeat_mends("offline", None, beat_after));
     assert!(!heartbeat_mends("offline", failed, None));
 }
+
+#[test]
+fn syncs_one_after_another_share_a_connection_and_each_carries_its_own_key() {
+    // A sync is a listing, the pages of it and a request or two for each change,
+    // and one runs every minute: they used to make a connection each. The client
+    // is kept from sync to sync, and it holds no key: every request carries the
+    // key of the account it is made for.
+    use crate::link::testkit::{Provider, Reply};
+    let server = Provider::start(|_| Reply::ok(r#"{"apps":[]}"#));
+    let (first, second) = (Api::new(&server.base, "flk_one").unwrap(), Api::new(&server.base, "flk_two").unwrap());
+    assert_eq!(first.get("/api/v1/app-logic").unwrap().status, 200);
+    assert_eq!(second.get("/api/v1/app-logic").unwrap().status, 200);
+    assert_eq!(first.get("/api/v1/app-logic").unwrap().status, 200);
+
+    let seen = server.requests();
+    let bearers: Vec<Option<&str>> = seen.iter().map(|r| r.header("authorization")).collect();
+    assert_eq!(bearers, [Some("Bearer flk_one"), Some("Bearer flk_two"), Some("Bearer flk_one")]);
+    assert!(
+        seen.iter().all(|r| r.header("user-agent").is_some_and(|u| u.starts_with("oaiy-desktop/"))),
+        "the user agent this client has always sent"
+    );
+    assert_eq!(server.connections(), 1, "{:?}", server.lines());
+}

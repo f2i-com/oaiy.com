@@ -187,7 +187,12 @@ pub fn spawn(store: LinkHandle) {
                 // up again on the next tick, and a burst of retries would only
                 // make a bad moment worse. The status carries the reason so the
                 // panel can say why it looks offline.
-                Err(e) => store.note_heartbeat(Some(e)),
+                Err(e) => {
+                    store.note_heartbeat(Some(e));
+                    // The next beat is on a new client, not one that has seen
+                    // the trouble.
+                    HTTP.start_afresh();
+                }
             }
             last_beat = Some((key, Instant::now()));
         }
@@ -374,6 +379,22 @@ fn engine_is_up(probe: Option<&EngineProbe>, host: &HealthSnapshot, now: Instant
         && now.saturating_duration_since(host.since) >= HEALTH_SETTLE
 }
 
+/// The client this lane keeps from beat to beat. A beat is 45 seconds after the
+/// last, so a connection is rarely still open to carry it (see
+/// [`super::net::POOL_IDLE`]); what is kept is the client itself, its TLS
+/// configuration and session cache, rather than a new one for every beat.
+static HTTP: super::net::LaneClient<reqwest::blocking::Client> =
+    super::net::LaneClient::new(build_client);
+
+fn build_client() -> Result<reqwest::blocking::Client, String> {
+    super::net::blocking_builder()
+        .build()
+        .map_err(|e| format!("could not build the heartbeat client: {e}"))
+}
+
+/// How long one beat may take.
+const BEAT_TIMEOUT: Duration = Duration::from_secs(15);
+
 /// One beat. Blocking; the worker thread exists for this.
 fn send(
     account: &LinkedAccount,
@@ -382,10 +403,7 @@ fn send(
     capabilities: &[String],
 ) -> Result<(), String> {
     let url = super::oauth::join(&account.base_url, &spec.path);
-    let client = reqwest::blocking::Client::builder()
-        .timeout(Duration::from_secs(15))
-        .build()
-        .map_err(|e| format!("could not build the heartbeat client: {e}"))?;
+    let client = HTTP.get()?;
 
     let mut body = serde_json::Map::new();
     body.insert(
@@ -410,6 +428,7 @@ fn send(
 
     let resp = client
         .post(&url)
+        .timeout(BEAT_TIMEOUT)
         .bearer_auth(&account.credential)
         .json(&serde_json::Value::Object(body))
         .send()
@@ -417,6 +436,7 @@ fn send(
 
     let status = resp.status();
     if status.is_success() {
+        super::net::drain(resp);
         return Ok(());
     }
     // 401/403 is the one worth naming: it means the key was revoked at the
@@ -760,5 +780,55 @@ mod tests {
         // Nothing has been sent for this account yet: the seeded schedule
         // decides when the first beat goes, not the token set.
         assert!(!beat(Duration::from_secs(20), None, &up));
+    }
+
+    // --- the connection a beat is made on ------------------------------------------
+
+    use crate::link::testkit::{Provider, Reply};
+
+    fn linked(base: String, credential: &str) -> LinkedAccount {
+        LinkedAccount {
+            connector_id: "formlogic".into(),
+            base_url: base,
+            credential: credential.into(),
+            account_id: None,
+            account_name: Some("Reception PC".into()),
+            granted_scopes: None,
+            linked_at: chrono::Utc::now(),
+            instance_id: Some("oaiy-test".into()),
+        }
+    }
+
+    #[test]
+    fn beats_close_together_share_a_connection_and_each_carries_the_credential() {
+        let server = Provider::start(|_| Reply::ok("{}"));
+        let account = linked(server.base.clone(), "flk_beat");
+        let spec = spec();
+        send(&account, &spec, "oaiy-test", &["logic-language:javascript".to_string()]).unwrap();
+        send(&account, &spec, "oaiy-test", &[]).unwrap();
+
+        assert_eq!(server.lines(), ["POST /api/v1/desktop-connections"; 2]);
+        assert_eq!(server.connections(), 1, "{:?}", server.lines());
+        let seen = server.requests();
+        assert!(seen.iter().all(|r| r.header("authorization") == Some("Bearer flk_beat")));
+        let bodies: Vec<serde_json::Value> = seen.iter().map(|r| serde_json::from_str(&r.body).unwrap()).collect();
+        assert_eq!(bodies[0]["desktopInstanceId"], "oaiy-test");
+        assert_eq!(bodies[0]["deviceName"], "Reception PC");
+        assert_eq!(bodies[0]["capabilities"], serde_json::json!(["logic-language:javascript"]));
+        assert_eq!(bodies[1]["capabilities"], serde_json::json!([]), "an empty list is still said");
+    }
+
+    #[test]
+    fn the_beat_lane_gives_each_account_only_its_own_credential() {
+        let (a, b) = (Provider::start(|_| Reply::ok("{}")), Provider::start(|_| Reply::ok("{}")));
+        let spec = spec();
+        for (server, credential) in [(&a, "flk_alpha"), (&b, "flk_beta"), (&a, "flk_gamma")] {
+            send(&linked(server.base.clone(), credential), &spec, "oaiy-test", &[]).unwrap();
+        }
+        let bearers = |server: &Provider| -> Vec<String> {
+            server.requests().iter().map(|r| r.header("authorization").unwrap_or("none").to_string()).collect()
+        };
+        assert_eq!(bearers(&a), ["Bearer flk_alpha", "Bearer flk_gamma"]);
+        assert_eq!(bearers(&b), ["Bearer flk_beta"]);
     }
 }

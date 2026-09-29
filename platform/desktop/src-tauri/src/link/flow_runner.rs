@@ -301,6 +301,9 @@ fn spawn_inner(store: LinkHandle, node: Option<crate::services::node_runtime::No
                 let stumbled = trouble.is_some();
                 store.note_flow_run(trouble);
                 if stumbled {
+                    // The try after a failure is on a new client, not one that
+                    // has seen the trouble.
+                    HTTP.start_afresh();
                     // The run is still at the head of the queue, so going
                     // straight back would retry the same failing claim as fast
                     // as the provider can refuse it.
@@ -313,18 +316,33 @@ fn spawn_inner(store: LinkHandle, node: Option<crate::services::node_runtime::No
             }
             Err(e) => {
                 store.note_flow_run(Some(e));
+                HTTP.start_afresh();
                 std::thread::sleep(ERROR_BACKOFF);
             }
         }
     });
 }
 
-fn client(timeout: Duration) -> Result<reqwest::blocking::Client, String> {
-    reqwest::blocking::Client::builder()
-        .timeout(timeout)
+/// The client this lane keeps from check to check, so that the queue, the claim,
+/// the graph and the report share a connection instead of each making one.
+///
+/// Also the sealed flow lane's for the graph it fetches to run a request (through
+/// `execute_sealed`), which has always followed redirects like the rest of this
+/// module; that lane's own requests use a client of its own that does not.
+static HTTP: super::net::LaneClient<reqwest::blocking::Client> =
+    super::net::LaneClient::new(build_client);
+
+fn build_client() -> Result<reqwest::blocking::Client, String> {
+    super::net::blocking_builder()
         .build()
         .map_err(|e| format!("could not build the flow runner client: {e}"))
 }
+
+/// How long one request to the provider may take.
+const REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// How long telling the provider of a kept outcome may take.
+const RESEND_TIMEOUT: Duration = Duration::from_secs(15);
 
 /// One look at the queue, and at most one run.
 ///
@@ -343,9 +361,10 @@ fn poll_once(
     node: Option<&crate::services::node_runtime::NodeHandle>,
     held: &Held,
 ) -> Result<(usize, Option<String>), String> {
-    let http = client(Duration::from_secs(30))?;
+    let http = HTTP.get()?;
     let resp = http
         .get(super::oauth::join(&account.base_url, lane.queued))
+        .timeout(REQUEST_TIMEOUT)
         .bearer_auth(&account.credential)
         .send()
         .map_err(|e| format!("could not reach the flow queue: {e}"))?;
@@ -415,7 +434,7 @@ fn serve(
     if let Held::Missing(why) = held {
         return Err(why.clone());
     }
-    let http = client(Duration::from_secs(30))?;
+    let http = HTTP.get()?;
 
     // Claim FIRST — before fetching the graph, before writing a file, before
     // anything with a side effect. Another runtime under the same account may
@@ -424,6 +443,7 @@ fn serve(
     let claim_url = super::oauth::join(&account.base_url, &lane.claim.replace("{id}", &run.id));
     let claimed = match http
         .post(&claim_url)
+        .timeout(REQUEST_TIMEOUT)
         .bearer_auth(&account.credential)
         // `runtime` says which kind of runtime took it, `instanceId` says which
         // machine. The provider binds the completion to the same instance, so
@@ -442,8 +462,12 @@ fn serve(
             return Err(format!("could not claim the run: {e}"));
         }
     };
-    if !claimed.status().is_success() {
-        let code = claimed.status().as_u16();
+    // Only the status is wanted; the rest is read out so the connection can carry
+    // what follows.
+    let claim_status = claimed.status();
+    super::net::drain(claimed);
+    if !claim_status.is_success() {
+        let code = claim_status.as_u16();
         // 409 is "somebody else got there first", which is the exactly-once
         // gate working, not a fault worth showing anyone.
         if code == 409 {
@@ -878,11 +902,12 @@ fn fetch_graph(
     lane: &Lane,
     run: &QueuedRun,
 ) -> Result<Value, Failure> {
-    let http = client(Duration::from_secs(30)).map_err(|e| {
+    let http = HTTP.get().map_err(|e| {
         Failure::new(FailureCode::RunnerUnavailable, e)
     })?;
     let resp = http
         .get(super::oauth::join(&account.base_url, lane.graph))
+        .timeout(REQUEST_TIMEOUT)
         .bearer_auth(&account.credential)
         .send()
         .map_err(|e| {
@@ -892,11 +917,13 @@ fn fetch_graph(
             )
         })?;
     if !resp.status().is_success() {
+        let status = resp.status();
+        super::net::drain(resp);
         return Err(Failure::new(
             FailureCode::RunnerUnavailable,
             format!(
                 "the provider refused the flow graph: HTTP {}",
-                resp.status().as_u16()
+                status.as_u16()
             ),
         ));
     }
@@ -1001,7 +1028,7 @@ fn report(
         if attempt > 0 {
             std::thread::sleep(Duration::from_secs(2));
         }
-        let http = match client(Duration::from_secs(30)) {
+        let http = match HTTP.get() {
             Ok(c) => c,
             Err(e) => {
                 last = e;
@@ -1010,14 +1037,19 @@ fn report(
         };
         match http
             .patch(&url)
+            .timeout(REQUEST_TIMEOUT)
             .bearer_auth(&account.credential)
             .json(&body)
             .send()
         {
-            Ok(resp) if resp.status().is_success() => return Ok(()),
+            Ok(resp) if resp.status().is_success() => {
+                super::net::drain(resp);
+                return Ok(());
+            }
             // Already finalised, or claimed by someone else after all. Nothing
             // more to report, and retrying would only repeat the refusal.
             Ok(resp) if resp.status().as_u16() == 409 => {
+                super::net::drain(resp);
                 log::info!("flow run {run_id} was already finalised by another runtime");
                 return Ok(());
             }
@@ -1079,7 +1111,7 @@ fn keep_pending(dir: &Path, account: &LinkedAccount, run_id: &str, url: &str, bo
 /// 410). While the provider cannot be reached the rest wait for the next try.
 fn resend_pending(dir: &Path, account: &LinkedAccount) {
     let Ok(entries) = std::fs::read_dir(dir) else { return };
-    let Ok(http) = client(Duration::from_secs(15)) else { return };
+    let Ok(http) = HTTP.get() else { return };
     for entry in entries.flatten() {
         let path = entry.path();
         if path.extension().and_then(|e| e.to_str()) != Some("json") {
@@ -1091,13 +1123,17 @@ fn resend_pending(dir: &Path, account: &LinkedAccount) {
         if kept.base_url != account.base_url {
             continue;
         }
-        match http.patch(&kept.url).bearer_auth(&account.credential).json(&kept.body).send() {
+        match http.patch(&kept.url).timeout(RESEND_TIMEOUT).bearer_auth(&account.credential).json(&kept.body).send() {
             Ok(resp) if resp.status().is_success() || matches!(resp.status().as_u16(), 404 | 409 | 410) => {
-                log::info!("flow run {}: its kept outcome was reported (HTTP {})", kept.run_id, resp.status().as_u16());
+                let status = resp.status().as_u16();
+                super::net::drain(resp);
+                log::info!("flow run {}: its kept outcome was reported (HTTP {status})", kept.run_id);
                 let _ = std::fs::remove_file(&path);
             }
             Ok(resp) => {
-                log::warn!("flow run {}: its kept outcome is still refused (HTTP {}); trying again later", kept.run_id, resp.status().as_u16());
+                let status = resp.status().as_u16();
+                super::net::drain(resp);
+                log::warn!("flow run {}: its kept outcome is still refused (HTTP {status}); trying again later", kept.run_id);
                 return;
             }
             Err(e) => {
@@ -2069,6 +2105,92 @@ mod tests {
             // URLs end up in access logs and error messages; headers do not.
             assert!(!line.contains("flk_secret"), "the {leg} leg put it in the URL: {line}");
         }
+    }
+
+    // --- the connections it makes, with the client it keeps -------------------------
+
+    use crate::link::testkit::{Provider, Reply};
+    use std::sync::atomic::{AtomicBool, Ordering};
+
+    /// A provider that keeps its connections: one queued run, once, and the same
+    /// answers as `stub_provider`'s. Its answer to a claim is padded, as a run's
+    /// can be.
+    fn keeping_provider() -> Provider {
+        let served = AtomicBool::new(false);
+        Provider::start(move |req| {
+            if req.target.starts_with("/runs/queued") {
+                if served.swap(true, Ordering::SeqCst) {
+                    Reply::ok(r#"{"runs":[]}"#)
+                } else {
+                    Reply::ok(ONE_RUN)
+                }
+            } else if req.target.ends_with("/claim") {
+                Reply::ok(&format!(r#"{{"claimed":true,"pad":"{}"}}"#, "x".repeat(200_000)))
+            } else if req.method == "GET" && req.target.starts_with("/flows") {
+                Reply::ok(NO_MATCHING_FLOW)
+            } else {
+                Reply::ok("{}")
+            }
+        })
+    }
+
+    #[test]
+    fn the_queue_the_claim_the_graph_the_report_and_the_next_check_share_one_connection() {
+        // Each of these five requests used to make its own connection, and do its
+        // own TLS handshake, and the queue is looked at every few seconds.
+        let server = keeping_provider();
+        let (linked, flows) = (account(server.base.clone()), spec());
+        let lane = Lane::of(&flows).unwrap();
+
+        let (handled, trouble) = poll_once(&linked, &flows, &lane, "oaiy-test", None, &Held::NotRequired).unwrap();
+        assert_eq!((handled, trouble), (1, None));
+        let (handled, trouble) = poll_once(&linked, &flows, &lane, "oaiy-test", None, &Held::NotRequired).unwrap();
+        assert_eq!((handled, trouble), (0, None));
+
+        assert_eq!(
+            server.lines(),
+            ["GET /runs/queued", "POST /runs/r1/claim", "GET /flows", "PATCH /runs/r1", "GET /runs/queued"]
+        );
+        assert_eq!(server.connections(), 1, "{:?}", server.lines());
+    }
+
+    #[test]
+    fn a_lane_that_keeps_its_client_gives_each_account_only_its_own_credential() {
+        let empty = || Provider::start(|_| Reply::ok(r#"{"runs":[]}"#));
+        let (a, b) = (empty(), empty());
+        let flows = spec();
+        let lane = Lane::of(&flows).unwrap();
+        for (server, credential) in [(&a, "flk_alpha"), (&b, "flk_beta"), (&a, "flk_gamma")] {
+            let mut linked = account(server.base.clone());
+            linked.credential = credential.into();
+            poll_once(&linked, &flows, &lane, "oaiy-test", None, &Held::NotRequired).unwrap();
+        }
+        let bearers = |server: &Provider| -> Vec<String> {
+            server.requests().iter().map(|r| r.header("authorization").unwrap_or("none").to_string()).collect()
+        };
+        assert_eq!(bearers(&a), ["Bearer flk_alpha", "Bearer flk_gamma"]);
+        assert_eq!(bearers(&b), ["Bearer flk_beta"]);
+        assert_eq!((a.connections(), b.connections()), (1, 1));
+    }
+
+    #[test]
+    fn a_redirect_is_followed_as_it_always_was_but_the_credential_does_not_go_with_it() {
+        // This lane's redirect policy is the client's default, unchanged. What is
+        // not followed is the bearer, which reqwest drops on the way to another
+        // origin (the sealed flow lane, by contrast, follows no redirect at all).
+        let elsewhere = Provider::start(|_| Reply::ok(r#"{"runs":[]}"#));
+        let moved_to = format!("{}/moved", elsewhere.base);
+        let origin = Provider::start(move |_| Reply::redirect(307, &moved_to));
+        let flows = spec();
+        let lane = Lane::of(&flows).unwrap();
+
+        let (handled, trouble) =
+            poll_once(&account(origin.base.clone()), &flows, &lane, "oaiy-test", None, &Held::NotRequired).unwrap();
+        assert_eq!((handled, trouble), (0, None), "the answer from where it was sent");
+        assert_eq!(origin.requests()[0].header("authorization"), Some("Bearer flk_secret"));
+        let followed = elsewhere.requests();
+        assert_eq!(followed.len(), 1);
+        assert_eq!(followed[0].header("authorization"), None, "the credential stayed with the provider");
     }
 
     #[test]

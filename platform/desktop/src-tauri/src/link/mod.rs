@@ -30,6 +30,8 @@ pub mod relay;
 pub mod result_actions;
 pub mod routes;
 pub mod script_profile;
+#[cfg(test)]
+pub(crate) mod testkit;
 
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;

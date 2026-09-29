@@ -471,6 +471,8 @@ fn run_once(cal: &Calendar, link: &LinkHandle) {
             r.report.problems = out.problems;
         }
         Err(fail) => {
+            // The next try is on a new client, not one that has seen the trouble.
+            HTTP.start_afresh();
             r.failures += 1;
             r.failed_at = Some(at);
             let wait = retry_wait(&fail, r.failures);
@@ -558,15 +560,26 @@ struct Reply {
     body: Value,
 }
 
+/// The client the sync keeps from one sync to the next, so that the requests of a
+/// sync (the listing, the pages of it, each write) share a connection instead of
+/// each making one. Its key is not on it: every request carries the key of the
+/// account it is made for.
+static HTTP: crate::link::net::LaneClient<reqwest::blocking::Client> =
+    crate::link::net::LaneClient::new(build_http);
+
+fn build_http() -> Result<reqwest::blocking::Client, String> {
+    crate::link::net::blocking_builder()
+        // Short enough that "Sync now" answers inside the page's own wait.
+        .connect_timeout(Duration::from_secs(5))
+        .timeout(Duration::from_secs(15))
+        .user_agent(concat!("oaiy-desktop/", env!("CARGO_PKG_VERSION")))
+        .build()
+        .map_err(|e| e.to_string())
+}
+
 impl Api {
     pub(crate) fn new(base: &str, key: &str) -> Result<Self, Failure> {
-        let http = reqwest::blocking::Client::builder()
-            // Short enough that "Sync now" answers inside the page's own wait.
-            .connect_timeout(Duration::from_secs(5))
-            .timeout(Duration::from_secs(15))
-            .user_agent(concat!("oaiy-desktop/", env!("CARGO_PKG_VERSION")))
-            .build()
-            .map_err(|e| Failure::Local(e.to_string()))?;
+        let http = HTTP.get().map_err(Failure::Local)?;
         Ok(Self { base: base.trim_end_matches('/').to_string(), key: key.to_string(), http })
     }
 

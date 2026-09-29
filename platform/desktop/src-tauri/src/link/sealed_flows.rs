@@ -111,8 +111,13 @@ fn poll_once(
     still_linked: &impl Fn() -> bool,
     execute: &impl Fn(&str, Value) -> Result<Value, String>,
 ) -> Result<bool, String> {
+    // The same for all three requests of a run, as the one timeout of the
+    // client this lane used to build for each poll was: over the server's wait,
+    // so a poll that comes back on time is not cut off by this side.
+    let timeout = Duration::from_secs(spec.wait_seconds + 15);
     let pending = http
         .get(super::oauth::join(&account.base_url, &spec.pending_path))
+        .timeout(timeout)
         .bearer_auth(&account.credential)
         .query(&[
             ("instanceId", instance.to_owned()),
@@ -122,13 +127,14 @@ fn poll_once(
         .send()
         .map_err(|_| "sealed flow poll could not reach the provider")?;
     if !pending.status().is_success() {
+        let status = pending.status();
         // Asked to slow down: wait as long as the provider said before the lane's own back-off.
-        if pending.status().as_u16() == 429 {
-            if let Some(wait) = super::net::retry_after(pending.headers()) {
-                std::thread::sleep(wait);
-            }
+        let asked = if status.as_u16() == 429 { super::net::retry_after(pending.headers()) } else { None };
+        super::net::drain(pending);
+        if let Some(wait) = asked {
+            std::thread::sleep(wait);
         }
-        return Err(format!("sealed flow poll: HTTP {}", pending.status()));
+        return Err(format!("sealed flow poll: HTTP {status}"));
     }
     let pending: Pending = read_json(pending)?;
     let Some(request) = pending.requests.into_iter().next() else {
@@ -151,15 +157,19 @@ fn poll_once(
             &account.base_url,
             &spec.claim_path.replace("{id}", &id),
         ))
+        .timeout(timeout)
         .bearer_auth(&account.credential)
         .json(&json!({"instanceId": instance}))
         .send()
         .map_err(|_| "sealed flow claim could not be confirmed; execution skipped")?;
     if claimed.status().as_u16() == 409 {
+        super::net::drain(claimed);
         return Ok(false);
     }
     if !claimed.status().is_success() {
-        return Err(format!("sealed flow claim: HTTP {}", claimed.status()));
+        let status = claimed.status();
+        super::net::drain(claimed);
+        return Err(format!("sealed flow claim: HTTP {status}"));
     }
     let claim: Claim = read_json(claimed)?;
     if !claim.claimed
@@ -190,24 +200,27 @@ fn poll_once(
         "resultEnvelope": sealed});
     let url = super::oauth::join(&account.base_url, &spec.complete_path.replace("{id}", &id));
     for attempt in 0..3 {
-        match http
+        if let Ok(response) = http
             .post(&url)
+            .timeout(timeout)
             .bearer_auth(&account.credential)
             .json(&body)
             .send()
         {
-            Ok(response) if response.status().is_success() => return Ok(true),
-            Ok(response) if response.status().is_client_error() => {
+            let status = response.status();
+            super::net::drain(response);
+            if status.is_success() {
+                return Ok(true);
+            }
+            if status.is_client_error() {
                 return Err(format!(
-                    "sealed flow completion: HTTP {}; flow will not be repeated",
-                    response.status()
-                ))
+                    "sealed flow completion: HTTP {status}; flow will not be repeated"
+                ));
             }
-            _ => {
-                if attempt < 2 {
-                    std::thread::sleep(Duration::from_secs(1));
-                }
-            }
+        }
+        // Not taken, and not refused either: the same sealed result is sent again.
+        if attempt < 2 {
+            std::thread::sleep(Duration::from_secs(1));
         }
     }
     Err("sealed flow completion could not be confirmed; flow will not be repeated".into())
@@ -238,11 +251,7 @@ pub fn spawn(store: LinkHandle, node: Option<NodeHandle>) {
                 std::thread::sleep(Duration::from_secs(30));
                 continue;
             };
-            let http = match Client::builder()
-                .timeout(Duration::from_secs(spec.wait_seconds + 15))
-                .redirect(reqwest::redirect::Policy::none())
-                .build()
-            {
+            let http = match HTTP.get() {
                 Ok(http) => http,
                 Err(_) => {
                     std::thread::sleep(Duration::from_secs(10));
@@ -289,11 +298,27 @@ pub fn spawn(store: LinkHandle, node: Option<NodeHandle>) {
                         log::warn!("{error}");
                         last_warned = Some(error);
                     }
+                    // The try after a failure is on a new client, not one that
+                    // has seen the trouble.
+                    HTTP.start_afresh();
                     std::thread::sleep(Duration::from_secs(spec.error_backoff_seconds));
                 }
             }
         }
     });
+}
+
+/// The client this lane keeps from poll to poll, so that a poll, its claim and the
+/// completion share a connection instead of each making one.
+static HTTP: super::net::LaneClient<Client> = super::net::LaneClient::new(build_client);
+
+fn build_client() -> Result<Client, String> {
+    super::net::blocking_builder()
+        // A reply that sends this lane somewhere else is an error to report, not
+        // a request to make again, elsewhere, with the credential on it.
+        .redirect(reqwest::redirect::Policy::none())
+        .build()
+        .map_err(|e| format!("could not build the sealed flow client: {e}"))
 }
 
 #[cfg(test)]
@@ -540,6 +565,115 @@ mod tests {
         let (success, body) = terminal(Ok(Value::String("x".repeat(MAX_RESULT_BYTES))));
         assert!(!success);
         assert_eq!(body["type"], "error");
+    }
+
+    // --- the connections it makes, with the client it keeps -------------------------
+
+    use crate::link::testkit::{Provider, Reply};
+    use std::sync::atomic::{AtomicBool, Ordering};
+
+    #[test]
+    fn a_poll_its_claim_the_completion_and_the_next_poll_share_one_connection() {
+        let identity = E2eIdentity::from_secret_bytes([17; 32]);
+        let sealed = request(
+            &identity,
+            "flow-one",
+            json!({"v":1,"flowId":"flow-one","inputs":{"n":1}}),
+        );
+        let served = AtomicBool::new(false);
+        let server = Provider::start(move |req| {
+            if req.target.starts_with("/api/v1/desktop-flows/pending") {
+                if served.swap(true, Ordering::SeqCst) {
+                    Reply::ok(&json!({"requests":[]}).to_string())
+                } else {
+                    Reply::ok(&json!({"requests":[sealed.clone()]}).to_string())
+                }
+            } else if req.target.ends_with("/claim") {
+                Reply::ok(&json!({"claimed":true,"request":sealed.clone()}).to_string())
+            } else {
+                Reply::ok("{}")
+            }
+        });
+        let run = |worked_expected: bool| {
+            // The client the lane keeps, taken for each poll as its loop takes it.
+            let worked = poll_once(
+                &HTTP.get().unwrap(),
+                &account(server.base.clone()),
+                &spec(),
+                "test-computer",
+                &identity,
+                &|| true,
+                &|_, _| Ok(json!("done")),
+            )
+            .unwrap();
+            assert_eq!(worked, worked_expected);
+        };
+        run(true);
+        run(false);
+
+        let pending = "GET /api/v1/desktop-flows/pending?instanceId=test-computer&wait=25000&limit=1";
+        assert_eq!(
+            server.lines(),
+            [
+                pending.to_string(),
+                format!("POST /api/v1/desktop-flows/{ID}/claim"),
+                format!("POST /api/v1/desktop-flows/{ID}/complete"),
+                pending.to_string(),
+            ]
+        );
+        assert_eq!(server.connections(), 1, "{:?}", server.lines());
+    }
+
+    #[test]
+    fn the_sealed_lane_never_follows_a_redirect_and_sends_its_credential_nowhere_else() {
+        // Set on the client this lane builds, and kept there: a provider that answers
+        // with a redirect is reported, not followed with the bearer on the request.
+        for status in [301, 302, 307, 308] {
+            let elsewhere = Provider::start(|_| Reply::ok(&json!({"requests":[]}).to_string()));
+            let moved_to = format!("{}/api/v1/desktop-flows/pending", elsewhere.base);
+            let origin = Provider::start(move |_| Reply::redirect(status, &moved_to));
+            let identity = E2eIdentity::from_secret_bytes([17; 32]);
+            let error = poll_once(
+                &HTTP.get().unwrap(),
+                &account(origin.base.clone()),
+                &spec(),
+                "test-computer",
+                &identity,
+                &|| true,
+                &|_, _| panic!("nothing was claimed"),
+            )
+            .unwrap_err();
+            assert!(error.starts_with(&format!("sealed flow poll: HTTP {status}")), "{error}");
+            assert_eq!(origin.requests().len(), 1);
+            assert!(elsewhere.requests().is_empty(), "{status}: the redirect was followed");
+        }
+    }
+
+    #[test]
+    fn a_lane_that_keeps_its_client_gives_each_account_only_its_own_credential() {
+        let identity = E2eIdentity::from_secret_bytes([17; 32]);
+        let empty = || Provider::start(|_| Reply::ok(&json!({"requests":[]}).to_string()));
+        let (a, b) = (empty(), empty());
+        for (server, credential) in [(&a, "flk_alpha"), (&b, "flk_beta"), (&a, "flk_gamma")] {
+            let mut linked = account(server.base.clone());
+            linked.credential = credential.into();
+            assert!(!poll_once(
+                &HTTP.get().unwrap(),
+                &linked,
+                &spec(),
+                "test-computer",
+                &identity,
+                &|| true,
+                &|_, _| panic!("nothing to run"),
+            )
+            .unwrap());
+        }
+        let bearers = |server: &Provider| -> Vec<String> {
+            server.requests().iter().map(|r| r.header("authorization").unwrap_or("none").to_string()).collect()
+        };
+        assert_eq!(bearers(&a), ["Bearer flk_alpha", "Bearer flk_gamma"]);
+        assert_eq!(bearers(&b), ["Bearer flk_beta"]);
+        assert_eq!((a.connections(), b.connections()), (1, 1));
     }
 
     #[test]

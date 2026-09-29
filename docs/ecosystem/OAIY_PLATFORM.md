@@ -110,6 +110,15 @@ Two transports, neither a WebSocket.
 | Encrypted flow relay | `link/sealed_flows.rs` | `/api/v1/desktop-flows/{pending,{id}/claim,{id}/complete}` |
 | Queued flow runs | `link/flow_runner.rs` | below |
 
+- Each lane keeps one HTTP client between its requests (`LaneClient` in `link/net.rs`; the
+  calendar sync's is its own), so a poll, the claim it leads to and the report share a
+  connection instead of each making one and doing a TLS handshake. A lane starts a new client
+  after a failed cycle and every five minutes, so the computer's proxy settings are read again
+  as they were when each poll built its own. Connections idle for more than four seconds are
+  closed by this side first, so a request is never sent down one a provider's web server is
+  closing. A client holds no credential: the bearer goes on each request. The encrypted flow
+  lane's client refuses redirects.
+
 - The relay's `desktop` connector answers `services.*` and `plugins.*`. A command for any other
   connector id goes to that plugin, with the idempotency key `relay-command-<commandId>`, only if
   the relay policy (`desktop/src-tauri/resources/relay-policy.json`) lets the website run it; see

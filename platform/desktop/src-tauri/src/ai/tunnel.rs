@@ -119,7 +119,9 @@ impl Lane<'_> {
             .await
             .map_err(|e| format!("could not poll for approvals: {e}"))?;
         if !resp.status().is_success() {
-            return Err(format!("the approval poll failed: HTTP {}", resp.status().as_u16()));
+            let status = resp.status().as_u16();
+            crate::link::net::drain_async(resp).await;
+            return Err(format!("the approval poll failed: HTTP {status}"));
         }
         resp.json::<Value>()
             .await
@@ -139,8 +141,12 @@ impl Lane<'_> {
             .send()
             .await
             .map_err(|e| format!("could not post a frame: {e}"))?;
-        if !resp.status().is_success() {
-            return Err(format!("the lane refused a frame: HTTP {}", resp.status().as_u16()));
+        // Only the status is wanted; the rest is read out so the connection can
+        // carry the next frame.
+        let status = resp.status();
+        crate::link::net::drain_async(resp).await;
+        if !status.is_success() {
+            return Err(format!("the lane refused a frame: HTTP {}", status.as_u16()));
         }
         Ok(())
     }
@@ -194,6 +200,11 @@ pub struct AiTunnel {
     /// Log-once latch, so a provider that is down does not fill the log.
     publish_note: std::sync::Mutex<Option<String>>,
     codex_catalog_probe: OptionalProviderProbe,
+    /// The client this lane keeps from poll to poll, so that a poll, the claim it
+    /// leads to, the turn's frames and its completion share a connection instead
+    /// of each making one. Its default timeout is what a turn's [`Lane`] has
+    /// always had; the polls and the key publish set their own.
+    http: crate::link::net::LaneClient<reqwest::Client>,
 }
 
 /// An optional provider must not stall discovery of working local providers.
@@ -238,6 +249,7 @@ impl AiTunnel {
             published_marker: data_dir.join("desktop-e2e-published.json"),
             publish_note: std::sync::Mutex::new(None),
             codex_catalog_probe: OptionalProviderProbe::default(),
+            http: crate::link::net::LaneClient::new(build_client),
         }))
     }
 
@@ -306,6 +318,9 @@ pub fn spawn(store: LinkHandle, sources: AiSources) {
                             log::warn!("AI tunnel poll: {e}");
                             last_warned = Some(e);
                         }
+                        // The try after a failure is on a new client, not one
+                        // that has seen the trouble.
+                        tunnel.http.start_afresh();
                         tokio::time::sleep(Duration::from_secs(spec.error_backoff_seconds)).await;
                     }
                 }
@@ -314,9 +329,13 @@ pub fn spawn(store: LinkHandle, sources: AiSources) {
     });
 }
 
-fn client(timeout: Duration) -> Result<reqwest::Client, String> {
-    reqwest::Client::builder()
-        .timeout(timeout)
+/// How long a request made through a turn's [`Lane`] may take: its frames, the
+/// approvals it waits for, the tool catalogue and each tool run.
+const TURN_TIMEOUT: Duration = Duration::from_secs(30);
+
+fn build_client() -> Result<reqwest::Client, String> {
+    crate::link::net::async_builder()
+        .timeout(TURN_TIMEOUT)
         .build()
         .map_err(|e| format!("could not build the tunnel client: {e}"))
 }
@@ -378,15 +397,17 @@ impl AiTunnel {
         instance: &str,
         pubkey: &str,
     ) -> Result<(), String> {
-        let http = client(Duration::from_secs(20))?;
+        let http = self.http.get()?;
         let resp = http
             .post(crate::link::oauth::join(&account.base_url, &spec.pubkey_path))
+            .timeout(Duration::from_secs(20))
             .bearer_auth(&account.credential)
             .json(&json!({ "instanceId": instance, "publicKey": pubkey }))
             .send()
             .await
             .map_err(|e| format!("could not reach the AI lane: {e}"))?;
         if resp.status().is_success() {
+            crate::link::net::drain_async(resp).await;
             return Ok(());
         }
         let status = resp.status().as_u16();
@@ -426,9 +447,12 @@ impl AiTunnel {
             spec.batch_limit,
             urlencode(instance),
         );
-        let http = client(Duration::from_secs(spec.wait_seconds + 15))?;
+        let http = self.http.get()?;
         let resp = http
             .get(&url)
+            // Generous over the server's wait so a long-poll that returns
+            // exactly on time is not cut off by this side and retried needlessly.
+            .timeout(Duration::from_secs(spec.wait_seconds + 15))
             .bearer_auth(&account.credential)
             .send()
             .await
@@ -483,7 +507,7 @@ impl AiTunnel {
         instance: &str,
         request: &AiRequest,
     ) -> Result<(), String> {
-        let http = client(Duration::from_secs(30))?;
+        let http = self.http.get()?;
         let claim_url = crate::link::oauth::join(
             &account.base_url,
             &spec.claim_path.replace("{id}", &request.id),
@@ -495,17 +519,21 @@ impl AiTunnel {
             .send()
             .await
             .map_err(|e| format!("could not claim: {e}"))?;
-        if !claimed.status().is_success() {
+        // Only the status is wanted; the rest is read out so the connection can
+        // carry what follows.
+        let claim_status = claimed.status();
+        crate::link::net::drain_async(claimed).await;
+        if !claim_status.is_success() {
             // 409 is the ordinary "someone else got there first".
-            return if claimed.status().as_u16() == 409 {
+            return if claim_status.as_u16() == 409 {
                 Ok(())
             } else {
-                Err(format!("claim refused: HTTP {}", claimed.status().as_u16()))
+                Err(format!("claim refused: HTTP {}", claim_status.as_u16()))
             };
         }
 
         let lane = Lane {
-            http: client(Duration::from_secs(30))?,
+            http: http.clone(),
             account,
             spec,
             instance,
@@ -542,10 +570,12 @@ impl AiTunnel {
             .await
             .map_err(|e| format!("could not report the outcome: {e}"))?;
         self.sessions.drop_thread(&request.id);
-        if !done.status().is_success() {
+        let done_status = done.status();
+        crate::link::net::drain_async(done).await;
+        if !done_status.is_success() {
             return Err(format!(
                 "the AI lane refused the outcome: HTTP {}",
-                done.status().as_u16()
+                done_status.as_u16()
             ));
         }
         Ok(())
@@ -1358,6 +1388,83 @@ mod tests {
         assert!(probe.connected.load(Ordering::Acquire));
         assert!(!probe.check(Duration::from_secs(1), || false).await);
         assert!(!probe.connected.load(Ordering::Acquire));
+    }
+
+    /// A tunnel over a fresh data folder, with nothing to answer a turn with: these
+    /// tests are about what it does on the wire.
+    fn tunnel_in(tag: &str) -> (Arc<AiTunnel>, std::path::PathBuf) {
+        let dir = std::env::temp_dir().join(format!("oaiy-tunnel-{tag}-{}", uuid::Uuid::new_v4().simple()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let sources = AiSources {
+            providers: crate::ai::providers::new_handle(),
+            codex: crate::ai::codex::new_handle(&dir),
+        };
+        (AiTunnel::new(&dir, sources).unwrap(), dir)
+    }
+
+    fn linked(base: String, credential: &str) -> LinkedAccount {
+        LinkedAccount {
+            connector_id: "formlogic".into(),
+            base_url: base,
+            credential: credential.into(),
+            account_id: None,
+            account_name: None,
+            granted_scopes: None,
+            linked_at: chrono::Utc::now(),
+            instance_id: Some("oaiy-test".into()),
+        }
+    }
+
+    #[tokio::test]
+    async fn the_key_publish_and_the_polls_share_one_connection() {
+        // A poll every 25 seconds used to make a connection, and do a TLS
+        // handshake, each time; the client is now kept from poll to poll.
+        use crate::link::testkit::{Provider, Reply};
+        let (tunnel, dir) = tunnel_in("reuse");
+        let server = Provider::start(|req| {
+            if req.target.starts_with("/api/v1/desktop-ai/pending") {
+                Reply::ok(r#"{"requests":[]}"#)
+            } else {
+                // The answer to a publish is not read, and this one is too big to
+                // have come in with its headers.
+                Reply::ok(&format!(r#"{{"pad":"{}"}}"#, "x".repeat(200_000)))
+            }
+        });
+        let (account, spec) = (linked(server.base.clone(), "flk_ai"), descriptor::builtin().remove(0).desktop_ai.unwrap());
+
+        tunnel.publish(&account, &spec, "oaiy-test", "the-public-key").await.unwrap();
+        assert_eq!(tunnel.poll_cycle(&account, &spec, "oaiy-test").await.unwrap(), 0);
+        assert_eq!(tunnel.poll_cycle(&account, &spec, "oaiy-test").await.unwrap(), 0);
+
+        assert_eq!(
+            server.lines(),
+            [
+                "POST /api/v1/desktop-ai/pubkey",
+                "GET /api/v1/desktop-ai/pending?wait=25000&limit=8&instanceId=oaiy-test",
+                "GET /api/v1/desktop-ai/pending?wait=25000&limit=8&instanceId=oaiy-test",
+            ]
+        );
+        assert_eq!(server.connections(), 1, "{:?}", server.lines());
+        assert!(server.requests().iter().all(|r| r.header("authorization") == Some("Bearer flk_ai")));
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[tokio::test]
+    async fn the_tunnel_gives_each_account_only_its_own_credential() {
+        use crate::link::testkit::{Provider, Reply};
+        let (tunnel, dir) = tunnel_in("credentials");
+        let empty = || Provider::start(|_| Reply::ok(r#"{"requests":[]}"#));
+        let (a, b) = (empty(), empty());
+        let spec = descriptor::builtin().remove(0).desktop_ai.unwrap();
+        for (server, credential) in [(&a, "flk_alpha"), (&b, "flk_beta"), (&a, "flk_gamma")] {
+            tunnel.poll_cycle(&linked(server.base.clone(), credential), &spec, "oaiy-test").await.unwrap();
+        }
+        let bearers = |server: &Provider| -> Vec<String> {
+            server.requests().iter().map(|r| r.header("authorization").unwrap_or("none").to_string()).collect()
+        };
+        assert_eq!(bearers(&a), ["Bearer flk_alpha", "Bearer flk_gamma"]);
+        assert_eq!(bearers(&b), ["Bearer flk_beta"]);
+        let _ = std::fs::remove_dir_all(dir);
     }
 
     #[test]

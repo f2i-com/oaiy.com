@@ -172,6 +172,11 @@ pub fn spawn(store: LinkHandle) {
             // Registering is a WRITE and belongs on the slow schedule.
             if now >= next_register {
                 let registered = register(&account, &spec, &identity);
+                if registered.is_err() {
+                    // The try after a failure is on a new client, not one that
+                    // has seen the trouble.
+                    HTTP.start_afresh();
+                }
                 // A failed one (the provider away) is tried again in five
                 // minutes, not an hour: enrolment waits on it. A provider that
                 // does not offer data nodes is not a failure: it is asked again
@@ -194,14 +199,33 @@ pub fn spawn(store: LinkHandle) {
             // registration, an approval sat invisible for up to an hour —
             // which reads as the approval not having worked.
             if now >= next_refresh {
-                if let Some(status) = refresh(&account, &spec) {
-                    store.note_data_node(Ok(status));
+                match refresh(&account, &spec) {
+                    Some(status) => store.note_data_node(Ok(status)),
+                    None => HTTP.start_afresh(),
                 }
                 next_refresh = now + REFRESH_INTERVAL;
             }
         }
     });
 }
+
+/// The client this lane keeps from one look to the next. The two looks are 45
+/// seconds apart, so a connection is rarely still open to carry the next (see
+/// [`super::net::POOL_IDLE`]); what is kept is the client itself, its TLS
+/// configuration and session cache, rather than a new one for every look.
+static HTTP: super::net::LaneClient<reqwest::blocking::Client> =
+    super::net::LaneClient::new(build_client);
+
+fn build_client() -> Result<reqwest::blocking::Client, String> {
+    super::net::blocking_builder()
+        .build()
+        .map_err(|e| format!("could not build the enrolment client: {e}"))
+}
+
+/// How long a registration may take.
+const REGISTER_TIMEOUT: Duration = Duration::from_secs(20);
+/// How long reading the record back may take.
+const READ_TIMEOUT: Duration = Duration::from_secs(15);
 
 /// One registration. Idempotent server-side. `Ok(None)`: the provider does not offer
 /// data nodes (switched off there), which is no error.
@@ -210,10 +234,7 @@ fn register(
     spec: &DataNodeSpec,
     identity: &NodeIdentity,
 ) -> Result<Option<DataNodeStatus>, String> {
-    let http = reqwest::blocking::Client::builder()
-        .timeout(Duration::from_secs(20))
-        .build()
-        .map_err(|e| format!("could not build the enrolment client: {e}"))?;
+    let http = HTTP.get()?;
     let body = json!({
         "signingPublicKey": identity.public_key_b64(),
         "displayName": account.account_name.clone().unwrap_or_else(|| "OAIY Desktop".into()),
@@ -223,6 +244,7 @@ fn register(
     });
     let resp = http
         .post(super::oauth::join(&account.base_url, &spec.register_path))
+        .timeout(REGISTER_TIMEOUT)
         .bearer_auth(&account.credential)
         .json(&body)
         .send()
@@ -265,16 +287,15 @@ fn offers_no_data_nodes(status: u16, payload: &Value) -> bool {
 /// could not be made is not news, and replacing a good record with an error
 /// would blank the fingerprint the owner is mid-way through comparing.
 fn refresh(account: &LinkedAccount, spec: &DataNodeSpec) -> Option<DataNodeStatus> {
-    let http = reqwest::blocking::Client::builder()
-        .timeout(Duration::from_secs(15))
-        .build()
-        .ok()?;
+    let http = HTTP.get().ok()?;
     let resp = http
         .get(super::oauth::join(&account.base_url, &spec.self_path))
+        .timeout(READ_TIMEOUT)
         .bearer_auth(&account.credential)
         .send()
         .ok()?;
     if !resp.status().is_success() {
+        super::net::drain(resp);
         return None;
     }
     node_status(&resp.json::<Value>().ok()?)
@@ -419,5 +440,34 @@ mod tests {
         assert!(node_status(&approved).unwrap().approved);
         // A body with no node at all is None, not a panic.
         assert!(node_status(&json!({ "data": {} })).is_none());
+    }
+
+    #[test]
+    fn enrolling_and_reading_the_record_back_share_a_connection() {
+        use crate::link::testkit::{Provider, Reply};
+        let node = json!({ "data": { "node": {
+            "fingerprint": "ff", "status": "pending", "approved": false, "signingKeyGeneration": 1 }}})
+        .to_string();
+        let server = Provider::start(move |_| Reply::ok(&node));
+        let account = LinkedAccount {
+            connector_id: "formlogic".into(),
+            base_url: server.base.clone(),
+            credential: "flk_node".into(),
+            account_id: None,
+            account_name: None,
+            granted_scopes: None,
+            linked_at: chrono::Utc::now(),
+            instance_id: Some("oaiy-test".into()),
+        };
+        let spec = descriptor::builtin().remove(0).data_node.expect("the shipped connector enrols a node");
+        let identity = NodeIdentity::from_secret_bytes([7u8; 32]);
+
+        let registered = register(&account, &spec, &identity).unwrap().expect("a node record");
+        let read_back = refresh(&account, &spec).expect("the record read back");
+        assert_eq!(registered, read_back);
+
+        assert_eq!(server.lines(), ["POST /api/v1/data-node/register", "GET /api/v1/data-node/self"]);
+        assert_eq!(server.connections(), 1);
+        assert!(server.requests().iter().all(|r| r.header("authorization") == Some("Bearer flk_node")));
     }
 }
