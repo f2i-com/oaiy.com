@@ -17,7 +17,7 @@
 use super::chat_tools;
 use serde_json::{json, Value};
 use std::collections::HashMap;
-use std::io::{BufRead, BufReader, Write};
+use std::io::{BufRead, BufReader, Read, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Child, ChildStdin, Command, Stdio};
 use std::sync::atomic::{AtomicI64, Ordering};
@@ -160,10 +160,54 @@ impl CodexError {
     }
 }
 
+/// How a session reaches its app-server: the two pipes it speaks over, and the
+/// child behind them. In production that is the `codex` CLI ([`spawn_codex`]);
+/// the tests connect an in-process fake speaking the same protocol, with no
+/// child at all.
+struct Transport {
+    to_server: Box<dyn Write + Send>,
+    from_server: Box<dyn Read + Send>,
+    child: Option<Child>,
+}
+
+/// Starts an app-server for a `CODEX_HOME`.
+type Connect = Arc<dyn Fn(&Path) -> Result<Transport, CodexError> + Send + Sync>;
+
+/// The real app-server: the `codex` CLI, in `app-server` mode, on stdio.
+fn spawn_codex(codex_home: &Path) -> Result<Transport, CodexError> {
+    std::fs::create_dir_all(codex_home)
+        .map_err(|e| CodexError::Unavailable(format!("cannot create CODEX_HOME: {e}")))?;
+
+    let mut cmd = base_command();
+    cmd.arg("app-server");
+    // Nothing of this process's environment reaches the child except an
+    // explicit allow-list: no PATH games, no OPENAI_API_KEY, no proxy vars.
+    cmd.env_clear();
+    for key in env_allow_list() {
+        if let Ok(v) = std::env::var(key) {
+            cmd.env(key, v);
+        }
+    }
+    cmd.env("CODEX_HOME", codex_home);
+    cmd.stdin(Stdio::piped()).stdout(Stdio::piped()).stderr(Stdio::piped());
+
+    let mut child = cmd
+        .spawn()
+        .map_err(|e| CodexError::Unavailable(format!("cannot run the codex CLI: {e}")))?;
+    // On Windows this child is `cmd /c codex`, so killing the tracked pid
+    // reaps the shell and leaves the real agent running with a live
+    // CODEX_HOME session. Job membership is inherited, so the whole tree
+    // goes together.
+    crate::services::job_object::adopt(child.id());
+    let stdin: ChildStdin = child.stdin.take().ok_or_else(|| CodexError::Unavailable("no stdin".into()))?;
+    let stdout = child.stdout.take().ok_or_else(|| CodexError::Unavailable("no stdout".into()))?;
+    Ok(Transport { to_server: Box::new(stdin), from_server: Box::new(stdout), child: Some(child) })
+}
+
 /// One live child + its RPC plumbing.
 struct Session {
-    child: Child,
-    stdin: ChildStdin,
+    child: Option<Child>,
+    stdin: Box<dyn Write + Send>,
     next_id: AtomicI64,
     /// id → the reply, filled by the reader thread.
     replies: Arc<Mutex<HashMap<i64, Value>>>,
@@ -173,33 +217,8 @@ struct Session {
 }
 
 impl Session {
-    fn spawn(codex_home: &Path) -> Result<Self, CodexError> {
-        std::fs::create_dir_all(codex_home)
-            .map_err(|e| CodexError::Unavailable(format!("cannot create CODEX_HOME: {e}")))?;
-
-        let mut cmd = base_command();
-        cmd.arg("app-server");
-        // Nothing of this process's environment reaches the child except an
-        // explicit allow-list: no PATH games, no OPENAI_API_KEY, no proxy vars.
-        cmd.env_clear();
-        for key in env_allow_list() {
-            if let Ok(v) = std::env::var(key) {
-                cmd.env(key, v);
-            }
-        }
-        cmd.env("CODEX_HOME", codex_home);
-        cmd.stdin(Stdio::piped()).stdout(Stdio::piped()).stderr(Stdio::piped());
-
-        let mut child = cmd
-            .spawn()
-            .map_err(|e| CodexError::Unavailable(format!("cannot run the codex CLI: {e}")))?;
-        // On Windows this child is `cmd /c codex`, so killing the tracked pid
-        // reaps the shell and leaves the real agent running with a live
-        // CODEX_HOME session. Job membership is inherited, so the whole tree
-        // goes together.
-        crate::services::job_object::adopt(child.id());
-        let stdin = child.stdin.take().ok_or_else(|| CodexError::Unavailable("no stdin".into()))?;
-        let stdout = child.stdout.take().ok_or_else(|| CodexError::Unavailable("no stdout".into()))?;
+    fn start(transport: Transport) -> Result<Self, CodexError> {
+        let Transport { to_server: stdin, from_server: stdout, child } = transport;
 
         let replies: Arc<Mutex<HashMap<i64, Value>>> = Arc::new(Mutex::new(HashMap::new()));
         let notes: Arc<Mutex<Vec<Value>>> = Arc::new(Mutex::new(Vec::new()));
@@ -278,12 +297,19 @@ impl Session {
     fn notes_len(&self) -> usize {
         self.notes.lock().map(|v| v.len()).unwrap_or(0)
     }
+
+    /// The child has exited.
+    fn exited(&mut self) -> bool {
+        self.child.as_mut().is_some_and(|c| c.try_wait().ok().flatten().is_some())
+    }
 }
 
 impl Drop for Session {
     fn drop(&mut self) {
-        let _ = self.child.kill();
-        let _ = self.child.wait();
+        if let Some(child) = self.child.as_mut() {
+            let _ = child.kill();
+            let _ = child.wait();
+        }
     }
 }
 
@@ -334,16 +360,20 @@ fn safe_login_url(raw: Option<&str>) -> Option<String> {
 /// The managed agent. One child at a time, started lazily and reused.
 pub struct CodexAgent {
     codex_home: PathBuf,
+    connect: Connect,
     session: Mutex<Option<Session>>,
 }
 
 pub type CodexHandle = Arc<CodexAgent>;
 
 pub fn new_handle(data_dir: &Path) -> CodexHandle {
-    Arc::new(CodexAgent {
-        codex_home: data_dir.join("ai").join("codex-home"),
-        session: Mutex::new(None),
-    })
+    CodexAgent::with_connect(data_dir.join("ai").join("codex-home"), Arc::new(spawn_codex))
+}
+
+impl CodexAgent {
+    fn with_connect(codex_home: PathBuf, connect: Connect) -> CodexHandle {
+        Arc::new(CodexAgent { codex_home, connect, session: Mutex::new(None) })
+    }
 }
 
 #[derive(Debug, serde::Serialize)]
@@ -368,7 +398,7 @@ impl CodexAgent {
     ) -> Result<T, CodexError> {
         let mut guard = self.session.lock().map_err(|_| CodexError::Rpc("session lock poisoned".into()))?;
         if guard.is_none() {
-            let mut s = Session::spawn(&self.codex_home)?;
+            let mut s = Session::start((self.connect)(&self.codex_home)?)?;
             s.call(
                 "initialize",
                 json!({
@@ -393,7 +423,7 @@ impl CodexAgent {
         let out = f(session);
         // A dead child must not be reused: drop it so the next call respawns.
         if let Err(CodexError::Rpc(_)) = &out {
-            if session.child.try_wait().ok().flatten().is_some() {
+            if session.exited() {
                 *guard = None;
             }
         }
@@ -1547,5 +1577,293 @@ mod tests {
         assert_eq!(LiveCallAlias::ReasoningNone.service_tier(), None);
         assert_eq!(LiveCallAlias::ReasoningLow.service_tier(), None);
         assert_eq!(LiveCallAlias::LunaReasoningLow.service_tier(), None);
+    }
+
+    // ---- The connector against a fake app-server, over in-memory pipes ----
+    //
+    // `fake_codex` above stands in for the whole turn, so it cannot see how the
+    // connector shares its child. This fake is the app-server instead: the
+    // connector's own session, reader and turn loop talk to it in the same
+    // line-delimited JSON-RPC as the real `codex app-server`.
+
+    /// How long a test waits for something that should happen at once.
+    const WAIT: Duration = Duration::from_secs(10);
+
+    /// The writing end of an in-memory pipe: what it writes arrives, in order,
+    /// at its reader. Dropping it is the end of the file, as a child's closed
+    /// stdout is.
+    struct PipeWriter(Sender<Vec<u8>>);
+
+    struct PipeReader {
+        rx: Receiver<Vec<u8>>,
+        buf: Vec<u8>,
+        at: usize,
+    }
+
+    fn pipe() -> (PipeWriter, PipeReader) {
+        let (tx, rx) = channel();
+        (PipeWriter(tx), PipeReader { rx, buf: Vec::new(), at: 0 })
+    }
+
+    impl Write for PipeWriter {
+        fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+            self.0.send(bytes.to_vec()).map_err(|_| std::io::ErrorKind::BrokenPipe)?;
+            Ok(bytes.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    impl Read for PipeReader {
+        fn read(&mut self, out: &mut [u8]) -> std::io::Result<usize> {
+            while self.at >= self.buf.len() {
+                match self.rx.recv() {
+                    Ok(bytes) => {
+                        self.buf = bytes;
+                        self.at = 0;
+                    }
+                    Err(_) => return Ok(0),
+                }
+            }
+            let n = out.len().min(self.buf.len() - self.at);
+            out[..n].copy_from_slice(&self.buf[self.at..self.at + n]);
+            self.at += n;
+            Ok(n)
+        }
+    }
+
+    /// The fake's side of the connector's stdout. `None` once it has "died".
+    type Wire = Arc<Mutex<Option<PipeWriter>>>;
+
+    fn send(out: &Wire, msg: Value) {
+        if let Some(w) = out.lock().unwrap().as_mut() {
+            let _ = writeln!(w, "{msg}");
+        }
+    }
+
+    /// What the fake app-server has seen and been told, shared with the test.
+    #[derive(Default)]
+    struct FakeState {
+        /// App-servers started: one per child the connector would have run.
+        connects: usize,
+        signed_in: bool,
+        login_starts: usize,
+        /// Each `turn/start`, in the order it arrived: its prompt, and whether
+        /// it was a live-call turn (an alias pins the effort on the turn).
+        started: Vec<(String, bool)>,
+        /// Each turn that finished, in order: its prompt.
+        finished: Vec<String>,
+        /// Live-call turns in progress now, and the most there ever were.
+        calls_running: usize,
+        most_calls_running: usize,
+        /// The names a `hold:<name>` turn waits on, once released.
+        released: std::collections::HashSet<String>,
+        next_thread: u64,
+    }
+
+    /// An in-process `codex app-server`: answers what the connector asks, and
+    /// runs each turn on a thread of its own, as the real one does.
+    ///
+    /// A turn answers "You said: <the prompt's last line>", in small fragments.
+    /// A prompt carrying `hold:<name>` says its first fragment and then waits
+    /// for [`FakeCodex::release`] — a long setup turn, held open.
+    #[derive(Default)]
+    struct FakeCodex {
+        state: Mutex<FakeState>,
+        changed: std::sync::Condvar,
+    }
+
+    impl FakeCodex {
+        /// A connector whose app-server is this fake.
+        fn agent(self: &Arc<Self>) -> CodexHandle {
+            let fake = self.clone();
+            CodexAgent::with_connect(PathBuf::from("fake-codex-home"), Arc::new(move |_home: &Path| Ok::<_, CodexError>(fake.serve())))
+        }
+
+        /// A new app-server, on a new pair of pipes.
+        fn serve(self: &Arc<Self>) -> Transport {
+            let (to_server, requests) = pipe();
+            let (to_client, from_server) = pipe();
+            let out: Wire = Arc::new(Mutex::new(Some(to_client)));
+            self.update(|s| s.connects += 1);
+            let fake = self.clone();
+            std::thread::spawn(move || {
+                for line in BufReader::new(requests).lines() {
+                    let Ok(line) = line else { break };
+                    let Ok(msg) = serde_json::from_str::<Value>(&line) else { continue };
+                    fake.answer(&msg, &out);
+                }
+            });
+            Transport { to_server: Box::new(to_server), from_server: Box::new(from_server), child: None }
+        }
+
+        fn answer(self: &Arc<Self>, msg: &Value, out: &Wire) {
+            // A notification (`initialized`) wants no answer.
+            let Some(id) = msg.get("id").cloned() else { return };
+            let params = &msg["params"];
+            let result = match msg["method"].as_str().unwrap_or_default() {
+                "initialize" => json!({ "userAgent": "fake-codex" }),
+                "account/read" => {
+                    let account = if self.state.lock().unwrap().signed_in {
+                        json!({ "type": "chatgpt", "email": "caller@example.com", "planType": "plus" })
+                    } else {
+                        Value::Null
+                    };
+                    json!({ "account": account, "requiresOpenaiAuth": true })
+                }
+                "account/login/start" => {
+                    // As if the person finished in the browser at once.
+                    self.update(|s| {
+                        s.login_starts += 1;
+                        s.signed_in = true;
+                    });
+                    json!({ "type": "chatgpt", "loginId": "login-1", "authUrl": "https://auth.openai.com/oauth/authorize?fake=1" })
+                }
+                "account/logout" => {
+                    self.update(|s| s.signed_in = false);
+                    json!({})
+                }
+                "model/list" => json!({ "data": [{ "id": "m1", "model": "gpt-5.5", "isDefault": true }] }),
+                "thread/start" => {
+                    let thread = format!("thread-{}", self.update(|s| {
+                        s.next_thread += 1;
+                        s.next_thread
+                    }));
+                    // Routed by `thread.id`, not `threadId`, as the real one sends it.
+                    send(out, json!({ "method": "thread/started", "params": { "thread": { "id": thread } } }));
+                    json!({ "thread": { "id": thread }, "model": params.get("model").cloned().unwrap_or(json!("gpt-5.5")) })
+                }
+                "turn/start" => {
+                    let thread = params["threadId"].as_str().unwrap_or_default().to_string();
+                    let prompt = params.pointer("/input/0/text").and_then(Value::as_str).unwrap_or_default().to_string();
+                    let call = params.get("effort").is_some();
+                    let turn = format!("turn-of-{thread}");
+                    self.update(|s| {
+                        s.started.push((prompt.clone(), call));
+                        if call {
+                            s.calls_running += 1;
+                            s.most_calls_running = s.most_calls_running.max(s.calls_running);
+                        }
+                    });
+                    // Answered at once; the turn itself runs on.
+                    send(out, json!({ "id": id, "result": { "turn": { "id": turn, "status": "inProgress", "items": [] } } }));
+                    let (fake, out) = (self.clone(), out.clone());
+                    std::thread::spawn(move || fake.run_turn(&out, &thread, &turn, &prompt, call));
+                    return;
+                }
+                other => {
+                    send(out, json!({ "id": id, "error": { "code": -32601, "message": format!("the fake has no {other}") } }));
+                    return;
+                }
+            };
+            send(out, json!({ "id": id, "result": result }));
+        }
+
+        fn run_turn(&self, out: &Wire, thread: &str, turn: &str, prompt: &str, call: bool) {
+            let reply = format!("You said: {}", prompt.lines().last().unwrap_or_default());
+            let chars: Vec<char> = reply.chars().collect();
+            let fragments: Vec<String> = chars.chunks(4).map(|c| c.iter().collect()).collect();
+            let hold = prompt
+                .split_whitespace()
+                .find_map(|w| w.strip_prefix("hold:"))
+                .map(str::to_string);
+            // Something no turn reads, for no thread in particular.
+            send(out, json!({ "method": "account/rateLimits/updated", "params": { "rateLimits": {} } }));
+            send(out, json!({ "method": "turn/started", "params": { "threadId": thread, "turn": { "id": turn, "status": "inProgress" } } }));
+            for (i, fragment) in fragments.iter().enumerate() {
+                send(out, json!({ "method": "item/agentMessage/delta", "params": {
+                    "threadId": thread, "turnId": turn, "itemId": "msg", "delta": fragment,
+                } }));
+                if let (0, Some(name)) = (i, &hold) {
+                    self.wait_for(|s| s.released.contains(name), Duration::from_secs(60));
+                }
+            }
+            send(out, json!({ "method": "item/completed", "params": {
+                "threadId": thread, "turnId": turn, "item": { "type": "agentMessage", "id": "msg", "text": reply },
+            } }));
+            self.update(|s| {
+                s.finished.push(prompt.to_string());
+                if call {
+                    s.calls_running -= 1;
+                }
+            });
+            send(out, json!({ "method": "turn/completed", "params": { "threadId": thread, "turn": { "id": turn, "status": "completed" } } }));
+        }
+
+        fn update<T>(&self, f: impl FnOnce(&mut FakeState) -> T) -> T {
+            let t = f(&mut self.state.lock().unwrap());
+            self.changed.notify_all();
+            t
+        }
+
+        /// Waits until `until` holds, for at most `within`. Whether it did.
+        fn wait_for(&self, until: impl Fn(&FakeState) -> bool, within: Duration) -> bool {
+            let deadline = Instant::now() + within;
+            let mut s = self.state.lock().unwrap();
+            while !until(&s) {
+                let left = deadline.saturating_duration_since(Instant::now());
+                if left.is_zero() {
+                    return false;
+                }
+                s = self.changed.wait_timeout(s, left).unwrap().0;
+            }
+            true
+        }
+    }
+
+    /// `agent` answering `text` on a thread of its own, as the routes answer an
+    /// HTTP request; the answer (or the error's message) arrives on the receiver.
+    fn ask_in_background(agent: &CodexHandle, text: &str, alias: Option<LiveCallAlias>) -> Receiver<Result<String, String>> {
+        let (tx, rx) = channel();
+        let agent = agent.clone();
+        let body = json!({ "messages": [{ "role": "user", "content": text }] });
+        std::thread::spawn(move || {
+            let answer = agent
+                .chat_as(&body, alias)
+                .map(|c| c["choices"][0]["message"]["content"].as_str().unwrap_or_default().to_string())
+                .map_err(|e| e.message());
+            let _ = tx.send(answer);
+        });
+        rx
+    }
+
+    fn answered(rx: &Receiver<Result<String, String>>) -> String {
+        rx.recv_timeout(WAIT).expect("answered in time").expect("answered without an error")
+    }
+
+    #[test]
+    fn turns_are_answered_by_the_app_server_over_its_pipes() {
+        let fake = Arc::new(FakeCodex::default());
+        let agent = fake.agent();
+        assert_eq!(answered(&ask_in_background(&agent, "Set up OAIY", None)), "You said: Set up OAIY");
+        let call = ask_in_background(&agent, "Hello, who is this?", Some(LiveCallAlias::ReasoningNone));
+        assert_eq!(answered(&call), "You said: Hello, who is this?");
+        let s = fake.state.lock().unwrap();
+        assert_eq!(s.started, [("Set up OAIY".to_string(), false), ("Hello, who is this?".to_string(), true)]);
+        assert_eq!(s.connects, 1, "one app-server serves every turn");
+    }
+
+    #[test]
+    fn sign_in_status_and_sign_out_share_the_one_app_server() {
+        let fake = Arc::new(FakeCodex::default());
+        let agent = fake.agent();
+        let before = agent.status();
+        assert!(before.available && !before.connected, "{before:?}");
+
+        let login = agent.start_login(false).expect("the login starts");
+        assert_eq!(login["loginId"], "login-1");
+        assert_eq!(login["authUrl"], "https://auth.openai.com/oauth/authorize?fake=1");
+        let signed_in = agent.status();
+        assert!(signed_in.connected, "{signed_in:?}");
+        assert_eq!(signed_in.email.as_deref(), Some("caller@example.com"));
+        assert_eq!(signed_in.plan_type.as_deref(), Some("plus"));
+        assert_eq!(agent.models().expect("models")["data"][0]["id"], "gpt-5.5");
+        assert_eq!(answered(&ask_in_background(&agent, "Hi", Some(LiveCallAlias::LunaReasoningLowFast))), "You said: Hi");
+
+        agent.logout().expect("signed out");
+        assert!(!agent.status().connected);
+        let s = fake.state.lock().unwrap();
+        assert_eq!((s.connects, s.login_starts), (1, 1), "one app-server, one login flow");
     }
 }
