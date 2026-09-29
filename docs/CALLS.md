@@ -69,6 +69,13 @@ words and goes to the agent with them, so it does not talk over them. Other
 tools (a file, `remember`) answer at once; one that takes more than two
 seconds gets a short "One moment, let me check."
 
+A reply that is slow to start gets a hold word: when the agent has begun
+nothing (no words, no tool) a second and a half after the caller's words
+ended, a short "Okay —", "Sure," or "Mm, right." is said, once a turn, in
+turn. Never over the greeting, a tool's line, or a goodbye, and never while
+the caller is speaking again (`HOLD_WORD_AFTER_MS` and `HOLD_WORDS` in
+`app/src/sessions.ts`).
+
 ## Who answers: a sub-agent a call
 
 Each call is answered by a sub-agent of the Front desk's runner (the agent

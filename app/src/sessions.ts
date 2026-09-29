@@ -69,6 +69,12 @@ export interface Session extends SessionInfo {
   /** The caller is speaking now (their words are not in yet). */
   callerSpeaking?: boolean;
   speakingTimer?: ReturnType<typeof setTimeout>;
+  /** When this call began, on this computer's clock (the desktop times the call's events from then). */
+  clockZero?: number;
+  /** When the caller's words the next run answers ended (this computer's clock): a hold word may follow them. Unset for words that may have none (said over the greeting). */
+  heardAt?: number;
+  /** The hold word waiting to be said in this run (see HOLD_WORD_AFTER_MS). */
+  holdWord?: ReturnType<typeof setTimeout>;
   /** Answers that came in while the caller spoke: given to the agent with their words. */
   held?: string[];
   /** The words of the reply that calls end_call, held back to be its goodbye (so no second goodbye is said). */
@@ -233,10 +239,12 @@ export class Speech {
   reply: string[] = [];
   /** A filler word ("Sure!") may start this reply: not after a tool, and only once. */
   private fillerOk = true;
+  /** A hold word has been said in this turn (see holdWord). */
+  private acknowledged = false;
 
   constructor(private readonly say: (text: string) => Promise<void>, private readonly failed: (error: string) => void = () => {}) {}
 
-  /** A new reply: speak again. */
+  /** A new reply: speak again (`afterTool`: the same turn goes on, after a tool). */
   begin(afterTool = false): void {
     this.hushed = false;
     this.buffer = '';
@@ -244,12 +252,28 @@ export class Speech {
     this.repeated = [];
     this.reply = [];
     this.fillerOk = !afterTool;
+    if (!afterTool) this.acknowledged = false;
   }
 
   /** A tool is taking a while: say a short line, unless this reply has said something already. */
   hold(line: string): void {
     if (this.hushed || this.spoke) return;
     this.speak(line);
+  }
+
+  /**
+   * The reply is slow to come: a short acknowledgement ("Okay —") now, once a
+   * turn, and only before the reply has said anything. It is not the reply's
+   * own words: a tool's "one moment" may still follow it, and a filler word
+   * that opens the reply after it is not said ("Okay — Sure!" is one too many).
+   */
+  holdWord(word: string): boolean {
+    const clean = spoken(word);
+    if (!clean || this.hushed || this.spoke || this.acknowledged) return false;
+    this.acknowledged = true;
+    this.fillerOk = false;
+    this.enqueue(clean, false);
+    return true;
   }
 
   /** A new call: nothing has been said on it yet. */
@@ -344,9 +368,12 @@ export class Speech {
     this.enqueue(clean);
   }
 
-  private enqueue(clean: string): void {
-    this.spoke = true;
-    this.reply.push(clean);
+  /** Queue `clean` to be said; `words`: it is the reply's own (a hold word is not). */
+  private enqueue(clean: string, words = true): void {
+    if (words) {
+      this.spoke = true;
+      this.reply.push(clean);
+    }
     this.chain = this.chain.then(() => (this.hushed ? undefined : this.say(clean))).catch((e: unknown) => this.failed((e as Error).message));
   }
 }
@@ -459,6 +486,16 @@ const BOOKING_NUDGE = "[OAIY] You told the caller their booking is requested, bu
 /** How long a tool may run on a call before a short line is said, and the line. */
 const HOLD_AFTER_MS = 2_000;
 const HOLD_LINE = 'One moment, let me check.';
+
+/**
+ * The hold word: when the model has said nothing this long after the caller's
+ * words ended, a short acknowledgement is said, once a turn, so the caller is
+ * not met with silence while the reply is written. Never over the greeting, a
+ * tool's "one moment", or a goodbye (end_call). Tune it here.
+ */
+export const HOLD_WORD_AFTER_MS = 1_500;
+/** The acknowledgements, taken in turn. */
+export const HOLD_WORDS = ['Okay —', 'Sure,', 'Mm, right.'];
 
 /** What the call's agent is told when it asks the business's records: the answer comes later. */
 export const LOOKUP_ASKED =
@@ -731,6 +768,10 @@ export class Sessions {
   answersCalls: () => boolean = () => true;
   /** The warm going on for a call not begun yet (see warmCall). */
   private warming: { key: string; callId?: string; controller: AbortController } | null = null;
+  /** Hold words said so far: the next is the next in HOLD_WORDS. */
+  private holdWords = 0;
+  /** How long after the caller's words a hold word waits (HOLD_WORD_AFTER_MS; a test makes it short). */
+  holdWordAfterMs = HOLD_WORD_AFTER_MS;
   /** Outreach (the runner's lists of people to call or text), while it runs on this page. */
   outreach: OutreachHooks | null = null;
   /**
@@ -1493,7 +1534,10 @@ export class Sessions {
         session.cutAtMs = undefined;
         session.callerSpeaking = false;
         session.endNudged = false;
-      }
+        // The desktop starts the call's clock as it says the call began: its times (a caller's words' end) are from now.
+        session.clockZero = Date.now();
+      } else session.clockZero = undefined;
+      session.heardAt = undefined;
       // (A call taken up by the caller's words, after a reload, keeps its outreach too; any other has none.)
       session.outreach = outreach;
       // A call the phone placed (Aokie says so): the agent rang them, and why (an outreach's objective).
@@ -1535,6 +1579,9 @@ export class Sessions {
         session.callerSpeaking = true;
         clearTimeout(session.speakingTimer);
         session.speakingTimer = setTimeout(() => this.heardAll(session!), 6_000);
+        // No hold word over them.
+        clearTimeout(session.holdWord);
+        session.holdWord = undefined;
         break;
       case 'call.said':
         if (typeof event.text === 'string' && typeof event.startMs === 'number' && typeof event.endMs === 'number') {
@@ -1556,6 +1603,11 @@ export class Sessions {
           this.heardAll(session);
           break;
         }
+        // When their words ended, for the hold word: none for words said before the greeting had played (or over it).
+        const greeting = session.played?.[0];
+        const afterGreeting = !!greeting && (typeof event.startMs !== 'number' || event.startMs >= greeting.endMs);
+        const ended = typeof event.endMs === 'number' && session.clockZero !== undefined ? Math.min(Date.now(), session.clockZero + event.endMs) : Date.now();
+        session.heardAt = afterGreeting ? ended : undefined;
         this.deliver(session, [...(session.aside ?? []).splice(0), line, ...(session.held ?? []).splice(0)].join('\n'), true);
         break;
       }
@@ -1880,7 +1932,11 @@ export class Sessions {
   /** A message for a lane: to its running agent, or its next run. */
   private deliver(session: Session, text: string, first = false): void {
     // A flow's task is its own run (its answer is what that run says), never added to another.
-    if (session.kind !== 'task' && session.running && session.agent.interject(text)) return;
+    if (session.kind !== 'task' && session.running && session.agent.interject(text)) {
+      // Read by the run going on: no hold word of a run of its own.
+      session.heardAt = undefined;
+      return;
+    }
     session.waiting.push(text);
     session.waitingSince ??= Date.now();
     const lane = session.kind === 'call' ? this.callQueue : this.queue;
@@ -1915,6 +1971,9 @@ export class Sessions {
     session.controller = controller;
     let finish!: () => void;
     session.running = new Promise<void>((resolve) => (finish = resolve));
+    // When the caller's words this run answers ended: a hold word follows them if nothing is said soon.
+    const heardAt = session.heardAt;
+    session.heardAt = undefined;
     this.hooks.changed();
     // A text thread's agent reads the person's contact as it is now: a moment's wait at most (a text can
     // wait that long; a call's agent never waits, see callEvent).
@@ -1940,6 +1999,21 @@ export class Sessions {
     let ending = false;
     let draft = '';
     session.parting = undefined;
+    // The hold word (HOLD_WORD_AFTER_MS): said once, when the model has begun nothing (no words, no tool) that
+    // long after the caller's words ended, and never with a goodbye coming, over the caller, or after the call.
+    let replying = false;
+    const stopHoldWord = () => {
+      clearTimeout(session.holdWord);
+      session.holdWord = undefined;
+    };
+    if (session.speech && onCall && heardAt !== undefined) {
+      stopHoldWord();
+      session.holdWord = setTimeout(() => {
+        session.holdWord = undefined;
+        if (replying || goodbye || ending || session.parting || session.callerSpeaking || session.callId !== onCall || controller.signal.aborted) return;
+        if (session.speech?.holdWord(HOLD_WORDS[this.holdWords % HOLD_WORDS.length])) this.holdWords++;
+      }, Math.max(0, heardAt + this.holdWordAfterMs - Date.now()));
+    }
     // When the messages it answers came: the time its first turn is kept with (the rest, as they come).
     let arrived = session.waitingSince;
     session.waitingSince = session.waiting.length ? Date.now() : undefined;
@@ -1949,6 +2023,11 @@ export class Sessions {
         arrived = undefined;
         if (event.type === 'done') said = event.text;
         if (event.type === 'error') failed = event.message;
+        // The reply has begun (its words, or a tool, whose own line covers a wait): no hold word now.
+        if ((event.type === 'text' && event.delta.trim()) || event.type === 'tool_start' || event.type === 'tool_draft' || event.type === 'tool_call') {
+          replying = true;
+          stopHoldWord();
+        }
         if (event.type === 'tool_start' && event.name === 'end_call') ending = true;
         // A model that writes its calls as text (OAIY's own format): the name is in the draft.
         if (event.type === 'tool_draft' && session.speech) {
@@ -1998,6 +2077,7 @@ export class Sessions {
       this.hooks.event(session, { type: 'error', message: (error as Error).message });
     } finally {
       stopHolding();
+      stopHoldWord();
       session.inTool = false;
       session.parting = undefined;
       // The task this run was (none, when it was a message of the person's).

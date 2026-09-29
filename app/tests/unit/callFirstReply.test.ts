@@ -1,6 +1,6 @@
 // A call's first reply comes sooner: its prompt starts the same on every call and every turn (the engine
 // keeps it read), the engine reads it as the phone rings or a dial goes out (and lets go cleanly at the
-// model's first word), and none of it slows ChatGPT's live-call route.
+// model's first word), a short hold word covers a slow reply, and none of it slows ChatGPT's live-call route.
 import { afterEach, beforeAll, describe, expect, it, vi } from 'vitest';
 import { Agent, WARM_TOKENS } from '../../src/agent/agent';
 import type { Turn } from '../../src/agent/protocol';
@@ -12,7 +12,7 @@ import { NetGate } from '../../src/gate/netgate';
 import { Outreach, type Campaign, type DoNotContact } from '../../src/outreach';
 import { PhoneLine } from '../../src/phoneLine';
 import { setLocalCountry } from '../../src/phoneNumbers';
-import { Sessions } from '../../src/sessions';
+import { HOLD_WORD_AFTER_MS, HOLD_WORDS, Sessions, Speech } from '../../src/sessions';
 import { DEFAULT_MESSAGE_SETTINGS, type MessageSettings } from '../../src/settings';
 import type { CallerNote, SessionInfo } from '../../src/vfs/projects';
 import { Vfs } from '../../src/vfs/vfs';
@@ -333,10 +333,11 @@ describe('the engine reads a call before it is answered', () => {
 });
 
 describe('on ChatGPT (the live-call route), nothing is warmed', () => {
-  it('no request at ring, dial or the call beginning', async () => {
+  it('no request at ring, dial or the call beginning; the hold word still covers a slow reply', async () => {
     const chatgpt = chatgptProvider({ origin: 'http://127.0.0.1:17972', token: 't' }, 'call', null);
     const sent = engine(() => ({ text: 'Friday is free.', delayMs: 120 }));
     const { sessions, outreach, said } = world(chatgpt);
+    sessions.holdWordAfterMs = 30;
     await sessions.load();
     await sessions.desktopEvent({ seq: 1, name: 'aokie.call.incoming', source: 'aokie', correlationId: 'call_c', idempotencyKey: '', occurredAt: new Date().toISOString(), data: { callId: 'call_c', from: JANE } });
     const plan = outreach.plan({ ...CAMPAIGN, people: CAMPAIGN.people.slice(1) }, null);
@@ -350,7 +351,105 @@ describe('on ChatGPT (the live-call route), nothing is warmed', () => {
     await sessions.callEvent({ type: 'call.caller', callId: 'call_c', text: 'Is Friday free?', startMs: 3000, endMs: 4000 });
     await settled(sessions);
     expect(sent).toHaveLength(1);
-    expect(said).toEqual(['Friday is free.']);
+    expect(said).toEqual([HOLD_WORDS[0], 'Friday is free.']);
+  });
+});
+
+describe('the hold word', () => {
+  /** A call begun, its greeting played; the caller's words answered by `answer`. */
+  async function call(answer: Answer | Answer[], opts: { greeted?: boolean; callId?: string } = {}) {
+    const script = Array.isArray(answer) ? answer : [answer];
+    const sent = engine((_b, n) => script[Math.min(n, script.length - 1)]);
+    const w = world({ ...ENGINE, type: 'openai', serverKind: undefined });
+    w.sessions.holdWordAfterMs = 40;
+    await w.sessions.load();
+    const callId = opts.callId ?? 'call_h';
+    await w.sessions.callEvent({ type: 'call.started', callId, from: JANE, greeting: 'Thanks for calling Green Lawns.' });
+    if (opts.greeted !== false) await w.sessions.callEvent({ type: 'call.said', callId, text: 'Thanks for calling Green Lawns.', startMs: 1500, endMs: 3200 });
+    const say = async (text: string, startMs = 4000) => {
+      await w.sessions.callEvent({ type: 'call.caller', callId, text, startMs, endMs: startMs + 900 });
+      await settled(w.sessions);
+    };
+    return { ...w, sent, say, callId };
+  }
+
+  it('the constant: about a second and a half, a few short words to rotate', () => {
+    expect(HOLD_WORD_AFTER_MS).toBe(1_500);
+    expect(HOLD_WORDS.length).toBeGreaterThanOrEqual(3);
+    for (const w of HOLD_WORDS) expect(w.split(' ').length).toBeLessThanOrEqual(2);
+  });
+
+  it('a slow reply gets one, once; a filler that opens the reply after it is not said; the next turn takes the next word', async () => {
+    const { say, said } = await call([{ text: 'Sure! Friday morning is free. Would ten suit?', delayMs: 150 }, { text: 'Ten on Friday it is.', delayMs: 150 }]);
+    await say('Is Friday morning free?');
+    expect(said).toEqual([HOLD_WORDS[0], 'Friday morning is free.', 'Would ten suit?']);
+    await say('Yes, ten is good.', 9000);
+    expect(said).toEqual([HOLD_WORDS[0], 'Friday morning is free.', 'Would ten suit?', HOLD_WORDS[1], 'Ten on Friday it is.']);
+  });
+
+  it('a quick reply gets none', async () => {
+    const { say, said } = await call({ text: 'Friday morning is free.' });
+    await say('Is Friday morning free?');
+    expect(said).toEqual(['Friday morning is free.']);
+  });
+
+  it('none on the greeting: words said before it had played, or over it', async () => {
+    const early = await call({ text: 'Hi there, how can I help?', delayMs: 150 }, { greeted: false });
+    await early.say('Hello?', 500);
+    expect(early.said).toEqual(['Hi there, how can I help?']);
+    const over = await call({ text: 'Hi there, how can I help?', delayMs: 150 });
+    await over.say('Hello? Hello?', 2000);
+    expect(over.said).toEqual(['Hi there, how can I help?']);
+  });
+
+  it('none when a tool comes first (its own "one moment" covers the wait), and none after end_call', async () => {
+    const tool = await call([{ calls: [{ name: 'remember', input: { fact: 'Prefers mornings' } }] }, { text: 'Noted. Anything else?', delayMs: 150 }]);
+    await tool.say('Mornings suit me best.');
+    expect(tool.said).toEqual(['Noted.', 'Anything else?']);
+    const bye = await call([{ calls: [{ name: 'end_call', input: { goodbye: 'Bye, Jane!' } }] }, { text: 'Done.', delayMs: 150 }]);
+    await bye.say("That's all, thanks.");
+    expect(bye.said).toEqual(['(goodbye) Bye, Jane!']);
+  });
+
+  it('none once the caller speaks again, or after the call has ended', async () => {
+    const again = await call({ text: 'Friday is free.', delayMs: 150 });
+    await again.sessions.callEvent({ type: 'call.caller', callId: again.callId, text: 'Is Friday free?', startMs: 4000, endMs: 4900 });
+    await again.sessions.callEvent({ type: 'call.speech_started', callId: again.callId, atMs: 5000 });
+    await settled(again.sessions);
+    expect(again.said).toEqual(['Friday is free.']);
+    const gone = await call({ text: 'Friday is free.', delayMs: 150 });
+    await gone.sessions.callEvent({ type: 'call.caller', callId: gone.callId, text: 'Is Friday free?', startMs: 4000, endMs: 4900 });
+    await gone.sessions.callEvent({ type: 'call.ended', callId: gone.callId });
+    await settled(gone.sessions);
+    expect(gone.said).toEqual([]);
+  });
+
+  it('Speech: once a turn, before the reply has said anything, not its own words (the tool line may follow)', async () => {
+    const out: string[] = [];
+    const speech = new Speech(async (t) => void out.push(t));
+    speech.begin();
+    expect(speech.holdWord('Okay —')).toBe(true);
+    expect(speech.holdWord('Sure,')).toBe(false);
+    // Not the reply's words: what the caller heard of the reply, when they cut in, is the model's own.
+    expect(speech.reply).toEqual([]);
+    // A tool's line still follows it.
+    speech.hold('One moment, let me check.');
+    speech.begin(true);
+    expect(speech.holdWord('Sure,')).toBe(false);
+    speech.push('We have Friday free.');
+    speech.flush();
+    // A new turn: one again, and a filler that opens the reply after it is not said.
+    speech.begin();
+    expect(speech.holdWord('Mm, right.')).toBe(true);
+    speech.push('Sure! Ten it is.');
+    speech.flush();
+    // Nothing after the reply has begun.
+    speech.begin();
+    speech.push('Done.');
+    speech.flush();
+    expect(speech.holdWord('Okay —')).toBe(false);
+    await speech.done;
+    expect(out).toEqual(['Okay —', 'One moment, let me check.', 'We have Friday free.', 'Mm, right.', 'Ten it is.', 'Done.']);
   });
 });
 
