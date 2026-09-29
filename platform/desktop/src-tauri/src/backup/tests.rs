@@ -2557,3 +2557,75 @@ fn an_undo_keeps_a_redo_snapshot_so_work_done_since_the_restore_is_not_lost() {
     assert!(matches!(restore::apply_pending(&dst.0), ApplyOutcome::Applied(_)));
     assert_eq!(snapshot(&dst.0), after_work, "the redo brings back the work that the undo overwrote and removed");
 }
+
+// ---- a rollback that cannot finish says so ----------------------------------------------------------
+
+#[test]
+fn a_rollback_that_cannot_put_a_file_back_says_so_and_keeps_the_evidence() {
+    let src = TempDir::new("stuck-src");
+    realistic(&src.0, "A");
+    let out = TempDir::new("stuck-out");
+    let file = out.0.join("s.oaiybackup");
+    make(&src.0, &file);
+    let dst = TempDir::new("stuck-dst");
+    target(&dst.0);
+    // The person has their own version of two of the files the restore will replace first.
+    put(&dst.0, "bridge/ledger.jsonl", b"{\"mine\":\"ledger\"}\n");
+    put(&dst.0, "calendar/calendar.json", b"{\"appointments\":[{\"id\":\"mine\"}]}");
+    let staged = restore::stage(&dst.0, &file, PASS, &Ticks::all(), &options()).unwrap();
+    // The restore fails part-way, and at the rollback one file is locked.
+    restore::INJECT.with(|c| c.set(Some(Inject::FailBeforeInstall(3))));
+    restore::ROLLBACK_FAILS.with(|c| c.set(2));
+    let outcome = restore::apply_pending(&dst.0);
+    restore::INJECT.with(|c| c.set(None));
+    restore::ROLLBACK_FAILS.with(|c| c.set(0));
+    let ApplyOutcome::Failed(last) = outcome else { panic!("the restore should fail") };
+    let error = last.error.clone().unwrap();
+    assert!(!last.ok);
+    assert!(!error.contains("Everything it had changed was put back"), "it must not claim what is not true: {error}");
+    assert!(error.contains("could not be put back") && error.contains("Nothing was deleted") && error.contains("undo-"), "{error}");
+    // The record of the restore and its journal are kept as evidence, under other names.
+    let restore_dir = dst.0.join("restore");
+    assert!(!restore_dir.join("pending.json").exists() && restore_dir.join(format!("failed-{}.json", staged.id)).is_file());
+    let journal = fs::read_to_string(restore_dir.join(format!("apply-journal-{}.jsonl", staged.id))).unwrap();
+    let named: Vec<String> = journal.lines().filter_map(|l| serde_json::from_str::<serde_json::Value>(l).ok()).filter_map(|v| v["rel"].as_str().map(str::to_string)).collect();
+    assert!(named.iter().any(|rel| error.contains(rel.as_str())), "the message names a file of the journal: {error}");
+    // What was set aside is still there: the originals of the target are not lost.
+    let holding = restore_dir.join(format!("undo-{}", staged.id)).join("files");
+    let saved = snapshot_all(&holding);
+    assert_eq!(saved.get("calendar/calendar.json").map(|b| b.as_slice()), Some(&b"{\"appointments\":[{\"id\":\"mine\"}]}"[..]), "the original is still there: {saved:?}");
+    assert_eq!(saved.get("bridge/ledger.jsonl").map(|b| b.as_slice()), Some(&b"{\"mine\":\"ledger\"}\n"[..]));
+    assert!(error.contains("bridge/ledger.jsonl") && error.contains("calendar/calendar.json"), "{error}");
+    // Nothing is applied twice, and the failure is what the dashboard reads.
+    assert!(matches!(restore::apply_pending(&dst.0), ApplyOutcome::None));
+    let reported = restore::last_restore(&dst.0).unwrap();
+    assert!(!reported.ok && reported.error.as_deref().unwrap().contains("could not be put back"));
+}
+
+#[test]
+fn a_rollback_at_the_next_start_that_cannot_finish_says_so_too() {
+    let src = TempDir::new("stuck2-src");
+    realistic(&src.0, "A");
+    let out = TempDir::new("stuck2-out");
+    let file = out.0.join("s.oaiybackup");
+    make(&src.0, &file);
+    let dst = TempDir::new("stuck2-dst");
+    target(&dst.0);
+    put(&dst.0, "bridge/ledger.jsonl", b"{\"mine\":\"ledger\"}\n");
+    let staged = restore::stage(&dst.0, &file, PASS, &Ticks::all(), &options()).unwrap();
+    // The process dies part-way (nothing is rolled back), and at the next start a file is locked.
+    restore::INJECT.with(|c| c.set(Some(Inject::CrashBeforeInstall(3))));
+    assert!(matches!(restore::apply_pending(&dst.0), ApplyOutcome::None));
+    restore::INJECT.with(|c| c.set(None));
+    restore::ROLLBACK_FAILS.with(|c| c.set(1));
+    let outcome = restore::apply_pending(&dst.0);
+    restore::ROLLBACK_FAILS.with(|c| c.set(0));
+    let ApplyOutcome::Failed(last) = outcome else { panic!("the rollback should report that it could not finish") };
+    let error = last.error.clone().unwrap();
+    assert!(!last.ok && !error.to_lowercase().contains("everything it had changed was put back"), "{error}");
+    assert!(error.contains("could not be put back") && error.contains("interrupted part-way"), "{error}");
+    let restore_dir = dst.0.join("restore");
+    assert!(!restore_dir.join("pending.json").exists() && restore_dir.join(format!("failed-{}.json", staged.id)).is_file(), "the record is kept as evidence");
+    assert!(restore_dir.join(format!("apply-journal-{}.jsonl", staged.id)).is_file(), "and so is the journal");
+    assert!(matches!(restore::apply_pending(&dst.0), ApplyOutcome::None), "it is not tried again behind the person's back");
+}

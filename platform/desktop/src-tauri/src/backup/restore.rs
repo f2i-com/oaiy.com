@@ -877,25 +877,45 @@ fn native(rel: &str) -> PathBuf {
     rel.split('/').collect()
 }
 
+/// One rename of a rollback. A test can make the next few fail, as a file that is locked at that
+/// moment (a virus scanner, an indexer, the program itself) would.
+fn put_back(from: &Path, to: &Path) -> std::io::Result<()> {
+    #[cfg(test)]
+    if ROLLBACK_FAILS.with(|c| {
+        let left = c.get();
+        c.set(left.saturating_sub(1));
+        left > 0
+    }) {
+        return Err(std::io::Error::new(std::io::ErrorKind::PermissionDenied, "the file is locked"));
+    }
+    secret_file::rename_over(from, to)
+}
+
 /// Put back what the journal says was begun, newest first. Safe to run more than once, and after a crash at any point.
 ///
 /// Nothing is ever deleted here. What a step put in place goes back to where it came from first (for
 /// an undo, the staged file is the only copy of what the restore replaced), and then the file that
-/// was set aside goes back to its place.
-fn roll_back(data_dir: &Path, staged_root: &Path, holding: &Path, lines: &[JournalLine]) {
+/// was set aside goes back to its place. Returns the files that could not be put back, each with
+/// whether a file of the person's had been set aside for it (its original is then in the holding
+/// folder): the step is left as it is rather than risk overwriting the one copy there is.
+fn roll_back(data_dir: &Path, staged_root: &Path, holding: &Path, lines: &[JournalLine]) -> Vec<(String, bool)> {
+    let mut failed = Vec::new();
     for line in lines.iter().rev().filter(|l| l.op == "begin") {
         let target = data_dir.join(native(&line.rel));
         let kept = holding.join(native(&line.rel));
         let staged = staged_root.join(native(&line.rel));
         // Installed: the staged file is gone from its place and a plain file stands at the target.
-        if line.install && !staged.exists() && target.is_file() {
-            let _ = secret_file::rename_over(&target, &staged);
+        if line.install && !staged.exists() && target.is_file() && put_back(&target, &staged).is_err() {
+            failed.push((line.rel.clone(), line.had));
+            continue;
         }
         // The original is in the holding folder if it was set aside: it goes back over whatever is there now.
-        if line.had && kept.exists() {
-            let _ = secret_file::rename_over(&kept, &target);
+        if line.had && kept.exists() && put_back(&kept, &target).is_err() {
+            failed.push((line.rel.clone(), true));
         }
     }
+    failed.reverse();
+    failed
 }
 
 /// Where the files an apply replaces or takes away are kept: for a restore, and for an undo too, so
@@ -992,7 +1012,10 @@ pub fn apply_pending(data_dir: &Path) -> ApplyOutcome {
             let applied: Vec<(String, bool)> = lines.iter().filter(|l| l.op == "begin").map(|l| (l.rel.clone(), l.had)).collect();
             return finalize(data_dir, &marker, &applied);
         }
-        roll_back(data_dir, &staged_root, &holding, &lines);
+        let stuck = roll_back(data_dir, &staged_root, &holding, &lines);
+        if !stuck.is_empty() {
+            return conclude_stuck(data_dir, &marker, "The restore was interrupted part-way.", &stuck, &holding);
+        }
         let last = failed(&marker.id, &marker.kind, "The restore was interrupted part-way, so everything it had changed was put back.");
         return conclude_failed(data_dir, &marker, last);
     }
@@ -1004,11 +1027,38 @@ pub fn apply_pending(data_dir: &Path) -> ApplyOutcome {
         Err(why) if why == CRASH => ApplyOutcome::None,
         Err(why) => {
             let lines = read_journal(&journal_file);
-            roll_back(data_dir, &staged_root, &holding, &lines);
+            let stuck = roll_back(data_dir, &staged_root, &holding, &lines);
+            if !stuck.is_empty() {
+                return conclude_stuck(data_dir, &marker, &why, &stuck, &holding);
+            }
             let last = failed(&marker.id, &marker.kind, &format!("{why} Everything it had changed was put back."));
             conclude_failed(data_dir, &marker, last)
         }
     }
+}
+
+/// A rollback that could not put everything back: say which files, where their originals are, and
+/// keep the evidence (the record of the restore and its journal are kept under other names, and
+/// nothing that was set aside or staged is deleted), and never claim that all was put back.
+fn conclude_stuck(data_dir: &Path, marker: &Marker, why: &str, stuck: &[(String, bool)], holding: &Path) -> ApplyOutcome {
+    let dir = restore_dir(data_dir);
+    let list = stuck.iter().take(10).map(|(rel, _)| review::clip(rel, 120)).collect::<Vec<_>>().join(", ");
+    let more = if stuck.len() > 10 { format!(" and {} more", stuck.len() - 10) } else { String::new() };
+    let set_aside = stuck.iter().filter(|(_, had)| *had).count();
+    let mut message = format!("{why} Rolling it back did not finish: these files could not be put back: {list}{more}.");
+    if set_aside > 0 {
+        message.push_str(&format!(" Nothing was deleted: the original of {} of them is in {}.", if set_aside == stuck.len() { "each" } else { "some" }, holding.display()));
+    }
+    if set_aside < stuck.len() {
+        message.push_str(" Some of them were not there before, and the file from the backup is still in place.");
+    }
+    message.push_str(" Close whatever may be holding them (another program, a virus scanner) and copy them back by hand, or ask for help.");
+    let last = failed(&marker.id, &marker.kind, &message);
+    record_last(data_dir, &last);
+    let _ = std::fs::rename(marker_path(data_dir), dir.join(format!("failed-{}.json", marker.id)));
+    let _ = std::fs::rename(journal_path(data_dir), dir.join(format!("apply-journal-{}.jsonl", marker.id)));
+    log::error!("backup: a restore could not be rolled back completely: {} file(s), {} of them set aside in {}", stuck.len(), set_aside, holding.display());
+    ApplyOutcome::Failed(last)
 }
 
 fn conclude_failed(data_dir: &Path, marker: &Marker, last: LastRestore) -> ApplyOutcome {
@@ -1234,4 +1284,10 @@ pub(crate) fn record_agent_result(data_dir: &Path, id: &str, ok: bool, error: Op
         last.redo.push(format!("Restore again once the Agent is open: its conversations and projects could not be brought back ({}).", error.unwrap_or("no reason given")));
     }
     record_last(data_dir, &last);
+}
+
+#[cfg(test)]
+thread_local! {
+    /// How many of the next renames of a rollback fail, on this thread only.
+    pub(crate) static ROLLBACK_FAILS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
 }
