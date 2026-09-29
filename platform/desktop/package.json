@@ -8,13 +8,15 @@
   "scripts": {
     "dev": "vite",
     "build": "node scripts/sync-cli.mjs && tsc --noEmit && vite build",
+    "build:bundle": "npm run stage-pages && npm run build",
     "test": "vitest run",
     "test:unit": "vitest",
     "preview": "vite preview",
     "tauri": "tauri",
     "tauri:dev": "tauri dev --features gui",
     "tauri:build": "tauri build --features gui",
-    "sync-cli": "node scripts/sync-cli.mjs"
+    "sync-cli": "node scripts/sync-cli.mjs",
+    "stage-pages": "node scripts/stage-pages.mjs"
   },
   "dependencies": {
     "@tauri-apps/api": "^2.1.1",

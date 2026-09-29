@@ -108,19 +108,50 @@ fn dist<R: Runtime>(app: &AppHandle<R>, page: Page) -> Option<PathBuf> {
         Page::Flows => "OAIY_FLOWS_DIST",
         Page::Engines => return None,
     };
-    let mut candidates: Vec<PathBuf> = Vec::new();
-    if let Ok(dir) = std::env::var(var) {
-        candidates.push(PathBuf::from(dir));
-    }
-    if let Ok(dir) = app.path().resource_dir() {
-        candidates.push(dir.join(page.folder()));
-    }
-    let repo = Path::new(env!("CARGO_MANIFEST_DIR"));
-    candidates.push(match page {
+    let candidates = dist_candidates(
+        std::env::var(var).ok().map(PathBuf::from),
+        app.path().resource_dir().ok(),
+        Path::new(env!("CARGO_MANIFEST_DIR")),
+        page,
+        cfg!(debug_assertions),
+    );
+    with_start_document(candidates, page)
+}
+
+/// The folders a page's built files may be in, best first: the variable
+/// (`OAIY_APP_DIST`, `OAIY_FLOWS_DIST`), the bundle's copy, the pages' own build
+/// folders under the repository at `repo` (`platform/desktop/src-tauri`).
+///
+/// The bundle's copy is `<resource dir>/resources/<folder>`: tauri.conf.json
+/// lists `resources/app` and `resources/flows` (staged by
+/// `scripts/stage-pages.mjs`), and Tauri keeps the path of a resource, in the
+/// installed program's folder on Windows and in `/usr/lib/<name>` on Linux, and
+/// beside the program in `target/<profile>` for a build from the repository.
+///
+/// A debug build (`tauri dev`) is a developer's own, and takes the build folders
+/// they are working on before a copy an earlier staging left among the resources.
+fn dist_candidates(var: Option<PathBuf>, resource_dir: Option<PathBuf>, repo: &Path, page: Page, debug: bool) -> Vec<PathBuf> {
+    let built = match page {
         Page::Agent => repo.join("../../../app/dist"),
         Page::Flows => repo.join("../../ui/dist"),
-        Page::Engines => return None,
-    });
+        Page::Engines => return Vec::new(),
+    };
+    let bundled = resource_dir.map(|dir| dir.join("resources").join(page.folder()));
+    let mut candidates: Vec<PathBuf> = var.into_iter().collect();
+    if debug {
+        candidates.push(built);
+        candidates.extend(bundled);
+    } else {
+        candidates.extend(bundled);
+        candidates.push(built);
+    }
+    candidates
+}
+
+/// The first of the folders that holds the page's start document: an empty
+/// folder (`build.rs` makes `resources/app` and `resources/flows` for a build
+/// that stages no pages) is not the page, and does not hide one further on.
+fn with_start_document(candidates: Vec<PathBuf>, page: Page) -> Option<PathBuf> {
     candidates.into_iter().find(|d| d.join(page.start().trim_start_matches('/')).is_file())
 }
 
@@ -446,5 +477,144 @@ mod tests {
         assert_eq!(mime("/zipp/engine.wasm"), "application/wasm");
         assert_eq!(mime("/index.html"), "text/html; charset=utf-8");
         assert_eq!(mime("/assets/main.js"), "text/javascript; charset=utf-8");
+    }
+
+    /// A folder under the temp folder for one test, removed when it is dropped.
+    struct Scratch(PathBuf);
+
+    impl Scratch {
+        fn new(name: &str) -> Scratch {
+            let dir = std::env::temp_dir().join(format!("oaiy-embed-{name}-{}", std::process::id()));
+            let _ = std::fs::remove_dir_all(&dir);
+            std::fs::create_dir_all(&dir).expect("a scratch folder");
+            Scratch(dir)
+        }
+
+        fn path(&self, relative: &str) -> PathBuf {
+            self.0.join(relative)
+        }
+
+        fn folder(&self, relative: &str) -> PathBuf {
+            let dir = self.path(relative);
+            std::fs::create_dir_all(&dir).expect("a folder");
+            dir
+        }
+
+        fn file(&self, relative: &str) {
+            let file = self.path(relative);
+            std::fs::create_dir_all(file.parent().expect("a parent")).expect("a folder");
+            std::fs::write(file, "<!doctype html>").expect("a file");
+        }
+    }
+
+    impl Drop for Scratch {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    /// A stand-in for `platform/desktop/src-tauri` in a scratch folder, so the pages' build folders (`../../../app/dist`, `../../ui/dist`) exist to be found.
+    fn repo(scratch: &Scratch) -> PathBuf {
+        scratch.folder("repo/platform/desktop/src-tauri")
+    }
+
+    fn start_of(page: Page) -> &'static str {
+        page.start().trim_start_matches('/')
+    }
+
+    #[test]
+    fn the_bundle_lists_the_folders_the_pages_are_looked_for_in() {
+        // tauri.conf.json's `bundle.resources` is where the installer's pages come from: `resources/<folder>` for each page this desktop serves.
+        let config: serde_json::Value = serde_json::from_str(include_str!("../tauri.conf.json")).expect("tauri.conf.json is JSON");
+        let listed: Vec<&str> = config["bundle"]["resources"].as_array().expect("a list of resources").iter().filter_map(|r| r.as_str()).collect();
+        for page in Page::SERVED {
+            let entry = format!("resources/{}", page.folder());
+            assert!(listed.contains(&entry.as_str()), "bundle.resources lists {entry}, which the {} page is looked for in: {listed:?}", page.folder());
+        }
+    }
+
+    #[test]
+    fn a_page_in_the_bundle_is_found_where_tauri_puts_resources() {
+        let scratch = Scratch::new("bundle");
+        let install = scratch.folder("install");
+        let repo = repo(&scratch);
+        for page in Page::SERVED {
+            scratch.file(&format!("install/resources/{}/{}", page.folder(), start_of(page)));
+        }
+        for page in Page::SERVED {
+            let found = with_start_document(dist_candidates(None, Some(install.clone()), &repo, page, false), page);
+            assert_eq!(found, Some(install.join("resources").join(page.folder())), "the {} page", page.folder());
+        }
+    }
+
+    #[test]
+    fn a_folder_beside_the_resources_is_not_where_the_pages_are() {
+        // The folder among the resources (`<resource dir>/app`) is not what `resources/app` in tauri.conf.json makes: Tauri keeps the `resources/`.
+        let scratch = Scratch::new("flat");
+        let install = scratch.folder("install");
+        let repo = repo(&scratch);
+        for page in Page::SERVED {
+            scratch.file(&format!("install/{}/{}", page.folder(), start_of(page)));
+            assert_eq!(with_start_document(dist_candidates(None, Some(install.clone()), &repo, page, false), page), None);
+        }
+    }
+
+    #[test]
+    fn an_empty_folder_among_the_resources_does_not_hide_the_pages_build() {
+        // What `build.rs` leaves when nothing was staged: the folders, empty.
+        let scratch = Scratch::new("empty");
+        let install = scratch.folder("install");
+        let repo = repo(&scratch);
+        scratch.folder("install/resources/app");
+        scratch.folder("install/resources/flows");
+        scratch.file("repo/app/dist/index.html");
+        scratch.file("repo/platform/ui/dist/app.html");
+        for (page, built) in [(Page::Agent, "../../../app/dist"), (Page::Flows, "../../ui/dist")] {
+            for debug in [false, true] {
+                let found = with_start_document(dist_candidates(None, Some(install.clone()), &repo, page, debug), page);
+                assert_eq!(found, Some(repo.join(built)), "the {} page, debug {debug}", page.folder());
+            }
+        }
+    }
+
+    #[test]
+    fn an_installed_build_takes_the_bundle_and_a_debug_build_its_own_build_folders() {
+        let scratch = Scratch::new("order");
+        let install = scratch.folder("install");
+        let repo = repo(&scratch);
+        for page in Page::SERVED {
+            scratch.file(&format!("install/resources/{}/{}", page.folder(), start_of(page)));
+        }
+        scratch.file("repo/app/dist/index.html");
+        scratch.file("repo/platform/ui/dist/app.html");
+        for (page, built) in [(Page::Agent, "../../../app/dist"), (Page::Flows, "../../ui/dist")] {
+            let bundled = install.join("resources").join(page.folder());
+            assert_eq!(with_start_document(dist_candidates(None, Some(install.clone()), &repo, page, false), page), Some(bundled));
+            assert_eq!(with_start_document(dist_candidates(None, Some(install.clone()), &repo, page, true), page), Some(repo.join(built)));
+        }
+    }
+
+    #[test]
+    fn the_variable_comes_first_when_it_names_a_page() {
+        let scratch = Scratch::new("variable");
+        let install = scratch.folder("install");
+        let repo = repo(&scratch);
+        scratch.file("install/resources/app/index.html");
+        scratch.file("mine/index.html");
+        let mine = scratch.path("mine");
+        for debug in [false, true] {
+            let found = with_start_document(dist_candidates(Some(mine.clone()), Some(install.clone()), &repo, Page::Agent, debug), Page::Agent);
+            assert_eq!(found, Some(mine.clone()), "debug {debug}");
+        }
+        // A variable that names a folder without the page is passed over, not obeyed.
+        let nothing = scratch.folder("nothing");
+        let found = with_start_document(dist_candidates(Some(nothing), Some(install.clone()), &repo, Page::Agent, false), Page::Agent);
+        assert_eq!(found, Some(install.join("resources").join("app")));
+    }
+
+    #[test]
+    fn the_engines_page_has_no_files_of_ours() {
+        let scratch = Scratch::new("engines");
+        assert!(dist_candidates(None, Some(scratch.path("install")), &repo(&scratch), Page::Engines, false).is_empty());
     }
 }

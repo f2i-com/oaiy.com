@@ -71,6 +71,11 @@ yarn-error.log*
 # Staged at build time by desktop/scripts/sync-cli.mjs (mirrors cli/dist, which is also ignored).
 desktop/src-tauri/resources/cli/
 
+# Staged at build time by desktop/scripts/stage-pages.mjs: copies of the builds
+# of the Agent (app/dist) and the flow editor (ui/dist) for the installer.
+desktop/src-tauri/resources/app/
+desktop/src-tauri/resources/flows/
+
 # Scratch measurement/probe harnesses written at the repo root of ui/.
 # Real tooling lives in ui/tests/ or ui/scripts/, so anything loose here is
 # throwaway by definition.

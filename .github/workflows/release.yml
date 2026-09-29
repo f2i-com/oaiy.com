@@ -56,7 +56,8 @@
 # pair (platform/scripts/fetch-zipp-release.mjs); the verification gate is
 # handed the same pair. The web job re-verifies the engines against the
 # published release before packaging and records the engine the site ships
-# in its evidence.
+# in its evidence. (The Agent inside the desktop installer carries the ZIPP
+# release app/ pins, not this one, and the evidence does not record it.)
 
 name: Release
 
@@ -321,6 +322,33 @@ jobs:
         working-directory: platform/cli
         run: node test/cli-http-exit.mjs
 
+      # The installer carries the Agent and the flow editor too: tauri build
+      # stages their builds into src-tauri/resources first
+      # (platform/desktop/scripts/stage-pages.mjs, from beforeBuildCommand) and
+      # stops if either is missing or incomplete, so both are built here. The
+      # Agent's build:desktop also fetches the SoftN runtime its app preview
+      # needs. The flow editor is built standalone (no VITE_API_BASE): an
+      # installed app does not talk to a hosted sharing backend.
+      #
+      # The Agent pins its own ZIPP and SoftN (app/scripts/fetch-zipp.mjs and
+      # fetch-softn.mjs) and reads ZIPP_SUMS_SHA256 as a replacement for its pin,
+      # so the release's pair, set for the whole job, is cleared for it: checked
+      # against the digest of another ZIPP release, its own would be refused.
+      - name: Install and build the Agent
+        working-directory: app
+        env:
+          ZIPP_RELEASE: ''
+          ZIPP_SUMS_SHA256: ''
+        run: |
+          npm ci
+          npm run build:desktop
+
+      - name: Install and build the flow editor
+        working-directory: platform/ui
+        run: |
+          npm ci
+          npm run build
+
       - name: Install the desktop app's dependencies
         working-directory: platform/desktop
         run: npm ci
@@ -515,7 +543,8 @@ jobs:
           against that release's \`SHA256SUMS\`; \`release-evidence-web.json\` records its digests.
 
           **OAIY Desktop** — the tray app that manages local model servers, downloads, Python and
-          the browser sidecar for the web app.
+          the browser sidecar for the web app. It has the Agent and the flow editor inside; the
+          engines are not built here.
           - Windows: \`oaiy-desktop-$VERSION-windows-x64-setup.exe\` (installer) or the \`.msi\`
           - Linux: \`.AppImage\` (portable), \`.deb\` (Debian/Ubuntu) or \`.rpm\` (Fedora/RHEL)
 
