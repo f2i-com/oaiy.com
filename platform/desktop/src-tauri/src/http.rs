@@ -1057,7 +1057,10 @@ fn is_bridge_exec_path(path: &str) -> bool {
         || (path.starts_with("/api/plugins/")
             && (path.ends_with("/start")
                 || path.ends_with("/stop")
-                || path.ends_with("/enabled")))
+                || path.ends_with("/enabled")
+                // Letting a package nobody signed run is the person's decision, and
+                // only OAIY's own window (or a token holder) may make it for them.
+                || path.ends_with("/trust")))
 }
 
 /// The AI gateway surface: provider CRUD + credential admin AND the chat/models
@@ -1861,6 +1864,8 @@ mod tests {
             (Method::POST, "/api/plugins/aokie/start"),
             (Method::POST, "/api/plugins/aokie/stop"),
             (Method::POST, "/api/plugins/aokie/enabled"),
+            // Trusting a package nobody signed is a trust act, like approving a pairing.
+            (Method::POST, "/api/plugins/aokie/trust"),
             // Installing/removing native code is the most dangerous of the lot.
             (Method::POST, "/api/plugins/install"),
             (Method::DELETE, "/api/plugins/aokie"),

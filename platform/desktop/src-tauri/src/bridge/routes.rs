@@ -13,7 +13,8 @@
 //! | `POST /api/bridge/runs/:id/cancel` | request cancellation |
 //! | `GET  /api/bridge/deadletters` | events that produced no work |
 //! | `POST /api/bridge/deadletters/:id/redrive` | re-dispatch one |
-//! | `GET  /api/plugins` | installed plugins + state + reason |
+//! | `GET  /api/plugins` | installed plugins + state + reason + package trust |
+//! | `POST /api/plugins/:id/trust` | trust this exact unsigned package (privileged; takes only the id) |
 //! | `POST /api/bridge/connectors/:id/request` | gated connector command |
 //!
 //! # Status codes carry meaning here
@@ -1189,6 +1190,62 @@ async fn uninstall_plugin(State(st): State<BridgeState>, Path(id): Path<String>)
     }
 }
 
+/// `POST /api/plugins/:id/trust` — trust this exact, unsigned package. PRIVILEGED.
+///
+/// The one thing a person can do about a plugin a release build holds back because it
+/// has no signature. It takes the plugin's id and nothing else: the folder is the one the
+/// registry already holds for that id, and no path, URL or body from a caller is read,
+/// so it cannot be pointed at something the person did not install. What it records is a
+/// digest of every file in that folder (see `plugins::trust`): any change ends the trust.
+///
+/// A package that carries a signature is refused (409): it is verified or quarantined by
+/// that signature, and no click turns a failed one into a good one.
+async fn trust_plugin(State(st): State<BridgeState>, Path(id): Path<String>) -> axum::response::Response {
+    let (dir, trust) = {
+        let mut reg = match st.plugins.lock() {
+            Ok(r) => r,
+            Err(_) => {
+                return bridge_error(StatusCode::INTERNAL_SERVER_ERROR, "internal", "plugin registry lock poisoned".into())
+            }
+        };
+        reg.scan();
+        let Some(rec) = reg.get(&id) else {
+            return bridge_error(StatusCode::NOT_FOUND, "invalid_request", format!("no plugin named {id:?}"));
+        };
+        if rec.trust.is_none() {
+            // Its manifest could not be loaded, so there is no plugin to trust.
+            return bridge_error(
+                StatusCode::CONFLICT,
+                "invalid_request",
+                format!("{id} cannot be trusted: {}", rec.reason.clone().unwrap_or_else(|| "its manifest is invalid".into())),
+            );
+        }
+        (rec.dir.clone(), reg.trust())
+    };
+
+    // Reads and hashes every file of the package: off the async threads, and with no
+    // registry lock held.
+    let plugin_id = id.clone();
+    let trusted = tokio::task::spawn_blocking(move || trust.trust_local(&dir, &plugin_id)).await;
+    match trusted {
+        Ok(Ok(_)) => match st.plugins.lock() {
+            Ok(mut reg) => {
+                // Brought in now, not on the next poll: it can be started.
+                reg.scan();
+                crate::modules::refresh(&reg);
+                crate::modules::poke();
+                match reg.get(&id) {
+                    Some(rec) => (StatusCode::OK, Json(rec.clone())).into_response(),
+                    None => bridge_error(StatusCode::NOT_FOUND, "invalid_request", format!("no plugin named {id:?}")),
+                }
+            }
+            Err(_) => bridge_error(StatusCode::INTERNAL_SERVER_ERROR, "internal", "plugin registry lock poisoned".into()),
+        },
+        Ok(Err(e)) => bridge_error(StatusCode::CONFLICT, "invalid_request", e),
+        Err(e) => bridge_error(StatusCode::INTERNAL_SERVER_ERROR, "internal", e.to_string()),
+    }
+}
+
 // ------- plugin-contributed UI -------
 
 /// Content type for a plugin UI asset, by extension. Deliberately a small
@@ -1681,6 +1738,8 @@ pub fn router(state: BridgeState) -> Router {
         // native code the host will supervise.
         .route("/api/plugins/install", post(install_plugin))
         .route("/api/plugins/:id", axum::routing::delete(uninstall_plugin))
+        // Trust this exact unsigned package. Privileged, and takes only the id.
+        .route("/api/plugins/:id/trust", post(trust_plugin))
         // Service definitions a plugin contributes (its invocable action surface).
         .route("/api/services/definitions", get(list_service_definitions))
         .route(
@@ -2079,6 +2138,227 @@ mod tests {
                 started.elapsed()
             );
             saving.await.unwrap();
+        }
+    }
+
+    // --- trusting a package nobody signed ------------------------------------
+
+    mod trusting_a_plugin {
+        use super::super::*;
+        use crate::plugins::registry::PluginRegistry;
+        use crate::plugins::trust::tests::{fill, TestKey};
+        use crate::plugins::trust::{Publishers, TrustPolicy, TrustService};
+        use axum::body::Body;
+        use axum::http::{Method, Request};
+        use serde_json::Value;
+        use std::path::PathBuf;
+        use tower::ServiceExt as _;
+
+        struct Sandbox(PathBuf);
+        impl Sandbox {
+            fn new(tag: &str) -> Self {
+                use std::sync::atomic::{AtomicU32, Ordering};
+                static N: AtomicU32 = AtomicU32::new(0);
+                let n = N.fetch_add(1, Ordering::Relaxed);
+                let p = std::env::temp_dir().join(format!("oaiy-routes-trust-{tag}-{}-{n}", std::process::id()));
+                let _ = std::fs::remove_dir_all(&p);
+                std::fs::create_dir_all(&p).unwrap();
+                Self(p)
+            }
+        }
+        impl Drop for Sandbox {
+            fn drop(&mut self) {
+                let _ = std::fs::remove_dir_all(&self.0);
+            }
+        }
+
+        /// The bridge over a registry that holds a release build's rules. The host does not
+        /// start plugins at boot (as `build_bridge_state`'s would), so a plugin the test puts
+        /// on disk is started by the test and by nothing else.
+        fn release_state(tag: &str, publishers: Publishers) -> (Sandbox, BridgeState) {
+            let sb = Sandbox::new(tag);
+            let root = sb.0.join("plugins");
+            std::fs::create_dir_all(&root).unwrap();
+            let trust = TrustService::new(TrustPolicy::release(), publishers, root.join("trusted-plugins.json"));
+            let plugins: PluginRegistryHandle = std::sync::Arc::new(std::sync::Mutex::new(PluginRegistry::with_trust(root, trust)));
+            let ledger = crate::bridge::ledger::new_handle();
+            let dead = crate::bridge::deadletters::open_handle(sb.0.join("deadletters.jsonl"));
+            let triggers: crate::plugins::TriggerStoreHandle =
+                std::sync::Arc::new(std::sync::Mutex::new(crate::plugins::TriggerStore::load(sb.0.join("triggers.json"))));
+            let host = crate::plugins::PluginHost::assemble(plugins.clone(), ledger.clone(), triggers, dead.clone(), "0.0.0-test".into(), true);
+            let st = BridgeState {
+                ledger,
+                dead,
+                plugins,
+                host,
+                flows: std::sync::Arc::new(crate::bridge::worker::FlowStore::new(sb.0.join("flows"))),
+                pairing: crate::bridge::pairing::open_handle(sb.0.join("pairings.json")),
+                device_id: "device".into(),
+                node: None,
+            };
+            (sb, st)
+        }
+
+        /// An unsigned plugin the demo fixtures make, under `plugins/<id>`, with the id in its manifest.
+        fn unsigned_plugin(sb: &Sandbox, id: &str) -> PathBuf {
+            let dir = sb.0.join("plugins").join(id);
+            std::fs::create_dir_all(&dir).unwrap();
+            fill(&dir);
+            let manifest = std::fs::read_to_string(dir.join("manifest.json")).unwrap().replace("\"id\":\"demo\"", &format!("\"id\":\"{id}\""));
+            std::fs::write(dir.join("manifest.json"), manifest).unwrap();
+            dir
+        }
+
+        async fn read(response: axum::response::Response) -> (StatusCode, Value) {
+            let status = response.status();
+            let bytes = axum::body::to_bytes(response.into_body(), 1 << 20).await.unwrap();
+            (status, serde_json::from_slice(&bytes).unwrap_or(Value::Null))
+        }
+
+        fn trust_of(st: &BridgeState, id: &str) -> Option<crate::plugins::TrustState> {
+            let mut reg = st.plugins.lock().unwrap();
+            reg.scan();
+            reg.get(id).and_then(|r| r.trust.as_ref().map(|t| t.state))
+        }
+
+        #[tokio::test]
+        async fn trusting_an_unsigned_plugin_lets_it_be_started_and_answers_with_the_record() {
+            let (sb, st) = release_state("trust-ok", Publishers::default());
+            unsigned_plugin(&sb, "demo");
+            assert_eq!(trust_of(&st, "demo"), Some(crate::plugins::TrustState::Unsigned));
+            assert!(st.host.start("demo").unwrap_err().contains("Not signed"), "held back until trusted");
+
+            let (status, body) = read(trust_plugin(State(st.clone()), Path("demo".into())).await).await;
+            assert_eq!(status, StatusCode::OK, "{body}");
+            assert_eq!(body["trust"]["state"], "trusted-local");
+            assert_eq!(body["state"], "installed", "brought in now: it can be started");
+            assert_eq!(body["manifest"]["id"], "demo");
+            assert_eq!(trust_of(&st, "demo"), Some(crate::plugins::TrustState::TrustedLocal));
+            // Started, it is past the trust check (the stub cannot run, so it is the launch that fails).
+            let err = st.host.start("demo").unwrap_err();
+            assert!(!err.contains("Not signed") && !err.contains("was not started"), "{err}");
+        }
+
+        #[tokio::test]
+        async fn an_unknown_signed_or_broken_plugin_cannot_be_trusted() {
+            let (sb, st) = release_state("trust-refused", Publishers::default());
+            // Nothing by that name.
+            let (status, _) = read(trust_plugin(State(st.clone()), Path("ghost".into())).await).await;
+            assert_eq!(status, StatusCode::NOT_FOUND);
+            // A path in the id's place is just an id nobody has.
+            for id in ["..", "../demo", "C:\\plugins\\demo", "demo/../demo"] {
+                let (status, _) = read(trust_plugin(State(st.clone()), Path(id.into())).await).await;
+                assert_eq!(status, StatusCode::NOT_FOUND, "{id}");
+            }
+            // One that carries a signature is judged by it.
+            let dir = unsigned_plugin(&sb, "signed");
+            TestKey::generate("k").sign(&dir, "signed-plugin", "1.0.0");
+            let (status, body) = read(trust_plugin(State(st.clone()), Path("signed".into())).await).await;
+            assert_eq!(status, StatusCode::CONFLICT, "{body}");
+            assert!(body["error"]["message"].as_str().unwrap().contains("cannot be trusted by hand"), "{body}");
+            assert_eq!(trust_of(&st, "signed"), Some(crate::plugins::TrustState::Quarantined));
+            // One with a manifest that does not load has no plugin to trust.
+            let broken = sb.0.join("plugins").join("broken");
+            std::fs::create_dir_all(&broken).unwrap();
+            std::fs::write(broken.join("manifest.json"), b"{ not json").unwrap();
+            let (status, body) = read(trust_plugin(State(st.clone()), Path("broken".into())).await).await;
+            assert_eq!(status, StatusCode::CONFLICT, "{body}");
+        }
+
+        async fn send(app: &Router, path: &str, headers: &[(&str, &str)], body: Option<Value>) -> (StatusCode, Value) {
+            let mut req = Request::builder().method(Method::POST).uri(path);
+            for (k, v) in headers {
+                req = req.header(*k, *v);
+            }
+            if body.is_some() {
+                req = req.header("content-type", "application/json");
+            }
+            read(app.clone().oneshot(req.body(body.map_or_else(Body::empty, |b| Body::from(b.to_string()))).unwrap()).await.unwrap()).await
+        }
+
+        #[tokio::test]
+        async fn the_route_is_closed_to_a_stranger_and_open_to_the_token_and_the_window() {
+            let (sb, st) = release_state("trust-gate", Publishers::default());
+            unsigned_plugin(&sb, "demo");
+
+            // A headless server: the token or nothing.
+            let headless = crate::http::guarded_for_tests(router(st.clone()), Some("desk-token".into()), false);
+            for headers in [vec![], vec![("Authorization", "Bearer wrong")], vec![("Origin", "tauri://localhost")]] {
+                let (status, _) = send(&headless, "/api/plugins/demo/trust", &headers, None).await;
+                assert_eq!(status, StatusCode::FORBIDDEN, "{headers:?}");
+            }
+            assert_eq!(trust_of(&st, "demo"), Some(crate::plugins::TrustState::Unsigned), "nothing was trusted");
+
+            // The desktop's window: its own origin, and not a web page or a caller with no origin.
+            let gui = crate::http::guarded_for_tests(router(st.clone()), None, true);
+            for headers in [vec![("Origin", "https://evil.example")], vec![("Origin", "null")], vec![]] {
+                let (status, _) = send(&gui, "/api/plugins/demo/trust", &headers, None).await;
+                assert_eq!(status, StatusCode::FORBIDDEN, "{headers:?}");
+            }
+            assert_eq!(trust_of(&st, "demo"), Some(crate::plugins::TrustState::Unsigned));
+
+            let (status, body) = send(&gui, "/api/plugins/demo/trust", &[("Origin", "tauri://localhost")], None).await;
+            assert_eq!((status, body["trust"]["state"].as_str()), (StatusCode::OK, Some("trusted-local")), "{body}");
+        }
+
+        #[tokio::test]
+        async fn the_route_reads_no_path_or_url_from_the_caller() {
+            // Two unsigned plugins; the caller names one in the URL and tries to smuggle
+            // the other, and a folder of its own, in the body. Only the named plugin's
+            // own folder is ever looked at.
+            let (sb, st) = release_state("trust-id-only", Publishers::default());
+            unsigned_plugin(&sb, "demo");
+            let other = unsigned_plugin(&sb, "other");
+            let elsewhere = sb.0.join("elsewhere");
+            std::fs::create_dir_all(&elsewhere).unwrap();
+            fill(&elsewhere);
+
+            let app = crate::http::guarded_for_tests(router(st.clone()), Some("desk-token".into()), false);
+            let body = json!({
+                "id": "other", "dir": other.display().to_string(), "path": elsewhere.display().to_string(),
+                "source": "https://example.com/plugin.zip", "url": "https://example.com/plugin.zip", "digest": "sha256:00",
+            });
+            let (status, reply) = send(&app, "/api/plugins/demo/trust", &[("Authorization", "Bearer desk-token")], Some(body)).await;
+            assert_eq!(status, StatusCode::OK, "{reply}");
+            assert_eq!(reply["id"], "demo");
+            assert_eq!(trust_of(&st, "demo"), Some(crate::plugins::TrustState::TrustedLocal));
+            assert_eq!(trust_of(&st, "other"), Some(crate::plugins::TrustState::Unsigned), "the id in the body was not read");
+            let trusted = std::fs::read_to_string(sb.0.join("plugins").join("trusted-plugins.json")).unwrap();
+            assert!(trusted.contains("\"demo\"") && !trusted.contains("\"other\"") && !trusted.contains("elsewhere"), "{trusted}");
+        }
+
+        #[tokio::test]
+        async fn uninstalling_a_plugin_takes_the_persons_trust_with_it() {
+            let (sb, st) = release_state("trust-uninstall", Publishers::default());
+            unsigned_plugin(&sb, "demo");
+            read(trust_plugin(State(st.clone()), Path("demo".into())).await).await;
+            assert_eq!(trust_of(&st, "demo"), Some(crate::plugins::TrustState::TrustedLocal));
+
+            let response = uninstall_plugin(State(st.clone()), Path("demo".into())).await;
+            assert_eq!(response.status(), StatusCode::NO_CONTENT);
+            // The same bytes installed again are a new decision.
+            unsigned_plugin(&sb, "demo");
+            assert_eq!(trust_of(&st, "demo"), Some(crate::plugins::TrustState::Unsigned));
+        }
+
+        #[tokio::test]
+        async fn the_listing_carries_each_plugins_trust() {
+            let key = TestKey::generate("fl-test-2026a");
+            let (sb, st) = release_state("trust-list", key.pinned_for("Demo Co", &["demo"]));
+            let dir = unsigned_plugin(&sb, "demo");
+            key.sign(&dir, "demo-plugin", "1.0.0");
+            unsigned_plugin(&sb, "loose");
+
+            let (status, body) = read(list_plugins(State(st.clone())).await).await;
+            assert_eq!(status, StatusCode::OK);
+            let plugins = body["plugins"].as_array().unwrap();
+            let by_id = |id: &str| plugins.iter().find(|p| p["id"] == id).unwrap().clone();
+            assert_eq!(by_id("demo")["trust"]["state"], "verified");
+            assert_eq!(by_id("demo")["trust"]["publisher"], "Demo Co");
+            assert_eq!(by_id("loose")["trust"]["state"], "unsigned");
+            assert!(by_id("loose")["trust"]["reason"].as_str().unwrap().contains("trust this exact package"));
+            assert_eq!(by_id("loose")["state"], "disabled");
+            assert!(by_id("loose").get("manifest").is_none(), "a held-back plugin offers no manifest to build on");
         }
     }
 }
