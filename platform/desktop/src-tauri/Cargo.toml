@@ -26,6 +26,7 @@ gui = [
     "dep:tauri-plugin-notification",
     "dep:tauri-plugin-single-instance",
     "dep:tauri-plugin-updater",
+    "dep:reqwest13",
     "dep:oaiy-studio",
     "dep:tauri-build",
 ]
@@ -58,6 +59,10 @@ tauri-plugin-single-instance = { version = "2", optional = true }
 # against the public key in tauri.conf.json). Only its Rust API is used: no webview is given its
 # commands.
 tauri-plugin-updater = { version = "2", optional = true }
+# The updater plugin's own HTTP client is reqwest 0.13 (the desktop's is 0.12, below): its ClientBuilder is what
+# `configure_client` hands over, and the redirect policy for the plugin's reads (https only, few) is made with this one. It adds no
+# feature of its own: the client is the plugin's.
+reqwest13 = { package = "reqwest", version = "0.13", default-features = false, optional = true }
 # The engines (language models, media), run by the desktop: std-only, no CUDA to build.
 oaiy-studio = { path = "../../../crates/oaiy-studio", optional = true }
 serde = { version = "1.0", features = ["derive"] }
@@ -156,3 +161,8 @@ windows-sys = { version = "0.61", features = [
     "Win32_System_JobObjects",
     "Win32_System_Threading",
 ] }
+
+[dev-dependencies]
+# The tests of the updater's redirect policy build a reqwest 0.13 client, which needs the TLS provider the updater plugin installs for
+# itself when it runs; the tests install the same one (already in the tree: the plugin's own).
+rustls = { version = "0.23", default-features = false, features = ["ring"] }

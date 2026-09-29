@@ -98,6 +98,34 @@ fn updater_config(app: &AppHandle) -> (String, bool) {
     (pubkey, require)
 }
 
+/// The most redirects the plugin's own reads follow. GitHub sends a release asset through two.
+const MAX_REDIRECTS: usize = 5;
+
+/// Whether the plugin's client may follow a redirect to `target` after `followed` others: only to https, and only so far. (The core's
+/// own read of the feed says the same: `update::check`.) A feed that sends the plugin to plain http, or round for ever, is trying to move
+/// its read to where it can be watched or changed.
+fn redirect_allowed(target: &str, followed: usize) -> Result<(), String> {
+    if followed >= MAX_REDIRECTS {
+        return Err(format!("more than {MAX_REDIRECTS} redirects"));
+    }
+    match url::Url::parse(target) {
+        Ok(url) if url.scheme() == "https" => Ok(()),
+        _ => Err("a redirect to an address that is not https".to_string()),
+    }
+}
+
+/// The plugin's HTTP client (the one `configure_client` hands over): redirects only to https, and only a few.
+///
+/// The plugin's read of the feed and of the installer use this client. What it cannot cap is the size of the feed it reads (the plugin
+/// offers no way to), so that read is bounded in time only (see `prepare`); the core's own read counts every byte of the feed, and the
+/// installer's size is capped as it arrives (`download`).
+fn https_redirects_only(builder: reqwest13::ClientBuilder) -> reqwest13::ClientBuilder {
+    builder.redirect(reqwest13::redirect::Policy::custom(|attempt| match redirect_allowed(attempt.url().as_str(), attempt.previous().len()) {
+        Ok(()) => attempt.follow(),
+        Err(why) => attempt.error(why),
+    }))
+}
+
 /// What this build can do about an update, and how it gets ready for one.
 pub struct GuiPlatform {
     app: AppHandle,
@@ -129,6 +157,10 @@ impl Platform for GuiPlatform {
             // it must still have its tray icon and its window. (After a good hand-off the process ends at once, and Windows
             // drops the icon the next time the mouse passes over it.)
             let mut builder = self.app.updater_builder().timeout(Duration::from_secs(20)).on_before_exit(|| {});
+            // Redirects only to https and only a few (a debug build reading a stub feed over http is not held to it, as the core's read is not).
+            if self.strict_assets {
+                builder = builder.configure_client(https_redirects_only);
+            }
             if let Some(url) = &self.feed_override {
                 let url = url.parse().map_err(|_| "The update address is not a web address.".to_string())?;
                 builder = builder.endpoints(vec![url]).map_err(|e| explain(&e))?;
@@ -523,6 +555,66 @@ mod tests {
         let rest = &src[start..];
         let end = rest.find("\n}\n").expect("the command ends");
         rest[..end].to_string()
+    }
+
+    #[test]
+    fn a_redirect_is_followed_only_to_https_and_only_so_far() {
+        // GitHub sends a release asset through two; a chain that goes on further than a few is not one.
+        assert!((2..=10).contains(&MAX_REDIRECTS), "{MAX_REDIRECTS}");
+        for (target, followed) in [("https://objects.githubusercontent.com/x", 0), ("https://release-assets.githubusercontent.com/x?y=1", 2), ("https://github.com/x", MAX_REDIRECTS - 1)] {
+            assert_eq!(redirect_allowed(target, followed), Ok(()), "{target} after {followed}");
+        }
+        assert!(redirect_allowed("https://github.com/x", MAX_REDIRECTS).unwrap_err().contains("redirects"));
+        for bad in ["http://github.com/x", "HTTP://github.com/x", "ftp://x/y", "file:///c:/x", "data:text/plain,hi", "not a url", "//evil.example/x", ""] {
+            assert!(redirect_allowed(bad, 0).is_err(), "{bad:?}");
+        }
+    }
+
+    /// A stand-in server on a port of its own that answers every request with a redirect to `location`.
+    fn redirecting_to(location: String) -> String {
+        use std::io::{Read, Write};
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let url = format!("http://{}/", listener.local_addr().unwrap());
+        std::thread::spawn(move || {
+            for stream in listener.incoming() {
+                let Ok(mut stream) = stream else { continue };
+                let mut buffer = [0u8; 2048];
+                let _ = stream.read(&mut buffer);
+                let _ = write!(stream, "HTTP/1.1 302 Found\r\nLocation: {location}\r\nContent-Length: 0\r\nConnection: close\r\n\r\n");
+            }
+        });
+        url
+    }
+
+    #[tokio::test]
+    async fn the_plugins_client_refuses_a_redirect_to_plain_http_and_follows_one_to_https() {
+        // The provider the updater plugin installs for itself before it builds a client (the client cannot be built without one).
+        let _ = rustls::crypto::ring::default_provider().install_default();
+        let client = https_redirects_only(reqwest13::Client::builder().timeout(Duration::from_secs(5))).build().unwrap();
+        // Sent on to plain http: refused as a redirect, and what is at the other end is never asked.
+        let http = redirecting_to("http://127.0.0.1:1/never".to_string());
+        let error = client.get(&http).send().await.unwrap_err();
+        assert!(error.is_redirect(), "{error}");
+        // Sent on to https: followed (nothing listens there, so it ends in a connection error, not a refused redirect).
+        let https = redirecting_to("https://127.0.0.1:1/never".to_string());
+        let error = client.get(&https).send().await.unwrap_err();
+        assert!(!error.is_redirect(), "the redirect to https was refused: {error}");
+        // Without the policy the same redirect to plain http is followed (what the default client does): the test tells the two apart.
+        let plain = reqwest13::Client::builder().timeout(Duration::from_secs(5)).build().unwrap();
+        let error = plain.get(&http).send().await.unwrap_err();
+        assert!(!error.is_redirect(), "{error}");
+    }
+
+    #[test]
+    fn the_plugins_reads_use_that_client_whenever_the_feed_is_the_real_one() {
+        let src = this_file();
+        let prepare = &src[src.find("fn prepare<'a>(").expect("prepare")..];
+        let prepare = &prepare[..prepare.find("\n    }\n").expect("prepare ends")];
+        let flat = prepare.split_whitespace().collect::<Vec<_>>().join(" ");
+        assert!(
+            flat.contains("if self.strict_assets { builder = builder.configure_client(https_redirects_only); }"),
+            "prepare no longer gives the plugin the https-only client, only when the feed is the real one (a debug stub over http is not held to it)"
+        );
     }
 
     #[test]

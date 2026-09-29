@@ -171,6 +171,14 @@ the installer it starts would inherit that and be killed with it.
   sends the request through two); every field checked; a version that is lower or equal is
   never an update, and neither is one that is not a version. A platform the feed has nothing
   for is "no update for this platform", not an error.
+- **The updater plugin's own reads.** The plugin reads the feed a second time, and downloads the
+  installer, with a client of its own. It follows redirects by the same rule as OAIY's own read
+  (only to https, at most five: OAIY gives the plugin's client that policy). What it cannot be
+  given is the byte cap: the plugin offers no way to cap the size of the feed it reads, so that
+  read is bounded in time (20 seconds) and not in size, while OAIY's own read counts every byte
+  of the feed; the installer is capped at 1 GiB as it arrives, and its signature is checked
+  whatever the feed says. (A development build reading a stub feed over http is not held to the
+  https rule, as OAIY's own read is not.)
 - **Who may ask.** Installing, downloading and checking are commands of the dashboard's own
   window (its webview is labelled `main`), and nothing else. The Agent, the flow editor and
   the engines' page are webviews of the same window and are refused; a web page is not a
