@@ -17,18 +17,22 @@ Environment=OAIY_DATA_DIR=/var/lib/oaiy
 Environment=OAIY_MODELS_DIR=/var/lib/oaiy/models
 # Bind port (loopback only). Front with nginx/Caddy + TLS if exposed.
 Environment=OAIY_SERVER_PORT=17972
-# Set a long random token to allow privileged admin calls (define service /
-# install python / create venv) from the CLI: Authorization: Bearer <token>.
-# Leave empty to keep privileged routes closed to non-browser callers.
+# The bearer token every request except health, capability discovery and the
+# pairing bootstrap must present (Authorization: Bearer <token>): the CLI and
+# anything else that manages this server. Set a long random one.
+# Left empty, the server answers ONLY those three public routes; everything
+# else, reads included, gets 403. (Binding wider than loopback refuses to start
+# with none.)
 Environment=OAIY_SERVER_TOKEN=
-# Optional: HuggingFace token for gated model downloads.
+# Optional: HuggingFace token for the server's own gated model downloads. It is
+# not passed on to the services and installers the server starts.
 # Environment=OAIY_HF_TOKEN=
 
 ExecStart=/usr/local/bin/oaiy-server
 Restart=on-failure
 RestartSec=3
 
-# oaiy-server stops every managed service on SIGTERM before exiting.
+# oaiy-server stops its plugins and every managed service on SIGTERM before exiting.
 KillSignal=SIGTERM
 TimeoutStopSec=30
 

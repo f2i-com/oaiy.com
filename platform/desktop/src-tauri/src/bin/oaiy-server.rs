@@ -5,8 +5,8 @@
 //! Linux box (or any server) driven by a CO-LOCATED Node CLI / oaiy-web. The API
 //! binds 127.0.0.1 by default; OAIY_SERVER_BIND=lan binds every interface for the
 //! case this exists to serve — editing from a phone on the same network. Prefer an
-//! SSH tunnel or an authenticating reverse proxy for anything beyond a trusted LAN,
-//! and set OAIY_SERVER_TOKEN whenever you bind wider than loopback.
+//! SSH tunnel or an authenticating reverse proxy for anything beyond a trusted LAN.
+//! OAIY_SERVER_BIND=lan refuses to start without OAIY_SERVER_TOKEN.
 //!
 //! Configuration is by environment variable instead of the GUI's pointer file:
 //!   OAIY_DATA_DIR        data root (databases, venvs, templates)  [~/.oaiy-server]
@@ -14,23 +14,31 @@
 //!   OAIY_EXTRA_MODEL_DIRS extra read-only model roots (`:`/`;`-separated)
 //!   OAIY_SERVER_PORT     listen port                              [17972]
 //!   OAIY_SERVER_BIND     `lan` binds 0.0.0.0 instead of loopback  [loopback]
-//!   OAIY_SERVER_TOKEN    bearer token gating privileged routes    [none]
-//!   OAIY_HF_TOKEN        HuggingFace token for gated downloads    [none]
+//!   OAIY_SERVER_TOKEN    the bearer every request but health, capability
+//!                       discovery and pairing must present       [none]
+//!   OAIY_HF_TOKEN        HuggingFace token for this server's own gated
+//!                       downloads (not passed on to services)    [none]
 //!   OAIY_ENGINES_UI      the engines' control pages, when oaiy-studio runs beside
-//!                       this server (e.g. http://127.0.0.1:7860): /api/engines*
-//!                       reads and relays them                   [none]
+//!                       this server (e.g. http://127.0.0.1:7860): /api/engines*,
+//!                       the AI gateway's engine provider and the control API's
+//!                       engine tools read and relay them          [none]
 //!   OAIY_VOICE_GATEWAY   `off`: do not serve the voice gateway (17872), for a server
 //!                       tried beside the desktop, whose calls use it [on]
 //!   OAIY_PLUGIN_SOURCES  a folder of plugin folders the setup wizard's catalog
 //!                       offers to install from (<dir>/<plugin id>) [none]
 //!
-//! With no OAIY_SERVER_TOKEN set, privileged routes (define service / install
-//! python / create venv / delete) are CLOSED: a headless server has no real
+//! Every request but a few needs the bearer token: a headless server has no real
 //! webview origin, and any local process can forge the `Origin` header, so the
-//! bearer token is the only credential trusted off the GUI. Set a token to
-//! administer the server — the CLI sends `Authorization: Bearer <token>`.
-//! (Non-privileged ops, e.g. starting an already-defined service, stay reachable
-//! on loopback.)
+//! token is the only credential trusted off the GUI. Public without one are only
+//! the health route (`/api/health`), capability discovery
+//! (`/api/bridge/capabilities`) and the pairing bootstrap (`/api/bridge/pairing`).
+//! With no OAIY_SERVER_TOKEN set that is ALL the server answers: everything else,
+//! reads included, gets 403. Set a token to administer the server — the CLI sends
+//! `Authorization: Bearer <token>`. (A token that pairing minted, or the one this
+//! process hands the flow runs it starts, is accepted too; approving a pairing
+//! needs a bearer to begin with.)
+//!
+//! SIGTERM / Ctrl-C stops the plugins and every managed service before exiting.
 
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex, OnceLock};
