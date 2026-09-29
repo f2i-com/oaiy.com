@@ -186,6 +186,26 @@ async function seed(page) {
       { role: 'assistant', text: '## Weather summary\n\nThe **warmest** city is Cairo at `31 °C`, and the mean across the five cities is **19.8 °C**.\n\n| City | °C |\n|---|---:|\n| Cairo | 31 |\n| Rome | 24 |\n| Paris | 18 |\n| Lima | 17 |\n| Oslo | 9 |\n\nIt is saved in `report.md`. To work it out again:\n\n```python\nimport statistics\n\ntemps = [18, 24, 9, 31, 17]\nprint(statistics.mean(temps))  # 19.8\n```\n\n1. Oslo is the coldest, at 9 °C\n2. Two cities are above the mean', calls: [] },
     ]);
 
+    // A long conversation (older turns are drawn a page at a time as it is scrolled).
+    const longMeta = await P.createProject('Long chat');
+    const long = await P.OpenProject.open(longMeta);
+    long.vfs.writeFile('/notes.md', '# Notes\n', { parents: true });
+    await long.flush();
+    // Seven turns an exchange (two messages of the person's, two steps with a tool each, a reply): the chat's pages
+    // (60 turns, from a message of the person's) then begin at the second message, so each page's edge falls
+    // between two of the person's messages, which must stay one run under one header.
+    const turns = [];
+    for (let i = 1; i <= 30; i++) {
+      turns.push({ role: 'user', text: `Request ${i}: add line ${i} to notes.md` });
+      turns.push({ role: 'user', text: `And read it back, please (${i}).` });
+      turns.push({ role: 'assistant', text: '', calls: [{ id: `a${i}`, name: 'append_file', input: { path: 'notes.md', content: `line ${i}\n` } }] });
+      turns.push({ role: 'tool', results: [{ id: `a${i}`, name: 'append_file', content: 'Appended.', isError: false }] });
+      turns.push({ role: 'assistant', text: '', calls: [{ id: `b${i}`, name: 'read_file', input: { path: 'notes.md' } }] });
+      turns.push({ role: 'tool', results: [{ id: `b${i}`, name: 'read_file', content: `line ${i}`, isError: false }] });
+      turns.push({ role: 'assistant', text: `Added line ${i}.`, calls: [] });
+    }
+    await long.saveChat(turns);
+
     // The Front desk: its knowledge, the runner's (empty) chat, and the phone's conversations.
     const desk = await P.OpenProject.openFrontDesk();
     desk.vfs.writeFile('/knowledge/services.md', '# Services\n\n- Lawn mowing, from $45\n- Hedge trimming, from $60\n- Garden clean-ups, quoted on site\n', { parents: true });
@@ -276,7 +296,7 @@ async function seed(page) {
     await ST.saveMessages({ ...ST.DEFAULT_MESSAGE_SETTINGS, calls: true });
     await ST.saveDesktop({ origin: desktopUrl, token: 'shots' });
     await ST.saveLastProject('front-desk');
-    return { project: meta.id };
+    return { project: meta.id, long: longMeta.id };
   }, modelUrl, desktopUrl);
 }
 
@@ -326,7 +346,7 @@ try {
   page.on('pageerror', (e) => console.log('  [pageerror]', e.message));
   page.on('dialog', (d) => d.accept());
   await page.setViewport({ width: SIZES[0][0], height: SIZES[0][1] });
-  const { project } = await seed(page);
+  const { project, long } = await seed(page);
   // OAIY's window: the desktop is given, and it says the theme.
   await page.evaluateOnNewDocument((origin) => {
     window.__OAIY_DESKTOP__ = { origin, token: 'shots' };
@@ -555,6 +575,34 @@ try {
   }
   // A narrow window: one pane at a time.
   await shoot(page, 'narrow', { sizes: [[760, 688]], before: async () => page.evaluate(() => document.querySelector('nav.tabs button[data-view="agent"]')?.click()) });
+
+  // A long conversation: its older turns come a page at a time as it is scrolled, each speaker's run going on across the pages.
+  if (!only || only.includes('long')) {
+    await page.setViewport({ width: 1440, height: 900 });
+    await verify('a long conversation draws its older turns as it is scrolled, one run per speaker across the pages', async () => {
+      const errors = [];
+      const onError = (e) => errors.push(e.message);
+      page.on('pageerror', onError);
+      await page.select('.project-select', long);
+      await page.waitForFunction(() => document.querySelector('.chat-log')?.textContent.includes('Added line 30.'), { timeout: 20_000 });
+      for (let i = 0; i < 20 && (await page.$('.chat-log .show-earlier')); i++) {
+        await page.evaluate(() => {
+          const log = document.querySelector('.chat-log');
+          log.scrollTop = log.scrollHeight;
+        });
+        await wait(250);
+      }
+      page.off('pageerror', onError);
+      const found = await page.evaluate(() => {
+        const runs = [...document.querySelectorAll('.chat-log > section.run')];
+        const twice = runs.filter((r, i) => i && runs[i - 1] === r.previousElementSibling && runs[i - 1].dataset.speaker === r.dataset.speaker && runs[i - 1].dataset.who === r.dataset.who).length;
+        const yours = runs.filter((r) => r.dataset.speaker === 'you').map((r) => r.querySelectorAll('.msg.user').length);
+        return { older: !!document.querySelector('.chat-log .show-earlier'), requests: document.querySelectorAll('.chat-log .msg.user').length, tools: document.querySelectorAll('.chat-log details.tool').length, groups: document.querySelectorAll('.chat-log details.tool-group').length, twice, yours: yours.length, split: yours.filter((n) => n !== 2).length };
+      });
+      expect(!errors.length, errors.join('; '));
+      expect(!found.older && found.requests === 60 && found.tools === 60 && found.groups === 30 && !found.twice && found.yours === 30 && !found.split, JSON.stringify(found));
+    });
+  }
   await page.close();
 
   // The same in a browser tab of its own (paired with the desktop, following the system's theme).
