@@ -707,7 +707,10 @@ export class Outreach {
 
   /** A text campaign is running, or waits for replies: this page takes the texts' lease for it. */
   textsOpen(): boolean {
-    return this.campaigns.some((c) => c.kind === 'text' && (c.state === 'running' || c.state === 'paused' || c.people.some((p) => p.state === 'awaiting_reply' || p.state === 'sending')));
+    const now = this.now();
+    // A person texted keeps it for two days after they are done: a late reply is answered too (never after a STOP).
+    const replyMayCome = (p: Person) => p.state === 'awaiting_reply' || p.state === 'sending' || (p.state === 'done' && !!p.attempt && p.outcome !== 'opted_out' && now - (p.doneAt ?? 0) < TEXT_CONTEXT_GRACE);
+    return this.campaigns.some((c) => c.kind === 'text' && (c.state === 'running' || c.state === 'paused' || c.people.some(replyMayCome)));
   }
 
   /** start_outreach's input as a plan (or what is wrong with it). */

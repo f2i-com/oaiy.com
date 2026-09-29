@@ -464,9 +464,18 @@ describe('texting down a list', () => {
     expect(link.instructions()).toContain('You texted them for your person\'s outreach "Friday reminders"');
     await link.resultTool().run({ outcome: 'completed', answers: { coming: 'yes' }, summary: 'Yes, see you Friday.' });
     expect(c.people[0]).toMatchObject({ state: 'done', outcome: 'completed', answers: { coming: true } });
-    // Their context stays for a while, for a late reply.
+    // Their context stays for a while, for a late reply (and the texts stay this page's for it).
     expect(r.outreach.forText('+61412345678')).toBeTruthy();
     r.phone.holdsTexts = false;
+    expect(r.outreach.forText('+61412345678')).toBeUndefined();
+    await r.outreach.event(ev('aokie.sms.sent', { messageId: `oaiy-out.${c.id}.p2.1` }));
+    r.phone.holdsTexts = true;
+    await r.outreach.forText('+61413000111')!.resultTool().run({ outcome: 'declined', summary: 'Not coming.' });
+    await r.outreach.tick();
+    expect(c.state).toBe('done');
+    expect(r.outreach.textsOpen()).toBe(true);
+    r.later(49 * 60 * MIN);
+    expect(r.outreach.textsOpen()).toBe(false);
     expect(r.outreach.forText('+61412345678')).toBeUndefined();
   });
 
