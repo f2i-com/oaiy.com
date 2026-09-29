@@ -44,7 +44,7 @@ export class FileTree {
   /** Say whose files these are (the front desk's, say): nothing for the open project's. */
   setPlace(place: string | null): void {
     this.place.hidden = !place;
-    this.place.replaceChildren(...(place ? [icon('phone'), h('strong', place), h('span', "what the phone's agents read")] : []));
+    this.place.replaceChildren(...(place ? [icon('phone'), h('span.tree-place-text', h('strong', `${place} files`), h('span', "What the phone's agents read"))] : []));
     this.place.title = place ? `The ${place.toLowerCase()}'s files: what the phone's agent reads` : '';
   }
 
