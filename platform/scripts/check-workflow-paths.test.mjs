@@ -384,9 +384,10 @@ describe('the real workflows', () => {
   );
 
   it('are read inside command substitutions: every place the ZIPP release is resolved', () => {
+    // Two in ci.yml (with the caller's pair, and the latest) and one in release.yml: a fourth, or one fewer, is a change to look at.
     assert.deepEqual(
-      resolving.map((r) => `${r.file}:${r.line}`),
-      ['.github/workflows/ci.yml:95', '.github/workflows/ci.yml:97', '.github/workflows/release.yml:111'],
+      resolving.map((r) => r.file),
+      ['.github/workflows/ci.yml', '.github/workflows/ci.yml', '.github/workflows/release.yml'],
     );
     for (const { file, line } of resolving) {
       assert.ok(real.entries.some((e) => e.file === file && e.line === line && e.kind === 'run (node)' && e.text === 'platform/scripts/fetch-zipp-release.mjs'), `${file}:${line} was not read`);
