@@ -312,8 +312,9 @@ function world({ plain, env: over = {} } = {}) {
   const idb = createFakeIDB();
   const storage = createStorage(plain === undefined ? {} : { [PLAIN]: typeof plain === 'string' ? plain : JSON.stringify(plain) });
   const warns = [];
-  const env = { indexedDB: idb.factory, crypto: webcrypto, storage, warn: (message) => warns.push(message), timeoutMs: 1500, ...over };
-  return { idb, storage, warns, env, load: () => V.createSecretVault(env) };
+  const details = [];
+  const env = { indexedDB: idb.factory, crypto: webcrypto, storage, warn: (message, detail) => { warns.push(message); details.push(detail); }, timeoutMs: 1500, ...over };
+  return { idb, storage, warns, details, env, load: () => V.createSecretVault(env) };
 }
 const KEY_A = 'sk-ant-api03-AAAA-secret-value-1';
 const KEY_B = 'sk-proj-BBBB-secret-value-2';
@@ -882,6 +883,89 @@ await check('a save that can be kept nowhere is an error the editor hears', asyn
   w.storage.failSet = true;
   await assert.rejects(vault.set('B', KEY_B), /quota/);
   assert.deepEqual(await vault.get(['A']), { A: KEY_A }, 'and what was there is intact');
+});
+
+// ---------------------------------------------------------------------------
+// What the vault says
+// ---------------------------------------------------------------------------
+await check('a warning that has no detail is one argument to the console, not a stray "undefined"', async () => {
+  const calls = [];
+  const original = console.warn;
+  console.warn = (...args) => { calls.push(args); };
+  try {
+    const w = world({ env: { warn: undefined } }); // the vault's own way of saying it: console.warn
+    const before = w.load();
+    await before.set('A', KEY_A);
+    w.idb.raw('keys').clear(); // the key is gone: what was sealed cannot be opened
+    const vault = w.load();
+    assert.equal(await vault.ready(), 'sealed');
+    w.idb.fail('put', new DOMException('quota', 'QuotaExceededError'), { store: 'secrets' });
+    await vault.set('B', KEY_B); // refused, with the error to say so
+  } finally {
+    console.warn = original;
+  }
+  assert.equal(calls.length, 2, calls.map((c) => c[0]).join(' | '));
+  assert.equal(calls[0].length, 1, 'no detail: the message alone');
+  assert.match(calls[0][0], /cannot be opened/);
+  assert.equal(calls[1].length, 2, 'a detail: the message and the error');
+  assert.match(calls[1][0], /could not save/);
+  assert.equal(calls[1][1].name, 'QuotaExceededError');
+});
+
+await check('no warning carries the value of a key, in its message or in its detail', async () => {
+  const SECRET = 'sk-never-in-a-log-4c9d2e7a51';
+  const show = (d) => (d instanceof Error ? `${d.name}: ${d.message}\n${d.stack ?? ''}` : typeof d === 'object' && d !== null ? JSON.stringify(d) : String(d));
+  const said = (w) => [...w.warns, ...w.details.map(show)].join('\n');
+  const worlds = {};
+  {
+    const w = (worlds['a wiped key store'] = world());
+    await w.load().set('A', SECRET);
+    w.idb.raw('keys').clear();
+    await w.load().ready();
+  }
+  {
+    const w = (worlds['a move the store refuses'] = world({ plain: { A: SECRET } }));
+    w.idb.fail('put', new DOMException('quota', 'QuotaExceededError'), { store: 'secrets', times: 5 });
+    const vault = w.load();
+    await vault.ready();
+    await vault.set('B', SECRET);
+  }
+  {
+    const w = (worlds['a store that will not open'] = world({ plain: { A: SECRET } }));
+    w.idb.knobs.openError = new DOMException('denied', 'SecurityError');
+    const vault = w.load();
+    await vault.ready();
+    await vault.set('B', SECRET);
+  }
+  {
+    const w = (worlds['a value that does not read back'] = world({ plain: { A: SECRET } }));
+    w.idb.knobs.corruptReads = true;
+    await w.load().ready();
+  }
+  {
+    const w = (worlds['plaintext that is damaged'] = world({ plain: `{"A": "${SECRET}` }));
+    await w.load().ready();
+  }
+  {
+    const w = (worlds['plaintext that cannot be written'] = world({ plain: { A: SECRET }, env: { indexedDB: undefined } }));
+    const vault = w.load();
+    await vault.ready();
+    w.storage.failSet = true;
+    await vault.set('B', SECRET);
+  }
+  {
+    const w = (worlds['a store that fails while the page runs'] = world());
+    const vault = w.load();
+    await vault.set('A', SECRET);
+    w.idb.fail('get', new DOMException('disk error', 'UnknownError'), { times: 10 });
+    await vault.get(['A']);
+    w.idb.fail('put', new DOMException('disk error', 'UnknownError'), { store: 'secrets' });
+    await vault.set('B', SECRET);
+  }
+  for (const [what, w] of Object.entries(worlds)) {
+    assert.ok(w.warns.length > 0, `${what}: it says something`);
+    assert.ok(!said(w).includes(SECRET), `${what}: the value is in what it says: ${said(w)}`);
+  }
 });
 
 // ---------------------------------------------------------------------------

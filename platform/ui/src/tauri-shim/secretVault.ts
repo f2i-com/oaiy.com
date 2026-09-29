@@ -187,7 +187,10 @@ export function createSecretVault(env: VaultEnv = browserEnv()): SecretVault {
   const warnOnce = (kind: string, message: string, detail?: unknown): void => {
     if (warned.has(kind)) return;
     warned.add(kind);
-    (env.warn ?? ((m, d) => console.warn(m, d)))(`[oaiy-web] ${message}`, detail);
+    const say = env.warn ?? ((...args: [string, unknown?]) => console.warn(...args));
+    // A warning without a detail is the message alone: the console prints an absent second argument as "undefined".
+    if (detail === undefined) say(`[oaiy-web] ${message}`);
+    else say(`[oaiy-web] ${message}`, detail);
   };
 
   let mode: VaultMode = 'plaintext';
