@@ -4,17 +4,26 @@
 //
 // The workflow's own text is read, and its bash is cut out and run (as release-version.test.mjs
 // does), so this cannot drift from what runs on GitHub.
+//
+// The key is used in ONE step of ONE job (`sign`): a build runs the project's npm packages and crates and
+// is given no secret; the sign job runs on a tag only, in the `release` environment, after the gate and the
+// builds, and only signs. These tests pin that, and run the signing step for real with a stand-in Tauri CLI.
 import assert from 'node:assert/strict';
 import { spawnSync } from 'node:child_process';
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import { after, describe, it } from 'node:test';
-import { fileURLToPath } from 'node:url';
+import { fileURLToPath, pathToFileURL } from 'node:url';
+import crypto from 'node:crypto';
+import { buildFeed, platformAssets } from './make-latest-json.mjs';
+import { makeKeys } from './minisign.testing.mjs';
 import { parseYaml, workflowSteps } from './workflow-yaml.mjs';
 
-const repo = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..', '..');
-const document = parseYaml(fs.readFileSync(path.join(repo, '.github', 'workflows', 'release.yml'), 'utf8'));
+const here = path.dirname(fileURLToPath(import.meta.url));
+const repo = path.resolve(here, '..', '..');
+const workflowText = fs.readFileSync(path.join(repo, '.github', 'workflows', 'release.yml'), 'utf8');
+const document = parseYaml(workflowText);
 const steps = workflowSteps(document);
 const stepNamed = (job, name) => {
   const found = steps.find((s) => s.job === job && s.name === name);
@@ -24,35 +33,88 @@ const stepNamed = (job, name) => {
 const bash = spawnSync('bash', ['-c', 'true']).status === 0;
 const scratch = fs.mkdtempSync(path.join(os.tmpdir(), 'oaiy-release-updater-test-'));
 after(() => fs.rmSync(scratch, { recursive: true, force: true }));
+const slashes = (p) => p.replace(/\\/g, '/');
+const runBash = (script, env, cwd) => spawnSync('bash', ['--noprofile', '--norc', '-eo', 'pipefail', '-c', script], { encoding: 'utf8', env, cwd });
 
 const SECRET = 'TAURI_SIGNING_PRIVATE_KEY';
 const PASSWORD = 'TAURI_SIGNING_PRIVATE_KEY_PASSWORD';
+const SIGN_JOB = 'sign';
+const SIGN_STEP = 'Sign the setup.exe and the AppImage';
+const VERSION = '0.1.0';
 
 describe('the updater signing key in release.yml', () => {
-  it('reaches only the step that builds the desktop, and the meta check that it is set', () => {
-    const uses = document.jobs;
-    for (const [name, job] of Object.entries(uses)) {
+  it('is named by ONE step of ONE job, the one that signs, and by nothing else', () => {
+    for (const [name, job] of Object.entries(document.jobs)) {
       assert.equal(job.env?.[SECRET], undefined, `${name}: the key is not in a job's environment`);
       assert.equal(job.env?.[PASSWORD], undefined, `${name}: the password is not in a job's environment`);
     }
-    const mentioning = steps.filter((s) => JSON.stringify({ env: s.env, with: s.with }).includes('secrets.TAURI_SIGNING')).map((s) => `${s.job}: ${s.name}`);
-    assert.deepEqual(mentioning.sort(), ['desktop: Build OAIY Desktop', 'meta: The updater signing key is set']);
+    const mentioning = steps.filter((s) => /secrets\./.test(JSON.stringify({ env: s.env, with: s.with, run: s.run })));
+    assert.deepEqual(mentioning.map((s) => `${s.job}: ${s.name}`), [`${SIGN_JOB}: ${SIGN_STEP}`]);
+    // In the text itself: two references to the secrets, and no way to hand over all of them.
+    const references = workflowText.split(/\r?\n/).filter((line) => /secrets\./.test(line) && !/^\s*#/.test(line));
+    assert.deepEqual(references.map((line) => line.trim()), [`${SECRET}: \${{ secrets.${SECRET} }}`, `${PASSWORD}: \${{ secrets.${PASSWORD} }}`]);
+    assert.ok(!/secrets:\s*inherit|toJSON\(\s*secrets|secrets\s*\[/.test(workflowText), 'all secrets are never passed on');
   });
 
-  it('is handed to the desktop build under the names the Tauri CLI reads', () => {
-    const build = stepNamed('desktop', 'Build OAIY Desktop');
-    assert.equal(build.env[SECRET], '${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}');
-    assert.equal(build.env[PASSWORD], '${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}');
+  it('is handed to the signing step under the names the Tauri CLI reads', () => {
+    const step = stepNamed(SIGN_JOB, SIGN_STEP);
+    assert.equal(step.env[SECRET], `\${{ secrets.${SECRET} }}`);
+    assert.equal(step.env[PASSWORD], `\${{ secrets.${PASSWORD} }}`);
+    assert.equal(step.env.VERSION, '${{ needs.meta.outputs.version }}');
   });
 
-  it('builds the installers with the updater artifacts on, by an override, when the key is there', () => {
+  it('is in a job that runs on a tag only, in the release environment, after the gate and the builds', () => {
+    const job = document.jobs[SIGN_JOB];
+    assert.equal(job.if, "needs.meta.outputs.is_tag == 'true'");
+    assert.equal(job.environment, 'release');
+    assert.deepEqual(job.needs, ['meta', 'verify', 'desktop']);
+    assert.deepEqual(job.permissions, { contents: 'read' });
+    // No other job is in an environment (and so no other job can be handed the environment's secrets).
+    for (const [name, other] of Object.entries(document.jobs)) if (name !== SIGN_JOB) assert.equal(other.environment, undefined, `${name} is in an environment`);
+  });
+
+  it('signs and nothing else: no build, none of the project’s own code, no install scripts', () => {
+    const inSign = steps.filter((s) => s.job === SIGN_JOB);
+    assert.deepEqual(inSign.map((s) => s.name), [
+      'actions/checkout@11d5960a326750d5838078e36cf38b85af677262',
+      'actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020',
+      'actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093',
+      'Install the Tauri CLI',
+      SIGN_STEP,
+      'actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02',
+    ]);
+    const install = stepNamed(SIGN_JOB, 'Install the Tauri CLI');
+    assert.equal(install.run.trim(), 'npm ci --ignore-scripts');
+    assert.equal(install.workingDirectory, 'platform/desktop');
+    for (const s of inSign) assert.ok(!/npm run|cargo|tauri build|tauri:build|node platform|\.mjs/.test(s.run ?? ''), `${s.name} runs project code: ${s.run}`);
+    const signing = stepNamed(SIGN_JOB, SIGN_STEP);
+    // The CLI is the one npm ci installed from the lockfile, called by its path: never fetched by npx.
+    assert.match(signing.run, /"\$GITHUB_WORKSPACE\/platform\/desktop\/node_modules\/\.bin\/tauri" signer sign "\$work\/\$bundled"/);
+    assert.ok(!/npx/.test(signing.run), 'nothing is fetched at signing time');
+    assert.equal(signing.workingDirectory, undefined);
+    // It is the download of the desktop builds it works on, and it checks out the revision the gate verified.
+    assert.deepEqual(inSign[2].with, { pattern: 'desktop-*', path: 'artifacts', 'merge-multiple': 'true' });
+    assert.equal(inSign[0].with.ref, '${{ needs.meta.outputs.revision }}');
+  });
+
+  it('signs each installer under the name the Tauri bundler gives it, the name the feed check and the desktop take', () => {
+    const run = stepNamed(SIGN_JOB, SIGN_STEP).run;
+    for (const { asset, signedName } of platformAssets('__V__')) {
+      const asAsset = asset.replace('__V__', '$VERSION');
+      const asBundled = signedName.replace('__V__', '${VERSION}');
+      assert.ok(run.includes(`sign_as "${asAsset}" "${asBundled}"`), `${asAsset} is signed as ${asBundled}`);
+    }
+    // The MSI, the .deb and the .rpm are not signed: nothing updates them.
+    assert.ok(!/\.msi|\.deb|\.rpm/.test(run));
+  });
+
+  it('is not given to any step that builds: the desktop job has no secret at all', () => {
+    for (const s of steps.filter((step) => step.job !== SIGN_JOB)) {
+      assert.ok(!/secrets\./.test(JSON.stringify({ env: s.env, with: s.with, run: s.run })), `${s.job}: ${s.name} reads a secret`);
+    }
     const build = stepNamed('desktop', 'Build OAIY Desktop');
-    assert.equal(build.workingDirectory, 'platform/desktop');
-    assert.match(build.run, /createUpdaterArtifacts":true/);
-    assert.match(build.run, /npm run tauri:build -- --config "\$RUNNER_TEMP\/updater-config\.json"/);
-    const override = /printf '%s' '(\{.*?\})'/.exec(build.run);
-    assert.ok(override, 'the override is written to a file');
-    assert.deepEqual(JSON.parse(override[1]), { bundle: { createUpdaterArtifacts: true } });
+    assert.deepEqual(build.env, {});
+    assert.ok(!/TAURI_SIGNING|createUpdaterArtifacts|--config/.test(build.run), build.run);
   });
 
   it('is not asked of a build on a developer machine: tauri.conf.json does not turn the artifacts on', () => {
@@ -74,71 +136,180 @@ describe('the updater signing key in release.yml', () => {
   });
 });
 
-describe('a tag run without the signing key', { skip: !bash && 'bash is needed' }, () => {
-  const check = stepNamed('meta', 'The updater signing key is set');
-  const run = (env) => spawnSync('bash', ['--noprofile', '--norc', '-eo', 'pipefail', '-c', check.run], { encoding: 'utf8', env: { ...process.env, SIGNING_KEY: '', SIGNING_KEY_PASSWORD: '', ...env } });
-
-  it('runs on a tag only', () => {
-    const conditional = document.jobs.meta.steps.find((s) => s.name === check.name);
-    assert.equal(conditional.if, "steps.v.outputs.is_tag == 'true'");
-    // After the step that decides whether this is a tag, and before anything else has built.
-    const order = document.jobs.meta.steps.map((s) => s.id ?? s.name);
-    assert.ok(order.indexOf(check.name) > order.indexOf('v'));
-  });
-
-  it('stops the release with a message that names the secret', () => {
-    const noKey = run({ SIGNING_KEY_PASSWORD: 'x' });
-    assert.equal(noKey.status, 1);
-    assert.match(noKey.stdout, /::error::.*Actions secret TAURI_SIGNING_PRIVATE_KEY is not set/);
-    const noPassword = run({ SIGNING_KEY: 'x' });
-    assert.equal(noPassword.status, 1);
-    assert.match(noPassword.stdout, /Actions secret TAURI_SIGNING_PRIVATE_KEY_PASSWORD is not set/);
-    const neither = run({});
-    assert.equal(neither.status, 1);
-    assert.match(neither.stdout, /TAURI_SIGNING_PRIVATE_KEY and TAURI_SIGNING_PRIVATE_KEY_PASSWORD is not set/);
-  });
-
-  it('lets a run go on when both are set, and never prints them', () => {
-    const ok = run({ SIGNING_KEY: 'a-private-key-value', SIGNING_KEY_PASSWORD: 'a-password-value' });
-    assert.equal(ok.status, 0, ok.stdout + ok.stderr);
-    assert.ok(!ok.stdout.includes('a-private-key-value') && !ok.stdout.includes('a-password-value'));
+describe('what the workflow may do to the repository', () => {
+  it('gives nothing write access by default, and the job that publishes the release alone', () => {
+    assert.deepEqual(document.permissions, { contents: 'read' });
+    assert.deepEqual(document.jobs.release.permissions, { contents: 'write' });
+    for (const [name, job] of Object.entries(document.jobs)) {
+      if (name === 'release') continue;
+      assert.ok(!Object.values(job.permissions ?? {}).includes('write'), `${name} may write`);
+    }
+    const writes = workflowText.split(/\r?\n/).filter((line) => /:\s*write\s*$/.test(line));
+    assert.equal(writes.length, 1, 'one place gives write access');
   });
 });
 
-describe('the build without the key (a run on a branch)', { skip: !bash && 'bash is needed' }, () => {
-  it('builds without updater artifacts instead of failing, and says so', () => {
+describe('a run on a branch', { skip: !bash && 'bash is needed' }, () => {
+  const isTag = (ref) => {
+    const output = path.join(scratch, `output-${crypto.randomBytes(4).toString('hex')}`);
+    fs.writeFileSync(output, '');
+    const v = steps.find((s) => s.job === 'meta' && s.id === 'v');
+    const result = runBash(v.run, { ...process.env, GITHUB_REF: ref, INPUT_VERSION: VERSION, GITHUB_OUTPUT: slashes(output) });
+    assert.equal(result.status, 0, result.stdout + result.stderr);
+    return /^is_tag=(\w+)$/m.exec(fs.readFileSync(output, 'utf8'))[1];
+  };
+
+  it('is not a tag run, so neither the sign job nor the release job starts', () => {
+    assert.equal(isTag('refs/heads/main'), 'false');
+    assert.equal(isTag('refs/heads/updater'), 'false');
+    assert.equal(isTag('refs/tags/v0.1.0'), 'true');
+    assert.equal(document.jobs[SIGN_JOB].if, "needs.meta.outputs.is_tag == 'true'");
+    assert.equal(document.jobs.release.if, "needs.meta.outputs.is_tag == 'true'");
+    // Nothing else in the workflow reads the key, so a branch run can sign nothing.
+    assert.ok(!/secrets\./.test(JSON.stringify(document.jobs.meta)) && !/secrets\./.test(JSON.stringify(document.jobs.desktop)));
+  });
+
+  it('builds unsigned installers, with no override and no key, and says so', () => {
     const build = stepNamed('desktop', 'Build OAIY Desktop');
-    const fake = path.join(scratch, 'bin');
+    assert.equal(build.workingDirectory, 'platform/desktop');
+    const fake = path.join(scratch, 'bin-npm');
     fs.mkdirSync(fake, { recursive: true });
-    const log = path.join(scratch, 'npm.log').replace(/\\/g, '/');
-    fs.writeFileSync(path.join(fake, 'npm'), `#!/bin/bash\necho "npm $*" >> "${log}"\n`, { mode: 0o755 });
-    const env = { ...process.env, PATH: `${fake.replace(/\\/g, '/')}${path.delimiter}${process.env.PATH}`, RUNNER_TEMP: scratch.replace(/\\/g, '/'), TAURI_SIGNING_PRIVATE_KEY: '', TAURI_SIGNING_PRIVATE_KEY_PASSWORD: '' };
-    const without = spawnSync('bash', ['--noprofile', '--norc', '-eo', 'pipefail', '-c', build.run], { encoding: 'utf8', env });
-    assert.equal(without.status, 0, without.stderr);
-    assert.match(without.stdout, /::warning::TAURI_SIGNING_PRIVATE_KEY is not set/);
+    const log = path.join(scratch, 'npm.log');
+    fs.writeFileSync(path.join(fake, 'npm'), `#!/bin/bash\necho "npm $*" >> "${slashes(log)}"\n`, { mode: 0o755 });
+    const env = { ...process.env, PATH: `${slashes(fake)}${path.delimiter}${process.env.PATH}`, RUNNER_TEMP: slashes(scratch) };
+    // Even with a key in the environment (a runner that had one would be misconfigured): the step never uses it.
+    const result = runBash(build.run, { ...env, [SECRET]: 'a-private-key', [PASSWORD]: 'a-password' });
+    assert.equal(result.status, 0, result.stderr);
     assert.equal(fs.readFileSync(log, 'utf8').trim(), 'npm run tauri:build');
-
-    fs.rmSync(log);
-    const withKey = spawnSync('bash', ['--noprofile', '--norc', '-eo', 'pipefail', '-c', build.run], { encoding: 'utf8', env: { ...env, TAURI_SIGNING_PRIVATE_KEY: 'k', TAURI_SIGNING_PRIVATE_KEY_PASSWORD: 'p' } });
-    assert.equal(withKey.status, 0, withKey.stderr);
-    const line = fs.readFileSync(log, 'utf8').trim();
-    assert.match(line, /^npm run tauri:build -- --config .*updater-config\.json$/);
-    const file = line.split('--config ')[1];
-    assert.deepEqual(JSON.parse(fs.readFileSync(file, 'utf8')), { bundle: { createUpdaterArtifacts: true } });
+    assert.match(result.stdout, /::notice::this build is unsigned/);
+    assert.match(result.stdout, /a run on a branch never signs/);
+    assert.ok(!result.stdout.includes('a-private-key') && !result.stdout.includes('a-password'));
   });
 });
 
-describe('the signatures and the feed in the release', () => {
-  it('collects the signature beside each installer under the renamed installer’s name and .sig', () => {
-    const collect = stepNamed('desktop', 'Collect').run;
-    assert.match(collect, /collect_signature "\$setup" "oaiy-desktop-\$VERSION-windows-x64-setup\.exe"/);
-    assert.match(collect, /collect_signature "\$appimage" "oaiy-desktop-\$VERSION-linux-x86_64\.AppImage"/);
-    assert.match(collect, /cp "\$installer\.sig" "\$out\/\$renamed\.sig"/);
-    // The MSI gets none: nothing updates it.
-    assert.ok(!/collect_signature .*\.msi/.test(collect));
-    // On a tag a missing signature stops the release; on a branch it is a warning.
-    assert.match(collect, /elif \[\[ "\$IS_TAG" == "true" \]\]; then\n\s+echo "::error::/);
-    assert.equal(stepNamed('desktop', 'Collect').env.IS_TAG, '${{ needs.meta.outputs.is_tag }}');
+describe('the signing step, run for real with a stand-in Tauri CLI', { skip: !bash && 'bash is needed' }, () => {
+  const step = stepNamed(SIGN_JOB, SIGN_STEP);
+  const keys = makeKeys(5);
+  const pem = keys.privateKey.export({ format: 'pem', type: 'pkcs8' });
+  const KEY = JSON.stringify({ pem, id: keys.keyId.toString('hex') });
+  const PASSWORD_VALUE = 'a-password-that-must-not-be-printed';
+  let counter = 0;
+
+  /** A workspace as the sign job has it after the download: the desktop builds' installers under artifacts/, and a stand-in Tauri CLI where npm ci puts it. */
+  function workspace({ skip = [] } = {}) {
+    const root = path.join(scratch, `sign-${++counter}`);
+    const dirs = { root, ws: path.join(root, 'ws'), tmp: path.join(root, 'tmp'), bin: path.join(root, 'ws', 'platform', 'desktop', 'node_modules', '.bin'), tools: path.join(root, 'tools') };
+    for (const d of Object.values(dirs)) fs.mkdirSync(d, { recursive: true });
+    fs.mkdirSync(path.join(dirs.ws, 'artifacts'), { recursive: true });
+    for (const { asset } of platformAssets(VERSION)) if (!skip.includes(asset)) fs.writeFileSync(path.join(dirs.ws, 'artifacts', asset), `the bytes of ${asset}`);
+    // The stand-in signer: signs the file it is given, for real, as the Tauri CLI does (a .sig beside it whose trusted comment names the file).
+    const signer = path.join(dirs.tools, 'signer.mjs');
+    fs.writeFileSync(
+      signer,
+      [
+        `import crypto from 'node:crypto'; import fs from 'node:fs'; import path from 'node:path';`,
+        `import { sign } from ${JSON.stringify(pathToFileURL(path.join(here, 'minisign.testing.mjs')).href)};`,
+        `const file = process.argv[process.argv.length - 1];`,
+        `const { pem, id } = JSON.parse(process.env.${SECRET});`,
+        `if (process.env.${PASSWORD} !== ${JSON.stringify(PASSWORD_VALUE)}) { console.error('no password'); process.exit(1); }`,
+        `const keys = { privateKey: crypto.createPrivateKey(pem), keyId: Buffer.from(id, 'hex') };`,
+        `fs.writeFileSync(file + '.sig', sign(keys, fs.readFileSync(file), { comment: 'timestamp:1790000000\\tfile:' + path.basename(file) }));`,
+        `console.log('Public signature: (made)');`,
+      ].join('\n'),
+    );
+    const log = path.join(dirs.root, 'npx.log');
+    fs.writeFileSync(path.join(dirs.bin, 'tauri'), `#!/bin/bash\necho "tauri $*" >> "${slashes(log)}"\nif [[ "\${FAKE_SIGNER_FAILS:-}" == "1" ]]; then echo "the signer failed" >&2; exit 1; fi\nif [[ "\${FAKE_SIGNER_WRITES_NOTHING:-}" == "1" ]]; then exit 0; fi\nexec node "${slashes(signer)}" "$@"\n`, { mode: 0o755 });
+    return { ...dirs, log, signer };
+  }
+
+  const run = (w, env = {}) =>
+    runBash(step.run, { ...process.env, GITHUB_WORKSPACE: slashes(w.ws), RUNNER_TEMP: slashes(w.tmp), VERSION, [SECRET]: KEY, [PASSWORD]: PASSWORD_VALUE, ...env }, w.ws);
+
+  it('signs the two installers, each as the bundler names it, and writes each signature under the release asset’s name', () => {
+    const w = workspace();
+    const result = run(w);
+    assert.equal(result.status, 0, result.stdout + result.stderr);
+    const calls = fs.readFileSync(w.log, 'utf8').trim().split('\n');
+    assert.deepEqual(calls, [
+      `tauri signer sign ${slashes(w.tmp)}/signing/OAIY_${VERSION}_x64-setup.exe`,
+      `tauri signer sign ${slashes(w.tmp)}/signing/OAIY_${VERSION}_amd64.AppImage`,
+    ]);
+    assert.deepEqual(fs.readdirSync(path.join(w.ws, 'signatures')).sort(), platformAssets(VERSION).map((p) => `${p.asset}.sig`).sort());
+    // Neither the key nor the password is ever printed.
+    assert.ok(!(result.stdout + result.stderr).includes(PASSWORD_VALUE) && !(result.stdout + result.stderr).includes(keys.keyId.toString('hex')), 'a secret was printed');
+  });
+
+  it('makes signatures the release job accepts: they verify against the key, and name the version and the kind of file the feed check wants', () => {
+    const w = workspace();
+    assert.equal(run(w).status, 0);
+    // What the release job has after it downloads every artifact into one folder.
+    const dir = path.join(w.root, 'release');
+    fs.mkdirSync(dir);
+    for (const name of fs.readdirSync(path.join(w.ws, 'artifacts'))) fs.copyFileSync(path.join(w.ws, 'artifacts', name), path.join(dir, name));
+    for (const name of fs.readdirSync(path.join(w.ws, 'signatures'))) fs.copyFileSync(path.join(w.ws, 'signatures', name), path.join(dir, name));
+    const feed = buildFeed({ dir, version: VERSION, pubkey: keys.pubkey, pubDate: '2026-10-01T02:03:04Z' });
+    assert.deepEqual(Object.keys(feed.platforms).sort(), ['linux-x86_64', 'windows-x86_64']);
+    // The same installers and signatures announced as another version are refused: the name inside them is the version's.
+    const other = path.join(w.root, 'release-9.9.9');
+    fs.mkdirSync(other);
+    for (const { asset } of platformAssets(VERSION)) {
+      const [renamed] = platformAssets('9.9.9').filter((p) => p.key === platformAssets(VERSION).find((q) => q.asset === asset).key).map((p) => p.asset);
+      fs.copyFileSync(path.join(dir, asset), path.join(other, renamed));
+      fs.copyFileSync(path.join(dir, `${asset}.sig`), path.join(other, `${renamed}.sig`));
+    }
+    assert.throws(() => buildFeed({ dir: other, version: '9.9.9', pubkey: keys.pubkey }), /is not version 9\.9\.9/);
+  });
+
+  it('stops before it signs anything when the key or the password is not there, and names the secret', () => {
+    for (const [env, message] of [
+      [{ [SECRET]: '' }, /the secret TAURI_SIGNING_PRIVATE_KEY is not set in the release environment/],
+      [{ [PASSWORD]: '' }, /the secret TAURI_SIGNING_PRIVATE_KEY_PASSWORD is not set/],
+      [{ [SECRET]: '', [PASSWORD]: '' }, /the secret TAURI_SIGNING_PRIVATE_KEY and TAURI_SIGNING_PRIVATE_KEY_PASSWORD is not set/],
+    ]) {
+      const w = workspace();
+      const result = run(w, env);
+      assert.equal(result.status, 1);
+      assert.match(result.stdout, message);
+      assert.equal(fs.existsSync(w.log), false, 'nothing was signed');
+      assert.equal(fs.existsSync(path.join(w.ws, 'signatures')), false);
+    }
+  });
+
+  it('fails when an installer is not among the builds’ artifacts, or the signer fails, and publishes nothing', () => {
+    const setup = platformAssets(VERSION)[0].asset;
+    const missing = workspace({ skip: [setup] });
+    const result = run(missing);
+    assert.equal(result.status, 1);
+    assert.match(result.stdout, new RegExp(`::error::${setup.replace(/\./g, '\\.')} is not among the desktop builds' artifacts`));
+    const failing = workspace();
+    const failed = run(failing, { FAKE_SIGNER_FAILS: '1' });
+    assert.notEqual(failed.status, 0);
+    assert.deepEqual(fs.existsSync(path.join(failing.ws, 'signatures')) ? fs.readdirSync(path.join(failing.ws, 'signatures')) : [], []);
+    // A signer that says nothing and writes nothing is not a signature either.
+    const silent = workspace();
+    const none = run(silent, { FAKE_SIGNER_WRITES_NOTHING: '1' });
+    assert.equal(none.status, 1);
+    assert.match(none.stdout, /::error::tauri signer sign made no signature for oaiy-desktop-0\.1\.0-windows-x64-setup\.exe/);
+    assert.deepEqual(fs.readdirSync(path.join(silent.ws, 'signatures')), []);
+  });
+});
+
+describe('the installers and the feed in the release', () => {
+  it('copies the installers under their release names in the desktop legs, and makes no signature there', () => {
+    const collect = stepNamed('desktop', 'Collect');
+    assert.match(collect.run, /cp "\$setup" "\$out\/oaiy-desktop-\$VERSION-windows-x64-setup\.exe"/);
+    assert.match(collect.run, /cp "\$appimage" "\$out\/oaiy-desktop-\$VERSION-linux-x86_64\.AppImage"/);
+    assert.ok(!/\.sig|collect_signature|IS_TAG/.test(collect.run), 'the legs make no signature: the sign job does');
+    assert.equal(collect.env.IS_TAG, undefined);
+  });
+
+  it('takes the signatures from the sign job, next to the installers, before the feed is written', () => {
+    const upload = steps.find((s) => s.job === SIGN_JOB && s.uses?.startsWith('actions/upload-artifact@'));
+    assert.deepEqual(upload.with, { name: 'signatures', path: 'signatures/*', 'if-no-files-found': 'error' });
+    assert.deepEqual(document.jobs.release.needs, ['meta', 'verify', 'web', 'desktop', 'sign']);
+    // The release job merges every artifact into artifacts/, the signatures among them.
+    const download = steps.find((s) => s.job === 'release' && s.uses?.startsWith('actions/download-artifact@'));
+    assert.deepEqual(download.with, { path: 'artifacts', 'merge-multiple': 'true' });
   });
 
   it('writes latest.json in the release job, after the evidence is attested and before the checksums cover it', () => {

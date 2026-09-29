@@ -175,7 +175,7 @@ describe('what the build makes', () => {
     assert.deepEqual(runs('ls platform/cli/node_modules/undici'), []);
     assert.deepEqual(runs('ls platform/desktop/src-tauri/resources/app/index.html'), []);
     assert.deepEqual(runs('cat platform/ui/vendor/zipp-wasm/SOURCE.json'), []);
-    assert.deepEqual(runs('cat release/release-evidence-web.json artifacts/x.json notes.md headless-dist/README.txt'), []);
+    assert.deepEqual(runs('cat release/release-evidence-web.json artifacts/x.json signatures/x.sig notes.md headless-dist/README.txt'), []);
   });
 
   it('fails when the folder it would be made in is not', () => {

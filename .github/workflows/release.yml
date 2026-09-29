@@ -26,9 +26,12 @@
 #                                            SHA256SUMS and oaiy-cli.json (= `oaiy capabilities --json`)
 #   SHA256SUMS.txt                           covers every file above, latest.json and the .sig files too
 #
-# The two installers an update can install are signed with the updater key: the
-# secrets TAURI_SIGNING_PRIVATE_KEY and TAURI_SIGNING_PRIVATE_KEY_PASSWORD (see
-# docs/RELEASING.md). A tag run without the key stops in the meta job.
+# The two installers an update can install (the NSIS setup.exe and the AppImage) are signed
+# with the updater key in ONE place: the `sign` job. It runs on a tag only, in the `release`
+# environment that holds the secrets TAURI_SIGNING_PRIVATE_KEY and
+# TAURI_SIGNING_PRIVATE_KEY_PASSWORD (docs/RELEASING.md, The updater key), after the
+# verification gate and every build have passed. The builds are unsigned and no step that
+# builds anything is given the key. A run on a branch builds unsigned installers and never signs.
 #
 # The tag is the version. It is stamped into
 # platform/desktop/src-tauri/tauri.conf.json and Cargo.toml at build time
@@ -82,8 +85,9 @@ on:
         description: 'Version to build (e.g. 0.1.0; not below it). Run on a branch, this builds and uploads artifacts only. Run on a tag, the tag is the version and the release is published.'
         required: true
 
+# Nothing may write by default: the job that publishes the release says so for itself.
 permissions:
-  contents: write
+  contents: read
 
 env:
   NODE_VERSION: '24'
@@ -152,25 +156,6 @@ jobs:
           fi
           echo "version=$version" >> "$GITHUB_OUTPUT"
           echo "Building version $version"
-
-      # A release is what every installed OAIY updates to, so it must be signed:
-      # stop here, before anything is built, when a tag run has no signing key.
-      # (A run on a branch builds without one, and its installers carry no signature.)
-      - name: The updater signing key is set
-        if: steps.v.outputs.is_tag == 'true'
-        shell: bash
-        env:
-          SIGNING_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
-          SIGNING_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
-        run: |
-          missing=""
-          [[ -n "$SIGNING_KEY" ]] || missing="TAURI_SIGNING_PRIVATE_KEY"
-          [[ -n "$SIGNING_KEY_PASSWORD" ]] || missing="${missing:+$missing and }TAURI_SIGNING_PRIVATE_KEY_PASSWORD"
-          if [[ -n "$missing" ]]; then
-            echo "::error::a release must be signed for OAIY's updater, and the Actions secret $missing is not set. Add it under Settings, Secrets and variables, Actions (docs/RELEASING.md, The updater key), then run this again."
-            exit 1
-          fi
-          echo "the updater signing key and its password are set"
 
   # ---------------------------------------------------------------- verification
   # The reusable gate, at the exact revision resolved above (OAI-01).
@@ -398,27 +383,18 @@ jobs:
         working-directory: platform/desktop
         run: npm ci
 
-      # The installers OAIY updates itself with are built with the updater
-      # artifacts on: a signature beside each, made with the updater key, which
-      # is in the environment of this step and no other. tauri.conf.json does not
-      # turn them on, so a build on a developer's machine, which has no key, still
-      # works. The override goes in as a file: JSON on the command line passes
-      # through npm and cmd.exe on Windows with its quotes mangled.
+      # The installers are built UNSIGNED, on every run, tag or branch. This step runs
+      # the project's npm packages and Rust crates, so it is given no secret at all: the
+      # updater key is used in the `sign` job, which only signs what these builds made
+      # (and only on a tag, after the gate). tauri.conf.json does not turn the updater
+      # artifacts on, so nothing here asks for a signature.
       - name: Build OAIY Desktop
         shell: bash
         working-directory: platform/desktop
-        env:
-          TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
-          TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
         run: |
           set -euo pipefail
-          if [[ -n "$TAURI_SIGNING_PRIVATE_KEY" ]]; then
-            printf '%s' '{"bundle":{"createUpdaterArtifacts":true}}' > "$RUNNER_TEMP/updater-config.json"
-            npm run tauri:build -- --config "$RUNNER_TEMP/updater-config.json"
-          else
-            echo "::warning::TAURI_SIGNING_PRIVATE_KEY is not set: this build has no updater signatures (a tag run stops earlier, in the meta job, without it)"
-            npm run tauri:build
-          fi
+          npm run tauri:build
+          echo "::notice::this build is unsigned: no step that builds is given the updater key. A tag run signs the setup.exe and the AppImage afterwards, in the sign job; a run on a branch never signs."
 
       - name: Build the headless server
         working-directory: platform/desktop/src-tauri
@@ -439,35 +415,22 @@ jobs:
         env:
           VERSION: ${{ needs.meta.outputs.version }}
           LABEL: ${{ matrix.label }}
-          IS_TAG: ${{ needs.meta.outputs.is_tag }}
         run: |
           set -euo pipefail
           out="$PWD/release"; mkdir -p "$out"
           bundle="platform/desktop/src-tauri/target/release/bundle"
           find "$bundle" -type f | sort
-          # The signature the build made beside an installer goes beside its renamed copy,
-          # under the same name and .sig. On a tag a missing one stops the release; a run
-          # on a branch, built without the key, has none.
-          collect_signature() {
-            local installer="$1" renamed="$2"
-            if [[ -f "$installer.sig" ]]; then
-              cp "$installer.sig" "$out/$renamed.sig"
-            elif [[ "$IS_TAG" == "true" ]]; then
-              echo "::error::the build made no signature beside $installer: it was built without the updater artifacts"; exit 1
-            else
-              echo "::warning::no signature beside $installer (built without the updater key)"
-            fi
-          }
+          # The installers an update can install get their signatures later, in the sign
+          # job (a tag run): it signs these very files, so they are copied under their
+          # release names and nothing else is done to them.
           if [[ "$LABEL" == "windows" ]]; then
             setup="$(find "$bundle" -type f -name '*-setup.exe' | head -1)"
             cp "$setup" "$out/oaiy-desktop-$VERSION-windows-x64-setup.exe"
-            collect_signature "$setup" "oaiy-desktop-$VERSION-windows-x64-setup.exe"
             cp "$(find "$bundle" -type f -name '*.msi' | head -1)"       "$out/oaiy-desktop-$VERSION-windows-x64.msi"
             ( cd headless-dist && 7z a -bd "$out/oaiy-server-$VERSION-windows-x64.zip" . >/dev/null )
           else
             appimage="$(find "$bundle" -type f -name '*.AppImage' | head -1)"
             cp "$appimage" "$out/oaiy-desktop-$VERSION-linux-x86_64.AppImage"
-            collect_signature "$appimage" "oaiy-desktop-$VERSION-linux-x86_64.AppImage"
             cp "$(find "$bundle" -type f -name '*.deb' | head -1)"      "$out/oaiy-desktop-$VERSION-linux-amd64.deb"
             rpm="$(find "$bundle" -type f -name '*.rpm' | head -1 || true)"
             [[ -n "$rpm" ]] && cp "$rpm" "$out/oaiy-desktop-$VERSION-linux-x86_64.rpm"
@@ -541,14 +504,90 @@ jobs:
           path: release/*
           if-no-files-found: error
 
+  # ---------------------------------------------------------------- signing
+  # The only place the updater key is used, and the only job that can read it. The
+  # `release` environment holds the two secrets, and its rules (tags only, a required
+  # reviewer: docs/RELEASING.md) decide when a run may have them. The job starts on a tag
+  # only, after the verification gate and the desktop builds, and does one thing to what
+  # the builds made: it signs the NSIS setup.exe and the AppImage with `tauri signer sign`,
+  # under the names the Tauri bundler gives them (OAIY_<v>_x64-setup.exe,
+  # OAIY_<v>_amd64.AppImage), because the desktop holds a signature to its version by the
+  # name of the file it was made for. It builds nothing and runs none of the project's own
+  # code: the Tauri CLI is installed from the desktop app's lockfile with no install scripts.
+  sign:
+    name: Sign the installers an update installs
+    needs: [meta, verify, desktop]
+    if: needs.meta.outputs.is_tag == 'true'
+    runs-on: ubuntu-latest
+    environment: release
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          ref: ${{ needs.meta.outputs.revision }}
+          persist-credentials: false
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          pattern: desktop-*
+          path: artifacts
+          merge-multiple: true
+
+      # The Tauri CLI, from the lockfile, and no install scripts: nothing here needs one.
+      - name: Install the Tauri CLI
+        working-directory: platform/desktop
+        run: npm ci --ignore-scripts
+
+      - name: Sign the setup.exe and the AppImage
+        shell: bash
+        env:
+          VERSION: ${{ needs.meta.outputs.version }}
+          TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
+          TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
+        run: |
+          set -euo pipefail
+          missing=""
+          [[ -n "$TAURI_SIGNING_PRIVATE_KEY" ]] || missing="TAURI_SIGNING_PRIVATE_KEY"
+          [[ -n "$TAURI_SIGNING_PRIVATE_KEY_PASSWORD" ]] || missing="${missing:+$missing and }TAURI_SIGNING_PRIVATE_KEY_PASSWORD"
+          if [[ -n "$missing" ]]; then
+            echo "::error::a release must be signed for OAIY's updater, and the secret $missing is not set in the release environment (Settings, Environments, release). See docs/RELEASING.md, The updater key."
+            exit 1
+          fi
+          artifacts="$GITHUB_WORKSPACE/artifacts"
+          work="$RUNNER_TEMP/signing"; out="$GITHUB_WORKSPACE/signatures"
+          mkdir -p "$work" "$out"
+          sign_as() {
+            local asset="$1" bundled="$2"
+            [[ -s "$artifacts/$asset" ]] || { echo "::error::$asset is not among the desktop builds' artifacts"; exit 1; }
+            cp "$artifacts/$asset" "$work/$bundled"
+            "$GITHUB_WORKSPACE/platform/desktop/node_modules/.bin/tauri" signer sign "$work/$bundled" >/dev/null
+            [[ -s "$work/$bundled.sig" ]] || { echo "::error::tauri signer sign made no signature for $asset"; exit 1; }
+            cp "$work/$bundled.sig" "$out/$asset.sig"
+          }
+          sign_as "oaiy-desktop-$VERSION-windows-x64-setup.exe" "OAIY_${VERSION}_x64-setup.exe"
+          sign_as "oaiy-desktop-$VERSION-linux-x86_64.AppImage" "OAIY_${VERSION}_amd64.AppImage"
+          ls -l "$out"
+
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: signatures
+          path: signatures/*
+          if-no-files-found: error
+
   # ---------------------------------------------------------------- release
   release:
     name: Publish release
-    # Publication needs the verification gate AND every build, all at the
-    # same resolved revision (OAI-01): a failing test in any lane blocks it.
-    needs: [meta, verify, web, desktop]
+    # Publication needs the verification gate, every build AND the signatures, all at
+    # the same resolved revision (OAI-01): a failing test in any lane blocks it.
+    needs: [meta, verify, web, desktop, sign]
     if: needs.meta.outputs.is_tag == 'true'
     runs-on: ubuntu-latest
+    # The only job that writes to the repository (it publishes the release).
+    permissions:
+      contents: write
     steps:
       # The attestation script is taken from the verified revision itself.
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4

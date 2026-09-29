@@ -33,19 +33,66 @@ models, the portable Python and the Node runtime) is downloaded on first use, no
 OAIY Desktop updates itself from these releases, and refuses any installer whose signature
 does not match the public key inside it (`plugins.updater.pubkey` in
 `platform/desktop/src-tauri/tauri.conf.json`). The release workflow signs the two
-installers an update can install with the matching private key, which lives in two GitHub
-Actions secrets on this repository (Settings, Secrets and variables, Actions):
+installers an update can install (the NSIS setup.exe and the AppImage) with the matching
+private key, in ONE job, `sign`, and nowhere else. The key is two secrets:
 
 | Secret | Value |
 |---|---|
 | `TAURI_SIGNING_PRIVATE_KEY` | the content of the private key file |
 | `TAURI_SIGNING_PRIVATE_KEY_PASSWORD` | its password |
 
-They are read by the desktop build step and by the `meta` job's check, and by nothing else.
-A run on a **tag** without either stops in `meta`, before anything is built, with a message
-naming the missing secret: a release that installed copies of OAIY could not verify would be
-worse than none. A run on a branch (the trial run below) without the key builds without
-signatures and says so.
+What keeps the key from everything that does not need it:
+
+- **Nothing that builds has it.** The `desktop` job runs the project's npm packages, its Rust
+  crates and the builds of the Agent and the flow editor. It is given no secret at all and
+  builds the installers UNSIGNED, on a tag and on a branch alike. The `sign` job is the only
+  place the two secrets are named, in one step ("Sign the setup.exe and the AppImage"), and
+  the job does nothing but `tauri signer sign` on the two installers the builds made: the Tauri
+  CLI is installed from the desktop app's lockfile with no install scripts, and nothing of the
+  project is built or run there.
+- **It runs on a tag only.** `sign` has `if: needs.meta.outputs.is_tag == 'true'`. A run on a
+  branch (the trial run below) never starts it, and says in its log that its installers are
+  unsigned. The job also waits for the verification gate and for every desktop build, so
+  nothing is signed that a test failed on.
+- **It runs in the `release` environment**, whose rules decide who and what may have the
+  secrets (next section).
+- **The workflow may not write to the repository** by default (`permissions: contents: read`
+  at the top): only the job that publishes the release has `contents: write`.
+
+Each installer is signed under the name the Tauri bundler gives it (`OAIY_<v>_x64-setup.exe`,
+`OAIY_<v>_amd64.AppImage`), because the desktop holds a signature to its version by the name of
+the file it was made for (UPDATES.md, "What the signature was made for"). The signatures are
+uploaded as the artifact `signatures` and reach the release next to the installers.
+
+### The `release` environment
+
+Set this up ONCE, before the first tag. **If the environment does not exist when the first tag is
+pushed, GitHub creates it empty: no reviewer and no tag rule, and the job would run unprotected.**
+
+1. Settings, Environments, New environment: `release`.
+2. **Deployment branches and tags**: choose "Selected branches and tags" and add two TAG
+   rules, `[0-9]*.[0-9]*.[0-9]*` and `v[0-9]*.[0-9]*.[0-9]*`. A branch, a pull request or any
+   other ref then cannot start a job in this environment, whatever a workflow file on it
+   says, so it can never be handed the secrets.
+3. **Required reviewers**: add the owner and anyone else who may cut a release. The `sign` job
+   waits for one of them to approve after the builds and the gate have passed: that click is
+   when someone looks at the run before the key is used. Look at what the tagged commit
+   changed in `.github/workflows`: the workflow that runs is the one at the tag, and it decides
+   what the job does with the key. (Turn on "Prevent self-review" only when there is a second
+   reviewer.)
+4. **Environment secrets**: add the two secrets HERE, under the environment's own secrets, and
+   delete any copy of them from the repository's Actions secrets. A repository secret can be
+   read by a workflow on any branch, whatever the environment's rules; an environment secret
+   only by a job that has passed them.
+5. **A tag ruleset** (Settings, Rules, Rulesets, New tag ruleset): target the same two tag
+   patterns; restrict who may create them to the people who cut releases, and block updates
+   and deletions (a published tag is never moved: see below). Whoever can create a matching
+   tag can start a run that reaches the environment, and its reviewer is the last check.
+
+None of this can be enforced from the workflow file: a rule that is missing is a weaker setup,
+not a failing build. A tag run whose environment lacks the secrets fails in the `sign` job,
+after the builds, naming the secret that is missing; try the key once before the first release
+(below) so that is not where it is found.
 
 The key was made once. Its file and its password are kept outside every repository, with a
 README that says this again (`C:\Users\<you>\.oaiy-signing\README.txt` on the machine that
@@ -62,9 +109,9 @@ when the secrets hold a different key from the one in the build, and a release s
 wrong key would install on nobody. If that step fails, the two secrets do not belong to the
 public key in `tauri.conf.json`.
 
-The base `tauri.conf.json` does not turn the signatures on (`bundle.createUpdaterArtifacts`).
-The release workflow passes that as an override of its own, so `npm run tauri:build` on a
-machine without the key still builds an unsigned installer.
+The base `tauri.conf.json` does not turn the updater artifacts on (`bundle.createUpdaterArtifacts`),
+and the release workflow does not either: `npm run tauri:build` builds an unsigned installer
+everywhere, on a developer's machine and in the workflow, and the `sign` job signs it afterwards.
 
 ## Cutting a release
 
@@ -102,7 +149,10 @@ machine without the key still builds an unsigned installer.
    holds the files above, and every `release-evidence-*.json` says `verified`. The
    release job writes `latest.json` (`platform/scripts/make-latest-json.mjs`) from the
    installers and their `.sig` files before it writes the checksums, and stops if an
-   installer or a signature is missing.
+   installer or a signature is missing, or does not verify against the key in
+   `tauri.conf.json`, or was made for another version or another kind of file. The `sign` job
+   comes after the gate and the desktop builds and waits for the `release` environment's
+   reviewer: approve it when `verify` and both desktop builds are green.
 
    The build stops when a page is missing, but nothing lists a finished package, so look
    inside one the first time. `7z l oaiy-desktop-<v>-windows-x64-setup.exe` shows
@@ -127,7 +177,9 @@ machine without the key still builds an unsigned installer.
 
 To try the build without publishing, run the same workflow on a branch instead:
 `gh workflow run release.yml --ref <branch> -f version=0.1.0`. It builds everything and
-keeps the files as the run's artifacts, and creates no release.
+keeps the files as the run's artifacts, and creates no release. Its installers are
+UNSIGNED (the `sign` job starts on a tag only, and no other job has the key), and the
+build's log says so.
 
 Do not move, delete or re-create a published tag. **A release that is published as the
 latest must always be complete**, because two things read the latest release: every

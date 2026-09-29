@@ -134,9 +134,9 @@ describe('the workflows', () => {
     const ci = parseYaml(workflow('ci.yml'));
     assert.deepEqual(Object.keys(ci.jobs), ['revision', 'zipp', 'web', 'cli', 'desktop']);
     const release = parseYaml(workflow('release.yml'));
-    assert.deepEqual(Object.keys(release.jobs), ['meta', 'verify', 'web', 'desktop', 'release']);
+    assert.deepEqual(Object.keys(release.jobs), ['meta', 'verify', 'web', 'desktop', 'sign', 'release']);
     assert.equal(release.jobs.verify.uses, './.github/workflows/ci.yml');
-    assert.deepEqual(release.jobs.release.needs, ['meta', 'verify', 'web', 'desktop']);
+    assert.deepEqual(release.jobs.release.needs, ['meta', 'verify', 'web', 'desktop', 'sign']);
 
     const steps = workflowSteps(release);
     const version = steps.find((step) => step.job === 'meta' && step.id === 'v');
@@ -144,7 +144,8 @@ describe('the workflows', () => {
     assert.ok(version.runLine > version.line);
     const build = steps.find((step) => step.name === 'Build OAIY Desktop');
     assert.equal(build.workingDirectory, 'platform/desktop');
-    assert.match(build.run, /npm run tauri:build -- --config /);
+    assert.match(build.run, /npm run tauri:build\n/);
+    assert.ok(!/--config/.test(build.run), 'the build is unsigned: it asks for no updater artifacts');
     const cache = steps.find((step) => step.job === 'web' && step.with['cache-dependency-path']);
     assert.equal(cache.with['cache-dependency-path'], 'platform/ui/package-lock.json');
   });
