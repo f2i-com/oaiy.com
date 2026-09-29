@@ -1502,6 +1502,36 @@ mod tests {
         assert!(held.is_some_and(|held| held < Duration::from_secs(1)), "the connection was held open: {held:?}");
     }
 
+    #[test]
+    fn a_poll_that_failed_is_followed_by_one_on_a_new_connection() {
+        // A lane starts its client afresh after a failed poll, as it was when every poll
+        // made its own client. The second poll comes a second after the first, well
+        // inside what a connection is kept for, so on a client that had been kept it
+        // would arrive on the same connection.
+        use crate::link::testkit::{Provider, Reply};
+        use std::sync::atomic::{AtomicBool, Ordering};
+        let failed = AtomicBool::new(false);
+        let server = Provider::start(move |req| {
+            if req.target.starts_with("/api/v1/desktop-ai/pending") && !failed.swap(true, Ordering::SeqCst) {
+                Reply::status(500, r#"{"message":"down for a moment"}"#)
+            } else {
+                Reply::ok(r#"{"requests":[]}"#)
+            }
+        });
+        let (store, dir) = crate::link::testkit::linked_to(&server.base, "ai-afresh", |d| {
+            d.desktop_ai.as_mut().unwrap().error_backoff_seconds = 1;
+        });
+        let sources = AiSources {
+            providers: crate::ai::providers::new_handle(),
+            codex: crate::ai::codex::new_handle(&dir),
+        };
+        spawn(store.clone(), sources);
+        let polls = server.wait_for("/api/v1/desktop-ai/pending", 2, Duration::from_secs(30));
+        crate::link::testkit::stop_lane(&store);
+        let _ = std::fs::remove_dir_all(dir);
+        assert_eq!(polls.iter().map(|p| p.conn).collect::<Vec<_>>(), [0, 1], "{:?}", server.lines());
+    }
+
     #[tokio::test]
     async fn the_tunnel_gives_each_account_only_its_own_credential() {
         use crate::link::testkit::{Provider, Reply};

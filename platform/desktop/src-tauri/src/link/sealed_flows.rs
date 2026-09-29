@@ -688,6 +688,30 @@ mod tests {
     }
 
     #[test]
+    fn a_poll_that_failed_is_followed_by_one_on_a_new_connection() {
+        // A lane starts its client afresh after a failed poll, as it was when every poll
+        // made its own client. The second poll comes a second after the first, well
+        // inside what a connection is kept for, so on a client that had been kept it
+        // would arrive on the same connection.
+        let failed = AtomicBool::new(false);
+        let server = Provider::start(move |_| {
+            if failed.swap(true, Ordering::SeqCst) {
+                Reply::ok(&json!({"requests":[]}).to_string())
+            } else {
+                Reply::status(500, "{}")
+            }
+        });
+        let (store, dir) = crate::link::testkit::linked_to(&server.base, "sealed-afresh", |d| {
+            d.desktop_flows.as_mut().unwrap().error_backoff_seconds = 1;
+        });
+        spawn_on(store.clone(), None, a_client_of_its_own());
+        let polls = server.wait_for("/api/v1/desktop-flows/pending", 2, Duration::from_secs(30));
+        crate::link::testkit::stop_lane(&store);
+        let _ = std::fs::remove_dir_all(dir);
+        assert_eq!(polls.iter().map(|p| p.conn).collect::<Vec<_>>(), [0, 1], "{:?}", server.lines());
+    }
+
+    #[test]
     fn the_sealed_lane_never_follows_a_redirect_and_sends_its_credential_nowhere_else() {
         // Set on the client this lane builds, and kept there: a provider that answers
         // with a redirect is reported, not followed with the bearer on the request.

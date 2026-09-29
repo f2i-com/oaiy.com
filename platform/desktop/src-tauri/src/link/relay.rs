@@ -874,6 +874,62 @@ mod tests {
     }
 
     #[test]
+    fn a_poll_that_failed_is_followed_by_one_on_a_new_connection() {
+        // A lane starts its client afresh after a failed poll, as it was when every poll
+        // made its own client: the try after a failure is not on one that has seen the
+        // trouble, and a change to the computer's proxy settings that broke the poll is
+        // read again by the next. The second poll comes a second after the first, well
+        // inside what a connection is kept for, so on a client that had been kept it
+        // would arrive on the same connection.
+        let failed = AtomicBool::new(false);
+        let server = Provider::start(move |_| {
+            if failed.swap(true, Ordering::SeqCst) {
+                Reply::ok(r#"{"commands":[]}"#)
+            } else {
+                Reply::status(500, r#"{"message":"down for a moment"}"#)
+            }
+        });
+        let (store, dir) = crate::link::testkit::linked_to(&server.base, "relay-afresh", |d| {
+            d.relay.as_mut().unwrap().error_backoff_seconds = 1;
+        });
+        spawn_on(store.clone(), working_dispatcher(), a_client_of_its_own());
+        let polls = server.wait_for(PENDING, 2, Duration::from_secs(30));
+        crate::link::testkit::stop_lane(&store);
+        let _ = std::fs::remove_dir_all(dir);
+        assert_eq!(polls.iter().map(|p| p.conn).collect::<Vec<_>>(), [0, 1], "{:?}", server.lines());
+    }
+
+    #[test]
+    fn a_poll_whose_command_could_not_be_claimed_is_followed_by_one_on_a_new_connection() {
+        // The poll worked and its claim was refused: the provider is half down, and the
+        // lane backs off and starts afresh as it does after a poll that failed.
+        let served = AtomicBool::new(false);
+        let server = Provider::start(move |req| {
+            if req.target.starts_with(PENDING) {
+                if served.swap(true, Ordering::SeqCst) {
+                    Reply::ok(r#"{"commands":[]}"#)
+                } else {
+                    Reply::ok(ONE_COMMAND)
+                }
+            } else if req.target.ends_with("/claim") {
+                Reply::status(500, "{}")
+            } else {
+                Reply::ok("{}")
+            }
+        });
+        let (store, dir) = crate::link::testkit::linked_to(&server.base, "relay-afresh-claim", |d| {
+            d.relay.as_mut().unwrap().error_backoff_seconds = 1;
+        });
+        spawn_on(store.clone(), working_dispatcher(), a_client_of_its_own());
+        let polls = server.wait_for(PENDING, 2, Duration::from_secs(30));
+        crate::link::testkit::stop_lane(&store);
+        let _ = std::fs::remove_dir_all(dir);
+        let seen: Vec<(String, usize)> = server.requests().iter().map(|r| (r.line(), r.conn)).collect();
+        assert_eq!(polls.iter().map(|p| p.conn).collect::<Vec<_>>(), [0, 1], "{seen:?}");
+        assert!(seen.iter().any(|(line, conn)| line.ends_with("/claim") && *conn == 0), "{seen:?}");
+    }
+
+    #[test]
     fn a_refusal_for_asking_too_often_still_says_why_after_a_wait_longer_than_the_poll_may_take() {
         // A poll of this spec (a hold of 1 second) is given 16 seconds, from the
         // request to the last byte of its reply. The provider asks to be left for 17,
