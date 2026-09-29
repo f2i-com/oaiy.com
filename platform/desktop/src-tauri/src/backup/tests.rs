@@ -3372,7 +3372,9 @@ fn every_command_of_the_dashboard_checks_its_caller_before_anything_else() {
     // And the check is the label test, which lets in the dashboard's window and no other.
     let source = source_text(include_str!("commands.rs"));
     assert!(source.contains("fn dashboard<R: Runtime>(webview: &Webview<R>) -> Result<(), String> {\n    check_label(webview.label())\n}"));
-    assert!(source.contains("const DASHBOARD_LABEL: &str = \"main\";") && source.contains("if label == DASHBOARD_LABEL {"));
+    // Which window is the dashboard's is the updater's one answer, and the backup has none of its own.
+    assert!(source.contains("if crate::update::gui::is_dashboard(label) {") && !source.contains("DASHBOARD_LABEL") && !source.contains("== \"main\""), "the label gate is the updater's");
+    assert!(source_text(include_str!("../update/gui.rs")).contains("pub const DASHBOARD_LABEL: &str = \"main\";"));
 }
 
 #[test]

@@ -23,12 +23,10 @@ use super::EXTENSION;
 use crate::services::registry::RegistryHandle;
 use crate::update::UpdaterHandle;
 
-/// The label of the dashboard's own webview.
-const DASHBOARD_LABEL: &str = "main";
-
-/// Only the dashboard's own window may call these.
+/// Only the dashboard's own window may call these. Which window that is has one answer, the updater's
+/// (`update::gui::is_dashboard`): a window that may not restart OAIY to update it may not back it up or restore it either.
 pub(crate) fn check_label(label: &str) -> Result<(), String> {
-    if label == DASHBOARD_LABEL {
+    if crate::update::gui::is_dashboard(label) {
         Ok(())
     } else {
         Err("Backups can only be started from OAIY's own dashboard window.".to_string())
