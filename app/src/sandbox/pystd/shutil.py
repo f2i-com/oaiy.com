@@ -1,4 +1,4 @@
-"""High-level file operations (pure Python, for bot.computer's sandbox)."""
+"""High-level file operations (pure Python, for OAIY's sandbox)."""
 import os
 import fnmatch
 

@@ -1,4 +1,4 @@
-"""Shell-style filename matching (pure Python, for bot.computer's sandbox)."""
+"""Shell-style filename matching (pure Python, for OAIY's sandbox)."""
 import re
 
 _cache = {}

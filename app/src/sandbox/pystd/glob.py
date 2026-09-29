@@ -1,4 +1,4 @@
-"""Filename pattern expansion (pure Python, for bot.computer's sandbox)."""
+"""Filename pattern expansion (pure Python, for OAIY's sandbox)."""
 import os
 import re
 import fnmatch

@@ -32,6 +32,8 @@ keeps are recorded in `docs/ecosystem/`: [Aokie](ecosystem/AOKIE_CONTRACT.md),
 - **The web app** is the same `app/` build at bot.computer. It finds the desktop on
   `127.0.0.1:17972`, pairs like FormLogic does, and uses the desktop's endpoints for the
   engines, plugins, sessions and flows. Without a desktop it is the browser agent it is today.
+  In a browser it installs as an app called OAIY (Install app, in its menu) and updates when
+  the person chooses Reload; see "Installing and updating the web app" in `app/README.md`.
 - **`app/src-tauri`** (bot.computer's own shell) is retired once the desktop serves the app.
 
 ### Ports

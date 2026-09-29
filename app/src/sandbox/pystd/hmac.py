@@ -1,4 +1,4 @@
-"""HMAC message authentication (pure Python over hashlib, for bot.computer's sandbox)."""
+"""HMAC message authentication (pure Python over hashlib, for OAIY's sandbox)."""
 import hashlib
 import binascii
 

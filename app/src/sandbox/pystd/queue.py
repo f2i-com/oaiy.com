@@ -1,4 +1,4 @@
-"""Queues (pure Python, single-threaded, for bot.computer's sandbox)."""
+"""Queues (pure Python, single-threaded, for OAIY's sandbox)."""
 import heapq
 
 

@@ -104,6 +104,8 @@ working agent:
   between a project's conversation and the phone's.
 - **Its model:** the model chosen in OAIY's engines, or ChatGPT (Settings → Agent). As a
   web app in a browser it can also use any OpenAI-compatible server or Anthropic's API.
+  The web app installs from the browser as an app (Install app, in its menu), works offline
+  and says when a new version is ready ([how](app/README.md#installing-and-updating-the-web-app)).
 - **Media:** pictures, video, speech, music, sound effects and 3D models from OAIY's
   engines, straight into the project, and background removal and upscaling.
 - **The Front desk:** the phone's own project. Its **runner** is your conversation that

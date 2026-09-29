@@ -366,7 +366,7 @@ export class SandboxHost implements HostHandler {
    *
    * A Python program's files are the whole project ("/" its root), with the
    * run's settings under `.botcomputer/` (the working folder, environment,
-   * stdin, argv[0]) for bot.computer's runtime additions (pystd/runtime.js),
+   * stdin, argv[0]) for OAIY's runtime additions (pystd/runtime.js),
    * which resolve relative paths against the working folder. Modules beside
    * the script are also placed at the root, where Zipp looks for imports, so
    * `import helper` finds scripts/helper.py as CPython's sys.path[0] would;

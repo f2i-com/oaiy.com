@@ -180,7 +180,7 @@ The Agent runs three ways. All three use the same build of the same web app.
 
 | | How | Where your projects live |
 |---|---|---|
-| **On the web** | Open it from any HTTPS host (the `dist/` folder is a static site). It installs as an app from the browser and works offline. | That browser's storage for the site |
+| **On the web** | Open it from any HTTPS host (the `dist/` folder is a static site). It installs as an app from the browser, works offline and updates when you say ([Installing and updating](#installing-and-updating-the-web-app)). | That browser's storage for the site |
 | **On this computer** | `npm start` builds it and serves it at http://localhost:5317 | That browser's storage for `localhost:5317` |
 | **Desktop app** | The installer from `npm run desktop:build` (Windows, macOS, Linux) | The app's own webview storage |
 | **Portable app** | One file from `npm run desktop:portable`: nothing to install, run it from anywhere (a USB stick) | `bot.computer-data/` beside the exe |
@@ -198,6 +198,20 @@ node tests/e2e/desktop.mjs  # Windows: checks the built app in WebView2 (isolati
 ```
 
 The Agent always uses port 5317 (`strictPort`), so a local server can allow it by origin. OAIY allows it by default.
+
+### Installing and updating the web app
+
+The web app is a progressive web app called **OAIY**: it has a manifest (`public/manifest.webmanifest`, with the id `oaiy-agent`), OAIY's icons and a service worker (`public/sw.js`) that keeps the app and the Zipp engine for offline use.
+
+- **Install.** Where the browser says the app can be installed (Chrome, Edge and the other Chromium browsers), the ☰ menu has **Install app** at its top; choosing it opens the browser's own question. The item is not there once the app is installed or runs in a window of its own, in a browser that offers nothing, or in OAIY's own window and the desktop app (they carry the page themselves). On iOS Safari, which never sends that offer, the item shows one sentence instead: tap the Share button, then Add to Home Screen. Any other browser that offers nothing shows nothing, rather than instructions that may be wrong.
+- **Icons.** PNG 192 and 512, a maskable 512 (the mark inside the safe zone, on the tile's gradient), a 180 px touch icon for iOS and a 32 px favicon beside the SVG one. `python scripts/make-icons.py` (Pillow) makes them from OAIY's icon, `platform/desktop/src-tauri/icons/icon.png`, and gives the same files every time.
+- **Update.** Every build has its own cache, named `oaiy-agent-` and a hash of the build. A new version installs beside the running one and waits: a tab that is open keeps the version it started with, so its files are never taken from under it. The page shows **A new version is ready** with a **Reload** button. Reload tells the waiting worker to take over and reloads the page once; nothing reloads it by itself. If another tab has already switched, the message says so too. When the page is shown again after more than an hour, it asks the browser for a new version (the browser also asks on every visit).
+- **Old caches.** When a version takes over it deletes the caches of earlier builds and the `bot.computer-*` ones from before the app was called OAIY, and no others on the same origin.
+- **First visit.** The first worker has nothing to wait for and starts at once; on a host without the isolation headers the page then reloads itself once (at most once a minute) to get them.
+- **From before.** A copy installed when the app was called bot.computer may keep its old name and icon until it is installed again, because browsers tie an installed app to its manifest id.
+- **Not in OAIY's window.** There the service worker is skipped: the desktop serves the page with the isolation headers and ships its files.
+
+`node tests/e2e/pwa.mjs` checks all of this in Chrome against the production build: the manifest and every icon it names, Chrome's installability errors (none), the old caches, "Install app" in each case above, and an update from the message to the reload.
 
 ### The desktop app
 
@@ -281,7 +295,7 @@ The shell works on the project's files through the same host calls, so it can't 
 
 ```sh
 npm test           # unit: gate, virtual filesystem, agent loop over both wire formats
-npm run test:e2e   # headless Chrome: the sandbox, shell, git and tools (tests/e2e/run.mjs), the whole app with a scripted model (tests/e2e/app.mjs), web pages on Zipp with screenshots and screen sizes, 3D models in the viewer and in a SoftN Scene3D (tests/e2e/webpage.mjs), media with a mock oaiy (tests/e2e/oaiy.mjs)
+npm run test:e2e   # headless Chrome: the sandbox, shell, git and tools (tests/e2e/run.mjs), the whole app with a scripted model (tests/e2e/app.mjs), web pages on Zipp with screenshots and screen sizes, 3D models in the viewer and in a SoftN Scene3D (tests/e2e/webpage.mjs), media with a mock oaiy (tests/e2e/oaiy.mjs), the production build on a static server with its service worker: isolation and offline use (tests/e2e/static.mjs), installing and updating (tests/e2e/pwa.mjs)
 ```
 
 The end-to-end tests use a local Chrome or Edge (`CHROME=<path>` to choose one).

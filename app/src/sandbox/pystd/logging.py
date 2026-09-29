@@ -1,4 +1,4 @@
-"""Logging (a pure-Python subset of CPython's logging, for bot.computer's sandbox)."""
+"""Logging (a pure-Python subset of CPython's logging, for OAIY's sandbox)."""
 import sys
 import time
 

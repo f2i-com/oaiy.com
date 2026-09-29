@@ -1,4 +1,4 @@
-"""CSV files (a pure-Python csv module for bot.computer's sandbox)."""
+"""CSV files (a pure-Python csv module for OAIY's sandbox)."""
 
 QUOTE_MINIMAL = 0
 QUOTE_ALL = 1

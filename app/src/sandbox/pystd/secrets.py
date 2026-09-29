@@ -1,4 +1,4 @@
-"""Tokens and random choices for secrets (pure Python, for bot.computer's sandbox)."""
+"""Tokens and random choices for secrets (pure Python, for OAIY's sandbox)."""
 import os
 import base64
 import binascii

@@ -1,4 +1,4 @@
-"""Base16, Base32 and Base64 encodings (pure Python, for bot.computer's sandbox)."""
+"""Base16, Base32 and Base64 encodings (pure Python, for OAIY's sandbox)."""
 import binascii
 
 _B64 = 'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/'

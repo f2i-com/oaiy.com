@@ -1,4 +1,4 @@
-"""Parse URLs and query strings (pure Python, for bot.computer's sandbox)."""
+"""Parse URLs and query strings (pure Python, for OAIY's sandbox)."""
 
 _ALWAYS_SAFE = 'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789_.-~'
 uses_netloc = ['', 'ftp', 'http', 'https', 'ws', 'wss', 'file', 'git', 'ssh', 'sftp']

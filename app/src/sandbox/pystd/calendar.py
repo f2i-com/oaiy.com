@@ -1,4 +1,4 @@
-"""Calendar functions (pure Python, for bot.computer's sandbox)."""
+"""Calendar functions (pure Python, for OAIY's sandbox)."""
 import datetime
 
 MONDAY, TUESDAY, WEDNESDAY, THURSDAY, FRIDAY, SATURDAY, SUNDAY = 0, 1, 2, 3, 4, 5, 6

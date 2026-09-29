@@ -1,4 +1,4 @@
-"""Names for built-in types, and SimpleNamespace (pure Python, for bot.computer's sandbox)."""
+"""Names for built-in types, and SimpleNamespace (pure Python, for OAIY's sandbox)."""
 
 
 def _f():

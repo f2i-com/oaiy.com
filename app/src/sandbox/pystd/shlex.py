@@ -1,4 +1,4 @@
-"""Shell-like syntax: split, quote and join (pure Python, for bot.computer's sandbox)."""
+"""Shell-like syntax: split, quote and join (pure Python, for OAIY's sandbox)."""
 import re
 
 _unsafe = re.compile(r'[^\w@%+=:,./-]')

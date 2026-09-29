@@ -1,4 +1,4 @@
-"""Threads in bot.computer's sandbox: there is one thread, so start() runs the target to completion. Locks and events work as they would uncontended."""
+"""Threads in OAIY's sandbox: there is one thread, so start() runs the target to completion. Locks and events work as they would uncontended."""
 
 
 class Lock:

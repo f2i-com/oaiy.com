@@ -1,4 +1,4 @@
-"""Comparing sequences: SequenceMatcher, unified and context diffs, close matches (pure Python, for bot.computer's sandbox)."""
+"""Comparing sequences: SequenceMatcher, unified and context diffs, close matches (pure Python, for OAIY's sandbox)."""
 
 
 class Match:

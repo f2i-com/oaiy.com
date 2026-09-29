@@ -1,4 +1,4 @@
-"""UUID objects (pure Python, for bot.computer's sandbox)."""
+"""UUID objects (pure Python, for OAIY's sandbox)."""
 import os
 import hashlib
 

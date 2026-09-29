@@ -1,4 +1,4 @@
-"""HTML escaping (pure Python, for bot.computer's sandbox)."""
+"""HTML escaping (pure Python, for OAIY's sandbox)."""
 
 _ENTITIES = {
     'amp': '&', 'lt': '<', 'gt': '>', 'quot': '"', 'apos': "'", 'nbsp': '\xa0', 'copy': '\xa9', 'reg': '\xae',

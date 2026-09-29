@@ -1,4 +1,4 @@
-"""Dates and times (a pure-Python subset of CPython's datetime for bot.computer's sandbox)."""
+"""Dates and times (a pure-Python subset of CPython's datetime for OAIY's sandbox)."""
 import time as _time
 
 MINYEAR = 1

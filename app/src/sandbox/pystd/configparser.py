@@ -1,4 +1,4 @@
-"""INI-style configuration files (pure Python, for bot.computer's sandbox)."""
+"""INI-style configuration files (pure Python, for OAIY's sandbox)."""
 import re
 
 DEFAULTSECT = 'DEFAULT'

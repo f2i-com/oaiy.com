@@ -1,4 +1,4 @@
-"""Conversions between binary data and ASCII (pure Python, for bot.computer's sandbox)."""
+"""Conversions between binary data and ASCII (pure Python, for OAIY's sandbox)."""
 
 
 class Error(ValueError):

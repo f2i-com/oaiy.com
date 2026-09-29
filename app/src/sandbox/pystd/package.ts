@@ -1,5 +1,5 @@
 /**
- * bot.computer's Python package for Zipp: standard-library modules Zipp's
+ * OAIY's Python package for Zipp: standard-library modules Zipp's
  * Python does not have (written in Python, in this folder) and the runtime
  * additions in runtime.js, packed in the `zipp-python-package 1` format
  * Zipp's addPythonPackage takes (see zipp-vm/src/python_packages.rs):

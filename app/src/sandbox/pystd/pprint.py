@@ -1,4 +1,4 @@
-"""Pretty printing of data structures (pure Python, for bot.computer's sandbox)."""
+"""Pretty printing of data structures (pure Python, for OAIY's sandbox)."""
 import sys
 
 

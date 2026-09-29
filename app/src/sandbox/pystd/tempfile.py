@@ -1,4 +1,4 @@
-"""Temporary files and folders, under /tmp in the project (pure Python, for bot.computer's sandbox)."""
+"""Temporary files and folders, under /tmp in the project (pure Python, for OAIY's sandbox)."""
 import os
 import random
 

@@ -1,4 +1,4 @@
-"""Warnings (pure Python, for bot.computer's sandbox): printed to stderr, filterable."""
+"""Warnings (pure Python, for OAIY's sandbox): printed to stderr, filterable."""
 import sys
 
 filters = []

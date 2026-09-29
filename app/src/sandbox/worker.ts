@@ -128,7 +128,7 @@ async function run(message: Extract<ToWorker, { type: 'run' }>): Promise<RunResu
   };
   await glue.default({ module_or_path: message.module });
   const request = message.request;
-  // bot.computer's Python additions (standard modules, stdin, the working folder), before any Python engine exists.
+  // OAIY's Python additions (standard modules, stdin, the working folder), before any Python engine exists.
   let packageError: string | undefined;
   if (request.lang === 'python' && glue.addPythonPackage && glue.pythonPackages) {
     try {

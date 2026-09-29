@@ -439,7 +439,7 @@ var frames = window;
   });
 })();
 
-// A page's storage: kept by bot.computer for this page, apart from everything else.
+// A page's storage: kept by OAIY for this page, apart from everything else.
 function __storage(area) {
   var api = {
     getItem: function (k) {
@@ -581,7 +581,7 @@ var PopStateEvent = function (type, init) {
   return __host('new', 'PopStateEvent', [type, __encode(init || {})]);
 };
 
-// Dialogs do not block the preview: the page carries on, and bot.computer notes them.
+// Dialogs do not block the preview: the page carries on, and OAIY notes them.
 function alert(message) {
   __host('dialog', 'alert', message === undefined ? '' : String(message));
 }
