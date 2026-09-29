@@ -597,6 +597,15 @@ export function phoneConversationsTool(sessions: () => Sessions | null): Session
   };
 }
 
+/**
+ * How a fact about a customer is written: the business reads them on the
+ * dashboard's Contacts ("What the receptionist remembered"), so plainly, about
+ * the customer, with none of the agents' own words for things.
+ */
+export function factStyle(business = ''): string {
+  return `Write each fact as a short plain note about the customer, e.g. "Wants to keep the Fri 2 Oct 1 pm booking". Refer to the business by its name (${business ? `"${business}"` : 'e.g. "Green Lawns"'}) or as "the owner", never "your person", and use no internal wording (no agents, runner, tools, notes or instructions).`;
+}
+
 /** One person's note, as the runner reads it: their name (and who gave it), the business's notes, and what was remembered. */
 function noteText(c: CallerNote): string {
   const lines = [
@@ -617,13 +626,13 @@ export function callerNotesTool(sessions: () => Sessions | null): SessionTool {
     spec: {
       name: 'caller_notes',
       description:
-        "What the phone's agents know about each person who calls or texts, from their contact on OAIY Desktop (the dashboard's Contacts): their name, your person's own notes about them, and short facts remembered on their calls and texts. Each of their calls' agents reads it as the call starts, their text thread's agent before every reply. With no number: everyone's who has been in touch. With a number: theirs. To change what was remembered, give name, add (one fact), remove (takes out the remembered facts that contain these words) or facts (all of them, replacing the rest). A name or notes your person set in Contacts are theirs: they stay (your person changes them there).",
+        `What the phone's agents know about each person who calls or texts, from their contact on OAIY Desktop (the dashboard's Contacts): their name, your person's own notes about them, and short facts remembered on their calls and texts. Each of their calls' agents reads it as the call starts, their text thread's agent before every reply. With no number: everyone's who has been in touch. With a number: theirs. To change what was remembered, give name, add (one fact), remove (takes out the remembered facts that contain these words) or facts (all of them, replacing the rest). A name or notes your person set in Contacts are theirs: they stay (your person changes them there). The facts show in Contacts, under "What the receptionist remembered": ${factStyle()}`,
       parameters: {
         type: 'object',
         properties: {
           number: { type: 'string', description: 'Their phone number' },
           name: { type: 'string' },
-          add: { type: 'string', description: 'A fact to add, in a few words' },
+          add: { type: 'string', description: 'A fact to add: a short plain note about the customer, e.g. "Wants to keep the Fri 2 Oct 1 pm booking"' },
           remove: { type: 'string' },
           facts: { type: 'array', items: { type: 'string' } },
         },
@@ -1174,12 +1183,16 @@ export class Sessions {
 
   /** A call's and a text thread's tools for the person on the other end: what is known about them, and their earlier conversations. */
   private personTools(session: Session): SessionTool[] {
+    const business = () => this.identity().business;
     return [
       {
-        spec: {
-          name: 'remember',
-          description: 'Save something about the person you are talking with, for their next call or text: their name when they tell you it, or one short fact worth knowing next time (what they usually book, a preference, where the job is). Only about them, and only what they said or what happened.',
-          parameters: { type: 'object', properties: { name: { type: 'string', description: 'Their name, as they said it' }, fact: { type: 'string', description: 'One short fact, in a few words' } } },
+        // Read each time: the business's name as the desktop says it now (the same for every call, so the prompt stays the same).
+        get spec() {
+          return {
+            name: 'remember',
+            description: `Save something about the person you are talking with, for their next call or text: their name when they tell you it, or one short fact worth knowing next time (what they usually book, a preference, where the job is). Only about them, and only what they said or what happened. The business reads these facts in its Contacts: ${factStyle(business())}`,
+            parameters: { type: 'object', properties: { name: { type: 'string', description: 'Their name, as they said it' }, fact: { type: 'string', description: 'One short fact: a plain note about them, e.g. "Wants to keep the Fri 2 Oct 1 pm booking"' } } },
+          };
         },
         run: async (input) => {
           const name = typeof input.name === 'string' ? input.name.trim() : '';

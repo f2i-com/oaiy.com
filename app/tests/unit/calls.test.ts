@@ -894,3 +894,31 @@ describe('a phone call answered by the agent', () => {
     expect(fake.bodies).toHaveLength(4);
   });
 });
+describe("what the agents remember about a customer is written for the business's Contacts", () => {
+  it('remember and caller_notes say how: a short plain note about the customer, the business by name or "the owner", never "your person"', async () => {
+    // Live 29 Sept 2026: Contacts showed "…Your person noticed the Thursday one…" and "…waiting on your person to confirm."
+    type Spec = { name: string; description: string; parameters: { properties: Record<string, { description?: string }> } };
+    let remember: Spec | undefined;
+    fakeProvider('openai', [
+      (body) => {
+        remember = (body.tools as Array<{ function: Spec }>).find((t) => t.function.name === 'remember')?.function;
+        return { text: 'Okay.' };
+      },
+    ]);
+    const { sessions } = setup();
+    sessions.identity = () => ({ business: 'Green Lawns', receptionist: 'Aokie' });
+    await sessions.callEvent({ type: 'call.started', callId: 'call_f', from: '+61412345678' });
+    await sessions.callEvent({ type: 'call.caller', callId: 'call_f', text: 'Hi.' });
+    await settled(sessions);
+    const notes = callerNotesTool(() => sessions).spec;
+    for (const description of [remember!.description, notes.description]) {
+      expect(description).toContain('Write each fact as a short plain note about the customer, e.g. "Wants to keep the Fri 2 Oct 1 pm booking".');
+      expect(description).toContain('or as "the owner", never "your person"');
+      expect(description).toContain('no internal wording');
+    }
+    // A call's agent knows the business's name.
+    expect(remember!.description).toContain('Refer to the business by its name ("Green Lawns")');
+    expect(remember!.parameters.properties.fact.description).toContain('"Wants to keep the Fri 2 Oct 1 pm booking"');
+    expect(notes.parameters.properties).toMatchObject({ add: { description: expect.stringContaining('a short plain note about the customer') } });
+  });
+});
