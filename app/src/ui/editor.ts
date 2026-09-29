@@ -9,16 +9,14 @@ import { javascript } from '@codemirror/lang-javascript';
 import { json } from '@codemirror/lang-json';
 import { markdown } from '@codemirror/lang-markdown';
 import { python } from '@codemirror/lang-python';
-import { oneDark } from '@codemirror/theme-one-dark';
 import { Compartment, EditorState, type Extension } from '@codemirror/state';
 import { EditorView, basicSetup } from 'codemirror';
 import type { Vfs } from '../vfs/vfs';
 import { clear, h } from './dom';
+import { editorLook } from './editorTheme';
+import { fileIcon, icon } from './icons';
 import { formatBytes, mediaElement, mediaKind, type Media } from './media';
-import { onTheme, theme, type Theme } from './theme';
-
-/** One Dark in the dark theme; CodeMirror's own light look in the light. */
-const look = (t: Theme): Extension => (t === 'dark' ? oneDark : []);
+import { onTheme, theme } from './theme';
 
 function languageFor(path: string): Extension[] {
   const ext = path.slice(path.lastIndexOf('.') + 1).toLowerCase();
@@ -34,12 +32,19 @@ function languageFor(path: string): Extension[] {
   }
 }
 
+/** What the header says about the open file's saving. */
+type SaveState = 'clean' | 'saving' | 'saved' | 'conflict' | 'error' | 'binary' | 'media';
+
 export class EditorPane {
   readonly element = h('section.editor');
-  /** The open file's path, beside a button that closes it. */
-  private readonly pathLabel = h('span.editor-path', 'No file open');
-  private readonly closeButton = h('button.icon.editor-close', { title: 'Close this file', 'aria-label': 'Close this file', onclick: () => this.closeByHand() }, '×') as HTMLButtonElement;
-  private readonly title = h('div.editor-title', this.pathLabel, this.closeButton);
+  /** The open file's path, as a breadcrumb (its text is the path). */
+  private readonly pathLabel = h('span.editor-title', 'No file open');
+  private readonly fileGlyph = h('span.editor-icon', { 'aria-hidden': 'true' });
+  /** A dot while there is typing not saved yet. */
+  private readonly dirtyDot = h('span.editor-dirty', { role: 'img', 'aria-label': 'unsaved changes', title: 'Not saved yet', hidden: true });
+  private readonly saveState = h('span.editor-state', { 'aria-live': 'polite' });
+  private readonly closeButton = h('button.icon.editor-close', { type: 'button', title: 'Close this file', 'aria-label': 'Close this file', onclick: () => this.closeByHand() }, icon('x')) as HTMLButtonElement;
+  private readonly title = h('div.editor-head', this.fileGlyph, this.pathLabel, this.dirtyDot, this.saveState, this.closeButton);
   /** The person closed the file (the tree lets go of it). */
   onClose: () => void = () => {};
   private readonly body = h('div.editor-body');
@@ -47,6 +52,7 @@ export class EditorPane {
   private path: string | null = null;
   private dirty = false;
   private saveTimer: ReturnType<typeof setTimeout> | null = null;
+  private savedTimer: ReturnType<typeof setTimeout> | null = null;
   private applying = false;
   /** The file changed outside the editor while it had unsaved typing: nothing is saved until the person chooses. */
   private conflict = false;
@@ -61,7 +67,7 @@ export class EditorPane {
     this.conflictBar.hidden = true;
     this.element.append(this.title, this.conflictBar, this.body);
     this.showEmpty();
-    onTheme((t) => this.view?.dispatch({ effects: this.look.reconfigure(look(t)) }));
+    onTheme((t) => this.view?.dispatch({ effects: this.look.reconfigure(editorLook(t)) }));
   }
 
   get openPath(): string | null {
@@ -74,10 +80,52 @@ export class EditorPane {
     this.close();
   }
 
+  /** The header for a file (or none): its icon, its path as a breadcrumb, and how its saving stands. */
+  private header(path: string | null, state: SaveState = 'clean', note = ''): void {
+    clear(this.pathLabel);
+    clear(this.fileGlyph);
+    this.closeButton.hidden = !path;
+    this.title.classList.toggle('empty', !path);
+    if (!path) {
+      this.pathLabel.textContent = 'No file open';
+      this.pathLabel.removeAttribute('title');
+    } else {
+      const parts = path.replace(/^\/+/, '').split('/');
+      parts.forEach((part, i) => {
+        this.pathLabel.append(h('span.crumb-sep', '/'), h(i === parts.length - 1 ? 'span.crumb.leaf' : 'span.crumb', part));
+      });
+      this.pathLabel.title = path;
+      const kind = fileIcon(parts[parts.length - 1]);
+      this.fileGlyph.className = `editor-icon tone-${kind.tone}`;
+      this.fileGlyph.append(icon(kind.icon));
+    }
+    this.setState(state, note);
+  }
+
+  private setState(state: SaveState, note = ''): void {
+    if (this.savedTimer) clearTimeout(this.savedTimer);
+    this.savedTimer = null;
+    this.dirtyDot.hidden = !(state === 'saving' || state === 'conflict');
+    this.saveState.dataset.state = state;
+    const words: Record<SaveState, string> = { clean: '', saving: 'Saving…', saved: 'Saved', conflict: 'Changed elsewhere', error: `Not saved: ${note}`, binary: note, media: note };
+    this.saveState.textContent = words[state];
+    this.saveState.title = state === 'saved' ? 'Saved to the project' : state === 'conflict' ? 'This file changed while you were typing: choose which version to keep' : '';
+    // "Saved" says so for a moment, then goes.
+    if (state === 'saved') this.savedTimer = setTimeout(() => this.setState('clean'), 1800);
+  }
+
   private showEmpty(): void {
-    this.closeButton.hidden = true;
+    this.header(null);
     clear(this.body);
-    this.body.append(h('div.empty', h('p', 'Open a file from the tree, or ask the agent to write one.')));
+    const key = (keys: string, what: string) => h('li', h('kbd', keys), h('span', what));
+    this.body.append(h(
+      'div.editor-empty',
+      h('span.editor-empty-icon', icon('file-text')),
+      h('h2', 'No file open'),
+      h('p', 'Open a file from the list, or ask the agent to write one.'),
+      h('ul.editor-keys', key('Ctrl F', 'find in the file'), key('Ctrl /', 'comment a line'), key('Alt ↑ ↓', 'move a line')),
+      h('p.editor-empty-note', 'What you type is saved to the project as you type.'),
+    ));
   }
 
   private dropMedia(): void {
@@ -98,14 +146,13 @@ export class EditorPane {
     if (!media) return;
     this.media = media;
     this.mediaPath = path;
-    this.pathLabel.textContent = path;
-    this.closeButton.hidden = false;
+    this.header(path, 'media', formatBytes(bytes.byteLength));
     const info = h('span.media-info', formatBytes(bytes.byteLength));
     const bar = h('div.media-bar', info);
     const img = media.element.querySelector('img');
     if (img) {
       img.addEventListener('load', () => (info.textContent = `${img.naturalWidth}×${img.naturalHeight} px · ${formatBytes(bytes.byteLength)}`), { once: true });
-      const zoom = h('button', { title: 'Show at actual size or fit to the pane (or click the image)' }, 'Actual size');
+      const zoom = h('button', { type: 'button', title: 'Show at actual size or fit to the pane (or click the image)' }, 'Actual size');
       const toggle = () => {
         const actual = media.element.classList.toggle('actual');
         zoom.textContent = actual ? 'Fit' : 'Actual size';
@@ -114,7 +161,7 @@ export class EditorPane {
       img.addEventListener('click', toggle);
       bar.append(zoom);
     }
-    if (/\.svg$/i.test(path)) bar.append(h('button', { title: 'Edit the SVG source', onclick: () => this.open(path, { source: true }) }, 'Source'));
+    if (/\.svg$/i.test(path)) bar.append(h('button', { type: 'button', title: 'Edit the SVG source', onclick: () => this.open(path, { source: true }) }, 'Source'));
     this.body.append(h('div.media-view', bar, media.element));
   }
 
@@ -132,29 +179,26 @@ export class EditorPane {
       this.view?.destroy();
       this.view = null;
       clear(this.body);
-      this.pathLabel.textContent = path;
-      this.closeButton.hidden = false;
       const size = this.vfs.stat(path)?.size ?? 0;
-      this.body.append(h('div.empty', h('p', `Binary file (${size.toLocaleString()} bytes) — not shown.`)));
+      this.header(path, 'binary', `${size.toLocaleString()} bytes`);
+      this.body.append(h('div.editor-empty', h('span.editor-empty-icon', icon('file')), h('h2', 'Binary file'), h('p', `${size.toLocaleString()} bytes: not shown here.`)));
       return;
     }
     this.path = path;
     this.dirty = false;
-    this.pathLabel.textContent = path;
-    this.closeButton.hidden = false;
+    this.header(path);
     const doc = this.vfs.readText(path);
     const state = EditorState.create({
       doc,
       extensions: [
         basicSetup,
-        this.look.of(look(theme())),
+        this.look.of(editorLook(theme())),
         EditorView.lineWrapping,
         ...languageFor(path),
         EditorView.updateListener.of((update) => {
           if (!update.docChanged || this.applying) return;
           this.dirty = true;
-          this.pathLabel.textContent = `${this.path} •`;
-          this.closeButton.hidden = false;
+          if (!this.conflict) this.setState('saving');
           if (this.saveTimer) clearTimeout(this.saveTimer);
           this.saveTimer = setTimeout(() => this.flush(), 400);
         }),
@@ -175,11 +219,9 @@ export class EditorPane {
     try {
       this.vfs.writeFile(this.path, this.view.state.doc.toString(), { parents: true });
       this.dirty = false;
-      this.pathLabel.textContent = this.path;
-      this.closeButton.hidden = false;
+      this.setState('saved');
     } catch (error) {
-      this.pathLabel.textContent = `${this.path} — not saved: ${(error as Error).message}`;
-      this.closeButton.hidden = false;
+      this.setState('error', (error as Error).message);
     }
   }
 
@@ -216,13 +258,13 @@ export class EditorPane {
     }
     clear(this.conflictBar);
     this.conflictBar.append(
+      icon('alert'),
       h('span', 'This file was changed (by the agent or the terminal) while you were editing it.'),
-      h('button', { onclick: () => this.resolve('theirs') }, 'Take the new version'),
-      h('button.primary', { onclick: () => this.resolve('mine') }, 'Keep mine'),
+      h('button', { type: 'button', onclick: () => this.resolve('theirs') }, 'Take the new version'),
+      h('button.primary', { type: 'button', onclick: () => this.resolve('mine') }, 'Keep mine'),
     );
     this.conflictBar.hidden = false;
-    this.pathLabel.textContent = `${this.path} • (changed elsewhere)`;
-    this.closeButton.hidden = false;
+    this.setState('conflict');
   }
 
   private resolve(choice: 'mine' | 'theirs'): void {
@@ -234,8 +276,7 @@ export class EditorPane {
       return;
     }
     this.dirty = false;
-    this.pathLabel.textContent = this.path;
-    this.closeButton.hidden = false;
+    this.setState('clean');
     const text = this.vfs.exists(this.path) ? this.vfs.readText(this.path) : '';
     this.applying = true;
     this.view.dispatch({ changes: { from: 0, to: this.view.state.doc.length, insert: text } });
@@ -257,7 +298,6 @@ export class EditorPane {
     this.view = null;
     this.path = null;
     this.dirty = false;
-    this.pathLabel.textContent = 'No file open';
     this.showEmpty();
   }
 }

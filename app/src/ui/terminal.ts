@@ -1,18 +1,43 @@
 /**
  * The terminal pane: the same emulated shell the agent uses, for the person.
  * Commands run on the Zipp VM against the project, through the network gate.
+ * It folds down to its header (remembered in this browser), giving the editor
+ * the room.
  */
 import type { NetGate } from '../gate/netgate';
 import { SandboxHost, summarize } from '../sandbox/host';
 import { runInSandbox } from '../sandbox/runner';
 import type { Vfs } from '../vfs/vfs';
 import { h } from './dom';
+import { icon } from './icons';
+
+/** Where this browser remembers the terminal folded. */
+const FOLDED = 'oaiy.terminal.folded';
+
+function remembered(): boolean {
+  try {
+    return localStorage.getItem(FOLDED) === '1';
+  } catch {
+    return false;
+  }
+}
+
+function remember(folded: boolean): void {
+  try {
+    localStorage.setItem(FOLDED, folded ? '1' : '0');
+  } catch {
+    // storage can be unavailable: it is only a convenience
+  }
+}
 
 export class TerminalPane {
   readonly element = h('section.terminal');
   private readonly out = h('pre.term-out');
-  private readonly prompt = h('span.term-prompt', '/ $');
-  private readonly input = h('input.term-input', { spellcheck: false, autocomplete: 'off', placeholder: 'ls, grep -rn TODO ., python script.py, help…' });
+  private readonly cwdLabel = h('span.term-cwd', '/');
+  private readonly prompt = h('span.term-prompt', { 'aria-hidden': 'true' }, this.cwdLabel, h('span.term-sigil', '$'));
+  private readonly input = h('input.term-input', { spellcheck: false, autocomplete: 'off', 'aria-label': 'Terminal command', placeholder: 'ls, grep -rn TODO ., python script.py, help…' });
+  private readonly toggle = h('button.term-toggle', { type: 'button' }) as HTMLButtonElement;
+  private readonly where = h('span.term-where');
   private cwd = '/';
   private env: Record<string, string> = {};
   private history: string[] = [];
@@ -23,11 +48,25 @@ export class TerminalPane {
   private stop: AbortController | null = null;
 
   constructor(private vfs: Vfs, private readonly gate: NetGate) {
-    this.element.append(
-      h('div.pane-title', 'Terminal ', h('span.muted', '— emulated shell on the Zipp VM, confined to the project')),
-      this.out,
-      h('div.term-line', this.prompt, this.input),
+    const head = h(
+      'div.pane-title.term-head',
+      { title: 'An emulated shell on the Zipp VM, confined to the project' },
+      h('span.pane-kicker', 'Terminal'),
+      h('span.term-about', 'emulated shell on the Zipp VM, confined to the project'),
+      this.where,
+      this.toggle,
     );
+    // The header folds it too (not its button's own click, which does it already).
+    head.addEventListener('click', (e) => {
+      if (!(e.target as Element).closest('button')) this.fold(!this.element.classList.contains('folded'));
+    });
+    this.toggle.addEventListener('click', (e) => {
+      // Its icon changes as it folds: the header must not take the same click again.
+      e.stopPropagation();
+      this.fold(!this.element.classList.contains('folded'));
+    });
+    this.element.append(head, this.out, h('div.term-line', this.prompt, this.input));
+    this.fold(remembered(), false);
     this.input.addEventListener('keydown', (e) => {
       if (e.key === 'Enter') void this.run(this.input.value);
       else if (e.key === 'ArrowUp' && this.history.length) {
@@ -51,13 +90,29 @@ export class TerminalPane {
     this.write('Type `help` to see what the shell can do.\n');
   }
 
+  /** Fold the terminal down to its header, or open it (and remember which, for this browser). */
+  private fold(folded: boolean, save = true): void {
+    this.element.classList.toggle('folded', folded);
+    this.toggle.setAttribute('aria-expanded', String(!folded));
+    this.toggle.title = folded ? 'Show the terminal' : 'Hide the terminal';
+    this.toggle.setAttribute('aria-label', this.toggle.title);
+    this.toggle.replaceChildren(icon(folded ? 'chevron-up' : 'chevron-down'));
+    if (save) remember(folded);
+    if (!folded && save) this.input.focus();
+  }
+
   setVfs(vfs: Vfs): void {
     this.vfs = vfs;
     this.cwd = '/';
     this.env = {};
     this.queue = [];
-    this.prompt.textContent = '/ $';
+    this.showPrompt();
     this.out.textContent = '';
+  }
+
+  private showPrompt(): void {
+    this.cwdLabel.textContent = this.cwd;
+    this.where.textContent = this.cwd === '/' ? '' : this.cwd;
   }
 
   private write(text: string, cls?: string): void {
@@ -108,7 +163,7 @@ export class TerminalPane {
     } finally {
       this.running = false;
       this.prompt.classList.remove('busy');
-      this.prompt.textContent = `${this.cwd} $`;
+      this.showPrompt();
       this.stop = null;
       // Back to the prompt only when the person was typing in the terminal, not somewhere else meanwhile.
       if (document.activeElement === document.body || this.element.contains(document.activeElement)) this.input.focus();
