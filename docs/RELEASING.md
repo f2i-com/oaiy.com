@@ -110,7 +110,8 @@ new version instead.
 
 ## The version
 
-A release is `N.N.N` (a tag of `N.N.N` or `vN.N.N`, no suffix such as `-beta`), and not
+A release is `N.N.N` (a tag of `N.N.N` or `vN.N.N`, no suffix such as `-beta`, and no
+leading zero in a number: Cargo refuses `0.09.0`, so `meta` does too), and not
 below `0.1.0`. The desktop's version is the one stamped from the tag, and it refuses a
 plugin whose manifest asks for a newer desktop. Aokie's manifest asks for 0.1.0, so an
 installer stamped `0.0.x` could not run Aokie; the `meta` job stops a tag below 0.1.0, and

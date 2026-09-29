@@ -59,16 +59,16 @@ function version(ref, input = '') {
 }
 
 describe('the version rule', { skip: bash ? false : 'no bash on this machine' }, () => {
-  for (const [tag, want] of [['0.1.0', '0.1.0'], ['v0.1.0', '0.1.0'], ['0.1.1', '0.1.1'], ['v0.10.0', '0.10.0'], ['0.09.0', '0.09.0'], ['1.0.0', '1.0.0'], ['v12.34.56', '12.34.56']]) {
+  for (const [tag, want] of [['0.1.0', '0.1.0'], ['v0.1.0', '0.1.0'], ['0.1.1', '0.1.1'], ['v0.10.0', '0.10.0'], ['0.100.0', '0.100.0'], ['1.0.0', '1.0.0'], ['v12.34.56', '12.34.56']]) {
     it(`accepts the tag ${tag} as ${want}`, () => {
       const r = version(`refs/tags/${tag}`);
       assert.equal(r.status, 0, r.stdout);
-      assert.equal(r.stderr, '', 'a leading zero (0.09.0) is a decimal number, not an octal one');
+      assert.equal(r.stderr, '');
       assert.deepEqual(r.lines, ['is_tag=true', `version=${want}`]);
     });
   }
 
-  for (const tag of ['0.0.0', '0.0.1', 'v0.0.6', '0.0.99', 'v00.00.5']) {
+  for (const tag of ['0.0.0', '0.0.1', 'v0.0.6', '0.0.99']) {
     it(`refuses the tag ${tag}, and says why`, () => {
       const r = version(`refs/tags/${tag}`);
       assert.equal(r.status, 1, r.stdout);
@@ -86,6 +86,17 @@ describe('the version rule', { skip: bash ? false : 'no bash on this machine' },
     });
   }
 
+  // A number with a leading zero is not a version (Cargo: "invalid leading zero in minor version number"), and it
+  // would only be found by the desktop legs' cargo build, after the whole gate had run.
+  for (const tag of ['0.09.0', '01.2.3', '1.02.3', '1.2.03', 'v00.00.5', '0.0.05', '00.1.0']) {
+    it(`refuses the tag ${tag} as not a version, for its leading zero`, () => {
+      const r = version(`refs/tags/${tag}`);
+      assert.equal(r.status, 1, r.stdout);
+      assert.match(r.stdout, /::error::'[^']+' is not a version of the form 0\.1\.0 \(three numbers, none with a leading zero\)/);
+      assert.deepEqual(r.lines, ['is_tag=true'], 'no version is passed on');
+    });
+  }
+
   it('holds a manual run of a branch to the same rule, and publishes nothing from it', () => {
     const ok = version('refs/heads/main', '0.1.0');
     assert.equal(ok.status, 0, ok.stdout);
@@ -94,6 +105,9 @@ describe('the version rule', { skip: bash ? false : 'no bash on this machine' },
     assert.equal(low.status, 1);
     assert.match(low.stdout, /is below 0\.1\.0/);
     assert.equal(low.outputs.version, undefined);
+    const zero = version('refs/heads/main', '0.09.0');
+    assert.equal(zero.status, 1);
+    assert.match(zero.stdout, /leading zero/);
   });
 
   it('takes the tag as the version on a tag, whatever a manual run says', () => {
