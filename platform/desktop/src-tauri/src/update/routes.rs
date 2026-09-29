@@ -1,8 +1,9 @@
 //! The update routes on the local API.
 //!
-//! - `GET  /api/update/status`: what the window reads (see [`super::updater::Status`]). Read-only,
-//!   open like `/api/health` (it says which version is running and whether a newer one exists,
-//!   which health already half says), so the headless server can be asked without a token.
+//! - `GET  /api/update/status`: what the window reads (see [`super::updater::Status`]). Read-only.
+//!   On the headless server it is open like `/api/health` (it says which version is running and whether a
+//!   newer one exists, which health already half says), so that can be asked without a token. On the desktop
+//!   it is a restricted read, like the calls (`http::origin_guard`): its blockers say whether a phone call is live.
 //! - `POST /api/update/check`: look for a newer release now. It is a plain GET of the release feed,
 //!   at most once every 30 seconds however it is asked for (this route, the window's button and the tray
 //!   share one limit), and privileged like the other routes that act (the desktop's own window, or the
@@ -365,6 +366,21 @@ mod tests {
         assert_eq!(gui.clone().oneshot(post(Some("https://evil.example"), None)).await.unwrap().status(), StatusCode::FORBIDDEN);
         assert_eq!(gui.clone().oneshot(post(None, None)).await.unwrap().status(), StatusCode::FORBIDDEN);
         assert_eq!(gui.clone().oneshot(post(Some("http://tauri.localhost"), None)).await.unwrap().status(), StatusCode::OK);
+        // The status says whether a call is live: on the desktop a page that is not OAIY's own may not read it.
+        let read = |origin: Option<&str>, bearer: Option<&str>| {
+            let mut r = Request::builder().method(Method::GET).uri("/api/update/status");
+            if let Some(o) = origin { r = r.header("origin", o); }
+            if let Some(b) = bearer { r = r.header("authorization", format!("Bearer {b}")); }
+            r.body(Body::empty()).unwrap()
+        };
+        for stranger in [Some("https://evil.example"), Some("http://evil.localhost:8080"), None] {
+            assert_eq!(gui.clone().oneshot(read(stranger, None)).await.unwrap().status(), StatusCode::FORBIDDEN, "{stranger:?}");
+        }
+        for own in ["http://tauri.localhost", "tauri://localhost", "http://oaiy.localhost", "https://oaiy.com"] {
+            assert_eq!(gui.clone().oneshot(read(Some(own), None)).await.unwrap().status(), StatusCode::OK, "{own}");
+        }
+        let with_token = guarded_for_tests(inner.clone(), Some("s3cret".into()), true);
+        assert_eq!(with_token.oneshot(read(None, Some("s3cret"))).await.unwrap().status(), StatusCode::OK);
         // The headless server (no gui mode): the check needs the token, the status does not.
         // (Another updater: checks are rate-limited, and the desktop one has just made one.)
         let (other, _) = app_at(&format!("{address}/latest.json"));

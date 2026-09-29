@@ -670,6 +670,9 @@ pub fn is_embedded_origin(origin: &str) -> bool {
     })
 }
 
+/// `GET /api/update/status`: open on the headless server (like health), a restricted read on the desktop.
+const UPDATE_STATUS_PATH: &str = "/api/update/status";
+
 fn is_allowed_origin(origin: &str) -> bool {
     // Dev + locally-served oaiy-web (any loopback port).
     if is_loopback_origin(origin) {
@@ -1277,8 +1280,9 @@ async fn origin_guard(
         || ((m == Method::GET || m == Method::HEAD)
             && (path == "/api/health"
                 // Which version runs and whether a newer release exists: what health half says already.
-                // Open, so the headless server, which only reports a newer release, can be asked without a token.
-                || path == "/api/update/status"
+                // Open, so the headless server, which only reports a newer release, can be asked without a
+                // token. (The desktop's listener does not take this exemption: see the restricted read below.)
+                || path == UPDATE_STATUS_PATH
                 || path == "/api/bridge/capabilities"
                 || path.strip_prefix("/api/bridge/pairing/")
                     .is_some_and(|id| !id.is_empty() && !id.contains('/'))));
@@ -1339,7 +1343,10 @@ async fn origin_guard(
         // Sensitive reads require a token outside the loopback GUI listener.
         let path = req.uri().path();
         let export_read = is_export_path(path);
-        let restricted_read = is_restricted_read_path(path);
+        // The update status says whether a phone call is live (it is why "Restart to update" is off), so on the
+        // desktop it is read like the calls themselves are: by OAIY's own pages or with the token, never by a page
+        // the owner happens to have open. The headless server computes no such thing and answers it openly.
+        let restricted_read = is_restricted_read_path(path) || (auth.gui_mode && path == UPDATE_STATUS_PATH);
         if export_read || restricted_read {
             let origin = req
                 .headers()
@@ -2010,14 +2017,17 @@ mod tests {
     }
 
     #[test]
-    fn checking_for_an_update_is_privileged_and_its_status_is_a_read_open_like_health() {
+    fn checking_for_an_update_is_privileged_and_its_status_is_open_on_the_headless_server_only() {
         // The check makes OAIY phone GitHub: the dashboard's own window or a token, never a local page.
         assert!(is_privileged_path(&Method::POST, "/api/update/check"));
         assert!(is_privileged_path(&Method::POST, "/api/update/agent-flushed"));
         // There is no route that downloads or installs: those are commands of the dashboard's window.
         assert!(!is_privileged_path(&Method::GET, "/api/update/status"));
+        // The status is open like health where nothing private is in it (the headless server); on the desktop's own
+        // listener origin_guard makes it a restricted read, because it says whether a call is live. That is
+        // asserted through the guard itself, in the update routes' guard test.
         assert!(!is_restricted_read_path("/api/update/status"));
-        // (A headless server answers the status without a token; see the update routes' guard test.)
+        assert_eq!(super::UPDATE_STATUS_PATH, "/api/update/status");
     }
 
     #[test]

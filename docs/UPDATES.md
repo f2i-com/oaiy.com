@@ -129,7 +129,7 @@ the update signature above, which OAIY checks and Windows does not.
 hardened unit and has nothing to replace itself with. It **reports** a newer release:
 
 ```sh
-curl -s http://127.0.0.1:17972/api/update/status            # open, like /api/health
+curl -s http://127.0.0.1:17972/api/update/status            # open here, like /api/health (the desktop keeps it to OAIY's own pages: it says whether a call is live)
 curl -s -X POST -H "Authorization: Bearer $OAIY_SERVER_TOKEN" http://127.0.0.1:17972/api/update/check
 ```
 
