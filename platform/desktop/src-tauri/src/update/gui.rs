@@ -123,7 +123,11 @@ impl Platform for GuiPlatform {
     fn prepare<'a>(&'a self, release: &'a Release) -> BoxFuture<'a, Result<(), String>> {
         Box::pin(async move {
             let changed = || "The update information changed while it was being read. Check again.".to_string();
-            let mut builder = self.app.updater_builder().timeout(Duration::from_secs(20));
+            // The plugin runs a hook before it starts the Windows installer that removes the tray icon and hides every window.
+            // OAIY has stopped what it runs by then (update::install), and if the installer then cannot be started it carries on:
+            // it must still have its tray icon and its window. (After a good hand-off the process ends at once, and Windows
+            // drops the icon the next time the mouse passes over it.)
+            let mut builder = self.app.updater_builder().timeout(Duration::from_secs(20)).on_before_exit(|| {});
             if let Some(url) = &self.feed_override {
                 let url = url.parse().map_err(|_| "The update address is not a web address.".to_string())?;
                 builder = builder.endpoints(vec![url]).map_err(|e| explain(&e))?;
@@ -223,11 +227,11 @@ pub async fn update_install(webview: Webview, app: AppHandle, updater: tauri::St
     match outcome {
         Outcome::HandedOff => {
             // Windows never gets here: the plugin started the installer and ended this process. On Linux the AppImage
-            // was replaced, so start it. Everything was stopped before the hand-off, and the same is done as the
-            // plugin does on Windows (clean up, then relaunch and exit) rather than the normal exit, which would stop it
-            // all a second time and empty the note of what was running that the hand-off wrote for the next start.
-            app.cleanup_before_exit();
-            tauri::process::restart(&app.env())
+            // was replaced, so start it, by the normal restart: its exit lets the single-instance plugin let go of its
+            // name (it does so on the exit event), which the new process needs. That exit stops everything a second time;
+            // the services part sees to it that this does not empty the note the hand-off wrote (settle_note).
+            app.request_restart();
+            Ok(())
         }
         Outcome::Refused(refusal) => Err(refusal.to_string()),
         Outcome::Failed { message, .. } => Err(message),
@@ -358,6 +362,23 @@ impl Part for PluginsPart {
     }
 }
 
+/// What the last update left as the running note for the next start, so that a second stop (the exit that follows a
+/// Linux hand-off) puts it back. None: no update is under way.
+static RELAUNCH_NOTE: Mutex<Option<Vec<String>>> = Mutex::new(None);
+
+/// The running note after services were stopped. Stopping each service empties it, which is right for a quit (a quit
+/// forgets). An update writes the services it found running, for the next start; and the exit that follows its hand-off
+/// on Linux stops the (already stopped) services again, which would empty it: so that pass puts the note back.
+fn settle_note(registry: &crate::services::registry::Registry, running: &[String], remember_for_relaunch: bool) {
+    let mut pending = RELAUNCH_NOTE.lock().unwrap_or_else(|e| e.into_inner());
+    if remember_for_relaunch {
+        registry.write_running_note(running);
+        *pending = Some(running.to_vec());
+    } else if let Some(note) = pending.as_ref() {
+        registry.write_running_note(note);
+    }
+}
+
 /// The services (model servers, the speech server for calls).
 struct ServicesPart {
     registry: Option<RegistryHandle>,
@@ -378,15 +399,15 @@ impl Part for ServicesPart {
             let running = r.running_ids();
             log::info!("stopping all services on exit");
             r.stop_all();
-            if self.remember_for_relaunch {
-                r.write_running_note(&running);
-            }
+            settle_note(&r, &running, self.remember_for_relaunch);
             *self.was_running.lock().unwrap_or_else(|e| e.into_inner()) = running;
         }
         Ok(())
     }
 
     fn start(&self) -> Result<(), String> {
+        // The update did not happen: OAIY carries on, and a later quit is an ordinary one.
+        *RELAUNCH_NOTE.lock().unwrap_or_else(|e| e.into_inner()) = None;
         let Some(registry) = &self.registry else { return Ok(()) };
         let ids = self.was_running.lock().unwrap_or_else(|e| e.into_inner()).clone();
         let mut r = registry.lock().unwrap_or_else(|e| e.into_inner());
@@ -526,13 +547,54 @@ mod tests {
     }
 
     #[test]
-    fn the_install_restarts_by_hand_after_the_stop_and_never_by_the_apps_restart_command_or_a_second_stop() {
+    fn the_install_relaunches_by_the_normal_restart_and_never_by_the_apps_restart_command() {
         let source = command_source("update_install");
-        assert!(source.contains("tauri::process::restart(&app.env())"));
-        assert!(source.contains("app.cleanup_before_exit();"));
-        // restart_app skips the stop; request_restart runs the exit body again, which empties the running note
-        // the install wrote for the next start.
-        assert!(!source.contains("restart_app") && !source.contains("request_restart(") && !source.contains(".restart()"), "{source}");
+        // restart_app relaunches without stopping anything; the normal restart runs the exit, which lets the single-instance
+        // plugin let go of its name before the new process asks for it.
+        assert!(source.contains("app.request_restart();"));
+        assert!(!source.contains("restart_app") && !source.contains("process::restart"), "{source}");
+    }
+
+    #[test]
+    fn the_stop_after_a_hand_off_puts_the_running_note_back_and_a_quit_forgets_as_it_always_did() {
+        use crate::services::registry::Registry;
+        let dir = std::env::temp_dir().join(format!("oaiy-update-note-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let registry = Registry::init(dir.clone(), dir.join("models"), Vec::new()).expect("a fresh folder is writable");
+        let note = || std::fs::read_to_string(dir.join("services-running.json")).unwrap_or_default();
+        let ids = vec!["oaiy-voice".to_string(), "llm".to_string()];
+
+        // No update under way: a quit leaves what stopping each service leaves, nothing.
+        *RELAUNCH_NOTE.lock().unwrap() = None;
+        registry.remember_running();
+        settle_note(&registry, &[], false);
+        assert_eq!(note().trim(), "[]");
+
+        // The update stops them and writes what it found running for the next start...
+        settle_note(&registry, &ids, true);
+        assert_eq!(serde_json::from_str::<Vec<String>>(&note()).unwrap(), ids);
+        // ...the exit that follows the hand-off stops everything again (which empties the note)...
+        registry.remember_running();
+        assert_eq!(note().trim(), "[]");
+        // ...and puts it back.
+        settle_note(&registry, &[], false);
+        assert_eq!(serde_json::from_str::<Vec<String>>(&note()).unwrap(), ids);
+
+        // An update that did not happen forgets the note it was going to leave.
+        *RELAUNCH_NOTE.lock().unwrap() = None;
+        registry.remember_running();
+        settle_note(&registry, &[], false);
+        assert_eq!(note().trim(), "[]");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn the_plugins_own_before_exit_hook_does_not_run_before_the_installer_is_started() {
+        // It removes the tray icon and hides every window; a failed hand-off must leave OAIY as it was.
+        let src = this_file();
+        let start = src.find("fn prepare<").expect("prepare");
+        let prepare = &src[start..start + src[start..].find("\n    }\n}").unwrap()];
+        assert!(prepare.contains(".on_before_exit(|| {})"), "{prepare}");
     }
 
     #[test]
