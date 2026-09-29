@@ -107,12 +107,25 @@ fn plural(n: usize, one: &str, many: &str) -> String {
 /// The reasons an install must wait, given what the app is doing (None: nothing is known yet, which is
 /// still starting up) and how long it has been running.
 pub fn compute(readings: Option<&Readings>, uptime: Duration) -> Vec<Blocker> {
-    let mut out = Vec::new();
     let Some(r) = readings else {
-        out.push(Blocker::new("starting", "OAIY is still starting up. Try again in a minute."));
-        return out;
+        return vec![Blocker::new("starting", "OAIY is still starting up. Try again in a minute.")];
     };
-    out.extend(call_blockers(&CallReadings { hub_calls: r.hub_calls, phone: r.phone.clone() }));
+    let mut out = work_blockers(r, "restart");
+    if uptime < MIN_UPTIME {
+        let left = (MIN_UPTIME - uptime).as_secs().max(1);
+        out.push(Blocker::new("starting", format!("OAIY started less than {} minutes ago; it can update in {left} seconds.", MIN_UPTIME.as_secs() / 60)));
+    }
+    out
+}
+
+/// What is in the way of anything that must not be interrupted, or copied while it is written: every reason an
+/// install waits for except how long OAIY has been up. An update asks it (through [`compute`]) and so does a backup
+/// (`backup::busy`), so that a call on OAIY's own line, a call a phone plugin reports (or cannot say), an Agent task, a
+/// download, an engine's media job, an install and a move of the data folder stop the one exactly as they stop the other.
+/// `waits` names what does not happen while OAIY cannot tell ("restart", "start a backup or a restore").
+pub fn work_blockers(r: &Readings, waits: &str) -> Vec<Blocker> {
+    let mut out = Vec::new();
+    out.extend(call_blockers_for(&CallReadings { hub_calls: r.hub_calls, phone: r.phone.clone() }, waits));
     if r.agent_tasks > 0 {
         out.push(Blocker::new("agentTask", plural(r.agent_tasks, "The Agent is working on a task from a flow.", "The Agent is working on {n} tasks from flows.")));
     }
@@ -128,7 +141,7 @@ pub fn compute(readings: Option<&Readings>, uptime: Duration) -> Vec<Blocker> {
         EnginesState::Known { media, .. } if *media > 0 => {
             out.push(Blocker::new("mediaJob", plural(*media, "The engines are making a picture, video or other media.", "The engines are making {n} pictures, videos or other media.")));
         }
-        EnginesState::Unknown(why) => out.push(Blocker::new("enginesUnknown", format!("OAIY can't tell whether the engines are busy: {why}. It does not restart while it can't tell."))),
+        EnginesState::Unknown(why) => out.push(Blocker::new("enginesUnknown", format!("OAIY can't tell whether the engines are busy: {why}. It does not {waits} while it can't tell."))),
         _ => {}
     }
     if !r.installing.is_empty() {
@@ -137,15 +150,16 @@ pub fn compute(readings: Option<&Readings>, uptime: Duration) -> Vec<Blocker> {
     if r.migrating {
         out.push(Blocker::new("migration", "The data folder is being moved."));
     }
-    if uptime < MIN_UPTIME {
-        let left = (MIN_UPTIME - uptime).as_secs().max(1);
-        out.push(Blocker::new("starting", format!("OAIY started less than {} minutes ago; it can update in {left} seconds.", MIN_UPTIME.as_secs() / 60)));
-    }
     out
 }
 
 /// The reasons the calls give: one on OAIY's own line, one a phone plugin reports, a phone plugin that cannot say.
 pub fn call_blockers(r: &CallReadings) -> Vec<Blocker> {
+    call_blockers_for(r, "restart")
+}
+
+/// [`call_blockers`], saying what does not happen while a phone plugin cannot be asked ("restart", "start a backup or a restore").
+pub fn call_blockers_for(r: &CallReadings, waits: &str) -> Vec<Blocker> {
     let mut out = Vec::new();
     if r.hub_calls > 0 {
         out.push(Blocker::new("call", plural(r.hub_calls, "A phone call is in progress on OAIY's own line.", "{n} phone calls are in progress on OAIY's own line.")));
@@ -158,7 +172,7 @@ pub fn call_blockers(r: &CallReadings) -> Vec<Blocker> {
         )),
         LineState::Unknown { plugin, why } => out.push(Blocker::new(
             "callUnknown",
-            format!("OAIY can't tell whether a phone call is live: {plugin} did not give an answer ({why}). It does not restart while it can't tell; stopping that plugin (Connections, Plugins, Stop) lets it."),
+            format!("OAIY can't tell whether a phone call is live: {plugin} did not give an answer ({why}). It does not {waits} while it can't tell; stopping that plugin (Connections, Plugins, Stop) lets it."),
         )),
     }
     out
@@ -317,6 +331,31 @@ mod tests {
 
     fn unknown(why: &str) -> LineState {
         LineState::Unknown { plugin: "Aokie Phone Bridge".into(), why: why.into() }
+    }
+
+    #[test]
+    fn what_stands_in_the_way_of_work_is_what_stands_in_the_way_of_an_update_apart_from_the_uptime() {
+        let a = Fake::default();
+        a.set(|s| {
+            s.calls = 1;
+            s.tasks = 1;
+            s.downloads = 1;
+            s.media = 1;
+            s.installing = vec!["Python".into()];
+            s.migrating = true;
+            s.phone = Some(unknown("no answer"));
+        });
+        let r = a.read(false);
+        let work = work_blockers(&r, "restart");
+        assert_eq!(work.iter().map(|b| b.code).collect::<Vec<_>>(), ["call", "callUnknown", "agentTask", "download", "mediaJob", "installing", "migration"]);
+        // An update sees the same, and only adds that OAIY has not been up long.
+        assert_eq!(compute(Some(&r), LONG), work);
+        assert_eq!(compute(Some(&r), Duration::from_secs(5)).len(), work.len() + 1);
+        // The wording names what waits: a backup does not "restart".
+        let backup = work_blockers(&r, "start a backup or a restore");
+        assert_eq!(backup.iter().map(|b| b.code).collect::<Vec<_>>(), work.iter().map(|b| b.code).collect::<Vec<_>>());
+        assert!(backup.iter().find(|b| b.code == "callUnknown").unwrap().message.contains("It does not start a backup or a restore while it can't tell"));
+        assert!(work.iter().find(|b| b.code == "callUnknown").unwrap().message.contains("It does not restart while it can't tell"));
     }
 
     #[test]
