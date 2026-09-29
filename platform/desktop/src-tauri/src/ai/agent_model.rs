@@ -232,8 +232,9 @@ struct Recommend {
 }
 
 /// How long the recommendation waits to learn whether ChatGPT is signed in.
-/// Asking starts the Codex child the first time, and waits behind a ChatGPT
-/// turn in progress; the wizard showing this should not.
+/// Asking starts the Codex child the first time, which can take a while; the
+/// wizard showing this should not wait for it. (A ChatGPT turn in progress no
+/// longer holds the question up: status is answered beside it.)
 const SIGN_IN_BUDGET: Duration = Duration::from_secs(5);
 
 /// The last answer, for when the budget runs out.

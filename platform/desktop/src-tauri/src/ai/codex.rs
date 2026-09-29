@@ -21,8 +21,8 @@ use std::io::{BufRead, BufReader, Read, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Child, ChildStdin, Command, Stdio};
 use std::sync::atomic::{AtomicI64, Ordering};
-use std::sync::mpsc::{channel, Receiver, Sender};
-use std::sync::{Arc, Mutex};
+use std::sync::mpsc::{channel, Receiver, RecvTimeoutError, Sender};
+use std::sync::{Arc, Condvar, Mutex, MutexGuard, PoisonError};
 use std::time::{Duration, Instant};
 
 /// The provider id this agent answers to, in the sources union and in
@@ -204,112 +204,258 @@ fn spawn_codex(codex_home: &Path) -> Result<Transport, CodexError> {
     Ok(Transport { to_server: Box::new(stdin), from_server: Box::new(stdout), child: Some(child) })
 }
 
-/// One live child + its RPC plumbing.
+/// Where the reader thread delivers what the app-server sends.
+#[derive(Default)]
+struct Routes {
+    /// Request id → whoever is waiting for that reply.
+    replies: HashMap<i64, Sender<Value>>,
+    /// Thread id → the turn reading that thread's notifications.
+    threads: HashMap<String, Sender<Value>>,
+    /// The app-server's stdout has closed: nothing more will come.
+    closed: bool,
+}
+
+/// One live app-server and its RPC plumbing, shared by every caller at once.
+///
+/// Nothing here is held for longer than it takes to write a line or update a
+/// map. A caller waits on a channel of its OWN, for its own reply or its own
+/// thread's notifications, so a long turn holds up nobody else's.
 struct Session {
-    child: Option<Child>,
-    stdin: Box<dyn Write + Send>,
+    child: Mutex<Option<Child>>,
+    stdin: Mutex<Box<dyn Write + Send>>,
     next_id: AtomicI64,
-    /// id → the reply, filled by the reader thread.
-    replies: Arc<Mutex<HashMap<i64, Value>>>,
-    /// Notifications, in arrival order (turn deltas etc.).
-    notes: Arc<Mutex<Vec<Value>>>,
-    _stop: Sender<()>,
+    routes: Arc<Mutex<Routes>>,
 }
 
 impl Session {
-    fn start(transport: Transport) -> Result<Self, CodexError> {
-        let Transport { to_server: stdin, from_server: stdout, child } = transport;
-
-        let replies: Arc<Mutex<HashMap<i64, Value>>> = Arc::new(Mutex::new(HashMap::new()));
-        let notes: Arc<Mutex<Vec<Value>>> = Arc::new(Mutex::new(Vec::new()));
-        let (tx, rx): (Sender<()>, Receiver<()>) = channel();
-
-        let r2 = replies.clone();
-        let n2 = notes.clone();
+    fn start(transport: Transport) -> Self {
+        let Transport { to_server, from_server, child } = transport;
+        let routes: Arc<Mutex<Routes>> = Arc::default();
+        let reading = routes.clone();
         std::thread::spawn(move || {
-            let reader = BufReader::new(stdout);
-            for line in reader.lines() {
-                if rx.try_recv().is_ok() {
-                    return;
-                }
-                let Ok(line) = line else { return };
-                let trimmed = line.trim();
-                if trimmed.is_empty() {
-                    continue;
-                }
-                let Ok(msg) = serde_json::from_str::<Value>(trimmed) else { continue };
-                match msg.get("id").and_then(Value::as_i64) {
-                    // A reply to something we asked.
-                    Some(id) if msg.get("method").is_none() => {
-                        if let Ok(mut map) = r2.lock() {
-                            map.insert(id, msg);
-                        }
-                    }
-                    // A server→client REQUEST. We expose no tools, so refusing is
-                    // the correct answer (and prevents the child from stalling).
-                    Some(_) => {}
-                    None => {
-                        if let Ok(mut v) = n2.lock() {
-                            v.push(msg);
-                        }
-                    }
-                }
+            for line in BufReader::new(from_server).lines() {
+                let Ok(line) = line else { break };
+                let Ok(msg) = serde_json::from_str::<Value>(line.trim()) else { continue };
+                deliver(&reading, msg);
             }
+            // The app-server is gone. Dropping every waiter's sender wakes it
+            // now, with an error, rather than when its timeout runs out.
+            let mut routes = lock(&reading);
+            routes.closed = true;
+            routes.replies.clear();
+            routes.threads.clear();
         });
-
-        Ok(Session { child, stdin, next_id: AtomicI64::new(0), replies, notes, _stop: tx })
+        Session { child: Mutex::new(child), stdin: Mutex::new(to_server), next_id: AtomicI64::new(0), routes }
     }
 
-    fn notify(&mut self, method: &str, params: Value) -> Result<(), CodexError> {
-        let line = json!({ "jsonrpc": "2.0", "method": method, "params": params }).to_string();
-        writeln!(self.stdin, "{line}").map_err(|e| CodexError::Rpc(format!("write failed: {e}")))?;
-        self.stdin.flush().ok();
+    fn write(&self, msg: Value) -> Result<(), CodexError> {
+        let mut stdin = lock(&self.stdin);
+        writeln!(stdin, "{msg}").map_err(|e| CodexError::Rpc(format!("write failed: {e}")))?;
+        stdin.flush().ok();
         Ok(())
     }
 
-    fn call(&mut self, method: &str, params: Value, timeout: Duration) -> Result<Value, CodexError> {
+    fn notify(&self, method: &str, params: Value) -> Result<(), CodexError> {
+        self.write(json!({ "jsonrpc": "2.0", "method": method, "params": params }))
+    }
+
+    fn call(&self, method: &str, params: Value, timeout: Duration) -> Result<Value, CodexError> {
         let id = self.next_id.fetch_add(1, Ordering::Relaxed) + 1;
-        let line = json!({ "jsonrpc": "2.0", "id": id, "method": method, "params": params }).to_string();
-        writeln!(self.stdin, "{line}").map_err(|e| CodexError::Rpc(format!("write failed: {e}")))?;
-        self.stdin.flush().ok();
-
-        let deadline = Instant::now() + timeout;
-        while Instant::now() < deadline {
-            if let Ok(mut map) = self.replies.lock() {
-                if let Some(msg) = map.remove(&id) {
-                    if let Some(err) = msg.get("error") {
-                        return Err(CodexError::Rpc(
-                            err.get("message").and_then(Value::as_str).unwrap_or("codex error").to_string(),
-                        ));
-                    }
-                    return Ok(msg.get("result").cloned().unwrap_or(Value::Null));
-                }
+        let (tx, rx) = channel();
+        {
+            let mut routes = lock(&self.routes);
+            if routes.closed {
+                return Err(exited());
             }
-            std::thread::sleep(Duration::from_millis(25));
+            // Before the request is written, so even an instant reply finds it.
+            routes.replies.insert(id, tx);
         }
-        Err(CodexError::Rpc(format!("{method} timed out")))
+        if let Err(e) = self.write(json!({ "jsonrpc": "2.0", "id": id, "method": method, "params": params })) {
+            lock(&self.routes).replies.remove(&id);
+            return Err(e);
+        }
+        let msg = match rx.recv_timeout(timeout) {
+            Ok(msg) => msg,
+            Err(RecvTimeoutError::Timeout) => {
+                lock(&self.routes).replies.remove(&id);
+                return Err(CodexError::Rpc(format!("{method} timed out")));
+            }
+            Err(RecvTimeoutError::Disconnected) => return Err(exited()),
+        };
+        if let Some(err) = msg.get("error") {
+            return Err(CodexError::Rpc(
+                err.get("message").and_then(Value::as_str).unwrap_or("codex error").to_string(),
+            ));
+        }
+        Ok(msg.get("result").cloned().unwrap_or(Value::Null))
     }
 
-    /// Notifications received since `from`, leaving the buffer intact.
-    fn notes_since(&self, from: usize) -> Vec<Value> {
-        self.notes.lock().map(|v| v[from.min(v.len())..].to_vec()).unwrap_or_default()
-    }
-    fn notes_len(&self) -> usize {
-        self.notes.lock().map(|v| v.len()).unwrap_or(0)
+    /// `thread`'s notifications from now on, until the listener is dropped.
+    fn listen(&self, thread: &str) -> Result<ThreadListener<'_>, CodexError> {
+        let (tx, rx) = channel();
+        let mut routes = lock(&self.routes);
+        if routes.closed {
+            return Err(exited());
+        }
+        routes.threads.insert(thread.to_string(), tx);
+        Ok(ThreadListener { session: self, thread: thread.to_string(), notes: rx })
     }
 
-    /// The child has exited.
-    fn exited(&mut self) -> bool {
-        self.child.as_mut().is_some_and(|c| c.try_wait().ok().flatten().is_some())
+    /// One turn: `thread/start` and `turn/start` as `request` says, and the
+    /// agent's whole message out, each fragment handed to `on_delta` as it
+    /// arrives.
+    fn turn(&self, request: &TurnRequest, on_delta: &mut dyn FnMut(&str)) -> Result<String, CodexError> {
+        let thread = self.call("thread/start", request.thread.clone(), RPC_TIMEOUT)?;
+        let thread_id = thread_id_of(&thread)
+            .ok_or_else(|| CodexError::Rpc("codex did not return a thread id".into()))?;
+
+        // Listening BEFORE the turn starts, so none of its notifications can
+        // arrive unheard.
+        let listener = self.listen(&thread_id)?;
+        let mut turn = request.turn.clone();
+        turn["threadId"] = Value::String(thread_id);
+        self.call("turn/start", turn, TURN_TIMEOUT)?;
+
+        // Collect the agent's message from this thread's notifications, each
+        // taken off the channel exactly once (see `fold_turn_notes`).
+        let deadline = Instant::now() + TURN_TIMEOUT;
+        let mut out = String::new();
+        loop {
+            let note = match listener.notes.recv_timeout(deadline.saturating_duration_since(Instant::now())) {
+                Ok(note) => note,
+                // Out of time: whatever arrived is the answer, as it always was.
+                Err(RecvTimeoutError::Timeout) => break,
+                // The app-server died mid-turn: this is not an answer.
+                Err(RecvTimeoutError::Disconnected) => return Err(exited()),
+            };
+            let before = out.len();
+            let done = fold_turn_notes(&mut out, std::slice::from_ref(&note));
+            // Whatever this note appended, verbatim — so a streaming caller
+            // sees exactly the text the buffered answer will contain and the
+            // two can never drift apart.
+            if out.len() > before {
+                on_delta(&out[before..]);
+            }
+            if done {
+                break;
+            }
+        }
+        if out.is_empty() {
+            return Err(CodexError::Rpc("codex returned no output for this turn".into()));
+        }
+        Ok(out)
+    }
+
+    /// The app-server is still there to answer.
+    fn alive(&self) -> bool {
+        !lock(&self.routes).closed
+            && lock(&self.child).as_mut().map_or(true, |c| c.try_wait().ok().flatten().is_none())
     }
 }
 
 impl Drop for Session {
     fn drop(&mut self) {
-        if let Some(child) = self.child.as_mut() {
+        if let Some(child) = lock(&self.child).as_mut() {
             let _ = child.kill();
             let _ = child.wait();
         }
+    }
+}
+
+/// One turn's hold on its thread's notifications. Dropped, it lets them go,
+/// so a turn that ended — or gave up — leaves nothing to pile up.
+struct ThreadListener<'a> {
+    session: &'a Session,
+    thread: String,
+    notes: Receiver<Value>,
+}
+
+impl Drop for ThreadListener<'_> {
+    fn drop(&mut self) {
+        lock(&self.session.routes).threads.remove(&self.thread);
+    }
+}
+
+/// Hands one message from the app-server to whoever is waiting for it.
+///
+/// Never blocks: every channel is unbounded, so a turn slow to read its own
+/// notifications cannot hold up another's.
+fn deliver(routes: &Mutex<Routes>, msg: Value) {
+    let mut routes = lock(routes);
+    match msg.get("id").and_then(Value::as_i64) {
+        // A reply to something we asked. One whose caller gave up has no
+        // waiter any more, and is dropped.
+        Some(id) if msg.get("method").is_none() => {
+            if let Some(waiter) = routes.replies.remove(&id) {
+                let _ = waiter.send(msg);
+            }
+        }
+        // A server→client REQUEST. We expose no tools, so refusing is
+        // the correct answer (and prevents the child from stalling).
+        Some(_) => {}
+        // A notification, to the turn on its thread. One for no thread
+        // (account news, rate limits) or for a thread nobody is reading any
+        // more is dropped.
+        None => {
+            let thread = msg.pointer("/params/threadId").and_then(Value::as_str);
+            if let Some(listener) = thread.and_then(|t| routes.threads.get(t)) {
+                let _ = listener.send(msg);
+            }
+        }
+    }
+}
+
+fn exited() -> CodexError {
+    CodexError::Rpc("the codex app-server exited".into())
+}
+
+/// A lock that outlives a panic elsewhere: nothing here is left half-changed
+/// by one, and the connector must keep answering.
+fn lock<T: ?Sized>(m: &Mutex<T>) -> MutexGuard<'_, T> {
+    m.lock().unwrap_or_else(PoisonError::into_inner)
+}
+
+/// A first-come, first-served line: one holder at a time, in the order they
+/// asked. `std`'s `Mutex` promises no order, and two turns of one call taken
+/// out of order would answer the caller's second sentence before the first.
+#[derive(Default)]
+struct Lane {
+    tickets: Mutex<Tickets>,
+    next_up: Condvar,
+}
+
+#[derive(Default)]
+struct Tickets {
+    issued: u64,
+    serving: u64,
+}
+
+impl Lane {
+    /// Waits for this caller's turn; it lasts until the result is dropped.
+    fn enter(&self) -> InLane<'_> {
+        let mut tickets = lock(&self.tickets);
+        let mine = tickets.issued;
+        tickets.issued += 1;
+        while tickets.serving != mine {
+            tickets = self.next_up.wait(tickets).unwrap_or_else(PoisonError::into_inner);
+        }
+        InLane(self)
+    }
+
+    /// In the lane now: the holder and those waiting behind it.
+    #[cfg(test)]
+    fn queued(&self) -> u64 {
+        let tickets = lock(&self.tickets);
+        tickets.issued - tickets.serving
+    }
+}
+
+struct InLane<'a>(&'a Lane);
+
+impl Drop for InLane<'_> {
+    fn drop(&mut self) {
+        lock(&self.0.tickets).serving += 1;
+        self.0.next_up.notify_all();
     }
 }
 
@@ -357,11 +503,56 @@ fn safe_login_url(raw: Option<&str>) -> Option<String> {
     LOGIN_HOSTS.contains(&host).then(|| raw.to_string())
 }
 
-/// The managed agent. One child at a time, started lazily and reused.
+/// The managed agent: one app-server child, started lazily and reused, with
+/// turns running on it side by side.
+///
+/// # A call never waits behind a setup turn
+///
+/// The app-server multiplexes. Each turn runs on a thread of its own,
+/// `turn/start` answers at once while the turn carries on, and every
+/// notification a turn sends (each delta, `item/completed`, `turn/completed`)
+/// names its `threadId`. So the one child can answer a live call while a long
+/// project or setup turn is still going. The [`Session`] routes each reply to
+/// the request that asked for it, by JSON-RPC id, and each notification to the
+/// turn on its thread, and holds nothing while a turn runs. It used to hold one
+/// lock for the whole turn, and a caller heard silence until the setup turn
+/// had finished.
+///
+/// What still takes turns is decided here, in two first-come, first-served
+/// [`Lane`]s:
+///
+/// - The live-call aliases' turns go one at a time, in the order they came, so
+///   two turns of one call never overtake each other. The routes carry no call
+///   id, so calls share the lane: two calls at once take turns with each other,
+///   never with anything else.
+/// - Every other turn (project, setup, runner, sms, task, and the tunnel's
+///   chat) goes one at a time in its own lane, as every turn did before. The
+///   account sees at most one of those plus one call turn at once.
+///
+/// Sign-in, status, sign-out and the model list take no lane. They are single
+/// requests, answered beside whatever turns are running.
+///
+/// # Why not a second child for calls
+///
+/// A second app-server on the same `CODEX_HOME` was the other way to keep
+/// calls apart, and it is the riskier one. Each child keeps its own copy of the
+/// ChatGPT credentials in memory, and writes `auth.json` itself when it
+/// refreshes them. The refresh token ROTATES: once one child has refreshed, the
+/// other's copy is spent, and Codex's answer to a spent token is "your refresh
+/// token was already used — please log out and sign in again". Codex 0.144
+/// re-reads `auth.json` before refreshing, which narrows that race but takes no
+/// lock against the other process. Two children would also mean two login
+/// flows to keep apart, and a sign-out through one leaving the other signed in
+/// until it was restarted. One child has one copy of the credentials, one
+/// login flow and one sign-out, and nothing new to stop on shutdown.
 pub struct CodexAgent {
     codex_home: PathBuf,
     connect: Connect,
-    session: Mutex<Option<Session>>,
+    session: Mutex<Option<Arc<Session>>>,
+    /// Live-call turns: one at a time, in the order they came.
+    call_lane: Lane,
+    /// Every other turn: one at a time, in the order they came.
+    turn_lane: Lane,
 }
 
 pub type CodexHandle = Arc<CodexAgent>;
@@ -372,7 +563,13 @@ pub fn new_handle(data_dir: &Path) -> CodexHandle {
 
 impl CodexAgent {
     fn with_connect(codex_home: PathBuf, connect: Connect) -> CodexHandle {
-        Arc::new(CodexAgent { codex_home, connect, session: Mutex::new(None) })
+        Arc::new(CodexAgent {
+            codex_home,
+            connect,
+            session: Mutex::new(None),
+            call_lane: Lane::default(),
+            turn_lane: Lane::default(),
+        })
     }
 }
 
@@ -392,42 +589,44 @@ pub struct CodexStatus {
 
 impl CodexAgent {
     /// Run `f` against a live, initialized session, starting one if needed.
-    fn with_session<T>(
-        &self,
-        f: impl FnOnce(&mut Session) -> Result<T, CodexError>,
-    ) -> Result<T, CodexError> {
-        let mut guard = self.session.lock().map_err(|_| CodexError::Rpc("session lock poisoned".into()))?;
-        if guard.is_none() {
-            let mut s = Session::start((self.connect)(&self.codex_home)?)?;
-            s.call(
-                "initialize",
-                json!({
-                    "clientInfo": { "name": "oaiy-desktop", "title": "OAIY Desktop",
-                                    "version": env!("CARGO_PKG_VERSION") },
-                    // Required, not optional. `thread/start` carries
-                    // `runtimeWorkspaceRoots` — the field that pins a turn to
-                    // NO workspace — and the runtime refuses that parameter
-                    // outright unless this capability was negotiated here.
-                    // Without it every chat fails with
-                    // "requires experimentalApi capability", and dropping the
-                    // parameter instead would hand the agent a default
-                    // workspace, which is the opposite of what it is for.
-                    "capabilities": { "experimentalApi": true }
-                }),
-                RPC_TIMEOUT,
-            )?;
-            s.notify("initialized", json!({}))?;
-            *guard = Some(s);
+    ///
+    /// The session is shared: `f` runs beside any other caller's, holding no
+    /// lock of this agent's while it does.
+    fn with_session<T>(&self, f: impl FnOnce(&Session) -> Result<T, CodexError>) -> Result<T, CodexError> {
+        let session = self.session()?;
+        f(&session)
+    }
+
+    /// The live, initialized app-server, starting one if there is none.
+    fn session(&self) -> Result<Arc<Session>, CodexError> {
+        let mut slot = lock(&self.session);
+        if let Some(s) = slot.as_ref().filter(|s| s.alive()) {
+            return Ok(s.clone());
         }
-        let session = guard.as_mut().expect("just ensured");
-        let out = f(session);
-        // A dead child must not be reused: drop it so the next call respawns.
-        if let Err(CodexError::Rpc(_)) = &out {
-            if session.exited() {
-                *guard = None;
-            }
-        }
-        out
+        // A dead child must not be reused: drop it so this call respawns. A
+        // turn still holding it has already been told it exited.
+        *slot = None;
+        let s = Arc::new(Session::start((self.connect)(&self.codex_home)?));
+        s.call(
+            "initialize",
+            json!({
+                "clientInfo": { "name": "oaiy-desktop", "title": "OAIY Desktop",
+                                "version": env!("CARGO_PKG_VERSION") },
+                // Required, not optional. `thread/start` carries
+                // `runtimeWorkspaceRoots` — the field that pins a turn to
+                // NO workspace — and the runtime refuses that parameter
+                // outright unless this capability was negotiated here.
+                // Without it every chat fails with
+                // "requires experimentalApi capability", and dropping the
+                // parameter instead would hand the agent a default
+                // workspace, which is the opposite of what it is for.
+                "capabilities": { "experimentalApi": true }
+            }),
+            RPC_TIMEOUT,
+        )?;
+        s.notify("initialized", json!({}))?;
+        *slot = Some(s.clone());
+        Ok(s)
     }
 
     /// Sign-in state + whether the CLI is usable at all. Never errors: the panel
@@ -538,50 +737,13 @@ impl CodexAgent {
         complete_with(body, alias, on_delta, |request, emit| self.run_turn(request, emit))
     }
 
-    /// One turn on the child: `thread/start` and `turn/start` as `request`
-    /// says, the agent's whole message out, each fragment handed to
-    /// `on_delta` as it arrives.
+    /// One turn on the child, once its lane lets it (see [`CodexAgent`]): a
+    /// live call's turn waits only for the call's turns before it, and never
+    /// for anything else.
     fn run_turn(&self, request: &TurnRequest, on_delta: &mut dyn FnMut(&str)) -> Result<String, CodexError> {
-        self.with_session(|s| {
-            let thread = s.call("thread/start", request.thread.clone(), RPC_TIMEOUT)?;
-            let thread_id = thread_id_of(&thread)
-                .ok_or_else(|| CodexError::Rpc("codex did not return a thread id".into()))?;
-
-            let from = s.notes_len();
-            let mut turn = request.turn.clone();
-            turn["threadId"] = Value::String(thread_id);
-            s.call("turn/start", turn, TURN_TIMEOUT)?;
-
-            // Collect the agent's message from the notification stream.
-            //
-            // The cursor ADVANCES. Re-reading from a fixed mark every 50 ms
-            // appended each delta once per polling round, so a two-word answer
-            // came back as "OAIYOAIY tunnel worksOAIY tunnel works." — plausible
-            // enough to read as the model repeating itself.
-            let deadline = Instant::now() + TURN_TIMEOUT;
-            let mut out = String::new();
-            let mut done = false;
-            let mut cursor = from;
-            while Instant::now() < deadline && !done {
-                let batch = s.notes_since(cursor);
-                cursor += batch.len();
-                let before = out.len();
-                done = fold_turn_notes(&mut out, &batch);
-                // Whatever this batch appended, verbatim — so a streaming
-                // caller sees exactly the text the buffered answer will contain
-                // and the two can never drift apart.
-                if out.len() > before {
-                    on_delta(&out[before..]);
-                }
-                if !done {
-                    std::thread::sleep(Duration::from_millis(50));
-                }
-            }
-            if out.is_empty() {
-                return Err(CodexError::Rpc("codex returned no output for this turn".into()));
-            }
-            Ok(out)
-        })
+        let lane = if request.live_call { &self.call_lane } else { &self.turn_lane };
+        let _in_lane = lane.enter();
+        self.with_session(|s| s.turn(request, on_delta))
     }
 }
 
@@ -604,6 +766,8 @@ struct TurnPlan {
 pub(super) struct TurnRequest {
     pub(super) thread: Value,
     pub(super) turn: Value,
+    /// A live-call alias's turn, which takes the call lane.
+    pub(super) live_call: bool,
 }
 
 impl TurnRequest {
@@ -633,7 +797,7 @@ impl TurnRequest {
                 turn["serviceTier"] = Value::String(tier.to_string());
             }
         }
-        Self { thread, turn }
+        Self { thread, turn, live_call: plan.alias.is_some() }
     }
 }
 
@@ -876,10 +1040,11 @@ fn model_catalog(result: &Value) -> Vec<Value> {
 /// Fold one batch of turn notifications into the answer. Returns whether the
 /// turn finished.
 ///
-/// Each note must be folded EXACTLY ONCE — the caller advances its cursor by
-/// the batch length for that reason. Folding an overlapping range appends every
-/// delta again, and the duplicate reads as the model repeating itself rather
-/// than as a cursor that never moved.
+/// Each note must be folded EXACTLY ONCE — the turn takes each off its
+/// thread's channel for that reason. Folding an overlapping range appends every
+/// delta again, and the duplicate reads as the model repeating itself: a poll
+/// that re-read from a fixed mark once turned "OAIY tunnel works." into
+/// "OAIYOAIY tunnel worksOAIY tunnel works.".
 fn fold_turn_notes(out: &mut String, notes: &[Value]) -> bool {
     let mut done = false;
     for n in notes {
@@ -1142,6 +1307,15 @@ mod tests {
         assert_eq!(request.thread["approvalPolicy"], "never");
         assert_eq!(request.thread["dynamicTools"], json!([]));
         assert_eq!(request.thread["runtimeWorkspaceRoots"], json!([]));
+        // …and takes the lane of ordinary turns; every alias, tools or none, takes the call lane.
+        assert!(!request.live_call);
+        let with_tools = json!({ "messages": [{ "role": "user", "content": "hello" }], "tools": weather_tools() });
+        for alias in LiveCallAlias::all() {
+            for body in [json!({ "messages": [{ "role": "user", "content": "hello" }] }), with_tools.clone()] {
+                assert!(TurnRequest::for_plan(&plan_turn(&body, Some(alias)).unwrap()).live_call, "{alias:?}");
+            }
+        }
+        assert!(!TurnRequest::for_plan(&plan_turn(&with_tools, None).unwrap()).live_call);
     }
 
     #[test]
@@ -1672,6 +1846,8 @@ mod tests {
     struct FakeCodex {
         state: Mutex<FakeState>,
         changed: std::sync::Condvar,
+        /// The latest app-server's side of the connector's stdout.
+        wire: Mutex<Option<Wire>>,
     }
 
     impl FakeCodex {
@@ -1686,6 +1862,7 @@ mod tests {
             let (to_server, requests) = pipe();
             let (to_client, from_server) = pipe();
             let out: Wire = Arc::new(Mutex::new(Some(to_client)));
+            *self.wire.lock().unwrap() = Some(out.clone());
             self.update(|s| s.connects += 1);
             let fake = self.clone();
             std::thread::spawn(move || {
@@ -1810,6 +1987,31 @@ mod tests {
             }
             true
         }
+
+        fn release(&self, name: &str) {
+            self.update(|s| {
+                s.released.insert(name.to_string());
+            });
+        }
+
+        /// The latest app-server dies: its stdout closes, mid-turn or not.
+        fn die(&self) {
+            if let Some(wire) = self.wire.lock().unwrap().take() {
+                wire.lock().unwrap().take();
+            }
+        }
+    }
+
+    /// Waits until `until` holds, for at most [`WAIT`]. Whether it did.
+    fn eventually(until: impl Fn() -> bool) -> bool {
+        let deadline = Instant::now() + WAIT;
+        while !until() {
+            if Instant::now() > deadline {
+                return false;
+            }
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        true
     }
 
     /// `agent` answering `text` on a thread of its own, as the routes answer an
@@ -1865,5 +2067,95 @@ mod tests {
         assert!(!agent.status().connected);
         let s = fake.state.lock().unwrap();
         assert_eq!((s.connects, s.login_starts), (1, 1), "one app-server, one login flow");
+    }
+
+    #[test]
+    fn a_live_call_is_answered_while_a_long_turn_holds_the_app_server() {
+        let fake = Arc::new(FakeCodex::default());
+        let agent = fake.agent();
+        // A long setup turn: it says its first words, then holds.
+        let setup = ask_in_background(&agent, "Set up OAIY hold:setup", None);
+        assert!(fake.wait_for(|s| s.started.len() == 1, WAIT), "the setup turn started");
+
+        // A caller speaks meanwhile, and the panel asks whether ChatGPT is signed in.
+        let call = ask_in_background(&agent, "Hello, is anyone there?", Some(LiveCallAlias::ReasoningNone));
+        let heard = call.recv_timeout(WAIT);
+        let (tx, status) = channel();
+        let asking = agent.clone();
+        std::thread::spawn(move || {
+            let _ = tx.send(asking.status());
+        });
+        let status = status.recv_timeout(WAIT);
+        let finished_while_held = fake.state.lock().unwrap().finished.clone();
+        // Before any assertion, so a failure never leaves the turn held.
+        fake.release("setup");
+
+        let heard = heard.expect("the caller waited behind the setup turn");
+        assert_eq!(heard.expect("the call was answered"), "You said: Hello, is anyone there?");
+        let status = status.expect("the status waited behind the setup turn");
+        assert!(status.available && !status.connected, "{status:?}");
+        assert_eq!(finished_while_held, ["Hello, is anyone there?"], "the setup turn was still held");
+
+        // The setup's first words went out before the call's and the rest after
+        // them; each answer is its own, whole, with nothing of the other's.
+        assert_eq!(answered(&setup), "You said: Set up OAIY hold:setup");
+        let s = fake.state.lock().unwrap();
+        assert_eq!(s.started, [("Set up OAIY hold:setup".to_string(), false), ("Hello, is anyone there?".to_string(), true)]);
+        assert_eq!(s.connects, 1, "one app-server took both turns");
+    }
+
+    #[test]
+    fn the_turns_of_a_call_are_taken_one_at_a_time_in_the_order_they_came() {
+        let fake = Arc::new(FakeCodex::default());
+        let agent = fake.agent();
+        let call = Some(LiveCallAlias::ReasoningNone);
+        // The caller's first sentence is still being answered…
+        let first = ask_in_background(&agent, "first hold:first", call);
+        assert!(fake.wait_for(|s| s.started.len() == 1, WAIT), "the first turn started");
+        // …when the second and the third arrive, each once the one before is in line.
+        let second = ask_in_background(&agent, "second", call);
+        assert!(eventually(|| agent.call_lane.queued() == 2), "the second is in line");
+        let third = ask_in_background(&agent, "third", call);
+        assert!(eventually(|| agent.call_lane.queued() == 3), "the third is in line");
+        // A setup turn meanwhile waits for none of them, either.
+        let setup = answered(&ask_in_background(&agent, "Set up OAIY", None));
+        let calls_started_while_held = fake.state.lock().unwrap().started.iter().filter(|(_, c)| *c).count();
+        fake.release("first");
+
+        assert_eq!(setup, "You said: Set up OAIY");
+        assert_eq!(calls_started_while_held, 1, "no later turn of the call started before the first finished");
+        assert_eq!(answered(&first), "You said: first hold:first");
+        assert_eq!(answered(&second), "You said: second");
+        assert_eq!(answered(&third), "You said: third");
+        let s = fake.state.lock().unwrap();
+        fn calls<'a>(turns: impl Iterator<Item = &'a str>) -> Vec<&'a str> {
+            turns.filter(|p| *p != "Set up OAIY").collect()
+        }
+        let order = ["first hold:first", "second", "third"];
+        assert_eq!(calls(s.started.iter().map(|(p, _)| p.as_str())), order, "started in the order they came");
+        assert_eq!(calls(s.finished.iter().map(String::as_str)), order, "answered in the order they came");
+        assert_eq!(s.most_calls_running, 1, "never two of the call's turns at once");
+        assert_eq!(agent.call_lane.queued(), 0);
+    }
+
+    #[test]
+    fn an_app_server_that_dies_fails_its_turn_at_once_and_is_replaced() {
+        let fake = Arc::new(FakeCodex::default());
+        let agent = fake.agent();
+        let held = ask_in_background(&agent, "Set up OAIY hold:forever", None);
+        assert!(fake.wait_for(|s| s.started.len() == 1, WAIT), "the turn started");
+        fake.die();
+        // Told now, not when its three minutes run out; and its first words
+        // are not passed off as the answer.
+        let failed = held.recv_timeout(WAIT).expect("the turn was told at once");
+        fake.release("forever");
+        let err = failed.expect_err("a turn cut short is not an answer");
+        assert!(err.contains("exited"), "{err}");
+
+        // The next request, a call's, starts a new app-server and is answered.
+        let call = ask_in_background(&agent, "Hello?", Some(LiveCallAlias::ReasoningNone));
+        assert_eq!(answered(&call), "You said: Hello?");
+        assert!(agent.status().available);
+        assert_eq!(fake.state.lock().unwrap().connects, 2);
     }
 }
