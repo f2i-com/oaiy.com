@@ -171,7 +171,9 @@ Every update is signed with one minisign key. Its **public** half is in `tauri.c
 and in every installed OAIY. Its **private** half and password are two GitHub Actions
 secrets (`TAURI_SIGNING_PRIVATE_KEY`, `TAURI_SIGNING_PRIVATE_KEY_PASSWORD`) and an offline
 copy in the owner's password manager, and nowhere else: not in a repository, not in an
-artifact, not in a log. A release without the secrets stops before anything is built.
+artifact, not in a log. A release without the secrets stops before anything is built, and a
+release whose signatures do not verify against the public key in `tauri.conf.json` (the
+secrets belong to another key) stops before it is published.
 [RELEASING.md](RELEASING.md#the-updater-key) says how the secrets are set.
 
 **If the private key is lost**, no one can sign an update that installed copies accept, and

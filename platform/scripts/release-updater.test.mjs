@@ -148,7 +148,7 @@ describe('the signatures and the feed in the release', () => {
     assert.ok(feed > release.indexOf('Check release evidence names the verified revision'));
     assert.ok(feed >= 0 && feed < release.indexOf('Checksums'));
     const step = stepNamed('release', 'Update feed (latest.json)');
-    assert.match(step.run, /node platform\/scripts\/make-latest-json\.mjs --dir artifacts --version "\$VERSION" --tag "\$TAG" --repo "\$GITHUB_REPOSITORY"/);
+    assert.match(step.run, /node platform\/scripts\/make-latest-json\.mjs --dir artifacts --version "\$VERSION" --tag "\$TAG" --repo "\$GITHUB_REPOSITORY" --conf platform\/desktop\/src-tauri\/tauri\.conf\.json$/);
     assert.equal(step.env.TAG, '${{ github.ref_name }}');
     assert.equal(step.env.VERSION, '${{ needs.meta.outputs.version }}');
   });

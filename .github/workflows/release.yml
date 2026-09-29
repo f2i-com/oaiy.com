@@ -605,13 +605,15 @@ jobs:
       # each platform's installer, its signature (the content of the .sig the build
       # made) and where the release publishes it. It stops the release when an
       # installer or a signature is missing, so the release GitHub calls the latest
-      # is never one whose feed is short. Written before the checksums, which then
-      # cover it and the signatures.
+      # is never one whose feed is short, and when a signature does not verify against
+      # the public key in tauri.conf.json (the Tauri CLI only warns when the secrets hold
+      # another key, and no installed OAIY could then install this release). Written
+      # before the checksums, which then cover it and the signatures.
       - name: Update feed (latest.json)
         env:
           VERSION: ${{ needs.meta.outputs.version }}
           TAG: ${{ github.ref_name }}
-        run: node platform/scripts/make-latest-json.mjs --dir artifacts --version "$VERSION" --tag "$TAG" --repo "$GITHUB_REPOSITORY"
+        run: node platform/scripts/make-latest-json.mjs --dir artifacts --version "$VERSION" --tag "$TAG" --repo "$GITHUB_REPOSITORY" --conf platform/desktop/src-tauri/tauri.conf.json
 
       - name: Checksums
         working-directory: artifacts

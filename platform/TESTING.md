@@ -66,6 +66,27 @@ node --test scripts/check-workflow-paths.test.mjs scripts/workflow-yaml.test.mjs
 are built before `tauri build` stages them, and the Agent's build has the release's ZIPP
 pair cleared, because the Agent pins its own ZIPP release.
 
+The updater's part of the release is tested the same two ways. `scripts/make-latest-json.test.mjs`
+runs the script that writes the update feed (`latest.json`, in the Tauri updater's format) over
+fixture release folders: the signature is the content of the `.sig` file, the URL is the release
+asset's, Windows is the NSIS installer and never the MSI, and a missing installer or signature is
+an error that writes nothing; and, given the desktop's `tauri.conf.json`, each installer has to
+verify against the public key in it (`scripts/minisign.mjs`, minisign in `node:crypto`, tested with
+a signature the Tauri CLI really made: `scripts/minisign.test.mjs`), because the CLI only warns when
+the Actions secrets hold another key. `scripts/release-updater.test.mjs` reads the workflow: the two
+signing secrets reach only the desktop build and the meta check, a tag run without them stops in
+`meta` (that step's bash is run), a run on a branch builds without signatures, `tauri.conf.json`
+does not turn the signed artifacts on, and every action is still pinned to a commit.
+
+```bash
+node --test scripts/make-latest-json.test.mjs scripts/release-updater.test.mjs scripts/minisign.test.mjs
+```
+
+The desktop's own updater (`src-tauri/src/update`) is covered by its Rust unit tests
+(`cargo test --lib update::`, both with and without the `gui` feature: the routes run against a
+stub feed server on a port the system picks) and by the dashboard's Vitest tests for
+Settings → About and updates and the Overview banner. `docs/UPDATES.md` says what they protect.
+
 | Suite | Where | Needs a running service? | Run |
 |---|---|---|---|
 | Rust unit tests | `desktop/src-tauri` | no (`tests/headless_server.rs` starts the real `oaiy-server` itself, on a port the system picks and with the voice gateway off) | `cargo test --no-default-features` (headless server) and `cargo test --features gui` (desktop) |

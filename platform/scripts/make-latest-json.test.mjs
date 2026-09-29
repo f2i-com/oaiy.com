@@ -11,7 +11,8 @@ import os from 'node:os';
 import path from 'node:path';
 import { after, describe, it } from 'node:test';
 import { fileURLToPath } from 'node:url';
-import { buildFeed, FeedError, platformAssets, readSignature, writeFeed } from './make-latest-json.mjs';
+import { buildFeed, FeedError, platformAssets, readPubkey, readSignature, writeFeed } from './make-latest-json.mjs';
+import { makeKeys, sign } from './minisign.testing.mjs';
 
 const script = path.join(path.dirname(fileURLToPath(import.meta.url)), 'make-latest-json.mjs');
 const root = fs.mkdtempSync(path.join(os.tmpdir(), 'oaiy-latest-json-test-'));
@@ -209,5 +210,83 @@ describe('as the release job runs it', () => {
     assert.equal(run('--dir', release(), '--version', VERSION, '--wat', 'x').status, 1);
     assert.equal(run('--version', VERSION).status, 1);
     assert.equal(run('--dir', release()).status, 1);
+  });
+});
+
+describe('the signatures against the public key the desktop carries', () => {
+  /** A release whose installers are signed for real by `keys` (the content of each installer is what is signed). */
+  function signedRelease(keys, { tamper } = {}) {
+    const dir = path.join(root, `signed-${++counter}`);
+    fs.mkdirSync(dir);
+    for (const name of [SETUP, APPIMAGE]) {
+      const bytes = Buffer.from(`the bytes of ${name}`);
+      fs.writeFileSync(path.join(dir, `${name}.sig`), sign(keys, bytes, { comment: `timestamp:1790000000\tfile:${name}` }));
+      fs.writeFileSync(path.join(dir, name), tamper === name ? Buffer.concat([bytes, Buffer.from('!')]) : bytes);
+    }
+    return dir;
+  }
+
+  it('let a release signed with that key through', () => {
+    const keys = makeKeys(5);
+    const feed = buildFeed({ dir: signedRelease(keys), version: VERSION, pubkey: keys.pubkey, pubDate: '2026-10-01T02:03:04Z' });
+    assert.deepEqual(Object.keys(feed.platforms).sort(), ['linux-x86_64', 'windows-x86_64']);
+  });
+
+  it('stop a release signed with another key, and say which secrets to look at', () => {
+    const wrong = makeKeys(6);
+    assert.throws(
+      () => buildFeed({ dir: signedRelease(wrong), version: VERSION, pubkey: makeKeys(5).pubkey }),
+      (e) => e instanceof FeedError && e.message.includes(SETUP) && e.message.includes('does not verify against the public key in tauri.conf.json') && e.message.includes('TAURI_SIGNING_PRIVATE_KEY'),
+    );
+  });
+
+  it('stop an installer that was changed after it was signed, whichever platform it is for', () => {
+    const keys = makeKeys(5);
+    for (const name of [SETUP, APPIMAGE]) {
+      assert.throws(() => buildFeed({ dir: signedRelease(keys, { tamper: name }), version: VERSION, pubkey: keys.pubkey }), (e) => e instanceof FeedError && e.message.includes(name) && e.message.includes('does not match its signature'));
+    }
+  });
+
+  it('stop a signature that cannot be read against the key, and a key that is not one', () => {
+    const keys = makeKeys(5);
+    assert.throws(() => buildFeed({ dir: release(), version: VERSION, pubkey: keys.pubkey }), (e) => e instanceof FeedError && /cannot be checked|is not a minisign signature/.test(e.message));
+    assert.throws(() => buildFeed({ dir: signedRelease(keys), version: VERSION, pubkey: 'not a key' }), (e) => e instanceof FeedError && e.message.includes('cannot be checked'));
+  });
+
+  it('are not checked when no key is given (the shape only)', () => {
+    assert.ok(buildFeed({ dir: release(), version: VERSION }));
+  });
+
+  it('read the key from a tauri.conf.json, and say when there is none', () => {
+    const keys = makeKeys(5);
+    const conf = path.join(root, 'conf.json');
+    fs.writeFileSync(conf, JSON.stringify({ plugins: { updater: { pubkey: keys.pubkey } } }));
+    assert.equal(readPubkey(conf), keys.pubkey);
+    for (const body of ['{}', '{"plugins":{"updater":{}}}', '{"plugins":{"updater":{"pubkey":"  "}}}', 'not json']) {
+      fs.writeFileSync(conf, body);
+      assert.throws(() => readPubkey(conf), FeedError, body);
+    }
+    assert.throws(() => readPubkey(path.join(root, 'nowhere.json')), FeedError);
+  });
+
+  it('as the release job runs it: --conf makes the check, and a wrong key fails the step with nothing written', () => {
+    const keys = makeKeys(5);
+    const dir = signedRelease(keys);
+    const conf = path.join(root, `conf-${counter}.json`);
+    fs.writeFileSync(conf, JSON.stringify({ plugins: { updater: { pubkey: keys.pubkey } } }));
+    const ok = spawnSync(process.execPath, [script, '--dir', dir, '--version', VERSION, '--conf', conf], { encoding: 'utf8' });
+    assert.equal(ok.status, 0, ok.stderr);
+    assert.ok(fs.existsSync(path.join(dir, 'latest.json')));
+
+    const other = signedRelease(makeKeys(6));
+    const bad = spawnSync(process.execPath, [script, '--dir', other, '--version', VERSION, '--conf', conf], { encoding: 'utf8' });
+    assert.equal(bad.status, 1);
+    assert.match(bad.stderr, /::error::update feed \(latest\.json\) NOT written: the signature of .* does not verify against the public key in tauri\.conf\.json/);
+    assert.equal(fs.existsSync(path.join(other, 'latest.json')), false);
+  });
+
+  it('read the key this repository ships', () => {
+    const conf = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..', 'desktop', 'src-tauri', 'tauri.conf.json');
+    assert.match(Buffer.from(readPubkey(conf), 'base64').toString('utf8'), /^untrusted comment: minisign public key: [0-9A-F]{16}\n/);
   });
 });

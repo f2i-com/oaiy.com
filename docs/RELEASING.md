@@ -56,6 +56,12 @@ release, and everyone installing that release by hand from the releases page; se
 [UPDATES.md](UPDATES.md#the-key-and-its-custody). Never build a test with this key: make a
 throwaway one (`npx tauri signer generate -w <a folder outside the repository>`).
 
+The release job checks each signed installer against the public key in `tauri.conf.json`
+before it writes `latest.json` and stops if one does not verify: the Tauri CLI only *warns*
+when the secrets hold a different key from the one in the build, and a release signed with the
+wrong key would install on nobody. If that step fails, the two secrets do not belong to the
+public key in `tauri.conf.json`.
+
 The base `tauri.conf.json` does not turn the signatures on (`bundle.createUpdaterArtifacts`).
 The release workflow passes that as an override of its own, so `npm run tauri:build` on a
 machine without the key still builds an unsigned installer.

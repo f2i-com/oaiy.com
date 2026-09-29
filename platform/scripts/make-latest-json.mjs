@@ -2,7 +2,8 @@
 // Write the update feed of a release: latest.json, in the format the Tauri updater reads.
 //
 //   node platform/scripts/make-latest-json.mjs --dir <release files> --version 0.1.0 \
-//        [--tag v0.1.0] [--repo f2i-com/oaiy.com] [--notes-file <file>] [--pub-date <RFC 3339>] [--out <file>]
+//        [--tag v0.1.0] [--repo f2i-com/oaiy.com] [--notes-file <file>] [--pub-date <RFC 3339>] [--out <file>] \
+//        [--conf platform/desktop/src-tauri/tauri.conf.json]
 //
 // The desktop asks https://github.com/<repo>/releases/latest/download/latest.json
 // whether a newer OAIY exists. Only the installers a desktop can replace itself
@@ -21,9 +22,16 @@
 // desktops there is no update, and the release that carries it is the one FormLogic's
 // CI and every desktop read as "latest". The release job runs this before it writes
 // SHA256SUMS.txt, so the feed and the signatures are covered by it.
+//
+// With --conf (the release job passes it) each installer is also CHECKED against its signature
+// with the public key in that tauri.conf.json (plugins.updater.pubkey), the key every installed
+// OAIY carries. The Tauri CLI only warns when the private key in the Actions secrets is not that
+// key's pair, and a release signed with the wrong one installs on nobody: this stops it before
+// it is published.
 import fs from 'node:fs';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
+import { MinisignError, verifyMinisign } from './minisign.mjs';
 
 export const DEFAULT_REPO = 'f2i-com/oaiy.com';
 
@@ -66,11 +74,38 @@ export function readSignature(file, what) {
   return content;
 }
 
+/** The installer against its signature, with the public key the desktop carries. */
+function checkAgainstKey(installer, asset, signature, pubkey) {
+  let result;
+  try {
+    result = verifyMinisign(fs.readFileSync(installer), signature, pubkey);
+  } catch (error) {
+    if (!(error instanceof MinisignError)) throw error;
+    throw new FeedError(`${asset} cannot be checked: ${error.message}`);
+  }
+  if (!result.ok) {
+    throw new FeedError(`the signature of ${asset} does not verify against the public key in tauri.conf.json (${result.reason}): the desktop would refuse this release. Were the Actions secrets TAURI_SIGNING_PRIVATE_KEY and TAURI_SIGNING_PRIVATE_KEY_PASSWORD made for that public key?`);
+  }
+}
+
+/** The updater's public key in a tauri.conf.json. */
+export function readPubkey(confPath) {
+  let conf;
+  try {
+    conf = JSON.parse(fs.readFileSync(confPath, 'utf8'));
+  } catch {
+    throw new FeedError(`${confPath} cannot be read as tauri.conf.json`);
+  }
+  const pubkey = conf?.plugins?.updater?.pubkey;
+  if (typeof pubkey !== 'string' || !pubkey.trim()) throw new FeedError(`${confPath} has no plugins.updater.pubkey`);
+  return pubkey.trim();
+}
+
 /**
  * The feed for a release whose files are in `dir`. Throws a FeedError, with a message that says
  * what to fix, when anything is missing; returns the feed object otherwise.
  */
-export function buildFeed({ dir, version, tag, repo = DEFAULT_REPO, notes, pubDate }) {
+export function buildFeed({ dir, version, tag, repo = DEFAULT_REPO, notes, pubDate, pubkey }) {
   if (!VERSION.test(String(version ?? ''))) throw new FeedError(`"${version ?? ''}" is not a version of the form 0.1.0 (three numbers, none with a leading zero)`);
   const releaseTag = tag ?? `v${version}`;
   if (!TAG.test(releaseTag) || releaseTag.replace(/^v/, '') !== version) throw new FeedError(`the tag "${releaseTag}" is not the version ${version} (or v${version})`);
@@ -86,6 +121,7 @@ export function buildFeed({ dir, version, tag, repo = DEFAULT_REPO, notes, pubDa
       throw new FeedError(`${what} is missing: ${asset} is not in ${dir}, so ${key} would have no update`);
     }
     const signature = readSignature(`${installer}.sig`, `${asset}`);
+    if (pubkey) checkAgainstKey(installer, asset, signature, pubkey);
     platforms[key] = { signature, url: `https://github.com/${repo}/releases/download/${releaseTag}/${asset}` };
   }
   return {
@@ -105,7 +141,7 @@ export function writeFeed(options) {
 }
 
 function parseArgs(argv) {
-  const names = new Set(['dir', 'version', 'tag', 'repo', 'notes-file', 'pub-date', 'out']);
+  const names = new Set(['dir', 'version', 'tag', 'repo', 'notes-file', 'pub-date', 'out', 'conf']);
   const options = {};
   for (let i = 0; i < argv.length; i += 2) {
     const flag = argv[i];
@@ -116,7 +152,7 @@ function parseArgs(argv) {
   return options;
 }
 
-const usage = () => 'usage: make-latest-json.mjs --dir <release files> --version <N.N.N> [--tag <tag>] [--repo <owner/name>] [--notes-file <file>] [--pub-date <RFC 3339>] [--out <file>]';
+const usage = () => 'usage: make-latest-json.mjs --dir <release files> --version <N.N.N> [--tag <tag>] [--repo <owner/name>] [--notes-file <file>] [--pub-date <RFC 3339>] [--out <file>] [--conf <tauri.conf.json>]';
 
 function main() {
   try {
@@ -137,6 +173,7 @@ function main() {
       repo: args.repo,
       notes,
       pubDate: args['pub-date'],
+      pubkey: args.conf ? readPubkey(path.resolve(args.conf)) : undefined,
       out: args.out ? path.resolve(args.out) : undefined,
     });
     console.log(`wrote ${out}`);
