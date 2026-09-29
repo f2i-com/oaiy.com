@@ -320,6 +320,61 @@ async fn with_no_model_and_no_page_an_acceptance_is_followed_by_still_connecting
 }
 
 #[tokio::test]
+async fn a_caller_who_speaks_while_the_owner_is_rung_with_no_page_to_answer_is_answered_by_the_desktop_and_never_hung_up_on() {
+    // No page holds the lease that answers calls (a closed or reloaded Agent page): the caller's next words used to end the call.
+    let mut f = flow(owner_settings(true)).await;
+    f.aokie.hub.set_page_answers(false);
+    f.caller_says(ASKED);
+    f.ring_through("assist_1", 30).await;
+    let hold_lines_before = said_of(&f, &transfer::HOLD_LINES).len();
+    f.aokie.hub.caller_said(&f.aokie.call, "Hello? Are you still there?", json!({}));
+    f.aokie.hub.caller_said(&f.aokie.call, "Hello?", json!({}));
+    tokio::time::sleep(Duration::from_millis(600)).await;
+    let told = f.aokie.events_within(Duration::from_millis(50)).await;
+    assert!(!told.iter().any(|e| e["type"] == "call.ended"), "the call was not ended: {told:?}");
+    assert!(f.aokie.text("formlogic.realtime.tool_call", Duration::from_millis(200)).await.is_none(), "no finish_call went to the phone");
+    assert!(!f.aokie.speech.spoken().iter().any(|l| l.contains("no one can take your call")), "{:?}", f.aokie.speech.spoken());
+    // They were answered by a hold line (once for both their turns: one at a time).
+    assert!(said_of(&f, &transfer::HOLD_LINES).len() > hold_lines_before, "{:?}", f.aokie.speech.spoken());
+    assert_eq!(f.dialog().await.len(), 1, "and it still rings");
+
+    // The owner accepts: the caller who speaks is told it is still being connected, and is not hung up on either.
+    f.a_device_takes_the_call("assist_1");
+    f.aokie.event("call.transfer", secs(3)).await.expect("accepted");
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    let before = said_of(&f, &transfer::STILL_CONNECTING_LINES).len();
+    f.aokie.hub.caller_said(&f.aokie.call, "Hello, is anyone there?", json!({}));
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    assert!(said_of(&f, &transfer::STILL_CONNECTING_LINES).len() > before, "{:?}", f.aokie.speech.spoken());
+    assert!(!f.aokie.speech.spoken().iter().any(|l| l.contains("no one can take your call")));
+}
+
+#[tokio::test]
+async fn a_caller_who_speaks_after_the_owner_declined_with_no_page_is_offered_the_message_at_once_and_a_call_with_no_request_is_finished_as_before() {
+    let timing = transfer::Timing { offer_after: Duration::from_secs(4), ..quick() };
+    let mut f = flow_full(owner_settings(true), None, crate::ring::testing::at_the_pc(), timing).await;
+    f.aokie.hub.set_page_answers(false);
+    f.caller_says(ASKED);
+    f.ring_through("assist_1", 30).await;
+    assert_eq!(f.owner_answers("assist_1", "decline").await.0, 200);
+    f.phone_is_asked_to_withdraw("assist_1", "owner_declined").await;
+    f.aokie.send(outcome(&f.aokie, "assist_1", "cancelled", None));
+    f.aokie.event("call.transfer", secs(3)).await.expect("cancelled");
+    assert!(!f.aokie.speech.spoken().iter().any(|l| l == transfer::OFFER_LINE), "its own clock is four seconds away");
+    f.aokie.hub.caller_said(&f.aokie.call, "Hello? Hello?", json!({}));
+    assert!(spoken_within(&f.aokie, transfer::OFFER_LINE, Duration::from_millis(600)).await, "answered at once: {:?}", f.aokie.speech.spoken());
+    assert!(f.aokie.text("formlogic.realtime.tool_call", Duration::from_millis(200)).await.is_none(), "and not hung up on");
+
+    // No request going and nobody to answer: as it always was, the caller is told and the call is finished.
+    let mut g = flow(owner_settings(true)).await;
+    g.aokie.hub.set_page_answers(false);
+    g.caller_says(ASKED);
+    g.aokie.hub.caller_said(&g.aokie.call, "Hello, anyone?", json!({}));
+    let finish = g.aokie.text("formlogic.realtime.tool_call", secs(3)).await.expect("finish_call reached the phone");
+    assert_eq!(finish["name"], "finish_call");
+}
+
+#[tokio::test]
 async fn a_phone_that_does_not_answer_the_withdrawal_leaves_it_over_here_after_two_seconds_and_a_late_acceptance_is_obeyed() {
     let mut f = flow(owner_settings(true)).await;
     f.caller_says(ASKED);

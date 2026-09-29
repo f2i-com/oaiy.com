@@ -83,6 +83,8 @@ struct Inner {
     messages: RwLock<crate::messages::Store>,
     /// What tells the owner a message arrived, when not the desktop's own (a test's).
     notifier: RwLock<Option<Arc<dyn crate::messages::MessageNotifier>>>,
+    /// Whether a page is answering calls, when a test says (else the `answer-calls` lease says).
+    page: RwLock<Option<bool>>,
     /// Calls the owner has taken: no session of ours carries them, and the caller is with the owner, until
     /// they hand it back (a new session for the same call) or one of them hangs up.
     handoffs: Mutex<HashMap<String, Instant>>,
@@ -153,6 +155,7 @@ impl VoiceHub {
             ring: RwLock::new(ring.clone()),
             messages: RwLock::new(crate::messages::shared()),
             notifier: RwLock::new(None),
+            page: RwLock::new(None),
             handoffs: Mutex::new(HashMap::new()),
             timing: RwLock::new(transfer::Timing::default()),
         });
@@ -171,6 +174,19 @@ impl VoiceHub {
                 VoiceHub { inner }.emit(json!({"type": "voice.features", "transfer": features.transfer, "messages": features.messages}));
             }
         }));
+    }
+
+    /// Whether a page is answering calls: the Agent's lease for it (tests say it directly, so they do not depend on the
+    /// process-wide lease table).
+    fn page_answers(&self) -> bool {
+        let said = *self.inner.page.read().unwrap_or_else(|e| e.into_inner());
+        said.unwrap_or_else(|| crate::bridge::leases::holder(ANSWER_CALLS).is_some())
+    }
+
+    /// Say whether a page is answering calls (tests), instead of asking the lease table.
+    #[cfg(test)]
+    pub(crate) fn set_page_answers(&self, answers: bool) {
+        *self.inner.page.write().unwrap_or_else(|e| e.into_inner()) = Some(answers);
     }
 
     /// The ring (the owner's settings for transfers and messages) this hub answers to.
@@ -317,7 +333,9 @@ impl VoiceHub {
 
     /// What the caller said: to the app, whose agent answers it, with `how`
     /// (when they said it, and whether over us). With no page answering calls,
-    /// the caller is told so and the call is finished.
+    /// the call is asked what to do about it: while a request to reach the owner
+    /// is going the caller hears the fixed line that fits and is never hung up
+    /// on, and otherwise they are told so and the call is finished.
     fn caller_said(&self, call: &str, text: &str, how: Value) {
         if how.get("backchannel").and_then(Value::as_bool) != Some(true) {
             self.note_turn(call, text);
@@ -327,10 +345,10 @@ impl VoiceHub {
             event.extend(how);
         }
         self.emit(event);
-        if crate::bridge::leases::holder(ANSWER_CALLS).is_none() {
+        // Nobody to answer them: the call decides what to do (it never hangs up on a caller while the owner is being rung).
+        if !self.page_answers() && !self.in_handoff(call) {
             if let Some(tx) = self.inner.calls.lock().unwrap().get(call) {
-                let (reply, _) = oneshot::channel();
-                let _ = tx.send(CallCommand::Finish { goodbye: "Sorry, no one can take your call right now. Please try again a little later. Goodbye!".into(), reply });
+                let _ = tx.send(CallCommand::NoAnswerer);
             }
         }
     }
@@ -825,6 +843,28 @@ mod tests {
         // A hub that is gone leaves the count (its calls went with it).
         drop(hub);
         let _ = live_call_count();
+    }
+
+    #[test]
+    fn a_caller_who_speaks_while_the_owner_has_the_call_is_not_told_to_finish() {
+        // A call in handoff has no session, so nothing can be told to it: but a session left over for the call id (a stale one)
+        // must not be finished for want of a page while the owner talks to the caller.
+        let hub = VoiceHub::new(Engines::at("http://127.0.0.1:9", "http://127.0.0.1:9"), |_| None);
+        hub.set_page_answers(false);
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        hub.register("call_1", tx);
+        hub.note_call("call_1", "+61491570006", "Alex");
+        hub.enter_handoff("call_1", "handoff:takeover");
+        hub.caller_said("call_1", "Hello?", json!({}));
+        assert!(rx.try_recv().is_err(), "nothing was sent to a call the owner has");
+        // Otherwise, with no page, the call is asked what to do about it.
+        hub.leave_handoff("call_1");
+        hub.caller_said("call_1", "Hello?", json!({}));
+        assert!(matches!(rx.try_recv(), Ok(CallCommand::NoAnswerer)));
+        // And with a page answering, it is not asked at all.
+        hub.set_page_answers(true);
+        hub.caller_said("call_1", "Hello?", json!({}));
+        assert!(rx.try_recv().is_err());
     }
 
     /// The app's side of the calls, on a port of its own.

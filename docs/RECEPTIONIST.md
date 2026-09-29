@@ -137,6 +137,11 @@ working: the desktop says short fixed lines itself, on its own clocks.
 - **After a decline, a ring nobody took or a takeover that failed**, the offer of a message within
   4 seconds of the phone's answer, unless the receptionist has already made it.
 
+- **If the Agent page is closed or reloaded** while you are rung (nothing is answering calls), a
+  caller who speaks is not hung up on: they hear the hold line, "still connecting" or the offer of
+  a message, whichever fits, straight away (not more than one every 3 seconds). Only a call with no
+  request going is finished for want of a page, as it always was.
+
 What it does not cover: a phone plugin that is not running or has lost its connection to this
 computer, in which case the call is not on this computer to speak to.
 

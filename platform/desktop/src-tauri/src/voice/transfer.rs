@@ -50,6 +50,9 @@ pub const HOLD_SILENCE: Duration = Duration::from_secs(8);
 /// While the owner is rung, and after they accept until the call is theirs, the desktop says another fixed line this often
 /// (unless the receptionist spoke lately), so a caller is not left in silence for longer than this.
 pub const HOLD_EVERY: Duration = Duration::from_secs(15);
+/// When the caller speaks and nothing will answer them (no page answers calls), the desktop answers with a fixed line, and
+/// not more often than this however much they say.
+pub const ANSWER_GAP: Duration = Duration::from_secs(3);
 /// The most hold lines said for one ring (three wordings, twice: a ring lasts up to 90 seconds).
 pub const HOLD_MAX: u32 = 6;
 /// The most "still connecting" lines said after an acceptance (the takeover has 55 seconds).
@@ -70,6 +73,7 @@ pub struct Timing {
     pub hold_after: Duration,
     pub hold_silence: Duration,
     pub hold_every: Duration,
+    pub answer_gap: Duration,
     pub offer_after: Duration,
     pub give_up_after: Duration,
     pub setup_limit: Duration,
@@ -78,7 +82,7 @@ pub struct Timing {
 
 impl Default for Timing {
     fn default() -> Self {
-        Self { hold_after: HOLD_AFTER, hold_silence: HOLD_SILENCE, hold_every: HOLD_EVERY, offer_after: OFFER_AFTER, give_up_after: GIVE_UP_AFTER, setup_limit: SETUP_LIMIT, cancel_wait: CANCEL_WAIT }
+        Self { hold_after: HOLD_AFTER, hold_silence: HOLD_SILENCE, hold_every: HOLD_EVERY, answer_gap: ANSWER_GAP, offer_after: OFFER_AFTER, give_up_after: GIVE_UP_AFTER, setup_limit: SETUP_LIMIT, cancel_wait: CANCEL_WAIT }
     }
 }
 
@@ -299,6 +303,31 @@ impl Transfer {
             self.cancelling = None;
         }
         was
+    }
+
+    /// The caller spoke and nothing will answer them (no page is answering calls): the fixed line that fits where the request
+    /// is, when there is one and the last was not just said: a hold line while the owner is rung, "still connecting" while an
+    /// acceptance is set up, the offer of a message when the request has ended and it has not been made. None means there is
+    /// nothing to say for a caller here, and the call is not ended for it while a request is going (see [`Transfer::busy`]).
+    pub fn answer_caller(&mut self, now: Instant) -> Option<&'static str> {
+        if self.last_said.is_some_and(|said| now < said + self.timing.answer_gap) {
+            return None;
+        }
+        let line = if self.accepted.is_some() {
+            let line = STILL_CONNECTING_LINES[self.connects_said as usize % STILL_CONNECTING_LINES.len()];
+            self.connects_said += 1;
+            self.connect_at = Some(now + self.timing.hold_every);
+            line
+        } else if self.ringing.is_some() {
+            let line = HOLD_LINES[self.holds_said as usize % HOLD_LINES.len()];
+            self.holds_said += 1;
+            self.hold_at = Some(now + self.timing.hold_every);
+            line
+        } else {
+            self.offer_at.take()?.1
+        };
+        self.last_said = Some(now);
+        Some(line)
     }
 
     /// The app said something (not a hold word): a silence is not what the caller is hearing.
@@ -713,6 +742,35 @@ mod tests {
     }
 
     #[test]
+    fn a_caller_nobody_can_answer_gets_the_line_that_fits_where_the_request_is_and_not_more_than_one_at_a_time() {
+        // Nothing going: nothing to say (the call is finished, as it always was).
+        let mut idle = Transfer::default();
+        assert_eq!(idle.answer_caller(at(0)), None);
+        assert!(!idle.busy());
+        // Ringing: a hold line, in turn, and not again within the gap however much they say.
+        let mut t = Transfer::default();
+        t.ringing("assist_1", 40, at(0));
+        assert_eq!(t.answer_caller(at(2)), Some(HOLD_LINES[0]));
+        assert_eq!(t.answer_caller(at(3)), None, "one at a time");
+        assert!(t.busy(), "a request is going: the call is not finished for want of a page");
+        assert_eq!(t.answer_caller(at(2) + ANSWER_GAP), Some(HOLD_LINES[1]));
+        // The clock's own next hold line is put back after theirs.
+        assert_eq!(t.next_deadline(), Some(at(2) + ANSWER_GAP + HOLD_EVERY).min(Some(at(0) + Duration::from_secs(40) + GIVE_UP_AFTER)));
+        // The owner accepted: still connecting.
+        t.outcome("assist_1", Outcome::Accepted, at(10));
+        assert_eq!(t.answer_caller(at(20)), Some(STILL_CONNECTING_LINES[0]));
+        assert!(t.busy() && !t.may_speak());
+        // A decline: the offer of a message, at once, and only once.
+        let mut t = Transfer::default();
+        t.ringing("assist_1", 40, at(0));
+        t.outcome("assist_1", Outcome::Declined, at(10));
+        assert_eq!(t.answer_caller(at(11)), Some(OFFER_LINE));
+        assert_eq!(t.answer_caller(at(20)), None);
+        assert!(!t.busy());
+        assert!(!t.due(at(30)).contains(&Due::Say(OFFER_LINE)), "said already: not said again by its clock");
+    }
+
+    #[test]
     fn the_clocks_a_call_runs_by_leave_no_silence_longer_than_the_docs_say() {
         // What docs/RECEPTIONIST.md says: a hold line five seconds in and every fifteen after, a message offered four seconds after an
         // ending, and the takeover given fifty-five seconds. A change to one of these is a change to what a caller is promised.
@@ -720,7 +778,7 @@ mod tests {
         assert_eq!((HOLD_MAX, CONNECT_MAX), (6, 4));
         // Six lines fifteen seconds apart cover the longest ring (ninety seconds) from the first at five seconds.
         assert!(HOLD_AFTER + HOLD_EVERY * (HOLD_MAX - 1) + HOLD_EVERY >= Duration::from_secs(90));
-        assert_eq!(Timing::default(), Timing { hold_after: HOLD_AFTER, hold_silence: HOLD_SILENCE, hold_every: HOLD_EVERY, offer_after: OFFER_AFTER, give_up_after: GIVE_UP_AFTER, setup_limit: SETUP_LIMIT, cancel_wait: CANCEL_WAIT });
+        assert_eq!(Timing::default(), Timing { hold_after: HOLD_AFTER, hold_silence: HOLD_SILENCE, hold_every: HOLD_EVERY, answer_gap: ANSWER_GAP, offer_after: OFFER_AFTER, give_up_after: GIVE_UP_AFTER, setup_limit: SETUP_LIMIT, cancel_wait: CANCEL_WAIT });
     }
 
     #[test]

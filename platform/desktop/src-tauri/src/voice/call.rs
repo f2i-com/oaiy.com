@@ -74,6 +74,10 @@ pub enum CallCommand {
     Finish { goodbye: String, reply: oneshot::Sender<Result<Value, String>> },
     /// Stop speaking: what plays is cut, what is queued is dropped.
     Hush,
+    /// The caller spoke and no page is answering calls. While a request to reach the owner rings, or the owner is taking the
+    /// call, the caller is not hung up on: the desktop says the fixed line that fits (a hold line, "still connecting", the
+    /// offer of a message). With no request going the call is finished, as it always was.
+    NoAnswerer,
     /// The owner declined a ring in the dashboard's dialog (or it ran out here): the phone is asked to withdraw the request
     /// (`formlogic.realtime.transfer_cancel`), and its answer decides what the caller hears; if it does not answer in a couple of
     /// seconds the request is over here.
@@ -81,6 +85,9 @@ pub enum CallCommand {
     /// A request to reach the owner came out (from a clock or the ring's own end): as if the phone had said so.
     Outcome { request: String, outcome: Outcome, source: &'static str },
 }
+
+/// What a caller is told when nobody can answer them and no request to reach the owner is going.
+pub const NO_ANSWERER_GOODBYE: &str = "Sorry, no one can take your call right now. Please try again a little later. Goodbye!";
 
 /// A text for the speaker, from a reply given before any `epoch` change.
 struct SpeakJob {
@@ -1185,6 +1192,21 @@ where
                         cut();
                     }
                     CallCommand::Outcome { request, outcome, source } => outcomes.push((request, outcome, None, source)),
+                    CallCommand::NoAnswerer => {
+                        match transfer.answer_caller(Instant::now()) {
+                            Some(line) => {
+                                speak(line.to_string(), false, None);
+                            }
+                            // A request is going: the caller is spoken to by its clocks, and never hung up on for want of a page.
+                            None if transfer.busy() => {}
+                            None => {
+                                let (reply, _) = oneshot::channel();
+                                if let Some(tx) = hub.command(&ids.call) {
+                                    let _ = tx.send(CallCommand::Finish { goodbye: NO_ANSWERER_GOODBYE.into(), reply });
+                                }
+                            }
+                        }
+                    }
                     CallCommand::CancelTransfer { request, reason } => {
                         // Only for the request that rings, and once. The owner declining asks and waits for the phone's answer; this
                         // desktop giving up only tells the phone, and nothing waits.
@@ -2473,7 +2495,7 @@ mod tests {
 
     /// The clocks of a ring, fast enough for a test.
     fn quick() -> transfer::Timing {
-        transfer::Timing { hold_after: Duration::from_millis(300), hold_silence: Duration::from_millis(300), hold_every: Duration::from_millis(400), offer_after: Duration::from_millis(300), give_up_after: Duration::from_millis(200), setup_limit: Duration::from_millis(600), cancel_wait: Duration::from_millis(500) }
+        transfer::Timing { hold_after: Duration::from_millis(300), hold_silence: Duration::from_millis(300), hold_every: Duration::from_millis(400), answer_gap: Duration::from_millis(150), offer_after: Duration::from_millis(300), give_up_after: Duration::from_millis(200), setup_limit: Duration::from_millis(600), cancel_wait: Duration::from_millis(500) }
     }
 
     fn owner_settings(enabled: bool) -> crate::ring::RingSettings {

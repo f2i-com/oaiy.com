@@ -124,7 +124,9 @@ seconds into a ring and every 15 seconds after (three wordings, at most six), "C
 on an acceptance and "Still connecting you" every 15 seconds after it (three wordings, at most four) until
 the call is the owner's or the takeover fails (55 seconds), and the offer of a message 4 seconds after a
 decline, a ring nobody took or a failed takeover, unless the receptionist has already spoken. A line waits
-for a receptionist who has spoken lately.
+for a receptionist who has spoken lately. When no page is answering calls (the Agent is closed or reloading),
+a caller's words no longer end the call while a request is going: the call is told `NoAnswerer` and answers
+with the line that fits, at most one every 3 seconds.
 
 ```
 caller: "Can I speak to the owner?"           (transcribed here: the desktop's own record of the call)
