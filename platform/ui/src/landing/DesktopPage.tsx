@@ -13,7 +13,9 @@
  * LandingPage's internal helpers.
  */
 import { useEffect, useState } from 'react';
-import SiteNav, { REPO_URL } from './SiteNav';
+import SiteNav from './SiteNav';
+import { REPO_URL, RELEASES_URL, repoFolderUrl } from './repoLinks';
+import { loadServiceLibrary, type LibraryItem } from './serviceLibrary';
 
 const APP_URL = 'app.html';
 const LANDING_URL = '/';
@@ -191,8 +193,8 @@ function Install() {
       tone="var(--signal-green)"
     >
       <div className="mb-8 flex flex-wrap gap-3">
-        <a className="btn btn-primary btn-lg" href={`${REPO_URL}/releases/latest`}><DownloadIcon /> Get the latest release</a>
-        <a className="btn btn-secondary btn-lg" href={`${REPO_URL}/tree/main/desktop`}>Installation documentation</a>
+        <a className="btn btn-primary btn-lg" href={RELEASES_URL}><DownloadIcon /> Get the latest release</a>
+        <a className="btn btn-secondary btn-lg" href={repoFolderUrl('desktop')}>Installation documentation</a>
       </div>
       <ol className="lp-steps">
         {steps.map((s, i) => (
@@ -300,19 +302,9 @@ function ServiceFormat() {
 /* Live service library (fetched from the PHP API)                     */
 /* ------------------------------------------------------------------ */
 
-interface LibraryItem {
-  file: string;
-  name: string;
-  description: string;
-  icon: string;
-  category: string;
-  count: number;
-  size: number;
-  downloadUrl: string;
-}
-
 function Library() {
-  const [state, setState] = useState<'loading' | 'ok' | 'error'>('loading');
+  // 'unavailable': this copy of the site has no library (the standalone release build serves no /api).
+  const [state, setState] = useState<'loading' | 'ok' | 'unavailable' | 'error'>('loading');
   const [items, setItems] = useState<LibraryItem[]>([]);
   const [attempt, setAttempt] = useState(0);
 
@@ -321,28 +313,12 @@ function Library() {
     const controller = new AbortController();
     const timeout = window.setTimeout(() => controller.abort(), 12000);
     setState('loading');
-    (async () => {
-      try {
-        const res = await fetch(`${API_BASE}/api/service-library`, { headers: { Accept: 'application/json' }, signal: controller.signal });
-        if (!res.ok) throw new Error(`HTTP ${res.status}`);
-        const data = await res.json();
-        if (!Array.isArray(data?.services) || !data.services.every((item: unknown) => {
-          if (!item || typeof item !== 'object') return false;
-          const entry = item as Record<string, unknown>;
-          return ['file', 'name', 'description', 'downloadUrl'].every((key) => typeof entry[key] === 'string')
-            && (entry.category === undefined || typeof entry.category === 'string')
-            && /^\/api\//.test(entry.downloadUrl as string)
-            && !(entry.downloadUrl as string).includes('\\');
-        })) throw new Error('Invalid service library response');
-        if (cancelled) return;
-        setItems(Array.isArray(data.services) ? data.services : []);
-        setState('ok');
-      } catch {
-        if (!cancelled) setState('error');
-      } finally {
-        window.clearTimeout(timeout);
-      }
-    })();
+    void loadServiceLibrary(API_BASE, controller.signal).then((result) => {
+      window.clearTimeout(timeout);
+      if (cancelled) return;
+      if (result.state === 'ok') setItems(result.items);
+      setState(result.state);
+    });
     return () => { cancelled = true; controller.abort(); window.clearTimeout(timeout); };
   }, [attempt]);
 
@@ -357,12 +333,21 @@ function Library() {
         <p role="status" className="text-sm" style={{ color: 'rgb(var(--color-text-tertiary))' }}>Loading the library…</p>
       )}
 
+      {state === 'unavailable' && (
+        <div className="lp-note" role="status">
+          <p>This copy of the site does not serve the service library. The same templates are in the OAIY repository on GitHub.</p>
+          <div className="mt-4 flex flex-wrap gap-3">
+            <a className="btn btn-secondary btn-sm" href={repoFolderUrl('serviceLibrary')}>Browse templates</a>
+          </div>
+        </div>
+      )}
+
       {state === 'error' && (
         <div className="lp-note" role="status">
           <p>We couldn’t load the service library. Try again, or browse the templates on GitHub.</p>
           <div className="mt-4 flex flex-wrap gap-3">
             <button type="button" className="btn btn-secondary btn-sm" onClick={() => setAttempt((value) => value + 1)}>Try again</button>
-            <a className="btn btn-secondary btn-sm" href={`${REPO_URL}/tree/main/api/service-library`}>Browse templates</a>
+            <a className="btn btn-secondary btn-sm" href={repoFolderUrl('serviceLibrary')}>Browse templates</a>
           </div>
         </div>
       )}

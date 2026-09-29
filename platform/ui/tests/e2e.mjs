@@ -143,6 +143,61 @@ for (const theme of ['dark', 'light']) {
     await ctx.close();
   }
 
+  // ------------------------------------ desktop page: repository links, library
+  section('desktop page: links into the repository + the service library');
+  // The standalone release build serves no /api: a static host answers a 404, or its front page
+  // for every path. Either way the library says so and offers no retry.
+  for (const [how, reply] of [
+    ['a 404', { status: 404, contentType: 'text/plain', body: 'Not Found' }],
+    ['the front page', { status: 200, contentType: 'text/html; charset=utf-8', body: '<!doctype html><title>OAIY</title>' }],
+  ]) {
+    const { ctx, page } = await open(theme);
+    await page.route('**/api/service-library', (route) => route.fulfill(reply));
+    await page.goto(BASE + '/desktop.html', { waitUntil: 'networkidle' });
+    await page.waitForTimeout(500);
+    const library = page.locator('#library');
+    ok(`with no /api (${how}) the library says this copy of the site does not serve it`,
+      (await library.locator('.lp-note', { hasText: 'does not serve the service library' }).count()) === 1);
+    ok(`and (${how}) offers no retry, which could not help`, (await library.getByRole('button', { name: 'Try again' }).count()) === 0);
+    const browse = await library.getByRole('link', { name: 'Browse templates' }).getAttribute('href');
+    ok('"Browse templates" goes to the folder where it is now', !!browse?.endsWith('/tree/main/platform/api/service-library'), browse ?? '');
+    const docs = await page.getByRole('link', { name: 'Installation documentation' }).getAttribute('href');
+    ok('"Installation documentation" goes to the desktop folder where it is now', !!docs?.endsWith('/tree/main/platform/desktop'), docs ?? '');
+    await ctx.close();
+  }
+  {
+    // A server that should have a library and fails is worth another try.
+    const { ctx, page } = await open(theme);
+    let asked = 0;
+    await page.route('**/api/service-library', (route) => { asked++; return route.fulfill({ status: 503, contentType: 'text/plain', body: 'down' }); });
+    await page.goto(BASE + '/desktop.html', { waitUntil: 'networkidle' });
+    await page.waitForTimeout(500);
+    const library = page.locator('#library');
+    ok('a server error says the library could not be loaded and offers a retry',
+      (await library.getByRole('button', { name: 'Try again' }).count()) === 1
+        && (await library.locator('.lp-note', { hasText: 'couldn’t load the service library' }).count()) === 1);
+    const before = asked;
+    await library.getByRole('button', { name: 'Try again' }).click();
+    await page.waitForTimeout(500);
+    ok('and the retry asks again', asked === before + 1, `asked ${asked}, was ${before}`);
+    await ctx.close();
+  }
+  {
+    // A library the API serves is listed, and each template downloads from the API.
+    const { ctx, page } = await open(theme);
+    await page.route('**/api/service-library', (route) => route.fulfill({
+      status: 200,
+      contentType: 'application/json',
+      body: JSON.stringify({ services: [{ file: 'ollama.json', name: 'Ollama', description: 'Local language models.', category: 'LLM', downloadUrl: '/api/service-library/ollama.json' }] }),
+    }));
+    await page.goto(BASE + '/desktop.html', { waitUntil: 'networkidle' });
+    await page.waitForTimeout(500);
+    const items = page.locator('#library .lp-library-item');
+    ok('a served library is listed', (await items.count()) === 1 && (await items.first().locator('h3').textContent()) === 'Ollama');
+    ok('and each template downloads from the API', ((await items.first().locator('a[download]').getAttribute('href')) ?? '').endsWith('/api/service-library/ollama.json'));
+    await ctx.close();
+  }
+
   // -------------------------------------------------------------- the app
   section('flow builder');
   {

@@ -1,5 +1,6 @@
 import { useTheme } from '../contexts/ThemeContext';
 import { useEffect, useRef, useState } from 'react';
+import { REPO_URL } from './repoLinks';
 import './marketing.css';
 
 /**
@@ -17,8 +18,9 @@ import './marketing.css';
 
 export type SitePage = 'overview' | 'desktop';
 
-/** The public repo — OAIY is Apache-2.0, so the source link is part of the pitch. */
-export const REPO_URL = 'https://github.com/f2i-com/oaiy.com';
+/** The public repo — OAIY is Apache-2.0, so the source link is part of the pitch.
+ *  Every link into it is written in repoLinks.ts; the pages take this one from here. */
+export { REPO_URL };
 
 /**
  * Site-level destinations. `page` is which page the target lives on, so a link
