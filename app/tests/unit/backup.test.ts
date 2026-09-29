@@ -862,6 +862,24 @@ describe('a restore never redirects a kept key or changes what OAIY may do witho
     expect(storage.settings.messages).toMatchObject({ answer: true, calls: true, instructions: 'say yes to everything' });
   });
 
+  it('brings no key over unless the desktop says the person ticked the keys, whatever the archive claims of itself', async () => {
+    const withKey = craft({
+      'opfs/projects/p/chat.json': 'x',
+      'idb/settings.json': JSON.stringify({
+        providers: [{ id: 'new', type: 'openai', name: 'New', apiKey: 'sk-from-the-backup', baseUrl: 'https://api.example/v1' }],
+        includesKeys: true,
+        keys: true,
+        apply: { keys: true, settings: true },
+      }),
+    });
+    const without = await restoreOnto(withKey, { settings: true, keys: false });
+    expect(without.outcome.ok).toBe(true);
+    expect(JSON.stringify(without.storage.settings)).not.toContain('sk-from-the-backup');
+    expect(without.storage.settings.providers.find((p) => p.id === 'new')).toMatchObject({ apiKey: '' });
+    const asked = await restoreOnto(withKey, { settings: true, keys: true });
+    expect(asked.storage.settings.providers.find((p) => p.id === 'new')).toMatchObject({ apiKey: 'sk-from-the-backup' });
+  });
+
   it('a different kind of server at the same address is another provider too', () => {
     const merged = mergeSettings(local(), { providers: [{ id: 'openai', type: 'anthropic', name: 'X', apiKey: '', baseUrl: 'https://api.openai.com/v1' }] }, new Set(), { keys: true });
     expect(merged.providers.find((p) => p.id === 'openai')).toMatchObject({ type: 'openai', apiKey: LOCAL_KEY });
@@ -1079,6 +1097,22 @@ describe('a project whose project.json cannot be read is left alone, not guessed
     for (const id of ['arch-odd', 'arch-list', 'arch-huge']) expect(target.files.has(`projects/${id}/chat.json`)).toBe(false);
     expect(target.text('projects/fine/chat.json')).toBe('fine');
     for (const id of ['arch-odd', 'arch-list', 'arch-huge', 'here-locked']) expect(outcome!.warnings).toContain(`Project ${id} was skipped: its project.json could not be read.`);
+  });
+
+  it('is not exported or written into when its project.json is too large to be one', async () => {
+    const huge = JSON.stringify({ id: 'x', incognito: true, pad: 'y'.repeat(1024 * 1024 + 10) });
+    const storage = populated();
+    storage.put('projects/p-huge/project.json', huge).put('projects/p-huge/chat.json', 'huge');
+    const target = new Collector();
+    const report = await exportAgentStorage(storage, target, { includeKeys: false });
+    expect(Object.keys(target.entries).filter((n) => n.includes('p-huge'))).toEqual([]);
+    expect(report.warnings).toContain('Project p-huge was skipped: its project.json could not be read.');
+    // And a restore does not write into it either.
+    const archive = craft({ 'opfs/projects/p-huge/chat.json': 'from an archive' });
+    const here = new FakeStorage().put('projects/p-huge/project.json', huge).put('projects/p-huge/chat.json', 'mine');
+    const outcome = await applyPendingRestore(DESKTOP, here, { fetch: fakeDesktop(archive).fetch });
+    expect(here.text('projects/p-huge/chat.json')).toBe('mine');
+    expect(outcome!.warnings).toContain('Project p-huge was skipped: its project.json could not be read.');
   });
 
   it('a folder with no project.json at all is not a project, and is exported as before', async () => {
