@@ -74,8 +74,11 @@ Each of these keeps "Restart to update" off, by itself, and is shown in words ne
     reaches OAIY's own line. Each plugin has 3 seconds to answer. Any call blocks. **A phone
     plugin that is running and does not answer, answers with an error, or answers something OAIY
     cannot read blocks the install** ("can't tell whether a call is live"), and so does one
-    that declares neither command or is still starting; stopping that plugin (Connections,
-    Plugins) lets it through, as does a plugin that is not running at all. A plugin that is
+    that declares neither command or is still starting, one whose process is alive though the
+    registry marks it stopped or turned off (an update stops what has a process, so it is not
+    taken for gone), and one whose connector another plugin also declares (a request reaches only
+    one of them, so the other cannot be asked); stopping that plugin (Connections, Plugins) lets
+    it through, as does a plugin that is not running at all. A plugin that is
     running without its radio attached, or paused, is such a case: it answers with an error, so
     the install waits until the plugin is stopped or the radio is back.
   - Not checked: a call the phone plugin does not report through those commands, and a call

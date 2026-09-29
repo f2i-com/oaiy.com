@@ -79,6 +79,10 @@ impl PluginLine {
     fn look(&self) -> LineState {
         let mut records = self.host.registry.lock().unwrap_or_else(|e| e.into_inner()).list();
         records.sort_by(|a, b| a.id.cmp(&b.id));
+        // What is stopped for an update is what the host has a PROCESS for (`running_ids`), and the registry's state is a separate record: a
+        // plugin the registry has marked stopped, crashed or turned off while its process still lives (a stop that failed before it was turned
+        // off) still holds its calls, and is stopped with the rest.
+        let alive: std::collections::HashSet<String> = self.host.running_ids().into_iter().collect();
         let mut live: Vec<(String, usize)> = Vec::new();
         let mut unknown: Vec<(String, String)> = Vec::new();
         let mut idle = false;
@@ -96,6 +100,8 @@ impl PluginLine {
                 },
                 // A process that has not answered its start yet: it may be picking up a call, and cannot say.
                 PluginState::Starting => unknown.push((name, "it is still starting".to_string())),
+                // The registry says it is not serving, but its process is alive: it may hold a call, and cannot be asked.
+                state if alive.contains(&record.id) => unknown.push((name, format!("its process is running though it is marked {state:?}"))),
                 // No process (never started, stopped, crashed, turned off): it holds no call.
                 _ => {}
             }
@@ -119,6 +125,12 @@ impl PluginLine {
         let Some(connector) = connector else {
             return unknown("its claim names no connector to ask".to_string());
         };
+        // A request goes to whichever plugin the registry finds for the connector's id. If that is another plugin (two declare one
+        // id), this one would never be asked, and its silence would read as quiet.
+        let served_by = self.host.registry.lock().unwrap_or_else(|e| e.into_inner()).manifest_for_connector(connector).map(|m| m.id.clone());
+        if served_by.as_deref() != Some(manifest.id.as_str()) {
+            return unknown(format!("the connector \"{connector}\" it names is served by another plugin, so it cannot be asked"));
+        }
         let declared: Vec<&String> = manifest.connectors.iter().find(|c| c.id == connector).map(|c| c.commands.iter().collect()).unwrap_or_default();
         let live = modules::def(PHONE).map(|d| d.live).unwrap_or(&[]);
         let Some(command) = live.iter().copied().find(|c| declared.iter().any(|d| d.as_str() == *c)) else {
@@ -328,6 +340,11 @@ mod process_tests {
 
     /// The same under another id. `modules` is the manifest's `modules` section (None: it has none, as Aokie's has not).
     fn install_as(sb: &Sandbox, id: &str, live_commands: &[&str], behavior: serde_json::Value, modules: Option<serde_json::Value>) -> PathBuf {
+        install_with_connector(sb, id, id, live_commands, behavior, modules)
+    }
+
+    /// The same, with the id of its connector given (two plugins can declare one).
+    fn install_with_connector(sb: &Sandbox, id: &str, connector: &str, live_commands: &[&str], behavior: serde_json::Value, modules: Option<serde_json::Value>) -> PathBuf {
         let dir = sb.0.join("plugins").join(id);
         std::fs::create_dir_all(&dir).unwrap();
         std::fs::write(dir.join("plugin.mjs"), SCRIPT).unwrap();
@@ -347,8 +364,8 @@ mod process_tests {
         let mut manifest = json!({
             "schemaVersion": 4, "id": id, "name": name, "version": "0.1.0", "pluginApiVersion": 1,
             "entry": { "kind": "process", "command": shim },
-            "capabilities": commands.iter().map(|c| format!("connector.{id}.{c}")).collect::<Vec<_>>(),
-            "connectors": [{ "id": id, "name": "Line Test", "commands": commands }],
+            "capabilities": commands.iter().map(|c| format!("connector.{connector}.{c}")).collect::<Vec<_>>(),
+            "connectors": [{ "id": connector, "name": "Line Test", "commands": commands }],
             "events": [],
         });
         if let Some(modules) = modules {
@@ -645,6 +662,13 @@ mod process_tests {
             registry.set_user_disabled("line", true);
             registry.set_state("line", PluginState::Running, None);
         }
+        // A rescan (which happens on every plugin listing) re-applies the choice and leaves a running plugin running.
+        host.registry.lock().unwrap().scan();
+        {
+            let registry = host.registry.lock().unwrap();
+            let record = registry.get("line").unwrap();
+            assert_eq!((record.user_disabled, record.state), (true, PluginState::Running), "the registry itself keeps it running and turned off");
+        }
         let records = host.registry.lock().unwrap().list();
         let phone = modules::resolve(&records).modules.into_iter().find(|m| m.id == PHONE).unwrap();
         assert!(!phone.enabled, "the phone module is off: {phone:?}");
@@ -652,6 +676,32 @@ mod process_tests {
         assert_eq!(state, LineState::Live { plugin: "Line Test Plugin".into(), count: 1 });
         assert_eq!(asked(&dir), ["call.switchboard"]);
         host.stop("line").unwrap();
+    }
+
+    #[test]
+    fn a_plugin_whose_process_is_alive_but_which_the_registry_marks_as_not_running_cannot_say_and_is_not_taken_for_gone() {
+        if !has_node() {
+            return;
+        }
+        let sb = Sandbox::new("alive");
+        let host = host(&sb);
+        install(&sb, &["call.switchboard"], board(Some(call())));
+        start(&host);
+        let line = PluginLine::with_timeout(host.clone(), Duration::from_millis(800));
+        assert!(matches!(line.ask(true), LineState::Live { .. }));
+        // The route that turns a plugin off stops it first and then marks it; if the stop did not take, the record says Disabled and the
+        // process is still there (and would be stopped with the rest for an update, calls and all). It cannot be asked, and it is not gone.
+        host.registry.lock().unwrap().set_user_disabled("line", true);
+        for state in [PluginState::Disabled, PluginState::Stopped, PluginState::Crashed, PluginState::Installed] {
+            host.registry.lock().unwrap().set_state("line", state, None);
+            match line.ask(true) {
+                LineState::Unknown { plugin, why } => assert_eq!((plugin.as_str(), why.contains("its process is running")), ("Line Test Plugin", true), "{state:?}: {why}"),
+                other => panic!("{state:?}: {other:?}"),
+            }
+        }
+        // Once the process is really gone it holds no call.
+        host.stop("line").unwrap();
+        assert_eq!(line.ask(true), LineState::NoPlugin);
     }
 
     #[test]
@@ -693,6 +743,32 @@ mod process_tests {
         // One cannot say and the other has a call: a call is what is said.
         behave(&a, board(Some(call())));
         assert!(matches!(line.ask(true), LineState::Live { .. }));
+        host.stop("a-line").unwrap();
+        host.stop("b-line").unwrap();
+    }
+
+    #[test]
+    fn two_running_plugins_that_declare_one_connector_cannot_both_be_asked_so_the_one_that_is_not_is_never_taken_for_quiet() {
+        if !has_node() {
+            return;
+        }
+        let sb = Sandbox::new("shared-connector");
+        let host = host(&sb);
+        // Both claim the phone through a connector called "shared": a request for it reaches only one of them.
+        let a = install_with_connector(&sb, "a-line", "shared", &["call.switchboard"], idle_board(), Some(claim("shared")));
+        let b = install_with_connector(&sb, "b-line", "shared", &["call.switchboard"], board(Some(call())), Some(claim("shared")));
+        start_as(&host, "a-line");
+        start_as(&host, "b-line");
+        let line = PluginLine::with_timeout(host.clone(), Duration::from_millis(800));
+        let state = line.ask(true);
+        // Whichever one the registry routes to answers; the other cannot be asked and says so. Either way the answer is not "quiet".
+        match &state {
+            LineState::Live { plugin, .. } => assert_eq!(plugin, "B-line Test Plugin", "{state:?}"),
+            LineState::Unknown { plugin, why } => assert!(why.contains("served by another plugin") && plugin.ends_with("-line Test Plugin"), "{state:?}"),
+            other => panic!("{other:?}"),
+        }
+        // Between them exactly one was asked, and the other's call cannot have gone unseen.
+        assert_eq!(asked(&a).len() + asked(&b).len(), 1, "one request, to the plugin the registry routes it to");
         host.stop("a-line").unwrap();
         host.stop("b-line").unwrap();
     }
