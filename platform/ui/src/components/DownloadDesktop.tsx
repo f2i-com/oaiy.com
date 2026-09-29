@@ -48,7 +48,7 @@ export default function DownloadDesktop({ variant = 'hero', fallback = ABOUT }: 
     if (!plan.primary) return null;
     return (
       <p className="oaiy-engine-get">
-        <a href={plan.primary.href} data-download={plan.device.os}>Get OAIY Desktop</a> for the models and services on your computer.
+        <a href={plan.primary.href} data-download={plan.device.os}>Get OAIY Desktop</a> for the Agent and the services on your computer.
       </p>
     );
   }

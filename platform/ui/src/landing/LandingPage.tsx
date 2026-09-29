@@ -520,7 +520,7 @@ function HowItWorks() {
   const steps = [
     { title: 'Open the flow editor', body: 'It runs in your browser, so there is nothing to install and no account to make. The first-run wizard wires a starter chat flow in three clicks.' },
     { title: 'Bring your own AI', body: 'Add Ollama, LM Studio, ComfyUI, OpenAI, Anthropic or any HTTP endpoint as a Service and test the connection in place. Keys stay on your device.' },
-    { title: 'Install OAIY Desktop for the rest', body: "For the Agent, OAIY's own models and the phone receptionist, install OAIY Desktop on Windows or Linux. Flows move between the two as files." },
+    { title: 'Install OAIY Desktop for the rest', body: "For the Agent, OAIY's own models and the phone receptionist, install OAIY Desktop on Windows or Linux (Linux is newer and less tested). Flows move between the two as files." },
   ];
   return (
     <Section id="how" title="From a blank canvas to a running flow">
@@ -541,14 +541,14 @@ function HowItWorks() {
 /* Browser or Desktop                                                  */
 /* ------------------------------------------------------------------ */
 
-const COMPARISON: { what: string; browser: string; desktop: string }[] = [
+const COMPARISON: { what: string; browser: string; desktop: string; muted?: boolean }[] = [
   { what: 'The flow editor', browser: 'Yes', desktop: 'Yes' },
   { what: 'Your own AI: Ollama, LM Studio, OpenAI, Anthropic, any endpoint', browser: 'Yes, called straight from the page', desktop: 'Yes' },
-  { what: "OAIY's own models: language, image, video and speech", browser: 'No', desktop: 'Yes, on your computer (an NVIDIA GPU for most)' },
-  { what: 'The Agent: projects, code and a live preview', browser: 'No', desktop: 'Yes' },
-  { what: 'The AI Receptionist', browser: 'No', desktop: 'Yes, with the Aokie plugin and your phone' },
-  { what: 'Browser automation and Python services', browser: 'No', desktop: 'Yes' },
-  { what: 'Installing', browser: 'Nothing to install; the editor can be installed as an app', desktop: 'Windows and Linux' },
+  { what: "OAIY's own models: language, image, video and speech", browser: 'No', desktop: 'Yes, on your computer (an NVIDIA GPU for most)', muted: true },
+  { what: 'The Agent: projects, code and a live preview', browser: 'Runs inside OAIY Desktop', desktop: 'Yes', muted: true },
+  { what: 'The AI Receptionist', browser: 'No', desktop: 'Yes, with the Aokie plugin and your phone', muted: true },
+  { what: 'Browser automation and Python services', browser: 'No', desktop: 'Yes', muted: true },
+  { what: 'Installing', browser: 'Nothing to install; the editor can be installed as an app', desktop: 'Windows, and Linux (newer, less tested)' },
 ];
 
 function Compare() {
@@ -573,8 +573,8 @@ function Compare() {
             {COMPARISON.map((row) => (
               <tr key={row.what}>
                 <th scope="row">{row.what}</th>
-                <td data-label="In your browser" className={row.browser.startsWith('No') ? 'no' : undefined}>{row.browser}</td>
-                <td data-label="With OAIY Desktop" className={row.desktop.startsWith('No') ? 'no' : undefined}>{row.desktop}</td>
+                <td data-label="In your browser" className={row.muted ? 'no' : undefined}>{row.browser}</td>
+                <td data-label="With OAIY Desktop">{row.desktop}</td>
               </tr>
             ))}
           </tbody>
@@ -631,7 +631,7 @@ function Desktop() {
     <Section
       id="desktop"
       title="OAIY Desktop: all of it, on your computer"
-      sub="A window and a tray icon, for Windows and Linux. The flow editor in your browser can use it too."
+      sub="A window and a tray icon, for Windows and Linux (Linux is newer and less tested). The flow editor in your browser can use it too."
       tone="var(--accent-secondary)"
     >
       <div className="grid gap-8 lg:grid-cols-[1fr_1fr] lg:items-start">
@@ -667,7 +667,7 @@ function Desktop() {
               About OAIY Desktop
             </a>
             <span className="text-sm" style={{ color: 'rgb(var(--color-text-tertiary))' }}>
-              For Windows and Linux
+              For Windows and Linux (Linux: AppImage and .deb, newer and less tested)
             </span>
           </div>
         </div>

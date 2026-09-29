@@ -205,6 +205,33 @@ await check('the pages no longer say what is not true of the product', () => {
   assert.doesNotMatch(desktop, /\.rpm|dnf install/, 'the release copies the .rpm only if it was made');
 });
 
+await check('Linux is not promised without its caveat: the packages are newer and less tested than the Windows installer (docs/RELEASING.md)', () => {
+  const landing = read('src/landing/LandingPage.tsx');
+  const desktop = read('src/landing/DesktopPage.tsx');
+  assert.ok((landing.match(/newer,? (and )?less tested|newer and less tested/g) ?? []).length >= 4, 'the landing page says so where it names Linux');
+  assert.ok((desktop.match(/newer and less tested/g) ?? []).length >= 3, 'and the desktop page');
+  assert.match(read('desktop.html'), /Linux is newer and less tested/, 'and its description');
+  assert.match(read('src/lib/downloads.ts'), /LINUX_NOTE = 'Linux is newer and less tested than Windows\.'/, 'and a Linux button');
+  // the root README says Windows and Linux, and which is better tested
+  const readme = fs.readFileSync(path.join(UI, '..', '..', 'README.md'), 'utf8');
+  assert.match(readme, /A Tauri 2 app for Windows and Linux/);
+  assert.doesNotMatch(readme, /A Tauri 2 app for Windows,/);
+  // the one sentence for devices it is not built for is still what the brief says
+  assert.match(read('src/lib/downloads.ts'), /OAIY Desktop is for Windows and Linux\. The web app works in your browser\./);
+});
+
+await check('the comparison says the Agent runs inside OAIY Desktop, not "No": that stays true when the Agent has a web build', () => {
+  const landing = read('src/landing/LandingPage.tsx');
+  assert.match(landing, /what: 'The Agent: projects, code and a live preview', browser: 'Runs inside OAIY Desktop'/);
+  assert.doesNotMatch(landing, /what: 'The Agent[^}]*browser: 'No'/);
+});
+
+await check('the sidebar\'s link does not promise models the installer does not have', () => {
+  const component = read('src/components/DownloadDesktop.tsx');
+  assert.match(component, /Get OAIY Desktop<\/a> for the Agent and the services on your computer\./);
+  assert.doesNotMatch(component, /for the models/);
+});
+
 await check('what the pages must say plainly is there', () => {
   const landing = read('src/landing/LandingPage.tsx');
   const desktop = read('src/landing/DesktopPage.tsx');

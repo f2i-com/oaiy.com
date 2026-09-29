@@ -87,7 +87,7 @@ function Hero() {
             className="lp-reveal mt-5 text-sm"
             style={{ animationDelay: '300ms', color: 'rgb(var(--color-text-tertiary))' }}
           >
-            For Windows and Linux. The flow editor in your browser works on any device.
+            For Windows and Linux (Linux: AppImage and .deb, newer and less tested than Windows). The flow editor in your browser works on any device.
           </p>
         </div>
         <div className="oaiy-runtime-strip" aria-label="What OAIY Desktop does">
@@ -189,7 +189,7 @@ function Install() {
     <Section
       id="install"
       title="Installing OAIY Desktop"
-      sub="For Windows and Linux. The installers are not code-signed yet, so Windows will warn you; how to go on is below."
+      sub="For Windows and Linux; the Linux packages are newer and less tested. The installers are not code-signed yet, so Windows will warn you; how to go on is below."
       tone="var(--signal-green)"
     >
       <div className="mb-4 flex flex-wrap items-start gap-3">
@@ -211,6 +211,7 @@ function Install() {
         </div>
         <div className="lp-install-os">
           <h3 className="lp-mini-h">Linux</h3>
+          <p className="mb-3 text-sm" style={{ color: 'rgb(var(--color-text-tertiary))', lineHeight: 1.55 }}>The AppImage and the .deb are newer and less tested than the Windows installer.</p>
           <ol>
             <li>Download the AppImage, make it executable and run it: <code>chmod +x oaiy-desktop-*.AppImage &amp;&amp; ./oaiy-desktop-*.AppImage</code>.</li>
             <li>Or install the <code>.deb</code>: <code>sudo apt install ./oaiy-desktop-*.deb</code>.</li>

@@ -67,7 +67,7 @@ are stand-ins. See [docs/README.md](docs/README.md#pictures).</sub>
 
 ### OAIY Desktop
 
-A Tauri 2 app for Windows, with its HTTP API (axum) on `127.0.0.1:17972`. Its sidebar:
+A Tauri 2 app for Windows and Linux (the Windows installers are the better tested), with its HTTP API (axum) on `127.0.0.1:17972`. Its sidebar:
 
 - **Overview:** the phone, the language model, the next appointment, requests to
   confirm, plugins and services.

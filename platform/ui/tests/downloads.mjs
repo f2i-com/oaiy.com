@@ -140,7 +140,7 @@ await check('Linux, built for v0.1.0: the AppImage is the button; the .deb and t
   const plan = D.downloadPlan(LIN, 'v0.1.0');
   assert.deepEqual(plan.primary, { label: 'Download OAIY Desktop for Linux', href: `${releases}/download/v0.1.0/oaiy-desktop-0.1.0-linux-x86_64.AppImage`, file: 'oaiy-desktop-0.1.0-linux-x86_64.AppImage' });
   assert.deepEqual(plan.others.map((o) => o.file), ['oaiy-desktop-0.1.0-linux-amd64.deb', 'oaiy-server-0.1.0-linux-x86_64.tar.gz']);
-  assert.equal(plan.caption, 'Version 0.1.0.');
+  assert.equal(plan.caption, 'Version 0.1.0. Linux is newer and less tested than Windows.', 'a Linux button says the Linux packages are newer and less tested');
   assert.equal(plan.allDownloads, releases);
 });
 
@@ -155,7 +155,7 @@ await check('built for a branch, or with no tag, the button goes to the latest r
     }
   }
   assert.equal(D.downloadPlan(WIN, undefined).caption, 'Not code-signed yet, so Windows will warn you.');
-  assert.equal(D.downloadPlan(LIN, undefined).caption, null);
+  assert.equal(D.downloadPlan(LIN, undefined).caption, 'Linux is newer and less tested than Windows.');
 });
 
 await check('a Mac, an iPhone, an iPad and an Android device get the sentence, and no download', () => {

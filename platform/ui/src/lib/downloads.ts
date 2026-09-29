@@ -184,6 +184,12 @@ export const PRIMARY_LABEL_UNVERSIONED = 'Download OAIY Desktop';
 /** The Windows installers are not signed yet: Windows SmartScreen warns about a download it does not know. */
 export const UNSIGNED_NOTE = 'Not code-signed yet, so Windows will warn you.';
 
+/**
+ * The Linux packages are newer and less tested than the Windows installer (docs/RELEASING.md: a first release is the
+ * first look at them), so a Linux button says so.
+ */
+export const LINUX_NOTE = 'Linux is newer and less tested than Windows.';
+
 /** The sentence for a device OAIY Desktop is not built for. */
 export const NOT_FOR_THIS_DEVICE = 'OAIY Desktop is for Windows and Linux. The web app works in your browser.';
 
@@ -228,7 +234,7 @@ export function downloadPlan(device: Device, tag?: unknown): DownloadPlan {
   if (device.os === 'other') return plan(latest(PRIMARY_LABEL_UNVERSIONED), [], 'The files are for Windows and Linux.');
 
   // A local build: one button to the latest release.
-  if (!release) return plan(latest(PRIMARY_LABEL_UNVERSIONED), [], null, device.os === 'windows' ? UNSIGNED_NOTE : null);
+  if (!release) return plan(latest(PRIMARY_LABEL_UNVERSIONED), [], null, device.os === 'windows' ? UNSIGNED_NOTE : LINUX_NOTE);
 
   const names = assetNames(release.version);
   if (device.os === 'windows') {
@@ -246,6 +252,6 @@ export function downloadPlan(device: Device, tag?: unknown): DownloadPlan {
       link('Headless server for Linux hosts (.tar.gz)', names.linuxServer),
     ],
     null,
-    `Version ${release.version}.`,
+    `Version ${release.version}. ${LINUX_NOTE}`,
   );
 }
