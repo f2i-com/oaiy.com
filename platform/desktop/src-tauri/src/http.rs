@@ -1834,6 +1834,23 @@ mod tests {
     use axum::http::Method;
 
     #[test]
+    fn token_eq_compares_the_whole_token() {
+        let want = "0123456789abcdef0123456789abcdef";
+        assert!(super::token_eq(want, want));
+        // The same length, one character different at the start, in the middle and at the end; every character different.
+        for wrong in ["1123456789abcdef0123456789abcdef", "0123456789abcdee0123456789abcdef", "0123456789abcdef0123456789abcdee", "fedcba9876543210fedcba9876543210", "00000000000000000000000000000000"] {
+            assert!(!super::token_eq(want, wrong), "{wrong}");
+        }
+        // Other lengths: a prefix, a longer one, and none.
+        for wrong in ["0123456789abcdef0123456789abcde", "0123456789abcdef0123456789abcdef0", "", "0"] {
+            assert!(!super::token_eq(want, wrong), "{wrong:?}");
+        }
+        assert!(!super::token_eq(want, ""));
+        // Two empty ones are equal: a caller refuses an empty token itself (see `token_matches`).
+        assert!(super::token_eq("", ""));
+    }
+
+    #[test]
     fn network_listener_requires_a_nonempty_token() {
         for token in [None, Some(""), Some("  ")] {
             assert!(super::validate_listener_auth(true, token).is_err());

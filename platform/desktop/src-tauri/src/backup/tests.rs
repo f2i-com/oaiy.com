@@ -3157,3 +3157,237 @@ fn a_backup_that_finishes_or_fails_normally_leaves_no_note_and_the_sweep_takes_o
     restore::sweep_leftovers(&data.0);
     assert!(!data.0.join("backup").join("output.json").exists());
 }
+
+// ---- tokens are compared whole -------------------------------------------------------------------------------
+
+/// Tokens of the same length as `token` that are not it: one character different at the start, the middle and the end,
+/// every character different, the same characters in the other order, and (of other lengths) a prefix and a token with more.
+fn wrong_tokens_like(token: &str) -> (Vec<String>, Vec<String>) {
+    let flip = |i: usize| -> String {
+        let mut b = token.as_bytes().to_vec();
+        b[i] = if b[i] == b'0' { b'1' } else { b'0' };
+        String::from_utf8(b).unwrap()
+    };
+    let last = token.len() - 1;
+    let reversed: String = token.chars().rev().collect();
+    let all_different: String = token.chars().map(|c| if c == '0' { '1' } else { '0' }).collect();
+    let mut same_length = vec![flip(0), flip(token.len() / 2), flip(last), all_different, "0".repeat(token.len()), "f".repeat(token.len())];
+    if reversed != token {
+        same_length.push(reversed);
+    }
+    same_length.retain(|t| t != token);
+    let other_length = vec![token[..last].to_string(), format!("{token}0"), String::new(), token[1..].to_string()];
+    (same_length, other_length)
+}
+
+#[test]
+fn an_export_sessions_token_is_compared_whole_and_only_the_right_one_passes() {
+    let dir = TempDir::new("token-eq");
+    let (id, token) = agent::open_session(&dir.0.join("t.part"), 1 << 20).unwrap();
+    let (same, other) = wrong_tokens_like(&token);
+    assert!(same.len() >= 5 && same.iter().all(|t| t.len() == token.len() && *t != token));
+    for wrong in same.iter().chain(other.iter()) {
+        assert_eq!(agent::receive_part(&id, wrong, 0, b"x"), Err(PartError::Denied), "a wrong token of length {} was accepted", wrong.len());
+        assert_eq!(agent::finish(&id, wrong, DonePayload { ok: true, parts: 1, ..Default::default() }), Err(PartError::Denied));
+    }
+    assert_eq!(fs::metadata(dir.0.join("t.part")).unwrap().len(), 0, "nothing was stored for any of them");
+    agent::receive_part(&id, &token, 0, b"x").expect("the right token is accepted");
+    agent::finish(&id, &token, DonePayload { ok: true, parts: 1, ..Default::default() }).expect("and finishes");
+    agent::close_session(&id);
+}
+
+#[test]
+fn the_import_secret_is_compared_whole_and_only_the_right_one_passes() {
+    let secret = agent::page_token().to_string();
+    let (same, other) = wrong_tokens_like(&secret);
+    assert!(same.len() >= 5);
+    for wrong in same.iter().chain(other.iter()) {
+        assert!(!agent::page_token_matches(wrong), "a wrong secret of length {} was accepted", wrong.len());
+    }
+    assert!(agent::page_token_matches(&secret));
+    // The same for the checks behind every import route.
+    let dir = TempDir::new("token-eq-import");
+    for wrong in same.iter().chain(other.iter()) {
+        assert_eq!(agent::import_part(&dir.0, "0000000000000000", wrong, 0), Err(PartError::Denied));
+        assert_eq!(agent::undo_part(&dir.0, "0000000000000000", wrong, 0, b"x"), Err(PartError::Denied));
+        assert_eq!(agent::import_done(&dir.0, "0000000000000000", wrong, &agent::ImportReport::default()), Err(PartError::Denied));
+    }
+}
+
+// ---- every command of the window checks its caller, and the window registers these and no others ----------------------
+
+/// The names of the functions of `commands.rs` that are Tauri commands, in the order they are written.
+fn command_names() -> Vec<String> {
+    let source = include_str!("commands.rs");
+    source
+        .match_indices("#[tauri::command]")
+        .map(|(at, _)| {
+            let rest = &source[at..];
+            let start = rest.find("pub async fn ").expect("a command is a public async fn") + "pub async fn ".len();
+            let name: String = rest[start..].chars().take_while(|c| c.is_alphanumeric() || *c == '_').collect();
+            name
+        })
+        .collect()
+}
+
+#[test]
+fn every_command_of_the_dashboard_checks_its_caller_before_anything_else() {
+    let names = command_names();
+    assert_eq!(names, ["backup_create", "backup_restore_inspect", "backup_restore_stage", "backup_undo_stage", "backup_discard_pending", "backup_restart_to_apply"], "a new command is a new door: add it here on purpose");
+    for name in &names {
+        let body = command_source(name);
+        let signature = &body[..body.find("{\n").expect("the body")];
+        assert!(signature.contains("webview: Webview"), "{name} is told which window called it");
+        let first = body[body.find("{\n").unwrap() + 2..].trim_start();
+        assert!(first.starts_with("dashboard(&webview)?;"), "{name}: the caller is checked before anything else: {:?}", &first[..first.len().min(60)]);
+    }
+    // And the check is the label test, which lets in the dashboard's window and no other.
+    let source = include_str!("commands.rs");
+    assert!(source.contains("fn dashboard<R: Runtime>(webview: &Webview<R>) -> Result<(), String> {\n    check_label(webview.label())\n}"));
+    assert!(source.contains("const DASHBOARD_LABEL: &str = \"main\";") && source.contains("if label == DASHBOARD_LABEL {"));
+}
+
+#[test]
+fn the_window_registers_exactly_the_backup_commands_there_are() {
+    let lib = include_str!("../lib.rs");
+    let mut registered: Vec<String> = lib
+        .match_indices("crate::backup::commands::")
+        .map(|(at, _)| lib[at + "crate::backup::commands::".len()..].chars().take_while(|c| c.is_alphanumeric() || *c == '_').collect::<String>())
+        .collect();
+    let mut written = command_names();
+    registered.sort();
+    written.sort();
+    assert_eq!(registered, written, "every command is registered, and nothing else of the module is");
+    // Nothing of the backup module is reachable from the flow editor's or the Agent's pages by another name.
+    assert_eq!(lib.matches("backup_restore_stage").count(), 1);
+}
+
+// ---- the staged restore is applied before anything else in the start-up touches the data folder -----------------------
+
+#[test]
+fn the_staged_restore_is_applied_before_anything_in_the_start_up_opens_a_store() {
+    let lib = include_str!("../lib.rs");
+    let setup = lib.find(".setup(|app| {").expect("the start-up");
+    let apply = lib[setup..].find("crate::backup::restore::apply_pending(&data_dir)").expect("the staged restore is applied at the start") + setup;
+    // Nothing runs before the builder's setup that could read the data folder: no data folder is even known.
+    let builder = &lib[lib[..setup].rfind("tauri::Builder::default()").expect("the builder")..setup];
+    let words: Vec<&str> = builder.split(|c: char| !(c.is_alphanumeric() || c == '_')).collect();
+    assert!(!words.contains(&"data_dir") && !words.contains(&"resolve_data_dir") && !words.contains(&"Registry") && !builder.contains(".manage("), "the builder chain before setup holds no store");
+    // Every statement of the start-up before the apply that names the data folder is on this list of readers,
+    // and every one of them is known to leave the restore's files alone.
+    let before = &lib[setup..apply];
+    let mut readers: Vec<&str> = before.lines().map(str::trim).filter(|l| !l.starts_with("//") && l.contains("data_dir")).collect();
+    readers.sort();
+    let mut expected = vec![
+        // The data folder itself: the folder chosen in the config folder, or the default.
+        "let data_dir = resolve_data_dir(app.handle());",
+        // The log file (a new file under logs/).
+        "crate::applog::LOGGER.attach(&data_dir);",
+        "log::info!(\"OAIY Desktop {} starting (data={})\", env!(\"CARGO_PKG_VERSION\"), data_dir.display());",
+        // What a killed backup or restore left behind.
+        "crate::backup::restore::sweep_leftovers(&data_dir);",
+    ];
+    expected.sort();
+    assert_eq!(readers, expected, "something new touches the data folder before the staged restore is applied");
+    // Everything that opens a store comes after it.
+    for opener in ["Registry::init(", "crate::engines::start(", "Python::new(", "CatalogHandle::new(", "crate::ai::open_handle(", "crate::link::open_handle(", "UpstreamStore::open(", "bridge::ledger::open_handle(", "plugins::TriggerStore::load(", "bridge::FlowStore::new(", "bridge::pairing::open_handle("] {
+        assert!(!before.contains(opener), "{opener} opens a store before the staged restore is applied");
+        assert!(lib[apply..].contains(opener), "{opener} is still opened after it (this list is up to date)");
+    }
+}
+
+// ---- a ZIP whose own headers disagree with its record --------------------------------------------------------------
+
+/// A plain (stored) ZIP of `files` in the order given, as bytes.
+fn stored_zip(files: &[(&str, &[u8])]) -> Vec<u8> {
+    let mut writer = zip::ZipWriter::new(Cursor::new(Vec::new()));
+    let opts = zip::write::SimpleFileOptions::default().compression_method(zip::CompressionMethod::Stored);
+    for (name, bytes) in files {
+        writer.start_file(*name, opts).unwrap();
+        writer.write_all(bytes).unwrap();
+    }
+    writer.finish().unwrap().into_inner()
+}
+
+/// Every place a header of `kind` (`PK\x03\x04` local, `PK\x01\x02` central) starts.
+fn headers_of(zip: &[u8], kind: [u8; 4]) -> Vec<usize> {
+    (0..zip.len().saturating_sub(3)).filter(|&i| zip[i..i + 4] == kind).collect()
+}
+
+fn put_u32(zip: &mut [u8], at: usize, value: u32) {
+    zip[at..at + 4].copy_from_slice(&value.to_le_bytes());
+}
+
+/// Encrypt `zip` as a backup, without going through the writer that would make it right.
+fn seal(dest: &Path, zip: &[u8]) {
+    let plain = dest.with_extension("plain.zip");
+    fs::write(&plain, zip).unwrap();
+    let _ = fs::remove_file(dest);
+    container::encrypt_file(&plain, dest, PASS, Cost::Fixed(8)).unwrap();
+    let _ = fs::remove_file(&plain);
+}
+
+#[test]
+fn a_zip_whose_headers_disagree_about_an_items_size_never_stages_bytes_the_record_does_not_vouch_for() {
+    let listed: Vec<(&str, &[u8])> = vec![("callers.json", b"{\"contacts\":[]}"), ("triggers.json", b"{\"triggers\":[]}")];
+    let manifest = manifest_for(&listed);
+    let record = manifest.to_json();
+    let honest = {
+        let mut files: Vec<(&str, &[u8])> = vec![("manifest.json", record.as_slice())];
+        files.extend(listed.iter().copied());
+        stored_zip(&files)
+    };
+    let out = TempDir::new("headers");
+    // The honest one is restored, to show the test can tell.
+    let ok = out.0.join("honest.oaiybackup");
+    seal(&ok, &honest);
+    let dst = TempDir::new("headers-ok");
+    restore::stage(&dst.0, &ok, PASS, &Ticks::all(), &options()).expect("the honest zip stages");
+
+    let locals = headers_of(&honest, *b"PK\x03\x04");
+    let centrals = headers_of(&honest, *b"PK\x01\x02");
+    assert_eq!((locals.len(), centrals.len()), (3, 3));
+    let real = listed[0].1.len() as u32;
+    // Each way the two copies of the size (in the local header before the item's bytes, and in the
+    // central directory at the end) can disagree with each other and with the record.
+    for (what, patch) in [
+        ("the local header says the item is larger", Box::new(|z: &mut Vec<u8>| { put_u32(z, locals[1] + 18, real + 5000); put_u32(z, locals[1] + 22, real + 5000); }) as Box<dyn Fn(&mut Vec<u8>)>),
+        ("the local header says the item is smaller", Box::new(|z: &mut Vec<u8>| { put_u32(z, locals[1] + 18, 1); put_u32(z, locals[1] + 22, 1); })),
+        ("the local header says it is empty", Box::new(|z: &mut Vec<u8>| { put_u32(z, locals[1] + 18, 0); put_u32(z, locals[1] + 22, 0); })),
+        ("the local header says it is enormous", Box::new(|z: &mut Vec<u8>| { put_u32(z, locals[1] + 18, u32::MAX - 1); put_u32(z, locals[1] + 22, u32::MAX - 1); })),
+        ("the central directory says the item is larger than the record does", Box::new(|z: &mut Vec<u8>| { put_u32(z, centrals[1] + 20, real + 5000); put_u32(z, centrals[1] + 24, real + 5000); })),
+        ("the central directory says the item is smaller than the record does", Box::new(|z: &mut Vec<u8>| { put_u32(z, centrals[1] + 20, 3); put_u32(z, centrals[1] + 24, 3); })),
+        ("the central directory says it is enormous", Box::new(|z: &mut Vec<u8>| { put_u32(z, centrals[1] + 20, u32::MAX - 1); put_u32(z, centrals[1] + 24, u32::MAX - 1); })),
+        ("the sizes of the record's own entry are wrong", Box::new(|z: &mut Vec<u8>| { put_u32(z, locals[0] + 22, 7); put_u32(z, centrals[0] + 24, 7); })),
+    ] {
+        let mut zip = honest.clone();
+        patch(&mut zip);
+        let file = out.0.join("patched.oaiybackup");
+        seal(&file, &zip);
+        let dst = TempDir::new("headers-dst");
+        target(&dst.0);
+        let before = snapshot(&dst.0);
+        let checked = restore::inspect(&dst.0, &file, PASS, &options());
+        let staged = restore::stage(&dst.0, &file, PASS, &Ticks::all(), &options());
+        match (&checked, &staged) {
+            (Err(_), Err(e)) => {
+                assert!(matches!(e.kind, ErrorKind::Damaged | ErrorKind::Unsafe | ErrorKind::TooLarge), "{what}: refused as {:?}", e.kind);
+                assert_nothing_staged(&dst.0);
+            }
+            (Ok(_), Ok(_)) => {
+                // If the ZIP library reads it by the central directory alone, what is staged is exactly what the record vouches for.
+                let staged_root = dst.0.join("restore");
+                let marker = fs::read_dir(&staged_root).unwrap().flatten().find(|e| e.file_name().to_string_lossy().starts_with("pending-")).expect("staged");
+                for (name, bytes) in &listed {
+                    assert_eq!(fs::read(marker.path().join("files").join(name)).unwrap(), *bytes, "{what}: {name} is what the record says");
+                }
+            }
+            other => panic!("{what}: the look and the staging disagree: {:?}", other.0.as_ref().map(|_| ()).map_err(|e| e.kind)),
+        }
+        assert_eq!(snapshot(&dst.0), before, "{what}: nothing live changed");
+        // What the ZIP library does with each (zip 2.4.2): it reads an item by the central directory and ignores the
+        // sizes in the local header, and refuses an item whose central-directory size is not the record's. A change here
+        // (a newer library) is worth a look: the property above holds either way.
+        assert_eq!(staged.is_err(), what.starts_with("the central directory"), "{what}");
+    }
+}
