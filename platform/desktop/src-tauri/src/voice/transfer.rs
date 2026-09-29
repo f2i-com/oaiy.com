@@ -185,6 +185,51 @@ pub fn parse_arguments(arguments: &Value) -> Result<crate::ring::Reason, &'stati
     }
 }
 
+/// What a line that tells the caller their call is being put through says: no line that does is said until an owner device has
+/// accepted, whatever the model wrote (see [`promises_transfer`]).
+const PROMISES: [&str; 20] = [
+    "connecting you",
+    "connecting your call",
+    "connecting the call",
+    "transferring you",
+    "transferring your call",
+    "transferring the call",
+    "putting you through",
+    "putting your call through",
+    "passing you",
+    "passing your call",
+    "handing you over",
+    "being connected",
+    "being transferred",
+    "being put through",
+    "you are now connected",
+    "you re now connected",
+    "you re through",
+    "i have transferred",
+    "i ve transferred",
+    "i have connected you",
+];
+
+/// Whether a line the receptionist is about to say tells the caller that their call is being put through, connected or handed
+/// over ("connecting you now", "I'm transferring you", "you're being put through"): true only of the owner having accepted. An honest
+/// line ("I'll try to reach them", "I'm trying to connect you") is not one.
+pub fn promises_transfer(text: &str) -> bool {
+    let mut plain = String::with_capacity(text.len());
+    let mut gap = true;
+    for c in text.to_lowercase().chars() {
+        let c = if matches!(c, '\u{2019}' | '\u{2018}' | '\u{02BC}') { '\'' } else { c };
+        if c.is_alphanumeric() {
+            plain.push(c);
+            gap = false;
+        } else if !gap {
+            plain.push(' ');
+            gap = true;
+        }
+    }
+    let plain = format!(" {} ", plain.trim());
+    PROMISES.iter().any(|p| plain.contains(&format!(" {p} ")))
+}
+
 /// What the model is told when a request to reach the owner is not made (or is refused), in the shape
 /// of a tool result: `{ok: false, output: {status, reason, instruction}}`.
 pub fn refused(status: &str, reason: &str) -> Value {
@@ -334,6 +379,23 @@ impl Transfer {
         Some(line)
     }
 
+    /// A request to reach the owner is going and no owner device has accepted: what is said must not tell the caller they are being
+    /// put through.
+    pub fn awaiting_owner(&self) -> bool {
+        self.ringing.is_some() && !self.handing_over && self.accepted.is_none()
+    }
+
+    /// The hold line to say in place of a line that promised what has not happened: the next in turn, counted as said.
+    pub fn hold_instead(&mut self, now: Instant) -> &'static str {
+        let line = HOLD_LINES[self.holds_said as usize % HOLD_LINES.len()];
+        self.holds_said += 1;
+        self.last_said = Some(now);
+        if self.ringing.is_some() {
+            self.hold_at = (self.holds_said < HOLD_MAX).then_some(now + self.timing.hold_every);
+        }
+        line
+    }
+
     /// The app said something (not a hold word): a silence is not what the caller is hearing.
     pub fn app_said(&mut self, now: Instant) {
         self.last_said = Some(now);
@@ -480,6 +542,11 @@ pub struct Tools {
 impl Tools {
     fn transfer_on_wire(&self) -> bool {
         self.on_wire.iter().any(|(_, name, _)| name == TOOL)
+    }
+
+    /// A transfer request is on the wire or waiting to be sent: asked for, and not yet answered.
+    pub fn transfer_pending(&self) -> bool {
+        self.transfer_on_wire() || self.waiting.iter().any(Waiting::is_transfer)
     }
 
     /// Whether `name` may be sent now.
@@ -666,6 +733,38 @@ mod tests {
         t.outcome("assist_1", Outcome::Unavailable, at(20));
         assert!(t.may_speak() && !t.busy());
         assert!(t.due(at(20) + OFFER_AFTER).contains(&Due::Say(FAILED_LINE)));
+    }
+
+    #[test]
+    fn a_line_that_tells_the_caller_the_call_is_being_put_through_is_known_and_an_honest_one_is_not() {
+        for lie in [
+            "Connecting you now, one moment.",
+            "I'm transferring you to the owner.",
+            "I\u{2019}m transferring you now",
+            "Please hold, putting you through.",
+            "You're being put through.",
+            "you are being connected",
+            "I've transferred your call to the manager",
+            "One moment, connecting your call!",
+            "Okay - handing you over now",
+            "You're now connected.",
+        ] {
+            assert!(promises_transfer(lie), "{lie}");
+        }
+        for honest in [
+            "I'll try to reach them, please stay with me.",
+            "I'm trying to connect you, one moment.",
+            "I'll see if they're free.",
+            "Could I take your name while I try to reach them?",
+            "I'm sorry, they can't come to the phone. Would you like to leave a message?",
+            "I'll connect the dots for you",
+            "",
+        ] {
+            assert!(!promises_transfer(honest), "{honest}");
+        }
+        // The fixed lines the desktop says itself: the connecting ones are said only after an acceptance, and they are what this catches.
+        assert!(promises_transfer(CONNECTING_LINE) && STILL_CONNECTING_LINES.iter().all(|l| promises_transfer(l)));
+        assert!(HOLD_LINES.iter().chain([&OFFER_LINE, &FAILED_LINE]).all(|l| !promises_transfer(l)), "nor does a hold line, the offer or the apology");
     }
 
     #[test]

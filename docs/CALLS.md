@@ -179,6 +179,11 @@ agent : "I'll try to reach them, please stay with me."  (it is trying: it does n
   (`call.ended`, `ended_during_handoff`). If the phone's word that the call ended is lost, the call is
   let go after 4 hours (`call.ended`, `handoff_expired`), so it does not hold an update back for ever. A
   call in handoff counts as a live call for the updater.
+- **A line that promises a transfer is not said before it happens.** While a request to reach the owner is being
+  made or rings and no owner device has accepted, a line the model writes that tells the caller they are being
+  connected, transferred, put through or handed over ("connecting you now", "I'm transferring you") is dropped and
+  the next hold line is said instead; the model's flow goes on as if it had been said. The instructions also name the
+  words. After an acceptance the desktop's own lines say it, and the model says nothing more.
 - **Nothing waits for ever.** A transfer request the phone never answers is answered to the model as
   unavailable (`no_answer`) after 25 seconds, and the tools and the goodbye that waited behind it go. A
   request the phone cancels on its own (consent taken back, say) while the caller is still there ends

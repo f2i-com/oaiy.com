@@ -102,7 +102,11 @@ describe('what the model is offered about reaching the owner', () => {
     expect(text).toContain('transfer_to_owner');
     expect(text).toContain('take_message');
     // What it may say: trying, never transferred or connected until told; nothing promised; no owner number.
-    expect(text).toContain('Never say the call is being transferred, connected or on hold until you are told the owner has accepted');
+    expect(text).toContain('Until you are told the owner has accepted');
+    expect(text).toContain('never say or imply that the call is being transferred, connected, put through, handed over or on hold');
+    // The words the desktop would drop anyway, named, so the model does not spend a turn saying them.
+    for (const words of ['"connecting you"', '"transferring you"', '"putting you through"']) expect(text).toContain(`not ${words}`);
+    expect(text).toContain('I\'ll try to reach them');
     expect(text).toContain('never promise a callback time or say why');
     expect(text).toContain("You do not have the owner's number, and never give one.");
     expect(text).toContain('Say the owner will be told only when take_message says so; otherwise say the message is saved.');

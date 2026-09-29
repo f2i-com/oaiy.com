@@ -1159,6 +1159,23 @@ where
                             let _ = reply.send(Err("the call is being handed over to the owner: say nothing more".into()));
                             continue;
                         }
+                        // The owner has not accepted (a request is being made or rings): a line that tells the caller their call is being put
+                        // through is not true, and is not said. The fixed hold line is said in its place, and the model's flow goes on.
+                        if (transfer.awaiting_owner() || tools.transfer_pending()) && transfer::promises_transfer(&text) {
+                            let line = transfer.hold_instead(Instant::now());
+                            resume = None;
+                            let said = if !begun {
+                                Err("the call has not begun".into())
+                            } else if opening.is_some() {
+                                // The greeting waits for the line to open: this is said after it, as the model's own line would be.
+                                after_greeting.push(SpeakJob::new(line.to_string(), epoch.load(Ordering::SeqCst), false, None));
+                                Ok(next_item("say"))
+                            } else {
+                                Ok(speak(line.to_string(), false, None))
+                            };
+                            let _ = reply.send(said);
+                            continue;
+                        }
                         // A hold word is for a silence: not over the caller, nor while their words are heard, nor before the greeting.
                         if hold && (caller.busy() || opening.is_some()) {
                             let _ = reply.send(Ok(String::new()));
@@ -2508,7 +2525,7 @@ mod tests {
 
     /// The clocks of a ring, fast enough for a test.
     fn quick() -> transfer::Timing {
-        transfer::Timing { hold_after: Duration::from_millis(300), hold_silence: Duration::from_millis(300), hold_every: Duration::from_millis(400), answer_gap: Duration::from_millis(150), offer_after: Duration::from_millis(300), give_up_after: Duration::from_millis(200), setup_limit: Duration::from_millis(600), cancel_wait: Duration::from_millis(500), tool_answer: Duration::from_millis(900) }
+        transfer::Timing { hold_after: Duration::from_millis(300), hold_silence: Duration::from_millis(300), hold_every: Duration::from_millis(400), answer_gap: Duration::from_millis(150), offer_after: Duration::from_millis(300), give_up_after: Duration::from_millis(200), setup_limit: Duration::from_millis(600), cancel_wait: Duration::from_millis(500), tool_answer: Duration::from_millis(2_500) }
     }
 
     fn owner_settings(enabled: bool) -> crate::ring::RingSettings {
@@ -2915,6 +2932,48 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn a_line_that_says_the_call_is_being_put_through_before_the_owner_accepted_is_not_said_the_hold_line_is() {
+        let mut aokie = transferable(owner_settings(true), true).await;
+        caller_asks(&aokie);
+        // The request is asked for and the phone has not answered: nothing has been accepted, and nothing has rung.
+        let asked = asking(&aokie, transfer::TOOL, json!({"reason": "caller_asked"}));
+        let call = aokie.text("formlogic.realtime.tool_call", secs(3)).await.expect("it reached the phone");
+        let dropped = aokie.say("Transferring you now, please hold.").await.expect("the model's flow goes on: it is answered");
+        assert!(!dropped.is_empty(), "a hold line was said in its place");
+        assert!(spoken_within(&aokie, transfer::HOLD_LINES[0], secs(2)).await, "{:?}", aokie.speech.spoken());
+        assert!(!aokie.speech.spoken().iter().any(|l| l.contains("Transferring you")), "{:?}", aokie.speech.spoken());
+        // It rings; the model tries again in other words, and again.
+        aokie.send(ringing(&aokie, call["toolCallId"].as_str().unwrap(), "assist_1", 30));
+        answer_of(asked).await.unwrap();
+        for lie in ["One moment, connecting you now!", "You're being put through to the manager."] {
+            aokie.say(lie).await.expect("answered");
+        }
+        tokio::time::sleep(Duration::from_millis(500)).await;
+        let spoken = aokie.speech.spoken();
+        assert!(!spoken.iter().any(|l| l.contains("connecting you now") || l.contains("put through")), "{spoken:?}");
+        assert!(transfer::HOLD_LINES.iter().filter(|h| spoken.iter().any(|l| l == *h)).count() >= 2, "in its place, the hold lines, in turn: {spoken:?}");
+        // An honest line is said as it is.
+        aokie.say("I'll try to reach them, please stay with me.").await.unwrap();
+        assert!(spoken_within(&aokie, "I'll try to reach them, please stay with me.", secs(2)).await);
+        // Once an owner device has accepted, the desktop says it itself, and the model says nothing more (as before).
+        aokie.send(outcome(&aokie, "assist_1", "accepted", None));
+        assert!(spoken_within(&aokie, transfer::CONNECTING_LINE, secs(3)).await);
+        assert!(aokie.say("Connecting you now.").await.unwrap_err().contains("handed over"));
+    }
+
+    #[tokio::test]
+    async fn what_the_model_says_after_a_decline_is_said_as_written() {
+        // The guard is for the time between asking and an answer: once the owner has declined, the model's words are its own.
+        let mut aokie = transferable(owner_settings(true), true).await;
+        caller_asks(&aokie);
+        ring_the_owner(&mut aokie, "assist_1", 30).await;
+        aokie.send(outcome(&aokie, "assist_1", "declined", None));
+        aokie.event("call.transfer", secs(3)).await.unwrap();
+        aokie.say("They can't come, but I can put you through to our booking line instead, connecting you now.").await.unwrap();
+        assert!(spoken_within(&aokie, "They can't come, but I can put you through to our booking line instead, connecting you now.", secs(2)).await);
+    }
+
+    #[tokio::test]
     async fn a_transfer_the_phone_never_answers_is_answered_as_unavailable_and_the_goodbye_is_sent() {
         let mut aokie = transferable(owner_settings(true), true).await;
         caller_asks(&aokie);
@@ -2925,7 +2984,7 @@ mod tests {
         let (reply, goodbye) = oneshot::channel();
         aokie.hub.command(&aokie.call).unwrap().send(CallCommand::Finish { goodbye: "Goodbye!".into(), reply }).unwrap();
         assert!(aokie.text("formlogic.realtime.tool_call", Duration::from_millis(400)).await.is_none(), "waits for the transfer to be answered");
-        // The phone never answers: after the limit (0.9 s here, 25 s in a call) the transfer is answered as unavailable, with a typed reason.
+        // The phone never answers: after the limit (2.5 s here, 25 s in a call) the transfer is answered as unavailable, with a typed reason.
         let answered = answer_of(transfer_asked).await.expect("the model is answered");
         assert_eq!((answered["ok"].clone(), answered["output"]["status"].clone(), answered["output"]["reason"].clone()), (json!(false), json!("unavailable"), json!("no_answer")), "{answered}");
         assert!(answered["output"]["instruction"].as_str().unwrap().contains("take a message"));
