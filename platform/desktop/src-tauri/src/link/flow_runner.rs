@@ -44,12 +44,71 @@ use super::{LinkHandle, LinkedAccount};
 use crate::bridge::worker::{instruction_budget_for, run_flow_cli, CliOutcome, CliRequest};
 use super::script_profile::Held;
 
-/// How long to wait after finding the queue empty.
+/// Wakes the queue check ahead of its timer.
 ///
-/// The queue is a plain GET, not a long poll, so the interval IS the latency a
-/// user waiting on their own trigger sees. Short enough to feel immediate,
-/// long enough that an idle desktop is not a meaningful load on the provider.
-const IDLE_POLL: Duration = Duration::from_secs(3);
+/// How long the check waits after finding the queue empty is the provider's own
+/// setting (`queuedIdleSeconds`), and the queue is a plain GET, not a long poll,
+/// so that setting is the longest a run the PROVIDER queued waits to be seen.
+/// A run this desktop reserves itself (an event on this machine that a flow
+/// binding matches) is another matter: this side knows the moment it is in the
+/// queue, so its reservation calls [`wake`] and the check looks at once, however
+/// long the timer.
+///
+/// A count rather than a flag, so that a wake that arrives while the check is
+/// busy (reading the queue, or running for minutes) is answered when it next
+/// waits, not lost.
+struct Wake {
+    woken: std::sync::Mutex<u64>,
+    signal: std::sync::Condvar,
+}
+
+impl Wake {
+    const fn new() -> Self {
+        Self { woken: std::sync::Mutex::new(0), signal: std::sync::Condvar::new() }
+    }
+
+    fn wake(&self) {
+        *self.woken.lock().unwrap_or_else(|e| e.into_inner()) += 1;
+        self.signal.notify_all();
+    }
+
+    fn count(&self) -> u64 {
+        *self.woken.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+    /// Wait up to `idle`, and not that long if this has been woken since the
+    /// `seen`th wake (which is then at once). Leaves `seen` at the count now.
+    fn wait(&self, idle: Duration, seen: &mut u64) {
+        let woken = self.woken.lock().unwrap_or_else(|e| e.into_inner());
+        let (woken, _) = self
+            .signal
+            .wait_timeout_while(woken, idle, |woken| *woken == *seen)
+            .unwrap_or_else(|e| e.into_inner());
+        *seen = *woken;
+    }
+}
+
+/// The wake of the running desktop's queue check.
+static QUEUE_WAKE: Wake = Wake::new();
+
+/// Have the queue looked at now: this desktop has just reserved a run in it.
+pub(super) fn wake() {
+    QUEUE_WAKE.wake();
+    #[cfg(test)]
+    WOKEN_BY_THIS_THREAD.with(|n| n.set(n.get() + 1));
+}
+
+#[cfg(test)]
+thread_local! {
+    static WOKEN_BY_THIS_THREAD: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+}
+
+/// How many times the calling thread has called [`wake`], for a test to see one
+/// happen (the wake itself is the process's, and other tests reserve runs too).
+#[cfg(test)]
+pub(super) fn woken() -> u64 {
+    WOKEN_BY_THIS_THREAD.with(|n| n.get())
+}
 
 /// Pause after a failed poll, so a provider that is down — or a key that was
 /// revoked — does not become a hot loop against it.
@@ -257,10 +316,14 @@ pub fn spawn(
     if let Some(dispatcher) = connector {
         let _ = CONNECTOR.set(dispatcher);
     }
-    spawn_inner(store, node)
+    spawn_inner(store, node, &QUEUE_WAKE)
 }
 
-fn spawn_inner(store: LinkHandle, node: Option<crate::services::node_runtime::NodeHandle>) {
+fn spawn_inner(
+    store: LinkHandle,
+    node: Option<crate::services::node_runtime::NodeHandle>,
+    wake: &'static Wake,
+) {
     let _ = PENDING_DIR.set(store.data_dir().join("link").join("completions"));
     let mut pending_at = std::time::Instant::now();
     std::thread::spawn(move || loop {
@@ -296,6 +359,10 @@ fn spawn_inner(store: LinkHandle, node: Option<crate::services::node_runtime::No
         // will touch).
         let held = super::script_profile::resolve(&account, store.data_dir());
 
+        // Counted BEFORE the queue is read: a run reserved just after the listing
+        // was made is answered by the wait below at once, not when the timer
+        // comes round.
+        let mut seen = wake.count();
         match poll_once(&account, &spec, &lane, &instance, node.as_ref(), &held) {
             Ok((handled, trouble)) => {
                 let stumbled = trouble.is_some();
@@ -311,7 +378,7 @@ fn spawn_inner(store: LinkHandle, node: Option<crate::services::node_runtime::No
                 } else if handled == 0 {
                     // Nothing to do. A queue that HAD work probably has more, so
                     // that case goes straight back round.
-                    std::thread::sleep(IDLE_POLL);
+                    wake.wait(Duration::from_secs(spec.queued_idle_seconds), &mut seen);
                 }
             }
             Err(e) => {
@@ -1565,6 +1632,7 @@ mod tests {
             bindings_path: "/bindings".into(),
             reserve_path: "/runs".into(),
             queued_path: None,
+            queued_idle_seconds: 3,
             claim_path: None,
             complete_path: None,
             graph_path: None,
@@ -1680,6 +1748,7 @@ mod tests {
             bindings_path: "/bindings".into(),
             reserve_path: "/runs".into(),
             queued_path: Some("/runs/queued".into()),
+            queued_idle_seconds: 3,
             claim_path: Some("/runs/{id}/claim".into()),
             complete_path: Some("/runs/{id}".into()),
             graph_path: Some("/flows".into()),
@@ -2191,6 +2260,100 @@ mod tests {
         let followed = elsewhere.requests();
         assert_eq!(followed.len(), 1);
         assert_eq!(followed[0].header("authorization"), None, "the credential stayed with the provider");
+    }
+
+    // --- looking at the queue again ----------------------------------------------------
+
+    use std::time::Instant;
+
+    #[test]
+    fn without_a_wake_the_check_waits_out_its_idle_time() {
+        let wake = Wake::new();
+        let mut seen = wake.count();
+        let started = Instant::now();
+        wake.wait(Duration::from_millis(200), &mut seen);
+        assert!(started.elapsed() >= Duration::from_millis(180), "{:?}", started.elapsed());
+        assert_eq!(seen, 0);
+    }
+
+    #[test]
+    fn a_wake_that_comes_while_the_check_waits_ends_the_wait_at_once() {
+        let wake = std::sync::Arc::new(Wake::new());
+        let mut seen = wake.count();
+        let waker = wake.clone();
+        std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(100));
+            waker.wake();
+        });
+        let started = Instant::now();
+        wake.wait(Duration::from_secs(30), &mut seen);
+        assert!(started.elapsed() < Duration::from_secs(5), "{:?}", started.elapsed());
+        assert_eq!(seen, 1);
+    }
+
+    #[test]
+    fn a_wake_that_comes_while_the_check_is_busy_is_answered_when_it_next_waits() {
+        // The queue is being read, or a run has been going for minutes, when the
+        // reservation lands: that is not lost, and it is answered once, not twice.
+        let wake = Wake::new();
+        let mut seen = wake.count();
+        wake.wake();
+        let started = Instant::now();
+        wake.wait(Duration::from_secs(30), &mut seen);
+        assert!(started.elapsed() < Duration::from_secs(5), "{:?}", started.elapsed());
+        assert_eq!(seen, 1);
+        let again = Instant::now();
+        wake.wait(Duration::from_millis(200), &mut seen);
+        assert!(again.elapsed() >= Duration::from_millis(180), "answered once, then it waits");
+    }
+
+    /// The queue check's own loop, on a wake of its own so that no other test's
+    /// reservation can reach it, against a provider whose queue is empty.
+    fn queue_loop(tag: &str, idle_seconds: u64) -> (Provider, &'static Wake, std::path::PathBuf) {
+        let server = Provider::start(|req| {
+            if req.target.starts_with("/api/v1/flow-runs/queued") {
+                Reply::ok(r#"{"runs":[]}"#)
+            } else {
+                Reply::ok("{}")
+            }
+        });
+        let (store, dir) = crate::link::testkit::linked_to(&server.base, tag, |d| {
+            // No prelude to fetch: the loop reads the queue and nothing else.
+            d.script_profile = None;
+            d.flows.as_mut().unwrap().queued_idle_seconds = idle_seconds;
+        });
+        let wake: &'static Wake = Box::leak(Box::new(Wake::new()));
+        spawn_inner(store, None, wake);
+        (server, wake, dir)
+    }
+
+    const QUEUED: &str = "/api/v1/flow-runs/queued";
+
+    #[test]
+    fn the_queue_is_looked_at_again_after_the_idle_time_the_descriptor_says() {
+        // The lane's own loop: a provider that asks for five seconds between looks
+        // at an empty queue is not asked again for five. (It was three seconds for
+        // every provider, from a constant.)
+        let (server, _wake, dir) = queue_loop("queue-idle", 5);
+        let looks = server.wait_for(QUEUED, 2, Duration::from_secs(30));
+        let _ = std::fs::remove_dir_all(dir);
+        let gap = looks[1].at - looks[0].at;
+        assert!(gap >= Duration::from_millis(4_800) && gap < Duration::from_secs(9), "{gap:?}");
+    }
+
+    #[test]
+    fn a_run_this_desktop_has_just_reserved_is_looked_for_at_once_however_long_the_idle_time() {
+        // The idle time is the longest a run the PROVIDER queued waits; a run this
+        // desktop reserved itself is known the moment it is in the queue.
+        let (server, wake, dir) = queue_loop("queue-wake", 300);
+        let first = server.wait_for(QUEUED, 1, Duration::from_secs(30));
+        // Give the loop a moment to be waiting, then reserve.
+        std::thread::sleep(Duration::from_millis(300));
+        wake.wake();
+        let looks = server.wait_for(QUEUED, 2, Duration::from_secs(10));
+        let _ = std::fs::remove_dir_all(dir);
+        let gap = looks[1].at - first[0].at;
+        assert!(gap < Duration::from_secs(5), "waited {gap:?} for a run in the queue");
     }
 
     #[test]

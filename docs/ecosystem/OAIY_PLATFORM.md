@@ -151,7 +151,10 @@ Two transports, neither a WebSocket.
   5 per event, unfired events to `deadletters.jsonl`.
 - FormLogic automations: an event reserves a run from the linked account's flow bindings
   (`link/flows.rs`, key `flow:<bindingId>:<eventKey>`); `link/flow_runner.rs` polls
-  `GET /api/v1/flow-runs/queued`, claims (`{runtime:"desktop", instanceId}`), fetches the
+  `GET /api/v1/flow-runs/queued` (again `flows.queuedIdleSeconds` after an empty look: 20 for
+  the shipped connector, 3 for a descriptor that says nothing; and at once when this desktop
+  has just reserved a run itself, so only a run the provider queued waits for the timer),
+  claims (`{runtime:"desktop", instanceId}`), fetches the
   graph, runs the CLI (300 s budget, results ≤ 192 KiB), reports
   `PATCH /api/v1/flow-runs/{id}` and applies the binding's `outputActions`
   (`link/result_actions.rs`). App-logic scripts (`link/app_logic.rs`) run each app's

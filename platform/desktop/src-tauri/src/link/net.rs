@@ -390,7 +390,11 @@ mod client_tests {
             ("ai/tunnel.rs", include_str!("../ai/tunnel.rs")),
             ("calendar/sync.rs", include_str!("../calendar/sync.rs")),
         ] {
-            let code = source.split("#[cfg(test)]").next().unwrap();
+            // Everything before the module of tests (a lane may have a helper of
+            // its own for them above it).
+            let source = source.replace("\r\n", "\n");
+            let code = source.split("#[cfg(test)]\nmod tests").next().unwrap();
+            assert!(code.len() < source.len(), "{name}: the module of tests was not found");
             for forbidden in ["Client::builder()", "Client::new()"] {
                 assert!(!code.contains(forbidden), "{name} builds its own client with {forbidden}");
             }

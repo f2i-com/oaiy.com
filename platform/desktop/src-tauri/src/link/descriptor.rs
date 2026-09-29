@@ -418,6 +418,18 @@ pub struct FlowsSpec {
     /// Queued runs waiting for a runtime to take them.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub queued_path: Option<String>,
+    /// How long this desktop waits, in seconds, after finding the queue empty
+    /// before it looks again.
+    ///
+    /// The queue is a plain GET, not a long poll, so this is the longest a run
+    /// the PROVIDER queued (a form submitted on its site) can wait for this
+    /// desktop to see it. A run this desktop reserves itself is looked for at
+    /// once, whatever this says. Three seconds unless a provider says otherwise,
+    /// which is what the check always was; the shipped provider documents twenty
+    /// for a desktop's claim loop, and its own browser runtime checks every
+    /// twenty.
+    #[serde(default = "default_queued_idle_seconds")]
+    pub queued_idle_seconds: u64,
     /// Take one queued run, exactly-once. `{id}` is substituted.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub claim_path: Option<String>,
@@ -472,6 +484,11 @@ pub struct FlowsSpec {
     /// budget it never chose. Absent means the engine's own default.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub instruction_budget: Option<u64>,
+}
+
+/// How long the queue check waits, unless a provider says, after it finds nothing.
+fn default_queued_idle_seconds() -> u64 {
+    3
 }
 
 /// Actions a binding performs with a finished run's result.
@@ -1233,6 +1250,15 @@ impl ConnectorDescriptor {
                     }
                 }
             }
+            // Zero would look at the queue as fast as the provider can answer;
+            // past five minutes a run the provider queued would wait longer than
+            // anyone waiting on it would.
+            if f.queued_idle_seconds == 0 || f.queued_idle_seconds > 300 {
+                return Err(format!(
+                    "connector {:?} flows queuedIdleSeconds {} is out of range (1..300s)",
+                    self.id, f.queued_idle_seconds
+                ));
+            }
             // Claiming is only meaningful with somewhere to report the outcome:
             // a run taken and never completed is worse than one left queued,
             // because it looks to everyone else like it is being worked on.
@@ -1605,6 +1631,36 @@ mod tests {
             d.relay.as_mut().unwrap().idle_pause_ms = good;
             d.desktop_flows.as_mut().unwrap().idle_pause_ms = good;
             d.desktop_ai.as_mut().unwrap().idle_pause_ms = good;
+            d.validate().unwrap_or_else(|e| panic!("{good}: {e}"));
+        }
+    }
+
+    #[test]
+    fn the_shipped_provider_has_its_queue_looked_at_as_often_as_its_own_documents_say() {
+        // Its route comment and its desktop document both say a desktop's claim
+        // loop checks every twenty seconds, and its own browser runtime does
+        // (CLAIM_POLL_INTERVAL_MS). A descriptor that says nothing about it gets
+        // what the check always was, three seconds.
+        let flows = builtin().remove(0).flows.expect("the connector declares a flow lane");
+        assert_eq!(flows.queued_idle_seconds, 20);
+        let bare: FlowsSpec = serde_json::from_value(serde_json::json!({
+            "bindingsPath": "/b", "reservePath": "/r"
+        }))
+        .unwrap();
+        assert_eq!(bare.queued_idle_seconds, 3);
+    }
+
+    #[test]
+    fn a_queue_check_interval_outside_its_range_is_refused() {
+        for bad in [0u64, 301] {
+            let mut d: ConnectorDescriptor = serde_json::from_str(BUILTIN[0]).unwrap();
+            d.flows.as_mut().unwrap().queued_idle_seconds = bad;
+            let e = d.validate().expect_err("an interval out of range must be refused");
+            assert!(e.contains("queuedIdleSeconds") && e.contains(&bad.to_string()), "{bad}: {e}");
+        }
+        for good in [1u64, 3, 20, 300] {
+            let mut d: ConnectorDescriptor = serde_json::from_str(BUILTIN[0]).unwrap();
+            d.flows.as_mut().unwrap().queued_idle_seconds = good;
             d.validate().unwrap_or_else(|e| panic!("{good}: {e}"));
         }
     }

@@ -68,6 +68,7 @@
     "bindingsPath": "/api/v1/flow-bindings",
     "reservePath": "/api/v1/flow-runs",
     "queuedPath": "/api/v1/flow-runs/queued",
+    "queuedIdleSeconds": 20,
     "claimPath": "/api/v1/flow-runs/{id}/claim",
     "completePath": "/api/v1/flow-runs/{id}",
     "graphPath": "/api/v1/flows",

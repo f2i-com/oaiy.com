@@ -594,6 +594,11 @@ pub fn reserve(
         let later = matches!(s, 401 | 403 | 408 | 429) || s >= 500;
         return Err(NotReserved { message: format!("HTTP {s}: {message}"), later });
     }
+    // The run is in the provider's queue, and this desktop is the runtime most
+    // likely to take it: have the queue looked at now, not when the next check
+    // comes round (an earlier delivery of the same event may have left one there
+    // that was not taken either).
+    super::flow_runner::wake();
     // Already reserved by an earlier delivery of this same event.
     if payload.get("created").and_then(Value::as_bool) == Some(false) {
         return Ok(None);
@@ -1123,5 +1128,43 @@ mod tests {
         let sel = decide(pending, &[], "aokie.call.ended", "aokie", &e);
         assert!(sel.fire.is_empty());
         assert!(matches!(sel.skipped[0].1, Skip::ConditionUnknown(_)));
+    }
+
+    #[test]
+    fn a_run_reserved_here_wakes_the_queue_check_that_will_take_it() {
+        // The run is queued at the provider and this desktop is the runtime most
+        // likely to take it, so its reservation has the queue looked at at once
+        // rather than when the check's timer comes round.
+        use crate::link::testkit::{Provider, Reply};
+        let server = Provider::start(|_| Reply::ok(r#"{"run":{"runId":"run-9"},"created":true}"#));
+        let before = super::super::flow_runner::woken();
+
+        let reserved = reserve(
+            &account(server.base.clone()),
+            &shipped_flows(),
+            &binding("b1", "aokie.call.ended"),
+            "aokie.call.ended",
+            "corr-1",
+            "evt-1",
+            &json!({ "name": "aokie.call.ended", "data": {} }),
+        );
+        assert_eq!(reserved, Ok(Some("run-9".to_string())));
+        assert_eq!(super::super::flow_runner::woken(), before + 1, "the queue check was not woken");
+
+        // The same event delivered again finds it reserved already; the queue is
+        // looked at all the same, in case the first was not taken.
+        let server = Provider::start(|_| Reply::ok(r#"{"created":false}"#));
+        let before = super::super::flow_runner::woken();
+        let again = reserve(
+            &account(server.base.clone()),
+            &shipped_flows(),
+            &binding("b1", "aokie.call.ended"),
+            "aokie.call.ended",
+            "corr-1",
+            "evt-1",
+            &json!({ "name": "aokie.call.ended", "data": {} }),
+        );
+        assert_eq!(again, Ok(None));
+        assert_eq!(super::super::flow_runner::woken(), before + 1);
     }
 }
