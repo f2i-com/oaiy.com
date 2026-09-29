@@ -87,6 +87,12 @@ Setup can be run again from **Settings** at any time.
 Before you change computers, or before a big change, make a backup here: one encrypted file
 of your contacts, calendar, conversations, flows, triggers, settings and plugin data, protected
 by a passphrase that only you know (a lost passphrase is a lost backup). On a new computer,
-run the first-run wizard, then restore the file from the same place; the credentials (the
-FormLogic link, the phone pairing, the ChatGPT sign-in, your provider keys) are never in a
-backup, so the restore lists what to set up again. See [BACKUP.md](BACKUP.md).
+run the first-run wizard, then restore the file from the same place. Most credentials (the
+FormLogic link, the phone pairing, the ChatGPT sign-in, a plugin's PIN) are never in a backup, so
+the restore lists what to set up again. Your AI provider keys are the exception, and only if you
+choose: they are left out unless you tick **Include my API provider keys** when you make the
+backup (the file is then as sensitive as the keys), and even then they come back only if you
+tick them again when you restore. A restore brings back your data on its own; what can run
+programs or change what OAIY and the Agent may do (service templates, flows, triggers, AI
+providers, settings) is listed by name and comes back only for the kinds you tick. See
+[BACKUP.md](BACKUP.md).
