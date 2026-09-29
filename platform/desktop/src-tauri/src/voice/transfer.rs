@@ -47,8 +47,8 @@ pub const MAX_OWNER_MESSAGE: usize = 320;
 pub const HOLD_AFTER: Duration = Duration::from_secs(5);
 /// ...and not if the receptionist spoke within this long before.
 pub const HOLD_SILENCE: Duration = Duration::from_secs(8);
-/// While the owner is rung, and after they accept until the call is theirs, the desktop says another fixed line this often
-/// (unless the receptionist spoke lately), so a caller is not left in silence for longer than this.
+/// While the owner is rung, the desktop says another fixed line this often (unless the receptionist spoke lately), so a caller is
+/// not left in silence for longer than this. After the owner accepts it says nothing more (see [`CONNECTING_LINE`]).
 pub const HOLD_EVERY: Duration = Duration::from_secs(15);
 /// When the caller speaks and nothing will answer them (no page answers calls), the desktop answers with a fixed line, and
 /// not more often than this however much they say.
@@ -58,8 +58,6 @@ pub const ANSWER_GAP: Duration = Duration::from_secs(3);
 pub const TOOL_ANSWER_LIMIT: Duration = Duration::from_secs(25);
 /// The most hold lines said for one ring (three wordings, twice: a ring lasts up to 90 seconds).
 pub const HOLD_MAX: u32 = 6;
-/// The most "still connecting" lines said after an acceptance (the takeover has 55 seconds).
-pub const CONNECT_MAX: u32 = 4;
 /// After a ring ends without the owner, this long without a word from the receptionist and the desktop offers a message.
 pub const OFFER_AFTER: Duration = Duration::from_secs(4);
 /// A ring that has not been heard of this long after it should have ended is over.
@@ -111,15 +109,16 @@ impl CancelReason {
     }
 }
 
-/// Said as the owner accepts (and only then).
+/// Said as the owner accepts (and only then), and the only thing said after it: the contract (`transfer-v1.md`, Timings) has the
+/// receptionist say one short line on `accepted` and then nothing more until the session stops with `handoff:takeover`, or
+/// `unavailable` (or a `failback` start) says the takeover failed, because anything more is spoken over the owner's first words.
+/// The takeover has [`SETUP_LIMIT`]; this desktop's own clock then says it failed ([`FAILED_LINE`]).
 pub const CONNECTING_LINE: &str = "Connecting you now, one moment.";
 /// Said when the receptionist has said nothing while the owner is being rung, and again every [`HOLD_EVERY`] with another
 /// wording (never that the call is being put through: nobody has accepted).
 pub const HOLD_LINE: &str = "One moment, I'm still trying to reach them.";
 /// The hold lines, in the order they are said.
 pub const HOLD_LINES: [&str; 3] = [HOLD_LINE, "Thank you for waiting, I'm still trying to reach them.", "I'm still trying, thank you for your patience."];
-/// Said every [`HOLD_EVERY`] after the owner accepted, until the call is theirs or the takeover failed.
-pub const STILL_CONNECTING_LINES: [&str; 3] = ["Still connecting you, thank you for waiting.", "Still connecting you, one more moment.", "Thank you for holding, I'm still connecting you."];
 /// Said when nobody could take the call and the receptionist has not offered a message.
 pub const OFFER_LINE: &str = "I'm sorry, I couldn't reach them. Would you like to leave a message?";
 /// Said when the owner accepted and the call could not be connected after all.
@@ -290,9 +289,6 @@ pub struct Transfer {
     hold_at: Option<Instant>,
     /// Hold lines said for this ring.
     holds_said: u32,
-    /// When the next "still connecting" line is due, after an acceptance, and how many have been said.
-    connect_at: Option<Instant>,
-    connects_said: u32,
     offer_at: Option<(Instant, &'static str)>,
     /// When the receptionist last said something that was not a hold word.
     last_said: Option<Instant>,
@@ -355,19 +351,16 @@ impl Transfer {
     }
 
     /// The caller spoke and nothing will answer them (no page is answering calls): the fixed line that fits where the request
-    /// is, when there is one and the last was not just said: a hold line while the owner is rung, "still connecting" while an
-    /// acceptance is set up, the offer of a message when the request has ended and it has not been made. None means there is
-    /// nothing to say for a caller here, and the call is not ended for it while a request is going (see [`Transfer::busy`]).
+    /// is, when there is one and the last was not just said: a hold line while the owner is rung, the offer of a message when the
+    /// request has ended and it has not been made. None means there is nothing to say for a caller here, and the call is not ended
+    /// for it while a request is going (see [`Transfer::busy`]): after an acceptance nothing is said, whatever they say, until the
+    /// call is the owner's or is ours again.
     pub fn answer_caller(&mut self, now: Instant) -> Option<&'static str> {
         if self.last_said.is_some_and(|said| now < said + self.timing.answer_gap) {
             return None;
         }
-        let line = if self.accepted.is_some() {
-            let line = STILL_CONNECTING_LINES[self.connects_said as usize % STILL_CONNECTING_LINES.len()];
-            self.connects_said += 1;
-            self.connect_at = Some(now + self.timing.hold_every);
-            line
-        } else if self.ringing.is_some() {
+        // After an acceptance neither is going (the ring is over and no offer is due), so there is nothing to say.
+        let line = if self.ringing.is_some() {
             let line = HOLD_LINES[self.holds_said as usize % HOLD_LINES.len()];
             self.holds_said += 1;
             self.hold_at = Some(now + self.timing.hold_every);
@@ -420,9 +413,7 @@ impl Transfer {
                 self.offer_at = None;
                 self.handing_over = true;
                 self.accepted = Some((request.to_string(), now + self.timing.setup_limit));
-                // The caller hears that they are being connected at once, and again every so often until the call is the owner's.
-                self.connect_at = Some(now + self.timing.hold_every);
-                self.connects_said = 0;
+                // The caller hears that they are being connected, once, at once: nothing more is said until the call is the owner's.
                 vec![Effect::Cut, Effect::Say(CONNECTING_LINE)]
             }
             // The first answer wins: an owner endpoint has taken the call, so a decline or a timeout of the same
@@ -433,7 +424,6 @@ impl Transfer {
             // phone saying it was cancelled (which this desktop did not itself ask for): the call is still live and nobody has it.
             Outcome::Declined | Outcome::Expired | Outcome::Unavailable | Outcome::Cancelled => {
                 let after_accept = self.accepted.take().is_some();
-                self.connect_at = None;
                 self.ringing = None;
                 self.handing_over = false;
                 self.offer_at = Some((now + self.timing.offer_after, if after_accept { FAILED_LINE } else { OFFER_LINE }));
@@ -445,7 +435,7 @@ impl Transfer {
 
     /// The next moment [`Transfer::due`] has something to do.
     pub fn next_deadline(&self) -> Option<Instant> {
-        [self.ringing.as_ref().map(|r| r.give_up_at), self.hold_at, self.offer_at.map(|(at, _)| at), self.accepted.as_ref().map(|(_, at)| *at), self.cancelling.as_ref().map(|c| c.answer_by), self.connect_at].into_iter().flatten().min()
+        [self.ringing.as_ref().map(|r| r.give_up_at), self.hold_at, self.offer_at.map(|(at, _)| at), self.accepted.as_ref().map(|(_, at)| *at), self.cancelling.as_ref().map(|c| c.answer_by)].into_iter().flatten().min()
     }
 
     /// What the clocks ask for at `now`. Each thing is asked for once.
@@ -466,12 +456,6 @@ impl Transfer {
                     }
                 }
             }
-        }
-        if self.accepted.is_some() && self.connect_at.is_some_and(|at| now >= at) {
-            due.push(Due::Say(STILL_CONNECTING_LINES[self.connects_said as usize % STILL_CONNECTING_LINES.len()]));
-            self.connects_said += 1;
-            self.last_said = Some(now);
-            self.connect_at = (self.connects_said < CONNECT_MAX).then_some(now + self.timing.hold_every);
         }
         if let Some((at, line)) = self.offer_at.filter(|(at, _)| now >= *at) {
             let _ = at;
@@ -699,20 +683,15 @@ mod tests {
         assert!(t.busy() && !t.may_speak(), "nothing more is said by the app while the owner takes the call");
         // The same acceptance again says nothing more.
         assert!(t.outcome("assist_1", Outcome::Accepted, at(7)).is_empty());
-        // The takeover never comes: the caller is told they are still being connected now and then, and after its setup and
-        // grace it is unavailable, and the receptionist is free to speak.
-        assert_eq!(t.next_deadline(), Some(at(6) + HOLD_EVERY));
-        let mut said = Vec::new();
+        // The takeover never comes: the desktop says nothing at all while it is set up (the contract has the one line and then
+        // silence: anything more is spoken over the owner's first words), and after its setup and grace it is unavailable, and the
+        // receptionist is free to speak.
+        assert_eq!(t.next_deadline(), Some(at(6) + SETUP_LIMIT), "the only clock that is running is the takeover's");
         for s in 1..=55 {
             for d in t.due(at(6 + s)) {
-                match d {
-                    Due::Say(line) => said.push((s, line)),
-                    other => assert!(s == 55 && other == Due::SetupFailed("assist_1".into()), "{s}: {other:?}"),
-                }
+                assert!(s == 55 && d == Due::SetupFailed("assist_1".into()), "{s}: {d:?}: nothing is said before the takeover fails");
             }
         }
-        assert_eq!(said.iter().map(|(s, _)| *s).collect::<Vec<_>>(), vec![15, 30, 45], "every fifteen seconds, and nothing after the last before the limit");
-        assert_eq!(said.iter().map(|(_, l)| *l).collect::<Vec<_>>(), STILL_CONNECTING_LINES.to_vec(), "in three wordings");
         let after = t.outcome("assist_1", Outcome::Unavailable, at(61));
         assert!(after.is_empty() && t.may_speak() && !t.busy());
         assert_eq!(t.next_deadline(), Some(at(61) + OFFER_AFTER));
@@ -762,8 +741,8 @@ mod tests {
         ] {
             assert!(!promises_transfer(honest), "{honest}");
         }
-        // The fixed lines the desktop says itself: the connecting ones are said only after an acceptance, and they are what this catches.
-        assert!(promises_transfer(CONNECTING_LINE) && STILL_CONNECTING_LINES.iter().all(|l| promises_transfer(l)));
+        // The fixed lines the desktop says itself: the connecting one is said only after an acceptance, and it is what this catches.
+        assert!(promises_transfer(CONNECTING_LINE));
         assert!(HOLD_LINES.iter().chain([&OFFER_LINE, &FAILED_LINE]).all(|l| !promises_transfer(l)), "nor does a hold line, the offer or the apology");
     }
 
@@ -862,9 +841,12 @@ mod tests {
         assert_eq!(t.answer_caller(at(2) + ANSWER_GAP), Some(HOLD_LINES[1]));
         // The clock's own next hold line is put back after theirs.
         assert_eq!(t.next_deadline(), Some(at(2) + ANSWER_GAP + HOLD_EVERY).min(Some(at(0) + Duration::from_secs(40) + GIVE_UP_AFTER)));
-        // The owner accepted: still connecting.
+        // The owner accepted: nothing more is said, however much the caller says and however long it takes (the contract: anything more
+        // is spoken over the owner's first words), and the call is not finished for want of an answer.
         t.outcome("assist_1", Outcome::Accepted, at(10));
-        assert_eq!(t.answer_caller(at(20)), Some(STILL_CONNECTING_LINES[0]));
+        for s in [11, 20, 30, 50, 64] {
+            assert_eq!(t.answer_caller(at(s)), None, "{s}");
+        }
         assert!(t.busy() && !t.may_speak());
         // A decline: the offer of a message, at once, and only once.
         let mut t = Transfer::default();
@@ -881,7 +863,7 @@ mod tests {
         // What docs/RECEPTIONIST.md says: a hold line five seconds in and every fifteen after, a message offered four seconds after an
         // ending, and the takeover given fifty-five seconds. A change to one of these is a change to what a caller is promised.
         assert_eq!((HOLD_AFTER, HOLD_EVERY, OFFER_AFTER, SETUP_LIMIT, CANCEL_WAIT), (Duration::from_secs(5), Duration::from_secs(15), Duration::from_secs(4), Duration::from_secs(55), Duration::from_secs(2)));
-        assert_eq!((HOLD_MAX, CONNECT_MAX), (6, 4));
+        assert_eq!(HOLD_MAX, 6);
         // Six lines fifteen seconds apart cover the longest ring (ninety seconds) from the first at five seconds.
         assert!(HOLD_AFTER + HOLD_EVERY * (HOLD_MAX - 1) + HOLD_EVERY >= Duration::from_secs(90));
         assert_eq!(Timing::default(), Timing { hold_after: HOLD_AFTER, hold_silence: HOLD_SILENCE, hold_every: HOLD_EVERY, answer_gap: ANSWER_GAP, offer_after: OFFER_AFTER, give_up_after: GIVE_UP_AFTER, setup_limit: SETUP_LIMIT, cancel_wait: CANCEL_WAIT, tool_answer: TOOL_ANSWER_LIMIT });

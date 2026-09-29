@@ -75,8 +75,8 @@ pub enum CallCommand {
     /// Stop speaking: what plays is cut, what is queued is dropped.
     Hush,
     /// The caller spoke and no page is answering calls. While a request to reach the owner rings, or the owner is taking the
-    /// call, the caller is not hung up on: the desktop says the fixed line that fits (a hold line, "still connecting", the
-    /// offer of a message). With no request going the call is finished, as it always was.
+    /// call, the caller is not hung up on: the desktop says the fixed line that fits (a hold line, the offer of a message; after
+    /// an acceptance nothing more). With no request going the call is finished, as it always was.
     NoAnswerer,
     /// The owner declined a ring in the dashboard's dialog (or it ran out here): the phone is asked to withdraw the request
     /// (`formlogic.realtime.transfer_cancel`), and its answer decides what the caller hears; if it does not answer in a couple of

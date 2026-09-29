@@ -123,8 +123,9 @@ best kept off unless every installed plugin is trusted: the Transfers page and `
 all of it: **a caller is never left in silence for long, and never told a lie.**
 The desktop's own clocks (`Transfer`, not the phone, the app or the model) say fixed lines: a hold line five
 seconds into a ring and every 15 seconds after (three wordings, at most six), "Connecting you now" at once
-on an acceptance and "Still connecting you" every 15 seconds after it (three wordings, at most four) until
-the call is the owner's or the takeover fails (55 seconds), and the offer of a message 4 seconds after a
+on an acceptance and then nothing at all until the call is the owner's or the takeover fails (55 seconds:
+the contract has the receptionist say one line on `accepted` and fall silent, because anything more would
+be spoken over the owner's first words), and the offer of a message 4 seconds after a
 decline, a ring nobody took or a failed takeover, unless the receptionist has already spoken. A line waits
 for a receptionist who has spoken lately. When no page is answering calls (the Agent is closed or reloading),
 a caller's words no longer end the call while a request is going: the call is told `NoAnswerer` and answers

@@ -144,15 +144,15 @@ working: the desktop says short fixed lines itself, on its own clocks.
 - **While you are rung**, if the receptionist has said nothing, a hold line five seconds in and
   another every 15 seconds after (three wordings in turn, at most six, so a ring of 90 seconds is
   covered): the longest silence is about 15 seconds. None of them says the call is being put through.
-- **After you accept**, "Connecting you now" at once, then "Still connecting you" every 15 seconds
-  (three wordings, at most four) until the call is yours or the takeover failed. The takeover has 55
-  seconds; after that the desktop says it could not connect the caller and offers a message.
+- **After you accept**, "Connecting you now" at once, and then nothing: the receptionist falls silent
+  until the call is yours, so it is never speaking over your first words. The takeover has 55
+  seconds; if it has not come by then the desktop says it could not connect the caller and offers a message.
 - **After a decline, a ring nobody took or a takeover that failed**, the offer of a message within
   4 seconds of the phone's answer, unless the receptionist has already made it.
 
 - **If the Agent page is closed or reloaded** while you are rung (nothing is answering calls), a
-  caller who speaks is not hung up on: they hear the hold line, "still connecting" or the offer of
-  a message, whichever fits, straight away (not more than one every 3 seconds). Only a call with no
+  caller who speaks is not hung up on: they hear the hold line or the offer of
+  a message, whichever fits, straight away (not more than one every 3 seconds); after you accept they hear nothing more. Only a call with no
   request going is finished for want of a page, as it always was.
 
 What it does not cover: a phone plugin that is not running or has lost its connection to this
