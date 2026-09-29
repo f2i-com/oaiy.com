@@ -85,9 +85,12 @@ fn forward_error_message(
 /// console asks `call.current` every few seconds, and would fill it.
 pub const RELAY_LOG_FILE: &str = "relay-log.jsonl";
 
-/// The ops of the `desktop` connector: the closed list [`dispatcher`] answers, and
-/// so the ones the relay log calls allowed. A test runs each through the
-/// dispatcher, so an op added there and not here cannot go unlogged as unknown.
+/// The ops of the `desktop` connector: the closed list [`dispatcher`] answers.
+///
+/// The relay lets an op through to the dispatcher only if it is on this list, and
+/// the relay log calls exactly these allowed, so what the log says ran is what ran.
+/// An op added to the dispatcher and not here is refused (and logged as refused) until
+/// somebody lists it, and a test that reads the dispatcher fails to say so.
 pub const DESKTOP_OPS: [&str; 10] = [
     "services.list",
     "services.start",
@@ -140,11 +143,18 @@ impl RelayGuard {
     }
 
     /// An op of this app's own. It is not the policy's to allow (the list of ops is
-    /// closed in [`dispatcher`]) but it is written down all the same: stopping the
-    /// phone plugin from the website is exactly what this log is for.
-    fn note_desktop_op(&self, command: &str, command_id: &str) {
-        let unknown = (!DESKTOP_OPS.contains(&command)).then_some("unknown_op");
-        self.record(DESKTOP_CONNECTOR, command, command_id, unknown);
+    /// closed, [`DESKTOP_OPS`]) but it is written down all the same: stopping the
+    /// phone plugin from the website is exactly what this log is for. An op that is
+    /// not on the list is refused here, in the dispatcher's own words, and never
+    /// reaches it, so the line written is always the truth about what happened.
+    fn admit_desktop_op(&self, command: &str, command_id: &str) -> Result<(), String> {
+        let listed = DESKTOP_OPS.contains(&command);
+        self.record(DESKTOP_CONNECTOR, command, command_id, (!listed).then_some("unknown_op"));
+        if listed {
+            Ok(())
+        } else {
+            Err(not_served(command))
+        }
     }
 
     /// One line: which command, on which connector, what was decided and why (`refused`
@@ -184,26 +194,43 @@ fn declared_by(plugins: &PluginRegistryHandle, connector: &str, command: &str) -
     }
 }
 
+/// What this desktop says of an op on its own connector that it does not serve.
+/// [`dispatcher`] says the same words to a caller on this computer (a test holds them together).
+fn not_served(op: &str) -> String {
+    format!("this desktop does not serve the remote op {op:?} on the desktop connector")
+}
+
 /// The dispatcher the relay worker calls: [`dispatcher`], behind the relay policy
 /// and the relay log.
 ///
 /// The `desktop` connector's ops are this app's own and are not asked about the
-/// policy, only written down. Everything else is asked first.
+/// policy, only checked against [`DESKTOP_OPS`] and written down. Everything else is
+/// asked first.
 pub fn relay_dispatcher(
     registry: RegistryHandle,
     plugins: PluginRegistryHandle,
     host: std::sync::Arc<crate::plugins::PluginHost>,
     guard: RelayGuard,
 ) -> super::relay::Dispatcher {
-    let asked = plugins.clone();
-    let inner = dispatcher(registry, plugins, host);
+    let inner = dispatcher(registry, plugins.clone(), host);
+    guarded(plugins, guard, inner)
+}
+
+/// `inner` behind the relay policy and the relay log: nothing reaches it that the
+/// policy or the list of desktop ops refuses. A seam of its own so that a test can put a
+/// dispatcher that serves anything behind it and see what gets through.
+fn guarded(
+    plugins: PluginRegistryHandle,
+    guard: RelayGuard,
+    inner: super::relay::Dispatcher,
+) -> super::relay::Dispatcher {
     std::sync::Arc::new(move |connector: &str, command: &str, payload: &Value, key: &str| {
         // `key` is the relayed command's own id: see `super::relay::Dispatcher`.
         if connector == DESKTOP_CONNECTOR {
-            guard.note_desktop_op(command, key);
+            guard.admit_desktop_op(command, key)?;
         } else {
             guard
-                .admit(&asked, connector, command, key)
+                .admit(&plugins, connector, command, key)
                 .map_err(|refusal| refusal.message())?;
         }
         inner(connector, command, payload, key)
@@ -796,9 +823,86 @@ mod guard_tests {
     }
 
     #[test]
+    fn the_dispatcher_answers_exactly_the_ops_on_the_list() {
+        // The relay lets an op through, and its log calls it allowed, only if it is on
+        // `DESKTOP_OPS`; what runs is what the dispatcher's own match names. Nothing but the
+        // source can say those are one list, so the match is read: every op it names is on the
+        // list, and every op on the list is named. (An op the match serves and the list leaves
+        // off is refused at the relay and logged as refused, which is true; this test is what
+        // tells whoever added it to list it.)
+        let source = include_str!("ops.rs");
+        let start = source.find("pub fn dispatcher(").expect("the dispatcher is in this file");
+        let end = start + source[start..].find("#[cfg(test)]").expect("its tests follow it");
+        // The text between the quotes, in the order it comes: an op is `area.verb`, lower case.
+        let is_op = |s: &&str| {
+            s.split_once('.').is_some_and(|(area, verb)| {
+                !area.is_empty()
+                    && !verb.is_empty()
+                    && area.chars().chain(verb.chars()).all(|c| c.is_ascii_lowercase())
+            })
+        };
+        let mut named: Vec<&str> = source[start..end].split('"').skip(1).step_by(2).filter(is_op).collect();
+        named.sort_unstable();
+        named.dedup();
+        let mut listed = DESKTOP_OPS.to_vec();
+        listed.sort_unstable();
+        assert_eq!(named, listed, "the dispatcher's ops and DESKTOP_OPS must be one list");
+    }
+
+    #[test]
+    fn an_op_off_the_list_is_refused_in_the_words_the_dispatcher_uses() {
+        let world = world("words");
+        let relay = relay(&world, RelayPolicy::shipped());
+        let from_the_relay = relay("desktop", "plugins.detonate", &Value::Null, "cmd-1").unwrap_err();
+        let from_this_computer = local(&world)("desktop", "plugins.detonate", &Value::Null, "run-1").unwrap_err();
+        assert_eq!(from_the_relay, from_this_computer);
+        assert_eq!(from_the_relay, not_served("plugins.detonate"));
+    }
+
+    #[test]
+    fn nothing_the_relay_refuses_reaches_the_dispatcher_behind_it() {
+        // Behind the relay's checks, a dispatcher that serves anything at all: an op nobody
+        // listed, as one added to the dispatcher and not to the list would be, or a plugin
+        // that answers every verb. What it is asked is what got past.
+        let dir = sandbox("behind");
+        let asked = Arc::new(Mutex::new(Vec::<String>::new()));
+        let noted = asked.clone();
+        let inner: Dispatcher = Arc::new(move |connector: &str, command: &str, _: &Value, _: &str| {
+            noted.lock().unwrap().push(format!("{connector} {command}"));
+            Ok(json!({ "ran": command }))
+        });
+        let plugins = crate::plugins::registry::new_handle(dir.join("plugins"));
+        let relay = guarded(plugins, RelayGuard::new(RelayPolicy::shipped(), dir.join(RELAY_LOG_FILE)), inner);
+
+        // Through: an op on the desktop's list, and a command Aokie's entry lists.
+        assert_eq!(relay("desktop", "plugins.list", &Value::Null, "cmd-1").unwrap()["ran"], "plugins.list");
+        assert_eq!(relay("aokie", "call.current", &Value::Null, "cmd-2").unwrap()["ran"], "call.current");
+        // Not through: an op nobody listed, a command the policy keeps here, a command with no id.
+        assert_eq!(
+            relay("desktop", "plugins.frobnicate", &Value::Null, "cmd-3").unwrap_err(),
+            not_served("plugins.frobnicate")
+        );
+        assert!(relay("aokie", "dongle.installDriver", &json!({ "vid": 1, "pid": 2 }), "cmd-4").is_err());
+        assert!(relay("aokie", "call.current", &Value::Null, "").is_err());
+        assert_eq!(*asked.lock().unwrap(), ["desktop plugins.list", "aokie call.current"]);
+
+        // And the log says it was refused, not that it ran.
+        let raw = std::fs::read_to_string(dir.join(RELAY_LOG_FILE)).expect("the relay log");
+        let refused: Vec<Value> = raw
+            .lines()
+            .map(|l| serde_json::from_str::<Value>(l).unwrap())
+            .filter(|l| l["args"]["command"] == "plugins.frobnicate")
+            .collect();
+        assert_eq!(refused.len(), 1, "{raw}");
+        assert_eq!(refused[0]["args"]["decision"], "refused");
+        assert_eq!(refused[0]["args"]["reason"], "unknown_op");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
     fn every_op_of_the_desktop_connector_is_one_the_dispatcher_answers_and_nothing_else_is() {
-        // The relay log calls an op allowed when it is in `DESKTOP_OPS`, and the dispatcher's own
-        // match decides what it runs: this is what keeps the two the same list.
+        // The other direction: every op on `DESKTOP_OPS` is one the dispatcher serves, so the
+        // relay log never calls an op allowed that then says this desktop does not serve it.
         let world = world("ops");
         let relay = relay(&world, RelayPolicy::shipped());
         for op in DESKTOP_OPS {
