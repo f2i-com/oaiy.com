@@ -18,11 +18,17 @@ const CACHE = 'oaiy-agent-v1';
 const OWNED = ['oaiy-agent-', 'bot.computer-'];
 const SCOPE = new URL(self.registration.scope);
 const PRECACHE = ['./', './index.html', './manifest.webmanifest', './icon.svg', './icon-192.png', './icon-512.png', './zipp/zipp_wasm.js', './zipp/zipp_wasm_bg.wasm'];
+// The entry a worker writes into its own cache when it takes over: when it did, so the next one knows which build ran before it.
+const TOOK_OVER = new URL('./__oaiy-took-over', SCOPE).href;
 
-// A new version installs beside the running one and waits: the tabs that are open keep the version
-// they started with (their hashed files are still cached), and the page says a new one is ready.
+const owned = (name) => OWNED.some((prefix) => name.startsWith(prefix));
+
+// A new version installs beside the running one and waits, and the page says a new one is ready.
 // The worker takes over when the person chooses to reload (the 'skip-waiting' message below), or
 // when no tab is left. The very first worker has nothing to wait for and starts at once.
+// While it waits, the running version keeps its own cache. Once it has taken over, the tabs that are
+// still on the earlier version find their files in that version's cache (see `fetch`), which is kept
+// until the version after this one takes over.
 self.addEventListener('install', (event) => {
   event.waitUntil(
     caches
@@ -32,14 +38,64 @@ self.addEventListener('install', (event) => {
   );
 });
 
+/** The caches of other builds this worker owns, oldest first. */
+async function otherBuilds() {
+  return (await caches.keys()).filter((name) => name !== CACHE && owned(name));
+}
+
+/** When the worker of this build took over (0: it never did, or wrote no record). */
+async function tookOverAt(name) {
+  try {
+    const record = await (await caches.open(name)).match(TOOK_OVER);
+    return record ? Number((await record.json()).at) || 0 : 0;
+  } catch {
+    return 0;
+  }
+}
+
+/**
+ * The build that ran before this one: the one that took over last. Builds that never took over (they
+ * were replaced while they waited) are not it. With no record at all (the caches of the bot.computer
+ * days, or of a build from before the records) it is the newest cache that holds anything.
+ */
+async function previousBuild(names) {
+  let previous = null;
+  let latest = 0;
+  for (const name of names) {
+    const at = await tookOverAt(name);
+    if (at > latest) {
+      previous = name;
+      latest = at;
+    }
+  }
+  if (previous) return previous;
+  for (const name of [...names].reverse()) if ((await (await caches.open(name)).keys()).length) return name;
+  return null;
+}
+
+// Taking over keeps the previous build's cache (tabs that have not reloaded still run that build and
+// load their files from it) and deletes every other cache of this app: the ones older than that, and
+// the ones of builds that were replaced while they waited.
 self.addEventListener('activate', (event) => {
   event.waitUntil(
-    caches
-      .keys()
-      .then((keys) => Promise.all(keys.filter((k) => k !== CACHE && OWNED.some((prefix) => k.startsWith(prefix))).map((k) => caches.delete(k))))
-      .then(() => self.clients.claim()),
+    (async () => {
+      const others = await otherBuilds();
+      const previous = await previousBuild(others);
+      await Promise.all(others.filter((name) => name !== previous).map((name) => caches.delete(name)));
+      await (await caches.open(CACHE)).put(TOOK_OVER, new Response(JSON.stringify({ at: Date.now() }), { headers: { 'content-type': 'application/json' } }));
+      await self.clients.claim();
+    })(),
   );
 });
+
+/** A response for the request from the cache of another build of this app, if one has it. */
+async function fromEarlierBuild(key) {
+  for (const name of (await otherBuilds()).reverse()) {
+    const hit = await (await caches.open(name)).match(key);
+    if (hit) return hit;
+  }
+  return undefined;
+}
 
 self.addEventListener('message', (event) => {
   // The person chose Reload (pwa/update.ts): take over from the version that is running.
@@ -87,13 +143,16 @@ self.addEventListener('fetch', (event) => {
         })
         .catch(() => null);
       // A page: fresh when online, cached when not.
-      if (request.mode === 'navigate') return isolate((await network) ?? (await cache.match(key)) ?? new Response('offline', { status: 503 }));
+      if (request.mode === 'navigate') return isolate((await network) ?? (await cache.match(key)) ?? (await fromEarlierBuild(key)) ?? new Response('offline', { status: 503 }));
       const cached = await cache.match(key);
       if (cached) {
         event.waitUntil(network);
         return isolate(cached);
       }
-      return isolate((await network) ?? new Response('offline', { status: 503 }));
+      const response = await network;
+      if (response?.ok) return isolate(response);
+      // Not on the host (or no host): a tab that is still on an earlier build finds its own files in that build's cache.
+      return isolate((await fromEarlierBuild(key)) ?? response ?? new Response('offline', { status: 503 }));
     })(),
   );
 });

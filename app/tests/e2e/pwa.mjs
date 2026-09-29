@@ -28,8 +28,10 @@ if (!existsSync(join(root, 'index.html')) || process.argv.includes('--build')) e
 const types = { '.html': 'text/html', '.js': 'text/javascript', '.mjs': 'text/javascript', '.css': 'text/css', '.wasm': 'application/wasm', '.svg': 'image/svg+xml', '.png': 'image/png', '.json': 'application/json', '.webmanifest': 'application/manifest+json', '.woff2': 'font/woff2' };
 
 // What the server answers, changed by the tests: which service worker file it serves (the build's own, or a
-// newer version of it), and whether it is there at all.
-const serving = { workerVersion: 1 };
+// newer version of it), a hashed file that only the first version has (the host deleted it when it deployed
+// the next), and paths that answer 404.
+const OLD_CHUNK = '/assets/old-chunk-1a2b3c4d.js';
+const serving = { workerVersion: 1, oldChunk: true, missing: new Set() };
 const NEXT_CACHE = 'oaiy-agent-000000000002';
 const stamped = readFileSync(join(root, 'sw.js'), 'utf8');
 const CACHE_LINE = /const CACHE = '(oaiy-agent-[0-9a-f]{12})';/;
@@ -45,11 +47,16 @@ const server = createServer((req, res) => {
     res.end('<!doctype html><meta charset="utf-8"><title>seed</title>');
     return;
   }
+  if (path === OLD_CHUNK && serving.oldChunk) {
+    res.setHeader('content-type', 'text/javascript');
+    res.end('export const chunk = "the first version";');
+    return;
+  }
   const relative = normalize(path).replace(/^([/\\])+/, '');
   let file = join(root, relative);
   const isPage = path === '/' || path === '/index.html';
   // A file that is not there is a 404 (not the page), so a wrong path in the manifest cannot pass.
-  if (!file.startsWith(root) || (!isPage && (!existsSync(file) || statSync(file).isDirectory()))) {
+  if (serving.missing.has(path) || !file.startsWith(root) || (!isPage && (!existsSync(file) || statSync(file).isDirectory()))) {
     res.statusCode = 404;
     res.setHeader('content-type', 'text/plain');
     res.end('not found');
@@ -57,7 +64,7 @@ const server = createServer((req, res) => {
   }
   if (isPage) file = join(root, 'index.html');
   res.setHeader('content-type', types[extname(file)] ?? 'application/octet-stream');
-  if (path === '/sw.js' && serving.workerVersion === 2) {
+  if (path === '/sw.js' && serving.workerVersion >= 2) {
     // The next build: another cache name, so other bytes.
     res.end(stamped.replace(CACHE_LINE, `const CACHE = '${NEXT_CACHE}';`) + '\n// the next version\n');
     return;
@@ -216,7 +223,8 @@ try {
   const seed = await browser.newPage();
   await seed.goto(`${base}__seed`);
   await seed.evaluate(async () => {
-    for (const name of ['bot.computer-deadbeef', 'oaiy-agent-000000000001', 'unrelated-cache']) await (await caches.open(name)).put('/old', new Response('old'));
+    // In this order: the newest of the app's caches is the one the first worker keeps (it has no record of a build that ran).
+    for (const name of ['oaiy-agent-000000000001', 'bot.computer-deadbeef', 'unrelated-cache']) await (await caches.open(name)).put('/old', new Response('old'));
   });
   await seed.close();
 
@@ -228,6 +236,7 @@ try {
     window.__realOffers = 0;
     window.addEventListener('beforeinstallprompt', () => window.__realOffers++);
   });
+  let tabB = null;
   let navigations = 0;
   page.on('framenavigated', (frame) => {
     if (frame === page.mainFrame()) navigations++;
@@ -244,14 +253,15 @@ try {
     same(state, { active: true, waiting: false, notice: false }, 'the worker and the notice');
   });
 
-  await check('the caches of earlier builds and of the old name are removed, and only those', async () => {
+  await check("the caches older than the previous build are removed (that one is kept), and nobody else's", async () => {
     let keys = [];
     for (let i = 0; i < 40; i++) {
       keys = (await cacheKeys(page)).sort();
-      if (!keys.some((k) => k.startsWith('bot.computer-') || k === 'oaiy-agent-000000000001')) break;
+      if (!keys.includes('oaiy-agent-000000000001')) break;
       await new Promise((r) => setTimeout(r, 250));
     }
-    same(keys, [builtCache, 'unrelated-cache'].sort(), 'the caches');
+    // The bot.computer cache was the newest of the app's, so it is the "previous build" a tab of the old days still runs.
+    same(keys, [builtCache, 'bot.computer-deadbeef', 'unrelated-cache'].sort(), 'the caches');
   });
 
   await check('the cache holds every file the worker precaches', async () => {
@@ -357,6 +367,15 @@ try {
     await page.evaluate(() => {
       window.__stillHere = true;
     });
+    // A second tab on the running version, which has loaded one of its hashed files.
+    tabB = await browser.newPage();
+    await tabB.goto(base);
+    await isolated(tabB);
+    await tabB.waitForSelector('.tree-row', { timeout: 30_000 });
+    same(await tabB.evaluate(async (u) => (await fetch(u)).status, OLD_CHUNK), 200, "the first version's hashed file, before the update");
+    for (let i = 0; i < 40 && !(await tabB.evaluate((u) => caches.match(u).then(Boolean), OLD_CHUNK)); i++) await new Promise((r) => setTimeout(r, 250));
+    // The host deploys the next version, and the first one's hashed file is gone from it.
+    serving.oldChunk = false;
     const navigationsBefore = navigations;
     serving.workerVersion = 2;
     await page.evaluate(async () => {
@@ -389,7 +408,17 @@ try {
       if (!keys.includes(builtCache)) break;
       await new Promise((r) => setTimeout(r, 250));
     }
-    same(keys, [NEXT_CACHE, 'unrelated-cache'], 'the caches after the update');
+    // The previous version's cache is kept for one more update; the bot.computer one, older than that, is gone.
+    same(keys, [builtCache, NEXT_CACHE, 'unrelated-cache'].sort(), 'the caches after the update');
+  });
+
+  await check('a tab that has not reloaded still finds its files after another tab took the update', async () => {
+    // Tab B still runs the first version, and the worker that serves it now is the new one. The host no longer has the
+    // first version's hashed file; the new worker finds it in the first version's cache.
+    same(await tabB.evaluate(async (u) => (await fetch(u)).status, OLD_CHUNK), 200, "the first version's hashed file, after the update");
+    // A file that no version ever had is still a 404: the 200 above came from the cache.
+    same(await tabB.evaluate(async () => (await fetch('/assets/never-was-1a2b3c4d.js')).status), 404, 'a file no version has');
+    await tabB.close();
   });
 
   // ---- offline ----
