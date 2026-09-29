@@ -3,7 +3,9 @@
  * with a row per tool call; and the prompt box, which also takes slash
  * commands.
  *
- * The log reads newest first. What each person said is grouped under their
+ * The log reads oldest first, the newest just above the message box, and
+ * keeps to the bottom while the reader is there (chat/scroll.ts). What each
+ * person said is grouped under their
  * name (a run: one speaker, one header), a call's and a text thread's words
  * are shown without the labels the agent reads them with (transcript.ts), and
  * tool calls made one after another fold into one "Used N tools" row.
@@ -33,6 +35,7 @@ import {
   type CallStart,
   type Part,
 } from './chat/transcript';
+import { Follow, anchorIndex, anchoredScrollTop } from './chat/scroll';
 
 /** How long a flag waits for a comment before it goes without one. */
 const FLAG_WAIT_SECONDS = 10;
@@ -58,7 +61,7 @@ function promptText(e: { system: string; turns: Turn[]; tools: string[] }): stri
 /** Steps after the one in progress that the checklist shows before folding the rest into "+N more". */
 const PLAN_UPCOMING = 4;
 
-/** How many turns of a saved conversation are drawn at a time (newest first; older ones as the log is scrolled down to them). */
+/** How many turns of a saved conversation are drawn at a time (the latest first; older ones as the log is scrolled up to them). */
 const REPLAY_PAGE = 60;
 
 /** Where the last page of `turns` starts: `size` turns back, moved back to the request they belong to. */
@@ -146,6 +149,11 @@ export class ChatPane {
   private replaying = false;
   /** The empty conversation's welcome. */
   private readonly hero = h('div.chat-empty');
+  /** What the log holds, oldest first; the agent at work (`status`) is always last. */
+  private readonly feed = h('div.chat-feed');
+  /** Whether the log keeps to the bottom, and how much came while it did not. */
+  private readonly follow = new Follow();
+  private readonly jumpCount = h('span.jump-count');
 
   constructor(
     private readonly handlers: {
@@ -161,13 +169,21 @@ export class ChatPane {
   ) {
     this.planBox.hidden = true;
     this.meter.hidden = true;
-    this.log.append(this.status);
+    this.log.append(this.feed);
+    this.feed.append(this.status);
     this.sessionTabs.append(this.sessionPicker.element);
     this.log.addEventListener('scroll', () => {
-      this.stick = this.log.scrollTop < 60;
-      this.toCurrent.hidden = this.log.scrollTop < 300;
+      this.follow.scrolled(this.log);
+      this.showJump();
       this.maybeLoadOlder();
     }, { passive: true });
+    // Whatever makes the log taller or its window shorter (a reply streaming, a row opened, a picture
+    // loaded, the message box growing): at the bottom, it stays there.
+    if (typeof ResizeObserver === 'function') {
+      const watch = new ResizeObserver(() => this.pin());
+      watch.observe(this.feed);
+      watch.observe(this.log);
+    }
     // A code block's Copy button.
     this.log.addEventListener('click', (e) => {
       const button = (e.target as Element).closest?.('.code-copy');
@@ -187,7 +203,7 @@ export class ChatPane {
       this.sessionTabs,
       this.liveBar,
       this.planBox,
-      h('div.chat-log-wrap', this.log, this.toCurrent),
+      h('div.chat-log-wrap', this.log, this.toLatest),
       h('div.chat-compose', composer),
       this.picker,
     );
@@ -332,60 +348,87 @@ export class ChatPane {
   }
 
   /**
-   * The log reads newest first: the current step is at the top. It follows
-   * new output only while the person is at the top: scrolled down to read
-   * older messages, they stay put (the browser keeps what they read in place
-   * as new entries arrive above it).
+   * The log reads oldest first, the newest at the bottom. It keeps to the
+   * bottom while the reader is there (or near it); scrolled up to read older
+   * messages, they stay put, and "Latest" says how much is new below.
    */
-  private stick = true;
   private scrollQueued = false;
   private scroll(): void {
-    if (!this.stick || this.scrollQueued || this.sink) return;
+    if (!this.follow.stick || this.scrollQueued || this.sink) return;
     this.scrollQueued = true;
     requestAnimationFrame(() => {
       this.scrollQueued = false;
-      if (this.stick) this.log.scrollTop = 0;
+      this.pin();
     });
   }
 
-  /** Back to the top, where the agent's current step is. */
-  private readonly toCurrent = h('button.to-current', { type: 'button', hidden: true, title: 'Back to the newest messages and what the agent is doing now', onclick: () => this.toTop() }, icon('arrow-up'), h('span', 'Latest'));
-
-  /** Straight to the top (the newest), following it from there. */
-  private toTop(): void {
-    this.stick = true;
-    const still = typeof matchMedia === 'function' && matchMedia('(prefers-reduced-motion: reduce)').matches;
-    this.log.scrollTo({ top: 0, behavior: still ? 'auto' : 'smooth' });
-    this.toCurrent.hidden = true;
+  /** At the bottom now, when the log follows. */
+  private pin(): void {
+    if (this.follow.stick && !this.sink) this.log.scrollTop = this.log.scrollHeight;
+    this.showJump();
   }
 
-  /** Where new entries go: the top of the log, or (drawing older turns) a holder of their own. */
+  /** Down to the latest, and what the agent is doing now. */
+  private readonly toLatest = h('button.to-latest', { type: 'button', hidden: true, title: 'Down to the newest messages and what the agent is doing now', onclick: () => this.toBottom(true) }, icon('arrow-down'), h('span', 'Latest'), this.jumpCount);
+
+  /** "Latest", while the reader is away from the bottom (with how many messages came meanwhile). */
+  private showJump(): void {
+    this.toLatest.hidden = !this.follow.offerJump(this.log);
+    this.jumpCount.textContent = this.follow.unseen ? `${this.follow.unseen} new` : '';
+  }
+
+  /** Straight to the bottom (the newest), following it from there. */
+  private toBottom(smooth = false): void {
+    const glide = smooth && !(typeof matchMedia === 'function' && matchMedia('(prefers-reduced-motion: reduce)').matches);
+    this.log.scrollTo({ top: this.log.scrollHeight, behavior: glide ? 'smooth' : 'auto' });
+    this.follow.jump(glide ? undefined : this.log.scrollTop);
+    this.showJump();
+  }
+
+  /** Where new entries go: the end of the log, or (drawing older turns) a holder of their own. */
   private sink: HTMLElement | null = null;
 
+  /** Put `node` at the end of `box` (in the log: before the agent-at-work line, which stays last). */
+  private place(box: HTMLElement, node: HTMLElement): void {
+    if (box === this.feed) this.feed.insertBefore(node, this.status);
+    else box.append(node);
+  }
+
+  /** The last entry of `box` (the log's own lines, and the welcome, are not entries). */
+  private lastEntry(box: HTMLElement): Element | null {
+    let last = box === this.feed ? this.status.previousElementSibling : box.lastElementChild;
+    while (last && (last === this.hero || last === this.older)) last = last.previousElementSibling;
+    return last;
+  }
+
   /**
-   * Put an entry on top: under its speaker's header when the entry on top is
+   * Put an entry at the end: under its speaker's header when the last entry is
    * theirs already (a run), in a new run otherwise; an entry of no one's (a
    * note from the app, a day) on its own.
    */
   private add(entry: HTMLElement, speaker: Speaker | null = null, who = ''): void {
-    const box = this.sink ?? this.log;
+    const box = this.sink ?? this.feed;
+    if (!this.sink && !this.replaying) {
+      this.follow.arrived(entry.matches('.msg.user, .msg.incoming, .msg.assistant, .msg.system, .sms-out'));
+      this.showJump();
+    }
     if (!speaker) {
-      box.prepend(entry);
+      this.place(box, entry);
       return;
     }
     if (!this.sink) this.hero.remove();
-    let run = this.topRun(box, speaker, who);
+    let run = this.endRun(box, speaker, who);
     if (!run) {
       run = this.makeRun(speaker, who);
-      box.prepend(run);
+      this.place(box, run);
     }
-    run.lastElementChild!.prepend(entry);
+    run.lastElementChild!.append(entry);
   }
 
-  /** The run on top of `box`, when it is `speaker`'s (and, for someone on the phone, the same someone). */
-  private topRun(box: HTMLElement, speaker: Speaker, who = ''): HTMLElement | null {
-    const top = box.firstElementChild;
-    return top instanceof HTMLElement && top.matches('section.run') && top.dataset.speaker === speaker && (top.dataset.who ?? '') === who ? top : null;
+  /** The run at the end of `box`, when it is `speaker`'s (and, for someone on the phone, the same someone). */
+  private endRun(box: HTMLElement, speaker: Speaker, who = ''): HTMLElement | null {
+    const last = this.lastEntry(box);
+    return last instanceof HTMLElement && last.matches('section.run') && last.dataset.speaker === speaker && (last.dataset.who ?? '') === who ? last : null;
   }
 
   /** A speaker's run: their avatar and name over what they said. */
@@ -553,8 +596,8 @@ export class ChatPane {
 
   /**
    * Marks in the log where the plan moved: a new plan, a step started or
-   * finished, the steps changed. The log reads newest first, so each step's
-   * work sits above the mark where it started.
+   * finished, the steps changed. Each step's work follows the mark where it
+   * started.
    */
   private planMarks(before: Plan | null, after: Plan): void {
     const fresh = !before || (!!after.goal && !!before.goal && after.goal !== before.goal);
@@ -582,11 +625,12 @@ export class ChatPane {
     this.setActivity('');
     this.showPlan(null);
     for (const m of this.media.splice(0)) m.dispose();
-    clear(this.log);
-    // What the agent is doing now shows at the top of the log, where its reply comes (styles.css puts it first).
-    this.log.append(this.status);
+    clear(this.feed);
+    // What the agent is doing now shows at the end of the log, where its reply comes.
+    this.feed.append(this.status);
     this.older.remove();
-    this.stick = true;
+    this.follow.jump();
+    this.showJump();
     this.cards.clear();
     this.current = null;
     this.thinking = null;
@@ -595,12 +639,13 @@ export class ChatPane {
 
   /** The empty conversation's welcome: what it is for, and a few things to ask (they fill the box; nothing is sent). */
   private updateEmpty(): void {
-    if (this.log.querySelector('section.run, details.tool, .msg.user')) {
+    if (this.feed.querySelector('section.run, details.tool, .msg.user')) {
       this.hero.remove();
       return;
     }
     this.drawHero();
-    if (!this.hero.isConnected) this.log.append(this.hero);
+    // First in the log: notes from the app come after it, nearer the message box.
+    if (!this.hero.isConnected) this.feed.prepend(this.hero);
   }
 
   private drawHero(): void {
@@ -736,12 +781,13 @@ export class ChatPane {
 
   /**
    * Words from the other end of a call or text thread while its agent answers:
-   * drawn where they came, and the reply being written goes on in its own box
-   * below them (it began first), not split around them.
+   * drawn where they came (at the end), and the reply being written goes on in
+   * its own box above them (it began first), not split around them. The log
+   * follows them as it follows anything new: at the bottom, it keeps there.
    */
   heard(text: string): void {
     this.words(text, []);
-    if (!this.sink) this.toTop();
+    this.scroll();
   }
 
   /** A run ended (finished, or cut off): what the agent writes next is a new reply. */
@@ -759,9 +805,12 @@ export class ChatPane {
       this.planOpen = null;
       this.showPlan(null);
     }
-    this.words(text, attachments, during, note);
-    // Sending a message goes back to the top, where the reply comes.
-    if (!this.sink) this.toTop();
+    const own = this.words(text, attachments, during, note);
+    if (this.sink || this.replaying) return;
+    // The person's own message takes them to the bottom, where the reply comes; a caller's or a
+    // texter's words (shown here when no reply is being written) are followed like anything new.
+    if (own) this.toBottom();
+    else this.scroll();
   }
 
   /**
@@ -769,7 +818,7 @@ export class ChatPane {
    * lines (with when, and how they fell against the agent's speech); in a text
    * thread, each text; a flow's task; notes from OAIY; and the person's own.
    */
-  private words(text: string, attachments: Attachment[], during = false, note = ''): void {
+  private words(text: string, attachments: Attachment[], during = false, note = ''): boolean {
     let parts: Part[];
     if (this.kind === 'call') parts = parseCallTurn(text);
     else if (this.kind === 'sms') parts = /^\[OAIY\] /.test(text) ? [{ kind: 'note', text: text.replace(/^\[OAIY\]\s*/, '') }] : parseTextTurn(text);
@@ -806,7 +855,11 @@ export class ChatPane {
           break;
       }
     }
-    if (!own && (attachments.length || !parts.length)) this.ownBubble(text && parts.length ? '' : text, attachments, during, note);
+    if (!own && (attachments.length || !parts.length)) {
+      this.ownBubble(text && parts.length ? '' : text, attachments, during, note);
+      own = true;
+    }
+    return own;
   }
 
   /** The person's own words, and what they attached. */
@@ -927,8 +980,14 @@ export class ChatPane {
       this.current = { box, text: '', body };
     }
     this.current.text += delta;
-    // A long reply streams in many pieces: drawn a few times a second, not for each.
     const target = this.current;
+    // A saved reply is drawn whole, at once: the log lands at its end, and older turns drawn in
+    // above what the reader sees keep it where it is, only if nothing grows after.
+    if (this.replaying) {
+      target.body.innerHTML = renderMarkdown(target.text);
+      return;
+    }
+    // A long reply streams in many pieces: drawn a few times a second, not for each.
     this.redraw(target.box, () => {
       target.body.innerHTML = renderMarkdown(target.text);
     });
@@ -1010,41 +1069,40 @@ export class ChatPane {
   }
 
   /**
-   * A tool's row, on top: folded in with the calls just before it ("Used 3
+   * A tool's row, at the end: folded in with the calls just before it ("Used 3
    * tools"), the prompts sent for those steps with them, or on its own when it
    * is the first.
    */
   private addTool(card: HTMLElement): void {
-    const box = this.sink ?? this.log;
-    const run = this.topRun(box, 'agent');
+    const box = this.sink ?? this.feed;
+    const run = this.endRun(box, 'agent');
     const body = run?.lastElementChild as HTMLElement | undefined;
     if (!body) {
       this.add(card, 'agent');
       return;
     }
+    // The prompts sent since the last row (oldest first), and what came before them.
     const prompts: HTMLElement[] = [];
-    let below = body.firstElementChild as HTMLElement | null;
-    while (below?.matches('.prompt-view')) {
-      prompts.push(below);
-      below = below.nextElementSibling as HTMLElement | null;
+    let before = body.lastElementChild as HTMLElement | null;
+    while (before?.matches('.prompt-view')) {
+      prompts.unshift(before);
+      before = before.previousElementSibling as HTMLElement | null;
     }
     let group: HTMLElement | null = null;
-    if (below?.matches('details.tool-group')) group = below;
-    else if (below && this.groupable(below)) {
+    if (before?.matches('details.tool-group')) group = before;
+    else if (before && this.groupable(before)) {
       group = this.toolGroup();
-      below.before(group);
       // The lone row, and the prompt sent for its step, go into the group.
-      const older = below.nextElementSibling;
-      group.lastElementChild!.append(below, ...(older?.matches('.prompt-view') ? [older] : []));
+      const prompt = before.previousElementSibling;
+      const lone = prompt?.matches('.prompt-view') ? [prompt as HTMLElement, before] : [before];
+      lone[0].before(group);
+      group.lastElementChild!.append(...lone);
     }
     if (!group) {
       this.add(card, 'agent');
       return;
     }
-    const list = group.lastElementChild!;
-    list.prepend(...prompts);
-    list.prepend(card);
-    body.prepend(group);
+    group.lastElementChild!.append(...prompts, card);
     this.updateGroup(group);
   }
 
@@ -1072,7 +1130,7 @@ export class ChatPane {
       names.textContent = `${running.querySelector('.tool-name')?.textContent ?? ''} ${running.querySelector('.tool-arg')?.textContent ?? ''}`.trim();
     } else {
       title.textContent = `Used ${cards.length} tools`;
-      const labels = [...new Set(cards.slice().reverse().map((c) => c.querySelector('.tool-name')?.textContent ?? ''))].filter(Boolean);
+      const labels = [...new Set(cards.map((c) => c.querySelector('.tool-name')?.textContent ?? ''))].filter(Boolean);
       names.textContent = `${labels.slice(0, 3).join(' · ')}${labels.length > 3 ? ` · +${labels.length - 3}` : ''}${failed ? ` · ${failed} failed` : ''}`;
     }
   }
@@ -1140,14 +1198,15 @@ export class ChatPane {
     const row = h('li.agent-task.queued', h('div.task-head', h('span.task-mark'), h('span.task-title', title), state), activity, h('details.task-more', h('summary', 'report'), report));
     const card = this.cards.get(id.split('#')[0]);
     let target = list ?? card?.querySelector('.agent-tasks');
-    // A sub-agent under another tool's row (the review of a picture): a list of its own just above the row (or its group), seen without opening it.
+    // A sub-agent under another tool's row (the review of a picture): a list of its own just after the row (or its group), seen without opening it.
     if (!target && card) {
       const anchor = this.anchorOf(card);
-      const next = anchor.previousElementSibling;
+      let next = anchor.nextElementSibling;
+      while (next?.matches('.msg.presented')) next = next.nextElementSibling;
       target = next instanceof HTMLElement && next.matches('ol.agent-tasks.under') ? next : null;
       if (!target) {
         target = h('ol.agent-tasks.under');
-        anchor.before(target);
+        anchor.after(target);
       }
     }
     target?.append(row);
@@ -1227,7 +1286,7 @@ export class ChatPane {
     if (result.files?.length) {
       // Pictures the agent made can be flagged; files it only shows (uploads, extracted frames) cannot.
       const shown = h('div.msg.presented', ...result.files.map((path) => this.fileView(path, undefined, undefined, result.name === 'generate_image')));
-      this.anchorOf(card).before(shown);
+      this.anchorOf(card).after(shown);
     }
     this.scroll();
   }
@@ -1323,15 +1382,16 @@ export class ChatPane {
     }
   }
 
-  /** Turns of a long saved conversation not drawn yet: drawn as the person scrolls down to them. */
+  /** Turns of a long saved conversation not drawn yet: drawn as the person scrolls up to them. */
   private hiddenTurns: Turn[] = [];
-  /** The end of the log while older turns are left: scrolling near it draws them. */
+  /** The start of the log while older turns are left: scrolling near it draws them. */
   private readonly older = h('button.show-earlier', { type: 'button', onclick: () => this.loadOlder() });
 
   /**
-   * Show a saved conversation, newest first. A long one opens at its latest
-   * turns, and older ones are drawn a page at a time as the person scrolls
-   * down to them: drawing hundreds of tool cards at once is slow.
+   * Show a saved conversation, oldest first, at its end (the latest). A long
+   * one opens at its latest turns, and older ones are drawn a page at a time
+   * as the person scrolls up to them: drawing hundreds of tool cards at once
+   * is slow.
    */
   replay(turns: Turn[], latest = REPLAY_PAGE): void {
     // What the conversation is, from its words (the list of conversations says it only after).
@@ -1354,32 +1414,50 @@ export class ChatPane {
     this.drawTurns(turns.slice(from));
     this.showOlder();
     this.updateEmpty();
-    this.log.scrollTop = 0;
+    // A conversation opens at its end, following what comes.
+    this.toBottom();
   }
 
-  /** The note at the end of the log: how much older conversation there is. */
+  /** The note at the start of the log: how much older conversation there is. */
   private showOlder(): void {
     if (!this.hiddenTurns.length) {
       this.older.remove();
       return;
     }
-    this.older.textContent = `${this.hiddenTurns.length} older turns: scroll down, or click, to show them`;
-    this.log.append(this.older);
+    this.older.textContent = `${this.hiddenTurns.length} older turns: scroll up, or click, to show them`;
+    if (this.feed.firstElementChild !== this.older) this.feed.prepend(this.older);
     // A short page does not fill the log: nothing to scroll, so draw on.
     requestAnimationFrame(() => this.maybeLoadOlder());
   }
 
   private maybeLoadOlder(): void {
-    if (this.hiddenTurns.length && this.log.scrollHeight - this.log.scrollTop - this.log.clientHeight < 400) this.loadOlder();
+    if (this.hiddenTurns.length && this.log.scrollTop < 400) this.loadOlder();
   }
 
-  /** Draw the next page of older turns at the end of the log, leaving what is live (the current reply, the plan) as it is. */
+  /**
+   * What the reader sees at the top of the log, and where: it is held there
+   * while older turns go in above it.
+   */
+  private topAnchor(): { el: Element; top: number } | null {
+    const view = this.log.getBoundingClientRect().top;
+    // What is inside the runs (the older page's last run may go on into the first one shown, above what is read in it).
+    const entries = [...this.feed.children].filter((el) => el !== this.older).flatMap((el) => (el.matches('section.run') ? [...(el.lastElementChild?.children ?? [])] : [el]));
+    const spans = entries.map((el) => {
+      const r = el.getBoundingClientRect();
+      return { top: r.top - view, bottom: r.bottom - view };
+    });
+    const i = anchorIndex(spans);
+    return i < 0 ? null : { el: entries[i], top: spans[i].top };
+  }
+
+  /** Draw the next page of older turns at the start of the log, leaving what is live (the current reply, the plan) as it is, and what the reader sees where it was. */
   private loadOlder(): void {
     if (!this.hiddenTurns.length || this.sink) return;
     const from = pageStart(this.hiddenTurns, REPLAY_PAGE);
     const page = this.hiddenTurns.slice(from);
     this.hiddenTurns = this.hiddenTurns.slice(0, from);
     const live = { current: this.current, thinking: this.thinking, draft: this.draft, plan: this.currentPlan, planOpen: this.planOpen, callName: this.callName };
+    const anchor = this.topAnchor();
     // The page's marks follow the plan as it was then, not as it is now.
     this.currentPlan = planAfter(this.hiddenTurns);
     this.sink = h('div');
@@ -1387,18 +1465,25 @@ export class ChatPane {
       this.drawTurns(page, false);
     } finally {
       // Where the pages meet, one speaker's run goes on under the header it has.
-      let last = this.older.previousElementSibling;
-      while (last && (last === this.status || last === this.hero)) last = last.previousElementSibling;
-      const first = this.sink.firstElementChild;
-      if (last instanceof HTMLElement && first instanceof HTMLElement && last.matches('section.run') && first.matches('section.run') && last.dataset.speaker === first.dataset.speaker && last.dataset.who === first.dataset.who) {
-        last.lastElementChild!.append(...first.lastElementChild!.children);
-        first.remove();
+      let first = this.older.isConnected ? this.older.nextElementSibling : this.feed.firstElementChild;
+      while (first && (first === this.hero || first === this.status)) first = first.nextElementSibling;
+      const last = this.sink.lastElementChild;
+      if (first instanceof HTMLElement && last instanceof HTMLElement && first.matches('section.run') && last.matches('section.run') && first.dataset.speaker === last.dataset.speaker && first.dataset.who === last.dataset.who) {
+        first.lastElementChild!.prepend(...last.lastElementChild!.children);
+        last.remove();
       }
-      this.older.before(...this.sink.children);
+      if (this.older.isConnected) this.older.after(...this.sink.children);
+      else this.feed.prepend(...this.sink.children);
       this.sink = null;
       ({ current: this.current, thinking: this.thinking, draft: this.draft, plan: this.currentPlan, planOpen: this.planOpen, callName: this.callName } = live);
       this.showPlan(this.currentPlan);
       this.showOlder();
+      // What the reader was looking at stays where it was (at the bottom, the log keeps to it).
+      if (this.follow.stick) this.pin();
+      else if (anchor?.el.isConnected) {
+        const view = this.log.getBoundingClientRect().top;
+        this.log.scrollTop = anchoredScrollTop(this.log.scrollTop, anchor.top, anchor.el.getBoundingClientRect().top - view);
+      }
     }
   }
 
@@ -1414,7 +1499,7 @@ export class ChatPane {
     }
   }
 
-  /** Draw turns in the order they came (each goes on top of the ones before). */
+  /** Draw turns in the order they came (each after the ones before). */
   private drawTurns(turns: Turn[], showPlan = true): void {
     this.replaying = true;
     try {

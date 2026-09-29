@@ -434,13 +434,18 @@ kbd { display: inline-block; padding: 1px 6px; border: 1px solid var(--border); 
 .chat { display: flex; flex-direction: column; min-height: 0; background: var(--panel); position: relative; }
 .chat > .pane-title { display: flex; align-items: center; gap: 8px; }
 .chat-log-wrap { flex: 1; min-height: 0; position: relative; display: flex; flex-direction: column; }
-/* Newest first: what arrives goes on top, and what is being read further down stays in place. */
-.chat-log { flex: 1; min-height: 0; overflow: auto; overflow-anchor: auto; overscroll-behavior: contain; scrollbar-gutter: stable; padding: 14px 14px 18px; display: flex; flex-direction: column; gap: 14px; }
+/* Oldest first, the newest just above the message box: a short conversation sits at the bottom, a long one scrolls.
+   The chat holds the reader's place itself (chat/scroll.ts), so the browser's own scroll anchoring is off. */
+.chat-log { flex: 1; min-height: 0; overflow: auto; overflow-anchor: none; overscroll-behavior: contain; scrollbar-gutter: stable; display: flex; flex-direction: column; }
+.chat-feed { flex: 1 0 auto; display: flex; flex-direction: column; justify-content: flex-end; gap: 14px; padding: 18px 14px 14px; }
 /* However long the conversation, each entry keeps its height (the log scrolls). */
-.chat-log > * { flex-shrink: 0; }
-.to-current { position: absolute; top: 10px; left: 50%; transform: translateX(-50%); z-index: 3; display: inline-flex; align-items: center; gap: 6px; height: 28px; padding: 0 12px 0 10px; border-radius: 999px; border: 1px solid color-mix(in srgb, var(--accent) 60%, var(--border)); background: var(--accent-grad); color: var(--on-accent); font-size: 12px; font-weight: 600; box-shadow: var(--shadow-soft); }
-.to-current .icon { width: 14px; height: 14px; }
-.to-current[hidden] { display: none; }
+.chat-feed > * { flex-shrink: 0; }
+/* Down to the latest, while the reader is up the log (with how many messages came meanwhile). */
+.to-latest { position: absolute; bottom: 12px; left: 50%; transform: translateX(-50%); z-index: 3; display: inline-flex; align-items: center; gap: 6px; height: 30px; padding: 0 12px 0 10px; border-radius: 999px; border: 1px solid color-mix(in srgb, var(--accent) 60%, var(--border)); background: var(--accent-grad); color: var(--on-accent); font-size: 12px; font-weight: 600; box-shadow: var(--shadow); }
+.to-latest .icon { width: 14px; height: 14px; }
+.to-latest[hidden] { display: none; }
+.jump-count { padding: 0 7px; border-radius: 999px; background: color-mix(in srgb, var(--on-accent) 22%, transparent); font-size: 11px; line-height: 17px; }
+.jump-count:empty { display: none; }
 
 /* The conversations' picker: who is on screen, and all the others a click away. */
 .session-switch { position: relative; flex: none; padding: 8px 10px 0; z-index: 5; }
@@ -649,8 +654,8 @@ details.tool.auto summary .tool-name { font-style: italic; }
 .prompt-view summary .icon { width: 12px; height: 12px; }
 .prompt-view pre { margin: 4px 0 0; padding: 8px 10px; border: 1px dashed var(--border); border-radius: var(--r-sm); white-space: pre-wrap; word-break: break-word; max-height: 480px; overflow: auto; font: 11.5px/1.4 var(--mono); color: var(--text); background: var(--well); }
 
-/* The agent at work: a line at the top of the log (where its reply comes), with three dots. */
-.chat-status { order: -1; align-self: flex-start; display: inline-flex; align-items: center; gap: 8px; max-width: 100%; padding: 4px 12px 4px 10px; border-radius: 999px; border: 1px solid var(--border); background: var(--surface-soft); font-size: 12px; color: var(--muted); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+/* The agent at work: a line at the end of the log (where its reply comes), with three dots. */
+.chat-status { align-self: flex-start; display: inline-flex; align-items: center; gap: 8px; max-width: 100%; padding: 4px 12px 4px 10px; border-radius: 999px; border: 1px solid var(--border); background: var(--surface-soft); font-size: 12px; color: var(--muted); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .chat-status::before { content: ''; flex: none; width: 22px; height: 6px; background: radial-gradient(circle, var(--accent) 2.4px, transparent 2.6px) 0 0 / 8px 6px repeat-x; animation: typing 1.2s steps(3, end) infinite; -webkit-mask: linear-gradient(90deg, #000 0 33%, rgba(0, 0, 0, 0.35) 33% 100%); mask: linear-gradient(90deg, #000 0 33%, rgba(0, 0, 0, 0.35) 33% 100%); -webkit-mask-size: 300% 100%; mask-size: 300% 100%; }
 @keyframes typing { from { -webkit-mask-position: 150% 0; mask-position: 150% 0; } to { -webkit-mask-position: -150% 0; mask-position: -150% 0; } }
 .chat-status:empty { display: none; }
