@@ -1242,6 +1242,7 @@ pub fn run() {
             log::info!("OAIY Desktop {} starting (data={})", env!("CARGO_PKG_VERSION"), data_dir.display());
             // A restore the person staged (or an undo) is put in place NOW, before anything below
             // opens a store: every store then loads what was restored, and nothing has a file open.
+            crate::backup::restore::sweep_leftovers(&data_dir);
             match crate::backup::restore::apply_pending(&data_dir) {
                 crate::backup::restore::ApplyOutcome::None => {}
                 crate::backup::restore::ApplyOutcome::Applied(done) => log::info!("backup: the staged {} was applied", done.kind),

@@ -609,6 +609,43 @@ fn failed(marker_id: &str, kind: &str, why: &str) -> LastRestore {
     LastRestore { id: marker_id.to_string(), kind: kind.to_string(), at: now(), ok: false, error: Some(why.to_string()), redo: Vec::new(), agent_storage: "none".into() }
 }
 
+/// Remove what a backup or a restore that was killed part-way leaves behind, at the start of the app
+/// and before a staged restore is applied: the working copies under `backup/scratch` (plaintext, and
+/// with the keys ticked, the provider keys), a `pending-<id>` folder that no marker names (a staging
+/// that never got as far as its marker) and, when no marker waits, a set-aside folder of an undo.
+/// What a waiting marker names, the undo snapshots and the Agent's import are left alone.
+/// Returns how many folders were removed.
+pub fn sweep_leftovers(data_dir: &Path) -> usize {
+    let mut removed = 0;
+    if let Ok(entries) = std::fs::read_dir(super::scratch_dir(data_dir)) {
+        for entry in entries.flatten() {
+            let path = entry.path();
+            let done = match entry.file_type() {
+                Ok(t) if t.is_dir() => std::fs::remove_dir_all(&path).is_ok(),
+                _ => std::fs::remove_file(&path).is_ok(),
+            };
+            removed += usize::from(done);
+        }
+    }
+    let waiting = read_json::<Marker>(&marker_path(data_dir));
+    let marker_present = std::fs::symlink_metadata(marker_path(data_dir)).is_ok();
+    let named = waiting.as_ref().map(|m| m.source.clone());
+    if let Ok(entries) = std::fs::read_dir(restore_dir(data_dir)) {
+        for entry in entries.flatten() {
+            let name = entry.file_name().to_string_lossy().into_owned();
+            let orphan_pending = name.strip_prefix("pending-").is_some_and(is_id) && named.as_deref() != Some(name.as_str());
+            let orphan_undone = name.strip_prefix("undone-").is_some_and(is_id) && !marker_present;
+            if (orphan_pending || orphan_undone) && entry.file_type().map(|t| t.is_dir()).unwrap_or(false) && std::fs::remove_dir_all(entry.path()).is_ok() {
+                removed += 1;
+            }
+        }
+    }
+    if removed > 0 {
+        log::info!("backup: removed {removed} leftover working folder(s) of a backup or restore that did not finish");
+    }
+    removed
+}
+
 /// Step 3: called at the very start of the app, before any store is opened. If a restore is
 /// staged, put it in place; otherwise do nothing.
 pub fn apply_pending(data_dir: &Path) -> ApplyOutcome {

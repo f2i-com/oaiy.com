@@ -38,8 +38,11 @@ video or song. Try again when it is finished.
 
 The unencrypted copy that is made on the way is kept in a private folder under the data folder
 (`backup/scratch`), never in the folder you chose (which may be synchronised or on a drive you
-take away), and is removed when the backup ends, however it ends. The encrypted file is written
-beside its final name and renamed into place only after the check.
+take away), and is removed when the backup ends, however it ends; if OAIY is killed part-way, the
+next start removes what was left. The encrypted file is written beside its final name (as
+`.<name>.<id>.tmp`, encrypted like the backup) and renamed into place only after the check; a
+kill at that moment can leave that one file behind in the folder you chose, and it is safe to
+delete.
 
 ## What is in a backup, and what is not
 

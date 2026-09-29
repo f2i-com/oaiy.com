@@ -1733,6 +1733,50 @@ fn only_the_dashboards_own_window_may_call_the_commands() {
 }
 
 #[test]
+fn what_a_killed_backup_or_restore_leaves_behind_is_swept_at_the_start() {
+    let src = TempDir::new("sweep-src");
+    realistic(&src.0, "A");
+    let out = TempDir::new("sweep-out");
+    let file = out.0.join("s.oaiybackup");
+    make(&src.0, &file);
+    let dst = TempDir::new("sweep-dst");
+    target(&dst.0);
+    let before = snapshot(&dst.0);
+    let staged = restore::stage(&dst.0, &file, PASS, &options()).unwrap();
+    // What a killed run leaves: a working copy of the whole data set, a staging that never got its marker,
+    // and the set-aside folder of an undo.
+    put(&dst.0.join("backup").join("scratch").join("aaaaaaaaaaaaaaaa"), "tree/f000001", b"a plaintext copy");
+    put(&dst.0.join("backup").join("scratch").join("aaaaaaaaaaaaaaaa"), "plain.zip", b"a decrypted backup");
+    put(&dst.0.join("restore").join("pending-bbbbbbbbbbbbbbbb"), "files/callers.json", b"orphan");
+    put(&dst.0.join("restore").join("undone-cccccccccccccccc"), "files/callers.json", b"set aside");
+    put(&dst.0.join("restore").join("undo-dddddddddddddddd"), "files/callers.json", b"a snapshot");
+    put(&dst.0.join("restore").join("agent-import"), "current.zip", b"waits for the page");
+    let restore_dir = dst.0.join("restore");
+    let pending = restore_dir.join(format!("pending-{}", staged.id));
+
+    // With a marker waiting: its staging stays, so does everything that is not a leftover, and an undo's
+    // set-aside folder stays too (a rollback of an interrupted apply needs it).
+    let removed = restore::sweep_leftovers(&dst.0);
+    assert_eq!(removed, 2, "the working copy and the unnamed staging");
+    assert!(!dst.0.join("backup").join("scratch").join("aaaaaaaaaaaaaaaa").exists());
+    assert!(!restore_dir.join("pending-bbbbbbbbbbbbbbbb").exists());
+    assert!(pending.join("files").join("callers.json").is_file(), "what the marker names stays");
+    assert!(restore_dir.join("undone-cccccccccccccccc").exists(), "while a marker waits the set-aside folder may be needed");
+    assert!(restore_dir.join("undo-dddddddddddddddd").exists() && restore_dir.join("agent-import").join("current.zip").is_file());
+    assert_eq!(restore::sweep_leftovers(&dst.0), 0, "and there is nothing more to sweep");
+
+    // The staged restore still applies.
+    assert!(matches!(restore::apply_pending(&dst.0), ApplyOutcome::Applied(_)));
+    assert_eq!(get(&dst.0, "callers.json"), get(&src.0, "callers.json"));
+
+    // With no marker the set-aside folder goes too, and the snapshot and the Agent's import do not.
+    assert_eq!(restore::sweep_leftovers(&dst.0), 1);
+    assert!(!restore_dir.join("undone-cccccccccccccccc").exists());
+    assert!(restore_dir.join("undo-dddddddddddddddd").exists() && restore_dir.join("agent-import").join("current.zip").is_file());
+    let _ = before;
+}
+
+#[test]
 fn a_backup_run_is_taken_one_at_a_time() {
     let data = TempDir::new("one");
     put(&data.0, "callers.json", b"{}");
