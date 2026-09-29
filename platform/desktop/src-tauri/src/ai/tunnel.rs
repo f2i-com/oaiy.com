@@ -310,7 +310,7 @@ pub fn spawn(store: LinkHandle, sources: AiSources) {
                             log::info!("AI tunnel poll: working again");
                         }
                         if handled == 0 {
-                            tokio::time::sleep(crate::link::net::idle_pause(polled.elapsed())).await;
+                            tokio::time::sleep(spec.idle_pause(polled.elapsed())).await;
                         }
                     }
                     Err(e) => {
@@ -1447,6 +1447,32 @@ mod tests {
         assert_eq!(server.connections(), 1, "{:?}", server.lines());
         assert!(server.requests().iter().all(|r| r.header("authorization") == Some("Bearer flk_ai")));
         let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn the_lane_waits_after_an_empty_poll_as_long_as_its_descriptor_says() {
+        // The lane's own loop, not a function beside it: a provider that asks for a
+        // three second pause is not polled again for three seconds. (Every lane
+        // used to wait half a second, or the rest of two seconds if the provider
+        // cut its poll short, and there was nowhere to say otherwise.)
+        use crate::link::testkit::{Provider, Reply};
+        let server = Provider::start(|_| Reply::ok(r#"{"requests":[]}"#));
+        let (store, dir) = crate::link::testkit::linked_to(&server.base, "ai-slow", |d| {
+            let lane = d.desktop_ai.as_mut().unwrap();
+            lane.wait_seconds = 1;
+            lane.idle_pause_ms = 3_000;
+        });
+        let sources = AiSources {
+            providers: crate::ai::providers::new_handle(),
+            codex: crate::ai::codex::new_handle(&dir),
+        };
+        spawn(store, sources);
+        let polls = server.wait_for("/api/v1/desktop-ai/pending", 3, Duration::from_secs(30));
+        let _ = std::fs::remove_dir_all(dir);
+        for pair in polls.windows(2) {
+            let gap = pair[1].at - pair[0].at;
+            assert!(gap >= Duration::from_millis(2_800) && gap < Duration::from_secs(6), "{gap:?}");
+        }
     }
 
     #[tokio::test]

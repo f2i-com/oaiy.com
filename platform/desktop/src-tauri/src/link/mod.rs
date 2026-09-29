@@ -293,6 +293,33 @@ pub fn open_handle(data_dir: PathBuf) -> LinkHandle {
     store
 }
 
+/// A store holding `account`, for the tests of a lane's loop: it needs a link to
+/// read and nothing else, so this starts none of the workers `open_handle` starts
+/// and does not touch the trusted origin every other test reads.
+#[cfg(test)]
+pub(crate) fn store_for_tests(data_dir: PathBuf, account: Option<LinkedAccount>) -> LinkHandle {
+    Arc::new(LinkStore {
+        path: data_dir.join("link").join("account.json"),
+        data_dir,
+        inner: Mutex::new(Inner {
+            account,
+            attempt: LinkPhase::Idle,
+            in_flight: false,
+            cancel: Arc::new(AtomicBool::new(false)),
+            last_heartbeat_at: None,
+            heartbeat_error: None,
+            last_relay_at: None,
+            relay_error: None,
+            last_flow_run_at: None,
+            flow_run_error: None,
+            last_sealed_flow_at: None,
+            sealed_flow_error: None,
+            data_node: None,
+            data_node_error: None,
+        }),
+    })
+}
+
 impl LinkStore {
     pub fn status(&self) -> LinkStatus {
         let inner = self.inner.lock().unwrap_or_else(|e| e.into_inner());

@@ -780,6 +780,18 @@ pub struct DesktopAiSpec {
     pub batch_limit: u32,
     #[serde(default = "default_relay_backoff")]
     pub error_backoff_seconds: u64,
+    /// The least this lane waits after a poll that came back with nothing; see
+    /// [`RelaySpec::idle_pause_ms`].
+    #[serde(default = "default_idle_pause_ms")]
+    pub idle_pause_ms: u64,
+}
+
+impl DesktopAiSpec {
+    /// How long this lane waits before polling again after one that came back
+    /// with nothing, given how long that poll took: see [`RelaySpec::idle_pause`].
+    pub fn idle_pause(&self, polled_for: std::time::Duration) -> std::time::Duration {
+        super::net::idle_pause(polled_for, std::time::Duration::from_millis(self.idle_pause_ms))
+    }
 }
 
 fn default_ai_batch() -> u32 {
@@ -806,6 +818,54 @@ pub struct RelaySpec {
     /// hot loop against it.
     #[serde(default = "default_relay_backoff")]
     pub error_backoff_seconds: u64,
+    /// The least this lane waits, in milliseconds, after a poll that came back
+    /// with nothing before it polls again.
+    ///
+    /// Half a second unless a provider says otherwise, which is what every lane
+    /// waited before this was a setting. The lane's polls are also kept two
+    /// seconds apart whatever this says, for a provider that cuts its long polls
+    /// short (see [`super::net::idle_pause`]).
+    ///
+    /// It is the time in which NO poll is open, so it is a delay as well as a
+    /// saving: work the provider queues in that time is not seen until the next
+    /// poll begins, up to this long after. A provider that holds its polls
+    /// (`waitSeconds`) delivers at once whatever arrives while one is open, and
+    /// this is the only time it does not. A provider that cannot hold a poll
+    /// (a shared host, where each held poll is a busy worker) can ask for a short
+    /// hold and a long pause instead: `waitSeconds` 1 and `idlePauseMs` 5000 is
+    /// a request every six seconds.
+    #[serde(default = "default_idle_pause_ms")]
+    pub idle_pause_ms: u64,
+}
+
+impl RelaySpec {
+    /// How long this lane waits before polling again after one that came back
+    /// with nothing, given how long that poll took.
+    pub fn idle_pause(&self, polled_for: std::time::Duration) -> std::time::Duration {
+        super::net::idle_pause(polled_for, std::time::Duration::from_millis(self.idle_pause_ms))
+    }
+}
+
+/// What every lane waited after an empty poll before the wait was a setting.
+fn default_idle_pause_ms() -> u64 {
+    500
+}
+
+/// The range a provider may set [`RelaySpec::idle_pause_ms`] within: below a tenth
+/// of a second the pause is no pause, and past a minute a command could expire
+/// unseen (the shipped provider keeps one for a minute, and a call's for 15
+/// seconds).
+const IDLE_PAUSE_MS_RANGE: std::ops::RangeInclusive<u64> = 100..=60_000;
+
+fn check_idle_pause(connector: &str, lane: &str, ms: u64) -> Result<(), String> {
+    if IDLE_PAUSE_MS_RANGE.contains(&ms) {
+        return Ok(());
+    }
+    Err(format!(
+        "connector {connector:?} {lane} idlePauseMs {ms} is out of range ({}..{}ms)",
+        IDLE_PAUSE_MS_RANGE.start(),
+        IDLE_PAUSE_MS_RANGE.end()
+    ))
 }
 
 fn default_relay_wait() -> u64 {
@@ -1050,6 +1110,7 @@ impl ConnectorDescriptor {
             if r.batch_limit == 0 || r.batch_limit > 50 || r.error_backoff_seconds == 0 {
                 return Err("relay batch limit must be 1..50 and backoff must be positive".into());
             }
+            check_idle_pause(&self.id, "relay", r.idle_pause_ms)?;
         }
         if let Some(a) = &self.desktop_ai {
             for (label, path) in [
@@ -1118,6 +1179,7 @@ impl ConnectorDescriptor {
                     self.id, a.wait_seconds
                 ));
             }
+            check_idle_pause(&self.id, "desktopAi", a.idle_pause_ms)?;
         }
         if let Some(n) = &self.data_node {
             for (label, path) in [
@@ -1470,6 +1532,81 @@ mod tests {
         let d = builtin().remove(0);
         assert_eq!(d.flows.as_ref().unwrap().instruction_budget, Some(200_000_000));
         assert_eq!(d.app_logic.as_ref().unwrap().instruction_budget, Some(200_000_000));
+    }
+
+    #[test]
+    fn the_shipped_provider_pauses_after_an_empty_poll_as_every_lane_always_did() {
+        // The pause was a constant before it was a setting, and a descriptor that
+        // says nothing about it gets what every lane waited: half a second after a
+        // poll that held for its full wait, the rest of two seconds after one the
+        // provider cut short.
+        use std::time::Duration;
+        let d = builtin().remove(0);
+        let (relay, flows, ai) = (d.relay.unwrap(), d.desktop_flows.unwrap(), d.desktop_ai.unwrap());
+        assert_eq!((relay.idle_pause_ms, flows.idle_pause_ms, ai.idle_pause_ms), (500, 500, 500));
+        let lanes: [(&str, Box<dyn Fn(Duration) -> Duration>); 3] = [
+            ("relay", Box::new(move |t| relay.idle_pause(t))),
+            ("desktopFlows", Box::new(move |t| flows.idle_pause(t))),
+            ("desktopAi", Box::new(move |t| ai.idle_pause(t))),
+        ];
+        for (lane, pause) in &lanes {
+            assert_eq!(pause(Duration::from_secs(25)), Duration::from_millis(500), "{lane}");
+            assert_eq!(pause(Duration::from_secs(1)), Duration::from_secs(1), "{lane}");
+            assert_eq!(pause(Duration::ZERO), Duration::from_secs(2), "{lane}");
+        }
+    }
+
+    #[test]
+    fn a_provider_may_set_the_pause_on_each_lane_that_pauses() {
+        use std::time::Duration;
+        let mut d: ConnectorDescriptor = serde_json::from_str(BUILTIN[0]).unwrap();
+        d.relay.as_mut().unwrap().idle_pause_ms = 5_000;
+        d.desktop_flows.as_mut().unwrap().idle_pause_ms = 3_000;
+        d.desktop_ai.as_mut().unwrap().idle_pause_ms = 1_500;
+        d.validate().unwrap();
+        // Kept when a descriptor is written out and read back, as a user's file is.
+        let again: ConnectorDescriptor = serde_json::from_str(&serde_json::to_string(&d).unwrap()).unwrap();
+        let held = Duration::from_secs(25);
+        assert_eq!(again.relay.unwrap().idle_pause(held), Duration::from_secs(5));
+        assert_eq!(again.desktop_flows.unwrap().idle_pause(held), Duration::from_secs(3));
+        assert_eq!(again.desktop_ai.unwrap().idle_pause(held), Duration::from_millis(1_500));
+
+        // By its own name in the JSON, beside the settings it goes with.
+        let spec: RelaySpec = serde_json::from_value(serde_json::json!({
+            "pendingPath": "/p", "claimPath": "/c/{id}", "completePath": "/d/{id}",
+            "waitSeconds": 1, "idlePauseMs": 4000
+        }))
+        .unwrap();
+        assert_eq!((spec.wait_seconds, spec.idle_pause_ms), (1, 4000));
+        // Left out, it is what the lanes always waited.
+        let spec: RelaySpec = serde_json::from_value(serde_json::json!({
+            "pendingPath": "/p", "claimPath": "/c/{id}", "completePath": "/d/{id}"
+        }))
+        .unwrap();
+        assert_eq!(spec.idle_pause_ms, 500);
+    }
+
+    #[test]
+    fn a_pause_outside_its_range_is_refused_on_each_lane_that_pauses() {
+        for bad in [0u64, 99, 60_001] {
+            for lane in ["relay", "desktopFlows", "desktopAi"] {
+                let mut d: ConnectorDescriptor = serde_json::from_str(BUILTIN[0]).unwrap();
+                match lane {
+                    "relay" => d.relay.as_mut().unwrap().idle_pause_ms = bad,
+                    "desktopFlows" => d.desktop_flows.as_mut().unwrap().idle_pause_ms = bad,
+                    _ => d.desktop_ai.as_mut().unwrap().idle_pause_ms = bad,
+                }
+                let e = d.validate().expect_err("a pause out of range must be refused");
+                assert!(e.contains("idlePauseMs") && e.contains(&bad.to_string()), "{lane} {bad}: {e}");
+            }
+        }
+        for good in [100u64, 500, 60_000] {
+            let mut d: ConnectorDescriptor = serde_json::from_str(BUILTIN[0]).unwrap();
+            d.relay.as_mut().unwrap().idle_pause_ms = good;
+            d.desktop_flows.as_mut().unwrap().idle_pause_ms = good;
+            d.desktop_ai.as_mut().unwrap().idle_pause_ms = good;
+            d.validate().unwrap_or_else(|e| panic!("{good}: {e}"));
+        }
     }
 
     #[test]

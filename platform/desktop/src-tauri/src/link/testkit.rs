@@ -14,6 +14,7 @@ use std::io::{BufRead, BufReader, Read, Write};
 use std::net::{SocketAddr, TcpListener, TcpStream};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
 
 /// One request as the server saw it.
 #[derive(Clone, Debug)]
@@ -23,6 +24,8 @@ pub struct Seen {
     /// Header names in lower case.
     pub headers: HashMap<String, String>,
     pub body: String,
+    /// When it arrived.
+    pub at: Instant,
 }
 
 impl Seen {
@@ -116,6 +119,51 @@ impl Provider {
     pub fn lines(&self) -> Vec<String> {
         self.requests().iter().map(Seen::line).collect()
     }
+
+    /// Wait until `count` requests to a path beginning `prefix` have arrived, and
+    /// return them: for a lane's loop, which is left to run on its own thread.
+    pub fn wait_for(&self, prefix: &str, count: usize, within: Duration) -> Vec<Seen> {
+        let deadline = Instant::now() + within;
+        loop {
+            let seen: Vec<Seen> = self.requests().into_iter().filter(|r| r.target.starts_with(prefix)).collect();
+            if seen.len() >= count {
+                return seen;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "only {} of {count} requests to {prefix} in {within:?}: {:?}",
+                seen.len(),
+                self.lines()
+            );
+            std::thread::sleep(Duration::from_millis(25));
+        }
+    }
+}
+
+/// A store linked to `base` with the shipped connector, changed by `edit`, in a
+/// data folder of its own: what a lane's loop reads to know where to poll and how
+/// (a user's connector file replaces the built-in one of the same id).
+pub fn linked_to(
+    base: &str,
+    tag: &str,
+    edit: impl FnOnce(&mut super::ConnectorDescriptor),
+) -> (super::LinkHandle, std::path::PathBuf) {
+    let dir = std::env::temp_dir().join(format!("oaiy-lane-{tag}-{}", uuid::Uuid::new_v4().simple()));
+    std::fs::create_dir_all(dir.join("connectors")).unwrap();
+    let mut descriptor = super::descriptor::builtin().remove(0);
+    edit(&mut descriptor);
+    std::fs::write(dir.join("connectors").join("formlogic.json"), serde_json::to_string(&descriptor).unwrap()).unwrap();
+    let account = super::LinkedAccount {
+        connector_id: "formlogic".into(),
+        base_url: base.into(),
+        credential: "flk_lane".into(),
+        account_id: None,
+        account_name: None,
+        granted_scopes: None,
+        linked_at: chrono::Utc::now(),
+        instance_id: Some("oaiy-test".into()),
+    };
+    (super::store_for_tests(dir.clone(), Some(account)), dir)
 }
 
 impl Drop for Provider {
@@ -166,7 +214,13 @@ fn serve_connection(stream: TcpStream, handler: Arc<Handler>, seen: Arc<Mutex<Ve
         if reader.read_exact(&mut body).is_err() {
             return;
         }
-        let request = Seen { method, target, headers, body: String::from_utf8_lossy(&body).into_owned() };
+        let request = Seen {
+            method,
+            target,
+            headers,
+            body: String::from_utf8_lossy(&body).into_owned(),
+            at: Instant::now(),
+        };
         seen.lock().unwrap().push(request.clone());
 
         let reply = handler(&request);

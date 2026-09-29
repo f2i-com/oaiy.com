@@ -105,7 +105,7 @@ pub fn spawn(store: LinkHandle, dispatch: Dispatcher) {
                     HTTP.start_afresh();
                     std::thread::sleep(Duration::from_secs(spec.error_backoff_seconds));
                 } else if handled == 0 {
-                    std::thread::sleep(super::net::idle_pause(polled.elapsed()));
+                    std::thread::sleep(spec.idle_pause(polled.elapsed()));
                 }
             }
             Err(e) => {
@@ -496,6 +496,7 @@ mod tests {
             wait_seconds: 1,
             batch_limit: 5,
             error_backoff_seconds: 1,
+            idle_pause_ms: 500,
         }
     }
 
@@ -761,6 +762,46 @@ mod tests {
         assert_eq!(bearers(&a), ["Bearer flk_alpha", "Bearer flk_gamma", "Bearer flk_alpha"]);
         assert_eq!(bearers(&b), ["Bearer flk_beta"]);
         assert_eq!((a.connections(), b.connections()), (1, 1), "each provider's requests shared its connection");
+    }
+
+    // --- the pause after an empty poll -----------------------------------------------
+
+    const PENDING: &str = "/api/v1/connector-commands/pending";
+
+    /// Run the lane's own loop against a provider that has nothing for it, with the
+    /// connector as `edit` leaves it, and say how far apart its first polls were.
+    fn gaps_between_empty_polls(tag: &str, edit: impl FnOnce(&mut RelaySpec)) -> Vec<Duration> {
+        let server = Provider::start(|_| Reply::ok(r#"{"commands":[]}"#));
+        let (store, dir) = crate::link::testkit::linked_to(&server.base, tag, |d| edit(d.relay.as_mut().unwrap()));
+        spawn(store, working_dispatcher());
+        let polls = server.wait_for(PENDING, 3, Duration::from_secs(30));
+        let _ = std::fs::remove_dir_all(dir);
+        polls.windows(2).map(|pair| pair[1].at - pair[0].at).collect()
+    }
+
+    #[test]
+    fn the_lane_waits_after_an_empty_poll_as_long_as_its_descriptor_says() {
+        // The lane's own loop, not a function beside it: a provider that asks for a
+        // three second pause is not polled again for three seconds. (Every lane
+        // used to wait half a second, or the rest of two seconds if the provider
+        // cut its poll short, and there was nowhere to say otherwise.)
+        let gaps = gaps_between_empty_polls("relay-slow", |relay| {
+            relay.wait_seconds = 1;
+            relay.idle_pause_ms = 3_000;
+        });
+        for gap in gaps {
+            assert!(gap >= Duration::from_millis(2_800) && gap < Duration::from_secs(6), "{gap:?}");
+        }
+    }
+
+    #[test]
+    fn a_descriptor_that_says_nothing_about_the_pause_polls_as_often_as_the_lane_always_did() {
+        // A provider that answers at once, and a descriptor with no pause in it: two
+        // seconds between polls, as before.
+        let gaps = gaps_between_empty_polls("relay-default", |_| {});
+        for gap in gaps {
+            assert!(gap >= Duration::from_millis(1_800) && gap < Duration::from_millis(2_800), "{gap:?}");
+        }
     }
 
     #[test]

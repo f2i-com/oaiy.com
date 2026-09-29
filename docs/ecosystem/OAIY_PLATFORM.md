@@ -118,6 +118,14 @@ Two transports, neither a WebSocket.
   closed by this side first, so a request is never sent down one a provider's web server is
   closing. A client holds no credential: the bearer goes on each request. The encrypted flow
   lane's client refuses redirects.
+- The three long-poll lanes (`relay`, `desktopFlows`, `desktopAi`) take their timing from the
+  descriptor: `waitSeconds` is how long the provider may hold a poll, and `idlePauseMs` (100 to
+  60000, 500 unless set) is the least the lane waits after a poll that came back with nothing.
+  Polls are also kept two seconds apart, for a provider that cuts its holds short. The pause
+  is time in which no poll is open, so work queued then waits for the next poll, up to
+  `idlePauseMs` later: the shipped connector leaves it at 500 (its server holds a poll for
+  25 seconds, polls its queue every 500 ms while it holds, and keeps a call command for 15
+  seconds). A provider that cannot hold polls can ask for `waitSeconds` 1 with a long pause.
 
 - The relay's `desktop` connector answers `services.*` and `plugins.*`. A command for any other
   connector id goes to that plugin, with the idempotency key `relay-command-<commandId>`, only if

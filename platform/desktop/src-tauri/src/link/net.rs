@@ -74,14 +74,14 @@ pub fn retry_after(headers: &reqwest::header::HeaderMap) -> Option<std::time::Du
 }
 
 /// How long a lane waits after a poll that came back with nothing, given how long
-/// that poll took: at least half a second, and enough that the lane's polls are
+/// that poll took: at least `least` (the provider's own setting, half a second
+/// unless its descriptor says otherwise), and enough that the lane's polls are
 /// two seconds apart. A provider that cuts its long polls short (FormLogic under
 /// `php -S` answers in a second) would otherwise get a request a second from each
 /// lane, over its rate limit, when the desktop has nothing to do.
-pub fn idle_pause(polled_for: std::time::Duration) -> std::time::Duration {
+pub fn idle_pause(polled_for: std::time::Duration, least: std::time::Duration) -> std::time::Duration {
     const CYCLE: std::time::Duration = std::time::Duration::from_secs(2);
-    const LEAST: std::time::Duration = std::time::Duration::from_millis(500);
-    CYCLE.saturating_sub(polled_for).max(LEAST)
+    CYCLE.saturating_sub(polled_for).max(least)
 }
 
 // ---- the clients the lanes keep -------------------------------------------------
@@ -220,13 +220,33 @@ mod idle_tests {
         assert_eq!(super::retry_after(&h), None);
     }
 
+    /// What a descriptor that says nothing about the pause gets (500 ms).
+    const DEFAULT_LEAST: Duration = Duration::from_millis(500);
+
     #[test]
     fn an_empty_poll_is_followed_by_enough_of_a_pause() {
         // A long poll that waited server-side: the least pause.
-        assert_eq!(idle_pause(Duration::from_secs(25)), Duration::from_millis(500));
+        assert_eq!(idle_pause(Duration::from_secs(25), DEFAULT_LEAST), Duration::from_millis(500));
         // One cut short at a second: the rest of the two seconds.
-        assert_eq!(idle_pause(Duration::from_secs(1)), Duration::from_secs(1));
-        assert_eq!(idle_pause(Duration::ZERO), Duration::from_secs(2));
+        assert_eq!(idle_pause(Duration::from_secs(1), DEFAULT_LEAST), Duration::from_secs(1));
+        assert_eq!(idle_pause(Duration::ZERO, DEFAULT_LEAST), Duration::from_secs(2));
+    }
+
+    #[test]
+    fn a_provider_that_sets_the_pause_gets_at_least_that_and_still_the_two_second_spacing() {
+        let five = Duration::from_secs(5);
+        // A long poll: the pause the provider asked for, and no less.
+        assert_eq!(idle_pause(Duration::from_secs(25), five), five);
+        // One cut short: the provider's pause is longer than the spacing needs.
+        assert_eq!(idle_pause(Duration::from_secs(1), five), five);
+        assert_eq!(idle_pause(Duration::ZERO, five), five);
+        // A pause shorter than the spacing does not shorten it: a provider that
+        // answers at once is still not asked more than every two seconds.
+        let tenth = Duration::from_millis(100);
+        assert_eq!(idle_pause(Duration::from_secs(1), tenth), Duration::from_secs(1));
+        assert_eq!(idle_pause(Duration::ZERO, tenth), Duration::from_secs(2));
+        // …and after a full hold it is the provider's own, however short.
+        assert_eq!(idle_pause(Duration::from_secs(25), tenth), tenth);
     }
 }
 
