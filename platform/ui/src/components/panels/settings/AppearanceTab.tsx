@@ -49,7 +49,7 @@ export default function AppearanceTab() {
       <Card title="Theme">
         <p className="oaiy-card-text">
           The editor follows OAIY: it is light or dark as OAIY is ({resolvedTheme} now), in OAIY&apos;s colours.
-          Switch it with the theme button at the foot of OAIY&apos;s sidebar.
+          Switch it with the theme button at the top right of OAIY&apos;s window.
         </p>
       </Card>
     );
