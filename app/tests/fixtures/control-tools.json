@@ -1,5 +1,5 @@
 {
- "about": "OAIY Desktop's control tools as its MCP server lists them (tools/list), captured from a headless oaiy-server built from main (c98da95): all of them for a project or setup session; the runner session is offered the read tools named in runner.",
+ "about": "OAIY Desktop's control tools as its MCP server lists them (tools/list), captured from a headless oaiy-server built from main (9aeb3d8): all of them for a project or setup session; the runner session is offered the read tools named in runner.",
  "tools": [
   {
    "annotations": {
@@ -1015,6 +1015,118 @@
     "destructiveHint": false,
     "openWorldHint": false,
     "readOnlyHint": true,
+    "title": "Contacts"
+   },
+   "description": "The people who ring and text, by name: each with key (the last nine digits of their number), number, name (one word is a whole name), nameBy (owner: the person named them; agent: the receptionist did; null: no name), the start of the person's notes for the receptionist, and how many facts the receptionist remembered. q finds names, numbers written any way, notes and facts.",
+   "inputSchema": {
+    "additionalProperties": false,
+    "properties": {
+     "q": {
+      "description": "Find by name, number, notes or what was remembered.",
+      "type": "string"
+     }
+    },
+    "required": [],
+    "type": "object"
+   },
+   "name": "contacts_list",
+   "title": "Contacts"
+  },
+  {
+   "annotations": {
+    "destructiveHint": false,
+    "openWorldHint": false,
+    "readOnlyHint": true,
+    "title": "A contact"
+   },
+   "description": "One contact by their number: name, nameBy, the person's notes for the receptionist (it reads them on every call and text with them), and facts (what the receptionist remembered, each with its index for contact_forget_fact).",
+   "inputSchema": {
+    "additionalProperties": false,
+    "properties": {
+     "number": {
+      "description": "Their phone number, written any way (0491 570 006, +61491570006, or the key contacts_list shows).",
+      "minLength": 1,
+      "type": "string"
+     }
+    },
+    "required": [
+     "number"
+    ],
+    "type": "object"
+   },
+   "name": "contact_get",
+   "title": "A contact"
+  },
+  {
+   "annotations": {
+    "destructiveHint": false,
+    "openWorldHint": false,
+    "readOnlyHint": false,
+    "title": "Name a contact or change their notes"
+   },
+   "description": "Set a contact's name or the person's notes for the receptionist, by their number; the contact is made when there is none. A name set here is the person's: the receptionist never renames them. Only what is given changes; an empty name clears it; notes (up to 2000 characters) replace the notes there.",
+   "inputSchema": {
+    "additionalProperties": false,
+    "properties": {
+     "name": {
+      "description": "Their name as the person wants it; one word is fine (Lance).",
+      "type": "string"
+     },
+     "notes": {
+      "description": "The person's notes for the receptionist, whole: they replace the notes there.",
+      "type": "string"
+     },
+     "number": {
+      "description": "Their phone number, written any way (0491 570 006, +61491570006, or the key contacts_list shows).",
+      "minLength": 1,
+      "type": "string"
+     }
+    },
+    "required": [
+     "number"
+    ],
+    "type": "object"
+   },
+   "name": "contact_set",
+   "title": "Name a contact or change their notes"
+  },
+  {
+   "annotations": {
+    "destructiveHint": true,
+    "openWorldHint": false,
+    "readOnlyHint": false,
+    "title": "Forget what the receptionist remembered"
+   },
+   "description": "Forget one thing the receptionist remembered about a contact: index is the fact's place in contact_get's facts, from 0.",
+   "inputSchema": {
+    "additionalProperties": false,
+    "properties": {
+     "index": {
+      "description": "The fact's index in contact_get.",
+      "maximum": 49,
+      "minimum": 0,
+      "type": "integer"
+     },
+     "number": {
+      "description": "Their phone number, written any way (0491 570 006, +61491570006, or the key contacts_list shows).",
+      "minLength": 1,
+      "type": "string"
+     }
+    },
+    "required": [
+     "number",
+     "index"
+    ],
+    "type": "object"
+   },
+   "name": "contact_forget_fact",
+   "title": "Forget what the receptionist remembered"
+  },
+  {
+   "annotations": {
+    "destructiveHint": false,
+    "openWorldHint": false,
+    "readOnlyHint": true,
     "title": "FormLogic link"
    },
    "description": "The FormLogic link (linked or not, the account and address) and how the calendar sync with it stands (state, last success, what is pending, any error).",
@@ -1085,10 +1197,15 @@
     "readOnlyHint": false,
     "title": "Show a dashboard page"
    },
-   "description": "Show the person a page of the OAIY dashboard: overview, agent, flows, calendar, engines, services, plugins, runs, models, python, providers, connections, settings, setup, or a plugin's page as plugin:<pluginId>:<navId>.",
+   "description": "Show the person a page of the OAIY dashboard: overview, agent, flows, calendar, contacts (the people who ring and text; with contact, that person's own), hours (Hours & Services: the business, its opening hours, services and booking rules), engines, services, plugins, runs, models, python, providers, connections, settings, setup, or a plugin's page as plugin:<pluginId>:<navId>.",
    "inputSchema": {
     "additionalProperties": false,
     "properties": {
+     "contact": {
+      "description": "With view contacts: a person's phone number, written any way, to open their contact.",
+      "minLength": 1,
+      "type": "string"
+     },
      "view": {
       "description": "The page.",
       "minLength": 1,
@@ -1147,6 +1264,8 @@
   "flows_list",
   "flow_get",
   "calendar_settings_get",
+  "contacts_list",
+  "contact_get",
   "link_status",
   "setup_status",
   "logs_tail"

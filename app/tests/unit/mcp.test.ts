@@ -88,11 +88,11 @@ describe('the control API client', () => {
     expect(seen.map((s) => s.method)).toEqual(['initialize', 'notifications/initialized', 'tools/list', 'tools/list']);
     expect(seen.every((s) => s.auth === 'Bearer tok')).toBe(true);
     expect(seen.filter((s) => s.method === 'tools/list').map((s) => s.session)).toEqual(['project', 'runner']);
-    expect(project).toHaveLength(46);
+    expect(project).toHaveLength(50);
     expect(runner.map((t) => t.name).sort()).toEqual([...READ].sort());
     expect(client.protocol).toBe('2025-06-18');
     // What was listed is there without asking again.
-    expect(client.listed('project')).toHaveLength(46);
+    expect(client.listed('project')).toHaveLength(50);
   });
 
   it('never asks for a call, a text or a flow task: they get no tools', async () => {
@@ -108,7 +108,7 @@ describe('the control API client', () => {
   it('gives the runner read tools only, even from a desktop that offers it more', async () => {
     const { client } = fakeServer({ offer: () => TOOLS });
     const runner = await client.tools('runner');
-    expect(runner.length).toBe(16);
+    expect(runner.length).toBe(18);
     expect(runner.every((t) => t.readOnly)).toBe(true);
   });
 
@@ -154,10 +154,10 @@ describe('the control API client', () => {
   it('starts again after a failed start, and lists again after a refresh (a modules change, the desktop back)', async () => {
     const { client, seen } = fakeServer({ failInitialize: 1 });
     await expect(client.tools('project')).rejects.toThrow('not ready');
-    expect(await client.tools('project')).toHaveLength(46);
+    expect(await client.tools('project')).toHaveLength(50);
     client.refresh();
     // Until listed again, what was listed stays.
-    expect(client.listed('project')).toHaveLength(46);
+    expect(client.listed('project')).toHaveLength(50);
     await client.tools('project');
     expect(seen.filter((s) => s.method === 'initialize')).toHaveLength(2);
     expect(seen.filter((s) => s.method === 'tools/list')).toHaveLength(2);
@@ -221,7 +221,7 @@ describe("the control tools each kind of conversation is given", () => {
       expect(tools.find((t) => t.spec.name === 'flow_run')!.spec.description).toBe('flow_run');
       expect(names).toContain('flow_delete');
       expect(names).toEqual(expect.arrayContaining(['status', 'setup_status', 'plugin_setup_open', 'plugin_setup_status', 'setup_finish', 'agent_model_set']));
-      expect(names.length).toBe(APP_OWN.length + 46 - 5);
+      expect(names.length).toBe(APP_OWN.length + 50 - 5);
       // What the desktop's descriptions call the tools left out, they now call the app's.
       const del = tools.find((t) => t.spec.name === 'flow_delete')!;
       expect(JSON.stringify(del.spec)).not.toMatch(/\bflows_list\b/);
@@ -283,6 +283,28 @@ describe("the control tools each kind of conversation is given", () => {
     expect(call('model_set_default', { group: 'llm', model: 'Qwen3-8B' })).toBe('llm → Qwen3-8B');
     expect(call('agent_model_set', { source: 'chatgpt', model: 'gpt-5.5' })).toBe('ChatGPT · gpt-5.5');
     expect(call('service_install', { id: 'oaiy-voice' })).toBe('oaiy-voice');
+  });
+
+  it('the contacts tools read in plain words, with their icons, and say whose contact', () => {
+    const names = ['contacts_list', 'contact_get', 'contact_set', 'contact_forget_fact'];
+    // The desktop lists them (the fixture is captured from it); the runner reads two of them.
+    expect(names.every((n) => TOOLS.some((t) => t.name === n))).toBe(true);
+    expect(names.filter((n) => READ.has(n))).toEqual(['contacts_list', 'contact_get']);
+    expect(names.map((n) => [toolLabel(n), toolIcon(n)])).toEqual([
+      ['Looked at the contacts', 'users'],
+      ['Read a contact', 'user'],
+      ['Changed a contact', 'pencil'],
+      ['Forgot something remembered', 'trash'],
+    ]);
+    expect(names.every((n) => hasIcon(toolIcon(n)))).toBe(true);
+    expect(toolLabel('oaiy_contact_get')).toBe('Read a contact');
+    const call = (name: string, input: Record<string, unknown>) => summarizeCall({ id: 'c', name, input });
+    expect(call('contacts_list', { q: 'Lance' })).toBe('Lance');
+    expect(call('contact_get', { number: '0491 570 006' })).toBe('0491 570 006');
+    expect(call('contact_set', { number: '0491570006', name: 'Lance', notes: 'Prefers texts' })).toBe('0491570006 · Lance · notes');
+    expect(call('contact_forget_fact', { number: '0491570006', index: 2 })).toBe('0491570006 · #2');
+    expect(call('ui_open', { view: 'contacts', contact: '491570006' })).toBe('contacts · 491570006');
+    expect(call('ui_open', { view: 'calendar' })).toBe('calendar');
   });
 
   it('cuts a long answer for the model', async () => {

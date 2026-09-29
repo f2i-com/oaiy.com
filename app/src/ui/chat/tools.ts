@@ -120,6 +120,10 @@ const TOOLS: Record<string, [string, string]> = {
   calendar_settings_set: ['Changed the calendar settings', 'calendar'],
   link_status: ['Checked the FormLogic link', 'link'],
   link_sync_now: ['Synced with FormLogic', 'refresh'],
+  contacts_list: ['Looked at the contacts', 'users'],
+  contact_get: ['Read a contact', 'user'],
+  contact_set: ['Changed a contact', 'pencil'],
+  contact_forget_fact: ['Forgot something remembered', 'trash'],
   ui_open: ['Showed you a page in OAIY', 'eye'],
   logs_tail: ['Read a log', 'file-text'],
 };
@@ -186,7 +190,11 @@ export function summarizeCall(call: ToolCall): string {
     case 'model_set_default': return [s('group'), s('model')].filter(Boolean).join(' → ');
     case 'model_download': return s('catalogId');
     case 'agent_model_set': return [s('source') === 'chatgpt' ? 'ChatGPT' : s('source') === 'engine' ? 'the engine' : s('source'), s('model')].filter(Boolean).join(' · ');
-    case 'ui_open': return s('view');
+    case 'ui_open': return [s('view'), s('contact')].filter(Boolean).join(' · ');
+    case 'contacts_list': return s('q');
+    case 'contact_get': return s('number');
+    case 'contact_set': return [s('number'), s('name'), typeof i.notes === 'string' ? 'notes' : ''].filter(Boolean).join(' · ');
+    case 'contact_forget_fact': return [s('number'), typeof i.index === 'number' ? `#${i.index}` : ''].filter(Boolean).join(' · ');
     case 'logs_tail': return s('source');
     case 'calendar_settings_set': return Object.keys(i).join(', ');
     default: return '';
