@@ -54,7 +54,12 @@
  * `plaintext` mode for this page, reads and writes the plaintext exactly as
  * before, leaves whatever is there where it is, and says so once. (Keys sealed
  * on an earlier load are not shown on such a page, because the store could not
- * be read. They are untouched, and the next page load tries again.)
+ * be read. They are untouched, and the next page load tries again.) A key
+ * deleted on such a page is kept as an empty value in the plaintext map, unless
+ * nothing is ever sealed here (no IndexedDB or WebCrypto), when the name just
+ * goes: a sealed record of it may be in the store, and the next load that can
+ * open the store takes the delete there, so the key does not come back. A move
+ * that the page has given up on writes nothing more, for the same reason.
  *
  * A store that can be read but refuses a WRITE (a full disk, a quota) is not
  * that. The vault stays `sealed`: what the store holds is shown as usual, the
@@ -176,6 +181,8 @@ const pick = (values: ReadonlyMap<string, string>, names: readonly string[]): Re
 
 export function createSecretVault(env: VaultEnv = browserEnv()): SecretVault {
   const patience = env.timeoutMs ?? PATIENCE_MS;
+  /** Whether a store could be used at all here: without IndexedDB or WebCrypto nothing is ever sealed, so nothing sealed is left to delete. */
+  const sealable = Boolean(env.indexedDB && env.crypto?.subtle);
   const warned = new Set<string>();
   const warnOnce = (kind: string, message: string, detail?: unknown): void => {
     if (warned.has(kind)) return;
@@ -244,7 +251,10 @@ export function createSecretVault(env: VaultEnv = browserEnv()): SecretVault {
     if (value !== '') warnOnce('fallback', `API keys are kept in plain localStorage, because they cannot be sealed here: ${why}`);
     const plain = readPlain();
     const map = plain.parsed ? plain.map : new Map<string, string>();
-    if (value === '') map.delete(name);
+    // Where the store may be used at another load, a delete is kept as an empty value: a sealed record of
+    // the name may be there, and that load takes the delete to it (or the key would come back). Where
+    // nothing is ever sealed, the name just goes.
+    if (value === '' && !sealable) map.delete(name);
     else map.set(name, value);
     const failed = writePlain(map);
     if (failed) warnOnce('plain-write', 'could not persist secret (storage full?)', failed);
@@ -452,10 +462,12 @@ export function createSecretVault(env: VaultEnv = browserEnv()): SecretVault {
     // The plaintext is the newer: what it holds replaces what the sealed store holds, and an
     // empty value (kept when a delete could not be made there) deletes it there.
     const entries = [...plain.map];
-    if (cancelled()) throw new Error('gave up on the sealed store before moving the plaintext keys');
     for (const [name, value] of entries) {
       // Sealing is the crypto's; a failure there is not the store refusing a write.
       const sealed = value === '' ? null : await seal(key, value);
+      // A move the page has given up on writes nothing more: what it holds is stale by now (a key it
+      // would seal may have been deleted or changed since), and the plaintext this page relies on is newer.
+      if (cancelled()) throw new Error('gave up on the sealed store before moving the plaintext keys');
       try {
         if (sealed) await putSealed(database, name, sealed);
         else await deleteSealed(database, name);

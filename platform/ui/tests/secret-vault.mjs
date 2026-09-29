@@ -65,7 +65,7 @@ const tick = (ms = 5) => new Promise((resolve) => setTimeout(resolve, ms));
 // ---------------------------------------------------------------------------
 function createFakeIDB() {
   const dbs = new Map();
-  const knobs = { hangOpen: false, openError: null, hung: [], failures: [], corruptReads: false, delay: {} };
+  const knobs = { hangOpen: false, openError: null, hung: [], failures: [], corruptReads: false, delay: {}, holds: [], held: [] };
   const puts = {};
   const domError = (name, message) => new DOMException(message, name);
 
@@ -79,6 +79,18 @@ function createFakeIDB() {
       return f.error;
     }
     return null;
+  }
+
+  /** A request made to hang ahead of time, the same way: it is not carried out, and its transaction does not finish, until `release()`. */
+  function holding(op, store) {
+    for (const h of knobs.holds) {
+      if (h.op !== op || (h.store && h.store !== store)) continue;
+      if (h.skip > 0) { h.skip--; continue; }
+      if (h.times <= 0) continue;
+      h.times--;
+      return true;
+    }
+    return false;
   }
 
   function makeDb() {
@@ -142,6 +154,11 @@ function createFakeIDB() {
         return;
       }
       this.busy = true;
+      // A hung transaction keeps every later one on its database waiting, as a browser's does.
+      if (holding(req.op, this.currentStore(req))) knobs.held.push(() => this.perform(req));
+      else this.perform(req);
+    }
+    perform(req) {
       let result; let error = null;
       try {
         error = injected(req.op, this.currentStore(req));
@@ -227,7 +244,15 @@ function createFakeIDB() {
     /** Connections closed without a word (the vault learns only when it next uses one). */
     closeQuietly() { for (const db of dbs.values()) for (const conn of db.conns) conn.closed = true; },
     fail(op, error, { store, skip = 0, times = 1 } = {}) { knobs.failures.push({ op, store, skip, times, error }); },
-    release() { knobs.hangOpen = false; for (const go of knobs.hung.splice(0)) go(); },
+    /** Make `op` on `store` hang (after `skip` of them) until `release()`. */
+    hold(op, { store, skip = 0, times = 1 } = {}) { knobs.holds.push({ op, store, skip, times }); },
+    /** The browser answers at last: whatever was hung goes through, and nothing more is held. */
+    release() {
+      knobs.hangOpen = false;
+      knobs.holds.length = 0;
+      for (const go of knobs.hung.splice(0)) go();
+      for (const go of knobs.held.splice(0)) go();
+    },
   };
 }
 
@@ -495,15 +520,22 @@ await check('plaintext that is still there is the newer, at every read: it is la
 // ---------------------------------------------------------------------------
 const OLD = { OPENAI_API_KEY: KEY_A, ANTHROPIC_API_KEY: KEY_B };
 
-/** The plaintext still holds every key, and the vault reads and writes through it, saying so once. */
-async function staysPlaintext(w, vault, why) {
+/**
+ * The plaintext still holds every key, and the vault reads and writes through it, saying so once.
+ * A delete is kept as an empty value where the sealed store may be used at another load (that load
+ * takes the delete to the store), and is just the name gone where it never can be (`sealable: false`).
+ */
+async function staysPlaintext(w, vault, why, { sealable = true } = {}) {
   assert.equal(await vault.ready(), 'plaintext', why);
   assert.deepEqual(JSON.parse(plainStored(w)), OLD, `${why}: the plaintext is where it was`);
   assert.deepEqual(await vault.get(['OPENAI_API_KEY', 'ANTHROPIC_API_KEY', 'NOT_SET']), OLD, `${why}: and is read`);
   await vault.set('OPENAI_API_KEY', 'sk-changed');
   await vault.set('ANTHROPIC_API_KEY', '');
   await vault.set('NEW_KEY', 'sk-new');
-  assert.deepEqual(JSON.parse(plainStored(w)), { OPENAI_API_KEY: 'sk-changed', NEW_KEY: 'sk-new' }, `${why}: and written`);
+  const written = sealable
+    ? { OPENAI_API_KEY: 'sk-changed', ANTHROPIC_API_KEY: '', NEW_KEY: 'sk-new' }
+    : { OPENAI_API_KEY: 'sk-changed', NEW_KEY: 'sk-new' };
+  assert.deepEqual(JSON.parse(plainStored(w)), written, `${why}: and written`);
   assert.deepEqual(await vault.get(['OPENAI_API_KEY', 'ANTHROPIC_API_KEY', 'NEW_KEY']), { OPENAI_API_KEY: 'sk-changed', NEW_KEY: 'sk-new' });
   assert.equal(w.warns.length, 1, `${why}: said once, not per operation (${w.warns.join(' | ')})`);
   assert.match(w.warns[0], /plain localStorage/);
@@ -511,12 +543,12 @@ async function staysPlaintext(w, vault, why) {
 
 await check('no IndexedDB: the keys stay in plaintext, and are used as before', async () => {
   const w = world({ plain: OLD, env: { indexedDB: undefined } });
-  await staysPlaintext(w, w.load(), 'no IndexedDB');
+  await staysPlaintext(w, w.load(), 'no IndexedDB', { sealable: false });
 });
 
 await check('no WebCrypto (an http:// page): the keys stay in plaintext, and are used as before', async () => {
   const w = world({ plain: OLD, env: { crypto: { getRandomValues: webcrypto.getRandomValues.bind(webcrypto) } } });
-  await staysPlaintext(w, w.load(), 'no subtle');
+  await staysPlaintext(w, w.load(), 'no subtle', { sealable: false });
   assert.equal(w.idb.has(), false, 'the database was not even opened');
 });
 
@@ -614,7 +646,43 @@ await check('a store that never answers: the keys stay in plaintext after the wa
   // The browser wakes up after the page gave up on it. The move must not finish then.
   w.idb.release();
   await tick(150);
-  assert.deepEqual(JSON.parse(plainStored(w)), { OPENAI_API_KEY: 'sk-changed', NEW_KEY: 'sk-new' }, 'the plaintext this page relies on is untouched');
+  assert.deepEqual(JSON.parse(plainStored(w)), { OPENAI_API_KEY: 'sk-changed', ANTHROPIC_API_KEY: '', NEW_KEY: 'sk-new' }, 'the plaintext this page relies on is untouched');
+});
+
+await check('a key deleted while the store could not be opened is deleted there too, at the next load', async () => {
+  const w = world();
+  const before = w.load();
+  await before.set('A', KEY_A);
+  await before.set('B', KEY_B);
+  w.idb.knobs.openError = new DOMException('denied', 'SecurityError'); // this page load cannot open the store
+  const degraded = w.load();
+  assert.equal(await degraded.ready(), 'plaintext');
+  await degraded.set('A', ''); // revoked here
+  await degraded.set('B', 'b-rotated'); // rotated here
+  assert.deepEqual(await degraded.get(['A', 'B']), { B: 'b-rotated' }, 'gone, as far as this page can tell');
+  w.idb.knobs.openError = null; // the next load can open it
+  const next = w.load();
+  assert.equal(await next.ready(), 'sealed');
+  assert.deepEqual(await next.get(['A', 'B']), { B: 'b-rotated' }, 'A stayed deleted, B is the rotated one');
+  assert.deepEqual([...w.idb.raw('secrets').keys()], ['B'], 'the sealed record of A is gone');
+  assert.equal(plainStored(w), null);
+});
+
+await check('a move the page gave up on stops at once: it seals nothing more, not even a key deleted since', async () => {
+  const w = world({ plain: { K1: 'v1', K2: 'v2', K3: 'v3' }, env: { timeoutMs: 150 } });
+  w.idb.hold('put', { store: 'secrets', skip: 1 }); // K1 goes in; the write of K2 never answers
+  const vault = w.load();
+  assert.equal(await vault.ready(), 'plaintext', 'the move ran out of time');
+  await vault.set('K3', ''); // deleted here, before the move got to it
+  w.idb.release(); // the browser answers at last, and the abandoned move carries on
+  await tick(150);
+  assert.deepEqual([...w.idb.raw('secrets').keys()].sort(), ['K1', 'K2'], 'K3 was not sealed after it was deleted');
+  assert.deepEqual(JSON.parse(plainStored(w)), { K1: 'v1', K2: 'v2', K3: '' }, 'the plaintext this page relied on is untouched');
+  // The next load has all the time it needs (the short patience was only to make the first give up).
+  const next = V.createSecretVault({ ...w.env, timeoutMs: 5000 });
+  assert.equal(await next.ready(), 'sealed');
+  assert.deepEqual(await next.get(['K1', 'K2', 'K3']), { K1: 'v1', K2: 'v2' }, 'and K3 stays deleted');
+  assert.equal(plainStored(w), null);
 });
 
 await check('a store too slow to finish the move in time: what the page kept meanwhile is not removed when the move ends', async () => {
