@@ -135,11 +135,18 @@ struct CallRecord {
 /// a call is live (an update, before it restarts the app) can ask without being handed the hub.
 static HUBS: Mutex<Vec<std::sync::Weak<Inner>>> = Mutex::new(Vec::new());
 
-/// Phone calls live now, on every hub of this process.
+/// Phone calls live now, on every hub of this process: those this desktop is speaking on, and those the owner has taken (a
+/// call in handoff has no session here but is a live call all the same: an update or a backup that restarted the app or the
+/// phone plugin would cut the owner off from the caller). Each once.
 pub fn live_call_count() -> usize {
     let mut hubs = HUBS.lock().unwrap_or_else(|e| e.into_inner());
     hubs.retain(|hub| hub.strong_count() > 0);
-    hubs.iter().filter_map(std::sync::Weak::upgrade).map(|hub| hub.calls.lock().unwrap_or_else(|e| e.into_inner()).len()).sum()
+    live_calls_on(&hubs)
+}
+
+/// [`live_call_count`] for these hubs.
+fn live_calls_on(hubs: &[std::sync::Weak<Inner>]) -> usize {
+    hubs.iter().filter_map(std::sync::Weak::upgrade).map(|inner| VoiceHub { inner }.live_calls().len()).sum()
 }
 
 impl VoiceHub {
@@ -865,6 +872,41 @@ mod tests {
         hub.set_page_answers(true);
         hub.caller_said("call_1", "Hello?", json!({}));
         assert!(rx.try_recv().is_err());
+    }
+
+    #[test]
+    fn a_call_with_the_owner_is_a_live_call_for_an_update_and_for_what_holds_a_backup_back() {
+        let hub = VoiceHub::new(Engines::at("http://127.0.0.1:9", "http://127.0.0.1:9"), |_| None);
+        let ours = vec![Arc::downgrade(&hub.inner)];
+        let blocked = |calls: usize| {
+            crate::update::blockers::call_blockers(&crate::update::blockers::CallReadings { hub_calls: calls, phone: crate::update::phone::LineState::NoPlugin }).iter().any(|b| b.code == "call")
+        };
+        assert_eq!(live_calls_on(&ours), 0);
+        assert!(!blocked(live_calls_on(&ours)));
+        // The owner has the call: this desktop has no session for it, and it is still a call that must not be cut.
+        hub.enter_handoff("call_owner", "handoff:takeover");
+        assert!(hub.command("call_owner").is_none(), "nothing to speak on");
+        assert_eq!(live_calls_on(&ours), 1, "a call in handoff counts");
+        assert!(blocked(live_calls_on(&ours)), "and the updater is held back by it, with the reason it gives for a call");
+        // A call with a session as well as one with the owner: two calls.
+        let (tx, _rx) = mpsc::unbounded_channel();
+        hub.register("call_live", tx);
+        assert_eq!(live_calls_on(&ours), 2);
+        // The same call in both (the session came back before the handoff was cleared) is one call.
+        let (tx, _rx2) = mpsc::unbounded_channel();
+        hub.register("call_owner", tx);
+        assert_eq!(live_calls_on(&ours), 2, "counted once");
+        // The call ends: nothing holds anything back.
+        hub.unregister("call_live");
+        hub.unregister("call_owner");
+        hub.end_handoff("call_owner", "ended_during_handoff");
+        assert_eq!(live_calls_on(&ours), 0);
+        assert!(!blocked(live_calls_on(&ours)));
+        // The process-wide count sees the hub's calls too (other tests hold calls of their own, so it is at least ours).
+        hub.enter_handoff("call_again", "handoff:takeover");
+        assert!(live_call_count() >= 1);
+        drop(hub);
+        let _ = live_call_count();
     }
 
     /// The app's side of the calls, on a port of its own.
