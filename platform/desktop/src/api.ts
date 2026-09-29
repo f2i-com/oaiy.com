@@ -1580,9 +1580,141 @@ export const setup = {
     ),
 };
 
-/** Ask the Agent (its page in OAIY's window) to do something only it can: its settings live in its own storage. */
-export function agentIntent(intent: 'answerWithOaiy'): Promise<void> {
+/**
+ * What the dashboard may ask the Agent (its page in OAIY's window) to do, by
+ * name only (embed.rs `AGENT_INTENTS`): answer calls and texts (its settings
+ * live in its own storage), or set up the rest of OAIY with the person, in a
+ * "Set up OAIY" conversation.
+ */
+export type AgentIntent = 'answerWithOaiy' | 'setupWithAgent';
+
+/** Ask the Agent to do something only it can. Fails when the Agent's page is not made yet. */
+export function agentIntent(intent: AgentIntent): Promise<void> {
   return tauriInvoke<void>('agent_intent', { intent });
+}
+
+// ----- the Agent's access to OAIY, what it changed, and its model (CONTROL_API.md §1, §2) -----
+
+/** A 404 from `request()`: a route this desktop does not have (an older desktop). */
+export function isNotFound(e: unknown): boolean {
+  return e instanceof Error && /^404: /.test(e.message);
+}
+
+/** A route this desktop may not have yet: `null` on a 404, its answer otherwise (any other failure still throws). */
+export async function optional<T>(pending: Promise<T>): Promise<T | null> {
+  try {
+    return await pending;
+  } catch (e) {
+    if (isNotFound(e)) return null;
+    throw e;
+  }
+}
+
+/** `<data>/control.json`: while `agentMayChange` is false the Agent's change tools refuse, and its read tools still work. */
+export interface ControlSettings {
+  agentMayChange: boolean;
+}
+
+/** Who asked, as the Agent app says with `X-OAIY-Session`. */
+export type AgentSession = 'project' | 'setup' | 'runner' | 'call' | 'sms' | 'task';
+
+/** One change the Agent made through the MCP API (`<data>/control-log.jsonl`), secrets redacted. */
+export interface ControlLogEntry {
+  /** When: an ISO time, or seconds or milliseconds since 1970. */
+  at: string | number;
+  /** The MCP tool, e.g. `plugin_install`. */
+  tool: string;
+  args?: unknown;
+  session?: AgentSession | string | null;
+  ok: boolean;
+  /** A sentence about what it did, when the tool wrote one. */
+  summary?: string | null;
+}
+
+/** The log's answer, as a list or in an object that holds one (the route's wrapper is not pinned). */
+export function logEntries(body: unknown): ControlLogEntry[] {
+  const list = Array.isArray(body)
+    ? body
+    : body && typeof body === 'object'
+      ? ((['entries', 'log', 'items', 'changes'] as const).map((k) => (body as Record<string, unknown>)[k]).find(Array.isArray) ?? [])
+      : [];
+  return (list as unknown[]).filter(
+    (e): e is ControlLogEntry => !!e && typeof e === 'object' && typeof (e as ControlLogEntry).tool === 'string',
+  );
+}
+
+export const control = {
+  /** `null`: this desktop has no control API yet (the switch shows as on, and cannot be changed). */
+  settings: () => optional(request<ControlSettings>('/api/control/settings')),
+  setSettings: async (s: ControlSettings) =>
+    (await request<ControlSettings | undefined>('/api/control/settings', { method: 'PUT', body: JSON.stringify(s) })) ?? s,
+  /** Newest first. `null`: this desktop keeps no log yet. */
+  log: async (limit = 100): Promise<ControlLogEntry[] | null> => {
+    const body = await optional(request<unknown>(`/api/control/log?limit=${limit}`));
+    return body === null ? null : logEntries(body);
+  },
+};
+
+/** What the Agent thinks with: the engine's language model, or ChatGPT (Codex's default model when `model` is left out). */
+export type AgentModelSource = 'engine' | 'chatgpt';
+export interface AgentModelPreference {
+  source: AgentModelSource;
+  model?: string | null;
+}
+export interface AgentPreferences {
+  model: AgentModelPreference;
+}
+
+export const agentPreferences = {
+  /** `null`: this desktop does not keep the Agent's model yet. */
+  get: () => optional(request<AgentPreferences>('/api/agent/preferences')),
+  set: async (prefs: AgentPreferences) =>
+    (await request<AgentPreferences | undefined>('/api/agent/preferences', { method: 'PUT', body: JSON.stringify(prefs) })) ?? prefs,
+};
+
+/** One GPU, as Engines reports it. */
+export interface GpuMemory {
+  name: string;
+  totalGb: number;
+  freeGb?: number | null;
+}
+
+/** The catalog's recommended language model, as the recommendation names it (the catalog's own entry). */
+export type SuggestedModel = Partial<EngineCatalogModel> & { id: string; name?: string };
+
+/** Local or ChatGPT for the Agent, from this computer's hardware and what Engines has chosen. */
+export interface EngineRecommendation {
+  recommend: AgentModelSource;
+  local: {
+    ok: boolean;
+    reason?: string | null;
+    gpus?: GpuMemory[];
+    /** The language model chosen in Engines, or null. */
+    chosen?: string | null;
+    suggested?: SuggestedModel | null;
+  };
+  chatgpt: { signedIn: boolean };
+}
+
+/** `null`: this desktop does not recommend yet (the wizard falls back to "local if Engines has a model chosen"). */
+export function engineRecommendation(): Promise<EngineRecommendation | null> {
+  return optional(request<EngineRecommendation>('/api/engines/recommendation'));
+}
+
+/** The ChatGPT connector's provider id (ai/codex.rs `CODEX_PROVIDER_ID`): a route, not a model. */
+export const CODEX_PROVIDER_ID = 'openai-codex-agent';
+
+/** One model of Codex's catalogue: `id` is what to send back as the model. */
+export interface CodexModel {
+  id: string;
+  displayName?: string | null;
+  isDefault?: boolean;
+}
+
+/** The models this ChatGPT account can use (fails while signed out). */
+export async function codexModels(): Promise<CodexModel[]> {
+  const r = await request<{ data?: CodexModel[] }>(`/api/ai/providers/${CODEX_PROVIDER_ID}/v1/models`);
+  return (r?.data ?? []).filter((m) => !!m && typeof m.id === 'string' && m.id !== '');
 }
 
 export const phone = {
