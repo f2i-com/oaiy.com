@@ -56,8 +56,8 @@ describe("the desktop's names", () => {
 describe('every agent a customer talks to says who it is, for whom', () => {
   it('a call, a text thread, an outreach call and an outreach text', () => {
     const who = 'You are Aokie, the receptionist for Green Lawns.';
-    expect(callInstructions('', '', false, GREEN)).toContain(who);
-    expect(callInstructions('', '', false, GREEN)).toContain(NEVER);
+    expect(callInstructions('', false, GREEN)).toContain(who);
+    expect(callInstructions('', false, GREEN)).toContain(NEVER);
     expect(smsInstructions('Jane', '+61412345678', '', false, '', new Date(), GREEN)).toContain(who);
     expect(smsInstructions('Jane', '+61412345678', '', false, '', new Date(), GREEN)).toContain(NEVER);
     const c = { name: 'Confirm Friday', objective: 'Confirm Friday.', openingLine: "Hi {first_name}, it's {receptionist} from {business} about Friday.", voicemail: 'no_message', voicemailMessage: '', collect: [], identity: GREEN } as unknown as Campaign;

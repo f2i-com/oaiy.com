@@ -117,6 +117,8 @@ export class Callbacks {
     private readonly callsToOaiy: () => Promise<boolean | null> = async () => true,
     /** A number never to be rung (they asked not to be called: the do-not-contact list). */
     private readonly skip: (number: string) => boolean = () => false,
+    /** A call back is being dialled: the model reads its call's prompt while the phone rings (never waited for). */
+    private readonly warm: (number: string, purpose: string) => void = () => {},
   ) {}
 
   /** A call back is ringing now. */
@@ -233,13 +235,15 @@ export class Callbacks {
       // Cannot say now (the phone away): asked again at the next look.
       if (route === null) return;
       const when = new Date(next.missedAt).toLocaleString('en-AU', { weekday: 'short', hour: 'numeric', minute: '2-digit' });
+      const purpose = next.queued
+        ? `Returning their call from ${when}: they hung up waiting while the line was busy. Say sorry for the wait, find out what they needed, and help them as on any call.`
+        : `Returning their missed call from ${when}: find out what they needed, and help them as on any call.`;
+      this.warm(next.number, purpose);
       try {
         await desktop.command('aokie', 'call.dial', {
           number: next.number,
           openingLine: next.queued ? QUEUE_CALL_BACK_LINE : settings.callBackLine.trim() || DEFAULT_CALL_BACK_LINE,
-          purpose: next.queued
-            ? `Returning their call from ${when}: they hung up waiting while the line was busy. Say sorry for the wait, find out what they needed, and help them as on any call.`
-            : `Returning their missed call from ${when}: find out what they needed, and help them as on any call.`,
+          purpose,
         }, `oaiy:callback:${next.number}:${next.missedAt}:${next.tries + 1}`);
         Object.assign(next, { state: 'calling', tries: next.tries + 1, nextAt: now, note: undefined });
       } catch (error) {

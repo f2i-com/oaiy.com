@@ -41,7 +41,8 @@ function sse(step) {
 }
 const textOf = (m) => (typeof m.content === 'string' ? m.content : (m.content ?? []).map((p) => p.text ?? '').join(''));
 function answer(body) {
-  if ((body.max_tokens ?? body.max_completion_tokens) === 1) return { text: '' };
+  // A warm (Agent.warm: the model reads the prompt ahead, and a few words at most are asked for): nothing to say.
+  if ((body.max_tokens ?? body.max_completion_tokens) <= 32) return { text: '' };
   const system = textOf(body.messages.find((m) => m.role === 'system') ?? { content: '' });
   const last = textOf([...body.messages].reverse().find((m) => m.role === 'user') ?? { content: '' });
   if (/live phone call/.test(system)) {

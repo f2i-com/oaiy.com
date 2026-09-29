@@ -91,9 +91,17 @@ the person talks to), in a conversation of its own:
 - **Bookings.** A request is recorded with `request_appointment`, never
   promised without it. A promise with no request gets one reminder a call.
 
-The call's instructions do not change from call to call or minute to minute,
-so the model's prompt cache keeps them: who is calling and today's date are
-in the call's first note instead.
+The call's instructions and tools do not change from call to call or minute
+to minute, so the engine keeps them read (its prompt cache holds a prompt up
+to the end of its system message): who is calling, today's date, what is
+known about them, the receptionist brief Aokie sends with the call and an
+outreach's part (the person on the list, why we rang) are in the call's first
+note instead. The engine reads a call before it is answered: as it rings in
+(`aokie.call.incoming`), as an outreach dial or a call back goes out, and
+again as the greeting plays. Each read lets go at the model's first word, so
+the engine ends it cleanly (a request it cuts off mid-way through a tool call
+fails, and it then forgets what it held). On ChatGPT's live-call route there
+is nothing to read ahead.
 
 The model is the one chosen in Engines: the Agent's OAIY provider names no
 model, so the engine answers with its choice (Qwen3.8-Flash-Next now).

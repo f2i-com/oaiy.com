@@ -26,6 +26,8 @@ import { NO_IDENTITY, identityInstructions, type Identity } from './identity';
 /** What the conversations ask of outreach (outreach.ts): who a call or a text thread is about, and a text that asks to stop. */
 export interface OutreachHooks {
   forCall(callId: string, number: string): OutreachLink | undefined;
+  /** Someone on a list ringing in (or rung back) now: the link their call will have, found without changing anything. */
+  forRing?(number: string): OutreachLink | undefined;
   forText(number: string): OutreachLink | undefined;
   /** A call of it ended: whether its agent should be asked for the result now. */
   callEnded(link: OutreachLink, lines: string[]): boolean;
@@ -111,6 +113,8 @@ export interface Thread {
 const MAX_KEPT_TURNS = 600;
 /** How far back the note that starts a call looks for the person's last contact. */
 const RECENT_MS = 2 * 24 * 60 * 60_000;
+/** A call heard ringing in later than this after it began ringing is not warmed (see warmCall): it has been answered or missed. */
+const RING_FRESH_MS = 20_000;
 
 /** How the app makes an agent for this project, with a conversation's own instructions and tools, for a conversation of `kind`. */
 export type MakeAgent = (extra: Pick<AgentOptions, 'instructions' | 'sessionTools' | 'tools' | 'reasoning' | 'conversation'>, kind: SessionInfo['kind']) => Agent;
@@ -400,22 +404,37 @@ export function spoken(text: string): string {
     .trim();
 }
 
-/** What a call conversation is for, in its agent's instructions. */
-export function callInstructions(brief: string, instructions: string, calendar = false, identity: Identity = NO_IDENTITY): string {
+/**
+ * What a call conversation is for, in its agent's instructions. They are the
+ * same for every call, and the whole call long, so the engine keeps them read
+ * (its prompt cache): what is this call's own (who, when, what is known about
+ * them, the receptionist brief the phone sent, an outreach's part) is in the
+ * note that starts the call (callStartNote).
+ */
+export function callInstructions(instructions: string, calendar = false, identity: Identity = NO_IDENTITY): string {
   return [
-    `This conversation is a live phone call, on the phone of the person you work for: who is calling, today's date and what you know about them are in the note that starts the call. Everything you write is spoken aloud to the caller as you write it, so write only what you would say: one or two short sentences, plain words, no markdown, lists, emoji, links or quotation marks. Start with what matters, not a filler word. Then stop, and let them answer.`,
+    `This conversation is a live phone call, on the phone of the person you work for: who is calling, today's date, what you know about them and the receptionist brief are in the note that starts the call (and, on a call of your person's outreach, why you rang). Everything you write is spoken aloud to the caller as you write it, so write only what you would say: one or two short sentences, plain words, no markdown, lists, emoji, links or quotation marks. Start with what matters, not a filler word. Then stop, and let them answer.`,
     identityInstructions(identity),
     'Their words arrive as "Caller [0:42]: …", transcribed from speech (allow for a misheard word), with when they said them (minutes and seconds into the call). "over you" means they spoke while you were talking: a short "mm-hmm" or "yeah" does not stop you (you see it with their next words); more than that stops you, and you see what you were saying. If they have not finished (they stopped mid-sentence, or said "um, let me think"), write nothing at all: an empty reply keeps listening. A message "[OAIY] A note from the runner" is your person\'s direction, passed on by the main agent they talk to: go by it, without reading it out. Any other message without the "Caller:" label comes from the person you work for, who may be watching: do what they say.',
     `Your call tools: request_appointment (a booking request for staff to confirm; never say it is booked or confirmed), ${calendar ? 'calendar_free_times (what is free, answered at once: a line a day with its hours, the times booked, the free ranges and when a service can start; use it for any question of when they can come), ' : ''}lookup_business_data (a question about the business's records or calendar), end_call (a short goodbye, then the call ends; use it when the caller is done; a brief that says finish_call means end_call). Your other tools work too.`,
+    'Answer directly when you can: use a tool only when what the caller said needs one. Confirming a booking you already know about (from the note that starts the call) needs no availability check.',
     REFERENCE,
     `To look something up, do it in the same reply as a few words: say "Let me check." and make the call at once. Never say you will check without doing it: the caller hears you and waits. lookup_business_data answers later, in a message of its own ("[OAIY] The answer to your lookup …"): keep the conversation going meanwhile (answer anything else they say, without guessing the answer), and tell them the answer when it comes. Other tools (${calendar ? 'calendar_free_times, ' : ''}a file, remember) answer at once.`,
     'Say only what you know: from these instructions, the brief, or what a tool returned. Never make up availability, times, prices or bookings, and never say a time is free or agree to one unless a tool said it is. If you cannot check, say so, and offer to take their preferred time as a request for staff to confirm.',
     'To take a booking request: once you have the service, the day and time they want and their name, call request_appointment in that same reply, and only then tell them it is requested. Saying you have noted it without calling request_appointment records nothing.',
     'Never repeat something you have already said on this call. When the caller says goodbye or is done, call end_call with a short goodbye, and write nothing else: its goodbye is the one thing said (words written in that reply are said as the goodbye instead), and nothing written after end_call is ever said.',
     'When you know their name, use it now and then, as a receptionist who remembers them would.',
-    brief.trim() ? `The receptionist brief:\n${brief.trim()}` : '',
     `The instructions of the person you work for, for calls:\n${instructions.trim() || '(none)'}`,
   ].filter(Boolean).join('\n');
+}
+
+/**
+ * What a call's note says that is this call's own, after who and when: the
+ * receptionist brief the phone sent with it, and an outreach's part (the
+ * person on the list, why you rang, what to find out).
+ */
+export function callOwnInstructions(brief: string, outreach = ''): string {
+  return [brief.trim() ? `The receptionist brief:\n${brief.trim()}` : '', outreach.trim()].filter(Boolean).join('\n');
 }
 
 /**
@@ -470,9 +489,10 @@ export const LOOKUP_UNAVAILABLE =
 
 /**
  * The note that starts a call: who, when, what is known about them, and their
- * last contact when it was recent (the model's view of the call starts there).
+ * last contact when it was recent (the model's view of the call starts there);
+ * then what else is this call's own (`own`: see callOwnInstructions).
  */
-export function callStartNote(who: string, greeting: string, known: string, now = new Date(), returning?: number, outbound?: { purpose?: string }, recent = ''): string {
+export function callStartNote(who: string, greeting: string, known: string, now = new Date(), returning?: number, outbound?: { purpose?: string }, recent = '', own = ''): string {
   const rang = returning !== undefined || !!outbound;
   const opened = greeting.trim() ? ` You ${rang ? 'opened with' : 'greeted them'}: "${greeting.trim()}"` : '';
   const why = outbound?.purpose?.trim() ? ` Why you rang: ${outbound.purpose.trim()}` : '';
@@ -481,7 +501,7 @@ export function callStartNote(who: string, greeting: string, known: string, now 
     : outbound
       ? `You rang ${who}; they answered ${whenSaid(now.getTime())}.${why}`
       : `A call from ${who} began, ${whenSaid(now.getTime())}.`;
-  return `[OAIY] 📞 ${began}${opened}\nToday is ${today(now)}.\n${known}${recent ? `\n${recent}` : ''}`;
+  return `[OAIY] 📞 ${began}${opened}\nToday is ${today(now)}.\n${known}${recent ? `\n${recent}` : ''}${own.trim() ? `\n${own.trim()}` : ''}`;
 }
 
 /** Words for a short summary: on one line, and not too long. */
@@ -707,6 +727,10 @@ export class Sessions {
   calendarOn: () => boolean = () => true;
   /** Who answers, and for whom (identity.ts): every call and text thread says those names. */
   identity: () => Identity = () => NO_IDENTITY;
+  /** Whether this page answers the phone's calls now (it holds their lease): a call ringing in is warmed only then. */
+  answersCalls: () => boolean = () => true;
+  /** The warm going on for a call not begun yet (see warmCall). */
+  private warming: { key: string; callId?: string; controller: AbortController } | null = null;
   /** Outreach (the runner's lists of people to call or text), while it runs on this page. */
   outreach: OutreachHooks | null = null;
   /**
@@ -881,8 +905,9 @@ export class Sessions {
       const calendar = callCalendarTools(this.desktop);
       const person = this.personTools(session);
       session.agent = this.makeAgent({
-        // A call of an outreach (one we placed, or someone on a list who rang in): its objective after the call's own.
-        instructions: () => this.directed([callInstructions(session.brief ?? '', this.settings().callInstructions, this.calendarOn(), this.identity()), session.outreach?.instructions()].filter(Boolean).join('\n')),
+        // The same for every call (the engine keeps them read): the brief the phone sent, and an outreach's
+        // part (one we placed, or someone on a list who rang in), are in the note that starts the call.
+        instructions: () => this.directed(callInstructions(this.settings().callInstructions, this.calendarOn(), this.identity())),
         // The calendar's tool only while there is a calendar (a plugin provides it); record_result on an outreach call.
         sessionTools: () => [...this.callTools(session), ...person, ...(this.calendarOn() ? calendar : []), ...(session.outreach ? [session.outreach.resultTool()] : [])],
         tools: TOOLS.filter((t) => CALL_TOOLS.has(t.name)),
@@ -1362,6 +1387,58 @@ export class Sessions {
   }
 
   /**
+   * The note that starts a call with the person of lane `s` (callStartNote),
+   * as it reads now: their contact as last read, then the brief the phone
+   * sent and the outreach's part (the lane's own).
+   */
+  private startNote(s: Session, call: { greeting: string; hidden: boolean; began: Date; missedAt?: number; outbound?: { purpose?: string }; recent: string }): string {
+    const who = `${s.title}${s.title !== s.key ? ` (${s.key})` : ''}`;
+    return callStartNote(who, call.greeting, knownText(call.hidden ? undefined : this.callerNote(s.key)), call.began, call.missedAt, call.outbound, call.recent, callOwnInstructions(s.brief ?? '', s.outreach?.instructions() ?? ''));
+  }
+
+  /**
+   * Have the model read a call's prompt before the call is answered: as it
+   * rings in (`aokie.call.incoming`), or as a dial goes out (an outreach's, a
+   * call back's). The call's instructions and tools are the same then as its
+   * first reply's will be (all that is this call's own is in the note that
+   * starts it), so by the caller's first words the engine holds them, and
+   * reads only the note and their words. Never waited for: a lane of its own,
+   * never listed or kept, whose warm is let go when another call warms, the
+   * call ends before it began, or it is not needed (a call is going on here:
+   * its turns come first). Nothing on a model that keeps no prompt (ChatGPT's
+   * live-call route): see Agent.warm.
+   */
+  warmCall(call: { number: string; name?: string; callId?: string; outbound?: { purpose?: string; opening?: string }; link?: OutreachLink }): void {
+    // A hidden number is often turned away by the phone's screening: not worth the engine's time.
+    if (isHidden(call.number)) return;
+    const key = phoneKey(call.number) || call.number.trim();
+    if (!key || this.list.some((s) => s.kind === 'call' && (s.callId || (s.running && this.isPerson(s, key))))) return;
+    if (this.warming && this.warming.key === key && !this.warming.controller.signal.aborted) return;
+    this.stopWarming();
+    const controller = new AbortController();
+    const warming = { key, ...(call.callId ? { callId: call.callId } : {}), controller };
+    this.warming = warming;
+    const note = this.callerNote(key);
+    const known = this.list.find((s) => s.kind !== 'task' && this.isPerson(s, key) && s.title !== s.key)?.title;
+    const probe = this.create({ id: `warm-${key.replace(/\W/g, '')}`, kind: 'call', key, title: (note?.nameBy === 'owner' ? note.name : '') || call.name || known || note?.name || key, lastAt: Date.now(), unread: 0, thread: `warm:${key}` } as SessionInfo);
+    // The outreach it is part of: one of ours being dialled, or someone on a list ringing in (or rung back).
+    probe.outreach = call.link ?? this.outreach?.forRing?.(key);
+    const link = probe.outreach && !probe.outreach.inbound ? probe.outreach : undefined;
+    const outbound = call.outbound || link ? { purpose: link?.objective ?? call.outbound?.purpose ?? '' } : undefined;
+    const missedAt = this.callingBack(key)?.missedAt;
+    probe.agent.turns = [{ role: 'user', text: this.startNote(probe, { greeting: call.outbound?.opening ?? '', hidden: false, began: new Date(), missedAt, outbound, recent: '' }), automatic: true, fresh: true }];
+    void probe.agent.warm(controller.signal).finally(() => {
+      if (this.warming === warming) this.warming = null;
+    });
+  }
+
+  /** The warm of a call not begun yet (warmCall) is let go. */
+  private stopWarming(): void {
+    this.warming?.controller.abort();
+    this.warming = null;
+  }
+
+  /**
    * An event from the desktop's calls: a call begins (its conversation, with
    * the caller's history), the caller speaks (the agent answers, before
    * anyone else waiting), the caller speaks over it (the rest of that reply is
@@ -1427,8 +1504,8 @@ export class Sessions {
       const began = new Date();
       const missedAt = this.callingBack(from)?.missedAt;
       // Who, and what is known about them: their contact as last read, never waited for (the call goes on
-      // at once), and read again meanwhile when that was a while ago.
-      const noteNow = () => callStartNote(`${s.title}${s.title !== s.key ? ` (${s.key})` : ''}`, greeting, knownText(hidden ? undefined : this.callerNote(s.key)), began, missedAt, outbound, recent);
+      // at once), and read again meanwhile when that was a while ago. The brief and an outreach's part too.
+      const noteNow = () => this.startNote(s, { greeting, hidden, began, missedAt, outbound, recent });
       const reading = hidden ? null : this.freshen(s.key);
       const start = { role: 'user' as const, text: noteNow(), automatic: true, ...(fresh ? { fresh: true } : {}), at: Date.now() };
       session.agent.turns.push(start);
@@ -1566,9 +1643,12 @@ export class Sessions {
         void this.conversationWith(number, '', 'call').then((session) => {
           if (session.callId) return;
           session.outreach = link;
-          this.queueRun(session, OUTREACH_AFTER_CALL);
+          // A call this page did not follow: its note (which has the outreach's part) may not be in the conversation.
+          this.queueRun(session, `${OUTREACH_AFTER_CALL}\n\n${link.instructions()}`);
         });
       },
+      // A dial of an outreach: its prompt read while the phone rings.
+      warmCall: (number, name, link) => this.warmCall({ number, name, link, outbound: { purpose: link.objective } }),
     };
   }
 
@@ -1684,8 +1764,23 @@ export class Sessions {
     return session;
   }
 
-  /** An event from the desktop: a text message becomes (or continues) a conversation. */
-  async desktopEvent(event: DesktopEvent): Promise<Session | null> {
+  /**
+   * An event from the desktop: a call ringing in has its prompt read before it
+   * is answered (and let go if it ends unanswered); a text message becomes (or
+   * continues) a conversation.
+   */
+  async desktopEvent(event: DesktopEvent, now = Date.now()): Promise<Session | null> {
+    const call = String(event.data.callId ?? '') || event.correlationId;
+    if (event.name === 'aokie.call.incoming') {
+      // (Not one heard of late, as when the desktop was out of reach a while: it has been answered or missed by now.)
+      const at = Date.parse(event.occurredAt);
+      if (this.answersCalls() && !(now - at > RING_FRESH_MS)) this.warmCall({ number: String(event.data.from ?? ''), name: String(event.data.name ?? ''), ...(call ? { callId: call } : {}) });
+      return null;
+    }
+    if (event.name === 'aokie.call.ended') {
+      if (call && this.warming?.callId === call) this.stopWarming();
+      return null;
+    }
     if (event.name !== 'aokie.sms.received') return null;
     const from = String(event.data.from ?? '');
     const body = String(event.data.body ?? '');

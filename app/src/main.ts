@@ -719,10 +719,12 @@ async function main(): Promise<void> {
     // What is known about each person is their contact on the desktop (read, and written as they are remembered).
     own.contacts = desktopContacts(() => desktop);
     own.identity = () => identity.get();
+    // A call ringing in is warmed (its prompt read before it is answered) only by the page that answers the calls.
+    own.answersCalls = () => holdsCalls;
     await own.load();
     // Missed calls rung back: by the page that answers the calls, when the line is free (started with the phone).
     // (Never anyone on the do-not-contact list: they asked not to be called.)
-    callbacks = new Callbacks(frontDesk, () => messages, () => desktop, () => holdsCalls && line.idle(Date.now(), own.list.some((s) => s.callId)) && !outreach?.busy, readScreening, () => {}, callsToOaiy, (number) => !!outreach?.doNotContact.some((d) => samePerson(d.number, number)));
+    callbacks = new Callbacks(frontDesk, () => messages, () => desktop, () => holdsCalls && line.idle(Date.now(), own.list.some((s) => s.callId)) && !outreach?.busy, readScreening, () => {}, callsToOaiy, (number) => !!outreach?.doNotContact.some((d) => samePerson(d.number, number)), (number, purpose) => own.warmCall({ number, outbound: { purpose } }));
     await callbacks.load();
     // A call back's call is taken by the agent knowing it rang them, and why.
     own.callingBack = (number) => callbacks?.calling(number);

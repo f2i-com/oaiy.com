@@ -140,15 +140,19 @@ describe('speaking what the agent writes', () => {
     expect(spoken('# Hi `there` > you')).toBe('Hi there you');
   });
 
-  it('its instructions put the phone first: spoken words, the call tools, the brief', () => {
-    const text = callInstructions('You are Aokie, a warm receptionist.', 'Never quote prices.');
+  it("its instructions put the phone first: spoken words, the call tools; the brief is the call's own", () => {
+    const text = callInstructions('Never quote prices.');
     expect(text).toContain('This conversation is a live phone call');
-    // Nothing in them changes during a call or from call to call (the model's prompt cache keeps them).
+    // Nothing in them changes during a call or from call to call (the model's prompt cache keeps them):
+    // the brief the phone sends with a call is in the note that starts it.
     expect(text).not.toMatch(/\d{4}|Lance/);
     expect(text).toContain('Everything you write is spoken aloud');
     expect(text).toContain('end_call');
-    expect(text).toContain('The receptionist brief:\nYou are Aokie');
+    expect(text).not.toContain('The receptionist brief:');
+    expect(text).toContain('the receptionist brief are in the note that starts the call');
     expect(text).toContain('for calls:\nNever quote prices.');
+    // A tool only when the caller's words need one.
+    expect(text).toContain('Confirming a booking you already know about (from the note that starts the call) needs no availability check.');
   });
 });
 
@@ -446,7 +450,7 @@ describe('a phone call answered by the agent', () => {
     await settled(sessions);
     expect(calls).toEqual([['say', 'call_3', "Let me check what's open on the calendar."]]);
     expect(fake.bodies).toHaveLength(1);
-    const rules = callInstructions('', '');
+    const rules = callInstructions('');
     expect(rules).toContain('Never say you will check without doing it');
     expect(rules).toContain('Never make up availability');
     expect(rules).toContain('When the caller says goodbye or is done, call end_call');
@@ -894,6 +898,7 @@ describe('a phone call answered by the agent', () => {
     expect(fake.bodies).toHaveLength(4);
   });
 });
+
 describe("what the agents remember about a customer is written for the business's Contacts", () => {
   it('remember and caller_notes say how: a short plain note about the customer, the business by name or "the owner", never "your person"', async () => {
     // Live 29 Sept 2026: Contacts showed "…Your person noticed the Thursday one…" and "…waiting on your person to confirm."

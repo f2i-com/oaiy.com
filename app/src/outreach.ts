@@ -187,6 +187,8 @@ export interface OutreachSessions {
   heardSince(number: string, at: number): string[];
   /** Their call's agent, asked for the result from what was said (the call's end was never heard). */
   askForResult(number: string, link: OutreachLink): void;
+  /** A dial to them is going out: the model reads their call's prompt while the phone rings (never waited for). */
+  warmCall?(number: string, name: string, link: OutreachLink): void;
 }
 
 /** What Aokie's settings say about calling. */
@@ -619,6 +621,7 @@ export function outreachCallInstructions(c: Campaign, p: Person, inbound = false
     `Why you rang: ${c.objective}`,
     c.collect.length ? `Find out, one question at a time, in your own words:\n${c.collect.map((f) => `- ${f.key}${typeWords(f)}${f.optional ? ' (only if needed)' : ''}: ${f.question}`).join('\n')}` : '',
     'Call record_result as soon as you have an answer, in the same reply as your next words; again if more comes in (the last one counts). Always before end_call.',
+    'Answer directly: their confirming what you rang about needs only record_result, no availability check.',
     `Be brief and warm, never pushy: ask once, accept no, don't argue or sell. A bad time: ask when to call back, record callback_requested with that time, end politely. They ask not to be called again: apologise, record opted_out, end the call. Not ${first} (a wrong number): say sorry, record wrong_number, end without saying why you rang.`,
     "Share nothing about anyone else, and nothing they don't already know.",
     c.voicemail === 'leave_message'
@@ -996,6 +999,8 @@ export class Outreach {
     this.setWaiting(c, '');
     await this.save(c);
     this.changed();
+    // The model reads their call's prompt while the phone rings: its first reply comes sooner.
+    this.deps.sessions()?.warmCall?.(p.number, p.name, this.link(c, p, false));
     try {
       const reply = (await desktop.command('aokie', 'call.dial', {
         number: p.number,
@@ -1379,6 +1384,11 @@ export class Outreach {
       return this.link(hit.c, hit.p, false);
     }
     // Someone on a list who rings in: the context, and their result counts.
+    return this.forRing(number);
+  }
+
+  /** Someone on a list who rings in (or is rung back) now: the link their call has, found without changing anything. */
+  forRing(number: string): OutreachLink | undefined {
     if (!number) return undefined;
     for (const c of this.campaigns) {
       if (c.kind !== 'call' || (c.state !== 'running' && c.state !== 'paused')) continue;

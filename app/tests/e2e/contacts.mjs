@@ -46,7 +46,8 @@ const end = (calls) => {
   return `${out}data: ${JSON.stringify({ choices: [{ index: 0, delta: {}, finish_reason: calls ? 'tool_calls' : 'stop' }] })}\n\ndata: [DONE]\n\n`;
 };
 function answer(body) {
-  if ((body.max_tokens ?? body.max_completion_tokens) === 1) return { text: '' };
+  // A warm (Agent.warm: the model reads the prompt ahead, and a few words at most are asked for): nothing to say.
+  if ((body.max_tokens ?? body.max_completion_tokens) <= 32) return { text: '' };
   const system = textOf(body.messages.find((m) => m.role === 'system') ?? { content: '' });
   const lastUser = body.messages.map((m) => m.role === 'user').lastIndexOf(true);
   const steps = body.messages.slice(lastUser + 1).filter((m) => m.role === 'assistant').length;

@@ -87,7 +87,8 @@ const end = (calls, n) => {
 };
 let served = 0;
 function answer(body) {
-  if ((body.max_tokens ?? body.max_completion_tokens) === 1) return { text: '' };
+  // A warm (Agent.warm: the model reads the prompt ahead, and a few words at most are asked for): nothing to say.
+  if ((body.max_tokens ?? body.max_completion_tokens) <= 32) return { text: '' };
   const system = textOf(body.messages.find((m) => m.role === 'system') ?? { content: '' });
   const tools = (body.tools ?? []).map((t) => t.function.name);
   const lastUser = body.messages.map((m) => m.role === 'user').lastIndexOf(true);
@@ -96,10 +97,13 @@ function answer(body) {
   const steps = after.filter((m) => m.role === 'assistant').length;
   const results = after.filter((m) => m.role === 'tool').map(textOf);
   if (/live phone call/.test(system)) {
-    asked.call.push({ tools, system, last });
-    const first = /Who: (\S+)/.exec(system)?.[1] ?? 'there';
-    if (/leave a message|after the tone/i.test(last)) return steps === 0 ? { calls: [{ name: 'record_result', input: { outcome: 'voicemail', summary: 'Their voicemail greeting; no message left.' } }, { name: 'end_call', input: { silent: true } }] } : { text: '' };
-    if (/still coming/i.test(last)) {
+    // The note that starts the call (who, the outreach's part) and the caller's words are one message: what they said is its Caller lines.
+    const note = textOf(body.messages.find((m) => m.role === 'user') ?? { content: '' });
+    const said = last.split('\n').filter((l) => /^Caller\b/.test(l)).join('\n') || last;
+    asked.call.push({ tools, system, note, last });
+    const first = /Who: (\S+)/.exec(note)?.[1] ?? 'there';
+    if (/leave a message|after the tone/i.test(said)) return steps === 0 ? { calls: [{ name: 'record_result', input: { outcome: 'voicemail', summary: 'Their voicemail greeting; no message left.' } }, { name: 'end_call', input: { silent: true } }] } : { text: '' };
+    if (/still coming/i.test(said)) {
       // Words and end_call in one reply (as seen live): the words are the one goodbye; "Done." after it is never said.
       return steps === 0
         ? { text: `Lovely, thanks ${first}, see you Friday.`, calls: [{ name: 'record_result', input: { outcome: 'completed', answers: { coming: true }, summary: 'Still coming on Friday at 10:30.' } }, { name: 'end_call', input: { goodbye: 'You are welcome, have a great day!' } }] }
@@ -413,7 +417,9 @@ try {
     expect(!spoken.some((s) => /Lovely|welcome|Done/.test(s)), JSON.stringify(spoken));
     const call = asked.call[0];
     expect(call.tools.includes('record_result') && call.tools.includes('end_call') && !call.tools.includes('start_outreach'), JSON.stringify(call.tools));
-    expect(/This is a call YOU placed: you are calling on behalf of Greenleaf Lawns, as Aokie, for your person's outreach "Confirm Friday bookings"/.test(call.system), 'the objective is not in the call\'s instructions');
+    // The outreach's part is the call's own: in the note that starts it, so the call's instructions stay the same from call to call.
+    expect(/This is a call YOU placed: you are calling on behalf of Greenleaf Lawns, as Aokie, for your person's outreach "Confirm Friday bookings"/.test(call.note) && /Who: Jane Smith/.test(call.note), 'the objective is not in the note that starts the call');
+    expect(!/Who: Jane|This is a call YOU placed/.test(call.system), "the outreach's part is in the call's instructions");
     expect(call.system.includes('You are Aokie, the receptionist for Greenleaf Lawns.'), 'the call does not say who it is');
     await page.waitForFunction(() => [...document.querySelectorAll('.chat-feed .msg.unsaid')].some((n) => /Done\./.test(n.textContent)), { timeout: 10_000 });
     hungUp('call_1', 'completed', 'agent_hangup');

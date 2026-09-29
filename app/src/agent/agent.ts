@@ -119,6 +119,13 @@ Be strict about what a viewer would notice: a picture not in the script's art st
 const KEEP_RECENT_TURNS = 8;
 /** How much of a step's thinking the saved conversation keeps (for the chat; the model never reads it again). */
 const MAX_KEPT_THINKING = 20_000;
+/**
+ * The most a warm (Agent.warm) lets the model write: it lets go at the first
+ * word, and the server notices a few words later, before this is reached (a
+ * request cut off by its limit mid-way through a tool call fails, and OAIY's
+ * engine then forgets what it had read).
+ */
+export const WARM_TOKENS = 32;
 /** For the same reply twice, with nothing done in between. */
 const REPEAT_NUDGE = 'You gave the same reply again, and still no tool has run. Do not reply in words: your next reply must be a tool call (update_plan for a task, or the first tool the work needs).';
 /** For a reply that only announced the work. */
@@ -1501,8 +1508,15 @@ ${this.instructions}` : ''}`;
   /**
    * Have the model read the conversation now, with nothing to answer yet, so
    * its next turn starts from a prompt it already holds: on a call, it reads
-   * while the greeting plays. One token, thrown away; only a local server
-   * (which keeps the prompt it read, and charges nothing for it).
+   * as the phone rings and while the greeting plays. Only a local server
+   * (which keeps the prompt it read, and charges nothing for it); on any
+   * other (ChatGPT's live-call route among them) nothing is sent.
+   *
+   * It lets go at the model's first word: by then the prompt is read, and a
+   * request whose client has gone ends cleanly. One cut off at its token
+   * limit halfway through a tool call is a failed request to OAIY's engine,
+   * which then forgets everything it held (a warm of one token whose token
+   * was `<tool_call>` cost the next reply its whole prompt).
    */
   async warm(signal?: AbortSignal): Promise<void> {
     const provider = this.options.provider();
@@ -1510,8 +1524,15 @@ ${this.instructions}` : ''}`;
     const b = this.budget(provider);
     const sent = wellFormed(trimmed(this.view(), this.keepImages, b.prompt * this.charsPerToken));
     if (sent.at(-1)?.role !== 'user') return;
+    const read = new AbortController();
+    const done = () => read.abort();
     try {
-      await sendTurn(provider, this.systemPrompt, sent, this.tools, { maxOutputTokens: 1, signal, reasoning: this.options.reasoning });
+      await sendTurn(provider, this.systemPrompt, sent, this.tools, {
+        maxOutputTokens: WARM_TOKENS,
+        signal: signal ? AbortSignal.any([signal, read.signal]) : read.signal,
+        reasoning: this.options.reasoning,
+        sink: { text: done, thinking: done, toolStart: done, toolArgs: done, draft: done },
+      });
     } catch {
       /* only a head start */
     }
