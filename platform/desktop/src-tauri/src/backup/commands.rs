@@ -12,6 +12,7 @@ use std::time::SystemTime;
 
 use serde::Serialize;
 use tauri::{AppHandle, Manager, Runtime, Webview};
+use zeroize::Zeroizing;
 
 use super::agent::AgentExport;
 use super::busy::{local_signals, BusySignals};
@@ -127,12 +128,16 @@ async fn with_time_limit<T: Send + 'static>(work: tokio::task::JoinHandle<super:
 #[tauri::command]
 pub async fn backup_create<R: Runtime>(app: AppHandle<R>, webview: Webview<R>, passphrase: String, include_keys: bool) -> Result<Option<CreateResult>, String> {
     dashboard(&webview)?;
+    // Wiped from memory when this is done with it, wherever it returns.
+    let passphrase = Zeroizing::new(passphrase);
     super::check_passphrase(&passphrase).map_err(|e| e.message)?;
     let data_dir = data_dir_of(&app)?;
-    let busy = gather_busy(&app).await;
-    busy.refuse_if_busy("making a backup").map_err(|e| e.message)?;
+    gather_busy(&app).await.refuse_if_busy("making a backup").map_err(|e| e.message)?;
     let name = format!("oaiy-backup-{}.{EXTENSION}", chrono::Local::now().format("%Y-%m-%d"));
     let Some(dest) = pick_save(&app, &name).await else { return Ok(None) };
+    // The save dialog can stay open for minutes: a call may have started, or a download, since it was asked.
+    let busy = gather_busy(&app).await;
+    busy.refuse_if_busy("making a backup").map_err(|e| e.message)?;
     let page = AgentPage { app: app.clone() };
     let made = tokio::task::spawn_blocking(move || {
         let mut options = CreateOptions::new(&data_dir, dest, &passphrase);
@@ -170,6 +175,7 @@ pub struct InspectOut {
 #[tauri::command]
 pub async fn backup_restore_inspect<R: Runtime>(app: AppHandle<R>, webview: Webview<R>, passphrase: String) -> Result<Option<InspectOut>, String> {
     dashboard(&webview)?;
+    let passphrase = Zeroizing::new(passphrase);
     if passphrase.is_empty() {
         return Err("Type the passphrase the backup was made with.".to_string());
     }
@@ -195,6 +201,7 @@ pub async fn backup_restore_inspect<R: Runtime>(app: AppHandle<R>, webview: Webv
 #[tauri::command]
 pub async fn backup_restore_stage<R: Runtime>(app: AppHandle<R>, webview: Webview<R>, inspect_id: String, passphrase: String, classes: Vec<String>, keys: bool) -> Result<Staged, String> {
     dashboard(&webview)?;
+    let passphrase = Zeroizing::new(passphrase);
     // What the person ticked: nothing that can run or reconfigure comes back without it.
     let ticks = Ticks::from_ids(&classes, keys).map_err(|e| e.message)?;
     let data_dir = data_dir_of(&app)?;

@@ -2984,3 +2984,41 @@ fn what_the_page_says_it_left_out_is_cut_and_limited_before_it_is_recorded() {
     assert!(from_page.iter().all(|n| n.chars().count() <= 320), "each cut to what a panel shows");
     assert!(fs::metadata(dst.0.join("restore").join("last-result.json")).unwrap().len() < 20_000, "and the result file stays small");
 }
+
+// ---- what the dashboard's commands do with the passphrase and the busy check ---------------------------------
+
+/// The text of one command of `commands.rs`, from its `pub async fn` line to the next `#[tauri::command]` (or the end).
+fn command_source(name: &str) -> String {
+    let source = include_str!("commands.rs");
+    let start = source.find(&format!("pub async fn {name}")).unwrap_or_else(|| panic!("{name} is in commands.rs"));
+    let rest = &source[start..];
+    let end = rest[1..].find("#[tauri::command]").map(|i| i + 1).unwrap_or(rest.len());
+    rest[..end].to_string()
+}
+
+#[test]
+fn the_passphrase_is_wiped_from_memory_by_every_command_that_is_given_one() {
+    for name in ["backup_create", "backup_restore_inspect", "backup_restore_stage"] {
+        let body = command_source(name);
+        assert!(body.contains("let passphrase = Zeroizing::new(passphrase);"), "{name} wraps the passphrase it was given");
+        // ... straight after the label check, before anything can return early with the plain String.
+        let label = body.find("dashboard(&webview)?;").unwrap();
+        let wrapped = body.find("Zeroizing::new(passphrase)").unwrap();
+        assert!(wrapped > label && body[label..wrapped].lines().count() <= 3, "{name}: wrapped first thing");
+        // The plain String is used nowhere after that (only the wrapper, by reference).
+        let after = &body[wrapped + "Zeroizing::new(passphrase)".len()..];
+        assert!(!after.contains("passphrase.clone()") && !after.contains("passphrase.to_string()") && !after.contains("String::from(passphrase"), "{name} does not copy it into a String that is not wiped");
+    }
+}
+
+#[test]
+fn a_backup_asks_again_whether_the_app_is_busy_after_the_save_dialog() {
+    let body = command_source("backup_create");
+    let dialog = body.find("pick_save(&app, &name).await").expect("the dialog");
+    let after = &body[dialog..];
+    let recheck = after.find("gather_busy(&app).await").expect("the app is looked at again after the dialog");
+    let refuse = after.find("refuse_if_busy(\"making a backup\")").expect("and refused if busy");
+    let start = after.find("spawn_blocking").expect("the work");
+    assert!(recheck < refuse && refuse < start, "looked at, refused, and only then started");
+    assert!(after.contains("options.busy = busy;"), "and the fresh look is what the backup itself is given");
+}

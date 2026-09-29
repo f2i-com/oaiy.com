@@ -192,6 +192,8 @@ zeroize = { version = "1", optional = true }
 age = { version = "0.11", default-features = false }
 # The same scrypt age uses, named here to time it: a backup is written at a work factor chosen here (see backup/container.rs).
 scrypt = { version = "0.11", default-features = false }
+# The passphrase of a backup is wiped from memory when the command that was given it is done with it.
+zeroize = "1"
 
 # Windows-only: the job object that kills child processes when this process
 # dies, however it dies. Already in the tree transitively (tauri, tokio); named
