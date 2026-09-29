@@ -20,6 +20,7 @@
  * deleted or left behind by incognito.
  */
 import type { Callback } from '../callbacks';
+import type { Campaign, DoNotContact } from '../outreach';
 import type { Turn } from '../agent/protocol';
 import { Vfs, type VfsChange } from './vfs';
 
@@ -407,6 +408,39 @@ export class OpenProject {
 
   async saveCallbacks(list: Callback[]): Promise<void> {
     await writeBytes(this.dir, 'callbacks.json', JSON.stringify(list));
+  }
+
+  /**
+   * Outreach campaigns (the front desk's): one file each in `outreach/`, with
+   * the list of them in `outreach/index.json`. Kept beside the files, not
+   * among them (their results are written into the files, under /outreach).
+   */
+  async loadOutreach(): Promise<Campaign[]> {
+    const dir = await dirAt(this.dir, 'outreach', false).catch(() => null);
+    if (!dir) return [];
+    const ids = (await readJson<string[]>(dir, 'index.json')) ?? [];
+    const out: Campaign[] = [];
+    for (const id of ids) {
+      const c = await readJson<Campaign>(dir, `${safeName(id)}.json`);
+      if (c?.id) out.push(c);
+    }
+    return out;
+  }
+
+  async saveOutreach(campaign: Campaign, ids: string[]): Promise<void> {
+    const dir = await dirAt(this.dir, 'outreach', true);
+    await writeBytes(dir, `${safeName(campaign.id)}.json`, JSON.stringify(campaign));
+    await writeBytes(dir, 'index.json', JSON.stringify(ids));
+  }
+
+  /** Numbers not to be called or texted again (they asked): outreach and call backs keep off them. */
+  async loadDoNotContact(): Promise<DoNotContact[]> {
+    const dir = await dirAt(this.dir, 'outreach', false).catch(() => null);
+    return (dir && (await readJson<DoNotContact[]>(dir, 'do-not-contact.json'))) ?? [];
+  }
+
+  async saveDoNotContact(list: DoNotContact[]): Promise<void> {
+    await writeBytes(await dirAt(this.dir, 'outreach', true), 'do-not-contact.json', JSON.stringify(list));
   }
 
   /** What the phone's agents know about the people who call and text (the front desk's). */
