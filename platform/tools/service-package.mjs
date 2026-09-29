@@ -16,8 +16,7 @@
  *       → re-bundles <srcdir>/_template.json + the sibling files back into the
  *         self-contained <template.json> (.sh normalized to LF)
  *
- * extract→embed with no edits is byte-stable (no spurious diff). Tests use the
- * same extract step to load the shipped code (tests/krea2/conftest.py).
+ * extract→embed with no edits is byte-stable (no spurious diff).
  */
 import fs from 'node:fs';
 import path from 'node:path';

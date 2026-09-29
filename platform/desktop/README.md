@@ -1,7 +1,8 @@
 # OAIY (desktop)
 
-Tray-resident OAIY Desktop for **oaiy-web**. Manages local AI services
-(Ollama, llama.cpp, custom Python rigs), model downloads from HuggingFace,
+Tray-resident OAIY Desktop for **oaiy-web**. Runs OAIY's own engine (models,
+in Rust) and manages local services (OAIY Voice, custom Python rigs, a
+Playwright browser), model downloads from HuggingFace,
 and a bundled portable Python runtime with reusable venvs — exposing
 everything to the oaiy-web flow editor over a localhost HTTP API.
 
@@ -24,7 +25,7 @@ OAIY-Desktop-managed services appear, browser nodes become usable.
 | Phase | What it ships | Status |
 |---|---|---|
 | **1** | Scaffold, tray icon, localhost API `/api/health`, web-side detection probe | ✅ |
-| **2** | Service registry (start/stop/install/logs) · bundled install scripts (llama.cpp, Ollama, Python) · HF model downloads with pause/resume · embedded Python + reusable venvs · React dashboard with Services / Models / Python tabs | ✅ |
+| **2** | Service registry (start/stop/install/logs) · bundled install scripts (Python, Playwright) · HF model downloads with pause/resume · embedded Python + reusable venvs · React dashboard with Services / Models / Python tabs | ✅ |
 | **3** | oaiy-web fetches OAIY Desktop services into the palette automatically | ✅ |
 | **4** | Playwright sidecar (managed "Playwright Browser" service) + `browser_*` nodes in oaiy-web | ✅ |
 | **5** | Single-exe productisation, auto-update, settings persistence | next |
@@ -36,12 +37,16 @@ config dir on first run; edit there to customise without rebuilding):
 
 | Template | What it installs / runs |
 |---|---|
-| **llama.cpp** | Pinned llama-server release; CUDA build when an NVIDIA GPU is detected, AVX2 CPU otherwise. Serves OpenAI-compatible API on `:8080`. |
-| **Ollama** | Official Windows installer (system-wide). Serves on `:11434`. |
+| **OAIY Voice** | OAIY's own voice for calls: speech-to-text and text-to-speech in one resident process on the GPU. Its program ships with OAIY. Serves on `:8783`. |
+| **Aokie Speech-to-Text** / **Aokie Text-to-Speech** | The Aokie receptionist's ears and voice; their program lives in the Aokie plugin. Serve on `:8781` / `:8782`. |
 | **Playwright Browser** | Headless Chromium backend for the `browser_*` nodes (goto/extract/click/screenshot). Installs Playwright into a venv reusing OAIY Desktop's Python. Serves on `:17880`. |
-| **LTX-2.3 Video** | Lightricks LTX-2.3 distilled text-to-video (with audio); CUDA venv via uv. Weights are user-supplied (point it at a model folder). Serves on `:17890`. |
-| **Lance (Image+Video)** | ByteDance **Lance** 3B unified image+video model; Python 3.11 CUDA venv, downloads weights, exposes a JSON API plus Lance's Gradio UI at `/ui`. Serves on `:17900`. |
-| **Krea-2 Turbo** | Official `krea-ai/krea-2` text-to-image inference (no ComfyUI); CUDA venv, pinned commit, GGUF checkpoint (Q4_K_M by default, `OAIY_KREA2_QUANT=bf16` for the full 24 GB). Serves on `:17910`. |
+
+Models are not services: OAIY's own engine runs them (OAIY → **Engines**). Krea-2
+Turbo, Lance, Llama.cpp Server, Ollama and LTX-2.3 Video used to be built in; at
+startup OAIY removes the copies it seeded from the templates folder (and drops
+them from the start-with-the-app and running lists), keeps any the person edited
+or wrote under the same name, and leaves their scripts, venvs and models on disk.
+A system-wide Ollama stays installed; OAIY just stops listing it.
 
 Add more by dropping a `<name>.json` template into the templates folder —
 no rebuild needed.
@@ -188,8 +193,6 @@ Configuration is by environment variable (no pointer file):
 | `OAIY_PLUGIN_DEV_MODE` | debug: `true`, release: `false` | `0`/`false` runs plugins against real hardware; `1`/`true` simulates. Invalid values keep simulation enabled. |
 | `OAIY_SERVER_TOKEN` | — | bearer token required for non-public headless APIs |
 | `OAIY_HF_TOKEN` | — | HuggingFace token for gated downloads |
-| `OAIY_LLAMACPP_MODEL` | — | GGUF the llama.cpp service loads (relative to the models dir) |
-| `OAIY_OLLAMA_MODEL` | — | model tag the Ollama service serves |
 
 **Auth:** set `OAIY_SERVER_TOKEN` and send it as `Authorization: Bearer …`.
 Headless APIs require a valid token for reads and writes except health,
@@ -206,23 +209,21 @@ version, platform and file hashes. Optional browser/image nodes still require
 their documented services/dependencies. Release CI extracts the final archive
 and executes a real flow through HTTP with system Node excluded from PATH.
 
-**Service installs on Linux:** each service template carries a `unix` install
+**Service installs on Linux:** a service template can carry a `unix` install
 script (`.sh`) alongside the Windows one, embedded + seeded by the registry.
-`ollama`, `playwright-browser`, and `llama-cpp` have working `.sh` installers;
-the GPU services (`ltx2-video`, `lance`) print manual-setup guidance (their CUDA
-installs need porting + validating on a real Linux GPU box). The portable Python
+`playwright-browser` has a working `.sh` installer; OAIY Voice and the Aokie
+voices install on Windows. The portable Python
 runtime + venvs are already cross-platform, and venv `run.command` paths
 (`…/Scripts/python.exe`) are rewritten to `…/bin/python` on Unix automatically.
 
 Drive it all from the CLI — see the management commands in `cli/README.md`
-(`oaiy python install`, `oaiy service install ollama`, `oaiy model download …`).
+(`oaiy python install`, `oaiy service install playwright-browser`, `oaiy model download …`).
 
-**PATH-based services (e.g. ollama):** ollama installs system-wide and adds
-itself to `PATH`. A *running* server won't see a tool that landed on `PATH`
-after it started, so right after `oaiy service install ollama`, restart the
+**PATH-based services:** a template whose installer puts a tool on `PATH`
+system-wide has a catch: a *running* server won't see a tool that landed on
+`PATH` after it started, so right after `oaiy service install <id>`, restart the
 server (a `systemctl restart` / fresh shell picks up the new `PATH`) before
-`oaiy service start ollama`. Validated end-to-end on 2× RTX 5090: install → start
-→ a flow's `service_call` node runs LLM inference on the GPU.
+`oaiy service start <id>`.
 
 ## Data folder
 
@@ -237,8 +238,8 @@ them across if you relocate.
 ```
 <data folder>/
 ├── templates/           # *.json service definitions (edit to customise)
-├── scripts/             # install-*.ps1 (edit if you want a different llama.cpp release etc.)
-├── bin/                 # binaries dropped by install scripts (llama-server.exe etc.)
+├── scripts/             # install-*.ps1 (edit to change what an installer fetches)
+├── bin/                 # binaries dropped by install scripts
 ├── models/              # downloaded GGUFs / safetensors (the designated downloads folder)
 ├── python/              # bundled portable Python runtime
 ├── venvs/<name>/        # named, reusable virtual envs
@@ -279,17 +280,13 @@ desktop/
 │   │   # get_config / set_data_dir / pick_folder / restart_app commands
 │   ├── resources/
 │   │   ├── templates/               # built-in service definitions (seeded to disk)
-│   │   │   ├── krea2.json           #   6 templates: krea2, lance, llama-cpp,
-│   │   │   ├── lance.json           #   ltx2-video, ollama, playwright-browser
-│   │   │   ├── llama-cpp.json
-│   │   │   ├── ltx2-video.json
-│   │   │   ├── ollama.json
+│   │   │   ├── aokie-stt.json       #   4 templates: aokie-stt, aokie-tts,
+│   │   │   ├── aokie-tts.json       #   oaiy-voice, playwright-browser
+│   │   │   ├── oaiy-voice.json
 │   │   │   └── playwright-browser.json
 │   │   └── scripts/                 # install + server scripts (seeded to disk)
-│   │       ├── install-{lance,ltx2}.{sh,bat}
-│   │       ├── install-{ollama,playwright}.{sh,ps1}
-│   │       ├── {lance,ltx2,playwright}_server.py
-│   │       └── fetch_zip.py, flash_attn_shim.py, patch_lance_*.py
+│   │       ├── install-playwright.{sh,ps1}
+│   │       └── playwright_server.py
 │   ├── capabilities/default.json    # Tauri 2 capability allowlist
 │   ├── icons/                       # generated by `npx tauri icon`
 │   ├── Cargo.toml

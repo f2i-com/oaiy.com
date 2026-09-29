@@ -181,7 +181,7 @@ test('runFlowForResult THROWS a failed run with the flow’s own error code', as
     body: {
       runId: 'r',
       status: 'failed',
-      error: { code: 'node_failed', message: 'Krea-2 refused', detail: 'start the service' },
+      error: { code: 'node_failed', message: 'ComfyUI refused', detail: 'start the service' },
     },
   }));
   await assert.rejects(

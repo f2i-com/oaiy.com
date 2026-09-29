@@ -345,8 +345,8 @@ forced shutdown even after a flow has written a successful result.
 
 Worth knowing before trusting a green run:
 
-- **Live AI inference remains a manual check.** Local model services (Ollama,
-  ComfyUI and Python environments) are not required by the automated flow tests.
+- **Live AI inference remains a manual check.** OAIY's engine and local services
+  (ComfyUI, Python environments) are not required by the automated flow tests.
 - **Production FormLogic pairing is manual.** The Rust bridge tests and packaged
   server smoke test cover local API requests and real CLI execution. A signed-in
   browser must still be checked against the deployed site using its paired token.

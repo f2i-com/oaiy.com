@@ -162,10 +162,10 @@ Two transports, neither a WebSocket.
 
 ## Services, models and the provider gateway
 
-- Service templates (`services/registry.rs`, `resources/templates`): llama-cpp, ollama,
-  playwright-browser, ltx2-video, lance, krea2, aokie-stt, aokie-tts; health checks, crash
-  backoff, autostart, GPU pinning. llama.cpp is pinned to b9802 (CUDA 13.3 on Windows with an
-  NVIDIA GPU; CPU on Linux).
+- Service templates (`services/registry.rs`, `resources/templates`): oaiy-voice, aokie-stt,
+  aokie-tts, playwright-browser; health checks, crash backoff, autostart, GPU pinning. Models
+  run in OAIY's own engine, so the krea2, lance, llama-cpp, ollama and ltx2-video templates
+  are retired: at startup the copies OAIY seeded are removed, and edited ones are kept.
 - Downloads (`downloads.rs`): HF blob → resolve, Range resume, SHA-256 from `X-Linked-ETag`;
   a curated catalog (`catalog.rs`). Portable Python and venvs (`python.rs`), a pinned Node for
   the CLI (`node_runtime.rs`).

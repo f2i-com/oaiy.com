@@ -277,13 +277,13 @@ oaiy python status
 oaiy venv create myenv --req torch --req diffusers   # create/reuse a venv + pip install
 oaiy venv rm myenv
 
-oaiy service list                           # ollama / llama-cpp / playwright / …
-oaiy service install ollama                 # run the install script (streams progress)
-oaiy service start ollama                   # spawn it · service stop ollama
-oaiy service add ./krea2.json               # load a service from a self-contained template JSON
+oaiy service list                           # oaiy-voice / playwright-browser / …
+oaiy service install playwright-browser     # run the install script (streams progress)
+oaiy service start playwright-browser       # spawn it · service stop playwright-browser
+oaiy service add ./my-rig.json              # load a service from a self-contained template JSON
                                            #   (same format the desktop app uses: install/run/health + inline `files`)
-oaiy service export krea2 ./krea2.json      # save a service to a self-contained JSON (bundles its scripts inline)
-oaiy service logs ollama --tail 100
+oaiy service export my-rig ./my-rig.json    # save a service to a self-contained JSON (bundles its scripts inline)
+oaiy service logs playwright-browser --tail 100
 
 oaiy model download <hf-or-url> --subdir llm   # streams % progress to completion
 oaiy model list · oaiy model rm <name> · oaiy model catalog

@@ -146,7 +146,7 @@ GET /api/bridge/capabilities
   "capabilities": [
     { "id": "oaiy.llm.chat", "available": true, "connections": ["conn_llama_local"] },
     { "id": "oaiy.image.generate", "available": false, "reason": "service_stopped",
-      "detail": "The Krea-2 service is installed but not running." },
+      "detail": "The ComfyUI service is installed but not running." },
     { "id": "connector.aokie.call.answer", "available": true, "pluginId": "aokie" }
   ]
 }
@@ -227,8 +227,8 @@ than a hope about how many workers are running.
   "status": "failed",
   "error": {
     "code": "capability_unavailable",
-    "message": "This step needs the Krea-2 image service, which is installed but not running.",
-    "detail": "Open OAIY Desktop → Services → Krea-2 Turbo → Start.",
+    "message": "This step needs the ComfyUI image service, which is installed but not running.",
+    "detail": "Open OAIY Desktop → Services → ComfyUI → Start.",
     "nodeId": "img_1",
     "capability": "oaiy.image.generate",
     "retryable": true

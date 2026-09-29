@@ -4,7 +4,7 @@
     {
       "id": "llm",
       "name": "LLM (GGUF)",
-      "description": "Local chat / completion models for llama.cpp + Ollama. Q4_K_M is the sweet spot for quality-vs-size; pick by how much VRAM you have.",
+      "description": "Local chat / completion models in GGUF, for a llama.cpp-compatible server you run yourself. Q4_K_M is the sweet spot for quality-vs-size; pick by how much VRAM you have.",
       "models": [
         {
           "id": "qwen3-0.6b-q8",

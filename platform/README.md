@@ -45,7 +45,7 @@ fits your existing setup.*
 |---|---|
 | **Codex / ChatGPT** | Select this option and use **Sign in with ChatGPT**. The wizard links to the Codex CLI installation guide if the CLI is missing. OAIY manages a separate Codex session; the CLI owns sign-in and credentials. Your eligible account's limits apply. |
 | **Provider API key** | Open **Providers → Add provider**, choose the protocol, enter the endpoint, model and key, then use **Test**. Provider keys are stored on the desktop and injected into outbound requests by its gateway. Provider charges may apply. |
-| **Local model** | Open **Services** to install or connect a model server, then use **Models** to download its model. Start the service and select it in your flow or connected app. Existing local OpenAI-compatible endpoints can also be added in **Providers**. |
+| **Local model** | Open **Engines** to add a model to OAIY's own engine, then select it in your flow or connected app. A model server you already run (Ollama, LM Studio, any OpenAI-compatible endpoint) can be added in **Providers**. |
 
 ![The Providers screen with the ChatGPT sign-in option and a configured local Qwen model](docs/images/ai-providers.png)
 
@@ -56,8 +56,7 @@ responses; no mock data was substituted.*
 
 Use **Test** to check a provider's actual response after configuring it. A saved
 provider or green setup check is not a substitute for an inference test.
-GPU use depends on the model server and its configuration; OAIY's llama.cpp
-installer selects a CUDA build when it detects an NVIDIA GPU on Windows.
+GPU use by a model server you run yourself depends on its configuration.
 
 ## Connect FormLogic and Aokie
 
@@ -195,8 +194,8 @@ php bin/migrate.php       # driver-aware: handles both SQLite + MySQL schemas
 php -S 0.0.0.0:8081 -t public/   # or hand public/ to nginx/Apache
 ```
 
-`:8081`, not `:8080`, because llama.cpp — a service OAIY downloads and launches
-for you — binds `:8080` by default. Note also that `php -S` is single-threaded
+`:8081`, not `:8080`, because llama.cpp's server — which plenty of people run
+beside OAIY — binds `:8080` by default. Note also that `php -S` is single-threaded
 and the run long-poll holds a request open for 20s, so it blocks every other
 request; it is fine for poking at the API alone, but see `api/README.md` before
 running the UI against it.
