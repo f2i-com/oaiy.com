@@ -16,6 +16,12 @@ import { useVisiblePoll } from './useVisiblePoll';
  * receptionist takes a message.
  */
 
+/**
+ * Passing a call to you needs the phone's consent for taking calls, and on this computer that consent is not signed: a plugin that
+ * can reach it could change what it allows. So the switch below is best kept off unless every installed plugin is trusted.
+ */
+export const CONSENT_NOT_SIGNED = 'Consent is not signed on this computer: a plugin could flip a scope. Keep this off unless you trust every plugin you have installed.';
+
 const errText = (e: unknown) => (e instanceof Error ? e.message : String(e));
 
 const DAYS = ['Sun', 'Mon', 'Tue', 'Wed', 'Thu', 'Fri', 'Sat'];
@@ -141,6 +147,10 @@ export default function TransfersPanel() {
           When a caller asks for you, the receptionist says it will try to reach you (never that they are put through until you have taken the call), rings your
           devices, and, if you do not answer, offers to take a message. Nothing changes until you turn this on.
         </p>
+        <div className="transfers-warning" data-testid="consent-not-signed">
+          <TriangleAlert size={14} aria-hidden />
+          <span>{CONSENT_NOT_SIGNED}</span>
+        </div>
         <label className="switch-row">
           <input type="checkbox" checked={on} onChange={(e) => patch({ enabled: e.target.checked, takeMessages: e.target.checked ? true : current.takeMessages })} />
           <span>

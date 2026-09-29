@@ -91,7 +91,13 @@ Messages page says so until you handle some.
 ### Transfers
 
 Whether the receptionist may try to reach you for a caller who asks for a person, and how. Both
-switches are **off** until you turn them on, and with them off the phone answers exactly as before:
+switches are **off** until you turn them on, and with them off the phone answers exactly as before.
+
+> **Consent is not signed on this computer: a plugin could flip a scope. Keep this off unless you
+> trust every plugin you have installed.** Passing a call to you needs the phone's consent for taking
+> calls, and this build does not sign that consent, so a plugin that can reach it could change what
+> it allows. The Transfers page says so beside the switch.
+
 
 - **Transfer calls to me.** When a caller asks for you, the receptionist says it will *try* to
   reach you, and this computer tells you: a notification, and a dialog with the caller's name and

@@ -118,7 +118,9 @@ model, so the engine answers with its choice (Qwen3.8-Flash-Next now).
 Off until the owner turns **Transfer calls to me** on (Transfers page); then, for a caller who asks
 for a person, the agent can try to reach the owner. The contract with the phone plugin is
 `docs/contracts/transfer/` (`transfer_v1`); the code is `voice/transfer.rs`, `voice/call.rs` and
-`ring/`. The rule for all of it: **a caller is never left in silence for long, and never told a lie.**
+`ring/`. **Consent is not signed on this computer** (a plugin could flip a scope), so the owner's switch is
+best kept off unless every installed plugin is trusted: the Transfers page and `RECEPTIONIST.md` say so. The rule for
+all of it: **a caller is never left in silence for long, and never told a lie.**
 The desktop's own clocks (`Transfer`, not the phone, the app or the model) say fixed lines: a hold line five
 seconds into a ring and every 15 seconds after (three wordings, at most six), "Connecting you now" at once
 on an acceptance and "Still connecting you" every 15 seconds after it (three wordings, at most four) until

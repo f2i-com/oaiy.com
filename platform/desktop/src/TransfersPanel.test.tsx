@@ -94,6 +94,23 @@ describe('Transfers', () => {
     expect(saveButton().disabled).toBe(true);
   });
 
+  it('says plainly that consent is not signed on this computer, whether transfers are on or off', async () => {
+    await mount();
+    const warning = () => host.querySelector('[data-testid=consent-not-signed]');
+    expect(warning()?.textContent).toBe('Consent is not signed on this computer: a plugin could flip a scope. Keep this off unless you trust every plugin you have installed.');
+    // It sits with the switch it is about, before it.
+    const switchRow = box('Transfer calls to me').closest('label')!;
+    expect(warning()!.compareDocumentPosition(switchRow) & Node.DOCUMENT_POSITION_FOLLOWING).toBeTruthy();
+    await click(box('Transfer calls to me'));
+    expect(warning()).not.toBeNull();
+    // A desktop that keeps it on says it as well.
+    await act(async () => root.unmount());
+    root = createRoot(host);
+    on();
+    await mount();
+    expect(warning()?.textContent).toContain('Keep this off unless you trust every plugin');
+  });
+
   it('explains how a call is put through, in a few lines, without promising a transfer', async () => {
     await mount();
     const help = host.querySelector('[aria-label="How a call is put through"]');
