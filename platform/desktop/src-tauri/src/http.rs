@@ -2485,7 +2485,10 @@ mod tests {
         // The Agent's page (its own scheme) passes the gate; the session does not exist, so the answer is the route's own.
         let own = client.post(format!("{base}/api/backup/agent/abc/part?seq=0")).header("Origin", "http://oaiy.localhost").body("x").send().await.unwrap();
         assert_eq!(own.status(), 404);
+        // ... but the description of an import needs the secret the desktop gave the Agent's window as well: the origin alone gets 403.
         let import = client.get(format!("{base}/api/backup/agent-import")).header("Origin", "http://oaiy.localhost").send().await.unwrap();
+        assert_eq!(import.status(), 403, "an origin is not enough");
+        let import = client.get(format!("{base}/api/backup/agent-import")).header("Origin", "http://oaiy.localhost").header("X-Backup-Token", crate::backup::agent::page_token()).send().await.unwrap();
         assert_eq!(import.status(), 200);
         // A paired or configured token, and the linked provider's own site, pass the guard but are not the Agent's page.
         let token_only = client.get(format!("{base}/api/backup/agent-import")).bearer_auth("desk-token").send().await.unwrap();

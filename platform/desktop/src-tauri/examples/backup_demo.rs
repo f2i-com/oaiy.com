@@ -11,6 +11,7 @@ use std::path::{Path, PathBuf};
 
 use oaiy_desktop_lib::backup::create::{create, CreateOptions};
 use oaiy_desktop_lib::backup::restore::{self, ApplyOutcome, RestoreOptions};
+use oaiy_desktop_lib::backup::review::Ticks;
 
 fn put(root: &Path, rel: &str, body: &[u8]) {
     let path = root.join(rel);
@@ -54,7 +55,8 @@ fn main() {
     put(&source, "flows/greeting.json", b"{\"name\":\"Greeting\"}");
     put(&source, "setup.json", b"{\"firstRun\":{\"finished\":true}}");
     put(&source, "voices/receptionist.wav", &vec![7u8; 5000]);
-    put(&source, "templates/my-rig.json", b"{\"id\":\"my-rig\"}");
+    put(&source, "templates/my-rig.json", b"{\"id\":\"my-rig\",\"name\":\"My rig\",\"run\":{\"command\":\"my-rig.exe\",\"args\":[\"--serve\"]},\"autostart\":true}");
+    put(&source, "services-autostart.json", b"[\"my-rig\"]");
     put(&source, "plugin-data/aokie/settings.json", b"{\"greeting\":\"hello\"}");
     put(&source, "plugin-data/aokie/pairing.json", b"{\"phone\":\"paired\"}");
     put(&source, "ai/providers.json", b"{\"providers\":[{\"apiKey\":\"sk-not-a-real-key\"}]}");
@@ -90,14 +92,31 @@ fn main() {
     }
     println!("  the backup lacks: {:?}", preview.lacks);
     println!("  to do again: {:?}", preview.redo);
+    println!("  what can act, and needs a tick ({} kinds, {} items):", preview.classes.len(), preview.items.len());
+    for c in &preview.classes {
+        println!("    [{}] {} ({} item(s))", c.id, c.label, c.count);
+    }
+    for item in &preview.items {
+        println!("    {} :: {} :: {}", item.name, item.title, item.what);
+    }
 
-    let staged = restore::stage(&target, &file, &passphrase, &opts).expect("staged");
-    println!("\nstaged {} files ({} bytes); the target folder now holds:", staged.files, staged.bytes);
+    // Round 1: nothing ticked, as it is to begin with. Only data comes back.
+    let staged = restore::stage(&target, &file, &passphrase, &Ticks::none(), &opts).expect("staged");
+    println!("\nstaged with nothing ticked: {} files ({} bytes); left out: {:?}", staged.files, staged.bytes, staged.skipped);
+    match restore::apply_pending(&target) {
+        ApplyOutcome::Applied(done) => println!("applied at the next start: ok = {}", done.ok),
+        other => panic!("not applied: {other:?}"),
+    }
+    println!("the target folder now holds (no template, no autostart list, no settings):");
     for line in tree(&target) {
         println!("  {line}");
     }
+    assert!(!target.join("templates").exists() && !target.join("services-autostart.json").exists(), "nothing that can run came back unticked");
 
-    println!("\napplying at the next start:");
+    // Round 2: everything ticked (your own backup, an explicit click).
+    let staged = restore::stage(&target, &file, &passphrase, &Ticks::all(), &opts).expect("staged");
+    println!("\nstaged with every kind ticked: {} files ({} bytes)", staged.files, staged.bytes);
+    println!("applying at the next start:");
     match restore::apply_pending(&target) {
         ApplyOutcome::Applied(done) => println!("  applied: ok = {}", done.ok),
         other => panic!("not applied: {other:?}"),
