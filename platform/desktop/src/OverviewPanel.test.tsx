@@ -292,6 +292,9 @@ describe("Plugins' own cards", () => {
     await settle();
     expect(text()).toContain('Aokie receptionist');
     expect(text()).toContain('Phone connected');
+    // Its health status reads as one pill, not "running" beside a bare "ok".
+    expect(host.querySelector('.overview-hero .badge')?.textContent).toBe('Healthy');
+    expect(host.querySelector('.overview-hero-headline')).toBeNull();
     expect(text()).not.toContain('$health');
     expect(text()).not.toContain('$poll');
     // Sent with no payload, through the gated connector route.

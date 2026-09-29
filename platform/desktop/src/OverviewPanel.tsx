@@ -79,6 +79,25 @@ function bindContext(plugin: PluginRecord | undefined, answers: Record<string, u
   return { health: live ? plugin?.lastHealth : undefined, polls: pollsOf(answers, pluginId) };
 }
 
+/** A plugin's health status word as the person reads it, with its pill; null for a word not known here. */
+function healthPill(status: string | null): { label: string; badge: string } | null {
+  switch ((status ?? '').trim().toLowerCase()) {
+    case 'ok':
+    case 'healthy':
+      return { label: 'Healthy', badge: 'badge-ok' };
+    case 'degraded':
+    case 'warn':
+    case 'warning':
+      return { label: 'Needs attention', badge: 'badge-neutral' };
+    case 'unhealthy':
+    case 'error':
+    case 'down':
+      return { label: 'Unhealthy', badge: 'badge-err' };
+    default:
+      return null;
+  }
+}
+
 export default function OverviewPanel({ onNavigate, onOpenPluginScreen }: Props) {
   // Seeded from the last known values so returning to Overview paints straight
   // away instead of showing four em-dashes while the round trips land.
@@ -202,6 +221,9 @@ export default function OverviewPanel({ onNavigate, onOpenPluginScreen }: Props)
         // itself knows, never to the raw "$health.status" text.
         const headline = bindText(card.bind.headline, ctx(card));
         const body = bindText(card.bind.body, ctx(card));
+        // A headline that is the plugin's health status reads as one pill
+        // ("Healthy"), in place of "running" beside a bare "ok".
+        const health = running && card.bind.headline === '$health.status' ? healthPill(headline) : null;
         return (
           <div
             key={`${card.pluginId}-${card.id}`}
@@ -213,8 +235,13 @@ export default function OverviewPanel({ onNavigate, onOpenPluginScreen }: Props)
             <span className="overview-hero-text">
               <span className="overview-hero-title">
                 <strong>{card.title}</strong>
-                {plugin && <span className={running ? 'badge badge-ok' : 'badge badge-neutral'}>{plugin.state}</span>}
-                {headline && <span className="overview-hero-headline">{headline}</span>}
+                {plugin &&
+                  (health ? (
+                    <span className={`badge ${health.badge}`}>{health.label}</span>
+                  ) : (
+                    <span className={running ? 'badge badge-ok' : 'badge badge-neutral'}>{plugin.state}</span>
+                  ))}
+                {headline && !health && <span className="overview-hero-headline">{headline}</span>}
               </span>
               <small>
                 {body ??
