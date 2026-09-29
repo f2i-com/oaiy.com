@@ -46,6 +46,12 @@ startDesktopDetection();
 // isn't running. See lib/desktopServices.ts.
 startDesktopServiceSync();
 
+// Ask the browser to keep this site's storage (the project, macros and API keys
+// live there) rather than clear it when space is short. Once, in the
+// background, and never a failure: see lib/persistentStorage.ts.
+import { requestPersistentStorage } from './lib/persistentStorage';
+void requestPersistentStorage();
+
 import { StrictMode } from 'react'
 import { createRoot } from 'react-dom/client'
 import './styles/fonts'
