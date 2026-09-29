@@ -11,7 +11,7 @@ import os from 'node:os';
 import path from 'node:path';
 import { after, describe, it } from 'node:test';
 import { fileURLToPath } from 'node:url';
-import { buildFeed, FeedError, platformAssets, readPubkey, readSignature, writeFeed } from './make-latest-json.mjs';
+import { buildFeed, checkSignedFile, FeedError, platformAssets, readPubkey, readSignature, signedFileOf, writeFeed } from './make-latest-json.mjs';
 import { makeKeys, sign } from './minisign.testing.mjs';
 
 const script = path.join(path.dirname(fileURLToPath(import.meta.url)), 'make-latest-json.mjs');
@@ -22,11 +22,18 @@ const VERSION = '0.1.0';
 const SETUP = `oaiy-desktop-${VERSION}-windows-x64-setup.exe`;
 const MSI = `oaiy-desktop-${VERSION}-windows-x64.msi`;
 const APPIMAGE = `oaiy-desktop-${VERSION}-linux-x86_64.AppImage`;
+/** The names the release signs the installers under: the bundler's own (see release.yml, the sign job). */
+const SIGNED_SETUP = `OAIY_${VERSION}_x64-setup.exe`;
+const SIGNED_APPIMAGE = `OAIY_${VERSION}_amd64.AppImage`;
+const SIGNED_AS = { 'windows-nsis': SIGNED_SETUP, 'windows-msi': `OAIY_${VERSION}_x64_en-US.msi`, 'linux-appimage': SIGNED_APPIMAGE };
 
-/** What the Tauri CLI writes into a .sig: the base64 of a minisign signature file. Distinct per label, so a mix-up shows. */
-function signature(label) {
-  const text = `untrusted comment: signature from tauri secret key\nRUR${label.padEnd(40, 'A')}==\ntrusted comment: timestamp:1 file:${label}\n${label.padEnd(60, 'B')}==\n`;
-  return Buffer.from(text).toString('base64');
+const testKeys = makeKeys(1);
+/**
+ * What the Tauri CLI writes into a .sig: the base64 of a minisign signature file, made for the file named `signedAs`
+ * (the trusted comment the CLI writes: a time and `file:<name>`). Distinct per label, so a mix-up shows.
+ */
+function signature(label, signedAs = SIGNED_AS[label] ?? label) {
+  return sign(testKeys, Buffer.from(label), { comment: `timestamp:1790000000\tfile:${signedAs}` });
 }
 
 let counter = 0;
@@ -158,6 +165,72 @@ describe('what it takes as input', () => {
   });
 });
 
+describe('what each signature was made for', () => {
+  const for_ = (asset, file) => ({ [`${asset}.sig`]: signature('x', file) });
+  const refuses = (sigs, pattern) => assert.throws(() => feedOf(release({ sigs })), (e) => e instanceof FeedError && pattern.test(e.message), String(pattern));
+
+  it('is the installer of that platform, for this version, under the name the bundler gives it', () => {
+    assert.ok(feedOf(release()));
+    // The AppImage is held to its ending and its version, not to its architecture or product name.
+    for (const file of ['OAIY_0.1.0_x86_64.AppImage', 'oaiy_0.1.0.AppImage']) assert.ok(feedOf(release({ sigs: for_(APPIMAGE, file) })), file);
+    // The names the release signs under are the ones this check takes, for each platform.
+    for (const { asset, signedName } of platformAssets(VERSION)) assert.ok(feedOf(release({ sigs: for_(asset, signedName) })), signedName);
+  });
+
+  it('refuses a signature made for an older release: an old installer with its genuine signature under a newer version', () => {
+    for (const [asset, old] of [[SETUP, 'OAIY_0.0.9_x64-setup.exe'], [APPIMAGE, 'OAIY_0.0.9_amd64.AppImage']]) {
+      assert.throws(
+        () => feedOf(release({ sigs: for_(asset, old) })),
+        (e) => e instanceof FeedError && e.message.includes(asset) && e.message.includes(old) && /is not version 0\.1\.0/.test(e.message) && /refuse this release/.test(e.message),
+        old,
+      );
+    }
+  });
+
+  it('refuses a version that only looks like the one released', () => {
+    for (const file of ['OAIY_10.1.0_x64-setup.exe', 'OAIY_0.1.05_x64-setup.exe', 'OAIY_0.1.0-rc.1_x64-setup.exe', 'OAIY_0.1.0.1_x64-setup.exe', 'OAIY_v0.1.0_x64-setup.exe', 'OAIY-0.1.0-x64-setup.exe', 'OAIY_x64-setup.exe']) {
+      refuses(for_(SETUP, file), /is not version 0\.1\.0/);
+    }
+  });
+
+  it('refuses a signature made for the other platform\u2019s file, or for one that is not an installer of this platform at all', () => {
+    refuses(for_(SETUP, SIGNED_APPIMAGE), /not a file whose name ends "-setup\.exe"/);
+    refuses(for_(APPIMAGE, SIGNED_SETUP), /not a file whose name ends "\.AppImage"/);
+    for (const file of ['OAIY_0.1.0_x64_en-US.msi', 'OAIY_0.1.0_amd64.deb', 'OAIY_0.1.0_x64-setup.exe.zip', 'OAIY_0.1.0_x64-setup.EXE', 'OAIY_0.1.0', '../OAIY_0.1.0_x64-setup.exe', 'C:\\OAIY_0.1.0_x64-setup.exe']) {
+      refuses(for_(SETUP, file), /not a file whose name ends "-setup\.exe"/);
+    }
+  });
+
+  it('refuses a signature that says no file, or says two', () => {
+    for (const comment of ['timestamp:1790000000', 'timestamp:1790000000\tfilename:OAIY_0.1.0_x64-setup.exe', 'timestamp:1790000000\tfile:OAIY_0.1.0_x64-setup.exe\tfile:OAIY_0.1.0_x64-setup.exe']) {
+      refuses({ [`${SETUP}.sig`]: sign(testKeys, Buffer.from('x'), { comment }) }, /does not say which file it was made for/);
+    }
+  });
+
+  it('is read from the trusted comment: the file field, once', () => {
+    assert.equal(signedFileOf('timestamp:1\tfile:OAIY_0.1.0_x64-setup.exe'), 'OAIY_0.1.0_x64-setup.exe');
+    assert.equal(signedFileOf('file:a\tfile:b'), undefined);
+    assert.equal(signedFileOf('timestamp:1'), undefined);
+    assert.equal(signedFileOf(undefined), undefined);
+    assert.doesNotThrow(() => checkSignedFile('timestamp:1\tfile:OAIY_1.2.3_x64-setup.exe', { asset: 'a', version: '1.2.3', suffix: '-setup.exe' }));
+    assert.throws(() => checkSignedFile('timestamp:1\tfile:OAIY_1.2.3_x64-setup.exe', { asset: 'a', version: '1.2.4', suffix: '-setup.exe' }), FeedError);
+  });
+
+  it('is asked of the signature even when the installer verifies with the key: an old, genuinely signed installer is not a new release', () => {
+    const keys = makeKeys(5);
+    const dir = path.join(root, `old-signed-${++counter}`);
+    fs.mkdirSync(dir);
+    // The installers and signatures of 0.0.9, renamed as the assets of 0.1.0.
+    for (const { asset, suffix } of platformAssets(VERSION)) {
+      const bytes = Buffer.from(`the bytes of the old ${suffix}`);
+      const old = suffix === '.AppImage' ? 'OAIY_0.0.9_amd64.AppImage' : 'OAIY_0.0.9_x64-setup.exe';
+      fs.writeFileSync(path.join(dir, asset), bytes);
+      fs.writeFileSync(path.join(dir, `${asset}.sig`), sign(keys, bytes, { comment: `timestamp:1790000000\tfile:${old}` }));
+    }
+    assert.throws(() => buildFeed({ dir, version: VERSION, pubkey: keys.pubkey }), (e) => e instanceof FeedError && /is not version 0\.1\.0/.test(e.message));
+  });
+});
+
 describe('writing latest.json', () => {
   it('writes the feed beside the release files by default, as JSON a Tauri updater parses', () => {
     const dir = release();
@@ -218,9 +291,9 @@ describe('the signatures against the public key the desktop carries', () => {
   function signedRelease(keys, { tamper } = {}) {
     const dir = path.join(root, `signed-${++counter}`);
     fs.mkdirSync(dir);
-    for (const name of [SETUP, APPIMAGE]) {
+    for (const { asset: name, signedName } of platformAssets(VERSION)) {
       const bytes = Buffer.from(`the bytes of ${name}`);
-      fs.writeFileSync(path.join(dir, `${name}.sig`), sign(keys, bytes, { comment: `timestamp:1790000000\tfile:${name}` }));
+      fs.writeFileSync(path.join(dir, `${name}.sig`), sign(keys, bytes, { comment: `timestamp:1790000000\tfile:${signedName}` }));
       fs.writeFileSync(path.join(dir, name), tamper === name ? Buffer.concat([bytes, Buffer.from('!')]) : bytes);
     }
     return dir;
@@ -249,7 +322,7 @@ describe('the signatures against the public key the desktop carries', () => {
 
   it('stop a signature that cannot be read against the key, and a key that is not one', () => {
     const keys = makeKeys(5);
-    assert.throws(() => buildFeed({ dir: release(), version: VERSION, pubkey: keys.pubkey }), (e) => e instanceof FeedError && /cannot be checked|is not a minisign signature/.test(e.message));
+    assert.throws(() => buildFeed({ dir: release(), version: VERSION, pubkey: keys.pubkey }), (e) => e instanceof FeedError && /cannot be checked|is not a minisign signature|does not verify/.test(e.message));
     assert.throws(() => buildFeed({ dir: signedRelease(keys), version: VERSION, pubkey: 'not a key' }), (e) => e instanceof FeedError && e.message.includes('cannot be checked'));
   });
 
@@ -288,5 +361,40 @@ describe('the signatures against the public key the desktop carries', () => {
   it('read the key this repository ships', () => {
     const conf = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..', 'desktop', 'src-tauri', 'tauri.conf.json');
     assert.match(Buffer.from(readPubkey(conf), 'base64').toString('utf8'), /^untrusted comment: minisign public key: [0-9A-F]{16}\n/);
+  });
+});
+
+describe('with signatures the Tauri CLI really made', () => {
+  // testdata/ of the desktop's update module: stand-in installers signed by `tauri signer sign` under the bundler's names,
+  // with a throwaway key (the same fixtures the desktop's Rust tests use).
+  const testdata = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..', 'desktop', 'src-tauri', 'src', 'update', 'testdata');
+  const read = (name) => fs.readFileSync(path.join(testdata, name));
+  const pubkey = read('throwaway.key.pub').toString('utf8').trim();
+
+  /** The two stand-in installers as the release assets of `version`, each beside its real signature. */
+  function realRelease(version) {
+    const dir = path.join(root, `real-${++counter}`);
+    fs.mkdirSync(dir);
+    for (const { asset } of platformAssets(version)) {
+      const [bin, sig] = asset.endsWith('.AppImage') ? ['linux-appimage.bin', 'linux-appimage.bin.sig'] : ['windows-setup.bin', 'windows-setup.bin.sig'];
+      fs.writeFileSync(path.join(dir, asset), read(bin));
+      fs.writeFileSync(path.join(dir, `${asset}.sig`), read(sig));
+    }
+    return dir;
+  }
+
+  it('let the release they were made for through, verified against the key', () => {
+    const feed = buildFeed({ dir: realRelease('0.1.0'), version: '0.1.0', pubkey });
+    assert.deepEqual(Object.keys(feed.platforms).sort(), ['linux-x86_64', 'windows-x86_64']);
+  });
+
+  it('stop the same genuinely signed installers offered as another version: the downgrade a reviewer ran', () => {
+    for (const announced of ['9.9.9', '0.1.1', '0.2.0']) {
+      assert.throws(
+        () => buildFeed({ dir: realRelease(announced), version: announced, pubkey }),
+        (e) => e instanceof FeedError && e.message.includes(`is not version ${announced}`) && e.message.includes('OAIY_0.1.0_'),
+        announced,
+      );
+    }
   });
 });

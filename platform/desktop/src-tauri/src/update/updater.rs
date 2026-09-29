@@ -576,7 +576,7 @@ pub(crate) mod tests {
         let keys = Keys::new(7);
         let bytes = b"installer".to_vec();
         let sig = keys.sign(&bytes, &comment(version));
-        super::super::verify::verify_package(bytes, &sig, &keys.pubkey, version, true).unwrap()
+        super::super::verify::verify_package(bytes, &sig, &keys.pubkey, &super::super::verify::Expected::new(version, super::super::target::Target::WindowsSetup)).unwrap()
     }
 
     struct Auto;

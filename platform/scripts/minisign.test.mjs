@@ -2,8 +2,9 @@
 //
 //   node --test platform/scripts/minisign.test.mjs
 //
-// The main proof is a REAL signature: testdata/ of the desktop's update module holds a payload signed by the
-// Tauri CLI (with a throwaway key, whose private half is not kept anywhere), the same fixture the desktop's Rust
+// The main proof is a REAL signature: testdata/ of the desktop's update module holds two stand-in installers (an MZ
+// file for Windows, an ELF one for the AppImage) signed by the Tauri CLI under the names the bundler gives an
+// installer, with a throwaway key whose private half is not kept anywhere: the same fixtures the desktop's Rust
 // tests verify with minisign-verify. What this file accepts is what an installed OAIY accepts.
 import assert from 'node:assert/strict';
 import crypto from 'node:crypto';
@@ -15,16 +16,27 @@ import { MinisignError, parsePublicKey, parseSignature, verifyMinisign } from '.
 import { makeKeys, sign } from './minisign.testing.mjs';
 
 const testdata = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..', 'desktop', 'src-tauri', 'src', 'update', 'testdata');
-const payload = fs.readFileSync(path.join(testdata, 'installer.bin'));
-const signature = fs.readFileSync(path.join(testdata, 'installer.bin.sig'), 'utf8').trim();
+const payload = fs.readFileSync(path.join(testdata, 'windows-setup.bin'));
+const signature = fs.readFileSync(path.join(testdata, 'windows-setup.bin.sig'), 'utf8').trim();
+const appImage = fs.readFileSync(path.join(testdata, 'linux-appimage.bin'));
+const appImageSignature = fs.readFileSync(path.join(testdata, 'linux-appimage.bin.sig'), 'utf8').trim();
 const pubkey = fs.readFileSync(path.join(testdata, 'throwaway.key.pub'), 'utf8').trim();
 
 describe('a signature made by the Tauri CLI', () => {
   it('verifies with the public key of the key that signed it', () => {
     const result = verifyMinisign(payload, signature, pubkey);
     assert.equal(result.ok, true, result.reason);
-    assert.match(result.trustedComment, /^timestamp:\d+\tfile:installer\.bin$/);
+    assert.match(result.trustedComment, /^timestamp:\d+\tfile:OAIY_0\.1\.0_x64-setup\.exe$/);
     assert.equal(parseSignature(signature).prehashed, true, 'the CLI signs the hash of the file');
+  });
+
+  it('is made for the file the bundler names, and says so in the comment the key covers: the AppImage too', () => {
+    const result = verifyMinisign(appImage, appImageSignature, pubkey);
+    assert.equal(result.ok, true, result.reason);
+    assert.match(result.trustedComment, /^timestamp:\d+\tfile:OAIY_0\.1\.0_amd64\.AppImage$/);
+    // Neither verifies for the other's bytes.
+    assert.equal(verifyMinisign(appImage, signature, pubkey).ok, false);
+    assert.equal(verifyMinisign(payload, appImageSignature, pubkey).ok, false);
   });
 
   it('does not verify with one byte of the file changed, or the file cut short', () => {
@@ -36,7 +48,9 @@ describe('a signature made by the Tauri CLI', () => {
 
   it('does not verify with the comment changed: it is covered by the signature', () => {
     const lines = Buffer.from(signature, 'base64').toString('utf8').split('\n');
-    lines[2] = lines[2].replace('installer.bin', 'other.bin');
+    // What a downgrade would need: the old signature pointed at a newer version's name.
+    lines[2] = lines[2].replace('OAIY_0.1.0_x64-setup.exe', 'OAIY_9.9.9_x64-setup.exe');
+    assert.ok(lines[2].includes('9.9.9'));
     const edited = Buffer.from(lines.join('\n')).toString('base64');
     assert.deepEqual(verifyMinisign(payload, edited, pubkey), { ok: false, reason: "the signature's comment was changed" });
   });

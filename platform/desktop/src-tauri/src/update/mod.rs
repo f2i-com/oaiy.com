@@ -14,7 +14,9 @@
 //!   means for this version on this platform;
 //! - [`check`]: reading it over https, with a size cap and https-only redirects;
 //! - [`verify`]: the signature check that turns downloaded bytes into a [`VerifiedPackage`], the
-//!   only thing that can be installed;
+//!   only thing that can be installed (it also holds the signature to the announced version, by the
+//!   name of the file it was made for);
+//! - [`target`]: which kind of installer each platform takes;
 //! - [`kind`]: whether this install can replace itself (the NSIS setup.exe and the AppImage can; an MSI, a
 //!   .deb, an .rpm and a development build cannot);
 //! - [`blockers`]: what stops an install, in words;
@@ -32,6 +34,7 @@ pub mod install;
 pub mod kind;
 pub mod phone;
 pub mod routes;
+pub mod target;
 pub mod updater;
 pub mod verify;
 pub mod version;

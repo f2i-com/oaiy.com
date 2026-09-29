@@ -10,14 +10,27 @@
 //!
 //! `signature` is the CONTENT of the `.sig` file: the base64 of the minisign signature file, and
 //! `pubkey` the base64 of the minisign public key file, both as Tauri writes them.
+//!
+//! What a signature proves is that the key signed THESE BYTES. It does not by itself say which
+//! release they belong to: the version in the feed is text, and a feed that pairs a newer version
+//! number with an older, genuinely signed installer would install as a downgrade dressed as an
+//! update. What ties the bytes to a release is the name of the file the signature was made for,
+//! which the Tauri CLI writes into the signature's trusted comment (`file:OAIY_0.2.0_x64-setup.exe`) and
+//! the key's signature covers. So the name has to be an installer of this platform's kind, for the
+//! announced version ([`Target::signed_name_fits`]). (The CLI in use writes no `version:` field;
+//! if one is there it must agree too, and `requireSignedVersion` can insist on one.)
 
 use base64::Engine as _;
 use minisign_verify::{PublicKey, Signature};
 
-/// An installer whose signature verified against the key this copy of OAIY carries.
+use super::target::{NameProblem, Target};
+
+/// An installer whose signature verified against the key this copy of OAIY carries, for the version the feed
+/// announced and the platform this copy runs on.
 #[derive(Debug, PartialEq, Eq)]
 pub struct VerifiedPackage {
     version: String,
+    target: Target,
     bytes: Vec<u8>,
 }
 
@@ -25,6 +38,11 @@ impl VerifiedPackage {
     /// The version the feed announced, and the signature was checked for.
     pub fn version(&self) -> &str {
         &self.version
+    }
+
+    /// The kind of installer it was checked to be.
+    pub fn target(&self) -> Target {
+        self.target
     }
 
     pub fn bytes(&self) -> &[u8] {
@@ -40,6 +58,26 @@ impl VerifiedPackage {
     }
 }
 
+/// What a signature has to agree with: the version the feed announced, the kind of installer this platform takes,
+/// and whether the signature must also name a version of its own.
+#[derive(Debug, Clone, Copy)]
+pub struct Expected<'a> {
+    pub version: &'a str,
+    pub target: Target,
+    /// `plugins.updater.requireSignedVersion`: a signature with no `version:` field is refused.
+    pub require_signed_version: bool,
+}
+
+impl<'a> Expected<'a> {
+    pub fn new(version: &'a str, target: Target) -> Expected<'a> {
+        Expected { version, target, require_signed_version: false }
+    }
+
+    pub fn requiring_signed_version(self) -> Expected<'a> {
+        Expected { require_signed_version: true, ..self }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum VerifyError {
     /// The key this build carries cannot be read.
@@ -48,7 +86,13 @@ pub enum VerifyError {
     BadSignature,
     /// The bytes are not what the signature signs (or it was made with another key).
     DoesNotMatch,
-    /// The signature was made for another version than the feed announced (a feed pairing a newer version with an older release).
+    /// The signature does not say which file it was made for.
+    NoSignedFile,
+    /// The signature was made for a file that is not an installer of this platform's kind (another platform's, an MSI, a path).
+    SignedFileNotThisKind { file: String, expected: &'static str },
+    /// The signature was made for a file of another version than the feed announced (a feed pairing a newer version with an older release).
+    SignedFileNotThisVersion { file: String, announced: String },
+    /// The signature says it was made for another version than the feed announced.
     SignedForOtherVersion { signed: String, announced: String },
     /// Versions must be signed, and this signature does not say which one it is for.
     NoSignedVersion,
@@ -60,6 +104,9 @@ impl std::fmt::Display for VerifyError {
             VerifyError::BadPublicKey => write!(f, "This copy of OAIY has no usable key to check updates with, so the update was refused."),
             VerifyError::BadSignature => write!(f, "The update's signature is not in a form that can be read, so the update was refused."),
             VerifyError::DoesNotMatch => write!(f, "The downloaded update does not match its signature, so it was thrown away. It may be damaged, or not made by OAIY."),
+            VerifyError::NoSignedFile => write!(f, "The update's signature does not say which file it was made for, so the update was refused."),
+            VerifyError::SignedFileNotThisKind { file, expected } => write!(f, "The update's signature was made for a file called {file}, which is not {expected}, so the update was refused."),
+            VerifyError::SignedFileNotThisVersion { file, announced } => write!(f, "The update's signature was made for a file called {file}, which is not version {announced}, so the update was refused."),
             VerifyError::SignedForOtherVersion { signed, announced } => write!(f, "The update was signed for version {signed} but the update information named {announced}, so it was refused."),
             VerifyError::NoSignedVersion => write!(f, "The update's signature does not say which version it is for, so it was refused."),
         }
@@ -73,42 +120,68 @@ fn decode_text(b64: &str) -> Option<String> {
     String::from_utf8(bytes).ok()
 }
 
-/// The version a signature was made for: the `version:` field of its trusted comment (tab-separated `key:value` pairs).
-fn signed_version(trusted_comment: &str) -> Option<&str> {
-    trusted_comment.split('\t').find_map(|field| field.strip_prefix("version:"))
+/// One field of a trusted comment (tab-separated `key:value` pairs, `key` given with its colon): None when it is not there, and
+/// when it is there twice, because a comment that says two things says nothing.
+fn field<'a>(trusted_comment: &'a str, key: &str) -> Option<&'a str> {
+    let mut found = trusted_comment.split('\t').filter_map(|part| part.strip_prefix(key));
+    let first = found.next()?;
+    if found.next().is_some() {
+        return None;
+    }
+    Some(first)
 }
 
-/// Check `bytes` against `signature` with `pubkey`, and the version the signature was made for against `announced_version`.
+/// The file a signature was made for: the `file:` field of its trusted comment.
+fn signed_file(trusted_comment: &str) -> Option<&str> {
+    field(trusted_comment, "file:")
+}
+
+/// The version a signature says it was made for: the `version:` field, if there is one (the Tauri CLI in use writes none).
+fn signed_version(trusted_comment: &str) -> Option<&str> {
+    field(trusted_comment, "version:")
+}
+
+/// Check `bytes` against `signature` with `pubkey`, and what the signature says it was made for against `expected`.
 ///
-/// `require_signed_version` is `plugins.updater.requireSignedVersion`: when on, a signature that
-/// names no version is refused. A signature that DOES name one must always match what the feed
-/// announced, whatever that setting: a mismatch is a feed that pairs a new version number with an
-/// older, genuinely signed release.
-pub fn verify_package(bytes: Vec<u8>, signature: &str, pubkey: &str, announced_version: &str, require_signed_version: bool) -> Result<VerifiedPackage, VerifyError> {
+/// After the signature itself (which also covers the trusted comment, so what is read from it next cannot have been edited):
+///
+/// - the file name in it must be an installer of `expected.target`'s kind (its ending) for `expected.version` (one whole
+///   underscore-separated part of it): [`Target::signed_name_fits`]. This is what a downgrade meets, since the older
+///   installer's signature names the older version;
+/// - a `version:` field, when there is one, must be the announced version, whatever `require_signed_version` says;
+///   with that on, a signature without one is refused.
+pub fn verify_package(bytes: Vec<u8>, signature: &str, pubkey: &str, expected: &Expected) -> Result<VerifiedPackage, VerifyError> {
     let key = decode_text(pubkey).and_then(|text| PublicKey::decode(&text).ok()).ok_or(VerifyError::BadPublicKey)?;
     let signature = decode_text(signature).and_then(|text| Signature::decode(&text).ok()).ok_or(VerifyError::BadSignature)?;
     // Legacy (non-prehashed) signatures are accepted as the updater plugin accepts them.
     key.verify(&bytes, &signature, true).map_err(|_| VerifyError::DoesNotMatch)?;
     // Only now is the trusted comment usable: verify() also checked the global signature that covers it.
-    match signed_version(signature.trusted_comment()) {
+    let comment = signature.trusted_comment();
+    let file = signed_file(comment).ok_or(VerifyError::NoSignedFile)?;
+    expected.target.signed_name_fits(file, expected.version).map_err(|problem| match problem {
+        NameProblem::NotThisKind => VerifyError::SignedFileNotThisKind { file: file.to_string(), expected: expected.target.what() },
+        NameProblem::NotThisVersion => VerifyError::SignedFileNotThisVersion { file: file.to_string(), announced: expected.version.to_string() },
+    })?;
+    match signed_version(comment) {
         Some(signed) => {
-            let same = match (super::version::parse(signed), super::version::parse(announced_version)) {
+            let same = match (super::version::parse(signed), super::version::parse(expected.version)) {
                 (Ok(signed), Ok(announced)) => signed == announced,
-                _ => signed == announced_version,
+                _ => signed == expected.version,
             };
             if !same {
-                return Err(VerifyError::SignedForOtherVersion { signed: signed.to_string(), announced: announced_version.to_string() });
+                return Err(VerifyError::SignedForOtherVersion { signed: signed.to_string(), announced: expected.version.to_string() });
             }
         }
-        None if require_signed_version => return Err(VerifyError::NoSignedVersion),
+        None if expected.require_signed_version => return Err(VerifyError::NoSignedVersion),
         None => {}
     }
-    Ok(VerifiedPackage { version: announced_version.to_string(), bytes })
+    Ok(VerifiedPackage { version: expected.version.to_string(), target: expected.target, bytes })
 }
 
 /// Test-only signing in the minisign format, so the tests need no fixture and no key file.
 #[cfg(test)]
 pub(crate) mod testing {
+    use super::super::target::Target;
     use base64::Engine as _;
     use ed25519_dalek::{Signer, SigningKey};
 
@@ -153,30 +226,50 @@ pub(crate) mod testing {
         }
     }
 
-    /// The trusted comment the Tauri CLI writes for a release: a time, the file, the version it was built as.
+    /// The trusted comment the Tauri CLI writes for the Windows setup of a release: a time and the file, as the bundler
+    /// named it, and no version (the CLI in use writes none).
     pub fn comment(version: &str) -> String {
-        format!("timestamp:1790000000\tfile:oaiy-setup.exe\tversion:{version}")
+        comment_for(Target::WindowsSetup, version)
+    }
+
+    /// The same for either installer.
+    pub fn comment_for(target: Target, version: &str) -> String {
+        let file = match target {
+            Target::WindowsSetup => format!("OAIY_{version}_x64-setup.exe"),
+            Target::LinuxAppImage => format!("OAIY_{version}_amd64.AppImage"),
+        };
+        format!("timestamp:1790000000\tfile:{file}")
+    }
+
+    /// What a later CLI might write: the file, and the version besides.
+    pub fn comment_with_version(version: &str) -> String {
+        format!("{}\tversion:{version}", comment(version))
     }
 }
 
 #[cfg(test)]
 mod tests {
-    use super::testing::{comment, Keys};
+    use super::testing::{comment, comment_for, comment_with_version, Keys};
     use super::*;
 
     const INSTALLER: &[u8] = b"pretend this is a 100 MB installer";
 
-    fn accepted(keys: &Keys, data: &[u8], sig: &str, announced: &str, require: bool) -> Result<VerifiedPackage, VerifyError> {
-        verify_package(data.to_vec(), sig, &keys.pubkey, announced, require)
+    fn setup(version: &str) -> Expected<'_> {
+        Expected::new(version, Target::WindowsSetup)
+    }
+
+    fn accepted(keys: &Keys, data: &[u8], sig: &str, expected: &Expected) -> Result<VerifiedPackage, VerifyError> {
+        verify_package(data.to_vec(), sig, &keys.pubkey, expected)
     }
 
     #[test]
     fn an_installer_signed_with_the_key_this_build_carries_verifies() {
         let keys = Keys::new(7);
         let sig = keys.sign(INSTALLER, &comment("0.2.0"));
-        let package = accepted(&keys, INSTALLER, &sig, "0.2.0", true).unwrap();
+        let package = accepted(&keys, INSTALLER, &sig, &setup("0.2.0")).unwrap();
         assert_eq!(package.bytes(), INSTALLER);
         assert_eq!(package.version(), "0.2.0");
+        assert_eq!(package.target(), Target::WindowsSetup);
         assert_eq!(package.len(), INSTALLER.len());
     }
 
@@ -186,13 +279,13 @@ mod tests {
         let sig = keys.sign(INSTALLER, &comment("0.2.0"));
         let mut tampered = INSTALLER.to_vec();
         tampered[10] ^= 1;
-        assert_eq!(accepted(&keys, &tampered, &sig, "0.2.0", true).unwrap_err(), VerifyError::DoesNotMatch);
+        assert_eq!(accepted(&keys, &tampered, &sig, &setup("0.2.0")).unwrap_err(), VerifyError::DoesNotMatch);
         // Cut short, or with something added.
-        assert_eq!(accepted(&keys, &INSTALLER[..INSTALLER.len() - 1], &sig, "0.2.0", true).unwrap_err(), VerifyError::DoesNotMatch);
+        assert_eq!(accepted(&keys, &INSTALLER[..INSTALLER.len() - 1], &sig, &setup("0.2.0")).unwrap_err(), VerifyError::DoesNotMatch);
         let mut longer = INSTALLER.to_vec();
         longer.push(0);
-        assert_eq!(accepted(&keys, &longer, &sig, "0.2.0", true).unwrap_err(), VerifyError::DoesNotMatch);
-        assert_eq!(accepted(&keys, b"", &sig, "0.2.0", true).unwrap_err(), VerifyError::DoesNotMatch);
+        assert_eq!(accepted(&keys, &longer, &sig, &setup("0.2.0")).unwrap_err(), VerifyError::DoesNotMatch);
+        assert_eq!(accepted(&keys, b"", &sig, &setup("0.2.0")).unwrap_err(), VerifyError::DoesNotMatch);
     }
 
     #[test]
@@ -200,47 +293,103 @@ mod tests {
         let ours = Keys::new(7);
         let theirs = Keys::new(9);
         let sig = theirs.sign(INSTALLER, &comment("0.2.0"));
-        assert_eq!(accepted(&ours, INSTALLER, &sig, "0.2.0", true).unwrap_err(), VerifyError::DoesNotMatch);
+        assert_eq!(accepted(&ours, INSTALLER, &sig, &setup("0.2.0")).unwrap_err(), VerifyError::DoesNotMatch);
         // A signature that names our key id but was made by another key: the check itself refuses it, not just the name.
         let ours = Keys::with_id(7, 1);
         let forger = Keys::with_id(9, 1);
         let forged = forger.sign(INSTALLER, &comment("0.2.0"));
-        assert_eq!(accepted(&ours, INSTALLER, &forged, "0.2.0", true).unwrap_err(), VerifyError::DoesNotMatch);
-        assert!(accepted(&ours, INSTALLER, &ours.sign(INSTALLER, &comment("0.2.0")), "0.2.0", true).is_ok());
+        assert_eq!(accepted(&ours, INSTALLER, &forged, &setup("0.2.0")).unwrap_err(), VerifyError::DoesNotMatch);
+        assert!(accepted(&ours, INSTALLER, &ours.sign(INSTALLER, &comment("0.2.0")), &setup("0.2.0")).is_ok());
     }
 
     #[test]
     fn a_trusted_comment_that_was_changed_is_refused() {
-        // The comment is covered by the global signature: pointing the signature at another version by editing it fails.
+        // The comment is covered by the global signature: pointing the signature at another version by editing the file name fails.
         let keys = Keys::new(7);
         let sig = keys.sign(INSTALLER, &comment("0.1.5"));
         let text = String::from_utf8(base64::engine::general_purpose::STANDARD.decode(&sig).unwrap()).unwrap();
-        let edited = text.replace("version:0.1.5", "version:0.2.0");
+        let edited = text.replace("OAIY_0.1.5_x64-setup.exe", "OAIY_0.2.0_x64-setup.exe");
+        assert_ne!(edited, text);
         let forged = base64::engine::general_purpose::STANDARD.encode(edited);
-        assert_eq!(accepted(&keys, INSTALLER, &forged, "0.2.0", true).unwrap_err(), VerifyError::DoesNotMatch);
+        assert_eq!(accepted(&keys, INSTALLER, &forged, &setup("0.2.0")).unwrap_err(), VerifyError::DoesNotMatch);
     }
 
     #[test]
-    fn a_signature_for_another_version_than_the_feed_announced_is_refused() {
-        // The feed says 9.9.9 but points at the genuinely signed 0.1.5: a downgrade dressed as an update.
+    fn the_downgrade_a_reviewer_ran_is_refused_an_old_signed_installer_announced_as_a_newer_version() {
+        // The feed says 9.9.9 and points at a v9.9.9 address, but the file behind it is the genuinely signed 0.1.0 installer.
         let keys = Keys::new(7);
-        let sig = keys.sign(INSTALLER, &comment("0.1.5"));
+        let old = keys.sign(INSTALLER, &comment("0.1.0"));
         assert_eq!(
-            accepted(&keys, INSTALLER, &sig, "9.9.9", true).unwrap_err(),
-            VerifyError::SignedForOtherVersion { signed: "0.1.5".into(), announced: "9.9.9".into() }
+            accepted(&keys, INSTALLER, &old, &setup("9.9.9")).unwrap_err(),
+            VerifyError::SignedFileNotThisVersion { file: "OAIY_0.1.0_x64-setup.exe".into(), announced: "9.9.9".into() }
         );
-        // Also when versions are not required: a version that IS there must match.
-        assert!(matches!(accepted(&keys, INSTALLER, &sig, "9.9.9", false), Err(VerifyError::SignedForOtherVersion { .. })));
-        // The same version spelled with a v is the same version.
-        assert!(accepted(&keys, INSTALLER, &keys.sign(INSTALLER, &comment("v0.2.0")), "0.2.0", true).is_ok());
+        // Whether or not versions are required of signatures.
+        assert!(matches!(accepted(&keys, INSTALLER, &old, &setup("9.9.9").requiring_signed_version()), Err(VerifyError::SignedFileNotThisVersion { .. })));
+        // A version that only looks like it is not it.
+        for announced in ["0.1", "0.1.00", "1.0", "10.1.0", "0.1.0-rc.1", "0.1.0+build"] {
+            assert!(matches!(accepted(&keys, INSTALLER, &old, &setup(announced)), Err(VerifyError::SignedFileNotThisVersion { .. })), "announced {announced}");
+        }
+        // The matching one is accepted.
+        assert!(accepted(&keys, INSTALLER, &old, &setup("0.1.0")).is_ok());
+        // ...and the message says what happened, in words.
+        let message = accepted(&keys, INSTALLER, &old, &setup("9.9.9")).unwrap_err().to_string();
+        assert!(message.contains("OAIY_0.1.0_x64-setup.exe") && message.contains("9.9.9") && message.contains("refused"), "{message}");
     }
 
     #[test]
-    fn a_signature_that_names_no_version_is_refused_only_when_versions_are_required() {
+    fn each_platform_takes_only_its_own_kind_of_file() {
         let keys = Keys::new(7);
-        let sig = keys.sign(INSTALLER, "timestamp:1790000000\tfile:oaiy-setup.exe");
-        assert_eq!(accepted(&keys, INSTALLER, &sig, "0.2.0", true).unwrap_err(), VerifyError::NoSignedVersion);
-        assert!(accepted(&keys, INSTALLER, &sig, "0.2.0", false).is_ok());
+        let windows = keys.sign(INSTALLER, &comment_for(Target::WindowsSetup, "0.2.0"));
+        let linux = keys.sign(INSTALLER, &comment_for(Target::LinuxAppImage, "0.2.0"));
+        // Each verifies for its own platform...
+        assert!(accepted(&keys, INSTALLER, &windows, &Expected::new("0.2.0", Target::WindowsSetup)).is_ok());
+        assert!(accepted(&keys, INSTALLER, &linux, &Expected::new("0.2.0", Target::LinuxAppImage)).is_ok());
+        // ...and not for the other: the Windows setup where the AppImage belongs, and the AppImage where the setup does.
+        assert!(matches!(accepted(&keys, INSTALLER, &windows, &Expected::new("0.2.0", Target::LinuxAppImage)), Err(VerifyError::SignedFileNotThisKind { .. })));
+        assert!(matches!(accepted(&keys, INSTALLER, &linux, &Expected::new("0.2.0", Target::WindowsSetup)), Err(VerifyError::SignedFileNotThisKind { .. })));
+        // Other files the pipeline makes, and things that are not file names.
+        for file in ["OAIY_0.2.0_x64_en-US.msi", "OAIY_0.2.0_amd64.deb", "OAIY-0.2.0-1.x86_64.rpm", "OAIY_0.2.0_x64-setup.exe.zip", "OAIY_0.2.0", "installer.bin", "../OAIY_0.2.0_x64-setup.exe", "C:\\OAIY_0.2.0_x64-setup.exe"] {
+            let sig = keys.sign(INSTALLER, &format!("timestamp:1790000000\tfile:{file}"));
+            assert!(matches!(accepted(&keys, INSTALLER, &sig, &setup("0.2.0")), Err(VerifyError::SignedFileNotThisKind { .. })), "{file}");
+        }
+        let message = accepted(&keys, INSTALLER, &linux, &setup("0.2.0")).unwrap_err().to_string();
+        assert!(message.contains("OAIY_0.2.0_amd64.AppImage") && message.contains("Windows installer"), "{message}");
+    }
+
+    #[test]
+    fn the_appimage_is_held_to_its_ending_and_its_version_and_nothing_more() {
+        // The AppImage's name has changed between Tauri versions (amd64, x86_64, no architecture), so only these two are looked at.
+        let keys = Keys::new(7);
+        for file in ["OAIY_0.2.0_amd64.AppImage", "OAIY_0.2.0_x86_64.AppImage", "oaiy_0.2.0.AppImage", "OAIY_0.2.0_aarch64.AppImage"] {
+            let sig = keys.sign(INSTALLER, &format!("timestamp:1790000000\tfile:{file}"));
+            assert!(accepted(&keys, INSTALLER, &sig, &Expected::new("0.2.0", Target::LinuxAppImage)).is_ok(), "{file}");
+            assert!(matches!(accepted(&keys, INSTALLER, &sig, &Expected::new("9.9.9", Target::LinuxAppImage)), Err(VerifyError::SignedFileNotThisVersion { .. })), "{file}");
+        }
+    }
+
+    #[test]
+    fn a_signature_that_says_no_file_or_two_is_refused() {
+        let keys = Keys::new(7);
+        for comment in ["timestamp:1790000000", "timestamp:1790000000\tfilename:OAIY_0.2.0_x64-setup.exe", "timestamp:1790000000\tfile:OAIY_0.2.0_x64-setup.exe\tfile:OAIY_0.2.0_x64-setup.exe"] {
+            let sig = keys.sign(INSTALLER, comment);
+            assert_eq!(accepted(&keys, INSTALLER, &sig, &setup("0.2.0")).unwrap_err(), VerifyError::NoSignedFile, "{comment:?}");
+        }
+    }
+
+    #[test]
+    fn a_version_the_signature_names_besides_must_agree_and_may_be_required() {
+        // (What a later Tauri CLI might write.) Present, it must be the announced one, whatever requireSignedVersion says.
+        let keys = Keys::new(7);
+        let sig = keys.sign(INSTALLER, &format!("{}\tversion:0.1.5", comment("0.2.0")));
+        assert_eq!(accepted(&keys, INSTALLER, &sig, &setup("0.2.0")).unwrap_err(), VerifyError::SignedForOtherVersion { signed: "0.1.5".into(), announced: "0.2.0".into() });
+        assert!(matches!(accepted(&keys, INSTALLER, &sig, &setup("0.2.0").requiring_signed_version()), Err(VerifyError::SignedForOtherVersion { .. })));
+        // The same version spelled with a v is the same version.
+        assert!(accepted(&keys, INSTALLER, &keys.sign(INSTALLER, &format!("{}\tversion:v0.2.0", comment("0.2.0"))), &setup("0.2.0").requiring_signed_version()).is_ok());
+        assert!(accepted(&keys, INSTALLER, &keys.sign(INSTALLER, &comment_with_version("0.2.0")), &setup("0.2.0").requiring_signed_version()).is_ok());
+        // Absent, it is refused only when versions are required.
+        let plain = keys.sign(INSTALLER, &comment("0.2.0"));
+        assert_eq!(accepted(&keys, INSTALLER, &plain, &setup("0.2.0").requiring_signed_version()).unwrap_err(), VerifyError::NoSignedVersion);
+        assert!(accepted(&keys, INSTALLER, &plain, &setup("0.2.0")).is_ok());
     }
 
     #[test]
@@ -248,56 +397,89 @@ mod tests {
         let keys = Keys::new(7);
         let sig = keys.sign(INSTALLER, &comment("0.2.0"));
         for bad in ["", "not base64!", "aGVsbG8="] {
-            assert_eq!(verify_package(INSTALLER.to_vec(), &sig, bad, "0.2.0", true).unwrap_err(), VerifyError::BadPublicKey, "key {bad:?}");
-            assert_eq!(verify_package(INSTALLER.to_vec(), bad, &keys.pubkey, "0.2.0", true).unwrap_err(), VerifyError::BadSignature, "signature {bad:?}");
+            assert_eq!(verify_package(INSTALLER.to_vec(), &sig, bad, &setup("0.2.0")).unwrap_err(), VerifyError::BadPublicKey, "key {bad:?}");
+            assert_eq!(verify_package(INSTALLER.to_vec(), bad, &keys.pubkey, &setup("0.2.0")).unwrap_err(), VerifyError::BadSignature, "signature {bad:?}");
         }
         // A public key file where the signature belongs, and the other way round.
-        assert_eq!(verify_package(INSTALLER.to_vec(), &keys.pubkey, &keys.pubkey, "0.2.0", true).unwrap_err(), VerifyError::BadSignature);
-        assert_eq!(verify_package(INSTALLER.to_vec(), &sig, &sig, "0.2.0", true).unwrap_err(), VerifyError::BadPublicKey);
-        for error in [VerifyError::BadPublicKey, VerifyError::BadSignature, VerifyError::DoesNotMatch, VerifyError::NoSignedVersion] {
+        assert_eq!(verify_package(INSTALLER.to_vec(), &keys.pubkey, &keys.pubkey, &setup("0.2.0")).unwrap_err(), VerifyError::BadSignature);
+        assert_eq!(verify_package(INSTALLER.to_vec(), &sig, &sig, &setup("0.2.0")).unwrap_err(), VerifyError::BadPublicKey);
+        for error in [VerifyError::BadPublicKey, VerifyError::BadSignature, VerifyError::DoesNotMatch, VerifyError::NoSignedVersion, VerifyError::NoSignedFile] {
             assert!(error.to_string().contains("refused") || error.to_string().contains("thrown away"), "{error}");
         }
     }
 
-    const REAL_PAYLOAD: &[u8] = include_bytes!("testdata/installer.bin");
-    const REAL_SIGNATURE: &str = include_str!("testdata/installer.bin.sig");
+    // A real installer's signature: two stand-in files (an `MZ` file and an ELF one, 3000 bytes each, not installers) signed by
+    // `tauri signer sign` (the Tauri CLI this repository uses, 2.11) under the names the bundler gives an installer, with a
+    // throwaway key. See testdata/README.txt.
+    const WINDOWS_PAYLOAD: &[u8] = include_bytes!("testdata/windows-setup.bin");
+    const WINDOWS_SIGNATURE: &str = include_str!("testdata/windows-setup.bin.sig");
+    const LINUX_PAYLOAD: &[u8] = include_bytes!("testdata/linux-appimage.bin");
+    const LINUX_SIGNATURE: &str = include_str!("testdata/linux-appimage.bin.sig");
     const REAL_PUBKEY: &str = include_str!("testdata/throwaway.key.pub");
 
+    fn real(target: Target, version: &str) -> Result<VerifiedPackage, VerifyError> {
+        let (payload, signature) = match target {
+            Target::WindowsSetup => (WINDOWS_PAYLOAD, WINDOWS_SIGNATURE),
+            Target::LinuxAppImage => (LINUX_PAYLOAD, LINUX_SIGNATURE),
+        };
+        verify_package(payload.to_vec(), signature.trim(), REAL_PUBKEY.trim(), &Expected::new(version, target))
+    }
+
     #[test]
-    fn a_signature_made_by_the_tauri_cli_verifies_and_a_changed_byte_or_another_key_does_not() {
-        let (signature, pubkey) = (REAL_SIGNATURE.trim(), REAL_PUBKEY.trim());
-        let package = verify_package(REAL_PAYLOAD.to_vec(), signature, pubkey, "0.1.0", false).expect("what the pipeline signs verifies");
-        assert_eq!(package.bytes(), REAL_PAYLOAD);
-        // The signature is the CLI's: prehashed, made by a key with its own name.
+    fn a_signature_made_by_the_tauri_cli_verifies_for_its_own_version_and_kind_and_a_changed_byte_or_another_key_does_not() {
+        let (signature, pubkey) = (WINDOWS_SIGNATURE.trim(), REAL_PUBKEY.trim());
+        let package = real(Target::WindowsSetup, "0.1.0").expect("what the pipeline signs verifies");
+        assert_eq!(package.bytes(), WINDOWS_PAYLOAD);
+        let appimage = real(Target::LinuxAppImage, "0.1.0").expect("the AppImage too");
+        assert_eq!((appimage.bytes(), appimage.target(), appimage.version()), (LINUX_PAYLOAD, Target::LinuxAppImage, "0.1.0"));
+        assert_eq!((package.target(), package.version()), (Target::WindowsSetup, "0.1.0"));
+        // The signature is the CLI's: prehashed, made by a key with its own name, for the file the bundler names.
         let parsed = Signature::decode(&decode_text(signature).unwrap()).unwrap();
-        assert!(parsed.trusted_comment().starts_with("timestamp:") && parsed.trusted_comment().ends_with("file:installer.bin"), "{}", parsed.trusted_comment());
-        for at in [0, REAL_PAYLOAD.len() / 2, REAL_PAYLOAD.len() - 1] {
-            let mut changed = REAL_PAYLOAD.to_vec();
+        assert!(parsed.trusted_comment().starts_with("timestamp:") && parsed.trusted_comment().ends_with("\tfile:OAIY_0.1.0_x64-setup.exe"), "{}", parsed.trusted_comment());
+        let parsed = Signature::decode(&decode_text(LINUX_SIGNATURE.trim()).unwrap()).unwrap();
+        assert!(parsed.trusted_comment().ends_with("\tfile:OAIY_0.1.0_amd64.AppImage"), "{}", parsed.trusted_comment());
+        for at in [0, WINDOWS_PAYLOAD.len() / 2, WINDOWS_PAYLOAD.len() - 1] {
+            let mut changed = WINDOWS_PAYLOAD.to_vec();
             changed[at] ^= 1;
-            assert_eq!(verify_package(changed, signature, pubkey, "0.1.0", false).unwrap_err(), VerifyError::DoesNotMatch, "byte {at}");
+            assert_eq!(verify_package(changed, signature, pubkey, &setup("0.1.0")).unwrap_err(), VerifyError::DoesNotMatch, "byte {at}");
         }
-        assert_eq!(verify_package(REAL_PAYLOAD[..REAL_PAYLOAD.len() - 1].to_vec(), signature, pubkey, "0.1.0", false).unwrap_err(), VerifyError::DoesNotMatch);
+        assert_eq!(verify_package(WINDOWS_PAYLOAD[..WINDOWS_PAYLOAD.len() - 1].to_vec(), signature, pubkey, &setup("0.1.0")).unwrap_err(), VerifyError::DoesNotMatch);
         // Not with the key OAIY's updates are really signed with: this signature is the throwaway key's.
         let conf: serde_json::Value = serde_json::from_str(include_str!("../../tauri.conf.json")).unwrap();
         let production = conf["plugins"]["updater"]["pubkey"].as_str().unwrap();
         assert_ne!(production, pubkey);
-        assert_eq!(verify_package(REAL_PAYLOAD.to_vec(), signature, production, "0.1.0", false).unwrap_err(), VerifyError::DoesNotMatch);
+        assert_eq!(verify_package(WINDOWS_PAYLOAD.to_vec(), signature, production, &setup("0.1.0")).unwrap_err(), VerifyError::DoesNotMatch);
+    }
+
+    #[test]
+    fn the_downgrade_with_a_real_signature_is_refused_and_so_is_the_wrong_platforms_file() {
+        // A real, genuinely signed 0.1.0 installer announced as 9.9.9 (the reviewer's downgrade), and as a version that only resembles it.
+        for announced in ["9.9.9", "0.2.0", "0.1.1", "1.0.0", "0.1.0-rc.1"] {
+            assert!(matches!(real(Target::WindowsSetup, announced), Err(VerifyError::SignedFileNotThisVersion { .. })), "{announced}");
+            assert!(matches!(real(Target::LinuxAppImage, announced), Err(VerifyError::SignedFileNotThisVersion { .. })), "{announced}");
+        }
+        // The Windows setup and its real signature, where the AppImage belongs.
+        let mixed = verify_package(WINDOWS_PAYLOAD.to_vec(), WINDOWS_SIGNATURE.trim(), REAL_PUBKEY.trim(), &Expected::new("0.1.0", Target::LinuxAppImage));
+        assert!(matches!(mixed, Err(VerifyError::SignedFileNotThisKind { .. })), "{mixed:?}");
+        let mixed = verify_package(LINUX_PAYLOAD.to_vec(), LINUX_SIGNATURE.trim(), REAL_PUBKEY.trim(), &Expected::new("0.1.0", Target::WindowsSetup));
+        assert!(matches!(mixed, Err(VerifyError::SignedFileNotThisKind { .. })), "{mixed:?}");
     }
 
     #[test]
     fn the_cli_in_use_writes_no_version_into_a_signature_so_requiring_one_would_refuse_every_release() {
-        // This is why plugins.updater.requireSignedVersion is off, and why the installer's address is held to the
-        // announced version instead (feed::check_asset_url). When the Tauri CLI records `version:` in the trusted
-        // comment, regenerate testdata/, flip these two assertions, and turn requireSignedVersion on.
-        let (signature, pubkey) = (REAL_SIGNATURE.trim(), REAL_PUBKEY.trim());
-        assert_eq!(verify_package(REAL_PAYLOAD.to_vec(), signature, pubkey, "0.1.0", true).unwrap_err(), VerifyError::NoSignedVersion);
+        // This is why plugins.updater.requireSignedVersion is off, and why the release is tied to its signature by the name of the
+        // file it was made for instead. When the Tauri CLI records `version:` in the trusted comment, regenerate testdata/, flip
+        // these two assertions, and turn requireSignedVersion on.
+        let (signature, pubkey) = (WINDOWS_SIGNATURE.trim(), REAL_PUBKEY.trim());
+        assert_eq!(verify_package(WINDOWS_PAYLOAD.to_vec(), signature, pubkey, &setup("0.1.0").requiring_signed_version()).unwrap_err(), VerifyError::NoSignedVersion);
         let conf: serde_json::Value = serde_json::from_str(include_str!("../../tauri.conf.json")).unwrap();
         assert!(!conf["plugins"]["updater"]["requireSignedVersion"].as_bool().unwrap_or(false), "turned on, it would make every update fail: the signatures carry no version");
     }
 
     /// The pipeline's real output, verified the way an installed OAIY verifies a download: an installer made by `tauri build`
-    /// with the updater artifacts on, the `.sig` beside it, and the public key of the key that signed it. Run on purpose,
-    /// with the paths in the environment (it needs an installer, so it is not part of a plain `cargo test`):
+    /// with the updater artifacts on (or signed with `tauri signer sign`), the `.sig` beside it, and the public key of the key
+    /// that signed it. Run on purpose, with the paths in the environment (it needs an installer, so it is not part of a plain
+    /// `cargo test`). A `.AppImage` is taken as the Linux installer, anything else as the Windows one:
     ///
     /// ```text
     /// OAIY_TEST_INSTALLER=<...-setup.exe> OAIY_TEST_PUBKEY_FILE=<key>.pub OAIY_TEST_VERSION=0.1.0 \
@@ -309,6 +491,7 @@ mod tests {
         let installer = std::env::var("OAIY_TEST_INSTALLER").expect("OAIY_TEST_INSTALLER is the path of the setup.exe");
         let pubkey_file = std::env::var("OAIY_TEST_PUBKEY_FILE").expect("OAIY_TEST_PUBKEY_FILE is the path of the .pub file");
         let version = std::env::var("OAIY_TEST_VERSION").unwrap_or_else(|_| "0.1.0".to_string());
+        let target = if installer.ends_with(".AppImage") { Target::LinuxAppImage } else { Target::WindowsSetup };
         let pubkey = std::fs::read_to_string(&pubkey_file).unwrap().trim().to_string();
         let signature = std::fs::read_to_string(format!("{installer}.sig")).expect("the .sig beside the installer");
         let bytes = std::fs::read(&installer).unwrap();
@@ -318,23 +501,27 @@ mod tests {
         let parsed = Signature::decode(&text).expect("a minisign signature");
         println!("untrusted comment: {}", parsed.untrusted_comment());
         println!("trusted comment: {}", parsed.trusted_comment());
+        println!("file in the trusted comment: {:?}", signed_file(parsed.trusted_comment()));
         println!("version in the trusted comment: {:?}", signed_version(parsed.trusted_comment()));
         println!("installer: {} bytes", bytes.len());
 
-        // It verifies with the key that signed it (versions are not required: this CLI does not write one).
-        let package = verify_package(bytes.clone(), &signature, &pubkey, &version, false).expect("the installer verifies with its key");
+        // It verifies with the key that signed it, for the version and the kind (versions are not required: this CLI does not write one).
+        let expected = Expected::new(&version, target);
+        let package = verify_package(bytes.clone(), &signature, &pubkey, &expected).expect("the installer verifies with its key");
         assert_eq!(package.len(), bytes.len());
-        // Not with one byte changed, in the middle or at the end...
+        // Not as another version...
+        assert!(matches!(verify_package(bytes.clone(), &signature, &pubkey, &Expected::new("9.9.9", target)), Err(VerifyError::SignedFileNotThisVersion { .. })));
+        // ...not with one byte changed, in the middle or at the end...
         for at in [bytes.len() / 2, bytes.len() - 1] {
             let mut changed = bytes.clone();
             changed[at] ^= 1;
-            assert_eq!(verify_package(changed, &signature, &pubkey, &version, false).unwrap_err(), VerifyError::DoesNotMatch, "byte {at}");
+            assert_eq!(verify_package(changed, &signature, &pubkey, &expected).unwrap_err(), VerifyError::DoesNotMatch, "byte {at}");
         }
         // ...and not with the production key, which did not sign it.
         let conf: serde_json::Value = serde_json::from_str(include_str!("../../tauri.conf.json")).unwrap();
         let production = conf["plugins"]["updater"]["pubkey"].as_str().unwrap();
         assert_ne!(production, pubkey, "this must be run with a throwaway key, never the production one");
-        assert_eq!(verify_package(bytes, &signature, production, &version, false).unwrap_err(), VerifyError::DoesNotMatch);
+        assert_eq!(verify_package(bytes, &signature, production, &expected).unwrap_err(), VerifyError::DoesNotMatch);
     }
 
     #[test]
@@ -350,6 +537,6 @@ mod tests {
         // And a signature made by some other key does not verify against it.
         let stranger = Keys::new(3);
         let sig = stranger.sign(INSTALLER, &comment("0.2.0"));
-        assert_eq!(verify_package(INSTALLER.to_vec(), &sig, pubkey, "0.2.0", true).unwrap_err(), VerifyError::DoesNotMatch);
+        assert_eq!(verify_package(INSTALLER.to_vec(), &sig, pubkey, &setup("0.2.0")).unwrap_err(), VerifyError::DoesNotMatch);
     }
 }

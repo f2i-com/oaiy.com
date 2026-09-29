@@ -29,3 +29,15 @@ fn the_desktops_activity_probes_ask_the_phone_plugin_the_engines_and_the_rest() 
     assert!(probes.contains("crate::update::phone::PluginLine::new("), "the phone source is not the plugin line");
     assert!(!probes.contains("..Default::default()"), "a field left to the default is a source not asked");
 }
+
+#[test]
+fn the_download_holds_its_signature_to_the_announced_version_and_this_platforms_installer() {
+    // The download itself is a function of the plugin's Update handle, which a unit test cannot make. What it must do before it
+    // hands back a package is what verify.rs tests: ask for THIS platform's installer, for the version the update was found as.
+    let gui = source(include_str!("gui.rs"));
+    let download = block(&gui, "async fn download(", "\n}\n");
+    assert!(download.contains("Target::current()"), "the download no longer asks which kind of installer this platform takes");
+    assert!(download.contains("let (version, signature) = (update.version.clone(), update.signature.clone());"), "the version is no longer the update handle's own");
+    assert!(download.contains("Expected::new(&version, target)"), "the signature is no longer held to the announced version and this platform's installer");
+    assert!(download.contains("verify_package(bytes, &signature, &pubkey, &expected)"), "what the plugin fetched no longer goes through verify_package");
+}

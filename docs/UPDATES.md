@@ -117,13 +117,25 @@ the installer it starts would inherit that and be killed with it.
   install step accepts. A signature that does not match, a signature of another key, a
   changed byte, or a signature that is not a signature: the download is discarded and shown
   as failed.
+- **What the signature was made for.** A signature proves that the key signed those bytes. It
+  does not say which release they belong to, and the version in the feed is only text: a feed
+  that announced 9.9.9 with the address and the genuine signature of an OLD installer would
+  install an old OAIY as if it were an update. What ties the bytes to a release is the name of
+  the file the signature was made for. The Tauri CLI writes it into the signature
+  (`file:OAIY_0.1.0_x64-setup.exe`) and the key's signature covers it, so it cannot be edited.
+  OAIY refuses the download unless that name (1) ends the way this platform's installer does,
+  `-setup.exe` on Windows and `.AppImage` on Linux, and (2) has the announced version as one
+  whole part of it: the parts are what the underscores of the bundler's names separate, so
+  `0.1.0` is not found in `10.1.0`, `0.1.05` or `0.1.0-rc.1`. Nothing else of the name is
+  looked at, on either platform: not the product name, not the architecture (the AppImage's
+  name has changed between Tauri versions, and neither adds to what stops a downgrade). The
+  release job signs the installers under the bundler's names (`OAIY_<v>_x64-setup.exe`,
+  `OAIY_<v>_amd64.AppImage`) and makes the same check from each `.sig` before it publishes.
 - **The address.** The installer must be this project's release asset on `github.com`, over
   https, under the tag `v<version>` (or `<version>`) and named `oaiy-desktop-<version>-...`,
-  and that version is the one the feed announced. (The signature of the Tauri CLI this
-  repository uses does not say which version it was made for, so the feed's version number
-  is otherwise unproven: a feed could pair a higher number with an older, genuinely signed
-  installer. The address closes that. Once the CLI records the version, turn
-  `requireSignedVersion` on; see "Not yet".)
+  and that version is the one the feed announced. That keeps a feed from sending OAIY
+  elsewhere, and it is not what ties the bytes to their version: a release can hold any file
+  under any name, so the version is proven by the signature (above), not by the address.
 - **The feed.** At most 256 KiB, counted as it arrives; https only, redirects too (GitHub
   sends the request through two); every field checked; a version that is lower or equal is
   never an update, and neither is one that is not a version. A platform the feed has nothing
@@ -215,10 +227,12 @@ OAIY would accept. Rotate it, and tell people to install the new release by hand
   installer under `<data>/updates`, mark the first launch after an update, and offer
   "Reinstall the previous version" when that launch does not come up healthy.
 - **A quiet-hours window** to install in. The owner presses the button; nothing picks a time.
-- **`requireSignedVersion`** (the updater plugin can insist that the signature names the
-  version it is for, which closes the replayed-feed downgrade at the signature): the Tauri CLI
-  in this repository (2.11) does not write the version into the signature, so it is off, and
-  the installer's address is checked instead. Upgrade the CLI, check the trusted comment of
-  a built signature for `version:`, then turn it on.
+- **`requireSignedVersion`** (the updater plugin can insist that a signature carries a
+  `version:` field of its own): the Tauri CLI in this repository (2.11) writes none, only
+  `timestamp:` and `file:`, so it is off: turned on, every release would be refused. The
+  version is tied to the signature by the name of the file it was made for (see "What the
+  signature was made for"). OAIY already refuses a signature whose `version:` field, if it has
+  one, is not the announced version. Should a later CLI write the field, check a built
+  signature for it, then turn this on.
 - **A beta channel**, **Authenticode signing**, **macOS**, updates of the engines and of
   plugins.

@@ -1,2 +1,3 @@
-# The repository ignores *.bin (build outputs); this one is a test fixture: what installer.bin.sig signs.
-!installer.bin
+# The repository ignores *.bin (build outputs); these are test fixtures: the bytes the .sig files beside them sign.
+!windows-setup.bin
+!linux-appimage.bin

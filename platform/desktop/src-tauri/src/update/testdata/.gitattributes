@@ -1,2 +1,2 @@
-# Byte for byte, whatever core.autocrlf says: installer.bin is what installer.bin.sig signs.
+# Byte for byte, whatever core.autocrlf says: the .bin files are what the .sig files beside them sign.
 * -text

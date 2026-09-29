@@ -24,8 +24,9 @@ use super::blockers::Probes;
 use super::feed::{check_asset_url, Release};
 use super::install::{self, Outcome, Part, Steps};
 use super::kind;
+use super::target::Target;
 use super::updater::{AutoUpdate, BoxFuture, CheckRefusal, Platform, Status, UpdaterHandle};
-use super::verify::{verify_package, VerifiedPackage, VerifyError};
+use super::verify::{verify_package, Expected, VerifiedPackage, VerifyError};
 use crate::plugins::PluginHost;
 use crate::services::registry::RegistryHandle;
 
@@ -149,6 +150,9 @@ impl Platform for GuiPlatform {
 /// Download and verify the installer: the plugin fetches it and checks its signature, then it is checked again here.
 /// The bytes stay in memory. Whatever goes wrong, nothing is kept.
 async fn download(update: Update, updater: UpdaterHandle, pubkey: String, require_signed_version: bool) -> Result<VerifiedPackage, String> {
+    let Some(target) = Target::current() else {
+        return Err("There is no release of OAIY for this kind of computer, so nothing was fetched.".to_string());
+    };
     let mut update = update;
     update.timeout = Some(DOWNLOAD_TIMEOUT);
     let (version, signature) = (update.version.clone(), update.signature.clone());
@@ -168,7 +172,12 @@ async fn download(update: Update, updater: UpdaterHandle, pubkey: String, requir
     match Abortable::new(update.download(progress, || {}), registration).await {
         Err(_) => Err("The update is larger than an installer should be (over 1 GiB), so it was not used.".to_string()),
         Ok(Err(e)) => Err(explain(&e)),
-        Ok(Ok(bytes)) => verify_package(bytes, &signature, &pubkey, &version, require_signed_version).map_err(|e| e.to_string()),
+        Ok(Ok(bytes)) => {
+            // The signature must be for this platform's kind of installer and for the version the update was found as.
+            let mut expected = Expected::new(&version, target);
+            expected.require_signed_version = require_signed_version;
+            verify_package(bytes, &signature, &pubkey, &expected).map_err(|e| e.to_string())
+        }
     }
 }
 

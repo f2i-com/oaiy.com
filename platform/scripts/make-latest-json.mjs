@@ -17,6 +17,15 @@
 // tauri.conf.json), and the url is where the release publishes the asset:
 // https://github.com/<repo>/releases/download/<tag>/<name>.
 //
+// Each signature is also read for WHAT IT WAS MADE FOR. The Tauri CLI writes the name of the file it
+// signed into the signature's trusted comment ("file:OAIY_0.1.0_x64-setup.exe"), and the key's
+// signature covers it. A signature says which bytes the key signed, not which release they belong
+// to, and the version in a feed is only text: a feed that announced 9.9.9 with the address and the
+// genuine signature of an OLD installer would install as a downgrade. So the name in the signature
+// must end the way this platform's installer does (-setup.exe, .AppImage) and carry the version
+// being released as one whole part (the parts of a bundler's name are what its underscores separate:
+// OAIY_<v>_x64-setup.exe), and the desktop makes the same check before it keeps a download.
+//
 // A missing installer, a missing or empty or unreadable signature is an error and
 // nothing is written: a feed that leaves a platform out would tell that platform's
 // desktops there is no update, and the release that carries it is the one FormLogic's
@@ -31,7 +40,7 @@
 import fs from 'node:fs';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
-import { MinisignError, verifyMinisign } from './minisign.mjs';
+import { MinisignError, parseSignature, verifyMinisign } from './minisign.mjs';
 
 export const DEFAULT_REPO = 'f2i-com/oaiy.com';
 
@@ -43,12 +52,35 @@ const RFC3339 = /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(\.\d+)?(Z|[+-]\d{2}:\d{2})
 
 export class FeedError extends Error {}
 
-/** The platforms the feed carries, by the feed's own key, and the release asset that updates each. */
+/**
+ * The platforms the feed carries, by the feed's own key, and the release asset that updates each; `suffix` is how the name of
+ * that kind of file ends, and `signedName` the name the release signs it under (the name the Tauri bundler gives it).
+ */
 export function platformAssets(version) {
   return [
-    { key: 'windows-x86_64', asset: `oaiy-desktop-${version}-windows-x64-setup.exe`, what: 'the Windows NSIS installer' },
-    { key: 'linux-x86_64', asset: `oaiy-desktop-${version}-linux-x86_64.AppImage`, what: 'the Linux AppImage' },
+    { key: 'windows-x86_64', asset: `oaiy-desktop-${version}-windows-x64-setup.exe`, suffix: '-setup.exe', signedName: `OAIY_${version}_x64-setup.exe`, what: 'the Windows NSIS installer' },
+    { key: 'linux-x86_64', asset: `oaiy-desktop-${version}-linux-x86_64.AppImage`, suffix: '.AppImage', signedName: `OAIY_${version}_amd64.AppImage`, what: 'the Linux AppImage' },
   ];
+}
+
+/** The `file:` field of a trusted comment (tab-separated key:value pairs), or undefined when it is not there exactly once. */
+export function signedFileOf(trustedComment) {
+  const found = String(trustedComment ?? '').split('\t').filter((field) => field.startsWith('file:')).map((field) => field.slice('file:'.length));
+  return found.length === 1 ? found[0] : undefined;
+}
+
+/**
+ * The name a signature says it was made for must be a file of this platform's kind for this version: it ends with
+ * `suffix`, is a name and not a path, and has `version` as one whole part (the parts are what the underscores
+ * separate, so 0.1.0 is never taken from 10.1.0, 0.1.05 or 0.1.0-rc.1). The desktop makes the same check
+ * (update/target.rs, signed_name_fits) on what it downloads.
+ */
+export function checkSignedFile(trustedComment, { asset, version, suffix }) {
+  const file = signedFileOf(trustedComment);
+  const refused = 'the desktop would refuse this release';
+  if (file === undefined) throw new FeedError(`the signature of ${asset} does not say which file it was made for (its trusted comment has no single "file:"): ${refused}`);
+  if (/[\\/]/.test(file) || !file.endsWith(suffix)) throw new FeedError(`the signature of ${asset} was made for "${file}", which is not a file whose name ends "${suffix}": ${refused}`);
+  if (!file.slice(0, -suffix.length).split('_').includes(version)) throw new FeedError(`the signature of ${asset} was made for "${file}", which is not version ${version} (a signature of an older release, kept and reused?): ${refused}`);
 }
 
 /**
@@ -115,13 +147,21 @@ export function buildFeed({ dir, version, tag, repo = DEFAULT_REPO, notes, pubDa
   if (!RFC3339.test(date) || Number.isNaN(Date.parse(date))) throw new FeedError(`"${date}" is not an RFC 3339 date`);
 
   const platforms = {};
-  for (const { key, asset, what } of platformAssets(version)) {
+  for (const { key, asset, suffix, what } of platformAssets(version)) {
     const installer = path.join(dir, asset);
     if (!fs.existsSync(installer) || fs.statSync(installer).size === 0) {
       throw new FeedError(`${what} is missing: ${asset} is not in ${dir}, so ${key} would have no update`);
     }
     const signature = readSignature(`${installer}.sig`, `${asset}`);
     if (pubkey) checkAgainstKey(installer, asset, signature, pubkey);
+    let trustedComment;
+    try {
+      trustedComment = parseSignature(signature).trustedComment;
+    } catch (error) {
+      if (!(error instanceof MinisignError)) throw error;
+      throw new FeedError(`the signature of ${asset} cannot be read: ${error.message}`);
+    }
+    checkSignedFile(trustedComment, { asset, version, suffix });
     platforms[key] = { signature, url: `https://github.com/${repo}/releases/download/${releaseTag}/${asset}` };
   }
   return {
