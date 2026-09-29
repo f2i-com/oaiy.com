@@ -13,6 +13,8 @@ const TRUSTED: PluginRecord = {
   id: 'aokie',
   state: 'installed',
   dir: 'C:/plugins/aokie',
+  userDisabled: false,
+  restartAttempts: 0,
   trust: { state: 'trusted-local', trustedAt: '2026-09-29T10:00:00Z', reason: 'You trusted this exact package.' },
 };
 
