@@ -165,6 +165,26 @@ export default function TransfersPanel() {
         )}
       </section>
 
+      <section className="model-section transfers-help" aria-label="How a call is put through">
+        <details>
+          <summary>How a call is put through to you</summary>
+          <ol>
+            <li>A caller asks for you, or for a person. The receptionist says it will try to reach you: never that they are put through.</li>
+            <li>
+              This computer rings (a notification, and a box on this window with Accept, Decline and Take a message instead), and so does the Companion on this computer
+              or on a second phone. Whoever answers first takes the call.
+            </li>
+            <li>The receptionist stops speaking, tells the caller it is connecting them, and you talk to the caller. The receptionist does not come back unless you hand the call back.</li>
+            <li>
+              If nobody answers in time, you decline, it is quiet hours, you are away with no device to ring, or a limit is reached, the receptionist offers to take a message. It
+              always ends with the caller being spoken to.
+            </li>
+            <li>It only tries when the caller’s own words asked for a person, and no more than the limits below allow, so a caller cannot make it ring over and over.</li>
+            <li>What callers leave is kept under Messages, on this computer.</li>
+          </ol>
+        </details>
+      </section>
+
       <section className="model-section">
         <h3 className="section-title">How it rings</h3>
         <div className="transfers-grid">

@@ -4,8 +4,7 @@ import type { Turn } from '../../src/agent/protocol';
 import { NetGate } from '../../src/gate/netgate';
 import { Vfs } from '../../src/vfs/vfs';
 import type { CallerNote, SessionInfo } from '../../src/vfs/projects';
-import { NO_CALL_FEATURES, Sessions, Speech, TRANSFER_NOTES, callInstructions, callerNotesTool, ownerInstructions, promisesBooking, sameNumber, spoken, tellAgentTool, tidyReplies } from '../../src/sessions';
-import { NO_IDENTITY } from '../../src/identity';
+import { Sessions, Speech, callInstructions, callerNotesTool, promisesBooking, sameNumber, spoken, tellAgentTool, tidyReplies } from '../../src/sessions';
 import type { Desktop } from '../../src/desktop/bridge';
 import { DEFAULT_MESSAGE_SETTINGS, type MessageSettings } from '../../src/settings';
 import { LOCAL, OPENAI, fakeProvider } from './fakeProvider';
@@ -157,7 +156,7 @@ describe('speaking what the agent writes', () => {
   });
 });
 
-function setup(provider: ProviderConfig = OPENAI, toolWait?: Promise<void>, desktopOverrides: Record<string, unknown> = {}) {
+function setup(provider: ProviderConfig = OPENAI, toolWait?: Promise<void>) {
   const chats = new Map<string, Turn[]>();
   let index: SessionInfo[] = [];
   const project = {
@@ -188,7 +187,6 @@ function setup(provider: ProviderConfig = OPENAI, toolWait?: Promise<void>, desk
       if (toolWait) await toolWait;
       return { ok: true, output: name === 'lookup_business_data' ? { answer: 'Open Saturday 8 to 2.' } : { recorded: true, status: 'requested' } };
     },
-    ...desktopOverrides,
   };
   const messages: MessageSettings = { ...DEFAULT_MESSAGE_SETTINGS, answer: false, instructions: '', calls: true, callInstructions: 'Be kind.' };
   const sessions = new Sessions(

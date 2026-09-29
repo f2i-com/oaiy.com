@@ -93,6 +93,21 @@ describe('Transfers', () => {
     expect(saveButton().disabled).toBe(true);
   });
 
+  it('explains how a call is put through, in a few lines, without promising a transfer', async () => {
+    await mount();
+    const help = host.querySelector('[aria-label="How a call is put through"]');
+    expect(help).not.toBeNull();
+    expect(help!.querySelector('summary')?.textContent).toBe('How a call is put through to you');
+    expect(help!.querySelectorAll('li').length).toBe(6);
+    const said = help!.textContent ?? '';
+    expect(said).toContain('never that they are put through');
+    expect(said).toContain('Accept, Decline and Take a message instead');
+    expect(said).toContain('always ends with the caller being spoken to');
+    expect(said).toContain('caller’s own words asked for a person');
+    // Reading it changes nothing.
+    expect(saveButton().disabled).toBe(true);
+  });
+
   it('turns message taking on with transfers, since a message is the fallback', async () => {
     await mount();
     await click(box('Transfer calls to me'));
