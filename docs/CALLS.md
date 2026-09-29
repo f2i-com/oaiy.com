@@ -113,6 +113,64 @@ is nothing to read ahead.
 The model is the one chosen in Engines: the Agent's OAIY provider names no
 model, so the engine answers with its choice (Qwen3.8-Flash-Next now).
 
+## Putting a caller through to the owner
+
+Off until the owner turns **Transfer calls to me** on (Transfers page); then, for a caller who asks
+for a person, the agent can try to reach the owner. The contract with the phone plugin is
+`docs/contracts/transfer/` (`transfer_v1`); the code is `voice/transfer.rs`, `voice/call.rs` and
+`ring/`. The rule for all of it: **a caller is never left in silence and never told a lie.**
+
+```
+caller: "Can I speak to the owner?"           (transcribed here: the desktop's own record of the call)
+agent : transfer_to_owner {reason: caller_asked}  → Agent page → POST /api/voice/calls/{id}/tool
+desktop gates it (all of these, in call.rs, before anything reaches the phone):
+    the owner's setting was on as the call began · the phone said allowTransfer and this desktop said
+    transfer_v1 in ready · the arguments are exactly {reason} · the phone is not near its tool limit ·
+    no request is going · the caller's own words asked for a person · quiet hours, presence, devices,
+    and the limits (per call, per gap, per caller and overall per hour) allow a ring
+phone : oaiy.ring.plan (same plan, counted once) → request → oaiy.ring.opened → tool_result "ringing"
+desktop rings: a native notification and the dialog; the phone offers the call to the Companions
+agent : "I'll try to reach them, please stay with me."  (it is trying: it does not know anyone will come)
+...then one of:
+  accepted    → the desktop says "Connecting you now, one moment." itself, cuts what plays, and refuses
+                every further line and the end of the call from the agent; the session stops with
+                handoff:takeover; the call is not over (call.handoff, not call.ended)
+  declined / expired / unavailable → the agent is told, in a note, what is true and to offer a message
+  (nothing heard) → the desktop's own clocks end the ring and say the fixed lines (see the contract)
+```
+
+- **What the model is told.** The instructions and the tool list follow the owner's settings, not the
+  call, so they are the same for every call and caller and the engine's prompt cache holds them (with
+  the settings off, they are byte for byte what they were). Whether the owner can be rung on *this*
+  call is in the call's own note. The model is told to say "I'll try", never that the call is
+  transferred, connected or on hold before it is told the owner accepted; to offer a message, never
+  promise a callback time or say why; and that it has no number of the owner's to give.
+- **Tools never overlap.** The phone ends a call that makes a tool call while another is unanswered
+  and at its ninth. Tools go to the phone as they always did, except that a transfer waits for any
+  tool on the wire and any tool waits for a transfer on the wire, at most four wait, and a transfer is
+  not asked for once six tools have been sent (one is kept for the goodbye).
+- **Handed over, handed back.** The owner taking the call ends this session and not the call: the app
+  is told (`call.handoff`) and the call stays in a ledger (it is in `hello.calls` and
+  `GET /api/voice/calls`). If the owner hands the caller back, or the takeover fails and the call
+  returns, the phone opens a new session for the same call id with `resume`: the app takes it as the
+  same call in the same conversation, does not greet again, and the greeting spoken is the phone's own
+  return line. If the phone hangs up meanwhile, the desktop ends the call itself
+  (`call.ended`, `ended_during_handoff`).
+- **The caller's words are heard here.** What the phone check reads ("did the caller ask?") is this
+  desktop's own transcript of the last three turns, never the model's claim or the plugin's.
+- **Take a message.** `take_message` goes to `POST /api/voice/calls/{id}/message`, on the call's own
+  route: the number comes from this desktop's record of the call, and the message is refused when the
+  owner has not allowed messages, or a limit is reached. The receptionist says the owner "will be
+  told" only when the answer says so (`notified`), else that the message is saved.
+- **Events for the app.** `call.started` carries `allowTransfer` and `takeMessages` (and `resume`),
+  `hello` and `voice.features` carry what the owner allows, and `call.transfer`
+  `{requestId, outcome, message?, source}` says how a request came out (`source` is `phone`,
+  `watchdog` when the desktop's clock ended it, or `desktop` when the owner answered in the dialog).
+
+The spoken lines of a transfer are the agent's own (it holds the conversation and the voice). They are
+not said in the speak-only mode below: that mode, used on a live call's id, would detach the live call,
+so a speak-only session no longer unregisters a call or says it ended.
+
 ## A line only to be said
 
 A start with `"mode": "speak"` asks OAIY only to say its greeting, once, in
