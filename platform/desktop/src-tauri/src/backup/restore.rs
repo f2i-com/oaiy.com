@@ -28,7 +28,8 @@ use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
 
-use super::manifest::Manifest;
+use super::manifest::{Entry, Manifest};
+use super::review::{self, ClassInfo, Local, RestoreClass, ReviewItem, Ticks};
 use super::rules::{self, Category, Excluded};
 use super::{agent, container, free_space, restore_dir, Budget, scratch_dir, sha256_file, BackupError, ErrorKind, Limits, Result, TempFolder, AGENT_ENTRY};
 use crate::secret_file;
@@ -51,11 +52,13 @@ pub struct RestoreOptions {
     /// What is going on in the app now: looking at a backup asks for a second of computing and up to
     /// a gigabyte of memory, and is not done while a call is live.
     pub busy: super::busy::BusySignals,
+    /// The largest Agent storage that is left for its page (which takes no more than this).
+    pub agent_import_max: u64,
 }
 
 impl Default for RestoreOptions {
     fn default() -> Self {
-        Self { limits: Limits::default(), free_space, time_limit: super::RESTORE_TIME_LIMIT, busy: super::busy::BusySignals::default() }
+        Self { limits: Limits::default(), free_space, time_limit: super::RESTORE_TIME_LIMIT, busy: super::busy::BusySignals::default(), agent_import_max: agent::IMPORT_MAX }
     }
 }
 
@@ -97,6 +100,20 @@ pub struct Preview {
     pub redo: Vec<String>,
     pub total_files: u64,
     pub total_bytes: u64,
+    /// The classes of things that can act, each to be ticked on its own (only those the backup has).
+    pub classes: Vec<ClassInfo>,
+    /// Every item of those classes, by name and by what it does.
+    pub items: Vec<ReviewItem>,
+    pub keys: KeysInfo,
+    /// What is said about what will be left out or cleaned on the way in.
+    pub notes: Vec<String>,
+}
+
+/// Whether the backup holds API keys (what its record says; the person decides whether they come back).
+#[derive(Clone, Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct KeysInfo {
+    pub in_backup: bool,
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -108,6 +125,8 @@ pub struct Staged {
     pub bytes: u64,
     pub agent_storage: bool,
     pub redo: Vec<String>,
+    /// What was left out, cleaned or dropped, in plain words.
+    pub skipped: Vec<String>,
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -118,6 +137,8 @@ pub struct PendingInfo {
     pub staged_at: String,
     pub files: u64,
     pub agent_storage: bool,
+    /// The classes that were ticked.
+    pub classes: Vec<String>,
 }
 
 /// How the last restore or undo went (camelCase).
@@ -134,6 +155,9 @@ pub struct LastRestore {
     pub redo: Vec<String>,
     /// `applied`, `pending` (waiting for the Agent page), `failed` or `none`.
     pub agent_storage: String,
+    /// What was left out, cleaned or dropped on the way in.
+    #[serde(default)]
+    pub notes: Vec<String>,
 }
 
 // ---- files kept in <data>/restore ------------------------------------------------------------------
@@ -151,6 +175,12 @@ struct MarkerFile {
 struct MarkerAgent {
     size: u64,
     sha256: String,
+    /// The Agent's own settings were ticked (or, in an undo, they are the person's own).
+    #[serde(default)]
+    apply_settings: bool,
+    /// The API keys were ticked.
+    #[serde(default)]
+    apply_keys: bool,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -161,7 +191,14 @@ struct Marker {
     kind: String,
     staged_at: String,
     backup_created_at: String,
-    includes_keys: bool,
+    /// The classes that were ticked, and whether the keys were.
+    #[serde(default)]
+    ticked: Vec<String>,
+    #[serde(default)]
+    keys: bool,
+    /// What was left out, cleaned or dropped on the way in.
+    #[serde(default)]
+    notes: Vec<String>,
     /// The folder in `<data>/restore` the staged files are in: `pending-<id>` or `undo-<id>`.
     source: String,
     files: Vec<MarkerFile>,
@@ -246,7 +283,7 @@ impl Marker {
         if name == AGENT_ENTRY {
             return Err("the record of the restore is damaged".into());
         }
-        rules::category_of_backup_entry(name, self.includes_keys).map(|_| ())
+        rules::category_of_backup_entry(name).map(|_| ())
     }
 }
 
@@ -333,8 +370,17 @@ fn redo_of(manifest: &Manifest) -> Vec<String> {
     manifest.excluded.iter().filter_map(|e| e.redo.clone()).filter(|r| seen.insert(r.clone())).collect()
 }
 
-fn preview_of(data_dir: &Path, manifest: &Manifest, file_name: &str) -> Result<Preview> {
-    let local = rules::plan(data_dir, manifest.includes_keys);
+/// The most of an item's own file that is read to describe it.
+const MAX_REVIEW_BYTES: u64 = 2 << 20;
+
+/// Cut a hostile string to what a panel can show, and a list to a length.
+fn clipped(lines: &[String], count: usize, each: usize) -> Vec<String> {
+    lines.iter().take(count).map(|l| review::clip(l, each)).collect()
+}
+
+fn preview_of(data_dir: &Path, verified: &container::Verified, scratch: &Path, file_name: &str, budget: &Budget) -> Result<Preview> {
+    let manifest = &verified.manifest;
+    let local = rules::plan(data_dir, true);
     let in_backup: HashSet<String> = manifest.entries.iter().map(|e| e.name.to_lowercase()).collect();
     let mut targets = Targets::new();
     let mut plans: HashMap<Category, CategoryPlan> = HashMap::new();
@@ -343,7 +389,7 @@ fn preview_of(data_dir: &Path, manifest: &Manifest, file_name: &str) -> Result<P
         f(p);
     };
     for entry in &manifest.entries {
-        let (category, _) = rules::category_of_backup_entry(&entry.name, manifest.includes_keys).map_err(|why| BackupError::new(ErrorKind::Unsafe, why))?;
+        let (category, _) = rules::category_of_backup_entry(&entry.name).map_err(|why| BackupError::new(ErrorKind::Unsafe, why))?;
         if category == Category::Agent {
             // Merged by the Agent page: files in the backup overwrite files of the same name, nothing is deleted.
             let files = manifest.counts.agent_files;
@@ -372,19 +418,83 @@ fn preview_of(data_dir: &Path, manifest: &Manifest, file_name: &str) -> Result<P
     categories.retain(|c| c.added + c.replaced + c.unchanged + c.left_alone > 0);
     let has: HashSet<&str> = categories.iter().filter(|c| c.added + c.replaced + c.unchanged > 0).map(|c| c.id.as_str()).collect();
     let lacks: Vec<String> = Category::ALL.iter().filter(|c| !has.contains(c.id())).map(|c| c.label().to_string()).collect();
+
+    // ---- everything that can act, by name and by what it does ----
+    let mut archive = container::open_archive(&verified.plain)?;
+    let here = Local::read(data_dir);
+    let mut backup_templates: HashSet<String> = HashSet::new();
+    let mut read: Vec<(Category, &str, Option<Vec<u8>>)> = Vec::new();
+    for entry in &manifest.entries {
+        budget.check()?;
+        let Ok((category, _)) = rules::category_of_backup_entry(&entry.name) else { continue };
+        if review::class_of(category).is_none() {
+            continue;
+        }
+        let bytes = container::read_entry(&mut archive, &entry.name, MAX_REVIEW_BYTES)?;
+        if entry.name.starts_with("templates/") {
+            if let Some(id) = bytes.as_ref().and_then(|b| serde_json::from_slice::<serde_json::Value>(b).ok()).and_then(|v| v.get("id").and_then(|i| i.as_str().map(str::to_string))) {
+                backup_templates.insert(id);
+            }
+        }
+        read.push((category, entry.name.as_str(), bytes));
+    }
+    let mut items: Vec<ReviewItem> = Vec::new();
+    for (category, name, bytes) in &read {
+        match bytes {
+            Some(bytes) => items.extend(review::describe(*category, name, bytes, &here, &backup_templates)),
+            None => {
+                if let Some(class) = review::class_of(*category) {
+                    items.push(ReviewItem { class, name: (*name).to_string(), title: review::clip(name.rsplit('/').next().unwrap_or(name), 120), what: "Too large to look at: it is not brought back.".to_string() });
+                }
+            }
+        }
+        if items.len() > review::MAX_REVIEW_ITEMS {
+            return Err(BackupError::new(ErrorKind::TooLarge, "This backup holds more things that can run or reconfigure OAIY than can be looked through, so it is refused."));
+        }
+    }
+    if manifest.entries.iter().any(|e| e.name == AGENT_ENTRY) {
+        let settings = container::read_nested_entry(&mut archive, AGENT_ENTRY, "idb/settings.json", scratch, MAX_REVIEW_BYTES, budget)?;
+        if let Some(settings) = settings {
+            items.extend(review::describe_agent_settings(&settings));
+        }
+    }
+    if items.len() > review::MAX_REVIEW_ITEMS {
+        return Err(BackupError::new(ErrorKind::TooLarge, "This backup holds more things that can run or reconfigure OAIY than can be looked through, so it is refused."));
+    }
+    let classes: Vec<ClassInfo> = RestoreClass::ALL
+        .iter()
+        .filter_map(|c| {
+            let count = items.iter().filter(|i| i.class == *c).count();
+            (count > 0).then(|| ClassInfo { id: c.id().to_string(), label: c.label().to_string(), description: c.description().to_string(), count })
+        })
+        .collect();
+    let mut notes = Vec::new();
+    if in_backup.contains("calendar/calendar.json") {
+        notes.push("The calendar comes back without its FormLogic sync state: it pairs and syncs again when you link FormLogic.".to_string());
+    }
+    if items.iter().any(|i| i.class == RestoreClass::Plugins) {
+        notes.push("Plugin settings come back without PINs, keys or values sealed to another computer; what this computer already has of those stays.".to_string());
+    }
+    if items.iter().any(|i| i.class == RestoreClass::Flows && i.name == "bridge/ledger.jsonl") {
+        notes.push("Runs that were waiting or running when the backup was made are never brought back.".to_string());
+    }
     Ok(Preview {
-        file_name: file_name.to_string(),
-        created_at: manifest.created_at.clone(),
-        app_version: manifest.app.version.clone(),
-        platform: manifest.platform.clone(),
+        file_name: review::clip(file_name, 200),
+        created_at: review::clip(&manifest.created_at, 40),
+        app_version: review::clip(&manifest.app.version, 64),
+        platform: review::clip(&manifest.platform, 32),
         includes_keys: manifest.includes_keys,
         categories,
         lacks,
-        partial: manifest.partial.clone(),
-        excluded: manifest.excluded.clone(),
-        redo: redo_of(manifest),
+        partial: clipped(&manifest.partial, 50, 400),
+        excluded: manifest.excluded.iter().take(300).map(|e| Excluded { pattern: review::clip(&e.pattern, 200), reason: review::clip(&e.reason, 400), redo: e.redo.as_ref().map(|r| review::clip(r, 400)) }).collect(),
+        redo: clipped(&redo_of(manifest), 50, 400),
         total_files: manifest.entries.len() as u64,
         total_bytes: manifest.entries.iter().map(|e| e.size).sum(),
+        classes,
+        items,
+        keys: KeysInfo { in_backup: manifest.includes_keys },
+        notes,
     })
 }
 
@@ -392,22 +502,48 @@ fn preview_of(data_dir: &Path, manifest: &Manifest, file_name: &str) -> Result<P
 pub fn inspect(data_dir: &Path, file: &Path, passphrase: &str, opts: &RestoreOptions) -> Result<Preview> {
     opts.busy.refuse_if_busy("checking a backup")?;
     let scratch = TempFolder::new(&scratch_dir(data_dir))?;
-    let verified = container::open_backup(file, passphrase, &scratch.0, &opts.limits, &opts.budget())?;
+    let budget = opts.budget();
+    let verified = container::open_backup(file, passphrase, &scratch.0, &opts.limits, &budget)?;
     let name = file.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
-    preview_of(data_dir, &verified.manifest, &name)
+    preview_of(data_dir, &verified, &scratch.0, &name, &budget)
 }
 
 // ---- staging ---------------------------------------------------------------------------------------
 
-/// Step 2: unpack the backup into `<data>/restore/pending-<id>/` and write the marker. Nothing
-/// live is changed.
-pub fn stage(data_dir: &Path, file: &Path, passphrase: &str, opts: &RestoreOptions) -> Result<Staged> {
+/// Step 2: unpack the backup into `<data>/restore/pending-<id>/` and write the marker. Nothing live
+/// is changed. Data comes back as it is; a class that can run things or change settings comes back
+/// only if `ticks` has it (see [`review`]).
+pub fn stage(data_dir: &Path, file: &Path, passphrase: &str, ticks: &Ticks, opts: &RestoreOptions) -> Result<Staged> {
     opts.busy.refuse_if_busy("preparing a restore")?;
     let budget = opts.budget();
     let scratch = TempFolder::new(&scratch_dir(data_dir))?;
     let verified = container::open_backup(file, passphrase, &scratch.0, &opts.limits, &budget)?;
     let manifest = &verified.manifest;
-    let total: u64 = manifest.entries.iter().map(|e| e.size).sum();
+    let mut skipped: Vec<String> = Vec::new();
+    // What is brought back: data, and the classes that were ticked (and the Agent's storage, if it is small enough for its page).
+    let mut selected: Vec<&Entry> = Vec::new();
+    let mut left_out: HashMap<RestoreClass, usize> = HashMap::new();
+    for entry in &manifest.entries {
+        if entry.name == AGENT_ENTRY {
+            if entry.size > opts.agent_import_max {
+                skipped.push(format!("The Agent's conversations and projects were not brought back: they are {} MB, more than the {} MB its page takes back.", entry.size >> 20, opts.agent_import_max >> 20));
+            } else {
+                selected.push(entry);
+            }
+            continue;
+        }
+        let Ok((category, _)) = rules::category_of_backup_entry(&entry.name) else { continue };
+        match review::class_of(category) {
+            Some(class) if !ticks.has(class) => *left_out.entry(class).or_default() += 1,
+            _ => selected.push(entry),
+        }
+    }
+    for class in RestoreClass::ALL {
+        if let Some(n) = left_out.get(&class) {
+            skipped.push(format!("Not brought back (not ticked): {} ({n} file{}).", class.label(), if *n == 1 { "" } else { "s" }));
+        }
+    }
+    let total: u64 = selected.iter().map(|e| e.size).sum();
     let plain_len = std::fs::metadata(&verified.plain).map(|m| m.len()).unwrap_or(0);
     let needed = total.saturating_add(plain_len).saturating_add(MARGIN);
     let free = (opts.free_space)(data_dir);
@@ -419,7 +555,7 @@ pub fn stage(data_dir: &Path, file: &Path, passphrase: &str, opts: &RestoreOptio
     }
     // Everything it would replace must be a plain file, and nothing may be behind a link.
     let mut targets = Targets::new();
-    for entry in &manifest.entries {
+    for entry in &selected {
         if entry.name != AGENT_ENTRY {
             targets.state(data_dir, &entry.name)?;
         }
@@ -429,80 +565,109 @@ pub fn stage(data_dir: &Path, file: &Path, passphrase: &str, opts: &RestoreOptio
     let id = super::random_id();
     let source = format!("pending-{id}");
     let root = restore_dir(data_dir).join(&source);
-    let staged = (|| -> Result<Marker> {
+    let wanted: HashSet<&str> = selected.iter().map(|e| e.name.as_str()).collect();
+    let staged = (|| -> Result<(Marker, Vec<String>)> {
         secret_file::create_private_dir(&root.join("files")).map_err(|e| BackupError::io("Could not make a folder for the restore", &e))?;
         let limits = &opts.limits;
         container::extract_all(&verified, |entry| {
-            if entry.name == AGENT_ENTRY {
-                Ok(root.join("agent-storage.zip"))
+            if !wanted.contains(entry.name.as_str()) {
+                Ok(None)
+            } else if entry.name == AGENT_ENTRY {
+                Ok(Some(root.join("agent-storage.zip")))
             } else {
-                container::safe_join(&root.join("files"), &entry.name, limits)
+                container::safe_join(&root.join("files"), &entry.name, limits).map(Some)
             }
         }, &budget)?;
-        let agent = manifest.entries.iter().find(|e| e.name == AGENT_ENTRY).map(|e| MarkerAgent { size: e.size, sha256: e.sha256.clone() });
+        let agent = selected.iter().find(|e| e.name == AGENT_ENTRY).map(|e| MarkerAgent { size: e.size, sha256: e.sha256.clone(), apply_settings: ticks.has(RestoreClass::AgentSettings), apply_keys: ticks.keys });
         // What can carry more than data is cleaned as it comes in, and the marker records what is there now.
-        let wanted: Vec<String> = manifest.entries.iter().filter(|e| e.name != AGENT_ENTRY).map(|e| e.name.clone()).collect();
-        let (kept, _notes) = clean_staged(data_dir, &root.join("files"), &wanted, &opts.limits)?;
+        let names: Vec<String> = selected.iter().filter(|e| e.name != AGENT_ENTRY).map(|e| e.name.clone()).collect();
+        let (kept, notes) = clean_staged(data_dir, &root.join("files"), &names, ticks, limits)?;
         let mut files = Vec::new();
         for name in &kept {
             let path = container::safe_join(&root.join("files"), name, limits)?;
             let (sha256, size) = sha256_file(&path).map_err(|e| BackupError::io("Could not read a staged file", &e))?;
             files.push(MarkerFile { name: name.clone(), size, sha256 });
         }
-        Ok(Marker {
-            v: 1,
-            id: id.clone(),
-            kind: KIND_RESTORE.to_string(),
-            staged_at: now(),
-            backup_created_at: manifest.created_at.clone(),
-            includes_keys: manifest.includes_keys,
-            source: source.clone(),
-            files,
-            removals: Vec::new(),
-            agent,
-            redo: redo_of(manifest),
-            bytes: total,
-        })
+        let bytes: u64 = files.iter().map(|f| f.size).sum();
+        Ok((
+            Marker {
+                v: 1,
+                id: id.clone(),
+                kind: KIND_RESTORE.to_string(),
+                staged_at: now(),
+                backup_created_at: review::clip(&manifest.created_at, 40),
+                ticked: ticks.ids(),
+                keys: ticks.keys,
+                notes: notes.iter().map(|n| review::clip(n, 400)).take(50).collect(),
+                source: source.clone(),
+                files,
+                removals: Vec::new(),
+                agent,
+                redo: clipped(&redo_of(manifest), 50, 400),
+                bytes,
+            },
+            notes,
+        ))
     })();
-    let marker = match staged {
+    let (marker, notes) = match staged {
         Ok(m) => m,
         Err(e) => {
             let _ = std::fs::remove_dir_all(&root);
             return Err(e);
         }
     };
+    skipped.extend(notes);
     // The marker is what commits the step.
     if let Err(e) = write_json(&marker_path(data_dir), &marker) {
         let _ = std::fs::remove_dir_all(&root);
         return Err(BackupError::io("Could not record the restore", &e));
     }
-    log::info!("backup: a restore ({} files) is staged and will be applied at the next start", marker.files.len());
+    log::info!("backup: a restore ({} files, {} classes ticked) is staged and will be applied at the next start", marker.files.len(), marker.ticked.len());
     Ok(Staged {
         id,
         kind: KIND_RESTORE.to_string(),
         files: marker.files.len() as u64,
-        bytes: total,
+        bytes: marker.bytes,
         agent_storage: marker.agent.is_some(),
         redo: marker.redo,
+        skipped: clipped(&skipped, 100, 400),
     })
 }
 
-/// Clean the staged files that carry more than data: the calendar loses its FormLogic sync state, and
-/// a plugin's settings lose every PIN, key and sealed value the backup holds while keeping the ones
-/// this computer already has. A file that cannot be cleaned is not brought back. Returns the names
-/// that remain and what was said about the rest.
-fn clean_staged(data_dir: &Path, files_root: &Path, names: &[String], limits: &Limits) -> Result<(Vec<String>, Vec<String>)> {
+/// Clean the staged files that carry more than data: the calendar loses its FormLogic sync state, a
+/// plugin's settings lose every PIN, key and sealed value the backup holds while keeping the ones this
+/// computer already has, the provider list loses its keys unless they were ticked, the run journal
+/// keeps only runs that finished, and the autostart list keeps only services that have a template
+/// here or in this restore. A file that cannot be cleaned is not brought back. Returns the names that
+/// remain and what was said about the rest.
+fn clean_staged(data_dir: &Path, files_root: &Path, names: &[String], ticks: &Ticks, limits: &Limits) -> Result<(Vec<String>, Vec<String>)> {
     let mut kept = Vec::new();
     let mut notes = Vec::new();
+    let read = |path: &Path| std::fs::read(path).map_err(|e| e.to_string());
     for name in names {
         let path = container::safe_join(files_root, name, limits)?;
-        let category = rules::category_of_backup_entry(name, true).map(|(c, _)| c).ok();
-        let cleaned = match category {
-            Some(Category::Calendar) => Some(std::fs::read(&path).map_err(|e| e.to_string()).and_then(|b| super::sanitize::calendar_json(&b))),
-            Some(Category::PluginData) => {
+        let category = rules::category_of_backup_entry(name).map(|(c, _)| c).ok();
+        let cleaned: Option<std::result::Result<Vec<u8>, String>> = match (category, name.as_str()) {
+            (Some(Category::Calendar), _) => Some(read(&path).and_then(|b| super::sanitize::calendar_json(&b))),
+            (Some(Category::PluginData), _) => {
                 let local = std::fs::read(data_dir.join(native(name))).ok();
-                Some(std::fs::read(&path).map_err(|e| e.to_string()).and_then(|b| super::sanitize::plugin_json_with_local(&b, local.as_deref()).map(|(c, _)| c)))
+                Some(read(&path).and_then(|b| super::sanitize::plugin_json_with_local(&b, local.as_deref()).map(|(c, _)| c)))
             }
+            (Some(Category::Providers), _) if !ticks.keys => Some(read(&path).and_then(|b| {
+                super::sanitize::providers_without_keys(&b).map(|(c, removed)| {
+                    if removed > 0 {
+                        notes.push(format!("{removed} API key(s) in the provider list were left out: you did not tick the keys."));
+                    }
+                    c
+                })
+            })),
+            (Some(Category::Flows), "bridge/ledger.jsonl") => Some(read(&path).map(|b| {
+                let (c, left_out) = super::sanitize::ledger_finished_only(&b);
+                if left_out > 0 {
+                    notes.push(format!("{left_out} run record(s) of runs that were waiting or running were left out: nothing starts by itself."));
+                }
+                c
+            })),
             _ => None,
         };
         match cleaned {
@@ -514,6 +679,30 @@ fn clean_staged(data_dir: &Path, files_root: &Path, names: &[String], limits: &L
             Some(Err(why)) => {
                 let _ = std::fs::remove_file(&path);
                 notes.push(format!("{name} was not brought back: {why}."));
+            }
+        }
+    }
+    // A service starts with OAIY only if OAIY has a template for it: one here already, or one in this restore.
+    if kept.iter().any(|n| n == "services-autostart.json") {
+        let mut known = Local::read(data_dir).template_ids;
+        for name in kept.iter().filter(|n| n.starts_with("templates/")) {
+            let staged = container::safe_join(files_root, name, limits)?;
+            if let Some(id) = std::fs::read(&staged).ok().and_then(|b| serde_json::from_slice::<serde_json::Value>(&b).ok()).and_then(|v| v.get("id").and_then(|i| i.as_str().map(str::to_string))) {
+                known.insert(id);
+            }
+        }
+        let path = container::safe_join(files_root, "services-autostart.json", limits)?;
+        match read(&path).and_then(|b| super::sanitize::autostart_known_only(&b, &known)) {
+            Ok((bytes, dropped)) => {
+                secret_file::write(&path, bytes).map_err(|e| BackupError::io("Could not clean a staged file", &e))?;
+                if !dropped.is_empty() {
+                    notes.push(format!("These services were not set to start with OAIY, because OAIY has no template for them: {}.", dropped.iter().take(20).map(|d| review::clip(d, 60)).collect::<Vec<_>>().join(", ")));
+                }
+            }
+            Err(why) => {
+                let _ = std::fs::remove_file(&path);
+                kept.retain(|n| n != "services-autostart.json");
+                notes.push(format!("services-autostart.json was not brought back: {why}."));
             }
         }
     }
@@ -590,7 +779,8 @@ pub fn stage_undo(data_dir: &Path, opts: &RestoreOptions) -> Result<Staged> {
     let agent = match std::fs::metadata(&agent_zip) {
         Ok(m) if m.is_file() => {
             let (sha256, size) = sha256_file(&agent_zip).map_err(|e| BackupError::io("Could not read the saved copy", &e))?;
-            Some(MarkerAgent { size, sha256 })
+            // What the page saved is the person's own state: its settings go back, its keys were never in it.
+            Some(MarkerAgent { size, sha256, apply_settings: true, apply_keys: false })
         }
         _ => None,
     };
@@ -600,8 +790,9 @@ pub fn stage_undo(data_dir: &Path, opts: &RestoreOptions) -> Result<Staged> {
         kind: KIND_UNDO.to_string(),
         staged_at: now(),
         backup_created_at: record.backup_created_at.clone(),
-        // Names put back were accepted the first time; a provider key file is among them only if it was in the backup.
-        includes_keys: record.replaced.iter().chain(record.added.iter()).any(|r| r.eq_ignore_ascii_case("ai/providers.json")),
+        ticked: Vec::new(),
+        keys: false,
+        notes: Vec::new(),
         source: format!("undo-{uid}"),
         files,
         removals: record.added.clone(),
@@ -617,6 +808,7 @@ pub fn stage_undo(data_dir: &Path, opts: &RestoreOptions) -> Result<Staged> {
         bytes,
         agent_storage: marker.agent.is_some(),
         redo: Vec::new(),
+        skipped: Vec::new(),
     })
 }
 
@@ -706,7 +898,7 @@ fn record_last(data_dir: &Path, last: &LastRestore) {
 }
 
 fn failed(marker_id: &str, kind: &str, why: &str) -> LastRestore {
-    LastRestore { id: marker_id.to_string(), kind: kind.to_string(), at: now(), ok: false, error: Some(why.to_string()), redo: Vec::new(), agent_storage: "none".into() }
+    LastRestore { id: marker_id.to_string(), kind: kind.to_string(), at: now(), ok: false, error: Some(why.to_string()), redo: Vec::new(), agent_storage: "none".into(), notes: Vec::new() }
 }
 
 /// Remove what a backup or a restore that was killed part-way leaves behind, at the start of the app
@@ -948,9 +1140,9 @@ fn finalize(data_dir: &Path, marker: &Marker, applied: &[(String, bool)]) -> App
         }
     }
     let mut agent_storage = "none";
-    if marker.agent.is_some() {
+    if let Some(agent_marker) = &marker.agent {
         let zip = source.join("agent-storage.zip");
-        match agent::leave_for_page(data_dir, &marker.id, &marker.kind, &zip) {
+        match agent::leave_for_page(data_dir, &marker.id, &marker.kind, &zip, agent_marker.apply_settings, agent_marker.apply_keys) {
             Ok(()) => agent_storage = "pending",
             Err(e) => {
                 log::warn!("backup: the Agent's storage could not be handed over: {e}");
@@ -966,6 +1158,7 @@ fn finalize(data_dir: &Path, marker: &Marker, applied: &[(String, bool)]) -> App
         error: None,
         redo: marker.redo.clone(),
         agent_storage: agent_storage.to_string(),
+        notes: marker.notes.clone(),
     };
     record_last(data_dir, &last);
     if marker.kind == KIND_RESTORE {
@@ -999,6 +1192,7 @@ pub fn pending_info(data_dir: &Path) -> Option<PendingInfo> {
         staged_at: marker.staged_at,
         files: (marker.files.len() + marker.removals.len()) as u64,
         agent_storage: marker.agent.is_some(),
+        classes: marker.ticked,
     })
 }
 

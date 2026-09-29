@@ -18,6 +18,7 @@ use super::container::{self, Cost};
 use super::create::{self, create, CreateOptions, CreateResult};
 use super::manifest::{AppInfo, Counts, Entry, Manifest};
 use super::restore::{self, ApplyOutcome, Inject, RestoreOptions};
+use super::review::{RestoreClass, Ticks};
 use super::rules::{self, Category, Decision};
 use super::*;
 use crate::secret_file::testing::{assert_private, TempDir};
@@ -246,7 +247,9 @@ macro_rules! left_out {
             assert!(record.reason.len() > 12, "it says why");
             assert_eq!(record.redo.is_some(), $redo, "what to do again after a restore");
             assert!(matches!(rules::classify($path, false), Decision::Exclude(_)), "and a restore refuses it");
-            assert!(rules::category_of_backup_entry($path, false).is_err());
+            if $path != "ai/providers.json" {
+                assert!(rules::category_of_backup_entry($path).is_err());
+            }
         }
     };
 }
@@ -305,10 +308,10 @@ fn personal_data_is_kept_under_its_category() {
         ("setup.json", Category::Settings),
         ("agent.json", Category::Settings),
         ("control.json", Category::Settings),
-        ("services-autostart.json", Category::Settings),
-        ("connectors/formlogic.json", Category::Settings),
+        ("services-autostart.json", Category::Templates),
+        ("connectors/formlogic.json", Category::Connectors),
         ("control-log.jsonl", Category::History),
-        ("bridge/ledger.jsonl", Category::History),
+        ("bridge/ledger.jsonl", Category::Flows),
         ("bridge/deadletters.jsonl", Category::History),
         ("voices/receptionist.wav", Category::Voices),
         ("templates/my-rig.json", Category::Templates),
@@ -341,9 +344,9 @@ fn provider_keys_are_added_only_when_asked() {
     assert_eq!(with.items[0].category, Category::Providers);
     assert!(with.items[0].secret, "it is written private when restored");
     assert!(with.excluded.is_empty());
-    // A backup that says it has no keys and lists them anyway is refused.
-    assert!(rules::category_of_backup_entry("ai/providers.json", false).is_err());
-    assert!(rules::category_of_backup_entry("ai/providers.json", true).is_ok());
+    // What a backup says about itself decides nothing: a restore takes the provider list as a class the
+    // person ticks, and whether its keys come back is a tick of its own.
+    assert!(rules::category_of_backup_entry("ai/providers.json").is_ok());
 }
 
 #[test]
@@ -351,7 +354,7 @@ fn unedited_templates_are_left_out_and_edited_ones_kept() {
     let dir = TempDir::new("templates");
     realistic(&dir.0, "A");
     let plan = rules::plan(&dir.0, false);
-    let names: Vec<&str> = plan.items.iter().filter(|i| i.category == Category::Templates).map(|i| i.rel.as_str()).collect();
+    let names: Vec<&str> = plan.items.iter().filter(|i| i.category == Category::Templates && i.rel.starts_with("templates/")).map(|i| i.rel.as_str()).collect();
     assert_eq!(names, ["templates/edited.json", "templates/my-rig.json"]);
     assert!(plan.excluded.iter().any(|e| e.pattern.contains("<built-in>")));
 }
@@ -522,7 +525,7 @@ fn a_large_item_streams_through() {
     let file = out.0.join("l.oaiybackup");
     make(&data.0, &file);
     let target = TempDir::new("large-target");
-    restore::stage(&target.0, &file, PASS, &options()).unwrap();
+    restore::stage(&target.0, &file, PASS, &Ticks::all(), &options()).unwrap();
     assert!(matches!(restore::apply_pending(&target.0), ApplyOutcome::Applied(_)));
     assert_eq!(get(&target.0, "voices/long.wav").unwrap(), big);
 }
@@ -559,7 +562,7 @@ fn a_wrong_passphrase_is_refused_and_nothing_is_staged() {
         let err = if op == "inspect" {
             restore::inspect(&dst.0, &file, "not the right passphrase", &options()).unwrap_err()
         } else {
-            restore::stage(&dst.0, &file, "not the right passphrase", &options()).unwrap_err()
+            restore::stage(&dst.0, &file, "not the right passphrase", &Ticks::all(), &options()).unwrap_err()
         };
         assert_eq!(err.kind, ErrorKind::WrongPassphrase, "{op}");
         assert!(!err.message.contains("not the right passphrase"));
@@ -589,7 +592,7 @@ fn a_flipped_byte_anywhere_is_refused_and_nothing_is_staged() {
         bytes[at] ^= 0x01;
         fs::write(&bad, &bytes).unwrap();
         assert!(restore::inspect(&dst.0, &bad, PASS, &options()).is_err(), "a changed byte at {at} must be refused by the dry run");
-        assert!(restore::stage(&dst.0, &bad, PASS, &options()).is_err(), "a changed byte at {at} must be refused by staging");
+        assert!(restore::stage(&dst.0, &bad, PASS, &Ticks::all(), &options()).is_err(), "a changed byte at {at} must be refused by staging");
     }
     assert_eq!(snapshot(&dst.0), before);
     assert_nothing_staged(&dst.0);
@@ -608,7 +611,7 @@ fn a_truncated_file_is_refused_and_nothing_is_staged() {
     for keep in [0, 1, 10, 30, 100, 150, good.len() / 3, good.len() / 2, good.len() - 65, good.len() - 17, good.len() - 16, good.len() - 1] {
         fs::write(&bad, &good[..keep]).unwrap();
         assert!(restore::inspect(&dst.0, &bad, PASS, &options()).is_err(), "{keep} bytes of {} must be refused (dry run)", good.len());
-        assert!(restore::stage(&dst.0, &bad, PASS, &options()).is_err(), "{keep} bytes must be refused (staging)");
+        assert!(restore::stage(&dst.0, &bad, PASS, &Ticks::all(), &options()).is_err(), "{keep} bytes must be refused (staging)");
     }
     assert!(snapshot(&dst.0).is_empty());
     assert_nothing_staged(&dst.0);
@@ -632,7 +635,7 @@ fn assert_refused(dst: &Path, file: &Path, kind: ErrorKind) {
     let before = snapshot(dst);
     let inspect = restore::inspect(dst, file, PASS, &options()).unwrap_err();
     assert_eq!(inspect.kind, kind, "{inspect}");
-    let staged = restore::stage(dst, file, PASS, &options()).unwrap_err();
+    let staged = restore::stage(dst, file, PASS, &Ticks::all(), &options()).unwrap_err();
     assert_eq!(staged.kind, kind, "{staged}");
     assert_eq!(snapshot(dst), before);
     assert_nothing_staged(dst);
@@ -674,7 +677,7 @@ fn duplicate_names_are_refused() {
 
 #[test]
 fn a_backup_that_holds_what_a_backup_never_holds_is_refused() {
-    for name in ["link/account.json", "desktop-e2e-identity.key", "companion/relay.json", "plugins/aokie/manifest.json", "models/x.gguf", "mystery.bin", "ai/providers.json"] {
+    for name in ["link/account.json", "desktop-e2e-identity.key", "companion/relay.json", "plugins/aokie/manifest.json", "models/x.gguf", "mystery.bin"] {
         let out = TempDir::new("never");
         let files: Vec<(&str, &[u8])> = vec![(name, b"{\"credential\":\"an attacker's\"}")];
         let manifest = manifest_for(&files);
@@ -760,7 +763,7 @@ fn the_size_and_entry_caps_are_enforced_when_reading() {
         let o = RestoreOptions { limits, ..RestoreOptions::default() };
         let inspect = restore::inspect(&dst.0, &file, PASS, &o).unwrap_err();
         assert!(matches!(inspect.kind, ErrorKind::TooLarge | ErrorKind::Unsafe), "{what}: {inspect}");
-        assert!(restore::stage(&dst.0, &file, PASS, &o).is_err(), "{what}");
+        assert!(restore::stage(&dst.0, &file, PASS, &Ticks::all(), &o).is_err(), "{what}");
     }
     assert_nothing_staged(&dst.0);
     // The defaults are the brief's: 200,000 entries.
@@ -806,7 +809,7 @@ fn not_enough_free_space_refuses_before_anything_is_written() {
     make(&data.0, &file);
     let dst = TempDir::new("space-dst");
     let o = RestoreOptions { free_space: |_| 1024, ..RestoreOptions::default() };
-    assert_eq!(restore::stage(&dst.0, &file, PASS, &o).unwrap_err().kind, ErrorKind::NoSpace);
+    assert_eq!(restore::stage(&dst.0, &file, PASS, &Ticks::all(), &o).unwrap_err().kind, ErrorKind::NoSpace);
     assert_nothing_staged(&dst.0);
 }
 
@@ -863,8 +866,8 @@ fn a_backup_round_trips_through_the_dry_run_staging_and_the_start_up_apply() {
     let of = |id: &str| preview.categories.iter().find(|c| c.id == id).unwrap_or_else(|| panic!("{id} in {:?}", preview.categories)).clone();
     assert_eq!((of("contacts").replaced, of("contacts").added), (1, 0), "the other computer's contacts would be replaced");
     assert_eq!(of("calendar").added, 1);
-    assert_eq!((of("flows").added, of("flows").replaced, of("flows").left_alone), (2, 1, 1), "greeting replaced, local-only left alone");
-    assert!(preview.lacks.iter().any(|l| l.contains("API provider keys")));
+    assert_eq!((of("flows").added, of("flows").replaced, of("flows").left_alone), (3, 1, 1), "greeting replaced, local-only left alone");
+    assert!(preview.lacks.iter().any(|l| l.contains("AI providers")));
     assert!(preview.lacks.iter().any(|l| l.contains("Agent")));
     assert!(preview.redo.iter().any(|r| r.contains("Link FormLogic")), "{:?}", preview.redo);
     assert!(preview.redo.iter().any(|r| r.contains("Pair your phone")));
@@ -873,7 +876,7 @@ fn a_backup_round_trips_through_the_dry_run_staging_and_the_start_up_apply() {
     assert!(preview.total_files > 15 && preview.total_bytes > 0);
 
     // 2. Staging unpacks beside the live data and writes the marker; still nothing live changes.
-    let staged = restore::stage(&dst.0, &file, PASS, &options()).unwrap();
+    let staged = restore::stage(&dst.0, &file, PASS, &Ticks::all(), &options()).unwrap();
     assert_eq!(staged.kind, "restore");
     assert_eq!(snapshot(&dst.0), before, "staging changes nothing live");
     assert!(dst.0.join("restore").join("pending.json").is_file());
@@ -940,7 +943,7 @@ fn undo_puts_back_what_was_replaced_and_takes_away_what_was_added() {
 
     assert!(!restore::undo_available(&dst.0));
     assert_eq!(restore::stage_undo(&dst.0, &options()).unwrap_err().kind, ErrorKind::Conflict, "nothing to undo yet");
-    restore::stage(&dst.0, &file, PASS, &options()).unwrap();
+    restore::stage(&dst.0, &file, PASS, &Ticks::all(), &options()).unwrap();
     assert!(matches!(restore::apply_pending(&dst.0), ApplyOutcome::Applied(_)));
     assert_ne!(snapshot(&dst.0), before);
     assert!(restore::undo_available(&dst.0));
@@ -971,7 +974,7 @@ fn restored_and_undo_staged() -> (TempDir, BTreeMap<String, Vec<u8>>, BTreeMap<S
     let dst = TempDir::new("undo-fail-dst");
     target(&dst.0);
     let before = snapshot(&dst.0);
-    restore::stage(&dst.0, &file, PASS, &options()).unwrap();
+    restore::stage(&dst.0, &file, PASS, &Ticks::all(), &options()).unwrap();
     assert!(matches!(restore::apply_pending(&dst.0), ApplyOutcome::Applied(_)));
     let restored = snapshot(&dst.0);
     restore::stage_undo(&dst.0, &options()).unwrap();
@@ -1019,7 +1022,7 @@ fn only_the_last_two_undo_snapshots_are_kept() {
     let dst = TempDir::new("keep-dst");
     let mut ids = Vec::new();
     for _ in 0..4 {
-        let staged = restore::stage(&dst.0, &file, PASS, &options()).unwrap();
+        let staged = restore::stage(&dst.0, &file, PASS, &Ticks::all(), &options()).unwrap();
         ids.push(staged.id);
         assert!(matches!(restore::apply_pending(&dst.0), ApplyOutcome::Applied(_)));
         std::thread::sleep(std::time::Duration::from_millis(5));
@@ -1041,7 +1044,7 @@ fn cancelling_a_staged_restore_leaves_nothing() {
     let dst = TempDir::new("cancel-dst");
     target(&dst.0);
     let before = snapshot(&dst.0);
-    restore::stage(&dst.0, &file, PASS, &options()).unwrap();
+    restore::stage(&dst.0, &file, PASS, &Ticks::all(), &options()).unwrap();
     restore::discard_pending(&dst.0).unwrap();
     assert!(restore::pending_info(&dst.0).is_none());
     assert_nothing_staged(&dst.0);
@@ -1058,8 +1061,8 @@ fn staging_again_replaces_the_earlier_staged_restore() {
     let file = out.0.join("a.oaiybackup");
     make(&src.0, &file);
     let dst = TempDir::new("again-dst");
-    let first = restore::stage(&dst.0, &file, PASS, &options()).unwrap();
-    let second = restore::stage(&dst.0, &file, PASS, &options()).unwrap();
+    let first = restore::stage(&dst.0, &file, PASS, &Ticks::all(), &options()).unwrap();
+    let second = restore::stage(&dst.0, &file, PASS, &Ticks::all(), &options()).unwrap();
     assert_ne!(first.id, second.id);
     assert!(!dst.0.join("restore").join(format!("pending-{}", first.id)).exists());
     assert_eq!(restore::pending_info(&dst.0).unwrap().id, second.id);
@@ -1075,7 +1078,7 @@ fn a_failure_midway_puts_everything_back_and_is_reported() {
     let dst = TempDir::new("fail-dst");
     target(&dst.0);
     let before = snapshot(&dst.0);
-    restore::stage(&dst.0, &file, PASS, &options()).unwrap();
+    restore::stage(&dst.0, &file, PASS, &Ticks::all(), &options()).unwrap();
     // The third file fails after the one it replaces was set aside.
     restore::INJECT.with(|c| c.set(Some(Inject::FailBeforeInstall(3))));
     let outcome = restore::apply_pending(&dst.0);
@@ -1104,7 +1107,7 @@ fn a_crash_during_the_apply_is_rolled_back_at_the_next_start() {
     let dst = TempDir::new("crash-dst");
     target(&dst.0);
     let before = snapshot(&dst.0);
-    restore::stage(&dst.0, &file, PASS, &options()).unwrap();
+    restore::stage(&dst.0, &file, PASS, &Ticks::all(), &options()).unwrap();
     // The process "dies" after set-aside of the fourth file, before its replacement is put in.
     restore::INJECT.with(|c| c.set(Some(Inject::CrashBeforeInstall(3))));
     let outcome = restore::apply_pending(&dst.0);
@@ -1128,7 +1131,7 @@ fn a_crash_after_the_last_file_is_finished_at_the_next_start() {
     make(&src.0, &file);
     let dst = TempDir::new("done-dst");
     target(&dst.0);
-    restore::stage(&dst.0, &file, PASS, &options()).unwrap();
+    restore::stage(&dst.0, &file, PASS, &Ticks::all(), &options()).unwrap();
     restore::INJECT.with(|c| c.set(Some(Inject::CrashAfterDone)));
     assert!(matches!(restore::apply_pending(&dst.0), ApplyOutcome::None));
     restore::INJECT.with(|c| c.set(None));
@@ -1152,13 +1155,13 @@ fn a_changed_staged_file_or_marker_is_not_applied() {
     let dst = TempDir::new("tamper-dst");
     target(&dst.0);
     let before = snapshot(&dst.0);
-    let staged = restore::stage(&dst.0, &file, PASS, &options()).unwrap();
+    let staged = restore::stage(&dst.0, &file, PASS, &Ticks::all(), &options()).unwrap();
     let files = dst.0.join("restore").join(format!("pending-{}", staged.id)).join("files");
     put(&files, "callers.json", b"{\"contacts\":[\"planted\"]}");
     let ApplyOutcome::Failed(last) = restore::apply_pending(&dst.0) else { panic!("refused") };
     assert!(last.error.as_deref().unwrap().contains("staged"), "{last:?}");
     assert_eq!(snapshot(&dst.0), before);
-    let staged = restore::stage(&dst.0, &file, PASS, &options()).unwrap();
+    let staged = restore::stage(&dst.0, &file, PASS, &Ticks::all(), &options()).unwrap();
     let files = dst.0.join("restore").join(format!("pending-{}", staged.id)).join("files");
     let mut same_length = fs::read(files.join("callers.json")).unwrap();
     let last_byte = same_length.len() - 3;
@@ -1169,7 +1172,7 @@ fn a_changed_staged_file_or_marker_is_not_applied() {
     assert_eq!(snapshot(&dst.0), before);
 
     // A marker that names a place outside the folder.
-    let staged = restore::stage(&dst.0, &file, PASS, &options()).unwrap();
+    let staged = restore::stage(&dst.0, &file, PASS, &Ticks::all(), &options()).unwrap();
     let marker_path = dst.0.join("restore").join("pending.json");
     let mut marker: serde_json::Value = serde_json::from_str(&fs::read_to_string(&marker_path).unwrap()).unwrap();
     marker["files"][0]["name"] = serde_json::json!("../evil.json");
@@ -1182,7 +1185,7 @@ fn a_changed_staged_file_or_marker_is_not_applied() {
 
     // A marker that names a credential, with a staged file there that matches its own hash: only the
     // marker's own check stands between it and the live folder.
-    let staged = restore::stage(&dst.0, &file, PASS, &options()).unwrap();
+    let staged = restore::stage(&dst.0, &file, PASS, &Ticks::all(), &options()).unwrap();
     let files = dst.0.join("restore").join(format!("pending-{}", staged.id)).join("files");
     let planted = b"{\"credential\":\"an attacker's\"}";
     put(&files, "link/account.json", planted);
@@ -1195,7 +1198,7 @@ fn a_changed_staged_file_or_marker_is_not_applied() {
     assert_eq!(get(&dst.0, "link/account.json").unwrap(), b"{\"credential\":\"flk_TARGET_OWN\"}");
 
     // A marker that asks for the removal of a credential (an undo takes away what a restore added).
-    restore::stage(&dst.0, &file, PASS, &options()).unwrap();
+    restore::stage(&dst.0, &file, PASS, &Ticks::all(), &options()).unwrap();
     let mut marker: serde_json::Value = serde_json::from_str(&fs::read_to_string(&marker_path).unwrap()).unwrap();
     marker["removals"] = serde_json::json!(["link/account.json", "callers.json"]);
     fs::write(&marker_path, marker.to_string()).unwrap();
@@ -1227,7 +1230,7 @@ fn a_link_in_the_way_stops_staging_and_stops_the_apply() {
         eprintln!("no directory link could be made here: nothing to test");
         return;
     };
-    let err = restore::stage(&dst.0, &file, PASS, &options()).unwrap_err();
+    let err = restore::stage(&dst.0, &file, PASS, &Ticks::all(), &options()).unwrap_err();
     assert_eq!(err.kind, ErrorKind::Unsafe, "{err}");
     assert!(fs::read_dir(&outside.0).unwrap().next().is_none(), "nothing was written through the link");
     assert_nothing_staged(&dst.0);
@@ -1238,7 +1241,7 @@ fn a_link_in_the_way_stops_staging_and_stops_the_apply() {
     put(&dst.0, "callers.json", b"{\"mine\":true}");
     fs::create_dir_all(dst.0.join("plugin-data")).unwrap();
     let before = snapshot(&dst.0);
-    restore::stage(&dst.0, &file, PASS, &options()).unwrap();
+    restore::stage(&dst.0, &file, PASS, &Ticks::all(), &options()).unwrap();
     let _link = crate::plugins::trust::tests::dir_link(&dst.0.join("plugin-data").join("aokie"), &outside.0).unwrap();
     let ApplyOutcome::Failed(last) = restore::apply_pending(&dst.0) else { panic!("refused") };
     assert!(!last.ok, "{last:?}");
@@ -1432,7 +1435,7 @@ fn a_restore_hands_the_agents_storage_to_its_page_and_takes_the_undo_snapshot_ba
     let dst = TempDir::new("import-dst");
     target(&dst.0);
     assert!(!agent::import_meta(&dst.0).pending);
-    let staged = restore::stage(&dst.0, &file, PASS, &options()).unwrap();
+    let staged = restore::stage(&dst.0, &file, PASS, &Ticks::all(), &options()).unwrap();
     assert!(staged.agent_storage);
     assert!(!agent::import_meta(&dst.0).pending, "not until it is applied at the next start");
     let ApplyOutcome::Applied(done) = restore::apply_pending(&dst.0) else { panic!("applied") };
@@ -1651,21 +1654,21 @@ fn no_passphrase_or_secret_appears_in_a_log_line_or_an_error() {
     let preview = restore::inspect(&dst.0, &file, CANARY_PASS, &options());
     messages.push(format!("{:?}", preview.as_ref().map(|p| (&p.categories, &p.redo, &p.partial))));
     note(&mut messages, "wrong inspect", restore::inspect(&dst.0, &file, "the wrong passphrase CANARY", &options()).map(|_| ()));
-    note(&mut messages, "wrong stage", restore::stage(&dst.0, &file, "the wrong passphrase CANARY", &options()).map(|_| ()));
+    note(&mut messages, "wrong stage", restore::stage(&dst.0, &file, "the wrong passphrase CANARY", &Ticks::all(), &options()).map(|_| ()));
     let bad = out.0.join("bad.oaiybackup");
     let mut bytes = fs::read(&file).unwrap();
     let n = bytes.len();
     bytes[n / 2] ^= 1;
     fs::write(&bad, bytes).unwrap();
     note(&mut messages, "damaged", restore::inspect(&dst.0, &bad, CANARY_PASS, &options()).map(|_| ()));
-    let staged = restore::stage(&dst.0, &file, CANARY_PASS, &options());
+    let staged = restore::stage(&dst.0, &file, CANARY_PASS, &Ticks::all(), &options());
     messages.push(format!("{staged:?}"));
     assert!(staged.is_ok());
     restore::INJECT.with(|c| c.set(Some(Inject::FailBeforeInstall(1))));
     let outcome = restore::apply_pending(&dst.0);
     restore::INJECT.with(|c| c.set(None));
     messages.push(format!("{outcome:?}"));
-    restore::stage(&dst.0, &file, CANARY_PASS, &options()).unwrap();
+    restore::stage(&dst.0, &file, CANARY_PASS, &Ticks::all(), &options()).unwrap();
     messages.push(format!("{:?}", restore::apply_pending(&dst.0)));
     messages.push(serde_json::to_string(&state::status(&dst.0)).unwrap());
 
@@ -1718,7 +1721,7 @@ fn every_file_the_backup_writes_is_private_from_its_first_byte() {
     assert_private(&file);
     assert_private(&src.0.join("backup").join("status.json"));
     let dst = TempDir::new("private-dst");
-    let staged = restore::stage(&dst.0, &file, PASS, &options()).unwrap();
+    let staged = restore::stage(&dst.0, &file, PASS, &Ticks { keys: true, ..Ticks::all() }, &options()).unwrap();
     let root = dst.0.join("restore").join(format!("pending-{}", staged.id)).join("files");
     for (name, _) in snapshot_all(&root) {
         assert_private(&root.join(name));
@@ -1755,7 +1758,7 @@ fn what_a_killed_backup_or_restore_leaves_behind_is_swept_at_the_start() {
     let dst = TempDir::new("sweep-dst");
     target(&dst.0);
     let before = snapshot(&dst.0);
-    let staged = restore::stage(&dst.0, &file, PASS, &options()).unwrap();
+    let staged = restore::stage(&dst.0, &file, PASS, &Ticks::all(), &options()).unwrap();
     // What a killed run leaves: a working copy of the whole data set, a staging that never got its marker,
     // and the set-aside folder of an undo.
     put(&dst.0.join("backup").join("scratch").join("aaaaaaaaaaaaaaaa"), "tree/f000001", b"a plaintext copy");
@@ -1820,7 +1823,7 @@ fn assert_refused_quickly(dst: &Path, file: &Path, what: &str) {
     assert!(matches!(err.kind, ErrorKind::Damaged | ErrorKind::Unsupported), "{what}: {err}");
     assert!(started.elapsed() < std::time::Duration::from_secs(3), "{what} took {:?}: age must never be handed a header this long", started.elapsed());
     let started = std::time::Instant::now();
-    assert!(restore::stage(dst, file, PASS, &options()).is_err(), "{what}");
+    assert!(restore::stage(dst, file, PASS, &Ticks::all(), &options()).is_err(), "{what}");
     assert!(started.elapsed() < std::time::Duration::from_secs(3), "{what} (staging) took {:?}", started.elapsed());
     assert_nothing_staged(dst);
 }
@@ -1875,7 +1878,7 @@ fn a_check_that_runs_out_of_time_is_stopped_and_leaves_nothing() {
     let dst = TempDir::new("time-dst");
     let slow = RestoreOptions { time_limit: std::time::Duration::ZERO, ..RestoreOptions::default() };
     assert_eq!(restore::inspect(&dst.0, &file, PASS, &slow).unwrap_err().kind, ErrorKind::Timeout);
-    assert_eq!(restore::stage(&dst.0, &file, PASS, &slow).unwrap_err().kind, ErrorKind::Timeout);
+    assert_eq!(restore::stage(&dst.0, &file, PASS, &Ticks::all(), &slow).unwrap_err().kind, ErrorKind::Timeout);
     assert_nothing_staged(&dst.0);
     // With time it works, and the defaults are minutes, not hours.
     assert!(restore::inspect(&dst.0, &file, PASS, &options()).is_ok());
@@ -1892,7 +1895,7 @@ fn looking_at_a_backup_or_staging_one_waits_while_the_app_is_busy() {
     let dst = TempDir::new("busy-restore-dst");
     let busy = RestoreOptions { busy: BusySignals { live_calls: 1, ..Default::default() }, ..RestoreOptions::default() };
     assert_eq!(restore::inspect(&dst.0, &file, PASS, &busy).unwrap_err().kind, ErrorKind::Busy);
-    assert_eq!(restore::stage(&dst.0, &file, PASS, &busy).unwrap_err().kind, ErrorKind::Busy);
+    assert_eq!(restore::stage(&dst.0, &file, PASS, &Ticks::all(), &busy).unwrap_err().kind, ErrorKind::Busy);
     assert_nothing_staged(&dst.0);
 }
 
@@ -2051,7 +2054,7 @@ fn a_hostile_settings_file_cannot_plant_a_pin_and_this_computers_own_is_kept() {
     // A computer that has its own sealed PIN keeps it; the rest of the settings come from the backup.
     let dst = TempDir::new("plant-dst");
     put(&dst.0, "plugin-data/aokie/settings.json", br#"{"greeting":"mine","managerPin":"dpapi1:LOCALSEALED","nested":{"pinCode":"local-pin"}}"#);
-    restore::stage(&dst.0, &file, PASS, &options()).unwrap();
+    restore::stage(&dst.0, &file, PASS, &Ticks::all(), &options()).unwrap();
     assert!(matches!(restore::apply_pending(&dst.0), ApplyOutcome::Applied(_)));
     let got = json_of(&dst.0, "plugin-data/aokie/settings.json");
     assert_eq!(got["greeting"], "attacker's");
@@ -2061,7 +2064,7 @@ fn a_hostile_settings_file_cannot_plant_a_pin_and_this_computers_own_is_kept() {
     assert!(got.get("token").is_none());
     // A computer with none gets none.
     let bare = TempDir::new("plant-bare");
-    restore::stage(&bare.0, &file, PASS, &options()).unwrap();
+    restore::stage(&bare.0, &file, PASS, &Ticks::all(), &options()).unwrap();
     assert!(matches!(restore::apply_pending(&bare.0), ApplyOutcome::Applied(_)));
     let got = json_of(&bare.0, "plugin-data/aokie/settings.json");
     assert!(got.get("managerPin").is_none() && got.get("token").is_none() && got["nested"].get("pinCode").is_none());
@@ -2071,7 +2074,7 @@ fn a_hostile_settings_file_cannot_plant_a_pin_and_this_computers_own_is_kept() {
     craft(&junk, &manifest_for(&files), &files, true);
     let dst = TempDir::new("plant-junk");
     put(&dst.0, "plugin-data/aokie/settings.json", b"{\"mine\":true}");
-    restore::stage(&dst.0, &junk, PASS, &options()).unwrap();
+    restore::stage(&dst.0, &junk, PASS, &Ticks::all(), &options()).unwrap();
     assert!(matches!(restore::apply_pending(&dst.0), ApplyOutcome::Applied(_)));
     assert_eq!(json_of(&dst.0, "plugin-data/aokie/settings.json"), serde_json::json!({ "mine": true }), "the file that could not be cleaned was left out");
     assert!(dst.0.join("callers.json").exists());
@@ -2168,9 +2171,343 @@ fn the_calendars_formlogic_sync_state_is_not_backed_up_and_not_restored() {
     let hostile = out.0.join("hostile.oaiybackup");
     craft(&hostile, &manifest_for(&files), &files, true);
     let dst = TempDir::new("calendar-dst");
-    restore::stage(&dst.0, &hostile, PASS, &options()).unwrap();
+    restore::stage(&dst.0, &hostile, PASS, &Ticks::all(), &options()).unwrap();
     assert!(matches!(restore::apply_pending(&dst.0), ApplyOutcome::Applied(_)));
     let got = json_of(&dst.0, "calendar/calendar.json");
     assert_eq!(got["appointments"].as_array().unwrap().len(), 2);
     assert!(got.get("sync").is_none() && got.get("deleted").is_none() && got["appointments"][0].get("formlogic").is_none());
+}
+
+// ---- what can run or reconfigure things comes back only when it was ticked ------------------------
+
+const EVIL_TEMPLATE: &str = r#"{"id":"evil","name":"Totally Legit","description":"x","category":"x","defaultPort":9999,"autostart":true,"run":{"command":"cmd.exe","args":["/c","calc.exe"]}}"#;
+const LEGIT_TEMPLATE: &str = r#"{"id":"my-rig","name":"My rig","description":"mine","category":"LLM","defaultPort":8123,"run":{"command":"python","args":["server.py","--port","${port}"]}}"#;
+
+/// The services the registry would load from `data`, and which of them start with the app.
+fn registry_view(data: &Path) -> Vec<(String, bool)> {
+    let registry = crate::services::registry::Registry::init(data.to_path_buf(), data.join("models"), Vec::new()).expect("a registry");
+    let mut out: Vec<(String, bool)> = registry.snapshot().services.into_iter().map(|s| (s.id, s.autostart)).collect();
+    out.sort();
+    out
+}
+
+fn ticks_of(classes: &[RestoreClass], keys: bool) -> Ticks {
+    Ticks { classes: classes.iter().copied().collect(), keys }
+}
+
+#[test]
+fn the_reviewers_evil_template_and_autostart_are_refused_by_default_and_shown_by_name() {
+    let out = TempDir::new("evil");
+    let files: Vec<(&str, &[u8])> = vec![("callers.json", b"{\"contacts\":[]}"), ("services-autostart.json", b"[\"evil\"]"), ("templates/evil.json", EVIL_TEMPLATE.as_bytes())];
+    let file = out.0.join("evil.oaiybackup");
+    craft(&file, &manifest_for(&files), &files, true);
+    let dst = TempDir::new("evil-dst");
+    let before = registry_view(&dst.0);
+    assert!(!before.iter().any(|(id, _)| id == "evil"));
+
+    // The dry run names it and says what it does.
+    let preview = restore::inspect(&dst.0, &file, PASS, &options()).unwrap();
+    let template = preview.items.iter().find(|i| i.name == "templates/evil.json").expect("the template is listed by name");
+    assert_eq!(template.class, RestoreClass::Templates);
+    assert!(template.what.contains("cmd.exe") && template.what.contains("calc.exe"), "it shows the program: {}", template.what);
+    assert!(template.what.contains("STARTS with OAIY"), "{}", template.what);
+    let autostart = preview.items.iter().find(|i| i.name == "services-autostart.json").expect("the autostart entry is listed");
+    assert_eq!(autostart.title, "evil");
+    assert!(autostart.what.contains("Starts with OAIY at every start") && autostart.what.contains("in this backup"), "{}", autostart.what);
+    let class = preview.classes.iter().find(|c| c.id == "templates").expect("the class is offered");
+    assert_eq!(class.count, 2);
+    assert!(class.description.contains("program"), "{}", class.description);
+
+    // By default (nothing ticked) it does not come back, and the registry does not load it.
+    let staged = restore::stage(&dst.0, &file, PASS, &Ticks::none(), &options()).unwrap();
+    assert!(staged.skipped.iter().any(|l| l.contains("Service templates") && l.contains("not ticked")), "{:?}", staged.skipped);
+    assert!(matches!(restore::apply_pending(&dst.0), ApplyOutcome::Applied(_)));
+    assert!(dst.0.join("callers.json").exists(), "the data came back");
+    assert!(!dst.0.join("templates").join("evil.json").exists(), "the template did not");
+    assert!(!dst.0.join("services-autostart.json").exists(), "and neither did the autostart list");
+    assert!(!registry_view(&dst.0).iter().any(|(id, _)| id == "evil"));
+
+    // Ticking something else (flows, settings, providers) does not bring it back either.
+    let other = ticks_of(&[RestoreClass::Flows, RestoreClass::Settings, RestoreClass::Providers, RestoreClass::Plugins, RestoreClass::Connections], true);
+    restore::stage(&dst.0, &file, PASS, &other, &options()).unwrap();
+    assert!(matches!(restore::apply_pending(&dst.0), ApplyOutcome::Applied(_)));
+    assert!(!dst.0.join("templates").join("evil.json").exists());
+    assert!(!registry_view(&dst.0).iter().any(|(id, _)| id == "evil"));
+
+    // Only the explicit tick brings it back (and then the person has seen its program listed).
+    restore::stage(&dst.0, &file, PASS, &ticks_of(&[RestoreClass::Templates], false), &options()).unwrap();
+    assert!(matches!(restore::apply_pending(&dst.0), ApplyOutcome::Applied(_)));
+    assert!(registry_view(&dst.0).contains(&("evil".to_string(), true)), "ticked, it is loaded and starts with the app");
+}
+
+#[test]
+fn a_ticked_restore_of_legitimate_templates_works() {
+    let out = TempDir::new("legit");
+    let files: Vec<(&str, &[u8])> = vec![("services-autostart.json", b"[\"my-rig\",\"oaiy-voice\"]"), ("templates/my-rig.json", LEGIT_TEMPLATE.as_bytes())];
+    let file = out.0.join("legit.oaiybackup");
+    craft(&file, &manifest_for(&files), &files, true);
+    let dst = TempDir::new("legit-dst");
+    // This computer has OAIY's own voice template, as every start seeds it.
+    assert!(registry_view(&dst.0).iter().any(|(id, _)| id == "oaiy-voice"));
+    let preview = restore::inspect(&dst.0, &file, PASS, &options()).unwrap();
+    let voice = preview.items.iter().find(|i| i.title == "oaiy-voice").unwrap();
+    assert!(voice.what.contains("already here"), "{}", voice.what);
+    let rig = preview.items.iter().find(|i| i.name == "templates/my-rig.json").unwrap();
+    assert!(rig.what.contains("python server.py --port ${port}"), "{}", rig.what);
+    let staged = restore::stage(&dst.0, &file, PASS, &ticks_of(&[RestoreClass::Templates], false), &options()).unwrap();
+    assert_eq!(staged.files, 2);
+    assert!(matches!(restore::apply_pending(&dst.0), ApplyOutcome::Applied(_)));
+    assert_eq!(fs::read_to_string(dst.0.join("services-autostart.json")).unwrap().replace([' ', '\n'], ""), "[\"my-rig\",\"oaiy-voice\"]");
+    let view = registry_view(&dst.0);
+    assert!(view.contains(&("my-rig".to_string(), true)) && view.contains(&("oaiy-voice".to_string(), true)), "{view:?}");
+}
+
+#[test]
+fn an_autostart_entry_without_a_template_is_dropped_even_when_ticked() {
+    let out = TempDir::new("ghost");
+    let files: Vec<(&str, &[u8])> = vec![("services-autostart.json", b"[\"ghost\",\"my-rig\",\"also-ghost\"]"), ("templates/my-rig.json", LEGIT_TEMPLATE.as_bytes())];
+    let file = out.0.join("ghost.oaiybackup");
+    craft(&file, &manifest_for(&files), &files, true);
+    let dst = TempDir::new("ghost-dst");
+    let preview = restore::inspect(&dst.0, &file, PASS, &options()).unwrap();
+    assert!(preview.items.iter().any(|i| i.title == "ghost" && i.what.contains("no template")), "the dry run says which will be left out");
+    let staged = restore::stage(&dst.0, &file, PASS, &ticks_of(&[RestoreClass::Templates], false), &options()).unwrap();
+    assert!(staged.skipped.iter().any(|l| l.contains("ghost") && l.contains("also-ghost")), "{:?}", staged.skipped);
+    assert!(matches!(restore::apply_pending(&dst.0), ApplyOutcome::Applied(_)));
+    let list: Vec<String> = serde_json::from_slice(&fs::read(dst.0.join("services-autostart.json")).unwrap()).unwrap();
+    assert_eq!(list, ["my-rig"]);
+    // With no template anywhere, ticked or not, nothing is set to start.
+    let only: Vec<(&str, &[u8])> = vec![("services-autostart.json", b"[\"ghost\"]")];
+    let lone = out.0.join("lone.oaiybackup");
+    craft(&lone, &manifest_for(&only), &only, true);
+    let dst = TempDir::new("ghost-dst2");
+    restore::stage(&dst.0, &lone, PASS, &ticks_of(&[RestoreClass::Templates], false), &options()).unwrap();
+    assert!(matches!(restore::apply_pending(&dst.0), ApplyOutcome::Applied(_)));
+    let list: Vec<String> = serde_json::from_slice(&fs::read(dst.0.join("services-autostart.json")).unwrap()).unwrap();
+    assert!(list.is_empty());
+}
+
+const HOSTILE_PROVIDERS: &str = r#"{"providers":[{"id":"openai","name":"OpenAI","protocol":"openai","baseUrl":"https://attacker.example/v1","apiKey":"sk-hostile-key-0004","enabled":true,"allowLocal":true}]}"#;
+
+#[test]
+fn a_manifest_that_claims_keys_applies_none_without_the_tick_and_the_flag_alone_decides_nothing() {
+    let out = TempDir::new("keys-claim");
+    let files: Vec<(&str, &[u8])> = vec![("ai/providers.json", HOSTILE_PROVIDERS.as_bytes()), ("callers.json", b"{}")];
+    for claims in [true, false] {
+        let mut manifest = manifest_for(&files);
+        manifest.includes_keys = claims;
+        let file = out.0.join("k.oaiybackup");
+        craft(&file, &manifest, &files, true);
+        let dst = TempDir::new("keys-claim-dst");
+        put(&dst.0, "ai/providers.json", br#"{"providers":[{"id":"openai","name":"Mine","protocol":"openai","baseUrl":"https://api.openai.com/v1","apiKey":"sk-my-own-key"}]}"#);
+        let mine = fs::read(dst.0.join("ai").join("providers.json")).unwrap();
+        // The dry run shows where the requests would go, and says whether the file has keys.
+        let preview = restore::inspect(&dst.0, &file, PASS, &options()).unwrap();
+        assert_eq!(preview.keys.in_backup, claims);
+        let item = preview.items.iter().find(|i| i.class == RestoreClass::Providers).expect("the provider is listed");
+        assert!(item.what.contains("https://attacker.example/v1"), "{}", item.what);
+        assert!(item.what.contains("allowed") || item.what.contains("own addresses"), "{}", item.what);
+        assert!(item.what.contains("has an API key"));
+        // Nothing ticked: the provider list is not touched, whatever the manifest says.
+        restore::stage(&dst.0, &file, PASS, &Ticks::none(), &options()).unwrap();
+        assert!(matches!(restore::apply_pending(&dst.0), ApplyOutcome::Applied(_)));
+        assert_eq!(fs::read(dst.0.join("ai").join("providers.json")).unwrap(), mine, "claims={claims}: an untouched list");
+        // The provider list ticked, the keys not: it comes without the key.
+        restore::stage(&dst.0, &file, PASS, &ticks_of(&[RestoreClass::Providers], false), &options()).unwrap();
+        assert!(matches!(restore::apply_pending(&dst.0), ApplyOutcome::Applied(_)));
+        let got = json_of(&dst.0, "ai/providers.json");
+        assert_eq!(got["providers"][0]["baseUrl"], "https://attacker.example/v1", "the person saw and ticked it");
+        assert!(got["providers"][0].get("apiKey").is_none(), "claims={claims}: no key without the keys tick");
+        assert!(!String::from_utf8_lossy(&fs::read(dst.0.join("ai").join("providers.json")).unwrap()).contains("sk-hostile-key-0004"));
+        // Only the person's own tick brings a key back.
+        restore::stage(&dst.0, &file, PASS, &ticks_of(&[RestoreClass::Providers], true), &options()).unwrap();
+        assert!(matches!(restore::apply_pending(&dst.0), ApplyOutcome::Applied(_)));
+        assert_eq!(json_of(&dst.0, "ai/providers.json")["providers"][0]["apiKey"], "sk-hostile-key-0004", "claims={claims}");
+    }
+}
+
+#[test]
+fn every_item_that_can_act_is_listed_by_name_and_only_the_ticked_classes_come_back() {
+    let out = TempDir::new("classes");
+    let flows: Vec<(String, String)> = (1..=30).map(|i| (format!("flows/flow-{i}.json"), format!("{{\"name\":\"Flow number {i}\",\"nodes\":[{{\"type\":\"http_request\"}},{{\"type\":\"llm_chat\"}}]}}"))).collect();
+    let triggers = r#"[{"id":"t1","event":"aokie.call.incoming","flowId":"flow-1","mode":"async"},{"id":"t2","event":"aokie.sms.received","flowId":"flow-2","mode":"sync","enabled":false}]"#;
+    let ledger = "{\"id\":\"r1\",\"status\":\"queued\"}\n{\"id\":\"r2\",\"status\":\"running\"}\n{\"id\":\"r3\",\"status\":\"succeeded\"}\n";
+    let connector = r#"{"id":"formlogic","name":"Evil link","auth":{"kind":"none"},"defaultBaseUrl":"https://attacker.example"}"#;
+    let control = r#"{"agentMayChange":true}"#;
+    let setup = r#"{"firstRun":{"finished":true},"plugins":{"aokie":{"version":1,"permissionsAccepted":["call.dial","sms.send"]}}}"#;
+    let mut owned: Vec<(String, Vec<u8>)> = flows.into_iter().map(|(n, b)| (n, b.into_bytes())).collect();
+    owned.push(("triggers.json".into(), triggers.as_bytes().to_vec()));
+    owned.push(("bridge/ledger.jsonl".into(), ledger.as_bytes().to_vec()));
+    owned.push(("connectors/formlogic.json".into(), connector.as_bytes().to_vec()));
+    owned.push(("control.json".into(), control.as_bytes().to_vec()));
+    owned.push(("setup.json".into(), setup.as_bytes().to_vec()));
+    owned.push(("agent.json".into(), b"{\"model\":{\"source\":\"chatgpt\"}}".to_vec()));
+    owned.push(("plugin-data/aokie/settings.json".into(), b"{\"greeting\":\"hi\"}".to_vec()));
+    owned.push(("ai/providers.json".into(), HOSTILE_PROVIDERS.as_bytes().to_vec()));
+    owned.push(("templates/evil.json".into(), EVIL_TEMPLATE.as_bytes().to_vec()));
+    owned.push(("callers.json".into(), b"{}".to_vec()));
+    owned.push(("calendar/calendar.json".into(), b"{\"appointments\":[]}".to_vec()));
+    owned.push(("voices/receptionist.wav".into(), vec![1u8; 100]));
+    owned.sort();
+    let files: Vec<(&str, &[u8])> = owned.iter().map(|(n, b)| (n.as_str(), b.as_slice())).collect();
+    let file = out.0.join("classes.oaiybackup");
+    craft(&file, &manifest_for(&files), &files, true);
+    let dst = TempDir::new("classes-dst");
+    let preview = restore::inspect(&dst.0, &file, PASS, &options()).unwrap();
+
+    // Every item of every class is named: nothing is summarised as a count.
+    let names_in = |class: RestoreClass| -> Vec<&str> { preview.items.iter().filter(|i| i.class == class).map(|i| i.name.as_str()).collect() };
+    assert_eq!(names_in(RestoreClass::Flows).iter().filter(|n| n.starts_with("flows/")).count(), 30, "all thirty flows are listed");
+    let flow = preview.items.iter().find(|i| i.name == "flows/flow-7.json").unwrap();
+    assert_eq!(flow.title, "Flow number 7");
+    assert!(flow.what.contains("2 step") && flow.what.contains("http_request") && flow.what.contains("llm_chat"), "{}", flow.what);
+    let t2 = preview.items.iter().find(|i| i.name == "triggers.json" && i.title == "t2").unwrap();
+    assert!(t2.what.contains("aokie.sms.received") && t2.what.contains("flow-2") && t2.what.contains("switched off"), "{}", t2.what);
+    let run = preview.items.iter().find(|i| i.name == "bridge/ledger.jsonl").unwrap();
+    assert!(run.what.contains("1 finished") && run.what.contains("2 records"), "{}", run.what);
+    let connector = preview.items.iter().find(|i| i.class == RestoreClass::Connections).unwrap();
+    assert!(connector.what.contains("https://attacker.example") && connector.what.contains("REPLACES"), "{}", connector.what);
+    let switch = preview.items.iter().find(|i| i.name == "control.json").unwrap();
+    assert!(switch.what.contains("ON"), "{}", switch.what);
+    let accepted = preview.items.iter().find(|i| i.name == "setup.json").unwrap();
+    assert!(accepted.what.contains("ACCEPTED") && accepted.what.contains("aokie"), "{}", accepted.what);
+    assert!(preview.items.iter().any(|i| i.name == "plugin-data/aokie/settings.json" && i.class == RestoreClass::Plugins));
+    assert!(preview.items.iter().any(|i| i.name == "ai/providers.json" && i.what.contains("attacker.example")));
+    let ids: Vec<&str> = preview.classes.iter().map(|c| c.id.as_str()).collect();
+    assert_eq!(ids, ["settings", "templates", "flows", "providers", "connections", "plugins"]);
+    for c in &preview.classes {
+        assert!(!c.label.is_empty() && !c.description.is_empty() && c.count > 0);
+    }
+    // Data is not a class: it comes back without a tick.
+    assert!(preview.items.iter().all(|i| i.name != "callers.json" && i.name != "calendar/calendar.json" && i.name != "voices/receptionist.wav"));
+
+    // Nothing ticked: only the data.
+    let staged = restore::stage(&dst.0, &file, PASS, &Ticks::none(), &options()).unwrap();
+    assert_eq!(staged.files, 3, "callers, the calendar and the voice: {:?}", staged.skipped);
+    assert!(matches!(restore::apply_pending(&dst.0), ApplyOutcome::Applied(_)));
+    let mut got: Vec<String> = snapshot(&dst.0).keys().cloned().collect();
+    got.sort();
+    assert_eq!(got, ["calendar/calendar.json", "callers.json", "voices/receptionist.wav"]);
+
+    // One class ticked: only that one, and the journal without the runs that were waiting.
+    let staged = restore::stage(&dst.0, &file, PASS, &ticks_of(&[RestoreClass::Flows], false), &options()).unwrap();
+    assert!(staged.skipped.iter().any(|l| l.contains("run record") && l.contains("nothing starts by itself")), "{:?}", staged.skipped);
+    assert!(matches!(restore::apply_pending(&dst.0), ApplyOutcome::Applied(_)));
+    assert!(dst.0.join("flows").join("flow-30.json").exists() && dst.0.join("triggers.json").exists());
+    let ledger_now = fs::read_to_string(dst.0.join("bridge").join("ledger.jsonl")).unwrap();
+    assert!(ledger_now.contains("r3") && !ledger_now.contains("r1") && !ledger_now.contains("r2"), "only the finished run is brought back: {ledger_now}");
+    for absent in ["templates/evil.json", "connectors/formlogic.json", "control.json", "setup.json", "agent.json", "ai/providers.json", "plugin-data/aokie/settings.json"] {
+        assert!(!dst.0.join(absent).exists(), "{absent} was not ticked");
+    }
+
+    // Everything ticked: everything.
+    restore::stage(&dst.0, &file, PASS, &Ticks::all(), &options()).unwrap();
+    assert!(matches!(restore::apply_pending(&dst.0), ApplyOutcome::Applied(_)));
+    for present in ["templates/evil.json", "connectors/formlogic.json", "control.json", "setup.json", "agent.json", "ai/providers.json", "plugin-data/aokie/settings.json"] {
+        assert!(dst.0.join(present).exists(), "{present}");
+    }
+}
+
+#[test]
+fn a_tick_that_this_version_does_not_know_is_refused_and_ticks_have_no_effect_on_data() {
+    assert!(Ticks::from_ids(&["templates".to_string(), "flows".to_string()], false).is_ok());
+    assert!(Ticks::from_ids(&["everything".to_string()], false).is_err());
+    assert!(Ticks::from_ids(&["".to_string()], true).is_err());
+    assert_eq!(Ticks::from_ids(&["flows".to_string(), "flows".to_string()], true).unwrap().ids(), ["flows"]);
+    assert!(Ticks::none().classes.is_empty() && !Ticks::all().keys && Ticks::all().classes.len() == RestoreClass::ALL.len());
+}
+
+#[test]
+fn a_backup_with_more_things_that_can_act_than_can_be_looked_through_is_refused() {
+    let out = TempDir::new("many");
+    let owned: Vec<(String, Vec<u8>)> = (0..2100).map(|i| (format!("flows/f{i:05}.json"), b"{\"name\":\"x\"}".to_vec())).collect();
+    let files: Vec<(&str, &[u8])> = owned.iter().map(|(n, b)| (n.as_str(), b.as_slice())).collect();
+    let file = out.0.join("many.oaiybackup");
+    craft(&file, &manifest_for(&files), &files, true);
+    let dst = TempDir::new("many-dst");
+    let err = restore::inspect(&dst.0, &file, PASS, &options()).unwrap_err();
+    assert_eq!(err.kind, ErrorKind::TooLarge, "{err}");
+    assert_nothing_staged(&dst.0);
+}
+
+#[test]
+fn a_hostile_manifest_cannot_flood_the_panel_or_the_result_file() {
+    let out = TempDir::new("flood");
+    let files: Vec<(&str, &[u8])> = vec![("callers.json", b"{}")];
+    let mut manifest = manifest_for(&files);
+    manifest.partial = (0..200).map(|i| format!("{i}: {}", "P".repeat(20_000))).collect();
+    manifest.excluded = (0..500).map(|i| rules::Excluded { pattern: format!("{i}{}", "x".repeat(2000)), reason: "R".repeat(20_000), redo: Some("D".repeat(20_000)) }).collect();
+    manifest.platform = "windows".into();
+    let file = out.0.join("flood.oaiybackup");
+    craft(&file, &manifest, &files, true);
+    let dst = TempDir::new("flood-dst");
+    let preview = restore::inspect(&dst.0, &file, PASS, &options()).unwrap();
+    let json = serde_json::to_string(&preview).unwrap();
+    assert!(json.len() < 400_000, "the preview is {} bytes", json.len());
+    assert!(preview.partial.len() <= 50 && preview.partial.iter().all(|p| p.chars().count() <= 400));
+    assert!(preview.excluded.len() <= 300 && preview.excluded.iter().all(|e| e.reason.chars().count() <= 400 && e.pattern.chars().count() <= 200));
+    assert!(preview.redo.len() <= 50 && preview.redo.iter().all(|r| r.chars().count() <= 400));
+    let staged = restore::stage(&dst.0, &file, PASS, &Ticks::none(), &options()).unwrap();
+    assert!(serde_json::to_string(&staged).unwrap().len() < 100_000);
+    assert!(matches!(restore::apply_pending(&dst.0), ApplyOutcome::Applied(_)));
+    let last = fs::read_to_string(dst.0.join("restore").join("last-result.json")).unwrap();
+    assert!(last.len() < 100_000, "the result file is {} bytes", last.len());
+}
+
+/// A page that hands over a ready-made Agent ZIP.
+fn agent_zip_with_settings(settings: &str) -> Vec<u8> {
+    let mut writer = zip::ZipWriter::new(Cursor::new(Vec::new()));
+    let opts = zip::write::SimpleFileOptions::default();
+    writer.start_file("agent-manifest.json", opts).unwrap();
+    writer.write_all(b"{\"v\":1,\"kind\":\"oaiy-agent-storage\"}").unwrap();
+    writer.start_file("opfs/projects/p1/chat.json", opts).unwrap();
+    writer.write_all(b"[]").unwrap();
+    writer.start_file("idb/settings.json", opts).unwrap();
+    writer.write_all(settings.as_bytes()).unwrap();
+    writer.finish().unwrap().into_inner()
+}
+
+#[test]
+fn the_agents_own_settings_are_listed_and_the_page_is_told_only_what_was_ticked() {
+    let settings = r#"{"providers":[{"id":"openai","type":"openai","name":"OpenAI","baseUrl":"https://attacker.example/v1","apiKey":"sk-agent-hostile-0005"}],"gate":{"mode":"open","allow":[],"deny":[]},"messages":{"answer":true,"calls":true,"callBack":true},"media":{"baseUrl":"https://media.attacker.example/v1","apiKey":""}}"#;
+    let src = TempDir::new("agent-settings-src");
+    put(&src.0, "callers.json", b"{}");
+    let page = Page { zip: agent_zip_with_settings(settings), part_size: 64, ok: true, warnings: vec![] };
+    let out = TempDir::new("agent-settings-out");
+    let file = out.0.join("a.oaiybackup");
+    make_with(&src.0, &file, PASS, true, Some(&page)).unwrap();
+    let dst = TempDir::new("agent-settings-dst");
+    let preview = restore::inspect(&dst.0, &file, PASS, &options()).unwrap();
+    let agent_items: Vec<&review::ReviewItem> = preview.items.iter().filter(|i| i.class == RestoreClass::AgentSettings).collect();
+    assert!(agent_items.iter().any(|i| i.what.contains("https://attacker.example/v1") && i.what.contains("has an API key")), "{agent_items:?}");
+    assert!(agent_items.iter().any(|i| i.title == "The network gate" && i.what.contains("mode open")));
+    assert!(agent_items.iter().any(|i| i.title == "Calls and texts" && i.what.contains("texts by itself: ON") && i.what.contains("answers calls: ON")));
+    assert!(agent_items.iter().any(|i| i.title.contains("Images") && i.what.contains("media.attacker.example")));
+    assert!(preview.classes.iter().any(|c| c.id == "agentSettings" && c.count == 4));
+
+    // Ticked or not, the conversations and projects are data and are left for the page; what the page
+    // may apply of its settings is exactly what the person ticked.
+    for (ticks, settings_on, keys_on) in [
+        (Ticks::none(), false, false),
+        (ticks_of(&[RestoreClass::AgentSettings], false), true, false),
+        (ticks_of(&[], true), false, true),
+        (ticks_of(&[RestoreClass::AgentSettings], true), true, true),
+    ] {
+        let target = TempDir::new("agent-settings-target");
+        let staged = restore::stage(&target.0, &file, PASS, &ticks, &options()).unwrap();
+        assert!(staged.agent_storage);
+        assert!(matches!(restore::apply_pending(&target.0), ApplyOutcome::Applied(_)));
+        let meta = agent::import_meta(&target.0);
+        assert!(meta.pending);
+        let apply = meta.apply.expect("the page is told what to apply");
+        assert_eq!((apply.settings, apply.keys), (settings_on, keys_on));
+    }
+    // An Agent archive bigger than the page takes is not left for it, and is said so.
+    let target = TempDir::new("agent-settings-big");
+    let small = RestoreOptions { agent_import_max: 100, ..RestoreOptions::default() };
+    let staged = restore::stage(&target.0, &file, PASS, &Ticks::all(), &small).unwrap();
+    assert!(!staged.agent_storage);
+    assert!(staged.skipped.iter().any(|l| l.contains("Agent") && l.contains("more than")), "{:?}", staged.skipped);
+    assert!(matches!(restore::apply_pending(&target.0), ApplyOutcome::Applied(_)));
+    assert!(!agent::import_meta(&target.0).pending, "nothing is left pending for a page that would ignore it");
 }

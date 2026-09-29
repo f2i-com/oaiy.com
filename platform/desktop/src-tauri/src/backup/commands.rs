@@ -17,6 +17,7 @@ use super::agent::AgentExport;
 use super::busy::{local_signals, BusySignals};
 use super::create::{create, CreateOptions, CreateResult};
 use super::restore::{self, Preview, RestoreOptions, Staged};
+use super::review::Ticks;
 use super::EXTENSION;
 use crate::services::downloads::{DownloadStatus, DownloadsHandle};
 use crate::services::python::PythonHandle;
@@ -192,8 +193,10 @@ pub async fn backup_restore_inspect<R: Runtime>(app: AppHandle<R>, webview: Webv
 /// Restore, step 2: unpack the backup that was just checked into the staging folder and note that it
 /// is to be applied at the next start. Nothing live changes.
 #[tauri::command]
-pub async fn backup_restore_stage<R: Runtime>(app: AppHandle<R>, webview: Webview<R>, inspect_id: String, passphrase: String) -> Result<Staged, String> {
+pub async fn backup_restore_stage<R: Runtime>(app: AppHandle<R>, webview: Webview<R>, inspect_id: String, passphrase: String, classes: Vec<String>, keys: bool) -> Result<Staged, String> {
     dashboard(&webview)?;
+    // What the person ticked: nothing that can run or reconfigure comes back without it.
+    let ticks = Ticks::from_ids(&classes, keys).map_err(|e| e.message)?;
     let data_dir = data_dir_of(&app)?;
     let path = {
         let guard = INSPECTED.lock().unwrap_or_else(|e| e.into_inner());
@@ -205,7 +208,7 @@ pub async fn backup_restore_stage<R: Runtime>(app: AppHandle<R>, webview: Webvie
         inspected.path.clone()
     };
     let options = RestoreOptions { busy: gather_busy(&app).await, ..RestoreOptions::default() };
-    let staged = with_time_limit(tokio::task::spawn_blocking(move || restore::stage(&data_dir, &path, &passphrase, &options)))
+    let staged = with_time_limit(tokio::task::spawn_blocking(move || restore::stage(&data_dir, &path, &passphrase, &ticks, &options)))
         .await
         .map_err(|e| e.message)?;
     *INSPECTED.lock().unwrap_or_else(|e| e.into_inner()) = None;

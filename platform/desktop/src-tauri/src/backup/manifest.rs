@@ -98,7 +98,7 @@ impl Manifest {
                 return Err(BackupError::new(ErrorKind::TooLarge, "An item in this backup is larger than OAIY will restore."));
             }
             total = total.saturating_add(entry.size);
-            super::rules::category_of_backup_entry(&entry.name, self.includes_keys)
+            super::rules::category_of_backup_entry(&entry.name)
                 .map_err(|why| BackupError::new(ErrorKind::Unsafe, format!("This backup is refused: {why}.")))?;
         }
         if total > limits.max_total_bytes {

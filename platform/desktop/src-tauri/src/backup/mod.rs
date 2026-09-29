@@ -37,6 +37,7 @@ pub mod container;
 pub mod create;
 pub mod manifest;
 pub mod restore;
+pub mod review;
 pub mod routes;
 pub mod rules;
 pub mod sanitize;

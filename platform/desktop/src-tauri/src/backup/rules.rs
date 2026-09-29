@@ -31,11 +31,12 @@ pub enum Category {
     Templates,
     PluginData,
     Providers,
+    Connectors,
     Agent,
 }
 
 impl Category {
-    pub const ALL: [Category; 10] = [
+    pub const ALL: [Category; 11] = [
         Category::Contacts,
         Category::Calendar,
         Category::Flows,
@@ -45,6 +46,7 @@ impl Category {
         Category::Templates,
         Category::PluginData,
         Category::Providers,
+        Category::Connectors,
         Category::Agent,
     ];
 
@@ -59,6 +61,7 @@ impl Category {
             Category::Templates => "templates",
             Category::PluginData => "pluginData",
             Category::Providers => "providers",
+            Category::Connectors => "connectors",
             Category::Agent => "agent",
         }
     }
@@ -74,7 +77,8 @@ impl Category {
             Category::Voices => "Voices",
             Category::Templates => "Service templates you edited or added",
             Category::PluginData => "Plugin data",
-            Category::Providers => "API provider keys",
+            Category::Providers => "AI providers and their API keys",
+            Category::Connectors => "Connector descriptors",
             Category::Agent => "Agent conversations and projects",
         }
     }
@@ -337,13 +341,14 @@ fn include_category(p: &str) -> Option<(Category, bool)> {
     let slashes = p.matches('/').count();
     match p {
         "callers.json" => Some((Category::Contacts, false)),
-        "triggers.json" => Some((Category::Flows, false)),
-        "setup.json" | "agent.json" | "control.json" | "services-autostart.json" => Some((Category::Settings, false)),
-        "control-log.jsonl" | "control-log.jsonl.1" | "bridge/ledger.jsonl" | "bridge/deadletters.jsonl" => Some((Category::History, false)),
+        "triggers.json" | "bridge/ledger.jsonl" => Some((Category::Flows, false)),
+        "setup.json" | "agent.json" | "control.json" => Some((Category::Settings, false)),
+        "services-autostart.json" => Some((Category::Templates, false)),
+        "control-log.jsonl" | "control-log.jsonl.1" | "bridge/deadletters.jsonl" => Some((Category::History, false)),
         "ai/providers.json" => Some((Category::Providers, true)),
         "calendar/calendar.json" => Some((Category::Calendar, false)),
         _ if under(p, "flows") && p != "flows" => Some((Category::Flows, false)),
-        _ if under(p, "connectors") && p != "connectors" => Some((Category::Settings, false)),
+        _ if under(p, "connectors") && p != "connectors" && slashes == 1 && p.ends_with(".json") => Some((Category::Connectors, false)),
         _ if under(p, "voices") && p != "voices" && slashes == 1 && voice_file_ok(p) => Some((Category::Voices, false)),
         _ if under(p, "templates") && slashes == 1 && p.ends_with(".json") => Some((Category::Templates, false)),
         // plugin-data/<id>/<file>: only the files of a plugin on the list
@@ -402,12 +407,14 @@ pub fn classify_dir(rel: &str, include_keys: bool) -> Decision {
 }
 
 /// The category a name in a backup belongs to, or why the backup must be refused for holding it.
-/// Used when a backup is read: nothing that a backup never holds may come in through one.
-pub fn category_of_backup_entry(name: &str, include_keys: bool) -> Result<(Category, bool), String> {
+/// Used when a backup is read: nothing that a backup never holds may come in through one. What a
+/// backup says about itself (that it holds keys, say) plays no part: whether the provider list comes
+/// back, and with or without its keys, is what the person ticks when restoring.
+pub fn category_of_backup_entry(name: &str) -> Result<(Category, bool), String> {
     if name == super::AGENT_ENTRY {
         return Ok((Category::Agent, false));
     }
-    match classify(name, include_keys) {
+    match classify(name, true) {
         Decision::Include { category, secret } => Ok((category, secret)),
         Decision::Exclude(rule) => Err(format!("it holds an item OAIY never backs up ({})", rule.pattern)),
         Decision::Unknown => Err("it holds an item that OAIY does not recognise".to_string()),

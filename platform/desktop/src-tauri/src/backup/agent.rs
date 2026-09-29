@@ -36,6 +36,10 @@ pub const PART_SIZE: usize = 4 * 1024 * 1024;
 /// What the backup says when the Agent's storage could not be included.
 pub const MISSING_WARNING: &str = "Agent conversations and projects were not included: open the Agent and try again";
 
+/// The largest Agent storage that is left for its page to take back: the page takes no more than this,
+/// so a larger one would wait for ever.
+pub const IMPORT_MAX: u64 = 2 << 30;
+
 /// The most an export may add up to (compressed), whatever the page says.
 pub const MAX_EXPORT_BYTES: u64 = 1 << 30;
 
@@ -305,6 +309,21 @@ pub struct PendingImport {
     pub kind: String,
     pub size: u64,
     pub sha256: String,
+    /// The person ticked the Agent's own settings (its providers, gate, how it answers): the page
+    /// applies its settings file only if this is true.
+    #[serde(default)]
+    pub apply_settings: bool,
+    /// The person ticked the API keys: only then may the page take a key from the backup.
+    #[serde(default)]
+    pub apply_keys: bool,
+}
+
+/// What the page applies of the settings in the storage it takes back.
+#[derive(Clone, Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ImportApply {
+    pub settings: bool,
+    pub keys: bool,
 }
 
 /// What the page is told.
@@ -326,6 +345,8 @@ pub struct ImportMeta {
     pub parts: Option<u64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub part_size: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub apply: Option<ImportApply>,
 }
 
 /// The token the page uses for the import in this run of the app: a new one each start, so a
@@ -344,13 +365,13 @@ pub(crate) fn read_pending_import(data_dir: &Path) -> Option<PendingImport> {
 }
 
 /// Leave `zip` (which is moved) for the page to import, replacing anything left from before.
-pub(crate) fn leave_for_page(data_dir: &Path, id: &str, kind: &str, zip: &Path) -> std::io::Result<()> {
+pub(crate) fn leave_for_page(data_dir: &Path, id: &str, kind: &str, zip: &Path, apply_settings: bool, apply_keys: bool) -> std::io::Result<()> {
     let dir = import_dir(data_dir);
     secret_file::create_private_dir(&dir)?;
     let (sha256, size) = sha256_file(zip)?;
     let _ = std::fs::remove_file(dir.join("current.json"));
     secret_file::rename_over(zip, &dir.join("current.zip"))?;
-    let meta = PendingImport { id: id.to_string(), kind: kind.to_string(), size, sha256 };
+    let meta = PendingImport { id: id.to_string(), kind: kind.to_string(), size, sha256, apply_settings, apply_keys };
     secret_file::write(&dir.join("current.json"), serde_json::to_string_pretty(&meta).unwrap_or_default())
 }
 
@@ -364,12 +385,13 @@ pub(crate) fn drop_pending_import(data_dir: &Path) {
 /// `GET /api/backup/agent-import`.
 pub fn import_meta(data_dir: &Path) -> ImportMeta {
     match read_pending_import(data_dir) {
-        None => ImportMeta { pending: false, id: None, token: None, kind: None, size: None, sha256: None, parts: None, part_size: None },
+        None => ImportMeta { pending: false, id: None, token: None, kind: None, size: None, sha256: None, parts: None, part_size: None, apply: None },
         Some(p) => ImportMeta {
             pending: true,
             token: Some(import_token().to_string()),
             parts: Some(p.size.div_ceil(PART_SIZE as u64)),
             part_size: Some(PART_SIZE as u64),
+            apply: Some(ImportApply { settings: p.apply_settings, keys: p.apply_keys }),
             kind: Some(p.kind),
             size: Some(p.size),
             sha256: Some(p.sha256),

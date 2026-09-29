@@ -369,7 +369,7 @@ pub(crate) fn open_backup(enc: &Path, passphrase: &str, scratch: &Path, limits: 
 
 /// Unpack every entry of a verified backup, each into the path `dest_for` gives it, streaming and
 /// checking each entry's hash again as it is written. The destination files are new and private.
-pub(crate) fn extract_all(verified: &Verified, mut dest_for: impl FnMut(&Entry) -> Result<PathBuf>, budget: &Budget) -> Result<()> {
+pub(crate) fn extract_all(verified: &Verified, mut dest_for: impl FnMut(&Entry) -> Result<Option<PathBuf>>, budget: &Budget) -> Result<()> {
     let file = File::open(&verified.plain).map_err(|e| BackupError::io("Could not read the staged backup", &e))?;
     let mut archive = ZipArchive::new(BufReader::new(file)).map_err(|_| damaged())?;
     let mut buf = vec![0u8; COPY_BUF];
@@ -380,7 +380,8 @@ pub(crate) fn extract_all(verified: &Verified, mut dest_for: impl FnMut(&Entry) 
         let Some(wanted) = verified.manifest.entries.iter().find(|e| e.name == name) else {
             return Err(damaged());
         };
-        let dest = dest_for(wanted)?;
+        // An entry that is not wanted (a class the person did not tick) is not read.
+        let Some(dest) = dest_for(wanted)? else { continue };
         if let Some(parent) = dest.parent() {
             secret_file::create_private_dir(parent).map_err(|e| BackupError::io("Could not make a folder to restore into", &e))?;
         }
@@ -406,4 +407,53 @@ pub(crate) fn extract_all(verified: &Verified, mut dest_for: impl FnMut(&Entry) 
         }
     }
     Ok(())
+}
+
+/// A ZIP opened for reading a few of its entries (a verified backup's plaintext).
+pub(crate) type Archive = ZipArchive<BufReader<File>>;
+
+pub(crate) fn open_archive(plain: &Path) -> Result<Archive> {
+    let file = File::open(plain).map_err(|e| BackupError::io("Could not read the staged backup", &e))?;
+    ZipArchive::new(BufReader::new(file)).map_err(|_| damaged())
+}
+
+/// One entry's bytes, when it is there and no larger than `max` (else `None`).
+pub(crate) fn read_entry(archive: &mut Archive, name: &str, max: u64) -> Result<Option<Vec<u8>>> {
+    let entry = match archive.by_name(name) {
+        Ok(e) => e,
+        Err(_) => return Ok(None),
+    };
+    if entry.size() > max {
+        return Ok(None);
+    }
+    let mut bytes = Vec::new();
+    entry.take(max + 1).read_to_end(&mut bytes).map_err(|_| damaged())?;
+    Ok((bytes.len() as u64 <= max).then_some(bytes))
+}
+
+/// One entry of a ZIP that is itself an entry of `archive` (the Agent's storage), copied to `scratch`
+/// to be read. `None` when either is not there, or the inner one is larger than `max`.
+pub(crate) fn read_nested_entry(archive: &mut Archive, outer: &str, inner: &str, scratch: &Path, max: u64, budget: &Budget) -> Result<Option<Vec<u8>>> {
+    let path = scratch.join("nested.zip");
+    {
+        let Ok(entry) = archive.by_name(outer) else { return Ok(None) };
+        let mut reader = entry;
+        let mut out = BufWriter::with_capacity(COPY_BUF, secret_file::create_new_owner_only(&path).map_err(|e| BackupError::io("Could not stage the Agent's storage", &e))?);
+        let mut buf = vec![0u8; COPY_BUF];
+        loop {
+            budget.check()?;
+            let n = reader.read(&mut buf).map_err(|_| damaged())?;
+            if n == 0 {
+                break;
+            }
+            out.write_all(&buf[..n]).map_err(|e| BackupError::io("Could not stage the Agent's storage", &e))?;
+        }
+        out.flush().map_err(|e| BackupError::io("Could not stage the Agent's storage", &e))?;
+    }
+    let found = (|| -> Result<Option<Vec<u8>>> {
+        let Ok(mut nested) = open_archive(&path) else { return Ok(None) };
+        read_entry(&mut nested, inner, max)
+    })();
+    let _ = std::fs::remove_file(&path);
+    found
 }
