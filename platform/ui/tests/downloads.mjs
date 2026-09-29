@@ -170,14 +170,112 @@ await check('a Mac, an iPhone, an iPad and an Android device get the sentence, a
   }
 });
 
-await check('Linux on ARM or 32-bit x86 is not offered files that would not run', () => {
-  for (const arch of ['arm', 'x86']) {
-    const plan = D.downloadPlan({ os: 'linux', arch }, '0.1.0');
-    assert.equal(plan.primary, null);
-    assert.deepEqual(plan.others, []);
-    assert.match(plan.note, /64-bit x86.*web app works in your browser/);
+const NEEDS_64 = /^OAIY Desktop needs a 64-bit Intel or AMD computer, and this looks like (an ARM|a 32-bit) one\. The web app works in your browser\.$/;
+
+await check('an ARM or 32-bit computer, on Windows or Linux, gets the honest sentence and no button that would install what cannot run; the files are listed for anyone who knows better', () => {
+  for (const os of ['windows', 'linux']) {
+    for (const [arch, which] of [['arm', 'an ARM'], ['x86', 'a 32-bit']]) {
+      const plan = D.downloadPlan({ os, arch }, 'v0.1.0');
+      assert.equal(plan.primary, null, `${os} ${arch}`);
+      assert.match(plan.note, NEEDS_64);
+      assert.ok(plan.note.includes(which));
+      assert.ok(plan.others.length >= 3, 'the files are listed');
+      assert.ok(plan.others.every((o) => o.href.startsWith(`${releases}/download/v0.1.0/oaiy-`)), 'the same addresses as for anyone else');
+      assert.equal(plan.allDownloads, releases);
+      // with no version there is nothing to list but the releases page
+      const bare = D.downloadPlan({ os, arch }, undefined);
+      assert.equal(bare.primary, null);
+      assert.deepEqual(bare.others, []);
+      assert.match(bare.note, NEEDS_64);
+    }
   }
-  assert.ok(D.downloadPlan({ os: 'linux', arch: 'unknown' }, '0.1.0').primary, 'an architecture the user agent does not give is offered the files');
+  assert.equal(D.downloadPlan({ os: 'windows', arch: 'arm' }, 'v0.1.0').others[0].file, 'oaiy-desktop-0.1.0-windows-x64-setup.exe');
+  assert.equal(D.downloadPlan({ os: 'linux', arch: 'arm' }, 'v0.1.0').others[0].file, 'oaiy-desktop-0.1.0-linux-x86_64.AppImage');
+  // an architecture nobody has said is offered the files, as before
+  assert.ok(D.downloadPlan({ os: 'linux', arch: 'unknown' }, 'v0.1.0').primary);
+  assert.ok(D.downloadPlan({ os: 'windows', arch: 'unknown' }, 'v0.1.0').primary);
+  assert.ok(D.downloadPlan({ os: 'windows', arch: 'x64' }, 'v0.1.0').primary);
+});
+
+await check('a 32-bit user agent on Windows ("Win32; x86") is not a 64-bit one', () => {
+  assert.deepEqual(D.detectDevice({ userAgent: 'Mozilla/5.0 (Windows NT 6.1; Win32; x86) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/109.0.0.0 Safari/537.36' }), { os: 'windows', arch: 'x86' });
+  assert.equal(D.detectDevice({ userAgent: UA.windowsChrome }).arch, 'x64');
+  assert.equal(D.detectDevice({ userAgent: UA.linuxChrome }).arch, 'x64', 'x86_64 is not 32-bit');
+});
+
+await check('Linux that reports a touch screen, or says it is on a phone, is a phone or a tablet: Android asked for the desktop site says "Linux x86_64"', () => {
+  const desktopSite = 'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/141.0.0.0 Safari/537.36';
+  assert.equal(os({ userAgent: desktopSite, uaPlatform: 'Linux', maxTouchPoints: 5 }), 'android', 'the reviewer\'s case');
+  assert.equal(os({ userAgent: desktopSite, uaPlatform: 'Linux', mobile: true }), 'android');
+  assert.equal(os({ userAgent: desktopSite, maxTouchPoints: 5 }), 'android', 'and where the browser has no userAgentData');
+  assert.equal(os({ userAgent: UA.linuxFirefox, maxTouchPoints: 10 }), 'android');
+  assert.equal(os({ userAgent: desktopSite, uaPlatform: 'Linux', maxTouchPoints: 0 }), 'linux');
+  assert.equal(os({ userAgent: desktopSite, uaPlatform: 'Linux', maxTouchPoints: 1 }), 'linux', 'one is not a screen');
+  assert.equal(os({ userAgent: desktopSite, uaPlatform: 'Linux', mobile: false, maxTouchPoints: 0 }), 'linux');
+  // a Windows machine with a touch screen is still Windows
+  assert.equal(os({ userAgent: UA.windowsChrome, uaPlatform: 'Windows', maxTouchPoints: 10 }), 'windows');
+  const plan = D.downloadPlan(D.detectDevice({ userAgent: desktopSite, uaPlatform: 'Linux', maxTouchPoints: 5 }), 'v0.1.0');
+  assert.equal(plan.primary, null);
+  assert.equal(plan.note, 'OAIY Desktop is for Windows and Linux. The web app works in your browser.');
+});
+
+const high = (architecture, bitness) => ({ architecture, bitness });
+const LIN_GUESS = { os: 'linux', arch: 'x64' };
+
+await check('what the browser says of its processor: ARM Linux that calls itself x86_64, Windows on ARM, 32-bit Windows; anything else leaves the guess', () => {
+  assert.deepEqual(D.withHighEntropy(LIN_GUESS, high('arm', '64')), { os: 'linux', arch: 'arm' }, 'the reviewer\'s ARM64 Chrome');
+  assert.deepEqual(D.withHighEntropy(WIN, high('arm', '64')), { os: 'windows', arch: 'arm' }, 'Windows on ARM');
+  assert.deepEqual(D.withHighEntropy(WIN, high('arm', '32')), { os: 'windows', arch: 'arm' });
+  assert.deepEqual(D.withHighEntropy(WIN, high('x86', '32')), { os: 'windows', arch: 'x86' }, '32-bit Windows');
+  assert.deepEqual(D.withHighEntropy({ os: 'windows', arch: 'unknown' }, high('x86', '64')), { os: 'windows', arch: 'x64' });
+  assert.deepEqual(D.withHighEntropy(WIN, high('x86', '64')), WIN);
+  // x86 with no bitness is not proof of 64 bits: the guess stands, whichever it was
+  assert.deepEqual(D.withHighEntropy({ os: 'windows', arch: 'x86' }, high('x86', '')), { os: 'windows', arch: 'x86' });
+  assert.deepEqual(D.withHighEntropy({ os: 'windows', arch: 'unknown' }, high('x86', '')), { os: 'windows', arch: 'unknown' });
+  assert.deepEqual(D.withHighEntropy(WIN, high('X86', '32')), { os: 'windows', arch: 'x86' }, 'case does not matter');
+  for (const nothing of [high('', ''), high('x86', ''), high(undefined, undefined), high(7, {}), high('riscv', '64'), {}, null, undefined]) {
+    assert.deepEqual(D.withHighEntropy(WIN, nothing), WIN, JSON.stringify(nothing));
+  }
+  const same = D.withHighEntropy(WIN, high('x86', '64'));
+  assert.equal(same, WIN, 'no change is the same object');
+  assert.equal(D.withHighEntropy({ os: 'mac', arch: 'unknown' }, high('arm', '64')).os, 'mac', 'the system is never changed by it');
+});
+
+await check('refineDevice asks the browser (userAgentData.getHighEntropyValues) for the architecture and the bitness, and nothing else', async () => {
+  const asked = [];
+  const uaData = { getHighEntropyValues: async (hints) => { asked.push(hints); return high('arm', '64'); } };
+  assert.deepEqual(await D.refineDevice(LIN_GUESS, uaData), { os: 'linux', arch: 'arm' });
+  assert.deepEqual(asked, [['architecture', 'bitness']]);
+  // the method is called on the object (a browser refuses it otherwise)
+  const strict = { tag: 'strict', getHighEntropyValues(hints) { if (this.tag !== 'strict') throw new TypeError('Illegal invocation'); return Promise.resolve(high('x86', '32')); } };
+  assert.deepEqual(await D.refineDevice(WIN, strict), { os: 'windows', arch: 'x86' });
+});
+
+await check('no userAgentData (Firefox, Safari), one that has no such method, one that refuses or fails: the device is left as it was', async () => {
+  for (const uaData of [undefined, null, {}, { getHighEntropyValues: 'no' }, { getHighEntropyValues: async () => { throw new DOMException('not allowed', 'NotAllowedError'); } }, { getHighEntropyValues: () => { throw new Error('sync'); } }, { getHighEntropyValues: async () => 'garbage' }]) {
+    assert.equal(await D.refineDevice(WIN, uaData), WIN);
+  }
+});
+
+await check('the whole path for each case: a guess, the browser\'s answer, the plan', async () => {
+  const plan = async (guess, answer) => D.downloadPlan(await D.refineDevice(guess, { getHighEntropyValues: async () => answer }), 'v0.1.0');
+  const armLinux = await plan(D.detectDevice({ userAgent: UA.linuxChrome, uaPlatform: 'Linux' }), high('arm', '64'));
+  assert.equal(armLinux.primary, null);
+  assert.match(armLinux.note, NEEDS_64);
+  const winArm = await plan(D.detectDevice({ userAgent: UA.windowsChrome, uaPlatform: 'Windows' }), high('arm', '64'));
+  assert.equal(winArm.primary, null);
+  assert.match(winArm.note, /an ARM one/);
+  const win32 = await plan(D.detectDevice({ userAgent: UA.windowsChrome, uaPlatform: 'Windows' }), high('x86', '32'));
+  assert.equal(win32.primary, null);
+  assert.match(win32.note, /a 32-bit one/);
+  const win64 = await plan(D.detectDevice({ userAgent: UA.windowsChrome, uaPlatform: 'Windows' }), high('x86', '64'));
+  assert.equal(win64.primary.file, 'oaiy-desktop-0.1.0-windows-x64-setup.exe');
+  const linux64 = await plan(D.detectDevice({ userAgent: UA.linuxChrome, uaPlatform: 'Linux' }), high('x86', '64'));
+  assert.equal(linux64.primary.file, 'oaiy-desktop-0.1.0-linux-x86_64.AppImage');
+  // without userAgentData the user agent string is all there is: Firefox on ARM Linux still says aarch64
+  const firefoxArm = D.downloadPlan(D.detectDevice({ userAgent: UA.linuxArm }), 'v0.1.0');
+  assert.equal(firefoxArm.primary, null);
+  assert.match(firefoxArm.note, NEEDS_64);
 });
 
 await check('a device that cannot be told gets the latest release, and is told the files are for Windows and Linux', () => {
@@ -240,6 +338,8 @@ await check('the helper reads nothing and asks nothing: no fetch, no XMLHttpRequ
   const env = fs.readFileSync(path.join(UI, 'src', 'lib', 'downloadsEnv.ts'), 'utf8').replace(/\/\*[\s\S]*?\*\//g, '');
   assert.doesNotMatch(env, /fetch\s*\(|XMLHttpRequest|api\.github\.com/);
   const component = fs.readFileSync(path.join(UI, 'src', 'components', 'DownloadDesktop.tsx'), 'utf8').replace(/\/\*[\s\S]*?\*\//g, '');
+  assert.match(component, /refinedDevice\(device\)/, 'the page asks the browser after the first draw');
+  assert.match(component, /useState\(currentDevice\)/, 'and is first drawn from the guess');
   assert.doesNotMatch(component, /fetch\s*\(|XMLHttpRequest|api\.github\.com|127\.0\.0\.1|localhost|desktopDetection/, 'no request and no probe of a desktop');
 });
 

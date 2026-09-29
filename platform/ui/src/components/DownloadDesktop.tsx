@@ -1,6 +1,6 @@
-import { useMemo } from 'react';
+import { useEffect, useMemo, useState } from 'react';
 import { inOaiyWindow } from '../lib/oaiyWindow';
-import { currentDownloadPlan } from '../lib/downloadsEnv';
+import { currentDevice, downloadPlanFor, refinedDevice } from '../lib/downloadsEnv';
 
 /**
  * "Download OAIY Desktop", for the device the page is on.
@@ -28,7 +28,20 @@ export type DownloadVariant = 'hero' | 'primary' | 'compact' | 'card';
 const ABOUT = { label: 'About OAIY Desktop', href: 'desktop.html' };
 
 export default function DownloadDesktop({ variant = 'hero', fallback = ABOUT }: { variant?: DownloadVariant; fallback?: { label: string; href: string } }) {
-  const plan = useMemo(() => currentDownloadPlan(), []);
+  const [device, setDevice] = useState(currentDevice);
+  // The user agent cannot tell ARM Linux or 32-bit Windows from x64; the browser can, when asked (no network), so the
+  // first draw is the guess and this is the answer.
+  useEffect(() => {
+    let live = true;
+    void refinedDevice(device).then((refined) => {
+      if (live) setDevice(refined);
+    });
+    return () => {
+      live = false;
+    };
+    // eslint-disable-next-line react-hooks/exhaustive-deps -- asked once, from the guess the page was drawn with
+  }, []);
+  const plan = useMemo(() => downloadPlanFor(device), [device]);
   if (inOaiyWindow()) return null;
 
   if (variant === 'compact') {

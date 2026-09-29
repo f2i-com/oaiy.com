@@ -51,8 +51,11 @@ the compiler sandbox worker.
 
 `components/DownloadDesktop.tsx` (on the landing and desktop pages, and in the editor's sidebar and Settings while no desktop
 answers) offers the OAIY Desktop file for the visitor's system: the Windows installer, or the Linux AppImage with `.deb`, `.rpm`
-and the headless server under "other downloads". A Mac or a phone is told OAIY Desktop is for Windows and Linux. The system comes
-from what the browser already says of itself (`lib/downloads.ts`); there is no request and no probe of a desktop.
+and the headless server under "other downloads". A Mac or a phone is told OAIY Desktop is for Windows and Linux (Linux with a touch screen is a phone, as Android asked for the
+desktop site is), and a 32-bit or ARM computer, which the files are not built for, is told so and not given an installer button
+(the files stay listed). The system comes from what the browser already says of itself (`lib/downloads.ts`), and the processor is
+asked of the browser after the first draw (`userAgentData.getHighEntropyValues`, a call in the page: the user agent string is
+frozen and says x64 on ARM); there is no request and no probe of a desktop.
 
 The links are **made when the site is built**: the files' names carry the release's version, so `VITE_OAIY_RELEASE_TAG` (the
 tag the release was pushed as, `github.ref_name`, set by the release workflow's web job) is baked into the build. The release is

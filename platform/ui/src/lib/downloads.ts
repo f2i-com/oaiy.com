@@ -26,7 +26,7 @@ export type Arch = 'x64' | 'arm' | 'x86' | 'unknown';
 
 export interface Device {
   os: OsFamily;
-  /** Only read for Linux, where the files are built for 64-bit x86 alone. */
+  /** The files are built for 64-bit Intel or AMD ('x64') alone, on Windows and on Linux. */
   arch: Arch;
 }
 
@@ -35,14 +35,17 @@ export interface DeviceInput {
   userAgent?: string;
   /** navigator.userAgentData.platform, where the browser has it (Chrome, Edge). */
   uaPlatform?: string;
-  /** navigator.maxTouchPoints: a tablet that calls itself a Mac has more than one. */
+  /** navigator.maxTouchPoints: a tablet that calls itself a Mac has more than one, and so does a phone that asks for the desktop site. */
   maxTouchPoints?: number;
+  /** navigator.userAgentData.mobile. */
+  mobile?: boolean;
 }
 
 function archOf(ua: string): Arch {
   if (/aarch64|arm64|armv\d|\barm\b/i.test(ua)) return 'arm';
   if (/i[3-6]86/i.test(ua)) return 'x86';
   if (/x86_64|x86-64|amd64|x64|wow64|win64/i.test(ua)) return 'x64';
+  if (/\bx86\b/i.test(ua)) return 'x86';
   return 'unknown';
 }
 
@@ -52,13 +55,16 @@ export function detectDevice(input: DeviceInput = {}): Device {
   const arch = archOf(ua);
   const touch = (input.maxTouchPoints ?? 0) > 1;
   const platform = (input.uaPlatform ?? '').toLowerCase();
+  // Linux with a touch screen, or a browser that says it is on a phone, is a phone or a tablet: Chrome on Android
+  // that is asked for the desktop site says "Linux x86_64" and still reports its touch points.
+  const linux = (): Device => ({ os: touch || input.mobile === true ? 'android' : 'linux', arch });
 
   // The browser's own word, where it gives one: a user agent string can say anything.
   if (platform === 'windows') return { os: 'windows', arch };
   if (platform === 'android') return { os: 'android', arch };
   if (platform === 'ios') return { os: 'ios', arch };
   if (platform === 'macos') return { os: touch ? 'ios' : 'mac', arch };
-  if (platform === 'linux') return /android/i.test(ua) ? { os: 'android', arch } : { os: 'linux', arch };
+  if (platform === 'linux') return /android/i.test(ua) ? { os: 'android', arch } : linux();
   if (platform === 'chrome os' || platform === 'chromeos') return { os: 'other', arch };
 
   // Android says "Linux" too, so it is asked about first.
@@ -68,8 +74,50 @@ export function detectDevice(input: DeviceInput = {}): Device {
   if (/windows nt|win64|win32|wow64/i.test(ua) && !/windows phone/i.test(ua)) return { os: 'windows', arch };
   // An iPad asks for the desktop site by calling itself a Mac; a real Mac has no touch screen.
   if (/macintosh|mac os x/i.test(ua)) return { os: touch ? 'ios' : 'mac', arch };
-  if (/linux|x11/i.test(ua) && !/bsd|sunos/i.test(ua)) return { os: 'linux', arch };
+  if (/linux|x11/i.test(ua) && !/bsd|sunos/i.test(ua)) return linux();
   return { os: 'other', arch };
+}
+
+/** What navigator.userAgentData.getHighEntropyValues gives for the two hints this asks for. */
+export interface HighEntropy {
+  architecture?: unknown;
+  bitness?: unknown;
+}
+
+/** The part of navigator.userAgentData that `refineDevice` uses. */
+export interface UaDataLike {
+  getHighEntropyValues?: (hints: string[]) => Promise<HighEntropy>;
+}
+
+/**
+ * The device with what the browser will say of its processor. The user agent string is frozen: Chrome on
+ * Linux on ARM still says "Linux x86_64", 32-bit Windows says nothing of its size, and Windows on ARM says
+ * x64. The browser says it when asked (getHighEntropyValues: a call in the page, no network): `arm`, or `x86`
+ * with a bitness of 32 or 64. Anything else it says (an empty answer, a value not known here) leaves the
+ * guess from the user agent as it was.
+ */
+export function withHighEntropy(device: Device, values: HighEntropy | null | undefined): Device {
+  if (!values) return device;
+  const architecture = typeof values.architecture === 'string' ? values.architecture.toLowerCase() : '';
+  const bitness = typeof values.bitness === 'string' ? values.bitness : '';
+  let arch: Arch = device.arch;
+  if (architecture === 'arm') arch = 'arm';
+  else if (architecture === 'x86' && bitness === '32') arch = 'x86';
+  else if (architecture === 'x86' && bitness === '64') arch = 'x64';
+  return arch === device.arch ? device : { ...device, arch };
+}
+
+/**
+ * The same, asked of the browser: after the page is first drawn, from the guess it was drawn with. A browser
+ * with no userAgentData (Firefox, Safari), or one that refuses or fails, leaves the device as it was.
+ */
+export async function refineDevice(device: Device, uaData: UaDataLike | null | undefined): Promise<Device> {
+  if (!uaData || typeof uaData.getHighEntropyValues !== 'function') return device;
+  try {
+    return withHighEntropy(device, await uaData.getHighEntropyValues(['architecture', 'bitness']));
+  } catch {
+    return device;
+  }
 }
 
 /** The release a build is for: the tag it was pushed as, and the version its files are named by. */
@@ -154,10 +202,26 @@ export function downloadPlan(device: Device, tag?: unknown): DownloadPlan {
   const link = (label: string, file: string): DownloadLink => ({ label, href: releaseAssetUrl((release as Release).tag, file), file });
   const latest = (label: string): DownloadLink => ({ label, href: RELEASES_URL });
 
-  const linuxArm = device.os === 'linux' && device.arch === 'arm';
-  const linux32 = device.os === 'linux' && device.arch === 'x86';
-  if (linuxArm || linux32) {
-    return plan(null, [], `OAIY Desktop for Linux is built for 64-bit x86 computers, and this is not one. The web app works in your browser.`);
+  // The files are for 64-bit Intel or AMD. A computer that says it is an ARM one or a 32-bit one is not offered a
+  // button that would install what cannot run; the files are still listed for anyone who knows better.
+  const wrongProcessor = (device.os === 'windows' || device.os === 'linux') && (device.arch === 'arm' || device.arch === 'x86');
+  if (wrongProcessor) {
+    const which = device.arch === 'arm' ? 'an ARM' : 'a 32-bit';
+    const note = `OAIY Desktop needs a 64-bit Intel or AMD computer, and this looks like ${which} one. The web app works in your browser.`;
+    if (!release) return plan(null, [], note);
+    const names = assetNames(release.version);
+    return plan(
+      null,
+      device.os === 'windows'
+        ? [link('Windows installer (.exe), 64-bit Intel or AMD', names.windowsSetup), link('Windows installer (.msi)', names.windowsMsi), link('Headless server for Windows (.zip)', names.windowsServer)]
+        : [
+            link('AppImage, 64-bit Intel or AMD', names.linuxAppImage),
+            link('Debian and Ubuntu (.deb)', names.linuxDeb),
+            link('Fedora and RHEL (.rpm)', names.linuxRpm),
+            link('Headless server for Linux hosts (.tar.gz)', names.linuxServer),
+          ],
+      note,
+    );
   }
   if (device.os === 'mac' || device.os === 'ios' || device.os === 'android') return plan(null, [], NOT_FOR_THIS_DEVICE);
 

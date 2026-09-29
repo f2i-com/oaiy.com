@@ -420,23 +420,37 @@ section('download OAIY Desktop');
     iphone: 'Mozilla/5.0 (iPhone; CPU iPhone OS 18_0 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/18.0 Mobile/15E148 Safari/604.1',
     android: 'Mozilla/5.0 (Linux; Android 14; Pixel 8) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/141.0.0.0 Mobile Safari/537.36',
   };
-  // navigator.userAgentData (Chrome, Edge) or none (Firefox, Safari); maxTouchPoints 5 is what an iPad reports.
+  const desktopSite = 'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/141.0.0.0 Safari/537.36';
+  const linuxArmFirefox = 'Mozilla/5.0 (X11; Linux aarch64; rv:143.0) Gecko/20100101 Firefox/143.0';
+  // navigator.userAgentData (Chrome, Edge) or none (Firefox, Safari); maxTouchPoints 5 is what an iPad reports. `high` is what
+  // getHighEntropyValues answers: the user agent string is frozen (ARM Linux says x86_64, Windows on ARM says x64).
+  const x64 = { architecture: 'x86', bitness: '64' };
   const devices = [
-    { name: 'Windows in Chrome', userAgent: ua.windows, uaData: 'Windows', touch: 0, os: 'windows' },
+    { name: 'Windows in Chrome', userAgent: ua.windows, uaData: 'Windows', high: x64, touch: 0, os: 'windows' },
     { name: 'Linux in Firefox', userAgent: ua.linux, uaData: null, touch: 0, os: 'linux' },
+    { name: 'Linux in Chrome', userAgent: desktopSite, uaData: 'Linux', high: x64, touch: 0, os: 'linux' },
     { name: 'a Mac in Safari', userAgent: ua.mac, uaData: null, touch: 0, os: 'mac' },
     { name: 'an iPhone', userAgent: ua.iphone, uaData: null, touch: 5, os: 'iphone' },
     { name: 'an iPad (a Mac that has a touch screen)', userAgent: ua.mac, uaData: null, touch: 5, os: 'ipad' },
-    { name: 'Android in Chrome', userAgent: ua.android, uaData: 'Android', touch: 5, os: 'android' },
+    { name: 'Android in Chrome', userAgent: ua.android, uaData: 'Android', high: x64, touch: 5, os: 'android' },
+    { name: 'Android asked for the desktop site (says Linux x86_64, has a touch screen)', userAgent: desktopSite, uaData: 'Linux', high: x64, touch: 5, mobile: true, os: 'android' },
+    { name: 'Linux on ARM64 in Chrome (its user agent says x86_64)', userAgent: desktopSite, uaData: 'Linux', high: { architecture: 'arm', bitness: '64' }, touch: 0, os: 'wrong-processor' },
+    { name: 'Windows on ARM in Edge (its user agent says x64)', userAgent: ua.windows, uaData: 'Windows', high: { architecture: 'arm', bitness: '64' }, touch: 0, os: 'wrong-processor' },
+    { name: '32-bit Windows in Chrome', userAgent: ua.windows, uaData: 'Windows', high: { architecture: 'x86', bitness: '32' }, touch: 0, os: 'wrong-processor' },
+    { name: 'Linux on ARM in Firefox (no userAgentData: its user agent says aarch64)', userAgent: linuxArmFirefox, uaData: null, touch: 0, os: 'wrong-processor' },
   ];
+  let versioned = null; // whether the build names files: read from the Windows button
   const site = new URL(BASE).origin;
   for (const d of devices) {
     const ctx = await browser.newContext({ userAgent: d.userAgent, viewport: { width: 1280, height: 900 } });
-    await ctx.addInitScript(({ uaData, touch }) => {
-      Object.defineProperty(navigator, 'userAgentData', { configurable: true, value: uaData ? { platform: uaData, mobile: false, brands: [] } : undefined });
+    await ctx.addInitScript(({ uaData, high, touch, mobile }) => {
+      Object.defineProperty(navigator, 'userAgentData', {
+        configurable: true,
+        value: uaData ? { platform: uaData, mobile: !!mobile, brands: [], getHighEntropyValues: async () => high ?? {} } : undefined,
+      });
       Object.defineProperty(navigator, 'maxTouchPoints', { configurable: true, value: touch });
       try { localStorage.setItem('oaiy_theme', 'dark'); } catch { /* blocked */ }
-    }, { uaData: d.uaData, touch: d.touch });
+    }, { uaData: d.uaData, high: d.high, touch: d.touch, mobile: d.mobile });
     const page = await ctx.newPage();
     const requests = [];
     page.on('request', (r) => requests.push(r.url()));
@@ -452,6 +466,14 @@ section('download OAIY Desktop');
       if (d.os === 'windows') {
         ok(`${where}: the button is the Windows installer (or the latest release)`, /releases\/(latest|download\/v?\d+\.\d+\.\d+\/oaiy-desktop-\d+\.\d+\.\d+-windows-x64-setup\.exe)$/.test(href) && /Download OAIY Desktop/.test(await button.textContent()), href);
         ok(`${where}: it says the installer is not code-signed yet`, /Not code-signed yet/.test(text), text);
+        versioned = /releases\/download\//.test(href);
+      } else if (d.os === 'wrong-processor') {
+        // After the first draw the page asks the browser what processor it has: no button that would install what cannot run.
+        const others = await box.locator('.oaiy-download-more a').count();
+        ok(`${where}: no installer button, the sentence about 64-bit Intel or AMD, and a way to the web app or the desktop page`,
+          /OAIY Desktop needs a 64-bit Intel or AMD computer, and this looks like (an ARM|a 32-bit) one\. The web app works in your browser\./.test(text) && !/releases\/(latest|download)/.test(href) && href === (path === '/' ? 'desktop.html' : 'app.html'), `${href} | ${text}`);
+        ok(`${where}: the files are still listed under other downloads (${versioned ? 'a versioned build' : 'an unversioned build lists only the releases page'})`,
+          versioned === false ? others === 0 : others >= 4, `${others} links`);
       } else if (d.os === 'linux') {
         ok(`${where}: the button is the AppImage (or the latest release)`, /releases\/(latest|download\/v?\d+\.\d+\.\d+\/oaiy-desktop-\d+\.\d+\.\d+-linux-x86_64\.AppImage)$/.test(href) && /Download OAIY Desktop/.test(await button.textContent()), href);
       } else {
