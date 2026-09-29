@@ -948,11 +948,23 @@ fn a_heartbeat_brings_the_sync_forward_only_after_formlogic_was_unreachable() {
 }
 
 #[test]
-fn syncs_one_after_another_share_a_connection_and_each_carries_its_own_key() {
+fn a_syncs_connection_is_closed_soon_after_its_last_request() {
+    // The next sync is a minute away, so a connection is kept only for the requests
+    // that follow one another within a sync (a listing, the pages of it, a request or
+    // two for each change). Held for seconds after the last, it is a worker of the
+    // provider's web server (Apache's prefork and worker models) doing nothing.
+    use crate::link::testkit::{Provider, Reply};
+    let server = Provider::start(|_| Reply::ok(r#"{"apps":[]}"#));
+    Api::new(&server.base, "flk_one").unwrap().get("/api/v1/app-logic").unwrap();
+    let held = server.closed_after_reply(0, Duration::from_secs(15));
+    assert!(held < Duration::from_secs(3), "the connection was held open {held:?} after its reply");
+}
+
+#[test]
+fn requests_close_together_share_a_connection_and_each_carries_the_key_of_its_own_account() {
     // A sync is a listing, the pages of it and a request or two for each change,
-    // and one runs every minute: they used to make a connection each. The client
-    // is kept from sync to sync, and it holds no key: every request carries the
-    // key of the account it is made for.
+    // and each used to make a connection of its own. The client is kept, and it
+    // holds no key: every request carries the key of the account it is made for.
     use crate::link::testkit::{Provider, Reply};
     let server = Provider::start(|_| Reply::ok(r#"{"apps":[]}"#));
     let (first, second) = (Api::new(&server.base, "flk_one").unwrap(), Api::new(&server.base, "flk_two").unwrap());

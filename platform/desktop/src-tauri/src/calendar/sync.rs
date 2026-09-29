@@ -560,15 +560,18 @@ struct Reply {
     body: Value,
 }
 
-/// The client the sync keeps from one sync to the next, so that the requests of a
-/// sync (the listing, the pages of it, each write) share a connection instead of
-/// each making one. Its key is not on it: every request carries the key of the
+/// The client the sync keeps from one sync to the next. The requests of a sync (the
+/// listing, the pages of it, each write) share a connection, as they did when each
+/// sync made a client, and a connection is kept for a second after the last of them
+/// ([`crate::link::net::Keep::Burst`]) and no longer: the next sync is a minute
+/// away. What is kept between syncs is the client itself, its TLS configuration and
+/// session cache. Its key is not on it: every request carries the key of the
 /// account it is made for.
 static HTTP: crate::link::net::LaneClient<reqwest::blocking::Client> =
     crate::link::net::LaneClient::new(build_http);
 
 fn build_http() -> Result<reqwest::blocking::Client, String> {
-    crate::link::net::blocking_builder()
+    crate::link::net::blocking_builder(crate::link::net::Keep::Burst)
         // Short enough that "Sync now" answers inside the page's own wait.
         .connect_timeout(Duration::from_secs(5))
         .timeout(Duration::from_secs(15))

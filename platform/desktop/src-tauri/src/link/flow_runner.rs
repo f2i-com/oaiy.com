@@ -393,7 +393,10 @@ fn spawn_inner(
 }
 
 /// The client this lane keeps from check to check, so that the queue, the claim,
-/// the graph and the report share a connection instead of each making one.
+/// the graph and the report share a connection instead of each making one. A
+/// connection is kept for a second after a request ([`super::net::Keep::Burst`]),
+/// enough for the claim and the graph that follow a queued run and no more: the
+/// next look at an empty queue is 20 seconds away.
 ///
 /// Also the sealed flow lane's for the graph it fetches to run a request (through
 /// `execute_sealed`), which has always followed redirects like the rest of this
@@ -402,7 +405,7 @@ static HTTP: super::net::LaneClient<reqwest::blocking::Client> =
     super::net::LaneClient::new(build_client);
 
 fn build_client() -> Result<reqwest::blocking::Client, String> {
-    super::net::blocking_builder()
+    super::net::blocking_builder(super::net::Keep::Burst)
         // On the client, where every request of this lane always had it, and not on
         // each request: a client's timeout bounds the wait for a reply and then, on
         // a budget of its own, the reading of it, while a request's runs to the last
@@ -2227,6 +2230,21 @@ mod tests {
             ["GET /runs/queued", "POST /runs/r1/claim", "GET /flows", "PATCH /runs/r1", "GET /runs/queued"]
         );
         assert_eq!(server.connections(), 1, "{:?}", server.lines());
+    }
+
+    #[test]
+    fn the_connection_of_a_check_that_found_the_queue_empty_is_closed_soon_after() {
+        // The next look is 20 seconds away for the shipped provider, so all a
+        // connection is kept for is the burst a queued run brings (its claim and its
+        // graph follow at once). Held for the 4 seconds of a lane that comes straight
+        // back, it is a worker of the provider's web server (Apache's prefork and
+        // worker models) doing nothing, three times a minute.
+        let server = Provider::start(|_| Reply::ok(r#"{"runs":[]}"#));
+        let flows = spec();
+        let lane = Lane::of(&flows).unwrap();
+        poll_once(&account(server.base.clone()), &flows, &lane, "oaiy-test", None, &Held::NotRequired).unwrap();
+        let held = server.closed_after_reply(0, Duration::from_secs(15));
+        assert!(held < Duration::from_secs(3), "the connection was held open {held:?} after its reply");
     }
 
     #[test]

@@ -380,14 +380,15 @@ fn engine_is_up(probe: Option<&EngineProbe>, host: &HealthSnapshot, now: Instant
 }
 
 /// The client this lane keeps from beat to beat. A beat is 45 seconds after the
-/// last, so a connection is rarely still open to carry it (see
-/// [`super::net::POOL_IDLE`]); what is kept is the client itself, its TLS
-/// configuration and session cache, rather than a new one for every beat.
+/// last, so no connection is kept for it to use ([`super::net::Keep::Never`]): each
+/// closes as soon as its reply has been read, as it did when the client went with
+/// the request. What is kept is the client itself, its TLS configuration and
+/// session cache, rather than a new one for every beat.
 static HTTP: super::net::LaneClient<reqwest::blocking::Client> =
     super::net::LaneClient::new(build_client);
 
 fn build_client() -> Result<reqwest::blocking::Client, String> {
-    super::net::blocking_builder()
+    super::net::blocking_builder(super::net::Keep::Never)
         // On the client, as it always was: the only request this lane makes.
         .timeout(BEAT_TIMEOUT)
         .build()
@@ -801,7 +802,7 @@ mod tests {
     }
 
     #[test]
-    fn beats_close_together_share_a_connection_and_each_carries_the_credential() {
+    fn a_beat_carries_the_credential_and_says_what_the_provider_reads() {
         let server = Provider::start(|_| Reply::ok("{}"));
         let account = linked(server.base.clone(), "flk_beat");
         let spec = spec();
@@ -809,7 +810,7 @@ mod tests {
         send(&account, &spec, "oaiy-test", &[]).unwrap();
 
         assert_eq!(server.lines(), ["POST /api/v1/desktop-connections"; 2]);
-        assert_eq!(server.connections(), 1, "{:?}", server.lines());
+        assert_eq!(server.connections(), 2, "a beat's connection is not kept for the next: {:?}", server.lines());
         let seen = server.requests();
         assert!(seen.iter().all(|r| r.header("authorization") == Some("Bearer flk_beat")));
         let bodies: Vec<serde_json::Value> = seen.iter().map(|r| serde_json::from_str(&r.body).unwrap()).collect();
@@ -817,6 +818,18 @@ mod tests {
         assert_eq!(bodies[0]["deviceName"], "Reception PC");
         assert_eq!(bodies[0]["capabilities"], serde_json::json!(["logic-language:javascript"]));
         assert_eq!(bodies[1]["capabilities"], serde_json::json!([]), "an empty list is still said");
+    }
+
+    #[test]
+    fn a_beats_connection_is_closed_as_soon_as_its_reply_is_read() {
+        // The next beat is 45 seconds away, so nothing can use the connection this
+        // one was made on, and the provider's web server would be holding a worker
+        // (Apache's prefork and worker models) or a slot for a client that will not
+        // be back. Before the client was kept the connection closed with it.
+        let server = Provider::start(|_| Reply::ok("{}"));
+        send(&linked(server.base.clone(), "flk_beat"), &spec(), "oaiy-test", &[]).unwrap();
+        let held = server.closed_after_reply(0, Duration::from_secs(15));
+        assert!(held < Duration::from_secs(1), "the connection was held open {held:?} after its reply");
     }
 
     #[test]

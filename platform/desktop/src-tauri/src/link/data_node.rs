@@ -209,15 +209,16 @@ pub fn spawn(store: LinkHandle) {
     });
 }
 
-/// The client this lane keeps from one look to the next. The two looks are 45
-/// seconds apart, so a connection is rarely still open to carry the next (see
-/// [`super::net::POOL_IDLE`]); what is kept is the client itself, its TLS
-/// configuration and session cache, rather than a new one for every look.
+/// The client this lane keeps from one look to the next. The looks are 45 seconds
+/// apart at the nearest, so no connection is kept for the next to use
+/// ([`super::net::Keep::Never`]): each closes as soon as its reply has been read, as
+/// it did when the client went with the request. What is kept is the client itself,
+/// its TLS configuration and session cache, rather than a new one for every look.
 static HTTP: super::net::LaneClient<reqwest::blocking::Client> =
     super::net::LaneClient::new(build_client);
 
 fn build_client() -> Result<reqwest::blocking::Client, String> {
-    super::net::blocking_builder()
+    super::net::blocking_builder(super::net::Keep::Never)
         .build()
         .map_err(|e| format!("could not build the enrolment client: {e}"))
 }
@@ -443,7 +444,11 @@ mod tests {
     }
 
     #[test]
-    fn enrolling_and_reading_the_record_back_share_a_connection() {
+    fn enrolling_and_reading_the_record_back_each_close_their_connection_as_soon_as_they_are_answered() {
+        // They are 45 seconds apart at the nearest, so no connection is left for the
+        // next to use: the provider's web server would only be holding it for a client
+        // that is not coming back. Before the client was kept the connection closed
+        // with it.
         use crate::link::testkit::{Provider, Reply};
         let node = json!({ "data": { "node": {
             "fingerprint": "ff", "status": "pending", "approved": false, "signingKeyGeneration": 1 }}})
@@ -467,7 +472,11 @@ mod tests {
         assert_eq!(registered, read_back);
 
         assert_eq!(server.lines(), ["POST /api/v1/data-node/register", "GET /api/v1/data-node/self"]);
-        assert_eq!(server.connections(), 1);
+        assert_eq!(server.connections(), 2);
         assert!(server.requests().iter().all(|r| r.header("authorization") == Some("Bearer flk_node")));
+        for conn in 0..2 {
+            let held = server.closed_after_reply(conn, Duration::from_secs(15));
+            assert!(held < Duration::from_secs(1), "connection {conn} was held open {held:?} after its reply");
+        }
     }
 }

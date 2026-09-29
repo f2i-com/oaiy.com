@@ -313,7 +313,7 @@ pub fn spawn(store: LinkHandle, node: Option<NodeHandle>) {
 static HTTP: super::net::LaneClient<Client> = super::net::LaneClient::new(build_client);
 
 fn build_client() -> Result<Client, String> {
-    super::net::blocking_builder()
+    super::net::blocking_builder(super::net::Keep::Between)
         // A reply that sends this lane somewhere else is an error to report, not
         // a request to make again, elsewhere, with the credential on it.
         .redirect(reqwest::redirect::Policy::none())

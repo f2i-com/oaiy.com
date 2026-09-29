@@ -130,7 +130,7 @@ static HTTP: super::net::LaneClient<reqwest::blocking::Client> =
 const ANSWER_TIMEOUT: Duration = Duration::from_secs(20);
 
 fn build_client() -> Result<reqwest::blocking::Client, String> {
-    super::net::blocking_builder()
+    super::net::blocking_builder(super::net::Keep::Between)
         .build()
         .map_err(|e| format!("could not build the relay client: {e}"))
 }

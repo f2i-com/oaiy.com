@@ -106,18 +106,49 @@ pub fn idle_pause(polled_for: std::time::Duration, least: std::time::Duration) -
 // requests, and reads a reply as soon as it has it; a lane that waits between the
 // two, out a `Retry-After`, reads first, or keeps its timeout on its client.
 
-/// How long a connection may sit unused before this desktop closes it, rather
-/// than send the next request down it.
+/// How long a connection may sit unused before it is not used again, for a lane
+/// that comes back within seconds (the long-poll lanes).
 ///
-/// A provider's web server closes a connection nobody has used for a few
-/// seconds (Apache's default is five), and a request sent in the moment one is
-/// being closed fails with no way to tell whether the provider saw it. Closing
-/// our side first, sooner than any common server closes theirs, means a
-/// connection is only reused while it is certainly still open. The long-poll
-/// lanes come back within a couple of seconds of a poll and a claim and its
-/// report follow their poll at once, so they reuse it; a beat a minute apart
-/// opens a new connection, as it always did.
+/// A provider's web server closes a connection nobody has used for a few seconds
+/// (Apache's default is five), and a request sent in the moment one is being
+/// closed fails with no way to tell whether the provider saw it. A connection
+/// idle for longer than this is not sent a request (the pool looks at its age when
+/// it takes one), which is sooner than any common server closes theirs, so a
+/// connection is reused only while it is very likely still open. That narrows the
+/// case and does not remove it: a request already written to a connection the
+/// server closes in that moment fails, and is not retried; the lane's back-off
+/// takes it from there.
+///
+/// The pool clears out what has gone stale once each period, so a connection
+/// nobody came back to is held for between one and two of them. That is why a lane
+/// that will not be back within one does not rely on this to let go of it: see
+/// [`Keep`].
 pub const POOL_IDLE: Duration = Duration::from_secs(4);
+
+/// How long a connection may sit unused before it is not used again, for a lane
+/// whose requests come in bursts a long way apart: enough for the next request of
+/// a burst, and no more.
+pub const BURST_IDLE: Duration = Duration::from_secs(1);
+
+/// How a lane's requests are spaced, which is what decides how long a connection
+/// it has made is worth holding open. A connection that no request comes back to
+/// is not free: the provider's web server holds a worker or a slot for it (all the
+/// more on Apache's prefork and worker models), and did so before only for as long
+/// as a request took, because every request made a client and dropped it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Keep {
+    /// The next request follows within seconds: a long poll and the claim and report
+    /// it leads to, then the next poll after a short pause. Held for [`POOL_IDLE`].
+    Between,
+    /// Requests come in bursts, and bursts are far apart: the queue check (a claim
+    /// and the graph follow a queued run at once, and the next look is 20 seconds
+    /// away), a calendar sync. Held for [`BURST_IDLE`].
+    Burst,
+    /// One request, then nothing for a good while: a heartbeat. Closed as soon as
+    /// its reply has been read, as it was when the client went with the request; the
+    /// client is kept, with its TLS configuration and session cache, for the next.
+    Never,
+}
 
 /// How long a lane goes on with one client before it builds another.
 ///
@@ -129,14 +160,24 @@ const CLIENT_LIFETIME: Duration = Duration::from_secs(300);
 
 /// A blocking client as every lane starts it: the settings any lane shares, and
 /// nothing that belongs to a credential. A lane adds its own (the sealed flows
-/// lane turns redirects off) and gives each request its own timeout.
-pub fn blocking_builder() -> reqwest::blocking::ClientBuilder {
-    reqwest::blocking::Client::builder().pool_idle_timeout(POOL_IDLE)
+/// lane turns redirects off) and gives its requests their timeouts.
+pub fn blocking_builder(keep: Keep) -> reqwest::blocking::ClientBuilder {
+    let builder = reqwest::blocking::Client::builder();
+    match keep {
+        Keep::Between => builder.pool_idle_timeout(POOL_IDLE),
+        Keep::Burst => builder.pool_idle_timeout(BURST_IDLE),
+        Keep::Never => builder.pool_max_idle_per_host(0),
+    }
 }
 
 /// [`blocking_builder`] for the async client of the AI tunnel.
-pub fn async_builder() -> reqwest::ClientBuilder {
-    reqwest::Client::builder().pool_idle_timeout(POOL_IDLE)
+pub fn async_builder(keep: Keep) -> reqwest::ClientBuilder {
+    let builder = reqwest::Client::builder();
+    match keep {
+        Keep::Between => builder.pool_idle_timeout(POOL_IDLE),
+        Keep::Burst => builder.pool_idle_timeout(BURST_IDLE),
+        Keep::Never => builder.pool_max_idle_per_host(0),
+    }
 }
 
 /// The client one lane keeps between its requests.
@@ -324,7 +365,7 @@ mod client_tests {
                 Reply::ok("{}")
             }
         });
-        let http = blocking_builder().build().unwrap();
+        let http = blocking_builder(Keep::Between).build().unwrap();
         drain(http.get(format!("{}/big", server.base)).send().unwrap());
         drain(http.post(format!("{}/claim", server.base)).body("{}").send().unwrap());
         assert_eq!(http.get(format!("{}/small", server.base)).send().unwrap().text().unwrap(), "{}");
@@ -338,7 +379,7 @@ mod client_tests {
         // seconds, and a request sent in the moment it does fails with no telling
         // whether it was seen. Our side lets go first.
         let server = Provider::start(|_| Reply::ok("{}"));
-        let http = blocking_builder().build().unwrap();
+        let http = blocking_builder(Keep::Between).build().unwrap();
         drain(http.get(format!("{}/a", server.base)).send().unwrap());
         drain(http.get(format!("{}/b", server.base)).send().unwrap());
         assert_eq!(server.connections(), 1, "a request straight after one uses its connection");
@@ -348,11 +389,50 @@ mod client_tests {
     }
 
     #[test]
+    fn a_lane_that_comes_back_within_seconds_finds_its_connection_after_its_pause() {
+        // The long-poll lanes wait half a second after an empty poll, and up to two
+        // when the provider cuts its holds short, then poll again.
+        let server = Provider::start(|_| Reply::ok("{}"));
+        let http = blocking_builder(Keep::Between).build().unwrap();
+        drain(http.get(format!("{}/a", server.base)).send().unwrap());
+        std::thread::sleep(Duration::from_millis(1500));
+        drain(http.get(format!("{}/b", server.base)).send().unwrap());
+        assert_eq!(server.connections(), 1, "{:?}", server.lines());
+    }
+
+    #[test]
+    fn a_lane_whose_requests_are_far_apart_closes_each_connection_when_its_reply_is_read() {
+        let server = Provider::start(|_| Reply::ok("{}"));
+        let http = blocking_builder(Keep::Never).build().unwrap();
+        drain(http.get(format!("{}/a", server.base)).send().unwrap());
+        drain(http.get(format!("{}/b", server.base)).send().unwrap());
+        assert_eq!(server.connections(), 2, "nothing is kept for the next request to use");
+        for conn in 0..2 {
+            let held = server.closed_after_reply(conn, Duration::from_secs(10));
+            assert!(held < Duration::from_secs(1), "connection {conn} was held open {held:?} after its reply");
+        }
+    }
+
+    #[test]
+    fn a_lane_that_makes_its_requests_in_bursts_keeps_a_connection_for_a_burst_and_no_longer() {
+        let server = Provider::start(|_| Reply::ok("{}"));
+        let http = blocking_builder(Keep::Burst).build().unwrap();
+        for path in ["/a", "/b", "/c"] {
+            drain(http.get(format!("{}{path}", server.base)).send().unwrap());
+        }
+        assert_eq!(server.connections(), 1, "the requests of a burst share a connection");
+        // Closed soon after the last, and well inside the time a lane that comes
+        // straight back keeps one.
+        let held = server.closed_after_reply(0, Duration::from_secs(10));
+        assert!(held < POOL_IDLE - Duration::from_secs(1), "held open {held:?} after its last reply");
+    }
+
+    #[test]
     fn a_client_carries_no_credential_and_a_request_carries_only_what_it_was_given() {
         // The bearer is put on each request by the code that makes it. A client
         // that held one would take it to whichever lane, or provider, next used it.
         let server = Provider::start(|_| Reply::ok("{}"));
-        let http = blocking_builder().build().unwrap();
+        let http = blocking_builder(Keep::Between).build().unwrap();
         drain(http.get(format!("{}/bare", server.base)).send().unwrap());
         drain(http.get(format!("{}/first", server.base)).bearer_auth("flk_first").send().unwrap());
         drain(http.get(format!("{}/second", server.base)).bearer_auth("flk_second").send().unwrap());
@@ -366,13 +446,13 @@ mod client_tests {
 
     #[test]
     fn a_request_has_the_timeout_it_was_given_not_the_clients() {
-        // Every lane gives each request its own timeout (a poll waits longer than a
-        // claim), which is what lets one client serve them all.
+        // A lane whose requests differ in length (a poll waits longer than a claim)
+        // gives each its own timeout, which is what lets one client serve them all.
         let server = Provider::start(|_| {
             std::thread::sleep(Duration::from_millis(1500));
             Reply::ok("{}")
         });
-        let http = blocking_builder().build().unwrap();
+        let http = blocking_builder(Keep::Between).build().unwrap();
         let started = Instant::now();
         let e = http
             .get(format!("{}/slow", server.base))
@@ -390,12 +470,12 @@ mod client_tests {
         // wait, longer than the timeout, is fine to a client's and fatal to a request's.
         let server = Provider::start(|_| Reply::ok(r#"{"message":"read late"}"#));
 
-        let on_the_client = blocking_builder().timeout(Duration::from_millis(300)).build().unwrap();
+        let on_the_client = blocking_builder(Keep::Between).timeout(Duration::from_millis(300)).build().unwrap();
         let reply = on_the_client.get(format!("{}/client", server.base)).send().unwrap();
         std::thread::sleep(Duration::from_millis(600));
         assert_eq!(reply.text().unwrap(), r#"{"message":"read late"}"#);
 
-        let on_the_request = blocking_builder().build().unwrap();
+        let on_the_request = blocking_builder(Keep::Between).build().unwrap();
         let reply = on_the_request
             .get(format!("{}/request", server.base))
             .timeout(Duration::from_millis(300))

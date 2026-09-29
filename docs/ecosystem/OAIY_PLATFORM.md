@@ -110,14 +110,26 @@ Two transports, neither a WebSocket.
 | Encrypted flow relay | `link/sealed_flows.rs` | `/api/v1/desktop-flows/{pending,{id}/claim,{id}/complete}` |
 | Queued flow runs | `link/flow_runner.rs` | below |
 
-- Each lane keeps one HTTP client between its requests (`LaneClient` in `link/net.rs`; the
-  calendar sync's is its own), so a poll, the claim it leads to and the report share a
-  connection instead of each making one and doing a TLS handshake. A lane starts a new client
-  after a failed cycle and every five minutes, so the computer's proxy settings are read again
-  as they were when each poll built its own. Connections idle for more than four seconds are
-  closed by this side first, so a request is never sent down one a provider's web server is
-  closing. A client holds no credential: the bearer goes on each request. The encrypted flow
-  lane's client refuses redirects.
+- Each lane keeps one HTTP client between its requests (`LaneClient` in `link/net.rs`), so a
+  poll, the claim it leads to and the report share a connection instead of each making one and
+  doing a TLS handshake. How long a connection is held open after its last request depends on
+  how the lane's requests are spaced (`Keep`): four seconds for the long-poll lanes (relay,
+  encrypted AI and flows), which come back within a couple of seconds; one second for the queue
+  check and the calendar sync, whose requests come in bursts a long way apart; none for the
+  heartbeat and the data-node read-back, 45 seconds apart, whose connections close as soon as
+  they are answered. A connection idle for longer than that is not used again, and is closed
+  within about as long after. A request written to a connection in the moment the provider's
+  server closes it fails and is not retried; the lane's back-off takes it from there. A lane
+  starts a new client after a failed cycle and every five minutes, so the computer's proxy
+  settings are read again as they were when each poll built its own. A client holds no
+  credential: the bearer goes on each request. The encrypted flow lane's client refuses
+  redirects.
+- A timeout set on a request is one deadline for the whole exchange, to the last byte of the
+  reply; one set on a blocking client bounds the wait for the reply and then, on a budget of its
+  own, the reading of it. The queue check and the heartbeat have theirs on the client (30 and
+  15 seconds); the relay, the encrypted flow lane, the data-node lane and the tunnel's polls on
+  each request (a poll is given its hold and 15 seconds), and the relay reads what the
+  provider said before it waits out a `Retry-After`, which its deadline might not outlast.
 - The three long-poll lanes (`relay`, `desktopFlows`, `desktopAi`) take their timing from the
   descriptor: `waitSeconds` is how long the provider may hold a poll, and `idlePauseMs` (100 to
   60000, 500 unless set) is the least the lane waits after a poll that came back with nothing.

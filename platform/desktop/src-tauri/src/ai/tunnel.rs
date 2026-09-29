@@ -334,7 +334,7 @@ pub fn spawn(store: LinkHandle, sources: AiSources) {
 const TURN_TIMEOUT: Duration = Duration::from_secs(30);
 
 fn build_client() -> Result<reqwest::Client, String> {
-    crate::link::net::async_builder()
+    crate::link::net::async_builder(crate::link::net::Keep::Between)
         .timeout(TURN_TIMEOUT)
         .build()
         .map_err(|e| format!("could not build the tunnel client: {e}"))
