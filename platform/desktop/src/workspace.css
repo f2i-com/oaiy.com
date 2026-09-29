@@ -12,6 +12,12 @@
   .sidebar nav .nav-group { margin: 10px 0 2px; }
 }
 .sidebar nav button[title*=", from the"] > span { white-space: normal; line-height: 1.3; }
+/* With a badge ("New") the label keeps to one line: the badge sits closer and
+   smaller, so "AI Receptionist" and its badge fit a 1440px window's sidebar; a
+   longer name ends in an ellipsis (its button's title has it whole). */
+.sidebar nav button:has(> .nav-badge) { gap: 10px; padding-right: 8px; }
+.sidebar nav button:has(> .nav-badge) > span { white-space: nowrap; line-height: normal; }
+.sidebar nav button > .nav-badge { flex: none; padding: 1px 5px; letter-spacing: 0.02em; }
 .content-page { overscroll-behavior: contain; scrollbar-gutter: stable; }
 .panel { width: 100%; max-width: 1160px; gap: 18px; }
 .overview-grid { gap: 12px; grid-template-columns: repeat(auto-fit, minmax(min(100%, 170px), 1fr)); }
