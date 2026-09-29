@@ -70,3 +70,15 @@ fn a_panic_of_the_install_task_is_turned_into_a_failed_update() {
     let perform = block(&install, "pub fn perform(", "\n}\n");
     assert!(perform.contains("Unwind {"), "the sequence no longer holds the guard that undoes a panic");
 }
+
+#[test]
+fn the_plugins_part_says_it_holds_the_calls_so_they_are_looked_at_once_more_right_before_it_stops() {
+    let gui = source(include_str!("gui.rs"));
+    let plugins = block(&gui, "impl Part for PluginsPart {", "\n}\n");
+    assert!(plugins.contains("fn holds_calls(&self) -> bool {\n        true\n    }"), "stopping the plugins ends a phone call, and the last look for one is no longer taken before it");
+    let install = source(include_str!("install.rs"));
+    let perform = block(&install, "pub fn perform(", "\n}\n");
+    let look = perform.find("updater.call_blockers()").expect("perform no longer looks at the calls before a part that holds them");
+    let stop = perform.find("part.stop()").expect("perform no longer stops parts");
+    assert!(look < stop, "the look for calls comes after the stop it is for");
+}

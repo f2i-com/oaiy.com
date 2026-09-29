@@ -10,7 +10,10 @@
 //!    anything is, nothing has been touched;
 //! 2. the Agent page is asked to save its work (bounded: the install goes on if it does not answer);
 //! 3. the blockers are looked at again, because the flush takes seconds and a call may have begun;
-//! 4. each [`Part`] is stopped, in the order quitting stops them;
+//! 4. each [`Part`] is stopped, in the order quitting stops them; but right before the part that holds the
+//!    phone (the plugins) the CALLS are looked at once more, from the sources alone: the stops before it take
+//!    seconds, and a call may have begun. If one has, the parts already stopped are started again and the
+//!    update goes back to `ready`, nothing installed;
 //! 5. the installer is handed the verified bytes ([`Steps::hand_off`]), which on Windows starts the
 //!    installer and exits this process, so nothing after it runs.
 //!
@@ -40,6 +43,10 @@ pub trait Part: Send + Sync {
     fn stop(&self) -> Result<(), String>;
     /// Bring back what `stop` took away (as it was, not as a fresh start would).
     fn start(&self) -> Result<(), String>;
+    /// Stopping this part ends a phone call (the plugins hold the phone). The calls are looked at again right before it.
+    fn holds_calls(&self) -> bool {
+        false
+    }
 }
 
 /// Quitting: stop every part in order, whatever one of them says (the app is going away either way).
@@ -93,6 +100,15 @@ pub fn perform(updater: &Updater, steps: &Steps) -> Outcome {
     }
     // 4. Everything is stopped, in order. (A part is on the list BEFORE it is asked to stop: one that panics or fails halfway is started again too.)
     for part in steps.parts {
+        if part.holds_calls() {
+            // The parts before this one took time to stop: a call may have begun, and this is the stop that would end it. The look asks
+            // only the call sources (the engines are gone by now, and what asks them would find nothing).
+            let blockers = updater.call_blockers();
+            if !blockers.is_empty() {
+                unwind.done = true;
+                return put_back(updater, package, &unwind.stopped, blockers);
+            }
+        }
         log::info!("update: stopping {}", part.name());
         unwind.stopped.push(*part);
         if let Err(e) = part.stop() {
@@ -129,9 +145,9 @@ impl Drop for Unwind<'_> {
     }
 }
 
-/// Start what was stopped again, last stopped first, and record the failure. A part whose start panics is reported like one that fails,
-/// and the others are still started.
-fn failed(updater: &Updater, stopped: &[&dyn Part], why: String) -> Outcome {
+/// Start what was stopped again, last stopped first: which were, and which could not be. A part whose start panics is reported like one
+/// that fails, and the others are still started.
+fn start_again(stopped: &[&dyn Part]) -> (Vec<&'static str>, Vec<(&'static str, String)>) {
     let mut restarted = Vec::new();
     let mut not_restarted = Vec::new();
     for part in stopped.iter().rev() {
@@ -141,6 +157,32 @@ fn failed(updater: &Updater, stopped: &[&dyn Part], why: String) -> Outcome {
             Err(_) => not_restarted.push((part.name(), "it failed while starting".to_string())),
         }
     }
+    (restarted, not_restarted)
+}
+
+/// A call (or a phone plugin that could not say) was found right before the plugins were to be stopped: start what was stopped again and go
+/// back to `ready` with the download, nothing installed. If something cannot be started again the update is `failed` instead, saying what.
+fn put_back(updater: &Updater, package: VerifiedPackage, stopped: &[&dyn Part], blockers: Vec<Blocker>) -> Outcome {
+    log::warn!("update: {}; putting back what was stopped", blockers.iter().map(|b| b.message.as_str()).collect::<Vec<_>>().join(" "));
+    let (restarted, not_restarted) = start_again(stopped);
+    if not_restarted.is_empty() {
+        updater.return_to_ready(package);
+        return Outcome::Refused(InstallRefusal::Blocked(blockers));
+    }
+    let names: Vec<&str> = not_restarted.iter().map(|(n, _)| *n).collect();
+    let message = format!(
+        "The update was stopped because {} OAIY could not start {} again: quit OAIY from its tray icon and open it again.",
+        blockers.iter().map(|b| b.message.as_str()).collect::<Vec<_>>().join(" "),
+        names.join(" and ")
+    );
+    log::warn!("update: {message}");
+    updater.fail_install(message.clone());
+    Outcome::Failed { message, restarted, not_restarted }
+}
+
+/// Start what was stopped again, last stopped first, and record the failure.
+fn failed(updater: &Updater, stopped: &[&dyn Part], why: String) -> Outcome {
+    let (restarted, not_restarted) = start_again(stopped);
     let mut message = format!("The update could not be installed: {why}.");
     if not_restarted.is_empty() {
         message.push_str(" OAIY started again what it had stopped, and is running as before.");
@@ -162,7 +204,7 @@ mod tests {
 
     type Log = Arc<Mutex<Vec<String>>>;
 
-    /// A part that records what is asked of it and can be told to fail, or to panic.
+    /// A part that records what is asked of it and can be told to fail, or to panic, or to do something once it has stopped.
     struct Fakepart {
         name: &'static str,
         log: Log,
@@ -170,11 +212,13 @@ mod tests {
         fail_start: bool,
         panic_stop: bool,
         panic_start: bool,
+        holds_calls: bool,
+        after_stop: Option<Arc<dyn Fn() + Send + Sync>>,
     }
 
     impl Fakepart {
         fn new(name: &'static str, log: &Log) -> Fakepart {
-            Fakepart { name, log: log.clone(), fail_stop: false, fail_start: false, panic_stop: false, panic_start: false }
+            Fakepart { name, log: log.clone(), fail_stop: false, fail_start: false, panic_stop: false, panic_start: false, holds_calls: name == "plugins", after_stop: None }
         }
     }
 
@@ -187,6 +231,9 @@ mod tests {
             if self.panic_stop {
                 panic!("an injected panic while stopping {}", self.name);
             }
+            if let Some(after) = &self.after_stop {
+                after();
+            }
             if self.fail_stop { Err("stuck".into()) } else { Ok(()) }
         }
         fn start(&self) -> Result<(), String> {
@@ -195,6 +242,9 @@ mod tests {
                 panic!("an injected panic while starting {}", self.name);
             }
             if self.fail_start { Err("gone".into()) } else { Ok(()) }
+        }
+        fn holds_calls(&self) -> bool {
+            self.holds_calls
         }
     }
 
@@ -364,6 +414,73 @@ mod tests {
         let error = s.error.unwrap();
         assert!(error.contains("it stopped unexpectedly, because of an internal error"), "{error}");
         assert!(error.contains("started again what it had stopped"), "{error}");
+    }
+
+    #[test]
+    fn a_call_that_begins_while_the_first_parts_are_stopping_puts_them_back_and_the_plugins_are_never_stopped() {
+        let (u, fake, now) = ready();
+        let log: Log = Log::default();
+        let mut parts = parts(&log);
+        // The engines take their time to stop; a call comes in meanwhile.
+        let f = fake.clone();
+        parts[0].after_stop = Some(Arc::new(move || f.set(|s| s.calls = 1)));
+        let outcome = run(&u, now, &parts, &log, || {}, false);
+        match outcome {
+            Outcome::Refused(InstallRefusal::Blocked(blockers)) => assert_eq!(blockers.iter().map(|b| b.code).collect::<Vec<_>>(), ["call"]),
+            other => panic!("{other:?}"),
+        }
+        // What was stopped is started again, last stopped first; the plugins (the phone) and everything after them were never touched.
+        assert_eq!(log_of(&log), ["stop engines", "stop script host", "start script host", "start engines"]);
+        // The look before the plugins asked the call sources alone: no second full reading of the engines it had just stopped.
+        let (call_reads, reads) = (fake.call_reads.load(std::sync::atomic::Ordering::SeqCst), fake.reads.load(std::sync::atomic::Ordering::SeqCst));
+        assert_eq!(call_reads, 1);
+        assert_eq!(reads, 2, "the button and the look after the flush read everything; the look before the plugins did not");
+        assert_eq!(u.status_at(now).state, State::Ready, "the download is kept: the owner can press the button again when the call is over");
+    }
+
+    #[test]
+    fn a_phone_plugin_that_cannot_say_at_the_last_look_puts_it_back_the_same_way() {
+        use super::super::phone::LineState;
+        let (u, fake, now) = ready();
+        let log: Log = Log::default();
+        let mut parts = parts(&log);
+        let f = fake.clone();
+        parts[1].after_stop = Some(Arc::new(move || f.set(|s| s.phone = Some(LineState::Unknown { plugin: "Aokie Phone Bridge".into(), why: "it did not answer within 3 s".into() }))));
+        match run(&u, now, &parts, &log, || {}, false) {
+            Outcome::Refused(InstallRefusal::Blocked(blockers)) => assert_eq!(blockers.iter().map(|b| b.code).collect::<Vec<_>>(), ["callUnknown"]),
+            other => panic!("{other:?}"),
+        }
+        assert_eq!(log_of(&log), ["stop engines", "stop script host", "start script host", "start engines"]);
+        assert_eq!(u.status_at(now).state, State::Ready);
+    }
+
+    #[test]
+    fn a_part_that_cannot_be_put_back_after_a_late_call_makes_the_update_failed_and_says_which() {
+        let (u, fake, now) = ready();
+        let log: Log = Log::default();
+        let mut parts = parts(&log);
+        let f = fake.clone();
+        parts[1].after_stop = Some(Arc::new(move || f.set(|s| s.calls = 1)));
+        parts[0].fail_start = true;
+        match run(&u, now, &parts, &log, || {}, false) {
+            Outcome::Failed { message, restarted, not_restarted } => {
+                assert_eq!(restarted, ["script host"]);
+                assert_eq!(not_restarted, [("engines", "gone".to_string())]);
+                assert!(message.contains("phone call is in progress") && message.contains("could not start engines again"), "{message}");
+            }
+            other => panic!("{other:?}"),
+        }
+        assert_eq!(u.status_at(now).state, State::Failed);
+    }
+
+    #[test]
+    fn with_no_part_that_holds_calls_there_is_no_extra_look() {
+        let (u, fake, now) = ready();
+        let log: Log = Log::default();
+        let mut parts = parts(&log);
+        parts[2].holds_calls = false;
+        assert_eq!(run(&u, now, &parts, &log, || {}, false), Outcome::HandedOff);
+        assert_eq!(fake.call_reads.load(std::sync::atomic::Ordering::SeqCst), 0);
     }
 
     #[test]

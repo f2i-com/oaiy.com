@@ -81,10 +81,23 @@ impl Default for Readings {
     }
 }
 
+/// What the call sources say, and nothing else: the look an install takes just before the plugins are stopped.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CallReadings {
+    /// Calls on OAIY's own call route.
+    pub hub_calls: usize,
+    /// The phone plugins' word on whether a call is live.
+    pub phone: LineState,
+}
+
 /// What the app is doing, as far as an update cares.
 pub trait Activity: Send + Sync {
     /// Look at everything. `fresh`: ask every source now (an install), rather than accept an answer kept a few seconds (the status a window polls).
     fn read(&self, fresh: bool) -> Readings;
+
+    /// Only the call sources, always asked afresh. An install takes this look right before it stops the plugins, when the engines and
+    /// the script host are already stopped: what asks the engines a question would find them gone, and a call is all that matters then.
+    fn calls(&self) -> CallReadings;
 }
 
 fn plural(n: usize, one: &str, many: &str) -> String {
@@ -99,20 +112,7 @@ pub fn compute(readings: Option<&Readings>, uptime: Duration) -> Vec<Blocker> {
         out.push(Blocker::new("starting", "OAIY is still starting up. Try again in a minute."));
         return out;
     };
-    if r.hub_calls > 0 {
-        out.push(Blocker::new("call", plural(r.hub_calls, "A phone call is in progress on OAIY's own line.", "{n} phone calls are in progress on OAIY's own line.")));
-    }
-    match &r.phone {
-        LineState::NoPlugin | LineState::Idle => {}
-        LineState::Live { plugin, count } => out.push(Blocker::new(
-            "phoneCall",
-            plural(*count, &format!("{plugin} reports a phone call (ringing, in progress or on hold)."), &format!("{plugin} reports {{n}} phone calls (ringing, in progress or on hold).")),
-        )),
-        LineState::Unknown { plugin, why } => out.push(Blocker::new(
-            "callUnknown",
-            format!("OAIY can't tell whether a phone call is live: {plugin} did not give an answer ({why}). It does not restart while it can't tell; stopping that plugin (Connections, Plugins) lets it."),
-        )),
-    }
+    out.extend(call_blockers(&CallReadings { hub_calls: r.hub_calls, phone: r.phone.clone() }));
     if r.agent_tasks > 0 {
         out.push(Blocker::new("agentTask", plural(r.agent_tasks, "The Agent is working on a task from a flow.", "The Agent is working on {n} tasks from flows.")));
     }
@@ -140,6 +140,26 @@ pub fn compute(readings: Option<&Readings>, uptime: Duration) -> Vec<Blocker> {
     if uptime < MIN_UPTIME {
         let left = (MIN_UPTIME - uptime).as_secs().max(1);
         out.push(Blocker::new("starting", format!("OAIY started less than {} minutes ago; it can update in {left} seconds.", MIN_UPTIME.as_secs() / 60)));
+    }
+    out
+}
+
+/// The reasons the calls give: one on OAIY's own line, one a phone plugin reports, a phone plugin that cannot say.
+pub fn call_blockers(r: &CallReadings) -> Vec<Blocker> {
+    let mut out = Vec::new();
+    if r.hub_calls > 0 {
+        out.push(Blocker::new("call", plural(r.hub_calls, "A phone call is in progress on OAIY's own line.", "{n} phone calls are in progress on OAIY's own line.")));
+    }
+    match &r.phone {
+        LineState::NoPlugin | LineState::Idle => {}
+        LineState::Live { plugin, count } => out.push(Blocker::new(
+            "phoneCall",
+            plural(*count, &format!("{plugin} reports a phone call (ringing, in progress or on hold)."), &format!("{plugin} reports {{n}} phone calls (ringing, in progress or on hold).")),
+        )),
+        LineState::Unknown { plugin, why } => out.push(Blocker::new(
+            "callUnknown",
+            format!("OAIY can't tell whether a phone call is live: {plugin} did not give an answer ({why}). It does not restart while it can't tell; stopping that plugin (Connections, Plugins) lets it."),
+        )),
     }
     out
 }
@@ -188,6 +208,10 @@ impl Activity for Probes {
             migrating: self.migration.as_ref().is_some_and(|f| f()),
         }
     }
+
+    fn calls(&self) -> CallReadings {
+        CallReadings { hub_calls: crate::voice::live_call_count(), phone: self.phone.as_ref().map_or(LineState::NoPlugin, |line| line.ask(true)) }
+    }
 }
 
 #[cfg(test)]
@@ -202,6 +226,8 @@ pub(crate) mod fake {
         pub state: Mutex<Readings>,
         pub reads: AtomicUsize,
         pub fresh_reads: AtomicUsize,
+        /// How often only the calls were looked at (just before the plugins stop).
+        pub call_reads: AtomicUsize,
     }
 
     /// The parts of [`Readings`] the tests set one at a time (the old names kept, so a test reads as before).
@@ -260,6 +286,12 @@ pub(crate) mod fake {
                 self.fresh_reads.fetch_add(1, Ordering::SeqCst);
             }
             self.state.lock().unwrap().clone()
+        }
+
+        fn calls(&self) -> CallReadings {
+            self.call_reads.fetch_add(1, Ordering::SeqCst);
+            let state = self.state.lock().unwrap();
+            CallReadings { hub_calls: state.hub_calls, phone: state.phone.clone() }
         }
     }
 }

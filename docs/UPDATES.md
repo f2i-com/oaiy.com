@@ -79,8 +79,14 @@ Each of these keeps "Restart to update" off, by itself, and is shown in words ne
 
 The blockers are looked at when the button is pressed, and again right before anything is
 stopped (saving the Agent's work takes a few seconds, and a call may have begun). The
-second look asks every source afresh, the phone plugin included: what the status showed a few
-seconds ago is never the answer to "is it safe now".
+second look asks every source afresh, the phone plugins included: what the status showed a few
+seconds ago is never the answer to "is it safe now". And the calls are looked at a third time,
+from their sources alone (OAIY's own line and the phone plugins, asked afresh), right before
+the plugins are stopped: the stops before it (the engines, the script host) take seconds, the
+plugins are what holds the phone, and stopping them is what would end a call. If a call has
+begun by then, or a phone plugin can no longer say, what was stopped is started again and
+the update is back to "ready" with its download, nothing installed. The one gap left is the
+instant between that look and the plugin's own stop.
 
 What OAIY cannot see, it cannot wait for: a conversation the person is having in the Agent
 page right now is not a task the desktop knows about. "Restart to update" asks the Agent to
@@ -95,7 +101,10 @@ save, and ends its turn, as quitting does.
 4. Everything OAIY runs is stopped, in the order quitting stops it (the same code: quitting
    and updating share one list): the engines OAIY started, the script host, the plugins, the
    services. The services that were running are written down so the OAIY that opens after
-   the update starts them again.
+   the update starts them again. Right before the plugins, the calls are looked at once more
+   (above); the phone plugins are not moved to the end of the list because that list is
+   quitting's too, and its order is the one that lets a phone plugin shut down cleanly before
+   anything slow runs.
 5. The installer takes the verified bytes. On Windows that starts the installer and ends
    this process; the installer replaces OAIY and opens it again (the old tray icon may stay
    on screen until the mouse passes over it: OAIY does not remove it before the installer is
@@ -104,8 +113,11 @@ save, and ends its turn, as quitting does.
 
 If a part will not stop, or the installer cannot be started, everything that was stopped is
 started again (last stopped, first started) and the update is shown as **failed**, with the
-reason in words. OAIY is then running as before. If something could not be started again,
-the message says which and to quit OAIY from its tray icon and open it again.
+reason in words. OAIY is then running as before. So it is after a panic (an internal error) anywhere
+in the sequence: a guard starts again what was stopped, including the part that was in the middle of
+stopping, and fails the update, so OAIY is never left half stopped with the update stuck on
+"installing". If something could not be started again, the message says which and to quit
+OAIY from its tray icon and open it again.
 
 The desktop process is never put in a job object that kills its children when it ends:
 the installer it starts would inherit that and be killed with it.
@@ -237,6 +249,12 @@ doing anything: publish that first, then a release signed with the new key.
 OAIY would accept. Rotate it, and tell people to install the new release by hand.
 
 ## Not yet
+
+- **A stop that never returns.** Each thing OAIY stops has its own limits (the engines' shutdown,
+  the services' kill timeouts), but a part that hangs inside its stop for ever would hang the
+  update with it: the sequence does not put a time limit of its own on a part, because giving
+  up on one that is still running and starting the others again would race it. If it ever
+  happens, quit OAIY from its tray icon.
 
 - **Rollback.** A failed install is put back (above), but an install that finishes and then
   does not work is not: the previous installer is not kept. The design: keep the last

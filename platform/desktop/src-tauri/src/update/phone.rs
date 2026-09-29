@@ -721,6 +721,62 @@ mod process_tests {
     }
 
     #[test]
+    fn a_call_that_begins_while_the_engines_are_stopping_is_seen_by_the_look_before_the_plugins_stop() {
+        if !has_node() {
+            return;
+        }
+        let sb = Sandbox::new("last-look");
+        let host = host(&sb);
+        let dir = install(&sb, &["call.switchboard"], idle_board());
+        start(&host);
+        // The real updater over the real probes and the real phone line, and two stand-in parts: the first (the engines) takes its time to
+        // stop, and in that time a call reaches the phone plugin; the second is the plugins, which hold the phone.
+        let line: Arc<dyn Line> = Arc::new(PluginLine::with_timeout(host.clone(), Duration::from_millis(800)));
+        let (updater, _, now) = crate::update::updater::tests::ready();
+        updater.set_activity(Arc::new(Probes { phone: Some(line), ..Default::default() }));
+        let log = Arc::new(Mutex::new(Vec::<String>::new()));
+        struct StandIn {
+            name: &'static str,
+            log: Arc<Mutex<Vec<String>>>,
+            on_stop: Option<Box<dyn Fn() + Send + Sync>>,
+            holds_calls: bool,
+        }
+        impl crate::update::install::Part for StandIn {
+            fn name(&self) -> &'static str {
+                self.name
+            }
+            fn stop(&self) -> Result<(), String> {
+                self.log.lock().unwrap().push(format!("stop {}", self.name));
+                if let Some(on_stop) = &self.on_stop {
+                    on_stop();
+                }
+                Ok(())
+            }
+            fn start(&self) -> Result<(), String> {
+                self.log.lock().unwrap().push(format!("start {}", self.name));
+                Ok(())
+            }
+            fn holds_calls(&self) -> bool {
+                self.holds_calls
+            }
+        }
+        let dir2 = dir.clone();
+        let engines = StandIn { name: "the engines", log: log.clone(), on_stop: Some(Box::new(move || behave(&dir2, board(Some(call()))))), holds_calls: false };
+        let plugins = StandIn { name: "the plugins", log: log.clone(), on_stop: None, holds_calls: true };
+        let parts: Vec<&dyn crate::update::install::Part> = vec![&engines, &plugins];
+        let hand_off = |_: &crate::update::VerifiedPackage| -> Result<(), String> { panic!("the installer must not be started") };
+        let (flush, clock) = (|| {}, move || now);
+        let outcome = crate::update::install::perform(&updater, &crate::update::install::Steps { flush: &flush, parts: &parts, hand_off: &hand_off, clock: &clock });
+        match outcome {
+            crate::update::install::Outcome::Refused(crate::update::updater::InstallRefusal::Blocked(blockers)) => assert!(blockers.iter().any(|b| b.code == "phoneCall"), "{blockers:?}"),
+            other => panic!("{other:?}"),
+        }
+        assert_eq!(*log.lock().unwrap(), ["stop the engines", "start the engines"], "the plugins were never stopped, and the engines are running again");
+        assert_eq!(updater.status_at(now).state, crate::update::updater::State::Ready);
+        host.stop("line").unwrap();
+    }
+
+    #[test]
     fn the_blockers_read_a_live_plugin_call_even_when_the_call_hub_knows_of_none() {
         let line = FakeLine::new(LineState::Live { plugin: "Line Test Plugin".into(), count: 2 });
         let probes = Probes { phone: Some(line.clone()), ..Default::default() };

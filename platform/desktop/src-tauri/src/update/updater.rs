@@ -295,6 +295,15 @@ impl Updater {
         self.blockers_with(now, true)
     }
 
+    /// Only what the calls say, asked afresh: the look right before the plugins are stopped (see `install::perform`).
+    pub fn call_blockers(&self) -> Vec<Blocker> {
+        let activity = self.activity.read().unwrap_or_else(|e| e.into_inner()).clone();
+        match activity {
+            Some(activity) => blockers::call_blockers(&activity.calls()),
+            None => blockers::compute(None, Duration::ZERO),
+        }
+    }
+
     fn blockers_with(&self, now: Instant, fresh: bool) -> Vec<Blocker> {
         let activity = self.activity.read().unwrap_or_else(|e| e.into_inner()).clone();
         let readings = activity.as_ref().map(|a| a.read(fresh));

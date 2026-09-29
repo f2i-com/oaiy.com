@@ -360,6 +360,11 @@ impl Part for PluginsPart {
         "the plugins"
     }
 
+    /// The phone plugins hold the calls: stopping them ends one, so the calls are looked at once more right before.
+    fn holds_calls(&self) -> bool {
+        true
+    }
+
     fn stop(&self) -> Result<(), String> {
         if let Some(host) = &self.host {
             *self.was_running.lock().unwrap_or_else(|e| e.into_inner()) = host.running_ids();
