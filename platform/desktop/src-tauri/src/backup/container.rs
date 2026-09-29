@@ -73,10 +73,20 @@ fn damaged() -> BackupError {
 
 // ---- names ----------------------------------------------------------------------------------------
 
-const RESERVED: [&str; 22] = [
-    "con", "prn", "aux", "nul", "com1", "com2", "com3", "com4", "com5", "com6", "com7", "com8", "com9", "lpt1", "lpt2", "lpt3", "lpt4", "lpt5", "lpt6",
-    "lpt7", "lpt8", "lpt9",
-];
+/// Whether a part of a name (before its first dot) is one Windows keeps for a device: `CON`, `PRN`, `AUX`, `NUL`, the console
+/// handles `CONIN$` and `CONOUT$`, and `COM` or `LPT` followed by one digit, `0` to `9`, or by a superscript digit
+/// (`COM¹`, `LPT²`, `COM³`), which Windows reads as the same device. A digit of another script or width is refused too.
+/// Trailing spaces are ignored, as Windows ignores them.
+pub(crate) fn is_reserved_device_name(stem: &str) -> bool {
+    let stem = stem.trim_end_matches(' ').to_lowercase();
+    if matches!(stem.as_str(), "con" | "prn" | "aux" | "nul" | "conin$" | "conout$") {
+        return true;
+    }
+    stem.strip_prefix("com").or_else(|| stem.strip_prefix("lpt")).is_some_and(|digit| {
+        let mut chars = digit.chars();
+        matches!((chars.next(), chars.next()), (Some(c), None) if c.is_numeric())
+    })
+}
 
 /// Whether `name` is a name that stays inside the folder it is put in, on every platform: a
 /// relative path of plain segments with forward slashes. Refuses `..` and `.`, a leading slash or
@@ -114,8 +124,7 @@ pub(crate) fn check_entry_name(name: &str, limits: &Limits) -> Result<()> {
         if segment.as_bytes().windows(2).any(|w| w[0] == b'~' && w[1].is_ascii_digit()) {
             return Err(unsafe_name("it is a short-name alias"));
         }
-        let stem = segment.split('.').next().unwrap_or(segment).to_lowercase();
-        if RESERVED.contains(&stem.as_str()) {
+        if is_reserved_device_name(segment.split('.').next().unwrap_or(segment)) {
             return Err(unsafe_name("a part is a reserved device name"));
         }
     }

@@ -5096,3 +5096,34 @@ fn the_agents_instruction_texts_are_listed_with_their_full_length_and_apply_only
     assert_eq!(all["messages"]["instructions"], long);
     assert_eq!((all["messages"]["callBackFilter"].as_str(), all["messages"]["callBackLine"].as_str(), all["messages"]["country"].as_str()), (Some("any"), Some("Sorry we missed you"), Some("NZ")));
 }
+
+/// Every name Windows keeps for a device is refused in every place a name is checked, whatever its case, its extension or
+/// the way its digit is written: the ones the first list had, COM0 and LPT0, the superscript digits, the console handles.
+#[test]
+fn every_reserved_device_name_is_refused_in_every_form() {
+    let limits = Limits::default();
+    let mut bad: Vec<String> = ["con", "prn", "aux", "nul", "conin$", "conout$"].iter().map(|s| s.to_string()).collect();
+    for device in ["com", "lpt"] {
+        for digit in ["0", "1", "2", "3", "4", "5", "6", "7", "8", "9", "\u{b9}", "\u{b2}", "\u{b3}", "\u{ff11}", "\u{ff10}"] {
+            bad.push(format!("{device}{digit}"));
+        }
+    }
+    for name in &bad {
+        for spelled in [name.clone(), name.to_uppercase(), format!("{name}.txt"), format!("{}.json", name.to_uppercase()), format!("a/{name}"), format!("a/{name}.tar.gz"), format!("{name} .x")] {
+            assert!(container::check_entry_name(&spelled, &limits).is_err(), "{spelled:?} is a reserved device name");
+        }
+    }
+    // Names that only look like them are fine.
+    for name in ["com", "comm1", "com10", "lpt", "combo.txt", "console", "lpt1a.txt", "aux1", "conin", "nul-1", "com.port", "a/lpt-1", "com\u{b9}\u{b9}"] {
+        assert!(container::check_entry_name(name, &limits).is_ok(), "{name:?} is an ordinary name");
+    }
+    // And they are refused in a backup that names them, whole.
+    let out = TempDir::new("reserved");
+    for name in ["flows/COM\u{b9}.json", "voices/lpt0.wav", "flows/Conin$.json"] {
+        let files: Vec<(&str, &[u8])> = vec![(name, b"{}")];
+        let file = out.0.join("r.oaiybackup");
+        craft(&file, &manifest_for(&files), &files, true);
+        let dst = TempDir::new("reserved-dst");
+        assert_refused(&dst.0, &file, ErrorKind::Unsafe);
+    }
+}
