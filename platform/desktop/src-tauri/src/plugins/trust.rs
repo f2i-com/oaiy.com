@@ -1672,6 +1672,49 @@ pub(crate) mod tests {
     }
 
     #[test]
+    fn a_weak_key_cannot_sign_anything_even_if_it_is_pinned() {
+        // A small-order public key (here the identity point) with R the base point and
+        // S = 1 makes a "signature" that plain Ed25519 verification accepts for ANY
+        // message: [1]B = B + [k]·identity. `verify_strict` refuses a small-order key, and
+        // that is what stands between a pin file with such a key in it (by mistake, or
+        // planted) and a package anyone can "sign".
+        use ed25519_dalek::Verifier as _;
+        let mut identity = [0u8; 32];
+        identity[0] = 1;
+        let weak = VerifyingKey::from_bytes(&identity).unwrap();
+        let mut signature_bytes = [0u8; 64];
+        signature_bytes[0] = 0x58;
+        signature_bytes[1..32].fill(0x66); // the base point, compressed
+        signature_bytes[32] = 1;
+        let signature = Signature::from_bytes(&signature_bytes);
+
+        let scratch = Scratch::new("weak-key");
+        let dir = scratch.package("demo");
+        fill(&dir);
+        let payload = TestKey::generate("unused").payload_of(&dir, "demo-plugin", "1.0.0");
+        assert!(weak.verify(&payload, &signature).is_ok(), "the premise: plain verification accepts it");
+        assert!(weak.verify_strict(&payload, &signature).is_err());
+
+        let envelope = serde_json::json!({
+            "format": 1,
+            "alg": "Ed25519",
+            "keyId": "weak-key",
+            "payloadB64": base64::engine::general_purpose::STANDARD.encode(&payload),
+            "signature": base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(signature_bytes),
+        });
+        std::fs::write(dir.join(PACKAGE_MANIFEST_FILE), envelope.to_string()).unwrap();
+        let pinned = Publishers(vec![Publisher {
+            key_id: "weak-key".into(),
+            name: "Weak".into(),
+            key: weak,
+            plugins: BTreeSet::from(["demo".to_string()]),
+        }]);
+        let svc = service(TrustPolicy::release(), pinned, &scratch);
+        let t = svc.assess_fresh(&dir, "demo");
+        assert!(quarantine_reason(&t).contains("signature does not match"), "{t:?}");
+    }
+
+    #[test]
     fn a_wrong_or_forged_signature_quarantines() {
         let (_s, dir, key, svc) = signed(TrustPolicy::release());
         let path = dir.join(PACKAGE_MANIFEST_FILE);
@@ -1851,6 +1894,23 @@ pub(crate) mod tests {
     }
 
     #[test]
+    fn a_directory_link_in_a_signed_package_quarantines_whatever_it_points_at() {
+        // A junction (Windows) or a symbolic link (elsewhere) standing in for a listed
+        // folder, pointing at a copy with the very same bytes: the check walks folders and
+        // files, so a link is refused, not followed.
+        let (scratch, dir, _k, svc) = signed(TrustPolicy::release());
+        let copy = scratch.package("ui-copy");
+        std::fs::write(copy.join("index.html"), b"<p>hello</p>").unwrap();
+        std::fs::remove_dir_all(dir.join("ui")).unwrap();
+        if !dir_link(&dir.join("ui"), &copy) {
+            return; // this machine cannot make one
+        }
+        let t = svc.assess_fresh(&dir, "demo");
+        remove_dir_link(&dir.join("ui"));
+        assert!(quarantine_reason(&t).contains("a symbolic link is present: ui"), "{t:?}");
+    }
+
+    #[test]
     fn a_quarantine_tells_a_developer_how_to_run_their_own_build_and_nobody_else() {
         let (_s, dir, _k, dev) = signed(TrustPolicy::developer());
         std::fs::write(dir.join("demo-plugin.exe"), b"my own build").unwrap();
@@ -2001,6 +2061,29 @@ pub(crate) mod tests {
         svc.forget_local("demo");
         assert_eq!(svc.assess(&dir, "demo").state, TrustState::Unsigned);
         assert_eq!(reopened.assess(&dir, "demo").state, TrustState::Unsigned, "the other reads the file again when it changes");
+    }
+
+    #[test]
+    fn a_decision_another_service_makes_over_the_same_store_is_seen_by_the_scan() {
+        // The desktop and a headless server can share a data directory. One scanned the
+        // package as changed since it was trusted and remembered that; the person then
+        // trusts it again through the other. The folder itself has not changed, so its
+        // fingerprint has not either: what tells the first that its answer is stale is
+        // the trust record it was made under.
+        let (scratch, dir, first) = unsigned_release();
+        first.trust_local(&dir, "demo").unwrap();
+        std::fs::write(dir.join("demo-plugin.exe"), b"a different build").unwrap();
+        assert_eq!(first.assess(&dir, "demo").state, TrustState::Unsigned);
+
+        // Another write of the same store must not share a file time with the last one.
+        std::thread::sleep(std::time::Duration::from_millis(60));
+        let second = service(TrustPolicy::release(), Publishers::default(), &scratch);
+        second.trust_local(&dir, "demo").unwrap();
+        assert_eq!(first.assess(&dir, "demo").state, TrustState::TrustedLocal, "the record changed, so the remembered answer is not used");
+
+        std::thread::sleep(std::time::Duration::from_millis(60));
+        second.forget_local("demo");
+        assert_eq!(first.assess(&dir, "demo").state, TrustState::Unsigned);
     }
 
     #[test]
