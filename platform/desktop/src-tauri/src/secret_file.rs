@@ -126,7 +126,7 @@ fn create_staging(dir: &Path, name: &OsStr, next: &mut impl FnMut() -> u64) -> i
 /// at it. Those clear within moments, so it tries a few times before giving up. It does not retry
 /// when a folder stands where the file belongs, which no wait would change.
 #[cfg(windows)]
-fn rename_over(from: &Path, to: &Path) -> io::Result<()> {
+pub(crate) fn rename_over(from: &Path, to: &Path) -> io::Result<()> {
     let mut attempt: u64 = 0;
     loop {
         match std::fs::rename(from, to) {
@@ -146,7 +146,7 @@ fn is_transient(e: &io::Error) -> bool {
 }
 
 #[cfg(not(windows))]
-fn rename_over(from: &Path, to: &Path) -> io::Result<()> {
+pub(crate) fn rename_over(from: &Path, to: &Path) -> io::Result<()> {
     std::fs::rename(from, to)
 }
 
@@ -392,8 +392,10 @@ fn owner_only_dir(builder: &mut DirBuilder) {
 #[cfg(not(unix))]
 fn owner_only_dir(_builder: &mut DirBuilder) {}
 
-/// A new file that only this user can read or write, from the call that creates it.
-fn create_new_owner_only(path: &Path) -> io::Result<File> {
+/// A new file that only this user can read or write, from the call that creates it (the backup
+/// writes its staged copies and its output through this, so a streamed file is private from its
+/// first byte too).
+pub(crate) fn create_new_owner_only(path: &Path) -> io::Result<File> {
     let mut options = OpenOptions::new();
     options.write(true).create_new(true);
     #[cfg(unix)]
