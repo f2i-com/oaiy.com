@@ -1,0 +1,449 @@
+// Reaching the owner for a caller who asks for a person, and taking a message: what the model is offered (nothing until
+// the owner allows it, and then the same for every call), what it is told when a request comes out, what the caller is
+// never told (a transfer that has not happened), and how a call the owner took goes on or ends. The desktop decides
+// whether anything rings; these are about what the receptionist's agent does with what the desktop says.
+import { afterEach, describe, expect, it, vi } from 'vitest';
+import { Agent } from '../../src/agent/agent';
+import type { Turn } from '../../src/agent/protocol';
+import { NetGate } from '../../src/gate/netgate';
+import { Vfs } from '../../src/vfs/vfs';
+import type { CallerNote, SessionInfo } from '../../src/vfs/projects';
+import { NO_CALL_FEATURES, Sessions, TRANSFER_NOTES, callInstructions, ownerInstructions } from '../../src/sessions';
+import { NO_IDENTITY } from '../../src/identity';
+import type { Desktop } from '../../src/desktop/bridge';
+import { DEFAULT_MESSAGE_SETTINGS, type MessageSettings } from '../../src/settings';
+import { OPENAI, fakeProvider } from './fakeProvider';
+
+afterEach(() => vi.unstubAllGlobals());
+
+type Sent = Array<[string, string, unknown]>;
+
+/** Sessions on a fake desktop that records what it is asked and answers a request to reach the owner as `ringing`. */
+function setup(overrides: Record<string, unknown> = {}) {
+  const chats = new Map<string, Turn[]>();
+  let index: SessionInfo[] = [];
+  const project = {
+    loadSessions: async () => index,
+    saveSessions: async (list: SessionInfo[]) => {
+      index = list;
+    },
+    loadSessionChat: async (id: string) => chats.get(id) ?? [],
+    saveSessionChat: async (id: string, turns: Turn[]) => {
+      chats.set(id, turns);
+    },
+    callers: [] as CallerNote[],
+    loadCallers: async () => project.callers,
+    saveCallers: async (list: CallerNote[]) => {
+      project.callers = list;
+    },
+  };
+  const sent: Sent = [];
+  const said: string[] = [];
+  const desktop = {
+    say: async (_callId: string, text: string) => void said.push(text),
+    finishCall: async (callId: string, goodbye: string) => {
+      sent.push(['finish', callId, goodbye]);
+      return { ok: true, output: { accepted: true } };
+    },
+    callTool: async (callId: string, name: string, args: unknown) => {
+      sent.push([name, callId, args]);
+      if (name === 'transfer_to_owner') return { ok: true, output: { status: 'ringing', requestId: 'assist_1', ringSeconds: 30, instruction: 'The owner is being rung.' } };
+      return { ok: true, output: { recorded: true } };
+    },
+    takeMessage: async (callId: string, body: unknown) => {
+      sent.push(['take_message', callId, body]);
+      return { recorded: true, id: 'msg_1', notified: true };
+    },
+    ...overrides,
+  };
+  const messages: MessageSettings = { ...DEFAULT_MESSAGE_SETTINGS, answer: false, instructions: '', calls: true, callInstructions: 'Be kind.' };
+  const sessions = new Sessions(
+    project as never,
+    (extra) => new Agent({ vfs: new Vfs(), gate: new NetGate(), provider: () => OPENAI, projectSummary: () => '', ...extra }),
+    () => messages,
+    () => desktop as unknown as Desktop,
+    { changed: () => {}, event: () => {} },
+  );
+  return { sessions, sent, said, chats };
+}
+
+async function settled(sessions: Sessions): Promise<void> {
+  for (let i = 0; i < 300 && sessions.busy; i++) await new Promise((r) => setTimeout(r, 10));
+  await Promise.all(sessions.list.map((s) => s.speech?.done));
+}
+
+const ALLOWED = { type: 'voice.features', transfer: true, messages: true };
+const START = { type: 'call.started', callId: 'call_o', from: '+61491570006', name: 'Alex', allowTransfer: true, greeting: 'Thanks for calling!' };
+const toolNames = (body: Record<string, unknown>) => (body.tools as Array<{ function: { name: string } }>).map((t) => t.function.name);
+const lastUser = (turns: Turn[]) => [...turns].reverse().find((t) => t.role === 'user') as { text: string } | undefined;
+
+describe('what the model is offered about reaching the owner', () => {
+  it('is nothing until the owner allows it: the instructions are byte for byte what they were, and there are no tools for it', async () => {
+    const before = callInstructions('Be kind.');
+    expect(callInstructions('Be kind.', false, NO_IDENTITY, NO_CALL_FEATURES)).toBe(before);
+    expect(ownerInstructions(NO_CALL_FEATURES)).toBe('');
+    expect(before).not.toMatch(/transfer_to_owner|take_message|speak to the owner/i);
+    const fake = fakeProvider('openai', [{ text: 'Hello!' }]);
+    const { sessions } = setup();
+    await sessions.callEvent(START);
+    await sessions.callEvent({ type: 'call.caller', callId: 'call_o', text: 'Can I speak to the owner?' });
+    await settled(sessions);
+    const names = toolNames(fake.bodies[0]);
+    expect(names).toEqual(expect.arrayContaining(['end_call', 'request_appointment', 'lookup_business_data']));
+    expect(names).not.toContain('transfer_to_owner');
+    expect(names).not.toContain('take_message');
+    expect(JSON.stringify(fake.bodies[0].messages)).not.toContain('transfer_to_owner');
+    // ...and the start note says nothing of it either (a call started as ever).
+    expect(JSON.stringify(fake.bodies[0].messages)).not.toContain('The owner can be reached');
+  });
+
+  it('is both tools and the words for them once it does, the same for every call and every caller', async () => {
+    const text = callInstructions('Be kind.', false, NO_IDENTITY, { transfer: true, messages: true });
+    expect(text).toContain('transfer_to_owner');
+    expect(text).toContain('take_message');
+    // What it may say: trying, never transferred or connected until told; nothing promised; no owner number.
+    expect(text).toContain('Never say the call is being transferred, connected or on hold until you are told the owner has accepted');
+    expect(text).toContain('never promise a callback time or say why');
+    expect(text).toContain("You do not have the owner's number, and never give one.");
+    expect(text).toContain('Say the owner will be told only when take_message says so; otherwise say the message is saved.');
+    // The same for every call: no name, number or time in it (the model's prompt cache keeps it).
+    expect(text).not.toMatch(/\d{4}|Alex|Liam/);
+    expect(callInstructions('Be kind.', false, NO_IDENTITY, { transfer: true, messages: true })).toBe(text);
+    // Messages alone (transfers off): a message for a caller who asks for the owner, never a person coming to the phone.
+    const only = ownerInstructions({ transfer: false, messages: true });
+    expect(only).toContain('take_message');
+    expect(only).not.toContain('transfer_to_owner');
+    expect(only).toContain('never say a person will come to the phone');
+
+    const fake = fakeProvider('openai', [{ text: 'One.' }, { text: 'Two.' }]);
+    const { sessions } = setup();
+    await sessions.callEvent(ALLOWED);
+    await sessions.callEvent(START);
+    await sessions.callEvent({ type: 'call.caller', callId: 'call_o', text: 'Hi' });
+    await settled(sessions);
+    expect(toolNames(fake.bodies[0])).toEqual(expect.arrayContaining(['transfer_to_owner', 'take_message']));
+    // Another caller's call: the model reads the very same instructions and tool list.
+    await sessions.callEvent({ type: 'call.ended', callId: 'call_o' });
+    await sessions.callEvent({ type: 'call.started', callId: 'call_p', from: '+61400000002', name: 'Sam', allowTransfer: false });
+    await sessions.callEvent({ type: 'call.caller', callId: 'call_p', text: 'Hi' });
+    await settled(sessions);
+    const system = (b: Record<string, unknown>) => JSON.stringify((b.messages as Array<{ role: string; content: unknown }>).filter((m) => m.role === 'system'));
+    expect(system(fake.bodies[1])).toBe(system(fake.bodies[0]));
+    expect(toolNames(fake.bodies[1])).toEqual(toolNames(fake.bodies[0]));
+  });
+
+  it('follows what the desktop says as it connects and when the owner changes it; an older desktop says nothing and nothing is offered', async () => {
+    const { sessions } = setup();
+    expect(sessions.features).toEqual({ transfer: false, messages: false });
+    await sessions.callEvent({ type: 'hello', calls: [] });
+    expect(sessions.features).toEqual({ transfer: false, messages: false });
+    await sessions.callEvent({ type: 'hello', calls: [], features: { transfer: true, messages: true } });
+    expect(sessions.features).toEqual({ transfer: true, messages: true });
+    await sessions.callEvent({ type: 'voice.features', transfer: false, messages: true });
+    expect(sessions.features).toEqual({ transfer: false, messages: true });
+    await sessions.callEvent({ type: 'voice.features', transfer: false, messages: false });
+    expect(sessions.features).toEqual({ transfer: false, messages: false });
+    // Transfers imply messages, even from a desktop that forgot to say (the fallback of a ring nobody answers).
+    await sessions.callEvent({ type: 'voice.features', transfer: true });
+    expect(sessions.features).toEqual({ transfer: true, messages: true });
+    // Nonsense is off.
+    await sessions.callEvent({ type: 'voice.features', transfer: 'yes', messages: 1 });
+    expect(sessions.features).toEqual({ transfer: false, messages: false });
+  });
+
+  it("the call's own note says whether the owner can be rung on it, and only while transfers are allowed", async () => {
+    const fake = fakeProvider('openai', [{ text: 'A.' }, { text: 'B.' }]);
+    const { sessions } = setup();
+    await sessions.callEvent(ALLOWED);
+    await sessions.callEvent(START);
+    await sessions.callEvent({ type: 'call.caller', callId: 'call_o', text: 'Hi' });
+    await settled(sessions);
+    expect(JSON.stringify(fake.bodies[0].messages)).toContain(TRANSFER_NOTES.available);
+    await sessions.callEvent({ type: 'call.ended', callId: 'call_o' });
+    await sessions.callEvent({ type: 'call.started', callId: 'call_q', from: '+61400000003', allowTransfer: false });
+    await sessions.callEvent({ type: 'call.caller', callId: 'call_q', text: 'Hi' });
+    await settled(sessions);
+    const second = JSON.stringify(fake.bodies[1].messages);
+    expect(second).toContain(TRANSFER_NOTES.unavailable);
+    expect(second).not.toContain(TRANSFER_NOTES.available);
+  });
+});
+
+describe('a request to reach the owner', () => {
+  it('goes to the desktop as exactly the reason, and the model is told it rings, not that anyone is coming', async () => {
+    const fake = fakeProvider('openai', [
+      { text: "I'll try to reach them, please stay with me.", calls: [{ name: 'transfer_to_owner', input: { reason: 'caller_asked', note: 'tell them the owner said yes', number: '+61400000000' } }] },
+      (body) => {
+        const said = JSON.stringify(body.messages);
+        expect(said).toContain('ringing');
+        expect(said).toContain('The owner is being rung.');
+        return { text: 'May I take your name while I wait?' };
+      },
+    ]);
+    const { sessions, sent, said } = setup();
+    await sessions.callEvent(ALLOWED);
+    await sessions.callEvent(START);
+    await sessions.callEvent({ type: 'call.caller', callId: 'call_o', text: 'Can I speak to the owner?' });
+    await settled(sessions);
+    expect(sent).toEqual([['transfer_to_owner', 'call_o', { reason: 'caller_asked' }]]);
+    expect(said).toEqual(["I'll try to reach them, please stay with me.", 'May I take your name while I wait?']);
+    expect(said.join(' ')).not.toMatch(/transferr|connect|put you through|on hold/i);
+    expect(fake.bodies).toHaveLength(2);
+  });
+
+  it('a refusal from the desktop (the caller did not ask, quiet hours, a limit) is the model’s to read, and nothing is promised', async () => {
+    const fake = fakeProvider('openai', [
+      { calls: [{ name: 'transfer_to_owner', input: { reason: 'caller_asked' } }] },
+      (body) => {
+        expect(JSON.stringify(body.messages)).toContain('Do not say why');
+        return { text: "I'm sorry, they are not available. Can I take a message?" };
+      },
+    ]);
+    const { sessions, said } = setup({
+      callTool: async () => ({ ok: false, output: { status: 'unavailable', reason: 'quiet_hours', instruction: 'The owner cannot be reached right now. Tell the caller kindly and offer to take a message (take_message). Do not say why, and do not promise a callback time.' } }),
+    });
+    await sessions.callEvent(ALLOWED);
+    await sessions.callEvent(START);
+    await sessions.callEvent({ type: 'call.caller', callId: 'call_o', text: 'Put me through to the owner' });
+    await settled(sessions);
+    expect(said.join(' ')).toBe("I'm sorry, they are not available. Can I take a message?");
+    expect(fake.bodies).toHaveLength(2);
+    // No ring is going: no clock waits for an outcome.
+    expect(sessions.list[0].transferRequest).toBeUndefined();
+  });
+
+  it('when the owner accepts the agent stops and says nothing more, and what the caller says is kept and not answered', async () => {
+    const fake = fakeProvider('openai', [{ calls: [{ name: 'transfer_to_owner', input: { reason: 'caller_asked' } }] }, { text: 'Please hold.' }]);
+    const { sessions, said } = setup();
+    await sessions.callEvent(ALLOWED);
+    const call = (await sessions.callEvent(START))!;
+    await sessions.callEvent({ type: 'call.caller', callId: 'call_o', text: 'Can I speak to the owner?' });
+    await settled(sessions);
+    const before = fake.bodies.length;
+    await sessions.callEvent({ type: 'call.transfer', callId: 'call_o', requestId: 'assist_1', outcome: 'accepted', source: 'phone' });
+    expect(call.handingOver).toBe(true);
+    expect(call.transferRequest).toBeUndefined();
+    expect(lastUser(call.agent.turns)?.text).toBe(TRANSFER_NOTES.accepted);
+    // The caller talks while the owner connects: heard, kept, not answered.
+    await sessions.callEvent({ type: 'call.caller', callId: 'call_o', text: 'Hello? Is anyone there?' });
+    await settled(sessions);
+    expect(fake.bodies).toHaveLength(before);
+    expect(said.filter((s) => s.includes('anyone'))).toEqual([]);
+    // What was said is in the record, after the note: nothing of it was answered.
+    expect(call.agent.turns.at(-1)).toMatchObject({ role: 'user', text: TRANSFER_NOTES.accepted });
+    expect(call.aside).toHaveLength(1);
+  });
+
+  it('a decline, a timeout and a takeover that failed each tell the model what is true and to offer a message', async () => {
+    for (const [outcome, expected] of [
+      ['declined', TRANSFER_NOTES.declined],
+      ['expired', TRANSFER_NOTES.nobody],
+      ['unavailable', TRANSFER_NOTES.nobody],
+    ] as const) {
+      const fake = fakeProvider('openai', [
+        { text: "I'll try.", calls: [{ name: 'transfer_to_owner', input: { reason: 'caller_asked' } }] },
+        { text: 'One moment.' },
+        (body) => {
+          expect(JSON.stringify(body.messages)).toContain(expected.replace(/"/g, '\\"'));
+          return { text: "I'm sorry, they can't come to the phone. Would you like to leave a message?" };
+        },
+      ]);
+      const { sessions, said } = setup();
+      await sessions.callEvent(ALLOWED);
+      await sessions.callEvent(START);
+      await sessions.callEvent({ type: 'call.caller', callId: 'call_o', text: 'I want to speak to the owner' });
+      await settled(sessions);
+      await sessions.callEvent({ type: 'call.transfer', callId: 'call_o', requestId: 'assist_1', outcome, source: 'phone' });
+      await settled(sessions);
+      expect(said.join(' '), outcome).toContain("I'm sorry, they can't come to the phone. Would you like to leave a message?");
+      expect(sessions.list[0].handingOver, outcome).toBe(false);
+      expect(said.join(' '), outcome).not.toMatch(/connect|transferr|put you through/i);
+      expect(fake.bodies).toHaveLength(3);
+      vi.unstubAllGlobals();
+    }
+  });
+
+  it('the owner’s own words for the caller are relayed as words, with no promise added', async () => {
+    const fake = fakeProvider('openai', [
+      { calls: [{ name: 'transfer_to_owner', input: { reason: 'caller_asked' } }] },
+      { text: 'Hold on.' },
+      (body) => {
+        expect(JSON.stringify(body.messages)).toContain(TRANSFER_NOTES.declinedWith('Back after three, please leave a message').replace(/"/g, '\\"'));
+        return { text: 'They will be back after three. Would you like to leave a message?' };
+      },
+    ]);
+    const { sessions, said } = setup();
+    await sessions.callEvent(ALLOWED);
+    await sessions.callEvent(START);
+    await sessions.callEvent({ type: 'call.caller', callId: 'call_o', text: 'Can I speak to the owner?' });
+    await settled(sessions);
+    await sessions.callEvent({ type: 'call.transfer', callId: 'call_o', requestId: 'assist_1', outcome: 'declined', message: 'Back after three, please leave a message' });
+    await settled(sessions);
+    expect(said.join(' ')).toContain('They will be back after three. Would you like to leave a message?');
+    expect(fake.bodies).toHaveLength(3);
+  });
+
+  it('a ring the desktop never reports the end of is ended for the model too, after its time and a grace', async () => {
+    const fake = fakeProvider('openai', [
+      { calls: [{ name: 'transfer_to_owner', input: { reason: 'caller_asked' } }] },
+      { text: 'One moment.' },
+      (body) => {
+        expect(JSON.stringify(body.messages)).toContain(TRANSFER_NOTES.nobody);
+        return { text: "I'm sorry, I couldn't reach them. Can I take a message?" };
+      },
+    ]);
+    const { sessions, said } = setup({ callTool: async () => ({ ok: true, output: { status: 'ringing', requestId: 'assist_9', ringSeconds: 0.01, instruction: 'Ringing.' } }) });
+    sessions.transferGraceMs = 250;
+    await sessions.callEvent(ALLOWED);
+    const call = (await sessions.callEvent(START))!;
+    await sessions.callEvent({ type: 'call.caller', callId: 'call_o', text: 'Can I speak to the owner?' });
+    await settled(sessions);
+    expect(call.transferRequest).toBe('assist_9');
+    await new Promise((r) => setTimeout(r, 450));
+    await settled(sessions);
+    expect(said.join(' ')).toContain("I'm sorry, I couldn't reach them. Can I take a message?");
+    expect(call.transferRequest).toBeUndefined();
+    expect(fake.bodies).toHaveLength(3);
+  });
+
+  it('a call that ends stops the clock, so nothing is said to a caller who has gone', async () => {
+    fakeProvider('openai', [{ calls: [{ name: 'transfer_to_owner', input: { reason: 'caller_asked' } }] }, { text: 'One moment.' }]);
+    const { sessions, said } = setup({ callTool: async () => ({ ok: true, output: { status: 'ringing', requestId: 'assist_9', ringSeconds: 0.01, instruction: 'Ringing.' } }) });
+    sessions.transferGraceMs = 250;
+    await sessions.callEvent(ALLOWED);
+    const call = (await sessions.callEvent(START))!;
+    await sessions.callEvent({ type: 'call.caller', callId: 'call_o', text: 'Can I speak to the owner?' });
+    await settled(sessions);
+    await sessions.callEvent({ type: 'call.ended', callId: 'call_o', reason: 'hung up' });
+    const spoken = said.length;
+    await new Promise((r) => setTimeout(r, 450));
+    expect(said).toHaveLength(spoken);
+    expect(call.transferRequest).toBeUndefined();
+  });
+});
+
+describe('a call the owner takes', () => {
+  it('is not a call that ended: nothing is written as its end, and it goes on in the same conversation when handed back', async () => {
+    fakeProvider('openai', [{ calls: [{ name: 'transfer_to_owner', input: { reason: 'caller_asked' } }] }, { text: 'Please hold.' }]);
+    const { sessions } = setup();
+    await sessions.callEvent(ALLOWED);
+    const call = (await sessions.callEvent(START))!;
+    await sessions.callEvent({ type: 'call.caller', callId: 'call_o', text: 'Can I speak to the owner?' });
+    await settled(sessions);
+    await sessions.callEvent({ type: 'call.transfer', callId: 'call_o', requestId: 'assist_1', outcome: 'accepted' });
+    await sessions.callEvent({ type: 'call.handoff', callId: 'call_o', phase: 'to_human', reason: 'handoff:takeover' });
+    expect(call.callId).toBe('call_o');
+    expect(call.handoff).toMatchObject({ reason: 'handoff:takeover' });
+    expect(call.agent.turns.some((t) => t.role === 'user' && t.text.includes('The call ended'))).toBe(false);
+    expect(lastUser(call.agent.turns)?.text).toBe(TRANSFER_NOTES.handoff);
+    // The owner's hello after a restart of the stream: a call in handoff is still going on.
+    await sessions.callEvent({ type: 'hello', calls: ['call_o'], features: { transfer: true, messages: true } });
+    expect(call.callId).toBe('call_o');
+
+    // Handed back: the same call begins again. Nothing of it starts over, and the model is told not to greet again.
+    const starts = () => call.agent.turns.filter((t) => t.role === 'user' && t.text.startsWith('[OAIY] 📞 A call from')).length;
+    const before = starts();
+    const back = await sessions.callEvent({ type: 'call.started', callId: 'call_o', from: '+61491570006', name: 'Alex', allowTransfer: true, resume: { afterHandoff: true, handoffSeconds: 42, via: 'return' } });
+    expect(back).toBe(call);
+    expect(call.handoff).toBeUndefined();
+    expect(call.handingOver).toBe(false);
+    expect(starts()).toBe(before);
+    expect(lastUser(call.agent.turns)?.text).toBe(TRANSFER_NOTES.back('0:42'));
+    expect(lastUser(call.agent.turns)?.text).toContain('do not greet the caller again');
+  });
+
+  it('ends as any call does when the phone says it ended while the owner had it', async () => {
+    fakeProvider('openai', [{ text: 'Hello.' }]);
+    const { sessions } = setup();
+    await sessions.callEvent(ALLOWED);
+    const call = (await sessions.callEvent(START))!;
+    await sessions.callEvent({ type: 'call.handoff', callId: 'call_o', phase: 'to_human', reason: 'handoff:takeover' });
+    await sessions.callEvent({ type: 'call.ended', callId: 'call_o', reason: 'ended_during_handoff' });
+    expect(call.callId).toBeUndefined();
+    expect(call.handoff).toBeUndefined();
+    expect(call.agent.turns.at(-1)).toMatchObject({ text: '[OAIY] 📞 The call ended.' });
+  });
+});
+
+describe('taking a message', () => {
+  it('keeps what the caller said, and says the owner will be told only when the desktop says so', async () => {
+    const fake = fakeProvider('openai', [
+      { calls: [{ name: 'take_message', input: { message: 'Ring me about Friday.', callerName: 'Sam', callbackNumber: '0491 570 156', urgency: 'urgent', wantsCallback: true, from: '+61400000000' } }] },
+      (body) => {
+        const said = JSON.stringify(body.messages);
+        expect(said).toContain('The owner has been told a message is waiting');
+        expect(said).toContain('Do not promise a callback time');
+        return { text: "I've passed that on." };
+      },
+    ]);
+    const { sessions, sent, said } = setup();
+    await sessions.callEvent(ALLOWED);
+    await sessions.callEvent(START);
+    await sessions.callEvent({ type: 'call.caller', callId: 'call_o', text: 'Yes, tell them to ring me about Friday' });
+    await settled(sessions);
+    // Only what the desktop is meant to take: never a number of the model's own choosing as the caller's.
+    expect(sent).toEqual([['take_message', 'call_o', { message: 'Ring me about Friday.', callerName: 'Sam', callbackNumber: '0491 570 156', urgency: 'urgent', wantsCallback: true }]]);
+    expect(said).toEqual(["I've passed that on."]);
+    expect(fake.bodies).toHaveLength(2);
+  });
+
+  it('says it is saved, not that the owner will be told, when nobody could be told', async () => {
+    fakeProvider('openai', [
+      { calls: [{ name: 'take_message', input: { message: 'Ring me.' } }] },
+      (body) => {
+        const said = JSON.stringify(body.messages);
+        expect(said).toContain('saved for the owner');
+        expect(said).not.toContain('The owner has been told');
+        return { text: 'I have saved that for them.' };
+      },
+    ]);
+    const { sessions, said } = setup({ takeMessage: async () => ({ recorded: true, id: 'msg_2', notified: false }) });
+    await sessions.callEvent(ALLOWED);
+    await sessions.callEvent(START);
+    await sessions.callEvent({ type: 'call.caller', callId: 'call_o', text: 'Just tell them to ring me' });
+    await settled(sessions);
+    expect(said).toEqual(['I have saved that for them.']);
+  });
+
+  it('never says it was kept when it was not: a limit, or messages off, is told as it is', async () => {
+    fakeProvider('openai', [
+      { calls: [{ name: 'take_message', input: { message: 'Another.' } }] },
+      (body) => {
+        const said = JSON.stringify(body.messages);
+        expect(said).toContain('NOT recorded');
+        expect(said).toContain('3 messages have been taken on this call');
+        return { text: "I'm sorry, I couldn't take that one." };
+      },
+    ]);
+    const { sessions, said } = setup({
+      takeMessage: async () => {
+        throw new Error('3 messages have been taken on this call: no more can be kept');
+      },
+    });
+    await sessions.callEvent(ALLOWED);
+    await sessions.callEvent(START);
+    await sessions.callEvent({ type: 'call.caller', callId: 'call_o', text: 'One more message please' });
+    await settled(sessions);
+    expect(said).toEqual(["I'm sorry, I couldn't take that one."]);
+  });
+
+  it('asks for the words when there are none, and keeps a long one to the limit', async () => {
+    fakeProvider('openai', [
+      { calls: [{ name: 'take_message', input: { message: '   ' } }] },
+      (body) => {
+        expect(JSON.stringify(body.messages)).toContain('message is empty');
+        return { calls: [{ name: 'take_message', input: { message: 'x'.repeat(601) } }] };
+      },
+      (body) => {
+        expect(JSON.stringify(body.messages)).toContain('keep it to 600');
+        return { text: 'What would you like me to tell them?' };
+      },
+    ]);
+    const { sessions, sent } = setup();
+    await sessions.callEvent(ALLOWED);
+    await sessions.callEvent(START);
+    await sessions.callEvent({ type: 'call.caller', callId: 'call_o', text: 'Can you take a message?' });
+    await settled(sessions);
+    expect(sent).toEqual([]);
+  });
+});

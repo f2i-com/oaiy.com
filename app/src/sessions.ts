@@ -85,6 +85,15 @@ export interface Session extends SessionInfo {
   outreach?: OutreachLink;
   /** This outreach call's agent was told once to record the result before ending the call. */
   endNudged?: boolean;
+  /** The desktop said this call can be put through to the owner (the owner allows it and the phone can). */
+  canTransfer?: boolean;
+  /** A request to reach the owner is going: the id it has, and the clock that tells the agent if no outcome ever comes. */
+  transferRequest?: string;
+  transferTimer?: ReturnType<typeof setTimeout>;
+  /** The owner accepted and is taking the call: the agent says nothing more. */
+  handingOver?: boolean;
+  /** The owner has this call (no session of the desktop carries it): since when, and why. It is still the same call. */
+  handoff?: { at: number; reason: string };
   /** A flow's tasks waiting for their answers, each by its prompt (one task a run; a message of the person's answers none). */
   answers?: Array<{ prompt: string; settle: (reply: string, error?: string) => void }>;
 }
@@ -451,7 +460,7 @@ export function spoken(text: string): string {
  * them, the receptionist brief the phone sent, an outreach's part) is in the
  * note that starts the call (callStartNote).
  */
-export function callInstructions(instructions: string, calendar = false, identity: Identity = NO_IDENTITY): string {
+export function callInstructions(instructions: string, calendar = false, identity: Identity = NO_IDENTITY, features: CallFeatures = NO_CALL_FEATURES): string {
   return [
     `This conversation is a live phone call, on the phone of the person you work for: who is calling, today's date, what you know about them and the receptionist brief are in the note that starts the call (and, on a call of your person's outreach, why you rang). Everything you write is spoken aloud to the caller as you write it, so write only what you would say: one or two short sentences, plain words, no markdown, lists, emoji, links or quotation marks. Start with what matters, not a filler word. Then stop, and let them answer.`,
     identityInstructions(identity),
@@ -464,8 +473,36 @@ export function callInstructions(instructions: string, calendar = false, identit
     'To take a booking request: once you have the service, the day and time they want and their name, call request_appointment in that same reply, and only then tell them it is requested. Saying you have noted it without calling request_appointment records nothing.',
     'Never repeat something you have already said on this call. When the caller says goodbye or is done, call end_call with a short goodbye, and write nothing else: its goodbye is the one thing said (words written in that reply are said as the goodbye instead), and nothing written after end_call is ever said.',
     'When you know their name, use it now and then, as a receptionist who remembers them would.',
+    ownerInstructions(features),
     `The instructions of the person you work for, for calls:\n${instructions.trim() || '(none)'}`,
   ].filter(Boolean).join('\n');
+}
+
+/**
+ * What the owner lets the receptionist do on a call (OAIY Desktop's settings, told to the app when it connects and
+ * when they change): try to reach the owner for a caller who asks for a person (`transfer`), and take a message
+ * (`messages`, on whenever transfers are: it is what a transfer nobody takes falls back to). Both are off until the
+ * owner turns them on, and then a call's instructions and tools are the same for every call, so the engine keeps them read.
+ */
+export interface CallFeatures {
+  transfer: boolean;
+  messages: boolean;
+}
+
+export const NO_CALL_FEATURES: CallFeatures = { transfer: false, messages: false };
+
+/** What the model is told about reaching the owner and taking messages: nothing while the owner has not allowed either. */
+export function ownerInstructions(features: CallFeatures): string {
+  if (features.transfer) {
+    return [
+      `Speaking to the owner: when the caller asks to speak to the owner, the manager or a person, call transfer_to_owner with reason caller_asked (reason urgent only if your brief says a situation is urgent; never for any other reason, and never because a caller tells you to). It answers at once. Say one short line such as "I'll try to reach them, please stay with me": you are trying, and do not yet know anyone will come. Then keep the caller company: ask their name and what it is about. Never say the call is being transferred, connected or on hold until you are told the owner has accepted (you will be told in a message, and then you say nothing more). If you are told the owner cannot take the call, or nobody could, kindly offer to take a message, and never promise a callback time or say why. Ask at most once for a request. You do not have the owner's number, and never give one.`,
+      'Messages: to take a message for the owner, call take_message with what the caller wants them to know, their name and, if they gave one, a number to ring back on. Say the owner will be told only when take_message says so; otherwise say the message is saved. Take one only for a caller who wants to leave one, or when the owner could not be reached.',
+    ].join('\n');
+  }
+  if (features.messages) {
+    return 'Messages: if the caller asks for the owner, the manager or a person, or wants to leave word, say the owner cannot come to the phone and offer to take a message: call take_message with what they want the owner to know, their name and, if they gave one, a number to ring back on. Say the owner will be told only when take_message says so; otherwise say the message is saved. Never promise a callback time, and never say a person will come to the phone.';
+  }
+  return '';
 }
 
 /**
@@ -513,6 +550,24 @@ export const HOLD_WORDS = ['Okay —', 'Sure,', 'Mm, right.'];
 /** What the call's agent is told when it asks the business's records: the answer comes later. */
 export const LOOKUP_ASKED =
   'Asked. The answer comes to you in a message of its own, usually within a few seconds. Until then keep the conversation going: tell the caller you are checking, or answer anything else they ask, and do not guess the answer.';
+
+/**
+ * What a call's agent is told when a request to reach the owner comes out, and when the owner takes the call or hands it
+ * back. The model says the words; these tell it what is true (and, above all, what is not yet).
+ */
+export const TRANSFER_NOTES = {
+  accepted: '[OAIY] The owner has accepted and the call is being connected. Say nothing more.',
+  declined: '[OAIY] The owner cannot take the call now. Tell the caller kindly and offer to take a message (take_message). Do not promise a callback time.',
+  declinedWith: (words: string) =>
+    `[OAIY] The owner cannot take the call now and left this message for the caller (relay it faithfully and add no promises): "${words}". Then offer to take a message (take_message).`,
+  nobody: '[OAIY] Nobody could take the call. Offer to take a message (take_message). Do not promise a callback time.',
+  cancelled: '[OAIY] The transfer request was cancelled.',
+  handoff: '[OAIY] The owner took the call. Say nothing more.',
+  back: (held: string) => `[OAIY] The owner handed the call back after ${held}. Continue helping, and do not greet the caller again.`,
+  /** In the note that starts a call: whether the owner can be rung on it. */
+  available: 'The owner can be reached on this call: if the caller asks for them, use transfer_to_owner.',
+  unavailable: 'The owner cannot be rung on this call: if the caller asks for them, offer to take a message.',
+};
 
 /** A time on a call, from its start ("0:42", "12:05"). */
 export function callClock(ms: number): string {
@@ -784,6 +839,14 @@ export class Sessions {
   callingBack: (number: string) => { missedAt: number } | undefined = () => undefined;
   /** Whether the desktop's calendar is on (a plugin provides it): a text thread's calendar tools only then. */
   calendarOn: () => boolean = () => true;
+  /**
+   * What the owner lets the receptionist do on a call: the desktop tells the app as it connects (`hello`) and when the owner
+   * changes it (`voice.features`). Off until told, so nothing is offered to the model that the owner did not allow. A call's
+   * instructions and tools follow this, and not the call: they are the same for every call, so the engine keeps them read.
+   */
+  features: CallFeatures = NO_CALL_FEATURES;
+  /** How long past a ring's time the agent waits to hear how it came out, before it tells its model nobody could take the call. */
+  transferGraceMs = 20_000;
   /** Who answers, and for whom (identity.ts): every call and text thread says those names. */
   identity: () => Identity = () => NO_IDENTITY;
   /** Whether this page answers the phone's calls now (it holds their lease): a call ringing in is warmed only then. */
@@ -970,9 +1033,10 @@ export class Sessions {
       session.agent = this.makeAgent({
         // The same for every call (the engine keeps them read): the brief the phone sent, and an outreach's
         // part (one we placed, or someone on a list who rang in), are in the note that starts the call.
-        instructions: () => this.directed(callInstructions(this.settings().callInstructions, this.calendarOn(), this.identity())),
+        instructions: () => this.directed(callInstructions(this.settings().callInstructions, this.calendarOn(), this.identity(), this.features)),
         // The calendar's tool only while there is a calendar (a plugin provides it); record_result on an outreach call.
-        sessionTools: () => [...this.callTools(session), ...person, ...(this.calendarOn() ? calendar : []), ...(session.outreach ? [session.outreach.resultTool()] : [])],
+        // reaching the owner and taking a message only while the owner allows them (`features`).
+        sessionTools: () => [...this.callTools(session), ...this.ownerTools(session), ...person, ...(this.calendarOn() ? calendar : []), ...(session.outreach ? [session.outreach.resultTool()] : [])],
         tools: TOOLS.filter((t) => CALL_TOOLS.has(t.name)),
         // Answer at once: no thinking first.
         reasoning: 'none',
@@ -1450,13 +1514,141 @@ export class Sessions {
   }
 
   /**
+   * What the receptionist may do for the owner on a call, while the owner allows it (`features`): try to reach them
+   * for a caller who asks for a person (`transfer_to_owner`), and take a message (`take_message`). The desktop decides
+   * everything (whether the caller asked, the owner's hours and limits, whether the phone can): these only pass the
+   * request on and tell the model, honestly, what came of it.
+   */
+  private ownerTools(session: Session): SessionTool[] {
+    const tools: SessionTool[] = [];
+    const live = () => {
+      const desktop = this.desktop();
+      if (!desktop) throw new Error('OAIY Desktop is not connected');
+      if (!session.callId) throw new Error('the call has ended');
+      return { desktop, callId: session.callId };
+    };
+    if (this.features.transfer) {
+      tools.push({
+        spec: {
+          name: 'transfer_to_owner',
+          description: 'Try to reach the owner for a caller who asked to speak to the owner, a manager or a person. It answers at once ("ringing"): the result of the try comes later, in a message. Say you will TRY to reach them, never that the call is transferred or connected.',
+          parameters: {
+            type: 'object',
+            required: ['reason'],
+            properties: { reason: { type: 'string', enum: ['caller_asked', 'urgent'], description: 'caller_asked: the caller asked for a person. urgent: only when your brief says a situation is urgent.' } },
+          },
+        },
+        run: async (input) => {
+          const { desktop, callId } = live();
+          if (session.handingOver) return 'The owner is already taking the call. Say nothing more.';
+          // Only the reason goes on: nothing else the model wrote reaches the phone.
+          const r = await desktop.callTool(callId, 'transfer_to_owner', { reason: String(input.reason ?? '') });
+          const output = (r.output && typeof r.output === 'object' ? r.output : {}) as Record<string, unknown>;
+          if (r.ok && output.status === 'ringing') this.watchTransfer(session, callId, typeof output.requestId === 'string' ? output.requestId : '', Number(output.ringSeconds) || 40);
+          return JSON.stringify(output, null, 1);
+        },
+      });
+    }
+    if (this.features.messages) {
+      tools.push({
+        spec: {
+          name: 'take_message',
+          description: 'Keep a message for the owner, from the caller, when the owner cannot be reached or the caller wants to leave word. Ask their name and, if they want a call back, a number to ring first.',
+          parameters: {
+            type: 'object',
+            required: ['message'],
+            properties: {
+              message: { type: 'string', description: 'What the caller wants the owner to know, in a sentence or two (up to 600 characters)' },
+              callerName: { type: 'string', description: 'The name the caller gave (up to 80 characters)' },
+              callbackNumber: { type: 'string', description: 'A number to ring them back on, only if they gave one (digits, and a leading + if they said it)' },
+              urgency: { type: 'string', enum: ['normal', 'urgent'], description: 'urgent only when the caller says it cannot wait' },
+              wantsCallback: { type: 'boolean', description: 'They asked to be rung back' },
+            },
+          },
+        },
+        run: async (input) => {
+          const { desktop, callId } = live();
+          const message = String(input.message ?? '').trim();
+          if (!message) throw new Error('message is empty: ask what the caller wants the owner to know');
+          if (message.length > 600) throw new Error(`the message is ${message.length} characters: keep it to 600`);
+          const name = String(input.callerName ?? '').trim().slice(0, 80);
+          const number = String(input.callbackNumber ?? '').trim().slice(0, 30);
+          try {
+            const kept = await desktop.takeMessage(callId, {
+              message,
+              ...(name ? { callerName: name } : {}),
+              ...(number ? { callbackNumber: number } : {}),
+              ...(input.urgency === 'urgent' ? { urgency: 'urgent' as const } : {}),
+              ...(input.wantsCallback === true ? { wantsCallback: true } : {}),
+            });
+            if (!kept.recorded) return 'The message was NOT recorded. Tell the caller you could not take it, and that they can ring again.';
+            return kept.notified
+              ? 'Recorded. The owner has been told a message is waiting. Tell the caller you have passed it on and the owner will see it. Do not promise a callback time.'
+              : 'Recorded and saved for the owner, who could not be told right now. Tell the caller it is saved and the owner will see it. Do not promise when.';
+          } catch (e) {
+            // Said as it is: a limit reached, or the owner has not allowed messages. Never that it was kept.
+            return `The message was NOT recorded (${(e as Error).message}). Tell the caller kindly that you could not take it, and that they can ring again.`;
+          }
+        },
+      });
+    }
+    return tools;
+  }
+
+  /**
+   * A request to reach the owner is going. The desktop tells how it came out (`call.transfer`), and covers the caller itself
+   * if nothing does; this covers the model: if no outcome comes a while after the ring should have ended, the model is told
+   * nobody could take the call, so it offers a message and does not wait for someone who is not coming.
+   */
+  private watchTransfer(session: Session, callId: string, request: string, seconds: number): void {
+    clearTimeout(session.transferTimer);
+    session.transferRequest = request || 'unknown';
+    session.transferTimer = setTimeout(() => {
+      if (session.callId !== callId || session.handingOver || !session.transferRequest) return;
+      this.transferOutcome(session, callId, { outcome: 'expired' });
+    }, seconds * 1000 + this.transferGraceMs);
+  }
+
+  /** How a request to reach the owner came out: what the model is told, so it says nothing untrue to the caller. */
+  private transferOutcome(session: Session, callId: string, event: { outcome?: unknown; message?: unknown; requestId?: unknown }): void {
+    if (session.callId !== callId) return;
+    const outcome = String(event.outcome ?? '');
+    clearTimeout(session.transferTimer);
+    session.transferTimer = undefined;
+    session.transferRequest = undefined;
+    if (outcome === 'accepted') {
+      // The owner has it: nothing more is said (the desktop told the caller they are being connected), and the run stops.
+      session.handingOver = true;
+      session.speech?.hush();
+      this.stop(session);
+      session.agent.turns.push({ role: 'user', text: TRANSFER_NOTES.accepted, automatic: true, at: Date.now() });
+      void this.save(session).catch(() => {});
+      return;
+    }
+    if (outcome === 'cancelled') {
+      session.handingOver = false;
+      session.agent.turns.push({ role: 'user', text: TRANSFER_NOTES.cancelled, automatic: true, at: Date.now() });
+      void this.save(session).catch(() => {});
+      return;
+    }
+    if (!['declined', 'expired', 'unavailable'].includes(outcome)) return;
+    session.handingOver = false;
+    const words = typeof event.message === 'string' ? event.message.trim() : '';
+    // The model speaks the offer (the desktop says a fixed one itself if it does not in a few seconds).
+    this.answered(session, callId, outcome === 'declined' && words ? TRANSFER_NOTES.declinedWith(words) : outcome === 'declined' ? TRANSFER_NOTES.declined : TRANSFER_NOTES.nobody);
+  }
+
+  /**
    * The note that starts a call with the person of lane `s` (callStartNote),
    * as it reads now: their contact as last read, then the brief the phone
    * sent and the outreach's part (the lane's own).
    */
   private startNote(s: Session, call: { greeting: string; hidden: boolean; began: Date; missedAt?: number; outbound?: { purpose?: string }; recent: string }): string {
     const who = `${s.title}${s.title !== s.key ? ` (${s.key})` : ''}`;
-    return callStartNote(who, call.greeting, knownText(call.hidden ? undefined : this.callerNote(s.key)), call.began, call.missedAt, call.outbound, call.recent, callOwnInstructions(s.brief ?? '', s.outreach?.instructions() ?? ''));
+    // Whether the owner can be rung on THIS call (the phone may not be able to): said in the call's own note, so the
+    // instructions and tools stay the same for every call. Nothing at all while the owner has not allowed transfers.
+    const reach = this.features.transfer ? (s.canTransfer ? TRANSFER_NOTES.available : TRANSFER_NOTES.unavailable) : '';
+    return callStartNote(who, call.greeting, knownText(call.hidden ? undefined : this.callerNote(s.key)), call.began, call.missedAt, call.outbound, call.recent, [callOwnInstructions(s.brief ?? '', s.outreach?.instructions() ?? ''), reach].filter(Boolean).join('\n'));
   }
 
   /**
@@ -1523,8 +1715,15 @@ export class Sessions {
     // The desktop's live calls, sent as its event stream opens: a call not among them has ended
     // (its end came while the stream was down, as when the desktop restarted).
     if (type === 'hello' && Array.isArray(event.calls)) {
+      // What the owner lets the receptionist do (an older desktop says nothing: nothing is offered).
+      this.setFeatures(event.features);
       const live = new Set(event.calls.map(String));
       for (const s of this.list) if (s.callId && !live.has(s.callId)) await this.endCall(s);
+      return null;
+    }
+    // The owner changed what the receptionist may do: from the next reply on, its tools and instructions follow.
+    if (type === 'voice.features') {
+      this.setFeatures(event);
       return null;
     }
     if (!callId) return null;
@@ -1538,6 +1737,9 @@ export class Sessions {
       this.ended.delete(callId);
     }
     let session = this.list.find((s) => s.callId === callId) ?? null;
+    // The owner had this call and hands it back: the same call goes on. Not a new call (its greeting was said, and what
+    // was said is still the conversation), so nothing of it begins again.
+    if (type === 'call.started' && session?.handoff) return this.resumeAfterHandoff(session, event);
     if (type === 'call.started' || (!session && type === 'call.caller')) {
       // A hidden number ("", "Private", "Withheld"): a conversation of its own for this call (never shared with another hidden caller), named as such.
       const hidden = isHidden(String(event.from ?? ''));
@@ -1550,6 +1752,15 @@ export class Sessions {
       const lastContact = Math.max(0, ...history.map((t) => t.at ?? 0), ...this.list.filter((s) => s.thread === session!.thread && s !== session && s.agent.turns.length).map((s) => s.lastAt), session.agent.turns.length ? session.lastAt : 0);
       const recent = hidden ? '' : recentContact(history, lastContact);
       session.callId = callId;
+      // Whether the owner can be rung on this call (the owner allows it and the phone can), and nothing of a request left from another call.
+      if (type === 'call.started') {
+        session.canTransfer = event.allowTransfer === true;
+        clearTimeout(session.transferTimer);
+        session.transferTimer = undefined;
+        session.transferRequest = undefined;
+        session.handingOver = false;
+        session.handoff = undefined;
+      }
       if (typeof event.instructions === 'string') session.brief = event.instructions;
       session.lastAt = Date.now();
       session.unread++;
@@ -1630,6 +1841,11 @@ export class Sessions {
         this.hooks.arrived?.(session, line);
         clearTimeout(session.speakingTimer);
         session.callerSpeaking = false;
+        // The owner is taking the call: what the caller says is kept for the record, and not answered (the owner hears it).
+        if (session.handingOver) {
+          (session.aside ??= []).push(line);
+          break;
+        }
         // "Mm-hmm" over the agent: it talks on, and reads it with the caller's next words.
         if (event.backchannel === true) {
           (session.aside ??= []).push(line);
@@ -1691,7 +1907,52 @@ export class Sessions {
       case 'call.ended':
         await this.endCall(session, typeof event.reason === 'string' ? event.reason : '');
         break;
+      // How a request to reach the owner came out (the receptionist tried; here is what happened).
+      case 'call.transfer':
+        this.transferOutcome(session, callId, event);
+        break;
+      // The owner took the call: no session of the desktop carries it now, and it has not ended, so no end is written
+      // (an outreach call's result is not recorded as if it had ended), and nothing more is said.
+      case 'call.handoff':
+        clearTimeout(session.transferTimer);
+        session.transferTimer = undefined;
+        session.transferRequest = undefined;
+        session.handingOver = true;
+        session.handoff = { at: Date.now(), reason: typeof event.reason === 'string' ? event.reason : '' };
+        clearTimeout(session.speakingTimer);
+        session.callerSpeaking = false;
+        session.speech?.hush();
+        this.stop(session);
+        session.agent.turns.push({ role: 'user', text: TRANSFER_NOTES.handoff, automatic: true, at: Date.now() });
+        await this.save(session);
+        this.hooks.changed();
+        break;
     }
+    return session;
+  }
+
+  /** What the owner lets the receptionist do (an event's `transfer` and `messages`, or a `features` object): anything else is off. */
+  private setFeatures(from: unknown): void {
+    const f = from && typeof from === 'object' ? (from as Record<string, unknown>) : {};
+    const next = { transfer: f.transfer === true, messages: f.messages === true || f.transfer === true };
+    if (next.transfer !== this.features.transfer || next.messages !== this.features.messages) this.features = next;
+  }
+
+  /**
+   * The owner handed the call back (or it came back after it failed to connect): the same call, in the same conversation. The
+   * agent is told, and told not to greet the caller again (the phone said its own line as they returned); it says nothing
+   * until the caller does.
+   */
+  private async resumeAfterHandoff(session: Session, event: Record<string, unknown>): Promise<Session> {
+    const resume = event.resume && typeof event.resume === 'object' ? (event.resume as Record<string, unknown>) : {};
+    const seconds = typeof resume.handoffSeconds === 'number' ? resume.handoffSeconds : Math.max(0, Math.round((Date.now() - (session.handoff?.at ?? Date.now())) / 1000));
+    session.handoff = undefined;
+    session.handingOver = false;
+    session.canTransfer = event.allowTransfer === true;
+    session.callerSpeaking = false;
+    session.agent.turns.push({ role: 'user', text: TRANSFER_NOTES.back(callClock(seconds * 1000)), automatic: true, at: Date.now() });
+    await this.save(session);
+    this.hooks.changed();
     return session;
   }
 
@@ -1699,6 +1960,11 @@ export class Sessions {
   private async endCall(session: Session, reason = ''): Promise<void> {
     if (session.callId) this.noteEnded(session.callId, session);
     clearTimeout(session.speakingTimer);
+    clearTimeout(session.transferTimer);
+    session.transferTimer = undefined;
+    session.transferRequest = undefined;
+    session.handingOver = false;
+    session.handoff = undefined;
     session.callerSpeaking = false;
     session.unsaid = undefined;
     session.speech?.hush();
