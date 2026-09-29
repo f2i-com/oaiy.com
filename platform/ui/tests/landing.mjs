@@ -65,12 +65,16 @@ fs.rmSync(bundlePath, { force: true });
 // Links into the repository
 // ---------------------------------------------------------------------------
 
-/** Whether `rel` (from the repository root) is a folder the repository has. */
-function inRepository(rel) {
-  const listed = spawnSync('git', ['ls-files', '--', rel], { cwd: ROOT, encoding: 'utf8' });
-  if (!listed.error && listed.status === 0) return listed.stdout.trim().length > 0;
-  // No git here (a source archive): the folder on disk is what there is to check.
-  return fs.statSync(path.join(ROOT, rel), { throwIfNoEntry: false })?.isDirectory() === true;
+/** Whether `rel` (from the repository root) is a folder or a file the repository has. */
+function inRepository(rel, useGit = true) {
+  if (useGit) {
+    const listed = spawnSync('git', ['ls-files', '--', rel], { cwd: ROOT, encoding: 'utf8' });
+    if (!listed.error && listed.status === 0) return listed.stdout.trim().length > 0;
+  }
+  // No git here (a source archive): what is on disk is what there is to check, and it is asked about
+  // files (a README) as well as folders.
+  const found = fs.statSync(path.join(ROOT, rel), { throwIfNoEntry: false });
+  return found !== undefined && (found.isDirectory() || found.isFile());
 }
 
 await check('every folder the pages link to is in the repository, from its root', () => {
@@ -83,6 +87,13 @@ await check('every folder the pages link to is in the repository, from its root'
   // What the buttons promise is what GitHub shows under the folder.
   assert.ok(inRepository(`${L.REPO_FOLDERS.desktop}/README.md`), "the desktop's installation documentation is its README");
   assert.ok(inRepository(`${L.REPO_FOLDERS.serviceLibrary}/README.md`));
+});
+
+await check('without git (a source archive) the same folders and READMEs are found on disk, and a file that is not there is not', () => {
+  const wanted = [...Object.values(L.REPO_FOLDERS), `${L.REPO_FOLDERS.desktop}/README.md`, `${L.REPO_FOLDERS.serviceLibrary}/README.md`];
+  for (const rel of wanted) assert.ok(inRepository(rel, false), `${rel} is on disk`);
+  assert.ok(!inRepository(`${L.REPO_FOLDERS.desktop}/NOT-A-FILE.md`, false));
+  assert.ok(!inRepository(`${L.REPO_FOLDERS.desktop}/NOT-A-FILE.md`));
 });
 
 await check("the folders that moved are not linked at their old places", () => {
