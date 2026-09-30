@@ -37,9 +37,18 @@ impl Drop for Scratch {
     }
 }
 
+/// The keyfile provider, by the name this platform allows: on Windows `keyfile` is refused, and only a test may name the unsafe one.
+fn keyfile() -> ProviderChoice {
+    if cfg!(windows) {
+        ProviderChoice::KeyfileUnsafe
+    } else {
+        ProviderChoice::Keyfile
+    }
+}
+
 /// The providers this platform has, with the extension their files carry.
 fn providers() -> Vec<(ProviderChoice, &'static str)> {
-    let mut list = vec![(ProviderChoice::Keyfile, "kf")];
+    let mut list = vec![(keyfile(), "kf")];
     if cfg!(windows) {
         list.push((ProviderChoice::DpapiFile, "ks"));
     }
@@ -117,7 +126,7 @@ fn round_trip_overwrite_delete_and_list_for_every_provider() {
         let store = store(&scratch, choice);
         let info = store.provider();
         match choice {
-            ProviderChoice::Keyfile => assert_eq!((info.id, info.strength), ("keyfile", Strength::FilePermissions)),
+            ProviderChoice::Keyfile | ProviderChoice::KeyfileUnsafe => assert_eq!((info.id, info.strength), ("keyfile", Strength::FilePermissions)),
             _ => assert_eq!((info.id, info.strength), ("windows-dpapi-file", Strength::OsAccount)),
         }
         let a = name(names::ARCHIVE_WRITER);
@@ -299,7 +308,7 @@ fn a_blob_copied_or_moved_to_another_name_fails_and_never_yields_the_other_secre
         fs::copy(file_of(&scratch, "archive.writer", ext), file_of(&scratch, "vault.pins", ext)).unwrap();
         let moved = store.get(&name("vault.pins")).expect_err("a blob under another name");
         match choice {
-            ProviderChoice::Keyfile => assert!(matches!(moved, KeyError::WrongName), "{moved:?}"),
+            ProviderChoice::Keyfile | ProviderChoice::KeyfileUnsafe => assert!(matches!(moved, KeyError::WrongName), "{moved:?}"),
             _ => assert!(matches!(moved, KeyError::Os(..)), "{moved:?}"),
         }
         // one secret's file over another's
@@ -325,7 +334,7 @@ fn no_plaintext_beside_the_blob() {
         let holders = files_containing(&scratch.keys(), &first);
         match choice {
             // the keyfile is a plaintext provider: the value is in its own file and in no other
-            ProviderChoice::Keyfile => assert_eq!(holders, ["archive.writer.kf"]),
+            ProviderChoice::Keyfile | ProviderChoice::KeyfileUnsafe => assert_eq!(holders, ["archive.writer.kf"]),
             _ => assert!(holders.is_empty(), "{ext}: DPAPI files hold the value in the clear: {holders:?}"),
         }
         assert_eq!(key_files(&scratch.keys()).len(), 1, "{ext}: exactly one file per secret, no temporary");
@@ -403,6 +412,7 @@ fn the_error_codes_are_stable_and_no_error_prints_a_secret() {
         (KeyError::Verify, "key_verify_failed"),
         (KeyError::ProviderUnavailable("x"), "key_provider_unavailable"),
         (KeyError::InvalidProvider("x".into()), "key_invalid_provider"),
+        (KeyError::ProviderMismatch { stored: "windows-dpapi-file".into(), requested: "keyfile" }, "key_provider_mismatch"),
     ];
     for (error, code) in all {
         assert_eq!(error.code(), code);
@@ -469,12 +479,118 @@ fn list_shows_only_names_and_only_files_of_its_own_provider() {
             fs::write(dir.join(junk), b"x").unwrap();
         }
         fs::create_dir(dir.join(format!("adir.{ext}"))).unwrap();
-        let other = if ext == "kf" { "ks" } else { "kf" };
-        fs::write(dir.join(format!("other.provider.{other}")), b"x").unwrap();
         let listed: Vec<String> = store.list("").unwrap().into_iter().map(|n| n.to_string()).collect();
         assert_eq!(listed, ["a.one", "b.two"], "{ext}");
-        // the other provider's file is not ours to read either
-        assert_eq!(get(&*store, &name("other.provider")), None);
+    }
+}
+
+/// M-2, the test that used to assert the bad behaviour: a file of the other provider's kind in the folder was not listed, and `get` of its name said `None`,
+/// "never stored", so a caller minted a new identity over a secret that exists. It is an error now, in every operation, and nothing changes.
+#[test]
+fn a_secret_of_another_providers_kind_is_an_error_everywhere_never_none_and_never_a_second_value() {
+    for (choice, ext) in providers() {
+        let scratch = Scratch::new("otherkind");
+        let store = store(&scratch, choice);
+        let n = name("other.provider");
+        store.put(&name("a.one"), b"1").unwrap();
+        let other = if ext == "kf" { "ks" } else { "kf" };
+        let foreign = scratch.keys().join(format!("other.provider.{other}"));
+        fs::write(&foreign, b"a secret that another provider made").unwrap();
+        let mismatch = |error: KeyError| matches!(&error, KeyError::ProviderMismatch { requested, .. } if *requested == store_id(ext));
+        assert!(mismatch(store.get(&n).unwrap_err()), "{ext}: get");
+        assert!(mismatch(store.put(&n, b"a second value").unwrap_err()), "{ext}: put");
+        assert!(mismatch(store.delete(&n).unwrap_err()), "{ext}: delete");
+        assert!(mismatch(store.list("").unwrap_err()), "{ext}: list");
+        assert_eq!(fs::read(&foreign).unwrap(), b"a secret that another provider made", "{ext}: nothing was changed");
+        assert_eq!(key_files(&scratch.keys()).len(), 2, "{ext}: and nothing was added: no second value, no temporary file");
+        // the names that have no such file are unaffected
+        assert_eq!(get(&*store, &name("a.one")), Some(b"1".to_vec()));
+        store.put(&name("b.two"), b"2").unwrap();
+        // and once the stray file is gone the store is whole again
+        fs::remove_file(&foreign).unwrap();
+        assert_eq!(get(&*store, &n), None);
+        assert_eq!(store.list("").unwrap().len(), 2);
+    }
+}
+
+fn store_id(ext: &str) -> &'static str {
+    if ext == "kf" {
+        "keyfile"
+    } else {
+        "windows-dpapi-file"
+    }
+}
+
+/// M-2: the folder remembers its provider. Opened again with another one it is refused before anything is read (the reviewer's DPAPI folder, reopened with
+/// `OAIY_KEY_PROVIDER=keyfile`, read every secret as `None`, listed nothing, and after a `put` held two live values under one name, one in the clear).
+#[test]
+fn a_folder_remembers_its_provider_and_refuses_to_be_opened_with_another() {
+    for (choice, ext) in providers() {
+        let scratch = Scratch::new("marker");
+        let id = store_id(ext);
+        {
+            let store = store(&scratch, choice);
+            store.put(&name("archive.writer"), &canary(70, 32)).unwrap();
+        }
+        let marker = scratch.keys().join(".provider");
+        assert_eq!(fs::read(&marker).unwrap(), format!("{id}\n").into_bytes(), "{ext}: the marker names the provider and nothing else");
+        // the same provider opens it again, and the marker is not rewritten
+        let before = fs::metadata(&marker).unwrap().modified().unwrap();
+        assert_eq!(get(&*store(&scratch, choice), &name("archive.writer")), Some(canary(70, 32)));
+        assert_eq!(fs::metadata(&marker).unwrap().modified().unwrap(), before);
+
+        // a marker that names another provider: refused, whatever the files are
+        for other in ["windows-dpapi-file", "keyfile", "os-keyring", "something-else"] {
+            if other == id {
+                continue;
+            }
+            fs::write(&marker, format!("{other}\n")).unwrap();
+            match open_at(scratch.keys(), choice) {
+                Err(KeyError::ProviderMismatch { stored, requested }) => assert_eq!((stored.as_str(), requested), (other, id)),
+                other => panic!("{ext}: a folder of another provider was opened: {:?}", other.err()),
+            }
+        }
+        // a marker that is not one of ours is an error, not a folder to adopt
+        for junk in [&b""[..], b"keyfile", b"keyfile\r\n", b"KEYFILE\n", b"key file\n", &[0xff, 0xfe, b'\n'][..], &[b'a'; 65][..]] {
+            fs::write(&marker, junk).unwrap();
+            assert!(matches!(open_at(scratch.keys(), choice), Err(KeyError::Corrupt(_))), "{ext}: marker {junk:?}");
+        }
+        // a marker that is gone, in a folder that holds only this provider's files (one made before markers): adopted, and the marker is written
+        fs::remove_file(&marker).unwrap();
+        assert_eq!(get(&*store(&scratch, choice), &name("archive.writer")), Some(canary(70, 32)));
+        assert_eq!(fs::read(&marker).unwrap(), format!("{id}\n").into_bytes());
+        // a folder with no marker that holds another provider's files is refused, and gets no marker
+        fs::remove_file(&marker).unwrap();
+        let other_ext = if ext == "kf" { "ks" } else { "kf" };
+        fs::write(scratch.keys().join(format!("strange.secret.{other_ext}")), b"x").unwrap();
+        match open_at(scratch.keys(), choice) {
+            Err(KeyError::ProviderMismatch { stored, requested }) => assert_eq!((stored.as_str(), requested), (store_id(other_ext), id)),
+            other => panic!("{ext}: a folder that holds another provider's files was adopted: {:?}", other.err()),
+        }
+        assert!(!marker.exists(), "{ext}: a refused folder is not claimed");
+    }
+}
+
+/// On Windows the keyfile has no modes and this crate sets no ACL: it is refused unless a test names it as unsafe, and a DPAPI folder cannot be downgraded to it
+/// by a setting.
+#[test]
+fn the_keyfile_is_refused_on_windows_and_the_unsafe_name_is_needed_to_use_it_there() {
+    assert_eq!(ProviderChoice::parse("keyfile-unsafe-for-tests").unwrap(), ProviderChoice::KeyfileUnsafe);
+    let scratch = Scratch::new("unsafe");
+    if cfg!(windows) {
+        let error = open_at(scratch.keys(), ProviderChoice::Keyfile).err().expect("the keyfile is refused on Windows");
+        assert!(matches!(&error, KeyError::ProviderUnavailable(why) if why.contains("keyfile-unsafe-for-tests")), "{error:?}");
+        assert!(!scratch.keys().exists(), "a refusal creates nothing");
+        // the downgrade the reviewer found: a DPAPI folder, reopened with the keyfile named on purpose, is refused by the folder itself
+        let dpapi = open_at(scratch.keys(), ProviderChoice::DpapiFile).unwrap();
+        dpapi.put(&name("archive.writer"), &canary(71, 32)).unwrap();
+        drop(dpapi);
+        assert!(matches!(open_at(scratch.keys(), ProviderChoice::KeyfileUnsafe), Err(KeyError::ProviderMismatch { .. })));
+        assert_eq!(get(&*open_at(scratch.keys(), ProviderChoice::DpapiFile).unwrap(), &name("archive.writer")), Some(canary(71, 32)));
+    } else {
+        assert!(open_at(scratch.keys(), ProviderChoice::Keyfile).is_ok());
+        let scratch = Scratch::new("unsafe2");
+        assert!(open_at(scratch.keys(), ProviderChoice::KeyfileUnsafe).is_ok(), "on Unix the unsafe name is the same provider");
     }
 }
 
@@ -524,7 +640,7 @@ fn shared_candidates() -> Vec<Vec<u8>> {
 #[test]
 fn child_of_the_two_process_test_rewrites_one_name_over_and_over() {
     let (Some(dir), Some(label)) = (std::env::var_os(CHILD_DIR), std::env::var(CHILD_PROVIDER).ok()) else { return };
-    let choice = if label == "dpapi" { ProviderChoice::DpapiFile } else { ProviderChoice::Keyfile };
+    let choice = if label == "dpapi" { ProviderChoice::DpapiFile } else { keyfile() };
     let store = open_at(dir, choice).unwrap();
     let candidates = shared_candidates();
     for i in 0..800usize {

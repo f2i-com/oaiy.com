@@ -99,7 +99,7 @@ fn the_keystores_copies_of_a_secret_are_zero_when_they_are_freed() {
     });
     assert!(leaked, "control: a buffer that grew freed a block with the secret in it");
 
-    let mut providers = vec![(ProviderChoice::Keyfile, "keyfile")];
+    let mut providers = vec![(if cfg!(windows) { ProviderChoice::KeyfileUnsafe } else { ProviderChoice::Keyfile }, "keyfile")];
     if cfg!(windows) {
         providers.push((ProviderChoice::DpapiFile, "dpapi"));
     }

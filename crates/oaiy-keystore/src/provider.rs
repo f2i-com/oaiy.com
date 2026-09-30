@@ -29,18 +29,22 @@ pub enum ProviderChoice {
     DpapiFile,
     /// `os-keyring`: the Secret Service. Not built.
     OsKeyring,
-    /// `keyfile`: a file per secret, the weakest provider, for headless machines and for tests.
+    /// `keyfile`: a file per secret, the weakest provider, for headless machines. On Windows it is **refused**: a file there has no POSIX modes and nothing in
+    /// this crate sets an ACL, so the value would be readable by whatever the folder's inherited permissions allow. Use `KeyfileUnsafe` in a test.
     Keyfile,
+    /// `keyfile-unsafe-for-tests`: the keyfile provider where `Keyfile` is refused (Windows), named as what it is. On Unix it is the same as `Keyfile`.
+    KeyfileUnsafe,
 }
 
 impl ProviderChoice {
-    /// Reads a provider name: `auto`, `windows-dpapi-file`, `os-keyring` or `keyfile` (exactly, in lower case).
+    /// Reads a provider name: `auto`, `windows-dpapi-file`, `os-keyring`, `keyfile` or `keyfile-unsafe-for-tests` (exactly, in lower case).
     pub fn parse(text: &str) -> Result<ProviderChoice, KeyError> {
         match text {
             "auto" => Ok(ProviderChoice::Auto),
             "windows-dpapi-file" => Ok(ProviderChoice::DpapiFile),
             "os-keyring" => Ok(ProviderChoice::OsKeyring),
             "keyfile" => Ok(ProviderChoice::Keyfile),
+            "keyfile-unsafe-for-tests" => Ok(ProviderChoice::KeyfileUnsafe),
             other => Err(KeyError::InvalidProvider(other.chars().take(64).collect())),
         }
     }
@@ -75,7 +79,10 @@ pub fn open(data_dir: &Path, choice: ProviderChoice) -> Result<Box<dyn KeyStore>
 pub fn open_at(keys_dir: impl AsRef<Path>, choice: ProviderChoice) -> Result<Box<dyn KeyStore>, KeyError> {
     let keys_dir = keys_dir.as_ref();
     match choice.resolve()? {
-        ProviderChoice::Keyfile => Ok(Box::new(FileStore::open(keys_dir, KeyfileCodec)?)),
+        ProviderChoice::Keyfile if cfg!(windows) => Err(KeyError::ProviderUnavailable(
+            "the keyfile provider is refused on Windows, where nothing protects a file the way modes do on Unix; use windows-dpapi-file (tests name keyfile-unsafe-for-tests)",
+        )),
+        ProviderChoice::Keyfile | ProviderChoice::KeyfileUnsafe => Ok(Box::new(FileStore::open(keys_dir, KeyfileCodec)?)),
         #[cfg(windows)]
         ProviderChoice::DpapiFile => Ok(Box::new(FileStore::open(keys_dir, crate::codec::DpapiCodec)?)),
         #[cfg(not(windows))]

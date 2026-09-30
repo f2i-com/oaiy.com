@@ -36,6 +36,15 @@ pub enum KeyError {
     ProviderUnavailable(&'static str),
     /// `OAIY_KEY_PROVIDER` holds something that is not a provider.
     InvalidProvider(String),
+    /// The keys folder holds values made by another provider than the one asked for (a folder remembers its provider in `.provider`, and a file of the other
+    /// provider's kind is refused too). Nothing was read or changed: a secret that the other provider holds is not "never stored", and it is not replaced by a
+    /// second value under the same name.
+    ProviderMismatch {
+        /// The provider the folder belongs to (as the folder says, cut to 64 characters).
+        stored: String,
+        /// The provider that was asked for.
+        requested: &'static str,
+    },
 }
 
 impl KeyError {
@@ -52,6 +61,7 @@ impl KeyError {
             KeyError::Verify => "key_verify_failed",
             KeyError::ProviderUnavailable(_) => "key_provider_unavailable",
             KeyError::InvalidProvider(_) => "key_invalid_provider",
+            KeyError::ProviderMismatch { .. } => "key_provider_mismatch",
         }
     }
 
@@ -73,6 +83,10 @@ impl fmt::Display for KeyError {
             KeyError::Verify => f.write_str("key_verify_failed: what was read back is not what was written"),
             KeyError::ProviderUnavailable(why) => write!(f, "key_provider_unavailable: {why}"),
             KeyError::InvalidProvider(value) => write!(f, "key_invalid_provider: {value:?}"),
+            KeyError::ProviderMismatch { stored, requested } => write!(
+                f,
+                "key_provider_mismatch: the keys folder holds values of the {stored:?} provider and {requested:?} was asked for; open it with the provider it was made with (nothing was read or changed)"
+            ),
         }
     }
 }

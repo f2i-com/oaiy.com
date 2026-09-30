@@ -147,6 +147,15 @@ impl KeyDir {
         }
     }
 
+    /// Whether the folder has an entry of any kind called `name` (a link and a directory count).
+    pub(crate) fn exists(&self, name: &str) -> Result<bool, KeyError> {
+        match fs::symlink_metadata(self.at(name)) {
+            Ok(_) => Ok(true),
+            Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(false),
+            Err(e) => Err(KeyError::io("inspect the keys directory", e)),
+        }
+    }
+
     /// The entries of the folder.
     pub(crate) fn list(&self) -> Result<Vec<Entry>, KeyError> {
         let op = "list the keys directory";

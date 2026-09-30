@@ -162,6 +162,15 @@ impl KeyDir {
         }
     }
 
+    /// Whether the folder has an entry of any kind called `name` (a link, a FIFO and a directory count).
+    pub(crate) fn exists(&self, name: &str) -> Result<bool, KeyError> {
+        match statat(&self.dir, name, AtFlags::SYMLINK_NOFOLLOW) {
+            Ok(_) => Ok(true),
+            Err(Errno::NOENT) => Ok(false),
+            Err(e) => Err(errno("inspect the keys directory", e)),
+        }
+    }
+
     /// The entries of the folder, through a descriptor of their own (the read position of a shared descriptor would be shared by every lister).
     pub(crate) fn list(&self) -> Result<Vec<Entry>, KeyError> {
         let op = "list the keys directory";

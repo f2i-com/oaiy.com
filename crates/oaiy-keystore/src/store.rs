@@ -41,6 +41,13 @@ pub trait KeyStore: Send + Sync {
     fn list(&self, prefix: &str) -> Result<Vec<Name>, KeyError>;
 }
 
+/// The file that says which provider made the values in the folder. It is written when the folder is first opened and never changes: a folder remembers its
+/// provider and refuses to be opened with another (review M-2).
+const MARKER_FILE: &str = ".provider";
+
+/// The providers that keep one file per secret, by the extension of their files: what a folder can hold.
+const PROVIDERS: [(&str, &str); 2] = [("ks", "windows-dpapi-file"), ("kf", "keyfile")];
+
 /// One file per secret in one directory.
 pub(crate) struct FileStore<C: Codec> {
     dir: KeyDir,
@@ -48,15 +55,65 @@ pub(crate) struct FileStore<C: Codec> {
 }
 
 impl<C: Codec> FileStore<C> {
-    /// Opens (creating it if need be) the keys directory, checks it, and removes the debris of an interrupted write.
+    /// Opens (creating it if need be) the keys directory, checks it, makes sure that it belongs to this provider, and removes the debris of an interrupted
+    /// write.
     pub(crate) fn open(dir: &Path, codec: C) -> Result<Self, KeyError> {
         let store = FileStore { dir: KeyDir::open(dir)?, codec };
+        {
+            let _lock = store.dir.lock(true)?;
+            store.claim_folder()?;
+        }
         store.remove_stale_temporaries();
         Ok(store)
     }
 
     fn file_name(&self, name: &Name) -> String {
         format!("{}.{}", name.as_str(), self.codec.extension())
+    }
+
+    /// **The folder belongs to one provider** (review M-2). Reopened with another provider (a machine that was switched to `OAIY_KEY_PROVIDER=keyfile`, a
+    /// build without DPAPI), a store used to read every secret of the first as `None`, list nothing, and on a `put` leave two live values under one name, one of
+    /// them in the clear. Now the marker file names the provider, a folder that has none is adopted only if it holds no file of another provider's kind, and
+    /// anything else is `ProviderMismatch` before anything is read. Must be called with the exclusive lock held.
+    fn claim_folder(&self) -> Result<(), KeyError> {
+        let info = self.codec.info();
+        if let Some(bytes) = self.dir.read(MARKER_FILE)? {
+            let stored = parse_marker(&bytes)?;
+            if stored != info.id {
+                return Err(KeyError::ProviderMismatch { stored, requested: info.id });
+            }
+            return Ok(());
+        }
+        // no marker: a new folder, or one made before folders remembered their provider. It may hold this provider's files, and no other's.
+        for entry in self.dir.list()? {
+            if !entry.is_file {
+                continue;
+            }
+            let Some((stem, extension)) = entry.name.rsplit_once('.') else { continue };
+            if extension == self.codec.extension() || Name::new(stem).is_err() {
+                continue;
+            }
+            if let Some((_, other)) = PROVIDERS.iter().find(|(e, _)| *e == extension) {
+                return Err(KeyError::ProviderMismatch { stored: (*other).to_owned(), requested: info.id });
+            }
+        }
+        let tmp = self.temporary_name(&Name::new("provider")?)?;
+        if let Err(error) = self.stage(&tmp, format!("{}\n", info.id).as_bytes()).and_then(|()| self.dir.rename(&tmp, MARKER_FILE)) {
+            let _ = self.dir.remove(&tmp);
+            return Err(error);
+        }
+        self.dir.sync()
+    }
+
+    /// A value of another provider's kind under this name is an error, not "nothing there": it is a secret that this provider cannot read, and a `put` beside
+    /// it would leave two live values.
+    fn refuse_a_value_of_another_provider(&self, name: &Name) -> Result<(), KeyError> {
+        for (extension, other) in PROVIDERS {
+            if extension != self.codec.extension() && self.dir.exists(&format!("{}.{extension}", name.as_str()))? {
+                return Err(KeyError::ProviderMismatch { stored: other.to_owned(), requested: self.codec.info().id });
+            }
+        }
+        Ok(())
     }
 
     /// Temporary files are `.<name>.<16 hex>.tmp`: they can never be a name, so `list` and `get` cannot see them. A crash between the write and the rename leaves one;
@@ -75,18 +132,34 @@ impl<C: Codec> FileStore<C> {
         Ok(format!(".{}.{}.tmp", name.as_str(), hex_lower(random.expose())))
     }
 
+    /// Makes `tmp` (which must not exist) with `bytes` in it and flushes it.
+    fn stage(&self, tmp: &str, bytes: &[u8]) -> Result<(), KeyError> {
+        let mut file = self.dir.create_new(tmp)?;
+        file.write_all(bytes).map_err(|e| KeyError::io("write the temporary file", e))?;
+        file.sync_all().map_err(|e| KeyError::io("flush the temporary file", e))
+    }
+
     /// Writes the blob to `tmp`, flushes it, reads it back through the provider and compares.
     fn write_and_verify(&self, tmp: &str, name: &Name, value: &[u8], blob: &[u8]) -> Result<(), KeyError> {
-        let mut file = self.dir.create_new(tmp)?;
-        file.write_all(blob).map_err(|e| KeyError::io("write the temporary file", e))?;
-        file.sync_all().map_err(|e| KeyError::io("flush the temporary file", e))?;
-        drop(file);
+        self.stage(tmp, blob)?;
         let back = self.dir.read(tmp)?.ok_or(KeyError::Verify)?;
         let opened = self.codec.open(name, &back)?;
         if !ct_eq(&opened, value) {
             return Err(KeyError::Verify);
         }
         Ok(())
+    }
+}
+
+/// What the marker file says: the provider's identifier, and a line feed. Anything else is not a marker this keystore wrote.
+fn parse_marker(bytes: &[u8]) -> Result<String, KeyError> {
+    const NOT_A_MARKER: KeyError = KeyError::Corrupt("the provider marker of the keys folder is not one this keystore wrote");
+    let text = std::str::from_utf8(bytes).map_err(|_| NOT_A_MARKER)?;
+    match text.strip_suffix('\n') {
+        Some(id) if (1..=64).contains(&id.len()) && id.bytes().all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-') => {
+            Ok(id.to_owned())
+        }
+        _ => Err(NOT_A_MARKER),
     }
 }
 
@@ -100,6 +173,7 @@ impl<C: Codec> KeyStore for FileStore<C> {
         // the lock, shared, is what makes `None` mean "not there": a writer that is replacing the name holds it exclusively (review H-1)
         let blob = {
             let _lock = self.dir.lock(false)?;
+            self.refuse_a_value_of_another_provider(name)?;
             self.dir.read(&self.file_name(name))?
         };
         let Some(blob) = blob else { return Ok(None) };
@@ -114,6 +188,7 @@ impl<C: Codec> KeyStore for FileStore<C> {
             return Err(KeyError::InvalidValue("larger than 64 KiB"));
         }
         self.dir.verify()?;
+        self.refuse_a_value_of_another_provider(name)?;
         let blob = self.codec.seal(name, value)?;
         let tmp = self.temporary_name(name)?;
         if let Err(error) = self.write_and_verify(&tmp, name, value, &blob) {
@@ -134,6 +209,7 @@ impl<C: Codec> KeyStore for FileStore<C> {
         self.dir.verify()?;
         {
             let _lock = self.dir.lock(true)?;
+            self.refuse_a_value_of_another_provider(name)?;
             self.dir.remove(&self.file_name(name))?;
         }
         self.dir.sync()
@@ -141,7 +217,7 @@ impl<C: Codec> KeyStore for FileStore<C> {
 
     fn list(&self, prefix: &str) -> Result<Vec<Name>, KeyError> {
         self.dir.verify()?;
-        let suffix = format!(".{}", self.codec.extension());
+        let own = self.codec.extension();
         let mut names = Vec::new();
         let entries = {
             let _lock = self.dir.lock(false)?;
@@ -151,18 +227,23 @@ impl<C: Codec> KeyStore for FileStore<C> {
             if !entry.is_file {
                 continue;
             }
-            let Some(stem) = entry.name.strip_suffix(suffix.as_str()) else { continue };
-            if let Ok(name) = Name::new(stem) {
-                if name.as_str().starts_with(prefix) {
-                    names.push(name);
+            let Some((stem, extension)) = entry.name.rsplit_once('.') else { continue };
+            let Ok(name) = Name::new(stem) else { continue };
+            if extension != own {
+                // a secret of another provider's kind is not "absent from the list": the caller would not know it exists
+                if let Some((_, other)) = PROVIDERS.iter().find(|(e, _)| *e == extension) {
+                    return Err(KeyError::ProviderMismatch { stored: (*other).to_owned(), requested: self.codec.info().id });
                 }
+                continue;
+            }
+            if name.as_str().starts_with(prefix) {
+                names.push(name);
             }
         }
         names.sort();
         Ok(names)
     }
 }
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -463,8 +544,9 @@ mod tests {
     fn a_put_and_a_delete_flush_the_folder() {
         let scratch = Scratch::new("flush");
         let store = faulty(&scratch);
-        let syncs = || store.dir.hooks.syncs.load(Ordering::SeqCst);
-        assert_eq!(syncs(), 0);
+        let opened = store.dir.hooks.syncs.load(Ordering::SeqCst);
+        assert_eq!(opened, 1, "opening a new folder flushes it once, after the marker file is renamed into place");
+        let syncs = || store.dir.hooks.syncs.load(Ordering::SeqCst) - opened;
         store.put(&name("a.one"), b"1").unwrap();
         assert_eq!(syncs(), 1, "put");
         store.delete(&name("a.one")).unwrap();

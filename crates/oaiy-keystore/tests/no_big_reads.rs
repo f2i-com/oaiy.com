@@ -38,7 +38,7 @@ static ALLOCATOR: Counting = Counting;
 
 #[test]
 fn a_file_far_larger_than_any_secret_is_refused_before_it_is_read_into_memory() {
-    let mut providers = vec![(ProviderChoice::Keyfile, "kf")];
+    let mut providers = vec![(if cfg!(windows) { ProviderChoice::KeyfileUnsafe } else { ProviderChoice::Keyfile }, "kf")];
     if cfg!(windows) {
         providers.push((ProviderChoice::DpapiFile, "ks"));
     }
