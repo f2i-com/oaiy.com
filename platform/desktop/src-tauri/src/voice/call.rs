@@ -2898,6 +2898,11 @@ mod tests {
         })
     }
 
+    /// What the call answers a command it was sent, or a failure after a few seconds: a test of a command the call must answer fails, and does not hang the run.
+    async fn answered<T>(answer: oneshot::Receiver<T>) -> T {
+        tokio::time::timeout(secs(5), answer).await.expect("the call did not answer the command within five seconds").expect("the call dropped the command without answering it")
+    }
+
     /// What the app is answered, or a failure after a few seconds: a test that waits for a phone that never answers must fail, not hang.
     async fn answer_of(asked: tokio::task::JoinHandle<Result<Value, String>>) -> Result<Value, String> {
         tokio::time::timeout(secs(5), asked).await.expect("the app was not answered within five seconds").unwrap()
@@ -3197,10 +3202,10 @@ mod tests {
         // The receptionist may not speak over the owner: a line from the app is refused, and so is ending the call.
         let (reply, answer) = oneshot::channel();
         aokie.hub.command(&aokie.call).unwrap().send(CallCommand::Say { text: "They are just coming.".into(), hold: false, reply }).unwrap();
-        assert!(answer.await.unwrap().unwrap_err().contains("handed over"));
+        assert!(answered(answer).await.unwrap_err().contains("handed over"));
         let (reply, answer) = oneshot::channel();
         aokie.hub.command(&aokie.call).unwrap().send(CallCommand::Finish { goodbye: "Bye".into(), reply }).unwrap();
-        assert!(answer.await.unwrap().unwrap_err().contains("handed over"));
+        assert!(answered(answer).await.unwrap_err().contains("handed over"));
         assert!(!aokie.speech.spoken().iter().any(|l| l == "They are just coming."));
     }
 
@@ -3238,7 +3243,7 @@ mod tests {
         aokie.event("call.transfer", secs(3)).await.unwrap();
         let (reply, answer) = oneshot::channel();
         aokie.hub.command(&aokie.call).unwrap().send(CallCommand::Say { text: "I'm sorry, they can't come to the phone. Can I take a message?".into(), hold: false, reply }).unwrap();
-        assert!(answer.await.unwrap().is_ok());
+        assert!(answered(answer).await.is_ok());
         tokio::time::sleep(Duration::from_millis(700)).await;
         assert!(!aokie.speech.spoken().iter().any(|l| l == transfer::OFFER_LINE), "{:?}", aokie.speech.spoken());
     }
@@ -3275,7 +3280,7 @@ mod tests {
         // The receptionist may speak again.
         let (reply, answer) = oneshot::channel();
         aokie.hub.command(&aokie.call).unwrap().send(CallCommand::Say { text: "Is there anything else?".into(), hold: false, reply }).unwrap();
-        assert!(answer.await.unwrap().is_ok());
+        assert!(answered(answer).await.is_ok());
     }
 
     #[tokio::test]

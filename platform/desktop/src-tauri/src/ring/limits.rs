@@ -157,7 +157,7 @@ mod tests {
         let c = a.counters("call_1", "491570006", 1_400);
         assert_eq!((c.attempts_this_call, c.seconds_since_last_attempt), (2, Some(300)));
         assert_eq!((c.caller_attempts_last_hour, c.global_attempts_last_hour), (3, 4));
-        let other = a.counters("call_9", "491570999", 1_400);
+        let other = a.counters("call_9", "491570157", 1_400);
         assert_eq!((other.attempts_this_call, other.seconds_since_last_attempt, other.caller_attempts_last_hour, other.global_attempts_last_hour), (0, None, 0, 4));
     }
 

@@ -1119,7 +1119,7 @@ mod tests {
             client.get(format!("{base}/api/voice/calls")),
             client.post(format!("{base}/api/voice/calls/call_1/say")).json(&json!({"text": "hi"})),
             client.post(format!("{base}/api/voice/calls/call_1/hush")),
-            client.put(format!("{base}/api/voice/callers")).json(&json!({"number": "+61400000000", "name": "Lance"})),
+            client.put(format!("{base}/api/voice/callers")).json(&json!({"number": "+61491570006", "name": "Lance"})),
         ];
         for request in refused {
             let resp = request.send().await.unwrap();
@@ -1196,7 +1196,7 @@ mod tests {
         assert_eq!(told.0.lock().unwrap().as_slice(), ["Please ring me about Friday.".to_string()]);
 
         // The number is the call's own: a body that names another one is refused, not believed.
-        let spoof = client.post(&url).json(&json!({"message": "Hello", "from": "+61491570999"})).send().await.unwrap();
+        let spoof = client.post(&url).json(&json!({"message": "Hello", "from": "+61491570157"})).send().await.unwrap();
         assert_eq!(spoof.status(), 422);
         assert_eq!(hub.messages().list(None, "").len(), 1);
         // No name given: the phone's, when it is a name.
@@ -1435,10 +1435,10 @@ mod tests {
     #[test]
     fn the_caller_is_found_by_call_id() {
         let events = vec![
-            json!({"name": "aokie.call.incoming", "correlationId": "call_a", "data": {"callId": "call_a", "from": "+61400000001"}}),
-            json!({"name": "aokie.call.incoming", "correlationId": "call_b", "data": {"callId": "call_b", "from": "+61400000002", "name": "Lance"}}),
+            json!({"name": "aokie.call.incoming", "correlationId": "call_a", "data": {"callId": "call_a", "from": "+61491570156"}}),
+            json!({"name": "aokie.call.incoming", "correlationId": "call_b", "data": {"callId": "call_b", "from": "+61491570157", "name": "Lance"}}),
         ];
-        assert_eq!(caller_from_events(&events, "call_b"), Some(("+61400000002".into(), "Lance".into())));
+        assert_eq!(caller_from_events(&events, "call_b"), Some(("+61491570157".into(), "Lance".into())));
         assert_eq!(caller_from_events(&events, "call_c"), None);
     }
 

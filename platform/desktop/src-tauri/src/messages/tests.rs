@@ -143,7 +143,7 @@ fn hidden_numbers_together_hold_a_small_part_of_the_store_and_only_their_handled
     for n in 0..MAX_WITHHELD {
         waiting(&known, n, "", noon() - Duration::days(2) + Duration::seconds(n as i64), State::New);
     }
-    let k = waiting(&known, 500, "+61491570001", noon() - Duration::days(5), State::Handled);
+    let k = waiting(&known, 500, "+61491570006", noon() - Duration::days(5), State::Handled);
     assert_eq!(known.add_at(new("call_q", "", "Nope"), noon()).unwrap_err().code, "withheld_full");
     assert!(known.get(&k).is_some());
     // Nothing to say while there is room.
@@ -158,7 +158,7 @@ fn a_store_full_of_messages_nobody_has_handled_says_so_and_a_number_may_not_have
     }
     let notice = full.notice().expect("told");
     assert!(notice.contains(&MAX_STORED.to_string()) && notice.contains("no more can be kept"), "{notice}");
-    assert_eq!(full.add_at(new("call_x", "+61491570999", "No room"), noon()).unwrap_err().code, "store_full");
+    assert_eq!(full.add_at(new("call_x", "+61491570157", "No room"), noon()).unwrap_err().code, "store_full");
 
     // One number may not have more than so many waiting, however slowly it leaves them.
     let store = Store::in_memory();
@@ -175,8 +175,8 @@ fn a_store_full_of_messages_nobody_has_handled_says_so_and_a_number_may_not_have
 #[test]
 fn old_handled_messages_go_and_a_full_store_never_drops_a_message_nobody_has_handled() {
     let store = Store::in_memory();
-    let old = store.add_at(new("call_old", "+61491570001", "Old news."), noon() - Duration::days(200)).unwrap();
-    let keep = store.add_at(new("call_keep", "+61491570002", "Unread and old."), noon() - Duration::days(200)).unwrap();
+    let old = store.add_at(new("call_old", "+61491570006", "Old news."), noon() - Duration::days(200)).unwrap();
+    let keep = store.add_at(new("call_keep", "+61491570156", "Unread and old."), noon() - Duration::days(200)).unwrap();
     store.set_state(&old.id, State::Handled, "owner").unwrap();
     {
         // Handled long ago (the clock of the state change is now, so age it).
@@ -185,7 +185,7 @@ fn old_handled_messages_go_and_a_full_store_never_drops_a_message_nobody_has_han
             m.handled_at = Some((noon() - Duration::days(KEEP_HANDLED_DAYS + 1)).to_rfc3339());
         }
     }
-    store.add_at(new("call_new", "+61491570003", "New."), noon()).unwrap();
+    store.add_at(new("call_new", "+61491570157", "New."), noon()).unwrap();
     assert!(store.get(&old.id).is_none(), "handled and older than 90 days: let go");
     assert!(store.get(&keep.id).is_some(), "an unread message is never let go by age");
 
@@ -197,13 +197,13 @@ fn old_handled_messages_go_and_a_full_store_never_drops_a_message_nobody_has_han
             inner.messages.push(Message { id: format!("msg_{n}"), at: (noon() - Duration::days(1) + Duration::seconds(n as i64)).to_rfc3339(), call_id: format!("c{n}"), from: format!("+6140000{n:04}"), name: String::new(), callback: String::new(), message: format!("m{n}"), urgency: Urgency::Normal, wants_callback: false, state: State::New, seen_at: None, handled_at: None, handled_by: None });
         }
     }
-    let refused = full.add_at(new("call_x", "+61491570999", "No room"), noon()).unwrap_err();
+    let refused = full.add_at(new("call_x", "+61491570157", "No room"), noon()).unwrap_err();
     assert_eq!((refused.status, refused.code), (507, "store_full"));
     assert_eq!(full.list(None, "").len(), MAX_STORED);
     // One handled message makes room: the oldest handled one.
     full.set_state("msg_5", State::Handled, "owner").unwrap();
     full.set_state("msg_9", State::Handled, "owner").unwrap();
-    assert!(full.add_at(new("call_x", "+61491570999", "Room now"), noon()).is_ok());
+    assert!(full.add_at(new("call_x", "+61491570157", "Room now"), noon()).is_ok());
     assert!(full.get("msg_5").is_none() && full.get("msg_9").is_some(), "the oldest handled message made room");
     assert_eq!(full.list(None, "").len(), MAX_STORED);
 }
