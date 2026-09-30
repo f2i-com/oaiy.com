@@ -292,6 +292,27 @@ test('4.7.1 tok.req: 120 requests in a burst, then 429; the bucket refills at 10
     eq(200, $r->call($r->desktop('B'), 'GET', '/v1/admin/status')['status']);
 });
 
+test('4.9.1 secrets and proofs are compared in constant time: Crypto::equals is hash_equals, and no code compares a stored hash, a secret or a token with == or ===', function () {
+    $root = dirname(__DIR__, 2) . '/src';
+    $crypto = (string)file_get_contents($root . '/Crypto.php');
+    ok(preg_match('/function equals\(string \$a, string \$b\): bool\s*\{\s*return hash_equals\(\$a, \$b\);\s*\}/', $crypto) === 1, 'Crypto::equals is exactly hash_equals');
+    // Behaviour: equal strings are equal, one differing byte at either end is not, and a different length is not.
+    ok(Oaiy\Relay\Crypto::equals(str_repeat('a', 64), str_repeat('a', 64)));
+    ok(!Oaiy\Relay\Crypto::equals(str_repeat('a', 64), 'b' . str_repeat('a', 63)));
+    ok(!Oaiy\Relay\Crypto::equals(str_repeat('a', 64), str_repeat('a', 63) . 'b'));
+    ok(!Oaiy\Relay\Crypto::equals(str_repeat('a', 64), str_repeat('a', 63)));
+    // Where a secret, a hash of one, a token or a proof is checked, it goes through Crypto::equals, hash_equals or sodium.
+    foreach (['Auth.php', 'Enrolment.php', 'Handlers/EnrollApi.php', 'Handlers/AdminApi.php', 'Handlers/CalibrationApi.php', 'Info.php'] as $f) {
+        foreach (explode("\n", (string)file_get_contents($root . '/' . $f)) as $i => $line) {
+            if (preg_match('/^\s*(\*|\/\/)/', $line)) {
+                continue;
+            }
+            ok(preg_match('/(\$stored|\$given|\$secret|\$secretHash|\$rec\[\'hash\'\]|\$row\[\'th\'\]|\$token|\$sig|\$proof)\s*[!=]==?\s*[^=]|[^=!]\s*[!=]==?\s*(\$stored|\$given|\$secret|\$secretHash|\$rec\[\'hash\'\]|\$row\[\'th\'\]|\$token|\$sig|\$proof)\b/', $line) !== 1
+                || preg_match('/[!=]==?\s*(null|\'\')/', $line) === 1, "$f line " . ($i + 1) . ': ' . trim($line));
+        }
+    }
+});
+
 // ------------------------------------------------------------------------------------------------ the admin token
 
 test('4.9.3 the admin token opens the status route and nothing else', function () {

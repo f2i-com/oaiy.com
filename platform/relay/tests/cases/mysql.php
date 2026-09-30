@@ -165,4 +165,28 @@ echo $bad, "\n";
         eq(range(1, 120), $seen, 'every seq once, in order, no gap');
         eq(120, (int)$r->ctx()->db->val('SELECT next_seq FROM mailboxes WHERE id = ?', [$d->inbox()]) - 1);
     });
+
+    slow_test("4.11 $tag: a key another request spent after this one read it is still the uniform 401, because the conditional UPDATE decides and not the earlier read", function () use ($flavour) {
+        if (!MysqlServer::available($flavour)) {
+            skip("no $flavour server binary here");
+        }
+        $srv = MysqlServer::for($flavour);
+        $dbName = $srv->newDatabase();
+        $r = Relay::make([], ['db' => ['driver' => 'mysql', 'dsn' => $srv->dsn($dbName), 'user' => 'root', 'pass' => '']]);
+        [, , $d] = enroll_mint($r);
+        $server = $r->serve();
+        // Another connection holds the key's row, so the redemption can read it and check its proof but its UPDATE has to wait.
+        $other = new PDO($srv->dsn($dbName), 'root', '', [PDO::ATTR_ERRMODE => PDO::ERRMODE_EXCEPTION]);
+        $other->exec('START TRANSACTION');
+        $other->prepare('SELECT kid FROM enroll_keys WHERE kid = ? FOR UPDATE')->execute([$d['kid']]);
+        [$body, $h] = enroll_request($d, 'desktop', 'Late');
+        $pending = $server->begin('POST', '/v1/enroll', ['Content-Type' => 'application/json'] + $h, $body);
+        usleep(900000);
+        // Meanwhile the key is spent.
+        $other->prepare('UPDATE enroll_keys SET used_at = ? WHERE kid = ?')->execute([\Oaiy\Relay\Clock::now(), $d['kid']]);
+        $other->exec('COMMIT');
+        $res = $pending->finish(20);
+        eq(401, $res['status'], $res['body']);
+        eq(0, (int)$r->ctx()->db->val('SELECT COUNT(*) FROM devices'), 'no device was made from a key that was already spent');
+    });
 }

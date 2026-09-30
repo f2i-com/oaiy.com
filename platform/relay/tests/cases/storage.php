@@ -27,6 +27,43 @@ function storage_wait(array $child): array
     return [$out, $err, $code];
 }
 
+// ------------------------------------------------------------------------------------------------ 4.18.4 signal files
+
+test('4.18.4 a signal file is replaced whole: a reader running while a writer rewrites it as fast as it can never sees an empty or a torn value', function () {
+    $r = Relay::make();
+    $a = 'aaaaaaaaaaaaaaaa';
+    $b = 'bbbbbbbbbbbbbbbb';
+    $child = storage_child('
+        $sig = new Oaiy\Relay\Signals($argv[1]);
+        $sig->writeGen("racer", $argv[2]);
+        file_put_contents($argv[4], "1");
+        $deadline = microtime(true) + 2.0;
+        $i = 0;
+        while (microtime(true) < $deadline) { $sig->writeGen("racer", $i++ % 2 ? $argv[2] : $argv[3]); }
+        echo $i;
+    ', [$r->data, $a, $b, $r->dir . '/writing']);
+    $sig = new Oaiy\Relay\Signals($r->data);
+    $deadline = microtime(true) + 10;
+    while (!is_file($r->dir . '/writing') && microtime(true) < $deadline) {
+        usleep(1000);
+    }
+    $seen = [];
+    $reads = 0;
+    $end = microtime(true) + 1.8;
+    while (microtime(true) < $end) {
+        $v = $sig->readGen('racer'); // null while Windows has the file busy for a moment: allowed; empty or partial never is
+        if ($v !== null) {
+            $reads++;
+            $seen[$v] = ($seen[$v] ?? 0) + 1;
+        }
+    }
+    [$out, $err, $code] = storage_wait($child);
+    eq(0, $code, $err);
+    ok((int)$out > 50, 'the writer rewrote the file ' . $out . ' times');
+    ok($reads > 50, "the reader read it $reads times");
+    eq([], array_values(array_diff(array_keys($seen), [$a, $b])), 'only whole values were ever read');
+});
+
 // ------------------------------------------------------------------------------------------------ 4.18.5 transactions
 
 test('4.18.5 a read-then-write transaction that meets another writer\'s commit waits and succeeds once (BEGIN IMMEDIATE), instead of failing at once', function () {

@@ -109,6 +109,18 @@ test('4.7.2 rule 1: a newer hold of the same principal supersedes the older and 
     eq([], array_filter(glob(dirname($r->data) . '/*'), fn($p) => !in_array(basename($p), ['data'], true)), 'nothing was written outside data/');
 });
 
+test('4.7.2 rule 1: a device that polls again while its older hold is still ending needs no new place, so it is not refused because of that older hold', function () {
+    $r = Relay::make();
+    $h = $r->ctx()->holds; // soft 3
+    $a1 = $h->acquire('poll', 'dev-A', 'edge', 20);
+    ok($a1 !== null && $h->acquire('poll', 'dev-B', 'edge', 20) !== null && $h->acquire('poll', 'dev-C', 'edge', 20) !== null);
+    eq(null, $h->acquire('poll', 'dev-D', 'edge', 20), 'three devices fill the pool: a fourth is refused');
+    $a2 = $h->acquire('poll', 'dev-A', 'edge', 20);
+    ok($a2 !== null, 'dev-A asking again replaces its own older hold within 250 ms: the pool still holds three devices, not four');
+    eq(4, holds_count($r), 'two markers of dev-A, one each for dev-B and dev-C');
+    eq(null, $h->acquire('poll', 'dev-D', 'edge', 20), 'and a fourth device is still refused');
+});
+
 test('4.7.2 rule 1: a marker older than its cap plus five seconds is ignored and removed (a crashed request ages out)', function () {
     $r = Relay::make();
     $h = $r->ctx()->holds;

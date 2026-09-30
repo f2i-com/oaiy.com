@@ -191,12 +191,16 @@ test('4.18.6 GC deletes expired slots, reply boxes, rendezvous, ticket ids, enro
 test('4.18.6 GC keeps a lock row that is still locked, and keeps this hour\'s status counters', function () {
     $r = Relay::make();
     $db = $r->ctx()->db;
-    $db->exec("INSERT INTO tokid_fail (id, addr, fails, first_at, locked_until) VALUES ('t', 'a', 20, ?, ?)", [Relay::T0 - 3000, Relay::T0 + 500]);
+    // The window of a row that locked late in its hour has ended while the lock still runs: only the lock keeps it.
+    $db->exec("INSERT INTO tokid_fail (id, addr, fails, first_at, locked_until) VALUES ('still-locked', 'a', 20, ?, ?)", [Relay::T0 - 3700, Relay::T0 + 500]);
+    $db->exec("INSERT INTO tokid_fail (id, addr, fails, first_at, locked_until) VALUES ('window-over', 'a', 3, ?, NULL)", [Relay::T0 - 3700]);
+    $db->exec("INSERT INTO tokid_fail (id, addr, fails, first_at, locked_until) VALUES ('lock-over', 'a', 20, ?, ?)", [Relay::T0 - 3700, Relay::T0 - 10]);
+    $db->exec("INSERT INTO tokid_fail (id, addr, fails, first_at, locked_until) VALUES ('recent', 'a', 4, ?, NULL)", [Relay::T0 - 3000]);
     $db->exec("INSERT INTO rl (k, w, n) VALUES (?, ?, 7)", ['s:rej:unauthorized:' . intdiv(Relay::T0, 3600), intdiv(Relay::T0, 3600) * 3600 * 1000]);
     Tmp::setClock(Relay::T0 + 100);
     $r->ctx()->gc->maybeRun();
     $db = $r->ctx()->db;
-    eq(1, (int)$db->val('SELECT COUNT(*) FROM tokid_fail'));
+    eq(['recent', 'still-locked'], array_column($db->all('SELECT id FROM tokid_fail ORDER BY id'), 'id'), 'a lock that is still running and a window that is still open stay; the rest go');
     eq(1, (int)$db->val("SELECT COUNT(*) FROM rl WHERE k LIKE 's:rej:%'"));
 });
 

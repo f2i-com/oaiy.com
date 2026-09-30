@@ -16,6 +16,15 @@ function http_relay_pk(Relay $r): string
     return Info::loadKeys($r->data)[0];
 }
 
+test('4.7.1 a 429 or 503 that has no Retry-After of its own leaves the relay with one second, and one that has is left alone', function () {
+    foreach ([429, 503] as $status) {
+        $res = Kernel::finalise(new Oaiy\Relay\Response($status, '{}', ['Content-Type' => 'application/json']), 1000);
+        eq('1', $res->headers['Retry-After'], "status $status");
+    }
+    eq('7', Kernel::finalise(new Oaiy\Relay\Response(429, '{}', ['Retry-After' => '7']), 1000)->headers['Retry-After']);
+    ok(!isset(Kernel::finalise(new Oaiy\Relay\Response(200, '{}', []), 1000)->headers['Retry-After']), 'other answers get none');
+});
+
 // ------------------------------------------------------------------------------------------------ 4.8 info and the identity proof
 
 test('4.8 vector A6: the static signature and the interactive proof of the shortened stand-in body', function () {
