@@ -188,8 +188,8 @@ One outreach campaign. Its run state (running, in flight, retry timers, attempts
 | `window` | runs | Only with the tick "Outreach campaigns (texts and calls to a list of people)" | The hours it may contact people |
 | `window.from` | runs | Only with the tick "Outreach campaigns (texts and calls to a list of people)" | From |
 | `window.to` | runs | Only with the tick "Outreach campaigns (texts and calls to a list of people)" | To |
-| `afterwards` | runs | Only with the tick "Outreach campaigns (texts and calls to a list of people)" | What to do afterwards |
-| `origin` | runs | Only with the tick "Outreach campaigns (texts and calls to a list of people)" | Who started it |
+| `afterwards` | runs | Only with the tick "Outreach campaigns (texts and calls to a list of people)" | What to do afterwards: When the campaign ends its report says: what your person asked for afterwards, do that now with your tools. It is an instruction to the Agent. |
+| `origin` | runs | Only with the tick "Outreach campaigns (texts and calls to a list of people)" | Who started it: It decides where the campaign reports to and what that project is then told to do. A restored campaign is started by the front desk, whoever it says. |
 | `origin.kind` | runs | Only with the tick "Outreach campaigns (texts and calls to a list of people)" | Who started it |
 | `origin.projectId` | runs | Only with the tick "Outreach campaigns (texts and calls to a list of people)" | The project that started it |
 | `origin.projectName` | runs | Only with the tick "Outreach campaigns (texts and calls to a list of people)" | The project's name |
@@ -205,10 +205,10 @@ One outreach campaign. Its run state (running, in flight, retry timers, attempts
 | `people` | runs | Only with the tick "Outreach campaigns (texts and calls to a list of people)" | The people to contact |
 | `people[].id` | runs | Only with the tick "Outreach campaigns (texts and calls to a list of people)" | A person's id |
 | `people[].name` | runs | Only with the tick "Outreach campaigns (texts and calls to a list of people)" | A person's name |
-| `people[].number` | runs | Only with the tick "Outreach campaigns (texts and calls to a list of people)" | A person's number: It is a number that is called or texted once the campaign is started. |
-| `people[].raw` | runs | Only with the tick "Outreach campaigns (texts and calls to a list of people)" | The number as it was given |
-| `people[].notes` | runs | Only with the tick "Outreach campaigns (texts and calls to a list of people)" | Notes about a person (read as instructions) |
-| `people[].fields` | runs | Only with the tick "Outreach campaigns (texts and calls to a list of people)" | Details about a person |
+| `people[].number` | runs | Only with the tick "Outreach campaigns (texts and calls to a list of people)" | A person's number: It is a number that is called or texted once the campaign is started. Only a full phone number (a + and 7 to 15 digits) comes back, as the Agent writes it. |
+| `people[].raw` | runs | Only with the tick "Outreach campaigns (texts and calls to a list of people)" | The number as it was given: It is not carried: the number is what is called. |
+| `people[].notes` | runs | Only with the tick "Outreach campaigns (texts and calls to a list of people)" | Notes about a person (read as instructions): The Agent reads them before it calls or texts that person. |
+| `people[].fields` | runs | Only with the tick "Outreach campaigns (texts and calls to a list of people)" | Details about a person: They are put into the text or the opening line, and the Agent reads them. |
 | `people[].state` | runs | Only with the tick "Outreach campaigns (texts and calls to a list of people)" | Where a person had got to: Only finished states are kept; a person who was in the middle of being reached comes back skipped. |
 | `people[].outcome` | runs | Only with the tick "Outreach campaigns (texts and calls to a list of people)" | How it ended for a person |
 | `people[].summary` | runs | Only with the tick "Outreach campaigns (texts and calls to a list of people)" | A summary of what they said |
@@ -639,8 +639,11 @@ in parts through internal routes with a secret made for that one backup.
   above lets come back, and only what its kind's tick allows. The dry run lists what would come
   back **by name and size**: each project by its name, the front desk's brief with what it says,
   each knowledge file, what the phone's agents remember about people, each outreach campaign by
-  name with how many people it would contact and what it says, and the Agent's settings key by
-  key with their values (the instructions with their full length). It says what is not restored
+  name with how many people it would contact and **every key of it that acts, by value** (what it
+  says to them: the objective, the text or the opening line, the questions, the voicemail; what it
+  does afterwards; who it speaks as; who said they started it; when it tries and how often; and
+  the notes and details of the people, ten of them by name and the rest counted), and the Agent's
+  settings key by key with their values (the instructions with their full length). It says what is not restored
   and why, and every name it does not know is "not restored: unknown item". The archive that is
   prepared is recorded with its size and SHA-256 and held to them like a staged data file is: when
   the restore is applied (a copy that was swapped stops the restore, and nothing is changed), again
@@ -659,7 +662,13 @@ in parts through internal routes with a secret made for that one backup.
 - **Campaigns never come back running.** With Outreach ticked, a campaign is rebuilt from the keys
   the table lets through and comes back **paused**, with nothing scheduled: you start it yourself,
   with Resume on its card (the Agent cannot start one that came from a backup: it is told to ask
-  you). A campaign that had already finished and has no one left to reach stays finished. Anyone
+  you). A restored campaign is **started by the front desk**, whoever the backup says started it
+  (that decides where its report goes and what that project is then told to do), keeps only the
+  people whose number is a full phone number as the Agent writes it (a + and 7 to 15 digits), and
+  does not carry the number as it was given. What the campaign says to be done *afterwards* is still
+  its author's words, and it is shown in full above: read it before you press Resume, because the
+  report of a campaign that ends tells the Agent to do it. A campaign that had already finished and
+  has no one left to reach stays finished. Anyone
   who was in the middle of being reached when the backup was made (calling, texting or waiting for
   a reply) is set aside, not contacted again by a restore. Where a campaign writes its results is
   cut to a file of its own under `/outreach/`, so it cannot be pointed at the brief. A campaign of the same id

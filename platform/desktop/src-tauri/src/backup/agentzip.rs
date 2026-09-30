@@ -173,11 +173,28 @@ fn strip_bom(bytes: &[u8]) -> &[u8] {
 
 // ---- outreach campaigns ------------------------------------------------------------------------------
 
+/// A campaign as it comes back, and what was changed or left out of it on the way.
+pub struct Rebuilt {
+    pub campaign: Value,
+    /// People whose number is not a full phone number (E.164, `+` and 7 to 15 digits), which the Agent never writes: left out.
+    pub bad_numbers: usize,
+    /// Who the backup said started it (the project's id and name): a restored campaign is started by the front desk, whoever it says.
+    pub started_by: Option<(String, String)>,
+}
+
+/// A full phone number as the Agent writes it into a campaign: `+`, then 7 to 15 digits, not starting with 0.
+fn full_number(number: &str) -> bool {
+    number.strip_prefix('+').is_some_and(|d| (7..=15).contains(&d.len()) && d.starts_with(|c: char| ('1'..='9').contains(&c)) && d.chars().all(|c| c.is_ascii_digit()))
+}
+
 /// A campaign as it comes back, rebuilt from what the table lets through: paused, nothing scheduled, and nobody
 /// who was in the middle of being reached is contacted again. A campaign that had finished (`was` says `done` or
 /// `stopped`) and has nobody left to reach stays finished, since that is the truth and nothing can run from it.
+/// It is started by the front desk, whoever the backup says started it (where a campaign reports to, and what it is
+/// then told to do, follows from who started it), and only what the Agent itself writes into a campaign is kept: a
+/// person whose number is not a full phone number is left out, and the number as it was given is not carried.
 /// `Err` says why it cannot come back.
-pub fn rebuild_campaign(found: &Value, was: Option<&str>) -> std::result::Result<Value, String> {
+pub fn rebuild_campaign(found: &Value, was: Option<&str>) -> std::result::Result<Rebuilt, String> {
     let Value::Object(c) = found else { return Err("it is not a campaign".to_string()) };
     let text = |key: &str, default: &str| c.get(key).and_then(Value::as_str).unwrap_or(default).to_string();
     let id = text("id", "");
@@ -209,10 +226,15 @@ pub fn rebuild_campaign(found: &Value, was: Option<&str>) -> std::result::Result
         }
     };
     let mut people = Vec::new();
+    let mut bad_numbers = 0usize;
     for p in c.get("people").and_then(Value::as_array).into_iter().flatten() {
         let Value::Object(p) = p else { continue };
         let number = p.get("number").and_then(Value::as_str).unwrap_or("").to_string();
         if number.is_empty() {
+            continue;
+        }
+        if !full_number(&number) {
+            bad_numbers += 1;
             continue;
         }
         let get = |key: &str| p.get(key).cloned();
@@ -221,11 +243,17 @@ pub fn rebuild_campaign(found: &Value, was: Option<&str>) -> std::result::Result
         person.insert("id".into(), Value::String(p.get("id").and_then(Value::as_str).map(str::to_string).unwrap_or_else(|| format!("p{}", people.len() + 1))));
         person.insert("name".into(), Value::String(p.get("name").and_then(Value::as_str).unwrap_or("").to_string()));
         person.insert("number".into(), Value::String(number.clone()));
-        person.insert("raw".into(), Value::String(p.get("raw").and_then(Value::as_str).unwrap_or(&number).to_string()));
+        // (The number as it was given is not carried: the number is what is called.)
+        person.insert("raw".into(), Value::String(number.clone()));
         if let Some(notes) = get("notes") {
             person.insert("notes".into(), notes);
         }
-        person.insert("fields".into(), get("fields").filter(Value::is_object).unwrap_or_else(|| json!({})));
+        // Details are named as the Agent names them: a letter or underscore, then letters, digits or underscores.
+        let fields: serde_json::Map<String, Value> = get("fields")
+            .and_then(|f| f.as_object().cloned())
+            .map(|f| f.into_iter().filter(|(k, _)| k.len() <= 32 && k.starts_with(|c: char| c.is_ascii_alphabetic() || c == '_') && k.chars().all(|c| c.is_ascii_alphanumeric() || c == '_')).collect())
+            .unwrap_or_default();
+        person.insert("fields".into(), Value::Object(fields));
         person.insert("tries".into(), json!(0));
         person.insert("nextAt".into(), json!(0));
         person.insert("history".into(), json!([]));
@@ -271,7 +299,8 @@ pub fn rebuild_campaign(found: &Value, was: Option<&str>) -> std::result::Result
     out.insert("replyDeadlineHours".into(), c.get("replyDeadlineHours").cloned().unwrap_or_else(|| json!(48)));
     out.insert("window".into(), c.get("window").filter(|v| v.is_object()).cloned().unwrap_or_else(|| json!({ "from": "09:00", "to": "18:00" })));
     out.insert("afterwards".into(), json!(text("afterwards", "")));
-    out.insert("origin".into(), c.get("origin").filter(|v| v.is_object()).cloned().unwrap_or_else(|| json!({ "kind": "runner", "projectId": "front-desk", "projectName": "Front desk" })));
+    let started_by = c.get("origin").and_then(|o| Some((o.get("projectId")?.as_str()?.to_string(), o.get("projectName").and_then(Value::as_str).unwrap_or("").to_string()))).filter(|(id, _)| id != "front-desk");
+    out.insert("origin".into(), json!({ "kind": "runner", "projectId": "front-desk", "projectName": "Front desk" }));
     out.insert("resultsPath".into(), json!(results_path));
     if let Some(identity) = c.get("identity").filter(|v| v.is_object()) {
         out.insert("identity".into(), identity.clone());
@@ -291,11 +320,36 @@ pub fn rebuild_campaign(found: &Value, was: Option<&str>) -> std::result::Result
     out.insert("lines".into(), json!([]));
     out.insert("people".into(), Value::Array(people));
     out.insert("skipped".into(), c.get("skipped").filter(|v| v.is_array()).cloned().unwrap_or_else(|| json!([])));
-    Ok(Value::Object(out))
+    Ok(Rebuilt { campaign: Value::Object(out), bad_numbers, started_by })
 }
 
-/// How a rebuilt campaign is described: by name, with how many people it would contact.
-fn describe_campaign(campaign: &Value, was: Option<&str>) -> String {
+/// (For the tests: how a campaign is described.)
+#[cfg(test)]
+pub fn describe_campaign_for_test(kept: &super::table::Filtered, rebuilt: &Rebuilt, was: Option<&str>) -> String {
+    describe_campaign(kept, rebuilt, was)
+}
+
+/// The most people of a campaign the dry run names one by one (the rest are counted), and the most of its own keys it lists.
+const MAX_PEOPLE_LISTED: usize = 10;
+
+/// The most a campaign's description says (a campaign's own words come to a few thousand characters).
+const MAX_CAMPAIGN_TEXT: usize = 6000;
+
+/// The keys of a campaign that are only names for it, or that the restore makes again: not listed as something it says.
+const CAMPAIGN_KEYS_NOT_LISTED: [&str; 5] = ["id", "slug", "createdAt", "resultsPath", "name"];
+
+/// A key of a campaign as a person reads it: `collect[2].question` for the second question.
+fn campaign_key(kept: &super::table::Kept) -> String {
+    let mut at = kept.at.iter();
+    kept.path.split("[]").enumerate().map(|(i, part)| if i == 0 { part.to_string() } else { format!("[{}]{part}", at.next().map(|n| n + 1).unwrap_or(0)) }).collect()
+}
+
+/// How a rebuilt campaign is described: by name, with how many people it would contact, and then EVERY key of it that acts, by
+/// its value (cut, with how long it is): what it says to them (the objective, the text, the opening line, the questions, the
+/// voicemail), what it does afterwards, who it speaks as, who started it, when it tries and how often. It is made from the key
+/// table, so a key added to the table is listed by construction. The people are counted, and those with notes or details are named.
+fn describe_campaign(kept: &super::table::Filtered, rebuilt: &Rebuilt, was: Option<&str>) -> String {
+    let campaign = &rebuilt.campaign;
     let people = campaign.get("people").and_then(Value::as_array).map(Vec::as_slice).unwrap_or(&[]);
     let count = |state: &str| people.iter().filter(|p| p.get("state").and_then(Value::as_str) == Some(state)).count();
     let (queued, done) = (count("queued"), count("done"));
@@ -305,14 +359,32 @@ fn describe_campaign(campaign: &Value, was: Option<&str>) -> String {
         "{kind} to {} ({queued} not yet contacted, {done} finished, {skipped} set aside).",
         plural(people.len(), "person", "people")
     );
-    if let Some(objective) = campaign.get("objective").and_then(Value::as_str).filter(|o| !o.is_empty()) {
-        what.push_str(&format!(" Objective, read as instructions: {}.", show_value(&Value::String(objective.to_string()))));
+    if rebuilt.bad_numbers > 0 {
+        what.push_str(&format!(" {} without a full phone number {} left out.", plural(rebuilt.bad_numbers, "person", "people"), if rebuilt.bad_numbers == 1 { "was" } else { "were" }));
     }
-    if let Some(template) = campaign.get("textTemplate").and_then(Value::as_str).filter(|t| !t.is_empty() && campaign.get("kind").and_then(Value::as_str) == Some("text")) {
-        what.push_str(&format!(" The text: {}.", show_value(&Value::String(template.to_string()))));
+    // Everything it says or does, by value: each key that the table lets through and that is not a person (listed below).
+    let mut listed = 0usize;
+    for k in kept.kept.iter().filter(|k| k.row.class == Class::Runs && !k.path.starts_with("people[]") && !k.path.starts_with("skipped[]") && !CAMPAIGN_KEYS_NOT_LISTED.contains(&k.path.as_str())) {
+        if matches!(&k.value, Value::String(s) if s.is_empty()) || matches!(&k.value, Value::Array(a) if a.is_empty()) {
+            continue;
+        }
+        if listed >= 60 {
+            what.push_str(" (More of its settings are not listed here.)");
+            break;
+        }
+        listed += 1;
+        let note = if k.path.starts_with("origin.") { " (it comes back started by the front desk)" } else { "" };
+        what.push_str(&format!(" {}, {}: {}{note}.", campaign_key(k), k.row.what.to_lowercase(), show_value(&k.value)));
     }
-    if let Some(line) = campaign.get("openingLine").and_then(Value::as_str).filter(|t| !t.is_empty() && campaign.get("kind").and_then(Value::as_str) == Some("call")) {
-        what.push_str(&format!(" Opens the call with: {}.", show_value(&Value::String(line.to_string()))));
+    // The people whose notes or details a model reads: named, up to a few; the rest are counted.
+    let with_words: Vec<(usize, &Value)> = people.iter().enumerate().filter(|(_, p)| p.get("notes").and_then(Value::as_str).is_some_and(|n| !n.is_empty()) || p.get("fields").and_then(Value::as_object).is_some_and(|f| !f.is_empty())).collect();
+    for (at, p) in with_words.iter().take(MAX_PEOPLE_LISTED) {
+        let notes = p.get("notes").and_then(Value::as_str).filter(|n| !n.is_empty()).map(|n| format!(" notes {}", show_value(&Value::String(n.to_string())))).unwrap_or_default();
+        let fields = p.get("fields").and_then(Value::as_object).filter(|f| !f.is_empty()).map(|f| format!(" details {}", f.iter().take(5).map(|(k, v)| format!("{k} = {}", show_value(v))).collect::<Vec<_>>().join(", "))).unwrap_or_default();
+        what.push_str(&format!(" Person {} ({}):{notes}{fields}.", at + 1, p.get("number").and_then(Value::as_str).unwrap_or("?")));
+    }
+    if with_words.len() > MAX_PEOPLE_LISTED {
+        what.push_str(&format!(" {} more people have notes or details of the same kind.", with_words.len() - MAX_PEOPLE_LISTED));
     }
     match was {
         Some("running") => what.push_str(" It was RUNNING when the backup was made; it comes back PAUSED, and nothing is sent or called until you start it."),
@@ -485,14 +557,14 @@ pub fn describe(path: &Path, listing: &Listing, limits: &Limits, budget: &Budget
                     let kt = table().key_table("agent.campaign").ok_or_else(|| "no key table".to_string())?;
                     let kept = filter_json(kt, &v, &|_| true);
                     let was = v.get("state").and_then(Value::as_str).map(str::to_string);
-                    rebuild_campaign(&kept.value, was.as_deref()).map(|c| (c, was))
+                    rebuild_campaign(&kept.value, was.as_deref()).map(|c| (kept, c, was))
                 });
                 match outcome {
-                    Ok((campaign, was)) => items.push(ReviewItem {
+                    Ok((kept, rebuilt, was)) => items.push(ReviewItem {
                         class,
                         name: shown,
-                        title: clip(&format!("Campaign \"{}\"", campaign.get("name").and_then(Value::as_str).unwrap_or("?")), 120),
-                        what: clip(&describe_campaign(&campaign, was.as_deref()), 900),
+                        title: clip(&format!("Campaign \"{}\"", rebuilt.campaign.get("name").and_then(Value::as_str).unwrap_or("?")), 120),
+                        what: clip(&describe_campaign(&kept, &rebuilt, was.as_deref()), MAX_CAMPAIGN_TEXT),
                     }),
                     Err(why) => items.push(ReviewItem { class, name: shown, title: clip(parts.last().copied().unwrap_or("campaign"), 120), what: format!("Could not be read ({why}): OAIY would not load it, so it is not brought back.") }),
                 }
@@ -764,12 +836,18 @@ pub fn filter(nested: &Path, out: &Path, scratch: &Path, ticks: &Ticks, mode: Mo
                     rebuild_campaign(&filter_json(kt, &v, &|_| true).value, v.get("state").and_then(Value::as_str))
                 });
                 match rebuilt {
-                    Ok(campaign) => {
+                    Ok(Rebuilt { campaign, bad_numbers, started_by }) => {
                         let id = campaign.get("id").and_then(Value::as_str).unwrap_or_default().to_string();
                         // The file is named for its campaign: a campaign cannot be written over another's file.
                         if entry.name != format!("opfs/front-desk/outreach/{id}.json") {
                             prepared.notes.push(format!("{} was not brought back: its name is not its campaign's.", clip(&display(&entry.name), 120)));
                             continue;
+                        }
+                        if bad_numbers > 0 {
+                            prepared.notes.push(format!("{}: {} without a full phone number {} left out.", clip(&display(&entry.name), 120), plural(bad_numbers, "person", "people"), if bad_numbers == 1 { "was" } else { "were" }));
+                        }
+                        if let Some((project, _)) = &started_by {
+                            prepared.notes.push(format!("{}: it said it was started by the project \"{}\"; it comes back started by the front desk.", clip(&display(&entry.name), 120), clip(project, 60)));
                         }
                         campaigns.push(id);
                         let bytes = serde_json::to_vec(&campaign).map_err(|_| BackupError::new(ErrorKind::Damaged, "A campaign could not be written."))?;
