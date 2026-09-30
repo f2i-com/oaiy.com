@@ -5,8 +5,9 @@
 //! - **A junction, a symbolic link or a mount point is not a real folder**, and is not held by that: a junction is an entry in its parent that points somewhere,
 //!   and whoever can change the parent can delete it and make it point somewhere else, with the store open (the reviewer did, and the store answered from another
 //!   tree: `None` for keys that exist, a write into the other tree, and an older copy of the same user's keys served as the current one). So **the path is refused
-//!   if any folder on it, the keys folder itself included, is a reparse point**, at open. The walk is repeated once the folder is held, because it cannot have
-//!   been swapped after that but could have been between the first walk and the open (a hook in the tests does exactly that).
+//!   if any folder on it, the keys folder itself included, is a reparse point**, at open: walked before anything is made through it (a folder made through a junction is
+//!   made in the tree the junction points to), and walked again, the whole way, once the folder is held, because it cannot have been swapped after that but could have
+//!   been between the first walk and the open (a hook in the tests does exactly that).
 //! - **Every operation works in the folder that is held, by the folder's real path** (`winfs::final_path` of the handle: no junction in it, and it cannot change
 //!   while the handle is open), never by the path the caller gave. And before each operation the path is opened afresh and its identity (volume and file index)
 //!   compared with the handle's: a path that leads somewhere else now is an error, never "nothing stored" and never another tree's value.
@@ -121,7 +122,6 @@ impl KeyDir {
             }
             Err(e) => return Err(KeyError::io("inspect the keys directory", e)),
         }
-        refuse_links_on_the_way(&absolute, false)?;
         #[cfg(test)]
         super::open_hooks::fire(&absolute, "after_walk");
         // no FILE_SHARE_DELETE: while this handle is open nobody can rename or remove the folder, or a real folder above it. Write access is what flushing the
@@ -140,7 +140,8 @@ impl KeyDir {
             #[cfg(test)]
             hooks: super::Hooks::default(),
         };
-        // the path leads to what was opened, and (walked again, now that the folder is held and nothing above it can be swapped) through real folders only
+        // the path leads to what was opened, and (walked now, the whole way, the keys folder included: it is made by now, and nothing above it can be swapped from here on)
+        // through real folders only. This is the walk that catches a junction that was put on the path after the first one, and before the open.
         found.path_leads_here()?;
         refuse_links_on_the_way(&found.path, false)?;
         Ok(found)
