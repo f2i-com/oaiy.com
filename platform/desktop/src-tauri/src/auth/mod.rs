@@ -10,11 +10,20 @@
 //!   credential is valid only while its whole parent chain is, the one-process lock, and who a
 //!   request is.
 //! - [`audit`], [`scrub`]: the audit and noise logs, and the scrub every log line passes through.
+//! - [`mode`], [`host`], [`clientip`], [`exposure_checks`], [`bearer_throttle`], [`cors`]: the access mode,
+//!   and the parts of a request's judgement that take plain values.
+
 pub mod audit;
+pub mod bearer_throttle;
 pub mod chain;
+pub mod clientip;
 pub mod clock;
+pub mod cors;
 pub mod export;
+pub mod exposure_checks;
+pub mod host;
 pub mod lock;
+pub mod mode;
 pub mod presets;
 pub mod principal;
 pub mod routes;
@@ -22,6 +31,8 @@ pub mod scopes;
 pub mod scrub;
 pub mod store;
 pub mod token;
+
+pub use mode::{AccessMode, ConfigRefusal, Exposure};
 
 #[cfg(test)]
 mod conformance;
