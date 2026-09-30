@@ -1,0 +1,291 @@
+# What a receptionist says in the ordinary course of a call, with transfers on: none of it is a promise that THIS call is being put through to a person, and
+# every line must reach the caller as written (a false positive swaps a true line for "One moment, please."). The first part is the final review of
+# the promise filter (G2), the rest is this branch's own. One line each; a line that begins with # is a comment.
+# this branch's own: hours, prices, bookings, quotes, invoices, forms, emails, call-backs, messages, links, menus, holds, transfers of things
+We're open from eight until five, Monday to Friday.
+We're closed on public holidays.
+Our opening hours are eight to five on weekdays.
+The call-out fee is eighty dollars.
+A standard lawn mow starts at forty five dollars.
+That will be one hundred and twenty dollars including GST.
+I'll email you the quote today.
+I'll email you a copy of the invoice.
+I'll forward you the invoice.
+I'll forward you the quote.
+I'll forward you the details by text.
+I'll forward you a copy of the booking confirmation.
+I'll forward you our price list.
+I'll forward that to the owner.
+I'll forward that on to the team.
+I'll forward this to the manager for a call back.
+I'll forward your enquiry to the office.
+I'll forward your message to the owner.
+I can forward the quote to your email address.
+Let me forward the invoice to you now.
+I'll pass that on to the owner.
+I'll pass that on.
+I'll pass the message on to the manager.
+I'll pass your details on to the team.
+I'll pass your number on to the owner and ask him to call you.
+I'll pass you the address.
+I'll pass you a link.
+You'll be passed a link to the booking form.
+You'll be forwarded the invoice by email.
+You will be forwarded a copy of the quote.
+You'll be sent a confirmation text.
+You will be emailed the invoice.
+You'll be given a quote on the day.
+I'll put you down for Wednesday at nine.
+I've put you down for a quote on Thursday.
+I've put you in the diary for next Tuesday.
+I've put you on the list for a call back.
+I'll put you on the waiting list.
+I'll put you on hold while I check the diary.
+I've put you on hold for a moment.
+Let me put you on hold for just a second.
+Please hold while I put you on hold and check.
+I'll put you on our mailing list.
+I'll put you on to our online form.
+Let me put you on to our online booking page.
+I'll put you onto the website.
+I'll put you on to Wednesday's schedule.
+I'll put you onto the Thursday list.
+I've put you on to the Tuesday roster.
+I've put you on the booking calendar.
+I'll put you through to the menu.
+I'll put you through to our automated booking line.
+I'll put you through to the voicemail box.
+I'll put you through to the options menu.
+Let me put you through to the online form.
+I'll connect you to the booking page.
+I'll connect you with our website.
+I'll connect you with our online form.
+I've connected you with the booking calendar.
+Let me connect you with our email newsletter.
+I'll transfer the funds to your account.
+I'll transfer the deposit into your account today.
+I'll transfer you the refund by Friday.
+We'll transfer the balance once the job is done.
+The transfer of funds takes two business days.
+The bank transfer should arrive tomorrow.
+A transfer fee of ten dollars applies.
+I'll transfer the booking to Thursday.
+I'll transfer your booking to the next free slot.
+I'll transfer these notes to the owner's diary.
+Your booking has been transferred to Thursday.
+Your call has been noted.
+Your call is very important to us.
+Your call may be recorded for training purposes.
+Thanks for holding.
+Thanks for waiting, how can I help?
+You've reached Dave's Lawn Care.
+You're through to Dave's Lawn Care.
+You are through to Dave's Lawn Care, how can I help?
+You've come through to the office of Dave's Lawn Care.
+You are through to the voicemail of Dave's Lawn Care.
+You're through to the menu.
+I've taken your message and I'll get the owner to call you back.
+I'll take a message and the owner will call you back today.
+I've noted that down for the owner.
+I'll make sure the owner sees your message.
+I'll leave a note for the manager.
+I'll get the owner to call you when he's finished the job.
+The owner will call you back this afternoon.
+The owner will call you once he's off the ladder.
+The owner will take a look at the job on Thursday.
+The owner will take your message and get back to you.
+The owner will take your details when he gets back.
+The owner will take that on board.
+The owner will be with a customer until three.
+The owner will be back at two.
+The owner will be with you on the day.
+The manager will be with the crew on site.
+The owner will speak to you after I pass on your message.
+The owner will speak to you once he has seen your message.
+The owner will talk to you when he calls back.
+The owner is on another call at the moment.
+The owner is out on a job.
+The manager is in a meeting.
+Someone will be with you on Tuesday to measure up.
+Someone will be out to see you on Friday.
+A technician will be with you between eight and ten.
+Our team will be at your place on Monday.
+I'll send you a link so you can pay online.
+I'll text you a link to the booking form.
+I'll email you the booking form.
+I'll send you the form to fill in.
+Please fill in the form on our website.
+You can find the form on our website.
+You can pay through our website.
+You can pay by bank transfer.
+You can book through our website.
+Press one for bookings.
+Our menu has three mowing packages.
+I'll read you the menu of services.
+Let me read you our services menu.
+Let me get you a quote.
+Let me get the price for you.
+Let me get the booking form.
+Let me get you a time for Thursday.
+Let me get the diary up.
+Let me get the details.
+I'll get the details down.
+I'll get you booked in for Wednesday.
+I'll get you a quote by tomorrow.
+I'll get your booking confirmed.
+I'll get the owner's email address for you.
+I'll get the address for you.
+I'll get you the invoice number.
+I'll bring up your booking.
+I'll bring up the calendar.
+I'll bring you up to date on your booking.
+I'll hand the details over to the team.
+I'll hand your booking over to the scheduling team for confirmation.
+I'll hand your message to the owner.
+I'll hand this to the team.
+Let me hand you a summary of the quote.
+I'll pass you over to our booking form.
+Sure, hold on a moment while I check the diary.
+Sure, one moment while I look that up.
+Please hold on while I find your booking.
+Hold on while I look up your invoice.
+Just a moment while I bring up the calendar.
+We'll connect the dots and get back to you.
+We'll get you sorted on Tuesday.
+The connection is a bit poor, could you say that again?
+I can hear you, but the line is a bit crackly.
+Can you hear me alright?
+Sorry, the line dropped out for a second.
+Your call is being recorded.
+Your booking is being processed.
+Your quote is being prepared.
+Your invoice is being sent to your email.
+Your message is being passed on to the owner.
+Your details are being forwarded to the team.
+Your call is being logged.
+You will be contacted by the owner.
+You will be contacted within one business day.
+You'll be called back within the hour.
+You'll be transferred a confirmation code by text.
+You are being booked in for Tuesday.
+You've been booked in for Tuesday.
+You have been put down for Wednesday.
+You've been put on the list.
+You will be put on the waiting list.
+You'll be put on our newsletter.
+Your enquiry has been passed on to the owner.
+Your message has been forwarded to the manager.
+Your booking has been forwarded to the crew.
+Your call details have been forwarded to the owner.
+I have passed your message on to the owner.
+I've passed that on to the manager.
+I have forwarded your quote by email.
+I've forwarded the invoice to your email.
+I've forwarded your message to the owner.
+I've transferred the booking to Thursday.
+I have transferred the funds to your account.
+I've connected the calendar to your booking.
+I've handed your message to the owner.
+I've handed the job over to the crew.
+I'm transferring the booking to Thursday.
+I'm forwarding the invoice to your email.
+I'm passing your message on to the owner.
+I'm connecting your booking to the calendar.
+I'm putting you down for Thursday.
+I'm putting you on hold for a second.
+I'm putting you in the diary for Friday.
+I'm getting the quote together for you.
+I'm getting the owner's number for you.
+# the coordinator's seven and the earlier reproduction
+I'll get the owner to call you back.
+I'll get someone to call you back.
+The owner will be there on Tuesday morning.
+Let me get the owner's email address for you.
+I'll forward you the quote by email.
+I'll put you through to the menu.
+I'll connect you with our online booking page.
+I'll get the owner to call you back.
+Let me get the owner to give you a ring.
+I'll get him to call you as soon as he can.
+I've taken your message and I'll get the owner to call you back.
+I'll get the manager to get back to you.
+I'll get somebody to ring you back tomorrow.
+I'll have the owner call you back.
+Let me get you the address.
+I can transfer you to voicemail.
+One moment while I connect to the calendar.
+The owner will be there on Tuesday morning.
+The manager will speak to you tomorrow.
+The owner will pick up the keys tomorrow.
+The owner will be in at nine on Monday.
+The owner will answer your email tonight.
+The owner will join us for the site visit.
+The owner will call you this afternoon.
+The owner will speak to you when he calls back.
+The owner will speak with you once he is back from the job.
+# new ordinary lines
+I'll pass your message on to the owner.
+Let me get your name and number.
+Let me get a pen.
+Let me get the details down.
+I'll get her to give you a ring tomorrow.
+I'll get someone to help you with that.
+I'm going to get the owner's number for you.
+I'll transfer the details to the owner.
+I'll forward the details to the owner.
+I'll forward your call details to the owner.
+I'll forward your message to the owner.
+I'll put you on hold for a moment.
+Let me put you on to our online form.
+I'll put you through to voicemail.
+I'll connect you with our booking calendar.
+I'll connect you to the website.
+I'll pass your call history to the owner.
+I'll bring the owner up to speed.
+I'll get the owner on the calendar for Thursday.
+Let me get the owner a note about that.
+Thanks for calling, the owner will get back to you.
+Thanks for calling Dave's Lawn Care, how can I help?
+The owner is out on a job right now.
+The owner is not available at the moment.
+I can't put you through to the owner right now.
+I'm not able to transfer you.
+I can take a message for the owner.
+Would you like me to transfer you?
+Would you like to be connected to the owner?
+Do you want me to put you through?
+I'll try to reach the owner.
+I'll see if the owner is free.
+Let me check whether someone is available.
+I'm trying to connect you.
+Please stay on the line while I check.
+The manager will be on site from Monday.
+The boss will be with the crew all week.
+The owner will talk to you on Wednesday when he gets back.
+I'll get the owner to speak to you tomorrow.
+We'll connect the dots on your booking.
+I'll get someone to call you after lunch.
+Our manager will be there once the delivery arrives.
+Someone will call you back within the hour.
+The owner will be right back to you.
+I'll get the manager's mobile number for you.
+I'll forward the quote to you by email.
+I'll send you a link to the booking form.
+I'll pass this on to the manager.
+I'll hand your details over to the team for a call back.
+Let me get someone to check the diary.
+I'll get the owner's opinion and call you back.
+I'll connect with the owner later today and call you back.
+Sure, hold on a moment while I look that up.
+Please hold while I find your booking.
+Bring the receipt with you on Friday.
+I'll put you down for Tuesday at three.
+I'll put you in the diary for next week.
+I've put you down for a quote on Thursday.
+Your call is important to us.
+Your booking has been confirmed for Tuesday.
+You have been booked in for Tuesday morning.
+You will be contacted by the owner tomorrow.
+You'll be called back by the manager this afternoon.
+Je peux prendre un message pour le patron.
+Puedo tomar un mensaje para el dueño.

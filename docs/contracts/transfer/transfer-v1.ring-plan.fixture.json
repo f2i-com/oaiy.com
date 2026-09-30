@@ -1,0 +1,464 @@
+{
+  "contract": "transfer_v1",
+  "kind": "ring_plan",
+  "direction": "aokie_to_oaiy_host",
+  "about": "Two plugin-to-host requests, sent over the plugin's stdio like flow.run. The host announces ringPlan in plugin.init.features when it answers them; without it the plugin never offers transfer. oaiy.ring.plan asks who may be rung and for how long (the host's ring policy decides; the plugin enforces the answer). oaiy.ring.opened tells the host the request is open so that it can act on it (today OAIY shows a desktop toast and raises its window; no host posts ring hints, wakes a phone or launches a Companion yet); nothing waits for its answer. A host that does not answer the plan within 1.5 s, or answers something unusable, means nobody is rung: the tool result is unavailable with reason plan_unavailable.",
+  "planWaitMillis": 1500,
+  "init": {
+    "method": "plugin.init",
+    "about": "The host announces ringPlan in the features of the plugin.init params when it answers oaiy.ring.plan and oaiy.ring.opened. Without it the plugin never offers the transfer tool. Every plugin.init replaces what the last one said, and a feature that merely resembles the name announces nothing. Transfer is offered on a call only when ringPlan is announced, at least one Companion device is approved in the private bootstrap roster, and consent currently grants both remote_assistance and remote_takeover (transfer-v1.start-ready.fixture.json).",
+    "feature": "ringPlan",
+    "cases": [
+      {
+        "name": "an older host sends no features",
+        "params": {
+          "pluginApiVersion": 1
+        },
+        "ringPlan": false
+      },
+      {
+        "name": "a host with the event ack and no ring policy",
+        "params": {
+          "pluginApiVersion": 1,
+          "features": [
+            "eventAck"
+          ]
+        },
+        "ringPlan": false
+      },
+      {
+        "name": "a host that answers oaiy.ring.plan and oaiy.ring.opened",
+        "params": {
+          "pluginApiVersion": 1,
+          "features": [
+            "eventAck",
+            "ringPlan"
+          ]
+        },
+        "ringPlan": true
+      },
+      {
+        "name": "ringPlan alone",
+        "params": {
+          "pluginApiVersion": 1,
+          "features": [
+            "ringPlan"
+          ]
+        },
+        "ringPlan": true
+      },
+      {
+        "name": "names that resemble it, and a member that is not a string, announce nothing",
+        "params": {
+          "pluginApiVersion": 1,
+          "features": [
+            "ringplan",
+            "ring_plan",
+            7
+          ]
+        },
+        "ringPlan": false
+      }
+    ]
+  },
+  "plan": {
+    "method": "oaiy.ring.plan",
+    "input": {
+      "callId": "call_0123",
+      "callEpoch": 7,
+      "ownerEpoch": 4,
+      "reason": "caller_asked",
+      "callerNumber": "+61491570006",
+      "recentCallerTurns": [
+        "turn 0",
+        "turn 1",
+        "turn 2",
+        "turn 3",
+        "turn 4"
+      ]
+    },
+    "params": {
+      "callId": "call_0123",
+      "callEpoch": 7,
+      "ownerEpoch": 4,
+      "reason": "caller_asked",
+      "callerNumber": "+61491570006",
+      "recentCallerTurns": [
+        "turn 2",
+        "turn 3",
+        "turn 4"
+      ]
+    },
+    "paramsRules": "At most the last three caller turns that are not only acknowledgements of the AI (\"mm-hmm\", \"yeah, okay\": see backchannel in the caller-asked fixture), each cut to its last 300 characters (a turn is read from its end), and only what was said after the last request the plugin opened (the host authorised the ring and the request is open; a plan that was refused, unanswered or unusable spends nothing, so the same ask can be planned again) and after the last time the AI got the caller back (an ask counts for one request); callerNumber is left out when unknown. The turns never leave the machine: the host runs the phrase checks on them.",
+    "results": [
+      {
+        "name": "ring the planned phone",
+        "result": {
+          "planId": "plan_0001",
+          "decision": "ring",
+          "reason": "ok",
+          "ringSeconds": 40,
+          "phones": [
+            "thumb_phone_a"
+          ],
+          "wake": [
+            "thumb_phone_a"
+          ],
+          "desktopToast": false,
+          "desktopCompanions": []
+        },
+        "parsed": {
+          "decision": "ring",
+          "ringSeconds": 40,
+          "targets": [
+            "thumb_phone_a"
+          ],
+          "targetRule": "only"
+        }
+      },
+      {
+        "name": "ring a phone and the Windows Companion (each device once)",
+        "result": {
+          "planId": "plan_0002",
+          "decision": "ring",
+          "reason": "ok",
+          "ringSeconds": 30,
+          "phones": [
+            "thumb_phone_a",
+            "thumb_phone_b"
+          ],
+          "wake": [],
+          "desktopToast": true,
+          "desktopCompanions": [
+            "thumb_windows",
+            "thumb_phone_a"
+          ],
+          "somethingNew": true
+        },
+        "parsed": {
+          "decision": "ring",
+          "ringSeconds": 30,
+          "targets": [
+            "thumb_phone_a",
+            "thumb_phone_b",
+            "thumb_windows"
+          ],
+          "targetRule": "only"
+        }
+      },
+      {
+        "name": "the ring window is clamped to 20..90 s (too short)",
+        "result": {
+          "planId": "plan_0003",
+          "decision": "ring",
+          "reason": "ok",
+          "ringSeconds": 5,
+          "phones": [
+            "thumb_phone_a"
+          ]
+        },
+        "parsed": {
+          "decision": "ring",
+          "ringSeconds": 20,
+          "targets": [
+            "thumb_phone_a"
+          ],
+          "targetRule": "only"
+        }
+      },
+      {
+        "name": "the ring window is clamped to 20..90 s (too long)",
+        "result": {
+          "planId": "plan_0004",
+          "decision": "ring",
+          "reason": "ok",
+          "ringSeconds": 500,
+          "phones": [
+            "thumb_phone_a"
+          ]
+        },
+        "parsed": {
+          "decision": "ring",
+          "ringSeconds": 90,
+          "targets": [
+            "thumb_phone_a"
+          ],
+          "targetRule": "only"
+        }
+      },
+      {
+        "name": "the host says the model should not offer a person at all",
+        "result": {
+          "planId": "plan_0005",
+          "decision": "refused",
+          "reason": "limit_gap",
+          "ringSeconds": 0,
+          "phones": [],
+          "wake": [],
+          "desktopToast": false,
+          "desktopCompanions": []
+        },
+        "parsed": {
+          "decision": "refused",
+          "reason": "limit_gap",
+          "targets": []
+        }
+      },
+      {
+        "name": "the host says offer a message instead",
+        "result": {
+          "planId": "plan_0006",
+          "decision": "message_only",
+          "reason": "quiet_hours",
+          "ringSeconds": 0,
+          "phones": [],
+          "wake": [],
+          "desktopToast": false,
+          "desktopCompanions": []
+        },
+        "parsed": {
+          "decision": "message_only",
+          "reason": "quiet_hours",
+          "targets": []
+        }
+      },
+      {
+        "name": "a refused plan whose planId the host left empty (a plan that does not ring need not name itself)",
+        "result": {
+          "planId": "",
+          "decision": "refused",
+          "reason": "limit_caller",
+          "ringSeconds": 0,
+          "phones": [],
+          "wake": [],
+          "desktopToast": false,
+          "desktopCompanions": []
+        },
+        "parsed": {
+          "decision": "refused",
+          "reason": "limit_caller",
+          "targets": []
+        }
+      },
+      {
+        "name": "a message-only plan with no planId at all",
+        "result": {
+          "decision": "message_only",
+          "reason": "all_do_not_disturb",
+          "ringSeconds": 0,
+          "phones": [],
+          "wake": [],
+          "desktopToast": false,
+          "desktopCompanions": []
+        },
+        "parsed": {
+          "decision": "message_only",
+          "reason": "all_do_not_disturb",
+          "targets": []
+        }
+      },
+      {
+        "name": "the host vouches for a reason that is not caller_asked (urgent, or the business rule behind policy_rule)",
+        "result": {
+          "planId": "plan_0009",
+          "decision": "ring",
+          "reason": "ok",
+          "ringSeconds": 40,
+          "phones": [
+            "thumb_phone_a"
+          ],
+          "wake": [],
+          "desktopToast": false,
+          "desktopCompanions": [],
+          "reasonAllowed": true
+        },
+        "parsed": {
+          "decision": "ring",
+          "ringSeconds": 40,
+          "targets": [
+            "thumb_phone_a"
+          ],
+          "targetRule": "only",
+          "reasonAllowed": true
+        },
+        "plugin": "For urgent and policy_rule the plugin skips its own phrase check (the caller asked for a person) only when the plan says reasonAllowed: true. A plan without it, or with anything but true, leaves the check in force: a ring for those reasons then needs the caller to have asked, and is otherwise refused (not_urgent for urgent, caller_did_not_ask for policy_rule) before anything is opened. caller_asked is unaffected: it is checked before the host is asked and no host word lifts it."
+      },
+      {
+        "name": "a desktop toast with no device named is not a target (design vector V01, fail closed)",
+        "result": {
+          "planId": "plan_0007",
+          "decision": "ring",
+          "reason": "ok",
+          "ringSeconds": 30,
+          "phones": [],
+          "wake": [],
+          "desktopToast": true,
+          "desktopCompanions": []
+        },
+        "parsed": {
+          "decision": "ring",
+          "ringSeconds": 30,
+          "targets": [],
+          "targetRule": "nobody"
+        },
+        "plugin": "Answers unavailable, reason no_endpoint, opens nothing and does not send oaiy.ring.opened, so no toast follows: a toast is a notification, not a target. A plan for the owner at the PC names the Windows Companion in desktopCompanions (see the next case)."
+      },
+      {
+        "name": "the owner is at the PC: the toast, and the Windows Companion named by its thumbprint (nothing launches it)",
+        "result": {
+          "planId": "plan_0007b",
+          "decision": "ring",
+          "reason": "ok",
+          "ringSeconds": 30,
+          "phones": [],
+          "wake": [],
+          "desktopToast": true,
+          "desktopCompanions": [
+            "thumb_win_companion_0123456789"
+          ]
+        },
+        "parsed": {
+          "decision": "ring",
+          "ringSeconds": 30,
+          "targets": [
+            "thumb_win_companion_0123456789"
+          ],
+          "targetRule": "only"
+        },
+        "plugin": "Offers the request to that Windows Companion and to no other device, whether or not the Companion is running yet: it is offered the request when it connects inside the ring window."
+      },
+      {
+        "name": "a ring with no device and no toast rings nobody",
+        "result": {
+          "planId": "plan_0008",
+          "decision": "ring",
+          "reason": "ok",
+          "ringSeconds": 30,
+          "phones": [],
+          "wake": [],
+          "desktopToast": false,
+          "desktopCompanions": []
+        },
+        "parsed": {
+          "decision": "ring",
+          "ringSeconds": 30,
+          "targets": [],
+          "targetRule": "nobody"
+        },
+        "plugin": "Answers unavailable, reason no_endpoint, and opens nothing."
+      }
+    ],
+    "unusableResults": [
+      {
+        "name": "not an object",
+        "result": "ring please"
+      },
+      {
+        "name": "a plan that rings and has no planId",
+        "result": {
+          "decision": "ring",
+          "phones": [
+            "thumb_phone_a"
+          ]
+        }
+      },
+      {
+        "name": "a plan that rings and has an empty planId",
+        "result": {
+          "planId": "",
+          "decision": "ring",
+          "phones": [
+            "thumb_phone_a"
+          ]
+        }
+      },
+      {
+        "name": "a planId that is not an identifier",
+        "result": {
+          "planId": "has space",
+          "decision": "ring"
+        }
+      },
+      {
+        "name": "an unknown decision",
+        "result": {
+          "planId": "plan_x",
+          "decision": "maybe"
+        }
+      },
+      {
+        "name": "a device list that is not a list",
+        "result": {
+          "planId": "plan_x",
+          "decision": "ring",
+          "phones": "thumb_phone_a"
+        }
+      },
+      {
+        "name": "a device that is not a string",
+        "result": {
+          "planId": "plan_x",
+          "decision": "ring",
+          "phones": [
+            7
+          ]
+        }
+      },
+      {
+        "name": "a device that is not an identifier",
+        "result": {
+          "planId": "plan_x",
+          "decision": "ring",
+          "phones": [
+            "bad thumb"
+          ]
+        }
+      },
+      {
+        "name": "more than 16 devices",
+        "result": {
+          "planId": "plan_x",
+          "decision": "ring",
+          "phones": [
+            "t0",
+            "t1",
+            "t2",
+            "t3",
+            "t4",
+            "t5",
+            "t6",
+            "t7",
+            "t8",
+            "t9",
+            "t10",
+            "t11",
+            "t12",
+            "t13",
+            "t14",
+            "t15",
+            "t16"
+          ]
+        }
+      }
+    ],
+    "targetRules": {
+      "only": "The plan names devices (phones and desktopCompanions, each once): the request is offered to those devices and no others, and no other device can accept it. On the relay carrier no other device can decline it either; on the socket carrier the plugin cannot attribute a decline to a key, so a device outside the plan can end the request with one (transfer-v1.md).",
+      "nobody": "The plan names no device, toast or not: nothing can be rung, and the answer is no_endpoint. A toast is not a target."
+    }
+  },
+  "opened": {
+    "method": "oaiy.ring.opened",
+    "input": {
+      "planId": "plan_0001",
+      "requestId": "assist_0123456789abcdef0123456789abcdef",
+      "callId": "call_0123",
+      "callEpoch": 7,
+      "ownerEpoch": 4,
+      "expiresAt": 1789000040
+    },
+    "paramsRules": "expiresAt is Unix seconds: when the ring window ends. A host that posts ring hints derives the reserved offer id of every phone in the plan from requestId and the phone's endpoint-key thumbprint (transfer-v1.reserved-offer-id.fixture.json), posts the ring items, and posts cancels when the request resolves. No host does yet: the id is defined and vector-tested, the plugin publishes the offer under it, and nothing else names it.",
+    "result": {
+      "ok": true
+    }
+  }
+}

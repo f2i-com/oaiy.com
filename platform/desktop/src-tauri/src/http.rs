@@ -1046,6 +1046,11 @@ fn is_personal_path(path: &str) -> bool {
         || path.starts_with("/api/calendar/")
         || path == "/api/contacts"
         || path.starts_with("/api/contacts/")
+        // Whom the receptionist may put through and to which devices, and the messages callers leave.
+        || path == "/api/ring"
+        || path.starts_with("/api/ring/")
+        || path == "/api/messages"
+        || path.starts_with("/api/messages/")
         || path.starts_with("/api/agent/")
 }
 
@@ -1504,18 +1509,7 @@ pub async fn serve(
     // and exec endpoints are additionally gated by `origin_guard` below, so a
     // random web page the user has open can't issue drive-by POST/DELETE
     // requests against the loopback API.
-    let cors = CorsLayer::new()
-        .allow_origin(Any)
-        .allow_methods([
-            Method::GET,
-            Method::POST,
-            Method::PUT,
-            Method::DELETE,
-            Method::OPTIONS,
-        ])
-        .allow_headers(Any)
-        // The dashboard (another origin) reads /api/modules' ETag to ask again with If-None-Match.
-        .expose_headers([axum::http::header::ETAG]);
+    let cors = cors_layer();
 
     /// Answer Chrome's Private Network Access preflight.
     ///
@@ -1557,6 +1551,10 @@ pub async fn serve(
         crate::voice::voices::init(&dir);
         // The contacts (and the names callers are greeted by): the older names file is upgraded now.
         crate::voice::contacts::init(&dir);
+        // Transferring calls to the owner and taking messages: the owner's settings, all off until turned on.
+        crate::ring::init(&dir);
+        // What callers leave for the owner.
+        crate::messages::init(&dir);
     }
     // The Agent's control API: its switch and its log live in the data folder too.
     let control = crate::control::Control::new(
@@ -1609,6 +1607,18 @@ pub async fn serve(
         })
     };
     let voice_routes = crate::voice::app_router(voice.clone());
+    // Putting a caller through to the owner: which Companions could take the call, and whether the owner is at the computer
+    // (only where there is a window to ring).
+    if let Some(ring) = crate::ring::shared() {
+        ring.set_devices(std::sync::Arc::new(crate::ring::devices::CompanionDevices::new(companion.clone(), "aokie")));
+        bridge.host.set_ring(ring.clone());
+        // A caller who asks for the owner by name is asking for the owner: the name is the business's, when it is named for a person.
+        ring.set_names(std::sync::Arc::new(|| crate::calendar::shared().map(|c| crate::ring::phrases::owner_names(&c.settings().business)).unwrap_or_default()));
+        if gui_mode {
+            ring.set_presence(std::sync::Arc::new(crate::ring::presence::IdlePresence::os(ring.settings.clone())));
+        }
+    }
+    let ring_routes = crate::ring::routes::router(crate::ring::shared().unwrap_or_else(|| crate::ring::Ring::in_memory(Default::default())));
     let bridge_routes = crate::bridge::bridge_router(bridge);
 
     // The AI gateway is its own sub-router with its own state (provider store +
@@ -1664,6 +1674,8 @@ pub async fn serve(
         .merge(bridge_routes)
         .merge(voice_routes)
         .merge(crate::voice::contacts::routes::router(crate::voice::contacts::shared()))
+        .merge(ring_routes)
+        .merge(crate::messages::routes::router(crate::messages::shared()))
         .merge(crate::calendar::routes::router())
         .merge(crate::modules::routes::router())
         .merge(crate::agent_tasks::router())
@@ -1725,6 +1737,26 @@ fn validate_listener_auth(bind_all: bool, token: Option<&str>) -> Result<(), Box
         return Err("network binding requires a non-empty OAIY_SERVER_TOKEN; use loopback or configure authentication".into());
     }
     Ok(())
+}
+
+/// The CORS layer `serve` puts on everything: what a page on another origin (the dashboard at `localhost:17973` or `tauri://`, the Agent, a hosted
+/// web app) may ask of this API. Every method those pages send must be in it, or the browser's preflight fails and the request is never made
+/// (a Messages page that cannot mark a message seen): the test below walks every method the pages' sources send.
+pub(crate) fn cors_layer() -> CorsLayer {
+    CorsLayer::new()
+        .allow_origin(Any)
+        .allow_methods([
+            Method::GET,
+            Method::POST,
+            Method::PUT,
+            // (The Messages page marks a message seen or handled, and the calendar changes an appointment, with PATCH.)
+            Method::PATCH,
+            Method::DELETE,
+            Method::OPTIONS,
+        ])
+        .allow_headers(Any)
+        // The dashboard (another origin) reads /api/modules' ETag to ask again with If-None-Match.
+        .expose_headers([axum::http::header::ETAG])
 }
 
 /// `router` behind the same gate `serve` puts in front of everything, for the
@@ -1910,6 +1942,151 @@ mod tests {
         }
         assert!(!is_restricted_read_path("/api/contactsx"));
         assert!(!is_privileged_path(&Method::POST, "/api/contacts-elsewhere"));
+    }
+
+    #[test]
+    fn the_rings_settings_and_the_messages_are_restricted_reads_and_their_changes_privileged() {
+        // Whom the receptionist may put through, the owner's VIP numbers, and what callers said to leave.
+        for path in ["/api/ring/settings", "/api/ring/active", "/api/messages", "/api/messages/msg_1"] {
+            assert!(is_restricted_read_path(path), "{path} must be a restricted read");
+        }
+        for (m, path) in [
+            (Method::PUT, "/api/ring/settings"),
+            (Method::POST, "/api/ring/active/assist_1/respond"),
+            (Method::POST, "/api/ring/notices/notice_1/dismiss"),
+            (Method::PATCH, "/api/messages/msg_1"),
+            (Method::DELETE, "/api/messages/msg_1"),
+            (Method::POST, "/api/messages"),
+            (Method::POST, "/api/voice/calls/call_1/message"),
+        ] {
+            assert!(is_privileged_path(&m, path), "{m} {path} must be privileged");
+        }
+        assert!(!is_restricted_read_path("/api/ringing") && !is_restricted_read_path("/api/messagesx"));
+        assert!(!is_privileged_path(&Method::POST, "/api/ringing"));
+    }
+
+    /// The access model's table (`auth/routes.rs`) has a row for each route of the receptionist's transfers and messages, in the scope of its kind
+    /// (reading callers' words and numbers is `calls.read`, as the call events are; the receptionist's own `take_message` is `calls.write`, as `say` and
+    /// `finish` are; acting on a message or a ring is `calls.manage` and the owner's transfer settings are `calls.settings`, which the Agent page's
+    /// preset holds neither of), with `since: 1` (the routes exist, and `legacy` mode keeps the guard they were built with), and the
+    /// scoped CORS answers a paired page's preflight for each method, PATCH and DELETE included, and no page that has not paired.
+    #[test]
+    fn the_receptionists_routes_take_the_scope_of_their_kind_and_the_scoped_cors_lets_a_paired_page_use_them() {
+        use crate::auth::routes::{pattern_existed_before, route_class, Class};
+        let paired: std::collections::BTreeSet<String> = ["https://app.oaiy.com".to_string()].into();
+        let routes = [
+            (Method::GET, "/api/messages", "calls.read"),
+            (Method::GET, "/api/messages/:id", "calls.read"),
+            (Method::PATCH, "/api/messages/:id", "calls.manage"),
+            (Method::DELETE, "/api/messages/:id", "calls.manage"),
+            (Method::GET, "/api/ring/settings", "calls.settings"),
+            (Method::PUT, "/api/ring/settings", "calls.settings"),
+            (Method::GET, "/api/ring/preview", "calls.read"),
+            (Method::GET, "/api/ring/active", "calls.read"),
+            (Method::POST, "/api/ring/active/:id/respond", "calls.manage"),
+            (Method::POST, "/api/ring/notices/:id/dismiss", "calls.manage"),
+            (Method::POST, "/api/voice/calls/:id/message", "calls.write"),
+        ];
+        for (method, pattern, scope) in &routes {
+            assert_eq!(route_class(method, pattern), Class::Scope(scope), "{method} {pattern}");
+            assert!(pattern_existed_before(pattern), "{pattern}: the guard these routes were built with is the one `legacy` mode keeps");
+            let cors = crate::auth::cors::decide(method, Some(pattern), Some("https://app.oaiy.com"), &paired, false);
+            assert_eq!(cors.get("access-control-allow-origin"), Some("https://app.oaiy.com"), "{method} {pattern}: a paired page's preflight is answered");
+            assert!(cors.get("access-control-allow-methods").is_some_and(|m| m.split(", ").any(|m| m == method.as_str())), "{method} {pattern}: {:?}", cors.get("access-control-allow-methods"));
+            assert!(crate::auth::cors::decide(method, Some(pattern), Some("https://evil.example"), &paired, false).is_empty(), "{method} {pattern}: a page that has not paired gets nothing");
+        }
+        // Every route this module's routers register is one of those (a route added to them needs its row and its line here).
+        let scanned = crate::auth::route_coverage::scan_main_router().found;
+        for f in scanned.iter().filter(|f| f.file.starts_with("ring/routes.rs") || f.file.starts_with("messages/routes.rs")) {
+            assert!(routes.iter().any(|(m, p, _)| m.as_str() == f.verb.as_str() && *p == f.pattern), "{} {} ({}:{}) has no line in this test: is its row in `auth/routes.rs` the scope of its kind?", f.verb.as_str(), f.pattern, f.file, f.line);
+        }
+    }
+
+    /// Every HTTP method the dashboard's and the Agent's sources send to this API (`method: 'PATCH'`; tests excluded). Read at test time, so a
+    /// verb added to a page later is held to the layer with no edit here.
+    fn methods_the_pages_send() -> std::collections::BTreeMap<String, Vec<String>> {
+        use std::path::{Path, PathBuf};
+        fn walk(dir: &Path, out: &mut Vec<PathBuf>) {
+            let Ok(read) = std::fs::read_dir(dir) else { return };
+            for entry in read.flatten() {
+                let path = entry.path();
+                let name = entry.file_name().to_string_lossy().to_string();
+                if path.is_dir() {
+                    if !matches!(name.as_str(), "node_modules" | "dist" | "target" | "tests" | "__tests__" | "e2e") {
+                        walk(&path, out);
+                    }
+                } else if (name.ends_with(".ts") || name.ends_with(".tsx")) && !name.contains(".test.") && !name.ends_with(".d.ts") {
+                    out.push(path);
+                }
+            }
+        }
+        let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..").join("..");
+        let mut files = Vec::new();
+        // (The dashboard and the Agent. Not the flow UI in `platform/ui`, whose `method` is a variable of a service it probes or a step it runs,
+        // and whose `'HEAD'` is a comparison or a request to some other server.)
+        for pages in ["platform/desktop/src", "app/src"] {
+            walk(&root.join(pages), &mut files);
+        }
+        assert!(files.len() > 20, "the pages' sources were not found under {root:?}: {} files", files.len());
+        let verb = regex::Regex::new(r#"method:\s*['"`](GET|POST|PUT|PATCH|DELETE|HEAD)['"`]"#).unwrap();
+        let mut found: std::collections::BTreeMap<String, Vec<String>> = Default::default();
+        for file in files {
+            let text = std::fs::read_to_string(&file).unwrap_or_default();
+            for cap in verb.captures_iter(&text) {
+                found.entry(cap[1].to_string()).or_default().push(file.strip_prefix(&root).unwrap_or(&file).display().to_string());
+            }
+        }
+        found
+    }
+
+    /// A real preflight, as a browser sends it before a request from another origin, against the layer `serve` uses: what it answers is what
+    /// the browser reads to decide whether the request may be made at all.
+    #[tokio::test]
+    async fn the_cors_layer_lets_every_method_the_pages_send_through_a_real_preflight() {
+        use axum::body::Body;
+        use axum::http::Request;
+        use axum::{routing::any, Router};
+        use tower::ServiceExt;
+        let app = Router::new().fallback(any(|| async { "ok" })).layer(super::cors_layer());
+        let found = methods_the_pages_send();
+        assert!(found.contains_key("POST") && found.contains_key("DELETE"), "the walk found the pages' verbs: {:?}", found.keys().collect::<Vec<_>>());
+        for origin in ["http://localhost:17973", "tauri://localhost", "http://tauri.localhost", "https://app.oaiy.com"] {
+            for (verb, files) in &found {
+                let request = Request::builder()
+                    .method("OPTIONS")
+                    .uri("/api/anything")
+                    .header("Origin", origin)
+                    .header("Access-Control-Request-Method", verb.as_str())
+                    .header("Access-Control-Request-Headers", "content-type,authorization")
+                    .body(Body::empty())
+                    .unwrap();
+                let response = app.clone().oneshot(request).await.unwrap();
+                assert!(response.status().is_success(), "preflight of {verb} from {origin}: {}", response.status());
+                let allowed = response.headers().get("access-control-allow-methods").and_then(|v| v.to_str().ok()).unwrap_or("");
+                let allowed: Vec<&str> = allowed.split(',').map(str::trim).collect();
+                assert!(
+                    allowed.contains(&verb.as_str()) || allowed.contains(&"*"),
+                    "{verb} is sent by {files:?} but the layer allows only {allowed:?}: the browser refuses the request after the preflight"
+                );
+                assert!(response.headers().get("access-control-allow-origin").is_some(), "{origin}");
+            }
+        }
+    }
+
+    #[test]
+    fn a_page_on_loopback_is_trusted_with_a_privileged_route_by_a_debug_build_only_and_a_page_that_only_ends_like_ours_never() {
+        // What ships (a release build) trusts OAIY's own window and oaiy.com; a debug build (the dev UI is served from a loopback port,
+        // and the owner's `tauri dev` is one) trusts any loopback page too. The routes for the ring and the messages take that
+        // gate like every route of their class, so this is what stands between them and a page the owner has open.
+        for origin in ["http://localhost:3000", "http://127.0.0.1:5173"] {
+            assert_eq!(is_allowed_origin_privileged(origin), cfg!(debug_assertions), "{origin}");
+        }
+        for origin in ["tauri://localhost", "https://oaiy.com", "https://app.oaiy.com"] {
+            assert!(is_allowed_origin_privileged(origin), "{origin}");
+        }
+        for origin in ["https://evil.example", "null", "https://oaiy.com.evil.example", "https://evil.example/oaiy.com", "https://notoaiy.com", "http://oaiy.com", "tauri://localhost.evil.example"] {
+            assert!(!is_allowed_origin_privileged(origin), "{origin}");
+        }
     }
 
     #[test]

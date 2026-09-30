@@ -678,6 +678,11 @@ async fn a_plugins_setup_step_is_shown_with_the_navigate_payload() {
     // Hours & Services is a page of its own (under the AI Receptionist in the dashboard).
     let r = call(&app, None, "ui_open", json!({ "view": "hours" })).await;
     assert!(!is_error(&r), "{r}");
+    // The receptionist's Messages and Transfers pages too (the person is pointed to them: a message was kept, transfers are off).
+    for view in ["messages", "transfers"] {
+        let r = call(&app, None, "ui_open", json!({ "view": view })).await;
+        assert!(!is_error(&r), "{view}: {r}");
+    }
     let r = call(&app, None, "ui_open", json!({ "view": "../../etc" })).await;
     assert!(is_error(&r) && text(&r).contains("not a page"), "{r}");
     // Contacts, and one person's: their number written any way, sent as its key.
@@ -697,6 +702,8 @@ async fn a_plugins_setup_step_is_shown_with_the_navigate_payload() {
             json!({ "view": "setup", "pluginId": "demo", "stepId": "permissions" }),
             json!({ "view": "plugin:demo:home" }),
             json!({ "view": "hours" }),
+            json!({ "view": "messages" }),
+            json!({ "view": "transfers" }),
             json!({ "view": "contacts" }),
             json!({ "view": "contacts", "contact": "491570006" }),
         ]
@@ -704,6 +711,30 @@ async fn a_plugins_setup_step_is_shown_with_the_navigate_payload() {
     // The person accepts what a plugin may do: the Agent shows it rather than recording it.
     let r = call(&app, None, "plugin_setup_step_done", json!({ "pluginId": "demo", "stepId": "permissions" })).await;
     assert!(is_error(&r) && text(&r).contains("plugin_setup_open"), "{r}");
+}
+
+/// The pages the Agent may ask to be shown are the dashboard's own: every view the dashboard can be navigated to (`NAV_VIEWS` in navigate.ts) is one the
+/// tool names, except the one that is a setting of the Agent's own (`agent-settings`), and the tool's own `setup` is the dashboard's setup page. The tool's
+/// description lists them, so a page the dashboard has and the description does not name is one the Agent cannot be asked to show.
+#[test]
+fn the_pages_the_agent_may_show_are_the_dashboards_own_and_the_description_names_each() {
+    let navigate = include_str!("../../../src/navigate.ts");
+    let list = navigate.split("export const NAV_VIEWS = [").nth(1).and_then(|rest| rest.split("] as const;").next()).expect("the dashboard's views are listed in navigate.ts");
+    let dashboard: Vec<String> = regex::Regex::new(r"'([a-z-]+)',").unwrap().captures_iter(list).map(|c| c[1].to_string()).collect();
+    assert!(dashboard.len() >= 17, "{dashboard:?}");
+    for view in &dashboard {
+        if view == "agent-settings" {
+            continue;
+        }
+        assert!(super::tools::VIEWS.contains(&view.as_str()), "the dashboard has a {view} page that ui_open cannot show");
+    }
+    for view in super::tools::VIEWS {
+        assert!(view == "setup" || dashboard.iter().any(|d| d == view), "ui_open names a {view} page the dashboard does not have");
+    }
+    let description = super::tools::defs().iter().find(|t| t.name == "ui_open").expect("ui_open").description;
+    for view in super::tools::VIEWS {
+        assert!(description.contains(view), "the description of ui_open does not name {view}");
+    }
 }
 
 // ---------------------------------------------------------------------------

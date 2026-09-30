@@ -1,0 +1,77 @@
+{
+  "contract": "transfer_v1",
+  "kind": "tool_result",
+  "direction": "aokie_to_oaiy",
+  "about": "The tool returns at once. ok true means the owner is being rung; how it ends arrives later as a transfer_outcome frame. ok false is a refusal: status is refused when the model should not offer a person at all, and unavailable when a person cannot be reached and a message should be offered instead. reason comes from a closed set and is never text from the call or from the host. The instruction member is fixed, model-facing text and is informative: OAIY passes the whole output to the model and does not depend on its wording.",
+  "informativeMembers": ["instruction"],
+  "frame": {
+    "type": "formlogic.realtime.tool_result",
+    "callId": "call_0123",
+    "generation": 7,
+    "toolCallId": "tool_0001",
+    "name": "transfer_to_owner",
+    "ok": true,
+    "output": {
+      "status": "ringing",
+      "requestId": "assist_0123456789abcdef0123456789abcdef",
+      "ringSeconds": 40,
+      "instruction": "The owner is being rung. Say one short line, then keep the caller company: ask what it is about and take a message if they want to leave one. Do not say the call is transferred, connected or on hold until you are told."
+    },
+    "continueResponse": true
+  },
+  "ringing": {
+    "requestId": "assist_0123456789abcdef0123456789abcdef",
+    "ringSeconds": 40
+  },
+  "planReasons": [
+    "disabled",
+    "initiative_off",
+    "not_urgent",
+    "caller_did_not_ask",
+    "limit_call",
+    "limit_gap",
+    "limit_caller",
+    "limit_global",
+    "quiet_hours",
+    "all_do_not_disturb",
+    "no_endpoint"
+  ],
+  "pluginReasons": [
+    "consent",
+    "pending_request",
+    "busy",
+    "bad_arguments",
+    "plan_unavailable",
+    "call_changed"
+  ],
+  "notInTheDesignDraft": {
+    "plan_unavailable": "The host did not answer the ring plan in time, or answered something unusable. Nobody is rung: a host that cannot say who may be rung is not a reason to ring everyone.",
+    "call_changed": "The call, or the AI's hold on it, changed while the request was being made. Nothing was done."
+  },
+  "refusals": [
+    { "name": "consent missing or paused", "status": "refused", "reason": "consent" },
+    { "name": "a request is already open", "status": "refused", "reason": "pending_request" },
+    { "name": "bad arguments", "status": "refused", "reason": "bad_arguments" },
+    { "name": "the caller did not ask", "status": "refused", "reason": "caller_did_not_ask" },
+    { "name": "too many for this call", "status": "refused", "reason": "limit_call" },
+    { "name": "too soon after the last", "status": "refused", "reason": "limit_gap" },
+    { "name": "too many for this caller", "status": "refused", "reason": "limit_caller" },
+    { "name": "too many this hour", "status": "refused", "reason": "limit_global" },
+    { "name": "quiet hours", "status": "unavailable", "reason": "quiet_hours" },
+    { "name": "every device is set to do not disturb", "status": "unavailable", "reason": "all_do_not_disturb" },
+    { "name": "nobody to ring", "status": "unavailable", "reason": "no_endpoint" },
+    { "name": "the host is off, slow or unusable", "status": "unavailable", "reason": "plan_unavailable" },
+    { "name": "the call changed", "status": "unavailable", "reason": "call_changed" },
+    { "name": "the feature is off", "status": "unavailable", "reason": "disabled" },
+    { "name": "the AI may not start a transfer itself", "status": "unavailable", "reason": "initiative_off" },
+    { "name": "urgent was not confirmed", "status": "unavailable", "reason": "not_urgent" }
+  ],
+  "toolRefusals": {
+    "about": "Not transfer results: a tool call the plugin cannot run right now is completed ok false with only an error code, and the call carries on.",
+    "cases": [
+      { "name": "a second slot tool while one is in flight", "output": { "error": "busy" } },
+      { "name": "the 25th tool call of a call", "output": { "error": "tool_limit" } },
+      { "name": "a tool the plugin or session does not have", "output": { "error": "unsupported" } }
+    ]
+  }
+}

@@ -8,7 +8,7 @@ for what OAIY is and how to build it.
 | Document | What it covers |
 |---|---|
 | [SETUP.md](SETUP.md) | The essentials-first setup wizard, "Continue with the Agent", setting up the rest yourself, and Settings → Agent. |
-| [RECEPTIONIST.md](RECEPTIONIST.md) | The AI Receptionist: calls, texts, the Calendar, Hours & Services, Contacts, the Front desk and outreach. |
+| [RECEPTIONIST.md](RECEPTIONIST.md) | The AI Receptionist: calls, texts, the Calendar, Hours & Services, Contacts, Messages, Transfers (putting a caller through to the owner), the Front desk and outreach. |
 | [The Agent](../app/README.md) | The Agent app (it began as bot.computer): projects, the editor and preview, the terminal on the Zipp VM, the chat and its plan, web pages, SoftN apps, media tools. |
 | [Flows, the CLI and FormLogic](../platform/README.md) | The flow editor, AI providers, connecting FormLogic and Aokie, the CLI, sharing flows and the optional PHP API. |
 | [REMOTE_FORMLOGIC.md](../platform/docs/REMOTE_FORMLOGIC.md) | Using OAIY from another computer or phone through a linked FormLogic account, and what is encrypted. |

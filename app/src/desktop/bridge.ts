@@ -223,7 +223,12 @@ export class Desktop {
   /**
    * The desktop's call events (server-sent: `call.started`, `call.caller`,
    * `call.said`, `call.speech_started`, `call.interrupted`, `call.error`,
-   * `call.ended`) until `signal` aborts or the stream ends.
+   * `call.ended`; and, when the owner lets the receptionist try to reach them,
+   * `call.transfer` (how a request came out), `call.handoff` (the owner took the
+   * call), `call.line_replaced` (a line of ours that promised a transfer was not
+   * said, and the desktop's own was, in its place) and `voice.features` (what
+   * the receptionist may do)) until `signal`
+   * aborts or the stream ends.
    */
   async voiceEvents(onEvent: (event: Record<string, unknown>) => void, signal: AbortSignal): Promise<void> {
     return this.follow('/api/voice/events', "OAIY Desktop's call events", onEvent, signal);
@@ -297,10 +302,24 @@ export class Desktop {
     await this.voice(callId, 'say', hold ? { text, hold } : { text }, signal);
   }
 
-  /** One of the call's tools (`request_appointment`, `lookup_business_data`): what the phone answered. */
+  /** One of the call's tools (`request_appointment`, `lookup_business_data`, `transfer_to_owner`): what the phone answered. */
   async callTool(callId: string, name: string, args: Record<string, unknown>, signal?: AbortSignal): Promise<{ ok: boolean; output: unknown }> {
     const result = await this.voice(callId, 'tool', { name, arguments: args }, signal);
     return { ok: result.ok === true, output: result.output };
+  }
+
+  /**
+   * A message for the owner, taken on this call (the receptionist's `take_message`): kept by the desktop with the number the
+   * call came from (never one the model gives), and the owner told when it can. Refused (a DesktopError with the desktop's
+   * words) when message taking is off, the call is not one the desktop knows, or a limit is reached.
+   */
+  async takeMessage(
+    callId: string,
+    message: { message: string; callerName?: string; callbackNumber?: string; urgency?: 'normal' | 'urgent'; wantsCallback?: boolean },
+    signal?: AbortSignal,
+  ): Promise<{ recorded: boolean; id: string; notified: boolean }> {
+    const result = await this.voice(callId, 'message', message, signal);
+    return { recorded: result.recorded === true, id: typeof result.id === 'string' ? result.id : '', notified: result.notified === true };
   }
 
   /** Say goodbye, then hang up. */

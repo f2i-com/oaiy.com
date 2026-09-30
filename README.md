@@ -74,8 +74,8 @@ A Tauri 2 app for Windows and Linux (the Windows installers are the better teste
 - **Work:**
   - **Agent:** the Agent app (below).
   - **Flows:** the flow editor, and the history of every flow run.
-  - **AI Receptionist:** Phone, Calendar, Contacts, and Hours & Services, while a plugin
-    provides the phone and the calendar.
+  - **AI Receptionist:** Phone, Calendar, Contacts, Messages, Hours & Services and
+    Transfers, while a plugin provides the phone and the calendar.
 - **Setup:**
   - **Engines:** the engines' own control pages, and model files.
   - **Services:** local services to install, start and stop (OAIY Voice, a Playwright
@@ -125,9 +125,10 @@ The **Aokie Phone Bridge** plugin connects the business's mobile phone to the PC
 Bluetooth. OAIY hears and speaks with **OAIY Voice** (Parakeet speech-to-text and
 Qwen3-TTS, in Rust on the GPU), and the Agent decides what to say. It listens the whole
 call, takes turns like a person, keeps talking while a lookup runs, and records a
-booking as a request for you to confirm. The Calendar, Hours & Services and Contacts
-live on this computer and work offline; with a FormLogic account linked, the calendar
-syncs with it. See [docs/RECEPTIONIST.md](docs/RECEPTIONIST.md) and
+booking as a request for you to confirm. The Calendar, Hours & Services, Contacts and
+Messages live on this computer and work offline; with a FormLogic account linked, the calendar
+syncs with it. When you turn it on under Transfers, a caller who asks for you makes your Companion ring, and a
+caller who cannot be put through can leave a message. See [docs/RECEPTIONIST.md](docs/RECEPTIONIST.md) and
 [docs/CALLS.md](docs/CALLS.md).
 
 ### Flows

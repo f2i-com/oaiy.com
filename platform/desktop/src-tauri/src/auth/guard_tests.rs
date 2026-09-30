@@ -464,6 +464,96 @@ async fn t1_exactly_the_routes_of_a_preset_succeed_for_a_credential_with_that_pr
     assert!(total > 3000, "{total} requests");
 }
 
+/// The owner's transfer settings (`/api/ring/settings`) are the owner's alone: a credential of the Agent page's preset, of any other preset and one
+/// that holds `calls.write` (what the design gave the route) is refused with 403 and the scope it lacks, on the read too (the VIP numbers are in it), and
+/// the dashboard's own credential gets through. What the reviewer did with a paired app of the `agent` preset on a real server in `scoped` mode: turn
+/// transfers on, name a VIP number and switch off the quiet hours.
+#[tokio::test]
+async fn a_credential_that_is_not_the_owners_cannot_read_or_rewrite_the_transfer_settings() {
+    let e = env(AccessMode::Scoped);
+    let rewrite = r#"{"enabled":true,"initiative":"on_request_or_urgent","urgentPhrases":["code red"],"vipNumbers":["+61491570006"],"quietHours":{"enabled":false},"phoneRing":"always"}"#;
+    let mut refused = Vec::new();
+    for preset in ALL_PRESETS {
+        if matches!(preset, Preset::Owner | Preset::Ceremony) {
+            continue;
+        }
+        refused.push((preset.name().to_string(), native_pat(&e, preset.scopes(), DAY), None));
+    }
+    refused.push((
+        "calls.read and calls.write".to_string(),
+        native_pat(&e, ScopeSet::of(&["calls.read", "calls.write"]), DAY),
+        None,
+    ));
+    refused.push(("the Agent page's own desk credential".to_string(), desk(&e, App::Agent, Preset::Agent, &[DESK_ORIGIN]), Some(DESK_ORIGIN)));
+    for (who, token, origin) in &refused {
+        for (m, body) in [(Method::PUT, Some(rewrite)), (Method::GET, None)] {
+            let mut s = send(m.clone(), "/api/ring/settings").bearer(token);
+            if let Some(origin) = origin {
+                s = s.h("origin", origin);
+            }
+            if let Some(body) = body {
+                s = s.json(body);
+            }
+            let r = go(&e, s).await;
+            assert_eq!(
+                (r.status, r.code().as_deref(), r.json()["required"].as_str().map(str::to_owned)),
+                (403, Some("insufficient_scope"), Some("calls.settings".to_string())),
+                "{who}: {m} /api/ring/settings: {}",
+                r.text
+            );
+        }
+    }
+    // The owner's own credential (the dashboard's desk) is let through, on both.
+    let owner = desk(&e, App::Dash, Preset::Owner, &[DESK_ORIGIN]);
+    for (m, body) in [(Method::PUT, Some(rewrite)), (Method::GET, None)] {
+        let mut s = send(m.clone(), "/api/ring/settings").bearer(&owner).h("origin", DESK_ORIGIN);
+        if let Some(body) = body {
+            s = s.json(body);
+        }
+        assert_eq!(go(&e, s).await.status, 200, "the owner: {m}");
+    }
+}
+
+/// What callers left and the rings going are the owner's to act on: a credential of the Agent page's preset can read the messages and keep the one
+/// the receptionist takes, and is refused (403, with `calls.manage`) when it marks a message, deletes one (which the review did: the message was
+/// gone), declines a ring or puts a notice away; so is the interim companion preset, which reads. The owner's dashboard credential is let through.
+#[tokio::test]
+async fn an_agent_can_read_the_messages_and_keep_one_and_cannot_mark_or_delete_them_or_answer_a_ring() {
+    let e = env(AccessMode::Scoped);
+    let agent = native_pat(&e, Preset::Agent.scopes(), DAY);
+    let companion = native_pat(&e, Preset::Companion.scopes(), DAY);
+    let owner = desk(&e, App::Dash, Preset::Owner, &[DESK_ORIGIN]);
+    let actions = [
+        (Method::PATCH, "/api/messages/msg_1", r#"{"state":"handled"}"#),
+        (Method::DELETE, "/api/messages/msg_1", ""),
+        (Method::POST, "/api/ring/active/assist_1/respond", r#"{"action":"decline"}"#),
+        (Method::POST, "/api/ring/notices/notice_1/dismiss", ""),
+    ];
+    for (who, token) in [("agent", &agent), ("companion", &companion)] {
+        for (m, path, body) in &actions {
+            let r = go(&e, send(m.clone(), path).bearer(token).json(body)).await;
+            assert_eq!(
+                (r.status, r.code().as_deref(), r.json()["required"].as_str().map(str::to_owned)),
+                (403, Some("insufficient_scope"), Some("calls.manage".to_string())),
+                "{who}: {m} {path}: {}",
+                r.text
+            );
+        }
+    }
+    // What it may still do: read, and keep the message the receptionist takes (the Agent page answers calls).
+    for path in ["/api/messages", "/api/messages/msg_1", "/api/ring/preview", "/api/ring/active"] {
+        assert_eq!(go(&e, send(Method::GET, path).bearer(&agent)).await.status, 200, "agent: GET {path}");
+        assert_eq!(go(&e, send(Method::GET, path).bearer(&companion)).await.status, 200, "companion: GET {path}");
+    }
+    assert_eq!(go(&e, send(Method::POST, "/api/voice/calls/call_1/message").bearer(&agent).json("{}")).await.status, 200);
+    assert_eq!(go(&e, send(Method::POST, "/api/voice/calls/call_1/message").bearer(&companion).json("{}")).await.status, 403, "the companion holds no calls.write");
+    // The owner's own credential gets through on every one.
+    for (m, path, body) in &actions {
+        let r = go(&e, send(m.clone(), path).bearer(&owner).h("origin", DESK_ORIGIN).json(body)).await;
+        assert_eq!(r.status, 200, "owner: {m} {path}");
+    }
+}
+
 #[tokio::test]
 async fn t1_the_environment_token_is_the_cli_preset_on_every_install_and_never_more() {
     let e = env(AccessMode::Scoped);
@@ -1880,7 +1970,7 @@ async fn whoami_says_who_and_what() {
         (v["kind"].as_str(), v["elevated"].as_bool()),
         (Some("desk"), Some(true))
     );
-    assert_eq!(v["scopes"].as_array().unwrap().len(), 54);
+    assert_eq!(v["scopes"].as_array().unwrap().len(), 56);
 }
 
 #[tokio::test]

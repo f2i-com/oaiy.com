@@ -161,6 +161,10 @@ sha2 = "0.10"
 subtle = "2"
 hmac = "0.12"
 
+# The receptionist's check that a caller asked for a person (`ring/phrases.rs`): a few
+# patterns over what they said. Already in the tree (through reqwest and tauri).
+regex = "1"
+
 # Windows-only: the job object that kills child processes when this process
 # dies, however it dies. Already in the tree transitively (tauri, tokio); named
 # here because a crate cannot `use` an undeclared transitive dependency.
@@ -168,7 +172,12 @@ hmac = "0.12"
 windows-sys = { version = "0.61", features = [
     "Win32_Foundation",
     "Win32_System_JobObjects",
+    "Win32_System_SystemInformation",
+    # Whether the workstation is locked (ring/presence.rs).
+    "Win32_System_StationsAndDesktops",
     "Win32_System_Threading",
+    # How long ago the owner last used the computer (ring/presence.rs).
+    "Win32_UI_Input_KeyboardAndMouse",
 ] }
 
 [dev-dependencies]

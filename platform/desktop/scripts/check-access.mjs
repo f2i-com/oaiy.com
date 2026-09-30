@@ -11,8 +11,8 @@
 //      any other fixed port) and sends an anonymous request to every row of the table.
 //   3. Reads the `routes.json` the tests wrote and checks it against itself, in JavaScript, so that a
 //      mistake in the Rust tables that its own tests share cannot hide: no duplicate row, every row
-//      well formed, every scope a row or a preset names is one of the 54, the counts of the design
-//      (48 core scopes: 18 read, 18 act, 12 dangerous; 6 reserved), only `owner` and `cli-admin`
+//      well formed, every scope a row or a preset names is one of the 56, the counts of the design
+//      (48 core scopes: 18 read, 18 act, 12 dangerous; 6 reserved; and `calls.settings` and `calls.manage`, the two act scopes this code adds: 50 core, 20 act), only `owner` and `cli-admin`
 //      hold a dangerous scope, no relay tier does, and `control.project` never travels without
 //      `control.read`.
 //
@@ -81,9 +81,9 @@ for (const r of doc.routes ?? []) {
 // The scopes, presets and relay tiers.
 const scopeInfo = new Map((doc.scopes ?? []).map((s) => [s.name, s]));
 const count = (group) => (doc.scopes ?? []).filter((s) => s.group === group).length;
-if (scopeInfo.size !== 54) problems.push(`${scopeInfo.size} scopes, expected 54`);
-if ([count('read'), count('act'), count('dangerous'), count('reserved')].join() !== '18,18,12,6') {
-  problems.push(`scope groups ${[count('read'), count('act'), count('dangerous'), count('reserved')].join('/')}, expected 18/18/12/6`);
+if (scopeInfo.size !== 56) problems.push(`${scopeInfo.size} scopes, expected 56`);
+if ([count('read'), count('act'), count('dangerous'), count('reserved')].join() !== '18,20,12,6') {
+  problems.push(`scope groups ${[count('read'), count('act'), count('dangerous'), count('reserved')].join('/')}, expected 18/20/12/6`);
 }
 for (const name of scopeRows.keys()) if (!scopeInfo.has(name)) problems.push(`a row names ${name}, which is not a scope`);
 for (const r of doc.routes ?? []) {
@@ -105,7 +105,7 @@ for (const [name, list] of Object.entries(doc.relayTiers ?? {})) {
   }
   if (list.includes('control.project') && !list.includes('control.read')) problems.push(`relay tier ${name} has control.project without control.read`);
 }
-if ((doc.presets?.owner ?? []).length !== 54) problems.push('owner does not hold all 54 scopes');
+if ((doc.presets?.owner ?? []).length !== 56) problems.push('owner does not hold all 56 scopes');
 // Every scope has a route, but `control.project` (the change level of POST /api/mcp) and `relay.manage`
 // (the relay design's routes).
 for (const name of scopeInfo.keys()) {

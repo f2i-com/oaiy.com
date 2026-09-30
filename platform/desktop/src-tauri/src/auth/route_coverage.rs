@@ -692,9 +692,15 @@ fn the_walker_finds_the_routes_the_design_counted_and_the_ones_added_since() {
         .map(|f| (f.verb, f.pattern.clone()))
         .collect();
     // The design's Appendix B counted 161 pairs on the main router; the four below are routes the
-    // code has gained since (the plugin trust route and three update routes), and the three routes of
-    // `/api/auth/` that the access model has built so far are the rows with `since: 2` that exist.
-    assert_eq!(pairs.len(), 165 + 3, "main-router (method, path) pairs");
+    // code has gained since (the plugin trust route and three update routes), the eleven of the
+    // receptionist's transfers and messages (the four the design reserved, `GET|PATCH /api/messages`
+    // and `GET|PUT /api/ring/settings`, and seven it did not have), and the three routes of `/api/auth/`
+    // that the access model has built so far are the rows with `since: 2` that exist.
+    assert_eq!(
+        pairs.len(),
+        165 + 11 + 3,
+        "main-router (method, path) pairs"
+    );
     let mut built: Vec<String> = ROUTES
         .iter()
         .filter(|r| r.since == 2 && pairs.contains(&(r.method, r.pattern.to_string())))
@@ -733,10 +739,12 @@ fn the_walker_finds_the_routes_the_design_counted_and_the_ones_added_since() {
 fn the_table_has_a_row_for_every_route_the_boot_test_probes_and_the_counts_the_design_gives() {
     let existing = ROUTES.iter().filter(|r| r.since == 1).count();
     let new_or_reserved = ROUTES.iter().filter(|r| r.since == 2).count();
-    assert_eq!(existing, 165);
+    // 161 in the design, and the eleven routes the code gained since (see above).
+    assert_eq!(existing, 165 + 11);
     // 41 new and 60 reserved in the design; `GET /api/update` (reserved) is gone, replaced by the
-    // real `GET /api/update/status`.
-    assert_eq!(new_or_reserved, 100);
+    // real `GET /api/update/status`, and four reserved rows (`GET|PATCH /api/messages`,
+    // `GET|PUT /api/ring/settings`) are `since: 1` now that their routes exist.
+    assert_eq!(new_or_reserved, 100 - 4);
     assert_eq!(ROUTES.iter().filter(|r| r.only == Only::Server).count(), 28);
 }
 

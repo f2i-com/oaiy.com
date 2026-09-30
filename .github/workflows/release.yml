@@ -113,6 +113,13 @@ jobs:
       - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
         with:
           node-version: ${{ env.NODE_VERSION }}
+      # The transfer_v1 contract folder (docs/contracts/transfer) is Aokie's, copied byte for byte, and its lock
+      # (oaiy-only/SYNCED_FROM.json) says which Aokie commit it is. A release with no lock, or with a folder that is not what the lock
+      # records, stops here, before anything is built: the check fails on a missing lock. Aokie's repository is not checked out in this
+      # workflow, so the comparison with it cannot be made here; it is a step of the release checklist (docs/RELEASING.md, "Cutting a
+      # release", which runs it with --require-aokie where both repositories are).
+      - name: Transfer contract lock (transfer_v1)
+        run: node scripts/check-transfer-contract.mjs
       # The ONE ZIPP release every job below installs, frozen with the digest of
       # its SHA256SUMS so a release ZIPP publishes mid-run changes nothing here.
       - id: zipp

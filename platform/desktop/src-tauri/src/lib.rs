@@ -15,6 +15,10 @@ pub mod services;
 pub mod bridge;
 pub mod plugins;
 pub mod voice;
+/// Putting a caller through to the owner: who is rung, and when (the ring policy).
+pub mod ring;
+/// What callers leave for the owner when the receptionist cannot put them through.
+pub mod messages;
 pub mod calendar;
 pub mod modules;
 pub mod agent_tasks;
@@ -215,6 +219,8 @@ mod embed;
 mod engines;
 #[cfg(feature = "gui")]
 mod migrate;
+#[cfg(feature = "gui")]
+mod notify;
 #[cfg(feature = "gui")]
 mod tray;
 #[cfg(feature = "gui")]
@@ -1236,6 +1242,10 @@ pub fn run() {
                     handle.emit(crate::control::NAVIGATE_EVENT, payload).map_err(|e| e.to_string())
                 }));
             }
+            // A caller asking for the owner, and a message left, reach them with a native
+            // notification (and, for a call, the window brought up).
+            crate::ring::set_global_notifier(Some(Arc::new(crate::notify::GuiRing::of(app.handle().clone()))));
+            crate::messages::set_notifier(Some(Arc::new(crate::notify::GuiMessages::of(app.handle().clone()))));
             // The engines: started on their own thread (a running studio is found
             // over HTTP, and launching one binds its ports), so the window is not kept waiting.
             {

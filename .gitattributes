@@ -1,0 +1,3 @@
+# The transfer contract is byte-exact: the folder is the Aokie repository's, compared with it by sha256, so every file in it keeps LF
+# endings on every checkout (the fixtures, transfer-v1.md, SHA256SUMS, and the OAIY-only ones under oaiy-only/).
+docs/contracts/transfer/** text eol=lf

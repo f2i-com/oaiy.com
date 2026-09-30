@@ -1,5 +1,6 @@
 //! The differential test: in `legacy` mode (the default), every route that existed before the access model is
-//! answered exactly as the guard of commit 2ea1ee8 answered it.
+//! answered exactly as the guard of commit 2ea1ee8 answered it (the frozen copy holds four more lines, for the
+//! routes of the receptionist's transfers and messages, which that guard did not know: see `frozen_guard.rs`).
 //!
 //! Two routers are built from the same stub routes: the routes of the real router (the scan of the source that
 //! `route_coverage` holds to the table) that existed before the model, each answering `200 ok` to exactly the
@@ -392,6 +393,48 @@ async fn the_matrix_would_notice_a_guard_that_answered_differently() {
     );
 }
 
+/// The routes of the receptionist's transfers and messages: `(method, pattern)`, each with a `since: 1` row in the table.
+const RECEPTIONISTS_ROUTES: [(&str, &str); 11] = [
+    ("GET", "/api/messages"),
+    ("GET", "/api/messages/:id"),
+    ("PATCH", "/api/messages/:id"),
+    ("DELETE", "/api/messages/:id"),
+    ("GET", "/api/ring/settings"),
+    ("PUT", "/api/ring/settings"),
+    ("GET", "/api/ring/preview"),
+    ("GET", "/api/ring/active"),
+    ("POST", "/api/ring/active/:id/respond"),
+    ("POST", "/api/ring/notices/:id/dismiss"),
+    ("POST", "/api/voice/calls/:id/message"),
+];
+
+/// The routes the receptionist's transfers and messages add were built before the access model merged, with the guard of their kind (a
+/// read is a restricted read, a change is privileged: `is_personal_path`). They have `since: 1` rows, so `legacy` mode keeps that guard for
+/// them and the differential compares it with the frozen one, which knows the same four lines: they are in the comparison (the stubs
+/// answer each of them), a page that is not OAIY's window gets nothing from either guard, the configured token gets everything and the
+/// desktop's own window is let in.
+#[tokio::test]
+async fn the_routes_of_the_receptionists_transfers_and_messages_are_in_the_comparison_and_are_held_as_personal_routes() {
+    let (pairing, _) = a_paired_token();
+    let asked = requests();
+    let bare = stub_routes();
+    for (method, pattern) in RECEPTIONISTS_ROUTES {
+        let method = Method::from_bytes(method.as_bytes()).unwrap();
+        let path = concrete(pattern);
+        assert!(asked.contains(&(method.clone(), path.clone())), "{method} {path} is not asked");
+        let stub = ask(&bare, &method, &path, None, None).await;
+        assert_eq!(stub.status, 200, "{method} {pattern} is not among the routes compared (its row is not `since: 1`?): {stub:?}");
+        for (name, guarded) in [("live", live(true, Some(STATIC_TOKEN), pairing.clone())), ("frozen", frozen(true, Some(STATIC_TOKEN), pairing.clone()))] {
+            let stranger = ask(&guarded, &method, &path, None, Some("http://evil.example")).await;
+            assert_eq!(stranger.status, 403, "{name}: {method} {path} from a page that is not the window");
+            let window = ask(&guarded, &method, &path, None, Some("http://oaiy.localhost")).await;
+            assert_eq!(window.status, 200, "{name}: {method} {path} from the desktop's own window");
+            let token = ask(&guarded, &method, &path, Some(&format!("Bearer {STATIC_TOKEN}")), None).await;
+            assert_eq!(token.status, 200, "{name}: {method} {path} with the configured token");
+        }
+    }
+}
+
 #[tokio::test]
 async fn the_old_guards_bodies_and_statuses_are_still_what_they_were() {
     // A few of the old answers pinned by value, so that a change to both guards cannot pass unseen.
@@ -500,7 +543,8 @@ async fn a_handler_that_reads_the_principal_gets_the_legacy_owner_in_legacy_mode
     .await;
     assert_eq!(
         String::from_utf8_lossy(&a.body),
-        format!("{:?}:54", PrincipalKind::Legacy)
+        // (The legacy owner holds every scope there is: 56 now, and never a number written here.)
+        format!("{:?}:{}", PrincipalKind::Legacy, crate::auth::scopes::SCOPES.len())
     );
     // Refused requests never reach the handler, so nothing is handed to a caller who did not pass.
     let a = ask(&app, &Method::GET, "/api/config", Some("Bearer nope"), None).await;

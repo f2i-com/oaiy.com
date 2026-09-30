@@ -6,6 +6,17 @@
 //! - `shadow`: the rollback lever. Authentication is exactly `scoped`; only a non-dangerous route-scope
 //!   mismatch is logged and allowed.
 //!
+//! **`scoped` must not be offered as a security boundary until flow approval (design ACC-05) exists.**
+//! The design says a flow must be approved before it runs, but no approval is built: there is no
+//! `POST /api/bridge/flows/:id/approve` handler, and a credential holding `flows.write` and `runs.write`
+//! (the `agent` preset, among others) can store a flow and start it with nothing in between. A flow is
+//! code that runs on this computer, so such a credential can do whatever a flow can, including writing
+//! files that the route scopes above guard. The route table, the scopes and `scoped`'s refusals are
+//! real and tested; this gap sits beside them. Until ACC-05 lands, `legacy` (the default) is the mode
+//! the desktop runs, and a `scoped` install should be treated as hardening, not as isolation from a
+//! credential that can run flows. `shadow` enforces only authentication and dangerous scopes, so the
+//! newer scopes (`calls.settings`, `calls.manage`) are enforced in `scoped` only.
+//!
 //! The mode is read once at startup: `accessMode` in the desktop's config, `OAIY_ACCESS_MODE` for
 //! `oaiy-server`.
 

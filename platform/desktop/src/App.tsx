@@ -11,11 +11,13 @@ import {
   ExternalLink,
   HardDrive,
   History,
+  Inbox,
   LayoutDashboard,
   ListChecks,
   LockKeyhole,
   Moon,
   Package,
+  PhoneForwarded,
   Plug,
   Puzzle,
   Server,
@@ -42,6 +44,10 @@ import RunsPanel from './RunsPanel';
 import CalendarPanel from './CalendarPanel';
 import HoursPanel from './HoursPanel';
 import ContactsPanel from './ContactsPanel';
+import MessagesPanel from './MessagesPanel';
+import RingDialog from './RingDialog';
+import TransfersPanel from './TransfersPanel';
+import { useUnreadMessages } from './unreadMessages';
 import PluginScreenPage from './PluginScreenPage';
 import ConnectionsPanel from './ConnectionsPanel';
 import PairingPrompt from './PairingPrompt';
@@ -81,6 +87,10 @@ type BuiltinView =
   | 'hours'
   /** The people who ring and text: their names, the person's notes, what the receptionist remembered. */
   | 'contacts'
+  /** What callers left when the receptionist could not put them through to you. */
+  | 'messages'
+  /** Whether the receptionist may try to reach you for a caller who asks, and how. */
+  | 'transfers'
   | 'engines'
   | 'overview'
   | 'services'
@@ -118,6 +128,8 @@ const SECTIONS: Section[] = [
   { id: 'flows', label: 'Flows', icon: Workflow, group: 'Work', tabs: ['flows', 'runs'] },
   { id: 'calendar', label: 'Calendar', icon: CalendarDays, group: 'Work', tabs: ['calendar', 'hours'] },
   { id: 'contacts', label: 'Contacts', icon: BookUser, group: 'Work', tabs: ['contacts'] },
+  { id: 'messages', label: 'Messages', icon: Inbox, group: 'Work', tabs: ['messages'] },
+  { id: 'transfers', label: 'Transfers', icon: PhoneForwarded, group: 'Work', tabs: ['transfers'] },
   { id: 'engines', label: 'Engines', icon: Cpu, group: 'Setup', tabs: ['engines', 'models'] },
   { id: 'services', label: 'Services', icon: Server, group: 'Setup', tabs: ['services', 'python'] },
   { id: 'connections', label: 'Connections', icon: Plug, group: 'Setup', tabs: ['connections', 'providers', 'plugins'] },
@@ -131,11 +143,11 @@ const SETTINGS: Section = { id: 'settings', label: 'Settings', icon: Settings2, 
  * they are when it has none (sections.ts `arrangeSections`). Contacts are the
  * phone's: the people who ring and text.
  */
-const MODULE_SECTIONS: Record<string, string> = { calendar: 'calendar', contacts: 'phone' };
-/** Their pages' order in the sub-menu, after the plugin's own (Phone): Calendar, Contacts, Hours & Services. */
-const SUB_MENU_ORDER = ['calendar', 'contacts', 'hours'] as const;
+const MODULE_SECTIONS: Record<string, string> = { calendar: 'calendar', contacts: 'phone', messages: 'phone', transfers: 'phone' };
+/** Their pages' order in the sub-menu, after the plugin's own (Phone): Calendar, Contacts, Messages, Hours & Services, Transfers. */
+const SUB_MENU_ORDER = ['calendar', 'contacts', 'messages', 'hours', 'transfers'] as const;
 /** The pages of those sections, by module: off with it. */
-const MODULE_VIEWS: Partial<Record<BuiltinView, string>> = { calendar: 'calendar', hours: 'calendar', contacts: 'phone' };
+const MODULE_VIEWS: Partial<Record<BuiltinView, string>> = { calendar: 'calendar', hours: 'calendar', contacts: 'phone', messages: 'phone', transfers: 'phone' };
 
 /** Each page: its tab's name and icon, and the line under the topbar's title. */
 const PAGE: Record<BuiltinView, { tab: string; icon: LucideIcon; copy: string }> = {
@@ -165,6 +177,16 @@ const PAGE: Record<BuiltinView, { tab: string; icon: LucideIcon; copy: string }>
     tab: 'Contacts',
     icon: BookUser,
     copy: 'The people who ring and text: their names, your notes for the receptionist, and what it remembered.',
+  },
+  messages: {
+    tab: 'Messages',
+    icon: Inbox,
+    copy: 'What callers asked the receptionist to tell you when it could not put them through.',
+  },
+  transfers: {
+    tab: 'Transfers',
+    icon: PhoneForwarded,
+    copy: 'Whether the receptionist may try to reach you for a caller who asks, how it rings, and when it takes a message.',
   },
   engines: {
     tab: 'Engines',
@@ -326,7 +348,9 @@ export default function App() {
   );
   /** The requests waiting to be confirmed: the Calendar's count in the sidebar. */
   const waiting = useWaitingRequests(calendarOn === true);
-  const countOf = (v: string) => (v === 'calendar' ? (waiting?.length ?? 0) : 0);
+  /** The messages callers left that nobody has looked at: the Messages page's count. */
+  const unread = useUnreadMessages(phoneOn === true);
+  const countOf = (v: string) => (v === 'calendar' ? (waiting?.length ?? 0) : v === 'messages' ? unread : 0);
   const [expanded, setExpanded] = useState<Record<string, boolean>>(readExpanded);
   const isOpen = useCallback((id: string) => expanded[id] !== false, [expanded]);
   const setOpen = useCallback((id: string, open: boolean) => {
@@ -628,7 +652,9 @@ export default function App() {
     const open = isOpen(s.id);
     const badge = newBadge(s, seen);
     const count = s.tabs.reduce((n, t) => n + countOf(t.view), 0);
-    const countText = (n: number) => `${n} request${n === 1 ? '' : 's'} waiting`;
+    const countText = (n: number, view = 'calendar') => (view === 'messages' ? `${n} new message${n === 1 ? '' : 's'}` : `${n} request${n === 1 ? '' : 's'} waiting`);
+    // The parent's count adds the requests and the new messages: said as what waits for the owner.
+    const parentText = (n: number) => (s.tabs.some((t) => t.view === 'messages') && s.tabs.some((t) => t.view === 'calendar') ? `${n} waiting for you` : countText(n, s.tabs.find((t) => countOf(t.view) > 0)?.view));
     return (
       <div key={s.id} className={`nav-sub${open ? ' is-expanded' : ''}${inside ? ' has-active' : ''}`}>
         <div className="nav-sub-head">
@@ -657,7 +683,7 @@ export default function App() {
                 closed; requests waiting come first (both would crowd the name out). */}
             {badge && count === 0 && <em className="nav-badge nav-badge-parent">{badge}</em>}
             {count > 0 && (
-              <em className="nav-count nav-count-parent" title={countText(count)}>
+              <em className="nav-count nav-count-parent" title={parentText(count)}>
                 {count}
               </em>
             )}
@@ -688,8 +714,8 @@ export default function App() {
                 data-child-of={s.id}
                 className={`nav-child${on ? ' active' : ''}`}
                 aria-current={on ? 'page' : undefined}
-                aria-label={n ? `${t.label}, ${countText(n)}` : t.label}
-                title={t.page ? `${t.label}, from the ${t.page.pluginName} plugin` : n ? `${t.label}: ${countText(n)}` : t.label}
+                aria-label={n ? `${t.label}, ${countText(n, t.view)}` : t.label}
+                title={t.page ? `${t.label}, from the ${t.page.pluginName} plugin` : n ? `${t.label}: ${countText(n, t.view)}` : t.label}
                 onClick={() => setView(t.view as View)}
               >
                 <TabIcon size={16} />
@@ -709,6 +735,8 @@ export default function App() {
       <a className="skip" href="#main">
         Skip to dashboard
       </a>
+      {/* A caller wants to speak to you: over everything, while the receptionist is trying to reach you. */}
+      <RingDialog on={phoneOn === true} />
 
       <aside className="sidebar">
         <div className="brand">
@@ -825,6 +853,16 @@ export default function App() {
             {view === 'calendar' && <CalendarPanel onOpenHours={() => setView('hours')} />}
             {view === 'hours' && <HoursPanel onOpenCalendar={() => setView('calendar')} />}
             {view === 'contacts' && <ContactsPanel open={contactToOpen} onOpened={() => setContactToOpen(null)} />}
+            {view === 'messages' && (
+              <MessagesPanel
+                onOpenContact={(key) => {
+                  setContactToOpen(key);
+                  setView('contacts');
+                }}
+                onOpenAgent={() => setView('agent')}
+              />
+            )}
+            {view === 'transfers' && <TransfersPanel />}
             {view === 'models' && <ModelsPanel />}
             {view === 'providers' && <AiProvidersPanel />}
             {view === 'connections' && <ConnectionsPanel />}

@@ -299,7 +299,7 @@ pub(crate) fn defs() -> &'static [ToolDef] {
                 "Record OAIY's first-run setup as finished, so the dashboard stops offering it.",
                 none()),
             def("ui_open", "Show a dashboard page", Change,
-                "Show the person a page of the OAIY dashboard: overview, agent, flows, calendar, contacts (the people who ring and text; with contact, that person's own), hours (Hours & Services: the business, its opening hours, services and booking rules), engines, services, plugins, runs, models, python, providers, connections, settings, setup, or a plugin's page as plugin:<pluginId>:<navId>.",
+                "Show the person a page of the OAIY dashboard: overview, agent, flows, calendar, contacts (the people who ring and text; with contact, that person's own), messages (what the receptionist took when the owner could not be reached), transfers (whether the receptionist may try to reach the owner for a caller who asks, and how), hours (Hours & Services: the business, its opening hours, services and booking rules), engines, services, plugins, runs, models, python, providers, connections, settings, setup, or a plugin's page as plugin:<pluginId>:<navId>.",
                 object(json!({
                     "view": { "type": "string", "minLength": 1, "description": "The page." },
                     "contact": { "type": "string", "minLength": 1, "description": "With view contacts: a person's phone number, written any way, to open their contact." }
@@ -1819,8 +1819,8 @@ async fn setup_status(d: &Desk) -> Result<Done, String> {
 }
 
 /// The dashboard's own pages, as it names them.
-pub(crate) const VIEWS: [&str; 16] = [
-    "overview", "agent", "flows", "calendar", "contacts", "hours", "engines", "services", "plugins", "runs", "models", "python", "providers", "connections", "settings", "setup",
+pub(crate) const VIEWS: [&str; 18] = [
+    "overview", "agent", "flows", "calendar", "contacts", "messages", "transfers", "hours", "engines", "services", "plugins", "runs", "models", "python", "providers", "connections", "settings", "setup",
 ];
 
 // ---------------------------------------------------------------------------

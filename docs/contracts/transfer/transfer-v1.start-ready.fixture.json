@@ -1,0 +1,82 @@
+{
+  "contract": "transfer_v1",
+  "kind": "start_ready",
+  "about": "How the two ends agree that a call can be transferred. Aokie offers it on the start (allowTransfer, only when true); OAIY answers in ready.features. The tool exists for the session only when both happened, so every combination of old and new builds is safe: an old OAIY ignores allowTransfer and lists nothing, and an old Aokie never sends it.",
+  "start": {
+    "about": "formlogic.realtime.start. allowTransfer is omitted when false, so a call that cannot be transferred sends exactly the start it always sent. The plugin offers it only for an inbound call on the OAIY route, when the host announced ringPlan at plugin.init, a Companion device is approved, and consent currently grants both remote_assistance and remote_takeover. resume is present only on the fresh session for the same call that follows a handoff, and only on a call that negotiated transfer_v1.",
+    "cases": [
+      {
+        "name": "transfer offered",
+        "allowTransfer": true,
+        "startHas": { "type": "formlogic.realtime.start", "allowTransfer": true },
+        "startOmits": ["resume"]
+      },
+      {
+        "name": "transfer not offered (every other call)",
+        "allowTransfer": false,
+        "startOmits": ["allowTransfer", "resume"]
+      },
+      {
+        "name": "the AI has the caller back because the owner handed the call back",
+        "allowTransfer": true,
+        "resume": { "afterHandoff": true, "handoffSeconds": 75, "via": "return" },
+        "greeting": "Thank you for waiting. Is there anything else I can help with?",
+        "startHas": {
+          "allowTransfer": true,
+          "resume": { "afterHandoff": true, "handoffSeconds": 75, "via": "return" },
+          "greeting": "Thank you for waiting. Is there anything else I can help with?"
+        }
+      },
+      {
+        "name": "the AI has the caller back because the media setup failed",
+        "allowTransfer": true,
+        "resume": { "afterHandoff": true, "handoffSeconds": 12, "via": "failback" },
+        "greeting": "Thank you for waiting. Is there anything else I can help with?",
+        "startHas": {
+          "resume": { "afterHandoff": true, "handoffSeconds": 12, "via": "failback" }
+        }
+      }
+    ]
+  },
+  "ready": {
+    "about": "formlogic.realtime.ready. features lists what this OAIY implements for the call; it lists transfer_v1 only when the start said allowTransfer and this OAIY implements the contract. Members the plugin does not know are ignored.",
+    "cases": [
+      {
+        "name": "an OAIY that implements the contract",
+        "frame": { "type": "formlogic.realtime.ready", "callId": "call_0123", "generation": 7, "destinationOrigin": "https://oaiy.localhost", "features": ["transfer_v1"] },
+        "features": ["transfer_v1"],
+        "negotiatedWhenOffered": true
+      },
+      {
+        "name": "an OAIY from before the contract sends no features",
+        "frame": { "type": "formlogic.realtime.ready", "callId": "call_0123", "generation": 7, "destinationOrigin": "https://oaiy.localhost" },
+        "features": [],
+        "negotiatedWhenOffered": false
+      },
+      {
+        "name": "a feature the plugin does not know",
+        "frame": { "type": "formlogic.realtime.ready", "callId": "call_0123", "generation": 7, "destinationOrigin": "https://oaiy.localhost", "features": ["future_thing"], "somethingNew": true },
+        "features": ["future_thing"],
+        "negotiatedWhenOffered": false
+      },
+      {
+        "name": "both",
+        "frame": { "type": "formlogic.realtime.ready", "callId": "call_0123", "generation": 7, "destinationOrigin": "https://oaiy.localhost", "features": ["future_thing", "transfer_v1"] },
+        "features": ["future_thing", "transfer_v1"],
+        "negotiatedWhenOffered": true
+      }
+    ]
+  },
+  "stop": {
+    "about": "formlogic.realtime.stop. When an owner endpoint takes the caller, the plugin stops the session with reason handoff:takeover (on a session that negotiated the contract; other sessions keep the free text they always had). OAIY must not treat a stop whose reason starts with handoff: as the end of the call. The plugin then opens a fresh session for the same call id, with start.resume, once the caller is back with Aokie.",
+    "handoffReason": "handoff:takeover",
+    "handoffPrefix": "handoff:",
+    "legacyReason": "Aokie media ownership changed"
+  },
+  "compatibility": [
+    { "aokie": "old", "oaiy": "new", "result": "no allowTransfer, so no tool: the agent behaves as before" },
+    { "aokie": "new", "oaiy": "old", "result": "ready has no features, so the plugin does not enable the tool even though it sent allowTransfer; stop keeps its old text on that session" },
+    { "aokie": "new", "oaiy": "new", "result": "the tool, the outcome frames, handoff:takeover and start.resume are in use" },
+    { "aokie": "new", "oaiy": "new, host without ringPlan", "result": "the plugin never sends allowTransfer" }
+  ]
+}

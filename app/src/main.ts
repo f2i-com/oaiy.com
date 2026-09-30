@@ -2121,13 +2121,27 @@ With that done, Settings → Images, video and audio → Find OAIY sets it up.`)
         try {
           await d.voiceEvents((event) => {
             // A call's end, and the calls still going on, are taken even without the lease: a call this page was on must end here.
-            if (!holdsCalls && event.type !== 'call.ended' && event.type !== 'hello') return;
+            // (What the owner lets the receptionist do comes with the hello, and when it changes: every page takes it.)
+            if (!holdsCalls && event.type !== 'call.ended' && event.type !== 'hello' && event.type !== 'voice.features') return;
             void sessions?.callEvent(event).then((session) => {
               // A call begins: show it (the person sees the conversation as it happens).
               if (session && event.type === 'call.started') {
                 selectSession(session.thread);
                 const placed = session.outreach && !session.outreach.inbound ? session.outreach : undefined;
-                chat.system(placed ? `📞 ${session.title} answered the call for "${placed.name}": the agent is on it.` : `📞 ${session.title} is calling: the agent is answering.`);
+                chat.system(
+                  event.resume
+                    ? `📞 ${session.title} is back with the receptionist: you handed the call back.`
+                    : placed
+                      ? `📞 ${session.title} answered the call for "${placed.name}": the agent is on it.`
+                      : `📞 ${session.title} is calling: the agent is answering.`,
+                );
+              }
+              // The owner took the call, or the receptionist could not reach them: the person sees what happened.
+              if (session && event.type === 'call.handoff') chat.system(`📞 You took the call from ${session.title}.`);
+              if (session && event.type === 'call.transfer') {
+                const how: Record<string, string> = { accepted: 'accepted: the call is being connected to you', declined: 'declined', expired: 'ran out with nobody answering', unavailable: 'could not connect', cancelled: 'cancelled' };
+                const said = how[String(event.outcome)];
+                if (said) chat.system(`📞 The receptionist tried to reach you for ${session.title}: ${said}.`);
               }
             });
           }, abort.signal);
