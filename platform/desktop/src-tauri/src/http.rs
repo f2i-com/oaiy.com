@@ -1495,9 +1495,10 @@ pub async fn serve(
         auth_token.clone(),
         &|name| std::env::var(name).ok(),
     )?;
-    if access.mode.is_enforcing() {
-        tokio::spawn(crate::auth::runtime::maintain_forever(guard.clone()));
-    }
+    // The upkeep of the credential store runs in every mode: in `legacy` the store is memory-only, and
+    // `derive` (a route the model adds, judged by the new guard even there) makes credentials that must not
+    // pile up.
+    tokio::spawn(crate::auth::runtime::maintain_forever(guard.clone()));
     // CORS stays permissive so a hosted oaiy-web at any domain can READ the
     // API (the localhost bind keeps non-local processes out). State-changing
     // and exec endpoints are additionally gated by `origin_guard` below, so a

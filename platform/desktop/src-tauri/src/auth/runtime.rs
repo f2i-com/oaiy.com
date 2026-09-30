@@ -126,15 +126,34 @@ pub fn flush_installed() {
     }
 }
 
+/// How often the upkeep of a running guard runs.
+pub const MAINTAIN_EVERY: std::time::Duration = std::time::Duration::from_secs(5);
+
 /// Periodic upkeep of a running guard: expire, purge, write the last-used times once a minute, write the
-/// noise of minutes that are over. Runs until the process ends.
+/// noise of minutes that are over. Runs until the process ends, in every access mode: `legacy` has a
+/// (memory-only) store too, and the routes it takes (`derive`) make credentials that must not pile up.
 pub async fn maintain_forever(guard: Arc<Guard>) {
+    maintain_every(guard, MAINTAIN_EVERY).await
+}
+
+/// [`maintain_forever`] at another pace (the tests').
+pub async fn maintain_every(guard: Arc<Guard>, period: std::time::Duration) {
+    log::info!(
+        "auth: credential upkeep every {} s (access mode {})",
+        period.as_secs(),
+        guard.mode().name()
+    );
     loop {
-        tokio::time::sleep(std::time::Duration::from_secs(30)).await;
-        guard.store().maintain();
-        if let Some(log) = guard.audit() {
-            log.flush_closed();
-        }
+        tokio::time::sleep(period).await;
+        maintain_once(&guard);
+    }
+}
+
+/// One round of upkeep.
+pub fn maintain_once(guard: &Guard) {
+    guard.store().maintain();
+    if let Some(log) = guard.audit() {
+        log.flush_closed();
     }
 }
 
@@ -170,6 +189,73 @@ mod tests {
         );
         assert_eq!(guard.health_extras().access, "legacy");
         assert_eq!(guard.health_extras().storage, "ok");
+        // With the upkeep running (it does in every mode) and a credential derived, still nothing on disk.
+        guard
+            .store()
+            .derive(
+                &super::super::principal::Principal::static_token(),
+                super::super::store::DeriveRequest {
+                    scopes: super::super::scopes::ScopeSet::of(&["system.read"]),
+                    ttl_ms: Some(1000),
+                    label: "x".into(),
+                },
+            )
+            .unwrap();
+        maintain_once(&guard);
+        flush_installed();
+        assert_eq!(
+            std::fs::read_dir(&dir.0).unwrap().count(),
+            0,
+            "the upkeep of a legacy guard writes nothing either"
+        );
+    }
+
+    #[tokio::test]
+    async fn f7_the_upkeep_runs_in_legacy_mode_too_and_drops_what_derive_made() {
+        use super::super::clock::ManualClock;
+        use super::super::principal::Principal;
+        use super::super::scopes::ScopeSet;
+        use super::super::store::{DeriveRequest, RUN_PURGE_AFTER_MS};
+        use super::super::token::Kind;
+        let clock = Arc::new(ManualClock::new(1_790_000_000_000));
+        let (config, _) = GuardConfig::from_env(&no_env, false, false, 17972);
+        let guard = Arc::new(Guard::new(
+            AccessMode::Legacy,
+            config,
+            Arc::new(AuthStore::memory(clock.clone())),
+            Some("t".repeat(32)),
+            None,
+            clock.clone(),
+        ));
+        for _ in 0..5 {
+            guard
+                .store()
+                .derive(
+                    &Principal::static_token(),
+                    DeriveRequest {
+                        scopes: ScopeSet::of(&["system.read"]),
+                        ttl_ms: Some(1000),
+                        label: "x".into(),
+                    },
+                )
+                .unwrap();
+            clock.advance(2000);
+        }
+        assert_eq!(guard.store().held_count(Kind::Run), 5);
+        clock.advance(RUN_PURGE_AFTER_MS + 60_000);
+        // The task the listener spawns in every mode, at a pace a test can wait for.
+        let task = tokio::spawn(maintain_every(
+            guard.clone(),
+            std::time::Duration::from_millis(5),
+        ));
+        for _ in 0..400 {
+            if guard.store().held_count(Kind::Run) == 0 {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        task.abort();
+        assert_eq!(guard.store().held_count(Kind::Run), 0);
     }
 
     #[test]

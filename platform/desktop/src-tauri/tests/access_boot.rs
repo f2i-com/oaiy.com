@@ -376,6 +376,14 @@ fn a_legacy_server_answers_what_it_always_did_and_health_says_the_mode() {
         (200, Some("static"), Some(15))
     );
     assert!(!scratch.data().join("auth").exists());
+    // The upkeep of the credential store runs in `legacy` too (a derive makes credentials there), and it
+    // still writes nothing to the data folder.
+    let stderr = std::fs::read_to_string(&server.stderr).unwrap_or_default();
+    assert!(
+        stderr.contains("credential upkeep every 5 s (access mode legacy)"),
+        "{stderr}"
+    );
+    assert!(!scratch.data().join("auth").exists());
 }
 
 #[test]
@@ -495,6 +503,10 @@ fn a_scoped_server_knows_the_environment_token_as_the_cli_preset_and_nothing_mor
     assert!(
         !stderr.contains(TOKEN) && !stderr.contains(&child),
         "no secret on stderr"
+    );
+    assert!(
+        stderr.contains("credential upkeep every 5 s (access mode scoped)"),
+        "{stderr}"
     );
 }
 
