@@ -665,7 +665,7 @@ jobs:
           VERIFY_RESULT: ${{ needs.verify.result }}
           REVISION: ${{ needs.meta.outputs.revision }}
           VERIFY_WORKFLOW: .github/workflows/ci.yml
-          VERIFY_JOBS: revision,zipp,web,cli,desktop (linux),desktop (windows)
+          VERIFY_JOBS: revision,zipp,web,cli,desktop (linux),desktop (windows),vault-linux,vault-windows
         run: node platform/scripts/attest-release-evidence.mjs --dir artifacts
 
       # Every evidence file must name the revision this workflow verified and
