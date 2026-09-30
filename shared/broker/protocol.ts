@@ -38,6 +38,8 @@ export const DEFAULT_MAX_BODY_BYTES = 1024 * 1024;
 export const DEFAULT_BYTES_PER_HOUR = 64 * 1024 * 1024;
 /** The embedded modal's Test and Load-models buttons call the provider too: they are an "app" of their own with their own, smaller hour. */
 export const MODAL_APP = 'modal';
+/** App names no deployment may give an app: the modal's own budget is kept under `modal`, and an app of that name would share it. */
+export const RESERVED_APP_NAMES: readonly string[] = [MODAL_APP];
 export const DEFAULT_MODAL_BUDGET_PER_HOUR = 60;
 /** How long a request may take when it says nothing, and the least and most it may ask for (ms). */
 export const DEFAULT_TIMEOUT_MS = 120_000;
@@ -104,7 +106,8 @@ export interface HelloReply {
 /**
  * The origins the holder answers, from its `<meta name="oaiy-apps" content="agent=https://agent.example flows=https://flows.example">`
  * (written when the folders are assembled, never hard-coded). An entry must be an exact origin (`https:`, or `http:` on this
- * computer, for tests); a malformed one makes the whole list empty, so a mistake fails closed.
+ * computer, for tests); a malformed one makes the whole list empty, so a mistake fails closed. So does an app called by a reserved name
+ * (`modal`: the embedded modal's own budget is kept under it, and an app of that name would spend it).
  */
 export function parseAppOrigins(content: string | null | undefined): Map<string, string> {
   const origins = new Map<string, string>();
@@ -113,7 +116,7 @@ export function parseAppOrigins(content: string | null | undefined): Map<string,
     const eq = part.indexOf('=');
     const app = part.slice(0, eq);
     const origin = part.slice(eq + 1);
-    if (eq <= 0 || !/^[a-z][a-z0-9-]{0,15}$/.test(app) || !isExactOrigin(origin) || origins.has(origin)) return new Map();
+    if (eq <= 0 || !/^[a-z][a-z0-9-]{0,15}$/.test(app) || RESERVED_APP_NAMES.includes(app) || !isExactOrigin(origin) || origins.has(origin)) return new Map();
     origins.set(origin, app);
   }
   return origins;

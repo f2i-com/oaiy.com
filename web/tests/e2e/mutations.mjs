@@ -408,6 +408,16 @@ const MUTATIONS = [
     files: { 'web/providers/src/limits.ts': [{ find: /    for \(const name of \['n', 'best_of'\]\) \{\n[\s\S]*?\n      \}\n    \}\n/, replace: '' }] },
     caught: ['a request for more than one reply (n, best_of) is refused when a cap is set'],
   },
+  {
+    name: 'L8 an app may be called modal',
+    what: 'the list of apps and the assembler let an app take the name of the embedded modal\'s budget',
+    tests: ['tests/unit/reserved-app.test.mjs'],
+    files: {
+      'shared/broker/protocol.ts': [{ find: ' || RESERVED_APP_NAMES.includes(app) || !isExactOrigin(origin)', replace: ' || !isExactOrigin(origin)' }],
+      'web/scripts/assemble.mjs': [{ find: 'if (RESERVED_APP_NAMES.includes(name)) throw', replace: 'if (false) throw' }],
+    },
+    caught: ['the list of apps refuses it', 'the assembler refuses it before it writes anything'],
+  },
   // Leaks the scans must find. They put the key where a scan of TEXT does not look (the reviewer's two: a Uint8Array, and reversed).
   {
     name: 'H1 leak: list returns the key as a Uint8Array',

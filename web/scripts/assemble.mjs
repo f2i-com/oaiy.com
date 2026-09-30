@@ -28,7 +28,10 @@ const META = /<meta\s+name="oaiy-apps"\s+content=""\s*\/?>/;
  * @returns {Promise<string>} the folder
  */
 export async function assembleProviders({ outDir, distDir = PROVIDERS_DIST, providers, apps, headers }) {
-  const { parseAppOrigins, isExactOrigin } = await loadTs('shared/broker/protocol.ts');
+  const { parseAppOrigins, isExactOrigin, RESERVED_APP_NAMES } = await loadTs('shared/broker/protocol.ts');
+  for (const name of Object.keys(apps)) {
+    if (RESERVED_APP_NAMES.includes(name)) throw new Error(`"${name}" is reserved (the embedded modal keeps its own budget under that name), so no app may be called it`);
+  }
   if (!fs.existsSync(path.join(distDir, 'broker.html'))) throw new Error(`there is no build in ${distDir}: run \`npm run build\` first`);
   if (!isExactOrigin(providers)) throw new Error(`the providers origin is not an origin: ${providers}`);
   const content = Object.entries(apps).map(([name, origin]) => `${name}=${origin}`).join(' ');
