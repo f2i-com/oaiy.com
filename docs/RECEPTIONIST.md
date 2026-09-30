@@ -106,8 +106,9 @@ not messages, or from a newer OAIY) is never written over: it is kept beside the
 first are let go, so a bad file is never refused a place), new messages go to a fresh file, and the Messages page says
 where it is kept. A file that cannot be read at all (another program holds it open, its permissions say no) is left
 exactly as it is, and is not put aside as if it were garbage. One that is only busy for a moment at start-up (an antivirus
-scan, an indexer) is read again: at once a few times over about three seconds, and then every 2, 5, 10 and 30 seconds for as
-long as it stays busy, with the Messages page saying so meanwhile. Messages the receptionist takes in the first fifteen
+scan, an indexer) is read again: at once a few times over less than a second (so that the desktop starts without waiting
+on it; the stores open one after the other), and then every 1, 2, 4, 8, 15 and 30 seconds for as long as it stays busy,
+with the Messages page saying so meanwhile. Messages the receptionist takes in the first fifteen
 seconds are kept in memory and written, merged with what the file held, when it can be read; after that no message is kept
 until it can be (the receptionist is told it could not be saved, and says so). The Transfers settings (`ring.json`) and the
 record of tries (`ring-attempts.json`) are treated the same way; with the settings unreadable everything stays off, and the

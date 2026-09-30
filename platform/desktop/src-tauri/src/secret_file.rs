@@ -189,12 +189,20 @@ pub struct Patience {
     pub window: std::time::Duration,
 }
 
+impl Patience {
+    /// What the desktop waits for: under a second at the start (the stores open one after the other, and the desktop is starting: the wait is the
+    /// start of the desktop's, however many are busy), then, in memory meanwhile, every 1, 2, 4, 8, 15 and then 30 seconds; messages are kept in memory
+    /// for the first fifteen.
+    pub fn for_use() -> Self {
+        let ms = std::time::Duration::from_millis;
+        Self { start: vec![ms(100), ms(200), ms(400)], later: vec![ms(1_000), ms(2_000), ms(4_000), ms(8_000), ms(15_000), ms(30_000)], window: ms(15_000) }
+    }
+}
+
 impl Default for Patience {
-    /// About three seconds at the start, then every 2, 5, 10 and then 30 seconds; messages are kept in memory for the first fifteen.
     #[cfg(not(test))]
     fn default() -> Self {
-        let ms = std::time::Duration::from_millis;
-        Self { start: vec![ms(100), ms(200), ms(400), ms(800), ms(1_600)], later: vec![ms(2_000), ms(5_000), ms(10_000), ms(30_000)], window: ms(15_000) }
+        Self::for_use()
     }
 
     /// Tests do not wait, do not go back to a file on their own and do not keep messages in memory, unless one says (`Patience { .. }`).
@@ -510,6 +518,19 @@ mod tests {
             .collect();
         names.sort();
         names
+    }
+
+    /// The desktop does not wait on a busy file for long as it starts (three stores, one after the other, on the thread that sets the window up), and
+    /// goes back to it, in memory meanwhile, ever less often.
+    #[test]
+    fn the_desktop_waits_under_a_second_for_a_busy_file_as_it_starts_and_goes_back_to_it_ever_less_often() {
+        let secs = std::time::Duration::from_secs;
+        let p = Patience::for_use();
+        let at_start: std::time::Duration = p.start.iter().sum();
+        assert!(!p.start.is_empty() && at_start < secs(1), "the wait at start-up: {at_start:?}");
+        assert!(p.later.len() >= 4 && p.later[0] >= secs(1) && p.later.windows(2).all(|w| w[0] <= w[1]), "then ever less often: {:?}", p.later);
+        assert!(p.later.last().is_some_and(|last| *last <= secs(30)), "and at least every thirty seconds: {:?}", p.later);
+        assert_eq!(p.window, secs(15), "messages are kept in memory for the first fifteen seconds");
     }
 
     #[test]
