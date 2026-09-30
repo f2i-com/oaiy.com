@@ -7,6 +7,7 @@ use Oaiy\Relay\ApiError;
 use Oaiy\Relay\Clock;
 use Oaiy\Relay\Context;
 use Oaiy\Relay\Facade;
+use Oaiy\Relay\Holds;
 use Oaiy\Relay\Json;
 use Oaiy\Relay\Kernel;
 use Oaiy\Relay\Party;
@@ -170,7 +171,9 @@ final class AokieApi
     public static function pull(Context $ctx, Request $req, ?Principal $p, array $m): Response
     {
         return Facade::run($ctx, static function () use ($ctx, $req): Response {
-            $f = Facade::identify($ctx, $req);
+            // A read that will wait is a hold: it is judged on the bearer alone before the database is touched (wait=0 holds nothing).
+            $waits = $req->hasQuery('wait') && (Json::queryInt($req->q('wait'), 0) ?? 0) > 0;
+            $f = Facade::identify($ctx, $req, $waits);
             $since = Facade::cursor($req);
             $wait = 0;
             if ($req->hasQuery('wait')) {
@@ -184,7 +187,7 @@ final class AokieApi
             $info = null;
             $headers = ['Content-Type' => 'application/json; charset=utf-8'];
             if ($wait > 0) {
-                $hold = $ctx->holds->acquire('stream', $f->holdKey(), 'core', $wait, 0);
+                $hold = $ctx->holds->acquire('stream', $f->holdKey(), 'core', $wait, 0, Holds::STREAM_INFLIGHT_MAX);
                 if ($hold === null) {
                     $wait = 0;
                     $info = ['refused' => true, 'retryAfter' => min($ctx->cfg->fallbackS(), 2)];
@@ -227,10 +230,10 @@ final class AokieApi
     public static function stream(Context $ctx, Request $req, ?Principal $p, array $m): Response
     {
         return Facade::run($ctx, static function () use ($ctx, $req): Response {
-            $f = Facade::identify($ctx, $req);
+            $f = Facade::identify($ctx, $req, true);
             $since = Facade::cursor($req);
             $seconds = min($ctx->eff->streamSeconds(), $f->secondsLeft(Clock::now()));
-            $hold = $ctx->holds->acquire('stream', $f->holdKey(), 'core', max(1, $seconds), 0);
+            $hold = $ctx->holds->acquire('stream', $f->holdKey(), 'core', max(1, $seconds), 0, Holds::STREAM_INFLIGHT_MAX);
             if ($hold === null) {
                 throw new ApiError(503, 'companion_unavailable', 'The relay is busy; try again shortly.', 2);
             }

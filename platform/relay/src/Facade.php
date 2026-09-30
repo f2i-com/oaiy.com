@@ -94,7 +94,7 @@ final class Facade
      * Verify the bearer and re-read the device row it stands for.
      * @throws ApiError feature_disabled, invalid_token (401), revoked (401), forbidden (403), rate_limited
      */
-    public static function identify(Context $ctx, Request $req): self
+    public static function identify(Context $ctx, Request $req, bool $opensHold = false): self
     {
         if (!$ctx->cfg->callEnabled()) {
             throw ApiError::make('feature_disabled');
@@ -108,6 +108,9 @@ final class Facade
         $c = Admission::verify($ctx->admissionSecret(), $bearer, $now);
         if ($c === null) {
             throw self::refuse($ctx, $req);
+        }
+        if ($opensHold) {
+            self::admitHold($ctx, $c); // before anything that reads or writes the database: a refusal here costs the least it can
         }
         $retry = $ctx->limiter->take('adm.req:' . $c['jti'], 1, 120, 10);
         if ($retry !== null) {
@@ -164,6 +167,29 @@ final class Facade
         }
         $f->mailbox = Party::mailbox($f->appId, $f->dsk, $f->party);
         return $f;
+    }
+
+    /**
+     * A stream open or a frames wait, admitted or refused on what the verified bearer says, before the database is touched (a refusal
+     * is a read of one folder and of one row). Two bounds per party (the plugin, or one phone) whatever admissions it holds: at most
+     * Holds::STREAM_INFLIGHT_MAX running at once, the ones being superseded included (each pins a worker until it notices, about 250
+     * ms), and a bucket of Holds::OPEN_BUCKET opens refilled at Holds::OPEN_REFILL_PER_S a second. Both are 429 rate_limited with
+     * Retry-After. An honest carrier opens one stream at a time and reopens when it ends; a burst of fifty from one party cannot
+     * keep the pool busy, however many admissions it has minted (30 a minute each) and whatever their own 120-request buckets hold.
+     * @param array<string,mixed> $c the verified claims
+     * @throws ApiError rate_limited
+     */
+    private static function admitHold(Context $ctx, array $c): void
+    {
+        $party = (string)$c['role'] === 'plugin' ? 'plugin' : 'mobile:' . (string)$c['holderKeyThumbprint'];
+        $key = 'aokie|' . (string)$c['dsk'] . '|' . (string)$c['appId'] . '|' . $party;
+        if ($ctx->holds->inFlight('stream', $key) >= Holds::STREAM_INFLIGHT_MAX) {
+            throw new ApiError(429, 'rate_limited', null, 1);
+        }
+        $retry = $ctx->limiter->take('adm.open:' . Signals::hash($key), 1, Holds::OPEN_BUCKET, Holds::OPEN_REFILL_PER_S);
+        if ($retry !== null) {
+            throw new ApiError(429, 'rate_limited', null, $retry);
+        }
     }
 
     /**

@@ -22,6 +22,11 @@ defined('OAIY_RELAY') or exit;
 final class Holds
 {
     public const KINDS = ['poll', 'lookup', 'rbx', 'pair', 'stream', 'admin'];
+    /** The most streams and frames waits of one party that may be running at once, the ones being superseded included. */
+    public const STREAM_INFLIGHT_MAX = 3;
+    /** A party's bucket of stream opens and frames waits: 10 at once, one more a second. */
+    public const OPEN_BUCKET = 10;
+    public const OPEN_REFILL_PER_S = 1;
 
     private string $dir;
     private Effective $eff;
@@ -43,7 +48,7 @@ final class Holds
      *                               file); N > 0 = at most N at once for the principal, more is 429 rate_limited
      * @return Hold|null null when the pool is too full for this class (the caller degrades to a short poll)
      */
-    public function acquire(string $kind, string $principal, string $class, int $capS, int $perPrincipal = 0): ?Hold
+    public function acquire(string $kind, string $principal, string $class, int $capS, int $perPrincipal = 0, int $maxInFlight = 0): ?Hold
     {
         if (!in_array($kind, self::KINDS, true) || !in_array($class, ['core', 'edge'], true)) {
             throw new \InvalidArgumentException('bad hold');
@@ -88,6 +93,13 @@ final class Holds
             $hold->release();
             throw ApiError::make('rate_limited', 1);
         }
+        // A principal that supersedes its own holds still has every one of them running until it notices, up to about 250 ms each, and
+        // each pins a worker meanwhile: the ones being superseded count here, unlike in the pool's count above. More than $maxInFlight of
+        // them at once is refused, so that one principal opening streams in a burst cannot occupy the pool one dying stream at a time.
+        if ($maxInFlight > 0 && $samePrincipal >= $maxInFlight) {
+            $hold->release();
+            throw new ApiError(429, 'rate_limited', null, 1);
+        }
         $limit = $class === 'core' ? $this->eff->heldHard : $this->eff->heldSoft;
         // A calibration hold is refused only by its per-credential cap: its purpose is to fill the pool and see where it stops.
         if ($kind !== 'admin' && $others >= $limit) {
@@ -95,6 +107,31 @@ final class Holds
             return null;
         }
         return $hold;
+    }
+
+    /**
+     * How many live markers of one kind this principal has right now, superseded ones included: a cheap read of one small folder (no
+     * database), for a request to be refused before it costs anything else.
+     */
+    public function inFlight(string $kind, string $principal): int
+    {
+        if (!in_array($kind, self::KINDS, true)) {
+            throw new \InvalidArgumentException('bad hold');
+        }
+        $pdir = $this->dir . '/' . $kind . '/' . Signals::hash($principal);
+        $n = 0;
+        $now = time();
+        foreach (glob($pdir . '/*') ?: [] as $f) {
+            if (!preg_match('/^(\d{1,4})\.[0-9a-f]{12}$/D', basename($f), $m)) {
+                continue;
+            }
+            $mt = @filemtime($f);
+            if ($mt === false || $mt + (int)$m[1] + 5 < $now || $mt > $now + 60) {
+                continue; // stale (a crashed request's) or from a clock that stepped back: liveMarkers() removes it
+            }
+            $n++;
+        }
+        return $n;
     }
 
     /** How many calibration holds one credential may have at once: about the pool, but never more than 16 and never fewer than 4. */

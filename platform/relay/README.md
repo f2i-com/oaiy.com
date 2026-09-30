@@ -395,7 +395,10 @@ the schema (case-sensitive ids, `MEDIUMTEXT` bodies, strict mode) and of concurr
 The pairing rendezvous and the sealed token (RL-06), and the admission issuer, the Aokie routes and the stream (RL-07) have their
 own tests: every rule of the design's sections 4.10 and 4.14 is named by one, the two are run against fleets of `php -S` servers
 for the races (two responders to one pid, an approval racing a burn, a newer stream replacing an older one within a step, a
-revocation ending a held stream) and against a fake clock for every lifetime, the bearers and credentials are checked against the
+revocation ending a held stream), the pool tests (`tests/cases/pool.php`: a pool of W workers, meaning W `php -S` servers behind
+`tests/pool_front.php`, a front that queues a request until a worker is free as PHP-FPM does, is put in front of the relay while one
+phone opens fifty streams or frames waits at once, and again every two seconds with a new admission each time, on 5 and on 8 workers,
+and `/v1/health` is timed: design 9.2's test; it needs no Python and runs with `--slow`) and against a fake clock for every lifetime, the bearers and credentials are checked against the
 design's vectors and against FormLogic's own known answers, the sealed tokens of a pairing were opened with the Rust `crypto_box` crate 0.9.1 (`fixtures/rust-check`, which also shows that its `unseal` alone does not refuse a small-order ephemeral key), and mutation testing broke the rules that carry safety one at a time (220 changes, 207 caught; the other 13 are equivalent: a second guard makes the first redundant, or the platform's own library refuses the same thing).
 
 **Not run:**

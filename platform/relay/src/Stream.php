@@ -24,6 +24,19 @@ final class Stream
     public const KEEPALIVE_S = 2.0;
     public const COALESCE_MS = 50;
     public const STEP_MS = 200;
+    /**
+     * The step of a hold's first two seconds. A hold that a newer one of its party supersedes ends at its next step, and it is the
+     * newest holds that are superseded (a carrier that reopens), so a burst of opens from one party would pin a worker for a full
+     * step each: with 50 ms in the first two seconds it pins it for a quarter of that, and after them the step is the usual 200 ms.
+     */
+    public const FAST_STEP_MS = 50;
+    public const FAST_FOR_S = 2.0;
+
+    /** How long to sleep before looking again: the fast step while the hold is young, the usual one after. */
+    public static function stepSeconds(float $startedAt): float
+    {
+        return (Clock::mono() - $startedAt < self::FAST_FOR_S ? self::FAST_STEP_MS : self::STEP_MS) / 1000.0;
+    }
     public const PAGE_FRAMES = 128;
     public const PAGE_BYTES = 1048576;
 
@@ -58,6 +71,7 @@ final class Stream
             return $cursor;
         }
         $lastOut = Clock::mono();
+        $startedAt = $lastOut;
         $wakeFile = $ctx->cfg->wakeMode() === 'file';
         $w0 = $wakeFile ? $ctx->signals->wakeRead($f->mailbox) : '';
         $safety = $wakeFile ? $ctx->cfg->wakeSafetyMs() / 1000.0 : 0.5;
@@ -107,7 +121,7 @@ final class Stream
             if ($left <= 0) {
                 break;
             }
-            usleep((int)(min(self::STEP_MS / 1000.0, $left) * 1e6));
+            usleep((int)(min(self::stepSeconds($startedAt), $left) * 1e6));
         }
         $write(self::endEvent($cursor));
         return $cursor;
@@ -137,8 +151,9 @@ final class Stream
         if (function_exists('set_time_limit')) {
             @set_time_limit($seconds + 10);
         }
+        $startedAt = Clock::mono();
         while (Clock::mono() < $deadline) {
-            usleep((int)(min(self::STEP_MS / 1000.0, max(0.0, $deadline - Clock::mono())) * 1e6));
+            usleep((int)(min(self::stepSeconds($startedAt), max(0.0, $deadline - Clock::mono())) * 1e6));
             if ($ctx->signals->isRevoked($f->deviceId)) {
                 throw ApiError::make('revoked');
             }

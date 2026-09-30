@@ -62,11 +62,11 @@ final class AokieRig
     }
 
     /** The verified identity a bearer stands for, as the compatibility routes see it (for tests of the stream itself). */
-    public function facade(string $bearer): \Oaiy\Relay\Facade
+    public function facade(string $bearer, bool $opensHold = false): \Oaiy\Relay\Facade
     {
         $req = new \Oaiy\Relay\Request('GET', self::BASE . 'stream', [], ['REMOTE_ADDR' => '127.0.0.1', 'REQUEST_METHOD' => 'GET', 'HTTP_AUTHORIZATION' => 'Bearer ' . $bearer], '', null);
         $req->client = '127.0.0.1';
-        return \Oaiy\Relay\Facade::identify($this->r->ctx(), $req);
+        return \Oaiy\Relay\Facade::identify($this->r->ctx(), $req, $opensHold);
     }
 
     public function epThumb(): string
