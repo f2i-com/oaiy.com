@@ -230,7 +230,23 @@ struct Marker {
     agent: Option<MarkerAgent>,
     #[serde(default)]
     redo: Vec<String>,
+    /// The staged files that were merged with the file that was here when the restore was prepared (see [`MarkerMerge`]).
+    #[serde(default)]
+    merges: Vec<MarkerMerge>,
     bytes: u64,
+}
+
+/// A staged file that was merged with the file that is here (the calendar, the settings of a phone plugin): what it was merged from,
+/// kept as it came in `<source>/theirs/<name>` with its size and SHA-256, and the SHA-256 of the file that was here (none: there was
+/// none). If that file has changed when the restore is applied, the backup's file is merged again with it (see `merge_again`).
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct MarkerMerge {
+    name: String,
+    theirs_size: u64,
+    theirs_sha256: String,
+    #[serde(default)]
+    here_sha256: Option<String>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -342,6 +358,14 @@ impl Marker {
         }
         for r in &self.removals {
             self.check_name(r, limits)?;
+        }
+        // A file that is merged again is a file of this restore, and only a restore merges (with a name of its own kind).
+        for m in &self.merges {
+            self.check_name(&m.name, limits)?;
+            let category = rules::category_of_backup_entry(&m.name).ok().flatten().map(|(c, _)| c);
+            if self.kind != KIND_RESTORE || !self.files.iter().any(|f| f.name == m.name) || !merged_with_local(&m.name, category) {
+                return Err("the record of the restore is damaged".into());
+            }
         }
         if let Some(agent) = &self.agent {
             if agent.remove.len() > agent::MAX_ADDED || (agent.file != AGENT_RESTORE_FILE && agent.file != AGENT_UNDO_FILE) {
@@ -811,7 +835,7 @@ fn stage_inner(data_dir: &Path, file: &Path, passphrase: &str, ticks: &Ticks, op
         }
         // What can carry more than data is cleaned as it comes in, and the marker records what is there now.
         let names: Vec<String> = selected.iter().filter(|e| e.name != AGENT_ENTRY).map(|e| e.name.clone()).collect();
-        let (kept, mut notes) = clean_staged(data_dir, &root.join("files"), &names, ticks, limits)?;
+        let Cleaned { kept, notes: mut notes, merges } = clean_staged(data_dir, &root.join("files"), &names, ticks, limits)?;
         notes.extend(agent_notes);
         let mut files = Vec::new();
         for name in &kept {
@@ -835,6 +859,7 @@ fn stage_inner(data_dir: &Path, file: &Path, passphrase: &str, ticks: &Ticks, op
                 removals: Vec::new(),
                 agent,
                 redo: clipped(&redo_of(manifest), 50, 400),
+                merges,
                 bytes,
             },
             notes,
@@ -870,10 +895,11 @@ fn stage_inner(data_dir: &Path, file: &Path, passphrase: &str, ticks: &Ticks, op
 /// computer already has, the provider list loses its keys unless they were ticked, the run journal
 /// keeps only runs that finished, and the autostart list keeps only services that have a template
 /// here or in this restore. A file that cannot be cleaned is not brought back. Returns the names that
-/// remain and what was said about the rest.
-pub(crate) fn clean_staged(data_dir: &Path, files_root: &Path, names: &[String], ticks: &Ticks, limits: &Limits) -> Result<(Vec<String>, Vec<String>)> {
+/// remain, what was said about the rest, and the files that were merged with what is here (see [`MarkerMerge`]).
+pub(crate) fn clean_staged(data_dir: &Path, files_root: &Path, names: &[String], ticks: &Ticks, limits: &Limits) -> Result<Cleaned> {
     let mut kept = Vec::new();
     let mut notes = Vec::new();
+    let mut merges: Vec<MarkerMerge> = Vec::new();
     // A staged file is measured before it is read: what a backup declares is checked when it is read, but a file
     // is only ever read whole when it is no larger than the most a file of its kind may be.
     let read = |path: &Path| {
@@ -886,45 +912,22 @@ pub(crate) fn clean_staged(data_dir: &Path, files_root: &Path, names: &[String],
     for name in names {
         let path = container::safe_join(files_root, name, limits)?;
         let category = rules::category_of_backup_entry(name).ok().flatten().map(|(c, _)| c);
-        // The file this computer has under that name, when it is JSON of a size that is read.
-        let local_of = |name: &str| {
-            let here = data_dir.join(native(name));
-            std::fs::metadata(&here)
-                .ok()
-                .filter(|m| m.len() <= limits.max_json_bytes)
-                .and_then(|_| std::fs::read(&here).ok())
-                .and_then(|b| serde_json::from_slice::<serde_json::Value>(b.strip_prefix(&[0xef, 0xbb, 0xbf][..]).unwrap_or(&b)).ok())
-        };
         let cleaned: Option<std::result::Result<Vec<u8>, String>> = match (category, name.as_str()) {
-            // The calendar: the typed values that carry no words come back, and the words only with their tick; an
-            // appointment that is here is never lost (see `sanitize::calendar_merge`).
-            (Some(Category::Calendar), _) => {
-                let local = local_of(name);
+            // The calendar, and a settings file with a key table, are put into the file this computer has (see `merge_file`).
+            (Some(_), _) if merged_with_local(name, category) => {
+                let (local, here) = (local_json(data_dir, name, limits), here_state(data_dir, name));
                 Some(read(&path).and_then(|b| {
-                    let staged: serde_json::Value = serde_json::from_slice(b.strip_prefix(&[0xef, 0xbb, 0xbf][..]).unwrap_or(&b)).map_err(|_| "it is not valid JSON".to_string())?;
-                    let merged = super::sanitize::calendar_merge(local.as_ref(), &staged, ticks)?;
-                    notes.extend(merged.notes.into_iter().map(|n| format!("{name}: {n}")));
-                    Ok(merged.bytes)
-                }))
-            }
-            // A settings file with a key table: what the table lets through (the keys that cannot act, and those
-            // whose tick was ticked) is put into the file this computer has, and everything else stays as it is here.
-            (Some(_), _) if rules::keys_of(name).is_some() => {
-                let keys_name = rules::keys_of(name).unwrap_or_default();
-                let local = local_of(name);
-                Some(read(&path).and_then(|b| {
-                    let staged: serde_json::Value = serde_json::from_slice(b.strip_prefix(&[0xef, 0xbb, 0xbf][..]).unwrap_or(&b)).map_err(|_| "it is not valid JSON".to_string())?;
-                    let table = super::table::table().key_table(keys_name).ok_or_else(|| "OAIY does not know how to read it".to_string())?;
-                    let found = super::table::filter_json(table, &staged, &|row| row.class == super::table::Class::Data || row.tick.is_some_and(|t| ticks.has(t)));
-                    let left = found.left.iter().map(|l| l.path.as_str()).collect::<HashSet<_>>().len() + found.left_more;
-                    if found.kept.is_empty() {
-                        // Nothing in it may come back (as ticked): the file that is here is left exactly as it is.
-                        return Err(format!("nothing in it comes back without its tick ({left} setting{} left out)", if left == 1 { "" } else { "s" }));
+                    let (bytes, more) = merge_file(name, local.as_ref(), &b, ticks)?;
+                    notes.extend(more);
+                    // What it was merged from is kept as it came, so that it can be merged again with what is here when it is applied.
+                    let theirs = files_root.parent().unwrap_or(files_root).join("theirs").join(native(name));
+                    if let Some(parent) = theirs.parent() {
+                        secret_file::create_private_dir(parent).map_err(|e| e.to_string())?;
                     }
-                    if left > 0 {
-                        notes.push(format!("{name}: {left} setting{} not brought back (addresses, switches that grant access, PINs and anything not in the table are never restored; the rest need their tick).", if left == 1 { " was" } else { "s were" }));
-                    }
-                    serde_json::to_vec_pretty(&super::table::merge_into_local(local.as_ref(), &found)).map_err(|_| "it could not be written".to_string())
+                    secret_file::write(&theirs, &b).map_err(|e| e.to_string())?;
+                    let (theirs_sha256, theirs_size) = sha256_file(&theirs).map_err(|e| e.to_string())?;
+                    merges.push(MarkerMerge { name: name.clone(), theirs_size, theirs_sha256, here_sha256: here });
+                    Ok(bytes)
                 }))
             }
             (Some(Category::Providers), _) if !ticks.keys => Some(read(&path).and_then(|b| {
@@ -1008,7 +1011,124 @@ pub(crate) fn clean_staged(data_dir: &Path, files_root: &Path, names: &[String],
             }
         }
     }
-    Ok((kept, notes))
+    merges.retain(|m| kept.contains(&m.name));
+    Ok(Cleaned { kept, notes, merges })
+}
+
+/// What [`clean_staged`] leaves: the names that come back, what was said, and the files that were merged with what is here.
+pub(crate) struct Cleaned {
+    pub(crate) kept: Vec<String>,
+    pub(crate) notes: Vec<String>,
+    merges: Vec<MarkerMerge>,
+}
+
+/// Whether the file `name` of a backup is put into the file this computer has (the calendar, and a settings file with a key table),
+/// instead of taking its place.
+fn merged_with_local(name: &str, category: Option<Category>) -> bool {
+    category == Some(Category::Calendar) || rules::keys_of(name).is_some()
+}
+
+/// The file this computer has under `name`, when it is JSON of a size that is read.
+fn local_json(data_dir: &Path, name: &str, limits: &Limits) -> Option<serde_json::Value> {
+    let here = data_dir.join(native(name));
+    std::fs::metadata(&here)
+        .ok()
+        .filter(|m| m.len() <= limits.max_json_bytes)
+        .and_then(|_| std::fs::read(&here).ok())
+        .and_then(|b| serde_json::from_slice::<serde_json::Value>(b.strip_prefix(&[0xef, 0xbb, 0xbf][..]).unwrap_or(&b)).ok())
+}
+
+/// The state of the file this computer has under `name`: the SHA-256 of a plain file, none when there is none (or it is not a plain file).
+fn here_state(data_dir: &Path, name: &str) -> Option<String> {
+    let here = data_dir.join(native(name));
+    if !std::fs::symlink_metadata(&here).ok()?.is_file() {
+        return None;
+    }
+    sha256_file(&here).ok().map(|(sha, _)| sha)
+}
+
+/// The backup's file `theirs` put into the file that is here (`local`, when it is JSON of a size that is read): the calendar merged
+/// appointment by appointment (see `sanitize::calendar_merge`), a settings file with a key table key by key: what the table lets
+/// through (the keys that cannot act, and those whose tick was ticked) goes into the file this computer has, and everything else
+/// stays as it is here. Returns the bytes that are to be in place and what was said of them (each note begins with the name).
+/// `Err` says why nothing of it may come back.
+fn merge_file(name: &str, local: Option<&serde_json::Value>, theirs: &[u8], ticks: &Ticks) -> std::result::Result<(Vec<u8>, Vec<String>), String> {
+    let staged: serde_json::Value = serde_json::from_slice(theirs.strip_prefix(&[0xef, 0xbb, 0xbf][..]).unwrap_or(theirs)).map_err(|_| "it is not valid JSON".to_string())?;
+    let category = rules::category_of_backup_entry(name).ok().flatten().map(|(c, _)| c);
+    if category == Some(Category::Calendar) {
+        let merged = super::sanitize::calendar_merge(local, &staged, ticks)?;
+        return Ok((merged.bytes, merged.notes.into_iter().map(|n| format!("{name}: {n}")).collect()));
+    }
+    let keys_name = rules::keys_of(name).ok_or_else(|| "OAIY does not know how to read it".to_string())?;
+    let table = super::table::table().key_table(keys_name).ok_or_else(|| "OAIY does not know how to read it".to_string())?;
+    let found = super::table::filter_json(table, &staged, &|row| row.class == super::table::Class::Data || row.tick.is_some_and(|t| ticks.has(t)));
+    let left = found.left.iter().map(|l| l.path.as_str()).collect::<HashSet<_>>().len() + found.left_more;
+    if found.kept.is_empty() {
+        // Nothing in it may come back (as ticked): the file that is here is left exactly as it is.
+        return Err(format!("nothing in it comes back without its tick ({left} setting{} left out)", if left == 1 { "" } else { "s" }));
+    }
+    let mut notes = Vec::new();
+    if left > 0 {
+        notes.push(format!("{name}: {left} setting{} not brought back (addresses, switches that grant access, PINs and anything not in the table are never restored; the rest need their tick).", if left == 1 { " was" } else { "s were" }));
+    }
+    let bytes = serde_json::to_vec_pretty(&super::table::merge_into_local(local, &found)).map_err(|_| "it could not be written".to_string())?;
+    Ok((bytes, notes))
+}
+
+/// A restore is applied to the files that are here when it is applied. What was merged with a file that is here when the restore was
+/// prepared (the calendar takes bookings, the phone plugin's settings are changed) is merged again with that file if it changed since,
+/// from what the backup held (kept as it came, and held to its size and SHA-256), so that nothing done in the hours between is lost.
+/// The staged file and the marker are updated (and the marker is written again) before anything is put in place. `Err` says why
+/// nothing may be applied.
+fn merge_again(data_dir: &Path, marker: &mut Marker, limits: &Limits) -> std::result::Result<(), String> {
+    if marker.merges.is_empty() {
+        return Ok(());
+    }
+    let ticks = Ticks::from_ids(&marker.ticked, marker.keys).map_err(|e| e.message)?;
+    let root = restore_dir(data_dir).join(&marker.source);
+    let mut changed = false;
+    for m in marker.merges.clone() {
+        let here = here_state(data_dir, &m.name);
+        if here == m.here_sha256 {
+            continue;
+        }
+        changed = true;
+        let theirs = root.join("theirs").join(native(&m.name));
+        let meta = std::fs::symlink_metadata(&theirs).map_err(|_| "A staged file is missing, so nothing was changed.".to_string())?;
+        if !meta.is_file() || meta.len() != m.theirs_size {
+            return Err("A staged file is not what was staged, so nothing was changed.".into());
+        }
+        if !matches!(sha256_file(&theirs), Ok((sha, _)) if sha == m.theirs_sha256) {
+            return Err("A staged file does not check out, so nothing was changed.".into());
+        }
+        let bytes = std::fs::read(&theirs).map_err(|_| "A staged file could not be read, so nothing was changed.".to_string())?;
+        let staged = container::safe_join(&root.join("files"), &m.name, limits).map_err(|e| e.message)?;
+        // What was said about this file when it was prepared is said again from what is here now.
+        marker.notes.retain(|n| !n.starts_with(&format!("{}: ", m.name)));
+        match merge_file(&m.name, local_json(data_dir, &m.name, limits).as_ref(), &bytes, &ticks) {
+            Ok((merged, more)) => {
+                secret_file::write(&staged, merged).map_err(|e| format!("Could not merge a staged file again ({e})."))?;
+                let (sha256, size) = sha256_file(&staged).map_err(|e| format!("Could not read a staged file ({e})."))?;
+                if let Some(f) = marker.files.iter_mut().find(|f| f.name == m.name) {
+                    f.sha256 = sha256;
+                    f.size = size;
+                }
+                marker.notes.push(review::clip(&format!("{}: it changed after this restore was prepared, so it was merged again with what is there now.", m.name), 400));
+                marker.notes.extend(more.iter().map(|n| review::clip(n, 400)));
+            }
+            // (What the backup holds is what it held when the restore was prepared, and it was merged then: this is reached only by
+            // a file that is not the one that was staged, or a table that has changed since.)
+            Err(why) => return Err(format!("{} could not be merged with what is there now ({why}), so nothing was changed.", m.name)),
+        }
+        if let Some(entry) = marker.merges.iter_mut().find(|e| e.name == m.name) {
+            entry.here_sha256 = here;
+        }
+    }
+    marker.notes.truncate(50);
+    if changed {
+        write_json(&marker_path(data_dir), marker).map_err(|e| format!("Could not record the restore again ({e})."))?;
+    }
+    Ok(())
 }
 
 /// Cancel a staged restore: the marker and, for a restore, its staged files. An undo snapshot is not touched.
@@ -1120,6 +1240,7 @@ pub fn stage_undo(data_dir: &Path, opts: &RestoreOptions) -> Result<Staged> {
         removals: record.added.clone(),
         agent,
         redo: Vec::new(),
+        merges: Vec::new(),
         bytes,
     };
     write_json(&marker_path(data_dir), &marker).map_err(|e| BackupError::io("Could not record the undo", &e))?;
@@ -1387,6 +1508,14 @@ pub fn apply_pending(data_dir: &Path) -> ApplyOutcome {
             return conclude_stuck(data_dir, &marker, "The restore was interrupted part-way.", &stuck, &holding);
         }
         let last = failed(&marker.id, &marker.kind, "The restore was interrupted part-way, so everything it had changed was put back.");
+        return conclude_failed(data_dir, &marker, last);
+    }
+
+    // The calendar and the settings that were merged with what was here when the restore was prepared are merged again if what is here
+    // has changed since (a booking taken in the hours between, a setting changed): the restore is applied to what is here now.
+    let mut marker = marker;
+    if let Err(why) = merge_again(data_dir, &mut marker, &limits) {
+        let last = failed(&marker.id, &marker.kind, &why);
         return conclude_failed(data_dir, &marker, last);
     }
 

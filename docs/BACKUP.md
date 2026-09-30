@@ -458,6 +458,13 @@ A restore is never done in place. It has three steps, and the first two change n
    is not applied within 24 hours is thrown away at the next start**, unapplied, and the result
    says so: what it would replace may have changed, and you may no longer remember choosing it.
    Until then Settings shows it, with how long it has waited and when it lapses.
+   **What is merged is merged again when it is applied.** The calendar (appointment by appointment)
+   and the settings of a phone plugin (key by key) are put into the file that is here, so preparing
+   merges them with the file as it is then, and the marker keeps the backup's file as it came (in
+   `pending-<id>/theirs/`, held to its size and SHA-256) with the SHA-256 of the file that was here.
+   If that file has changed by the time the restore is applied (a booking taken, a setting changed,
+   in the hours between), the backup's file is merged with what is there then, before anything is put
+   in place, and the result says so. A copy that does not check out stops the restore, with nothing changed.
 3. **Restart to finish restoring.** At the next start, before any part of OAIY opens its data,
    each staged file is put in place with an atomic rename. The file it replaces is not copied but
    **moved** into `<data>/restore/undo-<id>/`, so what is saved is exactly what was replaced,

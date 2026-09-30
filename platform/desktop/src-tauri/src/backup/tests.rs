@@ -3170,6 +3170,103 @@ fn the_numbers_not_to_be_contacted_are_cut_to_entries_of_the_shape_the_agent_wri
     assert!(clean_do_not_contact(&serde_json::json!({ "not": "a list" })).is_none());
 }
 
+/// The reviewer's x1: the calendar and the settings of a phone plugin are merged with what is here when the restore is prepared, and
+/// the restart that applies it can be up to a day later. A booking taken in between, or a setting changed, was in the undo copy only.
+/// What was merged is merged again with what is here when the restore is applied.
+#[test]
+fn a_booking_taken_and_a_setting_changed_after_the_restore_was_prepared_are_kept() {
+    let out = TempDir::new("remerge-out");
+    let theirs_settings = serde_json::json!({ "settings": { "bargeSensitivity": 200 } }).to_string();
+    let files: Vec<(&str, &[u8])> = vec![("calendar/calendar.json", HOSTILE_CALENDAR.as_bytes()), ("plugin-data/aokie/settings.json", theirs_settings.as_bytes())];
+    let file = out.0.join("c.oaiybackup");
+    craft(&file, &manifest_for(&files), &files, true);
+    let late = serde_json::json!({ "id": "appt_late", "service": "Lawn mowing", "start": "2026-10-09T10:00", "minutes": 30, "status": "confirmed", "name": "Late Booker", "phone": "0491 570 156", "notes": "", "source": "call", "createdAt": "2026-09-30T00:00:00Z", "updatedAt": "2026-09-30T00:00:00Z" });
+    for (what, ticks) in [("nothing ticked", Ticks::none()), ("everything ticked", Ticks::all())] {
+        let dst = TempDir::new("remerge-dst");
+        put(&dst.0, "calendar/calendar.json", calendar_text("mine"));
+        put(&dst.0, "plugin-data/aokie/settings.json", serde_json::json!({ "settings": { "greeting": "Hello", "autoAnswer": false }, "preferredDongle": "usb-1" }).to_string());
+        restore::stage(&dst.0, &file, PASS, &ticks, &options()).unwrap();
+        // After Prepare, and before the restart: the receptionist takes a booking, and the owner changes the greeting.
+        let mut live = json_of(&dst.0, "calendar/calendar.json");
+        live["appointments"].as_array_mut().unwrap().push(late.clone());
+        live["appointments"].as_array_mut().unwrap().retain(|a| a["id"] != "appt_2");
+        put(&dst.0, "calendar/calendar.json", live.to_string());
+        put(&dst.0, "plugin-data/aokie/settings.json", serde_json::json!({ "settings": { "greeting": "Changed after Prepare", "autoAnswer": true }, "preferredDongle": "usb-1" }).to_string());
+        let before_apply = snapshot(&dst.0);
+        assert!(matches!(restore::apply_pending(&dst.0), ApplyOutcome::Applied(_)), "{what}");
+        let ids: Vec<String> = json_of(&dst.0, "calendar/calendar.json")["appointments"].as_array().unwrap().iter().map(|a| a["id"].as_str().unwrap().to_string()).collect();
+        assert!(ids.iter().any(|i| i == "appt_late"), "{what}: the booking made after Prepare is still there: {ids:?}");
+        assert!(ids.iter().any(|i| i == "appt_1"), "{what}: {ids:?}");
+        assert!(!ids.iter().any(|i| i == "appt_2"), "{what}: one taken away after Prepare stays taken away: {ids:?}");
+        assert_eq!(read_calendar(&dst.0).get("appt_late").map(|a| a.name.clone()).as_deref(), Some("Late Booker"), "{what}: the calendar module reads it");
+        let last = restore::last_restore(&dst.0).unwrap();
+        assert!(last.notes.iter().any(|n| n.starts_with("calendar/calendar.json: it changed after this restore was prepared")), "{what}: {:?}", last.notes);
+        if ticks == Ticks::all() {
+            let settings = json_of(&dst.0, "plugin-data/aokie/settings.json");
+            assert_eq!(settings["settings"]["greeting"], "Changed after Prepare", "{what}: a setting changed after Prepare stays changed: {settings}");
+            assert_eq!(settings["settings"]["autoAnswer"], true, "{what}");
+            assert_eq!(settings["settings"]["bargeSensitivity"], 200, "{what}: and what the backup brings comes");
+            assert_eq!(settings["preferredDongle"], "usb-1", "{what}");
+            assert!(last.notes.iter().any(|n| n.starts_with("plugin-data/aokie/settings.json: it changed after this restore was prepared")), "{what}: {:?}", last.notes);
+            let ids_after_hostile = json_of(&dst.0, "calendar/calendar.json");
+            assert!(ids_after_hostile["appointments"].as_array().unwrap().iter().any(|a| a["id"] == "evil_1"), "{what}: and the backup's appointment comes with its tick");
+        }
+        // The undo takes what was here when the restore was applied back, the booking included.
+        restore::stage_undo(&dst.0, &options()).unwrap();
+        assert!(matches!(restore::apply_pending(&dst.0), ApplyOutcome::Applied(_)), "{what}");
+        assert_eq!(json_of(&dst.0, "calendar/calendar.json"), serde_json::from_slice::<serde_json::Value>(before_apply.get("calendar/calendar.json").unwrap()).unwrap(), "{what}: the undo puts the calendar back as it was");
+    }
+}
+
+/// A restore whose files have not changed since it was prepared is applied as it was prepared, with nothing merged again; and what
+/// it was merged from is held to what it was.
+#[test]
+fn what_is_merged_again_is_only_what_changed_and_is_held_to_what_the_backup_held() {
+    let out = TempDir::new("remerge-only-out");
+    let files: Vec<(&str, &[u8])> = vec![("calendar/calendar.json", HOSTILE_CALENDAR.as_bytes())];
+    let file = out.0.join("c.oaiybackup");
+    craft(&file, &manifest_for(&files), &files, true);
+    // Nothing changed: applied as prepared, and nothing is said of a merge.
+    let dst = TempDir::new("remerge-only-dst");
+    put(&dst.0, "calendar/calendar.json", calendar_text("mine"));
+    restore::stage(&dst.0, &file, PASS, &ticks_of(&[RestoreClass::Calendar], false), &options()).unwrap();
+    let marker_before = fs::read(dst.0.join("restore").join("pending.json")).unwrap();
+    assert!(matches!(restore::apply_pending(&dst.0), ApplyOutcome::Applied(_)));
+    assert!(!restore::last_restore(&dst.0).unwrap().notes.iter().any(|n| n.contains("merged again")));
+    let _ = marker_before;
+    // The calendar is not there when the restore is applied (removed after Prepare): the backup's is merged into an empty one.
+    let dst = TempDir::new("remerge-only-gone");
+    put(&dst.0, "calendar/calendar.json", calendar_text("mine"));
+    restore::stage(&dst.0, &file, PASS, &ticks_of(&[RestoreClass::Calendar], false), &options()).unwrap();
+    fs::remove_file(dst.0.join("calendar/calendar.json")).unwrap();
+    assert!(matches!(restore::apply_pending(&dst.0), ApplyOutcome::Applied(_)));
+    let got = json_of(&dst.0, "calendar/calendar.json");
+    assert!(got["appointments"].as_array().unwrap().iter().any(|a| a["id"] == "evil_1"));
+    assert!(crate::calendar::is_readable(&got.to_string()));
+    // What it was merged from is what the backup held: a copy that was swapped is not merged.
+    let dst = TempDir::new("remerge-only-swapped");
+    put(&dst.0, "calendar/calendar.json", calendar_text("mine"));
+    let staged = restore::stage(&dst.0, &file, PASS, &ticks_of(&[RestoreClass::Calendar], false), &options()).unwrap();
+    let mut live = json_of(&dst.0, "calendar/calendar.json");
+    live["settings"]["business"] = serde_json::json!("Changed");
+    put(&dst.0, "calendar/calendar.json", live.to_string());
+    let theirs = dst.0.join("restore").join(format!("pending-{}", staged.id)).join("theirs").join("calendar").join("calendar.json");
+    assert!(theirs.is_file(), "the backup's file is kept as it came");
+    fs::write(&theirs, br#"{"settings":{"business":"Swapped in"}}"#).unwrap();
+    let before = snapshot(&dst.0);
+    let ApplyOutcome::Failed(last) = restore::apply_pending(&dst.0) else { panic!("refused") };
+    assert!(last.error.as_deref().unwrap().contains("nothing was changed"), "{last:?}");
+    assert_eq!(snapshot(&dst.0), before, "nothing was changed");
+    // And the marker of a restore that merges names only files of its kind.
+    let (dst, _, _) = staged_with_agent_part("remerge-marker");
+    let marker_path = dst.0.join("restore").join("pending.json");
+    let mut marker: serde_json::Value = serde_json::from_slice(&fs::read(&marker_path).unwrap()).unwrap();
+    marker["merges"] = serde_json::json!([{ "name": "callers.json", "theirsSize": 1, "theirsSha256": "00", "hereSha256": null }]);
+    fs::write(&marker_path, marker.to_string()).unwrap();
+    let ApplyOutcome::Failed(last) = restore::apply_pending(&dst.0) else { panic!("a damaged record is refused") };
+    assert!(last.error.as_deref().unwrap().contains("damaged"), "{last:?}");
+}
+
 /// What the calendar table lets through is a calendar the calendar module reads, at the edge of every limit and with every choice.
 /// (`calendar_merge` checks its result with the module as a last resort; this is what makes that check a backstop that cannot be
 /// reached while the table and the module agree, and fails here the day they do not.)
@@ -5139,7 +5236,7 @@ fn a_staged_file_larger_than_its_kind_may_be_is_left_out_without_being_read() {
     put(&files, "callers.json", b"{}");
     let names = vec!["calendar/calendar.json".to_string(), "callers.json".to_string()];
     let (result, peak, _) = peak::measured(|| restore::clean_staged(&root.0, &files, &names, &Ticks::all(), &Limits::default()));
-    let (kept, notes) = result.unwrap();
+    let (kept, notes) = { let cleaned = result.unwrap(); (cleaned.kept, cleaned.notes) };
     assert_eq!(kept, ["callers.json"]);
     assert!(notes.iter().any(|n| n.contains("calendar/calendar.json") && n.contains("too large")), "{notes:?}");
     assert!(peak < 8 * MIB, "{} MiB", peak / MIB);
