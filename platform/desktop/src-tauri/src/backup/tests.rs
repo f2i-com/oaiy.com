@@ -8140,7 +8140,8 @@ fn a_backup_of_two_thousand_long_flows_makes_a_preview_of_a_few_megabytes_and_a_
     let out = TempDir::new("two-thousand-flows");
     let file = out.0.join("f.oaiybackup");
     craft(&file, &manifest_for(&refs), &refs, true);
-    let preview = restore::inspect(&TempDir::new("two-thousand-flows-dst").0, &file, PASS, &options()).unwrap();
+    let dst = TempDir::new("two-thousand-flows-dst");
+    let (preview, seen) = restore::inspect_bound(&dst.0, &file, PASS, &options()).unwrap();
     let said: usize = preview.items.iter().map(|i| i.what.len()).sum();
     let json = serde_json::to_string(&preview).unwrap().len();
     assert!(said <= MOST_PREVIEW_BYTES, "what the things say together is held to the most: {said}");
@@ -8153,6 +8154,120 @@ fn a_backup_of_two_thousand_long_flows_makes_a_preview_of_a_few_megabytes_and_a_
     let trigger = preview.items.iter().find(|i| i.kind == "trigger").expect("the small thing is listed");
     assert!(trigger.what.contains("Runs the flow \"f\""), "a small thing is described in full: {}", trigger.what);
     println!("two thousand long flows: what they say {said} bytes, the preview {json} bytes, {named} named and not described");
+    // What the preview only named is not brought back: a restore brings back what the person was told of when they ticked it, and they were not
+    // told of these. The others, and the trigger, come back.
+    let only_named: Vec<&str> = preview.items.iter().filter(|i| i.what.starts_with("Named and not described")).map(|i| i.name.as_str()).collect();
+    assert_eq!(seen.not_described.iter().map(String::as_str).collect::<std::collections::BTreeSet<_>>(), only_named.iter().copied().collect::<std::collections::BTreeSet<_>>(), "the look records what it only named");
+    assert!(seen.restorable.is_superset(&seen.not_described), "(they were listed: the look says what it did not describe)");
+    let staged = restore::stage_checked(&dst.0, &file, PASS, &ticks_of(&[RestoreClass::Flows], false), &options(), &seen).unwrap();
+    assert!(staged.skipped.iter().any(|n| n.starts_with(&format!("Not brought back: {named} files that the dry run named and did not describe"))), "{:?}", staged.skipped.iter().take(4).collect::<Vec<_>>());
+    assert!(matches!(restore::apply_pending(&dst.0), ApplyOutcome::Applied(_)));
+    let came: usize = fs::read_dir(dst.0.join("flows")).unwrap().count();
+    assert_eq!(came, 1999 - named, "only the flows the dry run described come back");
+    assert!(only_named.iter().all(|n| !dst.0.join(n).exists()), "a flow that was only named is not here");
+    assert!(dst.0.join("triggers.json").exists(), "the trigger that was described is");
+}
+
+/// A template past the four hundred the preview describes in full is named and not described, and a restore that was ticked for templates does not
+/// bring it back (nor the service that starts with OAIY for want of it): the person was told of four hundred.
+#[test]
+fn a_template_the_dry_run_only_named_is_not_brought_back_and_nor_is_the_service_that_starts_for_want_of_it() {
+    let template = |i: usize| serde_json::json!({ "id": format!("t{i:03}"), "name": format!("T{i}"), "run": { "command": "c" } }).to_string();
+    let mut owned: Vec<(String, String)> = (0..403).map(|i| (format!("templates/t{i:03}.json"), template(i))).collect();
+    owned.push(("services-autostart.json".to_string(), serde_json::json!(["t000", "t402"]).to_string()));
+    let refs: Vec<(&str, &[u8])> = owned.iter().map(|(n, text)| (n.as_str(), text.as_bytes())).collect();
+    let out = TempDir::new("named-templates");
+    let file = out.0.join("t.oaiybackup");
+    craft(&file, &manifest_for(&refs), &refs, true);
+    let dst = TempDir::new("named-templates-dst");
+    let (preview, seen) = restore::inspect_bound(&dst.0, &file, PASS, &options()).unwrap();
+    assert_eq!(preview.items.iter().filter(|i| i.kind == "template").count(), 400);
+    let named: Vec<&str> = seen.not_described.iter().map(String::as_str).collect();
+    assert_eq!(named, ["templates/t400.json", "templates/t401.json", "templates/t402.json"]);
+    assert!(preview.items.iter().any(|i| i.name == "templates/t401.json" && i.what.contains("is NOT brought back")), "the dry run says so");
+    // Not ticked, nothing of them; ticked, the four hundred and not the three.
+    let staged = restore::stage_checked(&dst.0, &file, PASS, &ticks_of(&[RestoreClass::Templates], false), &options(), &seen).unwrap();
+    assert!(staged.skipped.iter().any(|n| n.starts_with("Not brought back: 3 files that the dry run named and did not describe") && n.contains("templates/t401.json")), "{:?}", staged.skipped);
+    assert!(matches!(restore::apply_pending(&dst.0), ApplyOutcome::Applied(_)));
+    assert_eq!(fs::read_dir(dst.0.join("templates")).unwrap().count(), 400);
+    for gone in ["t400", "t401", "t402"] {
+        assert!(!dst.0.join("templates").join(format!("{gone}.json")).exists(), "{gone} is not here");
+    }
+    assert!(dst.0.join("templates").join("t399.json").exists());
+    let autostart: Vec<String> = serde_json::from_slice(&fs::read(dst.0.join("services-autostart.json")).unwrap()).unwrap_or_default();
+    assert_eq!(autostart, ["t000"], "a service is not set to start with a template that did not come back");
+}
+
+/// The same for the Agent's campaigns past the fifty that are described in full: the page is handed the fifty, and says of the rest that it did not bring them.
+#[test]
+fn a_campaign_the_dry_run_only_named_is_not_handed_to_the_agents_page() {
+    let campaign = |i: usize| serde_json::json!({ "id": format!("c{i:03}"), "kind": "text", "name": format!("C{i}"), "state": "paused", "textTemplate": "hi", "people": [{ "id": "p1", "name": "A", "number": "+61491570006", "state": "queued" }] });
+    let entries: Vec<(String, Vec<u8>)> = (0..53).map(|i| (format!("opfs/front-desk/outreach/c{i:03}.json"), campaign(i).to_string().into_bytes())).collect();
+    let refs: Vec<(&str, &[u8])> = entries.iter().map(|(n, b)| (n.as_str(), b.as_slice())).collect();
+    let src = TempDir::new("named-campaigns-src");
+    let out = TempDir::new("named-campaigns-out");
+    let file = backup_with_agent(&src.0, &out.0, "c.oaiybackup", agent_archive(&refs), false);
+    let dst = TempDir::new("named-campaigns-dst");
+    let (preview, seen) = restore::inspect_bound(&dst.0, &file, PASS, &options()).unwrap();
+    assert_eq!(preview.items.iter().filter(|i| i.kind == "campaign").count(), 50);
+    assert_eq!(seen.not_described.len(), 3, "{:?}", seen.not_described);
+    assert!(seen.not_described.iter().all(|n| n.starts_with(&format!("{AGENT_ENTRY}#opfs/front-desk/outreach/c05"))), "{:?}", seen.not_described);
+    let staged = restore::stage_checked(&dst.0, &file, PASS, &ticks_of(&[RestoreClass::Outreach], false), &options(), &seen).unwrap();
+    assert!(matches!(restore::apply_pending(&dst.0), ApplyOutcome::Applied(_)));
+    let items = zip_items(&handed_over(&dst.0));
+    assert_eq!(items.keys().filter(|n| n.contains("/outreach/c")).count(), 50, "{:?}", items.keys().collect::<Vec<_>>());
+    for gone in ["c050", "c051", "c052"] {
+        assert!(!items.contains_key(&format!("opfs/front-desk/outreach/{gone}.json")), "{gone} is not handed over");
+        assert!(staged.skipped.iter().any(|n| n.contains(gone) && n.contains("not brought back: the dry run named it")), "{gone} is said: {:?}", staged.skipped.iter().take(6).collect::<Vec<_>>());
+    }
+    assert!(items.contains_key("opfs/front-desk/outreach/c049.json") && items.contains_key("opfs/front-desk/outreach/c000.json"));
+}
+
+/// A file comes back whole or not at all: when what is said of one thing in it had no room, what is said of the others in it is that they are not brought
+/// back either, and the file is not (a file of triggers or settings has many things). A thing made of no entry of the backup is never cut for room.
+#[test]
+fn what_else_is_in_a_file_with_a_thing_that_was_only_named_is_not_brought_back_with_it() {
+    use super::parts::{cap, Parts, MOST_PREVIEW_BYTES};
+    let padded = |name: &str, hook: bool| {
+        let mut parts = Parts::new("flow")
+            .fixed("steps", "s".repeat(80))
+            .fixed("tool", "t".repeat(200))
+            .fixed("tool-description", "d".repeat(400))
+            .fixed("tool-inputs", "i".repeat(720));
+        if hook {
+            parts = parts.fixed("hook", "h".repeat(240));
+        }
+        parts.sample("kinds", "k".repeat(620)).item(RestoreClass::Flows, name, name)
+    };
+    let flow = |entry: &str, name: &str, hook: bool| padded(name, hook).from_entry(entry);
+    // A thousand two hundred things of a thousand two hundred files, and one file of two: the longest thing is in the two.
+    let mut items: Vec<review::ReviewItem> = (0..1200).map(|i| flow(&format!("flows/f{i}.json"), &format!("flows/f{i}.json"), false)).collect();
+    items.push(flow("triggers.json", "triggers.json: the long one", true));
+    items.push(flow("triggers.json", "triggers.json: the other long one", true));
+    items.push(Parts::new("trigger").fixed("mode", "async").item(RestoreClass::Flows, "triggers.json: the short one", "short").from_entry("triggers.json"));
+    // (One as long as the longest that is made of no entry: what is not made of an entry of the backup is not one a restore could leave out.)
+    items.push(padded("no entry", true));
+    let total: usize = items.iter().map(|i| i.what.len()).sum();
+    assert!(total > MOST_PREVIEW_BYTES, "the things say more than a preview holds: {total}");
+    let capped = cap(items);
+    assert!(capped.items.iter().map(|i| i.what.len()).sum::<usize>() <= MOST_PREVIEW_BYTES);
+    let by_name = |name: &str| capped.items.iter().find(|i| i.name == name).unwrap();
+    assert!(by_name("triggers.json: the long one").what.starts_with("Named and not described: it says "), "the longest is named first");
+    for other in ["triggers.json: the other long one", "triggers.json: the short one"] {
+        let said = &by_name(other).what;
+        assert!(said.starts_with("Named and not described: it is in a file with something") && said.ends_with("so the file is NOT brought back."), "{other}: {said}");
+    }
+    assert!(capped.not_brought_back.contains("triggers.json"), "{:?}", capped.not_brought_back.iter().take(3).collect::<Vec<_>>());
+    assert!(!by_name("no entry").what.starts_with("Named and not described") && by_name("no entry").what.len() > 2000, "a thing of no entry is not cut for room");
+    let named_flows = capped.items.iter().filter(|i| i.name.starts_with("flows/") && i.what.starts_with("Named and not described")).count();
+    assert_eq!(capped.not_brought_back.len(), named_flows + 1, "the entries of what was named, and no more");
+    // The same for a kind that is limited (a template past four hundred) that shares its entry with another thing.
+    let template = |i: usize| Parts::new("template").fixed("runs", "c").item(RestoreClass::Templates, &format!("templates/t{i}.json"), "t").from_entry(&format!("templates/t{i}.json"));
+    let mut items: Vec<review::ReviewItem> = (0..401).map(template).collect();
+    items.push(Parts::new("flow").fixed("steps", "2 steps").item(RestoreClass::Flows, "with the last template", "f").from_entry("templates/t400.json"));
+    let capped = cap(items);
+    assert!(capped.items[400].what.contains("NOT brought back") && capped.items[401].what.starts_with("Named and not described: it is in a file with something") && capped.items[401].what.ends_with("so the file is NOT brought back."), "{:?}", capped.items[401].what);
+    assert_eq!(capped.not_brought_back.iter().map(String::as_str).collect::<Vec<_>>(), ["templates/t400.json"]);
 }
 
 /// An address written `//host/path` is an address to the host, and what is not one says so: the hosts a connector sends to are counted by the

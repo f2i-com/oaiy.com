@@ -738,6 +738,12 @@ a thing does:
   things of a preview say at most 2 MiB together**: past it the longest are named and not described,
   longest first, each with how long it was, so that a backup of two thousand flows as long as a flow
   may be is a preview of a few megabytes, and a small thing beside them is still described in full.
+  **What is only named is not brought back.** A restore brings back what the person was told of when they
+  ticked it, and a thing the preview had no room for is one they were not told of: the look records the
+  files (and the Agent's items) it only named, and preparing the restore leaves them out and says which,
+  with the same rule for a file that holds several things (triggers, settings): if one of them was only
+  named, the file is not brought back, and the others in it are named as such. A service that starts with
+  OAIY for want of a template that did not come back is not set to start.
 - **The characters you cannot see are made visible**, wherever the dry run prints a value: a run of
   them is said as what it is and how many there are (`[25 invisible characters: U+E0041 ...]`),
   by the desktop before the text is counted and cut, and again by the dashboard on every text of a
@@ -811,7 +817,7 @@ shown in part, what is counted says how many, and what is inside one part is cut
 | `parts::cut` (with `short` and `review::clip`) | Every part and every value of the dry run, to a number of characters, after the invisible ones are made visible | It is the one function that cuts; it says how long the text was; a part is cut alone |
 | `KINDS` (the table above) | The budget of each part of each kind | Fixed parts first, each cut alone; the test that builds every kind with everything padded |
 | `MAX_REVIEW_ITEMS` (2,000) | Things of the dry run | Over it the backup is refused whole and is not shown in part |
-| `MOST_PREVIEW_BYTES` (2 MiB) | What all the things of one preview say together | Past it the longest are named and not described, longest first, each with how long it was, so that padding cannot crowd a small thing out; with the kinds' own limits, a preview of two thousand flows as long as may be is a few megabytes |
+| `MOST_PREVIEW_BYTES` (2 MiB) | What all the things of one preview say together | Past it the longest are named and not described, longest first, each with how long it was, so that padding cannot crowd a small thing out; with the kinds' own limits, a preview of two thousand flows as long as may be is a few megabytes. What is named and not described is not brought back |
 | `MAX_REVIEW_BYTES` (2 MiB), `MAX_REVIEW_TOTAL` (128 MiB), `MAX_JSON_BYTES` (16 MiB) | What is read of one file, of all of them, and of one JSON file | A file over it is said to be too large to look at and is not restored; a backup over the total is refused whole |
 | `MOST_WORDS_SCANNED` (1 MiB), `MAX_QUOTE_BYTES` (64 KiB), `BRIEF_QUOTE` (700) | The brief and knowledge files scanned for hidden text; the brief read to be quoted; the quote | A file over the first is not restored; over the second is said "too large to quote" (the size is said); the quote is inside the part `says`, which comes after `reads` |
 | `MAX_NAMED` (300) | Projects, knowledge files and unknown items named | The rest are counted in a thing of their own (kind `more`), and "and N more" |

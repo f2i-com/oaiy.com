@@ -167,8 +167,20 @@ pub struct ReviewItem {
     pub kind: &'static str,
     #[serde(skip)]
     pub parts: Vec<PartRecord>,
+    /// The entry of the backup it is made from, for what a restore leaves out when the preview could only name it (see [`cap`]): `None` for a thing
+    /// that is not made of one entry. Not sent to the dashboard.
+    #[serde(skip)]
+    pub from: Option<String>,
     #[serde(skip)]
     sealed: (),
+}
+
+impl ReviewItem {
+    /// The same thing, marked as made from the entry `entry` of the backup.
+    pub fn from_entry(mut self, entry: &str) -> Self {
+        self.from = Some(entry.to_string());
+        self
+    }
 }
 
 /// A value cut to `budget` characters inside a part (with how long it was, and the characters a person cannot see made visible).
@@ -274,6 +286,7 @@ impl Parts {
             what,
             kind: self.kind.id,
             parts: self.said.into_iter().map(|(record, _)| record).collect(),
+            from: None,
             sealed: (),
         }
     }
@@ -401,10 +414,31 @@ impl NoteBook {
     }
 }
 
+/// The things of a preview after its limits, and the entries of the backup that are not brought back because a thing made from them could only be
+/// named (see [`cap`]).
+pub struct Capped {
+    pub items: Vec<ReviewItem>,
+    pub not_brought_back: std::collections::BTreeSet<String>,
+}
+
+/// The limits of a preview: each kind is described in full up to a number of its things ([`Kind::full`]) and all the things together say at most so
+/// much ([`MOST_PREVIEW_BYTES`]); a thing past a limit is named and not described, and **is not brought back**: a restore brings back only what
+/// the dry run described to the person who ticked it, and a thing it had no room for was not. The entries the named things are made of are
+/// returned, and the rest of the things of each of those entries are named too (a file comes back whole or not at all, and what is said of
+/// it must be true of all of it).
+pub fn cap(items: Vec<ReviewItem>) -> Capped {
+    let mut named = vec![false; items.len()];
+    let items = cap_full(items, &mut named);
+    let items = with_its_entry(items, &mut named);
+    let items = cap_total(items, &mut named);
+    let not_brought_back = items.iter().zip(&named).filter(|(_, named)| **named).filter_map(|(item, _)| item.from.clone()).collect();
+    Capped { items, not_brought_back }
+}
+
 /// The preview of a kind that is described in full only up to a number ([`Kind::full`]): the items beyond it are named, with how many
 /// there are, and not described. (A hostile backup of three hundred campaigns as long as a campaign can be would otherwise make a
 /// preview of many megabytes.)
-pub fn cap_full(items: Vec<ReviewItem>) -> Vec<ReviewItem> {
+fn cap_full(items: Vec<ReviewItem>, named: &mut [bool]) -> Vec<ReviewItem> {
     let mut total: std::collections::HashMap<&'static str, usize> = std::collections::HashMap::new();
     for item in &items {
         *total.entry(item.kind).or_default() += 1;
@@ -412,13 +446,19 @@ pub fn cap_full(items: Vec<ReviewItem>) -> Vec<ReviewItem> {
     let mut seen: std::collections::HashMap<&'static str, usize> = std::collections::HashMap::new();
     items
         .into_iter()
-        .map(|item| {
+        .enumerate()
+        .map(|(at, item)| {
             let n = seen.entry(item.kind).or_default();
             *n += 1;
             match kind(item.kind).full {
-                Some(limit) if *n > limit => Parts::new("more")
-                    .fixed("count", format!("One of {} of its kind in this backup ({}): only the first {limit} are described in full, so this one is named and not described. Read it (its own file, or in the Agent) before you use it.", total[item.kind], kind(item.kind).place))
-                    .item(item.class, &item.name, &item.title),
+                Some(limit) if *n > limit => {
+                    named[at] = true;
+                    let mut only_named = Parts::new("more")
+                        .fixed("count", format!("One of {} of its kind in this backup ({}): only the first {limit} are described in full, so this one is named and not described, and is NOT brought back.", total[item.kind], kind(item.kind).place))
+                        .item(item.class, &item.name, &item.title);
+                    only_named.from = item.from;
+                    only_named
+                }
                 _ => item,
             }
         })
@@ -435,30 +475,64 @@ pub const MOST_PAGE_WARNINGS_NAMED: usize = 20;
 
 /// The things of a preview, with the longest named and not described while what they say together is more than [`MOST_PREVIEW_BYTES`]: what
 /// is padded to its length is what is left out, so that padding cannot crowd a small thing out, and a person is told which were not
-/// described and how long each was.
-pub fn cap_total(items: Vec<ReviewItem>) -> Vec<ReviewItem> {
+/// described and how long each was. (Only a thing made of an entry of the backup can be left out of a restore, so only those are named; and what
+/// else is made of the entry of a thing that is named is named with it, since the entry comes back whole or not at all.)
+fn cap_total(mut items: Vec<ReviewItem>, named: &mut [bool]) -> Vec<ReviewItem> {
     let mut total: usize = items.iter().map(|i| i.what.len()).sum();
     if total <= MOST_PREVIEW_BYTES {
         return items;
     }
-    let mut longest_first: Vec<usize> = (0..items.len()).collect();
+    let mut of_entry: std::collections::HashMap<String, Vec<usize>> = std::collections::HashMap::new();
+    for (at, item) in items.iter().enumerate() {
+        if let Some(from) = &item.from {
+            of_entry.entry(from.clone()).or_default().push(at);
+        }
+    }
+    let mut longest_first: Vec<usize> = (0..items.len()).filter(|&i| items[i].from.is_some() && !named[i]).collect();
     longest_first.sort_by_key(|&i| std::cmp::Reverse(items[i].what.len()));
-    let mut named: std::collections::HashMap<usize, ReviewItem> = std::collections::HashMap::new();
     for at in longest_first {
         if total <= MOST_PREVIEW_BYTES {
             break;
         }
-        let item = &items[at];
-        let only_named = Parts::new("more")
-            .fixed(
-                "count",
-                format!("Named and not described: it says {} characters, more than a preview holds of the things of one backup together (the longest are left out first). Read it (its own file, or in the Agent) before you use it.", item.what.chars().count()),
-            )
-            .item(item.class, &item.name, &item.title);
-        total = total - item.what.len() + only_named.what.len();
-        named.insert(at, only_named);
+        if named[at] {
+            continue;
+        }
+        let says = format!("Named and not described: it says {} characters, more than a preview holds of the things of one backup together (the longest are left out first). It is NOT brought back.", items[at].what.chars().count());
+        total = total - items[at].what.len() + name_only(&mut items[at], says);
+        named[at] = true;
+        let siblings = items[at].from.as_ref().and_then(|from| of_entry.get(from)).cloned().unwrap_or_default();
+        for other in siblings {
+            if !named[other] {
+                total = total - items[other].what.len() + name_only(&mut items[other], SIBLING_NAMED.to_string());
+                named[other] = true;
+            }
+        }
     }
-    items.into_iter().enumerate().map(|(at, item)| named.remove(&at).unwrap_or(item)).collect()
+    items
+}
+
+/// What is said of a thing that is named because something else in its file was only named.
+const SIBLING_NAMED: &str = "Named and not described: it is in a file with something that the preview had no room to describe, so the file is NOT brought back.";
+
+/// `item` said only by its name and title, with `text`: how long what it says is now.
+fn name_only(item: &mut ReviewItem, text: String) -> usize {
+    let mut only_named = Parts::new("more").fixed("count", text).item(item.class, &item.name, &item.title);
+    only_named.from = item.from.take();
+    *item = only_named;
+    item.what.len()
+}
+
+/// A file comes back whole or not at all: what else is made of an entry that has a thing in it that was only named (by [`cap_full`]) is named, and is
+/// not brought back, so that what the dry run says of each thing is true of the file.
+fn with_its_entry(mut items: Vec<ReviewItem>, named: &mut [bool]) -> Vec<ReviewItem> {
+    let gone: std::collections::BTreeSet<String> = items.iter().zip(named.iter()).filter(|(_, named)| **named).filter_map(|(item, _)| item.from.clone()).collect();
+    for (at, item) in items.iter_mut().enumerate() {
+        if !named[at] && item.from.as_ref().is_some_and(|from| gone.contains(from)) {
+            named[at] = true;
+            name_only(item, SIBLING_NAMED.to_string());
+        }
+    }
+    items
 }
 
 /// Why a text is not one that comes back (a value a person could have typed to be read by a model or a caller), or `None`. The dry run

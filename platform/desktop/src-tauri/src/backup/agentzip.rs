@@ -410,6 +410,7 @@ const NOTE_CAMPAIGNS: &str = "campaigns";
 const NOTE_DNC: &str = "numbers not to be contacted";
 const NOTE_KINDS: &str = "what was not brought back";
 const NOTE_WORDS: &str = "files with hidden text";
+const NOTE_UNDESCRIBED: &str = "things the dry run did not describe";
 
 /// The largest file of words (the brief, a knowledge file) that is read to see whether it hides text, and the reason it is not brought back
 /// when it does (see [`super::parts::text_problem`]). A file that is larger cannot be checked, and is not brought back.
@@ -685,9 +686,16 @@ pub fn describe(path: &Path, listing: &Listing, limits: &Limits, budget: &Budget
     let (mut desk_sessions, mut desk_session_bytes) = (0usize, 0u64);
     let mut excluded: BTreeMap<&str, (usize, String)> = BTreeMap::new();
     let mut unknown = 0usize;
+    // What is described of an entry is marked with it (the things made of one entry are the ones added while it is looked at).
+    let (mut marked, mut previous): (usize, Option<String>) = (0, None);
 
     for (position, entry) in listing.entries.iter().enumerate() {
         budget.check()?;
+        for item in &mut items[marked..] {
+            item.from = previous.clone();
+        }
+        marked = items.len();
+        previous = Some(entry.name.clone());
         let shown = display(&entry.name);
         if let Some(why) = entry.unfit {
             not_restored.push(NotRestored { name: clip(&shown, 200), why: format!("not restored: {why}") });
@@ -800,6 +808,10 @@ pub fn describe(path: &Path, listing: &Listing, limits: &Limits, budget: &Budget
         }
     }
 
+    for item in &mut items[marked..] {
+        item.from = previous.clone();
+    }
+
     // The projects, by name (the first few hundred: a person has a few dozen, and a hostile archive can name 50,000).
     let shown_projects = projects.len().min(MAX_NAMED);
     for (id, p) in projects.iter().take(MAX_NAMED) {
@@ -845,7 +857,7 @@ pub fn describe(path: &Path, listing: &Listing, limits: &Limits, budget: &Budget
         if let Some(why) = hidden_text_of(&mut archive, entry, "agent-desk-knowledge", limits)? {
             parts = parts.fixed("left-out", format!("Not brought back: {why}."));
         }
-        items.push(parts.item(RestoreClass::AgentData, &display(&entry.name), entry.name.rsplit('/').next().unwrap_or(&entry.name)));
+        items.push(parts.item(RestoreClass::AgentData, &display(&entry.name), entry.name.rsplit('/').next().unwrap_or(&entry.name)).from_entry(&entry.name));
     }
     if knowledge.len() > MAX_NAMED {
         let rest: u64 = knowledge[MAX_NAMED..].iter().map(|e| e.size).sum();
@@ -967,7 +979,9 @@ enum Source {
 }
 
 /// Write `out` (a new private file): the archive of only what is to come back. See the module note.
-pub fn filter(nested: &Path, out: &Path, scratch: &Path, ticks: &Ticks, mode: Mode, limits: &Limits, budget: &Budget) -> Result<Prepared> {
+/// (`skip` is the names of the entries that a restore leaves out because the dry run named them and did not describe them.)
+#[allow(clippy::too_many_arguments)]
+pub fn filter(nested: &Path, out: &Path, scratch: &Path, ticks: &Ticks, mode: Mode, skip: &std::collections::HashSet<String>, limits: &Limits, budget: &Budget) -> Result<Prepared> {
     let listing = read_listing(nested, limits)?;
     let mut archive = open(nested, limits)?;
     let mut prepared = Prepared::default();
@@ -1013,6 +1027,11 @@ pub fn filter(nested: &Path, out: &Path, scratch: &Path, ticks: &Ticks, mode: Mo
                 *left_out.entry(tick).or_default() += 1;
                 continue;
             }
+        }
+        // What the dry run named and did not describe is not brought back (an undo puts back the person's own).
+        if mode == Mode::Restore && skip.contains(&entry.name) {
+            book.push(NOTE_UNDESCRIBED, format!("{} was not brought back: the dry run named it and had no room to describe it.", clip(&display(&entry.name), 120)));
+            continue;
         }
         // Words a model reads that hide more than they show are not brought back (an undo puts back the person's own, whatever it holds).
         if mode == Mode::Restore && matches!(row.id.as_str(), "agent-desk-brief" | "agent-desk-knowledge" | "agent-desk-callers") {

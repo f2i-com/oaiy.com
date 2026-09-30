@@ -525,7 +525,7 @@ fn agent_item(inner: &str) -> String {
     format!("{AGENT_ENTRY}#{inner}")
 }
 
-fn preview_of(data_dir: &Path, verified: &container::Verified, scratch: &Path, file_name: &str, limits: &Limits, budget: &Budget) -> Result<(Preview, Vec<String>)> {
+fn preview_of(data_dir: &Path, verified: &container::Verified, scratch: &Path, file_name: &str, limits: &Limits, budget: &Budget) -> Result<(Preview, Vec<String>, BTreeSet<String>)> {
     let manifest = &verified.manifest;
     let local = rules::plan(data_dir, true);
     // The Agent's storage is read from its own directory, not from what the backup says of it.
@@ -614,6 +614,7 @@ fn preview_of(data_dir: &Path, verified: &container::Verified, scratch: &Path, f
         budget.check()?;
         let Ok(Some(standing)) = rules::standing_of_backup_entry(&entry.name) else { continue };
         let Some(class) = standing.tick else { continue };
+        let first = items.len();
         if standing.category == Category::Voices {
             // A voice is an audio file: it is listed by name and size, and never read.
             items.push(review::describe_voice(class, &entry.name, entry.size));
@@ -633,6 +634,10 @@ fn preview_of(data_dir: &Path, verified: &container::Verified, scratch: &Path, f
                 None => items.push(review::too_large(class, &entry.name, entry.name.rsplit('/').next().unwrap_or(&entry.name))),
             }
         }
+        // (What was made of this entry is marked with it, so that a thing the preview had no room to describe can be left out of a restore.)
+        for item in &mut items[first..] {
+            item.from = Some(entry.name.clone());
+        }
         if items.len() > review::MAX_REVIEW_ITEMS {
             return Err(too_much());
         }
@@ -645,7 +650,10 @@ fn preview_of(data_dir: &Path, verified: &container::Verified, scratch: &Path, f
     let mut agent_names: Vec<String> = Vec::new();
     let mut agent_dry_notes: Vec<String> = Vec::new();
     if let Some(described) = agent_described {
-        items.extend(described.items);
+        items.extend(described.items.into_iter().map(|mut item| {
+            item.from = item.from.map(|inner| agent_item(&inner));
+            item
+        }));
         not_restored.extend(described.not_restored);
         agent_names = described.names.iter().map(|n| agent_item(n)).collect();
         agent_dry_notes = described.notes;
@@ -653,9 +661,10 @@ fn preview_of(data_dir: &Path, verified: &container::Verified, scratch: &Path, f
     if items.len() > review::MAX_REVIEW_ITEMS {
         return Err(BackupError::new(ErrorKind::TooLarge, "This backup holds more things that can run or reconfigure OAIY than can be looked through, so it is refused."));
     }
-    // A kind whose items are each long is described in full up to a number of them, and the rest are named (see `parts::cap_full`); and all
-    // the things together say at most so much (see `parts::cap_total`).
-    let items = super::parts::cap_total(super::parts::cap_full(items));
+    // A kind whose items are each long is described in full up to a number of them, and the rest are named; and all the things together say at
+    // most so much (see `parts::cap`). What is only named is not brought back: a restore brings back only what the dry run described.
+    let capped = super::parts::cap(items);
+    let (items, not_described) = (capped.items, capped.not_brought_back);
     let classes: Vec<ClassInfo> = RestoreClass::ALL
         .iter()
         .filter_map(|c| {
@@ -699,7 +708,7 @@ fn preview_of(data_dir: &Path, verified: &container::Verified, scratch: &Path, f
         keys: KeysInfo { in_backup: manifest.includes_keys },
         notes,
     };
-    Ok((in_plain_sight(preview), agent_names))
+    Ok((in_plain_sight(preview), agent_names, not_described))
 }
 
 /// The preview with every text in it that a person reads made visible: the characters they cannot see (a tag, a zero-width or a
@@ -735,6 +744,9 @@ pub struct Inspection {
     pub plain_sha256: String,
     /// The entries the look said could come back (data, and what needs a tick), by their names in the backup.
     pub restorable: BTreeSet<String>,
+    /// The entries among them that the look named and did not describe, for want of room in the preview (the Agent's as `restorable` has them): a
+    /// restore brings back only what the look described, so these are left out.
+    pub not_described: BTreeSet<String>,
 }
 
 fn restorable_names(manifest: &Manifest) -> BTreeSet<String> {
@@ -753,10 +765,10 @@ pub fn inspect_bound(data_dir: &Path, file: &Path, passphrase: &str, opts: &Rest
     let budget = opts.budget();
     let verified = container::open_backup(file, passphrase, &scratch.0, &opts.limits, &budget)?;
     let name = file.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
-    let (preview, agent_names) = preview_of(data_dir, &verified, &scratch.0, &name, &opts.limits, &budget)?;
+    let (preview, agent_names, not_described) = preview_of(data_dir, &verified, &scratch.0, &name, &opts.limits, &budget)?;
     let mut restorable = restorable_names(&verified.manifest);
     restorable.extend(agent_names);
-    let inspection = Inspection { plain_sha256: verified.plain_sha256.clone(), restorable };
+    let inspection = Inspection { plain_sha256: verified.plain_sha256.clone(), restorable, not_described };
     Ok((preview, inspection))
 }
 
@@ -795,6 +807,7 @@ fn stage_inner(data_dir: &Path, file: &Path, passphrase: &str, ticks: &Ticks, op
     let mut selected: Vec<&Entry> = Vec::new();
     let mut left_out: HashMap<RestoreClass, usize> = HashMap::new();
     let mut unknown = 0usize;
+    let mut undescribed: Vec<String> = Vec::new();
     for entry in &manifest.entries {
         if entry.name == AGENT_ENTRY {
             if entry.size > opts.agent_import_max {
@@ -811,8 +824,17 @@ fn stage_inner(data_dir: &Path, file: &Path, passphrase: &str, ticks: &Ticks, op
         };
         match standing.file_tick() {
             Some(class) if !ticks.has(class) => *left_out.entry(class).or_default() += 1,
+            // What the look named and did not describe (there was no room in the preview) is not brought back: what a person ticked is what they were told of.
+            _ if looked_at.is_some_and(|seen| seen.not_described.contains(&entry.name)) => undescribed.push(entry.name.clone()),
             _ => selected.push(entry),
         }
+    }
+    if !undescribed.is_empty() {
+        skipped.push(format!(
+            "Not brought back: {} that the dry run named and did not describe, for want of room in it: {}.",
+            if undescribed.len() == 1 { "1 file".to_string() } else { format!("{} files", undescribed.len()) },
+            super::parts::some_of(&undescribed, MOST_LINES_NAMED, 120)
+        ));
     }
     if unknown > 0 {
         skipped.push(format!("Not restored: {unknown} item{} that this version of OAIY does not know (unknown items are never restored).", if unknown == 1 { "" } else { "s" }));
@@ -870,7 +892,11 @@ fn stage_inner(data_dir: &Path, file: &Path, passphrase: &str, ticks: &Ticks, op
             let mut outer = container::open_archive(&verified.plain)?;
             agentzip::extract(&mut outer, &nested, &budget)?;
             let built = root.join(AGENT_RESTORE_FILE);
-            let prepared = agentzip::filter(&nested, &built, &scratch.0, ticks, agentzip::Mode::Restore, limits, &budget)?;
+            // (What the look named and did not describe is left out, as it is of the desktop's own files.)
+            let skip: HashSet<String> = looked_at
+                .map(|seen| seen.not_described.iter().filter_map(|n| n.strip_prefix(&format!("{AGENT_ENTRY}#")).map(str::to_string)).collect())
+                .unwrap_or_default();
+            let prepared = agentzip::filter(&nested, &built, &scratch.0, ticks, agentzip::Mode::Restore, &skip, limits, &budget)?;
             let _ = std::fs::remove_file(&nested);
             if let Some(seen) = looked_at {
                 if let Some(unlisted) = prepared.items.iter().find(|i| !seen.restorable.contains(&agent_item(&i.name))) {
@@ -1299,7 +1325,7 @@ pub fn stage_undo(data_dir: &Path, opts: &RestoreOptions) -> Result<Staged> {
             let budget = opts.budget();
             let built = root.join(AGENT_UNDO_FILE);
             let _ = std::fs::remove_file(&built);
-            let prepared = agentzip::filter(&agent_zip, &built, &scratch.0, &Ticks::all(), agentzip::Mode::Undo, &opts.limits, &budget)?;
+            let prepared = agentzip::filter(&agent_zip, &built, &scratch.0, &Ticks::all(), agentzip::Mode::Undo, &HashSet::new(), &opts.limits, &budget)?;
             let remove = agent::read_added(data_dir, &uid);
             if prepared.items.is_empty() && remove.is_empty() {
                 let _ = std::fs::remove_file(&built);
