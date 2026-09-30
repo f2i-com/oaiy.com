@@ -75,6 +75,20 @@ export function isLoopbackHost(hostname: string): boolean {
   return host === 'localhost' || host.endsWith('.localhost') || host === '::1' || /^127(\.\d{1,3}){3}$/.test(host);
 }
 
+/** Whether the address is one on this computer or this network (where a browser may ask for a permission the person can give). */
+export function isLocalAddress(url: string): boolean {
+  try {
+    const host = new URL(url).hostname.replace(/^\[|\]$/g, '');
+    if (isLoopbackHost(host) || host.endsWith('.local')) return true;
+    const m = /^(\d{1,3})\.(\d{1,3})\.\d{1,3}\.\d{1,3}$/.exec(host);
+    if (!m) return false;
+    const [a, b] = [Number(m[1]), Number(m[2])];
+    return a === 10 || (a === 172 && b >= 16 && b <= 31) || (a === 192 && b === 168) || (a === 169 && b === 254) || (a === 100 && b >= 64 && b <= 127);
+  } catch {
+    return false;
+  }
+}
+
 /**
  * Whether the browser will block this call as mixed content: an https page
  * may not call plain http, except on this computer (localhost, 127.0.0.1,

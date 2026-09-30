@@ -166,6 +166,20 @@ const MUTATIONS = [
     files: { 'shared/downloads.ts': [{ find: 'export function assetNames(version: string) {', replace: "export function leak() {\n  return fetch('https://example.invalid/');\n}\n\nexport function assetNames(version: string) {" }] },
     caught: ['is pure: no fetch, no XMLHttpRequest', 'downloads.mjs'],
   },
+  {
+    name: 'F12 an adapter skips the record check',
+    what: 'an Agent config or a gateway provider becomes a record without validateRecord',
+    tests: ['tests/unit/adapter-validation.test.mjs'],
+    files: { 'shared/providers/adapters.ts': [{ find: 'return result.ok ? { ...result.record, via: record.via } : null;', replace: 'return record;' }] },
+    caught: ['Agent config: http on the internet (a name)', 'Agent config: a name with a line break'],
+  },
+  {
+    name: 'F12 a network address is an external service',
+    what: 'an Agent provider at a plain-http address on this network is kind external, so the record check refuses it and nothing imports',
+    tests: ['tests/unit/adapter-validation.test.mjs'],
+    files: { 'shared/providers/adapters.ts': [{ find: "kind: config.type === 'local' || onThisNetwork ? 'local-server' : 'external',", replace: "kind: config.type === 'local' ? 'local-server' : 'external'," }] },
+    caught: ['Agent config: http on this network (192.168)', 'an Agent custom provider at http://192.168.1.5 is a server on this network'],
+  },
   // Leaks the scans must find. They put the key where a scan of TEXT does not look (the reviewer's two: a Uint8Array, and reversed).
   {
     name: 'H1 leak: list returns the key as a Uint8Array',

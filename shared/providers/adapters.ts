@@ -8,16 +8,22 @@
  *   - the desktop or server's gateway record  (recordFromGatewayProvider / gatewayInputFromRecord)
  *
  * A conversion that cannot be exact says so by returning null (a base address with a query string, a base the gateway
- * cannot use); it never guesses.
+ * cannot use); it never guesses. The same goes for a record that would not be allowed: every record an adapter makes is checked by
+ * `validateRecord`, the check the add form's record passes, so an adapter is not a way round it (an Agent provider of type `custom` at
+ * `http://192.168.1.5/v1` is a service on the internet over plain http as far as a record can tell, and is null, not saved).
  */
 import { EXTRA_HEADER_NAMES, type ExtraHeader, type ProviderCap, type ProviderConfig, type ProviderRecord, type ProviderType } from './types';
 import { defaultBaseUrl, normalizeApiBase } from './endpoints';
+import { isLocalAddress, isLoopbackHost } from './errors';
+import { validateRecord } from './records';
 
 /** The Agent's kind of provider for a record: what the Agent's own code (its messages, its headers) takes it for. */
 export function providerTypeOf(record: Pick<ProviderRecord, 'dialect' | 'kind' | 'preset'>): ProviderType {
   if (record.dialect === 'anthropic') return 'anthropic';
-  if (record.kind === 'local-server') return 'local';
   if (record.preset === 'openai') return 'openai';
+  // An Agent `custom` provider on this network is a record of a server on this network (recordFromAgentConfig), and is still `custom`.
+  if (record.preset === 'custom') return 'custom';
+  if (record.kind === 'local-server') return 'local';
   return 'custom';
 }
 
@@ -33,6 +39,12 @@ export function recordFromAgentConfig(config: ProviderConfig): { record: Provide
   // The Agent sends OpenAI-Organization for `openai` only (providerHeaders).
   if (config.type === 'openai' && config.orgId?.trim()) extraHeaders.push({ name: 'OpenAI-Organization', value: config.orgId.trim() });
   const caps: ProviderCap[] = ['chat'];
+  // A provider that is not `local` at a plain-http address on this network (an Agent `custom` provider at http://192.168.1.5:8000/v1, a
+  // machine that serves a model to the house) is a server on this network, not a service on the internet: the record says so, so that
+  // the rule for a service on the internet (https, because a key over plain http can be read on the way) is not broken by calling it
+  // one. A plain-http address anywhere else stays a service on the internet, and `validateRecord` refuses it.
+  const url = new URL(baseUrl);
+  const onThisNetwork = url.protocol === 'http:' && !isLoopbackHost(url.hostname) && isLocalAddress(baseUrl);
   const record: ProviderRecord = {
     v: 1,
     id: config.id,
@@ -41,7 +53,7 @@ export function recordFromAgentConfig(config: ProviderConfig): { record: Provide
     baseUrl,
     auth: anthropic ? 'x-api-key' : 'bearer',
     caps,
-    kind: config.type === 'local' ? 'local-server' : 'external',
+    kind: config.type === 'local' || onThisNetwork ? 'local-server' : 'external',
     preset: config.type === 'local' ? 'local-server' : config.type,
     via: 'broker',
   };
@@ -51,7 +63,17 @@ export function recordFromAgentConfig(config: ProviderConfig): { record: Provide
   if (config.type === 'local' && config.serverKind) record.serverKind = config.serverKind;
   if (config.contextTokens !== undefined) record.contextTokens = config.contextTokens;
   if (config.parallelAgents !== undefined) record.parallelAgents = config.parallelAgents;
-  return { record, apiKey: config.apiKey };
+  const checked = validated(record);
+  return checked === null ? null : { record: checked, apiKey: config.apiKey };
+}
+
+/**
+ * The record as the record check makes it, or null when the check refuses it. `via` is the adapter's own (the check makes records the
+ * holder keeps; a gateway's is a mirror), and is put back after.
+ */
+function validated(record: ProviderRecord): ProviderRecord | null {
+  const result = validateRecord(record, record.id);
+  return result.ok ? { ...result.record, via: record.via } : null;
 }
 
 /**
@@ -219,7 +241,7 @@ export function recordFromGatewayProvider(p: GatewayProviderPublic): ProviderRec
   };
   if (p.model) record.model = p.model;
   if (p.category) record.preset = p.category;
-  return record;
+  return validated(record);
 }
 
 /** The gateway's own input for a record whose base the gateway can use (`<server>/v1`); null for one it cannot (Gemini's `/v1beta/openai`). */

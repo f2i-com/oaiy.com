@@ -6,8 +6,11 @@
  * second request, with `mode: 'no-cors'` and no credentials, tells the first two apart: an opaque answer means the server is up,
  * and no answer means it is not, or the browser did not let the call out.
  */
-import { describeNetworkFailure, isBlockedMixedContent, isLoopbackHost, type NetworkFailure } from '@oaiy/shared/providers/errors';
+import { describeNetworkFailure, isBlockedMixedContent, isLocalAddress, type NetworkFailure } from '@oaiy/shared/providers/errors';
 import type { ProviderRecord } from '@oaiy/shared/providers/types';
+
+// Where an address is on this computer or this network is decided in shared/ (the adapters need it too).
+export { isLocalAddress };
 
 export interface PageInfo {
   protocol: string;
@@ -20,20 +23,6 @@ export interface Failure {
 }
 
 const PROBE_TIMEOUT_MS = 4000;
-
-/** Whether the address is one on this computer or this network (where a browser may ask for a permission the person can give). */
-export function isLocalAddress(url: string): boolean {
-  try {
-    const host = new URL(url).hostname.replace(/^\[|\]$/g, '');
-    if (isLoopbackHost(host) || host.endsWith('.local')) return true;
-    const m = /^(\d{1,3})\.(\d{1,3})\.\d{1,3}\.\d{1,3}$/.exec(host);
-    if (!m) return false;
-    const [a, b] = [Number(m[1]), Number(m[2])];
-    return a === 10 || (a === 172 && b >= 16 && b <= 31) || (a === 192 && b === 168) || (a === 169 && b === 254) || (a === 100 && b >= 64 && b <= 127);
-  } catch {
-    return false;
-  }
-}
 
 /** Why a call to `url` (a provider's address) failed without an answer. */
 export async function classifyFailure(record: Pick<ProviderRecord, 'kind' | 'serverKind'>, url: string, page: PageInfo, fetchImpl: typeof fetch): Promise<Failure> {
