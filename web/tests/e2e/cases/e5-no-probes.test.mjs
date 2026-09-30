@@ -245,6 +245,28 @@ describe('E5: the Agent\'s saved links, and what its words say of each state', (
     await own.context.close();
   });
 
+  it('retyping the address that was found (deleted and typed again, or its path edited) keeps the OAIY that was found; another address drops it', async () => {
+    for (const [name, retype, keeps] of [
+      ['deleted and typed again', async (input) => { await input.fill(''); await input.fill(`${LAN}/v1`); }, true],
+      ['the path edited', async (input) => input.fill(`${LAN}/v1/`), true],
+      ['deleted, another address typed, the address that was found typed again', async (input) => { await input.fill(''); await input.fill('http://192.168.1.99:8080/v1'); await input.fill(`${LAN}/v1`); }, true],
+      ['another address', async (input) => input.fill('http://192.168.1.99:8080/v1'), false],
+    ]) {
+      const { context, page, attempts } = await withSavedOaiy();
+      const section = await openSettings(page);
+      await retype(section.locator('input').first());
+      await page.locator('dialog.settings button', { hasText: /^Save$/ }).first().click();
+      await page.waitForSelector('dialog.settings', { state: 'detached' });
+      await sleep(500);
+      assert.equal((await readStored(page)).discovered, keeps ? LAN : null, `${name}: what says an OAIY was found`);
+      attempts.length = 0;
+      await page.reload();
+      await ready('agent', page);
+      assert.deepEqual(attempts, keeps ? [`GET ${LAN}/v1/discovery`] : [], `${name}: what a reload asks`);
+      await context.close();
+    }
+  });
+
   it('OAIY\'s own window has no Forget OAIY button, though an OAIY is saved there: it is found again at every opening, so the button would do nothing', async () => {
     const { context, page } = await withSavedOaiy({ desktop: OAIY_WINDOW });
     const section = await openSettings(page);

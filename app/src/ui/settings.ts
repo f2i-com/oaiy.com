@@ -274,11 +274,16 @@ export function openSettings(initial: SettingsResult, context: { pairedDesktop?:
       const status = media.discovered
         ? `${media.discovered.service} ${media.discovered.version} at ${media.discovered.origin}`
         : media.baseUrl ? 'set up by hand' : 'not set up';
+      // What was found when this was drawn: typing another address drops it, and typing the address that was found again gives it back.
+      const found = { discovered: media.discovered, endpoints: media.endpoints };
       const address = h('input', { value: media.baseUrl, placeholder: `${OAIY_ORIGIN}/v1`, oninput: () => {
         media.baseUrl = address.value.trim();
         // The address is what makes this the OAIY that was found: another address, or none, is not that one any more (its routes may
-        // differ), and a page that has forgotten it does not ask it again when it opens or send it the key.
-        if (media.discovered && !addressOf(media.baseUrl, media.discovered.origin)) {
+        // differ), and a page that has forgotten it does not ask it again when it opens or send it the key. The same address, retyped, is.
+        if (found.discovered && addressOf(media.baseUrl, found.discovered.origin)) {
+          media.discovered = found.discovered;
+          media.endpoints = found.endpoints;
+        } else if (media.discovered) {
           media.discovered = undefined;
           media.endpoints = undefined;
         }
