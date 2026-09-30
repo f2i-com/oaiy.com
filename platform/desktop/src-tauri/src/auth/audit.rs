@@ -155,6 +155,14 @@ struct Bucket {
     host: String,
 }
 
+/// What one parent has derived in the minute it is in: the derives after the first, counted.
+struct DerivedTally {
+    minute: u64,
+    extra: u64,
+    who: Actor,
+    ip: Option<String>,
+}
+
 #[derive(Default)]
 struct NoiseState {
     /// `(event, address, minute start)`.
@@ -168,6 +176,8 @@ pub struct AuditLog {
     audit: Mutex<Rolling>,
     noise_file: Mutex<Rolling>,
     noise: Mutex<NoiseState>,
+    /// By the id of the parent that derives.
+    derived: Mutex<HashMap<String, DerivedTally>>,
     clock: Arc<dyn Clock>,
     stderr: bool,
 }
@@ -222,6 +232,7 @@ impl AuditLog {
                 keep: NOISE_FILES,
             }),
             noise: Mutex::new(NoiseState::default()),
+            derived: Mutex::new(HashMap::new()),
             clock,
             stderr,
         }
@@ -256,6 +267,84 @@ impl AuditLog {
         let rolling = self.audit.lock().unwrap_or_else(|e| e.into_inner());
         if let Err(e) = rolling.append(&line.to_string()) {
             log::warn!("auth: the audit log could not be written: {e}");
+        }
+    }
+
+    /// A derived credential was made (`credential.created`, derived), by `parent`. Thirty a minute for a
+    /// day would be 43,200 lines a day and wash the record of what people did out of a log that keeps
+    /// 40 MiB: the first derive of a parent in a minute is written in full, and the rest of that minute
+    /// are counted and written as one `credential.derived_more` line when the minute is over (by the next
+    /// derive of that parent, [`AuditLog::flush_closed`] or [`AuditLog::flush_noise`]).
+    pub fn derived(&self, parent: &Actor, ctx: &Context<'_>, detail: Value) {
+        let now = self.clock.now_ms();
+        let minute = now - now % 60_000;
+        let mut over = None;
+        {
+            let mut tallies = self.derived.lock().unwrap_or_else(|e| e.into_inner());
+            match tallies.get_mut(&parent.id) {
+                Some(t) if t.minute == minute => {
+                    t.extra += 1;
+                    return;
+                }
+                Some(t) => {
+                    if t.extra > 0 {
+                        over = Some((t.who.clone(), t.minute, t.extra, t.ip.clone()));
+                    }
+                    t.minute = minute;
+                    t.extra = 0;
+                    t.ip = ctx.ip.map(str::to_string);
+                }
+                None => {
+                    tallies.insert(
+                        parent.id.clone(),
+                        DerivedTally {
+                            minute,
+                            extra: 0,
+                            who: parent.clone(),
+                            ip: ctx.ip.map(str::to_string),
+                        },
+                    );
+                }
+            }
+        }
+        if let Some((who, minute, count, ip)) = over {
+            self.write_derived_more(&who, minute, count, ip.as_deref());
+        }
+        self.critical("credential.created", Some(parent), ctx, detail);
+    }
+
+    fn write_derived_more(&self, who: &Actor, minute: u64, count: u64, ip: Option<&str>) {
+        self.critical(
+            "credential.derived_more",
+            Some(who),
+            &Context {
+                ip,
+                host: None,
+                ua: None,
+            },
+            json!({ "derived": true, "count": count, "minute": iso(minute) }),
+        );
+    }
+
+    /// Write the counts of derives whose minute is over (`all`: every one, at shutdown).
+    fn flush_derived(&self, all: bool) {
+        let now = self.clock.now_ms();
+        let minute = now - now % 60_000;
+        let due: Vec<DerivedTally> = {
+            let mut tallies = self.derived.lock().unwrap_or_else(|e| e.into_inner());
+            let keys: Vec<String> = tallies
+                .iter()
+                .filter(|(_, t)| all || t.minute < minute)
+                .map(|(k, _)| k.clone())
+                .collect();
+            keys.into_iter()
+                .filter_map(|k| tallies.remove(&k))
+                .collect()
+        };
+        for t in due {
+            if t.extra > 0 {
+                self.write_derived_more(&t.who, t.minute, t.extra, t.ip.as_deref());
+            }
         }
     }
 
@@ -302,6 +391,7 @@ impl AuditLog {
 
     /// Write the buckets of minutes that are over (the periodic upkeep of a running server).
     pub fn flush_closed(&self) {
+        self.flush_derived(false);
         let now = self.clock.now_ms();
         let minute = now - now % 60_000;
         let closed: Vec<_> = {
@@ -322,6 +412,7 @@ impl AuditLog {
 
     /// Write every bucket, closed or not (at shutdown, and for the tests).
     pub fn flush_noise(&self) {
+        self.flush_derived(true);
         let closed: Vec<_> = {
             let mut state = self.noise.lock().unwrap_or_else(|e| e.into_inner());
             state.buckets.drain().collect()
@@ -500,6 +591,134 @@ mod tests {
         assert_eq!(l["ua"], "Mozilla/5.0 (X11; Linux x86_64)");
         assert_eq!(l["detail"], json!({ "device": true }));
         assert_eq!(l["at"], "2026-09-21T14:13:20.000Z");
+    }
+
+    fn derive_actor(id: &str) -> Actor {
+        Actor {
+            id: id.into(),
+            kind: "pat".into(),
+            label: "a tool".into(),
+        }
+    }
+
+    fn events(log_dir: &TempDir, name: &str) -> Vec<Value> {
+        lines(&log_dir.0.join("auth").join("audit.jsonl"))
+            .into_iter()
+            .filter(|l| l["event"] == name)
+            .collect()
+    }
+
+    #[test]
+    fn f7_thirty_derives_in_a_minute_are_one_line_in_full_and_one_line_that_counts_the_rest() {
+        let dir = TempDir::new("audit-derived");
+        let clock = Arc::new(ManualClock::new(T0));
+        let log = log(&dir, &clock);
+        let parent = derive_actor("aaaaaaaaaaaaaaaa");
+        let ctx = Context {
+            ip: Some("203.0.113.9"),
+            host: None,
+            ua: None,
+        };
+        for i in 0..30 {
+            log.derived(&parent, &ctx, json!({ "n": i }));
+            clock.advance(1000);
+        }
+        // The first is written when it happens; the count waits for the minute to be over.
+        assert_eq!(events(&dir, "credential.created").len(), 1);
+        assert_eq!(events(&dir, "credential.derived_more").len(), 0);
+        log.flush_closed();
+        assert_eq!(
+            events(&dir, "credential.derived_more").len(),
+            0,
+            "the minute is not over yet"
+        );
+        assert_eq!(
+            events(&dir, "credential.created")[0]["detail"],
+            json!({ "n": 0 })
+        );
+        clock.advance(60_000);
+        log.flush_closed();
+        let more = events(&dir, "credential.derived_more");
+        assert_eq!(more.len(), 1);
+        assert_eq!(more[0]["detail"]["count"], 29);
+        assert_eq!(more[0]["principal"]["id"], "aaaaaaaaaaaaaaaa");
+        assert_eq!(more[0]["ip"], "203.0.113.9");
+        assert!(more[0]["detail"]["minute"]
+            .as_str()
+            .unwrap()
+            .starts_with("2026-09-21T14:13:00"));
+        // Nothing more is written for that minute, by the same flush again.
+        log.flush_closed();
+        assert_eq!(events(&dir, "credential.derived_more").len(), 1);
+    }
+
+    #[test]
+    fn f7_six_hours_at_thirty_a_minute_write_at_most_two_lines_a_minute_and_not_ten_thousand() {
+        let dir = TempDir::new("audit-derived-hours");
+        let clock = Arc::new(ManualClock::new(T0 - T0 % 60_000));
+        let log = log(&dir, &clock);
+        let parent = derive_actor("bbbbbbbbbbbbbbbb");
+        let ctx = Context::default();
+        for _ in 0..360 {
+            for _ in 0..30 {
+                log.derived(&parent, &ctx, json!({}));
+                clock.advance(2000);
+            }
+        }
+        log.flush_noise();
+        let created = events(&dir, "credential.created").len();
+        let more = events(&dir, "credential.derived_more");
+        assert_eq!(created, 360, "one in full a minute");
+        assert_eq!(more.len(), 360, "and one count a minute");
+        let counted: u64 = more
+            .iter()
+            .map(|l| l["detail"]["count"].as_u64().unwrap())
+            .sum();
+        assert_eq!(
+            counted + created as u64,
+            10_800,
+            "every derive is in a line"
+        );
+    }
+
+    #[test]
+    fn f7_each_parent_has_its_own_line_and_a_lone_derive_has_no_count() {
+        let dir = TempDir::new("audit-derived-parents");
+        let clock = Arc::new(ManualClock::new(T0));
+        let log = log(&dir, &clock);
+        let (a, b) = (
+            derive_actor("aaaaaaaaaaaaaaaa"),
+            derive_actor("bbbbbbbbbbbbbbbb"),
+        );
+        let ctx = Context::default();
+        log.derived(&a, &ctx, json!({}));
+        log.derived(&b, &ctx, json!({}));
+        log.derived(&a, &ctx, json!({}));
+        // `b` derived once in that minute, `a` twice.
+        log.flush_noise();
+        assert_eq!(events(&dir, "credential.created").len(), 2);
+        let more = events(&dir, "credential.derived_more");
+        assert_eq!(more.len(), 1);
+        assert_eq!(more[0]["principal"]["id"], "aaaaaaaaaaaaaaaa");
+        assert_eq!(more[0]["detail"]["count"], 1);
+        // The next minute's first derive of a parent that had a count writes the count of the last one.
+        let log2 = AuditLog::open(&dir.0.join("auth2"), clock.clone(), false);
+        for _ in 0..3 {
+            log2.derived(&a, &ctx, json!({}));
+        }
+        clock.advance(60_000);
+        log2.derived(&a, &ctx, json!({}));
+        let text = lines(&dir.0.join("auth2").join("audit.jsonl"));
+        let names: Vec<&str> = text.iter().map(|l| l["event"].as_str().unwrap()).collect();
+        assert_eq!(
+            names,
+            [
+                "credential.created",
+                "credential.derived_more",
+                "credential.created"
+            ]
+        );
+        assert_eq!(text[1]["detail"]["count"], 2);
     }
 
     #[test]

@@ -2624,6 +2624,36 @@ async fn f4_a_static_token_that_fails_the_shape_rule_is_still_accepted_until_the
     assert_eq!(r.status, 400);
 }
 
+// ============================ F7: a busy parent does not wash out the audit log ======================
+
+#[tokio::test]
+async fn f7_a_parent_that_derives_twelve_in_a_minute_writes_one_audit_line_and_a_count() {
+    let e = env(AccessMode::Scoped);
+    for i in 0..12 {
+        let r = go(
+            &e,
+            send(Method::POST, "/api/auth/derive")
+                .bearer(STATIC_TOKEN)
+                .json(r#"{"scopes":["system.read"],"ttlSeconds":60,"label":"x"}"#),
+        )
+        .await;
+        assert_eq!(r.status, 201, "#{i}: {}", r.text);
+    }
+    e.audit.flush_noise();
+    let lines = e.audit.read(LogFile::Audit, 100, None, None);
+    let created = lines
+        .iter()
+        .filter(|l| l["event"] == "credential.created")
+        .count();
+    let more: Vec<&Value> = lines
+        .iter()
+        .filter(|l| l["event"] == "credential.derived_more")
+        .collect();
+    assert_eq!(created, 1, "one in full");
+    assert_eq!(more.len(), 1, "one count");
+    assert_eq!(more[0]["detail"]["count"], 11);
+}
+
 // ================================= F2: OPTIONS that is not a preflight ================================
 
 /// A router with a probe on the engine gateway (an `any` route: its handler runs for every method, and

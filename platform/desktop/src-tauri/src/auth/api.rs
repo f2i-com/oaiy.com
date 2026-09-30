@@ -198,7 +198,9 @@ async fn derive(
         Ok(minted) => {
             if let Some(audit) = guard.audit() {
                 let ip = info.as_ref().map(|Extension(i)| i.client_ip.clone());
-                audit.critical("credential.created", Some(&parent.actor()), &AuditContext { ip: ip.as_deref(), host: None, ua: None }, json!({ "kind": "run", "derived": true, "label": label, "scopes": minted.scopes.len(), "id": minted.id }));
+                // One line for the first derive of a minute and a count for the rest of it (a busy parent
+                // must not wash the audit log out).
+                audit.derived(&parent.actor(), &AuditContext { ip: ip.as_deref(), host: None, ua: None }, json!({ "kind": "run", "derived": true, "label": label, "scopes": minted.scopes.len(), "id": minted.id }));
             }
             (StatusCode::CREATED, Json(json!({ "id": minted.id, "token": minted.token, "scopes": minted.scopes.names(), "expiresMs": minted.expires_ms }))).into_response()
         }
