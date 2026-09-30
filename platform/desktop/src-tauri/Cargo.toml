@@ -153,8 +153,11 @@ minisign-verify = "0.2"
 sha2 = "0.10"
 
 # The access model's auth core (src/auth): every secret is compared in constant time (`subtle`),
-# and the CSRF value of a cookie session is an HMAC-SHA256 of its token's secret (`hmac`). Both
-# already sit in the tree under other crates; `hmac` shares `sha2`'s `digest` 0.10.
+# and the CSRF value of a cookie session is an HMAC-SHA256 of its token's secret (`hmac`).
+# `subtle` (2.6.1) was already in the lock, under `crypto_box` and the `digest` crates; this is a new
+# edge to it and no new package. `hmac` (0.12.1) is the one new package this adds to Cargo.lock: the
+# RustCrypto crate for the job, depending only on `digest` 0.10, which `sha2` 0.10 already brings, so no
+# other crate is added with it. A hand-written HMAC would be worse than the audited one.
 subtle = "2"
 hmac = "0.12"
 

@@ -367,6 +367,105 @@ fn the_auth_code_has_no_unsafe() {
     }
 }
 
+// ---- the crates the auth code adds ------------------------------------------------------------------
+
+/// The `[[package]]` entries of a `Cargo.lock`: `(name, version, dependencies)`, the dependencies as the lock
+/// names them (`digest`, or `digest 0.10.7` when the lock has to tell two versions apart).
+fn lock_packages(lock: &str) -> Vec<(String, String, Vec<String>)> {
+    let quoted = |line: &str| line.split('"').nth(1).map(str::to_string);
+    let mut out: Vec<(String, String, Vec<String>)> = Vec::new();
+    let mut in_dependencies = false;
+    for line in lock.lines() {
+        if line.starts_with("[[package]]") {
+            out.push((String::new(), String::new(), Vec::new()));
+            in_dependencies = false;
+        } else if let Some(entry) = out.last_mut() {
+            if let Some(rest) = line.strip_prefix("name = ") {
+                entry.0 = quoted(rest).unwrap_or_default();
+            } else if let Some(rest) = line.strip_prefix("version = ") {
+                entry.1 = quoted(rest).unwrap_or_default();
+            } else if line.starts_with("dependencies = [") {
+                in_dependencies = true;
+            } else if line.starts_with(']') {
+                in_dependencies = false;
+            } else if in_dependencies {
+                if let Some(dep) = quoted(line) {
+                    entry.2.push(dep);
+                }
+            }
+        }
+    }
+    out
+}
+
+#[test]
+fn the_lock_holds_one_subtle_and_one_hmac_that_brings_no_other_crate() {
+    // `Cargo.toml` says `subtle` was in the lock already and `hmac` is the one package this adds, depending
+    // only on `digest`. A change to that is a change to a dependency: it fails here until it is on purpose.
+    let lock = include_str!("../../Cargo.lock");
+    let packages = lock_packages(lock);
+    let named = |n: &str| -> Vec<&(String, String, Vec<String>)> {
+        packages.iter().filter(|p| p.0 == n).collect()
+    };
+    let hmac = named("hmac");
+    assert_eq!(hmac.len(), 1, "one hmac in the lock: {hmac:?}");
+    assert!(hmac[0].1.starts_with("0.12."), "{}", hmac[0].1);
+    assert_eq!(
+        hmac[0].2,
+        ["digest"],
+        "hmac depends on digest and nothing else"
+    );
+    let subtle = named("subtle");
+    assert_eq!(subtle.len(), 1, "one subtle in the lock: {subtle:?}");
+    assert!(subtle[0].1.starts_with("2."), "{}", subtle[0].1);
+    // The desktop names both, and so nothing else needs to.
+    let ours = named("oaiy-desktop");
+    assert_eq!(ours.len(), 1);
+    assert!(ours[0].2.contains(&"hmac".to_string()) && ours[0].2.contains(&"subtle".to_string()));
+}
+
+#[test]
+fn the_lock_reader_finds_a_package_its_version_and_its_dependencies() {
+    let lock = r#"
+version = 4
+
+[[package]]
+name = "alpha"
+version = "1.2.3"
+dependencies = [
+ "beta",
+ "gamma 0.1.0",
+]
+
+[[package]]
+name = "beta"
+version = "0.9.0"
+
+[[package]]
+name = "gamma"
+version = "0.1.0"
+dependencies = [
+ "beta",
+]
+"#;
+    assert_eq!(
+        lock_packages(lock),
+        [
+            (
+                "alpha".to_string(),
+                "1.2.3".to_string(),
+                vec!["beta".to_string(), "gamma 0.1.0".to_string()]
+            ),
+            ("beta".to_string(), "0.9.0".to_string(), vec![]),
+            (
+                "gamma".to_string(),
+                "0.1.0".to_string(),
+                vec!["beta".to_string()]
+            ),
+        ]
+    );
+}
+
 // ---- the checkers themselves, on source they have not seen ----------------------------------------
 
 fn code(src: &str) -> Vec<Token> {
