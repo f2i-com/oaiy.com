@@ -103,6 +103,14 @@ describe('Messages', () => {
     expect(text()).not.toContain('They did not say who.');
   });
 
+  it('says it is loading, with a real ellipsis, until the list has come', async () => {
+    // (The word was once written as the three characters a UTF-8 ellipsis is read as in Windows-1252.)
+    api.list.mockImplementation(() => new Promise(() => {}));
+    await mount();
+    expect(host.querySelector('.form-hint')?.textContent).toBe('Loading…');
+    expect(text()).not.toMatch(/[â€¦]/);
+  });
+
   it('shows what a caller said as plain text, never as markup', async () => {
     await mount();
     const words = card('msg_b').querySelector('.message-text')!;

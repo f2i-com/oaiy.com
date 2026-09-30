@@ -185,7 +185,7 @@ export default function MessagesPanel({ onOpenContact, onOpenAgent }: { onOpenCo
         </p>
       )}
       {error && <p className="form-error" role="alert">Could not read the messages: {error}</p>}
-      {list === null && !error && <p className="form-hint">Loadingâ€¦</p>}
+      {list === null && !error && <p className="form-hint">Loading…</p>}
       {list !== null && shown.length === 0 && (
         <div className="messages-empty">
           <Inbox size={22} aria-hidden />
