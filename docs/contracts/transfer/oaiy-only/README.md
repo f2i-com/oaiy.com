@@ -101,7 +101,8 @@ The plan reasons OAIY puts in an `oaiy.ring.plan` answer are exactly the plugin'
   * the `said` block reaches further (eight words, and "allowed", "permitted", "approved", "okayed" as well as "said" and
     "told"), and "do I have to talk to the manager" is a question put to the receptionist;
   * a person asked for by name counts when the name is the owner's. The desktop has no setting for the owner's name, so the
-    possessive that begins the business's name ("Dave's Lawn Care" gives "dave") is taken as the person to be asked for;
+    possessive that begins the business's name ("Dave's Lawn Care" gives "dave") is taken as the person to be asked for, and
+    asking for the owner by first name rings for no other business name;
   * a zero-width joiner or mark is not seen, and a zero-width space is a space (so a word cut by one is not read). The soft
     hyphen is removed outright, as the shared normaliser removes it.
 

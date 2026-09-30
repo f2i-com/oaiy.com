@@ -18,8 +18,9 @@ use super::plan::{Decision, PlanReason, Reason};
 /// The domain the reserved offer id is derived under.
 pub const OFFER_DOMAIN: &str = "oaiy/transfer-offer/v1";
 
-/// The id of the signed offer the plugin gives a device for a transfer request, and the id the ring
-/// hint carries, so a phone upgrades the ring it already shows instead of ringing again:
+/// The id of the signed offer the plugin gives a device for a transfer request, and the id a ring hint would carry, so that a phone upgrades the
+/// ring it already shows instead of ringing again. **This desktop posts no ring hint, launches no Companion and sends this to nobody**: the id is
+/// computed here and held to the shared fixture (`reserved-offer-id`) so that the two programs agree on it, and nothing else uses it.
 /// `"toffer_"` and the first 26 characters of the lower-case base32 (RFC 4648 alphabet, no padding)
 /// of SHA-256 over the domain, the request id and the device's endpoint-key thumbprint, each
 /// followed by a zero byte before the next; a retired offer takes the next `generation`, which

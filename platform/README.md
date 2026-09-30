@@ -78,7 +78,7 @@ through the [OAIY Bridge protocol](protocol/README.md).
    the Agent to). Its setup wizard takes you through consent, hearing and speaking,
    pairing the phone, your business's hours and services, and answering calls and
    texts with OAIY. Then **AI Receptionist** in the sidebar has the Phone, Calendar,
-   Contacts and Hours & Services. See [the AI Receptionist](../docs/RECEPTIONIST.md).
+   Contacts, Messages, Hours & Services and Transfers. See [the AI Receptionist](../docs/RECEPTIONIST.md).
 5. In FormLogic, configure the Aokie app's forms and event-to-flow bindings.
    Plugin events can trigger those linked flows, and the configured app records
    calls, transcripts and appointments in its workspace. Inspect **Flows → Run

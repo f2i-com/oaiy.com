@@ -1,5 +1,6 @@
 //! Messages callers leave for the owner: what the receptionist takes when the owner cannot
-//! be reached, in `<data>/messages/messages.json` (owner-only: it holds numbers and words).
+//! be reached, in `<data>/messages/messages.json` (it holds numbers and words: made for its owner alone on Linux and macOS, and with the data
+//! folder's own permissions on Windows, where nothing narrows it; see [`crate::secret_file`]).
 //!
 //! A message is `{id, at, callId, from, name, callback, message, urgency, wantsCallback, state,
 //! seenAt, handledAt, handledBy}`. `from` is the number the phone said the call came from: this

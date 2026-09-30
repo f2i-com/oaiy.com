@@ -179,10 +179,16 @@ agent : "I'll try to reach them, please stay with me."  (it is trying: it does n
   is told what happened and why (a notice in the dialog and a notification, at most one chime every ten
   minutes; never that no device is set up when a phone is approved and only set not to ring). The Companion on
   this computer is the approved device the owner ticks on the Transfers page; it is named in
-  `desktopCompanions` while the owner is at the computer, running or not: the notification is what starts
-  a Companion that is not running, and the plugin offers it the request when it connects inside the ring
-  window. The roster carries no kind (a device id, a name and a key), so a Companion is a phone unless the
-  owner ticked it. **"Ring when I am away" holds for phones when no Companion on this computer can take
+  `desktopCompanions` while the owner is at the computer, running or not. **This desktop launches nothing**: the
+  notification and the dialog only tell the owner, no Companion is started by them, and no ring hint is posted to the
+  phone (the reserved offer id of the contract is computed and tested against its fixture, and nothing sends it). A
+  Companion that is not running rings only if the owner opens it while the request is still out, when the plugin offers
+  the request to it as it connects inside the ring window. A roster device is taken to be reachable for the whole ring
+  window, and the plugin offers the call only to those with a live session; a ring nobody is connected to runs out and the
+  caller is offered a message. The roster carries no kind (a device id, a name and a key), so a Companion is a phone unless the
+  owner ticked it, and this desktop cannot tell which approved Companion is on the handset that carries the calls (that one
+  cannot take them: do not approve it, or set it to never ring). Asking for the owner by first name alone is not counted
+  unless the business is named for them (see the phrase check). **"Ring when I am away" holds for phones when no Companion on this computer can take
   the call instead**: an owner at the computer with one phone approved and nothing ticked (the setup of
   most owners) rings the phone, in every state of presence. The reference plan is the raw policy (its 33
   vectors); `Ring::plan_for` is what is done with its answer. `GET /api/ring/preview` asks the same policy

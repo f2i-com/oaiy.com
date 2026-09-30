@@ -45,11 +45,10 @@ const STAGING_NAMES: u64 = 32;
 ///
 /// # Windows
 ///
-/// There is no mode to set there, so nothing narrows the file: it inherits the access-control list
-/// of the folder it is created in. In the default data location that is a folder under the user's
-/// profile, which other accounts cannot read. A data folder the user has moved somewhere else keeps
-/// whatever ACL that folder has. Writing ACLs is a later task (with the keystore); this keeps the
-/// behaviour the stores had on Windows and adds the atomic replace.
+/// There is no mode to set there, so nothing narrows the file: it is NOT private to its owner, and no page or document may say it is. It inherits
+/// the access-control list of the folder it is created in. In the default data location that is a folder under the user's profile, which other
+/// ordinary accounts cannot read (the administrators and the system can). A data folder the user has moved somewhere else keeps whatever ACL that
+/// folder has. Writing ACLs is a later task (with the keystore); this keeps the behaviour the stores had on Windows and adds the atomic replace.
 pub fn write(path: &Path, contents: impl AsRef<[u8]>) -> io::Result<()> {
     write_with(path, contents.as_ref(), next_staging_number, |_| {})
 }

@@ -6,10 +6,11 @@
 //! Taking messages is the fallback of every transfer that is not answered, so it
 //! cannot be off while transfers are on ([`RingSettings::sanitize`] turns it on).
 //!
-//! The file holds numbers (the owner's VIP list), so it is written owner-only
-//! ([`crate::secret_file`]). A file that cannot be read as settings is put aside
-//! as `ring.json.corrupt` and the desktop starts with everything off: a broken
-//! file never turns a transfer on.
+//! The file holds numbers (the owner's VIP list), so it is written through
+//! [`crate::secret_file`]: owner-only on Linux and macOS, and with the data folder's own permissions on Windows, where nothing narrows it. It is
+//! read as UTF-8 or as UTF-16 with its byte order mark. A file that cannot be used (not text, not settings, or from a newer OAIY) is put aside as
+//! `ring.json.corrupt` (`.corrupt.1`, and so on) and the desktop starts with everything off: a broken file never turns a transfer on. A file that
+//! cannot be read at all is left as it is, everything is off, and no change is written over it.
 
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};

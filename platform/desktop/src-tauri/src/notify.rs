@@ -64,7 +64,8 @@ impl GuiRing {
     /// For the desktop's own window.
     pub fn of(app: AppHandle) -> Self {
         let window = app.clone();
-        Self::new(Arc::new(app), Arc::new(move || crate::tray::show_main(&window)))
+        // A ring shows the window and flashes its button; it does not take the keyboard from what the owner is doing.
+        Self::new(Arc::new(app), Arc::new(move || crate::tray::show_main_for_a_ring(&window)))
     }
 }
 

@@ -1,6 +1,7 @@
 //! How many times callers have been put through lately, so a caller cannot make the owner's
 //! devices ring over and over: the tries of the last hour, kept across a restart in
-//! `<data>/ring-attempts.json` (owner-only: it holds callers' numbers).
+//! `<data>/ring-attempts.json` (it holds callers' numbers: made for its owner alone on Linux and macOS, and with the data folder's own
+//! permissions on Windows, where nothing narrows it; see [`crate::secret_file`]).
 //!
 //! A try is counted the moment it is allowed, not when its ring opens, so a request that
 //! passes the policy and then never reaches a ring (a plugin that fails between the two, and
