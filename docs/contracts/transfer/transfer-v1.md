@@ -39,7 +39,8 @@ caller says "can I speak to the owner"
    and answers with the cancelled outcome, or with a transfer_notice when too late)
   an owner device wins the compare-and-swap
   Aokie       --transfer_outcome accepted-----------------------------> OAIY agent   (once, at the accept)
-  OAIY agent: one short fixed line ("Connecting you now"), then nothing more
+  OAIY agent: one short fixed line ("Connecting you now"); while the takeover is
+              pending, at most two short holding lines (about 15 s and 30 s later)
   media setup runs (up to 45 s); the AI is stopped when the human takes the caller
   Aokie       --stop "handoff:takeover"-------------------------------> OAIY
   ... the owner talks to the caller ...
@@ -240,15 +241,28 @@ The AI keeps the caller company during the ring.
 setup**, not when the takeover completes: the plugin reports it at the accept
 (the compare-and-swap in the broker), and the media setup that follows can take
 up to 45 s and can still fail. What OAIY does with it is part of the contract,
-not left to taste: on `accepted` the agent says **one** short fixed line ("Connecting
-you now" or its language's equivalent, no promise of who or when), and then says
-nothing more and does not start a new topic until one of two things happens: the
-session is stopped with `handoff:takeover` (the owner has the caller), or an
-`unavailable` outcome or a fresh `start` with `resume.via = "failback"` arrives
-(the setup failed, up to 55 s later, and the AI has the caller back and offers
-to take a message). Anything the AI says beyond that one line would be spoken over
-the owner's first words. OAIY chooses the wording of the line and its voice, not
-whether to say it and not whether to fall silent.
+not left to taste.
+
+On `accepted` the agent says one short fixed line ("Connecting you now" or its
+language's equivalent, no promise of who or when). While the takeover is still
+**pending** (`accepted` received, and no stop, no `unavailable` outcome and no
+`failback` start yet) it does not start a new topic, and it **may** say up to
+two more short holding lines, at about 15 s and 30 s after `accepted`, each
+saying only that the connection is still being made (never that the owner is on
+the line). A caller must not hear 55 s of silence if the bridge is failing: with
+the two lines the longest stretch of silence is 25 s (from the second line to the
+55 s at which the setup is written off), and without them it is 55 s.
+
+It **must** say nothing once the first of these has arrived: the session is stopped with
+`handoff:takeover` (the owner has the caller), or an `unavailable` outcome or a
+fresh `start` with `resume.via = "failback"` arrives (the setup failed, up to
+55 s after `accepted`, and the AI has the caller back and offers to take a
+message). It never speaks after the stop: the plugin has stopped the session, and
+OAIY cannot speak anyway. The reason not to talk over the owner's first words
+holds only once the takeover has completed, which is why the limit is the
+completion, not the acceptance. OAIY chooses the wording of the lines and its
+voice, not whether to say the first one and not whether to stay silent once the
+takeover has completed or failed.
 
 ## Who may ring, and how the offers are named
 
@@ -330,7 +344,7 @@ sets is ever echoed to the model or to OAIY.
 | `tool_result` `reason`, given by the plugin | `consent`, `pending_request`, `busy`, `bad_arguments`, `plan_unavailable`, `call_changed`; and, from its own checks, `caller_did_not_ask` (the phrase floor, also for `policy_rule`), `not_urgent` (an unconfirmed `urgent`), `limit_call`, `limit_gap`, `limit_caller`, `limit_global` (the plugin's ceilings), `no_endpoint` (a plan that names no device) |
 | `tool_result` `status` | `refused` (do not offer a person), `unavailable` (offer a message) |
 | tool intake errors, `output: {"error": ...}` with no `status` | `busy`, `tool_limit`, `unsupported` |
-| OAIY's own words, defined by OAIY and never sent or received by the plugin | `not_offered` and `tool_limit`: reasons in the tool result OAIY composes itself for `transfer_to_owner` (`status: "unavailable"`) when this call was not given `allowTransfer`, and when its own tool budget for the call is spent. They are not the plugin's tool-intake errors above, which are `{"error": ...}` with no `status` and answer a call that reached the plugin |
+| OAIY's own words, defined by OAIY and never sent or received by the plugin | `not_offered`, `tool_limit` and `no_answer`: reasons in the tool result OAIY composes itself for `transfer_to_owner` (`status: "unavailable"`, offer a message) when nothing reaches the plugin or the plugin does not answer. `not_offered`: transfer is not on for this call (the owner has it off, the call was not given `allowTransfer`, or it is a call the desktop placed). `tool_limit`: OAIY's own tool budget for the call is spent. `no_answer`: the plugin did not answer the request within 25 s, so OAIY answers the model for it (it is not the `expired` outcome, which is a ring nobody answered, sent by the plugin). None of them is the plugin's tool-intake errors above, which are `{"error": ...}` with no `status` and answer a call that reached the plugin |
 | a plan's `reason` the plugin does not know | becomes `plan_unavailable`: nothing the host says is echoed |
 | `transfer_to_owner` `reason` argument | `caller_asked`, `urgent`, `policy_rule` |
 | `transfer_outcome` `outcome` | `accepted`, `declined`, `unavailable`, `expired`, `cancelled` |
