@@ -88,6 +88,8 @@ pub struct ActiveRing {
 struct Live {
     ring: ActiveRing,
     plan: RingPlan,
+    /// The plan this ring opened on (which is used up): the plugin saying again that the request is out names it.
+    plan_id: String,
 }
 
 /// A ring that ended.
@@ -180,7 +182,28 @@ impl Ring {
     /// The plugin says the request is out: this desktop rings. Only for a plan this desktop allowed for the
     /// call and the plugin asked for; a request for anything else is refused and rings nothing.
     pub fn opened(self: &Arc<Self>, params: &OpenedParams) -> Result<ActiveRing, RingError> {
-        let Some(plan) = self.claimed_plan(&params.plan_id, &params.call_id) else {
+        // A request that is going, or is over, is not opened again (a replay, a late duplicate): the ring that is going is the answer, as it is (for
+        // the plan it opened on, which is used up), and one that ended stays ended, nobody told again. Nothing is claimed, judged or used up for
+        // it: a replay that comes after the caller has said something new must not use those words up as the ask of a ring that is already going.
+        {
+            let sessions = self.sessions.lock().unwrap_or_else(|e| e.into_inner());
+            if let Some(live) = sessions.live.iter().find(|l| l.ring.id == params.request_id && l.ring.call_id == params.call_id && l.plan_id == params.plan_id) {
+                return Ok(live.ring.clone());
+            }
+            if sessions.ended.iter().any(|e| e.id == params.request_id) {
+                return Err(error(409, "ring_over", "that ring has already ended"));
+            }
+        }
+        if !self.plan_is_claimed(&params.plan_id, &params.call_id) {
+            return Err(error(409, "unknown_plan", "that plan was not allowed for this call, or has run out: nothing rings"));
+        }
+        // The caller hung up while the request was being planned and sent: nobody is rung for a call that is over. The plan is left as it is, so
+        // the plugin's refusal of the request (which it must now make) gives the try back.
+        if self.call_is_over(&params.call_id) {
+            return Err(error(409, "call_ended", "the call ended while the request was being planned: nothing rings"));
+        }
+        // One plan opens one ring: it is used up here, moved out and not copied.
+        let Some(plan) = self.take_plan(&params.plan_id, &params.call_id) else {
             return Err(error(409, "unknown_plan", "that plan was not allowed for this call, or has run out: nothing rings"));
         };
         // A request opened a ring: the plugin's consent is there.
@@ -201,11 +224,6 @@ impl Ring {
         for id in plan.targets() {
             devices.push(self.device_label(&id));
         }
-        // A ring that ended stays ended: the plugin saying again that the request is out (a replay, a late duplicate) does not
-        // bring back a dialog the owner has seen go, nor tell them again.
-        if self.sessions.lock().unwrap_or_else(|e| e.into_inner()).ended.iter().any(|e| e.id == params.request_id) {
-            return Err(error(409, "ring_over", "that ring has already ended"));
-        }
         let ring = ActiveRing {
             id: params.request_id.clone(),
             call_id: params.call_id.clone(),
@@ -222,14 +240,16 @@ impl Ring {
             taken: false,
             note: String::new(),
         };
+        let toast = plan.desktop_toast;
         {
             let mut sessions = self.sessions.lock().unwrap_or_else(|e| e.into_inner());
             if sessions.live.iter().any(|l| l.ring.id == ring.id) {
                 return Ok(ring);
             }
-            sessions.live.push(Live { ring: ring.clone(), plan: plan.clone() });
+            // The plan moves into the ring it opened: nothing else holds a copy.
+            sessions.live.push(Live { ring: ring.clone(), plan, plan_id: params.plan_id.clone() });
         }
-        if plan.desktop_toast {
+        if toast {
             if let Some(notifier) = self.notifier() {
                 notifier.ringing(&ring);
             }

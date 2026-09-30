@@ -116,6 +116,10 @@ impl crate::ring::CallSource for HubCalls {
         }
     }
 
+    fn is_over(&self, call: &str) -> bool {
+        self.0.upgrade().is_some_and(|inner| VoiceHub { inner }.call_over(call))
+    }
+
     fn cancel_transfer(&self, call: &str, request: &str, reason: transfer::CancelReason) -> tokio::sync::oneshot::Receiver<crate::ring::Withdrawal> {
         let (reply, answer) = tokio::sync::oneshot::channel();
         let Some(inner) = self.0.upgrade() else {
@@ -366,6 +370,12 @@ impl VoiceHub {
             record.ended.get_or_insert_with(Instant::now);
         }
         prune(&mut records);
+    }
+
+    /// Whether this desktop's record of the call says it has ended (a call that began again, handed back by the owner, is not over).
+    pub fn call_over(&self, call: &str) -> bool {
+        let records = self.inner.records.lock().unwrap_or_else(|e| e.into_inner());
+        records.get(call).is_some_and(|r| r.ended.is_some())
     }
 
     /// Who a call is with, by this desktop's own record: for a call that is live or ended within ten minutes.
@@ -1183,6 +1193,25 @@ mod tests {
             assert_eq!(hub.call_facts("call_1"), None);
             assert_eq!(client.post(format!("{base}/api/voice/calls/call_1/message")).json(&json!({"message": "Too late."})).send().await.unwrap().status(), 404);
         }
+    }
+
+    #[test]
+    fn a_call_is_over_from_the_moment_it_ends_until_it_begins_again_and_the_ring_is_told_so() {
+        use crate::ring::CallSource as _;
+        let hub = VoiceHub::new(Engines::at("http://127.0.0.1:9", "http://127.0.0.1:9"), |_| None);
+        let calls = HubCalls(Arc::downgrade(&hub.inner));
+        assert!(!hub.call_over("call_1") && !calls.is_over("call_1"), "a call this desktop never heard of is not one that ended");
+        hub.note_call("call_1", "+61491570006", "");
+        assert!(!hub.call_over("call_1") && !calls.is_over("call_1"), "a call that is going is not over");
+        hub.unregister("call_1");
+        assert!(hub.call_over("call_1") && calls.is_over("call_1"), "the caller hung up");
+        assert!(hub.call_facts("call_1").is_some(), "though it is remembered a while");
+        // It begins again (the owner handed the caller back): it is a call like any other.
+        hub.note_call("call_1", "+61491570006", "");
+        assert!(!hub.call_over("call_1") && !calls.is_over("call_1"));
+        // A hub that is gone has no call to be over.
+        drop(hub);
+        assert!(!calls.is_over("call_1"));
     }
 
     #[tokio::test]

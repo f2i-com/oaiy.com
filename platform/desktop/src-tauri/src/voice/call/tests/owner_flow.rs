@@ -368,6 +368,8 @@ async fn with_transfers_off_or_on_a_call_we_placed_nothing_the_receptionist_says
     })
     .await;
     placed.begin(json!({}));
+    // The call is registered when it has started: a line said before that has no call to be said on.
+    placed.event("call.started", secs(3)).await.expect("the placed call started");
     assert!(placed.say("I'll transfer you now.").await.is_ok());
     assert!(spoken_within(&placed, "I'll transfer you now.", secs(4)).await, "{:?}", placed.speech.spoken());
 }

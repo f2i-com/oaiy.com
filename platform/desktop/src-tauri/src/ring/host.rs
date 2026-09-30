@@ -73,6 +73,11 @@ pub trait CallSource: Send + Sync {
     /// says "no, just take a message", or who is handed back by the owner and says "thanks, that's all sorted", has not asked again). A
     /// request that was refused, or that the phone refused before it rang, has acted on nothing: its ask stands.
     fn consume_turns(&self, _call: &str) {}
+    /// The call has ended (its record is kept a while after: see [`CallSource::facts`]). A request on a call that is over rings nobody: the
+    /// caller who hung up while the request was being planned is not one the owner is rung for.
+    fn is_over(&self, _call: &str) -> bool {
+        false
+    }
 }
 
 /// What came of asking the phone to withdraw a request (see [`CallSource::cancel_transfer`]): what the owner is told is never more than
@@ -123,8 +128,6 @@ struct Grant {
     reason_allowed: bool,
     at: Instant,
     claimed: bool,
-    /// A ring was opened for it: a try that has become a ring is not given back.
-    opened: bool,
 }
 
 /// What a request to reach the owner came to.
@@ -236,21 +239,27 @@ impl Ring {
         u64::try_from(self.clock().local().timestamp_millis()).unwrap_or(0)
     }
 
-    /// A plan this desktop allowed and the plugin asked for: what was decided for the call.
-    pub(super) fn claimed_plan(&self, plan_id: &str, call: &str) -> Option<RingPlan> {
+    /// A plan this desktop allowed and the plugin asked for, taken: what was decided for the call, moved out (not copied) and used up. One plan
+    /// opens one ring, for the request that opened first; a second request on it, or the same one again, finds nothing (the same one again
+    /// is answered before it gets here: see [`Ring::opened`]). Once a ring has opened for it the try is a ring's, and is never given back.
+    pub(super) fn take_plan(&self, plan_id: &str, call: &str) -> Option<RingPlan> {
         let mut grants = self.grants.lock().unwrap_or_else(|e| e.into_inner());
-        let grant = grants.get_mut(plan_id).filter(|g| g.claimed && g.call_id == call && g.at.elapsed() < PLAN_TTL * 4)?;
-        grant.opened = true;
-        Some(grant.plan.clone())
+        grants.get(plan_id).filter(|g| g.claimed && g.call_id == call && g.at.elapsed() < PLAN_TTL * 4)?;
+        grants.remove(plan_id).map(|g| g.plan)
+    }
+
+    /// Whether the call is over (see [`CallSource::is_over`]).
+    pub(super) fn call_is_over(&self, call: &str) -> bool {
+        get(&self.calls).is_some_and(|c| c.is_over(call))
     }
 
     /// The plugin refused a request this desktop allowed (its own checks: consent, a changed call, a plan it could not use)
     /// before any ring opened for it: the try is given back, so a refusal that rang nobody does not start the gap between tries or
-    /// use up the caller's hour. A request that opened a ring is never given back. Whether a try was.
+    /// use up the caller's hour. A request that opened a ring is never given back (its plan is used up when it opens). Whether a try was.
     pub fn request_refused(&self, call: &str) -> bool {
         let refunded = {
             let mut grants = self.grants.lock().unwrap_or_else(|e| e.into_inner());
-            let newest = grants.iter().filter(|(_, g)| g.call_id == call && !g.opened).max_by_key(|(_, g)| g.at).map(|(id, _)| id.clone());
+            let newest = grants.iter().filter(|(_, g)| g.call_id == call).max_by_key(|(_, g)| g.at).map(|(id, _)| id.clone());
             newest.is_some_and(|id| grants.remove(&id).is_some())
         };
         refunded && self.attempts.lock().unwrap_or_else(|e| e.into_inner()).forget_last(call)
@@ -387,7 +396,7 @@ impl Ring {
     /// counts as a try now, and is kept for [`PLAN_TTL`] under its plan id.
     pub fn authorise(&self, call: &str, reason: Reason) -> Authorised {
         let settings = self.settings.get();
-        let Some(info) = self.call_info(call) else {
+        let Some(info) = self.call_info(call).filter(|_| !self.call_is_over(call)) else {
             return Authorised { plan: unknown_call(&settings), plan_id: new_plan_id(), reason_allowed: false, caller_number: String::new(), caller_name: String::new() };
         };
         self.judge(call, reason, info, &settings)
@@ -406,7 +415,7 @@ impl Ring {
             self.attempts.lock().unwrap_or_else(|e| e.into_inner()).record(call, &caller_key(&info.from), now_unix);
             let mut grants = self.grants.lock().unwrap_or_else(|e| e.into_inner());
             grants.retain(|_, g| g.at.elapsed() < PLAN_TTL);
-            grants.insert(id.clone(), Grant { plan_id: id.clone(), call_id: call.to_string(), plan: plan.clone(), reason_allowed, at: Instant::now(), claimed: false, opened: false });
+            grants.insert(id.clone(), Grant { plan_id: id.clone(), call_id: call.to_string(), plan: plan.clone(), reason_allowed, at: Instant::now(), claimed: false });
         }
         Authorised { plan, plan_id: id, reason_allowed, caller_number: info.from, caller_name: info.name }
     }
@@ -417,6 +426,10 @@ impl Ring {
     /// desktop has no record of.
     pub fn plan_for_plugin(&self, call: &str, reason: Reason, fallback: CallInfo) -> Authorised {
         let settings = self.settings.get();
+        // A call that is over (the caller hung up while the request was on its way) is not planned for: nothing rings, and no try is counted.
+        if self.call_is_over(call) {
+            return Authorised { plan: unknown_call(&settings), plan_id: new_plan_id(), reason_allowed: false, caller_number: String::new(), caller_name: String::new() };
+        }
         let info = self.call_info(call).unwrap_or(fallback);
         {
             let mut grants = self.grants.lock().unwrap_or_else(|e| e.into_inner());

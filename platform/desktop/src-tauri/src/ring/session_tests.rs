@@ -28,11 +28,13 @@ struct Calls {
     /// The calls the ring said a request was judged on (see `CallSource::consume_turns`), and whether the call then forgets what was said, as the hub does.
     used: Mutex<Vec<String>>,
     consuming: std::sync::atomic::AtomicBool,
+    /// The calls that are over (the caller hung up).
+    over: Mutex<Vec<String>>,
 }
 
 impl Default for Calls {
     fn default() -> Self {
-        Self { info: Mutex::default(), cancels: Mutex::default(), ended: Mutex::default(), live: std::sync::atomic::AtomicBool::new(true), answer: Mutex::new(Withdrawal::Sent), used: Mutex::default(), consuming: std::sync::atomic::AtomicBool::new(false) }
+        Self { info: Mutex::default(), cancels: Mutex::default(), ended: Mutex::default(), live: std::sync::atomic::AtomicBool::new(true), answer: Mutex::new(Withdrawal::Sent), used: Mutex::default(), consuming: std::sync::atomic::AtomicBool::new(false), over: Mutex::default() }
     }
 }
 
@@ -57,6 +59,9 @@ impl CallSource for Calls {
                 }
             }
         }
+    }
+    fn is_over(&self, call: &str) -> bool {
+        self.over.lock().unwrap().iter().any(|c| c == call)
     }
     fn cancel_transfer(&self, call: &str, request: &str, reason: CancelReason) -> tokio::sync::oneshot::Receiver<Withdrawal> {
         self.cancels.lock().unwrap().push((call.to_string(), request.to_string(), reason));
@@ -220,6 +225,67 @@ fn a_ring_that_does_not_ring_this_computer_shows_in_no_notification() {
     let r = rig(Presence::Idle);
     let plan = r.ring.plan_for_plugin(CALL, Reason::CallerAsked, CallInfo::default());
     assert!(!plan.rings() && !plan.plan_id.is_empty());
+}
+
+/// The tries counted for `CALL` now.
+fn tries(r: &Rig) -> u32 {
+    r.ring.attempts.lock().unwrap().counters(CALL, &crate::ring::host::caller_key("+61491570006"), r.ring.clock().unix()).attempts_this_call
+}
+
+#[test]
+fn a_ring_is_not_opened_for_a_call_that_ended_while_the_request_was_being_planned() {
+    let r = rig(Presence::Active);
+    let plan = planned(&r.ring, CALL);
+    assert_eq!(tries(&r), 1, "the try is counted when the plan is allowed");
+    // The caller hangs up after the plan was allowed and before the plugin says the request is out.
+    r.calls.over.lock().unwrap().push(CALL.to_string());
+    let refused = r.ring.opened(&opened(&plan, "assist_1", CALL, 25, &r.ring)).unwrap_err();
+    assert_eq!((refused.status, refused.code), (409, "call_ended"));
+    // A plan this desktop did not allow is refused as it always was, whether or not the call is over.
+    assert_eq!(r.ring.opened(&opened("plan_made_up", "assist_1", CALL, 25, &r.ring)).unwrap_err().code, "unknown_plan");
+    assert!(r.ring.active().is_empty() && r.notified.rang.lock().unwrap().is_empty(), "nothing rings, and nobody is told");
+    assert!(r.calls.used.lock().unwrap().is_empty(), "the ask of a call that is over is not acted on");
+    // The plugin then refuses the request itself, as it must: nobody was rung, so the try is given back.
+    assert!(r.ring.request_refused(CALL));
+    assert_eq!(tries(&r), 0);
+    // A call that is over is not planned for either: nothing rings and no try is counted.
+    let again = r.ring.plan_for_plugin(CALL, Reason::CallerAsked, CallInfo::default());
+    assert!(!again.rings() && tries(&r) == 0, "{:?}", again.plan);
+    assert!(!r.ring.authorise(CALL, Reason::CallerAsked).rings() && tries(&r) == 0, "nor is a request from the call's own gate allowed");
+    // A call that begins again (the owner handed the caller back) is a call like any other.
+    r.calls.over.lock().unwrap().clear();
+    let plan = planned(&r.ring, CALL);
+    r.ring.opened(&opened(&plan, "assist_2", CALL, 25, &r.ring)).unwrap();
+    assert_eq!(r.ring.active().len(), 1);
+}
+
+#[test]
+fn a_plan_opens_one_ring_and_the_same_request_again_is_the_ring_that_is_going_and_uses_nothing_up() {
+    let r = rig(Presence::Active);
+    r.calls.consuming.store(true, std::sync::atomic::Ordering::SeqCst);
+    let plan = planned(&r.ring, CALL);
+    let first = r.ring.opened(&opened(&plan, "assist_1", CALL, 25, &r.ring)).unwrap();
+    assert_eq!(r.calls.used.lock().unwrap().len(), 1, "the ask was acted on once");
+    // A second request on the same plan is not a ring: the plan was for the one that opened first.
+    let second = r.ring.opened(&opened(&plan, "assist_2", CALL, 25, &r.ring)).unwrap_err();
+    assert_eq!((second.status, second.code), (409, "unknown_plan"));
+    assert_eq!((r.ring.active().len(), r.notified.rang.lock().unwrap().len()), (1, 1), "one ring, one notification");
+    assert_eq!(r.calls.used.lock().unwrap().len(), 1, "and nothing more was used up");
+    // The caller says something new, and the plugin says again that the first request is out (a replay): the ring that is going, as it is, and
+    // the new words are not used up as the ask of a ring that is already going.
+    r.calls.info.lock().unwrap()[0].1.turns.push("Actually, could I speak to the manager instead?".into());
+    let again = r.ring.opened(&opened(&plan, "assist_1", CALL, 25, &r.ring)).unwrap();
+    assert_eq!((again.id.as_str(), again.started_at, again.expires_at), (first.id.as_str(), first.started_at, first.expires_at), "the same ring");
+    assert_eq!(r.calls.used.lock().unwrap().len(), 1, "a replay uses nothing up");
+    assert_eq!(r.calls.info.lock().unwrap()[0].1.turns.len(), 1, "the words they said since are still theirs to ask on");
+    assert_eq!(r.notified.rang.lock().unwrap().len(), 1, "nobody is told again");
+    // Only the plan it opened on says it again: a plan this desktop did not allow does not, though the request is going.
+    assert_eq!(r.ring.opened(&opened("plan_made_up", "assist_1", CALL, 25, &r.ring)).unwrap_err().code, "unknown_plan");
+    // A plan is for its own call, and a request that is going on another call is not this one.
+    let other = rig(Presence::Active);
+    let plan = planned(&other.ring, CALL);
+    other.ring.opened(&opened(&plan, "assist_1", CALL, 25, &other.ring)).unwrap();
+    assert_eq!(other.ring.opened(&opened(&plan, "assist_1", "call_2", 25, &other.ring)).unwrap_err().code, "unknown_plan");
 }
 
 #[test]
