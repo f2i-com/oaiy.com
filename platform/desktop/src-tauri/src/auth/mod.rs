@@ -18,6 +18,7 @@ pub mod principal;
 pub mod routes;
 pub mod scopes;
 pub mod scrub;
+pub mod token;
 
 #[cfg(test)]
 mod route_coverage;

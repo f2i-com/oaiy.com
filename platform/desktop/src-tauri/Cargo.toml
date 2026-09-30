@@ -152,6 +152,12 @@ minisign-verify = "0.2"
 # majority of downloads can be verified with nothing asked of the user.
 sha2 = "0.10"
 
+# The access model's auth core (src/auth): every secret is compared in constant time (`subtle`),
+# and the CSRF value of a cookie session is an HMAC-SHA256 of its token's secret (`hmac`). Both
+# already sit in the tree under other crates; `hmac` shares `sha2`'s `digest` 0.10.
+subtle = "2"
+hmac = "0.12"
+
 # Windows-only: the job object that kills child processes when this process
 # dies, however it dies. Already in the tree transitively (tauri, tokio); named
 # here because a crate cannot `use` an undeclared transitive dependency.
