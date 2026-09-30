@@ -706,6 +706,9 @@ struct Inner {
     legacy: HashMap<String, String>,
     /// Top-level fields of the file this build does not know, written back.
     file_extra: Map<String, Value>,
+    /// Records of a shape this build cannot read (a `kind` or an `app` a newer build made): kept as they
+    /// were written and written back with the rest, never looked up and never honoured (design 4.1 rule 4).
+    unknown: Vec<Value>,
     owner: Option<OwnerFile>,
     min_epoch: u64,
     static_present: bool,
@@ -807,8 +810,20 @@ impl AuthStore {
         let path = dir.join("credentials.json");
         if let Some(bytes) = read_optional(&path)? {
             match parse_credentials(&bytes) {
-                Ok((records, extra)) => {
+                Ok((records, unknown, extra)) => {
                     inner.file_extra = extra;
+                    if !unknown.is_empty() {
+                        log::warn!(
+                            "auth: {} holds {} credential(s) of a kind this build does not know: they are kept in the file and not used",
+                            path.display(),
+                            unknown.len()
+                        );
+                        inner.notices.push(format!(
+                            "{} credential(s) were made by a newer OAIY: they are kept in the file and are not used by this version",
+                            unknown.len()
+                        ));
+                    }
+                    inner.unknown = unknown;
                     for r in records {
                         inner.insert_loaded(r);
                     }
@@ -1317,6 +1332,7 @@ impl Inner {
             records: HashMap::new(),
             legacy: HashMap::new(),
             file_extra: Map::new(),
+            unknown: Vec::new(),
             owner: None,
             min_epoch: 0,
             static_present: false,
@@ -1489,10 +1505,12 @@ impl Inner {
             rows.sort_by(|a, b| (a.created_ms, &a.id).cmp(&(b.created_ms, &b.id)));
             let mut doc = self.file_extra.clone();
             doc.insert("v".into(), Value::from(FILE_VERSION));
-            doc.insert(
-                "credentials".into(),
-                serde_json::to_value(&rows).map_err(io::Error::other)?,
-            );
+            let mut written = serde_json::to_value(&rows).map_err(io::Error::other)?;
+            if let Value::Array(list) = &mut written {
+                // What a newer build wrote and this one cannot read goes back as it came.
+                list.extend(self.unknown.iter().cloned());
+            }
+            doc.insert("credentials".into(), written);
             let mut text =
                 serde_json::to_string_pretty(&Value::Object(doc)).map_err(io::Error::other)?;
             text.push('\n');
@@ -1534,8 +1552,36 @@ enum Unparsable {
     Corrupt(String),
 }
 
-/// The records and the top-level fields this build does not know.
-fn parse_credentials(bytes: &[u8]) -> Result<(Vec<Record>, Map<String, Value>), Unparsable> {
+/// Whether `row` is a record of a newer build: sound in every way this build can check, except that its
+/// `kind` or its `app` is a name this build does not have. (Such a record is kept, not honoured; a record
+/// that is unsound in any other way makes the file unparsable, as before.)
+fn newer_shape(row: &Value) -> bool {
+    let Value::Object(fields) = row else {
+        return false;
+    };
+    let mut probe = fields.clone();
+    let mut replaced = false;
+    if let Some(Value::String(kind)) = fields.get("kind") {
+        if serde_json::from_value::<Kind>(Value::String(kind.clone())).is_err() {
+            probe.insert("kind".into(), Value::from("pat"));
+            replaced = true;
+        }
+    }
+    if let Some(Value::String(app)) = fields.get("app") {
+        if serde_json::from_value::<App>(Value::String(app.clone())).is_err() {
+            probe.insert("app".into(), Value::Null);
+            replaced = true;
+        }
+    }
+    replaced && serde_json::from_value::<Record>(Value::Object(probe)).is_ok()
+}
+
+/// The records this build reads, the ones it keeps without reading (a newer build's), and the top-level
+/// fields it does not know.
+#[allow(clippy::type_complexity)]
+fn parse_credentials(
+    bytes: &[u8],
+) -> Result<(Vec<Record>, Vec<Value>, Map<String, Value>), Unparsable> {
     let doc: Value =
         serde_json::from_slice(bytes).map_err(|e| Unparsable::Corrupt(e.to_string()))?;
     let Value::Object(mut doc) = doc else {
@@ -1551,16 +1597,26 @@ fn parse_credentials(bytes: &[u8]) -> Result<(Vec<Record>, Map<String, Value>), 
     let rows = doc
         .remove("credentials")
         .ok_or_else(|| Unparsable::Corrupt("no credentials".into()))?;
-    let records: Vec<Record> =
-        serde_json::from_value(rows).map_err(|e| Unparsable::Corrupt(e.to_string()))?;
-    let mut seen = std::collections::HashSet::new();
-    for r in &records {
-        if !seen.insert(r.id.as_str()) {
-            return Err(Unparsable::Corrupt(format!(
-                "the id {} appears twice",
-                r.id
-            )));
+    let Value::Array(rows) = rows else {
+        return Err(Unparsable::Corrupt("credentials is not a list".into()));
+    };
+    let mut records: Vec<Record> = Vec::new();
+    let mut unknown: Vec<Value> = Vec::new();
+    for row in rows {
+        match serde_json::from_value::<Record>(row.clone()) {
+            Ok(record) => records.push(record),
+            Err(_) if newer_shape(&row) => unknown.push(row),
+            Err(e) => return Err(Unparsable::Corrupt(e.to_string())),
         }
     }
-    Ok((records, doc))
+    let mut seen = std::collections::HashSet::new();
+    let unknown_ids = unknown
+        .iter()
+        .filter_map(|r| r.get("id").and_then(Value::as_str));
+    for id in records.iter().map(|r| r.id.as_str()).chain(unknown_ids) {
+        if !seen.insert(id) {
+            return Err(Unparsable::Corrupt(format!("the id {id} appears twice")));
+        }
+    }
+    Ok((records, unknown, doc))
 }

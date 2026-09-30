@@ -1852,6 +1852,157 @@ fn a_restart_keeps_persisted_credentials_and_drops_memory_only_ones() {
 }
 
 #[test]
+fn f6_a_record_of_a_kind_or_an_app_this_build_does_not_have_is_kept_untouched_and_never_honoured() {
+    // A newer build wrote a credential of a kind that does not exist here, and one of a known kind for an
+    // app that does not exist here, next to a valid paired token. Rolling back to this build must not lose
+    // the paired token (the file is not "corrupt"), must not honour what it cannot read, and must write
+    // those records back as they came (design 4.1 rule 4: additive compatibility).
+    let dir = TempDir::new("store-newer-records");
+    let clock = clock();
+    let mut valid = file_record("0123456789abcdef", "pat");
+    valid["hash"] = json!(KNOWN_HASH);
+    // A kind this build does not have. Its secret's hash is one this build could match, if it honoured it.
+    let mut other_kind = file_record("1111111111111111", "xyz");
+    other_kind["hash"] = json!(KNOWN_HASH);
+    other_kind["future_field"] = json!({ "nested": [1, 2, 3], "n": 12345678901234567u64 });
+    // A known kind, an app that does not exist here.
+    let mut other_app = file_record("2222222222222222", "pat");
+    other_app["hash"] = json!("b".repeat(64));
+    other_app["app"] = json!("newapp");
+    other_app["scopes"] = json!(["ai.read", "ai.use"]);
+    other_app["another_field"] = json!("kept");
+    write_file(
+        &dir,
+        &json!({ "v": 1, "credentials": [other_kind.clone(), valid, other_app.clone()], "top": "kept" }),
+    );
+
+    let store = open(&dir, &clock);
+    // The valid one works, and nothing was moved aside.
+    let me = store
+        .authenticate(KNOWN_TOKEN, None)
+        .expect("the valid token");
+    assert_eq!(me.kind, PrincipalKind::Pat);
+    let names: Vec<String> = std::fs::read_dir(auth_dir(&dir))
+        .unwrap()
+        .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+        .collect();
+    assert!(
+        !names.iter().any(|n| n.contains("corrupt")),
+        "the file was not treated as corrupt: {names:?}"
+    );
+    assert!(
+        store.notices().iter().any(|n| n.contains("newer OAIY")),
+        "{:?}",
+        store.notices()
+    );
+    // The two it cannot read are not credentials: not found by id, not counted, not usable by any token that
+    // carries their id.
+    assert!(store.record("1111111111111111").is_none());
+    assert!(store.record("2222222222222222").is_none());
+    assert_eq!(store.live_count(Kind::Pat), 1);
+    for kind in ["pat", "dsk", "run", "con"] {
+        for id in ["1111111111111111", "2222222222222222"] {
+            let token = format!("oaiy{kind}_{id}_AAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8");
+            assert_eq!(
+                store.authenticate(&token, None),
+                Err(AuthError::Invalid),
+                "{kind} {id}"
+            );
+        }
+    }
+    // The paired app of the unknown app has its origins, if any, out of the CORS list as well.
+    assert!(store.allowed_origins().is_empty());
+
+    // A write (a new credential) rewrites the file: the two records are still in it, as they were.
+    let made = store.mint(native_pat(&["ai.read"])).unwrap();
+    store.flush().unwrap();
+    let written = read_file(&dir);
+    assert_eq!(written["top"], "kept");
+    let rows = written["credentials"].as_array().unwrap();
+    assert_eq!(
+        rows.len(),
+        4,
+        "the paired token, the new one and the two kept"
+    );
+    for kept in [&other_kind, &other_app] {
+        assert!(rows.contains(kept), "{kept} was kept as it came");
+    }
+    assert!(rows.iter().any(|r| r["id"] == "0123456789abcdef"));
+    assert!(rows.iter().any(|r| r["id"] == made.id.as_str()));
+    // A revocation is a write too, and keeps them.
+    assert!(store.revoke(&made.id, "revoked"));
+    let after_revoke = read_file(&dir);
+    for kept in [&other_kind, &other_app] {
+        assert!(
+            after_revoke["credentials"]
+                .as_array()
+                .unwrap()
+                .contains(kept),
+            "{kept}"
+        );
+    }
+    drop(store);
+    // And so on across a restart: the same again, opened a second time.
+    let store = open(&dir, &clock);
+    assert!(store.authenticate(KNOWN_TOKEN, None).is_ok());
+    assert!(store.record("1111111111111111").is_none());
+    store.flush().unwrap();
+    let again = read_file(&dir);
+    for kept in [&other_kind, &other_app] {
+        assert!(again["credentials"].as_array().unwrap().contains(kept));
+    }
+}
+
+#[test]
+fn f6_a_record_that_is_unsound_in_any_other_way_still_makes_the_file_unparsable() {
+    // Only an unknown `kind` or `app` is a newer build's mark. A record with no hash, a `kind` that is not
+    // a string, or an id that appears twice is a broken file, as before: moved aside, the store starts empty.
+    for (what, rows) in [
+        ("no hash", {
+            let mut r = file_record("aaaaaaaaaaaaaaaa", "pat");
+            r.as_object_mut().unwrap().remove("hash");
+            json!([r])
+        }),
+        ("a kind that is not text", {
+            let mut r = file_record("aaaaaaaaaaaaaaaa", "pat");
+            r["kind"] = json!(7);
+            json!([r])
+        }),
+        ("an unknown kind and a missing hash", {
+            let mut r = file_record("aaaaaaaaaaaaaaaa", "xyz");
+            r.as_object_mut().unwrap().remove("hash");
+            json!([r])
+        }),
+        (
+            "the same id twice, one of them of an unknown kind",
+            json!([
+                file_record("aaaaaaaaaaaaaaaa", "pat"),
+                file_record("aaaaaaaaaaaaaaaa", "xyz")
+            ]),
+        ),
+        ("credentials that is not a list", json!({ "a": 1 })),
+    ] {
+        let dir = TempDir::new("store-unsound");
+        let clock = clock();
+        write_file(&dir, &json!({ "v": 1, "credentials": rows }));
+        let store = open(&dir, &clock);
+        assert!(store.record("aaaaaaaaaaaaaaaa").is_none(), "{what}");
+        assert!(
+            store.notices().iter().any(|n| n.contains("moved aside")),
+            "{what}: {:?}",
+            store.notices()
+        );
+        let moved = std::fs::read_dir(auth_dir(&dir)).unwrap().any(|e| {
+            e.unwrap()
+                .file_name()
+                .to_string_lossy()
+                .contains("credentials.json.corrupt-")
+        });
+        assert!(moved, "{what}: the file was moved aside");
+    }
+}
+
+#[test]
 fn unknown_fields_are_kept_and_written_back() {
     let dir = TempDir::new("store-extra");
     let clock = clock();
@@ -1965,9 +2116,10 @@ fn a_file_that_is_json_but_not_a_credential_file_is_corrupt_too() {
         ("string-version", r#"{"v":"1","credentials":[]}"#),
         ("no-credentials", r#"{"v":1}"#),
         ("bad-record", r#"{"v":1,"credentials":[{"id":5}]}"#),
+        // An unknown kind alone is a newer build's record (kept, not corrupt: F6); one with no id is nobody's.
         (
-            "unknown-kind",
-            r#"{"v":1,"credentials":[{"id":"a","kind":"tok","hash":"x"}]}"#,
+            "unknown-kind-and-no-id",
+            r#"{"v":1,"credentials":[{"kind":"tok","hash":"x"}]}"#,
         ),
     ] {
         let dir = TempDir::new(&format!("store-corrupt-{tag}"));
