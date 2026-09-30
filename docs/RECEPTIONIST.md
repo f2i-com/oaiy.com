@@ -139,7 +139,8 @@ What happens, every way it can go:
 
 The receptionist never promises a callback time, never says why you are not available, and has no
 number of yours to give. What the caller hears does not depend on the model or the Agent page
-working: the desktop says short fixed lines itself, on its own clocks.
+working: the desktop says short fixed lines itself, on its own clocks. The one silence is deliberate: after
+you accept, the receptionist says one line and then nothing until you have the call (see below).
 
 - **While you are rung**, if the receptionist has said nothing, a hold line five seconds in and
   another every 15 seconds after (three wordings in turn, at most six, so a ring of 90 seconds is

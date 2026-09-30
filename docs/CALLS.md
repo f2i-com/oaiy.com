@@ -122,7 +122,9 @@ unchanged and checked by `scripts/check-transfer-contract.mjs`; what only OAIY d
 next to it); the code is `voice/transfer.rs`, `voice/call.rs` and
 `ring/`. **Consent is not signed on this computer** (a plugin could flip a scope), so the owner's switch is
 best kept off unless every installed plugin is trusted: the Transfers page and `RECEPTIONIST.md` say so. The rule for
-all of it: **a caller is never left in silence for long, and never told a lie.**
+all of it: **a caller is never left in silence for long, and never told a lie.** There is one deliberate silence: once the
+owner has accepted, the receptionist says "Connecting you now" and then nothing until the owner has the call or the
+takeover has failed (up to 55 seconds), because the contract asks it not to speak over the owner's first words.
 The desktop's own clocks (`Transfer`, not the phone, the app or the model) say fixed lines: a hold line five
 seconds into a ring and every 15 seconds after (three wordings, at most six), "Connecting you now" at once
 on an acceptance and then nothing at all until the call is the owner's or the takeover fails (55 seconds:
@@ -171,10 +173,11 @@ agent : "I'll try to reach them, please stay with me."  (it is trying: it does n
   call is in the call's own note. The model is told to say "I'll try", never that the call is
   transferred, connected or on hold before it is told the owner accepted; to offer a message, never
   promise a callback time or say why; and that it has no number of the owner's to give.
-- **Tools never overlap.** The phone ends a call that makes a tool call while another is unanswered
-  and at its ninth. Tools go to the phone as they always did, except that a transfer waits for any
-  tool on the wire and any tool waits for a transfer on the wire, at most four wait, and a transfer is
-  not asked for once six tools have been sent (one is kept for the goodbye).
+- **Tools never overlap.** The phone answers a tool call made while another is unanswered `busy`, the 25th
+  tool call of a call `tool_limit`, and ends the session at its 35th (`transfer-v1.md`, Tool names). Tools go to
+  the phone as they always did, except that a transfer waits for any tool on the wire and any tool waits for a
+  transfer on the wire, at most four wait, and a transfer is not asked for once six tools have been sent (one is
+  kept for the goodbye): this desktop's own limit, well inside the phone's.
 - **Handed over, handed back.** The owner taking the call ends this session and not the call: the app
   is told (`call.handoff`) and the call stays in a ledger (it is in `hello.calls` and
   `GET /api/voice/calls`). If the owner hands the caller back, or the takeover fails and the call
