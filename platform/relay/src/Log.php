@@ -33,6 +33,11 @@ final class Log
         try {
             $dir = dirname($file);
             if (!is_dir($dir)) {
+                // logs/ belongs in a data/ folder that the installer made. A relay that was never installed (a wrong layout, a
+                // request before the installer ran) must not create a data/ folder of its own just by failing to start.
+                if (!is_dir(dirname($dir))) {
+                    return;
+                }
                 @mkdir($dir, 0700, true);
             }
             if (is_file($file) && (int)@filesize($file) > self::MAX_BYTES) {

@@ -303,6 +303,22 @@ test('9.2 privacy: canary secrets planted in every credential field never appear
     }
 });
 
+test('4.18.2 a relay that was never installed does not create a data/ folder by logging its failure to start; an installed one makes logs/ inside its data/', function () {
+    $base = Tmp::dir('nolog');
+    try {
+        Oaiy\Relay\Log::setFile($base . '/data/logs/relay.log');
+        Oaiy\Relay\Log::write('error', 'internal', ['where' => 'bootstrap']);
+        ok(!file_exists($base . '/data'), 'no data/ was made');
+        // With a data/ folder the log folder and file appear, as before.
+        mkdir($base . '/data', 0700);
+        Oaiy\Relay\Log::write('error', 'internal', ['where' => 'bootstrap']);
+        ok(is_file($base . '/data/logs/relay.log'));
+        eq(1, count(file($base . '/data/logs/relay.log')));
+    } finally {
+        Oaiy\Relay\Log::setFile(null);
+    }
+});
+
 test('9.2 privacy: the log carries event names, codes and ids, and scrubs anything credential-shaped', function () {
     $r = Relay::make();
     Oaiy\Relay\Log::setFile($r->data . '/logs/test.log');
