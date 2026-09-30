@@ -174,7 +174,13 @@ final class Poll
     {
         $wakeFile = $this->cfg->wakeMode() === 'file';
         $w0 = $wakeFile ? $this->signals->wakeRead($mailbox) : '';
-        $needAck = !$lookup && $this->mb->hasAckable($mailbox, $q['since']);
+        // The acknowledgement is applied now, before the wait and not when the hold ends (4.3, 4.18.4): `since` says the
+        // consumer has these items, and a mailbox that was full of them has room again while the consumer waits.
+        if (!$lookup && $this->mb->hasAckable($mailbox, $q['since'])) {
+            $this->db->write(function (Db $db) use ($mailbox, $q, $now): void {
+                $this->mb->ackInTx($db, $mailbox, $q['since'], $now);
+            });
+        }
         [$items, $more] = $this->pick($this->mb->fetch($mailbox, $q['since'], $q['limit'] + 1, $q['re'], $now), $q['limit'], $q['maxBytes']);
         $superseded = false;
 
@@ -234,11 +240,8 @@ final class Poll
 
         if (!$lookup) {
             $seqs = array_map(static fn(array $r): int => (int)$r['seq'], $items);
-            if ($needAck || $seqs) {
-                $this->db->write(function (Db $db) use ($mailbox, $q, $needAck, $seqs, $now): void {
-                    if ($needAck) {
-                        $this->mb->ackInTx($db, $mailbox, $q['since'], $now);
-                    }
+            if ($seqs) {
+                $this->db->write(function (Db $db) use ($mailbox, $seqs, $now): void {
                     $this->mb->markDeliveredInTx($db, $mailbox, $seqs, $now);
                 });
             }

@@ -109,6 +109,31 @@ test('4.7.2 rule 1: a newer hold of the same principal supersedes the older and 
     eq([], array_filter(glob(dirname($r->data) . '/*'), fn($p) => !in_array(basename($p), ['data'], true)), 'nothing was written outside data/');
 });
 
+test('4.5 poll since: the acknowledgement is applied when the poll arrives and not when its hold ends, so a mailbox that was full has room while the consumer waits', function () {
+    $r = Relay::make(['limits' => ['mailboxItems' => 3], 'capacity' => ['workers' => 20]]);
+    $d = $r->desktop();
+    $prov = $r->provider();
+    [$holder, $poster] = $r->fleet(2);
+    foreach ([1, 2, 3] as $i) {
+        eq('queued', holds_post($poster, $prov, ['to' => $d->inbox(), 'lane' => 'cmd', 'id' => "fill$i", 'body' => "b$i"])['json']['results'][0]['status']);
+    }
+    eq('quota_exceeded', holds_post($poster, $prov, ['to' => $d->inbox(), 'lane' => 'cmd', 'id' => 'fill4', 'body' => 'b4'])['json']['results'][0]['error']['code'], 'the mailbox is full');
+    $first = $r->call($d, 'GET', '/v1/poll')['json'];
+    eq([1, 2, 3], array_column($first['items'], 'seq'));
+    // The consumer has all three and says so, and waits.
+    $poll = holds_begin($holder, $d, ['since' => '3', 'wait' => '6']);
+    usleep(800000);
+    $db = $r->ctx()->db;
+    eq([0, 3], [(int)$db->val('SELECT live_items FROM mailboxes WHERE id = ?', [$d->inbox()]), (int)$db->val('SELECT COUNT(*) FROM items WHERE mailbox = ? AND state = 2', [$d->inbox()])], 'the three are acknowledged while the poll is still being held');
+    $t = microtime(true);
+    $res = holds_post($poster, $prov, ['to' => $d->inbox(), 'lane' => 'cmd', 'id' => 'fill4', 'body' => 'b4']);
+    eq('queued', $res['json']['results'][0]['status'], $res['body']);
+    $got = holds_finish($poll, 8.0);
+    eq(200, $got['status'], $got['body']);
+    eq(['fill4'], array_column($got['json']['items'], 'id'));
+    ok(microtime(true) - $t < 2.0, 'the held poll was woken by the post');
+});
+
 test('4.7.2 rule 1: a device that polls again while its older hold is still ending needs no new place, so it is not refused because of that older hold', function () {
     $r = Relay::make();
     $h = $r->ctx()->holds; // soft 3
