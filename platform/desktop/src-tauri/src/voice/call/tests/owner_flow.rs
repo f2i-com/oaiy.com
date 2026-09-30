@@ -1286,6 +1286,12 @@ async fn a_second_session_for_a_call_that_is_still_live_takes_the_call_and_the_f
     assert_eq!(f.dialog().await.len(), 1, "the ring for it goes on");
     assert!(again.say("Are you still there?").await.is_ok(), "the second session has the call's commands");
     assert!(spoken_within(&again, "Are you still there?", secs(3)).await, "and says what it is asked to: {:?}", again.speech.spoken());
+    // The phone's word on the ring the first session began comes on the new stream, and is taken there as it is for a ring a session never saw begin
+    // (not ignored, and not stale): the app is told, and the ring is over.
+    again.send(outcome(&again, "assist_1", "declined", None));
+    let told = again.event("call.transfer", secs(3)).await.expect("the outcome of the first session's ring is taken by the second");
+    assert_eq!((told["requestId"].clone(), told["outcome"].clone()), (json!("assist_1"), json!("declined")), "{told}");
+    assert_eq!(f.dialog().await.len(), 0, "and the ring is over");
     // The second ends the call, and that is the end of it: the app is told once, the record has it over, and what rang is over.
     again.send(json!({"type": "formlogic.realtime.stop", "callId": again.call, "generation": 2, "reason": "the caller hung up"}));
     let ended = again.event("call.ended", secs(3)).await.expect("the end is told, by the session that carried the call");
