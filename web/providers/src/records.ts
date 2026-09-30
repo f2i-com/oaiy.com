@@ -4,6 +4,7 @@
  */
 import { isLoopbackHost } from '@oaiy/shared/providers/errors';
 import { normalizeApiBase } from '@oaiy/shared/providers/endpoints';
+import { MAX_BODY_BYTES } from '@oaiy/shared/broker/protocol';
 import { EXTRA_HEADER_NAMES, PROVIDER_CAPS, type Dialect, type ExtraHeader, type ProviderCap, type ProviderKind, type ProviderRecord, type ServerKind } from '@oaiy/shared/providers/types';
 
 /** What a form hands over: text and choices, not yet a record. Numbers may still be text. */
@@ -20,6 +21,9 @@ export interface RecordInput {
   extraHeaders?: unknown;
   contextTokens?: unknown;
   parallelAgents?: unknown;
+  /** The largest request body in bytes, and the cap on a reply's length in tokens: see `ProviderRecord.limits`. */
+  maxBodyBytes?: unknown;
+  maxOutputTokens?: unknown;
 }
 
 export type Validation = { ok: true; record: ProviderRecord } | { ok: false; errors: Record<string, string> };
@@ -110,6 +114,10 @@ export function validateRecord(input: RecordInput, id: string): Validation {
   if (contextTokens === null) errors.contextTokens = 'The context window is a whole number of tokens, 1024 or more.';
   const parallelAgents = wholeNumber(input.parallelAgents, 1, 16);
   if (parallelAgents === null) errors.parallelAgents = 'How many agents may use it at once is a whole number from 1 to 16.';
+  const maxBodyBytes = wholeNumber(input.maxBodyBytes, 1024, MAX_BODY_BYTES);
+  if (maxBodyBytes === null) errors.maxBodyBytes = `The largest request is a whole number of bytes from 1024 to ${MAX_BODY_BYTES}.`;
+  const maxOutputTokens = wholeNumber(input.maxOutputTokens, 1, 1_000_000);
+  if (maxOutputTokens === null) errors.maxOutputTokens = 'The cap on a reply is a whole number of tokens, 1 to 1,000,000.';
 
   if (Object.keys(errors).length > 0 || baseUrl === null || name === null) return { ok: false, errors };
 
@@ -130,6 +138,10 @@ export function validateRecord(input: RecordInput, id: string): Validation {
   if (serverKind !== undefined) record.serverKind = serverKind;
   if (contextTokens !== undefined && contextTokens !== null) record.contextTokens = contextTokens;
   if (parallelAgents !== undefined && parallelAgents !== null) record.parallelAgents = parallelAgents;
+  const limits: NonNullable<ProviderRecord['limits']> = {};
+  if (maxBodyBytes !== undefined && maxBodyBytes !== null) limits.maxBodyBytes = maxBodyBytes;
+  if (maxOutputTokens !== undefined && maxOutputTokens !== null) limits.maxOutputTokens = maxOutputTokens;
+  if (Object.keys(limits).length > 0) record.limits = limits;
   return { ok: true, record };
 }
 

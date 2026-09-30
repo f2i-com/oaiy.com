@@ -8,6 +8,7 @@
  * the page, that keys are typed only at this address.
  */
 import { validateRecord, movesKey, type RecordInput } from './records';
+import { DEFAULT_MAX_BODY_BYTES, MODAL_APP } from '@oaiy/shared/broker/protocol';
 import { appNames } from './config';
 import { fill, h } from './dom';
 import type { Context } from './context';
@@ -148,6 +149,9 @@ export function mountManage(root: HTMLElement, ctx: Context): void {
     const key = h('input', { attrs: { type: 'password', autocomplete: 'off', spellcheck: 'false', placeholder: editing ? 'Stored on this device. Leave empty to keep it.' : preset.kind === 'local-server' ? 'Usually empty' : 'Paste the key' } });
     const modelText = h('input', { attrs: { type: 'text', autocomplete: 'off', spellcheck: 'false', placeholder: 'or type a model name' }, value: editing?.model ?? '' });
     const modelSelect = h('select', { attrs: { 'aria-label': 'Model' } });
+    // What the holder bounds for this provider (volume, not cost): the largest request, and a cap on the length of a chat reply.
+    const maxBody = h('input', { attrs: { type: 'number', min: '1', max: '32768', step: '1', placeholder: '1024 (the default)' }, value: editing?.limits?.maxBodyBytes ? String(Math.round(editing.limits.maxBodyBytes / 1024)) : '' });
+    const maxTokens = h('input', { attrs: { type: 'number', min: '1', max: '1000000', step: '1', placeholder: 'No cap' }, value: editing?.limits?.maxOutputTokens ? String(editing.limits.maxOutputTokens) : '' });
     const extras = (preset.extraHeaders ?? []).map((headerName) => ({
       headerName,
       input: h('input', { attrs: { type: 'text', autocomplete: 'off', placeholder: 'Optional' }, value: editing?.extraHeaders?.find((x) => x.name.toLowerCase() === headerName.toLowerCase())?.value ?? '' }),
@@ -194,6 +198,8 @@ export function mountManage(root: HTMLElement, ctx: Context): void {
       extraHeaders: extras.map((x) => ({ name: x.headerName, value: x.input.value })),
       contextTokens: editing?.contextTokens,
       parallelAgents: editing?.parallelAgents,
+      maxBodyBytes: maxBody.value.trim() ? Number(maxBody.value) * 1024 : undefined,
+      maxOutputTokens: maxTokens.value.trim() || undefined,
     });
     const showErrors = (errors: Record<string, string>): void => {
       problems.textContent = Object.values(errors).join(' ');
@@ -267,6 +273,8 @@ export function mountManage(root: HTMLElement, ctx: Context): void {
       ...extras.map((x) => field(x.headerName, x.input)),
       field('Model', modelSelect),
       modelText,
+      field('Largest request (KiB)', maxBody, 'A request larger than this is not sent. Chat needs little; raise it for images or audio.'),
+      field('Cap on a reply (tokens)', maxTokens, 'When set, the holder puts this in every chat request, so an app cannot ask for a longer reply.'),
       result,
       problems,
       h('div', { class: 'actions' }, check, save, clearKey, h('button', { class: 'button', text: 'Cancel', on: { click: () => { form = null; drawIdleForm(); } } })),
@@ -275,23 +283,50 @@ export function mountManage(root: HTMLElement, ctx: Context): void {
 
   // --- Apps and their budgets ---------------------------------------------------
   async function drawApps(): Promise<void> {
+    const records = await ctx.store.list();
+    const capped = records.filter((r) => r.limits?.maxOutputTokens);
+    const uncapped = records.filter((r) => !r.limits?.maxOutputTokens);
+    const largest = Math.max(DEFAULT_MAX_BODY_BYTES, ...records.map((r) => r.limits?.maxBodyBytes ?? 0));
+    const mib = (bytes: number): string => `${Math.round((bytes / 1024 / 1024) * 10) / 10} MiB`;
     const rows = await Promise.all(
-      appNames(ctx.apps).map(async (app) => {
+      [...appNames(ctx.apps), MODAL_APP].map(async (app) => {
         const usage = await ctx.budget.usage(app);
         const limit = h('input', { attrs: { type: 'number', min: '0', max: '100000', step: '1', 'aria-label': `Requests an hour for ${app}` }, value: String(usage.limit) });
+        const bytesLimit = h('input', { attrs: { type: 'number', min: '0', max: '4096', step: '1', 'aria-label': `MiB an hour for ${app}` }, value: String(Math.round(usage.byteLimit / 1024 / 1024)) });
         const status = h('span', { class: 'fine', attrs: { role: 'status' } });
         const set = h('button', { class: 'button', text: 'Set' });
         set.addEventListener('click', () =>
-          void ctx.budget.setLimit(app, Number(limit.value)).then(
-            () => (status.textContent = 'Saved.'),
-            (e: unknown) => (status.textContent = e instanceof Error ? e.message : 'Not saved.'),
-          ),
+          void ctx.budget
+            .setLimit(app, Number(limit.value))
+            .then(() => ctx.budget.setByteLimit(app, Math.round(Number(bytesLimit.value) * 1024 * 1024)))
+            .then(
+              () => (status.textContent = 'Saved.'),
+              (e: unknown) => (status.textContent = e instanceof Error ? e.message : 'Not saved.'),
+            ),
         );
-        const origin = [...ctx.apps].find(([, name]) => name === app)?.[0] ?? '';
-        return h('li', { class: 'row' }, h('div', { class: 'grow' }, h('strong', { text: app }), h('span', { class: 'fine', text: ` ${origin} · ${usage.used} of ${usage.limit} requests used this hour` })), h('div', { class: 'actions' }, limit, set, status));
+        const origin = app === MODAL_APP ? 'the Test and Load models buttons of the embedded modal' : ([...ctx.apps].find(([, name]) => name === app)?.[0] ?? '');
+        return h(
+          'li',
+          { class: 'row' },
+          h(
+            'div',
+            { class: 'grow' },
+            h('strong', { text: app }),
+            h('span', { class: 'fine', text: ` ${origin} · ${usage.used} of ${usage.limit} requests and ${mib(usage.bytes)} of ${mib(usage.byteLimit)} used this hour` }),
+            h('br'),
+            h('span', { class: 'fine', text: `Worst case an hour: ${usage.limit} requests, at most ${mib(Math.min(usage.byteLimit, usage.limit * largest))} sent.` }),
+          ),
+          h('div', { class: 'actions' }, limit, h('span', { class: 'fine', text: 'requests' }), bytesLimit, h('span', { class: 'fine', text: 'MiB' }), set, status),
+        );
       }),
     );
-    fill(appsBox, h('h2', { text: 'Apps' }), h('p', { class: 'fine', text: 'These apps can ask this site to call your providers with your keys, up to the number of requests an hour set here. They cannot read a key, add a provider or change an address.' }), rows.length ? h('ul', { class: 'rows' }, ...rows) : h('p', { class: 'fine', text: 'None.' }));
+    fill(
+      appsBox,
+      h('h2', { text: 'Apps' }),
+      h('p', { class: 'fine', text: 'These apps can ask this site to call your providers with your keys, up to the requests and the bytes an hour set here. They cannot read a key, add a provider or change an address. A request is refused when it is larger than its provider allows.' }),
+      h('p', { class: 'fine', text: `What this limits is VOLUME: how much is asked of your providers, not what it costs. An app can still name any model your key may use, and a reply's price is the provider's. ${capped.length ? `A cap on the length of a reply is set for ${capped.map((r) => r.name).join(', ')}` : 'No provider has a cap on the length of a reply'}${uncapped.length && capped.length ? `; ${uncapped.map((r) => r.name).join(', ')} ${uncapped.length === 1 ? 'has' : 'have'} none` : records.length && !capped.length ? ' (set one in a provider’s form)' : ''}. Set spending limits on the keys at the providers as well.` }),
+      rows.length ? h('ul', { class: 'rows' }, ...rows) : h('p', { class: 'fine', text: 'None.' }),
+    );
   }
 
   const redraw = (): void => {
@@ -299,7 +334,10 @@ export function mountManage(root: HTMLElement, ctx: Context): void {
     void drawList();
     void drawApps();
   };
-  ctx.store.onChange(() => void drawList());
+  ctx.store.onChange(() => {
+    void drawList();
+    void drawApps();
+  });
   drawIdleForm();
   redraw();
 }

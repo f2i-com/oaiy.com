@@ -11,7 +11,8 @@ import { buildRequestUrl, recordHeaders, RequestRefused } from '@oaiy/shared/pro
 import { errorBody, type FetchRequest, type StreamBody } from '@oaiy/shared/broker/protocol';
 import type { Budget } from './budget';
 import { fixedErrorBody, fixedStatusText, safeResponseHeaders } from './fixed';
-import { classifyFailure, type PageInfo } from './net';
+import { BodyRefused, capOutputTokens, maxBodyBytes } from './limits';
+import { bodyBytes, budgetMessage, classifyFailure, type PageInfo } from './net';
 import type { ProviderStore } from './store';
 
 export interface FetcherDeps {
@@ -45,10 +46,22 @@ export function createFetcher(deps: FetcherDeps): Fetcher {
         return fail('internal', 'The request could not be made.');
       }
 
-      const taken = await deps.budget.take(app);
-      if (!taken.ok) {
-        return fail('budget', `This app has made its ${taken.limit} requests for this hour. It can go on when the hour has passed, or the limit can be raised on the Providers page.`, { retryAfterMs: taken.retryAfterMs });
+      // What is sent is bounded before it is counted: a body over the record's limit is refused, and where the record caps a reply the
+      // holder puts the cap in the request itself.
+      let body = request.body;
+      if (request.method === 'POST' && body !== undefined) {
+        try {
+          if (bodyBytes(body) > maxBodyBytes(record)) throw new BodyRefused('too-large', `A request to this provider may carry up to ${maxBodyBytes(record)} bytes. The limit can be raised for this provider on the Providers page.`);
+          body = capOutputTokens(record, request.path, body);
+          if (bodyBytes(body) > maxBodyBytes(record)) throw new BodyRefused('too-large', `A request to this provider may carry up to ${maxBodyBytes(record)} bytes. The limit can be raised for this provider on the Providers page.`);
+        } catch (e) {
+          if (e instanceof BodyRefused) return fail(e.code, e.message);
+          return fail('internal', 'The request could not be made.');
+        }
       }
+
+      const taken = await deps.budget.take(app, request.method === 'POST' ? bodyBytes(body) : 0);
+      if (!taken.ok) return fail('budget', budgetMessage(taken.reason, taken.limit, taken.byteLimit), { retryAfterMs: taken.retryAfterMs });
 
       let why: 'aborted' | 'timeout' | null = null;
       const controller = new AbortController();
@@ -71,7 +84,7 @@ export function createFetcher(deps: FetcherDeps): Fetcher {
           response = await deps.fetchImpl(url, {
             method: request.method,
             headers,
-            body: request.method === 'GET' ? undefined : (request.body as BodyInit | undefined),
+            body: request.method === 'GET' ? undefined : (body as BodyInit | undefined),
             signal: controller.signal,
             // Never follow a redirect: a key sent in a header would go on to wherever the provider (or whoever answered for it) said.
             redirect: 'manual',

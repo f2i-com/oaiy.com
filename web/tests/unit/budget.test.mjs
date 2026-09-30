@@ -15,9 +15,9 @@ describe('the budget', () => {
     assert.equal(await h.budget.limit('agent'), 600);
     assert.equal(M.sharedProtocol.DEFAULT_BUDGET_PER_HOUR, 600);
     const first = await h.budget.take('agent');
-    assert.deepEqual(first, { ok: true, remaining: 599 });
-    assert.deepEqual(await h.budget.usage('agent'), { used: 1, limit: 600 });
-    assert.deepEqual(await h.budget.usage('flows'), { used: 0, limit: 600 }, 'the other app has its own');
+    assert.deepEqual(first, { ok: true, remaining: 599, bytesRemaining: 64 * 1024 * 1024 });
+    assert.deepEqual(await h.budget.usage('agent'), { used: 1, limit: 600, bytes: 0, byteLimit: 64 * 1024 * 1024 });
+    assert.deepEqual(await h.budget.usage('flows'), { used: 0, limit: 600, bytes: 0, byteLimit: 64 * 1024 * 1024 }, 'the other app has its own');
   });
 
   it('refuses the request after the limit, says when the hour makes room, and gives the room back as the hour slides', async () => {
@@ -48,7 +48,7 @@ describe('the budget', () => {
     const reloaded = anotherDocument(h);
     assert.equal(await reloaded.budget.limit('flows'), 2);
     assert.equal((await reloaded.budget.take('flows')).ok, false);
-    assert.deepEqual(await reloaded.budget.usage('flows'), { used: 2, limit: 2 });
+    assert.deepEqual(await reloaded.budget.usage('flows'), { used: 2, limit: 2, bytes: 0, byteLimit: 64 * 1024 * 1024 });
   });
 
   it('two documents cannot both take the last request', async () => {
@@ -75,6 +75,6 @@ describe('the budget', () => {
     let at = 1_000_000;
     const h = makeHolder({ now: () => at });
     await h.db.put('budget', 'agent', [at + 10 * HOUR, at + 10 * HOUR]);
-    assert.deepEqual(await h.budget.usage('agent'), { used: 0, limit: 600 });
+    assert.deepEqual(await h.budget.usage('agent'), { used: 0, limit: 600, bytes: 0, byteLimit: 64 * 1024 * 1024 });
   });
 });

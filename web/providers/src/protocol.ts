@@ -100,9 +100,9 @@ export function createBroker(deps: BrokerDeps): Broker {
       page: deps.page,
       key: (record) => deps.store.key(record.id),
       onModels: (record, ids) => deps.store.rememberModels(record.id, ids),
-      take: async () => {
-        const taken = await deps.budget.take(app);
-        return taken.ok ? { ok: true } : { ok: false, limit: taken.limit, retryAfterMs: taken.retryAfterMs };
+      take: async (bytes) => {
+        const taken = await deps.budget.take(app, bytes);
+        return taken.ok ? { ok: true } : taken;
       },
     });
 

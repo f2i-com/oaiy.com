@@ -26,8 +26,19 @@ const OP_SET: ReadonlySet<string> = new Set(OPS);
 
 // --- Limits -----------------------------------------------------------------
 
-/** The most a request body may hold. */
+/**
+ * The most a request body may EVER hold: the ceiling the checker enforces and a record's own limit cannot pass. What a request may hold
+ * in practice is `DEFAULT_MAX_BODY_BYTES`, or what the record says (`limits.maxBodyBytes`), because a request that carries megabytes is
+ * money, and the holder bounds volume, not cost.
+ */
 export const MAX_BODY_BYTES = 32 * 1024 * 1024;
+/** What a request body may hold when the record says nothing (1 MiB: a long conversation, an image of moderate size). */
+export const DEFAULT_MAX_BODY_BYTES = 1024 * 1024;
+/** The default number of bytes an app may send in an hour, across its requests. */
+export const DEFAULT_BYTES_PER_HOUR = 64 * 1024 * 1024;
+/** The embedded modal's Test and Load-models buttons call the provider too: they are an "app" of their own with their own, smaller hour. */
+export const MODAL_APP = 'modal';
+export const DEFAULT_MODAL_BUDGET_PER_HOUR = 60;
 /** How long a request may take when it says nothing, and the least and most it may ask for (ms). */
 export const DEFAULT_TIMEOUT_MS = 120_000;
 export const MIN_TIMEOUT_MS = 1_000;
@@ -256,6 +267,8 @@ export type ErrorCode =
   | 'bad-url'
   | 'bad-headers'
   | 'too-many'
+  | 'too-large'
+  | 'bad-body'
   | 'budget'
   | 'locked'
   | 'timeout'

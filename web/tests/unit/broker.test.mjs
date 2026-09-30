@@ -419,7 +419,7 @@ describe('the budget, where a request leaves', () => {
     const client = await w.connect();
     for (let i = 0; i < 5; i++) await client.call({ op: 'list' });
     await client.call({ op: 'status' });
-    assert.deepEqual(await w.budget.usage('agent'), { used: 0, limit: 1 });
+    assert.deepEqual(await w.budget.usage('agent'), { used: 0, limit: 1, bytes: 0, byteLimit: 64 * 1024 * 1024 });
   });
 });
 

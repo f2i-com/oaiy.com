@@ -60,12 +60,35 @@ export class BudgetExhausted extends Error {
   readonly limit: number;
   readonly retryAfterMs: number;
 
-  constructor(limit: number, retryAfterMs: number) {
-    super(`The app has made its ${limit} requests for this hour.`);
+  readonly reason: 'requests' | 'bytes';
+  readonly byteLimit: number;
+
+  constructor(limit: number, retryAfterMs: number, reason: 'requests' | 'bytes' = 'requests', byteLimit = 0) {
+    super(budgetMessage(reason, limit, byteLimit));
     this.name = 'BudgetExhausted';
     this.limit = limit;
     this.retryAfterMs = retryAfterMs;
+    this.reason = reason;
+    this.byteLimit = byteLimit;
   }
+}
+
+/** What an app is told when its hour is used up: fixed wording, a function of which limit it hit. */
+export function budgetMessage(reason: 'requests' | 'bytes', limit: number, byteLimit: number): string {
+  const size = byteLimit >= 1024 * 1024 ? `${Math.round((byteLimit / 1024 / 1024) * 10) / 10} MiB` : `${Math.round(byteLimit / 1024)} KiB`;
+  return reason === 'bytes'
+    ? `This app has sent its ${size} for this hour. It can go on when the hour has passed, or the limit can be raised on the Providers page.`
+    : `This app has made its ${limit} requests for this hour. It can go on when the hour has passed, or the limit can be raised on the Providers page.`;
+}
+
+/** What taking one request of an hour's allowance answers. */
+export type TakeResult = { ok: true } | { ok: false; reason: 'requests' | 'bytes'; limit: number; byteLimit: number; retryAfterMs: number };
+
+/** The size in bytes of a request body: text as UTF-8, bytes as they are, nothing as 0. */
+export function bodyBytes(body: unknown): number {
+  if (typeof body === 'string') return new TextEncoder().encode(body).byteLength;
+  if (body instanceof ArrayBuffer || ArrayBuffer.isView(body)) return body.byteLength;
+  return 0;
 }
 
 /**
@@ -76,15 +99,15 @@ export class BudgetExhausted extends Error {
 export function guardedFetch(
   record: Pick<ProviderRecord, 'baseUrl'>,
   fetchImpl: typeof fetch,
-  take?: () => Promise<{ ok: true } | { ok: false; limit: number; retryAfterMs: number }>,
+  take?: (bytes: number) => Promise<TakeResult>,
 ): typeof fetch {
   const origin = new URL(record.baseUrl).origin;
   return async (input, init) => {
     const url = typeof input === 'string' ? input : input instanceof URL ? input.href : input.url;
     if (new URL(url).origin !== origin) throw new TypeError('blocked: not the provider’s own address');
     if (take) {
-      const taken = await take();
-      if (!taken.ok) throw new BudgetExhausted(taken.limit, taken.retryAfterMs);
+      const taken = await take(bodyBytes(init?.body));
+      if (!taken.ok) throw new BudgetExhausted(taken.limit, taken.retryAfterMs, taken.reason, taken.byteLimit);
     }
     const response = await fetchImpl(url, { ...init, redirect: 'manual', credentials: 'omit', cache: 'no-store', referrerPolicy: 'no-referrer' });
     if (response.type === 'opaqueredirect' || (response.status >= 300 && response.status < 400)) {

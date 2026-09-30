@@ -103,6 +103,11 @@ export interface ProviderRecord {
   serverKind?: ServerKind;
   via: ProviderVia;
   parallelAgents?: number;
+  /**
+   * What the holder bounds for this provider, beyond an app's hourly count: the largest request body (default 1 MiB, at most 32) and, when
+   * set, a cap the holder puts on the reply length of a chat request (`max_tokens`). They bound VOLUME; they do not bound cost.
+   */
+  limits?: { maxBodyBytes?: number; maxOutputTokens?: number };
 }
 
 /** What a page is told about a record: everything but the secret. `hasKey` says whether one is stored; `locked` whether the vault could open it. */

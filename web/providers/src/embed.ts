@@ -7,6 +7,7 @@
  * so this modal never asks. Adding, editing and removing providers, keys, addresses and budgets are in the Providers page, which
  * this modal opens in a tab of its own.
  */
+import { MODAL_APP } from '@oaiy/shared/broker/protocol';
 import { fill, h } from './dom';
 import type { Context } from './context';
 import { createTester } from './test';
@@ -15,7 +16,10 @@ import type { ProviderRecord } from '@oaiy/shared/providers/types';
 
 export function mountEmbed(root: HTMLElement, ctx: Context): void {
   // The modal is a frame of the holder's own origin, so an app cannot read what it shows: a provider's words may be shown (as text, scrubbed).
-  const tester = (key: () => Promise<string>) => createTester({ fetchImpl: ctx.fetchImpl, page: ctx.page, key, providerText: 'scrubbed', onModels: (record, ids) => ctx.store.rememberModels(record.id, ids) });
+  // The modal's buttons call the provider too, and a page cannot press them, but a hostile page can draw over them: they count against an
+  // hour of their own (the `modal` app), which the owner sets on the Providers page.
+  const tester = (key: () => Promise<string>) =>
+    createTester({ fetchImpl: ctx.fetchImpl, page: ctx.page, key, providerText: 'scrubbed', onModels: (record, ids) => ctx.store.rememberModels(record.id, ids), take: async (bytes) => { const taken = await ctx.budget.take(MODAL_APP, bytes); return taken.ok ? { ok: true } : taken; } });
   const list = h('ul', { class: 'rows' });
   const openManage = h('button', { class: 'button', text: 'Manage providers…' });
   openManage.addEventListener('click', () => {

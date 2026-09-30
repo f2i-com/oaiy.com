@@ -15,7 +15,7 @@ import { listRecordModels } from '@oaiy/shared/providers/models';
 import { providerTypeOf } from '@oaiy/shared/providers/adapters';
 import type { TestResult } from '@oaiy/shared/broker/protocol';
 import type { ProviderRecord } from '@oaiy/shared/providers/types';
-import { BudgetExhausted, classifyFailure, guardedFetch, type PageInfo } from './net';
+import { BudgetExhausted, budgetMessage, classifyFailure, guardedFetch, type PageInfo, type TakeResult } from './net';
 import { probeContext, type ProbeResult } from './probe';
 
 export interface TesterDeps {
@@ -24,7 +24,7 @@ export interface TesterDeps {
   /** The key of a record (the holder's own; it never leaves). */
   key: (record: ProviderRecord) => Promise<string>;
   /** Counts one request against the app that asked; absent for the top-level page's own tests. */
-  take?: () => Promise<{ ok: true } | { ok: false; limit: number; retryAfterMs: number }>;
+  take?: (bytes: number) => Promise<TakeResult>;
   /**
    * Whether an error's message may hold the provider's own words. `omit` (the default, and what the port always uses): the message is fixed
    * wording that depends on the status alone. `scrubbed`: the words, with the key taken out, as inert text: only for the holder's own pages
@@ -44,10 +44,7 @@ export interface Tester {
 const DUMMY_TOOL = { type: 'function', function: { name: 'noop', description: 'Does nothing.', parameters: { type: 'object', properties: {} } } };
 
 export function createTester(deps: TesterDeps): Tester {
-  const budgetResult = (e: BudgetExhausted): TestResult => ({
-    ok: false,
-    error: { kind: 'budget', message: `This app has made its ${e.limit} requests for this hour. It can go on when the hour has passed, or the limit can be raised on the Providers page.` },
-  });
+  const budgetResult = (e: BudgetExhausted): TestResult => ({ ok: false, error: { kind: 'budget', message: budgetMessage(e.reason, e.limit, e.byteLimit) } });
 
   async function models(record: ProviderRecord): Promise<TestResult> {
     const key = await deps.key(record);

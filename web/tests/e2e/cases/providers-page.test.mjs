@@ -122,13 +122,13 @@ describe('the Providers page', () => {
     const { page } = await newPage(context);
     await page.goto(`${world.origins.providers}/`);
     const apps = page.locator('section[aria-label="Apps"]');
-    await apps.getByText('0 of 600 requests used this hour').first().waitFor();
+    await apps.getByText('0 of 600 requests and').first().waitFor();
     const agent = apps.locator('li.row', { hasText: 'agent' });
-    await agent.locator('input[type=number]').fill('7');
+    await agent.locator('input[aria-label="Requests an hour for agent"]').fill('7');
     await agent.getByRole('button', { name: 'Set' }).click();
     await agent.getByText('Saved.').waitFor();
     await page.reload();
-    await apps.locator('li.row', { hasText: 'agent' }).getByText('of 7 requests used this hour').waitFor();
+    await apps.locator('li.row', { hasText: 'agent' }).getByText('of 7 requests and').waitFor();
     await context.close();
   });
 });
@@ -165,6 +165,74 @@ describe('what a provider says about itself is text (design 6, threat 11)', () =
     } finally {
       await context.close();
       await hostile.close();
+    }
+  });
+});
+
+describe('what the holder bounds (volume, not cost)', () => {
+  it('the modal\'s Load models button counts against an hour of its own; the Apps section shows the worst case and says it bounds volume', async () => {
+    const { context } = await newContext(browser);
+    try {
+      const top = await newPage(context);
+      await addProvider(top.page, world.origins.providers, details({ name: 'Counted', check: false }));
+      const apps = top.page.locator('section[aria-label="Apps"]');
+      await apps.getByText('Worst case an hour').first().waitFor();
+      const text = await apps.innerText();
+      assert.match(text, /VOLUME: how much is asked of your providers, not what it costs/);
+      assert.match(text, /No provider has a cap on the length of a reply|Counted has none|set one in a provider/);
+      const modal = apps.locator('li.row', { hasText: 'modal' });
+      await modal.locator('input[aria-label="Requests an hour for modal"]').fill('2');
+      await modal.getByRole('button', { name: 'Set' }).click();
+      await modal.getByText('Saved.').waitFor();
+
+      const before = fake.log.filter((r) => r.path === '/v1/models' && r.method === 'GET').length;
+      const embed = await newPage(context);
+      await embed.page.goto(`${world.origins.providers}/embed.html`);
+      await embed.page.locator('li.row').first().waitFor();
+      const status = embed.page.locator('li.row .result');
+      for (let i = 0; i < 3; i++) {
+        await embed.page.getByRole('button', { name: 'Load models' }).click();
+        await waitFor(async () => /Loading…/.test(await status.innerText()) === false, { what: 'the models to load' });
+      }
+      assert.match(await status.innerText(), /2 requests for this hour/, 'the third press is refused in fixed words');
+      const after = fake.log.filter((r) => r.path === '/v1/models' && r.method === 'GET').length;
+      assert.equal(after - before, 2, 'and only two reached the provider');
+    } finally {
+      await context.close();
+    }
+  });
+
+  it('a provider with a cap on a reply and a largest request: the holder refuses a bigger one and puts the cap in a chat request', async () => {
+    const { context } = await newContext(browser);
+    try {
+      const top = await newPage(context);
+      await addProvider(top.page, world.origins.providers, details({ name: 'Bounded', check: false }));
+      const form = await editProvider(top.page, 'Bounded');
+      await form.locator('input[placeholder="1024 (the default)"]').fill('8');
+      await form.locator('input[placeholder="No cap"]').fill('128');
+      await form.getByRole('button', { name: 'Save changes' }).click();
+      await top.page.locator('section[aria-label="Apps"]').getByText('A cap on the length of a reply is set for Bounded').waitFor({ timeout: 8000 });
+
+      const app = await newPage(context);
+      await app.page.goto(`${world.origins.flows}/`);
+      await app.page.evaluate((origin) => window.oaiyTest.connect({ origin }), world.origins.providers);
+      const id = (await app.page.evaluate(() => window.oaiyTest.call({ op: 'list' }))).result.find((p) => p.name === 'Bounded').id;
+      const big = JSON.stringify({ model: 'fake-chat', messages: [{ role: 'user', content: 'x'.repeat(9000) }] });
+      const refused = await app.page.evaluate(async ([provider, b]) => {
+        window.oaiyTest.startStream('big', { provider, path: '/chat/completions', method: 'POST', body: b, headers: [['content-type', 'application/json']] });
+        return window.oaiyTest.streamDone('big');
+      }, [id, big]);
+      assert.equal(refused.at(-1).error.code, 'too-large');
+      const before = fake.log.length;
+      const ok = await app.page.evaluate(async ([provider, b]) => {
+        window.oaiyTest.startStream('ok', { provider, path: '/chat/completions', method: 'POST', body: b, headers: [['content-type', 'application/json']] });
+        return window.oaiyTest.streamDone('ok');
+      }, [id, JSON.stringify({ model: 'fake-chat', max_tokens: 999999, messages: [{ role: 'user', content: 'hi' }] })]);
+      assert.equal(ok[0].status, 200);
+      const seen = fake.log.slice(before).find((r) => r.method === 'POST');
+      assert.equal(JSON.parse(seen.body).max_tokens, 128, 'the provider was asked for at most the cap');
+    } finally {
+      await context.close();
     }
   });
 });
