@@ -30,6 +30,16 @@ gui = [
     "dep:oaiy-studio",
     "dep:tauri-build",
 ]
+# The browser login of `oaiy-server` (design 4.7): the Argon2id password, the strength estimate and
+# the console. Enabled for the headless server and left off for the desktop, so the GUI carries the
+# guard and the credential store but none of the login.
+web = [
+    "dep:argon2",
+    "dep:unicode-normalization",
+    "dep:zxcvbn",
+    "dep:rpassword",
+    "dep:zeroize",
+]
 
 [[bin]]
 name = "oaiy-desktop"
@@ -161,6 +171,17 @@ sha2 = "0.10"
 subtle = "2"
 hmac = "0.12"
 
+# The web login (feature `web`, src/auth/{password,policy,console}.rs). `argon2` is RustCrypto's
+# (0.5, password-hash 0.5, `digest` 0.10 like `sha2` above): Argon2id, PHC strings. The password is
+# Unicode NFKC-normalised before it is hashed or judged, `zxcvbn` estimates how guessable it is, and
+# the console reads a password from the terminal without echoing it.
+argon2 = { version = "0.5", optional = true }
+unicode-normalization = { version = "0.1", optional = true }
+zxcvbn = { version = "3", optional = true }
+rpassword = { version = "7", optional = true }
+# Already in the tree (crypto_box, ed25519-dalek): what holds a password is wiped when it is dropped.
+zeroize = { version = "1", optional = true }
+
 # Windows-only: the job object that kills child processes when this process
 # dies, however it dies. Already in the tree transitively (tauri, tokio); named
 # here because a crate cannot `use` an undeclared transitive dependency.
@@ -170,6 +191,16 @@ windows-sys = { version = "0.61", features = [
     "Win32_System_JobObjects",
     "Win32_System_Threading",
 ] }
+
+# An unoptimised Argon2 at 64 MiB and three passes takes seconds, and the estimate of a password
+# scans dictionaries: the tests that hash and judge would each wait for them. Only these crates are
+# optimised in the test profile; the crate's own code keeps its debug build.
+[profile.dev.package.argon2]
+opt-level = 3
+[profile.dev.package.blake2]
+opt-level = 3
+[profile.dev.package.zxcvbn]
+opt-level = 3
 
 [dev-dependencies]
 # The tests of the updater's redirect policy build a reqwest 0.13 client, which needs the TLS provider the updater plugin installs for
