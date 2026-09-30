@@ -10,6 +10,8 @@
 import assert from 'node:assert/strict';
 import { after, before, describe, it } from 'node:test';
 import { launchBrowser, newContext, newPage, startWorld } from '../harness.mjs';
+import { startFakeProvider } from '../fake-provider.mjs';
+import { addProvider } from '../providers-page.mjs';
 
 let world;
 let browser;
@@ -68,6 +70,29 @@ describe('E2 isolation', () => {
     assert.equal(hello?.t, 'hello');
     assert.equal(await (await frameOf(page)).evaluate(() => crossOriginIsolated), false);
     await context.close();
+  });
+
+  it('an embedder that gives the frame the `credentialless` attribute gets an anonymous, empty store, so the frame must not be given it (3.1 requirement 2)', async () => {
+    const fake = await startFakeProvider({ cors: { allowOrigins: [world.origins.providers] } });
+    const { context } = await newContext(browser);
+    try {
+      const top = await newPage(context);
+      await addProvider(top.page, world.origins.providers, { name: 'Saved at the top', preset: 'A server on this computer', serverKind: 'other', baseUrl: fake.baseUrl, key: '' });
+      const { page } = await newPage(context);
+      await page.goto(`${world.origins.agent}/`);
+      const normal = await page.evaluate((origin) => window.oaiyTest.connect({ origin }), world.origins.providers);
+      assert.equal(normal?.t, 'hello');
+      assert.equal((await page.evaluate(() => window.oaiyTest.call({ op: 'list' }))).result.length, 1, 'control: an ordinary frame lists it');
+      await page.evaluate(() => window.oaiyTest.disconnect());
+
+      const anonymous = await page.evaluate((origin) => window.oaiyTest.connect({ origin, credentialless: true }), world.origins.providers);
+      assert.equal(anonymous?.t, 'hello', 'it loads and answers');
+      const listed = await page.evaluate(() => window.oaiyTest.call({ op: 'list' }));
+      assert.deepEqual(listed.result, [], 'but its storage is another one, empty: nothing saved at the top-level window is in it');
+    } finally {
+      await context.close();
+      await fake.close();
+    }
   });
 
   it('a top-level visit of the providers origin is isolated by its own COOP and COEP', async () => {

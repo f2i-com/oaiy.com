@@ -53,10 +53,12 @@
      * Embed the providers frame and say hello. Resolves with the holder's hello, or `null` if nothing answered in time (a frame the
      * browser refused to load, or a holder that dropped the message).
      */
-    async connect({ origin, path = '/broker.html', v = 1, timeoutMs = 4000, allow = DEFAULT_ALLOW, hello = true } = {}) {
+    async connect({ origin, path = '/broker.html', v = 1, timeoutMs = 4000, allow = DEFAULT_ALLOW, hello = true, credentialless = false } = {}) {
       const iframe = document.createElement('iframe');
       iframe.hidden = true;
       iframe.allow = allow;
+      // The design says the frame must NOT be given this (it puts its storage in an anonymous, ephemeral partition): E2 shows it.
+      if (credentialless) iframe.setAttribute('credentialless', '');
       iframe.src = `${origin}${path}`;
       holder.iframe = iframe;
       const loaded = new Promise((resolve) => iframe.addEventListener('load', resolve, { once: true }));

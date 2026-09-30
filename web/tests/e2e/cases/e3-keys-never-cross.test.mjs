@@ -424,6 +424,9 @@ describe('E3.5 the policy of every document', () => {
       assert.ok(!csp.includes('unsafe-inline') && !csp.includes("'unsafe-eval'"), `${p}: no unsafe script`);
       assert.match(csp, /default-src 'none'/);
       assert.match(csp, /script-src 'self' 'wasm-unsafe-eval'/);
+      assert.match(csp, /worker-src 'self' blob:/);
+      assert.match(csp, /frame-src 'none'/);
+      assert.match(csp, /object-src 'none'/);
       assert.match(csp, /style-src 'self';/);
       assert.match(csp, /connect-src \*/);
       assert.match(csp, /base-uri 'none'/);

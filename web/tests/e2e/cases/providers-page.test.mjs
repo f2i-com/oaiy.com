@@ -133,6 +133,64 @@ describe('the Providers page', () => {
   });
 });
 
+describe('what a provider says about itself is text (design 6, threat 11)', () => {
+  it('a provider name and a model name that are markup are shown as what they say, on the Providers page and in the modal, and nothing runs', async () => {
+    const NAME = '<img src=x onerror="window.__x=1">';
+    const MODEL = '<img src=y onerror="window.__x=2">';
+    const hostile = await startFakeProvider({ cors: { allowOrigins: [world.origins.providers] }, models: [MODEL, 'plain-model'] });
+    const { context } = await newContext(browser);
+    try {
+      const { page } = await newPage(context);
+      await addProvider(page, world.origins.providers, { name: NAME, preset: 'A server on this computer', serverKind: 'other', baseUrl: hostile.baseUrl, key: '', check: true });
+      const row = page.locator('section[aria-label="Your providers"] li.row');
+      assert.ok((await row.innerText()).includes(NAME), 'the name is shown as it was written');
+      assert.equal(await page.locator('section[aria-label="Your providers"] img').count(), 0, 'and is not an image');
+      // The model list of the form is text too.
+      const form = await editProvider(page, NAME);
+      await form.getByRole('button', { name: 'Check connection' }).click();
+      await form.locator('.result.good').waitFor({ timeout: 10000 });
+      const options = await form.locator('select[aria-label="Model"] option').allTextContents();
+      assert.ok(options.includes(MODEL), `the model is listed as written: ${options}`);
+      assert.equal(await page.locator('img').count(), 0, 'no image anywhere on the page');
+      assert.equal(await page.evaluate(() => window.__x), undefined, 'and nothing ran');
+
+      const modal = await newPage(context);
+      await modal.page.goto(`${world.origins.providers}/embed.html`);
+      await modal.page.locator('li.row').first().waitFor();
+      await modal.page.getByRole('button', { name: 'Load models' }).click();
+      await waitFor(async () => (await modal.page.locator('select option').allTextContents()).includes(MODEL), { what: 'the model list in the modal' });
+      assert.ok((await modal.page.locator('li.row').innerText()).includes(NAME));
+      assert.equal(await modal.page.locator('img').count(), 0);
+      assert.equal(await modal.page.evaluate(() => window.__x), undefined);
+    } finally {
+      await context.close();
+      await hostile.close();
+    }
+  });
+});
+
+describe('the modal\'s Manage button', () => {
+  it('opens the Providers page in a tab of its own, with no opener, where the address bar shows whose form it is', async () => {
+    const { context } = await newContext(browser);
+    try {
+      const app = await newPage(context);
+      await app.page.goto(`${world.origins.flows}/`);
+      await app.page.evaluate((origin) => {
+        const frame = document.createElement('iframe');
+        frame.src = `${origin}/embed.html`;
+        document.body.append(frame);
+      }, world.origins.providers);
+      const frame = await waitFor(() => app.page.frames().find((f) => f.url() === `${world.origins.providers}/embed.html`), { what: 'the modal' });
+      const [popup] = await Promise.all([context.waitForEvent('page'), frame.getByRole('button', { name: /Manage providers/ }).click()]);
+      await popup.waitForLoadState();
+      assert.equal(popup.url(), `${world.origins.providers}/`);
+      assert.equal(await popup.evaluate(() => window.opener), null, 'no opener: the app cannot reach the page it opened');
+    } finally {
+      await context.close();
+    }
+  });
+});
+
 describe('storage.persist()', () => {
   it('is asked for once by the top-level Providers page, and never by the port or the modal', async () => {
     const { context } = await newContext(browser);
