@@ -29,7 +29,8 @@ const GENERATION_PATH = { openai: '/chat/completions', anthropic: '/messages' } 
 /**
  * The body with the reply length capped, when the record sets a cap and the request is a chat request. `max_tokens` (and, for the
  * OpenAI dialect, `max_completion_tokens`) is set to the cap when the request asks for more or names none; a smaller ask is kept. A chat
- * body that is not a JSON object is refused: the holder cannot cap what it cannot read. Anything else is returned as it was.
+ * body that is not a JSON object is refused: the holder cannot cap what it cannot read. So is one that asks for more than one reply
+ * (`n`, `best_of` above 1: the cap is on the length of each, so many replies are many times the cap). Anything else is returned as it was.
  */
 export function capOutputTokens(record: Pick<ProviderRecord, 'dialect' | 'limits'>, path: string, body: RequestBody | undefined): RequestBody | undefined {
   const cap = record.limits?.maxOutputTokens;
@@ -49,6 +50,13 @@ export function capOutputTokens(record: Pick<ProviderRecord, 'dialect' | 'limits
   };
   if (record.dialect === 'anthropic') clamp('max_tokens');
   else {
+    // A cap on the length of ONE reply is no cap on the volume if the request may ask for many: `n` replies of the capped length each, or
+    // `best_of` candidates made for one. Both are refused unless they say one (or say nothing).
+    for (const name of ['n', 'best_of']) {
+      if (name in asked && asked[name] !== 1 && asked[name] !== null) {
+        throw new BodyRefused('bad-body', `This provider caps the length of a reply, and does not take a request for more than one reply (${name}) with it.`);
+      }
+    }
     // Either name asks for a reply length; one that is present is capped, and `max_tokens` is set when neither is.
     let any = false;
     for (const name of ['max_tokens', 'max_completion_tokens']) {

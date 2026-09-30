@@ -80,6 +80,30 @@ describe('a cap on the length of a reply, put in the request by the holder', () 
     assert.equal(sent(w).messages[0].role, 'user');
   });
 
+  it('a request for more than one reply (n, best_of) is refused when a cap is set: max_tokens 100 with n 128 is 12,800 tokens, not 100 (the review\'s low 6)', async () => {
+    const w = await world({ record: { maxOutputTokens: 100 }, handler: () => jsonResponse({}) });
+    const client = await w.connect();
+    for (const extra of [{ n: 128 }, { n: 2 }, { n: '128' }, { n: 1.5 }, { n: -1 }, { n: 0 }, { best_of: 20 }, { best_of: '3' }, { max_tokens: 100, n: 128 }, { n: 1, best_of: 8 }, { n: [1] }, { n: {} }]) {
+      const result = await chat(client, w, jsonBody(extra));
+      assert.equal(result.error?.code, 'bad-body', JSON.stringify(extra));
+      assert.match(result.error.message, /more than one reply/, JSON.stringify(extra));
+    }
+    assert.equal(w.fetchStub.calls.length, 0, 'nothing was sent for any of them');
+    for (const extra of [{ n: 1 }, { n: null }, { best_of: 1 }, {}]) {
+      await chat(client, w, jsonBody(extra));
+      assert.equal(sent(w).max_tokens, 100, JSON.stringify(extra));
+    }
+    assert.equal(w.fetchStub.calls.length, 4, 'one reply each is sent, capped');
+  });
+
+  it('with no cap set, n and best_of are the app\'s own to ask (untouched byte for byte)', async () => {
+    const plain = await world({ handler: () => jsonResponse({}) });
+    const c = await plain.connect();
+    const body = '{"model":"m","n":4,"best_of":4,"max_tokens":50}';
+    await chat(c, plain, body);
+    assert.equal(plain.fetchStub.calls.at(-1).body, body);
+  });
+
   it('Anthropic dialect: max_tokens is required and is cut to the cap', async () => {
     const w = await world({ record: { dialect: 'anthropic', baseUrl: 'https://api.anthropic.com/v1', preset: 'anthropic', maxOutputTokens: 256 }, handler: () => jsonResponse({}) });
     const client = await w.connect();

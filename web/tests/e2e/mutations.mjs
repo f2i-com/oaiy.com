@@ -401,6 +401,13 @@ const MUTATIONS = [
     files: { 'shared/broker/protocol.ts': [{ find: ' || UNSAFE_TEXT.test(model) || model !== model.trim()) {', replace: ' || model !== model.trim()) {' }] },
     caught: ['is refused where the request is read'],
   },
+  {
+    name: 'L6 a reply cap that lets n through',
+    what: 'the cap on a reply\'s length is put in the request, and a request for 128 replies is sent as it is',
+    tests: ['tests/unit/spend.test.mjs'],
+    files: { 'web/providers/src/limits.ts': [{ find: /    for \(const name of \['n', 'best_of'\]\) \{\n[\s\S]*?\n      \}\n    \}\n/, replace: '' }] },
+    caught: ['a request for more than one reply (n, best_of) is refused when a cap is set'],
+  },
   // Leaks the scans must find. They put the key where a scan of TEXT does not look (the reviewer's two: a Uint8Array, and reversed).
   {
     name: 'H1 leak: list returns the key as a Uint8Array',
