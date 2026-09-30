@@ -190,7 +190,8 @@ mod tests {
         let Some(first) = OsIdle.idle_seconds() else { return }; // a session with no input at all (a service) says nothing
         std::thread::sleep(std::time::Duration::from_millis(1_200));
         let second = OsIdle.idle_seconds().expect("a session that said a time says another");
-        assert!((first + 1..=first + 4).contains(&second) || second < first, "idle {first} s, then {second} s a second and a bit later: neither on by about that nor back to nothing");
+        // (Input in that time puts it back to nothing: at most the second and a bit since, whatever it was before.)
+        assert!((first + 1..=first + 4).contains(&second) || second <= 1, "idle {first} s, then {second} s a second and a bit later: neither on by about that nor back to nothing");
         // Somebody used the computer within the last few seconds: they are at an unlocked screen, and the presence says so.
         let now = OsIdle.idle_seconds().unwrap_or(u64::MAX);
         if now < 3 {
