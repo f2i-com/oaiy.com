@@ -137,6 +137,35 @@ const MUTATIONS = [
     files: { 'web/package.json': [{ find: '"vite": "7.3.6"', replace: '"vite": "^7.3.6"' }] },
     caught: ['devDependencies: each is a version, exactly'],
   },
+  {
+    name: 'F10 no lane runs the web tests',
+    what: 'the gate\'s web/ lane no longer runs npm test',
+    tests: ['tests/unit/gate.test.mjs'],
+    files: { '.github/workflows/ci.yml': [{ find: '      - name: Typecheck and unit tests (web/)\n        working-directory: web\n        run: npm test\n', replace: '' }] },
+    caught: ['has a lane for web/ that installs from the lockfile and runs the typecheck and the unit tests'],
+  },
+  {
+    name: 'F10 the lockfile drifts',
+    what: 'the lockfile says another version of typescript than the manifest pins',
+    tests: ['tests/unit/gate.test.mjs'],
+    files: { 'web/package-lock.json': [{ find: '"typescript": "5.9.3"', replace: '"typescript": "5.9.2"' }] },
+    caught: ['lists the same dependencies as the manifest, each locked at the version the manifest pins'],
+  },
+  {
+    name: 'F10 a package from somewhere else',
+    what: 'the lockfile resolves packages to an address that is not the registry',
+    tests: ['tests/unit/gate.test.mjs'],
+    files: { 'web/package-lock.json': [{ find: '"resolved": "https://registry.npmjs.org/', replace: '"resolved": "https://example.invalid/' }] },
+    caught: ['holds every package from the registry, with an integrity hash'],
+  },
+  {
+    // The check moved with the code to shared/; a check that read the editor's re-export would pass with a request in the code.
+    name: 'F10 a request in the shared download helper',
+    what: 'shared/downloads.ts gains a function that calls fetch',
+    tests: ['tests/unit/downloads.test.mjs', '../platform/ui/tests/downloads.mjs'],
+    files: { 'shared/downloads.ts': [{ find: 'export function assetNames(version: string) {', replace: "export function leak() {\n  return fetch('https://example.invalid/');\n}\n\nexport function assetNames(version: string) {" }] },
+    caught: ['is pure: no fetch, no XMLHttpRequest', 'downloads.mjs'],
+  },
   // Leaks the scans must find. They put the key where a scan of TEXT does not look (the reviewer's two: a Uint8Array, and reversed).
   {
     name: 'H1 leak: list returns the key as a Uint8Array',
