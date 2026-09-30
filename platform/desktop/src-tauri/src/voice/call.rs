@@ -1298,8 +1298,9 @@ where
                             Some(line) => {
                                 speak(line.to_string(), false, None);
                             }
-                            // A request is going: the caller is spoken to by its clocks, and never hung up on for want of a page.
-                            None if transfer.busy() => {}
+                            // A request is going (it rings, or an owner device has it, or it is asked for and the phone has not answered yet, or it waits
+                            // behind another tool): the caller is spoken to by its clocks, and never hung up on for want of a page.
+                            None if transfer.busy() || tools.transfer_pending() => {}
                             None => {
                                 let (reply, _) = oneshot::channel();
                                 if let Some(tx) = hub.command(&ids.call) {

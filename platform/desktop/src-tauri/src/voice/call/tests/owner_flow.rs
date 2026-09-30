@@ -673,6 +673,57 @@ async fn a_receptionist_that_speaks_within_the_moment_after_a_failed_takeover_is
 }
 
 #[tokio::test]
+async fn a_caller_who_speaks_twice_while_the_phone_has_not_answered_the_request_and_no_page_answers_is_held_once_and_never_hung_up_on() {
+    // The clocks are put far off: what is checked is what the caller's own words get. The request is on the wire and unanswered (the phone
+    // answers it in a second or two, or never), nobody answers for the receptionist, and nothing rings yet.
+    let timing = transfer::Timing { request_hold_after: secs(30), hold_every: secs(30), ..quick() };
+    let mut f = flow_full(owner_settings(true), None, crate::ring::testing::at_the_pc(), timing).await;
+    f.aokie.hub.set_page_answers(false);
+    f.caller_says(ASKED);
+    let _asked = asking(&f.aokie, transfer::TOOL, json!({"reason": "caller_asked"}));
+    f.aokie.text("formlogic.realtime.tool_call", secs(3)).await.expect("the tool call reached the phone");
+    // Two turns of theirs within the moment a line is not said twice in.
+    f.aokie.hub.caller_said(&f.aokie.call, "Hello? Are you there?", json!({}));
+    f.aokie.hub.caller_said(&f.aokie.call, "Hello?", json!({}));
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    assert_eq!(said_of(&f, &transfer::HOLD_LINES), [transfer::HOLD_LINES[0]], "held once for both: {:?}", f.aokie.speech.spoken());
+    assert!(f.aokie.text("formlogic.realtime.tool_call", Duration::from_millis(300)).await.is_none(), "no finish_call went to the phone: they were not hung up on");
+    let told = f.aokie.events_within(Duration::from_millis(50)).await;
+    assert!(!told.iter().any(|e| e["type"] == "call.ended"), "the call was not ended: {told:?}");
+    // And a turn after the moment is held again, in the next wording.
+    f.aokie.hub.caller_said(&f.aokie.call, "Hello?", json!({}));
+    assert!(spoken_within(&f.aokie, transfer::HOLD_LINES[1], secs(2)).await, "{:?}", f.aokie.speech.spoken());
+    assert!(f.aokie.text("formlogic.realtime.tool_call", Duration::from_millis(300)).await.is_none(), "and still not hung up on");
+    // The phone never answers: the request is given up on after 2.5 s here (25 s in a real call). A goodbye that waited behind it would go
+    // now, and the caller would be hung up on a moment later than they would have been; the call goes on and they are offered a message.
+    assert!(spoken_within(&f.aokie, transfer::OFFER_LINE, secs(4)).await, "{:?}", f.aokie.speech.spoken());
+    assert!(f.aokie.text("formlogic.realtime.tool_call", Duration::from_millis(600)).await.is_none(), "no finish_call went to the phone once the request was given up on: {:?}", f.aokie.speech.spoken());
+    let told = f.aokie.events_within(Duration::from_millis(50)).await;
+    assert!(!told.iter().any(|e| e["type"] == "call.ended"), "the call was not ended: {told:?}");
+}
+
+#[tokio::test]
+async fn a_caller_who_speaks_while_a_request_waits_behind_another_tool_and_no_page_answers_is_not_hung_up_on() {
+    // The request for the owner is asked for while a lookup is on the wire, so it waits its turn (a transfer is only sent when nothing else is
+    // unanswered): the goodbye must not slip past it and end the call because no page is there to answer the caller.
+    let timing = transfer::Timing { request_hold_after: secs(30), hold_every: secs(30), ..quick() };
+    let mut f = flow_full(owner_settings(true), None, crate::ring::testing::at_the_pc(), timing).await;
+    f.aokie.hub.set_page_answers(false);
+    f.caller_says(ASKED);
+    let _lookup = asking(&f.aokie, "lookup_business_data", json!({"question": "What are your hours?"}));
+    let first = f.aokie.text("formlogic.realtime.tool_call", secs(3)).await.expect("the lookup reached the phone");
+    assert_eq!(first["name"], "lookup_business_data");
+    let _asked = asking(&f.aokie, transfer::TOOL, json!({"reason": "caller_asked"}));
+    tokio::time::sleep(Duration::from_millis(150)).await;
+    f.aokie.hub.caller_said(&f.aokie.call, "Hello? Are you there?", json!({}));
+    f.aokie.hub.caller_said(&f.aokie.call, "Hello?", json!({}));
+    let frame = f.aokie.text("formlogic.realtime.tool_call", Duration::from_millis(600)).await;
+    assert!(frame.is_none(), "no tool call reached the phone while the lookup was unanswered, and no finish_call slipped past the request that waits: {frame:?}");
+    let told = f.aokie.events_within(Duration::from_millis(50)).await;
+    assert!(!told.iter().any(|e| e["type"] == "call.ended"), "the call was not ended: {told:?}");
+}
+
+#[tokio::test]
 async fn a_stop_that_hands_the_call_to_the_owner_cancels_every_holding_line_still_to_come() {
     let mut f = accepted_and_pending(secs(1)).await;
     owner_takes_the_session(&f);
