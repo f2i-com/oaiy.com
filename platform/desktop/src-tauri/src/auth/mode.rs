@@ -124,20 +124,16 @@ impl std::fmt::Display for ConfigRefusal {
 
 impl std::error::Error for ConfigRefusal {}
 
-/// Whether `legacy` is refused on an install that is not local. The design refuses it (design 4.3: "refused
-/// when ... the exposure is not local"), but a LAN server with a bearer token starts today, and the
-/// step that lets it start on a login instead (`oaiy-server auth init`, ACC-14) comes after this one:
-/// refusing now would strand every existing LAN server. Until then the refusal is off, and ACC-14
-/// turns it on with the rest of the startup rules.
-pub const REFUSE_LEGACY_OFF_LOCAL: bool = false;
-
 /// The refusals that concern the mode (design 4.5.5 rule 6):
 ///
 /// - `shadow` on a proxied or LAN install: a valid `readonly` token must not become a `cli` token on the
 ///   internet.
 /// - `legacy` when an owner login exists (`<data>/auth/owner.json`): a login means the install has moved
 ///   past Origin trust.
-/// - `legacy` when the exposure is not local, once [`REFUSE_LEGACY_OFF_LOCAL`] is on.
+/// - `legacy` when the exposure is not local: Origin trust on an address other machines can reach. (Until
+///   the startup rules of `auth::exposure` this was not refused, because a LAN server with a bearer token
+///   was a supported install and had no login to move to; a LAN install now needs an owner login, made
+///   with `oaiy-server auth init`, and runs `scoped`.)
 pub fn validate_mode(
     mode: AccessMode,
     exposure: Exposure,
@@ -151,7 +147,7 @@ pub fn validate_mode(
         AccessMode::Legacy if owner_exists => Err(ConfigRefusal(
             "OAIY_ACCESS_MODE=legacy is refused because an owner login exists (<data>/auth/owner.json): use scoped".into(),
         )),
-        AccessMode::Legacy if REFUSE_LEGACY_OFF_LOCAL && exposure != Exposure::Local => Err(ConfigRefusal(format!(
+        AccessMode::Legacy if exposure != Exposure::Local => Err(ConfigRefusal(format!(
             "OAIY_ACCESS_MODE=legacy is refused on a {} install: use scoped",
             exposure.name()
         ))),
@@ -260,14 +256,22 @@ mod tests {
         assert!(validate_mode(AccessMode::Shadow, Exposure::Local, true).is_ok());
     }
 
-    /// The design refuses `legacy` off a local install. That is not done here, and this test says why and
-    /// where it changes: a LAN server with a bearer token is a supported install today (and the boot test
-    /// of `tests/headless_server.rs` runs one), and it can move to a login only with ACC-14.
+    /// Design 4.3 and 4.5.5 rule 6: `legacy` is refused off a local install. This test used to pin the
+    /// opposite (a LAN server with a bearer token had no login to move to until `oaiy-server auth init`);
+    /// ACC-14 flips it on purpose.
     #[test]
-    fn legacy_is_not_yet_refused_off_a_local_install_because_that_would_strand_every_lan_server() {
-        assert!(!std::hint::black_box(REFUSE_LEGACY_OFF_LOCAL));
+    fn legacy_is_refused_off_a_local_install_because_it_trusts_origins_other_machines_can_send() {
+        assert!(validate_mode(AccessMode::Legacy, Exposure::Local, false).is_ok());
         for exposure in [Exposure::Proxied, Exposure::Lan] {
-            assert!(validate_mode(AccessMode::Legacy, exposure, false).is_ok());
+            let why = validate_mode(AccessMode::Legacy, exposure, false).unwrap_err();
+            assert!(
+                why.to_string().contains("legacy") && why.to_string().contains(exposure.name()),
+                "{why}"
+            );
+            assert_eq!(why.exit_code(), 78);
+            // With or without an owner, and the modes that judge every route are not refused for it.
+            assert!(validate_mode(AccessMode::Legacy, exposure, true).is_err());
+            assert!(validate_mode(AccessMode::Scoped, exposure, false).is_ok());
         }
     }
 }

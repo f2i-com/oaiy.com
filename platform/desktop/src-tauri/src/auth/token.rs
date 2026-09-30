@@ -347,7 +347,8 @@ impl StaticTokenShape {
 }
 
 /// Whether `token` has the shape of a static token: 32 to 256 printable ASCII characters (0x21 to 0x7e),
-/// at least 16 of them different. Nothing acts on a `Err` yet (a later step makes it a startup refusal); it
+/// at least 16 of them different. `oaiy-server` refuses to start with a token that fails it (`auth::exposure`,
+/// rule 5), and the guard ignores such a token in `scoped` and `shadow` mode (the desktop's way); it also
 /// decides which wide tokens [`bearer_or_static`] takes.
 pub fn check_static_token_shape(token: &str) -> Result<(), StaticTokenShape> {
     let bytes = token.as_bytes();

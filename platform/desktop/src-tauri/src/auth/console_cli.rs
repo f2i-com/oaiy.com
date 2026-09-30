@@ -44,8 +44,9 @@ use zeroize::Zeroizing;
 use super::audit::{AuditLog, Context as AuditContext};
 use super::clock::{Clock, SystemClock};
 use super::console::{status_lines, INFO_FILE, TOKEN_FILE};
+use super::exposure::{self, Config, Facts};
 use super::lock::LockError;
-use super::mode::{validate_mode, Exposure};
+use super::mode::Exposure;
 use super::owner::{self, CreateError, OwnerDoc};
 use super::password::{Argon2Engine, PasswordEngine};
 use super::policy::{self, Reason};
@@ -256,13 +257,7 @@ pub fn parse(args: &[String]) -> Result<Command, String> {
 // ---- the data folder ---------------------------------------------------------------------------------
 
 fn data_dir(env: &dyn Fn(&str) -> Option<String>) -> Option<PathBuf> {
-    if let Some(d) = env("OAIY_DATA_DIR").filter(|d| !d.trim().is_empty()) {
-        return Some(PathBuf::from(d));
-    }
-    let home = env("HOME")
-        .filter(|h| !h.is_empty())
-        .or_else(|| env("USERPROFILE").filter(|h| !h.is_empty()))?;
-    Some(PathBuf::from(home).join(".oaiy-server"))
+    exposure::data_dir_from_env(env)
 }
 
 /// Who owns a folder: its user id and, when the password file names it, the user.
@@ -1041,26 +1036,16 @@ pub struct Report {
     pub warnings: Vec<String>,
 }
 
-/// Validate the configuration and the data folder without changing or locking anything: the mode, the port, the
-/// data folder and every file under `<data>/auth`. Every violation is listed, not only the first.
+/// Validate the configuration and the data folder without changing or locking anything: every rule of design
+/// 4.5.5 that the environment can break (`auth::exposure`), the data folder and every file under `<data>/auth`.
+/// Every violation is listed, not only the first.
 pub fn check(env: &dyn Fn(&str) -> Option<String>) -> Report {
+    check_with_config(env).0
+}
+
+/// [`check`], and the configuration that passed (none when a rule is broken).
+pub fn check_with_config(env: &dyn Fn(&str) -> Option<String>) -> (Report, Option<Config>) {
     let mut report = Report::default();
-    let get = |name: &str| {
-        env(name)
-            .map(|v| v.trim().to_string())
-            .filter(|v| !v.is_empty())
-    };
-    // The port.
-    if let Some(p) = get("OAIY_SERVER_PORT") {
-        if p.parse::<u16>().ok().filter(|n| *n != 0).is_none() {
-            report
-                .violations
-                .push(format!("OAIY_SERVER_PORT={p:?} is not a port (1 to 65535)"));
-        }
-    }
-    // The bind and the exposure.
-    let bind_all = get("OAIY_SERVER_BIND").is_some_and(|b| b.eq_ignore_ascii_case("lan"));
-    let exposure = Exposure::compute(bind_all, get("OAIY_PUBLIC_URL").is_some());
     // The data folder and the auth files.
     let data = data_dir(env);
     let mut owner_exists = false;
@@ -1078,25 +1063,30 @@ pub fn check(env: &dyn Fn(&str) -> Option<String>) -> Report {
             }
         }
     }
-    // The mode (a server with the web login defaults to scoped and refuses legacy).
-    match super::login::server_mode(get("OAIY_ACCESS_MODE").as_deref()) {
-        Ok(mode) => {
-            if let Err(refusal) = validate_mode(mode, exposure, owner_exists) {
-                report.violations.push(refusal.to_string());
-            }
-        }
-        Err(refusal) => report.violations.push(refusal.to_string()),
-    }
-    // What the server reads leniently and ignores: worth a warning here.
-    let (_, warnings) = super::guard::GuardConfig::from_env(env, bind_all, false, 17972);
-    report.warnings.extend(warnings);
-    // A list with a typo in it is refused, as the server refuses it: the restriction is a security setting.
-    if let Some(list) = get("OAIY_LOGIN_ALLOW") {
-        if let Err(refusal) = super::login::parse_login_allow(&list) {
-            report.violations.push(refusal.to_string());
-        }
-    }
+    // The rules of 4.5.5 (this build has the web login, so its default mode is scoped and it refuses legacy; a list
+    // in OAIY_LOGIN_ALLOW with an entry that is not an address or a network is refused whole, which is what the login
+    // does too: `login::parse_login_allow`).
+    let evaluation = exposure::evaluate(
+        env,
+        &Facts {
+            owner_exists,
+            web_login: true,
+        },
+    );
     // Flow authority is not here yet: a signed-in dashboard session (not elevated) can write and run flows.
+    let exposure = evaluation.config.as_ref().map_or_else(
+        || {
+            let get = |name: &str| {
+                env(name)
+                    .map(|v| v.trim().to_string())
+                    .filter(|v| !v.is_empty())
+            };
+            let bind_all = exposure::Bind::parse(get("OAIY_SERVER_BIND").as_deref())
+                .is_ok_and(|b| !b.is_loopback());
+            Exposure::compute(bind_all, get("OAIY_PUBLIC_URL").is_some())
+        },
+        |c| c.exposure,
+    );
     if exposure != Exposure::Local {
         report.warnings.push(format!(
             "flows: on a {} install a signed-in dashboard session can write and run flows without elevating (flows.write and runs.write are not dangerous scopes: flow authority is ACC-05, not built yet); do not put this install on a network with flows in use until it is (README, The web login)",
@@ -1104,6 +1094,10 @@ pub fn check(env: &dyn Fn(&str) -> Option<String>) -> Report {
         ));
     }
     report
+        .violations
+        .extend(evaluation.violations.iter().map(|v| v.message.clone()));
+    report.warnings.extend(evaluation.warnings);
+    (report, evaluation.config)
 }
 
 /// The files of `<data>/auth`, read the way the server reads them. Whether an owner exists.
@@ -1137,6 +1131,9 @@ fn inspect_auth_dir(auth: &Path, report: &mut Report) -> bool {
                 continue;
             }
             Err(e) => {
+                // An owner file that is there and cannot be read is an owner file (the message says why the
+                // server will not start; it is not also "no owner").
+                owner_exists |= name == "owner.json";
                 report
                     .violations
                     .push(format!("cannot read {}: {e}", path.display()));
@@ -1145,10 +1142,13 @@ fn inspect_auth_dir(auth: &Path, report: &mut Report) -> bool {
         };
         let doc: Result<Value, _> = serde_json::from_str(&text);
         match (name, doc) {
-            ("owner.json", Err(e)) => report.violations.push(format!(
-                "{} cannot be read ({e}): a mangled owner file must not reopen setup; restore it or run `oaiy-server auth init --force`",
-                path.display()
-            )),
+            ("owner.json", Err(e)) => {
+                owner_exists = true;
+                report.violations.push(format!(
+                    "{} cannot be read ({e}): a mangled owner file must not reopen setup; restore it or run `oaiy-server auth init --force`",
+                    path.display()
+                ))
+            }
             ("owner.json", Ok(v)) => {
                 owner_exists = true;
                 match v["v"].as_u64() {
@@ -1181,7 +1181,10 @@ fn inspect_auth_dir(auth: &Path, report: &mut Report) -> bool {
                     ));
                 }
             }
-            (_, Err(e)) => report.warnings.push(format!("{} cannot be read ({e}): it is ignored", path.display())),
+            (_, Err(e)) => report.warnings.push(format!(
+                "{} cannot be read ({e}): it is ignored",
+                path.display()
+            )),
             _ => {}
         }
     }
@@ -1189,18 +1192,14 @@ fn inspect_auth_dir(auth: &Path, report: &mut Report) -> bool {
 }
 
 fn check_command(io: &mut Io<'_>) -> i32 {
-    let report = check(io.env);
-    for w in &report.warnings {
-        let _ = writeln!(io.err, "oaiy-server check: warning: {w}");
-    }
-    if report.violations.is_empty() {
-        say(io, "oaiy-server check: ok");
-        return EXIT_OK;
-    }
-    for v in &report.violations {
-        let _ = writeln!(io.err, "oaiy-server check: {v}");
-    }
-    EXIT_CONFIG
+    let (report, config) = check_with_config(io.env);
+    exposure::print_check(
+        &report.violations,
+        &report.warnings,
+        config.as_ref(),
+        io.out,
+        io.err,
+    )
 }
 
 #[cfg(test)]
@@ -1497,12 +1496,24 @@ mod tests {
     }
 
     #[test]
-    fn check_warns_of_what_the_server_would_ignore_and_does_not_refuse_it() {
+    fn check_refuses_what_it_used_to_only_warn_of_because_the_server_now_refuses_it_too() {
+        // These were "ignored, with a warning" before the startup rules of design 4.5.5. A public URL that is
+        // not https, and a login allow-list with something in it that is not an address (which would leave a
+        // list that lets everyone in), stop the server now.
         let dir = TempDir::new("check-warn");
-        let r = check_in(&dir, &[("OAIY_PUBLIC_URL", "http://not-https.example.com")]);
-        assert!(r.violations.is_empty(), "{r:?}");
-        let text = r.warnings.join("\n");
-        assert!(text.contains("OAIY_PUBLIC_URL"), "{text}");
+        let r = check_in(
+            &dir,
+            &[
+                ("OAIY_PUBLIC_URL", "http://not-https.example.com"),
+                ("OAIY_LOGIN_ALLOW", "203.0.113.0/24, nonsense"),
+            ],
+        );
+        let text = r.violations.join("\n");
+        assert_eq!(r.violations.len(), 2, "{text}");
+        assert!(
+            text.contains("OAIY_PUBLIC_URL") && text.contains("nonsense"),
+            "{text}"
+        );
     }
 
     #[test]
@@ -1511,10 +1522,24 @@ mod tests {
         // On the machine alone: nothing to say.
         let r = check_in(&dir, &[]);
         assert!(!r.warnings.iter().any(|w| w.contains("flows")), "{r:?}");
+        // A lan install needs an owner login (and its token is of the kind the rules take).
+        let auth = dir.0.join("auth");
+        std::fs::create_dir_all(&auth).unwrap();
+        std::fs::write(
+            auth.join("owner.json"),
+            r#"{"v":1,"created_ms":1,"password_changed_ms":1,"password":"x"}"#,
+        )
+        .unwrap();
         // Behind a proxy, and on a network address: the login is reachable from elsewhere.
         for extra in [
-            &[("OAIY_PUBLIC_URL", "https://dash.example.com")][..],
-            &[("OAIY_SERVER_BIND", "lan"), ("OAIY_SERVER_TOKEN", "x")][..],
+            &[
+                ("OAIY_PUBLIC_URL", "https://dash.example.com"),
+                ("OAIY_ACCESS_MODE", "scoped"),
+            ][..],
+            &[
+                ("OAIY_SERVER_BIND", "lan"),
+                ("OAIY_SERVER_TOKEN", "Vl0JTnJtFseAe9ePKCDhuBymfRXQ8osZ-QMlM86leCU"),
+            ][..],
         ] {
             let r = check_in(&dir, extra);
             let warning = r
@@ -1529,6 +1554,9 @@ mod tests {
             // A warning is not a refusal: the install starts, and the operator has been told.
             assert!(r.violations.is_empty(), "{extra:?}: {r:?}");
         }
+        // Not even a list of rules that is broken takes the warning away: it says what the install would be.
+        let r = check_in(&dir, &[("OAIY_SERVER_BIND", "lan"), ("OAIY_SERVER_TOKEN", "x")]);
+        assert!(!r.violations.is_empty() && r.warnings.iter().any(|w| w.contains("flows")), "{r:?}");
     }
 
     #[test]
@@ -1572,6 +1600,95 @@ mod tests {
         assert!(check_in(&dir, &[("OAIY_LOGIN_ALLOW", "  ")])
             .violations
             .is_empty());
+    }
+
+    #[test]
+    fn check_warns_of_what_has_no_effect_and_does_not_refuse_it() {
+        let dir = TempDir::new("check-warn-noeffect");
+        let r = check_in(
+            &dir,
+            &[
+                ("OAIY_TRUSTED_PROXIES", "10.0.0.5"),
+                ("OAIY_ALLOW_PUBLIC_PLAINTEXT", "1"),
+            ],
+        );
+        assert!(r.violations.is_empty(), "{r:?}");
+        let text = r.warnings.join("\n");
+        assert!(
+            text.contains("OAIY_TRUSTED_PROXIES") && text.contains("OAIY_ALLOW_PUBLIC_PLAINTEXT"),
+            "{text}"
+        );
+    }
+
+    #[test]
+    fn check_lists_every_rule_of_the_startup_rules_at_once_and_says_the_exposure_when_all_hold() {
+        let dir = TempDir::new("check-rules");
+        // A lan bind with no owner and a weak token: two rules, both in one run.
+        let r = check_in(
+            &dir,
+            &[("OAIY_SERVER_BIND", "lan"), ("OAIY_SERVER_TOKEN", "short")],
+        );
+        assert_eq!(r.violations.len(), 2, "{r:?}");
+        assert!(r
+            .violations
+            .iter()
+            .any(|v| v.contains("oaiy-server auth init")));
+        assert!(r.violations.iter().any(|v| v.contains("OAIY_SERVER_TOKEN")));
+        // With an owner the lan bind is what the rules allow, and `check` says what the install is.
+        let auth = dir.0.join("auth");
+        std::fs::create_dir_all(&auth).unwrap();
+        std::fs::write(auth.join("owner.json"), r#"{"v":1,"password":"x"}"#).unwrap();
+        let env = env_of(&[
+            ("OAIY_DATA_DIR", dir.0.display().to_string()),
+            ("OAIY_SERVER_BIND", "lan".into()),
+        ]);
+        let (mut out, mut err) = (Vec::new(), Vec::new());
+        let mut prompt = typed(&[]);
+        let code = run(
+            &args("check"),
+            &mut Io {
+                env: &env,
+                out: &mut out,
+                err: &mut err,
+                prompt: &mut prompt,
+                euid: None,
+            },
+        );
+        let (out, err) = (
+            String::from_utf8(out).unwrap(),
+            String::from_utf8(err).unwrap(),
+        );
+        assert_eq!(code, EXIT_OK, "{err}");
+        assert!(
+            out.contains("exposure lan") && out.contains("oaiy-server check: ok"),
+            "{out}"
+        );
+        // A refusal is exit 78 with each violation on its own line, on stderr.
+        let env = env_of(&[
+            ("OAIY_DATA_DIR", dir.0.display().to_string()),
+            ("OAIY_SERVER_BIND", "bogus".into()),
+            ("OAIY_PUBLIC_URL", "https://dash.example.com/x".into()),
+        ]);
+        let (mut out, mut err) = (Vec::new(), Vec::new());
+        let code = run(
+            &args("check"),
+            &mut Io {
+                env: &env,
+                out: &mut out,
+                err: &mut err,
+                prompt: &mut prompt,
+                euid: None,
+            },
+        );
+        let err = String::from_utf8(err).unwrap();
+        assert_eq!(code, EXIT_CONFIG, "{err}");
+        // (A warning of the flows a login can run, which a proxied install gets, is a line of its own and no violation.)
+        assert_eq!(
+            err.lines().filter(|l| !l.contains(": warning: ")).count(),
+            2,
+            "{err}"
+        );
+        assert!(String::from_utf8(out).unwrap().is_empty());
     }
 
     #[test]
