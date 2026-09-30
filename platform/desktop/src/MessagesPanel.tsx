@@ -56,8 +56,11 @@ export default function MessagesPanel({ onOpenContact, onOpenAgent }: { onOpenCo
   const [missing, setMissing] = useState(false);
   const [filter, setFilter] = useState<Filter>('open');
   const [q, setQ] = useState('');
-  const [busy, setBusy] = useState<string | null>(null);
+  /** The messages something is being asked of the desktop about (its buttons wait). */
+  const [busyIds, setBusyIds] = useState<ReadonlySet<string>>(new Set());
   const [confirming, setConfirming] = useState<string | null>(null);
+  /** The messages a change is on its way for. */
+  const asking = useRef(new Set<string>());
 
   const load = useCallback(async () => {
     try {
@@ -76,21 +79,29 @@ export default function MessagesPanel({ onOpenContact, onOpenAgent }: { onOpenCo
 
   const change = useCallback(
     async (id: string, state: CallerMessage['state']) => {
-      setBusy(id);
+      // The message waits for its own answer (and only its own: another message's answer coming back first does not free it), so that no second
+      // change is asked for it while one is on its way: a "seen" that lands after a "handled" makes the message new again.
+      asking.current.add(id);
+      setBusyIds((prev) => new Set(prev).add(id));
       try {
         const next = await api.mark(id, state);
         setList((prev) => prev?.map((m) => (m.id === id ? next : m)) ?? prev);
       } catch (e) {
         toast.push({ kind: 'error', title: 'Could not change the message', body: errText(e) });
       } finally {
-        setBusy(null);
+        asking.current.delete(id);
+        setBusyIds((prev) => {
+          const rest = new Set(prev);
+          rest.delete(id);
+          return rest;
+        });
       }
     },
     [toast],
   );
 
   const remove = async (id: string) => {
-    setBusy(id);
+    setBusyIds((prev) => new Set(prev).add(id));
     try {
       await api.remove(id);
       setList((prev) => prev?.filter((m) => m.id !== id) ?? prev);
@@ -98,28 +109,50 @@ export default function MessagesPanel({ onOpenContact, onOpenAgent }: { onOpenCo
     } catch (e) {
       toast.push({ kind: 'error', title: 'Could not delete the message', body: errText(e) });
     } finally {
-      setBusy(null);
+      setBusyIds((prev) => {
+        const rest = new Set(prev);
+        rest.delete(id);
+        return rest;
+      });
     }
   };
-
-  // A new message is seen once it has been on screen a few seconds.
-  const newIds = useMemo(() => (list ?? []).filter((m) => m.state === 'new').map((m) => m.id).join(','), [list]);
-  const seenTimer = useRef<number | undefined>(undefined);
-  useEffect(() => {
-    window.clearTimeout(seenTimer.current);
-    if (!newIds) return;
-    seenTimer.current = window.setTimeout(() => {
-      if (document.hidden) return;
-      for (const id of newIds.split(',')) void change(id, 'seen');
-    }, SEEN_AFTER_MS);
-    return () => window.clearTimeout(seenTimer.current);
-  }, [newIds, change]);
 
   const shown = useMemo(
     () => (list ?? []).filter((m) => (filter === 'all' ? true : filter === 'handled' ? m.state === 'handled' : m.state !== 'handled')).filter((m) => matchesMessage(m, q)),
     [list, filter, q],
   );
   const todo = (list ?? []).filter((m) => m.state !== 'handled').length;
+
+  // A new message is seen once it has been ON SCREEN a few seconds: one that the open tab or the search hides is not on screen, and is not seen.
+  const onScreenNew = useMemo(() => shown.filter((m) => m.state === 'new').map((m) => m.id).join(','), [shown]);
+  // The window showing again (or getting the focus) starts the wait again: a timer that fired while it was hidden did not see anything, and nothing
+  // else would start another for messages that have not changed.
+  const [awake, setAwake] = useState(0);
+  useEffect(() => {
+    const wake = () => {
+      if (!document.hidden) setAwake((n) => n + 1);
+    };
+    document.addEventListener('visibilitychange', wake);
+    window.addEventListener('focus', wake);
+    return () => {
+      document.removeEventListener('visibilitychange', wake);
+      window.removeEventListener('focus', wake);
+    };
+  }, []);
+  const seenTimer = useRef<number | undefined>(undefined);
+  useEffect(() => {
+    window.clearTimeout(seenTimer.current);
+    if (!onScreenNew) return;
+    seenTimer.current = window.setTimeout(() => {
+      if (document.hidden) return;
+      for (const id of onScreenNew.split(',')) {
+        // Not a message that something is being asked about: one that is being handled stays handled (the wait ends the moment its answer changes it).
+        if (asking.current.has(id)) continue;
+        void change(id, 'seen');
+      }
+    }, SEEN_AFTER_MS);
+    return () => window.clearTimeout(seenTimer.current);
+  }, [onScreenNew, awake, change]);
 
   if (missing) {
     return (
@@ -152,7 +185,7 @@ export default function MessagesPanel({ onOpenContact, onOpenAgent }: { onOpenCo
         </p>
       )}
       {error && <p className="form-error" role="alert">Could not read the messages: {error}</p>}
-      {list === null && !error && <p className="form-hint">Loading…</p>}
+      {list === null && !error && <p className="form-hint">Loadingâ€¦</p>}
       {list !== null && shown.length === 0 && (
         <div className="messages-empty">
           <Inbox size={22} aria-hidden />
@@ -202,17 +235,17 @@ export default function MessagesPanel({ onOpenContact, onOpenAgent }: { onOpenCo
                     </button>
                   )}
                   {m.state === 'handled' ? (
-                    <button type="button" className="btn-tiny" disabled={busy === m.id} onClick={() => void change(m.id, 'new')}>
+                    <button type="button" className="btn-tiny" disabled={busyIds.has(m.id)} onClick={() => void change(m.id, 'new')}>
                       <Undo2 size={12} /> Not handled
                     </button>
                   ) : (
-                    <button type="button" className="btn-tiny" disabled={busy === m.id} onClick={() => void change(m.id, 'handled')}>
+                    <button type="button" className="btn-tiny" disabled={busyIds.has(m.id)} onClick={() => void change(m.id, 'handled')}>
                       <Check size={12} /> Handled
                     </button>
                   )}
                   {confirming === m.id ? (
                     <>
-                      <button type="button" className="btn-tiny danger" disabled={busy === m.id} onClick={() => void remove(m.id)}>
+                      <button type="button" className="btn-tiny danger" disabled={busyIds.has(m.id)} onClick={() => void remove(m.id)}>
                         <Trash2 size={12} /> Delete it
                       </button>
                       <button type="button" className="btn-tiny" onClick={() => setConfirming(null)} aria-label="Keep it">
