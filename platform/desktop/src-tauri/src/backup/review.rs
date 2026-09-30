@@ -39,6 +39,9 @@ pub enum RestoreClass {
     Voices,
     /// What is remembered about people: read by the AI as facts and instructions before it answers them.
     Memory,
+    /// The calendar's words: the business's name, the services and the appointments' names and notes, which the receptionist
+    /// reads before it answers and says to callers.
+    Calendar,
     /// Outreach campaigns: texts and calls to a list of people. They come back paused.
     Outreach,
     /// The Agent's projects, conversations, brief and knowledge files: read by the Agent as its context
@@ -47,7 +50,7 @@ pub enum RestoreClass {
 }
 
 impl RestoreClass {
-    pub const ALL: [RestoreClass; 11] = [
+    pub const ALL: [RestoreClass; 12] = [
         RestoreClass::Settings,
         RestoreClass::Templates,
         RestoreClass::Flows,
@@ -57,6 +60,7 @@ impl RestoreClass {
         RestoreClass::AgentSettings,
         RestoreClass::Voices,
         RestoreClass::Memory,
+        RestoreClass::Calendar,
         RestoreClass::Outreach,
         RestoreClass::AgentData,
     ];
@@ -72,6 +76,7 @@ impl RestoreClass {
             RestoreClass::AgentSettings => "agentSettings",
             RestoreClass::Voices => "voices",
             RestoreClass::Memory => "memory",
+            RestoreClass::Calendar => "calendar",
             RestoreClass::Outreach => "outreach",
             RestoreClass::AgentData => "agentData",
         }
@@ -92,6 +97,7 @@ impl RestoreClass {
             RestoreClass::AgentSettings => "The Agent's own settings (its providers, network gate, and how it answers calls and texts)",
             RestoreClass::Voices => "Voices your callers hear",
             RestoreClass::Memory => "Contacts and what is remembered about people",
+            RestoreClass::Calendar => "Calendar text your receptionist reads",
             RestoreClass::Outreach => "Outreach campaigns (texts and calls to a list of people)",
             RestoreClass::AgentData => "The Agent's projects, conversations, brief and knowledge files",
         }
@@ -108,6 +114,7 @@ impl RestoreClass {
             RestoreClass::AgentSettings => "Which servers the Agent talks to, whether its network gate is open, whether it answers calls and texts by itself, and the instructions it answers them by. A provider at another address arrives without a key, beside yours.",
             RestoreClass::Voices => "A voice is what your callers hear. A sample or a setting from a file that was not made by you would speak to them in your name.",
             RestoreClass::Memory => "The receptionist and the Agent read what is remembered about a person, and the notes for the receptionist, before they answer them. It is read as instructions, so a file that was not made by you could steer what they say.",
+            RestoreClass::Calendar => "The receptionist reads the business's name, the services (their names, prices and descriptions) and, for a caller, their appointments before it answers, says them to callers, and the Agent reads each appointment's name and notes. Opening hours, the length of a step and an appointment's time, length and state are brought back without a tick. An appointment that comes back without the tick has only its time: no name, number, service or notes.",
             RestoreClass::Outreach => "A campaign texts or calls the people on its list. A restored campaign is always PAUSED: it is never running and nothing is scheduled. It is listed by name with the number of people, and you start each one yourself.",
             RestoreClass::AgentData => "The Agent reads its projects, conversations, the front desk's brief and its knowledge files as context and instructions: the brief wins over what the phone's agents would otherwise say. Each project and file is listed by name and size.",
         }
@@ -489,6 +496,10 @@ pub fn describe(class: RestoreClass, name: &str, bytes: &[u8], local: &Local, ba
             }
             Err(_) => vec![unreadable(class, name, "it is not valid JSON")],
         },
+        "calendar/calendar.json" => match value() {
+            Ok(v) => describe_calendar(class, name, &v),
+            Err(_) => vec![unreadable(class, name, "it is not valid JSON")],
+        },
         _ if name.starts_with("plugin-data/") => {
             let plugin = name.split('/').nth(1).unwrap_or("?");
             match table().key_table(&format!("plugin.{plugin}")) {
@@ -497,7 +508,7 @@ pub fn describe(class: RestoreClass, name: &str, bytes: &[u8], local: &Local, ba
                         let found = filter_json(keys, &v, &|_| true);
                         let mut items: Vec<ReviewItem> = found.kept.iter().filter(|k| k.row.class == Class::Runs && !matches!(k.value, Value::Object(_))).map(|k| key_item(name, k)).collect();
                         if items.is_empty() {
-                            items.push(ReviewItem { class, name: name.to_string(), title: clip(&format!("Settings of the \"{plugin}\" plugin"), 120), what: "Nothing in it acts: only settings that cannot act (or nothing) come back, and those come back without a tick.".to_string() });
+                            items.push(ReviewItem { class, name: name.to_string(), title: clip(&format!("Settings of the \"{plugin}\" plugin"), 120), what: "Nothing in it is a setting OAIY restores: what is not left out is call handling, and none of it is in this file.".to_string() });
                         }
                         items
                     }
@@ -508,6 +519,54 @@ pub fn describe(class: RestoreClass, name: &str, bytes: &[u8], local: &Local, ba
         }
         _ => Vec::new(),
     }
+}
+
+/// The most services and appointments the dry run lists one by one (the rest are counted).
+const MAX_CALENDAR_LISTED: usize = 40;
+
+/// The calendar in a backup, by every word in it that the receptionist or the Agent reads: the business's and the
+/// receptionist's names, whether it texts, and for each service and each appointment the words of it, by value (cut, with how
+/// long each is). It is built from the key table, so a key added to the table with words in it is listed by construction.
+fn describe_calendar(class: RestoreClass, name: &str, document: &Value) -> Vec<ReviewItem> {
+    let Some(keys) = table().key_table("calendar") else { return vec![unreadable(class, name, "OAIY does not know how to read it")] };
+    let found = filter_json(keys, document, &|_| true);
+    let mut items: Vec<ReviewItem> = found.kept.iter().filter(|k| k.row.class == Class::Runs && !k.path.contains("[]") && !matches!(k.value, Value::Object(_) | Value::Array(_))).map(|k| key_item(name, k)).collect();
+    // The services and the appointments: one item for each, with its words by value.
+    let mut groups: std::collections::BTreeMap<(&str, usize), Vec<&super::table::Kept>> = std::collections::BTreeMap::new();
+    for kept in &found.kept {
+        if let (Some(list), Some(at)) = (kept.path.split("[]").next().filter(|_| kept.path.contains("[]")), kept.at.first()) {
+            groups.entry((if list == "appointments" { "appointments" } else { "settings.services" }, *at)).or_default().push(kept);
+        }
+    }
+    for list in ["settings.services", "appointments"] {
+        let mut total = 0usize;
+        let mut words = 0usize;
+        for ((_, at), kept) in groups.iter().filter(|((l, _), _)| *l == list) {
+            total += 1;
+            let says: Vec<String> = kept.iter().filter(|k| k.row.class == Class::Runs).map(|k| format!("{} {}", clip(&k.row.what.to_lowercase(), 60), show_value(&k.value))).collect();
+            if says.is_empty() {
+                continue;
+            }
+            words += 1;
+            if words > MAX_CALENDAR_LISTED {
+                continue;
+            }
+            let when = kept.iter().find(|k| k.path.ends_with(".start")).and_then(|k| k.value.as_str()).map(|s| format!(" at {}", clip(s, 20))).unwrap_or_default();
+            let (title, what) = if list == "appointments" { (format!("Appointment {}{when}", at + 1), "The receptionist tells the caller who booked it what it is for, and the Agent reads its name and notes") } else { (format!("Service {}", at + 1), "The receptionist reads it before it answers and says it to callers") };
+            items.push(ReviewItem { class, name: format!("{name}#{list}[{at}]"), title, what: clip(&format!("{what}: {}.", says.join("; ")), 1600) });
+        }
+        if words > MAX_CALENDAR_LISTED {
+            let more = words - MAX_CALENDAR_LISTED;
+            items.push(ReviewItem {
+                class,
+                name: format!("{name}#{list}"),
+                title: format!("and {more} more {}", if list == "appointments" { "appointments" } else { "services" }),
+                what: format!("{more} more of the {total} {} have words in them that are read in the same way; they come back with the same tick.", if list == "appointments" { "appointments" } else { "services" }),
+            });
+        }
+    }
+    // (A calendar with no words in it, only hours and times, has nothing to tick: it says nothing here.)
+    items
 }
 
 /// A voice file, by its name and size: it is audio, and is never read.

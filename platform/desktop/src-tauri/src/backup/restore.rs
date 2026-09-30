@@ -436,6 +436,16 @@ fn redo_of(manifest: &Manifest) -> Vec<String> {
 /// settings file is a few kilobytes; one that is larger is listed as too large to look at, and is not brought back.
 const MAX_REVIEW_BYTES: u64 = 2 << 20;
 
+/// The most of one entry that is read to describe it: a calendar of a busy business is larger than any other file that is
+/// described, and is read up to the largest a JSON file may be.
+fn review_cap(name: &str) -> u64 {
+    if name.eq_ignore_ascii_case("calendar/calendar.json") {
+        16 << 20
+    } else {
+        MAX_REVIEW_BYTES
+    }
+}
+
 /// The most that is read altogether to describe everything in a backup: 128 MiB, where a real backup's flows,
 /// templates, triggers and settings add up to a few megabytes. A backup that would take more to look through is
 /// refused whole, so that looking at a hostile file costs a bounded amount of time and memory.
@@ -547,7 +557,7 @@ fn preview_of(data_dir: &Path, verified: &container::Verified, scratch: &Path, f
             // A voice is an audio file: it is listed by name and size, and never read.
             items.push(review::describe_voice(class, &entry.name, entry.size));
         } else {
-            let bytes = container::read_entry(&mut archive, &entry.name, MAX_REVIEW_BYTES)?;
+            let bytes = container::read_entry(&mut archive, &entry.name, review_cap(&entry.name))?;
             match &bytes {
                 Some(bytes) => {
                     read_total += bytes.len() as u64;
@@ -589,7 +599,7 @@ fn preview_of(data_dir: &Path, verified: &container::Verified, scratch: &Path, f
         .collect();
     let mut notes = Vec::new();
     if in_backup.contains("calendar/calendar.json") {
-        notes.push("The calendar comes back without its FormLogic sync state: it pairs and syncs again when you link FormLogic.".to_string());
+        notes.push("The calendar comes back without its FormLogic sync state (it pairs and syncs again when you link FormLogic). Its hours and the time, length and state of each appointment come back without a tick; the words in it (the business's name, the services, each appointment's service, name, number and notes) come back only with the calendar tick. An appointment that is here is never lost to a restore.".to_string());
     }
     if items.iter().any(|i| i.class == RestoreClass::Plugins) {
         notes.push("Plugin settings come back without PINs, keys or values sealed to another computer; what this computer already has of those stays.".to_string());
@@ -860,23 +870,37 @@ pub(crate) fn clean_staged(data_dir: &Path, files_root: &Path, names: &[String],
     for name in names {
         let path = container::safe_join(files_root, name, limits)?;
         let category = rules::category_of_backup_entry(name).ok().flatten().map(|(c, _)| c);
+        // The file this computer has under that name, when it is JSON of a size that is read.
+        let local_of = |name: &str| {
+            let here = data_dir.join(native(name));
+            std::fs::metadata(&here)
+                .ok()
+                .filter(|m| m.len() <= limits.max_json_bytes)
+                .and_then(|_| std::fs::read(&here).ok())
+                .and_then(|b| serde_json::from_slice::<serde_json::Value>(b.strip_prefix(&[0xef, 0xbb, 0xbf][..]).unwrap_or(&b)).ok())
+        };
         let cleaned: Option<std::result::Result<Vec<u8>, String>> = match (category, name.as_str()) {
-            (Some(Category::Calendar), _) => Some(read(&path).and_then(|b| super::sanitize::calendar_json(&b))),
+            // The calendar: the typed values that carry no words come back, and the words only with their tick; an
+            // appointment that is here is never lost (see `sanitize::calendar_merge`).
+            (Some(Category::Calendar), _) => {
+                let local = local_of(name);
+                Some(read(&path).and_then(|b| {
+                    let staged: serde_json::Value = serde_json::from_slice(b.strip_prefix(&[0xef, 0xbb, 0xbf][..]).unwrap_or(&b)).map_err(|_| "it is not valid JSON".to_string())?;
+                    let merged = super::sanitize::calendar_merge(local.as_ref(), &staged, ticks)?;
+                    notes.extend(merged.notes.into_iter().map(|n| format!("{name}: {n}")));
+                    Ok(merged.bytes)
+                }))
+            }
             // A settings file with a key table: what the table lets through (the keys that cannot act, and those
             // whose tick was ticked) is put into the file this computer has, and everything else stays as it is here.
             (Some(_), _) if rules::keys_of(name).is_some() => {
                 let keys_name = rules::keys_of(name).unwrap_or_default();
-                let here = data_dir.join(native(name));
-                let local = std::fs::metadata(&here)
-                    .ok()
-                    .filter(|m| m.len() <= limits.max_json_bytes)
-                    .and_then(|_| std::fs::read(&here).ok())
-                    .and_then(|b| serde_json::from_slice::<serde_json::Value>(b.strip_prefix(&[0xef, 0xbb, 0xbf][..]).unwrap_or(&b)).ok());
+                let local = local_of(name);
                 Some(read(&path).and_then(|b| {
                     let staged: serde_json::Value = serde_json::from_slice(b.strip_prefix(&[0xef, 0xbb, 0xbf][..]).unwrap_or(&b)).map_err(|_| "it is not valid JSON".to_string())?;
                     let table = super::table::table().key_table(keys_name).ok_or_else(|| "OAIY does not know how to read it".to_string())?;
                     let found = super::table::filter_json(table, &staged, &|row| row.class == super::table::Class::Data || row.tick.is_some_and(|t| ticks.has(t)));
-                    let left = found.left.len() + found.left_more;
+                    let left = found.left.iter().map(|l| l.path.as_str()).collect::<HashSet<_>>().len() + found.left_more;
                     if found.kept.is_empty() {
                         // Nothing in it may come back (as ticked): the file that is here is left exactly as it is.
                         return Err(format!("nothing in it comes back without its tick ({left} setting{} left out)", if left == 1 { "" } else { "s" }));
@@ -927,7 +951,7 @@ pub(crate) fn clean_staged(data_dir: &Path, files_root: &Path, names: &[String],
             continue;
         };
         let path = container::safe_join(files_root, &name, limits)?;
-        let too_large = std::fs::metadata(&path).map(|m| m.len() > MAX_REVIEW_BYTES).unwrap_or(false);
+        let too_large = std::fs::metadata(&path).map(|m| m.len() > review_cap(&name)).unwrap_or(false);
         let unreadable = if too_large {
             Some(review::TOO_LARGE.to_string())
         } else {

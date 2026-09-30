@@ -589,7 +589,7 @@ describe('restoring: what can run or change settings needs a tick', () => {
     await check();
     for (const c of CLASSES) expect(classBox(c.label).checked).toBe(false);
     expect(keysBox()!.checked).toBe(false);
-    expect(text()).toContain('Nothing is ticked, so only data that cannot act comes back');
+    expect(text()).toContain('Nothing is ticked, so only what carries no words and does nothing comes back');
     expect(text()).not.toContain('only your data comes back');
     await click(buttonWith('Prepare restore'));
     expect(h.stage).toHaveBeenCalledWith('insp-1', PASS, { classes: [], keys: false });

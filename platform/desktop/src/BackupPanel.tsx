@@ -76,6 +76,7 @@ const CLASS_LABELS: Record<string, string> = {
   agentSettings: 'The Agent’s settings',
   voices: 'Voices your callers hear',
   memory: 'What is remembered about people',
+  calendar: 'Calendar text your receptionist reads',
   outreach: 'Outreach campaigns',
   agentData: 'The Agent’s projects, conversations, brief and knowledge',
 };
@@ -848,7 +849,7 @@ export function BackupSection() {
             </div>
             {ticked.length === 0 && (
               <p style={{ margin: '6px 0 0' }}>
-                Nothing is ticked, so only data that cannot act comes back (the calendar, the Agent’s change log, numbers not to be contacted, and settings that cannot act). Everything listed above stays behind until you tick it.
+                Nothing is ticked, so only what carries no words and does nothing comes back (opening hours, the time of each appointment, and numbers not to be contacted). Everything listed above stays behind until you tick it.
               </p>
             )}
             {preview.keys.inBackup && (

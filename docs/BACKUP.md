@@ -121,7 +121,7 @@ A path is matched without regard to case. The first row that matches counts; a p
 | `relay-log.jsonl, relay-reads.jsonl` | excluded | Never | The audit log of relayed commands: The record this computer keeps of what a website or app asked its plugins to do: an audit trail of this computer, which starts again. |
 | `restore/**, backup/**` | excluded | Never | The backup's and restore's own working folders. |
 | `callers.json` | runs | Only with the tick "Contacts and what is remembered about people" | Contacts and what is remembered about callers: The receptionist and the Agent read these facts and notes about a person before they answer them ("the person's notes for the receptionist"), so they are read as instructions: a file that was not made by you could steer what they say. |
-| `calendar/calendar.json` | data | Yes, without a tick | The calendar (without its FormLogic sync state): Appointments, hours and services: facts the Agent quotes. Nothing in it is an instruction and it cannot send, call or change what OAIY may do. It comes back without its FormLogic sync state. |
+| `calendar/calendar.json` | runs | Key by key (see the table of its keys) | The calendar, key by key (see the calendar table): The receptionist reads the business's name, the services and a caller's appointments before it answers, and says them to callers; the Agent reads each appointment's name and notes. Those words need the tick. Opening hours and an appointment's time, length and state are typed values that carry no words and come back without one. The sync with FormLogic is never restored. |
 | `triggers.json` | runs | Only with the tick "Flows, triggers and run history" | Triggers: which event starts which flow: A trigger starts a flow whenever its event happens. |
 | `flows/**` | runs | Only with the tick "Flows, triggers and run history" | Flows: A flow runs when it is triggered and can call your AI providers, send messages and run scripts. |
 | `bridge/ledger.jsonl` | runs | Only with the tick "Flows, triggers and run history" | The run journal (finished runs only): Runs that were waiting or running are never brought back; only finished ones are. |
@@ -296,6 +296,44 @@ The Agent's settings as its page keeps them in IndexedDB (database bot.computer,
 | `desktop` | excluded | Never | The paired desktop and its token: A token is never in a backup. To do again: Pair the Agent with OAIY Desktop again. |
 | `secret-key` | excluded | Never | The key that seals the API keys: It never leaves the browser. |
 
+#### Keys of `calendar/calendar.json` (calendar)
+
+The calendar: the business's settings and its appointments. The words in it (the business's and the receptionist's names, each service's name, price and description, and each appointment's service, name, phone number and notes) are read by the receptionist and the Agent and said to callers, so they need the calendar tick. Opening hours, the step between times and each appointment's time, length, state and origin are typed values that carry no words. The sync with FormLogic (its record of each appointment, the deletions it has yet to be told about, and where it got to) is never restored.
+
+| Key | Class | Comes back | What it is, why, and what to do again |
+|---|---|---|---|
+| `settings` | data | Yes, without a tick | The calendar's settings |
+| `settings.business` | runs | Only with the tick "Calendar text your receptionist reads" | The business's name: Every call, text and outreach agent has it in its instructions, and the receptionist says it to callers. |
+| `settings.receptionist` | runs | Only with the tick "Calendar text your receptionist reads" | The receptionist's name: It is the name the receptionist gives itself on calls and texts. |
+| `settings.hours` | data | Yes, without a tick | Opening hours: Seven days of opening times. |
+| `settings.services` | runs | Only with the tick "Calendar text your receptionist reads" | The services on offer: The receptionist reads and says each service's name, price and description. |
+| `settings.services[].id` | runs | Only with the tick "Calendar text your receptionist reads" | A service's id |
+| `settings.services[].name` | runs | Only with the tick "Calendar text your receptionist reads" | A service's name: The receptionist reads it and says it to callers. |
+| `settings.services[].minutes` | runs | Only with the tick "Calendar text your receptionist reads" | How long a service takes |
+| `settings.services[].description` | runs | Only with the tick "Calendar text your receptionist reads" | A service's description: The receptionist reads it before it answers and says it to callers. |
+| `settings.services[].price` | runs | Only with the tick "Calendar text your receptionist reads" | A service's price: The receptionist reads it and says it to callers. |
+| `settings.slotMinutes` | data | Yes, without a tick | The step between the times offered |
+| `settings.noticeMinutes` | data | Yes, without a tick | How soon from now a time may be offered |
+| `settings.horizonDays` | data | Yes, without a tick | How far ahead times are offered |
+| `settings.textConfirmations` | runs | Only with the tick "Calendar text your receptionist reads" | Text the person when an appointment is confirmed: It decides whether the phone sends a text to the person who asked for an appointment. |
+| `appointments` | data | Yes, without a tick | The appointments |
+| `appointments[].id` | data | Yes, without a tick | An appointment's id |
+| `appointments[].service` | runs | Only with the tick "Calendar text your receptionist reads" | An appointment's service: The receptionist tells a caller what their appointment is for. |
+| `appointments[].start` | data | Yes, without a tick | When an appointment starts |
+| `appointments[].minutes` | data | Yes, without a tick | How long an appointment lasts |
+| `appointments[].status` | data | Yes, without a tick | Where an appointment stands |
+| `appointments[].name` | runs | Only with the tick "Calendar text your receptionist reads" | Who an appointment is for: The Agent reads it when it looks at the calendar. |
+| `appointments[].phone` | runs | Only with the tick "Calendar text your receptionist reads" | The number an appointment is for: It decides which caller is told about the appointment, and where a confirmation text is sent. |
+| `appointments[].notes` | runs | Only with the tick "Calendar text your receptionist reads" | Notes on an appointment: The Agent reads them when it looks at the calendar. |
+| `appointments[].source` | data | Yes, without a tick | Where an appointment came from |
+| `appointments[].createdAt` | data | Yes, without a tick | When an appointment was made |
+| `appointments[].updatedAt` | data | Yes, without a tick | When an appointment last changed |
+| `appointments[].requestId` | excluded | Never | The phone's record of the call that asked for it: It names a request made on the computer the backup came from: a restored one could make the phone take a new request for a duplicate and drop it. |
+| `appointments[].callId` | excluded | Never | The call that asked for it: It names a call made on the computer the backup came from. |
+| `appointments[].formlogic` | excluded | Never | FormLogic's copy of an appointment: The sync state of another account: restored on a computer that is linked to another account, or to none, it would delete or duplicate records there. |
+| `deleted` | excluded | Never | Appointments deleted here that FormLogic may still have: The sync state of another account: it would delete records there. |
+| `sync` | excluded | Never | Where the sync with FormLogic got to: The sync state of another account: the form it is paired with, the cursor, the records to delete. |
+
 #### Keys of `plugin-data/aokie/settings.json` (plugin.aokie)
 
 Aokie's settings file: a document with a `settings` bag and a few fields of its own. Every key not listed here is left out.
@@ -468,6 +506,7 @@ yours to tick or not.
 | The Agent's own settings (its providers, network gate, and how it answers calls and texts) | Some keys of idb/settings.json | Which servers the Agent talks to, whether its network gate is open, whether it answers calls and texts by itself, and the instructions it answers them by. A provider at another address arrives without a key, beside yours. |
 | Voices your callers hear | Voices | A voice is what your callers hear. A sample or a setting from a file that was not made by you would speak to them in your name. |
 | Contacts and what is remembered about people | Contacts and what is remembered about callers; What the phone's agents remember about people | The receptionist and the Agent read what is remembered about a person, and the notes for the receptionist, before they answer them. It is read as instructions, so a file that was not made by you could steer what they say. |
+| Calendar text your receptionist reads | Some keys of calendar/calendar.json | The receptionist reads the business's name, the services (their names, prices and descriptions) and, for a caller, their appointments before it answers, says them to callers, and the Agent reads each appointment's name and notes. Opening hours, the length of a step and an appointment's time, length and state are brought back without a tick. An appointment that comes back without the tick has only its time: no name, number, service or notes. |
 | Outreach campaigns (texts and calls to a list of people) | The list of outreach campaigns; Some keys of opfs/front-desk/outreach/<id>.json | A campaign texts or calls the people on its list. A restored campaign is always PAUSED: it is never running and nothing is scheduled. It is listed by name with the number of people, and you start each one yourself. |
 | The Agent's projects, conversations, brief and knowledge files | The front desk's brief; The front desk's knowledge files; The other files the Agent keeps at the front desk (outreach results and the like); The front desk's own record and its conversation; The phone's conversations (each call and text thread); A project's record and its conversation; A project's files; A project's other conversations | The Agent reads its projects, conversations, the front desk's brief and its knowledge files as context and instructions: the brief wins over what the phone's agents would otherwise say. Each project and file is listed by name and size. |
 

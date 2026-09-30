@@ -405,14 +405,15 @@ fn copy_cleaned(from: &Path, to: &Path, rel: &str, kind: Sanitize, excluded: &mu
     let mut bytes = Vec::new();
     File::open(from).and_then(|f| f.take(sanitize::MAX_JSON_BYTES as u64 + 1).read_to_end(&mut bytes)).map_err(|_| "it could not be read".to_string())?;
     let cleaned = match kind {
-        Sanitize::Calendar => sanitize::calendar_json(&bytes)?,
         Sanitize::Keys(name) => {
             let keys = table().key_table(name).ok_or_else(|| "OAIY does not know how to read this file".to_string())?;
             let value: serde_json::Value = serde_json::from_slice(bytes.strip_prefix(&[0xef, 0xbb, 0xbf][..]).unwrap_or(&bytes)).map_err(|_| "it is not valid JSON".to_string())?;
             // Only the keys the table lets come back are copied: a PIN, an address that audio goes to, a
             // switch that grants access, or anything the table does not know stays out of the file.
             let found = filter_json(keys, &value, &|_| true);
-            for left in found.left.iter().take(50) {
+            // (A list of records leaves the same key out of each of them: it is said once.)
+            let mut said = std::collections::HashSet::new();
+            for left in found.left.iter().filter(|l| said.insert(l.path.clone())).take(50) {
                 let (reason, redo) = match (&left.why, left.row) {
                     (Why::Excluded, Some(row)) => (row.reason.clone(), row.redo.clone()),
                     (Why::BadValue(why), _) => (format!("Left out: its value is not one a restore accepts ({why})."), None),
@@ -420,8 +421,9 @@ fn copy_cleaned(from: &Path, to: &Path, rel: &str, kind: Sanitize, excluded: &mu
                 };
                 excluded.push(Excluded { pattern: format!("{rel}: {}", left.path), reason, redo });
             }
-            if found.left.len() > 50 || found.left_more > 0 {
-                excluded.push(Excluded { pattern: format!("{rel}: and more"), reason: format!("{} more keys of the file were left out in the same way.", found.left.len().saturating_sub(50) + found.left_more), redo: None });
+            let distinct = found.left.iter().map(|l| l.path.as_str()).collect::<std::collections::HashSet<_>>().len();
+            if distinct > 50 || found.left_more > 0 {
+                excluded.push(Excluded { pattern: format!("{rel}: and more"), reason: format!("{} more keys of the file were left out in the same way.", distinct.saturating_sub(50) + found.left_more), redo: None });
             }
             serde_json::to_vec_pretty(&found.value).map_err(|_| "it could not be written".to_string())?
         }

@@ -5,7 +5,7 @@
 # store that is added or renamed shows up here.
 
 callers.json	runs
-calendar/calendar.json	data
+calendar/calendar.json	runs
 triggers.json	runs
 flows/greeting.json	runs
 flows/smoke.json	runs

@@ -85,6 +85,17 @@ impl Default for Settings {
     }
 }
 
+/// Whether `text` is a calendar file this module reads. A file that is not is read as an empty calendar, and the next
+/// save writes that over it, so nothing may put such a file in place (a restore checks with this).
+pub fn is_readable(text: &str) -> bool {
+    serde_json::from_str::<Book>(text).is_ok()
+}
+
+/// The settings of a calendar that has none yet, as the calendar file writes them.
+pub fn default_settings_json() -> Value {
+    serde_json::to_value(Settings::default()).unwrap_or(Value::Null)
+}
+
 /// What the receptionist is called while no name is set: the phone's
 /// (Aokie's) own name for it.
 pub const DEFAULT_RECEPTIONIST: &str = "Aokie";

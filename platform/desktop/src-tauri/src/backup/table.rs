@@ -5,7 +5,7 @@
 //! has exactly one class:
 //!
 //! - **excluded**: never restored, with the reason and what to do again;
-//! - **data**: harmless personal content that cannot act, which comes back without a tick;
+//! - **data**: a value that no code path turns into behaviour (typed, carrying no words), which comes back without a tick;
 //! - **runs**: something a model reads as instructions, that plays audio to callers, sends messages or
 //!   calls, or changes trust or network destinations. It is listed by name, unticked by default, and
 //!   applied only when its tick is ticked.
@@ -244,6 +244,24 @@ pub enum ValueType {
     Object,
     /// A list of objects whose keys have rows of their own below `path[]`.
     Objects { max_items: usize },
+    /// A time of day, `HH:MM`.
+    Time,
+    /// A local date and time, `YYYY-MM-DDTHH:MM` (seconds allowed).
+    DateTime,
+    /// A moment as RFC 3339 writes it.
+    Stamp,
+    /// An identifier: letters, digits, `_`, `-` and `.`, at most 100 characters.
+    Slug,
+    /// Seven days, Monday first, each a list of opening spans `{open, close}` in `HH:MM`.
+    WeekHours,
+}
+
+impl ValueType {
+    /// Whether a value of this type can carry words: text a person typed, a list or map of it, an address. The audit does not let
+    /// such a value be data (a model can read words as instructions, and a person can be told them).
+    pub fn carries_words(&self) -> bool {
+        matches!(self, ValueType::Str { .. } | ValueType::Url { .. } | ValueType::Strings { .. } | ValueType::StringsMap { .. } | ValueType::ScalarsMap { .. })
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -488,6 +506,11 @@ fn key_from(raw: RawKey) -> Result<KeyRow, String> {
         (_, Some("strings")) => Some(ValueType::Strings { max_items: raw.max_items.ok_or_else(|| fail("strings has maxItems"))?, max_chars: raw.max_chars.ok_or_else(|| fail("strings has maxChars"))? }),
         (_, Some("strings-map")) => Some(ValueType::StringsMap { max_items: raw.max_items.ok_or_else(|| fail("a map has maxItems"))?, max_chars: raw.max_chars.ok_or_else(|| fail("a map has maxChars"))? }),
         (_, Some("scalars-map")) => Some(ValueType::ScalarsMap { max_items: raw.max_items.ok_or_else(|| fail("a map has maxItems"))?, max_chars: raw.max_chars.ok_or_else(|| fail("a map has maxChars"))? }),
+        (_, Some("time")) => Some(ValueType::Time),
+        (_, Some("datetime")) => Some(ValueType::DateTime),
+        (_, Some("stamp")) => Some(ValueType::Stamp),
+        (_, Some("slug")) => Some(ValueType::Slug),
+        (_, Some("weekHours")) => Some(ValueType::WeekHours),
         (_, Some("object")) => Some(ValueType::Object),
         (_, Some("objects")) => Some(ValueType::Objects { max_items: raw.max_items.ok_or_else(|| fail("objects has maxItems"))? }),
         (_, Some(other)) => return Err(fail(&format!("unknown type \"{other}\""))),
@@ -704,8 +727,41 @@ fn check_value(ty: &ValueType, value: &Value, is_a_key: bool) -> Result<(), Stri
                 Err("it is not a plain web address".to_string())
             }
         }
+        (ValueType::Time, Value::String(s)) => if time_of_day(s).is_some() { Ok(()) } else { Err("a time such as 09:30 is expected".to_string()) },
+        (ValueType::DateTime, Value::String(s)) => if chrono::NaiveDateTime::parse_from_str(s, "%Y-%m-%dT%H:%M").is_ok() || chrono::NaiveDateTime::parse_from_str(s, "%Y-%m-%dT%H:%M:%S").is_ok() { Ok(()) } else { Err("a date and time such as 2026-10-01T09:30 is expected".to_string()) },
+        (ValueType::Stamp, Value::String(s)) => if s.len() <= 40 && chrono::DateTime::parse_from_rfc3339(s).is_ok() { Ok(()) } else { Err("a moment such as 2026-10-01T09:30:00Z is expected".to_string()) },
+        (ValueType::Slug, Value::String(s)) => {
+            if !s.is_empty() && s.len() <= 100 && s.chars().all(|c| c.is_ascii_alphanumeric() || matches!(c, '_' | '-' | '.')) {
+                Ok(())
+            } else {
+                Err("an identifier of letters, digits, _, - and . is expected".to_string())
+            }
+        }
+        (ValueType::WeekHours, Value::Array(days)) => {
+            let fine = days.len() == 7
+                && days.iter().all(|day| {
+                    day.as_array().is_some_and(|spans| {
+                        spans.len() <= 8
+                            && spans.iter().all(|span| match (span.get("open").and_then(Value::as_str).and_then(time_of_day), span.get("close").and_then(Value::as_str).and_then(time_of_day)) {
+                                (Some(open), Some(close)) => open < close && span.as_object().is_some_and(|o| o.len() == 2),
+                                _ => false,
+                            })
+                    })
+                });
+            if fine { Ok(()) } else { Err("seven days of opening times such as 09:00 to 17:00 are expected".to_string()) }
+        }
         _ => Err("it is not the kind of value expected".to_string()),
     }
+}
+
+/// A time of day written `HH:MM` (two digits each), as minutes since midnight.
+fn time_of_day(text: &str) -> Option<u32> {
+    let bytes = text.as_bytes();
+    if bytes.len() != 5 || bytes[2] != b':' || !bytes.iter().enumerate().all(|(i, b)| i == 2 || b.is_ascii_digit()) {
+        return None;
+    }
+    let (h, m) = (text[..2].parse::<u32>().ok()?, text[3..].parse::<u32>().ok()?);
+    (h < 24 && m < 60).then_some(h * 60 + m)
 }
 
 struct Walk<'a> {

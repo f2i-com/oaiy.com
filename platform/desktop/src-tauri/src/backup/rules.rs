@@ -208,9 +208,8 @@ pub fn keys_of(name: &str) -> Option<&'static str> {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Sanitize {
     None,
-    /// The calendar, without its FormLogic sync state.
-    Calendar,
-    /// A settings file, passed through the key table of that name: only the keys it lists come through.
+    /// A file passed through the key table of that name: only the keys it lists come through (a plugin's or the Agent's
+    /// settings, the calendar).
     Keys(&'static str),
 }
 
@@ -310,10 +309,9 @@ pub fn plan(data_dir: &Path, include_keys: bool) -> Plan {
                         continue;
                     }
                     let row = table().desktop_row(&rel, include_keys);
-                    let sanitize = match (category, row.and_then(|r| r.keys.as_deref())) {
-                        (_, Some(keys)) => Sanitize::Keys(keys),
-                        (Category::Calendar, _) => Sanitize::Calendar,
-                        _ => Sanitize::None,
+                    let sanitize = match row.and_then(|r| r.keys.as_deref()) {
+                        Some(keys) => Sanitize::Keys(keys),
+                        None => Sanitize::None,
                     };
                     plan.items.push(PlanItem { rel, abs, size: meta.len(), category, secret, sanitize });
                 }
