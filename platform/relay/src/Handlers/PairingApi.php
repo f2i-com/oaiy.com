@@ -81,8 +81,8 @@ final class PairingApi
         }
         $now = Clock::now();
         $row = Pairing::live($ctx->db, $pid, $now);
-        if ($row === null) {
-            throw ApiError::make('not_found');
+        if ($row === null || !$ctx->cfg->appAllowed((string)$row['app_id'])) {
+            throw ApiError::make('not_found'); // an app config.apps no longer lists is as good as gone, and says so to a stranger no differently
         }
         // Each rendezvous answers 60 GETs while it is open or answered (the design's budget against a pid that is being guessed or hammered).
         // A rendezvous that has ended in an outcome (approved, denied) answers reads of it without counting them: the token was

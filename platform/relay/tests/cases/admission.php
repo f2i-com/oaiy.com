@@ -445,6 +445,35 @@ test('4.14.2 plugin admission: validation in order, each failure a plain 400 (a 
     eq($rosterBefore, $k->r->ctx()->db->all('SELECT * FROM roster'), 'no attempt changed the roster registry');
 });
 
+test('4.14.2 config.apps is checked on every admission and every compatibility request: narrowing it after the phones were paired ends their admissions (403) and a bearer that was already minted at its next request', function () {
+    $k = AokieRig::make();
+    $a = $k->addPhone('A');
+    $k->pushRoster();
+    $plug = $k->pluginToken();
+    $ta = $k->mobileToken($a);
+    eq(200, $k->mobile($a)['status']);
+    eq(200, aok_call($k, $ta, 'GET', 'challenge')['status']);
+    eq(200, aok_call($k, $plug, 'GET', 'challenge')['status']);
+    $k->r->configure(['apps' => ['some-other-app']]);
+    Tmp::setClock(Relay::T0 + 61);
+    $res = $k->mobile($a);
+    eq([403, 'forbidden'], [$res['status'], adm_code($res)], 'the phone\'s admission: ' . $res['body']);
+    $res = $k->r->call($a, 'POST', '/v1/admission', $k->mobileRequest($a));
+    eq(403, $res['status'], 'and on the native path');
+    eq(403, $k->plugin()['status'], 'the plugin\'s');
+    // A bearer minted before the narrowing is not served either.
+    foreach (['plugin' => $plug, 'phone' => $ta] as $who => $bearer) {
+        foreach (AOK_ROUTES as [$method, $route]) {
+            $res = aok_call($k, $bearer, $method, $route, $method === 'POST' ? '{"to":"plugin","frames":[{}]}' : null);
+            eq([403, 'forbidden'], [$res['status'], aok_err($res)['code'] ?? ''], "$who $method $route");
+        }
+    }
+    // Listing the app again brings it all back.
+    $k->r->configure(['apps' => ['aokie']]);
+    eq(200, $k->mobile($a)['status']);
+    eq(200, aok_call($k, $ta, 'GET', 'challenge')['status']);
+});
+
 test('4.14.2 step 4: an admission changes nothing the relay stores: a roster that lags the registry is echoed, not merged, and no phone is revoked or added by it', function () {
     $k = AokieRig::make();
     $a = $k->addPhone('A');

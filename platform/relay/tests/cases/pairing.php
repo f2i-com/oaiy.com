@@ -276,6 +276,34 @@ test('4.10.3 step 1: the request is checked before anything is stored: pid, offe
     eq('forbidden', pair_code($res));
 });
 
+test('4.10.3 config.apps is checked all along the rendezvous, not only when it opens: after it is narrowed the phone\'s routes answer as for an unknown pid (404) and no phone is made (403), while denying, rejecting and burning still work', function () {
+    [$r, $d, $c] = pair_setup();
+    $c->open();
+    $c->answer();
+    $keep = Ceremony::random($r, $d);
+    $keep->open();
+    $r->configure(['apps' => ['other']]);
+    $get = $c->get();
+    eq([404, 'not_found'], [$get['status'], pair_code($get)]);
+    eq($c->get(['wait' => '1'])['body'], $get['body'], 'a wait for it returns at once and says the same');
+    $res = $keep->answer();
+    eq([404, 'not_found'], [$res['status'], pair_code($res)], 'the phone\'s response');
+    eq(0, count(pair_items($r, $d)) - 1, 'and the response of the rendezvous that was open was not filed');
+    $res = $c->decide();
+    eq([403, 'forbidden'], [$res['status'], pair_code($res)], 'the approval');
+    eq(0, pair_phones($r, $d, false), 'no phone was made');
+    eq('answered', pair_row($r, $c->pid)['state'], 'and nothing changed');
+    eq(200, $c->decide(['approve' => false])['status'], 'a denial reduces what can happen: allowed');
+    eq(200, $keep->burn()['status'], 'so does a burn');
+    // Listed again, the rendezvous that was open takes its response.
+    $r->configure(['apps' => ['aokie']]);
+    [$r2, $d2, $c2] = pair_setup();
+    $c2->open();
+    eq(200, $c2->get()['status']);
+    eq(202, $c2->answer()['status']);
+    eq(200, $c2->decide()['status']);
+});
+
 test('4.10.3 step 1: the offer is parsed only to check what the desktop says about it: an object naming this app, this desktop key thumbprint and this desktop; a key of small order or a thumbprint that does not fit its key is refused', function () {
     [$r, $d, $c] = pair_setup();
     $tamper = function (callable $f) use ($c): array {

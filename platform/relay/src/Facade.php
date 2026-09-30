@@ -122,6 +122,9 @@ final class Facade
         $f->jti = (string)$c['jti'];
         $f->exp = (int)$c['exp'];
         $f->scopes = array_values($c['scopes']);
+        if (!$ctx->cfg->appAllowed($f->appId)) {
+            throw ApiError::make('forbidden'); // config.apps was narrowed after this admission was minted: the app is no longer served
+        }
         if ($f->role === 'plugin') {
             $f->party = 'plugin';
             $f->peers = array_values($c['approvedPeerKeyThumbprints']);

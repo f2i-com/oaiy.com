@@ -192,8 +192,8 @@ final class Pairing
         $now = Clock::now();
         $desktop = $ctx->db->write(function (Db $db) use ($ctx, $pid, $text, $now): string {
             $row = self::live($db, $pid, $now, true);
-            if ($row === null) {
-                throw ApiError::make('not_found');
+            if ($row === null || !$ctx->cfg->appAllowed((string)$row['app_id'])) {
+                throw ApiError::make('not_found'); // (an app that config.apps no longer lists: the same answer as an unknown pid)
             }
             if ($row['state'] !== 'open' || $row['responses'] >= self::RESPONSES_MAX) {
                 if (self::isRetryOfAccepted($db, $row, $text)) {
@@ -285,6 +285,9 @@ final class Pairing
             }
             if ($row['state'] !== 'answered') {
                 throw ApiError::make('conflict');
+            }
+            if (!$ctx->cfg->appAllowed((string)$row['app_id'])) {
+                throw ApiError::make('forbidden'); // config.apps was narrowed after the offer: no phone is made for an app the relay no longer serves
             }
             $phone = self::approval($row, $doc);
             // What follows counts phones that may not exist yet and makes one: two approvals for two of one desktop's pairings must
