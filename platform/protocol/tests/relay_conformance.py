@@ -1785,7 +1785,7 @@ for route in ("/v1/health", "/v1/info", "/v1/poll", "/v1/items", "/v1/slots", "/
               "/v1/admin/hold", "/v1/admin/stream-probe", "/v1/admin/echo", "/v1/admin/capacity", "/v1/aokie-companion/relay/stream"):
     ok(f"README lists the route {route}", route in readme)
 ok("README has an Interpretations section", re.search(r"^## (\d+\. )?Interpretations$", readme, re.M) is not None)
-interp_section = re.split(r"^## (?:\d+\. )?Interpretations$", readme, flags=re.M)[-1]
+interp_section = re.split(r"^## ", re.split(r"^## (?:\d+\. )?Interpretations$", readme, flags=re.M)[-1], maxsplit=1, flags=re.M)[0]  # up to the next H2: the design defects that follow are numbered too
 interp_numbers = [int(n) for n in re.findall(r"^(\d+)\. \*\*", interp_section, re.M)]
 ok("the Interpretations are numbered 1 to N with no gap and no repeat, and there are at least 23", interp_numbers == list(range(1, len(interp_numbers) + 1)) and len(interp_numbers) >= 23, str(interp_numbers))
 ok("README says the SAS input carries the raw 16 bytes of pid and points at extras.sasNegative", "**raw 16 bytes**" in readme and "extras.sasNegative" in readme and 'not its 22-character b64u text' in readme)
