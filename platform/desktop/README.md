@@ -262,6 +262,58 @@ startup, including when launched from the GUI. `SIGTERM`/`Ctrl-C` stops the mana
 services before exit, and on unix the plugins first, and so does a failed bind of the
 port (on Windows a plugin ends with the server's job object).
 
+### The web login (`oaiy-server` built with `--features web`)
+
+A server built with the `web` feature has an owner login for the dashboard in a browser: one password, sessions in
+a cookie per app host, a known-device cookie, a throttle, and a console (`oaiy-server auth ...`, run through
+`oaiyctl` on a service install) that makes the first owner and every recovery. It defaults to the `scoped` access
+mode and refuses `legacy`. `oaiy-server check` validates the whole configuration and the data folder and lists every
+violation (exit 78); a refusal to start is exit 78 too.
+
+| env | purpose |
+|---|---|
+| `OAIY_PUBLIC_URL`, `OAIY_AGENT_URL`, `OAIY_FLOWS_URL` | the `https://` hosts of the dashboard and the two apps behind your proxy; the dashboard's is where the login lives |
+| `OAIY_TRUSTED_PROXIES` | the proxies whose `X-Forwarded-*` headers are believed |
+| `OAIY_LOGIN_ALLOW` | addresses and networks a sign-in may come from (`203.0.113.7`, `203.0.113.0/24`, `2001:db8::/32`, comma-separated). **A list with any entry that is not an address or a network is refused whole** (the server does not start, `check` fails): a typo must not turn the restriction off. Unset means every address |
+
+**A service install** has one settings file, `/etc/oaiy/oaiy.env` (install it from
+`systemd/oaiy.env.example`, `root:oaiy`, `0640`), which the unit `systemd/oaiy-server.service` reads
+(`EnvironmentFile=`) and `oaiyctl` reads too: the unit sets no `OAIY_` setting of its own, so the console works in
+the folder the server keeps its data in. `oaiyctl` (`systemd/oaiyctl`) runs `oaiy-server ...` as the service user,
+says which data folder it is about to work in, and, while the service runs, refuses if that is not the folder the
+running server was started with. The unit runs `oaiy-server check` before the server (a refusal, exit 78, is not
+restarted). First run: `oaiyctl auth setup-code`, open the dashboard's `/setup` with it, or `oaiyctl auth init
+--generate` on the console. `auth init` makes no data folder of its own unless it is told to (`--new-folder`, for
+an install that has never run): a console that looks at the wrong folder says so instead of making an owner there.
+An install made with the earlier unit (`Environment=OAIY_DATA_DIR=...` in the unit) moves those lines into the file.
+
+**The password** is 16 to 128 characters and must be estimated (zxcvbn, with `oaiy`, `admin` and the install's host
+names counted as guessable) at 10^10 guesses or more, score 4. There are no composition rules; `oaiyctl auth init
+--generate` and the dashboard offer six words of the BIP-39 list, which pass with room to spare.
+
+**Limits to know before exposing a login** (they are recorded here so that nobody finds them by accident):
+
+- **Flows.** Until flow authority (ACC-05) exists, a signed-in dashboard session can write and run flows
+  (`PUT /api/bridge/flows/…`, `POST /api/bridge/runs`) *without elevating*: `flows.write` and `runs.write` are not
+  dangerous scopes yet. That is code execution as the service user for whoever holds the session. **Do not put a
+  web login on a network with flows in use until ACC-05 lands**; `oaiy-server check` warns of it on every install
+  that is not loopback-only.
+- **The setup code can be burned by strangers.** It allows 100 wrong guesses in all, across every address, and the
+  first owner is made with it: about twenty addresses (five wrong guesses each, before each is blocked) can use
+  them up. Nothing is lost but the code: make another (`oaiyctl auth setup-code`). Behind a proxy that is not
+  trusted, everything is one address.
+- **Wrong setup and link codes are cheap to try** (no password is hashed for them) but count towards slow mode like a
+  wrong password, so a flood of them slows the owner's sign-in down too; the owner's own known device is exempt.
+- **The throttle survives a restart, up to a point.** `throttle.json` holds the 2000 addresses that matter most (the
+  blocks that end last); the server tracks up to 50 000 in memory, so a flood of rotating addresses that were all
+  blocked is fully remembered until a restart and only mostly remembered after it.
+- **A `Cookie` header over 16 KiB is read as no cookie** (a browser that sends one is signed out, not refused).
+- **The session id is not rotated** when a session is elevated or the password is changed (a login always makes a new
+  one, so there is no fixation): the session that changes the password keeps its cookie, every other session is revoked.
+- **The guard reads the `Host` header.** A request with two `Host` headers is not refused, and the authority of an
+  absolute-form request target is ignored; both are core behaviour recorded for the exposure work (ACC-14) and the
+  static UI (ACC-15), and a proxy in front (Caddy, nginx) normalises both.
+
 **Updates:** the server never downloads or replaces itself. `GET /api/update/status` (open,
 like health) and `POST /api/update/check` (needs the token) tell you whether a newer release
 exists; [docs/UPDATES.md](../../docs/UPDATES.md#the-headless-server) has the steps to upgrade

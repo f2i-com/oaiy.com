@@ -239,6 +239,7 @@ fn methods(verb: Verb) -> Vec<reqwest::Method> {
 /// Routes the `legacy` guard has always left open on a headless server, though the table asks for a
 /// scope: `GET /api/update/status` is "open like health" there (`http.rs`, `UPDATE_STATUS_PATH`).
 /// The new guard does not keep this exemption; when it is on, the row is refused like the others.
+#[cfg(not(feature = "web"))]
 const OPEN_IN_LEGACY: &[&str] = &["GET /api/update/status"];
 
 /// What one anonymous request to a row got back.
@@ -280,6 +281,24 @@ fn probe_every_row(server: &Server) -> Vec<Answer> {
     answers
 }
 
+/// The public routes of the model that exist in this build: `info`; and with the web login `login`, `setup`, `link` and
+/// `session` (which answer a stranger something other than `401`: `404` on a host that serves no app, `200`).
+fn built_public_routes() -> Vec<&'static str> {
+    let mut routes = vec!["/api/auth/info"];
+    if cfg!(feature = "web") {
+        routes.extend([
+            "/api/auth/login",
+            "/api/auth/setup",
+            "/api/auth/link",
+            "/api/auth/session",
+        ]);
+    }
+    routes
+}
+
+// A server with the web login refuses `legacy` (`a_server_with_the_web_login_...` below), so the two tests of
+// legacy mode are for the build without it.
+#[cfg(not(feature = "web"))]
 #[test]
 fn every_row_of_the_table_is_behind_the_guard_in_legacy_mode() {
     let scratch = Scratch::new("boot-legacy");
@@ -334,6 +353,7 @@ fn every_row_of_the_table_is_behind_the_guard_in_legacy_mode() {
     );
 }
 
+#[cfg(not(feature = "web"))]
 #[test]
 fn a_legacy_server_answers_what_it_always_did_and_health_says_the_mode() {
     let scratch = Scratch::new("boot-legacy-health");
@@ -393,9 +413,14 @@ fn every_row_of_the_table_is_behind_the_guard_in_scoped_mode() {
     let answers = probe_every_row(&server);
     let mut answered = Vec::new();
     for a in &answers {
-        let public_and_built =
-            a.row.class == Class::Public && (a.row.since == 1 || a.row.pattern == "/api/auth/info");
-        if public_and_built {
+        // The public routes that are built: what existed, info, and (with the web login) the four of the login.
+        let public_and_built = a.row.class == Class::Public
+            && (a.row.since == 1 || built_public_routes().contains(&a.row.pattern));
+        // With the web login and no owner yet the server is in setup-only mode (design 4.7.1): the public routes of the
+        // bridge (pairing, capabilities) are refused with 401 like everything else until there is an owner.
+        let closed_until_there_is_an_owner =
+            cfg!(feature = "web") && a.row.pattern.starts_with("/api/bridge/");
+        if public_and_built && !closed_until_there_is_an_owner {
             if matches!(a.status, 401 | 403 | 421) {
                 answered.push(format!("public {} -> {}", a.name(), a.status));
             }
@@ -779,5 +804,42 @@ fn a_second_scoped_server_on_the_data_folder_is_refused_with_exit_78() {
         second.stderr_tail().contains("in use by process"),
         "{}",
         second.stderr_tail()
+    );
+}
+
+/// A server built with the web login is `scoped` unless told another mode, and refuses `legacy`: the login needs the
+/// store on disk, which `legacy` never opens.
+#[cfg(feature = "web")]
+#[test]
+fn a_server_with_the_web_login_defaults_to_scoped_and_refuses_legacy() {
+    let scratch = Scratch::new("boot-web-default");
+    let server = Server::start(&scratch, &[]);
+    let (status, health) = server.call(reqwest::Method::GET, "/api/health", None);
+    assert_eq!((status, health["access"].as_str()), (200, Some("scoped")));
+    // The store is on disk and the login is there: the folder exists, and the owner does not.
+    let auth = scratch.data().join("auth");
+    assert!(
+        auth.join(".lock").exists() && auth.join("console.token").exists(),
+        "{:?}",
+        std::fs::read_dir(&auth).map(|d| d.count())
+    );
+    drop(server);
+
+    let other = Scratch::new("boot-web-legacy");
+    let mut refused = Server::spawn(&other, &[("OAIY_ACCESS_MODE", "legacy")], "server");
+    assert_eq!(
+        refused.exit_code(Duration::from_secs(60)),
+        Some(78),
+        "{}",
+        refused.stderr_tail()
+    );
+    assert!(
+        refused.stderr_tail().contains("legacy"),
+        "{}",
+        refused.stderr_tail()
+    );
+    assert!(
+        !other.data().join("auth").exists(),
+        "nothing was opened on the way to refusing"
     );
 }

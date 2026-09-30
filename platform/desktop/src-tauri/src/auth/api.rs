@@ -1,6 +1,8 @@
 //! The routes of the access model that exist now: `GET /api/auth/info`, `GET /api/auth/whoami` and
 //! `POST /api/auth/derive`.
 //!
+//! (`loginConfigured` and `setupCode` are the web login's to say, when there is one.)
+//!
 //! They are rows of the table with `since: 2`, so the new guard judges them in every access mode:
 //! `info` is public (and, like the login routes, gets no CORS headers: it is same-origin by
 //! construction), `whoami` and `derive` need a credential, and `derive` adds its own rules (a `desk`,
@@ -43,7 +45,7 @@ pub fn router(guard: Arc<Guard>) -> Router {
 /// `GET /api/auth/info`: what a page needs to know before it has a credential: the request as the server
 /// understood it (`seen`), so that a proxy mistake shows before it becomes a lockout. It says nothing of
 /// the install's host names or its exposure: those came from a cross-origin reader in the first draft.
-async fn info(info: Option<Extension<RequestInfo>>) -> Response {
+async fn info(State(guard): State<Arc<Guard>>, info: Option<Extension<RequestInfo>>) -> Response {
     let (seen, secure, app) = match info {
         Some(Extension(i)) => {
             let app = match i.host_class {
@@ -62,8 +64,8 @@ async fn info(info: Option<Extension<RequestInfo>>) -> Response {
         "scheme": "oaiy-auth/1",
         "app": app,
         "apiVersion": crate::http::API_VERSION,
-        "loginConfigured": false,
-        "setupCode": "none",
+        "loginConfigured": guard.login_configured(),
+        "setupCode": guard.setup_code_status(),
         "secureChannel": secure,
         "factors": ["password"],
         "seen": seen,
@@ -118,7 +120,7 @@ struct DeriveBody {
 }
 
 /// A `Content-Type` of `application/json` (with or without parameters).
-fn is_json(headers: &HeaderMap) -> bool {
+pub(super) fn is_json(headers: &HeaderMap) -> bool {
     headers
         .get(header::CONTENT_TYPE)
         .and_then(|v| v.to_str().ok())

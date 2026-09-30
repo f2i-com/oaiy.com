@@ -21,21 +21,47 @@ pub mod bearer_throttle;
 pub mod chain;
 pub mod clientip;
 pub mod clock;
+#[cfg(feature = "web")]
+pub mod console;
+#[cfg(feature = "web")]
+pub mod console_cli;
+#[cfg(feature = "web")]
+pub mod cookie;
 pub mod cors;
+#[cfg(feature = "web")]
+pub mod device;
 pub mod export;
 pub mod exposure_checks;
 pub mod guard;
 pub mod host;
+#[cfg(feature = "web")]
+pub mod lanes;
 pub mod lock;
+#[cfg(feature = "web")]
+pub mod login;
 pub mod mode;
+#[cfg(feature = "web")]
+pub mod owner;
+#[cfg(feature = "web")]
+pub mod password;
+#[cfg(feature = "web")]
+pub mod policy;
 pub mod presets;
 pub mod principal;
 pub mod routes;
 pub mod runtime;
 pub mod scopes;
 pub mod scrub;
+#[cfg(feature = "web")]
+pub mod session;
+#[cfg(feature = "web")]
+pub mod setup;
 pub mod store;
+#[cfg(feature = "web")]
+pub mod throttle;
 pub mod token;
+#[cfg(feature = "web")]
+pub mod wordlist;
 
 pub use guard::{Guard, GuardConfig, HealthExtras};
 pub use mode::{AccessMode, ConfigRefusal, Exposure};
@@ -44,8 +70,14 @@ pub use runtime::{build_guard, flush_installed, AccessSettings};
 #[cfg(test)]
 mod conformance;
 #[cfg(test)]
+mod cookie_guard_tests;
+#[cfg(test)]
 mod guard_tests;
 #[cfg(test)]
+mod login_tests;
+#[cfg(test)]
 pub(crate) mod route_coverage;
+#[cfg(test)]
+mod store_login_tests;
 #[cfg(test)]
 mod store_tests;

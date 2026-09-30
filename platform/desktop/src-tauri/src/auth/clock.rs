@@ -48,6 +48,33 @@ impl Clock for ManualClock {
     }
 }
 
+/// A clock that only goes forward, whatever the wall clock does: what a link code's five minutes and an elevation's
+/// ten are measured on, so that a jump of the wall clock cannot extend one (design 6, "clock skew").
+pub struct MonotonicClock {
+    start: std::time::Instant,
+}
+
+impl MonotonicClock {
+    pub fn new() -> MonotonicClock {
+        MonotonicClock {
+            start: std::time::Instant::now(),
+        }
+    }
+}
+
+impl Default for MonotonicClock {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl Clock for MonotonicClock {
+    fn now_ms(&self) -> u64 {
+        // One is added so that "zero" can never be a moment.
+        self.start.elapsed().as_millis() as u64 + 1
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

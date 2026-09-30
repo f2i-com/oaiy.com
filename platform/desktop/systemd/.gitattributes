@@ -1,0 +1,2 @@
+# The wrapper runs on Linux: always LF, whatever the checkout's line ending setting.
+oaiyctl text eol=lf

@@ -12,24 +12,20 @@ Type=simple
 User=oaiy
 Group=oaiy
 
-# All state lives under one dir (databases, venvs, downloaded models, templates).
-Environment=OAIY_DATA_DIR=/var/lib/oaiy
-Environment=OAIY_MODELS_DIR=/var/lib/oaiy/models
-# Bind port (loopback only). Front with nginx/Caddy + TLS if exposed.
-Environment=OAIY_SERVER_PORT=17972
-# The bearer token every request except health, capability discovery and the
-# pairing bootstrap must present (Authorization: Bearer <token>): the CLI and
-# anything else that manages this server. Set a long random one.
-# Left empty, the server answers ONLY those three public routes; everything
-# else, reads included, gets 403. (Binding wider than loopback refuses to start
-# with none.)
-Environment=OAIY_SERVER_TOKEN=
-# Optional: HuggingFace token for the server's own gated model downloads. It is
-# not passed on to the services and installers the server starts.
-# Environment=OAIY_HF_TOKEN=
+# Every OAIY_ setting is in ONE file, and this unit sets none of its own: `oaiyctl` (the console) reads the same file,
+# so that the console works in the folder the server keeps its data in. Install it from the example beside this unit:
+#   install -d -m 0755 /etc/oaiy
+#   install -m 0640 -o root -g oaiy oaiy.env.example /etc/oaiy/oaiy.env
+# (root:oaiy 0640: the token in it is read by root for the service, and by the oaiy user through the group.)
+# The unit does not start without the file. One KEY=VALUE per line.
+EnvironmentFile=/etc/oaiy/oaiy.env
 
 ExecStart=/usr/local/bin/oaiy-server
+# Refuses to start on a configuration the server would refuse (exit 78), and says why, before the server runs.
+ExecStartPre=/usr/local/bin/oaiy-server check
+# A refusal of the configuration (exit 78) is not restarted: it would refuse again.
 Restart=on-failure
+RestartPreventExitStatus=78
 RestartSec=3
 
 # oaiy-server stops its plugins and every managed service on SIGTERM before exiting.

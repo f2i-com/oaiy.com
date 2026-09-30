@@ -287,7 +287,11 @@ pub fn channel(
             _ => Ok(Channel::Insecure),
         };
     }
-    if host.is_loopback_name() && peer_is_loopback && !forwarded_present {
+    // The three app names of a loopback server are loopback names too: they resolve to this machine, and a
+    // loopback server serves its login on them (the cookies of 4.7.5 are named for exactly these hosts).
+    let is_loopback =
+        host.is_loopback_name() || (policy.loopback_apps && loopback_app_of(&host.host).is_some());
+    if is_loopback && peer_is_loopback && !forwarded_present {
         return Ok(Channel::Secure);
     }
     Ok(Channel::Insecure)
@@ -710,6 +714,62 @@ mod tests {
             ),
             Ok(Channel::Insecure)
         );
+    }
+
+    #[test]
+    fn the_app_names_of_a_loopback_server_are_a_secure_channel_from_the_machine_itself_and_only_there(
+    ) {
+        // Without this the login of a loopback server (`http://dash.oaiy.localhost:<port>`) is refused as
+        // `secure_channel_required` before it is read.
+        let p = policy(Exposure::Local, 41000, true);
+        for name in [
+            "dash.oaiy.localhost:41000",
+            "agent.oaiy.localhost:41000",
+            "flows.oaiy.localhost",
+        ] {
+            let host = h(name);
+            assert_eq!(
+                channel(&p, &host, false, None, true, false),
+                Ok(Channel::Secure),
+                "{name} from a loopback peer"
+            );
+            // The same rules as `localhost`: a forwarded header, or a peer that is not this machine.
+            assert_eq!(
+                channel(&p, &host, false, None, true, true),
+                Ok(Channel::Insecure),
+                "{name} with a forwarded header"
+            );
+            assert_eq!(
+                channel(&p, &host, false, None, false, false),
+                Ok(Channel::Insecure),
+                "{name} from another machine"
+            );
+        }
+        // A install that does not serve the app names (the desktop) has no such names.
+        let desktop = policy(Exposure::Local, 41000, false);
+        assert_eq!(
+            channel(
+                &desktop,
+                &h("dash.oaiy.localhost:41000"),
+                false,
+                None,
+                true,
+                false
+            ),
+            Ok(Channel::Insecure)
+        );
+        // `oaiy.localhost` and look-alikes are not app names.
+        for name in [
+            "oaiy.localhost",
+            "x.dash.oaiy.localhost",
+            "dash.oaiy.localhost.evil.example",
+        ] {
+            assert_eq!(
+                channel(&p, &h(name), false, None, true, false),
+                Ok(Channel::Insecure),
+                "{name}"
+            );
+        }
     }
 
     #[test]

@@ -176,6 +176,16 @@ impl Denial {
         .header("www-authenticate", "Bearer realm=\"oaiy\"".into())
     }
 
+    /// No owner login exists yet (design 4.7.1): the answer of an install in setup-only mode.
+    pub fn setup_required() -> Denial {
+        Denial::new(
+            StatusCode::UNAUTHORIZED,
+            "setup_required",
+            "No owner login exists yet: run `oaiy-server auth setup-code` on the server, or `oaiy-server auth init`.",
+        )
+        .header("www-authenticate", "Bearer realm=\"oaiy\"".into())
+    }
+
     /// From a credential that was presented and was not accepted.
     pub fn from_auth_error(e: &AuthError) -> Denial {
         let status = StatusCode::UNAUTHORIZED;
@@ -336,6 +346,24 @@ impl Denial {
         );
         response
     }
+}
+
+/// The routes an install with no owner still answers (design 4.7.1): health, what says whether there is a login and
+/// what the session is, and the ways to make one (setup, and the login and link routes, which answer `409
+/// setup_required` themselves, so that a login never says whether a setup exists in any other way). `HEAD` is a
+/// `GET`.
+#[cfg(feature = "web")]
+fn setup_only_open(method: &Method, pattern: &str) -> bool {
+    matches!(
+        (method.as_str(), pattern),
+        (
+            "GET" | "HEAD",
+            "/api/health" | "/api/auth/info" | "/api/auth/session"
+        ) | (
+            "POST",
+            "/api/auth/setup" | "/api/auth/login" | "/api/auth/link"
+        )
+    )
 }
 
 // ---- authorization: the class of the route against the principal ------------------------------
@@ -535,6 +563,9 @@ pub struct Guard {
     /// When a trusted proxy's unusable `X-Forwarded-For` was last logged (once a minute), how many lines.
     fell_back_at: AtomicU64,
     fell_back_lines: AtomicU64,
+    /// The web login, when this server has one: it turns on the session cookie and setup-only mode.
+    #[cfg(feature = "web")]
+    login: std::sync::OnceLock<std::sync::Weak<dyn super::session::LoginFacts>>,
 }
 
 /// The least time between two lines of a kind that anonymous traffic can make.
@@ -590,6 +621,8 @@ impl Guard {
             proxy_misconfigured_noted: AtomicBool::new(false),
             fell_back_at: AtomicU64::new(0),
             fell_back_lines: AtomicU64::new(0),
+            #[cfg(feature = "web")]
+            login: std::sync::OnceLock::new(),
         }
     }
 
@@ -605,9 +638,12 @@ impl Guard {
     /// Write the throttle if it changed since the last write (the periodic upkeep asks every few seconds, and
     /// shutdown asks once more). A write that fails is logged and tried again next time.
     pub fn flush_throttle(&self) {
-        if !self.throttle.take_dirty() {
-            return;
+        if self.throttle.take_dirty() {
+            self.write_throttle_file();
         }
+    }
+
+    fn write_throttle_file(&self) {
         let file = self.throttle_file.lock().unwrap_or_else(|e| e.into_inner());
         let Some(file) = file.as_ref() else {
             return;
@@ -616,6 +652,32 @@ impl Guard {
             log::warn!("auth: the throttle could not be written: {e}");
             self.throttle.set_dirty();
         }
+    }
+
+    /// What `throttle.json` held under `key` when it was read: the state of a limiter that is not the bearer
+    /// throttle (the web login's, under `login`). `None` when no file is kept (`legacy`, a test) or it held none.
+    pub fn saved_throttle_state(&self, key: &str) -> Option<Value> {
+        self.throttle_file
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .as_ref()?
+            .saved(key)
+    }
+
+    /// Give the throttle file the state of another limiter and write the file now, with the bearer throttle's own.
+    /// The file has one writer, this guard: what the login keeps in it goes through here, so neither writer can
+    /// put back an older state of the other.
+    pub fn keep_throttle_state(&self, key: &str, state: Value) {
+        {
+            let file = self.throttle_file.lock().unwrap_or_else(|e| e.into_inner());
+            let Some(file) = file.as_ref() else {
+                return;
+            };
+            file.set(key, state);
+        }
+        // The write below carries the bearer state as well: nothing is left to write for the next upkeep.
+        self.throttle.take_dirty();
+        self.write_throttle_file();
     }
 
     /// How many lines of each kind the guard has written on its own account (for the tests): a forwarded
@@ -681,6 +743,39 @@ impl Guard {
         log::warn!(
             "auth: the X-Forwarded-For of the trusted proxy {peer} could not be used: its address stands for every client behind it; check the proxy and OAIY_TRUSTED_PROXIES"
         );
+    }
+
+    /// Install the web login: from now on a request with no `Authorization` header is authenticated by the session
+    /// cookie of its host, and an anonymous request to a route that needs a credential is `401 setup_required`
+    /// while there is no owner. Once; a second call is ignored. The guard holds the login weakly: the login holds
+    /// the guard, and the owner of both is whatever serves the routes.
+    #[cfg(feature = "web")]
+    pub fn install_login(&self, login: std::sync::Weak<dyn super::session::LoginFacts>) {
+        let _ = self.login.set(login);
+    }
+
+    /// The installed web login, if there is one and it is still there.
+    #[cfg(feature = "web")]
+    pub fn login(&self) -> Option<Arc<dyn super::session::LoginFacts>> {
+        self.login.get().and_then(std::sync::Weak::upgrade)
+    }
+
+    /// Whether an owner login exists (`GET /api/auth/info`): false on an install with no web login.
+    pub fn login_configured(&self) -> bool {
+        #[cfg(feature = "web")]
+        if let Some(login) = self.login() {
+            return login.owner_configured();
+        }
+        false
+    }
+
+    /// `active`, `expired` or `none` (`GET /api/auth/info`): `none` on an install with no web login.
+    pub fn setup_code_status(&self) -> &'static str {
+        #[cfg(feature = "web")]
+        if let Some(login) = self.login() {
+            return login.setup_code_status();
+        }
+        "none"
     }
 
     pub fn mode(&self) -> AccessMode {
@@ -920,12 +1015,26 @@ impl Guard {
         };
         let no_route = matched.is_none();
 
+        // Setup-only mode (design 4.7.1): an install with a web login and no owner answers only the short list of
+        // routes that say whether there is a login and make one, and 401 `setup_required` to everything else,
+        // however public the model would have that route be (the bridge's pairing and capabilities are not open
+        // until there is an owner to pair with).
+        #[cfg(feature = "web")]
+        if class == Class::Public && !no_route && self.in_setup_only() {
+            if let Some(m) = &matched {
+                if !setup_only_open(&method, m) {
+                    return Err(fail(Denial::setup_required()));
+                }
+            }
+        }
+
         // 7-9. the credential, if there is one
         let principal = if class == Class::Public {
             None
         } else {
             self.authenticate(
                 &headers,
+                &method,
                 &info,
                 direct_loopback,
                 self.throttle_applies(peer),
@@ -938,7 +1047,7 @@ impl Guard {
             return Err(fail(if principal.is_some() {
                 Denial::not_found()
             } else {
-                Denial::auth_required()
+                self.setup_only(Denial::auth_required())
             }));
         }
 
@@ -956,8 +1065,29 @@ impl Guard {
                     info: Some(info),
                 })
             }
-            Verdict::Deny(d) => Err(fail(d)),
+            Verdict::Deny(d) => Err(fail(if principal.is_none() {
+                self.setup_only(d)
+            } else {
+                d
+            })),
         }
+    }
+
+    /// An install with a web login and no owner is in setup-only mode (design 4.7.1): an anonymous caller of a
+    /// route that needs a credential is told to set up instead of to sign in. Bearer credentials are unaffected
+    /// (they never reach this), and every other refusal stands as it is.
+    fn setup_only(&self, denial: Denial) -> Denial {
+        #[cfg(feature = "web")]
+        if denial.code == "auth_required" && self.in_setup_only() {
+            return Denial::setup_required();
+        }
+        denial
+    }
+
+    /// Whether this is a server with a web login and no owner yet.
+    #[cfg(feature = "web")]
+    fn in_setup_only(&self) -> bool {
+        self.login().is_some_and(|l| !l.owner_configured())
     }
 
     /// The failed-bearer throttle does not apply to loopback peers of a local install: a desktop's own
@@ -970,6 +1100,7 @@ impl Guard {
     fn authenticate(
         &self,
         headers: &HeaderMap,
+        method: &Method,
         info: &RequestInfo,
         direct_loopback: bool,
         throttled: bool,
@@ -980,7 +1111,17 @@ impl Guard {
             .map(|v| v.as_bytes())
             .collect();
         let presented = match token::bearer_or_static(&values, self.static_token.as_deref()) {
-            Ok(None) => return Ok(None),
+            // No bearer: the session cookie of the host's app, on an install with a web login. A bearer wins over
+            // a cookie, so this is reached only without an `Authorization` header.
+            Ok(None) => {
+                #[cfg(feature = "web")]
+                return super::session::authenticate_cookie(self, headers, method, info);
+                #[cfg(not(feature = "web"))]
+                {
+                    let _ = (method, info);
+                    return Ok(None);
+                }
+            }
             Ok(Some(t)) => t,
             Err(e) => return Err(Denial::bad_request(e.message())),
         };

@@ -1504,6 +1504,23 @@ pub async fn serve(
     // `derive` (a route the model adds, judged by the new guard even there) makes credentials that must not
     // pile up.
     tokio::spawn(crate::auth::runtime::maintain_forever(guard.clone()));
+    // The web login (the server's `web` feature): a cookie session per app host, setup, the console. Only where
+    // the store is on disk (an enforcing mode) and not in the desktop, which has no login. It refuses, as the
+    // store does, a file it cannot read (a mangled or unreadable owner file is a startup error, never setup-only).
+    #[cfg(feature = "web")]
+    let login = if access.mode.is_enforcing() && !gui_mode && crate::auth::login::can_host(&guard) {
+        let opts =
+            crate::auth::login::LoginOptions::production(&|name| std::env::var(name).ok(), port)?;
+        let state = crate::auth::login::enable(&guard, &data_dir_for_auth.join("auth"), opts)?;
+        tokio::spawn(crate::auth::login::maintain_forever(state.clone()));
+        // One banner with no secret in it: not through the log facade, which the journal and the ring keep.
+        if let Some(banner) = state.banner() {
+            eprintln!("{banner}");
+        }
+        Some(state)
+    } else {
+        None
+    };
     // CORS stays permissive so a hosted oaiy-web at any domain can READ the
     // API (the localhost bind keeps non-local processes out). State-changing
     // and exec endpoints are additionally gated by `origin_guard` below, so a
@@ -1692,6 +1709,12 @@ pub async fn serve(
         .merge(crate::control::router(control.clone()))
         // What the access model has built so far: who am I, derive a credential, what the server saw.
         .merge(crate::auth::api::router(guard.clone()));
+    // The login's routes (and the console's), inside the guard like everything else.
+    #[cfg(feature = "web")]
+    let app = match &login {
+        Some(state) => app.merge(crate::auth::login::router(state.clone())),
+        None => app,
+    };
     let access_state = AccessState {
         // A network listener must never trust a forgeable Origin, even
         // when launched by the GUI. Its clients must present a credential.
@@ -1725,6 +1748,20 @@ pub async fn serve(
         );
     } else {
         log::info!("OAIY API listening on http://{addr}");
+    }
+    // The console's credential and the port it is on are written only now that the listener is bound: a console that
+    // finds them finds a server that answers. (A clean exit removes them; the binary does that.)
+    #[cfg(feature = "web")]
+    if let Some(state) = &login {
+        let bound = listener.local_addr().map_or(port, |a| a.port());
+        if let Err(e) = crate::auth::console::publish(state, bound) {
+            log::warn!(
+                "{}",
+                crate::auth::scrub::scrub_line(&format!(
+                    "auth: the console cannot reach this server: {e}"
+                ))
+            );
+        }
     }
     // With the peer's address on each request: the new guard needs it (a `desk` credential works only from
     // loopback, an address is what the failed-bearer throttle counts).

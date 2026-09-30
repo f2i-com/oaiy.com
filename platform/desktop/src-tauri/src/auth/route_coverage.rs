@@ -694,11 +694,12 @@ fn the_walker_finds_the_routes_the_design_counted_and_the_ones_added_since() {
     // The design's Appendix B counted 161 pairs on the main router; the four below are routes the
     // code has gained since (the plugin trust route and three update routes), the eleven of the
     // receptionist's transfers and messages (the four the design reserved, `GET|PATCH /api/messages`
-    // and `GET|PUT /api/ring/settings`, and seven it did not have), and the three routes of `/api/auth/`
-    // that the access model has built so far are the rows with `since: 2` that exist.
+    // and `GET|PUT /api/ring/settings`, and seven it did not have), and the routes of `/api/auth/` that
+    // the access model has built so far are the rows with `since: 2` that exist: `info`, `whoami` and
+    // `derive`, and the web login's fifteen (`login.rs`, `console.rs`).
     assert_eq!(
         pairs.len(),
-        165 + 11 + 3,
+        165 + 11 + 3 + 15,
         "main-router (method, path) pairs"
     );
     let mut built: Vec<String> = ROUTES
@@ -707,15 +708,30 @@ fn the_walker_finds_the_routes_the_design_counted_and_the_ones_added_since() {
         .map(|r| r.key())
         .collect();
     built.sort();
-    assert_eq!(
-        built,
-        [
-            "GET /api/auth/info",
-            "GET /api/auth/whoami",
-            "POST /api/auth/derive"
-        ],
-        "the routes of the model that exist"
-    );
+    let mut expected = vec![
+        "GET /api/auth/info",
+        "GET /api/auth/whoami",
+        "POST /api/auth/derive",
+        // The web login (login.rs).
+        "POST /api/auth/login",
+        "POST /api/auth/setup",
+        "POST /api/auth/link",
+        "GET /api/auth/session",
+        "POST /api/auth/logout",
+        "POST /api/auth/elevate",
+        "POST /api/auth/password",
+        "GET /api/auth/sessions",
+        "POST /api/auth/sessions/revoke-others",
+        "DELETE /api/auth/sessions/:id",
+        // The console's (console.rs).
+        "POST /api/auth/console/reset-password",
+        "POST /api/auth/console/setup-code",
+        "POST /api/auth/console/session-link",
+        "POST /api/auth/console/sessions/revoke-all",
+        "GET /api/auth/console/status",
+    ];
+    expected.sort();
+    assert_eq!(built, expected, "the routes of the model that exist");
     for (verb, pattern) in [
         (Verb::Get, "/api/health"),
         (Verb::Post, "/api/plugins/:id/trust"),

@@ -144,6 +144,13 @@ pub fn flush_guard(guard: &Guard) {
     if let Err(e) = guard.store().flush() {
         log::warn!("auth: the credential store could not be written at shutdown: {e}");
     }
+    // The web login's own state (its throttle goes into the throttle file with the failed-bearer throttle's, and
+    // the owner's devices into `owner.json`): first, so that the write below has nothing left to add. The login
+    // has an upkeep of its own while the server runs (`login::maintain_forever`).
+    #[cfg(feature = "web")]
+    if let Some(login) = guard.login() {
+        login.flush();
+    }
     guard.flush_throttle();
     if let Some(log) = guard.audit() {
         log.flush_noise();
