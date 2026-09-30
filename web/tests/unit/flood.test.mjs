@@ -232,14 +232,18 @@ describe('connections an app holds', () => {
     const channel = new MessageChannel();
     const got = [];
     channel.port1.onmessage = (event) => got.push(event.data);
-    const accepted = w.broker.onWindowMessage({ origin: AGENT, source: w.parent, data: { op: 'hello', v: 1 }, ports: [channel.port2] });
-    await sleep(60);
-    assert.equal(accepted, false);
-    assert.deepEqual(got, [{ t: 'refused', reason: 'too-many' }]);
-    assert.equal(w.broker.connections(), MAX_CONNECTIONS_PER_APP, 'none was closed for it');
-    for (const c of [mine[0], ...again]) assert.equal(count(c, (m) => m.t === 'closed'), 0);
-    channel.port1.close();
-    await mine[0].call({ op: 'abort', target: id });
+    try {
+      const accepted = w.broker.onWindowMessage({ origin: AGENT, source: w.parent, data: { op: 'hello', v: 1 }, ports: [channel.port2] });
+      await sleep(60);
+      assert.equal(accepted, false);
+      assert.deepEqual(got, [{ t: 'refused', reason: 'too-many' }]);
+      assert.equal(w.broker.connections(), MAX_CONNECTIONS_PER_APP, 'none was closed for it');
+      for (const c of [mine[0], ...again]) assert.equal(count(c, (m) => m.t === 'closed'), 0);
+    } finally {
+      // Pass or fail, the port is closed and the stream ended: an open port keeps the process alive (a mutant that fails this test must not hang the run).
+      channel.port1.close();
+      mine[0].raw({ id: 999_999, op: 'abort', target: id });
+    }
   });
 });
 

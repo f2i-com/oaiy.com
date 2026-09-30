@@ -528,7 +528,9 @@ function build() {
 
 /** The names of the tests that failed in one run of the given test files. */
 function runTests(files) {
-  const result = run(process.execPath, ['--test', '--test-timeout=180000', ...files]);
+  // `--test-force-exit`: a mutant that fails a test can leave a port or a timer open, and a run that waits for the event loop to drain would
+  // wait for its ten-minute limit and then report nothing failed.
+  const result = run(process.execPath, ['--test', '--test-timeout=180000', '--test-force-exit', ...files]);
   const failed = [...new Set([...result.text.matchAll(/^\s*✖ (.+?) \(\d[\d.]*ms\)/gm)].map((m) => m[1].replace(/\s+/g, ' ').trim()))];
   const tests = /ℹ tests (\d+)/.exec(result.text)?.[1];
   const passed = /ℹ pass (\d+)/.exec(result.text)?.[1];
