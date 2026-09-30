@@ -889,13 +889,15 @@ mod tests {
     #[test]
     fn what_the_contract_says_the_floor_lets_through_is_refused_here_and_kept_as_a_case() {
         let document = include_str!("../../../../../docs/contracts/transfer/transfer-v1.md").split_whitespace().collect::<Vec<_>>().join(" ");
-        let from = document.find("no block names on either end (").expect("the contract lists the forms no block names") + "no block names on either end (".len();
-        let to = from + document[from..].find(") are let through by both").expect("and says both ends let them through");
+        // (If the contract's sentence is reworded so that this cannot find its list, this test says so: the list is `oaiy-only/README.md`'s to follow.)
+        let from = document.find("no block names on either end (").expect("the contract lists the forms no block names on either end: has its sentence been reworded? see oaiy-only/README.md") + "no block names on either end (".len();
+        // (Up to the bracket that closes the list, whatever the sentence goes on to say of them: the contract may say what is let through, or by whom.)
+        let to = from + document[from..].find(')').expect("the list of forms is in brackets");
         let forms: Vec<String> = Regex::new(r#""([^"]+)""#).unwrap().captures_iter(&document[from..to]).map(|c| c[1].to_string()).collect();
         assert!(forms.len() >= 3, "the contract names at least three forms: {forms:?}");
         let ours: std::collections::BTreeSet<String> = cases(OAIY_EXTRA, "negative").iter().map(|turns| turns.join(" | ").to_lowercase()).collect();
         for form in &forms {
-            assert!(!caller_asked(&[form.as_str()]), "{form}: a form the contract says both ends let through is refused here");
+            assert!(!caller_asked(&[form.as_str()]), "{form}: a form the contract lists as getting past the floor is refused here, the host");
             assert!(ours.contains(&form.to_lowercase()), "{form}: and is a case of this desktop's own file");
         }
         // What only the host reads: an ask taken back, being told to say it, a different target such as billing, someone else in the room. The

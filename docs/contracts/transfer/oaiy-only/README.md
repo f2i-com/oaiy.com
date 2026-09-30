@@ -119,14 +119,19 @@ The plan reasons OAIY puts in an `oaiy.ring.plan` answer are exactly the plugin'
   what to say, or is a role marker is not read and drops what was carried; an ask before the refusal stands, and "never mind" after it takes
   it back. An acknowledgement that this desktop records as a turn (said in a pause) is not the verb the refusal is about, so it ends the
   carry here; the phone drops it by its words and joins the refusal to what follows, so **for that one sequence the floor refuses what this
-  desktop would count**, which is the allowed way round (its own case is in `phrases-oaiy.json`). The carry is the shared one and no wider:
+  desktop would count**. That is the wrong way round for a floor, which is meant never to be stricter than the host, and it is a stated
+  difference and not the allowed one: a caller who begins a refusal, says an acknowledgement in a pause after the receptionist had finished,
+  and then goes on with the verb ("I don't want to", "mm-hmm", "speak to the owner") is answered `caller_did_not_ask` by the phone and offered
+  a message, where this desktop would have rung. It errs towards a message and never towards a ring nobody asked for (its own case is in
+  `phrases-oaiy.json`). The carry is the shared one and no wider:
   a refusal this desktop's blocks know that the shared patterns do not (`couldn't`, `no way`, `not looking to`) is refused when it is in
   one sentence and is not carried across a pause.
 * **Where the floor accepts and this desktop refuses.** `phrases-oaiy.json` holds only what the shared file does not have as
   written: 37 requests, 49 that are not, and the 10 and 8 named ones (a case the shared file has is not repeated here, and a test
   fails if one is; of the two positives about a refusal split by a pause the floor accepts the one about being told what to say, and does
-  not accept the one about an acknowledgement, the one sequence where it is stricter). The phone's floor runs first, so a caller must pass both checks. Every way of asking that this desktop
-  counts is in the shared file, so the floor is never the stricter of the two for an ask, except for that acknowledgement. It is looser for what
+  not accept the one about an acknowledgement: a refusal, an acknowledgement in a pause, then the tail, the one sequence where the floor is
+  stricter than this desktop, as described above). The phone's floor runs first, so a caller must pass both checks. Every way of asking that
+  this desktop counts is in the shared file, so the floor is never the stricter of the two for an ask, except for that sequence. It is looser for what
   this desktop refuses besides: the say and write commands, an ask taken back, a different target, "do I have to talk to", and
   the contractions below. That is allowed. **The floor accepts these, this desktop refuses**, because they are not asks (each is an
   OAIY-only non-request, and each was checked to be accepted by the floor):
@@ -136,9 +141,10 @@ The plan reasons OAIY puts in an `oaiy.ring.plan` answer are exactly the plugin'
   * "I wouldnt speak to the manager"
   * "I couldn't speak to the owner earlier"
 
-  (The first, second and fourth are the three forms `transfer-v1.md` lists as ones no block names on either end and both ends let
-  through: this desktop, the host, refuses them, and a test reads that list from the contract and fails if one of them asks or is not a
-  case here. The four things it says only the host reads, an ask taken back, being told to say it, a different target such as billing and
+  (The first, second and fourth are the three forms `transfer-v1.md` lists as ones no block names on either end, and it says both ends
+  let them through. That is true of the phone's floor and not of this desktop: the host has to refuse them, and does, so no form of
+  that list is let through here. A test reads the list from the contract and fails if one of its forms asks or is not a case here. The
+  four things the contract says only the host reads, an ask taken back, being told to say it, a different target such as billing and
   someone else in the room, each have named cases in this file, and the same test holds them to it.)
 
   and seven more of the same kind ("we're going to talk to the owner on Friday", "she'll speak to the manager later", "he's put
