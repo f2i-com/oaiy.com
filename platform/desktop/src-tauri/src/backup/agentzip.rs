@@ -329,11 +329,19 @@ pub fn describe_campaign_for_test(kept: &super::table::Filtered, rebuilt: &Rebui
     describe_campaign(kept, rebuilt, was)
 }
 
-/// The most people of a campaign the dry run names one by one (the rest are counted), and the most of its own keys it lists.
+/// The most people of a campaign the dry run names one by one, with what a model reads of each (the rest are counted), and the most
+/// people skipped at planning it does the same for.
 const MAX_PEOPLE_LISTED: usize = 10;
 
-/// The most a campaign's description says (a campaign's own words come to a few thousand characters).
-const MAX_CAMPAIGN_TEXT: usize = 6000;
+/// The most that is said of one person or of one person who was skipped (each value is cut, with how long it is; this is the whole).
+const MAX_PERSON_TEXT: usize = 700;
+
+/// The most a campaign's description says (a campaign's own words come to a few thousand characters, and ten people to seven thousand).
+pub(crate) const MAX_CAMPAIGN_TEXT: usize = 12_000;
+
+/// What a rebuilt person holds that is not something a model reads or that is not said of them another way (their number is what
+/// names them): not listed as their words.
+const PERSON_KEYS_NOT_LISTED: [&str; 8] = ["id", "raw", "number", "state", "tries", "nextAt", "history", "doneAt"];
 
 /// The keys of a campaign that are only names for it, or that the restore makes again: not listed as something it says.
 const CAMPAIGN_KEYS_NOT_LISTED: [&str; 5] = ["id", "slug", "createdAt", "resultsPath", "name"];
@@ -344,21 +352,57 @@ fn campaign_key(kept: &super::table::Kept) -> String {
     kept.path.split("[]").enumerate().map(|(i, part)| if i == 0 { part.to_string() } else { format!("[{}]{part}", at.next().map(|n| n + 1).unwrap_or(0)) }).collect()
 }
 
+/// What a model reads of one person (or one person skipped at planning), by value: their name, notes and details, and for one who
+/// was done how it ended, what they said and what they answered. Every key of the person that is not an identifier or run state is
+/// said, so a key the rebuild carries is listed by construction (the test builds a person from the table and looks for each).
+fn person_words(person: &Value) -> String {
+    let Some(map) = person.as_object() else { return String::new() };
+    let mut parts = Vec::new();
+    for (key, value) in map {
+        if PERSON_KEYS_NOT_LISTED.contains(&key.as_str()) {
+            continue;
+        }
+        let shown = match value {
+            Value::String(s) if s.is_empty() => continue,
+            Value::Object(m) if m.is_empty() => continue,
+            Value::Object(m) => {
+                let more = m.len().saturating_sub(5);
+                format!("{}{}", m.iter().take(5).map(|(k, v)| format!("{} = {}", clip(k, 40), show_value(v))).collect::<Vec<_>>().join(", "), if more > 0 { format!(" and {more} more") } else { String::new() })
+            }
+            other => show_value(other),
+        };
+        let label = match key.as_str() {
+            "fields" => "details",
+            other => other,
+        };
+        parts.push(format!("{label} {shown}"));
+    }
+    parts.join("; ")
+}
+
 /// How a rebuilt campaign is described: by name, with how many people it would contact, and then EVERY key of it that acts, by
 /// its value (cut, with how long it is): what it says to them (the objective, the text, the opening line, the questions, the
 /// voicemail), what it does afterwards, who it speaks as, who started it, when it tries and how often. It is made from the key
-/// table, so a key added to the table is listed by construction. The people are counted, and those with notes or details are named.
+/// table, so a key added to the table is listed by construction. The people follow: for the first few, everything a model reads of
+/// them (their name, notes and details, and for one who was done how it ended, what they said and answered), and for the people
+/// skipped at planning their name and why; the rest are counted.
 fn describe_campaign(kept: &super::table::Filtered, rebuilt: &Rebuilt, was: Option<&str>) -> String {
     let campaign = &rebuilt.campaign;
     let people = campaign.get("people").and_then(Value::as_array).map(Vec::as_slice).unwrap_or(&[]);
     let count = |state: &str| people.iter().filter(|p| p.get("state").and_then(Value::as_str) == Some(state)).count();
     let (queued, done) = (count("queued"), count("done"));
-    let skipped = count("skipped");
+    let set_aside = count("skipped");
     let kind = if campaign.get("kind").and_then(Value::as_str) == Some("text") { "text messages" } else { "phone calls" };
     let mut what = format!(
-        "{kind} to {} ({queued} not yet contacted, {done} finished, {skipped} set aside).",
+        "{kind} to {} ({queued} not yet contacted, {done} finished, {set_aside} set aside).",
         plural(people.len(), "person", "people")
     );
+    // What comes of the campaign, before anything long: the description is cut at the end.
+    match was {
+        Some("running") => what.push_str(" It was RUNNING when the backup was made; it comes back PAUSED, and nothing is sent or called until you start it."),
+        _ if campaign.get("state").and_then(Value::as_str) != Some("paused") => what.push_str(" It had finished, and comes back as it was: nothing more is sent or called."),
+        _ => what.push_str(" It comes back PAUSED: nothing is sent or called until you start it."),
+    }
     if rebuilt.bad_numbers > 0 {
         what.push_str(&format!(" {} without a full phone number {} left out.", plural(rebuilt.bad_numbers, "person", "people"), if rebuilt.bad_numbers == 1 { "was" } else { "were" }));
     }
@@ -376,20 +420,20 @@ fn describe_campaign(kept: &super::table::Filtered, rebuilt: &Rebuilt, was: Opti
         let note = if k.path.starts_with("origin.") { " (it comes back started by the front desk)" } else { "" };
         what.push_str(&format!(" {}, {}: {}{note}.", campaign_key(k), k.row.what.to_lowercase(), show_value(&k.value)));
     }
-    // The people whose notes or details a model reads: named, up to a few; the rest are counted.
-    let with_words: Vec<(usize, &Value)> = people.iter().enumerate().filter(|(_, p)| p.get("notes").and_then(Value::as_str).is_some_and(|n| !n.is_empty()) || p.get("fields").and_then(Value::as_object).is_some_and(|f| !f.is_empty())).collect();
-    for (at, p) in with_words.iter().take(MAX_PEOPLE_LISTED) {
-        let notes = p.get("notes").and_then(Value::as_str).filter(|n| !n.is_empty()).map(|n| format!(" notes {}", show_value(&Value::String(n.to_string())))).unwrap_or_default();
-        let fields = p.get("fields").and_then(Value::as_object).filter(|f| !f.is_empty()).map(|f| format!(" details {}", f.iter().take(5).map(|(k, v)| format!("{k} = {}", show_value(v))).collect::<Vec<_>>().join(", "))).unwrap_or_default();
-        what.push_str(&format!(" Person {} ({}):{notes}{fields}.", at + 1, p.get("number").and_then(Value::as_str).unwrap_or("?")));
+    // The people: what a model reads of each of the first few, and the rest counted.
+    for (at, p) in people.iter().enumerate().take(MAX_PEOPLE_LISTED) {
+        what.push_str(&format!(" Person {} ({}): {}.", at + 1, p.get("number").and_then(Value::as_str).unwrap_or("?"), clip(&person_words(p), MAX_PERSON_TEXT)));
     }
-    if with_words.len() > MAX_PEOPLE_LISTED {
-        what.push_str(&format!(" {} more people have notes or details of the same kind.", with_words.len() - MAX_PEOPLE_LISTED));
+    if people.len() > MAX_PEOPLE_LISTED {
+        what.push_str(&format!(" {} more people are not listed here; what a model reads of them (their names, notes, details and results) is read in the same way.", people.len() - MAX_PEOPLE_LISTED));
     }
-    match was {
-        Some("running") => what.push_str(" It was RUNNING when the backup was made; it comes back PAUSED, and nothing is sent or called until you start it."),
-        _ if campaign.get("state").and_then(Value::as_str) != Some("paused") => what.push_str(" It had finished, and comes back as it was: nothing more is sent or called."),
-        _ => what.push_str(" It comes back PAUSED: nothing is sent or called until you start it."),
+    // The people skipped at planning: their names and why, which the report says to the Agent.
+    let skipped = campaign.get("skipped").and_then(Value::as_array).map(Vec::as_slice).unwrap_or(&[]);
+    for (at, s) in skipped.iter().enumerate().take(MAX_PEOPLE_LISTED) {
+        what.push_str(&format!(" Skipped at planning {} ({}): {}.", at + 1, s.get("number").and_then(Value::as_str).unwrap_or("?"), clip(&person_words(s), MAX_PERSON_TEXT)));
+    }
+    if skipped.len() > MAX_PEOPLE_LISTED {
+        what.push_str(&format!(" {} more people skipped at planning are not listed here.", skipped.len() - MAX_PEOPLE_LISTED));
     }
     what
 }

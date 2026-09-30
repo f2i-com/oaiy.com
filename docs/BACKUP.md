@@ -658,7 +658,10 @@ in parts through internal routes with a secret made for that one backup.
   name with how many people it would contact and **every key of it that acts, by value** (what it
   says to them: the objective, the text or the opening line, the questions, the voicemail; what it
   does afterwards; who it speaks as; who said they started it; when it tries and how often; and
-  the notes and details of the people, ten of them by name and the rest counted), and the Agent's
+  what a model reads of the people: the name, notes and details of each, and for one who was
+  done how it ended, what they said and what they answered, for ten of them, and the same for ten
+  of the people skipped at planning (their names and why, which the report of the campaign says to
+  the Agent), with the rest of each counted), and the Agent's
   settings key by key with their values (the instructions with their full length). It says what is not restored
   and why, and every name it does not know is "not restored: unknown item". The archive that is
   prepared is recorded with its size and SHA-256 and held to them like a staged data file is: when

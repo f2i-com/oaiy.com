@@ -6813,20 +6813,85 @@ fn a_campaign_key_that_is_words_is_listed_by_the_dry_run() {
     }
 }
 
-/// The dry run of a campaign names the first ten people who have notes or details a model reads, and counts the rest.
+/// The dry run of a campaign says what a model reads of the first ten people (their name, notes and details), and counts the rest.
 #[test]
 fn a_campaigns_dry_run_names_ten_people_with_notes_and_counts_the_rest() {
     let keys = super::table::table().key_table("agent.campaign").unwrap();
-    let people: Vec<serde_json::Value> = (0..14).map(|i| serde_json::json!({ "id": format!("p{i}"), "name": format!("P{i}"), "number": format!("+6140000{i:04}"), "state": "queued", "notes": format!("note number {i}") })).collect();
+    let people: Vec<serde_json::Value> = (0..14).map(|i| serde_json::json!({ "id": format!("p{i}"), "name": format!("Name number {i}"), "number": format!("+6140000{i:04}"), "state": "queued", "notes": format!("note number {i}") })).collect();
     let doc = serde_json::json!({ "id": "many", "kind": "text", "name": "Many", "state": "paused", "people": people, "textTemplate": "hello" });
     let kept = super::table::filter_json(keys, &doc, &|_| true);
     let rebuilt = super::agentzip::rebuild_campaign(&kept.value, None).unwrap();
     let said = super::agentzip::describe_campaign_for_test(&kept, &rebuilt, None);
     for i in 0..10 {
-        assert!(said.contains(&format!("note number {i}\"")), "person {i} is named: {said}");
+        assert!(said.contains(&format!("note number {i}\"")) && said.contains(&format!("Name number {i}\"")), "person {i} is said: {said}");
     }
-    assert!(!said.contains("note number 10\"") && !said.contains("note number 13\""), "and the rest are not: {said}");
-    assert!(said.contains("4 more people have notes or details of the same kind"), "{said}");
+    assert!(!said.contains("note number 10\"") && !said.contains("note number 13\"") && !said.contains("Name number 13"), "and the rest are not: {said}");
+    assert!(said.contains("4 more people are not listed here"), "{said}");
+    // The people skipped at planning are the same: their names and why are said for the first ten.
+    let skipped: Vec<serde_json::Value> = (0..12).map(|i| serde_json::json!({ "name": format!("Skipped name {i}"), "number": format!("+6150000{i:04}"), "why": format!("skipped because {i}") })).collect();
+    let doc = serde_json::json!({ "id": "many", "kind": "text", "name": "Many", "state": "paused", "people": [], "skipped": skipped });
+    let kept = super::table::filter_json(keys, &doc, &|_| true);
+    let rebuilt = super::agentzip::rebuild_campaign(&kept.value, None).unwrap();
+    let said = super::agentzip::describe_campaign_for_test(&kept, &rebuilt, None);
+    for i in 0..10 {
+        assert!(said.contains(&format!("Skipped name {i}\"")) && said.contains(&format!("skipped because {i}\"")), "skipped {i} is said: {said}");
+    }
+    assert!(!said.contains("Skipped name 11") && said.contains("2 more people skipped at planning are not listed here"), "{said}");
+}
+
+/// The reviewer's x6: every piece of text a model reads in a campaign is in the dry run. Built from the key table, so that a key of a
+/// person or of a skipped person that the table lets through and that holds words cannot be left out of the dry run (or out of the
+/// campaign that is rebuilt) without this test saying so.
+#[test]
+fn every_word_a_model_reads_in_a_campaign_is_in_the_dry_run_and_a_key_added_to_the_table_is_too() {
+    use super::table::{Class, ValueType};
+    let keys = super::table::table().key_table("agent.campaign").unwrap();
+    let mut person = serde_json::json!({ "id": "p1", "number": "+61491570006", "state": "done" });
+    let mut skipped = serde_json::json!({ "number": "+61491570156" });
+    let (mut people_markers, mut skipped_markers) = (Vec::new(), Vec::new());
+    for key in keys.keys.iter().filter(|k| k.class == Class::Runs) {
+        let (is_person, name) = match (key.path.strip_prefix("people[]."), key.path.strip_prefix("skipped[].")) {
+            (Some(n), _) => (true, n),
+            (_, Some(n)) => (false, n),
+            _ => continue,
+        };
+        if ["id", "raw", "number", "state", "doneAt"].contains(&name) {
+            continue;
+        }
+        let marker = format!("MARK-{}-{}-9", if is_person { "P" } else { "S" }, name.to_uppercase());
+        let value = match key.ty {
+            Some(ValueType::Str { .. }) => serde_json::json!(marker),
+            Some(ValueType::StringsMap { .. }) | Some(ValueType::ScalarsMap { .. }) => serde_json::json!({ "first_key": marker }),
+            _ => continue,
+        };
+        let (target, markers) = if is_person { (&mut person, &mut people_markers) } else { (&mut skipped, &mut skipped_markers) };
+        target[name] = value;
+        markers.push(marker);
+    }
+    // The reviewer's seven (the table has more: they are all looked for).
+    for marker in ["MARK-P-NAME-9", "MARK-P-OUTCOME-9", "MARK-P-SUMMARY-9", "MARK-P-ANSWERS-9", "MARK-P-WHY-9", "MARK-P-NOTES-9", "MARK-P-FIELDS-9"] {
+        assert!(people_markers.iter().any(|m| m == marker), "{marker} is a key of a person: {people_markers:?}");
+    }
+    assert!(skipped_markers.iter().any(|m| m == "MARK-S-NAME-9") && skipped_markers.iter().any(|m| m == "MARK-S-WHY-9"), "{skipped_markers:?}");
+    let doc = serde_json::json!({ "id": "c1", "kind": "call", "name": "Plain", "state": "running", "people": [person], "skipped": [skipped] });
+    let kept = super::table::filter_json(keys, &doc, &|_| true);
+    let rebuilt = super::agentzip::rebuild_campaign(&kept.value, Some("running")).unwrap();
+    let said = super::agentzip::describe_campaign_for_test(&kept, &rebuilt, Some("running"));
+    let restored = rebuilt.campaign.to_string();
+    for marker in people_markers.iter().chain(&skipped_markers) {
+        assert!(restored.contains(marker.as_str()), "{marker} comes back in the campaign that is rebuilt: {restored}");
+        assert!(said.contains(marker.as_str()), "{marker} is in the dry run: {said}");
+    }
+    // The same person twice over: the marker of a key of a skipped person is said under the skipped, not under the people.
+    assert!(said.contains("Skipped at planning 1 (+61491570156)"), "{said}");
+    // And what a person's text is cut to does not cut the state of the campaign (which is said before anything long).
+    let mut long = doc.clone();
+    long["people"][0]["notes"] = serde_json::json!("n".repeat(300));
+    long["people"][0]["summary"] = serde_json::json!("s".repeat(5000));
+    let kept = super::table::filter_json(keys, &long, &|_| true);
+    let rebuilt = super::agentzip::rebuild_campaign(&kept.value, Some("running")).unwrap();
+    let said = super::agentzip::describe_campaign_for_test(&kept, &rebuilt, Some("running"));
+    assert!(said.contains("comes back PAUSED") && said.contains("5000 characters"), "{said}");
 }
 
 /// A call campaign's dry run says what the phone says first and what it leaves on a voicemail (the reviewer's campaign is a text one).
