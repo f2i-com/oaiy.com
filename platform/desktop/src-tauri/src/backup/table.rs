@@ -254,6 +254,8 @@ pub enum ValueType {
     Stamp,
     /// An identifier: letters, digits, `_`, `-` and `.`, at most 100 characters.
     Slug,
+    /// The id the calendar gives an appointment: `appt_` and 32 lowercase hexadecimal digits (and no other id).
+    CalendarId,
     /// Seven days, Monday first, each a list of opening spans `{open, close}` in `HH:MM`.
     WeekHours,
 }
@@ -540,6 +542,7 @@ fn key_from(raw: RawKey) -> Result<KeyRow, String> {
         (_, Some("datetime")) => Some(ValueType::DateTime),
         (_, Some("stamp")) => Some(ValueType::Stamp),
         (_, Some("slug")) => Some(ValueType::Slug),
+        (_, Some("calendarId")) => Some(ValueType::CalendarId),
         (_, Some("weekHours")) => Some(ValueType::WeekHours),
         (_, Some("object")) => Some(ValueType::Object),
         (_, Some("objects")) => Some(ValueType::Objects { max_items: raw.max_items.ok_or_else(|| fail("objects has maxItems"))? }),
@@ -798,6 +801,7 @@ fn check_value(ty: &ValueType, value: &Value, is_a_key: bool, exact: bool) -> Re
                 Err("an identifier of letters, digits, _, - and . is expected".to_string())
             }
         }
+        (ValueType::CalendarId, Value::String(s)) => if crate::calendar::is_appointment_id(s) { Ok(()) } else { Err("an appointment id such as appt_ and 32 hexadecimal digits is expected".to_string()) },
         (ValueType::WeekHours, Value::Array(days)) => {
             let fine = days.len() == 7
                 && days.iter().all(|day| {

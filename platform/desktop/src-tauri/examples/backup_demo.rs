@@ -53,7 +53,7 @@ fn main() {
     put(
         &source,
         "calendar/calendar.json",
-        br#"{"settings":{"business":"Green Lawns","receptionist":"Sam","hours":[[{"open":"09:00","close":"17:00"}],[{"open":"09:00","close":"17:00"}],[],[],[],[],[]],"services":[{"id":"lawn","name":"Lawn mowing","minutes":60,"description":"We mow lawns","price":"from $60"}],"slotMinutes":30,"noticeMinutes":60,"horizonDays":30,"textConfirmations":true},"appointments":[{"id":"appt_1","service":"Lawn mowing","start":"2026-10-01T10:00","minutes":60,"status":"confirmed","name":"Pat","phone":"0491 570 006","notes":"side gate","source":"call","createdAt":"2026-09-01T00:00:00Z","updatedAt":"2026-09-01T00:00:00Z"}]}"#,
+        br#"{"settings":{"business":"Green Lawns","receptionist":"Sam","hours":[[{"open":"09:00","close":"17:00"}],[{"open":"09:00","close":"17:00"}],[],[],[],[],[]],"services":[{"id":"lawn","name":"Lawn mowing","minutes":60,"description":"We mow lawns","price":"from $60"}],"slotMinutes":30,"noticeMinutes":60,"horizonDays":30,"textConfirmations":true},"appointments":[{"id":"appt_00000000000000000000000000000001","service":"Lawn mowing","start":"2026-10-01T10:00","minutes":60,"status":"confirmed","name":"Pat","phone":"0491 570 006","notes":"side gate","source":"call","createdAt":"2026-09-01T00:00:00Z","updatedAt":"2026-09-01T00:00:00Z"}]}"#,
     );
     put(&source, "triggers.json", b"[{\"id\":\"call-in\",\"event\":\"aokie.call.incoming\",\"flowId\":\"greeting\",\"mode\":\"async\"}]");
     put(&source, "flows/greeting.json", b"{\"name\":\"Greeting\",\"nodes\":[{\"id\":\"a\",\"type\":\"logic_block\",\"data\":{}}],\"edges\":[]}");

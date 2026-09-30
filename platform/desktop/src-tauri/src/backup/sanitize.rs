@@ -146,7 +146,7 @@ pub fn calendar_merge(local: Option<&Value>, staged: &Value, ticks: &super::revi
     book.insert("appointments".into(), Value::Array(list));
 
     if skipped > 0 {
-        notes.push(format!("{skipped} appointment{} without a valid time, length or state {} left out.", if skipped == 1 { "" } else { "s" }, if skipped == 1 { "was" } else { "were" }));
+        notes.push(format!("{skipped} appointment{} without a valid id, time, length or state {} left out.", if skipped == 1 { "" } else { "s" }, if skipped == 1 { "was" } else { "were" }));
     }
     if over > 0 {
         notes.push(format!("{over} more appointment{} would make more than {MAX_APPOINTMENTS} in the calendar, so {} not added.", if over == 1 { "" } else { "s" }, if over == 1 { "it was" } else { "they were" }));
