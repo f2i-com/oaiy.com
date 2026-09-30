@@ -201,6 +201,18 @@ const MUTATIONS = [
     files: { 'web/providers/src/vault.ts': [{ find: "        if (e instanceof VaultError && e.code === 'damaged') return stored;", replace: "        if (e instanceof VaultError && e.code === 'damaged') return [];" }] },
     caught: ['is what a vault whose key is gone leaves'],
   },
+  {
+    name: 'F12 the page says apps never see keys',
+    what: 'the Providers page says again that apps never see a key and that nothing that reads the page can',
+    tests: ['tests/unit/words.test.mjs'],
+    files: {
+      'web/providers/src/words.ts': [
+        { find: 'but it is not given the key and cannot change where it goes.', replace: 'and the apps that use your providers never see them.' },
+        { find: 'while a call is being made the key is in this site’s memory.', replace: 'and it is kept away from anything that reads this page.' },
+      ],
+    },
+    caught: ['says what an app can do with a key', 'says what keeping keys here is and is not', 'claims nothing it cannot keep'],
+  },
   // Leaks the scans must find. They put the key where a scan of TEXT does not look (the reviewer's two: a Uint8Array, and reversed).
   {
     name: 'H1 leak: list returns the key as a Uint8Array',

@@ -14,7 +14,7 @@ import { fill, h } from './dom';
 import type { Context } from './context';
 import { loadPresets, inputFromPreset, withOrigin, type Preset } from './presets';
 import { createTester } from './test';
-import { keyText } from './words';
+import { KEYS_LEAD, KEYS_STORAGE, keyText } from './words';
 import type { ProviderRecord, ServerKind } from '@oaiy/shared/providers/types';
 import type { TestResult } from '@oaiy/shared/broker/protocol';
 
@@ -56,7 +56,7 @@ export function mountManage(root: HTMLElement, ctx: Context): void {
       'main',
       { class: 'page' },
       h('h1', { text: 'Providers' }),
-      h('p', { class: 'lead', text: 'The AI services and servers you use, in one place. Your keys are kept on this page’s site, and the apps that use your providers never see them: they ask this site to make the call.' }),
+      h('p', { class: 'lead', text: KEYS_LEAD }),
       noticeBox,
       listBox,
       formBox,
@@ -80,7 +80,7 @@ export function mountManage(root: HTMLElement, ctx: Context): void {
     fill(
       noticeBox,
       ...problems,
-      h('p', { class: 'fine', text: 'Your keys are sealed on this device. That keeps them away from the apps and from anything that reads this page. It does not protect them from someone who copies this browser’s profile: for that, set a passphrase (coming).' }),
+      h('p', { class: 'fine', text: KEYS_STORAGE }),
     );
   }
 

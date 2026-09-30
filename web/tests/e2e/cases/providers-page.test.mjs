@@ -38,12 +38,16 @@ describe('the Providers page', () => {
     const { context } = await newContext(browser);
     const { page } = await newPage(context);
     await page.goto(`${world.origins.providers}/`);
-    await page.getByText('sealed on this device').waitFor({ timeout: 8000 });
+    await page.getByText('stored encrypted on this device').waitFor({ timeout: 8000 });
     const text = await page.locator('main').innerText();
-    assert.match(text, /sealed on this device/);
-    assert.match(text, /does not protect them from someone who copies this browser/);
+    assert.match(text, /stored encrypted on this device, and only this site can open them/);
+    assert.match(text, /not protection against someone who has this computer or a copy of this browser’s profile/);
+    assert.match(text, /a browser extension that can read this site/);
+    assert.match(text, /the key is in this site’s memory/, 'the page says the key is in memory while a call is made');
+    assert.match(text, /An app can ask this site to make a call with one of them, up to the limits below, but it is not given the key/);
     assert.match(text, /Type a key only on this page, at providers\.web\.localhost:\d+/);
-    assert.match(text, /never see them/);
+    // What it used to claim, and no longer does.
+    assert.doesNotMatch(text, /never see them|anything that reads this page|sealed on this device/);
     await context.close();
   });
 
