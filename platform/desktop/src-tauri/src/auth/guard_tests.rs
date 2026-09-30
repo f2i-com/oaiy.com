@@ -2396,6 +2396,142 @@ async fn in_scoped_and_shadow_mode_the_new_guard_claims_every_request() {
     }
 }
 
+// ================================== F5: two branches the first tests did not reach =====================
+
+/// A request whose header values are raw bytes: a header that is not text.
+async fn go_raw(env: &Env, method: Method, path: &str, headers: &[(&str, &[u8])]) -> Reply {
+    let mut req = Request::builder()
+        .method(method)
+        .uri(path)
+        .header("host", "localhost:17972");
+    for (name, value) in headers {
+        req = req.header(
+            *name,
+            axum::http::HeaderValue::from_bytes(value).expect("a header value of bytes"),
+        );
+    }
+    let mut req = req.body(Body::empty()).unwrap();
+    req.extensions_mut().insert(ConnectInfo(
+        "127.0.0.1:50000".parse::<SocketAddr>().unwrap(),
+    ));
+    let response = env.app.clone().oneshot(req).await.unwrap();
+    let status = response.status().as_u16();
+    let headers = response.headers().clone();
+    let text = String::from_utf8_lossy(
+        &axum::body::to_bytes(response.into_body(), 1 << 20)
+            .await
+            .unwrap(),
+    )
+    .into_owned();
+    Reply {
+        status,
+        headers,
+        text,
+    }
+}
+
+#[tokio::test]
+async fn y03_an_origin_that_is_not_text_is_no_origin_a_bound_credential_is_bound_to_and_a_native_one_takes_none(
+) {
+    for mode in [AccessMode::Scoped, AccessMode::Shadow] {
+        let e = env(mode);
+        let bound = format!(
+            "Bearer {}",
+            browser_pat(&e, "https://app.example", &["system.read"])
+        );
+        let native = format!(
+            "Bearer {}",
+            native_pat(&e, ScopeSet::of(&["system.read"]), DAY)
+        );
+        // Sanity: the same requests with a text `Origin` go the ways the rules say.
+        let ok = go(
+            &e,
+            send(Method::GET, "/api/config")
+                .h("authorization", &bound)
+                .h("origin", "https://app.example"),
+        )
+        .await;
+        assert_eq!(ok.status, 200, "{mode:?}: {}", ok.text);
+        let native_ok = go(
+            &e,
+            send(Method::GET, "/api/config").h("authorization", &native),
+        )
+        .await;
+        assert_eq!(native_ok.status, 200, "{mode:?}");
+        for origin in [
+            &b"\xff\xfe"[..],
+            b"https://app.example\xff",
+            b"\x80",
+            b"h\xe9llo",
+        ] {
+            let r = go_raw(
+                &e,
+                Method::GET,
+                "/api/config",
+                &[("authorization", bound.as_bytes()), ("origin", origin)],
+            )
+            .await;
+            assert_eq!(
+                (r.status, r.code().as_deref()),
+                (403, Some("origin_mismatch")),
+                "{mode:?} {origin:?}: {}",
+                r.text
+            );
+            assert!(r.text.contains("bound to another origin"), "{}", r.text);
+            let r = go_raw(
+                &e,
+                Method::GET,
+                "/api/config",
+                &[("authorization", native.as_bytes()), ("origin", origin)],
+            )
+            .await;
+            assert_eq!(
+                (r.status, r.code().as_deref()),
+                (403, Some("origin_mismatch")),
+                "{mode:?} {origin:?}"
+            );
+            assert!(r.text.contains("native client"), "{}", r.text);
+        }
+    }
+}
+
+#[tokio::test]
+async fn y21_the_health_probe_is_exempt_from_the_host_check_for_get_and_head_of_that_one_path_only()
+{
+    for mode in [AccessMode::Scoped, AccessMode::Shadow] {
+        let e = env(mode);
+        let foreign = "10.1.2.3:8080";
+        for m in [Method::GET, Method::HEAD] {
+            let r = go(&e, send(m.clone(), "/api/health").h("host", foreign)).await;
+            assert_eq!(r.status, 200, "{mode:?} {m}: {}", r.text);
+            // A probe with no Host at all, too.
+            let r = go(&e, send(m.clone(), "/api/health").h("host", "")).await;
+            assert_eq!(r.status, 200, "{mode:?} {m} with no Host");
+        }
+        for (m, p) in [
+            (Method::POST, "/api/health"),
+            (Method::PUT, "/api/health"),
+            (Method::PATCH, "/api/health"),
+            (Method::DELETE, "/api/health"),
+            (Method::OPTIONS, "/api/health"),
+            (Method::GET, "/api/health/x"),
+            (Method::GET, "/api/healthz"),
+            (Method::GET, "/api/config"),
+            (Method::HEAD, "/api/config"),
+        ] {
+            for host in [foreign, ""] {
+                let r = go(&e, send(m.clone(), p).h("host", host)).await;
+                assert_eq!(
+                    (r.status, r.code().as_deref()),
+                    (421, Some("misdirected_host")),
+                    "{mode:?} {m} {p} Host {host:?}: {}",
+                    r.text
+                );
+            }
+        }
+    }
+}
+
 // ============================= F4: the static token in the shape the design gives it ==============
 
 /// Tokens of the static token's shape (`[\x21-\x7e]{32,256}`, 16 different characters) that the strict bearer
