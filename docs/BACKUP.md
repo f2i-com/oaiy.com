@@ -525,7 +525,8 @@ what it overwrites and takes away, in the same place and for the same length of 
 restore's: afterwards the button reads **Redo**, and it puts all of that back the same way. The
 last two snapshots (of restores or undos) are kept, and older ones are deleted. An undo uses up the
 snapshot it put back. An undo does not roll back API keys that a restore brought into the Agent
-(see below).
+for a provider that stays. A provider the restore added is taken away by an undo, with its key,
+and a redo brings it back without one (see below).
 
 ## The Agent's storage
 

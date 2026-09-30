@@ -3518,6 +3518,50 @@ fn an_undo_hands_the_page_the_settings_of_a_copy_that_had_no_providers() {
     assert_eq!(settings["gate"]["mode"], "allowlist");
 }
 
+/// An undo makes the page's providers exactly the list of the copy, so a provider that does not come through the desktop whole
+/// is one the undo would delete: every provider of the copy has to arrive, with what the page needs to read it (its id and its
+/// kind), its name, its address and its settings, and none with a key (the copy holds none, and the page keeps the key it has).
+/// (Four providers: two with keys that look like keys, one with a local server's key that does not, and one without a key.)
+#[test]
+fn an_undo_hands_the_page_every_provider_of_the_copy_readable_and_without_a_key() {
+    let before = serde_json::json!({
+        "providers": [
+            { "id": "main", "type": "openai", "name": "OpenAI", "baseUrl": "https://api.openai.com/v1", "apiKey": "sk-live-0123456789abcdef0123456789", "modelId": "gpt-x", "contextTokens": 128000, "detectedContext": 4096 },
+            { "id": "local", "type": "local", "name": "This computer", "baseUrl": "http://127.0.0.1:11434/v1", "serverKind": "ollama", "followEngine": true, "parallelAgents": 2 },
+            { "id": "claude", "type": "anthropic", "name": "Anthropic", "apiKey": "sk-ant-0123456789abcdef0123456789" },
+            { "id": "lm", "type": "custom", "name": "LM Studio", "baseUrl": "http://127.0.0.1:1234/v1", "apiKey": "lm-studio" }
+        ],
+        "activeProviderId": "main",
+        "gate": { "mode": "open" }
+    });
+    let src = TempDir::new("undo-providers-src");
+    let out = TempDir::new("undo-providers-out");
+    let file = backup_with_agent(&src.0, &out.0, "p.oaiybackup", agent_archive(&[("opfs/projects/p1/chat.json", b"[]")]), false);
+    let dst = TempDir::new("undo-providers-dst");
+    restore::stage(&dst.0, &file, PASS, &Ticks::all(), &options()).unwrap();
+    assert!(matches!(restore::apply_pending(&dst.0), ApplyOutcome::Applied(_)));
+    page_takes_import(&dst.0, &agent_archive(&[("idb/settings.json", before.to_string().as_bytes())]), &[]);
+    restore::stage_undo(&dst.0, &options()).unwrap();
+    assert!(matches!(restore::apply_pending(&dst.0), ApplyOutcome::Applied(_)));
+    let handed = handed_over(&dst.0);
+    let settings: serde_json::Value = serde_json::from_slice(&zip_entries(&handed)["idb/settings.json"]).unwrap();
+    let providers = settings["providers"].as_array().expect("the providers come through");
+    assert_eq!(providers.len(), 4, "every provider of the copy: {settings}");
+    for (at, id, kind, name) in [(0, "main", "openai", "OpenAI"), (1, "local", "local", "This computer"), (2, "claude", "anthropic", "Anthropic"), (3, "lm", "custom", "LM Studio")] {
+        assert_eq!((providers[at]["id"].as_str(), providers[at]["type"].as_str(), providers[at]["name"].as_str()), (Some(id), Some(kind), Some(name)), "provider {at} is readable by the page: {}", providers[at]);
+    }
+    assert_eq!(providers[0]["baseUrl"], "https://api.openai.com/v1");
+    assert_eq!(providers[1]["baseUrl"], "http://127.0.0.1:11434/v1");
+    assert_eq!((providers[0]["modelId"].as_str(), providers[0]["contextTokens"].as_u64()), (Some("gpt-x"), Some(128000)));
+    assert_eq!((providers[1]["serverKind"].as_str(), providers[1]["followEngine"].as_bool(), providers[1]["parallelAgents"].as_u64()), (Some("ollama"), Some(true), Some(2)));
+    assert!(providers.iter().all(|p| p.get("apiKey").is_none()), "no key is handed over: {settings}");
+    assert!(providers[0].get("detectedContext").is_none(), "what a server reported is detected again");
+    assert_eq!(settings["activeProviderId"], "main", "and the active provider is the copy's");
+    let everything: String = zip_entries(&handed).values().map(|bytes| String::from_utf8_lossy(bytes).into_owned()).collect();
+    // (A key that does not look like one, such as a local server's, is kept out by what the row says it is, not by how it looks.)
+    assert!(!everything.contains("sk-live") && !everything.contains("sk-ant") && !everything.contains("lm-studio"), "the keys are nowhere in what the page is given");
+}
+
 #[test]
 fn a_second_try_at_the_undo_copy_never_replaces_the_first() {
     let src = TempDir::new("agent-twice-src");
