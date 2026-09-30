@@ -4,7 +4,7 @@
 //! `salt = LE64(id) || 0x00 * 8`, `personal = ctx || 0x00 * 8`, an empty message, and an output of 16, 32 or 64 bytes. Each
 //! purpose has its own eight-character context, listed in [`REGISTRY`] (design 4.1.2, append-only); a test rejects a
 //! duplicate context and a context that is not eight characters of `[a-z0-9]`. The only derivation that production code has is
-//! [`derive`], which takes a [`Purpose`]; `derive_subkey` (any id, any context) exists for the known-answer tests, behind the `test-vectors`
+//! [`fn@derive`], which takes a [`Purpose`]; `derive_subkey` (any id, any context) exists for the known-answer tests, behind the `test-vectors`
 //! feature (FormLogic's second `flrecov1` vector uses subkey id 7). A consumer that needs a context of its own adds a row to the registry.
 //!
 //! HKDF-SHA256 is the derivation of the ceremony (`oaiy-kt:1`, 4.8) and of the browser device cache (4.4.3); HMAC-SHA256 and

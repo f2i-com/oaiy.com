@@ -3,7 +3,7 @@
 //! [`seal`] and [`open`] are the primitive as libsodium's `crypto_aead_xchacha20poly1305_ietf_*` and the XChaCha draft
 //! define it, except that `seal` takes a [`Nonce`], which only the random generator can make: a 24-byte nonce, a 16-byte tag after the ciphertext, and associated data of any bytes (the ceremony's is the
 //! 32-byte transcript hash). [`wrap`] is the format the vault uses for keys: `nonce(24) || ciphertext || tag(16)`, 72 bytes
-//! for a 32-byte key, with a random nonce and an [`Aad`](crate::canon::Aad) that is a checked canonical string, so that the
+//! for a 32-byte key, with a random nonce and an [`Aad`] that is a checked canonical string, so that the
 //! associated data of a wrapper always names its domain, its user and its purpose (4.2.1).
 //!
 //! Failure is uniform: a wrong key, a wrong nonce, a wrong AAD, a flipped bit anywhere, a truncated or an extended
@@ -33,7 +33,7 @@ pub const WRAPPED_KEY_LEN: usize = WRAP_OVERHEAD + KEY_LEN;
 /// A nonce for XChaCha20-Poly1305 that can only be drawn from the operating system's random generator (review L-10). `seal` used to take any 24 bytes, so a caller
 /// could reuse a (key, nonce) pair, which gives away the XOR of two plaintexts and the authentication key; now it takes a `Nonce` **by value**, and a `Nonce` has no
 /// constructor from bytes: [`Nonce::random`] is the only way to make one, and a `Nonce` that has been used is gone. (A nonce that a protocol fixes, or that a known-answer test
-/// chooses, is a different thing: the test-only [`Nonce::from_bytes_for_tests`] exists for the vectors, behind the `test-vectors` feature that this crate's own tests turn
+/// chooses, is a different thing: the test-only `Nonce::from_bytes_for_tests` exists for the vectors, behind the `test-vectors` feature that this crate's own tests turn
 /// on; a protocol that needs a derived nonce gets a constructor of its own, with its own test, when it is designed.) A nonce is public: it travels with the ciphertext.
 #[derive(Debug)]
 pub struct Nonce([u8; NONCE_LEN]);
