@@ -26,7 +26,7 @@ oaiy-relay/
     install.php     the web installer (answers 404 unless you arm it, see below)
     .htaccess       Apache and LiteSpeed rules: front controller, Authorization pass-through, deny the rest
   src/              the code (every file starts with: defined('OAIY_RELAY') or exit;)
-  bin/              install.php, doctor.php, gc.php  (each starts with a command-line guard)
+  bin/              install.php, doctor.php, relay.php (administration), gc.php  (each starts with a command-line guard)
   probe/            host-probe.php: the one-file host probe
   tests/            the test runner and the tests (not part of a release zip)
   data/             created by the installer; config, database, secrets. Outside public/
@@ -192,6 +192,54 @@ it opens a request whose body never finishes and reports whether the host closes
 sent in an `Authorization` header and is never printed. Exit 0 when nothing failed (warnings are advice), 1 on a failure, 2 on
 usage. `--slow-body-watch=SECONDS` (default 5) sets how long the slow-body probe watches.
 
+## Devices, enrolment and the roster
+
+A device is a desktop, a phone or a provider, and each holds one capability token (`oaiyrt1.<id>.<secret>`, 63 characters) that
+names only that device. The database keeps the token's id and a hash of its secret, never the token. Every way a token can fail
+is the same `401`; a device that was revoked hears `401 revoked`, but only after its secret verified, so a stranger learns
+nothing. Twenty wrong tokens in a minute from one address, or twenty wrong secrets for one token id in an hour, are refused for a
+while (a correct token is never refused by the address counter).
+
+- **Enrolment.** `php bin/relay.php key desktop` (or `provider`) mints a single-use key, valid for an hour by default, and writes
+  it to `data/keys/<id>.txt`; the desktop redeems it with `POST /v1/enroll`. The key carries a secret from which both the key id
+  and a signing key are derived; the relay stores only the derived **public** key, so a copy of the database cannot redeem
+  anything. Redeeming means signing the exact request body, so the secret is never sent. Five wrong proofs burn a key.
+- **Phones** are paired through the desktop, never by the relay alone (the pairing routes are a later part of the relay, not
+  in this build). The desktop lists, renames, limits and revokes them with `GET/POST /v1/devices…`, and pushes its
+  authoritative roster with `POST /v1/roster`. A phone that the roster leaves out is revoked at once. A phone cannot change
+  its own keys.
+- **Revoking** a device is immediate and complete: its token stops working, its inbox and pending items are deleted, and a
+  request it is holding open ends with `401 revoked` within a quarter of a second.
+- **Token rotation:** `POST /v1/tokens/rotate` returns a new token; the old one works for ten more minutes, and a second
+  rotation inside that time is `409`.
+
+### `php bin/relay.php`, the administration commands
+
+Run on the host, with shell access to `data/` (which is the relay's trust root). None of it is reachable from the network, and
+nothing prints a secret unless you pass `--print`.
+
+| Command | What it does |
+|---|---|
+| `key desktop\|provider [--ttl=SECONDS] [--name=NAME] [--print]` | Mint an enrolment key. Written to a 0600 file by default; `--print` writes it to the terminal |
+| `devices` | List devices (no tokens, no keys) |
+| `revoke <deviceId>` | Revoke a device; revoking a desktop revokes its phones too |
+| `roster-reset <desktopId> [appId]` | Forget a stored roster so that the next push starts clean |
+| `reset limits` / `reset epoch` | Clear rate limits and token locks / start a new epoch (every client resets its cursor) |
+| `status` | Counts and facts, no secrets |
+| `backup [--out=FILE]` | A consistent copy of the SQLite database (`VACUUM INTO`); never overwrites |
+| `restore FILE --yes` | Put a backup back. Refuses another relay's file, a newer schema or a damaged file, keeps the old database, and starts a new epoch |
+| `export DIR` / `import DIR --yes` | Move a relay: database, config, keys and a checksummed manifest; `import` refuses an installed relay |
+| `gc [--force] [--vacuum]` | Run the garbage collector now |
+
+Exit codes: 0 done, 1 failed, 2 usage. Set `OAIY_RELAY_DATA` to name a data folder elsewhere.
+
+### Calibration
+
+The relay does not know how many PHP workers it may use. OAIY's "Test this relay" measures it with four routes that only the
+desktop (or the admin token) may call: `GET /v1/admin/hold`, `GET /v1/admin/stream-probe`, `POST /v1/admin/echo` and
+`POST /v1/admin/capacity`. A measurement can only lower a limit (workers, the largest body, the longest hold), never raise one
+past the configuration, and `info` then advertises what is in force.
+
 ## Garbage collection without cron
 
 The relay clears out expired items, old metadata, spent tickets and stale signal files itself, at most once a minute, from a
@@ -214,7 +262,7 @@ OAIY_TEST_DB=mysql php tests/run.php     the same tests on a throwaway MySQL 8.x
 `OAIY_TEST_DB` starts a MySQL or MariaDB server of its own for the run: `mysqld` from `C:/wamp64/bin` or the one named by
 `OAIY_TEST_MYSQLD` / `OAIY_TEST_MARIADBD`, with `--no-defaults`, a data directory under the test's temporary folder and a port
 the operating system chose. It is shut down and deleted when the run ends and never touches another MySQL on the machine.
-Tests that are about SQLite alone skip themselves there.
+Tests that are about SQLite alone (backup, restore, export) skip themselves there.
 
 Dependency free: nothing to install. The runner enables `sodium` for a run on a PHP that ships it disabled (it never edits
 `php.ini`), works in temporary directories it deletes, starts `php -S` on free loopback ports of its own, and never touches a
