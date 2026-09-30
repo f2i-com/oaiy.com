@@ -245,6 +245,15 @@ describe('E5: the Agent\'s saved links, and what its words say of each state', (
     await own.context.close();
   });
 
+  it('OAIY\'s own window has no Forget OAIY button, though an OAIY is saved there: it is found again at every opening, so the button would do nothing', async () => {
+    const { context, page } = await withSavedOaiy({ desktop: OAIY_WINDOW });
+    const section = await openSettings(page);
+    assert.match(await section.locator('p.muted').first().textContent(), /OAIY is found on its own/);
+    assert.equal(await section.locator('button', { hasText: 'Forget OAIY' }).count(), 0);
+    assert.equal(await section.locator('button', { hasText: 'Find OAIY' }).count(), 1, 'the rest of the row is there');
+    await context.close();
+  });
+
   for (const how of ['clearing the address', 'Forget OAIY']) {
     it(`the Agent forgets the OAIY it found, by ${how} and Save: it stops asking it when it opens, and the key goes nowhere (the review's F1)`, async () => {
       const { context, page, attempts, details } = await withSavedOaiy();

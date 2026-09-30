@@ -364,7 +364,8 @@ export function openSettings(initial: SettingsResult, context: { pairedDesktop?:
         h('p.muted', `The agent can make pictures, short videos, speech, music, sound effects and 3D models with a media service: ${oaiyFoundWords(oaiyState)}, and any server with OpenAI's /v1/images/generations, /v1/videos and /v1/audio/speech works. Now: ${status}${media.baseUrl ? ` (${abilities || 'no models chosen'})` : ''}.`),
         ...(pairedWords ? [h('p.muted.paired-note', pairedWords)] : []),
         h('div.provider-form',
-          h('label', 'Address', h('div.window-picker', address, find, listButton, ...(media.discovered ? [forget] : []))),
+          // Forget OAIY is for a tab: OAIY's own window finds OAIY again at every opening, so the button would do nothing there.
+          h('label', 'Address', h('div.window-picker', address, find, listButton, ...(media.discovered && !looksOnLoad(pageHost()) ? [forget] : []))),
           h('label', 'API key', key),
           h('label', 'Images', modelInput('image')),
           h('label', 'Video', modelInput('video')),
