@@ -9,9 +9,16 @@ namespace OaiyTest {
 
     final class Registry
     {
-        /** @var list<array{name:string,fn:callable,slow:bool}> */
+        /** @var list<array{name:string,fn:callable,slow:bool,file:string}> */
         private static array $tests = [];
         private static string $current = '';
+        private static string $file = '';
+
+        /** The case file (without .php) whose tests are being registered, so a run can select by file. */
+        public static function file(string $f): void
+        {
+            self::$file = $f;
+        }
 
         public static function add(string $name, callable $fn, bool $slow = false): void
         {
@@ -20,10 +27,10 @@ namespace OaiyTest {
                     throw new \LogicException("duplicate test name: $name");
                 }
             }
-            self::$tests[] = ['name' => $name, 'fn' => $fn, 'slow' => $slow];
+            self::$tests[] = ['name' => $name, 'fn' => $fn, 'slow' => $slow, 'file' => self::$file];
         }
 
-        /** @return list<array{name:string,fn:callable,slow:bool}> */
+        /** @return list<array{name:string,fn:callable,slow:bool,file:string}> */
         public static function all(): array
         {
             return self::$tests;

@@ -346,6 +346,7 @@ test('4.18.3 lifecycle: over php -S the routes answer the same as in process', f
 });
 
 test('4.18.3 lifecycle: an unreachable database is a 503 that names nothing', function () {
+    Relay::sqliteOnly();
     $r = Relay::make();
     $srv = $r->serve();
     // Replace the database file with a directory: it cannot be opened.

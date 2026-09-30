@@ -142,11 +142,8 @@ final class Auth
             throw ApiError::make('unauthorized');
         }
         if ($row['last_used_at'] === null || $row['last_used_at'] < $now - 60) {
-            try {
-                $this->db->exec('UPDATE tokens SET last_used_at = ? WHERE id = ?', [$now, $tokenId]);
-            } catch (\PDOException $e) {
-                // last_used_at is bookkeeping; a busy database must not fail the request
-            }
+            // last_used_at is bookkeeping: a busy database must neither fail the request nor make it wait
+            $this->db->quick(fn(Db $db) => $db->exec('UPDATE tokens SET last_used_at = ? WHERE id = ?', [$now, $tokenId]));
         }
         $device = $row;
         unset($device['th'], $device['not_after'], $device['last_used_at'], $device['t_revoked']);

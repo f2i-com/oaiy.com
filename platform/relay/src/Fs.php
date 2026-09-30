@@ -63,16 +63,41 @@ final class Fs
         return 'wal';
     }
 
-    /** True when $inner is $outer or inside it (both resolved; symlinks followed). */
+    /**
+     * A path with symlinks resolved, for a path that may not exist yet: the nearest existing ancestor is resolved and the
+     * missing rest appended (a fresh install has no data/ folder yet, and that is exactly when it must be checked).
+     */
+    private static function resolveLoose(string $path): ?string
+    {
+        $cur = str_replace('\\', '/', $path);
+        $tail = [];
+        for ($i = 0; $i < 64; $i++) {
+            $real = @realpath($cur);
+            if ($real !== false) {
+                $real = rtrim(str_replace('\\', '/', $real), '/');
+                return $tail ? $real . '/' . implode('/', array_reverse($tail)) : $real;
+            }
+            $parent = dirname($cur);
+            $name = basename($cur);
+            if ($parent === $cur || $name === '..' || $name === '.') {
+                return null;
+            }
+            $tail[] = $name;
+            $cur = $parent;
+        }
+        return null;
+    }
+
+    /** True when $inner is $outer or inside it (both resolved; symlinks followed; $inner may not exist yet). */
     public static function isInside(string $inner, string $outer): bool
     {
-        $a = @realpath($inner);
-        $b = @realpath($outer);
-        if ($a === false || $b === false) {
+        $a = self::resolveLoose($inner);
+        $b = self::resolveLoose($outer);
+        if ($a === null || $b === null) {
             return false;
         }
-        $a = rtrim(str_replace('\\', '/', $a), '/') . '/';
-        $b = rtrim(str_replace('\\', '/', $b), '/') . '/';
+        $a = rtrim($a, '/') . '/';
+        $b = rtrim($b, '/') . '/';
         if (stripos(PHP_OS, 'WIN') === 0) {
             $a = strtolower($a);
             $b = strtolower($b);

@@ -108,13 +108,12 @@ final class Limiter
             if ($this->db->inTransaction()) {
                 return;
             }
-            if ($this->db->exec('UPDATE rl SET n = n + 1 WHERE k = ?', [$k]) === 0) {
-                try {
-                    $this->db->insertIgnore('rl', ['k' => $k, 'w' => $w, 'n' => 0]);
-                } catch (\PDOException $e) {
+            $this->db->quick(function (Db $db) use ($k, $w): void {
+                if ($db->exec('UPDATE rl SET n = n + 1 WHERE k = ?', [$k]) === 0) {
+                    $db->insertIgnore('rl', ['k' => $k, 'w' => $w, 'n' => 0]);
+                    $db->exec('UPDATE rl SET n = n + 1 WHERE k = ?', [$k]);
                 }
-                $this->db->exec('UPDATE rl SET n = n + 1 WHERE k = ?', [$k]);
-            }
+            });
         } catch (\Throwable $e) {
             // never let a counter break a response
         }

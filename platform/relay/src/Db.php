@@ -123,7 +123,18 @@ final class Db
     private function run(string $sql, array $params): \PDOStatement
     {
         $st = $this->pdo()->prepare($sql);
-        $st->execute($params);
+        try {
+            $st->execute($params);
+        } catch (\Throwable $e) {
+            // Reset the failed statement now: a statement left half-run keeps its locks (and, in SQLite, its read
+            // snapshot), which would make the next BEGIN IMMEDIATE on this connection fail at once instead of waiting.
+            try {
+                $st->closeCursor();
+            } catch (\Throwable $ignored) {
+            }
+            $st = null;
+            throw $e;
+        }
         return $st;
     }
 
@@ -237,6 +248,36 @@ final class Db
                     throw new ApiError(503, 'unavailable', null, 1);
                 }
                 throw $e;
+            }
+        }
+    }
+
+    /**
+     * Run bookkeeping that must never make a request wait: with a busy timeout of 50 ms instead of five seconds. Returns
+     * what $fn returns, or null when the database was busy (the bookkeeping is skipped, the request goes on).
+     * @template T
+     * @param callable(self):T $fn
+     * @return T|null
+     */
+    public function quick(callable $fn)
+    {
+        $sqlite = $this->driver === 'sqlite';
+        if ($sqlite) {
+            $this->pdo()->exec('PRAGMA busy_timeout = 50');
+        }
+        try {
+            return $fn($this);
+        } catch (\PDOException $e) {
+            if (self::isBusy($e)) {
+                return null;
+            }
+            throw $e;
+        } finally {
+            if ($sqlite) {
+                try {
+                    $this->pdo()->exec('PRAGMA busy_timeout = 5000');
+                } catch (\Throwable $ignored) {
+                }
             }
         }
     }

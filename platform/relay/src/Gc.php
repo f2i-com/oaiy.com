@@ -154,7 +154,8 @@ final class Gc
             $this->db->pdo()->exec('VACUUM');
         } else {
             foreach (['items', 'mailboxes', 'rl'] as $t) {
-                $this->db->pdo()->exec('OPTIMIZE TABLE ' . $t);
+                // OPTIMIZE TABLE answers with a result set, which exec() leaves pending; read it so the connection is clean.
+                $this->db->pdo()->query('OPTIMIZE TABLE ' . $t)->fetchAll();
             }
         }
     }

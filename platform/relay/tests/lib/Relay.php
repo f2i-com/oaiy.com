@@ -57,6 +57,20 @@ final class Relay
     public string $data;
     public string $publicUrl = 'http://127.0.0.1:8099';
 
+    /** True when this run is against a throwaway MySQL or MariaDB (OAIY_TEST_DB), false for the default SQLite. */
+    public static function isMysql(): bool
+    {
+        return MysqlServer::forEnv() !== null;
+    }
+
+    /** For a test that is about SQLite itself (files, pragmas, write-ahead log): it is skipped when the run is on MySQL. */
+    public static function sqliteOnly(): void
+    {
+        if (self::isMysql()) {
+            skip('SQLite-specific: this run uses ' . getenv('OAIY_TEST_DB'));
+        }
+    }
+
     /** @param array<string,mixed> $config merged into config.json after provisioning */
     public static function make(array $config = [], array $provision = []): self
     {
@@ -64,6 +78,10 @@ final class Relay
         $r->dir = Tmp::dir('relay');
         $r->data = $r->dir . '/data';
         Tmp::setClock(self::T0);
+        $my = MysqlServer::forEnv();
+        if ($my !== null && !isset($provision['db'])) {
+            $provision['db'] = ['driver' => 'mysql', 'dsn' => $my->dsn($my->newDatabase()), 'user' => 'root', 'pass' => ''];
+        }
         Installer::provision($r->data, array_merge(['public_url' => $r->publicUrl, 'journal' => 'wal'], $provision));
         // The gap rule looks at real time between two polls, which a test that polls twice in a row would trip; tests
         // of the rule itself set wait.gap_ms back to 250.
@@ -167,13 +185,13 @@ final class Relay
     /** The relay behind php -S on a free port (a single-threaded server: start several with fleet() to overlap requests). */
     public function serve(array $ini = []): Server
     {
-        return Server::start(dirname(__DIR__, 2) . '/public', ['env' => ['OAIY_TEST_DATA' => $this->data], 'ini' => $ini, 'name' => 'relay']);
+        return Server::start(dirname(__DIR__, 2) . '/public', ['env' => ['OAIY_TEST_DATA' => $this->data], 'ini' => $ini, 'name' => 'relay', 'router' => dirname(__DIR__) . '/router.php']);
     }
 
     /** @return list<Server> */
     public function fleet(int $n, array $ini = []): array
     {
-        return Server::fleet($n, dirname(__DIR__, 2) . '/public', ['env' => ['OAIY_TEST_DATA' => $this->data], 'ini' => $ini, 'name' => 'relay']);
+        return Server::fleet($n, dirname(__DIR__, 2) . '/public', ['env' => ['OAIY_TEST_DATA' => $this->data], 'ini' => $ini, 'name' => 'relay', 'router' => dirname(__DIR__) . '/router.php']);
     }
 
     /** JSON POST or GET over HTTP to a Server, returning the same shape as call(). */

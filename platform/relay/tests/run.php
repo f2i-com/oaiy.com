@@ -4,6 +4,7 @@
  *
  *   php tests/run.php                  run every test
  *   php tests/run.php --filter=poll    run the tests whose name contains "poll" (case-insensitive)
+ *   php tests/run.php --file=poll|holds  run the tests of tests/cases/poll.php and holds.php
  *   php tests/run.php --list           list the test names
  *   php tests/run.php --stop           stop at the first failure
  *   php tests/run.php --verbose        print passing tests too
@@ -22,9 +23,18 @@ if (PHP_SAPI !== 'cli') {
 }
 
 // The relay needs libsodium. Some PHP builds ship it disabled in php.ini; enable it for this run and every child
-// process it starts, never by editing php.ini.
-if (!extension_loaded('sodium') && getenv('OAIY_TEST_REEXEC') === false) {
-    $flags = ['-d', 'extension=sodium'];
+// process it starts, never by editing php.ini. Xdebug, where php.ini loads it, is switched off for the run: it slows
+// every request and keeps objects alive after an exception, which leaves SQLite files open and locked on Windows.
+$needSodium = !extension_loaded('sodium');
+$needNoXdebug = extension_loaded('xdebug') && ini_get('xdebug.mode') !== 'off';
+if (($needSodium || $needNoXdebug) && getenv('OAIY_TEST_REEXEC') === false) {
+    $flags = [];
+    if ($needSodium) {
+        array_push($flags, '-d', 'extension=sodium');
+    }
+    if ($needNoXdebug) {
+        array_push($flags, '-d', 'xdebug.mode=off');
+    }
     $cmd = array_merge([PHP_BINARY], $flags, $_SERVER['argv']);
     $env = getenv();
     $env['OAIY_TEST_REEXEC'] = '1';
@@ -60,6 +70,7 @@ foreach (glob($testsDir . '/lib/*.php') as $f) {
 }
 
 $filter = null;
+$onlyFiles = null;
 $list = false;
 $stop = false;
 $verbose = false;
@@ -67,6 +78,8 @@ $slow = false;
 foreach (array_slice($_SERVER['argv'], 1) as $arg) {
     if (strpos($arg, '--filter=') === 0) {
         $filter = strtolower(substr($arg, 9));
+    } elseif (strpos($arg, '--file=') === 0) {
+        $onlyFiles = explode('|', substr($arg, 7));
     } elseif ($arg === '--slow') {
         $slow = true;
     } elseif ($arg === '--list') {
@@ -82,6 +95,7 @@ foreach (array_slice($_SERVER['argv'], 1) as $arg) {
 }
 
 foreach (glob($testsDir . '/cases/*.php') as $file) {
+    \OaiyTest\Registry::file(basename($file, '.php'));
     require $file;
 }
 
@@ -101,14 +115,27 @@ $skipped = [];
 $started = microtime(true);
 $slowNotRun = 0;
 foreach ($tests as $t) {
-    if ($filter !== null && strpos(strtolower($t['name']), $filter) === false) {
-        continue;
+    if ($onlyFiles !== null && !in_array($t['file'], $onlyFiles, true)) {
+        continue; // --file=poll|holds runs the tests registered by tests/cases/poll.php and holds.php
+    }
+    if ($filter !== null) {
+        $hit = false;
+        foreach (explode('|', $filter) as $one) { // --filter=a|b runs the tests that contain a or b
+            if ($one !== '' && strpos(strtolower($t['name']), $one) !== false) {
+                $hit = true;
+            }
+        }
+        if (!$hit) {
+            continue;
+        }
     }
     if ($t['slow'] && !$slow) {
         $slowNotRun++;
         continue;
     }
     $t0 = microtime(true);
+    // The relay lowers the time limit while it holds a request (set_time_limit); in process that would otherwise end the run.
+    @set_time_limit(0);
     try {
         \OaiyTest\Registry::current($t['name']);
         ($t['fn'])();

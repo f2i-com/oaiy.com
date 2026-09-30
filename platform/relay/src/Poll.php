@@ -305,14 +305,13 @@ final class Poll
         $window = $this->cfg->presenceWindow();
         $last = $p->device['last_poll_at'] ?? null;
         $wasOnline = $last !== null && (int)$last >= $now - $window;
-        try {
+        // presence is bookkeeping: a busy database must neither fail a poll nor make it wait
+        $this->db->quick(function (Db $db) use ($wasOnline, $now, $p): void {
             if ($wasOnline) {
-                $this->db->exec('UPDATE devices SET last_poll_at = ?, last_seen_at = ? WHERE id = ?', [$now, $now, $p->id]);
+                $db->exec('UPDATE devices SET last_poll_at = ?, last_seen_at = ? WHERE id = ?', [$now, $now, $p->id]);
             } else {
-                $this->db->exec('UPDATE devices SET last_poll_at = ?, last_seen_at = ?, presence_changed_at = ? WHERE id = ?', [$now, $now, $now, $p->id]);
+                $db->exec('UPDATE devices SET last_poll_at = ?, last_seen_at = ?, presence_changed_at = ? WHERE id = ?', [$now, $now, $now, $p->id]);
             }
-        } catch (\PDOException $e) {
-            // presence is bookkeeping; a busy database must not fail a poll
-        }
+        });
     }
 }
