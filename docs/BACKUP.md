@@ -793,7 +793,9 @@ in parts through internal routes with a secret made for that one backup.
   address for the vendor's own: the key of your gateway would be sent to the vendor. A provider that
   has no address at all, or an empty one, is the vendor's own and keeps its key.
 - The undo copy has no API keys (they were sealed with a key the browser will not give up, and
-  the desktop keeps the copy as plain files). An undo puts back the person's own state without a
+  the desktop keeps the copy as plain files). **It does hold an address as you have it, so a name
+  and password you wrote in an address (`https://alice:secret@...`) is in those plain files** until
+  the copy is used or replaced; a backup never holds one (see above). An undo puts back the person's own state without a
   tick, but through the same table: an old campaign is not brought back running, stale callbacks
   and anything the table does not know are not written, and the numbers not to be contacted only
   grow. **An undo makes the Agent's providers exactly the list they were before the restore**: a
