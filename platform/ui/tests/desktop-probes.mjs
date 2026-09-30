@@ -361,6 +361,62 @@ await check('Reset keeps everything where the tab is still linked by Connect, an
 });
 
 // ---------------------------------------------------------------------------
+// Disconnect while the desktop is being asked (the review's F7)
+// ---------------------------------------------------------------------------
+/** Hold the answers to health requests until `release()`; the rest of the fake desktop answers as it did. */
+function holdHealth() {
+  const real = globalThis.fetch;
+  const waiting = [];
+  globalThis.fetch = async (url, init) => {
+    if (String(url).endsWith('/api/health')) await new Promise((resolve) => waiting.push(resolve));
+    return real(url, init);
+  };
+  return { release: () => waiting.splice(0).forEach((resolve) => resolve()), restore: () => { globalThis.fetch = real; } };
+}
+
+await check('a probe that was on its way when Disconnect was pressed does not bring the desktop back: its answer is about a link that is gone', async () => {
+  const p = await page();
+  await p.connect.connectDesktop();
+  await p.settle();
+  const hold = holdHealth();
+  try {
+    const late = p.detection.refreshDesktopStatus();
+    p.connect.disconnectDesktop();
+    assert.equal(p.detection.getDesktopInfo().available, false);
+    hold.release();
+    await late;
+    await p.settle();
+    assert.equal(p.detection.getDesktopInfo().available, false, 'the late answer did not say the desktop is there');
+    assert.equal(p.detection.getDesktopInfo().checked, false, 'nor that it was asked');
+    assert.equal(p.store.get(KEYS.linked), undefined);
+    assert.equal(p.timers.size, 0);
+    assert.equal(p.store.get(KEYS.services), undefined, 'and no service list came with it');
+  } finally {
+    hold.restore();
+  }
+});
+
+await check('a Connect that was on its way when Disconnect was pressed keeps nothing: no link, no poll, no list', async () => {
+  const p = await page();
+  const hold = holdHealth();
+  try {
+    const pending = p.connect.connectDesktop();
+    p.connect.disconnectDesktop();
+    hold.release();
+    const info = await pending;
+    await p.settle();
+    assert.equal(info.available, false);
+    assert.equal(p.store.get(KEYS.linked), undefined, 'the answer was not kept as a link');
+    assert.equal(p.timers.size, 0);
+    assert.equal(p.store.get(KEYS.services), undefined);
+    assert.equal(p.health().length, 1);
+    assert.equal(p.detection.getDesktopInfo().checked, false);
+  } finally {
+    hold.restore();
+  }
+});
+
+// ---------------------------------------------------------------------------
 // What the button and its card say, for each state (the review's F2 and F12)
 // ---------------------------------------------------------------------------
 await check('the words of each state: never connected sends nothing until pressed; linked (by Connect, or an address) asks each time the editor opens and every ten seconds; disconnected is the first again', async () => {

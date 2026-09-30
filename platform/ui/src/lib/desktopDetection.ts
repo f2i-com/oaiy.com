@@ -75,12 +75,19 @@ const listeners = new Set<Listener>();
 let pollTimer: number | null = null;
 let pollPromise: Promise<void> | null = null;
 
+/** Bumped by Disconnect: an answer that was asked for before it is not about the link that is there now. */
+let generation = 0;
+
 async function probeOnce(): Promise<void> {
   // The address this probe asks about: the setting as it is now. If the person
   // changes it while the answer is on its way, that answer is about a desktop
   // they no longer point at (a probe of the new address is already running, see
   // subscribeEngineBase below) and must not be published over it.
   const base = getEngineBase();
+  // A Disconnect while this is on its way is a change of mind about the very thing it answers: its answer is dropped, as one about an address
+  // that has since changed is.
+  const gen = generation;
+  const stale = () => getEngineBase() !== base || gen !== generation;
   try {
     const controller = new AbortController();
     const timeout = window.setTimeout(() => controller.abort(), FETCH_TIMEOUT_MS);
@@ -104,7 +111,7 @@ async function probeOnce(): Promise<void> {
       // identity. Reporting a squatter as "available" would silently route
       // desktop-backed nodes at a stranger.
       const isOaiyCompanion = body?.product === 'oaiy-desktop';
-      if (getEngineBase() !== base) return;
+      if (stale()) return;
       const next: DesktopInfo = {
         checked: true,
         available: isOaiyCompanion,
@@ -123,7 +130,7 @@ async function probeOnce(): Promise<void> {
     // available". Don't log to console; this probe runs on a 10s loop
     // and would flood the console otherwise.
   }
-  if (getEngineBase() !== base) return;
+  if (stale()) return;
   publish({
     checked: true,
     available: false,
@@ -193,6 +200,7 @@ export function stopDesktopDetection(): void {
 
 /** Disconnect: the probe stops and the desktop is neither there nor not there again, until someone asks. */
 export function resetDesktopDetection(): void {
+  generation++;
   stopDesktopDetection();
   publish({ checked: false, available: false, baseUrl: getEngineBase(), lastChange: current.available ? Date.now() : current.lastChange });
 }
