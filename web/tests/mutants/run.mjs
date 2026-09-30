@@ -70,7 +70,8 @@ const NOT_COVERED = [
   '- `app/src/main.ts`: `if (!target.withKey) media = { ...media, apiKey: \'\' }`, which keeps no key with what a `?oaiy=` address says about itself. A case would need a stand-in that answers as OAIY does (no case has one); what is sent is checked (`main-key-goes-to-the-linked-address`).',
   '- The review\'s F11 (a note in the browser shim) and the wording of comments: nothing to break.',
   '- A `.oaiy` package: it cannot be loaded in the editor\'s browser build, in a tab or in OAIY\'s window (`verify_package_for_load` is not available there).',
-  '- The three survivors above are marked informational, with the reason on each row: two are equivalent in effect or unobservable by design, and `strip-shared-flow-call` is a test not written (no case reaches the shared-link path), which the report lists as a follow-up.',
+  '- What an address cannot show, on purpose: a public address that redirects to this network, and a public name that resolves to a private address (`192.168.1.5.nip.io`). `shared/capabilities/local.ts` reads the address as written; the browser\'s own question about connecting to devices on the network still gates them, and `shared/capabilities/README.md` says so. `platform/ui/tests/local-media.mjs` writes both down as cases.',
+  '- The survivors above are marked informational, with the reason on each row: equivalent in effect or unobservable by design, none a test that was not written. A mutation marked informational that a first run kills is run again, and is a survivor if the second run passes (a browser case that failed on its own); the other rows are run once.',
   '',
 ];
 
@@ -104,15 +105,28 @@ for (const m of chosen) {
     rows.push({ ...m, verdict: 'not applied', by: [], seconds: 0 });
     continue;
   }
-  let outcome;
-  try {
-    fs.writeFileSync(file, Buffer.from(text.slice(0, at) + replace + text.slice(at + find.length), 'utf8'));
-    outcome = run(m.dir, m.command);
-  } finally {
-    fs.writeFileSync(file, original);
-    if (sha(fs.readFileSync(file)) !== before) {
-      console.error(`!!! ${m.file} was not restored`);
-      process.exit(3);
+  /** Break the file, run the tests, put the file back byte for byte. */
+  const attempt = () => {
+    try {
+      fs.writeFileSync(file, Buffer.from(text.slice(0, at) + replace + text.slice(at + find.length), 'utf8'));
+      return run(m.dir, m.command);
+    } finally {
+      fs.writeFileSync(file, original);
+      if (sha(fs.readFileSync(file)) !== before) {
+        console.error(`!!! ${m.file} was not restored`);
+        process.exit(3);
+      }
+    }
+  };
+  let outcome = attempt();
+  let flaked = false;
+  // A mutation that is expected to survive (informational) and is "killed" is more likely a browser case that failed on its own than a kill:
+  // it must fail again, or it is a survivor and the first failure is said to be a flake.
+  if (m.informational && !outcome.timedOut && outcome.code !== 0) {
+    const again = attempt();
+    if (again.code === 0) {
+      outcome = again;
+      flaked = true;
     }
   }
   if (outcome.timedOut) {
@@ -124,7 +138,8 @@ for (const m of chosen) {
   const killed = outcome.code !== 0;
   if (!killed) survivors++;
   const by = killed ? failures(outcome.text).slice(0, 4) : [];
-  rows.push({ ...m, verdict: killed ? 'killed' : 'SURVIVED', by, seconds: outcome.seconds });
+  const note = flaked ? `${m.note ?? ''} (a first run failed in a case that has nothing to do with this change, a flake: the second run passed)`.trim() : m.note;
+  rows.push({ ...m, note, verdict: killed ? 'killed' : 'SURVIVED', by, seconds: outcome.seconds });
   console.log(`${killed ? 'killed  ' : 'SURVIVED'} ${m.finding.padEnd(9)} ${m.id}${killed && by[0] ? `  <- ${by[0]}` : ''}${!killed && m.informational ? '  (informational)' : ''}`);
 }
 
