@@ -19,8 +19,12 @@ Where its README and its code disagree, the code is recorded.
 - The desktop's window is a management dashboard (Overview, Services, Plugins, Runs, Models,
   Providers, Python, Connections, and screens plugins add), not the flow editor. It calls its
   own HTTP API (`desktop/src/api.ts`) and ~24 native commands (`lib.rs`).
-- The desktop serves `127.0.0.1:17972` (`desktop/src-tauri/src/http.rs`; `serverPort`,
-  `lanAccess`; binding to the network needs `OAIY_SERVER_TOKEN`). Route groups: core
+- The desktop serves `127.0.0.1:17972` (`desktop/src-tauri/src/http.rs`; `serverPort`). Its
+  API is on this machine only: the desktop ignores the `lanAccess` setting (it says so once
+  in its log), and reaching it from another device is the relay's job. `oaiy-server` alone
+  binds beyond loopback (`OAIY_SERVER_BIND`: `lan` needs an owner login made first, behind a
+  reverse proxy `OAIY_PUBLIC_URL` and `OAIY_TRUSTED_PROXIES`; `oaiy-server check` lists what a
+  configuration gets wrong; `auth/exposure.rs`). Route groups: core
   (`/api/health`, config, services, models, python, node), bridge and plugins
   (`bridge/routes.rs`), companion phones (`companion/routes.rs`), account link
   (`link/routes.rs`), AI (`ai/routes.rs`). Everything sits behind `origin_guard` and a CORS
@@ -222,7 +226,7 @@ Two transports, neither a WebSocket.
 Overview and its setup guide (Runtime → Your AI → Plugins → FormLogic; readiness from
 `GET /api/bridge/status`); Runs with filters; Dead letters with redrive; logs for services,
 plugins and Python; Connections (paired apps, the linked account and each lane's status);
-Settings (data folder with migration, model folders, HF token, `serverPort`, `lanAccess`);
+Settings (data folder with migration, model folders, HF token, `serverPort`; `lanAccess` is read and ignored);
 toasts and OS notifications. The web editor adds share links, a package manager (`.oaiy`
 packages), macros and subflows, an AI flow designer, run history and a welcome wizard.
 

@@ -258,14 +258,17 @@ AppHandle-backed config is swapped for an env-var one (`ConfigProvider`).
 
 ```bash
 cargo run --bin oaiy-server                                   # dev (links tauri)
-cargo build --release --no-default-features --bin oaiy-server  # tauri-free, for a clean Linux server
+cargo build --release --no-default-features --features web --bin oaiy-server  # tauri-free, with the web login: what the release builds
 ```
 
 The GUI and the server share one crate but split on a default **`gui`** Cargo
 feature: `oaiy-desktop` (the tray app) requires it; `oaiy-server` built with
 `--no-default-features` drops tauri entirely — **no `webkit2gtk`/GTK on the
 box** (`cargo tree -i tauri` is empty). `npm run tauri:dev` / `tauri:build`
-pass `--features gui` for the GUI.
+pass `--features gui` for the GUI. The **`web`** feature is the server's web login
+(the owner's password, the sign-in page, `oaiy-server auth init`); the release builds
+the server with it (`scripts/check-release.mjs` fails if it does not), its default access
+mode is `scoped`, and a lan or a proxied install needs it (a build without it says so).
 
 Configuration is by environment variable (no pointer file):
 
@@ -275,17 +278,20 @@ Configuration is by environment variable (no pointer file):
 | `OAIY_MODELS_DIR` | `<data>/models` | where downloads land |
 | `OAIY_EXTRA_MODEL_DIRS` | — | extra read-only model roots (`:`/`;`-separated) |
 | `OAIY_SERVER_PORT` | `17972` | listen port (loopback by default) |
-| `OAIY_SERVER_BIND` | — | `lan` enables network binding; requires a token |
+| `OAIY_SERVER_BIND` | loopback | `lan` (every interface) or an address: bearer tokens only over plain HTTP, and it needs an owner login first (`oaiy-server auth init`; a token is no stand-in). Behind a reverse proxy set `OAIY_PUBLIC_URL` (`https://<host>`) and, with a bind beyond loopback, `OAIY_TRUSTED_PROXIES` (only that proxy and this machine are then answered). The desktop ignores `lanAccess`: its API is on this machine only |
 | `OAIY_PLUGIN_DEV_MODE` | debug: `true`, release: `false` | `0`/`false` runs plugins against real hardware; `1`/`true` simulates. Invalid values keep simulation enabled. **`1`/`true` also makes a release build start unsigned plugins** (a debug build always does, whatever this says: `0` there means real hardware); any other value in a release build does not. See [Package trust](../../docs/PLUGINS.md#package-trust). |
-| `OAIY_SERVER_TOKEN` | — | bearer token required for non-public headless APIs |
+| `OAIY_SERVER_TOKEN` | — | bearer token for non-public headless APIs: 32 to 256 printable characters worth 128 bits and no pattern (no word like `test`, no run like `1234`; `openssl rand -base64 32`). One that is not stops the server (exit 78) |
 | `OAIY_HF_TOKEN` | — | HuggingFace token for gated downloads |
 | `OAIY_UPDATE_FEED` | — | **debug builds only** (a release build ignores it): read the update feed from this address instead of GitHub's, for tests against a local stub |
 
 **Auth:** set `OAIY_SERVER_TOKEN` and send it as `Authorization: Bearer …`.
 Headless APIs require a valid token for reads and writes except health,
 capability discovery and pairing bootstrap. Missing or forged Origin headers
-never substitute for credentials. Network binding without a token fails at
-startup, including when launched from the GUI. `SIGTERM`/`Ctrl-C` stops the managed
+never substitute for credentials. A configuration the startup rules refuse (a lan bind
+with no owner login, a public URL with a path, a proxy not named, a token that is an
+example or a pattern, a mode that is not allowed there) is exit 78 and one line saying what
+to change; `oaiy-server check` lists every such rule at once, and the shipped systemd unit
+runs it first and does not restart a server that exits 78. `SIGTERM`/`Ctrl-C` stops the managed
 services before exit, and on unix the plugins first, and so does a failed bind of the
 port (on Windows a plugin ends with the server's job object).
 
@@ -340,6 +346,17 @@ names counted as guessable) at 10^10 guesses or more, score 4. There are no comp
 - **The guard reads the `Host` header.** A request with two `Host` headers is not refused, and the authority of an
   absolute-form request target is ignored; both are core behaviour recorded for the exposure work (ACC-14) and the
   static UI (ACC-15), and a proxy in front (Caddy, nginx) normalises both.
+
+**Behind a reverse proxy:** `OAIY_PUBLIC_URL` (and `OAIY_AGENT_URL`, `OAIY_FLOWS_URL` for the other two apps) names
+the hosts the proxy answers to, each `https://<host>[:<port>]` with no path (the scheme may be written in any case;
+the origin the server makes is lowercase), and `OAIY_TRUSTED_PROXIES` the peers whose `X-Forwarded-For` and
+`X-Forwarded-Proto` are believed: the last entry of each, as a proxy that adds to the header puts its own there. A few
+things to know about it: a **Docker network** written as a `/24` holds the bridge's gateway too, which is then trusted
+as well (a connection that reaches a published port comes from the gateway, whoever made it): name the proxy
+container's address, not its network, where the proxy has one; a list that contains a `/0` (every address) is
+accepted with a warning, since any client could then write `X-Forwarded-For`; and the **desktop ignores
+`OAIY_ALLOWED_HOSTS`** (its `Host` allow-list is the loopback names, stricter than the server's, which adds the
+names that variable lists).
 
 **Updates:** the server never downloads or replaces itself. `GET /api/update/status` (open,
 like health) and `POST /api/update/check` (needs the token) tell you whether a newer release

@@ -132,20 +132,21 @@ until the person has accepted.
 
 ## Trying it
 
-With a headless `oaiy-server` started with `OAIY_SERVER_TOKEN=secret` (see the
+With a headless `oaiy-server` started with a random `OAIY_SERVER_TOKEN` (`export OAIY_SERVER_TOKEN="$(openssl rand -base64 32)"`;
+the server refuses an example such as `secret` or `change-me`; see the
 [README](../README.md#the-headless-server)):
 
 ```sh
 curl -s http://127.0.0.1:17972/api/mcp \
-  -H 'Authorization: Bearer secret' -H 'Content-Type: application/json' \
+  -H "Authorization: Bearer $OAIY_SERVER_TOKEN" -H 'Content-Type: application/json' \
   -d '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-06-18","capabilities":{},"clientInfo":{"name":"curl","version":"1"}}}'
 
 # the read tools only, as the Front desk's runner sees them
 curl -s http://127.0.0.1:17972/api/mcp \
-  -H 'Authorization: Bearer secret' -H 'Content-Type: application/json' -H 'X-OAIY-Session: runner' \
+  -H "Authorization: Bearer $OAIY_SERVER_TOKEN" -H 'Content-Type: application/json' -H 'X-OAIY-Session: runner' \
   -d '{"jsonrpc":"2.0","id":2,"method":"tools/list"}'
 
 curl -s http://127.0.0.1:17972/api/mcp \
-  -H 'Authorization: Bearer secret' -H 'Content-Type: application/json' \
+  -H "Authorization: Bearer $OAIY_SERVER_TOKEN" -H 'Content-Type: application/json' \
   -d '{"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name":"status","arguments":{}}}'
 ```

@@ -286,11 +286,14 @@ await check('what the pages must say plainly is there', () => {
     ['SmartScreen and how to go on', /Windows protected your PC[\s\S]*More info[\s\S]*Run anyway/],
     ['not code-signed', /not code-signed yet/],
     ['the AppImage and the deb, and no rpm (a release may not have one)', /AppImage[\s\S]*apt install/],
-    ['the headless server', /headless server[\s\S]*oaiy-server[\s\S]*OAIY_SERVER_TOKEN/],
+    // with a token made at random: the server stops (exit 78) with one that is an example or a pattern, `change-me` among them
+    ['the headless server, started with a random token', /headless server[\s\S]*oaiy-server[\s\S]*OAIY_SERVER_TOKEN=&quot;\$\(openssl rand -base64 32\)&quot;/],
+    ['the headless server on a network needs an owner login', /oaiy-server auth init/],
     ['what the installer does not carry', /engines[^.]*not in the installer yet/],
     ['the receptionist needs a phone', /Bluetooth/],
     ['plugins', /Aokie[\s\S]*FormLogic/],
   ]) assert.match(desktop, pattern, what);
+  assert.doesNotMatch(desktop, /OAIY_SERVER_TOKEN=change-me/, 'the page must not show a token the server would refuse');
 });
 
 finish();
