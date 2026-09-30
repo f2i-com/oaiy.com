@@ -6,6 +6,7 @@ use std::sync::{Arc, Mutex, OnceLock};
 use super::audit::{self, AuditLog};
 use super::bearer_throttle::ThrottleFile;
 use super::clock::{Clock, SystemClock};
+use super::exposure::Config;
 use super::guard::{Guard, GuardConfig};
 use super::mode::{validate_mode, AccessMode};
 use super::store::{AuthStore, Host, SecureWriter, StoreError};
@@ -13,20 +14,29 @@ use super::store::{AuthStore, Host, SecureWriter, StoreError};
 type BoxError = Box<dyn std::error::Error + Send + Sync>;
 
 /// What `serve` is told about the access model.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug)]
 pub struct AccessSettings {
     pub mode: AccessMode,
+    /// A server that passed the startup rules (`auth::exposure`): what the guard, the login and the control
+    /// switch are built from. The desktop has none, and reads its settings leniently.
+    pub config: Option<Arc<Config>>,
 }
 
 impl AccessSettings {
     pub fn new(mode: AccessMode) -> Self {
-        AccessSettings { mode }
+        AccessSettings { mode, config: None }
     }
 
     /// Today's behaviour: the default until the flip.
     pub fn legacy() -> Self {
+        AccessSettings::new(AccessMode::Legacy)
+    }
+
+    /// A server whose configuration passed the startup rules.
+    pub fn for_server(config: Config) -> Self {
         AccessSettings {
-            mode: AccessMode::Legacy,
+            mode: config.mode,
+            config: Some(Arc::new(config)),
         }
     }
 }
@@ -53,7 +63,10 @@ pub fn build_guard(
     static_token: Option<String>,
     env: &dyn Fn(&str) -> Option<String>,
 ) -> Result<Arc<Guard>, BoxError> {
-    let (config, warnings) = GuardConfig::from_env(env, bind_all, gui, port);
+    let (config, warnings) = match &settings.config {
+        Some(validated) => (GuardConfig::from_config(validated, gui), Vec::new()),
+        None => GuardConfig::from_env(env, bind_all, gui, port),
+    };
     for w in &warnings {
         log::warn!("auth: {w}");
     }
@@ -109,6 +122,7 @@ pub fn build_guard(
                 "port": port,
                 "hosts": guard.config().hosts.describe(),
                 "trustedProxies": guard.config().trusted.describe(),
+                "proxyOnly": guard.config().proxy_only,
             }),
         );
     }

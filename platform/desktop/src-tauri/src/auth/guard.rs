@@ -253,6 +253,17 @@ impl Denial {
         Denial::new(StatusCode::MISDIRECTED_REQUEST, "proxy_detected", "A forwarded header reached an install that is not behind a proxy: set OAIY_PUBLIC_URL.").counted("auth.denied")
     }
 
+    /// A connection that is neither from a trusted proxy nor from this machine, to a server that is configured
+    /// to be reached only through its proxy (design 4.4, 4.5.5 rule 4).
+    pub fn direct_access_refused() -> Denial {
+        Denial::new(
+            StatusCode::FORBIDDEN,
+            "direct_access_refused",
+            "This server answers only its reverse proxy: use its public address.",
+        )
+        .counted("auth.denied")
+    }
+
     pub fn plaintext_from_public_address() -> Denial {
         Denial::new(
             StatusCode::FORBIDDEN,
@@ -455,6 +466,9 @@ pub struct GuardConfig {
     pub hosts: HostPolicy,
     /// `OAIY_ALLOW_PUBLIC_PLAINTEXT=1`.
     pub allow_public_plaintext: bool,
+    /// The proxy-only shape (design 4.5.5 rule 4): a bind beyond loopback behind a named proxy. A direct peer
+    /// that is neither a trusted proxy nor this machine is `403 direct_access_refused`.
+    pub proxy_only: bool,
 }
 
 /// `https://host[:port]` with no path, query or fragment, as a host.
@@ -466,9 +480,41 @@ fn https_origin_host(url: &str) -> Option<HostName> {
     HostName::parse(rest)
 }
 
+/// What the desktop does not read from its environment: it is never behind a proxy (design 3.4: the desktop's
+/// API is on loopback only), so none of these can make it a proxied install.
+const DESKTOP_IGNORES: [&str; 5] = [
+    "OAIY_PUBLIC_URL",
+    "OAIY_AGENT_URL",
+    "OAIY_FLOWS_URL",
+    "OAIY_TRUSTED_PROXIES",
+    "OAIY_ALLOW_PUBLIC_PLAINTEXT",
+];
+
 impl GuardConfig {
+    /// The settings of a server that passed the startup rules (`auth::exposure`): nothing left to read leniently.
+    pub fn from_config(config: &super::exposure::Config, gui: bool) -> GuardConfig {
+        let loopback_apps = !gui && config.exposure == Exposure::Local;
+        GuardConfig {
+            exposure: config.exposure,
+            gui,
+            port: config.port,
+            trusted: config.trusted.clone(),
+            hosts: HostPolicy::new(
+                config.exposure,
+                config.port,
+                config.allowed_hosts.clone(),
+                config.public.clone(),
+                loopback_apps,
+            ),
+            allow_public_plaintext: config.allow_public_plaintext,
+            proxy_only: config.proxy_only(),
+        }
+    }
+
     /// Read the settings of 4.13 from the environment (`env`), leniently: what cannot be read is
-    /// ignored and named in the warnings (the strict startup rules are a later step).
+    /// ignored and named in the warnings. This is the desktop's way (it starts whatever it is given) and the
+    /// tests'; `oaiy-server` applies the startup rules of `auth::exposure` first and uses
+    /// [`GuardConfig::from_config`]. The desktop ignores the settings of a proxy altogether, and says so.
     pub fn from_env(
         env: &dyn Fn(&str) -> Option<String>,
         bind_all: bool,
@@ -477,10 +523,22 @@ impl GuardConfig {
     ) -> (GuardConfig, Vec<String>) {
         let mut warnings = Vec::new();
         let get = |name: &str| {
+            if gui && DESKTOP_IGNORES.contains(&name) {
+                return None;
+            }
             env(name)
                 .map(|v| v.trim().to_string())
                 .filter(|v| !v.is_empty())
         };
+        if gui {
+            for name in DESKTOP_IGNORES {
+                if env(name).is_some_and(|v| !v.trim().is_empty()) {
+                    warnings.push(format!(
+                        "{name} is ignored: the desktop's API is on this machine only and is never behind a proxy"
+                    ));
+                }
+            }
+        }
         let public_url = get("OAIY_PUBLIC_URL");
         let exposure = Exposure::compute(bind_all, public_url.is_some());
         let mut public: BTreeMap<HostName, App> = BTreeMap::new();
@@ -527,6 +585,8 @@ impl GuardConfig {
         let loopback_apps = !gui && exposure == Exposure::Local;
         let hosts = HostPolicy::new(exposure, port, extra, public, loopback_apps);
         let allow_public_plaintext = get("OAIY_ALLOW_PUBLIC_PLAINTEXT").as_deref() == Some("1");
+        // Fail toward the stricter shape: a bind beyond loopback behind a public URL refuses direct peers.
+        let proxy_only = exposure == Exposure::Proxied && bind_all;
         (
             GuardConfig {
                 exposure,
@@ -535,6 +595,7 @@ impl GuardConfig {
                 trusted,
                 hosts,
                 allow_public_plaintext,
+                proxy_only,
             },
             warnings,
         )
@@ -563,6 +624,9 @@ pub struct Guard {
     /// When a trusted proxy's unusable `X-Forwarded-For` was last logged (once a minute), how many lines.
     fell_back_at: AtomicU64,
     fell_back_lines: AtomicU64,
+    /// When a trusted proxy's request with no `X-Forwarded-For` was last logged (once a minute), how many lines.
+    no_xff_at: AtomicU64,
+    no_xff_lines: AtomicU64,
     /// The web login, when this server has one: it turns on the session cookie and setup-only mode.
     #[cfg(feature = "web")]
     login: std::sync::OnceLock<std::sync::Weak<dyn super::session::LoginFacts>>,
@@ -606,6 +670,27 @@ impl Guard {
         let static_token = static_token
             .map(|t| t.trim().to_string())
             .filter(|t| !t.is_empty());
+        // The shape of design 4.1: `oaiy-server` refuses to start with a token that fails it (exit 78), and every
+        // other embedding (the desktop) ignores the token, with a line saying so. `legacy` keeps today's guard for
+        // the routes that existed before the model, which took any token, so it keeps the token too, and says
+        // what will change.
+        let static_token = match static_token {
+            Some(t) => match super::token::check_static_token_shape(&t) {
+                Ok(()) => Some(t),
+                Err(shape) if mode.is_enforcing() => {
+                    log::warn!("auth: OAIY_SERVER_TOKEN is ignored: {}", shape.message());
+                    None
+                }
+                Err(shape) => {
+                    log::warn!(
+                        "auth: {}: it is accepted while the access mode is legacy and ignored once it is scoped",
+                        shape.message()
+                    );
+                    Some(t)
+                }
+            },
+            None => None,
+        };
         store.set_static_present(static_token.is_some());
         Guard {
             mode,
@@ -621,6 +706,8 @@ impl Guard {
             proxy_misconfigured_noted: AtomicBool::new(false),
             fell_back_at: AtomicU64::new(0),
             fell_back_lines: AtomicU64::new(0),
+            no_xff_at: AtomicU64::new(0),
+            no_xff_lines: AtomicU64::new(0),
             #[cfg(feature = "web")]
             login: std::sync::OnceLock::new(),
         }
@@ -731,6 +818,23 @@ impl Guard {
                 json!({}),
             );
         }
+    }
+
+    /// A trusted proxy forwarded a request for a public host with no `X-Forwarded-For` at all: one log line a minute
+    /// (design 6, "proxy misconfigured").
+    fn note_no_forwarded_for(&self, peer: IpAddr) {
+        if !once_a_minute(&self.no_xff_at, self.clock.now_ms()) {
+            return;
+        }
+        self.no_xff_lines.fetch_add(1, Ordering::Relaxed);
+        log::warn!(
+            "auth: the trusted proxy {peer} forwarded a request with no X-Forwarded-For: its address stands for every client behind it (they share its limits); make the proxy send the client's address in X-Forwarded-For (nginx: proxy_set_header X-Forwarded-For $remote_addr)"
+        );
+    }
+
+    /// How many lines of the missing-`X-Forwarded-For` kind the guard has written (for the tests).
+    pub fn no_forwarded_for_lines(&self) -> u64 {
+        self.no_xff_lines.load(Ordering::Relaxed)
     }
 
     /// A trusted proxy's `X-Forwarded-For` could not be used, so its address stands for every client behind
@@ -895,6 +999,20 @@ impl Guard {
         if !is_served_method(&method) {
             return Err(fail(Denial::method_not_allowed(), &peer_text));
         }
+        let is_health_probe = matches!(method, Method::GET | Method::HEAD) && path == "/api/health";
+        // Proxy-only (design 4.5.5 rule 4): bound beyond loopback and told who the proxy is. A connection that is
+        // neither from that proxy nor from this machine (the CLI on the server, `oaiy-server auth ...`, a check
+        // inside a container: a loopback peer with no forwarded header) did not come through it, and is refused
+        // before anything else is read, whatever it says in its headers, and for any path: the pages a later
+        // step serves are behind the same door. A probe of `GET /api/health` is exempt, as it is from the Host check.
+        if self.config.proxy_only && !is_health_probe {
+            if let Some(peer_ip) = peer.ip() {
+                let direct = peer.is_loopback() && forwarded_header(req.headers()).is_none();
+                if !direct && !self.config.trusted.contains(peer_ip) {
+                    return Err(fail(Denial::direct_access_refused(), &peer_text));
+                }
+            }
+        }
         // A path outside the API that no route answers is not under the guard (there is nothing to guard).
         if matched.is_none() && !path.starts_with("/api/") && path != "/api" {
             return Ok(Admitted {
@@ -905,7 +1023,6 @@ impl Guard {
         let headers = req.headers().clone();
         let forwarded = forwarded_header(&headers);
         let direct_loopback = peer.is_loopback() && forwarded.is_none();
-        let is_health_probe = matches!(method, Method::GET | Method::HEAD) && path == "/api/health";
 
         // 2-4. the address side of the request (skipped for a request with no socket)
         let mut info = RequestInfo {
@@ -929,17 +1046,29 @@ impl Guard {
                 (None, true) => {}
                 (None, false) => return Err(fail(Denial::misdirected_host(), &peer_text)),
             }
+            // A header line that cannot be read as text is not skipped: it stands for an entry that is not an
+            // address, and one of those means nothing in the header can be believed (design 4.5.4).
             let xff: Vec<&str> = headers
                 .get_all("x-forwarded-for")
                 .iter()
-                .filter_map(|v| v.to_str().ok())
+                .map(|v| v.to_str().unwrap_or("\u{fffd}"))
                 .collect();
             let client: ClientIp = client_ip(peer_ip, &xff, &self.config.trusted);
             info.client_ip = client.ip.to_string();
             info.client_key = client.key.clone();
-            info.via_trusted_proxy = client.via_proxy || self.config.trusted.contains(peer_ip);
+            let peer_is_trusted = self.config.trusted.contains(peer_ip);
+            info.via_trusted_proxy = client.via_proxy || peer_is_trusted;
             if client.fell_back {
                 self.note_fell_back(peer_ip);
+            }
+            // A trusted peer that forwards a public host with no `X-Forwarded-For` is a proxy that names no client: every
+            // client behind it is that one address (they share its limits: five wrong logins from anyone block the
+            // owner). The CLI on this machine reaches the port by a loopback name, so it is not this.
+            if peer_is_trusted
+                && xff.is_empty()
+                && matches!(info.host_class, Some(HostClass::Public(_)))
+            {
+                self.note_no_forwarded_for(peer_ip);
             }
             if self.config.exposure == Exposure::Local {
                 if let Some(header) = forwarded {
