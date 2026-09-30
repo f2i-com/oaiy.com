@@ -82,10 +82,14 @@ The plan reasons OAIY puts in an `oaiy.ring.plan` answer are exactly the plugin'
   only for `urgent`, when the owner allows it and the caller said one of the owner's urgent phrases as a statement that it is
   so, read a sentence at a time and in order: not denied ("this is not a gas leak"), supposed ("if there were a gas leak"),
   quoted or spoken of as words, put as a question, or told to the receptionist to say, and a later denial takes it back.
-* **An ask counts for one request.** What the caller had said is used up when a ring opens on it, as far as the request was
-  judged on (what they said while it was planned and sent is the next request's), and when the owner hands the caller back
-  every turn so far is used up. A request refused, refused by the phone before it rang, or on a call whose session was made anew
-  with no owner between, is tried again on the same ask.
+* **An ask counts for one request** (`transfer-v1.md`, the caller-asked check). What the caller had said is spent when the request
+  **opens** (the plan authorised the ring and the request is open), as far as the request was judged on, and when the AI has the caller
+  back (the owner handed them back: every turn so far), and by nothing that stops short of that. The ask stands, and the retry is judged
+  on it, after a host that does not answer or whose plan cannot be read, a plan that refuses or is only a message, a request refused before
+  the host is asked or before anything rang (a busy mailbox, consent taken back, a ceiling, an arguments or plan error), a call that ends
+  or changes while the host plans, and a session made anew for the same call with no owner between. What the caller says after the tool
+  call, while the host plans, is not spent by the ring that opens on it. Each of these has a test (`a_request_that_stops_short_of_opening_spends_nothing_and_the_ask_stands`
+  in the ring, four on the call).
 * **Limits** are stricter than the plugin's floor: by default 2 tries a call, a minute apart, 3 an hour for one
   caller, 10 an hour in all, and all callers with a withheld or unusable number share one bucket of 2 an hour.
   A try the plugin refuses itself (`consent`, `call_changed`, `plan_unavailable`, the tool intake errors) is given back.
@@ -131,6 +135,11 @@ The plan reasons OAIY puts in an `oaiy.ring.plan` answer are exactly the plugin'
   * "he'd put the owner on"
   * "I wouldnt speak to the manager"
   * "I couldn't speak to the owner earlier"
+
+  (The first, second and fourth are the three forms `transfer-v1.md` lists as ones no block names on either end and both ends let
+  through: this desktop, the host, refuses them, and a test reads that list from the contract and fails if one of them asks or is not a
+  case here. The four things it says only the host reads, an ask taken back, being told to say it, a different target such as billing and
+  someone else in the room, each have named cases in this file, and the same test holds them to it.)
 
   and seven more of the same kind ("we're going to talk to the owner on Friday", "she'll speak to the manager later", "he's put
   the manager on the phone", "we couldnt talk to the owner", "I didnt speak to the manager", "you shouldnt talk to the boss", "he

@@ -883,6 +883,37 @@ mod tests {
         }
     }
 
+    /// transfer-v1.md says what the phone's floor lets through that this desktop, the host, has to refuse: the forms no block names on either end (which no
+    /// case can be shared for until both ends close them), and what only the host reads. Each is refused here, and each is a case of this desktop's own
+    /// file, so a change to the contract's list that this desktop has not followed, or a case dropped from the file, is seen.
+    #[test]
+    fn what_the_contract_says_the_floor_lets_through_is_refused_here_and_kept_as_a_case() {
+        let document = include_str!("../../../../../docs/contracts/transfer/transfer-v1.md").split_whitespace().collect::<Vec<_>>().join(" ");
+        let from = document.find("no block names on either end (").expect("the contract lists the forms no block names") + "no block names on either end (".len();
+        let to = from + document[from..].find(") are let through by both").expect("and says both ends let them through");
+        let forms: Vec<String> = Regex::new(r#""([^"]+)""#).unwrap().captures_iter(&document[from..to]).map(|c| c[1].to_string()).collect();
+        assert!(forms.len() >= 3, "the contract names at least three forms: {forms:?}");
+        let ours: std::collections::BTreeSet<String> = cases(OAIY_EXTRA, "negative").iter().map(|turns| turns.join(" | ").to_lowercase()).collect();
+        for form in &forms {
+            assert!(!caller_asked(&[form.as_str()]), "{form}: a form the contract says both ends let through is refused here");
+            assert!(ours.contains(&form.to_lowercase()), "{form}: and is a case of this desktop's own file");
+        }
+        // What only the host reads: an ask taken back, being told to say it, a different target such as billing, someone else in the room. The
+        // contract still says so (the words below are the ones it uses), and each has cases of its own here, by name.
+        for said in ["an ask taken back", "being told to say it", "a different target such as billing", "someone else in the room"] {
+            assert!(document.contains(said), "the contract no longer says {said:?}: is this list still what it says?");
+        }
+        let v: Value = serde_json::from_str(OAIY_EXTRA).unwrap();
+        for kind in ["taken back", "told to say it", "a different target", "someone else in the room"] {
+            let held: Vec<&Value> = v["negative"].as_array().unwrap().iter().filter(|c| c["name"].as_str().is_some_and(|n| n.starts_with(kind))).collect();
+            assert!(!held.is_empty(), "{kind}: no case of this desktop's own");
+            for case in held {
+                let turns: Vec<String> = case["turns"].as_array().unwrap().iter().map(|t| t.as_str().unwrap().to_string()).collect();
+                assert!(!caller_asked(&turns), "{kind}: {turns:?} is refused");
+            }
+        }
+    }
+
     #[test]
     fn someone_else_is_a_person_to_ask_for_and_a_caller_who_is_talking_to_someone_else_is_not_asking() {
         // "Someone else" is a plain ask for a person (the caller wants to be put through to another person than the one they have), in every
