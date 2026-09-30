@@ -318,7 +318,8 @@ async fn no_line_that_promises_a_transfer_is_said_before_an_owner_device_accepts
     assert_eq!((replaced["callId"].clone(), replaced["wanted"].clone(), replaced["said"].clone()), (json!(f.aokie.call), json!("Sure, I'm transferring you to the owner now."), json!(transfer::WAIT_LINE)), "{replaced}");
     f.ring_through("assist_1", 30).await;
     // While it rings: the hold line, whatever way it is put.
-    for line in ["I'll transfer you now.", "Let me put you through to the owner.", "You will be connected in a moment.", "Transferring you now."] {
+    // (the last is one the filter used to miss: with nothing to divide it, the promise does not begin the line)
+    for line in ["I'll transfer you now.", "Let me put you through to the owner.", "You will be connected in a moment.", "Transferring you now.", "sure hold on ill put you through to the owner now"] {
         assert!(f.aokie.say(line).await.is_ok(), "{line}");
         let replaced = f.aokie.event("call.line_replaced", secs(3)).await.unwrap_or_else(|| panic!("the app is told {line} was swapped"));
         assert_eq!(replaced["wanted"], line, "{replaced}");
@@ -327,7 +328,7 @@ async fn no_line_that_promises_a_transfer_is_said_before_an_owner_device_accepts
     }
     tokio::time::sleep(secs(1)).await;
     let spoken = f.aokie.speech.spoken();
-    for promised in ["Sure, I'm transferring you to the owner now.", "I'll transfer you now.", "Let me put you through to the owner.", "You will be connected in a moment.", "Transferring you now."] {
+    for promised in ["Sure, I'm transferring you to the owner now.", "I'll transfer you now.", "Let me put you through to the owner.", "You will be connected in a moment.", "Transferring you now.", "sure hold on ill put you through to the owner now"] {
         assert!(!spoken.iter().any(|l| l == promised), "said as written: {promised}: {spoken:?}");
     }
     assert!(!spoken.iter().any(|l| l == transfer::CONNECTING_LINE), "nobody has accepted: {spoken:?}");
@@ -343,7 +344,17 @@ async fn the_lines_of_an_ordinary_call_reach_the_caller_as_written_with_transfer
     let mut f = flow(owner_settings(true)).await;
     f.caller_says(ASKED);
     assert!(spoken_within(&f.aokie, "Hi Alex! Thanks for calling.", secs(6)).await, "{:?}", f.aokie.speech.spoken());
-    let ordinary = ["The owner will be there on Tuesday morning.", "I've taken your message and I'll get the owner to call you back.", "I'll put you through to the menu.", "I'll get someone to call you back."];
+    // (and the reviewer's second round: an email, an invoice, a booking and a form, that the words "forward you", "put you down" and "put you on to" are also used of)
+    let ordinary = [
+        "The owner will be there on Tuesday morning.",
+        "I've taken your message and I'll get the owner to call you back.",
+        "I'll put you through to the menu.",
+        "I'll get someone to call you back.",
+        "I'll forward you the quote by email.",
+        "I'll forward you the invoice.",
+        "I've put you down for a quote on Thursday.",
+        "Let me put you on to our online form.",
+    ];
     for line in ordinary {
         assert!(f.aokie.say(line).await.is_ok(), "{line}");
         assert!(spoken_within(&f.aokie, line, secs(3)).await, "said as written, before any request: {line}: {:?}", f.aokie.speech.spoken());
