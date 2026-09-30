@@ -1388,6 +1388,10 @@ where
         }
         // How a request came out, from the phone or from a clock: the app is told, and what the caller hears next is decided.
         for (request, outcome, words, source) in std::mem::take(&mut outcomes) {
+            // A request that already ended here, or that an owner device has, is not ended again by a late or repeated report of it.
+            if transfer.is_stale(&request, outcome) {
+                continue;
+            }
             let mut event = json!({"type": "call.transfer", "callId": ids.call, "requestId": request, "outcome": outcome.as_str(), "source": source});
             if let Some(words) = &words {
                 event["message"] = json!(words);
@@ -2974,7 +2978,7 @@ mod tests {
         let mut outputs: Vec<(String, Value)> = f["refusals"].as_array().unwrap().iter().map(|r| (r["name"].as_str().unwrap().to_string(), json!({"status": r["status"], "reason": r["reason"], "instruction": "Offer a message."}))).collect();
         outputs.extend(f["toolRefusals"]["cases"].as_array().unwrap().iter().map(|c| (c["name"].as_str().unwrap().to_string(), c["output"].clone())));
         assert_eq!(outputs.len(), 19);
-        // A call may send only so many tools (the phone ends it at its ninth), so a few to a call.
+        // A call may send only so many tools (six here, well inside the phone's limit), so a few to a call.
         for chunk in outputs.chunks(4) {
             let mut aokie = transferable(owner_settings(true), true).await;
             caller_asks(&aokie);
@@ -3128,7 +3132,7 @@ mod tests {
             answer_of(asked).await.unwrap();
         }
         let a = answer_of(asking(&aokie, transfer::TOOL, json!({"reason": "caller_asked"}))).await.unwrap();
-        assert_eq!((a["output"]["status"].clone(), a["output"]["reason"].clone()), (json!("unavailable"), json!("tool_limit")), "the phone ends a call at its ninth tool call: one is kept for the goodbye");
+        assert_eq!((a["output"]["status"].clone(), a["output"]["reason"].clone()), (json!("unavailable"), json!("tool_limit")), "a transfer is not asked for once six tools have been sent: one is kept for the goodbye");
         assert!(aokie.text("formlogic.realtime.tool_call", Duration::from_millis(300)).await.is_none());
     }
 

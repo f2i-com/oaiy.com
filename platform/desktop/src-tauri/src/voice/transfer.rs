@@ -12,7 +12,8 @@
 //!   ([`crate::ring::Ring::authorise`]), which is judged on what this desktop heard, not on the model.
 //!
 //! What follows is the caller's experience, and the rule for all of it is that the caller is never
-//! left in silence and never told a lie: the model says it will *try* to reach the owner; if the
+//! left in silence for long and never told a lie (the one deliberate silence is after an acceptance: one line,
+//! then nothing until the call is the owner's, see [`CONNECTING_LINE`]): the model says it will *try* to reach the owner; if the
 //! owner accepts, the caller hears that they are being connected (only then); if nobody does, or the
 //! owner declines, or the request runs out, the caller is offered a message. The model says these
 //! lines. If it has not within a few seconds, this desktop says a fixed line itself: [`Transfer`] is
@@ -41,7 +42,8 @@ pub const TOOL: &str = "transfer_to_owner";
 pub const HANDOFF_PREFIX: &str = "handoff:";
 /// Tool calls that may wait behind another.
 pub const MAX_WAITING: usize = 4;
-/// The phone ends a call at its ninth tool call: a transfer is not asked for once this many have been made.
+/// A transfer is not asked for once this many tools have been sent on a call, so one is kept for the goodbye. This desktop's own limit,
+/// well inside the phone's (its 25th tool call of a call is `tool_limit`, its 35th ends the session).
 pub const TOOLS_BEFORE_LAST: u32 = 6;
 /// The longest a caller's message from the owner is kept (characters).
 pub const MAX_OWNER_MESSAGE: usize = 320;
@@ -289,6 +291,8 @@ pub struct Transfer {
     cancelling: Option<Cancelling>,
     /// The request the phone was told this desktop gave up on.
     gave_up_sent: Option<String>,
+    /// The requests that ended here without an owner device taking the call, most recent last (a few: see [`Transfer::is_stale`]).
+    ended: Vec<String>,
     accepted: Option<(String, Instant)>,
     hold_at: Option<Instant>,
     /// Hold lines said for this ring.
@@ -410,6 +414,17 @@ impl Transfer {
         self.offer_at = None;
     }
 
+    /// Whether an outcome for `request` changes nothing here, and is not to be told again: the request already ended here (the phone's
+    /// own answer to a withdrawal that this desktop had given up waiting for, a second report of the same ending), or an owner device has it
+    /// and this is a second acceptance or a decline or a timeout of it. An acceptance after an ending is not stale (an owner device took it
+    /// after all), and neither is the takeover failing or the caller leaving once an owner device has it.
+    pub fn is_stale(&self, request: &str, outcome: Outcome) -> bool {
+        if outcome != Outcome::Accepted && self.ended.iter().any(|e| e == request) {
+            return true;
+        }
+        self.accepted.as_ref().is_some_and(|(a, _)| a == request) && matches!(outcome, Outcome::Accepted | Outcome::Declined | Outcome::Expired)
+    }
+
     /// The outcome of `request`. What a caller hears next is decided here.
     pub fn outcome(&mut self, request: &str, outcome: Outcome, now: Instant) -> Vec<Effect> {
         // A request other than the one going is stale, unless nothing is going (a ring we never saw begin).
@@ -426,6 +441,7 @@ impl Transfer {
                 }
                 self.ringing = None;
                 self.offer_at = None;
+                self.ended.retain(|e| e != request);
                 self.handing_over = true;
                 self.accepted = Some((request.to_string(), now + self.timing.setup_limit));
                 // The caller hears that they are being connected, once, at once: nothing more is said until the call is the owner's.
@@ -439,6 +455,11 @@ impl Transfer {
             // phone saying it was cancelled (which this desktop did not itself ask for): the call is still live and nobody has it.
             Outcome::Declined | Outcome::Expired | Outcome::Unavailable | Outcome::Cancelled => {
                 let after_accept = self.accepted.take().is_some();
+                self.ended.retain(|e| e != request);
+                self.ended.push(request.to_string());
+                if self.ended.len() > 8 {
+                    self.ended.remove(0);
+                }
                 self.ringing = None;
                 self.handing_over = false;
                 self.offer_at = Some((now + self.timing.offer_after, if after_accept { FAILED_LINE } else { OFFER_LINE }));
@@ -525,10 +546,10 @@ impl Waiting {
 
 /// The tool calls on this call: those on the wire, those waiting, and how many have been sent.
 ///
-/// The phone ends a call that makes a tool call while another is unanswered, and at its ninth. Tools
-/// other than a transfer are sent the moment they are asked for, as they always were; a transfer is
+/// The phone answers a tool call made while another is unanswered `busy` and one past its limit `tool_limit`, and ends a session
+/// that goes on regardless. Tools other than a transfer are sent the moment they are asked for, as they always were; a transfer is
 /// only sent when nothing else is unanswered, and nothing else is sent while it is unanswered, so
-/// asking to reach the owner can never be the call that overlaps another and ends it.
+/// asking to reach the owner can never be the call that overlaps another and is refused `busy`.
 #[derive(Default)]
 pub struct Tools {
     waiting: VecDeque<Waiting>,
@@ -814,6 +835,37 @@ mod tests {
         t.cancel("assist_1", at(3));
         assert_eq!(t.outcome("assist_1", Outcome::Accepted, at(4)), vec![Effect::Cut, Effect::Say(CONNECTING_LINE)]);
         assert!(!t.due(at(4) + CANCEL_WAIT).iter().any(|d| matches!(d, Due::CancelUnanswered(_))), "not still waiting");
+    }
+
+    #[test]
+    fn a_request_that_ended_is_not_ended_again_but_an_acceptance_after_it_is_obeyed() {
+        let mut t = Transfer::default();
+        t.ringing("assist_1", 40, at(0));
+        assert!(!t.is_stale("assist_1", Outcome::Declined), "the request rings: any ending of it counts");
+        assert!(t.cancel("assist_1", at(3)));
+        // The phone does not answer the withdrawal in time: it is over here, as if declined.
+        assert!(t.due(at(3) + CANCEL_WAIT).contains(&Due::CancelUnanswered("assist_1".into())));
+        t.outcome("assist_1", Outcome::Declined, at(6));
+        // Its own answer, late (or the same ending said twice), changes nothing and is not told again; another request's outcome is not this one's.
+        for late in [Outcome::Cancelled, Outcome::Declined, Outcome::Expired, Outcome::Unavailable] {
+            assert!(t.is_stale("assist_1", late), "{late:?}");
+        }
+        assert!(!t.is_stale("assist_2", Outcome::Cancelled));
+        // An owner device that took the call after all is obeyed, and then only the takeover failing or the caller leaving ends it.
+        assert!(!t.is_stale("assist_1", Outcome::Accepted));
+        t.outcome("assist_1", Outcome::Accepted, at(7));
+        assert!(t.is_stale("assist_1", Outcome::Accepted), "once per request");
+        assert!(t.is_stale("assist_1", Outcome::Declined) && t.is_stale("assist_1", Outcome::Expired), "the first answer wins");
+        assert!(!t.is_stale("assist_1", Outcome::Unavailable) && !t.is_stale("assist_1", Outcome::Cancelled));
+        // Its setup failing ends it, once.
+        t.outcome("assist_1", Outcome::Unavailable, at(20));
+        assert!(t.is_stale("assist_1", Outcome::Unavailable));
+        // Only a few are remembered.
+        for n in 0..12 {
+            t.ringing(&format!("r{n}"), 40, at(30));
+            t.outcome(&format!("r{n}"), Outcome::Expired, at(31));
+        }
+        assert!(t.is_stale("r11", Outcome::Cancelled) && !t.is_stale("r0", Outcome::Cancelled) && !t.is_stale("assist_1", Outcome::Unavailable));
     }
 
     #[test]

@@ -454,6 +454,14 @@ async fn a_phone_that_does_not_answer_the_withdrawal_leaves_it_over_here_after_t
     assert!(spoken_within(&f.aokie, transfer::OFFER_LINE, secs(3)).await, "{:?}", f.aokie.speech.spoken());
     assert!(f.dialog().await.is_empty());
     assert_eq!(f.ended(), vec![("assist_1".to_string(), "declined", "desktop")]);
+    // The phone's own answer to the withdrawal comes late: the request has ended here, so the app is not told a second ending and the
+    // caller is not offered the message a second time.
+    let offers = |f: &Flow| f.aokie.speech.spoken().iter().filter(|l| *l == transfer::OFFER_LINE).count();
+    let offered = offers(&f);
+    f.aokie.send(outcome(&f.aokie, "assist_1", "cancelled", None));
+    assert!(f.aokie.event("call.transfer", Duration::from_millis(600)).await.is_none(), "a late cancelled changes nothing");
+    assert_eq!(offers(&f), offered, "{:?}", f.aokie.speech.spoken());
+    assert_eq!(f.ended(), vec![("assist_1".to_string(), "declined", "desktop")]);
     // The owner's device takes it after all: the takeover is obeyed.
     f.aokie.send(outcome(&f.aokie, "assist_1", "accepted", None));
     let told = f.aokie.event("call.transfer", secs(3)).await.expect("the takeover is told");
