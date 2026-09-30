@@ -70,6 +70,7 @@ test('the systemd unit does not restart a server that its configuration refused,
     ['ExecStartPre=/usr/local/bin/oaiy-server check', '', /ExecStartPre/],
     ['StartLimitBurst=5', '', /StartLimit/],
     ['StartLimitIntervalSec=60', '', /StartLimit/],
+    ['# Requires systemd 230 or newer:', '# Requires a recent systemd:', /systemd 230/],
   ]) {
     const problems = problemsOf({ ...real, unit: without(real.unit, find, replace) });
     assert.equal(problems.length, 1, `${find} -> ${replace}`);

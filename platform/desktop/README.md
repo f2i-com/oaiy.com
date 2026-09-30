@@ -292,8 +292,10 @@ never substitute for credentials. A configuration the startup rules refuse (a la
 with no owner login, a public URL with a path, a proxy not named, a token that is an
 example or a pattern, a mode that is not allowed there) is exit 78 and one line saying what
 to change; `oaiy-server check` lists every such rule at once, and the shipped systemd unit
-runs it first and does not restart a server that exits 78. `SIGTERM`/`Ctrl-C` stops the managed
-services before exit, and on unix the plugins first, and so does a failed bind of the
+runs it first and does not restart a server that exits 78 (the unit needs systemd 230 or newer: it bounds the restarts
+with `StartLimitIntervalSec=` and `StartLimitBurst=` in `[Unit]`, which an older systemd ignores with a warning; on
+one, move the two to `[Service]`, where they are `StartLimitInterval=` and `StartLimitBurst=`). `SIGTERM`/`Ctrl-C`
+stops the managed services before exit, and on unix the plugins first, and so does a failed bind of the
 port (on Windows a plugin ends with the server's job object).
 
 ### A token-only install on the web build

@@ -6,6 +6,9 @@ Wants=network-online.target
 # A start that fails is tried again (Restart= below), but not for ever: five starts in a minute and the unit stays
 # failed (systemctl reset-failed oaiy-server, after the settings are put right). This bounds what
 # RestartPreventExitStatus= below cannot: a failing ExecStartPre is not "the main process" exiting 78.
+# Requires systemd 230 or newer: StartLimitIntervalSec= and StartLimitBurst= are read in [Unit] from that version (an older
+# systemd ignores them here with a warning. If `systemctl --version` says less, move both to [Service] and rename the
+# first to StartLimitInterval=: that is its name there before 230, which does not know StartLimitIntervalSec=).
 StartLimitIntervalSec=60
 StartLimitBurst=5
 

@@ -65,6 +65,10 @@ export function problemsOf({ release, ci, unit }) {
     if (!lines.some((l) => /^StartLimitBurst=\d+$/.test(l)) || !lines.some((l) => /^StartLimitIntervalSec=\d+$/.test(l))) {
       problems.push('oaiy-server.service has no StartLimitBurst= and StartLimitIntervalSec=: a failing ExecStartPre (which RestartPreventExitStatus= does not cover) is restarted for ever');
     }
+    // They are read in [Unit] from systemd 230: the unit says so where an operator on an older one reads it.
+    if (!/systemd 230/.test(unit)) {
+      problems.push('oaiy-server.service does not say that StartLimit* in [Unit] requires systemd 230 or newer');
+    }
   }
   return problems;
 }
