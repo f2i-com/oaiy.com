@@ -38,6 +38,9 @@ final class Log
             if (is_file($file) && (int)@filesize($file) > self::MAX_BYTES) {
                 @rename($file, $file . '.1');
             }
+            if (!is_file($file)) {
+                Fs::createPrivate($file); // the log names devices and error details: owner-only, whatever the host's umask
+            }
             @file_put_contents($file, Json::encode($line) . "\n", FILE_APPEND | LOCK_EX);
         } catch (\Throwable $e) {
             // Logging must never break a request.

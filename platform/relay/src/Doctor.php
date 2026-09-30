@@ -212,7 +212,7 @@ final class Doctor
             }
         }
         if ($bad) {
-            $out[] = self::row('data.modes', self::FAIL, implode('; ', $bad) . ': other users on this host can read secrets');
+            $out[] = self::row('data.modes', self::FAIL, implode('; ', $bad) . ': other users on this host can read the relay\'s secrets or data');
         } elseif ($warn) {
             $out[] = self::row('data.modes', self::WARN, implode('; ', $warn));
         } else {
@@ -486,17 +486,7 @@ final class Doctor
             ? self::row('data.webroot', self::FAIL, 'data/ lies inside the web root (public/): move the relay so that only public/ is served')
             : self::row('data.webroot', self::OK, 'data/ is outside public/');
         $posix = stripos(PHP_OS, 'WIN') !== 0;
-        $items = [['label' => 'data/', 'mode' => self::modeOf($data), 'dir' => true, 'secret' => false],
-            ['label' => 'data/secrets/', 'mode' => self::modeOf($data . '/secrets'), 'dir' => true, 'secret' => false]];
-        foreach (['relay.key', 'admission.hmac', 'admin.json'] as $f) {
-            $items[] = ['label' => 'data/secrets/' . $f, 'mode' => self::modeOf($data . '/secrets/' . $f), 'dir' => false, 'secret' => true];
-        }
-        foreach (['config.json', 'first-key.txt', 'admin-token.txt'] as $f) {
-            if (is_file($data . '/' . $f)) {
-                $items[] = ['label' => 'data/' . $f, 'mode' => self::modeOf($data . '/' . $f), 'dir' => false, 'secret' => true];
-            }
-        }
-        $out = array_merge($out, self::modes($items, $posix));
+        $out = array_merge($out, self::modes(self::dataModeItems($data), $posix));
         $left = [];
         foreach ([Installer::FIRST_KEY, Installer::ADMIN_TOKEN_FILE] as $f) {
             $t = is_file($data . '/' . $f) ? @filemtime($data . '/' . $f) : false;
@@ -537,8 +527,38 @@ final class Doctor
         return array_merge($out, self::webSection($opts, $cfg, $installed));
     }
 
+    /**
+     * What the mode check looks at: data/ and data/secrets/ as folders, and as "secret" (readable by the owner only) every
+     * file that holds a secret or the relay's data: the keys and tokens, the config, the SQLite database with its -wal, -shm
+     * and -journal files (token hashes, mailbox bodies), the log and the backups. A file that does not exist is left out.
+     * @return list<array{label:string,mode:?int,dir:bool,secret:bool}>
+     */
+    public static function dataModeItems(string $data): array
+    {
+        $data = rtrim(str_replace('\\', '/', $data), '/');
+        $items = [['label' => 'data/', 'mode' => self::modeOf($data), 'dir' => true, 'secret' => false],
+            ['label' => 'data/secrets/', 'mode' => self::modeOf($data . '/secrets'), 'dir' => true, 'secret' => false]];
+        foreach (['relay.key', 'admission.hmac', 'admin.json'] as $f) {
+            $items[] = ['label' => 'data/secrets/' . $f, 'mode' => self::modeOf($data . '/secrets/' . $f), 'dir' => false, 'secret' => true];
+        }
+        $files = ['config.json', Installer::FIRST_KEY, Installer::ADMIN_TOKEN_FILE, 'relay.sqlite', 'relay.sqlite-wal', 'relay.sqlite-shm', 'relay.sqlite-journal',
+            'logs/relay.log', 'logs/relay.log.1'];
+        foreach (glob($data . '/backups/*') ?: [] as $b) {
+            if (is_file($b)) {
+                $files[] = 'backups/' . basename($b);
+            }
+        }
+        foreach ($files as $f) {
+            if (is_file($data . '/' . $f)) {
+                $items[] = ['label' => 'data/' . $f, 'mode' => self::modeOf($data . '/' . $f), 'dir' => false, 'secret' => true];
+            }
+        }
+        return $items;
+    }
+
     private static function modeOf(string $path): ?int
     {
+        clearstatcache(true, $path); // a mode changed a moment ago must not be read from PHP's stat cache
         $p = @fileperms($path);
         return $p === false ? null : ($p & 0777);
     }

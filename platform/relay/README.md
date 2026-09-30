@@ -69,7 +69,10 @@ A lost first key is re-armed, never re-issued over the network: create `INSTALL_
 ### The installer's rules
 
 - It never prints or sends a token, key or secret: not to the screen, not in an HTTP response or header, not in an error.
-  It writes them to files (mode 0600, `data/` mode 0700) and names the files.
+  It writes them to files (mode 0600, `data/` mode 0700) and names the files. Files are created under a umask that leaves exactly
+  the mode asked for, so a host with a lax umask never has a secret readable by others, even for an instant. The SQLite database
+  (whose `-wal`, `-shm` and `-journal` files take its mode), the log and the backups are owner-only too, and the doctor checks all
+  of them on a POSIX system.
 - It refuses to write a secret where the web can read it, and it decides that in one place for the command line installer, the
   web installer and a re-key alike: `data/` inside `public/`, `data/` inside the document root the web server itself reports
   (the web installer knows it), or a canary file put in `data/` that is served over the web. **The canary probe is on by

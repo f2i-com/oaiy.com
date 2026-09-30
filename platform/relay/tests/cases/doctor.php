@@ -193,6 +193,91 @@ test('4.18.8 doctor: a secret file readable by group or other fails, a wide data
     eq('ok', doc_level(Doctor::modes($items(0666, 0777), false), 'data.modes'), 'not judged where modes mean nothing');
 });
 
+test('4.18.8 doctor: the mode check also covers the SQLite database with its -wal, -shm and -journal files, the log and the backups, and names each that is too open', function () {
+    $data = Tmp::dir('modes') . '/data';
+    $files = ['config.json', 'first-key.txt', 'admin-token.txt', 'relay.sqlite', 'relay.sqlite-wal', 'relay.sqlite-shm', 'relay.sqlite-journal', 'logs/relay.log', 'logs/relay.log.1',
+        'backups/relay-1.sqlite', 'secrets/relay.key'];
+    foreach ($files as $f) {
+        @mkdir(dirname($data . '/' . $f), 0700, true);
+        file_put_contents($data . '/' . $f, 'x');
+        @chmod($data . '/' . $f, 0644); // too open, on a system that has modes; Windows reports 0666, which is too open as well
+    }
+    $labels = array_column(Doctor::dataModeItems($data), 'label');
+    foreach ($files as $f) {
+        ok(in_array('data/' . $f, $labels, true), "data/$f is looked at");
+    }
+    $rows = Doctor::modes(Doctor::dataModeItems($data), true);
+    eq('fail', doc_level($rows, 'data.modes'));
+    foreach ($files as $f) {
+        contains('data/' . $f . ' is ', doc_msg($rows, 'data.modes'));
+    }
+    // A file that is not there is not a finding; a stray file that is not one of the relay's is not looked at.
+    unlink($data . '/relay.sqlite-shm');
+    file_put_contents($data . '/notes.txt', 'x');
+    $labels = array_column(Doctor::dataModeItems($data), 'label');
+    ok(!in_array('data/relay.sqlite-shm', $labels, true) && !in_array('data/notes.txt', $labels, true));
+});
+
+test('4.18.8 doctor (POSIX): an install under the loosest umask still leaves the database, its -wal and -shm, the log and every secret owner-only, and the doctor agrees', function () {
+    if (!inst_posix()) {
+        skip('file modes are not enforced on Windows; the same files are checked above by the list the doctor judges');
+    }
+    $old = umask(0); // a host whose umask lets everything through: every file would be 0666 without the code's own care
+    try {
+        [$root, $data] = inst_installed();
+    } finally {
+        umask($old);
+    }
+    $mode = static function (string $f) use ($data): string {
+        clearstatcache(true, $data . '/' . $f);
+        return sprintf('%04o', fileperms($data . '/' . $f) & 0777);
+    };
+    foreach (['relay.sqlite', 'config.json', 'first-key.txt', 'admin-token.txt', 'secrets/relay.key', 'secrets/admission.hmac', 'secrets/admin.json'] as $f) {
+        eq('0600', $mode($f), $f);
+    }
+    eq('0700', $mode(''), 'data/');
+    // Use the database: SQLite creates -wal and -shm now, with the mode of the database file.
+    $umask = umask(0);
+    try {
+        $cfg = Oaiy\Relay\Config::load($data);
+        $db = Oaiy\Relay\Db::open($cfg);
+        $db->write(fn($d) => $d->exec("UPDATE meta SET v = v WHERE k = 'schema_version'"));
+        $seen = 0;
+        foreach (['relay.sqlite-wal', 'relay.sqlite-shm'] as $f) {
+            if (is_file($data . '/' . $f)) { // absent when the install chose the truncate journal (a filesystem WAL is unsafe on)
+                $seen++;
+                eq('0600', $mode($f), $f);
+            }
+        }
+        ok($seen === 2 || (($cfg->toArray()['db']['journal'] ?? 'wal') !== 'wal'), 'in WAL mode both extra files exist while the database is open');
+        // The log, created by the relay under the same umask.
+        Oaiy\Relay\Log::setFile($data . '/logs/relay.log');
+        Oaiy\Relay\Log::write('info', 'test');
+        eq('0600', $mode('logs/relay.log'), 'logs/relay.log');
+        // A backup.
+        [$code, $out, $err] = inst_cli($root, 'relay.php', ['backup'], ['OAIY_RELAY_DATA' => $data]);
+        eq(0, $code, "$out $err");
+        $backups = glob($data . '/backups/*');
+        ok($backups !== [], 'the backup was made');
+        foreach ($backups as $b) {
+            clearstatcache(true, $b);
+            eq('0600', sprintf('%04o', fileperms($b) & 0777), basename($b));
+        }
+        $rows = Doctor::run(['dataDir' => $data, 'web' => false]);
+        eq('ok', doc_level($rows, 'data.modes'), doc_msg($rows, 'data.modes'));
+        // And the doctor notices when the database is opened up.
+        chmod($data . '/relay.sqlite', 0644);
+        $rows = Doctor::run(['dataDir' => $data, 'web' => false]);
+        eq('fail', doc_level($rows, 'data.modes'));
+        contains('data/relay.sqlite is 0644', doc_msg($rows, 'data.modes'));
+    } finally {
+        Oaiy\Relay\Log::setFile(null);
+        umask($umask);
+        $db = null;
+        Tmp::after('gc_collect_cycles');
+    }
+});
+
 test('4.18.8 doctor: the one-time key and the admin token left in data/ are a warning that names the file and its age, and nothing left is a pass', function () {
     eq('ok', doc_level(Doctor::leftovers([]), 'data.leftovers'));
     $rows = Doctor::leftovers([['name' => 'first-key.txt', 'age' => 90]]);

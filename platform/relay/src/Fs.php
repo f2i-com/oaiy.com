@@ -64,6 +64,25 @@ final class Fs
     }
 
     /**
+     * Make sure a file exists and only its owner can read or write it. The file is created under a umask of 0177, so it is
+     * never, even for an instant, readable by others whatever the host's umask is, and an existing one is chmod-ed. Used for
+     * files that hold data rather than secrets one by one (the SQLite database: SQLite gives its -wal, -shm and -journal
+     * files the mode of the database file, so creating that file right is what keeps the others right).
+     */
+    public static function createPrivate(string $path): void
+    {
+        if (!is_file($path)) {
+            $old = umask(0177);
+            try {
+                @touch($path);
+            } finally {
+                umask($old);
+            }
+        }
+        @chmod($path, 0600);
+    }
+
+    /**
      * A path with symlinks resolved, for a path that may not exist yet: the nearest existing ancestor is resolved and the
      * missing rest appended (a fresh install has no data/ folder yet, and that is exactly when it must be checked).
      */

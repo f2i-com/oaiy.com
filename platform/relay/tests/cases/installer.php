@@ -200,9 +200,11 @@ test('4.18.8 installer CLI: the secret files are mode 0600 and data/ is 0700 (PO
         skip('file modes are not enforced on Windows');
     }
     [, $data] = inst_installed();
-    foreach (['config.json', 'first-key.txt', 'admin-token.txt', 'secrets/relay.key', 'secrets/admission.hmac', 'secrets/admin.json'] as $f) {
+    foreach (['config.json', 'first-key.txt', 'admin-token.txt', 'relay.sqlite', 'secrets/relay.key', 'secrets/admission.hmac', 'secrets/admin.json'] as $f) {
         eq('0600', sprintf('%04o', fileperms($data . '/' . $f) & 0777), $f);
     }
+    // What is not secret stays readable by the web server user: the deny-all files.
+    eq('0644', sprintf('%04o', fileperms($data . '/.htaccess') & 0777), '.htaccess');
     eq('0700', sprintf('%04o', fileperms($data) & 0777), 'data/');
     eq('0700', sprintf('%04o', fileperms($data . '/secrets') & 0777), 'data/secrets/');
 });

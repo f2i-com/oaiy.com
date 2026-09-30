@@ -201,8 +201,11 @@ XML;
         @chmod($dataDir, 0700);
         @chmod($dataDir . '/secrets', 0700);
 
-        // The database.
+        // The database. A SQLite file is created owner-only first (SQLite then gives its -wal, -shm and -journal files the same mode).
         $config = Config::load($dataDir);
+        if ($config->driver() === 'sqlite') {
+            Fs::createPrivate($dataDir . '/relay.sqlite');
+        }
         $dbh = Db::open($config);
         $dbh->install();
         [$pk] = Crypto::signKeypairFromSeed($seed);

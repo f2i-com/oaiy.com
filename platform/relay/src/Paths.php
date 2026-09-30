@@ -73,7 +73,15 @@ final class Paths
     {
         self::ensureDir(dirname($path));
         $tmp = $path . '.' . bin2hex(random_bytes(4)) . '.tmp';
-        if (file_put_contents($tmp, $content) === false) {
+        // Created under a umask that leaves exactly $mode, so a secret is never readable by others, even for an instant,
+        // between its creation and the chmod.
+        $old = umask(~$mode & 0777);
+        try {
+            $written = file_put_contents($tmp, $content);
+        } finally {
+            umask($old);
+        }
+        if ($written === false) {
             throw new \RuntimeException('cannot write a file');
         }
         @chmod($tmp, $mode);
