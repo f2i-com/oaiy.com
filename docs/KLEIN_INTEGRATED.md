@@ -1,5 +1,8 @@
 # Native Klein integration checkpoint
 
+This is the original integration evidence. [KLEIN_LOCAL_GATES.md](KLEIN_LOCAL_GATES.md)
+records the verified merge into main and completed local build/browser follow-up.
+
 The native Rust/Candle Klein 4B implementation is integrated locally against
 published upstream `2d8e5e99323c5175de8a0d7d79f8d7238df5b56d`.
 Branch: `codex/native-flux2-klein4b-integrated-2d8e5e99` in
