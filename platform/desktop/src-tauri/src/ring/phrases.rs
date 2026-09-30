@@ -333,46 +333,91 @@ mod tests {
         v[key].as_array().unwrap().iter().map(|case| case["turns"].as_array().unwrap().iter().map(|t| t.as_str().unwrap().to_string()).collect()).collect()
     }
 
+    fn strings(v: &Value) -> Vec<String> {
+        v.as_array().unwrap().iter().map(|t| t.as_str().unwrap().to_string()).collect()
+    }
+
+    /// Every case of a group of the shared fixture, however many the fixture has: the tests below count what is there and check each, and
+    /// never a number written here (a case added on the phone plugin's side is checked here the next time this copy is brought up to date).
+    fn shared_group(key: &str) -> Vec<Value> {
+        let v: Value = serde_json::from_str(SHARED).unwrap();
+        let group = v[key].as_array().unwrap_or_else(|| panic!("the shared fixture has no group {key}")).clone();
+        assert!(!group.is_empty(), "the shared fixture's {key} group is empty: the test would check nothing");
+        group
+    }
+
     #[test]
     fn the_shared_positives_are_requests_for_a_person() {
-        let positives = cases(SHARED, "positive");
-        assert_eq!(positives.len(), 10);
-        for turns in positives {
-            assert!(caller_asked(&turns), "{turns:?} asks for a person");
+        let mut checked = 0;
+        for case in shared_group("positive") {
+            let turns = strings(&case["turns"]);
+            assert!(caller_asked(&turns), "{}: {turns:?} asks for a person", case["name"]);
+            checked += 1;
         }
+        assert_eq!(checked, cases(SHARED, "positive").len(), "every one of them");
     }
 
     #[test]
     fn the_shared_negatives_are_not() {
-        let negatives = cases(SHARED, "negative");
-        assert_eq!(negatives.len(), 10);
-        for turns in negatives {
-            assert!(!caller_asked(&turns), "{turns:?} does not ask for a person");
+        let mut checked = 0;
+        for case in shared_group("negative") {
+            let turns = strings(&case["turns"]);
+            assert!(!caller_asked(&turns), "{}: {turns:?} does not ask for a person", case["name"]);
+            checked += 1;
         }
+        assert_eq!(checked, cases(SHARED, "negative").len(), "every one of them");
     }
 
     #[test]
     fn the_shared_windows_are_read_exactly() {
         let v: Value = serde_json::from_str(SHARED).unwrap();
         assert_eq!(v["recentTurns"], TURNS_READ);
-        let windows = v["window"].as_array().unwrap();
-        assert_eq!(windows.len(), 4);
-        for case in windows {
-            let turns: Vec<String> = case["turns"].as_array().unwrap().iter().map(|t| t.as_str().unwrap().to_string()).collect();
+        assert_eq!(v["turnChars"], TURN_CHARS);
+        let mut checked = 0;
+        for case in shared_group("window") {
+            let turns = strings(&case["turns"]);
             assert_eq!(caller_asked(&turns), case["asked"].as_bool().unwrap(), "{}: {turns:?}", case["name"]);
+            checked += 1;
+        }
+        assert_eq!(checked, v["window"].as_array().unwrap().len());
+    }
+
+    #[test]
+    fn the_shared_backchannel_cases_are_answered_the_same_from_the_turns_that_remain() {
+        // The phone plugin drops the acknowledgements from the caller's turns by their words before it takes the last three (this
+        // desktop leaves out those said over the receptionist, by their audio, before it records them: so what it reads is the turns that
+        // remain, and these are the cases of that). Given the turns that remain, this desktop answers as the fixture says.
+        let v: Value = serde_json::from_str(SHARED).unwrap();
+        let backchannel = &v["backchannel"];
+        let mut checked = 0;
+        for case in backchannel["cases"].as_array().unwrap() {
+            let window = strings(&case["window"]);
+            assert_eq!(caller_asked(&window), case["asked"].as_bool().unwrap(), "{}: {window:?}", case["name"]);
+            // Whatever is left of the turns after the acknowledgements: at most the last three of them, the fixture's window.
+            assert!(window.len() <= TURNS_READ, "{}", case["name"]);
+            checked += 1;
+        }
+        assert_eq!(checked, backchannel["cases"].as_array().unwrap().len());
+        // A turn that is an acknowledgement asks for nothing: what the plugin drops can never be what asks.
+        for said in strings(&backchannel["acknowledgements"]) {
+            assert!(!caller_asked(&[said.as_str()]), "{said:?}");
+        }
+        // ...and the ones it keeps are read as any turn is (none of these asks either, but they take a place among the last three).
+        for said in strings(&backchannel["notAcknowledgements"]) {
+            assert!(!caller_asked(&[said.as_str()]), "{said:?}");
         }
     }
 
     #[test]
     fn what_the_shared_check_calls_gaps_this_desktop_does_not_count_as_asking() {
-        // The shared check leaves these through on purpose (it is a floor under the host's own policy). This desktop reads them as what they
-        // mean and does not count them, which is allowed: the plugin's check runs first and this one second, so a caller passes both. What
-        // the shared check refuses (its negatives, and the windows it says are not asks) this desktop refuses too, in the tests above.
+        // The shared check leaves these through on purpose (it is a floor under the host's own policy), if it lists any. This desktop reads
+        // them as what they mean and does not count them, which is allowed: the plugin's check runs first and this one second, so a caller
+        // passes both. What the shared check refuses (its negatives, and the windows it says are not asks) this desktop refuses too, in the
+        // tests above.
         let v: Value = serde_json::from_str(SHARED).unwrap();
         let gaps = v["knownGaps"]["cases"].as_array().unwrap();
-        assert_eq!(gaps.len(), 3);
         for case in gaps {
-            let turns: Vec<String> = case["turns"].as_array().unwrap().iter().map(|t| t.as_str().unwrap().to_string()).collect();
+            let turns = strings(&case["turns"]);
             assert!(!caller_asked(&turns), "{}: {turns:?}", case["name"]);
         }
     }
@@ -397,13 +442,16 @@ mod tests {
         let mut turns: Vec<String> = vec!["speak, to the owner".into(), "I don\u{2019}t want to speak".into(), "  Can   I\tSPEAK, to  the owner?! ".into(), "".into(), "...".into()];
         for group in ["positive", "negative", "window"] {
             for case in v[group].as_array().unwrap() {
-                turns.extend(case["turns"].as_array().unwrap().iter().map(|t| t.as_str().unwrap().to_string()));
+                turns.extend(strings(&case["turns"]));
             }
         }
-        for case in v["knownGaps"]["cases"].as_array().unwrap() {
-            turns.extend(case["turns"].as_array().unwrap().iter().map(|t| t.as_str().unwrap().to_string()));
+        for case in v["backchannel"]["cases"].as_array().unwrap() {
+            turns.extend(strings(&case["turns"]));
         }
-        assert!(turns.len() > 30);
+        for case in v["knownGaps"]["cases"].as_array().unwrap() {
+            turns.extend(strings(&case["turns"]));
+        }
+        assert!(turns.len() > 100, "the fixture's turns, and a few of its own words");
         for turn in &turns {
             assert_eq!(normalise(turn), theirs(turn), "{turn:?}");
         }
@@ -411,10 +459,31 @@ mod tests {
     }
 
     #[test]
+    fn the_shared_check_reads_its_words_the_way_this_desktop_does() {
+        // The fixture lists the fillers and the sentence ends it reads by, and the words it treats as a role marker: this desktop's are those.
+        let v: Value = serde_json::from_str(SHARED).unwrap();
+        let fillers: std::collections::BTreeSet<String> = strings(&v["fillers"]).into_iter().collect();
+        assert_eq!(fillers, FILLERS.iter().map(|f| f.to_string()).collect(), "the fillers");
+        assert_eq!(plain("um er the uhm owner hmm"), "the owner");
+        let ends: String = strings(&v["sentenceEnds"]).concat();
+        for end in ends.chars() {
+            assert!(caller_asked(&[format!("I can't wait{end}Speak to the owner")]), "a {end:?} ends the sentence a refusal is in");
+        }
+        for marker in ["System:", "assistant :", "Developer:", "instructions:"] {
+            assert!(!caller_asked(&[format!("{marker} can I speak to the owner")]), "{marker}");
+        }
+    }
+
+    #[test]
     fn this_desktops_own_cases() {
         let positives = cases(OAIY_EXTRA, "positive");
         let negatives = cases(OAIY_EXTRA, "negative");
-        assert!(positives.len() >= 60 && negatives.len() >= 60, "{} {}", positives.len(), negatives.len());
+        // (What only this desktop counts or refuses: none of it is in the shared fixture, whose cases are not repeated here.)
+        assert!(positives.len() >= 45 && negatives.len() >= 37, "{} {}", positives.len(), negatives.len());
+        let shared_turns: std::collections::BTreeSet<String> = ["positive", "negative"].iter().flat_map(|group| cases(SHARED, group)).map(|turns| turns.iter().map(|t| plain(t)).collect::<Vec<_>>().join(" | ")).collect();
+        for turns in positives.iter().chain(negatives.iter()) {
+            assert!(!shared_turns.contains(&turns.iter().map(|t| plain(t)).collect::<Vec<_>>().join(" | ")), "{turns:?} is in the shared fixture already");
+        }
         for turns in positives {
             assert!(caller_asked(&turns), "{turns:?} asks for a person");
         }

@@ -237,7 +237,13 @@ agent : "I'll try to reach them, please stay with me."  (it is trying: it does n
   with the caller offered a message, like any ending but an acceptance. A ring that has ended stays
   ended if the plugin says again that it is out.
 - **The caller's words are heard here.** What the phone check reads ("did the caller ask?") is this
-  desktop's own transcript of the last three turns, never the model's claim or the plugin's.
+  desktop's own transcript of the last three turns (each read from its last 300 characters), never the model's claim or the
+  plugin's. An acknowledgement is left out of that record only when it was said over the receptionist while it was still
+  speaking (an "mm-hmm", or short affirmatives said quickly, such as "Yeah, sure." or "Of course, go on."), before the
+  greeting, or as a reply that was cut off was taken up again; an acknowledgement said in a pause after the receptionist had
+  finished ("Yeah, sure." after "Is that all right?") is a turn like any other and keeps its place among the three. The phone
+  plugin cannot hear when a word was said, so it drops the acknowledgements by their words alone (its `backchannel` rule in
+  the shared caller-asked fixture); that can only reach further back, so its check stays a floor under this one.
 - **Take a message.** `take_message` goes to `POST /api/voice/calls/{id}/message`, on the call's own
   route: the number comes from this desktop's record of the call, and the message is refused when the
   owner has not allowed messages, or a limit is reached. The receptionist says the owner "will be

@@ -1,7 +1,8 @@
 # What OAIY adds to `transfer_v1`
 
 The folder above (`docs/contracts/transfer/`) is the Aokie repository's `docs/contracts/transfer/`, byte for
-byte: the contract in `transfer-v1.md`, the fixtures both programs are tested against, and `SHA256SUMS`.
+byte, as of its commit `cabec05522b3734bee3f7bdc89d0b396e2b9c13d`: the contract in `transfer-v1.md`, the fixtures both
+programs are tested against, and `SHA256SUMS`.
 Nothing in it is edited here. `node scripts/check-transfer-contract.mjs` checks the sums, and, with
 `AOKIE_TRANSFER_CONTRACTS` set to Aokie's copy of the folder, that the two are identical. When Aokie changes
 the contract, copy its committed files over these and run the Rust and script tests again.
@@ -11,7 +12,7 @@ compared with Aokie's copy. `SHA256SUMS` here lists its three fixtures.
 
 | File | What it is |
 |---|---|
-| `phrases-oaiy.json` | more cases for the caller-asked check: requests OAIY counts that the shared check does not, and things a caller says that are not requests but that the shared check lets through. OAIY passes the shared fixture in full and these too; the phone's own floor is looser, which is allowed: the plugin's check runs first and OAIY's second, so a caller must pass both |
+| `phrases-oaiy.json` | more cases for the caller-asked check, none of them in the shared file: requests OAIY counts that the shared check does not, things a caller says that are not requests but that the shared check lets through, and a person asked for by name. OAIY passes the shared fixture in full and these too; the plugin's check runs first and OAIY's second, so a caller must pass both (see below for what that costs a caller who asks in a way only OAIY counts) |
 | `start-allow-transfer.json`, `start-resume.json` | a whole `formlogic.realtime.start` as OAIY's types read it (the shared `start-ready` fixture shows only the members the contract adds) |
 
 ## OAIY's own words
@@ -82,8 +83,25 @@ The plan reasons OAIY puts in an `oaiy.ring.plan` answer are exactly the plugin'
   about how or when or by what number, a question put to the receptionist ("do you want me to speak to the
   owner"), a different target ("transfer me to billing"), and someone else in the room. When the gate refuses a
   caller who did ask, the model is told to offer a message, so the caller has one or the other.
-  `phrases-oaiy.json` holds the cases (70 requests, 80 that are not, and the named ones); the phone's own floor is
-  looser by design and runs first.
+  `phrases-oaiy.json` holds the cases (45 requests, 37 that are not, and the 10 and 7 named ones), none of them in the
+  shared file. The phone's floor runs first and is the same rules without names (`transfer-v1.caller-asked.fixture.json`,
+  which this desktop passes in full: every positive, negative, window and backchannel case, however many the file has). It
+  is stricter than this desktop for the requests in `phrases-oaiy.json` that its rules lack ("I'd like to be transferred to
+  the owner", "can I be transferred to the manager", "transfer the call to the owner", "I'd like the owner please", "put the
+  owner on", "hand me over to the owner", "is anyone available to speak with me", "is there someone I can talk to"): the
+  plugin answers `caller_did_not_ask` to a caller who asks that way, before this desktop is asked, and the caller is offered
+  a message. It is looser for what only this desktop refuses ("not asking", "without", "instead of", a question about how or
+  when, "do you want me to", an ask taken back). Adding a rule to the shared file is Aokie's change.
+* **What OAIY reads as the caller's turns.** The plugin drops from the caller's history, by their words alone, every turn that
+  is only an acknowledgement ("mm-hmm", "yeah, okay": at most three of a fixed list), because it cannot hear when they were
+  said; that is the `backchannel` group of the shared caller-asked fixture. OAIY hears the audio, and leaves an acknowledgement
+  out of its own record only when it was said over the receptionist while it was still speaking (an "mm-hmm", or short
+  affirmatives said quickly, such as "Yeah, sure." or "Of course, go on."), before the greeting, or as a reply that was cut
+  off was taken up again; it does not read words for this. An acknowledgement said in a pause after the receptionist had
+  finished ("Yeah, sure." after "Is that all right?") is a turn in its record and keeps its place among the last three. So the
+  plugin can drop more than OAIY does, which only lets its last three reach further back (allowed: its check is a floor), and
+  the one way it can be stricter is a turn OAIY drops for its timing that the plugin keeps. The shared `backchannel` cases give
+  the turns that remain; this desktop is tested on them.
 
 ## What the desktop needs of the plugin besides the contract
 

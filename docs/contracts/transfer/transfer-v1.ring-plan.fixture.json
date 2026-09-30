@@ -89,7 +89,7 @@
         "turn 4"
       ]
     },
-    "paramsRules": "At most the last three caller turns, each cut to 300 characters; callerNumber is left out when unknown. The turns never leave the machine: the host runs the phrase checks on them.",
+    "paramsRules": "At most the last three caller turns that are not only acknowledgements of the AI (\"mm-hmm\", \"yeah, okay\": see backchannel in the caller-asked fixture), each cut to its last 300 characters (a turn is read from its end); callerNumber is left out when unknown. The turns never leave the machine: the host runs the phrase checks on them.",
     "results": [
       {
         "name": "ring the planned phone",
