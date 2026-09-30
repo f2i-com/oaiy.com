@@ -11,15 +11,18 @@
 //!   leaves none with assertions on, and one in an optimised build.
 //! - **the output**, the derived key. A function that returns a key **by value** leaves a copy of it in the frame that made it, once that frame has returned; nothing inside the
 //!   function can wipe the frame it is still running in. The floor is what a function with no cryptography in it leaves when it builds a `Secret` and returns it through a
-//!   `Result` (`plain_return`, below): none in an optimised build and one in a build with no optimisation. The `*_into(&mut Secret)` variants write the key where the caller says and
-//!   must leave **none**, in every configuration; the by-value functions are allowed one more than the floor, and the test prints every count. The keys that are **made at
-//!   random** (`Secret::random`, the `generate` functions) come back by value too, and are allowed two more than the floor.
+//!   `Result` (`plain_return`, below), through the harness's own frame (`deep`): measured, 4 with no optimisation (with or without assertions) and 1 in an optimised build. The
+//!   `*_into(&mut Secret)` variants write the key where the caller says and must leave **none**, in every configuration; the by-value functions are allowed one more than the
+//!   floor, and the test prints every count (3 at most with no optimisation, 2 in an optimised build). The keys that are **made at random** (`Secret::random`, the
+//!   `generate` functions) come back by value too, and are allowed two more than the floor.
 //!
 //! The configurations this is run in (see the README): `cargo test` (dev: no optimisation, assertions on), `cargo test --release` (optimised), and
 //! `cargo test --profile vault-probe` (no optimisation **and no assertions**, the one that `debug_assertions` used to be mistaken for). The counts of each are printed with `--nocapture`.
 //!
 //! The probe: a function that calls the code under test is followed, in the same frame, by one whose local array covers the stack below; a scan of that array (reads of stack
-//! memory that nothing has written since, which is the point) counts the places where the key's 32 bytes still are. Controls: a callee that deliberately leaves a copy is
+//! memory that nothing has written since, which is the point) counts the places where the key's 32 bytes still are. Two things write on the stack where the code has just been, and
+//! the probe keeps out of the way of both: the scan's own frame (the code runs at eight depths and the largest count is kept) and the caller's own calls after the code returns, such as the drop of the output
+//! (the code runs under [`deep`], a frame of 1.5 KiB that these land in). Controls: a callee that deliberately leaves a copy is
 //! found (positive), a callee that does not is not (negative), so the scan is neither blind nor seeing things.
 //!
 //! This is the only test in this binary. The `unsafe` is test code: the read of bytes of uninitialised stack, which is undefined in Rust's abstract machine and is what every
@@ -69,12 +72,27 @@ fn scrub() {
 /// address, saved registers and small locals) are written on the stack right where the frames of the code that has just returned were: a copy that sits in the nearest few hundred
 /// bytes is overwritten by the scan itself, and one that lies just beyond is seen. A probe that ran the code at one depth saw a copy or not by the luck of that offset (a mutant that
 /// copied a derived key through a second local in `kdf::derive_into` was seen at one depth and not at another). Running at eight depths moves the code's frames relative to the scan's,
-/// and a copy is found at the depths where it is not under the scan''s own frame. The controls show that a small frame right under the caller is found this way.
+/// and a copy is found at the depths where it is not under the scan's own frame. The controls show that a small frame right under the caller is found this way.
 #[inline(never)]
 fn padded<const N: usize>(f: &mut dyn FnMut()) {
     let pad = [0u8; N];
     std::hint::black_box(&pad);
     f();
+}
+
+/// **Why the code under test is called through [`deep`].** The other thing that writes where the code under test has just been is the caller itself: a closure that calls a function and then
+/// drops the `Secret` it wrote into, or unwraps the `Result`, runs those calls in frames that start at the very place where the callee's frame was, and overwrites its nearest few hundred
+/// bytes. This is what hid a copy of the derived key left in the frame of an `_into` function (mutants S03 to S06, S11 and S12, which wrote the key through a plain array or a by-value
+/// key before copying it to `out`): the probe that ran the code at several depths but let the closure's own drop and unwrap follow it found 0. `deep` puts a frame of 1.5 KiB between the
+/// closure and the code, so that what the closure does afterwards lands in that frame and not on the code's.
+#[inline(never)]
+fn deep<R>(f: impl FnOnce() -> R) -> R {
+    let pad = [0u8; 1536];
+    std::hint::black_box(&pad);
+    let result = f();
+    // the pad is used again after the call, so that the call is not made as a jump that drops the frame first
+    std::hint::black_box(&pad);
+    result
 }
 
 /// How many depths: the index of [`call_at_depth`].
@@ -123,6 +141,20 @@ fn leaves_a_small_copy(key: &[u8; 32]) {
     std::hint::black_box(&copy);
 }
 
+/// The positive control of the shape that the rows have: a callee under [`deep`] that leaves a copy, followed by the things a caller does (an unwrap, the drop of a `Secret`). It is what the
+/// probe could not see before `deep`: the copy was found when nothing followed the call and was gone when the drop of the output did.
+#[inline(never)]
+fn leaves_a_copy_and_the_caller_drops_its_output(key: &[u8; 32]) {
+    let mut out = Secret::<32>::zeroed();
+    let result: Result<(), oaiy_crypto::Error> = deep(|| {
+        leaves_a_small_copy(key);
+        Ok(())
+    });
+    out.expose_mut()[0] = 1;
+    result.unwrap();
+    drop(out);
+}
+
 /// The floor for a by-value result: no cryptography at all, a `Secret` built from a value and returned by move through `Result`, unwrapped and dropped, as any caller of a
 /// function that returns a key does.
 #[inline(never)]
@@ -131,6 +163,11 @@ fn plain_return(x: &[u8; 32]) -> Result<Secret<32>, oaiy_crypto::Error> {
     let secret = Secret::new(out);
     zeroize::Zeroize::zeroize(&mut out);
     Ok(secret)
+}
+
+#[inline(never)]
+fn bare_return(x: &[u8; 32]) -> Secret<32> {
+    Secret::new(*x)
 }
 
 /// Like `run_and_scan`, for a function that makes a key at random: the needle is what it made, so `f` returns a copy of it **on the heap** (a copy in the frame would be the test's own).
@@ -192,8 +229,17 @@ fn no_primitive_leaves_its_key_in_the_dead_stack_and_the_into_variants_leave_no_
     );
     assert_eq!(negative, 0, "control: a callee that leaves none finds none");
     // the floor for a key that comes back by value: what a function with no cryptography in it leaves
-    let floor = run_and_scan(&[&d_backup], || drop(plain_return(&d_backup).unwrap()))[0];
-    let controls = (positive, positive_small, floor);
+    let floor = run_and_scan(&[&d_backup], || drop(deep(|| plain_return(&d_backup)).unwrap()))[0];
+    // the control of the shape that the rows have: a copy left by a callee, then the things a caller does after the call
+    let positive_shaped = run_and_scan(&[&master_bytes], || leaves_a_copy_and_the_caller_drops_its_output(master.expose()))[0];
+    assert!(
+        positive_shaped >= 1,
+        "control: a copy left under `deep`, followed by an unwrap and the drop of the output, is found ({positive_shaped})"
+    );
+    // the floor for a key object that is returned by value and is not in a `Result` (Ed25519 `from_seed` returns one): what a function with no cryptography in it leaves when its result passes
+    // through `deep` and is moved out. Measured by the same closure shape as the row that uses it.
+    let floor_bare = run_and_scan(&[&master_bytes], || drop(deep(|| bare_return(&master_bytes))))[0];
+    let controls = (positive, positive_small, positive_shaped, floor, floor_bare);
     {
         let mut row = |name: &'static str, input: &[u8], output: &[u8], mut f: Box<dyn FnMut() + '_>| {
             let counts = run_and_scan(&[input, output], &mut f);
@@ -202,21 +248,21 @@ fn no_primitive_leaves_its_key_in_the_dead_stack_and_the_into_variants_leave_no_
         };
 
         // the keys that come back: by value, and in place
-        row("kdf::derive", &master_bytes, &d_backup, Box::new(|| drop(kdf::derive(&master, Purpose::BackupRecipient).unwrap())));
+        row("kdf::derive", &master_bytes, &d_backup, Box::new(|| drop(deep(|| kdf::derive(&master, Purpose::BackupRecipient)).unwrap())));
         row(
             "kdf::derive_into",
             &master_bytes,
             &d_backup,
             Box::new(|| {
                 let mut out = Secret::zeroed();
-                kdf::derive_into(&master, Purpose::BackupRecipient, &mut out).unwrap();
+                deep(|| kdf::derive_into(&master, Purpose::BackupRecipient, &mut out)).unwrap();
             }),
         );
         row(
             "kdf::hkdf_sha256_secret",
             &master_bytes,
             &d_hkdf,
-            Box::new(|| drop(kdf::hkdf_sha256_secret::<32>(master.expose(), Some(b"salt"), b"info").unwrap())),
+            Box::new(|| drop(deep(|| kdf::hkdf_sha256_secret::<32>(master.expose(), Some(b"salt"), b"info")).unwrap())),
         );
         row(
             "kdf::hkdf_sha256_secret_into",
@@ -224,54 +270,54 @@ fn no_primitive_leaves_its_key_in_the_dead_stack_and_the_into_variants_leave_no_
             &d_hkdf,
             Box::new(|| {
                 let mut out = Secret::<32>::zeroed();
-                kdf::hkdf_sha256_secret_into(master.expose(), Some(b"salt"), b"info", &mut out).unwrap();
+                deep(|| kdf::hkdf_sha256_secret_into(master.expose(), Some(b"salt"), b"info", &mut out)).unwrap();
             }),
         );
-        row("kit.wrap_key", &master_bytes, &d_kit, Box::new(|| drop(kit.wrap_key().unwrap())));
+        row("kit.wrap_key", &master_bytes, &d_kit, Box::new(|| drop(deep(|| kit.wrap_key()).unwrap())));
         row(
             "kit.wrap_key_into",
             &master_bytes,
             &d_kit,
             Box::new(|| {
                 let mut out = Secret::zeroed();
-                kit.wrap_key_into(&mut out).unwrap();
+                deep(|| kit.wrap_key_into(&mut out)).unwrap();
             }),
         );
-        row("x25519 diffie_hellman", &master_bytes, &d_dh, Box::new(|| drop(x_secret.diffie_hellman(&x_peer).unwrap())));
+        row("x25519 diffie_hellman", &master_bytes, &d_dh, Box::new(|| drop(deep(|| x_secret.diffie_hellman(&x_peer)).unwrap())));
         row(
             "x25519 diffie_hellman_into",
             &master_bytes,
             &d_dh,
             Box::new(|| {
                 let mut out = Secret::zeroed();
-                x_secret.diffie_hellman_into(&x_peer, &mut out).unwrap();
+                deep(|| x_secret.diffie_hellman_into(&x_peer, &mut out)).unwrap();
             }),
         );
-        row("aead::unwrap_key", &master_bytes, &inner_bytes, Box::new(|| drop(aead::unwrap_key(&master, &aad, &wrapped).unwrap())));
+        row("aead::unwrap_key", &master_bytes, &inner_bytes, Box::new(|| drop(deep(|| aead::unwrap_key(&master, &aad, &wrapped)).unwrap())));
         row(
             "aead::unwrap_key_into",
             &master_bytes,
             &inner_bytes,
             Box::new(|| {
                 let mut out = Secret::zeroed();
-                aead::unwrap_key_into(&master, &aad, &wrapped, &mut out).unwrap();
+                deep(|| aead::unwrap_key_into(&master, &aad, &wrapped, &mut out)).unwrap();
             }),
         );
-        row("bip39::wrap_key", &[0x5a; 16], &d_phrase, Box::new(|| drop(bip39::wrap_key(&entropy, &salt, 3, argon::MEM_MIN).unwrap())));
+        row("bip39::wrap_key", &[0x5a; 16], &d_phrase, Box::new(|| drop(deep(|| bip39::wrap_key(&entropy, &salt, 3, argon::MEM_MIN)).unwrap())));
         row(
             "bip39::wrap_key_into",
             &[0x5a; 16],
             &d_phrase,
             Box::new(|| {
                 let mut out = Secret::zeroed();
-                bip39::wrap_key_into(&entropy, &salt, 3, argon::MEM_MIN, &mut out).unwrap();
+                deep(|| bip39::wrap_key_into(&entropy, &salt, 3, argon::MEM_MIN, &mut out)).unwrap();
             }),
         );
         row(
             "argon2id13 (the key as the password)",
             &master_bytes,
             &d_ikm,
-            Box::new(|| drop(argon::argon2id13(&master_bytes, &salt, 3, argon::MEM_MIN).unwrap())),
+            Box::new(|| drop(deep(|| argon::argon2id13(&master_bytes, &salt, 3, argon::MEM_MIN)).unwrap())),
         );
 
         // the keys that go in, and nothing comes back that is a key
@@ -281,7 +327,7 @@ fn no_primitive_leaves_its_key_in_the_dead_stack_and_the_into_variants_leave_no_
             &[0xA5; 32], // the output is the caller's own array: not counted
             Box::new(|| {
                 let mut out = [0u8; 64];
-                kdf::derive_subkey_into(&master, 1, &context, &mut out).unwrap();
+                deep(|| kdf::derive_subkey_into(&master, 1, &context, &mut out)).unwrap();
             }),
         );
         row(
@@ -290,7 +336,7 @@ fn no_primitive_leaves_its_key_in_the_dead_stack_and_the_into_variants_leave_no_
             &[0xA5; 32], // the output is the caller's own array: not counted
             Box::new(|| {
                 let mut out = [0u8; 64];
-                kdf::hkdf_sha256(master.expose(), Some(b"salt"), b"info", &mut out).unwrap();
+                deep(|| kdf::hkdf_sha256(master.expose(), Some(b"salt"), b"info", &mut out)).unwrap();
             }),
         );
         row(
@@ -298,7 +344,7 @@ fn no_primitive_leaves_its_key_in_the_dead_stack_and_the_into_variants_leave_no_
             &master_bytes,
             &master_bytes,
             Box::new(|| {
-                let _ = kdf::hmac_sha256(master.expose(), b"msg").unwrap();
+                let _ = deep(|| kdf::hmac_sha256(master.expose(), b"msg")).unwrap();
             }),
         );
         row(
@@ -306,7 +352,7 @@ fn no_primitive_leaves_its_key_in_the_dead_stack_and_the_into_variants_leave_no_
             &master_bytes,
             &master_bytes,
             Box::new(|| {
-                let _ = std::hint::black_box(kdf::hmac_sha256_verify(master.expose(), b"msg", &[0u8; 32]));
+                let _ = std::hint::black_box(deep(|| kdf::hmac_sha256_verify(master.expose(), b"msg", &[0u8; 32])));
             }),
         );
         row(
@@ -314,7 +360,7 @@ fn no_primitive_leaves_its_key_in_the_dead_stack_and_the_into_variants_leave_no_
             &master_bytes,
             &master_bytes,
             Box::new(|| {
-                let key = SigningKey::from_seed(KeyRole::Hazmat, &seed);
+                let key = deep(|| SigningKey::from_seed(KeyRole::Hazmat, &seed));
                 std::hint::black_box(&key);
             }),
         );
@@ -323,8 +369,8 @@ fn no_primitive_leaves_its_key_in_the_dead_stack_and_the_into_variants_leave_no_
             &master_bytes,
             &master_bytes,
             Box::new(|| {
-                let key = SigningKey::from_seed(KeyRole::Hazmat, &seed);
-                let _ = key.sign_raw(b"message").unwrap();
+                let key = deep(|| SigningKey::from_seed(KeyRole::Hazmat, &seed));
+                let _ = deep(|| key.sign_raw(b"message")).unwrap();
             }),
         );
         row(
@@ -332,11 +378,11 @@ fn no_primitive_leaves_its_key_in_the_dead_stack_and_the_into_variants_leave_no_
             &master_bytes,
             &master_bytes,
             Box::new(|| {
-                let w = aead::wrap(&master, &aad, b"a payload").unwrap();
-                let _ = aead::unwrap(&master, &aad, &w).unwrap();
+                let w = deep(|| aead::wrap(&master, &aad, b"a payload")).unwrap();
+                let _ = deep(|| aead::unwrap(&master, &aad, &w)).unwrap();
             }),
         );
-        row("sealbox open", &master_bytes, &master_bytes, Box::new(|| drop(sealbox::open(&box_key, &box_bytes).unwrap())));
+        row("sealbox open", &master_bytes, &master_bytes, Box::new(|| drop(deep(|| sealbox::open(&box_key, &box_bytes)).unwrap())));
     }
     // the keys that are made at random: by value, so held to the floor like the rest
     let mut made: Vec<(&str, usize)> = Vec::new();
@@ -346,23 +392,26 @@ fn no_primitive_leaves_its_key_in_the_dead_stack_and_the_into_variants_leave_no_
             println!("ZEROIZE_STACK {configuration}: {name}: made={count}");
             made.push((name, count));
         };
-        one("Secret::random", &mut || Secret::<32>::random().unwrap().expose().to_vec());
-        one("x25519 SecretKey::generate", &mut || SecretKey::generate().unwrap().to_secret().expose().to_vec());
-        one("ed25519 SigningKey::generate", &mut || SigningKey::generate(KeyRole::Hazmat).unwrap().seed().expose().to_vec());
-        one("bip39 Entropy::random", &mut || Entropy::random().unwrap().expose().to_vec());
-        one("RecoveryKit::generate", &mut || RecoveryKit::generate().unwrap().key().expose().to_vec());
+        one("Secret::random", &mut || deep(Secret::<32>::random).unwrap().expose().to_vec());
+        one("x25519 SecretKey::generate", &mut || deep(SecretKey::generate).unwrap().to_secret().expose().to_vec());
+        one("ed25519 SigningKey::generate", &mut || deep(|| SigningKey::generate(KeyRole::Hazmat)).unwrap().seed().expose().to_vec());
+        one("bip39 Entropy::random", &mut || deep(Entropy::random).unwrap().expose().to_vec());
+        one("RecoveryKit::generate", &mut || deep(RecoveryKit::generate).unwrap().key().expose().to_vec());
     }
-    println!("ZEROIZE_STACK {configuration}: controls (large frame, small frame, by-value floor) {controls:?}");
+    println!(
+        "ZEROIZE_STACK {configuration}: controls (large frame, small frame, small frame then the caller's own calls, by-value floor with a Result, by-value floor) {controls:?}"
+    );
 
     // what is asserted
     let mut failures: Vec<String> = Vec::new();
     for row in &table {
         let is_into = row.name.ends_with("_into");
-        // the input: never, except that Ed25519 `from_seed` **returns** a key that is the seed (the dalek key holds it), by value. Measured with the scrub after the expansion:
-        // none with assertions on and none with no optimisation, and **one** in an optimised build (the copy that the frame of `from_seed` keeps when it moves the key out).
-        // Without the scrub (mutant N06) it is one more in an optimised build and one in a build with assertions on: over the allowance in every configuration, so the
-        // debug suite kills it too, not only the release lane (review low 1).
-        let input_allowed = if row.name.starts_with("ed25519 from_seed") { usize::from(!cfg!(debug_assertions)) } else { 0 };
+        // the input: never, except that Ed25519 `from_seed` **returns** a key that is the seed (the dalek key holds it), by value, so that one copy is the price of a by-value
+        // return: with no optimisation it is the harness's own (the move of the result out of `deep`, which `bare_return` leaves too: `floor_bare` is 1 there), and in an optimised
+        // build, where the harness leaves none (`floor_bare` is 0), it is the one that the frame of `from_seed` keeps when it moves the key out. At most one in every
+        // configuration, then. Without the scrub after the expansion (mutant N06) there is at least one more in each, so the debug suite kills it too, not only the release lane
+        // (review low 1).
+        let input_allowed = if row.name.starts_with("ed25519 from_seed") { floor_bare.max(1) } else { 0 };
         if row.input > input_allowed {
             failures.push(format!("{}: {} copies of the input key", row.name, row.input));
         }
