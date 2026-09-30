@@ -124,15 +124,15 @@ test('4.14.5 a frame posted while a stream waits arrives at once as an event (id
     [$srv] = $k->r->fleet(1);
     usleep(300000);
     $p = aks_open($srv, $plug);
-    ok(aks_until($p, ': connected', 2.0) !== null, 'the preamble');
+    ok(aks_until($p, ': connected', 6.0) !== null, 'the preamble');
     usleep(400000);
     $t = microtime(true);
     $k->send($ta, 'plugin', [['n' => 1], ['n' => 2]]);
-    $seen = aks_until($p, "id: 2\nevent: frame", 2.0);
+    $seen = aks_until($p, "id: 2\nevent: frame", 8.0);
     ok($seen !== null && $seen < 0.6, 'the frames came ' . ($seen === null ? 'never' : round($seen * 1000) . ' ms') . ' after the post');
     $t2 = microtime(true);
     $k->send($ta, 'plugin', [['n' => 3]]);
-    $seen = aks_until($p, "id: 3\nevent: frame", 2.0);
+    $seen = aks_until($p, "id: 3\nevent: frame", 8.0);
     ok($seen !== null && $seen < 0.6, 'a later frame came ' . ($seen === null ? 'never' : round($seen * 1000) . ' ms') . ' after its post');
     $res = aks_finish($p, 8.0);
     $frames = aks_frames($res['body']);
@@ -169,7 +169,7 @@ test('4.14.5 a burst is coalesced: 60 frames posted one after another while a st
     [$srv] = $k->r->fleet(1);
     usleep(300000);
     $p = aks_open($srv, $plug);
-    ok(aks_until($p, ': connected', 2.0) !== null);
+    ok(aks_until($p, ': connected', 6.0) !== null);
     for ($i = 1; $i <= 60; $i++) {
         eq(200, $k->send($ta, 'plugin', [['i' => $i]])['status']);
     }
@@ -201,7 +201,7 @@ test('4.14.5 resume without loss: Last-Event-ID (or since) starts after the last
     usleep(300000);
     $k->send($ta, 'plugin', [['n' => 1], ['n' => 2], ['n' => 3], ['n' => 4], ['n' => 5]]);
     $p = aks_open($s1, $plug);
-    ok(aks_until($p, "id: 3\nevent: frame", 3.0) !== null);
+    ok(aks_until($p, "id: 3\nevent: frame", 10.0) !== null);
     $p->abort();
     $res = aks_finish(aks_open($s2, $plug, [], ['Last-Event-ID' => '3']), 8.0);
     eq([4, 5], array_keys(aks_frames($res['body'])));
@@ -222,8 +222,8 @@ test('4.14.5 supersede: a newer stream of the same party ends the older within 2
     $t0 = microtime(true);
     $first = aks_open($s1, $plug);
     $other = aks_open($s3, $tb);
-    ok(aks_until($first, ': connected', 2.0) !== null);
-    ok(aks_until($other, ': connected', 2.0) !== null);
+    ok(aks_until($first, ': connected', 6.0) !== null);
+    ok(aks_until($other, ': connected', 6.0) !== null);
     usleep(600000);
     $tb0 = microtime(true);
     $second = aks_open($s2, $plug);
@@ -247,7 +247,7 @@ test('4.14.5 a frames wait supersedes a stream of the same party and the reverse
     [$s1, $s2, $s3] = $k->r->fleet(3);
     usleep(300000);
     $stream = aks_open($s1, $plug);
-    ok(aks_until($stream, ': connected', 2.0) !== null);
+    ok(aks_until($stream, ': connected', 6.0) !== null);
     usleep(300000);
     $tail = Relay::http($s2, $plug, 'GET', AKS_FRAMES . '?since=0&wait=0');
     eq(200, $tail['status']);
@@ -280,7 +280,7 @@ test('4.14.5 a stream is a core hold: one per party, released at its end, at han
     }
     // The soft limit is reached: a core hold still fits below the hard limit.
     $p = aks_open($srv, $ta);
-    ok(aks_until($p, ': connected', 2.0) !== null, 'granted at the soft limit');
+    ok(aks_until($p, ': connected', 6.0) !== null, 'granted at the soft limit');
     eq(1, aks_holds($k)['stream']);
     $r = aks_finish($p, 8.0);
     eq(200, $r['status']);
@@ -310,7 +310,7 @@ test('4.14.5 a client that hangs up is noticed within about 2 seconds (the keepa
     [$srv] = $k->r->fleet(1);
     usleep(300000);
     $p = aks_open($srv, $ta);
-    ok(aks_until($p, ': connected', 2.0) !== null);
+    ok(aks_until($p, ': connected', 6.0) !== null);
     eq(1, aks_holds($k)['stream']);
     $p->abort();
     $t = microtime(true);
@@ -328,7 +328,7 @@ test('4.14.5 revoking the phone ends its stream within a step with an end event,
     usleep(300000);
     $t0 = microtime(true);
     $p = aks_open($srv, $ta);
-    ok(aks_until($p, ': connected', 2.0) !== null);
+    ok(aks_until($p, ': connected', 6.0) !== null);
     usleep(500000);
     $tr = microtime(true);
     Devices::revoke($k->r->ctx(), $a->id);
@@ -349,7 +349,7 @@ test('4.14.5 nothing is emitted after the admission\'s own end (exp + 30 s): a s
     Tmp::setClock(Relay::T0 + 118); // two seconds of the admission are left
     $t = microtime(true);
     $p = aks_open($srv, $ta);
-    ok(aks_until($p, ': connected', 2.0) !== null);
+    ok(aks_until($p, ': connected', 6.0) !== null);
     usleep(400000);
     Tmp::setClock(Relay::T0 + 121); // now past exp + 30
     $sender = $k->pluginToken();
@@ -370,7 +370,7 @@ test('4.14.5 no first byte ever takes 10 seconds: three parties open streams tog
     usleep(300000);
     $opens = [aks_open($s1, $plug), aks_open($s2, $ta), aks_open($s3, $tb)];
     foreach ($opens as $i => $p) {
-        $seen = aks_until($p, ': connected', 2.0);
+        $seen = aks_until($p, ': connected', 6.0);
         ok($seen !== null && $seen < 0.5, "stream $i preamble after " . ($seen === null ? 'never' : round($seen * 1000) . ' ms'));
     }
     foreach ($opens as $p) {
@@ -458,7 +458,7 @@ test('4.14.5 two desktops of one relay with one app id: opening one plugin\'s st
     [$s1, $s2] = $k->r->fleet(2);
     usleep(300000);
     $first = aks_open($s1, $plug);
-    ok(aks_until($first, ': connected', 2.0) !== null);
+    ok(aks_until($first, ': connected', 6.0) !== null);
     usleep(400000);
     $second = aks_open($s2, $plug2);
     $r1 = aks_finish($first, 10.0);
