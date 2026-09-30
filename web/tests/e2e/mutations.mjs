@@ -116,6 +116,48 @@ const MUTATIONS = [
     files: { 'web/providers/src/store.ts': [{ find: "if (by !== undefined && (record.model ?? '') !== model && !(Array.isArray(known) && known.includes(model))) return 'unknown-model' as const;", replace: '' }] },
     caught: ['an app may choose only a model the provider listed', 'a model no provider listed is refused'],
   },
+  {
+    name: 'F5 no cap on operations being worked on',
+    what: 'a further operation is queued behind the others, as before the fix',
+    tests: ['tests/unit/flood.test.mjs'],
+    files: { 'web/providers/src/protocol.ts': [{ find: "      if (request.op !== 'fetch' && request.op !== 'abort' && pending >= MAX_PENDING_OPS) return 'pending';\n", replace: '' }] },
+    caught: ['a further one is refused `busy` at once'],
+  },
+  {
+    name: 'F5 no rate limit',
+    what: 'every operation is let in, however many a second',
+    tests: ['tests/unit/flood.test.mjs'],
+    files: { 'web/providers/src/protocol.ts': [{ find: "      if (tokens < 1) return 'rate';\n", replace: '' }] },
+    caught: ['the rate is a burst and then a number a second', 'a flood of refusals is not answered past a number a second'],
+  },
+  {
+    name: 'F5 every refusal is answered',
+    what: 'a flood of refusals is answered in full',
+    tests: ['tests/unit/flood.test.mjs'],
+    files: { 'web/providers/src/protocol.ts': [{ find: '      if (++refusals > REFUSALS_ANSWERED_PER_SECOND) return;\n', replace: '' }] },
+    caught: ['a flood of refusals is not answered past a number a second'],
+  },
+  {
+    name: 'F5 no cap on connections',
+    what: 'an app may hold as many connections as it opens',
+    tests: ['tests/unit/flood.test.mjs'],
+    files: { 'web/providers/src/protocol.ts': [{ find: 'if (mine.length >= MAX_CONNECTIONS_PER_APP) {', replace: 'if (false as boolean) {' }] },
+    caught: ['the next one closes the least recently active', 'opens connections without end'],
+  },
+  {
+    name: 'F5 quiet connections are kept',
+    what: 'a connection that has gone quiet is never closed',
+    tests: ['tests/unit/flood.test.mjs'],
+    files: { 'web/providers/src/protocol.ts': [{ find: 'if (at - connection.lastActive > IDLE_CLOSE_MS && !connection.working()) {', replace: 'if (false as boolean) {' }] },
+    caught: ['is closed after a quarter of an hour'],
+  },
+  {
+    name: 'F5 a stream is a quiet connection',
+    what: 'a connection with a request open is closed when it sends nothing',
+    tests: ['tests/unit/flood.test.mjs'],
+    files: { 'web/providers/src/protocol.ts': [{ find: ' && !connection.working()) {', replace: ') {' }] },
+    caught: ['is not one that has a request open'],
+  },
 ];
 
 const read = (rel) => fs.readFileSync(path.join(ROOT, rel), 'utf8');

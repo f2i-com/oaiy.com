@@ -20,5 +20,8 @@ window.addEventListener('message', (event: MessageEvent) => {
   broker.onWindowMessage({ origin: event.origin, source: event.source, data: event.data, ports: event.ports as unknown as PortLike[] });
 });
 
+// A page that has gone leaves its port behind and there is no event to say so: the quiet ones are closed (and told).
+setInterval(() => broker.sweep(), 60_000);
+
 // The top-level Providers page (and any other frame of this origin) changed something.
 ctx.store.onChange(() => broker.notifyChanged());

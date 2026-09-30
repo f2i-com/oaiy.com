@@ -94,7 +94,8 @@ function makeClient(port) {
 }
 
 /**
- * @param {{ handler?: (call: object) => Response | Promise<Response>, record?: object, key?: string|null, apps?: Map<string,string>, now?: () => number }} [options]
+ * @param {{ handler?: (call: object) => Response | Promise<Response>, record?: object, key?: string|null, apps?: Map<string,string>, now?: () => number, brokerNow?: () => number }} [options]
+ *   `now` is the budget's clock, `brokerNow` the port's (the rate limit and the idle time).
  */
 export async function brokerWorld(options = {}) {
   const fetchStub = stubFetch(options.handler ?? (() => jsonResponse({ data: [{ id: 'fake-chat' }] })));
@@ -103,7 +104,7 @@ export async function brokerWorld(options = {}) {
   const saved = await h.store.save(input({ baseUrl: 'https://api.openai.com/v1', ...(options.record ?? {}) }), key ?? undefined);
   if (!saved.ok) throw new Error(`the test record was refused: ${JSON.stringify(saved)}`);
   const parent = { name: 'the parent window' };
-  const broker = M.protocol.createBroker({ apps: options.apps ?? APPS, store: h.store, vault: h.vault, budget: h.budget, fetchImpl: fetchStub.impl, page: h.page, parent });
+  const broker = M.protocol.createBroker({ apps: options.apps ?? APPS, store: h.store, vault: h.vault, budget: h.budget, fetchImpl: fetchStub.impl, page: h.page, parent, now: options.brokerNow });
   // As the port's page does (broker-main.ts): a change to the list is told to every connected page.
   h.store.onChange(() => broker.notifyChanged());
   const clients = [];

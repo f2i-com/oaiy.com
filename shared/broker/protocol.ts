@@ -45,6 +45,20 @@ export const MIN_TIMEOUT_MS = 1_000;
 export const MAX_TIMEOUT_MS = 600_000;
 /** How many requests one app connection may have open at once. */
 export const MAX_IN_FLIGHT = 8;
+/**
+ * How much a connection may ask of the holder itself, apart from the provider (a compromised app can flood the port, and the holder's
+ * cost of answering is what it must bound): operations being worked on at once (a further one is refused `busy` at once, not queued), a
+ * rate for every operation of any kind (a burst, then a sustained number a second), connections an app may hold (the least recently
+ * active is closed to make room), and how long a connection may be silent before it is closed (a MessagePort has no close event, so the
+ * holder cannot tell a page that has gone from one that is quiet: it closes the quiet ones, and tells them, `{t:'closed'}`).
+ */
+export const MAX_PENDING_OPS = 16;
+export const OPS_BURST = 100;
+export const OPS_PER_SECOND = 50;
+export const MAX_CONNECTIONS_PER_APP = 16;
+export const IDLE_CLOSE_MS = 15 * 60 * 1000;
+/** Refusals a connection is answered for in a second; past that a flood is dropped without an answer, which is cheaper still. */
+export const REFUSALS_ANSWERED_PER_SECOND = 100;
 /** The default number of provider requests an app may make in an hour. */
 export const DEFAULT_BUDGET_PER_HOUR = 600;
 export const BUDGET_WINDOW_MS = 60 * 60 * 1000;
@@ -267,6 +281,7 @@ export type ErrorCode =
   | 'bad-url'
   | 'bad-headers'
   | 'too-many'
+  | 'busy'
   | 'too-large'
   | 'bad-body'
   | 'budget'
@@ -303,8 +318,11 @@ export type StreamEvent =
 /** A stream event before it is given the id of the request it answers. */
 export type StreamBody = StreamEvent extends infer E ? (E extends unknown ? Omit<E, 'id'> : never) : never;
 
-/** Sent to an app without being asked. `changed` means the list of providers did. */
-export type Push = { t: 'changed' };
+/**
+ * Sent to an app without being asked. `changed` means the list of providers did. `closed` means the holder has dropped this connection
+ * (it was quiet for too long, or the app opened too many): the app says hello again if it still wants one.
+ */
+export type Push = { t: 'changed' } | { t: 'closed'; reason: 'idle' | 'replaced' };
 
 export type ListResult = ProviderSummary[];
 

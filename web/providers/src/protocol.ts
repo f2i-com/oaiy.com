@@ -5,21 +5,35 @@
  * compiled list (the `oaiy-apps` meta tag), only when its source is this frame's parent (not a sibling frame, not a sandboxed frame
  * whose origin is `null`), and only with exactly one port. Everything after goes over that port, and the operations are the nine in
  * `OPS`: none of them returns, edits or redirects a key, or adds, edits or deletes a provider. The one thing a page can change is a
- * provider's model.
+ * provider's model, and only to one the provider itself listed.
  *
  * Each app has a request budget an hour, counted here at the one place a request leaves (a `fetch`, or a call the holder makes for
  * `models`, `test` or `probe`), so a page cannot spend more by asking another way.
+ *
+ * A compromised app can also flood the port, and what that costs is the holder's own work. So every connection is bounded (protocol.ts
+ * in shared/): operations being worked on at once are capped and a further one is refused `busy` at once, not queued behind the rest;
+ * every operation of any kind is rate limited; an app may hold only so many connections, the least recently active closed to make room;
+ * a connection that has been quiet too long is closed (a MessagePort has no close event, so a page that has gone is only ever seen as
+ * quiet); and a connection that keeps being refused is not answered past a number a second, which is cheaper than the refusals.
  */
 import {
+  IDLE_CLOSE_MS,
+  MAX_CONNECTIONS_PER_APP,
   MAX_IN_FLIGHT,
+  MAX_PENDING_OPS,
   OPS,
+  OPS_BURST,
+  OPS_PER_SECOND,
   PROTOCOL_VERSION,
+  REFUSALS_ANSWERED_PER_SECOND,
   appForOrigin,
   errorBody,
   parseHello,
   parseRequest,
   type ErrorBody,
   type FetchRequest,
+  type PortRequest,
+  type Push,
   type Reply,
   type StatusBody,
   type StreamEvent,
@@ -50,6 +64,8 @@ export interface BrokerDeps {
   page: PageInfo;
   /** `window.parent`: the only window a `hello` may come from. */
   parent: unknown;
+  /** The clock, for the rate limit and the idle time (a test hands in its own). */
+  now?: () => number;
 }
 
 /** A window `message` event, as far as the holder reads one. */
@@ -65,18 +81,42 @@ export interface Broker {
   onWindowMessage(event: WindowMessage): boolean;
   /** Tell every connected app the list of providers changed. */
   notifyChanged(): void;
+  /** Close the connections that have been quiet for `IDLE_CLOSE_MS`, telling each. The page calls it every minute. */
+  sweep(): number;
   connections(): number;
 }
 
+interface Connection {
+  app: string;
+  lastActive: number;
+  /** Whether a request of this connection is being worked on: a stream that runs for a long time is not a quiet connection. */
+  working(): boolean;
+  close(reason: 'idle' | 'replaced'): void;
+}
+
 export function createBroker(deps: BrokerDeps): Broker {
-  const ports = new Set<PortLike>();
+  const now = deps.now ?? Date.now;
+  const connections = new Map<PortLike, Connection>();
   const fetcher = createFetcher({ store: deps.store, budget: deps.budget, fetchImpl: deps.fetchImpl, page: deps.page });
 
   function attach(port: PortLike, app: string): void {
-    ports.add(port);
-    const inFlight = new Map<number, AbortController>();
+    // An app that holds too many connections loses its least recently active: a page that has gone leaves its port behind, and a
+    // hostile one that opens many is held to its own share.
+    const mine = [...connections.entries()].filter(([, c]) => c.app === app);
+    if (mine.length >= MAX_CONNECTIONS_PER_APP) {
+      mine.sort((a, b) => a[1].lastActive - b[1].lastActive);
+      for (const [, c] of mine.slice(0, mine.length - MAX_CONNECTIONS_PER_APP + 1)) c.close('replaced');
+    }
 
-    const send = (message: Reply | StreamEvent | { t: 'hello'; v: number; ops: readonly string[]; app: string } | { t: 'changed' }, transfer?: Transferable[]): void => {
+    const inFlight = new Map<number, AbortController>();
+    let pending = 0;
+    // A token bucket for every operation of any kind, and a count of the refusals answered in the current second.
+    let tokens = OPS_BURST;
+    let refilled = now();
+    let refusalsSecond = Math.floor(refilled / 1000);
+    let refusals = 0;
+
+    const send = (message: Reply | StreamEvent | Push | { t: 'hello'; v: number; ops: readonly string[]; app: string }, transfer?: Transferable[]): void => {
       try {
         port.postMessage(message, transfer);
       } catch {
@@ -85,6 +125,35 @@ export function createBroker(deps: BrokerDeps): Broker {
     };
     const ok = (id: number, result: unknown): void => send({ id, ok: true, result });
     const refuse = (id: number, error: ErrorBody): void => send({ id, ok: false, error });
+    const refuseRequest = (request: PortRequest | null, id: number, error: ErrorBody): void => {
+      // Past a number of refusals a second, a flood is not answered.
+      const second = Math.floor(now() / 1000);
+      if (second !== refusalsSecond) {
+        refusalsSecond = second;
+        refusals = 0;
+      }
+      if (++refusals > REFUSALS_ANSWERED_PER_SECOND) return;
+      if (request?.op === 'fetch') send({ id, t: 'error', error });
+      else refuse(id, error);
+    };
+
+    const connection: Connection = {
+      app,
+      lastActive: now(),
+      working: () => inFlight.size > 0 || pending > 0,
+      close(reason) {
+        send({ t: 'closed', reason });
+        connections.delete(port);
+        port.onmessage = null;
+        try {
+          port.close?.();
+        } catch {
+          // already closed
+        }
+        for (const controller of inFlight.values()) controller.abort();
+      },
+    };
+    connections.set(port, connection);
 
     const providerFor = async (id: number, providerId: string): Promise<ProviderRecord | null> => {
       const record = await deps.store.get(providerId);
@@ -106,13 +175,7 @@ export function createBroker(deps: BrokerDeps): Broker {
       },
     });
 
-    async function handle(data: unknown): Promise<void> {
-      const parsed = parseRequest(data);
-      if (!parsed.ok) {
-        if (parsed.id !== null) refuse(parsed.id, errorBody(parsed.code, parsed.message));
-        return;
-      }
-      const { id, request } = parsed;
+    async function handle(id: number, request: PortRequest): Promise<void> {
       try {
         switch (request.op) {
           case 'list':
@@ -152,6 +215,18 @@ export function createBroker(deps: BrokerDeps): Broker {
       }
     }
 
+    /** Whether a message is let in: it costs the holder something to answer, so it is counted first. */
+    function admit(request: PortRequest): 'ok' | 'rate' | 'pending' {
+      const at = now();
+      tokens = Math.min(OPS_BURST, tokens + ((at - refilled) / 1000) * OPS_PER_SECOND);
+      refilled = at;
+      if (tokens < 1) return 'rate';
+      tokens -= 1;
+      // A fetch is long-lived and has its own cap; an abort is cheap and is what ends work: neither waits behind the others.
+      if (request.op !== 'fetch' && request.op !== 'abort' && pending >= MAX_PENDING_OPS) return 'pending';
+      return 'ok';
+    }
+
     function startFetch(id: number, request: FetchRequest): void {
       if (inFlight.size >= MAX_IN_FLIGHT || inFlight.has(id)) {
         send({ id, t: 'error', error: errorBody('too-many', 'Too many requests are open at once.') });
@@ -173,7 +248,28 @@ export function createBroker(deps: BrokerDeps): Broker {
         .finally(() => inFlight.delete(id));
     }
 
-    port.onmessage = (event) => void handle(event.data);
+    port.onmessage = (event) => {
+      connection.lastActive = now();
+      const parsed = parseRequest(event.data);
+      if (!parsed.ok) {
+        if (parsed.id !== null) refuseRequest(null, parsed.id, errorBody(parsed.code, parsed.message));
+        return;
+      }
+      const { id, request } = parsed;
+      const verdict = admit(request);
+      if (verdict !== 'ok') {
+        refuseRequest(request, id, errorBody('busy', verdict === 'rate' ? 'Too many requests a second. Slow down.' : 'Too many operations are being worked on. Try again in a moment.'));
+        return;
+      }
+      if (request.op === 'fetch' || request.op === 'abort') {
+        void handle(id, request);
+        return;
+      }
+      pending++;
+      void handle(id, request).finally(() => {
+        pending--;
+      });
+    };
     port.start?.();
     send({ t: 'hello', v: PROTOCOL_VERSION, ops: OPS, app });
   }
@@ -192,15 +288,27 @@ export function createBroker(deps: BrokerDeps): Broker {
     },
 
     notifyChanged() {
-      for (const port of ports) {
+      for (const port of connections.keys()) {
         try {
           port.postMessage({ t: 'changed' });
         } catch {
-          ports.delete(port);
+          connections.delete(port);
         }
       }
     },
 
-    connections: () => ports.size,
+    sweep() {
+      const at = now();
+      let closed = 0;
+      for (const connection of [...connections.values()]) {
+        if (at - connection.lastActive > IDLE_CLOSE_MS && !connection.working()) {
+          connection.close('idle');
+          closed++;
+        }
+      }
+      return closed;
+    },
+
+    connections: () => connections.size,
   };
 }
