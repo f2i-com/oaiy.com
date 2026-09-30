@@ -260,6 +260,49 @@ export function samePerson(a: string | null | undefined, b: string | null | unde
   return dx.length >= 8 && dy.length >= 8 && /^\+?\d+$/.test(x) && /^\+?\d+$/.test(y) && dx.slice(-9) === dy.slice(-9);
 }
 
+/**
+ * A set of caller ids that says whether it holds someone who is the same person as a given one, in constant time, and
+ * says it exactly as `samePerson` does (over the same country): `has(x)` is `members.some((m) => samePerson(m, x, country))`.
+ * Asking that of a list is a scan; a list of thousands asked of thousands is a freeze (the numbers not to be contacted that a
+ * restore adds took 40 s for 8,000). `samePerson` is not an equivalence (a number the country's rules cannot read matches by
+ * its last nine digits, and two that they can read match only when they are the same number), so this keeps what it needs to
+ * say the same: every member's key, and the last nine digits of the members that are numbers, by whether they can be read.
+ */
+export class PersonIndex {
+  private readonly keys = new Set<string>();
+  /** The last nine digits of members whose number the country's rules can read as E.164. */
+  private readonly readableTails = new Set<string>();
+  /** The last nine digits of members that are numbers those rules cannot read. */
+  private readonly otherTails = new Set<string>();
+
+  constructor(private readonly country: string | Country = localCountry()) {}
+
+  private read(raw: string | null | undefined): { key: string; readable: boolean; tail: string | null } | null {
+    if (isHidden(raw)) return null;
+    const key = phoneKey(raw, this.country);
+    const digits = digitsOf(key);
+    const tail = /^\+?\d+$/.test(key) && digits.length >= 8 ? digits.slice(-9) : null;
+    return { key, readable: toE164(raw, this.country) !== null, tail };
+  }
+
+  add(raw: string | null | undefined): void {
+    const one = this.read(raw);
+    if (!one) return;
+    this.keys.add(one.key);
+    if (one.tail) (one.readable ? this.readableTails : this.otherTails).add(one.tail);
+  }
+
+  /** Whether some member is the same person as `raw`. */
+  has(raw: string | null | undefined): boolean {
+    const one = this.read(raw);
+    if (!one) return false;
+    if (this.keys.has(one.key)) return true;
+    if (!one.tail) return false;
+    // Two numbers the rules can read are the same only when they are the same number (the keys, above).
+    return this.otherTails.has(one.tail) || (!one.readable && this.readableTails.has(one.tail));
+  }
+}
+
 /** Digits in groups: threes, the last group up to four ("301 234 5678"). */
 function groups(d: string): string {
   const out: string[] = [];

@@ -5731,3 +5731,38 @@ fn the_table_covers_every_extension_of_a_voice_clip() {
     restore::stage(&dst.0, &file, PASS, &ticks_of(&[RestoreClass::Voices], false), &options()).unwrap();
     assert_eq!(restored_names(&dst.0).len(), 2);
 }
+
+/// The reviewer's list of numbers not to be contacted: a hundred thousand entries fit the size a file may be (about 5 MB), and the
+/// page compared each with the list it had (hours). What is handed to the page is cut here to a list a person could have made:
+/// each number once, however it is written (the same digits), and at most 5,000.
+#[test]
+fn a_huge_list_of_numbers_not_to_be_contacted_is_cleaned_before_the_page_is_given_it() {
+    let mut list: Vec<serde_json::Value> = Vec::with_capacity(100_000);
+    for k in 0..40_000u32 {
+        list.push(serde_json::json!({ "number": format!("04{:02} {:03} {:03}", k / 1_000_000, k / 1000 % 1000, k % 1000), "at": 1, "why": "asked" }));
+        list.push(serde_json::json!({ "number": format!("04{:02}{:03}{:03}", k / 1_000_000, k / 1000 % 1000, k % 1000), "at": 2, "why": "the same number, written without spaces" }));
+    }
+    for k in 40_000..60_000u32 {
+        list.push(serde_json::json!({ "number": format!("04{:08}", k), "at": 3, "why": "asked" }));
+    }
+    assert_eq!(list.len(), 100_000);
+    let text = serde_json::to_vec(&list).unwrap();
+    assert!(text.len() > 4 * MIB && text.len() < 8 * MIB, "the file is the size a file of a hundred thousand entries is: {}", text.len());
+    let src = TempDir::new("dnc-big-src");
+    let out = TempDir::new("dnc-big-out");
+    let file = backup_with_agent(&src.0, &out.0, "d.oaiybackup", agent_archive(&[("opfs/front-desk/outreach/do-not-contact.json", text.as_slice())]), false);
+    let dst = TempDir::new("dnc-big-dst");
+    let (staged, peak, took) = peak::measured(|| restore::stage(&dst.0, &file, PASS, &Ticks::none(), &options()));
+    let staged = staged.unwrap();
+    eprintln!("a hundred thousand numbers not to be contacted, prepared: {} MiB, {took:?}", peak / MIB);
+    assert!(took < std::time::Duration::from_secs(20) && peak < 192 * MIB, "{} MiB in {took:?}", peak / MIB);
+    assert!(staged.skipped.iter().any(|n| n.contains("40000 entries") && n.contains("repeated a number")), "{:?}", staged.skipped);
+    assert!(staged.skipped.iter().any(|n| n.contains("55000 more of the numbers not to be contacted were left out") && n.contains("5000")), "{:?}", staged.skipped);
+    assert!(matches!(restore::apply_pending(&dst.0), ApplyOutcome::Applied(_)));
+    let handed = zip_entries(&handed_over(&dst.0));
+    let cleaned: Vec<serde_json::Value> = serde_json::from_slice(&handed["opfs/front-desk/outreach/do-not-contact.json"]).unwrap();
+    assert_eq!(cleaned.len(), 5000);
+    let numbers: std::collections::HashSet<&str> = cleaned.iter().map(|e| e["number"].as_str().unwrap()).collect();
+    assert_eq!(numbers.len(), 5000, "each number once");
+    assert!(cleaned.iter().all(|e| e["why"].as_str().is_some_and(|w| w.len() <= 300) && e["at"].is_number()));
+}

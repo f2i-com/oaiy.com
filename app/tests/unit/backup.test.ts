@@ -7,6 +7,7 @@ import {
   CAMPAIGN_INDEX,
   DO_NOT_CONTACT,
   MAX_ADDED,
+  MAX_DO_NOT_CONTACT_ADDED,
   MAX_ENTRIES,
   PART_BYTES,
   RECORD,
@@ -1432,6 +1433,41 @@ describe('the numbers not to be contacted only grow', () => {
     // A date that is not one, and a reason too long to be one, are not taken: the number still is.
     expect(after[3]).toEqual({ number: '0499 555 666', at: 0, why: '' });
     expect(outcome!.added).toEqual([]);
+  });
+
+  it('adds numbers to a list of a hundred thousand in a moment, not in hours (it was quadratic: 8,000 took 40 seconds)', async () => {
+    const number = (i: number) => `+61${400_000_000 + i}`;
+    const here = Array.from({ length: 100_000 }, (_, i) => ({ number: number(i), at: 1, why: 'asked' }));
+    // A hundred thousand numbers in the backup (the size a file may be), the first five thousand of them new.
+    const coming = Array.from({ length: 100_000 }, (_, i) => ({ number: number(100_000 + i), at: 2, why: 'STOP' }));
+    const target = new FakeStorage().put(PATH, JSON.stringify(here));
+    const desk = fakeDesktop(craft({ [DO_NOT_CONTACT]: JSON.stringify(coming) }), { partSize: 1 << 20 });
+    const started = performance.now();
+    const outcome = await applyPendingRestore(DESKTOP, target, { fetch: desk.fetch });
+    const took = performance.now() - started;
+    expect(outcome!.ok).toBe(true);
+    expect(list(target)).toHaveLength(100_000 + MAX_DO_NOT_CONTACT_ADDED);
+    expect(outcome!.warnings.join('\n')).toContain(`${(100_000 - MAX_DO_NOT_CONTACT_ADDED).toLocaleString()} of the numbers not to be contacted in the backup were left out`);
+    // (The bound is generous: the work is a few hundred milliseconds, and a page that opens nothing until it is done must not wait for more.)
+    expect(took).toBeLessThan(4000);
+    // At the size the reviewer measured (8,000 and 8,000), and with the numbers written another way, the answer is the same and as quick.
+    const eight = Array.from({ length: 8000 }, (_, i) => ({ number: `0${400_000_000 + i}`, at: 1, why: 'a' }));
+    const again = Array.from({ length: 5000 }, (_, i) => ({ number: i % 2 ? `+61${400_000_000 + i}` : `0${400_000_000 + 8000 + i}`, at: 2, why: 'b' }));
+    const small = new FakeStorage().put(PATH, JSON.stringify(eight));
+    const deskSmall = fakeDesktop(craft({ [DO_NOT_CONTACT]: JSON.stringify(again) }), { partSize: 1 << 20 });
+    const t0 = performance.now();
+    await applyPendingRestore(DESKTOP, small, { fetch: deskSmall.fetch });
+    expect(performance.now() - t0).toBeLessThan(2000);
+    // Odd i are the same people as some of the first 8,000 (written with +61): not added twice. Even i are new.
+    expect(list(small)).toHaveLength(8000 + 2500);
+  });
+
+  it('adds nothing beyond what a restore may add at once, and says how many were left out', async () => {
+    const target = new FakeStorage();
+    const many = Array.from({ length: MAX_DO_NOT_CONTACT_ADDED + 3 }, (_, i) => ({ number: `+61${500_000_000 + i}`, at: 1, why: 'x' }));
+    const outcome = await restore(target, many);
+    expect(list(target)).toHaveLength(MAX_DO_NOT_CONTACT_ADDED);
+    expect(outcome!.warnings.join('\n')).toContain('3 of the numbers not to be contacted in the backup were left out');
   });
 
   it('writes the numbers of the backup where there is no list, and lists the file as added for an undo', async () => {

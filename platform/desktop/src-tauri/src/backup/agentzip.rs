@@ -40,7 +40,8 @@ const MAX_QUOTE_BYTES: u64 = 64 << 10;
 /// The most items listed by name for one kind of file before the rest are counted.
 const MAX_NAMED: usize = 300;
 /// The most numbers not to be contacted that come back (the page adds them to its own).
-const MAX_DO_NOT_CONTACT: usize = 100_000;
+/// The most numbers not to be contacted that one restore brings (the page adds them to the list it has, and holds to the same bound).
+pub const MAX_DO_NOT_CONTACT: usize = 5_000;
 
 /// A name inside the Agent's archive that is a plain relative path.
 pub fn safe_name(name: &str) -> bool {
@@ -321,21 +322,42 @@ fn describe_campaign(campaign: &Value, was: Option<&str>) -> String {
     what
 }
 
-/// The numbers not to be contacted, checked: only entries of the shape the Agent writes, and no more than
-/// [`MAX_DO_NOT_CONTACT`]. `None`: it is not a list.
-pub fn clean_do_not_contact(value: &Value) -> Option<Vec<Value>> {
+/// The numbers not to be contacted, cleaned.
+pub struct CleanedList {
+    /// The entries that come back: of the shape the Agent writes, each number once (the same digits written another way
+    /// count once: the page adds the ones that are not yet here, person by person), and no more than [`MAX_DO_NOT_CONTACT`].
+    pub entries: Vec<Value>,
+    /// Entries that repeated a number already in the list.
+    pub repeated: usize,
+    /// Entries left out because the list was already as long as one restore takes.
+    pub over: usize,
+}
+
+/// The numbers not to be contacted, checked: only entries of the shape the Agent writes, each number once, and no more than
+/// [`MAX_DO_NOT_CONTACT`]. `None`: it is not a list. (A file of a hundred thousand entries fits the size a file may be, and
+/// the page compares each with the list it has: it is cut here, to a list a person could have made, before it is handed over.)
+pub fn clean_do_not_contact(value: &Value) -> Option<CleanedList> {
     let list = value.as_array()?;
-    Some(
-        list.iter()
-            .filter_map(|entry| {
-                let number = entry.get("number")?.as_str().filter(|n| !n.is_empty() && n.len() <= 40 && !n.chars().any(char::is_control))?;
-                let at = entry.get("at").filter(|a| a.as_f64().is_some_and(|f| f.is_finite() && f >= 0.0)).cloned().unwrap_or(json!(0));
-                let why = entry.get("why").and_then(Value::as_str).map(|w| w.chars().take(300).collect::<String>()).unwrap_or_default();
-                Some(json!({ "number": number, "at": at, "why": why }))
-            })
-            .take(MAX_DO_NOT_CONTACT)
-            .collect(),
-    )
+    let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
+    let mut cleaned = CleanedList { entries: Vec::new(), repeated: 0, over: 0 };
+    for entry in list {
+        let Some(number) = entry.get("number").and_then(Value::as_str).filter(|n| !n.is_empty() && n.len() <= 40 && !n.chars().any(char::is_control)) else { continue };
+        // The same digits, however they are written, are one number here; a number of letters is compared as it is.
+        let digits: String = number.chars().filter(char::is_ascii_digit).collect();
+        let key = if digits.is_empty() { number.trim().to_lowercase() } else { digits };
+        if !seen.insert(key) {
+            cleaned.repeated += 1;
+            continue;
+        }
+        if cleaned.entries.len() >= MAX_DO_NOT_CONTACT {
+            cleaned.over += 1;
+            continue;
+        }
+        let at = entry.get("at").filter(|a| a.as_f64().is_some_and(|f| f.is_finite() && f >= 0.0)).cloned().unwrap_or(json!(0));
+        let why = entry.get("why").and_then(Value::as_str).map(|w| w.chars().take(300).collect::<String>()).unwrap_or_default();
+        cleaned.entries.push(json!({ "number": number, "at": at, "why": why }));
+    }
+    Some(cleaned)
 }
 
 // ---- looking ------------------------------------------------------------------------------------------
@@ -767,10 +789,16 @@ pub fn filter(nested: &Path, out: &Path, scratch: &Path, ticks: &Ticks, mode: Mo
                     prepared.notes.push("The list of numbers not to be contacted was not brought back: it is not a list of numbers.".to_string());
                     continue;
                 };
-                if list.is_empty() {
+                if list.repeated > 0 {
+                    prepared.notes.push(format!("{} in the list of numbers not to be contacted repeated a number and {} counted once.", plural(list.repeated, "entry", "entries"), if list.repeated == 1 { "was" } else { "were" }));
+                }
+                if list.over > 0 {
+                    prepared.notes.push(format!("{} more of the numbers not to be contacted were left out: at most {MAX_DO_NOT_CONTACT} come back in one restore.", list.over));
+                }
+                if list.entries.is_empty() {
                     continue;
                 }
-                let bytes = serde_json::to_vec(&list).map_err(|_| BackupError::new(ErrorKind::Damaged, "The list of numbers could not be written."))?;
+                let bytes = serde_json::to_vec(&list.entries).map_err(|_| BackupError::new(ErrorKind::Damaged, "The list of numbers could not be written."))?;
                 plan.push((entry.name.clone(), "union".to_string(), Source::Temp(temp_file(&bytes)?)));
             }
             _ => plan.push((entry.name.clone(), "replace".to_string(), Source::Nested(entry.index, entry.size))),

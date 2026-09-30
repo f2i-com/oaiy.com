@@ -643,7 +643,13 @@ in parts through internal routes with a secret made for that one backup.
   key with their values (the instructions with their full length). It says what is not restored
   and why, and every name it does not know is "not restored: unknown item".
 - **Nothing ticked** brings back only the numbers not to be called or texted again (which are
-  *added* to yours: none of yours is ever taken away, on a restore or an undo). **Agent data** (projects, conversations, the brief and knowledge files) and
+  *added* to yours: none of yours is ever taken away, on a restore or an undo). At most **5,000**
+  numbers come back in one restore, each once (the same digits written another way are one
+  number, and the desktop says how many it counted once and how many it left out); the Agent's
+  page then adds the ones that are not already on your list, person by person, in constant time
+  each: a list of a hundred thousand is a moment's work for it, where comparing each number with
+  the whole list took 40 seconds for 8,000, in a page that opens nothing until it is done.
+  **Agent data** (projects, conversations, the brief and knowledge files) and
   **Memory** (what the phone's agents remember about people, which they read as instructions) and
   **Outreach** each need their own tick.
 - **Campaigns never come back running.** With Outreach ticked, a campaign is rebuilt from the keys

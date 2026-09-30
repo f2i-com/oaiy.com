@@ -1,5 +1,68 @@
 import { describe, expect, it } from 'vitest';
-import { detectCountry, displayNumber, isHidden, phoneKey, samePerson, setLocalCountry, splitE164, toE164 } from '../../src/phoneNumbers';
+import { PersonIndex, detectCountry, displayNumber, isHidden, phoneKey, samePerson, setLocalCountry, splitE164, toE164 } from '../../src/phoneNumbers';
+
+/** A small deterministic random generator (mulberry32), so that a failure can be found again. */
+function seeded(seed: number): () => number {
+  let a = seed >>> 0;
+  return () => {
+    a = (a + 0x6d2b79f5) >>> 0;
+    let t = a;
+    t = Math.imul(t ^ (t >>> 15), t | 1);
+    t ^= t + Math.imul(t ^ (t >>> 7), t | 61);
+    return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
+  };
+}
+
+describe('a set of people found in constant time says what samePerson says', () => {
+  // Numbers written every way, in and out of the country's rules, that are the same person as one another or not: the same
+  // digits with and without the country code and the trunk, numbers of several countries, one that no country's rules can
+  // read (a foreign one written as it is dialled there) that shares its last nine digits with one that can be read, short codes,
+  // sender ids and hidden callers.
+  const pool = [
+    '0491570006', '0491 570 006', '+61491570006', '+61 491 570 006', '61491570006', '0011 61 491 570 006', '491570006', '+61 (0) 491 570 006',
+    '0400111222', '+61400111222', '400111222', '+64400111222', '0400 111 222', '+44 7700 900123', '07700 900123', '7700900123', '+447700900123',
+    '+1 415 555 0132', '(415) 555-0132', '415-555-0132', '4155550132', '+64 21 123 4567', '021 123 4567', '211234567', '+27 82 123 4567', '0821234567', '821234567',
+    '02 9876 5432', '+61298765432', '298765432', '+33 1 42 68 53 00', '0033 1 42 68 53 00', '142685300', '33142685300', '1300 123 456', '1300123456', '13 11 11', '131111',
+    'ACME', 'acme', 'Acme Bank', 'Private', 'Unknown', 'Withheld', '', '  ', '+', 'abc123', '123', '12345678', '123456789', '0123456789', '+1234567890123',
+  ];
+  it('for every sequence of numbers a list could be built from, in five countries', () => {
+    let compared = 0;
+    let matched = 0;
+    for (const country of ['AU', 'NZ', 'GB', 'US', 'ZA']) {
+      for (let run = 0; run < 60; run++) {
+        const random = seeded(run * 7919 + country.charCodeAt(0));
+        const members: string[] = [];
+        const index = new PersonIndex(country);
+        for (let step = 0; step < 90; step++) {
+          const next = pool[Math.floor(random() * pool.length)];
+          const want = members.some((m) => samePerson(m, next, country));
+          expect(index.has(next), `${country}: ${JSON.stringify(next)} against ${JSON.stringify(members)}`).toBe(want);
+          compared++;
+          if (want) matched++;
+          if (random() < 0.55) {
+            members.push(next);
+            index.add(next);
+          }
+        }
+      }
+    }
+    expect(compared).toBe(5 * 60 * 90);
+    // The comparisons include plenty of people who are the same and plenty who are not (a test of two that agree on nothing proves nothing).
+    expect(matched).toBeGreaterThan(2000);
+    expect(compared - matched).toBeGreaterThan(2000);
+  });
+
+  it('is not a partition: a number that cannot be read matches by its last nine digits, and two that can be read only when equal', () => {
+    const index = new PersonIndex('AU');
+    index.add('+61491570006');
+    expect(index.has('491570006')).toBe(true);
+    expect(index.has('+14915700069')).toBe(false);
+    expect(index.has('+64491570006')).toBe(false);
+    index.add('491570006');
+    expect(index.has('+64491570006')).toBe(true);
+    expect(index.has('+61491570006')).toBe(true);
+  });
+});
 
 describe('a caller id as a person: E.164, read with the country for local numbers', () => {
   it('reads an Australian number in every way a phone writes it as one', () => {
