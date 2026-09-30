@@ -686,10 +686,13 @@ in parts through internal routes with a secret made for that one backup.
   above lets come back, and only what its kind's tick allows. The dry run lists what would come
   back **by name and size**: each project by its name, the front desk's brief with what it says,
   each knowledge file, what the phone's agents remember about people, each outreach campaign by
-  name with how many people it would contact and **every key of it that acts, by value** (what it
-  says to them: the objective, the text or the opening line, the questions, the voicemail; what it
-  does afterwards; who it speaks as; who said they started it; when it tries and how often) **and
-  a sample of its people, not all of them**: the first ten people, with every key of each (the name,
+  name with how many people it would contact and **every key of the campaign itself that acts, by
+  value** (what it says to them: the objective, the text or the opening line, the voicemail; what
+  it does afterwards; who it speaks as; who said they started it; when it tries and how often),
+  listed first and in the order of the table, each with a cut of its own, so that no number of
+  questions or people can push one of them out, **a sample of its questions** (the first eight, with
+  every key of each; a campaign may ask fifty, and the dry run says "the first 8 of 50" and counts the
+  rest) **and a sample of its people, not all of them**: the first ten people, with every key of each (the name,
   notes and details, and for one who was done how it ended, what they said and what they answered),
   and the first ten of the people skipped at planning (their names and why, which the report of the
   campaign says to the Agent), while **every other person is only counted**. Each value is cut to

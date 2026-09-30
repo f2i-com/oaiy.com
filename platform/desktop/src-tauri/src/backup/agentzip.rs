@@ -394,13 +394,24 @@ const MAX_VALUE_TEXT: usize = 100;
 const MAX_ENTRIES_SAID: usize = 3;
 const MAX_ENTRY_TEXT: usize = 50;
 
-/// The most a campaign's description says: what comes of it, everything it says (each value cut), and ten people and ten skipped (at
-/// most a thousand or so each), which come to a few thousand characters and, if all of it is as long as it may be, to twenty.
-pub(crate) const MAX_CAMPAIGN_TEXT: usize = 20_000;
+/// The most a campaign's description says. It is a bound that is never reached: what comes of the campaign, every key of the campaign itself
+/// (each value cut), eight questions, and ten people and ten set aside (each value of each cut) come to about twenty-two thousand characters
+/// when every key of every one is as long as it may be (a test builds that), and the description is not cut at the end, or anywhere,
+/// for how many questions or people there are.
+pub(crate) const MAX_CAMPAIGN_TEXT: usize = 24_000;
 
 /// What a rebuilt person holds that is not something a model reads or that is not said of them another way (their number is what
 /// names them): not listed as their words.
 const PERSON_KEYS_NOT_LISTED: [&str; 8] = ["id", "raw", "number", "state", "tries", "nextAt", "history", "doneAt"];
+
+/// How many of a campaign's questions the dry run says one by one (the rest are counted).
+const MAX_QUESTIONS_LISTED: usize = 8;
+
+/// Whether a key of a campaign is one of its collections (the questions, the people, the people set aside) and not one of the
+/// campaign's own.
+fn is_collection_key(path: &str) -> bool {
+    ["collect[]", "people[]", "skipped[]"].iter().any(|c| path.starts_with(c))
+}
 
 /// The keys of a campaign that are only names for it, or that the restore makes again: not listed as something it says.
 const CAMPAIGN_KEYS_NOT_LISTED: [&str; 5] = ["id", "slug", "createdAt", "resultsPath", "name"];
@@ -485,19 +496,33 @@ fn describe_campaign(kept: &super::table::Filtered, rebuilt: &Rebuilt, was: Opti
         what.push(' ');
         what.push_str(&other_reasons_said(rebuilt.other_reasons));
     }
-    // Everything it says or does, by value: each key that the table lets through and that is not a person (listed below).
-    let mut listed = 0usize;
-    for k in kept.kept.iter().filter(|k| k.row.class == Class::Runs && !k.path.starts_with("people[]") && !k.path.starts_with("skipped[]") && !CAMPAIGN_KEYS_NOT_LISTED.contains(&k.path.as_str())) {
+    // Everything it says or does, by value: every key of the campaign itself that the table lets through, in the table's order (what it
+    // says to the people, then how it tries, then who it speaks as), and each with a cut of its own. These are the keys the table has, so
+    // there are no more of them than it has and none is left out for how many questions or people the campaign has (the questions and
+    // the people are collections, said below, as a sample).
+    let mut fixed: Vec<&super::table::Kept> = kept.kept.iter().filter(|k| k.row.class == Class::Runs && !is_collection_key(&k.path) && !CAMPAIGN_KEYS_NOT_LISTED.contains(&k.path.as_str())).collect();
+    fixed.sort_by_key(|k| table().key_table("agent.campaign").and_then(|kt| kt.keys.iter().position(|r| r.path == k.path)).unwrap_or(usize::MAX));
+    for k in fixed {
         if matches!(&k.value, Value::String(s) if s.is_empty()) || matches!(&k.value, Value::Array(a) if a.is_empty()) {
             continue;
         }
-        if listed >= 60 {
-            what.push_str(" (More of its settings are not listed here.)");
-            break;
-        }
-        listed += 1;
         let note = if k.path.starts_with("origin.") { " (it comes back started by the front desk)" } else { "" };
         what.push_str(&format!(" {}, {}: {}{note}.", campaign_key(k), k.row.what.to_lowercase(), show_value(&k.value)));
+    }
+    // The questions: every key of each of the first few (they are said to each person), and the rest counted. A campaign may ask fifty, of
+    // five keys each, and what follows must not depend on how many.
+    let asked = campaign.get("collect").and_then(Value::as_array).map_or(0, Vec::len);
+    if asked > MAX_QUESTIONS_LISTED {
+        what.push_str(&format!(" The questions below are a sample: the first {MAX_QUESTIONS_LISTED} of {asked}."));
+    }
+    for k in kept.kept.iter().filter(|k| k.row.class == Class::Runs && k.path.starts_with("collect[]") && k.at.first().is_some_and(|at| *at < MAX_QUESTIONS_LISTED)) {
+        if matches!(&k.value, Value::String(s) if s.is_empty()) || matches!(&k.value, Value::Array(a) if a.is_empty()) {
+            continue;
+        }
+        what.push_str(&format!(" {}, {}: {}.", campaign_key(k), k.row.what.to_lowercase(), said(&k.value, MAX_VALUE_TEXT)));
+    }
+    if asked > MAX_QUESTIONS_LISTED {
+        what.push_str(&format!(" {} more questions are not listed here; each is asked in the same way.", asked - MAX_QUESTIONS_LISTED));
     }
     // The people: what a model reads of each of the first few, and the rest counted. Said plainly for a list that is longer: it is a sample.
     if people.len() > MAX_PEOPLE_LISTED {

@@ -7430,6 +7430,73 @@ fn a_padded_value_of_a_person_does_not_hide_another_key_of_the_same_person() {
     assert_eq!(said.matches("why \"asked not to be contacted\"").count(), 10, "{said}");
 }
 
+/// A campaign made from its key table: a marker in every key of the campaign itself that is words and a valid value in every other, and
+/// `questions` questions with every key as long as it may be. Returns it, and the keys of the campaign itself that the dry run lists (each
+/// with its marker when its value is words).
+fn campaign_of_the_table(questions: usize) -> (serde_json::Value, Vec<(String, Option<String>)>) {
+    use super::table::{Class, ValueType};
+    let keys = super::table::table().key_table("agent.campaign").unwrap();
+    let mut doc = serde_json::json!({ "id": "c1", "kind": "call", "name": "Marked", "slug": "c1", "state": "paused", "resultsPath": "/outreach/c1/results.md", "people": [], "skipped": [] });
+    let mut said_keys = Vec::new();
+    for key in keys.keys.iter().filter(|k| k.class == Class::Runs && !k.path.contains("[]")) {
+        if ["id", "kind", "name", "slug", "resultsPath", "createdAt", "collect", "people", "skipped", "state"].contains(&key.path.as_str()) {
+            continue;
+        }
+        let marker = format!("MARK-{}-9", key.path.to_uppercase().replace('.', "-"));
+        let (value, words) = match key.ty.as_ref().unwrap() {
+            ValueType::Object | ValueType::Objects { .. } => continue,
+            ValueType::Str { .. } => (serde_json::json!(marker), true),
+            ValueType::Enum(options) => (serde_json::json!(options.last().unwrap()), false),
+            ValueType::Int { min, max } => (serde_json::json!((*min + *max) / 2), false),
+            ValueType::Time => (serde_json::json!("09:00"), false),
+            other => panic!("agent.campaign has a key of a kind this test does not make: {other:?}"),
+        };
+        put_at(&mut doc, &key.path.split('.').collect::<Vec<_>>(), &value);
+        said_keys.push((key.path.clone(), words.then_some(marker)));
+    }
+    doc["collect"] = (0..questions)
+        .map(|i| serde_json::json!({ "key": format!("k{i}"), "question": format!("QUESTION-{i}-MARK {}", "q".repeat(900)), "type": "choice", "options": (0..50).map(|o| format!("option-{i}-{o} {}", "o".repeat(150))).collect::<Vec<_>>(), "optional": true }))
+        .collect();
+    (doc, said_keys)
+}
+
+/// The reviewer's x6f: the dry run listed the campaign's own keys in the order the JSON gives them (alphabetical) and stopped at sixty, so
+/// the questions (`collect` sorts first, at five keys a question) pushed the opening line, the text, the voicemail, the objective and who it
+/// speaks as out, with about eleven questions; only `afterwards` always survived. The campaign's own keys are said first, in the table's
+/// order, and the questions are a sample, whatever number of them there are.
+#[test]
+fn a_campaigns_own_words_are_in_the_dry_run_whatever_number_of_questions_it_asks() {
+    let keys = super::table::table().key_table("agent.campaign").unwrap();
+    for questions in [0usize, 5, 8, 9, 11, 12, 15, 50] {
+        let (doc, said_keys) = campaign_of_the_table(questions);
+        assert!(said_keys.len() >= 15 && said_keys.iter().any(|(p, m)| p == "openingLine" && m.is_some()), "the campaign has its own keys: {said_keys:?}");
+        let kept = super::table::filter_json(keys, &doc, &|_| true);
+        let rebuilt = super::agentzip::rebuild_campaign(&kept.value, Some("running")).unwrap();
+        let said = super::agentzip::describe_campaign_for_test(&kept, &rebuilt, Some("running"));
+        for (path, marker) in &said_keys {
+            assert!(said.contains(&format!(" {path}, ")), "{questions} questions: {path} is listed: {said}");
+            if let Some(marker) = marker {
+                assert!(said.contains(marker.as_str()), "{questions} questions: {marker} is said: {said}");
+            }
+        }
+        // The questions are a sample of the first eight, said plainly, and the rest are counted.
+        for i in 0..questions {
+            assert_eq!(said.contains(&format!("QUESTION-{i}-MARK")), i < 8, "{questions} questions: question {i}");
+        }
+        assert_eq!(said.contains("The questions below are a sample: the first 8 of"), questions > 8, "{questions}");
+        if questions > 8 {
+            assert!(said.contains(&format!("The questions below are a sample: the first 8 of {questions}.")) && said.contains(&format!(" {} more questions are not listed here", questions - 8)), "{said}");
+        }
+        // What comes of the campaign is first, and the campaign's own words come before the questions.
+        assert!(said.starts_with("phone calls to 0 people") && said.contains("comes back PAUSED"), "{said}");
+        let at = |needle: &str| said.find(needle).unwrap_or_else(|| panic!("{needle}"));
+        assert!(at("MARK-OBJECTIVE-9") < at("MARK-OPENINGLINE-9") && at("MARK-VOICEMAILMESSAGE-9") < at("MARK-AFTERWARDS-9"), "in the table's order: {said}");
+        if questions > 0 {
+            assert!(at("MARK-IDENTITY-BUSINESS-9") < at("collect[1].key"), "the campaign's own keys come before its questions: {said}");
+        }
+    }
+}
+
 /// A list of people that is longer than the ten the dry run says is a sample, and it is said so plainly (a list of ten or fewer is not).
 #[test]
 fn a_campaigns_dry_run_says_that_the_people_it_lists_are_a_sample_when_there_are_more() {
@@ -7576,39 +7643,45 @@ fn a_call_campaigns_dry_run_lists_its_opening_line_and_the_voicemail_it_leaves()
     }
 }
 
-/// A campaign whose description is longer than the dry run says (it is cut, at the end): what comes of the campaign is said before
-/// anything long, so no cut can take it away. Through the dry run, where the cut is made.
+/// A campaign as long as every key of it may be (fifty questions with every key, twelve people and twelve set aside with every key) is
+/// described whole: what the dry run says of a campaign is bounded by what a campaign's keys and its samples come to, and is below the
+/// most it says, so the end of it is never cut (and the cut is never what decides what is said). What comes of the campaign is first.
+/// Through the dry run.
 #[test]
-fn what_comes_of_a_campaign_survives_the_cut_of_a_description_that_is_too_long() {
+fn a_campaign_as_long_as_it_may_be_is_described_whole_and_what_comes_of_it_is_first() {
     let people: Vec<serde_json::Value> = (0..12)
         .map(|i| {
             let (answers, fields): (serde_json::Map<String, serde_json::Value>, serde_json::Map<String, serde_json::Value>) = (
-                (0..4).map(|k| (format!("an_answer_with_a_long_key_number_{k}"), serde_json::json!("x".repeat(400)))).collect(),
-                (0..4).map(|k| (format!("a_detail_with_long_key_{k}_"), serde_json::json!("f".repeat(200)))).collect(),
+                (0..50).map(|k| (format!("an_answer_with_a_long_key_number_{k}"), serde_json::json!("x".repeat(1000)))).collect(),
+                (0..20).map(|k| (format!("a_detail_with_long_key_{k}_"), serde_json::json!("f".repeat(200)))).collect(),
             );
-            serde_json::json!({ "id": format!("p{i}"), "name": format!("Name {i} {}", "n".repeat(70)), "number": format!("+6140000{i:04}"), "state": "done", "notes": "n".repeat(300), "summary": "s".repeat(600), "outcome": "answered", "why": "w".repeat(200), "answers": answers, "fields": fields })
+            serde_json::json!({ "id": format!("p{i}"), "name": format!("Name {i} {}", "n".repeat(70)), "number": format!("+6140000{i:04}"), "state": "done", "notes": "n".repeat(300), "summary": "s".repeat(5000), "outcome": "answered", "why": "w".repeat(300), "answers": answers, "fields": fields })
         })
         .collect();
-    let skipped: Vec<serde_json::Value> = (0..12).map(|i| serde_json::json!({ "name": format!("Skipped {i} {}", "k".repeat(150)), "number": format!("+6150000{i:04}"), "why": "z".repeat(300) })).collect();
-    let campaign = serde_json::json!({
-        "id": "long", "kind": "call", "name": "Long", "state": "running", "objective": "o".repeat(4000), "openingLine": "l".repeat(1500), "textTemplate": "t".repeat(1500),
-        "voicemail": "leave_message", "voicemailMessage": "v".repeat(1500), "afterwards": "a".repeat(4000), "identity": { "business": "b".repeat(150), "receptionist": "r".repeat(150) },
-        "collect": (0..30).map(|i| serde_json::json!({ "key": format!("k{i}"), "question": "q".repeat(900), "type": "text" })).collect::<Vec<_>>(),
-        "people": people, "skipped": skipped,
-    });
-    let src = TempDir::new("cut-src");
-    let out = TempDir::new("cut-out");
-    let file = backup_with_agent(&src.0, &out.0, "c.oaiybackup", agent_archive(&[("opfs/front-desk/outreach/long.json", campaign.to_string().as_bytes())]), false);
-    let dst = TempDir::new("cut-dst");
+    let skipped: Vec<serde_json::Value> = (0..12).map(|i| serde_json::json!({ "name": format!("Skipped {i} {}", "k".repeat(190)), "number": format!("+6150000{i:04}"), "why": "z".repeat(300) })).collect();
+    let (mut campaign, _) = campaign_of_the_table(50);
+    for (key, len) in [("objective", 5000), ("openingLine", 2000), ("textTemplate", 2000), ("voicemailMessage", 2000), ("afterwards", 5000)] {
+        campaign[key] = serde_json::json!("l".repeat(len));
+    }
+    campaign["identity"] = serde_json::json!({ "business": "b".repeat(200), "receptionist": "r".repeat(200) });
+    campaign["origin"]["projectName"] = serde_json::json!("p".repeat(200));
+    campaign["state"] = serde_json::json!("running");
+    campaign["people"] = serde_json::json!(people);
+    campaign["skipped"] = serde_json::json!(skipped);
+    let src = TempDir::new("whole-src");
+    let out = TempDir::new("whole-out");
+    let file = backup_with_agent(&src.0, &out.0, "c.oaiybackup", agent_archive(&[("opfs/front-desk/outreach/c1.json", campaign.to_string().as_bytes())]), false);
+    let dst = TempDir::new("whole-dst");
     let preview = restore::inspect(&dst.0, &file, PASS, &options()).unwrap();
-    let item = preview.items.iter().find(|i| i.name.ends_with("outreach/long.json")).expect("the campaign is listed");
-    let long = super::agentzip::MAX_CAMPAIGN_TEXT;
-    assert!(item.what.chars().count() <= long + 1 && item.what.chars().count() >= long - 200, "the description was cut to what a dry run says: {} characters", item.what.chars().count());
-    assert!(item.what.ends_with('…'), "and it was cut at the end, not at the start");
-    assert!(item.what.contains("It was RUNNING when the backup was made; it comes back PAUSED"), "what comes of the campaign is still there");
-    assert!(item.what.contains("Person 1 ("), "and the first of the people are said before the cut");
+    let item = preview.items.iter().find(|i| i.name.ends_with("outreach/c1.json")).expect("the campaign is listed");
+    let longest = item.what.chars().count();
+    assert!(longest < super::agentzip::MAX_CAMPAIGN_TEXT && !item.what.ends_with('…'), "described whole, not cut: {longest} characters of {}", super::agentzip::MAX_CAMPAIGN_TEXT);
+    assert!(longest > super::agentzip::MAX_CAMPAIGN_TEXT * 3 / 4, "and it is the longest a campaign comes to, so the most it says is not far above it: {longest}");
+    assert!(item.what.starts_with("phone calls to 12 people") && item.what.contains("It was RUNNING when the backup was made; it comes back PAUSED"), "what comes of the campaign is first: {}", &item.what[..300.min(item.what.len())]);
+    for last in ["42 more questions are not listed here", "Person 10 (", "2 more people are not listed here", "Skipped at planning 10 (", "2 more people skipped at planning are not listed here"] {
+        assert!(item.what.contains(last), "{last:?} is there: {longest} characters");
+    }
 }
-
 // ---- the kinds of tick, on the desktop and on the dashboard -----------------------------------------------
 
 /// The dashboard knows the kinds the desktop has: the union of ids in api.ts is `RestoreClass::ALL`, in the same order, and the
