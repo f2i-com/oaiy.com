@@ -46,3 +46,96 @@ fn derive_by_purpose_is_the_free_form_derivation_of_its_registry_row() {
         seen.push(*typed.expose());
     }
 }
+
+/// The `*_into` functions (review low 1 of the second review) write the key where the caller says and leave none in the stack below it (`tests/zeroize_stack.rs` counts that).
+/// What they must also do is the same thing as the by-value functions: give the same key, and on an error **not write** `out`, so that a caller that ignores the error
+/// has a zero key and not half of one.
+#[test]
+fn the_into_variants_write_what_the_by_value_functions_return_and_leave_out_untouched_on_an_error() {
+    use oaiy_crypto::aead::{unwrap_key, unwrap_key_into, wrap_key};
+    use oaiy_crypto::argon::MEM_MIN;
+    use oaiy_crypto::bip39::{self, Entropy};
+    use oaiy_crypto::canon::{Aad, AadDomain};
+    use oaiy_crypto::kit::RecoveryKit;
+    use oaiy_crypto::x25519::SecretKey;
+    use oaiy_crypto::Error;
+
+    let master = Secret::<32>::new(std::array::from_fn(|i| i as u8 * 5 + 3));
+    let zero = [0u8; 32];
+
+    // kdf::derive_into, for every registry row
+    for purpose in [Purpose::KitWrap, Purpose::PhraseWrap, Purpose::PrfWrap, Purpose::BackupRecipient, Purpose::BackupSigning, Purpose::LocalData] {
+        let mut out = Secret::<32>::zeroed();
+        kdf::derive_into(&master, purpose, &mut out).unwrap();
+        assert_eq!(out, kdf::derive(&master, purpose).unwrap(), "{purpose:?}");
+        assert_ne!(out.expose(), &zero);
+    }
+    // hkdf, for the sizes that are keys
+    let by_value: Secret<32> = kdf::hkdf_sha256_secret(master.expose(), Some(b"salt"), b"info").unwrap();
+    let mut out = Secret::<32>::zeroed();
+    kdf::hkdf_sha256_secret_into(master.expose(), Some(b"salt"), b"info", &mut out).unwrap();
+    assert_eq!(out, by_value);
+    let mut long = Secret::<64>::zeroed();
+    kdf::hkdf_sha256_secret_into(master.expose(), None, b"info", &mut long).unwrap();
+    assert_eq!(long, kdf::hkdf_sha256_secret::<64>(master.expose(), None, b"info").unwrap());
+    // the kit
+    let kit = RecoveryKit::from_bytes(Secret::new([0x42; 32]));
+    let mut out = Secret::<32>::zeroed();
+    kit.wrap_key_into(&mut out).unwrap();
+    assert_eq!(out, kit.wrap_key().unwrap());
+    // x25519, and the refusal of a result of small order leaves `out` as it was
+    let (mine, theirs) = (SecretKey::from_bytes([0x11; 32]), SecretKey::from_bytes([0x22; 32]).public_key());
+    let mut out = Secret::<32>::zeroed();
+    mine.diffie_hellman_into(&theirs, &mut out).unwrap();
+    assert_eq!(out, mine.diffie_hellman(&theirs).unwrap());
+    // aead: the same key, and a wrong wrapping key, a wrong AAD and a wrong length leave `out` alone
+    let aad = Aad::new(AadDomain::VaultWrap, &["u", "w", "recovery-phrase", "x"]).unwrap();
+    let other_aad = Aad::new(AadDomain::VaultWrap, &["u", "w", "recovery-phrase", "y"]).unwrap();
+    let inner = Secret::<32>::new([0x77; 32]);
+    let wrapped = wrap_key(&master, &aad, &inner).unwrap();
+    let mut out = Secret::<32>::zeroed();
+    unwrap_key_into(&master, &aad, &wrapped, &mut out).unwrap();
+    assert_eq!((&out, &unwrap_key(&master, &aad, &wrapped).unwrap()), (&inner, &inner));
+    for (why, result) in [
+        ("another wrapping key", {
+            let mut o = Secret::<32>::zeroed();
+            let r = unwrap_key_into(&Secret::new([1; 32]), &aad, &wrapped, &mut o);
+            (r, o)
+        }),
+        ("another AAD", {
+            let mut o = Secret::<32>::zeroed();
+            let r = unwrap_key_into(&master, &other_aad, &wrapped, &mut o);
+            (r, o)
+        }),
+        ("a truncated blob", {
+            let mut o = Secret::<32>::zeroed();
+            let r = unwrap_key_into(&master, &aad, &wrapped[..71], &mut o);
+            (r, o)
+        }),
+    ] {
+        assert_eq!(result.0.unwrap_err(), Error::DecryptFailed, "{why}");
+        assert_eq!(result.1.expose(), &zero, "{why}: `out` was written on an error");
+    }
+    // the phrase: the same wrap key, and a bad phrase leaves `out` alone and runs no key derivation
+    let entropy = Entropy::from_bytes([0x5a; 16]);
+    let salt = [3u8; 16];
+    let mut out = Secret::<32>::zeroed();
+    bip39::wrap_key_into(&entropy, &salt, 3, MEM_MIN, &mut out).unwrap();
+    assert_eq!(out, bip39::wrap_key(&entropy, &salt, 3, MEM_MIN).unwrap());
+    let phrase = bip39::encode(&entropy);
+    let mut from_phrase = Secret::<32>::zeroed();
+    bip39::phrase_wrap_key_into(phrase.expose(), &salt, 3, MEM_MIN, &mut from_phrase).unwrap();
+    assert_eq!(from_phrase, out);
+    let mut untouched = Secret::<32>::zeroed();
+    assert!(bip39::phrase_wrap_key_into(
+        "abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon",
+        &salt,
+        3,
+        MEM_MIN,
+        &mut untouched
+    )
+    .is_err());
+    assert_eq!(untouched.expose(), &zero);
+    assert_eq!(bip39::wrap_key_into(&entropy, &salt, 2, MEM_MIN, &mut untouched).unwrap_err(), Error::KdfParamsOutOfRange);
+    assert_eq!(untouched.expose(), &zero, "a refused Argon2 parameter leaves `out` alone");
+}

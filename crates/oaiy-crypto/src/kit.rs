@@ -16,7 +16,7 @@ use zeroize::{Zeroize, Zeroizing};
 use crate::error::Error;
 use crate::kdf::{self, sha256, Purpose};
 use crate::text::is_js_space;
-use crate::zeroize::{Secret, SecretString};
+use crate::zeroize::{scrub_stack, Secret, SecretString};
 
 /// The longest text `decode` looks at, in bytes: a code is 75 characters, and the rest is room for the white space a person types. Longer is `KitFormat`. (FormLogic's
 /// decoder has no cap; this is one of the places where this decoder is stricter, and `tests/vectors/text-corpus.json` has the boundary: 256 bytes accepted, 257 not.)
@@ -61,7 +61,10 @@ impl RecoveryKit {
 
     /// A fresh key from the operating system's random generator.
     pub fn generate() -> Result<RecoveryKit, Error> {
-        Ok(RecoveryKit(Secret::random()?))
+        let mut key = Secret::<32>::zeroed();
+        key.fill_random()?;
+        scrub_stack();
+        Ok(RecoveryKit(key))
     }
 
     /// The key.
@@ -134,6 +137,11 @@ impl RecoveryKit {
     /// `kdf(1, "flrecov1", key)`: the key that wraps the UMK.
     pub fn wrap_key(&self) -> Result<Secret<32>, Error> {
         kdf::derive(&self.0, Purpose::KitWrap)
+    }
+
+    /// [`RecoveryKit::wrap_key`], written into `out` in place: no copy of the wrap key is left in the stack below the caller (see `kdf::derive_into`).
+    pub fn wrap_key_into(&self, out: &mut Secret<32>) -> Result<(), Error> {
+        kdf::derive_into(&self.0, Purpose::KitWrap, out)
     }
 }
 

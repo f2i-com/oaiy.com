@@ -31,11 +31,28 @@ impl<const N: usize> Secret<N> {
         Ok(Secret(array))
     }
 
+    /// `N` zero bytes: a place for a secret to be written **in place** (see [`Secret::expose_mut`]). A secret that a function returns by value is copied at every move between
+    /// the frame that made it and the frame that holds it, and the copies stay in stack that has been given back; a caller that makes the `Secret` itself and hands the function
+    /// `&mut` of it (the `*_into` functions) gets the value written once, where it will live.
+    pub const fn zeroed() -> Self {
+        Secret([0u8; N])
+    }
+
+    /// The bytes, writable: for the `*_into` functions of this crate, which fill a secret in place. Write to it and never copy out of it.
+    pub fn expose_mut(&mut self) -> &mut [u8; N] {
+        &mut self.0
+    }
+
+    /// Fills the bytes from the operating system's random generator, in place (the random bytes are written once, where they will live).
+    pub fn fill_random(&mut self) -> Result<(), Error> {
+        crate::random::fill(&mut self.0)
+    }
+
     /// `N` bytes from the operating system's random generator.
     pub fn random() -> Result<Self, Error> {
-        let mut bytes = [0u8; N];
-        crate::random::fill(&mut bytes)?;
-        Ok(Secret(bytes))
+        let mut secret = Secret::zeroed();
+        secret.fill_random()?;
+        Ok(secret)
     }
 
     /// The bytes, for use as a key or a message. Keep the borrow short; never copy them into a type without zeroization.
@@ -134,10 +151,12 @@ pub fn ct_eq(a: &[u8], b: &[u8]) -> bool {
     a.ct_eq(b).into()
 }
 
-/// How much of the stack below the caller is overwritten by [`scrub_stack`]: as much as a computation on a key can have used. The frames of a debug build are very large
-/// (the BLAKE2b computation reaches about 80 KiB down; the computation needs that much stack itself, so scrubbing it asks for nothing new), those of an optimised build
-/// a few hundred bytes.
-const SCRUB_DEPTH: usize = if cfg!(debug_assertions) { 96 * 1024 } else { 4 * 1024 };
+/// How much of the stack below the caller is overwritten by [`scrub_stack`]: **one depth, in every build configuration** (review low 1: it was keyed on `debug_assertions`, which is
+/// not what decides how deep a computation's frames are, and a build with assertions off and no optimisation left a copy of the master key that the depth of a debug build would
+/// have reached). The frames of a computation are largest with no optimisation (the BLAKE2b computation reaches about 80 KiB down; measured: 8 KiB and 64 KiB left a copy, 88 KiB left
+/// none) and a few hundred bytes with it; 96 KiB covers every configuration that was measured (dev, release at opt-level 0, 1, 2, 3, s and z, with and without assertions), and what
+/// it costs is one `memset` of 96 KiB per derivation, and stack that the computation needed anyway. A thread with less than about 200 KiB of stack left is not safe to derive on.
+const SCRUB_DEPTH: usize = 96 * 1024;
 
 /// Overwrites the stack below its caller with zeros. A function that has worked on a key leaves, in the stack space it has given back, the copies that moves made
 /// (Rust cannot name them and `zeroize` cannot reach them: a state that is moved into a function is copied, and dropping wipes one of the places). Calling this, from

@@ -26,7 +26,7 @@ use crate::argon;
 use crate::error::Error;
 use crate::kdf::{self, sha256, Purpose};
 use crate::text::{is_js_space, push_zeroizing};
-use crate::zeroize::{Secret, SecretString};
+use crate::zeroize::{scrub_stack, Secret, SecretString};
 
 /// The list, one word per line, LF-terminated.
 const WORDLIST: &str = include_str!("bip39_english.txt");
@@ -57,7 +57,10 @@ impl Entropy {
 
     /// Sixteen bytes from the operating system's random generator: how a phrase is made.
     pub fn random() -> Result<Entropy, Error> {
-        Ok(Entropy(Secret::random()?))
+        let mut secret = Secret::<16>::zeroed();
+        secret.fill_random()?;
+        scrub_stack();
+        Ok(Entropy(secret))
     }
 
     /// The bytes.
@@ -153,9 +156,21 @@ pub fn decode(input: &str) -> Result<Entropy, Error> {
 
 /// `wk = kdf(1, "flphras1", argon2id13(entropy16, salt16, ops, mem))`, the key that wraps the UMK (design 4.3). Argon2's bounds are
 /// checked before it runs (`KdfParamsOutOfRange`), and it takes the entropy, which exists only after the checksum was verified.
+pub fn wrap_key_into(entropy: &Entropy, salt: &[u8], ops: u64, mem_bytes: u64, out: &mut Secret<32>) -> Result<(), Error> {
+    let ikm = argon::argon2id13(entropy.expose(), salt, ops, mem_bytes)?;
+    kdf::derive_into(&ikm, Purpose::PhraseWrap, out)
+}
+
+/// [`wrap_key_into`] by value (which leaves a copy of the wrap key in the frame that made it: see `kdf::derive`).
 pub fn wrap_key(entropy: &Entropy, salt: &[u8], ops: u64, mem_bytes: u64) -> Result<Secret<32>, Error> {
     let ikm = argon::argon2id13(entropy.expose(), salt, ops, mem_bytes)?;
     kdf::derive(&ikm, Purpose::PhraseWrap)
+}
+
+/// The words to the wrap key, written into `out` in place: [`decode`] (the checksum, before any KDF work), then [`wrap_key_into`].
+pub fn phrase_wrap_key_into(phrase: &str, salt: &[u8], ops: u64, mem_bytes: u64, out: &mut Secret<32>) -> Result<(), Error> {
+    let entropy = decode(phrase)?;
+    wrap_key_into(&entropy, salt, ops, mem_bytes, out)
 }
 
 /// The words to the wrap key: [`decode`] (the checksum, before any KDF work), then [`wrap_key`].

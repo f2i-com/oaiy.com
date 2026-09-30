@@ -17,7 +17,7 @@ use x25519_dalek::{PublicKey as DalekPublic, StaticSecret};
 use zeroize::{Zeroize, ZeroizeOnDrop};
 
 use crate::error::Error;
-use crate::zeroize::Secret;
+use crate::zeroize::{scrub_stack, Secret};
 
 /// Key, public key and shared secret length.
 pub const KEY_LEN: usize = 32;
@@ -113,8 +113,17 @@ impl SecretKey {
 
     /// A fresh key from the operating system's random generator.
     pub fn generate() -> Result<SecretKey, Error> {
-        let secret: Secret<32> = Secret::random()?;
-        Ok(SecretKey::from_bytes(*secret.expose()))
+        let mut secret = Secret::<32>::zeroed();
+        secret.fill_random()?;
+        let key = SecretKey::from_secret(&secret);
+        scrub_stack();
+        Ok(key)
+    }
+
+    /// From a secret that the caller holds: the key is copied once, inside this function, and not through the caller's frame.
+    #[inline(never)]
+    pub fn from_secret(secret: &Secret<32>) -> SecretKey {
+        SecretKey(StaticSecret::from(*secret.expose()))
     }
 
     /// libsodium's `crypto_box_seed_keypair`: the private key is the first 32 bytes of SHA-512 of the 32-byte seed.
@@ -139,13 +148,29 @@ impl SecretKey {
         Secret::new(self.0.to_bytes())
     }
 
-    /// X25519 with a peer's public key. An all-zero result is `Error::LowOrderPoint` and no secret is returned.
+    /// X25519 with a peer's public key. An all-zero result is `Error::LowOrderPoint` and no secret is returned. The secret comes back **by value**, which leaves a copy in
+    /// the frame that made it (see `kdf::derive`); [`SecretKey::diffie_hellman_into`] leaves none.
     pub fn diffie_hellman(&self, peer: &PublicKey) -> Result<Secret<32>, Error> {
+        let mut out = Secret::zeroed();
+        self.diffie_hellman_into(peer, &mut out)?;
+        Ok(out)
+    }
+
+    /// [`SecretKey::diffie_hellman`], written into `out` in place: no copy of the shared secret is left in the stack below the caller. On an error `out` is not written.
+    pub fn diffie_hellman_into(&self, peer: &PublicKey, out: &mut Secret<32>) -> Result<(), Error> {
+        let result = self.dh_unscrubbed(peer, out);
+        scrub_stack();
+        result
+    }
+
+    #[inline(never)]
+    fn dh_unscrubbed(&self, peer: &PublicKey, out: &mut Secret<32>) -> Result<(), Error> {
         let shared = self.0.diffie_hellman(&DalekPublic::from(peer.0));
         if !shared.was_contributory() {
             return Err(Error::LowOrderPoint);
         }
-        Ok(Secret::new(shared.to_bytes()))
+        out.expose_mut().copy_from_slice(shared.as_bytes());
+        Ok(())
     }
 }
 

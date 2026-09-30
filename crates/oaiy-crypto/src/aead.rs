@@ -111,11 +111,23 @@ pub fn wrap_key(wrapping: &Secret<32>, aad: &Aad, key: &Secret<32>) -> Result<[u
     blob.try_into().map_err(|_| Error::InvalidLength("wrapped key"))
 }
 
-/// Unwraps a 32-byte key from exactly 72 bytes; any other length is `DecryptFailed`.
+/// Unwraps a 32-byte key from exactly 72 bytes; any other length is `DecryptFailed`. The key comes back **by value**, which leaves a copy of it in the frame that made it
+/// (see `kdf::derive`); [`unwrap_key_into`] leaves none, and is what to use for a key that is long-lived or that must not be found in memory (the UMK).
 pub fn unwrap_key(wrapping: &Secret<32>, aad: &Aad, blob: &[u8]) -> Result<Secret<32>, Error> {
+    let mut out = Secret::zeroed();
+    unwrap_key_into(wrapping, aad, blob, &mut out)?;
+    Ok(out)
+}
+
+/// [`unwrap_key`], written into `out` in place. On an error `out` is not written.
+pub fn unwrap_key_into(wrapping: &Secret<32>, aad: &Aad, blob: &[u8], out: &mut Secret<32>) -> Result<(), Error> {
     if blob.len() != WRAPPED_KEY_LEN {
         return Err(Error::DecryptFailed);
     }
     let plain = unwrap(wrapping, aad, blob)?;
-    Secret::from_slice(plain.expose()).map_err(|_| Error::DecryptFailed)
+    if plain.len() != KEY_LEN {
+        return Err(Error::DecryptFailed);
+    }
+    out.expose_mut().copy_from_slice(plain.expose());
+    Ok(())
 }

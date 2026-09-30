@@ -233,8 +233,11 @@ impl SigningKey {
 
     /// A fresh key from the operating system's random generator.
     pub fn generate(role: KeyRole) -> Result<SigningKey, Error> {
-        let seed: Secret<32> = Secret::random()?;
-        Ok(SigningKey::from_seed(role, &seed))
+        let mut seed = Secret::<32>::zeroed();
+        seed.fill_random()?; // written once, where it lives, and wiped when it is dropped
+        let key = SigningKey::from_seed(role, &seed);
+        scrub_stack(); // the frames of the random generator and of the expansion are below this one
+        Ok(key)
     }
 
     /// From libsodium's 64-byte secret key (`seed || public key`, the form FormLogic's key bundle stores). The public half must be

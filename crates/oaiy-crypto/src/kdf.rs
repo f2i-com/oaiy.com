@@ -150,17 +150,20 @@ impl Purpose {
 /// `kdf(id, ctx8, key)` for a registered purpose: 32 bytes. **The only derivation in the library that production code has** (review L-10): the context and the subkey
 /// id come from the registry row of the [`Purpose`], so a caller cannot derive under a context that the registry does not hold (a misspelt one, another component's, one
 /// that is reserved), and adding a purpose means adding a registry row, which the tests that guard the registry see.
+///
+/// The key comes back **by value**, which leaves a copy of it in the frame that made it once that frame has returned (one in a build with no optimisation, and none or one in an
+/// optimised one: `tests/zeroize_stack.rs` counts them). A caller that keeps the key for a while, or that has to show that no key is left in memory after it has connected
+/// (design test P9), uses [`derive_into`], which writes the key where the caller says and leaves none.
 pub fn derive(master: &Secret<32>, purpose: Purpose) -> Result<Secret<32>, Error> {
-    let entry = purpose.entry();
-    derive_32(master, entry.id, &entry.context)
+    let mut out = Secret::zeroed();
+    derive_into(master, purpose, &mut out)?;
+    Ok(out)
 }
 
-fn derive_32(master: &Secret<32>, id: u64, context: &Context) -> Result<Secret<32>, Error> {
-    let mut out = [0u8; 32];
-    let result = derive_into(master, id, context, &mut out);
-    let secret = Secret::new(out);
-    out.zeroize();
-    result.map(|()| secret)
+/// [`fn@derive`], written into `out` in place: no copy of the derived key is left in the stack below the caller (review low 1: the by-value functions left one to three).
+pub fn derive_into(master: &Secret<32>, purpose: Purpose, out: &mut Secret<32>) -> Result<(), Error> {
+    let entry = purpose.entry();
+    derive_bytes(master, entry.id, &entry.context, out.expose_mut())
 }
 
 /// `crypto_kdf_derive_from_key` with a 32-byte output, for any subkey id and any (valid) context: for the known-answer tests (FormLogic's second `flrecov1` vector uses
@@ -168,7 +171,9 @@ fn derive_32(master: &Secret<32>, id: u64, context: &Context) -> Result<Secret<3
 /// under a context of its own.
 #[cfg(any(test, feature = "test-vectors"))]
 pub fn derive_subkey(master: &Secret<32>, id: u64, context: &Context) -> Result<Secret<32>, Error> {
-    derive_32(master, id, context)
+    let mut out = Secret::zeroed();
+    derive_bytes(master, id, context, out.expose_mut())?;
+    Ok(out)
 }
 
 /// `crypto_kdf_derive_from_key` for a 16, 32 or 64 byte output (libsodium allows 16 to 64; nothing here needs the others). Only with the `test-vectors` feature, like
@@ -178,14 +183,14 @@ pub fn derive_subkey_into(master: &Secret<32>, id: u64, context: &Context, out: 
     if !matches!(out.len(), 16 | 32 | 64) {
         return Err(Error::KdfContext);
     }
-    derive_into(master, id, context, out)
+    derive_bytes(master, id, context, out)
 }
 
 /// `kdf(id, ctx, key)` into `out`, and then the stack the computation used is overwritten (review L-7): the BLAKE2b state copies the master key into a block when
 /// it is built and is moved into `finalize`, which copies it again; dropping the state wipes one place, and the copies the moves left in the frames of the functions
 /// that have returned stayed in the dead stack, where a memory scan finds them (four copies of the 32-byte master key after `kdf::derive`; the design's test P9, "no UMK
 /// in a memory scan after connect", would have tripped). See [`scrub_stack`].
-fn derive_into(master: &Secret<32>, id: u64, context: &Context, out: &mut [u8]) -> Result<(), Error> {
+fn derive_bytes(master: &Secret<32>, id: u64, context: &Context, out: &mut [u8]) -> Result<(), Error> {
     let result = derive_unscrubbed(master, id, context, out);
     scrub_stack();
     result
@@ -233,13 +238,16 @@ fn hkdf_unscrubbed(ikm: &[u8], salt: Option<&[u8]>, info: &[u8], out: &mut [u8])
     Hkdf::<Sha256>::new(salt, ikm).expand(info, out).map_err(|_| Error::HkdfLength)
 }
 
-/// HKDF-SHA256 with a fixed-size secret output.
+/// HKDF-SHA256 with a fixed-size secret output, **by value** (which leaves a copy in the frame that made it: see [`fn@derive`]; [`hkdf_sha256_secret_into`] leaves none).
 pub fn hkdf_sha256_secret<const N: usize>(ikm: &[u8], salt: Option<&[u8]>, info: &[u8]) -> Result<Secret<N>, Error> {
-    let mut out = [0u8; N];
-    let result = hkdf_sha256(ikm, salt, info, &mut out);
-    let secret = Secret::new(out);
-    out.zeroize();
-    result.map(|()| secret)
+    let mut out = Secret::zeroed();
+    hkdf_sha256_secret_into(ikm, salt, info, &mut out)?;
+    Ok(out)
+}
+
+/// [`hkdf_sha256_secret`], written into `out` in place: no copy of the derived key is left in the stack below the caller.
+pub fn hkdf_sha256_secret_into<const N: usize>(ikm: &[u8], salt: Option<&[u8]>, info: &[u8], out: &mut Secret<N>) -> Result<(), Error> {
+    hkdf_sha256(ikm, salt, info, &mut out.expose_mut()[..])
 }
 
 /// HMAC-SHA256. HMAC takes a key of any length, so the error is never returned; it is mapped, not unwrapped, so that
