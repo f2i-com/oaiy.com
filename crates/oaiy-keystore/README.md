@@ -2,8 +2,15 @@
 
 **K1**, the named-secret keystore of the OAIY desktop: work package **V-02** of `design/vault.final.md`, section 4.5.1. A library, not linked by the
 desktop yet; the relay design (D1: `relay.token`, `relay.host_identity`, `endpoint.x25519.<plugin>`) and the apps design (V1: `link.credential`) can code
-against the trait now. A workspace member, not a default member: `cargo test -p oaiy-keystore` runs it, and the `vault-linux` and `vault-windows` lanes of
-`.github/workflows/ci.yml` run it (and `oaiy-crypto`) on both platforms and in the release gate.
+against the trait now. A workspace member, not a default member: `cargo test -p oaiy-keystore` runs it **as a product is built** (see the feature below), `cargo test -p oaiy-keystore
+--features unsafe-keyfile` runs everything (on Windows, the keyfile tests too), and the `vault-linux` and `vault-windows` lanes of `.github/workflows/ci.yml` run both (and `oaiy-crypto`,
+and the keystore's tests in a release build, where the unsafe name is refused too) on both platforms and in the release gate.
+
+**The `unsafe-keyfile` feature** (off by default, and never to be enabled by a product or a dependency): adds `ProviderChoice::KeyfileUnsafe` (`keyfile-unsafe-for-tests`), the keyfile
+provider on Windows, where nothing in this crate makes a file private and the plain `keyfile` is refused. Without it the name is `ProviderUnavailable` (from `ProviderChoice::parse` and from
+`OAIY_KEY_PROVIDER`), the variant does not exist, and **on Windows the plaintext codec is not compiled in at all**, so no setting can make a Windows build store a value in the clear
+(it used to be accepted from the environment in every build, and on a fresh Windows folder it made a plaintext store). The CI lanes check that the documentation of the library built
+without the feature has no `KeyfileUnsafe`.
 
 ```rust
 let store = oaiy_keystore::open(&data_dir, ProviderChoice::from_env()?)?;   // <data>/keys, provider from OAIY_KEY_PROVIDER
@@ -41,7 +48,7 @@ prefix of its own (`endpoint.x25519.<hex>`), and the mapping is the caller's to 
 | Provider | Where | What protects the value | Choice |
 |---|---|---|---|
 | `windows-dpapi-file` | `<data>/keys/<name>.ks` = `"OAIYKS1" \|\| 0x01 \|\|` DPAPI blob | Windows DPAPI, user scope (never `LOCAL_MACHINE`: the blob's flags are asserted to be zero), no UI, the name bound in as entropy `SHA-256("oaiy-ks:1\|" + name)` | the default on Windows |
-| `keyfile` | `<data>/keys/<name>.kf` = `"OAIYKF1" \|\| 0x01 \|\| tag \|\| u32be(len) \|\| value \|\| check` | file permissions only: `0600` in a `0700` directory, in directories that others cannot rename in; the loader refuses looser modes, links, FIFOs and another owner. **The weakest provider; the value is in the clear in that file. Refused on Windows** (no modes there, and no ACL is set): `ProviderChoice::KeyfileUnsafe`, `keyfile-unsafe-for-tests`, is the only way to it, and is for tests | by name on Unix (`OAIY_KEY_PROVIDER=keyfile`), for headless machines |
+| `keyfile` | `<data>/keys/<name>.kf` = `"OAIYKF1" \|\| 0x01 \|\| tag \|\| u32be(len) \|\| value \|\| check` | file permissions only: `0600` in a `0700` directory, in directories that others cannot rename in; the loader refuses looser modes, links, FIFOs and another owner. **The weakest provider; the value is in the clear in that file. Refused on Windows** (no modes there, and no ACL is set): `ProviderChoice::KeyfileUnsafe`, `keyfile-unsafe-for-tests`, is the only way to it, exists only with the `unsafe-keyfile` feature, and is for tests | by name on Unix (`OAIY_KEY_PROVIDER=keyfile`), for headless machines |
 | `os-keyring` (Secret Service) | | | named, **not built**: it answers `ProviderUnavailable` and never falls back |
 
 `Auto` (unset `OAIY_KEY_PROVIDER`) is DPAPI on Windows and an error everywhere else: no provider is chosen for you where none is strong, and a typo in the
@@ -76,7 +83,7 @@ in by another user was read as the real one, a FIFO hung a read for ever, and op
   user's keys served as the current value). So a path with a junction, a symbolic link or a mount point on it, **at any level**, is refused at open (walked before the folder is
   opened and again once it is held); every operation works in the held folder by its real path (the handle's final path: no junction in it, and it cannot change while the handle
   is open); before each operation the path is opened afresh and its volume and file index compared with the handle's; and every file is opened as itself and refused if it is a
-  reparse point, not a regular file, or has more than one name. The folder is flushed after a rename and a removal. A reparse point of any kind is refused, cloud placeholders
+  reparse point, not a regular file, or has more than one name (**on Unix too**: a key file has exactly one name, and a put repairs one that has two). The folder is flushed after a rename and a removal. A reparse point of any kind is refused, cloud placeholders
   (OneDrive) and a profile folder moved by junction included: fail closed; give the store the real path. **What is left, and is not claimed away:** whoever can write in the keys
   folder itself can delete a key file (a caller then sees `None`, "never stored") or put back an older copy of a DPAPI blob (which the same user can unprotect: a rollback). Windows
   gives `E:\` and other roots that nobody set up "Modify" to Authenticated Users, which is exactly that: **keep the data folder under the user's profile** (`%LOCALAPPDATA%`,
@@ -111,10 +118,15 @@ Tests marked (all) run on every provider the platform has: the keyfile on Unix a
 | a FIFO in place of a key file is refused at once and never blocks; a link, another owner (M-3) | `keystore::unix::a_fifo_in_place_of_a_key_file_is_refused_at_once_and_never_blocks`, `keystore::unix::a_symbolic_link_in_place_of_the_file_or_the_directory_is_refused`, `perm::tests::*` |
 | the folders above the keys folder: not writable by others unless sticky, not another user's, judged as the file system has them (M-3) | `keystore::unix::a_folder_above_the_keys_folder_that_others_can_rename_in_is_refused_unless_it_is_sticky`, `keystore::unix::the_folders_above_are_those_of_the_real_folder_however_the_path_reaches_it`, `perm::tests::an_ancestor_that_others_can_rename_in_is_refused_unless_it_is_sticky` |
 | the owner rule is applied at open, before each operation, to a file, to the lock and to the folders above | `store::tests::what_another_user_owns_is_refused_at_open_before_each_operation_in_a_file_the_lock_and_the_folders_above`; with a real second account: `keystore::unix::a_file_a_folder_and_a_parent_that_a_real_other_user_owns_are_refused` (`#[ignore]`, root) |
-| a junction or link where the folder or a file should be is refused (Windows, both providers) (L-9) | `keystore::windows::a_junction_in_place_of_the_keys_folder_is_refused_for_every_provider`, `keystore::windows::a_junction_or_a_file_in_place_of_a_key_file_is_an_error_not_none`, `keystore::windows::a_keys_path_that_is_a_file_is_refused` |
+| a junction or link where the folder or a file should be is refused (Windows, both providers) (L-9), and a `keys` path that is a file is refused **as** "not a directory" (the kind is asserted: K17) | `keystore::windows::a_junction_in_place_of_the_keys_folder_is_refused_for_every_provider`, `keystore::windows::a_junction_or_a_file_in_place_of_a_key_file_is_an_error_not_none`, `keystore::windows::a_keys_path_that_is_a_file_is_refused_as_not_a_directory` |
+| **a junction above the keys folder is refused, and nothing is made through it** (Windows, both providers) (M-1) | `keystore::windows::a_junction_above_the_keys_folder_is_refused_for_every_provider_and_nothing_is_made_through_it`, `keydir::sys::tests::a_junction_put_in_place_of_a_folder_between_the_walk_and_the_open_is_found_by_the_second_walk` (a hook puts the junction between the first walk and the open) |
+| **the rollback through a re-pointed junction cannot happen**: the store that is open keeps answering with the current value, and a store opened through a junction to either copy is refused (M-1) | `keystore::windows::a_junction_pointed_at_an_older_copy_of_the_keys_folder_cannot_roll_a_value_back`, `keystore::windows::the_real_folders_above_the_keys_folder_cannot_be_renamed_or_replaced_while_the_store_is_open` |
+| **a path that leads elsewhere is an error, never `None`, and every file is the held folder's** (M-1 (b) and (c)) | `keydir::sys::tests::a_path_that_leads_elsewhere_is_an_error_and_every_file_is_still_the_held_folders`, `store::tests::a_store_whose_path_leads_elsewhere_answers_with_errors_never_none_and_never_the_other_trees_value`; `winfs::tests::*` (the id, the final path, a path longer than the first buffer); the rules that judge a handle, over every attribute with made-up handles (a reparse point that is not a folder, a folder where a key file should be, a file with two names): `keydir::sys::tests::the_rules_for_a_folder_and_for_a_key_file_hold_over_every_attribute` |
+| a key file has exactly one name (Windows and Unix) | `perm::tests::a_key_file_with_more_than_one_name_is_refused_and_a_folder_is_not_judged_by_its_count`, `keystore::unix::a_key_file_with_another_hard_link_is_refused_until_the_extra_name_is_gone`, `keystore::windows::a_key_file_with_another_hard_link_is_refused_until_the_extra_name_is_gone` |
+| the unsafe keyfile is not in a build without the feature: refused from `parse` and from `OAIY_KEY_PROVIDER`, no plaintext provider on Windows, no folder made | `keystore::a_build_without_the_unsafe_keyfile_feature_refuses_the_unsafe_name_and_windows_has_no_plaintext_provider`, `keystore::the_provider_is_chosen_on_purpose_and_a_typo_is_an_error` (run without `--features`); with the feature: `keystore::the_keyfile_is_refused_on_windows_and_the_unsafe_name_is_needed_to_use_it_there` |
 | a put and a delete flush the folder (L-9) | `store::tests::a_put_and_a_delete_flush_the_folder` |
-| **a reader is never told that a key that exists was never stored** (H-1) | `store::tests::a_reader_waits_for_a_writer_in_the_middle_of_a_replace_and_is_never_told_that_nothing_is_stored`, `keystore::readers_never_see_a_name_that_other_processes_are_rewriting_as_missing_or_torn` (two writer processes, three reader threads), `store::tests::readers_share_the_lock_and_a_holder_that_never_lets_go_is_an_error_after_the_wait`, `store::tests::a_put_does_not_hold_the_lock_while_it_writes` |
-| a folder remembers its provider; the other provider's files are refused everywhere (M-2) | `keystore::a_folder_remembers_its_provider_and_refuses_to_be_opened_with_another`, `keystore::a_secret_of_another_providers_kind_is_an_error_everywhere_never_none_and_never_a_second_value`, `keystore::the_keyfile_is_refused_on_windows_and_the_unsafe_name_is_needed_to_use_it_there` |
+| **a reader is never told that a key that exists was never stored** (H-1) | `store::tests::a_reader_that_starts_in_the_middle_of_a_puts_rename_waits_and_never_returns_none` (**the guard**: the real put paused inside its locked rename step, on every platform), `store::tests::a_reader_waits_for_a_writer_in_the_middle_of_a_replace_and_is_never_told_that_nothing_is_stored`, `keystore::readers_never_see_a_name_that_other_processes_are_rewriting_as_missing_or_torn` (two writer processes, three reader threads: a weak guard, see the limits), `store::tests::readers_share_the_lock_and_a_holder_that_never_lets_go_is_an_error_after_the_wait`, `store::tests::a_put_does_not_hold_the_lock_while_it_writes` |
+| a folder remembers its provider; the other provider's files are refused everywhere (M-2) | `keystore::a_folder_remembers_its_provider_and_refuses_to_be_opened_with_another`, `keystore::a_secret_of_another_providers_kind_is_an_error_everywhere_never_none_and_never_a_second_value` |
 | opening the store never deletes a put in progress (L-6) | `store::tests::opening_the_store_removes_the_debris_of_an_interrupted_put_and_nothing_else`, `store::tests::a_put_in_progress_survives_another_process_opening_the_store`, `store::tests::a_slow_write_that_is_older_than_a_minute_is_not_debris_while_its_writer_holds_the_lock`, `keystore::puts_do_not_fail_while_the_store_is_being_opened_again_and_again` |
 | a blob moved to another name fails (all) | `keystore::a_blob_copied_or_moved_to_another_name_fails_and_never_yields_the_other_secret`, `dpapi::a_blob_that_names_a_master_key_this_user_does_not_hold_is_an_error` |
 | the formats and the DPAPI scope are pinned | `codec::tests::the_name_binding_and_the_keyfile_format_are_pinned_byte_for_byte`, `keystore::a_keyfile_is_the_pinned_format_on_disk_and_a_pinned_file_is_read`, `keystore::dpapi::the_file_is_a_dpapi_blob_with_the_magic_and_no_plaintext` (flags zero) |
@@ -143,23 +155,25 @@ A test cannot make a second user, and this crate does not create accounts. Three
   # in WSL, from Windows:   wsl -d Ubuntu-24.04 -u root -- /tmp/oaiy-vault-wsl/target/debug/deps/keystore-<hash> --ignored --nocapture --test-threads=1
   ```
 
-  Both ran on the final code in WSL2 Ubuntu 24.04 as root: the owner test passed, and the stress made 226,209 swaps in five seconds while the victim read 114,837
-  values of its own, got 1,782,504 errors (the folder is not where it was: fail closed), no `None` and no attacker value. The stress also asserts that a new `open` in the
+  Both ran on the final code in WSL2 Ubuntu 24.04 as root (rustc 1.94, from a copy in the WSL file system, run from `target/debug/deps/keystore-<hash>`): the owner test passed, and the stress made 227,612 swaps in
+  about five seconds while the victim read 165,115 values of its own, got 1,174,341 errors (the folder is not where it was: fail closed), no `None` and no attacker value. The stress also asserts that a new `open` in the
   world-writable parent is refused.
 
 ## Platforms, and what was actually run
 
 | Platform | Result |
 |---|---|
-| Windows 11 (this machine): DPAPI and the unsafe keyfile | `cargo test --locked -p oaiy-crypto -p oaiy-keystore`: **oaiy-keystore 47 passed, 1 ignored** (the other-user DPAPI test); with oaiy-crypto 98 passed and 1 ignored: 145 and 2 |
-| Linux (WSL2 Ubuntu 24.04, ext4, rustc 1.94, from a copy in the WSL file system, WSL stopped afterwards): keyfile, the `unix` tests, the two-process and FIFO tests, the allocator probe | **oaiy-keystore 53 passed, 2 ignored** (the two root tests, which also passed when run as root: above); with oaiy-crypto 151 and 3 |
+| Windows 11 (this machine): DPAPI and the unsafe keyfile | `cargo test --locked --no-fail-fast -p oaiy-crypto -p oaiy-keystore` (as a product is built): **oaiy-keystore 60 passed, 1 ignored** (the other-user DPAPI test; before the second review 47 and 1), oaiy-crypto 100 passed and 1 ignored (98 and 1): 160 and 2. With `--features unsafe-keyfile` the keystore is also 60 and 1. `cargo test --release -p oaiy-keystore` (no feature): 60 and 1, the refusal of the unsafe name included |
+| Linux (WSL2 Ubuntu 24.04, ext4, rustc 1.94, from a copy in the WSL file system, WSL stopped afterwards): keyfile, the `unix` tests, the two-process and FIFO tests, the allocator probe | **oaiy-keystore 56 passed, 2 ignored** (the two root tests, which also passed when run as root: above; before the second review 53 and 2), oaiy-crypto 100 and 1 (98 and 1): 156 and 3. The same with `--features unsafe-keyfile` (56 and 2), and in a release build (`cargo test --release -p oaiy-keystore`: 56 and 2) |
 | macOS | **compile only**: `cargo check --target aarch64-apple-darwin --all-targets` is clean (and is a step of the `vault-linux` lane); the keyfile provider is the only one there, and only by name |
 | `x86_64-unknown-linux-musl` | `cargo clippy --all-targets -- -D warnings` clean (compiles the Unix code from Windows) |
 
 ## Unsafe
 
-One module, `dpapi.rs`, Windows only: the two calls `CryptProtectData` and `CryptUnprotectData` (through `windows-sys`, bindings only) and `LocalFree`. The crate root is
-`#![deny(unsafe_code)]`, the module carries the one `#[allow(unsafe_code)]`, and each block says why it is sound. `rustix` (Unix) is used through its safe API only. What the DPAPI module does
+Two modules, both Windows only, both through `windows-sys` (bindings only). `dpapi.rs`: the two calls `CryptProtectData` and `CryptUnprotectData`, and `LocalFree`. `winfs.rs` (review M-1):
+`GetFileInformationByHandle` and `GetFileInformationByHandleEx` (which file a handle is: volume and file index, how many names it has, its attributes) and `GetFinalPathNameByHandleW` (where it
+really is), which `std` answers only on nightly (`windows_by_handle`) or not at all; each on a handle that a `&File` keeps open for the call, with a buffer the module owns. The crate root is
+`#![deny(unsafe_code)]`, each of the two modules carries its one `#[allow(unsafe_code)]`, and each block says why it is sound. `rustix` (Unix) is used through its safe API only. What the DPAPI module does
 that a safe wrapper could not: it copies the plaintext DPAPI returns into a zeroizing buffer, overwrites the system's copy with volatile writes and only then frees it. That overwrite cannot be
 observed from Rust (the memory is not the Rust allocator's); it is covered by review, and the mutant that removes it is reported as surviving.
 
@@ -172,7 +186,7 @@ as it is freed, the second records the largest request), with the safety argumen
 |---|---|---|---|
 | `oaiy-crypto` | path, 0.1.0 | Apache-2.0 | SHA-256 (the name binding and the integrity check), the constant-time `ct_eq`, the random generator; and its dependencies (46 crates, listed in its README) |
 | `zeroize` | 1.9.0 | Apache-2.0 OR MIT | `Zeroizing<Vec<u8>>`, the return type of `get` |
-| `windows-sys` | 0.61.2 | MIT OR Apache-2.0 | Windows only, features `Win32_Foundation` and `Win32_Security_Cryptography`: the DPAPI bindings. Already in the workspace lock (the tray app uses it), so it adds no package |
+| `windows-sys` | 0.61.2 | MIT OR Apache-2.0 | Windows only, features `Win32_Foundation`, `Win32_Security_Cryptography` (the DPAPI bindings) and `Win32_Storage_FileSystem` (the file id, link count and final path of a handle). Already in the workspace lock (the tray app uses it), so it adds no package |
 | `rustix` | 1.1.4 | Apache-2.0 WITH LLVM-exception OR Apache-2.0 OR MIT | Unix only, features `std`, `fs`, `process`, through its safe API: the directory descriptor and the calls relative to it (`openat`, `renameat`, `unlinkat`, `fsync`, directory listing), which std does not offer, and `geteuid`. Already in the workspace lock, so it adds no package (`bitflags`, `errno`, `libc`, `linux-raw-sys`, its own dependencies, are in it too) |
 
 No dev-dependencies. For the two crates together the workspace lock gained 39 `[[package]]` entries (`oaiy-crypto`, `oaiy-keystore` and 37 others, most of them the RustCrypto and dalek crates of `oaiy-crypto`'s tree, plus its dev-dependencies `bip39` and its own tree), and no existing package changed version: the edits to existing entries are that two dependency lines that said `rand_core` now say `rand_core 0.9.5`, because a second version is present, and one added line each for `rustix` (in `oaiy-keystore`) and `oaiy-crypto` (in its own dev-dependencies, for the `test-vectors` feature) (`git diff be3dd0bb..HEAD -- Cargo.lock`). `node platform/scripts/audit-vault-crates.mjs` audits the 75 packages of the two crates' tree with warnings denied (the CI lane runs it): clean.
@@ -186,8 +200,8 @@ No dev-dependencies. For the two crates together the workspace lock gained 39 `[
    device on Windows and the regular expression admits it (a design defect, below).
 4. **Values are at least one byte** (DPAPI refuses an empty one, and an empty secret is not a secret).
 5. **A keys folder that has gone is an error** on every operation (the design says `Err` never becomes "empty"; this applies it to the folder as well as the file).
-6. **`Auto` never selects the keyfile**, and **the keyfile is refused on Windows** except under its unsafe-for-tests name (review M-2; the design allows a keyfile; on Windows
-   nothing here could make it private, and setting an ACL needs more `unsafe`).
+6. **`Auto` never selects the keyfile**, and **the keyfile is refused on Windows**, and is there only in a build with the `unsafe-keyfile` feature, under its unsafe-for-tests name (review M-2 and
+   the second review; the design allows a keyfile; on Windows nothing here could make it private, and setting an ACL needs more `unsafe`).
 7. **The store holds its folder and locks it** (review H-1, M-3): a directory descriptor and calls relative to it on Unix, a handle that blocks renames on Windows, an
    advisory lock file, a provider marker. The design says only "`Ok(None)` is never stored" and "the loader refuses looser modes"; these are what it takes to make
    those true against another process and another user.
@@ -204,7 +218,15 @@ No dev-dependencies. For the two crates together the workspace lock gained 39 `[
 - The directories above the keys folder are judged when the store is opened, not before each operation (a folder renamed later is caught by the comparison with the path, which is every operation).
   On Windows the real folders above are held by the handle inside them and the path is compared with the handle before each operation; the window between the first walk for junctions
   and the open is closed by a second walk and the comparison, except for an attacker who flips the path back and forth faster than a check takes (every later operation compares again). A path through `/mnt/c` under WSL (drvfs: every file `0777`) is refused by the ancestor rule; use the Linux file system.
-- A crash between the flush and the rename leaves a temporary file until an `open` that finds it older than a minute and not locked.
+- A crash between the flush and the rename leaves a temporary file until an `open` that finds it older than a minute and not locked. That rule is tested at the minute on both platforms
+  (`store::tests::opening_the_store_removes_the_debris_of_an_interrupted_put_and_nothing_else`, which runs on Windows: a file of 50 seconds survives and one of 70 is removed).
+- **The lock wait is ten seconds** (`LOCK_WAIT`): one stall under Windows Defender in the reviewer's runs reached 8.5 seconds. An operation that gives up is an error that names the lock, fails
+  closed and changes nothing, so a slow machine costs a caller a retry and never a wrong answer.
+- **The two-process test is a weak guard of H-1**, and says so: the window is microseconds wide (the reviewer's lock-less store gave one false `None` in about 2.73 million reads and the locked
+  store none in 2.0 million, which proves little). The guard is deterministic: `store::tests::a_reader_that_starts_in_the_middle_of_a_puts_rename_waits_and_never_returns_none` pauses the real
+  `put` inside its locked rename step and requires that a reader waits and never returns `None`.
+- **Reparse points are refused at any level on Windows**, cloud placeholders (OneDrive) and a profile folder that was moved by a junction included: fail closed, give the store the real path.
+  The store does not read or set ACLs; the data folder belongs under the user's profile, not under `E:\` or another root that nobody set up (see "What the store does").
 - The plaintext that DPAPI allocates is overwritten by the module before it is freed, and that cannot be observed from a test (K23 below).
 
 ## Mutation checks
@@ -289,3 +311,32 @@ The survivors that cannot be observed from a test:
 A second finding of the round: the first version of the owner test (G01) passed even when `open` did not compare the owner, because the folders above, judged with the same pretended user, refused first. The test now also opens a folder directly under `/tmp`
 (root's and sticky) so that nothing above it is what refuses, and G01 is killed. The two-process test did not reproduce H-1 without the lock on this machine in two runs of 28 seconds (the reviewer saw it with Defender running); the deterministic test is what carries the
 finding, and the two-process test is what shows that two writer processes and three readers coexist.
+
+### Round 3, after the second review
+
+The second review found one medium (M-1, a junction above the keys folder on Windows) and lows. The mutants below break the code that fixed them, one place each, run the crate's suite (Windows, except R13 and R14, which are run on Linux under WSL; the ones that need the keyfile run with `--features unsafe-keyfile`, U01 and U03 without it) and restore the file from git (`scratchpad/vault-impl/mutate3.ps1` and `mutants3.ps1`, outside the repository; the crypto crate's half, the stack scrub and the in-place derivations, is in its README). **22 mutants of the keystore: 22 killed, none survived.**
+
+| R01 | the path is not walked before the folder is made (a folder is made through a junction above it) | KILLED | `a_junction_above_the_keys_folder_is_refused_for_every_provider_and_nothing_is_made_through_it` |
+| R02 | the path is not walked again once the folder is held (a junction put on the path between the first walk and the open is kept) | KILLED | `a_junction_put_in_place_of_a_folder_between_the_walk_and_the_open_is_found_by_the_second_walk` |
+| R03 | a reparse point is not refused (junction, symbolic link, mount point) | KILLED | `the_rules_for_a_folder_and_for_a_key_file_hold_over_every_attribute` |
+| R04 | the walk does not look at the folders on the way (only the keys folder is judged) | KILLED | `a_junction_put_in_place_of_a_folder_between_the_walk_and_the_open_is_found_by_the_second_walk`, `a_junction_above_the_keys_folder_is_refused_for_every_provider_and_nothing_is_made_through_it`, `a_junction_pointed_at_an_older_copy_of_the_keys_folder_cannot_roll_a_value_back` |
+| R05 | the path is not compared with the held folder (volume and file index) | KILLED | `a_path_that_leads_elsewhere_is_an_error_and_every_file_is_still_the_held_folders` |
+| R06 | verify does not compare the path with the handle before an operation | KILLED | `a_path_that_leads_elsewhere_is_an_error_and_every_file_is_still_the_held_folders` |
+| R07 | files are reached by the path the caller gave, not the real path of the held folder | KILLED | `a_path_that_leads_elsewhere_is_an_error_and_every_file_is_still_the_held_folders` |
+| R08 | a listing is of the path the caller gave, not of the held folder | KILLED | `a_path_that_leads_elsewhere_is_an_error_and_every_file_is_still_the_held_folders` |
+| R09 | a file with more than one name is accepted (Windows) | KILLED | `a_key_file_with_another_hard_link_is_refused_until_the_extra_name_is_gone` |
+| R10 | a file where the keys folder should be is accepted (K17) | KILLED | `a_keys_path_that_is_a_file_is_refused_as_not_a_directory` |
+| R11 | the folder is held open with FILE_SHARE_DELETE | KILLED | `a_keys_directory_that_has_gone_is_an_error_not_an_empty_store` |
+| R12 | a file that is a directory is accepted as a key file | KILLED | `the_rules_for_a_folder_and_for_a_key_file_hold_over_every_attribute` |
+| R13 | a key file with more than one name is accepted (Unix) | KILLED | `a_key_file_with_more_than_one_name_is_refused_and_a_folder_is_not_judged_by_its_count`, `a_key_file_with_another_hard_link_is_refused_until_the_extra_name_is_gone` |
+| R14 | the link rule is off by one (two names are accepted) | KILLED | `a_key_file_with_more_than_one_name_is_refused_and_a_folder_is_not_judged_by_its_count`, `a_key_file_with_another_hard_link_is_refused_until_the_extra_name_is_gone` |
+| U01 | a build without the feature accepts the unsafe name as the plain keyfile | KILLED | `a_build_without_the_unsafe_keyfile_feature_refuses_the_unsafe_name_and_windows_has_no_plaintext_provider`, `the_provider_is_chosen_on_purpose_and_a_typo_is_an_error` |
+| U02 | the plain keyfile is accepted on Windows | KILLED | `the_keyfile_is_refused_on_windows_and_the_unsafe_name_is_needed_to_use_it_there` |
+| U03 | the environment variable names the unsafe keyfile and it is accepted without the feature | KILLED | `the_provider_is_chosen_on_purpose_and_a_typo_is_an_error` |
+| P01 | the rename of a put is not under the exclusive lock (the hook is never reached) | KILLED | `readers_share_the_lock_and_a_holder_that_never_lets_go_is_an_error_after_the_wait`, `a_reader_that_starts_in_the_middle_of_a_puts_rename_waits_and_never_returns_none`, `readers_never_see_a_name_that_other_processes_are_rewriting_as_missing_or_torn` |
+| P02 | the lock is taken and released before the rename (a reader is not held) | KILLED | `a_reader_that_starts_in_the_middle_of_a_puts_rename_waits_and_never_returns_none` |
+| P03 | a read takes no lock | KILLED | `readers_share_the_lock_and_a_holder_that_never_lets_go_is_an_error_after_the_wait`, `a_reader_waits_for_a_writer_in_the_middle_of_a_replace_and_is_never_told_that_nothing_is_stored`, `a_reader_that_starts_in_the_middle_of_a_puts_rename_waits_and_never_returns_none` |
+| P04 | a young temporary file is debris after five seconds, not after a minute | KILLED | `opening_the_store_removes_the_debris_of_an_interrupted_put_and_nothing_else` |
+| P05 | a temporary file is debris only after ten minutes | KILLED | `opening_the_store_removes_the_debris_of_an_interrupted_put_and_nothing_else` |
+
+How this round went, because two of the mutants were alive at first: **R03** (a reparse point is not refused) and **R12** (a directory is accepted as a key file) survived the first run, because a junction is also a directory and a directory in place of a key file is refused by the open of the file before the rule is reached, so the junction tests and the store tests cannot tell whether the rules are there. They are killed by `the_rules_for_a_folder_and_for_a_key_file_hold_over_every_attribute`, which judges made-up handles over every combination of attribute bits (a file symbolic link and a cloud placeholder cannot be made in a test without privileges). A variant of R02 that removed a *third* walk of the path (between the open and the comparison) survived, because it was redundant: the walk was removed from the code (`956082a1`). U01 and U02 did not compile in their first form and were rewritten. The survivors that nothing can observe (B06, K23, the flush) are those of round 2, above, and are unchanged.

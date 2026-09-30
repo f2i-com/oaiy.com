@@ -8,11 +8,11 @@ This is work package **V-01** of `design/vault.final.md` (section 4.1 "Primitive
 It is a workspace member and not a default member; `cargo test -p oaiy-crypto` runs it.
 
 ```text
-cargo test --locked -p oaiy-crypto                           # 98 tests (and 1 ignored), about 40 seconds unoptimised
-cargo test --release -p oaiy-crypto -- --ignored             # the one-million-iteration X25519 vector of RFC 7748 (run once: passed, 44 s)
+cargo test --locked -p oaiy-crypto                           # 100 tests (and 1 ignored), about a minute unoptimised
+cargo test --release -p oaiy-crypto -- --ignored             # the one-million-iteration X25519 vector of RFC 7748 (passed again on the final code: 46.7 s)
 ```
 
-Run on Windows 11 (MSVC, rustc 1.92.0): 98 passed, 1 ignored, none failed. Run on Linux (WSL2 Ubuntu 24.04, rustc 1.94.0, from a copy in the WSL file system, WSL stopped afterwards): the same 98 pass.
+Run on Windows 11 (MSVC, rustc 1.92.0): 100 passed, 1 ignored, none failed (98 and 1 before the second review). Run on Linux (WSL2 Ubuntu 24.04, rustc 1.94.0, from a copy in the WSL file system, WSL stopped afterwards): the same 100 pass. The dead-stack probe (`zeroize_stack`) is also run with `--release` and with `--profile vault-probe`, on both.
 macOS: compile-checked only (`cargo check --target aarch64-apple-darwin --all-targets`, a step of the `vault-linux` CI lane). `cargo clippy --all-targets -- -D warnings` and `cargo fmt --check` (the crate's `rustfmt.toml`)
 are clean on Windows, Linux and `x86_64-unknown-linux-musl`. The independent review of `5859fd8d` (differential tests against libsodium in Node and PHP: 400 kdf, 7,774 xchacha, 3,642 sealed boxes,
 31,801 Ed25519 verdicts, 6,542 X25519, Argon2id, 510,000 fuzz inputs, all identical or refused with no panic) found the primitives sound and zeroization and the keystore not; the fixes are the commits after it.
@@ -115,7 +115,7 @@ Versions are the ones in `Cargo.lock` (the workspace lock, checked with `--locke
 | **dev** `bip39` | 2.2.2 | CC0-1.0 | an independent BIP-39 implementation (rust-bitcoin's) that the 200,000-input fuzz checks this crate's decoder against; it is not used by the library, which has its own 60 lines and the official word list |
 | **dev** `serde_json` | 1.0.151 | MIT OR Apache-2.0 | reads the vector files |
 
-The closure of the library is 46 crates along normal dependency edges, on every target (build-time helpers such as ustc_version, semver and ersion_check come with curve25519-dalek on top; the proc-macro helpers `syn`, `quote`, `proc-macro2`; `curve25519-dalek` with `fiat-crypto`
+The closure of the library is 46 crates along normal dependency edges, on every target (build-time helpers such as rustc_version, semver and version_check come with curve25519-dalek on top; the proc-macro helpers `syn`, `quote`, `proc-macro2`; `curve25519-dalek` with `fiat-crypto`
 and `cpufeatures`; `digest`, `cipher`, `aead`, `generic-array`, `typenum`; `tinyvec`; `libc`; and, for targets no build of OAIY has, `wasip2`,
 `wit-bindgen` and `r-efi`). Licences across it: dual MIT / Apache-2.0 for all but these: BSD-3-Clause (four: `ed25519-dalek`, `x25519-dalek`,
 `curve25519-dalek`, `subtle`), MIT (`generic-array`), and rows with a permissive alternative among several (`fiat-crypto`: MIT OR Apache-2.0 OR BSD-1-Clause;
@@ -169,11 +169,19 @@ Rust's abstract machine and is what every stack-scanning test does; the counts a
 
 - Rust cannot promise that no copy of a secret is left in a register or a dead stack slot; the crate removes the copies it owns, and `zeroize_stack` counts what is left, for every primitive, on Windows and
   Linux, in **three** build configurations (`cargo test`: no optimisation, assertions on; `cargo test --release`; `cargo test --profile vault-probe`: no optimisation **and** no assertions, which neither of the
-  others is). **The input keys: none, in any of them** (Ed25519 `from_seed`, which returns a key that is the seed, is the one exception: none with assertions on, **one** in an optimised build). **The keys that
-  come out of an `*_into` function: none, in any of them.** **The keys that come out by value, which is the floor of any function that returns a key through a `Result`:** the floor of a function with no
-  cryptography in it (none in an optimised build; one, or two in a call made from a deeper frame, with no optimisation) plus at most one, for `kdf::derive`, `hkdf_sha256_secret`, `RecoveryKit::wrap_key`,
-  `SecretKey::diffie_hellman`, `aead::unwrap_key` and `bip39::wrap_key`; and **the keys made at random** (`Secret::random`, the `generate` functions, `Entropy::random`), by value and scrubbed, at most two
-  above it: measured up to 2 in an optimised build on Windows and up to 3 on Linux (Ed25519 `generate`, which includes the copy `from_seed` keeps). **A consumer that has to show that no key is in memory
+  others is). The probe runs every call under a frame of its own (`deep`) and at eight depths, and keeps the largest count, because the scan's frame and the caller's own `unwrap` and drop
+  overwrite the nearest few hundred bytes of the stack where the code has just been (the first two forms of the probe did not see a copy left in the frame of an `_into` function for that reason:
+  the mutants that write the key through a plain array or a by-value `Secret` before they copy it to `out`, S03, S05, S06 and, through the by-value derivation, S11 and S12, were alive until the probe was changed). **The input keys: none, in any of them** (Ed25519 `from_seed`, which
+  returns a key that is the seed, is the one exception: one, which is the price of a by-value return: the harness's own move of the result with no optimisation, the frame of `from_seed` in an optimised build).
+  **The keys that come out of an `*_into` function: none, in any of them** (`kdf::derive_into`, `hkdf_sha256_secret_into`, `RecoveryKit::wrap_key_into`, `SecretKey::diffie_hellman_into`,
+  `aead::unwrap_key_into`, `bip39::wrap_key_into`). **The keys that come out by value** (`kdf::derive`, `hkdf_sha256_secret`, `RecoveryKit::wrap_key`, `SecretKey::diffie_hellman`, `aead::unwrap_key`,
+  `bip39::wrap_key`): at most the floor of a function with no cryptography in it plus one. The floor, measured the same way (a `Secret` returned through a `Result`, moved out of the harness's frame),
+  is **4** with no optimisation (assertions on or off, Windows and Linux) and **1** in an optimised build; the functions leave 1 to 3 with no optimisation and 1 to 2 in an optimised build (kdf::derive 3 / 2,
+  hkdf 3 / 1, kit.wrap_key 3 / 2, x25519 3 / 2, unwrap_key 3 / 2, bip39::wrap_key 1 to 2 / 2). **The keys made at random** (`Secret::random`, the `generate` functions, `Entropy::random`), by value and
+  scrubbed, at most two above the floor: measured 0 to 4 (Windows: up to 2 with assertions on, 3 optimised, 4 with no optimisation and no assertions; Linux: up to 4, with `Entropy::random` and
+  `RecoveryKit::generate` the highest). **The bounds on the by-value and the made keys are loose with no optimisation** (the floor is 4 and the functions leave 3, so "floor plus one" and "floor plus two" allow 5 and 6):
+  they do not discriminate there, and the optimised build is where they bite (floor 1, by-value at most 2, made at most 3, Ed25519 `generate` exactly at 3); the assertions that do discriminate in every configuration are the two that matter for
+  a consumer, **none in the input and none in an `_into` output**. **A consumer that has to show that no key is in memory
   after it has connected (design test P9: the UMK and what is derived from it: `flbkrcp1`, `flbksig1`) uses the `_into` functions and must account for the rest: tracked as a follow-up for V-13 (a
   `generate_into` for the keys made at random and a constructor for `SigningKey` that fills in place).** What none of this covers: a register; a swap file; a debugger. The scrub is an overwrite of a depth
   measured for this compiler and this dependency tree (8 KiB and 64 KiB left a copy, 88 KiB did not), so a new `blake2`, a new compiler or a new target can need it deeper, and the probe is what says so.
@@ -302,3 +310,41 @@ The review found the primitives sound, and its own mutants found six places in t
 | T05 | the typed derive uses the wrong subkey id | KILLED | `the_backup_manifest_signature_flbackup_1`, `the_backup_recipient_secret_and_public_key`, `the_kdf_registry_vectors` |
 
 The older survivors (C14, C28, C32) are unchanged: a redundant line, a timing-only change and a redundant guard. The one this round leaves is in the keystore (B06, a redundant unlock).
+
+### Round 3, after the second review
+
+The second review (low 1) found that the derived keys left one to three copies in the dead stack and that the probe and the scrub depended on `debug_assertions`. The mutants below break the code that fixed that, one place each, and run the crate's suite on Windows (and Linux where said); the keystore's half is in its README (`scratchpad/vault-impl/mutate3.ps1` and `mutants3.ps1`, outside the repository). **29 mutants of the crypto crate: 26 killed, 3 survived** (S04, Z04 and Z05, each killed in the configuration where the code it breaks leaves something: S04r and S04p, Z04w and Z05w).
+
+| S01 | the scrub is 8 KiB deep (debug build) | KILLED | `no_primitive_leaves_its_key_in_the_dead_stack_and_the_into_variants_leave_no_derived_key` |
+| S02 | the scrub depth is keyed on debug_assertions again (no optimisation, no assertions) | KILLED | `no_primitive_leaves_its_key_in_the_dead_stack_and_the_into_variants_leave_no_derived_key` |
+| S03 | derive_into derives into a plain array and copies (a copy of the key stays in the stack) | KILLED | `no_primitive_leaves_its_key_in_the_dead_stack_and_the_into_variants_leave_no_derived_key` |
+| S04 | diffie_hellman_into does not scrub the stack | SURVIVED |  |
+| S05 | hkdf_sha256_secret_into derives into a plain array and copies | KILLED | `no_primitive_leaves_its_key_in_the_dead_stack_and_the_into_variants_leave_no_derived_key` |
+| S06 | unwrap_key_into goes through a plain array | KILLED | `no_primitive_leaves_its_key_in_the_dead_stack_and_the_into_variants_leave_no_derived_key` |
+| S07 | unwrap_key_into writes out before it knows the blob is good | KILLED | `the_into_variants_write_what_the_by_value_functions_return_and_leave_out_untouched_on_an_error` |
+| S08 | Ed25519 from_seed does not scrub the stack (N06, the debug suite) | KILLED | `no_primitive_leaves_its_key_in_the_dead_stack_and_the_into_variants_leave_no_derived_key` |
+| S09 | Ed25519 from_seed does not scrub the stack (N06, an optimised build) | KILLED | `no_primitive_leaves_its_key_in_the_dead_stack_and_the_into_variants_leave_no_derived_key` |
+| S10 | Ed25519 from_seed does not scrub the stack (N06, no optimisation and no assertions) | KILLED | `no_primitive_leaves_its_key_in_the_dead_stack_and_the_into_variants_leave_no_derived_key` |
+| S11 | the kit wrap_key_into goes through the by-value key | KILLED | `no_primitive_leaves_its_key_in_the_dead_stack_and_the_into_variants_leave_no_derived_key` |
+| S12 | bip39 wrap_key_into goes through the by-value key | KILLED | `no_primitive_leaves_its_key_in_the_dead_stack_and_the_into_variants_leave_no_derived_key` |
+| S13 | SigningKey::generate does not fill the seed from the random generator | KILLED | `every_key_that_is_made_at_random_is_not_zero_and_not_the_same_twice` |
+| S14 | SecretKey::generate does not fill the secret from the random generator | KILLED | `every_key_that_is_made_at_random_is_not_zero_and_not_the_same_twice` |
+| S15 | fill_random writes nothing | KILLED | `every_key_that_is_made_at_random_is_not_zero_and_not_the_same_twice` |
+| Q01 | the phrase decoder has no byte cap | KILLED | `the_phrase_decoder_agrees_with_the_browser_code_on_every_entry_of_the_corpus` |
+| Q02 | the phrase cap is one byte too big | KILLED | `the_phrase_decoder_agrees_with_the_browser_code_on_every_entry_of_the_corpus` |
+| S04r | diffie_hellman_into does not scrub the stack (an optimised build) | KILLED | `no_primitive_leaves_its_key_in_the_dead_stack_and_the_into_variants_leave_no_derived_key` |
+| S04p | diffie_hellman_into does not scrub the stack (no optimisation, no assertions) | KILLED | `no_primitive_leaves_its_key_in_the_dead_stack_and_the_into_variants_leave_no_derived_key` |
+| S03v | derive_into is derive copied into out, through a by-value Secret and a move (the first form of S03) | KILLED | `no_primitive_leaves_its_key_in_the_dead_stack_and_the_into_variants_leave_no_derived_key` |
+| S06v | unwrap_key_into goes through a by-value Secret and a move (the first form of S06) | KILLED | `no_primitive_leaves_its_key_in_the_dead_stack_and_the_into_variants_leave_no_derived_key` |
+| Z01 | kdf::derive does not scrub the stack (debug build) | KILLED | `no_primitive_leaves_its_key_in_the_dead_stack_and_the_into_variants_leave_no_derived_key` |
+| Z02 | kdf::derive does not scrub the stack (no optimisation, no assertions) | KILLED | `no_primitive_leaves_its_key_in_the_dead_stack_and_the_into_variants_leave_no_derived_key` |
+| Z03 | HKDF does not scrub the stack (optimised build) | KILLED | `no_primitive_leaves_its_key_in_the_dead_stack_and_the_into_variants_leave_no_derived_key` |
+| Z04 | HMAC does not scrub the stack (optimised build) | SURVIVED |  |
+| Z05 | HMAC verify does not scrub the stack (optimised build) | SURVIVED |  |
+| Z06 | the scrub writes nothing the compiler must keep (optimised build) | KILLED | `no_primitive_leaves_its_key_in_the_dead_stack_and_the_into_variants_leave_no_derived_key` |
+| Z04w | HMAC does not scrub the stack (optimised build, Linux) | KILLED | `no_primitive_leaves_its_key_in_the_dead_stack_and_the_into_variants_leave_no_derived_key` |
+| Z05w | HMAC verify does not scrub the stack (optimised build, Linux) | KILLED | `no_primitive_leaves_its_key_in_the_dead_stack_and_the_into_variants_leave_no_derived_key` |
+
+The three survivors are equivalent on the build they are run in, and each has a twin that is killed where the leak exists: **S04** (`diffie_hellman_into` without the scrub) leaves no copy of the key or of the shared secret with assertions on (the copy in a build with no optimisation and no assertions, S04p, and in an optimised one, S04r, is found); **Z04** and **Z05** (HMAC and HMAC verify without the scrub) leave none in an optimised build on Windows, and leave the key on Linux (Z04w and Z05w).
+
+How this round went, because six of the mutants were alive at first: S03, S05, S06, S11 and S12 (an `_into` function that derives into a plain array, or a by-value key, and copies it to `out`) survived the first two forms of the probe, which ran the code and then dropped the output in the same frame: the drop's own calls were made where the callee's frame had been and overwrote the copy. The code now runs under `deep` (a frame of 1.5 KiB) and at eight depths, with a control that has the shape of a row (a copy left under `deep`, followed by an unwrap and the drop of a `Secret`); S03 and S06 are kept in both of their forms (S03v and S06v are the by-value ones that the first form of each wrote); S04, the sixth, is explained above. The first run of Ed25519's mutants (S08 to S10: N06, the missing scrub after the key expansion) is killed in a debug build as well as in an optimised one and in a build with no optimisation and no assertions, which review low 1 asked for.
