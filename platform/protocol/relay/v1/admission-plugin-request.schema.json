@@ -2,7 +2,7 @@
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "$id": "https://oaiy.com/schemas/relay/v1/admission-plugin-request.schema.json",
   "title": "Plugin admission request",
-  "description": "POST /v1/admission with the desktop token: exactly what the host's admission_request_body produces plus supportedTransports. The roster is the roster the plugin holds; approvedPeerKeyThumbprints is strictly ascending (checked by code) and holds 1 to 16 entries.",
+  "description": "POST /v1/admission with the desktop token: exactly what the host's admission_request_body produces, which carries no supportedTransports (absent means [relay]; when the member is there it must be valid). The roster is the roster the plugin holds; approvedPeerKeyThumbprints is strictly ascending (checked by code) and holds 1 to 16 entries.",
   "type": "object",
   "properties": {
     "appId": {
@@ -57,8 +57,7 @@
     "holderKeyThumbprint",
     "approvedPeerKeyThumbprints",
     "peerRosterRevision",
-    "peerRosterHash",
-    "supportedTransports"
+    "peerRosterHash"
   ],
   "additionalProperties": true
 }

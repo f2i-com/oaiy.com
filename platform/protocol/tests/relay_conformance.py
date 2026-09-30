@@ -967,10 +967,13 @@ pos("admission-claims", "a plugin claims set", {"aud": "aokie-v2-gateway", "appI
 PLUGIN_REQUEST = {"appId": "aokie", "pluginId": "aokie", "displayName": "Receptionist", "endpointPublicKey": ENDPOINT_KEY, "holderKeyThumbprint": DESK_TH,
                   "approvedPeerKeyThumbprints": [PHONE_TH], "peerRosterRevision": 7, "peerRosterHash": ROSTER_HASH, "supportedTransports": ["relay"]}
 pos("admission-plugin-request", "a plugin admission request", PLUGIN_REQUEST)
+pos("admission-plugin-request", "a plugin admission request without supportedTransports (the desktop's broker sends none: it means relay)",
+    {k: v for k, v in PLUGIN_REQUEST.items() if k != "supportedTransports"})
 pos("admission-plugin-response", "a plugin admission response", PLUGIN_RESPONSE)
 pos("admission-plugin-response", "a poll-mode response", dict(PLUGIN_RESPONSE, relay=dict(RELAY_URLS, mode="poll")))
 MOBILE_REQUEST = {"appId": "aokie", "deviceId": PHONEID, "displayName": "Test phone", "holderKeyThumbprint": PHONE_TH, "supportedTransports": ["relay"]}
 pos("admission-mobile-request", "a phone admission request", MOBILE_REQUEST)
+pos("admission-mobile-request", "a phone admission request without supportedTransports", {k: v for k, v in MOBILE_REQUEST.items() if k != "supportedTransports"})
 pos("admission-mobile-response", "a phone admission response", MOBILE_RESPONSE)
 pos("ice-server", "STUN", STUN)
 pos("ice-server", "TURN with the A5 credential", TURN)
@@ -1278,7 +1281,7 @@ neg("admission-claims", "a plugin claims set with an empty roster", dict(PLUGIN_
 neg("admission-claims", "a plugin claims set with 17 thumbprints", dict(PLUGIN_CLAIMS, approvedPeerKeyThumbprints=sorted(b64u(hashlib.sha256(bytes([i])).digest()) for i in range(17))), "oneOf")
 neg("admission-claims", "a plugin claims set with revision 0", dict(PLUGIN_CLAIMS, peerRosterRevision=0), "oneOf")
 neg("admission-claims", "a role that is neither mobile nor plugin", dict(MOBILE_CLAIMS, role="admin"), "oneOf")
-neg("admission-plugin-request", "no supportedTransports", mut(PLUGIN_REQUEST, "supportedTransports"), "supportedTransports")
+neg("admission-plugin-request", "a supportedTransports that is null", mut(PLUGIN_REQUEST, "supportedTransports", None), "supportedTransports")
 neg("admission-plugin-request", "an empty supportedTransports", mut(PLUGIN_REQUEST, "supportedTransports", []), "supportedTransports")
 neg("admission-plugin-request", "a websocket transport", mut(PLUGIN_REQUEST, "supportedTransports", ["websocket"]), "supportedTransports")
 neg("admission-plugin-request", "an empty roster", mut(PLUGIN_REQUEST, "approvedPeerKeyThumbprints", []), "approvedPeerKeyThumbprints")

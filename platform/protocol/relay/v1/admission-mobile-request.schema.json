@@ -33,8 +33,7 @@
   "required": [
     "appId",
     "deviceId",
-    "holderKeyThumbprint",
-    "supportedTransports"
+    "holderKeyThumbprint"
   ],
   "additionalProperties": true
 }

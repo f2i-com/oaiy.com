@@ -137,6 +137,7 @@ final class AokieFixtures
         };
         $pluginReq = $k->pluginRequest();
         $pa = $plugin('plugin, stream, STUN and TURN', $pluginReq, 'What the desktop\'s broker sends (upstream.rs) plus supportedTransports. The two phones are the roster, revision 7.');
+        $plugin('plugin, exactly as the desktop\'s broker sends it', array_diff_key($pluginReq, ['supportedTransports' => 1]), 'upstream.rs (admission_request_body) sends no supportedTransports; the relay reads the absent member as ["relay"], so the answer is the stream one.');
         $plugin('plugin, poll mode', array_merge($pluginReq, ['supportedTransports' => ['relay-poll']]), 'A carrier that only polls: relay.mode is "poll".', '/v1/admission');
         $plugin('plugin, a carrier that offers both', array_merge($pluginReq, ['supportedTransports' => ['relay', 'relay-poll']]), 'The stream wins when the host flushes.');
         $ma = $mobile('phone A, stream, STUN and TURN', $a, $k->mobileRequest($a), 'What the phone sends (managed_auth.rs) plus supportedTransports.');

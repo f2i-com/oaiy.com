@@ -104,13 +104,18 @@ final class AdmissionApi
     }
 
     /**
-     * `supportedTransports`: a list of 1 to 8 short strings. Which of them the relay serves is decided by mode().
+     * `supportedTransports`: a list of 1 to 8 short strings. Which of them the relay serves is decided by mode(). The member may
+     * be absent (the design says a request "may carry" it, and the desktop's broker never sends it): the carrier then is the
+     * stream that every shipped carrier opens, `relay`. A member that is there and wrong (null, a string, a list of numbers) is 400.
      * @param array<string,mixed> $doc
      * @return list<string>
      */
     private static function transports(array $doc): array
     {
-        $t = $doc['supportedTransports'] ?? null;
+        if (!array_key_exists('supportedTransports', $doc)) {
+            return ['relay'];
+        }
+        $t = $doc['supportedTransports'];
         if (!is_array($t) || !Json::isList($t) || count($t) < 1 || count($t) > 8) {
             throw ApiError::make('invalid_request');
         }

@@ -382,7 +382,8 @@ test('4.14.2 plugin admission: validation in order, each failure a plain 400 (a 
         'revision 2^53' => ['peerRosterRevision' => 9007199254740992], 'no revision' => ['peerRosterRevision' => $drop],
         'a wrong roster hash' => ['peerRosterHash' => B64::enc(random_bytes(32))], 'the hash of another revision' => ['peerRosterHash' => DevicesApi::rosterHash($th, 2)],
         'the hash of another roster' => ['peerRosterHash' => DevicesApi::rosterHash([$th[0]], 1)], 'no hash' => ['peerRosterHash' => $drop],
-        'no supportedTransports' => ['supportedTransports' => $drop], 'an empty supportedTransports' => ['supportedTransports' => []], 'supportedTransports a string' => ['supportedTransports' => 'relay'],
+        'supportedTransports null' => ['supportedTransports' => null], 'an empty supportedTransports' => ['supportedTransports' => []], 'supportedTransports a string' => ['supportedTransports' => 'relay'],
+        'supportedTransports an object' => ['supportedTransports' => ['a' => 'relay']], 'a transport of 33 characters' => ['supportedTransports' => [str_repeat('r', 33)]], 'an empty transport' => ['supportedTransports' => ['']],
         'supportedTransports with a number' => ['supportedTransports' => ['relay', 5]], 'nine transports' => ['supportedTransports' => array_fill(0, 9, 'relay')],
     ];
     $n = 0;
@@ -498,7 +499,7 @@ test('4.14.2 mobile admission: unknown grants are dropped (the phone refuses an 
     eq(['state_read', 'caller_read'], $res['json']['scopes']);
     eq(['state_read', 'caller_read'], $res['json']['device']['grants']);
     foreach ([array_diff_key($k->mobileRequest($ph), ['deviceId' => 1]), array_diff_key($k->mobileRequest($ph), ['appId' => 1]), array_diff_key($k->mobileRequest($ph), ['holderKeyThumbprint' => 1]),
-        array_diff_key($k->mobileRequest($ph), ['supportedTransports' => 1]), $k->mobileRequest($ph, ['deviceId' => 'x']), $k->mobileRequest($ph, ['displayName' => 5]),
+        $k->mobileRequest($ph, ['supportedTransports' => null]), $k->mobileRequest($ph, ['deviceId' => 'x']), $k->mobileRequest($ph, ['displayName' => 5]),
         $k->mobileRequest($ph, ['supportedTransports' => 'relay']), $k->mobileRequest($ph, ['supportedTransports' => []]), $k->pluginRequest()] as $i => $doc) {
         eq(400, $k->r->call($ph, 'POST', '/v1/aokie-companion/admission', $doc)['status'], "request $i");
     }
@@ -528,6 +529,31 @@ test('4.14.2 who may ask: the desktop for the plugin, a phone for itself; a prov
 });
 
 // ------------------------------------------------------------------------------------------------ transports
+
+test('4.14.2 an absent supportedTransports is ["relay"]: the desktop\'s broker never sends the member, so its plugin admission must be served (stream), by the host that flushes; where none has passed the probe it is 422 as an explicit ["relay"] is', function () {
+    $k = AokieRig::make([], true, false);
+    $ph = $k->addPhone();
+    $k->pushRoster();
+    $plain = array_diff_key($k->pluginRequest(), ['supportedTransports' => 1]); // what upstream.rs sends
+    ok(!array_key_exists('supportedTransports', $plain));
+    $res = $k->plugin($plain);
+    eq(422, $res['status'], 'no probe has passed: the same answer as for an explicit relay: ' . $res['body']);
+    eq('unprocessable', adm_code($res));
+    $k->streamOk();
+    $res = $k->plugin($plain);
+    eq(200, $res['status'], $res['body']);
+    ok(!array_key_exists('mode', $res['json']['relay']), 'the stream, as for an explicit ["relay"]');
+    $explicit = $k->plugin();
+    eq(array_keys($explicit['json']), array_keys($res['json']));
+    // The phone's request without the member is the same.
+    $req = array_diff_key($k->mobileRequest($ph), ['supportedTransports' => 1]);
+    $res = $k->mobile($ph, $req);
+    eq(200, $res['status'], $res['body']);
+    ok(!array_key_exists('mode', $res['json']['relay']));
+    // A member that is there and wrong is still a 400 (the cases above), and an empty list is not "absent".
+    eq(400, $k->plugin(array_merge($plain, ['supportedTransports' => null]))['status']);
+    eq(400, $k->plugin(array_merge($plain, ['supportedTransports' => []]))['status']);
+});
 
 test('4.14.2 supportedTransports: the framed stream is advertised only for a carrier that asks for it and a host that flushes; otherwise poll mode when asked, otherwise 422', function () {
     $k = AokieRig::make([], true, false);
