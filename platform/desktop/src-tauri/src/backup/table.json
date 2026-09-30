@@ -183,7 +183,9 @@
       "category": "contacts",
       "paths": ["callers.json"],
       "what": "Contacts and what is remembered about callers",
-      "reason": "The receptionist and the Agent read these facts and notes about a person before they answer them (\"the person's notes for the receptionist\"), so they are read as instructions: a file that was not made by you could steer what they say."
+      "reason": "The receptionist and the Agent read these facts and notes about a person before they answer them (\"the person's notes for the receptionist\"), so they are read as instructions: a file that was not made by you could steer what they say.",
+      "reads": "The receptionist reads a caller's facts and notes by the last nine digits of their number before it answers (voice/callers.rs), the Agent reads them through the contact tools, and the notes are written for the receptionist to follow.",
+      "readers": ["platform/desktop/src-tauri/src/voice/callers.rs#last nine digits", "platform/desktop/src-tauri/src/voice/contacts/mod.rs#FILE_NAME", "app/src/contacts.ts#CallerNote"]
     },
     {
       "id": "calendar",
@@ -220,7 +222,9 @@
       "category": "flows",
       "paths": ["bridge/ledger.jsonl"],
       "what": "The run journal (finished runs only)",
-      "reason": "Runs that were waiting or running are never brought back; only finished ones are."
+      "reason": "Runs that were waiting or running are never brought back; only finished ones are.",
+      "reads": "The dashboard shows finished runs with their inputs and results; nothing on that page runs one again (only a dead letter has a Redrive button), but the records hold the text that went through each run.",
+      "readers": ["platform/desktop/src-tauri/src/bridge/ledger.rs#pub struct Ledger"]
     },
     {
       "id": "settings-files",
@@ -284,7 +288,9 @@
       "category": "voices",
       "paths": ["voices/chosen", "voices/*.wav", "voices/*.mp3", "voices/*.ogg", "voices/*.flac", "voices/*.m4a", "voices/*.opus", "voices/*.webm", "voices/*.aac", "voices/*.txt", "voices/*.json"],
       "what": "Voices",
-      "reason": "A voice is what your callers hear: a sample or a setting from a file that was not made by you would speak to them in your name."
+      "reason": "A voice is what your callers hear: a sample or a setting from a file that was not made by you would speak to them in your name.",
+      "reads": "A voice clip is played to callers when the plugin speaks in that voice; every extension the voice library accepts is in this row.",
+      "readers": ["platform/desktop/src-tauri/src/voice/voices.rs#CLIP_EXTENSIONS"]
     },
     {
       "id": "templates",
@@ -389,7 +395,9 @@
       "tick": "agentData",
       "paths": ["opfs/front-desk/sessions/**"],
       "what": "The phone's conversations (each call and text thread)",
-      "reason": "A conversation is loaded as what was said before, and the Agent goes on from it."
+      "reason": "A conversation is loaded as what was said before, and the Agent goes on from it.",
+      "reads": "A conversation is loaded into the model as what was said before, and the earlier_conversations tool hands what was said in earlier calls and texts back to a model.",
+      "readers": ["app/src/sessions.ts#earlier_conversations"]
     },
     {
       "id": "agent-desk-callers",
@@ -397,7 +405,9 @@
       "tick": "memory",
       "paths": ["opfs/front-desk/callers.json", "opfs/front-desk/contacts-moved.json"],
       "what": "What the phone's agents remember about people",
-      "reason": "The receptionist and the Agent read these facts and notes about a person before they answer them: they are read as instructions."
+      "reason": "The receptionist and the Agent read these facts and notes about a person before they answer them: they are read as instructions.",
+      "reads": "The front desk's agents read them before they answer a person, and the remember tool writes them (Memory).",
+      "readers": ["app/src/vfs/projects.ts#loadCallers", "app/src/sessions.ts#remember"]
     },
     {
       "id": "agent-desk-callbacks",
@@ -412,7 +422,10 @@
       "merge": "union",
       "paths": ["opfs/front-desk/outreach/do-not-contact.json"],
       "what": "Numbers not to be called or texted again",
-      "reason": "It can only stop contact: the numbers in the backup are added to yours and none of yours is ever taken away."
+      "reason": "It can only stop contact: the numbers in the backup are added to yours and none of yours is ever taken away.",
+      "reads": "Only tests of the form 'is this number on the list' read it (outreach planning, the callback filter, the people of a campaign); the reason a number was added is never read by a model or said to a caller. It can only stop contact, and forgetting an opt-out is the harmful direction, so it feeds no behaviour except refusing to call or text a number that asked not to be contacted.",
+      "readers": ["app/src/outreach.ts#addDoNotContact", "app/src/outreach.ts#asked not to be contacted", "app/src/main.ts#outreach?.doNotContact"],
+      "keylessBecause": "One merge reads every entry and keeps only a number of at most 40 characters without control characters, a time and a reason cut to 300 characters; the file has no other shape, and the merge dedupes and bounds the list."
     },
     {
       "id": "agent-outreach-index",
@@ -481,22 +494,22 @@
         { "path": "settings.services[].minutes", "class": "runs", "tick": "calendar", "type": "int", "min": 1, "max": 1440, "what": "How long a service takes" },
         { "path": "settings.services[].description", "class": "runs", "tick": "calendar", "type": "string", "maxChars": 2000, "what": "A service's description", "reason": "The receptionist reads it before it answers and says it to callers." },
         { "path": "settings.services[].price", "class": "runs", "tick": "calendar", "type": "string", "maxChars": 200, "what": "A service's price", "reason": "The receptionist reads it and says it to callers." },
-        { "path": "settings.slotMinutes", "class": "data", "type": "int", "min": 5, "max": 240, "what": "The step between the times offered", "reads": "Only the calendar's own arithmetic reads it, to space the times it offers; a number within its limits.", "readers": ["platform/desktop/src-tauri/src/calendar/mod.rs#slot_minutes"] },
-        { "path": "settings.noticeMinutes", "class": "data", "type": "int", "min": 0, "max": 525600, "what": "How soon from now a time may be offered", "reads": "Only the calendar's own arithmetic reads it, to leave the notice before a time is offered; a number within its limits.", "readers": ["platform/desktop/src-tauri/src/calendar/mod.rs#notice_minutes"] },
-        { "path": "settings.horizonDays", "class": "data", "type": "int", "min": 1, "max": 366, "what": "How far ahead times are offered", "reads": "Only the calendar's own arithmetic reads it, to limit how far ahead times are offered; a number within its limits.", "readers": ["platform/desktop/src-tauri/src/calendar/mod.rs#horizon_days"] },
+        { "path": "settings.slotMinutes", "class": "data", "type": "int", "min": 5, "max": 240, "what": "The step between the times offered", "reads": "Only the calendar's own arithmetic reads it, to space the times it offers; a number within its limits. It feeds no behaviour beyond which times are offered.", "readers": ["platform/desktop/src-tauri/src/calendar/mod.rs#slot_minutes"] },
+        { "path": "settings.noticeMinutes", "class": "data", "type": "int", "min": 0, "max": 525600, "what": "How soon from now a time may be offered", "reads": "Only the calendar's own arithmetic reads it, to leave the notice before a time is offered; a number within its limits. It feeds no behaviour beyond which times are offered.", "readers": ["platform/desktop/src-tauri/src/calendar/mod.rs#notice_minutes"] },
+        { "path": "settings.horizonDays", "class": "data", "type": "int", "min": 1, "max": 366, "what": "How far ahead times are offered", "reads": "Only the calendar's own arithmetic reads it, to limit how far ahead times are offered; a number within its limits. It feeds no behaviour beyond which times are offered.", "readers": ["platform/desktop/src-tauri/src/calendar/mod.rs#horizon_days"] },
         { "path": "settings.textConfirmations", "class": "runs", "tick": "calendar", "type": "bool", "what": "Text the person when an appointment is confirmed", "reason": "It decides whether the phone sends a text to the person who asked for an appointment." },
         { "path": "appointments", "class": "data", "type": "objects", "maxItems": 10000, "what": "The appointments" },
-        { "path": "appointments[].id", "class": "data", "type": "slug", "what": "An appointment's id", "reads": "An identifier the calendar and the dashboard look an appointment up by; it is never shown to a model or a caller.", "readers": ["platform/desktop/src-tauri/src/calendar/mod.rs#fn get"] },
+        { "path": "appointments[].id", "class": "data", "type": "slug", "what": "An appointment's id", "reads": "An identifier the calendar and the dashboard look an appointment up by; it is never shown to a model or a caller, and it feeds no behaviour.", "readers": ["platform/desktop/src-tauri/src/calendar/mod.rs#fn get"] },
         { "path": "appointments[].service", "class": "runs", "tick": "calendar", "type": "string", "maxChars": 200, "what": "An appointment's service", "reason": "The receptionist tells a caller what their appointment is for." },
-        { "path": "appointments[].start", "class": "data", "type": "datetime", "what": "When an appointment starts", "reads": "Only the calendar's own arithmetic reads it, to hold the time and to say the day and hour to the caller who booked it; a validated date and time that carries no words.", "readers": ["platform/desktop/src-tauri/src/calendar/mod.rs#fn starts"] },
-        { "path": "appointments[].minutes", "class": "data", "type": "int", "min": 1, "max": 1440, "what": "How long an appointment lasts", "reads": "Only the calendar's own arithmetic reads it, to hold the time; a number within its limits.", "readers": ["platform/desktop/src-tauri/src/calendar/mod.rs#fn ends"] },
-        { "path": "appointments[].status", "class": "data", "type": "enum", "options": ["requested", "confirmed", "declined", "cancelled", "done"], "what": "Where an appointment stands", "reads": "Only the calendar's own arithmetic reads it, to decide whether the time is held; one of five fixed states.", "readers": ["platform/desktop/src-tauri/src/calendar/mod.rs#fn holds_time"] },
+        { "path": "appointments[].start", "class": "data", "type": "datetime", "what": "When an appointment starts", "reads": "Only the calendar's own arithmetic reads it, to hold the time and to say the day and hour to the caller who booked it; a validated date and time that carries no words. It feeds no behaviour beyond which times are offered.", "readers": ["platform/desktop/src-tauri/src/calendar/mod.rs#fn starts"] },
+        { "path": "appointments[].minutes", "class": "data", "type": "int", "min": 1, "max": 1440, "what": "How long an appointment lasts", "reads": "Only the calendar's own arithmetic reads it, to hold the time; a number within its limits. It feeds no behaviour beyond which times are offered.", "readers": ["platform/desktop/src-tauri/src/calendar/mod.rs#fn ends"] },
+        { "path": "appointments[].status", "class": "data", "type": "enum", "options": ["requested", "confirmed", "declined", "cancelled", "done"], "what": "Where an appointment stands", "reads": "Only the calendar's own arithmetic reads it, to decide whether the time is held; one of five fixed states. It feeds no behaviour beyond which times are offered.", "readers": ["platform/desktop/src-tauri/src/calendar/mod.rs#fn holds_time"] },
         { "path": "appointments[].name", "class": "runs", "tick": "calendar", "type": "string", "maxChars": 200, "what": "Who an appointment is for", "reason": "The Agent reads it when it looks at the calendar." },
         { "path": "appointments[].phone", "class": "runs", "tick": "calendar", "type": "string", "maxChars": 40, "what": "The number an appointment is for", "reason": "It decides which caller is told about the appointment, and where a confirmation text is sent." },
         { "path": "appointments[].notes", "class": "runs", "tick": "calendar", "type": "string", "maxChars": 2000, "what": "Notes on an appointment", "reason": "The Agent reads them when it looks at the calendar." },
-        { "path": "appointments[].source", "class": "data", "type": "enum", "options": ["call", "text", "agent", "manual", "formlogic"], "what": "Where an appointment came from", "reads": "Only shown to the person, and used by the FormLogic sync (which is not restored); one of five fixed words.", "readers": ["platform/desktop/src-tauri/src/calendar/mod.rs#pub source"] },
-        { "path": "appointments[].createdAt", "class": "data", "type": "stamp", "what": "When an appointment was made", "reads": "Only shown to the person and used to order changes; a validated moment.", "readers": ["platform/desktop/src-tauri/src/calendar/mod.rs#created_at"] },
-        { "path": "appointments[].updatedAt", "class": "data", "type": "stamp", "what": "When an appointment last changed", "reads": "Only shown to the person and used to order changes; a validated moment.", "readers": ["platform/desktop/src-tauri/src/calendar/mod.rs#updated_at"] },
+        { "path": "appointments[].source", "class": "data", "type": "enum", "options": ["call", "text", "agent", "manual", "formlogic"], "what": "Where an appointment came from", "reads": "Only shown to the person, and used by the FormLogic sync (which is not restored); one of five fixed words; it feeds no behaviour.", "readers": ["platform/desktop/src-tauri/src/calendar/mod.rs#pub source"] },
+        { "path": "appointments[].createdAt", "class": "data", "type": "stamp", "what": "When an appointment was made", "reads": "Only shown to the person and used to order changes; a validated moment; it feeds no behaviour.", "readers": ["platform/desktop/src-tauri/src/calendar/mod.rs#created_at"] },
+        { "path": "appointments[].updatedAt", "class": "data", "type": "stamp", "what": "When an appointment last changed", "reads": "Only shown to the person and used to order changes; a validated moment; it feeds no behaviour.", "readers": ["platform/desktop/src-tauri/src/calendar/mod.rs#updated_at"] },
         { "path": "appointments[].requestId", "class": "excluded", "what": "The phone's record of the call that asked for it", "reason": "It names a request made on the computer the backup came from: a restored one could make the phone take a new request for a duplicate and drop it." },
         { "path": "appointments[].callId", "class": "excluded", "what": "The call that asked for it", "reason": "It names a call made on the computer the backup came from." },
         { "path": "appointments[].formlogic", "class": "excluded", "what": "FormLogic's copy of an appointment", "reason": "The sync state of another account: restored on a computer that is linked to another account, or to none, it would delete or duplicate records there." },
@@ -536,14 +549,14 @@
 
         { "path": "settings.aiModel", "class": "runs", "tick": "plugins", "type": "string", "maxChars": 200, "what": "The model's name", "reason": "It decides which model answers callers; the endpoint it is asked at is not restored." },
         { "path": "settings.audioTranscriptModel", "class": "runs", "tick": "plugins", "type": "string", "maxChars": 200, "what": "The transcription model's name", "reason": "It decides which model hears callers; the endpoint it is asked at is not restored." },
-        { "path": "settings.ttsVoice", "class": "runs", "tick": "plugins", "type": "string", "maxChars": 200, "what": "The voice's name", "reason": "It decides which voice callers hear: a name that is not one of the voices installed here is spoken in whatever voice the plugin falls back to." },
+        { "path": "settings.ttsVoice", "class": "runs", "tick": "plugins", "type": "string", "maxChars": 200, "what": "The voice's name", "reason": "It decides which voice callers hear: a name that is not one of the voices installed here is spoken in whatever voice the plugin falls back to.", "reads": "The phone plugin speaks to every caller in this voice.", "readers": ["platform/desktop/src-tauri/src/backup/testdata/aokie-settings-schema.v1.json#ttsVoice"] },
         { "path": "settings.ttsEngine", "class": "runs", "tick": "plugins", "type": "enum", "options": ["", "pocket", "sherpa"], "what": "Which speech engine", "reason": "It decides how callers are spoken to." },
         { "path": "settings.realtimeVoice", "class": "runs", "tick": "plugins", "type": "enum", "options": ["marin", "cedar", "alloy", "ash", "ballad", "coral", "echo", "sage", "shimmer", "verse"], "what": "The realtime voice", "reason": "It decides which voice callers hear." },
         { "path": "settings.realtimeTurnDetection", "class": "runs", "tick": "plugins", "type": "enum", "options": ["server_vad", "semantic_vad"], "what": "How the end of a turn is found", "reason": "It decides when the receptionist starts to talk: call handling." },
         { "path": "settings.realtimeMaxOutputTokens", "class": "runs", "tick": "plugins", "type": "int", "min": 64, "max": 4096, "what": "Longest reply, in tokens", "reason": "It limits how much the receptionist may say in one turn: call handling." },
-        { "path": "settings.bargeSensitivity", "class": "runs", "tick": "plugins", "type": "int", "min": 50, "max": 5000, "what": "Interruption sensitivity", "reason": "It decides how easily a caller interrupts the receptionist: call handling." },
-        { "path": "settings.sttEndpointMs", "class": "runs", "tick": "plugins", "type": "int", "min": 100, "max": 5000, "what": "Silence that ends a turn, in milliseconds", "reason": "It decides when a caller's turn is taken to be over (a time, not an address): call handling." },
-        { "path": "settings.maxSilenceSecs", "class": "runs", "tick": "plugins", "type": "int", "min": 0, "max": 600, "what": "Longest silence, in seconds", "reason": "It decides when a silent call is hung up (0 switches the hang-up off): call handling." },
+        { "path": "settings.bargeSensitivity", "class": "runs", "tick": "plugins", "type": "int", "min": 50, "max": 5000, "what": "Interruption sensitivity", "reason": "It decides how easily a caller interrupts the receptionist: call handling.", "reads": "The phone plugin reads it on every call to decide when speech from the caller cuts the receptionist off.", "readers": ["platform/desktop/src-tauri/src/backup/testdata/aokie-settings-schema.v1.json#bargeSensitivity"] },
+        { "path": "settings.sttEndpointMs", "class": "runs", "tick": "plugins", "type": "int", "min": 100, "max": 5000, "what": "Silence that ends a turn, in milliseconds", "reason": "It decides when a caller's turn is taken to be over (a time, not an address): call handling.", "reads": "The phone plugin reads it on every call to decide when a caller has finished speaking.", "readers": ["platform/desktop/src-tauri/src/backup/testdata/aokie-settings-schema.v1.json#sttEndpointMs"] },
+        { "path": "settings.maxSilenceSecs", "class": "runs", "tick": "plugins", "type": "int", "min": 0, "max": 600, "what": "Longest silence, in seconds", "reason": "It decides when a silent call is hung up (0 switches the hang-up off): call handling.", "reads": "The phone plugin hangs up a call that has been silent this long; 0 switches the hang-up off.", "readers": ["platform/desktop/src-tauri/src/backup/testdata/aokie-settings-schema.v1.json#maxSilenceSecs"] },
         { "path": "settings.defaultSpeechRate", "class": "runs", "tick": "plugins", "type": "int", "min": 60, "max": 140, "what": "Speech rate", "reason": "It decides how fast callers are spoken to." },
         { "path": "settings.detailSpeechRate", "class": "runs", "tick": "plugins", "type": "int", "min": 50, "max": 100, "what": "Speech rate for details", "reason": "It decides how fast callers are spoken to." },
         { "path": "settings.protectedSpeechMaxMs", "class": "runs", "tick": "plugins", "type": "int", "min": 500, "max": 5000, "what": "Longest protected speech, in milliseconds", "reason": "It decides how long the receptionist may not be interrupted: call handling." },
@@ -626,7 +639,7 @@
         { "path": "messages.callInstructions", "class": "runs", "tick": "agentSettings", "type": "string", "maxChars": 20000, "what": "Instructions for answering calls", "reason": "Read as instructions by the receptionist on every call." },
         { "path": "messages.callBackFilter", "class": "runs", "tick": "agentSettings", "type": "string", "maxChars": 32, "what": "Which missed calls are rung back", "reason": "It decides whose calls are returned." },
         { "path": "messages.callBackLine", "class": "runs", "tick": "agentSettings", "type": "string", "maxChars": 2000, "what": "What is said first when a missed call is rung back", "reason": "It is said to the person who is rung." },
-        { "path": "messages.country", "class": "runs", "tick": "agentSettings", "type": "string", "maxChars": 8, "what": "The country numbers are read for", "reason": "It decides how a written number is read: with NZ, GB, ZA or ID the number 0491 570 006 becomes +64, +44, +27 or +62, so the list of people who are answered, called back or not contacted stops matching the numbers it was made for. It is call handling." },
+        { "path": "messages.country", "class": "runs", "tick": "agentSettings", "type": "string", "maxChars": 8, "what": "The country numbers are read for", "reason": "It decides how a written number is read: with NZ, GB, ZA or ID the number 0491 570 006 becomes +64, +44, +27 or +62, so the list of people who are answered, called back or not contacted stops matching the numbers it was made for. It is call handling.", "reads": "Every number the Agent reads or dials is normalised for this country (setLocalCountry), so it decides whom a list matches.", "readers": ["app/src/phoneNumbers.ts#setLocalCountry"] },
         { "path": "lastProjectId", "class": "excluded", "what": "The project that was open last", "reason": "It belongs to the computer it was last used on: it may name a project that is not here." },
         { "path": "lastKeptProjectId", "class": "excluded", "what": "The last project that is kept", "reason": "It belongs to the computer it was last used on: it may name a project that is not here." },
         { "path": "desktop", "class": "excluded", "what": "The paired desktop and its token", "reason": "A token is never in a backup.", "redo": "Pair the Agent with OAIY Desktop again." },
@@ -708,6 +721,11 @@
       ]
     }
   },
+
+  "audit": [
+    { "item": "Themes", "class": "not stored", "reads": "The page's themes ship inside the program (the folder theme is looked in, not written); a person's choice of theme lives in the browser and is not in the data folder or in the Agent's storage that a backup reads. It feeds no behaviour.", "why": "Nothing is stored that a restore could write, so there is nothing to classify.", "readers": ["platform/desktop/src-tauri/src/backup/table.json#\"theme\": \"not-a-store"] },
+    { "item": "A Messages store", "class": "not stored", "reads": "There is none: a text conversation is a conversation of the front desk (opfs/front-desk/sessions), and the texts' settings are the Agent's settings (messages.*). Both are rows of this table.", "why": "A store that appears later is refused by the scanner tests until it is classified.", "readers": ["platform/desktop/src-tauri/src/backup/table.json#agent-desk-sessions"] }
+  ],
 
   "scan": {
     "_about": "Every name the desktop's own code uses for a file or a folder under its data folder, and every name the Agent's page uses in its browser storage, mapped to the row that classifies it or to the reason it is not a store. A test reads the sources and fails when a name is not here, so a new store cannot be added without a decision.",

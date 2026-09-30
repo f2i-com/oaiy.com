@@ -186,6 +186,8 @@ pub struct Row {
     pub reads: Option<String>,
     /// Where it is read: `<path from the repository root>#<a name that is in that file>`.
     pub readers: Vec<String>,
+    /// For a data row that has no key table: why the value can be trusted without one.
+    pub keyless_because: Option<String>,
     words_under: Option<String>,
     words: Vec<String>,
 }
@@ -309,6 +311,8 @@ pub struct Table {
     pub desktop: Vec<Row>,
     pub agent: Vec<Row>,
     pub key_tables: BTreeMap<String, KeyTable>,
+    /// What the audit decided about things that are not rows of the table.
+    pub audit: Vec<AuditNote>,
     pub scan: Scan,
 }
 
@@ -323,6 +327,8 @@ struct RawTable {
     desktop: Vec<RawRow>,
     agent: Vec<RawRow>,
     key_tables: BTreeMap<String, RawKeyTable>,
+    #[serde(default)]
+    audit: Vec<RawAudit>,
     scan: RawScan,
 }
 
@@ -363,6 +369,29 @@ struct RawRow {
     reads: Option<String>,
     #[serde(default)]
     readers: Vec<String>,
+    #[serde(default)]
+    keyless_because: Option<String>,
+}
+
+/// A judgment of the audit about something that is not a row of the table (a place nothing is stored in).
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields, rename_all = "camelCase")]
+struct RawAudit {
+    item: String,
+    class: String,
+    reads: String,
+    why: String,
+    #[serde(default)]
+    readers: Vec<String>,
+}
+
+#[derive(Clone, Debug)]
+pub struct AuditNote {
+    pub item: String,
+    pub class: String,
+    pub reads: String,
+    pub why: String,
+    pub readers: Vec<String>,
 }
 
 #[derive(Deserialize)]
@@ -471,6 +500,7 @@ fn row_from(raw: RawRow) -> Result<Row, String> {
         redo: raw.redo,
         reads: raw.reads,
         readers: raw.readers,
+        keyless_because: raw.keyless_because,
         words_under: raw.words_under,
         words: raw.words,
     })
@@ -532,7 +562,8 @@ impl Table {
             let keys = kt.keys.into_iter().map(key_from).collect::<Result<Vec<_>, _>>()?;
             key_tables.insert(name.clone(), KeyTable { name, file: kt.file, about: kt.about, keys });
         }
-        let table = Table { desktop, agent, key_tables, scan: Scan { desktop_names: raw.scan.desktop_names, agent_names: raw.scan.agent_names, agent_modules: raw.scan.agent_modules } };
+        let audit = raw.audit.into_iter().map(|a| AuditNote { item: a.item, class: a.class, reads: a.reads, why: a.why, readers: a.readers }).collect();
+        let table = Table { desktop, agent, key_tables, audit, scan: Scan { desktop_names: raw.scan.desktop_names, agent_names: raw.scan.agent_names, agent_modules: raw.scan.agent_modules } };
         let problems = table.problems();
         if problems.is_empty() {
             Ok(table)
@@ -562,6 +593,31 @@ impl Table {
             }
             if row.globs.is_empty() && row.words.is_empty() && row.id != "built-in-template" {
                 out.push(format!("row {} matches nothing", row.id));
+            }
+        }
+        // The audit's rule, held by the loader: a value is data only if it says what reads it (and where), it feeds no
+        // behaviour, and it carries no words; a data row that has no key table says why it needs none.
+        let audited = |what: &str, reads: &Option<String>, readers: &[String], out: &mut Vec<String>| {
+            match reads {
+                Some(text) if text.to_lowercase().contains(FEEDS_NOTHING) => {}
+                _ => out.push(format!("{what} is data and does not say what reads it and that it \"{FEEDS_NOTHING}\" (reads)")),
+            }
+            if readers.is_empty() {
+                out.push(format!("{what} is data and does not name the code that reads it (readers)"));
+            }
+        };
+        for row in self.desktop.iter().chain(&self.agent).filter(|r| r.class == Class::Data) {
+            audited(&format!("row {}", row.id), &row.reads, &row.readers, &mut out);
+            if row.keys.is_none() && row.keyless_because.as_deref().is_none_or(|w| w.trim().is_empty()) {
+                out.push(format!("row {} is data and has no key table, and does not say why it needs none (keylessBecause)", row.id));
+            }
+        }
+        for (name, kt) in &self.key_tables {
+            for key in kt.keys.iter().filter(|k| k.class == Class::Data && !matches!(k.ty, Some(ValueType::Object | ValueType::Objects { .. }))) {
+                audited(&format!("key {name}: \"{}\"", key.path), &key.reads, &key.readers, &mut out);
+                if key.ty.as_ref().is_some_and(ValueType::carries_words) {
+                    out.push(format!("key table {name}: \"{}\" is data and can carry words: words are read", key.path));
+                }
             }
         }
         for (name, kt) in &self.key_tables {
@@ -618,6 +674,9 @@ impl Table {
         self.key_tables.get(name)
     }
 }
+
+/// What a data row or key must say of what reads it.
+pub const FEEDS_NOTHING: &str = "feeds no behaviour";
 
 /// The key a key sits inside (`gate` for `gate.mode`, `providers` for `providers[].id`), if it sits in one.
 fn parent_of(path: &str) -> Option<String> {
@@ -1071,6 +1130,24 @@ impl Table {
                 }
             }
             out.push_str(&format!("| {} | {} | {} |\n", cell(class.label()), cell(&holds.join("; ")), cell(class.description())));
+        }
+        out
+    }
+
+    /// The audit: for everything that says what reads it, what reads it, where, the class and why, as markdown.
+    pub fn render_audit(&self) -> String {
+        let mut out = String::from("| Item | Class | What reads it | Where | Why it is classed so |\n|---|---|---|---|---|\n");
+        let readers = |list: &[String]| if list.is_empty() { "-".to_string() } else { list.iter().map(|r| format!("`{}`", cell(r))).collect::<Vec<_>>().join(", ") };
+        for row in self.desktop.iter().chain(&self.agent).filter(|r| r.reads.is_some()) {
+            out.push_str(&format!("| `{}` | {} | {} | {} | {} |\n", cell(&row.pattern), row.class.id(), cell(row.reads.as_deref().unwrap_or("")), readers(&row.readers), why_cell(&row.what, &row.reason, None)));
+        }
+        for table in self.key_tables.values() {
+            for key in table.keys.iter().filter(|k| k.reads.is_some()) {
+                out.push_str(&format!("| `{}`: `{}` | {} | {} | {} | {} |\n", cell(&table.file), cell(&key.path), key.class.id(), cell(key.reads.as_deref().unwrap_or("")), readers(&key.readers), why_cell(&key.what, &key.reason, None)));
+            }
+        }
+        for note in &self.audit {
+            out.push_str(&format!("| {} | {} | {} | {} | {} |\n", cell(&note.item), cell(&note.class), cell(&note.reads), readers(&note.readers), cell(&note.why)));
         }
         out
     }

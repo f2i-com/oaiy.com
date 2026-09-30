@@ -627,6 +627,104 @@ fn every_name_the_agents_page_stores_under_is_classified_or_declared_not_a_store
     }
 }
 
+// ---- the audit: data is what no code turns into behaviour -----------------------------------------------
+
+fn repo_root() -> PathBuf {
+    manifest_dir().join("../../..")
+}
+
+/// Every place the table says something is read: `<path from the repository root>#<a name that is in that file>`.
+fn all_readers(t: &Table) -> Vec<(String, String)> {
+    let mut out = Vec::new();
+    for row in t.desktop.iter().chain(&t.agent) {
+        out.extend(row.readers.iter().map(|r| (format!("row {}", row.id), r.clone())));
+    }
+    for table in t.key_tables.values() {
+        for key in &table.keys {
+            out.extend(key.readers.iter().map(|r| (format!("key {}: {}", table.name, key.path), r.clone())));
+        }
+    }
+    out.extend(t.audit.iter().flat_map(|a| a.readers.iter().map(|r| (format!("audit note {}", a.item), r.clone()))));
+    out
+}
+
+/// An annotation cannot go stale: each place it names is a file that is there and holds the name.
+#[test]
+fn every_place_the_audit_names_is_a_file_that_holds_the_name() {
+    let t = table();
+    let readers = all_readers(t);
+    assert!(readers.len() >= 30, "the audit names what reads things: {} places", readers.len());
+    let mut wrong = Vec::new();
+    for (who, reader) in readers {
+        let Some((path, symbol)) = reader.split_once('#') else {
+            wrong.push(format!("{who}: {reader:?} is not <path>#<name>"));
+            continue;
+        };
+        match std::fs::read_to_string(repo_root().join(path)) {
+            Ok(text) if lf(&text).contains(symbol) => {}
+            Ok(_) => wrong.push(format!("{who}: {path} does not hold {symbol:?}")),
+            Err(_) => wrong.push(format!("{who}: there is no file {path}")),
+        }
+    }
+    assert!(wrong.is_empty(), "{wrong:#?}");
+}
+
+/// The data values that exist, and nothing else: a new one is a deliberate edit of this list, made after the audit's questions
+/// were asked of it (see docs/BACKUP.md, "The audit").
+#[test]
+fn the_values_that_are_data_are_the_ones_the_audit_found() {
+    let t = table();
+    let mut data: Vec<String> = t.desktop.iter().chain(&t.agent).filter(|r| r.class == Class::Data).map(|r| format!("row {}", r.id)).collect();
+    for table in t.key_tables.values() {
+        data.extend(table.keys.iter().filter(|k| k.class == Class::Data && !matches!(k.ty, Some(ValueType::Object | ValueType::Objects { .. }))).map(|k| format!("{}: {}", table.name, k.path)));
+    }
+    data.sort();
+    let expected = [
+        "calendar: appointments[].createdAt", "calendar: appointments[].id", "calendar: appointments[].minutes", "calendar: appointments[].source", "calendar: appointments[].start",
+        "calendar: appointments[].status", "calendar: appointments[].updatedAt", "calendar: settings.horizonDays", "calendar: settings.hours", "calendar: settings.noticeMinutes",
+        "calendar: settings.slotMinutes", "row agent-do-not-contact",
+    ];
+    assert_eq!(data, expected, "a value that is data has been added or removed: ask the audit's questions of it, and say so here");
+    // None of them is text, and each of them says what reads it and that it feeds no behaviour (the loader holds that; this is the test that it does).
+    for table in t.key_tables.values() {
+        for key in table.keys.iter().filter(|k| k.class == Class::Data && !matches!(k.ty, Some(ValueType::Object | ValueType::Objects { .. }))) {
+            assert!(!key.ty.as_ref().unwrap().carries_words(), "{}: {}", table.name, key.path);
+            assert!(key.reads.as_deref().unwrap_or("").to_lowercase().contains(super::table::FEEDS_NOTHING) && !key.readers.is_empty(), "{}: {}", table.name, key.path);
+        }
+    }
+    let dnc = t.agent.iter().find(|r| r.id == "agent-do-not-contact").unwrap();
+    assert!(dnc.keyless_because.is_some() && dnc.merge.as_deref() == Some("union"), "the one data file without a key table is checked by its merge");
+}
+
+/// The loader holds the rule itself: a table in which something is data without saying what reads it, or that carries words, is
+/// not a table OAIY starts with.
+#[test]
+fn a_table_that_calls_something_data_without_the_audit_does_not_load() {
+    let broken = |edit: &dyn Fn(&mut Value)| {
+        let mut v: Value = serde_json::from_str(TABLE_JSON).unwrap();
+        edit(&mut v);
+        Table::parse(&v.to_string()).err()
+    };
+    fn key<'a>(v: &'a mut Value, table: &str, path: &str) -> &'a mut Value {
+        let at = v["keyTables"][table]["keys"].as_array().unwrap().iter().position(|k| k["path"] == path).unwrap();
+        &mut v["keyTables"][table]["keys"][at]
+    }
+    let says = |e: Option<String>, what: &str| assert!(e.as_ref().is_some_and(|e| e.contains(what)), "{what:?} in {e:?}");
+    says(broken(&|v| { key(v, "calendar", "settings.slotMinutes").as_object_mut().unwrap().remove("reads"); }), "does not say what reads it");
+    says(broken(&|v| { key(v, "calendar", "settings.slotMinutes")["reads"] = json!("Read by the calendar."); }), "does not say what reads it");
+    says(broken(&|v| { key(v, "calendar", "settings.slotMinutes")["readers"] = json!([]); }), "does not name the code that reads it");
+    // The calendar hole, exactly: the business's name as data, with an annotation that says the right words.
+    says(broken(&|v| {
+        let k = key(v, "calendar", "settings.business");
+        k["class"] = json!("data");
+        k.as_object_mut().unwrap().remove("tick");
+        k["reads"] = json!("Nothing reads it and it feeds no behaviour.");
+        k["readers"] = json!(["platform/desktop/src-tauri/src/calendar/mod.rs#Settings"]);
+    }), "can carry words");
+    says(broken(&|v| { v["agent"].as_array_mut().unwrap().iter_mut().find(|r| r["id"] == "agent-do-not-contact").unwrap().as_object_mut().unwrap().remove("keylessBecause"); }), "does not say why it needs none");
+    says(broken(&|v| { v["agent"].as_array_mut().unwrap().iter_mut().find(|r| r["id"] == "agent-do-not-contact").unwrap().as_object_mut().unwrap().remove("reads"); }), "does not say what reads it");
+}
+
 // ---- the documentation is generated from the table ----------------------------------------------------
 
 fn docs_path() -> PathBuf {
@@ -638,7 +736,7 @@ fn the_backup_docs_are_generated_from_the_table() {
     let t = table();
     let path = docs_path();
     let doc = lf(&std::fs::read_to_string(&path).expect("docs/BACKUP.md"));
-    let blocks = [("classification-table", t.render_table()), ("tick-kinds", t.render_kinds())];
+    let blocks = [("classification-table", t.render_table()), ("tick-kinds", t.render_kinds()), ("audit", t.render_audit())];
     let mut expected = doc.clone();
     for (name, block) in &blocks {
         expected = splice_generated(&expected, name, block).unwrap_or_else(|| panic!("docs/BACKUP.md has no <!-- BEGIN GENERATED: {name} --> ... <!-- END GENERATED: {name} --> block"));
