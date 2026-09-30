@@ -1,0 +1,56 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://oaiy.com/schemas/relay/v1/pairing-decision-response.schema.json",
+  "title": "Pairing decision response",
+  "description": "200 response of POST /v1/pair/{pid}/decision. An approval answers with the relay device id the phone was given; a denial has no device. Both are idempotent: the same decision again answers the same. The sealed token is never in this answer: it goes to the phone, in GET /v1/pair/{pid}, sealed to its own key.",
+  "type": "object",
+  "properties": {
+    "v": {
+      "const": 1
+    },
+    "state": {
+      "enum": [
+        "approved",
+        "denied"
+      ]
+    },
+    "deviceId": {
+      "$ref": "https://oaiy.com/schemas/relay/v1/common.schema.json#/$defs/deviceId"
+    },
+    "time": {
+      "$ref": "https://oaiy.com/schemas/relay/v1/common.schema.json#/$defs/unixTime"
+    }
+  },
+  "required": [
+    "v",
+    "state",
+    "time"
+  ],
+  "additionalProperties": true,
+  "allOf": [
+    {
+      "if": {
+        "properties": {
+          "state": {
+            "const": "approved"
+          }
+        },
+        "required": [
+          "state"
+        ]
+      },
+      "then": {
+        "required": [
+          "deviceId"
+        ]
+      },
+      "else": {
+        "not": {
+          "required": [
+            "deviceId"
+          ]
+        }
+      }
+    }
+  ]
+}

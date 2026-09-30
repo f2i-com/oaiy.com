@@ -58,7 +58,7 @@ final class Info
     /** @return list<string> the features this build implements and this relay has enabled */
     public function features(): array
     {
-        $f = ['poll', 'items', 'presence', 'methods.post-forms'];
+        $f = ['poll', 'items', 'presence', 'pairing.v3', 'methods.post-forms'];
         return $f;
     }
 

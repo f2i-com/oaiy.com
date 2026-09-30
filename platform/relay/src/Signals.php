@@ -168,6 +168,6 @@ final class Signals
                 $removed++;
             }
         }
-        return $removed;
+        return $removed + AddressHolds::collect($this->dir);
     }
 }

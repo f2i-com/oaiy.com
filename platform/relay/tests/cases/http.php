@@ -82,10 +82,10 @@ test('4.8 info: a static, signed document with a strong ETag, cacheable for a mi
     eq(200, $r->call(null, 'GET', '/v1/info', null, [], ['If-None-Match' => '"other"'])['status']);
 });
 
-test('4.8 info lists only what this build implements: poll, items, presence, POST forms; and only the lanes it serves', function () {
+test('4.8 info lists only what this build implements: poll, items, presence, pairing, POST forms; and only the lanes it serves', function () {
     $r = Relay::make();
     $doc = $r->call(null, 'GET', '/v1/info')['json'];
-    eq(['poll', 'items', 'presence', 'methods.post-forms'], $doc['features']);
+    eq(['poll', 'items', 'presence', 'pairing.v3', 'methods.post-forms'], $doc['features']);
     eq(['cmd', 'res', 'ctl', 'sync'], array_keys($doc['limits']['lanes']));
     eq(['body' => 32768, 'ttl' => ['default' => 60, 'min' => 1, 'max' => 300]], $doc['limits']['lanes']['cmd']);
     eq(false, $doc['turn']);

@@ -172,7 +172,8 @@ final class Db
     private static function cast(array $r): array
     {
         foreach (self::INT_COLS as $c) {
-            if (isset($r[$c]) && is_string($r[$c])) {
+            // Only a number: pairings.state is text ('open', 'answered') under a name items.state uses for an integer.
+            if (isset($r[$c]) && is_string($r[$c]) && is_numeric($r[$c])) {
                 $r[$c] = (int)$r[$c];
             }
         }

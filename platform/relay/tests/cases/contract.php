@@ -115,6 +115,35 @@ test('9.1 contract: every response shape the relay produces validates against th
     $add('roster-request', ['appId' => 'aokie', 'revision' => 8, 'thumbprints' => [$ths[0]]], 'roster request (one phone)');
     $addRes('roster-response', $go($desk, 'POST', '/v1/roster', ['appId' => 'aokie', 'revision' => 8, 'thumbprints' => [$ths[0]]]), 'roster response with a revocation');
 
+    // Pairing (RL-06): a whole ceremony, a denial, a reject, a burn, a wait and the errors of each.
+    $c = OaiyTest\Ceremony::random($r, $desk);
+    $add('pairing-create-request', $c->createDoc(), 'pairing create request');
+    $addRes('pairing-create-response', $go($desk, 'POST', '/v1/pair', $c->createDoc()), 'pairing create response');
+    $addRes('pairing-fetch-response', $go(null, 'GET', '/v1/pair/' . $c->pid), 'pairing fetch: open');
+    $addRes('pairing-fetch-response', $go(null, 'GET', '/v1/pair/' . $c->pid, null, ['wait' => '1']), 'pairing fetch: open, after a refused wait (the poll markers above fill the pool)');
+    $add('pairing-answer-request', ['response' => $c->responseText()], 'pairing answer request');
+    $addRes('pairing-answer-response', $go(null, 'POST', '/v1/pair/' . $c->pid . '/response', ['response' => $c->responseText()]), 'pairing answer response');
+    $addRes('pairing-fetch-response', $go(null, 'GET', '/v1/pair/' . $c->pid), 'pairing fetch: answered');
+    $go(null, 'POST', '/v1/pair/' . $c->pid . '/response', ['response' => $c->responseText()]); // 409 already_answered
+    $add('pairing-decision', $c->decisionDoc(), 'pairing approval');
+    $addRes('pairing-decision-response', $go($desk, 'POST', '/v1/pair/' . $c->pid . '/decision', $c->decisionDoc()), 'pairing approval response');
+    $addRes('pairing-fetch-response', $go(null, 'GET', '/v1/pair/' . $c->pid), 'pairing fetch: approved');
+    $c2 = OaiyTest\Ceremony::random($r, $desk);
+    $go($desk, 'POST', '/v1/pair', $c2->createDoc());
+    $go(null, 'POST', '/v1/pair/' . $c2->pid . '/response', ['response' => $c2->responseText()]);
+    $add('pairing-decision', ['approve' => false], 'pairing denial');
+    $addRes('pairing-decision-response', $go($desk, 'POST', '/v1/pair/' . $c2->pid . '/decision', ['approve' => false]), 'pairing denial response');
+    $addRes('pairing-fetch-response', $go(null, 'GET', '/v1/pair/' . $c2->pid), 'pairing fetch: denied');
+    $c3 = OaiyTest\Ceremony::random($r, $desk);
+    $go($desk, 'POST', '/v1/pair', $c3->createDoc());
+    $go(null, 'POST', '/v1/pair/' . $c3->pid . '/response', ['response' => $c3->responseText()]);
+    $add('pairing-reject-request', ['reason' => 'mac mismatch'], 'pairing reject request');
+    $addRes('pairing-state-response', $go($desk, 'POST', '/v1/pair/' . $c3->pid . '/reject', ['reason' => 'mac mismatch']), 'pairing reject response (open again)');
+    $addRes('pairing-state-response', $go($desk, 'POST', '/v1/pair/' . $c3->pid . '/burn'), 'pairing burn response');
+    $go(null, 'GET', '/v1/pair/' . $c3->pid); // 404
+    $go($desk, 'POST', '/v1/pair/' . $c3->pid . '/decision', ['approve' => false]); // 410
+    $go($desk, 'POST', '/v1/pair', ['pid' => 'short'] + $c3->createDoc()); // 400
+
     // Revocation.
     $add('devices-revoke-request', ['role' => 'phone'], 'revoke-all request');
     $addRes('devices-revoke-response', $go($desk, 'POST', '/v1/devices/revoke', ['role' => 'phone']), 'revoke-all response');

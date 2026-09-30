@@ -246,14 +246,37 @@ while (a correct token is never refused by the address counter).
   it to `data/keys/<id>.txt`; the desktop redeems it with `POST /v1/enroll`. The key carries a secret from which both the key id
   and a signing key are derived; the relay stores only the derived **public** key, so a copy of the database cannot redeem
   anything. Redeeming means signing the exact request body, so the secret is never sent. Five wrong proofs burn a key.
-- **Phones** are paired through the desktop, never by the relay alone (the pairing routes are a later part of the relay, not
-  in this build). The desktop lists, renames, limits and revokes them with `GET/POST /v1/devices…`, and pushes its
-  authoritative roster with `POST /v1/roster`. A phone that the roster leaves out is revoked at once. A phone cannot change
-  its own keys.
+- **Phones** are paired through the desktop, never by the relay alone (next section). The desktop lists, renames, limits and
+  revokes them with `GET/POST /v1/devices…`, and pushes its authoritative roster with `POST /v1/roster`. A phone that the
+  roster leaves out is revoked at once. A phone cannot change its own keys.
 - **Revoking** a device is immediate and complete: its token stops working, its inbox and pending items are deleted, and a
   request it is holding open ends with `401 revoked` within a quarter of a second.
 - **Token rotation:** `POST /v1/tokens/rotate` returns a new token; the old one works for ten more minutes, and a second
   rotation inside that time is `409`.
+
+## Pairing a phone
+
+The relay keeps a **rendezvous** for one pairing: a mailbox that holds the desktop's offer, the phone's response and the owner's
+decision, and that hands the phone its token sealed to its own key. It never sees the secret (the QR code or the typed code): the
+phone finds the rendezvous by an id (`pid`) derived from it, checks the offer's MAC with a key only the two ends can derive, and
+the relay only stores and forwards. The steps and their answers are in the protocol package
+([`README.md`](../protocol/relay/v1/README.md), section 10.1); what the relay adds:
+
+- **The pid is the phone's only credential.** An unknown, an expired and a burned pid answer one identical `404` (same lookup, same
+  body), a bad request body is `400` whatever the pid, and a wait for an unknown pid returns at once. Nothing tells a stranger
+  which pids exist.
+- **Limits** (each has a test): an offer of 4,096 bytes, a response of 8,192, three responses and three rejects per rendezvous,
+  60 `GET`s in its life, at most 900 seconds of life (600 by default), 16 rendezvous open per desktop, 30 requests a minute per
+  client address on the phone's two routes, and at most 4 waiting requests per address. A waiting `GET` is an edge hold: when the
+  worker pool is nearly full it is answered at once with `hold.refused` and the phone short-polls.
+- **The sealed token.** On approval the relay creates the phone's device, mints its token, seals it with `sodium_crypto_box_seal`
+  to the phone's X25519 key (a key of small order is `422` before anything is created) and stores only the sealed box, the token's
+  hash and the desktop's signed **receipt**. The plaintext token exists inside that one request. The relay checks the receipt
+  against the desktop key in the offer, and the approved keys against the response the phone posted, before it creates anything;
+  the phone checks both again, because the relay is not trusted.
+- **Races.** Every change of state is a conditional `UPDATE` in one immediate transaction: two responders to one pid cannot both
+  win, an approval racing a burn has one winner, and the database agrees with it.
+- **Garbage collection** removes a rendezvous ten minutes after the phone read its outcome, and at expiry.
 
 ### `php bin/relay.php`, the administration commands
 

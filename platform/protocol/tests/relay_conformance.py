@@ -947,6 +947,15 @@ pos("pairing-decision", "approve", {"approve": True, "phone": {"ed25519": PUB["p
                                     "grants": RECEIPT["grants"], "receipt": {"issuedAt": NOW, "signature": SIG64}})
 pos("pairing-decision", "deny", {"approve": False})
 pos("pairing-reject-request", "a reason", {"reason": "mac mismatch"})
+pos("pairing-reject-request", "no reason at all", {})
+pos("pairing-decision-response", "an approval", {"v": 1, "state": "approved", "deviceId": PHONEID, "time": NOW})
+pos("pairing-decision-response", "a denial (no device)", {"v": 1, "state": "denied", "time": NOW})
+pos("pairing-state-response", "a reject that reopened it", {"v": 1, "state": "open", "time": NOW})
+pos("pairing-state-response", "a burn, or the third reject", {"v": 1, "state": "expired", "time": NOW})
+FETCH_OPEN = POS["pairing-fetch-response"][0][1]
+pos("pairing-fetch-response", "open, after a granted wait", dict(FETCH_OPEN, hold={"granted": True}))
+pos("pairing-fetch-response", "answered, superseded by a newer wait", dict(FETCH_OPEN, state="answered", hold={"granted": True, "superseded": True}))
+pos("pairing-fetch-response", "open, the wait refused because the pool is nearly full", dict(FETCH_OPEN, hold={"refused": True, "retryAfter": 2}))
 pos("approval-receipt", "the A3 receipt document", RECEIPT)
 pos("admission-claims", "the A4 mobile claims", vec["A4"]["inputs"]["claims"])
 pos("admission-claims", "a plugin claims set", {"aud": "aokie-v2-gateway", "appId": "aokie", "subjectId": "aokie", "role": "plugin", "holderKeyThumbprint": DESK_TH,
@@ -1212,6 +1221,33 @@ neg("pairing-fetch-response", "approved without a sealed token", mut(p1("pairing
 neg("pairing-fetch-response", "open without an offer", mut(p1("pairing-fetch-response"), "offer"), "offer")
 neg("pairing-fetch-response", "expired is an error (410), not a state", {"v": 1, "state": "expired", "time": NOW}, "state")
 neg("pairing-reject-request", "a reason of 201 characters", {"reason": "x" * 201}, "reason")
+neg("pairing-reject-request", "a reason that is a number", {"reason": 5}, "reason")
+neg("pairing-create-request", "ttl zero", mut(p1("pairing-create-request"), "ttl", 0), "ttl")
+neg("pairing-create-request", "ttl fractional", mut(p1("pairing-create-request"), "ttl", 1.5), "ttl")
+neg("pairing-create-request", "no desktopThumbprint", mut(p1("pairing-create-request"), "desktopThumbprint"), "desktopThumbprint")
+neg("pairing-create-request", "a pid of 23 characters", mut(p1("pairing-create-request"), "pid", "A" * 23), "pid")
+neg("pairing-create-request", "an appId of 65 characters", mut(p1("pairing-create-request"), "appId", "a" * 65), "appId")
+neg("pairing-create-request", "an empty offer", mut(p1("pairing-create-request"), "offer", ""), "offer")
+neg("pairing-answer-request", "no response member", {}, "response")
+neg("pairing-answer-request", "an empty response", {"response": ""}, "response")
+neg("pairing-answer-request", "a response that is an object, not text", {"response": {"kind": "aokie_mobile_pairing_response"}}, "response")
+neg("pairing-decision", "an approval with 17 grants", mut(p1("pairing-decision"), "grants", [f"g{i}" for i in range(17)]), "grants")
+neg("pairing-decision", "a grant that is not a name", mut(p1("pairing-decision"), "grants", ["State-Read"]), "grants")
+neg("pairing-decision", "an approval without the phone's X25519 key", mut(p1("pairing-decision"), "phone.x25519"), "x25519")
+neg("pairing-decision", "a receipt with a negative issuedAt", mut(p1("pairing-decision"), "receipt.issuedAt", -1), "issuedAt")
+neg("pairing-decision", "a receipt signature of 85 characters", mut(p1("pairing-decision"), "receipt.signature", SIG64[:85]), "signature")
+neg("pairing-decision", "a name of 61 characters", mut(p1("pairing-decision"), "name", "x" * 61), "name")
+neg("pairing-decision-response", "state open is not an outcome", {"v": 1, "state": "open", "time": NOW}, "state")
+neg("pairing-decision-response", "an approval without the device id", {"v": 1, "state": "approved", "time": NOW}, "deviceId")
+neg("pairing-decision-response", "a denial that names a device", {"v": 1, "state": "denied", "deviceId": PHONEID, "time": NOW}, "deviceId")
+neg("pairing-decision-response", "a device id that is a provider id", {"v": 1, "state": "approved", "deviceId": PROVID, "time": NOW}, "deviceId")
+neg("pairing-decision-response", "no time", {"v": 1, "state": "denied"}, "time")
+neg("pairing-state-response", "state approved is not for a reject", {"v": 1, "state": "approved", "time": NOW}, "state")
+neg("pairing-state-response", "v 2", {"v": 2, "state": "open", "time": NOW}, "v")
+neg("pairing-fetch-response", "a hold both granted and refused", dict(p1("pairing-fetch-response"), hold={"granted": True, "refused": True, "retryAfter": 2}), "hold")
+neg("pairing-fetch-response", "a refused hold without retryAfter", dict(p1("pairing-fetch-response"), hold={"refused": True}), "hold")
+neg("pairing-fetch-response", "an approval without the receipt", mut(p1("pairing-fetch-response", 1), "receipt"), "receipt")
+neg("pairing-fetch-response", "an answered rendezvous without its MAC", mut(dict(p1("pairing-fetch-response"), state="answered"), "mac"), "mac")
 
 # --- admission (4.14)
 MOBILE_CLAIMS = vec["A4"]["inputs"]["claims"]
@@ -1469,6 +1505,69 @@ for t in ex["tokens"]["invalid"]:
 rule("item ids: a path-like id never reaches a file name (ids are matched by pattern)", lambda: validate("common#itemId", "../../data/relay.sqlite") != [])
 rule("item ids: NUL byte", lambda: validate("common#itemId", "a\u0000b") != [])
 rule("item ids: . and .. match the character class and are refused all the same", lambda: validate("common#itemId", ".") != [] and validate("common#itemId", "..") != [])
+
+# --- the rendezvous state machine (README 10.1): the reference function, and what it must refuse
+class Conflict(ValueError):
+    pass
+
+
+def pairing_next(state: str, event: str, rejects: int = 0, responses: int = 0) -> str:
+    """One step of the relay-side state machine: open -> answered -> approved | denied; answered -> open by a reject (the
+    third ends it); open | answered | denied -> expired by a burn or at exp. Anything else is a Conflict."""
+    if state == "expired":
+        raise Conflict("gone")
+    if event == "response" and state == "open" and responses < 3:
+        return "answered"
+    if event == "reject" and state == "answered":
+        return "open" if rejects + 1 < 3 else "expired"
+    if event == "approve" and state == "answered":
+        return "approved"
+    if event == "deny" and state == "answered":
+        return "denied"
+    if event == "burn" and state in ("open", "answered", "denied"):
+        return "expired"
+    raise Conflict(f"{event} in {state}")
+
+
+def refused_step(state: str, event: str, **kw) -> bool:
+    try:
+        pairing_next(state, event, **kw)
+        return False
+    except Conflict:
+        return True
+
+
+def pair_item_id(pid: str, n: int) -> str:
+    """The id of the pair item of the n-th accepted response: the pid itself for the first, pid.n after a reject."""
+    return pid if n == 1 else f"{pid}.{n}"
+
+
+PID3 = A3["expected"]["pid"]
+rule("pairing states: a response opens the answered state, a reject reopens it, the third reject ends it",
+     lambda: (pairing_next("open", "response"), pairing_next("answered", "reject", rejects=0), pairing_next("answered", "reject", rejects=1),
+              pairing_next("answered", "reject", rejects=2)) == ("answered", "open", "open", "expired"))
+rule("pairing states: a second response while answered is refused (already_answered)", lambda: refused_step("answered", "response"))
+rule("pairing states: a response after an approval is refused", lambda: refused_step("approved", "response"))
+rule("pairing states: a response after a denial is refused", lambda: refused_step("denied", "response"))
+rule("pairing states: a fourth response is refused whatever the state (three are accepted)", lambda: refused_step("open", "response", responses=3))
+rule("pairing states: an approval of an open rendezvous (nobody answered) is refused", lambda: refused_step("open", "approve"))
+rule("pairing states: a denial of an open rendezvous is refused", lambda: refused_step("open", "deny"))
+rule("pairing states: a reject of an open rendezvous is refused", lambda: refused_step("open", "reject"))
+rule("pairing states: an approval after a denial is refused", lambda: refused_step("denied", "approve"))
+rule("pairing states: a reject after an approval is refused", lambda: refused_step("approved", "reject"))
+rule("pairing states: an approved rendezvous is not burned (its phone has yet to read the token)", lambda: refused_step("approved", "burn"))
+rule("pairing states: nothing happens to an expired rendezvous", lambda: all(refused_step("expired", e) for e in ("response", "reject", "approve", "deny", "burn")))
+rule("pairing states: the state after a burn is expired, from open, answered and denied",
+     lambda: all(pairing_next(s, "burn") == "expired" for s in ("open", "answered", "denied")))
+rule("pairing: the item ids of three responses are all different and the first is the pid",
+     lambda: [pair_item_id(PID3, n) for n in (1, 2, 3)] == [PID3, PID3 + ".2", PID3 + ".3"] and len({pair_item_id(PID3, n) for n in (1, 2, 3)}) == 3)
+rule("pairing: the receipt document lists the grants sorted, so an unsorted list is another text and another signature",
+     lambda: canonical_json(json.dumps(dict(A3["inputs"]["receiptDocument"], grants=list(reversed(A3["inputs"]["receiptDocument"]["grants"]))))) != A3["expected"]["receiptText"])
+rule("pairing: a receipt signature does not verify for another pid",
+     lambda: not ed_verify(pub["desktopEndpoint"], b"oaiy/pairing/3/approval\x00" + canonical_json(json.dumps(dict(A3["inputs"]["receiptDocument"], pid=b64u(bytes(16))))).encode(), unb64u_strict(A3["expected"]["receiptSignature"])))
+rule("pairing: a receipt signature does not verify under the response domain",
+     lambda: not ed_verify(pub["desktopEndpoint"], b"oaiy/pairing/3/response\x00" + A3["expected"]["receiptText"].encode(), unb64u_strict(A3["expected"]["receiptSignature"])))
+
 n_rules = 0
 for label, fn in RULES:
     n_rules += 1

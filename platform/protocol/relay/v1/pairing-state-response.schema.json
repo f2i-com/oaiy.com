@@ -1,0 +1,27 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://oaiy.com/schemas/relay/v1/pairing-state-response.schema.json",
+  "title": "Pairing state response",
+  "description": "200 response of POST /v1/pair/{pid}/reject and POST /v1/pair/{pid}/burn: the state the rendezvous is in afterwards. A reject leaves it open (for the phone's next attempt) unless it was the third, which ends it; a burn always ends it. `expired` is a state the desktop is told about here; to the phone it is one 404.",
+  "type": "object",
+  "properties": {
+    "v": {
+      "const": 1
+    },
+    "state": {
+      "enum": [
+        "open",
+        "expired"
+      ]
+    },
+    "time": {
+      "$ref": "https://oaiy.com/schemas/relay/v1/common.schema.json#/$defs/unixTime"
+    }
+  },
+  "required": [
+    "v",
+    "state",
+    "time"
+  ],
+  "additionalProperties": true
+}
