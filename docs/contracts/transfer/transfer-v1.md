@@ -19,7 +19,7 @@ step with the OAIY repository's copy. The digests are in [SHA256SUMS](SHA256SUMS
 | [transfer-v1.start-ready.fixture.json](transfer-v1.start-ready.fixture.json) | `start.allowTransfer`, `ready.features`, `start.resume`, the `handoff:takeover` stop, and the compatibility matrix. |
 | [transfer-v1.ring-plan.fixture.json](transfer-v1.ring-plan.fixture.json) | The two plugin-to-host requests `oaiy.ring.plan` and `oaiy.ring.opened`. |
 | [transfer-v1.reserved-offer-id.fixture.json](transfer-v1.reserved-offer-id.fixture.json) | The reserved transfer offer id and its generations (vector V2). |
-| [transfer-v1.caller-asked.fixture.json](transfer-v1.caller-asked.fixture.json) | The "caller asked" phrase check: the normaliser, every rule and block, 51 positive and 66 negative cases, the windows, and the turns that only acknowledge the AI. |
+| [transfer-v1.caller-asked.fixture.json](transfer-v1.caller-asked.fixture.json) | The "caller asked" phrase check: the normaliser, every rule and block, 65 positive and 76 negative cases, the windows, and the turns that only acknowledge the AI. |
 
 ## How a transfer runs
 
@@ -141,13 +141,17 @@ Checks, in this order; each refusal is an ordinary `ok: false` result:
    okay": one to three acknowledgements and nothing else, so a caller's "yeah"
    after the ask does not push it out of the last three), each read from its
    last 300 characters, a sentence at a time, after normalising (lower-case,
-   apostrophe look-alikes such as U+2019 become `'`, every run of other
+   the soft hyphen, hex 00AD, removed outright and not made a space, so a
+   word with one inside it reads as the word; apostrophe look-alikes such as U+2019
+   become `'`, every run of other
    characters and of spaces becomes one space, thinking noises dropped), so
    "speak, to the owner" matches and "I don't want to speak" (or "I dont want
    to speak", or the same with a curly apostrophe) is a refusal. The rules,
-   the blocks that stop a sentence counting (a refusal, the future or the past,
-   a question about what the receptionist is, what someone else said, a caller
-   telling the receptionist what to say) and the cases are the caller-asked
+   the blocks that stop a sentence counting (a refusal, doing it without or
+   instead of it, a question about how or when, the future or the past, a
+   question about what the receptionist is, what someone else said, a caller
+   who is talking to somebody now, a caller telling the receptionist what to
+   say) and the cases are the caller-asked
    fixture, the one source both ends are tested against; the plugin's check is
    meant never to be stricter than the host's (what the host counts, the
    plugin lets through), because it runs first, with two differences that are
@@ -165,7 +169,14 @@ Checks, in this order; each refusal is an ordinary `ok: false` result:
    acknowledgement-only turn can never be what asks, so dropping more of them
    only lets the last three reach further back); the one way it can be
    stricter is a turn the host drops for its timing that the plugin keeps,
-   which uses one of the plugin's three places. The same turns, cut the same
+   which uses one of the plugin's three places. The floor is also looser than
+   the host for what only the host reads (an ask taken back, being told to say
+   it, a different target such as billing, someone else in the room), which the
+   host refuses after the floor has let it through; and the one difference of
+   writing that runs the other way is that the host also removes the invisible
+   joiners and marks (hex 200C to 200F, 2060, FEFF) that the normaliser here
+   turns into a space, so a word cut by one in typed text (a speech engine
+   never writes them) is two words to the floor. The same turns, cut the same
    way, are the `recentCallerTurns` of the plan request, which the host reads
    only for a call it has no record of;
 7. the host's ring plan (`oaiy.ring.plan`). For `urgent` and `policy_rule` the
