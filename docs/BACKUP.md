@@ -682,10 +682,12 @@ a thing does:
   more than three invisible characters that nothing explains, a run of six or more joiners,
   selectors or direction marks, or is mostly invisible (more than eight, and more than half).
   Nothing is stripped: a value that holds hidden text is left out whole. A flag, a joined emoji, a
-  right-to-left mark and Persian text pass (tests of both kinds). The dry run reads the brief and
-  the knowledge files (up to 1 MiB each) and every value of the table for this; the conversations,
-  projects and sessions it lists by name and size are not read, and are not restored without their
-  own tick.
+  right-to-left mark and Persian text pass (tests of both kinds). The dry run reads for this the brief
+  and the knowledge files (up to 1 MiB each), every value of the table, and every key and text of a
+  flow, a template, the trigger list, a connector, the notes about callers and the setup, agent and
+  control records (read as JSON, so a hidden character written as an escape is seen too; such a file
+  is left out whole and the dry run describes nothing else of it); the conversations, projects and
+  sessions it lists by name and size are not read, and are not restored without their own tick.
 - **What a restore says of what it left out or changed is kept by class**: at most eight notes of
   one class (a campaign for each, a file for each), then one that says how many more there were,
   so no class of note crowds out another.
@@ -709,7 +711,7 @@ a thing does:
 | a service of the calendar (`calendar-service`) | `about` (200), then each of the 5 keys of the table `calendar` that acts under `settings.services[].` (560 each) | - | all (each is small) |
 | an appointment of the calendar (`calendar-appointment`) | `about` (300), then each of the 11 keys of the table `calendar` that acts under `appointments[].` (560 each) | - | all (each is small) |
 | a voice clip (voices/) (`voice`) | `file` (200) | - | all (each is small) |
-| a file that could not be read (`unreadable`) | `problem` (320) | - | all (each is small) |
+| a file that could not be read (`unreadable`) | `problem` (480) | - | all (each is small) |
 | a settings file that holds nothing OAIY restores (`nothing`) | `nothing` (240) | - | all (each is small) |
 | the things of a kind that are only counted (`more`) | `count` (400) | - | all (each is small) |
 | a project of the Agent (`project`) | `files` (320) | - | all (each is small) |

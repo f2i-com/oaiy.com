@@ -15,7 +15,7 @@ use serde::Serialize;
 use serde_json::Value;
 
 pub use super::parts::ReviewItem;
-use super::parts::{quoted, short, some_of, Parts};
+use super::parts::{quoted, short, some_of, text_problem, Parts};
 use super::table::{filter_json, table, Class, Why};
 use super::{BackupError, ErrorKind, Result};
 
@@ -218,6 +218,9 @@ impl Local {
 /// How the description of a file that could not be read begins (see [`is_unreadable`]).
 const UNREADABLE: &str = "Could not be read (";
 
+/// How the description of a file that hides text begins (see [`is_unreadable`] and [`hidden_text_in`]).
+const HIDES: &str = "Not brought back: it hides text (";
+
 /// What is said of a file too large to look at.
 pub const TOO_LARGE: &str = "Too large to look at: it is not brought back.";
 
@@ -238,7 +241,30 @@ pub fn too_large(class: RestoreClass, name: &str, title: &str) -> ReviewItem {
 /// Whether the description says its file is not brought back because it could not be read (or is too
 /// large to be looked at). The dry run says so, and staging leaves such a file out: the two agree.
 pub fn is_unreadable(item: &ReviewItem) -> bool {
-    item.what.starts_with(UNREADABLE) || item.what == TOO_LARGE
+    item.what.starts_with(UNREADABLE) || item.what.starts_with(HIDES) || item.what == TOO_LARGE
+}
+
+/// The first value of a JSON document that hides text (see [`super::parts::text_problem`]), by where it is, and why: a key or a text.
+fn first_hidden_text(value: &Value, at: &str) -> Option<String> {
+    let here = |key: &str| if at.is_empty() { key.to_string() } else { format!("{at}.{key}") };
+    match value {
+        Value::String(text) => text_problem(text).map(|why| format!("{}: {why}", short(at, 80))),
+        Value::Array(items) => items.iter().enumerate().find_map(|(i, v)| first_hidden_text(v, &format!("{at}[{i}]"))),
+        Value::Object(map) => map.iter().find_map(|(key, v)| text_problem(key).map(|why| format!("a key of {}: {why}", short(&here(key), 80))).or_else(|| first_hidden_text(v, &here(key)))),
+        _ => None,
+    }
+}
+
+/// Why a file of the desktop that is copied whole, and that holds words a model reads or a caller hears (a flow's descriptions and prompts,
+/// a template's, a trigger's condition, a connector's, the notes about callers, the setup, agent and control records), is not brought back:
+/// a value in it hides text. The dry run says it, and staging leaves the file out.
+fn hidden_text_in(name: &str, bytes: &[u8]) -> Option<String> {
+    let watched = name.starts_with("flows/") || name.starts_with("templates/") || name.starts_with("connectors/") || matches!(name, "triggers.json" | "callers.json" | "setup.json" | "agent.json" | "control.json" | "services-autostart.json");
+    if !watched {
+        return None;
+    }
+    let value: Value = serde_json::from_slice(bytes.strip_prefix(&[0xef, 0xbb, 0xbf][..]).unwrap_or(bytes)).ok()?;
+    first_hidden_text(&value, "")
 }
 
 /// `3 places`, `1 place`.
@@ -395,6 +421,12 @@ fn place_said(place: &str, all: &[Address]) -> String {
 
 /// Describe one restorable file of a class that can act.
 pub fn describe(class: RestoreClass, name: &str, bytes: &[u8], local: &Local, backup_templates: &HashSet<String>) -> Vec<ReviewItem> {
+    // A value that says one thing to a person and another to a model is not brought back: nothing of the file is described as if it would be.
+    if let Some(why) = hidden_text_in(name, bytes) {
+        return vec![Parts::new("unreadable")
+            .fixed("problem", format!("{HIDES}{why}): a value in it says one thing to a person and another to a model, so nothing of it comes back."))
+            .item(class, name, name.rsplit('/').next().unwrap_or(name))];
+    }
     let value = || serde_json::from_slice::<Value>(bytes.strip_prefix(&[0xef, 0xbb, 0xbf][..]).unwrap_or(bytes));
     match name {
         "services-autostart.json" => match serde_json::from_slice::<Vec<String>>(bytes) {

@@ -117,7 +117,7 @@ pub const KINDS: &[Kind] = &[
         full: None,
     },
     Kind { id: "voice", place: "a voice clip (voices/)", fixed: &[part("file", 200)], keys: NO_KEYS, sample: &[], full: None },
-    Kind { id: "unreadable", place: "a file that could not be read", fixed: &[part("problem", 320)], keys: NO_KEYS, sample: &[], full: None },
+    Kind { id: "unreadable", place: "a file that could not be read", fixed: &[part("problem", 480)], keys: NO_KEYS, sample: &[], full: None },
     Kind { id: "nothing", place: "a settings file that holds nothing OAIY restores", fixed: &[part("nothing", 240)], keys: NO_KEYS, sample: &[], full: None },
     Kind { id: "more", place: "the things of a kind that are only counted", fixed: &[part("count", 400)], keys: NO_KEYS, sample: &[], full: None },
     Kind { id: "project", place: "a project of the Agent", fixed: &[part("files", 320)], keys: NO_KEYS, sample: &[], full: None },
