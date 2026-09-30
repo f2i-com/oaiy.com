@@ -817,12 +817,36 @@ fn describe_messages(class: RestoreClass, name: &str, document: &Value, local: &
     let mut parts = Parts::new("messages").fixed(
         "count",
         format!(
-            "{} ({new} new, {seen} seen, {handled} handled) from {} and {} from a hidden number. Each holds what a caller said and the number they rang from or asked to be rung on. {here} At most the newest 2,000 come back, each cleaned as a message is when it is taken.",
+            "{} ({new} new, {seen} seen, {handled} handled) from {} and {} from a hidden number. Each holds what a caller said and the number they rang from or asked to be rung on. {here} At most the newest {} come back, each cleaned as a message is when it is taken.",
             words(list.len(), "message", "messages"),
             words(numbers.len(), "number", "numbers"),
-            words(hidden, "message", "messages")
+            words(hidden, "message", "messages"),
+            crate::messages::MAX_STORED
         ),
     );
+    // What does not come back of them is what staging leaves out: the same function says it (see `sanitize::clean_messages`).
+    let cleaned = super::sanitize::clean_messages(list);
+    let gone = list.len() - cleaned.kept.len();
+    if gone > 0 || cleaned.changed > 0 {
+        let mut why: Vec<String> = Vec::new();
+        if cleaned.malformed > 0 {
+            why.push(format!("{} not {} (no id, no words or no time)", cleaned.malformed, if cleaned.malformed == 1 { "a message" } else { "messages" }));
+        }
+        if cleaned.repeated > 0 {
+            why.push(format!("{} with an id that is in the file already", cleaned.repeated));
+        }
+        if cleaned.over > 0 {
+            why.push(format!("the oldest {} over the {} that are kept", cleaned.over, crate::messages::MAX_STORED));
+        }
+        let mut left = String::new();
+        if gone > 0 {
+            left = format!("{} of them do NOT come back: {}.", gone, why.join(", "));
+        }
+        if cleaned.changed > 0 {
+            left = format!("{}{}{} of those that come back have characters a message never holds taken out, or are cut to the length that is kept.", left, if left.is_empty() { "" } else { " " }, cleaned.changed);
+        }
+        parts = parts.fixed("left-out", left);
+    }
     // The newest few, by value: what a caller is made to have said is read here before it comes back.
     let mut newest: Vec<&Value> = list.iter().collect();
     newest.sort_by(|a, b| s(b, "at").unwrap_or("").cmp(s(a, "at").unwrap_or("")));

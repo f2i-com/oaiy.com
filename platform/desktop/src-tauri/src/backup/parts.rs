@@ -98,7 +98,7 @@ pub const KINDS: &[Kind] = &[
         sample: &[part("summary", 240), part("other-places", 7400)],
         full: Some(100),
     },
-    Kind { id: "messages", place: "the messages callers left (messages/messages.json)", fixed: &[part("count", 520)], keys: NO_KEYS, sample: &[part("newest", 1400)], full: None },
+    Kind { id: "messages", place: "the messages callers left (messages/messages.json)", fixed: &[part("count", 560), part("left-out", 420)], keys: NO_KEYS, sample: &[part("newest", 1400)], full: None },
     Kind { id: "callers", place: "what is remembered about callers (callers.json)", fixed: &[part("entries", 320)], keys: NO_KEYS, sample: &[], full: None },
     Kind { id: "setting", place: "a key that acts in a settings file (the calendar's, a plugin's, the Agent's)", fixed: &[part("sets", 520)], keys: NO_KEYS, sample: &[part("why", 320)], full: None },
     Kind {

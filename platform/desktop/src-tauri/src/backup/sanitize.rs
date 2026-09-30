@@ -223,15 +223,28 @@ pub fn autostart_known_only(bytes: &[u8], known: &HashSet<String>) -> Result<(Ve
     Ok((serde_json::to_vec_pretty(&kept).map_err(|_| "it could not be written".to_string())?, dropped))
 }
 
-/// The messages a restore brings back: each is cleaned as the store cleans a message it takes (its words, its name, its numbers and its ids), what is not
-/// a message is left out, an id that is there twice is taken once, and there are at most as many as the store holds, the newest. The store enforces
-/// its limits when a message is taken and not when its file is read, so a file that is put in place is held to them here, and what comes out is what
-/// the store would have written (it reads it without complaint: it never puts a restored file aside). Returns the file, and what was said of it.
-pub fn messages_for_restore(bytes: &[u8]) -> Result<(Vec<u8>, Vec<String>), String> {
+/// The messages a restore brings back, and what was left out of them (see [`clean_messages`]).
+pub struct CleanedMessages {
+    /// What comes back, in the order the file had.
+    pub kept: Vec<Value>,
+    /// Messages that are not messages: no id, no words or no time.
+    pub malformed: usize,
+    /// Messages whose id was already in the file.
+    pub repeated: usize,
+    /// The oldest messages, left out because the store keeps no more than [`crate::messages::MAX_STORED`].
+    pub over: usize,
+    /// Messages of which the cleaning took characters out, or that were cut to the length the store keeps.
+    pub changed: usize,
+}
+
+/// The messages of a file as a restore brings them back: each is cleaned as the store cleans a message it takes (its words, its name, its numbers and its
+/// ids), what is not a message is left out, an id that is there twice is taken once, and there are at most as many as the store holds, the newest. The
+/// store enforces its limits when a message is taken and not when its file is read, so a file that is put in its place is held to them here, and what
+/// comes out is what the store would have written (it reads it without complaint: it never puts a restored file aside). The dry run says the same,
+/// from the same function, so that what it says is what comes back.
+pub fn clean_messages(list: &[Value]) -> CleanedMessages {
     use crate::messages::{clean, MAX_MESSAGE, MAX_NAME, MAX_STORED};
     use serde_json::json;
-    let value = parse(bytes)?;
-    let Some(list) = value.get("messages").and_then(Value::as_array) else { return Err("it is not a list of messages".to_string()) };
     // What a message says in `key`, cleaned as the store cleans it, and whether cleaning changed it.
     let text = |m: &Value, key: &str, most: usize| -> (String, bool) {
         let said = m.get(key).and_then(Value::as_str).unwrap_or("");
@@ -240,9 +253,10 @@ pub fn messages_for_restore(bytes: &[u8]) -> Result<(Vec<u8>, Vec<String>), Stri
         (cleaned, changed)
     };
     let stamp = |m: &Value, key: &str| m.get(key).and_then(Value::as_str).filter(|s| chrono::DateTime::parse_from_rfc3339(s).is_ok()).map(str::to_string);
-    let mut kept: Vec<Value> = Vec::new();
+    // (each with whether cleaning changed it: counted of those that stay)
+    let mut kept: Vec<(Value, bool)> = Vec::new();
     let mut ids: HashSet<String> = HashSet::new();
-    let (mut malformed, mut repeated, mut changed) = (0usize, 0usize, 0usize);
+    let (mut malformed, mut repeated) = (0usize, 0usize);
     for m in list {
         let ((id, _), (message, message_changed), at) = (text(m, "id", 100), text(m, "message", MAX_MESSAGE), stamp(m, "at"));
         if id.is_empty() || message.is_empty() || at.is_none() {
@@ -256,25 +270,26 @@ pub fn messages_for_restore(bytes: &[u8]) -> Result<(Vec<u8>, Vec<String>), Stri
         // (The store keeps the number a caller rang from as the phone said it, and the number to ring back on as digits, or else the number they rang from:
         // so both are kept as words, at the most the store keeps of either.)
         let ((call_id, a), (from, b), (name, c), (callback, d)) = (text(m, "callId", 200), text(m, "from", 40), text(m, "name", MAX_NAME), text(m, "callback", 40));
-        if message_changed || a || b || c || d {
-            changed += 1;
-        }
+        let was_changed = message_changed || a || b || c || d;
         let state = match m.get("state").and_then(Value::as_str) {
             Some(s @ ("seen" | "handled")) => s,
             _ => "new",
         };
-        kept.push(json!({
-            "id": id, "at": at, "callId": call_id, "from": from, "name": name, "callback": callback, "message": message,
-            "urgency": if m.get("urgency").and_then(Value::as_str) == Some("urgent") { "urgent" } else { "normal" },
-            "wantsCallback": m.get("wantsCallback").and_then(Value::as_bool).unwrap_or(false), "state": state,
-            "seenAt": stamp(m, "seenAt"), "handledAt": stamp(m, "handledAt"),
-            "handledBy": m.get("handledBy").and_then(Value::as_str).map(|s| clean(s, 40)).filter(|s| !s.is_empty()),
-        }));
+        kept.push((
+            json!({
+                "id": id, "at": at, "callId": call_id, "from": from, "name": name, "callback": callback, "message": message,
+                "urgency": if m.get("urgency").and_then(Value::as_str) == Some("urgent") { "urgent" } else { "normal" },
+                "wantsCallback": m.get("wantsCallback").and_then(Value::as_bool).unwrap_or(false), "state": state,
+                "seenAt": stamp(m, "seenAt"), "handledAt": stamp(m, "handledAt"),
+                "handledBy": m.get("handledBy").and_then(Value::as_str).map(|s| clean(s, 40)).filter(|s| !s.is_empty()),
+            }),
+            was_changed,
+        ));
     }
     // The newest are kept (by the time each says, not by where it is in the file), and what is kept stays in the order the file had.
     let over = kept.len().saturating_sub(MAX_STORED);
     if over > 0 {
-        let when = |m: &Value| m["at"].as_str().and_then(|s| chrono::DateTime::parse_from_rfc3339(s).ok()).map(|t| t.timestamp_millis()).unwrap_or(i64::MIN);
+        let when = |m: &(Value, bool)| m.0["at"].as_str().and_then(|s| chrono::DateTime::parse_from_rfc3339(s).ok()).map(|t| t.timestamp_millis()).unwrap_or(i64::MIN);
         let mut order: Vec<usize> = (0..kept.len()).collect();
         order.sort_by_key(|&i| (when(&kept[i]), i));
         let oldest: HashSet<usize> = order.into_iter().take(over).collect();
@@ -284,6 +299,16 @@ pub fn messages_for_restore(bytes: &[u8]) -> Result<(Vec<u8>, Vec<String>), Stri
             !oldest.contains(&(i - 1))
         });
     }
+    let changed = kept.iter().filter(|(_, changed)| *changed).count();
+    CleanedMessages { kept: kept.into_iter().map(|(message, _)| message).collect(), malformed, repeated, over, changed }
+}
+
+/// The messages file a restore puts in place, and what was said of it (each thing that was left out or changed, one note each).
+pub fn messages_for_restore(bytes: &[u8]) -> Result<(Vec<u8>, Vec<String>), String> {
+    use crate::messages::{MAX_MESSAGE, MAX_NAME, MAX_STORED};
+    let value = parse(bytes)?;
+    let Some(list) = value.get("messages").and_then(Value::as_array) else { return Err("it is not a list of messages".to_string()) };
+    let CleanedMessages { kept, malformed, repeated, over, changed } = clean_messages(list);
     let messages = |n: usize| if n == 1 { "1 message".to_string() } else { format!("{n} messages") };
     let were = |n: usize| if n == 1 { "was" } else { "were" };
     let mut notes = Vec::new();
@@ -299,5 +324,5 @@ pub fn messages_for_restore(bytes: &[u8]) -> Result<(Vec<u8>, Vec<String>), Stri
     if changed > 0 {
         notes.push(format!("messages/messages.json: {} had characters a message never holds taken out, or {} cut to the length the store keeps (a message {MAX_MESSAGE} characters, a name {MAX_NAME}).", messages(changed), were(changed)));
     }
-    Ok((serde_json::to_vec_pretty(&json!({ "version": 1, "messages": kept })).map_err(|_| "it could not be written".to_string())?, notes))
+    Ok((serde_json::to_vec_pretty(&serde_json::json!({ "version": 1, "messages": kept })).map_err(|_| "it could not be written".to_string())?, notes))
 }

@@ -7701,14 +7701,17 @@ fn every_kind_of_thing_the_dry_run_describes_says_every_fixed_part_whatever_is_p
     // the owner's transfer policy, every key that can act marked, and the messages callers left (two thousand, the most kept, each as long as may be)
     let (ring_doc, ring_needles) = marked_document("ring", &[]);
     need("setting", &ring_needles.iter().map(String::as_str).collect::<Vec<_>>());
-    let messages = serde_json::json!({
-        "version": 1,
-        "messages": (0..2000).map(|i| serde_json::json!({
+    let mut message_list: Vec<serde_json::Value> = (0..2001)
+        .map(|i| serde_json::json!({
             "id": format!("m{i}"), "at": format!("2026-09-30T{:02}:{:02}:{:02}Z", i / 3600, (i / 60) % 60, i % 60), "callId": "c", "from": format!("+6140000{i:04}"), "name": "N".repeat(80),
             "callback": format!("+6150000{i:04}"), "message": format!("MARK-MESSAGE-{i} {}", "m".repeat(560)), "urgency": "normal", "wantsCallback": true, "state": "new",
-        })).collect::<Vec<_>>(),
-    });
-    need("messages", &["2000 messages (2000 new, 0 seen, 0 handled)", "They REPLACE the 2 messages that are here now.", "MARK-MESSAGE-1999"]);
+        }))
+        .collect();
+    // (one more than a store keeps, one that is no message, and one whose id is there twice: what does not come back is said in a part of its own)
+    message_list.push(serde_json::json!({ "id": "no-words", "at": "2026-09-30T00:00:00Z", "callId": "c", "message": "  " }));
+    message_list.push(message_list[0].clone());
+    let messages = serde_json::json!({ "version": 1, "messages": message_list });
+    need("messages", &["2003 messages (2003 new, 0 seen, 0 handled)", "They REPLACE the 2 messages that are here now.", "MARK-MESSAGE-2000", "3 of them do NOT come back: 1 not a message (no id, no words or no time), 1 with an id that is in the file already, the oldest 1 over the 2000 that are kept."]);
     let texts: Vec<(&str, String)> = vec![
         ("flows/pad.json", flow.to_string()),
         ("flows/bad.json", "not json at all".to_string()),
@@ -8412,6 +8415,7 @@ fn the_messages_callers_left_come_back_only_with_their_tick_and_replace_what_is_
     let preview = restore::inspect(&dst.0, &file, PASS, &options()).unwrap();
     let item = preview.items.iter().find(|i| i.class == RestoreClass::Messages).expect("the messages are listed");
     assert!(item.what.contains("4 messages (2 new, 1 seen, 1 handled) from 1 number and 1 message from a hidden number.") && item.what.contains("They REPLACE the 3 messages that are here now."), "{}", item.what);
+    assert!(!item.what.contains("do NOT come back") && !item.what.contains("of those that come back"), "nothing is left out of them: {}", item.what);
     let newest = item.what.split("The newest: ").nth(1).unwrap_or("");
     assert!(newest.contains("Ring me about the bill") && newest.contains("Thanks") && newest.contains("Third of them") && !newest.contains("OLDEST-MESSAGE"), "the newest three are quoted: {newest}");
     assert!(newest.find("Ring me about the bill") < newest.find("Thanks") && newest.find("Thanks") < newest.find("Third of them"), "newest first: {newest}");
@@ -8653,7 +8657,9 @@ fn restored_messages_are_read_by_the_store_that_reads_them_and_held_to_the_limit
     here(&dst.0);
     let preview = restore::inspect(&dst.0, &crafted, PASS, &options()).unwrap();
     let said = preview.items.iter().find(|i| i.class == RestoreClass::Messages).map(|i| i.what.clone()).unwrap_or_default();
-    assert!(said.contains("At most the newest 2,000 come back"), "the dry run says how many come back: {said}");
+    assert!(said.contains("At most the newest 2000 come back"), "the dry run says how many come back: {said}");
+    assert!(said.contains("104 of them do NOT come back: 3 not messages (no id, no words or no time), 1 with an id that is in the file already, the oldest 100 over the 2000 that are kept."), "the dry run says what does not come back, as staging leaves it out: {said}");
+    assert!(said.contains("2 of those that come back have characters a message never holds taken out, or are cut to the length that is kept."), "{said}");
     let (store, said) = land(&dst.0, &crafted, &ticks_of(&[RestoreClass::Messages], false));
     let all = store.list(None, "");
     assert_eq!(all.len(), MAX_STORED, "the store holds no more than it holds when it takes a message");

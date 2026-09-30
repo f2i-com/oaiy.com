@@ -614,7 +614,8 @@ The receptionist's transfers and messages (the owner's settings and what callers
   The store that reads the file enforces its limits when it *takes* a message and not when it *reads* a file, so a restore holds the file to
   them as it stages it: each message is cleaned as the store cleans one it takes (its words to 600 characters, a name to 80, a number to
   40, characters a message never holds taken out), what is not a message (no id, no words or no time) and an id that is there twice are left
-  out, and at most the newest 2,000 come back; each of these is said in the result of the restore, and the dry run says the cap.
+  out, and at most the newest 2,000 come back; each of these is said in the result of the restore, and the dry run says it before (from
+  the same function: how many of the messages in the file do NOT come back and why, and how many of the rest are cleaned).
 - **Transfer settings** (`ring.json`, the tick "Transfer settings") are the owner's policy for putting callers through: whether the
   receptionist may try to reach you at all (off until you turn it on), whom and when, the VIP numbers that ring whatever the limits and
   the quiet hours say, how often a caller may try. **Every key needs the tick**, so a backup that was not ticked for it cannot turn
@@ -780,7 +781,7 @@ a thing does:
 | a service template (templates/) (`template`) | `autostart` (80), `replaces` (80), `runs` (420), `install` (240), `writes` (640), `deletes` (360), `env` (480), `cwd` (180), `marker` (200), `health` (200), `docs` (180) | - | 400, the rest named and counted |
 | a flow (flows/) (`flow`) | `steps` (80), `tool` (200), `tool-description` (400), `tool-inputs` (720), `hook` (240) | `kinds` (620) | all (each is small) |
 | a connector descriptor (connectors/) (`connector`) | `replaces` (100), `prefilled` (260), `scopes` (1840), `auth` (1100), `health` (760), `heartbeat` (760), `relay` (1100), `desktopFlows` (1100), `desktopAi` (2000), `flows` (2000), `appLogic` (1300), `dataNode` (940), `scriptProfile` (760), `docs` (760) | `summary` (240), `other-places` (7400) | 100, the rest named and counted |
-| the messages callers left (messages/messages.json) (`messages`) | `count` (520) | `newest` (1400) | all (each is small) |
+| the messages callers left (messages/messages.json) (`messages`) | `count` (560), `left-out` (420) | `newest` (1400) | all (each is small) |
 | what is remembered about callers (callers.json) (`callers`) | `entries` (320) | - | all (each is small) |
 | a key that acts in a settings file (the calendar's, a plugin's, the Agent's) (`setting`) | `sets` (520) | `why` (320) | all (each is small) |
 | a service of the calendar (`calendar-service`) | `about` (200), then each of the 5 keys of the table `calendar` that acts under `settings.services[].` (560 each) | - | all (each is small) |
