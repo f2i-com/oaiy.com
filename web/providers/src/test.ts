@@ -1,0 +1,127 @@
+/**
+ * Testing a provider inside the holder, so the test is of what will really be called (design 4.2): the same address, the same key,
+ * the same headers, the same browser rules. It returns what a person can act on; it never returns the key, and the provider's own
+ * words are scrubbed of it.
+ *
+ *   1. `GET {base}/models` (Anthropic's is paged). OpenAI needs this first: a wrong key on a chat request answers 401 with no CORS
+ *      headers, which a browser shows as an opaque "Failed to fetch", while the model list answers with a readable 401.
+ *   2. With a model chosen, one tiny chat request. For an OpenAI-dialect provider it carries a dummy tool, so it also says whether the
+ *      model takes a `tools` array (the Agent sends tools on every request); Anthropic's Messages API always does.
+ *   3. When a call never got an answer, why (net.ts).
+ */
+import { buildRequestUrl, recordHeaders } from '@oaiy/shared/providers/endpoints';
+import { ProviderConnectionError, describeConnectionError, kindForStatus, redactSecret } from '@oaiy/shared/providers/errors';
+import { listRecordModels } from '@oaiy/shared/providers/models';
+import { providerTypeOf } from '@oaiy/shared/providers/adapters';
+import type { TestResult } from '@oaiy/shared/broker/protocol';
+import type { ProviderRecord } from '@oaiy/shared/providers/types';
+import { BudgetExhausted, classifyFailure, guardedFetch, type PageInfo } from './net';
+import { probeContext, type ProbeResult } from './probe';
+
+export interface TesterDeps {
+  fetchImpl: typeof fetch;
+  page: PageInfo;
+  /** The key of a record (the holder's own; it never leaves). */
+  key: (record: ProviderRecord) => Promise<string>;
+  /** Counts one request against the app that asked; absent for the top-level page's own tests. */
+  take?: () => Promise<{ ok: true } | { ok: false; limit: number; retryAfterMs: number }>;
+}
+
+export interface Tester {
+  models(record: ProviderRecord): Promise<TestResult>;
+  test(record: ProviderRecord): Promise<TestResult>;
+  probe(record: ProviderRecord): Promise<ProbeResult>;
+}
+
+const DUMMY_TOOL = { type: 'function', function: { name: 'noop', description: 'Does nothing.', parameters: { type: 'object', properties: {} } } };
+
+export function createTester(deps: TesterDeps): Tester {
+  const budgetResult = (e: BudgetExhausted): TestResult => ({
+    ok: false,
+    error: { kind: 'budget', message: `This app has made its ${e.limit} requests for this hour. It can go on when the hour has passed, or the limit can be raised on the Providers page.` },
+  });
+
+  async function models(record: ProviderRecord): Promise<TestResult> {
+    const key = await deps.key(record);
+    let exhausted: BudgetExhausted | null = null;
+    const inner = guardedFetch(record, deps.fetchImpl, deps.take);
+    const fetchImpl: typeof fetch = async (input, init) => {
+      try {
+        return await inner(input, init);
+      } catch (e) {
+        if (e instanceof BudgetExhausted) exhausted = e;
+        throw e;
+      }
+    };
+    try {
+      const list = await listRecordModels(record, key, { fetchImpl, page: deps.page, redact: (text) => redactSecret(text, key) });
+      return { ok: true, models: list.map((m) => (m.label ? { id: m.id, label: m.label } : { id: m.id })) };
+    } catch (e) {
+      if (exhausted) return budgetResult(exhausted);
+      if (!(e instanceof ProviderConnectionError)) return { ok: false, error: { kind: 'internal', message: 'The model list could not be read.' } };
+      if (e.kind === 'network') {
+        const failure = await classifyFailure(record, record.baseUrl, deps.page, deps.fetchImpl);
+        return { ok: false, error: { kind: failure.kind, message: failure.message } };
+      }
+      return { ok: false, error: { kind: e.kind, message: e.message, ...(e.status !== undefined ? { status: e.status } : {}) } };
+    }
+  }
+
+  async function test(record: ProviderRecord): Promise<TestResult> {
+    const listed = await models(record);
+    if (!listed.ok || !record.model) return { ...listed, ...(listed.ok ? { tools: 'unknown' as const } : {}) };
+
+    // One tiny request with the chosen model. It proves the model is one this key may use, and says whether it takes tools.
+    const key = await deps.key(record);
+    const anthropic = record.dialect === 'anthropic';
+    const path = anthropic ? '/messages' : '/chat/completions';
+    const body = anthropic
+      ? { model: record.model, max_tokens: 1, messages: [{ role: 'user', content: 'Say OK.' }] }
+      : { model: record.model, max_tokens: 1, messages: [{ role: 'user', content: 'Say OK.' }], tools: [DUMMY_TOOL], tool_choice: 'none' };
+    const guarded = guardedFetch(record, deps.fetchImpl, deps.take);
+    const context = { type: providerTypeOf(record), serverKind: record.serverKind, url: record.baseUrl, pageOrigin: deps.page.origin };
+    let response: Response;
+    try {
+      const url = buildRequestUrl(record, path, 'POST');
+      response = await guarded(url, { method: 'POST', headers: recordHeaders(record, key, [['content-type', 'application/json']]), body: JSON.stringify(body), signal: AbortSignal.timeout(60_000) });
+    } catch (e) {
+      if (e instanceof BudgetExhausted) return budgetResult(e);
+      const failure = await classifyFailure(record, record.baseUrl, deps.page, deps.fetchImpl);
+      return { ok: false, models: listed.models, error: { kind: failure.kind, message: failure.message } };
+    }
+    if (response.ok) {
+      void response.body?.cancel().catch(() => {});
+      return { ok: true, models: listed.models, tools: 'yes' };
+    }
+    const detail = redactSecret(await errorText(response), key);
+    // A 400 that says the tools are the problem is a model that works and does not take them.
+    if (!anthropic && (response.status === 400 || response.status === 422) && /\btools?\b|function[- ]call/i.test(detail)) return { ok: true, models: listed.models, tools: 'no' };
+    const kind = kindForStatus(response.status);
+    return { ok: false, models: listed.models, error: { kind, message: describeConnectionError(kind, { ...context, detail: detail || undefined }, response.status), status: response.status } };
+  }
+
+  async function probe(record: ProviderRecord): Promise<ProbeResult> {
+    const key = await deps.key(record);
+    return probeContext(record, key, guardedFetch(record, deps.fetchImpl, deps.take));
+  }
+
+  return { models, test, probe };
+}
+
+/** A short excerpt of an error answer's message. */
+async function errorText(response: Response): Promise<string> {
+  try {
+    const text = (await response.text()).slice(0, 2000);
+    try {
+      const body = JSON.parse(text) as { error?: { message?: unknown } | string; message?: unknown };
+      const message = typeof body.error === 'string' ? body.error : typeof body.error?.message === 'string' ? body.error.message : typeof body.message === 'string' ? body.message : '';
+      if (message.trim()) return message.trim().slice(0, 240);
+    } catch {
+      // not JSON
+    }
+    const plain = text.replace(/<[^>]*>/g, ' ').replace(/\s+/g, ' ').trim();
+    return plain.length <= 240 ? plain : '';
+  } catch {
+    return '';
+  }
+}

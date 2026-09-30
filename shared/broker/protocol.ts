@@ -286,6 +286,9 @@ export type StreamEvent =
   | { id: number; t: 'end' }
   | { id: number; t: 'error'; error: ErrorBody };
 
+/** A stream event before it is given the id of the request it answers. */
+export type StreamBody = StreamEvent extends infer E ? (E extends unknown ? Omit<E, 'id'> : never) : never;
+
 /** Sent to an app without being asked. `changed` means the list of providers did. */
 export type Push = { t: 'changed' };
 

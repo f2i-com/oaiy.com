@@ -164,7 +164,7 @@ export function kindForStatus(status: number): ConnectionErrorKind {
  * providers origin asks once more, with `mode: 'no-cors'`: an opaque answer means the server is up and refused CORS; no
  * answer means it is down, or blocked by the local-network permission.
  */
-export type NetworkFailure = 'cors' | 'unreachable' | 'mixed-content';
+export type NetworkFailure = 'cors' | 'unreadable' | 'unreachable' | 'mixed-content';
 
 export interface NetworkFailureContext {
   /** The address that was called. */
@@ -194,6 +194,10 @@ export function describeNetworkFailure(failure: NetworkFailure, context: Network
               : `Allow requests from ${page} in the server’s CORS settings (for llama.cpp: --cors-origins ${page} --cors-headers Authorization,Content-Type).`;
       return `${target} is running, but it does not allow requests from ${page}. Allow ${page}: ${line}`;
     }
+    case 'unreadable':
+      // A service on the internet that is up and answered in a way the browser will not let a page read. Some providers do this to a
+      // wrong or revoked key on a chat request (OpenAI's 401 has no CORS headers), so the first thing to look at is the key.
+      return `${target} answered, but the browser could not read the answer. Some providers answer this way when the key is wrong or has been revoked: check the key on the Providers page, then test again.`;
     case 'unreachable':
       return `Nothing answered at ${target}. Either the server is not running there, or the browser blocked the call${
         context.local ? ' (a page may need your permission to reach devices on your local network: look for the prompt or the address-bar icon)' : ''
