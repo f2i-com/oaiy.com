@@ -73,7 +73,7 @@
           ".."
         ]
       },
-      "description": "Item id chosen by the sender. Unique per (mailbox, lane) while the relay remembers it. The ids . and .. match the pattern and are refused (README, Interpretations)."
+      "description": "Item id chosen by the sender. Unique per (mailbox, lane, sender) while the relay remembers it. The ids . and .. match the pattern and are refused (README, Interpretations)."
     },
     "appId": {
       "type": "string",

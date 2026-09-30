@@ -59,7 +59,8 @@ final class Mailbox
             if ($mb === null) {
                 throw new ApiError(503, 'unavailable', null, 1);
             }
-            $dup = $db->one('SELECT seq, body_hash FROM items WHERE mailbox = ? AND lane = ? AND id = ?', [$mailbox, $lane, $id]);
+            // The key of a repeat is (mailbox, lane, sender, id): another sender's item of the same id is not a repeat of this one.
+            $dup = $db->one('SELECT seq, body_hash FROM items WHERE mailbox = ? AND lane = ? AND sender = ? AND id = ?', [$mailbox, $lane, $sender, $id]);
             if ($dup !== null) {
                 if (hash_equals((string)$dup['body_hash'], $hash)) {
                     return ['status' => 'duplicate', 'seq' => $dup['seq']];
@@ -251,11 +252,10 @@ final class Mailbox
         return $out;
     }
 
-    /** The sender of a retained cmd item: used to decide who a res may answer. */
-    public function senderOf(string $mailbox, string $lane, string $id): ?string
+    /** Whether $sender posted an item with this lane and id to this mailbox (and its metadata is still retained): who a res may answer. */
+    public function hasItemFrom(string $mailbox, string $lane, string $id, string $sender): bool
     {
-        $v = $this->db->val('SELECT sender FROM items WHERE mailbox = ? AND lane = ? AND id = ?', [$mailbox, $lane, $id]);
-        return $v === null ? null : (string)$v;
+        return $this->db->val('SELECT 1 FROM items WHERE mailbox = ? AND lane = ? AND sender = ? AND id = ?', [$mailbox, $lane, $sender, $id]) !== null;
     }
 
     /** Delete a mailbox and everything in it (a revoked device). Call inside write(). */

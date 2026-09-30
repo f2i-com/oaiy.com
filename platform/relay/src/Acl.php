@@ -65,8 +65,7 @@ final class Acl
                 if (!is_string($re)) {
                     throw ApiError::make('invalid_item');
                 }
-                $cmdSender = $mailbox->senderOf('dev:' . $sender->id, 'cmd', $re);
-                if ($cmdSender === null || $cmdSender !== $rcpt['id']) {
+                if (!$mailbox->hasItemFrom('dev:' . $sender->id, 'cmd', $re, (string)$rcpt['id'])) {
                     throw ApiError::make('forbidden');
                 }
                 break;

@@ -426,12 +426,65 @@ test('4.18.5 the code refuses to run against a newer schema (503 naming both ver
     contains('schema 99', $res['json']['error']['message']);
     contains('supports ' . Schema::VERSION, $res['json']['error']['message']);
     ok(isset($res['headers']['retry-after']));
-    $raw->exec("UPDATE meta SET v = 1 WHERE k = 'schema_version'");
+    $raw->exec('UPDATE meta SET v = ' . Schema::VERSION . " WHERE k = 'schema_version'");
     eq(200, Relay::http($srv, null, 'GET', '/v1/health')['status'], 'restoring the version restores service');
     $raw->exec("DELETE FROM meta WHERE k = 'schema_version'");
     $res = Relay::http($srv, null, 'GET', '/v1/health');
     eq(503, $res['status']);
     contains('not installed', $res['json']['error']['message']);
+});
+
+/** The columns of the idempotency key of the items table, in order, on whichever engine. @return list<string> */
+function storage_dedupe_columns(Db $db): array
+{
+    if ($db->driver === 'mysql') {
+        return array_column($db->all("SELECT column_name AS c FROM information_schema.statistics WHERE table_schema = DATABASE() AND table_name = 'items' AND index_name = 'items_dedupe' ORDER BY seq_in_index"), 'c');
+    }
+    return array_column($db->all('PRAGMA index_info(items_dedupe)'), 'name');
+}
+
+test('4.18.5 a database at schema 1 is migrated when a request first meets it: the idempotency key gains the sender, nothing is lost, and several requests at once take turns', function () {
+    $r = Relay::make();
+    $d = $r->desktop();
+    $a = $r->provider('A');
+    $ctx = $r->ctx();
+    $ctx->mb->post($d->inbox(), 'cmd', 'kept', $a->id, 300, '{}', null, null, 'still here');
+    eq(['mailbox', 'lane', 'sender', 'id'], storage_dedupe_columns($ctx->db));
+    eq(2, Schema::VERSION);
+    // Make it a schema 1 database: the old key, and the old version.
+    $raw = Db::open(Oaiy\Relay\Config::load($r->data));
+    if ($raw->driver === 'mysql') {
+        $raw->exec('ALTER TABLE items DROP INDEX items_dedupe, ADD UNIQUE KEY items_dedupe (mailbox, lane, id)');
+    } else {
+        $raw->exec('DROP INDEX items_dedupe');
+        $raw->exec('CREATE UNIQUE INDEX items_dedupe ON items(mailbox, lane, id)');
+    }
+    $raw->exec("UPDATE meta SET v = 1 WHERE k = 'schema_version'");
+    eq(['mailbox', 'lane', 'id'], storage_dedupe_columns($raw));
+    $twin = 'INSERT INTO items (mailbox, seq, lane, id, sender, re, rp, hdr, body, body_hash, size, subject_id, grants, state, at, exp, delivered_at, acked_at)'
+        . " SELECT mailbox, seq + 100, lane, id, 'another-sender', re, rp, hdr, body, body_hash, size, subject_id, grants, state, at, exp, delivered_at, acked_at FROM items";
+    throws(fn() => $raw->exec($twin), PDOException::class); // the old key: another sender's item of that id collides
+    // Several requests meet it at the same moment: they take turns, and each finds the database migrated.
+    $barrier = $r->dir . '/go';
+    $code = '
+        while (!is_file($argv[2])) { usleep(300); }
+        $ctx = Oaiy\Relay\Context::open($argv[1]);
+        echo $ctx->db->schemaVersion();
+    ';
+    $kids = [storage_child($code, [$r->data, $barrier]), storage_child($code, [$r->data, $barrier]), storage_child($code, [$r->data, $barrier])];
+    usleep(1200000);
+    file_put_contents($barrier, '1');
+    foreach ($kids as $k) {
+        [$out, $err, $c] = storage_wait($k);
+        eq(['2', '', 0], [$out, $err, $c]);
+    }
+    $db = $r->ctx()->db;
+    eq(2, $db->schemaVersion());
+    eq(['mailbox', 'lane', 'sender', 'id'], storage_dedupe_columns($db));
+    eq(1, (int)$db->val("SELECT COUNT(*) FROM items WHERE id = 'kept'"), 'the item is still there');
+    $db->exec($twin); // and another sender's item of the same id is now a different item
+    $db->exec("DELETE FROM items WHERE sender = 'another-sender'");
+    eq([], $r->counterDrift());
 });
 
 test('4.18.5 journal mode: WAL by default, TRUNCATE when the config says so, and the choice sticks across connections', function () {

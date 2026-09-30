@@ -345,6 +345,53 @@ final class Db
         if ($v > Schema::VERSION) {
             throw new ApiError(503, 'unavailable', 'The database is at schema ' . $v . ' and this relay code supports ' . Schema::VERSION . '.', 60);
         }
+        if ($v < Schema::VERSION) {
+            $this->migrate();
+        }
+    }
+
+    /**
+     * Bring an older database up to Schema::VERSION, one version at a time, on the first request that meets it. Two requests that
+     * meet it together take turns: SQLite runs each step in one immediate transaction (its DDL is transactional), MySQL and MariaDB
+     * hold a named lock, and each re-reads the version once it has it, so a step is never applied twice.
+     */
+    public function migrate(): void
+    {
+        $locked = false;
+        if ($this->driver === 'mysql') {
+            $locked = (int)$this->val("SELECT GET_LOCK('oaiy-relay-migrate', 20)") === 1;
+            if (!$locked) {
+                throw new ApiError(503, 'unavailable', null, 5);
+            }
+        }
+        try {
+            for ($guard = 0; $guard <= Schema::VERSION; $guard++) { // one pass per version at most: a step that does not advance is an error, not a loop
+                $v = $this->schemaVersion();
+                if ($v === null || $v >= Schema::VERSION) {
+                    return;
+                }
+                $step = function (self $db) use ($v): void {
+                    foreach (Schema::migration($db->driver, $v) as $sql) {
+                        $db->pdo()->exec($sql);
+                    }
+                    $db->exec("UPDATE meta SET v = ? WHERE k = 'schema_version' AND v = ?", [$v + 1, $v]);
+                };
+                if ($this->driver === 'mysql') {
+                    $step($this); // DDL commits by itself on MySQL
+                } else {
+                    $this->write(function (self $db) use ($step, $v): void {
+                        if ((int)$db->val("SELECT v FROM meta WHERE k = 'schema_version'") === $v) {
+                            $step($db);
+                        }
+                    });
+                }
+            }
+            throw new \RuntimeException('the schema migration did not reach version ' . Schema::VERSION);
+        } finally {
+            if ($locked) {
+                $this->val("SELECT RELEASE_LOCK('oaiy-relay-migrate')");
+            }
+        }
     }
 
     public function metaInt(string $k): ?int

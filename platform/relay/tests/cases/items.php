@@ -623,6 +623,51 @@ foreach ([false, true] as $callOn) {
     });
 }
 
+test('4.3 idempotency: the key is (mailbox, lane, sender, id): another sender\'s item of the same id is a different item, learns nothing about the first, and cannot claim it ahead of its sender', function () {
+    $r = Relay::make();
+    $d = $r->desktop();
+    $a = $r->provider('A');
+    $b = $r->provider('B');
+    $ra = items_post($r, $a, items_cmd($d, 'same', 'from A'));
+    eq(['queued', 1], [$ra['status'], $ra['seq']]);
+    $rb = items_post($r, $b, items_cmd($d, 'same', 'from B'));
+    eq(['queued', 2], [$rb['status'], $rb['seq'] ?? null], 'not a duplicate of A\'s item and not a conflict with it');
+    $rb2 = items_post($r, $b, items_cmd($d, 'same', 'from B'));
+    eq(['duplicate', 2], [$rb2['status'], $rb2['seq']], 'B\'s own repeat is answered with B\'s seq');
+    eq('conflict', items_code(items_post($r, $b, items_cmd($d, 'same', 'B changed his mind'))), 'and B\'s different body is B\'s conflict');
+    $ra2 = items_post($r, $a, items_cmd($d, 'same', 'from A'));
+    eq(['duplicate', 1], [$ra2['status'], $ra2['seq']]);
+    eq('conflict', items_code(items_post($r, $a, items_cmd($d, 'same', 'A changed'))));
+    // B cannot take an id ahead of the sender that means to use it.
+    eq('queued', items_code(items_post($r, $b, items_cmd($d, 'claimed', 'squatter'))));
+    $late = items_post($r, $a, items_cmd($d, 'claimed', 'the real one'));
+    eq('queued', $late['status'], 'A\'s item is queued, not refused because B used the id first');
+    // Both were delivered, each with its own sender, and the state answers each caller about its own item.
+    $got = $r->call($d, 'GET', '/v1/poll')['json']['items'];
+    eq([['same', $a->id], ['same', $b->id], ['claimed', $b->id], ['claimed', $a->id]], array_map(fn($i) => [$i['id'], $i['from']], $got));
+    foreach ([[$a, 1], [$b, 2]] as [$who, $seq]) {
+        $st = $r->call($who, 'GET', '/v1/items/same', null, ['to' => $d->inbox(), 'lane' => 'cmd']);
+        eq(200, $st['status'], $st['body']);
+        eq($seq, $st['json']['seq']);
+    }
+    eq([], $r->counterDrift());
+});
+
+test('4.4 rule 2: a res may answer the cmd of that id which the recipient sent, even when another sender used the same id', function () {
+    $r = Relay::make();
+    $d = $r->desktop();
+    $a = $r->provider('A');
+    $b = $r->provider('B');
+    $c = $r->provider('C');
+    items_post($r, $a, items_cmd($d, 'x1'));
+    items_post($r, $b, items_cmd($d, 'x1', 'the same id from another sender'));
+    $res = fn(Actor $to, string $re, string $id): array => items_post($r, $d, ['to' => $to->inbox(), 'lane' => 'res', 'id' => $id, 'body' => 'r', 'hdr' => ['re' => $re]]);
+    eq('queued', items_code($res($a, 'x1', 'r1')), 'to A, who sent an x1');
+    eq('queued', items_code($res($b, 'x1', 'r2')), 'to B, who also sent an x1');
+    eq('forbidden', items_code($res($c, 'x1', 'r3')), 'not to C, who sent none');
+    eq('forbidden', items_code($res($a, 'x2', 'r4')), 'not to A for an id A never sent');
+});
+
 test('4.4 rule 2: a res goes only to the sender of the cmd named in hdr.re, and only while that cmd\'s metadata is retained', function () {
     $r = Relay::make();
     $d = $r->desktop();

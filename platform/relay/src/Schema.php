@@ -10,17 +10,34 @@ defined('OAIY_RELAY') or exit;
  * milliseconds); every numeric column is an INTEGER or BIGINT, never text; every hash is hex text.
  *
  * Differences from Appendix B, each on purpose: hashes are lower-case hex text (CHAR(64)) rather than BLOB so that
- * no driver has a binary-parameter quirk; devices has presence_changed_at; enroll_keys has created_at. Forward-only
- * migrations: the version lives in meta.schema_version and the code refuses to run against a newer one.
+ * no driver has a binary-parameter quirk; devices has presence_changed_at; enroll_keys has created_at; and the idempotency key of an item is
+ * (mailbox, lane, sender, id), so that one sender's ids cannot collide with another's (version 2; Appendix B keys it by (mailbox, lane, id)).
+ * A difference on purpose too, and a recorded one: Interpretation 24 of the protocol package.
+ * Forward-only migrations: the version lives in meta.schema_version, an older database is brought up to date by Db::migrate() on the
+ * first request that meets it, and the code refuses to run against a newer one.
  */
 final class Schema
 {
-    public const VERSION = 1;
+    public const VERSION = 2;
 
     /** @return list<string> */
     public static function ddl(string $driver): array
     {
         return $driver === 'mysql' ? self::mysql() : self::sqlite();
+    }
+
+    /**
+     * The statements that take a database from version $from to $from + 1.
+     * @return list<string>
+     */
+    public static function migration(string $driver, int $from): array
+    {
+        if ($from === 1) { // the idempotency key gains the sender
+            return $driver === 'mysql'
+                ? ['ALTER TABLE items DROP INDEX items_dedupe, ADD UNIQUE KEY items_dedupe (mailbox, lane, sender, id)']
+                : ['DROP INDEX IF EXISTS items_dedupe', 'CREATE UNIQUE INDEX IF NOT EXISTS items_dedupe ON items(mailbox, lane, sender, id)'];
+        }
+        return [];
     }
 
     /** @return list<string> */
@@ -56,7 +73,7 @@ final class Schema
                 subject_id TEXT, grants TEXT, state INTEGER NOT NULL DEFAULT 0,
                 at INTEGER NOT NULL, exp INTEGER NOT NULL, delivered_at INTEGER, acked_at INTEGER,
                 PRIMARY KEY (mailbox, seq))',
-            'CREATE UNIQUE INDEX IF NOT EXISTS items_dedupe ON items(mailbox, lane, id)',
+            'CREATE UNIQUE INDEX IF NOT EXISTS items_dedupe ON items(mailbox, lane, sender, id)',
             'CREATE INDEX IF NOT EXISTS items_re ON items(mailbox, re) WHERE re IS NOT NULL',
             'CREATE INDEX IF NOT EXISTS items_exp ON items(exp)',
             'CREATE INDEX IF NOT EXISTS items_sender ON items(sender, lane, id)',
@@ -123,7 +140,7 @@ final class Schema
                 rp VARCHAR(40) $ascii NULL, hdr TEXT $utf NOT NULL, body MEDIUMTEXT $utf NULL, body_hash CHAR(64) $ascii NOT NULL,
                 size INT NOT NULL, subject_id VARCHAR(64) $ascii NULL, grants TEXT $ascii NULL, state TINYINT NOT NULL DEFAULT 0,
                 at BIGINT NOT NULL, exp BIGINT NOT NULL, delivered_at BIGINT NULL, acked_at BIGINT NULL,
-                PRIMARY KEY (mailbox, seq), UNIQUE KEY items_dedupe (mailbox, lane, id), KEY items_re (mailbox, re),
+                PRIMARY KEY (mailbox, seq), UNIQUE KEY items_dedupe (mailbox, lane, sender, id), KEY items_re (mailbox, re),
                 KEY items_exp (exp), KEY items_sender (sender, lane, id)) $eng",
             "CREATE TABLE IF NOT EXISTS slots (
                 dev VARCHAR(40) $ascii NOT NULL, name VARCHAR(64) $ascii NOT NULL, body MEDIUMTEXT $utf NOT NULL,
