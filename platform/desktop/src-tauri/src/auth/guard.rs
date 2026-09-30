@@ -620,9 +620,12 @@ impl Guard {
     /// Write the throttle if it changed since the last write (the periodic upkeep asks every few seconds, and
     /// shutdown asks once more). A write that fails is logged and tried again next time.
     pub fn flush_throttle(&self) {
-        if !self.throttle.take_dirty() {
-            return;
+        if self.throttle.take_dirty() {
+            self.write_throttle_file();
         }
+    }
+
+    fn write_throttle_file(&self) {
         let file = self.throttle_file.lock().unwrap_or_else(|e| e.into_inner());
         let Some(file) = file.as_ref() else {
             return;
@@ -631,6 +634,32 @@ impl Guard {
             log::warn!("auth: the throttle could not be written: {e}");
             self.throttle.set_dirty();
         }
+    }
+
+    /// What `throttle.json` held under `key` when it was read: the state of a limiter that is not the bearer
+    /// throttle (the web login's, under `login`). `None` when no file is kept (`legacy`, a test) or it held none.
+    pub fn saved_throttle_state(&self, key: &str) -> Option<Value> {
+        self.throttle_file
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .as_ref()?
+            .saved(key)
+    }
+
+    /// Give the throttle file the state of another limiter and write the file now, with the bearer throttle's own.
+    /// The file has one writer, this guard: what the login keeps in it goes through here, so neither writer can
+    /// put back an older state of the other.
+    pub fn keep_throttle_state(&self, key: &str, state: Value) {
+        {
+            let file = self.throttle_file.lock().unwrap_or_else(|e| e.into_inner());
+            let Some(file) = file.as_ref() else {
+                return;
+            };
+            file.set(key, state);
+        }
+        // The write below carries the bearer state as well: nothing is left to write for the next upkeep.
+        self.throttle.take_dirty();
+        self.write_throttle_file();
     }
 
     /// How many lines of each kind the guard has written on its own account (for the tests): a forwarded

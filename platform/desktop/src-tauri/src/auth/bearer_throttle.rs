@@ -195,7 +195,9 @@ fn sane(mut e: Entry, now: u64) -> Option<Entry> {
 /// alone: read as empty, never written.
 pub struct ThrottleFile {
     path: PathBuf,
-    extra: Map<String, Value>,
+    /// Whatever else the file holds: the state of another limiter (the web login's, under `login`), kept as it was
+    /// read and replaced when its owner hands over a newer one ([`ThrottleFile::set`]).
+    extra: Mutex<Map<String, Value>>,
     writable: bool,
 }
 
@@ -209,7 +211,7 @@ impl ThrottleFile {
     pub fn open(path: &Path) -> (ThrottleFile, Option<Value>) {
         let mut file = ThrottleFile {
             path: path.to_path_buf(),
-            extra: Map::new(),
+            extra: Mutex::new(Map::new()),
             writable: true,
         };
         let bytes = match std::fs::read(path) {
@@ -240,8 +242,26 @@ impl ThrottleFile {
             }
         }
         let bearer = doc.remove("bearer");
-        file.extra = doc;
+        file.extra = Mutex::new(doc);
         (file, bearer)
+    }
+
+    /// What the file held under `key` when it was read, or was last given: the state of a limiter other than the
+    /// bearer throttle (the web login's, under `login`).
+    pub fn saved(&self, key: &str) -> Option<Value> {
+        self.extra
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .get(key)
+            .cloned()
+    }
+
+    /// Give the file the state of another limiter, to be written with the next save.
+    pub fn set(&self, key: &str, state: Value) {
+        self.extra
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .insert(key.to_string(), state);
     }
 
     /// Write the file: atomic and private, with the bearer throttle's `state` and what else it held.
@@ -249,7 +269,7 @@ impl ThrottleFile {
         if !self.writable {
             return Ok(());
         }
-        let mut doc = self.extra.clone();
+        let mut doc = self.extra.lock().unwrap_or_else(|e| e.into_inner()).clone();
         doc.insert("v".into(), Value::from(THROTTLE_FILE_VERSION));
         doc.insert("bearer".into(), bearer);
         let mut text =
@@ -571,6 +591,17 @@ mod tests {
         let doc: Value = serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
         assert_eq!(doc["login"], serde_json::json!({ "l1": [1, 2, 3] }));
         assert!(doc["bearer"].get("203.0.113.9").is_some());
+        // The other limiter's state can be read back, and replaced: the next save writes the newer one.
+        assert_eq!(
+            file.saved("login"),
+            Some(serde_json::json!({ "l1": [1, 2, 3] }))
+        );
+        assert_eq!(file.saved("nothing"), None);
+        file.set("login", serde_json::json!({ "l1": [4] }));
+        file.save(t.snapshot()).unwrap();
+        let doc: Value = serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        assert_eq!(doc["login"], serde_json::json!({ "l1": [4] }));
+        assert_eq!(doc["v"], 1);
         drop(again);
         // A file of another version is read as empty and never written.
         let newer = r#"{"v":2,"bearer":{"x":1},"future":true}"#;
