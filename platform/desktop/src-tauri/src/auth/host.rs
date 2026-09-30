@@ -206,6 +206,33 @@ impl HostPolicy {
         Err(Misdirected)
     }
 
+    /// The names this install answers to, as text: what the startup audit event says. The loopback names on
+    /// any port, the three app names on a loopback server, the configured public hosts, the extra ones, and
+    /// on a LAN listener the IP literals of its port.
+    pub fn describe(&self) -> Vec<String> {
+        let mut out: Vec<String> = ["localhost", "127.0.0.1", "[::1]"]
+            .iter()
+            .map(|h| format!("{h} (any port)"))
+            .collect();
+        if self.loopback_apps {
+            out.extend(
+                [
+                    "dash.oaiy.localhost",
+                    "agent.oaiy.localhost",
+                    "flows.oaiy.localhost",
+                ]
+                .iter()
+                .map(|h| h.to_string()),
+            );
+        }
+        out.extend(self.public.keys().map(HostName::display));
+        out.extend(self.extra.iter().map(HostName::display));
+        if self.exposure == Exposure::Lan {
+            out.push(format!("any IP literal on port {}", self.port));
+        }
+        out
+    }
+
     /// Whether a `Host` with this port (as [`HostName`] keeps it: `None` for no port and for `:80` and `:443`,
     /// which it drops as the schemes' defaults) is for the port the listener is bound to: the port itself, and
     /// no port at all when the listener is on 80 or 443, the ports a client uses when it names none.
@@ -455,6 +482,47 @@ mod tests {
         assert_eq!(
             p.classify(&h("127.0.0.1:17972"), true),
             Ok(HostClass::Loopback)
+        );
+    }
+
+    #[test]
+    fn f9_a_policy_says_the_names_it_answers_to_for_the_startup_event() {
+        // A desktop: the loopback names only.
+        let desktop = policy(Exposure::Local, 17972, false).describe();
+        assert_eq!(desktop.len(), 3);
+        assert!(desktop.iter().all(|h| h.ends_with("(any port)")));
+        // A loopback server: and its three app names.
+        let server = policy(Exposure::Local, 17972, true).describe();
+        for name in [
+            "dash.oaiy.localhost",
+            "agent.oaiy.localhost",
+            "flows.oaiy.localhost",
+        ] {
+            assert!(server.contains(&name.to_string()), "{name}");
+        }
+        // A proxied install: the public hosts, with their ports when they have one.
+        let proxied = policy(Exposure::Proxied, 17972, false).describe();
+        for name in [
+            "dash.example.com",
+            "agent.example.com",
+            "flows.example.com:8443",
+        ] {
+            assert!(proxied.contains(&name.to_string()), "{name} in {proxied:?}");
+        }
+        // A LAN listener: the IP literals of its port.
+        let lan = policy(Exposure::Lan, 8080, false).describe();
+        assert!(
+            lan.contains(&"any IP literal on port 8080".to_string()),
+            "{lan:?}"
+        );
+        // The extra hosts.
+        let mut extra = BTreeSet::new();
+        extra.insert(h("nas.example:9000"));
+        let with_extra =
+            HostPolicy::new(Exposure::Local, 17972, extra, BTreeMap::new(), false).describe();
+        assert!(
+            with_extra.contains(&"nas.example:9000".to_string()),
+            "{with_extra:?}"
         );
     }
 

@@ -2636,6 +2636,194 @@ async fn f4_a_static_token_that_fails_the_shape_rule_is_still_accepted_until_the
     assert_eq!(r.status, 400);
 }
 
+// ======================= F9: what the guard says of the address it sees, and what it keeps ================
+
+fn proxied_env() -> Env {
+    env_with(
+        AccessMode::Scoped,
+        &[("OAIY_PUBLIC_URL", "https://dash.example.com")],
+        false,
+        false,
+        Some(STATIC_TOKEN),
+    )
+}
+
+fn events_named(e: &Env, name: &str) -> Vec<Value> {
+    e.audit
+        .read(LogFile::Audit, 1000, None, None)
+        .into_iter()
+        .filter(|l| l["event"] == name)
+        .collect()
+}
+
+#[tokio::test]
+async fn f9_a_forwarded_header_on_a_local_install_is_audited_and_logged_once_a_minute() {
+    let e = env(AccessMode::Scoped);
+    async fn ask(e: &Env, header: &str) -> Reply {
+        go(
+            e,
+            send(Method::GET, "/api/config")
+                .bearer(STATIC_TOKEN)
+                .h(header, "203.0.113.9"),
+        )
+        .await
+    }
+    for _ in 0..6 {
+        let r = ask(&e, "x-forwarded-for").await;
+        assert_eq!(
+            (r.status, r.code().as_deref()),
+            (421, Some("proxy_detected"))
+        );
+    }
+    let lines = events_named(&e, "proxy.detected");
+    assert_eq!(lines.len(), 1, "six requests, one audit line: {lines:?}");
+    assert_eq!(lines[0]["detail"]["header"], "x-forwarded-for");
+    assert_eq!(lines[0]["ip"], "127.0.0.1");
+    assert_eq!(e.guard.note_counts().0, 1, "and one log line");
+    // Still the same minute a little later; a minute on, one more (and it names the header it saw).
+    e.clock.advance(59_000);
+    ask(&e, "via").await;
+    assert_eq!(events_named(&e, "proxy.detected").len(), 1);
+    e.clock.advance(1_000);
+    ask(&e, "via").await;
+    let lines = events_named(&e, "proxy.detected");
+    assert_eq!(lines.len(), 2);
+    assert_eq!(e.guard.note_counts().0, 2);
+    assert!(lines.iter().any(|l| l["detail"]["header"] == "via"));
+}
+
+#[tokio::test]
+async fn f9_a_proxy_that_says_http_for_an_https_host_is_audited_once() {
+    let e = proxied_env();
+    for _ in 0..4 {
+        let r = go(
+            &e,
+            send(Method::GET, "/api/config")
+                .h("host", "dash.example.com")
+                .h("x-forwarded-for", "203.0.113.9")
+                .h("x-forwarded-proto", "http"),
+        )
+        .await;
+        assert_eq!(
+            (r.status, r.code().as_deref()),
+            (400, Some("proxy_misconfigured"))
+        );
+    }
+    assert_eq!(events_named(&e, "proxy.misconfigured").len(), 1);
+    // Once: a minute later it is still the one.
+    e.clock.advance(3_600_000);
+    go(
+        &e,
+        send(Method::GET, "/api/config")
+            .h("host", "dash.example.com")
+            .h("x-forwarded-for", "203.0.113.9")
+            .h("x-forwarded-proto", "http"),
+    )
+    .await;
+    assert_eq!(events_named(&e, "proxy.misconfigured").len(), 1);
+}
+
+#[tokio::test]
+async fn f9_a_trusted_proxys_unusable_forwarded_for_is_logged_once_a_minute_and_a_usable_one_is_not(
+) {
+    let e = proxied_env();
+    async fn ask(e: &Env, xff: &str) -> Reply {
+        go(
+            e,
+            send(Method::GET, "/api/config")
+                .h("host", "dash.example.com")
+                .h("x-forwarded-for", xff)
+                .h("x-forwarded-proto", "https"),
+        )
+        .await
+    }
+    // A usable header: nothing to say.
+    ask(&e, "203.0.113.9").await;
+    assert_eq!(e.guard.note_counts().1, 0);
+    // An entry that is not an address, and a header of nothing but trusted proxies: the proxy stands for everyone.
+    for xff in ["not-an-ip", "203.0.113.9, garbage", "127.0.0.1", "::1"] {
+        for _ in 0..3 {
+            ask(&e, xff).await;
+        }
+    }
+    assert_eq!(e.guard.note_counts().1, 1, "twelve requests, one line");
+    e.clock.advance(60_000);
+    ask(&e, "not-an-ip").await;
+    assert_eq!(e.guard.note_counts().1, 2);
+}
+
+#[tokio::test]
+async fn f9_the_throttle_is_saved_when_it_changed_and_a_new_guard_starts_from_the_file() {
+    use super::bearer_throttle::ThrottleFile;
+    let dir = TempDir::new("guard-throttle");
+    let path = dir.0.join("throttle.json");
+    // A LAN listener: the throttle applies to every peer there, a loopback one too.
+    let wrong = format!("oaiypat_{}_{}", "0123456789abcdef", "A".repeat(43));
+    async fn ask(e: &Env, peer: &str, wrong: &str) -> Reply {
+        go(e, send(Method::GET, "/api/config").peer(peer).bearer(wrong)).await
+    }
+    let e = env_at_port(
+        AccessMode::Scoped,
+        &[],
+        true,
+        false,
+        Some(STATIC_TOKEN),
+        17972,
+    );
+    let (file, saved) = ThrottleFile::open(&path);
+    assert!(saved.is_none());
+    e.guard.keep_throttle_in(file, saved.as_ref());
+    e.guard.flush_throttle();
+    assert!(!path.exists(), "nothing changed, nothing written");
+    for _ in 0..20 {
+        assert_eq!(ask(&e, "192.168.1.20:5000", &wrong).await.status, 401);
+    }
+    assert_eq!(
+        ask(&e, "192.168.1.20:5000", &wrong).await.status,
+        429,
+        "blocked"
+    );
+    e.guard.flush_throttle();
+    assert!(path.exists(), "changed, so written");
+    let saved_text = std::fs::read_to_string(&path).unwrap();
+    // Written when it changed, not on every round of upkeep.
+    std::fs::remove_file(&path).unwrap();
+    e.guard.flush_throttle();
+    assert!(!path.exists(), "not written again while nothing changes");
+    // A guard that starts later from the file knows the block, and only that one.
+    std::fs::write(&path, &saved_text).unwrap();
+    let again = env_at_port(
+        AccessMode::Scoped,
+        &[],
+        true,
+        false,
+        Some(STATIC_TOKEN),
+        17972,
+    );
+    let (file, saved) = ThrottleFile::open(&path);
+    again.guard.keep_throttle_in(file, saved.as_ref());
+    assert_eq!(
+        ask(&again, "192.168.1.20:5000", &wrong).await.status,
+        429,
+        "the block survived"
+    );
+    assert_eq!(
+        ask(&again, "192.168.1.21:5000", &wrong).await.status,
+        401,
+        "and nobody else is blocked"
+    );
+    // Without the file it is gone (this is what a restart used to do).
+    let fresh = env_at_port(
+        AccessMode::Scoped,
+        &[],
+        true,
+        false,
+        Some(STATIC_TOKEN),
+        17972,
+    );
+    assert_eq!(ask(&fresh, "192.168.1.20:5000", &wrong).await.status, 401);
+}
+
 // ================================ F8: a LAN listener on a port the schemes use ========================
 
 #[tokio::test]

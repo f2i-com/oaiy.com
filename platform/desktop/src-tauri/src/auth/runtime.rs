@@ -4,6 +4,7 @@ use std::path::Path;
 use std::sync::{Arc, Mutex, OnceLock};
 
 use super::audit::{self, AuditLog};
+use super::bearer_throttle::ThrottleFile;
 use super::clock::{Clock, SystemClock};
 use super::guard::{Guard, GuardConfig};
 use super::mode::{validate_mode, AccessMode};
@@ -92,8 +93,24 @@ pub fn build_guard(
         settings.mode.name(),
         exposure.name()
     );
+    if settings.mode.is_enforcing() {
+        // Blocks survive a restart and a kill: what the last run saved is loaded, and the upkeep saves it.
+        let (file, saved) = ThrottleFile::open(&auth_dir.join("throttle.json"));
+        guard.keep_throttle_in(file, saved.as_ref());
+    }
     if let Some(log) = guard.audit() {
-        log.critical("startup", None, &Default::default(), serde_json::json!({ "exposure": exposure.name(), "mode": settings.mode.name(), "port": port }));
+        log.critical(
+            "startup",
+            None,
+            &Default::default(),
+            serde_json::json!({
+                "exposure": exposure.name(),
+                "mode": settings.mode.name(),
+                "port": port,
+                "hosts": guard.config().hosts.describe(),
+                "trustedProxies": guard.config().trusted.describe(),
+            }),
+        );
     }
     remember(guard.clone());
     Ok(guard)
@@ -117,12 +134,19 @@ pub fn flush_installed() {
         .unwrap_or_else(|e| e.into_inner())
         .clone();
     if let Some(guard) = guard {
-        if let Err(e) = guard.store().flush() {
-            log::warn!("auth: the credential store could not be written at shutdown: {e}");
-        }
-        if let Some(log) = guard.audit() {
-            log.flush_noise();
-        }
+        flush_guard(&guard);
+    }
+}
+
+/// What shutdown does to a guard: write the credential store, the throttle and the audit counts that are
+/// still in memory.
+pub fn flush_guard(guard: &Guard) {
+    if let Err(e) = guard.store().flush() {
+        log::warn!("auth: the credential store could not be written at shutdown: {e}");
+    }
+    guard.flush_throttle();
+    if let Some(log) = guard.audit() {
+        log.flush_noise();
     }
 }
 
@@ -152,6 +176,7 @@ pub async fn maintain_every(guard: Arc<Guard>, period: std::time::Duration) {
 /// One round of upkeep.
 pub fn maintain_once(guard: &Guard) {
     guard.store().maintain();
+    guard.flush_throttle();
     if let Some(log) = guard.audit() {
         log.flush_closed();
     }
@@ -202,12 +227,168 @@ mod tests {
             )
             .unwrap();
         maintain_once(&guard);
-        flush_installed();
+        flush_guard(&guard);
         assert_eq!(
             std::fs::read_dir(&dir.0).unwrap().count(),
             0,
             "the upkeep of a legacy guard writes nothing either"
         );
+    }
+
+    #[test]
+    fn shutdown_writes_the_last_used_times_the_store_kept_in_memory() {
+        use super::super::scopes::ScopeSet;
+        use super::super::store::MintSpec;
+        use super::super::token::Kind;
+        let dir = TempDir::new("runtime-shutdown");
+        let guard = build_guard(
+            &AccessSettings::new(AccessMode::Scoped),
+            &dir.0,
+            17972,
+            false,
+            false,
+            None,
+            &no_env,
+        )
+        .unwrap();
+        let made = guard
+            .store()
+            .mint(MintSpec::new(
+                Kind::Pat,
+                "a tool",
+                ScopeSet::of(&["system.read"]),
+                30 * 24 * 3_600_000,
+            ))
+            .unwrap();
+        guard
+            .store()
+            .authenticate(&made.token, Some("127.0.0.1"))
+            .unwrap();
+        let last_used = || {
+            let text =
+                std::fs::read_to_string(dir.0.join("auth").join("credentials.json")).unwrap();
+            let doc: serde_json::Value = serde_json::from_str(&text).unwrap();
+            doc["credentials"][0]["last_used_ms"].clone()
+        };
+        assert!(last_used().is_null(), "kept in memory until it is written");
+        flush_guard(&guard);
+        assert!(last_used().is_u64(), "{}", last_used());
+        audit::uninstall();
+    }
+
+    #[test]
+    fn f9_the_startup_event_says_the_hosts_and_the_trusted_proxies() {
+        let dir = TempDir::new("runtime-startup");
+        let vars = |name: &str| match name {
+            "OAIY_PUBLIC_URL" => Some("https://dash.example.com".to_string()),
+            "OAIY_AGENT_URL" => Some("https://agent.example.com:8443".to_string()),
+            "OAIY_TRUSTED_PROXIES" => Some("10.0.0.0/8, 192.0.2.7".to_string()),
+            "OAIY_ALLOWED_HOSTS" => Some("nas.example:9000".to_string()),
+            _ => None,
+        };
+        let _guard = build_guard(
+            &AccessSettings::new(AccessMode::Scoped),
+            &dir.0,
+            17972,
+            false,
+            false,
+            None,
+            &vars,
+        )
+        .unwrap();
+        let text = std::fs::read_to_string(dir.0.join("auth").join("audit.jsonl")).unwrap();
+        let startup: serde_json::Value = text
+            .lines()
+            .map(|l| serde_json::from_str::<serde_json::Value>(l).unwrap())
+            .find(|l| l["event"] == "startup")
+            .expect("a startup event");
+        let d = &startup["detail"];
+        assert_eq!(d["mode"], "scoped");
+        assert_eq!(d["exposure"], "proxied");
+        assert_eq!(d["port"], 17972);
+        let hosts: Vec<&str> = d["hosts"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|h| h.as_str().unwrap())
+            .collect();
+        for want in [
+            "dash.example.com",
+            "agent.example.com:8443",
+            "nas.example:9000",
+        ] {
+            assert!(hosts.contains(&want), "{want} in {hosts:?}");
+        }
+        assert!(
+            hosts.iter().any(|h| h.starts_with("localhost")),
+            "{hosts:?}"
+        );
+        assert_eq!(
+            d["trustedProxies"],
+            serde_json::json!(["10.0.0.0/8", "192.0.2.7/32"])
+        );
+        audit::uninstall();
+    }
+
+    #[test]
+    fn f9_a_scoped_guard_keeps_its_throttle_in_the_data_folder_and_a_legacy_one_does_not() {
+        use super::super::bearer_throttle::THROTTLE_FILE_VERSION;
+        let dir = TempDir::new("runtime-throttle");
+        // Saved by an earlier run: an address blocked for a while.
+        let now = super::super::clock::SystemClock.now_ms();
+        std::fs::create_dir_all(dir.0.join("auth")).unwrap();
+        std::fs::write(
+            dir.0.join("auth").join("throttle.json"),
+            serde_json::json!({
+                "v": THROTTLE_FILE_VERSION,
+                "bearer": { "203.0.113.9": { "failures": [], "blocked_until": now + 600_000, "last_block_end": now + 600_000, "level": 1, "last_seen": now } }
+            })
+            .to_string(),
+        )
+        .unwrap();
+        let guard = build_guard(
+            &AccessSettings::new(AccessMode::Scoped),
+            &dir.0,
+            17972,
+            false,
+            false,
+            None,
+            &no_env,
+        )
+        .unwrap();
+        assert!(
+            guard.throttle().blocked_for("203.0.113.9").is_some(),
+            "loaded at start"
+        );
+        // A failure is saved by the upkeep, and the last one at shutdown.
+        let file = dir.0.join("auth").join("throttle.json");
+        guard.throttle().record_failure("198.51.100.4");
+        maintain_once(&guard);
+        let saved = std::fs::read_to_string(&file).unwrap();
+        assert!(
+            saved.contains("198.51.100.4") && saved.contains("203.0.113.9"),
+            "{saved}"
+        );
+        guard.throttle().record_failure("198.51.100.5");
+        flush_guard(&guard);
+        let saved = std::fs::read_to_string(&file).unwrap();
+        assert!(saved.contains("198.51.100.5"), "{saved}");
+        audit::uninstall();
+        // Legacy touches no disk, so it has no file to keep it in.
+        let legacy_dir = TempDir::new("runtime-throttle-legacy");
+        let legacy = build_guard(
+            &AccessSettings::legacy(),
+            &legacy_dir.0,
+            17972,
+            false,
+            true,
+            None,
+            &no_env,
+        )
+        .unwrap();
+        legacy.throttle().record_failure("198.51.100.4");
+        maintain_once(&legacy);
+        assert_eq!(std::fs::read_dir(&legacy_dir.0).unwrap().count(), 0);
     }
 
     #[tokio::test]

@@ -32,7 +32,8 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::net::{IpAddr, SocketAddr};
-use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::{Arc, Mutex};
 
 use axum::extract::{ConnectInfo, MatchedPath, Request};
 use axum::http::{header, HeaderMap, HeaderName, HeaderValue, Method, StatusCode};
@@ -41,7 +42,7 @@ use axum::response::{IntoResponse, Response};
 use serde_json::{json, Value};
 
 use super::audit::AuditLog;
-use super::bearer_throttle::BearerThrottle;
+use super::bearer_throttle::{BearerThrottle, ThrottleFile};
 use super::clientip::{client_ip, ClientIp, TrustedProxies};
 use super::clock::Clock;
 use super::exposure_checks::{forwarded_header, is_loopback, is_public_address};
@@ -522,6 +523,31 @@ pub struct Guard {
     static_token: Option<String>,
     throttle: BearerThrottle,
     audit: Option<Arc<AuditLog>>,
+    clock: Arc<dyn Clock>,
+    /// Where the throttle is kept between runs (`scoped` and `shadow`; `legacy` touches no disk).
+    throttle_file: Mutex<Option<ThrottleFile>>,
+    /// When a forwarded header on a local install was last audited and logged (once a minute), how many
+    /// lines that made.
+    proxy_detected_at: AtomicU64,
+    proxy_detected_lines: AtomicU64,
+    /// A trusted proxy that says `http` for a public host is audited once.
+    proxy_misconfigured_noted: AtomicBool,
+    /// When a trusted proxy's unusable `X-Forwarded-For` was last logged (once a minute), how many lines.
+    fell_back_at: AtomicU64,
+    fell_back_lines: AtomicU64,
+}
+
+/// The least time between two lines of a kind that anonymous traffic can make.
+const NOTE_EVERY_MS: u64 = 60_000;
+
+/// Whether a line of a kind that `last` last wrote may be written now, and if so record it: at most one a
+/// minute, however much traffic asks.
+fn once_a_minute(last: &AtomicU64, now: u64) -> bool {
+    let before = last.load(Ordering::Relaxed);
+    (before == 0 || now.saturating_sub(before) >= NOTE_EVERY_MS)
+        && last
+            .compare_exchange(before, now.max(1), Ordering::Relaxed, Ordering::Relaxed)
+            .is_ok()
 }
 
 /// A request refused, and where it came from (the address and host it is counted against).
@@ -555,9 +581,106 @@ impl Guard {
             config,
             store,
             static_token,
-            throttle: BearerThrottle::new(clock),
+            throttle: BearerThrottle::new(clock.clone()),
             audit,
+            clock,
+            throttle_file: Mutex::new(None),
+            proxy_detected_at: AtomicU64::new(0),
+            proxy_detected_lines: AtomicU64::new(0),
+            proxy_misconfigured_noted: AtomicBool::new(false),
+            fell_back_at: AtomicU64::new(0),
+            fell_back_lines: AtomicU64::new(0),
         }
+    }
+
+    /// Keep the throttle in `file` from now on, starting from what it held (`saved`): a block survives a
+    /// restart and a kill.
+    pub fn keep_throttle_in(&self, file: ThrottleFile, saved: Option<&Value>) {
+        if let Some(saved) = saved {
+            self.throttle.restore(saved);
+        }
+        *self.throttle_file.lock().unwrap_or_else(|e| e.into_inner()) = Some(file);
+    }
+
+    /// Write the throttle if it changed since the last write (the periodic upkeep asks every few seconds, and
+    /// shutdown asks once more). A write that fails is logged and tried again next time.
+    pub fn flush_throttle(&self) {
+        if !self.throttle.take_dirty() {
+            return;
+        }
+        let file = self.throttle_file.lock().unwrap_or_else(|e| e.into_inner());
+        let Some(file) = file.as_ref() else {
+            return;
+        };
+        if let Err(e) = file.save(self.throttle.snapshot()) {
+            log::warn!("auth: the throttle could not be written: {e}");
+            self.throttle.set_dirty();
+        }
+    }
+
+    /// How many lines of each kind the guard has written on its own account (for the tests): a forwarded
+    /// header on a local install, and a trusted proxy's `X-Forwarded-For` it could not use.
+    pub fn note_counts(&self) -> (u64, u64) {
+        (
+            self.proxy_detected_lines.load(Ordering::Relaxed),
+            self.fell_back_lines.load(Ordering::Relaxed),
+        )
+    }
+
+    /// A forwarded header reached an install that is not behind a proxy (`421 proxy_detected`): one audit
+    /// line and one log line naming `OAIY_PUBLIC_URL` a minute at the most, whatever the traffic.
+    fn note_proxy_detected(&self, header: &str, ip: &str, host: &str) {
+        if !once_a_minute(&self.proxy_detected_at, self.clock.now_ms()) {
+            return;
+        }
+        self.proxy_detected_lines.fetch_add(1, Ordering::Relaxed);
+        log::warn!(
+            "auth: a request carried a {header} header, and this install is not behind a proxy: refused; if there is one, set OAIY_PUBLIC_URL (and OAIY_TRUSTED_PROXIES)"
+        );
+        if let Some(audit) = &self.audit {
+            audit.critical(
+                "proxy.detected",
+                None,
+                &super::audit::Context {
+                    ip: Some(ip),
+                    host: Some(host),
+                    ua: None,
+                },
+                json!({ "header": header }),
+            );
+        }
+    }
+
+    /// A trusted proxy said `http` for a public host: its configuration is wrong. Audited once.
+    fn note_proxy_misconfigured(&self, ip: &str, host: &str) {
+        if self.proxy_misconfigured_noted.swap(true, Ordering::Relaxed) {
+            return;
+        }
+        log::warn!("auth: a trusted proxy sent X-Forwarded-Proto http for an https host: fix the proxy's X-Forwarded-Proto");
+        if let Some(audit) = &self.audit {
+            audit.critical(
+                "proxy.misconfigured",
+                None,
+                &super::audit::Context {
+                    ip: Some(ip),
+                    host: Some(host),
+                    ua: None,
+                },
+                json!({}),
+            );
+        }
+    }
+
+    /// A trusted proxy's `X-Forwarded-For` could not be used, so its address stands for every client behind
+    /// it (they share its limits): one log line a minute.
+    fn note_fell_back(&self, peer: IpAddr) {
+        if !once_a_minute(&self.fell_back_at, self.clock.now_ms()) {
+            return;
+        }
+        self.fell_back_lines.fetch_add(1, Ordering::Relaxed);
+        log::warn!(
+            "auth: the X-Forwarded-For of the trusted proxy {peer} could not be used: its address stands for every client behind it; check the proxy and OAIY_TRUSTED_PROXIES"
+        );
     }
 
     pub fn mode(&self) -> AccessMode {
@@ -720,8 +843,14 @@ impl Guard {
             info.client_ip = client.ip.to_string();
             info.client_key = client.key.clone();
             info.via_trusted_proxy = client.via_proxy || self.config.trusted.contains(peer_ip);
-            if self.config.exposure == Exposure::Local && forwarded.is_some() {
-                return Err(fail(Denial::proxy_detected(), &info.client_ip));
+            if client.fell_back {
+                self.note_fell_back(peer_ip);
+            }
+            if self.config.exposure == Exposure::Local {
+                if let Some(header) = forwarded {
+                    self.note_proxy_detected(header, &info.client_ip, &info.host);
+                    return Err(fail(Denial::proxy_detected(), &info.client_ip));
+                }
             }
             if self.config.exposure == Exposure::Lan
                 && headers.contains_key(header::AUTHORIZATION)
@@ -747,7 +876,8 @@ impl Guard {
                 ) {
                     Ok(c) => info.channel = c,
                     Err(ProxyMisconfigured) => {
-                        return Err(fail(Denial::proxy_misconfigured(), &info.client_ip))
+                        self.note_proxy_misconfigured(&info.client_ip, &info.host);
+                        return Err(fail(Denial::proxy_misconfigured(), &info.client_ip));
                     }
                 }
             }

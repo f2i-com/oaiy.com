@@ -59,6 +59,11 @@ impl Cidr {
         let ip = unmap(ip);
         ip.is_ipv4() == self.net.is_ipv4() && mask(ip, self.prefix) == self.net
     }
+
+    /// `203.0.113.0/24`: the network as `parse` reads it back.
+    pub fn describe(&self) -> String {
+        format!("{}/{}", self.net, self.prefix)
+    }
 }
 
 /// `ip` with everything past `prefix` bits cleared.
@@ -122,6 +127,11 @@ impl TrustedProxies {
 
     pub fn is_empty(&self) -> bool {
         self.0.is_empty()
+    }
+
+    /// The networks, as text: what the startup audit event says the install trusts.
+    pub fn describe(&self) -> Vec<String> {
+        self.0.iter().map(Cidr::describe).collect()
     }
 }
 
@@ -202,6 +212,25 @@ mod tests {
         assert!(rejected.is_empty(), "{rejected:?}");
         let c = client_ip(ip(peer), xff, &t);
         (c.ip.to_string(), c.key)
+    }
+
+    #[test]
+    fn f9_the_trusted_proxies_are_described_as_networks_that_read_back() {
+        let (t, rejected) =
+            TrustedProxies::parse_list("10.0.0.5/8, 192.0.2.7, 2001:db8:1::/32, ::1");
+        assert!(rejected.is_empty());
+        assert_eq!(
+            t.describe(),
+            ["10.0.0.0/8", "192.0.2.7/32", "2001:db8::/32", "::1/128"]
+        );
+        // What it says reads back as the same set.
+        let (again, _) = TrustedProxies::parse_list(&t.describe().join(","));
+        assert_eq!(again, t);
+        assert!(TrustedProxies::none().describe().is_empty());
+        assert_eq!(
+            TrustedProxies::loopback().describe(),
+            ["127.0.0.1/32", "::1/128"]
+        );
     }
 
     /// The design's reference table (4.5.4, vectors2.mjs and vectors4.mjs): 11 rows.

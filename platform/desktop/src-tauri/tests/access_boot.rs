@@ -683,6 +683,48 @@ fn the_startup_refusals_of_design_4_5_5_that_are_not_made_yet_are_pinned() {
 }
 
 #[test]
+fn a_block_of_the_failed_bearer_throttle_survives_a_kill() {
+    // A network listener, so that the throttle applies to this test's own (loopback) peer. The first server
+    // is killed, not stopped: what the next one knows is what the upkeep saved.
+    let scratch = Scratch::new("boot-throttle-kill");
+    let env = [("OAIY_ACCESS_MODE", "scoped"), ("OAIY_SERVER_BIND", "lan")];
+    let wrong = format!("oaiypat_0123456789abcdef_{}", "A".repeat(43));
+    {
+        let server = Server::start(&scratch, &env);
+        for i in 0..20 {
+            let (status, _) = server.call(reqwest::Method::GET, "/api/config", Some(&wrong));
+            assert_eq!(status, 401, "failure {i}");
+        }
+        let (status, body) = server.call(reqwest::Method::GET, "/api/config", Some(&wrong));
+        assert_eq!(
+            (status, body["error"]["code"].as_str()),
+            (429, Some("rate_limited"))
+        );
+        // The upkeep saves a changed throttle within a few seconds.
+        let file = scratch.data().join("auth").join("throttle.json");
+        let deadline = Instant::now() + Duration::from_secs(20);
+        while !file.exists() {
+            assert!(
+                Instant::now() < deadline,
+                "the throttle was not saved: {}",
+                server.stderr_tail()
+            );
+            std::thread::sleep(Duration::from_millis(200));
+        }
+    }
+    let server = Server::start(&scratch, &env);
+    let (status, body) = server.call(reqwest::Method::GET, "/api/config", Some(&wrong));
+    assert_eq!(
+        (status, body["error"]["code"].as_str()),
+        (429, Some("rate_limited")),
+        "the block came back from the file"
+    );
+    // A block stops a bearer that failed, never a request without one.
+    let (status, _) = server.call(reqwest::Method::GET, "/api/health", None);
+    assert_eq!(status, 200, "a route without a bearer is never blocked");
+}
+
+#[test]
 fn a_mode_that_is_not_one_stops_the_server_with_exit_78() {
     let scratch = Scratch::new("boot-badmode");
     let mut server = Server::spawn(&scratch, &[("OAIY_ACCESS_MODE", "scopd")], "server");

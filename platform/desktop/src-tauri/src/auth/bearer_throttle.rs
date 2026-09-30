@@ -14,9 +14,12 @@
 //! throttle of a later step) so that a restart does not clear a block.
 
 use std::collections::{HashMap, VecDeque};
+use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 
 use serde::{Deserialize, Serialize};
+use serde_json::{Map, Value};
 
 use super::clock::Clock;
 
@@ -47,6 +50,8 @@ struct Entry {
 pub struct BearerThrottle {
     state: Mutex<HashMap<String, Entry>>,
     clock: Arc<dyn Clock>,
+    /// Changed since it was last taken for saving.
+    dirty: AtomicBool,
 }
 
 /// The length of the `level`th block (1 is the first).
@@ -61,7 +66,18 @@ impl BearerThrottle {
         BearerThrottle {
             state: Mutex::new(HashMap::new()),
             clock,
+            dirty: AtomicBool::new(false),
         }
+    }
+
+    /// Whether the state changed since the last call (and forget that it did): what the periodic save asks.
+    pub fn take_dirty(&self) -> bool {
+        self.dirty.swap(false, Ordering::Relaxed)
+    }
+
+    /// The state changed and is not saved (a save that failed).
+    pub fn set_dirty(&self) {
+        self.dirty.store(true, Ordering::Relaxed);
     }
 
     fn lock(&self) -> std::sync::MutexGuard<'_, HashMap<String, Entry>> {
@@ -81,6 +97,7 @@ impl BearerThrottle {
     pub fn record_failure(&self, key: &str) -> bool {
         let now = self.clock.now_ms();
         let mut state = self.lock();
+        self.set_dirty();
         if !state.contains_key(key) && state.len() >= MAX_TRACKED {
             evict(&mut state, now);
         }
@@ -133,15 +150,112 @@ impl BearerThrottle {
         serde_json::to_value(live).unwrap_or(serde_json::Value::Null)
     }
 
-    /// Load a saved state (a restart does not clear a block). What cannot be read is ignored.
+    /// Load a saved state (a restart does not clear a block). What cannot be read is ignored, and what is
+    /// read is made sane first: a file is not trusted to name a block that ends in the year 3000, or
+    /// failures that have not happened yet, and an address with nothing left to remember is not loaded.
     pub fn restore(&self, saved: &serde_json::Value) {
         let Ok(loaded) = serde_json::from_value::<HashMap<String, Entry>>(saved.clone()) else {
             return;
         };
+        let now = self.clock.now_ms();
         let mut state = self.lock();
         for (k, v) in loaded.into_iter().take(MAX_TRACKED) {
-            state.insert(k, v);
+            if let Some(entry) = sane(v, now) {
+                state.insert(k, entry);
+            }
         }
+    }
+}
+
+/// An entry read from a file, with what cannot be true cut back; `None` when nothing of it is worth keeping
+/// (no block, no recent failure, and the last block is more than a day over).
+fn sane(mut e: Entry, now: u64) -> Option<Entry> {
+    let ceiling = now.saturating_add(MAX_BLOCK_MS);
+    e.blocked_until = e.blocked_until.min(ceiling);
+    e.last_block_end = e.last_block_end.min(ceiling);
+    e.last_seen = e.last_seen.min(now);
+    e.level = e.level.min(21);
+    // Oldest first (a file may say anything), only the recent past, and never a block's worth.
+    let mut times: Vec<u64> = e.failures.drain(..).collect();
+    times.sort_unstable();
+    times.retain(|t| *t <= now && now.saturating_sub(*t) < WINDOW_MS);
+    e.failures = times.into();
+    while e.failures.len() >= FAILURES_TO_BLOCK {
+        e.failures.pop_front();
+    }
+    let worth_keeping = e.blocked_until > now
+        || !e.failures.is_empty()
+        || (e.last_block_end != 0 && now.saturating_sub(e.last_block_end) < RESET_MS);
+    worth_keeping.then_some(e)
+}
+
+/// `<data>/auth/throttle.json`: the throttle's state on disk, so that a restart or a kill does not clear a
+/// block (design 4.5.6 and 4.7.4). It holds `{"v":1,"bearer":{...}}` and whatever else a later step (the login
+/// throttle) has put in it, kept and written back. A file written by a newer build (another `v`) is left
+/// alone: read as empty, never written.
+pub struct ThrottleFile {
+    path: PathBuf,
+    extra: Map<String, Value>,
+    writable: bool,
+}
+
+/// The `v` of `throttle.json` this build reads and writes.
+pub const THROTTLE_FILE_VERSION: u64 = 1;
+
+impl ThrottleFile {
+    /// Read `path`: the file, and the saved state of the bearer throttle if there is one. A file that is not
+    /// there, or is not JSON, is an empty state (this is a throttle, not a credential: nothing is lost that
+    /// cannot be counted again).
+    pub fn open(path: &Path) -> (ThrottleFile, Option<Value>) {
+        let mut file = ThrottleFile {
+            path: path.to_path_buf(),
+            extra: Map::new(),
+            writable: true,
+        };
+        let bytes = match std::fs::read(path) {
+            Ok(b) => b,
+            Err(e) => {
+                if e.kind() != std::io::ErrorKind::NotFound {
+                    log::warn!("auth: {} could not be read: {e}", path.display());
+                }
+                return (file, None);
+            }
+        };
+        let Ok(Value::Object(mut doc)) = serde_json::from_slice::<Value>(&bytes) else {
+            log::warn!(
+                "auth: {} is not readable: starting with no blocks",
+                path.display()
+            );
+            return (file, None);
+        };
+        match doc.remove("v").and_then(|v| v.as_u64()) {
+            Some(THROTTLE_FILE_VERSION) => {}
+            other => {
+                log::warn!(
+                    "auth: {} has version {other:?}: it was written by another OAIY and is left alone",
+                    path.display()
+                );
+                file.writable = false;
+                return (file, None);
+            }
+        }
+        let bearer = doc.remove("bearer");
+        file.extra = doc;
+        (file, bearer)
+    }
+
+    /// Write the file: atomic and private, with the bearer throttle's `state` and what else it held.
+    pub fn save(&self, bearer: Value) -> std::io::Result<()> {
+        if !self.writable {
+            return Ok(());
+        }
+        let mut doc = self.extra.clone();
+        doc.insert("v".into(), Value::from(THROTTLE_FILE_VERSION));
+        doc.insert("bearer".into(), bearer);
+        let mut text =
+            serde_json::to_string_pretty(&Value::Object(doc)).map_err(std::io::Error::other)?;
+        text.push('\n');
+        crate::secret_file::write(&self.path, text)
     }
 }
 
@@ -358,5 +472,136 @@ mod tests {
         // A saved state that cannot be read is ignored.
         restarted.restore(&serde_json::json!("garbage"));
         restarted.restore(&serde_json::json!({ "x": { "failures": "no" } }));
+    }
+
+    #[test]
+    fn f9_a_failure_makes_the_state_dirty_until_it_is_taken() {
+        let (t, _) = throttle();
+        assert!(!t.take_dirty(), "nothing has happened");
+        t.record_failure("k");
+        assert!(t.take_dirty());
+        assert!(!t.take_dirty(), "taken once");
+        t.set_dirty();
+        assert!(t.take_dirty(), "a save that failed is asked for again");
+        // A block that is only read changes nothing.
+        fail(&t, "b", 20);
+        t.take_dirty();
+        assert!(t.blocked_for("b").is_some());
+        assert!(!t.take_dirty());
+    }
+
+    #[test]
+    fn f9_a_file_is_not_trusted_to_name_a_block_of_the_year_3000_or_failures_from_the_future() {
+        let (t, clock) = throttle();
+        let now = clock.now_ms();
+        let day = 24 * 3_600_000u64;
+        let entry = |failures: Vec<u64>, blocked_until: u64, last_block_end: u64, level: u32| {
+            serde_json::json!({
+                "failures": failures, "blocked_until": blocked_until,
+                "last_block_end": last_block_end, "level": level, "last_seen": now + 5 * day
+            })
+        };
+        t.restore(&serde_json::json!({
+            // A block that ends at the end of time: cut to a day.
+            "forever": entry(vec![], u64::MAX, u64::MAX, u32::MAX),
+            // Failures that have not happened yet, and ones from an hour ago: only the recent past counts.
+            "future": entry(vec![now + 1000, now + 2000], 0, 0, 0),
+            "old": entry(vec![now - 3_600_000], 0, 0, 0),
+            // Nothing left to remember: not loaded.
+            "stale": entry(vec![], now - 2 * day, now - 2 * day, 3),
+            // A hundred failures in the last minute: never more than a block's worth are kept.
+            "many": entry((0..100).map(|i| now - i * 1000).collect(), 0, 0, 0),
+        }));
+        assert!(
+            t.blocked_for("forever").unwrap() <= day / 1000,
+            "{:?}",
+            t.blocked_for("forever")
+        );
+        assert!(t.blocked_for("forever").unwrap() > day / 1000 - 5);
+        assert_eq!(t.blocked_for("future"), None);
+        assert_eq!(t.blocked_for("old"), None);
+        assert_eq!(t.tracked(), 2, "forever and many; the others are not kept");
+        // "many" has at most 19 failures, the newest: one more and it is blocked.
+        assert_eq!(t.blocked_for("many"), None);
+        assert_eq!(
+            t.snapshot()["many"]["failures"].as_array().unwrap().len(),
+            FAILURES_TO_BLOCK - 1
+        );
+        t.record_failure("many");
+        assert!(t.blocked_for("many").is_some(), "the twentieth blocks");
+        // The block it earns is the first rung, not a rung of a made-up level.
+        assert_eq!(t.blocked_for("many"), Some(15 * 60));
+        // The made-up level of "forever" (the largest number there is) is cut: an hour after its block ends
+        // the next one is the top rung, and nothing overflows on the way.
+        clock.advance(day + 3_600_000);
+        for _ in 0..20 {
+            t.record_failure("forever");
+        }
+        let next = t.blocked_for("forever").unwrap();
+        assert!(next <= day / 1000 && next > day / 2000, "{next}");
+    }
+
+    fn scratch(tag: &str) -> crate::secret_file::testing::TempDir {
+        crate::secret_file::testing::TempDir::new(tag)
+    }
+
+    #[test]
+    fn f9_the_throttle_file_round_trips_keeps_what_else_it_holds_and_leaves_a_newer_file_alone() {
+        let dir = scratch("throttle-file");
+        let path = dir.0.join("throttle.json");
+        // Not there: an empty state.
+        let (file, saved) = ThrottleFile::open(&path);
+        assert!(saved.is_none());
+        // Saved and read back, with the block in it.
+        let (t, clock) = throttle();
+        fail(&t, "203.0.113.9", 20);
+        file.save(t.snapshot()).unwrap();
+        let (again, saved) = ThrottleFile::open(&path);
+        let restarted = BearerThrottle::new(clock.clone());
+        restarted.restore(&saved.expect("the bearer state"));
+        assert_eq!(restarted.blocked_for("203.0.113.9"), Some(15 * 60));
+        let doc: Value = serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        assert_eq!(doc["v"], 1);
+        // What a later step put in the file is kept when this one writes.
+        let mut with_more = doc.clone();
+        with_more["login"] = serde_json::json!({ "l1": [1, 2, 3] });
+        std::fs::write(&path, with_more.to_string()).unwrap();
+        let (file, _) = ThrottleFile::open(&path);
+        file.save(t.snapshot()).unwrap();
+        let doc: Value = serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        assert_eq!(doc["login"], serde_json::json!({ "l1": [1, 2, 3] }));
+        assert!(doc["bearer"].get("203.0.113.9").is_some());
+        drop(again);
+        // A file of another version is read as empty and never written.
+        let newer = r#"{"v":2,"bearer":{"x":1},"future":true}"#;
+        std::fs::write(&path, newer).unwrap();
+        let (file, saved) = ThrottleFile::open(&path);
+        assert!(saved.is_none());
+        file.save(t.snapshot()).unwrap();
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), newer);
+        // A file that is not JSON is an empty state, and the next save replaces it.
+        std::fs::write(&path, "{ not json").unwrap();
+        let (file, saved) = ThrottleFile::open(&path);
+        assert!(saved.is_none());
+        file.save(t.snapshot()).unwrap();
+        assert!(ThrottleFile::open(&path).1.is_some());
+        // Not an object, no version, a version that is not a number: all empty, none written over a newer one.
+        for text in ["[]", "3", r#"{"bearer":{}}"#, r#"{"v":"1","bearer":{}}"#] {
+            std::fs::write(&path, text).unwrap();
+            let (_, saved) = ThrottleFile::open(&path);
+            assert!(saved.is_none(), "{text}");
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn f9_the_throttle_file_is_private() {
+        use std::os::unix::fs::PermissionsExt as _;
+        let dir = scratch("throttle-file-mode");
+        let path = dir.0.join("throttle.json");
+        let (file, _) = ThrottleFile::open(&path);
+        file.save(serde_json::json!({})).unwrap();
+        let mode = std::fs::metadata(&path).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o600);
     }
 }
