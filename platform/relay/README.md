@@ -176,8 +176,12 @@ could choose its own address. nginx drops them by default (`underscores_in_heade
 
 ## Apache and LiteSpeed: `public/.htaccess`
 
-Not run through Apache in this repository's tests: read it as a starting point and let the doctor judge it on your host. It:
+Run against a real Apache 2.4 (`tests/cases/htaccess.php`, which starts the httpd it finds on a loopback port and skips where there is
+none; 2.2 syntax and LiteSpeed were not run): read it as a starting point and let the doctor judge it on your host. It:
 
+- **grants itself** (`Require all granted`): Apache reads the `.htaccess` of every folder on the way to a file wherever
+  `AllowOverride` covers them, and many hosts set it for all of `/home` or `/var/www`, so the package root's deny-all (below) would
+  otherwise refuse every request to the relay, which is what a real Apache 2.4.65 did before this line was added;
 - turns directory listings off, denies dotfiles and every file type except `.php` and `.html`;
 - passes the `Authorization` header to PHP (`CGIPassAuth On` on Apache 2.4.13 or later, and the `SetEnvIf` / `RewriteRule`
   forms for older stacks). Without it every request is a uniform `401`, which looks like a revoked device;
@@ -186,7 +190,13 @@ Not run through Apache in this repository's tests: read it as a starting point a
 The folder above it carries its own `.htaccess` (and `data/` gets one from the installer) that refuses everything, in Apache 2.4
 syntax (`Require all denied`) and 2.2 syntax (`Order deny,allow` and `Deny from all`), each inside an `IfModule` for the module
 that understands it. It matters only when the document root is wrong, and then only if the server lets `.htaccess` files apply
-(`AllowOverride`). `web.config` does the same on IIS. The doctor tells you which of them held.
+(`AllowOverride`). `web.config` does the same on IIS. The doctor tells you which of them held. On a real Apache 2.4 a site whose
+document root holds the relay folder, and one whose document root is the relay folder, answered 403 to `data/`, `src/`, `bin/`,
+`VERSION`, `INSTALL_ENABLED` and the dotfiles, and `data/` alone was refused where the package root's file was missing (an upload
+that skips dotfiles). The grant in `public/.htaccess` replaces the `Require` rules that were applied to that folder before it (a
+`<Directory>` block of the server's configuration and any `.htaccess` above), which is how Apache lets a folder's rules replace its
+parents'; a site that limits the relay to some addresses says so in a `<Location>` block, which Apache applies after the `.htaccess`
+files.
 
 ## Configuration: `data/config.json`
 
@@ -389,8 +399,10 @@ the operating system chose. It is shut down and deleted when the run ends and ne
 Tests that are about SQLite alone (backup, restore, export) skip themselves there.
 
 Dependency free: nothing to install. The runner enables `sodium` for a run on a PHP that ships it disabled (it never edits
-`php.ini`), works in temporary directories it deletes, starts `php -S` on free loopback ports of its own, and never touches a
-web server's document root, a real data folder or any port that is not its own. `php -S` serves one request at a time on
+`php.ini`), works in temporary directories it deletes, starts `php -S` on free loopback ports of its own (and, for the `.htaccess`
+tests only, an Apache `httpd` with a configuration of its own, bound to `127.0.0.1`, when `OAIY_TEST_HTTPD` names one or WAMP's is
+found; those tests skip otherwise), and never touches a web server's document root, a real data folder or any port that is not
+its own. `php -S` serves one request at a time on
 Windows, so tests that need overlapping requests start several servers on one data folder. The test clock is a PHP constant
 that only `tests/prepend.php` defines; the release zip leaves `tests/` out.
 
@@ -422,9 +434,11 @@ design's vectors and against FormLogic's own known answers, the sealed tokens of
 - The framed stream was tested against `php -S` on Windows only. How a real host's web server, PHP-FPM, LiteSpeed or a CDN buffers
   it, and how they report a client that hung up, was not tried: the calibration's probe is what decides, on your host.
 
-- `public/.htaccess` was **not** run through Apache or LiteSpeed. The nginx snippet above was **not** run through nginx or PHP-FPM.
-  Both are written from the design and from general knowledge of those servers; the doctor's exposure and Authorization probes
-  are the check to use on your host.
+- `public/.htaccess` and the deny-all files were run through a real Apache 2.4.65 (WAMP's, static files, on Windows: which files are
+  refused and served under each layout, `tests/cases/htaccess.php`), but **not** with PHP behind it (the rewrite to `index.php` and
+  the `Authorization` pass-through), not on Apache 2.2 and not on LiteSpeed. The nginx snippet above was **not** run through nginx or
+  PHP-FPM. Those are written from the design and from general knowledge of those servers; the doctor's exposure and Authorization
+  probes are the check to use on your host.
 - No real shared host, cPanel account, VPS, CDN or proxy was tried.
 - File modes (0600 and 0700) and the ownership checks are only asserted on POSIX systems, and this was developed on Windows,
   where the tests skip them. The `/proc/self/mountinfo` reader is tested with synthetic text, not on an NFS mount.

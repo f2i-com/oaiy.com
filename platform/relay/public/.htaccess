@@ -1,5 +1,16 @@
 # OAIY Relay. The document root of the site must be THIS folder (public/); data/, src/ and bin/ live above it.
-# Not run through Apache in this repository's tests: read it as a starting point and check it with `php bin/doctor.php --url=...`.
+# Run against Apache 2.4 by tests/cases/htaccess.php (2.2 syntax and LiteSpeed are not): check a host with `php bin/doctor.php --url=...`.
+
+# This folder is the one that is served. The package root above it carries a deny-all .htaccess (for a document root that is
+# wrong), and Apache reads the .htaccess of every folder on the way to a file wherever AllowOverride covers them, as it does on
+# hosts that set it for all of /home or /var/www: without this grant that file refuses every request to the relay.
+<IfModule mod_authz_core.c>
+    Require all granted
+</IfModule>
+<IfModule !mod_authz_core.c>
+    Order allow,deny
+    Allow from all
+</IfModule>
 
 Options -Indexes
 DirectoryIndex index.php
