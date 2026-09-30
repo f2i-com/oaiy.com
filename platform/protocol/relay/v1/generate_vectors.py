@@ -445,6 +445,8 @@ def build() -> dict:
              "output": '{"a":9007199254740991,"b":9223372036854775807,"c":18446744073709551615,"d":-9223372036854775808,"e":0}'},
             {"label": "empty containers, booleans and null", "input": '{"c":null,"b":true,"a":[],"d":{},"e":false}',
              "output": '{"a":[],"b":true,"c":null,"d":{},"e":false}'},
+            {"label": "0 and negative integers are accepted; only the spelling -0 is not", "input": '{"a":0,"b":-1,"c":-10,"d":10}',
+             "output": '{"a":0,"b":-1,"c":-10,"d":10}'},
         ],
         "refused": [
             {"label": "a fraction", "input": '{"n":0.5}'},
@@ -453,6 +455,8 @@ def build() -> dict:
             {"label": "a float nested in an array", "input": '{"a":[1,2,3.5]}'},
             {"label": "an integer above the unsigned 64-bit range", "input": '{"n":18446744073709551616}'},
             {"label": "an integer below the signed 64-bit range", "input": '{"n":-9223372036854775809}'},
+            {"label": "-0 is not a canonical spelling of the integer 0 (every integer has exactly one spelling)", "input": '{"n":-0}'},
+            {"label": "-0 nested in an array", "input": '{"a":[1,-0,3]}'},
         ],
     }
     good_tok = [token, "oaiyrt1." + b64u(b"\xff" * 8) + "." + b64u(b"\x00" * 32), "oaiyrt1." + b64u(bytes(range(8))) + "." + b64u(bytes(range(32)))]
@@ -508,6 +512,34 @@ def build() -> dict:
     sas_samples = [sas12] + [crock(int.from_bytes(hashlib.sha256(b"sas" + bytes([i])).digest()[:8], "big") >> 4, 60) for i in range(1, 8)]
     extras["sasCheck"] = {"samples": [{"sas12": x, "check": sas_check_for(x)} for x in sas_samples],
                           "algorithm": "ALPHABET[SHA-256(\"oaiy/pairing/3/sas-check\" || 0x00 || the 12 characters as ASCII)[0] >> 3]"}
+
+    # The SAS input carries the RAW 16 bytes of pid. The prose `info = "oaiy/pairing/3/sas" || 0x00 || pid` can be read as the
+    # 22-character b64u text of pid (the form pid has everywhere else), which gives a different, wrong SAS. These are the wrong
+    # readings, recorded so that an implementation can show that it does not make them.
+    def sas_from_info(info: bytes) -> dict:
+        raw = hkdf(dpub + ppub, nonce, info, 8)
+        s12 = crock(int.from_bytes(raw, "big") >> 4, 60)
+        return {"infoHex": info.hex(), "infoLength": len(info), "sasRawHex": raw.hex(), "sas12": s12,
+                "sasDisplay": s12[:4] + "-" + s12[4:8] + "-" + s12[8:] + "-" + sas_check_for(s12)}
+    sas_prefix = b"oaiy/pairing/3/sas\x00"
+    sas_right = sas_from_info(sas_prefix + pid)
+    sas_wrong_b64u = sas_from_info(sas_prefix + b64u(pid).encode())
+    sas_wrong_hex = sas_from_info(sas_prefix + pid.hex().encode())
+    assert sas_right["sasRawHex"] == sas_raw.hex() and sas_right["sasDisplay"] == sas_disp and sas_right["infoLength"] == 35
+    assert sas_wrong_b64u["sasRawHex"] == "24b574fd2e0d1e24" and sas_wrong_b64u["infoLength"] == 41
+    assert sas_wrong_hex["infoLength"] == 51
+    assert len({sas_right["sasRawHex"], sas_wrong_b64u["sasRawHex"], sas_wrong_hex["sasRawHex"]}) == 3
+    extras["sasNegative"] = {
+        "note": "The inputs are those of A3. The SAS is computed from the RAW 16 bytes of pid. The two wrong readings below are what an implementation gets when it takes pid as text; neither may ever be produced or accepted.",
+        "inputs": {"desktopEndpointPublicHex": dpub.hex(), "phoneEndpointPublicHex": ppub.hex(), "nonceHex": nonce.hex(),
+                   "pidHex": pid.hex(), "pidB64u": b64u(pid)},
+        "algorithm": "sas_raw = HKDF-SHA256(IKM = desktopEndpointPublic || phoneEndpointPublic, salt = nonce, info = \"oaiy/pairing/3/sas\" || 0x00 || PID, L = 8); sas12 = the top 60 bits as 12 Crockford base32 characters",
+        "correct": dict(reading="PID = the 16 raw bytes of pid", **sas_right),
+        "wrong": [
+            dict(reading="PID = the 22 ASCII characters of the b64u text of pid", mustNotProduce=True, **sas_wrong_b64u),
+            dict(reading="PID = the 32 ASCII characters of the lower-case hex of pid", mustNotProduce=True, **sas_wrong_hex),
+        ],
+    }
     extras["errors"] = [
         {"status": 400, "code": "invalid_request", "retry": "no"}, {"status": 400, "code": "invalid_item", "retry": "no"},
         {"status": 401, "code": "unauthorized", "retry": "no"}, {"status": 401, "code": "revoked", "retry": "no"},

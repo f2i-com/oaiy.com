@@ -138,6 +138,7 @@ function canonNode(n) {
     case 'b': return n.v ? 'true' : 'false';
     case 'n': {
       if (!/^-?(0|[1-9][0-9]*)$/.test(n.v)) throw new Refused('float ' + n.v);
+      if (n.v === '-0') throw new Refused('negative zero');
       const b = BigInt(n.v);
       if (b < -(2n ** 63n) || b > 2n ** 64n - 1n) throw new Refused('range ' + n.v);
       return b.toString();
@@ -542,6 +543,28 @@ function infoProof(seed, bodyBytes, nonceB64u, time) {
   };
   for (const n of x.typedCode.normalise) eq('normalise ' + n.input, norm(n.input), n.output);
   for (const s of x.sasCheck.samples) eq('sas check ' + s.sas12, AL[sha(cat('oaiy/pairing/3/sas-check\0', s.sas12))[0] >> 3], s.check);
+
+  // The SAS input carries the RAW 16 bytes of pid; the two wrong readings (pid as text) must give the recorded, different values.
+  const sn = x.sasNegative;
+  const sasOf = (pidInput) => {
+    const info = cat('oaiy/pairing/3/sas\0', pidInput);
+    const raw = hkdf(Buffer.concat([hex(sn.inputs.desktopEndpointPublicHex), hex(sn.inputs.phoneEndpointPublicHex)]), hex(sn.inputs.nonceHex), info, 8);
+    const s12 = crock(BigInt('0x' + raw.toString('hex')) >> 4n, 60);
+    const c = AL[sha(cat('oaiy/pairing/3/sas-check\0', s12))[0] >> 3];
+    return { infoHex: info.toString('hex'), infoLength: info.length, sasRawHex: raw.toString('hex'), sas12: s12, sasDisplay: s12.slice(0, 4) + '-' + s12.slice(4, 8) + '-' + s12.slice(8) + '-' + c };
+  };
+  eq('sasNegative inputs are those of A3',
+    [sn.inputs.desktopEndpointPublicHex, sn.inputs.phoneEndpointPublicHex, sn.inputs.nonceHex, sn.inputs.pidHex, sn.inputs.pidB64u],
+    [pub.desktopEndpoint.toString('hex'), pub.phone.toString('hex'), V.A3.inputs.nonceHex, V.A3.expected.pidHex, V.A3.expected.pid]);
+  const rawPid = hex(sn.inputs.pidHex);
+  for (const [entry, input] of [[sn.correct, rawPid], [sn.wrong[0], Buffer.from(sn.inputs.pidB64u, 'ascii')], [sn.wrong[1], Buffer.from(sn.inputs.pidHex, 'ascii')]]) {
+    eq('sasNegative ' + entry.reading, sasOf(input),
+      { infoHex: entry.infoHex, infoLength: entry.infoLength, sasRawHex: entry.sasRawHex, sas12: entry.sas12, sasDisplay: entry.sasDisplay });
+  }
+  eq('sasNegative: the correct reading is the SAS of A3', sn.correct.sasDisplay, V.A3.expected.sasDisplay);
+  truthy('sasNegative: the wrong readings are flagged and give three different values',
+    sn.wrong.length === 2 && sn.wrong.every((w) => w.mustNotProduce === true && w.sasDisplay !== sn.correct.sasDisplay)
+    && new Set([sn.correct.sasRawHex, ...sn.wrong.map((w) => w.sasRawHex)]).size === 3);
 }
 
 console.log(`${checks} checks, ${bad} mismatches`);

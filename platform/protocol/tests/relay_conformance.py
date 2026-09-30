@@ -238,6 +238,11 @@ def canonical_json(text: str) -> str:
     def no_const(s: str):
         raise Refused("constant " + s)
 
+    def int_of(s: str) -> int:
+        if s == "-0":
+            raise Refused("negative zero: not a canonical spelling of 0")
+        return int(s)
+
     def w(v) -> str:
         if v is None:
             return "null"
@@ -255,7 +260,7 @@ def canonical_json(text: str) -> str:
             return "[" + ",".join(w(x) for x in v) + "]"
         return "{" + ",".join(json.dumps(k, ensure_ascii=False) + ":" + w(v[k]) for k in sorted(v, key=lambda k: k.encode())) + "}"
 
-    return w(json.loads(text, parse_float=no_float, parse_constant=no_const))
+    return w(json.loads(text, parse_float=no_float, parse_constant=no_const, parse_int=int_of))
 
 
 def is_small_order_x25519(enc: bytes) -> bool:
@@ -715,6 +720,28 @@ for n in ex["typedCode"]["normalise"]:
     vok(f"typed code normalisation of {n['input']!r}", normalise_typed(n["input"]), n["output"])
 for c in ex["sasCheck"]["samples"]:
     vok(f"SAS check character of {c['sas12']}", (sas_check_char(c["sas12"]), sas_ok(c["sas12"] + c["check"])), (c["check"], True))
+
+# The SAS input carries the RAW 16 bytes of pid. Reading pid as its text (b64u or hex) gives other values; those are recorded as
+# negative vectors so that an implementation can show it does not make that mistake.
+sasneg = ex["sasNegative"]
+sni = sasneg["inputs"]
+sn_dpub, sn_ppub, sn_nonce, sn_pid = (bytes.fromhex(sni[k]) for k in ("desktopEndpointPublicHex", "phoneEndpointPublicHex", "nonceHex", "pidHex"))
+
+
+def sas_of_pid_reading(pid_input: bytes) -> tuple:
+    info = b"oaiy/pairing/3/sas\x00" + pid_input
+    raw = _hkdf(sn_dpub + sn_ppub, sn_nonce, info, 8)
+    s12 = crock(int.from_bytes(raw, "big") >> 4, 60)
+    return info.hex(), len(info), raw.hex(), s12, s12[:4] + "-" + s12[4:8] + "-" + s12[8:] + "-" + sas_check_char(s12)
+
+
+vok("SAS negative: the recorded inputs are those of A3", (sn_dpub, sn_ppub, sn_nonce, sn_pid, sni["pidB64u"]), (pub["desktopEndpoint"], pub["phone"], nonce3, pid3, x3["pid"]))
+for entry, pid_input in ((sasneg["correct"], sn_pid), (sasneg["wrong"][0], sni["pidB64u"].encode()), (sasneg["wrong"][1], sn_pid.hex().encode())):
+    vok(f"SAS negative: {entry['reading']}", sas_of_pid_reading(pid_input),
+        (entry["infoHex"], entry["infoLength"], entry["sasRawHex"], entry["sas12"], entry["sasDisplay"]))
+vok("SAS negative: the correct reading is the SAS of A3", sasneg["correct"]["sasDisplay"], x3["sasDisplay"])
+vok("SAS negative: the wrong readings are flagged and give three different values",
+    ([w["mustNotProduce"] for w in sasneg["wrong"]], len({sasneg["correct"]["sasRawHex"]} | {w["sasRawHex"] for w in sasneg["wrong"]})), ([True, True], 3))
 print(f"\n  {recomputed} vector values recomputed in Python")
 
 # ---------------------------------------------------------------------------
@@ -1376,6 +1403,11 @@ rule("canonical form: a float inside an array inside a claim is refused", lambda
 rule("canonical form: NaN is refused", lambda: raises(lambda: canonical_json('{"n":NaN}')))
 rule("canonical form: an integer above 2^64-1 is refused", lambda: raises(lambda: canonical_json('{"n":18446744073709551616}')))
 rule("canonical form: an integer below -2^63 is refused", lambda: raises(lambda: canonical_json('{"n":-9223372036854775809}')))
+rule("canonical form: -0 is refused (every integer has exactly one spelling)", lambda: raises(lambda: canonical_json('{"n":-0}')))
+rule("canonical form: -0 inside an array is refused", lambda: raises(lambda: canonical_json('{"a":[1,-0,3]}')))
+rule("SAS: pid read as its 22-character b64u text (a 41-byte info) does not give the SAS of A3", lambda: sas_of_pid_reading(sni["pidB64u"].encode())[4] != A3["expected"]["sasDisplay"])
+rule("SAS: pid read as its 32-character hex text (a 51-byte info) does not give the SAS of A3", lambda: sas_of_pid_reading(sn_pid.hex().encode())[4] != A3["expected"]["sasDisplay"])
+rule("SAS: only the raw 16 bytes of pid (a 35-byte info) give the SAS of A3", lambda: sas_of_pid_reading(sn_pid)[4] == A3["expected"]["sasDisplay"] and sas_of_pid_reading(sn_pid)[1] == 35)
 rule("hdr: 513 serialised bytes is over the 512 byte cap", lambda: hdr_bytes({"pad": "x" * 503}) == 513 > 512)
 rule("hdr: the serialised size counts UTF-8 bytes, not characters",
      lambda: hdr_bytes({"n": "é" * 300}) > 512 and len(json.dumps({"n": "é" * 300}, ensure_ascii=False)) < 512)
@@ -1455,6 +1487,7 @@ else:
     m = re.search(r"(\d+) checks, (\d+) mismatches", proc.stdout)
     node_total = int(m.group(1)) if m else 0
     ok(f"node re-computation agrees ({node_total} checks)", proc.returncode == 0 and bool(m) and m.group(2) == "0", "\n".join(tail[-8:]) + proc.stderr[-300:])
+    ok("node re-computation ran at least 217 checks (a checker that was silently thinned fails here)", node_total >= 217, str(node_total))
 
 section("vectors.json is what generate_vectors.py writes")
 proc = subprocess.run([sys.executable, str(V1 / "generate_vectors.py"), "--check"], capture_output=True, text=True, encoding="utf-8", timeout=120)
@@ -1481,9 +1514,9 @@ ok("README has a Response shapes section", re.search(r"^## (\d+\. )?Response sha
 
 # ---------------------------------------------------------------------------
 print("\n" + "-" * 60)
-n_vec_neg = len(ex["tokens"]["invalid"]) + len(ex["canonical"]["refused"]) + 2 * len(a12["inputs"]["encodings"])
+n_vec_neg = len(ex["tokens"]["invalid"]) + len(ex["canonical"]["refused"]) + 2 * len(a12["inputs"]["encodings"]) + len(ex["sasNegative"]["wrong"])
 print(f"negative documents: {n_neg_schema} by schema + {n_rules} by reference rule "
-      f"({n_vec_neg} of the rules replay the vectors' invalid tokens, refused numbers and small-order keys) "
+      f"({n_vec_neg} of the rules replay the vectors' invalid tokens, refused numbers, wrong SAS readings and small-order keys) "
       f"= {n_neg_schema + n_rules}")
 print(f"positive documents: {n_pos}; vector values recomputed in Python: {recomputed}; node checks: {node_total}")
 print(f"relay protocol conformance: {passed} passed, {len(failures)} failed")

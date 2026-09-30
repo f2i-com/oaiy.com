@@ -615,6 +615,11 @@
      "label": "empty containers, booleans and null",
      "input": "{\"c\":null,\"b\":true,\"a\":[],\"d\":{},\"e\":false}",
      "output": "{\"a\":[],\"b\":true,\"c\":null,\"d\":{},\"e\":false}"
+    },
+    {
+     "label": "0 and negative integers are accepted; only the spelling -0 is not",
+     "input": "{\"a\":0,\"b\":-1,\"c\":-10,\"d\":10}",
+     "output": "{\"a\":0,\"b\":-1,\"c\":-10,\"d\":10}"
     }
    ],
    "refused": [
@@ -641,6 +646,14 @@
     {
      "label": "an integer below the signed 64-bit range",
      "input": "{\"n\":-9223372036854775809}"
+    },
+    {
+     "label": "-0 is not a canonical spelling of the integer 0 (every integer has exactly one spelling)",
+     "input": "{\"n\":-0}"
+    },
+    {
+     "label": "-0 nested in an array",
+     "input": "{\"a\":[1,-0,3]}"
     }
    ]
   },
@@ -835,6 +848,45 @@
     }
    ],
    "algorithm": "ALPHABET[SHA-256(\"oaiy/pairing/3/sas-check\" || 0x00 || the 12 characters as ASCII)[0] >> 3]"
+  },
+  "sasNegative": {
+   "note": "The inputs are those of A3. The SAS is computed from the RAW 16 bytes of pid. The two wrong readings below are what an implementation gets when it takes pid as text; neither may ever be produced or accepted.",
+   "inputs": {
+    "desktopEndpointPublicHex": "fd1724385aa0c75b64fb78cd602fa1d991fdebf76b13c58ed702eac835e9f618",
+    "phoneEndpointPublicHex": "ea4a6c63e29c520abef5507b132ec5f9954776aebebe7b92421eea691446d22c",
+    "nonceHex": "404142434445464748494a4b4c4d4e4f505152535455565758595a5b5c5d5e5f",
+    "pidHex": "6f96247cc713bc96f4835193bf790d35",
+    "pidB64u": "b5YkfMcTvJb0g1GTv3kNNQ"
+   },
+   "algorithm": "sas_raw = HKDF-SHA256(IKM = desktopEndpointPublic || phoneEndpointPublic, salt = nonce, info = \"oaiy/pairing/3/sas\" || 0x00 || PID, L = 8); sas12 = the top 60 bits as 12 Crockford base32 characters",
+   "correct": {
+    "reading": "PID = the 16 raw bytes of pid",
+    "infoHex": "6f6169792f70616972696e672f332f736173006f96247cc713bc96f4835193bf790d35",
+    "infoLength": 35,
+    "sasRawHex": "3563599914bdf7f9",
+    "sas12": "6NHNK68MQQVZ",
+    "sasDisplay": "6NHN-K68M-QQVZ-5"
+   },
+   "wrong": [
+    {
+     "reading": "PID = the 22 ASCII characters of the b64u text of pid",
+     "mustNotProduce": true,
+     "infoHex": "6f6169792f70616972696e672f332f736173006235596b664d6354764a62306731475476336b4e4e51",
+     "infoLength": 41,
+     "sasRawHex": "24b574fd2e0d1e24",
+     "sas12": "4JTQ9Z9E1MF2",
+     "sasDisplay": "4JTQ-9Z9E-1MF2-6"
+    },
+    {
+     "reading": "PID = the 32 ASCII characters of the lower-case hex of pid",
+     "mustNotProduce": true,
+     "infoHex": "6f6169792f70616972696e672f332f736173003666393632343763633731336263393666343833353139336266373930643335",
+     "infoLength": 51,
+     "sasRawHex": "450a6e7283157c37",
+     "sas12": "8M56WWM32NY3",
+     "sasDisplay": "8M56-WWM3-2NY3-6"
+    }
+   ]
   },
   "errors": [
    {
