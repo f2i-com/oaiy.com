@@ -1509,18 +1509,7 @@ pub async fn serve(
     // and exec endpoints are additionally gated by `origin_guard` below, so a
     // random web page the user has open can't issue drive-by POST/DELETE
     // requests against the loopback API.
-    let cors = CorsLayer::new()
-        .allow_origin(Any)
-        .allow_methods([
-            Method::GET,
-            Method::POST,
-            Method::PUT,
-            Method::DELETE,
-            Method::OPTIONS,
-        ])
-        .allow_headers(Any)
-        // The dashboard (another origin) reads /api/modules' ETag to ask again with If-None-Match.
-        .expose_headers([axum::http::header::ETAG]);
+    let cors = cors_layer();
 
     /// Answer Chrome's Private Network Access preflight.
     ///
@@ -1750,6 +1739,26 @@ fn validate_listener_auth(bind_all: bool, token: Option<&str>) -> Result<(), Box
     Ok(())
 }
 
+/// The CORS layer `serve` puts on everything: what a page on another origin (the dashboard at `localhost:17973` or `tauri://`, the Agent, a hosted
+/// web app) may ask of this API. Every method those pages send must be in it, or the browser's preflight fails and the request is never made
+/// (a Messages page that cannot mark a message seen): the test below walks every method the pages' sources send.
+pub(crate) fn cors_layer() -> CorsLayer {
+    CorsLayer::new()
+        .allow_origin(Any)
+        .allow_methods([
+            Method::GET,
+            Method::POST,
+            Method::PUT,
+            // (The Messages page marks a message seen or handled, and the calendar changes an appointment, with PATCH.)
+            Method::PATCH,
+            Method::DELETE,
+            Method::OPTIONS,
+        ])
+        .allow_headers(Any)
+        // The dashboard (another origin) reads /api/modules' ETag to ask again with If-None-Match.
+        .expose_headers([axum::http::header::ETAG])
+}
+
 /// `router` behind the same gate `serve` puts in front of everything, for the
 /// tests of other modules (the control tools' in-process calls go through it).
 #[cfg(test)]
@@ -1954,6 +1963,77 @@ mod tests {
         }
         assert!(!is_restricted_read_path("/api/ringing") && !is_restricted_read_path("/api/messagesx"));
         assert!(!is_privileged_path(&Method::POST, "/api/ringing"));
+    }
+
+    /// Every HTTP method the dashboard's and the Agent's sources send to this API (`method: 'PATCH'`; tests excluded). Read at test time, so a
+    /// verb added to a page later is held to the layer with no edit here.
+    fn methods_the_pages_send() -> std::collections::BTreeMap<String, Vec<String>> {
+        use std::path::{Path, PathBuf};
+        fn walk(dir: &Path, out: &mut Vec<PathBuf>) {
+            let Ok(read) = std::fs::read_dir(dir) else { return };
+            for entry in read.flatten() {
+                let path = entry.path();
+                let name = entry.file_name().to_string_lossy().to_string();
+                if path.is_dir() {
+                    if !matches!(name.as_str(), "node_modules" | "dist" | "target" | "tests" | "__tests__" | "e2e") {
+                        walk(&path, out);
+                    }
+                } else if (name.ends_with(".ts") || name.ends_with(".tsx")) && !name.contains(".test.") && !name.ends_with(".d.ts") {
+                    out.push(path);
+                }
+            }
+        }
+        let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..").join("..");
+        let mut files = Vec::new();
+        // (The dashboard and the Agent. Not the flow UI in `platform/ui`, whose `method` is a variable of a service it probes or a step it runs,
+        // and whose `'HEAD'` is a comparison or a request to some other server.)
+        for pages in ["platform/desktop/src", "app/src"] {
+            walk(&root.join(pages), &mut files);
+        }
+        assert!(files.len() > 20, "the pages' sources were not found under {root:?}: {} files", files.len());
+        let verb = regex::Regex::new(r#"method:\s*['"`](GET|POST|PUT|PATCH|DELETE|HEAD)['"`]"#).unwrap();
+        let mut found: std::collections::BTreeMap<String, Vec<String>> = Default::default();
+        for file in files {
+            let text = std::fs::read_to_string(&file).unwrap_or_default();
+            for cap in verb.captures_iter(&text) {
+                found.entry(cap[1].to_string()).or_default().push(file.strip_prefix(&root).unwrap_or(&file).display().to_string());
+            }
+        }
+        found
+    }
+
+    /// A real preflight, as a browser sends it before a request from another origin, against the layer `serve` uses: what it answers is what
+    /// the browser reads to decide whether the request may be made at all.
+    #[tokio::test]
+    async fn the_cors_layer_lets_every_method_the_pages_send_through_a_real_preflight() {
+        use axum::body::Body;
+        use axum::http::Request;
+        use axum::{routing::any, Router};
+        use tower::ServiceExt;
+        let app = Router::new().fallback(any(|| async { "ok" })).layer(super::cors_layer());
+        let found = methods_the_pages_send();
+        assert!(found.contains_key("POST") && found.contains_key("DELETE"), "the walk found the pages' verbs: {:?}", found.keys().collect::<Vec<_>>());
+        for origin in ["http://localhost:17973", "tauri://localhost", "http://tauri.localhost", "https://app.oaiy.com"] {
+            for (verb, files) in &found {
+                let request = Request::builder()
+                    .method("OPTIONS")
+                    .uri("/api/anything")
+                    .header("Origin", origin)
+                    .header("Access-Control-Request-Method", verb.as_str())
+                    .header("Access-Control-Request-Headers", "content-type,authorization")
+                    .body(Body::empty())
+                    .unwrap();
+                let response = app.clone().oneshot(request).await.unwrap();
+                assert!(response.status().is_success(), "preflight of {verb} from {origin}: {}", response.status());
+                let allowed = response.headers().get("access-control-allow-methods").and_then(|v| v.to_str().ok()).unwrap_or("");
+                let allowed: Vec<&str> = allowed.split(',').map(str::trim).collect();
+                assert!(
+                    allowed.contains(&verb.as_str()) || allowed.contains(&"*"),
+                    "{verb} is sent by {files:?} but the layer allows only {allowed:?}: the browser refuses the request after the preflight"
+                );
+                assert!(response.headers().get("access-control-allow-origin").is_some(), "{origin}");
+            }
+        }
     }
 
     #[test]
