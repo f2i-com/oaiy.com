@@ -10,7 +10,8 @@
 # shipping GUI feature configurations, each on the platform it ships on, and the two
 # crates that hold the vault's keys (oaiy-crypto and oaiy-keystore: the vault-linux and
 # vault-windows lanes, which run format, clippy, the tests as a product is built and
-# with the test-only features, the memory probes in three build configurations, and a
+# with the test-only features, the keystore's tests in a release build (the unsafe keyfile
+# is refused there), the memory probes in three build configurations, and a
 # dependency audit of those two crates).
 # A later commit can never inherit an earlier run's status: the caller
 # passes the revision it is about to build, and every lane checks it out.
@@ -396,6 +397,9 @@ jobs:
         run: |
           cargo test --locked --release -p oaiy-crypto --test zeroize_stack --test zeroize_text --test zeroize
           cargo test --locked --profile vault-probe -p oaiy-crypto --test zeroize_stack
+      # The keystore's tests in a release build, as a product is built: the unsafe keyfile is refused there too (second review, low 2), by the parser and by the environment variable.
+      - name: Keystore tests in a release build (no unsafe keyfile)
+        run: cargo test --locked --release --no-fail-fast -p oaiy-keystore
       # The keystore has a macOS code path (Unix, no provider but the keyfile): it must compile for macOS, which no runner here executes.
       - name: Compile check for macOS
         run: cargo check --locked --target aarch64-apple-darwin -p oaiy-crypto -p oaiy-keystore --all-targets
@@ -454,6 +458,8 @@ jobs:
         run: |
           cargo test --locked --no-fail-fast -p oaiy-crypto -p oaiy-keystore
           cargo test --locked --no-fail-fast -p oaiy-keystore --features unsafe-keyfile
+      - name: Keystore tests in a release build (no unsafe keyfile)
+        run: cargo test --locked --release --no-fail-fast -p oaiy-keystore
       - name: Memory probes (release build, and no optimisation with no assertions)
         run: |
           cargo test --locked --release -p oaiy-crypto --test zeroize_stack --test zeroize_text --test zeroize
