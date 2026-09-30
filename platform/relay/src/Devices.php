@@ -10,8 +10,9 @@ defined('OAIY_RELAY') or exit;
  *
  * Revocation is immediate and complete (section 4.5): the device is marked revoked, its tokens are marked revoked (the
  * rows stay, so the device learns "revoked" instead of a blank 401, and only after its secret verified), its inbox is
- * purged, the items it had already posted to other mailboxes are retired (they are not delivered afterwards), its party
- * mailboxes, slots and push registration go, and any hold it has ends with
+ * purged, the items it had already posted to other mailboxes are retired (they are not delivered afterwards, and that holds
+ * for the frames a phone posted to the plugin, which carry its party rather than its id), its party mailbox, slots and push
+ * registration go, and any hold it has ends with
  * `401 revoked` within 250 ms because a marker file tells the waiting request.
  */
 final class Devices
@@ -84,7 +85,11 @@ final class Devices
                 $ctx->mb->retireSenderInTx($db, $one); // what it already posted to others is not delivered after this
                 $ctx->mb->purgeInTx($db, 'dev:' . $one);
                 if ($row['app_id'] !== null && $row['owner_desktop'] !== null && $row['thumbprint'] !== null) {
-                    $ctx->mb->purgeInTx($db, 'app:' . $row['app_id'] . '@' . $row['owner_desktop'] . '/mobile:' . $row['thumbprint']);
+                    $party = 'mobile:' . $row['thumbprint'];
+                    // The frames a phone posted to the plugin carry its party as their sender, not its device id, so retireSenderInTx did not
+                    // find them; they carry its device id as their subject. They must not be delivered after the revocation either.
+                    $ctx->mb->retireSubjectFromInTx($db, Party::mailbox((string)$row['app_id'], (string)$row['owner_desktop'], 'plugin'), $one);
+                    $ctx->mb->purgeInTx($db, Party::mailbox((string)$row['app_id'], (string)$row['owner_desktop'], $party));
                 }
                 $db->exec('DELETE FROM slots WHERE dev = ?', [$one]);
                 $ids[] = $one;

@@ -210,9 +210,30 @@ final class Mailbox
         sort($boxes, SORT_STRING);
         $n = 0;
         foreach ($boxes as $box) {
-            $n += $this->retireInTx($db, $box, 'sender = ?', [$sender], 'UPDATE items SET body = NULL, state = 3 WHERE mailbox = ? AND state IN (0, 1) AND sender = ?', [$box, $sender]);
+            $n += $this->retireSenderFromInTx($db, $box, $sender);
         }
         return $n;
+    }
+
+    /**
+     * Retire the live items one sender posted to ONE mailbox, with the same locking and counter fix as every retirement. Call inside write().
+     * @return int the number of items retired
+     */
+    public function retireSenderFromInTx(Db $db, string $mailbox, string $sender): int
+    {
+        return $this->retireInTx($db, $mailbox, 'sender = ?', [$sender], 'UPDATE items SET body = NULL, state = 3 WHERE mailbox = ? AND state IN (0, 1) AND sender = ?', [$mailbox, $sender]);
+    }
+
+    /**
+     * Retire the live items posted to ONE mailbox under one admission subject. The Aokie frames carry the party (`plugin`,
+     * `mobile:<thumbprint>`) as their sender, which is not a device id, so a revocation cannot find them by sender; the subject is
+     * the device the admission stood for, and it is exact: a phone that pairs again with the same key has a new device, and the
+     * frames of its old device go with the old one while the new one's stay. Call inside write().
+     * @return int the number of items retired
+     */
+    public function retireSubjectFromInTx(Db $db, string $mailbox, string $subjectId): int
+    {
+        return $this->retireInTx($db, $mailbox, 'subject_id = ?', [$subjectId], 'UPDATE items SET body = NULL, state = 3 WHERE mailbox = ? AND state IN (0, 1) AND subject_id = ?', [$mailbox, $subjectId]);
     }
 
     /** Record that these items were returned to a consumer. Call inside write(). @param list<int> $seqs */

@@ -199,6 +199,48 @@ test('4.14.4 revoking a phone ends its bearer at once: 401 revoked on every rout
     eq(401, $k->mobile($a)['status'], 'and no new admission');
 });
 
+test('4.14.4 revoking a phone retires the frames it had posted to the plugin (they carry its party as their sender, not its id): the plugin is not handed them afterwards, the other phone\'s stay, so do those of a new device with the same key and of another desktop\'s mailbox, and the counters follow', function () {
+    [$k, $a, $b, $plug, $ta, $tb] = aok_pair();
+    $k2 = $k->second();
+    $db = $k->r->ctx()->db;
+    $ctx = $k->r->ctx();
+    eq(200, $k->send($ta, 'plugin', [['n' => 1], ['n' => 2]])['status']);
+    eq(200, $k->send($tb, 'plugin', [['n' => 3]])['status']);
+    eq(200, $k->send($plug, 'mobile:' . $k->thumb($a), [['n' => 4]])['status']);
+    // The same phone key is a party in another desktop's mailbox too (one phone paired with two desktops): that one stays.
+    $elsewhere = \Oaiy\Relay\Party::mailbox($k2->app, $k2->desk->id, 'plugin');
+    \Oaiy\Relay\Party::append($ctx, $elsewhere, 'mobile:' . $k->thumb($a), $a->id, ['state_read'], ['{"n":5}'], false);
+    // The same key under another device id (the phone paired again: a new device): its frame is not the revoked device's.
+    \Oaiy\Relay\Party::append($ctx, \Oaiy\Relay\Party::mailbox($k->app, $k->desk->id, 'plugin'), 'mobile:' . $k->thumb($a), 'dev-' . B64::enc(random_bytes(16)), ['state_read'], ['{"n":6}'], false);
+    eq([1, 2, 3, 4], array_column($k->read($plug, 0)['json']['frames'], 'seq'));
+    Devices::revoke($ctx, $a->id);
+    $after = $k->read($plug, 0);
+    eq(200, $after['status']);
+    eq([3, 4], array_column($after['json']['frames'], 'seq'), 'only the other phone\'s frame and the new device\'s are left for the plugin');
+    eq(['mobile:' . $k->thumb($b), 'mobile:' . $k->thumb($a)], array_column($after['json']['frames'], 'from'));
+    $box = \Oaiy\Relay\Party::mailbox($k->app, $k->desk->id, 'plugin');
+    $row = $db->one('SELECT live_items, live_bytes, next_seq FROM mailboxes WHERE id = ?', [$box]);
+    eq([2, 2 * strlen('{"n":3}'), 5], [(int)$row['live_items'], (int)$row['live_bytes'], (int)$row['next_seq']], 'the counters were fixed, the sequence goes on');
+    eq(1, (int)$db->val('SELECT live_items FROM mailboxes WHERE id = ?', [$elsewhere]), 'the other desktop\'s mailbox keeps its frame');
+    eq(1, (int)$db->val('SELECT COUNT(*) FROM items WHERE mailbox = ? AND state IN (0, 1)', [$elsewhere]));
+    eq(0, (int)$db->val('SELECT COUNT(*) FROM mailboxes WHERE id = ?', [\Oaiy\Relay\Party::mailbox($k->app, $k->desk->id, 'mobile:' . $k->thumb($a))]), 'its own mailbox is gone');
+    // Revoking it again changes nothing (and the runner recounts every mailbox when this test ends).
+    eq([], Devices::revoke($ctx, $a->id));
+});
+
+test('4.14.4 a phone the desktop\'s roster push removes is revoked with the same effect: the frames it had already posted are not delivered to the plugin', function () {
+    [$k, $a, $b, $plug, $ta, $tb] = aok_pair();
+    eq(200, $k->send($ta, 'plugin', [['n' => 1], ['n' => 2]])['status']);
+    eq(200, $k->send($tb, 'plugin', [['n' => 3]])['status']);
+    $res = $k->pushRoster([$b], 2);
+    eq(200, $res['status'], $res['body']);
+    eq([$a->id], $res['json']['revoked']);
+    $after = $k->read($plug, 0);
+    eq([3], array_column($after['json']['frames'], 'seq'));
+    $row = $k->r->ctx()->db->one('SELECT live_items, live_bytes FROM mailboxes WHERE id = ?', [\Oaiy\Relay\Party::mailbox($k->app, $k->desk->id, 'plugin')]);
+    eq([1, strlen('{"n":3}')], [(int)$row['live_items'], (int)$row['live_bytes']]);
+});
+
 test('4.14.4 revoking the desktop ends the plugin\'s bearer and, with or without the cascade, every phone\'s: 401 revoked', function () {
     foreach ([true, false] as $cascade) {
         [$k, $a, $b, $plug, $ta] = aok_pair();
