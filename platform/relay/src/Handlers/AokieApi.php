@@ -94,6 +94,10 @@ final class AokieApi
                     throw ApiError::make('invalid_request');
                 }
             }
+            // A bare -0 is the same kind of change: PHP reads it as the integer 0 and it would be stored as `0` (Interpretation 23 refuses it).
+            if (strpos($req->body, '-0') !== false && Json::hasNegativeZero($req->body)) {
+                throw ApiError::make('invalid_request');
+            }
             @ini_set('serialize_precision', '-1'); // the shortest text that reads back the same float, whatever the host's php.ini says
             $to = $body->to ?? null;
             if (!Party::isParty($to)) {

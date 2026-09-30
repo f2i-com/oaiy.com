@@ -469,6 +469,8 @@ test('4.14.4 a malformed frames request is a plain 400 invalid_request and nothi
         'a lone surrogate' => '{"to":"plugin","frames":[{"a":"\ud800"}]}',
         'an integer past 64 bits' => '{"to":"plugin","frames":[{"n":18446744073709551616}]}', 'another one' => '{"to":"plugin","frames":[{"n":12345678901234567890}]}',
         'a number too large for a float' => '{"to":"plugin","frames":[{"n":1e999}]}', 'a property name with a NUL' => '{"to":"plugin","frames":[{"\u0000a":1}]}',
+        'a bare -0 (it would be stored as 0, Interpretation 23)' => '{"to":"plugin","frames":[{"n":-0}]}', 'a bare -0 in a list' => '{"to":"plugin","frames":[{"n":[1,-0,2]}]}',
+        'a bare -0 last in its frame' => '{"to":"plugin","frames":[{},{"n":{"m":-0}}]}', 'a bare -0 in the envelope' => '{"to":"plugin","frames":[{}],"x":-0}',
     ];
     foreach ($bad as $label => $raw) {
         $res = $k->call($ta, 'POST', 'frames', $raw, [], [], ['REMOTE_ADDR' => aok_ip()]);
@@ -511,7 +513,7 @@ test('4.14.4 a frame comes back as it went in: {} stays an object, 64-bit intege
         '{}', '{"a":{},"b":[],"c":[{}],"d":[[]]}', '{"n":9223372036854775807,"m":-9223372036854775808,"z":0}',
         '{"u":"héllo 😀 日本語","s":"a/b/c","q":"say \"hi\"\n","t":"tab\there"}',
         '{"z":1,"a":2,"m":3}', '{"0":"a","1":"b"}', '{"":"empty key"}', '{"f":0.1,"g":1.5,"h":1.0,"i":-2.5e-7,"j":1e21}', '{"nested":{"deep":{"deeper":{"x":[1,2,{"y":null}]}}},"t":true,"f":false,"n":null}',
-        '{"big":"12345678901234567890"}',
+        '{"big":"12345678901234567890"}', '{"s":"-0","f":-0.5,"g":-0.0,"h":-10,"i":"a-0b"}', // what merely looks like a bare -0 is not one
     ];
     eq(200, $k->send($ta, 'plugin', $frames)['status']);
     $res = $k->read($plug);
@@ -521,6 +523,7 @@ test('4.14.4 a frame comes back as it went in: {} stays an object, 64-bit intege
         '"frame":{}', '"frame":{"a":{},"b":[],"c":[{}],"d":[[]]}', '"frame":{"n":9223372036854775807,"m":-9223372036854775808,"z":0}',
         '"frame":{"u":"héllo 😀 日本語","s":"a/b/c","q":"say \"hi\"\n","t":"tab\there"}', '"frame":{"z":1,"a":2,"m":3}', '"frame":{"0":"a","1":"b"}', '"frame":{"":"empty key"}',
         '"frame":{"f":0.1,"g":1.5,"h":1.0,"i":-2.5e-7,"j":1.0e+21}', '"frame":{"nested":{"deep":{"deeper":{"x":[1,2,{"y":null}]}}},"t":true,"f":false,"n":null}', '"frame":{"big":"12345678901234567890"}',
+        '"frame":{"s":"-0","f":-0.5,"g":-0.0,"h":-10,"i":"a-0b"}',
     ] as $want) {
         contains($want, $body);
     }
