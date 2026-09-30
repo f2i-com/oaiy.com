@@ -151,6 +151,13 @@ impl KeyDir {
         self.root.join(name)
     }
 
+    /// Test hook: points the path that is compared with the handle at another folder, as a junction above the folder that was re-pointed would (which cannot be done to a
+    /// folder that is held and has no junction on its path, and this is what the open refuses).
+    #[cfg(test)]
+    pub(crate) fn point_the_path_at(&mut self, path: &Path) {
+        self.path = path.to_path_buf();
+    }
+
     /// Opens the path afresh and compares what it leads to with what is held: the same volume and file index, and a folder that is not a reparse point.
     fn path_leads_here(&self) -> Result<(), KeyError> {
         let shown = self.path.display().to_string();

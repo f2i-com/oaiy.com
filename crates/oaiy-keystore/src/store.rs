@@ -643,6 +643,37 @@ mod tests {
         assert_eq!(&**got, b"the new value");
     }
 
+    /// M-1 at the level of the store: a path that leads to another tree now (here pointed there by the test hook, the way a re-pointed junction above the folder would: the open
+    /// refuses a path with a junction on it, so that cannot be done to a store that is open) makes **every** operation an error. Not `None` for a key that exists in the held
+    /// folder, not the other tree's value, not a write into either, and the same store works again when the path leads back.
+    #[cfg(windows)]
+    #[test]
+    fn a_store_whose_path_leads_elsewhere_answers_with_errors_never_none_and_never_the_other_trees_value() {
+        let scratch = Scratch::new("elsewhere");
+        let (keys, decoy) = (scratch.0.join("a").join("keys"), scratch.0.join("b").join("keys"));
+        let mut store = FileStore::open(&keys, KeyfileCodec).unwrap();
+        let n = name("vault.pins");
+        store.put(&n, b"the real value").unwrap();
+        {
+            let other = FileStore::open(&decoy, KeyfileCodec).unwrap();
+            other.put(&n, b"the other tree's value").unwrap();
+        }
+        let before = (files(&keys), files(&decoy));
+
+        store.dir.point_the_path_at(&decoy);
+        let is_the_path = |error: KeyError| matches!(&error, KeyError::Io { op: "inspect the keys directory", source } if source.to_string().contains("replaced or moved"));
+        assert!(is_the_path(store.get(&n).unwrap_err()), "get: not None and not the other tree's value");
+        assert!(is_the_path(store.get(&name("never.stored")).unwrap_err()), "get of a name nobody has: still an error, not None");
+        assert!(is_the_path(store.put(&n, b"a new value").unwrap_err()), "put");
+        assert!(is_the_path(store.delete(&n).unwrap_err()), "delete");
+        assert!(is_the_path(store.list("").unwrap_err()), "list");
+        assert_eq!((files(&keys), files(&decoy)), before, "nothing was written, removed or made in either tree");
+
+        store.dir.point_the_path_at(&keys);
+        assert_eq!(&**store.get(&n).unwrap().unwrap(), b"the real value", "the same store, once the path leads back");
+        assert!(decoy.join("vault.pins.kf").exists(), "and the other tree still has its own file");
+    }
+
     /// H-1 through the real `put`, at the point that matters, on every platform (the review's two-process test is a weak guard: the lock-less store gave one false `None` in about
     /// 2.73 million reads, and the locked store none in 2.0 million, which proves little; this is the guard). The writer is paused **inside its locked rename step**: it holds the
     /// exclusive lock, the temporary file is verified, and the old file has just been taken away, which is the moment that a rename over an existing file leaves on Windows
