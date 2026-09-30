@@ -21,7 +21,7 @@
 //! request body buffers and `serde_json`'s intermediate strings are not under this code's control.
 
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
 use axum::body::Body;
@@ -196,6 +196,9 @@ pub struct LoginState {
     /// One write of `owner.json` at a time, from the owner as it is when the write starts: a slow write of an older
     /// owner can never land after a newer one.
     owner_write: Mutex<()>,
+    /// Which password the owner has: one more with every password that is set (a setup, a change, a reset). A
+    /// verification is made against a snapshot and carries its generation to the point where it would make a session.
+    generation: AtomicU64,
     pub(crate) setup: SetupCode,
     pub(crate) throttle: Arc<LoginThrottle>,
     anon: Arc<AnonLane>,
@@ -249,6 +252,7 @@ pub fn enable(
         last_owner_flush: Mutex::new(opts.clock.now_ms()),
         owner_gate: tokio::sync::Mutex::new(()),
         owner_write: Mutex::new(()),
+        generation: AtomicU64::new(0),
         setup,
         throttle,
         anon,
@@ -541,11 +545,28 @@ impl LoginState {
 
     // ---- the owner file --------------------------------------------------------------------
 
-    /// The stored password and the known devices, if an owner exists.
-    fn owner_snapshot(&self) -> Option<(String, Vec<owner::Device>)> {
-        self.owner_lock()
-            .as_ref()
-            .map(|o| (o.password.clone(), o.devices.clone()))
+    /// The stored password, the known devices and which password it is, if an owner exists. Taken as one, under the
+    /// owner's lock, so that the hash and its generation cannot disagree.
+    fn owner_snapshot(&self) -> Option<OwnerView> {
+        let owner = self.owner_lock();
+        owner.as_ref().map(|o| OwnerView {
+            hash: o.password.clone(),
+            devices: o.devices.clone(),
+            generation: self.generation.load(Ordering::SeqCst),
+        })
+    }
+
+    /// Take the owner gate if the password is still the one that was verified (`generation`, from the snapshot the
+    /// verification was made against), and refuse as a wrong password does if it is not: a password changed while a
+    /// login was verifying the old one leaves the login nothing to make. What the login makes (a session, a device)
+    /// is made while the gate is held, so a change cannot fall between the check and the making: it either comes
+    /// first and this is refused, or comes after and revokes what was made.
+    async fn unchanged(&self, generation: u64) -> Result<Fresh<'_>, Denial> {
+        let gate = self.owner_gate.lock().await;
+        if self.generation.load(Ordering::SeqCst) != generation {
+            return Err(invalid_credentials());
+        }
+        Ok(Fresh(gate))
     }
 
     /// Write the owner as it is in memory, for what may fail without failing the request (a device's use, a
@@ -589,7 +610,7 @@ impl LoginState {
     fn replace_owner(&self, doc: OwnerDoc) -> std::io::Result<()> {
         let _one_at_a_time = self.owner_write.lock().unwrap_or_else(|e| e.into_inner());
         owner::write(self.writer.as_ref(), &self.auth_dir, &doc)?;
-        *self.owner_lock() = Some(doc);
+        self.put_owner(doc);
         Ok(())
     }
 
@@ -597,8 +618,16 @@ impl LoginState {
     fn create_owner(&self, doc: OwnerDoc) -> Result<(), CreateError> {
         let _one_at_a_time = self.owner_write.lock().unwrap_or_else(|e| e.into_inner());
         owner::create_exclusive(self.writer.as_ref(), &self.auth_dir, &doc)?;
-        *self.owner_lock() = Some(doc);
+        self.put_owner(doc);
         Ok(())
+    }
+
+    /// The owner in memory is this one, and it is another password than the one before: what was verified against
+    /// the old one (`generation`) is no longer the owner's password.
+    fn put_owner(&self, doc: OwnerDoc) {
+        let mut owner = self.owner_lock();
+        *owner = Some(doc);
+        self.generation.fetch_add(1, Ordering::SeqCst);
     }
 
     /// Write the owner if a use changed it and a minute has passed (or `force`).
@@ -761,6 +790,18 @@ impl LoginState {
 
     // ---- what a good login makes -------------------------------------------------------------
 
+    /// The session of a login (a setup is one): elevated, made only with the proof that the password it verified is
+    /// still the owner's.
+    fn open_login_session(
+        &self,
+        _fresh: &Fresh<'_>,
+        pre: &Prelude,
+        remember: bool,
+        device_cookie: Option<String>,
+    ) -> Result<(Value, Vec<String>, Actor), Denial> {
+        self.open_session(pre, remember, true, device_cookie)
+    }
+
     /// A session for the owner, elevated, with its cookie; the body, the cookies to set and the actor.
     fn open_session(
         &self,
@@ -802,7 +843,7 @@ impl LoginState {
 
     /// A device for the browser that just proved the password: kept in the owner file when it can be written and in
     /// memory always. The cookie value.
-    fn new_device(&self, ip: &str) -> Option<String> {
+    fn new_device(&self, _fresh: &Fresh<'_>, ip: &str) -> Option<String> {
         let mut fill = |buf: &mut [u8]| (self.random)(buf);
         let made = device::make(self.now(), ip, &mut fill).ok()?;
         {
@@ -816,7 +857,7 @@ impl LoginState {
         Some(made.token)
     }
 
-    fn touch_device(&self, id: &str, ip: &str) {
+    fn touch_device(&self, _fresh: &Fresh<'_>, id: &str, ip: &str) {
         let now = self.now();
         if let Some(doc) = self.owner_lock().as_mut() {
             device::touch(&mut doc.devices, id, now, ip);
@@ -849,7 +890,7 @@ impl LoginState {
     ) -> Result<Response, Denial> {
         let pre = self.prelude(info, &headers)?;
         let req: LoginBody = read_json(&headers, body).await?;
-        let Some((stored, devices)) = self.owner_snapshot() else {
+        let Some(view) = self.owner_snapshot() else {
             return Err(denial(
                 StatusCode::CONFLICT,
                 "setup_required",
@@ -859,7 +900,7 @@ impl LoginState {
         // The lane: a valid device cookie is the known-device lane; anything else (no cookie, an unknown id, a
         // wrong secret, a cookie of another kind) is the anonymous lane, all alike.
         let device_id = match cookie::find(&headers, &pre.ch.device_cookie()) {
-            Lookup::One(v) => device::verify(&devices, &v).map(|d| d.id.clone()),
+            Lookup::One(v) => device::verify(&view.devices, &v).map(|d| d.id.clone()),
             _ => None,
         };
         let lane = match &device_id {
@@ -875,7 +916,7 @@ impl LoginState {
             self.verified(
                 permit,
                 password.clone(),
-                stored,
+                view.hash.clone(),
                 move |st, verdict| match verdict {
                     Verdict::Mismatch => st.failed(&lane, &info),
                     Verdict::Match { .. } => st.succeeded(&lane),
@@ -887,18 +928,22 @@ impl LoginState {
         match verdict {
             Verdict::Mismatch => Err(invalid_credentials()),
             Verdict::Match { rehash } => {
+                // The session and the device are made only if the password is still the one that was verified, and
+                // while the gate is held: a password changed since is refused as a wrong one.
+                let (body, cookies, actor) = {
+                    let fresh = self.unchanged(view.generation).await?;
+                    let device_cookie = match &lane {
+                        Lane::Device(id) => {
+                            self.touch_device(&fresh, id, &pre.info.client_ip);
+                            None
+                        }
+                        Lane::Anonymous(_) => self.new_device(&fresh, &pre.info.client_ip),
+                    };
+                    self.open_login_session(&fresh, &pre, req.remember, device_cookie)?
+                };
                 if rehash {
                     self.rehash(&password).await;
                 }
-                let device_cookie = match &lane {
-                    Lane::Device(id) => {
-                        self.touch_device(id, &pre.info.client_ip);
-                        None
-                    }
-                    Lane::Anonymous(_) => self.new_device(&pre.info.client_ip),
-                };
-                let (body, cookies, actor) =
-                    self.open_session(&pre, req.remember, true, device_cookie)?;
                 self.critical(
                     "login.ok",
                     Some(&actor),
@@ -965,7 +1010,7 @@ impl LoginState {
         drop(permit);
         let phc = phc.map_err(hash_denial)?;
 
-        let _gate = self.owner_gate.lock().await;
+        let fresh = Fresh(self.owner_gate.lock().await);
         if self.owner_lock().is_some() {
             return Err(already_configured());
         }
@@ -990,8 +1035,8 @@ impl LoginState {
         self.setup.consume();
         self.throttle.address_succeeded(&pre.info.client_key);
         // Setup is a login: a session, elevated, and the browser's device.
-        let device_cookie = self.new_device(&pre.info.client_ip);
-        let (body, cookies, actor) = self.open_session(&pre, false, true, device_cookie)?;
+        let device_cookie = self.new_device(&fresh, &pre.info.client_ip);
+        let (body, cookies, actor) = self.open_login_session(&fresh, &pre, false, device_cookie)?;
         self.critical("setup.ok", Some(&actor), &pre.ctx(), json!({}));
         Ok(json_reply(StatusCode::CREATED, body, &cookies))
     }
@@ -1128,7 +1173,7 @@ impl LoginState {
             ));
         }
         let permit = self.session_lane_enter(&principal).await?;
-        let Some((stored, _)) = self.owner_snapshot() else {
+        let Some(view) = self.owner_snapshot() else {
             return Err(denial(
                 StatusCode::CONFLICT,
                 "setup_required",
@@ -1141,7 +1186,7 @@ impl LoginState {
             self.verified(
                 Permit::Reserved(permit),
                 policy::normalise(&req.password.0),
-                stored,
+                view.hash,
                 move |st, verdict| match verdict {
                     Verdict::Mismatch => st.session_wrong(&who, &info, "elevate"),
                     Verdict::Match { .. } => st.session_lane.right(&who.id),
@@ -1178,8 +1223,7 @@ impl LoginState {
     ) -> Result<Response, Denial> {
         let req: PasswordBody = read_json(&headers, body).await?;
         let permit = self.session_lane_enter(&principal).await?;
-        let _gate = self.owner_gate.lock().await;
-        let Some((stored, devices)) = self.owner_snapshot() else {
+        let Some(view) = self.owner_snapshot() else {
             return Err(denial(
                 StatusCode::CONFLICT,
                 "setup_required",
@@ -1192,7 +1236,7 @@ impl LoginState {
             self.verified(
                 Permit::Reserved(permit),
                 policy::normalise(&req.current.0),
-                stored,
+                view.hash,
                 move |st, verdict| match verdict {
                     Verdict::Mismatch => st.session_wrong(&who, &info, "password"),
                     Verdict::Match { .. } => st.session_lane.right(&who.id),
@@ -1208,11 +1252,15 @@ impl LoginState {
             .map_err(|reasons| weak_password(&reasons))?;
         let phc = self.hasher.hash(next).await.map_err(hash_denial)?;
         drop(permit);
+        // The change is made only if the password is still the one that was verified (another change may have been
+        // made while this one was hashing), and while the gate is held.
+        let _gate = self.unchanged(view.generation).await?;
         // Written before anything changes: a disk that will not take it leaves the old password in place.
         let mut doc = self
             .owner_lock()
             .clone()
             .ok_or_else(|| store_unavailable("The owner is gone."))?;
+        let devices: Vec<String> = doc.devices.iter().map(|d| d.id.clone()).collect();
         doc.password = phc;
         doc.password_changed_ms = self.now();
         doc.devices.clear();
@@ -1229,8 +1277,8 @@ impl LoginState {
                 "The new password could not be written: the old one is still in force.",
             ));
         }
-        for d in &devices {
-            self.throttle.forget_device(&d.id);
+        for id in &devices {
+            self.throttle.forget_device(id);
         }
         // Every other session, every derived credential and, on request, the paired tokens.
         let keep = principal.id.clone();
@@ -1249,8 +1297,7 @@ impl LoginState {
                 ua: None,
             },
             json!({ "revoked": revoked.len(), "devices": devices.len(), "tokens": tokens }),
-        );
-        // The browser's device is among those revoked: its cookie is no use, so it is dropped.
+        ); // The browser's device is among those revoked: its cookie is no use, so it is dropped.
         let clear = CookieHost::of(&info).map(|c| c.clear_device());
         Ok(no_content(&clear.into_iter().collect::<Vec<_>>()))
     }
@@ -1605,6 +1652,17 @@ fn hash_denial(e: HashError) -> Denial {
         ),
         HashError::Argon2(_) => store_unavailable("The password could not be hashed."),
     }
+}
+
+/// The proof that the owner gate is held and that the password is the one that was verified: what a login makes (a
+/// device, a session) can be made only with it, so that the making cannot be moved out from under the gate.
+struct Fresh<'a>(#[allow(dead_code)] tokio::sync::MutexGuard<'a, ()>);
+
+/// What a verification is made against: the stored hash, the known devices, and which password it is.
+struct OwnerView {
+    hash: String,
+    devices: Vec<owner::Device>,
+    generation: u64,
 }
 
 /// The lane of a login.

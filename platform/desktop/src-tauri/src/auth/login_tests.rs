@@ -3720,3 +3720,102 @@ async fn two_password_changes_at_once_from_the_same_password_make_one_change_and
     }
     assert_eq!(works, 1);
 }
+
+// ==================================== a password change is not outlived by a login in flight ==========
+
+/// A login with `password` from `from`, with a device cookie of no browser: the anonymous lane.
+async fn late_login(e: &Env, password: &str, from: &str) -> Reply {
+    login_as(e, password, from).await
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_login_that_verified_the_old_password_does_not_outlive_the_password_change() {
+    let e = Arc::new(build(Build {
+        hold: Duration::from_millis(300),
+        ..Build::default()
+    }));
+    let owner = make_owner(&e, PASSWORD).await;
+    let b = browser_from(&e, &owner);
+    let (e1, session, csrf) = (e.clone(), b.session.clone(), b.csrf.clone());
+    let change = tokio::spawn(async move {
+        let browser = Browser {
+            session,
+            csrf,
+            device: None,
+        };
+        go(
+            &e1,
+            as_page(&e1, &browser, Method::POST, "/api/auth/password")
+                .json(json!({ "current": PASSWORD, "next": NEW_PASSWORD })),
+        )
+        .await
+        .status
+    });
+    // The change verifies the current password and then hashes the new one (300 ms each) and is written at about
+    // 600 ms; a login with the old password starts at 450 ms, reads the old hash and verifies it (300 ms), so it
+    // finishes at 750 ms, after the change is written.
+    tokio::time::sleep(Duration::from_millis(450)).await;
+    let e2 = e.clone();
+    let late = tokio::spawn(async move { late_login(&e2, PASSWORD, "198.51.100.44").await });
+    assert_eq!(change.await.unwrap(), 204);
+    let late = late.await.unwrap();
+    assert_eq!(
+        (late.status, late.code().as_deref()),
+        (401, Some("invalid_credentials")),
+        "a login that verified the old password, and finished after the change, is refused like a wrong password: {}",
+        late.text
+    );
+    assert!(
+        late.cookies().is_empty(),
+        "no session and no device cookie: {:?}",
+        late.cookies()
+    );
+    assert_eq!(
+        owner_file(&e)["devices"].as_array().unwrap().len(),
+        0,
+        "and no device was made in the owner file"
+    );
+    // Which password does the owner have, when everything has settled?
+    assert_eq!(login_as(&e, PASSWORD, "198.51.100.45").await.status, 401);
+    assert_eq!(
+        login_as(&e, NEW_PASSWORD, "198.51.100.46").await.status,
+        200
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_login_that_verified_the_old_password_does_not_outlive_a_console_reset() {
+    let e = Arc::new(build(Build {
+        hold: Duration::from_millis(300),
+        ..Build::default()
+    }));
+    make_owner(&e, PASSWORD).await;
+    let con = console_token(&e);
+    let (e1, con1) = (e.clone(), con.clone());
+    let reset = tokio::spawn(async move {
+        go(
+            &e1,
+            req(&e1, Method::POST, "/api/auth/console/reset-password")
+                .bearer(&con1)
+                .json(json!({ "password": NEW_PASSWORD })),
+        )
+        .await
+        .status
+    });
+    // The reset hashes the new password (300 ms) and is written at about 310 ms; the login starts at 200 ms, reads
+    // the old hash, and finishes verifying it (300 ms) at 500 ms, after the reset is written.
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    let late = late_login(&e, PASSWORD, "198.51.100.47").await;
+    assert_eq!(reset.await.unwrap(), 200);
+    assert_eq!(
+        (late.status, late.code().as_deref()),
+        (401, Some("invalid_credentials")),
+        "{}",
+        late.text
+    );
+    assert_eq!(login_as(&e, PASSWORD, "198.51.100.48").await.status, 401);
+    assert_eq!(
+        login_as(&e, NEW_PASSWORD, "198.51.100.49").await.status,
+        200
+    );
+}
