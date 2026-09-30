@@ -513,7 +513,7 @@ jobs:
               // The Node version comes from the runtime itself (an unexported shell variable used to leave it empty).
               toolchain: { rustc: process.argv[1], cargo: process.argv[2], node: process.version },
               // Attested by the release job after the gate passed (see the note in the web job).
-              verification: { status: "unverified", gate: ".github/workflows/ci.yml@" + process.env.REVISION + " (web, cli npm test + typecheck, desktop vitest, cargo test headless + gui, vault crates: cargo test + clippy + memory probes, npm audit high, cargo audit of the vault crates)" },
+              verification: { status: "unverified", gate: ".github/workflows/ci.yml@" + process.env.REVISION + " (web, cli npm test + typecheck, desktop vitest, cargo test headless + gui, the vault-linux and vault-windows lanes, the vault crates: cargo test + clippy + memory probes, npm audit high, cargo audit of the vault crates)" },
               dependencyAudit: { status: "pending", tool: "npm audit --audit-level=high (ci.yml: ui, cli, desktop); cargo audit --deny warnings (ci.yml: vault-linux, the vault crates)", level: "high", revision: process.env.REVISION },
               tests: {
                 cliHttpsShutdown: "node test/cli-http-exit.mjs", stagedHeadlessSmoke: "smoke-server.mjs headless-dist",
