@@ -68,6 +68,8 @@ pub use mode::{AccessMode, ConfigRefusal, Exposure};
 pub use runtime::{build_guard, flush_installed, AccessSettings};
 
 #[cfg(test)]
+mod clientip_crosscheck;
+#[cfg(test)]
 mod conformance;
 #[cfg(test)]
 mod cookie_guard_tests;

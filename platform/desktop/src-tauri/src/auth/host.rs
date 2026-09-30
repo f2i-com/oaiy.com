@@ -716,6 +716,126 @@ mod tests {
         );
     }
 
+    /// Channel classification (design 4.5.4), over every combination of what it reads, against the two rules of the
+    /// design written out on their own: (a) the peer is a trusted proxy, `X-Forwarded-Proto` is `https` and `Host`
+    /// is a configured public host; (b) `Host` is a loopback name, the peer is loopback and no forwarded header is
+    /// present. Anything else is insecure; a trusted proxy that says `http` for a public host is misconfigured.
+    #[test]
+    fn t30_the_channel_is_the_two_rules_of_the_design_over_every_combination_of_its_inputs() {
+        let hosts = [
+            "dash.example.com",
+            "agent.example.com",
+            "other.example.com",
+            "localhost:17972",
+            "127.0.0.1:17972",
+            "[::1]:17972",
+            "dash.oaiy.localhost:17972",
+            "192.168.1.5:17972",
+            "oaiy.localhost",
+        ];
+        let protos = [
+            None,
+            Some("https"),
+            Some("HTTPS"),
+            Some(" https "),
+            Some("http"),
+            Some("HTTP"),
+            Some("gopher"),
+            Some(""),
+            Some("https, http"),
+        ];
+        let mut secure = 0;
+        for loopback_apps in [false, true] {
+            let p = policy(
+                if loopback_apps {
+                    Exposure::Local
+                } else {
+                    Exposure::Proxied
+                },
+                17972,
+                loopback_apps,
+            );
+            // Which of those are configured public hosts on this install: none on a loopback server.
+            let public = |host: &str| p.is_public(&h(host));
+            for host in hosts {
+                for proto in protos {
+                    for trusted in [false, true] {
+                        for peer_loopback in [false, true] {
+                            for forwarded in [false, true] {
+                                let name = h(host);
+                                let want: Result<Channel, ProxyMisconfigured> = if trusted
+                                    && public(host)
+                                {
+                                    match proto.map(|x| x.trim().to_ascii_lowercase()).as_deref() {
+                                        Some("https") => Ok(Channel::Secure),
+                                        Some("http") => Err(ProxyMisconfigured),
+                                        _ => Ok(Channel::Insecure),
+                                    }
+                                } else {
+                                    let loopbackish = matches!(
+                                        name.host.as_str(),
+                                        "localhost" | "127.0.0.1" | "[::1]"
+                                    ) || (loopback_apps
+                                        && name.host == "dash.oaiy.localhost");
+                                    if loopbackish && peer_loopback && !forwarded {
+                                        Ok(Channel::Secure)
+                                    } else {
+                                        Ok(Channel::Insecure)
+                                    }
+                                };
+                                let got =
+                                    channel(&p, &name, trusted, proto, peer_loopback, forwarded);
+                                assert_eq!(
+                                    got, want,
+                                    "apps {loopback_apps} host {host} proto {proto:?} trusted {trusted} loopback {peer_loopback} forwarded {forwarded}"
+                                );
+                                if got == Ok(Channel::Secure) {
+                                    secure += 1;
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        assert!(secure > 20, "the table has {secure} secure rows");
+    }
+
+    #[test]
+    fn t30_a_secure_channel_needs_the_trusted_proxy_to_say_https_and_nothing_a_client_says_counts()
+    {
+        let p = policy(Exposure::Proxied, 17972, false);
+        let dash = h("dash.example.com");
+        // The Caddy double: a trusted peer, `X-Forwarded-Proto: https`, the public Host.
+        assert_eq!(
+            channel(&p, &dash, true, Some("https"), false, true),
+            Ok(Channel::Secure)
+        );
+        // A client that sends the same headers itself is not a trusted proxy.
+        assert_eq!(
+            channel(&p, &dash, false, Some("https"), false, true),
+            Ok(Channel::Insecure)
+        );
+        // Even from this machine, a public host is not a loopback name.
+        assert_eq!(
+            channel(&p, &dash, false, Some("https"), true, true),
+            Ok(Channel::Insecure)
+        );
+        assert_eq!(
+            channel(&p, &dash, false, None, true, false),
+            Ok(Channel::Insecure)
+        );
+        // A wrong `X-Forwarded-Proto` from the proxy, and a missing one.
+        assert_eq!(
+            channel(&p, &dash, true, Some("http"), false, true),
+            Err(ProxyMisconfigured)
+        );
+        assert_eq!(
+            channel(&p, &dash, true, None, false, true),
+            Ok(Channel::Insecure)
+        );
+    }
+
     #[test]
     fn the_app_names_of_a_loopback_server_are_a_secure_channel_from_the_machine_itself_and_only_there(
     ) {
