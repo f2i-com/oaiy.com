@@ -151,7 +151,7 @@ export default function RingDialog({ on = true }: { on?: boolean }) {
         </div>
         <p className="ring-note">Answer on your Companion. This computer cannot take the call.</p>
         <div className="ring-actions">
-          <button type="button" className="button secondary" disabled={busy !== null || shown.stopping} onClick={() => void act('decline')}>
+          <button type="button" className="button secondary" disabled={busy !== null || shown.stopping || shown.taken} onClick={() => void act('decline')}>
             <PhoneOff size={14} /> Decline and take a message
           </button>
           <button type="button" className="button secondary" onClick={() => setPutAway((ids) => [...ids.slice(-20), shown.id])}>

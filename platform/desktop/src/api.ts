@@ -1724,6 +1724,8 @@ export interface ActiveRing {
   devices: string[];
   /** The owner declined and the phone is being asked to withdraw the request: the dialog waits for its answer. */
   stopping: boolean;
+  /** The phone said an owner device had already taken the call as the owner declined it: it is being connected, and there is nothing left to decline. */
+  taken: boolean;
   /** The last thing the owner asked of it here, and what came of it. */
   note: string;
 }

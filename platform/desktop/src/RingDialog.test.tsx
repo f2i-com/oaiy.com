@@ -34,6 +34,7 @@ const ringing = (r: Partial<ActiveRing> = {}): ActiveRing => ({
   now: Date.now() + SKEW + 5_000,
   devices: ['this computer', 'Pixel 6'],
   stopping: false,
+  taken: false,
   note: '',
   ...r,
 });
@@ -178,6 +179,24 @@ describe('the ring dialog', () => {
     });
     await settle();
     expect(host.querySelector('.ring-dialog')).toBeNull();
+  });
+
+  it('offers nothing to decline once the phone says an owner device has the call: the button stays off and says why', async () => {
+    serve({});
+    api.respond.mockResolvedValue({ ok: true, note: 'Asking your Companion to stop ringing. The receptionist will offer the caller a message.' });
+    await mount();
+    await click(button('Decline and take a message'));
+    // The phone: too late, an owner device took it. The ring goes on until it says so, and Decline is not offered again.
+    serve({ stopping: false, taken: true, note: 'An owner device took the call just before you declined: it is being connected.' });
+    await act(async () => {
+      vi.advanceTimersByTime(POLL_MS + 10);
+    });
+    await settle();
+    expect(text()).toContain('took the call just before you declined');
+    expect(button('Decline and take a message').disabled).toBe(true);
+    const asked = api.respond.mock.calls.length;
+    await click(button('Decline and take a message'));
+    expect(api.respond.mock.calls.length).toBe(asked);
   });
 
   it('Not now only puts the box away: nothing is asked of the phone and the ring is not shown again', async () => {
