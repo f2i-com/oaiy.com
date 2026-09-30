@@ -508,6 +508,24 @@ mod tests {
     }
 
     #[test]
+    fn the_thumbprints_this_desktop_derives_for_the_fixtures_keys_are_the_fixtures() {
+        // A plan names devices by endpoint-key thumbprint, so the thumbprint this desktop derives for a device's key must be the one the plugin
+        // derives: the fixture's test phones are Ed25519 keys from a seed of one repeated byte, with the public key and thumbprint written down.
+        use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine as _};
+        let f = fixture("reserved-offer-id");
+        let seed_byte = regex::Regex::new(r"0x([0-9a-f]{2})").unwrap();
+        for phone in f["testPhones"].as_array().unwrap() {
+            let name = phone["name"].as_str().unwrap();
+            let seed = u8::from_str_radix(&seed_byte.captures(name).unwrap_or_else(|| panic!("{name}"))[1], 16).unwrap();
+            let public = ed25519_dalek::SigningKey::from_bytes(&[seed; 32]).verifying_key().to_bytes();
+            let hex: String = public.iter().map(|b| format!("{b:02x}")).collect();
+            assert_eq!(hex, phone["publicKeyHex"].as_str().unwrap(), "{name}: the key of that seed");
+            let thumbprint = crate::companion::identity::thumbprint_for(&URL_SAFE_NO_PAD.encode(public));
+            assert_eq!(thumbprint, phone["holderThumbprint"].as_str().unwrap(), "{name}");
+        }
+    }
+
+    #[test]
     fn base32_is_the_lower_case_rfc_4648_alphabet_without_padding() {
         assert_eq!(base32_lower(b""), "");
         assert_eq!(base32_lower(b"f"), "my");
@@ -668,6 +686,21 @@ mod tests {
             statuses.insert(status.to_string());
         }
         assert_eq!(statuses, BTreeSet::from(["refused".to_string(), "unavailable".to_string()]));
+        // A reason this desktop's own plans give is refused or unavailable exactly as the plugin says it is: `refused` (do not offer a person)
+        // for a decision of `refused`, `unavailable` (offer a message) for `message_only`. The plugin's table is the fixture's, and a plan
+        // of the 33 vectors that gives a reason must land in the same row.
+        let table: BTreeMap<String, String> = f["refusals"].as_array().unwrap().iter().map(|r| (r["reason"].as_str().unwrap().to_string(), r["status"].as_str().unwrap().to_string())).collect();
+        let mut checked = BTreeSet::new();
+        for (id, plan) in super::super::tests::vector_plans() {
+            let (plan, _) = super::super::host::name_somebody(plan);
+            if plan.rings() {
+                continue;
+            }
+            let ours = if plan.decision == Decision::Refused { "refused" } else { "unavailable" };
+            assert_eq!(table.get(plan.reason.as_str()).map(String::as_str), Some(ours), "{id}: {}", plan.reason.as_str());
+            checked.insert(plan.reason.as_str());
+        }
+        assert!(checked.len() >= 5, "{checked:?}");
         // The tool intake errors carry no status: they are not a refusal of a transfer.
         for case in f["toolRefusals"]["cases"].as_array().unwrap() {
             assert!(case["output"]["error"].is_string() && case["output"].get("status").is_none(), "{}", case["name"]);

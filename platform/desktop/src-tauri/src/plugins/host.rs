@@ -2563,6 +2563,25 @@ mod tests {
         }
     }
 
+    #[test]
+    fn the_phone_plugins_shipped_manifest_names_the_capability_bare_and_is_answered_the_ring_requests_all_the_same() {
+        // Aokie's manifest declares `companion.admission`, with no `oaiy.` in front (its manifest is in its own repository, on its own release
+        // cycle). This host reads that as `oaiy.companion.admission` when it loads the manifest, so a plugin that names it the way Aokie does
+        // is answered: were it refused `capability_denied`, the plugin would call every ring plan unavailable and nobody would ever be rung.
+        let (sb, host) = host_with("ring-bare", vec![]);
+        install_plugin(&sb, "aokie", &["companion.admission"]);
+        host.registry.lock().unwrap().scan();
+        host.set_ring(a_ring());
+        let plan = host
+            .handle_plugin_request("aokie", "oaiy.ring.plan", serde_json::json!({"callId": "call_1", "reason": "caller_asked", "recentCallerTurns": ["Can I speak to the owner please"]}))
+            .expect("a plugin that declares the bare capability is answered");
+        assert_eq!(plan["decision"], "ring", "{plan}");
+        let (code, _) = host
+            .handle_plugin_request("aokie", "oaiy.ring.opened", serde_json::json!({"planId": "plan_made_up", "requestId": "assist_1", "callId": "call_1", "callEpoch": 1, "ownerEpoch": 1, "expiresAt": 1_789_000_040u64}))
+            .unwrap_err();
+        assert_ne!(code, "capability_denied", "answered, and refused for what it is: a plan this desktop never made");
+    }
+
     /// The desktop's record of one call, for the ring's questions.
     struct OneCall;
 
