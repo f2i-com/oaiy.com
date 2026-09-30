@@ -1,19 +1,26 @@
 # What OAIY adds to `transfer_v1`
 
 The folder above (`docs/contracts/transfer/`) is the Aokie repository's `docs/contracts/transfer/`, byte for
-byte, as of its commit `49c46d81b0d422c6b5707cb7fbd207af6f3912e4`: the contract in `transfer-v1.md`, the fixtures both
-programs are tested against, and `SHA256SUMS`.
-Nothing in it is edited here. `node scripts/check-transfer-contract.mjs` checks the sums, and, with
-`AOKIE_TRANSFER_CONTRACTS` set to Aokie's copy of the folder, that the two are identical. When Aokie changes
-the contract, copy its committed files over these and run the Rust and script tests again.
+byte: the contract in `transfer-v1.md`, the fixtures both programs are tested against, and `SHA256SUMS`. Which Aokie
+commit it was copied from is written in one place, `SYNCED_FROM.json` in this folder, which a program reads (the
+commit, and the digest of every file as copied); this page does not repeat it, so it cannot go out of date.
+Nothing in the folder above is edited here. `node scripts/check-transfer-contract.mjs` checks the sums and that every file is
+the one `SYNCED_FROM.json` records. With `AOKIE_TRANSFER_CONTRACTS` set to Aokie's copy of the folder it also checks that the
+two are identical, and, when that is inside a git checkout, that the commit is there and its folder at that commit is what
+`SYNCED_FROM.json` records. Without the variable it says SKIPPED and NOT VERIFIED AGAINST AOKIE, loudly, and passes: nothing then
+shows the folder is Aokie's, only that it has not been edited since the lock was written (`--require-aokie` fails instead).
+`npm run check:transfer-contract` in `platform/desktop` runs it with its own tests, and the desktop job of CI runs that.
+When Aokie changes the contract, copy its committed files over these, run
+`node scripts/check-transfer-contract.mjs --write-lock <commit>`, and run the Rust and script tests again.
 
 This folder is what only OAIY has. None of it is sent to, or read from, the phone plugin, and none of it is
-compared with Aokie's copy. `SHA256SUMS` here lists its three fixtures.
+compared with Aokie's copy. `SHA256SUMS` here lists its four `.json` files (the lock among them).
 
 | File | What it is |
 |---|---|
 | `phrases-oaiy.json` | more cases for the caller-asked check, none of them in the shared file: requests OAIY counts that the shared check does not, things a caller says that are not requests but that the shared check lets through, and a person asked for by name. OAIY passes the shared fixture in full and these too; the plugin's check runs first and OAIY's second, so a caller must pass both (see below for what that costs a caller who asks in a way only OAIY counts) |
 | `start-allow-transfer.json`, `start-resume.json` | a whole `formlogic.realtime.start` as OAIY's types read it (the shared `start-ready` fixture shows only the members the contract adds) |
+| `SYNCED_FROM.json` | the lock: the Aokie commit the folder above was copied from, and the digest of each of its files as copied. Written by `--write-lock <commit>`, never by hand |
 
 ## OAIY's own words
 

@@ -1,12 +1,12 @@
 import assert from 'node:assert/strict';
 import { spawnSync } from 'node:child_process';
-import { cpSync, mkdtempSync, readFileSync, readdirSync, rmSync, statSync, writeFileSync } from 'node:fs';
+import { cpSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, rmSync, statSync, writeFileSync } from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import test from 'node:test';
 
-import { checkSums, checkTransfer, compareWithAokie, DEFAULT_DIR, digest, writeOaiySums } from './check-transfer-contract.mjs';
+import { AOKIE_FOLDER, checkLock, checkSums, checkTransfer, compareWithAokie, DEFAULT_DIR, digest, readLock, verifyCommit, writeLock, writeOaiySums } from './check-transfer-contract.mjs';
 
 const script = fileURLToPath(new URL('./check-transfer-contract.mjs', import.meta.url));
 
@@ -34,8 +34,10 @@ test('the folder in this repository agrees with its own sums', () => {
   const result = checkTransfer({ dir: DEFAULT_DIR, aokieDir: undefined });
   assert.deepEqual(result.problems, []);
   assert.equal(result.files, 8, 'the eight shared fixtures');
-  assert.equal(result.ownFiles, 3, 'and the three that only OAIY has');
+  assert.equal(result.ownFiles, 4, 'and the four that only OAIY has: the phrases, the two starts and the lock');
   assert.equal(result.compared, null, 'no comparison without Aokie\'s copy');
+  assert.equal(result.commit, null, 'and no commit looked up');
+  assert.match(result.lockedCommit, /^[0-9a-f]{40}$/);
 });
 
 test('the shared folder holds the prose contract, the fixtures and the sums, and nothing else at the top', () => {
@@ -85,7 +87,7 @@ test('the oaiy-only sums are checked the same way', (t) => {
   assert.ok(problems.some((p) => p.startsWith('oaiy-only/phrases-oaiy.json changed and SHA256SUMS was not updated')), problems.join('\n'));
   // Rewriting them makes them right, and never touches the shared ones.
   const shared = readFileSync(path.join(dir, 'SHA256SUMS'));
-  assert.equal(writeOaiySums(dir), 3);
+  assert.equal(writeOaiySums(dir), 4);
   assert.deepEqual(checkTransfer({ dir, aokieDir: undefined }).problems, []);
   assert.deepEqual(readFileSync(path.join(dir, 'SHA256SUMS')), shared);
 });
@@ -127,17 +129,213 @@ test('any difference from Aokie\'s copy is a problem: a fixture, the prose, the 
 test('run as a program: OK without the variable (with a note), FAIL with a copy that differs', (t) => {
   const plain = spawnSync(process.execPath, [script], { encoding: 'utf8', env: { ...process.env, AOKIE_TRANSFER_CONTRACTS: '' } });
   assert.equal(plain.status, 0, plain.stderr);
-  assert.match(plain.stdout, /OK, 8 fixtures match SHA256SUMS, 3 in oaiy-only/);
-  assert.match(plain.stdout, /Aokie's copy was not compared/);
+  assert.match(plain.stdout, /OK, 8 fixtures match SHA256SUMS, 4 in oaiy-only/);
+  assert.match(plain.stdout, /SKIPPED, NOT VERIFIED AGAINST AOKIE/, 'a run that did not check Aokie says so');
 
   const { aokie } = copyAsAokieHasIt(t);
   const same = spawnSync(process.execPath, [script], { encoding: 'utf8', env: { ...process.env, AOKIE_TRANSFER_CONTRACTS: aokie } });
   assert.equal(same.status, 0, same.stderr);
   assert.match(same.stdout, /10 files identical with Aokie's copy/);
+  assert.match(same.stdout, /THE COMMIT WAS NOT VERIFIED/, 'a folder that is not in a git checkout cannot show the commit');
 
   edit(path.join(aokie, 'transfer-v1.md'), (text) => `${text}\nAn extra line.\n`);
   const drift = spawnSync(process.execPath, [script], { encoding: 'utf8', env: { ...process.env, AOKIE_TRANSFER_CONTRACTS: aokie } });
   assert.equal(drift.status, 1);
   assert.match(drift.stderr, /FAIL, 1 problem/);
   assert.match(drift.stderr, /transfer-v1\.md differs from Aokie's/);
+});
+
+test('the lock names the Aokie commit and records every file, and this folder is what it records', () => {
+  const { lock, problems } = readLock(DEFAULT_DIR);
+  assert.deepEqual(problems, []);
+  assert.match(lock.commit, /^[0-9a-f]{40}$/);
+  assert.equal(lock.folder, AOKIE_FOLDER);
+  const top = readdirSync(DEFAULT_DIR).filter((n) => statSync(path.join(DEFAULT_DIR, n)).isFile()).sort();
+  assert.deepEqual(Object.keys(lock.files).sort(), top, 'every file at the top of the folder, and no other');
+  assert.deepEqual(checkLock(DEFAULT_DIR).problems, []);
+  // The commit is written in that file and nowhere in the prose: a second place would be the one that goes out of date.
+  const prose = readFileSync(path.join(DEFAULT_DIR, 'oaiy-only', 'README.md'), 'utf8');
+  assert.ok(!prose.includes(lock.commit), 'oaiy-only/README.md does not repeat the commit');
+});
+
+test('a file edited here, a file added, a lock missing a file, a lock naming a gone one and a lock that is not well formed are each a problem', (t) => {
+  const edited = copyOfFolder(t);
+  edit(path.join(edited, 'transfer-v1.md'), (text) => `${text}\nAn edit made here.\n`);
+  // The prose contract is in no SHA256SUMS: the lock is what notices it.
+  assert.deepEqual(checkSums(edited).problems, []);
+  assert.match(checkLock(edited).problems.join('\n'), /transfer-v1\.md is not the file copied from Aokie [0-9a-f]{8} \(oaiy-only\/SYNCED_FROM\.json\)/);
+  assert.match(checkTransfer({ dir: edited, aokieDir: undefined }).problems.join('\n'), /transfer-v1\.md is not the file copied from Aokie/);
+
+  const added = copyOfFolder(t);
+  writeFileSync(path.join(added, 'NOTES.md'), 'mine\n');
+  assert.match(checkLock(added).problems.join('\n'), /NOTES\.md is in the folder and not in oaiy-only\/SYNCED_FROM\.json/);
+
+  const gone = copyOfFolder(t);
+  rmSync(path.join(gone, 'transfer-v1.md'));
+  assert.match(checkLock(gone).problems.join('\n'), /records transfer-v1\.md, which is not in the folder/);
+
+  const unlocked = copyOfFolder(t);
+  rmSync(path.join(unlocked, 'oaiy-only', 'SYNCED_FROM.json'));
+  assert.match(checkLock(unlocked).problems.join('\n'), /SYNCED_FROM\.json is missing/);
+
+  const badCommit = copyOfFolder(t);
+  edit(path.join(badCommit, 'oaiy-only', 'SYNCED_FROM.json'), (text) => text.replace(/"commit": "[0-9a-f]{40}"/, '"commit": "49c46d8"'));
+  assert.match(checkLock(badCommit).problems.join('\n'), /"commit" is not a full 40 digit commit hash/);
+
+  const badDigest = copyOfFolder(t);
+  edit(path.join(badDigest, 'oaiy-only', 'SYNCED_FROM.json'), (text) => text.replace(/"transfer-v1\.md": "[0-9a-f]{64}"/, '"transfer-v1.md": "nope"'));
+  assert.match(checkLock(badDigest).problems.join('\n'), /the digest of transfer-v1\.md is not a SHA-256/);
+
+  const notJson = copyOfFolder(t);
+  writeFileSync(path.join(notJson, 'oaiy-only', 'SYNCED_FROM.json'), '{ nope');
+  assert.match(checkLock(notJson).problems.join('\n'), /SYNCED_FROM\.json is not valid JSON/);
+
+  const empty = copyOfFolder(t);
+  edit(path.join(empty, 'oaiy-only', 'SYNCED_FROM.json'), (text) => JSON.stringify({ ...JSON.parse(text), files: {} }));
+  assert.match(checkLock(empty).problems.join('\n'), /"files" lists no file/);
+});
+
+test('writing the lock after a sync records the commit and the files, and the sums of oaiy-only follow', (t) => {
+  const dir = copyOfFolder(t);
+  edit(path.join(dir, 'transfer-v1.md'), (text) => `${text}\nSynced.\n`);
+  assert.ok(checkLock(dir).problems.length > 0);
+  const commit = 'abcdef0123456789abcdef0123456789abcdef01';
+  const lock = writeLock(commit, dir);
+  assert.equal(lock.commit, commit);
+  assert.deepEqual(checkTransfer({ dir, aokieDir: undefined }).problems, []);
+  assert.equal(checkTransfer({ dir, aokieDir: undefined }).lockedCommit, commit);
+  assert.throws(() => writeLock('49c46d8', dir), /not a full 40 digit commit hash/);
+  assert.throws(() => writeLock('', dir), /not a full 40 digit commit hash/);
+});
+
+/** A git repository standing for Aokie's: the top-level files of `dir` committed at `docs/contracts/transfer`. Answers its folder and commit. */
+function aokieRepo(t, dir) {
+  const root = mkdtempSync(path.join(os.tmpdir(), 'oaiy-transfer-aokie-'));
+  t.after(() => rmSync(root, { recursive: true, force: true }));
+  const folder = path.join(root, ...AOKIE_FOLDER.split('/'));
+  mkdirSync(folder, { recursive: true });
+  for (const name of readdirSync(dir).filter((n) => statSync(path.join(dir, n)).isFile())) {
+    writeFileSync(path.join(folder, name), readFileSync(path.join(dir, name)));
+  }
+  const run = (...args) => {
+    const r = spawnSync('git', ['-c', 'user.name=izuc', '-c', 'user.email=the@lance.name', '-c', 'core.autocrlf=false', '-c', 'commit.gpgsign=false', ...args], { cwd: root, encoding: 'utf8' });
+    assert.equal(r.status, 0, r.stderr);
+    return r.stdout.trim();
+  };
+  run('init', '-q');
+  run('add', '-A');
+  run('commit', '-q', '-m', 'the contract');
+  return { root, folder, commit: run('rev-parse', 'HEAD'), run };
+}
+
+const hasGit = spawnSync('git', ['--version']).status === 0;
+
+test('the commit in the lock is looked up in an Aokie checkout: found and the same is verified', { skip: !hasGit && 'git is not installed' }, (t) => {
+  const dir = copyOfFolder(t);
+  const aokie = aokieRepo(t, dir);
+  const lock = writeLock(aokie.commit, dir);
+  const result = checkTransfer({ dir, aokieDir: aokie.folder });
+  assert.deepEqual(result.problems, []);
+  assert.equal(result.commit, 'verified');
+  assert.equal(result.compared, 10);
+  assert.equal(verifyCommit(lock, aokie.folder).status, 'verified');
+});
+
+test('a commit that is not in the checkout, or whose folder is not what the lock records, is a problem', { skip: !hasGit && 'git is not installed' }, (t) => {
+  const dir = copyOfFolder(t);
+  const aokie = aokieRepo(t, dir);
+  // The copy was synced from a commit that is not there (the lock says a commit nobody has).
+  writeLock('1234567890abcdef1234567890abcdef12345678', dir);
+  const missing = checkTransfer({ dir, aokieDir: aokie.folder });
+  assert.equal(missing.commit, 'failed');
+  assert.match(missing.problems.join('\n'), /the commit 1234567890abcdef1234567890abcdef12345678 named in oaiy-only\/SYNCED_FROM\.json is not in the Aokie checkout/);
+
+  // The commit is there, but Aokie's folder at that commit is not what was copied: the lock names a later commit than the one the copy is of.
+  const first = aokie.commit;
+  writeFileSync(path.join(aokie.folder, 'transfer-v1.md'), `${readFileSync(path.join(aokie.folder, 'transfer-v1.md'), 'utf8')}\nA later line.\n`);
+  aokie.run('commit', '-q', '-am', 'a later contract');
+  const second = aokie.run('rev-parse', 'HEAD');
+  const wrong = verifyCommit(writeLock(second, dir), aokie.folder);
+  assert.equal(wrong.status, 'failed');
+  assert.match(wrong.problems.join('\n'), /transfer-v1\.md at Aokie [0-9a-f]{8} is not what oaiy-only\/SYNCED_FROM\.json records/);
+  // Named as the commit it was copied from, it is verified.
+  assert.equal(verifyCommit(writeLock(first, dir), aokie.folder).status, 'verified');
+
+  // A file the commit has and the lock does not, and one the lock has and the commit does not.
+  writeFileSync(path.join(aokie.folder, 'transfer-v1.extra.fixture.json'), '{}\n');
+  aokie.run('add', '-A');
+  aokie.run('commit', '-q', '-m', 'a new fixture');
+  const third = aokie.run('rev-parse', 'HEAD');
+  assert.match(verifyCommit(writeLock(third, dir), aokie.folder).problems.join('\n'), /transfer-v1\.extra\.fixture\.json is in Aokie's docs\/contracts\/transfer at [0-9a-f]{8} and not in oaiy-only\/SYNCED_FROM\.json/);
+  aokie.run('rm', '-q', 'docs/contracts/transfer/transfer-v1.cancel.fixture.json');
+  aokie.run('commit', '-q', '-m', 'a fixture gone');
+  const fourth = aokie.run('rev-parse', 'HEAD');
+  assert.match(verifyCommit(writeLock(fourth, dir), aokie.folder).problems.join('\n'), /records transfer-v1\.cancel\.fixture\.json, which is not in Aokie's docs\/contracts\/transfer at [0-9a-f]{8}/);
+});
+
+test('a folder that is not in a git checkout cannot show the commit: skipped, and said so', (t) => {
+  const { dir, aokie } = copyAsAokieHasIt(t);
+  const looked = verifyCommit(readLock(dir).lock, aokie);
+  assert.equal(looked.status, 'skipped');
+  assert.match(looked.note, /is not inside a git checkout, so the commit [0-9a-f]{40} was not looked up/);
+  assert.deepEqual(looked.problems, []);
+});
+
+test('run as a program: without Aokie it says SKIPPED and passes, --require-aokie fails, and GitHub Actions gets an annotation', (t) => {
+  const dir = copyOfFolder(t);
+  const run = (args, env) => spawnSync(process.execPath, [script, '--dir', dir, ...args], { encoding: 'utf8', env: { ...process.env, AOKIE_TRANSFER_CONTRACTS: '', GITHUB_ACTIONS: '', ...env } });
+  const plain = run([]);
+  assert.equal(plain.status, 0, plain.stderr);
+  assert.match(plain.stdout, /SKIPPED, NOT VERIFIED AGAINST AOKIE: AOKIE_TRANSFER_CONTRACTS is not set/);
+  assert.doesNotMatch(plain.stdout, /::warning/, 'no annotation outside GitHub Actions');
+  assert.equal(run(['--require-aokie']).status, 1, 'the check before a merge does not pass on trust');
+  const ci = run([], { GITHUB_ACTIONS: 'true' });
+  assert.equal(ci.status, 0, ci.stderr);
+  assert.match(ci.stdout, /^::warning title=transfer contract not verified against Aokie::/m);
+});
+
+test('run as a program: a checkout that does not have the locked commit fails', { skip: !hasGit && 'git is not installed' }, (t) => {
+  // The folder committed in a checkout of its own: the lock's commit (an earlier Aokie one) is not in it.
+  const dir = copyOfFolder(t);
+  const aokie = aokieRepo(t, dir);
+  const r = spawnSync(process.execPath, [script, '--dir', dir], { encoding: 'utf8', env: { ...process.env, AOKIE_TRANSFER_CONTRACTS: aokie.folder } });
+  assert.equal(r.status, 1, r.stdout);
+  assert.match(r.stderr, /named in oaiy-only\/SYNCED_FROM\.json is not in the Aokie checkout/);
+});
+
+test('run as a program: a checkout that has the locked commit is verified, and --require-aokie passes only then', { skip: !hasGit && 'git is not installed' }, (t) => {
+  const dir = copyOfFolder(t);
+  const aokie = aokieRepo(t, dir);
+  const written = spawnSync(process.execPath, [script, '--dir', dir, '--write-lock', aokie.commit], { encoding: 'utf8' });
+  assert.equal(written.status, 0, written.stderr);
+  assert.match(written.stdout, new RegExp(`Aokie ${aokie.commit}, 10 files`));
+  const env = { ...process.env, AOKIE_TRANSFER_CONTRACTS: aokie.folder };
+  const checked = spawnSync(process.execPath, [script, '--dir', dir, '--require-aokie'], { encoding: 'utf8', env });
+  assert.equal(checked.status, 0, checked.stderr + checked.stdout);
+  assert.match(checked.stdout, /10 files identical with Aokie's copy/);
+  assert.match(checked.stdout, new RegExp(`the folder at Aokie commit ${aokie.commit} is the one locked`));
+  // The same, from a folder that is not in a git checkout: the files agree, the commit is not verified, and a required check fails.
+  const { aokie: exported } = copyAsAokieHasIt(t);
+  const loose = { ...process.env, AOKIE_TRANSFER_CONTRACTS: exported };
+  const notLooked = spawnSync(process.execPath, [script, '--dir', dir], { encoding: 'utf8', env: loose });
+  assert.equal(notLooked.status, 0, notLooked.stderr);
+  assert.match(notLooked.stdout, /SKIPPED, THE COMMIT WAS NOT VERIFIED/);
+  assert.equal(spawnSync(process.execPath, [script, '--dir', dir, '--require-aokie'], { encoding: 'utf8', env: loose }).status, 1);
+});
+
+test('run as a program: --write-lock refuses a short or a missing commit hash and writes nothing', (t) => {
+  const dir = copyOfFolder(t);
+  const before = readFileSync(path.join(dir, 'oaiy-only', 'SYNCED_FROM.json'), 'utf8');
+  const bad = spawnSync(process.execPath, [script, '--dir', dir, '--write-lock', '49c46d8'], { encoding: 'utf8' });
+  assert.equal(bad.status, 1);
+  assert.match(bad.stderr, /not a full 40 digit commit hash/);
+  const none = spawnSync(process.execPath, [script, '--dir', dir, '--write-lock'], { encoding: 'utf8' });
+  assert.equal(none.status, 1);
+  assert.equal(readFileSync(path.join(dir, 'oaiy-only', 'SYNCED_FROM.json'), 'utf8'), before, 'the lock is as it was');
+});
+
+test('run as a program: the real folder of this repository passes, on its own sums and its lock', () => {
+  const r = spawnSync(process.execPath, [script], { encoding: 'utf8', env: { ...process.env, AOKIE_TRANSFER_CONTRACTS: '' } });
+  assert.equal(r.status, 0, r.stderr);
+  assert.match(r.stdout, /OK, 8 fixtures match SHA256SUMS, 4 in oaiy-only\/, every file is the one locked from Aokie [0-9a-f]{40}/);
 });

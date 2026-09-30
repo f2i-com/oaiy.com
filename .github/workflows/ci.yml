@@ -330,6 +330,15 @@ jobs:
       - name: Desktop unit tests (Vitest)
         working-directory: platform/desktop
         run: npm test
+      # The transfer_v1 contract folder (docs/contracts/transfer) is Aokie's, copied byte for byte: every
+      # file is the one its lock (oaiy-only/SYNCED_FROM.json) records, and the check's own tests. Aokie's
+      # repository is not checked out here, so the comparison with it and the lock's commit are SKIPPED
+      # (a warning on the run, never a silent pass): they are run where both repositories are, with
+      # AOKIE_TRANSFER_CONTRACTS set (see docs/contracts/transfer/oaiy-only/README.md).
+      - name: Transfer contract folder (transfer_v1)
+        working-directory: platform/desktop
+        shell: bash
+        run: npm run check:transfer-contract
       - name: Desktop typecheck + web build
         working-directory: platform/desktop
         run: npm run build
