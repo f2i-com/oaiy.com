@@ -636,6 +636,17 @@ test('4.18.8 doctor web: a relay unpacked into a folder of an existing site is p
     contains('path', doc_msg($rows, 'web'));
 });
 
+test('4.9.1 doctor web: the relay\'s own routes are asked under the URL\'s path too, so the dummy bearer goes to /<path>/v1/health', function () {
+    [$root, $data] = inst_installed();
+    $site = Tmp::dir('sitestub');
+    mkdir($site . '/relay');
+    // Answers as the relay does, and reports the header seen only when it was asked under /relay/v1/health.
+    file_put_contents($site . '/relay/index.php', '<?php header("Content-Type: application/json"); echo json_encode(["ok" => true, "time" => time(), "authHeaderSeen" => isset($_SERVER["HTTP_AUTHORIZATION"]) && strpos($_SERVER["REQUEST_URI"], "/relay/v1/health") === 0]);');
+    $srv = Server::start($site, ['prepend' => false, 'name' => 'stub-site']);
+    $rows = Doctor::run(['dataDir' => $data, 'url' => $srv->base() . '/relay', 'slowBody' => false, 'publicDir' => $root . '/public']);
+    eq('ok', doc_level($rows, 'web.authorization'), doc_msg($rows, 'web.authorization'));
+});
+
 test('4.9.1 doctor web: a host that strips the Authorization header fails the dummy bearer probe loudly (a stub that reports it stripped)', function () {
     $dir = Tmp::dir('strip');
     // A stub that answers /v1/health as the relay does, from a stack that dropped the Authorization header.

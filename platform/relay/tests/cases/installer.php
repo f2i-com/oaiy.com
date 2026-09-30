@@ -405,6 +405,12 @@ test('4.18.2 installer (both, and a re-key): one guard refuses data/ inside publ
     $e = throws(fn() => Oaiy\Relay\Installer::guard($data, ['documentRoot' => $root]), Oaiy\Relay\InstallRefused::class);
     eq('docroot', $e->kind);
     eq(['notes' => [], 'checked' => false], Oaiy\Relay\Installer::guard($data, ['publicDir' => $root . '/public']), 'no probe asked, nothing to say');
+    // A path that reaches public/ through ".." is judged where it lands, whether or not the folders in it exist yet.
+    $e = throws(fn() => Oaiy\Relay\Installer::guard($root . '/public/sub/../data', ['publicDir' => $root . '/public']), Oaiy\Relay\InstallRefused::class);
+    eq('webroot', $e->kind);
+    $e = throws(fn() => Oaiy\Relay\Installer::guard($root . '/nothing/../public/deeper', ['publicDir' => $root . '/public']), Oaiy\Relay\InstallRefused::class);
+    eq('webroot', $e->kind);
+    eq(['notes' => [], 'checked' => false], Oaiy\Relay\Installer::guard($root . '/public/../data', ['publicDir' => $root . '/public']), 'a ".." that leaves public/ is outside it');
     $pub = Server::start($root . '/public', ['prepend' => false, 'name' => 'inst-pub']);
     eq(['notes' => [], 'checked' => true], Oaiy\Relay\Installer::guard($data, ['publicDir' => $root . '/public', 'probeUrl' => $pub->base()]));
     $dead = Oaiy\Relay\Installer::guard($data, ['probeUrl' => 'http://127.0.0.1:' . Server::freePort()]);
