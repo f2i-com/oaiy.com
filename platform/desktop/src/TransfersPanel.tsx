@@ -1,7 +1,6 @@
 import { useCallback, useEffect, useMemo, useState } from 'react';
 import { Check, Loader2, TriangleAlert } from 'lucide-react';
-import { companion, isNotFound, ring, type CompanionApproved, type RingFeatures, type RingSettings } from './api';
-import { nothingWouldRing } from './transfersModel';
+import { companion, isNotFound, ring, type CompanionApproved, type RingFeatures, type RingPreview, type RingSettings } from './api';
 import { openSetup } from './useSetupState';
 import { useVisiblePoll } from './useVisiblePoll';
 
@@ -22,6 +21,9 @@ import { useVisiblePoll } from './useVisiblePoll';
  */
 export const CONSENT_NOT_SIGNED = 'Consent is not signed on this computer: a plugin could flip a scope. Keep this off unless you trust every plugin you have installed.';
 
+/** These settings are reached over OAIY's local address, which a program that OAIY has paired (or that has an administrator's token) can use as well as this window. */
+export const PAIRED_APP_CAN_CHANGE = 'A program on this computer that OAIY has paired can also change these settings, and turn transfers on. Pair only programs you trust.';
+
 const errText = (e: unknown) => (e instanceof Error ? e.message : String(e));
 
 const DAYS = ['Sun', 'Mon', 'Tue', 'Wed', 'Thu', 'Fri', 'Sat'];
@@ -38,6 +40,8 @@ export default function TransfersPanel() {
   const [saving, setSaving] = useState(false);
   const [justSaved, setJustSaved] = useState(false);
   const [devices, setDevices] = useState<CompanionApproved[] | null>(null);
+  /** What a caller who asks for you would get now, from the desktop's own policy. */
+  const [preview, setPreview] = useState<RingPreview | null>(null);
   /** The urgent phrases and VIP numbers are typed as lines: kept as typed until saved. */
   const [urgentText, setUrgentText] = useState('');
   const [vipText, setVipText] = useState('');
@@ -65,12 +69,18 @@ export default function TransfersPanel() {
     };
   }, [adopt]);
 
-  // The devices that may take a call: the Companions approved for the phone.
+  const look = useCallback(() => {
+    ring.preview().then(setPreview, () => setPreview(null));
+  }, []);
+
+  // The devices that may take a call: the Companions approved for the phone. And what a caller would get now, which changes as the owner
+  // comes and goes and as the phone plugin calls.
   useVisiblePoll(() => {
     companion.status('aokie').then(
       (s) => setDevices(s.approvedMobiles ?? []),
       () => setDevices([]),
     );
+    look();
   }, 20_000);
 
   const current = useMemo(() => (draft ? { ...draft, urgentPhrases: fromLines(urgentText), vipNumbers: fromLines(vipText) } : null), [draft, urgentText, vipText]);
@@ -114,6 +124,7 @@ export default function TransfersPanel() {
       });
       adopt(r.settings, r.features);
       setJustSaved(true);
+      look();
     } catch (e) {
       setError(`Not saved: ${errText(e)}`);
     } finally {
@@ -137,8 +148,8 @@ export default function TransfersPanel() {
   }
 
   const on = current.enabled;
-  // What is saved is what rings: a warning about a setting not yet saved would say something the desktop is not doing.
-  const nothingRings = saved ? nothingWouldRing(saved, devices) : null;
+  // What is saved is what rings, and the desktop says what a caller would get: a warning about a setting not yet saved would say something it is not doing.
+  const nothingRings = preview?.enabled && !preview.rings && preview.cause ? preview : null;
   return (
     <div className="panel transfers-page">
       <section className="model-section">
@@ -150,6 +161,10 @@ export default function TransfersPanel() {
         <div className="transfers-warning" data-testid="consent-not-signed">
           <TriangleAlert size={14} aria-hidden />
           <span>{CONSENT_NOT_SIGNED}</span>
+        </div>
+        <div className="transfers-warning" data-testid="paired-app-can-change">
+          <TriangleAlert size={14} aria-hidden />
+          <span>{PAIRED_APP_CAN_CHANGE}</span>
         </div>
         <label className="switch-row">
           <input type="checkbox" checked={on} onChange={(e) => patch({ enabled: e.target.checked, takeMessages: e.target.checked ? true : current.takeMessages })} />
@@ -175,11 +190,24 @@ export default function TransfersPanel() {
         {nothingRings && (
           <div className="transfers-warning" data-testid="nothing-would-ring">
             <TriangleAlert size={14} aria-hidden />
-            <span>{nothingRings}</span>
-            <button type="button" className="btn-tiny" onClick={() => openSetup({ plugin: 'aokie', step: 'pair' })}>
-              Set up a Companion
-            </button>
+            <span>{nothingRings.text}</span>
+            {nothingRings.cause === 'noCompanion' && (
+              <button type="button" className="btn-tiny" onClick={() => openSetup({ plugin: 'aokie', step: 'pair' })}>
+                Set up a Companion
+              </button>
+            )}
           </div>
+        )}
+        {preview?.enabled && preview.plugin && (
+          <div className="transfers-warning" data-testid="plugin-state">
+            <TriangleAlert size={14} aria-hidden />
+            <span>{preview.plugin}</span>
+          </div>
+        )}
+        {preview?.enabled && !nothingRings && preview.text && (
+          <p className="form-hint" data-testid="what-would-ring">
+            {preview.text}
+          </p>
         )}
         {features && (
           <p className="form-hint" data-testid="what-it-may-do">
@@ -199,7 +227,8 @@ export default function TransfersPanel() {
               decline and have the receptionist take a message, or be put away with Not now.
             </li>
             <li>
-              Nothing rings unless a Companion is set up to take the call: tick the one that runs on this computer (below), or approve one on a second phone. With none, callers are
+              Nothing rings unless a Companion is set up to take the call: approve one on the Phone page. A phone rings when you are away, and also when no Companion on this
+              computer can take the call, so one phone is enough; tick “This is the Companion on this computer” only for a Companion that is the Windows app here. With none, callers are
               offered a message and you are told someone asked for you.
             </li>
             <li>The receptionist stops speaking, tells the caller it is connecting them, and you talk to the caller. The receptionist does not come back unless you hand the call back.</li>
@@ -235,6 +264,7 @@ export default function TransfersPanel() {
               <option value="always">Always ring</option>
               <option value="never">Never ring</option>
             </select>
+            <small className="form-hint">A phone rings when you are away, and also when no Companion on this computer can take the call. Choose “Always ring” to have it ring even when one does.</small>
           </label>
           <label>
             I am
@@ -329,8 +359,9 @@ export default function TransfersPanel() {
       <section className="model-section">
         <h3 className="section-title">Devices that may take a call</h3>
         <p className="form-hint">
-          The Companions you approved on the Phone page. The phone that carries your calls is never one of them. Say which one is the Companion on this computer, and which
-          never to ring.
+          The Companions you approved on the Phone page. The phone that carries your calls is never one of them. Tick “This is the Companion on this computer” only for a
+          Companion that is the Windows app on this computer: it rings only while you are at the computer. A phone stays unticked, and rings by the Phones setting above. Say
+          which never to ring.
         </p>
         {devices === null ? (
           <p className="form-hint">Looking…</p>

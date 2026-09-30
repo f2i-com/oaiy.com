@@ -100,8 +100,6 @@ pub struct Ended {
     pub source: &'static str,
 }
 
-/// What the owner is told when somebody asked for them and no ring could be made for want of a device.
-pub const NO_DEVICE_TEXT: &str = "Someone asked for you. No device is set up to take a transfer, so they were offered a message.";
 /// What the owner is told when the phone said an owner device had already taken the call as they declined it.
 pub const TAKEN_NOTE: &str = "An owner device took the call just before you declined: it is being connected.";
 /// The most notices kept, and how long each is shown (milliseconds).
@@ -120,7 +118,10 @@ pub struct Notice {
     pub caller_number: String,
     /// Unix milliseconds.
     pub at: u64,
+    /// Why nobody could be rung, in a sentence that follows "Someone asked for you."
     pub text: String,
+    /// The cause of it, for the page to offer what helps (see [`super::preview::Cause`]).
+    pub cause: &'static str,
 }
 
 #[derive(Default)]
@@ -182,6 +183,8 @@ impl Ring {
         let Some(plan) = self.claimed_plan(&params.plan_id, &params.call_id) else {
             return Err(error(409, "unknown_plan", "that plan was not allowed for this call, or has run out: nothing rings"));
         };
+        // A request opened a ring: the plugin's consent is there.
+        self.note_ring_opened();
         let info = self.call_info(&params.call_id).unwrap_or_default();
         let now = self.now_ms();
         let given = params.expires_at.saturating_mul(1000);
@@ -286,7 +289,7 @@ impl Ring {
     /// Somebody asked for the owner and the plan had nobody to ring: told once a call, and shown until dismissed or a while has
     /// passed. The native notification is raised at most every ten minutes, so a caller who rings again and again cannot make
     /// the owner's computer chime for ever; the notice itself is always kept.
-    pub(super) fn note_no_device(&self, call: &str, info: &super::host::CallInfo) {
+    pub(super) fn note_no_device(&self, call: &str, info: &super::host::CallInfo, cause: super::preview::Cause) {
         let now = self.now_ms();
         let notice = {
             let mut sessions = self.sessions.lock().unwrap_or_else(|e| e.into_inner());
@@ -294,7 +297,7 @@ impl Ring {
             if sessions.notices.iter().any(|n| n.call_id == call) {
                 return;
             }
-            let notice = Notice { id: format!("notice_{}", &uuid::Uuid::new_v4().simple().to_string()[..12]), call_id: call.to_string(), caller_name: crate::messages::clean(&info.name, 80), caller_number: crate::messages::clean(&info.from, 40), at: now, text: NO_DEVICE_TEXT.to_string() };
+            let notice = Notice { id: format!("notice_{}", &uuid::Uuid::new_v4().simple().to_string()[..12]), call_id: call.to_string(), caller_name: crate::messages::clean(&info.name, 80), caller_number: crate::messages::clean(&info.from, 40), at: now, text: cause.notice_text().to_string(), cause: cause.code() };
             sessions.notices.push_back(notice.clone());
             while sessions.notices.len() > NOTICES_KEPT {
                 sessions.notices.pop_front();

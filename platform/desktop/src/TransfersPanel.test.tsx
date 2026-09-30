@@ -5,15 +5,15 @@
 import { act } from 'react';
 import { createRoot, type Root } from 'react-dom/client';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
-import type { RingSettings } from './api';
+import type { RingPreview, RingSettings } from './api';
 
-const api = vi.hoisted(() => ({ settings: vi.fn(), save: vi.fn(), status: vi.fn(), openSetup: vi.fn() }));
+const api = vi.hoisted(() => ({ settings: vi.fn(), save: vi.fn(), preview: vi.fn(), status: vi.fn(), openSetup: vi.fn() }));
 vi.mock('./useSetupState', () => ({ openSetup: (...a: unknown[]) => api.openSetup(...a) }));
 vi.mock('./api', async (importOriginal) => {
   const real = await importOriginal<typeof import('./api')>();
   return {
     ...real,
-    ring: { ...real.ring, settings: (...a: unknown[]) => api.settings(...a), save: (...a: unknown[]) => api.save(...a) },
+    ring: { ...real.ring, settings: (...a: unknown[]) => api.settings(...a), save: (...a: unknown[]) => api.save(...a), preview: (...a: unknown[]) => api.preview(...a) },
     companion: { ...real.companion, status: (...a: unknown[]) => api.status(...a) },
   };
 });
@@ -79,6 +79,7 @@ beforeEach(() => {
     return { settings, features: features(settings) };
   });
   api.status.mockResolvedValue({ approvedMobiles: [], pendingApprovals: [], available: true, rosterRevision: 1, rosterHash: 'h', remoteAccessReady: true });
+  api.preview.mockResolvedValue({ enabled: false, rings: false, devices: [], text: '', cause: null, plugin: null } satisfies RingPreview);
 });
 afterEach(async () => {
   await act(async () => root.unmount());
@@ -208,39 +209,106 @@ describe('Transfers', () => {
     api.settings.mockResolvedValue({ settings, features: features(settings) });
   };
   const warning = () => host.querySelector('[data-testid=nothing-would-ring]');
+  const preview = (change: Partial<RingPreview> = {}): RingPreview => ({ enabled: true, rings: false, devices: [], text: '', cause: null, plugin: null, ...change });
+  const says = (p: RingPreview) => api.preview.mockResolvedValue(p);
 
   it('warns, with a way to set one up, when transfers are on and no Companion is approved', async () => {
     on();
+    says(preview({ cause: 'noCompanion', text: 'No Companion is approved yet, so nothing can ring and every caller is offered a message.' }));
     await mount();
     expect(warning()?.textContent).toContain('No Companion is approved yet, so nothing can ring and every caller is offered a message.');
     await click([...warning()!.querySelectorAll('button')].find((b) => b.textContent === 'Set up a Companion')!);
     expect(api.openSetup).toHaveBeenCalledWith({ plugin: 'aokie', step: 'pair' });
   });
 
-  it('warns that nothing rings at this computer when a phone is approved and none is ticked as this computer’s, and stops once it is', async () => {
+  it('says what the desktop says a caller would get now, whichever way nothing would ring, and offers to set a Companion up only when there is none', async () => {
     on();
-    approve(PIXEL, OFFICE);
+    approve(PIXEL);
+    // A phone that is set never to ring: the way out is in the words, and there is no Companion to set up.
+    says(preview({ cause: 'phonesOff', text: 'Your phone is set to never ring, so nothing rings and a caller who asks for you is offered a message. Set Phones to “Ring when I am away” or “Always ring”.' }));
     await mount();
-    expect(warning()?.textContent).toContain('While you are at this computer nothing rings');
-    expect(warning()?.textContent).toContain('Tick “This is the Companion on this computer”');
-    const office = [...host.querySelectorAll('.transfers-devices li')].find((li) => li.textContent?.includes('Office PC'))!;
-    // A choice not yet saved is not what the desktop does: the warning is about what is saved.
-    await click(office.querySelectorAll('input')[0]);
-    expect(warning()).not.toBeNull();
-    await click(saveButton());
-    expect(warning()).toBeNull();
+    expect(warning()?.textContent).toContain('Your phone is set to never ring');
+    expect(warning()?.textContent).toContain('Set Phones to');
+    expect([...warning()!.querySelectorAll('button')]).toEqual([]);
+    // The only Companion is ticked as this computer's and the owner is not at it: the way out is in the words.
+    await act(async () => root.unmount());
+    root = createRoot(host);
+    says(preview({ cause: 'onlyThisComputers', text: 'The only Companion is set as the one on this computer, and it rings only while you are at the computer, which you are not now, so a caller who asks for you is offered a message. If it is a phone, untick “This is the Companion on this computer” below.' }));
+    await mount();
+    expect(warning()?.textContent).toContain('untick “This is the Companion on this computer”');
   });
 
-  it('says nothing while transfers are off, while devices are still being looked for, or when something rings', async () => {
+  it('says what would ring when something would, and quiet hours as a plain line and not as a warning', async () => {
+    on();
+    approve(PIXEL);
+    says(preview({ rings: true, devices: ['this computer', 'Pixel 6'], text: 'Right now a caller who asks for you would ring: this computer, Pixel 6.' }));
+    await mount();
+    expect(warning()).toBeNull();
+    expect(host.querySelector('[data-testid=what-would-ring]')?.textContent).toBe('Right now a caller who asks for you would ring: this computer, Pixel 6.');
+    await act(async () => root.unmount());
+    root = createRoot(host);
+    says(preview({ text: 'It is quiet hours now, so a caller who asks for you is offered a message.' }));
+    await mount();
+    expect(warning()).toBeNull();
+    expect(host.querySelector('[data-testid=what-would-ring]')?.textContent).toContain('quiet hours');
+  });
+
+  it('says so when the phone plugin does not offer the calls for transfer, and why', async () => {
+    on();
+    approve(PIXEL);
+    says(preview({ rings: true, text: 'Right now a caller who asks for you would ring: Pixel 6.', plugin: 'Your phone plugin does not support transfers yet: it did not offer the last call for transfer. Callers are offered a message.' }));
+    await mount();
+    expect(host.querySelector('[data-testid=plugin-state]')?.textContent).toContain('Your phone plugin does not support transfers yet');
+    await act(async () => root.unmount());
+    root = createRoot(host);
+    says(preview({ rings: true, text: 'Right now a caller who asks for you would ring: Pixel 6.', plugin: 'Transfers are not allowed by your phone plugin’s consent settings (the Phone page). Callers are offered a message.' }));
+    await mount();
+    expect(host.querySelector('[data-testid=plugin-state]')?.textContent).toContain('consent settings');
+  });
+
+  it('says nothing while transfers are off, or when nothing is wrong', async () => {
     approve(PIXEL);
     await mount();
     expect(warning()).toBeNull();
+    expect(host.querySelector('[data-testid=plugin-state]')).toBeNull();
+    expect(host.querySelector('[data-testid=what-would-ring]')).toBeNull();
     await act(async () => root.unmount());
     root = createRoot(host);
-    // A phone that rings whether the owner is at the computer or away.
     on({ phoneRing: 'always' });
+    says(preview({ rings: true, devices: ['Pixel 6'], text: 'Right now a caller who asks for you would ring: Pixel 6.' }));
     await mount();
     expect(warning()).toBeNull();
+    expect(host.querySelector('[data-testid=plugin-state]')).toBeNull();
+  });
+
+  it('says a paired app can change these settings too, whether transfers are on or off', async () => {
+    await mount();
+    const line = () => host.querySelector('[data-testid=paired-app-can-change]');
+    expect(line()?.textContent).toBe('A program on this computer that OAIY has paired can also change these settings, and turn transfers on. Pair only programs you trust.');
+    await act(async () => root.unmount());
+    root = createRoot(host);
+    on();
+    await mount();
+    expect(line()).not.toBeNull();
+  });
+
+  it('looks again at what a caller would get once the settings are saved', async () => {
+    approve(PIXEL);
+    await mount();
+    const before = api.preview.mock.calls.length;
+    await click(box('Transfer calls to me'));
+    await click(saveButton());
+    expect(api.preview.mock.calls.length).toBeGreaterThan(before);
+  });
+
+  it('tells a phone from the Companion on this computer in its own words: only the second is ticked', async () => {
+    approve(PIXEL, OFFICE);
+    await mount();
+    expect(text()).toContain('Tick “This is the Companion on this computer” only for a Companion that is the Windows app on this computer');
+    expect(text()).toContain('A phone stays unticked, and rings by the Phones setting');
+    expect(text()).toContain('A phone rings when you are away, and also when no Companion on this computer can take the call');
+    // Nothing is ticked for either until the owner says.
+    expect([...host.querySelectorAll<HTMLInputElement>('.transfers-devices input')].every((i) => !i.checked)).toBe(true);
   });
 
   it('says how to pair a Companion when there is none', async () => {

@@ -116,13 +116,20 @@ switches are **off** until you turn them on, and with them off the phone answers
   connection is being made, at most two short lines saying it is still being made, and nothing once you have the call.
 - **It needs a device.** A notification on this computer is not something a call can be offered
   to: the phone plugin offers a transfer only to the Companions the plan names. So a ring happens
-  only when you have set one up: tick **This is the Companion on this computer** (Transfers page)
-  for the Companion that runs here, which is the one that rings while you are at your computer,
-  and/or approve a Companion on a second phone, which rings when you are away (or always, if you
-  say so). With none, nothing rings: the caller is offered a message, no try is used up, and you are
-  told, by a notification and a note on this window, "Someone asked for you. No device is set up to
-  take a transfer, so they were offered a message." The Transfers page warns you when **Transfer
-  calls to me** is on and nothing would ring.
+  only when you have approved a Companion (Phone page). **One phone is enough.** A phone rings when
+  you are away, and also when no Companion on this computer can take the call, so a caller who asks
+  for you rings your phone whether you are at your computer or not (Phones: *Always ring* rings it
+  even when a Companion on this computer rings too). Tick **This is the Companion on this computer**
+  (Transfers page) only for a Companion that is the Windows app on this computer: it rings only while
+  you are at your computer, so a phone ticked there would not ring when you are away. Nothing rings
+  when nothing is approved, when every Companion is set to never ring, when phones are set to never
+  ring, or when the only Companion is the one on this computer and you are not at it: the caller is
+  offered a message, no try is used up, and you are told, by a notification and a note on this
+  window, which it was ("Someone asked for you. Your phone is set to not ring, so they were offered a
+  message."), never that no device is set up when one is. The Transfers page says, from the same
+  policy, what a caller who asks for you would get **right now** (what would ring, or why nothing
+  would), and warns when your phone plugin does not offer calls for transfer: too old to support
+  it, no Companion approved, or the Companion's consent for taking calls not granted.
 - **Take messages.** The receptionist keeps a message from a caller who wants to leave one, or
   when nobody could take the call. It is on whenever transfers are: taking a message is what a
   transfer nobody answers falls back to, always.

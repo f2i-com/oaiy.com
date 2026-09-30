@@ -167,11 +167,19 @@ agent : "I'll try to reach them, please stay with me."  (it is trying: it does n
   therefore never plans a `ring` that names nobody: when the reference policy would ring only the toast
   (the owner at the computer, no Companion ticked as this computer's), the plan is `message_only` with
   the reason `no_endpoint` (the plugin's own word for it), before any try is counted, the model is told to offer a message, and the owner
-  is told what happened (a notice in the dialog and a notification, at most one chime every ten
-  minutes). The Companion on this computer is the approved device the owner ticks on the Transfers
-  page; it is named in `desktopCompanions` while the owner is at the computer, running or not: the
-  notification is what starts a Companion that is not running, and the plugin offers it the request
-  when it connects inside the ring window.
+  is told what happened and why (a notice in the dialog and a notification, at most one chime every ten
+  minutes; never that no device is set up when a phone is approved and only set not to ring). The Companion on
+  this computer is the approved device the owner ticks on the Transfers page; it is named in
+  `desktopCompanions` while the owner is at the computer, running or not: the notification is what starts
+  a Companion that is not running, and the plugin offers it the request when it connects inside the ring
+  window. The roster carries no kind (a device id, a name and a key), so a Companion is a phone unless the
+  owner ticked it. **"Ring when I am away" holds for phones when no Companion on this computer can take
+  the call instead**: an owner at the computer with one phone approved and nothing ticked (the setup of
+  most owners) rings the phone, in every state of presence. The reference plan is the raw policy (its 33
+  vectors); `Ring::plan_for` is what is done with its answer. `GET /api/ring/preview` asks the same policy
+  what a caller would get now (nothing is counted) and adds what the phone plugin did with the calls that
+  began while transfers were on (offered for transfer, or not: too old, no Companion approved, or its
+  consent); the Transfers page shows both.
 - **What the model is told.** The instructions and the tool list follow the owner's settings, not the
   call, so they are the same for every call and caller and the engine's prompt cache holds them (with
   the settings off, they are byte for byte what they were). Whether the owner can be rung on *this*

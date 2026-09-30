@@ -18,7 +18,7 @@ use serde_json::{json, Value};
 
 use super::limits::Attempts;
 use super::plan::{plan, CallFacts, Device, Inputs, Now, Presence, Reason, RingPlan};
-use super::settings::{RingSettings, SettingsError, SettingsStore};
+use super::settings::{PhoneRing, RingSettings, SettingsError, SettingsStore};
 use super::{phrases, Decision, PlanReason};
 
 /// How long a plan that was allowed waits for the plugin to ask for it.
@@ -163,6 +163,8 @@ pub struct Ring {
     notifier: RwLock<Option<Arc<dyn super::session::RingNotifier>>>,
     /// How long past its time a ring waits to hear how it came out before it is over.
     pub(super) expiry_grace: RwLock<Duration>,
+    /// Whether the phone plugin offers calls for transfer (see `preview.rs`).
+    pub(super) offers: super::preview::OfferLog,
 }
 
 fn get<T: Clone>(lock: &RwLock<T>) -> T {
@@ -188,6 +190,7 @@ impl Ring {
             sessions: Mutex::new(super::session::Sessions::default()),
             notifier: RwLock::new(None),
             expiry_grace: RwLock::new(super::session::EXPIRY_GRACE),
+            offers: Mutex::default(),
         })
     }
 
@@ -341,7 +344,30 @@ impl Ring {
             now: Now::of(&local),
             settings: effective,
         };
-        name_somebody(plan(&inputs))
+        Ring::plan_for(&inputs)
+    }
+
+    /// The plan the policy makes for `inputs`, as this desktop answers with it: what the reference plans, with two things changed that the phone
+    /// plugin's contract and the owner's own purpose ask for.
+    ///
+    /// A phone rings for a caller who asks for the owner whether or not they are at the computer, unless they said phones never ring: the
+    /// reference rings phones only when the owner is away, and only names a Companion that is a Windows one, so an owner at their computer with
+    /// a phone approved and nothing ticked as this computer's would ring nobody (the plan would name only the toast, which is not a device).
+    /// "Ring when I am away" therefore also holds when there is no Companion on this computer to take the call instead; the reference vectors
+    /// are the raw policy, and this is what is done with its answer. Then a plan that would ring only the toast is made `no_endpoint`
+    /// (see [`name_somebody`]).
+    pub(super) fn plan_for(inputs: &Inputs) -> (RingPlan, bool) {
+        let first = plan(inputs);
+        let nobody = (first.rings() && first.targets().is_empty()) || (first.decision == Decision::MessageOnly && first.reason == PlanReason::NoEndpoint);
+        if nobody && inputs.settings.phone_ring == PhoneRing::WhenAway {
+            let mut again = inputs.clone();
+            again.settings.phone_ring = PhoneRing::Always;
+            let with_phones = plan(&again);
+            if with_phones.rings() && !with_phones.targets().is_empty() {
+                return (with_phones, false);
+            }
+        }
+        name_somebody(first)
     }
 
     /// Whether a request to reach the owner on `call` is allowed: judged on what this desktop heard
@@ -356,9 +382,10 @@ impl Ring {
     }
 
     fn judge(&self, call: &str, reason: Reason, info: CallInfo, settings: &RingSettings) -> Authorised {
-        let (plan, toast_only) = self.decide(call, reason, &info, settings);
-        if toast_only {
-            self.note_no_device(call, &info);
+        let (plan, _) = self.decide(call, reason, &info, settings);
+        // Nobody could be rung for want of a device that may ring: the owner is told, and why.
+        if plan.reason == PlanReason::NoEndpoint {
+            self.note_no_device(call, &info, self.cause(settings));
         }
         let reason_allowed = plan.decision == Decision::Ring && vouches_for(reason, settings, &info.turns);
         let id = new_plan_id();

@@ -678,6 +678,11 @@ where
     let ring = hub.ring();
     let features = ring.features();
     let allow_transfer = !speak_only && !outbound && features.transfer && start.get("allowTransfer").and_then(Value::as_bool) == Some(true);
+    // Whether the phone plugin offers the calls that begin while transfers are on: the Transfers page says so when it does not (a plugin that
+    // is too old, or has no consent, or has no Companion approved leaves the settings looking right and nothing ever ringing).
+    if !speak_only && !outbound {
+        ring.note_call(features.transfer, start.get("allowTransfer").and_then(Value::as_bool) == Some(true));
+    }
     // The call comes back to this desktop after the owner had it: the phone says so (`resume`).
     let start_resume = start.get("resume").filter(|r| r.get("afterHandoff").and_then(Value::as_bool) == Some(true)).cloned();
     // The voice chosen for calls (a clip in the voices folder; see `voices`).
@@ -1087,6 +1092,9 @@ where
                                         // The phone refused it itself (consent, a changed call, a plan it could not use) and rang nobody:
                                         // the try this desktop counted for it is given back, so a refusal does not start the gap or spend the hour.
                                         hub.ring().request_refused(&ids.call);
+                                        if output.get("reason").and_then(Value::as_str) == Some("consent") {
+                                            ring.note_consent_refused();
+                                        }
                                         // A ring the owner declined for a request that was refused has nothing to withdraw: it is over here.
                                         if let Some((queued, _)) = queued_cancel.take() {
                                             ring.outcome_seen(&queued, Outcome::Declined, "desktop");
@@ -2852,6 +2860,47 @@ mod tests {
                 assert_eq!(tries(&aokie).global_attempts_last_hour, 0);
             }
         }
+    }
+
+    #[tokio::test]
+    async fn the_transfers_page_learns_whether_the_phone_plugin_offers_the_calls_that_begin_while_transfers_are_on() {
+        // A call whose phone does not offer it, with transfers on: the plugin is too old (it never has), which the page says.
+        let aokie = transferable(owner_settings(true), false).await;
+        let line = aokie.hub.ring().preview().plugin.expect("the page is told");
+        assert!(line.contains("does not support transfers yet"), "{line}");
+        // A call that is offered: well.
+        let aokie = transferable(owner_settings(true), true).await;
+        assert!(aokie.hub.ring().preview().plugin.is_none());
+        // Transfers off: a call not offered says nothing about the plugin.
+        let aokie = transferable(owner_settings(false), false).await;
+        assert!(aokie.hub.ring().preview().plugin.is_none() && !aokie.hub.ring().preview().enabled);
+        // A request the plugin then refuses for want of consent says so.
+        let mut aokie = transferable(owner_settings(true), true).await;
+        caller_asks(&aokie);
+        let asked = asking(&aokie, transfer::TOOL, json!({"reason": "caller_asked"}));
+        let call = aokie.text("formlogic.realtime.tool_call", secs(3)).await.expect("the request reached the phone");
+        let mut refusal = on_this_call(shared("tool-result")["frame"].clone(), &aokie, None);
+        refusal["toolCallId"] = call["toolCallId"].clone();
+        refusal["ok"] = json!(false);
+        refusal["output"] = json!({"status": "refused", "reason": "consent", "instruction": "Offer a message."});
+        aokie.send(refusal);
+        answer_of(asked).await.unwrap();
+        let line = aokie.hub.ring().preview().plugin.expect("the page is told");
+        assert!(line.contains("consent settings") && line.contains("Phone page"), "{line}");
+    }
+
+    #[tokio::test]
+    async fn a_call_this_desktop_placed_or_a_line_to_say_says_nothing_about_the_plugin() {
+        let aokie = Aokie::start_with(json!({"direction": "outbound", "from": "+61491570006"}), |hub| {
+            hub.set_ring(crate::ring::Ring::in_memory(owner_settings(true)));
+        })
+        .await;
+        assert!(aokie.hub.ring().preview().plugin.is_none(), "an outbound call is never offered for transfer, and that is not the plugin's fault");
+        let aokie = Aokie::start_with(json!({"mode": "speak", "greeting": "Please hold."}), |hub| {
+            hub.set_ring(crate::ring::Ring::in_memory(owner_settings(true)));
+        })
+        .await;
+        assert!(aokie.hub.ring().preview().plugin.is_none());
     }
 
     #[tokio::test]

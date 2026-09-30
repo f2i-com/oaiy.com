@@ -7,6 +7,8 @@
 //!                              [`super::settings::RingSettings`]), `quietHours` and `limits`
 //!                              member by member; a name that is not a setting, or a value of
 //!                              the wrong kind, is a 400 `bad_settings` and changes nothing
+//!   GET /api/ring/preview   → what a caller who asks for the owner would get right now, in words, and what the phone
+//!                              plugin has done with the calls while transfers were on (`preview.rs`); nothing is counted
 //!   GET /api/ring/active    → {rings}: whom the receptionist is trying to reach the owner for now
 //!   POST /api/ring/active/:id/respond {action} → {ok, note}: the owner answers in the dialog
 //!
@@ -27,10 +29,16 @@ use super::Ring;
 pub fn router(ring: Arc<Ring>) -> Router {
     Router::new()
         .route("/api/ring/settings", get(get_settings).put(put_settings))
+        .route("/api/ring/preview", get(preview))
         .route("/api/ring/active", get(active))
         .route("/api/ring/active/:id/respond", post(respond))
         .route("/api/ring/notices/:id/dismiss", post(dismiss))
         .with_state(ring)
+}
+
+/// `GET /api/ring/preview` → [`super::Preview`]: what would happen to a caller who asked for the owner now.
+async fn preview(State(ring): State<Arc<Ring>>) -> Json<super::Preview> {
+    Json(ring.preview())
 }
 
 /// `GET /api/ring/active` → `{rings, notices}`: the callers the receptionist is trying to reach the owner for now (see

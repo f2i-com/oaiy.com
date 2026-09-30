@@ -46,7 +46,8 @@ const notice = (n: Partial<RingNotice> = {}): RingNotice => ({
   callerName: 'Alex',
   callerNumber: '+61491570006',
   at: NOW,
-  text: 'Someone asked for you. No device is set up to take a transfer, so they were offered a message.',
+  text: 'No Companion is approved to take a transfer, so they were offered a message.',
+  cause: 'noCompanion',
   ...n,
 });
 
@@ -248,7 +249,7 @@ describe('the ring dialog', () => {
     expect(host.querySelector('.ring-dialog')).toBeNull();
     const stack = host.querySelector('[role=status].ring-notices')!;
     expect(stack.textContent).toContain('Alex asked for you.');
-    expect(stack.textContent).toContain('No device is set up to take a transfer, so they were offered a message.');
+    expect(stack.textContent).toContain('No Companion is approved to take a transfer, so they were offered a message.');
     expect(button('Accept')).toBeUndefined();
     await click(button('Set up a Companion'));
     expect(api.openSetup).toHaveBeenCalledWith({ plugin: 'aokie', step: 'pair' });
@@ -261,6 +262,23 @@ describe('the ring dialog', () => {
     });
     await settle();
     expect(host.querySelector('.ring-notices')).toBeNull();
+  });
+
+  it('says what was found, and offers to set a Companion up only when none is approved: a phone set not to ring is not a missing device', async () => {
+    api.active.mockResolvedValue({ rings: [], notices: [notice({ id: 'n_phone', cause: 'phonesOff', text: 'Your phone is set to not ring, so they were offered a message.' })] });
+    await mount();
+    const stack = host.querySelector('.ring-notices')!;
+    expect(stack.textContent).toContain('Your phone is set to not ring, so they were offered a message.');
+    expect(stack.textContent).not.toContain('No device is set up');
+    expect(button('Set up a Companion')).toBeUndefined();
+    expect(button('Dismiss')).toBeDefined();
+    // A notice from a desktop that names no cause keeps the button it had.
+    api.active.mockResolvedValue({ rings: [], notices: [notice({ id: 'n_old', cause: undefined })] });
+    await act(async () => {
+      vi.advanceTimersByTime(POLL_MS + 10);
+    });
+    await settle();
+    expect(button('Set up a Companion')).toBeDefined();
   });
 
   it('shows a notice as plain text and a hidden number as such, beside a ring that is going', async () => {

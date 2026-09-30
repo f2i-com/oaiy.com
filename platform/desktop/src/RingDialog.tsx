@@ -101,9 +101,11 @@ export default function RingDialog({ on = true }: { on?: boolean }) {
           </p>
           <p>{n.text}</p>
           <div className="ring-notice-actions">
-            <button type="button" className="btn-tiny" onClick={() => openSetup({ plugin: 'aokie', step: 'pair' })}>
-              Set up a Companion
-            </button>
+            {(!n.cause || n.cause === 'noCompanion') && (
+              <button type="button" className="btn-tiny" onClick={() => openSetup({ plugin: 'aokie', step: 'pair' })}>
+                Set up a Companion
+              </button>
+            )}
             <button type="button" className="btn-tiny" onClick={() => dismiss(n.id)}>
               Dismiss
             </button>

@@ -824,10 +824,24 @@ async fn a_caller_who_talks_the_model_into_it_rings_nobody_even_when_the_plugin_
 }
 
 #[tokio::test]
-async fn in_the_default_setup_nobody_is_rung_for_want_of_a_device_the_owner_is_told_and_a_message_is_kept() {
-    // The owner at their computer, a phone approved, and no Companion ticked as this computer's: nothing a call can be offered to.
+async fn in_the_default_setup_with_one_phone_approved_the_owner_at_their_computer_is_rung_on_the_phone() {
+    // The reviewer's setup: the owner at their computer, one Companion on a second phone, no Companion ticked as this computer's, and the settings
+    // as they come. What used to happen was that nothing rang and the owner was told no device was set up. The phone rings.
     let devices = Arc::new(crate::ring::testing::Devices(vec![crate::ring::testing::android("ph1")]));
     let mut f = flow_on(owner_settings(true), None, devices).await;
+    f.caller_says(ASKED);
+    let plan = f.ring_through("assist_1", 30).await;
+    assert_eq!((plan["phones"].clone(), plan["decision"].clone()), (json!(["ph1"]), json!("ring")), "{plan}");
+    assert_eq!(f.dialog().await.len(), 1);
+    assert!(f.notices().await.is_empty(), "nothing is wrong: nothing to tell the owner");
+    assert_eq!(tries(&f.aokie).global_attempts_last_hour, 1);
+}
+
+#[tokio::test]
+async fn when_the_owner_said_phones_never_ring_nobody_is_rung_for_want_of_a_device_the_owner_is_told_and_a_message_is_kept() {
+    // The owner at their computer, a phone approved and set to never ring, and no Companion ticked as this computer's: nothing a call can be offered to.
+    let devices = Arc::new(crate::ring::testing::Devices(vec![crate::ring::testing::android("ph1")]));
+    let mut f = flow_on(RingSettings { phone_ring: crate::ring::settings::PhoneRing::Never, ..owner_settings(true) }, None, devices).await;
     f.caller_says(ASKED);
     let answer = answer_of(asking(&f.aokie, transfer::TOOL, json!({"reason": "caller_asked"}))).await.unwrap();
     assert_eq!((answer["ok"].clone(), answer["output"]["status"].clone(), answer["output"]["reason"].clone()), (json!(false), json!("unavailable"), json!("no_endpoint")), "{answer}");
@@ -842,7 +856,7 @@ async fn in_the_default_setup_nobody_is_rung_for_want_of_a_device_the_owner_is_t
     assert!(f.dialog().await.is_empty() && f.bell.rang.lock().unwrap().is_empty());
     let notices = f.notices().await;
     assert_eq!(notices.len(), 1);
-    assert!(notices[0]["text"].as_str().unwrap().contains("No device is set up to take a transfer"), "{}", notices[0]);
+    assert!(notices[0]["text"].as_str().unwrap().contains("Your phone is set to not ring") && !notices[0]["text"].as_str().unwrap().contains("No device is set up"), "{}", notices[0]);
     assert_eq!((notices[0]["callerName"].as_str(), notices[0]["callerNumber"].as_str()), (Some("Alex"), Some(RANG_FROM)));
     assert_eq!(f.bell.noticed.lock().unwrap().len(), 1, "a notification was asked for");
     // The caller is offered a message and it is kept.

@@ -793,7 +793,7 @@ mod tests {
         }
         let limit = refused("refused", "limit_gap");
         assert!(limit["output"]["instruction"].as_str().unwrap().contains("Do not try again"));
-        assert!(refused("refused", "caller_did_not_ask")["output"]["instruction"].as_str().unwrap().contains("has not asked"));
+        assert!(refused("refused", "caller_did_not_ask")["output"]["instruction"].as_str().unwrap().contains("has not clearly asked"));
     }
 
     #[test]

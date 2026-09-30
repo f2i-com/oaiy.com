@@ -412,15 +412,21 @@ fn the_time_the_phone_gives_is_believed_only_when_it_makes_sense() {
     }
 }
 
-/// The owner at their computer, an approved phone, and nothing ticked as this computer's Companion: the default setup.
-fn nobody_to_offer_a_call_to(r: &Rig) {
+/// An approved phone, and nothing ticked as this computer's Companion: the setup of an owner with one Companion, on a second phone.
+fn only_a_phone(r: &Rig) {
     r.ring.set_devices(Arc::new(crate::ring::testing::Devices(vec![crate::ring::testing::android("ph1")])));
+}
+
+/// ...whose owner said phones never ring: nothing a call can be offered to.
+fn phones_never_ring(r: &Rig) {
+    only_a_phone(r);
+    r.ring.change_settings(&json!({ "phoneRing": "never" })).unwrap();
 }
 
 #[test]
 fn a_toast_alone_is_not_a_ring_so_nobody_is_planned_for_and_no_try_is_counted() {
     let r = rig(Presence::Active);
-    nobody_to_offer_a_call_to(&r);
+    phones_never_ring(&r);
     // The reference plans a ring for the owner at their computer with only the toast, and this desktop does not: a plugin that
     // offers a transfer only to the devices a plan names would open nothing for it.
     let plan = r.ring.authorise(CALL, Reason::CallerAsked);
@@ -440,9 +446,147 @@ fn a_toast_alone_is_not_a_ring_so_nobody_is_planned_for_and_no_try_is_counted() 
 }
 
 #[test]
+fn the_owner_at_their_computer_with_only_a_phone_approved_is_rung_on_the_phone_by_default() {
+    // The setup of an owner with one Companion, on a second phone, and the settings as they come: "ring when I am away" holds when there is no
+    // Companion on this computer to take the call instead, so a caller who asks for the owner rings the phone, whatever the owner is doing.
+    for presence in [Presence::Active, Presence::Idle, Presence::Locked, Presence::Off] {
+        let r = rig(presence);
+        only_a_phone(&r);
+        let plan = r.ring.authorise(CALL, Reason::CallerAsked);
+        assert!(plan.rings(), "{presence:?}: {:?}", plan.plan);
+        assert_eq!(plan.plan.phones, vec!["ph1".to_string()], "{presence:?}");
+        assert_eq!(plan.plan.desktop_toast, presence == Presence::Active, "{presence:?}: this computer rings too while they are at it");
+        assert!(r.ring.notices().is_empty(), "{presence:?}: nothing to tell the owner");
+    }
+    // The owner who said phones ring only when they are away and has this computer's Companion set up keeps that: at the computer it rings.
+    let r = rig(Presence::Active);
+    r.ring.set_devices(Arc::new(crate::ring::testing::Devices(vec![crate::ring::testing::android("ph1"), crate::ring::testing::windows("pc1")])));
+    let plan = r.ring.authorise(CALL, Reason::CallerAsked);
+    assert_eq!((plan.plan.phones.clone(), plan.plan.desktop_companions.clone()), (vec![], vec!["pc1".to_string()]));
+    // Never means never.
+    let r = rig(Presence::Active);
+    phones_never_ring(&r);
+    assert!(!r.ring.authorise(CALL, Reason::CallerAsked).rings());
+    // A phone set to never ring, by device, is left out too.
+    let r = rig(Presence::Active);
+    only_a_phone(&r);
+    r.ring.change_settings(&json!({ "desktopRing": "never" })).unwrap();
+    assert!(r.ring.authorise(CALL, Reason::CallerAsked).rings(), "this computer set never to ring does not stop a phone from ringing");
+}
+
+/// What a caller who asks for the owner would get, for `devices` and `settings`, with the owner `presence`.
+fn previewed(presence: Presence, devices: Vec<Device>, change: serde_json::Value) -> crate::ring::Preview {
+    let r = rig(presence);
+    r.ring.set_devices(Arc::new(crate::ring::testing::Devices(devices)));
+    r.ring.change_settings(&change).unwrap();
+    r.ring.preview()
+}
+
+#[test]
+fn the_preview_says_what_a_caller_would_get_in_each_state_of_the_owner_and_of_their_devices() {
+    use crate::ring::testing::{android, windows};
+    let none = json!({});
+    // One Companion, on a second phone (the user's own setup): it rings whatever the owner is doing.
+    for presence in [Presence::Active, Presence::Idle, Presence::Locked, Presence::Off] {
+        let p = previewed(presence, vec![android("ph1")], none.clone());
+        assert!(p.enabled && p.rings && p.cause.is_none() && p.devices.iter().any(|d| d.contains("ph1")), "{presence:?}: {p:?}");
+        assert!(p.text.starts_with("Right now a caller who asks for you would ring:") && p.text.contains("ph1"), "{presence:?}: {}", p.text);
+    }
+    // One Companion, the Windows one on this computer: it rings while the owner is at the computer, and only then.
+    let p = previewed(Presence::Active, vec![windows("pc1")], none.clone());
+    assert!(p.rings && p.devices.iter().any(|d| d == "this computer") && p.devices.iter().any(|d| d.contains("pc1")), "{p:?}");
+    for presence in [Presence::Idle, Presence::Locked, Presence::Off] {
+        let p = previewed(presence, vec![windows("pc1")], none.clone());
+        assert!(!p.rings && p.cause == Some("onlyThisComputers"), "{presence:?}: {p:?}");
+        assert!(p.text.contains("which you are not now") && p.text.contains("untick"), "{presence:?}: the way out is said: {}", p.text);
+    }
+    // A phone the owner ticked as this computer's (the mistake the page's advice made easy): at the computer it rings, away it does not, and
+    // the page says so and how to put it right.
+    let ticked = vec![windows("ph1")];
+    assert!(previewed(Presence::Active, ticked.clone(), none.clone()).rings);
+    assert_eq!(previewed(Presence::Idle, ticked, none.clone()).cause, Some("onlyThisComputers"));
+    // Both: the computer's Companion while they are at it, the phone when they are away.
+    let both = || vec![android("ph1"), windows("pc1")];
+    let at = previewed(Presence::Active, both(), none.clone());
+    assert!(at.rings && at.devices.iter().any(|d| d.contains("pc1")) && !at.devices.iter().any(|d| d.contains("ph1")), "{at:?}");
+    let away = previewed(Presence::Idle, both(), none.clone());
+    assert!(away.rings && away.devices.iter().any(|d| d.contains("ph1")) && !away.devices.iter().any(|d| d.contains("pc1")), "{away:?}");
+    // None approved, all set never to ring, phones set never to ring.
+    for presence in [Presence::Active, Presence::Off] {
+        let p = previewed(presence, vec![], none.clone());
+        assert!(!p.rings && p.cause == Some("noCompanion") && p.text.contains("No Companion is approved yet"), "{presence:?}: {p:?}");
+    }
+    let p = previewed(Presence::Active, vec![], json!({ "excludedDevices": ["ph1"] }));
+    assert_eq!(p.cause, Some("allNever"));
+    let p = previewed(Presence::Active, vec![android("ph1")], json!({ "phoneRing": "never" }));
+    assert!(!p.rings && p.cause == Some("phonesOff") && p.text.contains("Set Phones to"), "{p:?}");
+    // Quiet hours are a reason of their own, and transfers off says nothing.
+    let quiet = json!({ "quietHours": { "enabled": true, "start": "00:00", "end": "23:59", "days": 127, "allowUrgent": false, "allowVip": false } });
+    let p = previewed(Presence::Active, vec![android("ph1")], quiet);
+    assert!(!p.rings && p.cause.is_none() && p.text.contains("quiet hours"), "{p:?}");
+    let p = previewed(Presence::Active, vec![android("ph1")], json!({ "enabled": false }));
+    assert!(!p.enabled && !p.rings && p.text.is_empty() && p.plugin.is_none());
+    // Nothing is counted for asking.
+    let r = rig(Presence::Active);
+    only_a_phone(&r);
+    r.ring.preview();
+    let counters = r.ring.attempts.lock().unwrap().counters(CALL, "491570006", r.ring.clock().unix());
+    assert_eq!((counters.attempts_this_call, counters.global_attempts_last_hour), (0, 0));
+}
+
+#[test]
+fn the_page_is_told_when_the_phone_plugin_does_not_offer_calls_for_transfer_and_why() {
+    let r = rig(Presence::Active);
+    only_a_phone(&r);
+    // Nothing has happened yet, or the calls were offered, or transfers were off: nothing to say.
+    assert!(r.ring.preview().plugin.is_none());
+    r.ring.note_call(false, false);
+    assert!(r.ring.preview().plugin.is_none(), "a call that began with transfers off says nothing about the plugin");
+    r.ring.note_call(true, true);
+    assert!(r.ring.preview().plugin.is_none());
+    // A plugin that never offered a call: too old.
+    let old = rig(Presence::Active);
+    only_a_phone(&old);
+    old.ring.note_call(true, false);
+    let line = old.ring.preview().plugin.unwrap();
+    assert!(line.contains("does not support transfers yet") && line.contains("offered a message"), "{line}");
+    // One that offered before and does not now: its consent for taking calls.
+    r.ring.note_call(true, false);
+    let line = r.ring.preview().plugin.unwrap();
+    assert!(line.contains("consent settings") && !line.contains("does not support"), "{line}");
+    // Offered again: it is well.
+    r.ring.note_call(true, true);
+    assert!(r.ring.preview().plugin.is_none());
+    // With no Companion approved, that is the reason it does not offer.
+    let none = rig(Presence::Active);
+    none.ring.set_devices(Arc::new(crate::ring::testing::Devices(vec![])));
+    none.ring.note_call(true, false);
+    assert!(none.ring.preview().plugin.unwrap().contains("No Companion is approved"));
+    // A request the plugin refused for want of consent says so, until a ring opens.
+    r.ring.note_consent_refused();
+    assert!(r.ring.preview().plugin.unwrap().contains("consent settings"));
+    let plan = planned(&r.ring, CALL);
+    r.ring.opened(&opened(&plan, "assist_1", CALL, 25, &r.ring)).unwrap();
+    assert!(r.ring.preview().plugin.is_none(), "a ring opened: consent is there");
+    // Transfers off: nothing is said at all.
+    old.ring.change_settings(&json!({ "enabled": false })).unwrap();
+    assert!(old.ring.preview().plugin.is_none());
+}
+
+#[tokio::test]
+async fn the_preview_is_read_over_http() {
+    let r = rig(Presence::Active);
+    only_a_phone(&r);
+    let base = serve(r.ring.clone()).await;
+    let read: serde_json::Value = reqwest::get(format!("{base}/api/ring/preview")).await.unwrap().json().await.unwrap();
+    assert_eq!((read["enabled"].clone(), read["rings"].clone(), read["cause"].clone()), (json!(true), json!(true), json!(null)), "{read}");
+    assert!(read["devices"].as_array().unwrap().iter().any(|d| d == "this computer"), "{read}");
+}
+
+#[test]
 fn the_owner_away_still_rings_their_phone_and_only_the_toast_needs_the_computers_companion() {
     let r = rig(Presence::Idle);
-    nobody_to_offer_a_call_to(&r);
+    only_a_phone(&r);
     let plan = r.ring.authorise(CALL, Reason::CallerAsked);
     assert!(plan.rings(), "{:?}", plan.plan);
     assert_eq!(plan.plan.phones, vec!["ph1".to_string()]);
@@ -458,14 +602,15 @@ fn the_owner_away_still_rings_their_phone_and_only_the_toast_needs_the_computers
 #[test]
 fn the_owner_is_told_once_a_call_that_nobody_could_be_rung_for_want_of_a_device_and_can_dismiss_it() {
     let r = rig(Presence::Active);
-    nobody_to_offer_a_call_to(&r);
+    phones_never_ring(&r);
     r.ring.authorise(CALL, Reason::CallerAsked);
     r.ring.plan_for_plugin(CALL, Reason::CallerAsked, CallInfo::default());
     let notices = r.ring.notices();
     assert_eq!(notices.len(), 1, "once a call, whoever asked");
     let n = &notices[0];
-    assert_eq!((n.call_id.as_str(), n.caller_name.as_str(), n.caller_number.as_str(), n.text.as_str()), (CALL, "Alex", "+61491570006", crate::ring::session::NO_DEVICE_TEXT));
-    assert!(n.text.contains("No device is set up to take a transfer") && n.text.contains("offered a message"));
+    assert_eq!((n.call_id.as_str(), n.caller_name.as_str(), n.caller_number.as_str(), n.text.as_str(), n.cause), (CALL, "Alex", "+61491570006", crate::ring::Cause::PhonesOff.notice_text(), "phonesOff"));
+    // A phone is approved and set to not ring: never told that no device is set up.
+    assert!(n.text.contains("Your phone is set to not ring") && n.text.contains("offered a message") && !n.text.contains("No device"), "{}", n.text);
     assert_eq!(r.notified.noticed.lock().unwrap().len(), 1, "and the desktop was asked to tell the owner");
     // A ring is not what this is: nothing is offered to accept.
     assert!(r.ring.active().is_empty());
@@ -491,7 +636,7 @@ fn the_owner_is_told_once_a_call_that_nobody_could_be_rung_for_want_of_a_device_
 fn a_quiet_hour_or_a_disabled_setting_is_not_a_missing_device() {
     // Transfers off: message only for its own reason, and no notice about devices.
     let r = rig(Presence::Active);
-    nobody_to_offer_a_call_to(&r);
+    phones_never_ring(&r);
     r.ring.change_settings(&json!({ "enabled": false })).unwrap();
     let plan = r.ring.authorise(CALL, Reason::CallerAsked);
     assert_eq!(plan.plan.reason, PlanReason::Disabled);
@@ -779,7 +924,7 @@ async fn the_dialog_reads_the_rings_and_answers_them_over_http() {
 #[tokio::test]
 async fn a_notice_that_nobody_could_be_rung_is_read_and_dismissed_over_http() {
     let r = rig(Presence::Active);
-    nobody_to_offer_a_call_to(&r);
+    phones_never_ring(&r);
     let base = serve(r.ring.clone()).await;
     let client = reqwest::Client::new();
     r.ring.authorise(CALL, Reason::CallerAsked);
@@ -787,7 +932,7 @@ async fn a_notice_that_nobody_could_be_rung_is_read_and_dismissed_over_http() {
     assert_eq!(read["rings"], json!([]));
     let notice = &read["notices"][0];
     assert_eq!((notice["callerName"].as_str(), notice["callerNumber"].as_str(), notice["callId"].as_str()), (Some("Alex"), Some("+61491570006"), Some(CALL)), "{notice}");
-    assert!(notice["text"].as_str().unwrap().contains("No device is set up"));
+    assert!(notice["text"].as_str().unwrap().contains("Your phone is set to not ring") && notice["cause"] == "phonesOff", "{notice}");
     let id = notice["id"].as_str().unwrap().to_string();
     let gone = client.post(format!("{base}/api/ring/notices/notice_nope/dismiss")).send().await.unwrap();
     assert_eq!(gone.status(), 404);

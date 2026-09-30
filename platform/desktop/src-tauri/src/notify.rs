@@ -82,7 +82,8 @@ impl RingNotifier for GuiRing {
     /// Somebody asked for the owner and no device was set up to take a transfer: told, without bringing the window up
     /// (nothing rings, and there is nothing to answer).
     fn noticed(&self, notice: &crate::ring::Notice) {
-        let body = format!("{} asked for you. No device is set up to take a transfer, so they were offered a message.", who(&notice.caller_name, &notice.caller_number));
+        // Why nobody was rung is what the desktop found (never that no device is set up when a phone is approved and only set not to ring).
+        let body = format!("{} asked for you. {}", who(&notice.caller_name, &notice.caller_number), notice.text);
         if let Err(e) = self.toast.show("Someone asked for you", &body) {
             log::warn!("ring: the notification could not be shown: {e}");
         }
@@ -189,9 +190,14 @@ mod tests {
         let raised = Arc::new(Mutex::new(0));
         let r = raised.clone();
         let gui = GuiRing::new(toast.clone(), Arc::new(move || *r.lock().unwrap() += 1));
-        gui.noticed(&crate::ring::Notice { id: "notice_1".into(), call_id: "call_1".into(), caller_name: "Alex".into(), caller_number: String::new(), at: 0, text: String::new() });
+        let notice = |cause: crate::ring::Cause| crate::ring::Notice { id: "notice_1".into(), call_id: "call_1".into(), caller_name: "Alex".into(), caller_number: String::new(), at: 0, text: cause.notice_text().to_string(), cause: cause.code() };
+        gui.noticed(&notice(crate::ring::Cause::PhonesOff));
         assert_eq!(toast.shown.lock().unwrap()[0].0, "Someone asked for you");
-        assert!(toast.shown.lock().unwrap()[0].1.contains("No device is set up to take a transfer"));
+        assert_eq!(toast.shown.lock().unwrap()[0].1, "Alex asked for you. Your phone is set to not ring, so they were offered a message.");
+        // The words say what was found: never that no device is set up when one is, and only set not to ring.
+        gui.noticed(&notice(crate::ring::Cause::NoCompanion));
+        assert!(toast.shown.lock().unwrap()[1].1.contains("No Companion is approved"));
+        assert!(!toast.shown.lock().unwrap()[0].1.contains("No device is set up"));
         assert_eq!(*raised.lock().unwrap(), 0);
     }
 

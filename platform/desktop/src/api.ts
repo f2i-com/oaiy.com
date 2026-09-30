@@ -1730,7 +1730,7 @@ export interface ActiveRing {
   note: string;
 }
 
-/** Somebody asked for the owner and nobody could be rung, for want of a device set up to take a transfer. */
+/** Somebody asked for the owner and nobody could be rung, for want of a device that may ring: the sentence says which. */
 export interface RingNotice {
   id: string;
   callId: string;
@@ -1738,7 +1738,26 @@ export interface RingNotice {
   callerNumber: string;
   /** Unix milliseconds, by the desktop's clock. */
   at: number;
+  /** Why nobody was rung, after "asked for you". */
   text: string;
+  /** The cause: `noCompanion`, `allNever`, `phonesOff`, `onlyThisComputers` or `nothing`. */
+  cause?: string;
+}
+
+/** What a caller who asks for the owner would get right now, from the desktop's own policy (nothing is counted by asking). */
+export interface RingPreview {
+  /** Transfers are on: when they are not, nothing else here is said. */
+  enabled: boolean;
+  /** Something would ring. */
+  rings: boolean;
+  /** What would ring, by name. */
+  devices: string[];
+  /** In plain words: what would ring, or why nothing would. */
+  text: string;
+  /** When nothing would ring for want of a device that may: why (`noCompanion`, `allNever`, `phonesOff`, `onlyThisComputers`, `nothing`). */
+  cause: string | null;
+  /** What the phone plugin has done with the calls while transfers were on, when that is a problem for the owner. */
+  plugin: string | null;
 }
 
 export const ring = {
@@ -1746,6 +1765,8 @@ export const ring = {
   /** Change some settings (any of them; `quietHours` and `limits` member by member). */
   save: (change: Partial<Omit<RingSettings, 'quietHours' | 'limits'>> & { quietHours?: Partial<QuietHours>; limits?: Partial<RingSettings['limits']> }) =>
     request<{ settings: RingSettings; features: RingFeatures }>('/api/ring/settings', { method: 'PUT', body: JSON.stringify(change) }),
+  /** What a caller who asks for the owner would get right now, and what the phone plugin has done with the calls. */
+  preview: () => request<RingPreview>('/api/ring/preview'),
   /** The rings going now (none most of the time), and the callers who asked for the owner when nothing could be rung. */
   active: async () => {
     const r = await request<{ rings?: ActiveRing[]; notices?: RingNotice[] }>('/api/ring/active');
