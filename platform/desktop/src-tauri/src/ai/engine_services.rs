@@ -518,7 +518,31 @@ mod tests {
         assert!(!forwardable(&d, "/oaiy/images"), "the OAIY-dialect route is not one of the contracts");
     }
 
-    /// Against the running engines (`OAIY_LIVE_GATEWAY`, e.g. http://127.0.0.1:8080):
+    #[tokio::test]
+    async fn media_forwarding_keeps_caller_credentials_at_the_desktop_boundary() {
+        let app = Router::new().route("/v1/images/generations", any(|req: Request| async move {
+            assert!(req.headers().get("authorization").is_none());
+            assert!(req.headers().get("cookie").is_none());
+            assert_eq!(req.headers().get("content-type").unwrap(), "application/json");
+            StatusCode::NO_CONTENT
+        }));
+        let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
+        let gateway = format!("http://{}", listener.local_addr().unwrap());
+        let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        let req = axum::http::Request::builder()
+            .method("POST")
+            .uri(format!("{GATEWAY_PREFIX}/v1/images/generations"))
+            .header("authorization", "Bearer desktop-only-test-sentinel")
+            .header("cookie", "desktop-only-test-cookie=sentinel")
+            .header("content-type", "application/json")
+            .body(Body::from("{}"))
+            .unwrap();
+        let response = forward_to(&gateway, &discovery(), req).await;
+        assert_eq!(response.status(), StatusCode::NO_CONTENT);
+        server.abort();
+        assert!(server.await.unwrap_err().is_cancelled());
+    }
+
     /// An explicitly started isolated Studio can verify the scoped guard, the
     /// actual forwarding function, native CUDA worker and configured style LoRA
     /// together. Credentials live in memory and are never written to evidence.
