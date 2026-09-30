@@ -4,21 +4,21 @@
  * never closed anything. What is counted is elapsed time, so the wall clock is not asked.
  *
  * The wall clock here is a stand-in whose skew a test sets, installed before any broker is made (a broker that read `Date.now` would hold
- * this one), and the monotonic clock is `performance.now` with a forward offset a test sets: it only ever moves forward.
+ * this one), and the monotonic clock is `performance.now` advanced explicitly by a test: it only ever moves forward. Host scheduling
+ * must not refill the burst while the MessageChannel loop runs on a busy or slower machine.
  */
 import assert from 'node:assert/strict';
 import { after, describe, it } from 'node:test';
 import { M } from '../support/holder.mjs';
 import { brokerWorld } from '../support/broker-world.mjs';
 
-const { IDLE_CLOSE_MS } = M.sharedProtocol;
+const { IDLE_CLOSE_MS, OPS_BURST, OPS_PER_SECOND } = M.sharedProtocol;
 
 const realNow = Date.now;
 let skew = 0;
 Date.now = () => realNow() + skew;
-const realPerformanceNow = performance.now.bind(performance);
 let elapsed = 0;
-performance.now = () => realPerformanceNow() + elapsed;
+performance.now = () => elapsed;
 
 const worlds = [];
 const world = async (options) => {
@@ -48,10 +48,14 @@ describe('the clock the port counts time with', () => {
     const client = await w.connect();
     skew = 24 * 60 * 60 * 1000;
     let answered = 0;
-    // 150 operations one after another, faster than the sustained rate: the first hundred are the burst, the rest are refused.
-    for (let i = 0; i < 150; i++) if ((await client.call({ op: 'list' })).ok) answered++;
+    // No monotonic time passes: the first hundred are the burst, the rest are refused regardless of host execution speed.
+    for (let i = 0; i < OPS_BURST + OPS_PER_SECOND; i++) if ((await client.call({ op: 'list' })).ok) answered++;
     skew = 0;
-    assert.ok(answered < 150, `${answered} of 150 were answered: a day forward on the wall clock was not a day of refills`);
+    assert.equal(answered, OPS_BURST, 'a day forward on the wall clock does not refill the burst');
+    // Only monotonic elapsed time refills it, at the configured sustained rate.
+    elapsed += 1000;
+    for (let i = 0; i < OPS_PER_SECOND; i++) assert.equal((await client.call({ op: 'list' })).ok, true, `refill #${i + 1}`);
+    assert.equal((await client.call({ op: 'list' })).ok, false, 'the one-second refill is exhausted');
   });
 
   it('the idle sweep closes a quiet connection when the wall clock has been set back, and keeps a used one when it has been set forward', async () => {
