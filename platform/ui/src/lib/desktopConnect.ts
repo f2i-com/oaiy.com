@@ -8,9 +8,9 @@
  * The desktop's own answer to Connect is the request this makes, so the request that starts the poll is not asked twice: the poll
  * and the service list are started without a probe of their own.
  */
-import { refreshDesktopStatus, resetDesktopDetection, startDesktopDetection, type DesktopInfo } from './desktopDetection';
+import { mayLookOnLoad, refreshDesktopStatus, resetDesktopDetection, startDesktopDetection, type DesktopInfo } from './desktopDetection';
 import { startDesktopServiceSync, stopDesktopServiceSync } from './desktopServices';
-import { forgetDesktopLink, rememberDesktopLink } from './desktopLink';
+import { forgetDesktopLink, rememberDesktopLink, subscribeDesktopLink } from './desktopLink';
 
 /** The person pressed Connect. Resolves with what the desktop said: `available` when it answered as OAIY Desktop. */
 export async function connectDesktop(): Promise<DesktopInfo> {
@@ -27,4 +27,21 @@ export function disconnectDesktop(): void {
   forgetDesktopLink();
   stopDesktopServiceSync();
   resetDesktopDetection();
+}
+
+let keeping = false;
+
+/**
+ * A link can go without Disconnect: Reset in Settings gives the engine its default address back, and if nothing kept from Connect is
+ * left, the tab has no link. What a link started (the poll, the desktop's services in the palette) stops with it, as it does at
+ * Disconnect. Called once as the editor starts; where the page may look on its own (OAIY's own window) it never stops anything.
+ */
+export function keepToTheLink(): void {
+  if (keeping) return;
+  keeping = true;
+  subscribeDesktopLink(() => {
+    if (mayLookOnLoad()) return;
+    stopDesktopServiceSync();
+    resetDesktopDetection();
+  });
 }

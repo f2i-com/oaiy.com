@@ -244,6 +244,19 @@ describe('E5: the flow editor', () => {
     await context.close();
   });
 
+  it('Reset in Settings, with no link kept from Connect, ends the looking: the poll stops and nothing goes out afterwards, not even to the default address', async () => {
+    const { context, page, attempts } = await open('flows', { storage: { 'oaiy.engineBase': 'http://192.168.1.50:17972' } });
+    await ready('flows', page);
+    assert.equal(health(attempts).length, 2, `it looked at the address it was given: ${attempts.join(', ')}`);
+    await page.locator('button[aria-label="Settings"]').click();
+    await page.getByRole('button', { name: 'Reset', exact: true }).click();
+    await page.waitForFunction(() => /not connected/.test(document.querySelector('main')?.textContent ?? ''), null, { timeout: 5000 });
+    const before = attempts.length;
+    await sleep(11_000);
+    assert.equal(attempts.length, before, `nothing asked after Reset: ${attempts.slice(before).join(', ')}`);
+    await context.close();
+  });
+
   it('a tab with a link (kept from Connect) looks as it opens, like the window does; one whose engine has an address of its own looks there', async () => {
     const linked = await open('flows', { storage: { 'oaiy.desktopLinked': '1' } });
     await ready('flows', linked.page);

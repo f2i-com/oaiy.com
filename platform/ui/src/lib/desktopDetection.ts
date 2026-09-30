@@ -229,9 +229,11 @@ export async function refreshDesktopStatus(): Promise<DesktopInfo> {
 }
 
 // Re-probe immediately when the endpoint changes, rather than making the user
-// wait out the 10s poll after typing a new address.
+// wait out the 10s poll after typing a new address. Not when the change leaves a
+// tab with no link (Reset to the default address, with nothing kept from Connect):
+// that tab looks at nothing (see lib/desktopConnect.ts).
 subscribeEngineBase(() => {
-  void probeOnce();
+  if (mayLookOnLoad()) void probeOnce();
 });
 
 /** Internal: lets tests/dev tools await an in-flight probe. */

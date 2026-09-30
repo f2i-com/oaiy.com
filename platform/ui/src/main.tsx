@@ -46,11 +46,14 @@ import './dynamicModules';
 // person presses Connect (or has a link from before). See lib/desktopLink.ts.
 import { startDesktopDetection } from './lib/desktopDetection';
 import { startDesktopServiceSync } from './lib/desktopServices';
+import { keepToTheLink } from './lib/desktopConnect';
 startDesktopDetection();
 // Mirror OAIY Desktop's running services into the service dropdowns +
 // compilers while it's available (Phase 3). No-op when OAIY Desktop
 // isn't running. See lib/desktopServices.ts.
 startDesktopServiceSync();
+// A link that goes without Disconnect (Reset in Settings) stops what it started.
+keepToTheLink();
 
 // Ask the browser to keep this site's storage (the project, macros and API keys
 // live there) rather than clear it when space is short. Once, in the

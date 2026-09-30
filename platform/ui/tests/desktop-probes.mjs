@@ -299,6 +299,52 @@ await check('Disconnect forgets the link, stops the polls, empties the palette o
   assert.deepEqual(after.requests, []);
 });
 
+await check('Reset in Settings gives the default address back: with no Connect link kept, the tab has no link, and what the address started stops (the poll, the services, and no request after)', async () => {
+  const p = await page();
+  p.connect.keepToTheLink();
+  // The person saves an address: the settings card asks once (the address change) and starts keeping up with the desktop there.
+  p.endpoint.setEngineBase('192.168.1.50:17972');
+  p.detection.startDesktopDetection({ probeNow: false });
+  p.services.startDesktopServiceSync({ probeNow: false });
+  await p.settle();
+  assert.equal([...p.timers.values()].filter((t) => t.ms === 10_000).length, 2, 'the health poll and the service poll');
+  assert.equal(JSON.parse(p.store.get(KEYS.services)).length, 1, "the desktop's service is in the palette's list");
+  assert.ok(p.requests.every((r) => r.url.startsWith(LAN)), p.requests.map((r) => r.url).join(', '));
+  const before = p.requests.length;
+  p.endpoint.setEngineBase(null);
+  await p.settle();
+  assert.equal(p.timers.size, 0, 'nothing polls any more');
+  assert.equal(p.store.get(KEYS.services), undefined, "the desktop's services leave the palette");
+  assert.equal(p.detection.getDesktopInfo().checked, false, 'and the desktop is neither there nor not there again');
+  assert.equal(p.requests.length, before, 'and not one request went out after the Reset, to the default address or any other');
+  assert.equal(p.link.hasSavedDesktopLink(), false);
+});
+
+await check('Reset keeps everything where the tab is still linked by Connect, and in OAIY\'s own window, which needs no link', async () => {
+  const linked = await page();
+  linked.connect.keepToTheLink();
+  await linked.connect.connectDesktop();
+  linked.endpoint.setEngineBase('192.168.1.50:17972');
+  await linked.settle();
+  linked.endpoint.setEngineBase(null);
+  await linked.settle();
+  assert.equal(linked.link.linkedByConnect(), true);
+  assert.equal([...linked.timers.values()].filter((t) => t.ms === 10_000).length, 2, 'still polling');
+  assert.ok(linked.store.get(KEYS.services), 'and the list kept');
+
+  const window = await page({ hostname: 'oaiyflows.localhost', protocol: 'http:', desktop: given });
+  window.connect.keepToTheLink();
+  window.detection.startDesktopDetection();
+  window.services.startDesktopServiceSync();
+  await window.settle();
+  const polling = window.timers.size;
+  assert.ok(polling >= 1);
+  window.endpoint.setEngineBase('192.168.1.50:17972');
+  window.endpoint.setEngineBase(null);
+  await window.settle();
+  assert.equal(window.timers.size, polling, 'OAIY\'s own window never stops looking');
+});
+
 await check('listeners are told when the link is made or forgotten, so what depends on it is drawn again', async () => {
   const p = await page();
   const told = [];
