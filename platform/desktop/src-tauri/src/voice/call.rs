@@ -88,6 +88,15 @@ pub enum CallCommand {
 /// What a caller is told when nobody can answer them and no request to reach the owner is going.
 pub const NO_ANSWERER_GOODBYE: &str = "Sorry, no one can take your call right now. Please try again a little later. Goodbye!";
 
+/// End the call with `goodbye` (an apology, in place of an offer of a message that nobody could take: see [`transfer::UNREACHED_GOODBYE`]), as
+/// the app ends one: the goodbye goes to the phone as `finish_call`, is said once the phone accepts it, and the call ends after it.
+fn end_without_offer(hub: &VoiceHub, call: &str, goodbye: &'static str) {
+    let (reply, _) = oneshot::channel();
+    if let Some(tx) = hub.command(call) {
+        let _ = tx.send(CallCommand::Finish { goodbye: goodbye.into(), reply });
+    }
+}
+
 /// A text for the speaker, from a reply given before any `epoch` change.
 struct SpeakJob {
     /// Which it is, in the `Ledger`.
@@ -1307,9 +1316,13 @@ where
                     }
                     CallCommand::NoAnswerer => {
                         match transfer.answer_caller(Instant::now()) {
-                            Some(line) => {
-                                speak(line.to_string(), false, None);
-                            }
+                            // (No page answers, or this would not have been asked: nobody can take a message, so it is not offered.)
+                            Some(line) => match transfer::goodbye_for_offer(line) {
+                                Some(goodbye) => end_without_offer(&hub, &ids.call, goodbye),
+                                None => {
+                                    speak(line.to_string(), false, None);
+                                }
+                            },
                             // A request is going (it rings, or an owner device has it, or it is asked for and the phone has not answered yet, or it waits
                             // behind another tool): the caller is spoken to by its clocks, and never hung up on for want of a page.
                             None if transfer.busy() || tools.transfer_pending() => {}
@@ -1474,9 +1487,14 @@ where
                 }
                 for due in transfer.due(Instant::now()) {
                     match due {
-                        Due::Say(line) => {
-                            speak(line.to_string(), false, None);
-                        }
+                        // The offer of a message is made when someone can take one: with no page answering calls nobody can, and the caller is not asked
+                        // (and then hung up on when they say yes) but told, and the call ends.
+                        Due::Say(line) => match transfer::goodbye_for_offer(line).filter(|_| !hub.page_answers()) {
+                            Some(goodbye) => end_without_offer(&hub, &ids.call, goodbye),
+                            None => {
+                                speak(line.to_string(), false, None);
+                            }
+                        },
                         // A holding line while the takeover is set up: not if the phone's stop is already here (the owner has the caller).
                         Due::Connecting(line) => {
                             if !stop_already_here(&mut backlog, &mut stream) {
@@ -2860,6 +2878,9 @@ mod tests {
             ring.set_devices(crate::ring::testing::at_the_pc());
             hub.set_ring(ring);
             hub.set_transfer_timing(quick());
+            // A page answers calls (these tests speak for it), so someone can take the message that is offered; a test of what is said when
+            // none does says so.
+            hub.set_page_answers(true);
         })
         .await;
         aokie.begin(json!({}));

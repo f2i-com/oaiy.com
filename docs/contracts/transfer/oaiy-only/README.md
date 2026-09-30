@@ -55,7 +55,10 @@ The plan reasons OAIY puts in an `oaiy.ring.plan` answer are exactly the plugin'
   desktop says a hold line 6 seconds after the request was sent and another 15 seconds after that, counted from the
   request and not from the plugin's answer, which may take long or never come, whether or not the model or the Agent
   page works; on `no_answer` a caller the receptionist leaves in silence is offered a message 4 seconds later. No
-  silence there is longer than 15 seconds.
+  silence there is longer than 15 seconds. (The offer, here and after a decline, a ring nobody took and a takeover that
+  failed, is made when a page is answering calls, so that someone can take the message. With none nobody can, and the desktop
+  says "I'm sorry, I couldn't reach them. Please try again a little later. Goodbye!", or "...couldn't connect you...", and
+  ends the call, rather than ask and hang up on the caller's yes.)
 * **While the owner is rung** the desktop says a fixed hold line five seconds in and every 15 seconds after
   (three wordings, at most six) when the receptionist has said nothing, whether or not the model or the Agent
   page is working. None of them says the call is being put through, and a line from the model that does (before it

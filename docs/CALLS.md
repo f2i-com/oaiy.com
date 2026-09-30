@@ -143,7 +143,10 @@ decline or a ring nobody took, and 2 seconds after a failed takeover (whose call
 receptionist has already spoken. A line waits
 for a receptionist who has spoken lately. When no page is answering calls (the Agent is closed or reloading),
 a caller's words no longer end the call while a request is going: the call is told `NoAnswerer` and answers
-with the line that fits, at most one every 3 seconds.
+with the line that fits, at most one every 3 seconds. With no page nobody can take a message, so the offer of one is
+not made: in its place the desktop says "I'm sorry, I couldn't reach them. Please try again a little later. Goodbye!"
+(`UNREACHED_GOODBYE`; after a takeover that failed, "...couldn't connect you...", `UNCONNECTED_GOODBYE`) and ends the call, so a
+caller is never asked whether they want to leave a message and then hung up on when they say yes.
 
 ```
 caller: "Can I speak to the owner?"           (transcribed here: the desktop's own record of the call)

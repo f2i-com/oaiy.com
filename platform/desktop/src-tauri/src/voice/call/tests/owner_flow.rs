@@ -84,6 +84,9 @@ async fn flow_full(settings: RingSettings, clock: Option<chrono::DateTime<chrono
     let setup = {
         let (ring, told) = (ring.clone(), told.clone());
         move |hub: &VoiceHub| {
+            // A page answers calls (these tests speak for it, with `say`), so someone can take the message that is offered; a test of what is
+            // said when none does says so (`set_page_answers(false)`).
+            hub.set_page_answers(true);
             hub.set_ring(ring);
             hub.set_transfer_timing(timing);
             hub.set_messages(Store::default());
@@ -601,7 +604,6 @@ async fn while_the_takeover_is_pending_the_caller_hears_the_connecting_line_and_
 async fn a_takeover_that_never_comes_ends_with_the_two_lines_and_then_the_offer_of_a_message() {
     let timing = transfer::Timing { setup_limit: Duration::from_millis(2_500), ..quick() };
     let mut f = flow_full(owner_settings(true), None, crate::ring::testing::at_the_pc(), timing).await;
-    f.aokie.hub.set_page_answers(false);
     f.caller_says(ASKED);
     f.ring_through("assist_1", 30).await;
     f.a_device_takes_the_call("assist_1");
@@ -614,12 +616,12 @@ async fn a_takeover_that_never_comes_ends_with_the_two_lines_and_then_the_offer_
 }
 
 #[tokio::test]
-async fn a_phone_that_never_answers_the_request_leaves_the_caller_with_a_hold_line_from_the_request_and_the_offer_of_a_message_when_it_is_given_up_on_with_no_model_and_no_page() {
+async fn a_phone_that_never_answers_the_request_leaves_the_caller_with_a_hold_line_from_the_request_and_the_offer_of_a_message_when_it_is_given_up_on_with_no_model() {
     // The clocks here: a line 0.35 s after the request (6 s in a real call) and another 1.1 s later (15 s), the request given up on at 2.5 s
-    // (25 s) and the offer 0.3 s after that. Nobody speaks for the receptionist: no model, no page, and the phone says nothing at all.
+    // (25 s) and the offer 0.3 s after that. Nobody speaks for the receptionist: the model is dead (the page is there, and says nothing), and the
+    // phone says nothing at all.
     let timing = transfer::Timing { hold_every: Duration::from_millis(1_100), ..quick() };
     let mut f = flow_full(owner_settings(true), None, crate::ring::testing::at_the_pc(), timing).await;
-    f.aokie.hub.set_page_answers(false);
     f.caller_says(ASKED);
     let asked = asking(&f.aokie, transfer::TOOL, json!({"reason": "caller_asked"}));
     f.aokie.text("formlogic.realtime.tool_call", secs(3)).await.expect("the tool call reached the phone");
@@ -682,12 +684,11 @@ async fn a_phone_that_answers_after_a_line_was_said_goes_on_from_that_line_in_th
 }
 
 #[tokio::test]
-async fn with_no_model_and_no_page_the_caller_is_told_the_takeover_failed_two_seconds_after_the_desktop_gives_up_on_it_and_not_after_the_offers_four() {
+async fn with_no_model_the_caller_is_told_the_takeover_failed_two_seconds_after_the_desktop_gives_up_on_it_and_not_after_the_offers_four() {
     // The takeover is given 2.5 s here (55 s in a real call); the apology 0.15 s after that (2 s), where the offer after a ring nobody took
     // is 4 s away: the caller has waited for the takeover in silence, and has no more to wait for a receptionist that may be dead.
     let timing = transfer::Timing { setup_limit: Duration::from_millis(2_500), offer_after: secs(4), failed_after: Duration::from_millis(150), ..quick() };
     let mut f = flow_full(owner_settings(true), None, crate::ring::testing::at_the_pc(), timing).await;
-    f.aokie.hub.set_page_answers(false);
     f.caller_says(ASKED);
     f.ring_through("assist_1", 30).await;
     f.a_device_takes_the_call("assist_1");
@@ -740,12 +741,15 @@ async fn a_caller_who_speaks_twice_while_the_phone_has_not_answered_the_request_
     f.aokie.hub.caller_said(&f.aokie.call, "Hello?", json!({}));
     assert!(spoken_within(&f.aokie, transfer::HOLD_LINES[1], secs(2)).await, "{:?}", f.aokie.speech.spoken());
     assert!(f.aokie.text("formlogic.realtime.tool_call", Duration::from_millis(300)).await.is_none(), "and still not hung up on");
-    // The phone never answers: the request is given up on after 2.5 s here (25 s in a real call). A goodbye that waited behind it would go
-    // now, and the caller would be hung up on a moment later than they would have been; the call goes on and they are offered a message.
-    assert!(spoken_within(&f.aokie, transfer::OFFER_LINE, secs(4)).await, "{:?}", f.aokie.speech.spoken());
-    assert!(f.aokie.text("formlogic.realtime.tool_call", Duration::from_millis(600)).await.is_none(), "no finish_call went to the phone once the request was given up on: {:?}", f.aokie.speech.spoken());
-    let told = f.aokie.events_within(Duration::from_millis(50)).await;
-    assert!(!told.iter().any(|e| e["type"] == "call.ended"), "the call was not ended: {told:?}");
+    // The phone never answers: the request is given up on after 2.5 s here (25 s in a real call). A goodbye that had waited behind it (the app's, a
+    // hang-up for want of a page) would go now and the caller would be hung up on a moment later than they would have been; there is none, so
+    // the caller is told, by the desktop, that they could not be put through and it ends the call in an apology: no message is offered, since no
+    // page is there to take one.
+    let finish = f.aokie.text("formlogic.realtime.tool_call", secs(5)).await.expect("the desktop ends the call once the request was given up on");
+    assert_eq!(finish["name"], "finish_call");
+    f.aokie.send(json!({"type": "formlogic.realtime.tool_result", "callId": f.aokie.call, "generation": 1, "toolCallId": finish["toolCallId"], "ok": true, "output": {}}));
+    assert!(spoken_within(&f.aokie, transfer::UNREACHED_GOODBYE, secs(3)).await, "{:?}", f.aokie.speech.spoken());
+    assert!(!f.aokie.speech.spoken().iter().any(|l| l == transfer::OFFER_LINE), "no message is offered that nobody can take: {:?}", f.aokie.speech.spoken());
 }
 
 #[tokio::test]
@@ -808,6 +812,8 @@ async fn a_holding_line_that_falls_due_in_the_very_moment_the_stop_arrives_is_dr
 #[tokio::test]
 async fn a_takeover_that_fails_between_the_lines_cancels_the_second_and_the_caller_is_offered_a_message() {
     let mut f = accepted_and_pending(secs(1)).await;
+    // The page is there (its model says nothing), so a message can be taken and is offered; with no page it is an apology and the end of the call.
+    f.aokie.hub.set_page_answers(true);
     assert!(spoken_within(&f.aokie, transfer::STILL_CONNECTING_LINES[0], secs(3)).await, "{:?}", f.aokie.speech.spoken());
     f.aokie.send(outcome(&f.aokie, "assist_1", "unavailable", None));
     let told = f.aokie.event("call.transfer", secs(3)).await.expect("the app is told");
@@ -857,7 +863,7 @@ async fn a_caller_who_speaks_while_the_owner_is_rung_with_no_page_to_answer_is_a
 }
 
 #[tokio::test]
-async fn a_caller_who_speaks_after_the_owner_declined_with_no_page_is_offered_the_message_at_once_and_a_call_with_no_request_is_finished_as_before() {
+async fn a_caller_who_speaks_after_the_owner_declined_with_no_page_is_told_at_once_that_nobody_could_be_reached_and_a_call_with_no_request_is_finished_as_before() {
     let timing = transfer::Timing { offer_after: Duration::from_secs(4), ..quick() };
     let mut f = flow_full(owner_settings(true), None, crate::ring::testing::at_the_pc(), timing).await;
     f.aokie.hub.set_page_answers(false);
@@ -867,10 +873,15 @@ async fn a_caller_who_speaks_after_the_owner_declined_with_no_page_is_offered_th
     f.phone_is_asked_to_withdraw("assist_1", "owner_declined").await;
     f.aokie.send(outcome(&f.aokie, "assist_1", "cancelled", None));
     f.aokie.event("call.transfer", secs(3)).await.expect("cancelled");
-    assert!(!f.aokie.speech.spoken().iter().any(|l| l == transfer::OFFER_LINE), "its own clock is four seconds away");
+    assert!(f.aokie.text("formlogic.realtime.tool_call", Duration::from_millis(200)).await.is_none(), "its own clock is four seconds away: nothing yet");
+    // The caller speaks, and no page is there to answer them: they are not offered a message (nobody could take one, and their yes would be answered
+    // by a hang-up), but told, at once, and the call ends.
     f.aokie.hub.caller_said(&f.aokie.call, "Hello? Hello?", json!({}));
-    assert!(spoken_within(&f.aokie, transfer::OFFER_LINE, Duration::from_millis(600)).await, "answered at once: {:?}", f.aokie.speech.spoken());
-    assert!(f.aokie.text("formlogic.realtime.tool_call", Duration::from_millis(200)).await.is_none(), "and not hung up on");
+    let finish = f.aokie.text("formlogic.realtime.tool_call", secs(2)).await.expect("answered at once, by ending the call");
+    assert_eq!(finish["name"], "finish_call");
+    f.aokie.send(json!({"type": "formlogic.realtime.tool_result", "callId": f.aokie.call, "generation": 1, "toolCallId": finish["toolCallId"], "ok": true, "output": {}}));
+    assert!(spoken_within(&f.aokie, transfer::UNREACHED_GOODBYE, secs(3)).await, "{:?}", f.aokie.speech.spoken());
+    assert!(!f.aokie.speech.spoken().iter().any(|l| l == transfer::OFFER_LINE), "{:?}", f.aokie.speech.spoken());
 
     // No request going and nobody to answer: as it always was, the caller is told and the call is finished.
     let mut g = flow(owner_settings(true)).await;
@@ -879,6 +890,59 @@ async fn a_caller_who_speaks_after_the_owner_declined_with_no_page_is_offered_th
     g.aokie.hub.caller_said(&g.aokie.call, "Hello, anyone?", json!({}));
     let finish = g.aokie.text("formlogic.realtime.tool_call", secs(3)).await.expect("finish_call reached the phone");
     assert_eq!(finish["name"], "finish_call");
+}
+
+/// With no page answering calls nobody can take a message, so none is offered: the desktop says it could not reach them and ends the call, where
+/// it used to ask "Would you like to leave a message?" and then hang up on the caller's yes (nothing was there to hear it).
+#[tokio::test]
+async fn with_no_page_a_ring_nobody_took_ends_the_call_with_an_apology_and_never_offers_a_message() {
+    for how in ["declined", "expired", "unavailable"] {
+        let mut f = flow(owner_settings(true)).await;
+        f.aokie.hub.set_page_answers(false);
+        f.caller_says(ASKED);
+        f.ring_through("assist_1", 30).await;
+        f.aokie.send(outcome(&f.aokie, "assist_1", how, None));
+        f.aokie.event("call.transfer", secs(3)).await.expect("the app is told");
+        // The desktop itself ends the call: the goodbye is the apology, and it is said once the phone has accepted the end of the call.
+        let finish = f.aokie.text("formlogic.realtime.tool_call", secs(3)).await.unwrap_or_else(|| panic!("{how}: the call was not ended: {:?}", f.aokie.speech.spoken()));
+        assert_eq!(finish["name"], "finish_call", "{how}");
+        f.aokie.send(json!({"type": "formlogic.realtime.tool_result", "callId": f.aokie.call, "generation": 1, "toolCallId": finish["toolCallId"], "ok": true, "output": {}}));
+        assert!(spoken_within(&f.aokie, transfer::UNREACHED_GOODBYE, secs(3)).await, "{how}: {:?}", f.aokie.speech.spoken());
+        assert!(f.aokie.text("formlogic.realtime.hangup_requested", secs(3)).await.is_some(), "{how}: the call ends");
+        assert!(!f.aokie.speech.spoken().iter().any(|l| l == transfer::OFFER_LINE), "{how}: no message is offered that nobody can take: {:?}", f.aokie.speech.spoken());
+    }
+}
+
+/// The same for a takeover that failed (whose caller has waited for it already): the apology for that.
+#[tokio::test]
+async fn with_no_page_a_takeover_that_failed_ends_the_call_with_an_apology_for_that_and_never_offers_a_message() {
+    let mut f = flow(owner_settings(true)).await;
+    f.aokie.hub.set_page_answers(false);
+    f.caller_says(ASKED);
+    f.ring_through("assist_1", 30).await;
+    f.a_device_takes_the_call("assist_1");
+    f.aokie.event("call.transfer", secs(3)).await.expect("accepted");
+    f.aokie.send(outcome(&f.aokie, "assist_1", "unavailable", None));
+    f.aokie.event("call.transfer", secs(3)).await.expect("the takeover failed");
+    let finish = f.aokie.text("formlogic.realtime.tool_call", secs(3)).await.expect("the call was ended by the desktop");
+    assert_eq!(finish["name"], "finish_call");
+    f.aokie.send(json!({"type": "formlogic.realtime.tool_result", "callId": f.aokie.call, "generation": 1, "toolCallId": finish["toolCallId"], "ok": true, "output": {}}));
+    assert!(spoken_within(&f.aokie, transfer::UNCONNECTED_GOODBYE, secs(3)).await, "{:?}", f.aokie.speech.spoken());
+    assert!(!f.aokie.speech.spoken().iter().any(|l| l == transfer::FAILED_LINE || l == transfer::OFFER_LINE), "{:?}", f.aokie.speech.spoken());
+}
+
+/// With a page answering, someone can take the message: the offer is made as it always was, and the call goes on.
+#[tokio::test]
+async fn with_a_page_answering_the_offer_of_a_message_is_made_and_the_call_goes_on() {
+    let mut f = flow(owner_settings(true)).await;
+    f.aokie.hub.set_page_answers(true);
+    f.caller_says(ASKED);
+    f.ring_through("assist_1", 30).await;
+    f.aokie.send(outcome(&f.aokie, "assist_1", "declined", None));
+    f.aokie.event("call.transfer", secs(3)).await.expect("declined");
+    assert!(spoken_within(&f.aokie, transfer::OFFER_LINE, secs(3)).await, "{:?}", f.aokie.speech.spoken());
+    assert!(f.aokie.text("formlogic.realtime.tool_call", Duration::from_millis(500)).await.is_none(), "the call was not ended");
+    assert!(!f.aokie.speech.spoken().iter().any(|l| l == transfer::UNREACHED_GOODBYE));
 }
 
 #[tokio::test]

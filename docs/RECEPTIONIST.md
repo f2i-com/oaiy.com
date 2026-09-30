@@ -160,7 +160,7 @@ What happens, every way it can go:
 
 | The owner... | The caller hears |
 |---|---|
-| accepts on the Companion | "Connecting you now, one moment.", then (if the connection takes a while) up to two short "still connecting" lines, then you. If it cannot be connected, "I'm sorry, I couldn't connect you. Would you like to leave a message?" |
+| accepts on the Companion | "Connecting you now, one moment.", then (if the connection takes a while) up to two short "still connecting" lines, then you. If it cannot be connected, "I'm sorry, I couldn't connect you. Would you like to leave a message?" (with no page answering calls, no message can be taken, so it is "I'm sorry, I couldn't connect you. Please try again a little later. Goodbye!" and the call ends) |
 | declines (on the Companion, or **Decline and take a message** here: the phone is asked to withdraw the request and answers within two seconds) | the receptionist, kindly: they cannot come to the phone, and an offer to take a message. If you left words for the caller they are relayed faithfully, with no promise added. If a device of yours took the call just before, the phone says so and nothing is offered |
 | does not answer in time | the same offer of a message |
 | is not to be rung (quiet hours, nobody at the computer and no phone to ring, every phone on do-not-disturb, no Companion set up to take a call, no consent) | the same offer, and nothing rings |
@@ -192,10 +192,14 @@ is about 24 seconds, and only while a connection you accepted is being made (see
   receptionist has already made it; **after a takeover that failed**, 2 seconds after (the caller has waited for it already).
 
 - **If the Agent page is closed or reloaded** while you are rung (nothing is answering calls), a
-  caller who speaks is not hung up on: they hear the hold line or the offer of
-  a message, whichever fits, straight away (not more than one every 3 seconds); after you accept their words are not answered with more lines, only the two timed ones above. Only a call with no
+  caller who speaks is not hung up on: they hear the hold line, or, once the ring is over, the apology and goodbye above,
+  straight away (not more than one every 3 seconds); after you accept their words are not answered with more lines, only the two timed ones above. Only a call with no
   request going is finished for want of a page, as it always was. A page reloaded while you have the call
   takes it up again when you hand it back, in the caller's saved conversation, and does not greet them again.
+  This is when a page is answering calls, so that someone can take the message. **With no page answering (the Agent is closed or
+  reloading) nobody can take one, so none is offered**: the desktop says "I'm sorry, I couldn't reach them. Please try again a
+  little later. Goodbye!" (or "...couldn't connect you...") and ends the call, rather than ask "Would you like to leave a message?"
+  and hang up on the caller's yes.
 
 What it does not cover: a phone plugin that is not running or has lost its connection to this
 computer, in which case the call is not on this computer to speak to.

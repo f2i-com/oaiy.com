@@ -181,6 +181,21 @@ pub const HOLD_LINES: [&str; 3] = [HOLD_LINE, "Thank you for waiting, I'm still 
 pub const OFFER_LINE: &str = "I'm sorry, I couldn't reach them. Would you like to leave a message?";
 /// Said when the owner accepted and the call could not be connected after all.
 pub const FAILED_LINE: &str = "I'm sorry, I couldn't connect you. Would you like to leave a message?";
+/// Said, and the call ended with, in place of [`OFFER_LINE`] when no page is answering calls: nobody can take a message then, so none is offered (the
+/// caller who said yes to it was hung up on, as nothing was there to hear them).
+pub const UNREACHED_GOODBYE: &str = "I'm sorry, I couldn't reach them. Please try again a little later. Goodbye!";
+/// ...and in place of [`FAILED_LINE`].
+pub const UNCONNECTED_GOODBYE: &str = "I'm sorry, I couldn't connect you. Please try again a little later. Goodbye!";
+
+/// The goodbye that takes the place of `line` when no page answers calls, if `line` is an offer of a message (see [`UNREACHED_GOODBYE`]); none for
+/// any other line.
+pub fn goodbye_for_offer(line: &str) -> Option<&'static str> {
+    match line {
+        OFFER_LINE => Some(UNREACHED_GOODBYE),
+        FAILED_LINE => Some(UNCONNECTED_GOODBYE),
+        _ => None,
+    }
+}
 
 /// How a request to reach the owner came out (`formlogic.realtime.transfer_outcome`).
 #[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
@@ -1475,6 +1490,22 @@ mod tests {
         assert!(!t.is_stale("assist_2", Outcome::Declined) && t.is_stale("assist_1", Outcome::Declined));
         assert!(!t.outcome("assist_2", Outcome::Declined, at(210)).iter().any(|_| true));
         assert_eq!(t.due(at(210) + OFFER_AFTER), vec![Due::Say(OFFER_LINE)]);
+    }
+
+    #[test]
+    fn an_offer_of_a_message_has_a_goodbye_for_when_no_page_answers_and_nobody_can_take_one() {
+        assert_eq!(goodbye_for_offer(OFFER_LINE), Some(UNREACHED_GOODBYE));
+        assert_eq!(goodbye_for_offer(FAILED_LINE), Some(UNCONNECTED_GOODBYE));
+        for line in HOLD_LINES.iter().chain(STILL_CONNECTING_LINES.iter()).chain([&CONNECTING_LINE, &WAIT_LINE, &UNREACHED_GOODBYE, &UNCONNECTED_GOODBYE]) {
+            assert_eq!(goodbye_for_offer(line), None, "{line}");
+        }
+        assert_eq!(goodbye_for_offer("Would you like to leave a message?"), None);
+        assert!(OFFER_LINE.contains("leave a message") && FAILED_LINE.contains("leave a message"), "the lines they replace ask");
+        for goodbye in [UNREACHED_GOODBYE, UNCONNECTED_GOODBYE] {
+            assert!(!goodbye.to_lowercase().contains("message") && !goodbye.contains('?'), "it offers nothing: {goodbye}");
+            assert!(goodbye.ends_with("Goodbye!") && goodbye.starts_with("I'm sorry, I couldn't"), "{goodbye}");
+            assert!(!promises_transfer(goodbye), "{goodbye}");
+        }
     }
 
     #[test]
