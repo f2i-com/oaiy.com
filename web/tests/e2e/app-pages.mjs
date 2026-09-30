@@ -57,7 +57,7 @@ export async function startAppWorld() {
  */
 export async function openApp(env, app, { desktop = null, storage = {}, path = app === 'agent' ? '/' : '/app.html', refuseAfterMs = 0, answer = null, viewport = { width: 1440, height: 900 }, at = app } = {}) {
   const context = await env.browser.newContext({ viewport });
-  const { attempts } = await watchLocal(context, { sites: env.sites, refuseAfterMs, answer });
+  const { attempts, details } = await watchLocal(context, { sites: env.sites, refuseAfterMs, answer });
   const errors = [];
   await context.addInitScript(
     ({ desktop, storage }) => {
@@ -79,7 +79,73 @@ export async function openApp(env, app, { desktop = null, storage = {}, path = a
   const page = await context.newPage();
   page.on('pageerror', (e) => errors.push(e.message));
   await page.goto(`${env.world.origins[at]}${path}`);
-  return { context, page, attempts, errors };
+  return { context, page, attempts, details, errors };
+}
+
+/**
+ * What the Agent keeps in its own IndexedDB (`bot.computer`/`kv`, src/settings.ts): a key or a token is sealed under the page's own
+ * AES-GCM key, so a test that wants one stored seals it the way the page does. Run in the page, after it has loaded once.
+ */
+async function seedStore(page, records) {
+  await page.evaluate(async (records) => {
+    const db = await new Promise((resolve, reject) => {
+      const open = indexedDB.open('bot.computer', 1);
+      open.onsuccess = () => resolve(open.result);
+      open.onerror = () => reject(open.error);
+    });
+    let key = await new Promise((resolve) => {
+      const get = db.transaction('kv').objectStore('kv').get('secret-key');
+      get.onsuccess = () => resolve(get.result);
+      get.onerror = () => resolve(undefined);
+    });
+    if (!key) key = await crypto.subtle.generateKey({ name: 'AES-GCM', length: 256 }, false, ['encrypt', 'decrypt']);
+    const seal = async (text) => {
+      if (!text) return null;
+      const iv = crypto.getRandomValues(new Uint8Array(12));
+      return { iv, data: await crypto.subtle.encrypt({ name: 'AES-GCM', iv }, key, new TextEncoder().encode(text)) };
+    };
+    const tx = db.transaction('kv', 'readwrite');
+    const store = tx.objectStore('kv');
+    store.put(key, 'secret-key');
+    if (records.media) {
+      const { apiKey, ...rest } = records.media;
+      store.put({ baseUrl: '', enabled: true, imageModels: [], videoModels: [], ...rest, apiKeySealed: await seal(apiKey) }, 'media');
+    }
+    if (records.desktop) store.put({ origin: records.desktop.origin, tokenSealed: await seal(records.desktop.token) }, 'desktop');
+    await new Promise((resolve) => (tx.oncomplete = resolve));
+    db.close();
+  }, records);
+}
+
+/** An OAIY the person found before, and the key they typed for it: the Agent's saved link (media.discovered). */
+export const seedOaiyLink = (page, { origin, key = '' }) =>
+  seedStore(page, { media: { baseUrl: `${origin}/v1`, apiKey: key, discovered: { service: 'oaiy-studio', version: '0.1.0', origin, at: 1 } } });
+
+/** The desktop the page was paired with: its address and token. */
+export const seedPairing = (page, { origin, token }) => seedStore(page, { desktop: { origin, token } });
+
+/** What the Agent has stored of the media service and the pairing (the token and key as sealed or absent, never opened). */
+export function readStored(page) {
+  return page.evaluate(async () => {
+    const db = await new Promise((resolve) => {
+      const open = indexedDB.open('bot.computer', 1);
+      open.onsuccess = () => resolve(open.result);
+    });
+    const get = (name) => new Promise((resolve) => {
+      const r = db.transaction('kv').objectStore('kv').get(name);
+      r.onsuccess = () => resolve(r.result ?? null);
+    });
+    const media = await get('media');
+    const desktop = await get('desktop');
+    db.close();
+    return {
+      discovered: media?.discovered?.origin ?? null,
+      baseUrl: media?.baseUrl ?? null,
+      keySealed: !!media?.apiKeySealed,
+      endpoints: !!media?.endpoints,
+      desktop: desktop?.origin ?? null,
+    };
+  });
 }
 
 /** The app is up: the Agent shows its project tree, the flow editor its workspace. Then it is given `settleMs` to send what it will. */

@@ -20,7 +20,7 @@
 import assert from 'node:assert/strict';
 import { after, before, describe, it } from 'node:test';
 import { sleep } from '../harness.mjs';
-import { DESKTOP, OAIY, OAIY_WINDOW, appReady as ready, fakeDesktop, healthOf as health, openApp, startAppWorld } from '../app-pages.mjs';
+import { DESKTOP, OAIY, OAIY_WINDOW, appReady as ready, fakeDesktop, healthOf as health, openApp, readStored, seedOaiyLink, seedPairing, startAppWorld } from '../app-pages.mjs';
 
 let env;
 
@@ -158,7 +158,7 @@ describe('E5: the Agent', () => {
     assert.deepEqual(attempts, []);
     await page.locator('button.chip.phone').click();
     await page.waitForSelector('dialog[open]');
-    assert.match(await page.locator('dialog[open] p.muted').first().textContent(), /Looking for OAIY Desktop at http:\/\/127\.0\.0\.1:17972.*may ask whether it may connect to your network/);
+    assert.match(await page.locator('dialog[open] p.muted').first().textContent(), /Looking for OAIY Desktop at http:\/\/127\.0\.0\.1:17972 now, because you opened this dialog.*may ask whether it may connect to your network/);
     await page.waitForFunction(() => /is not running at/.test(document.querySelector('dialog[open]')?.textContent ?? ''), null, { timeout: 15_000 });
     await sleep(500);
     assert.deepEqual(attempts, [`GET ${DESKTOP}/api/health`]);
@@ -172,13 +172,113 @@ describe('E5: the Agent', () => {
     await page.locator('button.settings-button').click();
     await page.waitForSelector('dialog.settings[open]');
     const section = page.locator('.media-settings');
-    assert.match(await section.textContent(), /OAIY is looked for only when you press Find OAIY/);
+    assert.match(await section.textContent(), /OAIY is looked for only when you press Find OAIY: until you do, this page sends nothing to your computer or your network/);
     assert.match((await section.locator('button', { hasText: 'Find OAIY' }).getAttribute('title')) ?? '', /reaches out to your computer only when you press this/);
     await section.locator('button', { hasText: 'Find OAIY' }).click();
     await page.waitForFunction(() => /Nothing answered at/.test(document.querySelector('.media-settings .form-note')?.textContent ?? ''), null, { timeout: 15_000 });
     await sleep(500);
     assert.deepEqual(attempts, [`GET ${OAIY}/v1/discovery`]);
     await context.close();
+  });
+});
+
+describe('E5: the Agent\'s saved links, and what its words say of each state', () => {
+  const LAN = 'http://192.168.1.20:8080';
+  const KEY = 'sk-oaiy-review-key-0123456789';
+
+  /** The Agent as a tab that has found an OAIY at LAN (with a key), reloaded so the saved link is what it starts with. */
+  async function withSavedOaiy(options = {}) {
+    const s = await open('agent', options);
+    await ready('agent', s.page);
+    await seedOaiyLink(s.page, { origin: LAN, key: KEY });
+    s.attempts.length = 0;
+    s.details.length = 0;
+    await s.page.reload();
+    await ready('agent', s.page);
+    return s;
+  }
+  const openSettings = async (page) => {
+    await page.locator('button.settings-button').click();
+    await page.waitForSelector('dialog.settings[open]');
+    return page.locator('.media-settings');
+  };
+
+  it('a tab that saved an OAIY asks it there as it opens, with the key, and Settings says that: not "never reaches out", not "only when you press"', async () => {
+    const { context, page, attempts, details } = await withSavedOaiy();
+    assert.deepEqual(attempts, [`GET ${LAN}/v1/discovery`], 'it asked, before any button was pressed');
+    assert.equal(details[0].headers.authorization, `Bearer ${KEY}`, 'and sent the key');
+    const section = await openSettings(page);
+    const words = await section.locator('p.muted').first().textContent();
+    assert.match(words, /OAIY was found at http:\/\/192\.168\.1\.20:8080: this page asks it there each time it opens \(sending the key below\), and now and then to follow the model chosen in OAIY's Engines\. Forget OAIY, or clearing the address, ends that/);
+    assert.doesNotMatch(words, /sends nothing|only when you press|never reaches/);
+    assert.match((await section.locator('button', { hasText: 'Find OAIY' }).getAttribute('title')) ?? '', /also asks OAIY at http:\/\/192\.168\.1\.20:8080 each time it opens/);
+    assert.equal(await section.locator('button', { hasText: 'Forget OAIY' }).count(), 1);
+    await context.close();
+  });
+
+  it('a tab that has found none says it sends nothing until Find OAIY is pressed; and OAIY\'s own window says it is found on its own', async () => {
+    const tab = await open('agent');
+    await ready('agent', tab.page);
+    const words = await (await openSettings(tab.page)).locator('p.muted').first().textContent();
+    assert.match(words, /OAIY is looked for only when you press Find OAIY: until you do, this page sends nothing to your computer or your network/);
+    assert.equal(await tab.page.locator('.media-settings button', { hasText: 'Forget OAIY' }).count(), 0, 'nothing found, nothing to forget');
+    assert.deepEqual(tab.attempts, []);
+    await tab.context.close();
+
+    const own = await open('agent', { desktop: OAIY_WINDOW });
+    await ready('agent', own.page);
+    assert.match(await (await openSettings(own.page)).locator('p.muted').first().textContent(), /with a media service: OAIY is found on its own, and any server/);
+    await own.context.close();
+  });
+
+  for (const how of ['clearing the address', 'Forget OAIY']) {
+    it(`the Agent forgets the OAIY it found, by ${how} and Save: it stops asking it when it opens, and the key goes nowhere (the review's F1)`, async () => {
+      const { context, page, attempts, details } = await withSavedOaiy();
+      assert.deepEqual(attempts, [`GET ${LAN}/v1/discovery`], 'the control: before, it asks, with the key');
+      assert.equal(details[0].headers.authorization, `Bearer ${KEY}`);
+      const section = await openSettings(page);
+      if (how === 'Forget OAIY') {
+        await section.locator('button', { hasText: 'Forget OAIY' }).click();
+        assert.match(await section.locator('.form-note').textContent(), /^Forgotten \(http:\/\/192\.168\.1\.20:8080\)\. Press Save to keep that/);
+      } else {
+        await section.locator('input').first().fill('');
+        await section.locator('input').first().dispatchEvent('input');
+      }
+      await page.locator('dialog.settings button.primary').click();
+      await page.waitForSelector('dialog.settings', { state: 'detached' });
+      await sleep(500);
+      const stored = await readStored(page);
+      assert.equal(stored.discovered, null, 'what says it was found is gone');
+      assert.equal(stored.endpoints, false);
+      if (how === 'Forget OAIY') assert.deepEqual([stored.baseUrl, stored.keySealed], ['', false], 'and its address and key with it');
+      attempts.length = 0;
+      details.length = 0;
+      await page.reload();
+      await ready('agent', page);
+      await sleep(3500);
+      assert.deepEqual(attempts, [], 'a reload asks nothing at the old address, or anywhere');
+      assert.deepEqual(details, []);
+      // and the words are the words of a tab that has found none
+      assert.match(await (await openSettings(page)).locator('p.muted').first().textContent(), /only when you press Find OAIY: until you do, this page sends nothing/);
+      await context.close();
+    });
+  }
+
+  it('a paired tab keeps in touch with its desktop, and the dialog says so; an unpaired one says it asks only because the dialog is open', async () => {
+    const DESK = 'http://127.0.0.1:17972';
+    const paired = await open('agent', { refuseAfterMs: 1500 });
+    await ready('agent', paired.page);
+    await seedPairing(paired.page, { origin: DESK, token: 'paired-token-0123456789' });
+    paired.attempts.length = 0;
+    await paired.page.reload();
+    await ready('agent', paired.page);
+    assert.ok(paired.attempts.some((a) => a.startsWith(`GET ${DESK}/api/`)), `it asks its desktop in the background, before any dialog: ${paired.attempts.join(', ')}`);
+    await paired.page.locator('button.chip.phone').click();
+    await paired.page.waitForSelector('dialog[open]');
+    const words = await paired.page.locator('dialog[open] p.muted').first().textContent();
+    assert.match(words, /^This page is paired with OAIY Desktop at http:\/\/127\.0\.0\.1:17972 and keeps in touch with it while it is open \(its calls, texts, settings and flows\)\. Checking it now\.$/);
+    assert.doesNotMatch(words, /only from here|asks nothing|because you opened this dialog/);
+    await paired.context.close();
   });
 });
 
@@ -212,9 +312,57 @@ describe('E5: the flow editor', () => {
     const card = page.locator('main .oaiy-connect');
     await card.waitFor();
     assert.match(await page.locator('main').textContent(), /not connected/);
-    assert.match(await card.textContent(), /Connect asks OAIY Desktop, on this computer or at the address above, whether it is running: one request\. Until you press it this page sends nothing to your computer or your network\. Your browser may ask whether this site may connect to devices on your network/);
+    assert.match(await card.textContent(), /Connect sends one request to http:\/\/127\.0\.0\.1:17972 \(GET \/api\/health\) to ask whether OAIY Desktop is running\. Until you press it this page sends nothing to your computer or your network\. Your browser may ask whether this site may connect to devices on your network/);
     assert.deepEqual(attempts, []);
     await context.close();
+  });
+
+  it('the card says what is true of each state (the review\'s F2 and F12): linked by Connect asks as it opens and every ten seconds, an address of its own does too, and after Disconnect it is never connected again', async () => {
+    const card = (page) => page.locator('main [data-connect-words]');
+    const openCard = async (page) => {
+      await page.locator('button[aria-label="Settings"]').click();
+      await card(page).waitFor();
+      return card(page);
+    };
+
+    // A link kept by Connect, the desktop switched off: it asks anyway (as it opens, then every ten seconds), and says so.
+    const linked = await open('flows', { storage: { 'oaiy.desktopLinked': '1' } });
+    await ready('flows', linked.page);
+    const c = await openCard(linked.page);
+    assert.equal(await c.getAttribute('data-connect-words'), 'connected');
+    const text = await c.textContent();
+    assert.match(text, /^This browser has a link to OAIY Desktop at http:\/\/127\.0\.0\.1:17972, so the editor asks there each time it opens and every 10 seconds while it is open; nothing answers now\. Connect asks again now; Disconnect forgets the link and ends that\.$/);
+    assert.doesNotMatch(text, /sends nothing|Until you press it/);
+    assert.equal(await linked.page.locator('main .oaiy-connect button').count(), 2, 'Connect (again) and Disconnect: the link can be forgotten while the desktop is off');
+    assert.equal(health(linked.attempts).length, 2, `it asked as it opened, without a button: ${linked.attempts.join(', ')}`);
+    await sleep(10_500);
+    assert.equal(health(linked.attempts).length, 3, 'and again after ten seconds: what the words say');
+    // Disconnect: the words are the words of a tab that never connected, and it asks nothing more.
+    await linked.page.locator('main .oaiy-connect button', { hasText: 'Disconnect' }).click();
+    await linked.page.waitForFunction(() => document.querySelector('main [data-connect-words]')?.getAttribute('data-connect-words') === 'never', null, { timeout: 5000 });
+    assert.match(await c.textContent(), /^Connect sends one request to http:\/\/127\.0\.0\.1:17972 \(GET \/api\/health\)/);
+    const before = linked.attempts.length;
+    await sleep(11_000);
+    assert.equal(linked.attempts.length, before);
+    await linked.context.close();
+
+    // An address of its own in Settings, nothing answering there.
+    const addressed = await open('flows', { storage: { 'oaiy.engineBase': 'http://192.168.1.50:17972' } });
+    await ready('flows', addressed.page);
+    const a = await openCard(addressed.page);
+    assert.equal(await a.getAttribute('data-connect-words'), 'address');
+    assert.match(await a.textContent(), /^The engine's address in Settings is http:\/\/192\.168\.1\.50:17972, so the editor asks there each time it opens and every 10 seconds while it is open; nothing answers now\. Reset above gives the default address back/);
+    assert.equal(health(addressed.attempts).length, 2, 'and it did ask as it opened');
+    await addressed.context.close();
+
+    // Connected and answering: the words say what Connect started, and the requests are those.
+    const up = await open('flows', { storage: { 'oaiy.desktopLinked': '1' }, answer: fakeDesktop });
+    await ready('flows', up.page);
+    const u = await openCard(up.page);
+    assert.equal(await u.getAttribute('data-connect-words'), 'connected');
+    assert.match(await u.textContent(), /^Connected to http:\/\/127\.0\.0\.1:17972\. This browser keeps the link: the editor asks OAIY Desktop whether it is running, and reads its services, each time it opens and every 10 seconds while it is open\. Disconnect ends that\.$/);
+    assert.ok(up.attempts.includes(`GET ${DESKTOP}/api/services`), `it read the desktop's services as it opened: ${up.attempts.join(', ')}`);
+    await up.context.close();
   });
 
   it('Connect in Settings makes exactly one health request, says nothing answered, and nothing keeps asking', async () => {
@@ -259,7 +407,7 @@ describe('E5: the flow editor', () => {
     const { context, page, attempts } = await open('flows');
     await ready('flows', page);
     const button = page.locator('aside [data-connect-desktop]');
-    assert.match((await button.getAttribute('title')) ?? '', /one request\. Until you press it this page sends nothing/);
+    assert.match((await button.getAttribute('title')) ?? '', /Connect sends one request to .* Until you press it this page sends nothing/);
     await button.click();
     await page.waitForFunction(() => /Nothing answered at/.test(document.querySelector('aside .oaiy-engine-get [role="status"]')?.textContent ?? ''), null, { timeout: 15_000 });
     assert.deepEqual(attempts, [`GET ${DESKTOP}/api/health`]);
