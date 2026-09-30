@@ -398,6 +398,7 @@ pub fn image_request(cfg: &Json, root: &Path, output_root: &Path, body: &Json, a
     let arch = str_or(model, "architecture", "qwen-image");
     let step = if arch == "sdxl" { 64 } else if arch == "flux2-klein-4b" { 16 } else { 32 };
     if arch == "flux2-klein-4b" {
+        if body.get("turbo").is_some_and(|v|v.as_bool()!=Some(false)) { return Err("Klein does not use Qwen turbo".into()); }
         for key in ["image", "images", "input_image", "input_reference", "adapter", "negative_prompt"] {
             if body.get(key).is_some_and(|v| !matches!(v, Json::Null) && !v.as_array().is_some_and(|a| a.is_empty())) {
                 return Err("native Klein currently supports text-to-image without reference images or negative prompts".into());
@@ -456,6 +457,7 @@ pub fn image_request(cfg: &Json, root: &Path, output_root: &Path, body: &Json, a
         let variant = str_or(model, "variant", "distilled");
         if !["distilled", "base"].contains(&variant) { return Err("Klein variant must be distilled or base".into()); }
         let distilled = variant == "distilled";
+        if body.get("steps").is_some_and(|v|v.as_i64().is_none()) { return Err("steps must be an integer".into()); }
         let count = steps(if distilled { 4 } else { 50 }, 1, 100)?;
         let cfg_scale = match body.get("cfg").or_else(|| model.get("cfg")) {
             None => if distilled { 1.0 } else { 4.0 },

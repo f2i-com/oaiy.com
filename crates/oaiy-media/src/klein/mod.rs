@@ -83,6 +83,7 @@ impl Request {
             "images",
             "image",
             "input_image",
+            "input_reference",
             "adapter",
             "negative_prompt",
         ] {
@@ -91,6 +92,9 @@ impl Request {
             }) {
                 return Err("Klein currently supports text-to-image; use loras for style adapters, without Qwen turbo/reference/negative fields".into());
             }
+        }
+        if j.get("turbo").is_some_and(|v| v.as_bool() != Some(false)) {
+            return Err("Klein does not use Qwen turbo".into());
         }
         let count = number("n", 1, 1, 1000)?;
         let prompts = match j.get("prompts") {
@@ -299,6 +303,7 @@ pub fn generate(r: &Request, mut event: impl FnMut(Json)) -> Result<Json> {
         manifest.flush()?;
         event(Json::obj([
             ("stage", Json::str("image_saved")),
+            ("image", Json::Int(i as i64 + 1)),
             ("path", Json::str(path.to_string_lossy())),
         ]));
         data.push(record);

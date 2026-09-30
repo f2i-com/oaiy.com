@@ -517,6 +517,14 @@ pub fn validate(v: &Json) -> Result<(), String> {
         if arch == "qwen-image" && str_or(m, "transformer", "").is_empty() && str_or(m, "safetensors_transformer", "").is_empty() {
             return Err(format!("image model {name} needs a transformer (a .gguf or a .safetensors checkpoint)"));
         }
+        if arch == "flux2-klein-4b" {
+            let variant=str_or(m,"variant","distilled");
+            if !["distilled","base"].contains(&variant) { return Err(format!("image model {name}: Klein variant must be distilled or base")); }
+            let distilled=variant=="distilled";
+            let steps=match m.get("steps") { None=>if distilled {4}else{50}, Some(v)=>v.as_i64().ok_or_else(||format!("image model {name}: steps must be an integer"))? };
+            let cfg=match m.get("cfg") { None=>if distilled {1.0}else{4.0}, Some(v)=>v.as_f64().ok_or_else(||format!("image model {name}: cfg must be numeric"))? };
+            if !(1..=100).contains(&steps) || !cfg.is_finite() || !(1.0..=10.0).contains(&cfg) || (distilled&&(steps!=4||cfg!=1.0)) { return Err(format!("image model {name}: distilled Klein requires four steps and cfg 1; base cfg must be 1..10")); }
+        }
         memory(m, &format!("image model {name}"))?;
     }
     let video = object(media, "video")?;

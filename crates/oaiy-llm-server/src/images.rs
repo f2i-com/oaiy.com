@@ -1165,6 +1165,27 @@ mod tests {
         }
     }
     #[test]
+    fn klein_catalog_dispatch_owns_paths_and_can_disable_style_loras() {
+        let mut cfg=config();
+        let root=std::env::temp_dir().join(format!("oaiy-klein-catalog-{}",std::process::id()));
+        std::fs::create_dir_all(&root).unwrap();
+        for file in ["transformer.safetensors","text.safetensors","vae.safetensors","tokenizer.json","style.safetensors"] { std::fs::write(root.join(file),b"fixture").unwrap(); }
+        std::fs::write(root.join("image.json"),br#"{"default_model":"klein","models":{"klein":{"architecture":"flux2-klein-4b","transformer":"transformer.safetensors","text_encoder":"text.safetensors","vae":"vae.safetensors","tokenizer":"tokenizer.json","loras":[{"path":"style.safetensors","strength":0.75}]}}}"#).unwrap();
+        cfg.media_dir=Some(root.clone());
+        let request=prepare(&cfg,&Json::parse(br#"{"model":"klein","prompt":"fox","transformer":"untrusted","device":99}"#).unwrap()).unwrap();
+        assert_eq!(request.get("architecture").and_then(Json::as_str),Some("flux2-klein-4b"));
+        assert_eq!(request.get("transformer").and_then(Json::as_str),root.join("transformer.safetensors").to_str());
+        assert_eq!(request.get("device").and_then(Json::as_i64),Some(1));
+        assert_eq!(request.get("steps").and_then(Json::as_i64),Some(4));
+        assert_eq!(request.get("cfg").and_then(Json::as_f64),Some(1.0));
+        assert_eq!(request.get("loras").and_then(Json::as_array).unwrap().len(),1);
+        let baseline=prepare(&cfg,&Json::parse(br#"{"model":"klein","prompt":"fox","use_loras":false}"#).unwrap()).unwrap();
+        assert!(baseline.get("loras").and_then(Json::as_array).unwrap().is_empty());
+        for bad in [br#"{"model":"klein","prompt":"fox","steps":8}"#.as_slice(),br#"{"model":"klein","prompt":"fox","cfg":4}"#.as_slice(),br#"{"model":"klein","prompt":"fox","input_reference":"untrusted"}"#.as_slice()] { assert!(prepare(&cfg,&Json::parse(bad).unwrap()).is_err()); }
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
     fn rejects_invalid_batches_before_creating_output() {
         let cfg = config();
         for json in [

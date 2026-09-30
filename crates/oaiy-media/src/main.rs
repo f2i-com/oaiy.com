@@ -13,6 +13,7 @@ fn run() -> candle_core::Result<()> {
     let args: Vec<_> = std::env::args().skip(1).collect();
     if args.first().is_some_and(|a| a == "--help") {
         println!("oaiy-media --request request.json | --stdin\nNative Rust Qwen Image 2.1, SDXL and LTX video. JSON: base, transformer, adapter (optional), prompt or prompts, output_dir, n, width, height, steps, seed, device, cfg.\nTurbo: 6 steps by default (4 supported), CFG=1. Base: 40 steps, CFG=6.\nSDXL: architecture=sdxl, checkpoint, tokenizer (CLIP tokenizer.json), prompt, negative_prompt, output_dir. Defaults: 1024x1024, 16 steps, CFG=2.5, DPM++ 2M Karras, clip_skip=1 (penultimate); no turbo or reference images.\nVideo: kind=video, model=ltx-2.3|ltx-2.5|sulphur-2, transformer, text_encoder, tokenizer (Gemma 3), vae, prompt, output_dir, optional image (starting frame), end_image (final-frame guidance) and cache_dir (bounded prompt cache). Eight steps; memory=auto|gpu|ram|ssd, ram_gb, vram_gb.");
+        println!("Klein: architecture=flux2-klein-4b, transformer (original BFL safetensors), text_encoder (Qwen3-4B), tokenizer, vae (Flux2), prompt, output_dir. Distilled: 4 steps, CFG=1. Style adapters: loras=[{{path,strength}}]. Native text-to-image; dimensions multiple of 16; no Qwen turbo, negative prompts or references. Explicit variant=base for Klein base 4B weights.");
         return Ok(());
     }
     let bytes = match args.first().map(String::as_str) {

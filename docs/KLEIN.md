@@ -1,4 +1,8 @@
-# Native FLUX.2 Klein 4B — implementation checkpoint
+# Native FLUX.2 Klein 4B — archived initial checkpoint
+
+**Updated:** native CUDA baseline, strength-1 LoRA image and byte-identical
+strength-zero control have now succeeded. See [current validation and reproduction](KLEIN_VALIDATED.md).
+The text below preserves the initial checkpoint and its inspection evidence.
 
 This is a recoverable development checkpoint, **not a validated full-model image release**.
 No baseline or LoRA image has been generated. No active desktop process was restarted,
