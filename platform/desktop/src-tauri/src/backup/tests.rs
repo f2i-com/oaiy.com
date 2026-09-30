@@ -3005,6 +3005,11 @@ fn a_restored_campaign_keeps_only_people_with_a_full_number_and_details_named_as
     let rebuilt = rebuild_campaign(&campaign, Some("running")).unwrap();
     let kept: Vec<&str> = rebuilt.campaign["people"].as_array().unwrap().iter().map(|p| p["number"].as_str().unwrap()).collect();
     assert_eq!(kept, good, "only the full numbers");
+    // A campaign that does not say what to do with a voicemail leaves none (an absent key is not an empty word), and one that says so does.
+    assert_eq!(rebuilt.campaign["voicemail"], "no_message");
+    let mut leaves = campaign.clone();
+    leaves["voicemail"] = serde_json::json!("leave_message");
+    assert_eq!(rebuild_campaign(&leaves, None).unwrap().campaign["voicemail"], "leave_message");
     assert_eq!(rebuilt.bad_numbers, bad.len(), "and the others are counted (a person with no number at all is not a person to count)");
     for p in rebuilt.campaign["people"].as_array().unwrap() {
         assert_eq!(p["raw"], p["number"], "the number is what is called: the number as it was typed is not carried");
