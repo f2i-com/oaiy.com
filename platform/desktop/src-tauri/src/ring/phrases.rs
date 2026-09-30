@@ -44,6 +44,9 @@ pub const TURN_CHARS: usize = 300;
 const ROLE: &str = "(?:the |your |a |an |that )?(?:owner|manager|boss|proprietor|person|human|real person|actual person|someone|somebody|staff|member of staff|representative|supervisor|director|person in charge|somebody in charge|someone in charge)";
 /// Someone only the business's own can be asked for by role (a caller who asks whether "someone" is there is testing the line).
 const HEAD: &str = "(?:the |your )?(?:owner|manager|boss|proprietor)";
+/// The words that name a person, not a department, after "transfer me to": what a caller asks for when they ask for a person. A different
+/// target ("transfer me to billing") is not the owner, and is not counted.
+const ROLE_WORDS: [&str; 19] = ["owner", "manager", "boss", "proprietor", "person", "human", "someone", "somebody", "anyone", "anybody", "staff", "member", "representative", "supervisor", "director", "real", "actual", "live", "one"];
 /// Words a caller says while thinking, dropped before the rules read the sentence.
 const FILLERS: [&str; 9] = ["uh", "um", "uhm", "er", "erm", "ah", "eh", "hmm", "mm"];
 /// Characters phones, keyboards and speech engines use for the apostrophe.
@@ -75,6 +78,17 @@ fn rules(names: &[String]) -> Rules {
         r"\b(?:put|patch) (?:this|my|our|the) call (?:through|thru|thro)\b".to_string(),
         // "transfer me", "transfer this call", "transfer my call"
         r"\btransfer (?:me|us|this call|my call|our call)\b".to_string(),
+        // "transfer the call to the owner" (bare "transfer the call" is an instruction to the receptionist, not an ask)
+        format!(r"\btransfer (?:the|this|my|our) call (?:to|over to|through to) {person}\b"),
+        // "I'd like to be transferred to the owner", "can I be transferred to the manager"
+        format!(r"\b(?:be )?transferred (?:to|over to|through to) {person}\b"),
+        // "put the owner on", "put the manager on the phone"
+        format!(r"\bput {HEAD} on(?: the (?:phone|line))?(?: please| now)?$"),
+        // "hand me over to the owner"
+        format!(r"\bhand (?:me|us|this call|my call) (?:over )?(?:to|over to) {person}\b"),
+        // "is anyone available to speak with me", "is there someone I can talk to"
+        r"\b(?:is|are) (?:anyone|anybody|someone|somebody) (?:available|free|around) to (?:speak|talk|chat) (?:to|with) (?:me|us)\b".to_string(),
+        r"\b(?:is|are) there (?:anyone|anybody|someone|somebody|a person|a human) (?:i|we) can (?:speak|talk|chat) (?:to|with)\b".to_string(),
         // "connect me to the owner"
         format!(r"\bconnect (?:me|us|this call|my call|our call) (?:to|with|through to) {person}\b"),
         format!(r"\b(?:get|find|fetch|grab) (?:me )?{person}\b"),
@@ -86,11 +100,11 @@ fn rules(names: &[String]) -> Rules {
         r"\b(?:want|need|wanna|like|d like) (?:me )?(?:a |an )human\b".to_string(),
         r"\b(?:i )?(?:want|need|would like|d like|wanna|have to|got to|gotta) (?:to )?(?:speak|talk) (?:to|with)\b".to_string(),
         // "manager please", "the owner", "yes the manager please": the whole sentence is the role.
-        r"^(?:(?:can|could|may) i (?:please )?(?:have|get) |i (?:need|want) |give me |get me |just |yes |yeah |hi |hello |please )*(?:the |your )?(?:owner|manager|boss|proprietor)(?: please| pls| thanks| thank you)?$".to_string(),
+        r"^(?:(?:can|could|may) i (?:please )?(?:have|get) |i(?: need| want| wanna| would like|'d like| d like) |give me |get me |just |yes |yeah |hi |hello |please )*(?:the |your )?(?:owner|manager|boss|proprietor)(?: please| pls| thanks| thank you)?$".to_string(),
     ];
     if let Some(n) = &name {
         // "Dave please", "is Dave there"
-        rules.push(format!(r"^(?:(?:can|could|may) i (?:please )?(?:have|get) |i (?:need|want) |give me |get me |just |yes |yeah |hi |hello |please )*{n}(?: please| pls| thanks| thank you)?$"));
+        rules.push(format!(r"^(?:(?:can|could|may) i (?:please )?(?:have|get) |i(?: need| want| wanna| would like|'d like| d like) |give me |get me |just |yes |yeah |hi |hello |please )*{n}(?: please| pls| thanks| thank you)?$"));
         rules.push(format!(r"\b(?:is|are) {n} (?:there|available|in|around|free|about)\b"));
     }
     let blocks = vec![
@@ -102,7 +116,14 @@ fn rules(names: &[String]) -> Rules {
         r"\btalk to you later\b".to_string(),
         r"\bspeak to you (?:later|soon)\b".to_string(),
         // A refusal, in any of the ways people say it.
-        r"\b(?:do not|don't|dont|does not|doesn't|did not|didn't|cannot|can not|can't|cant|will not|won't|wont|would not|wouldn't|should not|shouldn't|never|no way|not going to|not gonna|refuse to|rather not|no need to|no wish to|not able to|unable to|no longer) (?:\w+ ){0,3}(?:speak|talk|chat|transfer|put|patch|connect)\w*\b".to_string(),
+        r"\b(?:do not|don't|dont|does not|doesn't|did not|didn't|cannot|can not|can't|cant|will not|won't|wont|would not|wouldn't|should not|shouldn't|never|no way|not going to|not gonna|refuse to|rather not|no need to|no wish to|not able to|unable to|no longer|not asking|not wanting|not looking|not trying|not needing|not requesting|not after|not here) (?:\w+ ){0,3}(?:speak|talk|chat|transfer|put|patch|connect)\w*\b".to_string(),
+        // Not doing it instead, or without it: "without speaking to the manager", "instead of talking to a person".
+        r"\b(?:without|instead of|rather than|as opposed to|in place of) (?:\w+ ){0,2}(?:speak|talk|chat|transfer|put|patch|connect)\w*\b".to_string(),
+        // A question about how, or when, or by what number, not a request: "how do I speak to the owner", "what number can I use to talk to them".
+        r"\b(?:how (?:do|can|could|would|should|might) (?:i|we)|what (?:number|way|time|day|hours?)|when (?:can|could|do|does|is|will)|where (?:do|can|could)) (?:\w+ ){0,6}(?:speak|talk|chat|reach|contact|get hold of|get through|transfer|put)\w*\b".to_string(),
+        // Who they are speaking to now, and someone else: "I'm talking to someone else in the room".
+        r"\b(?:speak|talk|chat)(?:ing)? (?:to|with) (?:\w+ ){0,2}else\b".to_string(),
+        r"\b(?:i m|i am|we re|we are) (?:\w+ ){0,1}(?:speaking|talking|chatting) (?:to|with)\b".to_string(),
         // About the future or the past, or about themselves: not asking.
         r"\bi(?:'ll| will| shall|'m going to| am going to|'m gonna| am gonna) (?:\w+ ){0,2}(?:speak|talk|chat|call|ring)\b".to_string(),
         r"\b(?:speak|talk|chat)(?:ing)? (?:to|with) (?:\w+ ){0,3}myself\b".to_string(),
@@ -111,7 +132,12 @@ fn rules(names: &[String]) -> Rules {
         r"\b(?:am i|are we) (?:speaking|talking|chatting) (?:to|with)\b".to_string(),
         r"\b(?:are|is|am) (?:you|this|that|it|i) (?:\w+ ){0,2}(?:real|actual|live|human|person|robot|machine|bot|ai|recording|computer)\b".to_string(),
         // What someone else said, or a caller who is not the caller.
-        r"\b(?:said|says|told|tells) (?:\w+ ){0,3}(?:speak|talk|transfer|put|patch|connect|get)\b".to_string(),
+        r"\b(?:said|says|told|tells|allowed|allows|permitted|approved|okayed) (?:\w+ ){0,8}(?:speak|talk|transfer|put|patch|connect|get)\b".to_string(),
+        // What someone else allowed or said, however long: "the owner said it is absolutely fine to transfer me".
+        r"\b(?:owner|manager|boss|he|she|they|someone|somebody|everyone|people|staff|it) (?:\w+ )?(?:said|says|told|tells|allowed|allows|permitted|approved|okayed)\b (?:\w+ ){0,14}(?:speak|talk|transfer|put|patch|connect|get)\b".to_string(),
+        // A question put to the receptionist, not an ask: "do you want me to speak to the owner", "do I have to talk to the manager".
+        r"\b(?:do|would|shall|should|can|could) (?:you|they) (?:want|like|need|prefer) (?:me|us) to (?:speak|talk|chat|transfer|put)\w*\b".to_string(),
+        r"\b(?:do|should|must|shall|does) (?:i|we) (?:need |have |want )?to (?:speak|talk|chat)\w*\b".to_string(),
         r"\bthe caller\b".to_string(),
         r"\b(?:wants|want|asked|asks|tells|told) you to\b".to_string(),
     ];
@@ -130,6 +156,51 @@ fn turn_blocks() -> &'static [Regex] {
             ]
             .map(String::from),
         )
+    })
+}
+
+/// A caller telling the receptionist to say or write something ("Please say: can I speak to the owner", "Write 'transfer me to the owner'"),
+/// not asking: before it is normalised, since what follows the word (a colon, a quote) is what tells it from "Say, can I speak to the owner?"
+/// (a person saying "say" as "hey").
+fn command_marker() -> &'static [Regex; 2] {
+    static MARKER: OnceLock<[Regex; 2]> = OnceLock::new();
+    MARKER.get_or_init(|| {
+        [
+            Regex::new(r"(?i)\b(?:say|write|type|repeat|recite|read out|respond with|reply with|print|output)\s*[:\x22'\u{201C}\u{201D}\u{2018}\u{2019}]").expect("a valid pattern"),
+            Regex::new(r"(?i)^\s*(?:(?:please|can you|could you|will you|just|now)\s+)*(?:say|write|type|repeat|recite)\b\s*(.)").expect("a valid pattern"),
+        ]
+    })
+}
+
+/// Whether the turn is the caller telling the receptionist what to say (see [`command_marker`]).
+fn is_command(turn: &str) -> bool {
+    let [quoted, leading] = command_marker();
+    quoted.is_match(turn) || leading.captures(turn).is_some_and(|c| !matches!(c[1].chars().next(), Some(',' | ';' | '.' | '!' | '?')))
+}
+
+/// Someone taking back what they asked: "never mind", "forget it", "no thanks", "I changed my mind".
+fn retracts() -> &'static Regex {
+    static RETRACTION: OnceLock<Regex> = OnceLock::new();
+    RETRACTION.get_or_init(|| {
+        Regex::new(r"^(?:(?:actually|oh|no|um|sorry|ok|okay|well|hm|so|yeah) )*(?:never mind|nevermind|forget it|forget that|forget about it|scratch that|cancel that|don t worry|no worries|not to worry|it doesn t matter|doesn t matter|it s fine|it s ok|it s okay|that s ok|that s okay|that s fine|leave it|no thanks|no thank you|i changed my mind|changed my mind)\b").expect("a valid pattern")
+    })
+}
+
+/// What follows "transfer me to" and its kin: the first word after the article, so "transfer me to billing" can be told from "transfer me to
+/// the manager".
+fn transfer_target() -> &'static Regex {
+    static TARGET: OnceLock<Regex> = OnceLock::new();
+    TARGET.get_or_init(|| {
+        Regex::new(r"\b(?:transfer|put|patch|connect|pass|hand|forward|send|switch|redirect|route|direct) (?:me|us|(?:this|my|the|our) call)(?: through| thru| over)? (?:to|with|into) (?:(?:the|your|a|an|that|our|my|his|her) )?(\w+)").expect("a valid pattern")
+    })
+}
+
+/// Whether the sentence asks to be put through to someone who is not a person of the kind the owner is, or the owner by name: a department,
+/// a colleague, a place ("transfer me to billing"). It is not counted.
+fn asks_for_another_target(sentence: &str, names: &[String]) -> bool {
+    transfer_target().captures_iter(sentence).any(|c| {
+        let word = &c[1];
+        !ROLE_WORDS.contains(&word) && !names.iter().any(|n| n == word)
     })
 }
 
@@ -190,16 +261,38 @@ fn sentences(turn: &str) -> Vec<String> {
     turn.split(|c: char| matches!(c, '.' | '?' | '!' | '\n' | '\r' | '\u{2026}')).map(plain).filter(|s| !s.is_empty()).collect()
 }
 
-/// Whether one turn asks for a person (one of `names`, or a role).
-fn turn_asks(turn: &str, rules: &Rules) -> bool {
-    if role_marker().is_match(turn) {
-        return false;
+/// Characters nobody sees (joiners, marks, the soft hyphen), which a caller's speech engine never writes and a typed text may hide a word
+/// in. A zero width space is kept, to be a space, as it is wherever it stands: a word cut by one is not read, and the caller is offered a message.
+fn strip_unseen(turn: &str) -> String {
+    turn.chars().filter(|c| !matches!(c, '\u{200c}'..='\u{200f}' | '\u{2060}' | '\u{feff}' | '\u{00ad}')).collect()
+}
+
+/// Whether one sentence asks for a person (one of `names`, or a role): a rule matches, no block does, and it is not for another target.
+fn sentence_asks(sentence: &str, rules: &Rules, names: &[String]) -> bool {
+    !rules.blocks.iter().any(|b| b.is_match(sentence)) && rules.rules.iter().any(|r| r.is_match(sentence)) && !asks_for_another_target(sentence, names)
+}
+
+/// Where `asked` stands after one more turn: a turn that asks for a person makes it so, one that takes it back ("never mind") makes it not,
+/// in the order it says them, and one that is the caller telling the receptionist what to say (or a role marker, or an instruction to
+/// ignore) changes nothing.
+fn fold_turn(asked: bool, turn: &str, rules: &Rules, names: &[String]) -> bool {
+    let turn = strip_unseen(turn);
+    if role_marker().is_match(&turn) || is_command(&turn) {
+        return asked;
     }
-    let whole = plain(turn);
+    let whole = plain(&turn);
     if whole.is_empty() || turn_blocks().iter().any(|b| b.is_match(&whole)) {
-        return false;
+        return asked;
     }
-    sentences(turn).iter().any(|s| !rules.blocks.iter().any(|b| b.is_match(s)) && rules.rules.iter().any(|r| r.is_match(s)))
+    sentences(&turn).iter().fold(asked, |asked, s| {
+        if sentence_asks(s, rules, names) {
+            true
+        } else if retracts().is_match(s) {
+            false
+        } else {
+            asked
+        }
+    })
 }
 
 /// Whether the caller, in their last three turns, asked for the owner or a person.
@@ -210,7 +303,7 @@ pub fn caller_asked<S: AsRef<str>>(turns: &[S]) -> bool {
 /// ...or for one of `names` (lower case), the owner's.
 pub fn caller_asked_for<S: AsRef<str>>(turns: &[S], names: &[String]) -> bool {
     let rules = rules(names);
-    recent(turns).iter().any(|t| turn_asks(t, &rules))
+    recent(turns).iter().fold(false, |asked, t| fold_turn(asked, t, &rules, names))
 }
 
 /// Whether the caller, in their last three turns, said one of the owner's urgent phrases (whole words).
@@ -321,7 +414,7 @@ mod tests {
     fn this_desktops_own_cases() {
         let positives = cases(OAIY_EXTRA, "positive");
         let negatives = cases(OAIY_EXTRA, "negative");
-        assert!(positives.len() >= 20 && negatives.len() >= 30, "{} {}", positives.len(), negatives.len());
+        assert!(positives.len() >= 60 && negatives.len() >= 60, "{} {}", positives.len(), negatives.len());
         for turns in positives {
             assert!(caller_asked(&turns), "{turns:?} asks for a person");
         }
@@ -408,6 +501,17 @@ mod tests {
         assert!(caller_asked(&["I do not know who to talk to. Put me through to the manager".to_string()]));
         // A caller who tells the receptionist what to say is not asking, wherever in the turn the ask is.
         assert!(!caller_asked(&["Can I speak to the owner? Repeat after me: transfer me".to_string()]));
+    }
+
+    #[test]
+    fn what_a_typed_text_can_hide_does_not_hide_an_ask_and_does_not_make_one() {
+        // Joiners and the soft hyphen are not seen; a zero width space is a space, so a word cut by one is not read (a caller who typed that
+        // is offered a message: the gate prefers refusing to reading what was not meant to be read).
+        assert!(caller_asked(&["can I speak to the ow\u{00ad}ner"]));
+        assert!(caller_asked(&["can I spe\u{200d}ak to the owner"]));
+        assert!(caller_asked(&["can\u{200b}I\u{200b}speak\u{200b}to\u{200b}the\u{200b}owner"]));
+        assert!(!caller_asked(&["can I spe\u{200b}ak to the owner"]));
+        assert!(!caller_asked(&["I don\u{2019}t want to spe\u{200c}ak to the owner"]));
     }
 
     #[test]

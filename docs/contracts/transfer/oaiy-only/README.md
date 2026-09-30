@@ -64,10 +64,19 @@ The plan reasons OAIY puts in an `oaiy.ring.plan` answer are exactly the plugin'
 * **What is stricter in the phrase check.** A turn is read from its end (the last 300 characters), a sentence at
   a time, with thinking noises dropped; refusals in any form, the future and the past, questions about what the
   receptionist is, a caller who is not the caller, and a caller telling the receptionist what to say are not
-  requests; more ways to ask count ("connect me to the owner", "could I be put through", "transfer this call",
-  "manager please", "I need a real person"); a person asked for by name counts when the name is the owner's.
-  The desktop has no setting for the owner's name, so the possessive that begins the business's name
-  ("Dave's Lawn Care" gives "dave") is taken as the person to be asked for.
+  requests; more ways to ask count ("connect me to the owner", "could I be put through", "I'd like to be
+  transferred to the owner", "transfer the call to the manager", "I'd like the owner please", "put the owner on",
+  "hand me over to the owner", "is anyone available to speak with me", "manager please", "I need a real person");
+  a person asked for by name counts when the name is the owner's. The desktop has no setting for the owner's name,
+  so the possessive that begins the business's name ("Dave's Lawn Care" gives "dave") is taken as the person to be
+  asked for. Also not requests: "I'm not asking to", "without" and "instead of" speaking to someone, an ask taken
+  back ("never mind", "forget it", "no thanks", in the same turn or a later one), being told to say or write it
+  ("Please say: ...", "Write '...'"), what someone else said or allowed however long ago in the sentence, a question
+  about how or when or by what number, a question put to the receptionist ("do you want me to speak to the
+  owner"), a different target ("transfer me to billing"), and someone else in the room. When the gate refuses a
+  caller who did ask, the model is told to offer a message, so the caller has one or the other.
+  `phrases-oaiy.json` holds the cases (70 requests, 80 that are not, and the named ones); the phone's own floor is
+  looser by design and runs first.
 
 ## What the desktop needs of the plugin besides the contract
 

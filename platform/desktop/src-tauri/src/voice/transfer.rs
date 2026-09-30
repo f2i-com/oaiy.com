@@ -285,7 +285,9 @@ pub fn promises_transfer(text: &str) -> bool {
 /// of a tool result: `{ok: false, output: {status, reason, instruction}}`.
 pub fn refused(status: &str, reason: &str) -> Value {
     let instruction = match reason {
-        "caller_did_not_ask" => "The caller has not asked for a person. Do not offer to transfer the call; carry on helping.",
+        // The gate reads the caller's own words and errs towards refusing, so a caller who did ask (in words it did not read) must not be left with
+        // neither the owner nor a message: this says what to do for either.
+        "caller_did_not_ask" => "The caller has not clearly asked for a person, so nothing was tried. If they want to speak to someone, offer to take a message (take_message); otherwise carry on helping. Do not say the call is being transferred.",
         "bad_arguments" => "Call transfer_to_owner with exactly {reason: \"caller_asked\"}. Only do so when the caller asked for the owner or a person.",
         "pending_request" => "A request to reach the owner is already going. Wait for its result; do not ask again.",
         "limit_call" | "limit_gap" | "limit_caller" | "limit_global" => {
@@ -912,6 +914,15 @@ mod tests {
         // The fixed lines the desktop says itself: the connecting one is said only after an acceptance, and it is what this catches.
         assert!(promises_transfer(CONNECTING_LINE));
         assert!(HOLD_LINES.iter().chain([&OFFER_LINE, &FAILED_LINE]).all(|l| !promises_transfer(l)), "nor does a hold line, the offer or the apology");
+    }
+
+    #[test]
+    fn a_refusal_for_want_of_an_ask_offers_a_message_to_a_caller_who_wanted_a_person() {
+        let said = refused("refused", "caller_did_not_ask");
+        let instruction = said["output"]["instruction"].as_str().unwrap();
+        assert!(instruction.contains("offer to take a message (take_message)") && instruction.contains("carry on helping"), "{instruction}");
+        assert!(!instruction.to_lowercase().contains("do not offer"), "{instruction}");
+        assert!(!promises_transfer(instruction), "the instruction is the model's to read, and says nothing that is a promise: {instruction}");
     }
 
     #[test]
