@@ -287,6 +287,36 @@ test('4.7.1 client address: the rightmost address that is not itself a trusted p
     eq('203.0.113.9', ClientIp::resolve(['REMOTE_ADDR' => '::ffff:10.0.0.2', 'HTTP_X_FORWARDED_FOR' => '203.0.113.9'], 'X-Forwarded-For', $trusted), 'a mapped trusted proxy');
 });
 
+test('4.7.1 client address: a prefix that is not a multiple of 8 bits masks the partial byte, for IPv4, IPv6 and a trusted-proxy list', function () {
+    $in = fn(string $ip, string $cidr): bool => ClientIp::inCidr(ClientIp::toBin($ip), ClientIp::parseCidr($cidr));
+    foreach ([
+        ['10.8.0.0/13', ['10.8.0.0', '10.8.0.1', '10.12.34.56', '10.15.255.255'], ['10.7.255.255', '10.16.0.0', '10.0.0.1', '11.8.0.0']],
+        ['192.168.8.0/21', ['192.168.8.0', '192.168.15.255', '192.168.11.1'], ['192.168.7.255', '192.168.16.0', '192.168.0.1']],
+        ['172.16.0.0/12', ['172.16.0.1', '172.31.255.255'], ['172.15.255.255', '172.32.0.0']],
+        ['10.0.0.0/1', ['10.0.0.1', '127.255.255.255'], ['128.0.0.0', '192.0.2.1']],
+        ['128.0.0.0/1', ['128.0.0.0', '255.255.255.255'], ['127.255.255.255', '10.0.0.1']],
+        ['198.51.100.128/25', ['198.51.100.128', '198.51.100.255'], ['198.51.100.127', '198.51.100.0']],
+        ['203.0.113.6/31', ['203.0.113.6', '203.0.113.7'], ['203.0.113.5', '203.0.113.8']],
+        ['203.0.113.9/32', ['203.0.113.9'], ['203.0.113.8', '203.0.113.10']],
+        ['2001:db8:8000::/33', ['2001:db8:8000::1', '2001:db8:ffff:ffff::1'], ['2001:db8:7fff:ffff::1', '2001:db8::1']],
+        ['2001:db8::/35', ['2001:db8::1', '2001:db8:1fff::1'], ['2001:db8:2000::1', '2001:db9::1']],
+        ['2001:db8:0:0:8000::/65', ['2001:db8::8000:0:0:1', '2001:db8::ffff:ffff:ffff:ffff'], ['2001:db8::7fff:ffff:ffff:ffff', '2001:db8::1']],
+        ['2001:db8::/127', ['2001:db8::', '2001:db8::1'], ['2001:db8::2']],
+    ] as [$cidr, $inside, $outside]) {
+        foreach ($inside as $ip) {
+            ok($in($ip, $cidr), "$ip is inside $cidr");
+        }
+        foreach ($outside as $ip) {
+            ok(!$in($ip, $cidr), "$ip is outside $cidr");
+        }
+    }
+    // The address of a request follows the same rule when the proxy list has such a prefix.
+    $srv = fn(string $remote) => ['REMOTE_ADDR' => $remote, 'HTTP_X_FORWARDED_FOR' => '203.0.113.9'];
+    eq('203.0.113.9', ClientIp::resolve($srv('10.12.34.56'), 'X-Forwarded-For', ['10.8.0.0/13']), 'a proxy inside /13');
+    eq('10.16.0.1', ClientIp::resolve($srv('10.16.0.1'), 'X-Forwarded-For', ['10.8.0.0/13']), 'one just outside is not a proxy');
+    eq('192.168.16.5', ClientIp::resolve($srv('192.168.16.5'), 'X-Forwarded-For', ['192.168.8.0/21']));
+});
+
 test('4.7.1 client address: behind a trusted proxy only the exact header name counts, and an underscore variant, which PHP folds into the same variable, is ignored where the SAPI reports names as sent', function () {
     $r = OaiyTest\Relay::make(['client_ip' => ['header' => 'X-Forwarded-For', 'trusted_proxies' => ['10.0.0.0/8']]]);
     $client = function (array $sent, ?string $foldedByPhp, bool $names = true) use ($r): string {
