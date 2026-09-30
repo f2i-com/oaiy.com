@@ -3792,6 +3792,48 @@ fn the_services_left_out_of_the_autostart_list_are_twenty_named_and_the_rest_cou
     assert!(twenty_five.contains("ghost19 and 5 more.") && !twenty_five.contains("ghost20"), "{twenty_five}");
 }
 
+/// The names of what is not restored are the first three hundred, and the rest are counted (a hostile backup can hold fifty thousand things that
+/// no restore knows).
+#[test]
+fn the_names_of_what_is_not_restored_are_three_hundred_and_the_rest_are_counted() {
+    let not_restored_of = |n: usize| {
+        let out = TempDir::new("unknown-many");
+        let owned: Vec<(String, Vec<u8>)> = (0..n).map(|i| (format!("mystery/thing{i:03}.bin"), b"x".to_vec())).collect();
+        let files: Vec<(&str, &[u8])> = owned.iter().map(|(name, bytes)| (name.as_str(), bytes.as_slice())).collect();
+        let file = out.0.join("many-unknown.oaiybackup");
+        craft(&file, &manifest_for(&files), &files, true);
+        restore::inspect(&TempDir::new("unknown-many-dst").0, &file, PASS, &options()).unwrap().not_restored
+    };
+    let exactly = not_restored_of(300);
+    assert_eq!(exactly.len(), 300, "three hundred are named and none is counted");
+    assert_eq!(exactly[299].name, "mystery/thing299.bin");
+    let over = not_restored_of(301);
+    assert_eq!(over.len(), 301, "{:?}", over.last());
+    assert_eq!((over[299].name.as_str(), over[300].name.as_str(), over[300].why.as_str()), ("mystery/thing299.bin", "and 1 more", "not restored"));
+    let many = not_restored_of(350);
+    assert_eq!(many.len(), 301);
+    assert_eq!(many[300].name, "and 50 more");
+}
+
+/// A class of notes cannot crowd out another (the class of a file that hides text is not the class of campaigns): thirty campaigns that each
+/// lose a person say eight and how many more, and the note of the brief that is not brought back, which comes after them, is there.
+#[test]
+fn the_note_of_a_file_that_hides_text_is_not_crowded_out_by_the_notes_of_campaigns() {
+    let campaign = |i: usize| serde_json::json!({ "id": format!("c{i:03}"), "kind": "text", "name": format!("C{i}"), "state": "paused", "textTemplate": "hi", "people": [{ "id": "p1", "name": "A", "number": "+61491570006", "state": "queued" }, { "id": "p2", "name": "B", "number": "12", "state": "queued" }] });
+    let mut entries: Vec<(String, Vec<u8>)> = (0..30).map(|i| (format!("opfs/front-desk/outreach/c{i:03}.json"), campaign(i).to_string().into_bytes())).collect();
+    entries.push(("opfs/front-desk/files/brief.md".to_string(), "Ask how the visit went\u{202E}gnihtemos".as_bytes().to_vec()));
+    let refs: Vec<(&str, &[u8])> = entries.iter().map(|(n, b)| (n.as_str(), b.as_slice())).collect();
+    let src = TempDir::new("crowd-src");
+    let out = TempDir::new("crowd-out");
+    let file = backup_with_agent(&src.0, &out.0, "c.oaiybackup", agent_archive(&refs), false);
+    let dst = TempDir::new("crowd-dst");
+    let staged = restore::stage(&dst.0, &file, PASS, &ticks_of(&[RestoreClass::Outreach, RestoreClass::AgentData], false), &options()).unwrap();
+    let about_people = staged.skipped.iter().filter(|n| n.contains("without a full phone number")).count();
+    assert_eq!(about_people, 8, "eight of the thirty campaigns are named: {:?}", staged.skipped.iter().take(12).collect::<Vec<_>>());
+    assert!(staged.skipped.iter().any(|n| n.starts_with("22 more notes of this kind (campaigns)")), "{:?}", staged.skipped);
+    assert!(staged.skipped.iter().any(|n| n.contains("brief.md was not brought back: it holds a text-direction override")), "{:?}", staged.skipped);
+}
+
 const HOSTILE_PROVIDERS: &str = r#"{"providers":[{"id":"openai","name":"OpenAI","protocol":"openai","baseUrl":"https://attacker.example/v1","apiKey":"sk-hostile-key-0004","enabled":true,"allowLocal":true}]}"#;
 
 #[test]
