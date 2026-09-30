@@ -1752,6 +1752,13 @@
    "key": "73e5be01a9ce5da9321c80638f4c5e30ea2fe126fa75b544b6bf120c121a1cb2"
   },
   {
+   "input": "FLRK1-CE\u0131R-CEIR-CEIR-CEIR-CEIR-CEIR-CEIR-CEIR-CEIR-CEIR-CEIR-CEIR-CEIQ-ALKE",
+   "class": "stricter",
+   "note": "dotless i (U+0131) upper-cases to I",
+   "js_ok": true,
+   "key": "1111111111111111111111111111111111111111111111111111111111111111"
+  },
+  {
    "input": "FLRK1-AAAQ-EAYE-AUDA-OCAJ-B\u0131FQ-YDIO-B4IB-CEQT-CQKR-MFYY-DENB-WHA5-DYPQ-MMG4",
    "class": "stricter",
    "note": "dotless i (U+0131) upper-cases to I",
@@ -1759,65 +1766,142 @@
    "key": "000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f"
   },
   {
-   "input": "FLRK1-LLWO-2UXW-BGZ\u0131-AXWC-XGWL-XUQN-OW46-YX6Z-EYJB-AJVG-PGX4-NY6\u0131-C5CQ-5JIR",
-   "class": "same",
+   "input": "FLRK1-VV3D-M5HM-PHH6-VC4O-CUB7-3HQ7-764H-KTYZ-NXXR-VXV5-4QJT-6LL5-G72Q-\u0131YEO",
+   "class": "stricter",
    "note": "dotless i (U+0131) upper-cases to I",
-   "js_ok": false,
-   "key": null
+   "js_ok": true,
+   "key": "ad763674ec79cfea8b8e1503fd9e1fffb8754f196def1adebde4133f2d7d37f5"
   },
   {
-   "input": "FLRK1-AAAQ-EAYE-AUDA-OCAJ-B\u017fFQ-YDIO-B4IB-CEQT-CQKR-MFYY-DENB-WHA5-DYPQ-MMG4",
-   "class": "same",
+   "input": "FLRK1-LLWO-2UXW-BGZS-AXWC-XGWL-XUQN-OW46-YX6Z-EYJB-AJVG-PGX4-NY6\u0131-C5CQ-5JIR",
+   "class": "stricter",
+   "note": "dotless i (U+0131) upper-cases to I",
+   "js_ok": true,
+   "key": "5aeced52f609b3205ec2b9acbbd20d75b9ec5fd926121026a679afc6e3c81745"
+  },
+  {
+   "input": "FLRK1-LLWO-2UXW-BGZ\u017f-AXWC-XGWL-XUQN-OW46-YX6Z-EYJB-AJVG-PGX4-NY6I-C5CQ-5JIR",
+   "class": "stricter",
    "note": "long s (U+017F) upper-cases to S",
-   "js_ok": false,
-   "key": null
+   "js_ok": true,
+   "key": "5aeced52f609b3205ec2b9acbbd20d75b9ec5fd926121026a679afc6e3c81745"
   },
   {
-   "input": "FLRK1-LLWO-2UXW-BGZ\u017f-AXWC-XGWL-XUQN-OW46-YX6Z-EYJB-AJVG-PGX4-NY6\u017f-C5CQ-5JIR",
-   "class": "same",
+   "input": "FLRK1-OP\u017f3-4ANJ-ZZO2-SMQ4-QBRY-6TC6-GDVC-7YJG-7J23-KRFW-X4JA-YEQ2-DSZA-4737",
+   "class": "stricter",
    "note": "long s (U+017F) upper-cases to S",
+   "js_ok": true,
+   "key": "73e5be01a9ce5da9321c80638f4c5e30ea2fe126fa75b544b6bf120c121a1cb2"
+  },
+  {
+   "input": "\ufb02RK1-AAAA-AAAA-AAAA-AAAA-AAAA-AAAA-AAAA-AAAA-AAAA-AAAA-AAAA-AAAA-AAAA-MZUH",
+   "class": "stricter",
+   "note": "the fl ligature (U+FB02) upper-cases to FL, in the prefix",
+   "js_ok": true,
+   "key": "0000000000000000000000000000000000000000000000000000000000000000"
+  },
+  {
+   "input": "\ufb02RK1-7777-7777-7777-7777-7777-7777-7777-7777-7777-7777-7777-7777-777Q-V6LB",
+   "class": "stricter",
+   "note": "the fl ligature (U+FB02) upper-cases to FL, in the prefix",
+   "js_ok": true,
+   "key": "ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff"
+  },
+  {
+   "input": "\ufb02RK1-CEIR-CEIR-CEIR-CEIR-CEIR-CEIR-CEIR-CEIR-CEIR-CEIR-CEIR-CEIR-CEIQ-ALKE",
+   "class": "stricter",
+   "note": "the fl ligature (U+FB02) upper-cases to FL, in the prefix",
+   "js_ok": true,
+   "key": "1111111111111111111111111111111111111111111111111111111111111111"
+  },
+  {
+   "input": "\ufb02RK1-AAAQ-EAYE-AUDA-OCAJ-BIFQ-YDIO-B4IB-CEQT-CQKR-MFYY-DENB-WHA5-DYPQ-MMG4",
+   "class": "stricter",
+   "note": "the fl ligature (U+FB02) upper-cases to FL, in the prefix",
+   "js_ok": true,
+   "key": "000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f"
+  },
+  {
+   "input": "\ufb02RK1-VV3D-M5HM-PHH6-VC4O-CUB7-3HQ7-764H-KTYZ-NXXR-VXV5-4QJT-6LL5-G72Q-IYEO",
+   "class": "stricter",
+   "note": "the fl ligature (U+FB02) upper-cases to FL, in the prefix",
+   "js_ok": true,
+   "key": "ad763674ec79cfea8b8e1503fd9e1fffb8754f196def1adebde4133f2d7d37f5"
+  },
+  {
+   "input": "\ufb02RK1-LLWO-2UXW-BGZS-AXWC-XGWL-XUQN-OW46-YX6Z-EYJB-AJVG-PGX4-NY6I-C5CQ-5JIR",
+   "class": "stricter",
+   "note": "the fl ligature (U+FB02) upper-cases to FL, in the prefix",
+   "js_ok": true,
+   "key": "5aeced52f609b3205ec2b9acbbd20d75b9ec5fd926121026a679afc6e3c81745"
+  },
+  {
+   "input": "\ufb02RK1-OPS3-4ANJ-ZZO2-SMQ4-QBRY-6TC6-GDVC-7YJG-7J23-KRFW-X4JA-YEQ2-DSZA-4737",
+   "class": "stricter",
+   "note": "the fl ligature (U+FB02) upper-cases to FL, in the prefix",
+   "js_ok": true,
+   "key": "73e5be01a9ce5da9321c80638f4c5e30ea2fe126fa75b544b6bf120c121a1cb2"
+  },
+  {
+   "input": "FLRK1-LLWO-2UXW-BGZ\u1e9e-AXWC-XGWL-XUQN-OW46-YX6Z-EYJB-AJVG-PGX4-NY6I-C5CQ-5JIR",
+   "class": "same",
+   "note": "capital sharp s (U+1E9E) is not a letter of the alphabet",
    "js_ok": false,
    "key": null
   },
   {
-   "input": "FLRK1-AAAQ-EAYE-AUDA-OCAJ-B\ufb01FQ-YDIO-B4IB-CEQT-CQKR-MFYY-DENB-WHA5-DYPQ-MMG4",
+   "input": "FLRK1-OP\u1e9e3-4ANJ-ZZO2-SMQ4-QBRY-6TC6-GDVC-7YJG-7J23-KRFW-X4JA-YEQ2-DSZA-4737",
    "class": "same",
-   "note": "the fi ligature upper-cases to FI",
+   "note": "capital sharp s (U+1E9E) is not a letter of the alphabet",
    "js_ok": false,
    "key": null
   },
   {
-   "input": "FLRK1-LLWO-2UXW-BGZ\ufb01-AXWC-XGWL-XUQN-OW46-YX6Z-EYJB-AJVG-PGX4-NY6\ufb01-C5CQ-5JIR",
+   "input": "FLR\u212a1-AAAA-AAAA-AAAA-AAAA-AAAA-AAAA-AAAA-AAAA-AAAA-AAAA-AAAA-AAAA-AAAA-MZUH",
    "class": "same",
-   "note": "the fi ligature upper-cases to FI",
+   "note": "the Kelvin sign (U+212A) is upper case already and is not the letter K",
    "js_ok": false,
    "key": null
   },
   {
-   "input": "FLRK1-AAAQ-EAYE-AUDA-OCAJ-B\ufb00FQ-YDIO-B4IB-CEQT-CQKR-MFYY-DENB-WHA5-DYPQ-MMG4",
+   "input": "FLR\u212a1-7777-7777-7777-7777-7777-7777-7777-7777-7777-7777-7777-7777-777Q-V6LB",
    "class": "same",
-   "note": "the ff ligature upper-cases to FF",
+   "note": "the Kelvin sign (U+212A) is upper case already and is not the letter K",
    "js_ok": false,
    "key": null
   },
   {
-   "input": "FLRK1-LLWO-2UXW-BGZ\ufb00-AXWC-XGWL-XUQN-OW46-YX6Z-EYJB-AJVG-PGX4-NY6\ufb00-C5CQ-5JIR",
+   "input": "FLR\u212a1-CEIR-CEIR-CEIR-CEIR-CEIR-CEIR-CEIR-CEIR-CEIR-CEIR-CEIR-CEIR-CEIQ-ALKE",
    "class": "same",
-   "note": "the ff ligature upper-cases to FF",
+   "note": "the Kelvin sign (U+212A) is upper case already and is not the letter K",
    "js_ok": false,
    "key": null
   },
   {
-   "input": "FLRK1-AAAQ-EAYE-AUDA-OCAJ-B\u1e9eFQ-YDIO-B4IB-CEQT-CQKR-MFYY-DENB-WHA5-DYPQ-MMG4",
+   "input": "FLR\u212a1-AAAQ-EAYE-AUDA-OCAJ-BIFQ-YDIO-B4IB-CEQT-CQKR-MFYY-DENB-WHA5-DYPQ-MMG4",
    "class": "same",
-   "note": "capital sharp s is not in the alphabet",
+   "note": "the Kelvin sign (U+212A) is upper case already and is not the letter K",
    "js_ok": false,
    "key": null
   },
   {
-   "input": "FLRK1-LLWO-2UXW-BGZ\u1e9e-AXWC-XGWL-XUQN-OW46-YX6Z-EYJB-AJVG-PGX4-NY6\u1e9e-C5CQ-5JIR",
+   "input": "FLR\u212a1-VV3D-M5HM-PHH6-VC4O-CUB7-3HQ7-764H-KTYZ-NXXR-VXV5-4QJT-6LL5-G72Q-IYEO",
    "class": "same",
-   "note": "capital sharp s is not in the alphabet",
+   "note": "the Kelvin sign (U+212A) is upper case already and is not the letter K",
+   "js_ok": false,
+   "key": null
+  },
+  {
+   "input": "FLR\u212a1-LLWO-2UXW-BGZS-AXWC-XGWL-XUQN-OW46-YX6Z-EYJB-AJVG-PGX4-NY6I-C5CQ-5JIR",
+   "class": "same",
+   "note": "the Kelvin sign (U+212A) is upper case already and is not the letter K",
+   "js_ok": false,
+   "key": null
+  },
+  {
+   "input": "FLR\u212a1-OPS3-4ANJ-ZZO2-SMQ4-QBRY-6TC6-GDVC-7YJG-7J23-KRFW-X4JA-YEQ2-DSZA-4737",
+   "class": "same",
+   "note": "the Kelvin sign (U+212A) is upper case already and is not the letter K",
    "js_ok": false,
    "key": null
   },

@@ -180,22 +180,27 @@ for (const c of codes) {
     addKit(mutated.join('-'), 'stricter', `trailing bits ${low} set: JavaScript ignores them, so two spellings of one key decode there`);
   }
 }
-// (b) letters that JavaScript's toUpperCase() turns into A to Z: the dotless i, the long s, the ligatures
-for (const [ch, note] of [
-  ['ı', 'dotless i (U+0131) upper-cases to I'],
-  ['ſ', 'long s (U+017F) upper-cases to S'],
-  ['ﬁ', 'the fi ligature upper-cases to FI'],
-  ['ﬀ', 'the ff ligature upper-cases to FF'],
-  ['ẞ', 'capital sharp s is not in the alphabet'],
-]) {
-  for (const c of [codes[0], codes[3], codes[5]]) {
-    const spelled = c.replace(/I/, ch).replace(/S/, ch);
+// (b) letters that JavaScript's toUpperCase() turns into A to Z: the dotless i (U+0131), the long s (U+017F) and the ligatures. Each is put in for one letter of a
+// code (the first one of that kind in the body, or the FL of the prefix, which every code has); the verdict decides the class: if JavaScript reads it, it is `stricter`
+const unicodeUpper = [
+  ['\u0131', /I/, 'dotless i (U+0131) upper-cases to I', 'body'],
+  ['\u017f', /S/, 'long s (U+017F) upper-cases to S', 'body'],
+  ['\ufb02', /FL/, 'the fl ligature (U+FB02) upper-cases to FL, in the prefix', 'prefix'],
+  ['\ufb01', /FI/, 'the fi ligature (U+FB01) upper-cases to FI', 'body'],
+  ['\ufb00', /FF/, 'the ff ligature (U+FB00) upper-cases to FF', 'body'],
+  ['\ufb05', /ST/, 'the long s t ligature (U+FB05) upper-cases to ST', 'body'],
+  ['\u1e9e', /S/, 'capital sharp s (U+1E9E) is not a letter of the alphabet', 'body'],
+  ['\u212a', /K/, 'the Kelvin sign (U+212A) is upper case already and is not the letter K', 'prefix'],
+];
+for (const [ch, pattern, note, where] of unicodeUpper) {
+  for (const c of codes) {
+    const at = where === 'prefix' ? 0 : 6;
+    const spelled = c.slice(0, at) + c.slice(at).replace(pattern, ch);
     if (spelled === c) continue;
     const verdict = decodeRecoveryKey(spelled);
     addKit(spelled, verdict.ok ? 'stricter' : 'same', note);
   }
-}
-// (c) a length cap: white space around a valid code, past 256 bytes
+}// (c) a length cap: white space around a valid code, past 256 bytes
 // (the class of an entry over the cap is decided in addKit: accepted by JavaScript, so `stricter`)
 addKit(`${' '.repeat(120)}${codes[3]}${' '.repeat(120)}`, 'same', 'white space to 75 + 240 bytes');
 addKit(`${' '.repeat(90)}${codes[3]}${' '.repeat(90)}`, 'same', 'white space to 75 + 180 bytes');

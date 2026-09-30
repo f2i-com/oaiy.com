@@ -1,7 +1,7 @@
 //! The text of a recovery kit code and of a recovery phrase, against what JavaScript does with it (review L-8, and the survivors M53 and M33).
 //!
 //! `vectors/text-corpus.json` is made by `vectors/scripts/text_corpora.mjs` in Node: the white space that `\s` means, a verbatim port of FormLogic's
-//! `decodeRecoveryKey` for 262 kit inputs, and the decoder of design 4.3 written the way the browser will write it (`normalize('NFKD').toLowerCase().split(/\s+/)`)
+//! `decodeRecoveryKey` for 274 kit inputs, and the decoder of design 4.3 written the way the browser will write it (`normalize('NFKD').toLowerCase().split(/\s+/)`)
 //! for 172 phrases. Every entry has the verdict that JavaScript gave. Nothing here is computed by the Rust code under test.
 //!
 //! **Kit:** an entry of class `same` must get exactly JavaScript's verdict and, when accepted, the same key (this is where a white space that one decoder knows
