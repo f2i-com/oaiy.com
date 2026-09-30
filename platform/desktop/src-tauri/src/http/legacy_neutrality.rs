@@ -1,5 +1,6 @@
 //! The differential test: in `legacy` mode (the default), every route that existed before the access model is
-//! answered exactly as the guard of commit 2ea1ee8 answered it.
+//! answered exactly as the guard of commit 2ea1ee8 answered it (the frozen copy holds four more lines, for the
+//! routes of the receptionist's transfers and messages, which that guard did not know: see `frozen_guard.rs`).
 //!
 //! Two routers are built from the same stub routes: the routes of the real router (the scan of the source that
 //! `route_coverage` holds to the table) that existed before the model, each answering `200 ok` to exactly the
