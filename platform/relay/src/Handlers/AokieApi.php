@@ -71,8 +71,9 @@ final class AokieApi
 
     /**
      * `{"to":"plugin"|"mobile:<thumbprint>","frames":[...]}` : 1 to 64 frames, each a JSON object of at most the sig lane's cap
-     * once encoded. A phone may address only the plugin; the plugin only a phone its own admission lists whose device row is
-     * active. Frames are decoded without associative arrays and encoded as FormLogic does, so `{}` stays an object.
+     * once encoded. A phone may address only the plugin and the plugin only a phone (403 for anything else); the plugin's post to
+     * a phone its own admission does not list, or whose device row is not active, is answered as a delivered one and stores
+     * nothing. Frames are decoded without associative arrays and encoded as FormLogic does, so `{}` stays an object.
      */
     public static function post(Context $ctx, Request $req, ?Principal $p, array $m): Response
     {
@@ -103,15 +104,22 @@ final class AokieApi
             if (!Party::isParty($to)) {
                 throw ApiError::make('invalid_request');
             }
+            // Only a target that cannot be right at all is refused: a phone addressing anything but the plugin, the plugin addressing
+            // itself. A phone that is revoked, removed from the roster, not in the plugin's admission or another desktop's is answered
+            // like any other post and stored nowhere: the shipped plugin turns a 403 into a rebootstrap that tears down the session of
+            // every phone, so one phone's removal would end them all (design 6.7: the plugin keeps going), and one answer for
+            // every target says nothing about which of them exist.
+            $deliver = true;
             if ($f->role === 'mobile') {
                 if ($to !== 'plugin') {
                     throw new ApiError(403, 'relay_target_forbidden', 'A phone may only send frames to the plugin.');
                 }
             } else {
-                $thumb = $to === 'plugin' ? '' : substr($to, 7);
-                if ($to === 'plugin' || !in_array($thumb, $f->peers, true) || Facade::activePhone($ctx, $f->dsk, $f->appId, $thumb) === null) {
-                    throw new ApiError(403, 'relay_target_forbidden', 'That phone is not one this admission may send frames to.');
+                if ($to === 'plugin') {
+                    throw new ApiError(403, 'relay_target_forbidden', 'The plugin may only send frames to a phone.');
                 }
+                $thumb = substr($to, 7);
+                $deliver = in_array($thumb, $f->peers, true) && Facade::activePhone($ctx, $f->dsk, $f->appId, $thumb) !== null;
             }
             $frames = $body->frames ?? null;
             if (!is_array($frames) || !Json::isList($frames) || count($frames) < 1 || count($frames) > 64) {
@@ -132,7 +140,12 @@ final class AokieApi
                 }
                 $encoded[] = $e;
             }
-            $r = Party::append($ctx, Party::mailbox($f->appId, $f->dsk, $to), $f->party, $f->subjectId, $f->scopes, $encoded, $to === 'plugin');
+            $mailbox = Party::mailbox($f->appId, $f->dsk, $to);
+            if (!$deliver) {
+                // What a delivered post would answer: the count and the sequence number the last frame would have had.
+                return Response::json(200, ['accepted' => count($encoded), 'seq' => $ctx->mb->highestSeq($mailbox) + count($encoded), 'time' => Clock::now()]);
+            }
+            $r = Party::append($ctx, $mailbox, $f->party, $f->subjectId, $f->scopes, $encoded, $to === 'plugin');
             return Response::json(200, ['accepted' => $r['accepted'], 'seq' => $r['seq'], 'time' => Clock::now()]);
         });
     }

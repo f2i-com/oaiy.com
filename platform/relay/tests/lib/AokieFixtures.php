@@ -197,6 +197,9 @@ final class AokieFixtures
             'Reading does not acknowledge: the same read answers the same until the frames\' 120 seconds are up.');
         $step('phone A reads them again, from where it left off', 'phone A', self::request('GET', self::BASE . 'frames', 'Bearer of phone A', null, ['since' => '1', 'wait' => '0']), $k->read($atok, 1, 0));
         $step('phone B has nothing', 'phone B', self::request('GET', self::BASE . 'frames', 'Bearer of phone B', null, ['since' => '0', 'wait' => '0']), $k->read($btok, 0, 0), 'A mailbox is the party\'s own.');
+        $gone = '{"to":"mobile:' . B64::enc(hash('sha256', 'a phone this desktop no longer has', true)) . '","frames":[{"kind":"plugin_idle"}]}';
+        $step('the plugin posts to a phone the desktop no longer has', 'plugin', self::request('POST', self::BASE . 'frames', 'Bearer of the plugin', $gone), $k->call($ptok, 'POST', 'frames', $gone),
+            'Answered like a delivered post (200, the same three members) and stored nowhere: the shipped plugin ends the session of every phone on a 403, so the removal of one phone must not look like an error. The same answer covers a revoked phone, one the roster dropped, one the plugin\'s admission does not list, and another desktop\'s.');
         $files['frames.json'] = self::head('Frames posted and read through the relay',
             'A conversation through POST and GET /v1/aokie-companion/relay/frames, in order, with the bearers of admission.json. Request bodies are what the shipped carriers send (relay_post_body embeds the frames as they are).')
             + ['relay' => self::relayInfo(), 'bearers' => ['plugin' => $ptok, 'phone A' => $atok, 'phone B' => $btok], 'steps' => $steps];

@@ -266,7 +266,8 @@ test('4.14.4 a phone the desktop\'s roster no longer lists is 403 forbidden on e
     eq(200, aok_call($k, $tb, 'GET', 'challenge')['status']);
     eq(200, aok_call($k, $plug, 'GET', 'challenge')['status']);
     $res = $k->send($plug, 'mobile:' . $k->thumb($a), [['x' => 1]]);
-    eq([403, 'relay_target_forbidden'], [$res['status'], aok_err($res)['code'] ?? ''], 'nor may the plugin send to it');
+    eq([200, 1], [$res['status'], $res['json']['accepted'] ?? 0], 'the plugin\'s post to it is answered like any other, so its fan-out goes on: ' . $res['body']);
+    eq(0, aok_count($k), 'and nothing was stored');
     $db->exec('DELETE FROM roster');
     eq(200, aok_call($k, $ta, 'GET', 'challenge')['status'], 'no row: nobody excluded');
 });
@@ -375,7 +376,7 @@ test('4.14.4 what fails before a handler runs (a body of another type, an unsupp
 
 // ------------------------------------------------------------------------------------------------ POST frames: who may address whom
 
-test('4.14.4 direction: a phone may address only the plugin; the plugin only a phone its own admission lists whose device is active and listed by the roster', function () {
+test('4.14.4 direction: a phone may address only the plugin and the plugin only a phone (403 otherwise); its post to a phone that is not in its admission, revoked, out of the roster or another desktop\'s is answered as a delivered one and stores nothing', function () {
     $k = AokieRig::make();
     $a = $k->addPhone('A');
     $b = $k->addPhone('B');
@@ -399,17 +400,47 @@ test('4.14.4 direction: a phone may address only the plugin; the plugin only a p
     };
     ok($ok($k->send($plug, 'mobile:' . $k->thumb($a), $frame)), 'plugin to A');
     ok($ok($k->send($plug, 'mobile:' . $k->thumb($b), $frame)), 'plugin to B');
-    $denied($k->send($plug, 'mobile:' . $k->thumb($c), $frame), 'C is not in the admission it holds');
-    $denied($k->send($plug, 'mobile:' . $k->thumb($d), $frame), 'D was revoked');
-    $denied($k->send($plug, 'mobile:' . $k->thumb($e), $frame), 'E is no longer in the roster');
+    // A target that is not one the plugin may reach is answered like a delivered post (the shipped plugin ends the session of every
+    // phone on a 403), with the same members, and nothing is stored.
+    $dropped = function (array $res, string $why) use ($ok): void {
+        ok($ok($res), $why . ': ' . $res['body']);
+        eq(['accepted', 'seq', 'time'], array_keys($res['json']), $why);
+    };
+    $dropped($k->send($plug, 'mobile:' . $k->thumb($c), $frame), 'C is not in the admission it holds');
+    $dropped($k->send($plug, 'mobile:' . $k->thumb($d), $frame), 'D was revoked');
+    $dropped($k->send($plug, 'mobile:' . $k->thumb($e), $frame), 'E is no longer in the roster');
+    $dropped($k->send($plug, 'mobile:' . $k->thumb($x), $frame), 'a phone of another desktop');
+    $dropped($k->send($plug, 'mobile:' . B64::enc(random_bytes(32)), $frame), 'a key nobody has');
     $denied($k->send($plug, 'plugin', $frame), 'the plugin to itself');
-    $denied($k->send($plug, 'mobile:' . $k->thumb($x), $frame), 'a phone of another desktop');
-    $denied($k->send($plug, 'mobile:' . B64::enc(random_bytes(32)), $frame), 'a key nobody has');
     ok($ok($k->send($ta, 'plugin', $frame)), 'A to the plugin');
     $denied($k->send($ta, 'mobile:' . $k->thumb($b), $frame), 'A to B');
     $denied($k->send($ta, 'mobile:' . $k->thumb($a), $frame), 'A to itself');
     $denied($k->send($ta, 'mobile:' . $k->thumb($c), $frame), 'A to C');
-    eq(3, aok_count($k), 'only the three that were allowed were stored');
+    eq(3, aok_count($k), 'only the three that were addressed to a phone that is there were stored');
+    // The same request, checked as a frame: a dropped post is judged like a delivered one (a bad frame is a 400 either way).
+    eq(400, $k->call($plug, 'POST', 'frames', '{"to":"mobile:' . $k->thumb($d) . '","frames":[5]}')['status']);
+    eq(413, $k->send($plug, 'mobile:' . $k->thumb($d), ['{"p":"' . str_repeat('x', 196608) . '"}'])['status']);
+});
+
+test('4.14.4 the plugin\'s fan-out goes on when one phone has been removed: a post to each phone in turn is 200 for every one of them, the removed phone\'s included, and the others receive theirs', function () {
+    [$k, $a, $b, $plug, $ta, $tb] = aok_pair();
+    $c = $k->addPhone('C');
+    $k->pushRoster(null, 2);
+    $plug = $k->pluginToken();
+    $bc = $k->mobileToken($b);
+    $cc = $k->mobileToken($c);
+    Devices::revoke($k->r->ctx(), $a->id); // the desktop removes A; the plugin still holds the admission that lists it
+    $bodies = [];
+    foreach ([$a, $b, $c] as $ph) { // the order in which the plugin's broadcast walks its phones
+        $res = $k->send($plug, 'mobile:' . $k->thumb($ph), [['kind' => 'assistance_request', 'n' => 1]]);
+        eq(200, $res['status'], $k->thumb($ph) . ': ' . $res['body']);
+        eq(1, $res['json']['accepted']);
+        $bodies[] = $res['body'];
+    }
+    eq([$bodies[1]], [$bodies[0]], 'the answer for the removed phone is the very answer a delivered post gets (same members, values and sequence number)');
+    eq(1, count($k->read($bc, 0)['json']['frames']));
+    eq(1, count($k->read($cc, 0)['json']['frames']));
+    eq(401, $k->read($ta, 0)['status'], 'the removed phone itself is still refused');
 });
 
 test('4.14.4 the mailboxes are the bearer\'s: two desktops on one relay with one app id, and two phones, never see one another\'s frames', function () {
