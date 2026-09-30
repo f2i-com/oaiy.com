@@ -37,8 +37,10 @@ final class Signals
         if (@file_put_contents($tmp, $content) === false) {
             return false;
         }
-        // Windows refuses a rename onto a file another process has open for a moment; a few tries are enough.
-        for ($i = 0; $i < 5; $i++) {
+        // Windows refuses a rename onto a file another process has open for a moment (the waiting polls read the generation file
+        // every 200 ms); a write that gave up would leave an older hold as the newest one, so keep trying for a tenth of a second.
+        // On POSIX the first try succeeds and nothing here ever waits.
+        for ($i = 0; $i < 50; $i++) {
             if (@rename($tmp, $path)) {
                 return true;
             }

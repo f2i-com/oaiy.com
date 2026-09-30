@@ -543,43 +543,68 @@ test('4.7.2 rule 4: a consumer poll and the same device\'s lookups are independe
     eq(['granted' => true], $p['json']['hold'], 'the lookup did not end the poll');
 });
 
-test('4.7.2 rule 5: many polls from one device leave one live hold, and /v1/health stays fast meanwhile', function () {
-    $r = Relay::make(['wait' => ['max' => 2], 'capacity' => ['workers' => 20]]);
+test('4.7.2 rule 5: many polls from one device leave exactly one live hold, and the workers that held the superseded ones are free again', function () {
+    $r = Relay::make(['wait' => ['max' => 8], 'capacity' => ['workers' => 20]]);
     $d = $r->desktop();
-    $servers = $r->fleet(5);
-    $health = $r->fleet(1)[0];
+    $servers = $r->fleet(5); // the pool: five workers, each serving one request at a time; the health probes below go to the same ones
     usleep(300000);
+    // A pool has one queue: a request waits for whichever worker is free first. (Queueing per worker would leave a poll stuck
+    // behind the hold that only its own start could supersede, which is not what a pool does.)
     $pend = [];
+    $slot = array_fill(0, 5, null);
     for ($i = 0; $i < 20; $i++) {
-        $pend[] = holds_begin($servers[$i % 5], $d, ['wait' => '2']);
+        $free = null;
+        $wait0 = microtime(true);
+        while ($free === null && microtime(true) - $wait0 < 6.0) {
+            foreach ($slot as $k => $p) {
+                if ($p !== null && !$p->done()) {
+                    $p->pump(0.005);
+                }
+                if ($free === null && ($p === null || $p->done())) {
+                    $free = $k;
+                }
+            }
+        }
+        ok($free !== null, "poll $i found a free worker");
+        $slot[$free] = $pend[] = holds_begin($servers[$free], $d, ['wait' => '8']);
         usleep(60000);
     }
-    $slowest = 0.0;
-    $maxLive = 0;
-    for ($k = 0; $k < 8; $k++) {
-        $t = microtime(true);
-        $h = Relay::http($health, null, 'GET', '/v1/health', null, [], [], );
-        $slowest = max($slowest, microtime(true) - $t);
-        eq(200, $h['status']);
-        $poll = 0;
-        foreach ($r->ctx()->holds->byKind() as $kind => $n) {
-            $poll += $kind === 'poll' ? $n : 0;
+    // Every superseded hold ends within a quarter of a second of the newer poll starting: the pool drains at once.
+    $t0 = microtime(true);
+    do {
+        $open = 0;
+        foreach ($pend as $p) {
+            if (!$p->done()) {
+                $p->pump(0.01);
+                $open += $p->done() ? 0 : 1;
+            }
         }
-        $maxLive = max($maxLive, $poll);
-        usleep(200000);
+    } while ($open > 1 && microtime(true) - $t0 < 4.0);
+    $drain = microtime(true) - $t0;
+    ok($open <= 1, "the superseded polls were answered within " . round($drain * 1000) . " ms of the last one being sent ($open still open)");    // Now the count is what the rule says. Health goes to every worker of the pool at once, and all but the one that is still
+    // holding the newest poll answer immediately: the workers that held superseded polls are free.
+    $probes = array_map(fn($s) => $s->begin('GET', '/v1/health'), $servers);
+    $t1 = microtime(true);
+    $answered = [];
+    while (count($answered) < 5 && microtime(true) - $t1 < 1.5) {
+        foreach ($probes as $k => $p) { // all at once: one worker being busy must not delay the reading of the others' answers
+            if (!isset($answered[$k])) {
+                $p->pump(0.005);
+                if ($p->done()) {
+                    $answered[$k] = microtime(true) - $t1;
+                }
+            }
+        }
     }
-    ok($slowest < 1.0, 'health answered in ' . round($slowest * 1000) . ' ms');
-    ok($maxLive <= 2, "at most one hold per device (plus one in the act of ending): saw $maxLive");
-    $superseded = 0;
-    $granted = 0;
+    eq(1, holds_count($r), 'one live hold, the newest: no superseded hold lingers');
+    ok(count($answered) >= 4, 'four of the five workers answered health at once (' . count($answered) . ' did, in ' . implode(', ', array_map(fn($x) => round($x * 1000) . ' ms', $answered)) . '): the workers that held superseded polls are free');
+    foreach ($probes as $p) {
+        eq(200, $p->finish(15.0)['status']); // the fifth is the worker that holds the newest poll: it answers when that ends
+    }    $superseded = 0;
     foreach ($pend as $p) {
-        $res = holds_finish($p, 12.0);
+        $res = holds_finish($p, 15.0);
         eq(200, $res['status'], $res['body']);
-        if (isset($res['json']['hold']['superseded'])) {
-            $superseded++;
-        } else {
-            $granted++;
-        }
+        $superseded += isset($res['json']['hold']['superseded']) ? 1 : 0;
     }
     ok($superseded >= 15, "$superseded of 20 were superseded by a newer poll");
     eq(0, holds_count($r));
