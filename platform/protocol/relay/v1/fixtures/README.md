@@ -7,7 +7,7 @@ box is not one of those: its ephemeral key is random, so no two are alike. The f
 
 | File | What it is | Read by |
 |---|---|---|
-| `sealed-token.json` | the token a pairing seals to the phone, three real ones and eight that must not open | the desktop's Rust test of `crypto_box`, the phone's opener |
+| `sealed-token.json` | the token a pairing seals to the phone, three real ones and ten that must not open | the desktop's Rust test of `crypto_box`, the phone's opener |
 | `rust-check/` | a stand-alone Rust crate that opens `sealed-token.json` with the `crypto_box` crate | a first Rust reader, to copy from |
 | `pairing-ceremony.json` | one whole pairing (Appendix A3's keys and values) as the requests a desktop and a phone make and the answers the relay gives | a Rust stub relay, a phone double, a host client |
 | `verify_fixtures.py`, `verify_fixtures.mjs` | two independent checks of the two files above, with no libsodium | the conformance suite (`../../../tests/relay_conformance.py`) |
@@ -40,8 +40,12 @@ which is the 63 character device token as ASCII. The nonce is not sent: it is BL
 A reader MUST
 
 1. decode the base64url strictly (no padding, no other alphabet, unused low bits zero) and refuse a box under 48 bytes;
-2. refuse an ephemeral key of small order (an all-zero X25519 shared secret): `refused[6]` and `refused[7]` are those. libsodium
-   does this itself; the Rust `crypto_box` crate does **not**, so check it before opening (`README.md` section 10.3, vector A12);
+2. refuse an ephemeral key of small order (an all-zero X25519 shared secret): `refused[6]` and `refused[7]` are those, but their
+   tags fail as well, so a reader that skips the rule still refuses them. **`refused[8]` and `refused[9]` are the ones that test
+   the rule**: a small-order ephemeral key (`zero` and `order8-a` of vector A12) with a real `crypto_secretbox` under
+   `HSalsa20(0^32, 0^16)`, which a reader that skips the check opens. libsodium refuses them itself; the Rust `crypto_box` crate
+   does **not** (its `unseal` opens `refused[8]`; `rust-check` shows it), so check the shared secret before opening (`README.md` section
+   10.3, vector A12);
 3. open the box, and only then look at the plaintext: 63 bytes matching `oaiyrt1\.[A-Za-z0-9_-]{11}\.[A-Za-z0-9_-]{43}`, whose
    SHA-256 is `plaintextSha256`;
 4. verify the approval receipt (`pairing-fetch-response.receipt`) with the desktop key it pinned from the MAC-verified offer
@@ -51,8 +55,10 @@ A reader MUST
 In Rust (`crypto_box` with its `seal` feature, which the desktop's `Cargo.toml` does not yet enable; check the version in the
 lockfile) the opening is `SecretKey::from(secret_bytes).unseal(&sealed)`. **Run**: `rust-check/` is a stand-alone crate (its own
 empty `[workspace]`, no relation to any other Cargo project) that reads `sealed-token.json` with `crypto_box` 0.9.1 and opens the
-three tokens (length, SHA-256 and shape as the file says), refuses the eight boxes that must not open and the wrong recipient:
-`cargo run --release -- ../sealed-token.json` printed `18 checks, 0 mismatches` (Windows, rustc of the machine's toolchain,
+three tokens (length, SHA-256 and shape as the file says), refuses the ten boxes that must not open and the wrong recipient,
+and shows that `unseal` alone opens `refused[8]` (its `open` therefore checks for an all-zero shared secret with
+`curve25519-dalek` first; `refused[9]`, an order-8 point, does not open with `unseal` either, because `crypto_box` multiplies by
+the scalar reduced modulo the group order and so does not get the zero that RFC 7748 and libsodium get): `cargo run --release -- ../sealed-token.json` printed `21 checks, 0 mismatches` (Windows, rustc of the machine's toolchain,
 crates fetched from crates.io, `Cargo.lock` committed). `DK-07` adds the desktop's own test and, in the other direction, a
 Rust-sealed sample of the same shape (`opens[]` with another `recipient`) that `verify_fixtures.py` and `verify_fixtures.mjs`
 open the same way, which is the reverse fixture `vectors.json` interpretation 17 asks for.

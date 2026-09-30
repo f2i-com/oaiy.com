@@ -9,7 +9,7 @@
     "nonce": "BLAKE2b with a 24 byte output over ephemeralPublic || recipientPublic",
     "key": "crypto_box_beforenm: HSalsa20 over the X25519 shared secret of the recipient secret and ephemeralPublic",
     "plaintext": "the ASCII device token: \"oaiyrt1.\" + 11 characters + \".\" + 43 characters, 63 bytes. It is never written in this file: plaintextSha256 is the check.",
-    "refuse": "a box that does not authenticate, a length under 48 bytes, or an X25519 shared secret of all zeros (a small-order ephemeral key)"
+    "refuse": "a box that does not authenticate, a length under 48 bytes, or an X25519 shared secret of all zeros (a small-order ephemeral key), even when the box authenticates under the key that shared secret gives (refused[8] and refused[9])"
   },
   "recipient": {
     "note": "The test phone of Appendix A3: a fixed public test key, never a real one.",
@@ -19,63 +19,71 @@
   "opens": [
     {
       "label": "the token of the recorded ceremony",
-      "sealedToken": "HpCLWB0JAF3LworjHfD1HM6j_0H4-3EfcVkwpyNvxlHLxNhlpLKYs2hAbdzMT0FU_oh3fqr05V7pUPI_kEnrniG8GpMk8hXUHjV6T61xbFMRLe6htmqD--1NzRsxfBS1Ysn_0TiLc4PzH5LrUBlL",
+      "sealedToken": "IUwkc-ECVm2xHI7cj3zqQAO4ghRP4xFqkGO3hq1BkX-D2nxuK8wJoL1z4YeCYfp_FanpwTdtOmhPAPngOxvevHjv_sR0NBwW3z214TW2w8QjSSywECdSUzEPTqYE8u4gEVQe7BBBA7ViHLYc8G6B",
       "sealedBytes": 111,
       "plaintextLength": 63,
-      "plaintextSha256": "894ab206881d554c643a09433acfe556915e5ab92b58b85436dd92987c825bd2"
+      "plaintextSha256": "86100c7037423b92c38e095c96506d85ae4b65a7055276932dc4fc8971b60952"
     },
     {
       "label": "another ceremony, token 2 (a fresh ephemeral key each time)",
-      "sealedToken": "Xs9kWeNAw-6_ARzAb-ChOO8ZeMw0MjZWBUCpP_GGcnYbOacAFDgJOyVQzkl0zqWSZeSZW7kdMwDcBwycYgNkFE57kf8bx7pmLTeVYIC3oP8oWt0pEljIdNPwzbQCS5CFJnqwz_qakM1qiwspTkCh",
+      "sealedToken": "fVTv910m5tc5sWNtk_QTpeqV1PUYkpjOTqDluzuuPDwm0C4SGkKYQPXOLRpwL5KXjsF1_9At8XAoaBaWV7IFbizUiB9x9Tq_EtL1zjHDRX2NW7OeInovp01jXSDlWE81NzdBlRSHxXu69QfiPscC",
       "sealedBytes": 111,
       "plaintextLength": 63,
-      "plaintextSha256": "5d3b2c1e987d8311121f3966b40768d0a04c0f3de0948d8f4231b4296779eed7"
+      "plaintextSha256": "bd907e3edb428a820632b6ce4277077e1b98cdf12406f07795f8de42b3d88573"
     },
     {
       "label": "another ceremony, token 3 (a fresh ephemeral key each time)",
-      "sealedToken": "nxIyKcDWzy5c0WM5FAappXIvQNEH4cVnLwg7k6ceYD1Q95SyzdfB6cvek9KqfvgD583tbFygLf0w0TQA7DLyEkDD-UWNV1tjqeLQhFfp_wE9HyHAszSszSCO4zBjHdY9dtCv4vNntRj26m-oiYWc",
+      "sealedToken": "4YayMhTtKfICEbrJQCr9so40cC78Z6JyK9A2mo7vhSF45m9LaIWmt7cEOZSK37iq0SGnCEHhOe9rbW13VjF21kYUDAtJw00V6R9I44U1BbJRCOTB4qWfWMcIhCEbmLCZBW6UaIc_8zWljl2VRD5O",
       "sealedBytes": 111,
       "plaintextLength": 63,
-      "plaintextSha256": "b1252deafe0261a730e112af313426dce8f6eb67c7b54fb75ad6c3459f6093e8"
+      "plaintextSha256": "0f04b1706ebc291021eef0a80237b52a676db1c1f365734eb99df3c9493a469d"
     }
   ],
   "refused": [
     {
       "label": "one bit of the ephemeral public key flipped",
-      "sealedToken": "HpCLWB0IAF3LworjHfD1HM6j_0H4-3EfcVkwpyNvxlHLxNhlpLKYs2hAbdzMT0FU_oh3fqr05V7pUPI_kEnrniG8GpMk8hXUHjV6T61xbFMRLe6htmqD--1NzRsxfBS1Ysn_0TiLc4PzH5LrUBlL"
+      "sealedToken": "IUwkc-EDVm2xHI7cj3zqQAO4ghRP4xFqkGO3hq1BkX-D2nxuK8wJoL1z4YeCYfp_FanpwTdtOmhPAPngOxvevHjv_sR0NBwW3z214TW2w8QjSSywECdSUzEPTqYE8u4gEVQe7BBBA7ViHLYc8G6B"
     },
     {
       "label": "one bit of the authentication tag flipped",
-      "sealedToken": "HpCLWB0JAF3LworjHfD1HM6j_0H4-3EfcVkwpyNvxlHLxNhlpLKYs2lAbdzMT0FU_oh3fqr05V7pUPI_kEnrniG8GpMk8hXUHjV6T61xbFMRLe6htmqD--1NzRsxfBS1Ysn_0TiLc4PzH5LrUBlL"
+      "sealedToken": "IUwkc-ECVm2xHI7cj3zqQAO4ghRP4xFqkGO3hq1BkX-D2nxuK8wJoLxz4YeCYfp_FanpwTdtOmhPAPngOxvevHjv_sR0NBwW3z214TW2w8QjSSywECdSUzEPTqYE8u4gEVQe7BBBA7ViHLYc8G6B"
     },
     {
       "label": "one bit of the ciphertext flipped",
-      "sealedToken": "HpCLWB0JAF3LworjHfD1HM6j_0H4-3EfcVkwpyNvxlHLxNhlpLKYs2hAbdzMT0FU_oh3fqr05V7pUPI_kUnrniG8GpMk8hXUHjV6T61xbFMRLe6htmqD--1NzRsxfBS1Ysn_0TiLc4PzH5LrUBlL"
+      "sealedToken": "IUwkc-ECVm2xHI7cj3zqQAO4ghRP4xFqkGO3hq1BkX-D2nxuK8wJoL1z4YeCYfp_FanpwTdtOmhPAPngOhvevHjv_sR0NBwW3z214TW2w8QjSSywECdSUzEPTqYE8u4gEVQe7BBBA7ViHLYc8G6B"
     },
     {
       "label": "the last byte removed",
-      "sealedToken": "HpCLWB0JAF3LworjHfD1HM6j_0H4-3EfcVkwpyNvxlHLxNhlpLKYs2hAbdzMT0FU_oh3fqr05V7pUPI_kEnrniG8GpMk8hXUHjV6T61xbFMRLe6htmqD--1NzRsxfBS1Ysn_0TiLc4PzH5LrUBk"
+      "sealedToken": "IUwkc-ECVm2xHI7cj3zqQAO4ghRP4xFqkGO3hq1BkX-D2nxuK8wJoL1z4YeCYfp_FanpwTdtOmhPAPngOxvevHjv_sR0NBwW3z214TW2w8QjSSywECdSUzEPTqYE8u4gEVQe7BBBA7ViHLYc8G4"
     },
     {
       "label": "a byte added",
-      "sealedToken": "HpCLWB0JAF3LworjHfD1HM6j_0H4-3EfcVkwpyNvxlHLxNhlpLKYs2hAbdzMT0FU_oh3fqr05V7pUPI_kEnrniG8GpMk8hXUHjV6T61xbFMRLe6htmqD--1NzRsxfBS1Ysn_0TiLc4PzH5LrUBlLAA"
+      "sealedToken": "IUwkc-ECVm2xHI7cj3zqQAO4ghRP4xFqkGO3hq1BkX-D2nxuK8wJoL1z4YeCYfp_FanpwTdtOmhPAPngOxvevHjv_sR0NBwW3z214TW2w8QjSSywECdSUzEPTqYE8u4gEVQe7BBBA7ViHLYc8G6BAA"
     },
     {
       "label": "shorter than an ephemeral key and a tag (47 bytes)",
-      "sealedToken": "HpCLWB0JAF3LworjHfD1HM6j_0H4-3EfcVkwpyNvxlHLxNhlpLKYs2hAbdzMT0E"
+      "sealedToken": "IUwkc-ECVm2xHI7cj3zqQAO4ghRP4xFqkGO3hq1BkX-D2nxuK8wJoL1z4YeCYfo"
     },
     {
       "label": "an ephemeral key of small order (the identity), with the rest of a real box",
-      "sealedToken": "AQAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAADLxNhlpLKYs2hAbdzMT0FU_oh3fqr05V7pUPI_kEnrniG8GpMk8hXUHjV6T61xbFMRLe6htmqD--1NzRsxfBS1Ysn_0TiLc4PzH5LrUBlL"
+      "sealedToken": "AQAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAACD2nxuK8wJoL1z4YeCYfp_FanpwTdtOmhPAPngOxvevHjv_sR0NBwW3z214TW2w8QjSSywECdSUzEPTqYE8u4gEVQe7BBBA7ViHLYc8G6B"
     },
     {
       "label": "an all-zero ephemeral key",
-      "sealedToken": "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAADLxNhlpLKYs2hAbdzMT0FU_oh3fqr05V7pUPI_kEnrniG8GpMk8hXUHjV6T61xbFMRLe6htmqD--1NzRsxfBS1Ysn_0TiLc4PzH5LrUBlL"
+      "sealedToken": "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAACD2nxuK8wJoL1z4YeCYfp_FanpwTdtOmhPAPngOxvevHjv_sR0NBwW3z214TW2w8QjSSywECdSUzEPTqYE8u4gEVQe7BBBA7ViHLYc8G6B"
+    },
+    {
+      "label": "an ephemeral key of small order (zero) whose box authenticates under the all-zero shared secret",
+      "sealedToken": "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAbC4P43GGYIdc1bUSywdIjibJaj6tevozDgBEUVR0W2riNzHT9NQrKASjkGjZNJ56Oee8Sh23cNyM6c-d1KKdnK_Fi80-SJb8FsOY0x7dK"
+    },
+    {
+      "label": "an ephemeral key of small order (order8-a) whose box authenticates under the all-zero shared secret",
+      "sealedToken": "4Ot6fDtBuK4WVuP68Z_EatoJjeucMrH9hmIFFl9JuADBsHbumxIULzoSU3_LoW0TlrOa2beA1N4kVNZbWyzdW7gZiaPkEWnhd4GEvOhjQPg2M_psNh8u9wF8ekaD8HRdnLug4kXPuWNHSqQmfsXj"
     }
   ],
   "wrongRecipient": {
     "note": "The first recorded token does not open with this other key.",
-    "x25519Secret": "H9y9PS8INacw5Eft6TAmOGsp-CuVvrzVdX1kwmlPsfk",
-    "x25519Public": "wlaLE3rKWN8grCZ6WZDqL8FHt4YTmFy617c4gg3PfQs"
+    "x25519Secret": "-_B5Wz2XXmwOdQhJqwtmNq7csusWRjkOWQUI3TO2RX4",
+    "x25519Public": "SNj3M5MCUJXQa-hVw-FW7VsZyoC0q96BU9t14qmlIgw"
   }
 }

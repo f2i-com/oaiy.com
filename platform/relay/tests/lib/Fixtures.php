@@ -117,6 +117,19 @@ final class Fixtures
             ['label' => 'an ephemeral key of small order (the identity), with the rest of a real box', 'sealedToken' => B64::enc("\1" . str_repeat("\0", 31) . substr($raw, 32))],
             ['label' => 'an all-zero ephemeral key', 'sealedToken' => B64::enc(str_repeat("\0", 32) . substr($raw, 32))],
         ];
+        // Two boxes that a reader which skips the small-order check WOULD open: a small-order ephemeral key, and a real
+        // crypto_secretbox under the key that an all-zero shared secret gives (HSalsa20 of 32 zero bytes and 16 zero bytes, computed
+        // once by verify_fixtures.py's own hsalsa20), with the nonce a sealed box derives. libsodium refuses them (its
+        // crypto_box_beforenm rejects a zero result); only the small-order rule does, because the tag is valid.
+        $zeroKey = hex2bin('351f86faa3b988468a850122b65b0acece9c4826806aeee63de9c0da2bd7f91e');
+        $recipientPub = B64::decN($k['x25519Public']['phone'], 32);
+        $notAToken = 'oaiyrt1.' . str_repeat('A', 11) . '.' . str_repeat('A', 43);
+        $a12 = Vectors::get('A12.inputs.encodings');
+        foreach (['zero', 'order8-a'] as $name) {
+            $epk = hex2bin($a12[$name]);
+            $nonce = sodium_crypto_generichash($epk . $recipientPub, '', 24);
+            $refused[] = ['label' => "an ephemeral key of small order ($name) whose box authenticates under the all-zero shared secret", 'sealedToken' => B64::enc($epk . sodium_crypto_secretbox($notAToken, $nonce, $zeroKey))];
+        }
         $wrong = sodium_crypto_box_keypair();
         $sealed = [
             'protocol' => 'oaiy-relay/1',
@@ -129,7 +142,7 @@ final class Fixtures
                 'nonce' => 'BLAKE2b with a 24 byte output over ephemeralPublic || recipientPublic',
                 'key' => 'crypto_box_beforenm: HSalsa20 over the X25519 shared secret of the recipient secret and ephemeralPublic',
                 'plaintext' => 'the ASCII device token: "oaiyrt1." + 11 characters + "." + 43 characters, 63 bytes. It is never written in this file: plaintextSha256 is the check.',
-                'refuse' => 'a box that does not authenticate, a length under 48 bytes, or an X25519 shared secret of all zeros (a small-order ephemeral key)',
+                'refuse' => 'a box that does not authenticate, a length under 48 bytes, or an X25519 shared secret of all zeros (a small-order ephemeral key), even when the box authenticates under the key that shared secret gives (refused[8] and refused[9])',
             ],
             'recipient' => [
                 'note' => 'The test phone of Appendix A3: a fixed public test key, never a real one.',
