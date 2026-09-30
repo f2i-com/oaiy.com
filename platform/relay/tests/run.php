@@ -51,6 +51,10 @@ require $testsDir . '/lib/Tmp.php';
 putenv('OAIY_TEST_CLOCK=' . \OaiyTest\Tmp::clockFile());
 require $testsDir . '/prepend.php';
 
+// The relay's own code, loaded the way index.php loads it.
+define('OAIY_RELAY', true);
+require_once dirname($testsDir) . '/src/autoload.php';
+
 foreach (glob($testsDir . '/lib/*.php') as $f) {
     require_once $f;
 }
