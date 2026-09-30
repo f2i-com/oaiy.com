@@ -188,7 +188,7 @@ expert with two positioned reads.
 echo Explain how rainbows form. > prompt.txt
 
 # decode on both GPUs: layers 0-19 on cuda:1, 20-39 on cuda:0
-cargo run -p dsv41-cuda --release --example generate -- prompt.txt 256 1,0
+cargo run -p dsv41-cuda --release --example dsv41_generate -- prompt.txt 256 1,0
 ```
 
 The prompt goes through OAIY's own Rust tokenizer and chat format, both matched

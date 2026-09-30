@@ -302,7 +302,7 @@ the chat encoder and serving in item 7.
     the same `dsv41` functions.
 - **C2** (`expert_cache.rs`): an LFRU VRAM expert pool, ~1,085 slots (20 GB) after the
   trunk on a 32 GB card.
-  - Text generation, `examples/generate.rs` (prompt ids from
+  - Text generation, `examples/dsv41_generate.rs` (prompt ids from
     `tools/dsv41/encode.py`, text out through `dsv41::detok`):
     - Cold: 1.54 s/token. Second 64 tokens: **0.46 s/token (2.2 tok/s)**.
     - 62.7% VRAM hits overall, still warming.

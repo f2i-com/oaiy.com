@@ -2,7 +2,7 @@
 //! text, with per-token timing and cache statistics.
 //!
 //!   echo Explain how rainbows form. > prompt.txt
-//!   cargo run -p dsv41-cuda --release --example generate -- prompt.txt [max_new_tokens] [devices]
+//!   cargo run -p dsv41-cuda --release --example dsv41_generate -- prompt.txt [max_new_tokens] [devices]
 //!
 //! The prompt file holds a user message (encoded with the chat format, chat
 //! mode) or token ids, comma or space separated.
@@ -30,7 +30,7 @@ use dsv41_cuda::{GpuModel, GpuOptions};
 
 fn main() -> oaiy_engine::Result<()> {
     let args: Vec<String> = std::env::args().collect();
-    let ids_file = args.get(1).expect("usage: generate PROMPT_IDS_FILE [max_new_tokens] [devices]");
+    let ids_file = args.get(1).expect("usage: dsv41_generate PROMPT_IDS_FILE [max_new_tokens] [devices]");
     let max_new: usize = args.get(2).and_then(|v| v.parse().ok()).unwrap_or(128);
     let devices: Vec<usize> = args
         .get(3)

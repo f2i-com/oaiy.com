@@ -1,7 +1,7 @@
 //! Where the time goes: the talker's frames and the codec's chunks, timed
 //! apart (with the device synchronized around each part).
 //!
-//! cargo run --release -p oaiy-tts --features flash-attn --example bench -- \
+//! cargo run --release -p oaiy-tts --features flash-attn --example tts_bench -- \
 //!     --voice clip.wav --transcript "..." --device 1 [--frames 60]
 use oaiy_tts::codec::{CodecDecoder, CodecStream};
 use oaiy_tts::talker::{Draws, Talker};

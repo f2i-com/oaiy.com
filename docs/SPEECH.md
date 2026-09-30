@@ -196,7 +196,7 @@ in a voice cloned from a 6-second clip:
 
 `cargo run --release -p oaiy-tts --features flash-attn --example speak --
 --voice clip.mp3 --transcript "..." --text "..." --out out.wav --device 1`
-speaks a line and prints these numbers; `--example bench` times frames and codec
+speaks a line and prints these numbers; `--example tts_bench` times frames and codec
 chunks apart. `cargo test -p oaiy-tts` runs on the CPU with no weights.
 
 ## Speed and memory
