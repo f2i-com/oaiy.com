@@ -20,7 +20,7 @@
 import assert from 'node:assert/strict';
 import { after, before, describe, it } from 'node:test';
 import { sleep } from '../harness.mjs';
-import { DESKTOP, OAIY, OAIY_WINDOW, appReady as ready, fakeDesktop, healthOf as health, openApp, readStored, seedOaiyLink, seedPairing, startAppWorld } from '../app-pages.mjs';
+import { DESKTOP, OAIY, OAIY_WINDOW, appReady as ready, fakeDesktop, healthOf as health, openApp, readStored, seedMediaAddress, seedOaiyLink, seedPairing, startAppWorld } from '../app-pages.mjs';
 
 let env;
 
@@ -187,7 +187,7 @@ describe('E5: the Agent', () => {
     await page.waitForSelector('dialog.settings[open]');
     const section = page.locator('.media-settings');
     assert.match(await section.textContent(), /OAIY is looked for only when you press Find OAIY: until you do, this page sends nothing to your computer or your network/);
-    assert.match((await section.locator('button', { hasText: 'Find OAIY' }).getAttribute('title')) ?? '', /reaches out to your computer only when you press this/);
+    assert.match((await section.locator('button', { hasText: 'Find OAIY' }).getAttribute('title')) ?? '', /looks for OAIY only when you press this, and your browser may ask you to allow it/);
     await section.locator('button', { hasText: 'Find OAIY' }).click();
     await page.waitForFunction(() => /Nothing answered at/.test(document.querySelector('.media-settings .form-note')?.textContent ?? ''), null, { timeout: 15_000 });
     await sleep(500);
@@ -293,6 +293,90 @@ describe('E5: the Agent\'s saved links, and what its words say of each state', (
     assert.match(words, /^This page is paired with OAIY Desktop at http:\/\/127\.0\.0\.1:17972 and keeps in touch with it while it is open \(its calls, texts, settings and flows\)\. Checking it now\.$/);
     assert.doesNotMatch(words, /only from here|asks nothing|because you opened this dialog/);
     await paired.context.close();
+  });
+});
+
+describe('E5: what the Agent\'s Settings say is true of each state it can be in (the review\'s F2-R)', () => {
+  // A tab is PAIRED with OAIY Desktop or not, and holds NOTHING of OAIY, an OAIY it FOUND, or a media address TYPED by hand: every combination
+  // of the two, and a pairing forgotten. For each, what it sends in five seconds with no button pressed is recorded, and the words are held to it:
+  // the claim that nothing is sent only where nothing was, every address that was asked named in the words, and each state's own sentence.
+  const DESK = 'http://127.0.0.1:17972';
+  const LAN = 'http://192.168.1.20:8080';
+  const TYPED = 'http://192.168.1.30:8080/v1';
+  const KEY = 'sk-oaiy-review-key-0123456789';
+  const TOKEN = 'paired-token-0123456789';
+  const NOTHING = /sends nothing to your computer or your network/;
+  const originsOf = (attempts) => [...new Set(attempts.map((a) => new URL(a.slice(a.indexOf(' ') + 1)).origin))].sort();
+
+  const pair = (page) => seedPairing(page, { origin: DESK, token: TOKEN });
+  const find = (page) => seedOaiyLink(page, { origin: LAN, key: KEY });
+  const type = (page) => seedMediaAddress(page, TYPED);
+  const STATES = [
+    { name: 'never linked: not paired, nothing of OAIY', seed: [], asks: [], says: [/OAIY is looked for only when you press Find OAIY: until you do, this page sends nothing to your computer or your network to look for it/], title: /looks for OAIY only when you press this/, paired: false },
+    { name: 'paired, nothing of OAIY', seed: [pair], asks: [DESK], says: [/OAIY is looked for only when you press Find OAIY, and your browser may ask you to allow it/], title: /looks for OAIY only when you press this.* keeps in touch with its paired desktop at http:\/\/127\.0\.0\.1:17972, whether or not you press this/, paired: true },
+    { name: 'not paired, an OAIY found', seed: [find], asks: [LAN], says: [/OAIY was found at http:\/\/192\.168\.1\.20:8080: this page asks it there each time it opens \(sending the key below\)/], title: /also asks OAIY at http:\/\/192\.168\.1\.20:8080 each time it opens/, paired: false },
+    { name: 'not paired, a media address typed', seed: [type], asks: [], says: [/You typed the address of a media service \(http:\/\/192\.168\.1\.30:8080\/v1\): the agent uses it when it makes media, and this page sends nothing to it before then/], title: /asks the address you typed \(http:\/\/192\.168\.1\.30:8080\/v1\)/, paired: false },
+    { name: 'paired, an OAIY found', seed: [pair, find], asks: [DESK, LAN], says: [/OAIY was found at http:\/\/192\.168\.1\.20:8080: this page asks it there each time it opens/], title: /also asks OAIY at http:\/\/192\.168\.1\.20:8080 each time it opens.* paired desktop at http:\/\/127\.0\.0\.1:17972/, paired: true },
+    { name: 'paired, a media address typed', seed: [pair, type], asks: [DESK], says: [/You typed the address of a media service \(http:\/\/192\.168\.1\.30:8080\/v1\)/], title: /asks the address you typed .* paired desktop at http:\/\/127\.0\.0\.1:17972/, paired: true },
+  ];
+
+  async function settingsWords(page) {
+    await page.locator('button.settings-button').click();
+    await page.waitForSelector('dialog.settings[open]');
+    const section = page.locator('.media-settings');
+    return {
+      words: (await section.locator('p.muted').allTextContents()).join('\n'),
+      title: (await section.locator('button', { hasText: 'Find OAIY' }).getAttribute('title')) ?? '',
+    };
+  }
+
+  for (const state of STATES) {
+    it(`${state.name}: what is sent with no button pressed is what the words say`, async () => {
+      const { context, page, attempts } = await open('agent');
+      await ready('agent', page);
+      for (const seed of state.seed) await seed(page);
+      attempts.length = 0;
+      await page.reload();
+      await ready('agent', page, 5000);
+      const sent = originsOf(attempts);
+      const { words, title } = await settingsWords(page);
+      assert.deepEqual(sent, [...state.asks].sort(), `what went out in five seconds: ${attempts.join(', ')}`);
+      // The claim that nothing goes out, checked against what went out.
+      if (NOTHING.test(`${words}\n${title}`)) assert.deepEqual(attempts, [], 'the words say nothing is sent, and something was');
+      // Every address that was asked is one the words name.
+      for (const origin of sent) assert.ok(`${words}\n${title}`.includes(origin), `the words name ${origin}, which the page asked`);
+      for (const says of state.says) assert.match(words, says);
+      assert.match(title, state.title);
+      // The pairing is said exactly where there is one.
+      assert.equal(/is paired with OAIY Desktop at http:\/\/127\.0\.0\.1:17972 and keeps in touch with it while it is open/.test(words), state.paired);
+      assert.equal(/whether or not OAIY is found/.test(words), state.paired);
+      await context.close();
+    });
+  }
+
+  it('after the pairing is forgotten the tab asks its desktop no more, and its words are those of a tab that was never paired', async () => {
+    const { context, page, attempts } = await open('agent');
+    await ready('agent', page);
+    await pair(page);
+    await page.reload();
+    await ready('agent', page, 3000);
+    assert.ok(attempts.some((a) => a.startsWith(`GET ${DESK}/api/`)), `the control: a paired tab asks its desktop: ${attempts.join(', ')}`);
+    assert.match((await settingsWords(page)).words, /is paired with OAIY Desktop at http:\/\/127\.0\.0\.1:17972/);
+    await page.locator('dialog.settings button', { hasText: /^Cancel$/ }).first().click();
+    await page.waitForSelector('dialog.settings', { state: 'detached' });
+    await page.locator('button.chip.phone').click();
+    await page.locator('dialog[open] button', { hasText: 'Forget the pairing' }).click();
+    await sleep(800);
+    await page.locator('dialog[open] footer.dialog-buttons button', { hasText: /^Close$/ }).click();
+    await page.waitForSelector('dialog[open]', { state: 'detached' });
+    const cut = attempts.length;
+    await sleep(5000);
+    assert.deepEqual(attempts.slice(cut), [], 'nothing goes to the desktop after the pairing is forgotten');
+    const { words, title } = await settingsWords(page);
+    assert.match(words, /OAIY is looked for only when you press Find OAIY: until you do, this page sends nothing to your computer or your network to look for it/);
+    assert.doesNotMatch(`${words}\n${title}`, /paired/);
+    assert.equal((await readStored(page)).desktop, null, 'and the pairing is not kept');
+    await context.close();
   });
 });
 

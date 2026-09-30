@@ -12,7 +12,7 @@ import { EMPTY_MEDIA, OAIY_ORIGIN, discoverOaiy, listMediaModels, mediaAbilities
 import { newId } from '../vfs/projects';
 import { looksOnLoad, pageHost } from '@oaiy/shared/capabilities/host';
 import { clear, h } from './dom';
-import { findOaiyTitle, oaiyFoundWords, type OaiyState } from './linkWords';
+import { findOaiyTitle, oaiyFoundWords, oaiyStateOf, pairedTabWords } from './linkWords';
 
 export interface SettingsResult {
   providers: ProviderConfig[];
@@ -78,7 +78,11 @@ function kindOf(p: ProviderConfig): string {
   return p.type;
 }
 
-export function openSettings(initial: SettingsResult): Promise<SettingsResult | null> {
+/**
+ * `pairedDesktop`: the origin of the OAIY Desktop this tab is paired with (null: none). The words about how OAIY is found say what a tab
+ * that is paired keeps doing besides.
+ */
+export function openSettings(initial: SettingsResult, context: { pairedDesktop?: string | null } = {}): Promise<SettingsResult | null> {
   return new Promise((resolve) => {
     let providers = initial.providers.map((p) => ({ ...p }));
     let activeId = initial.activeId;
@@ -292,7 +296,10 @@ export function openSettings(initial: SettingsResult): Promise<SettingsResult | 
         return h('span.model-choice', input, h('datalist', { id: listId }, ...ids.map((id) => h('option', { value: id, label: note(id) }))));
       };
       // OAIY's own windows look for OAIY as they start; a tab in a browser only when this button is pressed (agent/lookup.ts).
-      const oaiyState: OaiyState = looksOnLoad(pageHost()) ? { kind: 'own' } : media.discovered ? { kind: 'saved', origin: media.discovered.origin, withKey: !!media.apiKey } : { kind: 'never' };
+      // What this tab holds (linkWords.ts): a desktop it is paired with, and an OAIY it found or a media address typed by hand, as the
+      // dialog was drawn (Find OAIY, Forget OAIY and a saved change draw it again).
+      const oaiyState = oaiyStateOf({ own: looksOnLoad(pageHost()), desktop: context.pairedDesktop ?? null, discovered: media.discovered?.origin, withKey: !!media.apiKey, typed: media.baseUrl });
+      const pairedWords = pairedTabWords(oaiyState);
       const find = h('button', { title: findOaiyTitle(oaiyState), onclick: async () => {
         note.textContent = 'Looking for OAIY…';
         let where = OAIY_ORIGIN;
@@ -355,6 +362,7 @@ export function openSettings(initial: SettingsResult): Promise<SettingsResult | 
       mediaSection.append(
         h('strong', 'Images, video and audio'),
         h('p.muted', `The agent can make pictures, short videos, speech, music, sound effects and 3D models with a media service: ${oaiyFoundWords(oaiyState)}, and any server with OpenAI's /v1/images/generations, /v1/videos and /v1/audio/speech works. Now: ${status}${media.baseUrl ? ` (${abilities || 'no models chosen'})` : ''}.`),
+        ...(pairedWords ? [h('p.muted.paired-note', pairedWords)] : []),
         h('div.provider-form',
           h('label', 'Address', h('div.window-picker', address, find, listButton, ...(media.discovered ? [forget] : []))),
           h('label', 'API key', key),

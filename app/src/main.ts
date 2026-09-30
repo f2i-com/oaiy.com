@@ -985,7 +985,7 @@ async function main(): Promise<void> {
   };
 
   const editSettings = async () => {
-    const result = await openSettings({ providers, activeId, agent: agentSettings, media });
+    const result = await openSettings({ providers, activeId, agent: agentSettings, media }, { pairedDesktop: given ? null : desktop?.origin ?? null });
     if (!result) return;
     providers = result.providers;
     activeId = result.activeId;

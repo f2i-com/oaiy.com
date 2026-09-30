@@ -122,6 +122,9 @@ async function seedStore(page, records) {
 export const seedOaiyLink = (page, { origin, key = '' }) =>
   seedStore(page, { media: { baseUrl: `${origin}/v1`, apiKey: key, discovered: { service: 'oaiy-studio', version: '0.1.0', origin, at: 1 } } });
 
+/** A media address typed by hand, with no OAIY found (Settings, Images, video and audio, Address). */
+export const seedMediaAddress = (page, address) => seedStore(page, { media: { baseUrl: address } });
+
 /** The desktop the page was paired with: its address and token. */
 export const seedPairing = (page, { origin, token }) => seedStore(page, { desktop: { origin, token } });
 
