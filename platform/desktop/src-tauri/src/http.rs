@@ -1733,6 +1733,13 @@ pub(crate) fn guarded_for_tests(router: Router, token: Option<String>, gui_mode:
     router.layer(middleware::from_fn_with_state(AuthConfig { token, gui_mode, pairing: None }, origin_guard))
 }
 
+/// A frozen copy of the guard as it was before the access model, and the differential test that holds the live
+/// guard to it in `legacy` mode.
+#[cfg(test)]
+mod frozen_guard;
+#[cfg(test)]
+mod legacy_neutrality;
+
 #[cfg(test)]
 mod tests {
     use super::{
