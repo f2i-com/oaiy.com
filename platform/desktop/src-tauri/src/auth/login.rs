@@ -40,7 +40,7 @@ use zeroize::{Zeroize, Zeroizing};
 use super::api::{is_json, MAX_BODY};
 use super::audit::Context as AuditContext;
 use super::clientip::Cidr;
-use super::clock::{Clock, SystemClock};
+use super::clock::{Clock, MonotonicClock, SystemClock};
 use super::cookie::{self, Lookup, DEVICE_MAX_AGE, REMEMBER_MAX_AGE};
 use super::device;
 use super::guard::{Denial, Guard, RequestInfo};
@@ -71,33 +71,6 @@ pub const LINK_VALID_MS: u64 = 5 * 60_000;
 pub const OWNER_FLUSH_MS: u64 = 60_000;
 
 // ---- the pieces a test replaces -----------------------------------------------------------------
-
-/// A clock that only goes forward: what a link code's five minutes are measured on, so that a wall-clock jump
-/// cannot extend one (design 6, "clock skew").
-pub struct MonotonicClock {
-    start: std::time::Instant,
-}
-
-impl MonotonicClock {
-    pub fn new() -> MonotonicClock {
-        MonotonicClock {
-            start: std::time::Instant::now(),
-        }
-    }
-}
-
-impl Default for MonotonicClock {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
-impl Clock for MonotonicClock {
-    fn now_ms(&self) -> u64 {
-        // One is added so that "zero" can never be a moment.
-        self.start.elapsed().as_millis() as u64 + 1
-    }
-}
 
 /// What the login is built from. [`LoginOptions::production`] is what `oaiy-server` runs; the tests replace the
 /// clock, the engine, the randomness and the writer.
@@ -261,6 +234,9 @@ pub fn enable(
     if let Some(saved) = guard.saved_throttle_state("login") {
         throttle.restore(&saved);
     }
+    // An elevation's ten minutes are measured on the monotonic clock: a step of the wall clock neither extends the
+    // window nor ends it early (design 6, "clock skew").
+    guard.store().use_monotonic_elevation(opts.mono.clone());
     let anon = AnonLane::new(opts.clock.clone(), throttle.clone());
     let state = Arc::new(LoginState {
         guard: guard.clone(),

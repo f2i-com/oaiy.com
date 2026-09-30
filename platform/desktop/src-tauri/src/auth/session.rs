@@ -249,19 +249,21 @@ pub fn idle_expires_ms(rec: &Record) -> u64 {
         .saturating_add(rec.idle_ms.unwrap_or(IDLE_MS))
 }
 
-/// The end of the session's elevation if it is still running, else zero.
+/// The end of the session's elevation if it is still running, else zero, as a wall-clock time (`now_ms` and what is
+/// left of the window on the elevation clock: a step of the wall clock moves the answer, not the window).
 pub fn elevated_until_ms(store: &AuthStore, id: &str, now_ms: u64) -> u64 {
     store
         .elevated_until(id)
-        .filter(|until| *until > now_ms)
-        .unwrap_or(0)
+        .and_then(|until| until.checked_sub(store.elevation_now_ms()))
+        .filter(|left| *left > 0)
+        .map_or(0, |left| now_ms.saturating_add(left))
 }
 
-/// Elevate a session for ten minutes from `now_ms`. The time it ends.
+/// Elevate a session for ten minutes from now: the window runs on the store's elevation clock (a monotonic one on a
+/// server). The wall-clock time it ends at, from `now_ms`, for the answer.
 pub fn elevate(store: &AuthStore, id: &str, now_ms: u64) -> u64 {
-    let until = now_ms.saturating_add(ELEVATION_MS);
-    store.set_elevated_until(id, until);
-    until
+    store.set_elevated_until(id, store.elevation_now_ms().saturating_add(ELEVATION_MS));
+    now_ms.saturating_add(ELEVATION_MS)
 }
 
 fn control_level_name(p: &Principal) -> &'static str {

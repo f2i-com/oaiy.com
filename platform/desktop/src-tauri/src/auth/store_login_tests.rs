@@ -165,3 +165,79 @@ fn the_end_of_an_elevation_is_reported_and_a_revocation_ends_it() {
     store.revoke(&s.id, "logged_out");
     assert_eq!(store.elevated_until(&s.id), None);
 }
+
+#[test]
+fn an_elevation_on_a_monotonic_clock_is_moved_by_that_clock_and_not_by_the_wall_clock() {
+    let wall = Arc::new(ManualClock::new(T0));
+    let mono = Arc::new(ManualClock::new(1_000));
+    let store = AuthStore::memory(wall.clone());
+    let s = store.mint(session()).unwrap();
+    // An elevation given before the store is told of the clock is on the wall clock, and is dropped by it.
+    store.set_elevated_until(&s.id, T0 + 600_000);
+    store.use_monotonic_elevation(mono.clone());
+    assert_eq!(store.elevated_until(&s.id), None);
+    assert_eq!(store.elevation_now_ms(), 1_000);
+    store.set_elevated_until(&s.id, store.elevation_now_ms() + 600_000);
+    assert_eq!(store.elevated_until(&s.id), Some(1_000 + 600_000));
+    assert!(store.authenticate(&s.token, None).unwrap().elevated);
+    // The wall clock goes back an hour and forward two: nothing happens to the window.
+    wall.set(T0 - 3_600_000);
+    assert!(store.authenticate(&s.token, None).unwrap().elevated);
+    wall.set(T0 + 7_200_000);
+    assert!(store.authenticate(&s.token, None).unwrap().elevated);
+    // The upkeep purges once an hour by the wall clock: it does not forget a window that is still running on the
+    // monotonic clock, and does forget one that is over on it.
+    let over = store.mint(session()).unwrap();
+    store.set_elevated_until(&over.id, 1_000 + 10);
+    wall.advance(3_600_000);
+    store.maintain();
+    assert_eq!(store.elevated_until(&s.id), Some(1_000 + 600_000));
+    assert_eq!(
+        store.elevated_until(&over.id),
+        Some(1_000 + 10),
+        "not over yet"
+    );
+    mono.advance(11);
+    wall.advance(3_600_000);
+    store.maintain();
+    assert_eq!(store.elevated_until(&over.id), None, "over: forgotten");
+    assert_eq!(store.elevated_until(&s.id), Some(1_000 + 600_000));
+    // The monotonic clock ends it, to the millisecond.
+    mono.advance(599_999 - 11);
+    assert!(store.authenticate(&s.token, None).unwrap().elevated);
+    mono.advance(1);
+    assert!(!store.authenticate(&s.token, None).unwrap().elevated);
+}
+
+/// What the session module gives and reports of an elevation, on the same two clocks (it is in the build with the web
+/// login only).
+#[cfg(feature = "web")]
+#[test]
+fn the_session_gives_an_elevation_on_the_monotonic_clock_and_reports_what_is_left_of_it_from_the_wall_clock(
+) {
+    let wall = Arc::new(ManualClock::new(T0));
+    let mono = Arc::new(ManualClock::new(1_000));
+    let store = AuthStore::memory(wall.clone());
+    let s = store.mint(session()).unwrap();
+    store.use_monotonic_elevation(mono.clone());
+    // What it says is the wall-clock time the window ends at, from the now it is given.
+    assert_eq!(super::session::elevate(&store, &s.id, T0), T0 + 600_000);
+    assert_eq!(store.elevated_until(&s.id), Some(1_000 + 600_000));
+    // The wall clock goes forward two hours: what is left of the window is still ten minutes from its now.
+    wall.set(T0 + 7_200_000);
+    assert_eq!(
+        super::session::elevated_until_ms(&store, &s.id, wall.now_ms()),
+        wall.now_ms() + 600_000,
+        "what is left of the window, from the wall clock's now"
+    );
+    mono.advance(599_999);
+    assert_eq!(
+        super::session::elevated_until_ms(&store, &s.id, wall.now_ms()),
+        wall.now_ms() + 1
+    );
+    mono.advance(1);
+    assert_eq!(
+        super::session::elevated_until_ms(&store, &s.id, wall.now_ms()),
+        0
+    );
+}

@@ -727,6 +727,8 @@ struct Inner {
     owner: Option<OwnerFile>,
     min_epoch: u64,
     static_present: bool,
+    /// When each session's elevation ends, on the elevation clock (the store's own, or a monotonic one: see
+    /// [`AuthStore::use_monotonic_elevation`]).
     elevated: HashMap<String, u64>,
     derive_times: HashMap<String, VecDeque<u64>>,
     dirty_touch: bool,
@@ -747,6 +749,9 @@ fn default_random() -> Random {
 pub struct AuthStore {
     inner: Mutex<Inner>,
     clock: Arc<dyn Clock>,
+    /// The clock an elevation window is measured on, when it is not the store's: a monotonic one, so that a jump of the
+    /// wall clock can neither extend a window nor end it (design 6, "clock skew").
+    elevation_clock: Mutex<Option<Arc<dyn Clock>>>,
     writer: Arc<dyn FileWriter>,
     random: Mutex<Random>,
     _lock: Option<AuthLock>,
@@ -802,6 +807,7 @@ impl AuthStore {
         AuthStore {
             inner: Mutex::new(Inner::new(None)),
             clock,
+            elevation_clock: Mutex::new(None),
             writer: Arc::new(SecureWriter),
             random: Mutex::new(default_random()),
             _lock: None,
@@ -879,6 +885,7 @@ impl AuthStore {
         let store = AuthStore {
             inner: Mutex::new(inner),
             clock,
+            elevation_clock: Mutex::new(None),
             writer,
             random: Mutex::new(default_random()),
             _lock: Some(lock),
@@ -1258,7 +1265,8 @@ impl AuthStore {
         }
         g.dirty_touch = true;
         let rec = g.records.get(&record.id).cloned().unwrap_or(record);
-        Ok(g.principal_for(&rec, now))
+        let elevation_now = self.elevation_now(now);
+        Ok(g.principal_for(&rec, elevation_now))
     }
 
     /// Count one use of a credential made with `max_uses` (the vault ceremony token) and revoke it at
@@ -1316,12 +1324,39 @@ impl AuthStore {
         ids
     }
 
-    /// Give a session an elevation until `until_ms` (in memory only; a restart drops it).
+    /// Measure elevation windows on `clock` from now on (a monotonic clock): what `set_elevated_until` and
+    /// `elevated_until` say is a time on it. Without this the store's own clock is used. Windows already given are
+    /// forgotten (they were on another clock); call it before any is.
+    pub fn use_monotonic_elevation(&self, clock: Arc<dyn Clock>) {
+        *self
+            .elevation_clock
+            .lock()
+            .unwrap_or_else(|e| e.into_inner()) = Some(clock);
+        self.lock().elevated.clear();
+    }
+
+    /// The time on the clock elevation windows are measured on.
+    pub fn elevation_now_ms(&self) -> u64 {
+        self.elevation_now(self.clock.now_ms())
+    }
+
+    fn elevation_now(&self, wall_now: u64) -> u64 {
+        match &*self
+            .elevation_clock
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+        {
+            Some(clock) => clock.now_ms(),
+            None => wall_now,
+        }
+    }
+
+    /// Give a session an elevation until `until_ms` on the elevation clock (in memory only; a restart drops it).
     pub fn set_elevated_until(&self, id: &str, until_ms: u64) {
         self.lock().elevated.insert(id.to_string(), until_ms);
     }
 
-    /// When a session's elevation ends, if it has one (the time it was given, past or not).
+    /// When a session's elevation ends on the elevation clock, if it has one (the time it was given, past or not).
     pub fn elevated_until(&self, id: &str) -> Option<u64> {
         self.lock().elevated.get(id).copied()
     }
@@ -1343,13 +1378,14 @@ impl AuthStore {
     /// and drop what expired more than seven days ago (hourly).
     pub fn maintain(&self) {
         let now = self.clock.now_ms();
+        let elevation_now = self.elevation_now(now);
         let mut g = self.lock();
         g.clamp_future_use(now);
         // Derived credentials are memory-only: nothing to write when they go.
         g.purge_runs(now);
         let mut changed = false;
         if now.saturating_sub(g.last_purge_ms) >= PURGE_EVERY_MS || g.last_purge_ms == 0 {
-            changed = g.purge(now);
+            changed = g.purge(now, elevation_now);
             g.last_purge_ms = now;
         }
         if changed || (g.dirty_touch && now.saturating_sub(g.last_flush_ms) >= FLUSH_EVERY_MS) {
@@ -1547,7 +1583,7 @@ impl Inner {
         }
     }
 
-    fn principal_for(&self, rec: &Record, now: u64) -> Principal {
+    fn principal_for(&self, rec: &Record, elevation_now: u64) -> Principal {
         let kind = match rec.kind {
             Kind::Pat => PrincipalKind::Pat,
             Kind::Ses => PrincipalKind::Session,
@@ -1559,7 +1595,10 @@ impl Inner {
             // The OS user at the machine is the owner: the dashboard's desk credential is always elevated.
             Kind::Dsk => rec.app == Some(App::Dash),
             Kind::Con => true,
-            Kind::Ses => self.elevated.get(&rec.id).is_some_and(|until| *until > now),
+            Kind::Ses => self
+                .elevated
+                .get(&rec.id)
+                .is_some_and(|until| *until > elevation_now),
             _ => false,
         };
         Principal {
@@ -1589,7 +1628,7 @@ impl Inner {
     }
 
     /// Drop what ended more than seven days ago. Whether anything went.
-    fn purge(&mut self, now: u64) -> bool {
+    fn purge(&mut self, now: u64, elevation_now: u64) -> bool {
         let before = self.records.len();
         self.records.retain(|_, r| {
             let ended = r
@@ -1608,7 +1647,7 @@ impl Inner {
         self.derive_times
             .retain(|id, _| self.records.contains_key(id) || id == STATIC_PARENT);
         self.elevated
-            .retain(|id, until| self.records.contains_key(id) && *until > now);
+            .retain(|id, until| self.records.contains_key(id) && *until > elevation_now);
         self.records.len() != before
     }
 

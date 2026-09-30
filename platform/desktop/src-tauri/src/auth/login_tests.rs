@@ -1622,6 +1622,12 @@ async fn logout_revokes_the_session_and_what_derives_from_it_and_keeps_the_devic
     assert!(has_event(&e, "logout"));
 }
 
+/// Time passes, on the wall clock and on the monotonic one: as it does.
+fn later(e: &Env, ms: u64) {
+    e.clock.advance(ms);
+    e.mono.advance(ms);
+}
+
 #[tokio::test]
 async fn the_elevation_of_a_login_is_ten_minutes_and_elevate_gives_another_with_the_password() {
     let e = env();
@@ -1633,7 +1639,7 @@ async fn the_elevation_of_a_login_is_ten_minutes_and_elevate_gives_another_with_
         200,
         "a login is an elevation"
     );
-    e.clock.advance(10 * MIN);
+    later(&e, 10 * MIN);
     let r = go(&e, dangerous(&e, &b)).await;
     assert_eq!(
         (r.status, r.code().as_deref()),
@@ -1676,6 +1682,69 @@ async fn the_elevation_of_a_login_is_ten_minutes_and_elevate_gives_another_with_
     );
 }
 
+/// Whether the session of `b` is elevated, as the server says it.
+async fn elevated(e: &Env, b: &Browser) -> bool {
+    go(e, as_page(e, b, Method::GET, "/api/auth/whoami"))
+        .await
+        .json()["elevated"]
+        .as_bool()
+        .unwrap()
+}
+
+#[tokio::test]
+async fn a_backward_step_of_the_wall_clock_does_not_extend_an_elevation() {
+    let e = env();
+    let owner = make_owner(&e, PASSWORD).await;
+    let b = browser_from(&e, &owner);
+    assert!(elevated(&e, &b).await, "elevated right after the login");
+    // The wall clock is stepped back an hour (a correction of the time), and eleven minutes pass: the window of ten
+    // minutes is over, though by the wall clock it has 49 minutes to run.
+    e.clock.set(T0 - HOUR);
+    later(&e, 11 * MIN);
+    assert!(
+        !elevated(&e, &b).await,
+        "the window was extended by a backward step of the wall clock"
+    );
+    let s = go(&e, as_page(&e, &b, Method::GET, "/api/auth/session"))
+        .await
+        .json();
+    assert_eq!(s["elevatedUntilMs"], 0);
+}
+
+#[tokio::test]
+async fn a_forward_step_of_the_wall_clock_does_not_end_an_elevation_early_and_the_window_is_ten_minutes_exactly(
+) {
+    let e = env();
+    let owner = make_owner(&e, PASSWORD).await;
+    let b = browser_from(&e, &owner);
+    // The wall clock jumps forward an hour while one minute passes.
+    e.clock.advance(HOUR);
+    e.mono.advance(MIN);
+    assert!(
+        elevated(&e, &b).await,
+        "the window was ended by a forward step of the wall clock"
+    );
+    // What the session says is what is left of the window, from the wall clock's now.
+    let s = go(&e, as_page(&e, &b, Method::GET, "/api/auth/session"))
+        .await
+        .json();
+    assert_eq!(s["elevatedUntilMs"], e.clock.now_ms() + 9 * MIN);
+    // The last millisecond of the window, and the end of it.
+    later(&e, 9 * MIN - 1);
+    assert!(elevated(&e, &b).await);
+    later(&e, 1);
+    assert!(!elevated(&e, &b).await);
+    // An elevation the owner asks for is ten minutes on the same clock.
+    let r = go(
+        &e,
+        as_page(&e, &b, Method::POST, "/api/auth/elevate").json(json!({ "password": PASSWORD })),
+    )
+    .await;
+    assert_eq!(r.status, 200, "{}", r.text);
+    e.clock.set(T0 - 5 * HOUR);
+    e.mono.advance(10 * MIN - 1);
+    assert!(elevated(&e, &b).await);
+}
 #[tokio::test]
 async fn an_elevation_is_a_session_lane_five_wrong_answers_revoke_the_session_and_they_are_shared_with_password(
 ) {
