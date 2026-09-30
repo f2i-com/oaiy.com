@@ -43,8 +43,9 @@ The plan reasons OAIY puts in an `oaiy.ring.plan` answer are exactly the plugin'
   application's own lines are refused throughout.
 * **While the owner is rung** the desktop says a fixed hold line five seconds in and every 15 seconds after
   (three wordings, at most six) when the receptionist has said nothing, whether or not the model or the Agent
-  page is working. None of them says the call is being put through, and a line from the model that does is
-  replaced by a hold line until an owner device has accepted.
+  page is working. None of them says the call is being put through, and a line from the model that does (before it
+  asks for the owner, while it rings, or after a decline: any time until an owner device has accepted) is not said, and
+  a hold line, or before any request "One moment, please.", is said in its place.
 * **Withdrawing.** Declining the ring dialog, or "Decline and take a message", sends `transfer_cancel` on the
   call's stream (`owner_declined`, `message_instead`) and waits up to two seconds: `cancelled` offers the caller a
   message; `too_late` offers nothing and the ring goes on; `unknown_request` ends the wait at once as a decline; no

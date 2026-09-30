@@ -302,6 +302,33 @@ async fn a_withdrawal_the_phone_has_no_open_request_for_ends_the_wait_at_once_an
 }
 
 #[tokio::test]
+async fn no_line_that_promises_a_transfer_is_said_before_an_owner_device_accepts_whenever_the_model_writes_it() {
+    // The reviewer's probe, against a warmed call: the model's words come first and its tool call after, and while it rings it goes on.
+    let mut f = flow(owner_settings(true)).await;
+    f.caller_says(ASKED);
+    assert!(spoken_within(&f.aokie, "Hi Alex! Thanks for calling.", secs(6)).await, "{:?}", f.aokie.speech.spoken());
+    // Before any request: there is nothing being tried, so what is said in its place is a plain one moment, not that anything is.
+    assert!(f.aokie.say("Sure, I'm transferring you to the owner now.").await.is_ok());
+    assert!(spoken_within(&f.aokie, transfer::WAIT_LINE, secs(3)).await, "{:?}", f.aokie.speech.spoken());
+    f.ring_through("assist_1", 30).await;
+    // While it rings: the hold line, whatever way it is put.
+    for line in ["I'll transfer you now.", "Let me put you through to the owner.", "You will be connected in a moment.", "Transferring you now."] {
+        assert!(f.aokie.say(line).await.is_ok(), "{line}");
+        tokio::time::sleep(Duration::from_millis(400)).await;
+    }
+    tokio::time::sleep(secs(1)).await;
+    let spoken = f.aokie.speech.spoken();
+    for promised in ["Sure, I'm transferring you to the owner now.", "I'll transfer you now.", "Let me put you through to the owner.", "You will be connected in a moment.", "Transferring you now."] {
+        assert!(!spoken.iter().any(|l| l == promised), "said as written: {promised}: {spoken:?}");
+    }
+    assert!(!spoken.iter().any(|l| l == transfer::CONNECTING_LINE), "nobody has accepted: {spoken:?}");
+    assert!(said_of(&f, &transfer::HOLD_LINES).len() >= 2, "{spoken:?}");
+    // An honest line goes through as written, and once an owner device has accepted the desktop's own line is the one said.
+    assert!(f.aokie.say("I'll try to reach them, please stay with me.").await.is_ok());
+    assert!(spoken_within(&f.aokie, "I'll try to reach them, please stay with me.", secs(3)).await, "{:?}", f.aokie.speech.spoken());
+}
+
+#[tokio::test]
 async fn a_decline_before_the_phone_names_the_request_to_the_call_is_kept_and_goes_the_moment_it_does() {
     // The reviewer's case: the owner's likeliest click is right after the popup, before the model's line has drained and the phone's answer
     // to the tool call has said which request rings. Nothing may be lost, and the owner is told only what is true.

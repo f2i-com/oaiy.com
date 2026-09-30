@@ -132,6 +132,9 @@ pub const STILL_CONNECTING_LINES: [&str; 2] = ["Thank you for waiting, I'm still
 /// Said when the receptionist has said nothing while the owner is being rung, and again every [`HOLD_EVERY`] with another
 /// wording (never that the call is being put through: nobody has accepted).
 pub const HOLD_LINE: &str = "One moment, I'm still trying to reach them.";
+/// Said in place of a line that promised a transfer when no request to reach the owner is going yet: nothing is being tried, so it does
+/// not say that anything is.
+pub const WAIT_LINE: &str = "One moment, please.";
 /// The hold lines, in the order they are said.
 pub const HOLD_LINES: [&str; 3] = [HOLD_LINE, "Thank you for waiting, I'm still trying to reach them.", "I'm still trying, thank you for your patience."];
 /// Said when nobody could take the call and the receptionist has not offered a message.
@@ -199,49 +202,83 @@ pub fn parse_arguments(arguments: &Value) -> Result<crate::ring::Reason, &'stati
     }
 }
 
-/// What a line that tells the caller their call is being put through says: no line that does is said until an owner device has
-/// accepted, whatever the model wrote (see [`promises_transfer`]).
-const PROMISES: [&str; 20] = [
-    "connecting you",
-    "connecting your call",
-    "connecting the call",
-    "transferring you",
-    "transferring your call",
-    "transferring the call",
-    "putting you through",
-    "putting your call through",
-    "passing you",
-    "passing your call",
-    "handing you over",
-    "being connected",
-    "being transferred",
-    "being put through",
-    "you are now connected",
-    "you re now connected",
-    "you re through",
-    "i have transferred",
-    "i ve transferred",
-    "i have connected you",
-];
+/// What a line that tells the caller their call is being put through says (see [`promises_transfer`]): the forms a model writes when it
+/// means to hand the caller to a person, in the present ("I'm transferring you", "putting you through"), the future ("I'll transfer you",
+/// "let me put you through", "you'll be connected in a moment"), the passive ("you are being put through", "your call is being
+/// transferred"), the perfect ("I've transferred you") and of the owner ("the owner will take your call", "is coming to the phone"). What
+/// hedges it ("I'll try to", "I'll see if", "I'm trying to") is not one, and neither is what says it cannot be done.
+fn promise_patterns() -> &'static [regex::Regex] {
+    static PATTERNS: std::sync::OnceLock<Vec<regex::Regex>> = std::sync::OnceLock::new();
+    PATTERNS.get_or_init(|| {
+        let obj = "(?:you|your call|the call|this call|the line)";
+        let who = "(?:the )?(?:owner|manager|boss|him|her|someone|somebody|a person|a human|a real person)";
+        // The forms of doing it to the caller, after "I'll", "let me", "while I": the base verb and what it is done to.
+        let do_it = format!(
+            "(?:(?:transfer|connect|forward) {obj}|put {obj} (?:through|thru|on to|onto|straight through)|patch (?:{obj} )?(?:through|thru)|hand (?:{obj} )?over|pass {obj} (?:over|on|along)|(?:get|fetch|bring|grab) {who}(?: (?:on|for|to the phone|to come|now))?)"
+        );
+        let lead = "(?:i ll|i will|we ll|we will|i m going to|i am going to|i m gonna|i m about to|i am about to|going to|about to|let me|lemme|allow me to|i shall|while i|please let me|just let me|i can now|i ll just|i will just)";
+        let adv = "(?:(?:just|now|quickly|shortly|right now|go ahead and|first|straight away|immediately) )*";
+        // The same in the participle, on its own or after "I'm", "still", "working on".
+        let doing = format!(
+            "(?:(?:transferring|connecting|forwarding) {obj}|putting {obj} (?:through|thru|on to|onto|straight through)|patching (?:{obj} )?(?:through|thru)|handing (?:{obj} )?over|passing {obj} (?:over|on|along)|(?:getting|fetching|bringing|grabbing) {who}(?: (?:on|for|to the phone|to come|now))?)"
+        );
+        let passive = "(?:you|your call|the call|this call) (?:will be|ll be|will now be|are being|re being|is being|are now being|have been|ve been|shall be|are about to be|re about to be|are going to be|re going to be) (?:connected|transferred|put through|patched through|passed|passed on|handed over|forwarded|through)";
+        let now = "you (?:are|re) now (?:connected|through|speaking to|talking to|speaking with|talking with|with)|the call is (?:now )?(?:being )?(?:transferred|connected|put through|forwarded)|you (?:will|ll) (?:be )?(?:speaking|talking|chatting|speak|talk|chat) (?:to|with) (?:the )?(?:owner|manager|boss|him|her)|you (?:will|ll) be on (?:the phone|the line|with) (?:the )?(?:owner|manager|boss|him|her)?";
+        let owner = "(?:the )?(?:owner|manager|boss) (?:(?:will|ll|is going to|is about to|is ready to|is now) (?:take your call|take the call|speak with you|speak to you|talk to you|talk with you|come to the phone|pick up|answer|join|be with you|be right with you|be on the line|be on the phone|be there)|is (?:coming|on the way|on their way|heading) to the (?:phone|line)|is (?:picking up|answering|joining))";
+        let perfect = format!("(?:i have|i ve|we have|we ve|i have just|i ve just) (?:transferred|connected|forwarded|patched|passed|handed|put) {obj}(?: through| over| on)?");
+        let mut list = vec![
+            format!("(?:^| ){lead} {adv}{do_it}(?: |$)"),
+            format!("(?:^| ){doing}(?: |$)"),
+            format!("(?:^| ){passive}(?: |$)"),
+            format!("(?:^| )(?:{now})(?: |$)"),
+            format!("(?:^| ){owner}(?: |$)"),
+            format!("(?:^| ){perfect}(?: |$)"),
+        ];
+        list.push("(?:^| )you re through(?: |$)".to_string());
+        list.into_iter().map(|p| regex::Regex::new(&p).expect("a promise pattern is a valid pattern")).collect()
+    })
+}
 
-/// Whether a line the receptionist is about to say tells the caller that their call is being put through, connected or handed
-/// over ("connecting you now", "I'm transferring you", "you're being put through"): true only of the owner having accepted. An honest
-/// line ("I'll try to reach them", "I'm trying to connect you") is not one.
-pub fn promises_transfer(text: &str) -> bool {
-    let mut plain = String::with_capacity(text.len());
+/// What says a thing cannot or will not be done, before the words that would promise it ("I can't put you through", "I'm not
+/// transferring you", "without transferring you"): a promise that is denied is not one.
+fn denies_before() -> &'static regex::Regex {
+    static DENIAL: std::sync::OnceLock<regex::Regex> = std::sync::OnceLock::new();
+    DENIAL.get_or_init(|| regex::Regex::new(r"(?:^| )(?:not|never|cannot|cant|wont|dont|unable|without|instead of|rather than|no way|(?:can|won|don|couldn|wouldn|didn|isn|aren|wasn|shouldn|haven|hasn) t)(?: |$)").expect("a valid pattern"))
+}
+
+/// A clause of `text` as the promise patterns read it: lower case, apostrophes and every run of anything but letters and digits one
+/// space ("I'll" is "i ll"), characters that are not seen (zero width, soft hyphen) dropped, and a hyphen inside a word dropped
+/// ("trans-ferring" is "transferring").
+fn plain_clause(clause: &str) -> String {
+    let chars: Vec<char> = clause.to_lowercase().chars().filter(|c| !matches!(c, '\u{200b}'..='\u{200f}' | '\u{2060}' | '\u{feff}' | '\u{00ad}')).collect();
+    let mut plain = String::with_capacity(chars.len());
     let mut gap = true;
-    for c in text.to_lowercase().chars() {
-        let c = if matches!(c, '\u{2019}' | '\u{2018}' | '\u{02BC}') { '\'' } else { c };
+    for (i, c) in chars.iter().enumerate() {
+        let inside_word = matches!(c, '-' | '\u{2010}' | '\u{2011}') && i > 0 && chars.get(i + 1).is_some_and(|n| n.is_alphanumeric()) && chars[i - 1].is_alphanumeric();
+        if inside_word {
+            continue;
+        }
         if c.is_alphanumeric() {
-            plain.push(c);
+            plain.push(*c);
             gap = false;
         } else if !gap {
             plain.push(' ');
             gap = true;
         }
     }
-    let plain = format!(" {} ", plain.trim());
-    PROMISES.iter().any(|p| plain.contains(&format!(" {p} ")))
+    plain.trim().to_string()
+}
+
+/// Whether a line the receptionist is about to say tells the caller that their call is being put through, connected or handed
+/// over ("connecting you now", "I'm transferring you", "I'll transfer you", "let me put you through", "you'll be connected in a moment",
+/// "the owner will take your call"): true only of the owner having accepted, so no such line is said before it, whatever the model wrote
+/// and whether it came before its request or after it. An honest line ("I'll try to reach them", "I'm trying to connect you", "I can't
+/// transfer you", "the owner is not available") is not one.
+pub fn promises_transfer(text: &str) -> bool {
+    // A clause at a time: what is denied in one is not a promise, and what is promised in another still is.
+    text.split(['.', '!', '?', ';', ':', ',', '\n', '\r', '\u{2026}', '\u{2014}', '\u{2013}']).map(plain_clause).filter(|c| !c.is_empty()).any(|clause| {
+        promise_patterns().iter().any(|p| p.find_iter(&clause).any(|m| !denies_before().is_match(&clause[..m.start()].split(' ').rev().take(6).collect::<Vec<_>>().into_iter().rev().collect::<Vec<_>>().join(" "))))
+    })
 }
 
 /// What the model is told when a request to reach the owner is not made (or is refused), in the shape
@@ -437,6 +474,12 @@ impl Transfer {
             self.hold_at = (self.holds_said < HOLD_MAX).then_some(now + self.timing.hold_every);
         }
         line
+    }
+
+    /// The line to say in place of one that promised a transfer before any request was made ([`WAIT_LINE`]), counted as said.
+    pub fn wait_instead(&mut self, now: Instant) -> &'static str {
+        self.last_said = Some(now);
+        WAIT_LINE
     }
 
     /// The app said something (not a hold word): a silence is not what the caller is hearing.
@@ -869,6 +912,85 @@ mod tests {
         // The fixed lines the desktop says itself: the connecting one is said only after an acceptance, and it is what this catches.
         assert!(promises_transfer(CONNECTING_LINE));
         assert!(HOLD_LINES.iter().chain([&OFFER_LINE, &FAILED_LINE]).all(|l| !promises_transfer(l)), "nor does a hold line, the offer or the apology");
+    }
+
+    #[test]
+    fn the_promise_filter_reads_the_forms_a_model_writes_and_not_what_it_writes_honestly() {
+        // The reviewer's evidence, and the rest of what a model writes when it means to hand a caller to a person: present, future, passive,
+        // perfect, of the owner, with the odd spelling. Then what is honest, or denies it, or only offers.
+        let promises = [
+            "Sure, I'm transferring you to the owner now.",
+            "I'll transfer you now.",
+            "Let me put you through to the owner.",
+            "You will be connected in a moment.",
+            "Transferring you now.",
+            "I'll connect you to the owner right away.",
+            "Let me connect you.",
+            "I will transfer you.",
+            "I'll put you through.",
+            "I'll get the owner on the line for you.",
+            "You'll be connected in a moment.",
+            "You will be transferred shortly.",
+            "Please hold while I transfer your call.",
+            "Please hold while I connect your call.",
+            "The owner will take your call now.",
+            "The owner is coming to the phone.",
+            "Putting you through now.",
+            "Transferring your call.",
+            "One moment while I patch you through.",
+            "Passing you over to the owner.",
+            "Handing you over.",
+            "Connecting\u{a0}you now",
+            "CONNECTING YOU",
+            "connecting  you",
+            "Trans-ferring you",
+            "Tra\u{200b}nsferring you",
+            "Okay, I'm going to put you through to the manager.",
+            "Alright, let me hand you over to the owner.",
+            "I've put you through.",
+            "You are now connected to the owner.",
+            "The manager will be with you shortly.",
+            "Hold on, I'm getting the owner for you.",
+            "Of course. Connecting your call now.",
+            "I can't hear you well, so let me transfer you.",
+        ];
+        for line in promises {
+            assert!(promises_transfer(line), "a promise, and not caught: {line:?}");
+        }
+        let honest = [
+            "I can't transfer you.",
+            "I'm not able to put you through right now.",
+            "The owner is unavailable.",
+            "I'll try to reach them.",
+            "Please stay with me while I try to reach the owner.",
+            "Could I take your name while I try?",
+            "I'm trying to connect you.",
+            "I'm not transferring you.",
+            "I won't be able to connect you.",
+            "Would you like me to transfer you?",
+            "Do you want me to connect you to the owner?",
+            "I'll take a message.",
+            "I'll pass that on to the owner.",
+            "The owner will call you back.",
+            "I'll see if the owner is free.",
+            "Sorry, I couldn't connect you.",
+            "Your call is important to us.",
+            "I'll connect the dots for you",
+            "Let me check whether the owner is in.",
+            "You can leave a message for the owner.",
+            "",
+            "Thanks for calling Dave's Lawn Care.",
+            "I'll put you on hold for a moment.",
+            "Without transferring you, I can still take a message.",
+            "I could transfer you if they are free.",
+        ];
+        for line in honest {
+            assert!(!promises_transfer(line), "honest, and taken for a promise: {line:?}");
+        }
+        // One clause that promises is enough, whatever else the line says.
+        assert!(promises_transfer("I can't say when they will be free, but I'm transferring you now."));
+        assert!(!promises_transfer("I'm not transferring you, and I'm not connecting you either, sorry."));
+        assert!(promises.len() + honest.len() >= 40);
     }
 
     #[test]

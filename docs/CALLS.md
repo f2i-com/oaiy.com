@@ -192,11 +192,15 @@ agent : "I'll try to reach them, please stay with me."  (it is trying: it does n
   (`call.ended`, `ended_during_handoff`). If the phone's word that the call ended is lost, the call is
   let go after 4 hours (`call.ended`, `handoff_expired`), so it does not hold an update back for ever. A
   call in handoff counts as a live call for the updater.
-- **A line that promises a transfer is not said before it happens.** While a request to reach the owner is being
-  made or rings and no owner device has accepted, a line the model writes that tells the caller they are being
-  connected, transferred, put through or handed over ("connecting you now", "I'm transferring you") is dropped and
-  the next hold line is said instead; the model's flow goes on as if it had been said. The instructions also name the
-  words. After an acceptance the desktop's own lines say it, and the model says nothing more.
+- **A line that promises a transfer is not said before it happens.** Until an owner device has accepted, a line the
+  model writes that tells the caller they are being connected, transferred, put through or handed over, in any of the
+  forms a model uses ("connecting you now", "I'm transferring you", "I'll transfer you", "let me put you through",
+  "you'll be connected in a moment", "the owner will take your call"), is not said, whether it came before the model
+  asked for the owner (its words come first, then its call), while it rings, or after a decline. While a request is being
+  made or rings the next hold line is said in its place; before any request there is nothing being tried, so "One
+  moment, please." is; and the model's flow goes on as if it had been said. What denies it ("I can't transfer you") or
+  only offers it ("would you like me to transfer you?") or hedges it ("I'll try to reach them") is said as written. The
+  instructions also name the words. After an acceptance the desktop's own lines say it, and the model says nothing more.
 - **Nothing waits for ever.** A transfer request the phone never answers is answered to the model as
   unavailable (`no_answer`) after 25 seconds, and the tools and the goodbye that waited behind it go. A
   request the phone cancels on its own (consent taken back, say) while the caller is still there ends

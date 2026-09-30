@@ -1230,10 +1230,12 @@ where
                             let _ = reply.send(Err("the call is being handed over to the owner: say nothing more".into()));
                             continue;
                         }
-                        // The owner has not accepted (a request is being made or rings): a line that tells the caller their call is being put
-                        // through is not true, and is not said. The fixed hold line is said in its place, and the model's flow goes on.
-                        if (transfer.awaiting_owner() || tools.transfer_pending()) && transfer::promises_transfer(&text) {
-                            let line = transfer.hold_instead(Instant::now());
+                        // No owner device has accepted (once one has, the receptionist says nothing at all, above): a line that tells the caller
+                        // their call is being put through is not true, and is not said, whether the model wrote it before it asked for the owner (its
+                        // words come first, then its call), while it rings, or after. The fixed hold line is said in its place while a request is being
+                        // made or rings; before any request there is nothing being tried, so a plain "one moment" is; and the model's flow goes on.
+                        if !text.is_empty() && transfer::promises_transfer(&text) {
+                            let line = if transfer.awaiting_owner() || tools.transfer_pending() { transfer.hold_instead(Instant::now()) } else { transfer.wait_instead(Instant::now()) };
                             resume = None;
                             let said = if !begun {
                                 Err("the call has not begun".into())
@@ -3253,15 +3255,19 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn what_the_model_says_after_a_decline_is_said_as_written() {
-        // The guard is for the time between asking and an answer: once the owner has declined, the model's words are its own.
+    async fn what_the_model_says_after_a_decline_is_said_as_written_unless_it_promises_a_transfer_nobody_accepted() {
+        // Once the owner has declined, the model's words are its own, as they are before anyone is asked for; but no owner device has accepted, so
+        // a line that says the call is being put through is no more true now than while it rang, and is not said.
         let mut aokie = transferable(owner_settings(true), true).await;
         caller_asks(&aokie);
         ring_the_owner(&mut aokie, "assist_1", 30).await;
         aokie.send(outcome(&aokie, "assist_1", "declined", None));
         aokie.event("call.transfer", secs(3)).await.unwrap();
+        aokie.say("They can't come to the phone, but I can take a message if you like.").await.unwrap();
+        assert!(spoken_within(&aokie, "They can't come to the phone, but I can take a message if you like.", secs(2)).await);
         aokie.say("They can't come, but I can put you through to our booking line instead, connecting you now.").await.unwrap();
-        assert!(spoken_within(&aokie, "They can't come, but I can put you through to our booking line instead, connecting you now.", secs(2)).await);
+        assert!(spoken_within(&aokie, transfer::WAIT_LINE, secs(2)).await, "{:?}", aokie.speech.spoken());
+        assert!(!aokie.speech.spoken().iter().any(|l| l.contains("connecting you now")), "{:?}", aokie.speech.spoken());
     }
 
     #[tokio::test]
