@@ -2569,17 +2569,41 @@ mod tests {
         tokio::time::timeout(secs(5), asked).await.expect("the app was not answered within five seconds").unwrap()
     }
 
-    fn ringing(aokie: &Aokie, tool: &str, request: &str, seconds: u64) -> Value {
-        json!({"type": "formlogic.realtime.tool_result", "callId": aokie.call, "generation": 1, "toolCallId": tool, "ok": true,
-            "output": {"status": "ringing", "requestId": request, "ringSeconds": seconds, "instruction": "The owner is being rung."}})
+    /// The shared transfer_v1 fixture of that kind (`docs/contracts/transfer/transfer-v1.<kind>.fixture.json`), the phone plugin's own.
+    pub(super) fn shared(kind: &str) -> Value {
+        let path = format!("{}/../../../docs/contracts/transfer/transfer-v1.{kind}.fixture.json", env!("CARGO_MANIFEST_DIR"));
+        serde_json::from_str(&std::fs::read_to_string(&path).unwrap_or_else(|e| panic!("{path}: {e}"))).unwrap()
     }
 
-    fn outcome(aokie: &Aokie, request: &str, outcome: &str, message: Option<&str>) -> Value {
-        let mut v = json!({"type": "formlogic.realtime.transfer_outcome", "callId": aokie.call, "generation": 1, "requestId": request, "outcome": outcome, "atMs": 4_000});
-        if let Some(m) = message {
-            v["message"] = json!(m);
+    /// `frame`, a frame of the shared fixtures, as it would be on this call: its ids, and the request it is about.
+    pub(super) fn on_this_call(mut frame: Value, aokie: &Aokie, request: Option<&str>) -> Value {
+        frame["callId"] = json!(aokie.call);
+        frame["generation"] = json!(1);
+        if let Some(request) = request {
+            frame["requestId"] = json!(request);
         }
-        v
+        frame
+    }
+
+    /// The phone's answer that the owner is being rung: the shared fixture's frame, for this tool call and request.
+    fn ringing(aokie: &Aokie, tool: &str, request: &str, seconds: u64) -> Value {
+        let mut frame = on_this_call(shared("tool-result")["frame"].clone(), aokie, None);
+        frame["toolCallId"] = json!(tool);
+        frame["output"]["requestId"] = json!(request);
+        frame["output"]["ringSeconds"] = json!(seconds);
+        frame
+    }
+
+    /// How the phone says a request came out: the shared fixture's frame for that outcome (with the owner's words, for a decline that has
+    /// them), for this call and request.
+    pub(super) fn outcome(aokie: &Aokie, request: &str, outcome: &str, message: Option<&str>) -> Value {
+        let cases = shared("outcome")["cases"].clone();
+        let case = cases.as_array().unwrap().iter().find(|c| c["frame"]["outcome"] == outcome && c["frame"].get("message").is_some() == message.is_some()).unwrap_or_else(|| panic!("the shared fixture has no {outcome} case (with words: {})", message.is_some()));
+        let mut frame = on_this_call(case["frame"].clone(), aokie, Some(request));
+        if let Some(words) = message {
+            frame["message"] = json!(words);
+        }
+        frame
     }
 
     /// The caller asks for the owner, as the desktop heard it.
@@ -2624,6 +2648,10 @@ mod tests {
             if offered {
                 assert_eq!(aokie.ready["features"], json!(["transfer_v1"]));
             }
+            // What this desktop sends is a frame of the shared fixture: the one that implements the contract, or the one from before it.
+            let cases = shared("start-ready")["ready"]["cases"].clone();
+            let expected = on_this_call(cases[if offered { 0 } else { 1 }]["frame"].clone(), &aokie, None);
+            assert_eq!(aokie.ready, expected, "ready: {on} {allow}");
             caller_asks(&aokie);
             if !offered {
                 let answer = answer_of(asking(&aokie, transfer::TOOL, json!({"reason": "caller_asked"}))).await.expect("answered, not an error");
@@ -2849,6 +2877,12 @@ mod tests {
         let told = aokie.event("call.transfer", secs(4)).await.expect("the desktop ends the ring itself");
         assert_eq!((told["requestId"].clone(), told["outcome"].clone(), told["source"].clone()), (json!("assist_1"), json!("expired"), json!("watchdog")));
         assert!(spoken_within(&aokie, transfer::OFFER_LINE, secs(3)).await, "{:?}", aokie.speech.spoken());
+        // The phone is told this desktop gave up on the request it may still hold, once, in the shared fixture's frame.
+        let frame = aokie.text(transfer::CANCEL_FRAME, secs(2)).await.expect("the phone was told");
+        let cases = shared("cancel")["cancel"]["cases"].clone();
+        let case = cases.as_array().unwrap().iter().find(|c| c["frame"]["reason"] == "gave_up").unwrap();
+        assert_eq!(frame, on_this_call(case["frame"].clone(), &aokie, Some("assist_1")));
+        assert!(aokie.text(transfer::CANCEL_FRAME, Duration::from_millis(300)).await.is_none(), "once");
     }
 
     #[tokio::test]
@@ -2930,6 +2964,33 @@ mod tests {
         let started = back.event("call.started", secs(3)).await.unwrap();
         assert_eq!(started["resume"]["afterHandoff"], true);
         assert_eq!(started["resume"]["via"], "return");
+    }
+
+    #[tokio::test]
+    async fn every_refusal_the_plugin_can_give_reaches_the_app_as_it_is_and_gives_the_try_back() {
+        // The fixture's refusals (a status and a reason each) and the tool intake errors (an error and no status), for a transfer request
+        // the plugin turned down: the model is told exactly what the plugin said, and nothing was rung, so no try stays spent.
+        let f = shared("tool-result");
+        let mut outputs: Vec<(String, Value)> = f["refusals"].as_array().unwrap().iter().map(|r| (r["name"].as_str().unwrap().to_string(), json!({"status": r["status"], "reason": r["reason"], "instruction": "Offer a message."}))).collect();
+        outputs.extend(f["toolRefusals"]["cases"].as_array().unwrap().iter().map(|c| (c["name"].as_str().unwrap().to_string(), c["output"].clone())));
+        assert_eq!(outputs.len(), 19);
+        // A call may send only so many tools (the phone ends it at its ninth), so a few to a call.
+        for chunk in outputs.chunks(4) {
+            let mut aokie = transferable(owner_settings(true), true).await;
+            caller_asks(&aokie);
+            for (name, output) in chunk {
+                let asked = asking(&aokie, transfer::TOOL, json!({"reason": "caller_asked"}));
+                let call = aokie.text("formlogic.realtime.tool_call", secs(3)).await.unwrap_or_else(|| panic!("{name}: the tool call reached the phone"));
+                let mut frame = on_this_call(f["frame"].clone(), &aokie, None);
+                frame["toolCallId"] = call["toolCallId"].clone();
+                frame["ok"] = json!(false);
+                frame["output"] = output.clone();
+                aokie.send(frame);
+                let answer = answer_of(asked).await.unwrap_or_else(|e| panic!("{name}: {e}"));
+                assert_eq!((answer["ok"].clone(), answer["output"].clone()), (json!(false), output.clone()), "{name}");
+                assert_eq!(tries(&aokie).attempts_this_call, 0, "{name}: the try was given back");
+            }
+        }
     }
 
     #[tokio::test]

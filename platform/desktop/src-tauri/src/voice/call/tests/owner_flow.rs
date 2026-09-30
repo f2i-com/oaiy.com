@@ -114,6 +114,10 @@ impl Flow {
     async fn phone_is_asked_to_withdraw(&mut self, request: &str, why: &str) -> Value {
         let frame = self.aokie.text(transfer::CANCEL_FRAME, secs(3)).await.expect("the phone was asked to withdraw the request");
         assert_eq!((frame["requestId"].clone(), frame["reason"].clone(), frame["callId"].clone()), (json!(request), json!(why), json!(self.aokie.call)), "{frame}");
+        // And it is the shared fixture's frame for that reason, member for member.
+        let cases = shared("cancel")["cancel"]["cases"].clone();
+        let case = cases.as_array().unwrap().iter().find(|c| c["frame"]["reason"] == why).unwrap_or_else(|| panic!("the shared fixture has no {why} case"));
+        assert_eq!(frame, on_this_call(case["frame"].clone(), &self.aokie, Some(request)), "{why}");
         frame
     }
 
@@ -127,14 +131,23 @@ impl Flow {
         let asked = asking(&self.aokie, transfer::TOOL, json!({"reason": "caller_asked"}));
         let call = self.aokie.text("formlogic.realtime.tool_call", secs(3)).await.expect("the tool call reached the phone");
         assert_eq!((call["name"].clone(), call["arguments"].clone()), (json!("transfer_to_owner"), json!({"reason": "caller_asked"})));
-        let plan = PluginHost::ring_request(&self.ring, "oaiy.ring.plan", json!({"callId": self.aokie.call, "reason": "caller_asked", "recentCallerTurns": [ASKED]})).expect("the plugin was answered");
+        // The plugin asks as the shared fixture has it ask (the epochs and the caller's number too), about this call and what was said.
+        let mut question = shared("ring-plan")["plan"]["params"].clone();
+        question["callId"] = json!(self.aokie.call);
+        question["recentCallerTurns"] = json!([ASKED]);
+        let plan = PluginHost::ring_request(&self.ring, "oaiy.ring.plan", question).expect("the plugin was answered");
         assert_eq!((plan["decision"].as_str(), plan["reason"].as_str()), (Some("ring"), Some("ok")), "{plan}");
         self.aokie.send(ringing(&self.aokie, call["toolCallId"].as_str().unwrap(), request, seconds));
         let answered = answer_of(asked).await.expect("the model is answered");
         assert_eq!((answered["ok"].clone(), answered["output"]["status"].clone(), answered["output"]["requestId"].clone()), (json!(true), json!("ringing"), json!(request)));
         let expires = self.ring.clock().unix() + seconds;
-        let opened = PluginHost::ring_request(&self.ring, "oaiy.ring.opened", json!({"planId": plan["planId"], "requestId": request, "callId": self.aokie.call, "callEpoch": 1, "ownerEpoch": 1, "expiresAt": expires}));
-        assert_eq!(opened.expect("the ring opened"), json!({"ok": true}));
+        let mut told = shared("ring-plan")["opened"]["input"].clone();
+        told["planId"] = plan["planId"].clone();
+        told["requestId"] = json!(request);
+        told["callId"] = json!(self.aokie.call);
+        told["expiresAt"] = json!(expires);
+        let opened = PluginHost::ring_request(&self.ring, "oaiy.ring.opened", told);
+        assert_eq!(opened.expect("the ring opened"), shared("ring-plan")["opened"]["result"]);
         plan
     }
 
@@ -254,12 +267,12 @@ async fn a_withdrawal_the_phone_has_no_open_request_for_ends_the_wait_at_once_an
     assert_eq!(f.owner_answers("assist_1", "decline").await.0, 200);
     f.phone_is_asked_to_withdraw("assist_1", "owner_declined").await;
     // A notice about another request is not the answer.
-    f.aokie.send(json!({"type": transfer::NOTICE_FRAME, "callId": f.aokie.call, "generation": 1, "requestId": "assist_9", "notice": "unknown_request", "atMs": 1789000014500u64}));
+    f.aokie.send(notice(&f.aokie, "assist_9", "unknown_request"));
     assert!(f.aokie.event("call.transfer", Duration::from_millis(400)).await.is_none(), "nothing is decided by a notice about another request");
     assert_eq!(f.dialog().await[0]["stopping"], json!(true));
     // The phone has no such request open (it ended, and the withdrawal crossed its end): nothing is left to wait for.
     let sent = Instant::now();
-    f.aokie.send(json!({"type": transfer::NOTICE_FRAME, "callId": f.aokie.call, "generation": 1, "requestId": "assist_1", "notice": "unknown_request", "atMs": 1789000014600u64}));
+    f.aokie.send(notice(&f.aokie, "assist_1", "unknown_request"));
     let told = f.aokie.event("call.transfer", secs(2)).await.expect("the app is told at once");
     assert!(sent.elapsed() < secs(2), "{:?}", sent.elapsed());
     assert_eq!((told["requestId"].clone(), told["outcome"].clone(), told["source"].clone()), (json!("assist_1"), json!("declined"), json!("desktop")));
@@ -276,7 +289,7 @@ async fn a_decline_that_races_an_accept_is_decided_once_by_the_phone_too_late_of
     assert_eq!(f.owner_answers("assist_1", "message").await.0, 200);
     f.phone_is_asked_to_withdraw("assist_1", "message_instead").await;
     // An owner device had taken it a moment before: the phone says it is too late.
-    f.aokie.send(json!({"type": transfer::NOTICE_FRAME, "callId": f.aokie.call, "generation": 1, "requestId": "assist_1", "notice": "too_late"}));
+    f.aokie.send(notice(&f.aokie, "assist_1", "too_late"));
     tokio::time::sleep(Duration::from_millis(200)).await;
     let shown = f.dialog().await;
     assert_eq!(shown.len(), 1, "the ring is not over: the acceptance is coming");
@@ -300,6 +313,13 @@ async fn a_decline_that_races_an_accept_is_decided_once_by_the_phone_too_late_of
 /// What the desktop said on its own, of the lines it keeps for a ring and an acceptance.
 fn said_of(f: &Flow, lines: &[&str]) -> Vec<String> {
     f.aokie.speech.spoken().into_iter().filter(|l| lines.contains(&l.as_str())).collect()
+}
+
+/// The phone's answer to a withdrawal that changed nothing: the shared fixture's frame for that notice, for this call and request.
+fn notice(aokie: &Aokie, request: &str, kind: &str) -> Value {
+    let cases = shared("cancel")["notice"]["cases"].clone();
+    let case = cases.as_array().unwrap().iter().find(|c| c["frame"]["notice"] == kind).unwrap_or_else(|| panic!("the shared fixture has no {kind} notice"));
+    on_this_call(case["frame"].clone(), aokie, Some(request))
 }
 
 /// Every fixed line the desktop says for a request, in the order said (not the greeting, which has its own clock).
