@@ -177,7 +177,7 @@ test('4.18.7 hold: many at once are all granted (a pool of any size is measured 
     }
 });
 
-test('4.18.7 hold: one credential may keep only about a pool\'s worth at once - the eighth on an unmeasured pool is 429 - and each credential has its own', function () {
+test('4.18.7 hold: the holds of a credential are counted in the registry while they wait, and each credential has its own', function () {
     $r = Relay::make(['wait' => ['max' => 20]]);
     $d = $r->desktop();
     $admin = $r->adminToken();
@@ -188,12 +188,7 @@ test('4.18.7 hold: one credential may keep only about a pool\'s worth at once - 
     }
     usleep(900000);
     eq(7, $r->ctx()->holds->byKind()['admin'], 'seven are held and counted');
-    $res = $servers[7]->request('GET', '/v1/admin/hold?wait=4', ['Authorization' => 'Bearer ' . $d->token]);
-    eq(429, $res['status'], $res['body']);
-    eq('rate_limited', json_decode($res['body'], true)['error']['code']);
-    eq('1', $res['headers']['retry-after']);
-    eq(7, $r->ctx()->holds->byKind()['admin'], 'the refused one left no marker');
-    // Another credential has a cap of its own.
+    // Another credential has holds of its own.
     $other = $servers[8]->begin('GET', '/v1/admin/hold?wait=3', ['Authorization' => 'Bearer ' . $admin]);
     usleep(500000);
     eq(8, $r->ctx()->holds->byKind()['admin']);
@@ -209,14 +204,64 @@ test('4.18.7 hold: one credential may keep only about a pool\'s worth at once - 
     eq(0, $r->ctx()->holds->liveCount(), 'every marker is gone');
 });
 
-test('4.18.7 hold: the per-credential cap follows the pool - never below 4, two more than the workers, never above 16', function () {
+test('4.18.7 hold: one credential may have 16 at once whatever the pool (a cap that follows the pool never trips on a small one: the rest wait in the web server), and the 17th is 429 before it leaves a marker', function () {
     $r = Relay::make();
     $cfg = $r->ctx()->cfg;
-    foreach ([[1, 4], [2, 4], [5, 7], [10, 12], [14, 16], [30, 16], [1000, 16]] as [$w, $cap]) {
+    foreach ([1, 2, 5, 10, 30, 1000] as $w) {
         $h = new Oaiy\Relay\Holds($r->data, new Oaiy\Relay\Effective($cfg, $w, null, null, false, null));
-        eq($cap, $h->adminCap(), "W=$w");
+        eq(16, $h->adminCap(), "W=$w");
     }
-    eq(7, $r->ctx()->holds->adminCap(), 'unmeasured: W is assumed to be 5');
+    $holds = $r->ctx()->holds;
+    $made = [];
+    for ($i = 0; $i < 16; $i++) {
+        $made[] = $holds->acquire('admin', 'tok:x', 'core', 30, $holds->adminCap());
+    }
+    $err = null;
+    try {
+        $holds->acquire('admin', 'tok:x', 'core', 30, $holds->adminCap());
+    } catch (Oaiy\Relay\ApiError $e) {
+        $err = $e;
+    }
+    eq([429, 'rate_limited'], [$err->status ?? 0, $err->errorCode ?? '']);
+    eq(16, $holds->byKind()['admin'], 'the refused one left no marker');
+    ok($holds->acquire('admin', 'tok:y', 'core', 30, $holds->adminCap()) !== null, 'another credential has its own');
+});
+
+test('4.18.7 hold: a credential has a budget of hold time - 600 seconds at once, a fifth of a second back for every second - and a hold that does not fit is 429 rate_limited with the wait, before anything is held', function () {
+    $r = Relay::make();
+    $d = $r->desktop();
+    $ctx = $r->ctx();
+    $p = $ctx->auth->device(new Oaiy\Relay\Request('GET', '/v1/admin/hold', [], ['REMOTE_ADDR' => '127.0.0.1', 'HTTP_AUTHORIZATION' => 'Bearer ' . $d->token], '', null));
+    for ($i = 1; $i <= 17; $i++) { // 17 holds of 35 seconds are 595 of the 600
+        Oaiy\Relay\Handlers\CalibrationApi::admitHold($ctx, $p, 35);
+    }
+    $err = null;
+    try {
+        Oaiy\Relay\Handlers\CalibrationApi::admitHold($ctx, $p, 35);
+    } catch (Oaiy\Relay\ApiError $e) {
+        $err = $e;
+    }
+    eq([429, 'rate_limited'], [$err->status ?? 0, $err->errorCode ?? '']);
+    ok($err->retryAfter >= 150 && $err->retryAfter <= 200, 'wait ' . $err->retryAfter . ' s: 35 s of hold is 175 s of refill at a fifth');
+    // The route applies it: a hold of 35 seconds is refused at once (no marker, no wait), and with the budget short by one second so is 10.
+    $res = $r->call($d, 'GET', '/v1/admin/hold', null, ['wait' => '35']);
+    eq([429, 'rate_limited'], [$res['status'], $res['json']['error']['code'] ?? '']);
+    ok((int)$res['headers']['retry-after'] >= 150, 'Retry-After ' . $res['headers']['retry-after']);
+    eq(0, $ctx->holds->byKind()['admin'], 'and it left no marker');
+    Oaiy\Relay\Handlers\CalibrationApi::admitHold($ctx, $p, 5); // 5 seconds of hold still fit
+    Tmp::setClock(Relay::T0 + 175);
+    Oaiy\Relay\Handlers\CalibrationApi::admitHold($ctx, $p, 35); // and after 175 seconds a whole one fits again
+    $err = null;
+    try {
+        Oaiy\Relay\Handlers\CalibrationApi::admitHold($ctx, $p, 35);
+    } catch (Oaiy\Relay\ApiError $e) {
+        $err = $e;
+    }
+    ok($err !== null, 'but only one');
+    // Another credential has its own budget, and wait=0 holds nothing and draws on nothing.
+    $p2 = $ctx->auth->device(new Oaiy\Relay\Request('GET', '/v1/admin/hold', [], ['REMOTE_ADDR' => '127.0.0.1', 'HTTP_AUTHORIZATION' => 'Bearer ' . $r->phone($d)->token], '', null));
+    Oaiy\Relay\Handlers\CalibrationApi::admitHold($ctx, $p2, 35);
+    eq(200, $r->call($d, 'GET', '/v1/admin/hold', null, ['wait' => '0'])['status']);
 });
 
 test('4.18.7 hold: a bad wait is 400, a phone 403, no credential 401; the admin token may hold', function () {

@@ -351,7 +351,11 @@ Exit codes: 0 done, 1 failed, 2 usage. Set `OAIY_RELAY_DATA` to name a data fold
 The relay does not know how many PHP workers it may use. OAIY's "Test this relay" measures it with four routes that only the
 desktop (or the admin token) may call: `GET /v1/admin/hold`, `GET /v1/admin/stream-probe`, `POST /v1/admin/echo` and
 `POST /v1/admin/capacity`. A measurement can only lower a limit (workers, the largest body, the longest hold), never raise one
-past the configuration, and `info` then advertises what is in force.
+past the configuration, and `info` then advertises what is in force. A calibration hold pins a worker like any other, so a credential
+may have 16 of them running at once and has a budget of hold time: 600 seconds at once and a fifth of a second back for every second
+(twelve minutes an hour), after which `GET /v1/admin/hold` is `429 rate_limited` with the seconds to wait. (A cap that followed the
+pool, its workers plus two, never tripped on a small one: the requests beyond the workers wait in the web server, where nothing counts
+them, so a credential could pin every worker for as long as it liked.) A measurement of a pool of any size is a small part of the budget.
 
 ## Garbage collection without cron
 

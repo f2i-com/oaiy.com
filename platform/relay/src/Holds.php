@@ -22,6 +22,16 @@ defined('OAIY_RELAY') or exit;
 final class Holds
 {
     public const KINDS = ['poll', 'lookup', 'rbx', 'pair', 'stream', 'admin'];
+    /** Calibration holds (GET /v1/admin/hold): at most this many at once per credential... */
+    public const ADMIN_CAP = 16;
+    /**
+     * ...and a budget of hold time per credential: a bucket of 600 seconds of hold, refilled at a fifth of a second for every second,
+     * so a credential can pin workers for ten minutes at once and for twelve minutes an hour after that. A calibration (a few holds of
+     * 35 seconds for each of the pool's workers) is a small part of it; a stolen credential cannot keep a pool pinned.
+     */
+    public const ADMIN_BURST_S = 600;
+    public const ADMIN_UNITS_PER_S = 5;
+    public const ADMIN_REFILL_UNITS_PER_S = 1;
     /** The most streams and frames waits of one party that may be running at once, the ones being superseded included. */
     public const STREAM_INFLIGHT_MAX = 3;
     /** A party's bucket of stream opens and frames waits: 10 at once, one more a second. */
@@ -134,10 +144,14 @@ final class Holds
         return $n;
     }
 
-    /** How many calibration holds one credential may have at once: about the pool, but never more than 16 and never fewer than 4. */
+    /**
+     * How many calibration holds one credential may have running at once: 16, whatever the pool. A cap that follows the pool (its
+     * workers plus two) never trips on a small one: only as many requests as there are workers run at once, the rest wait in the web
+     * server's queue where no marker counts them, so the cap that mattered was the time, which is ADMIN_BURST_S below.
+     */
     public function adminCap(): int
     {
-        return min(16, max(4, $this->eff->workers + 2));
+        return self::ADMIN_CAP;
     }
 
     /**
