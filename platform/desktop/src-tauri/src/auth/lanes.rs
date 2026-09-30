@@ -301,28 +301,41 @@ impl Hasher {
     }
 
     /// Verify `password` (normalised) against `stored`, on a blocking thread, behind the fence.
+    ///
+    /// The place in the fence belongs to the pass, not to whoever asked for it: it is dropped when the pass returns.
+    /// A caller whose future is dropped (a client that hung up) leaves a blocking thread running, and the fence must
+    /// go on counting it for as long as it holds its 64 MiB.
     pub async fn verify(&self, password: Zeroizing<String>, stored: String) -> Verdict {
-        let Ok(_permit) = self.fence.clone().acquire_owned().await else {
+        let Ok(permit) = self.fence.clone().acquire_owned().await else {
             return Verdict::Mismatch;
         };
         let engine = self.engine.clone();
-        tokio::task::spawn_blocking(move || engine.verify(password.as_bytes(), &stored))
-            .await
-            .unwrap_or(Verdict::Mismatch)
+        tokio::task::spawn_blocking(move || {
+            let verdict = engine.verify(password.as_bytes(), &stored);
+            drop(permit);
+            verdict
+        })
+        .await
+        .unwrap_or(Verdict::Mismatch)
     }
 
-    /// Hash `password` (normalised), on a blocking thread, behind the fence.
+    /// Hash `password` (normalised), on a blocking thread, behind the fence (its place goes with the pass, as in
+    /// [`Hasher::verify`]).
     pub async fn hash(&self, password: Zeroizing<String>) -> Result<String, HashError> {
-        let _permit = self
+        let permit = self
             .fence
             .clone()
             .acquire_owned()
             .await
             .map_err(|_| HashError::Argon2("the hasher is shut down".into()))?;
         let engine = self.engine.clone();
-        tokio::task::spawn_blocking(move || engine.hash(password.as_bytes()))
-            .await
-            .map_err(|e| HashError::Argon2(e.to_string()))?
+        tokio::task::spawn_blocking(move || {
+            let hashed = engine.hash(password.as_bytes());
+            drop(permit);
+            hashed
+        })
+        .await
+        .map_err(|e| HashError::Argon2(e.to_string()))?
     }
 }
 
@@ -874,6 +887,50 @@ mod tests {
             gauge.most_all.load(Ordering::SeqCst) >= 2,
             "and they did run together"
         );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn the_fence_goes_on_counting_a_pass_whose_caller_went_away() {
+        for hashing in [false, true] {
+            let gauge = Gauge::new();
+            let hasher = Hasher::new(gauge.clone());
+            let mut gave_up = 0;
+            for _ in 0..12 {
+                let hasher = hasher.clone();
+                let calls_before = gauge.calls.load(Ordering::SeqCst);
+                let caller = tokio::spawn(async move {
+                    let pw = Zeroizing::new("A pw".to_string());
+                    if hashing {
+                        let _ = hasher.hash(pw).await;
+                    } else {
+                        let _ = hasher.verify(pw, "x".into()).await;
+                    }
+                });
+                // The caller goes away as soon as its pass has begun (or, when the fence is full and it is still
+                // waiting for a place, after a moment): its pass (25 ms) runs on without it.
+                let waited = std::time::Instant::now();
+                while gauge.calls.load(Ordering::SeqCst) == calls_before
+                    && waited.elapsed() < Duration::from_millis(30)
+                {
+                    tokio::task::yield_now().await;
+                }
+                caller.abort();
+                gave_up += 1;
+            }
+            tokio::time::sleep(Duration::from_millis(400)).await;
+            assert_eq!(gave_up, 12, "the callers went away");
+            assert!(
+                gauge.calls.load(Ordering::SeqCst) >= 1,
+                "and their passes began ({})",
+                gauge.calls.load(Ordering::SeqCst)
+            );
+            assert!(
+                gauge.most_all.load(Ordering::SeqCst) <= FENCE,
+                "{} passes at once ({}): the fence let a new one start while a pass of a caller that left was still running",
+                gauge.most_all.load(Ordering::SeqCst),
+                if hashing { "hash" } else { "verify" }
+            );
+        }
     }
 
     #[tokio::test]

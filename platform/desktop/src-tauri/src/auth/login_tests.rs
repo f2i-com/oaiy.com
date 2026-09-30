@@ -2584,6 +2584,45 @@ async fn a_flood_of_logins_runs_at_most_three_verifications_at_once() {
     );
 }
 
+// A client that hangs up: the request's future is dropped at its next await point, but a pass of Argon2 that has
+// started runs to its end on its blocking thread. The bound (2 + 1 passes at once, 192 MiB) and the counting of the
+// failure must hold whatever becomes of the client.
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_client_that_hangs_up_does_not_free_the_verification_bound_before_the_pass_ends() {
+    let e = Arc::new(build(Build {
+        hold: Duration::from_millis(400),
+        ..Build::default()
+    }));
+    make_owner(&e, PASSWORD).await;
+    e.engine.most.store(0, Ordering::SeqCst);
+    let mut hung_up = 0;
+    for i in 0..24u32 {
+        // Each request comes from its own address and is dropped 25 ms after it starts: long after its pass began,
+        // long before it ends.
+        let r = tokio::time::timeout(
+            Duration::from_millis(25),
+            login_as(&e, "wrong wrong wrong", &format!("198.51.100.{}", 10 + i)),
+        )
+        .await;
+        if r.is_err() {
+            hung_up += 1;
+        }
+    }
+    // Let the passes that are still running end.
+    tokio::time::sleep(Duration::from_millis(1300)).await;
+    let most = e.engine.most.load(Ordering::SeqCst);
+    assert!(
+        hung_up >= 20,
+        "the requests were really dropped ({hung_up})"
+    );
+    assert!(
+        most <= 3,
+        "{most} passes ran at once: dropping the request freed its place while its pass ran on"
+    );
+    assert!(most >= 2, "and they did overlap ({most})");
+}
+
 #[tokio::test]
 async fn the_login_allow_list_refuses_other_addresses_before_any_hashing() {
     let e = build(Build {
