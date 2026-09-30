@@ -23,12 +23,12 @@ export { isLocalHostname };
  * this computer or its network that is not a site under test is REFUSED and recorded.
  *
  * @param {import('playwright').BrowserContext} context
- * @param {{ sites: string[], refuseAfterMs?: number, answer?: (request: { url: string, method: string }) => ({ status?: number, body: unknown } | null) }} options
+ * @param {{ sites: string[], refuseAfterMs?: number, answer?: (request: { url: string, method: string }) => ({ status?: number, delay?: number, body: unknown } | null) }} options
  *   `sites`: the `host:port` of every site under test (`agent.web.localhost:PORT` ...), which are local addresses and not probes.
  *   `refuseAfterMs`: how long a request is held before it is refused (default none), for a test that looks at what a page says while
  *   its request is out. `answer`: a stand-in for what would be at that address (OAIY Desktop): given a request it returns a JSON
- *   answer, and the request is fulfilled with it in the browser and goes no further, or null to refuse it as usual. Either way the
- *   request is recorded.
+ *   answer (after `delay` ms, if it says so), and the request is fulfilled with it in the browser and goes no further, or null to refuse
+ *   it as usual. Either way the request is recorded.
  * @returns {{ attempts: string[], details: { url: string, method: string, headers: Record<string,string>, at: number }[] }} `attempts`
  *   lists every request to a local address that was made, in order, with its method: `GET http://127.0.0.1:17972/api/health`.
  *   `details` are the same, with the headers the page set (an Authorization) and when it was made.
@@ -56,6 +56,8 @@ export async function watchLocal(context, { sites, refuseAfterMs = 0, answer = n
       if (refuseAfterMs > 0) await new Promise((resolve) => setTimeout(resolve, refuseAfterMs));
       const said = answer?.({ url: route.request().url(), method: route.request().method() });
       if (said) {
+        // A slow answer (`delay`, in ms): what a page does while an OAIY that is on its way has not answered.
+        if (said.delay > 0) await new Promise((resolve) => setTimeout(resolve, said.delay));
         // The page is on another origin: what answers it has to allow that, as OAIY Desktop does.
         await route.fulfill({ status: said.status ?? 200, contentType: 'application/json', headers: { 'access-control-allow-origin': '*' }, body: JSON.stringify(said.body) }).catch(() => {});
         return;

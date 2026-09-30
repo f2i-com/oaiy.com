@@ -627,6 +627,36 @@ describe('E5: the Agent\'s boot (the review\'s F9)', () => {
   });
 });
 
+describe('E5: the welcome in OAIY\'s own window waits for OAIY, as it always did', () => {
+  // OAIY answers its discovery slowly (the engine is starting): in a tab the welcome comes a second after the look began (F9), in OAIY's own
+  // window it must not come at all when OAIY is about to be found and set up as the provider.
+  const DISCOVERY = { service: 'oaiy-studio', version: '0.1.0', endpoints: [], models: { llm: [{ id: 'qwen-4b' }] }, defaults: { llm: 'qwen-4b' }, llm: { context_tokens: 32768 } };
+  for (const delay of [1500, 2500]) {
+    it(`OAIY answering after ${delay} ms: no welcome asking for a provider comes up before it, or after`, async () => {
+      const answer = ({ url }) => {
+        const u = new URL(url);
+        if (u.port === '8080' && u.pathname === '/v1/discovery') return { delay, body: DISCOVERY };
+        return { status: 404, body: {} };
+      };
+      const { context, page } = await open('agent', { desktop: OAIY_WINDOW, answer });
+      let welcomed = false;
+      let found = false;
+      const until = Date.now() + delay + 6000;
+      while (Date.now() < until && !found) {
+        const text = (await page.locator('.chat-log').textContent({ timeout: 1000 }).catch(() => '')) ?? '';
+        if (/Welcome!/.test(text)) welcomed = true;
+        found = /Found oaiy-studio/.test(text);
+        await sleep(100);
+      }
+      await sleep(1500);
+      const text = (await page.locator('.chat-log').textContent()) ?? '';
+      assert.ok(found, `OAIY was found and set up: ${text.replace(/\s+/g, ' ').slice(0, 300)}`);
+      assert.equal(welcomed || /Welcome!/.test(text), false, 'and the welcome that asks the person to set up a provider never came up');
+      await context.close();
+    });
+  }
+});
+
 describe('E5: the flow editor\'s media (the review\'s F4)', () => {
   // What a flow from someone else can carry: the addresses its nodes show. Each host is a different local range.
   const MEDIA = {

@@ -2357,10 +2357,13 @@ With that done, Settings → Images, video and audio → Find OAIY sets it up.`)
   const sandbox = sandboxAvailable();
   if (!sandbox.ok) chat.system(`The code sandbox is unavailable: ${sandbox.reason}.`, 'error');
   else void zippModule().catch((error: unknown) => chat.system(`Could not load the Zipp engine: ${(error as Error).message}`, 'error'));
-  // Looking for OAIY is not waited for (design R4: nothing on the boot path waits for what leaves the site): a saved OAIY that does not answer
-  // (a network the person is not on) costs the page 3 s otherwise. The page draws and the desktop starts as it always did; what is found is
-  // applied when it arrives, and only the welcome below waits for it, for at most WELCOME_WAITS_MS.
+  // A tab does not wait for its look at OAIY (design R4: nothing on the boot path waits for what leaves the site): a saved OAIY that does not
+  // answer (a network the person is not on) costs the page 3 s otherwise. The page draws and the desktop starts as it always did; what is found
+  // is applied when it arrives, and only the welcome below waits for it, for at most WELCOME_WAITS_MS. OAIY's own window (and the desktop
+  // shell) waits as it always has: OAIY is on this computer and answers at once or not at all, and a welcome that asks for a provider must not
+  // come up ahead of the OAIY that is about to be found and set up as one.
   const lookedFor = lookForOaiy().catch(() => {});
+  if (DESKTOP) await lookedFor;
   renderPhoneChip();
   // What the Agent runs on (the desktop's choice: its engine, or ChatGPT), shown on the model chip. The welcome
   // below waits for it: a person whose Agent runs on ChatGPT has nothing to set up in Settings.
