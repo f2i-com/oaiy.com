@@ -386,11 +386,17 @@ pub fn describe_campaign_for_test(kept: &super::table::Filtered, rebuilt: &Rebui
 /// people skipped at planning it does the same for.
 const MAX_PEOPLE_LISTED: usize = 10;
 
-/// The most that is said of one person or of one person who was skipped (each value is cut, with how long it is; this is the whole).
-const MAX_PERSON_TEXT: usize = 700;
+/// The most characters of any one value of a person that are said (with how long it is in all). It is a cut of each value and not of
+/// the person: a value padded to any length cannot push another key of the same person out of the dry run.
+const MAX_VALUE_TEXT: usize = 100;
 
-/// The most a campaign's description says (a campaign's own words come to a few thousand characters, and ten people to seven thousand).
-pub(crate) const MAX_CAMPAIGN_TEXT: usize = 12_000;
+/// Of a person's details or answers (a key that holds several values): how many are said, and how much of each.
+const MAX_ENTRIES_SAID: usize = 3;
+const MAX_ENTRY_TEXT: usize = 50;
+
+/// The most a campaign's description says: what comes of it, everything it says (each value cut), and ten people and ten skipped (at
+/// most a thousand or so each), which come to a few thousand characters and, if all of it is as long as it may be, to twenty.
+pub(crate) const MAX_CAMPAIGN_TEXT: usize = 20_000;
 
 /// What a rebuilt person holds that is not something a model reads or that is not said of them another way (their number is what
 /// names them): not listed as their words.
@@ -405,9 +411,25 @@ fn campaign_key(kept: &super::table::Kept) -> String {
     kept.path.split("[]").enumerate().map(|(i, part)| if i == 0 { part.to_string() } else { format!("[{}]{part}", at.next().map(|n| n + 1).unwrap_or(0)) }).collect()
 }
 
+/// A value of a person as it is said: text is cut to `cut` characters, with how long it is in all.
+fn said(value: &Value, cut: usize) -> String {
+    match value {
+        Value::String(text) => {
+            let length = text.chars().count();
+            if length > cut {
+                format!("\"{}\" ({length} characters in all)", clip(text, cut))
+            } else {
+                format!("\"{text}\"")
+            }
+        }
+        other => show_value(other),
+    }
+}
+
 /// What a model reads of one person (or one person skipped at planning), by value: their name, notes and details, and for one who
-/// was done how it ended, what they said and what they answered. Every key of the person that is not an identifier or run state is
-/// said, so a key the rebuild carries is listed by construction (the test builds a person from the table and looks for each).
+/// was done how it ended, what they said and what they answered. EVERY key of the person that is not an identifier or run state is
+/// said, each with a cut of its own (see [`MAX_VALUE_TEXT`]), so a key the rebuild carries is listed by construction (the test builds
+/// a person from the table and looks for each) and a value that is padded cannot hide another.
 fn person_words(person: &Value) -> String {
     let Some(map) = person.as_object() else { return String::new() };
     let mut parts = Vec::new();
@@ -419,10 +441,10 @@ fn person_words(person: &Value) -> String {
             Value::String(s) if s.is_empty() => continue,
             Value::Object(m) if m.is_empty() => continue,
             Value::Object(m) => {
-                let more = m.len().saturating_sub(5);
-                format!("{}{}", m.iter().take(5).map(|(k, v)| format!("{} = {}", clip(k, 40), show_value(v))).collect::<Vec<_>>().join(", "), if more > 0 { format!(" and {more} more") } else { String::new() })
+                let more = m.len().saturating_sub(MAX_ENTRIES_SAID);
+                format!("{}{}", m.iter().take(MAX_ENTRIES_SAID).map(|(k, v)| format!("{} = {}", clip(k, 30), said(v, MAX_ENTRY_TEXT))).collect::<Vec<_>>().join(", "), if more > 0 { format!(" and {more} more") } else { String::new() })
             }
-            other => show_value(other),
+            other => said(other, MAX_VALUE_TEXT),
         };
         let label = match key.as_str() {
             "fields" => "details",
@@ -477,20 +499,26 @@ fn describe_campaign(kept: &super::table::Filtered, rebuilt: &Rebuilt, was: Opti
         let note = if k.path.starts_with("origin.") { " (it comes back started by the front desk)" } else { "" };
         what.push_str(&format!(" {}, {}: {}{note}.", campaign_key(k), k.row.what.to_lowercase(), show_value(&k.value)));
     }
-    // The people: what a model reads of each of the first few, and the rest counted.
+    // The people: what a model reads of each of the first few, and the rest counted. Said plainly for a list that is longer: it is a sample.
+    if people.len() > MAX_PEOPLE_LISTED {
+        what.push_str(&format!(" The people below are a sample: the first {MAX_PEOPLE_LISTED} of {}.", people.len()));
+    }
     for (at, p) in people.iter().enumerate().take(MAX_PEOPLE_LISTED) {
-        what.push_str(&format!(" Person {} ({}): {}.", at + 1, p.get("number").and_then(Value::as_str).unwrap_or("?"), clip(&person_words(p), MAX_PERSON_TEXT)));
+        what.push_str(&format!(" Person {} ({}): {}.", at + 1, p.get("number").and_then(Value::as_str).unwrap_or("?"), person_words(p)));
     }
     if people.len() > MAX_PEOPLE_LISTED {
-        what.push_str(&format!(" {} more people are not listed here; what a model reads of them (their names, notes, details and results) is read in the same way.", people.len() - MAX_PEOPLE_LISTED));
+        what.push_str(&format!(" {} more people are not listed here; what a model reads of them (their names, notes, details and results) comes back with them, and is read in the same way.", people.len() - MAX_PEOPLE_LISTED));
     }
     // The people skipped at planning: their names and why, which the report says to the Agent.
     let skipped = campaign.get("skipped").and_then(Value::as_array).map(Vec::as_slice).unwrap_or(&[]);
+    if skipped.len() > MAX_PEOPLE_LISTED {
+        what.push_str(&format!(" The people skipped at planning below are a sample: the first {MAX_PEOPLE_LISTED} of {}.", skipped.len()));
+    }
     for (at, s) in skipped.iter().enumerate().take(MAX_PEOPLE_LISTED) {
-        what.push_str(&format!(" Skipped at planning {} ({}): {}.", at + 1, s.get("number").and_then(Value::as_str).unwrap_or("?"), clip(&person_words(s), MAX_PERSON_TEXT)));
+        what.push_str(&format!(" Skipped at planning {} ({}): {}.", at + 1, s.get("number").and_then(Value::as_str).unwrap_or("?"), person_words(s)));
     }
     if skipped.len() > MAX_PEOPLE_LISTED {
-        what.push_str(&format!(" {} more people skipped at planning are not listed here.", skipped.len() - MAX_PEOPLE_LISTED));
+        what.push_str(&format!(" {} more people skipped at planning are not listed here (their reasons are one of the Agent's, or \"{REASON_OTHER}\").", skipped.len() - MAX_PEOPLE_LISTED));
     }
     what
 }

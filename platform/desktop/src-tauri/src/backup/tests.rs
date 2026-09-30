@@ -7337,6 +7337,60 @@ fn a_campaigns_dry_run_names_ten_people_with_notes_and_counts_the_rest() {
     assert!(!said.contains("Skipped name 11") && said.contains("2 more people skipped at planning are not listed here"), "{said}");
 }
 
+/// The reviewer's x6c: a person's keys were said in alphabetical order and the whole person was cut at 700 characters, so a value padded
+/// to any length (`answers`, which comes first) pushed the notes, the summary and the reason out of the dry run. Every key of a person is
+/// said, each cut to its own length, so no value hides another.
+#[test]
+fn a_padded_value_of_a_person_does_not_hide_another_key_of_the_same_person() {
+    let keys = super::table::table().key_table("agent.campaign").unwrap();
+    let (long, field) = ("x".repeat(1000), "f".repeat(200));
+    let person = |n: usize| {
+        serde_json::json!({
+            "id": format!("p{n}"), "name": format!("NAME-{n}-MARK {}", "n".repeat(60)), "number": format!("+6140000{n:04}"), "state": "done", "outcome": format!("OUTCOME-{n}-MARK"),
+            "answers": { "a1": long, "a2": long, "a3": long, "a4": long, "a5": long, "a6": long },
+            "fields": { "f1": field, "f2": field, "f3": field, "f4": field, "f5": field },
+            "notes": format!("NOTES-{n}-MARK {}", "y".repeat(250)), "summary": format!("SUMMARY-{n}-MARK {}", "z".repeat(4900)), "why": format!("WHY-{n}-MARK {}", "w".repeat(250)),
+        })
+    };
+    let people: Vec<serde_json::Value> = (1..=10).map(person).collect();
+    let skipped: Vec<serde_json::Value> = (1..=10).map(|n| serde_json::json!({ "name": format!("SKIPPED-{n}-MARK {}", "k".repeat(150)), "number": format!("+6150000{n:04}"), "why": "asked not to be contacted" })).collect();
+    let doc = serde_json::json!({ "id": "pad", "kind": "text", "name": "Padded", "state": "paused", "textTemplate": "hello", "people": people, "skipped": skipped });
+    let kept = super::table::filter_json(keys, &doc, &|_| true);
+    let rebuilt = super::agentzip::rebuild_campaign(&kept.value, None).unwrap();
+    let said = super::agentzip::describe_campaign_for_test(&kept, &rebuilt, None);
+    for n in 1..=10 {
+        for key in ["NAME", "OUTCOME", "NOTES", "SUMMARY", "WHY"] {
+            assert!(said.contains(&format!("{key}-{n}-MARK")), "{key} of person {n} is said, though the values beside it are long: {said}");
+        }
+        assert!(said.contains(&format!("SKIPPED-{n}-MARK")), "{n}");
+    }
+    // Each value is cut, with how long it is, and a map says how many entries it does not.
+    assert!(said.contains("(4915 characters in all)") && said.contains("and 3 more") && said.contains("and 2 more"), "{said}");
+    // Ten people as long as they may be do not push each other out, or the state of the campaign: nothing here was cut at the end.
+    assert!(!said.ends_with('…') && said.chars().count() < super::agentzip::MAX_CAMPAIGN_TEXT, "{} characters", said.chars().count());
+    assert!(said.contains("Person 10 (") && said.contains("Skipped at planning 10 ("), "{said}");
+}
+
+/// A list of people that is longer than the ten the dry run says is a sample, and it is said so plainly (a list of ten or fewer is not).
+#[test]
+fn a_campaigns_dry_run_says_that_the_people_it_lists_are_a_sample_when_there_are_more() {
+    let keys = super::table::table().key_table("agent.campaign").unwrap();
+    let describe = |people: usize, skipped: usize| {
+        let people: Vec<serde_json::Value> = (0..people).map(|i| serde_json::json!({ "id": format!("p{i}"), "name": format!("Person {i}"), "number": format!("+6140000{i:04}"), "state": "queued" })).collect();
+        let skipped: Vec<serde_json::Value> = (0..skipped).map(|i| serde_json::json!({ "name": format!("Aside {i}"), "number": format!("+6150000{i:04}"), "why": "other" })).collect();
+        let doc = serde_json::json!({ "id": "s", "kind": "text", "name": "S", "state": "paused", "textTemplate": "hello", "people": people, "skipped": skipped });
+        let kept = super::table::filter_json(keys, &doc, &|_| true);
+        let rebuilt = super::agentzip::rebuild_campaign(&kept.value, None).unwrap();
+        super::agentzip::describe_campaign_for_test(&kept, &rebuilt, None)
+    };
+    let few = describe(10, 10);
+    assert!(!few.contains("sample") && !few.contains("not listed here"), "{few}");
+    let many = describe(14, 12);
+    assert!(many.contains("The people below are a sample: the first 10 of 14."), "{many}");
+    assert!(many.contains("The people skipped at planning below are a sample: the first 10 of 12."), "{many}");
+    assert!(many.contains("4 more people are not listed here") && many.contains("2 more people skipped at planning are not listed here"), "{many}");
+}
+
 /// The reviewer's x6: every piece of text a model reads in a campaign is in the dry run. Built from the key table, so that a key of a
 /// person or of a skipped person that the table lets through and that holds words cannot be left out of the dry run (or out of the
 /// campaign that is rebuilt) without this test saying so.
@@ -7468,7 +7522,13 @@ fn a_call_campaigns_dry_run_lists_its_opening_line_and_the_voicemail_it_leaves()
 #[test]
 fn what_comes_of_a_campaign_survives_the_cut_of_a_description_that_is_too_long() {
     let people: Vec<serde_json::Value> = (0..12)
-        .map(|i| serde_json::json!({ "id": format!("p{i}"), "name": format!("Name {i} {}", "n".repeat(60)), "number": format!("+6140000{i:04}"), "state": "done", "notes": "n".repeat(300), "summary": "s".repeat(600), "outcome": "answered", "why": "w".repeat(200), "answers": { "a": "x".repeat(400), "b": "y".repeat(400) }, "fields": { "first_name": "f".repeat(200), "second_name": "g".repeat(200) } }))
+        .map(|i| {
+            let (answers, fields): (serde_json::Map<String, serde_json::Value>, serde_json::Map<String, serde_json::Value>) = (
+                (0..4).map(|k| (format!("an_answer_with_a_long_key_number_{k}"), serde_json::json!("x".repeat(400)))).collect(),
+                (0..4).map(|k| (format!("a_detail_with_long_key_{k}_"), serde_json::json!("f".repeat(200)))).collect(),
+            );
+            serde_json::json!({ "id": format!("p{i}"), "name": format!("Name {i} {}", "n".repeat(70)), "number": format!("+6140000{i:04}"), "state": "done", "notes": "n".repeat(300), "summary": "s".repeat(600), "outcome": "answered", "why": "w".repeat(200), "answers": answers, "fields": fields })
+        })
         .collect();
     let skipped: Vec<serde_json::Value> = (0..12).map(|i| serde_json::json!({ "name": format!("Skipped {i} {}", "k".repeat(150)), "number": format!("+6150000{i:04}"), "why": "z".repeat(300) })).collect();
     let campaign = serde_json::json!({

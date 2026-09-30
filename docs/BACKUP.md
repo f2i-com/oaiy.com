@@ -677,15 +677,21 @@ in parts through internal routes with a secret made for that one backup.
   each knowledge file, what the phone's agents remember about people, each outreach campaign by
   name with how many people it would contact and **every key of it that acts, by value** (what it
   says to them: the objective, the text or the opening line, the questions, the voicemail; what it
-  does afterwards; who it speaks as; who said they started it; when it tries and how often; and
-  what a model reads of the people: the name, notes and details of each, and for one who was
-  done how it ended, what they said and what they answered, for ten of them, and the same for ten
-  of the people skipped at planning (their names and why, which the report of the campaign says to
-  the Agent), with the rest of each counted; **why is never free text**: it is one of the reasons the
+  does afterwards; who it speaks as; who said they started it; when it tries and how often) **and
+  a sample of its people, not all of them**: the first ten people, with every key of each (the name,
+  notes and details, and for one who was done how it ended, what they said and what they answered),
+  and the first ten of the people skipped at planning (their names and why, which the report of the
+  campaign says to the Agent), while **every other person is only counted**. Each value is cut to
+  a length of its own with how long it is in all (a hundred characters, and three of the entries of
+  a person's details or answers), so a long value cannot push another key of the same person out; and
+  a list of more than ten people says plainly in the dry run that what it lists is a sample. What a model
+  reads of the people that are not listed comes back with them and is read the same way: **the dry run
+  cannot show it**, so a campaign of more people than that comes back paused, and is to be read in the
+  Agent before you start it. **Why is never free text**: it is one of the reasons the
   Agent gives when it plans a campaign (not a full phone number, on the phone's blocked list, not a
   number the phone answers, asked not to be contacted) or `other`, for every person set aside and
   not only the ones the dry run shows, and the dry run and the result say how many were replaced.
-  A reason that names another campaign ("already texted in ...") comes back as `other`), and the Agent's
+  A reason that names another campaign ("already texted in ...") comes back as `other`. The dry run also lists the Agent's
   settings key by key with their values (the instructions with their full length). It says what is not restored
   and why, and every name it does not know is "not restored: unknown item". The archive that is
   prepared is recorded with its size and SHA-256 and held to them like a staged data file is: when
