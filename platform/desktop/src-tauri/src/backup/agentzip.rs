@@ -39,9 +39,10 @@ use crate::secret_file;
 const MAX_QUOTE_BYTES: u64 = 64 << 10;
 /// The most items listed by name for one kind of file before the rest are counted.
 const MAX_NAMED: usize = 300;
-/// The most numbers not to be contacted that come back (the page adds them to its own).
-/// The most numbers not to be contacted that one restore brings (the page adds them to the list it has, and holds to the same bound).
-pub const MAX_DO_NOT_CONTACT: usize = 5_000;
+/// The most numbers not to be contacted that one restore brings, each once (the page adds them to the list it has, and holds to the
+/// same bound on the numbers it ADDS). A person's list of opt-outs can run to tens of thousands: a restore that could not take it all
+/// would leave someone who opted out to be contacted, so the bound is a defence against a hostile file, not a limit a real list meets.
+pub const MAX_DO_NOT_CONTACT: usize = 50_000;
 
 /// A name inside the Agent's archive that is a plain relative path.
 pub fn safe_name(name: &str) -> bool {

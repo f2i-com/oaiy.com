@@ -562,8 +562,13 @@ const MODES: readonly ItemMode[] = ['replace', 'union', 'campaign', 'campaign-in
 const OUTREACH = 'opfs/front-desk/outreach/';
 /** The numbers not to be called or texted again. */
 export const DO_NOT_CONTACT = `${OUTREACH}do-not-contact.json`;
-/** The most numbers a restore adds to the list of numbers not to be contacted (the desktop hands over no more than this, and the page holds to it). */
-export const MAX_DO_NOT_CONTACT_ADDED = 5000;
+/**
+ * The most numbers a restore adds to the list of numbers not to be contacted (the desktop hands over no more than this, and the page
+ * holds to it). It counts the numbers that are ADDED, not the numbers that are read: a number already on the list does not use it up,
+ * so a list of more than this is added a part at a time, and never stops short of a number that is new. (A list of a person's opt-outs
+ * that runs to tens of thousands is a real one; a restore that could not take it all would leave someone who opted out to be contacted.)
+ */
+export const MAX_DO_NOT_CONTACT_ADDED = 50_000;
 /** The list of campaigns. */
 export const CAMPAIGN_INDEX = `${OUTREACH}index.json`;
 /** The archive's own record of what it brings back. */
@@ -1016,17 +1021,23 @@ async function unionDoNotContact(storage: AgentStorage, item: Item, data: Uint8A
   // 40 s for 8,000 numbers, in a page that waits for this before it opens anything).
   const here = new PersonIndex();
   for (const have of list) if (isObject(have) && typeof have.number === 'string') here.add(have.number);
-  const coming = incoming.length > MAX_DO_NOT_CONTACT_ADDED ? incoming.slice(0, MAX_DO_NOT_CONTACT_ADDED) : incoming;
-  const warn = incoming.length > coming.length ? `${(incoming.length - coming.length).toLocaleString()} of the numbers not to be contacted in the backup were left out: at most ${MAX_DO_NOT_CONTACT_ADDED.toLocaleString()} are added at once.` : undefined;
-  for (const entry of coming) {
+  // Every number that comes is looked at (in constant time each); the ones that are new are added until the most a restore adds, and the
+  // rest of the new ones are counted.
+  let over = 0;
+  for (const entry of incoming) {
     if (!isObject(entry)) continue;
     const number = text(entry.number, 40);
     if (!number || [...number].some((c) => c < ' ')) continue;
     if (here.has(number)) continue;
+    if (list.length - before >= MAX_DO_NOT_CONTACT_ADDED) {
+      over++;
+      continue;
+    }
     const at = typeof entry.at === 'number' && Number.isFinite(entry.at) && entry.at >= 0 ? entry.at : 0;
     list.push({ number, at, why: text(entry.why, 300) ?? '' });
     here.add(number);
   }
+  const warn = over > 0 ? `${over.toLocaleString()} of the numbers not to be contacted in the backup were left out: at most ${MAX_DO_NOT_CONTACT_ADDED.toLocaleString()} are added at once.` : undefined;
   // Nothing to add: the file that is here is left as it is.
   if (list.length === before) return warn ? { warn } : {};
   return { data: new TextEncoder().encode(JSON.stringify(list)), ...(warn ? { warn } : {}) };

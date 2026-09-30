@@ -1644,6 +1644,28 @@ describe('the numbers not to be contacted only grow', () => {
     expect(list(small)).toHaveLength(8000 + 2500);
   });
 
+  it('counts the numbers it adds against the most a restore may add, not the numbers it reads (the reviewer’s F8)', async () => {
+    const number = (i: number) => `+61${400_000_000 + i}`;
+    // A long run of numbers that are here already, and then three that are new: the run does not use up what a restore may add.
+    const here = Array.from({ length: MAX_DO_NOT_CONTACT_ADDED + 10 }, (_, i) => ({ number: number(i), at: 1, why: 'asked' }));
+    const target = new FakeStorage().put(PATH, JSON.stringify(here));
+    const coming = [...here.map((h) => ({ ...h, why: 'again' })), { number: '0499 000 001', at: 2, why: 'new' }, { number: '0499 000 002', at: 2, why: 'new' }, { number: '0499 000 003', at: 2, why: 'new' }];
+    const outcome = await restore(target, coming);
+    expect(outcome!.ok).toBe(true);
+    const after = list(target);
+    expect(after).toHaveLength(here.length + 3);
+    expect(after.slice(here.length).map((d) => d.number)).toEqual(['0499 000 001', '0499 000 002', '0499 000 003']);
+    expect(outcome!.warnings.join('\n')).not.toContain('left out');
+    // Many that are new, with some that are here between them: the most is added, the rest of the new ones are counted, and the ones
+    // that are here are not counted at all.
+    const empty = new FakeStorage().put(PATH, JSON.stringify([{ number: number(7), at: 1, why: 'asked' }]));
+    const many = Array.from({ length: MAX_DO_NOT_CONTACT_ADDED + 9 }, (_, i) => ({ number: number(1_000_000 + i), at: 1, why: 'x' }));
+    many.splice(3, 0, { number: number(7), at: 1, why: 'here' }, { number: number(7), at: 1, why: 'here' });
+    const again = await restore(empty, many);
+    expect(list(empty)).toHaveLength(1 + MAX_DO_NOT_CONTACT_ADDED);
+    expect(again!.warnings.join('\n')).toContain('9 of the numbers not to be contacted in the backup were left out');
+  });
+
   it('adds nothing beyond what a restore may add at once, and says how many were left out', async () => {
     const target = new FakeStorage();
     const many = Array.from({ length: MAX_DO_NOT_CONTACT_ADDED + 3 }, (_, i) => ({ number: `+61${500_000_000 + i}`, at: 1, why: 'x' }));

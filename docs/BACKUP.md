@@ -678,11 +678,14 @@ in parts through internal routes with a secret made for that one backup.
   when it is handed to the page (the result says that it was not), and where the page first asks
   for it (a hand-over that changed on the disk is dropped, and the result says so).
 - **Nothing ticked** brings back only the numbers not to be called or texted again (which are
-  *added* to yours: none of yours is ever taken away, on a restore or an undo). At most **5,000**
+  *added* to yours: none of yours is ever taken away, on a restore or an undo). At most **50,000**
   numbers come back in one restore, each once (the same digits written another way are one
   number, and the desktop says how many it counted once and how many it left out); the Agent's
   page then adds the ones that are not already on your list, person by person, in constant time
-  each: a list of a hundred thousand is a moment's work for it, where comparing each number with
+  each, and **only the numbers it adds count against its own 50,000**, not the ones it reads (a
+  number that is on your list already uses nothing up, so a list of opt-outs that runs to tens of
+  thousands comes back whole, and one beyond that is added a part at a time; what was left out is
+  said): a list of a hundred thousand is a moment's work for it, where comparing each number with
   the whole list took 40 seconds for 8,000, in a page that opens nothing until it is done.
   **Agent data** (projects, the brief and knowledge files), **Earlier conversations** (the phone's
   call and text threads, which the receptionist loads as what was said before), **Memory** (what

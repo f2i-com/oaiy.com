@@ -3246,6 +3246,30 @@ fn a_service_without_a_name_or_a_length_is_left_out_and_the_rest_of_the_calendar
     assert_eq!(book["settings"]["business"], "Only bad");
 }
 
+/// The cap counts the numbers that come back, once each: numbers that repeat one already taken (however they are written) do not
+/// use it up, so a list of a person's real size (tens of thousands) is handed over whole, and only a list beyond it is cut.
+#[test]
+fn a_list_of_numbers_not_to_be_contacted_of_a_real_size_comes_whole_and_repeats_do_not_use_up_the_cap() {
+    use super::agentzip::{clean_do_not_contact, MAX_DO_NOT_CONTACT};
+    assert_eq!(MAX_DO_NOT_CONTACT, 50_000);
+    let entry = |i: usize| serde_json::json!({ "number": format!("+61{}", 400_000_000 + i), "at": 1, "why": "asked" });
+    // Twenty thousand opt-outs, each written twice (with a space, so the same digits), then a few more: all come.
+    let mut list: Vec<serde_json::Value> = Vec::new();
+    for i in 0..20_000 {
+        list.push(entry(i));
+        list.push(serde_json::json!({ "number": format!("+61 {}", 400_000_000 + i), "at": 2, "why": "again" }));
+    }
+    list.extend((20_000..20_005).map(entry));
+    let cleaned = clean_do_not_contact(&serde_json::Value::Array(list)).unwrap();
+    assert_eq!((cleaned.entries.len(), cleaned.repeated, cleaned.over), (20_005, 20_000, 0));
+    // More than the cap of new numbers, with repeats between them: the first 50,000 come, the rest are counted, the repeats are not.
+    let mut list: Vec<serde_json::Value> = (0..MAX_DO_NOT_CONTACT + 7).map(entry).collect();
+    list.insert(10, entry(3));
+    list.insert(MAX_DO_NOT_CONTACT + 4, entry(4));
+    let cleaned = clean_do_not_contact(&serde_json::Value::Array(list)).unwrap();
+    assert_eq!((cleaned.entries.len(), cleaned.repeated, cleaned.over), (MAX_DO_NOT_CONTACT, 2, 7));
+}
+
 /// The numbers not to be contacted that the desktop hands to the page are entries of the shape the Agent writes, each number once.
 #[test]
 fn the_numbers_not_to_be_contacted_are_cut_to_entries_of_the_shape_the_agent_writes() {
@@ -6303,7 +6327,7 @@ fn the_table_covers_every_extension_of_a_voice_clip() {
 
 /// The reviewer's list of numbers not to be contacted: a hundred thousand entries fit the size a file may be (about 5 MB), and the
 /// page compared each with the list it had (hours). What is handed to the page is cut here to a list a person could have made:
-/// each number once, however it is written (the same digits), and at most 5,000.
+/// each number once, however it is written (the same digits), and at most 50,000.
 #[test]
 fn a_huge_list_of_numbers_not_to_be_contacted_is_cleaned_before_the_page_is_given_it() {
     let mut list: Vec<serde_json::Value> = Vec::with_capacity(100_000);
@@ -6326,13 +6350,13 @@ fn a_huge_list_of_numbers_not_to_be_contacted_is_cleaned_before_the_page_is_give
     eprintln!("a hundred thousand numbers not to be contacted, prepared: {} MiB, {took:?}", peak / MIB);
     assert!(took < std::time::Duration::from_secs(20) && peak < 192 * MIB, "{} MiB in {took:?}", peak / MIB);
     assert!(staged.skipped.iter().any(|n| n.contains("40000 entries") && n.contains("repeated a number")), "{:?}", staged.skipped);
-    assert!(staged.skipped.iter().any(|n| n.contains("55000 more of the numbers not to be contacted were left out") && n.contains("5000")), "{:?}", staged.skipped);
+    assert!(staged.skipped.iter().any(|n| n.contains("10000 more of the numbers not to be contacted were left out") && n.contains("50000")), "{:?}", staged.skipped);
     assert!(matches!(restore::apply_pending(&dst.0), ApplyOutcome::Applied(_)));
     let handed = zip_entries(&handed_over(&dst.0));
     let cleaned: Vec<serde_json::Value> = serde_json::from_slice(&handed["opfs/front-desk/outreach/do-not-contact.json"]).unwrap();
-    assert_eq!(cleaned.len(), 5000);
+    assert_eq!(cleaned.len(), 50_000);
     let numbers: std::collections::HashSet<&str> = cleaned.iter().map(|e| e["number"].as_str().unwrap()).collect();
-    assert_eq!(numbers.len(), 5000, "each number once");
+    assert_eq!(numbers.len(), 50_000, "each number once");
     assert!(cleaned.iter().all(|e| e["why"].as_str().is_some_and(|w| w.len() <= 300) && e["at"].is_number()));
 }
 
