@@ -1,0 +1,14 @@
+[package]
+name = "oaiy-keystore"
+version = "0.1.0"
+edition = "2021"
+license = "Apache-2.0"
+description = "K1, the named-secret keystore of the OAIY desktop: Windows DPAPI files and a strict keyfile, fail closed, the name bound into every blob"
+publish = false
+
+[dependencies]
+oaiy-crypto = { path = "../oaiy-crypto" }
+zeroize = "1.8.2"
+
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.61", features = ["Win32_Foundation", "Win32_Security_Cryptography"] }

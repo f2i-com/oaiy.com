@@ -56,6 +56,7 @@ members = [
     # so members and not default members, like oaiy-media: nothing links them
     # yet, and `cargo test -p oaiy-crypto -p oaiy-keystore` runs them.
     "crates/oaiy-crypto",
+    "crates/oaiy-keystore",
 ]
 default-members = [
     "crates/oaiy-engine",

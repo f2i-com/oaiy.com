@@ -1787,6 +1787,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "oaiy-keystore"
+version = "0.1.0"
+dependencies = [
+ "oaiy-crypto",
+ "windows-sys",
+ "zeroize",
+]
+
+[[package]]
 name = "oaiy-llm-cli"
 version = "0.7.0"
 dependencies = [
