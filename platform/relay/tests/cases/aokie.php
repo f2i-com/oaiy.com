@@ -650,6 +650,39 @@ test('4.14.4 the byte limit works the same way: a quarter of mailboxBytes for on
     eq(429, $k->send($plug, 'mobile:' . $k->thumb($c), [$f])['status'], 'and no more than the mailbox');
 });
 
+test('4.14.4 four processes posting to the plugin\'s mailbox at once never skip or repeat a seq, and each sender ends with exactly its quarter of the mailbox', function () {
+    [$k, $a, $b, $plug] = aok_pair();
+    $script = $k->r->dir . '/frames.php';
+    file_put_contents($script, '<?php
+define("OAIY_RELAY", true);
+require ' . var_export(dirname(__DIR__, 2) . '/src/autoload.php', true) . ';
+$ctx = Oaiy\Relay\Context::open($argv[1]);
+$ok = 0;
+for ($i = 1; $i <= (int)$argv[4]; $i++) {
+    try { Oaiy\Relay\Party::append($ctx, $argv[2], $argv[3], "dev-x", ["state_read"], ["{}"], true); $ok++; }
+    catch (Oaiy\Relay\ApiError $e) { if ($e->errorCode !== "relay_backpressure") { fwrite(STDERR, $e->errorCode . "\n"); } }
+    catch (Throwable $e) { fwrite(STDERR, get_class($e) . ": " . $e->getMessage() . "\n"); }
+}
+echo $ok, "\n";
+');
+    $mailbox = 'app:aokie@' . $k->desk->id . '/plugin';
+    $procs = [];
+    foreach (['mobile:a', 'mobile:b', 'mobile:c', 'mobile:d'] as $sender) {
+        $procs[$sender] = [proc_open(array_merge([PHP_BINARY], \OaiyTest\Server::phpFlags(), [$script, $k->r->data, $mailbox, $sender, '300']), [1 => ['pipe', 'w'], 2 => ['pipe', 'w']], $pipes), $pipes];
+    }
+    $stored = [];
+    foreach ($procs as $sender => [$p, $pipes]) {
+        $stored[$sender] = (int)trim((string)stream_get_contents($pipes[1]));
+        eq('', trim((string)stream_get_contents($pipes[2])), "$sender: nothing but backpressure went wrong");
+        proc_close($p);
+    }
+    eq(['mobile:a' => 256, 'mobile:b' => 256, 'mobile:c' => 256, 'mobile:d' => 256], $stored, 'a quarter of 1,024 each');
+    $db = $k->r->ctx()->db;
+    $seqs = array_map('intval', array_column($db->all('SELECT seq FROM items WHERE mailbox = ? ORDER BY seq', [$mailbox]), 'seq'));
+    eq(range(1, 1024), $seqs, 'every seq once, no gap');
+    eq(1024, (int)$db->val('SELECT live_items FROM mailboxes WHERE id = ?', [$mailbox]));
+});
+
 test('4.14.4 the sig lane is not reachable through the native routes: POST /v1/items to it is refused and GET /v1/poll never returns a frame', function () {
     [$k, $a, $b, $plug, $ta] = aok_pair();
     $k->send($ta, 'plugin', [['n' => 1]]);

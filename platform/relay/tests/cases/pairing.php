@@ -762,6 +762,45 @@ test('4.10.3 step 8: a phone key of small order is 422 unprocessable (every X255
     eq(200, $c->decide()['status'], 'an honest approval still works');
 });
 
+test('4.10.3 step 8: a phone that ANSWERED with a key of small order (so the approval names the same key, with an honest thumbprint and a receipt) is refused too: 422, nothing created', function () {
+    foreach (['ed25519', 'x25519'] as $which) {
+        [$r, $d, $c] = pair_setup();
+        $small = hex2bin('0100000000000000000000000000000000000000000000000000000000000000');
+        $th = Crypto::thumbprint($small);
+        $claims = $c->claims();
+        if ($which === 'ed25519') {
+            $claims['mobileEndpointKey'] = ['algorithm' => 'ed25519', 'publicKey' => B64::enc($small), 'thumbprint' => $th];
+        } else {
+            $claims['mobileX25519'] = B64::enc($small);
+        }
+        $c->open();
+        eq(202, $c->answer($c->responseText($claims))['status']);
+        $phoneTh = $which === 'ed25519' ? $th : $c->phoneThumb();
+        $grants = Grants::DEFAULT;
+        $iat = $c->issuedAt + 40;
+        $text = Pairing::receiptText($c->app, $grants, $iat, $phoneTh, $c->pid);
+        $sig = B64::enc(Crypto::sign(Crypto::signKeypairFromSeed($c->deskSeed)[1], Pairing::RECEIPT_DOMAIN . $text));
+        $doc = ['approve' => true, 'phone' => ['ed25519' => $which === 'ed25519' ? B64::enc($small) : B64::enc($c->phonePk), 'x25519' => $which === 'x25519' ? B64::enc($small) : B64::enc($c->phoneXPk), 'thumbprint' => $phoneTh],
+            'name' => 'Phone', 'appId' => $c->app, 'grants' => $grants, 'receipt' => ['issuedAt' => $iat, 'signature' => $sig]];
+        $res = $c->decide($doc);
+        eq([422, 'unprocessable'], [$res['status'], pair_code($res)], "$which: " . $res['body']);
+        eq(0, pair_phones($r, $d, false), "$which: no device was created");
+        eq('answered', pair_row($r, $c->pid)['state']);
+    }
+});
+
+test('4.10.3 step 7: an approval that names another app than the rendezvous is 422 even with a receipt that verifies for the rendezvous\'s own app', function () {
+    [$r, $d, $c] = pair_setup();
+    $c->open();
+    $c->answer();
+    $doc = $c->decisionDoc();
+    $doc['appId'] = 'other';
+    $res = $c->decide($doc);
+    eq([422, 'unprocessable'], [$res['status'], pair_code($res)], $res['body']);
+    eq(0, pair_phones($r, $d, false));
+    eq(200, $c->decide()['status'], 'the honest approval still works');
+});
+
 test('4.10.3 step 7: the approval must be the phone that answered: other keys than the response\'s are 422 (a desktop that mixes up two phones seals a token to the wrong one)', function () {
     [$r, $d, $c] = pair_setup();
     $c->open();
