@@ -205,6 +205,27 @@ test('4.7.1 a pairing-wait marker stamped more than a minute ahead (a clock that
     eq(1, \Oaiy\Relay\AddressHolds::collect($r->data), 'the collector removes it too');
 });
 
+test('4.7.1 an address\'s pairing-wait markers are stamped with the relay\'s own clock too: a data folder whose clock is off PHP\'s does not make the four-wait limit bind on nothing', function () {
+    $r = Relay::make();
+    foreach ([300, -300, 7200, -7200] as $off) {
+        $clock = fn() => time() + $off;
+        $addr = '203.0.113.' . (40 + (int)abs($off / 300));
+        $held = [];
+        for ($i = 0; $i < 4; $i++) {
+            $held[] = \Oaiy\Relay\AddressHolds::acquire($r->data, 'pair', $addr, 20, 4, $clock);
+        }
+        eq(4, \Oaiy\Relay\AddressHolds::count($r->data, 'pair', $addr, $clock), "four waits count with the filesystem $off seconds off");
+        $e = throws(fn() => \Oaiy\Relay\AddressHolds::acquire($r->data, 'pair', $addr, 20, 4, $clock), \Oaiy\Relay\ApiError::class);
+        eq(['rate_limited', 429], [$e->errorCode, $e->status], "the fifth is refused with the filesystem $off seconds off");
+        eq(0, \Oaiy\Relay\AddressHolds::collect($r->data, $clock), 'the collector leaves live markers alone');
+        eq(4, \Oaiy\Relay\AddressHolds::count($r->data, 'pair', $addr, $clock));
+        foreach ($held as $h) {
+            $h->release();
+        }
+        eq(0, \Oaiy\Relay\AddressHolds::count($r->data, 'pair', $addr, $clock));
+    }
+});
+
 test('4.7.1 the address limit is 4 held waits, not 4 requests: a request that only asked for wait=0 or for a state that had already changed holds no slot', function () {
     [$r, $d, $c] = pair_setup(['wait' => ['max' => 1]]);
     $c->open();

@@ -13,7 +13,9 @@ defined('OAIY_RELAY') or exit;
  * of other principals second, and if a limit is exceeded deletes its own marker and is refused. Create-then-count is
  * what stops two concurrent fifth holds both passing, which count-then-create allows. A marker names its own cap, is
  * refreshed every 5 seconds, is ignored once older than cap + 5 seconds (a crashed request ages out), and is removed
- * by the hold itself and by a shutdown function.
+ * by the hold itself and by a shutdown function. A marker's time is set from PHP's clock (Hold), never left to the
+ * filesystem's, so a data folder on a share whose clock is off PHP's does not make every marker look stale or from the
+ * future and leave the pool's caps counting nothing.
  *
  * Limits, with W the worker pool (5 until measured): held_soft = max(2, floor(0.6 W)), held_hard = max(3, W - 1).
  * An edge hold is refused when the live count of the others is at or above the soft limit, a core hold at the hard
@@ -40,11 +42,14 @@ final class Holds
 
     private string $dir;
     private Effective $eff;
+    private \Closure $clock;
 
-    public function __construct(string $dataDir, Effective $eff)
+    /** @param callable|null $clock seconds since the epoch that markers are stamped and judged with: time() (a test passes another) */
+    public function __construct(string $dataDir, Effective $eff, ?callable $clock = null)
     {
         $this->dir = rtrim($dataDir, '/') . '/holds';
         $this->eff = $eff;
+        $this->clock = \Closure::fromCallable($clock ?? 'time');
     }
 
     /**
@@ -76,7 +81,7 @@ final class Holds
             // Cannot record the hold: refuse it, which degrades the caller to a short poll. Fail closed.
             return null;
         }
-        $hold = new Hold($file, $capS);
+        $hold = new Hold($file, $capS, $this->clock); // stamps the marker from the relay's clock, not the filesystem's
         // Count what the others pin. A principal that may hold only one request at a time (every kind but lookup) pins one
         // worker however many markers it has: a second marker is a hold being superseded, which ends within 250 ms.
         $distinct = [];
@@ -130,13 +135,13 @@ final class Holds
         }
         $pdir = $this->dir . '/' . $kind . '/' . Signals::hash($principal);
         $n = 0;
-        $now = time();
+        $now = (int)($this->clock)();
         foreach (glob($pdir . '/*') ?: [] as $f) {
             if (!preg_match('/^(\d{1,4})\.[0-9a-f]{12}$/D', basename($f), $m)) {
                 continue;
             }
             $mt = @filemtime($f);
-            if ($mt === false || $mt + (int)$m[1] + 5 < $now || $mt > $now + 60) {
+            if ($mt === false || Hold::isStale($mt, (int)$m[1], $now)) {
                 continue; // stale (a crashed request's) or from a clock that stepped back: liveMarkers() removes it
             }
             $n++;
@@ -162,7 +167,7 @@ final class Holds
     public function liveMarkers(): array
     {
         $out = [];
-        $now = time();
+        $now = (int)($this->clock)();
         foreach (self::KINDS as $kind) {
             foreach (glob($this->dir . '/' . $kind . '/*', GLOB_ONLYDIR) ?: [] as $pdir) {
                 foreach (glob($pdir . '/*') ?: [] as $f) {
@@ -175,7 +180,7 @@ final class Holds
                         continue;
                     }
                     // Stale: older than its cap plus five seconds, or stamped more than a minute ahead (a clock that stepped back).
-                    if ($mt + (int)$m[1] + 5 < $now || $mt > $now + 60) {
+                    if (Hold::isStale($mt, (int)$m[1], $now)) {
                         @unlink($f);
                         continue;
                     }

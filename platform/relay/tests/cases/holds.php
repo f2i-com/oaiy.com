@@ -169,6 +169,40 @@ test('4.7.2 rule 1: a marker stamped more than a minute ahead (a clock that step
     ok(!is_file($ahead) && is_file($skew));
 });
 
+test('4.7.2 rule 1: a marker is stamped with the relay\'s own clock, so a data folder whose clock is minutes or hours off PHP\'s (a network share) does not make every hold invisible, and the pool caps still bind', function () {
+    $r = Relay::make();
+    // A filesystem whose clock differs from PHP's is a PHP clock that differs from the stamp the filesystem puts on a new file.
+    // The test process cannot change either, so the clock the registry reads is one that is $off seconds from the real one.
+    foreach ([300, -300, 7200, -7200] as $off) {
+        $h = new Holds($r->data, $r->ctx()->eff, fn() => time() + $off); // soft 3
+        $held = [];
+        foreach (['a', 'b', 'c'] as $p) {
+            $held[$p] = $h->acquire('poll', "dev-$p-$off", 'edge', 20);
+            ok($held[$p] !== null, "edge hold $p is granted with the filesystem $off seconds off");
+        }
+        eq(3, $h->liveCount(), "the three markers count with the filesystem $off seconds off");
+        eq(null, $h->acquire('poll', "dev-d-$off", 'edge', 20), "the fourth is refused with the filesystem $off seconds off: the cap binds");
+        eq(1, $h->inFlight('poll', "dev-a-$off"), 'and in flight counts too');
+        foreach (glob($r->data . '/holds/poll/*/*') ?: [] as $f) {
+            ok(abs(filemtime($f) - (time() + $off)) <= 3, 'the marker carries the relay\'s clock, not the filesystem\'s');
+        }
+        // The heartbeat is stamped the same way.
+        $ref = new ReflectionProperty(\Oaiy\Relay\Hold::class, 'touched');
+        $ref->setAccessible(true);
+        $f = glob($r->data . '/holds/poll/' . Signals::hash("dev-a-$off") . '/*')[0];
+        touch($f, 1000);
+        $ref->setValue($held['a'], 0.0); // "the last touch was long ago"
+        $held['a']->refresh();
+        clearstatcache(true, $f);
+        ok(abs(filemtime($f) - (time() + $off)) <= 3, 'a refresh stamps the relay\'s clock too');
+        eq(3, $h->liveCount());
+        foreach ($held as $x) {
+            $x->release();
+        }
+        eq(0, $h->liveCount());
+    }
+});
+
 test('4.7.2 rule 5: at most four waiting lookups per device; the fifth is 429 rate_limited with Retry-After 1', function () {
     $r = Relay::make();
     $h = $r->ctx()->holds;

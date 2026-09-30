@@ -13,7 +13,7 @@ The wire protocol is [`platform/protocol/relay/v1/`](../protocol/relay/v1/README
 |---|---|
 | PHP | 8.0 or later; **8.2 or later is recommended** (PHP 8.0 and 8.1 are end of life, and the doctor warns on both). Tested on 8.0.30 and 8.4.15. |
 | Extensions | `sodium` (bundled with PHP since 7.2), `json`, `hash`, and `pdo_sqlite` (the default store) or `pdo_mysql`. `openssl` and `curl` matter only to the optional FCM sender, which is not part of this build. |
-| Disk | A writable `data/` folder on a **local** filesystem (SQLite's write-ahead log is unsafe on NFS and similar). |
+| Disk | A writable `data/` folder on a **local** filesystem (SQLite's write-ahead log is unsafe on NFS and similar). The hold markers in `data/holds/` are stamped with PHP's clock and not the filesystem's, so a `data/` whose filesystem clock is off PHP's by minutes still counts its holds (a marker is stale 5 seconds past its cap, or when stamped more than a minute ahead). |
 | HTTPS | A publicly trusted certificate on a hostname of its own (a subdomain such as `relay.example.com`, not a path on a site that hosts anything else). The desktop and the phone use the bundled web roots and cannot use a private CA. |
 | Workers | Each waiting poll holds one PHP worker for up to 20 seconds. Measure what your host allows with the [host probe](probe/host-probe.php) and [`docs/relay-hosting-matrix.md`](../../docs/relay-hosting-matrix.md) before you commit to a plan. |
 
