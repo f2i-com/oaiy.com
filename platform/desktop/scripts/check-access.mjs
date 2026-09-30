@@ -9,8 +9,12 @@
 //      when a route has no row, the exported file, and everything else under `auth::`.
 //   2. The boot test, which starts `oaiy-server` on a port the system picks (never 17972, 17872 or
 //      any other fixed port) and sends an anonymous request to every row of the table.
-//   3. Reads the `routes.json` the tests wrote and checks it against itself: no duplicate row, every
-//      row well formed, every scope named by a row spelled like a scope.
+//   3. Reads the `routes.json` the tests wrote and checks it against itself, in JavaScript, so that a
+//      mistake in the Rust tables that its own tests share cannot hide: no duplicate row, every row
+//      well formed, every scope a row or a preset names is one of the 54, the counts of the design
+//      (48 core scopes: 18 read, 18 act, 12 dangerous; 6 reserved), only `owner` and `cli-admin`
+//      hold a dangerous scope, no relay tier does, and `control.project` never travels without
+//      `control.read`.
 //
 // The cargo command can be replaced with OAIY_CARGO (a program and its leading arguments). On a
 // machine whose C++ tools are not on the PATH, run it through the wrapper that loads them.
@@ -74,11 +78,44 @@ for (const r of doc.routes ?? []) {
     problems.push(`${key}: class ${r.class}`);
   }
 }
+// The scopes, presets and relay tiers.
+const scopeInfo = new Map((doc.scopes ?? []).map((s) => [s.name, s]));
+const count = (group) => (doc.scopes ?? []).filter((s) => s.group === group).length;
+if (scopeInfo.size !== 54) problems.push(`${scopeInfo.size} scopes, expected 54`);
+if ([count('read'), count('act'), count('dangerous'), count('reserved')].join() !== '18,18,12,6') {
+  problems.push(`scope groups ${[count('read'), count('act'), count('dangerous'), count('reserved')].join('/')}, expected 18/18/12/6`);
+}
+for (const name of scopeRows.keys()) if (!scopeInfo.has(name)) problems.push(`a row names ${name}, which is not a scope`);
+for (const r of doc.routes ?? []) {
+  if (r.class === 'scope' && r.dangerous !== Boolean(scopeInfo.get(r.scope)?.dangerous)) problems.push(`${r.method} ${r.pattern}: dangerous flag`);
+}
+const mayHoldDangerous = new Set(['owner', 'cli-admin']);
+for (const [name, list] of Object.entries(doc.presets ?? {})) {
+  for (const s of list) {
+    if (!scopeInfo.has(s)) problems.push(`preset ${name} names ${s}, which is not a scope`);
+    if (scopeInfo.get(s)?.dangerous && !mayHoldDangerous.has(name)) problems.push(`preset ${name} holds the dangerous scope ${s}`);
+    if (scopeInfo.get(s)?.group === 'reserved' && !['owner', 'ceremony'].includes(name)) problems.push(`preset ${name} holds the reserved scope ${s}`);
+  }
+  if (list.includes('control.project') && !list.includes('control.read')) problems.push(`preset ${name} has control.project without control.read`);
+}
+for (const [name, list] of Object.entries(doc.relayTiers ?? {})) {
+  for (const s of list) {
+    if (!scopeInfo.has(s)) problems.push(`relay tier ${name} names ${s}, which is not a scope`);
+    if (scopeInfo.get(s)?.dangerous) problems.push(`relay tier ${name} holds the dangerous scope ${s}`);
+  }
+  if (list.includes('control.project') && !list.includes('control.read')) problems.push(`relay tier ${name} has control.project without control.read`);
+}
+if ((doc.presets?.owner ?? []).length !== 54) problems.push('owner does not hold all 54 scopes');
+// Every scope has a route, but `control.project` (the change level of POST /api/mcp) and `relay.manage`
+// (the relay design's routes).
+for (const name of scopeInfo.keys()) {
+  if (!scopeRows.has(name) && !['control.project', 'relay.manage'].includes(name)) problems.push(`scope ${name} has no route`);
+}
 if (problems.length) {
   console.error('\ncheck-access: routes.json has problems:\n  ' + problems.join('\n  '));
   process.exit(1);
 }
 const existing = doc.routes.filter((r) => r.since === 1).length;
-console.log(`\ncheck-access: ok. ${doc.routes.length} rows (${existing} for routes that existed before the access model, ${doc.routes.length - existing} added or reserved), ${scopeRows.size} scopes named by a row.`);
+console.log(`\ncheck-access: ok. ${doc.routes.length} rows (${existing} for routes that existed before the access model, ${doc.routes.length - existing} added or reserved), ${scopeRows.size} scopes named by a row, ${Object.keys(doc.presets).length} presets, ${Object.keys(doc.relayTiers).length} relay tiers.`);
 if (process.argv.includes('--keep')) console.log(`routes.json: ${file}`);
 else fs.rmSync(out, { recursive: true, force: true });

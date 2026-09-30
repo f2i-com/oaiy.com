@@ -6,7 +6,9 @@ use std::path::PathBuf;
 
 use serde_json::{json, Value};
 
+use super::presets::{all_bundles, App};
 use super::routes::{Class, DeskRole, Only, Route, ROUTES};
+use super::scopes::{is_dangerous, Group, SCOPES};
 
 /// One row as the exported file spells it.
 fn row_json(r: &Route) -> Value {
@@ -25,7 +27,10 @@ fn row_json(r: &Route) -> Value {
             "desk",
             json!({ "roles": roles.iter().map(|r| match r { DeskRole::Dashboard => "dashboard", DeskRole::Agent => "agent", DeskRole::Flows => "flows" }).collect::<Vec<_>>() }),
         ),
-        Class::Scope(scope) => ("scope", json!({ "scope": scope })),
+        Class::Scope(scope) => (
+            "scope",
+            json!({ "scope": scope, "dangerous": is_dangerous(scope) }),
+        ),
         Class::Unclassified => ("unclassified", Value::Null),
     };
     row["class"] = json!(class);
@@ -37,11 +42,39 @@ fn row_json(r: &Route) -> Value {
     row
 }
 
-/// The exported document.
+/// The exported document: the rows, the scopes, and the bundles (presets and relay tiers) that hold them.
 pub fn routes_json() -> Value {
+    let scopes: Vec<Value> = SCOPES
+        .iter()
+        .map(|s| {
+            let group = match s.group {
+                Group::Read => "read",
+                Group::Act => "act",
+                Group::Dangerous => "dangerous",
+                Group::Reserved => "reserved",
+            };
+            json!({ "name": s.name, "group": group, "dangerous": s.dangerous })
+        })
+        .collect();
+    let mut presets = serde_json::Map::new();
+    let mut tiers = serde_json::Map::new();
+    for (name, set) in all_bundles() {
+        match name.strip_prefix("relay:") {
+            Some(tier) => tiers.insert(tier.to_string(), json!(set.names())),
+            None => presets.insert(name, json!(set.names())),
+        };
+    }
+    let apps: Vec<Value> = [App::Dash, App::Agent, App::Flows]
+        .iter()
+        .map(|a| json!({ "app": a.name(), "sessionCeiling": a.session_ceiling().name(), "deskCeiling": a.desk_ceiling().name() }))
+        .collect();
     json!({
         "schema": "oaiy-access-routes/1",
         "routes": ROUTES.iter().map(row_json).collect::<Vec<_>>(),
+        "scopes": scopes,
+        "presets": presets,
+        "relayTiers": tiers,
+        "apps": apps,
     })
 }
 
