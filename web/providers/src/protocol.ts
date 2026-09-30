@@ -64,7 +64,7 @@ export interface BrokerDeps {
   page: PageInfo;
   /** `window.parent`: the only window a `hello` may come from. */
   parent: unknown;
-  /** The clock, for the rate limit and the idle time (a test hands in its own). */
+  /** The clock, in milliseconds, for the rate limit and the idle time. Default `performance.now()`: monotonic, unlike the wall clock. A test hands in its own. */
   now?: () => number;
 }
 
@@ -95,7 +95,9 @@ interface Connection {
 }
 
 export function createBroker(deps: BrokerDeps): Broker {
-  const now = deps.now ?? Date.now;
+  // A clock that only goes forward: the wall clock (`Date.now`) can be set back an hour, and then the rate limit would see a negative
+  // time (every connection locked for that hour) and the idle timer would never run out. What is counted here is elapsed time.
+  const now = deps.now ?? (() => performance.now());
   const connections = new Map<PortLike, Connection>();
   const fetcher = createFetcher({ store: deps.store, budget: deps.budget, fetchImpl: deps.fetchImpl, page: deps.page });
 

@@ -329,6 +329,13 @@ const MUTATIONS = [
     files: { '.github/workflows/release.yml': [{ find: 'VERIFY_JOBS: revision,zipp,web,webapp,cli,', replace: 'VERIFY_JOBS: revision,zipp,web,cli,' }] },
     caught: ['attest-release-evidence.test.mjs'],
   },
+  {
+    name: 'L1 the port counts time with the wall clock',
+    what: 'the rate limit and the idle timer read Date.now, so a clock set back an hour locks every connection',
+    tests: ['tests/unit/clock.test.mjs'],
+    files: { 'web/providers/src/protocol.ts': [{ find: 'const now = deps.now ?? (() => performance.now());', replace: 'const now = deps.now ?? Date.now;' }] },
+    caught: ['a wall clock set back an hour does not lock the connections that exist', 'the idle sweep closes a quiet connection when the wall clock has been set back'],
+  },
   // Leaks the scans must find. They put the key where a scan of TEXT does not look (the reviewer's two: a Uint8Array, and reversed).
   {
     name: 'H1 leak: list returns the key as a Uint8Array',
