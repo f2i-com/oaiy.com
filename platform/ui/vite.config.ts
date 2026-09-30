@@ -101,6 +101,9 @@ export default defineConfig({
       { find: /^oaiy-core\/(.*)$/, replacement: path.resolve(__dirname, 'vendor/oaiy-core/$1') },
       { find: /^oaiy-ui-components$/, replacement: path.resolve(__dirname, 'vendor/oaiy-ui-components/src/index.ts') },
       { find: /^oaiy-ui-components\/(.*)$/, replacement: path.resolve(__dirname, 'vendor/oaiy-ui-components/src/$1') },
+
+      // --- code shared with the Agent and the providers origin (../../shared, plain TypeScript) ---
+      { find: /^@oaiy\/shared\/(.*)$/, replacement: path.resolve(__dirname, '../../shared/$1') },
     ],
   },
   optimizeDeps: {
@@ -123,7 +126,8 @@ export default defineConfig({
       // server never needs to read outside the project root. Scoping to __dirname
       // keeps the api/ PHP backend + its SQLite DB (var/oaiy.sqlite), cli/, and
       // desktop/ out of reach of the dev server's /@fs/ route.
-      allow: [__dirname],
+      // ../../shared is the code the editor shares with the Agent (imported as @oaiy/shared, see resolve.alias).
+      allow: [__dirname, path.resolve(__dirname, '../../shared')],
     },
     // Note: to switch ffmpeg.wasm to its multi-threaded build (3-5×
     // faster) we'll need to add COOP/COEP here (and in production

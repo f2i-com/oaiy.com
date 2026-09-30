@@ -12,6 +12,9 @@ import * as esbuild from 'esbuild';
 
 export const UI = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..', '..');
 
+/** The code shared with the Agent and the providers origin (`@oaiy/shared/...`), at the repository's root. */
+export const SHARED = path.resolve(UI, '..', '..', 'shared');
+
 let counter = 0;
 
 /** Bundle `entry` (a path from platform/ui) and import it. */
@@ -25,6 +28,7 @@ export async function loadTs(entry) {
     format: 'esm',
     platform: 'node',
     packages: 'external',
+    alias: { '@oaiy/shared': SHARED },
     outfile,
     logLevel: 'silent',
   });
