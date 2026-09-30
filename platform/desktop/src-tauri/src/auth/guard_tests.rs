@@ -3368,129 +3368,6 @@ fn proxy_only_env() -> Env {
     )
 }
 
-#[tokio::test]
-async fn t45_a_proxy_only_install_answers_its_proxy_and_this_machine_and_nothing_else() {
-    let e = proxy_only_env();
-    assert!(e.guard.config().proxy_only);
-    let through_proxy = |peer: &str| {
-        send(Method::GET, "/api/config")
-            .bearer(STATIC_TOKEN)
-            .peer(peer)
-            .h("host", "dash.example.com")
-            .add("x-forwarded-for", "203.0.113.9")
-            .add("x-forwarded-proto", "https")
-    };
-    // The proxy, in its own network (and as a mapped IPv6 address, which is the same peer).
-    for peer in [
-        "172.30.0.3:5000",
-        "172.30.0.254:5000",
-        "[::ffff:172.30.0.3]:5000",
-    ] {
-        let r = go(&e, through_proxy(peer)).await;
-        assert_eq!(r.status, 200, "{peer}: {}", r.text);
-    }
-    // Everyone else who reaches the port directly, with or without the headers a proxy would add: refused, and
-    // nothing they send in a header changes it.
-    for peer in [
-        "203.0.113.9:5000",
-        "[2001:db8::9]:5000",
-        "192.168.1.9:5000",
-        "10.0.0.7:5000",
-        "172.30.1.3:5000",
-        "172.31.0.3:5000",
-        "172.29.255.255:5000",
-        "[::ffff:172.31.0.3]:5000",
-    ] {
-        let r = go(&e, through_proxy(peer)).await;
-        assert_eq!(
-            (r.status, r.code().as_deref()),
-            (403, Some("direct_access_refused")),
-            "{peer} with the proxy's headers"
-        );
-        let r = go(
-            &e,
-            send(Method::GET, "/api/config")
-                .bearer(STATIC_TOKEN)
-                .peer(peer)
-                .h("host", "10.9.9.9:17972"),
-        )
-        .await;
-        assert_eq!(
-            (r.status, r.code().as_deref()),
-            (403, Some("direct_access_refused")),
-            "{peer} bare"
-        );
-        // Not a credential in the world changes it, and no request is judged before it: a request with nothing
-        // (an anonymous one) is refused the same way, not with a `401` that says a credential would do.
-        let r = go(
-            &e,
-            send(Method::GET, "/api/config")
-                .peer(peer)
-                .h("host", "dash.example.com"),
-        )
-        .await;
-        assert_eq!(
-            r.code().as_deref(),
-            Some("direct_access_refused"),
-            "{peer} anonymous"
-        );
-    }
-    // Every path, routed or not: the pages a later step serves are behind the same door as the API.
-    for path in ["/", "/index.html", "/assets/app.js", "/api/no/such/route"] {
-        let r = go(
-            &e,
-            send(Method::GET, path)
-                .peer("203.0.113.9:5000")
-                .h("host", "dash.example.com"),
-        )
-        .await;
-        assert_eq!(
-            (r.status, r.code().as_deref()),
-            (403, Some("direct_access_refused")),
-            "{path}"
-        );
-        let r = go(
-            &e,
-            send(Method::GET, path)
-                .peer("172.30.0.3:5000")
-                .h("host", "dash.example.com"),
-        )
-        .await;
-        assert_ne!(r.code().as_deref(), Some("direct_access_refused"), "{path}");
-    }
-    // This machine, straight to the port (the CLI on the server, `oaiy-server auth ...`, a check inside the
-    // container): answered, with no forwarded header. With one it is not a client of the port but a proxy that
-    // was never named.
-    for (peer, host) in [
-        ("127.0.0.1:5000", "127.0.0.1:17972"),
-        ("[::1]:5000", "[::1]:17972"),
-        ("127.0.0.1:5000", "localhost:17972"),
-    ] {
-        let r = go(
-            &e,
-            send(Method::GET, "/api/config")
-                .bearer(STATIC_TOKEN)
-                .peer(peer)
-                .h("host", host),
-        )
-        .await;
-        assert_eq!(r.status, 200, "{peer} {host}: {}", r.text);
-    }
-    let r = go(
-        &e,
-        send(Method::GET, "/api/config")
-            .bearer(STATIC_TOKEN)
-            .peer("127.0.0.1:5000")
-            .h("host", "127.0.0.1:17972")
-            .add("x-forwarded-for", "203.0.113.9"),
-    )
-    .await;
-    assert_eq!(
-        (r.status, r.code().as_deref()),
-        (403, Some("direct_access_refused"))
-    );
-}
-
 /// A preflight is answered by the CORS layer, which sits outside the guard so that an app can read the refusal it
 /// gets, and it was answered before the front door every other request meets: a proxy-only listener answered the
 /// preflight of anyone, and a `Host` that is not the server's got `204` too. The front door
@@ -3699,6 +3576,129 @@ async fn t45_a_preflight_and_a_trace_meet_the_front_door_before_anything_answers
         let r = go(&e, s).await;
         assert_eq!(answer(&r), passed, "{what}: {}", r.text);
     }
+}
+
+#[tokio::test]
+async fn t45_a_proxy_only_install_answers_its_proxy_and_this_machine_and_nothing_else() {
+    let e = proxy_only_env();
+    assert!(e.guard.config().proxy_only);
+    let through_proxy = |peer: &str| {
+        send(Method::GET, "/api/config")
+            .bearer(STATIC_TOKEN)
+            .peer(peer)
+            .h("host", "dash.example.com")
+            .add("x-forwarded-for", "203.0.113.9")
+            .add("x-forwarded-proto", "https")
+    };
+    // The proxy, in its own network (and as a mapped IPv6 address, which is the same peer).
+    for peer in [
+        "172.30.0.3:5000",
+        "172.30.0.254:5000",
+        "[::ffff:172.30.0.3]:5000",
+    ] {
+        let r = go(&e, through_proxy(peer)).await;
+        assert_eq!(r.status, 200, "{peer}: {}", r.text);
+    }
+    // Everyone else who reaches the port directly, with or without the headers a proxy would add: refused, and
+    // nothing they send in a header changes it.
+    for peer in [
+        "203.0.113.9:5000",
+        "[2001:db8::9]:5000",
+        "192.168.1.9:5000",
+        "10.0.0.7:5000",
+        "172.30.1.3:5000",
+        "172.31.0.3:5000",
+        "172.29.255.255:5000",
+        "[::ffff:172.31.0.3]:5000",
+    ] {
+        let r = go(&e, through_proxy(peer)).await;
+        assert_eq!(
+            (r.status, r.code().as_deref()),
+            (403, Some("direct_access_refused")),
+            "{peer} with the proxy's headers"
+        );
+        let r = go(
+            &e,
+            send(Method::GET, "/api/config")
+                .bearer(STATIC_TOKEN)
+                .peer(peer)
+                .h("host", "10.9.9.9:17972"),
+        )
+        .await;
+        assert_eq!(
+            (r.status, r.code().as_deref()),
+            (403, Some("direct_access_refused")),
+            "{peer} bare"
+        );
+        // Not a credential in the world changes it, and no request is judged before it: a request with nothing
+        // (an anonymous one) is refused the same way, not with a `401` that says a credential would do.
+        let r = go(
+            &e,
+            send(Method::GET, "/api/config")
+                .peer(peer)
+                .h("host", "dash.example.com"),
+        )
+        .await;
+        assert_eq!(
+            r.code().as_deref(),
+            Some("direct_access_refused"),
+            "{peer} anonymous"
+        );
+    }
+    // Every path, routed or not: the pages a later step serves are behind the same door as the API.
+    for path in ["/", "/index.html", "/assets/app.js", "/api/no/such/route"] {
+        let r = go(
+            &e,
+            send(Method::GET, path)
+                .peer("203.0.113.9:5000")
+                .h("host", "dash.example.com"),
+        )
+        .await;
+        assert_eq!(
+            (r.status, r.code().as_deref()),
+            (403, Some("direct_access_refused")),
+            "{path}"
+        );
+        let r = go(
+            &e,
+            send(Method::GET, path)
+                .peer("172.30.0.3:5000")
+                .h("host", "dash.example.com"),
+        )
+        .await;
+        assert_ne!(r.code().as_deref(), Some("direct_access_refused"), "{path}");
+    }
+    // This machine, straight to the port (the CLI on the server, `oaiy-server auth ...`, a check inside the
+    // container): answered, with no forwarded header. With one it is not a client of the port but a proxy that
+    // was never named.
+    for (peer, host) in [
+        ("127.0.0.1:5000", "127.0.0.1:17972"),
+        ("[::1]:5000", "[::1]:17972"),
+        ("127.0.0.1:5000", "localhost:17972"),
+    ] {
+        let r = go(
+            &e,
+            send(Method::GET, "/api/config")
+                .bearer(STATIC_TOKEN)
+                .peer(peer)
+                .h("host", host),
+        )
+        .await;
+        assert_eq!(r.status, 200, "{peer} {host}: {}", r.text);
+    }
+    let r = go(
+        &e,
+        send(Method::GET, "/api/config")
+            .bearer(STATIC_TOKEN)
+            .peer("127.0.0.1:5000")
+            .h("host", "127.0.0.1:17972")
+            .add("x-forwarded-for", "203.0.113.9"),
+    )
+    .await;
+    assert_eq!(
+        (r.status, r.code().as_deref()),
+        (403, Some("direct_access_refused"))
+    );
 }
 
 #[tokio::test]
@@ -4410,4 +4410,37 @@ async fn t45_a_local_install_built_from_its_environment_refuses_every_forwarded_
     let default = env_validated(&[("OAIY_PUBLIC_URL", "https://dash.example.com")], false);
     let r = go(&default, info("127.0.0.1:4000")).await;
     assert_eq!(r.json()["seen"]["clientIp"], "203.0.113.9");
+}
+
+/// The release builds the headless server with the web login, whose mode is `scoped`, and its smoke test of the
+/// distribution (`scripts/smoke-server.mjs`) does what this does: with the static token, the routes it uses, and
+/// without a credential, a refusal (401 of `scoped`, where `legacy` said 403) whatever the Origin says.
+#[tokio::test]
+async fn the_release_smoke_test_of_the_headless_distribution_passes_a_scoped_server_with_its_token()
+{
+    let e = env_with(AccessMode::Scoped, &[], false, false, Some(STATIC_TOKEN));
+    for (m, p) in [
+        (Method::GET, "/api/health"),
+        (Method::GET, "/api/node"),
+        (Method::PUT, "/api/bridge/flows/audit-smoke"),
+        (Method::POST, "/api/bridge/runs"),
+        (Method::GET, "/api/bridge/runs/run_1"),
+    ] {
+        let r = go(&e, send(m.clone(), p).bearer(STATIC_TOKEN)).await;
+        assert_eq!(r.status, 200, "{m} {p}: {}", r.text);
+    }
+    for origin in [None, Some("https://oaiy.com"), Some("tauri://localhost")] {
+        let s = send(Method::GET, "/api/config");
+        let s = match origin {
+            Some(o) => s.h("origin", o),
+            None => s,
+        };
+        let r = go(&e, s).await;
+        assert_eq!(
+            (r.status, r.code().as_deref()),
+            (401, Some("auth_required")),
+            "{origin:?}: {}",
+            r.text
+        );
+    }
 }

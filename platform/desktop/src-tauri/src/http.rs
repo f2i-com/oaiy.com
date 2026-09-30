@@ -1763,6 +1763,14 @@ pub async fn serve(
             );
         }
     }
+    // What this install is, in words, with no secret in it (the audit log's startup event has it too): now that the
+    // credential store is open and the listener is bound, so that "listening on" is true. One banner, not through the
+    // log facade, which the journal and the ring keep. (A server that stops before this says why in one line.)
+    if let Some(config) = &access.config {
+        for line in config.banner_lines() {
+            eprintln!("{line}");
+        }
+    }
     // With the peer's address on each request: the new guard needs it (a `desk` credential works only from
     // loopback, an address is what the failed-bearer throttle counts).
     axum::serve(listener, app.into_make_service_with_connect_info::<SocketAddr>()).await?;

@@ -57,9 +57,11 @@ try {
   const node = await request('/api/node');
   assert.equal(node.source, 'bundled');
   assert.equal(node.available, true);
+  // No credential, whatever the Origin says (a browser page's, the desktop's): refused. The server is built with the web
+  // login, whose mode is `scoped`, and that says 401 (who are you?) where `legacy` said 403.
   for (const origin of [undefined, 'https://oaiy.com', 'tauri://localhost']) {
     const response = await fetch(base + '/api/config', { headers: origin ? { Origin: origin } : {} });
-    assert.equal(response.status, 403);
+    assert.ok([401, 403].includes(response.status), `${origin ?? 'no Origin'}: ${response.status}`);
   }
   await request('/api/bridge/flows/audit-smoke', {
     nodes: [

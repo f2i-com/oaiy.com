@@ -296,6 +296,7 @@ fn lan_address() -> Option<IpAddr> {
 }
 
 /// Whether the address is one a lan listener takes a bearer from (loopback, RFC 1918, link-local, CGNAT).
+#[allow(dead_code)] // (the opt-in tests that use it are for a build with the web login)
 fn is_private(ip: IpAddr) -> bool {
     match ip {
         IpAddr::V4(v4) => {
@@ -496,6 +497,159 @@ fn t28_rule_2_a_lan_bind_needs_an_owner_and_is_accepted_with_one() {
             && out.contains("0.0.0.0:17972")
             && out.contains("oaiy-server check: ok"),
         "{out}"
+    );
+}
+
+/// What the server reads of `<data>/auth/owner.json` is what the store reads, in the start and in `check` alike: a file
+/// that is there and that it cannot use is a refusal named by the file, exit 78 and one line, and `check` lists the
+/// same. Existence was all that rule 2 asked, so an empty file satisfied it (and `check` of a build without the web
+/// login said ok) and the server stopped a step later, after it had printed that it was listening.
+#[test]
+fn t28_an_owner_file_the_server_cannot_use_is_a_refusal_of_the_start_and_of_check_alike() {
+    #[allow(unused_mut)] // (only a build with the web login adds a case)
+    let mut cases = vec![
+        ("an empty file", "", "cannot be read"),
+        ("text", "not json", "cannot be read"),
+        ("no version", r#"{"password":"x"}"#, "no version"),
+        ("a newer OAIY's", r#"{"v":2}"#, "newer OAIY"),
+    ];
+    // A version the store reads and a document the login cannot (no times): with the web login it is a refusal too,
+    // and on a lan install, which hosts no login, only the start's own reading of the file refuses it.
+    #[cfg(feature = "web")]
+    cases.push((
+        "a version the store reads and no times",
+        r#"{"v":1,"password":"x"}"#,
+        "created_ms",
+    ));
+    for (i, (what, text, says)) in cases.into_iter().enumerate() {
+        // The local install of the build's own default, and the lan one that rule 2 is about.
+        for (shape, env) in [
+            ("local", vec![]),
+            (
+                "lan",
+                vec![("OAIY_SERVER_BIND", "lan"), ("OAIY_ACCESS_MODE", "scoped")],
+            ),
+        ] {
+            let scratch = Scratch::new(&format!("owner-file-{i}-{shape}"));
+            let auth = scratch.data().join("auth");
+            std::fs::create_dir_all(&auth).unwrap();
+            std::fs::write(auth.join("owner.json"), text).unwrap();
+            let (code, out, err) = check(&scratch, &env);
+            assert_eq!(code, Some(78), "{what} {shape}: {err}");
+            assert!(out.is_empty(), "{what} {shape}: {out}");
+            assert!(
+                err.contains("owner.json") && err.contains(says),
+                "{what} {shape}: {err}"
+            );
+            assert!(
+                !err.contains("auth init`, then"),
+                "{what} {shape}: the file is there, so it is not 'make an owner first': {err}"
+            );
+            let mut server = Server::spawn(&scratch, &env);
+            assert_eq!(
+                server.exit_code(Duration::from_secs(60)),
+                Some(78),
+                "{what} {shape}: {}",
+                server.stderr_text()
+            );
+            let said = server.stderr_text();
+            assert!(
+                said.contains("owner.json") && said.contains(says),
+                "{what} {shape}: {said}"
+            );
+            assert_eq!(
+                said.lines()
+                    .filter(|l| l.starts_with("oaiy-server:"))
+                    .count(),
+                1,
+                "{what} {shape}: one line: {said}"
+            );
+            assert!(
+                !said.contains("listening on") && !said.contains("exposure "),
+                "{what} {shape}: it never said it was listening: {said}"
+            );
+        }
+    }
+}
+
+/// The banner says "listening on": it is printed once the credential store is open and the listener is bound, and a
+/// server that stops at the store has not printed it.
+#[test]
+fn t28_a_server_that_stops_at_the_credential_store_never_said_it_was_listening() {
+    let scratch = Scratch::new("store-refuses");
+    let auth = scratch.data().join("auth");
+    std::fs::create_dir_all(&auth).unwrap();
+    // A credentials file of a newer OAIY: the store refuses it when it opens, which is after the rules have passed.
+    std::fs::write(auth.join("credentials.json"), r#"{"v":9}"#).unwrap();
+    let env = [("OAIY_ACCESS_MODE", "scoped")];
+    // (`check` of a build with the web login reads every file of the folder; one without it reads the owner's only.)
+    #[cfg(feature = "web")]
+    {
+        let (code, _, err) = check(&scratch, &env);
+        assert_eq!(code, Some(78), "{err}");
+    }
+    let mut server = Server::spawn(&scratch, &env);
+    assert_eq!(
+        server.exit_code(Duration::from_secs(60)),
+        Some(78),
+        "{}",
+        server.stderr_text()
+    );
+    let said = server.stderr_text();
+    assert!(
+        said.contains("credentials.json") && said.contains("newer OAIY"),
+        "{said}"
+    );
+    assert!(
+        !said.contains("listening on") && !said.contains("exposure local"),
+        "{said}"
+    );
+    // A server that starts says it once it does.
+    let scratch = Scratch::new("store-opens");
+    let server = Server::start(&scratch, &env);
+    assert!(
+        server.stderr_text().contains(&format!(
+            "exposure local: listening on 127.0.0.1:{}",
+            server.port
+        )),
+        "{}",
+        server.stderr_text()
+    );
+}
+
+/// A build without the web login has no console: rule 2 must not send its operator to `oaiy-server auth init`, which
+/// answers "no console", and the `legacy` it defaults to is not refused as if it had been set.
+#[cfg(not(feature = "web"))]
+#[test]
+fn t28_a_build_without_the_web_login_says_so_where_it_pointed_at_a_console() {
+    refused(
+        "r2-no-web-login",
+        &[("OAIY_SERVER_BIND", "lan"), ("OAIY_ACCESS_MODE", "scoped")],
+        "this build has no web login",
+    );
+    let scratch = Scratch::new("r2-no-web-login-check");
+    let (code, _, err) = check(
+        &scratch,
+        &[("OAIY_SERVER_BIND", "lan"), ("OAIY_ACCESS_MODE", "scoped")],
+    );
+    assert_eq!(code, Some(78), "{err}");
+    assert!(
+        err.contains("use the web build of oaiy-server")
+            && !err.contains("auth init`, then start the server"),
+        "{err}"
+    );
+    // Nothing set: the mode is the build's default, and that is what is refused.
+    refused(
+        "r6-no-web-login-default",
+        &[("OAIY_PUBLIC_URL", "https://dash.example.com")],
+        "OAIY_ACCESS_MODE is not set",
+    );
+    let (code, _, err) = check(&scratch, &[("OAIY_PUBLIC_URL", "https://dash.example.com")]);
+    assert_eq!(code, Some(78), "{err}");
+    assert!(
+        err.contains("set OAIY_ACCESS_MODE=scoped")
+            && !err.contains("OAIY_ACCESS_MODE=legacy is refused"),
+        "{err}"
     );
 }
 

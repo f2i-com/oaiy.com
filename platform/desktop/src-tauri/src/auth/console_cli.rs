@@ -1381,6 +1381,29 @@ mod tests {
             .contains("corrupt")));
     }
 
+    /// An owner file that is there and cannot be read is an owner file: `check` says why the server will not start, and
+    /// does not also say "no owner: run auth init" of a lan bind (which would send the operator to make another).
+    #[test]
+    fn check_takes_an_owner_file_it_cannot_read_for_an_owner_file_and_does_not_say_to_make_one() {
+        let dir = TempDir::new("check-unreadable-owner");
+        // A folder where the file belongs: a read error that is not "not there".
+        std::fs::create_dir_all(dir.0.join("auth").join("owner.json")).unwrap();
+        let r = check_in(
+            &dir,
+            &[("OAIY_SERVER_BIND", "lan"), ("OAIY_ACCESS_MODE", "scoped")],
+        );
+        assert!(
+            r.violations
+                .iter()
+                .any(|v| v.contains("cannot read") && v.contains("owner.json")),
+            "{r:?}"
+        );
+        assert!(
+            !r.violations.iter().any(|v| v.contains("auth init`, then")),
+            "{r:?}"
+        );
+    }
+
     #[test]
     fn check_refuses_an_owner_file_of_another_version_and_one_with_no_version() {
         let dir = TempDir::new("check-version");
@@ -1399,6 +1422,16 @@ mod tests {
         let r = check_in(&dir, &[]);
         assert!(
             r.violations.len() == 1 && r.violations[0].contains("no version"),
+            "{r:?}"
+        );
+        // A version the store reads and a document the login cannot (no times): the start refuses it (the login is
+        // built from what the store read), so `check` does too, in one line that names the file.
+        write(r#"{"v":1,"password":"x"}"#);
+        let r = check_in(&dir, &[]);
+        assert!(
+            r.violations.len() == 1
+                && r.violations[0].contains("owner.json")
+                && r.violations[0].contains("created_ms"),
             "{r:?}"
         );
     }
@@ -1538,7 +1571,10 @@ mod tests {
             ][..],
             &[
                 ("OAIY_SERVER_BIND", "lan"),
-                ("OAIY_SERVER_TOKEN", "Vl0JTnJtFseAe9ePKCDhuBymfRXQ8osZ-QMlM86leCU"),
+                (
+                    "OAIY_SERVER_TOKEN",
+                    "Vl0JTnJtFseAe9ePKCDhuBymfRXQ8osZ-QMlM86leCU",
+                ),
             ][..],
         ] {
             let r = check_in(&dir, extra);
@@ -1555,8 +1591,14 @@ mod tests {
             assert!(r.violations.is_empty(), "{extra:?}: {r:?}");
         }
         // Not even a list of rules that is broken takes the warning away: it says what the install would be.
-        let r = check_in(&dir, &[("OAIY_SERVER_BIND", "lan"), ("OAIY_SERVER_TOKEN", "x")]);
-        assert!(!r.violations.is_empty() && r.warnings.iter().any(|w| w.contains("flows")), "{r:?}");
+        let r = check_in(
+            &dir,
+            &[("OAIY_SERVER_BIND", "lan"), ("OAIY_SERVER_TOKEN", "x")],
+        );
+        assert!(
+            !r.violations.is_empty() && r.warnings.iter().any(|w| w.contains("flows")),
+            "{r:?}"
+        );
     }
 
     #[test]
@@ -1637,7 +1679,11 @@ mod tests {
         // With an owner the lan bind is what the rules allow, and `check` says what the install is.
         let auth = dir.0.join("auth");
         std::fs::create_dir_all(&auth).unwrap();
-        std::fs::write(auth.join("owner.json"), r#"{"v":1,"password":"x"}"#).unwrap();
+        std::fs::write(
+            auth.join("owner.json"),
+            r#"{"v":1,"created_ms":1,"password_changed_ms":1,"password":"x"}"#,
+        )
+        .unwrap();
         let env = env_of(&[
             ("OAIY_DATA_DIR", dir.0.display().to_string()),
             ("OAIY_SERVER_BIND", "lan".into()),

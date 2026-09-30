@@ -217,8 +217,16 @@ async fn server_main() {
     // proxy), the public URLs, the token's shape, the access mode. The first violation is the one line printed and
     // the exit is 78, which the shipped unit does not restart; `oaiy-server check` lists them all. Nothing here
     // guesses: a bind that is not loopback, lan or an address used to keep loopback quietly, and does not now.
+    // The owner file is read as the store reads it (`inspect_owner_file`): one that is there and that this server
+    // cannot use is a refusal named by the file, first, as `oaiy-server check` lists it, and not a file that
+    // satisfies rule 2 and stops the server one step later.
+    let owner = oaiy_desktop_lib::auth::exposure::inspect_owner_file(&data_dir.join("auth"));
+    if let Some(line) = owner.refusal() {
+        eprintln!("oaiy-server: {line}");
+        std::process::exit(oaiy_desktop_lib::auth::mode::EX_CONFIG);
+    }
     let facts = oaiy_desktop_lib::auth::exposure::Facts {
-        owner_exists: oaiy_desktop_lib::auth::exposure::owner_file_present(&data_dir.join("auth")),
+        owner_exists: owner.exists(),
         web_login: cfg!(feature = "web"),
     };
     let config = match oaiy_desktop_lib::auth::exposure::validate_config(&env_text, &facts) {
@@ -231,10 +239,8 @@ async fn server_main() {
     for warning in &config.warnings {
         log::warn!("{warning}");
     }
-    // What this install is, in words, with no secret in it (the audit log's startup event has it too).
-    for line in config.banner_lines() {
-        eprintln!("{line}");
-    }
+    // (What this install is, in words, with no secret in it, is printed by `http::serve` once the credential store is
+    // open and the listener is bound: a banner that says "listening" is not printed by a server that then stops.)
     let port: u16 = config.port;
     let bind = config.bind.addr();
     // Trimmed and of the shape of design 4.1, or the server would not be here.

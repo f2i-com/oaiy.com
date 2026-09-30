@@ -402,9 +402,12 @@ jobs:
           npm run tauri:build
           echo "::notice::this build is unsigned: no step that builds is given the updater key. A tag run signs the setup.exe and the AppImage afterwards, in the sign job; a run on a branch never signs."
 
+      # WITH the web login (the `web` feature): oaiy-server's startup rules (design 4.5.5) make a lan or a proxied install
+      # need it (the owner, the sign-in, `oaiy-server auth init`), and a build without it cannot serve either. Its default
+      # access mode is then `scoped`, and it refuses OAIY_ACCESS_MODE=legacy. `check-access.mjs` fails if this line loses it.
       - name: Build the headless server
         working-directory: platform/desktop/src-tauri
-        run: cargo build --release --no-default-features --bin oaiy-server
+        run: cargo build --release --no-default-features --features web --bin oaiy-server
 
       - name: Stage complete headless distribution
         shell: bash
@@ -506,7 +509,7 @@ jobs:
             fs.writeFileSync(`release/release-evidence-${process.env.LABEL}.json`, JSON.stringify({
               component: "desktop+headless", version: process.env.VERSION, revision: process.env.REVISION,
               target: process.env.LABEL, runner: process.env.RUNNER_OS,
-              features: { desktop: ["gui"], headless: ["--no-default-features"] },
+              features: { desktop: ["gui"], headless: ["--no-default-features", "--features web"] },
               cli,
               // The Node version comes from the runtime itself (an unexported shell variable used to leave it empty).
               toolchain: { rustc: process.argv[1], cargo: process.argv[2], node: process.version },

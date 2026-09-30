@@ -17,6 +17,10 @@
 //      hold a dangerous scope, no relay tier does, and `control.project` never travels without
 //      `control.read`.
 //
+//   0. First, and without cargo: `check-release.mjs` reads the release and CI workflows and fails if the release builds the
+//      headless server without the `web` feature (a lan or a proxied install needs the web login, and a build without it
+//      cannot serve either), or if CI does not test that build.
+//
 // The cargo command can be replaced with OAIY_CARGO (a program and its leading arguments). On a
 // machine whose C++ tools are not on the PATH, run it through the wrapper that loads them.
 
@@ -31,6 +35,12 @@ const here = path.dirname(fileURLToPath(import.meta.url));
 const crate = path.resolve(here, '..', 'src-tauri');
 const skipBoot = process.argv.includes('--skip-boot');
 const cargo = (process.env.OAIY_CARGO ?? 'cargo').split(/\s+/).filter(Boolean);
+
+// The release builds the headless server with the web login and CI tests that build: text only, before anything is built.
+{
+  const release = spawnSync(process.execPath, [path.join(here, 'check-release.mjs')], { stdio: 'inherit' });
+  if (release.status !== 0) process.exit(release.status || 1);
+}
 
 // The tests write routes.json here, so this script knows where to read it.
 const out = fs.mkdtempSync(path.join(os.tmpdir(), 'oaiy-access-check-'));

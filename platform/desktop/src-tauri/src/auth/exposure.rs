@@ -4,13 +4,16 @@
 //! nothing else (whether `<data>/auth/owner.json` exists is a [`Facts`] the caller looks up, so that every rule
 //! is a pure function of two values and can be tested without a disk). [`validate_config`] is the same with the
 //! first violation as its error: the one line `oaiy-server` prints before it exits 78 (`EX_CONFIG`, which the
-//! shipped unit does not restart). `oaiy-server check` prints every violation.
+//! shipped unit does not restart: `RestartPreventExitStatus=78`). `oaiy-server check` prints every violation, the
+//! owner file's first (`inspect_owner_file`: read as the store reads it, which is what the start does).
 //!
 //! The rules of 4.5.5, by number:
 //!
 //! 1. `OAIY_SERVER_BIND` is `loopback`, `lan` (an alias of `0.0.0.0`) or an IP literal.
-//! 2. A **lan** install (a bind beyond loopback and no `OAIY_PUBLIC_URL`) needs `<data>/auth/owner.json`. A
-//!    **proxied** install may start without one, in setup-only mode.
+//! 2. A **lan** install (a bind beyond loopback and no `OAIY_PUBLIC_URL`) needs `<data>/auth/owner.json`, a file
+//!    this server reads as an owner (`inspect_owner_file`: as the store reads it; an empty, cut-off or newer file
+//!    is a refusal named by the file, in the start and in `check`). A **proxied** install may start without one,
+//!    in setup-only mode.
 //! 3. `OAIY_PUBLIC_URL`, `OAIY_AGENT_URL` and `OAIY_FLOWS_URL` are each `https://<host>[:<port>]` with no path,
 //!    query or fragment, none has a loopback host, and no two share a host. An app whose URL is unset is not
 //!    served; the dashboard's URL is required by the other two.
@@ -562,15 +565,22 @@ pub fn evaluate(env: &dyn Fn(&str) -> Option<String>, facts: &Facts) -> Evaluati
 
     // 2. a lan install needs an owner.
     if exposure == Exposure::Lan && !facts.owner_exists {
+        let bind = env("OAIY_SERVER_BIND")
+            .map(|b| b.trim().to_string())
+            .filter(|b| !b.is_empty())
+            .unwrap_or_else(|| "lan".into());
         violate!(
             Rule::LanNeedsOwner,
-            format!(
-                "OAIY_SERVER_BIND={} reaches the network, which needs an owner login first: run `oaiy-server auth init`, then start the server again",
-                env("OAIY_SERVER_BIND")
-                    .map(|b| b.trim().to_string())
-                    .filter(|b| !b.is_empty())
-                    .unwrap_or_else(|| "lan".into())
-            ),
+            if facts.web_login {
+                format!(
+                    "OAIY_SERVER_BIND={bind} reaches the network, which needs an owner login first: run `oaiy-server auth init`, then start the server again"
+                )
+            } else {
+                // No console in this build: `auth init` answers "no console", and is not what to run.
+                format!(
+                    "OAIY_SERVER_BIND={bind} reaches the network, which needs an owner login first, and this build has no web login to make one (it was built without the `web` feature): use the web build of oaiy-server, run `oaiy-server auth init` with it, then start the server again"
+                )
+            },
         );
     }
 
@@ -578,7 +588,24 @@ pub fn evaluate(env: &dyn Fn(&str) -> Option<String>, facts: &Facts) -> Evaluati
     let mode = match mode_from_env(env("OAIY_ACCESS_MODE").as_deref(), facts.web_login) {
         Ok(mode) => {
             if let Err(refusal) = validate_mode(mode, exposure, facts.owner_exists) {
-                violate!(Rule::Mode, refusal.to_string());
+                let defaulted = nonblank(env, "OAIY_ACCESS_MODE").is_none();
+                if defaulted && !facts.web_login {
+                    // The operator named no mode: the `legacy` that a build without the web login runs unless told
+                    // otherwise is what is refused, and the line says so (not "OAIY_ACCESS_MODE=legacy is refused").
+                    let why = if facts.owner_exists {
+                        "an owner login exists (<data>/auth/owner.json)".to_string()
+                    } else {
+                        format!("this is a {} install", exposure.name())
+                    };
+                    violate!(
+                        Rule::Mode,
+                        format!(
+                            "OAIY_ACCESS_MODE is not set, and a build without the web login (this one was built without the `web` feature) then runs legacy, which is refused because {why}: use the web build of oaiy-server, or set OAIY_ACCESS_MODE=scoped"
+                        ),
+                    );
+                } else {
+                    violate!(Rule::Mode, refusal.to_string());
+                }
             }
             mode
         }
@@ -641,12 +668,55 @@ pub fn data_dir_from_env(env: &dyn Fn(&str) -> Option<String>) -> Option<std::pa
     Some(std::path::PathBuf::from(home).join(".oaiy-server"))
 }
 
-/// Whether `<data>/auth/owner.json` is there. A file that cannot be looked at counts as there: the store says
-/// why when it opens, and rule 2 must not send the operator to `auth init` over a file that exists.
-pub fn owner_file_present(auth_dir: &std::path::Path) -> bool {
-    match std::fs::metadata(auth_dir.join("owner.json")) {
-        Ok(_) => true,
-        Err(e) => e.kind() != std::io::ErrorKind::NotFound,
+/// What `<data>/auth/owner.json` is to a server that opens it.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum OwnerState {
+    /// No file: no owner login yet.
+    Absent,
+    /// A file that this server reads as an owner.
+    Usable,
+    /// A file that is there and that this server would refuse to start with (one line: which file and why, as the
+    /// store says it). It is an owner file all the same: rule 2 must not send the operator to `auth init` over it.
+    Refused(String),
+}
+
+impl OwnerState {
+    /// Whether there is a file, usable or not.
+    pub fn exists(&self) -> bool {
+        !matches!(self, OwnerState::Absent)
+    }
+
+    /// The line that says why this server would not start with it.
+    pub fn refusal(&self) -> Option<&str> {
+        match self {
+            OwnerState::Refused(line) => Some(line),
+            _ => None,
+        }
+    }
+}
+
+/// Read `<data>/auth/owner.json` as the server does at start, so that the start (rule 2 and the mode it allows) and
+/// `oaiy-server check` say the same: the store's own reader (a file that is not JSON, has no version or has another
+/// one is refused, and never taken for "no owner yet"), and in a build with the web login the owner document that
+/// login reads from it. Existence alone is not it: an empty file used to satisfy rule 2 and stop the server one step
+/// later.
+pub fn inspect_owner_file(auth_dir: &std::path::Path) -> OwnerState {
+    match super::store::read_owner(auth_dir) {
+        Ok(None) => OwnerState::Absent,
+        Err(e) => OwnerState::Refused(e.to_string()),
+        #[cfg(feature = "web")]
+        Ok(Some(owner)) => match super::owner::OwnerDoc::from_value(&owner.doc) {
+            Ok(_) => OwnerState::Usable,
+            Err(detail) => OwnerState::Refused(
+                super::store::StoreError::OwnerUnparsable {
+                    file: super::owner::path(auth_dir),
+                    detail,
+                }
+                .to_string(),
+            ),
+        },
+        #[cfg(not(feature = "web"))]
+        Ok(Some(_)) => OwnerState::Usable,
     }
 }
 
@@ -683,18 +753,21 @@ pub fn check_headless(
     out: &mut dyn std::io::Write,
     err: &mut dyn std::io::Write,
 ) -> i32 {
-    let owner_exists = data_dir_from_env(env).is_some_and(|d| owner_file_present(&d.join("auth")));
+    let owner =
+        data_dir_from_env(env).map_or(OwnerState::Absent, |d| inspect_owner_file(&d.join("auth")));
     let evaluation = evaluate(
         env,
         &Facts {
-            owner_exists,
+            owner_exists: owner.exists(),
             web_login: false,
         },
     );
-    let violations: Vec<String> = evaluation
-        .violations
-        .iter()
-        .map(|v| v.message.clone())
+    // The file first, as the start says it, then the rules: what stops the start is what `check` lists.
+    let violations: Vec<String> = owner
+        .refusal()
+        .map(str::to_string)
+        .into_iter()
+        .chain(evaluation.violations.iter().map(|v| v.message.clone()))
         .collect();
     print_check(
         &violations,
@@ -1445,7 +1518,8 @@ mod tests {
             ),
             [Rule::Mode]
         );
-        // The default of a build without the login is legacy, so a lan bind with no mode named is refused too.
+        // The default of a build without the login is legacy, so a lan bind with no mode named is refused too (and
+        // the line says that it is the default that is refused: see the test of the messages below).
         assert_eq!(
             broken(
                 &[("OAIY_SERVER_BIND", "lan")],
@@ -1460,6 +1534,228 @@ mod tests {
         let e = eval(&[("OAIY_ACCESS_MODE", "scopd")], NO_OWNER);
         assert_eq!(e.violations[0].rule, Rule::Mode);
         assert!(e.violations[0].message.contains("scopd"));
+    }
+
+    /// A build without the web login has no console: rule 2 used to send the operator to `oaiy-server auth init`, which
+    /// answers "no console" there, and the `legacy` that such a build defaults to was refused as if the operator had
+    /// set it. Each line now says what is so.
+    #[test]
+    fn a_build_without_the_web_login_does_not_send_the_operator_to_a_console_it_has_not_got() {
+        let lan_scoped = [("OAIY_SERVER_BIND", "lan"), ("OAIY_ACCESS_MODE", "scoped")];
+        // Rule 2.
+        let e = eval(&lan_scoped, HEADLESS);
+        assert_eq!(
+            e.violations.iter().map(|v| v.rule).collect::<Vec<_>>(),
+            [Rule::LanNeedsOwner]
+        );
+        let line = &e.violations[0].message;
+        assert!(
+            line.contains("this build has no web login")
+                && line.contains("web build of oaiy-server")
+                && line.contains("`web` feature"),
+            "{line}"
+        );
+        // The web build says what to run, and does not say it has no login.
+        let e = eval(&lan_scoped, NO_OWNER);
+        let line = &e.violations[0].message;
+        assert!(
+            line.contains("run `oaiy-server auth init`, then start the server again")
+                && !line.contains("no web login"),
+            "{line}"
+        );
+        // Rule 6: the operator set no mode, and the line says that it is the build's default that is refused.
+        for (pairs, facts, rules, why) in [
+            // No owner on a lan install is rule 2's as well, and the mode is named for what it is.
+            (
+                vec![("OAIY_SERVER_BIND", "lan")],
+                HEADLESS,
+                vec![Rule::LanNeedsOwner, Rule::Mode],
+                "this is a lan install",
+            ),
+            (
+                vec![("OAIY_SERVER_BIND", "lan")],
+                Facts {
+                    owner_exists: true,
+                    web_login: false,
+                },
+                vec![Rule::Mode],
+                "an owner login exists",
+            ),
+            (
+                vec![("OAIY_PUBLIC_URL", "https://dash.example.com")],
+                HEADLESS,
+                vec![Rule::Mode],
+                "this is a proxied install",
+            ),
+            (
+                vec![],
+                Facts {
+                    owner_exists: true,
+                    web_login: false,
+                },
+                vec![Rule::Mode],
+                "an owner login exists",
+            ),
+        ] {
+            let e = eval(&pairs, facts);
+            assert_eq!(
+                e.violations.iter().map(|v| v.rule).collect::<Vec<_>>(),
+                rules,
+                "{pairs:?}"
+            );
+            let line = &e.violations.last().unwrap().message;
+            assert!(
+                line.contains("OAIY_ACCESS_MODE is not set")
+                    && line.contains(why)
+                    && line.contains(
+                        "use the web build of oaiy-server, or set OAIY_ACCESS_MODE=scoped"
+                    ),
+                "{pairs:?}: {line}"
+            );
+        }
+        // What the operator did set is refused as it is named, there and in the web build.
+        for facts in [
+            HEADLESS,
+            Facts {
+                owner_exists: true,
+                web_login: false,
+            },
+        ] {
+            let e = eval(
+                &[
+                    ("OAIY_ACCESS_MODE", "legacy"),
+                    ("OAIY_PUBLIC_URL", "https://dash.example.com"),
+                ],
+                facts,
+            );
+            assert!(
+                e.violations[0]
+                    .message
+                    .starts_with("OAIY_ACCESS_MODE=legacy is refused"),
+                "{}",
+                e.violations[0].message
+            );
+        }
+        // And the install that a build without the login can serve is served, as it was: local, and scoped named.
+        assert!(eval(&[], HEADLESS).violations.is_empty());
+        assert!(eval(
+            &lan_scoped,
+            Facts {
+                owner_exists: true,
+                web_login: false
+            }
+        )
+        .violations
+        .is_empty());
+    }
+
+    /// The owner file is read as the server reads it, by the start and by `check`: existence was all that rule 2
+    /// asked, and a file that the store refused satisfied it and stopped the server a step later.
+    #[test]
+    fn the_owner_file_is_read_as_the_server_reads_it() {
+        use crate::secret_file::testing::TempDir;
+        let dir = TempDir::new("owner-state");
+        let auth = dir.0.join("auth");
+        assert_eq!(inspect_owner_file(&auth), OwnerState::Absent, "no folder");
+        std::fs::create_dir_all(&auth).unwrap();
+        assert_eq!(inspect_owner_file(&auth), OwnerState::Absent, "no file");
+        assert!(!OwnerState::Absent.exists());
+        let put = |text: &str| std::fs::write(auth.join("owner.json"), text).unwrap();
+        // What the store refuses: each is a file that is there, and a line that names it and says why.
+        for (what, text, says) in [
+            ("an empty file", "", "cannot be read"),
+            ("text", "not json", "cannot be read"),
+            ("a cut-off file", r#"{"v":1,"password":"#, "cannot be read"),
+            ("a list", "[]", "no version"),
+            ("no version", r#"{"password":"x"}"#, "no version"),
+            ("a version that is text", r#"{"v":"1"}"#, "no version"),
+            ("a newer OAIY's", r#"{"v":2}"#, "newer OAIY"),
+        ] {
+            put(text);
+            let state = inspect_owner_file(&auth);
+            assert!(
+                state.exists(),
+                "{what}: a file that is there is an owner file, not setup"
+            );
+            let line = state
+                .refusal()
+                .unwrap_or_else(|| panic!("{what}: {state:?}"));
+            assert!(
+                line.contains("owner.json") && line.contains(says),
+                "{what}: {line}"
+            );
+        }
+        // A folder where the file belongs cannot be read either.
+        std::fs::remove_file(auth.join("owner.json")).unwrap();
+        std::fs::create_dir(auth.join("owner.json")).unwrap();
+        let state = inspect_owner_file(&auth);
+        assert!(
+            state.exists() && state.refusal().is_some_and(|l| l.contains("cannot read")),
+            "{state:?}"
+        );
+        std::fs::remove_dir(auth.join("owner.json")).unwrap();
+        // A file that is an owner: with the web login, the document it reads (the times and the password hash).
+        put(
+            r#"{"v":1,"created_ms":1,"password_changed_ms":1,"min_session_epoch":3,"password":"$argon2id$x"}"#,
+        );
+        assert_eq!(inspect_owner_file(&auth), OwnerState::Usable);
+        #[cfg(feature = "web")]
+        {
+            put(r#"{"v":1}"#);
+            let state = inspect_owner_file(&auth);
+            assert!(
+                state.refusal().is_some_and(|l| l.contains("created_ms")),
+                "the login cannot read it, and the start refuses what it cannot read: {state:?}"
+            );
+        }
+        #[cfg(not(feature = "web"))]
+        {
+            put(r#"{"v":1}"#);
+            assert_eq!(inspect_owner_file(&auth), OwnerState::Usable);
+        }
+    }
+
+    #[test]
+    fn check_of_a_build_without_the_web_login_lists_an_owner_file_it_cannot_use_first() {
+        use crate::secret_file::testing::TempDir;
+        let dir = TempDir::new("check-headless-owner");
+        let auth = dir.0.join("auth");
+        std::fs::create_dir_all(&auth).unwrap();
+        let data = dir.0.display().to_string();
+        let env = move |n: &str| match n {
+            "OAIY_DATA_DIR" => Some(data.clone()),
+            "OAIY_SERVER_TOKEN" => Some("short".to_string()),
+            "OAIY_ACCESS_MODE" => Some("scoped".to_string()),
+            _ => None,
+        };
+        for text in ["", "not json", r#"{"v":2}"#] {
+            std::fs::write(auth.join("owner.json"), text).unwrap();
+            let (mut out, mut err) = (Vec::new(), Vec::new());
+            let code = check_headless(&env, &mut out, &mut err);
+            let err = String::from_utf8(err).unwrap();
+            assert_eq!(code, 78, "{text:?}: {err}");
+            assert!(out.is_empty());
+            // The file first, then the token: each on a line of its own, as the start would have said the first.
+            let lines: Vec<&str> = err.lines().collect();
+            assert_eq!(lines.len(), 2, "{text:?}: {err}");
+            assert!(lines[0].contains("owner.json"), "{text:?}: {err}");
+            assert!(lines[1].contains("OAIY_SERVER_TOKEN"), "{text:?}: {err}");
+        }
+        std::fs::write(
+            auth.join("owner.json"),
+            r#"{"v":1,"created_ms":1,"password_changed_ms":1,"password":"x"}"#,
+        )
+        .unwrap();
+        let env = |n: &str| (n == "OAIY_DATA_DIR").then(|| dir.0.display().to_string());
+        // (No mode is named, so the build's default, legacy, meets an owner login: that is refused, as it was.)
+        let (mut out, mut err) = (Vec::new(), Vec::new());
+        let code = check_headless(&env, &mut out, &mut err);
+        let err = String::from_utf8(err).unwrap();
+        assert_eq!(code, 78, "{err}");
+        assert!(
+            err.contains("an owner login exists") && !err.contains("owner.json cannot"),
+            "{err}"
+        );
     }
 
     // ---- the rest -----------------------------------------------------------------------------------
@@ -1493,6 +1789,62 @@ mod tests {
                 "{bad:?}"
             );
         }
+    }
+
+    #[test]
+    fn rule_3_the_scheme_of_a_public_url_is_read_in_any_case_and_the_origin_is_lowercase() {
+        // RFC 3986: a scheme is case-insensitive. This one was refused as "not an https URL".
+        for (text, origin) in [
+            ("HTTPS://DASH.EXAMPLE.TEST", "https://dash.example.test"),
+            (
+                "Https://Dash.Example.Test:8443",
+                "https://dash.example.test:8443",
+            ),
+            ("hTTps://dash.example.test", "https://dash.example.test"),
+            ("  HTTPS://dash.example.test  ", "https://dash.example.test"),
+        ] {
+            let c = ok(&[("OAIY_PUBLIC_URL", text)], NO_OWNER);
+            assert_eq!(c.public_origins[&App::Dash], origin, "{text:?}");
+            assert_eq!(c.exposure, Exposure::Proxied);
+        }
+        // A scheme that is not https in any case is still refused, and a text that is too short to have one, or has
+        // characters that are not a scheme's, does not panic.
+        for bad in [
+            "http://dash.example.test",
+            "HTTP://dash.example.test",
+            "httpss://dash.example.test",
+            "https:/dash.example.test",
+            "https//dash.example.test",
+            "https",
+            "https:/",
+            "\u{ff48}ttps://dash.example.test",
+            "\u{e9}\u{e9}\u{e9}\u{e9}\u{e9}\u{e9}\u{e9}\u{e9}\u{e9}",
+        ] {
+            assert_eq!(
+                broken(&[("OAIY_PUBLIC_URL", bad)], NO_OWNER),
+                [Rule::PublicUrl],
+                "{bad:?}"
+            );
+        }
+        // The port is read as strictly as a `Host`'s.
+        for bad in [
+            "https://dash.example.test:+8443",
+            "https://dash.example.test:08443",
+            "https://dash.example.test:0",
+            "https://dash.example.test:65536",
+            "https://dash.example.test:",
+        ] {
+            assert_eq!(
+                broken(&[("OAIY_PUBLIC_URL", bad)], NO_OWNER),
+                [Rule::PublicUrl],
+                "{bad:?}"
+            );
+        }
+        // The desktop's reader, which does not judge, reads the scheme in the same way.
+        assert!(
+            strip_https_scheme("HTTPS://x") == Some("x")
+                && strip_https_scheme("http://x").is_none()
+        );
     }
 
     #[test]
@@ -1623,62 +1975,6 @@ mod tests {
         let (addr, note) = desktop_bind(Some(" true "));
         assert_eq!(addr, IpAddr::V4(Ipv4Addr::LOCALHOST));
         assert!(note.unwrap().contains("lanAccess"));
-    }
-
-    #[test]
-    fn rule_3_the_scheme_of_a_public_url_is_read_in_any_case_and_the_origin_is_lowercase() {
-        // RFC 3986: a scheme is case-insensitive. This one was refused as "not an https URL".
-        for (text, origin) in [
-            ("HTTPS://DASH.EXAMPLE.TEST", "https://dash.example.test"),
-            (
-                "Https://Dash.Example.Test:8443",
-                "https://dash.example.test:8443",
-            ),
-            ("hTTps://dash.example.test", "https://dash.example.test"),
-            ("  HTTPS://dash.example.test  ", "https://dash.example.test"),
-        ] {
-            let c = ok(&[("OAIY_PUBLIC_URL", text)], NO_OWNER);
-            assert_eq!(c.public_origins[&App::Dash], origin, "{text:?}");
-            assert_eq!(c.exposure, Exposure::Proxied);
-        }
-        // A scheme that is not https in any case is still refused, and a text that is too short to have one, or has
-        // characters that are not a scheme's, does not panic.
-        for bad in [
-            "http://dash.example.test",
-            "HTTP://dash.example.test",
-            "httpss://dash.example.test",
-            "https:/dash.example.test",
-            "https//dash.example.test",
-            "https",
-            "https:/",
-            "\u{ff48}ttps://dash.example.test",
-            "\u{e9}\u{e9}\u{e9}\u{e9}\u{e9}\u{e9}\u{e9}\u{e9}\u{e9}",
-        ] {
-            assert_eq!(
-                broken(&[("OAIY_PUBLIC_URL", bad)], NO_OWNER),
-                [Rule::PublicUrl],
-                "{bad:?}"
-            );
-        }
-        // The port is read as strictly as a `Host`'s.
-        for bad in [
-            "https://dash.example.test:+8443",
-            "https://dash.example.test:08443",
-            "https://dash.example.test:0",
-            "https://dash.example.test:65536",
-            "https://dash.example.test:",
-        ] {
-            assert_eq!(
-                broken(&[("OAIY_PUBLIC_URL", bad)], NO_OWNER),
-                [Rule::PublicUrl],
-                "{bad:?}"
-            );
-        }
-        // The desktop's reader, which does not judge, reads the scheme in the same way.
-        assert!(
-            strip_https_scheme("HTTPS://x") == Some("x")
-                && strip_https_scheme("http://x").is_none()
-        );
     }
 
     #[test]

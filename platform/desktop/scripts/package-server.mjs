@@ -36,9 +36,10 @@ fs.cpSync(cli, path.join(destination, 'resources/cli'), { recursive: true });
 fs.copyFileSync(process.execPath, path.join(destination, 'resources/node', path.basename(process.execPath)));
 fs.writeFileSync(path.join(destination, 'README.txt'), `OAIY headless distribution
 Contains the server, CLI, its ZIPP engine, undici and Node ${process.version} (${process.platform}/${process.arch}).
-Set OAIY_SERVER_TOKEN to a private random credential before making API requests.
-Run ${path.basename(server)}. The default listener is loopback; OAIY_SERVER_BIND=lan
-requires a token and disables all Origin-based authentication exceptions.
+Set OAIY_SERVER_TOKEN to a private random credential (openssl rand -base64 32) before making API requests.
+Run ${path.basename(server)}. The default listener is loopback. OAIY_SERVER_BIND=lan needs an
+owner login first (oaiy-server auth init) and answers bearer tokens only; behind a reverse proxy set
+OAIY_PUBLIC_URL and OAIY_TRUSTED_PROXIES. oaiy-server check lists what a configuration gets wrong.
 Core flows run offline without Node/npm on PATH. Optional browser/image nodes
 still require their documented services/dependencies. Keep resources beside the server.
 `);

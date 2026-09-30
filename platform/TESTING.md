@@ -120,6 +120,8 @@ session, and after a few runs the shim can no longer start.
 (cd ui      && npm test)                 # installs the ZIPP engines if needed, then typecheck, css tokens, contracts, both engines, and the editor's own suites (OAIY's window, services, storage, landing links, engine address, sealed API keys, the service worker and its build, install and update, manifest and icons, download links, the site's pictures and metadata)
 (cd desktop && npm run build)            # tsc --noEmit + vite build
 node --test scripts/fetch-zipp-release.test.mjs   # the ZIPP installer (see "ZIPP engines")
+(cd desktop && node scripts/check-release.mjs)    # the release builds oaiy-server with --features web, CI tests that, the unit does not restart exit 78
+(cd desktop && node --test scripts/check-release.test.mjs)   # ... and that check fails for each way they lose it
 ```
 
 **Nothing in a default run listens or connects beyond loopback.** A listener on `0.0.0.0` or a LAN address makes Windows
