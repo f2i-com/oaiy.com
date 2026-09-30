@@ -129,7 +129,8 @@ pub async fn stage<H: Host>(host: &H, inspect_id: String, passphrase: String, cl
     let ticks = Ticks::from_ids(&classes, keys).map_err(|e| e.message)?;
     let data_dir = host.data_dir()?;
     let (path, looked_at) = host.desk().recall(&inspect_id)?;
-    let options = RestoreOptions { busy: host.busy().await, ..RestoreOptions::default() };
+    // (No look at what is in the way: preparing changes nothing that is live. See `restore::stage_checked`.)
+    let options = RestoreOptions::default();
     let staged = with_time_limit(tokio::task::spawn_blocking(move || restore::stage_checked(&data_dir, &path, &passphrase, &ticks, &options, &looked_at))).await;
     match staged {
         Ok(staged) => {

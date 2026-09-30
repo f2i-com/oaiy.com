@@ -406,8 +406,8 @@ A restore is never done in place. It has three steps, and the first two change n
    items the look listed; when you prepare, the file is decrypted again and must hash the same
    (a file of the same size and date with other things in it is refused: "This is not the backup
    that was checked"), and nothing is prepared that the look did not list. The busy check is made
-   before the file dialog and again after it (a dialog can stay open for minutes), and once more
-   when you prepare.
+   before the file dialog and again after it (a dialog can stay open for minutes). Preparing does
+   not make one (see below).
    Still nothing you use is changed. You can **Cancel restore** here. **A prepared restore that
    is not applied within 24 hours is thrown away at the next start**, unapplied, and the result
    says so: what it would replace may have changed, and you may no longer remember choosing it.
@@ -622,7 +622,8 @@ in parts through internal routes with a secret made for that one backup.
   and refuses more before running any of it. It writes files at the work factor that takes about
   a second on this computer, but never below 2^18 (256 MiB) and never above 2^20 (1 GiB): a
   backup made on a busy computer is not a weak one. Checking and preparing a restore have a
-  15-minute limit and the panel goes on after it; a check is refused while OAIY is busy.
+  15-minute limit and the panel goes on after it; a check is refused while OAIY is busy, and
+  preparing is not (it changes nothing that is live).
 - **What a file may ask is bounded from its own record, before any of it is read.** At most 20,000
   items (a real backup has a few hundred), a record of 16 MiB, one JSON or text item of 16 MiB (a
   calendar is a few megabytes; one of 512 MiB is not a calendar), a voice of 128 MiB, the Agent's

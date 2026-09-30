@@ -898,12 +898,13 @@ fn each_thing_that_stops_an_update_stops_a_backup_a_check_and_a_restore_by_itsel
         assert_eq!(err.kind, ErrorKind::Busy, "{what}");
         assert!(err.message.starts_with("Making a backup has to wait.") && err.message.contains(word) && err.message.ends_with("Try again when it is finished."), "{what}: {err}");
         assert!(!out.0.join("b.oaiybackup").exists(), "{what}: nothing was written");
-        // ... the check of a backup, and preparing a restore.
+        // ... and the check of a backup; preparing one only writes the staging folder, so it does not wait.
         let restoring = RestoreOptions { busy: busy.clone(), ..RestoreOptions::default() };
         let dst = TempDir::new("busy-dst");
         assert_eq!(restore::inspect(&dst.0, &file, PASS, &restoring).unwrap_err().kind, ErrorKind::Busy, "{what}");
-        assert_eq!(restore::stage(&dst.0, &file, PASS, &Ticks::all(), &restoring).unwrap_err().kind, ErrorKind::Busy, "{what}");
         assert_nothing_staged(&dst.0);
+        assert!(restore::stage(&dst.0, &file, PASS, &Ticks::all(), &restoring).is_ok(), "{what}: preparing goes on");
+        restore::discard_pending(&dst.0).unwrap();
     }
 }
 
@@ -993,7 +994,8 @@ fn what_a_backup_waits_for_is_worked_out_in_one_place_and_not_a_second_time() {
     let desk = source_text(include_str!("desk.rs"));
     assert!(desk.contains("host.busy().await.refuse_if_busy(\"checking a backup\")"), "looking asks whether the app is busy and refuses with \"checking a backup\"");
     assert!(desk.contains("busy: host.busy().await, ..RestoreOptions::default() };\n    let file = path.clone();"), "and takes a second look after the dialog");
-    assert!(desk[desk.find("pub async fn stage").unwrap()..].contains("busy: host.busy().await"), "preparing a restore takes its own fresh look");
+    let staging = &desk[desk.find("pub async fn stage").unwrap()..desk.find("pub async fn restart_to_apply").unwrap()];
+    assert!(!staging.contains("host.busy()"), "preparing a restore does not wait for a quiet app: it changes nothing that is live");
     for name in ["backup_restore_inspect", "backup_restore_stage"] {
         assert!(command_source(name).contains("desk::"), "{name} hands over to the restore flow");
     }
@@ -2399,7 +2401,7 @@ fn a_check_that_runs_out_of_time_is_stopped_and_leaves_nothing() {
 }
 
 #[test]
-fn looking_at_a_backup_or_staging_one_waits_while_the_app_is_busy() {
+fn looking_at_a_backup_waits_while_the_app_is_busy_and_staging_one_does_not() {
     let src = TempDir::new("busy-restore-src");
     put(&src.0, "callers.json", b"{}");
     let out = TempDir::new("busy-restore-out");
@@ -2408,8 +2410,9 @@ fn looking_at_a_backup_or_staging_one_waits_while_the_app_is_busy() {
     let dst = TempDir::new("busy-restore-dst");
     let busy = RestoreOptions { busy: Busy::from_readings(&Readings { hub_calls: 1, ..Readings::default() }), ..RestoreOptions::default() };
     assert_eq!(restore::inspect(&dst.0, &file, PASS, &busy).unwrap_err().kind, ErrorKind::Busy);
-    assert_eq!(restore::stage(&dst.0, &file, PASS, &Ticks::all(), &busy).unwrap_err().kind, ErrorKind::Busy);
     assert_nothing_staged(&dst.0);
+    // Preparing only writes the staging folder, so a live call does not stop it.
+    assert!(restore::stage(&dst.0, &file, PASS, &Ticks::all(), &busy).is_ok());
 }
 
 #[test]
@@ -5265,3 +5268,32 @@ async fn the_restart_that_applies_a_restore_asks_again_right_before_it_restarts(
     assert!(host5.calls().is_empty() && !marker.exists());
 }
 
+/// A phone plugin that cannot say whether a call is live stops a backup, a look and a restart, but not the preparing of a
+/// restore that was looked at (it only writes the staging folder).
+#[tokio::test]
+async fn preparing_a_restore_goes_on_while_the_app_is_busy_and_looking_and_restarting_do_not() {
+    use super::desk;
+    let out = TempDir::new("busy-stage");
+    let data = TempDir::new("busy-stage-data");
+    let file = small_backup(&out.0, "a.oaiybackup", "one");
+    let host = FakeHost::new(&data.0, vec![], vec![Some(file.clone())]);
+    let seen = desk::inspect(&host, PASS.to_string()).await.unwrap().unwrap();
+    // The app is busy from now on, in every look that is made.
+    let cannot_tell = || Busy::cannot_tell();
+    *host.busy.lock().unwrap() = std::iter::repeat_with(cannot_tell).take(10).collect();
+    let staged = desk::stage(&host, seen.inspect_id, PASS.to_string(), vec![], false).await.unwrap();
+    assert_eq!(staged.files, 2, "it was prepared");
+    assert!(!host.calls().iter().skip(3).any(|c| *c == "busy"), "and preparing did not even ask: {:?}", host.calls());
+    // Looking at another backup, and restarting, are refused in the same state.
+    let another = FakeHost::new(&data.0, vec![Busy::cannot_tell(); 3], vec![Some(file)]);
+    let err = desk::inspect(&another, PASS.to_string()).await.err().unwrap();
+    assert!(err.contains("could not tell"), "{err}");
+    let err = desk::restart_to_apply(&another).await.unwrap_err();
+    assert!(err.contains("could not tell"), "{err}");
+    assert_eq!(*another.restarts.lock().unwrap(), 0);
+    // And so is the core: preparing with a busy app works, a look with one does not.
+    let busy = RestoreOptions { busy: in_a_call(), ..RestoreOptions::default() };
+    restore::discard_pending(&data.0).unwrap();
+    assert!(restore::stage(&data.0, &small_backup(&out.0, "b.oaiybackup", "two"), PASS, &Ticks::none(), &busy).is_ok());
+    assert_eq!(restore::inspect(&data.0, &small_backup(&out.0, "c.oaiybackup", "three"), PASS, &busy).unwrap_err().kind, ErrorKind::Busy);
+}

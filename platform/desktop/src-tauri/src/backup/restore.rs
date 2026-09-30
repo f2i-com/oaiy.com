@@ -675,7 +675,10 @@ pub fn stage_checked(data_dir: &Path, file: &Path, passphrase: &str, ticks: &Tic
 }
 
 fn stage_inner(data_dir: &Path, file: &Path, passphrase: &str, ticks: &Ticks, opts: &RestoreOptions, looked_at: Option<&Inspection>) -> Result<Staged> {
-    opts.busy.refuse_if_busy("preparing a restore")?;
+    // Preparing writes only into the staging folder and changes nothing that is live, so it does not wait for a quiet app: a
+    // phone plugin that cannot say whether a call is live would otherwise leave the person unable to go on. What needs a
+    // quiet app is what a restore does to the app: looking at a backup (a second of computing and up to a gigabyte of memory),
+    // making a backup, and the restart that applies one (it ends a call).
     let budget = opts.budget();
     let scratch = TempFolder::new(&scratch_dir(data_dir))?;
     let verified = container::open_backup(file, passphrase, &scratch.0, &opts.limits, &budget)?;
