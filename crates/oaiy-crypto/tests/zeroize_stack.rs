@@ -63,31 +63,64 @@ fn scrub() {
     std::hint::black_box(&mut pad);
 }
 
-/// A frame of some depth between the caller and the code under test, so that the code does not always run at the same offset (the counts must not depend on it).
+/// A frame of `N` bytes between the caller and the code under test.
+///
+/// **Why the code under test is run at several depths and the largest count is kept.** `scan_dead_stack` has a frame of its own, and the first few hundred bytes of it (its return
+/// address, saved registers and small locals) are written on the stack right where the frames of the code that has just returned were: a copy that sits in the nearest few hundred
+/// bytes is overwritten by the scan itself, and one that lies just beyond is seen. A probe that ran the code at one depth saw a copy or not by the luck of that offset (a mutant that
+/// copied a derived key through a second local in `kdf::derive_into` was seen at one depth and not at another). Running at eight depths moves the code's frames relative to the scan's,
+/// and a copy is found at the depths where it is not under the scan''s own frame. The controls show that a small frame right under the caller is found this way.
 #[inline(never)]
-fn padded(f: &mut dyn FnMut()) {
-    let pad = [0u8; 512];
+fn padded<const N: usize>(f: &mut dyn FnMut()) {
+    let pad = [0u8; N];
     std::hint::black_box(&pad);
     f();
 }
 
+/// How many depths: the index of [`call_at_depth`].
+const DEPTHS: usize = 8;
+
 #[inline(never)]
-fn run_and_scan(needles: &[&[u8]], deep: bool, mut f: impl FnMut()) -> Vec<usize> {
-    scrub();
-    if deep {
-        padded(&mut f);
-    } else {
-        f();
+fn call_at_depth(depth: usize, f: &mut dyn FnMut()) {
+    match depth {
+        0 => f(),
+        1 => padded::<200>(f),
+        2 => padded::<400>(f),
+        3 => padded::<700>(f),
+        4 => padded::<1100>(f),
+        5 => padded::<1700>(f),
+        6 => padded::<2600>(f),
+        _ => padded::<4000>(f),
     }
-    scan_dead_stack(needles)
 }
 
-/// The positive control: a callee that leaves a copy of the key in its own frame.
+/// Runs `f` at every depth, each time on a scrubbed stack, and returns for each needle the **largest** number of places that it was found in.
+#[inline(never)]
+fn run_and_scan(needles: &[&[u8]], mut f: impl FnMut()) -> Vec<usize> {
+    let mut most = vec![0usize; needles.len()];
+    for depth in 0..DEPTHS {
+        scrub();
+        call_at_depth(depth, &mut f);
+        for (m, found) in most.iter_mut().zip(scan_dead_stack(needles)) {
+            *m = (*m).max(found);
+        }
+    }
+    most
+}
+
+/// The positive controls. A callee that leaves a copy of the key in a large frame of its own, and one that leaves it in the smallest: a local array in a function called directly by
+/// the code being run, which is the nearest frame there is.
 #[inline(never)]
 fn leaves_a_copy(key: &[u8; 32]) {
     let mut pad = [0u8; 4096];
     pad[2000..2032].copy_from_slice(key);
     std::hint::black_box(&pad);
+}
+
+#[inline(never)]
+fn leaves_a_small_copy(key: &[u8; 32]) {
+    let copy = *key;
+    std::hint::black_box(&copy);
 }
 
 /// The floor for a by-value result: no cryptography at all, a `Secret` built from a value and returned by move through `Result`, unwrapped and dropped, as any caller of a
@@ -102,17 +135,16 @@ fn plain_return(x: &[u8; 32]) -> Result<Secret<32>, oaiy_crypto::Error> {
 
 /// Like `run_and_scan`, for a function that makes a key at random: the needle is what it made, so `f` returns a copy of it **on the heap** (a copy in the frame would be the test's own).
 #[inline(never)]
-fn run_and_scan_made(deep: bool, mut f: impl FnMut() -> Vec<u8>) -> usize {
-    scrub();
-    let mut needle = Vec::new();
-    if deep {
-        padded(&mut || needle = f());
-    } else {
-        needle = f();
+fn run_and_scan_made(mut f: impl FnMut() -> Vec<u8>) -> usize {
+    let mut most = 0;
+    for depth in 0..DEPTHS {
+        scrub();
+        let mut needle = Vec::new();
+        call_at_depth(depth, &mut || needle = f());
+        most = most.max(scan_dead_stack(&[&needle])[0]);
     }
-    scan_dead_stack(&[&needle])[0]
+    most
 }
-
 struct Row {
     name: &'static str,
     input: usize,
@@ -147,22 +179,26 @@ fn no_primitive_leaves_its_key_in_the_dead_stack_and_the_into_variants_leave_no_
     let d_phrase = *bip39::wrap_key(&entropy, &salt, 3, argon::MEM_MIN).unwrap().expose();
 
     let mut table: Vec<Row> = Vec::new();
-    let mut controls: Vec<(String, usize, usize)> = Vec::new();
-    for deep in [false, true] {
-        let tag = if deep { "deep" } else { "top" };
-        let positive = run_and_scan(&[&master_bytes], deep, || leaves_a_copy(master.expose()))[0];
-        let negative = run_and_scan(&[&master_bytes], deep, || {
-            std::hint::black_box(master.expose().len());
-        })[0];
-        assert!(positive >= 1, "{tag} control: a callee that leaves a copy of the key is found ({positive})");
-        assert_eq!(negative, 0, "{tag} control: a callee that leaves none finds none");
-        let floor = run_and_scan(&[&d_backup], deep, || drop(plain_return(&d_backup).unwrap()))[0];
-        controls.push((tag.to_string(), positive, floor));
-
+    // the controls: a large frame that leaves a copy, the smallest frame that leaves one, and nothing
+    let positive = run_and_scan(&[&master_bytes], || leaves_a_copy(master.expose()))[0];
+    let positive_small = run_and_scan(&[&master_bytes], || leaves_a_small_copy(master.expose()))[0];
+    let negative = run_and_scan(&[&master_bytes], || {
+        std::hint::black_box(master.expose().len());
+    })[0];
+    assert!(positive >= 1, "control: a callee with a large frame that leaves a copy of the key is found ({positive})");
+    assert!(
+        positive_small >= 1,
+        "control: a callee with the smallest frame, right under the caller, that leaves a copy of the key is found ({positive_small})"
+    );
+    assert_eq!(negative, 0, "control: a callee that leaves none finds none");
+    // the floor for a key that comes back by value: what a function with no cryptography in it leaves
+    let floor = run_and_scan(&[&d_backup], || drop(plain_return(&d_backup).unwrap()))[0];
+    let controls = (positive, positive_small, floor);
+    {
         let mut row = |name: &'static str, input: &[u8], output: &[u8], mut f: Box<dyn FnMut() + '_>| {
-            let counts = run_and_scan(&[input, output], deep, &mut f);
+            let counts = run_and_scan(&[input, output], &mut f);
             table.push(Row { name, input: counts[0], output: counts[1] });
-            println!("ZEROIZE_STACK {configuration}, {tag}: {name}: input={} output={}", counts[0], counts[1]);
+            println!("ZEROIZE_STACK {configuration}: {name}: input={} output={}", counts[0], counts[1]);
         };
 
         // the keys that come back: by value, and in place
@@ -304,11 +340,10 @@ fn no_primitive_leaves_its_key_in_the_dead_stack_and_the_into_variants_leave_no_
     }
     // the keys that are made at random: by value, so held to the floor like the rest
     let mut made: Vec<(&str, usize)> = Vec::new();
-    for deep in [false, true] {
-        let tag = if deep { "deep" } else { "top" };
+    {
         let mut one = |name: &'static str, f: &mut dyn FnMut() -> Vec<u8>| {
-            let count = run_and_scan_made(deep, &mut *f);
-            println!("ZEROIZE_STACK {configuration}, {tag}: {name}: made={count}");
+            let count = run_and_scan_made(&mut *f);
+            println!("ZEROIZE_STACK {configuration}: {name}: made={count}");
             made.push((name, count));
         };
         one("Secret::random", &mut || Secret::<32>::random().unwrap().expose().to_vec());
@@ -317,10 +352,9 @@ fn no_primitive_leaves_its_key_in_the_dead_stack_and_the_into_variants_leave_no_
         one("bip39 Entropy::random", &mut || Entropy::random().unwrap().expose().to_vec());
         one("RecoveryKit::generate", &mut || RecoveryKit::generate().unwrap().key().expose().to_vec());
     }
-    println!("ZEROIZE_STACK {configuration}: controls (tag, positive, by-value floor) {controls:?}");
+    println!("ZEROIZE_STACK {configuration}: controls (large frame, small frame, by-value floor) {controls:?}");
 
     // what is asserted
-    let floor = controls.iter().map(|(_, _, floor)| *floor).max().unwrap_or(0);
     let mut failures: Vec<String> = Vec::new();
     for row in &table {
         let is_into = row.name.ends_with("_into");
