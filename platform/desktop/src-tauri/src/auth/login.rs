@@ -45,6 +45,7 @@ use super::cookie::{self, Lookup, DEVICE_MAX_AGE, REMEMBER_MAX_AGE};
 use super::device;
 use super::guard::{Denial, Guard, RequestInfo};
 use super::lanes::{AnonLane, AnonPermit, Hasher, Reject, ReservedLane, SessionGate, SessionLane};
+use super::mode::{AccessMode, ConfigRefusal};
 use super::owner::{self, CreateError, OwnerDoc};
 use super::password::{Argon2Engine, HashError, PasswordEngine, Verdict};
 use super::policy::{self, Reason};
@@ -1678,6 +1679,22 @@ async fn revoke_others(
     st.do_revoke_others(&p, &i)
 }
 
+/// The access mode of an `oaiy-server` built with the web login: `scoped` unless it is told another, and `legacy`
+/// refused. The login needs the store on disk, which `legacy` never opens (it changes nothing under the data
+/// folder), and `legacy` trusts Origins: a server with a login has moved past that (design 4.5.5 rule 6).
+pub fn server_mode(value: Option<&str>) -> Result<AccessMode, ConfigRefusal> {
+    match value.map(str::trim).filter(|v| !v.is_empty()) {
+        None => Ok(AccessMode::Scoped),
+        Some(_) => match AccessMode::from_env(value)? {
+            AccessMode::Legacy => Err(ConfigRefusal(
+                "OAIY_ACCESS_MODE=legacy is refused by a server with the web login: use scoped (the default)"
+                    .into(),
+            )),
+            mode => Ok(mode),
+        },
+    }
+}
+
 /// The period of the upkeep task: the throttle is written at most every five seconds when it changed.
 pub const TICK_MS: u64 = FLUSH_EVERY_MS;
 
@@ -1697,6 +1714,23 @@ pub fn can_host(guard: &Guard) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_server_with_the_web_login_defaults_to_scoped_and_refuses_legacy() {
+        assert_eq!(server_mode(None), Ok(AccessMode::Scoped));
+        assert_eq!(server_mode(Some("")), Ok(AccessMode::Scoped));
+        assert_eq!(server_mode(Some("  ")), Ok(AccessMode::Scoped));
+        assert_eq!(server_mode(Some("scoped")), Ok(AccessMode::Scoped));
+        assert_eq!(server_mode(Some("SHADOW")), Ok(AccessMode::Shadow));
+        let refused = server_mode(Some("legacy")).unwrap_err();
+        assert!(refused.to_string().contains("legacy"), "{refused}");
+        assert_eq!(refused.exit_code(), 78);
+        // A value that is not a mode is refused as it always was.
+        assert!(server_mode(Some("scopd"))
+            .unwrap_err()
+            .to_string()
+            .contains("scopd"));
+    }
 
     #[test]
     fn a_secret_is_never_shown() {

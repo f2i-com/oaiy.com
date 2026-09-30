@@ -24,6 +24,8 @@ pub mod clock;
 #[cfg(feature = "web")]
 pub mod console;
 #[cfg(feature = "web")]
+pub mod console_cli;
+#[cfg(feature = "web")]
 pub mod cookie;
 pub mod cors;
 #[cfg(feature = "web")]
@@ -40,6 +42,10 @@ pub mod login;
 pub mod mode;
 #[cfg(feature = "web")]
 pub mod owner;
+#[cfg(feature = "web")]
+pub mod password;
+#[cfg(feature = "web")]
+pub mod policy;
 pub mod presets;
 pub mod principal;
 pub mod routes;
@@ -51,13 +57,9 @@ pub mod session;
 #[cfg(feature = "web")]
 pub mod setup;
 pub mod store;
-pub mod token;
-#[cfg(feature = "web")]
-pub mod password;
-#[cfg(feature = "web")]
-pub mod policy;
 #[cfg(feature = "web")]
 pub mod throttle;
+pub mod token;
 #[cfg(feature = "web")]
 pub mod wordlist;
 
