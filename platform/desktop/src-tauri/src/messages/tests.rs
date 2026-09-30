@@ -222,6 +222,17 @@ fn states_and_times_follow_the_owner() {
     let again = store.set_state(&m.id, State::New, "owner").unwrap();
     assert!(again.seen_at.is_none() && again.handled_at.is_none() && again.handled_by.is_none());
     assert_eq!(store.unread(), 1);
+    // A "seen" that comes late (from another window, or one that was on its way when it was handled) does not make a handled message new again, and one
+    // already seen is as it was: only "not handled" makes a message new.
+    let handled = store.set_state(&m.id, State::Handled, "owner").unwrap();
+    let late = store.set_state(&m.id, State::Seen, "owner").unwrap();
+    assert_eq!((late.state, late.handled_at.clone(), late.handled_by.clone()), (State::Handled, handled.handled_at.clone(), handled.handled_by.clone()), "still handled, and when and by whom");
+    assert_eq!(store.get(&m.id).unwrap().state, State::Handled);
+    let again = store.set_state(&m.id, State::New, "owner").unwrap();
+    assert_eq!(again.state, State::New);
+    let seen_once = store.set_state(&m.id, State::Seen, "owner").unwrap();
+    let seen_twice = store.set_state(&m.id, State::Seen, "owner").unwrap();
+    assert_eq!((seen_once.state, seen_twice.seen_at), (State::Seen, seen_once.seen_at), "seen again keeps the time it was first seen");
     // Handling a message nobody saw counts as having seen it.
     let direct = store.add(new("call_2", "+61491570006", "Second.")).unwrap();
     assert!(store.set_state(&direct.id, State::Handled, "owner").unwrap().seen_at.is_some());

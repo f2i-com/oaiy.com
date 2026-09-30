@@ -487,6 +487,11 @@ impl Store {
             return Err(Error::new(404, "no_message", format!("no message {id:?}")));
         };
         let before = inner.messages[i].clone();
+        // Seen is only ever a step from new: a message that is handled stays handled when a "seen" reaches it (one that was on its way when the owner
+        // handled it, or comes from another window), and one already seen is as it was. Only the owner's "not handled" makes it new again.
+        if state == State::Seen && before.state != State::New {
+            return Ok(before);
+        }
         {
             let m = &mut inner.messages[i];
             m.state = state;
