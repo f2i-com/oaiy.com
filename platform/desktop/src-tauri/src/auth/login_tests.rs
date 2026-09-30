@@ -738,7 +738,7 @@ async fn a_login_makes_a_session_with_the_exact_cookies_and_body_behind_a_proxy(
     assert_eq!(body["app"], "dash");
     assert_eq!(body["next"], Value::Null);
     assert_eq!(body["persisted"], true);
-    assert_eq!(body["scopes"].as_array().unwrap().len(), 54);
+    assert_eq!(body["scopes"].as_array().unwrap().len(), 56);
     // The csrf value is the one derived from the token secret (the vector's rule), and it works.
     let secret = token::parse(&session).unwrap().secret;
     assert_eq!(body["csrf"], token::csrf_value(secret).unwrap());
@@ -2238,7 +2238,7 @@ async fn the_session_endpoint_is_public_says_who_you_are_and_never_carries_cors(
     assert_eq!(s["authenticated"], true);
     assert_eq!(s["csrf"], b.csrf.as_str());
     assert_eq!(s["controlLevel"], "project");
-    assert_eq!(s["scopes"].as_array().unwrap().len(), 54);
+    assert_eq!(s["scopes"].as_array().unwrap().len(), 56);
     assert_eq!(s["persisted"], true);
     // A request from another site sees the anonymous answer (the cookie is ignored).
     let cross = go(
