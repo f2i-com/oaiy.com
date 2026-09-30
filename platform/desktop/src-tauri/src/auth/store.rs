@@ -20,7 +20,8 @@
 //! - Signing in never needs a write: a session made while the disk is full lives in memory, marked
 //!   not persisted. Every other writer (a pairing, a token) fails with `store_unavailable`.
 
-use std::collections::{BTreeSet, HashMap, VecDeque};
+use std::cmp::Reverse;
+use std::collections::{BTreeSet, BinaryHeap, HashMap, HashSet, VecDeque};
 use std::io;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, MutexGuard};
@@ -49,6 +50,10 @@ pub const MAX_SESSIONS: usize = 32;
 pub const DERIVE_PER_MINUTE: usize = 30;
 /// A record expired or revoked for longer than this is dropped.
 pub const PURGE_AFTER_MS: u64 = 7 * DAY;
+/// A `run` credential (a derived or per-run one: memory-only, made in bulk) is dropped this long after it
+/// ended, not seven days: long enough that a client that presents a stale one is told it expired and not that
+/// it is unknown, short enough that thirty a minute do not pile up (10,800 in six hours).
+pub const RUN_PURGE_AFTER_MS: u64 = 10 * MINUTE;
 pub const FLUSH_EVERY_MS: u64 = 60_000;
 pub const PURGE_EVERY_MS: u64 = HOUR;
 /// Exit code of a refused configuration (`EX_CONFIG`): the unit does not restart it.
@@ -709,6 +714,12 @@ struct Inner {
     /// Records of a shape this build cannot read (a `kind` or an `app` a newer build made): kept as they
     /// were written and written back with the rest, never looked up and never honoured (design 4.1 rule 4).
     unknown: Vec<Value>,
+    /// The ids of the records made under each parent: what the cap on children and the sessions' rotation
+    /// look at, instead of every record there is.
+    children: HashMap<String, HashSet<String>>,
+    /// When each `run` credential ended (its expiry, and again its revocation), earliest first: what
+    /// [`Inner::purge_runs`] pops. An entry the record has outlived is dropped when it comes up.
+    run_ends: BinaryHeap<Reverse<(u64, String)>>,
     owner: Option<OwnerFile>,
     min_epoch: u64,
     static_present: bool,
@@ -926,6 +937,21 @@ impl AuthStore {
         self.lock().insert_loaded(r);
     }
 
+    /// How many credentials of `kind` the store holds in memory, alive or not: what upkeep keeps small.
+    pub fn held_count(&self, kind: Kind) -> usize {
+        self.lock()
+            .records
+            .values()
+            .filter(|r| r.kind == kind)
+            .count()
+    }
+
+    /// How many ids the by-parent index holds (the tests hold it to the records there are).
+    #[cfg(test)]
+    pub(crate) fn indexed_children(&self) -> usize {
+        self.lock().children.values().map(HashSet::len).sum()
+    }
+
     /// How many credentials of `kind` are alive (not revoked, not expired).
     pub fn live_count(&self, kind: Kind) -> usize {
         let now = self.clock.now_ms();
@@ -956,6 +982,9 @@ impl AuthStore {
         let expires_ms = now.saturating_add(spec.ttl_ms);
         let mut g = self.lock();
         let persisted = persisted_kind(spec.kind);
+        // What ended a while ago goes first, so that what follows looks at what is there and not at
+        // everything there has been.
+        g.purge_runs(now);
 
         if persisted
             && g.records
@@ -968,18 +997,13 @@ impl AuthStore {
         }
         if let Some(parent) = &spec.parent {
             g.check_parent(parent, now)?;
-            let children = g
-                .records
-                .values()
-                .filter(|r| r.parent.as_deref() == Some(parent.as_str()) && r.alive(now))
-                .count();
+            let children = g.live_children(parent, now);
             // A session's rotation frees its slot below; count only what would remain.
             let rotating = spec.kind == Kind::Ses
-                && g.records.values().any(|r| {
-                    r.kind == Kind::Ses
-                        && r.parent.as_deref() == Some(parent.as_str())
-                        && r.app == spec.app
-                        && r.alive(now)
+                && g.children.get(parent.as_str()).is_some_and(|ids| {
+                    ids.iter()
+                        .filter_map(|id| g.records.get(id))
+                        .any(|r| r.kind == Kind::Ses && r.app == spec.app && r.alive(now))
                 });
             if children - usize::from(rotating) >= MAX_CHILDREN {
                 return Err(MintFailure::TooManyChildren);
@@ -989,14 +1013,12 @@ impl AuthStore {
             // One child session per (parent, app): a new handoff rotates and revokes the previous one.
             if let Some(parent) = &spec.parent {
                 let previous: Vec<String> = g
-                    .records
-                    .values()
-                    .filter(|r| {
-                        r.kind == Kind::Ses
-                            && r.parent.as_deref() == Some(parent.as_str())
-                            && r.app == spec.app
-                            && r.alive(now)
-                    })
+                    .children
+                    .get(parent.as_str())
+                    .into_iter()
+                    .flatten()
+                    .filter_map(|id| g.records.get(id))
+                    .filter(|r| r.kind == Kind::Ses && r.app == spec.app && r.alive(now))
                     .map(|r| r.id.clone())
                     .collect();
                 for id in previous {
@@ -1077,7 +1099,7 @@ impl AuthStore {
             extra: Map::new(),
         };
         let id = record.id.clone();
-        g.records.insert(id.clone(), record);
+        g.insert(record);
         if persisted {
             if let Err(e) = g.flush(self.writer.as_ref(), now) {
                 if spec.kind == Kind::Ses {
@@ -1089,7 +1111,7 @@ impl AuthStore {
                         "auth: a session could not be written and lives in memory only: {e}"
                     );
                 } else {
-                    g.records.remove(&id);
+                    g.remove(&id);
                     return Err(MintFailure::StoreUnavailable(e));
                 }
             }
@@ -1288,6 +1310,8 @@ impl AuthStore {
         let now = self.clock.now_ms();
         let mut g = self.lock();
         g.clamp_future_use(now);
+        // Derived credentials are memory-only: nothing to write when they go.
+        g.purge_runs(now);
         let mut changed = false;
         if now.saturating_sub(g.last_purge_ms) >= PURGE_EVERY_MS || g.last_purge_ms == 0 {
             changed = g.purge(now);
@@ -1333,6 +1357,8 @@ impl Inner {
             legacy: HashMap::new(),
             file_extra: Map::new(),
             unknown: Vec::new(),
+            children: HashMap::new(),
+            run_ends: BinaryHeap::new(),
             owner: None,
             min_epoch: 0,
             static_present: false,
@@ -1350,7 +1376,71 @@ impl Inner {
         if r.legacy {
             self.legacy.insert(r.hash.clone(), r.id.clone());
         }
+        self.insert(r);
+    }
+
+    /// Put a record in, and in the indexes that find it by its parent and by when it ends.
+    fn insert(&mut self, r: Record) {
+        if let Some(parent) = &r.parent {
+            self.children
+                .entry(parent.clone())
+                .or_default()
+                .insert(r.id.clone());
+        }
+        if r.kind == Kind::Run {
+            self.run_ends.push(Reverse((r.expires_ms, r.id.clone())));
+        }
         self.records.insert(r.id.clone(), r);
+    }
+
+    /// Take a record out of the store and the indexes.
+    fn remove(&mut self, id: &str) {
+        if let Some(r) = self.records.remove(id) {
+            if let Some(ids) = r.parent.as_ref().and_then(|p| self.children.get_mut(p)) {
+                ids.remove(id);
+            }
+        }
+    }
+
+    /// How many of the records made under `parent` are alive.
+    fn live_children(&self, parent: &str, now: u64) -> usize {
+        self.children.get(parent).map_or(0, |ids| {
+            ids.iter()
+                .filter(|id| self.records.get(*id).is_some_and(|r| r.alive(now)))
+                .count()
+        })
+    }
+
+    /// Drop the `run` credentials that ended more than [`RUN_PURGE_AFTER_MS`] ago (expired, or revoked): the
+    /// ones at the front of the queue and only those, so what a derive costs does not grow with what has
+    /// been derived. Whether anything went.
+    fn purge_runs(&mut self, now: u64) -> bool {
+        let mut removed = false;
+        while let Some(Reverse((ended, id))) = self.run_ends.peek().cloned() {
+            if ended.saturating_add(RUN_PURGE_AFTER_MS) > now {
+                break;
+            }
+            self.run_ends.pop();
+            // The entry may be old: the record may be gone, or have ended earlier (revoked) and been queued
+            // again for then. What counts is when it ended by now.
+            let gone = self.records.get(&id).is_some_and(|r| {
+                r.kind == Kind::Run
+                    && r.revoked_ms
+                        .into_iter()
+                        .chain(std::iter::once(r.expires_ms))
+                        .min()
+                        .unwrap_or(0)
+                        .saturating_add(RUN_PURGE_AFTER_MS)
+                        <= now
+            });
+            if gone {
+                self.remove(&id);
+                self.derive_times.remove(&id);
+                self.elevated.remove(&id);
+                removed = true;
+            }
+        }
+        removed
     }
 
     fn chain_ctx(&self, now: u64) -> chain::Ctx {
@@ -1380,6 +1470,10 @@ impl Inner {
             if r.revoked_ms.is_none() {
                 r.revoked_ms = Some(now);
                 r.revoked_reason = Some(reason.to_string());
+                if r.kind == Kind::Run {
+                    // Ended now, not at its expiry: queued again for then.
+                    self.run_ends.push(Reverse((now, id.to_string())));
+                }
             }
         }
         self.elevated.remove(id);
@@ -1472,6 +1566,10 @@ impl Inner {
             now.saturating_sub(ended) < PURGE_AFTER_MS
         });
         self.legacy.retain(|_, id| self.records.contains_key(id));
+        self.children.retain(|_, ids| {
+            ids.retain(|id| self.records.contains_key(id));
+            !ids.is_empty()
+        });
         self.derive_times
             .retain(|id, _| self.records.contains_key(id) || id == STATIC_PARENT);
         self.elevated

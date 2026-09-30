@@ -1542,6 +1542,238 @@ fn at_most_30_derived_credentials_a_minute_per_credential_and_64_alive() {
     ));
 }
 
+// ============ F7: derived credentials do not pile up, and a derive costs what it cost the first time =========
+
+fn short_lived() -> DeriveRequest {
+    DeriveRequest {
+        scopes: ScopeSet::of(&["system.read"]),
+        ttl_ms: Some(1000),
+        label: "x".into(),
+    }
+}
+
+#[test]
+fn f7_thirty_derives_a_minute_for_six_hours_leave_a_few_hundred_records_and_not_ten_thousand() {
+    // A holder of the static token derives 30 a minute with a life of a second: 10,800 in six hours. What the
+    // store holds is what ended in the last ten minutes (a few hundred), and the same at the end as after
+    // the first hour: nothing here grows with what has been derived. (The number of records held bounds
+    // the work of every scan; no wall-clock time is measured.)
+    let clock = clock();
+    let store = memory(&clock);
+    store.set_static_present(true);
+    let parent = Principal::static_token();
+    let (mut peak, mut after_an_hour) = (0, 0);
+    for minute in 0..360u32 {
+        for _ in 0..DERIVE_PER_MINUTE {
+            store.derive(&parent, short_lived()).expect("a derive");
+            clock.advance(2000);
+        }
+        store.maintain();
+        peak = peak.max(store.held_count(Kind::Run));
+        if minute == 59 {
+            after_an_hour = store.held_count(Kind::Run);
+        }
+    }
+    let ten_minutes = 10 * DERIVE_PER_MINUTE;
+    assert!(
+        peak <= ten_minutes + 2 * DERIVE_PER_MINUTE,
+        "{peak} run credentials held at the most: 10,800 were made"
+    );
+    let now = store.held_count(Kind::Run);
+    assert!(
+        now <= after_an_hour + DERIVE_PER_MINUTE,
+        "flat: {after_an_hour} after an hour, {now} after six"
+    );
+    assert!(store.live_count(Kind::Run) <= 1, "and almost none is alive");
+    // The index by parent holds exactly the records there are.
+    assert_eq!(store.indexed_children(), now);
+}
+
+#[test]
+fn f7_a_derive_makes_room_for_itself_when_no_upkeep_runs() {
+    // Nothing calls `maintain` here: the derive itself drops what ended.
+    let clock = clock();
+    let store = memory(&clock);
+    store.set_static_present(true);
+    let parent = Principal::static_token();
+    let mut peak = 0;
+    for _ in 0..180 {
+        for _ in 0..DERIVE_PER_MINUTE {
+            store.derive(&parent, short_lived()).unwrap();
+            clock.advance(2000);
+        }
+        peak = peak.max(store.held_count(Kind::Run));
+    }
+    assert!(
+        peak <= 10 * DERIVE_PER_MINUTE + 2 * DERIVE_PER_MINUTE,
+        "{peak} held of 5,400 made"
+    );
+}
+
+#[test]
+fn f7_a_revoked_derived_credential_is_dropped_ten_minutes_after_it_was_revoked_not_at_its_expiry() {
+    let clock = clock();
+    let store = memory(&clock);
+    store.set_static_present(true);
+    let parent = Principal::static_token();
+    let day_long = |store: &AuthStore| {
+        store
+            .derive(
+                &parent,
+                DeriveRequest {
+                    scopes: ScopeSet::of(&["system.read"]),
+                    ttl_ms: Some(DAY),
+                    label: "x".into(),
+                },
+            )
+            .unwrap()
+    };
+    let one = day_long(&store);
+    store.revoke(&one.id, "revoked");
+    clock.advance(RUN_PURGE_AFTER_MS - 1);
+    store.maintain();
+    assert_eq!(
+        store.authenticate(&one.token, None),
+        Err(AuthError::Revoked { reason: "revoked" }),
+        "told it was revoked while it is remembered"
+    );
+    clock.advance(1);
+    store.maintain();
+    assert_eq!(store.held_count(Kind::Run), 0);
+    assert_eq!(
+        store.authenticate(&one.token, None),
+        Err(AuthError::Invalid)
+    );
+    // Thirty a minute for two hours, each revoked at once and made to live a day: not 3,600 for a day.
+    let mut peak = 0;
+    for _ in 0..120 {
+        for _ in 0..DERIVE_PER_MINUTE {
+            let made = day_long(&store);
+            store.revoke(&made.id, "revoked");
+            clock.advance(2000);
+        }
+        store.maintain();
+        peak = peak.max(store.held_count(Kind::Run));
+    }
+    assert!(
+        peak <= 10 * DERIVE_PER_MINUTE + 2 * DERIVE_PER_MINUTE,
+        "{peak} held of 3,600 revoked"
+    );
+}
+
+#[test]
+fn f7_a_stale_derived_credential_is_told_it_expired_for_ten_minutes_and_is_unknown_after() {
+    let clock = clock();
+    let store = memory(&clock);
+    store.set_static_present(true);
+    let made = store
+        .derive(&Principal::static_token(), short_lived())
+        .unwrap();
+    // It ended a second in. One millisecond short of ten minutes after that: still remembered.
+    clock.advance(1000 + RUN_PURGE_AFTER_MS - 1);
+    store.maintain();
+    assert_eq!(store.held_count(Kind::Run), 1);
+    assert_eq!(
+        store.authenticate(&made.token, None),
+        Err(AuthError::Expired)
+    );
+    clock.advance(1);
+    store.maintain();
+    assert_eq!(store.held_count(Kind::Run), 0);
+    assert_eq!(
+        store.authenticate(&made.token, None),
+        Err(AuthError::Invalid)
+    );
+}
+
+#[test]
+fn f7_the_cap_on_children_counts_the_live_ones_of_each_parent_and_a_slot_frees_when_one_ends() {
+    let clock = clock();
+    let store = memory(&clock);
+    let a = store.mint(native_pat(&["system.read"])).unwrap();
+    let b = store.mint(native_pat(&["system.read"])).unwrap();
+    let a_p = store.authenticate(&a.token, None).unwrap();
+    let b_p = store.authenticate(&b.token, None).unwrap();
+    let ten_minutes = || DeriveRequest {
+        scopes: ScopeSet::of(&["system.read"]),
+        ttl_ms: Some(10 * MIN),
+        label: "x".into(),
+    };
+    // 64 children, made in three batches under the rate of 30 a minute, all alive.
+    for batch in [
+        DERIVE_PER_MINUTE,
+        DERIVE_PER_MINUTE,
+        MAX_CHILDREN - 2 * DERIVE_PER_MINUTE,
+    ] {
+        for _ in 0..batch {
+            store.derive(&a_p, ten_minutes()).unwrap();
+        }
+        clock.advance(MIN + 1000);
+    }
+    assert_eq!(store.live_count(Kind::Run), MAX_CHILDREN);
+    assert!(matches!(
+        store.derive(&a_p, ten_minutes()),
+        Err(DeriveError::Mint(MintFailure::TooManyChildren))
+    ));
+    // Another parent has a cap of its own.
+    store.derive(&b_p, ten_minutes()).unwrap();
+    // Eleven minutes on, every one of them has ended: they are still held (they are dropped ten minutes after
+    // they ended), and none of them counts against the cap.
+    clock.advance(11 * MIN);
+    assert!(store.held_count(Kind::Run) > MAX_CHILDREN);
+    assert_eq!(store.live_count(Kind::Run), 0);
+    store.derive(&a_p, ten_minutes()).unwrap();
+    assert_eq!(store.live_count(Kind::Run), 1);
+}
+
+#[test]
+fn f7_purging_a_dead_parent_never_makes_a_child_that_is_still_alive_valid() {
+    // A child alive by its own record whose parent is gone (dropped seven days after it ended) is refused:
+    // a parent that is missing is a chain that is broken, never valid by absence. (No API makes such a
+    // child, since a child never outlives its parent; the records are put in the store as a file edit or a
+    // clock that jumped would.)
+    let clock = clock();
+    let store = memory(&clock);
+    store.set_static_present(true);
+    let parent = store.mint(native_pat(&["system.read"])).unwrap();
+    let parent_p = store.authenticate(&parent.token, None).unwrap();
+    let child = store
+        .derive(
+            &parent_p,
+            DeriveRequest {
+                scopes: ScopeSet::of(&["system.read"]),
+                ttl_ms: Some(HOUR),
+                label: "x".into(),
+            },
+        )
+        .unwrap();
+    assert!(store.authenticate(&child.token, None).is_ok());
+    let mut record = store.record(&child.id).unwrap();
+    record.expires_ms = T0 + 30 * DAY;
+    store.insert_for_tests(record);
+    store.revoke(&parent.id, "revoked");
+    // Seven days and a bit on: the parent is dropped by the hourly purge, the child is not (it is alive).
+    clock.advance(7 * DAY + 2 * HOUR);
+    store.maintain();
+    assert!(store.record(&parent.id).is_none(), "the parent is dropped");
+    assert!(
+        store.record(&child.id).is_some(),
+        "the child, alive, is not"
+    );
+    assert_eq!(
+        store.authenticate(&child.token, None),
+        Err(AuthError::Revoked {
+            reason: "parent_ended"
+        }),
+        "and it is refused"
+    );
+    // A new child of the gone parent cannot be made either.
+    assert!(matches!(
+        store.derive(&parent_p, request(&["system.read"])),
+        Err(DeriveError::Mint(MintFailure::ParentInvalid))
+    ));
+}
+
 /// A small xorshift, so that the property test is the same run every time.
 struct Rng(u64);
 
