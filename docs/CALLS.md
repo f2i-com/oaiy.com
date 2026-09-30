@@ -225,10 +225,14 @@ agent : "I'll try to reach them, please stay with me."  (it is trying: it does n
 
   So the `agent` preset (the Agent page, or a hosted web Agent paired to this computer) reads the messages and the
   rings and keeps the message the receptionist takes, and nothing more of these routes; the interim `companion` preset
-  reads the messages, the preview and the rings; and a paired program cannot turn transfers on, whatever else it may
-  do (that is what these scopes say: the flow approval of the access design, which would also keep a flow of its own
-  from running, is not built in the code yet, and the internal token a flow's process is given is not a credential in
-  `scoped` mode). The Transfers page's warning that a paired program can change these settings is the `legacy` mode's,
+  reads the messages, the preview and the rings; and a paired program cannot turn transfers on *through these
+  routes* (that is what these scopes say). It is not yet a guarantee about everything such a program can do: the flow
+  approval of the access design is not built in the code, so a credential that holds `flows.write` and `runs.write`
+  (the `agent` preset, among others) can store a flow and run it in `scoped` mode, and a flow is code that runs on this
+  computer and could write the settings file directly. `scoped` mode is therefore hardening, not isolation, until
+  flow approval (ACC-05) exists, and it must not be offered as a security boundary before then (`auth/mode.rs` says
+  the same). The internal token a flow's process is given is not a credential in `scoped` mode. `shadow` mode enforces
+  only authentication and the dangerous scopes, so `calls.settings` and `calls.manage` are enforced in `scoped` only. The Transfers page's warning that a paired program can change these settings is the `legacy` mode's,
   and does not yet know the mode. No scope of these is dangerous, and none takes a call to the owner, which only the
   Companion does. Who marked a message
   is recorded from the credential that asked ("owner" for the owner's own; "pat: <label>" for a paired app), and a name
