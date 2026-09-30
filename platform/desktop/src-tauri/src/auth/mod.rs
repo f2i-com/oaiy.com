@@ -11,14 +11,21 @@
 //!   request is.
 //! - [`audit`], [`scrub`]: the audit and noise logs, and the scrub every log line passes through.
 pub mod audit;
+pub mod chain;
 pub mod clock;
 pub mod export;
+pub mod lock;
 pub mod presets;
 pub mod principal;
 pub mod routes;
 pub mod scopes;
 pub mod scrub;
+pub mod store;
 pub mod token;
 
 #[cfg(test)]
+mod conformance;
+#[cfg(test)]
 mod route_coverage;
+#[cfg(test)]
+mod store_tests;

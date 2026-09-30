@@ -202,6 +202,10 @@ fn is_punct(t: &[Token], i: usize, p: char) -> bool {
 }
 
 /// The index just after the bracketed group that opens at `t[i]` (any of `( [ {`).
+pub(super) fn group_end(t: &[Token], i: usize) -> usize {
+    skip_group(t, i)
+}
+
 fn skip_group(t: &[Token], i: usize) -> usize {
     let mut depth = 0i32;
     let mut k = i;
