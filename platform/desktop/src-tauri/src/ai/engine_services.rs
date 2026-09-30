@@ -543,6 +543,75 @@ mod tests {
         assert!(server.await.unwrap_err().is_cancelled());
     }
 
+    #[tokio::test]
+    async fn independently_keyed_desktop_and_studio_refuse_cross_service_credentials_without_generation() {
+        use crate::auth::{clock::ManualClock, guard::{scoped_guard, GuardConfig},
+            scopes::ScopeSet, store::{AuthStore, MintSpec}, token::Kind as TokenKind,
+            AccessMode, Guard};
+        use axum::{extract::ConnectInfo, http::HeaderMap, middleware};
+        use std::{net::SocketAddr, sync::{Arc, atomic::{AtomicUsize, Ordering}}};
+
+        const STUDIO_KEY: &str = "isolated-studio-service-test-key";
+        let hits = Arc::new(AtomicUsize::new(0));
+        let count = hits.clone();
+        let keyed = |headers: &HeaderMap| headers.get("authorization")
+            .and_then(|h| h.to_str().ok()) == Some("Bearer isolated-studio-service-test-key");
+        let studio_app = Router::new()
+            .route("/v1/discovery", get(move |headers: HeaderMap| async move {
+                Json(if keyed(&headers) { discovery() } else { json!({"models":{},"endpoints":[]}) })
+            }))
+            .route("/v1/images/generations", any(move |headers: HeaderMap| {
+                let count = count.clone();
+                async move {
+                    if keyed(&headers) { count.fetch_add(1, Ordering::SeqCst); StatusCode::NO_CONTENT }
+                    else { StatusCode::UNAUTHORIZED }
+                }
+            }));
+        let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
+        let gateway = format!("http://{}", listener.local_addr().unwrap());
+        let studio_task = tokio::spawn(async move { axum::serve(listener, studio_app).await.unwrap() });
+        let client = reqwest::Client::new();
+        // This is the same unauthenticated upstream discovery call used by engine_discovery.
+        let hidden: Value = client.get(format!("{gateway}/v1/discovery")).send().await.unwrap().json().await.unwrap();
+        assert!(services_from_discovery(&hidden).is_empty());
+        let clock = Arc::new(ManualClock::new(1_790_000_000_000));
+        let store = Arc::new(AuthStore::memory(clock.clone()));
+        let mint = |scopes: &[&str]| store.mint(MintSpec::new(TokenKind::Pat,
+            "two-hop test", ScopeSet::of(scopes), 60_000)).unwrap().token;
+        let read = mint(&["ai.read"]);
+        let infer = mint(&["ai.use"]);
+        let (config, _) = GuardConfig::from_env(&|_| None, false, false, 19379);
+        let guard = Arc::new(Guard::new(AccessMode::Scoped, config, store, None, None, clock));
+        let upstream = gateway.clone();
+        let desktop_app = Router::new().route(&format!("{GATEWAY_PREFIX}/*path"),
+            any(move |req: Request| {
+                let (g, d) = (upstream.clone(), hidden.clone());
+                async move { forward_to(&g, &d, req).await }
+            })).layer(middleware::from_fn_with_state(guard, scoped_guard));
+        let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
+        let desktop = format!("http://{}{GATEWAY_PREFIX}/v1/images/generations", listener.local_addr().unwrap());
+        let desktop_task = tokio::spawn(async move {
+            axum::serve(listener, desktop_app.into_make_service_with_connect_info::<SocketAddr>()).await.unwrap()
+        });
+        // Host matches the scoped guard's fixed fixture origin; listeners use only dynamic ports.
+        for (key, status) in [(None, 401), (Some(read.as_str()), 403), (Some(infer.as_str()), 404), (Some(STUDIO_KEY), 401)] {
+            let mut call = client.post(&desktop).header("host", "localhost:19379").json(&json!({"prompt":"synthetic; no generation"}));
+            if let Some(key) = key { call = call.bearer_auth(key); }
+            assert_eq!(call.send().await.unwrap().status().as_u16(), status);
+        }
+        assert_eq!(hits.load(Ordering::SeqCst), 0, "desktop never reached an unadvertised image service");
+        for (key, status) in [(None, 401), (Some(infer.as_str()), 401), (Some(STUDIO_KEY), 204)] {
+            let mut call = client.post(format!("{gateway}/v1/images/generations")).json(&json!({"prompt":"synthetic; no generation"}));
+            if let Some(key) = key { call = call.bearer_auth(key); }
+            assert_eq!(call.send().await.unwrap().status().as_u16(), status);
+        }
+        assert_eq!(hits.load(Ordering::SeqCst), 1, "only its own service key reached the response stub; no engine is launched");
+        desktop_task.abort(); studio_task.abort();
+        assert!(desktop_task.await.unwrap_err().is_cancelled());
+        assert!(studio_task.await.unwrap_err().is_cancelled());
+        let _ = std::mem::size_of::<ConnectInfo<SocketAddr>>();
+    }
+
     /// An explicitly started isolated Studio can verify the scoped guard, the
     /// actual forwarding function, native CUDA worker and configured style LoRA
     /// together. Credentials live in memory and are never written to evidence.
