@@ -304,6 +304,9 @@ names counted as guessable) at 10^10 guesses or more, score 4. There are no comp
   trusted, everything is one address.
 - **Wrong setup and link codes are cheap to try** (no password is hashed for them) but count towards slow mode like a
   wrong password, so a flood of them slows the owner's sign-in down too; the owner's own known device is exempt.
+- **The throttle survives a restart, up to a point.** `throttle.json` holds the 2000 addresses that matter most (the
+  blocks that end last); the server tracks up to 50 000 in memory, so a flood of rotating addresses that were all
+  blocked is fully remembered until a restart and only mostly remembered after it.
 - **A `Cookie` header over 16 KiB is read as no cookie** (a browser that sends one is signed out, not refused).
 - **The session id is not rotated** when a session is elevated or the password is changed (a login always makes a new
   one, so there is no fixation): the session that changes the password keeps its cookie, every other session is revoked.
