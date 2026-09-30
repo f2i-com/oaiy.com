@@ -162,11 +162,11 @@ fn every_key_of_the_agents_settings_export_is_classified() {
     let all = filter_json(keys, &export, &|_| true);
     let unknown: Vec<&str> = all.left.iter().filter(|l| l.why == Why::Unknown).map(|l| l.path.as_str()).collect();
     assert!(unknown.is_empty(), "these keys of the Agent's settings are not in the table: {unknown:?}");
-    // With nothing ticked only what cannot act comes back.
+    // With nothing ticked nothing in the Agent's settings comes back: every one of them is read by the Agent or by a call
+    // (the audit found none that only decides how something is shown).
     let none = filter_json(keys, &export, &|row| row.class == Class::Data);
-    let mut kept: Vec<&str> = none.kept.iter().map(|k| k.path.as_str()).collect();
-    kept.sort();
-    assert_eq!(kept, ["agent.compactAt", "agent.subAgentTokens", "media.imageModel", "media.model3dModel", "media.musicModel", "media.soundModel", "media.speechModel", "media.videoModel", "messages.country"]);
+    let kept: Vec<&str> = none.kept.iter().map(|k| k.path.as_str()).collect();
+    assert!(kept.is_empty(), "{kept:?}");
     assert!(none.value.get("providers").is_none() || none.value["providers"].as_array().is_some_and(|p| p.is_empty()));
     assert!(none.value["messages"].get("instructions").is_none() && none.value["media"].get("baseUrl").is_none() && none.value.get("gate").is_none_or(|g| g.as_object().is_some_and(|o| o.is_empty())));
     // Whatever is ticked, an address that was read from a service and a project that was open on another computer stay out.
@@ -228,6 +228,19 @@ fn every_setting_in_aokies_schema_is_classified_and_typed_as_the_schema_says() {
     let unknown = filter_json(keys, &json!({ "settings": { "brandNewSwitch": true, "greeting": "hi" } }), &|_| true);
     assert!(unknown.value["settings"].get("brandNewSwitch").is_none());
     assert!(unknown.left.iter().any(|l| l.path == "settings.brandNewSwitch" && l.why == Why::Unknown));
+}
+
+/// The audit found that every setting of the phone plugin is call handling (what callers hear, who is answered, when a call ends):
+/// no key of its table comes back without a tick. A key added to the table as data has to be argued for in the audit's terms.
+#[test]
+fn no_key_of_the_phone_plugins_settings_comes_back_without_a_tick() {
+    let keys = table().key_table("plugin.aokie").unwrap();
+    let data: Vec<&str> = keys.keys.iter().filter(|k| k.class == Class::Data).map(|k| k.path.as_str()).collect();
+    assert!(data.is_empty(), "these keys of the phone plugin's settings are data: {data:?}");
+    for key in ["ttsVoice", "maxSilenceSecs", "bargeSensitivity", "sttEndpointMs", "realtimeVoice", "ttsEngine", "aiModel"] {
+        let row = keys.row(&format!("settings.{key}")).unwrap();
+        assert_eq!((row.class, row.tick), (Class::Runs, Some(RestoreClass::Plugins)), "settings.{key}");
+    }
 }
 
 // ---- filtering a document by its key table ------------------------------------------------------------

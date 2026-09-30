@@ -182,6 +182,10 @@ pub struct Row {
     pub what: String,
     pub reason: String,
     pub redo: Option<String>,
+    /// What reads the value, and why that is (or is not) behaviour: the audit's answer for this row.
+    pub reads: Option<String>,
+    /// Where it is read: `<path from the repository root>#<a name that is in that file>`.
+    pub readers: Vec<String>,
     words_under: Option<String>,
     words: Vec<String>,
 }
@@ -254,6 +258,10 @@ pub struct KeyRow {
     pub what: String,
     pub reason: String,
     pub redo: Option<String>,
+    /// What reads the value, and why that is (or is not) behaviour: the audit's answer for this key.
+    pub reads: Option<String>,
+    /// Where it is read: `<path from the repository root>#<a name that is in that file>`.
+    pub readers: Vec<String>,
 }
 
 #[derive(Clone, Debug)]
@@ -333,6 +341,10 @@ struct RawRow {
     reason: String,
     #[serde(default)]
     redo: Option<String>,
+    #[serde(default)]
+    reads: Option<String>,
+    #[serde(default)]
+    readers: Vec<String>,
 }
 
 #[derive(Deserialize)]
@@ -371,6 +383,10 @@ struct RawKey {
     reason: String,
     #[serde(default)]
     redo: Option<String>,
+    #[serde(default)]
+    reads: Option<String>,
+    #[serde(default)]
+    readers: Vec<String>,
 }
 
 #[derive(Deserialize)]
@@ -435,6 +451,8 @@ fn row_from(raw: RawRow) -> Result<Row, String> {
         what: raw.what,
         reason: raw.reason,
         redo: raw.redo,
+        reads: raw.reads,
+        readers: raw.readers,
         words_under: raw.words_under,
         words: raw.words,
     })
@@ -474,7 +492,7 @@ fn key_from(raw: RawKey) -> Result<KeyRow, String> {
         (_, Some("objects")) => Some(ValueType::Objects { max_items: raw.max_items.ok_or_else(|| fail("objects has maxItems"))? }),
         (_, Some(other)) => return Err(fail(&format!("unknown type \"{other}\""))),
     };
-    Ok(KeyRow { path: raw.path.clone(), class, tick, ty, secret: raw.secret, merge: raw.merge, what: raw.what, reason: raw.reason, redo: raw.redo })
+    Ok(KeyRow { path: raw.path.clone(), class, tick, ty, secret: raw.secret, merge: raw.merge, what: raw.what, reason: raw.reason, redo: raw.redo, reads: raw.reads, readers: raw.readers })
 }
 
 impl Table {

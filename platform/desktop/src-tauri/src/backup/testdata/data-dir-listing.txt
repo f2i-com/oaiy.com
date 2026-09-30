@@ -18,10 +18,10 @@ model-catalog.json	excluded
 .model-catalog.seed.json	excluded
 .install-markers-backfilled	excluded
 .install.lock	excluded
-control-log.jsonl	data
-control-log.jsonl.1	data
+control-log.jsonl	excluded
+control-log.jsonl.1	excluded
 bridge/ledger.jsonl	runs
-bridge/deadletters.jsonl	data
+bridge/deadletters.jsonl	excluded
 bridge/pairings.json	excluded
 ai/providers.json	runs
 ai/codex-home/auth.json	excluded
@@ -76,6 +76,8 @@ voices/receptionist.wav	runs
 voices/receptionist.txt	runs
 voices/chosen	runs
 voices/settings.json	runs
+voices/front-desk.webm	runs
+voices/front-desk.aac	runs
 voices/run.exe	unknown
 .window-state.json	unknown
 oaiy.db	unknown

@@ -74,8 +74,11 @@ Agent's). **A restore is default-deny**: a path, a name or a key that the table 
 - **excluded**: never restored. A credential, a key, a program, something that belongs to the
   computer it came from. The table says why and what you do again. (A backup that holds one of
   the files OAIY never backs up is refused whole.)
-- **data**: harmless personal content that cannot act (a log of what happened, a number within
-  its limits). It comes back without a tick.
+- **data**: content that no code path turns into behaviour (a time, a duration, a yes or no, an
+  identifier, a number that only stops contact). It comes back without a tick. A value that a
+  model reads, that is spoken or sent to someone, that chooses where something is sent, that
+  changes how calls are handled, or that acts when you press an ordinary button is not data,
+  however plain it looks.
 - **runs**: anything a model reads as instructions (a brief, knowledge files, what is remembered
   about a person, instructions, a persona, a greeting), that plays audio to callers, that sends
   messages or makes calls, or that changes whom OAIY trusts or where it sends things. It is
@@ -124,14 +127,14 @@ A path is matched without regard to case. The first row that matches counts; a p
 | `bridge/ledger.jsonl` | runs | Only with the tick "Flows, triggers and run history" | The run journal (finished runs only): Runs that were waiting or running are never brought back; only finished ones are. |
 | `setup.json, agent.json, control.json` | runs | Only with the tick "Settings that decide what OAIY and the Agent may do" | Setup state, the Agent's model and the Agent's switch: They decide what OAIY and the Agent may do: whether the Agent may change OAIY, which plugin permissions count as accepted, which model the Agent uses. |
 | `services-autostart.json` | runs | Only with the tick "Service templates and what starts with OAIY" | Which services start with OAIY: A service that starts with OAIY runs at every start. |
-| `control-log.jsonl, control-log.jsonl.1` | data | Yes, without a tick | The Agent's change log: A record of what the Agent changed. Nothing reads it as an instruction and it cannot act. |
-| `bridge/deadletters.jsonl` | data | Yes, without a tick | Events that could not be delivered: A record of events that could not be delivered. It is read only by the person and it cannot act. |
+| `control-log.jsonl, control-log.jsonl.1` | excluded | Never | The Agent's change log: The record of what the Agent changed on this computer: an audit trail. A restore must not replace it, and a file that this computer did not write must not be able to say what the Agent 'did'. It starts again on the new computer. |
+| `bridge/deadletters.jsonl` | excluded | Never | Events that could not be delivered, kept so that the person can send them again: the Redrive button sends the stored event again (to the linked FormLogic account, or to the flow that took it), and the person does not see what is in it. An entry from a file that this computer did not write would be sent on a click. They are transient, and they are not restored. |
 | `ai/providers.json` | runs | Only with the tick "AI providers (the addresses OAIY sends your AI requests to)" | AI providers and their addresses: It says where your AI requests, and your conversations in them, are sent. Keys come back only if the keys box is ticked too. |
 | `connectors/*.json` | runs | Only with the tick "Connector descriptors (where a link to a provider goes)" | Connector descriptors: A connector descriptor points OAIY's link at a provider's address. |
-| `voices/chosen, voices/*.wav, voices/*.mp3, voices/*.ogg, voices/*.flac, voices/*.m4a, voices/*.opus, voices/*.txt, voices/*.json` | runs | Only with the tick "Voices your callers hear" | Voices: A voice is what your callers hear: a sample or a setting from a file that was not made by you would speak to them in your name. |
+| `voices/chosen, voices/*.wav, voices/*.mp3, voices/*.ogg, voices/*.flac, voices/*.m4a, voices/*.opus, voices/*.webm, voices/*.aac, voices/*.txt, voices/*.json` | runs | Only with the tick "Voices your callers hear" | Voices: A voice is what your callers hear: a sample or a setting from a file that was not made by you would speak to them in your name. |
 | `templates/*.json` | runs | Only with the tick "Service templates and what starts with OAIY" | Service templates you edited or added: A service template names a program that OAIY runs, and can start it with OAIY at every start. |
 | `templates/<built-in>.json` | excluded | Never | A built-in service template you did not edit: OAIY makes it again. |
-| `plugin-data/aokie/settings.json` | runs | Key by key (see the table of its keys) | Aokie's settings, key by key (see the plugin table): Only the keys listed in the plugin table come back, and only those that cannot act come back without a tick. |
+| `plugin-data/aokie/settings.json` | runs | Key by key (see the table of its keys) | Aokie's settings, key by key (see the plugin table): Only the keys listed in the plugin table come back. Every one of them is call handling (what callers hear, who is answered, when a call ends), so every one needs the tick. |
 | `plugin-data/aokie/**` | excluded | Never | The rest of Aokie's data (pairings, PIN store, throttle, outbox, consent record, last phone): Only this plugin's settings file is backed up: the rest of its data holds pairings, sealed values, queues and other state that belongs to this computer. To do again: Pair the plugin's devices and set its PIN again. |
 | `plugin-data/<other plugins>/**` | excluded | Never | The data of a plugin OAIY has not been taught about: OAIY does not know how to back up this plugin's data safely: only plugins it knows are backed up, file by file. To do again: Set the plugin up again on the new computer. |
 
@@ -141,7 +144,7 @@ These are names inside the archive the Agent's page makes of its browser storage
 
 | Name | Class | Comes back | What it is, why, and what to do again |
 |---|---|---|---|
-| `idb/settings.json` | runs | Key by key (see the table of its keys) | The Agent's settings, key by key (see the Agent settings table): Only the keys listed in the Agent settings table come back, and only those that cannot act come back without a tick. |
+| `idb/settings.json` | runs | Key by key (see the table of its keys) | The Agent's settings, key by key (see the Agent settings table): Only the keys listed in the Agent settings table come back. Every one of them is read by the Agent or by a call (where requests go, what is answered and how, how numbers are read), so every one needs the tick. |
 | `opfs/front-desk/files/brief.md` | runs | Only with the tick "The Agent's projects, conversations, brief and knowledge files" | The front desk's brief: Every call, text and task reads the brief before each reply, and it wins over what the phone's agents would otherwise say: it is read as instructions. |
 | `opfs/front-desk/files/knowledge/**` | runs | Only with the tick "The Agent's projects, conversations, brief and knowledge files" | The front desk's knowledge files: The phone's agents read these files to answer callers: they are read as instructions and facts. |
 | `opfs/front-desk/files/**` | runs | Only with the tick "The Agent's projects, conversations, brief and knowledge files" | The other files the Agent keeps at the front desk (outreach results and the like): Files the Agent reads and writes: it can be told what to do by what they say. |
@@ -255,19 +258,19 @@ The Agent's settings as its page keeps them in IndexedDB (database bot.computer,
 | `gate.mode` | runs | Only with the tick "The Agent's own settings (its providers, network gate, and how it answers calls and texts)" | The gate's mode |
 | `gate.allow` | runs | Only with the tick "The Agent's own settings (its providers, network gate, and how it answers calls and texts)" | Sites the gate allows |
 | `gate.deny` | runs | Only with the tick "The Agent's own settings (its providers, network gate, and how it answers calls and texts)" | Sites the gate denies |
-| `agent` | data | Yes, without a tick | How the Agent manages its work |
-| `agent.compactAt` | data | Yes, without a tick | When the conversation is compacted: A share of the context window. |
-| `agent.subAgentTokens` | data | Yes, without a tick | A sub-agent's context, in tokens: A number within its limits. |
+| `agent` | runs | Only with the tick "The Agent's own settings (its providers, network gate, and how it answers calls and texts)" | How the Agent manages its work |
+| `agent.compactAt` | runs | Only with the tick "The Agent's own settings (its providers, network gate, and how it answers calls and texts)" | When the conversation is compacted: A share of the context window: it decides how much of a conversation the model still sees. |
+| `agent.subAgentTokens` | runs | Only with the tick "The Agent's own settings (its providers, network gate, and how it answers calls and texts)" | A sub-agent's context, in tokens: How much a sub-agent may read and spend. |
 | `media` | runs | Only with the tick "The Agent's own settings (its providers, network gate, and how it answers calls and texts)" | The image, video and audio service |
 | `media.baseUrl` | runs | Only with the tick "The Agent's own settings (its providers, network gate, and how it answers calls and texts)" | The media service's address: Prompts and pictures are sent to it. |
 | `media.enabled` | runs | Only with the tick "The Agent's own settings (its providers, network gate, and how it answers calls and texts)" | The Agent may use the media service |
 | `media.apiKey` | runs | Only with the tick "The Agent's own settings (its providers, network gate, and how it answers calls and texts)" | The media service's API key: Only with the keys box, only where none is kept, only for the same address. |
-| `media.imageModel` | data | Yes, without a tick | The picture model's name |
-| `media.videoModel` | data | Yes, without a tick | The video model's name |
-| `media.speechModel` | data | Yes, without a tick | The speech model's name |
-| `media.musicModel` | data | Yes, without a tick | The music model's name |
-| `media.soundModel` | data | Yes, without a tick | The sound model's name |
-| `media.model3dModel` | data | Yes, without a tick | The 3D model's name |
+| `media.imageModel` | runs | Only with the tick "The Agent's own settings (its providers, network gate, and how it answers calls and texts)" | The picture model's name: It decides which model makes the pictures. |
+| `media.videoModel` | runs | Only with the tick "The Agent's own settings (its providers, network gate, and how it answers calls and texts)" | The video model's name: It decides which model makes the videos. |
+| `media.speechModel` | runs | Only with the tick "The Agent's own settings (its providers, network gate, and how it answers calls and texts)" | The speech model's name: It decides which model makes speech, which can be played to callers. |
+| `media.musicModel` | runs | Only with the tick "The Agent's own settings (its providers, network gate, and how it answers calls and texts)" | The music model's name: It decides which model makes the music. |
+| `media.soundModel` | runs | Only with the tick "The Agent's own settings (its providers, network gate, and how it answers calls and texts)" | The sound model's name: It decides which model makes the sounds. |
+| `media.model3dModel` | runs | Only with the tick "The Agent's own settings (its providers, network gate, and how it answers calls and texts)" | The 3D model's name: It decides which model makes the 3D models. |
 | `media.endpoints` | excluded | Never | The media service's routes: Full addresses read from the service's discovery document: a file could point them anywhere. To do again: Refresh the media service in the Agent's settings. |
 | `media.imageModels` | excluded | Never | Lists of models read from the service: Read again from the service. To do again: Refresh the media service in the Agent's settings. |
 | `media.videoModels` | excluded | Never | Lists of models read from the service: Read again from the service. To do again: Refresh the media service in the Agent's settings. |
@@ -287,7 +290,7 @@ The Agent's settings as its page keeps them in IndexedDB (database bot.computer,
 | `messages.callInstructions` | runs | Only with the tick "The Agent's own settings (its providers, network gate, and how it answers calls and texts)" | Instructions for answering calls: Read as instructions by the receptionist on every call. |
 | `messages.callBackFilter` | runs | Only with the tick "The Agent's own settings (its providers, network gate, and how it answers calls and texts)" | Which missed calls are rung back: It decides whose calls are returned. |
 | `messages.callBackLine` | runs | Only with the tick "The Agent's own settings (its providers, network gate, and how it answers calls and texts)" | What is said first when a missed call is rung back: It is said to the person who is rung. |
-| `messages.country` | data | Yes, without a tick | The country numbers are read for: A country code that only decides how a written number is understood. |
+| `messages.country` | runs | Only with the tick "The Agent's own settings (its providers, network gate, and how it answers calls and texts)" | The country numbers are read for: It decides how a written number is read: with NZ, GB, ZA or ID the number 0491 570 006 becomes +64, +44, +27 or +62, so the list of people who are answered, called back or not contacted stops matching the numbers it was made for. It is call handling. |
 | `lastProjectId` | excluded | Never | The project that was open last: It belongs to the computer it was last used on: it may name a project that is not here. |
 | `lastKeptProjectId` | excluded | Never | The last project that is kept: It belongs to the computer it was last used on: it may name a project that is not here. |
 | `desktop` | excluded | Never | The paired desktop and its token: A token is never in a backup. To do again: Pair the Agent with OAIY Desktop again. |
@@ -322,19 +325,19 @@ Aokie's settings file: a document with a `settings` bag and a few fields of its 
 | `settings.rejectPrivate` | runs | Only with the tick "Plugin settings" | Rejects callers who hide their number: It decides who is answered. |
 | `settings.autoBlockAbuse` | runs | Only with the tick "Plugin settings" | Blocks abusive callers by itself: It adds numbers to the block list by itself. |
 | `settings.blockedNumbers` | runs | Only with the tick "Plugin settings"; joined to yours, none of yours is ever taken away | Numbers that are never answered: It can only turn callers away: the numbers in the backup are added to yours and none of yours is taken away. |
-| `settings.aiModel` | data | Yes, without a tick | The model's name: A model name; the endpoint it is asked at is not restored. |
-| `settings.audioTranscriptModel` | data | Yes, without a tick | The transcription model's name: A model name; the endpoint it is asked at is not restored. |
-| `settings.ttsVoice` | data | Yes, without a tick | The voice's name: The name of one of the voices installed here. |
-| `settings.ttsEngine` | data | Yes, without a tick | Which speech engine: One of the engines installed with the plugin. |
-| `settings.realtimeVoice` | data | Yes, without a tick | The realtime voice: One voice of a fixed list. |
-| `settings.realtimeTurnDetection` | data | Yes, without a tick | How the end of a turn is found: One of two fixed choices. |
-| `settings.realtimeMaxOutputTokens` | data | Yes, without a tick | Longest reply, in tokens: A number within its limits. |
-| `settings.bargeSensitivity` | data | Yes, without a tick | Interruption sensitivity: A number within its limits. |
-| `settings.sttEndpointMs` | data | Yes, without a tick | Silence that ends a turn, in milliseconds: A number within its limits (it is a time, not an address). |
-| `settings.maxSilenceSecs` | data | Yes, without a tick | Longest silence, in seconds: A number within its limits. |
-| `settings.defaultSpeechRate` | data | Yes, without a tick | Speech rate: A number within its limits. |
-| `settings.detailSpeechRate` | data | Yes, without a tick | Speech rate for details: A number within its limits. |
-| `settings.protectedSpeechMaxMs` | data | Yes, without a tick | Longest protected speech, in milliseconds: A number within its limits. |
+| `settings.aiModel` | runs | Only with the tick "Plugin settings" | The model's name: It decides which model answers callers; the endpoint it is asked at is not restored. |
+| `settings.audioTranscriptModel` | runs | Only with the tick "Plugin settings" | The transcription model's name: It decides which model hears callers; the endpoint it is asked at is not restored. |
+| `settings.ttsVoice` | runs | Only with the tick "Plugin settings" | The voice's name: It decides which voice callers hear: a name that is not one of the voices installed here is spoken in whatever voice the plugin falls back to. |
+| `settings.ttsEngine` | runs | Only with the tick "Plugin settings" | Which speech engine: It decides how callers are spoken to. |
+| `settings.realtimeVoice` | runs | Only with the tick "Plugin settings" | The realtime voice: It decides which voice callers hear. |
+| `settings.realtimeTurnDetection` | runs | Only with the tick "Plugin settings" | How the end of a turn is found: It decides when the receptionist starts to talk: call handling. |
+| `settings.realtimeMaxOutputTokens` | runs | Only with the tick "Plugin settings" | Longest reply, in tokens: It limits how much the receptionist may say in one turn: call handling. |
+| `settings.bargeSensitivity` | runs | Only with the tick "Plugin settings" | Interruption sensitivity: It decides how easily a caller interrupts the receptionist: call handling. |
+| `settings.sttEndpointMs` | runs | Only with the tick "Plugin settings" | Silence that ends a turn, in milliseconds: It decides when a caller's turn is taken to be over (a time, not an address): call handling. |
+| `settings.maxSilenceSecs` | runs | Only with the tick "Plugin settings" | Longest silence, in seconds: It decides when a silent call is hung up (0 switches the hang-up off): call handling. |
+| `settings.defaultSpeechRate` | runs | Only with the tick "Plugin settings" | Speech rate: It decides how fast callers are spoken to. |
+| `settings.detailSpeechRate` | runs | Only with the tick "Plugin settings" | Speech rate for details: It decides how fast callers are spoken to. |
+| `settings.protectedSpeechMaxMs` | runs | Only with the tick "Plugin settings" | Longest protected speech, in milliseconds: It decides how long the receptionist may not be interrupted: call handling. |
 | `settings.aiEndpoint` | excluded | Never | Where the AI is asked: An address that receives callers' audio and words: a file that was not made by you could send them anywhere. To do again: Choose the AI's address again in the plugin's settings. |
 | `settings.sttEndpoint` | excluded | Never | Where speech is turned into text: An address that receives callers' audio. To do again: Choose the speech-to-text address again. |
 | `settings.ttsEndpoint` | excluded | Never | Where text is turned into speech: An address that receives what is said to callers. To do again: Choose the text-to-speech address again. |
@@ -440,10 +443,10 @@ backup waits (the reasons are the update's, plus a backup already being made).
 
 ### What comes back by default, and what needs your tick
 
-**Only data comes back without a tick**: the class *data* of the table above (the calendar, the
-Agent's change log, undelivered events, numbers not to be contacted, which are only ever added to
-yours, and settings that cannot act, such as a number within its limits). A restore adds and
-replaces these, and deletes nothing.
+**Only data comes back without a tick**: the class *data* of the table above (numbers not to be
+contacted, which are only ever added to yours). The Agent's change log and the events that could
+not be delivered are not restored at all: the first is an audit trail and the second is sent
+again by a button. A restore adds and replaces these, and deletes nothing.
 
 **Everything that can act needs a tick.** A backup file is protected by its passphrase, but
 nothing proves who made it, and a restore is not always of a file you made yourself (a shared
@@ -551,8 +554,7 @@ in parts through internal routes with a secret made for that one backup.
   key with their values (the instructions with their full length). It says what is not restored
   and why, and every name it does not know is "not restored: unknown item".
 - **Nothing ticked** brings back only the numbers not to be called or texted again (which are
-  *added* to yours: none of yours is ever taken away, on a restore or an undo) and settings that
-  cannot act. **Agent data** (projects, conversations, the brief and knowledge files) and
+  *added* to yours: none of yours is ever taken away, on a restore or an undo). **Agent data** (projects, conversations, the brief and knowledge files) and
   **Memory** (what the phone's agents remember about people, which they read as instructions) and
   **Outreach** each need their own tick.
 - **Campaigns never come back running.** With Outreach ticked, a campaign is rebuilt from the keys
@@ -579,8 +581,9 @@ in parts through internal routes with a secret made for that one backup.
 - **The Agent's own settings** are brought back key by key (see the table of `idb/settings.json`
   above): the instructions for texts and calls, the answer and call-back switches, the line said to
   a person who is rung back, the network gate, the providers and the media service's address need
-  the tick of the Agent's settings, and the dry run lists each by its key and value. A number
-  within its limits, the country, and model names come back without one. An address that was read
+  the tick of the Agent's settings, and the dry run lists each by its key and value. So do the
+  country (it decides how a written number is read), the numbers that tune the Agent and the
+  names of the models it uses: nothing in the Agent's settings comes back without the tick. An address that was read
   from a service, the project that was last open, and the paired desktop are never restored. Even
   with the tick a provider at a different address or of a different kind from one you have is never
   merged over yours (which could point your kept key at a different server): it arrives as a new
