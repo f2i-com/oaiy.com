@@ -145,15 +145,33 @@ pub const API_VERSION: u32 = 1;
 /// Bump only on a breaking wire change; add fields freely without touching it.
 pub const BRIDGE_PROTOCOL: &str = "oaiy-bridge/1";
 
-async fn health() -> Json<HealthResponse> {
-    Json(HealthResponse {
-        status: "ok",
-        product: PRODUCT_ID,
-        companion: PRODUCT_ID,
-        protocol: BRIDGE_PROTOCOL,
-        version: env!("CARGO_PKG_VERSION"),
-        api_version: API_VERSION,
-        plugin_api_version: *crate::plugins::manifest::SUPPORTED_PLUGIN_API.end(),
+/// `GET /api/health`'s answer: the fixed fields above and, when the access guard is in front of the
+/// route, `access` (the access mode: anything but `scoped` is worth a banner) and `storage` (`ok`,
+/// `low` or `full`: the disk of the credential store). Both are additive; nothing else changed.
+#[derive(Serialize)]
+struct HealthBody {
+    #[serde(flatten)]
+    base: HealthResponse,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    access: Option<&'static str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    storage: Option<&'static str>,
+}
+
+async fn health(extras: Option<axum::Extension<crate::auth::HealthExtras>>) -> Json<HealthBody> {
+    let extras = extras.map(|e| e.0);
+    Json(HealthBody {
+        base: HealthResponse {
+            status: "ok",
+            product: PRODUCT_ID,
+            companion: PRODUCT_ID,
+            protocol: BRIDGE_PROTOCOL,
+            version: env!("CARGO_PKG_VERSION"),
+            api_version: API_VERSION,
+            plugin_api_version: *crate::plugins::manifest::SUPPORTED_PLUGIN_API.end(),
+        },
+        access: extras.map(|e| e.access),
+        storage: extras.map(|e| e.storage),
     })
 }
 
@@ -1387,6 +1405,37 @@ async fn origin_guard(
     next.run(req).await
 }
 
+/// What the access guard decides with: the old guard's settings (what `legacy` mode judges by) and the
+/// new guard.
+#[derive(Clone)]
+struct AccessState {
+    legacy: AuthConfig,
+    guard: Arc<crate::auth::Guard>,
+}
+
+/// The one guard of the listener.
+///
+/// In `legacy` mode a request for a route that existed before the access model, and a request for a route
+/// that does not exist, go to [`origin_guard`] exactly as they always did (the guard itself is
+/// unchanged), with the owner as the principal for any handler that reads one. Only a route the model
+/// adds (`since: 2` in `auth/routes.rs`) is judged by the new pipeline. In `scoped` and `shadow` mode the
+/// new pipeline judges every request, and `origin_guard` is never called.
+async fn access_guard(
+    State(s): State<AccessState>,
+    mut req: Request,
+    next: Next,
+) -> axum::response::Response {
+    if req.uri().path() == "/api/health" {
+        req.extensions_mut().insert(s.guard.health_extras());
+    }
+    if s.guard.claims(&req) {
+        s.guard.handle(req, next).await
+    } else {
+        req.extensions_mut().insert(crate::auth::principal::Principal::legacy_owner());
+        origin_guard(State(s.legacy), req, next).await
+    }
+}
+
 pub async fn serve(
     port: u16,
     // Bind every interface instead of loopback only.
@@ -1428,8 +1477,27 @@ pub async fn serve(
     node: crate::services::node_runtime::NodeHandle,
     // What is known of newer releases, shared with whatever else (the desktop's window and tray) asks.
     updater: crate::update::UpdaterHandle,
+    // The access mode (`legacy` keeps every route that existed before the access model exactly as it was).
+    access: crate::auth::AccessSettings,
 ) -> Result<(), BoxError> {
     validate_listener_auth(bind_all, auth_token.as_deref())?;
+    // The access guard: in `legacy` mode it holds nothing on disk; otherwise it opens `<data>/auth`.
+    let data_dir_for_auth = registry
+        .lock()
+        .map(|r| r.data_dir().to_path_buf())
+        .map_err(|_| BoxError::from("the registry is poisoned: the data folder is not known"))?;
+    let guard = crate::auth::build_guard(
+        &access,
+        &data_dir_for_auth,
+        port,
+        bind_all,
+        gui_mode,
+        auth_token.clone(),
+        &|name| std::env::var(name).ok(),
+    )?;
+    if access.mode.is_enforcing() {
+        tokio::spawn(crate::auth::runtime::maintain_forever(guard.clone()));
+    }
     // CORS stays permissive so a hosted oaiy-web at any domain can READ the
     // API (the localhost bind keeps non-local processes out). State-changing
     // and exec endpoints are additionally gated by `origin_guard` below, so a
@@ -1609,16 +1677,25 @@ pub async fn serve(
         .merge(ai_routes)
         // The MCP server and the Agent's switch: inside the guard, like everything else.
         .merge(crate::control::router(control.clone()))
-        .layer(middleware::from_fn_with_state(
-            // A network listener must never trust a forgeable Origin, even
-            // when launched by the GUI. Its clients must present a credential.
-            AuthConfig { token: auth_token, gui_mode: gui_mode && !bind_all, pairing: Some(pairing_for_auth) },
-            origin_guard,
-        ))
-        .layer(cors)
-        // OUTSIDE the CORS layer so it runs after it and can add to the
-        // preflight response CORS produced.
-        .layer(axum::middleware::from_fn(allow_private_network));
+        // What the access model has built so far: who am I, derive a credential, what the server saw.
+        .merge(crate::auth::api::router(guard.clone()));
+    let access_state = AccessState {
+        // A network listener must never trust a forgeable Origin, even
+        // when launched by the GUI. Its clients must present a credential.
+        legacy: AuthConfig { token: auth_token, gui_mode: gui_mode && !bind_all, pairing: Some(pairing_for_auth) },
+        guard: guard.clone(),
+    };
+    let app = if access.mode.is_enforcing() {
+        // The new guard alone, and CORS decided by what is paired (never `Any`).
+        app.layer(middleware::from_fn_with_state(access_state, access_guard))
+            .layer(middleware::from_fn_with_state(guard.clone(), crate::auth::guard::scoped_cors))
+    } else {
+        app.layer(middleware::from_fn_with_state(access_state, access_guard))
+            .layer(cors)
+            // OUTSIDE the CORS layer so it runs after it and can add to the
+            // preflight response CORS produced.
+            .layer(axum::middleware::from_fn(allow_private_network))
+    };
     // The control tools call the routes above in-process, through this same
     // router and its gate (see `control/`).
     control.set_router(app.clone());
@@ -1636,7 +1713,9 @@ pub async fn serve(
     } else {
         log::info!("OAIY API listening on http://{addr}");
     }
-    axum::serve(listener, app).await?;
+    // With the peer's address on each request: the new guard needs it (a `desk` credential works only from
+    // loopback, an address is what the failed-bearer throttle counts).
+    axum::serve(listener, app.into_make_service_with_connect_info::<SocketAddr>()).await?;
     Ok(())
 }
 

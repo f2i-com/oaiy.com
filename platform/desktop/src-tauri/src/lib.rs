@@ -1398,6 +1398,14 @@ pub fn run() {
             if lan_access {
                 log::warn!("lanAccess is on — the API will bind every interface on port {server_port}");
             }
+            // How the API judges requests: `legacy` (the default) keeps every route that existed before the
+            // access model exactly as it was; `scoped` and `shadow` are the new guard. Read once, like the
+            // port: a typo keeps the default and says so.
+            let (access_mode, access_warning) =
+                crate::auth::AccessMode::from_config(read_config_str(&app_for_dialog, "accessMode").as_deref());
+            if let Some(warning) = access_warning {
+                log::warn!("{warning}");
+            }
             // What is known of newer releases, shared by the local API's routes, the window's commands and the tray.
             let feed = crate::update::FeedSource::from_env();
             let updater = crate::update::Updater::new(env!("CARGO_PKG_VERSION"), feed.clone(), std::time::Instant::now());
@@ -1541,6 +1549,7 @@ pub fn run() {
                     ai_codex_for_http,
                     node_for_http,
                     updater,
+                    crate::auth::AccessSettings::new(access_mode),
                 )
                 .await
                 {

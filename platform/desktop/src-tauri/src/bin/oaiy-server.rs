@@ -26,6 +26,10 @@
 //!                       tried beside the desktop, whose calls use it [on]
 //!   OAIY_PLUGIN_SOURCES  a folder of plugin folders the setup wizard's catalog
 //!                       offers to install from (<dir>/<plugin id>) [none]
+//!   OAIY_ACCESS_MODE     `legacy` (every route that existed before the access model is judged
+//!                       as it always was), `scoped` (the new guard everywhere) or `shadow`
+//!                       (scoped, but a scope a token lacks is logged, not refused, unless it is
+//!                       a dangerous one) [legacy]
 //!
 //! Every request but a few needs the bearer token: a headless server has no real
 //! webview origin, and any local process can forge the `Origin` header, so the
@@ -175,6 +179,18 @@ async fn main() {
         std::process::exit(1);
     }
 
+    // A mode nobody chose must not be guessed: a value that is not one of the three stops the server
+    // (exit 78, which the shipped unit does not restart).
+    let access_mode = match oaiy_desktop_lib::auth::AccessMode::from_env(
+        std::env::var("OAIY_ACCESS_MODE").ok().as_deref(),
+    ) {
+        Ok(mode) => mode,
+        Err(refusal) => {
+            eprintln!("oaiy-server: {refusal}");
+            std::process::exit(refusal.exit_code());
+        }
+    };
+
     // Trim symmetrically with the client (bearer_token trims), so surrounding
     // whitespace in the env var can't silently reject a valid token.
     let auth_token = std::env::var("OAIY_SERVER_TOKEN")
@@ -298,6 +314,8 @@ async fn main() {
             shutdown_signal().await;
             log::info!("oaiy-server: shutting down — stopping plugins and all services");
             stop_children(registry, plugin_host.get().cloned()).await;
+            // The credential store's last-used times and the noise counted so far, before the process ends.
+            oaiy_desktop_lib::auth::flush_installed();
             std::process::exit(0);
         });
     }
@@ -424,14 +442,23 @@ async fn main() {
         port,
         bind_all, config, auth_token, false, registry, downloads, python, catalog, bridge,
         companion, companion_upstream, link, ai_providers, ai_codex, node_runtime, updater,
+        oaiy_desktop_lib::auth::AccessSettings::new(access_mode),
     )
     .await
     {
         eprintln!("oaiy-server: HTTP server error: {e}");
+        // A refusal of the configuration or of the data folder (a mode that is not allowed here, a second
+        // process on the folder, a credential file from a newer OAIY) is exit 78: not restarted by the unit.
+        let refused = e.downcast_ref::<oaiy_desktop_lib::auth::ConfigRefusal>().is_some()
+            || e.downcast_ref::<oaiy_desktop_lib::auth::store::StoreError>().is_some();
         // A port that is in use is found only here, when serve binds it, after the plugins
         // and the services ticked "start with the app" are already running.
         stop_children(registry_for_exit, plugin_host.get().cloned()).await;
-        std::process::exit(1);
+        std::process::exit(if refused {
+            oaiy_desktop_lib::auth::store::EX_CONFIG
+        } else {
+            1
+        });
     }
 }
 
