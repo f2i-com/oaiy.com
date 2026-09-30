@@ -88,8 +88,9 @@ final class Relay
         }
         Installer::provision($r->data, array_merge(['public_url' => $r->publicUrl, 'journal' => 'wal'], $provision));
         // The gap rule looks at real time between two polls, which a test that polls twice in a row would trip; tests
-        // of the rule itself set wait.gap_ms back to 250.
-        $r->configure(array_replace_recursive(['wait' => ['gap_ms' => 0]], $config));
+        // of the rule itself set wait.gap_ms back to 250. Garbage collection after a random request would strike at random in
+        // a test that moved the clock, so it is off (gc.one_in 0) unless a test of it asks for it.
+        $r->configure(array_replace_recursive(['wait' => ['gap_ms' => 0], 'gc' => ['one_in' => 0]], $config));
         Paths::setDataDir($r->data);
         self::$made[] = $r;
         return $r;

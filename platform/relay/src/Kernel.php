@@ -220,14 +220,18 @@ final class Kernel
     {
         $canFinish = function_exists('fastcgi_finish_request') || function_exists('litespeed_finish_request');
         $gc = $this->ctx->gc;
+        // About one request in gc.one_in (20) checks whether a pass is due; the check is a single read of meta.last_gc.
+        $oneIn = $this->ctx->cfg->gcOneIn();
+        $sampled = $oneIn > 0 && random_int(1, $oneIn) === 1;
         if ($canFinish) {
-            if ($this->route === 'poll' && $res->status === 200 || random_int(1, 20) === 1) {
+            if ($this->route === 'poll' && $res->status === 200 || $sampled) {
                 $this->after[] = static function () use ($gc): void {
                     $gc->maybeRun(5000);
                 };
             }
-        } elseif ($this->route === 'health' || $this->route === 'admin.status') {
-            // No way to answer first: only a health or status request pays for a pass, and only 50 ms of it.
+        } elseif ($this->route === 'health' || $this->route === 'admin.status' || $sampled) {
+            // No way to answer first (mod_php, CGI, php -S): a health or status request, or about one request in twenty of any
+            // kind, pays for a pass, and only 50 ms of it. Nothing in normal use calls health, so the sampling is what runs it.
             $this->after[] = static function () use ($gc): void {
                 $gc->maybeRun(50);
             };

@@ -36,6 +36,7 @@ final class Config
         'cors' => ['extra_origins' => []],
         'token_pepper' => null,
         'wake' => ['mode' => 'file', 'safety_ms' => 2000],
+        'gc' => ['one_in' => 20],
         'client_ip' => ['header' => null, 'trusted_proxies' => []],
     ];
 
@@ -188,6 +189,7 @@ final class Config
             throw self::bad('wake.mode');
         }
         self::intIn($c['wake']['safety_ms'] ?? null, 200, 60000, 'wake.safety_ms');
+        self::intIn($c['gc']['one_in'] ?? null, 0, 1000, 'gc.one_in');
         if ($c['token_pepper'] !== null && (!is_string($c['token_pepper']) || strlen($c['token_pepper']) < 16)) {
             throw self::bad('token_pepper');
         }
@@ -304,6 +306,12 @@ final class Config
     public function wakeSafetyMs(): int
     {
         return (int)$this->c['wake']['safety_ms'];
+    }
+
+    /** About one request in this many checks whether a garbage-collection pass is due (0: none does; a health or status request always does). */
+    public function gcOneIn(): int
+    {
+        return (int)$this->c['gc']['one_in'];
     }
 
     public function clientIpHeader(): ?string

@@ -306,6 +306,7 @@ test('4.18.10 config: defaults, and a public_url that is https or loopback http 
     eq(60, $c->presenceWindow());
     eq(false, $c->callEnabled());
     eq('file', $c->wakeMode());
+    eq(20, $c->gcOneIn());
     eq(2, $c->limit('desktops'));
     eq(16, $c->limit('rosterMax'));
     eq('https://relay.example.com', Config::fromArray(['public_url' => 'https://Relay.Example.com/'], '/tmp/x')->publicUrl());
@@ -339,7 +340,8 @@ test('4.18.10 config: wrong types and out-of-range values fail closed', function
         ['presence_window' => 0], ['call' => ['enabled' => 'yes']], ['call' => ['enabled' => 1]], ['compat' => ['sse' => 'maybe']], ['wake' => ['mode' => 'carrier-pigeon']],
         ['wake' => ['safety_ms' => 10]], ['token_pepper' => 'short'], ['client_ip' => ['header' => 'X Forwarded']], ['client_ip' => ['trusted_proxies' => ['nope']]],
         ['client_ip' => ['trusted_proxies' => 'nope']], ['db' => ['driver' => 'oracle']], ['db' => ['driver' => 'mysql']], ['db' => ['journal' => 'delete']],
-        ['apps' => 'aokie'], ['apps' => ['bad app']], ['capacity' => ['workers' => 0]], ['cors' => ['extra_origins' => ['http://x.example']]]];
+        ['apps' => 'aokie'], ['apps' => ['bad app']], ['capacity' => ['workers' => 0]], ['cors' => ['extra_origins' => ['http://x.example']]],
+        ['gc' => ['one_in' => -1]], ['gc' => ['one_in' => 1001]], ['gc' => ['one_in' => '20']], ['gc' => ['one_in' => 2.5]]];
     foreach ($bad as $patch) {
         throws(fn() => Config::fromArray($base + $patch, '/x'), \RuntimeException::class, 'config invalid', json_encode($patch));
     }

@@ -277,6 +277,38 @@ test('4.18.6 without a finish_request function GC runs only after health and sta
     eq(Relay::T0 + 61, gc_meta($r, 'last_gc'), 'a status request did');
 });
 
+test('4.18.6 without a finish function GC also runs after about one request in gc.one_in, of any kind, so a host that nothing pings still cleans up; gc.one_in 0 turns that off', function () {
+    $r = Relay::make(['gc' => ['one_in' => 1]]);
+    $d = $r->desktop();
+    $get = function (string $path, ?Actor $a) use ($r): int {
+        $k = new Kernel($r->ctx());
+        $srv = ['REMOTE_ADDR' => '127.0.0.1'] + ($a === null ? [] : ['HTTP_AUTHORIZATION' => 'Bearer ' . $a->token]);
+        $res = $k->handle(new Request('GET', $path, [], $srv, '', null));
+        $k->finish();
+        return $res->status;
+    };
+    eq(0, gc_meta($r, 'last_gc'));
+    Tmp::setClock(Relay::T0 + 200);
+    eq(200, $get('/v1/presence', $d));
+    eq(Relay::T0 + 200, gc_meta($r, 'last_gc'), 'an ordinary request ran the pass');
+    Tmp::setClock(Relay::T0 + 400);
+    eq(404, $get('/v1/nothing-here', null));
+    eq(Relay::T0 + 400, gc_meta($r, 'last_gc'), 'so did an unknown path');
+    // Expired things really go: an item that expired long ago is retired by a pass that an ordinary request started.
+    $r->ctx()->mb->post($d->inbox(), 'cmd', 'old', 's', 5, '{}', null, null, 'x');
+    Tmp::setClock(Relay::T0 + 600);
+    eq(200, $get('/v1/presence', $d));
+    eq([0, 3], [(int)$r->ctx()->db->val('SELECT live_items FROM mailboxes WHERE id = ?', [$d->inbox()]), (int)$r->ctx()->db->val('SELECT state FROM items WHERE id = ?', ['old'])]);
+    // Off: nothing but health and status runs it.
+    $off = Relay::make(['gc' => ['one_in' => 0]]);
+    $desk = $off->desktop();
+    Tmp::setClock(Relay::T0 + 5000);
+    $k = new Kernel($off->ctx());
+    $k->handle(new Request('GET', '/v1/presence', [], ['REMOTE_ADDR' => '127.0.0.1', 'HTTP_AUTHORIZATION' => 'Bearer ' . $desk->token], '', null));
+    $k->finish();
+    eq(0, gc_meta($off, 'last_gc'));
+});
+
 test('4.18.6 GC is idempotent and harmless on an empty relay, and a failed step does not lose the claim', function () {
     $r = Relay::make();
     $s1 = $r->ctx()->gc->maybeRun(null, true);
