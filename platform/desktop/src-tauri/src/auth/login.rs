@@ -866,15 +866,21 @@ impl LoginState {
         self.owner_dirty.store(true, Ordering::SeqCst);
     }
 
-    /// Hash the password again at the current cost, after a good login with a hash that was cheaper.
-    async fn rehash(&self, password: &Zeroizing<String>) {
+    /// Hash the password again at the current cost, after a good login with a hash that was cheaper. A compare and
+    /// set: the new hash replaces the stored one only if that is still the hash the login verified. A
+    /// password changed while this hashed is the owner's, and is not undone (a changed password is always another
+    /// string: it has its own salt).
+    async fn rehash(&self, password: &Zeroizing<String>, verified: &str) {
         let Ok(new_hash) = self.hasher.hash(password.clone()).await else {
             return;
         };
-        let _gate = self.owner_gate.lock().await;
         {
+            // Under the owner's lock: the check and the set are one step, whatever a change does around them.
             let mut owner = self.owner_lock();
             let Some(doc) = owner.as_mut() else { return };
+            if !token::hashes_equal(&doc.password, verified) {
+                return;
+            }
             doc.password = new_hash;
         }
         self.persist_owner_best_effort();
@@ -942,7 +948,7 @@ impl LoginState {
                     self.open_login_session(&fresh, &pre, req.remember, device_cookie)?
                 };
                 if rehash {
-                    self.rehash(&password).await;
+                    self.rehash(&password, &view.hash).await;
                 }
                 self.critical(
                     "login.ok",

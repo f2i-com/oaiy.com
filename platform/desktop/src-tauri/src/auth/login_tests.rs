@@ -3819,3 +3819,73 @@ async fn a_login_that_verified_the_old_password_does_not_outlive_a_console_reset
         200
     );
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_re_hash_does_not_write_the_old_password_over_one_that_was_changed_while_it_hashed() {
+    // The stored hash of the tests is cheaper than the current cost, so every good login hashes the password again.
+    let e = Arc::new(build(Build {
+        hold: Duration::from_millis(300),
+        ..Build::default()
+    }));
+    let owner = make_owner(&e, PASSWORD).await;
+    let b = browser_from(&e, &owner);
+    let (e1, session, csrf) = (e.clone(), b.session.clone(), b.csrf.clone());
+    let change = tokio::spawn(async move {
+        let browser = Browser {
+            session,
+            csrf,
+            device: None,
+        };
+        go(
+            &e1,
+            as_page(&e1, &browser, Method::POST, "/api/auth/password")
+                .json(json!({ "current": PASSWORD, "next": NEW_PASSWORD })),
+        )
+        .await
+        .status
+    });
+    // A login with the old password starts 150 ms into the change: it verifies (300 ms) before the change is written
+    // (at about 610 ms), so it is a good login; its re-hash (300 ms more) ends at 750 ms, after the change is written.
+    tokio::time::sleep(Duration::from_millis(150)).await;
+    let late = late_login(&e, PASSWORD, "198.51.100.50").await;
+    assert_eq!(change.await.unwrap(), 204);
+    assert_eq!(
+        late.status, 200,
+        "the login was good when it verified: {}",
+        late.text
+    );
+    // The change came after the login made its session, so it revoked it.
+    let cookie = format!(
+        "{}={}",
+        session_cookie_name(&e),
+        late.cookie(session_cookie_name(&e)).unwrap()
+    );
+    let who = go(&e, req(&e, Method::GET, "/api/config").cookie(&cookie)).await;
+    assert_eq!(
+        who.status, 401,
+        "the session made before the change is revoked by it: {}",
+        who.text
+    );
+    // Which password does the owner have? The re-hash did not undo the change.
+    assert_eq!(
+        login_as(&e, PASSWORD, "198.51.100.51").await.status,
+        401,
+        "the old password works again: the re-hash of the login wrote over the changed password"
+    );
+    assert_eq!(
+        login_as(&e, NEW_PASSWORD, "198.51.100.52").await.status,
+        200
+    );
+    // And the file, as a restart would read it.
+    let e3 = restart(
+        Arc::try_unwrap(e)
+            .ok()
+            .expect("nothing else holds the server"),
+        MIN,
+    );
+    assert_eq!(login_as(&e3, PASSWORD, "198.51.100.53").await.status, 401);
+    assert_eq!(
+        login_as(&e3, NEW_PASSWORD, "198.51.100.54").await.status,
+        200
+    );
+}
