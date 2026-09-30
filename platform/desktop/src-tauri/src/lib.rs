@@ -24,6 +24,8 @@ pub mod setup;
 pub mod control;
 /// Newer releases: found in the release feed, checked, and (in the desktop) installed when the owner says so.
 pub mod update;
+/// The access model: the route table (which scope each route takes), credentials, scopes, presets.
+pub mod auth;
 
 /// Port the localhost API binds to. Fixed so oaiy-web's detection probe has a
 /// stable target. Shared by both binaries (the GUI and the headless server).
