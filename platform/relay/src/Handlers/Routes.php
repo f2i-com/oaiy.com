@@ -9,7 +9,7 @@ defined('OAIY_RELAY') or exit;
 
 /**
  * Routes of enrolment, devices, presence, tokens, the roster and calibration (RL-03a), of pairing (RL-06), and of the admission
- * issuer (RL-07).
+ * issuer and the Aokie compatibility routes (RL-07).
  */
 final class Routes
 {
@@ -17,7 +17,7 @@ final class Routes
     public static function all(string $dev): array
     {
         $desktop = ['desktop'];
-        return array_merge(self::devices($dev, $desktop), PairingApi::routes(), AdmissionApi::routes());
+        return array_merge(self::devices($dev, $desktop), PairingApi::routes(), AdmissionApi::routes(), AokieApi::routes());
     }
 
     /**
