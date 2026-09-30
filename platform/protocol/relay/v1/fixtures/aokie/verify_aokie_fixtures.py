@@ -452,19 +452,32 @@ for c in streams["cases"]:
           [f["seq"] for f in frames_] == sorted(f["seq"] for f in frames_) and events[-1][1]["seq"] == (frames_[-1]["seq"] if frames_ else int(c["request"].get("query", {}).get("since", 0))))
     check(f"{c['name']}: every id: line is the frame's seq", [int(m) for m in re.findall(r"^id: (\d+)\nevent: frame", body, re.M)] == [f["seq"] for f in frames_])
     check(f"{c['name']}: no other event name", set(re.findall(r"^event: (.+)$", body, re.M)) <= {"frame", "end"})
-    for i in range(len(body) + 1):
+    raw = body.encode("utf-8")
+    check(f"{c['name']}: the stream is ASCII, so no chunk boundary can split a character", raw.isascii())
+    # The plugin reads the network in chunks and decodes each on its own, lossily: cut the recorded bytes at EVERY offset.
+    for i in range(len(raw) + 1):
         p = D.SseParser()
-        got = p.push(body[:i]) + p.push(body[i:])
+        got = p.push_bytes(raw[:i]) + p.push_bytes(raw[i:])
         if got != events:
             check(f"{c['name']}: split at byte {i} reads the same events", False)
             break
     else:
-        check(f"{c['name']}: split at every offset the parser reads the same events", True)
+        check(f"{c['name']}: split at every byte offset (each chunk decoded on its own, lossily) the parser reads the same events", True)
     check(f"{c['name']}: with CRLF line ends the parser reads the same events", D.SseParser().push(body.replace("\n", "\r\n")) == events)
     check(f"{c['name']}: the phone's parser (no metadata) reads the same seqs and frames", [(e[0], e[1].get("seq"), e[1].get("frame")) for e in D.SseParser(plugin=False).push(body)] == [(e[0], e[1].get("seq"), e[1].get("frame")) for e in events])
     if "keepalive" in body:
         check(f"{c['name']}: a keepalive is a comment line and no event", body.count(": keepalive\n\n") == 1 and len(events) == 1)
 first = streams["cases"][0]["body"]
+# Control: the same stream written the way the relay once did (frames as raw UTF-8) IS corrupted by some chunk boundary, so the
+# split check above can fail and passing it means something.
+raw_variant = "\n".join(("data: " + json.dumps(json.loads(ln[6:]), separators=(",", ":"), ensure_ascii=False)) if ln.startswith("data: {") and '"seq"' in ln else ln for ln in first.split("\n"))
+raw_bytes = raw_variant.encode("utf-8")
+raw_events = D.SseParser().push(raw_variant)
+def _lossy_split(i):
+    p = D.SseParser()
+    return p.push_bytes(raw_bytes[:i]) + p.push_bytes(raw_bytes[i:])
+check("control: a stream written with raw UTF-8 is not ASCII and reads the same whole", not raw_bytes.isascii() and [e[1]["frame"] for e in raw_events if e[0] == "frame"] == [e[1]["frame"] for e in D.SseParser().push(first) if e[0] == "frame"])
+check("control: and some chunk boundary of it changes what the plugin reads (the check above can fail)", any(_lossy_split(i) != raw_events for i in range(len(raw_bytes) + 1)))
 resume = streams["cases"][1]["body"]
 check("resuming with since=2 delivers only frame 3", [e[1]["seq"] for e in D.SseParser().push(resume) if e[0] == "frame"] == [3])
 check("the stream's frame events carry what the page carries", [e[1]["frame"] for e in D.SseParser().push(first) if e[0] == "frame"] == [f["frame"] for f in page["frames"]])

@@ -544,6 +544,11 @@ class SseParser:
         self.buffer = ""
         self.plugin = plugin
 
+    def push_bytes(self, chunk: bytes) -> list:
+        """What the shipped plugin does with a network chunk: it turns the bytes of THAT chunk into text on their own, lossily
+        (String::from_utf8_lossy in companion_relay.rs), so a character that a chunk boundary splits becomes U+FFFD."""
+        return self.push(chunk.decode("utf-8", errors="replace"))
+
     def push(self, chunk: str) -> list:
         self.buffer += chunk.replace("\r\n", "\n")
         events = []

@@ -165,7 +165,8 @@ foreach (['mysql', 'mariadb'] as $flavour) {
         eq(200, $page['status']);
         eq(3, count($page['json']['frames']));
         contains('"frame":{}', $page['body']);
-        contains($emoji, $page['body']);
+        eq($emoji, $page['json']['frames'][1]['frame']['e'], 'four-byte characters and a joiner survive the trip (stored as \uXXXX pairs, decoded by the reader)');
+        eq(1, preg_match('/^[\x00-\x7F]*$/D', $page['body']), 'and the page is ASCII');
         contains('"n":9007199254740993,"f":1.0,"o":{},"a":[]', $page['body']);
         contains('"p":"' . str_repeat('y', 50), $page['body']);
         eq(strlen($big), strlen(json_encode($page['json']['frames'][2]['frame'])), 'the biggest frame is whole');

@@ -131,12 +131,21 @@ final class AokieApi
                 if (!is_object($frame)) {
                     throw ApiError::make('invalid_request');
                 }
-                $e = json_encode($frame, JSON_UNESCAPED_SLASHES | JSON_UNESCAPED_UNICODE | JSON_PRESERVE_ZERO_FRACTION);
-                if ($e === false) {
+                // The size that counts against the cap is the frame's text as FormLogic writes it (raw UTF-8: slashes and Unicode as they are).
+                $plain = json_encode($frame, JSON_UNESCAPED_SLASHES | JSON_UNESCAPED_UNICODE | JSON_PRESERVE_ZERO_FRACTION);
+                if ($plain === false) {
                     throw ApiError::make('invalid_request');
                 }
-                if (strlen($e) > $cap) {
+                if (strlen($plain) > $cap) {
                     throw new ApiError(413, 'relay_frame_too_large', 'Each frame must be at most ' . $cap . ' bytes once encoded.');
+                }
+                // What is stored, and so what every stream and page carries, is the same JSON with every non-ASCII character written as
+                // \uXXXX (a surrogate pair above the BMP): the shipped plugin decodes each network chunk of a stream on its own, lossily
+                // (companion_relay.rs), so a character that a chunk boundary splits would come out as U+FFFD, and text that is only ASCII
+                // cannot be split. The plugin reads the frame into a value and writes it again, so the meaning is the same.
+                $e = json_encode($frame, JSON_UNESCAPED_SLASHES | JSON_PRESERVE_ZERO_FRACTION);
+                if ($e === false) {
+                    throw ApiError::make('invalid_request');
                 }
                 $encoded[] = $e;
             }

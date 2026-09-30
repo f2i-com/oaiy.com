@@ -46,6 +46,29 @@ function aok_count(AokieRig $k, string $sql = 'SELECT COUNT(*) FROM items WHERE 
     return (int)$k->r->ctx()->db->val($sql, $p);
 }
 
+/**
+ * The frame events the shipped plugin reads from a stream that arrives in two network chunks, cut after $cut bytes: each chunk is
+ * decoded on its own and lossily (companion_relay.rs turns every chunk into text with from_utf8_lossy, so an invalid sequence,
+ * such as half of a character, becomes U+FFFD), then the text is parsed as SSE.
+ * @return list<array<string,mixed>|null> the decoded data of each frame event (null when it is not JSON any more)
+ */
+function aok_lossy_events(string $bytes, int $cut): array
+{
+    $valid = '/[\x00-\x7F]+|[\xC2-\xDF][\x80-\xBF]|\xE0[\xA0-\xBF][\x80-\xBF]|[\xE1-\xEC\xEE\xEF][\x80-\xBF]{2}|\xED[\x80-\x9F][\x80-\xBF]|\xF0[\x90-\xBF][\x80-\xBF]{2}|[\xF1-\xF3][\x80-\xBF]{3}|\xF4[\x80-\x8F][\x80-\xBF]{2}|(.)/s';
+    $text = '';
+    foreach ([substr($bytes, 0, $cut), substr($bytes, $cut)] as $chunk) {
+        $text .= preg_replace_callback($valid, static fn(array $m): string => isset($m[1]) && $m[1] !== '' ? "\u{FFFD}" : $m[0], $chunk);
+    }
+    $events = [];
+    foreach (explode("\n\n", str_replace("\r\n", "\n", $text)) as $block) {
+        if (strpos($block, "event: frame\n") === false || preg_match('/^data: (.*)$/m', $block, $m) !== 1) {
+            continue;
+        }
+        $events[] = json_decode($m[1], true);
+    }
+    return $events;
+}
+
 /** @return array{0:AokieRig,1:Actor,2:Actor,3:string,4:string,5:string} the rig with phones A and B, the plugin's bearer and A's and B's */
 function aok_pair(array $config = []): array
 {
@@ -575,14 +598,61 @@ test('4.14.4 a frame comes back as it went in: {} stays an object, 64-bit intege
     eq(count($frames), count($res['json']['frames']));
     foreach ([
         '"frame":{}', '"frame":{"a":{},"b":[],"c":[{}],"d":[[]]}', '"frame":{"n":9223372036854775807,"m":-9223372036854775808,"z":0}',
-        '"frame":{"u":"héllo 😀 日本語","s":"a/b/c","q":"say \"hi\"\n","t":"tab\there"}', '"frame":{"z":1,"a":2,"m":3}', '"frame":{"0":"a","1":"b"}', '"frame":{"":"empty key"}',
+        '"frame":{"u":"h\\u00e9llo \\ud83d\\ude00 \\u65e5\\u672c\\u8a9e","s":"a/b/c","q":"say \"hi\"\n","t":"tab\there"}', '"frame":{"z":1,"a":2,"m":3}', '"frame":{"0":"a","1":"b"}', '"frame":{"":"empty key"}',
         '"frame":{"f":0.1,"g":1.5,"h":1.0,"i":-2.5e-7,"j":1.0e+21}', '"frame":{"nested":{"deep":{"deeper":{"x":[1,2,{"y":null}]}}},"t":true,"f":false,"n":null}', '"frame":{"big":"12345678901234567890"}',
         '"frame":{"s":"-0","f":-0.5,"g":-0.0,"h":-10,"i":"a-0b"}',
     ] as $want) {
         contains($want, $body);
     }
     not_contains('\\/', $body, 'slashes are not escaped');
-    not_contains('\\u00e9', $body, 'nor is unicode');
+    // Non-ASCII text is written \uXXXX (a surrogate pair above the BMP): the whole answer is ASCII, and means what the frame meant.
+    eq(1, preg_match('/^[\x00-\x7F]*$/D', $body), 'nothing but ASCII bytes leave the relay');
+    eq(json_encode(json_decode($frames[3], true)), json_encode($res['json']['frames'][3]['frame']), 'and the text is the text that was sent');
+    eq("h\u{00E9}llo \u{1F600} \u{65E5}\u{672C}\u{8A9E}", $res['json']['frames'][3]['frame']['u']);
+});
+
+test('4.14.4 a frame is written in ASCII wherever it goes, so no chunk boundary of a stream can split a character: the stream, the page and what is stored, for every kind of non-ASCII text; the size cap is on the text as it is sent', function () {
+    [$k, $a, $b, $plug, $ta] = aok_pair();
+    $texts = ["h\u{00E9}llo", "\u{65E5}\u{672C}\u{8A9E}", "\u{1F600}\u{1F468}\u{200D}\u{1F469}\u{200D}\u{1F467}", "e\u{0301}", "\u{FEFF}\u{2028}\u{2029}", "\u{10FFFF}\u{FFFF}", "a\u{0000}b" /* NUL */];
+    $frames = [];
+    foreach ($texts as $i => $t) {
+        $frames[] = json_encode(['n' => $i, 'text' => $t, "k\u{00E9}y" => [$t]], JSON_UNESCAPED_SLASHES | JSON_UNESCAPED_UNICODE);
+    }
+    eq(200, $k->send($ta, 'plugin', $frames)['status']);
+    $page = $k->read($plug);
+    eq(1, preg_match('/^[\x00-\x7F]*$/D', $page['body']), 'the page is ASCII: ' . substr($page['body'], 0, 200));
+    foreach ($texts as $i => $t) {
+        eq(['n' => $i, 'text' => $t, "k\u{00E9}y" => [$t]], $page['json']['frames'][$i]['frame'], "frame $i");
+    }
+    $stored = array_column($k->r->ctx()->db->all("SELECT body FROM items WHERE lane = 'sig' ORDER BY seq"), 'body');
+    foreach ($stored as $i => $body) {
+        eq(1, preg_match('/^[\x00-\x7F]*$/D', $body), "stored frame $i is ASCII");
+    }
+    // The same through the stream, byte for byte, and split at every offset the way the plugin reads it (each chunk decoded on its own).
+    $f = $k->facade($plug);
+    $bytes = '';
+    \Oaiy\Relay\Stream::run($k->r->ctx(), $f, 0, 0.3, static function (string $b) use (&$bytes): bool {
+        $bytes .= $b;
+        return true;
+    }, static fn(): bool => false);
+    eq(1, preg_match('/^[\x00-\x7F]*$/D', $bytes), 'the stream is ASCII');
+    contains('event: frame', $bytes);
+    $whole = aok_lossy_events($bytes, strlen($bytes));
+    eq(count($texts), count($whole), 'every frame is one event');
+    for ($cut = 0; $cut <= strlen($bytes); $cut++) {
+        if (aok_lossy_events($bytes, $cut) !== $whole) {
+            fail("split at byte $cut: the events differ");
+        }
+    }
+    foreach ($whole as $i => $data) {
+        eq($texts[$i], $data['frame']['text'], "event $i");
+    }
+    // The cap counts the frame as it is sent, not as it is stored: 6 stored bytes for each 3-byte character do not shrink it.
+    $cap = $k->r->ctx()->eff->body('sig');
+    $wide = '{"p":"' . str_repeat("\u{65E5}", intdiv($cap - 8, 3)) . '"}'; // as sent: at most the cap; stored: twice as long
+    ok(strlen($wide) <= $cap && strlen($wide) > $cap - 3);
+    eq(200, $k->send($ta, 'plugin', [$wide])['status'], 'a frame of the cap\'s size in Chinese is accepted');
+    eq(413, $k->send($ta, 'plugin', ['{"p":"' . str_repeat("\u{65E5}", intdiv($cap - 8, 3) + 1) . '"}'])['status'], 'one character more is not');
 });
 
 test('4.14.4 an integer that does not fit 64 bits is refused rather than turned into a float; the checks add no cost to an ordinary frame (no 19-digit run, no second decode)', function () {
