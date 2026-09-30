@@ -388,6 +388,45 @@ test('4.10.6 a desktop keeps at most 16 rendezvous open at once (429 quota_excee
     eq(201, Ceremony::random($r, $other)->open()['status'], 'the limit is per desktop');
 });
 
+test('4.10.6 the 16 that may be open are the pending approvals: an answered rendezvous counts as well as an open one, and one that has been approved or denied does not', function () {
+    [$r, $d] = pair_setup();
+    $made = [];
+    for ($i = 0; $i < 16; $i++) {
+        $made[$i] = Ceremony::random($r, $d);
+        eq(201, $made[$i]->open(['ttl' => 600])['status']);
+    }
+    for ($i = 0; $i < 8; $i++) {
+        eq(202, $made[$i]->answer()['status']); // waiting for the owner: still pending
+    }
+    $res = Ceremony::random($r, $d)->open();
+    eq([429, 'quota_exceeded'], [$res['status'], pair_code($res)], 'eight answered and eight open are sixteen pending');
+    for ($i = 0; $i < 4; $i++) {
+        eq(200, $made[$i]->decide()['status']);
+        eq(200, $made[$i + 4]->decide(['approve' => false])['status']);
+    }
+    for ($i = 0; $i < 8; $i++) {
+        eq(201, Ceremony::random($r, $d)->open()['status'], "a place freed by a decision: $i");
+    }
+    eq(429, Ceremony::random($r, $d)->open()['status'], 'and then it is full again');
+});
+
+test('4.10.3 what the rendezvous holds is dropped when it stops needing it: the phone\'s response text is gone once the owner has decided, denied, burned or rejected it', function () {
+    foreach (['approve' => null, 'deny' => ['approve' => false], 'burn' => 'burn', 'reject' => 'reject'] as $how => $arg) {
+        [$r, $d, $c] = pair_setup();
+        $c->open();
+        $c->answer();
+        ok(strlen((string)pair_row($r, $c->pid)['response']) > 100, "$how: while answered the response is held");
+        if ($how === 'burn') {
+            $c->burn();
+        } elseif ($how === 'reject') {
+            $c->reject();
+        } else {
+            $c->decide($arg);
+        }
+        eq(null, pair_row($r, $c->pid)['response'], "$how: the response text is gone");
+    }
+});
+
 // ------------------------------------------------------------------------------------------------ GET /v1/pair/{pid}
 
 test('4.10.3 step 2: GET /v1/pair/{pid} needs no credential and returns the state, the offer text, its MAC and the expiry; the answer validates against pairing-fetch-response', function () {
@@ -806,6 +845,24 @@ test('4.10.3 step 9: the phone reading the outcome marks the rendezvous read (de
     Tmp::setClock(Relay::T0 + 600 + 61);
     $r2->ctx()->gc->maybeRun(null, true);
     eq(null, pair_row($r2, $c2->pid));
+    // Only an outcome is "read": a phone that fetches the offer of an open or answered rendezvous starts no clock, and the
+    // rendezvous lives until it ends or expires (a phone may look at the offer many times while its owner decides).
+    Tmp::setClock(Relay::T0);
+    [$r3, $d3, $c3] = pair_setup();
+    $c3->open([], 900);
+    Tmp::setClock(Relay::T0 + 50);
+    eq(200, $c3->get()['status']);
+    eq(null, pair_row($r3, $c3->pid)['read_at'], 'an open rendezvous read: no clock started');
+    $c3->answer();
+    eq(200, $c3->get()['status']);
+    eq(null, pair_row($r3, $c3->pid)['read_at'], 'an answered one too');
+    Tmp::setClock(Relay::T0 + 50 + 601);
+    $r3->ctx()->gc->maybeRun(null, true);
+    ok(pair_row($r3, $c3->pid) !== null, 'ten minutes after a read of the offer it is still there');
+    eq(200, $c3->get()['status']);
+    Tmp::setClock(Relay::T0 + 900 + 61);
+    $r3->ctx()->gc->maybeRun(null, true);
+    eq(null, pair_row($r3, $c3->pid), 'at its own expiry it is collected');
 });
 
 test('4.10.3 step 7: a refusal moves an answered rendezvous to denied; the phone reads {"state":"denied"}; no device exists', function () {
