@@ -321,8 +321,11 @@ final class Pairing
             try {
                 $sealed = sodium_crypto_box_seal($token, $phone['x']);
             } catch (\SodiumException $e) {
+                sodium_memzero($token);
                 throw ApiError::make('unprocessable'); // an all-zero shared secret: a key of small order that slipped past the list
             }
+            sodium_memzero($token); // the plaintext token has done its one job: it is in the box, and nowhere else
+            unset($token);
             $db->exec(
                 "UPDATE pairings SET state = 'approved', phone_dev = ?, sealed_token = ?, receipt = ?, response = NULL WHERE pid = ? AND state = 'answered'",
                 [$id, B64::enc($sealed), Json::encode(['issuedAt' => $phone['issuedAt'], 'signature' => $phone['signature']]), $pid]
