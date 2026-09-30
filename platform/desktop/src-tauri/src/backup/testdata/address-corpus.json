@@ -98,6 +98,12 @@
     { "raw": "https://gw.example/v1?api-version=2024-02-15&api_version=sk-SECRET", "cleaned": "https://gw.example/v1?api-version=2024-02-15", "changed": true, "comesBack": true },
     { "raw": "https://gw.example/v1?api-version=2023-05-15", "cleaned": "https://gw.example/v1?api-version=2023-05-15", "changed": false, "comesBack": true },
     { "raw": "https://gw.example/v1?api-version=1.0", "cleaned": "https://gw.example/v1?api-version=1.0", "changed": false, "comesBack": true },
-    { "raw": "https://gw.example/v1?api-version=٢٠٢٤-٠٢-١٥", "cleaned": "https://gw.example/v1", "changed": true, "comesBack": true }
+    { "raw": "https://gw.example/v1?api-version=٢٠٢٤-٠٢-١٥", "cleaned": "https://gw.example/v1", "changed": true, "comesBack": true },
+    { "raw": "https://gw.example/v1?key=2024-02-15", "cleaned": "https://gw.example/v1", "changed": true, "comesBack": true },
+    { "raw": "https://gw.example/v1?version=1", "cleaned": "https://gw.example/v1", "changed": true, "comesBack": true },
+    { "raw": "https://gw.example/v1?api-version-x=1", "cleaned": "https://gw.example/v1", "changed": true, "comesBack": true },
+    { "raw": "https://gw.example/v1?api-version=24-02-15", "cleaned": "https://gw.example/v1", "changed": true, "comesBack": true },
+    { "raw": "https://gw.example/v1?api-version=2024-02-5", "cleaned": "https://gw.example/v1", "changed": true, "comesBack": true },
+    { "raw": "https://gw.example/v1?api-version=20240-02-15", "cleaned": "https://gw.example/v1", "changed": true, "comesBack": true }
   ]
 }

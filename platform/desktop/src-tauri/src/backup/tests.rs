@@ -7426,6 +7426,8 @@ fn a_padded_value_of_a_person_does_not_hide_another_key_of_the_same_person() {
     // Ten people as long as they may be do not push each other out, or the state of the campaign: nothing here was cut at the end.
     assert!(!said.ends_with('…') && said.chars().count() < super::agentzip::MAX_CAMPAIGN_TEXT, "{} characters", said.chars().count());
     assert!(said.contains("Person 10 (") && said.contains("Skipped at planning 10 ("), "{said}");
+    // And a person set aside is said whole too: the long name does not cut the reason after it.
+    assert_eq!(said.matches("why \"asked not to be contacted\"").count(), 10, "{said}");
 }
 
 /// A list of people that is longer than the ten the dry run says is a sample, and it is said so plainly (a list of ten or fewer is not).
