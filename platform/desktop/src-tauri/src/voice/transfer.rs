@@ -433,10 +433,13 @@ pub struct Transfer {
     connect_at: Option<Instant>,
     connects_said: u32,
     hold_at: Option<Instant>,
-    /// Hold lines said for this ring (or for the request before the phone answered it).
+    /// Hold lines said for this ring (or for the request before the phone answered it), whatever said them: the wordings go round by this.
     holds_said: u32,
-    /// How many of them were said before the phone answered, and are not counted against the ring's own [`HOLD_MAX`].
-    pending_holds: u32,
+    /// How many of them came on the desktop's own clock (a line in answer to the caller, or in place of a promise, does not: it is said when
+    /// they speak or when the model does, and the clock is not the one that covers the silence after), and how many of those were said before
+    /// the phone answered, which are not counted against the ring's own [`HOLD_MAX`].
+    timed_said: u32,
+    pending_timed: u32,
     /// The request on the wire that this has begun to count the caller's silence for (by when it was sent), answered or not.
     tracked: Option<Instant>,
     /// A request is on the wire and the phone has not answered it, and nothing has ended it: the caller's silence is counted from when
@@ -478,12 +481,13 @@ impl Transfer {
         }
         self.ringing = Some(Ringing { request: request.to_string(), give_up_at: now + Duration::from_secs(ring_seconds.clamp(1, 300)) + self.timing.give_up_after });
         self.hold_at = Some(now + self.timing.hold_after);
-        // Lines said while the phone had not answered are not the ring's own: the wordings go on from them, and they are not counted
-        // against its cap.
-        self.pending_holds = if std::mem::take(&mut self.requested) {
-            self.holds_said
+        // Lines said while the phone had not answered are not the ring's own: the wordings go on from them, and the ones on the clock are not
+        // counted against its cap.
+        self.pending_timed = if std::mem::take(&mut self.requested) {
+            self.timed_said
         } else {
             self.holds_said = 0;
+            self.timed_said = 0;
             0
         };
         self.offer_at = None;
@@ -503,7 +507,8 @@ impl Transfer {
                     self.requested = true;
                     self.hold_at = Some(at + self.timing.request_hold_after);
                     self.holds_said = 0;
-                    self.pending_holds = 0;
+                    self.timed_said = 0;
+                    self.pending_timed = 0;
                     self.offer_at = None;
                 }
             }
@@ -532,9 +537,11 @@ impl Transfer {
         self.ringing.is_some() || self.requested
     }
 
-    /// Another hold line may be said for this ring (the lines said before the phone answered do not count).
+    /// Another hold line may be said on the clock for this ring: only the lines the clock said count (the ones said before the phone answered do
+    /// not, and neither do the ones said in answer to the caller or in place of a promise, or a ring of ninety seconds with a caller who spoke
+    /// early would have no line left for the last minute).
     fn more_holds(&self) -> bool {
-        self.holds_said.saturating_sub(self.pending_holds) < HOLD_MAX
+        self.timed_said.saturating_sub(self.pending_timed) < HOLD_MAX
     }
 
     /// This desktop asks the phone to withdraw `request` (the owner declined): whether the frame should be sent, which it should be once
@@ -595,7 +602,8 @@ impl Transfer {
         let line = if self.awaiting() {
             let line = HOLD_LINES[self.holds_said as usize % HOLD_LINES.len()];
             self.holds_said += 1;
-            self.hold_at = Some(now + self.timing.hold_every);
+            // The clock's own next line is put back after theirs (while it has any left).
+            self.hold_at = self.more_holds().then_some(now + self.timing.hold_every);
             line
         } else {
             self.offer_at.take()?.1
@@ -714,6 +722,7 @@ impl Transfer {
                         self.last_said = Some(now);
                         due.push(Due::Say(HOLD_LINES[self.holds_said as usize % HOLD_LINES.len()]));
                         self.holds_said += 1;
+                        self.timed_said += 1;
                         // Another, a while on, in another wording: a ring can last a minute and a half.
                         self.hold_at = self.more_holds().then_some(now + self.timing.hold_every);
                     }
@@ -1287,6 +1296,80 @@ mod tests {
         ];
         for line in promises {
             assert!(promises_transfer(line), "a promise, and not caught: {line:?}");
+        }
+    }
+
+    /// The longest a caller waits without a word from this desktop in a ring of `ring_seconds` when the receptionist says nothing, by a fake
+    /// clock that moves a second at a time: `speaks(second)` is a caller whose words are answered with a hold line (no page answers calls),
+    /// and `promises(second)` a model whose line is swapped for a hold line. The wait from the start to the first line is the five seconds
+    /// the first hold line is given, and is not counted: what is counted is the silence between one thing said and the next, and after the last.
+    fn longest_silence_in_a_ring(ring_seconds: u64, speaks: impl Fn(u64) -> bool, promises: impl Fn(u64) -> bool) -> (u64, Vec<(u64, &'static str)>) {
+        let mut t = Transfer::default();
+        t.ringing("assist_1", ring_seconds, at(0));
+        let (mut said, mut last, mut longest) = (Vec::new(), None::<u64>, 0);
+        let mut heard = |second: u64, line: &'static str, last: &mut Option<u64>, longest: &mut u64, said: &mut Vec<(u64, &'static str)>| {
+            if let Some(before) = *last {
+                *longest = (*longest).max(second - before);
+            }
+            *last = Some(second);
+            said.push((second, line));
+        };
+        for second in 1..=ring_seconds {
+            for due in t.due(at(second)) {
+                if let Due::Say(line) = due {
+                    heard(second, line, &mut last, &mut longest, &mut said);
+                }
+            }
+            if promises(second) {
+                let line = t.hold_instead(at(second));
+                heard(second, line, &mut last, &mut longest, &mut said);
+            }
+            if speaks(second) {
+                if let Some(line) = t.answer_caller(at(second)) {
+                    heard(second, line, &mut last, &mut longest, &mut said);
+                }
+            }
+        }
+        if let Some(before) = last {
+            longest = longest.max(ring_seconds - before);
+        }
+        (longest, said)
+    }
+
+    #[test]
+    fn what_is_said_in_answer_to_the_caller_or_in_place_of_a_promise_does_not_use_up_the_timed_lines_a_long_ring_is_covered_by() {
+        // A ring of ninety seconds, the longest, with no page and a caller who speaks every three seconds for the first twenty, then goes quiet:
+        // the reviewer measured fifty-three seconds without a word once the six timed lines had been spent on their words.
+        let (silence, said) = longest_silence_in_a_ring(90, |s| s % 3 == 0 && s <= 20, |_| false);
+        assert!(silence <= 16, "{silence} s without a word: {said:?}");
+        // The same for a model whose lines are swapped for a hold line every five seconds for the first thirty.
+        let (silence, said) = longest_silence_in_a_ring(90, |_| false, |s| s % 5 == 0 && s <= 30);
+        assert!(silence <= 16, "{silence} s without a word: {said:?}");
+        // And both together.
+        let (silence, said) = longest_silence_in_a_ring(90, |s| s % 3 == 0 && s <= 25, |s| s % 4 == 0 && s <= 25);
+        assert!(silence <= 16, "{silence} s without a word: {said:?}");
+        // The wordings go round by everything said, so the clock's line after one said in answer to the caller is the next wording and never the
+        // same one twice running.
+        let (_, said) = longest_silence_in_a_ring(90, |s| s == 3, |_| false);
+        assert!(said.len() > 2 && said.windows(2).all(|w| w[0].1 != w[1].1), "{said:?}");
+        // With nothing said by anyone else the six timed lines cover the ring as they always did, and never more than six are said on their own clock.
+        let (silence, said) = longest_silence_in_a_ring(90, |_| false, |_| false);
+        assert!(silence <= 16 && said.len() as u32 == HOLD_MAX, "{silence} s: {said:?}");
+        // Timed lines said after a caller's words are still counted against the cap: only six in all come on the clock, whoever else spoke before.
+        let mut t = Transfer::default();
+        t.ringing("assist_1", 300, at(0));
+        for second in [1, 4, 7, 10] {
+            assert!(t.answer_caller(at(second)).is_some());
+        }
+        let mut timed = 0;
+        for second in 11..=250 {
+            timed += t.due(at(second)).iter().filter(|d| matches!(d, Due::Say(l) if HOLD_LINES.contains(l))).count() as u32;
+        }
+        assert_eq!(timed, HOLD_MAX, "six on the clock in a long ring, after the four said in answer to the caller, and no more");
+        // The six are spent: a caller who speaks again is answered, and that puts no seventh on the clock.
+        assert!(t.answer_caller(at(251)).is_some());
+        for second in 252..=290 {
+            assert!(t.due(at(second)).iter().all(|d| !matches!(d, Due::Say(l) if HOLD_LINES.contains(l))), "{second}: a line on the clock beyond the six");
         }
     }
 

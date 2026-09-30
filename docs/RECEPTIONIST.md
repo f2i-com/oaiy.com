@@ -165,8 +165,10 @@ is about 24 seconds, and only while a connection you accepted is being made (see
   answers cannot leave the caller in silence); if the phone has not answered in 25 seconds the request is given up on,
   the receptionist is told, and if it says nothing the caller is offered a message 4 seconds later.
 - **While you are rung**, if the receptionist has said nothing, a hold line five seconds in and
-  another every 15 seconds after (three wordings in turn, at most six, so a ring of 90 seconds is
-  covered): the longest silence is about 15 seconds. None of them says the call is being put through.
+  another every 15 seconds after (three wordings in turn, at most six on the desktop's own clock, so a ring of 90 seconds is
+  covered): the longest silence is about 15 seconds, however much the caller spoke or the receptionist's lines were replaced
+  before, because a line said in answer to the caller, or in place of a promise, is not one of the six. None of them says the
+  call is being put through.
 - **After you accept**, "Connecting you now" at once. While the connection is being made the caller then hears at
   most two short lines, about 15 and 30 seconds later ("Thank you for waiting, I'm still connecting you." and
   "Still working on connecting you, thank you for your patience.": they say only that it is being made, never that you

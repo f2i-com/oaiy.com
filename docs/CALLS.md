@@ -132,8 +132,8 @@ is waiting for the phone's answer (25 seconds at most) the desktop says a hold l
 call and not from an answer that may never come, and another 15 seconds after that, and if the phone never answers it offers a message
 4 seconds after giving up on it: no silence there is longer than 15 seconds, with the model dead or alive alike.
 The desktop's own clocks (`Transfer`, not the phone, the app or the model) say fixed lines: a hold line five
-seconds into a ring and every 15 seconds after (three wordings, at most six; the ones said before the phone answered are not counted
-against the six), "Connecting you now" at once
+seconds into a ring and every 15 seconds after (three wordings, at most six on the clock; the ones said before the phone answered, and
+the ones said in answer to the caller or in place of a promise, are not counted against the six), "Connecting you now" at once
 on an acceptance and, while the takeover is set up (55 seconds at most), two holding lines 15 and 30 seconds after it ("Thank you
 for waiting, I'm still connecting you.", "Still working on connecting you, thank you for your patience.": they say only that it is
 being done, and promise no result and no time) and nothing more. The phone's stop (the owner has the caller), a takeover that
