@@ -360,6 +360,31 @@ fn no_plaintext_beside_the_blob() {
     }
 }
 
+/// KM11, KM12 at the file system: what the store writes is the pinned format, byte for byte (the expected bytes are computed with node's crypto, not with this
+/// code), and a file in that format that someone else wrote is read. A later version must read the files of this one.
+#[test]
+fn a_keyfile_is_the_pinned_format_on_disk_and_a_pinned_file_is_read() {
+    fn unhex(text: &str) -> Vec<u8> {
+        (0..text.len() / 2).map(|i| u8::from_str_radix(&text[2 * i..2 * i + 2], 16).unwrap()).collect()
+    }
+    let first = "4f4149594b463101195a64d1c2e3a8d0c197bc2ddf1df260424530839be9fda34c33e23fdde2795c0000001a6f616979206b657973746f7265206b6e6f776e20616e73776572d57f32c601b74541a0f629ddf6506393553028cb8598860d71ade7a85424bc2e";
+    let second = "4f4149594b46310171a3542662649453a76dc19689a899f8bbff6f57b7dd580805c66c809a7aa7770000000300ff01748ed4d0507837dfd14a1edb9e7296d0a9638617d76efe6359acb88933fb2a46";
+    let scratch = Scratch::new("kat");
+    let store = store(&scratch, keyfile());
+    store.put(&name("archive.writer"), b"oaiy keystore known answer").unwrap();
+    assert_eq!(fs::read(file_of(&scratch, "archive.writer", "kf")).unwrap(), unhex(first));
+    // a file of the same format that this store did not write
+    let path = file_of(&scratch, "vault.fk.f1", "kf");
+    fs::write(&path, unhex(second)).unwrap();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o600)).unwrap();
+    }
+    assert_eq!(get(&*store, &name("vault.fk.f1")), Some(vec![0x00, 0xff, 0x01]));
+    assert_eq!(get(&*store, &name("archive.writer")), Some(b"oaiy keystore known answer".to_vec()));
+}
+
 #[test]
 fn values_are_one_byte_to_sixty_four_kib() {
     for (choice, _) in providers() {
@@ -753,6 +778,10 @@ mod dpapi {
         // DPAPI blobs start with version 1 and the DPAPI provider GUID df9d8cd0-1501-11d1-8c7a-00c04fc297eb
         assert_eq!(&bytes[8..12], &[1, 0, 0, 0]);
         assert_eq!(&bytes[12..28], &[0xd0, 0x8c, 0x9d, 0xdf, 0x01, 0x15, 0xd1, 0x11, 0x8c, 0x7a, 0x00, 0xc0, 0x4f, 0xc2, 0x97, 0xeb]);
+        // KM19: the scope. The blob header after the master key's GUID is dwFlags: zero for a blob protected for the current user, 0x4 (CRYPTPROTECT_LOCAL_MACHINE)
+        // for one that any process of the machine could open. A real blob of this provider is user scope; a provider that asked for the machine scope would be a
+        // silent weakening that nothing else here would notice, because the same machine opens it.
+        assert_eq!(&bytes[48..52], &[0, 0, 0, 0], "the DPAPI blob is not user-scope: flags {:02x?}", &bytes[48..52]);
         // the same value stored twice gives different blobs (DPAPI salts every one)
         store.put(&name("vault.wrapper"), &value).unwrap();
         assert_ne!(fs::read(file_of(&scratch, "vault.wrapper", "ks")).unwrap(), bytes);
