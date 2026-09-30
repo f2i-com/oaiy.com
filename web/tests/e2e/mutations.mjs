@@ -116,6 +116,20 @@ const MUTATIONS = [
     files: { 'web/providers/src/store.ts': [{ find: "if (by !== undefined && (record.model ?? '') !== model && !(Array.isArray(known) && known.includes(model))) return 'unknown-model' as const;", replace: '' }] },
     caught: ['an app may choose only a model the provider listed', 'a model no provider listed is refused'],
   },
+  {
+    name: 'F9 templates keep CRLF',
+    what: 'a template with CRLF line ends is rendered with them (a header value that ends in CR)',
+    tests: ['tests/unit/eol.test.mjs'],
+    files: { 'web/scripts/headers.mjs': [{ find: "const lf = (text) => text.replace(/\\r\\n?/g, '\\n');", replace: 'const lf = (text) => text;' }] },
+    caught: ['readTemplate returns no CR', 'renderHeaders takes a CRLF template too'],
+  },
+  {
+    name: 'F9 no line end rule',
+    what: '.gitattributes says nothing about web/ and shared/, so a converting checkout gives CRLF',
+    tests: ['tests/unit/eol.test.mjs'],
+    files: { '.gitattributes': [{ find: '/web/** text=auto eol=lf\n/shared/** text=auto eol=lf\n', replace: '' }] },
+    caught: ['.gitattributes says eol=lf for web/ and shared/', 'a checkout on a machine that converts line ends'],
+  },
   // Leaks the scans must find. They put the key where a scan of TEXT does not look (the reviewer's two: a Uint8Array, and reversed).
   {
     name: 'H1 leak: list returns the key as a Uint8Array',
@@ -220,13 +234,16 @@ function runTests(files) {
 }
 
 function apply(file, edits) {
-  let text = read(file);
+  const original = read(file);
+  // The edits are written with `\n`; a file that has CRLF (a checkout that converts line ends) is edited as LF and written back as CRLF.
+  const crlf = original.includes('\r\n');
+  let text = original.replace(/\r\n/g, '\n');
   for (const edit of edits) {
     const before = text;
     text = typeof edit.find === 'string' ? text.split(edit.find).join(edit.replace) : text.replace(edit.find, edit.replace);
     if (text === before) throw new Error(`the edit did not match in ${file}: ${String(edit.find).slice(0, 80)}`);
   }
-  write(file, text);
+  write(file, crlf ? text.replace(/\n/g, '\r\n') : text);
 }
 
 // A run that is killed (not interrupted) cannot put anything back, and a file left broken looks like a source file. So the originals are

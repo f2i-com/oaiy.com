@@ -1,0 +1,5 @@
+# The web app's sources and the code it shares are LF in every checkout. A machine with core.autocrlf=true would otherwise check them out
+# with CRLF, and the header templates (a `\r` at the end of a header value), the mutation runner and the tests that match on exact text
+# would each fail in a way that looks like a bug in the code. `text=auto` leaves binary files (fonts, images) alone.
+/web/** text=auto eol=lf
+/shared/** text=auto eol=lf

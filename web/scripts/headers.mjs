@@ -17,9 +17,12 @@ export const HEADER_TEMPLATES = path.resolve(HERE, '..', 'hosting', 'headers');
 
 const TOKENS = { AGENT_ORIGIN: 'agent', FLOWS_ORIGIN: 'flows', PROVIDERS_ORIGIN: 'providers' };
 
-/** The template of one host (`agent`, `flows`, `providers`), unrendered. */
-export function readTemplate(host) {
-  return fs.readFileSync(path.join(HEADER_TEMPLATES, `${host}.headers`), 'utf8');
+/** Line ends as `\n`: a checkout on a machine that converts them (core.autocrlf) has CRLF, and a header value must not end in `\r`. */
+const lf = (text) => text.replace(/\r\n?/g, '\n');
+
+/** The template of one host (`agent`, `flows`, `providers`), unrendered, with `\n` line ends whatever the file has. `dir` is for a test. */
+export function readTemplate(host, dir = HEADER_TEMPLATES) {
+  return lf(fs.readFileSync(path.join(dir, `${host}.headers`), 'utf8'));
 }
 
 /**
@@ -28,7 +31,7 @@ export function readTemplate(host) {
  * in a policy.
  */
 export function renderHeaders(text, origins) {
-  const rendered = text.replace(/\{\{([A-Z_]+)\}\}/g, (whole, token) => {
+  const rendered = lf(text).replace(/\{\{([A-Z_]+)\}\}/g, (whole, token) => {
     if (token === 'APP_ORIGINS') {
       const apps = origins?.apps;
       if (!Array.isArray(apps)) throw new Error(`no origins for ${whole}`);
