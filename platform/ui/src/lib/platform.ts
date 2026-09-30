@@ -3,13 +3,15 @@
  *
  * The web build loads `src/tauri-shim/core.ts`, which installs
  * `window.__OAIY_WEB_SHIM__ = true` (and shims `invoke` so unmapped native
- * commands resolve to null). A real desktop (Tauri) build uses the actual
- * `@tauri-apps` APIs and never loads the shim, so the flag stays unset.
+ * commands resolve to null).
  *
- * Use this to gate features that need native capabilities the browser can't
- * provide — e.g. unzipping/verifying `.oaiy` packages or scanning the
- * filesystem for installable packages. Importing a `.json` flow still works
- * in the browser and should NOT be gated.
+ * That is NOT a sign of a browser tab: OAIY's own window shows this same
+ * build (platform/desktop serves platform/ui/dist to it), so the flag is set
+ * there too. To gate something on where the editor is, ask what it can do
+ * here (lib/caps.ts, shared/capabilities): a tab is told from OAIY's window
+ * by the desktop the window is given, not by the shim. Nothing calls this
+ * function for that reason: gating the Packages section on it would have
+ * taken the section out of OAIY's window.
  */
 export function isWebBuild(): boolean {
   return (
