@@ -2498,6 +2498,14 @@ async fn the_status_says_what_is_going_on_and_holds_no_secret() {
     assert_eq!(s["blockedAddresses"][0]["key"], "203.0.113.170");
     assert_eq!(s["storage"], "ok");
     assert_eq!(s["linksOutstanding"], 1);
+    // The verifications: five wrong passwords were checked, never more than the bound at once, none running now.
+    let v = &s["verifications"];
+    assert_eq!(
+        (v["bound"].as_u64(), v["running"].as_u64()),
+        (Some(3), Some(0))
+    );
+    assert_eq!(v["started"].as_u64(), Some(5), "{v}");
+    assert!((1..=3).contains(&v["mostAtOnce"].as_u64().unwrap()), "{v}");
     let text = r.text.clone();
     for secret in [
         b.session.as_str(),

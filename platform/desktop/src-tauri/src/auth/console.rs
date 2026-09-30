@@ -320,6 +320,13 @@ pub fn status_lines(status: &Value) -> Vec<String> {
             n("recentFailures")
         ),
         format!("storage: {}", s("storage")),
+        format!(
+            "verifications: {} started, at most {} at once (the bound is {}), {} running now",
+            status["verifications"]["started"].as_u64().unwrap_or(0),
+            status["verifications"]["mostAtOnce"].as_u64().unwrap_or(0),
+            status["verifications"]["bound"].as_u64().unwrap_or(0),
+            status["verifications"]["running"].as_u64().unwrap_or(0)
+        ),
     ];
     for (key, label) in [
         ("blockedAddresses", "blocked address"),

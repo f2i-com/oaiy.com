@@ -836,6 +836,134 @@ fn check_is_ok_on_a_good_configuration_and_lists_every_violation_on_a_bad_one() 
     );
 }
 
+/// The running server's console status as JSON, read the way the console reads it: the credential in its file, from the
+/// machine itself, no Origin.
+fn console_status(scratch: &Scratch, server: &Server) -> Value {
+    let token = read(&scratch.auth().join("console.token"));
+    let response = reqwest::blocking::Client::new()
+        .get(format!(
+            "http://127.0.0.1:{}/api/auth/console/status",
+            server.port
+        ))
+        .bearer_auth(token.trim())
+        .send()
+        .unwrap();
+    assert_eq!(response.status().as_u16(), 200);
+    response.json().unwrap()
+}
+
+/// A login from `from` behind a trusted proxy, sent whole and abandoned 12 ms later: the pass of Argon2 that it
+/// started is still running (it takes far longer) when the client is gone.
+fn hang_up_login(port: u16, from: &str) {
+    use std::io::Write;
+    let body = json!({ "password": "wrong wrong wrong" }).to_string();
+    let request = format!(
+        "POST /api/auth/login HTTP/1.1\r\nHost: dash.example.com\r\nOrigin: https://dash.example.com\r\n\
+         Sec-Fetch-Site: same-origin\r\nX-Forwarded-For: {from}\r\nX-Forwarded-Proto: https\r\n\
+         Content-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+        body.len()
+    );
+    if let Ok(mut socket) = std::net::TcpStream::connect(("127.0.0.1", port)) {
+        let _ = socket.write_all(request.as_bytes());
+        std::thread::sleep(Duration::from_millis(12));
+        // Dropped without reading a byte.
+    }
+}
+
+#[test]
+fn a_flood_of_logins_whose_clients_hang_up_is_bounded_and_counted() {
+    let scratch = Scratch::new("hangup");
+    let mut server = Server::spawn(
+        &scratch,
+        &[
+            ("OAIY_PUBLIC_URL", "https://dash.example.com"),
+            ("OAIY_TRUSTED_PROXIES", "127.0.0.1"),
+        ],
+        "server",
+    );
+    server.wait_until_up();
+    let code = setup_code_of(&console(&scratch, &["auth", "setup-code"]));
+    let proxied = |method: reqwest::Method, path: &str, body: Value, from: &str| {
+        reqwest::blocking::Client::new()
+            .request(method, format!("http://127.0.0.1:{}{path}", server.port))
+            .header("host", "dash.example.com")
+            .header("origin", "https://dash.example.com")
+            .header("sec-fetch-site", "same-origin")
+            .header("x-forwarded-for", from)
+            .header("x-forwarded-proto", "https")
+            .json(&body)
+            .send()
+            .unwrap()
+    };
+    let made = proxied(
+        reqwest::Method::POST,
+        "/api/auth/setup",
+        json!({ "code": code, "password": PASSWORD }),
+        "203.0.113.1",
+    );
+    assert_eq!(made.status().as_u16(), 201, "{}", made.text().unwrap());
+
+    // Forty logins from forty addresses, each abandoned as soon as it is sent, about thirty a second.
+    let port = server.port;
+    let clients: Vec<_> = (0..40)
+        .map(|i| {
+            let client = std::thread::spawn(move || {
+                hang_up_login(port, &format!("198.51.100.{}", 10 + i));
+            });
+            std::thread::sleep(Duration::from_millis(30));
+            client
+        })
+        .collect();
+    for client in clients {
+        client.join().unwrap();
+    }
+    // Let the passes that are still running end.
+    let deadline = Instant::now() + Duration::from_secs(60);
+    let status = loop {
+        let status = console_status(&scratch, &server);
+        if status["verifications"]["running"] == 0 {
+            std::thread::sleep(Duration::from_millis(500));
+            let again = console_status(&scratch, &server);
+            if again["verifications"]["running"] == 0 {
+                break again;
+            }
+        }
+        assert!(
+            Instant::now() < deadline,
+            "the passes did not end: {status}"
+        );
+        std::thread::sleep(Duration::from_millis(200));
+    };
+    let v = &status["verifications"];
+    let (started, most, bound) = (
+        v["started"].as_u64().unwrap(),
+        v["mostAtOnce"].as_u64().unwrap(),
+        v["bound"].as_u64().unwrap(),
+    );
+    eprintln!("hang-up flood: {v}, recent failures {}", status["recentFailures"]);
+    assert_eq!(bound, 3);
+    assert!(started >= 3, "the flood started passes: {v}");
+    assert!(
+        most <= bound,
+        "{most} passes ran at once (the bound is {bound}): a client that hangs up must not free the bound: {v}"
+    );
+    // Every pass of the flood was a wrong password, and every one was counted though nobody was left to be told.
+    assert_eq!(
+        status["recentFailures"].as_u64(),
+        Some(started),
+        "the failures of clients that hung up are counted: {status}"
+    );
+    // The owner still gets in.
+    let owner = proxied(
+        reqwest::Method::POST,
+        "/api/auth/login",
+        json!({ "password": PASSWORD }),
+        "203.0.113.77",
+    );
+    assert_eq!(owner.status().as_u16(), 200, "{}", owner.text().unwrap());
+    let _ = server.exit_code(Duration::from_millis(1));
+}
+
 #[test]
 fn a_running_server_that_the_console_cannot_read_the_files_of_is_not_touched() {
     let scratch = Scratch::new("cannot-read");

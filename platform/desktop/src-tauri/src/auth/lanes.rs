@@ -286,10 +286,44 @@ impl ReservedLane {
     }
 }
 
+/// What the hasher has done: passes running now, the most that ran at once since the server started, and the
+/// verifications started (a pass that checks a password against a stored hash).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Gauge {
+    pub running: usize,
+    pub peak: usize,
+    pub verifications: u64,
+}
+
+#[derive(Default)]
+struct Counters {
+    running: AtomicUsize,
+    peak: AtomicUsize,
+    verifications: std::sync::atomic::AtomicU64,
+}
+
+impl Counters {
+    /// A pass begins; the guard ends it when it is dropped (on the blocking thread, as the fence's place is).
+    fn begin(self: &Arc<Self>) -> Running {
+        let now = self.running.fetch_add(1, Ordering::SeqCst) + 1;
+        self.peak.fetch_max(now, Ordering::SeqCst);
+        Running(self.clone())
+    }
+}
+
+struct Running(Arc<Counters>);
+
+impl Drop for Running {
+    fn drop(&mut self) {
+        self.0.running.fetch_sub(1, Ordering::SeqCst);
+    }
+}
+
 /// The verifications, behind the fence.
 pub struct Hasher {
     engine: Arc<dyn PasswordEngine>,
     fence: Arc<Semaphore>,
+    counters: Arc<Counters>,
 }
 
 impl Hasher {
@@ -297,7 +331,17 @@ impl Hasher {
         Arc::new(Hasher {
             engine,
             fence: Arc::new(Semaphore::new(FENCE)),
+            counters: Arc::new(Counters::default()),
         })
+    }
+
+    /// The counts, for the status: whether the bound holds is something an operator can see.
+    pub fn gauge(&self) -> Gauge {
+        Gauge {
+            running: self.counters.running.load(Ordering::SeqCst),
+            peak: self.counters.peak.load(Ordering::SeqCst),
+            verifications: self.counters.verifications.load(Ordering::SeqCst),
+        }
     }
 
     /// Verify `password` (normalised) against `stored`, on a blocking thread, behind the fence.
@@ -310,8 +354,12 @@ impl Hasher {
             return Verdict::Mismatch;
         };
         let engine = self.engine.clone();
+        let counters = self.counters.clone();
         tokio::task::spawn_blocking(move || {
+            let pass = counters.begin();
+            counters.verifications.fetch_add(1, Ordering::SeqCst);
             let verdict = engine.verify(password.as_bytes(), &stored);
+            drop(pass);
             drop(permit);
             verdict
         })
@@ -329,8 +377,11 @@ impl Hasher {
             .await
             .map_err(|_| HashError::Argon2("the hasher is shut down".into()))?;
         let engine = self.engine.clone();
+        let counters = self.counters.clone();
         tokio::task::spawn_blocking(move || {
+            let pass = counters.begin();
             let hashed = engine.hash(password.as_bytes());
+            drop(pass);
             drop(permit);
             hashed
         })
@@ -887,6 +938,43 @@ mod tests {
             gauge.most_all.load(Ordering::SeqCst) >= 2,
             "and they did run together"
         );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn the_hasher_says_what_it_ran_and_the_most_it_ran_at_once() {
+        let gauge = Gauge::new();
+        let hasher = Hasher::new(gauge.clone());
+        assert_eq!(
+            hasher.gauge(),
+            super::Gauge {
+                running: 0,
+                peak: 0,
+                verifications: 0
+            }
+        );
+        let mut tasks = Vec::new();
+        for i in 0..10 {
+            let hasher = hasher.clone();
+            tasks.push(tokio::spawn(async move {
+                let pw = Zeroizing::new("A pw".to_string());
+                if i % 5 == 0 {
+                    let _ = hasher.hash(pw).await;
+                } else {
+                    let _ = hasher.verify(pw, "x".into()).await;
+                }
+            }));
+        }
+        for t in tasks {
+            t.await.unwrap();
+        }
+        let seen = hasher.gauge();
+        assert_eq!(seen.running, 0);
+        assert_eq!(seen.verifications, 8, "the hashes are not verifications");
+        assert!(
+            (2..=FENCE).contains(&seen.peak),
+            "they overlapped, within the fence: {seen:?}"
+        );
+        assert_eq!(seen.peak, gauge.most_all.load(Ordering::SeqCst));
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]

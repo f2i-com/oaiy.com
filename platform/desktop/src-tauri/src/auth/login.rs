@@ -44,7 +44,9 @@ use super::clock::{Clock, SystemClock};
 use super::cookie::{self, Lookup, DEVICE_MAX_AGE, REMEMBER_MAX_AGE};
 use super::device;
 use super::guard::{Denial, Guard, RequestInfo};
-use super::lanes::{AnonLane, AnonPermit, Hasher, Reject, ReservedLane, SessionGate, SessionLane};
+use super::lanes::{
+    self, AnonLane, AnonPermit, Hasher, Reject, ReservedLane, SessionGate, SessionLane,
+};
 use super::mode::{AccessMode, ConfigRefusal};
 use super::owner::{self, CreateError, OwnerDoc};
 use super::password::{Argon2Engine, HashError, PasswordEngine, Verdict};
@@ -1427,6 +1429,7 @@ impl LoginState {
                 .map(|(k, s)| json!({ "key": k, "retryAfterSeconds": s }))
                 .collect()
         };
+        let gauge = self.hasher.gauge();
         json!({
             "exposure": self.guard.config().exposure.name(),
             "accessMode": self.guard.mode().name(),
@@ -1444,6 +1447,12 @@ impl LoginState {
             "storage": self.store().storage().name(),
             "persistent": self.store().is_persistent(),
             "linksOutstanding": self.links_outstanding(),
+            "verifications": {
+                "started": gauge.verifications,
+                "running": gauge.running,
+                "mostAtOnce": gauge.peak,
+                "bound": lanes::FENCE,
+            },
             "port": self.port,
         })
     }
