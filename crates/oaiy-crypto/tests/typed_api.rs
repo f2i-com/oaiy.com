@@ -139,3 +139,41 @@ fn the_into_variants_write_what_the_by_value_functions_return_and_leave_out_unto
     assert_eq!(bip39::wrap_key_into(&entropy, &salt, 2, MEM_MIN, &mut untouched).unwrap_err(), Error::KdfParamsOutOfRange);
     assert_eq!(untouched.expose(), &zero, "a refused Argon2 parameter leaves `out` alone");
 }
+
+/// Keys that are made at random are made from the random generator and are all different (a generator that wrote nothing, or wrote the same thing twice, would make every key
+/// the same): the generate functions write the random bytes in place, and this is what shows that they do write them.
+#[test]
+fn every_key_that_is_made_at_random_is_not_zero_and_not_the_same_twice() {
+    use oaiy_crypto::bip39::Entropy;
+    use oaiy_crypto::ed25519::{KeyRole, SigningKey};
+    use oaiy_crypto::kit::RecoveryKit;
+    use oaiy_crypto::x25519::SecretKey;
+
+    fn filled() -> Vec<u8> {
+        let mut secret = Secret::<32>::zeroed();
+        secret.fill_random().unwrap();
+        secret.expose().to_vec()
+    }
+
+    let made: Vec<(&str, Vec<u8>, Vec<u8>)> = vec![
+        ("Secret::random", Secret::<32>::random().unwrap().expose().to_vec(), Secret::<32>::random().unwrap().expose().to_vec()),
+        ("Secret::fill_random", filled(), filled()),
+        (
+            "x25519 generate",
+            SecretKey::generate().unwrap().to_secret().expose().to_vec(),
+            SecretKey::generate().unwrap().to_secret().expose().to_vec(),
+        ),
+        (
+            "ed25519 generate",
+            SigningKey::generate(KeyRole::Hazmat).unwrap().seed().expose().to_vec(),
+            SigningKey::generate(KeyRole::Hazmat).unwrap().seed().expose().to_vec(),
+        ),
+        ("kit generate", RecoveryKit::generate().unwrap().key().expose().to_vec(), RecoveryKit::generate().unwrap().key().expose().to_vec()),
+        ("entropy random", Entropy::random().unwrap().expose().to_vec(), Entropy::random().unwrap().expose().to_vec()),
+    ];
+    for (name, first, second) in made {
+        assert!(first.iter().any(|b| *b != 0), "{name}: a zero key");
+        assert!(second.iter().any(|b| *b != 0), "{name}: a zero key");
+        assert_ne!(first, second, "{name}: the same key twice");
+    }
+}
