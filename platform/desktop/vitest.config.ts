@@ -1,4 +1,4 @@
-import { defineConfig } from 'vitest/config';
+import { configDefaults, defineConfig } from 'vitest/config';
 
 /**
  * Component tests for the OAIY Desktop UI.
@@ -20,6 +20,9 @@ export default defineConfig({
     // TypeScript build's `include` is `src` only, and an import of an .mjs from
     // there would need a declaration the build does not have.
     include: ['src/**/*.{test,spec}.{ts,tsx}', 'scripts/**/*.test.mjs'],
+    // oaiyctl uses node:test and a real POSIX shell, rather than Vitest/jsdom.
+    // npm test runs it separately, preserving both test runners' failures.
+    exclude: [...configDefaults.exclude, 'scripts/oaiyctl.test.mjs'],
     setupFiles: ['./src/test-setup.ts'],
   },
 });
