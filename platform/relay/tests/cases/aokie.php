@@ -654,6 +654,7 @@ test('4.14.4 four processes posting to the plugin\'s mailbox at once never skip 
     [$k, $a, $b, $plug] = aok_pair();
     $script = $k->r->dir . '/frames.php';
     file_put_contents($script, '<?php
+ini_set("display_errors", "stderr");
 define("OAIY_RELAY", true);
 require ' . var_export(dirname(__DIR__, 2) . '/src/autoload.php', true) . ';
 $ctx = Oaiy\Relay\Context::open($argv[1]);
@@ -663,7 +664,7 @@ for ($i = 1; $i <= (int)$argv[4]; $i++) {
     catch (Oaiy\Relay\ApiError $e) { if ($e->errorCode !== "relay_backpressure") { fwrite(STDERR, $e->errorCode . "\n"); } }
     catch (Throwable $e) { fwrite(STDERR, get_class($e) . ": " . $e->getMessage() . "\n"); }
 }
-echo $ok, "\n";
+echo "stored ", $ok, "\n";
 ');
     $mailbox = 'app:aokie@' . $k->desk->id . '/plugin';
     $procs = [];
@@ -671,12 +672,14 @@ echo $ok, "\n";
         $procs[$sender] = [proc_open(array_merge([PHP_BINARY], \OaiyTest\Server::phpFlags(), [$script, $k->r->data, $mailbox, $sender, '300']), [1 => ['pipe', 'w'], 2 => ['pipe', 'w']], $pipes), $pipes];
     }
     $stored = [];
+    $raw = [];
     foreach ($procs as $sender => [$p, $pipes]) {
-        $stored[$sender] = (int)trim((string)stream_get_contents($pipes[1]));
+        $raw[$sender] = trim((string)stream_get_contents($pipes[1]));
+        $stored[$sender] = preg_match('/^stored (\d+)$/m', $raw[$sender], $m) === 1 ? (int)$m[1] : -1;
         eq('', trim((string)stream_get_contents($pipes[2])), "$sender: nothing but backpressure went wrong");
         proc_close($p);
     }
-    eq(['mobile:a' => 256, 'mobile:b' => 256, 'mobile:c' => 256, 'mobile:d' => 256], $stored, 'a quarter of 1,024 each');
+    eq(['mobile:a' => 256, 'mobile:b' => 256, 'mobile:c' => 256, 'mobile:d' => 256], $stored, 'a quarter of 1,024 each; what the processes printed: ' . json_encode(array_map(fn($x) => substr($x, 0, 400), $raw)));
     $db = $k->r->ctx()->db;
     $seqs = array_map('intval', array_column($db->all('SELECT seq FROM items WHERE mailbox = ? ORDER BY seq', [$mailbox]), 'seq'));
     eq(range(1, 1024), $seqs, 'every seq once, no gap');
