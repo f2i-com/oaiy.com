@@ -49,6 +49,9 @@ pub const ATTACK_WINDOW_MS: u64 = 24 * 3_600_000;
 pub const ALERT_EVERY_MS: u64 = 3_600_000;
 /// Addresses tracked at once: a flood of rotating addresses cannot grow memory without bound.
 pub const MAX_TRACKED: usize = 50_000;
+/// Addresses (and devices) written to the file: the most that matter, so that the file stays a few hundred
+/// kilobytes whatever is tracked.
+pub const MAX_SAVED: usize = 2_000;
 /// How often the state is written when it changed.
 pub const FLUSH_EVERY_MS: u64 = 5_000;
 
@@ -359,15 +362,9 @@ impl LoginThrottle {
         let mut s = self.lock();
         s.dirty = false;
         s.last_flush = now;
-        let live = |m: &HashMap<String, Ladder>| -> HashMap<String, Ladder> {
-            m.iter()
-                .filter(|(_, l)| !l.is_quiet(now))
-                .map(|(k, l)| (k.clone(), l.clone()))
-                .collect()
-        };
         json!({
-            "addresses": live(&s.addresses),
-            "devices": live(&s.devices),
+            "addresses": saved(&s.addresses, now, MAX_SAVED),
+            "devices": saved(&s.devices, now, MAX_SAVED),
             "failures": s.failures.iter().filter(|t| now.saturating_sub(**t) < ATTACK_WINDOW_MS).collect::<Vec<_>>(),
             "slow_since_ms": s.slow_since,
             "last_alert_ms": s.last_alert,
@@ -424,6 +421,32 @@ impl LoginThrottle {
             .map(|t| t.min(now));
         refresh_slow(&mut s, now);
     }
+}
+
+/// What is worth saving of a table: the ladders that are not quiet, and when there are more than `most` of them
+/// the ones that matter most, the blocks that end last first (then the most failures, then the newest). The file is
+/// the guard's, written whole every few seconds: a flood of rotating addresses that were each blocked (30 000
+/// /64s in an hour is what a botnet of a modest size gives) must not make it megabytes long. What is not saved is
+/// still held in memory (up to `MAX_TRACKED`); it is only forgotten by a restart.
+fn saved(m: &HashMap<String, Ladder>, now: u64, most: usize) -> HashMap<String, Ladder> {
+    let mut live: Vec<(&String, &Ladder)> = m.iter().filter(|(_, l)| !l.is_quiet(now)).collect();
+    if live.len() > most {
+        live.select_nth_unstable_by(most, |(ka, a), (kb, b)| {
+            let key = |l: &Ladder| {
+                (
+                    l.blocked_until.max(now),
+                    l.level,
+                    l.consecutive,
+                    l.last_seen,
+                )
+            };
+            key(b).cmp(&key(a)).then_with(|| ka.cmp(kb))
+        });
+        live.truncate(most);
+    }
+    live.into_iter()
+        .map(|(k, l)| (k.clone(), l.clone()))
+        .collect()
 }
 
 /// A ladder read from a file, with what cannot be true cut back; `None` when nothing of it is worth keeping.
@@ -937,6 +960,120 @@ mod tests {
         assert_eq!(t.recent_failures(), KEEP_FAILURES);
         assert!(t.is_slow());
         assert_eq!(t.tracked(), 1000);
+    }
+
+    #[test]
+    fn what_is_saved_is_bounded_and_keeps_the_blocks_that_end_last() {
+        let (t, clock) = throttle();
+        let fail_five = |key: &str| {
+            for _ in 0..FAILURES_TO_BLOCK {
+                t.address_failed(key);
+            }
+        };
+        // More blocked addresses than the file holds, all blocked for fifteen minutes...
+        for i in 0..MAX_SAVED + 500 {
+            fail_five(&format!("early-{i:05}"));
+        }
+        // ...and a few that were blocked a little later: their blocks end last, so they are the ones kept.
+        clock.advance(MIN);
+        for i in 0..10 {
+            fail_five(&format!("late-{i}"));
+        }
+        assert_eq!(t.tracked(), MAX_SAVED + 510, "memory holds them all");
+        let saved = t.snapshot();
+        let addresses = saved["addresses"].as_object().unwrap();
+        assert_eq!(addresses.len(), MAX_SAVED);
+        for i in 0..10 {
+            assert!(addresses.contains_key(&format!("late-{i}")), "late-{i}");
+        }
+        assert!(
+            saved.to_string().len() < 400_000,
+            "{} bytes for {MAX_SAVED} addresses",
+            saved.to_string().len()
+        );
+        // What was kept is what a restart brings back, and a block is a block.
+        let (again, _) = throttle();
+        again.restore(&saved);
+        assert_eq!(again.tracked(), MAX_SAVED);
+        assert!(blocked(&again, "late-3").is_some());
+    }
+
+    #[test]
+    fn of_addresses_that_matter_equally_the_same_ones_are_kept_whatever_the_order_of_the_table() {
+        // Two tables that went through the same failures hold them in an order of their own (a hash map's), and
+        // what is saved does not depend on it: the same state is the same file.
+        let file = || {
+            let (t, _clock) = throttle();
+            for i in 0..MAX_SAVED + 500 {
+                for _ in 0..FAILURES_TO_BLOCK {
+                    t.address_failed(&format!("addr-{i:05}"));
+                }
+            }
+            t.snapshot()["addresses"].clone()
+        };
+        let first = file();
+        assert_eq!(first.as_object().unwrap().len(), MAX_SAVED);
+        assert_eq!(first, file());
+    }
+
+    #[test]
+    fn a_block_that_is_running_is_kept_before_a_ladder_that_only_remembers_blocks_that_ended() {
+        let (t, clock) = throttle();
+        let fail_five = |key: &str| {
+            for _ in 0..FAILURES_TO_BLOCK {
+                t.address_failed(key);
+            }
+        };
+        // Addresses on the third rung whose blocks are over (a day is not up, so the ladder is remembered)...
+        for wait in [16 * MIN, 31 * MIN, 61 * MIN] {
+            for i in 0..MAX_SAVED + 500 {
+                fail_five(&format!("over-{i:05}"));
+            }
+            clock.advance(wait);
+        }
+        // ...and a few on the first whose block is running now: it is those the file is for.
+        for i in 0..10 {
+            fail_five(&format!("now-{i}"));
+        }
+        assert!(blocked(&t, "now-0").is_some());
+        assert!(blocked(&t, "over-00000").is_none());
+        let saved = t.snapshot();
+        let addresses = saved["addresses"].as_object().unwrap();
+        assert_eq!(addresses.len(), MAX_SAVED);
+        for i in 0..10 {
+            assert!(addresses.contains_key(&format!("now-{i}")), "now-{i}");
+        }
+    }
+
+    #[test]
+    fn a_ladder_with_nothing_left_to_remember_is_not_saved() {
+        let (t, _clock) = throttle();
+        for _ in 0..FAILURES_TO_BLOCK {
+            t.address_failed("blocked");
+        }
+        for key in ["fine-1", "fine-2"] {
+            t.address_failed(key);
+            t.address_succeeded(key);
+        }
+        t.address_failed("one-failure");
+        let saved = t.snapshot();
+        let mut names: Vec<&String> = saved["addresses"].as_object().unwrap().keys().collect();
+        names.sort();
+        assert_eq!(names, ["blocked", "one-failure"]);
+    }
+
+    #[test]
+    fn a_table_that_fits_the_bound_is_saved_whole() {
+        let (t, _clock) = throttle();
+        for i in 0..MAX_SAVED {
+            for _ in 0..FAILURES_TO_BLOCK {
+                t.address_failed(&format!("addr-{i}"));
+            }
+        }
+        assert_eq!(
+            t.snapshot()["addresses"].as_object().unwrap().len(),
+            MAX_SAVED
+        );
     }
 
     #[test]
