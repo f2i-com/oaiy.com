@@ -10,7 +10,7 @@ import { contextWindow, detectContextWindow, formatTokens } from '../agent/conte
 import type { AgentSettings } from '../settings';
 import { OAIY_ORIGIN, discoverOaiy, listMediaModels, mediaAbilities, mergeDiscovered, originOf, type Discovery, type MediaSettings } from '../agent/media';
 import { newId } from '../vfs/projects';
-import { looksOnLoad, readHost } from '@oaiy/shared/capabilities/host';
+import { looksOnLoad, pageHost } from '@oaiy/shared/capabilities/host';
 import { clear, h } from './dom';
 
 export interface SettingsResult {
@@ -275,7 +275,7 @@ export function openSettings(initial: SettingsResult): Promise<SettingsResult | 
         return h('span.model-choice', input, h('datalist', { id: listId }, ...ids.map((id) => h('option', { value: id, label: note(id) }))));
       };
       // OAIY's own windows look for OAIY as they start; a tab in a browser only when this button is pressed (agent/lookup.ts).
-      const lookedForOnItsOwn = looksOnLoad(readHost());
+      const lookedForOnItsOwn = looksOnLoad(pageHost());
       const find = h('button', { title: `Ask OAIY for its details (/v1/discovery) and fill everything in${lookedForOnItsOwn ? '' : `. This page reaches out to your computer only when you press this, and your browser may ask you to allow it.`}`, onclick: async () => {
         note.textContent = 'Looking for OAIY…';
         let where = OAIY_ORIGIN;

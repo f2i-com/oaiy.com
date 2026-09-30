@@ -11,23 +11,33 @@
 import { looksOnLoad, type Host } from '@oaiy/shared/capabilities/host';
 import { OAIY_ORIGIN } from './media';
 
+/** Where to look, and whether the API key the person typed may go with the request. */
+export interface LookTarget {
+  origin: string;
+  /**
+   * False for an address that came from the page's own address (`?oaiy=`): a key the person typed for their own OAIY is not sent to
+   * whatever a link names, and is not kept with what that address says about itself.
+   */
+  withKey: boolean;
+}
+
 /**
  * Where to look for OAIY as the page starts, or null for nowhere.
  *
- * - `asked`: an address in the page's own address (`?oaiy=<address>`), a way to point the page at OAIY somewhere else. It is honoured
- *   in OAIY's windows and in an automated browser (the tests use it to point the page at a stand-in); a visitor's tab ignores it, so
- *   that a link someone sends cannot make the page look at the visitor's network.
+ * - `asked`: an address in the page's own address (`?oaiy=<address>`). It is a seam for the tests, which point the page at a stand-in
+ *   for OAIY, and it is honoured ONLY in an automated browser: anywhere else a link (one a model wrote into its reply, one someone
+ *   sent) would choose where the page looks, and could carry the person's key there.
  * - `discovered`: the origin of the OAIY found before, which is a link the person saved.
  * - `setByHand`: the media service was typed in by hand, so what OAIY says is not looked for again.
  *
  * An automated browser looks only when asked, so a test never talks to a desktop it did not start.
  */
-export function whereToLook(input: { host: Host; asked: string | null; discovered?: string; setByHand: boolean }): string | null {
+export function whereToLook(input: { host: Host; asked: string | null; discovered?: string; setByHand: boolean }): LookTarget | null {
   const { host } = input;
-  const asked = input.asked !== null && (host.kind !== 'browser' || host.automated) ? input.asked : null;
-  const where = asked ?? (host.automated ? null : (input.discovered ?? (looksOnLoad(host) ? OAIY_ORIGIN : null)));
-  if (!where || (input.setByHand && !asked)) return null;
-  return where;
+  if (host.automated) return input.asked ? { origin: input.asked, withKey: false } : null;
+  const origin = input.discovered ?? (looksOnLoad(host) ? OAIY_ORIGIN : null);
+  if (!origin || input.setByHand) return null;
+  return { origin, withKey: true };
 }
 
 /** Where to look again, now and then, for what OAIY's Engines has chosen: the OAIY found before, else (in OAIY's own windows) its usual address. */

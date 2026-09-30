@@ -8,7 +8,8 @@
  */
 import { readTemplate, renderHeaders } from '../../scripts/headers.mjs';
 import { buildApps } from './apps.mjs';
-import { browserVersion, launchBrowser, sleep, startWorld } from './harness.mjs';
+import { browserVersion, launchBrowser, sleep } from './harness.mjs';
+import { startHosts } from './hosts.mjs';
 import { watchLocal } from './local-ranges.mjs';
 
 export const DESKTOP = 'http://127.0.0.1:17972';
@@ -22,20 +23,27 @@ export const SETTLE_MS = 3000;
 
 export async function startAppWorld() {
   const apps = await buildApps();
-  const world = await startWorld({ providers: false });
-  const origins = { ...world.origins, apps: [] };
-  world.hosts.setSite('agent', { root: apps.agent, headers: renderHeaders(readTemplate('agent'), origins) });
-  world.hosts.setSite('flows', { root: apps.flows, headers: renderHeaders(readTemplate('flows'), origins) });
-  const sites = Object.keys(world.origins).map((name) => `${world.hosts.host(name)}:${world.hosts.port}`);
+  // The two apps on their own hosts, and each again at the name OAIY's own window is served from: a browser resolves every
+  // `*.localhost` name to this computer, so a page at `oaiy.localhost:PORT` is whatever answers on that port. It is not OAIY's window
+  // (which has no port and is given the desktop): the cases that show the apps do not take it for one open these two.
+  const hosts = await startHosts({ hostNames: { oaiyAsAgent: 'oaiy.localhost', oaiyflowsAsFlows: 'oaiyflows.localhost' } });
+  const names = ['agent', 'flows', 'providers', 'oaiyAsAgent', 'oaiyflowsAsFlows'];
+  const origins = Object.fromEntries(names.map((name) => [name, hosts.origin(name)]));
+  const headers = { agent: renderHeaders(readTemplate('agent'), { ...origins, apps: [] }), flows: renderHeaders(readTemplate('flows'), { ...origins, apps: [] }) };
+  hosts.setSite('agent', { root: apps.agent, headers: headers.agent });
+  hosts.setSite('flows', { root: apps.flows, headers: headers.flows });
+  hosts.setSite('oaiyAsAgent', { root: apps.agent, headers: headers.agent });
+  hosts.setSite('oaiyflowsAsFlows', { root: apps.flows, headers: headers.flows });
+  const sites = names.map((name) => `${hosts.host(name)}:${hosts.port}`);
   const browser = await launchBrowser({});
   console.log(`# browser: ${await browserVersion(browser)}`);
   return {
-    world,
+    world: { hosts, origins },
     sites,
     browser,
     async close() {
       await browser.close();
-      await world.close();
+      await hosts.close();
       apps.remove();
     },
   };
@@ -44,9 +52,10 @@ export async function startAppWorld() {
 /**
  * A page of one of the apps, in a browser context of its own with the recorder on.
  * `desktop`: what OAIY's window gives its pages before they run. `storage`: localStorage set before the page runs.
- * `refuseAfterMs` and `answer`: see watchLocal.
+ * `refuseAfterMs` and `answer`: see watchLocal. `at`: the host to open it at (`agent`, `flows`, or `oaiyAsAgent` / `oaiyflowsAsFlows`, the
+ * app at `oaiy.localhost:PORT` / `oaiyflows.localhost:PORT`: OAIY's names, on a port).
  */
-export async function openApp(env, app, { desktop = null, storage = {}, path = app === 'agent' ? '/' : '/app.html', refuseAfterMs = 0, answer = null, viewport = { width: 1440, height: 900 } } = {}) {
+export async function openApp(env, app, { desktop = null, storage = {}, path = app === 'agent' ? '/' : '/app.html', refuseAfterMs = 0, answer = null, viewport = { width: 1440, height: 900 }, at = app } = {}) {
   const context = await env.browser.newContext({ viewport });
   const { attempts } = await watchLocal(context, { sites: env.sites, refuseAfterMs, answer });
   const errors = [];
@@ -69,7 +78,7 @@ export async function openApp(env, app, { desktop = null, storage = {}, path = a
   );
   const page = await context.newPage();
   page.on('pageerror', (e) => errors.push(e.message));
-  await page.goto(`${env.world.origins[app]}${path}`);
+  await page.goto(`${env.world.origins[at]}${path}`);
   return { context, page, attempts, errors };
 }
 

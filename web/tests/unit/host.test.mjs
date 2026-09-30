@@ -45,6 +45,55 @@ describe("OAIY's own windows", () => {
       assert.equal(H.readHost({ location: { hostname: 'localhost', protocol } }).kind, 'browser', protocol);
     }
   });
+
+  describe('the origin is matched exactly (the review\'s F5), not "any port of a host name"', () => {
+    const page = (protocol, hostname, port = '', href = `${protocol}//${hostname}${port ? `:${port}` : ''}/index.html`) => ({ location: { protocol, hostname, port, href } });
+    const kind = (env) => H.readHost(env).kind;
+    const OWN = [['http:', 'oaiy.localhost'], ['oaiy:', 'localhost'], ['http:', 'oaiyflows.localhost'], ['oaiyflows:', 'localhost']];
+
+    it('the four origins OAIY serves from, with no port, are its window, given a desktop or not', () => {
+      for (const [protocol, hostname] of OWN) assert.equal(kind(page(protocol, hostname)), 'oaiy-window', `${protocol}//${hostname}`);
+    });
+
+    it('the same names on any port are not: a page at oaiy.localhost:8000 is whatever answers on that port of this computer', () => {
+      for (const [protocol, hostname] of OWN) {
+        for (const port of ['80', '443', '1', '5317', '8000', '8080', '17972', '65535']) assert.equal(kind(page(protocol, hostname, port)), 'browser', `${protocol}//${hostname}:${port}`);
+      }
+      // Given a desktop, a page is still OAIY's window at any address: it is the desktop that says so, before the page runs.
+      assert.equal(kind({ ...page('http:', 'oaiy.localhost', '8000'), __OAIY_DESKTOP__: GIVEN }), 'oaiy-window');
+    });
+
+    it('a user name or a password in the address is not OAIY', () => {
+      for (const href of ['http://user@oaiy.localhost/', 'http://user:secret@oaiy.localhost/', 'http://:secret@oaiy.localhost/', 'oaiy://user@localhost/', 'http://evil@oaiyflows.localhost/']) {
+        const url = new URL(href);
+        assert.equal(kind(page(url.protocol, url.hostname, url.port, href)), 'browser', href);
+      }
+    });
+
+    it('another scheme, another host under the scheme, or another case is not OAIY', () => {
+      assert.equal(kind(page('https:', 'oaiy.localhost')), 'browser', 'https');
+      assert.equal(kind(page('HTTP:', 'oaiy.localhost')), 'browser', 'scheme in capitals');
+      assert.equal(kind(page('http:', 'OAIY.localhost')), 'browser', 'name in capitals');
+      assert.equal(kind(page('http:', 'Oaiy.Localhost')), 'browser', 'name in mixed case');
+      assert.equal(kind(page('oaiy:', 'evil.example')), 'browser', 'oaiy:// is OAIY\'s only at localhost');
+      assert.equal(kind(page('oaiy:', 'oaiy.localhost')), 'browser');
+      assert.equal(kind(page('oaiyflows:', 'oaiy.localhost')), 'browser');
+      assert.equal(kind(page('http:', 'localhost')), 'browser');
+      assert.equal(kind(page('http:', 'oaiy.localhost.')), 'browser', 'a trailing dot is another name');
+    });
+
+    it('an address that does not parse is not OAIY', () => {
+      assert.equal(kind({ location: { protocol: 'http:', hostname: 'oaiy.localhost', port: '', href: 'not a url' } }), 'browser');
+    });
+
+    it('the bot.computer shell is matched the same way: no port, no user name', () => {
+      assert.equal(kind(page('http:', 'botcomputer.localhost')), 'desktop-shell');
+      assert.equal(kind(page('botcomputer:', 'localhost')), 'desktop-shell');
+      assert.equal(kind(page('http:', 'botcomputer.localhost', '5317')), 'browser');
+      assert.equal(kind(page('http:', 'botcomputer.localhost', '', 'http://u@botcomputer.localhost/')), 'browser');
+      assert.equal(kind(page('botcomputer:', 'evil.example')), 'browser');
+    });
+  });
 });
 
 describe('the bot.computer desktop shell', () => {
@@ -105,6 +154,65 @@ describe('where the page is hosted, and whether the browser is automated', () =>
   it('being automated changes no window into another', () => {
     assert.equal(H.readHost({ ...at('agent.example.org'), navigator: { webdriver: true } }).kind, 'browser');
     assert.equal(H.readHost({ ...at('oaiy.localhost'), navigator: { webdriver: true } }).kind, 'oaiy-window');
+  });
+});
+
+describe('the window is read once (the review\'s F8)', () => {
+  const globals = ['location', '__OAIY_DESKTOP__', '__TAURI_INTERNALS__', '__OAIY_WEB_SHIM__'];
+  const clean = () => {
+    for (const name of globals) delete globalThis[name];
+    H.forgetPageHost();
+  };
+
+  it('pageHost gives the window as it was at the first ask, and the same frozen answer after: a script that sets __OAIY_DESKTOP__ later does not turn the tab into OAIY\'s window', () => {
+    clean();
+    try {
+      globalThis.location = { hostname: 'flows.example.org', protocol: 'https:', port: '', href: 'https://flows.example.org/app.html' };
+      const first = H.pageHost();
+      assert.equal(first.kind, 'browser');
+      // What a flow's code, a model-written page or an injected script can do after the page has loaded.
+      globalThis.__OAIY_DESKTOP__ = Object.freeze({ origin: 'http://192.168.1.1:17972', token: 'x', theme: 'dark' });
+      globalThis.__TAURI_INTERNALS__ = {};
+      assert.equal(H.pageHost().kind, 'browser', 'still a tab');
+      assert.equal(H.pageHost(), first, 'the same answer');
+      assert.equal(H.looksOnLoad(H.pageHost()), false);
+      // The pure reading, for a test, sees what is there now: it is the memo that holds the answer.
+      assert.equal(H.readHost().kind, 'oaiy-window');
+    } finally {
+      clean();
+    }
+  });
+
+  it('the answer is frozen, and so is what readHost returns', () => {
+    clean();
+    try {
+      globalThis.location = { hostname: 'flows.example.org', protocol: 'https:' };
+      const host = H.pageHost();
+      assert.equal(Object.isFrozen(host), true);
+      assert.throws(() => {
+        host.kind = 'oaiy-window';
+      }, TypeError);
+      assert.throws(() => {
+        host.automated = true;
+      }, TypeError);
+      assert.equal(host.kind, 'browser');
+      assert.equal(Object.isFrozen(H.readHost({})), true);
+    } finally {
+      clean();
+    }
+  });
+
+  it('it is read at the first ask, not before: a page that OAIY gave its desktop before it ran is OAIY\'s window for good', () => {
+    clean();
+    try {
+      globalThis.location = { hostname: 'oaiyflows.localhost', protocol: 'http:', port: '', href: 'http://oaiyflows.localhost/app.html' };
+      globalThis.__OAIY_DESKTOP__ = Object.freeze({ origin: 'http://127.0.0.1:17972', token: 't', theme: 'dark' });
+      assert.equal(H.pageHost().kind, 'oaiy-window');
+      delete globalThis.__OAIY_DESKTOP__;
+      assert.equal(H.pageHost().kind, 'oaiy-window', 'and a script that removes it afterwards changes nothing either');
+    } finally {
+      clean();
+    }
   });
 });
 

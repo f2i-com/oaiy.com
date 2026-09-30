@@ -93,6 +93,28 @@ describe('E5: the Agent', () => {
     }
   });
 
+  it('a page at oaiy.localhost on a port, given no desktop, is a tab, not OAIY\'s window: it looks at nothing, and a link\'s address (?oaiy=) is ignored (the review\'s F5)', async () => {
+    const seen = [];
+    for (const path of ['/', `/?oaiy=${encodeURIComponent('http://192.168.1.1:8080')}`, `/?oaiy=${encodeURIComponent(OAIY)}`]) {
+      const { context, page, attempts } = await open('agent', { at: 'oaiyAsAgent', path });
+      await ready('agent', page);
+      assert.match(await page.locator('.chat-log').textContent(), /Welcome!/);
+      assert.equal(await page.evaluate(() => location.hostname), 'oaiy.localhost');
+      assert.equal(await page.locator('button.chip.phone').evaluate((e) => e.hidden), false, 'the pairing chip: it is a tab');
+      seen.push(...attempts);
+      await context.close();
+    }
+    assert.deepEqual(seen, []);
+  });
+
+  it('OAIY\'s own window ignores an address in the page\'s own address too: only an automated browser is pointed elsewhere by one', async () => {
+    const { context, page, attempts } = await open('agent', { desktop: OAIY_WINDOW, path: `/?oaiy=${encodeURIComponent('http://192.168.1.1:8080')}` });
+    await ready('agent', page);
+    assert.ok(attempts.includes(`GET ${OAIY}/v1/discovery`), `it looked at OAIY's usual address: ${attempts.join(', ')}`);
+    assert.ok(attempts.every((a) => !a.includes('192.168.1.1')), `and never at the address the link named: ${attempts.join(', ')}`);
+    await context.close();
+  });
+
   it('a tab with an OAIY it found before (a link it saved) looks at that one, and only that', async () => {
     // The link is what the settings keep after Find OAIY: media.discovered. Saved through the page's own store, then reloaded.
     const again = await open('agent');
@@ -171,6 +193,15 @@ describe('E5: the flow editor', () => {
     // Nothing keeps asking either: the poll runs every ten seconds where there is one.
     await sleep(11_000);
     assert.deepEqual(attempts, []);
+    await context.close();
+  });
+
+  it('a page at oaiyflows.localhost on a port, given no desktop, is a tab too: it looks at nothing and offers Connect', async () => {
+    const { context, page, attempts } = await open('flows', { at: 'oaiyflowsAsFlows' });
+    await ready('flows', page);
+    assert.equal(await page.evaluate(() => location.hostname), 'oaiyflows.localhost');
+    assert.deepEqual(attempts, []);
+    assert.equal(await page.locator('aside [data-connect-desktop]').count(), 1, 'Connect: it is a tab');
     await context.close();
   });
 

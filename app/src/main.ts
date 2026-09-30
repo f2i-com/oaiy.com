@@ -36,7 +36,7 @@ import { editPhone } from './ui/phone';
 import { startTheme } from './ui/theme';
 import { discoverOaiy, mediaAbilities, mergeDiscovered, originOf } from './agent/media';
 import { whereToFollow, whereToLook } from './agent/lookup';
-import { readHost } from '@oaiy/shared/capabilities/host';
+import { pageHost } from '@oaiy/shared/capabilities/host';
 import type { FeatureId } from '@oaiy/shared/capabilities/features';
 import { agentCaps } from './desktop/caps';
 import { budgetFor, contextWindow, detectContextWindow, formatTokens } from './agent/context';
@@ -105,15 +105,17 @@ function embeddedDesktop(): { origin: string; token: string } | null {
   return given && typeof given.origin === 'string' && typeof given.token === 'string' && given.token ? { origin: given.origin, token: given.token } : null;
 }
 
+// Which window this is, read once as the page loads (shared/capabilities/host.ts): OAIY's own window (given the desktop, or served from OAIY's own
+// origin, exactly), the bot.computer desktop shell, or a tab in a browser. Only the first two look for OAIY on their own (agent/lookup.ts).
+const HOST = pageHost();
 /** OAIY's own window, where the app is a page beside the sidebar (it knows the desktop from its first line). */
-const IN_OAIY = location.hostname === 'oaiy.localhost' || location.protocol === 'oaiy:' || !!embeddedDesktop();
+const IN_OAIY = HOST.kind === 'oaiy-window';
 // Inside OAIY's window the page takes the window's look (styles.css, `.in-oaiy`).
 if (IN_OAIY) document.documentElement.classList.add('in-oaiy');
 // Light or dark: OAIY's (the dashboard's choice), or the system's.
 startTheme(IN_OAIY);
-const DESKTOP = IN_OAIY || location.hostname === 'botcomputer.localhost' || location.protocol === 'botcomputer:' || '__TAURI_INTERNALS__' in window;
-// Which window this is, for what the page may look at (see agent/lookup.ts): only OAIY's own windows and the desktop shell look for OAIY on their own.
-const HOST = readHost();
+/** One of OAIY's own windows or the desktop shell: not a tab. */
+const DESKTOP = HOST.kind !== 'browser';
 // The browser offers to install the app as the page loads: listened for here, before anything is awaited. Never in OAIY's own window.
 const install = startInstall(window, DESKTOP);
 
@@ -1568,16 +1570,16 @@ A project can hold several apps, each in its own folder (any folder whose manife
   /**
    * OAIY on this computer: read its discovery document and set up images,
    * video and chat from it. A service set up by hand is left alone; one found
-   * before is refreshed (its models may have changed). `?oaiy=<address>` looks
-   * somewhere else; automated browsers (the tests) only look when asked to.
+x
    * Where the page looks on its own is decided in agent/lookup.ts: OAIY's own
    * windows at OAIY's usual address, a tab in a browser only at an OAIY it
    * found before (Settings → Find OAIY looks whenever it is pressed).
    */
   async function lookForOaiy(): Promise<void> {
-    const where = whereToLook({ host: HOST, asked: new URLSearchParams(location.search).get('oaiy'), discovered: media.discovered?.origin, setByHand: !!media.baseUrl && !media.discovered });
-    if (!where) return;
-    const found = await discoverOaiy(where, media.apiKey, undefined, 3000).catch(() => null);
+    const target = whereToLook({ host: HOST, asked: new URLSearchParams(location.search).get('oaiy'), discovered: media.discovered?.origin, setByHand: !!media.baseUrl && !media.discovered });
+    if (!target) return;
+    // The person's key goes only to the OAIY they set up, never to an address a link named.
+    const found = await discoverOaiy(target.origin, target.withKey ? media.apiKey : '', undefined, 3000).catch(() => null);
     if (!found || found.state === 'absent') return;
     if (found.state !== 'found') {
       // OAIY is there but closed to this page: say how to open it, once per browser.
@@ -1594,6 +1596,8 @@ With that done, Settings → Images, video and audio → Find OAIY sets it up.`)
     }
     const first = !media.discovered;
     media = mergeDiscovered(media, found.media);
+    // What a link's address says about itself is kept without the key the person typed: later requests to it would carry it.
+    if (!target.withKey) media = { ...media, apiKey: '' };
     await saveMedia(media);
     followEngine(found);
     const chatProvider = oaiyProvider(providers, found);
