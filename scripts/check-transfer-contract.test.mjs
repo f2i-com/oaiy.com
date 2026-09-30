@@ -334,6 +334,34 @@ test('run as a program: --write-lock refuses a short or a missing commit hash an
   assert.equal(readFileSync(path.join(dir, 'oaiy-only', 'SYNCED_FROM.json'), 'utf8'), before, 'the lock is as it was');
 });
 
+test('run as a program: a folder without its lock fails, whatever else is right', (t) => {
+  // The workflow that releases relies on this: with no SYNCED_FROM.json nothing says which Aokie commit the folder is.
+  const dir = copyOfFolder(t);
+  rmSync(path.join(dir, 'oaiy-only', 'SYNCED_FROM.json'));
+  const r = spawnSync(process.execPath, [script, '--dir', dir], { encoding: 'utf8', env: { ...process.env, AOKIE_TRANSFER_CONTRACTS: '' } });
+  assert.equal(r.status, 1, r.stdout);
+  assert.match(r.stderr, /SYNCED_FROM\.json is missing: it says which Aokie commit the folder was copied from/);
+  // ...and so does one whose lock is empty or is not the folder's.
+  const empty = copyOfFolder(t);
+  writeFileSync(path.join(empty, 'oaiy-only', 'SYNCED_FROM.json'), '{}\n');
+  assert.equal(spawnSync(process.execPath, [script, '--dir', empty], { encoding: 'utf8', env: { ...process.env, AOKIE_TRANSFER_CONTRACTS: '' } }).status, 1);
+});
+
+test('the release workflow refuses a release without the lock, and the release checklist runs the comparison with Aokie\'s checkout', () => {
+  const root = fileURLToPath(new URL('../', import.meta.url));
+  const workflow = readFileSync(path.join(root, '.github', 'workflows', 'release.yml'), 'utf8');
+  // The first job of the release, before anything is built, runs the check (which fails on a missing lock).
+  const meta = workflow.slice(workflow.indexOf('\n  meta:'), workflow.indexOf('\n  verify:'));
+  assert.match(meta, /- name: Transfer contract lock \(transfer_v1\)\s+run: node scripts\/check-transfer-contract\.mjs\s*\n/, 'the release workflow runs the contract check in its first job');
+  assert.doesNotMatch(meta, /continue-on-error/, 'and it cannot be let through');
+  // CI runs it too (the desktop leg), and the checklist says how to compare with Aokie's checkout, which the workflows cannot.
+  assert.match(readFileSync(path.join(root, '.github', 'workflows', 'ci.yml'), 'utf8'), /npm run check:transfer-contract/);
+  const releasing = readFileSync(path.join(root, 'docs', 'RELEASING.md'), 'utf8');
+  assert.match(releasing, /AOKIE_TRANSFER_CONTRACTS=<Aokie checkout>\/docs\/contracts\/transfer node scripts\/check-transfer-contract\.mjs --require-aokie/);
+  assert.match(releasing, /Do not tag on a NOT VERIFIED run/);
+  assert.doesNotMatch(releasing, /OAIY_TRANSFER_CONTRACTS/, 'the variable the script reads is AOKIE_TRANSFER_CONTRACTS');
+});
+
 test('run as a program: the real folder of this repository passes, on its own sums and its lock', () => {
   const r = spawnSync(process.execPath, [script], { encoding: 'utf8', env: { ...process.env, AOKIE_TRANSFER_CONTRACTS: '' } });
   assert.equal(r.status, 0, r.stderr);

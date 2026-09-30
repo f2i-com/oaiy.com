@@ -213,7 +213,25 @@ everywhere, on a developer's machine and in the workflow, and the `sign` job sig
    `tauri.conf.json` and `Cargo.toml` while the installers are built, so no release commit
    is needed for it. The `0.1.0` committed in those files is only what a build from a
    checkout reports.
-2. **Tag a commit whose message does not contain `[skip ci]`.** GitHub starts no workflow
+2. **Check the transfer contract against Aokie's checkout, where both repositories are.** The
+   folder `docs/contracts/transfer` is Aokie's, copied byte for byte, and `oaiy-only/SYNCED_FROM.json`
+   is its lock: the Aokie commit it was copied from and the digest of every file. CI checks the
+   folder against its own lock and sums, but the release workflow does not have Aokie's
+   repository, so the comparison with it is made here, before the tag, by whoever cuts the
+   release:
+
+   ```sh
+   AOKIE_TRANSFER_CONTRACTS=<Aokie checkout>/docs/contracts/transfer node scripts/check-transfer-contract.mjs --require-aokie
+   ```
+
+   The variable is `AOKIE_TRANSFER_CONTRACTS` (the script reads no other) and must point at a
+   folder inside a git checkout of Aokie that has the locked commit. It passes only when the
+   files are identical with Aokie's, and the folder at the locked commit is the one the lock
+   records; a run without the variable, or with a folder that is not in a git checkout, is
+   reported as NOT VERIFIED and `--require-aokie` fails it. Do not tag on a NOT VERIFIED run.
+   The release workflow itself refuses a release whose lock is missing, or whose folder is not
+   what the lock records (its first job runs `node scripts/check-transfer-contract.mjs`).
+3. **Tag a commit whose message does not contain `[skip ci]`.** GitHub starts no workflow
    for a push whose commit says so (`[skip ci]`, `[ci skip]`, `[no ci]`, `[skip actions]`
    and `[actions skip]`), and a tag push is a push: the tag on such a commit starts
    nothing. The commit at the head of a push to this repository has carried `[skip ci]`
@@ -226,7 +244,7 @@ everywhere, on a developer's machine and in the workflow, and the `sign` job sig
 
    The commit must also hold `.github/workflows/release.yml`, which the commits before the
    workflows moved to the root (and so `v0.0.1` to `v0.0.6`) do not.
-3. **Tag it and push the tag.**
+4. **Tag it and push the tag.**
 
    ```sh
    git tag -a v0.1.0 -m "OAIY 0.1.0"
@@ -236,7 +254,7 @@ everywhere, on a developer's machine and in the workflow, and the `sign` job sig
    The workflow takes `0.1.0` or `v0.1.0` for the same version; the earlier releases were
    tagged with the `v` and annotated, so do the same, and push only one of the two forms.
    Push the commit first if it is not on GitHub yet.
-4. **Watch the run** (Actions, "Release", or `gh run watch`). `meta` fixes the version and
+5. **Watch the run** (Actions, "Release", or `gh run watch`). `meta` fixes the version and
    the revision, `verify` runs `ci.yml` at that revision, and the web and desktop builds
    run beside it. `release` publishes only when all of them passed. The GitHub Release then
    holds the files above, and every `release-evidence-*.json` says `verified`. The
@@ -254,7 +272,7 @@ everywhere, on a developer's machine and in the workflow, and the `sign` job sig
    should show both in the Debian package. The Windows installers were looked at this way
    when the pages were added; the Linux packages come from the same configuration but had
    not been built then, so a first release is their first look.
-5. **If the push started nothing**, run the workflow by hand on the tag's ref. A run on a
+6. **If the push started nothing**, run the workflow by hand on the tag's ref. A run on a
    tag publishes, the same as the push would have:
 
    ```sh
@@ -264,7 +282,7 @@ everywhere, on a developer's machine and in the workflow, and the `sign` job sig
    The `version` input is required but the tag decides the version. GitHub takes manual
    runs only of workflows that are on the default branch, so the workflows have to be
    there. `gh run list --workflow release.yml` shows the run.
-6. **Redeploy the site** from the release's `oaiy-web-<v>.zip`. Nothing in the workflow puts it
+7. **Redeploy the site** from the release's `oaiy-web-<v>.zip`. Nothing in the workflow puts it
    on a host, and until it is replaced the site's download buttons still offer the previous
    release (see the next section).
 
