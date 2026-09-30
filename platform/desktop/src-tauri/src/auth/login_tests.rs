@@ -73,27 +73,93 @@ const REAL_MORE: [&str; 2] = [
     "/api/auth/console/status",
 ];
 
-/// A disk that can be made full, and slow for what holds a marker.
+/// The longest a test lets a call or a write wait to be let go, so that a test that failed before it let go cannot
+/// hang the run: the wait ends and the test fails on what it found.
+const LONGEST_HELD: Duration = Duration::from_secs(60);
+
+/// Wait (by looking every few milliseconds) until `done`; fail the test, saying what it waited for, if that does not
+/// happen in thirty seconds. The tests that have to say what is running when something else happens hold the
+/// password engine or the disk and wait on what they can see: they do not sleep and hope.
+async fn eventually(what: &str, done: impl Fn() -> bool) {
+    let until = std::time::Instant::now() + Duration::from_secs(30);
+    while !done() {
+        assert!(
+            std::time::Instant::now() < until,
+            "timed out waiting for {what}"
+        );
+        tokio::time::sleep(Duration::from_millis(2)).await;
+    }
+}
+
+/// Wait for `done` for at most `settle`, and say whether it happened. For what must NOT happen: a server that is
+/// wrong does it at once, so a short wait finds it, and a slow machine can only make the wait find less.
+async fn happens_within(settle: Duration, done: impl Fn() -> bool) -> bool {
+    let until = std::time::Instant::now() + settle;
+    while !done() {
+        if std::time::Instant::now() >= until {
+            return false;
+        }
+        tokio::time::sleep(Duration::from_millis(2)).await;
+    }
+    true
+}
+
+/// A disk that can be made full, and held: a write of bytes that hold a marker waits until it is let go.
 struct Disk {
     full: AtomicBool,
     writes: AtomicUsize,
-    /// A write of bytes that hold this marker sleeps this long before it writes.
-    slow: std::sync::Mutex<Option<(Vec<u8>, Duration)>>,
+    /// While this is a marker, a write of bytes that hold it waits (and is counted in `held`).
+    hold: std::sync::Mutex<Option<Vec<u8>>>,
+    held: AtomicUsize,
+    go: std::sync::Condvar,
+}
+
+impl Disk {
+    fn hold_writes_of(&self, marker: &[u8]) {
+        *self.hold.lock().unwrap_or_else(|e| e.into_inner()) = Some(marker.to_vec());
+    }
+
+    fn release(&self) {
+        *self.hold.lock().unwrap_or_else(|e| e.into_inner()) = None;
+        self.go.notify_all();
+    }
+
+    /// Writes that are waiting now, or have waited and are let go.
+    fn held(&self) -> usize {
+        self.held.load(Ordering::SeqCst)
+    }
+
+    fn wait_to_be_let_go(&self) {
+        let until = std::time::Instant::now() + LONGEST_HELD;
+        let mut hold = self.hold.lock().unwrap_or_else(|e| e.into_inner());
+        while hold.is_some() {
+            let left = until.saturating_duration_since(std::time::Instant::now());
+            if left.is_zero() {
+                break;
+            }
+            hold = self
+                .go
+                .wait_timeout(hold, left)
+                .unwrap_or_else(|e| e.into_inner())
+                .0;
+        }
+    }
 }
 
 impl FileWriter for Disk {
     fn write(&self, path: &std::path::Path, bytes: &[u8]) -> std::io::Result<()> {
         self.writes.fetch_add(1, Ordering::SeqCst);
-        let slow = self.slow.lock().unwrap_or_else(|e| e.into_inner()).clone();
-        if let Some((marker, wait)) = slow {
+        let marker = self.hold.lock().unwrap_or_else(|e| e.into_inner()).clone();
+        if let Some(marker) = marker {
             if bytes.windows(marker.len()).any(|w| w == marker.as_slice()) {
+                self.held.fetch_add(1, Ordering::SeqCst);
                 // On a worker of a multi-threaded runtime the wait hands the worker (and the task that its
                 // wake-ups have queued behind this one) to another thread: a busy disk does not stop the others.
                 match tokio::runtime::Handle::try_current().map(|h| h.runtime_flavor()) {
                     Ok(tokio::runtime::RuntimeFlavor::MultiThread) => {
-                        tokio::task::block_in_place(|| std::thread::sleep(wait))
+                        tokio::task::block_in_place(|| self.wait_to_be_let_go())
                     }
-                    _ => std::thread::sleep(wait),
+                    _ => self.wait_to_be_let_go(),
                 }
             }
         }
@@ -104,35 +170,84 @@ impl FileWriter for Disk {
     }
 }
 
+/// Which calls of the engine wait to be let go.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Stop {
+    Nothing,
+    /// Every call that is made.
+    All,
+    /// The call with this number (the calls are numbered from 1 in the order they arrive, hashes and verifications
+    /// alike).
+    Only(usize),
+}
+
 /// Argon2id at the cheapest cost the verifier accepts, counting what it is asked.
 struct Engine {
     inner: Argon2Engine,
     verifies: AtomicUsize,
     hashes: AtomicUsize,
-    /// How many run at once, at most (for the memory bound).
+    /// How many calls have been made.
+    arrived: AtomicUsize,
+    /// How many run at once, at most (for the memory bound). A call that is held is running.
     running: AtomicUsize,
     most: AtomicUsize,
-    /// Held for this long inside each call, to make them overlap.
-    hold: Duration,
+    stop: std::sync::Mutex<Stop>,
+    go: std::sync::Condvar,
 }
 
 impl Engine {
-    fn new(hold: Duration) -> Arc<Engine> {
+    fn new() -> Arc<Engine> {
         Arc::new(Engine {
             inner: Argon2Engine::with(Cost::CHEAPEST, Arc::new(token::os_random)),
             verifies: AtomicUsize::new(0),
             hashes: AtomicUsize::new(0),
+            arrived: AtomicUsize::new(0),
             running: AtomicUsize::new(0),
             most: AtomicUsize::new(0),
-            hold,
+            stop: std::sync::Mutex::new(Stop::Nothing),
+            go: std::sync::Condvar::new(),
         })
     }
 
+    /// From now on every call waits until `release`.
+    fn hold_all(&self) {
+        *self.stop.lock().unwrap_or_else(|e| e.into_inner()) = Stop::All;
+    }
+
+    /// The call with this number waits until `release`; the others do not.
+    fn hold_call(&self, number: usize) {
+        *self.stop.lock().unwrap_or_else(|e| e.into_inner()) = Stop::Only(number);
+    }
+
+    fn release(&self) {
+        *self.stop.lock().unwrap_or_else(|e| e.into_inner()) = Stop::Nothing;
+        self.go.notify_all();
+    }
+
+    fn arrived(&self) -> usize {
+        self.arrived.load(Ordering::SeqCst)
+    }
+
+    fn running(&self) -> usize {
+        self.running.load(Ordering::SeqCst)
+    }
+
     fn enter(&self) {
+        let number = self.arrived.fetch_add(1, Ordering::SeqCst) + 1;
         let n = self.running.fetch_add(1, Ordering::SeqCst) + 1;
         self.most.fetch_max(n, Ordering::SeqCst);
-        if !self.hold.is_zero() {
-            std::thread::sleep(self.hold);
+        let until = std::time::Instant::now() + LONGEST_HELD;
+        let mut stop = self.stop.lock().unwrap_or_else(|e| e.into_inner());
+        while *stop == Stop::All || *stop == Stop::Only(number) {
+            let left = until.saturating_duration_since(std::time::Instant::now());
+            if left.is_zero() {
+                break;
+            }
+            stop = self
+                .go
+                .wait_timeout(stop, left)
+                .unwrap_or_else(|e| e.into_inner())
+                .0;
         }
     }
 
@@ -172,10 +287,26 @@ struct Env {
     proxied: bool,
 }
 
+/// Lets go of what a test held (the engine's calls, the disk's writes) when the test ends, however it ends: a thread
+/// that is waiting would keep the run from ending.
+struct LetGo(Arc<Engine>, Arc<Disk>);
+
+impl LetGo {
+    fn of(e: &Env) -> LetGo {
+        LetGo(e.engine.clone(), e.disk.clone())
+    }
+}
+
+impl Drop for LetGo {
+    fn drop(&mut self) {
+        self.0.release();
+        self.1.release();
+    }
+}
+
 struct Build {
     proxied: bool,
     login_allow: Option<&'static str>,
-    hold: Duration,
     /// Reuse a data folder (a restart).
     dir: Option<TempDir>,
     /// A time to start the clock at (a restart later).
@@ -188,7 +319,6 @@ impl Default for Build {
         Build {
             proxied: true,
             login_allow: None,
-            hold: Duration::ZERO,
             dir: None,
             at: T0,
             static_token: None,
@@ -203,7 +333,9 @@ fn build(b: Build) -> Env {
     let disk = Arc::new(Disk {
         full: AtomicBool::new(false),
         writes: AtomicUsize::new(0),
-        slow: std::sync::Mutex::new(None),
+        hold: std::sync::Mutex::new(None),
+        held: AtomicUsize::new(0),
+        go: std::sync::Condvar::new(),
     });
     let mut vars: std::collections::BTreeMap<String, String> = Default::default();
     if b.proxied {
@@ -241,7 +373,7 @@ fn build(b: Build) -> Env {
     // What the runtime does when it builds a guard that keeps its data in a folder.
     let (throttle_file, saved) = ThrottleFile::open(&auth.join("throttle.json"));
     guard.keep_throttle_in(throttle_file, saved.as_ref());
-    let engine = Engine::new(b.hold);
+    let engine = Engine::new();
     let mut opts =
         LoginOptions::production(&move |n| env_vars.get(n).cloned(), 41000).expect("the options");
     opts.engine = engine.clone();
@@ -514,6 +646,7 @@ async fn make_owner(env: &Env, password: &str) -> Reply {
 }
 
 /// A signed-in browser: its session cookie value, the csrf value and the device cookie.
+#[derive(Clone)]
 struct Browser {
     session: String,
     csrf: String,
@@ -2738,13 +2871,14 @@ async fn setup_only_mode_lets_a_console_credential_through_before_there_is_an_ow
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_flood_of_logins_runs_at_most_three_verifications_at_once() {
-    let e = Arc::new(build(Build {
-        hold: Duration::from_millis(30),
-        ..Build::default()
-    }));
+    let e = Arc::new(env());
     let owner = make_owner(&e, PASSWORD).await;
     let b = browser_from(&e, &owner);
+    let _let_go = LetGo::of(&e);
+    // Every pass waits to be let go, so that what runs at once is what the server let start.
+    e.engine.hold_all();
     e.engine.most.store(0, Ordering::SeqCst);
+    let base = e.engine.arrived();
     let mut tasks = Vec::new();
     // 40 wrong logins from 40 addresses, 15 device-lane logins (some wrong), 10 elevations: all at once.
     for i in 0..40u32 {
@@ -2789,13 +2923,18 @@ async fn a_flood_of_logins_runs_at_most_three_verifications_at_once() {
             .status
         }));
     }
+    // Three start (the bound), and no more while those three are held.
+    eventually("three passes to start", || e.engine.arrived() >= base + 3).await;
+    let fourth = happens_within(Duration::from_millis(300), || e.engine.arrived() > base + 3).await;
+    assert!(!fourth, "a fourth pass started while three were running");
+    assert_eq!(e.engine.running(), 3);
+    e.engine.release();
     let mut statuses = Vec::new();
     for t in tasks {
         statuses.push(t.await.unwrap());
     }
     let most = e.engine.most.load(Ordering::SeqCst);
-    assert!(most <= 3, "{most} verifications ran at once");
-    assert!(most >= 2, "they did overlap ({most})");
+    assert_eq!(most, 3, "{most} verifications ran at once");
     assert!(
         statuses.contains(&429),
         "and some of the flood was turned away at once"
@@ -2812,32 +2951,54 @@ async fn a_flood_of_logins_runs_at_most_three_verifications_at_once() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_client_that_hangs_up_does_not_free_the_verification_bound_before_the_pass_ends() {
-    let e = Arc::new(build(Build {
-        hold: Duration::from_millis(400),
-        ..Build::default()
-    }));
+    let e = Arc::new(env());
     make_owner(&e, PASSWORD).await;
+    let _let_go = LetGo::of(&e);
+    // The passes wait to be let go: they are running, and the clients hang up while they are.
+    e.engine.hold_all();
     e.engine.most.store(0, Ordering::SeqCst);
+    let base = e.engine.arrived();
+    let wave = |from: u32| {
+        (0..12u32)
+            .map(|i| {
+                let e2 = e.clone();
+                tokio::spawn(async move {
+                    login_as(
+                        &e2,
+                        "wrong wrong wrong",
+                        &format!("198.51.100.{}", from + i),
+                    )
+                    .await
+                })
+            })
+            .collect::<Vec<_>>()
+    };
+    let first = wave(10);
+    // Two passes start (the anonymous lane runs two), the rest wait their turn or are turned away...
+    eventually("two passes to start", || e.engine.arrived() >= base + 2).await;
+    // ...and every client hangs up.
     let mut hung_up = 0;
-    for i in 0..24u32 {
-        // Each request comes from its own address and is dropped 25 ms after it starts: long after its pass began,
-        // long before it ends.
-        let r = tokio::time::timeout(
-            Duration::from_millis(25),
-            login_as(&e, "wrong wrong wrong", &format!("198.51.100.{}", 10 + i)),
-        )
-        .await;
-        if r.is_err() {
-            hung_up += 1;
-        }
+    for t in first {
+        t.abort();
+        hung_up += usize::from(t.await.is_err());
     }
-    // Let the passes that are still running end.
-    tokio::time::sleep(Duration::from_millis(1300)).await;
-    let most = e.engine.most.load(Ordering::SeqCst);
+    assert!(hung_up >= 2, "the requests were really dropped ({hung_up})");
+    // New clients arrive while the two passes of the ones that left are still running. Their places are held by
+    // those passes: nothing more may start. (A server that gave the places back when the client left starts
+    // them at once.)
+    let second = wave(40);
+    let more = happens_within(Duration::from_millis(400), || e.engine.arrived() > base + 2).await;
     assert!(
-        hung_up >= 20,
-        "the requests were really dropped ({hung_up})"
+        !more,
+        "a pass started while the two passes of the clients that hung up were running on ({} at once)",
+        e.engine.running()
     );
+    e.engine.release();
+    for t in second {
+        let _ = t.await;
+    }
+    eventually("the passes to end", || e.engine.running() == 0).await;
+    let most = e.engine.most.load(Ordering::SeqCst);
     assert!(
         most <= 3,
         "{most} passes ran at once: dropping the request freed its place while its pass ran on"
@@ -2847,22 +3008,27 @@ async fn a_client_that_hangs_up_does_not_free_the_verification_bound_before_the_
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_client_that_hangs_up_is_counted_and_keeps_its_place_until_its_pass_ends() {
-    let e = Arc::new(build(Build {
-        hold: Duration::from_millis(400),
-        ..Build::default()
-    }));
+    let e = Arc::new(env());
     make_owner(&e, PASSWORD).await;
-    // Two attempts from one address, each dropped 25 ms in (its pass is running).
-    for _ in 0..2 {
-        let r = tokio::time::timeout(
-            Duration::from_millis(25),
-            login_as(&e, "wrong wrong wrong", "203.0.113.50"),
-        )
-        .await;
-        assert!(r.is_err(), "the request was dropped");
+    let _let_go = LetGo::of(&e);
+    e.engine.hold_all();
+    let base = e.engine.arrived();
+    // Two attempts from one address, each dropped when its pass is running.
+    for n in 1..=2 {
+        let e2 = e.clone();
+        let attempt =
+            tokio::spawn(async move { login_as(&e2, "wrong wrong wrong", "203.0.113.50").await });
+        eventually("the pass to start", || e.engine.arrived() >= base + n).await;
+        attempt.abort();
+        assert!(attempt.await.is_err(), "the request was dropped");
     }
     // Their passes run on, in the places of the address (two): a third attempt is turned away at once.
-    let third = login_as(&e, PASSWORD, "203.0.113.50").await;
+    let e3 = e.clone();
+    let third = tokio::time::timeout(Duration::from_secs(5), async move {
+        login_as(&e3, PASSWORD, "203.0.113.50").await
+    })
+    .await
+    .expect("a third attempt waited for a place, or started a pass: the places of the ones that left were given back");
     assert_eq!(
         (third.status, third.code().as_deref()),
         (429, Some("rate_limited")),
@@ -2870,10 +3036,22 @@ async fn a_client_that_hangs_up_is_counted_and_keeps_its_place_until_its_pass_en
         third.text
     );
     // When they end, both were counted, though nobody was left to be told.
-    tokio::time::sleep(Duration::from_millis(1000)).await;
+    e.engine.release();
+    eventually("both attempts to be counted", || {
+        e.state.throttle.recent_failures() == 2
+    })
+    .await;
+    // And the places are free again (a place is given back a moment after the count is made).
+    let mut answer = 429;
+    for _ in 0..500 {
+        answer = login_as(&e, PASSWORD, "203.0.113.50").await.status;
+        if answer != 429 {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(5)).await;
+    }
+    assert_eq!(answer, 200);
     assert_eq!(e.state.throttle.recent_failures(), 2);
-    // And the places are free again.
-    assert_eq!(login_as(&e, PASSWORD, "203.0.113.50").await.status, 200);
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -2888,23 +3066,34 @@ async fn wrong_passwords_of_a_client_that_hangs_up_still_revoke_a_session_in_the
             json!({ "current": "wrong wrong wrong", "next": NEW_PASSWORD }),
         ),
     ] {
-        let e = Arc::new(build(Build {
-            hold: Duration::from_millis(100),
-            ..Build::default()
-        }));
+        let e = Arc::new(env());
         let owner = make_owner(&e, PASSWORD).await;
         let b = browser_from(&e, &owner);
+        let _let_go = LetGo::of(&e);
         for _ in 0..5 {
-            let r = tokio::time::timeout(
-                Duration::from_millis(25),
-                go(&e, as_page(&e, &b, Method::POST, path).json(body.clone())),
-            )
-            .await;
-            assert!(r.is_err(), "{path}: the request was dropped");
-            // Its pass ends (100 ms) before the next request is sent.
-            tokio::time::sleep(Duration::from_millis(200)).await;
+            // The pass of each wrong answer waits to be let go; the client hangs up while it is running, and the
+            // pass ends after.
+            let number = e.engine.arrived() + 1;
+            e.engine.hold_call(number);
+            let (e2, b2, body2) = (e.clone(), b.clone(), body.clone());
+            let attempt = tokio::spawn(async move {
+                go(&e2, as_page(&e2, &b2, Method::POST, path).json(body2)).await
+            });
+            eventually("the pass to start", || e.engine.arrived() >= number).await;
+            attempt.abort();
+            assert!(attempt.await.is_err(), "{path}: the request was dropped");
+            e.engine.release();
+            eventually("the pass to end", || e.engine.running() == 0).await;
         }
-        let r = go(&e, as_page(&e, &b, Method::GET, "/api/config")).await;
+        // The session is revoked by the count made when the last pass ended, a moment after the pass.
+        let mut r = go(&e, as_page(&e, &b, Method::GET, "/api/config")).await;
+        for _ in 0..500 {
+            if r.status == 401 {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+            r = go(&e, as_page(&e, &b, Method::GET, "/api/config")).await;
+        }
         assert_eq!(
             (r.status, r.code().as_deref()),
             (401, Some("session_expired")),
@@ -3959,10 +4148,10 @@ async fn a_slow_write_of_the_old_owner_file_does_not_undo_a_password_change() {
         let owner = make_owner(&e, PASSWORD).await;
         let b = browser_from(&e, &owner);
         let old_hash = hash_on_disk(&e);
-        // A write of the owner file with the old hash in it is slow (a busy disk).
-        *e.disk.slow.lock().unwrap() =
-            Some((old_hash.clone().into_bytes(), Duration::from_millis(500)));
-        // Revoking a device writes the owner file from the owner as it is in memory, and here it is slow.
+        let _let_go = LetGo::of(&e);
+        // A write of the owner file with the old hash in it is held on the disk (a busy disk).
+        e.disk.hold_writes_of(old_hash.as_bytes());
+        // Revoking a device writes the owner file from the owner as it is in memory, and here it is held.
         let device = token::parse(b.device.as_ref().unwrap())
             .unwrap()
             .id
@@ -3986,27 +4175,42 @@ async fn a_slow_write_of_the_old_owner_file_does_not_undo_a_password_change() {
             .await
             .status
         });
-        tokio::time::sleep(Duration::from_millis(150)).await;
+        eventually("the write of the old owner file to be on the disk", || {
+            e.disk.held() >= 1
+        })
+        .await;
+        let writes = e.disk.writes.load(Ordering::SeqCst);
         // The password change, while that write is still in flight.
-        let status = if by_console {
-            let con = console_token(&e);
-            go(
-                &e,
-                req(&e, Method::POST, "/api/auth/console/reset-password")
-                    .bearer(&con)
-                    .json(json!({ "password": NEW_PASSWORD })),
-            )
-            .await
-            .status
-        } else {
-            go(
-                &e,
-                as_page(&e, &b, Method::POST, "/api/auth/password")
-                    .json(json!({ "current": PASSWORD, "next": NEW_PASSWORD })),
-            )
-            .await
-            .status
-        };
+        let (e3, b3, con) = (e.clone(), b.clone(), console_token(&e));
+        let change = tokio::spawn(async move {
+            if by_console {
+                go(
+                    &e3,
+                    req(&e3, Method::POST, "/api/auth/console/reset-password")
+                        .bearer(&con)
+                        .json(json!({ "password": NEW_PASSWORD })),
+                )
+                .await
+                .status
+            } else {
+                go(
+                    &e3,
+                    as_page(&e3, &b3, Method::POST, "/api/auth/password")
+                        .json(json!({ "current": PASSWORD, "next": NEW_PASSWORD })),
+                )
+                .await
+                .status
+            }
+        });
+        // A server that writes the owner file from more than one place at once writes the new password now, under
+        // the held write; one that does not waits for it. A short wait finds the first: the other only ever
+        // passes it by.
+        happens_within(Duration::from_millis(400), || {
+            e.disk.writes.load(Ordering::SeqCst) > writes
+        })
+        .await;
+        e.disk.release();
+        let status = change.await.unwrap();
         assert!(matches!(status, 200 | 204), "{by_console}: {status}");
         assert_eq!(slow.await.unwrap(), 204, "the device was revoked");
         assert_ne!(
@@ -4032,17 +4236,15 @@ async fn a_slow_write_of_the_old_owner_file_does_not_undo_a_password_change() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn two_password_changes_at_once_from_the_same_password_make_one_change_and_refuse_the_other()
 {
-    let e = Arc::new(build(Build {
-        hold: Duration::from_millis(150),
-        ..Build::default()
-    }));
+    let e = Arc::new(env());
     let owner = make_owner(&e, PASSWORD).await;
     let first = browser_from(&e, &owner);
     let second = browser_from(&e, &login_as(&e, PASSWORD, "198.51.100.30").await);
-    // Writing the owner file is slow, so that the second change has time to read the owner while the first is
-    // still writing its own: only the gate stands between them.
-    *e.disk.slow.lock().unwrap() =
-        Some((b"password_changed_ms".to_vec(), Duration::from_millis(300)));
+    let _let_go = LetGo::of(&e);
+    let base = e.engine.arrived();
+    // Writing the owner file of a password change is held on the disk, so that the second change has read the owner
+    // and hashed its password while the first is still writing its own: only the gate stands between them.
+    e.disk.hold_writes_of(b"password_changed_ms");
     let change = |e: Arc<Env>, b: Browser, next: &'static str| {
         tokio::spawn(async move {
             go(
@@ -4058,6 +4260,14 @@ async fn two_password_changes_at_once_from_the_same_password_make_one_change_and
         change(e.clone(), first, NEW_PASSWORD),
         change(e.clone(), second, "Qm7&rT2!vX9# kd4Lp"),
     );
+    // Both have verified the password and hashed the new one (four calls), and one is writing.
+    eventually("both changes to have hashed and one to be writing", || {
+        e.engine.arrived() >= base + 4 && e.disk.held() >= 1
+    })
+    .await;
+    // Give the other time to get to the gate, or past it.
+    tokio::time::sleep(Duration::from_millis(150)).await;
+    e.disk.release();
     let mut statuses = [a.await.unwrap(), b.await.unwrap()];
     statuses.sort_unstable();
     assert_eq!(
@@ -4088,34 +4298,29 @@ async fn late_login(e: &Env, password: &str, from: &str) -> Reply {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_login_that_verified_the_old_password_does_not_outlive_the_password_change() {
-    let e = Arc::new(build(Build {
-        hold: Duration::from_millis(300),
-        ..Build::default()
-    }));
+    let e = Arc::new(env());
     let owner = make_owner(&e, PASSWORD).await;
     let b = browser_from(&e, &owner);
-    let (e1, session, csrf) = (e.clone(), b.session.clone(), b.csrf.clone());
-    let change = tokio::spawn(async move {
-        let browser = Browser {
-            session,
-            csrf,
-            device: None,
-        };
-        go(
-            &e1,
-            as_page(&e1, &browser, Method::POST, "/api/auth/password")
-                .json(json!({ "current": PASSWORD, "next": NEW_PASSWORD })),
-        )
-        .await
-        .status
-    });
-    // The change verifies the current password and then hashes the new one (300 ms each) and is written at about
-    // 600 ms; a login with the old password starts at 450 ms, reads the old hash and verifies it (300 ms), so it
-    // finishes at 750 ms, after the change is written.
-    tokio::time::sleep(Duration::from_millis(450)).await;
+    let _let_go = LetGo::of(&e);
+    // A login with the old password reads the owner, and its verification (the first call of the engine from here)
+    // is held while it runs...
+    let verification = e.engine.arrived() + 1;
+    e.engine.hold_call(verification);
     let e2 = e.clone();
     let late = tokio::spawn(async move { late_login(&e2, PASSWORD, "198.51.100.44").await });
-    assert_eq!(change.await.unwrap(), 204);
+    eventually("the login to be verifying the old password", || {
+        e.engine.arrived() >= verification
+    })
+    .await;
+    // ...while the password is changed: the change is made and written in full, and then the verification ends.
+    let changed = go(
+        &e,
+        as_page(&e, &b, Method::POST, "/api/auth/password")
+            .json(json!({ "current": PASSWORD, "next": NEW_PASSWORD })),
+    )
+    .await;
+    assert_eq!(changed.status, 204);
+    e.engine.release();
     let late = late.await.unwrap();
     assert_eq!(
         (late.status, late.code().as_deref()),
@@ -4143,28 +4348,30 @@ async fn a_login_that_verified_the_old_password_does_not_outlive_the_password_ch
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_login_that_verified_the_old_password_does_not_outlive_a_console_reset() {
-    let e = Arc::new(build(Build {
-        hold: Duration::from_millis(300),
-        ..Build::default()
-    }));
+    let e = Arc::new(env());
     make_owner(&e, PASSWORD).await;
     let con = console_token(&e);
-    let (e1, con1) = (e.clone(), con.clone());
-    let reset = tokio::spawn(async move {
-        go(
-            &e1,
-            req(&e1, Method::POST, "/api/auth/console/reset-password")
-                .bearer(&con1)
-                .json(json!({ "password": NEW_PASSWORD })),
-        )
-        .await
-        .status
-    });
-    // The reset hashes the new password (300 ms) and is written at about 310 ms; the login starts at 200 ms, reads
-    // the old hash, and finishes verifying it (300 ms) at 500 ms, after the reset is written.
-    tokio::time::sleep(Duration::from_millis(200)).await;
-    let late = late_login(&e, PASSWORD, "198.51.100.47").await;
-    assert_eq!(reset.await.unwrap(), 200);
+    let _let_go = LetGo::of(&e);
+    // A login with the old password reads the owner, and its verification is held while it runs...
+    let verification = e.engine.arrived() + 1;
+    e.engine.hold_call(verification);
+    let e2 = e.clone();
+    let late = tokio::spawn(async move { late_login(&e2, PASSWORD, "198.51.100.47").await });
+    eventually("the login to be verifying the old password", || {
+        e.engine.arrived() >= verification
+    })
+    .await;
+    // ...while the console resets the password, in full; and then the verification ends.
+    let reset = go(
+        &e,
+        req(&e, Method::POST, "/api/auth/console/reset-password")
+            .bearer(&con)
+            .json(json!({ "password": NEW_PASSWORD })),
+    )
+    .await;
+    assert_eq!(reset.status, 200);
+    e.engine.release();
+    let late = late.await.unwrap();
     assert_eq!(
         (late.status, late.code().as_deref()),
         (401, Some("invalid_credentials")),
@@ -4181,32 +4388,31 @@ async fn a_login_that_verified_the_old_password_does_not_outlive_a_console_reset
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_re_hash_does_not_write_the_old_password_over_one_that_was_changed_while_it_hashed() {
     // The stored hash of the tests is cheaper than the current cost, so every good login hashes the password again.
-    let e = Arc::new(build(Build {
-        hold: Duration::from_millis(300),
-        ..Build::default()
-    }));
+    let e = Arc::new(env());
     let owner = make_owner(&e, PASSWORD).await;
     let b = browser_from(&e, &owner);
-    let (e1, session, csrf) = (e.clone(), b.session.clone(), b.csrf.clone());
-    let change = tokio::spawn(async move {
-        let browser = Browser {
-            session,
-            csrf,
-            device: None,
-        };
-        go(
-            &e1,
-            as_page(&e1, &browser, Method::POST, "/api/auth/password")
-                .json(json!({ "current": PASSWORD, "next": NEW_PASSWORD })),
-        )
-        .await
-        .status
-    });
-    // A login with the old password starts 150 ms into the change: it verifies (300 ms) before the change is written
-    // (at about 610 ms), so it is a good login; its re-hash (300 ms more) ends at 750 ms, after the change is written.
-    tokio::time::sleep(Duration::from_millis(150)).await;
-    let late = late_login(&e, PASSWORD, "198.51.100.50").await;
-    assert_eq!(change.await.unwrap(), 204);
+    let _let_go = LetGo::of(&e);
+    // A login with the old password verifies it (the first call of the engine from here) and is good: it makes its
+    // session. Then it hashes the password again (the second call), and that is held...
+    let rehash = e.engine.arrived() + 2;
+    e.engine.hold_call(rehash);
+    let e2 = e.clone();
+    let late = tokio::spawn(async move { late_login(&e2, PASSWORD, "198.51.100.50").await });
+    eventually("the login to be hashing the old password again", || {
+        e.engine.arrived() >= rehash
+    })
+    .await;
+    // ...while the password is changed, in full (the change revokes the session the login made); and then the
+    // re-hash ends.
+    let changed = go(
+        &e,
+        as_page(&e, &b, Method::POST, "/api/auth/password")
+            .json(json!({ "current": PASSWORD, "next": NEW_PASSWORD })),
+    )
+    .await;
+    assert_eq!(changed.status, 204);
+    e.engine.release();
+    let late = late.await.unwrap();
     assert_eq!(
         late.status, 200,
         "the login was good when it verified: {}",
