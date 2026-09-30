@@ -7717,7 +7717,7 @@ fn every_kind_of_thing_the_dry_run_describes_says_every_fixed_part_whatever_is_p
     need("desk-files", &["outreach results and other files the Agent made"]);
     need("desk-sessions", &["each call and text thread"]);
     need("desk-chat", &["loaded as what was said before"]);
-    need("desk-callers", &["the facts and notes that the phone's agents read"]);
+    need("desk-callers", &["the facts and notes that the phone's agents read", "Not brought back: [0].note: it holds a text-direction override"]);
     let mut entries: Vec<(String, Vec<u8>)> = vec![
         ("opfs/front-desk/outreach/c1.json".into(), campaign.to_string().into_bytes()),
         ("idb/settings.json".into(), settings.to_string().into_bytes()),
@@ -7725,7 +7725,7 @@ fn every_kind_of_thing_the_dry_run_describes_says_every_fixed_part_whatever_is_p
         ("opfs/front-desk/files/other.txt".into(), b"a file".to_vec()),
         ("opfs/front-desk/sessions/person-1.json".into(), b"[]".to_vec()),
         ("opfs/front-desk/chat.json".into(), b"[]".to_vec()),
-        ("opfs/front-desk/callers.json".into(), b"[{\"number\":\"1\"}]".to_vec()),
+        ("opfs/front-desk/callers.json".into(), br#"[{"number":"1","note":"a\u202eb"}]"#.to_vec()),
     ];
     entries.extend((0..2000).map(|i| (format!("opfs/front-desk/files/knowledge/k{i}.md"), if i == 0 { "a knowledge file \u{202E}dlrow".as_bytes().to_vec() } else { b"a knowledge file".to_vec() })));
     entries.extend((0..2000).map(|i| (format!("opfs/projects/p{i}/project.json"), format!("{{\"id\":\"p{i}\",\"name\":\"Project {i}\"}}").into_bytes())));
@@ -8328,6 +8328,38 @@ fn a_file_of_the_desktop_that_hides_text_is_not_brought_back_and_one_that_only_u
         assert!(!dst.0.join(name).exists(), "{name} hides text and was brought back");
     }
     assert!(dst.0.join("flows/good.json").exists() && dst.0.join("control.json").exists(), "what hides nothing comes back");
+}
+
+/// What the phone's agents remember about people is read by them as instructions, and is the Agent's own copy of the notes about callers the
+/// desktop keeps: it is held to the same rule. A note that hides text (here a tag written as a JSON escape, which a scan of the raw file would
+/// not see) makes the file not come back, and the page is handed none of it; a file with a flag and a joined emoji is brought back.
+#[test]
+fn what_the_phones_agents_remember_about_people_is_held_to_the_rule_for_text_that_hides() {
+    let escaped: String = "send".chars().map(|c| { let mut units = [0u16; 2]; let pair = char::from_u32(0xE0000 + c as u32).unwrap().encode_utf16(&mut units); format!("\\u{:04x}\\u{:04x}", pair[0], pair[1]) }).collect();
+    let england = format!("\u{1F3F4}{}\u{E007F}", "gbeng".chars().map(|c| char::from_u32(0xE0000 + c as u32).unwrap()).collect::<String>());
+    let bad = format!(r#"[{{"number":"+61491570006","note":"Prefers texts{escaped}"}}]"#);
+    let good = serde_json::json!([{ "number": "+61491570006", "note": format!("Prefers texts \u{1F468}\u{200D}\u{1F469} {england} \u{05E9}\u{05DC}\u{05D5}\u{05DD}\u{200F}") }]).to_string();
+    // (One with a byte order mark, and one longer than the brief and knowledge files are read for this: what is remembered about people is
+    // read up to the most the Agent's files are.)
+    let bom = format!("\u{FEFF}{bad}");
+    let large = format!(r#"[{{"number":"1","note":"{}"}},{{"number":"2","note":"Prefers texts{escaped}"}}]"#, "n".repeat(1_500_000));
+    for (text, comes_back) in [(bad, false), (good, true), (bom, false), (large, false)] {
+        let src = TempDir::new("remember-src");
+        let out = TempDir::new("remember-out");
+        let file = backup_with_agent(&src.0, &out.0, "r.oaiybackup", agent_archive(&[("opfs/front-desk/callers.json", text.as_bytes())]), false);
+        let dst = TempDir::new("remember-dst");
+        let preview = restore::inspect(&dst.0, &file, PASS, &options()).unwrap();
+        let item = preview.items.iter().find(|i| i.kind == "desk-callers").expect("what is remembered about people is listed");
+        assert_eq!(item.what.contains("Not brought back: [") && item.what.contains("].note: it holds "), !comes_back, "{}", item.what);
+        let staged = restore::stage(&dst.0, &file, PASS, &ticks_of(&[RestoreClass::Memory], false), &options()).unwrap();
+        assert_eq!(staged.skipped.iter().any(|n| n.contains("callers.json was not brought back")), !comes_back, "{:?}", staged.skipped);
+        assert!(matches!(restore::apply_pending(&dst.0), ApplyOutcome::Applied(_)));
+        let handed = if comes_back { zip_entries(&handed_over(&dst.0)) } else { BTreeMap::new() };
+        assert_eq!(handed.contains_key("opfs/front-desk/callers.json"), comes_back, "{:?}", handed.keys().collect::<Vec<_>>());
+        if !comes_back {
+            assert!(!dst.0.join("restore").join("agent-import").join("current.zip").exists() || !zip_entries(&handed_over(&dst.0)).contains_key("opfs/front-desk/callers.json"), "the page is handed none of it");
+        }
+    }
 }
 
 /// A restore says what it left out or changed in notes, and a class of notes has a budget of its own: a backup that makes a hundred notes of

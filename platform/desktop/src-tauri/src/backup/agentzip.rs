@@ -415,9 +415,16 @@ const NOTE_WORDS: &str = "files with hidden text";
 /// when it does (see [`super::parts::text_problem`]). A file that is larger is not read for this.
 const MOST_WORDS_SCANNED: u64 = 1 << 20;
 
-/// Why a file of words that a model reads is not brought back, or `None`: the text in it is one that hides more than it shows.
-fn hidden_text_of(archive: &mut Archive, entry: &Entry) -> Result<Option<String>> {
-    Ok(read_small(archive, entry, MOST_WORDS_SCANNED)?.and_then(|bytes| super::parts::text_problem(&String::from_utf8_lossy(&bytes))))
+/// Why a file of words that a model reads is not brought back, or `None`: the text in it is one that hides more than it shows. What is
+/// remembered about people is JSON, and is read as it is (so a hidden character written as an escape is seen); the brief and the knowledge
+/// files are text.
+fn hidden_text_of(archive: &mut Archive, entry: &Entry, row: &str, limits: &Limits) -> Result<Option<String>> {
+    let cap = if row == "agent-desk-callers" { limits.max_agent_read_bytes } else { MOST_WORDS_SCANNED };
+    let Some(bytes) = read_small(archive, entry, cap)? else { return Ok(None) };
+    if row == "agent-desk-callers" {
+        return Ok(serde_json::from_slice::<Value>(strip_bom(&bytes)).ok().and_then(|v| super::review::first_hidden_text(&v, "")));
+    }
+    Ok(super::parts::text_problem(&String::from_utf8_lossy(&bytes)))
 }
 
 /// What a rebuilt person holds that is not something a model reads or that is not said of them another way (their number is what
@@ -728,7 +735,7 @@ pub fn describe(path: &Path, listing: &Listing, limits: &Limits, budget: &Budget
                 let mut parts = Parts::new("brief")
                     .fixed("reads", format!("{}. Every call, text and task reads it before each reply, and it wins over what the phone's agents would otherwise say.", kb(entry.size)))
                     .fixed("says", says);
-                if let Some(why) = hidden_text_of(&mut archive, entry)? {
+                if let Some(why) = hidden_text_of(&mut archive, entry, "agent-desk-brief", limits)? {
                     parts = parts.fixed("left-out", format!("Not brought back: {why}."));
                 }
                 items.push(parts.item(class, &shown, "The front desk's brief"));
@@ -754,7 +761,11 @@ pub fn describe(path: &Path, listing: &Listing, limits: &Limits, budget: &Budget
                     Some(n) => format!("{}: the facts and notes that the phone's agents read about a person before they answer them.", plural(n, "entry", "entries")),
                     None => format!("{} that OAIY could not read as a list, or that is too large to look at.", kb(entry.size)),
                 };
-                items.push(Parts::new("desk-callers").fixed("entries", what).item(class, &shown, "What the phone's agents remember about people"));
+                let mut parts = Parts::new("desk-callers").fixed("entries", what);
+                if let Some(why) = hidden_text_of(&mut archive, entry, "agent-desk-callers", limits)? {
+                    parts = parts.fixed("left-out", format!("Not brought back: {why}."));
+                }
+                items.push(parts.item(class, &shown, "What the phone's agents remember about people"));
             }
             "agent-outreach-campaign" => {
                 let bytes = read_small(&mut archive, entry, limits.max_agent_read_bytes)?;
@@ -828,7 +839,7 @@ pub fn describe(path: &Path, listing: &Listing, limits: &Limits, budget: &Budget
     // The knowledge files, each by name.
     for entry in knowledge.iter().take(MAX_NAMED) {
         let mut parts = Parts::new("knowledge").fixed("size", format!("{}. The phone's agents read it to answer callers.", kb(entry.size)));
-        if let Some(why) = hidden_text_of(&mut archive, entry)? {
+        if let Some(why) = hidden_text_of(&mut archive, entry, "agent-desk-knowledge", limits)? {
             parts = parts.fixed("left-out", format!("Not brought back: {why}."));
         }
         items.push(parts.item(RestoreClass::AgentData, &display(&entry.name), entry.name.rsplit('/').next().unwrap_or(&entry.name)));
@@ -1001,8 +1012,8 @@ pub fn filter(nested: &Path, out: &Path, scratch: &Path, ticks: &Ticks, mode: Mo
             }
         }
         // Words a model reads that hide more than they show are not brought back (an undo puts back the person's own, whatever it holds).
-        if mode == Mode::Restore && matches!(row.id.as_str(), "agent-desk-brief" | "agent-desk-knowledge") {
-            if let Some(why) = hidden_text_of(&mut archive, entry)? {
+        if mode == Mode::Restore && matches!(row.id.as_str(), "agent-desk-brief" | "agent-desk-knowledge" | "agent-desk-callers") {
+            if let Some(why) = hidden_text_of(&mut archive, entry, &row.id, limits)? {
                 book.push(NOTE_WORDS, format!("{} was not brought back: {why}.", clip(&display(&entry.name), 120)));
                 continue;
             }

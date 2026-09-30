@@ -126,7 +126,7 @@ pub const KINDS: &[Kind] = &[
     Kind { id: "desk-files", place: "the other files of the front desk", fixed: &[part("files", 240)], keys: NO_KEYS, sample: &[], full: None },
     Kind { id: "desk-sessions", place: "the phone's conversations", fixed: &[part("files", 240)], keys: NO_KEYS, sample: &[], full: None },
     Kind { id: "desk-chat", place: "the front desk's own conversation", fixed: &[part("size", 160)], keys: NO_KEYS, sample: &[], full: None },
-    Kind { id: "desk-callers", place: "what the phone's agents remember about people", fixed: &[part("entries", 320)], keys: NO_KEYS, sample: &[], full: None },
+    Kind { id: "desk-callers", place: "what the phone's agents remember about people", fixed: &[part("entries", 320), part("left-out", 520)], keys: NO_KEYS, sample: &[], full: None },
     Kind {
         id: "campaign",
         place: "an outreach campaign",

@@ -245,7 +245,7 @@ pub fn is_unreadable(item: &ReviewItem) -> bool {
 }
 
 /// The first value of a JSON document that hides text (see [`super::parts::text_problem`]), by where it is, and why: a key or a text.
-fn first_hidden_text(value: &Value, at: &str) -> Option<String> {
+pub(crate) fn first_hidden_text(value: &Value, at: &str) -> Option<String> {
     let here = |key: &str| if at.is_empty() { key.to_string() } else { format!("{at}.{key}") };
     match value {
         Value::String(text) => text_problem(text).map(|why| format!("{}: {why}", short(at, 80))),

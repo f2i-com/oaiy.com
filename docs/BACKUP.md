@@ -685,9 +685,10 @@ a thing does:
   right-to-left mark and Persian text pass (tests of both kinds). The dry run reads for this the brief
   and the knowledge files (up to 1 MiB each), every value of the table, and every key and text of a
   flow, a template, the trigger list, a connector, the notes about callers and the setup, agent and
-  control records (read as JSON, so a hidden character written as an escape is seen too; such a file
-  is left out whole and the dry run describes nothing else of it); the conversations, projects and
-  sessions it lists by name and size are not read, and are not restored without their own tick.
+  control records, and what the phone's agents remember about people in the Agent's storage (all read as
+  JSON, so a hidden character written as an escape is seen too; such a file is left out whole, and the
+  dry run describes nothing else of it); the conversations, projects and sessions it lists by name and
+  size are not read, and are not restored without their own tick.
 - **What a restore says of what it left out or changed is kept by class**: at most eight notes of
   one class (a campaign for each, a file for each), then one that says how many more there were,
   so no class of note crowds out another.
@@ -720,7 +721,7 @@ a thing does:
 | the other files of the front desk (`desk-files`) | `files` (240) | - | all (each is small) |
 | the phone's conversations (`desk-sessions`) | `files` (240) | - | all (each is small) |
 | the front desk's own conversation (`desk-chat`) | `size` (160) | - | all (each is small) |
-| what the phone's agents remember about people (`desk-callers`) | `entries` (320) | - | all (each is small) |
+| what the phone's agents remember about people (`desk-callers`) | `entries` (320), `left-out` (520) | - | all (each is small) |
 | an outreach campaign (`campaign`) | `comes-back` (480), `left-out` (520), then each of the 17 keys of the table `agent.campaign` that acts (640 each) | `questions` (240), `question` (900), `people` (240), `person` (2000), `set-aside` (240), `skipped` (500) | 50, the rest named and counted |
 | a provider of the Agent (`agent-provider`) | `type` (80), `model` (260), `key` (200), `beside` (200) | `address` (190) | all (each is small) |
 
