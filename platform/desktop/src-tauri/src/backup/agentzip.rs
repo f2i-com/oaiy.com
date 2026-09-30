@@ -104,6 +104,20 @@ fn open(path: &Path, limits: &Limits) -> Result<Archive> {
     container::open_archive(path)
 }
 
+/// The names of the files an Agent archive holds, in the order of its directory (its directory only is read), or none when it cannot
+/// be read.
+pub(crate) fn file_names(path: &Path) -> Option<Vec<String>> {
+    let mut archive = open(path, &Limits::default()).ok()?;
+    let mut names = Vec::new();
+    for index in 0..archive.len() {
+        let file = archive.by_index_raw(index).ok()?;
+        if !(file.is_dir() || file.name().ends_with('/')) {
+            names.push(file.name().to_string());
+        }
+    }
+    Some(names)
+}
+
 /// Read the archive's directory (never its contents): each file's name and its declared size, and the table's
 /// answer for it. A backup whose archive lists a name twice, or more than the limits allow, is refused.
 pub fn read_listing(path: &Path, limits: &Limits) -> Result<Listing> {

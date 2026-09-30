@@ -341,7 +341,8 @@ fn plausible_name(name: &str) -> bool {
 pub struct ImportReport {
     pub ok: bool,
     pub error: Option<String>,
-    /// The files the import wrote that were not there before: what an undo takes away.
+    /// The files the import wrote that were not there before, as the page saw them. The desktop does not use it: a try that is made
+    /// again finds the files there and lists none, so what an undo takes away is worked out from the archive and the copy instead.
     pub added: Vec<String>,
     /// What the page left out or could not do, in its own words.
     pub warnings: Vec<String>,
@@ -655,12 +656,36 @@ pub fn undo_done(data_dir: &Path, id: &str, token: &str, done: &DonePayload) -> 
     secret_file::rename_over(&partial, &undo_agent_path(data_dir, id)).map_err(|_| PartError::Io)
 }
 
-/// `POST .../done`: the page has imported (or could not), and says which files it added.
+/// The Agent's files the import of restore `id` added, which an undo takes away: the files the archive that was handed over holds
+/// that the copy the page took of its own storage before it began does not (that copy is the first one kept, so it is the storage as
+/// it was before the restore however many tries the import took). The desktop works this out; the page's own list is not used: a
+/// try that is made again after the first one was cut short finds the files already there, and says it added none.
+/// Returns the names, in the order of the archive, and how many were left out for want of room (see [`MAX_ADDED`]); `None` when
+/// there is no copy to compare with (then nothing can be said to have been added).
+fn added_by_the_import(data_dir: &Path, id: &str) -> Option<(Vec<String>, usize)> {
+    let handed = super::agentzip::file_names(&import_dir(data_dir).join("current.zip"))?;
+    let before: std::collections::HashSet<String> = super::agentzip::file_names(&undo_agent_path(data_dir, id))?.into_iter().collect();
+    let added: Vec<String> = handed.into_iter().filter(|n| n.starts_with("opfs/") && plausible_name(n) && !before.contains(n)).collect();
+    let over = added.len().saturating_sub(MAX_ADDED);
+    Some((added.into_iter().take(MAX_ADDED).collect(), over))
+}
+
+/// `POST .../done`: the page has imported (or could not). Which files it added is worked out here, not taken from the page.
 pub fn import_done(data_dir: &Path, id: &str, token: &str, report: &ImportReport) -> Result<(), PartError> {
     check_import(data_dir, id, token)?;
-    keep_added(data_dir, id, &report.added);
+    let mut warnings = report.warnings.clone();
+    match added_by_the_import(data_dir, id) {
+        Some((added, over)) => {
+            keep_added(data_dir, id, &added);
+            if over > 0 {
+                warnings.push(format!("{over} added file{} not listed, so an undo will not take {} away.", if over == 1 { " is" } else { "s are" }, if over == 1 { "it" } else { "them" }));
+            }
+        }
+        None if report.ok => warnings.push("No copy of the Agent's storage from before was kept, so an undo cannot take away what was added.".to_string()),
+        None => {}
+    }
     drop_pending_import(data_dir);
-    super::restore::record_agent_result(data_dir, id, report.ok, report.error.as_deref(), &report.warnings);
+    super::restore::record_agent_result(data_dir, id, report.ok, report.error.as_deref(), &warnings);
     Ok(())
 }
 

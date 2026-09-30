@@ -4044,30 +4044,39 @@ fn an_undo_takes_away_what_the_agents_import_added_and_keeps_a_copy_of_what_it_t
     let src = TempDir::new("agent-undo-src");
     realistic(&src.0, "A");
     let out = TempDir::new("agent-undo-out");
-    let backed_up = agent_archive(&[("opfs/projects/p1/chat.json", b"[{\"role\":\"user\",\"text\":\"hello\"}]")]);
+    let backed_up = agent_archive(&[
+        ("opfs/projects/p1/chat.json", b"[{\"role\":\"user\",\"text\":\"hello\"}]"),
+        ("opfs/projects/p1/files/notes.md", b"notes"),
+        ("opfs/front-desk/files/greeting.txt", b"hello there"),
+    ]);
     let file = backup_with_agent(&src.0, &out.0, "u.oaiybackup", backed_up.clone(), false);
     let dst = TempDir::new("agent-undo-dst");
     target(&dst.0);
     restore::stage(&dst.0, &file, PASS, &Ticks::all(), &options()).unwrap();
     assert!(matches!(restore::apply_pending(&dst.0), ApplyOutcome::Applied(_)));
 
-    // The page imports: it saves what it held, writes, and says which files it added (and what it left out).
-    let before = agent_archive(&[("opfs/projects/p1/chat.json", b"[\"as it was before the restore\"]")]);
-    let (restore_id, seen) = page_takes_import(&dst.0, &before, &["opfs/projects/p1/notes.md", "opfs/front-desk/greeting.txt"]);
+    // The page imports: it saves what it held, writes, and says which files it added (and what it left out). What it says it added is
+    // not what counts: the desktop works it out (here the page names a file the restore never held, and none it did).
+    let before = agent_archive(&[("opfs/projects/p1/chat.json", b"[\"as it was before the restore\"]"), ("opfs/front-desk/files/from-before.txt", b"kept")]);
+    let (restore_id, seen) = page_takes_import(&dst.0, &before, &["opfs/projects/p9/not-from-the-restore.md"]);
     assert_eq!(seen.kind, "restore");
     assert!(seen.remove.is_empty(), "a restore takes nothing away");
     assert_eq!(zip_entries(&seen.fetched)["opfs/projects/p1/chat.json"], zip_entries(&backed_up)["opfs/projects/p1/chat.json"]);
     let last = restore::last_restore(&dst.0).unwrap();
     assert!(last.notes.iter().any(|n| n.starts_with("Agent: ") && n.contains("project.json")), "what the page left out reaches the result: {:?}", last.notes);
-    assert_eq!(agent::read_added(&dst.0, &restore_id), ["opfs/projects/p1/notes.md", "opfs/front-desk/greeting.txt"]);
+    let mut added = agent::read_added(&dst.0, &restore_id);
+    added.sort();
+    assert_eq!(added, ["opfs/front-desk/files/greeting.txt", "opfs/projects/p1/files/notes.md"], "the files the archive holds that the copy from before did not");
 
     // The undo hands the page the snapshot (rebuilt through the table) and the list of what to take away.
     restore::stage_undo(&dst.0, &options()).unwrap();
     assert!(matches!(restore::apply_pending(&dst.0), ApplyOutcome::Applied(_)));
     let when_the_undo_began = agent_archive(&[("opfs/projects/p1/chat.json", b"[\"as it was when the undo began\"]")]);
-    let (undo_id, seen) = page_takes_import(&dst.0, &when_the_undo_began, &["opfs/projects/p9/came-back.md"]);
+    let (undo_id, seen) = page_takes_import(&dst.0, &when_the_undo_began, &[]);
     assert_eq!(seen.kind, "undo");
-    assert_eq!(seen.remove, ["opfs/projects/p1/notes.md", "opfs/front-desk/greeting.txt"]);
+    let mut removals = seen.remove.clone();
+    removals.sort();
+    assert_eq!(removals, ["opfs/front-desk/files/greeting.txt", "opfs/projects/p1/files/notes.md"]);
     assert_eq!(zip_entries(&seen.fetched)["opfs/projects/p1/chat.json"], b"[\"as it was before the restore\"]");
     // The undo took a snapshot of its own (the redo copy), and it is what a redo hands back.
     assert_eq!(fs::read(agent::undo_agent_path(&dst.0, &undo_id)).unwrap(), when_the_undo_began);
@@ -4078,7 +4087,8 @@ fn an_undo_takes_away_what_the_agents_import_added_and_keeps_a_copy_of_what_it_t
     let after_the_undo = agent_archive(&[("opfs/projects/p1/chat.json", b"[\"after the undo\"]")]);
     let (_, seen) = page_takes_import(&dst.0, &after_the_undo, &[]);
     assert_eq!(zip_entries(&seen.fetched)["opfs/projects/p1/chat.json"], b"[\"as it was when the undo began\"]");
-    assert_eq!(seen.remove, ["opfs/projects/p9/came-back.md"], "the redo takes away what the undo brought back");
+    // The undo brought back a file that the page's own storage did not have when the undo began: the redo takes it away again.
+    assert_eq!(seen.remove, ["opfs/front-desk/files/from-before.txt"], "the redo takes away what the undo brought back");
 }
 
 /// An undo puts back the person's own state, but through the same table: an old campaign is not brought back running,
@@ -4210,25 +4220,117 @@ fn a_second_try_at_the_undo_copy_never_replaces_the_first() {
     assert_eq!(fs::read(&path).unwrap(), b"the true original");
 }
 
+/// An Agent archive with these names, and nothing in them.
+fn agent_archive_of_names(names: &[String]) -> Vec<u8> {
+    let mut writer = zip::ZipWriter::new(Cursor::new(Vec::new()));
+    let opts = zip::write::SimpleFileOptions::default();
+    for name in names {
+        writer.start_file(name.as_str(), opts).unwrap();
+    }
+    writer.finish().unwrap().into_inner()
+}
+
+/// A data folder where a restore of this id was applied and its Agent archive waits for the page: made by hand, so that its archive
+/// can be of any size and hold any name.
+fn machine_where_the_page_is_handed(archive: &[u8], id: &str) -> TempDir {
+    let data = TempDir::new("handed-by-hand");
+    let zip = data.0.join("handed.zip");
+    fs::write(&zip, archive).unwrap();
+    agent::leave_for_page(&data.0, id, "restore", &zip, false, false, &[]).unwrap();
+    let folder = data.0.join("restore").join(format!("undo-{id}"));
+    fs::create_dir_all(&folder).unwrap();
+    fs::write(folder.join("undo.json"), serde_json::json!({ "id": id, "appliedAt": "2026-09-30T00:00:00Z", "backupCreatedAt": "2026-09-30T00:00:00Z", "kind": "restore", "replaced": [], "added": [] }).to_string()).unwrap();
+    fs::write(data.0.join("restore").join("last-result.json"), serde_json::json!({ "id": id, "kind": "restore", "at": "2026-09-30T00:00:00Z", "ok": true, "redo": [], "agentStorage": "pending", "notes": [] }).to_string()).unwrap();
+    data
+}
+
+/// The Agent's files that an undo takes away are worked out by the desktop from the archive it handed over and the copy the page took
+/// of its own storage: only the plain names of files of the storage, and only so many, whatever names the archive holds and whatever
+/// the page says.
 #[test]
-fn what_the_page_lists_as_added_is_kept_only_if_it_is_plain_and_only_so_many() {
-    let src = TempDir::new("agent-names-src");
-    realistic(&src.0, "A");
-    let out = TempDir::new("agent-names-out");
-    let file = out.0.join("n.oaiybackup");
-    let page = Page { zip: agent_zip(), part_size: PART_SIZE, ok: true, warnings: vec![] };
-    make_with(&src.0, &file, PASS, false, Some(&page)).unwrap();
-    let dst = TempDir::new("agent-names-dst");
+fn what_the_desktop_lists_as_added_is_only_plain_names_of_the_storage_and_only_so_many() {
+    let id = "0123456789abcdef";
+    let mut names: Vec<String> = ["agent-manifest.json", "idb/settings.json", "opfs/projects/p1/files/keep.md", "opfs/projects//c.md", "opfs/projects/p1/files/\u{7}bell", "opfs/projects/p1/../../../callers.json", "opfs\\projects\\p1\\b.md", "/etc/passwd", "opfs/projects/p1/files/in-the-copy.md"]
+        .iter()
+        .map(|s| s.to_string())
+        .collect();
+    names.push(format!("opfs/{}", "x".repeat(2000)));
+    names.extend((0..agent::MAX_ADDED + 50).map(|i| format!("opfs/projects/p2/files/file-{i}.md")));
+    let data = machine_where_the_page_is_handed(&agent_archive_of_names(&names), id);
+    let token = agent::page_token().to_string();
+    // The copy the page took of its own storage before it began: two of the archive's files were there already.
+    let before = agent_archive_of_names(&["opfs/projects/p1/files/in-the-copy.md".to_string(), "opfs/projects/p2/files/file-0.md".to_string(), "opfs/projects/p7/files/only-there.md".to_string()]);
+    agent::undo_part(&data.0, id, &token, 0, &before).unwrap();
+    agent::undo_done(&data.0, id, &token, &DonePayload { ok: true, parts: 1, ..Default::default() }).unwrap();
+    // The page's own list names a file that is not in the archive and a name that leaves the storage: neither is used.
+    let report = agent::ImportReport { ok: true, added: vec!["opfs/projects/p1/files/not-in-the-archive.md".into(), "../../callers.json".into()], ..Default::default() };
+    agent::import_done(&data.0, id, &token, &report).unwrap();
+    let kept = agent::read_added(&data.0, id);
+    assert_eq!(kept.len(), agent::MAX_ADDED, "only so many are kept");
+    assert_eq!(kept[0], "opfs/projects/p1/files/keep.md", "in the order of the archive");
+    assert_eq!(kept[1], "opfs/projects/p2/files/file-1.md", "the two the copy held are not added");
+    assert!(kept.iter().all(|n| n.starts_with("opfs/projects/") && !n.contains("..") && !n.contains('\\') && !n.contains("//") && !n.chars().any(char::is_control) && !n.contains("in-the-copy") && !n.contains("not-in-the-archive")), "nothing that leaves the storage, is not a name, or is not from the archive");
+    let last = restore::last_restore(&data.0).unwrap();
+    assert!(last.notes.iter().any(|n| n.contains("50 added files are not listed")), "{:?}", last.notes);
+}
+
+/// The reviewer's V1: the import is cut short after it began to write (the page is closed, or its report is lost), and at the next
+/// start it is tried again over storage that is half restored: the files are there already, and the page says it added none. The
+/// copy of the first try is kept, so the undo still takes away everything the restore added.
+#[test]
+fn an_import_that_is_done_again_still_lets_the_undo_take_away_everything_it_added() {
+    let src = TempDir::new("retry-added-src");
+    let out = TempDir::new("retry-added-out");
+    let file = backup_with_agent(
+        &src.0,
+        &out.0,
+        "r.oaiybackup",
+        agent_archive(&[
+            ("opfs/projects/p-new/project.json", b"{\"id\":\"p-new\",\"name\":\"New\"}"),
+            ("opfs/projects/p-new/chat.json", b"[]"),
+            ("opfs/front-desk/files/brief.md", b"a brief of the backup"),
+            ("opfs/projects/p-old/chat.json", b"[\"replaces mine\"]"),
+        ]),
+        false,
+    );
+    let dst = TempDir::new("retry-added-dst");
     restore::stage(&dst.0, &file, PASS, &Ticks::all(), &options()).unwrap();
     assert!(matches!(restore::apply_pending(&dst.0), ApplyOutcome::Applied(_)));
-    let id = agent::import_meta(&dst.0).id.unwrap();
-    let mut added: Vec<String> = vec!["opfs/projects/p1/a.md".into(), "../../callers.json".into(), "/etc/passwd".into(), "opfs\\projects\\p1\\b.md".into(), "opfs/projects//c.md".into(), "opfs/projects/p1/\u{7}bell".into(), "".into(), "x".repeat(2000)];
-    added.extend((0..agent::MAX_ADDED + 50).map(|i| format!("opfs/projects/p2/file-{i}.md")));
-    agent::import_done(&dst.0, &id, agent::page_token(), &agent::ImportReport { ok: true, added, ..Default::default() }).unwrap();
-    let kept = agent::read_added(&dst.0, &id);
-    assert_eq!(kept.len(), agent::MAX_ADDED, "only so many are kept");
-    assert_eq!(kept[0], "opfs/projects/p1/a.md");
-    assert!(kept.iter().all(|n| n.starts_with("opfs/projects/") && !n.contains("..") && !n.contains('\\') && !n.contains("//") && !n.chars().any(char::is_control)), "nothing that leaves the storage or is not a name");
+    let meta = agent::import_meta(&dst.0);
+    let (id, token) = (meta.id.clone().unwrap(), agent::page_token().to_string());
+    // The first try: the copy of the page's storage as it is (it holds a project of its own), then the writes... and the page is closed
+    // before it says it is done.
+    let original = agent_archive(&[("opfs/projects/p-old/chat.json", b"[\"mine\"]")]);
+    agent::undo_part(&dst.0, &id, &token, 0, &original).unwrap();
+    agent::undo_done(&dst.0, &id, &token, &DonePayload { ok: true, parts: 1, ..Default::default() }).unwrap();
+    // The next start: the desktop still offers it; the page takes a copy of what is now half restored (the desktop keeps the first
+    // copy), finds the files there, and says it added none.
+    assert!(agent::import_meta(&dst.0).pending);
+    let half_restored = agent_archive(&[("opfs/projects/p-old/chat.json", b"[\"replaces mine\"]"), ("opfs/projects/p-new/project.json", b"{}"), ("opfs/projects/p-new/chat.json", b"[]"), ("opfs/front-desk/files/brief.md", b"a brief of the backup")]);
+    agent::undo_part(&dst.0, &id, &token, 0, &half_restored).unwrap();
+    agent::undo_done(&dst.0, &id, &token, &DonePayload { ok: true, parts: 1, ..Default::default() }).unwrap();
+    agent::import_done(&dst.0, &id, &token, &agent::ImportReport { ok: true, added: vec![], ..Default::default() }).unwrap();
+    let mut added = agent::read_added(&dst.0, &id);
+    added.sort();
+    assert_eq!(added, ["opfs/front-desk/files/brief.md", "opfs/projects/p-new/chat.json", "opfs/projects/p-new/project.json"], "what the restore added, whatever the page saw the second time");
+    // The undo hands the page the list to take away, and the copy of the first try to put back.
+    restore::stage_undo(&dst.0, &options()).unwrap();
+    assert!(matches!(restore::apply_pending(&dst.0), ApplyOutcome::Applied(_)));
+    let seen = agent::import_meta(&dst.0);
+    assert_eq!(seen.kind.as_deref(), Some("undo"));
+    let mut remove = seen.remove.clone();
+    remove.sort();
+    assert_eq!(remove, added);
+    // A restore whose page never took a copy has nothing to compare with: nothing is said to have been added, and the result says so.
+    let (bare, bare_id) = machine_with_a_waiting_agent_part("retry-added-none");
+    agent::import_done(&bare.0, &bare_id, agent::page_token(), &agent::ImportReport { ok: true, added: vec!["opfs/front-desk/files/brief.md".into()], ..Default::default() }).unwrap();
+    assert!(agent::read_added(&bare.0, &bare_id).is_empty());
+    let last = restore::last_restore(&bare.0).unwrap();
+    assert!(last.notes.iter().any(|n| n.contains("No copy of the Agent's storage from before was kept")), "{:?}", last.notes);
+    // (A page that says it failed, having taken no copy, wrote nothing: there is nothing to say of that.)
+    let (failed, failed_id) = machine_with_a_waiting_agent_part("retry-added-failed");
+    agent::import_done(&failed.0, &failed_id, agent::page_token(), &agent::ImportReport { ok: false, error: Some("the undo copy could not be made".into()), ..Default::default() }).unwrap();
+    assert!(!restore::last_restore(&failed.0).unwrap().notes.iter().any(|n| n.contains("No copy of the Agent's storage")));
 }
 
 #[test]
@@ -4277,12 +4379,15 @@ async fn the_pages_report_of_an_import_reaches_the_desktop_over_the_route() {
     .to_string()
     .into_bytes();
     let done = format!("/api/backup/agent-import/{id}/done");
+    // (The page takes its copy first, as it does: the desktop lists what the archive holds that the copy does not.)
+    agent::undo_part(&dst.0, &id, &secret, 0, &agent_archive(&[("opfs/projects/p2/chat.json", b"[]")])).unwrap();
+    agent::undo_done(&dst.0, &id, &secret, &DonePayload { ok: true, parts: 1, ..Default::default() }).unwrap();
     // Not from a caller without the secret; then from the page.
     assert_eq!(call_from(&app, "POST", &done, Some("guess"), Some("oaiy://localhost"), body.clone()).await.0, 403);
     assert!(agent::import_meta(&dst.0).pending, "still waiting");
     assert_eq!(call_from(&app, "POST", &done, Some(&secret), Some("oaiy://localhost"), body).await.0, 200);
     assert!(!agent::import_meta(&dst.0).pending);
-    assert_eq!(agent::read_added(&dst.0, &id), ["opfs/projects/p1/notes.md"]);
+    assert_eq!(agent::read_added(&dst.0, &id), ["opfs/projects/p1/chat.json"], "what the archive holds that the copy did not");
     let last = restore::last_restore(&dst.0).unwrap();
     assert_eq!(last.agent_storage, "applied");
     assert!(last.notes.iter().any(|n| n.contains("project.json could not be read")), "{:?}", last.notes);

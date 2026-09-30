@@ -700,8 +700,12 @@ in parts through internal routes with a secret made for that one backup.
   not find, or an archive that lists a name twice, is refused whole. On a restore the desktop
   leaves the Agent's part for its page. At the next start the page fetches it **before it opens
   anything**, first saves what it holds now as the undo copy (and does nothing at all if it
-  cannot), then writes what the record names. It reports which files it **added**, so an undo can
-  take exactly those away again, and what it left out. The result appears in Settings. The undo
+  cannot), then writes what the record names, and reports what it left out. The result appears in
+  Settings. **Which files the restore added is worked out by the desktop**, not taken from the page:
+  they are the files the archive it handed over holds that the undo copy does not (only plain names
+  of files of the storage, at most 20,000), so an undo can take exactly those away again. A page that is closed after it began to write, or
+  whose report is lost, tries again over files that are there already and says it added none: the
+  undo still takes them away. The undo
   copy of a restore is made once: if the page is closed part-way and tries again, its second copy
   (of storage that is already half restored) is thrown away and the first one is kept. What was
   left for the page and not taken within 24 hours, or that the page refused (say, because it is
