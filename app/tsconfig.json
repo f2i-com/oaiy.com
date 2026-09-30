@@ -12,7 +12,8 @@
     "isolatedModules": true,
     "resolveJsonModule": true,
     "allowJs": false,
-    "types": ["vite/client"]
+    "types": ["vite/client"],
+    "paths": { "@oaiy/shared/*": ["../shared/*"] }
   },
-  "include": ["src", "tests/unit"]
+  "include": ["src", "tests/unit", "../shared"]
 }
