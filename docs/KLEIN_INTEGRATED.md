@@ -122,7 +122,12 @@ Source anchors: `platform/desktop/src-tauri/src/auth/routes.rs` (`ai.use` route)
 ## Tests, reproduction, and retained evidence
 
 - Native media/server/Studio CPU tests: 242 passed, 0 failed, 49 ignored at the
-  first integration snapshot. Final CPU results are in the archive's summary.
+  first integration snapshot, including binary/integration targets. Final library
+  checks at 2d8e5e99 yielded 88 server + 79 media passes, then 71 Studio passes
+  in its complete rerun (238 total, 46 ignored). The initial Studio attempt had
+  one access-denied error deleting its own Windows Temp fixture; a CPU-only
+  rerun outside the restricted process passed all 71. Both logs are preserved;
+  this was temporary-folder cleanup, not inference or image math.
 - Component checks including supplied rank-32 LoRA and existing VAE: 10 passed.
 - Actual CUDA full tiny-transformer forward oracle against BFL: 1 passed, covering
   GPU/RAM/SSD block tiers within 2e-5 error, on GPU 1. Full production RAM/SSD
