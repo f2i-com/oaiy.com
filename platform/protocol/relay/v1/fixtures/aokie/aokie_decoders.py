@@ -591,7 +591,9 @@ def mint_ice(config: dict, endpoint: dict, now: int) -> dict:
         servers.append({"urls": list(config["stunUrls"]), "username": "", "credential": ""})
     expires = None
     if config["turnUrls"]:
-        expires = now + config["turnTtl"]
+        ttl = config["turnTtl"]
+        window = min(100, 10 * max(1, ttl // 60))  # the expiry is rounded down to a window: one coturn quota key per endpoint and window
+        expires = now // window * window + ttl
         username = f"{expires}:{turn_opaque_id(config['turnSecret'], endpoint['role'], endpoint['appId'], endpoint['subjectId'])}"
         servers.append({"urls": list(config["turnUrls"]), "username": username, "credential": turn_credential(config["turnSecret"], username), "expiresAt": expires})
     return {"iceServers": servers, "relayOnly": config["relayOnly"], "turnCredentialExpiresAt": expires}

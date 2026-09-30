@@ -75,6 +75,24 @@ final class Ice
         return array_values($v);
     }
 
+    /**
+     * The window an expiry is rounded down to, in seconds: a sixth of the lifetime, at least 10 and at most 100 (a lifetime of 600
+     * gives 100). coturn's user quota is kept per username as it receives it, and the username holds the expiry, so an expiry that
+     * is new for every admission gives an endpoint a new quota key with every mint (30 a minute): its quota is no bound at all.
+     * Admissions of one endpoint within a window share the username and the credential, so the quota counts one endpoint.
+     */
+    public static function window(int $ttl): int
+    {
+        return min(100, 10 * max(1, intdiv($ttl, 60)));
+    }
+
+    /** The expiry of a credential minted at $now: the start of its window plus the lifetime, so it is more than 5/6 of the lifetime ahead and never past it. */
+    public static function expiry(int $now, int $ttl): int
+    {
+        $w = self::window($ttl);
+        return intdiv($now, $w) * $w + $ttl;
+    }
+
     /** base64(HMAC-SHA1(secret, username)): the credential coturn computes from the username it is sent (Appendix A5). */
     public static function credential(string $secret, string $username): string
     {
@@ -101,7 +119,7 @@ final class Ice
         }
         $expires = null;
         if ($turn['urls'] !== []) {
-            $expires = $now + $turn['ttl'];
+            $expires = self::expiry($now, (int)$turn['ttl']);
             $username = $expires . ':' . self::opaqueId((string)$turn['secret'], $role, $appId, $subjectId);
             $servers[] = ['urls' => $turn['urls'], 'username' => $username, 'credential' => self::credential((string)$turn['secret'], $username), 'expiresAt' => $expires];
         }

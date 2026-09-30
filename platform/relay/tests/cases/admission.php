@@ -228,6 +228,43 @@ test('4.14.3 every admission carries its own short-lived TURN credential: userna
     eq((Relay::T0 + 700) . ':' . explode(':', $again['username'])[1], $later['username'], 'the expiry moves with the clock, the id does not');
 });
 
+test('4.14.3 the expiry in a TURN username is rounded down to a window (a sixth of the lifetime, 10 to 100 seconds): an endpoint\'s admissions inside a window share one username and credential, so coturn\'s per-username quota counts an endpoint and not a mint; a credential is always more than five sixths of its lifetime ahead and never past it', function () {
+    $turn = ['turn:turn.example.com:3478?transport=udp'];
+    $cfgFor = fn(int $ttl) => Config::fromArray(['public_url' => 'https://relay.example.com', 'turn' => ['urls' => $turn, 'secret' => AokieRig::SECRET, 'ttl' => $ttl], 'stun' => ['urls' => []]], '/tmp/x');
+    foreach ([60 => 10, 119 => 10, 120 => 20, 599 => 90, 600 => 100, 1800 => 100, 3600 => 100] as $ttl => $window) {
+        eq($window, Ice::window($ttl), "the window of a $ttl second lifetime");
+        $cfg = $cfgFor($ttl);
+        $names = [];
+        for ($now = Relay::T0; $now < Relay::T0 + 3600; $now++) {
+            $r = Ice::forAdmission($cfg, 'mobile', 'aokie', 'dev-x', $now);
+            $exp = $r['expiresAt'];
+            if ($exp - $now < 31 || $exp - $now > $ttl || $exp - $now <= $ttl - $window) {
+                fail("lifetime $ttl, now +" . ($now - Relay::T0) . ': the credential expires ' . ($exp - $now) . ' seconds ahead');
+            }
+            eq($exp, $r['servers'][0]['expiresAt']);
+            $names[$r['servers'][0]['username']] = true;
+        }
+        $want = intdiv(3600, $window);
+        ok(count($names) === $want || count($names) === $want + 1, "a lifetime of $ttl: an endpoint that mints every second for an hour has one username per window ($want, or one more where the hour starts inside a window), not one per mint: " . count($names));
+    }
+    // Inside a window the credential is one credential; across it, another; another endpoint's is its own.
+    $cfg = $cfgFor(600);
+    $a = Ice::forAdmission($cfg, 'mobile', 'aokie', 'dev-x', Relay::T0 + 1)['servers'][0];
+    eq($a, Ice::forAdmission($cfg, 'mobile', 'aokie', 'dev-x', Relay::T0 + 99)['servers'][0]);
+    neq($a['username'], Ice::forAdmission($cfg, 'mobile', 'aokie', 'dev-x', Relay::T0 + 100)['servers'][0]['username']);
+    neq(substr($a['username'], strpos($a['username'], ':')), substr(Ice::forAdmission($cfg, 'mobile', 'aokie', 'dev-y', Relay::T0 + 1)['servers'][0]['username'], strpos($a['username'], ':')));
+    // Through the route: one phone that mints thirty times a minute for two minutes is one username.
+    $k = AokieRig::make();
+    $ph = $k->addPhone();
+    $k->pushRoster();
+    $users = [];
+    for ($i = 0; $i < 30; $i++) {
+        Tmp::setClock(Relay::T0 + 2 * $i);
+        $users[$k->mobile($ph)['json']['iceServers'][1]['username']] = true;
+    }
+    eq(1, count($users));
+});
+
 test('4.14.3 the opaque TURN id is a keyed hash of role, app and subject: 32 hex characters, stable, different for each of them and for another secret', function () {
     $id = Ice::opaqueId(AokieRig::SECRET, 'mobile', 'aokie', 'dev-x');
     eq(1, preg_match('/^[0-9a-f]{32}$/D', $id));

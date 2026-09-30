@@ -211,6 +211,123 @@
       }
     },
     {
+      "name": "inside a window",
+      "note": "The expiry is rounded down to a window (a sixth of turn.ttl, 10 to 100 seconds; 100 for 600) and then turn.ttl is added, so the same endpoint has one username, and one coturn quota key, for the whole window: 37 seconds in, the expiry is the window's start plus 600.",
+      "config": {
+        "stunUrls": [
+          "stun:stun.example.com:3478"
+        ],
+        "turnUrls": [
+          "turn:turn.example.com:3478?transport=udp"
+        ],
+        "turnSecret": "0123456789abcdef0123456789abcdef",
+        "turnTtl": 600,
+        "relayOnly": false
+      },
+      "endpoint": {
+        "role": "mobile",
+        "appId": "aokie",
+        "subjectId": "dev-sLGys7S1tre4ubq7vL2-vw"
+      },
+      "now": 1790000037,
+      "expected": {
+        "iceServers": [
+          {
+            "urls": [
+              "stun:stun.example.com:3478"
+            ],
+            "username": "",
+            "credential": ""
+          },
+          {
+            "urls": [
+              "turn:turn.example.com:3478?transport=udp"
+            ],
+            "username": "1790000600:7ff63462c30fe39275b3a7c6ac580ce2",
+            "credential": "x4zr15hpi6xJVK29djMqDln7j7M=",
+            "expiresAt": 1790000600
+          }
+        ],
+        "relayOnly": false,
+        "turnCredentialExpiresAt": 1790000600
+      }
+    },
+    {
+      "name": "the next window",
+      "note": "137 seconds in: the next window, so the expiry and the username are new.",
+      "config": {
+        "stunUrls": [
+          "stun:stun.example.com:3478"
+        ],
+        "turnUrls": [
+          "turn:turn.example.com:3478?transport=udp"
+        ],
+        "turnSecret": "0123456789abcdef0123456789abcdef",
+        "turnTtl": 600,
+        "relayOnly": false
+      },
+      "endpoint": {
+        "role": "mobile",
+        "appId": "aokie",
+        "subjectId": "dev-sLGys7S1tre4ubq7vL2-vw"
+      },
+      "now": 1790000137,
+      "expected": {
+        "iceServers": [
+          {
+            "urls": [
+              "stun:stun.example.com:3478"
+            ],
+            "username": "",
+            "credential": ""
+          },
+          {
+            "urls": [
+              "turn:turn.example.com:3478?transport=udp"
+            ],
+            "username": "1790000700:7ff63462c30fe39275b3a7c6ac580ce2",
+            "credential": "1+PDBJTbVV8ESJ1SIFI0pCYRdw4=",
+            "expiresAt": 1790000700
+          }
+        ],
+        "relayOnly": false,
+        "turnCredentialExpiresAt": 1790000700
+      }
+    },
+    {
+      "name": "a short lifetime, mid-window",
+      "note": "turn.ttl 90 gives a window of 10 seconds: 7 seconds in the expiry is the start plus 90; the credential is 83 seconds ahead, more than the decoders' 30.",
+      "config": {
+        "stunUrls": [],
+        "turnUrls": [
+          "turn:turn.example.com:3478"
+        ],
+        "turnSecret": "0123456789abcdef0123456789abcdef",
+        "turnTtl": 90,
+        "relayOnly": false
+      },
+      "endpoint": {
+        "role": "plugin",
+        "appId": "aokie",
+        "subjectId": "aokie"
+      },
+      "now": 1790000007,
+      "expected": {
+        "iceServers": [
+          {
+            "urls": [
+              "turn:turn.example.com:3478"
+            ],
+            "username": "1790000090:e8e8d6685ab52d2b50f62b7235f0633c",
+            "credential": "cnHXXmEAwrwhbb9d9qVpdiqX5fI=",
+            "expiresAt": 1790000090
+          }
+        ],
+        "relayOnly": false,
+        "turnCredentialExpiresAt": 1790000090
+      }
+    },
+    {
       "name": "relay only",
       "note": "relayOnly needs a TURN entry.",
       "config": {

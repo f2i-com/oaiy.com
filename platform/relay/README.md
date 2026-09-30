@@ -308,7 +308,7 @@ on) the relay does what FormLogic does for the shipped Aokie plugin and phone, s
 
 **TURN.** Put a coturn beside the relay (a phone on a carrier network needs it: the status page warns when none is configured) with
 `use-auth-secret`, `static-auth-secret=<the same string as turn.secret>` and a `realm`, and list its urls in `turn.urls`. Every
-admission carries its own credential: `username = <expiry>:<opaque id>`, `credential = base64(HMAC-SHA1(secret, username))`, the id a
+admission carries a credential: `username = <expiry>:<opaque id>` (the expiry is rounded down to a window of a sixth of `turn.ttl`, at most 100 seconds, so one endpoint keeps one username, and one coturn `user-quota` key, for a window instead of getting a new one with every admission), `credential = base64(HMAC-SHA1(secret, username))`, the id a
 keyed hash of the endpoint (FormLogic's), so no device id reaches coturn's log. A bad `turn.*` or `stun.*` section stops the relay
 at the next request instead of issuing credentials that the plugin's decoder would refuse.
 
