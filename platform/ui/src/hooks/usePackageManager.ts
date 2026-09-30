@@ -20,6 +20,7 @@ import type {
 } from 'oaiy-core';
 import { createLogger } from '../utils/logger';
 import { registerImportedServices } from '../utils/ProjectIO';
+import { withoutRunOutputs } from '../utils/runOutputs';
 
 const logger = createLogger('PackageManager');
 
@@ -205,7 +206,7 @@ export function normalizeFlowData(data: Record<string, unknown>): Partial<Flow> 
       tags: data.tags as string[] | undefined,
       localOnly: data.localOnly as boolean | undefined,
       graph: {
-        nodes: data.nodes as WorkflowGraph['nodes'],
+        nodes: withoutRunOutputs(data.nodes as WorkflowGraph['nodes']),
         edges: data.edges as WorkflowGraph['edges'],
       },
     };
@@ -214,7 +215,7 @@ export function normalizeFlowData(data: Record<string, unknown>): Partial<Flow> 
   if (data.graph && typeof data.graph === 'object') {
     const graph = data.graph as Record<string, unknown>;
     if (Array.isArray(graph.nodes) && Array.isArray(graph.edges)) {
-      return data as Partial<Flow>;
+      return { ...(data as Partial<Flow>), graph: { ...(data.graph as WorkflowGraph), nodes: withoutRunOutputs(graph.nodes as WorkflowGraph['nodes']) } };
     }
   }
   return null;

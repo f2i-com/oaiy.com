@@ -2,6 +2,7 @@ import { memo, useState, useEffect, useRef, useCallback, useMemo, type ChangeEve
 import { Position } from '@xyflow/react';
 import { useNodeResize, CollapsibleNodeWrapper, type HandleConfig } from 'oaiy-ui-components';
 import { pathToMediaUrl } from 'oaiy-core';
+import { BLOCKED_MEDIA_WORDS, mediaUrlBlocked } from '../../../lib/localMedia';
 
 
 interface OutputNodeData {
@@ -20,6 +21,9 @@ interface OutputNodeProps {
 
 const isSafeUrl = (url: string): boolean => {
   if (!url || typeof url !== 'string') return false;
+  // An address on this computer or its network, in a tab not linked to OAIY Desktop, is not loaded (lib/localMedia.ts): the node
+  // shows the text and says why.
+  if (mediaUrlBlocked(url)) return false;
   const trimmed = url.trim().toLowerCase();
   return (
     trimmed.startsWith('http://') ||
@@ -432,6 +436,9 @@ function OutputNode({ data }: OutputNodeProps) {
 
           <div>
             <label className="text-slate-600 dark:text-slate-400 text-xs block mb-1">Result</label>
+            {outputArray.some((v) => /^https?:\/\//i.test(v.trim()) && mediaUrlBlocked(v)) && (
+              <p className="text-amber-600 dark:text-amber-400 text-[10px] mb-1" data-blocked-media>{BLOCKED_MEDIA_WORDS}</p>
+            )}
             {isVideoArray || isSingleVideo ? (
               <div
                 className="bg-slate-100 dark:bg-slate-900 border border-orange-600 rounded overflow-hidden"

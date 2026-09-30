@@ -1,6 +1,7 @@
 import { memo, useRef, useEffect, useCallback, useMemo, type ChangeEvent } from 'react';
 import { Position } from '@xyflow/react';
 import { CollapsibleNodeWrapper, type HandleConfig } from 'oaiy-ui-components';
+import { BLOCKED_MEDIA_WORDS, mediaUrlBlocked } from '../../../lib/localMedia';
 
 
 interface ImageSaveNodeData {
@@ -109,7 +110,9 @@ function ImageSaveNode({ data }: ImageSaveNodeProps) {
             <label className="text-slate-600 dark:text-slate-400 text-xs block mb-1">Preview</label>
             <div className={`w-full h-20 bg-white dark:bg-slate-900 border rounded flex items-center justify-center ${hasImage ? 'border-teal-600' : 'border-slate-300 dark:border-slate-700'
               }`}>
-              {hasImage ? (
+              {hasImage && mediaUrlBlocked(data.imageUrl) ? (
+                <span className="text-amber-600 dark:text-amber-400 text-[10px] p-2" data-blocked-media>{BLOCKED_MEDIA_WORDS}</span>
+              ) : hasImage ? (
                 <img
                   src={
                     data.imageUrl?.startsWith('data:') || data.imageUrl?.startsWith('http')

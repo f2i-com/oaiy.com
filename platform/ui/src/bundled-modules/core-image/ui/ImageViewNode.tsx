@@ -1,6 +1,7 @@
 import { memo, useState, useRef, useEffect, useCallback, useMemo, type ChangeEvent } from 'react';
 import { Position } from '@xyflow/react';
 import { CollapsibleNodeWrapper, type HandleConfig } from 'oaiy-ui-components';
+import { BLOCKED_MEDIA_WORDS, mediaUrlBlocked } from '../../../lib/localMedia';
 
 
 interface ImageViewNodeData {
@@ -50,7 +51,8 @@ function ImageViewNode({ data }: ImageViewNodeProps) {
   // `data:image/` MIME (not any `data:` payload), so an arbitrary string from
   // upstream node output can't be dropped straight into an <img src>.
   const imageUrl = data.imageUrl ?? '';
-  const isValidImage = hasImage && (
+  const blocked = !!hasImage && mediaUrlBlocked(imageUrl);
+  const isValidImage = hasImage && !blocked && (
     imageUrl.startsWith('data:image/') ||
     /^https?:\/\//i.test(imageUrl) ||
     imageUrl.startsWith('blob:')
@@ -138,6 +140,10 @@ function ImageViewNode({ data }: ImageViewNodeProps) {
                   onError={() => setHasLoadError(true)}
                   onLoad={() => setHasLoadError(false)}
                 />
+              ) : blocked ? (
+                <div className="text-center p-2">
+                  <span className="text-amber-600 dark:text-amber-400 text-[10px]" data-blocked-media>{BLOCKED_MEDIA_WORDS}</span>
+                </div>
               ) : hasImage ? (
                 <div className="text-center p-2">
                   <svg className="w-8 h-8 mx-auto text-slate-600 mb-1" fill="none" stroke="currentColor" viewBox="0 0 24 24">

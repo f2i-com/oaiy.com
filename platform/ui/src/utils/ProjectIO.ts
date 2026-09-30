@@ -12,6 +12,7 @@ import type {
   LogEntry,
 } from 'oaiy-core';
 import { getModuleLoader } from 'oaiy-core';
+import { withoutRunOutputs } from './runOutputs';
 import {
   defaultLLMEndpoints,
   defaultImageGenEndpoints,
@@ -381,7 +382,7 @@ export const parseImportedProject = (content: string): ExportedProject => {
         ...f,
         graph:
           f && f.graph && Array.isArray(f.graph.nodes) && Array.isArray(f.graph.edges)
-            ? f.graph
+            ? { ...f.graph, nodes: withoutRunOutputs(f.graph.nodes) }
             : { nodes: [], edges: [] },
       }))
     ),
