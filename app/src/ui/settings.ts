@@ -12,6 +12,7 @@ import { EMPTY_MEDIA, OAIY_ORIGIN, discoverOaiy, listMediaModels, mediaAbilities
 import { newId } from '../vfs/projects';
 import { looksOnLoad, pageHost } from '@oaiy/shared/capabilities/host';
 import { clear, h } from './dom';
+import { findOaiyTitle, oaiyFoundWords, type OaiyState } from './linkWords';
 
 export interface SettingsResult {
   providers: ProviderConfig[];
@@ -291,8 +292,8 @@ export function openSettings(initial: SettingsResult): Promise<SettingsResult | 
         return h('span.model-choice', input, h('datalist', { id: listId }, ...ids.map((id) => h('option', { value: id, label: note(id) }))));
       };
       // OAIY's own windows look for OAIY as they start; a tab in a browser only when this button is pressed (agent/lookup.ts).
-      const lookedForOnItsOwn = looksOnLoad(pageHost());
-      const find = h('button', { title: `Ask OAIY for its details (/v1/discovery) and fill everything in${lookedForOnItsOwn ? '' : `. This page reaches out to your computer only when you press this, and your browser may ask you to allow it.`}`, onclick: async () => {
+      const oaiyState: OaiyState = looksOnLoad(pageHost()) ? { kind: 'own' } : media.discovered ? { kind: 'saved', origin: media.discovered.origin, withKey: !!media.apiKey } : { kind: 'never' };
+      const find = h('button', { title: findOaiyTitle(oaiyState), onclick: async () => {
         note.textContent = 'Looking for OAIY…';
         let where = OAIY_ORIGIN;
         try {
@@ -353,7 +354,7 @@ export function openSettings(initial: SettingsResult): Promise<SettingsResult | 
       const enabled = h('input', { type: 'checkbox', checked: media.enabled, onchange: () => { media.enabled = enabled.checked; } }) as HTMLInputElement;
       mediaSection.append(
         h('strong', 'Images, video and audio'),
-        h('p.muted', `The agent can make pictures, short videos, speech, music, sound effects and 3D models with a media service: ${lookedForOnItsOwn ? 'OAIY is found on its own' : `OAIY is looked for only when you press Find OAIY (this page never reaches out to your computer before that, and your browser may ask you to allow it)`}, and any server with OpenAI's /v1/images/generations, /v1/videos and /v1/audio/speech works. Now: ${status}${media.baseUrl ? ` (${abilities || 'no models chosen'})` : ''}.`),
+        h('p.muted', `The agent can make pictures, short videos, speech, music, sound effects and 3D models with a media service: ${oaiyFoundWords(oaiyState)}, and any server with OpenAI's /v1/images/generations, /v1/videos and /v1/audio/speech works. Now: ${status}${media.baseUrl ? ` (${abilities || 'no models chosen'})` : ''}.`),
         h('div.provider-form',
           h('label', 'Address', h('div.window-picker', address, find, listButton, ...(media.discovered ? [forget] : []))),
           h('label', 'API key', key),

@@ -6,6 +6,7 @@
  * OAIY Desktop dialog.
  */
 import { DESKTOP_ORIGIN, desktopHealth, pairingStatus, startPairing } from '../desktop/bridge';
+import { desktopLookingWords } from './linkWords';
 import { AU_PATTERN, DEFAULT_CALL_BACK_LINE, type Callback, type CallBackFilter, type Screening } from '../callbacks';
 import { COUNTRIES, countryOf, detectCountry, displayNumber } from '../phoneNumbers';
 import type { DesktopSettings, MessageSettings } from '../settings';
@@ -34,7 +35,7 @@ export interface PhoneDialog {
 export async function editPhone(options: PhoneDialog): Promise<MessageSettings | null> {
   let desktop = options.desktop;
   const phone = options.phone !== false;
-  const status = h('p.muted', options.given ? (phone ? "This is OAIY's own window: texts and calls to the phone come here." : "This is OAIY's own window: it is OAIY Desktop's.") : `Looking for OAIY Desktop at ${desktop?.origin ?? DESKTOP_ORIGIN}. This page reaches out to your computer only from here, so your browser may ask whether it may connect to your network: that is this.`);
+  const status = h('p.muted', desktopLookingWords(options.given ? { kind: 'given' } : desktop ? { kind: 'paired', origin: desktop.origin } : { kind: 'unpaired', origin: DESKTOP_ORIGIN }, phone));
   const code = h('div.pair-code');
   code.hidden = true;
   let pairing: AbortController | null = null;
