@@ -242,7 +242,8 @@ fn build(b: Build) -> Env {
     let (throttle_file, saved) = ThrottleFile::open(&auth.join("throttle.json"));
     guard.keep_throttle_in(throttle_file, saved.as_ref());
     let engine = Engine::new(b.hold);
-    let mut opts = LoginOptions::production(&move |n| env_vars.get(n).cloned(), 41000);
+    let mut opts =
+        LoginOptions::production(&move |n| env_vars.get(n).cloned(), 41000).expect("the options");
     opts.engine = engine.clone();
     opts.writer = disk.clone();
     opts.clock = clock.clone();
@@ -2713,6 +2714,49 @@ async fn wrong_passwords_of_a_client_that_hangs_up_still_revoke_a_session_in_the
             "{path}: five wrong answers, though every client hung up, revoke the session"
         );
     }
+}
+
+#[test]
+fn a_login_allow_list_with_an_entry_that_is_not_an_address_is_refused_and_not_trimmed() {
+    let with = |list: &'static str| {
+        move |name: &str| (name == "OAIY_LOGIN_ALLOW").then(|| list.to_string())
+    };
+    // A typo must not turn the restriction off (a list of what parsed, or an empty one, would let everyone in).
+    for bad in [
+        "203.0.113.0/24x",
+        "203.0.113.0/24, oops",
+        "oops",
+        "203.0.113.0/33",
+        "203.0.113.0/24;198.51.100.0/24",
+        ",",
+    ] {
+        let Err(refusal) = LoginOptions::production(&with(bad), 41000) else {
+            panic!("{bad:?} was accepted");
+        };
+        assert!(
+            refusal.to_string().contains("OAIY_LOGIN_ALLOW"),
+            "{bad:?}: {refusal}"
+        );
+    }
+    let Err(refusal) = LoginOptions::production(&with("203.0.113.0/24, oops, 9.9.9.9/40"), 41000)
+    else {
+        panic!("accepted");
+    };
+    assert!(
+        refusal.to_string().contains("oops") && refusal.to_string().contains("9.9.9.9/40"),
+        "every bad entry is named: {refusal}"
+    );
+    // What is right is taken, and nothing at all is no restriction.
+    let ok = LoginOptions::production(&with(" 203.0.113.0/24, 2001:db8::/32,"), 41000).unwrap();
+    assert_eq!(ok.login_allow.len(), 2);
+    assert!(LoginOptions::production(&with(""), 41000)
+        .unwrap()
+        .login_allow
+        .is_empty());
+    assert!(LoginOptions::production(&|_| None, 41000)
+        .unwrap()
+        .login_allow
+        .is_empty());
 }
 
 #[tokio::test]

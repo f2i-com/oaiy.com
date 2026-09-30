@@ -813,6 +813,47 @@ fn an_unreadable_or_mangled_owner_file_stops_the_server_with_exit_78_naming_it()
 }
 
 #[test]
+fn a_login_allow_list_with_a_typo_stops_the_server_with_exit_78_and_check_says_the_same() {
+    let scratch = Scratch::new("allow-typo");
+    for list in ["203.0.113.0/24x", "203.0.113.0/24, oops"] {
+        let mut server = Server::spawn(&scratch, &[("OAIY_LOGIN_ALLOW", list)], "server");
+        assert_eq!(
+            server.exit_code(Duration::from_secs(60)),
+            Some(78),
+            "{list:?}: {}",
+            server.stderr_text()
+        );
+        let stderr = server.stderr_text();
+        assert!(
+            stderr.contains("OAIY_LOGIN_ALLOW") && stderr.contains("not an address or a network"),
+            "{list:?}: {stderr}"
+        );
+        // Nothing listened, so nothing was open to the world for want of a restriction.
+        let checked = command(&scratch, &[("OAIY_LOGIN_ALLOW", list)])
+            .arg("check")
+            .output()
+            .unwrap();
+        assert_eq!(checked.status.code(), Some(78), "{list:?}");
+        assert!(
+            String::from_utf8_lossy(&checked.stderr).contains("OAIY_LOGIN_ALLOW"),
+            "{list:?}"
+        );
+    }
+    // A list that is right starts the server, and the restriction is there.
+    let mut server = Server::spawn(&scratch, &[("OAIY_LOGIN_ALLOW", "203.0.113.0/24")], "ok");
+    server.wait_until_up();
+    // The machine itself is not in the list: the sign-in is refused, before the password is looked at.
+    let r = login(&server, PASSWORD);
+    assert_eq!(
+        (r.status, r.body["error"]["code"].as_str()),
+        (403, Some("login_not_allowed")),
+        "{}",
+        r.text
+    );
+    let _ = server.exit_code(Duration::from_millis(1));
+}
+
+#[test]
 fn check_is_ok_on_a_good_configuration_and_lists_every_violation_on_a_bad_one() {
     let scratch = Scratch::new("check");
     let ok = console(&scratch, &["check"]);
@@ -940,7 +981,10 @@ fn a_flood_of_logins_whose_clients_hang_up_is_bounded_and_counted() {
         v["mostAtOnce"].as_u64().unwrap(),
         v["bound"].as_u64().unwrap(),
     );
-    eprintln!("hang-up flood: {v}, recent failures {}", status["recentFailures"]);
+    eprintln!(
+        "hang-up flood: {v}, recent failures {}",
+        status["recentFailures"]
+    );
     assert_eq!(bound, 3);
     assert!(started >= 3, "the flood started passes: {v}");
     assert!(

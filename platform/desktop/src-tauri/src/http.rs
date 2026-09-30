@@ -1504,7 +1504,8 @@ pub async fn serve(
     // store does, a file it cannot read (a mangled or unreadable owner file is a startup error, never setup-only).
     #[cfg(feature = "web")]
     let login = if access.mode.is_enforcing() && !gui_mode && crate::auth::login::can_host(&guard) {
-        let opts = crate::auth::login::LoginOptions::production(&|name| std::env::var(name).ok(), port);
+        let opts =
+            crate::auth::login::LoginOptions::production(&|name| std::env::var(name).ok(), port)?;
         let state = crate::auth::login::enable(&guard, &data_dir_for_auth.join("auth"), opts)?;
         tokio::spawn(crate::auth::login::maintain_forever(state.clone()));
         // One banner with no secret in it: not through the log facade, which the journal and the ring keep.

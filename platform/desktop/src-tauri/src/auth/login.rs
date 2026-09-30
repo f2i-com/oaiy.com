@@ -120,8 +120,12 @@ pub struct LoginOptions {
 }
 
 impl LoginOptions {
-    /// The real thing, from the environment: `OAIY_PUBLIC_URL` and `OAIY_LOGIN_ALLOW`.
-    pub fn production(env: &dyn Fn(&str) -> Option<String>, port: u16) -> LoginOptions {
+    /// The real thing, from the environment: `OAIY_PUBLIC_URL` and `OAIY_LOGIN_ALLOW` (a list with an entry that is
+    /// not an address or a network is refused, see [`parse_login_allow`]).
+    pub fn production(
+        env: &dyn Fn(&str) -> Option<String>,
+        port: u16,
+    ) -> Result<LoginOptions, ConfigRefusal> {
         let get = |name: &str| {
             env(name)
                 .map(|v| v.trim().to_string())
@@ -140,21 +144,11 @@ impl LoginOptions {
                 }
             }
         }
-        let mut login_allow = Vec::new();
-        if let Some(list) = get("OAIY_LOGIN_ALLOW") {
-            for entry in list.split(',').map(str::trim).filter(|e| !e.is_empty()) {
-                match Cidr::parse(entry) {
-                    Some(c) => login_allow.push(c),
-                    None => log::warn!(
-                        "{}",
-                        scrub_line(&format!(
-                            "OAIY_LOGIN_ALLOW: {entry:?} is not an address or a network: ignored"
-                        ))
-                    ),
-                }
-            }
-        }
-        LoginOptions {
+        let login_allow = match get("OAIY_LOGIN_ALLOW") {
+            Some(list) => parse_login_allow(&list)?,
+            None => Vec::new(),
+        };
+        Ok(LoginOptions {
             port,
             dash_origin,
             hosts,
@@ -164,8 +158,39 @@ impl LoginOptions {
             writer: Arc::new(SecureWriter),
             clock: Arc::new(SystemClock),
             mono: Arc::new(MonotonicClock::new()),
+        })
+    }
+}
+
+/// `OAIY_LOGIN_ALLOW`: the addresses and networks a sign-in may come from. The list is refused whole if any entry is not
+/// an address or a network, and if it names none: the restriction is a security setting, and a typo must not turn it
+/// off by being skipped (what parsed would be a shorter list, or an empty one, which lets everyone in). Not set, or
+/// empty, is no restriction; that is the only way to have none.
+pub fn parse_login_allow(list: &str) -> Result<Vec<Cidr>, ConfigRefusal> {
+    let mut allowed = Vec::new();
+    let mut bad = Vec::new();
+    for entry in list.split(',').map(str::trim).filter(|e| !e.is_empty()) {
+        match Cidr::parse(entry) {
+            Some(c) => allowed.push(c),
+            None => bad.push(entry),
         }
     }
+    let refusal = |what: String| {
+        Err(ConfigRefusal(scrub_line(&format!(
+            "OAIY_LOGIN_ALLOW: {what}; the sign-in restriction would not be what was meant, so the server does not start (use addresses and networks like 203.0.113.7, 203.0.113.0/24 or 2001:db8::/32, or unset it to allow every address)"
+        ))))
+    };
+    if !bad.is_empty() {
+        let named: Vec<String> = bad.iter().map(|e| format!("{e:?}")).collect();
+        return refusal(format!(
+            "{} is not an address or a network",
+            named.join(", ")
+        ));
+    }
+    if allowed.is_empty() {
+        return refusal("the list names no address or network".to_string());
+    }
+    Ok(allowed)
 }
 
 // ---- the state ----------------------------------------------------------------------------------

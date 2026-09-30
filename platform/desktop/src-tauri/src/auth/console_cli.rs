@@ -1069,13 +1069,10 @@ pub fn check(env: &dyn Fn(&str) -> Option<String>) -> Report {
     // What the server reads leniently and ignores: worth a warning here.
     let (_, warnings) = super::guard::GuardConfig::from_env(env, bind_all, false, 17972);
     report.warnings.extend(warnings);
+    // A list with a typo in it is refused, as the server refuses it: the restriction is a security setting.
     if let Some(list) = get("OAIY_LOGIN_ALLOW") {
-        for entry in list.split(',').map(str::trim).filter(|e| !e.is_empty()) {
-            if super::clientip::Cidr::parse(entry).is_none() {
-                report.warnings.push(format!(
-                    "OAIY_LOGIN_ALLOW: {entry:?} is not an address or a network: ignored"
-                ));
-            }
+        if let Err(refusal) = super::login::parse_login_allow(&list) {
+            report.violations.push(refusal.to_string());
         }
     }
     report
@@ -1432,19 +1429,53 @@ mod tests {
     #[test]
     fn check_warns_of_what_the_server_would_ignore_and_does_not_refuse_it() {
         let dir = TempDir::new("check-warn");
-        let r = check_in(
-            &dir,
-            &[
-                ("OAIY_PUBLIC_URL", "http://not-https.example.com"),
-                ("OAIY_LOGIN_ALLOW", "203.0.113.0/24, nonsense"),
-            ],
-        );
+        let r = check_in(&dir, &[("OAIY_PUBLIC_URL", "http://not-https.example.com")]);
         assert!(r.violations.is_empty(), "{r:?}");
         let text = r.warnings.join("\n");
+        assert!(text.contains("OAIY_PUBLIC_URL"), "{text}");
+    }
+
+    #[test]
+    fn check_refuses_a_login_allow_list_with_any_entry_that_is_not_an_address_or_a_network() {
+        let dir = TempDir::new("check-allow");
+        // A typo does not turn the restriction off: the whole list is refused, and every bad entry is named.
+        for list in [
+            "203.0.113.0/24x",
+            "203.0.113.0/24, nonsense",
+            "203.0.113.0/33",
+            "203.0.113.256",
+            "2001:db8::/129",
+            "203.0.113.0/24;198.51.100.0/24",
+            ",",
+        ] {
+            let r = check_in(&dir, &[("OAIY_LOGIN_ALLOW", list)]);
+            assert_eq!(r.violations.len(), 1, "{list:?}: {r:?}");
+            assert!(r.violations[0].contains("OAIY_LOGIN_ALLOW"), "{list:?}");
+        }
+        let r = check_in(
+            &dir,
+            &[("OAIY_LOGIN_ALLOW", "203.0.113.0/24, nonsense, 9.9.9.9/40")],
+        );
+        let text = r.violations.join("\n");
         assert!(
-            text.contains("OAIY_PUBLIC_URL") && text.contains("nonsense"),
+            text.contains("nonsense") && text.contains("9.9.9.9/40"),
             "{text}"
         );
+        // What is right passes: v4 and v6, single addresses and networks, spaces and a trailing comma.
+        for list in [
+            "203.0.113.7",
+            "203.0.113.0/24",
+            "2001:db8::/32, 203.0.113.0/24,",
+            " 198.51.100.1 ,203.0.113.0/24 ",
+        ] {
+            let r = check_in(&dir, &[("OAIY_LOGIN_ALLOW", list)]);
+            assert!(r.violations.is_empty(), "{list:?}: {r:?}");
+        }
+        // Not set, or empty: no restriction, as before.
+        assert!(check_in(&dir, &[]).violations.is_empty());
+        assert!(check_in(&dir, &[("OAIY_LOGIN_ALLOW", "  ")])
+            .violations
+            .is_empty());
     }
 
     #[test]
