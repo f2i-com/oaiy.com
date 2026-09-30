@@ -1615,7 +1615,25 @@ def pair_item_id(pid: str, n: int) -> str:
     return pid if n == 1 else f"{pid}.{n}"
 
 
+def response_status(state: str, same_as_accepted: bool, rejects_left_open: bool = False) -> int:
+    """The status a phone's response gets in each state (README 10.1 and Interpretation 51): 202 in the open state, and 202 again in
+    answered, approved and denied for the very response the state holds (a retry whose 202 was lost), else 409; 404 for an ended one."""
+    if state in ("burned", "expired"):
+        return 404
+    if state == "open":
+        return 202
+    if state in ("answered", "approved", "denied"):
+        return 202 if same_as_accepted else 409
+    raise Conflict(state)
+
+
 PID3 = A3["expected"]["pid"]
+rule("pairing states: the identical response again is 202 in the answered, approved and denied states (a retry whose 202 was lost)",
+     lambda: all(response_status(s, True) == 202 for s in ("answered", "approved", "denied")))
+rule("pairing states: a different response is 409 in the answered, approved and denied states",
+     lambda: all(response_status(s, False) == 409 for s in ("answered", "approved", "denied")))
+rule("pairing states: a response is 202 in the open state whatever it says (a reject discarded the earlier one) and 404 once ended",
+     lambda: response_status("open", True) == 202 and response_status("open", False) == 202 and response_status("burned", True) == 404 and response_status("expired", False) == 404)
 rule("pairing states: a response opens the answered state, a reject reopens it, the third reject ends it",
      lambda: (pairing_next("open", "response"), pairing_next("answered", "reject", rejects=0), pairing_next("answered", "reject", rejects=1),
               pairing_next("answered", "reject", rejects=2)) == ("answered", "open", "open", "expired"))

@@ -131,11 +131,16 @@ test('4.10.6 the rendezvous lives 600 s by default and at most 900 s; ttl is an 
     eq(Relay::T0 + 1, $c4->open([], 1)['json']['exp']);
 });
 
-test('4.10.3 step 1: a pid that exists is 409 conflict, whoever asks; the original rendezvous is untouched', function () {
+test('4.10.3 step 1: a pid that exists is 409 conflict for any request that is not the same desktop\'s identical one; the original rendezvous is untouched', function () {
     [$r, $d, $c] = pair_setup();
     eq(201, $c->open()['status']);
     $d2 = $r->desktop('Second');
-    $mine = $c->open();
+    foreach (['another mac' => ['mac' => B64::enc(random_bytes(32))], 'another offer' => ['offer' => $c->offerText . ' '], 'another app' => ['appId' => 'other']] as $label => $over) {
+        $mine = $c->open($over);
+        ok(in_array($mine['status'], [400, 409, 403], true), "$label: " . $mine['status']);
+        neq(201, $mine['status'], $label);
+    }
+    $mine = $c->open(['mac' => B64::enc(random_bytes(32))]);
     eq(409, $mine['status']);
     eq('conflict', pair_code($mine));
     $c2 = clone $c;
@@ -143,6 +148,94 @@ test('4.10.3 step 1: a pid that exists is 409 conflict, whoever asks; the origin
     $res = $r->call($d2, 'POST', '/v1/pair', array_merge($c->createDoc(), ['offer' => str_replace($d->id, $d2->id, $c->offerText)]));
     ok(in_array($res['status'], [400, 409], true), 'another desktop cannot take the pid either (' . $res['status'] . ')');
     eq($c->offerText, pair_row($r, $c->pid)['offer']);
+});
+
+test('4.10.3 a retry of the desktop\'s POST /v1/pair whose answer was lost gets the original answer (201, the original expiry) and changes nothing, in whatever state the rendezvous has reached; a request that differs at all stays 409', function () {
+    [$r, $d, $c] = pair_setup();
+    $first = $c->open([], 300);
+    eq(201, $first['status']);
+    Tmp::setClock(Relay::T0 + 50);
+    $again = $c->open([], 600); // a retry with another ttl: the rendezvous is the one that was made
+    eq(201, $again['status'], $again['body']);
+    eq([$first['json']['pid'], $first['json']['exp']], [$again['json']['pid'], $again['json']['exp']], 'the original expiry, not a new one');
+    eq(1, (int)$r->ctx()->db->val('SELECT COUNT(*) FROM pairings WHERE pid = ?', [$c->pid]));
+    eq(Relay::T0 + 300, (int)pair_row($r, $c->pid)['exp']);
+    $c->answer();
+    eq(201, $c->open()['status'], 'answered');
+    $c->decide();
+    eq(201, $c->open()['status'], 'approved');
+    foreach (['another mac' => ['mac' => B64::enc(random_bytes(32))], 'another offer' => ['offer' => $c->offerText . ' ']] as $label => $over) {
+        neq(201, $c->open($over)['status'], "$label stays refused");
+    }
+    // Another desktop with the very same request is not the desktop that made it.
+    $d2 = $r->desktop('Second');
+    $res = $r->call($d2, 'POST', '/v1/pair', $c->createDoc());
+    ok($res['status'] >= 400 && $res['status'] < 500, 'another desktop: ' . $res['status']);
+    eq(1, (int)$r->ctx()->db->val('SELECT COUNT(*) FROM pairings WHERE pid = ?', [$c->pid]));
+    // A retry is not counted twice against the 16 that may be open.
+    [$r2, $d2b] = pair_setup();
+    $ceremonies = [];
+    for ($i = 0; $i < 16; $i++) {
+        $ceremonies[$i] = Ceremony::random($r2, $d2b);
+        eq(201, $ceremonies[$i]->open()['status']);
+    }
+    eq(201, $ceremonies[7]->open()['status'], 'the 16th open and a retry of the 8th: still fine');
+    eq(429, Ceremony::random($r2, $d2b)->open()['status'], 'a 17th is not');
+    eq(16, (int)$r2->ctx()->db->val("SELECT COUNT(*) FROM pairings WHERE state = 'open'"));
+});
+
+test('4.10.3 a retry of the phone\'s response whose 202 was lost is answered 202 again and changes nothing (while it is answered, and after the owner has decided); a different response stays 409; a response a reject discarded is a new one', function () {
+    foreach (['answered', 'approved', 'denied'] as $stage) {
+        [$r, $d, $c] = pair_setup();
+        $c->open();
+        $text = $c->responseText();
+        eq(202, $c->answer($text)['status']);
+        if ($stage === 'approved') {
+            eq(200, $c->decide()['status']);
+        } elseif ($stage === 'denied') {
+            eq(200, $c->decide(['approve' => false])['status']);
+        }
+        $before = [pair_row($r, $c->pid), count(pair_items($r, $d))];
+        $retry = $c->answer($text);
+        eq(202, $retry['status'], "$stage: " . $retry['body']);
+        eq('answered', $retry['json']['state'], "$stage: the original body");
+        eq($before, [pair_row($r, $c->pid), count(pair_items($r, $d))], "$stage: nothing changed");
+        eq(1, count(pair_items($r, $d)), "$stage: still one pair item");
+        $other = $c->answer($c->responseText(array_merge($c->claims(), ['displayName' => 'Rival'])));
+        eq([409, 'already_answered'], [$other['status'], pair_code($other)], "$stage: a different response");
+        eq(409, $c->answer($text . ' ')['status'], "$stage: not the same text (one byte more is another response, not a retry)");
+    }
+    // The metadata of the pair item is remembered for ten minutes only: once it is gone a retry after the decision is 409, as before.
+    [$r, $d, $c] = pair_setup();
+    $c->open();
+    $text = $c->responseText();
+    $c->answer($text);
+    $c->decide();
+    $r->ctx()->db->exec("DELETE FROM items WHERE lane = 'pair'");
+    $r->ctx()->db->exec('UPDATE mailboxes SET live_items = 0, live_bytes = 0, bulk_items = 0, bulk_bytes = 0');
+    eq(409, $c->answer($text)['status']);
+    // After a reject the rendezvous is open again: the response it discarded is taken as a new one, in its own item.
+    [$r, $d, $c] = pair_setup();
+    $c->open();
+    $text = $c->responseText();
+    eq(202, $c->answer($text)['status']);
+    eq(200, $c->reject()['status']);
+    eq(202, $c->answer($text)['status'], 'the same text again after a reject');
+    eq([$c->pid, $c->pid . '.2'], array_column(pair_items($r, $d), 'id'));
+    eq(2, (int)pair_row($r, $c->pid)['responses']);
+    // A retry is compared with the response that was accepted LAST (its own item, pid.2 here), not with the first: after a reject and
+    // a second response the owner approves; the second text is the retry, and a different one (the first, discarded) is not.
+    [$r, $d, $c] = pair_setup();
+    $c->open();
+    $first = $c->responseText();
+    $second = $c->responseText(array_merge($c->claims(), ['displayName' => 'Second try']));
+    eq(202, $c->answer($first)['status']);
+    eq(200, $c->reject()['status']);
+    eq(202, $c->answer($second)['status']);
+    eq(200, $c->decide()['status']);
+    eq(202, $c->answer($second)['status'], 'the response the owner decided on, again');
+    eq(409, $c->answer($first)['status'], 'the one a reject discarded is not what was accepted last');
+    eq([$c->pid, $c->pid . '.2'], array_column(pair_items($r, $d), 'id'));
 });
 
 test('4.10.3 step 1: a finished rendezvous that the garbage collector has not reached yet does not hold its pid', function () {
@@ -155,6 +248,8 @@ test('4.10.3 step 1: a finished rendezvous that the garbage collector has not re
     eq(201, $c2->open()['status']);
     eq(200, $c2->burn()['status']);
     eq(201, $c2->open()['status'], 'a burned rendezvous does not hold its pid');
+    eq('open', pair_row($r2, $c2->pid)['state'], 'and the new one is a live rendezvous, not the burned one answered again');
+    eq(200, $c2->get()['status']);
 });
 
 test('4.10.3 step 1: the request is checked before anything is stored: pid, offer, mac, appId and thumbprint have their exact shapes (400), and the app must be allowed', function () {
@@ -479,7 +574,7 @@ test('4.10.6 three responses are accepted (a reject reopens the rendezvous each 
         $texts[$n] = $c->responseText(array_merge($c->claims(), ['displayName' => "Try $n"]));
         $res = $c->answer($texts[$n]);
         eq(202, $res['status'], "response $n: " . $res['body']);
-        $fourth = $c->answer($texts[$n]);
+        $fourth = $c->answer($c->responseText(array_merge($c->claims(), ['displayName' => "Rival $n"])));
         eq(409, $fourth['status'], "another while answered $n");
         eq('already_answered', pair_code($fourth));
         $rej = $c->reject();
@@ -501,7 +596,7 @@ test('4.10.6 a fourth response is 409 while the third is still waiting for the o
         eq(200, $c->reject()['status']);
     }
     eq(202, $c->answer()['status'], 'the third');
-    $res = $c->answer();
+    $res = $c->answer($c->responseText(array_merge($c->claims(), ['displayName' => 'Fourth'])));
     eq(409, $res['status'], 'the fourth');
     eq('already_answered', pair_code($res));
     eq(3, (int)pair_row($r, $c->pid)['responses']);
@@ -512,14 +607,15 @@ test('4.10.3 step 4: a response is refused after a decision (409) and after a bu
     $c->open();
     $c->answer();
     $c->decide();
-    $res = $c->answer();
+    $other = fn(Ceremony $x): string => $x->responseText(array_merge($x->claims(), ['displayName' => 'Somebody else']));
+    $res = $c->answer($other($c));
     eq(409, $res['status']);
     eq('already_answered', pair_code($res));
     [$r2, $d2, $c2] = pair_setup();
     $c2->open();
     $c2->answer();
     $c2->decide(['approve' => false]);
-    eq(409, $c2->answer()['status'], 'after a denial');
+    eq(409, $c2->answer($other($c2))['status'], 'after a denial');
     [$r3, $d3, $c3] = pair_setup();
     $c3->open();
     $c3->burn();
@@ -1186,6 +1282,7 @@ test('4.10.3 the state table: every operation in every state gives the answer th
     $table = [
         'GET' => [200, 200, 200, 200, 404, 404, 404],
         'response' => [202, 409, 409, 409, 404, 404, 404],
+        'response again' => [202, 202, 202, 202, 404, 404, 404], // the same text as the one accepted: a retry whose 202 was lost
         'approve' => [409, 200, 200, 409, 410, 410, 410],
         'deny' => [409, 200, 409, 200, 410, 410, 410],
         'reject' => [409, 200, 409, 409, 410, 410, 410],
@@ -1200,7 +1297,10 @@ test('4.10.3 the state table: every operation in every state gives the answer th
                 case 'GET':
                     $res = $c->get();
                     break;
-                case 'response':
+                case 'response': // another response than the one the state holds
+                    $res = $c->answer($c->responseText(array_merge($c->claims(), ['displayName' => 'A second phone'])));
+                    break;
+                case 'response again': // the very response the state holds (or the first one, in the open state)
                     $res = $c->answer();
                     break;
                 case 'approve':

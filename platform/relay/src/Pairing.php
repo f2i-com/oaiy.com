@@ -133,12 +133,25 @@ final class Pairing
         $now = Clock::now();
         $exp = $now + $ttl;
         try {
-            $ctx->db->write(function (Db $db) use ($p, $pid, $offer, $mac, $appId, $thumb, $now, $exp): void {
+            return $ctx->db->write(function (Db $db) use ($p, $pid, $offer, $mac, $appId, $thumb, $now, $exp): array {
                 // The count below is of rows that do not exist yet: two opens by one desktop must not both count 15 and both make the
                 // 16th and 17th. The gate is taken first, before any read, so the second waits for the first to commit and counts it.
                 $db->gate('pair:' . $p->id);
-                // A finished rendezvous the garbage collector has not reached yet does not hold its pid.
-                $db->exec('DELETE FROM pairings WHERE pid = ? AND (exp <= ? OR state = ?)', [$pid, $now, 'expired']);
+                $row = $db->one('SELECT desktop_dev, app_id, offer, mac, desktop_thumb, exp, state FROM pairings WHERE pid = ?' . $db->forUpdate(), [$pid]);
+                if ($row !== null) {
+                    if ($row['exp'] > $now && $row['state'] !== 'expired') {
+                        // The pid is in use. The same desktop's identical request is a retry of one whose answer was lost: it gets the
+                        // original answer (a 201 with the original expiry) and nothing changes or is counted twice. Any difference is a
+                        // conflict, which tells a stranger nothing (pids are 128 bits from a secret the relay never sees).
+                        if (hash_equals((string)$row['desktop_dev'], $p->id) && hash_equals((string)$row['offer'], $offer) && hash_equals((string)$row['mac'], $mac)
+                            && $row['app_id'] === $appId && $row['desktop_thumb'] === $thumb) {
+                            return ['pid' => $pid, 'exp' => (int)$row['exp']];
+                        }
+                        throw ApiError::make('conflict');
+                    }
+                    // A finished rendezvous the garbage collector has not reached yet does not hold its pid.
+                    $db->exec('DELETE FROM pairings WHERE pid = ?', [$pid]);
+                }
                 $open = (int)$db->val("SELECT COUNT(*) FROM pairings WHERE desktop_dev = ? AND exp > ? AND state IN ('open', 'answered')", [$p->id, $now]);
                 if ($open >= self::OPEN_PER_DESKTOP) {
                     throw new ApiError(429, 'quota_exceeded', null, 5);
@@ -148,14 +161,14 @@ final class Pairing
                     'state' => 'open', 'response' => null, 'rejects' => 0, 'responses' => 0, 'gets' => 0, 'phone_dev' => null,
                     'sealed_token' => null, 'receipt' => null, 'created_at' => $now, 'exp' => $exp, 'read_at' => null,
                 ]);
+                return ['pid' => $pid, 'exp' => $exp];
             });
         } catch (\PDOException $e) {
             if (Db::isDuplicate($e)) {
-                throw ApiError::make('conflict');
+                throw ApiError::make('conflict'); // another desktop's request for the same pid won the race between the read and the insert
             }
             throw $e;
         }
-        return ['pid' => $pid, 'exp' => $exp];
     }
 
     // ---------------------------------------------------------------- POST /v1/pair/{pid}/response
@@ -183,6 +196,9 @@ final class Pairing
                 throw ApiError::make('not_found');
             }
             if ($row['state'] !== 'open' || $row['responses'] >= self::RESPONSES_MAX) {
+                if (self::isRetryOfAccepted($db, $row, $text)) {
+                    return ''; // the phone's retry of a response that was accepted (its 202 was lost): the same answer, nothing changes
+                }
                 throw ApiError::make('already_answered');
             }
             // The row is locked by the read above; the state, the count of responses and the change are still one statement, so a
@@ -197,8 +213,34 @@ final class Pairing
             $ctx->mb->post('dev:' . $row['desktop_dev'], 'pair', $itemId, 'relay', $ttl, '{"ct":"json"}', null, null, $text, true);
             return (string)$row['desktop_dev'];
         });
+        if ($desktop === '') {
+            return; // a retry: nothing was written, so nobody needs waking
+        }
         $ctx->signals->wakeWrite('pair:' . $pid);
         $ctx->signals->wakeWrite('dev:' . $desktop); // the item was committed with the state change; wake the desktop's poll again
+    }
+
+    /**
+     * Is $text the response this rendezvous accepted last? While it is answered the stored text says; once the owner has decided the
+     * text is gone, and the pair item that carried it (its id is <pid>, <pid>.2 or <pid>.3 by the response's number) keeps its hash
+     * for the ten minutes the relay remembers items. A response that an earlier reject discarded is not the current one: the
+     * rendezvous is open again and takes it as a new response.
+     * @param array<string,mixed> $row
+     */
+    private static function isRetryOfAccepted(Db $db, array $row, string $text): bool
+    {
+        $n = (int)$row['responses'];
+        if ($n < 1) {
+            return false;
+        }
+        if ($row['state'] === 'answered') {
+            return $row['response'] !== null && hash_equals((string)$row['response'], $text);
+        }
+        if ($row['state'] === 'approved' || $row['state'] === 'denied') {
+            $hash = $db->val("SELECT body_hash FROM items WHERE mailbox = ? AND lane = 'pair' AND sender = 'relay' AND id = ?", ['dev:' . $row['desktop_dev'], $n === 1 ? $row['pid'] : $row['pid'] . '.' . $n]);
+            return $hash !== null && hash_equals((string)$hash, hash('sha256', $text));
+        }
+        return false;
     }
 
     // ---------------------------------------------------------------- POST /v1/pair/{pid}/decision
