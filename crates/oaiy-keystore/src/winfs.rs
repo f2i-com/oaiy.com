@@ -1,0 +1,171 @@
+//! Two questions about an open Windows handle that `std` answers only on nightly (`windows_by_handle`) or not at all: **which file is this** (the volume and the
+//! file index, what the operating system itself says two handles have in common when they are one file; and its attributes), and **where is it really** (the final path, with every
+//! junction and symbolic link on the way resolved). The keystore holds its keys folder open and needs both (review M-1): to compare the folder it holds with the
+//! folder its path leads to now, and to work in the folder it holds, by its real path, and not in whatever a path with a junction in it leads to at this moment.
+//!
+//! This is the second module of the crate with `unsafe`, and the only other one (the first is `dpapi.rs`): three calls into `kernel32`, each on a handle that a
+//! `&File` keeps open for the length of the call, each with a buffer that this module owns. Nothing here keeps a pointer after it returns.
+
+use core::ffi::c_void;
+use core::mem::size_of;
+use std::ffi::OsString;
+use std::fs::File;
+use std::io;
+use std::os::windows::ffi::OsStringExt;
+use std::os::windows::io::AsRawHandle;
+use std::path::PathBuf;
+
+use windows_sys::Win32::Foundation::HANDLE;
+use windows_sys::Win32::Storage::FileSystem::{
+    FileIdInfo, GetFileInformationByHandle, GetFileInformationByHandleEx, GetFinalPathNameByHandleW, BY_HANDLE_FILE_INFORMATION, FILE_ID_INFO,
+    FILE_NAME_NORMALIZED, VOLUME_NAME_DOS, VOLUME_NAME_GUID,
+};
+
+/// What makes a file the same file: the volume it is on and its index there. Two handles with equal ids are two ways into one file or folder, whatever path each was
+/// opened by (this is how a hard link, a junction and a subst drive are told from a different file).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct FileId {
+    volume: u64,
+    index: u128,
+}
+
+/// What the file system says about an open file.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct Info {
+    /// Which file.
+    pub id: FileId,
+    /// The attribute bits (`FILE_ATTRIBUTE_*`).
+    pub attributes: u32,
+}
+
+fn handle_of(file: &File) -> HANDLE {
+    file.as_raw_handle() as HANDLE
+}
+
+/// The id and the attributes of an open file or folder. The id is the 128-bit file id where the file system has one (NTFS and ReFS do, from
+/// Windows 8 on) and the 64-bit index otherwise.
+pub(crate) fn info(file: &File) -> io::Result<Info> {
+    let handle = handle_of(file);
+    // SAFETY: an all-zero `BY_HANDLE_FILE_INFORMATION` is a valid value (integers and two `FILETIME`s of integers).
+    let mut basic: BY_HANDLE_FILE_INFORMATION = unsafe { core::mem::zeroed() };
+    // SAFETY: `handle` is open for as long as `file` is borrowed, which covers the call; `basic` is a valid, writable structure of the type the call expects.
+    if unsafe { GetFileInformationByHandle(handle, &mut basic) } == 0 {
+        return Err(io::Error::last_os_error());
+    }
+    // SAFETY: an all-zero `FILE_ID_INFO` is a valid value (a 64-bit integer and sixteen bytes).
+    let mut wide: FILE_ID_INFO = unsafe { core::mem::zeroed() };
+    // SAFETY: as above; the buffer is `wide`, `size_of::<FILE_ID_INFO>()` bytes, which is what the `FileIdInfo` class writes.
+    let have_wide = unsafe {
+        GetFileInformationByHandleEx(handle, FileIdInfo, (&mut wide as *mut FILE_ID_INFO).cast::<c_void>(), size_of::<FILE_ID_INFO>() as u32)
+    } != 0;
+    let id = if have_wide {
+        FileId { volume: wide.VolumeSerialNumber, index: u128::from_le_bytes(wide.FileId.Identifier) }
+    } else {
+        FileId { volume: u64::from(basic.dwVolumeSerialNumber), index: (u128::from(basic.nFileIndexHigh) << 32) | u128::from(basic.nFileIndexLow) }
+    };
+    Ok(Info { id, attributes: basic.dwFileAttributes })
+}
+
+/// The real path of an open file or folder: the name the file system knows it by, from the root of its volume, with no junction and no symbolic link in it
+/// (`\\?\C:\...`, or `\\?\Volume{...}\...` for a volume that has no drive letter). A folder that is held open cannot be renamed, so this stays true for as long as
+/// the handle is open.
+pub(crate) fn final_path(file: &File) -> io::Result<PathBuf> {
+    let handle = handle_of(file);
+    let mut last = io::Error::other("no path");
+    for flags in [FILE_NAME_NORMALIZED | VOLUME_NAME_DOS, FILE_NAME_NORMALIZED | VOLUME_NAME_GUID] {
+        let mut buffer = vec![0u16; 512];
+        loop {
+            // SAFETY: `handle` is open for the call; `buffer` is a valid, writable array of `buffer.len()` UTF-16 units, which is the size passed.
+            let length = unsafe { GetFinalPathNameByHandleW(handle, buffer.as_mut_ptr(), buffer.len() as u32, flags) } as usize;
+            if length == 0 {
+                last = io::Error::last_os_error();
+                break;
+            }
+            if length < buffer.len() {
+                return Ok(PathBuf::from(OsString::from_wide(&buffer[..length])));
+            }
+            // too small: `length` is the size that is needed, terminator included
+            buffer.resize(length + 1, 0);
+        }
+    }
+    Err(last)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::fs::OpenOptions;
+    use std::os::windows::fs::OpenOptionsExt;
+
+    fn scratch(tag: &str) -> PathBuf {
+        let nanos = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_nanos()).unwrap_or(0);
+        let dir = std::env::temp_dir().join(format!("oaiy-keystore-winfs-{tag}-{}-{nanos}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    fn folder(path: &std::path::Path) -> File {
+        OpenOptions::new().read(true).share_mode(7).custom_flags(0x0200_0000 | 0x0020_0000).open(path).unwrap()
+    }
+
+    /// Two handles to one file have one id, however they were opened; two files have two; a hard link is another name of the same file.
+    #[test]
+    fn the_id_is_the_file_and_a_hard_link_is_the_same_file() {
+        let dir = scratch("id");
+        let (a, b) = (dir.join("a"), dir.join("b"));
+        std::fs::write(&a, b"x").unwrap();
+        std::fs::write(&b, b"x").unwrap();
+        let (first, second) = (File::open(&a).unwrap(), File::open(&a).unwrap());
+        let other = File::open(&b).unwrap();
+        assert_eq!(info(&first).unwrap().id, info(&second).unwrap().id);
+        assert_ne!(info(&first).unwrap().id, info(&other).unwrap().id);
+        std::fs::hard_link(&a, dir.join("a2")).unwrap();
+        let linked = File::open(dir.join("a2")).unwrap();
+        assert_eq!(info(&linked).unwrap().id, info(&first).unwrap().id, "a hard link is the same file");
+        // a folder is a folder: the directory attribute, and its own id
+        let held = folder(&dir);
+        let dir_info = info(&held).unwrap();
+        assert_ne!(dir_info.attributes & 0x10, 0);
+        assert_ne!(dir_info.id, info(&first).unwrap().id);
+        drop((first, second, other, linked, held));
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// The final path is the real one: a junction on the way to the folder is resolved, so that the path and the folder are not two things that can come apart.
+    #[test]
+    fn the_final_path_has_no_junction_in_it() {
+        let dir = scratch("final");
+        std::fs::create_dir_all(dir.join("real").join("keys")).unwrap();
+        let link = dir.join("link");
+        let made = std::process::Command::new("cmd").args(["/C", "mklink", "/J"]).arg(&link).arg(dir.join("real")).output().unwrap();
+        assert!(made.status.success(), "mklink /J failed");
+        let through_the_junction = folder(&link.join("keys"));
+        let direct = folder(&dir.join("real").join("keys"));
+        let (via, real) = (final_path(&through_the_junction).unwrap(), final_path(&direct).unwrap());
+        assert_eq!(via, real, "one folder, one real path");
+        let shown = real.to_string_lossy().to_lowercase();
+        assert!(shown.starts_with(r"\\?\") && shown.ends_with(r"\real\keys") && !shown.contains("link"), "{shown}");
+        assert_eq!(info(&through_the_junction).unwrap().id, info(&direct).unwrap().id);
+        drop((through_the_junction, direct));
+        std::fs::remove_dir(&link).unwrap();
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// A path longer than the first buffer (512 units) is returned whole.
+    #[test]
+    fn a_path_longer_than_the_first_buffer_is_returned_whole() {
+        let dir = scratch("long");
+        let mut deep = dir.clone();
+        while deep.to_string_lossy().len() < 600 {
+            deep = deep.join("a-folder-with-a-rather-long-name-so-that-the-path-gets-long-quickly");
+        }
+        let verbatim = PathBuf::from(format!(r"\\?\{}", deep.display()));
+        std::fs::create_dir_all(&verbatim).unwrap();
+        let held = folder(&verbatim);
+        let path = final_path(&held).unwrap();
+        assert!(path.to_string_lossy().len() > 512, "{}", path.display());
+        assert!(path.to_string_lossy().to_lowercase().ends_with("so-that-the-path-gets-long-quickly"));
+        drop(held);
+        std::fs::remove_dir_all(PathBuf::from(format!(r"\\?\{}", dir.display()))).unwrap();
+    }
+}

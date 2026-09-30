@@ -10,10 +10,13 @@
 //!   refused. The folder is judged again before each operation (owner, mode) and compared with the path (same device and inode): a folder that was
 //!   replaced, moved or removed is an error, never "nothing stored". At open the directories **above** are judged too, by walking `..` from the descriptor
 //!   ([`crate::perm::check_ancestor`]): not owned by another user, not writable by others unless sticky.
-//! - **Windows:** a handle to the folder held open **without `FILE_SHARE_DELETE`**, so that nobody can rename or remove the folder, or a folder above it,
-//!   while the store is open: the same guarantee by other means. The folder is opened as itself (`FILE_FLAG_OPEN_REPARSE_POINT`) and refused if it is a
-//!   junction or a symbolic link, and every file is opened as itself and refused if it is a reparse point or not a regular file. The handle is also what
-//!   the store flushes after a rename, so that the new name survives a power cut.
+//! - **Windows:** a handle to the folder held open **without `FILE_SHARE_DELETE`**, so that nobody can rename or remove the folder, or a **real** folder above it,
+//!   while the store is open. That does not hold for a junction or a symbolic link above the folder: it is an entry that whoever can change its parent can delete and
+//!   make point elsewhere, with the store open (review M-1: the store answered from another tree, and served an older copy as the current value). So the path is
+//!   **refused if any folder on it is a reparse point** (walked before the folder is opened and again once it is held), every operation works in the held folder by
+//!   its **real path** (the handle's final path), and the path is opened afresh before each operation and compared with the handle (volume and file index). Every
+//!   file is opened as itself and refused if it is a reparse point, not a regular file, or has more than one name. The handle is also what the store flushes after a
+//!   rename, so that the new name survives a power cut. The header of `keydir_windows.rs` says what is left: the attacker who can write in the keys folder itself.
 //!
 //! The two platform modules implement the same small set of operations; the store above them does not know which it is on.
 
@@ -131,6 +134,33 @@ pub(super) fn read_exactly(reader: &mut impl Read, length: u64) -> Result<Zeroiz
 #[cfg(test)]
 type Action = std::sync::Arc<dyn Fn() + Send + Sync>;
 
+/// Hooks of `KeyDir::open` (Windows): a test that acts between the steps of an open names the path it is opening, so that tests that run at the same time do not see
+/// each other's.
+#[cfg(all(test, windows))]
+pub(crate) mod open_hooks {
+    use super::Action;
+    use std::path::{Path, PathBuf};
+    use std::sync::{Arc, Mutex};
+
+    type Entry = (PathBuf, &'static str, Action);
+    static HOOKS: Mutex<Vec<Entry>> = Mutex::new(Vec::new());
+
+    /// Runs `action` when an open of exactly `path` passes the named point (`after_walk`: the path was walked for links and the folder is not open yet).
+    pub(crate) fn at(path: &Path, point: &'static str, action: impl Fn() + Send + Sync + 'static) {
+        HOOKS.lock().unwrap().push((path.to_path_buf(), point, Arc::new(action)));
+    }
+
+    pub(crate) fn fire(path: &Path, point: &str) {
+        let action = {
+            let mut hooks = HOOKS.lock().unwrap();
+            hooks.iter().position(|(p, q, _)| p == path && *q == point).map(|at| hooks.remove(at).2)
+        };
+        if let Some(action) = action {
+            action();
+        }
+    }
+}
+
 /// Test hooks: a failure to inject, a count, and moments at which a test can do what an attacker or another process would.
 #[cfg(test)]
 #[derive(Default)]
@@ -145,12 +175,11 @@ pub(crate) struct Hooks {
 #[cfg(test)]
 impl Hooks {
     /// Runs `action` whenever the code passes the named point (`before_open`: after the folder was judged and before a file is opened).
-    #[cfg_attr(windows, allow(dead_code))] // the tests that use hooks act as an attacker who renames folders, which Windows does not allow
     pub(crate) fn at(&self, point: &'static str, action: impl Fn() + Send + Sync + 'static) {
         self.points.lock().unwrap().push((point, std::sync::Arc::new(action)));
     }
 
-    #[cfg_attr(windows, allow(dead_code))]
+    #[cfg_attr(windows, allow(dead_code))] // the tests that clear hooks act as an attacker who renames folders, which Windows does not allow
     pub(crate) fn clear(&self) {
         self.points.lock().unwrap().clear();
     }

@@ -68,10 +68,19 @@ in by another user was read as the real one, a FIFO hung a read for ever, and op
   other permission. Before every operation the folder is judged again (owner, mode) and compared by device and inode with the path: a folder that was replaced,
   moved or removed is an error. At open the directories **above** are judged by walking `..` from the descriptor: not another user's (root's is allowed), and not
   writable by group or others unless sticky (as `/tmp`). On systems whose umask leaves new folders `0775` the data folder's parent must be made `0755`: the store
-  says which level refuses and never repairs a mode. On Windows the folder is held open without `FILE_SHARE_DELETE`, so neither it nor a folder above it can be
-  renamed or removed while the store is open; a junction or symbolic link is refused for the folder and for every file (DPAPI included), and the folder is flushed
-  after a rename and a removal. The reviewer's swap (1.1 million in 40 seconds) read 3,388 of the attacker's values and answered `None` 58,442 times; with a real
-  second account (WSL, uid 65534) against this store: 224,332 swaps, 0 attacker values, 0 `None`, the rest errors (`unix::uid_swap_stress_...`, `#[ignore]`d, below).
+  says which level refuses and never repairs a mode. The reviewer's swap (1.1 million in 40 seconds) read 3,388 of the attacker's values and answered `None` 58,442
+  times; with a real second account (WSL, uid 65534) against this store: 224,332 swaps, 0 attacker values, 0 `None`, the rest errors (`unix::uid_swap_stress_...`, `#[ignore]`d, below).
+  **On Windows** (review M-1 corrected what an earlier edition of this file said): the folder is held open without `FILE_SHARE_DELETE`, so neither it nor a **real** folder above it
+  can be renamed or removed while the store is open. That is **not** true of a junction or symbolic link above the folder: it is an entry in its parent that whoever can change the parent
+  can delete and re-point with the store open, and the store then answered from the other tree (`None` for keys that exist, a write into the other tree, an older copy of the same
+  user's keys served as the current value). So a path with a junction, a symbolic link or a mount point on it, **at any level**, is refused at open (walked before the folder is
+  opened and again once it is held); every operation works in the held folder by its real path (the handle's final path: no junction in it, and it cannot change while the handle
+  is open); before each operation the path is opened afresh and its volume and file index compared with the handle's; and every file is opened as itself and refused if it is a
+  reparse point, not a regular file, or has more than one name. The folder is flushed after a rename and a removal. A reparse point of any kind is refused, cloud placeholders
+  (OneDrive) and a profile folder moved by junction included: fail closed; give the store the real path. **What is left, and is not claimed away:** whoever can write in the keys
+  folder itself can delete a key file (a caller then sees `None`, "never stored") or put back an older copy of a DPAPI blob (which the same user can unprotect: a rollback). Windows
+  gives `E:\` and other roots that nobody set up "Modify" to Authenticated Users, which is exactly that: **keep the data folder under the user's profile** (`%LOCALAPPDATA%`,
+  `%APPDATA%`), whose access control is the user, SYSTEM and Administrators. The store does not read or set ACLs (a follow-up).
 - **An advisory lock orders readers and writers** (`<keys>/.lock`; `flock` on Unix, `LockFileEx` on Windows, through std's `File::lock`). A reader holds it shared
   and a change of what a name refers to (the rename of a put, the removal of a delete) holds it exclusively, so a reader never sees a name in the middle of a replace
   (on Windows a rename over an existing file does leave such a moment, and a reader in another process used to get `None`). Each operation opens the lock file for
@@ -193,7 +202,8 @@ No dev-dependencies. For the two crates together the workspace lock gained 39 `[
   (or a file system with no locks: a network mount) makes an operation fail after ten seconds with an error that names the lock.
 - **No migrate call**: a folder belongs to its provider. Switching providers is a copy that reads every secret with the old one and writes it with the new one, which does not exist yet.
 - The directories above the keys folder are judged when the store is opened, not before each operation (a folder renamed later is caught by the comparison with the path, which is every operation).
-  Windows trusts the held handle for the same guarantee. A path through `/mnt/c` under WSL (drvfs: every file `0777`) is refused by the ancestor rule; use the Linux file system.
+  On Windows the real folders above are held by the handle inside them and the path is compared with the handle before each operation; the window between the first walk for junctions
+  and the open is closed by a second walk and the comparison, except for an attacker who flips the path back and forth faster than a check takes (every later operation compares again). A path through `/mnt/c` under WSL (drvfs: every file `0777`) is refused by the ancestor rule; use the Linux file system.
 - A crash between the flush and the rename leaves a temporary file until an `open` that finds it older than a minute and not locked.
 - The plaintext that DPAPI allocates is overwritten by the module before it is freed, and that cannot be observed from a test (K23 below).
 

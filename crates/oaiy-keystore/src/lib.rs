@@ -37,6 +37,9 @@ mod name;
 pub mod perm;
 mod provider;
 mod store;
+#[cfg(windows)]
+#[allow(unsafe_code)]
+mod winfs;
 
 pub use codec::{ProviderInfo, Strength};
 pub use error::KeyError;

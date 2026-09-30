@@ -16,4 +16,5 @@ zeroize = "1.8.2"
 rustix = { version = "1.1.4", default-features = false, features = ["std", "fs", "process"] }
 
 [target.'cfg(windows)'.dependencies]
-windows-sys = { version = "0.61", features = ["Win32_Foundation", "Win32_Security_Cryptography"] }
+# Win32_Storage_FileSystem: which file a handle is (volume and file index), how many names it has, and its real path (`src/winfs.rs`, the second unsafe module)
+windows-sys = { version = "0.61", features = ["Win32_Foundation", "Win32_Security_Cryptography", "Win32_Storage_FileSystem"] }

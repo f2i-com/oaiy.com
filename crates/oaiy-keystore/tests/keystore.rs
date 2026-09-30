@@ -1169,12 +1169,101 @@ mod windows {
         }
     }
 
+    /// K17: the kind of the refusal, not just that there is one. A `keys` path that is a file must be refused **as that**: without the check a DPAPI store would open
+    /// it, and every read would fail later for some other reason or, worse, read as `None`.
     #[test]
-    fn a_keys_path_that_is_a_file_is_refused() {
+    fn a_keys_path_that_is_a_file_is_refused_as_not_a_directory() {
         for (choice, _) in providers() {
             let scratch = Scratch::new("notdir");
             fs::write(scratch.keys(), b"not a folder").unwrap();
-            assert!(open_at(scratch.keys(), choice).is_err());
+            let error = open_at(scratch.keys(), choice).err().expect("refused");
+            assert!(matches!(&error, KeyError::Permissions(why) if why.contains("not a directory")), "{error:?}");
+            assert_eq!(fs::read(scratch.keys()).unwrap(), b"not a folder", "and the file is left as it was");
+        }
+    }
+
+    /// M-1, the reviewer's first case. A junction **above** the keys folder (`p`, pointing at a tree of the attacker's or of another place), with the store opened through
+    /// it and the junction re-pointed while the store is open: the store answered from the other tree (`None` for a key that exists, a write into the other tree). The
+    /// junction is a reparse point on the path, and a path with one on it is refused at open, so the store is never open through it to be re-pointed. Nothing is made
+    /// through the junction either: not the keys folder, not the lock, not the marker.
+    #[test]
+    fn a_junction_above_the_keys_folder_is_refused_for_every_provider_and_nothing_is_made_through_it() {
+        for (choice, _) in providers() {
+            let scratch = Scratch::new("jabove");
+            let (t1, t2) = (scratch.0.join("t1"), scratch.0.join("t2"));
+            fs::create_dir_all(&t1).unwrap();
+            fs::create_dir_all(t2.join("keys")).unwrap();
+            let link = scratch.0.join("p");
+            junction(&link, &t1);
+            // the folder is not made through the junction (there is no t1\keys yet)
+            let error = open_at(link.join("keys"), choice).err().expect("a junction on the way is refused");
+            assert!(matches!(&error, KeyError::Permissions(why) if why.contains("junction") && why.contains("real directories")), "{error:?}");
+            assert!(fs::read_dir(&t1).unwrap().next().is_none(), "the keys folder was not made in the tree the junction points to");
+            // re-pointed at another tree, which has a keys folder of its own: the same refusal, and nothing is added to it
+            fs::remove_dir(&link).unwrap();
+            junction(&link, &t2);
+            assert!(matches!(open_at(link.join("keys"), choice), Err(KeyError::Permissions(_))));
+            assert!(fs::read_dir(t2.join("keys")).unwrap().next().is_none(), "no lock file, no marker, nothing in the other tree");
+            // and the junction as the data folder itself, with `keys` inside it
+            assert!(matches!(open_at(link, choice), Err(KeyError::Permissions(_))));
+        }
+    }
+
+    /// M-1, the reviewer's rollback. The same user's keys folder exists twice, current and older (a backup or a snapshot), and a junction above `keys` is pointed at the older
+    /// one: DPAPI blobs of one user stay valid, so a store that followed the junction would serve the old value as the current one. Here the store is opened at the real
+    /// path of the current folder: re-pointing a junction that is not on its path changes nothing, and a store opened through the junction is refused, whichever copy
+    /// it points at. `None` is never the answer, and neither is the old value.
+    #[test]
+    fn a_junction_pointed_at_an_older_copy_of_the_keys_folder_cannot_roll_a_value_back() {
+        for (choice, ext) in providers() {
+            let scratch = Scratch::new("rollback");
+            let (current, old) = (scratch.0.join("current"), scratch.0.join("old"));
+            let store = open_at(current.join("keys"), choice).unwrap();
+            let pins = name("vault.pins");
+            store.put(&pins, b"pins version 1 (old)").unwrap();
+            fs::create_dir_all(old.join("keys")).unwrap();
+            for entry in fs::read_dir(current.join("keys")).unwrap() {
+                let entry = entry.unwrap();
+                if !entry.file_name().to_string_lossy().ends_with(".lock") {
+                    fs::copy(entry.path(), old.join("keys").join(entry.file_name())).unwrap();
+                }
+            }
+            store.put(&pins, b"pins version 2 (current)").unwrap();
+            let link = scratch.0.join("p");
+            for target in [&current, &old] {
+                junction(&link, target);
+                assert!(
+                    matches!(open_at(link.join("keys"), choice), Err(KeyError::Permissions(_))),
+                    "{ext}: opened through a junction to {}",
+                    target.display()
+                );
+                assert_eq!(
+                    get(&*store, &pins),
+                    Some(b"pins version 2 (current)".to_vec()),
+                    "{ext}: the store that is open is unmoved by a junction that is not on its path"
+                );
+                fs::remove_dir(&link).unwrap();
+            }
+            // and the old copy is itself a perfectly good store, which shows what a rollback would have been
+            drop(store);
+            assert_eq!(get(&*open_at(old.join("keys"), choice).unwrap(), &pins), Some(b"pins version 1 (old)".to_vec()));
+        }
+    }
+
+    /// Nothing above the keys folder can be replaced while the store is open: the real folders are held by the handle inside them. (This is the half of the guarantee that does
+    /// hold for folders, and that a junction does not get.)
+    #[test]
+    fn the_real_folders_above_the_keys_folder_cannot_be_renamed_or_replaced_while_the_store_is_open() {
+        for (choice, _) in providers() {
+            let scratch = Scratch::new("held-above");
+            let above = scratch.0.join("a").join("b");
+            let store = open_at(above.join("keys"), choice).unwrap();
+            store.put(&name("a.one"), b"1").unwrap();
+            for folder in [above.clone(), scratch.0.join("a"), scratch.0.clone()] {
+                assert!(fs::rename(&folder, folder.with_extension("moved")).is_err(), "{} was renamed under the store", folder.display());
+                assert!(fs::remove_dir(&folder).is_err(), "{} was removed under the store", folder.display());
+            }
+            assert_eq!(get(&*store, &name("a.one")), Some(b"1".to_vec()));
         }
     }
 }
