@@ -219,7 +219,10 @@ myself"; the last 300 characters of what they said are read, so a caller who ram
 and a caller who asks for a person by your name counts when your business is named for you, "Dave's
 Lawn Care"); the model may not claim any
 reason but the caller asking (or, if you allow it, your own urgent phrases); an urgent request
-rings only when you allowed it and the caller's own words held one of your phrases (this desktop
+rings only when you allowed it and the caller's own words held one of your phrases as a statement that it is so
+(read as the ask is, a sentence at a time and in order: not a denial such as "this is not a gas leak" or "there is no gas
+leak", not a supposition such as "if there were a gas leak", not the words in quotes or spoken of as words, not a question such
+as "is this a gas leak?", not something the caller was told to say, and a later denial takes an earlier statement back) (this desktop
 then vouches for the reason to the phone plugin, `reasonAllowed` in the plan, which the plugin
 wants for any reason but a caller who asked for a person); and by default a caller
 may be put through twice a call, 60 seconds apart, 3 times an hour, and 10 in an hour for everyone.
