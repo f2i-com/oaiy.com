@@ -25,6 +25,12 @@ export interface TesterDeps {
   key: (record: ProviderRecord) => Promise<string>;
   /** Counts one request against the app that asked; absent for the top-level page's own tests. */
   take?: () => Promise<{ ok: true } | { ok: false; limit: number; retryAfterMs: number }>;
+  /**
+   * Whether an error's message may hold the provider's own words. `omit` (the default, and what the port always uses): the message is fixed
+   * wording that depends on the status alone. `scrubbed`: the words, with the key taken out, as inert text: only for the holder's own pages
+   * (the Providers page and the modal), whose DOM no app can read.
+   */
+  providerText?: 'omit' | 'scrubbed';
 }
 
 export interface Tester {
@@ -54,7 +60,7 @@ export function createTester(deps: TesterDeps): Tester {
       }
     };
     try {
-      const list = await listRecordModels(record, key, { fetchImpl, page: deps.page, redact: (text) => redactSecret(text, key) });
+      const list = await listRecordModels(record, key, { fetchImpl, page: deps.page, providerText: deps.providerText === 'scrubbed' ? 'include' : 'omit' });
       return { ok: true, models: list.map((m) => (m.label ? { id: m.id, label: m.label } : { id: m.id })) };
     } catch (e) {
       if (exhausted) return budgetResult(exhausted);
@@ -93,11 +99,14 @@ export function createTester(deps: TesterDeps): Tester {
       void response.body?.cancel().catch(() => {});
       return { ok: true, models: listed.models, tools: 'yes' };
     }
-    const detail = redactSecret(await errorText(response), key);
-    // A 400 that says the tools are the problem is a model that works and does not take them.
-    if (!anthropic && (response.status === 400 || response.status === 422) && /\btools?\b|function[- ]call/i.test(detail)) return { ok: true, models: listed.models, tools: 'no' };
+    const text = await errorText(response);
+    // A 400 that says the tools are the problem is a model that works and does not take them. It is read from the provider's words as they
+    // are, not scrubbed: the answer is one of two fixed values, and a scrub in front of it would make it depend on the key.
+    if (!anthropic && (response.status === 400 || response.status === 422) && /\btools?\b|function[- ]call/i.test(text)) return { ok: true, models: listed.models, tools: 'no' };
     const kind = kindForStatus(response.status);
-    return { ok: false, models: listed.models, error: { kind, message: describeConnectionError(kind, { ...context, detail: detail || undefined }, response.status), status: response.status } };
+    // The provider's words go into the message only where the caller is a page of the holder's own (see `providerText`).
+    const detail = deps.providerText === 'scrubbed' ? redactSecret(text, key) || undefined : undefined;
+    return { ok: false, models: listed.models, error: { kind, message: describeConnectionError(kind, { ...context, detail }, response.status), status: response.status } };
   }
 
   async function probe(record: ProviderRecord): Promise<ProbeResult> {

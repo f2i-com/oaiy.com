@@ -4,13 +4,13 @@
  * What a page chooses is only a provider (by id), one path of the fixed list, a query, `content-type` and `accept`, a body and a
  * timeout. Everything else is the holder's: the address is the record's base plus the path (checked, `buildRequestUrl`), the
  * headers are the key, the dialect's and the record's own (`recordHeaders`), redirects are never followed (a key in `x-api-key` would
- * go with the request to wherever it was sent), and the answer comes back as a stream of events. An error a provider sends is
- * scrubbed of the key before it is passed on, because a provider's error text can quote the key it refused.
+ * go with the request to wherever it was sent), and the answer comes back as a stream of events. None of a provider's error text goes on
+ * (fixed.ts): a scrub that depends on the key would tell an app which pieces the key holds.
  */
 import { buildRequestUrl, recordHeaders, RequestRefused } from '@oaiy/shared/providers/endpoints';
-import { redactSecret } from '@oaiy/shared/providers/errors';
 import { errorBody, type FetchRequest, type StreamBody } from '@oaiy/shared/broker/protocol';
 import type { Budget } from './budget';
+import { fixedErrorBody, fixedStatusText, safeResponseHeaders } from './fixed';
 import { classifyFailure, type PageInfo } from './net';
 import type { ProviderStore } from './store';
 
@@ -20,11 +20,6 @@ export interface FetcherDeps {
   fetchImpl: typeof fetch;
   page: PageInfo;
 }
-
-/** The most of an error answer that is read and scrubbed before it is passed on. */
-const ERROR_BODY_MAX = 256 * 1024;
-
-const OMITTED_HEADERS = new Set(['set-cookie', 'set-cookie2', 'content-encoding', 'content-length', 'transfer-encoding']);
 
 export interface Fetcher {
   /** Run one request for `app`. Every outcome is an event to `emit`; nothing here rejects. */
@@ -95,22 +90,16 @@ export function createFetcher(deps: FetcherDeps): Fetcher {
           return fail('redirect', 'The provider answered with a redirect. It is not followed: a request goes only to the address the provider was saved with.');
         }
 
-        const heads: Array<[string, string]> = [];
-        response.headers.forEach((value, name) => {
-          if (!OMITTED_HEADERS.has(name.toLowerCase())) heads.push([name, value]);
-        });
-
         if (response.status >= 400) {
-          // An error is read whole (it is small) and scrubbed of the key before a page sees it.
-          const bytes = await readCapped(response, ERROR_BODY_MAX, controller.signal).catch(() => null);
-          if (bytes === null) return why ? stopped() : fail('network', 'The provider’s answer was cut off.');
-          const scrubbed = new TextEncoder().encode(redactSecret(new TextDecoder().decode(bytes), key));
-          emit({ t: 'head', status: response.status, statusText: response.statusText, headers: heads });
-          if (scrubbed.byteLength > 0) emit({ t: 'chunk', bytes: scrubbed.buffer.slice(scrubbed.byteOffset, scrubbed.byteOffset + scrubbed.byteLength) as ArrayBuffer });
+          // No word of a provider's error goes on: an app gets the status and wording that are a function of the status alone (fixed.ts).
+          void response.body?.cancel().catch(() => {});
+          const body = fixedErrorBody(record, response.status);
+          emit({ t: 'head', status: response.status, statusText: fixedStatusText(response.status), headers: safeResponseHeaders(response.headers, true) });
+          emit({ t: 'chunk', bytes: body.buffer.slice(body.byteOffset, body.byteOffset + body.byteLength) as ArrayBuffer });
           return emit({ t: 'end' });
         }
 
-        emit({ t: 'head', status: response.status, statusText: response.statusText, headers: heads });
+        emit({ t: 'head', status: response.status, statusText: fixedStatusText(response.status), headers: safeResponseHeaders(response.headers) });
         if (!response.body) return emit({ t: 'end' });
         const reader = response.body.getReader();
         // A stop reaches the body whether or not the browser ties it to the request's signal.
@@ -137,31 +126,4 @@ export function createFetcher(deps: FetcherDeps): Fetcher {
       }
     },
   };
-}
-
-/** The body of `response`, up to `max` bytes. */
-async function readCapped(response: Response, max: number, signal: AbortSignal): Promise<Uint8Array> {
-  const reader = response.body?.getReader();
-  if (!reader) return new Uint8Array(0);
-  const parts: Uint8Array[] = [];
-  let total = 0;
-  for (;;) {
-    signal.throwIfAborted();
-    const { done, value } = await reader.read();
-    if (done) break;
-    parts.push(value);
-    total += value.byteLength;
-    if (total >= max) {
-      void reader.cancel().catch(() => {});
-      break;
-    }
-  }
-  const out = new Uint8Array(Math.min(total, max));
-  let at = 0;
-  for (const part of parts) {
-    const take = part.subarray(0, Math.max(0, out.length - at));
-    out.set(take, at);
-    at += take.length;
-  }
-  return out;
 }

@@ -13,7 +13,7 @@
  * key, which the providers origin runs with its own `fetch`.
  */
 import { providerEndpoints, providerHeaders, recordHeaders, type ProviderEndpoints } from './endpoints';
-import { ProviderConnectionError, describeConnectionError, isBlockedMixedContent, kindForStatus, type ErrorContext } from './errors';
+import { ProviderConnectionError, describeConnectionError, isBlockedMixedContent, kindForStatus, redactSecret, type ErrorContext } from './errors';
 import { providerTypeOf } from './adapters';
 import type { LocalServerKind, ProviderConfig, ProviderRecord, ProviderType } from './types';
 
@@ -56,8 +56,13 @@ export interface ListModelsOptions {
   timeoutMs?: number;
   /** This page's protocol and origin; default the real page's. */
   page?: { protocol: string; origin: string };
-  /** The provider's own words are kept out of the message when they contain this (the key): see `redactSecret`. */
-  redact?: (text: string) => string;
+  /**
+   * Whether the provider's own words go into an error message: `include` (the default: the Agent's own use, where the text is the person's)
+   * or `omit` (the message is fixed wording that depends only on the status, so it can be handed to a page that must not be able to read
+   * the key out of it). `scrub` is applied to the text when it is included.
+   */
+  providerText?: 'include' | 'omit';
+  scrub?: (text: string) => string;
 }
 
 const LIST_TIMEOUT_MS = 15_000;
@@ -165,8 +170,8 @@ async function getJson(
     const resp = await doFetch(url, { method: 'GET', headers, signal: controller.signal });
     if (!resp.ok) {
       const kind = kindForStatus(resp.status);
-      const found = await errorDetail(resp);
-      const detail = found !== undefined && options.redact ? options.redact(found) : found;
+      const found = options.providerText === 'omit' ? undefined : await errorDetail(resp);
+      const detail = found !== undefined && options.scrub ? options.scrub(found) : found;
       throw new ProviderConnectionError(kind, describeConnectionError(kind, { ...context, url, pageOrigin: page.origin, detail }, resp.status), resp.status);
     }
     const text = await resp.text();
@@ -265,15 +270,20 @@ export async function listModels(
   );
 }
 
-/** The same for a record and its key: what the providers origin runs, with the key it holds. */
+/**
+ * The same for a record and its key: what the providers origin runs, with the key it holds. The provider's own words are OMITTED from an
+ * error's message unless the caller says `providerText: 'include'` (a page of the holder's own, whose DOM no app can read); then they are
+ * scrubbed of the key first.
+ */
 export async function listRecordModels(
   record: Pick<ProviderRecord, 'dialect' | 'baseUrl' | 'auth' | 'extraHeaders' | 'kind' | 'preset' | 'serverKind'>,
   key: string,
   options: ListModelsOptions = {},
 ): Promise<ModelInfo[]> {
   const type = providerTypeOf(record);
+  const providerText = options.providerText ?? 'omit';
   return listFrom(
     { type, serverKind: record.serverKind, endpoints: providerEndpoints({ type, baseUrl: record.baseUrl, serverKind: record.serverKind }), headers: recordHeaders(record, key) },
-    options,
+    { ...options, providerText, scrub: providerText === 'include' ? (text) => redactSecret(text, key) : undefined },
   );
 }

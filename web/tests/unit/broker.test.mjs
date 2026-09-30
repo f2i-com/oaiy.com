@@ -238,26 +238,25 @@ describe('what comes back', () => {
     assert.ok(Date.now() - started >= 70);
   });
 
-  it('a set-cookie header and the encoding of the body are not passed on', async () => {
-    const w = await world({ handler: () => new Response('{}', { status: 200, headers: { 'content-type': 'application/json', 'x-request-id': 'r1', 'retry-after': '3' } }) });
+  it('a set-cookie header, the encoding of the body and any header that is not a media type or a plain counter are not passed on', async () => {
+    const w = await world({ handler: () => new Response('{}', { status: 200, headers: { 'content-type': 'application/json', 'x-request-id': 'r1', 'retry-after': '3', 'set-cookie': 'a=b' } }) });
     const client = await w.connect();
     const result = await client.fetch({ provider: w.record.id, path: '/models', method: 'GET' });
     const names = result.head.headers.map(([k]) => k.toLowerCase());
-    assert.ok(names.includes('x-request-id') && names.includes('retry-after'));
-    for (const omitted of ['set-cookie', 'content-encoding', 'content-length', 'transfer-encoding']) assert.ok(!names.includes(omitted), omitted);
+    assert.ok(names.includes('content-type') && names.includes('retry-after'));
+    for (const omitted of ['x-request-id', 'set-cookie', 'content-encoding', 'content-length', 'transfer-encoding']) assert.ok(!names.includes(omitted), omitted);
   });
 
-  it('an error a provider sends is scrubbed of the key it quotes, and its status is kept', async () => {
+  it('an error a provider sends is not passed on: its status is kept, its words are ours (the full set of cases is provider-text.test.mjs)', async () => {
     const masked = `${KEY.slice(0, 8)}${'*'.repeat(20)}${KEY.slice(-4)}`;
     const w = await world({ handler: () => jsonResponse({ error: { message: `Incorrect API key provided: ${masked}. Also here it is in full: ${KEY}.`, code: 'invalid_api_key' } }, 401) });
     const client = await w.connect();
     const result = await client.fetch({ provider: w.record.id, path: '/chat/completions', method: 'POST', body: '{}' });
     assert.equal(result.head.status, 401);
-    assert.match(result.text, /Incorrect API key provided: …/);
-    assert.match(result.text, /invalid_api_key/);
+    assert.doesNotMatch(result.text, /Incorrect API key provided|invalid_api_key/);
+    assert.match(result.text, /did not accept this API key \(401\)/);
     assert.deepEqual(leaks(result.text), []);
     assert.deepEqual(leaks(client.everything()), []);
-    assert.ok(!result.text.includes(KEY.slice(-4)) || !result.text.includes(KEY.slice(-6)), 'not even the tail of it');
   });
 
   it('a redirect is not followed and not passed on: nothing else is asked, and the page is told', async () => {

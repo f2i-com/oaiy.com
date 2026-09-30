@@ -283,17 +283,19 @@ describe('E3.2 a hostile script in the flow editor tries every operation', () =>
     }
   });
 
-  it('what the provider\'s own error says about the key is scrubbed before a page sees it', async () => {
+  it('none of the provider\'s own error text reaches a page: the status, and words that are ours', async () => {
     const s = await scenario('flows');
     // The fake quotes the key it was given, masked, when the key is wrong. Ask with a provider whose stored key is then wrong.
     fake.set({ key: 'sk-somebody-elses-key-0123456789abcdef' });
     const events = await fetchAll(s.app.page, 'e1', { provider: s.provider.id, path: '/models', method: 'GET' });
     fake.set({ key: KEY });
     assert.equal(events[0].status, 401);
+    assert.equal(events[0].statusText, 'Unauthorized');
     const text = events.filter((e) => e.t === 'chunk').map((e) => e.text).join('');
-    assert.match(text, /Incorrect API key provided/);
-    assert.deepEqual(NEEDLES.filter((n) => text.includes(n)), [], 'the provider\'s echo of the key is gone');
-    assert.ok(!/sk-e3-Zq7/.test(text) && !text.includes(KEY.slice(-6)), 'and so is the masked start and end of it');
+    assert.doesNotMatch(text, /Incorrect API key provided/, 'not a word of the provider\'s');
+    assert.match(text, /did not accept (this API key|the one given) \(401\)/, 'the words are ours, and a function of the status');
+    assert.deepEqual(NEEDLES.filter((n) => text.includes(n)), []);
+    assert.ok(!/sk-e3-Zq7/.test(text) && !text.includes(KEY.slice(-6)), 'and not the masked start and end of the key either');
     await s.context.close();
   });
 });

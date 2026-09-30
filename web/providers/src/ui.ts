@@ -40,7 +40,8 @@ export function mountManage(root: HTMLElement, ctx: Context): void {
   }
 
   const presets = loadPresets();
-  const tester = (key: () => Promise<string>) => createTester({ fetchImpl: ctx.fetchImpl, page: ctx.page, key });
+  // This page is the holder's own, and no app can read its DOM: a provider's words may be shown (as text, scrubbed of the key).
+  const tester = (key: () => Promise<string>) => createTester({ fetchImpl: ctx.fetchImpl, page: ctx.page, key, providerText: 'scrubbed' });
 
   const listBox = h('section', { class: 'card', attrs: { 'aria-label': 'Your providers' } });
   const formBox = h('section', { class: 'card', attrs: { 'aria-label': 'Add or change a provider' } });

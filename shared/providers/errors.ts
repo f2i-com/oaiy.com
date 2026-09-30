@@ -207,8 +207,13 @@ export function describeNetworkFailure(failure: NetworkFailure, context: Network
 
 /**
  * The text with a secret, and anything that looks like part of it, taken out. A provider's own error can quote the key it
- * refused (OpenAI's 401 shows `sk-proj-…abcd`), and the holder must not hand even that much back to a page. The whole secret
- * goes, and so does any run of four or more characters that the secret also contains: that is what a mask leaves.
+ * refused (OpenAI's 401 shows `sk-proj-…abcd`). The whole secret goes, and so does any run of four or more characters that the
+ * secret also contains: that is what a mask leaves.
+ *
+ * It is ONLY for text the holder shows on its own pages, whose DOM no app can read. It is NOT what stands between an app and the key:
+ * output that depends on the key is a channel (an app that chooses what a provider echoes reads, from what is removed, which pieces the
+ * key holds, and a key under eight characters is not scrubbed at all), so an app is given none of a provider's error text and the
+ * question does not arise (web/providers/src/fixed.ts).
  */
 export function redactSecret(text: string, secret: string): string {
   if (!secret || secret.length < 8) return text;

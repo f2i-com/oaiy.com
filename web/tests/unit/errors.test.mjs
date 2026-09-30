@@ -81,11 +81,11 @@ describe('redactSecret: a provider\'s own error text does not carry the key back
     assert.equal(E.redactSecret(text, ''), text);
   });
 
-  it('a listing error says the provider\'s words without the key, through listRecordModels', async () => {
+  it('a listing error says the provider\'s words without the key, through listRecordModels, when the caller asks for the words (a page of the holder\'s own)', async () => {
     const record = { dialect: 'openai', baseUrl: 'https://api.openai.com/v1', auth: 'bearer', kind: 'external', preset: 'openai' };
     const fetchImpl = async () => new Response(JSON.stringify({ error: { message: `Incorrect API key provided: ${KEY.slice(0, 8)}****${KEY.slice(-4)}.` } }), { status: 401 });
     await assert.rejects(
-      M.listRecordModels(record, KEY, { fetchImpl, page: { protocol: 'https:', origin: 'https://p.example' }, redact: (t) => E.redactSecret(t, KEY) }),
+      M.listRecordModels(record, KEY, { fetchImpl, page: { protocol: 'https:', origin: 'https://p.example' }, providerText: 'include' }),
       (error) => {
         assert.equal(error.kind, 'auth');
         assert.ok(!error.message.includes(KEY.slice(0, 8)), error.message);

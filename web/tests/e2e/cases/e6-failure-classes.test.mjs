@@ -5,7 +5,7 @@
  *
  *   - a server that is up and does not allow the page says "allow <this origin>", with the exact line for the server;
  *   - one that is down says nothing answered there;
- *   - a wrong key on the model list is a readable "did not accept this key", with the provider's words and none of the key;
+ *   - a wrong key on the model list is a readable "did not accept this key" in words that are ours (an app is never given the provider's);
  *   - mixed content (an https page calling plain http on another machine) names itself: it cannot happen on these http test pages,
  *     so it is checked by unit tests (net.test.mjs, broker.test.mjs) with the page's protocol given, and said so here.
  *
@@ -115,7 +115,7 @@ describe('E6 failure classes', () => {
     await context.close();
   });
 
-  it('a wrong key on the model list is a readable "did not accept this key", with the provider\'s words and none of the key', async () => {
+  it('a wrong key on the model list is a readable "did not accept this key" in words that are ours: none of the provider\'s, and none of the key', async () => {
     const { context } = await newContext(browser);
     const top = await newPage(context);
     const WRONG = 'sk-e6-WRONG-Kx9Pq3Vn7Ld2Tb8Ye4Hs1Mj6Rc5Gf0Za';
@@ -126,8 +126,17 @@ describe('E6 failure classes', () => {
     assert.equal(reply.result.ok, false);
     assert.equal(reply.result.error.kind, 'auth');
     assert.equal(reply.result.error.status, 401);
-    assert.match(reply.result.error.message, /Incorrect API key provided: …/, 'the provider\'s words');
-    assert.ok(!reply.result.error.message.includes(WRONG.slice(-6)) && !reply.result.error.message.includes(WRONG.slice(0, 8)), 'without the key it quoted, masked');
+    assert.match(reply.result.error.message, /did not accept (this API key|the one given) \(401\)/);
+    assert.doesNotMatch(reply.result.error.message, /Incorrect API key provided|The provider said/, 'not the provider\'s words');
+    assert.ok(!reply.result.error.message.includes(WRONG.slice(-6)) && !reply.result.error.message.includes(WRONG.slice(0, 8)), 'and not the key it quoted, masked');
+    // The Providers page is the holder's own, and shows the provider's words as text, scrubbed.
+    await top.page.goto(`${world.origins.providers}/`);
+    const row = top.page.locator('section[aria-label="Your providers"] li.row', { hasText: 'Wrong key' });
+    await row.getByRole('button', { name: 'Check' }).click();
+    await row.locator('.result.bad').waitFor({ timeout: 10000 });
+    const shown = await row.locator('.result.bad').innerText();
+    assert.match(shown, /The provider said: “Incorrect API key provided: …/);
+    assert.ok(!shown.includes(WRONG.slice(-6)) && !shown.includes(WRONG.slice(0, 8)));
     await context.close();
   });
 

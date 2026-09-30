@@ -14,7 +14,8 @@ import { describe } from './ui';
 import type { ProviderRecord } from '@oaiy/shared/providers/types';
 
 export function mountEmbed(root: HTMLElement, ctx: Context): void {
-  const tester = (key: () => Promise<string>) => createTester({ fetchImpl: ctx.fetchImpl, page: ctx.page, key });
+  // The modal is a frame of the holder's own origin, so an app cannot read what it shows: a provider's words may be shown (as text, scrubbed).
+  const tester = (key: () => Promise<string>) => createTester({ fetchImpl: ctx.fetchImpl, page: ctx.page, key, providerText: 'scrubbed' });
   const list = h('ul', { class: 'rows' });
   const openManage = h('button', { class: 'button', text: 'Manage providers…' });
   openManage.addEventListener('click', () => {
