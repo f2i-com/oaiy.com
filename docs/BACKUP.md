@@ -641,7 +641,11 @@ in parts through internal routes with a secret made for that one backup.
   each knowledge file, what the phone's agents remember about people, each outreach campaign by
   name with how many people it would contact and what it says, and the Agent's settings key by
   key with their values (the instructions with their full length). It says what is not restored
-  and why, and every name it does not know is "not restored: unknown item".
+  and why, and every name it does not know is "not restored: unknown item". The archive that is
+  prepared is recorded with its size and SHA-256 and held to them like a staged data file is: when
+  the restore is applied (a copy that was swapped stops the restore, and nothing is changed), again
+  when it is handed to the page (the result says that it was not), and where the page first asks
+  for it (a hand-over that changed on the disk is dropped, and the result says so).
 - **Nothing ticked** brings back only the numbers not to be called or texted again (which are
   *added* to yours: none of yours is ever taken away, on a restore or an undo). At most **5,000**
   numbers come back in one restore, each once (the same digits written another way are one

@@ -475,8 +475,30 @@ fn undo_record_exists(data_dir: &Path, id: &str) -> bool {
 }
 
 /// `GET /api/backup/agent-import` (the route checks the page's token with [`page_token_matches`]).
+///
+/// What waits is what was handed over: its size is checked when it is read, and its SHA-256 here, where the page first asks for
+/// it. A hand-over that was changed on the disk since (or a swap of the same size) is dropped, with the reason in the result:
+/// the page checks the hash it is told against what it downloads, and this makes the desktop tell it the truth.
 pub fn import_meta(data_dir: &Path) -> ImportMeta {
-    match read_pending_import(data_dir) {
+    let changed = |id: &str| {
+        log::warn!("backup: the Agent's part of restore {id} changed on the disk after it was handed over, so it was dropped");
+        drop_pending_import(data_dir);
+        super::restore::record_agent_result(data_dir, id, false, Some("the copy left for the Agent's page changed on the disk after it was prepared"), &[]);
+    };
+    let waiting = match (read_pending_import(data_dir), pending_import_id(data_dir)) {
+        (Some(p), _) if matches!(sha256_file(&import_dir(data_dir).join("current.zip")), Ok((sha, _)) if sha == p.sha256) => Some(p),
+        (Some(p), _) => {
+            changed(&p.id);
+            None
+        }
+        // The record is there and the copy is not what it says (another size, or gone).
+        (None, Some(id)) => {
+            changed(&id);
+            None
+        }
+        (None, None) => None,
+    };
+    match waiting {
         None => ImportMeta { pending: false, id: None, kind: None, size: None, sha256: None, parts: None, part_size: None, apply: None, remove: Vec::new() },
         Some(p) => ImportMeta {
             pending: true,

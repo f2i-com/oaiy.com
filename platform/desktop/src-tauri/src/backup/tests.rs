@@ -5934,3 +5934,74 @@ fn a_copy_of_the_agents_storage_that_no_restore_owns_is_kept_and_reported() {
     let last = restore::last_restore(&data.0).unwrap();
     assert!(last.notes.iter().any(|n| n.contains("no restore owns") && n.contains("unowned-agent-copy-fedcba9876543210.zip")), "{:?}", last.notes);
 }
+
+/// The bytes of a hostile archive of the very same size as `original` (one byte changed).
+fn same_size_other(original: &[u8]) -> Vec<u8> {
+    let mut other = original.to_vec();
+    let at = other.len() / 2;
+    other[at] ^= 0xff;
+    other
+}
+
+/// The reviewer's swap: the Agent's archive that was staged is replaced before the restore is applied, and was handed to the page
+/// as if it were what was staged. It is checked like a staged data file is: at the apply (nothing is changed), again when it is
+/// handed over (the result says it was not), and once more where the page first asks for it (it is dropped).
+#[test]
+fn a_swapped_staged_agent_archive_is_not_handed_to_the_page() {
+    let prepare = |tag: &str| {
+        let src = TempDir::new(&format!("{tag}-src"));
+        let out = TempDir::new(&format!("{tag}-out"));
+        let file = backup_with_agent(&src.0, &out.0, "s.oaiybackup", agent_part(), false);
+        let dst = TempDir::new(&format!("{tag}-dst"));
+        put(&dst.0, "callers.json", b"{\"contacts\":[]}");
+        let staged = restore::stage(&dst.0, &file, PASS, &Ticks::all(), &options()).unwrap();
+        let zip = dst.0.join("restore").join(format!("pending-{}", staged.id)).join("agent-storage.zip");
+        assert!(zip.is_file());
+        (dst, staged.id, zip)
+    };
+    // 1. Swapped before the apply, for an archive of another size and for one of the same size: nothing is changed.
+    for variant in ["other size", "same size"] {
+        let (dst, _, zip) = prepare("swap-before");
+        let original = fs::read(&zip).unwrap();
+        fs::write(&zip, if variant == "same size" { same_size_other(&original) } else { b"PK a hostile archive".to_vec() }).unwrap();
+        let before = snapshot(&dst.0);
+        let ApplyOutcome::Failed(last) = restore::apply_pending(&dst.0) else { panic!("{variant}: the restore should be refused") };
+        assert!(last.error.as_deref().unwrap().contains("Agent's storage") && last.error.as_deref().unwrap().contains("nothing was changed"), "{variant}: {last:?}");
+        assert_eq!(snapshot(&dst.0), before, "{variant}: nothing was changed");
+        assert!(!agent::import_meta(&dst.0).pending, "{variant}: nothing is left for the page");
+    }
+    // 2. Swapped after the files are in place and before the archive is handed over (a crash between the two): the files stand,
+    // and the result says the Agent's part was not handed over.
+    for variant in ["other size", "same size"] {
+        let (dst, _, zip) = prepare("swap-between");
+        restore::INJECT.with(|c| c.set(Some(Inject::CrashAfterDone)));
+        assert!(matches!(restore::apply_pending(&dst.0), ApplyOutcome::None));
+        restore::INJECT.with(|c| c.set(None));
+        let original = fs::read(&zip).unwrap();
+        fs::write(&zip, if variant == "same size" { same_size_other(&original) } else { b"PK a hostile archive".to_vec() }).unwrap();
+        let ApplyOutcome::Applied(last) = restore::apply_pending(&dst.0) else { panic!("{variant}: the files were in place") };
+        assert_eq!(last.agent_storage, "failed", "{variant}");
+        assert!(last.notes.iter().any(|n| n.contains("not handed to the Agent's page")), "{variant}: {:?}", last.notes);
+        assert!(!agent::import_meta(&dst.0).pending, "{variant}");
+    }
+    // 3. Swapped after it was handed over and before the page came: the page is not told it is the archive that was prepared.
+    for variant in ["other size", "same size"] {
+        let (dst, id, _) = prepare("swap-after");
+        assert!(matches!(restore::apply_pending(&dst.0), ApplyOutcome::Applied(_)));
+        assert!(agent::import_meta(&dst.0).pending);
+        let handed = dst.0.join("restore").join("agent-import").join("current.zip");
+        let original = fs::read(&handed).unwrap();
+        fs::write(&handed, if variant == "same size" { same_size_other(&original) } else { b"PK a hostile archive".to_vec() }).unwrap();
+        assert!(!agent::import_meta(&dst.0).pending, "{variant}: dropped where the page first asks");
+        assert_eq!(agent::import_part(&dst.0, &id, agent::page_token(), 0).err(), Some(PartError::Unknown), "{variant}");
+        let last = restore::last_restore(&dst.0).unwrap();
+        assert_eq!(last.agent_storage, "failed", "{variant}");
+        assert!(last.redo.iter().any(|r| r.contains("changed on the disk")), "{variant}: {:?}", last.redo);
+    }
+    // And the archive that was staged is handed over as it is.
+    let (dst, id, zip) = prepare("swap-none");
+    let staged_bytes = fs::read(&zip).unwrap();
+    assert!(matches!(restore::apply_pending(&dst.0), ApplyOutcome::Applied(_)));
+    assert!(agent::import_meta(&dst.0).pending && agent::import_meta(&dst.0).id.as_deref() == Some(id.as_str()));
+    assert_eq!(fs::read(dst.0.join("restore").join("agent-import").join("current.zip")).unwrap(), staged_bytes);
+}

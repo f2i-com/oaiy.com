@@ -256,6 +256,20 @@ fn agent_file() -> String {
     AGENT_RESTORE_FILE.to_string()
 }
 
+/// The Agent's archive that was staged is the one the marker recorded: a plain file of that size with that SHA-256. (The files
+/// staged for the data folder are checked when they are applied; this is the same for the one that is handed to the page.)
+fn verify_staged_agent(zip: &Path, recorded: &MarkerAgent) -> std::result::Result<(), String> {
+    let meta = std::fs::symlink_metadata(zip).map_err(|_| "The staged copy of the Agent's storage is missing".to_string())?;
+    if !meta.is_file() || rules::is_link(&meta) || meta.len() != recorded.size {
+        return Err("The staged copy of the Agent's storage is not what was staged".to_string());
+    }
+    let (sha, _) = sha256_file(zip).map_err(|_| "The staged copy of the Agent's storage could not be read".to_string())?;
+    if sha != recorded.sha256 {
+        return Err("The staged copy of the Agent's storage does not check out".to_string());
+    }
+    Ok(())
+}
+
 fn marker_path(data_dir: &Path) -> PathBuf {
     restore_dir(data_dir).join("pending.json")
 }
@@ -1359,6 +1373,14 @@ pub fn apply_pending(data_dir: &Path) -> ApplyOutcome {
         return conclude_failed(data_dir, &marker, last);
     }
 
+    // What is handed to the page is what was staged, before anything is changed (a copy that was swapped after it was prepared
+    // stops the restore as a staged data file that was swapped does).
+    if let Some(agent_marker) = &marker.agent {
+        if let Err(why) = verify_staged_agent(&dir.join(&marker.source).join(&agent_marker.file), agent_marker) {
+            let last = failed(&marker.id, &marker.kind, &format!("{why}, so nothing was changed."));
+            return conclude_failed(data_dir, &marker, last);
+        }
+    }
     match apply_files(data_dir, &marker, &staged_root, &holding, &journal_file, &limits) {
         Ok(applied) => finalize(data_dir, &marker, &applied),
         // A test's stand-in for the process dying: nothing is rolled back and nothing is cleaned up.
@@ -1577,12 +1599,21 @@ fn finalize(data_dir: &Path, marker: &Marker, applied: &[(String, bool)]) -> App
     let mut agent_storage = "none";
     if let Some(agent_marker) = &marker.agent {
         let zip = source.join(&agent_marker.file);
-        match agent::leave_for_page(data_dir, &marker.id, &marker.kind, &zip, agent_marker.apply_settings, agent_marker.apply_keys, &agent_marker.remove) {
-            Ok(()) => agent_storage = "pending",
-            Err(e) => {
-                log::warn!("backup: the Agent's storage could not be handed over: {e}");
+        // Once more, at the last moment: the page is given what was staged, or nothing (the files are in place already, so the
+        // result says what was not handed over).
+        match verify_staged_agent(&zip, agent_marker) {
+            Err(why) => {
+                log::warn!("backup: the Agent's storage was not handed over: {why}");
+                notes.push(format!("{why}, so it was not handed to the Agent's page."));
                 agent_storage = "failed";
             }
+            Ok(()) => match agent::leave_for_page(data_dir, &marker.id, &marker.kind, &zip, agent_marker.apply_settings, agent_marker.apply_keys, &agent_marker.remove) {
+                Ok(()) => agent_storage = "pending",
+                Err(e) => {
+                    log::warn!("backup: the Agent's storage could not be handed over: {e}");
+                    agent_storage = "failed";
+                }
+            },
         }
     }
     let last = LastRestore {
