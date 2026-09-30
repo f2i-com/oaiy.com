@@ -79,6 +79,53 @@ describe('the device vault', () => {
     assert.notDeepEqual(Buffer.from(stored(h).items['key:a'].iv), before, 'the same value is not sealed the same way twice');
   });
 
+  it('every CryptoKey the vault makes or imports is not extractable: the wrapping key AND the master key (the review\'s M08), in this document and in one that reloads', async () => {
+    const made = [];
+    const subtle = new Proxy(webcrypto.subtle, {
+      get(target, prop) {
+        const value = target[prop];
+        if (typeof value !== 'function') return value;
+        return async (...args) => {
+          const out = await value.apply(target, args);
+          if (['generateKey', 'importKey', 'unwrapKey', 'deriveKey'].includes(String(prop))) made.push({ op: String(prop), key: out });
+          return out;
+        };
+      },
+    });
+    const crypto = { subtle, getRandomValues: (a) => webcrypto.getRandomValues(a) };
+    const h = makeHolder({ crypto });
+    await h.vault.set('key:a', KEY);
+    const other = anotherDocument(h);
+    assert.deepEqual(await other.vault.get(['key:a']), { 'key:a': KEY });
+    const ops = made.map((m) => m.op);
+    assert.ok(ops.includes('generateKey'), 'the wrapping key was made');
+    assert.ok(ops.filter((op) => op === 'importKey').length >= 2, `the master key was imported by each document: ${ops}`);
+    for (const { op, key } of made) {
+      assert.equal(key.extractable, false, `${op} made an extractable key`);
+      await assert.rejects(webcrypto.subtle.exportKey('raw', key), `${op}: its bytes cannot be read`);
+    }
+  });
+
+  it('a name is looked up among the vault\'s OWN items: a sealed item that an inherited property carries is not a stored secret (the review\'s M14)', async () => {
+    const h = makeHolder();
+    const name = 'key:p_inherited_probe';
+    await h.vault.set(name, KEY);
+    const record = stored(h);
+    const item = record.items[name];
+    delete record.items[name]; // no longer among the vault's own items
+    h.idb.raw('vault').set('record', record);
+    // A valid sealed item, put where a lookup that does not check for an own property would find it: the prototype every object inherits from.
+    Object.defineProperty(Object.prototype, name, { value: item, configurable: true, enumerable: false, writable: true });
+    try {
+      assert.deepEqual(await h.vault.get([name]), {}, 'not read');
+      assert.deepEqual(await h.vault.names(), [], 'and not listed');
+      assert.deepEqual(await h.vault.unreadable([name]), [], 'and not an item that is stored');
+    } finally {
+      delete Object.prototype[name];
+    }
+    assert.ok(!(name in {}), 'the probe left the prototype as it was');
+  });
+
   it('a value moved from one name to another does not open (the name is part of what is sealed)', async () => {
     const h = makeHolder();
     await h.vault.set('key:a', KEY);

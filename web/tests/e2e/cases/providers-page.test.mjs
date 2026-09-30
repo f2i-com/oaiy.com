@@ -332,6 +332,10 @@ describe('the modal\'s Manage button', () => {
       const [popup] = await Promise.all([context.waitForEvent('page'), frame.getByRole('button', { name: /Manage providers/ }).click()]);
       await popup.waitForLoadState();
       assert.equal(popup.url(), `${world.origins.providers}/`);
+      // Two layers make this true, and this assertion cannot tell them apart: the modal opens the page with `noopener`, and the Providers
+      // page is served with Cross-Origin-Opener-Policy same-origin, which severs the opener of a page opened from another origin's frame
+      // whatever the opener asked for. So the mutation that drops `noopener` (M10 in mutations.mjs) is not caught here, and is reported as
+      // informational: the second layer is what holds, the first is kept.
       assert.equal(await popup.evaluate(() => window.opener), null, 'no opener: the app cannot reach the page it opened');
     } finally {
       await context.close();

@@ -213,6 +213,39 @@ const MUTATIONS = [
     },
     caught: ['says what an app can do with a key', 'says what keeping keys here is and is not', 'claims nothing it cannot keep'],
   },
+  {
+    name: 'M08 the master key is extractable',
+    what: 'the vault imports its master key as extractable',
+    tests: ['tests/unit/vault.test.mjs'],
+    files: { 'web/providers/src/vault.ts': [{ find: "const key = await s.importKey('raw', bytes(raw), { name: 'AES-GCM' }, false, ['encrypt', 'decrypt']);", replace: "const key = await s.importKey('raw', bytes(raw), { name: 'AES-GCM' }, true, ['encrypt', 'decrypt']);" }] },
+    caught: ['every CryptoKey the vault makes or imports is not extractable'],
+  },
+  {
+    name: 'M09 the wrapping key is extractable',
+    what: 'the vault makes its device wrapping key extractable',
+    tests: ['tests/unit/vault.test.mjs'],
+    files: { 'web/providers/src/vault.ts': [{ find: "const kek = await s.generateKey({ name: 'AES-GCM', length: 256 }, false, ['encrypt', 'decrypt']);", replace: "const kek = await s.generateKey({ name: 'AES-GCM', length: 256 }, true, ['encrypt', 'decrypt']);" }] },
+    caught: ['every CryptoKey the vault makes or imports is not extractable', 'what is stored is ciphertext'],
+  },
+  {
+    name: 'M14 vault.get reads inherited names',
+    what: 'a name is looked up with `in`-style access, so a sealed item on Object.prototype is read as a stored secret',
+    tests: ['tests/unit/vault.test.mjs'],
+    files: { 'web/providers/src/vault.ts': [{ find: 'const item = record && Object.hasOwn(record.items, name) ? record.items[name] : undefined;', replace: 'const item = record ? record.items[name] : undefined;' }] },
+    caught: ['a name is looked up among the vault\'s OWN items'],
+  },
+  {
+    // The modal's Manage button opens the Providers page with `noopener`. That is redundant: the Providers page is served with
+    // Cross-Origin-Opener-Policy same-origin, which severs the opener of a page opened from another origin's frame whatever the opener asked
+    // for, so the test that reads `window.opener` in the popup passes with or without `noopener`. It is kept as a second layer, and reported,
+    // not required (like the prefix check above).
+    name: 'M10 the modal\'s Manage button keeps an opener (informational)',
+    what: 'the modal opens the Providers page without `noopener`',
+    informational: true,
+    tests: ['tests/e2e/cases/providers-page.test.mjs'],
+    files: { 'web/providers/src/embed.ts': [{ find: "window.open(`${location.origin}/`, '_blank', 'noopener');", replace: "window.open(`${location.origin}/`, '_blank');" }] },
+    caught: [],
+  },
   // Leaks the scans must find. They put the key where a scan of TEXT does not look (the reviewer's two: a Uint8Array, and reversed).
   {
     name: 'H1 leak: list returns the key as a Uint8Array',

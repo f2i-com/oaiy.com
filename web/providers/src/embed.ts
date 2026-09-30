@@ -24,7 +24,10 @@ export function mountEmbed(root: HTMLElement, ctx: Context): void {
   const list = h('ul', { class: 'rows' });
   const openManage = h('button', { class: 'button', text: 'Manage providers…' });
   openManage.addEventListener('click', () => {
-    // The Providers page in a tab of its own, where the address bar shows whose form it is.
+    // The Providers page in a tab of its own, where the address bar shows whose form it is. `noopener` is a second layer, and redundant:
+    // the Providers page is served with Cross-Origin-Opener-Policy same-origin, which severs the opener of a page opened from another
+    // origin's frame whatever the opener asked for. Dropping it changes nothing a test can see (M10 in mutations.mjs, informational);
+    // it stays, because it is one word and it does not depend on a header.
     window.open(`${location.origin}/`, '_blank', 'noopener');
   });
   fill(root, h('main', { class: 'page embed' }, h('h1', { text: 'Providers' }), list, h('div', { class: 'actions' }, openManage)));
