@@ -362,7 +362,9 @@ them, so a credential could pin every worker for as long as it liked.) A measure
 The relay clears out expired items, old metadata, spent tickets and stale signal files itself, at most once a minute, from a
 health or status request (or after a poll when the host can answer first). If your host has cron, `*/5 * * * * php
 ~/oaiy-relay/bin/gc.php` is optional: `php bin/gc.php [--force] [--vacuum]` runs the same pass, and `--vacuum` (weekly at
-most, because it locks the database) compacts the file.
+most, because it locks the database) compacts the file. A request's pass has a budget of 50 ms and keeps to it inside the deletes as
+well as between them (a hundred rows at a time): a backlog of a hundred thousand rows of metadata, or a limiter table far over its
+bound, is worked off over many passes and never by one request that waits for all of it.
 
 ## Tests
 

@@ -251,6 +251,51 @@ test('4.18.6 GC stops between steps when its time budget is spent, and the next 
     eq(0, (int)$r->ctx()->db->val('SELECT live_items FROM mailboxes WHERE id = ?', [$d->inbox()]));
 });
 
+slow_test('4.18.6 a backlog of a hundred thousand rows is worked off over several passes: a pass of 50 ms spends about 50 ms in the deletes of metadata and of limiter rows, where it took a second or more, and the passes together leave nothing', function () {
+    $r = Relay::make();
+    $d = $r->desktop();
+    $ctx = $r->ctx();
+    $db = $ctx->db;
+    $box = $d->inbox();
+    $old = Relay::T0 - 7200;
+    $db->write(function (Db $x) use ($box, $old): void {
+        $x->exec('INSERT INTO mailboxes (id, next_seq, live_items, live_bytes, bulk_items, bulk_bytes, created_at) VALUES (?, 60001, 0, 0, 0, 0, ?)', [$box, $old]);
+        $item = $x->pdo()->prepare('INSERT INTO items (mailbox, seq, lane, id, sender, re, rp, hdr, body, body_hash, size, subject_id, grants, state, at, exp, delivered_at, acked_at) VALUES (?, ?, \'cmd\', ?, \'s\', NULL, NULL, \'{}\', NULL, ?, 1, NULL, NULL, 2, ?, ?, NULL, ?)');
+        for ($i = 1; $i <= 60000; $i++) {
+            $item->execute([$box, $i, 'm' . $i, str_repeat('0', 64), $old, $old + 60, $old + 30]);
+        }
+    });
+    eq(60000, (int)$db->val("SELECT COUNT(*) FROM items WHERE state = 2"));
+    // Passes of 50 ms until the job is done: the time of each, and how many it took.
+    $work = function (callable $done) use ($ctx): array {
+        $times = [];
+        do {
+            $t0 = microtime(true);
+            $ctx->gc->pass(Relay::T0, 50);
+            $times[] = microtime(true) - $t0;
+        } while (!$done() && count($times) < 600);
+        sort($times);
+        return [$times, $times[intdiv(count($times), 2)]];
+    };
+    // First the metadata alone...
+    [$times, $median] = $work(fn(): bool => (int)$db->val("SELECT COUNT(*) FROM items WHERE state IN (2, 3)") === 0);
+    ok(count($times) > 2, 'the metadata took ' . count($times) . ' passes, not one');
+    ok($median < 0.1, sprintf('the median pass of the metadata took %.3f s against a budget of 0.05 (one pass took %.3f s at most)', $median, end($times)));
+    ok(end($times) < 0.5, sprintf('and none took %.3f s', end($times)));
+    // ...then a limiter table sixty thousand rows over its bound (they are live windows: bounded by the cap, not by age).
+    $db->write(function (Db $x): void {
+        $rl = $x->pdo()->prepare('INSERT INTO rl (k, w, n) VALUES (?, ?, 1)');
+        for ($i = 1; $i <= 60000; $i++) {
+            $rl->execute(['w:bulk-' . $i, (Relay::T0 - 60 + ($i % 50)) * 1000]);
+        }
+    });
+    [$times, $median] = $work(fn(): bool => (int)$db->val("SELECT COUNT(*) FROM rl WHERE k NOT LIKE 's:%'") <= Oaiy\Relay\Gc::RL_MAX_ROWS);
+    ok(count($times) > 2, 'the limiter rows took ' . count($times) . ' passes, not one');
+    ok($median < 0.1, sprintf('the median pass over the limiter rows took %.3f s against a budget of 0.05', $median));
+    ok(end($times) < 0.5, sprintf('and none took %.3f s', end($times)));
+    eq(0, (int)$db->val("SELECT COUNT(*) FROM items WHERE state IN (2, 3)"), 'all the metadata is gone');
+});
+
 // ------------------------------------------------------------------------------------------------ 4.18.6 when it runs
 
 test('4.18.6 without a finish_request function GC runs only after health and status requests, and only for 50 ms', function () {

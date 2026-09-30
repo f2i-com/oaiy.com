@@ -22,6 +22,8 @@ final class Gc
     /** The most rate-limit rows (not counting status counters) a pass leaves: the oldest go first. One row per address and bucket. */
     public const RL_MAX_ROWS = 20000;
     private const BATCH = 2000;
+    /** Rows deleted in one write transaction; the pass's budget is asked between chunks. */
+    private const CHUNK = 100;
 
     private Db $db;
     private Config $cfg;
@@ -86,7 +88,7 @@ final class Gc
         // 2. Metadata past its retention: acked or expired more than ten minutes ago.
         if ($left()) {
             $cut = $now - Mailbox::RETAIN_S;
-            $out['metadata'] = $this->deleteItems('state IN (2, 3) AND ((state = 2 AND acked_at < ?) OR (state = 3 AND exp < ?))', [$cut, $cut]);
+            $out['metadata'] = $this->deleteItems('state IN (2, 3) AND ((state = 2 AND acked_at < ?) OR (state = 3 AND exp < ?))', [$cut, $cut], $left);
         }
         // 3. The small tables.
         if ($left()) {
@@ -103,7 +105,7 @@ final class Gc
             $out['limits'] = $this->db->write(fn(Db $db): int => $db->exec("DELETE FROM rl WHERE (w < ? OR w > ?) AND k NOT LIKE 's:%'", [$hourAgoMs, ($now + 3600) * 1000]));
             // Status counters are kept for 25 hours.
             $this->db->write(fn(Db $db): int => $db->exec("DELETE FROM rl WHERE k LIKE 's:%' AND w < ?", [($now - 25 * 3600) * 1000]));
-            $out['limits'] += $this->boundLimiterRows();
+            $out['limits'] += $this->boundLimiterRows($left);
             $out['locks'] = $this->db->write(fn(Db $db): int => $db->exec('DELETE FROM tokid_fail WHERE (first_at < ? AND (locked_until IS NULL OR locked_until < ?)) OR first_at > ?', [$now - 3600, $now, $now + 3600]));
         }
         // 4. Signal files nobody needs any more.
@@ -131,41 +133,57 @@ final class Gc
      * with rows of its own): past RL_MAX_ROWS the oldest rows go. Status counters (s:...) are not part of this; they are bounded by
      * their cap and by their 25 hours.
      */
-    private function boundLimiterRows(): int
+    private function boundLimiterRows(callable $left): int
     {
         $n = (int)$this->db->val("SELECT COUNT(*) FROM rl WHERE k NOT LIKE 's:%'");
         $excess = $n - self::RL_MAX_ROWS;
-        if ($excess <= 0) {
+        if ($excess <= 0 || !$left()) {
             return 0;
         }
         $rows = $this->db->all("SELECT k FROM rl WHERE k NOT LIKE 's:%' ORDER BY w ASC LIMIT " . min($excess, 5000));
-        $this->db->write(function (Db $db) use ($rows): void {
-            foreach ($rows as $r) {
-                $db->exec('DELETE FROM rl WHERE k = ?', [$r['k']]);
+        $done = 0;
+        foreach (array_chunk($rows, self::CHUNK) as $chunk) { // a chunk at a time, asking the budget between them
+            $this->db->write(function (Db $db) use ($chunk): void {
+                foreach ($chunk as $r) {
+                    $db->exec('DELETE FROM rl WHERE k = ?', [$r['k']]);
+                }
+            });
+            $done += count($chunk);
+            if (!$left()) {
+                break;
             }
-        });
-        return count($rows);
+        }
+        return $done;
     }
 
     /**
-     * Delete matching items in batches so no single statement holds the write lock for long.
+     * Delete matching items in batches so no single statement holds the write lock for long, and stop when the pass's budget is
+     * spent: a backlog (a hundred thousand rows of metadata that came due together) is worked off over several passes, not by
+     * one request that waits for all of it. The budget is asked between chunks of CHUNK rows, so a chunk is the most that can
+     * run past it.
      * @param array<int,mixed> $args
+     * @param callable():bool $left true while the pass has budget left
      */
-    private function deleteItems(string $where, array $args): int
+    private function deleteItems(string $where, array $args, callable $left): int
     {
         // DELETE ... LIMIT is not portable; select a bounded set of keys and delete exactly those.
         $total = 0;
-        for ($round = 0; $round < 50; $round++) {
+        for ($round = 0; $round < 50 && $left(); $round++) {
             $rows = $this->db->all('SELECT mailbox, seq FROM items WHERE ' . $where . ' LIMIT ' . self::BATCH, $args);
             if (!$rows) {
                 break;
             }
-            $this->db->write(function (Db $db) use ($rows): void {
-                foreach ($rows as $r) {
-                    $db->exec('DELETE FROM items WHERE mailbox = ? AND seq = ?', [$r['mailbox'], $r['seq']]);
+            foreach (array_chunk($rows, self::CHUNK) as $chunk) {
+                $this->db->write(function (Db $db) use ($chunk): void {
+                    foreach ($chunk as $r) {
+                        $db->exec('DELETE FROM items WHERE mailbox = ? AND seq = ?', [$r['mailbox'], $r['seq']]);
+                    }
+                });
+                $total += count($chunk);
+                if (!$left()) {
+                    return $total;
                 }
-            });
-            $total += count($rows);
+            }
             if (count($rows) < self::BATCH) {
                 break;
             }
