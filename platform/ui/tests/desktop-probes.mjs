@@ -37,7 +37,8 @@ await esbuild.build({
 export * as services from './src/lib/desktopServices.ts';
 export * as link from './src/lib/desktopLink.ts';
 export * as connect from './src/lib/desktopConnect.ts';
-export * as endpoint from './src/lib/engineEndpoint.ts';`,
+export * as endpoint from './src/lib/engineEndpoint.ts';
+export * as words from './src/lib/connectWords.ts';`,
     resolveDir: UI,
     loader: 'ts',
   },
@@ -357,6 +358,53 @@ await check('Reset keeps everything where the tab is still linked by Connect, an
   window.endpoint.setEngineBase(null);
   await window.settle();
   assert.equal(window.timers.size, polling, 'OAIY\'s own window never stops looking');
+});
+
+// ---------------------------------------------------------------------------
+// What the button and its card say, for each state (the review's F2 and F12)
+// ---------------------------------------------------------------------------
+await check('the words of each state: never connected sends nothing until pressed; linked (by Connect, or an address) asks each time the editor opens and every ten seconds; disconnected is the first again', async () => {
+  const p = await page();
+  const W = p.words;
+  const base = DEFAULT;
+  const never = W.connectState({ linkedByConnect: false, addressGiven: false, base, available: false });
+  const connected = W.connectState({ linkedByConnect: true, addressGiven: false, base, available: true });
+  const offline = W.connectState({ linkedByConnect: true, addressGiven: false, base, available: false });
+  const address = W.connectState({ linkedByConnect: false, addressGiven: true, base: LAN, available: false });
+  const addressUp = W.connectState({ linkedByConnect: false, addressGiven: true, base: LAN, available: true });
+  assert.deepEqual([never.kind, connected.kind, offline.kind, address.kind, addressUp.kind], ['never', 'connected', 'connected', 'address', 'address']);
+
+  const neverWords = W.connectWords(never);
+  assert.match(neverWords, /^Connect sends one request to http:\/\/127\.0\.0\.1:17972 \(GET \/api\/health\) to ask whether OAIY Desktop is running\. Until you press it this page sends nothing to your computer or your network\./);
+  assert.match(neverWords, /may ask whether this site may connect to devices on your network/);
+  assert.match(neverWords, /keeps the link: from then on the editor asks it again each time it opens and every 10 seconds while it is open, and reads its services\. Disconnect ends that\./, 'what one request leads to is said, not hidden');
+
+  for (const [name, state] of [['connected', connected], ['offline', offline], ['address', address], ['address that answers', addressUp]]) {
+    const words = W.connectWords(state);
+    assert.match(words, /each time it opens and every 10 seconds while it is open/, name);
+    assert.doesNotMatch(words, /sends nothing|Until you press it/, `${name}: what is true of a tab that has never connected is not said of this one`);
+    assert.ok(words.includes(state.base), `${name}: it names where it asks`);
+  }
+  assert.match(W.connectWords(connected), /^Connected to http:\/\/127\.0\.0\.1:17972\. This browser keeps the link: the editor asks OAIY Desktop whether it is running, and reads its services, each time it opens and every 10 seconds while it is open\. Disconnect ends that\.$/);
+  assert.match(W.connectWords(offline), /nothing answers now\. Connect asks again now; Disconnect forgets the link and ends that\.$/);
+  assert.match(W.connectWords(address), /^The engine's address in Settings is http:\/\/192\.168\.1\.50:17972, so the editor asks there .*; nothing answers now\. Reset above gives the default address back/);
+  assert.doesNotMatch(W.connectWords(addressUp), /nothing answers/);
+  assert.equal(new Set([neverWords, W.connectWords(connected), W.connectWords(offline), W.connectWords(address)]).size, 4, 'each says something the others do not');
+  assert.match(W.connectLead(never), /Already running OAIY Desktop\?/);
+  assert.match(W.connectLead(connected), /^Linked to OAIY Desktop\. $/);
+  assert.match(W.connectLead(offline), /does not answer now/);
+});
+
+await check('the state follows what the tab has: Connect made a link (it wins over an address), an address alone is a link, and neither is never', async () => {
+  const p = await page();
+  const S = (linkedByConnect, addressGiven) => p.words.connectState({ linkedByConnect, addressGiven, base: DEFAULT, available: false }).kind;
+  assert.equal(S(false, false), 'never');
+  assert.equal(S(true, false), 'connected');
+  assert.equal(S(true, true), 'connected');
+  assert.equal(S(false, true), 'address');
+  assert.equal(p.words.POLL_SECONDS, 10, 'and the seconds it says are the seconds the poll waits');
+  await p.connect.connectDesktop();
+  assert.deepEqual([...p.timers.values()].map((t) => t.ms / 1000).filter((s) => s === p.words.POLL_SECONDS).length, 2);
 });
 
 await check('listeners are told when the link is made or forgotten, so what depends on it is drawn again', async () => {
