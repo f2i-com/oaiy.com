@@ -43,7 +43,7 @@ const bundlePath = path.join(os.tmpdir(), `oaiy-local-media-${process.pid}.mjs`)
 await esbuild.build({
   stdin: {
     contents: `export { mediaUrlBlocked, BLOCKED_MEDIA_WORDS } from './src/lib/localMedia.ts';
-export { RUN_OUTPUT_FIELDS, withoutRunOutputs } from './src/utils/runOutputs.ts';
+export { RUN_OUTPUT_FIELDS, withoutRunOutputs, flowWithoutRunOutputs } from './src/utils/runOutputs.ts';
 export { parseImportedProject } from './src/utils/ProjectIO.ts';
 export { parseWorkflowJson } from './src/utils/WorkflowIO.ts';
 export { normalizeFlowData } from './src/hooks/usePackageManager.ts';
@@ -235,6 +235,15 @@ await check('a flow file added with "Import flows…" arrives without them, in e
   assert.equal(graphed.name, 'graphed');
   assert.deepEqual(STALE_FLOW.graph.nodes[0].data, { label: 'Out', outputValue: 'http://192.168.77.7:8188/view?filename=stale.png' }, 'what it was given is unchanged');
   assert.equal(M.normalizeFlowData({ name: 'neither' }), null);
+});
+
+await check('a flow that a shared link brings (App.tsx keeps its project) arrives without them, and what is not a flow with a graph is left as it is', () => {
+  const shared = M.flowWithoutRunOutputs(STALE_FLOW);
+  assert.deepEqual(shared.graph.nodes.map((n) => n.data), [{ label: 'Out' }, {}, { endpoint: 'http://192.168.77.11:9000/x' }]);
+  assert.equal(shared.name, 'Shared flow');
+  assert.deepEqual(shared.graph.edges, []);
+  assert.deepEqual(STALE_FLOW.graph.nodes[0].data, { label: 'Out', outputValue: 'http://192.168.77.7:8188/view?filename=stale.png' }, 'what it was given is unchanged');
+  for (const other of [null, undefined, 7, 'text', {}, { graph: null }, { graph: {} }, { graph: { nodes: 'no' } }]) assert.equal(M.flowWithoutRunOutputs(other), other, JSON.stringify(other));
 });
 
 fs.rmSync(stub, { force: true });
