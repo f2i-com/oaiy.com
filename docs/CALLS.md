@@ -122,19 +122,25 @@ unchanged and checked by `scripts/check-transfer-contract.mjs`; what only OAIY d
 next to it); the code is `voice/transfer.rs`, `voice/call.rs` and
 `ring/`. **Consent is not signed on this computer** (a plugin could flip a scope), so the owner's switch is
 best kept off unless every installed plugin is trusted: the Transfers page and `RECEPTIONIST.md` say so. The rule for
-all of it: **a caller is never left in silence for long, and never told a lie.** The longest silence there can be is 25
-seconds. After the owner has accepted, the receptionist says "Connecting you now", then, while the takeover is still set up, at
-most two short holding lines about 15 and 30 seconds later, and nothing at all once the owner has the call (the phone stops the
-session) or the takeover has failed: 15 seconds before the first line, 15 between the two, and 25 from the second to the 55
-seconds at which the takeover is given up on.
+all of it: **a caller is never left in silence for long, and never told a lie.** The longest silence there can be is about 25
+seconds, and only while a takeover the owner accepted is being made. After the owner has accepted, the receptionist says
+"Connecting you now", then, while the takeover is still set up, at most two short holding lines about 15 and 30 seconds later, and
+nothing at all once the owner has the call (the phone stops the session) or the takeover has failed: 15 seconds before the first
+line, 15 between the two, and then the second line (about 3 seconds long) and the 55 seconds at which the takeover is given up on,
+with the apology 2 seconds after that: 27 seconds from the start of the second line, about 24 of them without a word. While a request
+is waiting for the phone's answer (25 seconds at most) the desktop says a hold line 6 seconds after the request, counted from the tool
+call and not from an answer that may never come, and another 15 seconds after that, and if the phone never answers it offers a message
+4 seconds after giving up on it: no silence there is longer than 15 seconds, with the model dead or alive alike.
 The desktop's own clocks (`Transfer`, not the phone, the app or the model) say fixed lines: a hold line five
-seconds into a ring and every 15 seconds after (three wordings, at most six), "Connecting you now" at once
+seconds into a ring and every 15 seconds after (three wordings, at most six; the ones said before the phone answered are not counted
+against the six), "Connecting you now" at once
 on an acceptance and, while the takeover is set up (55 seconds at most), two holding lines 15 and 30 seconds after it ("Thank you
 for waiting, I'm still connecting you.", "Still working on connecting you, thank you for your patience.": they say only that it is
 being done, and promise no result and no time) and nothing more. The phone's stop (the owner has the caller), a takeover that
 fails, and the caller hanging up each cancel a line not yet said, and a line that falls due in the very moment the stop arrives
 is not said: nothing is said over the owner's first words, and never after the stop. The offer of a message comes 4 seconds after a
-decline, a ring nobody took or a failed takeover, unless the receptionist has already spoken. A line waits
+decline or a ring nobody took, and 2 seconds after a failed takeover (whose caller has already waited for it in silence), unless the
+receptionist has already spoken. A line waits
 for a receptionist who has spoken lately. When no page is answering calls (the Agent is closed or reloading),
 a caller's words no longer end the call while a request is going: the call is told `NoAnswerer` and answers
 with the line that fits, at most one every 3 seconds.
@@ -213,7 +219,9 @@ agent : "I'll try to reach them, please stay with me."  (it is trying: it does n
   only offers it ("would you like me to transfer you?") or hedges it ("I'll try to reach them") is said as written. The
   instructions also name the words. After an acceptance the desktop's own lines say it, and the model says nothing more.
 - **Nothing waits for ever.** A transfer request the phone never answers is answered to the model as
-  unavailable (`no_answer`) after 25 seconds, and the tools and the goodbye that waited behind it go. A
+  unavailable (`no_answer`) after 25 seconds, and the tools and the goodbye that waited behind it go. Meanwhile the
+  caller hears hold lines from the request (6 and 21 seconds after it), and if the receptionist then says nothing
+  they are offered a message 4 seconds after it is given up on. A
   request the phone cancels on its own (consent taken back, say) while the caller is still there ends
   with the caller offered a message, like any ending but an acceptance. A ring that has ended stays
   ended if the plugin says again that it is out.

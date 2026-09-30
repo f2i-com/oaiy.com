@@ -68,8 +68,17 @@ pub const HOLD_MAX: u32 = 6;
 /// one about fifteen seconds after that. Two, so the caller is never more than [`SETUP_LIMIT`] minus thirty seconds in silence at the end,
 /// and never more of them than the owner's first words could be spoken over.
 pub const CONNECT_MAX: u32 = 2;
+/// A request to reach the owner has been on the wire this long and the phone has not answered it: the desktop says a hold line, and again this
+/// long after that (unless the receptionist spoke lately), for as long as the request goes unanswered ([`TOOL_ANSWER_LIMIT`]), so a phone that
+/// never answers cannot leave the caller in silence. One second more than [`HOLD_AFTER`]: the phone answers in a second or two, so this is said
+/// only when it does not.
+pub const REQUEST_HOLD_AFTER: Duration = Duration::from_secs(6);
 /// After a ring ends without the owner, this long without a word from the receptionist and the desktop offers a message.
 pub const OFFER_AFTER: Duration = Duration::from_secs(4);
+/// ...but after an owner device accepted and the takeover then failed, this long: the caller has waited for the takeover in silence (up to
+/// [`SETUP_LIMIT`] less the two holding lines), so the apology is not held back for a receptionist who may be dead. A receptionist that is alive
+/// says its own offer within this time, and the desktop's is not said.
+pub const FAILED_AFTER: Duration = Duration::from_secs(2);
 /// A ring that has not been heard of this long after it should have ended is over.
 pub const GIVE_UP_AFTER: Duration = Duration::from_secs(5);
 /// After the owner accepts, the takeover must have happened by this long (setup 45 s and its grace 10 s).
@@ -82,10 +91,12 @@ pub const CANCEL_WAIT: Duration = Duration::from_secs(2);
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Timing {
     pub hold_after: Duration,
+    pub request_hold_after: Duration,
     pub hold_silence: Duration,
     pub hold_every: Duration,
     pub answer_gap: Duration,
     pub offer_after: Duration,
+    pub failed_after: Duration,
     pub give_up_after: Duration,
     pub setup_limit: Duration,
     pub cancel_wait: Duration,
@@ -94,7 +105,19 @@ pub struct Timing {
 
 impl Default for Timing {
     fn default() -> Self {
-        Self { hold_after: HOLD_AFTER, hold_silence: HOLD_SILENCE, hold_every: HOLD_EVERY, answer_gap: ANSWER_GAP, offer_after: OFFER_AFTER, give_up_after: GIVE_UP_AFTER, setup_limit: SETUP_LIMIT, cancel_wait: CANCEL_WAIT, tool_answer: TOOL_ANSWER_LIMIT }
+        Self {
+            hold_after: HOLD_AFTER,
+            request_hold_after: REQUEST_HOLD_AFTER,
+            hold_silence: HOLD_SILENCE,
+            hold_every: HOLD_EVERY,
+            answer_gap: ANSWER_GAP,
+            offer_after: OFFER_AFTER,
+            failed_after: FAILED_AFTER,
+            give_up_after: GIVE_UP_AFTER,
+            setup_limit: SETUP_LIMIT,
+            cancel_wait: CANCEL_WAIT,
+            tool_answer: TOOL_ANSWER_LIMIT,
+        }
     }
 }
 
@@ -351,8 +374,15 @@ pub struct Transfer {
     connect_at: Option<Instant>,
     connects_said: u32,
     hold_at: Option<Instant>,
-    /// Hold lines said for this ring.
+    /// Hold lines said for this ring (or for the request before the phone answered it).
     holds_said: u32,
+    /// How many of them were said before the phone answered, and are not counted against the ring's own [`HOLD_MAX`].
+    pending_holds: u32,
+    /// The request on the wire that this has begun to count the caller's silence for (by when it was sent), answered or not.
+    tracked: Option<Instant>,
+    /// A request is on the wire and the phone has not answered it, and nothing has ended it: the caller's silence is counted from when
+    /// it was sent, and a hold line is said for it as for a ring.
+    requested: bool,
     offer_at: Option<(Instant, &'static str)>,
     /// When the receptionist last said something that was not a hold word.
     last_said: Option<Instant>,
@@ -389,9 +419,63 @@ impl Transfer {
         }
         self.ringing = Some(Ringing { request: request.to_string(), give_up_at: now + Duration::from_secs(ring_seconds.clamp(1, 300)) + self.timing.give_up_after });
         self.hold_at = Some(now + self.timing.hold_after);
-        self.holds_said = 0;
+        // Lines said while the phone had not answered are not the ring's own: the wordings go on from them, and they are not counted
+        // against its cap.
+        self.pending_holds = if std::mem::take(&mut self.requested) {
+            self.holds_said
+        } else {
+            self.holds_said = 0;
+            0
+        };
         self.offer_at = None;
         true
+    }
+
+    /// A request to reach the owner is on the wire (it was sent at `since`) or none is: the caller's silence is counted from the request
+    /// and not from the phone's answer to it, which may take a second or two, or never come. Asked each time round, with the instant the
+    /// request was sent (see [`Tools::transfer_sent_at`]): a request newly on the wire starts the clock for a hold line
+    /// ([`Timing::request_hold_after`], and again every [`Timing::hold_every`]), and its going off the wire (the phone answered, refused
+    /// it, or it was given up on) stops it. Nothing starts for a call an owner device has, or for a ring that is going.
+    pub fn request_on_wire(&mut self, since: Option<Instant>) {
+        match since {
+            Some(at) if self.tracked != Some(at) => {
+                self.tracked = Some(at);
+                if self.ringing.is_none() && self.accepted.is_none() && !self.handing_over {
+                    self.requested = true;
+                    self.hold_at = Some(at + self.timing.request_hold_after);
+                    self.holds_said = 0;
+                    self.pending_holds = 0;
+                    self.offer_at = None;
+                }
+            }
+            Some(_) => {}
+            None => {
+                self.tracked = None;
+                if std::mem::take(&mut self.requested) && self.ringing.is_none() {
+                    self.hold_at = None;
+                }
+            }
+        }
+    }
+
+    /// The phone never answered the request (it was given up on after [`Timing::tool_answer`]): the receptionist is told it could not be
+    /// reached, and if it says nothing the caller is offered a message, as after a ring nobody took. Nothing is done for a request that
+    /// something else has ended already.
+    pub fn request_unanswered(&mut self, now: Instant) {
+        if std::mem::take(&mut self.requested) && self.ringing.is_none() {
+            self.hold_at = None;
+            self.offer_at = Some((now + self.timing.offer_after, OFFER_LINE));
+        }
+    }
+
+    /// The owner is being rung, or the phone is being waited on for a request it has not answered.
+    fn awaiting(&self) -> bool {
+        self.ringing.is_some() || self.requested
+    }
+
+    /// Another hold line may be said for this ring (the lines said before the phone answered do not count).
+    fn more_holds(&self) -> bool {
+        self.holds_said.saturating_sub(self.pending_holds) < HOLD_MAX
     }
 
     /// This desktop asks the phone to withdraw `request` (the owner declined): whether the frame should be sent, which it should be once
@@ -449,7 +533,7 @@ impl Transfer {
             return None;
         }
         // After an acceptance neither is going (the ring is over and no offer is due), so there is nothing to say.
-        let line = if self.ringing.is_some() {
+        let line = if self.awaiting() {
             let line = HOLD_LINES[self.holds_said as usize % HOLD_LINES.len()];
             self.holds_said += 1;
             self.hold_at = Some(now + self.timing.hold_every);
@@ -472,8 +556,8 @@ impl Transfer {
         let line = HOLD_LINES[self.holds_said as usize % HOLD_LINES.len()];
         self.holds_said += 1;
         self.last_said = Some(now);
-        if self.ringing.is_some() {
-            self.hold_at = (self.holds_said < HOLD_MAX).then_some(now + self.timing.hold_every);
+        if self.awaiting() {
+            self.hold_at = self.more_holds().then_some(now + self.timing.hold_every);
         }
         line
     }
@@ -508,6 +592,8 @@ impl Transfer {
             return Vec::new();
         }
         self.hold_at = None;
+        // A request the phone had not answered yet has its outcome: it is not waited on for a hold line any more.
+        self.requested = false;
         // Whatever the phone said, it has now answered a request to withdraw this one.
         self.cancelling = None;
         match outcome {
@@ -542,7 +628,9 @@ impl Transfer {
                 }
                 self.ringing = None;
                 self.handing_over = false;
-                self.offer_at = Some((now + self.timing.offer_after, if after_accept { FAILED_LINE } else { OFFER_LINE }));
+                // (After a takeover that failed the caller has waited for it in silence, so the apology comes sooner.)
+                let (after, line) = if after_accept { (self.timing.failed_after, FAILED_LINE) } else { (self.timing.offer_after, OFFER_LINE) };
+                self.offer_at = Some((now + after, line));
                 Vec::new()
             }
 
@@ -560,15 +648,15 @@ impl Transfer {
         if let Some(at) = self.hold_at.filter(|at| now >= *at) {
             // A receptionist that spoke lately has not left the caller in silence: look again after its silence.
             match self.last_said.filter(|said| now < *said + self.timing.hold_silence) {
-                Some(said) if self.ringing.is_some() => self.hold_at = Some(said + self.timing.hold_silence).filter(|next| *next > at),
+                Some(said) if self.awaiting() => self.hold_at = Some(said + self.timing.hold_silence).filter(|next| *next > at),
                 _ => {
                     self.hold_at = None;
-                    if self.ringing.is_some() {
+                    if self.awaiting() {
                         self.last_said = Some(now);
                         due.push(Due::Say(HOLD_LINES[self.holds_said as usize % HOLD_LINES.len()]));
                         self.holds_said += 1;
                         // Another, a while on, in another wording: a ring can last a minute and a half.
-                        self.hold_at = (self.holds_said < HOLD_MAX).then_some(now + self.timing.hold_every);
+                        self.hold_at = self.more_holds().then_some(now + self.timing.hold_every);
                     }
                 }
             }
@@ -654,6 +742,11 @@ impl Tools {
     /// A transfer request is on the wire or waiting to be sent: asked for, and not yet answered.
     pub fn transfer_pending(&self) -> bool {
         self.transfer_on_wire() || self.waiting.iter().any(Waiting::is_transfer)
+    }
+
+    /// When the transfer request on the wire was sent, if one is (and the phone has not answered it, nor has it been given up on).
+    pub fn transfer_sent_at(&self) -> Option<Instant> {
+        self.on_wire.iter().find(|(_, name, _)| name == TOOL).map(|(_, _, at)| *at)
     }
 
     /// Whether `name` may be sent now.
@@ -822,8 +915,8 @@ mod tests {
         assert_eq!(said, vec![(15, STILL_CONNECTING_LINES[0]), (30, STILL_CONNECTING_LINES[1])], "two, fifteen seconds apart, and no third before the limit");
         let after = t.outcome("assist_1", Outcome::Unavailable, at(61));
         assert!(after.is_empty() && t.may_speak() && !t.busy());
-        assert_eq!(t.next_deadline(), Some(at(61) + OFFER_AFTER));
-        assert_eq!(t.due(at(61) + OFFER_AFTER), vec![Due::Say(FAILED_LINE)]);
+        assert_eq!(t.next_deadline(), Some(at(61) + FAILED_AFTER), "the apology comes sooner than the offer after a ring nobody took: the caller has waited for the takeover");
+        assert_eq!(t.due(at(61) + FAILED_AFTER), vec![Due::Say(FAILED_LINE)]);
     }
 
     #[test]
@@ -844,7 +937,7 @@ mod tests {
         t.ringing("assist_1", 40, at(0));
         t.outcome("assist_1", Outcome::Accepted, at(6));
         t.outcome("assist_1", Outcome::Unavailable, at(10));
-        assert_eq!(t.due(at(10) + OFFER_AFTER), vec![Due::Say(FAILED_LINE)]);
+        assert_eq!(t.due(at(10) + FAILED_AFTER), vec![Due::Say(FAILED_LINE)]);
         assert!(t.due(at(6) + HOLD_EVERY).iter().all(|d| !matches!(d, Due::Connecting(_))));
         // A takeover whose time has run out says no holding line in that tick: it is the failure that is said.
         let mut t = Transfer::default();
@@ -881,7 +974,7 @@ mod tests {
         // The takeover failing is the way back, and the caller hears it.
         t.outcome("assist_1", Outcome::Unavailable, at(20));
         assert!(t.may_speak() && !t.busy());
-        assert!(t.due(at(20) + OFFER_AFTER).contains(&Due::Say(FAILED_LINE)));
+        assert!(t.due(at(20) + FAILED_AFTER).contains(&Due::Say(FAILED_LINE)));
     }
 
     #[test]
@@ -1208,13 +1301,145 @@ mod tests {
         // What docs/RECEPTIONIST.md says: a hold line five seconds in and every fifteen after, a message offered four seconds after an
         // ending, and the takeover given fifty-five seconds. A change to one of these is a change to what a caller is promised.
         assert_eq!((HOLD_AFTER, HOLD_EVERY, OFFER_AFTER, SETUP_LIMIT, CANCEL_WAIT), (Duration::from_secs(5), Duration::from_secs(15), Duration::from_secs(4), Duration::from_secs(55), Duration::from_secs(2)));
+        assert_eq!((REQUEST_HOLD_AFTER, FAILED_AFTER, TOOL_ANSWER_LIMIT), (Duration::from_secs(6), Duration::from_secs(2), Duration::from_secs(25)));
         assert_eq!((HOLD_MAX, CONNECT_MAX), (6, 2));
-        // Two holding lines while a takeover is set up: the caller's longest silence there is the fifteen seconds before the first and the
-        // twenty-five after the second.
-        assert!(SETUP_LIMIT - HOLD_EVERY * CONNECT_MAX <= Duration::from_secs(25));
+        // Two holding lines while a takeover is set up. The longest silence there is the fifteen seconds before the first, the fifteen
+        // between the two, and after the second (said thirty seconds in, and about three seconds long) the takeover's fifty-five seconds
+        // and the apology two seconds after that: twenty-seven seconds from the start of the second line, about twenty-four of them silent.
+        assert_eq!(SETUP_LIMIT + FAILED_AFTER - HOLD_EVERY * CONNECT_MAX, Duration::from_secs(27));
         // Six lines fifteen seconds apart cover the longest ring (ninety seconds) from the first at five seconds.
         assert!(HOLD_AFTER + HOLD_EVERY * (HOLD_MAX - 1) + HOLD_EVERY >= Duration::from_secs(90));
-        assert_eq!(Timing::default(), Timing { hold_after: HOLD_AFTER, hold_silence: HOLD_SILENCE, hold_every: HOLD_EVERY, answer_gap: ANSWER_GAP, offer_after: OFFER_AFTER, give_up_after: GIVE_UP_AFTER, setup_limit: SETUP_LIMIT, cancel_wait: CANCEL_WAIT, tool_answer: TOOL_ANSWER_LIMIT });
+        // A request the phone does not answer: a line six seconds after the request, another fifteen after that, and then the twenty-five
+        // seconds it is given up on and the offer four seconds after: the longest silence is the fifteen between the lines.
+        assert!(REQUEST_HOLD_AFTER + HOLD_EVERY < TOOL_ANSWER_LIMIT, "two lines before it is given up on");
+        assert!(REQUEST_HOLD_AFTER.max(HOLD_EVERY).max(TOOL_ANSWER_LIMIT - REQUEST_HOLD_AFTER - HOLD_EVERY + OFFER_AFTER) <= Duration::from_secs(15));
+        assert_eq!(
+            Timing::default(),
+            Timing {
+                hold_after: HOLD_AFTER,
+                request_hold_after: REQUEST_HOLD_AFTER,
+                hold_silence: HOLD_SILENCE,
+                hold_every: HOLD_EVERY,
+                answer_gap: ANSWER_GAP,
+                offer_after: OFFER_AFTER,
+                failed_after: FAILED_AFTER,
+                give_up_after: GIVE_UP_AFTER,
+                setup_limit: SETUP_LIMIT,
+                cancel_wait: CANCEL_WAIT,
+                tool_answer: TOOL_ANSWER_LIMIT
+            }
+        );
+    }
+
+    #[test]
+    fn a_request_the_phone_does_not_answer_is_covered_by_a_hold_line_from_the_request_and_not_from_an_answer_that_may_never_come() {
+        let mut t = Transfer::default();
+        let sent = at(100);
+        t.request_on_wire(Some(sent));
+        assert!(!t.awaiting_owner() && !t.busy(), "nothing rings and nobody holds it: only the caller's silence is counted");
+        assert_eq!(t.next_deadline(), Some(sent + REQUEST_HOLD_AFTER), "a line six seconds after the request");
+        assert!(t.due(sent + REQUEST_HOLD_AFTER - Duration::from_secs(1)).is_empty());
+        assert_eq!(t.due(sent + REQUEST_HOLD_AFTER), vec![Due::Say(HOLD_LINES[0])]);
+        // Looked at again and again while it is on the wire: nothing starts over.
+        t.request_on_wire(Some(sent));
+        assert_eq!(t.next_deadline(), Some(sent + REQUEST_HOLD_AFTER + HOLD_EVERY), "another fifteen seconds on, in another wording");
+        assert_eq!(t.due(sent + REQUEST_HOLD_AFTER + HOLD_EVERY), vec![Due::Say(HOLD_LINES[1])]);
+        // The phone never answers: it is given up on, and a caller who is still in silence is offered a message a few seconds after.
+        t.request_unanswered(sent + TOOL_ANSWER_LIMIT);
+        t.request_on_wire(None);
+        assert_eq!(t.next_deadline(), Some(sent + TOOL_ANSWER_LIMIT + OFFER_AFTER));
+        assert_eq!(t.due(sent + TOOL_ANSWER_LIMIT + OFFER_AFTER), vec![Due::Say(OFFER_LINE)]);
+        assert!(t.next_deadline().is_none(), "and nothing else is due");
+        // ...unless the receptionist has spoken by then.
+        let mut spoke = Transfer::default();
+        spoke.request_on_wire(Some(sent));
+        spoke.request_unanswered(sent + TOOL_ANSWER_LIMIT);
+        spoke.app_said(sent + TOOL_ANSWER_LIMIT + Duration::from_secs(1));
+        assert!(spoke.due(sent + TOOL_ANSWER_LIMIT + OFFER_AFTER).is_empty());
+    }
+
+    #[test]
+    fn the_hold_clock_of_a_request_hands_over_to_the_rings_when_the_phone_answers_and_stops_when_it_refuses_or_something_ends_the_request() {
+        let sent = at(100);
+        // The phone answers ringing after a line was said: the ring's clock goes on from it (its first line waits for the silence to be as long
+        // as ever), the wordings go on in turn from the one said, and the ring has its own six.
+        let mut t = Transfer::default();
+        t.request_on_wire(Some(sent));
+        assert_eq!(t.due(sent + REQUEST_HOLD_AFTER), vec![Due::Say(HOLD_LINES[0])]);
+        t.ringing("assist_1", 90, sent + Duration::from_secs(8));
+        t.request_on_wire(None);
+        assert_eq!(t.next_deadline(), Some(sent + Duration::from_secs(8) + HOLD_AFTER));
+        let mut said = Vec::new();
+        for i in 0..10 {
+            for due in t.due(sent + Duration::from_secs(13) + HOLD_EVERY * i) {
+                if let Due::Say(line) = due {
+                    said.push(line);
+                }
+            }
+        }
+        // (The first look, thirteen seconds in, finds the line said at six not yet eight seconds old and puts the next back to fourteen.)
+        assert_eq!(said, [HOLD_LINES[1], HOLD_LINES[2], HOLD_LINES[0], HOLD_LINES[1], HOLD_LINES[2], HOLD_LINES[0]], "the ring's six, in turn from the one said before the phone answered");
+        // The phone refuses it: it is off the wire, and nothing is said for it nor offered.
+        let mut refused = Transfer::default();
+        refused.request_on_wire(Some(sent));
+        refused.request_on_wire(None);
+        assert!(refused.next_deadline().is_none());
+        assert!(refused.due(sent + TOOL_ANSWER_LIMIT * 2).is_empty());
+        // An outcome for it (the phone opens the request before it answers the tool call, and the owner declined at once) ends it: the
+        // offer of a message and no hold line, though the tool call is still unanswered.
+        let mut ended = Transfer::default();
+        ended.request_on_wire(Some(sent));
+        ended.outcome("assist_1", Outcome::Declined, sent + Duration::from_secs(2));
+        ended.request_on_wire(Some(sent));
+        assert!(!ended.awaiting_owner());
+        assert_eq!(ended.answer_caller(sent + Duration::from_secs(3)), Some(OFFER_LINE), "a caller who speaks now is offered a message, not held");
+        assert!(ended.due(sent + TOOL_ANSWER_LIMIT * 2).iter().all(|d| !matches!(d, Due::Say(l) if HOLD_LINES.contains(l))));
+        // The receptionist spoke lately: the line waits for its silence to be as long as ever.
+        let mut talking = Transfer::default();
+        talking.request_on_wire(Some(sent));
+        talking.app_said(sent + Duration::from_secs(3));
+        assert!(talking.due(sent + REQUEST_HOLD_AFTER).is_empty());
+        assert_eq!(talking.next_deadline(), Some(sent + Duration::from_secs(3) + HOLD_SILENCE));
+        assert_eq!(talking.due(sent + Duration::from_secs(3) + HOLD_SILENCE), vec![Due::Say(HOLD_LINES[0])]);
+        // A caller who speaks with nothing to answer them, while the phone has not answered: a hold line, and not more than one in a moment.
+        let mut spoken_to = Transfer::default();
+        spoken_to.request_on_wire(Some(sent));
+        assert_eq!(spoken_to.answer_caller(sent + Duration::from_secs(2)), Some(HOLD_LINES[0]));
+        assert_eq!(spoken_to.answer_caller(sent + Duration::from_secs(3)), None);
+        // A line the receptionist wrote that promised a transfer, said as a hold line in its place while the phone has not answered: the
+        // hold clock is put back after it, as for a ring.
+        let mut replaced = Transfer::default();
+        replaced.request_on_wire(Some(sent));
+        assert_eq!(replaced.hold_instead(sent + Duration::from_secs(2)), HOLD_LINES[0]);
+        assert_eq!(replaced.next_deadline(), Some(sent + Duration::from_secs(2) + HOLD_EVERY));
+        // Nothing is counted for a call an owner device has.
+        let mut owned = Transfer::default();
+        owned.ringing("assist_1", 40, sent);
+        owned.outcome("assist_1", Outcome::Accepted, sent + Duration::from_secs(1));
+        owned.request_on_wire(Some(sent + Duration::from_secs(2)));
+        assert!(owned.due(sent + Duration::from_secs(2) + REQUEST_HOLD_AFTER).iter().all(|d| !matches!(d, Due::Say(l) if HOLD_LINES.contains(l))));
+        // A second request, after the first ended, has a clock of its own.
+        let mut second = Transfer::default();
+        second.request_on_wire(Some(sent));
+        second.request_unanswered(sent + TOOL_ANSWER_LIMIT);
+        second.request_on_wire(None);
+        let again = sent + Duration::from_secs(60);
+        second.request_on_wire(Some(again));
+        assert_eq!(second.next_deadline(), Some(again + REQUEST_HOLD_AFTER));
+    }
+
+    #[test]
+    fn the_apology_after_a_takeover_that_failed_comes_two_seconds_after_and_the_offer_after_a_ring_nobody_took_four() {
+        for (outcome, accepted, wait, line) in [(Outcome::Unavailable, true, FAILED_AFTER, FAILED_LINE), (Outcome::Declined, false, OFFER_AFTER, OFFER_LINE), (Outcome::Expired, false, OFFER_AFTER, OFFER_LINE)] {
+            let mut t = Transfer::default();
+            t.ringing("assist_1", 40, at(0));
+            if accepted {
+                t.outcome("assist_1", Outcome::Accepted, at(10));
+            }
+            t.outcome("assist_1", outcome, at(60));
+            assert!(t.due(at(60) + wait - Duration::from_millis(1)).iter().all(|d| !matches!(d, Due::Say(l) if *l == line)), "{outcome:?}: not before {wait:?}");
+            assert_eq!(t.due(at(60) + wait), vec![Due::Say(line)], "{outcome:?}");
+        }
     }
 
     #[test]

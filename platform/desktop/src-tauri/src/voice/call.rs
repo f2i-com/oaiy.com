@@ -992,6 +992,9 @@ where
     // Frames taken from the stream to see whether a stop is already there (see `stop_already_here`), and not yet read.
     let mut backlog: VecDeque<Frame<E>> = VecDeque::new();
     let reason: String = loop {
+        // A request to reach the owner that the phone has not answered: the caller's silence is counted from when it was sent, and not from an
+        // answer that may take long or never come.
+        transfer.request_on_wire(tools.transfer_sent_at());
         // The next moment one of the transfer's clocks has something to do: a caller is not left in silence.
         let watch = [transfer.next_deadline(), tools.next_expiry(timing.tool_answer)].into_iter().flatten().min();
         tokio::select! {
@@ -1444,6 +1447,9 @@ where
                     }
                 }
                 if !unanswered.is_empty() {
+                    // The caller who is left with nothing said is offered a message a few seconds after (the receptionist, told it could not be
+                    // reached, is given those seconds to offer it itself).
+                    transfer.request_unanswered(Instant::now());
                     // A withdrawal that waited for the phone to name the request it never named: it may have opened one all the same, so the
                     // phone is told now, and this desktop waits for its answer as for any.
                     if let Some((queued, reason)) = queued_cancel.take() {
@@ -2727,7 +2733,19 @@ mod tests {
 
     /// The clocks of a ring, fast enough for a test.
     fn quick() -> transfer::Timing {
-        transfer::Timing { hold_after: Duration::from_millis(300), hold_silence: Duration::from_millis(300), hold_every: Duration::from_millis(400), answer_gap: Duration::from_millis(150), offer_after: Duration::from_millis(300), give_up_after: Duration::from_millis(200), setup_limit: Duration::from_millis(600), cancel_wait: Duration::from_millis(500), tool_answer: Duration::from_millis(2_500) }
+        transfer::Timing {
+            hold_after: Duration::from_millis(300),
+            request_hold_after: Duration::from_millis(350),
+            hold_silence: Duration::from_millis(300),
+            hold_every: Duration::from_millis(400),
+            answer_gap: Duration::from_millis(150),
+            offer_after: Duration::from_millis(300),
+            failed_after: Duration::from_millis(100),
+            give_up_after: Duration::from_millis(200),
+            setup_limit: Duration::from_millis(600),
+            cancel_wait: Duration::from_millis(500),
+            tool_answer: Duration::from_millis(2_500),
+        }
     }
 
     fn owner_settings(enabled: bool) -> crate::ring::RingSettings {

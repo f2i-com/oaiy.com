@@ -39,8 +39,15 @@ The plan reasons OAIY puts in an `oaiy.ring.plan` answer are exactly the plugin'
   the Agent page works. The stop with `handoff:takeover`, an `unavailable` outcome, a `failback` start or the caller
   hanging up cancels a line not yet said, a line that falls due in the very moment a stop arrives is dropped, and
   nothing is said after the stop. Its own 55 second clock (45 s of setup and 10 s of grace) ends a takeover that
-  never comes, and the caller is offered a message. With the two lines the longest silence is 25 s. The
-  application's own lines are refused throughout.
+  never comes, and the caller is told so and offered a message 2 seconds later (a receptionist that speaks in that
+  time makes the offer itself). With the two lines the longest silence is about 24 s: 15 s before the first, 15 s
+  between them, and after the second (said at 30 s, about 3 s long) the 55 s and the 2 s, which is 27 s from the start
+  of the second line. The application's own lines are refused throughout.
+* **While the plugin has not answered the `transfer_to_owner` request** (up to 25 seconds, then `no_answer`) the
+  desktop says a hold line 6 seconds after the request was sent and another 15 seconds after that, counted from the
+  request and not from the plugin's answer, which may take long or never come, whether or not the model or the Agent
+  page works; on `no_answer` a caller the receptionist leaves in silence is offered a message 4 seconds later. No
+  silence there is longer than 15 seconds.
 * **While the owner is rung** the desktop says a fixed hold line five seconds in and every 15 seconds after
   (three wordings, at most six) when the receptionist has said nothing, whether or not the model or the Agent
   page is working. None of them says the call is being put through, and a line from the model that does (before it

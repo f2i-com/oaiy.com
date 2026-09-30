@@ -147,8 +147,12 @@ What happens, every way it can go:
 The receptionist never promises a callback time, never says why you are not available, and has no
 number of yours to give. What the caller hears does not depend on the model or the Agent page
 working: the desktop says short fixed lines itself, on its own clocks. The longest silence a caller can hear
-is 25 seconds, and only while a connection you accepted is being made (see below).
+is about 25 seconds, and only while a connection you accepted is being made (see below).
 
+- **While the phone has not yet answered the request**, if the receptionist has said nothing, a hold line six
+  seconds after the request was made and another 15 seconds after that (counted from the request, so a phone that never
+  answers cannot leave the caller in silence); if the phone has not answered in 25 seconds the request is given up on,
+  the receptionist is told, and if it says nothing the caller is offered a message 4 seconds later.
 - **While you are rung**, if the receptionist has said nothing, a hold line five seconds in and
   another every 15 seconds after (three wordings in turn, at most six, so a ring of 90 seconds is
   covered): the longest silence is about 15 seconds. None of them says the call is being put through.
@@ -157,10 +161,11 @@ is 25 seconds, and only while a connection you accepted is being made (see below
   "Still working on connecting you, thank you for your patience.": they say only that it is being made, never that you
   are on the line). Once you have the call nothing more is said, and never a word after your Companion takes it, so
   the receptionist is never speaking over your first words. The connection has 55 seconds; if it has not come by
-  then the desktop says it could not connect the caller and offers a message. With the two lines the longest silence is
-  25 seconds (15 before the first, 15 between them, 25 from the second to the 55).
-- **After a decline, a ring nobody took or a takeover that failed**, the offer of a message within
-  4 seconds of the phone's answer, unless the receptionist has already made it.
+  then the desktop says it could not connect the caller and offers a message, 2 seconds later. With the two lines the
+  longest silence is about 24 seconds (15 before the first, 15 between them; the second line is about 3 seconds long and
+  the apology comes 27 seconds after its start, at 57 seconds after you accepted).
+- **After a decline or a ring nobody took**, the offer of a message within 4 seconds of the phone's answer, unless the
+  receptionist has already made it; **after a takeover that failed**, 2 seconds after (the caller has waited for it already).
 
 - **If the Agent page is closed or reloaded** while you are rung (nothing is answering calls), a
   caller who speaks is not hung up on: they hear the hold line or the offer of
