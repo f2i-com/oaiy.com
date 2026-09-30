@@ -109,13 +109,19 @@ pub(crate) struct Entry {
 /// refusing one that is too big to be a blob.
 pub(super) fn read_blob(mut file: File) -> Result<Zeroizing<Vec<u8>>, KeyError> {
     let length = file.metadata().map_err(|e| KeyError::io("inspect a key file", e))?.len();
+    read_exactly(&mut file, length)
+}
+
+/// Reads `length` bytes from `reader`, which must end there: a reader that has more (the file grew between the moment its size was asked and the read) is an
+/// error and not a truncated secret, and one that has less is an error too. A `length` that no blob can have is refused before anything is allocated.
+pub(super) fn read_exactly(reader: &mut impl Read, length: u64) -> Result<Zeroizing<Vec<u8>>, KeyError> {
     if length > MAX_BLOB_LEN as u64 {
         return Err(KeyError::Corrupt("larger than any secret"));
     }
     let mut bytes = Zeroizing::new(vec![0u8; length as usize]);
-    file.read_exact(&mut bytes).map_err(|e| KeyError::io("read a key file", e))?;
+    reader.read_exact(&mut bytes).map_err(|e| KeyError::io("read a key file", e))?;
     let mut extra = [0u8; 1];
-    if file.read(&mut extra).map_err(|e| KeyError::io("read a key file", e))? != 0 {
+    if reader.read(&mut extra).map_err(|e| KeyError::io("read a key file", e))? != 0 {
         return Err(KeyError::Corrupt("the file changed while it was read"));
     }
     Ok(bytes)
@@ -167,4 +173,38 @@ impl KeyDir {
     #[cfg(not(test))]
     #[inline(always)]
     pub(crate) fn fire(&self, _point: &'static str) {}
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::io::Cursor;
+
+    /// KM08: the size of a file is asked, and the file is read; in between it can grow. The extra byte is what says so: without the check the first `length`
+    /// bytes of a file that changed are returned as if they were the file.
+    #[test]
+    fn a_file_that_grew_or_shrank_while_it_was_read_is_an_error_not_a_secret() {
+        let ok = read_exactly(&mut Cursor::new(vec![7u8; 4]), 4).unwrap();
+        assert_eq!(&**ok, &[7u8; 4]);
+        let grew = read_exactly(&mut Cursor::new(vec![7u8; 5]), 4).unwrap_err();
+        assert!(matches!(grew, KeyError::Corrupt("the file changed while it was read")), "{grew:?}");
+        let shrank = read_exactly(&mut Cursor::new(vec![7u8; 3]), 4).unwrap_err();
+        assert!(matches!(shrank, KeyError::Io { op: "read a key file", .. }), "{shrank:?}");
+        let empty = read_exactly(&mut Cursor::new(Vec::new()), 0).unwrap();
+        assert!(empty.is_empty());
+    }
+
+    /// A length that no blob can have is refused before the reader is touched and before any buffer exists.
+    #[test]
+    fn a_length_no_blob_can_have_is_refused_before_anything_is_read_or_allocated() {
+        struct NeverRead;
+        impl Read for NeverRead {
+            fn read(&mut self, _: &mut [u8]) -> io::Result<usize> {
+                panic!("the reader was touched");
+            }
+        }
+        let error = read_exactly(&mut NeverRead, MAX_BLOB_LEN as u64 + 1).unwrap_err();
+        assert!(matches!(error, KeyError::Corrupt("larger than any secret")), "{error:?}");
+        assert!(read_exactly(&mut Cursor::new(vec![0u8; MAX_BLOB_LEN]), MAX_BLOB_LEN as u64).is_ok(), "the largest blob is read");
+    }
 }

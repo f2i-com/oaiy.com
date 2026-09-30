@@ -865,6 +865,28 @@ mod unix {
         assert!(matches!(open_at(link_parent.0.join("keys"), ProviderChoice::Keyfile), Err(KeyError::Permissions(_))));
     }
 
+    /// KM25: every failure to open a key file other than "there is no such file" is an error. A store that read them all as "never stored" would let a caller
+    /// mint a new identity over a key it merely could not open (a file that another account owns, a disk that is failing). A mode of 0000 is the simplest such
+    /// failure; root is not stopped by modes, so the test stands aside for root (the locked-file test does the same on Windows).
+    #[test]
+    fn a_key_file_that_cannot_be_opened_is_an_error_and_never_none() {
+        if rustix::process::geteuid().is_root() {
+            return;
+        }
+        let scratch = Scratch::new("noaccess");
+        let store = store(&scratch, ProviderChoice::Keyfile);
+        store.put(&name("vault.pins"), b"pins").unwrap();
+        let file = file_of(&scratch, "vault.pins", "kf");
+        fs::set_permissions(&file, fs::Permissions::from_mode(0o000)).unwrap();
+        let error = store.get(&name("vault.pins")).expect_err("a file that cannot be opened is not `None`");
+        assert!(
+            matches!(&error, KeyError::Io { op: "open a key file", source } if source.kind() == std::io::ErrorKind::PermissionDenied),
+            "{error:?}"
+        );
+        assert!(matches!(store.put(&name("vault.pins"), b"x"), Ok(())), "a put replaces the file by renaming, which needs no access to the old one");
+        assert_eq!(get(&*store, &name("vault.pins")), Some(b"x".to_vec()));
+    }
+
     fn make_fifo(path: &Path) {
         use rustix::fs::{mknodat, FileType, Mode, CWD};
         mknodat(CWD, path, FileType::Fifo, Mode::RUSR | Mode::WUSR, 0).unwrap();
