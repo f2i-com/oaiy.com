@@ -205,8 +205,13 @@ impl Inner {
                 }
                 self.quarantined = true;
                 self.protected = true;
+                // How long what is taken is kept in memory is the store's own window (fifteen seconds, in use), and is said as it is.
+                let kept = match self.patience.window.as_secs() {
+                    0 => String::new(),
+                    seconds => format!("messages taken in the first {seconds} seconds are kept in memory and written when it can be, and after that "),
+                };
                 self.problem = Some(format!(
-                    "The file of saved messages could not be read ({e}): another program may have it open. OAIY is trying again; messages taken in the first few seconds are kept in memory and written when it can be, and after that no new message can be kept until it can be read. The file has not been changed."
+                    "The file of saved messages could not be read ({e}): another program may have it open. OAIY is trying again; {kept}no new message can be kept until it can be read. The file has not been changed."
                 ));
                 return;
             }

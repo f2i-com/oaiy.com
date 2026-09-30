@@ -520,8 +520,8 @@ mod tests {
         names
     }
 
-    /// The desktop does not wait on a busy file for long as it starts (three stores, one after the other, on the thread that sets the window up), and
-    /// goes back to it, in memory meanwhile, ever less often.
+    /// The desktop does not wait on a busy file for long as it starts (three stores, one after the other, as its local server is built), and goes back
+    /// to it, in memory meanwhile, ever less often.
     #[test]
     fn the_desktop_waits_under_a_second_for_a_busy_file_as_it_starts_and_goes_back_to_it_ever_less_often() {
         let secs = std::time::Duration::from_secs;

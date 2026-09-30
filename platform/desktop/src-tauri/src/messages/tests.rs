@@ -399,6 +399,15 @@ fn a_messages_file_that_is_busy_at_start_is_read_again_and_what_was_taken_meanwh
     std::fs::create_dir(&file).unwrap(); // a read fails where the file belongs
     let store = Store::open_patiently(&dir.0, Patience { start: vec![ms(1)], later: vec![ms(20)], window: std::time::Duration::from_secs(60) });
     assert!(store.notice().is_some_and(|n| n.contains("could not be read") && n.contains("trying again")), "the owner is told: {:?}", store.notice());
+    // ...and told for how long what is taken is kept in memory: the store's own window, and nothing of it when it keeps none.
+    assert!(store.notice().is_some_and(|n| n.contains("in the first 60 seconds are kept in memory")), "{:?}", store.notice());
+    let none_kept = TempDir::new("messages-busy-none");
+    Store::open(&none_kept.0).add(new("call_1", "+61491570006", "Ring me about Friday.")).unwrap();
+    let held = none_kept.0.join("messages").join(FILE_NAME);
+    std::fs::remove_file(&held).unwrap();
+    std::fs::create_dir(&held).unwrap();
+    let none = Store::open_patiently(&none_kept.0, Patience { start: vec![ms(1)], later: vec![ms(20)], window: std::time::Duration::ZERO });
+    assert!(none.notice().is_some_and(|n| n.contains("no new message can be kept until it can be read") && !n.contains("kept in memory")), "{:?}", none.notice());
     // A message taken meanwhile is kept, in memory, and the file is not touched.
     let meanwhile = store.add(new("call_2", "+61491570156", "Another one.")).expect("kept in memory while the file is busy");
     assert_eq!(store.list(None, "").len(), 1);
