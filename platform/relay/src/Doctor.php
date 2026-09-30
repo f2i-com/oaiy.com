@@ -221,6 +221,44 @@ final class Doctor
         return $out;
     }
 
+    /** "45 s", "12 min", "3 h" or "2 days": how long ago, for a message. */
+    public static function age(int $seconds): string
+    {
+        $seconds = max(0, $seconds);
+        if ($seconds < 120) {
+            return $seconds . ' s';
+        }
+        if ($seconds < 7200) {
+            return intdiv($seconds, 60) . ' min';
+        }
+        if ($seconds < 172800) {
+            return intdiv($seconds, 3600) . ' h';
+        }
+        return intdiv($seconds, 86400) . ' days';
+    }
+
+    /**
+     * The two files the installer leaves for the owner to read once and delete. They hold a secret each (the one-time
+     * enrolment key, the admin token), so while they are there anyone who can read data/ can use them: a warning, naming the
+     * file and how old it is.
+     * @param list<array{name:string,age:int}> $files the files that exist, with their age in seconds
+     * @return list<array{name:string,level:string,message:string}>
+     */
+    public static function leftovers(array $files): array
+    {
+        if (!$files) {
+            return [self::row('data.leftovers', self::OK, 'no first-key.txt or admin-token.txt is left in data/')];
+        }
+        $parts = [];
+        foreach ($files as $f) {
+            $what = $f['name'] === Installer::FIRST_KEY
+                ? 'a one-time enrolment key: use it in OAIY (Connections, Remote access), then delete it (re-arm a lost one with php bin/install.php --rekey)'
+                : 'the admin token: keep it somewhere safe, then delete this copy';
+            $parts[] = 'data/' . $f['name'] . ' is still there (' . self::age($f['age']) . ' old): it is ' . $what;
+        }
+        return [self::row('data.leftovers', self::WARN, implode('; ', $parts))];
+    }
+
     /**
      * SQLite's journal mode against the filesystem the database lives on.
      * @return list<array{name:string,level:string,message:string}>
@@ -459,6 +497,14 @@ final class Doctor
             }
         }
         $out = array_merge($out, self::modes($items, $posix));
+        $left = [];
+        foreach ([Installer::FIRST_KEY, Installer::ADMIN_TOKEN_FILE] as $f) {
+            $t = is_file($data . '/' . $f) ? @filemtime($data . '/' . $f) : false;
+            if ($t !== false) {
+                $left[] = ['name' => $f, 'age' => time() - $t];
+            }
+        }
+        $out = array_merge($out, self::leftovers($left));
 
         $installed = Installer::isInstalled($data);
         $out[] = $installed

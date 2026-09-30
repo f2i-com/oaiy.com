@@ -215,7 +215,9 @@ Accepted and validated now, used by later parts of the relay: `apps`, `compat.ss
 `php bin/doctor.php [--url=https://relay.example.com] [--admin-token-file=PATH] [--json] [--no-slow-body] [--skip-web]`
 
 It checks PHP, extensions, the ini values that matter (memory_limit 64M or more, post_max_size, disabled functions), the data
-folder (outside `public/`, modes, config, schema, journal mode against the filesystem type), that a wake shard written here is
+folder (outside `public/`, modes, config, schema, journal mode against the filesystem type, and a warning naming
+`first-key.txt` or `admin-token.txt` and how old it is while either is still there: each holds a secret you were to read once
+and delete), that a wake shard written here is
 visible to a second PHP process within 50 ms, and the keys. With `--url` it also asks the public address what only the web can
 answer: it requests `/data/relay.sqlite`, `/data/secrets/admission.hmac`, `/data/secrets/relay.key`, a dot-dot path into
 `data/`, `/bin/doctor.php`, `/src/Db.php`, `/install.php` (after installation), `/.env`, and what an install leaves behind that

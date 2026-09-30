@@ -193,6 +193,47 @@ test('4.18.8 doctor: a secret file readable by group or other fails, a wide data
     eq('ok', doc_level(Doctor::modes($items(0666, 0777), false), 'data.modes'), 'not judged where modes mean nothing');
 });
 
+test('4.18.8 doctor: the one-time key and the admin token left in data/ are a warning that names the file and its age, and nothing left is a pass', function () {
+    eq('ok', doc_level(Doctor::leftovers([]), 'data.leftovers'));
+    $rows = Doctor::leftovers([['name' => 'first-key.txt', 'age' => 90]]);
+    eq('warn', doc_level($rows, 'data.leftovers'));
+    contains('data/first-key.txt', doc_msg($rows, 'data.leftovers'));
+    contains('90 s old', doc_msg($rows, 'data.leftovers'));
+    contains('one-time enrolment key', doc_msg($rows, 'data.leftovers'));
+    contains('--rekey', doc_msg($rows, 'data.leftovers'));
+    not_contains('admin-token', doc_msg($rows, 'data.leftovers'));
+    $rows = Doctor::leftovers([['name' => 'admin-token.txt', 'age' => 3 * 3600 + 5]]);
+    eq('warn', doc_level($rows, 'data.leftovers'));
+    contains('data/admin-token.txt', doc_msg($rows, 'data.leftovers'));
+    contains('3 h old', doc_msg($rows, 'data.leftovers'));
+    contains('admin token', doc_msg($rows, 'data.leftovers'));
+    $both = Doctor::leftovers([['name' => 'first-key.txt', 'age' => 5], ['name' => 'admin-token.txt', 'age' => 5]]);
+    contains('first-key.txt', doc_msg($both, 'data.leftovers'));
+    contains('admin-token.txt', doc_msg($both, 'data.leftovers'));
+    // Ages read naturally.
+    foreach ([[0, '0 s'], [119, '119 s'], [120, '2 min'], [3599, '59 min'], [7199, '119 min'], [7200, '2 h'], [86400, '24 h'], [172799, '47 h'], [172800, '2 days'], [-5, '0 s']] as [$s, $want]) {
+        eq($want, Doctor::age($s), (string)$s);
+    }
+    // No secret in the message: only names and ages.
+    not_contains('oaiy://', doc_msg($both, 'data.leftovers'));
+    not_contains('oaiyadm1', doc_msg($both, 'data.leftovers'));
+});
+
+test('4.18.8 doctor: a fresh install still has its two files and the doctor says so; once they are deleted it passes', function () {
+    $data = doc_data();
+    $rows = Doctor::run(['dataDir' => $data, 'web' => false]);
+    eq('warn', doc_level($rows, 'data.leftovers'));
+    contains('first-key.txt', doc_msg($rows, 'data.leftovers'));
+    contains('admin-token.txt', doc_msg($rows, 'data.leftovers'));
+    eq([], doc_failures($rows), 'a warning, not a failure');
+    // A file made an hour ago is reported as an hour old.
+    touch($data . '/first-key.txt', time() - 3 * 3600);
+    contains('3 h old', doc_msg(Doctor::run(['dataDir' => $data, 'web' => false]), 'data.leftovers'));
+    unlink($data . '/first-key.txt');
+    unlink($data . '/admin-token.txt');
+    eq('ok', doc_level(Doctor::run(['dataDir' => $data, 'web' => false]), 'data.leftovers'));
+});
+
 test('4.18.8 doctor: every exposure probe must answer 403 or 404, anything else (200, redirect, error, no answer) fails', function () {
     $mk = static function (int $status) {
         $r = [];
