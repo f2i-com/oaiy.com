@@ -23,6 +23,7 @@ use zeroize::{Zeroize, ZeroizeOnDrop, Zeroizing};
 use crate::argon;
 use crate::error::Error;
 use crate::kdf::{self, sha256, Purpose};
+use crate::text::push_zeroizing;
 use crate::zeroize::{Secret, SecretString};
 
 /// The list, one word per line, LF-terminated.
@@ -85,7 +86,9 @@ pub fn encode(entropy: &Entropy) -> SecretString {
     let mut bits = [0u8; 19];
     bits[..16].copy_from_slice(entropy.expose());
     bits[16] = (sha256(entropy.expose())[0] >> 4) << 4;
-    let mut text = String::new();
+    // reserved up front (the longest word has eight letters, so twelve words and eleven spaces fit): a `String` that grows moves to a new block and leaves the
+    // old one, with part of the phrase in it, unwiped (review M-4)
+    let mut text = String::with_capacity(WORD_COUNT * 9);
     for i in 0..WORD_COUNT {
         let start = 11 * i;
         let byte = start / 8;
@@ -105,8 +108,18 @@ pub fn decode(input: &str) -> Result<Entropy, Error> {
     if input.len() > MAX_INPUT_BYTES {
         return Err(Error::PhraseLength);
     }
-    let decomposed: Zeroizing<String> = Zeroizing::new(input.nfkd().collect());
-    let lowered: Zeroizing<String> = Zeroizing::new(decomposed.to_lowercase());
+    // Both copies of the text are built into buffers of a size that is not outgrown in the usual case (NFKD may lengthen a character, so there is room), and by
+    // hand when it is (`push_zeroizing`), so that no block of the phrase is ever freed without being wiped (review M-4).
+    let mut decomposed: Zeroizing<String> = Zeroizing::new(String::with_capacity(input.len() * 2 + 16));
+    for c in input.nfkd() {
+        push_zeroizing(&mut decomposed, c);
+    }
+    let mut lowered: Zeroizing<String> = Zeroizing::new(String::with_capacity(decomposed.len() * 2 + 16));
+    for c in decomposed.chars() {
+        for lower in c.to_lowercase() {
+            push_zeroizing(&mut lowered, lower);
+        }
+    }
     let words: Vec<&str> = lowered.split(|c: char| c.is_whitespace() || c == '\u{feff}').filter(|w| !w.is_empty()).collect();
     if words.len() != WORD_COUNT {
         return Err(Error::PhraseLength);

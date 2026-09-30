@@ -63,7 +63,9 @@ impl RecoveryKit {
     /// The code as printed: `FLRK1-XXXX-...-XXXX` (14 groups after the prefix).
     pub fn encode(&self) -> SecretString {
         let body = Zeroizing::new(base32_encode(self.0.expose()));
-        let mut text = String::from(PREFIX);
+        // 5 + 14 x 5 characters; reserved up front so that the text never moves to a bigger block and leaves the old one unwiped (review M-4)
+        let mut text = String::with_capacity(96);
+        text.push_str(PREFIX);
         for group in body.as_bytes().chunks(4) {
             text.push('-');
             text.push_str(core::str::from_utf8(group).unwrap_or(""));
@@ -79,8 +81,11 @@ impl RecoveryKit {
         if display.len() > 256 {
             return Err(Error::KitFormat);
         }
-        let mut cleaned: Zeroizing<String> =
-            Zeroizing::new(display.chars().filter(|c| !c.is_ascii_whitespace() && *c != '-').map(|c| c.to_ascii_uppercase()).collect());
+        // never longer than the input, so it never grows (review M-4)
+        let mut cleaned: Zeroizing<String> = Zeroizing::new(String::with_capacity(display.len()));
+        for c in display.chars().filter(|c| !c.is_ascii_whitespace() && *c != '-') {
+            cleaned.push(c.to_ascii_uppercase());
+        }
         let rest = cleaned.strip_prefix(PREFIX).ok_or(Error::KitFormat)?;
         if rest.len() != 56 || !rest.bytes().all(|b| ALPHABET.contains(&b)) {
             return Err(Error::KitFormat);

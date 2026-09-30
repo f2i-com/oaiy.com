@@ -29,6 +29,7 @@ pub mod kdf;
 pub mod kit;
 mod random;
 pub mod sealbox;
+mod text;
 pub mod x25519;
 pub mod zeroize;
 
