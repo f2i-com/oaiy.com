@@ -19,6 +19,7 @@ import {
   type LucideIcon,
 } from 'lucide-react';
 import { useEffect, useRef, type ReactNode } from 'react';
+import type { FeatureId } from '@oaiy/shared/capabilities/features';
 import { useFocusTrap } from '../../hooks/useFocusTrap';
 
 /**
@@ -68,9 +69,20 @@ const SECTIONS: Array<{ id: EditorSection; label: string; icon: LucideIcon; hint
 ];
 export const SETTINGS_ITEM = { id: 'settings' as const, label: 'Settings', icon: Settings2, hint: 'Services, API keys, constants, security' };
 
-/** The sections, and which is showing: the same for the web rail and for the tabs in OAIY's window. */
-export function shellNavItems(section: EditorSection, onSelect: (s: EditorSection) => void, badges: Partial<Record<EditorSection, ReactNode>> = {}): ShellNavItem[] {
-  return SECTIONS.map((s) => ({ ...s, active: section === s.id, onClick: () => onSelect(s.id), badge: badges[s.id] }));
+/**
+ * The sections, and which is showing: the same for the web rail and for the tabs in OAIY's window.
+ *
+ * `features` is what the editor can do here (lib/caps.ts): Packages is left out where its feature is off, which is everywhere but OAIY's
+ * own window (loading a package uses the desktop's own commands, which a browser tab does not have). Left out, every section shows, as
+ * it did before the editor knew where it was.
+ */
+export function shellNavItems(
+  section: EditorSection,
+  onSelect: (s: EditorSection) => void,
+  badges: Partial<Record<EditorSection, ReactNode>> = {},
+  features?: Readonly<Partial<Record<FeatureId, boolean>>>,
+): ShellNavItem[] {
+  return SECTIONS.filter((s) => s.id !== 'packages' || features?.packages !== false).map((s) => ({ ...s, active: section === s.id, onClick: () => onSelect(s.id), badge: badges[s.id] }));
 }
 
 /* --------------------------------------------------------------- sections */

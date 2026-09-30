@@ -261,10 +261,12 @@ for (const theme of ['dark', 'light']) {
 
     ok('boots with a clean console', errors.length === 0, errors.slice(0, 2).join(' | '));
     ok('app shell renders', (await page.locator('.app-shell').count()) === 1);
-    // Workflows, Data, Queue, Packages; Settings sits at the foot of the rail.
-    ok('sidebar has the full primary nav', (await page.locator('.oaiy-nav button').count()) === 4);
+    // Workflows, Data, Queue; Settings sits at the foot of the rail. A tab that is not linked to OAIY Desktop has no Packages (loading a
+    // package uses the desktop's own commands, which only OAIY's window has) and no endpoint dock (it shows the desktop's engine).
+    ok('sidebar has the primary nav a tab can use: Workflows, Data, Queue', (await page.locator('.oaiy-nav button').count()) === 3);
+    ok('there is no Packages section in a tab', (await page.locator('.oaiy-nav button[aria-label="Packages"]').count()) === 0);
     ok('Settings is in the rail too', (await page.locator('.oaiy-settings-btn').count()) === 1);
-    ok('endpoint dock renders', (await page.locator('.oaiy-dock').count()) === 1);
+    ok('there is no endpoint dock in a tab that is not linked to a desktop', (await page.locator('.oaiy-dock').count()) === 0);
     ok('engine card reports companion state',
       ((await page.locator('.oaiy-engine small').first().textContent()) ?? '').length > 0);
 
@@ -289,6 +291,22 @@ for (const theme of ['dark', 'light']) {
     // An empty flow opens with the palette; the inspector is a toolbar button
     // away (docked from the start only where the canvas has room for both).
     ok('creating a flow reveals the node palette', (await page.locator('[data-testid="node-palette"]').count()) > 0);
+    // A tab that is not linked to OAIY Desktop is not offered the nodes that drive it: the browser nodes, Ask the Agent, Folder Input.
+    // A plain HTTP request (Browser Request) is the page's own and stays.
+    {
+      const search = page.locator('[data-testid="node-palette"] input[placeholder="Search nodes"]');
+      const found = async (query) => {
+        await search.fill(query);
+        await page.waitForTimeout(300);
+        return (await page.locator('[data-testid="node-palette"]').textContent()) ?? '';
+      };
+      const browser = await found('Browser');
+      ok("the palette of a tab offers Browser Request, a plain HTTP request", /Browser Request/.test(browser), browser.slice(0, 120));
+      ok("and not the nodes that drive OAIY Desktop's browser", !/Browser (Session|Page|Extract|Action)/.test(browser));
+      ok('nor Ask the Agent', !/Ask the Agent/.test(await found('Ask the')));
+      ok('nor Folder Input', !/Folder Input/.test(await found('Folder')));
+      await search.fill('');
+    }
     const propsButton = page.locator('.oaiy-toolbar button[aria-label$="the properties"]');
     ok('the canvas toolbar offers the properties', (await propsButton.count()) === 1);
     if ((await page.locator('aside[aria-label="Inspector"]').count()) === 0) await propsButton.click();
@@ -310,6 +328,15 @@ for (const theme of ['dark', 'light']) {
         (await page.locator('input.oaiy-name[aria-label="Flow name"]').count()) === 1);
       await page.keyboard.press('Escape');
     }
+
+    // The editor's SQLite has no persistent storage in a tab (the browser gives it only on a worker's thread), so what the
+    // Database nodes store lasts as long as the tab: the Data page says so.
+    await page.locator('.oaiy-nav button[aria-label="Data"]').click();
+    await page.waitForTimeout(500);
+    ok('the Data page of a tab says what it holds is kept for the session only',
+      /Kept for this session only/.test((await page.locator('[data-testid="data-page"]').textContent()) ?? ''));
+    await page.locator('.oaiy-nav button[aria-label="Workflows"]').click();
+    await page.waitForTimeout(300);
 
     // regression: the accent must be applied consistently, not half-default
     const secondary = await page.evaluate(() =>

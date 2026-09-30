@@ -41,11 +41,19 @@ globalThis.window = { __OAIY_DESKTOP__: { origin: 'http://127.0.0.1:17972', toke
 globalThis.sessionStorage = { getItem: (k) => session.get(k) ?? null, setItem: (k, v) => session.set(k, String(v)) };
 
 const bundlePath = path.join(os.tmpdir(), `oaiy-in-oaiy-${process.pid}.mjs`);
+// The palette's environment reads the desktop's service list, which reaches oaiy-ui-components (the flow canvas's library): stubbed, as engine-endpoint.mjs does.
+const uiStub = path.join(os.tmpdir(), `oaiy-in-oaiy-stub-${process.pid}.mjs`);
+fs.writeFileSync(uiStub, 'export function invalidateDynamicOptions() {}\nexport function subscribeToDynamicOptionsInvalidation() { return () => {}; }\n');
 await esbuild.build({
   stdin: {
     contents: `export { flowKey, fromDoc, reconcile, shared } from './src/hooks/useDesktopFlows.ts';
 export { desktopTheme } from './src/contexts/ThemeContext.tsx';
-export { taskText } from './src/bundled-modules/core-agent/runtime.ts';`,
+export { taskText } from './src/bundled-modules/core-agent/runtime.ts';
+export { shellNavItems } from './src/components/chrome/ShellChrome.tsx';
+export { currentCaps } from './src/lib/caps.ts';
+export { currentAvailabilityEnv } from './src/lib/availabilityEnv.ts';
+export { paletteShowsNode, nodeNotice } from './src/lib/nodeAvailability.ts';
+export { hasSavedDesktopLink } from './src/lib/desktopLink.ts';`,
     resolveDir: UI,
     loader: 'ts',
   },
@@ -55,8 +63,10 @@ export { taskText } from './src/bundled-modules/core-agent/runtime.ts';`,
   outfile: bundlePath,
   logLevel: 'silent',
   jsx: 'automatic',
+  plugins: [{ name: 'oaiy-ui-components', setup: (build) => build.onResolve({ filter: /^oaiy-ui-components$/ }, () => ({ path: uiStub })) }],
 });
-const { flowKey, fromDoc, reconcile, shared, desktopTheme, taskText } = await import(pathToFileURL(bundlePath).href);
+fs.rmSync(uiStub, { force: true });
+const { flowKey, fromDoc, reconcile, shared, desktopTheme, taskText, shellNavItems, currentCaps, currentAvailabilityEnv, paletteShowsNode, nodeNotice, hasSavedDesktopLink } = await import(pathToFileURL(bundlePath).href);
 fs.rmSync(bundlePath, { force: true });
 
 const flow = (extra = {}) => ({ id: 'f1', name: 'Greeting', createdAt: '', updatedAt: '', graph: { nodes: [], edges: [] }, ...extra });
@@ -134,6 +144,113 @@ check('the theme is the one OAIY said last', () => {
   assert.equal(desktopTheme(), 'light', 'said while loading');
   window.__OAIY_THEME__ = 'sepia';
   assert.equal(desktopTheme(), 'dark', 'not a theme');
+});
+
+// ---------------------------------------------------------------------------
+// What the editor shows where it is (lib/caps.ts, shared/capabilities): in OAIY's window every control it had is still there.
+// ---------------------------------------------------------------------------
+// In a browser `window` is the page's global object; here it is a stand-in, so the page's globals get the same desktop (readHost reads them).
+globalThis.__OAIY_DESKTOP__ = window.__OAIY_DESKTOP__;
+const store = new Map();
+globalThis.localStorage = { getItem: (k) => (store.has(k) ? store.get(k) : null), setItem: (k, v) => store.set(k, String(v)), removeItem: (k) => store.delete(k) };
+const SECTIONS = ['workflows', 'data', 'queue', 'packages'];
+const DESKTOP_NODES = ['browser_session', 'browser_page', 'browser_extract', 'browser_action', 'ask_agent', 'input_folder'];
+const ids = (items) => items.map((i) => i.id);
+
+/** The page as a tab in a browser on a public host, for `fn`: no desktop given, and the address of a site. */
+function asTab(fn) {
+  const given = window.__OAIY_DESKTOP__;
+  delete window.__OAIY_DESKTOP__;
+  delete globalThis.__OAIY_DESKTOP__;
+  globalThis.location = { hostname: 'flows.example.org', protocol: 'https:', origin: 'https://flows.example.org' };
+  try {
+    return fn();
+  } finally {
+    window.__OAIY_DESKTOP__ = given;
+    globalThis.__OAIY_DESKTOP__ = given;
+    delete globalThis.location;
+    store.clear();
+  }
+}
+
+check("in OAIY's window every feature of the desktop's is on, and Data is not called session-only: nothing that was there is hidden", () => {
+  const caps = currentCaps();
+  assert.equal(caps.host, 'oaiy-window');
+  assert.equal(caps.mode, 'paired');
+  assert.equal(caps.looksOnLoad, true);
+  assert.equal(caps.dataSessionOnly, false);
+  for (const [id, on] of Object.entries(caps.features)) assert.equal(on, true, id);
+  for (const id of ['phone', 'calendar', 'flowTools', 'control', 'setup', 'browserNodes', 'askAgent', 'inputFolder', 'packages', 'dock']) assert.ok(id in caps.features, `${id} is a feature the layer knows`);
+});
+
+check("the sections in OAIY's window are Workflows, Data, Queue and Packages, in that order, with the features given or not", () => {
+  const noop = () => {};
+  assert.deepEqual(ids(shellNavItems('workflows', noop)), SECTIONS, 'no features given: as before the editor knew where it was');
+  assert.deepEqual(ids(shellNavItems('workflows', noop, {}, currentCaps().features)), SECTIONS, 'the features of this window');
+  const items = shellNavItems('data', noop, { queue: 'badge' }, currentCaps().features);
+  assert.deepEqual(items.map((i) => [i.id, i.active, i.badge]), [['workflows', false, undefined], ['data', true, undefined], ['queue', false, 'badge'], ['packages', false, undefined]]);
+  const picked = [];
+  items.find((i) => i.id === 'packages').onClick();
+  shellNavItems('workflows', (s) => picked.push(s), {}, currentCaps().features).find((i) => i.id === 'packages').onClick();
+  assert.deepEqual(picked, ['packages'], 'and Packages still opens');
+});
+
+check("the palette in OAIY's window offers the desktop's nodes (the browser nodes, Ask the Agent, Folder input) and says nothing is missing on them", () => {
+  const env = currentAvailabilityEnv();
+  assert.equal(env.inOaiy, true);
+  for (const type of DESKTOP_NODES) {
+    assert.equal(paletteShowsNode(type, env), true, type);
+    assert.equal(nodeNotice(type, {}, env), null, `${type}: nothing missing`);
+  }
+});
+
+check('a tab that is not linked to a desktop has no Packages section, no dock and none of the desktop\'s nodes in the palette, and says Data is kept for the session', () => {
+  asTab(() => {
+    const caps = currentCaps();
+    assert.equal(caps.host, 'browser');
+    assert.equal(caps.mode, 'standalone');
+    assert.equal(caps.dataSessionOnly, true);
+    assert.equal(caps.looksOnLoad, false);
+    assert.equal(hasSavedDesktopLink(), false);
+    assert.deepEqual(ids(shellNavItems('workflows', () => {}, {}, caps.features)), ['workflows', 'data', 'queue']);
+    assert.equal(caps.features.dock, false);
+    const env = currentAvailabilityEnv();
+    assert.equal(env.inOaiy, false);
+    for (const type of DESKTOP_NODES) {
+      assert.equal(paletteShowsNode(type, env), false, type);
+      assert.match(nodeNotice(type, {}, env), /needs? OAIY Desktop or an OAIY server.*Connect it in Settings/, `${type}: says what it needs`);
+    }
+    assert.equal(paletteShowsNode('browser_request', env), true, 'a plain HTTP request is still offered');
+    assert.equal(paletteShowsNode('input_text', env), true);
+  });
+});
+
+check('a tab linked to a desktop (Connect answered) has the desktop\'s nodes and the dock, and still no Packages: no link gives a tab the desktop\'s own commands', () => {
+  asTab(() => {
+    store.set('oaiy.desktopLinked', '1');
+    const caps = currentCaps();
+    assert.equal(caps.mode, 'paired');
+    assert.equal(caps.host, 'browser');
+    assert.deepEqual(ids(shellNavItems('workflows', () => {}, {}, caps.features)), ['workflows', 'data', 'queue']);
+    assert.equal(caps.features.dock, true);
+    const env = currentAvailabilityEnv();
+    for (const type of DESKTOP_NODES) {
+      assert.equal(paletteShowsNode(type, env), true, type);
+      assert.equal(nodeNotice(type, {}, env), null, type);
+    }
+    assert.equal(caps.dataSessionOnly, true, "the tab's own SQLite is in the tab, linked or not");
+  });
+});
+
+check('the capabilities are the same object until the link changes, so a component that follows them is not drawn again for nothing', () => {
+  asTab(() => {
+    const a = currentCaps();
+    assert.equal(currentCaps(), a);
+    store.set('oaiy.desktopLinked', '1');
+    const b = currentCaps();
+    assert.notEqual(b, a);
+    assert.equal(currentCaps(), b);
+  });
 });
 
 console.log(`\n${pass} passed, ${failures.length} failed`);

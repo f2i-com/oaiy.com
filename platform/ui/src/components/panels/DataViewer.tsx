@@ -15,6 +15,7 @@ import { getFlowDatabaseManager, type FlowDatabaseInfo } from '../../services/da
 import { CopyLink } from '../ui/CopyButton';
 import SectionPage, { Card, EmptyState } from '../chrome/SectionPage';
 import { useConfirmDialog } from '../../hooks/useConfirmDialog';
+import { useCaps } from '../../hooks/useCaps';
 
 type ExportFormat = 'json' | 'csv';
 
@@ -36,6 +37,8 @@ interface DataViewerProps {
 }
 
 export default function DataViewer({ activeFlowId, packageId, flowName }: DataViewerProps) {
+  // In a tab the editor's SQLite has no persistent storage (the browser gives it only on a worker's thread), so what is stored lasts as long as the tab.
+  const caps = useCaps();
   const [collections, setCollections] = useState<CollectionInfo[]>([]);
   const [selectedCollection, setSelectedCollection] = useState<string | null>(null);
   const [data, setData] = useState<Record<string, unknown>[]>([]);
@@ -445,9 +448,17 @@ export default function DataViewer({ activeFlowId, packageId, flowName }: DataVi
       kicker="Flows"
       title="Data"
       description={
-        currentFlowId
-          ? <>What the Database nodes in <strong className="text-content-primary">{displayName}</strong> have stored.</>
-          : 'What the Database nodes in your flows have stored. Pick a flow’s database.'
+        <>
+          {currentFlowId
+            ? <>What the Database nodes in <strong className="text-content-primary">{displayName}</strong> have stored.</>
+            : 'What the Database nodes in your flows have stored. Pick a flow’s database.'}
+          {caps.dataSessionOnly && (
+            <>
+              {' '}
+              <strong className="text-content-primary" data-session-only>Kept for this session only:</strong> in a browser tab it lives in memory, and is gone when the tab is closed or reloaded.
+            </>
+          )}
+        </>
       }
       fill
       actions={

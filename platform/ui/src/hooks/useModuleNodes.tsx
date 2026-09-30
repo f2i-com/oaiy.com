@@ -21,6 +21,7 @@ import type { PackageNodeInfo } from './usePackageNodes';
 import { listAllServices } from '../utils/serviceRegistry';
 import { listDesktopServices } from '../lib/desktopServices';
 import { moduleLogger as logger } from '../utils/logger';
+import { useCaps } from './useCaps';
 
 // ============================================
 // Types
@@ -104,6 +105,8 @@ const AI_SERVICE_NODE_IDS: ReadonlySet<string> = new Set([
 
 export function useModuleNodes(options?: UseModuleNodesOptions) {
   const { activePackageId, packageNodes: pkgNodes } = options || {};
+  // What the editor can do here decides which of the desktop's nodes the palette offers.
+  const caps = useCaps();
 
   const [loader] = useState(() => getModuleLoader());
   const [nodes, setNodes] = useState<ModuleNodeInfo[]>([]);
@@ -169,9 +172,9 @@ export function useModuleNodes(options?: UseModuleNodesOptions) {
   const paletteNodes = useMemo(() => {
     const env = currentAvailabilityEnv();
     return nodes.filter((n) => paletteShowsNode(n.definition.id, env));
-    // servicesVersion: the lists behind `env` changed.
+    // servicesVersion: the lists behind `env` changed. caps: the editor was linked to a desktop, or unlinked (lib/caps.ts).
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [nodes, servicesVersion]);
+  }, [nodes, servicesVersion, caps]);
 
   // Group nodes by category (including package nodes when active)
   const groupedNodes = useMemo<GroupedNodes[]>(() => {

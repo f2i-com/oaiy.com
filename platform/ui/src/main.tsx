@@ -18,7 +18,8 @@ installConsoleBuffer();
 //   service:list                 — every registered service (Service Call uses this).
 //   service:list:<nodeType>      — only services tagged for the given node type;
 //                                  e.g. `service:list:ai_llm` for the AI LLM dropdown.
-import { registerDynamicOptionsResolver, registerNodeNoticeProvider } from 'oaiy-ui-components';
+import { invalidateDynamicOptions, registerDynamicOptionsResolver, registerNodeNoticeProvider } from 'oaiy-ui-components';
+import { subscribeCaps } from './lib/caps';
 import { serviceOptions } from './lib/serviceOptions';
 import { nodeNotice } from './lib/nodeAvailability';
 import { currentAvailabilityEnv } from './lib/availabilityEnv';
@@ -31,6 +32,8 @@ registerDynamicOptionsResolver('service:list', (rest: string) =>
 );
 // A node in a flow whose service is not installed says so on the node.
 registerNodeNoticeProvider((nodeType, data) => nodeNotice(nodeType, data, currentAvailabilityEnv()));
+// What the editor can do here follows the link to OAIY Desktop (lib/caps.ts): the notices on nodes that need it are drawn again when it is made or forgotten.
+subscribeCaps(() => invalidateDynamicOptions());
 
 // Dynamic module discovery - MUST be imported first before any module access
 import './dynamicModules';
