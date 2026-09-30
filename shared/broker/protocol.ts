@@ -14,7 +14,7 @@
  * import it.
  */
 import { isLoopbackHost } from '../providers/errors';
-import type { ProviderSummary } from '../providers/types';
+import { UNSAFE_TEXT, type ProviderSummary } from '../providers/types';
 
 export const PROTOCOL_VERSION = 1;
 
@@ -234,7 +234,7 @@ export function parseRequest(data: unknown): ParsedRequest {
     case 'setModel': {
       const provider = providerId(data.provider);
       const model = data.model;
-      if (provider === null || typeof model !== 'string' || model.length === 0 || model.length > MODEL_MAX || CONTROL.test(model) || model !== model.trim()) {
+      if (provider === null || typeof model !== 'string' || model.length === 0 || model.length > MODEL_MAX || CONTROL.test(model) || UNSAFE_TEXT.test(model) || model !== model.trim()) {
         return refuse('bad-request', 'setModel names a provider and a model.');
       }
       return { ok: true, id, request: { op: 'setModel', provider, model } };

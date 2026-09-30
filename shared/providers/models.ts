@@ -15,7 +15,7 @@
 import { providerEndpoints, providerHeaders, recordHeaders, type ProviderEndpoints } from './endpoints';
 import { ProviderConnectionError, describeConnectionError, isBlockedMixedContent, kindForStatus, redactSecret, type ErrorContext } from './errors';
 import { providerTypeOf } from './adapters';
-import type { LocalServerKind, ProviderConfig, ProviderRecord, ProviderType } from './types';
+import { isSafeName, type LocalServerKind, type ProviderConfig, type ProviderRecord, type ProviderType } from './types';
 
 function isRecord(value: unknown): value is Record<string, unknown> {
   return !!value && typeof value === 'object' && !Array.isArray(value);
@@ -117,12 +117,13 @@ function readModelList(body: unknown): ModelInfo[] | null {
   if (!isRecord(body) || !Array.isArray(body.data)) return null;
   const models: ModelInfo[] = [];
   for (const item of body.data) {
-    if (!isRecord(item) || typeof item.id !== 'string' || !item.id.trim()) continue;
+    // An id that is not fit to show (control or format characters, over 200 characters) is not a model the person can be offered.
+    if (!isRecord(item) || !isSafeName(item.id)) continue;
     // OAIY lists its image, video, speech, music, sound effects and 3D models here too, typed: they cannot chat.
     if (item.type === 'image' || item.type === 'video' || item.type === 'speech' || item.type === 'music' || item.type === 'sound' || item.type === 'model3d') continue;
     models.push({
       id: item.id,
-      label: typeof item.display_name === 'string' && item.display_name !== item.id ? item.display_name : undefined,
+      label: isSafeName(item.display_name) && item.display_name !== item.id ? item.display_name : undefined,
       created: toMs(item.created_at ?? item.created),
     });
   }
@@ -135,7 +136,7 @@ function readOllamaTags(body: unknown): ModelInfo[] | null {
   for (const item of body.models) {
     if (!isRecord(item)) continue;
     const id = typeof item.model === 'string' ? item.model : typeof item.name === 'string' ? item.name : '';
-    if (id.trim()) models.push({ id, created: toMs(item.modified_at) });
+    if (isSafeName(id)) models.push({ id, created: toMs(item.modified_at) });
   }
   return models;
 }

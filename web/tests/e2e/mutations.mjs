@@ -380,6 +380,27 @@ const MUTATIONS = [
     files: { 'shared/providers/errors.ts': [{ find: '(a === 172 && b >= 16 && b <= 31) || (a === 192 && b === 168) || (a === 169 && b === 254) || a === 127;', replace: '(a === 172) || (a === 192 && b === 168) || (a === 169 && b === 254) || a === 127;' }] },
     caught: ['http://172.15.255.255/v1 is refused', 'http://172.32.0.1/v1 is refused'],
   },
+  {
+    name: 'L5 model ids are not checked when the list is read',
+    what: 'an id with a bidi override, a zero-width or a control character, or over 200 characters, is offered as a model',
+    tests: ['tests/unit/model-ids.test.mjs'],
+    files: { 'shared/providers/models.ts': [{ find: 'if (!isRecord(item) || !isSafeName(item.id)) continue;', replace: "if (!isRecord(item) || typeof item.id !== 'string' || !item.id.trim()) continue;" }] },
+    caught: ['is left out of the list an app is given by models'],
+  },
+  {
+    name: 'L5 a store keeps any model id',
+    what: 'the ids an app may choose from are kept without a check',
+    tests: ['tests/unit/model-ids.test.mjs'],
+    files: { 'web/providers/src/store.ts': [{ find: 'const clean = [...new Set(ids.filter((m) => isSafeName(m, MODEL_ID_MAX)))].slice(0, MODELS_KEPT);', replace: "const clean = [...new Set(ids.filter((m) => typeof m === 'string' && m !== ''))].slice(0, MODELS_KEPT);" }] },
+    caught: ['is not kept for an app to choose from'],
+  },
+  {
+    name: 'L5 setModel is read without the check',
+    what: 'the request reader lets a model with a bidi or a format character through',
+    tests: ['tests/unit/model-ids.test.mjs'],
+    files: { 'shared/broker/protocol.ts': [{ find: ' || UNSAFE_TEXT.test(model) || model !== model.trim()) {', replace: ' || model !== model.trim()) {' }] },
+    caught: ['is refused where the request is read'],
+  },
   // Leaks the scans must find. They put the key where a scan of TEXT does not look (the reviewer's two: a Uint8Array, and reversed).
   {
     name: 'H1 leak: list returns the key as a Uint8Array',

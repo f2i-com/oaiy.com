@@ -7,7 +7,7 @@
 import { isLoopbackHost, isPrivateNetworkHost } from './errors';
 import { normalizeApiBase } from './endpoints';
 import { MAX_BODY_BYTES } from '../broker/protocol';
-import { EXTRA_HEADER_NAMES, PROVIDER_CAPS, type Dialect, type ExtraHeader, type ProviderCap, type ProviderKind, type ProviderRecord, type ServerKind } from './types';
+import { EXTRA_HEADER_NAMES, NAME_MAX, PROVIDER_CAPS, UNSAFE_TEXT, type Dialect, type ExtraHeader, type ProviderCap, type ProviderKind, type ProviderRecord, type ServerKind } from './types';
 
 /** What a form hands over: text and choices, not yet a record. Numbers may still be text. */
 export interface RecordInput {
@@ -57,7 +57,7 @@ export function validateRecord(input: RecordInput, id: string): Validation {
 
   const name = text(input.name);
   if (name === null || name === '') errors.name = 'Give it a name.';
-  else if (name.length > 80 || CONTROL.test(name)) errors.name = 'A name is up to 80 characters, on one line.';
+  else if (name.length > 80 || UNSAFE_TEXT.test(name)) errors.name = 'A name is up to 80 characters, on one line, with no control or direction-changing characters.';
 
   const dialect = input.dialect;
   if (dialect !== 'openai' && dialect !== 'anthropic') errors.dialect = 'Choose OpenAI-compatible or Anthropic.';
@@ -75,7 +75,7 @@ export function validateRecord(input: RecordInput, id: string): Validation {
   }
 
   const model = input.model === undefined || input.model === null || input.model === '' ? undefined : text(input.model);
-  if (model === null || (model !== undefined && (model.length > 200 || CONTROL.test(model)))) errors.model = 'A model name is up to 200 characters, on one line.';
+  if (model === null || (model !== undefined && (model.length > NAME_MAX || UNSAFE_TEXT.test(model)))) errors.model = 'A model name is up to 200 characters, on one line, with no control or direction-changing characters.';
 
   let caps: ProviderCap[] = ['chat'];
   if (input.caps !== undefined) {

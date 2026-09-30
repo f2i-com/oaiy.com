@@ -129,6 +129,22 @@ export interface ProviderSummary {
   locked: boolean;
 }
 
+/**
+ * Characters that must not be in a name the holder's own pages show as text when a provider or an app supplied it: control characters, format
+ * characters (the bidirectional overrides and isolates that make text read as something else, the zero-width ones, the joiners), the line
+ * and paragraph separators, and lone surrogates. A model id from a provider's list is such a name, and the Providers page (where a key is
+ * typed) shows it, so one that holds these is not a model id.
+ */
+export const UNSAFE_TEXT = /[\p{Cc}\p{Cf}\p{Zl}\p{Zp}\p{Cs}]/u;
+
+/** The longest a name a provider or an app supplies may be (model ids and their labels), in UTF-16 units. */
+export const NAME_MAX = 200;
+
+/** Whether `text` is fit to be shown as a name: a string, not empty, up to `NAME_MAX` long, and none of `UNSAFE_TEXT`. */
+export function isSafeName(text: unknown, max: number = NAME_MAX): text is string {
+  return typeof text === 'string' && text.trim() !== '' && text.length <= max && !UNSAFE_TEXT.test(text);
+}
+
 /** The headers a record may carry beyond the ones its dialect fixes (lower case). */
 export const EXTRA_HEADER_NAMES: readonly string[] = ['openai-organization', 'http-referer', 'x-title', 'anthropic-beta'];
 

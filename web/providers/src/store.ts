@@ -8,7 +8,7 @@
 import { hostOf, movesKey, newRecordId, validateRecord, type RecordInput } from './records';
 import { request, type Db } from './db';
 import type { ListableVault } from './vault';
-import { providerKeyName, type ProviderRecord, type ProviderSummary } from '@oaiy/shared/providers/types';
+import { isSafeName, providerKeyName, type ProviderRecord, type ProviderSummary } from '@oaiy/shared/providers/types';
 
 export interface StoreEnv {
   random: (n: number) => Uint8Array;
@@ -149,7 +149,8 @@ export function createStore(db: Db, vault: ListableVault, env: StoreEnv): Provid
     },
 
     async rememberModels(id, ids) {
-      const clean = [...new Set(ids.filter((m) => typeof m === 'string' && m !== '' && m.length <= MODEL_ID_MAX))].slice(0, MODELS_KEPT);
+      // Only ids fit to be shown on the Providers page are kept: an app may choose from these, and the page draws the choice.
+      const clean = [...new Set(ids.filter((m) => isSafeName(m, MODEL_ID_MAX)))].slice(0, MODELS_KEPT);
       await db.put('meta', modelsKey(id), clean);
     },
 
