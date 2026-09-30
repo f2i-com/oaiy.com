@@ -639,7 +639,7 @@ fn preview_of(data_dir: &Path, verified: &container::Verified, scratch: &Path, f
         .collect();
     let mut notes = Vec::new();
     if in_backup.contains("calendar/calendar.json") {
-        notes.push("The calendar comes back without its FormLogic sync state (it pairs and syncs again when you link FormLogic). Its hours and the time, length and state of each appointment come back without a tick; the words in it (the business's name, the services, each appointment's service, name, number and notes) come back only with the calendar tick. An appointment that is here is never lost to a restore.".to_string());
+        notes.push("The calendar comes back without its FormLogic sync state (it pairs and syncs again when you link FormLogic). Only its opening hours and the steps between the times offered come back without a tick; the rest (the business's name, the services, and the appointments, which the phone also sends to your linked FormLogic account) comes back only with the calendar tick. An appointment that is here is never touched by a restore that was not ticked.".to_string());
     }
     if items.iter().any(|i| i.class == RestoreClass::Plugins) {
         notes.push("Plugin settings come back without PINs, keys or values sealed to another computer; what this computer already has of those stays.".to_string());

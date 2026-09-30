@@ -8,8 +8,9 @@
 //!   [`super::table`]: only the keys it lists come through, each with a value of the kind it allows. A PIN, an
 //!   address that audio goes to, a switch that grants access and anything the table does not know never
 //!   travel, in either direction.
-//! - **The calendar** is brought back key by key ([`calendar_merge`]): its words need a tick, the typed values
-//!   that carry none (hours, the times of appointments) do not, and its FormLogic sync state (the form it is
+//! - **The calendar** is brought back key by key ([`calendar_merge`]): its words and its appointments (the phone
+//!   sends every appointment it has no copy of at FormLogic to the linked account) need a tick, the typed values
+//!   that carry none (the opening hours, the steps between the times offered) do not, and its FormLogic sync state (the form it is
 //!   paired with, the cursor, the list of records to delete, each appointment's remote copy, the tombstones
 //!   of deleted ones) never comes back: restored on a computer that is linked to another account, or to none,
 //!   it would delete or duplicate records.
@@ -43,23 +44,21 @@ const MAX_APPOINTMENTS: usize = 10_000;
 
 /// The calendar in a backup put into the one that is here, key by key (see the key table `calendar`).
 ///
-/// What the table lets through for this choice is brought in: the typed values that carry no words always, and the
-/// words (the business's and the receptionist's names, the services, and each appointment's service, name, number and
-/// notes) only when `ticks` has the calendar. What is here is never lost to a restore that was not ticked: an
-/// appointment that is here is kept exactly as it is, and one that is not here is added (with only its time, length,
-/// state and origin when the words were not ticked). With the words ticked, an appointment of the same id takes the
-/// backup's, and keeps the record of FormLogic's copy that is here. Appointments that are only here stay. The
-/// FormLogic sync state (deleted records, where the sync got to) is never taken from a backup.
+/// What the table lets through for this choice is brought in: the typed values that carry no words always (the opening hours
+/// and the steps between the times offered), and the rest (the business's and the receptionist's names, the services, and the
+/// appointments) only when `ticks` has the calendar. An appointment is not data: the phone sends every appointment it has no copy
+/// of at FormLogic to the linked account, so a restore that was not ticked for the calendar brings back none, and an appointment
+/// that is here is never touched by it. With the calendar ticked, an appointment of the same id takes the backup's and keeps the
+/// record of FormLogic's copy that is here, a new one is added (the calendar holds no more than [`MAX_APPOINTMENTS`]), and
+/// appointments that are only here stay. The FormLogic sync state (deleted records, where the sync got to) is never taken from a backup.
 ///
 /// The result is a calendar the calendar module reads (a file it cannot read is read as an empty calendar and then
 /// saved over): when it would not be one, `Err` says so and the file that is here is left alone.
 pub fn calendar_merge(local: Option<&Value>, staged: &Value, ticks: &super::review::Ticks) -> Result<CalendarMerge, String> {
-    use super::review::RestoreClass;
     use super::table::{filter_json, table, Class};
     use serde_json::{json, Map};
 
     let keys = table().key_table("calendar").ok_or_else(|| "OAIY does not know how to read it".to_string())?;
-    let words = ticks.has(RestoreClass::Calendar);
     let found = filter_json(keys, staged, &|row| row.class == Class::Data || row.tick.is_some_and(|t| ticks.has(t)));
     let left = found.left.iter().map(|l| l.path.as_str()).collect::<HashSet<_>>().len() + found.left_more;
     if found.kept.is_empty() {
@@ -67,6 +66,14 @@ pub fn calendar_merge(local: Option<&Value>, staged: &Value, ticks: &super::revi
     }
     let theirs = found.value.as_object().cloned().unwrap_or_default();
     let mut notes = Vec::new();
+    if left > 0 && !ticks.has(super::review::RestoreClass::Calendar) {
+        notes.push(format!(
+            "{left} setting{} of the calendar {} not brought back: its words, its services and its appointments need the tick \"{}\".",
+            if left == 1 { "" } else { "s" },
+            if left == 1 { "was" } else { "were" },
+            super::review::RestoreClass::Calendar.label()
+        ));
+    }
 
     // What is here, if it is a calendar the module reads; otherwise a calendar with nothing in it.
     let mut book: Map<String, Value> = match local {
@@ -102,11 +109,11 @@ pub fn calendar_merge(local: Option<&Value>, staged: &Value, ticks: &super::revi
         }
     }
 
-    // The appointments: by id, and never one of the person's own lost.
+    // The appointments (there are some only when they were ticked): by id, and never one of the person's own lost.
     let now = chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, true);
     let mut list: Vec<Value> = book.get("appointments").and_then(Value::as_array).cloned().unwrap_or_default();
     let mut at: std::collections::HashMap<String, usize> = list.iter().enumerate().filter_map(|(i, a)| a.get("id").and_then(Value::as_str).map(|id| (id.to_string(), i))).collect();
-    let (mut added, mut replaced, mut kept, mut skipped, mut over) = (0usize, 0usize, 0usize, 0usize, 0usize);
+    let (mut added, mut replaced, mut skipped, mut over) = (0usize, 0usize, 0usize, 0usize);
     for appointment in theirs.get("appointments").and_then(Value::as_array).map(Vec::as_slice).unwrap_or(&[]) {
         let text = |key: &str| appointment.get(key).and_then(Value::as_str).map(str::to_string);
         let (Some(id), Some(start), Some(status)) = (text("id"), text("start"), text("status")) else {
@@ -124,7 +131,7 @@ pub fn calendar_merge(local: Option<&Value>, staged: &Value, ticks: &super::revi
             "createdAt": text("createdAt").unwrap_or_else(|| now.clone()), "updatedAt": text("updatedAt").unwrap_or_else(|| now.clone()),
         });
         match at.get(&id).copied() {
-            Some(i) if words => {
+            Some(i) => {
                 // The record of FormLogic's copy, and of the request and the call, belong to this computer.
                 for keep in ["formlogic", "requestId", "callId"] {
                     if let Some(v) = list[i].get(keep).cloned() {
@@ -134,7 +141,6 @@ pub fn calendar_merge(local: Option<&Value>, staged: &Value, ticks: &super::revi
                 list[i] = composed;
                 replaced += 1;
             }
-            Some(_) => kept += 1,
             None if list.len() >= MAX_APPOINTMENTS => over += 1,
             None => {
                 at.insert(id, list.len());
@@ -151,11 +157,8 @@ pub fn calendar_merge(local: Option<&Value>, staged: &Value, ticks: &super::revi
     if over > 0 {
         notes.push(format!("{over} more appointment{} would make more than {MAX_APPOINTMENTS} in the calendar, so {} not added.", if over == 1 { "" } else { "s" }, if over == 1 { "it was" } else { "they were" }));
     }
-    if kept > 0 {
-        notes.push(format!("{kept} appointment{} already here {} kept exactly as {} ({}).", if kept == 1 { "" } else { "s" }, if kept == 1 { "was" } else { "were" }, if kept == 1 { "it is" } else { "they are" }, "the calendar's words were not ticked"));
-    }
-    if !words && added > 0 {
-        notes.push(format!("{added} appointment{} came back with only {} time, length and state: {} service, name, number and notes need the tick \"{}\".", if added == 1 { "" } else { "s" }, if added == 1 { "its" } else { "their" }, if added == 1 { "its" } else { "their" }, RestoreClass::Calendar.label()));
+    if added + replaced > 0 {
+        notes.push(format!("{} appointment{} came back: the phone sends {} to your linked FormLogic account at its next sync, as it does any appointment it has no copy of there.", added + replaced, if added + replaced == 1 { "" } else { "s" }, if added + replaced == 1 { "it" } else { "them" }));
     }
     if replaced > 0 {
         notes.push(format!("{replaced} appointment{} here {} replaced by the backup's.", if replaced == 1 { "" } else { "s" }, if replaced == 1 { "was" } else { "were" }));

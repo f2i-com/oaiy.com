@@ -834,7 +834,7 @@ export function BackupSection() {
             </div>
             {ticked.length === 0 && (
               <p style={{ margin: '6px 0 0' }}>
-                Nothing is ticked, so only what carries no words and does nothing comes back (opening hours, the time of each appointment, and numbers not to be contacted). Everything listed above stays behind until you tick it.
+                Nothing is ticked, so only what carries no words and does nothing comes back (opening hours, the steps between the times offered, and numbers not to be contacted). Everything listed above stays behind until you tick it.
               </p>
             )}
             {preview.keys.inBackup && (

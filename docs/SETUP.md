@@ -93,7 +93,7 @@ the restore lists what to set up again. Your AI provider keys are the exception,
 choose: they are left out unless you tick **Include my API provider keys** when you make the
 backup (the file is then as sensitive as the keys), and even then they come back only if you
 tick them again when you restore. A restore is default-deny: only what carries no words and does
-nothing (opening hours, the time of each appointment, numbers not to be contacted) comes back on
+nothing (opening hours, the steps between the times offered, numbers not to be contacted) comes back on
 its own. Everything a model reads or that is said to callers or sent to anyone (the calendar's
 words, service templates, flows, triggers, AI providers, settings, the phone plugin's settings,
 what is remembered about people, earlier conversations, voices, the Agent's brief, knowledge and

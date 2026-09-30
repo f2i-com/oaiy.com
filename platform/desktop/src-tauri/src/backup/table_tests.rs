@@ -679,11 +679,9 @@ fn the_values_that_are_data_are_the_ones_the_audit_found() {
         data.extend(table.keys.iter().filter(|k| k.class == Class::Data && !matches!(k.ty, Some(ValueType::Object | ValueType::Objects { .. }))).map(|k| format!("{}: {}", table.name, k.path)));
     }
     data.sort();
-    let expected = [
-        "calendar: appointments[].createdAt", "calendar: appointments[].id", "calendar: appointments[].minutes", "calendar: appointments[].source", "calendar: appointments[].start",
-        "calendar: appointments[].status", "calendar: appointments[].updatedAt", "calendar: settings.horizonDays", "calendar: settings.hours", "calendar: settings.noticeMinutes",
-        "calendar: settings.slotMinutes", "row agent-do-not-contact",
-    ];
+    // (An appointment is not on the list: the phone sends every appointment it has no copy of at FormLogic to the linked account, so
+    // an appointment is an action, and comes back only with the calendar tick.)
+    let expected = ["calendar: settings.horizonDays", "calendar: settings.hours", "calendar: settings.noticeMinutes", "calendar: settings.slotMinutes", "row agent-do-not-contact"];
     assert_eq!(data, expected, "a value that is data has been added or removed: ask the audit's questions of it, and say so here");
     // None of them is text, and each of them says what reads it and that it feeds no behaviour (the loader holds that; this is the test that it does).
     for table in t.key_tables.values() {

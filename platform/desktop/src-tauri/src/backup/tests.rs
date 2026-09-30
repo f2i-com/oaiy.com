@@ -2959,15 +2959,13 @@ fn the_calendars_words_are_listed_by_value_and_come_back_only_with_their_tick() 
     assert_eq!(got["settings"]["business"], "Green Lawns mine", "the calendar that is here keeps its words");
     assert_eq!(got["settings"]["services"][0]["name"], "Lawn mowing");
     assert_eq!(got["settings"]["textConfirmations"], true);
-    // The typed values that carry no words did come: the hours, and the appointment as a time.
+    // The typed values that carry no words did come: the hours. No appointment did (the phone sends every appointment it has no copy of
+    // at FormLogic to the linked account: see `an_unticked_restore_makes_the_phone_send_nothing_to_formlogic`).
     assert_eq!(got["settings"]["hours"][0][0]["open"], "00:00");
-    let added = got["appointments"].as_array().unwrap().iter().find(|a| a["id"] == "appt_000000000000000000000000000000e1").expect("the appointment came as a time");
-    assert_eq!((added["start"].as_str(), added["minutes"].as_u64(), added["status"].as_str()), (Some("2026-10-05T10:00"), Some(30), Some("confirmed")));
-    assert_eq!((added["name"].as_str(), added["phone"].as_str(), added["notes"].as_str(), added["service"].as_str()), (Some(""), Some(""), Some(""), Some("")), "with no words");
-    assert_eq!(got["appointments"].as_array().unwrap().len(), 3, "the two that were here, and the one that came");
-    assert!(read_calendar(&dst.0).get("appt_000000000000000000000000000000e1").is_some_and(|a| a.name.is_empty()), "the calendar module reads it");
+    assert_eq!(got["appointments"].as_array().unwrap().len(), 2, "the two that were here, and none that came");
+    assert!(!got["appointments"].as_array().unwrap().iter().any(|a| a["id"] == "appt_000000000000000000000000000000e1"));
     let last = restore::last_restore(&dst.0).unwrap();
-    assert!(last.notes.iter().any(|n| n.contains("came back with only") && n.contains("Calendar text your receptionist reads")), "{:?}", last.notes);
+    assert!(last.notes.iter().any(|n| n.contains("not brought back") && n.contains("Calendar text your receptionist reads")), "{:?}", last.notes);
     assert_ne!(fs::read(dst.0.join("calendar/calendar.json")).unwrap(), before);
 
     // Another tick brings none of it either.
@@ -3089,12 +3087,13 @@ fn a_calendar_a_restore_would_leave_unreadable_is_not_brought_back_and_the_one_h
         { "id": "appt_00000000000000000000000000000a0a", "start": "2026-10-05T10:00", "minutes": 30, "status": "requested" },
         { "id": "appt_000000000000000000000000000000b1", "start": "soon", "minutes": 30, "status": "confirmed" }
     ]});
-    let merged = calendar_merge(Some(&here), &mixed, &Ticks::none()).unwrap();
+    let calendar_ticked = ticks_of(&[RestoreClass::Calendar], false);
+    let merged = calendar_merge(Some(&here), &mixed, &calendar_ticked).unwrap();
     let book: serde_json::Value = serde_json::from_slice(&merged.bytes).unwrap();
     assert_eq!(book["appointments"].as_array().unwrap().len(), 3);
     assert!(crate::calendar::is_readable(&String::from_utf8(merged.bytes).unwrap()));
     // A calendar here that is not one is not a reason to lose the backup's: it starts from an empty one.
-    let fresh = calendar_merge(Some(&serde_json::json!({ "appointments": [{ "title": "old" }] })), &mixed, &Ticks::none()).unwrap();
+    let fresh = calendar_merge(Some(&serde_json::json!({ "appointments": [{ "title": "old" }] })), &mixed, &calendar_ticked).unwrap();
     assert!(crate::calendar::is_readable(&String::from_utf8(fresh.bytes).unwrap()));
 }
 
@@ -3105,11 +3104,11 @@ fn a_restore_adds_to_a_calendar_only_up_to_a_bound_and_says_so() {
     let mut here = calendar_value("here");
     here["appointments"] = serde_json::Value::Array((0..9_999).map(appointment).collect());
     let theirs = serde_json::json!({ "appointments": (10_000..10_005).map(|i| serde_json::json!({ "id": format!("appt_{i:032x}"), "start": "2026-10-06T10:00", "minutes": 30, "status": "requested" })).collect::<Vec<_>>() });
-    let merged = calendar_merge(Some(&here), &theirs, &Ticks::none()).unwrap();
+    let merged = calendar_merge(Some(&here), &theirs, &ticks_of(&[RestoreClass::Calendar], false)).unwrap();
     let book: serde_json::Value = serde_json::from_slice(&merged.bytes).unwrap();
     assert_eq!(book["appointments"].as_array().unwrap().len(), 10_000, "one fits");
     assert!(merged.notes.iter().any(|n| n.contains("4 more appointments") && n.contains("10000")), "{:?}", merged.notes);
-    assert!(merged.notes.iter().any(|n| n.contains("1 appointment came back with only")), "{:?}", merged.notes);
+    assert!(merged.notes.iter().any(|n| n.contains("1 appointment came back") && n.contains("FormLogic")), "{:?}", merged.notes);
 }
 
 /// An appointment's id is the key FormLogic's copy of it is asked for by (`oaiy:<id>`), and the Agent's calendar tools print it into a
@@ -3345,17 +3344,18 @@ fn every_value_the_calendar_table_lets_through_is_one_the_calendar_module_reads(
             let text = String::from_utf8(merged.bytes).unwrap();
             assert!(crate::calendar::is_readable(&text), "edge {edge}: {text}");
             let book: serde_json::Value = serde_json::from_str(&text).unwrap();
-            assert_eq!(book["appointments"].as_array().unwrap().len(), 25, "every status and every origin came");
+            let came = if ticks.has(RestoreClass::Calendar) { 25 } else { 0 };
+            assert_eq!(book["appointments"].as_array().unwrap().len(), came, "every status and every origin came with the tick, and none without it");
             assert_eq!(book["settings"]["slotMinutes"], staged["settings"]["slotMinutes"]);
         }
     }
 }
 
-/// An appointment of yours is never replaced by a restore that was not ticked for the calendar's words. The backup's record of the
-/// same id would come without the service, name, number and notes (they are words, and not ticked), so replacing yours with it would
-/// blank them: it is kept exactly as it is, including the record of FormLogic's copy, and the person is told.
+/// An appointment of yours is untouched by a restore that was not ticked for the calendar: the backup's appointments do not come (the
+/// phone sends every appointment it has no copy of at FormLogic to the linked account), and the calendar that is here stays as it is.
+/// With the tick the backup's record of the same id takes its place, keeping the record of FormLogic's copy that is here.
 #[test]
-fn an_appointment_of_yours_is_kept_exactly_as_it_is_when_the_backup_has_the_same_id_and_the_words_were_not_ticked() {
+fn an_appointment_of_yours_is_untouched_by_a_restore_that_was_not_ticked_and_replaced_by_one_that_was() {
     use super::sanitize::calendar_merge;
     let mut here = calendar_value("here");
     here["appointments"][0]["formlogic"] = serde_json::json!({ "id": "remote-1", "revision": 3 });
@@ -3369,13 +3369,8 @@ fn an_appointment_of_yours_is_kept_exactly_as_it_is_when_the_backup_has_the_same
         ("nothing ticked", Ticks::none()),
         ("another kind ticked", ticks_of(&[RestoreClass::Memory, RestoreClass::Plugins, RestoreClass::Conversations], true)),
     ] {
-        let merged = calendar_merge(Some(&here), &theirs, &ticks).unwrap();
-        let book: serde_json::Value = serde_json::from_slice(&merged.bytes).unwrap();
-        assert_eq!(book["appointments"][0], mine, "{what}: the appointment here is exactly as it was");
-        assert_eq!(book["appointments"], here["appointments"], "{what}: and no other was added or lost");
-        let text = book.to_string();
-        assert!(!text.contains("Someone else") && !text.contains("$1") && !text.contains("2027-01-01"), "{what}: nothing of the backup's record of it came: {text}");
-        assert!(merged.notes.iter().any(|n| n.contains("1 appointment already here was kept exactly as it is")), "{what}: {:?}", merged.notes);
+        let err = calendar_merge(Some(&here), &theirs, &ticks).err().unwrap_or_else(|| panic!("{what}: nothing of it comes back"));
+        assert!(err.contains("nothing in it comes back"), "{what}: {err}");
     }
     // With the calendar's tick the backup's record takes its place, and the record of FormLogic's copy stays with the computer.
     let merged = calendar_merge(Some(&here), &theirs, &ticks_of(&[RestoreClass::Calendar], false)).unwrap();
@@ -3385,7 +3380,7 @@ fn an_appointment_of_yours_is_kept_exactly_as_it_is_when_the_backup_has_the_same
         assert_eq!(book["appointments"][0][kept], mine[kept], "{kept} belongs to this computer and stays with the appointment");
     }
     assert!(merged.notes.iter().any(|n| n.contains("1 appointment here was replaced by the backup's")), "{:?}", merged.notes);
-    // And through a restore: the file that is here keeps the appointment byte for byte (as JSON).
+    // And through a restore that was not ticked: the file that is here is left exactly as it is, and the result says the calendar was not brought.
     let out = TempDir::new("cal-same-id");
     let text = serde_json::json!({ "appointments": theirs["appointments"] }).to_string();
     let files: Vec<(&str, &[u8])> = vec![("calendar/calendar.json", text.as_bytes())];
@@ -3393,8 +3388,11 @@ fn an_appointment_of_yours_is_kept_exactly_as_it_is_when_the_backup_has_the_same
     craft(&file, &manifest_for(&files), &files, true);
     let dst = TempDir::new("cal-same-id-dst");
     put(&dst.0, "calendar/calendar.json", here.to_string());
-    restore::stage(&dst.0, &file, PASS, &Ticks::none(), &options()).unwrap();
-    assert!(matches!(restore::apply_pending(&dst.0), ApplyOutcome::Applied(_)));
+    let staged = restore::stage(&dst.0, &file, PASS, &Ticks::none(), &options()).unwrap();
+    assert!(staged.skipped.iter().any(|n| n.contains("calendar/calendar.json was not brought back")), "{:?}", staged.skipped);
+    let before = snapshot(&dst.0);
+    assert!(matches!(restore::apply_pending(&dst.0), ApplyOutcome::Applied(_) | ApplyOutcome::None));
+    assert_eq!(snapshot(&dst.0), before, "nothing of the calendar was touched");
     assert_eq!(json_of(&dst.0, "calendar/calendar.json")["appointments"][0], mine);
 }
 

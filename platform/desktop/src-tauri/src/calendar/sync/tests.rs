@@ -981,3 +981,34 @@ fn requests_close_together_share_a_connection_and_each_carries_the_key_of_its_ow
     );
     assert_eq!(server.connections(), 1, "{:?}", server.lines());
 }
+
+/// A restore must not make this computer send anything away: the phone sends every appointment it has no copy of at FormLogic to the
+/// linked account, so a restore that was not ticked for the calendar brings back no appointment (only the opening hours), and nothing
+/// is created at FormLogic; one that was ticked brings them, and they are sent at the next sync (and it says so).
+#[test]
+fn a_restore_that_was_not_ticked_for_the_calendar_makes_the_sync_send_nothing() {
+    use crate::backup::review::{RestoreClass, Ticks};
+    let backup = json!({
+        "settings": { "hours": [[{"open": "09:00", "close": "17:00"}], [], [], [], [], [], []] },
+        "appointments": [{
+            "id": "appt_00000000000000000000000000000011", "start": "2026-10-05T10:00", "minutes": 30, "status": "confirmed", "source": "call",
+            "createdAt": "2026-09-01T00:00:00Z", "updatedAt": "2026-09-01T00:00:00Z", "name": "N", "phone": "0491 570 006", "notes": "n", "service": "s"
+        }]
+    });
+    for (ticked, expect) in [(false, 0usize), (true, 1)] {
+        let ticks = if ticked { Ticks { classes: [RestoreClass::Calendar].into_iter().collect(), keys: false } } else { Ticks::none() };
+        let merged = crate::backup::sanitize::calendar_merge(None, &backup, &ticks).unwrap();
+        assert_eq!(merged.notes.iter().any(|n| n.contains("your linked FormLogic account")), ticked, "{:?}", merged.notes);
+        let dir = std::env::temp_dir().join(format!("oaiy-calsync-restore-{}", uuid::Uuid::new_v4().simple()));
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("calendar.json"), &merged.bytes).unwrap();
+        let cal = Calendar::open(&dir, None);
+        assert_eq!(cal.list(None, None).len(), expect, "ticked: {ticked}");
+        assert_eq!(pending_of(&cal).creates, expect, "ticked: {ticked}: what would be created at FormLogic");
+        let (fake, base) = formlogic();
+        let out = run(&cal, &base).unwrap();
+        assert_eq!(out.pushed, expect, "ticked: {ticked}");
+        assert_eq!(fake.lock().unwrap().records.len(), expect, "ticked: {ticked}: what FormLogic was sent");
+        let _ = std::fs::remove_dir_all(dir);
+    }
+}
