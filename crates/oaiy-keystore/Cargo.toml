@@ -10,5 +10,10 @@ publish = false
 oaiy-crypto = { path = "../oaiy-crypto" }
 zeroize = "1.8.2"
 
+# The keys folder is held as a directory descriptor and every file is opened, created, renamed and removed relative to it (openat, renameat, unlinkat), which std
+# does not offer. rustix's safe API is used: this crate keeps `#![deny(unsafe_code)]` outside the DPAPI module. Only what it uses is enabled.
+[target.'cfg(unix)'.dependencies]
+rustix = { version = "1.1.4", default-features = false, features = ["std", "fs", "process"] }
+
 [target.'cfg(windows)'.dependencies]
 windows-sys = { version = "0.61", features = ["Win32_Foundation", "Win32_Security_Cryptography"] }

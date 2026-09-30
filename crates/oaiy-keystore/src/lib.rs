@@ -32,6 +32,7 @@ mod codec;
 #[allow(unsafe_code)]
 mod dpapi;
 mod error;
+mod keydir;
 mod name;
 pub mod perm;
 mod provider;

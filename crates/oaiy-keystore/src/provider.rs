@@ -72,7 +72,8 @@ pub fn open(data_dir: &Path, choice: ProviderChoice) -> Result<Box<dyn KeyStore>
 }
 
 /// Opens the keystore in the given directory itself.
-pub fn open_at(keys_dir: std::path::PathBuf, choice: ProviderChoice) -> Result<Box<dyn KeyStore>, KeyError> {
+pub fn open_at(keys_dir: impl AsRef<Path>, choice: ProviderChoice) -> Result<Box<dyn KeyStore>, KeyError> {
+    let keys_dir = keys_dir.as_ref();
     match choice.resolve()? {
         ProviderChoice::Keyfile => Ok(Box::new(FileStore::open(keys_dir, KeyfileCodec)?)),
         #[cfg(windows)]

@@ -60,6 +60,7 @@ fn a_file_far_larger_than_any_secret_is_refused_before_it_is_read_into_memory() 
         let asked = LARGEST.load(Ordering::Relaxed);
         assert!(matches!(result, Err(KeyError::Corrupt(_))), "{ext}: {result:?}");
         assert!(asked < 1024 * 1024, "{ext}: reading a 300 MiB file asked the allocator for {asked} bytes in one piece");
+        drop(store); // the store holds its folder open, and Windows will not remove an open folder
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

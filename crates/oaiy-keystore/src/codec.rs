@@ -9,17 +9,12 @@
 //! provider, protected by `0600` in a `0700` directory and by nothing else); the tag makes a moved file fail with `WrongName` and the check makes a
 //! damaged one fail with `Corrupt`, in that order of precedence: a copy is intact, so it is a wrong name, not damage.
 
-use std::fs::{self, File, OpenOptions};
-use std::io;
-use std::path::Path;
-
 use oaiy_crypto::kdf::sha256;
 use oaiy_crypto::zeroize::ct_eq;
 use zeroize::Zeroizing;
 
 use crate::error::KeyError;
 use crate::name::Name;
-use crate::perm::{self, Kind};
 
 /// How strongly a provider protects a secret at rest.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -58,26 +53,6 @@ pub(crate) trait Codec: Send + Sync {
     fn seal(&self, name: &Name, value: &[u8]) -> Result<Zeroizing<Vec<u8>>, KeyError>;
     /// The value of a file's bytes under `name`. Never `Ok` for a blob of another name.
     fn open(&self, name: &Name, blob: &[u8]) -> Result<Zeroizing<Vec<u8>>, KeyError>;
-    /// Makes the directory, if it is not there, the way the provider wants it.
-    fn prepare_dir(&self, dir: &Path) -> Result<(), KeyError> {
-        fs::create_dir_all(dir).map_err(|e| KeyError::io("create the keys directory", e))
-    }
-    /// Checks the directory before every operation.
-    fn check_dir(&self, _dir: &Path, _owner: Option<u32>) -> Result<(), KeyError> {
-        Ok(())
-    }
-    /// The user this process runs as, learned by making a file of its own in the directory (`None` where owners are not compared).
-    fn probe_owner(&self, _dir: &Path) -> Result<Option<u32>, KeyError> {
-        Ok(None)
-    }
-    /// Checks a file before it is read.
-    fn check_file(&self, _path: &Path, _owner: Option<u32>) -> Result<(), KeyError> {
-        Ok(())
-    }
-    /// Creates a new file that must not exist.
-    fn create_file(&self, path: &Path) -> io::Result<File> {
-        OpenOptions::new().write(true).create_new(true).open(path)
-    }
 }
 
 // ---------------------------------------------------------------------------------------------------------------------------------------
@@ -142,45 +117,6 @@ impl Codec for KeyfileCodec {
             return Err(KeyError::WrongName);
         }
         Ok(Zeroizing::new(value.to_vec()))
-    }
-
-    #[cfg(unix)]
-    fn prepare_dir(&self, dir: &Path) -> Result<(), KeyError> {
-        use std::os::unix::fs::DirBuilderExt;
-        if !dir.exists() {
-            // a new directory is made 0700; an existing one is checked, never repaired
-            fs::DirBuilder::new().recursive(true).mode(0o700).create(dir).map_err(|e| KeyError::io("create the keys directory", e))?;
-        }
-        Ok(())
-    }
-
-    fn check_dir(&self, dir: &Path, owner: Option<u32>) -> Result<(), KeyError> {
-        let meta = perm::read_meta(dir).map_err(|e| KeyError::io("inspect the keys directory", e))?;
-        perm::check(Kind::Dir, &meta, owner).map_err(|why| KeyError::Permissions(format!("{}: {why}", dir.display())))
-    }
-
-    #[cfg(unix)]
-    fn probe_owner(&self, dir: &Path) -> Result<Option<u32>, KeyError> {
-        use std::os::unix::fs::MetadataExt;
-        let random: oaiy_crypto::zeroize::Secret<8> =
-            oaiy_crypto::zeroize::Secret::random().map_err(|_| KeyError::io("random", io::Error::other("the random generator failed")))?;
-        let probe = dir.join(format!(".probe.{}.tmp", oaiy_crypto::kdf::hex_lower(random.expose())));
-        let file = self.create_file(&probe).map_err(|e| KeyError::io("create a probe file", e))?;
-        let uid = file.metadata().map(|m| m.uid());
-        drop(file);
-        let _ = fs::remove_file(&probe);
-        uid.map(Some).map_err(|e| KeyError::io("inspect a probe file", e))
-    }
-
-    fn check_file(&self, path: &Path, owner: Option<u32>) -> Result<(), KeyError> {
-        let meta = perm::read_meta(path).map_err(|e| KeyError::io("inspect a key file", e))?;
-        perm::check(Kind::File, &meta, owner).map_err(|why| KeyError::Permissions(format!("{}: {why}", path.display())))
-    }
-
-    #[cfg(unix)]
-    fn create_file(&self, path: &Path) -> io::Result<File> {
-        use std::os::unix::fs::OpenOptionsExt;
-        OpenOptions::new().write(true).create_new(true).mode(0o600).open(path)
     }
 }
 

@@ -1791,6 +1791,7 @@ name = "oaiy-keystore"
 version = "0.1.0"
 dependencies = [
  "oaiy-crypto",
+ "rustix",
  "windows-sys",
  "zeroize",
 ]

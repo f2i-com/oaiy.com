@@ -4,11 +4,10 @@
 //! does; `put` writes a temporary file (created new, never overwriting, with only what the provider makes of the value in it), flushes it, reads
 //! it back through the provider and compares, and only then renames it over the old value, so a failure at any step leaves the previous value
 //! and no file of the failed attempt; `delete` is idempotent; `list` shows valid names only; a keys directory that has disappeared is an error, not an
-//! empty store.
+//! empty store. Every file is reached through the folder the store holds open ([`crate::keydir`]), never through a path looked up again.
 
-use std::fs::{self, File};
-use std::io::{self, Read, Write};
-use std::path::{Path, PathBuf};
+use std::io::Write;
+use std::path::Path;
 
 use oaiy_crypto::kdf::hex_lower;
 use oaiy_crypto::zeroize::{ct_eq, Secret};
@@ -16,13 +15,11 @@ use zeroize::Zeroizing;
 
 use crate::codec::{Codec, ProviderInfo};
 use crate::error::KeyError;
+use crate::keydir::KeyDir;
 use crate::name::Name;
 
 /// The most a value may be: 64 KiB.
 pub const MAX_VALUE_LEN: usize = 64 * 1024;
-
-/// A blob is never larger than a value plus a provider's framing; a file larger than this is not one of ours and is not read into memory.
-const MAX_BLOB_LEN: usize = MAX_VALUE_LEN + 4096;
 
 /// K1: named secrets. `Ok(None)` and `Err` are not the same thing.
 pub trait KeyStore: Send + Sync {
@@ -46,61 +43,45 @@ pub trait KeyStore: Send + Sync {
 
 /// One file per secret in one directory.
 pub(crate) struct FileStore<C: Codec> {
-    dir: PathBuf,
+    dir: KeyDir,
     codec: C,
-    owner: Option<u32>,
 }
 
 impl<C: Codec> FileStore<C> {
     /// Opens (creating it if need be) the keys directory, checks it, and removes the debris of an interrupted write.
-    pub(crate) fn open(dir: PathBuf, codec: C) -> Result<Self, KeyError> {
-        codec.prepare_dir(&dir)?;
-        codec.check_dir(&dir, None)?;
-        let owner = codec.probe_owner(&dir)?;
-        codec.check_dir(&dir, owner)?;
-        let store = FileStore { dir, codec, owner };
+    pub(crate) fn open(dir: &Path, codec: C) -> Result<Self, KeyError> {
+        let store = FileStore { dir: KeyDir::open(dir)?, codec };
         store.remove_stale_temporaries();
         Ok(store)
     }
 
-    fn path(&self, name: &Name) -> PathBuf {
-        self.dir.join(format!("{}.{}", name.as_str(), self.codec.extension()))
-    }
-
-    /// The directory is checked before every operation: one that has gone is a failure, not an empty store.
-    fn require_dir(&self) -> Result<(), KeyError> {
-        let meta = fs::metadata(&self.dir).map_err(|e| KeyError::io("inspect the keys directory", e))?;
-        if !meta.is_dir() {
-            return Err(KeyError::io("inspect the keys directory", io::Error::other("not a directory")));
-        }
-        self.codec.check_dir(&self.dir, self.owner)
+    fn file_name(&self, name: &Name) -> String {
+        format!("{}.{}", name.as_str(), self.codec.extension())
     }
 
     /// Temporary files are `.<name>.<16 hex>.tmp`: they can never be a name, so `list` and `get` cannot see them. A crash between the write and the rename leaves one;
     /// with the keyfile provider it holds a value in the clear, so it is removed the next time the store is opened.
     fn remove_stale_temporaries(&self) {
-        let Ok(entries) = fs::read_dir(&self.dir) else { return };
-        for entry in entries.flatten() {
-            let file_name = entry.file_name();
-            let Some(text) = file_name.to_str() else { continue };
-            if text.starts_with('.') && text.ends_with(".tmp") && entry.file_type().map(|t| t.is_file()).unwrap_or(false) {
-                let _ = fs::remove_file(entry.path());
+        let Ok(entries) = self.dir.list() else { return };
+        for entry in entries {
+            if entry.is_file && entry.name.starts_with('.') && entry.name.ends_with(".tmp") {
+                let _ = self.dir.remove(&entry.name);
             }
         }
     }
 
-    fn temporary_path(&self, name: &Name) -> Result<PathBuf, KeyError> {
-        let random: Secret<8> = Secret::random().map_err(|_| KeyError::io("random", io::Error::other("the random generator failed")))?;
-        Ok(self.dir.join(format!(".{}.{}.tmp", name.as_str(), hex_lower(random.expose()))))
+    fn temporary_name(&self, name: &Name) -> Result<String, KeyError> {
+        let random: Secret<8> = Secret::random().map_err(|_| KeyError::io("random", std::io::Error::other("the random generator failed")))?;
+        Ok(format!(".{}.{}.tmp", name.as_str(), hex_lower(random.expose())))
     }
 
     /// Writes the blob to `tmp`, flushes it, reads it back through the provider and compares.
-    fn write_and_verify(&self, tmp: &Path, name: &Name, value: &[u8], blob: &[u8]) -> Result<(), KeyError> {
-        let mut file = self.codec.create_file(tmp).map_err(|e| KeyError::io("create the temporary file", e))?;
+    fn write_and_verify(&self, tmp: &str, name: &Name, value: &[u8], blob: &[u8]) -> Result<(), KeyError> {
+        let mut file = self.dir.create_new(tmp)?;
         file.write_all(blob).map_err(|e| KeyError::io("write the temporary file", e))?;
         file.sync_all().map_err(|e| KeyError::io("flush the temporary file", e))?;
         drop(file);
-        let back = read_bounded(tmp)?.ok_or(KeyError::Verify)?;
+        let back = self.dir.read(tmp)?.ok_or(KeyError::Verify)?;
         let opened = self.codec.open(name, &back)?;
         if !ct_eq(&opened, value) {
             return Err(KeyError::Verify);
@@ -109,51 +90,14 @@ impl<C: Codec> FileStore<C> {
     }
 }
 
-/// Reads a whole file into one buffer of exactly its size (a buffer that grows leaves earlier, smaller copies of a secret behind in freed memory),
-/// refusing one that is too big to be a blob. `Ok(None)` if there is no such file.
-fn read_bounded(path: &Path) -> Result<Option<Zeroizing<Vec<u8>>>, KeyError> {
-    let mut file = match File::open(path) {
-        Ok(file) => file,
-        Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(None),
-        Err(e) => return Err(KeyError::io("open a key file", e)),
-    };
-    let length = file.metadata().map_err(|e| KeyError::io("inspect a key file", e))?.len();
-    if length > MAX_BLOB_LEN as u64 {
-        return Err(KeyError::Corrupt("larger than any secret"));
-    }
-    let mut bytes = Zeroizing::new(vec![0u8; length as usize]);
-    file.read_exact(&mut bytes).map_err(|e| KeyError::io("read a key file", e))?;
-    let mut extra = [0u8; 1];
-    if file.read(&mut extra).map_err(|e| KeyError::io("read a key file", e))? != 0 {
-        return Err(KeyError::Corrupt("the file changed while it was read"));
-    }
-    Ok(Some(bytes))
-}
-
-#[cfg(unix)]
-fn sync_directory(dir: &Path) {
-    if let Ok(handle) = File::open(dir) {
-        let _ = handle.sync_all();
-    }
-}
-
-#[cfg(not(unix))]
-fn sync_directory(_dir: &Path) {}
-
 impl<C: Codec> KeyStore for FileStore<C> {
     fn provider(&self) -> ProviderInfo {
         self.codec.info()
     }
 
     fn get(&self, name: &Name) -> Result<Option<Zeroizing<Vec<u8>>>, KeyError> {
-        self.require_dir()?;
-        let path = self.path(name);
-        match self.codec.check_file(&path, self.owner) {
-            Ok(()) => {}
-            Err(KeyError::Io { source, .. }) if source.kind() == io::ErrorKind::NotFound => return Ok(None),
-            Err(other) => return Err(other),
-        }
-        let Some(blob) = read_bounded(&path)? else { return Ok(None) };
+        self.dir.verify()?;
+        let Some(blob) = self.dir.read(&self.file_name(name))? else { return Ok(None) };
         self.codec.open(name, &blob).map(Some)
     }
 
@@ -164,41 +108,35 @@ impl<C: Codec> KeyStore for FileStore<C> {
         if value.len() > MAX_VALUE_LEN {
             return Err(KeyError::InvalidValue("larger than 64 KiB"));
         }
-        self.require_dir()?;
+        self.dir.verify()?;
         let blob = self.codec.seal(name, value)?;
-        let tmp = self.temporary_path(name)?;
+        let tmp = self.temporary_name(name)?;
         if let Err(error) = self.write_and_verify(&tmp, name, value, &blob) {
-            let _ = fs::remove_file(&tmp);
+            let _ = self.dir.remove(&tmp);
             return Err(error);
         }
-        if let Err(error) = fs::rename(&tmp, self.path(name)) {
-            let _ = fs::remove_file(&tmp);
-            return Err(KeyError::io("replace the key file", error));
+        if let Err(error) = self.dir.rename(&tmp, &self.file_name(name)) {
+            let _ = self.dir.remove(&tmp);
+            return Err(error);
         }
-        sync_directory(&self.dir);
-        Ok(())
+        self.dir.sync()
     }
 
     fn delete(&self, name: &Name) -> Result<(), KeyError> {
-        self.require_dir()?;
-        match fs::remove_file(self.path(name)) {
-            Ok(()) => Ok(()),
-            Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(()),
-            Err(e) => Err(KeyError::io("remove a key file", e)),
-        }
+        self.dir.verify()?;
+        self.dir.remove(&self.file_name(name))?;
+        self.dir.sync()
     }
 
     fn list(&self, prefix: &str) -> Result<Vec<Name>, KeyError> {
-        self.require_dir()?;
+        self.dir.verify()?;
         let suffix = format!(".{}", self.codec.extension());
         let mut names = Vec::new();
-        for entry in fs::read_dir(&self.dir).map_err(|e| KeyError::io("list the keys directory", e))? {
-            let entry = entry.map_err(|e| KeyError::io("list the keys directory", e))?;
-            if !entry.file_type().map(|t| t.is_file()).unwrap_or(false) {
+        for entry in self.dir.list()? {
+            if !entry.is_file {
                 continue;
             }
-            let file_name = entry.file_name();
-            let Some(stem) = file_name.to_str().and_then(|f| f.strip_suffix(suffix.as_str())) else { continue };
+            let Some(stem) = entry.name.strip_suffix(suffix.as_str()) else { continue };
             if let Ok(name) = Name::new(stem) {
                 if name.as_str().starts_with(prefix) {
                     names.push(name);
@@ -214,6 +152,8 @@ impl<C: Codec> KeyStore for FileStore<C> {
 mod tests {
     use super::*;
     use crate::codec::{KeyfileCodec, Strength};
+    use std::fs;
+    use std::path::PathBuf;
     use std::sync::atomic::{AtomicU8, Ordering};
 
     /// What the wrapped codec should do wrong next.
@@ -222,8 +162,6 @@ mod tests {
     const FAULT_WRONG_VALUE: u8 = 1;
     /// `open` fails.
     const FAULT_OPEN_FAILS: u8 = 2;
-    /// `create_file` fails (the disk is full, the directory went read-only).
-    const FAULT_CREATE_FAILS: u8 = 3;
 
     struct Faulty {
         inner: KeyfileCodec,
@@ -247,22 +185,26 @@ mod tests {
                 _ => self.inner.open(name, blob),
             }
         }
-        fn create_file(&self, path: &Path) -> io::Result<File> {
-            if self.fault.load(Ordering::SeqCst) == FAULT_CREATE_FAILS {
-                return Err(io::Error::other("injected: no space left on device"));
-            }
-            self.inner.create_file(path)
-        }
     }
 
-    struct Scratch(PathBuf);
+    pub(crate) struct Scratch(pub(crate) PathBuf);
 
     impl Scratch {
-        fn new(tag: &str) -> Scratch {
+        pub(crate) fn new(tag: &str) -> Scratch {
             let nanos = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_nanos()).unwrap_or(0);
             let dir = std::env::temp_dir().join(format!("oaiy-keystore-unit-{tag}-{}-{nanos}", std::process::id()));
             fs::create_dir_all(&dir).unwrap();
+            // a folder above the keys folder that others could rename in is refused (the umask of some systems makes it 0775)
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                fs::set_permissions(&dir, fs::Permissions::from_mode(0o700)).unwrap();
+            }
             Scratch(dir)
+        }
+
+        pub(crate) fn keys(&self) -> PathBuf {
+            self.0.join("keys")
         }
     }
 
@@ -273,7 +215,7 @@ mod tests {
     }
 
     fn faulty(scratch: &Scratch) -> FileStore<Faulty> {
-        FileStore::open(scratch.0.join("keys"), Faulty { inner: KeyfileCodec, fault: AtomicU8::new(FAULT_NONE) }).unwrap()
+        FileStore::open(&scratch.keys(), Faulty { inner: KeyfileCodec, fault: AtomicU8::new(FAULT_NONE) }).unwrap()
     }
 
     fn files(dir: &Path) -> Vec<String> {
@@ -294,7 +236,7 @@ mod tests {
         let store = faulty(&scratch);
         let n = name("archive.writer");
         store.put(&n, b"the old value").unwrap();
-        let before = files(&store.dir);
+        let before = files(&scratch.keys());
         assert_eq!(before, vec!["archive.writer.kf".to_string()]);
 
         store.codec.fault.store(FAULT_WRONG_VALUE, Ordering::SeqCst);
@@ -302,7 +244,7 @@ mod tests {
         store.codec.fault.store(FAULT_NONE, Ordering::SeqCst);
 
         assert_eq!(&**store.get(&n).unwrap().unwrap(), b"the old value", "the previous value is still there");
-        assert_eq!(files(&store.dir), before, "no temporary file of the failed attempt is left");
+        assert_eq!(files(&scratch.keys()), before, "no temporary file of the failed attempt is left");
     }
 
     #[test]
@@ -315,7 +257,7 @@ mod tests {
         assert!(store.put(&n, b"second").is_err());
         store.codec.fault.store(FAULT_NONE, Ordering::SeqCst);
         assert_eq!(&**store.get(&n).unwrap().unwrap(), b"first");
-        assert_eq!(files(&store.dir), vec!["backup.sig.kf".to_string()]);
+        assert_eq!(files(&scratch.keys()), vec!["backup.sig.kf".to_string()]);
     }
 
     #[test]
@@ -324,30 +266,99 @@ mod tests {
         let store = faulty(&scratch);
         let n = name("relay.token");
         store.put(&n, b"first").unwrap();
-        store.codec.fault.store(FAULT_CREATE_FAILS, Ordering::SeqCst);
+        store.dir.hooks.fail_create.store(true, Ordering::SeqCst);
         assert!(matches!(store.put(&n, b"second"), Err(KeyError::Io { op: "create the temporary file", .. })));
         // and a name that was never stored is still not stored, not an empty file
         assert!(matches!(store.put(&name("never.stored"), b"x"), Err(KeyError::Io { .. })));
-        store.codec.fault.store(FAULT_NONE, Ordering::SeqCst);
+        store.dir.hooks.fail_create.store(false, Ordering::SeqCst);
         assert_eq!(&**store.get(&n).unwrap().unwrap(), b"first");
         assert!(store.get(&name("never.stored")).unwrap().is_none());
-        assert_eq!(files(&store.dir), vec!["relay.token.kf".to_string()]);
+        assert_eq!(files(&scratch.keys()), vec!["relay.token.kf".to_string()]);
     }
 
     /// A crash between the write and the rename leaves a temporary file. With the keyfile provider it holds a value in the clear, so opening the store removes it.
     #[test]
     fn opening_the_store_removes_the_debris_of_an_interrupted_put() {
         let scratch = Scratch::new("debris");
-        let dir = scratch.0.join("keys");
+        let dir = scratch.keys();
         {
-            let store = FileStore::open(dir.clone(), KeyfileCodec).unwrap();
+            let store = FileStore::open(&dir, KeyfileCodec).unwrap();
             store.put(&name("keep.me"), b"kept").unwrap();
         }
         fs::write(dir.join(".keep.me.0123456789abcdef.tmp"), b"a value in the clear").unwrap();
         fs::write(dir.join(".other.fedcba9876543210.tmp"), b"another").unwrap();
         fs::write(dir.join("notes.txt"), b"not ours").unwrap();
-        let store = FileStore::open(dir.clone(), KeyfileCodec).unwrap();
+        let store = FileStore::open(&dir, KeyfileCodec).unwrap();
         assert_eq!(files(&dir), vec!["keep.me.kf".to_string(), "notes.txt".to_string()]);
         assert_eq!(&**store.get(&name("keep.me")).unwrap().unwrap(), b"kept");
+    }
+
+    /// M-3, the reviewer's attack: between the moment the store has judged its folder and the moment it opens a file, someone who can rename folders puts a
+    /// folder of their own at the path. A store that looks the path up again reads the attacker's values as its own (the reviewer's victim read 3,388 of
+    /// them, and was told `None` 58,442 times). This store opened its folder once and opens every file relative to it: the read is of the real folder, the
+    /// write goes to the real folder, nothing is ever written into the attacker's, and the very next operation says that the path leads elsewhere now.
+    #[cfg(unix)]
+    #[test]
+    fn a_folder_swapped_in_after_the_check_is_never_read_or_written_in_place_of_the_real_one() {
+        use std::sync::atomic::AtomicBool;
+        let scratch = Scratch::new("swap");
+        let keys = scratch.keys();
+        let store = FileStore::open(&keys, KeyfileCodec).unwrap();
+        let n = name("archive.writer");
+        store.put(&n, b"the victim's value").unwrap();
+        // the attacker's folder: a valid blob under the same name, made by a store of its own
+        let attacker = scratch.0.join("attacker");
+        FileStore::open(&attacker, KeyfileCodec).unwrap().put(&n, b"the attacker's value").unwrap();
+        let attacker_before = fs::read(attacker.join("archive.writer.kf")).unwrap();
+        let moved = scratch.0.join("victim-moved");
+        let armed = std::sync::Arc::new(AtomicBool::new(true));
+        let swap = {
+            let (keys, attacker, moved, armed) = (keys.clone(), attacker.clone(), moved.clone(), armed.clone());
+            move || {
+                if armed.swap(false, Ordering::SeqCst) {
+                    fs::rename(&keys, &moved).unwrap();
+                    fs::rename(&attacker, &keys).unwrap();
+                }
+            }
+        };
+
+        store.dir.hooks.at("before_open", swap.clone());
+        let read = store.get(&n).unwrap().expect("the victim's own value is still found");
+        assert_eq!(&**read, b"the victim's value", "the read went through the descriptor of the real folder, not through the path");
+        // the next operation notices that the path leads to another folder now, and says so: neither `None` nor the attacker's value
+        assert!(matches!(store.get(&n), Err(KeyError::Io { op: "inspect the keys directory", .. })));
+        assert!(matches!(store.put(&n, b"x"), Err(KeyError::Io { .. })));
+        assert!(matches!(store.list(""), Err(KeyError::Io { .. })));
+        assert!(matches!(store.delete(&n), Err(KeyError::Io { .. })));
+        assert_eq!(fs::read(keys.join("archive.writer.kf")).unwrap(), attacker_before, "nothing was written into the attacker's folder");
+        assert_eq!(files(&keys), vec!["archive.writer.kf".to_string()]);
+
+        // the same swap in the middle of a put: the temporary file, its read-back and the rename are all in the real folder
+        fs::rename(&keys, &attacker).unwrap();
+        fs::rename(&moved, &keys).unwrap();
+        armed.store(true, Ordering::SeqCst);
+        store.dir.hooks.clear();
+        store.dir.hooks.at("before_open", swap);
+        store.put(&n, b"the new victim value").unwrap();
+        assert_eq!(fs::read(keys.join("archive.writer.kf")).unwrap(), attacker_before, "the attacker's folder is at the path, and was not touched");
+        assert_eq!(files(&keys), vec!["archive.writer.kf".to_string()], "no temporary file of the put is in the attacker's folder");
+        let reopened = FileStore::open(&moved, KeyfileCodec).unwrap();
+        assert_eq!(&**reopened.get(&n).unwrap().unwrap(), b"the new victim value", "the put landed in the real folder");
+    }
+
+    /// A put flushes the folder after the rename, and a delete after the removal: the new name, and the absence of the old one, survive a power cut (L-9: on
+    /// Windows the flush was missing altogether).
+    #[test]
+    fn a_put_and_a_delete_flush_the_folder() {
+        let scratch = Scratch::new("flush");
+        let store = faulty(&scratch);
+        let syncs = || store.dir.hooks.syncs.load(Ordering::SeqCst);
+        assert_eq!(syncs(), 0);
+        store.put(&name("a.one"), b"1").unwrap();
+        assert_eq!(syncs(), 1, "put");
+        store.delete(&name("a.one")).unwrap();
+        assert_eq!(syncs(), 2, "delete");
+        assert!(store.put(&name("a.two"), b"").is_err());
+        assert_eq!(syncs(), 2, "a refused put flushes nothing");
     }
 }

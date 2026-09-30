@@ -131,6 +131,7 @@ fn the_keystores_copies_of_a_secret_are_zero_when_they_are_freed() {
         let (_, leaked) = probe(|| assert!(store.get(&name).is_err()));
         assert!(!leaked, "{label}: a failed get freed a buffer that still held the secret (size {})", LEAKED_SIZE.load(Ordering::SeqCst));
 
+        drop(store); // the store holds its folder open, and Windows will not remove an open folder
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

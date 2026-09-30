@@ -17,6 +17,12 @@ impl Scratch {
         let nanos = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_nanos()).unwrap_or(0);
         let dir = std::env::temp_dir().join(format!("oaiy-keystore-test-{tag}-{}-{nanos}", std::process::id()));
         fs::create_dir_all(&dir).unwrap();
+        // the folder above the keys folder is judged too: one that others could rename in is refused, and the umask of some systems makes it 0775
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            fs::set_permissions(&dir, fs::Permissions::from_mode(0o700)).unwrap();
+        }
         Scratch(dir)
     }
 
@@ -223,11 +229,26 @@ fn a_keys_directory_that_has_gone_is_an_error_not_an_empty_store() {
         let store = store(&scratch, choice);
         let n = name("vault.pins");
         store.put(&n, b"pins").unwrap();
-        fs::remove_dir_all(scratch.keys()).unwrap();
-        assert!(matches!(store.get(&n), Err(KeyError::Io { .. })), "get");
-        assert!(matches!(store.put(&n, b"pins"), Err(KeyError::Io { .. })), "put");
-        assert!(matches!(store.list(""), Err(KeyError::Io { .. })), "list");
-        assert!(matches!(store.delete(&n), Err(KeyError::Io { .. })), "delete");
+        if cfg!(windows) {
+            // the store holds its folder open without FILE_SHARE_DELETE: nobody can remove or rename it, or the one above it, while the store is open
+            assert!(fs::rename(scratch.keys(), scratch.0.join("moved")).is_err(), "a folder held open cannot be renamed");
+            assert!(fs::rename(&scratch.0, scratch.0.with_extension("moved")).is_err(), "nor can the folder above it");
+            for entry in fs::read_dir(scratch.keys()).unwrap() {
+                fs::remove_file(entry.unwrap().path()).unwrap(); // the files can go: the folder cannot
+            }
+            assert!(fs::remove_dir(scratch.keys()).is_err(), "an empty folder held open cannot be removed");
+            assert_eq!(get(&*store, &n), None, "and the store is still usable, and its folder is still its folder");
+            store.put(&n, b"pins").unwrap();
+            assert_eq!(get(&*store, &n), Some(b"pins".to_vec()));
+            drop(store);
+            fs::remove_dir_all(scratch.keys()).unwrap();
+        } else {
+            fs::remove_dir_all(scratch.keys()).unwrap();
+            assert!(matches!(store.get(&n), Err(KeyError::Io { .. })), "get");
+            assert!(matches!(store.put(&n, b"pins"), Err(KeyError::Io { .. })), "put");
+            assert!(matches!(store.list(""), Err(KeyError::Io { .. })), "list");
+            assert!(matches!(store.delete(&n), Err(KeyError::Io { .. })), "delete");
+        }
         // and a store opened again finds the folder empty: that is a new store, and the caller learns it from `None` only now
         let reopened = open_at(scratch.keys(), choice).unwrap();
         assert_eq!(get(&*reopened, &n), None);
@@ -611,5 +632,132 @@ mod unix {
         let link_parent = Scratch::new("symlink-dir");
         symlink(elsewhere.0.join("keys"), link_parent.0.join("keys")).unwrap();
         assert!(matches!(open_at(link_parent.0.join("keys"), ProviderChoice::Keyfile), Err(KeyError::Permissions(_))));
+    }
+
+    fn make_fifo(path: &Path) {
+        use rustix::fs::{mknodat, FileType, Mode, CWD};
+        mknodat(CWD, path, FileType::Fifo, Mode::RUSR | Mode::WUSR, 0).unwrap();
+    }
+
+    /// A FIFO with a perfectly good mode in place of a key file: opening it for reading blocks until someone opens it for writing, so a store that opens the
+    /// path first and looks at what it is afterwards never returns (the reviewer's probe hung for ever). The file is opened without blocking and judged by
+    /// `fstat` on the descriptor.
+    #[test]
+    fn a_fifo_in_place_of_a_key_file_is_refused_at_once_and_never_blocks() {
+        let scratch = Scratch::new("fifo");
+        let store = store(&scratch, ProviderChoice::Keyfile);
+        store.put(&name("other.secret"), b"x").unwrap();
+        let fifo = file_of(&scratch, "piped.secret", "kf");
+        make_fifo(&fifo);
+        assert_eq!(mode_of(&fifo), 0o600);
+        let (sender, receiver) = std::sync::mpsc::channel();
+        let store: Arc<dyn KeyStore> = Arc::from(store);
+        let asked = Arc::clone(&store);
+        thread::spawn(move || {
+            let _ = sender.send(asked.get(&name("piped.secret")).map(|v| v.map(|_| ())));
+        });
+        let answer = receiver.recv_timeout(std::time::Duration::from_secs(20)).expect("get on a FIFO blocked");
+        let error = answer.expect_err("a FIFO is not a key file");
+        assert!(matches!(&error, KeyError::Permissions(why) if why.contains("not a regular file")), "{error:?}");
+        // the FIFO is not listed, does not stop the store, and a put replaces it with a file of the store's own
+        assert_eq!(store.list("").unwrap().len(), 1);
+        store.put(&name("piped.secret"), b"now a file").unwrap();
+        assert_eq!(get(&*store, &name("piped.secret")), Some(b"now a file".to_vec()));
+    }
+
+    /// The directories above the keys folder: whoever can rename the folder can put another in its place (the reviewer's attacker did it 1.1 million times
+    /// in 40 seconds against a check-then-open store). World- or group-writable and not sticky, or another user's, is refused; sticky (as `/tmp` is) is not.
+    #[test]
+    fn a_folder_above_the_keys_folder_that_others_can_rename_in_is_refused_unless_it_is_sticky() {
+        let scratch = Scratch::new("ancestors");
+        let above = scratch.0.join("above");
+        fs::create_dir(&above).unwrap();
+        for (mode, ok) in [(0o755, true), (0o700, true), (0o1777, true), (0o777, false), (0o775, false), (0o757, false), (0o770, false)] {
+            fs::set_permissions(&above, fs::Permissions::from_mode(mode)).unwrap();
+            let result = open_at(above.join(format!("keys-{mode:o}")), ProviderChoice::Keyfile);
+            match (ok, result) {
+                (true, Ok(_)) => {}
+                (false, Err(KeyError::Permissions(why))) => {
+                    assert!(why.contains("above the keys directory") && why.contains("sticky"), "{mode:o}: {why}")
+                }
+                (ok, other) => panic!("mode {mode:o}: expected ok={ok}, got {:?}", other.err()),
+            }
+        }
+        fs::set_permissions(&above, fs::Permissions::from_mode(0o700)).unwrap();
+    }
+
+    /// The chain is the one the file system has, not the one the path spells: a symbolic link to a folder under a world-writable one does not hide it.
+    #[test]
+    fn the_folders_above_are_those_of_the_real_folder_however_the_path_reaches_it() {
+        let scratch = Scratch::new("physical");
+        let shared = scratch.0.join("shared");
+        fs::create_dir(&shared).unwrap();
+        fs::create_dir(shared.join("real")).unwrap();
+        fs::set_permissions(shared.join("real"), fs::Permissions::from_mode(0o700)).unwrap();
+        fs::set_permissions(&shared, fs::Permissions::from_mode(0o777)).unwrap();
+        symlink(shared.join("real"), scratch.0.join("link")).unwrap();
+        let error = open_at(scratch.0.join("link").join("keys"), ProviderChoice::Keyfile).err().expect("refused");
+        assert!(matches!(&error, KeyError::Permissions(why) if why.contains("above the keys directory")), "{error:?}");
+        fs::set_permissions(&shared, fs::Permissions::from_mode(0o700)).unwrap();
+        assert!(
+            open_at(scratch.0.join("link").join("keys"), ProviderChoice::Keyfile).is_ok(),
+            "the same path is fine once the folder above it is private"
+        );
+    }
+
+    #[test]
+    fn a_keys_path_that_is_a_file_or_another_users_folder_is_refused() {
+        let scratch = Scratch::new("notdir");
+        fs::write(scratch.keys(), b"not a folder").unwrap();
+        assert!(matches!(open_at(scratch.keys(), ProviderChoice::Keyfile), Err(KeyError::Permissions(why)) if why.contains("not a directory")));
+    }
+}
+
+/// What Windows adds: a junction is a reparse point that `std` follows, and the folder is held open so that it cannot be swapped.
+#[cfg(windows)]
+mod windows {
+    use super::*;
+
+    fn junction(link: &Path, target: &Path) {
+        let status = std::process::Command::new("cmd").args(["/C", "mklink", "/J"]).arg(link).arg(target).output().unwrap();
+        assert!(status.status.success(), "mklink /J failed: {}", String::from_utf8_lossy(&status.stdout));
+    }
+
+    /// The reviewer's junction: `keys` is a junction to a folder somewhere else, so every value would be read from and written to a place the owner never chose.
+    #[test]
+    fn a_junction_in_place_of_the_keys_folder_is_refused_for_every_provider() {
+        for (choice, _) in providers() {
+            let scratch = Scratch::new("junction");
+            let elsewhere = scratch.0.join("elsewhere");
+            fs::create_dir(&elsewhere).unwrap();
+            junction(&scratch.keys(), &elsewhere);
+            let error = open_at(scratch.keys(), choice).err().expect("a junction is refused");
+            assert!(matches!(&error, KeyError::Permissions(why) if why.contains("junction")), "{error:?}");
+            assert!(fs::read_dir(&elsewhere).unwrap().next().is_none(), "nothing was written through the junction");
+            fs::remove_dir(scratch.keys()).unwrap();
+        }
+    }
+
+    #[test]
+    fn a_junction_or_a_file_in_place_of_a_key_file_is_an_error_not_none() {
+        for (choice, ext) in providers() {
+            let scratch = Scratch::new("junction-file");
+            let store = store(&scratch, choice);
+            let elsewhere = scratch.0.join("elsewhere");
+            fs::create_dir(&elsewhere).unwrap();
+            junction(&file_of(&scratch, "linked.secret", ext), &elsewhere);
+            assert!(store.get(&name("linked.secret")).is_err(), "{ext}: a junction where a key file should be");
+            assert!(store.list("").unwrap().is_empty(), "a junction is not a key file, so it is not listed");
+            fs::remove_dir(file_of(&scratch, "linked.secret", ext)).unwrap();
+        }
+    }
+
+    #[test]
+    fn a_keys_path_that_is_a_file_is_refused() {
+        for (choice, _) in providers() {
+            let scratch = Scratch::new("notdir");
+            fs::write(scratch.keys(), b"not a folder").unwrap();
+            assert!(open_at(scratch.keys(), choice).is_err());
+        }
     }
 }
