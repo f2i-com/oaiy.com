@@ -287,6 +287,36 @@ test('4.7.1 client address: the rightmost address that is not itself a trusted p
     eq('203.0.113.9', ClientIp::resolve(['REMOTE_ADDR' => '::ffff:10.0.0.2', 'HTTP_X_FORWARDED_FOR' => '203.0.113.9'], 'X-Forwarded-For', $trusted), 'a mapped trusted proxy');
 });
 
+test('4.7.1 client address: behind a trusted proxy only the exact header name counts, and an underscore variant, which PHP folds into the same variable, is ignored where the SAPI reports names as sent', function () {
+    $r = OaiyTest\Relay::make(['client_ip' => ['header' => 'X-Forwarded-For', 'trusted_proxies' => ['10.0.0.0/8']]]);
+    $client = function (array $sent, ?string $foldedByPhp, bool $names = true) use ($r): string {
+        $server = ['REMOTE_ADDR' => '10.1.2.3'] + ($foldedByPhp === null ? [] : ['HTTP_X_FORWARDED_FOR' => $foldedByPhp]);
+        $req = new Oaiy\Relay\Request('GET', '/v1/health', [], $server, '', $names ? fn() => $sent : null);
+        (new Oaiy\Relay\Kernel($r->ctx()))->handle($req);
+        return $req->client;
+    };
+    // Both spellings arrive; $_SERVER holds the last one, which is the client's.
+    eq('198.51.100.7', $client(['X-Forwarded-For' => '198.51.100.7', 'X_Forwarded_For' => '203.0.113.9'], '203.0.113.9'), 'the proxy\'s own header wins');
+    eq('198.51.100.7', $client(['X_Forwarded_For' => '203.0.113.9', 'X-Forwarded-For' => '198.51.100.7'], '198.51.100.7'));
+    // Only the underscore spelling: not a forwarding header at all.
+    eq('10.1.2.3', $client(['X_Forwarded_For' => '203.0.113.9'], '203.0.113.9'), 'an underscore variant alone picks nothing');
+    // Name case does not matter, and a SAPI without getallheaders() has only $_SERVER.
+    eq('198.51.100.7', $client(['x-forwarded-for' => '198.51.100.7'], null));
+    eq('198.51.100.7', $client([], '198.51.100.7', false));
+    eq('10.1.2.3', $client([], null, false));
+});
+
+test('4.7.1 client address: over php -S, which reports header names as sent, a client behind a trusted proxy cannot pick its address with an underscore header', function () {
+    $r = OaiyTest\Relay::make(['client_ip' => ['header' => 'X-Forwarded-For', 'trusted_proxies' => ['127.0.0.1']]]);
+    $srv = $r->serve();
+    $send = fn(array $headers) => $srv->request('GET', '/v1/health', $headers);
+    eq(200, $send(['X-Forwarded-For' => '198.51.100.7', 'X_Forwarded_For' => '203.0.113.9'])['status']);
+    eq(200, $send(['X_Forwarded_For' => '203.0.113.5'])['status']);
+    eq(200, $send(['X-Forwarded-For' => '198.51.100.8', 'X_FORWARDED_FOR' => '203.0.113.6'])['status']);
+    $keys = array_column($r->ctx()->db->all("SELECT k FROM rl WHERE k LIKE 'w:ip.info:%' ORDER BY k"), 'k');
+    eq(['w:ip.info:127.0.0.1', 'w:ip.info:198.51.100.7', 'w:ip.info:198.51.100.8'], $keys, 'only the proxy\'s own header named a client, and the underscore variants named none');
+});
+
 test('4.7.1 client address: CIDR parsing refuses nonsense', function () {
     foreach (['10.0.0.0/33', '10.0.0.0/-1', '10.0.0.0/x', 'nope', '::1/129', '10.0.0.0/08x', ''] as $bad) {
         eq(null, ClientIp::parseCidr($bad), $bad);

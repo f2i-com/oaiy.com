@@ -76,6 +76,31 @@ final class Request
         return null;
     }
 
+    /**
+     * A header by its exact name, as the client sent it, where the SAPI can tell. PHP folds "X-Forwarded-For" and the underscore
+     * spelling "X_Forwarded_For" into one $_SERVER['HTTP_X_FORWARDED_FOR'] and the last one wins, so a client behind a trusted
+     * proxy that passes both could pick its own value. Where getallheaders() reports the names as sent (php -S, Apache) only the
+     * hyphenated name is read and an underscore variant is a different header, ignored. Where there is no getallheaders() the
+     * $_SERVER entry is all there is. On FastCGI the SAPI itself turns underscores into hyphens and the two cannot be told apart:
+     * the web server in front must drop headers with underscores in their names, which nginx does by default (the README says so).
+     */
+    public function exactHeader(string $name): ?string
+    {
+        if ($this->getallheaders === null) {
+            return $this->header($name);
+        }
+        $h = ($this->getallheaders)();
+        if (!is_array($h)) {
+            return null;
+        }
+        $found = null;
+        foreach ($h as $k => $v) {
+            if (is_string($k) && is_string($v) && strcasecmp($k, $name) === 0) {
+                $found = $v;
+            }
+        }
+        return $found;
+    }
     public function contentType(): ?string
     {
         foreach (['CONTENT_TYPE', 'HTTP_CONTENT_TYPE'] as $k) {

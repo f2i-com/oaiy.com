@@ -97,16 +97,21 @@ final class ClientIp
     /**
      * @param array<string,mixed> $server $_SERVER
      * @param list<string> $trustedProxies
+     * @param (callable(string):?string)|null $exactHeader reads a header by its exact name (Request::exactHeader); without it $server is read
      */
-    public static function resolve(array $server, ?string $header, array $trustedProxies): string
+    public static function resolve(array $server, ?string $header, array $trustedProxies, ?callable $exactHeader = null): string
     {
         $remote = isset($server['REMOTE_ADDR']) && is_string($server['REMOTE_ADDR']) ? self::toBin($server['REMOTE_ADDR']) : null;
         if ($remote === null) {
             return 'unknown';
         }
         if ($header !== null && $trustedProxies !== [] && self::trusted($remote, $trustedProxies)) {
-            $k = 'HTTP_' . strtoupper(str_replace('-', '_', $header));
-            $v = isset($server[$k]) && is_string($server[$k]) ? $server[$k] : '';
+            if ($exactHeader !== null) {
+                $v = $exactHeader($header) ?? '';
+            } else {
+                $k = 'HTTP_' . strtoupper(str_replace('-', '_', $header));
+                $v = isset($server[$k]) && is_string($server[$k]) ? $server[$k] : '';
+            }
             if ($v !== '' && strlen($v) <= 1024) {
                 $chain = array_reverse(array_map('trim', explode(',', $v)));
                 foreach ($chain as $entry) {

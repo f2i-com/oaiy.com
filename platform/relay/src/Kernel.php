@@ -114,7 +114,7 @@ final class Kernel
 
     public function handle(Request $req): Response
     {
-        $req->client = ClientIp::resolve($req->server, $this->ctx->cfg->clientIpHeader(), $this->ctx->cfg->trustedProxies());
+        $req->client = ClientIp::resolve($req->server, $this->ctx->cfg->clientIpHeader(), $this->ctx->cfg->trustedProxies(), [$req, 'exactHeader']);
         $code = null;
         try {
             $res = $this->dispatch($req);

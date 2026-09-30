@@ -136,7 +136,10 @@ server {
 
 Do not put the relay behind a proxy that terminates TLS and that you do not control (a proxied CDN hostname sees every bearer
 token and every unsealed lane). If you must, list its addresses in `client_ip.trusted_proxies` and set `client_ip.header`, or
-every client will share one rate-limit address.
+every client will share one rate-limit address. The proxy must also drop request headers that have an underscore in their
+name (`X_Forwarded_For`): PHP folds that spelling into the same variable as `X-Forwarded-For`, so a client that sends both
+could choose its own address. nginx drops them by default (`underscores_in_headers off`). Where PHP reports header names as sent
+(`php -S`, Apache) the relay reads only the hyphenated name itself; on FastCGI it cannot tell, so the proxy has to.
 
 ## Apache and LiteSpeed: `public/.htaccess`
 
