@@ -415,6 +415,9 @@ pub struct MintSpec {
     pub idle_ms: Option<u64>,
     pub created_by: Option<String>,
     pub max_uses: Option<u32>,
+    /// Fields written into the record beside its own: what the login keeps about a session (where it was made
+    /// and by which browser). They are kept in `credentials.json` and never read by the store.
+    pub extra: Map<String, Value>,
 }
 
 impl MintSpec {
@@ -432,6 +435,7 @@ impl MintSpec {
             idle_ms: None,
             created_by: None,
             max_uses: None,
+            extra: Map::new(),
         }
     }
 }
@@ -1096,7 +1100,7 @@ impl AuthStore {
                 0
             },
             memory_only: false,
-            extra: Map::new(),
+            extra: spec.extra.clone(),
         };
         let id = record.id.clone();
         g.insert(record);
@@ -1291,9 +1295,40 @@ impl AuthStore {
         true
     }
 
+    /// Revoke, with `reason`, every credential that is not revoked yet and for which `keep_out` says so: one
+    /// write for all of them, and the ids that were revoked. What a password change, a logout everywhere and
+    /// the console do, so that no later flush can bring one back.
+    pub fn revoke_where(&self, reason: &str, keep_out: &dyn Fn(&Record) -> bool) -> Vec<String> {
+        let now = self.clock.now_ms();
+        let mut g = self.lock();
+        let ids: Vec<String> = g
+            .records
+            .values()
+            .filter(|r| r.revoked_ms.is_none() && keep_out(r))
+            .map(|r| r.id.clone())
+            .collect();
+        for id in &ids {
+            g.revoke_in_memory(id, reason, now);
+        }
+        if !ids.is_empty() {
+            g.persist_quietly(self.writer.as_ref(), now);
+        }
+        ids
+    }
+
     /// Give a session an elevation until `until_ms` (in memory only; a restart drops it).
     pub fn set_elevated_until(&self, id: &str, until_ms: u64) {
         self.lock().elevated.insert(id.to_string(), until_ms);
+    }
+
+    /// When a session's elevation ends, if it has one (the time it was given, past or not).
+    pub fn elevated_until(&self, id: &str) -> Option<u64> {
+        self.lock().elevated.get(id).copied()
+    }
+
+    /// A copy of every record (for lists and for the console's counts). Never the secret: there is none.
+    pub fn records(&self) -> Vec<Record> {
+        self.lock().records.values().cloned().collect()
     }
 
     // ---- keeping it -----------------------------------------------------------------------

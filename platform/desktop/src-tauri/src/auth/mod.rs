@@ -66,4 +66,6 @@ mod guard_tests;
 #[cfg(test)]
 pub(crate) mod route_coverage;
 #[cfg(test)]
+mod store_login_tests;
+#[cfg(test)]
 mod store_tests;
