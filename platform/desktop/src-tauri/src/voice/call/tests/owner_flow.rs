@@ -1438,3 +1438,113 @@ async fn ring_through_on(aokie: &mut Aokie, ring: &Arc<Ring>, request: &str, sec
     PluginHost::ring_request(ring, "oaiy.ring.opened", json!({"planId": plan["planId"], "requestId": request, "callId": aokie.call, "callEpoch": 1, "ownerEpoch": 1, "expiresAt": expires})).expect("the ring opened");
     plan
 }
+
+// The contract's rule for an ask (`transfer-v1.md`, the caller-asked check): it is spent when the request opens and when the AI has the caller back
+// (the tests above: `the_ask_that_began_a_ring_is_not_an_ask_for_the_next_request_after_the_owner_hands_the_caller_back`), and by nothing that stops
+// short of that. One test for each way a request stops short, on the real call: what the caller said is where it was, and the retry is judged on it.
+
+/// The turns of the call that the next request would be judged on.
+fn unspent(f: &Flow) -> Vec<String> {
+    f.aokie.hub.caller_turns(&f.aokie.call)
+}
+
+/// A request the phone refuses itself before anything rings, whatever its reason (consent taken back, a busy mailbox, a request already going, a plan it
+/// could not read or use, a call that changed, arguments it did not accept, a plan that named nobody, one of its own ceilings): the ask stands, the try is
+/// given back, and the retry is judged on the same ask and rings, at once.
+#[tokio::test]
+async fn a_request_the_phone_refuses_before_anything_rings_spends_nothing_and_the_retry_is_judged_on_the_same_ask() {
+    let mut f = flow(owner_settings(true)).await;
+    f.caller_says(ASKED);
+    for reason in ["consent", "busy", "pending_request", "plan_unavailable", "call_changed", "bad_arguments", "no_endpoint", "limit_call", "limit_gap", "limit_caller", "limit_global"] {
+        let asked = asking(&f.aokie, transfer::TOOL, json!({"reason": "caller_asked"}));
+        let call = f.aokie.text("formlogic.realtime.tool_call", secs(3)).await.unwrap_or_else(|| panic!("{reason}: the retry reached the phone, on the same ask"));
+        f.aokie.send(json!({"type": "formlogic.realtime.tool_result", "callId": f.aokie.call, "generation": 1, "toolCallId": call["toolCallId"], "ok": false,
+            "output": {"status": "refused", "reason": reason, "instruction": "Offer to take a message."}}));
+        let answer = answer_of(asked).await.unwrap();
+        assert_eq!((answer["ok"].clone(), answer["output"]["reason"].clone()), (json!(false), json!(reason)), "{answer}");
+        assert_eq!(unspent(&f), [ASKED], "{reason}: what the caller said is where it was");
+        assert_eq!(f.aokie.hub.turns_said(&f.aokie.call), 1, "{reason}");
+        assert_eq!(tries(&f.aokie).attempts_this_call, 0, "{reason}: the try was given back");
+    }
+    // ...and after all of them the retry rings, on the ask the caller made once.
+    f.ring_through("assist_1", 30).await;
+    assert_eq!(f.dialog().await.len(), 1);
+    // The ring that opened is what spent it.
+    assert!(unspent(&f).is_empty(), "a ring that opened used the ask up: {:?}", unspent(&f));
+}
+
+/// A host that never answers (the request sits unanswered until the call gives up on it, `no_answer`): nothing opened, so nothing is spent, and the
+/// retry after the gap between tries (which a try that was made still holds) is judged on the same ask and reaches the phone.
+#[tokio::test]
+async fn a_request_nobody_answers_spends_nothing_and_the_retry_after_the_gap_is_judged_on_the_same_ask() {
+    let timing = transfer::Timing { tool_answer: Duration::from_millis(600), ..quick() };
+    let mut f = flow_full(owner_settings(true), None, crate::ring::testing::at_the_pc(), timing).await;
+    f.caller_says(ASKED);
+    let asked = asking(&f.aokie, transfer::TOOL, json!({"reason": "caller_asked"}));
+    f.aokie.text("formlogic.realtime.tool_call", secs(3)).await.expect("the request reached the phone, which says nothing");
+    let answer = answer_of(asked).await.unwrap();
+    assert_eq!((answer["output"]["status"].clone(), answer["output"]["reason"].clone()), (json!("unavailable"), json!("no_answer")), "{answer}");
+    assert_eq!(unspent(&f), [ASKED], "nothing opened, so nothing was spent");
+    assert_eq!(f.dialog().await.len(), 0);
+    // At once, the gap between tries still holds (the try was made); it is a limit and not the ask that says no.
+    let soon = answer_of(asking(&f.aokie, transfer::TOOL, json!({"reason": "caller_asked"}))).await.unwrap();
+    assert_eq!(soon["output"]["reason"], "limit_gap", "{soon}");
+    assert_eq!(unspent(&f), [ASKED], "a refusal for the gap spends nothing either");
+    // After the gap: the same ask, judged again, reaches the phone.
+    f.ring.set_clock(Arc::new(At(f.ring.clock().local() + chrono::Duration::seconds(120))));
+    let retried = asking(&f.aokie, transfer::TOOL, json!({"reason": "caller_asked"}));
+    let frame = f.aokie.text("formlogic.realtime.tool_call", secs(3)).await.expect("the retry reached the phone, on the same ask");
+    assert_eq!(frame["name"], transfer::TOOL);
+    drop(retried);
+}
+
+/// The caller hangs up while the host plans: nothing rings when the plugin then says its request is out, and nothing was spent.
+#[tokio::test]
+async fn a_caller_who_hangs_up_while_the_host_plans_spends_nothing_and_no_ring_opens() {
+    let mut f = flow(owner_settings(true)).await;
+    f.caller_says(ASKED);
+    let asked = asking(&f.aokie, transfer::TOOL, json!({"reason": "caller_asked"}));
+    f.aokie.text("formlogic.realtime.tool_call", secs(3)).await.expect("the request reached the phone");
+    let mut question = shared("ring-plan")["plan"]["params"].clone();
+    question["callId"] = json!(f.aokie.call);
+    question["recentCallerTurns"] = json!([ASKED]);
+    let plan = PluginHost::ring_request(&f.ring, "oaiy.ring.plan", question).expect("the plugin was answered");
+    assert_eq!(plan["decision"], "ring", "{plan}");
+    f.aokie.send(json!({"type": "formlogic.realtime.stop", "callId": f.aokie.call, "generation": 1, "reason": "the caller hung up"}));
+    f.aokie.event("call.ended", secs(3)).await.expect("the call ended");
+    let mut told = shared("ring-plan")["opened"]["input"].clone();
+    told["planId"] = plan["planId"].clone();
+    told["requestId"] = json!("assist_1");
+    told["callId"] = json!(f.aokie.call);
+    told["expiresAt"] = json!(f.ring.clock().unix() + 30);
+    let refused = PluginHost::ring_request(&f.ring, "oaiy.ring.opened", told).unwrap_err();
+    assert_eq!(refused.0, "call_ended", "{refused:?}");
+    assert_eq!(f.dialog().await.len(), 0, "nothing rings for a call that is over");
+    assert_eq!(unspent(&f), [ASKED], "and the ask was not spent");
+    drop(asked);
+}
+
+/// What the caller says after the tool call, while the host plans, is not spent by the ring that opens on it: it is what the next request rests on.
+#[tokio::test]
+async fn what_the_caller_says_while_the_host_plans_is_not_spent_by_the_ring_that_opens() {
+    let mut f = flow(owner_settings(true)).await;
+    f.caller_says(ASKED);
+    let asked = asking(&f.aokie, transfer::TOOL, json!({"reason": "caller_asked"}));
+    let call = f.aokie.text("formlogic.realtime.tool_call", secs(3)).await.expect("the request reached the phone");
+    let mut question = shared("ring-plan")["plan"]["params"].clone();
+    question["callId"] = json!(f.aokie.call);
+    question["recentCallerTurns"] = json!([ASKED]);
+    let plan = PluginHost::ring_request(&f.ring, "oaiy.ring.plan", question).expect("the plugin was answered");
+    assert_eq!(plan["decision"], "ring", "{plan}");
+    // The caller changes their mind while the plan is on its way.
+    f.caller_says("Actually, no, just take a message please.");
+    f.aokie.send(ringing(&f.aokie, call["toolCallId"].as_str().unwrap(), "assist_1", 30));
+    answer_of(asked).await.expect("the model is answered");
+    let mut told = shared("ring-plan")["opened"]["input"].clone();
+    told["planId"] = plan["planId"].clone();
+    told["requestId"] = json!("assist_1");
+    told["callId"] = json!(f.aokie.call);
+    told["expiresAt"] = json!(f.ring.clock().unix() + 30);
+    PluginHost::ring_request(&f.ring, "oaiy.ring.opened", told).expect("the ring opened");
+    assert_eq!(unspent(&f), ["Actually, no, just take a message please."], "the ring used up the ask it was made on, and not what came after");
+}

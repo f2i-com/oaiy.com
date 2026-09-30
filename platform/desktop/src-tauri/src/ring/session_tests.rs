@@ -1031,6 +1031,113 @@ fn a_refusal_that_a_ring_has_used_up_is_not_carried_into_the_words_after_it() {
     assert!(alone.rings(), "read alone, it asks: {:?}", alone.plan);
 }
 
+/// The contract's rule for an ask (`transfer-v1.md`, the caller-asked check): it is spent when the request **opens** and when the AI has the caller back,
+/// and by nothing that stops short of that. Each way a request can stop short is a case here, and each leaves what the caller said where it was (the turns
+/// are still the call's, none used up) and the retry judged on the same ask. (What a ring that opens spends, and what the caller says after the tool call
+/// while the host plans, is `what_the_caller_says_while_a_request_is_planned_and_sent_is_not_spent_by_the_ring_that_opens_on_it`; the owner handing the
+/// caller back is the hub's `the_owner_handing_the_caller_back_spends_what_was_said_and_a_session_made_anew_does_not`.)
+#[test]
+fn a_request_that_stops_short_of_opening_spends_nothing_and_the_ask_stands() {
+    struct At(chrono::DateTime<chrono::FixedOffset>);
+    impl Clock for At {
+        fn local(&self) -> chrono::DateTime<chrono::FixedOffset> {
+            self.0
+        }
+    }
+    let start = chrono::DateTime::parse_from_rfc3339("2026-09-30T11:00:00+10:00").unwrap();
+    // A call whose caller has said "Hi" and asked, and whose calls forget what a ring used up, as the hub does: a spend would show.
+    let fresh = || {
+        let r = rig(Presence::Active);
+        r.calls.consuming.store(true, std::sync::atomic::Ordering::SeqCst);
+        r.ring.set_clock(Arc::new(At(start)));
+        r
+    };
+    let minutes_on = |r: &Rig, minutes: i64| r.ring.set_clock(Arc::new(At(start + chrono::Duration::minutes(minutes))));
+    let unspent = |r: &Rig, case: &str| {
+        assert!(r.calls.used.lock().unwrap().is_empty(), "{case}: no ask was acted on");
+        assert_eq!(r.calls.cleared.load(std::sync::atomic::Ordering::SeqCst), 0, "{case}: nothing was forgotten");
+        assert_eq!(r.calls.info.lock().unwrap()[0].1.turns, ["Hi", ASKED], "{case}: what the caller said is where it was");
+    };
+    let retried = |r: &Rig, case: &str| {
+        let again = r.ring.authorise(CALL, Reason::CallerAsked);
+        assert!(again.rings(), "{case}: the retry is judged on the same ask, and rings: {:?}", again.plan);
+    };
+
+    // A host that never answers, or whose plan cannot be read: the plan was allowed and no request was ever opened on it (the try is counted, so the
+    // gap between tries still holds, and the retry is after it).
+    let r = fresh();
+    planned(&r.ring, CALL);
+    unspent(&r, "a plan nobody opened");
+    assert_eq!(r.ring.authorise(CALL, Reason::CallerAsked).plan.reason, PlanReason::LimitGap, "the gap still holds");
+    unspent(&r, "a retry at once");
+    minutes_on(&r, 2);
+    retried(&r, "a plan nobody opened");
+    unspent(&r, "a plan nobody opened, tried again");
+
+    // A plan that refuses: the words are not an ask, so the ring is not planned, and nothing is used up (nor is an ask that comes later).
+    let r = fresh();
+    r.calls.info.lock().unwrap()[0].1.turns = vec!["Hi".into(), "No, just take a message please.".into()];
+    let refused = r.ring.authorise(CALL, Reason::CallerAsked);
+    assert_eq!((refused.plan.decision, refused.plan.reason), (Decision::Refused, PlanReason::CallerDidNotAsk), "{:?}", refused.plan);
+    assert!(r.calls.used.lock().unwrap().is_empty() && r.calls.cleared.load(std::sync::atomic::Ordering::SeqCst) == 0, "a refusal used nothing up");
+    assert_eq!(r.calls.info.lock().unwrap()[0].1.turns, ["Hi", "No, just take a message please."]);
+
+    // A plan that is only a message (the owner's settings, or quiet hours): the ask stands, and rings when the owner allows it.
+    let r = fresh();
+    r.ring.change_settings(&json!({ "enabled": false })).unwrap();
+    let message_only = r.ring.authorise(CALL, Reason::CallerAsked);
+    assert_eq!((message_only.plan.decision, message_only.plan.reason), (Decision::MessageOnly, PlanReason::Disabled), "{:?}", message_only.plan);
+    unspent(&r, "a message-only plan");
+    r.ring.change_settings(&json!({ "enabled": true })).unwrap();
+    retried(&r, "a message-only plan");
+
+    // Refused before the host is asked, by a ceiling: the per-call limit (a try was made, and a second is refused for the call).
+    let r = fresh();
+    assert!(r.ring.authorise(CALL, Reason::CallerAsked).rings());
+    minutes_on(&r, 2);
+    assert!(r.ring.authorise(CALL, Reason::CallerAsked).rings(), "a second try, after the gap");
+    minutes_on(&r, 4);
+    let third = r.ring.authorise(CALL, Reason::CallerAsked);
+    assert_eq!((third.plan.decision, third.plan.reason), (Decision::Refused, PlanReason::LimitCall), "{:?}", third.plan);
+    // (The two plans above were allowed and never opened, so nothing had been used up for the third to find.)
+    unspent(&r, "a ceiling");
+
+    // Refused by the phone before anything rang (a busy mailbox, consent taken back, an arguments or plan error): the try is given back, and the
+    // retry is at once, on the same ask.
+    let r = fresh();
+    assert!(r.ring.authorise(CALL, Reason::CallerAsked).rings());
+    assert!(r.ring.request_refused(CALL), "a try was given back");
+    unspent(&r, "a request the phone refused");
+    retried(&r, "a request the phone refused");
+
+    // The caller hangs up while the host plans: nothing rings, and nothing is used up; the call that begins again is judged on the same ask.
+    let r = fresh();
+    let plan = planned(&r.ring, CALL);
+    r.calls.over.lock().unwrap().push(CALL.to_string());
+    assert_eq!(r.ring.opened(&opened(&plan, "assist_1", CALL, 25, &r.ring)).unwrap_err().code, "call_ended");
+    unspent(&r, "a call that ended while the host planned");
+    assert!(r.ring.request_refused(CALL));
+    r.calls.over.lock().unwrap().clear();
+    retried(&r, "a call that ended while the host planned");
+
+    // The call's session is made anew while the host plans: that plan was for another beginning of the call, opens nothing and uses nothing up.
+    let r = fresh();
+    let plan = planned(&r.ring, CALL);
+    r.calls.generation.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+    assert_eq!(r.ring.opened(&opened(&plan, "assist_1", CALL, 25, &r.ring)).unwrap_err().code, "call_changed");
+    unspent(&r, "a call that changed while the host planned");
+    assert!(r.ring.request_refused(CALL));
+    retried(&r, "a call that changed while the host planned");
+
+    // And the two that do spend, so that the cases above are known to be able to fail: a request that opens uses up what it was judged on, and a
+    // plan that is used up once opens once.
+    let r = fresh();
+    let plan = planned(&r.ring, CALL);
+    r.ring.opened(&opened(&plan, "assist_1", CALL, 25, &r.ring)).unwrap();
+    assert_eq!(r.calls.used_up_to.lock().unwrap().as_slice(), [2], "the request that opened used up its two turns");
+    assert!(r.calls.info.lock().unwrap()[0].1.turns.is_empty(), "and the call forgot them");
+}
+
 #[test]
 fn a_caller_who_asks_for_the_owner_by_name_rings_only_when_the_desktop_knows_that_name() {
     let r = rig(Presence::Active);
