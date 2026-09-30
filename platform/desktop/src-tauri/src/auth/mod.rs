@@ -30,6 +30,8 @@ pub mod export;
 pub mod exposure_checks;
 pub mod guard;
 pub mod host;
+#[cfg(feature = "web")]
+pub mod lanes;
 pub mod lock;
 pub mod mode;
 #[cfg(feature = "web")]
