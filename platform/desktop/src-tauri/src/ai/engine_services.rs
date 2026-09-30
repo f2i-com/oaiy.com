@@ -548,7 +548,7 @@ mod tests {
         use crate::auth::{clock::ManualClock, guard::{scoped_guard, GuardConfig},
             scopes::ScopeSet, store::{AuthStore, MintSpec}, token::Kind as TokenKind,
             AccessMode, Guard};
-        use axum::{extract::ConnectInfo, http::HeaderMap, middleware};
+        use axum::{http::HeaderMap, middleware};
         use std::{net::SocketAddr, sync::{Arc, atomic::{AtomicUsize, Ordering}}};
 
         const STUDIO_KEY: &str = "isolated-studio-service-test-key";
@@ -609,7 +609,6 @@ mod tests {
         desktop_task.abort(); studio_task.abort();
         assert!(desktop_task.await.unwrap_err().is_cancelled());
         assert!(studio_task.await.unwrap_err().is_cancelled());
-        let _ = std::mem::size_of::<ConnectInfo<SocketAddr>>();
     }
 
     /// An explicitly started isolated Studio can verify the scoped guard, the
