@@ -479,7 +479,7 @@ pub struct GuardConfig {
 
 /// `https://host[:port]` with no path, query or fragment, as a host.
 fn https_origin_host(url: &str) -> Option<HostName> {
-    let rest = url.trim().strip_prefix("https://")?;
+    let rest = super::exposure::strip_https_scheme(url.trim())?;
     if rest.is_empty() || rest.contains(['/', '?', '#', '@']) {
         return None;
     }

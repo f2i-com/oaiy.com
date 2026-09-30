@@ -35,7 +35,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::net::{IpAddr, Ipv4Addr};
 
 use super::clientip::{unmap, Cidr, TrustedProxies};
-use super::host::HostName;
+use super::host::{parse_port_digits, HostName};
 use super::mode::{validate_mode, AccessMode, Exposure};
 use super::presets::App;
 use super::token::check_static_token_shape;
@@ -149,14 +149,22 @@ impl Bind {
     }
 }
 
-/// A configured public host: `https://<host>[:<port>]`. `Err` says what to change.
+/// What follows `https://`, the scheme in any case (RFC 3986: a scheme is case-insensitive, so `HTTPS://DASH.EXAMPLE.TEST`
+/// is the URL of `https://dash.example.test`), or `None` for a text that is not an https URL.
+pub fn strip_https_scheme(text: &str) -> Option<&str> {
+    let (scheme, rest) = (text.get(..8)?, text.get(8..)?);
+    scheme.eq_ignore_ascii_case("https://").then_some(rest)
+}
+
+/// A configured public host: `https://<host>[:<port>]`. `Err` says what to change. The origin it makes is
+/// lowercase, whatever the case of the text.
 pub fn parse_https_origin(var: &str, text: &str) -> Result<(HostName, String), String> {
     let bad = |why: &str| {
         Err(format!(
             "{var}={text:?} {why}: write it as https://<host>[:<port>] with no path, query or fragment"
         ))
     };
-    let Some(rest) = text.strip_prefix("https://") else {
+    let Some(rest) = strip_https_scheme(text) else {
         return bad("is not an https URL");
     };
     if rest.is_empty() {
@@ -327,8 +335,8 @@ fn nonblank(env: &dyn Fn(&str) -> Option<String>, name: &str) -> Option<String> 
 pub fn parse_port(value: Option<&str>) -> Result<u16, String> {
     match value.map(str::trim).filter(|v| !v.is_empty()) {
         None => Ok(crate::DESKTOP_PORT),
-        Some(v) => v.parse::<u16>().ok().filter(|p| *p != 0).ok_or_else(|| {
-            format!("OAIY_SERVER_PORT={v:?} is not a port: use a number from 1 to 65535")
+        Some(v) => parse_port_digits(v).ok_or_else(|| {
+            format!("OAIY_SERVER_PORT={v:?} is not a port: use a number from 1 to 65535, with digits only")
         }),
     }
 }
@@ -953,7 +961,8 @@ mod tests {
             "https://dash.example.com?x=1",
             "https://dash.example.com#frag",
             "http://dash.example.com",
-            "HTTPS://dash.example.com",
+            "HTTP://dash.example.com",
+            // (`HTTPS://dash.example.com` was in this list: a scheme is case-insensitive, RFC 3986, and it is read.)
             "dash.example.com",
             "https://",
             "https://user@dash.example.com",
@@ -1460,6 +1469,7 @@ mod tests {
         assert_eq!(parse_port(None), Ok(17972));
         assert_eq!(parse_port(Some(" 8080 ")), Ok(8080));
         assert_eq!(parse_port(Some("65535")), Ok(65535));
+        assert_eq!(parse_port(Some("1")), Ok(1));
         for bad in [
             "0",
             "65536",
@@ -1469,6 +1479,12 @@ mod tests {
             "1e3",
             "0x50",
             "8080 8081",
+            // What `u16::from_str` takes and no one writes: a sign, a leading zero, digits of another script.
+            "+8080",
+            "08080",
+            "00",
+            "\u{ff18}\u{ff10}\u{ff18}\u{ff10}",
+            "8_080",
         ] {
             assert!(parse_port(Some(bad)).is_err(), "{bad:?}");
             assert_eq!(
@@ -1607,6 +1623,62 @@ mod tests {
         let (addr, note) = desktop_bind(Some(" true "));
         assert_eq!(addr, IpAddr::V4(Ipv4Addr::LOCALHOST));
         assert!(note.unwrap().contains("lanAccess"));
+    }
+
+    #[test]
+    fn rule_3_the_scheme_of_a_public_url_is_read_in_any_case_and_the_origin_is_lowercase() {
+        // RFC 3986: a scheme is case-insensitive. This one was refused as "not an https URL".
+        for (text, origin) in [
+            ("HTTPS://DASH.EXAMPLE.TEST", "https://dash.example.test"),
+            (
+                "Https://Dash.Example.Test:8443",
+                "https://dash.example.test:8443",
+            ),
+            ("hTTps://dash.example.test", "https://dash.example.test"),
+            ("  HTTPS://dash.example.test  ", "https://dash.example.test"),
+        ] {
+            let c = ok(&[("OAIY_PUBLIC_URL", text)], NO_OWNER);
+            assert_eq!(c.public_origins[&App::Dash], origin, "{text:?}");
+            assert_eq!(c.exposure, Exposure::Proxied);
+        }
+        // A scheme that is not https in any case is still refused, and a text that is too short to have one, or has
+        // characters that are not a scheme's, does not panic.
+        for bad in [
+            "http://dash.example.test",
+            "HTTP://dash.example.test",
+            "httpss://dash.example.test",
+            "https:/dash.example.test",
+            "https//dash.example.test",
+            "https",
+            "https:/",
+            "\u{ff48}ttps://dash.example.test",
+            "\u{e9}\u{e9}\u{e9}\u{e9}\u{e9}\u{e9}\u{e9}\u{e9}\u{e9}",
+        ] {
+            assert_eq!(
+                broken(&[("OAIY_PUBLIC_URL", bad)], NO_OWNER),
+                [Rule::PublicUrl],
+                "{bad:?}"
+            );
+        }
+        // The port is read as strictly as a `Host`'s.
+        for bad in [
+            "https://dash.example.test:+8443",
+            "https://dash.example.test:08443",
+            "https://dash.example.test:0",
+            "https://dash.example.test:65536",
+            "https://dash.example.test:",
+        ] {
+            assert_eq!(
+                broken(&[("OAIY_PUBLIC_URL", bad)], NO_OWNER),
+                [Rule::PublicUrl],
+                "{bad:?}"
+            );
+        }
+        // The desktop's reader, which does not judge, reads the scheme in the same way.
+        assert!(
+            strip_https_scheme("HTTPS://x") == Some("x")
+                && strip_https_scheme("http://x").is_none()
+        );
     }
 
     #[test]

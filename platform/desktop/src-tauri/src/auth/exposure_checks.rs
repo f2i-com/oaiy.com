@@ -107,6 +107,17 @@ mod tests {
             "fe80::1",
             "::ffff:192.168.1.1",
             "::ffff:127.0.0.1",
+            // fe80::/10 is fe80:: to febf:ffff:...: the whole of the first 10 bits, not only the addresses that
+            // start with fe80.
+            "fe80::",
+            "fe81::1",
+            "fe90::1",
+            "fea0::1",
+            "febf::1",
+            "febf:ffff:ffff:ffff:ffff:ffff:ffff:ffff",
+            "fdff:ffff::1",
+            "::ffff:169.254.255.255",
+            "169.254.0.1",
         ] {
             assert!(is_private_address(ip(private)), "{private}");
             assert!(!is_public_address(ip(private)));
@@ -123,6 +134,15 @@ mod tests {
             "2606:4700::1",
             "fb00::1",
             "::ffff:8.8.8.8",
+            // The edges of the two ranges of IPv6 that are private: the first address outside each, either side.
+            "fbff:ffff::1",
+            "fe00::1",
+            "fe7f:ffff::1",
+            "fec0::1",
+            "fec0::",
+            "ff02::1",
+            "169.253.255.255",
+            "169.255.0.1",
         ] {
             assert!(is_public_address(ip(public)), "{public}");
         }

@@ -19,6 +19,19 @@ use std::collections::{BTreeMap, BTreeSet};
 use super::mode::Exposure;
 use super::presets::App;
 
+/// A port as a browser writes it: digits and nothing else (no `+`, no space), no leading zero, 1 to 65535.
+/// `u16::from_str` alone takes `+8080` and `08080`, which no client sends and which a `Host` check has no reason to
+/// read as the port they stand for.
+pub fn parse_port_digits(text: &str) -> Option<u16> {
+    if text.is_empty()
+        || !text.bytes().all(|b| b.is_ascii_digit())
+        || (text.len() > 1 && text.starts_with('0'))
+    {
+        return None;
+    }
+    text.parse::<u16>().ok().filter(|n| *n != 0)
+}
+
 /// A `Host` (or a configured host) as `host` and optional `port`, lowercased, with the port of the
 /// scheme's default (`:443`, `:80`) removed: `dash.example.com`, not `dash.example.com:443`.
 #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
@@ -88,7 +101,7 @@ impl HostName {
         let port = match port {
             None => None,
             Some(p) => {
-                let n: u16 = p.parse().ok().filter(|n| *n != 0)?;
+                let n = parse_port_digits(p)?;
                 (n != 80 && n != 443).then_some(n)
             }
         };
@@ -331,6 +344,53 @@ mod tests {
 
     fn h(s: &str) -> HostName {
         HostName::parse(s).unwrap_or_else(|| panic!("{s} does not parse"))
+    }
+
+    #[test]
+    fn a_port_in_a_host_is_digits_from_1_to_65535_as_a_browser_writes_it() {
+        // The ports the `Host` of a request may carry: 80 and 443 are the defaults and are dropped.
+        assert_eq!(h("localhost:8080").port, Some(8080));
+        assert_eq!(h("localhost:1").port, Some(1));
+        assert_eq!(h("localhost:65535").port, Some(65535));
+        assert_eq!(h("localhost:80").port, None);
+        assert_eq!(h("dash.example.com:443").port, None);
+        assert_eq!(h("[::1]:5").port, Some(5));
+        // `u16::from_str` takes a sign and leading zeros, which the check for the port a request is on then took
+        // for the port they stand for: `localhost:+8080` and `dash.example.com:0443` were a valid `Host`.
+        for bad in [
+            "localhost:+8080",
+            "localhost:08080",
+            "localhost:00",
+            "localhost:0",
+            "localhost:65536",
+            "localhost:99999",
+            "localhost:",
+            "localhost:-1",
+            "localhost:8 0",
+            "localhost:8080a",
+            "localhost:0x50",
+            "localhost:\u{ff18}\u{ff10}",
+            "dash.example.com:+443",
+            "dash.example.com:0443",
+            "dash.example.com:00443",
+            "[::1]:+5",
+            "[::1]:05",
+            "[::1]:",
+        ] {
+            assert_eq!(HostName::parse(bad), None, "{bad:?}");
+        }
+        for (text, want) in [
+            ("8080", Some(8080)),
+            ("1", Some(1)),
+            ("65535", Some(65535)),
+            ("0", None),
+            ("", None),
+            ("+1", None),
+            ("01", None),
+            ("65536", None),
+        ] {
+            assert_eq!(parse_port_digits(text), want, "{text:?}");
+        }
     }
 
     #[test]

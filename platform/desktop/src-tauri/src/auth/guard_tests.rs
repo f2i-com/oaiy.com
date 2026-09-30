@@ -2681,6 +2681,94 @@ async fn y21_the_health_probe_is_exempt_from_the_host_check_for_get_and_head_of_
     }
 }
 
+/// The reader that does not judge (the desktop's, and these tests') reads the scheme of a public URL as the startup
+/// rules do, in any case: `HTTPS://Dash.Example.com` is the host `dash.example.com`, where it was a warning and no host.
+#[tokio::test]
+async fn y21_a_public_url_with_its_scheme_in_capitals_is_read_to_a_host_by_the_lenient_reader_too()
+{
+    let e = env_with(
+        AccessMode::Scoped,
+        &[("OAIY_PUBLIC_URL", "HTTPS://Dash.Example.com")],
+        false,
+        false,
+        None,
+    );
+    let r = go(
+        &e,
+        send(Method::GET, "/api/auth/info")
+            .h("host", "dash.example.com")
+            .add("x-forwarded-for", "203.0.113.9")
+            .add("x-forwarded-proto", "https"),
+    )
+    .await;
+    assert_eq!(r.status, 200, "{}", r.text);
+    assert_eq!(r.json()["secureChannel"], true);
+}
+
+/// A `Host` whose port is not written as a browser writes it is not the `Host` of the server: `+8080` and `08080`
+/// used to be read as the port they stand for (`u16::from_str` takes both), on a loopback name and on a public one.
+#[tokio::test]
+async fn y21_a_host_with_a_port_a_browser_does_not_write_is_misdirected() {
+    for mode in [AccessMode::Scoped, AccessMode::Shadow] {
+        let e = env(mode);
+        for host in [
+            "localhost:+8080",
+            "localhost:08080",
+            "127.0.0.1:+1",
+            "127.0.0.1:0",
+            "[::1]:05",
+            "localhost:",
+        ] {
+            let r = go(&e, send(Method::GET, "/api/config").h("host", host)).await;
+            assert_eq!(
+                (r.status, r.code().as_deref()),
+                (421, Some("misdirected_host")),
+                "{mode:?} {host}"
+            );
+        }
+        for host in [
+            "localhost:8080",
+            "127.0.0.1:1",
+            "[::1]:5",
+            "localhost:65535",
+        ] {
+            let r = go(&e, send(Method::GET, "/api/config").h("host", host)).await;
+            assert_ne!(
+                r.code().as_deref(),
+                Some("misdirected_host"),
+                "{mode:?} {host}"
+            );
+        }
+    }
+    let p = proxied_env();
+    let via_proxy = |host: &str| {
+        send(Method::GET, "/api/auth/info")
+            .h("host", host)
+            .add("x-forwarded-for", "203.0.113.9")
+            .add("x-forwarded-proto", "https")
+    };
+    for host in [
+        "dash.example.com:+443",
+        "dash.example.com:0443",
+        "dash.example.com:00443",
+    ] {
+        let r = go(&p, via_proxy(host)).await;
+        assert_eq!(
+            (r.status, r.code().as_deref()),
+            (421, Some("misdirected_host")),
+            "{host}"
+        );
+    }
+    for host in [
+        "dash.example.com",
+        "dash.example.com:443",
+        "DASH.example.com:443",
+    ] {
+        let r = go(&p, via_proxy(host)).await;
+        assert_eq!(r.status, 200, "{host}: {}", r.text);
+    }
+}
+
 // ============================= F4: the static token in the shape the design gives it ==============
 
 /// `len` printable characters that the static token rule takes: the first of a seeded xorshift series that it does.
