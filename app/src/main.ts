@@ -152,6 +152,9 @@ function summarizeProject(meta: ProjectMeta, vfs: Vfs, gate: NetGate): string {
   return `Project "${meta.name}": ${files}${walked.truncated ? '+' : ''} files. Network gate: ${gate.mode}.\n${tree}`;
 }
 
+/** How long the welcome waits for a look at OAIY before it asks the person to set up a provider (a nearby OAIY answers at once; one that does not is not waited for). */
+const WELCOME_WAITS_MS = 1000;
+
 async function main(): Promise<void> {
   const app = document.getElementById('app')!;
   if (!crossOriginIsolated && (await registerServiceWorker())) {
@@ -2354,7 +2357,10 @@ With that done, Settings → Images, video and audio → Find OAIY sets it up.`)
   const sandbox = sandboxAvailable();
   if (!sandbox.ok) chat.system(`The code sandbox is unavailable: ${sandbox.reason}.`, 'error');
   else void zippModule().catch((error: unknown) => chat.system(`Could not load the Zipp engine: ${(error as Error).message}`, 'error'));
-  await lookForOaiy();
+  // Looking for OAIY is not waited for (design R4: nothing on the boot path waits for what leaves the site): a saved OAIY that does not answer
+  // (a network the person is not on) costs the page 3 s otherwise. The page draws and the desktop starts as it always did; what is found is
+  // applied when it arrives, and only the welcome below waits for it, for at most WELCOME_WAITS_MS.
+  const lookedFor = lookForOaiy().catch(() => {});
   renderPhoneChip();
   // What the Agent runs on (the desktop's choice: its engine, or ChatGPT), shown on the model chip. The welcome
   // below waits for it: a person whose Agent runs on ChatGPT has nothing to set up in Settings.
@@ -2369,7 +2375,7 @@ With that done, Settings → Images, video and audio → Find OAIY sets it up.`)
     // The phone's calls, its chip and call backs start once the desktop says there is a phone.
     startModules();
   } else applyModules(UNPAIRED);
-  void modelKnown.then(() => {
+  void Promise.all([modelKnown, Promise.race([lookedFor, new Promise<void>((resolve) => setTimeout(resolve, WELCOME_WAITS_MS))])]).then(() => {
     if (!agentProvider('project')) chat.system('Welcome! Set up an AI provider in ⚙ Settings to talk to the agent — a local server (Ollama, LM Studio, OAIY) keeps everything on this computer. The editor and terminal work without one.');
   });
   // Leaving the page (closing the tab, reloading, switching away on a phone): save now.
