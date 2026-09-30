@@ -1,0 +1,7 @@
+node_modules/
+# The providers origin's build, and the folders assembled from it (scripts/assemble.mjs).
+providers/dist/
+dist/
+# Browser profiles and other scratch of the e2e harness.
+.e2e/
+*.log

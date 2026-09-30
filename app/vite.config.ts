@@ -1,9 +1,14 @@
 import { defineConfig } from 'vitest/config';
+import { searchForWorkspaceRoot } from 'vite';
 import { createHash } from 'node:crypto';
 import { readFileSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
+import { fileURLToPath } from 'node:url';
 import { copyBridge, installBridge } from './scripts/softn-bridge/install.mjs';
 import { buildViewer } from './scripts/modelview/build.mjs';
+
+/** Code the Agent shares with the flow editor and the providers origin: `@oaiy/shared/...` (plain TypeScript). */
+const sharedDir = fileURLToPath(new URL('../shared', import.meta.url));
 
 // The sandbox blocks a Worker on SharedArrayBuffer + Atomics.wait while the
 // page answers its host calls, which needs a cross-origin isolated page.
@@ -68,9 +73,11 @@ const stampServiceWorker = {
 
 export default defineConfig({
   plugins: [softnHeaders, stampServiceWorker],
+  // Code the Agent shares with the flow editor and the providers origin (../shared, plain TypeScript).
+  resolve: { alias: { '@oaiy/shared': sharedDir } },
   // One fixed port, so a local server (OAIY) can allow the Agent by its origin, http://localhost:5317.
   // src-tauri/target is Cargo's: its files are locked while it builds the desktop app.
-  server: { port: 5317, strictPort: true, headers: isolation, watch: { ignored: ['**/src-tauri/**'] } },
+  server: { port: 5317, strictPort: true, headers: isolation, watch: { ignored: ['**/src-tauri/**'] }, fs: { allow: [searchForWorkspaceRoot(process.cwd()), sharedDir] } },
   preview: { port: 5317, strictPort: true, headers: isolation },
   worker: { format: 'es' },
   build: {

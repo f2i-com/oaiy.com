@@ -1,0 +1,14 @@
+# flows.D: the flow editor's static host (design 3.8). Tokens are filled in by web/scripts/headers.mjs.
+#
+# As it is served today: NO COOP and NO COEP (the web build is deliberately not cross-origin isolated, platform/ui/vite.config.ts),
+# its policy is the meta tag in app.html, and the compiler sandbox worker gets the strict policy of platform/ui/public/_headers.
+# Flows runs the person's flows in its main window and calls arbitrary endpoints, so a broader policy cannot be set here. It embeds
+# the providers origin, which answers only to it and to the Agent (frame-ancestors there).
+/*
+  X-Content-Type-Options: nosniff
+  Referrer-Policy: no-referrer
+  Strict-Transport-Security: max-age=86400
+/assets/compiler-sandbox-worker-*
+  Content-Security-Policy: default-src 'none'; script-src 'self' 'unsafe-eval'; connect-src 'none'; worker-src 'none'
+/sw.js
+  Cache-Control: no-cache

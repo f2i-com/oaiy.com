@@ -312,6 +312,7 @@ cd platform/ui && npm run dev        # the flow editor: http://localhost:5173/ap
 | `platform/desktop/src-tauri/` | `cargo test --no-default-features`, `cargo test --features gui` | the desktop's Rust, headless and with the GUI |
 | `platform/ui/` | `npm test` | the flow editor: types, node contracts, the ZIPP engines |
 | `platform/cli/` | `npm run build && npm test` | the CLI and its ZIPP guards |
+| `web/` | `npm test`, `npm run test:e2e`, `npm run test:mutations` | the OAIY web app's providers origin: typecheck and unit tests (the CI gate runs these); real-browser tests and the mutation checks (by hand) |
 
 `platform/TESTING.md` has the details. The CI and release workflows are in
 `.github/workflows`; automatic CI is paused, so `ci.yml` is started by hand, and a

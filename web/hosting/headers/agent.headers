@@ -1,0 +1,29 @@
+# agent.D: the Agent's static host (design 3.8). Tokens are filled in by web/scripts/headers.mjs.
+#
+# Rules apply in order and a later one replaces the same header of an earlier one (Caddy's `header` does the same; a host that joins
+# the values of two rules would need the exceptions below written another way).
+#
+# The Agent is cross-origin isolated (its Zipp sandbox needs SharedArrayBuffer): COOP same-origin and COEP credentialless, so the
+# providers frame it embeds must send COEP and a CORP that admits it (providers.headers does). CORP same-origin keeps every other
+# site from embedding its files, except the three folders a sandboxed preview frame loads scripts from, which have an opaque origin.
+# The policy is the one in app/index.html plus the providers frame and no framing of the Agent.
+/*
+  X-Content-Type-Options: nosniff
+  Referrer-Policy: no-referrer
+  Strict-Transport-Security: max-age=86400
+  Cross-Origin-Opener-Policy: same-origin
+  Cross-Origin-Embedder-Policy: credentialless
+  Cross-Origin-Resource-Policy: same-origin
+  Content-Security-Policy: default-src 'self'; script-src 'self' 'wasm-unsafe-eval'; worker-src 'self' blob:; style-src 'self' 'unsafe-inline'; img-src 'self' data: blob:; media-src 'self' data: blob:; font-src 'self' data:; connect-src * data: blob: ws: wss:; frame-src 'self' {{PROVIDERS_ORIGIN}}; object-src 'none'; base-uri 'none'; form-action 'none'; frame-ancestors 'none'
+/softn/*
+  Cross-Origin-Resource-Policy: cross-origin
+  Access-Control-Allow-Origin: *
+/webpage/*
+  Cross-Origin-Resource-Policy: cross-origin
+  Access-Control-Allow-Origin: *
+/modelview/*
+  Cross-Origin-Resource-Policy: cross-origin
+  Access-Control-Allow-Origin: *
+# The service worker's script is never served from a cache.
+/sw.js
+  Cache-Control: no-cache

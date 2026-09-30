@@ -169,6 +169,52 @@ jobs:
         working-directory: platform/ui
         run: npm run build
 
+  # OAIY on the web (web/): the providers origin that holds the keys, and the scripts and tests that check its three hosts. The typecheck
+  # and the unit tests (a fake IndexedDB, a real MessageChannel, the leak scans shown to find what they look for) run here on every
+  # gate. The browser tests (npm run test:e2e: real origins in Chromium and Firefox) and the mutation checks (npm run test:mutations)
+  # need the browsers and a few minutes, and are run by hand for now. No ZIPP engine: nothing here loads one.
+  webapp:
+    name: OAIY on the web (web/), typecheck and unit tests
+    needs: [revision]
+    runs-on: ubuntu-latest
+    env:
+      PLAYWRIGHT_SKIP_BROWSER_DOWNLOAD: '1'
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          ref: ${{ inputs.ref || '' }}
+          persist-credentials: false
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          cache: npm
+          cache-dependency-path: web/package-lock.json
+      - working-directory: web
+        run: npm ci
+      # ECO-04, as in the lanes above: advisories at high or above fail the lane, and an unreachable registry is UNKNOWN, never clean.
+      - name: Dependency audit (high or above)
+        working-directory: web
+        shell: bash
+        run: |
+          set -o pipefail
+          if out=$(npm audit --audit-level=high 2>&1); then
+            echo "$out" | tail -n 3
+            echo "## Dependency audit (web): PASS" >> "$GITHUB_STEP_SUMMARY"
+          else
+            code=$?
+            echo "$out" | tail -n 40
+            if echo "$out" | grep -qiE 'ENOTFOUND|ECONNRESET|ETIMEDOUT|EAI_AGAIN|503|registry error|network'; then
+              echo "## Dependency audit (web): UNKNOWN (registry unreachable at $(date -u +%FT%TZ))" >> "$GITHUB_STEP_SUMMARY"
+              echo "::error::npm audit could not reach the registry; result UNKNOWN, not clean"
+            else
+              echo "## Dependency audit (web): FAIL" >> "$GITHUB_STEP_SUMMARY"
+            fi
+            exit "$code"
+          fi
+      - name: Typecheck and unit tests (web/)
+        working-directory: web
+        run: npm test
+
   cli:
     name: CLI tests, typecheck and HTTPS shutdown
     needs: [revision, zipp]

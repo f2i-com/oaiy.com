@@ -21,7 +21,8 @@
       "@tauri-apps/api/event": ["./src/tauri-shim/event.ts"],
       "@tauri-apps/plugin-dialog": ["./src/tauri-shim/dialog.ts"],
       "@tauri-apps/plugin-fs": ["./src/tauri-shim/fs.ts"],
-      "@tauri-apps/plugin-sql": ["./src/tauri-shim/sql.ts"]
+      "@tauri-apps/plugin-sql": ["./src/tauri-shim/sql.ts"],
+      "@oaiy/shared/*": ["../../shared/*"]
     },
     "moduleResolution": "bundler",
     "allowImportingTsExtensions": true,
@@ -31,5 +32,5 @@
     "strict": true,
     "noFallthroughCasesInSwitch": true
   },
-  "include": ["src", "vendor"]
+  "include": ["src", "vendor", "../../shared"]
 }

@@ -336,11 +336,19 @@ await check('every link goes to the project\'s repository, and only the names of
 });
 
 await check('the helper reads nothing and asks nothing: no fetch, no XMLHttpRequest, no navigator, no import.meta', () => {
-  const source = fs.readFileSync(path.join(UI, 'src', 'lib', 'downloads.ts'), 'utf8');
+  // The helper and the repository's addresses moved to shared/ (the editor's src/lib/downloads.ts only re-exports it), so it is the text of
+  // THE SHARED FILES that must be pure: a check of the re-export cannot fail, whatever the code it re-exports does.
+  const shared = path.join(UI, '..', '..', 'shared');
+  assert.match(fs.readFileSync(path.join(UI, 'src', 'lib', 'downloads.ts'), 'utf8'), /export \* from '@oaiy\/shared\/downloads';/, 'the editor\'s file re-exports the shared one');
+  const source = fs.readFileSync(path.join(shared, 'downloads.ts'), 'utf8');
   // Comments may talk about them; code may not.
   const code = source.replace(/\/\*[\s\S]*?\*\//g, '').replace(/\/\/.*$/gm, '');
   for (const forbidden of [/\bfetch\s*\(/, /XMLHttpRequest/, /\bnavigator\b/, /import\.meta/, /api\.github\.com/, /sendBeacon/, /new WebSocket/]) {
     assert.doesNotMatch(code, forbidden, String(forbidden));
+  }
+  const links = fs.readFileSync(path.join(shared, 'repoLinks.ts'), 'utf8').replace(/\/\*[\s\S]*?\*\//g, '').replace(/\/\/.*$/gm, '');
+  for (const forbidden of [/\bfetch\s*\(/, /XMLHttpRequest/, /\bnavigator\b/, /import\.meta/, /api\.github\.com/, /sendBeacon/, /new WebSocket/]) {
+    assert.doesNotMatch(links, forbidden, `repoLinks.ts: ${forbidden}`);
   }
   const env = fs.readFileSync(path.join(UI, 'src', 'lib', 'downloadsEnv.ts'), 'utf8').replace(/\/\*[\s\S]*?\*\//g, '');
   assert.doesNotMatch(env, /fetch\s*\(|XMLHttpRequest|api\.github\.com/);

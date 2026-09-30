@@ -244,13 +244,14 @@ await check('Linux is not promised without its caveat: the packages are newer an
   assert.ok((landing.match(/newer,? (and )?less tested|newer and less tested/g) ?? []).length >= 4, 'the landing page says so where it names Linux');
   assert.ok((desktop.match(/newer and less tested/g) ?? []).length >= 3, 'and the desktop page');
   assert.match(read('desktop.html'), /Linux is newer and less tested/, 'and its description');
-  assert.match(read('src/lib/downloads.ts'), /LINUX_NOTE = 'Linux is newer and less tested than Windows\.'/, 'and a Linux button');
+  // The download plan is in shared/downloads.ts (src/lib/downloads.ts re-exports it).
+  assert.match(read('../../shared/downloads.ts'), /LINUX_NOTE = 'Linux is newer and less tested than Windows\.'/, 'and a Linux button');
   // the root README says Windows and Linux, and which is better tested
   const readme = fs.readFileSync(path.join(UI, '..', '..', 'README.md'), 'utf8');
   assert.match(readme, /A Tauri 2 app for Windows and Linux/);
   assert.doesNotMatch(readme, /A Tauri 2 app for Windows,/);
   // the one sentence for devices it is not built for is still what the brief says
-  assert.match(read('src/lib/downloads.ts'), /OAIY Desktop is for Windows and Linux\. The web app works in your browser\./);
+  assert.match(read('../../shared/downloads.ts'), /OAIY Desktop is for Windows and Linux\. The web app works in your browser\./);
 });
 
 await check('the comparison says the Agent runs inside OAIY Desktop, not "No": that stays true when the Agent has a web build', () => {
