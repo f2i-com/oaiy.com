@@ -215,7 +215,10 @@ impl<C: Codec> KeyStore for FileStore<C> {
         }
         self.dir.fire("before_rename");
         // the exclusive lock is held for the rename only, not for the write and the read-back: readers wait for one rename, never for a disk
-        let renamed = self.dir.lock(true).and_then(|_lock| self.dir.rename(&tmp, &self.file_name(name)));
+        let renamed = self.dir.lock(true).and_then(|_lock| {
+            self.dir.fire("rename_locked");
+            self.dir.rename(&tmp, &self.file_name(name))
+        });
         if let Err(error) = renamed {
             let _ = self.dir.remove(&tmp);
             return Err(error);
@@ -410,11 +413,16 @@ mod tests {
             let store = FileStore::open(&dir, KeyfileCodec).unwrap();
             store.put(&name("keep.me"), b"kept").unwrap();
         }
-        let old = [".keep.me.0123456789abcdef.tmp", ".other.fedcba9876543210.tmp", ".provider.00000000000000ff.tmp"];
+        let old =
+            [".keep.me.0123456789abcdef.tmp", ".other.fedcba9876543210.tmp", ".provider.00000000000000ff.tmp", ".just-over.00000000000000aa.tmp"];
         for debris in old {
             fs::write(dir.join(debris), b"a value in the clear").unwrap();
-            age(&dir.join(debris), 120);
+            age(&dir.join(debris), if debris.starts_with(".just-over") { 70 } else { 120 });
         }
+        // the minute: a file of 50 seconds is a put that has been going a while, not debris; one of 70 is (this runs on Windows too, where the lock and the removal are LockFileEx and a
+        // delete of a file that this process has open)
+        fs::write(dir.join(".just-under.00000000000000bb.tmp"), b"a put in progress").unwrap();
+        age(&dir.join(".just-under.00000000000000bb.tmp"), 50);
         // not debris: young (the put of another process that has not renamed yet), locked (an old file that someone is still writing), or not the store's shape
         fs::write(dir.join(".young.0123456789abcdef.tmp"), b"a put in progress").unwrap();
         fs::write(dir.join(".locked.0123456789abcdef.tmp"), b"a slow write").unwrap();
@@ -435,7 +443,10 @@ mod tests {
         }
         let store = FileStore::open(&dir, KeyfileCodec).unwrap();
         let mut survivors: Vec<String> =
-            [".young.0123456789abcdef.tmp", ".locked.0123456789abcdef.tmp", "keep.me.kf"].iter().map(|s| s.to_string()).collect();
+            [".young.0123456789abcdef.tmp", ".locked.0123456789abcdef.tmp", ".just-under.00000000000000bb.tmp", "keep.me.kf"]
+                .iter()
+                .map(|s| s.to_string())
+                .collect();
         survivors.extend(not_ours.iter().map(|s| s.to_string()));
         survivors.sort();
         assert_eq!(files(&dir), survivors);
@@ -630,6 +641,52 @@ mod tests {
         drop(lock);
         let got = reader.join().unwrap().unwrap().expect("the key exists: it is not `None`");
         assert_eq!(&**got, b"the new value");
+    }
+
+    /// H-1 through the real `put`, at the point that matters, on every platform (the review's two-process test is a weak guard: the lock-less store gave one false `None` in about
+    /// 2.73 million reads, and the locked store none in 2.0 million, which proves little; this is the guard). The writer is paused **inside its locked rename step**: it holds the
+    /// exclusive lock, the temporary file is verified, and the old file has just been taken away, which is the moment that a rename over an existing file leaves on Windows
+    /// (`MoveFileEx` with `REPLACE_EXISTING`: the destination name is briefly absent; on Unix `rename` does not leave it, and the test puts it there by hand). A reader that starts now
+    /// must **wait**, and must then find the new value: it must never return, and never return `None`, while the writer is between the two states. Without the exclusive lock
+    /// around the rename the reader runs at once and says `None`; without the shared lock around the read it does the same.
+    #[test]
+    fn a_reader_that_starts_in_the_middle_of_a_puts_rename_waits_and_never_returns_none() {
+        use std::sync::{mpsc, Arc, Mutex};
+        use std::time::Duration;
+        let scratch = Scratch::new("midrename");
+        let keys = scratch.keys();
+        let store = Arc::new(FileStore::open(&keys, KeyfileCodec).unwrap());
+        let n = name("vault.pins");
+        store.put(&n, b"old").unwrap();
+        let (entered_tx, entered_rx) = mpsc::channel::<()>();
+        let (go_tx, go_rx) = mpsc::channel::<()>();
+        let go_rx = Mutex::new(go_rx);
+        let old_file = keys.join("vault.pins.kf");
+        store.dir.hooks.at("rename_locked", move || {
+            fs::remove_file(&old_file).unwrap(); // the destination name, briefly absent
+            entered_tx.send(()).unwrap();
+            go_rx.lock().unwrap().recv().unwrap();
+        });
+        let writer = {
+            let (store, n) = (Arc::clone(&store), n.clone());
+            std::thread::spawn(move || store.put(&n, b"new"))
+        };
+        entered_rx
+            .recv_timeout(Duration::from_secs(20))
+            .expect("the writer never reached its locked rename step: the put does not rename under the lock");
+        let reader = {
+            let (store, n) = (Arc::clone(&store), n.clone());
+            std::thread::spawn(move || store.get(&n))
+        };
+        std::thread::sleep(Duration::from_millis(500));
+        assert!(
+            !reader.is_finished(),
+            "a reader that started in the middle of a rename returned at once, and would have said `None` for a key that exists"
+        );
+        go_tx.send(()).unwrap();
+        writer.join().unwrap().expect("the put succeeds");
+        let got = reader.join().unwrap().unwrap().expect("the key exists: the reader must not be told that it was never stored");
+        assert_eq!(&**got, b"new");
     }
 
     /// The other half: readers share the lock, so one reader never waits for another, and a holder that never lets go is an error after the wait (naming the

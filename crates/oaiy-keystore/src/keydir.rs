@@ -46,7 +46,9 @@ pub(crate) const MAX_BLOB_LEN: usize = MAX_VALUE_LEN + 4096;
 pub(crate) const LOCK_FILE: &str = ".lock";
 
 /// How long an operation waits for another process's lock before it gives up with an error: a lock is held for the length of one rename, so a longer wait
-/// means a process that is stuck, and an error is better than a caller that never returns.
+/// means a process that is stuck, and an error is better than a caller that never returns. Ten seconds is generous on purpose: one stall under Windows Defender in the
+/// reviewer's runs reached 8.5 seconds, and an operation that gives up is an error (it fails closed, nothing is changed, the caller may try again), so a slow machine
+/// costs a caller a retry and never a wrong answer.
 pub(crate) const LOCK_WAIT: Duration = Duration::from_secs(10);
 
 /// An advisory lock on the folder, held until it is dropped. **Why there is one (review H-1):** replacing a file is not atomic for a reader on Windows

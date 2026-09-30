@@ -723,6 +723,12 @@ fn child_of_the_two_process_test_rewrites_one_name_over_and_over() {
 /// H-1 with real processes. Two rewrite one name in a loop (each put is a rename over the existing file); three threads of this process read it in a loop. A
 /// reader must see a whole value every time: never `None` (on Windows a reader that opens a name in the moment of a `MoveFileEx` replace finds it missing, and
 /// the reviewer's reader was told `None` for a key that existed, 174 times in one run), never an error, never a mix of two values.
+///
+/// **This is a weak guard of H-1, and says so.** The window is microseconds wide: the reviewer saw the lock-less store give one false `None` in about 2.73 million reads,
+/// and the locked one none in 2.0 million, which proves little, and on this machine the lock-less store did not fail in two runs of 28 seconds. What shows that the lock is
+/// taken is deterministic: `store::tests::a_reader_that_starts_in_the_middle_of_a_puts_rename_waits_and_never_returns_none` (the real `put`, paused inside its locked rename
+/// step, on every platform), `a_reader_waits_for_a_writer_in_the_middle_of_a_replace_...` and `readers_share_the_lock_and_a_holder_that_never_lets_go_...`. This test shows
+/// that two writer processes and three readers coexist, with whole values, no error and no temporary file left.
 #[test]
 fn readers_never_see_a_name_that_other_processes_are_rewriting_as_missing_or_torn() {
     for (choice, _) in providers() {
