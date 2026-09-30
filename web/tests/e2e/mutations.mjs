@@ -96,6 +96,26 @@ const MUTATIONS = [
     files: { 'shared/providers/endpoints.ts': [{ find: /  if \(target\.origin !== baseUrl\.origin[^\n]*\{\n[^\n]*\n  \}\n/, replace: '' }] },
     caught: [],
   },
+  // --- The reviewer's findings (each fix has tests that fail without it; these break the fix and show it) ------------------------------
+  {
+    name: 'F1 forward the provider\'s error text',
+    what: 'an error body is passed to the app (as before the fix), scrubbed of the key',
+    tests: ['tests/unit/provider-text.test.mjs'],
+    files: {
+      'web/providers/src/fetcher.ts': [
+        { find: '          const body = fixedErrorBody(record, response.status);', replace: '          const body = new TextEncoder().encode(redactSecret(await response.text(), key));' },
+        { find: "import { errorBody,", replace: "import { redactSecret } from '@oaiy/shared/providers/errors';\nimport { errorBody," },
+      ],
+    },
+    caught: ['for every status and every kind of echo', 'what an app reads out of the answer does not depend on the key'],
+  },
+  {
+    name: 'F6 setModel takes any model',
+    what: 'an app may set a model the provider never listed',
+    tests: ['tests/unit/store.test.mjs', 'tests/unit/broker.test.mjs'],
+    files: { 'web/providers/src/store.ts': [{ find: "if (by !== undefined && (record.model ?? '') !== model && !(Array.isArray(known) && known.includes(model))) return 'unknown-model' as const;", replace: '' }] },
+    caught: ['an app may choose only a model the provider listed', 'a model no provider listed is refused'],
+  },
 ];
 
 const read = (rel) => fs.readFileSync(path.join(ROOT, rel), 'utf8');
@@ -124,9 +144,9 @@ function build() {
   if (result.status !== 0) throw new Error(`the build failed:\n${result.text}`);
 }
 
-/** The names of the tests that failed in one run of E3. */
-function e3() {
-  const result = run(process.execPath, ['--test', E3]);
+/** The names of the tests that failed in one run of the given test files. */
+function runTests(files) {
+  const result = run(process.execPath, ['--test', '--test-timeout=180000', ...files]);
   const failed = [...new Set([...result.text.matchAll(/^\s*✖ (.+?) \(\d[\d.]*ms\)/gm)].map((m) => m[1].replace(/\s+/g, ' ').trim()))];
   const tests = /ℹ tests (\d+)/.exec(result.text)?.[1];
   const passed = /ℹ pass (\d+)/.exec(result.text)?.[1];
@@ -153,8 +173,14 @@ if (fs.existsSync(BACKUP)) {
   console.log(`a previous run was cut off: ${Object.keys(left).length} file(s) were put back as they were before it (${Object.keys(left).join(', ')})`);
 }
 
+// `--only <text>` runs the mutations whose name has the text (a way to iterate); each mutation runs the test files it names, E3 by default.
+const only = process.argv.includes('--only') ? process.argv[process.argv.indexOf('--only') + 1] : null;
+const SELECTED = MUTATIONS.filter((m) => !only || m.name.includes(only));
+const testsOf = (m) => m.tests ?? [E3];
+const CONTROL_FILES = [...new Set(SELECTED.flatMap(testsOf))];
+
 const originals = new Map();
-for (const mutation of MUTATIONS) for (const file of Object.keys(mutation.files)) if (!originals.has(file)) originals.set(file, read(file));
+for (const mutation of SELECTED) for (const file of Object.keys(mutation.files)) if (!originals.has(file)) originals.set(file, read(file));
 
 // The originals are what is committed. A file that already differs from it is somebody's work in progress (or an earlier mutation), and
 // would be "restored" to itself, so the run does not begin.
@@ -178,17 +204,17 @@ let bad = 0;
 const report = [];
 try {
   build();
-  const control = e3();
+  const control = runTests(CONTROL_FILES);
   console.log(`control (nothing broken): ${control.passed}/${control.tests} pass`);
   if (control.status !== 0) {
-    console.error(`E3 fails with nothing broken; a mutation check would prove nothing: ${control.failed.join(' | ')}`);
+    console.error(`the tests fail with nothing broken; a mutation check would prove nothing: ${control.failed.join(' | ')}`);
     process.exit(2);
   }
-  for (const mutation of MUTATIONS) {
+  for (const mutation of SELECTED) {
     try {
       for (const [file, edits] of Object.entries(mutation.files)) apply(file, edits);
       build();
-      const outcome = e3();
+      const outcome = runTests(testsOf(mutation));
       const caughtBy = mutation.caught.filter((expected) => outcome.failed.some((name) => name.includes(expected)));
       if (mutation.informational) {
         console.log(`${outcome.status !== 0 ? 'CAUGHT ' : 'SURVIVED'} ${mutation.name} (${mutation.what}): ${outcome.failed.length} test(s) failed (informational: not required)`);
@@ -205,7 +231,7 @@ try {
     }
   }
   build();
-  const after = e3();
+  const after = runTests(CONTROL_FILES);
   console.log(`restored: ${after.passed}/${after.tests} pass`);
   if (after.status !== 0) bad++;
 } finally {
