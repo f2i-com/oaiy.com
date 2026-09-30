@@ -643,50 +643,99 @@ fn child_of_the_two_process_test_rewrites_one_name_over_and_over() {
     let choice = if label == "dpapi" { ProviderChoice::DpapiFile } else { keyfile() };
     let store = open_at(dir, choice).unwrap();
     let candidates = shared_candidates();
-    for i in 0..800usize {
+    for i in 0..150usize {
         store.put(&name("shared.value"), &candidates[i % 4]).unwrap();
     }
 }
 
-/// H-1 with two real processes. One rewrites a name in a loop (each put is a rename over the existing file); this one reads it in a loop. The reader must see
-/// a whole value every time: never `None` (on Windows a reader that opens a name in the moment of a `MoveFileEx` replace finds it missing, and the reviewer's
-/// reader was told `None` for a key that existed), never an error, never a mix of two values.
+/// H-1 with real processes. Two rewrite one name in a loop (each put is a rename over the existing file); three threads of this process read it in a loop. A
+/// reader must see a whole value every time: never `None` (on Windows a reader that opens a name in the moment of a `MoveFileEx` replace finds it missing, and
+/// the reviewer's reader was told `None` for a key that existed, 174 times in one run), never an error, never a mix of two values.
 #[test]
-fn a_reader_never_sees_a_name_that_another_process_is_rewriting_as_missing_or_torn() {
+fn readers_never_see_a_name_that_other_processes_are_rewriting_as_missing_or_torn() {
     for (choice, _) in providers() {
         let label = if choice == ProviderChoice::DpapiFile { "dpapi" } else { "keyfile" };
         let scratch = Scratch::new("twoproc");
-        let store = store(&scratch, choice);
+        let store: Arc<dyn KeyStore> = Arc::from(store(&scratch, choice));
         let shared = name("shared.value");
         let candidates = shared_candidates();
         store.put(&shared, &candidates[0]).unwrap();
-        let mut child = std::process::Command::new(std::env::current_exe().unwrap())
-            .args(["--exact", "child_of_the_two_process_test_rewrites_one_name_over_and_over", "--test-threads=1"])
-            .env(CHILD_DIR, scratch.keys())
-            .env(CHILD_PROVIDER, label)
-            .stdout(std::process::Stdio::null())
-            .spawn()
-            .unwrap();
-        let mut reads = 0u64;
-        let status = loop {
-            if let Some(status) = child.try_wait().unwrap() {
-                break status;
-            }
-            match store.get(&shared) {
-                Ok(Some(value)) => {
-                    assert!(candidates.iter().any(|c| c.as_slice() == *value), "{label}: a torn or foreign value after {reads} reads")
-                }
-                Ok(None) => panic!("{label}: a key that exists was reported as never stored, after {reads} reads"),
-                Err(error) => panic!("{label}: a read failed while another process was replacing the file, after {reads} reads: {error}"),
-            }
-            reads += 1;
-        };
-        assert!(status.success(), "{label}: the writer process failed: {status}");
-        assert!(reads >= 20, "{label}: the reader only got {reads} reads in while the writer ran");
+        let writers: Vec<std::process::Child> = (0..2)
+            .map(|_| {
+                std::process::Command::new(std::env::current_exe().unwrap())
+                    .args(["--exact", "child_of_the_two_process_test_rewrites_one_name_over_and_over", "--test-threads=1"])
+                    .env(CHILD_DIR, scratch.keys())
+                    .env(CHILD_PROVIDER, label)
+                    .stdout(std::process::Stdio::piped())
+                    .spawn()
+                    .unwrap()
+            })
+            .collect();
+        let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let readers: Vec<_> = (0..3)
+            .map(|_| {
+                let (store, stop, shared, candidates) = (Arc::clone(&store), Arc::clone(&stop), shared.clone(), candidates.clone());
+                thread::spawn(move || {
+                    let (mut reads, mut wrong) = (0u64, Vec::new());
+                    while !stop.load(std::sync::atomic::Ordering::SeqCst) {
+                        match store.get(&shared) {
+                            Ok(Some(value)) if candidates.iter().any(|c| c.as_slice() == *value) => {}
+                            Ok(Some(_)) => wrong.push("a torn or foreign value".to_string()),
+                            Ok(None) => wrong.push("a key that exists was reported as never stored".to_string()),
+                            Err(error) => wrong.push(format!("a read failed while other processes were replacing the file: {error}")),
+                        }
+                        reads += 1;
+                    }
+                    (reads, wrong)
+                })
+            })
+            .collect();
+        for writer in writers {
+            let output = writer.wait_with_output().unwrap();
+            assert!(output.status.success(), "{label}: a writer process failed: {}\n{}", output.status, String::from_utf8_lossy(&output.stdout));
+        }
+        stop.store(true, std::sync::atomic::Ordering::SeqCst);
+        let (mut reads, mut wrong) = (0, Vec::new());
+        for reader in readers {
+            let (r, w) = reader.join().unwrap();
+            reads += r;
+            wrong.extend(w);
+        }
+        assert!(wrong.is_empty(), "{label}: {} of {reads} reads were wrong, for example: {}", wrong.len(), wrong[0]);
+        assert!(reads >= 100, "{label}: the readers only got {reads} reads in while the writers ran");
         assert_eq!(key_files(&scratch.keys()).len(), 1, "{label}: no temporary file is left");
     }
 }
-
+/// L-6 with threads: one opens the store over and over (as other processes do), the other puts. No put may fail because of an open: the store used to delete
+/// the temporary file of a put in progress, and the put failed at its read-back (870 of 874 puts on Linux, about 1,200 of 1,265 on Windows).
+#[test]
+fn puts_do_not_fail_while_the_store_is_being_opened_again_and_again() {
+    for (choice, _) in providers() {
+        let scratch = Scratch::new("openloop");
+        let store = store(&scratch, choice);
+        let n = name("relay.token");
+        let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let opener = {
+            let (keys, stop) = (scratch.keys(), Arc::clone(&stop));
+            thread::spawn(move || {
+                let mut opens = 0u32;
+                while !stop.load(std::sync::atomic::Ordering::SeqCst) {
+                    drop(open_at(&keys, choice).expect("a second open of the same folder"));
+                    opens += 1;
+                }
+                opens
+            })
+        };
+        for i in 0..60u8 {
+            let value = canary(i, 40 + usize::from(i));
+            store.put(&n, &value).unwrap_or_else(|e| panic!("put {i} failed while the store was being opened: {e}"));
+            assert_eq!(get(&*store, &n), Some(value));
+        }
+        stop.store(true, std::sync::atomic::Ordering::SeqCst);
+        assert!(opener.join().unwrap() > 5, "the other thread opened the store a few times at least");
+        assert_eq!(key_files(&scratch.keys()).len(), 1, "no temporary file is left");
+    }
+}
 /// DPAPI specifics: what is on disk, and what "another user's key" does.
 #[cfg(windows)]
 mod dpapi {

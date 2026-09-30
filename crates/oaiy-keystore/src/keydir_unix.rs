@@ -10,9 +10,9 @@ use rustix::fs::{fsync, openat, renameat, statat, unlinkat, AtFlags, Dir, FileTy
 use rustix::io::Errno;
 use zeroize::Zeroizing;
 
-use super::{read_blob, DirLock, Entry, LOCK_FILE, LOCK_WAIT};
+use super::{claim_if_stale, read_blob, DirLock, Entry, LOCK_FILE, LOCK_WAIT};
 use crate::error::KeyError;
-use crate::perm::{self, Kind};
+use crate::perm::{self, FileKind, Kind};
 
 /// The most directories above the keys folder that are walked (a path is never this deep; a loop of links cannot make the walk endless).
 const MAX_DEPTH: usize = 4096;
@@ -152,6 +152,20 @@ impl KeyDir {
     /// Renames `from` to `to`, replacing `to`.
     pub(crate) fn rename(&self, from: &str, to: &str) -> Result<(), KeyError> {
         renameat(&self.dir, from, &self.dir, to).map_err(|e| errno("replace the key file", e))
+    }
+
+    /// Removes the temporary file `name` if it is debris: one of ours, older than `min_age`, and not locked by anyone (see [`STALE_AFTER`](super::STALE_AFTER)).
+    /// Best effort: whether it was removed is the answer, and no failure is an error.
+    pub(crate) fn remove_if_stale(&self, name: &str, min_age: Duration) -> bool {
+        let flags = OFlags::RDWR | OFlags::NOFOLLOW | OFlags::NONBLOCK | OFlags::CLOEXEC;
+        let Ok(fd) = openat(&self.dir, name, flags, Mode::empty()) else { return false };
+        let file = File::from(fd);
+        let Ok(meta) = file.metadata() else { return false };
+        let meta = perm::meta_of(&meta);
+        if meta.kind != FileKind::Regular || meta.uid != self.uid || !claim_if_stale(&file, min_age) {
+            return false;
+        }
+        unlinkat(&self.dir, name, AtFlags::empty()).is_ok()
     }
 
     /// Removes a file; one that is not there is not an error.

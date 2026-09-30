@@ -9,7 +9,7 @@ use std::time::Duration;
 
 use zeroize::Zeroizing;
 
-use super::{read_blob, DirLock, Entry, LOCK_FILE, LOCK_WAIT};
+use super::{claim_if_stale, read_blob, DirLock, Entry, LOCK_FILE, LOCK_WAIT};
 use crate::error::KeyError;
 
 const FILE_FLAG_BACKUP_SEMANTICS: u32 = 0x0200_0000;
@@ -136,6 +136,18 @@ impl KeyDir {
     /// Renames `from` to `to`, replacing `to`.
     pub(crate) fn rename(&self, from: &str, to: &str) -> Result<(), KeyError> {
         fs::rename(self.at(from), self.at(to)).map_err(|e| KeyError::io("replace the key file", e))
+    }
+
+    /// Removes the temporary file `name` if it is debris: a regular file, older than `min_age`, and not locked by anyone (see [`STALE_AFTER`](super::STALE_AFTER)).
+    /// Best effort: whether it was removed is the answer, and no failure is an error.
+    pub(crate) fn remove_if_stale(&self, name: &str, min_age: Duration) -> bool {
+        let path = self.at(name);
+        let Ok(file) = OpenOptions::new().read(true).write(true).custom_flags(FILE_FLAG_OPEN_REPARSE_POINT).open(&path) else { return false };
+        let Ok(meta) = file.metadata() else { return false };
+        if require_file(&meta, "").is_err() || !claim_if_stale(&file, min_age) {
+            return false;
+        }
+        fs::remove_file(&path).is_ok()
     }
 
     /// Removes a file; one that is not there is not an error.

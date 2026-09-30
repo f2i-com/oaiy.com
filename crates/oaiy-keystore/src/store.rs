@@ -15,7 +15,7 @@ use zeroize::Zeroizing;
 
 use crate::codec::{Codec, ProviderInfo};
 use crate::error::KeyError;
-use crate::keydir::KeyDir;
+use crate::keydir::{KeyDir, STALE_AFTER};
 use crate::name::Name;
 
 /// The most a value may be: 64 KiB.
@@ -117,12 +117,14 @@ impl<C: Codec> FileStore<C> {
     }
 
     /// Temporary files are `.<name>.<16 hex>.tmp`: they can never be a name, so `list` and `get` cannot see them. A crash between the write and the rename leaves one;
-    /// with the keyfile provider it holds a value in the clear, so it is removed the next time the store is opened.
+    /// with the keyfile provider it holds a value in the clear, so it is removed the next time the store is opened. **Only debris is removed** (review L-6): a
+    /// file of exactly that shape, older than a minute, that nobody has locked. The temporary file of a `put` in another process is young, and locked while it is
+    /// written; opening the store used to delete it, and the put failed at its read-back with `key_verify_failed`.
     fn remove_stale_temporaries(&self) {
         let Ok(entries) = self.dir.list() else { return };
         for entry in entries {
-            if entry.is_file && entry.name.starts_with('.') && entry.name.ends_with(".tmp") {
-                let _ = self.dir.remove(&entry.name);
+            if entry.is_file && is_temporary_name(&entry.name) {
+                self.dir.remove_if_stale(&entry.name, STALE_AFTER);
             }
         }
     }
@@ -132,11 +134,20 @@ impl<C: Codec> FileStore<C> {
         Ok(format!(".{}.{}.tmp", name.as_str(), hex_lower(random.expose())))
     }
 
-    /// Makes `tmp` (which must not exist) with `bytes` in it and flushes it.
+    /// Makes `tmp` (which must not exist) with `bytes` in it and flushes it. The file is locked while it is written, so that a process that is looking for debris
+    /// can tell this one is not (a file system that cannot lock is no reason to fail: the age rule still protects a young file).
     fn stage(&self, tmp: &str, bytes: &[u8]) -> Result<(), KeyError> {
         let mut file = self.dir.create_new(tmp)?;
-        file.write_all(bytes).map_err(|e| KeyError::io("write the temporary file", e))?;
-        file.sync_all().map_err(|e| KeyError::io("flush the temporary file", e))
+        let locked = file.try_lock().is_ok();
+        self.dir.fire("staging");
+        let written = file
+            .write_all(bytes)
+            .map_err(|e| KeyError::io("write the temporary file", e))
+            .and_then(|()| file.sync_all().map_err(|e| KeyError::io("flush the temporary file", e)));
+        if locked {
+            let _ = file.unlock();
+        }
+        written
     }
 
     /// Writes the blob to `tmp`, flushes it, reads it back through the provider and compares.
@@ -149,6 +160,13 @@ impl<C: Codec> FileStore<C> {
         }
         Ok(())
     }
+}
+
+/// Whether a file name is one of the store's temporary files: `.<name>.<16 lower-case hex>.tmp`, and nothing else (a file someone else put there is not debris).
+fn is_temporary_name(file_name: &str) -> bool {
+    let Some(inner) = file_name.strip_prefix('.').and_then(|rest| rest.strip_suffix(".tmp")) else { return false };
+    let Some((stem, random)) = inner.rsplit_once('.') else { return false };
+    random.len() == 16 && random.bytes().all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b)) && Name::new(stem).is_ok()
 }
 
 /// What the marker file says: the provider's identifier, and a line feed. Anything else is not a marker this keystore wrote.
@@ -376,23 +394,122 @@ mod tests {
         assert_eq!(files(&scratch.keys()), vec!["relay.token.kf".to_string()]);
     }
 
-    /// A crash between the write and the rename leaves a temporary file. With the keyfile provider it holds a value in the clear, so opening the store removes it.
+    /// Makes the modification time of `path` `seconds` seconds ago.
+    fn age(path: &Path, seconds: u64) {
+        let file = fs::OpenOptions::new().write(true).open(path).unwrap();
+        file.set_modified(std::time::SystemTime::now() - std::time::Duration::from_secs(seconds)).unwrap();
+    }
+
+    /// A crash between the write and the rename leaves a temporary file. With the keyfile provider it holds a value in the clear, so opening the store removes
+    /// it (L-6: but only debris: a file of exactly the store's temporary shape, older than a minute, that nobody has locked).
     #[test]
-    fn opening_the_store_removes_the_debris_of_an_interrupted_put() {
+    fn opening_the_store_removes_the_debris_of_an_interrupted_put_and_nothing_else() {
         let scratch = Scratch::new("debris");
         let dir = scratch.keys();
         {
             let store = FileStore::open(&dir, KeyfileCodec).unwrap();
             store.put(&name("keep.me"), b"kept").unwrap();
         }
-        fs::write(dir.join(".keep.me.0123456789abcdef.tmp"), b"a value in the clear").unwrap();
-        fs::write(dir.join(".other.fedcba9876543210.tmp"), b"another").unwrap();
-        fs::write(dir.join("notes.txt"), b"not ours").unwrap();
+        let old = [".keep.me.0123456789abcdef.tmp", ".other.fedcba9876543210.tmp", ".provider.00000000000000ff.tmp"];
+        for debris in old {
+            fs::write(dir.join(debris), b"a value in the clear").unwrap();
+            age(&dir.join(debris), 120);
+        }
+        // not debris: young (the put of another process that has not renamed yet), locked (an old file that someone is still writing), or not the store's shape
+        fs::write(dir.join(".young.0123456789abcdef.tmp"), b"a put in progress").unwrap();
+        fs::write(dir.join(".locked.0123456789abcdef.tmp"), b"a slow write").unwrap();
+        age(&dir.join(".locked.0123456789abcdef.tmp"), 120);
+        let held = fs::OpenOptions::new().write(true).open(dir.join(".locked.0123456789abcdef.tmp")).unwrap();
+        held.lock().unwrap();
+        let not_ours = [
+            ".notes.tmp",
+            ".upper.0123456789ABCDEF.tmp",
+            ".short.0123456789abcde.tmp",
+            ".Capital.0123456789abcdef.tmp",
+            ".x.0123456789abcdef.temp",
+            "notes.txt",
+        ];
+        for other in not_ours {
+            fs::write(dir.join(other), b"someone else's file").unwrap();
+            age(&dir.join(other), 120);
+        }
         let store = FileStore::open(&dir, KeyfileCodec).unwrap();
-        assert_eq!(files(&dir), vec!["keep.me.kf".to_string(), "notes.txt".to_string()]);
+        let mut survivors: Vec<String> =
+            [".young.0123456789abcdef.tmp", ".locked.0123456789abcdef.tmp", "keep.me.kf"].iter().map(|s| s.to_string()).collect();
+        survivors.extend(not_ours.iter().map(|s| s.to_string()));
+        survivors.sort();
+        assert_eq!(files(&dir), survivors);
         assert_eq!(&**store.get(&name("keep.me")).unwrap().unwrap(), b"kept");
+        // once the writer lets go, the old file is debris like any other
+        held.unlock().unwrap();
+        drop(held);
+        drop(FileStore::open(&dir, KeyfileCodec).unwrap());
+        assert!(!files(&dir).contains(&".locked.0123456789abcdef.tmp".to_string()));
+        assert!(files(&dir).contains(&".young.0123456789abcdef.tmp".to_string()), "a young file is still not debris");
     }
 
+    /// L-6, the reviewer's case made deterministic: another process opens the store while this one is between writing its temporary file and renaming it. The
+    /// open used to delete the temporary file, and the put failed with `key_verify_failed` (870 of 874 puts on Linux, 1,201 of 1,265 on Windows, with a second
+    /// process opening the store in a loop).
+    #[test]
+    fn a_put_in_progress_survives_another_process_opening_the_store() {
+        use std::sync::{mpsc, Arc, Mutex};
+        let scratch = Scratch::new("openduringput");
+        let keys = scratch.keys();
+        let store = Arc::new(FileStore::open(&keys, KeyfileCodec).unwrap());
+        let n = name("vault.pins");
+        store.put(&n, b"old").unwrap();
+        let (entered_tx, entered_rx) = mpsc::channel::<()>();
+        let (go_tx, go_rx) = mpsc::channel::<()>();
+        let go_rx = Mutex::new(go_rx);
+        store.dir.hooks.at("before_rename", move || {
+            entered_tx.send(()).unwrap();
+            go_rx.lock().unwrap().recv().unwrap();
+        });
+        let writer = {
+            let (store, n) = (Arc::clone(&store), n.clone());
+            std::thread::spawn(move || store.put(&n, b"new"))
+        };
+        entered_rx.recv().unwrap(); // the temporary file is written and verified, and not renamed
+        let temporaries = || files(&keys).into_iter().filter(|f| f.ends_with(".tmp")).count();
+        assert_eq!(temporaries(), 1);
+        drop(FileStore::open(&keys, KeyfileCodec).unwrap()); // another process opens the store
+        assert_eq!(temporaries(), 1, "opening the store deleted the temporary file of a put that was in progress");
+        go_tx.send(()).unwrap();
+        writer.join().unwrap().expect("the put succeeds");
+        assert_eq!(&**store.get(&n).unwrap().unwrap(), b"new");
+        assert_eq!(temporaries(), 0);
+    }
+    /// The lock is what keeps an old file that is still being written: a write that takes longer than a minute (a suspended laptop, a stalled disk) is older than
+    /// the age rule, and only the lock tells the other process that the file is alive.
+    #[test]
+    fn a_slow_write_that_is_older_than_a_minute_is_not_debris_while_its_writer_holds_the_lock() {
+        use std::sync::{mpsc, Arc, Mutex};
+        let scratch = Scratch::new("slowwrite");
+        let keys = scratch.keys();
+        let store = Arc::new(FileStore::open(&keys, KeyfileCodec).unwrap());
+        let (entered_tx, entered_rx) = mpsc::channel::<()>();
+        let (go_tx, go_rx) = mpsc::channel::<()>();
+        let go_rx = Mutex::new(go_rx);
+        store.dir.hooks.at("staging", move || {
+            entered_tx.send(()).unwrap();
+            go_rx.lock().unwrap().recv().unwrap();
+        });
+        let n = name("archive.writer");
+        let writer = {
+            let (store, n) = (Arc::clone(&store), n.clone());
+            std::thread::spawn(move || store.put(&n, b"a slow write"))
+        };
+        entered_rx.recv().unwrap(); // the temporary file exists and its writer holds its lock
+        let temporary: Vec<String> = files(&keys).into_iter().filter(|f| f.ends_with(".tmp")).collect();
+        assert_eq!(temporary.len(), 1);
+        age(&keys.join(&temporary[0]), 600);
+        drop(FileStore::open(&keys, KeyfileCodec).unwrap());
+        assert_eq!(files(&keys).into_iter().filter(|f| f.ends_with(".tmp")).count(), 1, "an old file whose writer holds its lock was removed");
+        go_tx.send(()).unwrap();
+        writer.join().unwrap().expect("the slow put succeeds");
+        assert_eq!(&**store.get(&n).unwrap().unwrap(), b"a slow write");
+    }
     /// M-3, the reviewer's attack: between the moment the store has judged its folder and the moment it opens a file, someone who can rename folders puts a
     /// folder of their own at the path. A store that looks the path up again reads the attacker's values as its own (the reviewer's victim read 3,388 of
     /// them, and was told `None` 58,442 times). This store opened its folder once and opens every file relative to it: the read is of the real folder, the

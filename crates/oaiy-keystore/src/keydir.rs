@@ -85,6 +85,18 @@ impl Drop for DirLock {
     }
 }
 
+/// A temporary file is debris only when it is older than this **and** nobody holds its lock (review L-6): the file of a `put` that is in progress is young and
+/// is locked while it is written, and opening the store in another process used to delete it, so that the put failed with a misleading `key_verify_failed`
+/// (870 of 874 puts on Linux, about 1,200 of 1,265 on Windows, with a second process opening the store in a loop).
+pub(crate) const STALE_AFTER: Duration = Duration::from_secs(60);
+
+/// Whether `file` (a temporary file, open for writing) is debris: old enough, and its lock is free. When this is true the lock is held by `file`, so
+/// that nobody starts to use it before the caller has removed it.
+pub(super) fn claim_if_stale(file: &File, min_age: Duration) -> bool {
+    let old = file.metadata().and_then(|m| m.modified()).ok().and_then(|t| t.elapsed().ok()).is_some_and(|age| age >= min_age);
+    old && file.try_lock().is_ok()
+}
+
 /// One entry of the folder.
 pub(crate) struct Entry {
     /// The file name (only names that are valid text are listed).
