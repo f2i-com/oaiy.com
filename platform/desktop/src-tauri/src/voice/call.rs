@@ -1918,7 +1918,9 @@ mod tests {
                 )
                 .route(
                     "/v1/audio/transcriptions",
-                    post(move || {
+                    // (The upload is read, as a real server reads it: one answered without being read and then closed resets the connection under
+                    // a body larger than the socket's buffers, and the call would see an error for an utterance longer than about six seconds.)
+                    post(move |_upload: axum::body::Bytes| {
                         let (text, wait) = (heard.lock().unwrap().clone(), hearing_ms.load(Ordering::SeqCst));
                         async move {
                             tokio::time::sleep(Duration::from_millis(wait)).await;
@@ -2323,16 +2325,21 @@ mod tests {
 
     #[tokio::test]
     async fn a_caller_who_talks_on_is_greeted_after_three_seconds_at_most() {
+        // The three seconds themselves are `a_greeting_waits_for_the_settle_or_the_callers_hello`'s, on the instants `Opening` is given, so they cannot be
+        // late for a busy machine. This is the wiring: a caller who talks and does not stop is greeted, by the call's own clock, over them. It reads the
+        // wall clock of a machine that may be busy with other work (a full test run), and a busy machine can only be late: so nothing earlier than
+        // three seconds is allowed, and the bound on the other side is loose (twice the three seconds, and not the tight second and a half a quiet
+        // machine would keep to): a call that waited for the caller to stop would not greet them at all in the time the wait below allows.
         let mut aokie = Aokie::start(json!({})).await;
         aokie.begin(json!({}));
         // Talking from the start, and not stopping.
-        aokie.caller(&[tone(100, 40.0), tone(5_000, 6_000.0)].concat());
-        let (at, _) = aokie.first_audio(secs(8)).await.expect("the greeting");
+        aokie.caller(&[tone(100, 40.0), tone(8_000, 6_000.0)].concat());
+        let (at, _) = aokie.first_audio(secs(20)).await.expect("the greeting");
         assert!(at >= Duration::from_millis(3_000), "greeted {at:?} after the call began, over the caller");
-        assert!(at < Duration::from_millis(4_500), "greeted {at:?} after the call began");
+        assert!(at < Duration::from_millis(6_500), "greeted {at:?} after the call began: it waited for the caller to stop");
         // What they said, begun before the greeting, is read with their next words too.
         aokie.caller(&tone(1_000, 40.0));
-        let heard = aokie.event("call.caller", secs(5)).await.expect("their words, for the app");
+        let heard = aokie.event("call.caller", secs(15)).await.expect("their words, for the app");
         assert_eq!((heard["beforeGreeting"].as_bool(), heard["backchannel"].as_bool()), (Some(true), Some(true)), "{heard}");
     }
 
