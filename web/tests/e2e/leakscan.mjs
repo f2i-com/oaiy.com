@@ -4,8 +4,16 @@
  * WHAT THESE SCANS CAN AND CANNOT SHOW. A scan looks for the secret, and for a list of shapes a page might hold it in (see `needlesFor`:
  * as it is, reversed, in base64 and hex, percent-encoded, as a list of character codes, each also for a prefix, a suffix and a middle
  * piece), in text, in the bytes of typed arrays and ArrayBuffers (of what a page was sent, and of what is reachable from its `window`),
- * in IndexedDB, Cache Storage and the origin private file system, and in the JavaScript heap's strings. A secret in a form that is not on that list (XORed, encrypted, split over
- * messages and joined by arithmetic) is not found, and a scan that finds nothing is NOT a proof that there is nothing. The proof is the
+ * in IndexedDB, Cache Storage and the origin private file system, and in the JavaScript heap's strings. A secret in a form that is not on
+ * that list is not found, and a scan that finds nothing is NOT a proof that there is nothing. The forms that are known not to be found:
+ *   - SHIFTED: every character moved (a Caesar or ROT13 shift, each code plus one, XORed with a byte, any cipher);
+ *   - SPLIT: in runs shorter than 20 characters, or over several messages, several storage entries or several objects that are never joined
+ *     in one place a scan looks (a page that receives the key 14 characters at a time in 14 replies holds no 20 of them together);
+ *   - in a BLOB (or a File): the bytes of a Blob are not in the heap snapshot, not reachable as text from `window`, and not read by the
+ *     buffer scan, which reads ArrayBuffers and typed arrays; a Blob in a page's memory, in a `blob:` URL it made, or in a message that
+ *     carried one is not searched (the storage dump reads a file system file and a cache body by its bytes, and an IndexedDB Blob as `{}`);
+ *   - held only by a CLOSURE (a buffer no property of `window` reaches), or in a worker's heap, or in another process.
+ * The proof is the
  * rule the scans check, not the scans: no operation of the port returns anything that depends on a key (design 3.2, and
  * web/providers/src/fixed.ts for why even an error's words are not passed on). The scans are what would show that rule broken in the
  * ordinary ways, and they are shown to find each of the shapes they claim to (leakscan.test.mjs, harness.test.mjs).

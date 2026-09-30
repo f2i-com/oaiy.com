@@ -16,6 +16,13 @@ export const KEYS_LEAD =
 export const KEYS_STORAGE =
   'Your keys are stored encrypted on this device, and only this site can open them, which keeps them apart from the apps. That is not protection against someone who has this computer or a copy of this browser’s profile, or against a browser extension that can read this site: while a call is being made the key is in this site’s memory. For a copied profile, set a passphrase (coming).';
 
+/**
+ * What a provider can do with a key it is given, which no page here can stop. A reply is passed to the app that asked as the provider sent
+ * it (a stream, a model list fetched as any other path): the holder does not read it for a key.
+ */
+export const KEYS_PROVIDER =
+  'A provider you give a key to can see it, so give a key only to a provider you trust with it. This page cannot stop a provider from echoing the key back in a reply: what a provider answers goes to the app that asked, as the provider sent it.';
+
 /** What a provider's row says about its key. A key that is stored and cannot be opened says so, and what to do: it is not "stored". */
 export function keyText(summary: Pick<ProviderSummary, 'hasKey' | 'keyUnreadable'>): string {
   if (summary.keyUnreadable) return 'key unreadable: re-enter it';

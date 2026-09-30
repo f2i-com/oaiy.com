@@ -8,8 +8,14 @@
  * own pages, whose DOM an app cannot read, and may show provider text as inert text after the same scrub (see `providerText` in test.ts).
  *
  * What is passed on from a provider's answer, then: the status; a `content-type`; `retry-after` and rate-limit counters when they are
- * plain numbers; and the body of a SUCCESS, which is the provider's answer to the request and cannot be otherwise. The holder trusts the
- * provider not to reflect its `Authorization` header into a success body; nothing filters one that does.
+ * plain numbers; and the body of a SUCCESS, which is the provider's answer to the request and cannot be otherwise.
+ *
+ * WHAT THIS DOES NOT STOP, plainly: the body of a 2xx answer (a stream of a chat reply, and the body of ANY path fetched, a model list
+ * fetched as `/models` included) is passed to the app as the provider sent it, byte for byte, and nothing reads it for a key. A provider
+ * that echoes its `Authorization` header (or the key in any other form) into a success body hands the key to the app that asked. The holder
+ * trusts a provider with the key, as the person who typed it did: a provider is the one party that must see it. (The `models` operation
+ * does not pass raw bytes: it returns the ids and labels the holder read, and only those that are fit to show.) The Providers page says the
+ * first part of this to the person (`KEYS_PROVIDER` in words.ts), and web/tests/e2e/README.md says what the leak scans cannot show.
  */
 import { providerTypeOf } from '@oaiy/shared/providers/adapters';
 import { describeConnectionError, kindForStatus } from '@oaiy/shared/providers/errors';

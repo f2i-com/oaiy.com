@@ -45,6 +45,8 @@ describe('the Providers page', () => {
     assert.match(text, /a browser extension that can read this site/);
     assert.match(text, /the key is in this site’s memory/, 'the page says the key is in memory while a call is made');
     assert.match(text, /An app can ask this site to make a call with one of them, up to the limits below, but it is not given the key/);
+    assert.match(text, /A provider you give a key to can see it, so give a key only to a provider you trust with it/);
+    assert.match(text, /This page cannot stop a provider from echoing the key back in a reply/);
     assert.match(text, /Type a key only on this page, at providers\.web\.localhost:\d+/);
     // What it used to claim, and no longer does.
     assert.doesNotMatch(text, /never see them|anything that reads this page|sealed on this device/);

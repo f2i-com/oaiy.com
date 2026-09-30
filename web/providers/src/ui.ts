@@ -14,7 +14,7 @@ import { fill, h } from './dom';
 import type { Context } from './context';
 import { loadPresets, inputFromPreset, withOrigin, type Preset } from './presets';
 import { createTester } from './test';
-import { KEYS_LEAD, KEYS_STORAGE, keyText } from './words';
+import { KEYS_LEAD, KEYS_PROVIDER, KEYS_STORAGE, keyText } from './words';
 import type { ProviderRecord, ServerKind } from '@oaiy/shared/providers/types';
 import type { TestResult } from '@oaiy/shared/broker/protocol';
 
@@ -81,6 +81,7 @@ export function mountManage(root: HTMLElement, ctx: Context): void {
       noticeBox,
       ...problems,
       h('p', { class: 'fine', text: KEYS_STORAGE }),
+      h('p', { class: 'fine', text: KEYS_PROVIDER }),
     );
   }
 

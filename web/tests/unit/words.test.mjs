@@ -33,10 +33,33 @@ describe('what the Providers page says about keys', () => {
     for (const text of [KEYS_LEAD, KEYS_STORAGE]) for (const claim of OVERCLAIMS) assert.doesNotMatch(text, claim, `${claim} in: ${text}`);
   });
 
+  it('says plainly that a provider can see a key and can echo it back to the app that asked (the review\'s low 7)', () => {
+    const { KEYS_PROVIDER } = M.words;
+    assert.match(KEYS_PROVIDER, /A provider you give a key to can see it/);
+    assert.match(KEYS_PROVIDER, /give a key only to a provider you trust with it/);
+    assert.match(KEYS_PROVIDER, /cannot stop a provider from echoing the key back in a reply/);
+    assert.match(KEYS_PROVIDER, /goes to the app that asked, as the provider sent it/);
+    for (const claim of OVERCLAIMS) assert.doesNotMatch(KEYS_PROVIDER, claim, `${claim}`);
+  });
+
+  it('says it in the docs too: the holder\'s own comment, and the tests\' README with what the leak scans cannot find', () => {
+    const read = (...parts) => fs.readFileSync(path.join(ROOT, ...parts), 'utf8').replace(/\r\n/g, '\n');
+    const fixed = read('web', 'providers', 'src', 'fixed.ts');
+    assert.match(fixed, /WHAT THIS DOES NOT STOP, plainly: the body of a 2xx answer/);
+    assert.match(fixed, /hands the key to the app that asked/);
+    assert.match(fixed, /a model list\s+\* fetched as `\/models` included/);
+    for (const [file, text] of [['leakscan.mjs', read('web', 'tests', 'e2e', 'leakscan.mjs')], ['README.md', read('web', 'tests', 'e2e', 'README.md')]]) {
+      for (const gap of [/SHIFTED|\*\*shifted\*\*/, /SPLIT|\*\*split\*\*/, /Blob/, /CLOSURE|closure/, /worker/]) assert.match(text, gap, `${file} names ${gap}`);
+      assert.match(text, /not a proof|NOT a proof/i, `${file} says a scan that finds nothing is not a proof`);
+    }
+    assert.match(read('web', 'tests', 'e2e', 'README.md'), /a chat stream, or any path fetched, `\/models` included/);
+  });
+
   it('is what the page draws, and the page has no other words about it', () => {
     const source = fs.readFileSync(path.join(ROOT, 'web', 'providers', 'src', 'ui.ts'), 'utf8');
     assert.match(source, /text: KEYS_LEAD/);
     assert.match(source, /text: KEYS_STORAGE/);
+    assert.match(source, /text: KEYS_PROVIDER/);
     for (const claim of OVERCLAIMS) assert.doesNotMatch(source.replace(/\/\/.*$/gm, ''), claim, `${claim} in ui.ts`);
   });
 });

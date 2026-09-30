@@ -418,6 +418,20 @@ const MUTATIONS = [
     },
     caught: ['the list of apps refuses it', 'the assembler refuses it before it writes anything'],
   },
+  {
+    name: 'L7 the page does not say a provider can echo a key',
+    what: 'the Providers page no longer says that a provider can see a key and echo it back to the app that asked',
+    tests: ['tests/unit/words.test.mjs'],
+    files: { 'web/providers/src/ui.ts': [{ find: "      h('p', { class: 'fine', text: KEYS_PROVIDER }),\n", replace: '' }] },
+    caught: ['is what the page draws, and the page has no other words about it'],
+  },
+  {
+    name: 'L7 the docs do not say what the scans cannot find',
+    what: 'the scan header no longer lists the shifted-key gap',
+    tests: ['tests/unit/words.test.mjs'],
+    files: { 'web/tests/e2e/leakscan.mjs': [{ find: ' *   - SHIFTED: every character moved (a Caesar or ROT13 shift, each code plus one, XORed with a byte, any cipher);\n', replace: '' }] },
+    caught: ['says it in the docs too'],
+  },
   // Leaks the scans must find. They put the key where a scan of TEXT does not look (the reviewer's two: a Uint8Array, and reversed).
   {
     name: 'H1 leak: list returns the key as a Uint8Array',
