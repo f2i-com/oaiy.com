@@ -44,14 +44,15 @@ final class Gc
         $now = Clock::now();
         if (!$force) {
             $last = $this->db->metaInt('last_gc');
-            if ($last !== null && $now - $last < self::INTERVAL_S) {
+            // A last pass in the future is a clock that stepped back: it is not a pass a minute ago, and waiting for it would freeze GC.
+            if ($last !== null && $last <= $now && $now - $last < self::INTERVAL_S) {
                 return null;
             }
         }
         $due = $now - self::INTERVAL_S;
         $won = $force ? true : $this->db->write(function (Db $db) use ($now, $due): bool {
             $db->insertIgnore('meta', ['k' => 'last_gc', 'v' => 0, 's' => null]);
-            return $db->exec('UPDATE meta SET v = ? WHERE k = ? AND v <= ?', [$now, 'last_gc', $due]) === 1;
+            return $db->exec('UPDATE meta SET v = ? WHERE k = ? AND (v <= ? OR v > ?)', [$now, 'last_gc', $due, $now]) === 1;
         });
         if (!$won) {
             return null;
@@ -96,10 +97,11 @@ final class Gc
         }
         if ($left()) {
             $hourAgoMs = ($now - 3600) * 1000;
-            $out['limits'] = $this->db->write(fn(Db $db): int => $db->exec("DELETE FROM rl WHERE w < ? AND k NOT LIKE 's:%'", [$hourAgoMs]));
+            // Rows from more than an hour ahead are a clock that stepped back and forth: they would outlive their window for as long as the step.
+            $out['limits'] = $this->db->write(fn(Db $db): int => $db->exec("DELETE FROM rl WHERE (w < ? OR w > ?) AND k NOT LIKE 's:%'", [$hourAgoMs, ($now + 3600) * 1000]));
             // Status counters are kept for 25 hours.
             $this->db->write(fn(Db $db): int => $db->exec("DELETE FROM rl WHERE k LIKE 's:%' AND w < ?", [($now - 25 * 3600) * 1000]));
-            $out['locks'] = $this->db->write(fn(Db $db): int => $db->exec('DELETE FROM tokid_fail WHERE first_at < ? AND (locked_until IS NULL OR locked_until < ?)', [$now - 3600, $now]));
+            $out['locks'] = $this->db->write(fn(Db $db): int => $db->exec('DELETE FROM tokid_fail WHERE (first_at < ? AND (locked_until IS NULL OR locked_until < ?)) OR first_at > ?', [$now - 3600, $now, $now + 3600]));
         }
         // 4. Signal files nobody needs any more.
         if ($left()) {

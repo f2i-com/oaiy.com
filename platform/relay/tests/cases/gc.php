@@ -309,6 +309,84 @@ test('4.18.6 without a finish function GC also runs after about one request in g
     eq(0, gc_meta($off, 'last_gc'));
 });
 
+test('4.18.6 a clock that steps forward a month or back an hour does not freeze GC: a last pass in the future counts as due', function () {
+    $r = Relay::make();
+    Tmp::setClock(Relay::T0 + 30 * 86400);
+    ok($r->ctx()->gc->maybeRun() !== null, 'the first pass');
+    eq(Relay::T0 + 30 * 86400, gc_meta($r, 'last_gc'));
+    Tmp::setClock(Relay::T0 + 100); // the clock is corrected
+    ok($r->ctx()->gc->maybeRun() !== null, 'a pass claimed in the future is not a pass a minute ago');
+    eq(Relay::T0 + 100, gc_meta($r, 'last_gc'));
+    Tmp::setClock(Relay::T0 + 100 + 3600);
+    ok($r->ctx()->gc->maybeRun() !== null);
+    Tmp::setClock(Relay::T0 + 100); // an hour back
+    ok($r->ctx()->gc->maybeRun() !== null, 'an hour back');
+    // The ordinary minute is still kept.
+    Tmp::setClock(Relay::T0 + 130);
+    eq(null, $r->ctx()->gc->maybeRun());
+    Tmp::setClock(Relay::T0 + 161);
+    ok($r->ctx()->gc->maybeRun() !== null);
+});
+
+test('4.7.1 a clock that steps back does not freeze a limit: a window, a bucket or a lock stamped in the future is over', function () {
+    $r = Relay::make();
+    $l = $r->ctx()->limiter;
+    Tmp::setClock(Relay::T0 + 30 * 86400);
+    for ($i = 0; $i < 3; $i++) {
+        eq(null, $l->hit('step', 3, 60));
+    }
+    ok($l->hit('step', 3, 60) !== null, 'the window is full');
+    for ($i = 0; $i < 5; $i++) {
+        eq(null, $l->take('bucket', 1, 5, 1));
+    }
+    ok($l->take('bucket', 1, 5, 1) !== null, 'the bucket is empty');
+    Tmp::setClock(Relay::T0);
+    eq(0, $l->peek('step', 60), 'a window that starts in the future counts nothing');
+    eq(null, $l->hit('step', 3, 60), 'a new window opens');
+    for ($i = 0; $i < 5; $i++) {
+        eq(null, $l->take('bucket', 1, 5, 1), "a full bucket again: take $i");
+    }
+    // A token lock made a day ahead is not a lock now; one that runs a few minutes is.
+    $d = $r->desktop();
+    $tid = explode('.', $d->token)[1];
+    $db = $r->ctx()->db;
+    $db->exec('INSERT INTO tokid_fail (id, addr, fails, first_at, locked_until) VALUES (?, ?, 20, ?, ?)', [$tid, '127.0.0.1', Relay::T0 + 86400, Relay::T0 + 86400 + 900]);
+    eq(200, $r->call($d, 'GET', '/v1/presence')['status'], 'a lock from a clock that was a day ahead does not lock now');
+    // A wrong secret now starts a fresh count instead of adding to one that began a day from now.
+    eq(401, $r->call(auth_wrong_secret($d), 'GET', '/v1/presence')['status']);
+    eq([1, Relay::T0, null], array_values(array_map(fn($v) => $v === null ? null : (int)$v, $db->one('SELECT fails, first_at, locked_until FROM tokid_fail WHERE id = ?', [$tid]) ?? [])), 'the count started over');
+    $db->exec('DELETE FROM tokid_fail');
+    $db->exec('INSERT INTO tokid_fail (id, addr, fails, first_at, locked_until) VALUES (?, ?, 20, ?, ?)', [$tid, '127.0.0.1', Relay::T0 - 10, Relay::T0 + 600]);
+    eq(401, $r->call($d, 'GET', '/v1/presence')['status'], 'a real lock still refuses');
+});
+
+test('4.18.6 GC removes limiter rows and lock rows stamped more than an hour ahead, which a clock that stepped back leaves behind', function () {
+    $r = Relay::make();
+    $db = $r->ctx()->db;
+    $db->exec('INSERT INTO rl (k, w, n) VALUES (?, ?, 3)', ['w:future', (Relay::T0 + 40 * 86400) * 1000]);
+    $db->exec('INSERT INTO rl (k, w, n) VALUES (?, ?, 3)', ['w:now', (Relay::T0 - 10) * 1000]);
+    $db->exec('INSERT INTO tokid_fail (id, addr, fails, first_at, locked_until) VALUES (?, ?, 20, ?, ?)', ['tfuture', 'a', Relay::T0 + 40 * 86400, Relay::T0 + 40 * 86400 + 900]);
+    $db->exec('INSERT INTO tokid_fail (id, addr, fails, first_at, locked_until) VALUES (?, ?, 4, ?, NULL)', ['tnow', 'a', Relay::T0 - 10]);
+    $r->ctx()->gc->maybeRun(null, true);
+    $db = $r->ctx()->db;
+    eq(['w:now'], array_column($db->all("SELECT k FROM rl WHERE k LIKE 'w:%' ORDER BY k"), 'k'));
+    eq(['tnow'], array_column($db->all('SELECT id FROM tokid_fail ORDER BY id'), 'id'));
+});
+
+test('4.18.6 GC removes signal files stamped more than an hour ahead (a clock that stepped back) and keeps a fresh one', function () {
+    $r = Relay::make();
+    $sig = new Signals($r->data);
+    $sig->writeGen('future-principal', 'tok');
+    $sig->markRevoked('dev-future');
+    $sig->writeGen('fresh-principal', 'tok');
+    touch($r->data . '/holds/gen/' . Signals::hash('future-principal'), time() + 7200);
+    touch($r->data . '/holds/rev/' . Signals::hash('dev-future'), time() + 7200);
+    $s = $r->ctx()->gc->maybeRun();
+    eq(2, $s['signals']);
+    ok(!is_file($r->data . '/holds/gen/' . Signals::hash('future-principal')) && !is_file($r->data . '/holds/rev/' . Signals::hash('dev-future')));
+    ok(is_file($r->data . '/holds/gen/' . Signals::hash('fresh-principal')));
+});
+
 test('4.18.6 GC is idempotent and harmless on an empty relay, and a failed step does not lose the claim', function () {
     $r = Relay::make();
     $s1 = $r->ctx()->gc->maybeRun(null, true);

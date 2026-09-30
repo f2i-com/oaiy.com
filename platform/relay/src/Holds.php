@@ -116,7 +116,8 @@ final class Holds
                     if ($mt === false) {
                         continue;
                     }
-                    if ($mt + (int)$m[1] + 5 < $now) {
+                    // Stale: older than its cap plus five seconds, or stamped more than a minute ahead (a clock that stepped back).
+                    if ($mt + (int)$m[1] + 5 < $now || $mt > $now + 60) {
                         @unlink($f);
                         continue;
                     }

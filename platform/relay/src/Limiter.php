@@ -31,7 +31,8 @@ final class Limiter
         $winMs = $windowSeconds * 1000;
         $now = Clock::nowMs();
         $row = $this->db->one('SELECT w, n FROM rl WHERE k = ?', [$k]);
-        if ($row !== null && $now - $row['w'] < $winMs && $row['n'] >= $limit) {
+        // A window that starts in the future is a clock that stepped back: it is over, not a window with a month to run.
+        if ($row !== null && $row['w'] <= $now && $now - $row['w'] < $winMs && $row['n'] >= $limit) {
             return max(1, (int)ceil(($row['w'] + $winMs - $now) / 1000));
         }
         return $this->db->write(function (Db $db) use ($k, $limit, $winMs, $now): ?int {
@@ -40,7 +41,7 @@ final class Limiter
             if ($row === null) {
                 return null; // unreachable: the row was just ensured
             }
-            if ($now - $row['w'] >= $winMs) {
+            if ($row['w'] > $now || $now - $row['w'] >= $winMs) {
                 $db->exec('UPDATE rl SET w = ?, n = 1 WHERE k = ?', [$now, $k]);
                 return null;
             }
@@ -56,7 +57,7 @@ final class Limiter
     public function peek(string $key, int $windowSeconds): int
     {
         $row = $this->db->one('SELECT w, n FROM rl WHERE k = ?', ['w:' . $key]);
-        if ($row === null || Clock::nowMs() - $row['w'] >= $windowSeconds * 1000) {
+        if ($row === null || $row['w'] > Clock::nowMs() || Clock::nowMs() - $row['w'] >= $windowSeconds * 1000) {
             return 0;
         }
         return $row['n'];
@@ -91,8 +92,8 @@ final class Limiter
     private static function refilled(?array $row, int $now, int $capacity, int $refillPerSec): int
     {
         $max = $capacity * 1000;
-        if ($row === null) {
-            return $max;
+        if ($row === null || $row['w'] > $now) {
+            return $max; // no bucket yet, or one stamped in the future by a clock that stepped back: start full, never frozen
         }
         $elapsed = max(0, $now - $row['w']);
         return (int)min($max, $row['n'] + $elapsed * $refillPerSec);

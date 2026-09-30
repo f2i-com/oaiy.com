@@ -89,7 +89,7 @@ final class Auth
             if ($row === null) {
                 return;
             }
-            if ($now - $row['first_at'] >= 3600) {
+            if ($row['first_at'] > $now || $now - $row['first_at'] >= 3600) { // a first failure in the future is a clock that stepped back
                 $db->exec('UPDATE tokid_fail SET fails = 1, first_at = ?, locked_until = NULL WHERE id = ? AND addr = ?', [$now, $tokenId, $addr]);
                 return;
             }
@@ -102,7 +102,9 @@ final class Auth
     private function isLocked(string $tokenId, string $addr): bool
     {
         $until = $this->db->val('SELECT locked_until FROM tokid_fail WHERE id = ? AND addr = ?', [$tokenId, $addr]);
-        return $until !== null && (int)$until > Clock::now();
+        $now = Clock::now();
+        // A lock is at most fifteen minutes: one that runs further than that ahead was made by a clock that stepped back.
+        return $until !== null && (int)$until > $now && (int)$until <= $now + 900;
     }
 
     /** Authenticate a device token from the request. Throws the uniform 401 (or 401 revoked, or 429 for the address). */

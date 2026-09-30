@@ -160,6 +160,15 @@ test('4.7.2 rule 1: a marker older than its cap plus five seconds is ignored and
     eq(2, $h->liveCount());
 });
 
+test('4.7.2 rule 1: a marker stamped more than a minute ahead (a clock that stepped back) is ignored and removed, and a few seconds of skew is not', function () {
+    $r = Relay::make();
+    $h = $r->ctx()->holds;
+    $ahead = holds_fake($r, 'poll', 'far-ahead', 20, time() + 7200);
+    $skew = holds_fake($r, 'poll', 'skewed', 20, time() + 20);
+    eq(1, $h->liveCount(), 'only the skewed one counts');
+    ok(!is_file($ahead) && is_file($skew));
+});
+
 test('4.7.2 rule 5: at most four waiting lookups per device; the fifth is 429 rate_limited with Retry-After 1', function () {
     $r = Relay::make();
     $h = $r->ctx()->holds;

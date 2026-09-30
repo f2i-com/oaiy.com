@@ -152,7 +152,7 @@ final class Signals
             $excess = max(0, count($files) - $cap);
             foreach ($files as $f) {
                 $mt = @filemtime($f);
-                if ($mt !== false && ($mt < $cutoff || $excess > 0)) {
+                if ($mt !== false && ($mt < $cutoff || $mt > time() + 3600 || $excess > 0)) {
                     if (@unlink($f)) {
                         $removed++;
                         $excess--;
