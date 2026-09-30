@@ -744,9 +744,23 @@ fn a_console_for_a_folder_that_is_not_the_servers_makes_nothing_and_init_makes_t
     );
     let pw = password_file(&scratch, PASSWORD);
     std::fs::create_dir_all(scratch.data()).unwrap();
-    let init = console(
+    // Without --new-folder it refuses: no server has made this folder.
+    let refused = console(
         &scratch,
         &["auth", "init", "--password-file", pw.to_str().unwrap()],
+    );
+    assert_eq!(refused.code, 1, "{} / {}", refused.out, refused.err);
+    assert!(refused.err.contains("--new-folder"), "{}", refused.err);
+    assert!(!scratch.auth().exists());
+    let init = console(
+        &scratch,
+        &[
+            "auth",
+            "init",
+            "--new-folder",
+            "--password-file",
+            pw.to_str().unwrap(),
+        ],
     );
     assert_eq!(init.code, 0, "{} / {}", init.out, init.err);
     assert!(scratch.auth().join("owner.json").exists());

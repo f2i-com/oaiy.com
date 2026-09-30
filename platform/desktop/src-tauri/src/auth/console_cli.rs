@@ -83,6 +83,9 @@ pub enum Command {
         generate: bool,
         password_file: Option<PathBuf>,
         force: bool,
+        /// Make the auth folder (and the data folder) if there is none: without it init only works in a folder
+        /// a server has already made its own.
+        new_folder: bool,
     },
     SetupCode,
     ResetPassword {
@@ -129,7 +132,7 @@ impl Command {
 }
 
 pub const USAGE: &str = "usage:
-  oaiy-server auth init [--generate] [--password-file PATH] [--force]
+  oaiy-server auth init [--generate] [--password-file PATH] [--force] [--new-folder]
   oaiy-server auth setup-code
   oaiy-server auth reset-password [--generate] [--password-file PATH]
   oaiy-server auth session-link
@@ -193,6 +196,7 @@ pub fn parse(args: &[String]) -> Result<Command, String> {
                 "init" => Command::Init {
                     generate: f.has("--generate"),
                     force: f.has("--force"),
+                    new_folder: f.has("--new-folder"),
                     password_file: f.value("--password-file")?.map(PathBuf::from),
                 },
                 "setup-code" => Command::SetupCode,
@@ -484,6 +488,23 @@ fn auth_command(command: Command, io: &mut Io<'_>) -> i32 {
         return fail(io, why);
     }
     let creating = matches!(command, Command::Init { .. });
+    // init makes nothing that a running server has not made: a folder that is not there is the sign of a console
+    // that is not looking at the server's data (the unit's environment differs from this one's), and an owner made
+    // there would be reported as a success and be no use. A new install says so with --new-folder.
+    if let Command::Init {
+        new_folder: false, ..
+    } = &command
+    {
+        if !auth_dir.is_dir() {
+            return fail(
+                io,
+                format!(
+                    "{} does not exist: a server that has run has made it, so this is not the data folder of a server that runs (a service reads OAIY_DATA_DIR from its environment file, /etc/oaiy/oaiy.env, and oaiyctl reads the same one). To make a data folder for a server that has not run yet, add --new-folder",
+                    auth_dir.display()
+                ),
+            );
+        }
+    }
     if !creating && !data.is_dir() {
         return fail(
             io,
@@ -656,7 +677,7 @@ fn stopped(
                 Err(e) => fail(io, e.to_string()),
             }
         }
-        Command::Init { generate, password_file, force } => {
+        Command::Init { generate, password_file, force, .. } => {
             if has_owner && !*force {
                 return fail(io, "an owner login already exists; `--force` makes a new password (revoking every session and device)");
             }
@@ -912,7 +933,7 @@ fn running(command: Command, client: &Client, auth_dir: &Path, io: &mut Io<'_>) 
             "/api/auth/console/sessions/revoke-all",
             Some(json!({ "devices": devices })),
         ),
-        Command::Init { generate, password_file, force } => {
+        Command::Init { generate, password_file, force, .. } => {
             // `init` on a running server asks its status first: it refuses when an owner exists unless `--force`.
             match client.call(Method::GET, "/api/auth/console/status", None) {
                 Ok((200, s)) if s["loginConfigured"] == true && !*force => {
@@ -1190,18 +1211,20 @@ mod tests {
             Command::Init {
                 generate: false,
                 password_file: None,
-                force: false
+                force: false,
+                new_folder: false
             }
         );
         assert_eq!(
             parse(&args(
-                "auth init --generate --force --password-file /tmp/pw"
+                "auth init --generate --force --new-folder --password-file /tmp/pw"
             ))
             .unwrap(),
             Command::Init {
                 generate: true,
                 password_file: Some("/tmp/pw".into()),
-                force: true
+                force: true,
+                new_folder: true
             }
         );
         assert_eq!(parse(&args("auth setup-code")).unwrap(), Command::SetupCode);
@@ -1593,7 +1616,10 @@ mod tests {
         std::fs::write(&pwfile, format!("{PASSWORD}\n")).unwrap();
         let (code, out, err) = run_in(
             &dir,
-            &format!("auth init --password-file {}", pwfile.display()),
+            &format!(
+                "auth init --new-folder --password-file {}",
+                pwfile.display()
+            ),
             &[],
             None,
         );
@@ -1606,7 +1632,10 @@ mod tests {
         // A second init is refused, and `--force` makes a new password.
         let (code, _, err) = run_in(
             &dir,
-            &format!("auth init --password-file {}", pwfile.display()),
+            &format!(
+                "auth init --new-folder --password-file {}",
+                pwfile.display()
+            ),
             &[],
             None,
         );
@@ -1630,6 +1659,57 @@ mod tests {
     }
 
     #[test]
+    fn init_makes_no_folder_that_a_server_has_not_made_unless_it_is_told_to() {
+        // A console that looks at the wrong folder (its environment is not the service's) must not make an owner
+        // there and call it a success: with no auth folder, `init` refuses and says where the setting is.
+        for (tag, make_data) in [("cli-init-nodata", false), ("cli-init-nodir", true)] {
+            let dir = TempDir::new(tag);
+            let pwfile =
+                std::env::temp_dir().join(format!("oaiy-init-pw-{tag}-{}", std::process::id()));
+            std::fs::write(&pwfile, format!("{PASSWORD}\n")).unwrap();
+            if make_data {
+                std::fs::create_dir_all(&dir.0).unwrap();
+            } else {
+                let _ = std::fs::remove_dir_all(&dir.0);
+            }
+            let (code, out, err) = run_in(
+                &dir,
+                &format!("auth init --password-file {}", pwfile.display()),
+                &[],
+                None,
+            );
+            assert_eq!(code, EXIT_FAILED, "{tag}: {out} / {err}");
+            assert!(
+                err.contains("--new-folder") && err.contains("OAIY_DATA_DIR"),
+                "{tag}: {err}"
+            );
+            assert!(!dir.0.join("auth").exists(), "{tag}: a folder was made");
+            // Told to, it makes the folder and the owner.
+            let (code, out, err) = run_in(
+                &dir,
+                &format!(
+                    "auth init --new-folder --password-file {}",
+                    pwfile.display()
+                ),
+                &[],
+                None,
+            );
+            assert_eq!(code, EXIT_OK, "{tag}: {out} / {err}");
+            assert!(dir.0.join("auth").join("owner.json").exists(), "{tag}");
+            // A folder that a server has made needs no flag: `--force` is the only thing a second one needs.
+            let (code, _, err) = run_in(
+                &dir,
+                &format!("auth init --password-file {}", pwfile.display()),
+                &[],
+                None,
+            );
+            assert_eq!(code, EXIT_FAILED, "{tag}: {err}");
+            assert!(err.contains("already exists"), "{tag}: {err}");
+            let _ = std::fs::remove_file(&pwfile);
+        }
+    }
+
+    #[test]
     fn a_weak_password_from_a_file_or_the_terminal_is_refused_with_its_reasons() {
         let dir = TempDir::new("cli-weak");
         std::fs::create_dir_all(&dir.0).unwrap();
@@ -1637,7 +1717,10 @@ mod tests {
         std::fs::write(&pwfile, "short\n").unwrap();
         let (code, _, err) = run_in(
             &dir,
-            &format!("auth init --password-file {}", pwfile.display()),
+            &format!(
+                "auth init --new-folder --password-file {}",
+                pwfile.display()
+            ),
             &[],
             None,
         );
@@ -1647,7 +1730,7 @@ mod tests {
         // The terminal: two that do not match, then two weak, then a good pair.
         let (code, out, _) = run_in(
             &dir,
-            "auth init",
+            "auth init --new-folder",
             &[
                 "one one one one one",
                 "two",
@@ -1666,7 +1749,12 @@ mod tests {
         // Three failures in a row: no password is set.
         let dir2 = TempDir::new("cli-weak2");
         std::fs::create_dir_all(&dir2.0).unwrap();
-        let (code, _, err) = run_in(&dir2, "auth init", &["a", "b", "a", "b", "a", "b"], None);
+        let (code, _, err) = run_in(
+            &dir2,
+            "auth init --new-folder",
+            &["a", "b", "a", "b", "a", "b"],
+            None,
+        );
         assert_eq!(code, EXIT_FAILED);
         assert!(err.contains("no password was set"), "{err}");
     }
@@ -1675,7 +1763,7 @@ mod tests {
     fn a_generated_password_is_printed_once_and_is_the_password() {
         let dir = TempDir::new("cli-generate");
         std::fs::create_dir_all(&dir.0).unwrap();
-        let (code, out, _) = run_in(&dir, "auth init --generate", &[], None);
+        let (code, out, _) = run_in(&dir, "auth init --new-folder --generate", &[], None);
         assert_eq!(code, EXIT_OK, "{out}");
         let phrase = out
             .lines()
@@ -1724,7 +1812,7 @@ mod tests {
         assert_eq!(
             run_in(
                 &dir,
-                &format!("auth init --password-file {}", pw.display()),
+                &format!("auth init --new-folder --password-file {}", pw.display()),
                 &[],
                 None
             )
@@ -1745,7 +1833,7 @@ mod tests {
         assert_eq!(
             run_in(
                 &dir,
-                &format!("auth init --password-file {}", pw.display()),
+                &format!("auth init --new-folder --password-file {}", pw.display()),
                 &[],
                 None
             )
