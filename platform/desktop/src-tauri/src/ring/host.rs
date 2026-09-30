@@ -54,8 +54,11 @@ pub struct CallInfo {
     /// The number the phone said the call came from ("" when hidden).
     pub from: String,
     pub name: String,
-    /// What the caller said, oldest first.
+    /// What the caller said, oldest first (not what an earlier request has used up).
     pub turns: Vec<String>,
+    /// How many turns the caller had said on the call in all when this was read: the request judged on `turns` uses up that many when a ring
+    /// opens on it, and no more (what the caller said while it was being planned and sent is the next request's).
+    pub total: u64,
 }
 
 /// Where the ring learns of a call: the voice hub.
@@ -68,11 +71,17 @@ pub trait CallSource: Send + Sync {
     /// `transfer_cancel` on its stream, waits for the phone's answer and acts on it. What came of the asking is the answer: the frame
     /// is on the wire, or is waiting for the phone to name the request to the call, or there was nothing to withdraw, or no session.
     fn cancel_transfer(&self, call: &str, request: &str, reason: crate::voice::transfer::CancelReason) -> tokio::sync::oneshot::Receiver<Withdrawal>;
-    /// A ring opened for `call` on what the caller had said as `facts` gave it: those words are used up. An ask counts for ONE request, so the
-    /// next request is judged on what the caller says after it, never on an ask that has been acted on (a caller who was rung, and who then
-    /// says "no, just take a message", or who is handed back by the owner and says "thanks, that's all sorted", has not asked again). A
-    /// request that was refused, or that the phone refused before it rang, has acted on nothing: its ask stands.
-    fn consume_turns(&self, _call: &str) {}
+    /// A ring opened for `call` on the first `up_to` turns the caller had said (as `facts` gave them: [`CallInfo::total`]): those words are used
+    /// up. An ask counts for ONE request, so the next request is judged on what the caller says after it, never on an ask that has been acted on
+    /// (a caller who was rung, and who then says "no, just take a message", or who is handed back by the owner and says "thanks, that's all
+    /// sorted", has not asked again). What they said after it was read, while the request was planned and sent, is not spent by it. A request
+    /// that was refused, or that the phone refused before it rang, has acted on nothing: its ask stands.
+    fn consume_turns(&self, _call: &str, _up_to: u64) {}
+    /// Which beginning of the call this is: it changes each time the call begins (its session made anew, or handed back by the owner), so a
+    /// request planned for one beginning is not opened on another.
+    fn generation(&self, _call: &str) -> u64 {
+        0
+    }
     /// The call has ended (its record is kept a while after: see [`CallSource::facts`]). A request on a call that is over rings nobody: the
     /// caller who hung up while the request was being planned is not one the owner is rung for.
     fn is_over(&self, _call: &str) -> bool {
@@ -128,6 +137,17 @@ struct Grant {
     reason_allowed: bool,
     at: Instant,
     claimed: bool,
+    /// How many of the caller's turns the request was judged on: what a ring opened on it uses up.
+    judged: u64,
+    /// Which beginning of the call it was judged for (see [`CallSource::generation`]).
+    generation: u64,
+}
+
+/// A plan taken for a ring that opens on it.
+pub(super) struct Taken {
+    pub plan: RingPlan,
+    /// See [`Grant::judged`].
+    pub judged: u64,
 }
 
 /// What a request to reach the owner came to.
@@ -242,10 +262,22 @@ impl Ring {
     /// A plan this desktop allowed and the plugin asked for, taken: what was decided for the call, moved out (not copied) and used up. One plan
     /// opens one ring, for the request that opened first; a second request on it, or the same one again, finds nothing (the same one again
     /// is answered before it gets here: see [`Ring::opened`]). Once a ring has opened for it the try is a ring's, and is never given back.
-    pub(super) fn take_plan(&self, plan_id: &str, call: &str) -> Option<RingPlan> {
+    pub(super) fn take_plan(&self, plan_id: &str, call: &str) -> Option<Taken> {
         let mut grants = self.grants.lock().unwrap_or_else(|e| e.into_inner());
         grants.get(plan_id).filter(|g| g.claimed && g.call_id == call && g.at.elapsed() < PLAN_TTL * 4)?;
-        grants.remove(plan_id).map(|g| g.plan)
+        grants.remove(plan_id).map(|g| Taken { plan: g.plan, judged: g.judged })
+    }
+
+    /// Whether the plan `plan_id` was judged for the call as it is now: not for an earlier beginning of it (its session made anew, or handed back
+    /// by the owner, since). A plan that is not there is not current.
+    pub(super) fn plan_is_current(&self, plan_id: &str, call: &str) -> bool {
+        let generation = self.call_generation(call);
+        self.grants.lock().unwrap_or_else(|e| e.into_inner()).get(plan_id).is_some_and(|g| g.call_id == call && g.generation == generation)
+    }
+
+    /// Which beginning of the call this is (see [`CallSource::generation`]).
+    fn call_generation(&self, call: &str) -> u64 {
+        get(&self.calls).map_or(0, |c| c.generation(call))
     }
 
     /// Whether the call is over (see [`CallSource::is_over`]).
@@ -303,10 +335,10 @@ impl Ring {
         get(&self.calls).and_then(|c| c.facts(call))
     }
 
-    /// The words a ring for `call` was made on are used up (see [`CallSource::consume_turns`]).
-    pub(super) fn use_up_asked_turns(&self, call: &str) {
+    /// The first `up_to` words a ring for `call` was made on are used up (see [`CallSource::consume_turns`]).
+    pub(super) fn use_up_asked_turns(&self, call: &str, up_to: u64) {
         if let Some(calls) = get(&self.calls) {
-            calls.consume_turns(call);
+            calls.consume_turns(call, up_to);
         }
     }
 
@@ -410,12 +442,13 @@ impl Ring {
         }
         let reason_allowed = plan.decision == Decision::Ring && vouches_for(reason, settings, &info.turns);
         let id = new_plan_id();
+        let generation = self.call_generation(call);
         if plan.decision == Decision::Ring {
             let now_unix = self.clock().unix();
             self.attempts.lock().unwrap_or_else(|e| e.into_inner()).record(call, &caller_key(&info.from), now_unix);
             let mut grants = self.grants.lock().unwrap_or_else(|e| e.into_inner());
             grants.retain(|_, g| g.at.elapsed() < PLAN_TTL);
-            grants.insert(id.clone(), Grant { plan_id: id.clone(), call_id: call.to_string(), plan: plan.clone(), reason_allowed, at: Instant::now(), claimed: false });
+            grants.insert(id.clone(), Grant { plan_id: id.clone(), call_id: call.to_string(), plan: plan.clone(), reason_allowed, at: Instant::now(), claimed: false, judged: info.total, generation });
         }
         Authorised { plan, plan_id: id, reason_allowed, caller_number: info.from, caller_name: info.name }
     }
@@ -431,6 +464,17 @@ impl Ring {
             return Authorised { plan: unknown_call(&settings), plan_id: new_plan_id(), reason_allowed: false, caller_number: String::new(), caller_name: String::new() };
         }
         let info = self.call_info(call).unwrap_or(fallback);
+        // A plan this desktop allowed for an earlier beginning of the call (its session was made anew, or handed back, since) is not the one the
+        // plugin asks about: it is let go, its try is given back, and the request is judged afresh on the call as it is.
+        let generation = self.call_generation(call);
+        let stale = {
+            let mut grants = self.grants.lock().unwrap_or_else(|e| e.into_inner());
+            let stale: Vec<String> = grants.iter().filter(|(_, g)| g.call_id == call && !g.claimed && g.generation != generation).map(|(id, _)| id.clone()).collect();
+            stale.into_iter().filter(|id| grants.remove(id).is_some()).count()
+        };
+        for _ in 0..stale {
+            self.attempts.lock().unwrap_or_else(|e| e.into_inner()).forget_last(call);
+        }
         {
             let mut grants = self.grants.lock().unwrap_or_else(|e| e.into_inner());
             grants.retain(|_, g| g.at.elapsed() < PLAN_TTL);

@@ -1114,6 +1114,8 @@ async fn the_ask_that_began_a_ring_is_not_an_ask_for_the_next_request_after_the_
     let mut f = flow(owner_settings(true)).await;
     f.caller_says(ASKED);
     f.ring_through("assist_1", 30).await;
+    // The caller says it again while the owner is rung: after the request was judged, so the ring that opened has not used it up.
+    f.caller_says("Yes please, can I speak to the owner?");
     f.a_device_takes_the_call("assist_1");
     f.aokie.event("call.transfer", secs(3)).await.expect("accepted");
     owner_takes_the_session(&f);
@@ -1135,6 +1137,34 @@ async fn the_ask_that_began_a_ring_is_not_an_ask_for_the_next_request_after_the_
     let frame = back.text("formlogic.realtime.tool_call", secs(3)).await.expect("the second request reached the phone");
     assert_eq!(frame["name"], transfer::TOOL);
     drop(asked);
+}
+
+/// The ask stands when nothing has acted on it: a request the phone refused before it rang, and then the call's session made anew (the phone's
+/// stream dropped and came back, with no owner between), is tried again on the same ask without the caller having to say it again. Only the owner
+/// handing the caller back spends what was said (the test before it).
+#[tokio::test]
+async fn a_request_the_phone_refused_is_tried_again_on_the_same_ask_after_the_calls_session_is_made_anew() {
+    let mut f = flow(owner_settings(true)).await;
+    f.caller_says(ASKED);
+    let asked = asking(&f.aokie, transfer::TOOL, json!({"reason": "caller_asked"}));
+    let call = f.aokie.text("formlogic.realtime.tool_call", secs(3)).await.expect("it reached the phone");
+    f.aokie.send(json!({"type": "formlogic.realtime.tool_result", "callId": f.aokie.call, "generation": 1, "toolCallId": call["toolCallId"], "ok": false,
+        "output": {"status": "refused", "reason": "consent", "instruction": "Passing the call to the owner is not permitted right now. Offer to take a message."}}));
+    assert_eq!(answer_of(asked).await.unwrap()["output"]["reason"], "consent");
+    // The call's session is made anew, with no owner between: the old one ends (not a hand-off) and a new start for the same call comes, with no `resume`.
+    f.aokie.send(json!({"type": "formlogic.realtime.stop", "callId": f.aokie.call, "generation": 1, "reason": "replaced"}));
+    f.aokie.event("call.ended", secs(3)).await.expect("the old session ended");
+    assert!(f.aokie.hub.call_over(&f.aokie.call));
+    let mut again = f.aokie.restart(json!({"allowTransfer": true, "generation": 2, "greeting": "Sorry about that."})).await;
+    again.begin(json!({}));
+    again.event("call.started", secs(3)).await.expect("the call began again");
+    assert!(!f.aokie.hub.call_over(&again.call), "it is not over: it began again");
+    assert_eq!(f.aokie.hub.turns_said(&again.call), 1, "the caller has said nothing more");
+    // The ask stands: the retry is judged on it, and reaches the phone.
+    let retried = asking(&again, transfer::TOOL, json!({"reason": "caller_asked"}));
+    let frame = again.text("formlogic.realtime.tool_call", secs(3)).await.expect("the retry reached the phone, on the same ask");
+    assert_eq!(frame["name"], transfer::TOOL);
+    drop(retried);
 }
 
 /// The other scenario: a ring the owner declined, a minute and a bit on, and the caller says only "No, just take a message please." Nothing

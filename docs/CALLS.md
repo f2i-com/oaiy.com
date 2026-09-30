@@ -261,10 +261,15 @@ agent : "I'll try to reach them, please stay with me."  (it is trying: it does n
   finished ("Yeah, sure." after "Is that all right?") is a turn like any other and keeps its place among the three. The phone
   plugin cannot hear when a word was said, so it drops the acknowledgements by their words alone (its `backchannel` rule in
   the shared caller-asked fixture); that can only reach further back, so its check stays a floor under this one. **An ask counts for
-  one request.** Once a ring opens from it, what the caller had said is used up, and a call that begins again (the owner handing the
-  caller back) starts with nothing said: the next request is judged on what the caller says after that, so "Thanks, that is all
-  sorted now" or "No, just take a message please" after a ring, however much later, is never taken for asking again. A request that was
-  refused, or that the phone refused before anything rang, acted on nothing, and its ask stands.
+  one request.** Once a ring opens from it, what the caller had said is used up, as far as the request was judged on and no
+  further (what they said while the request was being planned and sent is the next request's own), and when the owner hands
+  the caller back to the receptionist (`resume.afterHandoff`, or this desktop's own record of the handoff) every turn so far is
+  used up: the next request is judged on what the caller says after that, so "Thanks, that is all sorted now" or "No, just take a
+  message please" after a ring, however much later, is never taken for asking again. A request that was refused, or that the phone
+  refused before anything rang, acted on nothing, and its ask stands, and so does it when the call's session is made anew for
+  the same call with no owner between (the phone's stream dropped and came back): the retry is judged on the same ask. A plan is
+  for one beginning of the call: if the call began again since it was allowed, the request is refused as a call that changed
+  (`call_changed`, the try given back), and one plan opens one ring.
 - **Take a message.** `take_message` goes to `POST /api/voice/calls/{id}/message`, on the call's own
   route: the number comes from this desktop's record of the call, and the message is refused when the
   owner has not allowed messages, or a limit is reached. The receptionist says the owner "will be

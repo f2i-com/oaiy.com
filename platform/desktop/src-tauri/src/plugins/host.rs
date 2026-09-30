@@ -1658,7 +1658,7 @@ impl PluginHost {
                     .and_then(Value::as_array)
                     .map(|a| a.iter().filter_map(Value::as_str).map(str::to_string).collect())
                     .unwrap_or_default();
-                let fallback = crate::ring::CallInfo { from: text("callerNumber"), name: String::new(), turns: crate::ring::phrases::recent(&turns) };
+                let fallback = crate::ring::CallInfo { from: text("callerNumber"), name: String::new(), turns: crate::ring::phrases::recent(&turns), ..Default::default() };
                 Ok(crate::ring::host::plan_result(&ring.plan_for_plugin(&call, reason, fallback)))
             }
             _ => {
@@ -2589,9 +2589,9 @@ mod tests {
         fn facts(&self, call: &str) -> Option<crate::ring::CallInfo> {
             let asked = vec!["Can I speak to the owner please".to_string()];
             match call {
-                "call_1" => Some(crate::ring::CallInfo { from: "+61491570006".into(), name: "Alex".into(), turns: asked }),
-                "call_2" => Some(crate::ring::CallInfo { from: "+61491570156".into(), name: "Sam".into(), turns: asked }),
-                "call_3" => Some(crate::ring::CallInfo { from: "+61491570157".into(), name: "Kim".into(), turns: vec!["There is a gas leak at the shop".to_string()] }),
+                "call_1" => Some(crate::ring::CallInfo { from: "+61491570006".into(), name: "Alex".into(), turns: asked, ..Default::default() }),
+                "call_2" => Some(crate::ring::CallInfo { from: "+61491570156".into(), name: "Sam".into(), turns: asked, ..Default::default() }),
+                "call_3" => Some(crate::ring::CallInfo { from: "+61491570157".into(), name: "Kim".into(), turns: vec!["There is a gas leak at the shop".to_string()], ..Default::default() }),
                 _ => None,
             }
         }

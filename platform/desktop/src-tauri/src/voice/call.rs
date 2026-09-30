@@ -1033,6 +1033,12 @@ where
                                 // The owner had this call and hands it back: the phone says so, and so does the desktop's own record.
                                 let handed_back = hub.leave_handoff(&ids.call);
                                 let resume = start_resume.clone().or_else(|| handed_back.map(|held| json!({"afterHandoff": true, "handoffSeconds": held.as_secs(), "via": "return"})));
+                                // The AI has the caller back: what was said before is not an ask for what comes next, whatever the owner and the
+                                // caller said to one another. (A session made anew for the same call, with no owner between, spends nothing: the
+                                // ask stands, and a request that was refused or never opened is tried again on it.)
+                                if resume.is_some() {
+                                    hub.spend_turns(&ids.call);
+                                }
                                 // A contact from now on, with this as the number last seen (never a hidden caller).
                                 super::contacts::saw(&from);
                                 // Greeted by name when we know it: the name kept for their number, else the phone's.

@@ -202,16 +202,24 @@ impl Ring {
         if self.call_is_over(&params.call_id) {
             return Err(error(409, "call_ended", "the call ended while the request was being planned: nothing rings"));
         }
+        // The call began again since the plan was allowed for it (its session was made anew, or the owner handed the caller back): that request
+        // was for another beginning, and is refused as the plugin refuses a call that changed. The plan is left as it is, so its refusal gives
+        // the try back.
+        if !self.plan_is_current(&params.plan_id, &params.call_id) {
+            return Err(error(409, "call_changed", "the call began again since that plan was allowed: nothing rings"));
+        }
         // One plan opens one ring: it is used up here, moved out and not copied.
-        let Some(plan) = self.take_plan(&params.plan_id, &params.call_id) else {
+        let Some(taken) = self.take_plan(&params.plan_id, &params.call_id) else {
             return Err(error(409, "unknown_plan", "that plan was not allowed for this call, or has run out: nothing rings"));
         };
+        let (plan, judged) = (taken.plan, taken.judged);
         // A request opened a ring: the plugin's consent is there.
         self.note_ring_opened();
         let info = self.call_info(&params.call_id).unwrap_or_default();
-        // The ask that this ring is for is acted on now: the next request needs an ask of its own, said after this. (What the dialog shows is what
-        // was read just above.)
-        self.use_up_asked_turns(&params.call_id);
+        // The ask that this ring is for is acted on now: the next request needs an ask of its own, said after this. What is used up is what the
+        // request was judged on, and no more: the caller may have said something since, while the request was being planned and sent, and that is
+        // the next request's own. (What the dialog shows is what the caller has said, read just above.)
+        self.use_up_asked_turns(&params.call_id, judged);
         let now = self.now_ms();
         let given = params.expires_at.saturating_mul(1000);
         let longest = now + (u64::from(plan.ring_seconds) + 10) * 1000;

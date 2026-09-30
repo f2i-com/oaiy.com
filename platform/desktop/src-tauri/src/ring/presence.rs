@@ -147,7 +147,7 @@ mod tests {
         let ring = Ring::in_memory(RingSettings { enabled: true, ..Default::default() });
         ring.set_presence(std::sync::Arc::new(Locked));
         ring.set_devices(std::sync::Arc::new(Devices));
-        let plan = ring.plan_for_plugin("call_1", Reason::CallerAsked, CallInfo { from: "+61491570006".into(), name: String::new(), turns: vec!["Can I speak to the owner".into()] });
+        let plan = ring.plan_for_plugin("call_1", Reason::CallerAsked, CallInfo { from: "+61491570006".into(), name: String::new(), turns: vec!["Can I speak to the owner".into()], ..Default::default() });
         // Away: the phone rings (when_away), and the computer, which nobody is at, does not.
         assert!(plan.rings(), "{:?}", plan.plan);
         assert_eq!((plan.plan.phones.clone(), plan.plan.desktop_toast, plan.plan.desktop_companions.clone()), (vec!["ph1".to_string()], false, Vec::<String>::new()));

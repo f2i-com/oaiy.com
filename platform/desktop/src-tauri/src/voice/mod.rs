@@ -101,7 +101,10 @@ struct HubCalls(std::sync::Weak<Inner>);
 impl crate::ring::CallSource for HubCalls {
     fn facts(&self, call: &str) -> Option<crate::ring::CallInfo> {
         let hub = VoiceHub { inner: self.0.upgrade()? };
-        hub.call_facts(call).map(|(from, name)| crate::ring::CallInfo { from, name, turns: hub.caller_turns(call) })
+        hub.call_facts(call).map(|(from, name)| {
+            let (turns, total) = hub.turns_read(call);
+            crate::ring::CallInfo { from, name, turns, total }
+        })
     }
 
     fn call_ended_by_phone(&self, call: &str) {
@@ -110,10 +113,14 @@ impl crate::ring::CallSource for HubCalls {
         }
     }
 
-    fn consume_turns(&self, call: &str) {
+    fn consume_turns(&self, call: &str, up_to: u64) {
         if let Some(inner) = self.0.upgrade() {
-            VoiceHub { inner }.consume_turns(call);
+            VoiceHub { inner }.consume_turns(call, up_to);
         }
+    }
+
+    fn generation(&self, call: &str) -> u64 {
+        self.0.upgrade().map_or(0, |inner| VoiceHub { inner }.call_generation(call))
     }
 
     fn is_over(&self, call: &str) -> bool {
@@ -163,8 +170,9 @@ struct CallRecord {
     total: u64,
     /// The turns before this number are used up: an ask counts for one request (see [`VoiceHub::consume_turns`]).
     used_up: u64,
-    /// How many turns the last read of them (by a request being judged) had.
-    read: u64,
+    /// How many times the call has begun (a session made anew for the same call, or handed back by the owner, begins it again): a request
+    /// planned for one beginning is not opened on another (see [`VoiceHub::call_generation`]).
+    generation: u64,
     /// When the call ended (None while it is live).
     ended: Option<Instant>,
 }
@@ -341,14 +349,34 @@ impl VoiceHub {
     fn note_call(&self, call: &str, from: &str, name: &str) {
         let mut records = self.inner.records.lock().unwrap_or_else(|e| e.into_inner());
         prune(&mut records);
-        let record = records.entry(call.to_string()).or_insert_with(|| CallRecord { from: String::new(), name: String::new(), turns: VecDeque::new(), total: 0, used_up: 0, read: 0, ended: None });
+        let record = records.entry(call.to_string()).or_insert_with(|| CallRecord { from: String::new(), name: String::new(), turns: VecDeque::new(), total: 0, used_up: 0, generation: 0, ended: None });
         record.from = from.trim().to_string();
         record.name = name.trim().to_string();
         record.ended = None;
-        // The call begins again (the owner handed the caller back, or its session was made anew): whatever was said before is used up, and a
-        // caller who then says "thanks, that is all sorted now" has not asked for anyone. What is said from here on is its own.
-        record.used_up = record.total;
-        record.read = record.total;
+        // The call begins again. What was said is not spent by that: a session made anew for the same call (the phone's stream dropped and came
+        // back) leaves a caller's ask where it was, and a request that was refused, or that the phone never opened, is tried again on the same
+        // ask. Only the owner handing the caller back spends what was said ([`VoiceHub::spend_turns`]).
+        record.generation += 1;
+    }
+
+    /// The owner has handed the caller back: every turn said so far is spent. A caller who then says "thanks, that is all sorted now" has not asked
+    /// for anyone, and what they say from here on is the next request's own.
+    fn spend_turns(&self, call: &str) {
+        let mut records = self.inner.records.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(record) = records.get_mut(call) {
+            record.used_up = record.total;
+        }
+    }
+
+    /// Which beginning of the call this is (0 for a call this desktop has not heard of): it changes each time the call begins, so a request
+    /// planned before a session was made anew is not opened after it.
+    pub fn call_generation(&self, call: &str) -> u64 {
+        self.inner.records.lock().unwrap_or_else(|e| e.into_inner()).get(call).map_or(0, |r| r.generation)
+    }
+
+    /// How many turns the caller has said on the call in all, spent or not.
+    pub fn turns_said(&self, call: &str) -> u64 {
+        self.inner.records.lock().unwrap_or_else(|e| e.into_inner()).get(call).map_or(0, |r| r.total)
     }
 
     /// What the caller said, as this desktop heard it (not an acknowledgement: "mm-hmm" asks for nothing).
@@ -385,23 +413,29 @@ impl VoiceHub {
         records.get(call).map(|r| (r.from.clone(), r.name.clone()))
     }
 
-    /// What the caller said last on a call, oldest first (at most six), not counting what a request has used up. Reading them is what
-    /// [`VoiceHub::consume_turns`] then uses up.
+    /// What the caller said last on a call, oldest first (at most six), not counting what a request has used up. Reading them uses nothing up:
+    /// a request that is judged says how many turns it read ([`VoiceHub::turns_said`]), and the ring uses up as many when a ring opens on it.
     pub fn caller_turns(&self, call: &str) -> Vec<String> {
-        let mut records = self.inner.records.lock().unwrap_or_else(|e| e.into_inner());
-        let Some(record) = records.get_mut(call) else { return Vec::new() };
-        record.read = record.total;
-        // The kept turns are the last ones said: the first of them is number `total - kept`.
-        let first = record.total - record.turns.len() as u64;
-        record.turns.iter().enumerate().filter(|(i, _)| first + *i as u64 >= record.used_up).map(|(_, t)| t.clone()).collect()
+        self.turns_read(call).0
     }
 
-    /// What the caller said on `call` as far as the last read of [`VoiceHub::caller_turns`] is used up by the request that read it: an ask counts
-    /// for ONE request. What the caller says after that read is kept for the next.
-    pub fn consume_turns(&self, call: &str) {
+    /// [`VoiceHub::caller_turns`], and how many turns the caller had said in all at that moment (the two together, so that no turn said between
+    /// them is counted as read: it is spent only if it was).
+    pub fn turns_read(&self, call: &str) -> (Vec<String>, u64) {
+        let records = self.inner.records.lock().unwrap_or_else(|e| e.into_inner());
+        let Some(record) = records.get(call) else { return (Vec::new(), 0) };
+        // The kept turns are the last ones said: the first of them is number `total - kept`.
+        let first = record.total - record.turns.len() as u64;
+        let turns = record.turns.iter().enumerate().filter(|(i, _)| first + *i as u64 >= record.used_up).map(|(_, t)| t.clone()).collect();
+        (turns, record.total)
+    }
+
+    /// The first `up_to` turns the caller said on `call` are used up by the request that was judged on them: an ask counts for ONE request. What
+    /// the caller says after they were read (while the request was being planned and sent) is kept for the next.
+    pub fn consume_turns(&self, call: &str, up_to: u64) {
         let mut records = self.inner.records.lock().unwrap_or_else(|e| e.into_inner());
         if let Some(record) = records.get_mut(call) {
-            record.used_up = record.used_up.max(record.read);
+            record.used_up = record.used_up.max(up_to.min(record.total));
         }
     }
 
@@ -1214,6 +1248,27 @@ mod tests {
         assert!(!calls.is_over("call_1"));
     }
 
+    #[test]
+    fn the_ring_is_told_each_time_a_call_begins_and_what_the_caller_had_said_when_it_read_it() {
+        use crate::ring::CallSource as _;
+        let hub = VoiceHub::new(Engines::at("http://127.0.0.1:9", "http://127.0.0.1:9"), |_| None);
+        let calls = HubCalls(Arc::downgrade(&hub.inner));
+        assert_eq!(calls.generation("call_1"), 0);
+        hub.note_call("call_1", "+61491570006", "Alex");
+        let first = calls.generation("call_1");
+        hub.note_call("call_1", "+61491570006", "Alex");
+        assert_eq!(calls.generation("call_1"), first + 1, "a session made anew is a new beginning");
+        hub.caller_said("call_1", "Can I speak to the owner?", json!({}));
+        hub.caller_said("call_1", "Hello?", json!({}));
+        let info = calls.facts("call_1").unwrap();
+        assert_eq!((info.turns.len(), info.total), (2, 2), "what was read, and how many that was");
+        calls.consume_turns("call_1", info.total - 1);
+        let after = calls.facts("call_1").unwrap();
+        assert_eq!((after.turns, after.total), (vec!["Hello?".to_string()], 2), "only as far as it was told");
+        drop(hub);
+        assert_eq!(calls.generation("call_1"), 0, "a hub that is gone has no call");
+    }
+
     #[tokio::test]
     async fn with_messages_off_nothing_is_kept_and_the_receptionist_is_told_so() {
         let _on = crate::modules::test_gate::enable(&[crate::modules::PHONE]);
@@ -1288,34 +1343,64 @@ mod tests {
     }
 
     #[test]
-    fn an_ask_is_used_up_by_the_request_that_read_it_and_a_call_that_begins_again_starts_with_none() {
+    fn an_ask_is_used_up_as_far_as_the_request_that_read_it_and_no_further() {
         let hub = VoiceHub::new(Engines::at("http://127.0.0.1:9", "http://127.0.0.1:9"), |_| None);
         hub.note_call("call_1", "+61491570006", "Alex");
         hub.caller_said("call_1", "Can I speak to the owner?", json!({}));
+        // Reading the turns uses nothing up, however often, and says how many the caller had said.
+        assert_eq!(hub.turns_read("call_1"), (vec!["Can I speak to the owner?".to_string()], 1));
         assert_eq!(hub.caller_turns("call_1"), ["Can I speak to the owner?"]);
-        // Said after the request read it and before it was judged: that is the next request's, and is kept.
+        // Said after the request read them, while it was being planned and sent: the next request's, and kept when this one is used up.
         hub.caller_said("call_1", "Hello?", json!({}));
-        hub.consume_turns("call_1");
-        assert_eq!(hub.caller_turns("call_1"), ["Hello?"], "only what was read is used up");
-        hub.consume_turns("call_1");
+        hub.consume_turns("call_1", 1);
+        assert_eq!(hub.caller_turns("call_1"), ["Hello?"], "only as far as the request had read");
+        hub.consume_turns("call_1", 1);
+        assert_eq!(hub.caller_turns("call_1"), ["Hello?"], "and used up again, no more");
+        assert_eq!(hub.turns_said("call_1"), 2, "spent or not, they were said");
+        hub.consume_turns("call_1", 2);
         assert!(hub.caller_turns("call_1").is_empty(), "and that too, once a request has read it");
+        // Never more than was said, and never backwards.
+        hub.consume_turns("call_1", 50);
+        hub.caller_said("call_1", "One more.", json!({}));
+        assert_eq!(hub.caller_turns("call_1"), ["One more."], "a request cannot use up what has not been said yet");
+        hub.consume_turns("call_1", 1);
+        assert_eq!(hub.caller_turns("call_1"), ["One more."], "nor take back what it used up");
         // What the caller says after is the next request's own, however many turns were kept and dropped meanwhile.
         for n in 1..=9 {
             hub.caller_said("call_1", &format!("turn {n}"), json!({}));
             if n == 4 {
-                assert_eq!(hub.caller_turns("call_1").len(), 4);
-                hub.consume_turns("call_1");
+                let (turns, said) = hub.turns_read("call_1");
+                assert_eq!(turns.len(), 5, "one more, and four");
+                hub.consume_turns("call_1", said);
             }
         }
         assert_eq!(hub.caller_turns("call_1"), ["turn 5", "turn 6", "turn 7", "turn 8", "turn 9"], "only what came after what was used up (the last six are kept)");
-        // The call begins again, as it does when the owner hands the caller back: what was said before is not an ask for what comes next.
+        // A call this desktop does not know has nothing to use up.
+        hub.consume_turns("call_9", 3);
+        assert!(hub.caller_turns("call_9").is_empty());
+        assert_eq!(hub.turns_read("call_9"), (Vec::new(), 0));
+    }
+
+    /// The spend rules of the ask: what the owner handing the caller back spends, and what a session made anew for the same call does not.
+    #[test]
+    fn the_owner_handing_the_caller_back_spends_what_was_said_and_a_session_made_anew_does_not() {
+        let hub = VoiceHub::new(Engines::at("http://127.0.0.1:9", "http://127.0.0.1:9"), |_| None);
+        assert_eq!(hub.call_generation("call_1"), 0, "a call this desktop has not heard of");
         hub.note_call("call_1", "+61491570006", "Alex");
+        assert_eq!(hub.call_generation("call_1"), 1);
+        hub.caller_said("call_1", "Can I speak to the owner?", json!({}));
+        // The call's session is made anew (the phone's stream dropped and came back), with no owner between: the ask stands.
+        hub.note_call("call_1", "+61491570006", "Alex");
+        assert_eq!(hub.call_generation("call_1"), 2, "it began again");
+        assert_eq!(hub.caller_turns("call_1"), ["Can I speak to the owner?"], "a session made anew spends nothing");
+        // The owner hands the caller back: every turn so far is spent, and what is said from then on is its own.
+        hub.note_call("call_1", "+61491570006", "Alex");
+        hub.spend_turns("call_1");
         assert!(hub.caller_turns("call_1").is_empty());
         hub.caller_said("call_1", "Thanks, that is all sorted now.", json!({}));
         assert_eq!(hub.caller_turns("call_1"), ["Thanks, that is all sorted now."]);
-        // A call this desktop does not know has nothing to use up.
-        hub.consume_turns("call_9");
-        assert!(hub.caller_turns("call_9").is_empty());
+        hub.spend_turns("call_9");
+        assert_eq!(hub.call_generation("call_9"), 0);
     }
 
     #[test]

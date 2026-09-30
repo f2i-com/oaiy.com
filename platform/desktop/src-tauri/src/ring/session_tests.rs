@@ -27,14 +27,32 @@ struct Calls {
     answer: Mutex<Withdrawal>,
     /// The calls the ring said a request was judged on (see `CallSource::consume_turns`), and whether the call then forgets what was said, as the hub does.
     used: Mutex<Vec<String>>,
+    /// How many turns each of those said had been used up ("the first this many").
+    used_up_to: Mutex<Vec<u64>>,
     consuming: std::sync::atomic::AtomicBool,
+    /// How many turns the call has forgotten because a request used them up (the turns it says it holds are the rest).
+    cleared: std::sync::atomic::AtomicU64,
     /// The calls that are over (the caller hung up).
     over: Mutex<Vec<String>>,
+    /// Which beginning of the call this is (see `CallSource::generation`).
+    generation: std::sync::atomic::AtomicU64,
 }
 
 impl Default for Calls {
     fn default() -> Self {
-        Self { info: Mutex::default(), cancels: Mutex::default(), ended: Mutex::default(), live: std::sync::atomic::AtomicBool::new(true), answer: Mutex::new(Withdrawal::Sent), used: Mutex::default(), consuming: std::sync::atomic::AtomicBool::new(false), over: Mutex::default() }
+        Self {
+            info: Mutex::default(),
+            cancels: Mutex::default(),
+            ended: Mutex::default(),
+            live: std::sync::atomic::AtomicBool::new(true),
+            answer: Mutex::new(Withdrawal::Sent),
+            used: Mutex::default(),
+            used_up_to: Mutex::default(),
+            consuming: std::sync::atomic::AtomicBool::new(false),
+            cleared: std::sync::atomic::AtomicU64::new(0),
+            over: Mutex::default(),
+            generation: std::sync::atomic::AtomicU64::new(1),
+        }
     }
 }
 
@@ -45,20 +63,28 @@ fn respond(ring: &Ring, request: &str, action: Action) -> Result<crate::ring::se
 
 impl CallSource for Calls {
     fn facts(&self, call: &str) -> Option<CallInfo> {
-        self.info.lock().unwrap().iter().find(|(c, _)| c == call).map(|(_, i)| i.clone())
+        let cleared = self.cleared.load(std::sync::atomic::Ordering::SeqCst);
+        self.info.lock().unwrap().iter().find(|(c, _)| c == call).map(|(_, i)| CallInfo { total: cleared + i.turns.len() as u64, ..i.clone() })
     }
     fn call_ended_by_phone(&self, call: &str) {
         self.ended.lock().unwrap().push(call.to_string());
     }
-    fn consume_turns(&self, call: &str) {
+    fn consume_turns(&self, call: &str, up_to: u64) {
         self.used.lock().unwrap().push(call.to_string());
+        self.used_up_to.lock().unwrap().push(up_to);
         if self.consuming.load(std::sync::atomic::Ordering::SeqCst) {
             for (c, info) in self.info.lock().unwrap().iter_mut() {
                 if c == call {
-                    info.turns.clear();
+                    let cleared = self.cleared.load(std::sync::atomic::Ordering::SeqCst);
+                    let forget = (up_to.saturating_sub(cleared) as usize).min(info.turns.len());
+                    info.turns.drain(..forget);
+                    self.cleared.fetch_add(forget as u64, std::sync::atomic::Ordering::SeqCst);
                 }
             }
         }
+    }
+    fn generation(&self, _call: &str) -> u64 {
+        self.generation.load(std::sync::atomic::Ordering::SeqCst)
     }
     fn is_over(&self, call: &str) -> bool {
         self.over.lock().unwrap().iter().any(|c| c == call)
@@ -119,7 +145,7 @@ struct Rig {
 }
 
 fn caller(from: &str, name: &str, said: &str) -> CallInfo {
-    CallInfo { from: from.into(), name: name.into(), turns: vec!["Hi".into(), said.into()] }
+    CallInfo { from: from.into(), name: name.into(), turns: vec!["Hi".into(), said.into()], ..Default::default() }
 }
 
 fn rig(presence: Presence) -> Rig {
@@ -257,6 +283,67 @@ fn a_ring_is_not_opened_for_a_call_that_ended_while_the_request_was_being_planne
     let plan = planned(&r.ring, CALL);
     r.ring.opened(&opened(&plan, "assist_2", CALL, 25, &r.ring)).unwrap();
     assert_eq!(r.ring.active().len(), 1);
+}
+
+#[test]
+fn a_ring_is_not_opened_for_a_call_that_began_again_since_the_plan_and_a_plan_for_the_call_as_it_was_is_let_go() {
+    let r = rig(Presence::Active);
+    let plan = planned(&r.ring, CALL);
+    assert_eq!(tries(&r), 1);
+    // The call's session is made anew (the owner handed the caller back, or the phone's stream came back) after the plan was allowed and before the
+    // plugin says the request is out: that request was for another beginning of the call.
+    r.calls.generation.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+    let refused = r.ring.opened(&opened(&plan, "assist_1", CALL, 25, &r.ring)).unwrap_err();
+    assert_eq!((refused.status, refused.code), (409, "call_changed"));
+    assert!(r.ring.active().is_empty() && r.notified.rang.lock().unwrap().is_empty(), "nothing rings, and nobody is told");
+    assert!(r.calls.used.lock().unwrap().is_empty(), "and no ask was acted on");
+    assert_eq!(r.ring.opened(&opened("plan_made_up", "assist_1", CALL, 25, &r.ring)).unwrap_err().code, "unknown_plan", "a plan that was never allowed is still that");
+    // The plugin then refuses the request itself, as it must: nobody was rung, and the try is given back.
+    assert!(r.ring.request_refused(CALL));
+    assert_eq!(tries(&r), 0);
+
+    // A plan allowed at the call's own gate for the call as it was, and then asked about by the plugin after the call began again: let go (its try given
+    // back), and the request judged afresh on the call as it is. The old plan opens nothing; the new one does.
+    let old = r.ring.authorise(CALL, Reason::CallerAsked);
+    assert!(old.rings() && tries(&r) == 1, "{:?}", old.plan);
+    r.calls.generation.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+    let asked = r.ring.plan_for_plugin(CALL, Reason::CallerAsked, CallInfo::default());
+    assert!(asked.rings(), "{:?}", asked.plan);
+    assert_ne!(asked.plan_id, old.plan_id, "not the plan that was allowed for the call as it was");
+    assert_eq!(tries(&r), 1, "one try in all: the old one was given back");
+    assert_eq!(r.ring.opened(&opened(&old.plan_id, "assist_2", CALL, 25, &r.ring)).unwrap_err().code, "unknown_plan");
+    r.ring.opened(&opened(&asked.plan_id, "assist_2", CALL, 25, &r.ring)).unwrap();
+    assert_eq!(r.ring.active().len(), 1);
+}
+
+#[test]
+fn what_the_caller_says_while_a_request_is_planned_and_sent_is_not_spent_by_the_ring_that_opens_on_it() {
+    struct At(chrono::DateTime<chrono::FixedOffset>);
+    impl Clock for At {
+        fn local(&self) -> chrono::DateTime<chrono::FixedOffset> {
+            self.0
+        }
+    }
+    let r = rig(Presence::Active);
+    r.calls.consuming.store(true, std::sync::atomic::Ordering::SeqCst);
+    let start = chrono::DateTime::parse_from_rfc3339("2026-09-30T11:00:00+10:00").unwrap();
+    r.ring.set_clock(Arc::new(At(start)));
+    // The request is judged on the two turns the caller had said, and the plugin plans it.
+    let plan = planned(&r.ring, CALL);
+    // The caller says something more while the request is on its way, and then the ring opens.
+    r.calls.info.lock().unwrap()[0].1.turns.push("Actually, no, just take a message please.".into());
+    let ring = r.ring.opened(&opened(&plan, "assist_1", CALL, 25, &r.ring)).unwrap();
+    assert_eq!(r.calls.used_up_to.lock().unwrap().as_slice(), [2], "what the request was judged on is used up, and no more");
+    assert!(ring.said.iter().any(|s| s.starts_with("Actually, no")), "the dialog shows what the caller has said by now: {:?}", ring.said);
+    assert_eq!(r.calls.info.lock().unwrap()[0].1.turns, ["Actually, no, just take a message please."], "and what was said since is still to be read");
+    // Two minutes on, declined: the next request is judged on those words, which are not an ask.
+    r.ring.resolve("assist_1", Outcome::Declined, "phone");
+    r.ring.set_clock(Arc::new(At(start + chrono::Duration::minutes(2))));
+    let second = r.ring.authorise(CALL, Reason::CallerAsked);
+    assert_eq!((second.plan.decision, second.plan.reason), (Decision::Refused, PlanReason::CallerDidNotAsk), "{:?}", second.plan);
+    // And had they asked again in that time, it would have been an ask of its own, judged on its own words.
+    r.calls.info.lock().unwrap()[0].1.turns.push("Sorry, can I speak to the owner please".into());
+    assert!(r.ring.authorise(CALL, Reason::CallerAsked).rings());
 }
 
 #[test]

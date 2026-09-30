@@ -71,8 +71,18 @@ The plan reasons OAIY puts in an `oaiy.ring.plan` answer are exactly the plugin'
   once.
 * **The plan.** The desktop judges a request on its own record of the call (what it heard, and who rang), and
   uses what the plugin says of the call only for a call it has no record of. It names every paired Windows
-  Companion whether or not it is running, and never plans a `ring` that names nobody. `reasonAllowed` is true
-  only for `urgent`, when the owner allows it and the caller said one of the owner's urgent phrases.
+  Companion whether or not it is running, and never plans a `ring` that names nobody. It launches no Companion and posts
+  no ring hint (the reserved offer id is computed and tested against its fixture, and nothing sends it), and takes a roster
+  device to be reachable for the whole ring window: the plugin offers the call only to those with a live session. A plan
+  opens one ring (a second request on it, or one for a call that ended while it was being planned, opens nothing: 409
+  `unknown_plan` or `call_ended`), and the same request said again is the ring that is going. `reasonAllowed` is true
+  only for `urgent`, when the owner allows it and the caller said one of the owner's urgent phrases as a statement that it is
+  so, read a sentence at a time and in order: not denied ("this is not a gas leak"), supposed ("if there were a gas leak"),
+  quoted or spoken of as words, put as a question, or told to the receptionist to say, and a later denial takes it back.
+* **An ask counts for one request.** What the caller had said is used up when a ring opens on it, as far as the request was
+  judged on (what they said while it was planned and sent is the next request's), and when the owner hands the caller back
+  every turn so far is used up. A request refused, refused by the phone before it rang, or on a call whose session was made anew
+  with no owner between, is tried again on the same ask.
 * **Limits** are stricter than the plugin's floor: by default 2 tries a call, a minute apart, 3 an hour for one
   caller, 10 an hour in all, and all callers with a withheld or unusable number share one bucket of 2 an hour.
   A try the plugin refuses itself (`consent`, `call_changed`, `plan_unavailable`, the tool intake errors) is given back.
