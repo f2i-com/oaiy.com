@@ -54,9 +54,39 @@ test('4.5 roster: a phone the desktop no longer lists is revoked at once, comple
     $r->ctx()->mb->post($b->inbox(), 'sync', 's', $d->id, 60, '{}', null, null, 'queued for b');
     $res = roster_push($r, $d, roster_sorted([$a]), 2);
     eq([$b->id], $res['json']['revoked']);
+    ok($r->ctx()->signals->isRevoked($b->id), 'a held request of the dropped phone is told (the marker that ends it with 401 revoked)');
+    ok(!$r->ctx()->signals->isRevoked($a->id));
     eq('revoked', $r->call($b, 'GET', '/v1/poll')['json']['error']['code']);
     eq(200, $r->call($a, 'GET', '/v1/poll')['status']);
     eq(0, (int)$r->ctx()->db->val('SELECT COUNT(*) FROM items WHERE mailbox = ?', [$b->inbox()]));
+});
+
+test('4.5 roster: a push is one transaction - the stored roster and the revocations of the phones it drops happen together, so a failure halfway leaves neither (before, the list was stored and committed first)', function () {
+    $r = Relay::make();
+    $d = $r->desktop();
+    $a = $r->phone($d, 'A');
+    $b = $r->phone($d, 'B');
+    $c = $r->phone($d, 'C');
+    $ths = roster_sorted([$a, $b, $c]);
+    eq(200, roster_push($r, $d, $ths, 1)['status']);
+    $db = $r->ctx()->db;
+    $before = $db->all('SELECT * FROM roster');
+    // A revocation that cannot finish: the table a revocation clears is gone.
+    $db->exec('ALTER TABLE slots RENAME TO slots_hidden');
+    try {
+        $res = roster_push($r, $d, roster_sorted([$a]), 2);
+        eq(500, $res['status'], 'the push failed: ' . $res['body']);
+    } finally {
+        $db->exec('ALTER TABLE slots_hidden RENAME TO slots');
+    }
+    eq($before, $db->all('SELECT * FROM roster'), 'the list was not stored');
+    eq(3, (int)$db->val("SELECT COUNT(*) FROM devices WHERE role = 'phone' AND revoked_at IS NULL"), 'and no phone was revoked');
+    eq(200, $r->call($b, 'GET', '/v1/poll')['status']);
+    // The same push with the table back does both.
+    $res = roster_push($r, $d, roster_sorted([$a]), 2);
+    eq(200, $res['status'], $res['body']);
+    eq([DevicesApi::rosterHash(roster_sorted([$a]), 2)], array_column($db->all('SELECT hash FROM roster'), 'hash'));
+    eq(1, (int)$db->val("SELECT COUNT(*) FROM devices WHERE role = 'phone' AND revoked_at IS NULL"));
 });
 
 test('4.5 roster: an empty roster is valid (the last phone was revoked) and revokes every phone of that app', function () {

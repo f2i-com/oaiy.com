@@ -302,16 +302,22 @@ final class DevicesApi
         }
         $hash = self::rosterHash($ths, $rev);
         $now = Clock::now();
-        $ctx->db->write(function (Db $db) use ($p, $app, $rev, $hash, $ths, $now): void {
+        // One transaction, taken one push at a time per desktop (the gate pairing's approvals take too): the roster is stored and the
+        // phones it no longer lists are revoked together, so no one sees the new list with the old phones still active, two pushes do
+        // not interleave (each one's list is stored and acted on whole, in an order), and a failure halfway leaves neither.
+        $revoked = $ctx->db->write(function (Db $db) use ($ctx, $p, $app, $rev, $hash, $ths, $now): array {
+            $db->gate('roster:' . $p->id);
             $db->insertIgnore('roster', ['desktop_dev' => $p->id, 'app_id' => $app, 'revision' => 0, 'hash' => '', 'thumbprints' => '[]', 'updated_at' => $now]);
             $db->exec('UPDATE roster SET revision = ?, hash = ?, thumbprints = ?, updated_at = ? WHERE desktop_dev = ? AND app_id = ?', [$rev, $hash, Json::encode(array_values($ths)), $now, $p->id, $app]);
-        });
-        $revoked = [];
-        foreach ($ctx->db->all("SELECT id, thumbprint FROM devices WHERE role = 'phone' AND owner_desktop = ? AND app_id = ? AND revoked_at IS NULL", [$p->id, $app]) as $ph) {
-            if ($ph['thumbprint'] === null || !in_array((string)$ph['thumbprint'], $ths, true)) {
-                $revoked = array_merge($revoked, Devices::revoke($ctx, (string)$ph['id']));
+            $ids = [];
+            foreach ($db->all("SELECT id, thumbprint FROM devices WHERE role = 'phone' AND owner_desktop = ? AND app_id = ? AND revoked_at IS NULL", [$p->id, $app]) as $ph) {
+                if ($ph['thumbprint'] === null || !in_array((string)$ph['thumbprint'], $ths, true)) {
+                    $ids = array_merge($ids, Devices::revokeInTx($ctx, $db, (string)$ph['id'], false, $now));
+                }
             }
-        }
+            return $ids;
+        });
+        Devices::markRevoked($ctx, $revoked);
         return Response::json(200, ['v' => 1, 'hash' => $hash, 'revoked' => $revoked, 'time' => $now]);
     }
 }

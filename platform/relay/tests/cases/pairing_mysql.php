@@ -478,6 +478,35 @@ echo $bad, "\n";
         eq(0, (int)$r->ctx()->db->val('SELECT COUNT(*) FROM mailboxes WHERE id = ?', [$d2->inbox()]), 'no mailbox was made for the revoked recipient');
     });
 
+    slow_test("4.5 $tag: a roster push takes the desktop's gate (the one an approval takes): it waits for the holder and then stores its list and revokes the phones it drops in one go; an approval waits for a push in flight in the same way", function () use ($flavour) {
+        if (!MysqlServer::available($flavour)) {
+            skip("no $flavour server binary here");
+        }
+        $prov = pmy_db($flavour);
+        $r = Relay::make([], $prov);
+        $d = $r->desktop();
+        $x = $r->phone($d, 'X');
+        $y = $r->phone($d, 'Y');
+        [$a, $b] = $r->fleet(2);
+        $h = ['Content-Type' => 'application/json', 'Authorization' => 'Bearer ' . $d->token];
+        $keep = [\Oaiy\Relay\Crypto::thumbprint($x->edPk)];
+        $release = pmy_hold_gate($prov, 'roster:' . $d->id); // an approval (or another push) is in the middle of its check
+        $push = $a->begin('POST', '/v1/roster', $h, json_encode(['appId' => 'aokie', 'revision' => 3, 'thumbprints' => $keep]));
+        pmy_expect_blocked([$push], $release);
+        $res = $push->finish(15);
+        eq(200, $res['status'], $res['body']);
+        eq([$y->id], json_decode($res['body'], true)['revoked']);
+        eq(1, (int)$r->ctx()->db->val("SELECT COUNT(*) FROM devices WHERE role = 'phone' AND revoked_at IS NULL"));
+        // An approval takes the same gate: a push that holds it makes the approval wait.
+        $c = Ceremony::random($r, $d);
+        eq(201, $c->open()['status']);
+        eq(202, $c->answer()['status']);
+        $release = pmy_hold_gate($prov, 'roster:' . $d->id);
+        $approval = $b->begin('POST', '/v1/pair/' . $c->pid . '/decision', $h, json_encode($c->decisionDoc()));
+        pmy_expect_blocked([$approval], $release);
+        eq(200, $approval->finish(15)['status']);
+    });
+
     slow_test("4.5 $tag: eight posters racing the revocation of their sender leave nothing of it live, and eight racing the revocation of their recipient leave no mailbox of it", function () use ($flavour) {
         if (!MysqlServer::available($flavour)) {
             skip("no $flavour server binary here");
