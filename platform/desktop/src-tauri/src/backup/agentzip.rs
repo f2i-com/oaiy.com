@@ -412,7 +412,7 @@ const NOTE_KINDS: &str = "what was not brought back";
 const NOTE_WORDS: &str = "files with hidden text";
 
 /// The largest file of words (the brief, a knowledge file) that is read to see whether it hides text, and the reason it is not brought back
-/// when it does (see [`super::parts::text_problem`]). A file that is larger is not read for this.
+/// when it does (see [`super::parts::text_problem`]). A file that is larger cannot be checked, and is not brought back.
 const MOST_WORDS_SCANNED: u64 = 1 << 20;
 
 /// Why a file of words that a model reads is not brought back, or `None`: the text in it is one that hides more than it shows. What is
@@ -420,7 +420,10 @@ const MOST_WORDS_SCANNED: u64 = 1 << 20;
 /// files are text.
 fn hidden_text_of(archive: &mut Archive, entry: &Entry, row: &str, limits: &Limits) -> Result<Option<String>> {
     let cap = if row == "agent-desk-callers" { limits.max_agent_read_bytes } else { MOST_WORDS_SCANNED };
-    let Some(bytes) = read_small(archive, entry, cap)? else { return Ok(None) };
+    // A file that is too large to be read for this is not brought back: what cannot be checked is not let through.
+    let Some(bytes) = read_small(archive, entry, cap)? else {
+        return Ok(Some(format!("it is larger than the {} that a restore reads to check that it hides nothing", kb(cap))));
+    };
     if row == "agent-desk-callers" {
         return Ok(serde_json::from_slice::<Value>(strip_bom(&bytes)).ok().and_then(|v| super::review::first_hidden_text(&v, "")));
     }

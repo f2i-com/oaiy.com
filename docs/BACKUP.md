@@ -687,8 +687,10 @@ a thing does:
   flow, a template, the trigger list, a connector, the notes about callers and the setup, agent and
   control records, and what the phone's agents remember about people in the Agent's storage (all read as
   JSON, so a hidden character written as an escape is seen too; such a file is left out whole, and the
-  dry run describes nothing else of it); the conversations, projects and sessions it lists by name and
-  size are not read, and are not restored without their own tick.
+  dry run describes nothing else of it), and a brief or a knowledge file of more than 1 MiB (or what
+  the phone's agents remember of more than 8 MiB) is not brought back either, since it cannot be read
+  for this: what cannot be checked is not let through; the conversations, projects and sessions it lists
+  by name and size are not read, and are not restored without their own tick.
 - **What a restore says of what it left out or changed is kept by class**: at most eight notes of
   one class (a campaign for each, a file for each), then one that says how many more there were,
   so no class of note crowds out another.

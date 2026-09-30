@@ -7977,6 +7977,90 @@ fn every_class_of_notes_a_restore_says_is_its_own() {
     }
 }
 
+/// A brief or a knowledge file of more than a megabyte, and what the phone's agents remember about people of more than the most the Agent's
+/// files are read, cannot be read to check that it hides nothing, and is not brought back (what cannot be checked is not let through); one of
+/// exactly the most is read, and comes back.
+#[test]
+fn a_file_of_words_that_is_too_large_to_be_checked_for_hidden_text_is_not_brought_back() {
+    let most_callers = options().limits.max_agent_read_bytes as usize;
+    let list_of = |size: usize| format!("[{}]", " ".repeat(size - 2)).into_bytes();
+    let run = |entries: Vec<(&str, Vec<u8>)>| {
+        let refs: Vec<(&str, &[u8])> = entries.iter().map(|(n, b)| (*n, b.as_slice())).collect();
+        let src = TempDir::new("too-large-src");
+        let out = TempDir::new("too-large-out");
+        let file = backup_with_agent(&src.0, &out.0, "l.oaiybackup", agent_archive(&refs), false);
+        let dst = TempDir::new("too-large-dst");
+        let preview = restore::inspect(&dst.0, &file, PASS, &options()).unwrap();
+        let staged = restore::stage(&dst.0, &file, PASS, &ticks_of(&[RestoreClass::AgentData, RestoreClass::Memory], false), &options()).unwrap();
+        assert!(matches!(restore::apply_pending(&dst.0), ApplyOutcome::Applied(_)));
+        let handed = zip_entries(&handed_over(&dst.0));
+        (preview, staged.skipped, handed)
+    };
+    let (preview, skipped, handed) = run(vec![
+        ("opfs/front-desk/files/brief.md", vec![b'a'; 1 << 20]),
+        ("opfs/front-desk/files/knowledge/big.md", vec![b'a'; (1 << 20) + 1]),
+        ("opfs/front-desk/files/knowledge/ok.md", b"Open nine to five".to_vec()),
+        ("opfs/front-desk/callers.json", list_of(most_callers)),
+    ]);
+    let says = |kind: &str, title: &str| preview.items.iter().find(|i| i.kind == kind && i.title.contains(title)).unwrap_or_else(|| panic!("{kind} {title}")).what.clone();
+    assert!(!says("brief", "brief").contains("Not brought back"), "a brief of exactly a megabyte is checked and comes back");
+    assert!(says("knowledge", "big.md").contains("Not brought back: it is larger than the 1024 KB that a restore reads to check that it hides nothing."), "{}", says("knowledge", "big.md"));
+    assert!(!says("knowledge", "ok.md").contains("Not brought back"));
+    assert!(!says("desk-callers", "remember").contains("Not brought back"), "what is remembered of exactly the most comes back: {}", says("desk-callers", "remember"));
+    assert!(skipped.iter().any(|n| n.contains("big.md was not brought back: it is larger than the 1024 KB")), "{skipped:?}");
+    assert!(handed.contains_key("opfs/front-desk/files/brief.md") && handed.contains_key("opfs/front-desk/files/knowledge/ok.md") && handed.contains_key("opfs/front-desk/callers.json"), "{:?}", handed.keys().collect::<Vec<_>>());
+    assert!(!handed.contains_key("opfs/front-desk/files/knowledge/big.md"));
+    // One byte more of what is remembered about people, and it does not come back either.
+    let (preview, skipped, handed) = run(vec![("opfs/front-desk/files/knowledge/ok.md", b"Open nine to five".to_vec()), ("opfs/front-desk/callers.json", list_of(most_callers + 1))]);
+    assert!(says_in(&preview, "desk-callers").contains(&format!("Not brought back: it is larger than the {} KB that a restore reads", most_callers / 1024)), "{}", says_in(&preview, "desk-callers"));
+    assert!(skipped.iter().any(|n| n.contains("callers.json was not brought back: it is larger than")), "{skipped:?}");
+    assert!(!handed.contains_key("opfs/front-desk/callers.json") && handed.contains_key("opfs/front-desk/files/knowledge/ok.md"));
+}
+
+fn says_in(preview: &restore::Preview, kind: &str) -> String {
+    preview.items.iter().find(|i| i.kind == kind).unwrap_or_else(|| panic!("{kind}")).what.clone()
+}
+
+/// A list says how many more there were only when there were more, and each of its items is cut on its own.
+#[test]
+fn a_list_says_how_many_more_there_were_only_when_there_were_more() {
+    use super::parts::{lines_of, some_of};
+    let lines = |n: usize| (0..n).map(|i| format!("line{i}")).collect::<Vec<_>>();
+    assert_eq!(lines_of(&lines(0), 3, 40), Vec::<String>::new());
+    assert_eq!(lines_of(&lines(3), 3, 40), lines(3), "exactly its most says nothing more");
+    assert_eq!(lines_of(&lines(4), 3, 40), ["line0", "line1", "line2", "and 1 more are not listed here."]);
+    assert_eq!(lines_of(&lines(9), 3, 40).last().map(String::as_str), Some("and 6 more are not listed here."));
+    assert_eq!(lines_of(&["x".repeat(50)], 3, 40), [format!("{} … (cut, 50 characters in all)", "x".repeat(40))]);
+    assert_eq!(some_of(&lines(3), 3, 40), "line0, line1, line2");
+    assert_eq!(some_of(&lines(4), 3, 40), "line0, line1, line2 and 1 more");
+    assert_eq!(some_of(&lines(9), 3, 40), "line0, line1, line2 and 6 more");
+    assert_eq!(some_of(&["y".repeat(50)], 3, 40), format!("{} … (cut, 50 characters in all)", "y".repeat(40)));
+}
+
+/// A kind that is described in full only up to a number names the rest and counts them (a backup of hundreds of them is not a preview of
+/// many megabytes); one of exactly that number is all described. The kinds that are limited are listed here, so that a kind that is given a
+/// limit is tested (the campaigns are in the test of many long campaigns).
+#[test]
+fn a_kind_that_is_described_in_full_only_up_to_a_number_names_and_counts_the_rest() {
+    use super::parts::KINDS;
+    let limited: Vec<(&str, usize)> = KINDS.iter().filter_map(|k| k.full.map(|n| (k.id, n))).collect();
+    assert_eq!(limited, [("template", 400), ("connector", 100), ("campaign", 50)], "a kind that is limited is built and tested here");
+    let check = |kind: &str, dir: &str, n: usize, body: &dyn Fn(usize) -> String| {
+        for count in [n, n + 3] {
+            let files: Vec<(String, String)> = (0..count).map(|i| (format!("{dir}/x{i:03}.json"), body(i))).collect();
+            let refs: Vec<(&str, String)> = files.iter().map(|(name, text)| (name.as_str(), text.clone())).collect();
+            let items = inspect_desktop_files(&refs, false);
+            let described = items.iter().filter(|i| i.kind == kind).count();
+            let named: Vec<&review::ReviewItem> = items.iter().filter(|i| i.kind == "more" && i.name.starts_with(dir)).collect();
+            assert_eq!(described, count.min(n), "{kind} x {count}");
+            assert_eq!(named.len(), count.saturating_sub(n), "{kind} x {count}");
+            assert!(named.iter().all(|i| i.what.contains(&format!("only the first {n} are described in full"))), "{kind}: {:?}", named.first().map(|i| &i.what));
+        }
+    };
+    check("connector", "connectors", 100, &|i| serde_json::json!({ "id": format!("c{i}"), "name": format!("C{i}"), "defaultBaseUrl": format!("https://c{i}.example") }).to_string());
+    check("template", "templates", 400, &|i| serde_json::json!({ "id": format!("t{i}"), "name": format!("T{i}"), "run": { "command": "c" } }).to_string());
+}
+
 /// The desktop and the dashboard make the same characters visible: the ranges of `is_invisible` (`parts.rs`) are those of `isInvisible`
 /// (`visibleText.ts`), for every code point there is. (There are two copies of the rule, one in each language, because a text reaches the
 /// person by the desktop and the dashboard draws whatever it is given; this holds them together.)
