@@ -17,8 +17,9 @@ if (PHP_SAPI !== 'cli') {
  *
  * It refuses when data/ lies inside public/, when a canary file put in data/ is served over the web, and when the relay is
  * already installed. The canary is requested at the --url address unless --probe-url names another one (a host whose own
- * address is not reachable from itself yet) or --no-probe skips it; an address that cannot be reached is a note that says
- * the exposure was not checked, never a silent pass. --rekey writes a new first key (after a lost one) through the same
+ * address is not reachable from itself yet) or --no-probe skips it; it is asked for at /data/ and at the places a folder
+ * above data/ could serve it (/relay/data/ for a relay in a folder of a site); an address that cannot be reached is a note
+ * that says the exposure was not checked, never a silent pass. --rekey writes a new first key (after a lost one) through the same
  * checks and changes nothing else.
  *
  * Exit codes: 0 done, 1 refused or failed, 2 usage.

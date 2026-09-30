@@ -23,11 +23,14 @@ function inst_copy_tree(string $from, string $to): void
     }
 }
 
-/** A scratch copy of the relay (src, bin, public, VERSION) in a temp directory. Returns its root. */
-function inst_scratch(): string
+/** A scratch copy of the relay (src, bin, public, VERSION) in a temp directory, or in a folder named oaiy-relay inside $site (a site that holds it). Returns its root. */
+function inst_scratch(?string $site = null): string
 {
     $src = dirname(__DIR__, 2);
-    $root = Tmp::dir('scratch');
+    $root = $site === null ? Tmp::dir('scratch') : $site . '/oaiy-relay';
+    if ($site !== null) {
+        mkdir($root, 0700, true);
+    }
     foreach (['src', 'bin', 'public'] as $d) {
         inst_copy_tree($src . '/' . $d, $root . '/' . $d);
     }
@@ -383,6 +386,62 @@ test('4.18.2 installer CLI: --rekey goes through the same probe, at the address 
     // With --no-probe the owner has been told it is on them.
     [$code, , $err] = inst_cli($root, 'install.php', ['--rekey', '--no-probe']);
     eq(0, $code);
+});
+
+test('4.18.2 installer: a relay unpacked into a folder of a site is probed where it is served, /oaiy-relay/data/, and not only at the origin\'s /data/', function () {
+    // The site's document root is the folder that holds the relay folder: the origin's /data/ is nothing, /oaiy-relay/data/ is
+    // the relay's secrets. The probe used to ask the first and report "data/ is not readable through the web".
+    $site = Tmp::dir('site');
+    $root = inst_scratch($site);
+    $srv = Server::start($site, ['prepend' => false, 'name' => 'inst-site']);
+    [$code, $out, $err] = inst_cli($root, 'install.php', ['--url=https://relay.example.com', '--probe-url=' . $srv->base()]);
+    eq(1, $code, "stdout: $out stderr: $err");
+    contains('can be read through the web', $err);
+    contains('/oaiy-relay/', $err, 'it names the folder the canary was served under');
+    not_contains('not readable', $out . $err);
+    foreach (['installed.lock', 'config.json', 'first-key.txt', 'admin-token.txt', 'relay.sqlite', 'secrets/relay.key'] as $f) {
+        ok(!file_exists($root . '/data/' . $f), "$f was not written");
+    }
+    ok(glob($root . '/data/canary-*') === [] || !is_dir($root . '/data'), 'no canary left behind');
+    // The same, asked at --url with no --probe-url (the default probe), and by the guard that the web installer and a re-key use.
+    [$code, $out, $err] = inst_cli($root, 'install.php', ['--url=' . $srv->base()]);
+    eq(1, $code, "stdout: $out stderr: $err");
+    contains('can be read through the web', $err);
+    $e = throws(fn() => Oaiy\Relay\Installer::guard($root . '/data', ['probeUrl' => $srv->base()]), Oaiy\Relay\InstallRefused::class);
+    eq('reachable', $e->kind);
+    // A --probe-url that carries the path where the site serves the relay folder (an alias the folders do not spell) works too.
+    [$code, $out, $err] = inst_cli($root, 'install.php', ['--url=https://relay.example.com', '--probe-url=' . $srv->base() . '/oaiy-relay']);
+    eq(1, $code, "stdout: $out stderr: $err");
+    contains('can be read through the web', $err);
+    // The proof that the layout is wrong: a file in data/ is handed out there, and is not at the origin's /data/.
+    mkdir($root . '/data');
+    file_put_contents($root . '/data/first-key.txt', "not a real key\n");
+    eq(200, $srv->request('GET', '/oaiy-relay/data/first-key.txt')['status'], 'this layout serves data/ under the relay folder');
+    eq(404, $srv->request('GET', '/data/first-key.txt')['status'], 'and not at the origin');
+});
+
+test('4.18.2 installer: a relay in a folder of a site whose document root is its public/ passes the wider probe, and the places the probe asks are the ones a folder above data/ could serve it at', function () {
+    $site = Tmp::dir('site');
+    $root = inst_scratch($site);
+    $srv = Server::start($root . '/public', ['prepend' => false, 'name' => 'inst-pub']);
+    [$code, $out, $err] = inst_cli($root, 'install.php', ['--url=https://relay.example.com', '--probe-url=' . $srv->base()]);
+    eq(0, $code, "stdout: $out stderr: $err");
+    contains('data/ is not readable through the web', $out);
+    // The list of places: data, then the relay folder and each folder above it in turn, up to the depth; anything a URL path
+    // cannot carry as it is (a drive letter, a space) ends it.
+    eq(['/data', '/oaiy-relay/data', '/html/oaiy-relay/data', '/www/html/oaiy-relay/data'], Oaiy\Relay\Installer::canaryPaths('/var/www/html/oaiy-relay/data'));
+    eq(['/data', '/relay/data', '/srv/relay/data'], Oaiy\Relay\Installer::canaryPaths('C:/srv/relay/data/'));
+    eq(['/data', '/my-relay/data'], Oaiy\Relay\Installer::canaryPaths('/home/my site/my-relay/data'));
+    eq(['/data', '/site/data'], Oaiy\Relay\Installer::canaryPaths('/site/data'), 'a short path gives a short list');
+    eq(['/data', '/relay-data'], Oaiy\Relay\Installer::canaryPaths('/srv/x y/relay-data'), 'a data folder of another name is asked for under its own name too');
+    eq(['/data'], Oaiy\Relay\Installer::canaryPaths('data'));
+    // An unreachable address is one answer, null: the exposure was not checked.
+    $dead = 'http://127.0.0.1:' . Server::freePort();
+    eq(null, Oaiy\Relay\Installer::canaryReachable($root . '/data', $dead));
+    // Every path answered 404: not served anywhere.
+    $served = 'unset';
+    eq(false, Oaiy\Relay\Installer::canaryReachable($root . '/data', $srv->base(), $served));
+    eq(null, $served);
 });
 
 test('4.18.2 installer (both, and a re-key): one guard refuses data/ inside public/, inside the server\'s own document root and a served canary, before anything is written', function () {

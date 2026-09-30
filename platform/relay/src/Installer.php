@@ -89,30 +89,78 @@ XML;
         return Fs::isInside($inner, $outer) || Doctor::isInsideLoose($inner, $outer);
     }
 
+    /** How many trailing folders of data/'s own path name a place where it could be served (data, relay/data, site/relay/data ...). */
+    public const CANARY_DEPTH = 4;
+
     /**
-     * Ask the web whether data/ can be read: write a canary there and request it under the public URL. Returns true
-     * when the canary is served (a failure), false when the answer is 403 or 404, null when the URL cannot be reached.
+     * The URL paths at which data/ would be served if some folder above it were the document root: /data (the relay folder
+     * is the root), then /<relay folder>/data (the relay is one folder inside a site), then one folder more each, up to
+     * CANARY_DEPTH. A relay unpacked into a folder of an existing site is exactly the layout where data/ is served under a
+     * path, and asking the site's origin for /data/ alone reports it as protected. A folder name the URL could not carry
+     * as it is ends the list.
+     *
+     * @return list<string> paths with a leading slash and none trailing
      */
-    public static function canaryReachable(string $dataDir, string $baseUrl): ?bool
+    public static function canaryPaths(string $dataDir): array
     {
+        $segments = explode('/', str_replace('\\', '/', $dataDir));
+        $paths = ['/data'];
+        $tail = [];
+        for ($i = count($segments) - 1; $i >= 0 && count($tail) < self::CANARY_DEPTH; $i--) {
+            $s = $segments[$i];
+            if ($s === '') {
+                continue;
+            }
+            if (preg_match('#^[A-Za-z0-9._~-]+$#D', $s) !== 1 || $s === '.' || $s === '..') {
+                break; // a drive letter, a space, a dot folder: no URL path is made from it or from anything above it
+            }
+            array_unshift($tail, $s);
+            $path = '/' . implode('/', $tail);
+            if (!in_array($path, $paths, true)) {
+                $paths[] = $path;
+            }
+        }
+        return $paths;
+    }
+
+    /**
+     * Ask the web whether data/ can be read: write a canary there and request it under the public URL, at /data/ and at the
+     * paths canaryPaths() lists (a relay in a folder of a site is served there). Returns true when the canary is served at
+     * any of them (a failure; $servedAt then names the path), false when every answer is something else, null when the
+     * URL cannot be reached (or any one of the requests could not be).
+     */
+    public static function canaryReachable(string $dataDir, string $baseUrl, ?string &$servedAt = null): ?bool
+    {
+        $servedAt = null;
         $name = 'canary-' . bin2hex(random_bytes(6)) . '.txt';
         $file = $dataDir . '/' . $name;
         $content = 'oaiy-relay-canary-' . bin2hex(random_bytes(8));
         $created = !is_dir($dataDir);
         Paths::ensureDir($dataDir);
         file_put_contents($file, $content);
+        $unreached = false;
         try {
-            $r = HttpProbe::get(rtrim($baseUrl, '/') . '/data/' . $name, [], 5.0, 4096);
+            foreach (self::canaryPaths($dataDir) as $i => $path) {
+                $r = HttpProbe::get(rtrim($baseUrl, '/') . $path . '/' . $name, [], 5.0, 4096);
+                if ($r['status'] === 0) {
+                    $unreached = true;
+                    if ($i === 0) {
+                        break; // the address itself is away: the other paths would only wait as long again
+                    }
+                    continue;
+                }
+                if ($r['status'] === 200 && strpos($r['body'], $content) !== false) {
+                    $servedAt = $path;
+                    return true;
+                }
+            }
         } finally {
             @unlink($file);
             if ($created) {
                 @rmdir($dataDir); // a refused install leaves no folder behind (rmdir fails, harmlessly, when something else is in it)
             }
         }
-        if ($r['status'] === 0) {
-            return null;
-        }
-        return $r['status'] === 200 && strpos($r['body'], $content) !== false;
+        return $unreached ? null : false;
     }
 
     /**
@@ -139,9 +187,10 @@ XML;
         $checked = false;
         $probe = $opts['probeUrl'] ?? null;
         if (is_string($probe) && $probe !== '') {
-            $reach = self::canaryReachable($dataDir, $probe);
+            $servedAt = null;
+            $reach = self::canaryReachable($dataDir, $probe, $servedAt);
             if ($reach === true) {
-                throw new InstallRefused('reachable', 'the data folder can be read through the web at ' . $probe . '; fix the document root first');
+                throw new InstallRefused('reachable', 'the data folder can be read through the web at ' . $probe . ($servedAt !== null && $servedAt !== '/data' ? ' (under ' . $servedAt . '/)' : '') . '; fix the document root first');
             }
             if ($reach === null) {
                 $notes[] = 'the address could not be reached, so the exposure of data/ was not checked; run php bin/doctor.php --url=... once the web server is set up';

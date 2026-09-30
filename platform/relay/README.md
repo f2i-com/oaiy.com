@@ -78,7 +78,12 @@ A lost first key is re-armed, never re-issued over the network: create `INSTALL_
   (the web installer knows it), or a canary file put in `data/` that is served over the web. **The canary probe is on by
   default**: the command line asks at the `--url` address (or at `--probe-url` if you name another), the web installer at the
   public address you type, a re-key at the address in `config.json`. Refusal happens before any question is asked and before
-  anything is written, so a document root that is the relay folder leaves no key behind. An address that cannot be reached is
+  anything is written, so a document root that is the relay folder leaves no key behind. The canary is asked for at `/data/` and
+  at every place a folder above `data/` could serve it (`/relay/data/`, `/site/relay/data/`, up to four folders of `data/`'s own
+  path), because a relay unpacked into a folder of an existing site is served under that folder's name and the origin's
+  `/data/` says nothing about it; a canary served at any of them is a refusal that names the folder. A site that maps the
+  relay to a name its folders do not have (an alias, a rewrite) is asked with `--probe-url=` followed by the address and path
+  where the relay folder is served. An address that cannot be reached is
   never a silent pass: the installer says the exposure of `data/` was **not checked** and to run the doctor once the site is up.
   `--no-probe` (and the web form's "do not ask" box) skips the probe on purpose, and says so. It refuses a second run.
 - The web installer works only while `INSTALL_ENABLED` exists and the relay is not installed; a wrong or missing token is a
