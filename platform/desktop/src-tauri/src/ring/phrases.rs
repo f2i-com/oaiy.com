@@ -125,9 +125,11 @@ fn rules(names: &[String]) -> Rules {
         r"\b(?:without|instead of|rather than|as opposed to|in place of) (?:\w+ ){0,2}(?:speak|talk|chat|transfer|put|patch|connect)\w*\b".to_string(),
         // A question about how, or when, or by what number, not a request: "how do I speak to the owner", "what number can I use to talk to them".
         r"\b(?:how (?:do|can|could|would|should|might) (?:i|we)|what (?:number|way|time|day|hours?)|when (?:can|could|do|does|is|will)|where (?:do|can|could)) (?:\w+ ){0,6}(?:speak|talk|chat|reach|contact|get hold of|get through|transfer|put)\w*\b".to_string(),
-        // Who they are speaking to now, and someone else: "I'm talking to someone else in the room".
-        r"\b(?:speak|talk|chat)(?:ing)? (?:to|with) (?:\w+ ){0,2}else\b".to_string(),
-        r"\b(?:i m|i am|we re|we are) (?:\w+ ){0,1}(?:speaking|talking|chatting) (?:to|with)\b".to_string(),
+        // Who they are speaking to now, and someone else: "I'm talking to someone else in the room", "talking to someone else, hold on". Only
+        // the participle: "can I speak to someone else" and "can I talk to somebody else about this" are plain asks for a person.
+        r"\b(?:speaking|talking|chatting) (?:to|with) (?:\w+ ){0,2}else\b".to_string(),
+        // (The apostrophe stays in a word, so "I'm" is one, as "I am" is two.)
+        r"\b(?:i m|i'm|i am|we re|we're|we are) (?:\w+ ){0,1}(?:speaking|talking|chatting) (?:to|with)\b".to_string(),
         // About the future or the past, or about themselves: not asking.
         r"\bi(?:'ll| will| shall|'m going to| am going to|'m gonna| am gonna) (?:\w+ ){0,2}(?:speak|talk|chat|call|ring)\b".to_string(),
         r"\b(?:speak|talk|chat)(?:ing)? (?:to|with) (?:\w+ ){0,3}myself\b".to_string(),
@@ -488,7 +490,7 @@ mod tests {
         let positives = cases(OAIY_EXTRA, "positive");
         let negatives = cases(OAIY_EXTRA, "negative");
         // (What only this desktop counts or refuses: none of it is in the shared fixture, whose cases are not repeated here.)
-        assert!(positives.len() >= 33 && negatives.len() >= 37, "{} {}", positives.len(), negatives.len());
+        assert!(positives.len() >= 37 && negatives.len() >= 40, "{} {}", positives.len(), negatives.len());
         // (Compared as written, lower-cased: a case that differs only in what the shared normaliser reads past, such as a zero width space, is
         // this desktop's own to keep.)
         let shared_turns: std::collections::BTreeSet<String> = ["positive", "negative"].iter().flat_map(|group| cases(SHARED, group)).map(|turns| turns.iter().map(|t| t.to_lowercase()).collect::<Vec<_>>().join(" | ")).collect();
@@ -510,6 +512,20 @@ mod tests {
         }
         for turns in named("negative") {
             assert!(!caller_asked_for(&turns, &names), "{turns:?} does not");
+        }
+    }
+
+    #[test]
+    fn someone_else_is_a_person_to_ask_for_and_a_caller_who_is_talking_to_someone_else_is_not_asking() {
+        // "Someone else" is a plain ask for a person (the caller wants to be put through to another person than the one they have), in every
+        // way of asking...
+        for said in ["Can I speak to someone else", "can I talk to somebody else about this", "I want to speak to someone else", "Could I please talk to someone else", "Can I speak with somebody else please"] {
+            assert!(caller_asked(&[said]), "{said}");
+        }
+        // ...and a caller who says they are talking to someone else, or to the owner, is telling the receptionist so and not asking. (The
+        // apostrophe stays in a word, so "I'm" and "we're" are read as the words they are.)
+        for said in ["I'm talking to someone else in the room, hold on", "talking to someone else, hold on", "I'm speaking to someone else right now", "we are chatting with someone else", "I am talking to somebody else", "hold on I'm talking with someone else here", "I'm talking to the owner, right?", "We're speaking to the manager now", "we\u{2019}re talking to the boss"] {
+            assert!(!caller_asked(&[said]), "{said}");
         }
     }
 

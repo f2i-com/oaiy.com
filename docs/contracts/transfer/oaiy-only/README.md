@@ -81,9 +81,10 @@ The plan reasons OAIY puts in an `oaiy.ring.plan` answer are exactly the plugin'
   back ("never mind", "forget it", "no thanks", in the same turn or a later one), being told to say or write it
   ("Please say: ...", "Write '...'"), what someone else said or allowed however long ago in the sentence, a question
   about how or when or by what number, a question put to the receptionist ("do you want me to speak to the
-  owner"), a different target ("transfer me to billing"), and someone else in the room. When the gate refuses a
+  owner"), a different target ("transfer me to billing"), and a caller who says they are talking to someone else ("I'm talking to someone else
+  in the room"; but "can I speak to someone else" is an ask for a person, and counts). When the gate refuses a
   caller who did ask, the model is told to offer a message, so the caller has one or the other.
-  `phrases-oaiy.json` holds the cases (33 requests, 37 that are not, and the 10 and 7 named ones), none of them in the
+  `phrases-oaiy.json` holds the cases (37 requests, 40 that are not, and the 10 and 7 named ones), none of them in the
   shared file as written. The phone's floor runs first: the same algorithm as this desktop's over the rules of the shared file
   (`transfer-v1.caller-asked.fixture.json`), with no names. This desktop passes that file in full: every positive, negative,
   window and backchannel case, and its word lists for the acknowledgements, however many the file has. The floor has every way
