@@ -339,7 +339,8 @@ jobs:
       - name: Playwright server guard tests (Python)
         shell: bash
         run: |
-          py=python3; command -v python3 >/dev/null 2>&1 || py=python
+          # The one that runs: on a Windows runner python3 can be the Store stub, which is found and fails.
+          py=python3; "$py" -c "" >/dev/null 2>&1 || py=python
           "$py" -m unittest discover -s platform/desktop/scripts -p "test_*.py"
       # Native tests in BOTH shipped configurations: the headless server (no
       # default features) and the GUI feature set the desktop installer ships.
