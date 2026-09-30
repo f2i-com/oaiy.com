@@ -55,12 +55,14 @@
 //! webview origin, and any local process can forge the `Origin` header, so a
 //! token is the only credential trusted off the GUI. Public without one are only
 //! the health route (`/api/health`), capability discovery
-//! (`/api/bridge/capabilities`) and the pairing bootstrap (`/api/bridge/pairing`).
-//! With no OAIY_SERVER_TOKEN set that is ALL the server answers: everything else,
-//! reads included, is refused. Set a token to administer the server — the CLI sends
-//! `Authorization: Bearer <token>`. (A token that pairing minted, or the one this
-//! process hands the flow runs it starts, is accepted too; approving a pairing
-//! needs a bearer to begin with.)
+//! (`/api/bridge/capabilities`) and the pairing bootstrap (`/api/bridge/pairing`):
+//! on a build with the web login (the release's) the last two are open to a caller
+//! with no credential once an owner exists, and before that, in setup-only mode, to
+//! a caller WITH one (the token) only. With no OAIY_SERVER_TOKEN set that is ALL the
+//! server answers: everything else, reads included, is refused. Set a token to
+//! administer the server — the CLI sends `Authorization: Bearer <token>`. (A token
+//! that pairing minted, or the one this process hands the flow runs it starts, is
+//! accepted too; approving a pairing needs a bearer to begin with.)
 //!
 //! SIGTERM / Ctrl-C stops every managed service before exiting, and on unix the plugins
 //! first (on Windows a plugin ends with the server's job object).

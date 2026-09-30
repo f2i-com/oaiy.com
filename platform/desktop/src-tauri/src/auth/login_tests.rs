@@ -2870,6 +2870,278 @@ async fn setup_only_mode_lets_a_console_credential_through_before_there_is_an_ow
         );
     }
 }
+
+/// An existing headless install has `OAIY_SERVER_TOKEN` and no owner. On the web build (what the release ships now) its
+/// server is in setup-only mode until `oaiy-server auth init`, which answers a STRANGER `setup_required` on the public
+/// routes of the bridge. It answered the operator's own valid token that too, where the same token reached every
+/// protected route: capability discovery (which bridge clients call with the token on, `bridge-client.ts`) and the
+/// pairing routes were closed to it, and the install could not be discovered. The gate is for the unauthenticated.
+#[tokio::test]
+async fn a_token_only_install_with_no_owner_lets_its_token_through_the_setup_only_gate_and_keeps_a_stranger_out(
+) {
+    const TOKEN: &str = "Vl0JTnJtFseAe9ePKCDhuBymfRXQ8osZ-QMlM86leCU";
+    let e = build(Build {
+        static_token: Some(TOKEN),
+        ..Build::default()
+    });
+    assert!(!e.state.owner_configured());
+    // The public routes of the bridge, the ones the gate closes, and a few of the protected ones (the operator's token
+    // reached those all along: it is the `cli` preset, `system.read` and `services.read` among others).
+    let closed_to_strangers = [
+        (Method::GET, "/api/bridge/capabilities"),
+        (Method::POST, "/api/bridge/pairing"),
+        (Method::GET, "/api/bridge/pairing/x"),
+    ];
+    let protected = [
+        (Method::GET, "/api/services"),
+        (Method::GET, "/api/config"),
+        (Method::GET, "/api/node"),
+        (Method::GET, "/api/update/status"),
+        (Method::GET, "/api/auth/whoami"),
+    ];
+    let ask = |e: &Env, m: &Method, p: &str| req(e, m.clone(), p).json(json!({}));
+    for (m, p) in closed_to_strangers.iter().chain(protected.iter()) {
+        // A stranger: `setup_required`, as R11 has it.
+        let r = go(&e, ask(&e, m, p)).await;
+        assert_eq!(
+            (r.status, r.code().as_deref()),
+            (401, Some("setup_required")),
+            "a stranger: {m} {p}: {}",
+            r.text
+        );
+        // The token: the route answers (the stubs here say `ok`; `whoami` says who this is).
+        let r = go(&e, ask(&e, m, p).bearer(TOKEN)).await;
+        assert_eq!(r.status, 200, "the token: {m} {p}: {}", r.text);
+    }
+    let me = go(&e, req(&e, Method::GET, "/api/auth/whoami").bearer(TOKEN)).await;
+    assert_eq!(me.json()["kind"], "static");
+    // A stranger that carries a session cookie (a leftover one, a garbage one, a well-formed one the store has never heard
+    // of) is a stranger still: no cookie opens or changes this gate, and the cookie is not read as a credential on a route
+    // that the gate closes (it is `setup_required`, not the `token_invalid` or `csrf` that reading it would say).
+    let unknown = token::mint(Kind::Ses).unwrap().token;
+    for value in ["garbage".to_string(), unknown] {
+        let cookie = format!("{}={value}", session_cookie_name(&e));
+        for (m, p) in &closed_to_strangers {
+            let r = go(&e, ask(&e, m, p).cookie(&cookie)).await;
+            assert_eq!(
+                (r.status, r.code().as_deref()),
+                (401, Some("setup_required")),
+                "a stranger with a session cookie: {m} {p}: {}",
+                r.text
+            );
+        }
+    }
+    // A token that is not the operator's is what it is anywhere, on the public routes too: not `setup_required`, which
+    // would say nothing about the credential, and it is counted (the throttle) as a wrong bearer is.
+    for (m, p) in closed_to_strangers.iter().chain(protected.iter().take(1)) {
+        let wrong = format!("W{}", &TOKEN[1..]);
+        let r = go(&e, ask(&e, m, p).bearer(&wrong)).await;
+        assert_eq!(
+            (r.status, r.code().as_deref()),
+            (401, Some("token_invalid")),
+            "a wrong token: {m} {p}: {}",
+            r.text
+        );
+        // One that is not even a bearer is a bad request, as it is everywhere.
+        let r = go(&e, ask(&e, m, p).h("authorization", "Bearer a b")).await;
+        assert_eq!(
+            (r.status, r.code().as_deref()),
+            (400, Some("bad_request")),
+            "a malformed bearer: {m} {p}: {}",
+            r.text
+        );
+        // A scheme that is not Bearer says nothing: the caller has no credential.
+        let r = go(&e, ask(&e, m, p).h("authorization", "Basic dXNlcjpwdw==")).await;
+        assert_eq!(
+            (r.status, r.code().as_deref()),
+            (400, Some("bad_request")),
+            "not a bearer: {m} {p}: {}",
+            r.text
+        );
+    }
+    // Every wrong guess counted: a flood of them from one address is blocked, on the public routes as on the others.
+    let mut last = 0;
+    for _ in 0..30 {
+        let wrong = format!("W{}", &TOKEN[1..]);
+        let r = go(
+            &e,
+            ask(&e, &Method::GET, "/api/bridge/capabilities").bearer(&wrong),
+        )
+        .await;
+        last = r.status;
+        if last == 429 {
+            break;
+        }
+    }
+    assert_eq!(
+        last, 429,
+        "guessing the token on a public route is throttled"
+    );
+
+    // With an owner, as R11 has it: the public routes are public again, to a stranger as to the token, and the token
+    // is what it was.
+    let e = build(Build {
+        static_token: Some(TOKEN),
+        ..Build::default()
+    });
+    make_owner(&e, PASSWORD).await;
+    assert!(e.state.owner_configured());
+    for (m, p) in &closed_to_strangers {
+        let r = go(&e, ask(&e, m, p)).await;
+        assert_ne!(r.code().as_deref(), Some("setup_required"), "{m} {p}");
+        assert_eq!(
+            r.status, 200,
+            "a stranger, with an owner: {m} {p}: {}",
+            r.text
+        );
+        let r = go(&e, ask(&e, m, p).bearer(TOKEN)).await;
+        assert_eq!(
+            r.status, 200,
+            "the token, with an owner: {m} {p}: {}",
+            r.text
+        );
+    }
+    for (m, p) in &protected {
+        let r = go(&e, ask(&e, m, p)).await;
+        assert_eq!(
+            (r.status, r.code().as_deref()),
+            (401, Some("auth_required")),
+            "a stranger, with an owner: {m} {p}: {}",
+            r.text
+        );
+        let r = go(&e, ask(&e, m, p).bearer(TOKEN)).await;
+        assert_eq!(
+            r.status, 200,
+            "the token, with an owner: {m} {p}: {}",
+            r.text
+        );
+    }
+}
+
+/// The gate's exception is a valid credential, not the static token alone: a token of the store (one that was paired or
+/// made on the console) passes the gate on the public routes of the bridge as it reaches every other route, and a dead one
+/// (revoked, expired) is what it is anywhere (`401 token_revoked`, `401 token_expired`), and not `setup_required`, which
+/// says nothing of the credential. The install whose `owner.json` was deleted and whose `credentials.json` survived is
+/// this shape.
+#[tokio::test]
+async fn a_token_of_the_store_passes_the_setup_only_gate_and_a_dead_one_is_not_told_setup_required()
+{
+    let e = build(Build::default());
+    assert!(!e.state.owner_configured());
+    let gated = [
+        (Method::GET, "/api/bridge/capabilities"),
+        (Method::POST, "/api/bridge/pairing"),
+        (Method::GET, "/api/bridge/pairing/x"),
+    ];
+    let ask = |e: &Env, m: &Method, p: &str| req(e, m.clone(), p).json(json!({}));
+    let (live, revoked, expired) = (a_pat(&e), a_pat(&e), a_pat(&e));
+    assert!(e.store.revoke(&revoked.id, "revoked"));
+    for (m, p) in &gated {
+        let r = go(&e, ask(&e, m, p)).await;
+        assert_eq!(
+            (r.status, r.code().as_deref()),
+            (401, Some("setup_required")),
+            "a stranger: {m} {p}: {}",
+            r.text
+        );
+        let r = go(&e, ask(&e, m, p).bearer(&live.token)).await;
+        assert_eq!(r.status, 200, "a token of the store: {m} {p}: {}", r.text);
+        let r = go(&e, ask(&e, m, p).bearer(&revoked.token)).await;
+        assert_eq!(
+            (r.status, r.code().as_deref()),
+            (401, Some("token_revoked")),
+            "a revoked token: {m} {p}: {}",
+            r.text
+        );
+    }
+    // It is the guard's own judgement: the same token is who it is on a route that asks for a credential.
+    let me = go(
+        &e,
+        req(&e, Method::GET, "/api/auth/whoami").bearer(&live.token),
+    )
+    .await;
+    assert_eq!(
+        (me.status, me.json()["kind"].as_str()),
+        (200, Some("pat")),
+        "{}",
+        me.text
+    );
+    // One that has run out is dead too.
+    e.clock.advance(31 * 24 * HOUR);
+    for (m, p) in &gated {
+        let r = go(&e, ask(&e, m, p).bearer(&expired.token)).await;
+        assert_eq!(
+            (r.status, r.code().as_deref()),
+            (401, Some("token_expired")),
+            "an expired token: {m} {p}: {}",
+            r.text
+        );
+    }
+}
+
+/// What the operator's static token is on the web build (the `cli` preset), which is less than it reached in `legacy`:
+/// these are the routes that existed before the access model and that it cannot reach now, `403 insufficient_scope`,
+/// by the scope each asks for. They are written in the README (The headless server on the web build) and `oaiy-server
+/// check` says how many there are: this pins both to the table, so that a route the model adds or re-classifies
+/// changes what the operator is told.
+#[tokio::test]
+async fn the_static_token_loses_exactly_the_routes_the_documents_list() {
+    let cli = super::presets::Preset::Cli.scopes();
+    let mut lost: std::collections::BTreeMap<&str, usize> = Default::default();
+    let mut total = 0;
+    for r in ROUTES {
+        if r.since == 1 {
+            if let Class::Scope(s) = r.class {
+                if !cli.contains(s) {
+                    *lost.entry(s).or_default() += 1;
+                    total += 1;
+                }
+            }
+        }
+    }
+    assert_eq!(total, super::exposure::TOKEN_ONLY_LOSES_ROUTES);
+    let scopes: Vec<&str> = lost.keys().copied().collect();
+    assert_eq!(scopes, super::exposure::TOKEN_ONLY_LOSES_SCOPES);
+    // ... and it is what the guard says to the token: a 403 naming the scope, on a sample of each scope.
+    let e = build(Build {
+        static_token: Some("Vl0JTnJtFseAe9ePKCDhuBymfRXQ8osZ-QMlM86leCU"),
+        ..Build::default()
+    });
+    make_owner(&e, PASSWORD).await;
+    for scope in &scopes {
+        let row = ROUTES
+            .iter()
+            .find(|r| r.since == 1 && matches!(r.class, Class::Scope(s) if s == *scope))
+            .unwrap();
+        let method = match row.method {
+            Verb::Get => Method::GET,
+            Verb::Post => Method::POST,
+            Verb::Put => Method::PUT,
+            Verb::Delete => Method::DELETE,
+            Verb::Patch => Method::PATCH,
+            other => panic!("{other:?}"),
+        };
+        let path: String = row
+            .pattern
+            .split('/')
+            .map(|s| if s.starts_with(':') { "x" } else { s })
+            .collect::<Vec<_>>()
+            .join("/");
+        let r = go(
+            &e,
+            req(&e, method.clone(), &path)
+                .json(json!({}))
+                .bearer("Vl0JTnJtFseAe9ePKCDhuBymfRXQ8osZ-QMlM86leCU"),
+        )
+        .await;
+        assert_eq!(
+            (r.status, r.code().as_deref()),
+            (403, Some("insufficient_scope")),
+            "{method} {path} ({scope}): {}",
+            r.text
+        );
+    }
+}
 // ==================================== the memory bound and the allow-list =============================
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]

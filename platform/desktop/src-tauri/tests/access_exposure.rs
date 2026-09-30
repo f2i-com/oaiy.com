@@ -947,6 +947,159 @@ fn t45_lan_optin_a_proxy_only_server_with_no_owner_starts_in_setup_only_mode() {
     );
 }
 
+/// An existing headless install: `OAIY_SERVER_TOKEN` and nothing else (no owner, no public URL, loopback). The release
+/// builds the server with the web login now, where it was built without; what a caller meets must not depend on which.
+/// A server without the web login answers the public routes of the bridge to anyone (legacy); the web build is in
+/// setup-only mode until there is an owner, which answers a stranger `setup_required` and, since the gate is for the
+/// unauthenticated, answers the operator's token as it answers it everywhere else. The token is the `cli` preset there:
+/// what `legacy` let it reach and it cannot is `403 insufficient_scope`, and `check` says so.
+#[test]
+fn n1_a_token_only_install_is_discoverable_with_its_token_on_the_web_build_and_by_anyone_on_the_other(
+) {
+    let scratch = Scratch::new("token-only");
+    let server = Server::start(
+        &scratch,
+        &[
+            ("OAIY_SERVER_TOKEN", TOKEN),
+            (
+                "OAIY_ACCESS_MODE",
+                if cfg!(feature = "web") {
+                    "scoped"
+                } else {
+                    "legacy"
+                },
+            ),
+        ],
+    );
+    let bearer = format!("Bearer {TOKEN}");
+    let with = [("authorization", bearer.as_str())];
+    for (method, path) in [
+        ("GET", "/api/bridge/capabilities"),
+        ("POST", "/api/bridge/pairing"),
+        ("GET", "/api/bridge/pairing/x"),
+    ] {
+        let (status, body, text) = server.ask("127.0.0.1", method, path, &with);
+        assert_ne!(status, 401, "the token: {method} {path}: {text}");
+        assert_ne!(
+            code(&body),
+            Some("setup_required"),
+            "the token: {method} {path}: {text}"
+        );
+        let (status, body, text) = server.ask("127.0.0.1", method, path, &[]);
+        if cfg!(feature = "web") {
+            assert_eq!(
+                (status, code(&body)),
+                (401, Some("setup_required")),
+                "a stranger: {method} {path}: {text}"
+            );
+        } else {
+            assert_ne!(status, 401, "legacy: {method} {path}: {text}");
+        }
+    }
+    let (status, body, text) = server.ask("127.0.0.1", "GET", "/api/bridge/capabilities", &with);
+    assert_eq!(status, 200, "{text}");
+    assert!(body["capabilities"].is_array(), "{text}");
+    // A token that is not the operator's is refused as a wrong token, on a public route too.
+    let wrong = format!("Bearer W{}", &TOKEN[1..]);
+    let (status, body, text) = server.ask(
+        "127.0.0.1",
+        "GET",
+        "/api/bridge/capabilities",
+        &[("authorization", wrong.as_str())],
+    );
+    if cfg!(feature = "web") {
+        assert_eq!(
+            (status, code(&body)),
+            (401, Some("token_invalid")),
+            "{text}"
+        );
+    } else {
+        assert_eq!(status, 200, "{text}");
+    }
+    // The protected routes answer the token on both.
+    for path in ["/api/config", "/api/services", "/api/node"] {
+        let (status, _, text) = server.ask("127.0.0.1", "GET", path, &with);
+        assert_eq!(status, 200, "{path}: {text}");
+    }
+    // What the web build's `cli` preset is not: a route of the model that `legacy` let it reach.
+    let (status, body, text) = server.ask("127.0.0.1", "GET", "/api/calendar", &with);
+    if cfg!(feature = "web") {
+        assert_eq!(
+            (status, code(&body)),
+            (403, Some("insufficient_scope")),
+            "{text}"
+        );
+    } else {
+        assert_ne!(status, 403, "{text}");
+    }
+    // `check` tells the operator of the web build, before it starts, what the token is there.
+    let (code, _out, err) = check(
+        &scratch,
+        &[
+            ("OAIY_SERVER_TOKEN", TOKEN),
+            (
+                "OAIY_ACCESS_MODE",
+                if cfg!(feature = "web") {
+                    "scoped"
+                } else {
+                    "legacy"
+                },
+            ),
+        ],
+    );
+    assert_eq!(code, Some(0), "{err}");
+    assert_eq!(
+        err.contains("the `cli` preset on this build")
+            && err.contains("403 insufficient_scope")
+            && err.contains("auth token create"),
+        cfg!(feature = "web"),
+        "{err}"
+    );
+}
+
+/// The same server once the owner exists (made on the console, the server restarted): the public routes are public
+/// again to a stranger, and the token is what it was.
+#[cfg(feature = "web")]
+#[test]
+fn n1_with_an_owner_the_public_routes_of_the_bridge_are_open_again_and_the_token_is_what_it_was() {
+    let scratch = Scratch::new("token-only-owner");
+    make_owner(&scratch);
+    let server = Server::start(
+        &scratch,
+        &[("OAIY_SERVER_TOKEN", TOKEN), ("OAIY_ACCESS_MODE", "scoped")],
+    );
+    let bearer = format!("Bearer {TOKEN}");
+    let with = [("authorization", bearer.as_str())];
+    for (method, path) in [
+        ("GET", "/api/bridge/capabilities"),
+        ("POST", "/api/bridge/pairing"),
+        ("GET", "/api/bridge/pairing/x"),
+    ] {
+        let (status, body, text) = server.ask("127.0.0.1", method, path, &[]);
+        assert_ne!(
+            code(&body),
+            Some("setup_required"),
+            "a stranger: {method} {path}: {text}"
+        );
+        assert_ne!(status, 401, "a stranger: {method} {path}: {text}");
+        let (status, body, text) = server.ask("127.0.0.1", method, path, &with);
+        assert_ne!(
+            code(&body),
+            Some("setup_required"),
+            "the token: {method} {path}: {text}"
+        );
+        assert_ne!(status, 401, "the token: {method} {path}: {text}");
+    }
+    let (status, body, text) = server.ask("127.0.0.1", "GET", "/api/services", &[]);
+    assert_eq!(
+        (status, code(&body)),
+        (401, Some("auth_required")),
+        "{text}"
+    );
+    let (status, _, text) = server.ask("127.0.0.1", "GET", "/api/services", &with);
+    assert_eq!(status, 200, "{text}");
+}
+
 /// The proxy the operator names is believed and no other, and the same headers from a peer that is not named are worth
 /// nothing (design 4.5.4): with the peers being other loopback addresses of this machine, so that nothing listens or
 /// connects beyond loopback. (`OAIY_TRUSTED_PROXIES` replaces the default, which is 127.0.0.1 and ::1.)

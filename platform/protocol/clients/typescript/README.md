@@ -103,7 +103,14 @@ a loopback port is not a trust boundary. Two ways to reach them:
   `OAIY_SERVER_TOKEN`). It is sent as a bearer on every request.
 
 A client with neither gets a typed `capability_denied` (403) on exec routes and
-can still read discovery (`health`, `capabilities`) — those stay open.
+can still read discovery (`health`, `capabilities`) — those stay open, with one
+exception: a headless server built with the web login (the release's) that has
+no owner yet (`oaiy-server auth init` has not been run) answers a caller with no
+credential `401 setup_required` to everything but health, `capabilities`
+included. A client that was given the `token` is not that caller: it is sent on
+every request, including discovery, and is judged as it is on every other route,
+so discovery finds such a server with the token and without it only once there
+is an owner.
 
 ## Tests
 

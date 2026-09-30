@@ -1182,15 +1182,32 @@ impl Guard {
         };
         let no_route = matched.is_none();
 
-        // Setup-only mode (design 4.7.1): an install with a web login and no owner answers only the short list of
-        // routes that say whether there is a login and make one, and 401 `setup_required` to everything else,
-        // however public the model would have that route be (the bridge's pairing and capabilities are not open
-        // until there is an owner to pair with).
+        // Setup-only mode (design 4.7.1): an install with a web login and no owner answers an UNAUTHENTICATED caller
+        // only the short list of routes that say whether there is a login and make one, and 401 `setup_required` to
+        // everything else, however public the model would have that route be (the bridge's pairing and capabilities
+        // are not open to anyone until there is an owner to pair with). A caller that presents a credential is not
+        // the stranger this is for: it is judged by the guard as it is everywhere else (the operator's static token
+        // reaches capability discovery and the pairing routes on an install that has no owner yet, as it reaches
+        // the protected routes), and a credential that is not valid is what it is anywhere (`401 token_invalid`, a
+        // `429`), not `setup_required`.
         #[cfg(feature = "web")]
         if class == Class::Public && !no_route && self.in_setup_only() {
             if let Some(m) = &matched {
                 if !setup_only_open(&method, m) {
-                    return Err(fail(Denial::setup_required()));
+                    if !headers.contains_key(header::AUTHORIZATION) {
+                        return Err(fail(Denial::setup_required()));
+                    }
+                    match self.authenticate(
+                        &headers,
+                        &method,
+                        &info,
+                        direct_loopback,
+                        self.throttle_applies(peer),
+                    ) {
+                        Ok(Some(_)) => {}
+                        Ok(None) => return Err(fail(Denial::setup_required())),
+                        Err(denial) => return Err(fail(denial)),
+                    }
                 }
             }
         }
@@ -1242,7 +1259,8 @@ impl Guard {
 
     /// An install with a web login and no owner is in setup-only mode (design 4.7.1): an anonymous caller of a
     /// route that needs a credential is told to set up instead of to sign in. Bearer credentials are unaffected
-    /// (they never reach this), and every other refusal stands as it is.
+    /// (they never reach this; nor does a valid one on a public route, see the gate in `admit`), and every other
+    /// refusal stands as it is.
     fn setup_only(&self, denial: Denial) -> Denial {
         #[cfg(feature = "web")]
         if denial.code == "auth_required" && self.in_setup_only() {

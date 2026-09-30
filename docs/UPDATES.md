@@ -231,13 +231,20 @@ the update signature above, which OAIY checks and Windows does not.
 hardened unit and has nothing to replace itself with. It **reports** a newer release:
 
 ```sh
-curl -s http://127.0.0.1:17972/api/update/status            # open here, like /api/health (the desktop keeps it to OAIY's own pages: it says whether a call is live)
+curl -s -H "Authorization: Bearer $OAIY_SERVER_TOKEN" http://127.0.0.1:17972/api/update/status   # system.read: the token has it (see below)
 curl -s -X POST -H "Authorization: Bearer $OAIY_SERVER_TOKEN" http://127.0.0.1:17972/api/update/check
 ```
 
 The status says `currentVersion`, `latestVersion`, `notes`, when it last looked, and
 `canAutoUpdate: false` with the reason. The server looks only when asked (there is no daily
 check); the check is limited to one in 30 seconds.
+
+The status is **open, like `/api/health`, on a server built without the web login. On the web build (which is what the
+release ships) it is a read of the scope `system.read`**, as it is on the desktop: the status says in words whether a call
+is live (the blockers of "Restart to update"), which is not for a stranger. `OAIY_SERVER_TOKEN` has that scope, so the
+commands above work with the token; a caller with no credential gets `401 auth_required`, and `401 setup_required` until an
+owner has been made with `oaiy-server auth init`. What else the token can and cannot reach on the web build is in
+[the desktop guide](../platform/desktop/README.md#a-token-only-install-on-the-web-build).
 
 To upgrade one, by hand, keeping each version in a directory of its own so that going back
 is one command (the archive has `resources/` beside the server, and needs them there):

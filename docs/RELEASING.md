@@ -344,6 +344,19 @@ a release matter here:
   `SHA256SUMS.txt` (`certutil -hashfile <file> SHA256`), then choose "More info" and "Run
   anyway". The NSIS installer installs for the current user (`%LOCALAPPDATA%\OAIY`) and
   asks for no administrator rights.
+- **The headless server has the web login, and that changes an existing install that has only a token.** From this release
+  `oaiy-server` is built with `--features web` (the release check `scripts/check-release.mjs` fails if it is not). A
+  server that was told only `OAIY_SERVER_TOKEN` (no owner, no public URL) starts as before, in setup-only mode, and:
+  a caller with no credential is told `401 setup_required` by every route but health and the login routes (capability
+  discovery, the pairing routes and `GET /api/update/status` included); its token is not a stranger and reaches
+  them as it reaches the rest; the token is the `cli` preset, so the 90 routes of voice, calendar, contacts, the Agent,
+  setup, the control settings, the account link, pairings, the companion relay, AI provider keys and the installs answer
+  it `403 insufficient_scope`, which a server without the web login let it reach. There is no setting that brings that
+  back: `oaiy-server auth init`, then `oaiy-server auth token create --preset cli --scope <scope>` for the jobs that need
+  them. A token that is an example or a pattern (`change-me`, `secret`, a counting run) stops the server (exit 78); make
+  one with `openssl rand -base64 32`. `oaiy-server check` says all of this before the new version is started (the
+  systemd unit runs it). Say so in the notes of the release. The details are in the
+  [desktop guide](../platform/desktop/README.md#a-token-only-install-on-the-web-build).
 - **The first release with the updater is installed by hand by everyone.** Only a copy that
   already contains the updater can update itself, and no earlier copy does: 0.1.0 is a download
   from this page for every owner of OAIY, and from that copy on, updates are offered inside OAIY

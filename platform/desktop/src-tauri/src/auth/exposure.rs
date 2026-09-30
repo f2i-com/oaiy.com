@@ -365,6 +365,48 @@ pub fn mode_from_env(value: Option<&str>, web_login: bool) -> Result<AccessMode,
     }
 }
 
+/// The routes that existed before the access model, which a server without the web login let a token reach and which the
+/// `cli` preset (what `OAIY_SERVER_TOKEN` is on the web build) cannot: `403 insufficient_scope`. The README lists them
+/// (The headless server on the web build), `auth::login_tests` pins this number and these scopes to the route table.
+pub const TOKEN_ONLY_LOSES_ROUTES: usize = 90;
+/// The scopes those routes ask for, in order.
+pub const TOKEN_ONLY_LOSES_SCOPES: [&str; 27] = [
+    "agent.read",
+    "agent.serve",
+    "agent.settings",
+    "agent.tasks",
+    "ai.admin",
+    "auth.manage",
+    "auth.read",
+    "auth.revoke",
+    "calendar.read",
+    "calendar.write",
+    "calls.read",
+    "calls.write",
+    "companion.manage",
+    "companion.read",
+    "connectors.use",
+    "contacts.read",
+    "contacts.write",
+    "control.admin",
+    "control.read",
+    "link.manage",
+    "link.read",
+    "plugins.install",
+    "runtimes.install",
+    "services.define",
+    "setup.read",
+    "setup.write",
+    "speech.use",
+];
+
+/// One line for `check` and the start's log: what `OAIY_SERVER_TOKEN` is on the web build, and what it is not.
+fn token_only_warning() -> String {
+    format!(
+        "OAIY_SERVER_TOKEN is the `cli` preset on this build (it has the web login, whose access mode is `scoped`), which is less than a server without the web login let a token reach: {TOKEN_ONLY_LOSES_ROUTES} routes answer it `403 insufficient_scope` (voice calls and voices, the calendar, contacts, the Agent's tasks and preferences, setup, the control settings and log, the account link, pairings, the companion relay, AI provider keys, and defining services or installing runtimes and plugins). There is no setting that brings the old behaviour back: run `oaiy-server auth init` and make the tokens those routes need with `oaiy-server auth token create --preset cli --scope <scope>` (`--preset cli-admin` adds the installs). Until the owner exists the server is in setup-only mode: a caller with no credential is told `setup_required` everywhere but health and the login routes, and your token is judged as it is everywhere else"
+    )
+}
+
 /// Read the settings of 4.13 from `env`, apply every rule of 4.5.5 and say everything that is wrong.
 pub fn evaluate(env: &dyn Fn(&str) -> Option<String>, facts: &Facts) -> Evaluation {
     let mut violations: Vec<Violation> = Vec::new();
@@ -562,6 +604,12 @@ pub fn evaluate(env: &dyn Fn(&str) -> Option<String>, facts: &Facts) -> Evaluati
             }
         },
     };
+
+    // What the operator's token is on the web build, told where it is read (`check` and the start's log), not found out
+    // by a 403: a server without the web login let a token reach every route, and this one holds it to the `cli` preset.
+    if static_token.is_some() && facts.web_login {
+        warnings.push(token_only_warning());
+    }
 
     // 2. a lan install needs an owner.
     if exposure == Exposure::Lan && !facts.owner_exists {
@@ -1406,41 +1454,6 @@ mod tests {
         }
     }
 
-    #[test]
-    fn rule_5_a_static_token_of_the_right_shape_is_kept_trimmed() {
-        // 256 printable characters that are no pattern: a xorshift stream, seeded.
-        let mut x: u64 = 88_172_645_463_325_252;
-        let printable_256: String = (0..256)
-            .map(|_| {
-                x ^= x << 13;
-                x ^= x >> 7;
-                x ^= x << 17;
-                (0x21 + (x % 94) as u8) as char
-            })
-            .collect();
-        for good in [
-            GOOD_TOKEN.to_string(),
-            "Sup3r$ecret!Zq7kLm9VbNw2XyHdFg5!".to_string(),
-            // Random hex, of the lengths people use, and one of them with only 15 of the 16 digits.
-            "f450474c461f635bacde4cc71a4d10a9".to_string(),
-            "d812d74ba4c163bbf58d6fa2605b596946c9d50880c35500".to_string(),
-            "zkwdexEjP8A727+Q2moKCafq4F2IVlZbLJOseRU8Ric=".to_string(),
-            printable_256,
-        ] {
-            let padded = format!("  {good}\n");
-            let c = evaluate(
-                &|n| (n == "OAIY_SERVER_TOKEN").then(|| padded.clone()),
-                &NO_OWNER,
-            )
-            .config
-            .unwrap_or_else(|| panic!("{good} was refused"));
-            assert_eq!(c.static_token.as_deref(), Some(good.as_str()));
-        }
-        assert_eq!(ok(&[], NO_OWNER).static_token, None);
-    }
-
-    // ---- rule 6: the mode -----------------------------------------------------------------------
-
     /// The line names what was matched (a random hex token with `0000` in it was refused with a line that did not list
     /// `0000`), says that a random token has one by chance, and never says what the token says.
     #[test]
@@ -1490,6 +1503,82 @@ mod tests {
         );
         assert!(e.violations[0].message.contains("generate another"));
     }
+
+    /// N1: what `OAIY_SERVER_TOKEN` is on the web build is said where an operator reads it (`check` and the start's log),
+    /// with the count of routes that the `cli` preset does not reach, for every web-build install that sets a good
+    /// token (with an owner or without) and for no other.
+    #[test]
+    fn a_token_on_the_web_build_is_told_what_it_is_and_no_other_install_is() {
+        let said = |e: &Evaluation| -> Vec<String> {
+            e.warnings
+                .iter()
+                .filter(|w| w.contains("is the `cli` preset"))
+                .cloned()
+                .collect()
+        };
+        for facts in [NO_OWNER, OWNER] {
+            let e = eval(&[("OAIY_SERVER_TOKEN", GOOD_TOKEN)], facts);
+            assert!(e.violations.is_empty(), "{:?}", e.violations);
+            let lines = said(&e);
+            assert_eq!(lines.len(), 1, "{:?}", e.warnings);
+            for must in [
+                format!("{TOKEN_ONLY_LOSES_ROUTES} routes"),
+                "403 insufficient_scope".to_string(),
+                "There is no setting that brings the old behaviour back".to_string(),
+                "oaiy-server auth init".to_string(),
+                "--preset cli --scope".to_string(),
+                "setup-only mode".to_string(),
+            ] {
+                assert!(lines[0].contains(&must), "{must}: {}", lines[0]);
+            }
+            assert!(!lines[0].contains(GOOD_TOKEN), "the warning never says the token");
+        }
+        // No token: there is nothing to say. Not the web build: a token there is what it always was.
+        assert!(said(&eval(&[], NO_OWNER)).is_empty());
+        assert!(said(&eval(&[("OAIY_SERVER_TOKEN", GOOD_TOKEN)], HEADLESS)).is_empty());
+        // A token the rule refuses is a refusal, and not a description of what it would be.
+        let e = eval(
+            &[("OAIY_SERVER_TOKEN", "change-me-change-me-change-me-change-me")],
+            NO_OWNER,
+        );
+        assert_eq!(e.violations.len(), 1);
+        assert!(said(&e).is_empty(), "{:?}", e.warnings);
+    }
+
+    #[test]
+    fn rule_5_a_static_token_of_the_right_shape_is_kept_trimmed() {
+        // 256 printable characters that are no pattern: a xorshift stream, seeded.
+        let mut x: u64 = 88_172_645_463_325_252;
+        let printable_256: String = (0..256)
+            .map(|_| {
+                x ^= x << 13;
+                x ^= x >> 7;
+                x ^= x << 17;
+                (0x21 + (x % 94) as u8) as char
+            })
+            .collect();
+        for good in [
+            GOOD_TOKEN.to_string(),
+            "Sup3r$ecret!Zq7kLm9VbNw2XyHdFg5!".to_string(),
+            // Random hex, of the lengths people use, and one of them with only 15 of the 16 digits.
+            "f450474c461f635bacde4cc71a4d10a9".to_string(),
+            "d812d74ba4c163bbf58d6fa2605b596946c9d50880c35500".to_string(),
+            "zkwdexEjP8A727+Q2moKCafq4F2IVlZbLJOseRU8Ric=".to_string(),
+            printable_256,
+        ] {
+            let padded = format!("  {good}\n");
+            let c = evaluate(
+                &|n| (n == "OAIY_SERVER_TOKEN").then(|| padded.clone()),
+                &NO_OWNER,
+            )
+            .config
+            .unwrap_or_else(|| panic!("{good} was refused"));
+            assert_eq!(c.static_token.as_deref(), Some(good.as_str()));
+        }
+        assert_eq!(ok(&[], NO_OWNER).static_token, None);
+    }
+
+    // ---- rule 6: the mode -----------------------------------------------------------------------
 
     #[test]
     fn rule_6_shadow_is_refused_on_a_proxied_or_lan_install_and_allowed_on_a_local_one() {

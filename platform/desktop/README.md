@@ -93,7 +93,7 @@ is loopback-only.
 
 ### General
 - `GET    /api/health` — `{ status, product, protocol, version }`
-- `GET    /api/update/status` — whether a newer release exists (`state`, `currentVersion`, `latestVersion`, `notes`, `lastCheckedAt`, `blockers`, …). Open like health on the headless server, which only reports; on the desktop it is read like the calls are (OAIY's own pages or the token), because it says whether a call is live ([docs/UPDATES.md](../../docs/UPDATES.md))
+- `GET    /api/update/status` — whether a newer release exists (`state`, `currentVersion`, `latestVersion`, `notes`, `lastCheckedAt`, `blockers`, …). Open like health on a headless server built without the web login, which only reports; on the web build (what the release ships) and on the desktop it is read like the calls are (OAIY's own pages or a credential with `system.read`, which the token has), because it says whether a call is live ([docs/UPDATES.md](../../docs/UPDATES.md))
 - `POST   /api/update/check` — look at the release feed now (a plain GET, at most once every 30 seconds; privileged). There is no route that downloads or installs: those are commands of the dashboard's own window
 - `GET    /api/config` — `{ activeDir, defaultDir, configuredDir, isCustom, restartRequired }` (read-only; changing the data dir is a desktop-only action — native picker + restart)
 
@@ -286,7 +286,8 @@ Configuration is by environment variable (no pointer file):
 
 **Auth:** set `OAIY_SERVER_TOKEN` and send it as `Authorization: Bearer …`.
 Headless APIs require a valid token for reads and writes except health,
-capability discovery and pairing bootstrap. Missing or forged Origin headers
+capability discovery and the pairing bootstrap (which, on the web build, are open to a caller with no credential
+only once an owner exists: see *A token-only install on the web build* below). Missing or forged Origin headers
 never substitute for credentials. A configuration the startup rules refuse (a lan bind
 with no owner login, a public URL with a path, a proxy not named, a token that is an
 example or a pattern, a mode that is not allowed there) is exit 78 and one line saying what
@@ -294,6 +295,43 @@ to change; `oaiy-server check` lists every such rule at once, and the shipped sy
 runs it first and does not restart a server that exits 78. `SIGTERM`/`Ctrl-C` stops the managed
 services before exit, and on unix the plugins first, and so does a failed bind of the
 port (on Windows a plugin ends with the server's job object).
+
+### A token-only install on the web build
+
+The release builds the headless server with the web login. An install that has only `OAIY_SERVER_TOKEN` (no owner, no
+public URL, the loopback default: what a server without the web login was told) meets three differences, none of which
+a setting undoes:
+
+1. **Until an owner exists the server is in setup-only mode.** A caller with no credential is told `401 setup_required` by
+   every route but health, `GET /api/auth/info`, `GET /api/auth/session` and the login, setup and link routes: capability
+   discovery (`GET /api/bridge/capabilities`), the pairing routes and `GET /api/update/status` included. Those are kept
+   closed on purpose: discovery lists the installed plugins with their states and the reasons they are not running (which
+   can name a path on this machine), and a public server must not accept pairing requests from anyone before there is an
+   owner to approve them. **A caller with a valid credential is not a stranger**: the operator's token, and any token
+   the console made, is judged as it is on every other route, so it reaches capability discovery and the pairing routes
+   (a bridge client that is given the token, as `bridge-client.ts` does on every request, finds the server as before), and
+   a token that is not valid is `401 token_invalid` there as anywhere, and counts towards the failed-bearer throttle. Once
+   an owner exists (`oaiy-server auth init`) those routes are open to everyone again, as on a server without the web login.
+2. **`GET /api/update/status` is not open on the web build.** It is a read of `system.read`, which the token has; it says
+   whether a call is live (the blockers of "Restart to update"), which is not for a stranger. (On a server without the web
+   login it is open, like health.)
+3. **The token is the `cli` preset, which is less than a server without the web login let it reach.** The web build's
+   access mode is `scoped`, and it refuses `legacy`. The token holds `system.read`, `logs.read`, `services.read` and
+   `.control`, `models.read` and `.write`, `plugins.read` and `.control`, `flows.read` and `.write`, `runs.read` and
+   `.write`, `ai.read`, `ai.use` and `events.read`: what the CLI and a bridge client do. **90 routes that existed before
+   the access model answer it `403 insufficient_scope`**, by the scope they ask for: `services.define` (defining,
+   uninstalling and exporting services), `runtimes.install` and `plugins.install` (Python and Node installs, installing,
+   removing and trusting a plugin: native code), `ai.admin` (provider keys and the ChatGPT login), `connectors.use`,
+   `speech.use`, `calls.read` and `calls.write` (voice calls, voices, callers, settings), `calendar.*`, `contacts.*`,
+   `agent.*` (tasks, events, leases, preferences), `setup.*` (the setup wizard and its catalog), `control.read` and
+   `control.admin` (the MCP endpoint, the control settings and log), `link.*` (the account link), `auth.*` (pairings),
+   `companion.*` (the phone relay). `oaiy-server check` and the start's log say so, with the count, for any web-build
+   install that sets a token. The list is pinned to the route table by a test (`auth::login_tests`).
+
+   There is no setting that brings the old behaviour back. Run `oaiy-server auth init`, then make a token with the scopes
+   the job needs: `oaiy-server auth token create --preset cli --scope calendar.read --scope contacts.read`, or `--preset
+   cli-admin` (which adds the installs and is a 24-hour token), and give that token to the client instead of
+   `OAIY_SERVER_TOKEN`; a dashboard session or a paired or derived credential reaches the rest.
 
 ### The web login (`oaiy-server` built with `--features web`)
 
@@ -359,7 +397,8 @@ accepted with a warning, since any client could then write `X-Forwarded-For`; an
 names that variable lists).
 
 **Updates:** the server never downloads or replaces itself. `GET /api/update/status` (open,
-like health) and `POST /api/update/check` (needs the token) tell you whether a newer release
+like health, on a build without the web login; `system.read` on the web build) and `POST /api/update/check` (needs the
+token) tell you whether a newer release
 exists; [docs/UPDATES.md](../../docs/UPDATES.md#the-headless-server) has the steps to upgrade
 one by hand, keeping each version in a directory of its own so going back is one command.
 
