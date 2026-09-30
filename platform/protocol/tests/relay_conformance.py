@@ -1812,6 +1812,10 @@ ok("the Interpretations are numbered 1 to N with no gap and no repeat, and there
 ok("README says the SAS input carries the raw 16 bytes of pid and points at extras.sasNegative", "**raw 16 bytes**" in readme and "extras.sasNegative" in readme and 'not its 22-character b64u text' in readme)
 ok("README says the item ids . and .. and the spelling -0 are refused", "never `.` or `..`" in readme and "the spelling `-0`" in readme and "`-0` is not an integer" in readme)
 ok("README has a Response shapes section", re.search(r"^## (\d+\. )?Response shapes$", readme, re.M) is not None)
+ok("README says consumers de-duplicate on (from, id) and never on the id alone, and keys the relay's own rule with the sender",
+   "consumers de-duplicate on `(from, id)`" in readme and "never on `id` alone" in readme and "`(mailbox, lane, sender, id)` uniqueness for 10 minutes" in readme
+   and "`(mailbox, lane, id)` uniqueness" not in readme and "A consumer de-duplicates on (from, id), after authenticating the sender" in readme)
+ok("README makes the challenge life a config value, call.challenge_s", "`call.challenge_s` (10 to 30, default 25)" in readme)
 
 # ---------------------------------------------------------------------------
 print("\n" + "-" * 60)
