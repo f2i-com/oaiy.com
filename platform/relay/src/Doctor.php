@@ -31,6 +31,13 @@ final class Doctor
         '/src/Db.php',
         '/install.php',
         '/.env',
+        // What an install leaves behind that anyone who could read it could use: the one-time key, the admin token, the
+        // config (database password, pepper), the admin token's record and the web installer's own token.
+        '/data/first-key.txt',
+        '/data/admin-token.txt',
+        '/data/config.json',
+        '/data/secrets/admin.json',
+        '/INSTALL_ENABLED',
     ];
 
     /** ini values the CLI and the web SAPI are compared on. */
@@ -629,16 +636,25 @@ final class Doctor
         if ($p === false || !isset($p['scheme'], $p['host']) || !in_array($p['scheme'], ['http', 'https'], true)) {
             return [self::row('web', self::FAIL, '--url is not an http or https URL')];
         }
-        $base = $p['scheme'] . '://' . $p['host'] . (isset($p['port']) ? ':' . $p['port'] : '');
+        $origin = $p['scheme'] . '://' . $p['host'] . (isset($p['port']) ? ':' . $p['port'] : '');
+        // A relay unpacked into a folder of an existing site is served under a path (https://site/relay): the probes ask there
+        // too, or the commonest wrong layout, where /relay/data/ is served, would be reported as protected.
+        $prefix = rtrim((string)($p['path'] ?? ''), '/');
+        if ($prefix !== '' && preg_match('#^(/[A-Za-z0-9._~-]+)+$#D', $prefix) !== 1) {
+            return [self::row('web', self::FAIL, '--url has a path with characters the doctor will not put in a request; use letters, digits and . _ ~ - only')];
+        }
+        $base = $origin . $prefix;
         $out = [];
-        // 1. Exposure.
+        // 1. Exposure, at the URL's own path and, when it has one, at the site's root as well.
         $results = [];
         foreach (self::EXPOSURE as $path) {
             if ($path === '/install.php' && !$installed) {
                 continue;
             }
-            $r = HttpProbe::get($base . $path, [], 5.0, 2048);
-            $results[] = ['path' => $path, 'status' => $r['status'], 'error' => $r['error']];
+            foreach ($prefix === '' ? [$path] : [$prefix . $path, $path] as $rel) {
+                $r = HttpProbe::get($origin . $rel, [], 5.0, 2048);
+                $results[] = ['path' => $rel, 'status' => $r['status'], 'error' => $r['error']];
+            }
         }
         $out = array_merge($out, self::exposure($results));
         // 2. The Authorization header through the real stack.

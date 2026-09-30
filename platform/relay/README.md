@@ -218,7 +218,11 @@ It checks PHP, extensions, the ini values that matter (memory_limit 64M or more,
 folder (outside `public/`, modes, config, schema, journal mode against the filesystem type), that a wake shard written here is
 visible to a second PHP process within 50 ms, and the keys. With `--url` it also asks the public address what only the web can
 answer: it requests `/data/relay.sqlite`, `/data/secrets/admission.hmac`, `/data/secrets/relay.key`, a dot-dot path into
-`data/`, `/bin/doctor.php`, `/src/Db.php`, `/install.php` (after installation) and `/.env` and fails on anything but 403 or 404;
+`data/`, `/bin/doctor.php`, `/src/Db.php`, `/install.php` (after installation), `/.env`, and what an install leaves behind that
+would hand over the relay (`/data/first-key.txt`, `/data/admin-token.txt`, `/data/config.json`, `/data/secrets/admin.json` and the
+web installer's `/INSTALL_ENABLED`) and fails on anything but 403 or 404. If `--url` has a path (a relay unpacked into a folder
+of an existing site, `https://site/relay`), every probe is made at that path **and** at the site's root, because that is the
+commonest way for `/relay/data/` to be served;
 it sends a dummy bearer through the real web stack and fails loudly when the header does not arrive; with `--admin-token-file`
 it compares what the **web** PHP sees (ini values, functions, `REMOTE_ADDR`, forwarding headers) with the command line's; and
 it opens a request whose body never finishes and reports whether the host closes it. The admin token comes from a file, is only

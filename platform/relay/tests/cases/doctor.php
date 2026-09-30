@@ -216,8 +216,10 @@ test('4.18.8 doctor: every exposure probe must answer 403 or 404, anything else 
     $rows = Doctor::exposure($r);
     eq(1, count(doc_failures($rows)));
     eq('fail', doc_level($rows, 'web.exposure /data/../data/relay.sqlite'));
-    // The design's list, exactly.
-    eq(['/data/relay.sqlite', '/data/secrets/admission.hmac', '/data/secrets/relay.key', '/data/../data/relay.sqlite', '/bin/doctor.php', '/src/Db.php', '/install.php', '/.env'], Doctor::EXPOSURE);
+    // The design's list, then what an install leaves behind that would hand over the relay: the one-time key, the admin token,
+    // the config, the admin token's record and the web installer's own token.
+    eq(['/data/relay.sqlite', '/data/secrets/admission.hmac', '/data/secrets/relay.key', '/data/../data/relay.sqlite', '/bin/doctor.php', '/src/Db.php', '/install.php', '/.env',
+        '/data/first-key.txt', '/data/admin-token.txt', '/data/config.json', '/data/secrets/admin.json', '/INSTALL_ENABLED'], Doctor::EXPOSURE);
 });
 
 test('4.9.1 doctor: the dummy bearer must arrive: authHeaderSeen true passes, false fails loudly with the fix, a non-answer fails', function () {
@@ -450,13 +452,46 @@ test('4.18.8 doctor web: with the relay folder as the document root data/, src/ 
     $before = $snapshot();
     $rows = Doctor::run(['dataDir' => $data, 'url' => $srv->base(), 'slowBody' => false, 'publicDir' => $root . '/public']);
     eq($before, $snapshot(), 'nothing outside data/ was created or changed');
-    foreach (['/data/relay.sqlite', '/data/secrets/admission.hmac', '/data/secrets/relay.key', '/data/../data/relay.sqlite', '/bin/doctor.php', '/src/Db.php'] as $p) {
+    foreach (['/data/relay.sqlite', '/data/secrets/admission.hmac', '/data/secrets/relay.key', '/data/../data/relay.sqlite', '/bin/doctor.php', '/src/Db.php',
+        '/data/first-key.txt', '/data/admin-token.txt', '/data/config.json', '/data/secrets/admin.json'] as $p) {
         eq('fail', doc_level($rows, 'web.exposure ' . $p), $p . ': ' . doc_msg($rows, 'web.exposure ' . $p));
     }
     eq('ok', doc_level($rows, 'web.exposure /.env'));
+    eq('ok', doc_level($rows, 'web.exposure /INSTALL_ENABLED'), 'there is no such file after a command line install');
     eq('fail', Doctor::worst($rows));
     // The probe itself was only GET requests: the secret files are still intact.
     ok(is_file($data . '/secrets/relay.key') && is_file($data . '/relay.sqlite'), 'data/ intact');
+});
+
+test('4.18.8 doctor web: the web installer\'s INSTALL_ENABLED (it holds the owner\'s installer token) is an exposure failure when it can be fetched', function () {
+    [$root, $data] = inst_installed();
+    file_put_contents($root . '/INSTALL_ENABLED', "owner-chosen-installer-token-2026\n");
+    $srv = Server::start($root, ['prepend' => false, 'name' => 'doc-root']);
+    $rows = Doctor::run(['dataDir' => $data, 'url' => $srv->base(), 'slowBody' => false, 'publicDir' => $root . '/public']);
+    eq('fail', doc_level($rows, 'web.exposure /INSTALL_ENABLED'));
+    $pub = Server::start($root . '/public', ['prepend' => false, 'name' => 'doc-pub']);
+    $rows = Doctor::run(['dataDir' => $data, 'url' => $pub->base(), 'slowBody' => false, 'publicDir' => $root . '/public']);
+    eq('ok', doc_level($rows, 'web.exposure /INSTALL_ENABLED'));
+});
+
+test('4.18.8 doctor web: a relay unpacked into a folder of an existing site is probed at the URL\'s own path, so a served /relay/data/ is a failure', function () {
+    [$root, $data] = inst_installed();
+    // The site's document root is the folder that holds the relay folder: https://site/<relay>/data/... is served.
+    $site = dirname($root);
+    $name = basename($root);
+    $srv = Server::start($site, ['prepend' => false, 'name' => 'doc-site']);
+    $rows = Doctor::run(['dataDir' => $data, 'url' => $srv->base() . '/' . $name, 'slowBody' => false, 'publicDir' => $root . '/public']);
+    foreach (['/data/relay.sqlite', '/data/secrets/relay.key', '/data/first-key.txt', '/data/admin-token.txt', '/data/config.json', '/bin/doctor.php', '/src/Db.php'] as $p) {
+        eq('fail', doc_level($rows, 'web.exposure /' . $name . $p), $p . ' under the path: ' . doc_msg($rows, 'web.exposure /' . $name . $p));
+    }
+    // The site's root itself is asked too, and does not have these files.
+    eq('ok', doc_level($rows, 'web.exposure /data/relay.sqlite'));
+    eq('ok', doc_level($rows, 'web.exposure /.env'));
+    eq('fail', Doctor::worst($rows));
+    // A path with characters the doctor will not put in a request is refused, not probed.
+    $rows = Doctor::run(['dataDir' => $data, 'url' => $srv->base() . '/a%20b', 'slowBody' => false, 'publicDir' => $root . '/public']);
+    eq('fail', doc_level($rows, 'web'));
+    contains('path', doc_msg($rows, 'web'));
 });
 
 test('4.9.1 doctor web: a host that strips the Authorization header fails the dummy bearer probe loudly (a stub that reports it stripped)', function () {
