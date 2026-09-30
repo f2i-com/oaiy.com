@@ -73,7 +73,8 @@ fn the_keystores_copies_of_a_secret_are_zero_when_they_are_freed() {
     let (seen, nonzero) = probe(N, N + 100, || drop(vec![0xABu8; N + 7]));
     assert_eq!((seen, nonzero), (1, true), "control: the probe sees a plain Vec and finds the bytes in it");
 
-    let mut providers = vec![(ProviderChoice::Keyfile, N + 100, "keyfile")];
+    // the keyfile window reaches twice the secret's size, so that a buffer that grew by doubling (and left a smaller copy behind when it moved) would be seen
+    let mut providers = vec![(ProviderChoice::Keyfile, 2 * N + 200, "keyfile")];
     if cfg!(windows) {
         // the DPAPI blob is ciphertext and its size is not the secret's; only blocks of exactly the value's size are copies of it
         providers.push((ProviderChoice::DpapiFile, N, "dpapi"));
