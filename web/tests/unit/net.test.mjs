@@ -102,6 +102,46 @@ describe('context detection', () => {
     assert.equal(none.calls.length > 0, true);
   });
 
+  it('only a server on this computer or network is probed: an external record (OpenAI, a custom service) is asked nothing, and gets no key sent to /props', async () => {
+    for (const over of [{ kind: 'external', baseUrl: 'https://api.openai.com/v1' }, { kind: 'external', preset: 'custom', baseUrl: 'https://models.example.com/v1' }, { kind: 'external', serverKind: 'ollama', baseUrl: 'https://ollama.example.com/v1' }]) {
+      const f = stubFetch(() => jsonResponse({ data: [{ id: 'm', context_length: 4096 }] }));
+      assert.deepEqual(await M.probe.probeContext(rec(over), 'SECRET-KEY-VALUE', f.impl), { contextTokens: null, how: null }, JSON.stringify(over));
+      assert.equal(f.calls.length, 0, `no request at all for ${over.baseUrl}`);
+    }
+  });
+
+  it('the key goes only to an address under the record\'s base: the servers\' own information endpoints outside it are asked without it', async () => {
+    const KEY2 = 'SECRET-KEY-VALUE-1234567890';
+    const f = stubFetch((c) => {
+      if (c.url.endsWith('/api/ps') || c.url.endsWith('/api/show') || c.url.endsWith('/props') || c.url.includes('/api/v0/models/')) return jsonResponse({}, 404);
+      return jsonResponse({ data: [{ id: 'm' }] });
+    });
+    for (const serverKind of ['ollama', 'lmstudio', 'oaiy', 'other']) {
+      f.calls.length = 0;
+      await M.probe.probeContext(rec({ serverKind, baseUrl: serverKind === 'ollama' ? 'http://localhost:11434/v1' : serverKind === 'lmstudio' ? 'http://localhost:1234/v1' : 'http://localhost:8080/v1' }), KEY2, f.impl);
+      assert.ok(f.calls.length >= 2, serverKind);
+      for (const call of f.calls) {
+        const url = new URL(call.url);
+        const under = url.pathname === '/v1' || url.pathname.startsWith('/v1/');
+        assert.equal(call.headers.authorization !== undefined, under, `${serverKind}: ${call.url} ${under ? 'is under the base and carries the key' : 'is outside it and carries none'}`);
+        assert.ok(!JSON.stringify(call.headers).includes(KEY2) || under, `${call.url}: no key outside the base`);
+      }
+    }
+  });
+
+  it('Ollama\'s own model list (outside the API base) is asked only of a local server, and without the key', async () => {
+    const KEY2 = 'SECRET-KEY-VALUE-1234567890';
+    const local = stubFetch((c) => (c.url.endsWith('/api/tags') ? jsonResponse({ models: [{ name: 'llama3:8b' }] }) : jsonResponse({}, 404)));
+    const found = await M.models.listRecordModels({ dialect: 'openai', baseUrl: 'http://localhost:11434/v1', auth: 'bearer', kind: 'local-server', preset: 'local-server', serverKind: 'ollama' }, KEY2, { fetchImpl: local.impl, page: PAGE });
+    assert.deepEqual(found.map((m) => m.id), ['llama3:8b']);
+    const tags = local.calls.find((c) => c.url.endsWith('/api/tags'));
+    assert.equal(tags.headers.authorization, undefined, 'no key to /api/tags');
+    assert.equal(local.calls.find((c) => c.url.endsWith('/v1/models')).headers.authorization, `Bearer ${KEY2}`, 'the key to the model list under the base');
+    const external = stubFetch(() => jsonResponse({}, 404));
+    await assert.rejects(M.models.listRecordModels({ dialect: 'openai', baseUrl: 'https://models.example.com/v1', auth: 'bearer', kind: 'external', preset: 'custom' }, KEY2, { fetchImpl: external.impl, page: PAGE }), { kind: 'not-found' });
+    assert.ok(external.calls.every((c) => !c.url.includes('/api/tags')), 'an external service is not asked for Ollama\'s list');
+  });
+
   it('a number too small to be a window is not one', async () => {
     const f = stubFetch(() => jsonResponse({ data: [{ id: 'm', context_length: 100 }] }));
     assert.equal((await M.probe.probeContext(rec({}), '', f.impl)).contextTokens, null);

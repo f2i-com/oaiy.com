@@ -15,5 +15,6 @@ export * as vault from '../../providers/src/vault';
 export * as sharedProtocol from '@oaiy/shared/broker/protocol';
 export * as sharedVault from '@oaiy/shared/secrets/vault';
 export * as endpoints from '@oaiy/shared/providers/endpoints';
+export * as models from '@oaiy/shared/providers/models';
 export * as errors from '@oaiy/shared/providers/errors';
 export * as types from '@oaiy/shared/providers/types';

@@ -199,6 +199,8 @@ interface ListTarget {
   serverKind?: LocalServerKind;
   endpoints: ProviderEndpoints;
   headers: Record<string, string>;
+  /** The headers for Ollama's own list, which is outside the API base: for a record, without the key. */
+  tagsHeaders?: Record<string, string>;
 }
 
 async function listFrom(target: ListTarget, options: ListModelsOptions): Promise<ModelInfo[]> {
@@ -240,7 +242,7 @@ async function listFrom(target: ListTarget, options: ListModelsOptions): Promise
     const retryable = first && !['cancelled', 'mixed-content', 'auth'].includes(first.kind);
     if (!endpoints.ollamaTags || !retryable) throw err;
     try {
-      const body = await getJson(endpoints.ollamaTags, headers, context, options);
+      const body = await getJson(endpoints.ollamaTags, target.tagsHeaders ?? headers, context, options);
       const models = readOllamaTags(body);
       if (!models) throw first;
       return sortModels(models);
@@ -282,8 +284,12 @@ export async function listRecordModels(
 ): Promise<ModelInfo[]> {
   const type = providerTypeOf(record);
   const providerText = options.providerText ?? 'omit';
+  const endpoints = providerEndpoints({ type, baseUrl: record.baseUrl, serverKind: record.serverKind });
+  // Ollama's own list is at the ORIGIN, outside the API base the key is for: only a server on this computer or network is asked, and
+  // without the key (Ollama takes none).
+  if (record.kind !== 'local-server') delete endpoints.ollamaTags;
   return listFrom(
-    { type, serverKind: record.serverKind, endpoints: providerEndpoints({ type, baseUrl: record.baseUrl, serverKind: record.serverKind }), headers: recordHeaders(record, key) },
+    { type, serverKind: record.serverKind, endpoints, headers: recordHeaders(record, key), tagsHeaders: recordHeaders(record, '') },
     { ...options, providerText, scrub: providerText === 'include' ? (text) => redactSecret(text, key) : undefined },
   );
 }
