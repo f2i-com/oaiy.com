@@ -11,12 +11,17 @@
 //! The pipeline, in order (an in-process request, one made by code in this process with no socket, has
 //! no `Host`, no peer and no `Origin`, so the steps that read them are skipped for it):
 //!
+//! 0. on a proxy-only listener, a peer that is neither a trusted proxy nor this machine: `403
+//!    direct_access_refused`, for any method and any path (`GET`/`HEAD /api/health` alone is let by);
 //! 1. a method other than `GET HEAD POST PUT PATCH DELETE OPTIONS`: `405`;
 //! 2. `Host` not in the allow-list: `421 misdirected_host` (except `GET`/`HEAD /api/health`);
 //! 3. the effective client address (trusted proxies);
 //! 4. a forwarded header on a local install: `421 proxy_detected`; a bearer from a public address on a
-//!    LAN listener: `403 plaintext_from_public_address`; the channel;
-//! 5. `OPTIONS`: public (the CORS layer answers it);
+//!    LAN listener: `403 plaintext_from_public_address`; the channel (`X-Forwarded-Proto`: the last entry
+//!    of the header, across its lines, as for `X-Forwarded-For`);
+//! 5. `OPTIONS`: public (the CORS layer answers it, once the steps above, which it asks the guard for
+//!    before it answers a preflight, `Guard::refuses_before_a_preflight`, have let it by: `OPTIONS
+//!    /api/health` is the one path it does not ask about, which stays what it was);
 //! 6. classify `(Method, MatchedPath)`; a route with no row is `403 unclassified_route`;
 //! 7. the credential: `Authorization: Bearer`, strictly parsed (`400 bad_request`);
 //! 8. the failed-bearer throttle (`429`), before any lookup;
@@ -937,7 +942,7 @@ impl Guard {
     /// Decide `req`: refuse it, or put the principal and the request's facts on it and run the handler.
     pub async fn handle(&self, mut req: Request, next: Next) -> Response {
         let path = req.uri().path().to_owned();
-        match self.admit(&mut req) {
+        match self.admit(&req) {
             Ok(admitted) => {
                 if let Some(info) = admitted.info {
                     req.extensions_mut().insert(info);
@@ -966,8 +971,33 @@ impl Guard {
         }
     }
 
-    /// Steps 1 to 10. On a refusal, the client address and host to count it against.
-    fn admit(&self, req: &mut Request) -> Result<Admitted, Box<Refusal>> {
+    /// What the front door of the listener says to an `OPTIONS` request before the CORS layer answers it, which
+    /// the layer does without the guard (it sits outside it, so that an app can read the refusal it gets): the
+    /// refusals that are made of the connection alone and come first for every other method, the proxy-only
+    /// listener's `403 direct_access_refused` and the rest of what steps 0 to 5 refuse (the Host, a proxy that says
+    /// http, a forwarded header on a local install, a bearer from a public address on a lan one). `None` is a request
+    /// the door lets by: the layer answers it. `GET /api/health` and `HEAD` of it are the probe that passes the
+    /// door from anywhere; `OPTIONS /api/health` is not asked here either, and is what it was (a preflight is
+    /// answered, a bare `OPTIONS` is judged by the Host like every other request).
+    pub fn refuses_before_a_preflight(&self, req: &Request) -> Option<Response> {
+        if req.method() != Method::OPTIONS || req.uri().path() == "/api/health" {
+            return None;
+        }
+        match self.admit(req) {
+            Ok(_) => None,
+            // The one refusal that is a `204` is the answer to an `OPTIONS` that got past everything above it.
+            Err(refusal) if refusal.denial.status == StatusCode::NO_CONTENT => None,
+            Err(refusal) => {
+                if let Some(event) = refusal.denial.noise {
+                    self.note(event, &refusal.ip, &refusal.host);
+                }
+                Some(refusal.denial.into_response())
+            }
+        }
+    }
+
+    /// Steps 0 to 10. On a refusal, the client address and host to count it against.
+    fn admit(&self, req: &Request) -> Result<Admitted, Box<Refusal>> {
         let peer = req
             .extensions()
             .get::<ConnectInfo<SocketAddr>>()
@@ -996,16 +1026,14 @@ impl Guard {
             .map(|i| i.to_string())
             .unwrap_or_else(|| "in-process".into());
 
-        // 1. methods
-        if !is_served_method(&method) {
-            return Err(fail(Denial::method_not_allowed(), &peer_text));
-        }
         let is_health_probe = matches!(method, Method::GET | Method::HEAD) && path == "/api/health";
-        // Proxy-only (design 4.5.5 rule 4): bound beyond loopback and told who the proxy is. A connection that is
+        // 0. Proxy-only (design 4.5.5 rule 4): bound beyond loopback and told who the proxy is. A connection that is
         // neither from that proxy nor from this machine (the CLI on the server, `oaiy-server auth ...`, a check
         // inside a container: a loopback peer with no forwarded header) did not come through it, and is refused
-        // before anything else is read, whatever it says in its headers, and for any path: the pages a later
-        // step serves are behind the same door. A probe of `GET /api/health` is exempt, as it is from the Host check.
+        // first, before the method is read (`TRACE` is a 403 from it, as everything is), whatever the request says
+        // in its headers, and for any path: the pages a later step serves are behind the same door. A probe of
+        // `GET /api/health` is exempt, as it is from the Host check. (An `OPTIONS` reaches this the same way: the
+        // CORS layer asks the guard first, `Guard::refuses_before_a_preflight`.)
         if self.config.proxy_only && !is_health_probe {
             if let Some(peer_ip) = peer.ip() {
                 let direct = peer.is_loopback() && forwarded_header(req.headers()).is_none();
@@ -1013,6 +1041,10 @@ impl Guard {
                     return Err(fail(Denial::direct_access_refused(), &peer_text));
                 }
             }
+        }
+        // 1. methods
+        if !is_served_method(&method) {
+            return Err(fail(Denial::method_not_allowed(), &peer_text));
         }
         // A path outside the API that no route answers is not under the guard (there is nothing to guard).
         if matched.is_none() && !path.starts_with("/api/") && path != "/api" {
@@ -1352,14 +1384,19 @@ pub async fn scoped_guard(
 }
 
 /// CORS and Private Network Access for the `scoped` and `shadow` modes (`auth/cors.rs`), outside the guard so
-/// that a paired app can read the refusal it gets. A preflight is answered here, without a credential, `204`;
-/// a route with no row, and an origin no live credential is bound to, get no headers.
+/// that a paired app can read the refusal it gets. A preflight is answered here, without a credential, `204`,
+/// once the front door of the listener has let it by (`Guard::refuses_before_a_preflight`: a listener that
+/// answers only its proxy answers no preflight of anyone else, and a Host that is not the server's is refused, as
+/// for any request); a route with no row, and an origin no live credential is bound to, get no headers.
 pub async fn scoped_cors(
     axum::extract::State(guard): axum::extract::State<Arc<Guard>>,
     req: Request,
     next: Next,
 ) -> Response {
     use super::cors;
+    if let Some(refusal) = guard.refuses_before_a_preflight(&req) {
+        return refusal;
+    }
     let method = req.method().clone();
     let origin = req
         .headers()

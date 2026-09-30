@@ -3403,6 +3403,216 @@ async fn t45_a_proxy_only_install_answers_its_proxy_and_this_machine_and_nothing
     );
 }
 
+/// A preflight is answered by the CORS layer, which sits outside the guard so that an app can read the refusal it
+/// gets, and it was answered before the front door every other request meets: a proxy-only listener answered the
+/// preflight of anyone, and a `Host` that is not the server's got `204` too. The front door
+/// (`Guard::refuses_before_a_preflight`) is now first for every path but the health probe's, and `TRACE` of a peer
+/// that is not let in is `403` and not `405`, as the comment on the door says.
+#[tokio::test]
+async fn t45_a_preflight_and_a_trace_meet_the_front_door_before_anything_answers_them() {
+    let preflight = |path: &str, host: &str| {
+        send(Method::OPTIONS, path)
+            .h("host", host)
+            .h("origin", "https://evil.example")
+            .h("access-control-request-method", "GET")
+            .h("access-control-request-headers", "authorization")
+    };
+    let pna = |s: Send| s.h("access-control-request-private-network", "true");
+    let through_the_proxy = |s: Send| {
+        s.peer("172.30.0.3:5000")
+            .add("x-forwarded-for", "203.0.113.9")
+            .add("x-forwarded-proto", "https")
+    };
+    let po = proxy_only_env();
+    let stranger = "203.0.113.9:5000";
+    // What each is answered: the status, the code of a refusal, and whether the answer carries CORS headers at all.
+    let answer = |r: &Reply| {
+        (
+            r.status,
+            r.code(),
+            r.headers.contains_key("access-control-allow-origin")
+                || r.headers.contains_key("access-control-allow-methods"),
+        )
+    };
+    let refused = |status: u16, code: &str| (status, Some(code.to_string()), false);
+    let passed = (204, None, false);
+
+    // A proxy-only listener: a peer that is neither the proxy nor this machine is refused, whatever it asks.
+    for (what, s) in [
+        ("preflight", preflight("/api/config", "dash.example.com")),
+        (
+            "preflight with a bad Host",
+            preflight("/api/config", "evil.example"),
+        ),
+        (
+            "preflight that asks for the private network",
+            pna(preflight("/api/config", "evil.example")),
+        ),
+        (
+            "preflight of a path with no route",
+            preflight("/api/no/such", "dash.example.com"),
+        ),
+        (
+            "bare OPTIONS",
+            send(Method::OPTIONS, "/api/config").h("host", "dash.example.com"),
+        ),
+        (
+            "bare OPTIONS of the health route",
+            send(Method::OPTIONS, "/api/health").h("host", "dash.example.com"),
+        ),
+        (
+            "TRACE",
+            send(Method::TRACE, "/api/config").h("host", "dash.example.com"),
+        ),
+        (
+            "CONNECT",
+            send(Method::CONNECT, "/api/config").h("host", "dash.example.com"),
+        ),
+    ] {
+        let r = go(&po, s.peer(stranger)).await;
+        assert_eq!(
+            answer(&r),
+            refused(403, "direct_access_refused"),
+            "{what}: {}",
+            r.text
+        );
+    }
+    // The refusals of the door are counted, by address, as every refusal of that kind is (the noise log): in a listener
+    // that has refused nothing else, one preflight is one count.
+    let fresh = proxy_only_env();
+    let r = go(
+        &fresh,
+        preflight("/api/config", "dash.example.com").peer(stranger),
+    )
+    .await;
+    assert_eq!(answer(&r), refused(403, "direct_access_refused"));
+    fresh.audit.flush_noise();
+    let noise = fresh.audit.read(LogFile::Noise, 50, None, None);
+    assert!(
+        noise
+            .iter()
+            .any(|l| l["event"] == "auth.denied" && l["ip"] == "203.0.113.9" && l["count"] == 1),
+        "{noise:?}"
+    );
+    // ... and the peers it does answer are answered as they were: its proxy, and this machine.
+    let r = go(
+        &po,
+        through_the_proxy(preflight("/api/config", "dash.example.com")),
+    )
+    .await;
+    assert_eq!(answer(&r), passed, "the proxy's preflight: {}", r.text);
+    // A route that is public altogether is passed on to the layer too (what its router would say is public already).
+    let r = go(
+        &po,
+        through_the_proxy(preflight("/api/bridge/capabilities", "dash.example.com")),
+    )
+    .await;
+    assert_eq!(
+        answer(&r),
+        (204, None, true),
+        "a preflight of a public route (answered with the headers of a public route): {}",
+        r.text
+    );
+    let r = go(&po, preflight("/api/config", "localhost:17972")).await;
+    assert_eq!(answer(&r), passed, "this machine's preflight: {}", r.text);
+    // A `Host` that is not the server's is refused for every peer that is let in: a preflight is no exception.
+    for (who, s) in [
+        (
+            "the proxy",
+            through_the_proxy(preflight("/api/config", "evil.example")),
+        ),
+        (
+            "the proxy, asking for the private network",
+            through_the_proxy(pna(preflight("/api/config", "evil.example"))),
+        ),
+        ("this machine", preflight("/api/config", "evil.example")),
+        (
+            "this machine, asking for the private network",
+            pna(preflight("/api/config", "evil.example")),
+        ),
+    ] {
+        let r = go(&po, s).await;
+        assert_eq!(
+            answer(&r),
+            refused(421, "misdirected_host"),
+            "{who}: {}",
+            r.text
+        );
+    }
+    // TRACE of the proxy is what it always was: a method that is not served.
+    let r = go(
+        &po,
+        through_the_proxy(send(Method::TRACE, "/api/config").h("host", "dash.example.com")),
+    )
+    .await;
+    assert_eq!(answer(&r), refused(405, "method_not_allowed"), "{}", r.text);
+    // The health route is what it was: a preflight of it is answered `204` with the headers of a public route, for
+    // any peer and any Host (a page that probes this server from another origin asks), and the probe itself, `GET`
+    // and `HEAD`, passes the door from anywhere; a bare `OPTIONS` of it is what any `OPTIONS` is.
+    for peer in [stranger, "127.0.0.1:50000"] {
+        let r = go(
+            &po,
+            pna(preflight("/api/health", "evil.example")).peer(peer),
+        )
+        .await;
+        assert_eq!(
+            r.status, 204,
+            "a preflight of health from {peer}: {}",
+            r.text
+        );
+        assert!(
+            r.headers.get("access-control-allow-origin").is_some(),
+            "{peer}: {:?}",
+            r.headers
+        );
+        let r = go(
+            &po,
+            send(Method::GET, "/api/health")
+                .h("host", "evil.example")
+                .peer(peer),
+        )
+        .await;
+        assert_eq!(r.status, 200, "{peer}: {}", r.text);
+    }
+    let r = go(
+        &po,
+        send(Method::OPTIONS, "/api/health").h("host", "evil.example"),
+    )
+    .await;
+    assert_eq!(
+        r.status, 421,
+        "a bare OPTIONS of health is judged by the Host: {}",
+        r.text
+    );
+
+    // A proxied install that listens on this machine only, and a desktop-shaped one: the same, for the Host.
+    for (what, e) in [
+        ("proxied", proxied_env()),
+        ("local", env(AccessMode::Scoped)),
+    ] {
+        let r = go(&e, preflight("/api/config", "evil.example")).await;
+        assert_eq!(
+            answer(&r),
+            refused(421, "misdirected_host"),
+            "{what}: {}",
+            r.text
+        );
+        let good = if what == "proxied" {
+            "dash.example.com"
+        } else {
+            "localhost:17972"
+        };
+        let s = preflight("/api/config", good);
+        let s = if what == "proxied" {
+            through_the_proxy(s).peer("127.0.0.1:50000")
+        } else {
+            s
+        };
+        let r = go(&e, s).await;
+        assert_eq!(answer(&r), passed, "{what}: {}", r.text);
+    }
+}
+
 #[tokio::test]
 async fn t45_a_probe_of_health_from_a_pod_address_is_answered_by_a_proxy_only_install_and_nothing_else_is(
 ) {
