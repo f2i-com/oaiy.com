@@ -250,6 +250,8 @@ C01 and C08 are killed by them.
 
 ### Round 2, after the independent review
 
+Where each of the reviewer's surviving mutants went (the round-1 mutants were not re-run: the reviewer's survivors are covered by these): M04 by T01 (and T02 to T04), M05 by N01 (and N02 to N04), M33 by W06 to W08, M52 by W09 and W01, M53 by W05. **H05** (the zeroizing growth of a secret `String` leaves its old buffer unwiped) survived at first, because the allocator probe only ran inputs that fit the reserved buffers; the section with a phrase whose NFKD form outgrows its buffer (U+FDFA) was added and kills it.
+
 The review found the primitives sound, and its own mutants found six places in this crate that no test noticed (M04 HMAC verify accepts a truncated tag; M05 wrap uses an all-zero nonce; M33 no length cap on a kit code; M52 U+0085 as a phrase separator; M53 the kit's white space set; and the dead-stack copies of L-7, which a mutant cannot show). Round 2 is run on the code after the fixes, in a second worktree (`scratchpad/vault-impl/mutate2.ps1` and `mutants2.ps1`, outside the repository), on Windows, except the optimised-build and Linux ones (L702 and L703 are run on Linux under WSL in a release build, and L705 and L706 in a release build on Windows): **32 mutants, 32 killed.** The keystore's round 2 is in its README.
 
 | # | Break | Result | Killed by (up to three tests) |

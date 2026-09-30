@@ -254,6 +254,20 @@ is run on the code after the review's fixes, one mutant or more for each finding
 | G04 | the owner of the lock file is not compared | KILLED | `what_another_user_owns_is_refused_at_open_before_each_operation_in_a_file_the_lock_and_the_folders_above` |
 | G05 | the owner of the folders above is not compared | KILLED | `what_another_user_owns_is_refused_at_open_before_each_operation_in_a_file_the_lock_and_the_folders_above` |
 
+Where each of the reviewer's surviving mutants went (the round-1 mutants were **not** re-run on the refactored code: the code they broke is gone; the reviewer's survivors are covered by the round-2 mutants named here):
+
+| Reviewer's survivor | Now |
+|---|---|
+| KM07: a `keys` path that is a file read as `None` under DPAPI | A12 (Windows), `unix::a_keys_path_that_is_a_file_is_refused`, `windows::a_keys_path_that_is_a_file_is_refused` |
+| KM08: a file that grew during the read | E01 |
+| KM11: the name-binding string | F01 |
+| KM12: the keyfile length's byte order | F02 and F03 |
+| KM16: the owner probe | G01 to G05 |
+| KM19: the DPAPI scope | F04 |
+| KM25: any failure to open read as never stored | E02 (Unix) and E03 (Windows) |
+
+Two of the round's mutants survived at first and were killed only after their tests were extended, and that history is part of the result: **G01** (open does not compare the owner of the folder) because the folders above, judged with the same pretended user, refused first (the test now also opens a folder directly under `/tmp`); and, in the crypto crate, H05. **B01**, the lock, is killed only by the deterministic hook test (`a_reader_waits_for_a_writer_in_the_middle_of_a_replace...`); the two-process test that the coordinator asked for does not fail without the lock on this machine.
+
 The survivors that cannot be observed from a test:
 
 - **B06** does not unlock the folder's lock by hand when the guard is dropped: closing the handle releases it too, at once in every run, so nothing observes the difference (the unlock is kept: Windows documents that release at close

@@ -1123,7 +1123,7 @@ mod unix {
     }
 
     #[test]
-    fn a_keys_path_that_is_a_file_or_another_users_folder_is_refused() {
+    fn a_keys_path_that_is_a_file_is_refused() {
         let scratch = Scratch::new("notdir");
         fs::write(scratch.keys(), b"not a folder").unwrap();
         assert!(matches!(open_at(scratch.keys(), ProviderChoice::Keyfile), Err(KeyError::Permissions(why)) if why.contains("not a directory")));
