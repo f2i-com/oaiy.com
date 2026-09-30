@@ -1152,7 +1152,16 @@ fn inspect_auth_dir(auth: &Path, report: &mut Report) -> bool {
             ("owner.json", Ok(v)) => {
                 owner_exists = true;
                 match v["v"].as_u64() {
-                    Some(1) => {}
+                    // The server reads it as it does the login: a file it cannot make an owner of is a refusal to
+                    // start (a hash it cannot use is not: that is a password that does not match).
+                    Some(1) => {
+                        if let Err(detail) = super::owner::OwnerDoc::from_value(&v) {
+                            report.violations.push(format!(
+                                "{} cannot be read as an owner ({detail}): a mangled owner file must not reopen setup; restore it or run `oaiy-server auth init --force`",
+                                path.display()
+                            ));
+                        }
+                    }
                     Some(other) => report.violations.push(format!(
                         "{} was written by a newer OAIY (version {other}; this one reads version 1): update OAIY",
                         path.display()
@@ -1379,7 +1388,7 @@ mod tests {
         let auth = dir.0.join("auth");
         std::fs::create_dir_all(&auth).unwrap();
         let write = |text: &str| std::fs::write(auth.join("owner.json"), text).unwrap();
-        write(r#"{"v":1,"password":"x"}"#);
+        write(r#"{"v":1,"created_ms":1,"password_changed_ms":1,"password":"x"}"#);
         assert_eq!(check_in(&dir, &[]), Report::default());
         write(r#"{"v":2,"password":"x"}"#);
         let r = check_in(&dir, &[]);
@@ -1416,6 +1425,37 @@ mod tests {
             r.violations.iter().any(|v| v.contains("owner.json")),
             "{r:?}"
         );
+    }
+
+    #[test]
+    fn check_reads_the_owner_file_as_the_server_does_and_refuses_what_the_server_would() {
+        let dir = TempDir::new("check-owner-shape");
+        let auth = dir.0.join("auth");
+        std::fs::create_dir_all(&auth).unwrap();
+        let write = |text: &str| std::fs::write(auth.join("owner.json"), text).unwrap();
+        // What the server needs of it: a version it reads, and a password (a hash it cannot use is a wrong password, not
+        // a refusal to start).
+        write(r#"{"v":1,"created_ms":1,"password_changed_ms":1,"password":"x"}"#);
+        assert_eq!(check_in(&dir, &[]), Report::default());
+        for (text, word) in [
+            (
+                r#"{"v":1,"created_ms":1,"password_changed_ms":1}"#,
+                "password",
+            ),
+            (
+                r#"{"v":1,"created_ms":1,"password_changed_ms":1,"password":7}"#,
+                "expected a string",
+            ),
+            (r#"[]"#, "owner.json"),
+        ] {
+            write(text);
+            let r = check_in(&dir, &[]);
+            assert_eq!(r.violations.len(), 1, "{text}: {r:?}");
+            assert!(
+                r.violations[0].contains("owner.json") && r.violations[0].contains(word),
+                "{text}: {r:?}"
+            );
+        }
     }
 
     #[test]
