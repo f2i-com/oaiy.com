@@ -912,7 +912,11 @@ where
                 caller.heard(utterance.seq);
                 let item = next_item("in");
                 let _ = out_tx.send(ids.event("formlogic.realtime.input_transcript", json!({"itemId": item, "transcript": text, "final": true}))).await;
-                let mut how = json!({"startMs": utterance.start_ms, "endMs": utterance.end_ms, "over": utterance.over, "cut": cut, "backchannel": backchannel});
+                // What the app reads with their next words (`backchannel`: over us, before the greeting, or as a reply went on) is one thing; what this
+                // desktop leaves out of its record of what they said is another, and is only an acknowledgement: "Hi, can I speak to the owner?" said
+                // over the greeting is a turn like any other.
+                let only_an_acknowledgement = utterance.resumed || acknowledged || (utterance.early && acknowledges(&text, utterance.end_ms.saturating_sub(utterance.start_ms)));
+                let mut how = json!({"startMs": utterance.start_ms, "endMs": utterance.end_ms, "over": utterance.over, "cut": cut, "backchannel": backchannel, "acknowledgement": only_an_acknowledgement});
                 if utterance.early {
                     how["beforeGreeting"] = json!(true);
                 }
@@ -2241,6 +2245,50 @@ mod tests {
         assert_eq!(sent.iter().filter(|v| v["type"] == "formlogic.realtime.output_item_started").count(), 1, "{sent:?}");
     }
 
+    /// The reviewer's case, on the real call: "Hi, can I speak to the owner?" said first, over the greeting, is a turn like any other, and the
+    /// model's request for the owner is judged on it. It used to be dropped with the acknowledgements (it began before the greeting), and the
+    /// caller was refused for want of an ask. Only what is an acknowledgement is left out of the record.
+    #[tokio::test]
+    async fn an_ask_said_over_the_greeting_is_recorded_and_an_acknowledgement_over_it_is_not() {
+        let start = |fields: Value| {
+            Aokie::start_with(fields, move |hub| {
+                let ring = crate::ring::Ring::in_memory(owner_settings(true));
+                ring.set_presence(Arc::new(Here));
+                ring.set_devices(crate::ring::testing::at_the_pc());
+                hub.set_ring(ring);
+                hub.set_transfer_timing(quick());
+                // (A page answers: with none, a caller's words end the call for want of anyone to answer them.)
+                hub.set_page_answers(true);
+            })
+        };
+        // An ask, said before the greeting was.
+        let mut aokie = start(json!({"from": "+61491570006", "callerName": "Alex", "allowTransfer": true})).await;
+        aokie.speech.hears("Hi, can I speak to the owner?");
+        aokie.begin(json!({}));
+        aokie.caller(&hello());
+        let heard = aokie.event("call.caller", secs(5)).await.expect("their words, for the app");
+        assert_eq!((heard["text"].as_str(), heard["beforeGreeting"].as_bool()), (Some("Hi, can I speak to the owner?"), Some(true)), "{heard}");
+        assert_eq!(aokie.hub.caller_turns(&aokie.call), ["Hi, can I speak to the owner?"], "this desktop's record has it");
+        let asked = asking(&aokie, transfer::TOOL, json!({"reason": "caller_asked"}));
+        let frame = aokie.text("formlogic.realtime.tool_call", secs(3)).await.expect("the request for the owner reached the phone: the caller had asked");
+        assert_eq!(frame["name"], transfer::TOOL);
+        drop(asked);
+        // An acknowledgement said before the greeting asks for nothing, and is not a turn.
+        let mut other = start(json!({"from": "+61491570156", "callerName": "Sam", "allowTransfer": true})).await;
+        other.speech.hears("Mm-hmm.");
+        other.begin(json!({}));
+        other.caller(&hello());
+        let heard = other.event("call.caller", secs(5)).await.expect("their words, for the app");
+        assert_eq!((heard["text"].as_str(), heard["beforeGreeting"].as_bool()), (Some("Mm-hmm."), Some(true)), "{heard}");
+        assert!(other.hub.caller_turns(&other.call).is_empty(), "an acknowledgement is not a turn");
+        // A hello said before the greeting is a turn (it is words, and answered by the greeting), and harmless.
+        let mut third = start(json!({"from": "+61491570157", "callerName": "Kim", "allowTransfer": true})).await;
+        third.begin(json!({}));
+        third.caller(&hello());
+        third.event("call.caller", secs(5)).await.expect("their hello, for the app");
+        assert_eq!(third.hub.caller_turns(&third.call), ["Hello?"]);
+    }
+
     #[tokio::test]
     async fn a_caller_who_talks_on_is_greeted_after_three_seconds_at_most() {
         let mut aokie = Aokie::start(json!({})).await;
@@ -2440,6 +2488,7 @@ mod tests {
         let heard = of("call.caller");
         assert_eq!(heard.len(), 1, "{told:?}");
         assert_eq!((heard[0]["text"].as_str(), heard[0]["over"].as_bool(), heard[0]["cut"].as_bool(), heard[0]["backchannel"].as_bool(), heard[0]["resumed"].as_bool()), (Some("Yeah, sure."), Some(true), Some(false), Some(true), Some(true)), "{}", heard[0]);
+        assert!(aokie.hub.caller_turns(&aokie.call).is_empty(), "an acknowledgement of a reply that went on is not a turn");
         let said_again: Vec<&Value> = told.iter().filter(|v| v["type"] == "call.said" && v["itemId"] == again.as_str()).map(|v| &v["text"]).collect();
         assert_eq!(said_again, [&json!(REPLY[1]), &json!(REPLY[2])]);
     }
@@ -2453,6 +2502,7 @@ mod tests {
         aokie.caller_live(saying(300));
         let heard = aokie.event("call.caller", secs(5)).await.expect("their words, for the app");
         assert_eq!((heard["over"].as_bool(), heard["cut"].as_bool(), heard["backchannel"].as_bool()), (Some(true), Some(false), Some(true)), "{heard}");
+        assert!(aokie.hub.caller_turns(&aokie.call).is_empty(), "an acknowledgement over the reply is not a turn in this desktop's record");
         // The reply plays on to its end: Aokie is never told to stop it, and nothing is said again.
         let sent = aokie.sent_within(Duration::from_millis(4_500)).await;
         assert!(!sent.iter().any(|v| v["type"] == "formlogic.realtime.speech_started" || v["type"] == "formlogic.realtime.output_item_started"), "{sent:?}");
@@ -2595,6 +2645,7 @@ mod tests {
         // Their words are in while it still plays: an acknowledgement, and it goes on.
         let heard = aokie.event("call.caller", secs(5)).await.expect("their words, for the app");
         assert_eq!((heard["over"].as_bool(), heard["cut"].as_bool(), heard["backchannel"].as_bool()), (Some(true), Some(false), Some(true)), "{heard}");
+        assert!(aokie.hub.caller_turns(&aokie.call).is_empty(), "\"Yeah, sure.\" over the greeting is an acknowledgement, and not a turn");
         let sent = aokie.sent_within(Duration::from_millis(2_500)).await;
         assert!(!sent.iter().any(|v| v["type"] == "formlogic.realtime.speech_started" || v["type"] == "formlogic.realtime.output_item_started"), "{sent:?}");
         let said = sent.iter().find(|v| v["type"] == "formlogic.realtime.output_transcript" && v["itemId"] == greeting.as_str());

@@ -436,7 +436,10 @@ impl VoiceHub {
     /// is going the caller hears the fixed line that fits and is never hung up
     /// on, and otherwise they are told so and the call is finished.
     fn caller_said(&self, call: &str, text: &str, how: Value) {
-        if how.get("backchannel").and_then(Value::as_bool) != Some(true) {
+        // Only an acknowledgement ("mm-hmm") is left out of the record of what they said, and the call says which is one (`acknowledgement`); a caller
+        // that says only `backchannel` (what the app reads with their next words) is read as it always was.
+        let acknowledgement = how.get("acknowledgement").or_else(|| how.get("backchannel")).and_then(Value::as_bool) == Some(true);
+        if !acknowledgement {
             self.note_turn(call, text);
         }
         let mut event = json!({"type": "call.caller", "callId": call, "text": text});
@@ -1236,6 +1239,23 @@ mod tests {
             hub.set_transfer_timing(transfer::Timing { tool_answer: Duration::from_secs(tool_answer), ..transfer::Timing::default() });
             assert!(hub.route_wait("call_1", transfer::TOOL) >= Duration::from_secs(tool_answer + 2), "{tool_answer}");
         }
+    }
+
+    #[test]
+    fn only_an_acknowledgement_is_left_out_of_what_the_caller_said_and_what_says_so_is_the_call_and_not_the_apps_aside() {
+        let hub = VoiceHub::new(Engines::at("http://127.0.0.1:9", "http://127.0.0.1:9"), |_| None);
+        hub.note_call("call_1", "+61491570006", "Alex");
+        // The app reads what was said before the greeting with the caller's next words (`backchannel`), but it is a turn all the same, unless the
+        // call says it is only an acknowledgement.
+        hub.caller_said("call_1", "Hi, can I speak to the owner?", json!({"backchannel": true, "beforeGreeting": true, "acknowledgement": false}));
+        hub.caller_said("call_1", "Mm-hmm.", json!({"backchannel": true, "beforeGreeting": true, "acknowledgement": true}));
+        hub.caller_said("call_1", "Yeah, sure.", json!({"backchannel": true, "resumed": true, "acknowledgement": true}));
+        hub.caller_said("call_1", "What are your hours?", json!({"backchannel": false, "acknowledgement": false}));
+        assert_eq!(hub.caller_turns("call_1"), ["Hi, can I speak to the owner?", "What are your hours?"]);
+        // A caller of the old shape (a test, or a call that says only `backchannel`) is read as it always was.
+        hub.caller_said("call_1", "Mm-hmm.", json!({"backchannel": true}));
+        hub.caller_said("call_1", "Thanks.", json!({"backchannel": false}));
+        assert_eq!(hub.caller_turns("call_1"), ["Hi, can I speak to the owner?", "What are your hours?", "Thanks."]);
     }
 
     #[test]
