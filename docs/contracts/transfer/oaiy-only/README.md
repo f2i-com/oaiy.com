@@ -81,7 +81,10 @@ The plan reasons OAIY puts in an `oaiy.ring.plan` answer are exactly the plugin'
   `unknown_plan` or `call_ended`), and the same request said again is the ring that is going. `reasonAllowed` is true
   only for `urgent`, when the owner allows it and the caller said one of the owner's urgent phrases as a statement that it is
   so, read a sentence at a time and in order: not denied ("this is not a gas leak"), supposed ("if there were a gas leak"),
-  quoted or spoken of as words, put as a question, or told to the receptionist to say, and a later denial takes it back.
+  quoted or spoken of as words, put as a question, or told to the receptionist to say, doubted ("I don't think there's a gas leak"),
+  ruled out ("we ruled out a gas leak", but not "we can't rule out a gas leak"), said by a sign or a label ("the sign says gas
+  leak"), or what was so and is over ("there was a gas leak last year", but not "... and it is still leaking"); and a later denial,
+  or a later "ignore that", "never mind" or "false alarm", takes it back.
 * **An ask counts for one request** (`transfer-v1.md`, the caller-asked check). What the caller had said is spent when the request
   **opens** (the plan authorised the ring and the request is open), as far as the request was judged on, and when the AI has the caller
   back (the owner handed them back: every turn so far), and by nothing that stops short of that. The ask stands, and the retry is judged

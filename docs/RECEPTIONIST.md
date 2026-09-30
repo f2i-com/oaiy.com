@@ -237,7 +237,11 @@ reason but the caller asking (or, if you allow it, your own urgent phrases); an 
 rings only when you allowed it and the caller's own words held one of your phrases as a statement that it is so
 (read as the ask is, a sentence at a time and in order: not a denial such as "this is not a gas leak" or "there is no gas
 leak", not a supposition such as "if there were a gas leak", not the words in quotes or spoken of as words, not a question such
-as "is this a gas leak?", not something the caller was told to say, and a later denial takes an earlier statement back) (this desktop
+as "is this a gas leak?", not something the caller was told to say, not a doubt such as "I don't think there's a gas leak" or "I doubt
+it's a gas leak", not something ruled out ("we ruled out a gas leak"), not what a sign or a label says ("the sign says gas leak"), not
+what was so and is over ("there was a gas leak last year", "there was a gas leak but it's fixed"), and a later denial, or a later
+"ignore that", "never mind" or "false alarm", takes an earlier statement back; "I think there's a gas leak", "we can't rule out a gas
+leak" and "there was a gas leak and it's still leaking" are statements) (this desktop
 then vouches for the reason to the phone plugin, `reasonAllowed` in the plan, which the plugin
 wants for any reason but a caller who asked for a person); and by default a caller
 may be put through twice a call, 60 seconds apart, 3 times an hour, and 10 in an hour for everyone.

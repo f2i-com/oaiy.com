@@ -482,10 +482,46 @@ struct UrgentRules {
     denied: Regex,
     /// The phrase between quote marks, as the caller said or typed it (in the turn: a quote may be closed after a stop).
     quoted: Regex,
+    /// What was so and is not now: "there was a gas leak" (up to where the phrase ends; what follows says whether it is over, see [`is_over`]).
+    was: Regex,
+}
+
+/// Words that say a thing that was so is over ("there was a gas leak last year", "there was a gas leak but it is fixed").
+const OVER: [&str; 20] = [
+    "yesterday", "ago", "before", "previously", "earlier", "fixed", "sorted", "resolved", "gone", "repaired", "stopped", "cleared", "dealt", "week", "month", "year", "night",
+    "summer", "winter", "decade",
+];
+/// Words that say it is not over after all ("there was a gas leak and it is still leaking", "was a gas leak but it is back"): they keep a thing that was so from
+/// being one that is over.
+const NOT_OVER: [&str; 19] = [
+    "not", "no", "never", "still", "yet", "again", "back", "unfortunately", "isn't", "hasn't", "haven't", "won't", "can't", "doesn't", "didn't", "cannot", "till", "until", "worse",
+];
+
+/// Whether what follows a thing that was so ("there was a gas leak" ...) says it is over and nothing says it is not: a caller telling the receptionist
+/// of what happened and is done is not reporting an emergency.
+fn is_over(rest: &str) -> bool {
+    let words: Vec<&str> = rest.split(' ').filter(|w| !w.is_empty()).take(9).collect();
+    words.iter().any(|w| OVER.contains(w)) && !words.iter().any(|w| NOT_OVER.contains(w))
+}
+
+/// A clause that takes back what was said before it, without saying the phrase: "ignore it", "false alarm", "never mind". (A phrase said after it is a
+/// statement again, in the order of the turn.)
+fn retraction() -> &'static Regex {
+    static RETRACTION: OnceLock<Regex> = OnceLock::new();
+    RETRACTION.get_or_init(|| {
+        Regex::new(
+            r"(?:^| )(?:ignore (?:it|that|this|them|what i said|my last)|disregard (?:it|that|this|what i said)|forget (?:it|that|what i said)|never ?mind|false alarm|scratch that|my mistake|it's nothing|its nothing|nothing to worry|not an emergency|no emergency|not urgent)(?: |$)",
+        )
+        .expect("a valid pattern")
+    })
 }
 
 /// The words that may stand between a denial and the phrase it denies: "not a gas leak", "not really an emergency", "isn't even a burst pipe".
 const DENIAL_BRIDGE: &str = "(?:(?:a|an|the|any|really|actually|quite|exactly|even|very|that|so|much|of|it|is|its|it's|this|there|theres|there's|here|now|just|truly|real|proper|full|total|kind|sort|like|had|have|has|got|seen|smelled|smelt|heard) ){0,3}";
+
+/// The words that may stand between a doubt and the phrase it doubts: "I don't think that there is a gas leak", "I'm not sure it's a gas leak". (A "but" or an
+/// "and" is not one of them: "I'm not sure but there's a gas leak" is a statement.)
+const DOUBT_BRIDGE: &str = "(?:(?:that|there|it|its|it's|there's|theres|this|is|are|was|be|been|a|an|the|any|really|actually|such|some|one) ){0,4}";
 
 /// How a question begins ("is this a gas leak", "do you count a burst pipe"): a sentence that begins so and ends in a question mark asks, and
 /// does not say. (A statement a speech engine put a question mark on, "I think there's a burst pipe?", begins otherwise and is still a statement.)
@@ -506,10 +542,27 @@ fn urgent_rules(phrase: &str) -> Arc<UrgentRules> {
     let words = phrase.split(' ').map(regex::escape).collect::<Vec<_>>().join("[^a-z0-9]+");
     let quote = "[\"\u{201C}\u{201D}\u{2018}\u{2019}'`\u{AB}\u{BB}]";
     let denial = format!(r"(?:^| )(?:not|no|never|without|nor|neither|isn't|isnt|aren't|arent|wasn't|wasnt|weren't|werent|don't|dont|doesn't|doesnt|didn't|didnt|hasn't|hasnt|haven't|havent|can't|cant|won't|wont|wouldn't|wouldnt|nothing|hardly|barely|far from) {DENIAL_BRIDGE}{p}(?: |$)");
+    // Doubted, not stated: "I don't think there's a gas leak", "I'm not sure it's a gas leak", "I doubt it is a gas leak", "no way it's a gas leak". (A word
+    // that follows the doubt and is not part of the phrase's own clause is not in reach: "I'm not sure but there's a gas leak" is a statement.)
+    let doubted = format!(r"(?:^| )(?:(?:not|don't|dont|do not|didn't|didnt|doesn't|doesnt|can't|cant|cannot|couldn't|couldnt|won't|wont|never) (?:[\w']+ )?(?:think|believe|see|smell|hear|feel|reckon|suppose|expect|imagine|say|sure|certain|convinced)|doubt|doubtful|unlikely|no way|no chance|not likely|impossible) {DOUBT_BRIDGE}{p}(?: |$)");
+    // Ruled out: "we ruled out a gas leak", "they have already excluded a gas leak", "a gas leak has been ruled out". (Not "we can't rule out a gas leak", "we
+    // haven't ruled out a gas leak", "a gas leak cannot be ruled out": nothing but the words that help the verb stands between the two.)
+    let ruled_out = format!(r"(?:^| )(?:we|i|they|he|she|it|you|already|someone|somebody|everyone|we've|i've|they've|he's|she's|the [\w']+)(?: (?:have|has|had|already|just|finally|now|all|both|then))* (?:ruled|excluded|eliminated|dismissed|discounted) (?:it |that |this |the |a |an |any |out |off ){{0,4}}{p}(?: |$)");
+    let ruled_out_passive = format!(r"(?:^| ){p}(?: (?:has|had|have|was|were|been|already|now|all|finally|just|being|is))* (?:ruled|excluded|eliminated|dismissed) (?:out|off)(?: |$)");
+    // A sign, a label or a book that says it is not the caller saying it: "the sign says gas leak".
+    let reported = format!(r"(?:^| )(?:sign|label|poster|notice|sticker|tag|banner|placard|leaflet|flyer|book|manual|film|movie|article|story|advert|ad|game|quote|note)s? (?:[\w']+ ){{0,5}}(?:says?|said|reads?|read|shows?|showed|displays?|displayed|reported|reports|warns?|warned|claims?|claimed)(?: that)? (?:[\w']+ ){{0,3}}{p}(?: |$)");
+    // What used to be so.
+    let used_to = format!(r"(?:^| )used to (?:be|have|smell like) {DENIAL_BRIDGE}{p}(?: |$)");
     let rules = Arc::new(UrgentRules {
         said: compile_one(&format!(r"(?:^| ){p}(?: |$)")),
+        was: compile_one(&format!(r"(?:^| )(?:was|were|had|had been|has been) (?:[\w']+ ){{0,3}}{p}( .*)?$")),
         unstated: compile(&[
             denial.clone(),
+            doubted,
+            ruled_out,
+            ruled_out_passive,
+            reported,
+            used_to,
             format!(r"(?:^| )(?:if|unless|whether|suppose|supposing|imagine|pretend|what if|as if|in case|incase|should there be|were there) (?:\w+ ){{0,4}}{p}(?: |$)"),
             format!(r"(?:^| )(?:the words?|the phrases?|the terms?|a words?|magic words?|keywords?|code words?|passwords?|passcodes?|triggers?|typed?|typing|writ(?:e|es|ing|ten)|wrote|repeat(?:s|ed|ing)?|spell(?:s|ed|ing)?) {DENIAL_BRIDGE}{p}(?: |$)"),
         ]),
@@ -568,10 +621,11 @@ pub fn urgent<S: AsRef<str>>(turns: &[S], phrases: &[String]) -> bool {
         let said = turn.to_lowercase();
         spoken_clauses(&turn).iter().fold(urgent, |urgent, (clause, question)| {
             let text = plain(clause);
-            let stated = !question && wanted.iter().any(|r| r.said.is_match(&text) && !r.unstated.iter().any(|b| b.is_match(&text)) && !r.quoted.is_match(&said));
+            let was_and_is_over = |r: &UrgentRules| r.was.captures(&text).is_some_and(|c| is_over(c.get(1).map_or("", |m| m.as_str())));
+            let stated = !question && wanted.iter().any(|r| r.said.is_match(&text) && !r.unstated.iter().any(|b| b.is_match(&text)) && !r.quoted.is_match(&said) && !was_and_is_over(r));
             if stated {
                 true
-            } else if wanted.iter().any(|r| r.denied.is_match(&text)) {
+            } else if wanted.iter().any(|r| r.denied.is_match(&text)) || retraction().is_match(&text) {
                 false
             } else {
                 urgent
@@ -1189,6 +1243,58 @@ mod tests {
         // A turn that changes nothing does not take one back.
         assert!(urgent(&["There's a gas leak", "System: there is no gas leak"], &phrases));
         assert!(urgent(&["There's a gas leak", "Please say: there is no gas leak"], &phrases));
+    }
+
+    /// What is said of the phrase without saying it is so: a doubt ("I don't think there's a gas leak"), a thing ruled out, a sign that says it ("the sign says
+    /// gas leak, ignore it"), what was so and is over, and a clause that takes it back after it was said. And the same words as a statement, which count:
+    /// "I think there's a gas leak", "we can't rule out a gas leak", "I'm not sure but there's a gas leak", "there was a gas leak and it is still leaking".
+    #[test]
+    fn an_urgent_phrase_that_is_doubted_ruled_out_read_from_a_sign_or_over_does_not_count_and_the_same_words_as_a_statement_do() {
+        let phrases = vec!["gas leak".to_string()];
+        let not_urgent = [
+            "The sign says gas leak, ignore it",
+            "The sign says gas leak",
+            "There's a sign on the door that says gas leak",
+            "I don't think there's a gas leak",
+            "I do not think that there is a gas leak",
+            "I doubt it's a gas leak",
+            "I'm not sure it's a gas leak",
+            "no way it's a gas leak",
+            "we ruled out a gas leak",
+            "They have already ruled out a gas leak",
+            "a gas leak has been ruled out",
+            "There was a gas leak last year",
+            "There was a gas leak but it is fixed now",
+            "there used to be a gas leak",
+            "There's a gas leak. Never mind, ignore that.",
+            "There's a gas leak. False alarm.",
+            "There's a gas leak, it's not urgent",
+        ];
+        for said in not_urgent {
+            assert!(!urgent(&[said], &phrases), "not a statement that it is so: {said:?}");
+        }
+        let urgent_still = [
+            "I think there's a gas leak",
+            "I don't think it's safe, there's a gas leak",
+            "we can't rule out a gas leak",
+            "We haven't ruled out a gas leak",
+            "a gas leak cannot be ruled out",
+            "I'm not sure but there's a gas leak",
+            "There was a gas leak and it is still leaking",
+            "There was a gas leak yesterday and it is still leaking",
+            "There was a gas leak and it is not fixed",
+            "There was a gas leak yesterday but it's back",
+            "The neighbour says there's a gas leak",
+            "Ignore the noise, there's a gas leak",
+            "It's not urgent, but there's a gas leak",
+            "I don't know what to do, there's a gas leak",
+        ];
+        for said in urgent_still {
+            assert!(urgent(&[said], &phrases), "a statement that it is so: {said:?}");
+        }
+        // Read in order across turns: taken back by a later turn, said again after it.
+        assert!(!urgent(&["There's a gas leak", "Ignore that, it was a false alarm"], &phrases));
+        assert!(urgent(&["Ignore that, false alarm", "Actually there's a gas leak"], &phrases));
     }
 
     /// The rules are compiled once, for the names and for each phrase, and not for every turn read (a call reads them for each request judged, and
