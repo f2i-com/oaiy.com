@@ -445,3 +445,42 @@ test('4.14.5 neither the bearers nor the admission secret appear in the server\'
         not_contains($plug, (string)file_get_contents($f));
     }
 });
+
+test('4.14.5 two desktops of one relay with one app id: opening one plugin\'s stream does not end the other\'s (a hold is per desktop, app and party)', function () {
+    [$k, $a, $b, $plug] = aok_pair(['wait' => ['max' => 3]]);
+    $k2 = $k->second();
+    $k2->addPhone('X');
+    $k2->pushRoster();
+    $plug2 = $k2->pluginToken();
+    [$s1, $s2] = $k->r->fleet(2);
+    usleep(300000);
+    $first = aks_open($s1, $plug);
+    ok(aks_until($first, ': connected', 2.0) !== null);
+    usleep(400000);
+    $second = aks_open($s2, $plug2);
+    $r1 = aks_finish($first, 10.0);
+    $r2 = aks_finish($second, 10.0);
+    between(2.5, 4.6, $r1['elapsed'], 'the first ran to its own deadline');
+    between(2.5, 4.6, $r2['elapsed'], 'and so did the second');
+    ok(str_ends_with($r1['body'], aks_end(0)) && str_ends_with($r2['body'], aks_end(0)));
+    eq(0, aks_holds($k)['stream']);
+});
+
+test('4.14.5 a frames wait is a core hold like the stream: at the soft limit it is still granted, and it ends with its admission (two seconds left, a wait of eight is over in about two)', function () {
+    [$k, $a, $b, $plug, $ta] = aok_pair(['wait' => ['max' => 8]]);
+    $eff = $k->r->ctx()->eff;
+    for ($i = 0; $i < $eff->heldSoft; $i++) {
+        aks_fake($k->r, 'other-' . $i);
+    }
+    $t = microtime(true);
+    $res = $k->read($ta, 0, 1);
+    $el = microtime(true) - $t;
+    eq(['granted' => true], $res['json']['hold'], 'granted at the soft limit');
+    between(0.8, 2.5, $el);
+    Tmp::setClock(Relay::T0 + 118); // the admission ends at +120 (exp + 30)
+    $t = microtime(true);
+    $res = $k->read($ta, 0, 8);
+    $el = microtime(true) - $t;
+    eq(200, $res['status'], $res['body']);
+    between(1.5, 3.6, $el, 'the wait ended with the admission, not after eight seconds');
+});

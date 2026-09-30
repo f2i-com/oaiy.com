@@ -366,7 +366,7 @@ test('4.10.3 step 2: a wait on an unknown, an expired or a burned pid returns at
 
 test('4.10.3 step 2: wait and state are checked: a non-number, a negative or a fraction and an unknown state are 400; a wait above wait.max is clamped, not refused', function () {
     [$r, $d, $c] = pair_setup(['wait' => ['max' => 1]]);
-    $c->open();
+    $c->open([], 5); // a life of 5 seconds: a wait that was not clamped would hold for all of it and fail the bound below instead of hanging
     foreach (['abc', '-1', '1.5', '', '1e1', ' 5'] as $w) {
         $res = $c->get(['wait' => $w]);
         eq(400, $res['status'], "wait=$w");
@@ -786,6 +786,31 @@ test('4.10.3 step 8: a phone that ANSWERED with a key of small order (so the app
         eq([422, 'unprocessable'], [$res['status'], pair_code($res)], "$which: " . $res['body']);
         eq(0, pair_phones($r, $d, false), "$which: no device was created");
         eq('answered', pair_row($r, $c->pid)['state']);
+    }
+});
+
+test('4.10.3 step 7: keys that do not fit their thumbprints are 422 even when the response and the approval agree with each other: a thumbprint that is not the key\'s, a response whose own key and thumbprint disagree', function () {
+    $x = Crypto::signKeypairFromSeed(str_repeat("\x21", 32))[0];
+    $y = Crypto::signKeypairFromSeed(str_repeat("\x22", 32))[0];
+    $cases = [
+        // [the response's key, the response's thumbprint, the approval's key, the approval's thumbprint, the receipt's thumbprint]
+        'response and approval both carry a thumbprint that is not the key\'s' => [$x, 'A' . substr(Crypto::thumbprint($y), 1), $x, 'A' . substr(Crypto::thumbprint($y), 1), 'A' . substr(Crypto::thumbprint($y), 1)],
+        'the approval is honest but the response\'s thumbprint is not' => [$x, 'A' . substr(Crypto::thumbprint($y), 1), $x, Crypto::thumbprint($x), Crypto::thumbprint($x)],
+        'the response\'s key is one and its thumbprint another key\'s, and the approval names the second' => [$x, Crypto::thumbprint($y), $y, Crypto::thumbprint($y), Crypto::thumbprint($y)],
+    ];
+    foreach ($cases as $label => [$rk, $rth, $ak, $ath, $recTh]) {
+        [$r, $d, $c] = pair_setup();
+        $claims = $c->claims();
+        $claims['mobileEndpointKey'] = ['algorithm' => 'ed25519', 'publicKey' => B64::enc($rk), 'thumbprint' => $rth];
+        $c->open();
+        eq(202, $c->answer($c->responseText($claims))['status'], $label);
+        $iat = $c->issuedAt + 40;
+        $grants = Grants::DEFAULT;
+        $sig = B64::enc(Crypto::sign(Crypto::signKeypairFromSeed($c->deskSeed)[1], Pairing::RECEIPT_DOMAIN . Pairing::receiptText($c->app, $grants, $iat, $recTh, $c->pid)));
+        $doc = ['approve' => true, 'phone' => ['ed25519' => B64::enc($ak), 'x25519' => B64::enc($c->phoneXPk), 'thumbprint' => $ath], 'name' => 'Phone', 'appId' => $c->app, 'grants' => $grants, 'receipt' => ['issuedAt' => $iat, 'signature' => $sig]];
+        $res = $c->decide($doc);
+        eq([422, 'unprocessable'], [$res['status'], pair_code($res)], "$label: " . $res['body']);
+        eq(0, pair_phones($r, $d, false), "$label: nothing was created");
     }
 });
 

@@ -371,9 +371,10 @@ test('4.14.2 plugin admission: validation in order, each failure a plain 400 (a 
         'algorithm in capitals' => ['endpointPublicKey' => array_merge($ep, ['algorithm' => 'Ed25519'])], 'publicKey of 42 characters' => ['endpointPublicKey' => array_merge($ep, ['publicKey' => substr($ep['publicKey'], 0, 42)])],
         'publicKey non-canonical' => ['endpointPublicKey' => array_merge($ep, ['publicKey' => substr($ep['publicKey'], 0, 42) . 'B'])], 'publicKey padded' => ['endpointPublicKey' => array_merge($ep, ['publicKey' => $ep['publicKey'] . '='])],
         'a thumbprint that is not the key\'s' => ['endpointPublicKey' => array_merge($ep, ['thumbprint' => $th[0]])],
-        'a holder that is not the key\'s thumbprint' => ['holderKeyThumbprint' => $th[0]], 'no holder' => ['holderKeyThumbprint' => $drop],
+        'a holder that is not the key\'s thumbprint' => ['holderKeyThumbprint' => B64::enc(random_bytes(32))], 'no holder' => ['holderKeyThumbprint' => $drop],
         'an empty roster' => ['approvedPeerKeyThumbprints' => []] + $rev(1), 'a roster that is an object' => ['approvedPeerKeyThumbprints' => ['a' => $th[0]]],
-        'an unsorted roster' => ['approvedPeerKeyThumbprints' => array_reverse($th)], 'a duplicate' => ['approvedPeerKeyThumbprints' => [$th[0], $th[0]]],
+        'an unsorted roster (with the hash of that order, so only its order is wrong)' => ['approvedPeerKeyThumbprints' => array_reverse($th), 'peerRosterHash' => DevicesApi::rosterHash(array_reverse($th), 1)],
+        'a duplicate (with its own hash)' => ['approvedPeerKeyThumbprints' => [$th[0], $th[0]], 'peerRosterHash' => DevicesApi::rosterHash([$th[0], $th[0]], 1)],
         'a roster that holds the plugin\'s own key' => ['approvedPeerKeyThumbprints' => (function () use ($k, $th) { $x = array_merge($th, [$k->epThumb()]); sort($x, SORT_STRING); return $x; })()],
         'a roster of 17' => (function () use ($rev) { $x = []; for ($i = 0; $i < 17; $i++) { $x[] = B64::enc(hash('sha256', chr($i), true)); } sort($x, SORT_STRING); return ['approvedPeerKeyThumbprints' => $x, 'peerRosterHash' => DevicesApi::rosterHash($x, 1)]; })(),
         'a thumbprint of 42 characters' => ['approvedPeerKeyThumbprints' => [substr($th[0], 0, 42)]], 'a number in the roster' => ['approvedPeerKeyThumbprints' => [5]],
@@ -479,6 +480,10 @@ test('4.14.2 mobile admission: the phone must be itself (deviceId, key, app), li
     // No recorded pin (a phone not made by a pairing).
     $d = $k->r->phone($k->desk, 'D', ['grants' => ['state_read']]);
     eq(403, $k->mobile($d)['status'], 'no expected peer');
+    // A pin that is the phone's own key (the plugin would be told to expect the phone itself).
+    $s = $k->addPhone('Self pinned');
+    $k->r->ctx()->db->exec('UPDATE devices SET peer_thumbprint = thumbprint WHERE id = ?', [$s->id]);
+    eq(403, $k->mobile($s)['status'], 'an expected peer that is its own key');
     // A desktop that was revoked takes its phones with it.
     $e = $k->addPhone('E');
     \Oaiy\Relay\Devices::revoke($k->r->ctx(), $k->desk->id, false);

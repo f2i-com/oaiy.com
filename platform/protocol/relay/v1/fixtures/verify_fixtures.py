@@ -21,6 +21,7 @@ import base64
 import hashlib
 import hmac
 import json
+import os
 import pathlib
 import re
 import struct
@@ -37,6 +38,7 @@ except ImportError:
     raise SystemExit(2)
 
 HERE = pathlib.Path(__file__).resolve().parent
+FIXDIR = pathlib.Path(os.environ.get("OAIY_FIXTURE_DIR", str(HERE)))   # where sealed-token.json and pairing-ceremony.json are read (selftest_fixtures.py: damaged copies)
 V1 = HERE.parent
 CROCKFORD = "0123456789ABCDEFGHJKMNPQRSTVWXYZ"
 M32 = 0xFFFFFFFF
@@ -194,7 +196,7 @@ TOKEN_RE = re.compile(r"oaiyrt1\.[A-Za-z0-9_-]{11}\.[A-Za-z0-9_-]{43}")
 
 
 def sealed_file() -> None:
-    doc = json.loads((HERE / "sealed-token.json").read_text(encoding="utf-8"))
+    doc = json.loads((FIXDIR / "sealed-token.json").read_text(encoding="utf-8"))
     sk = unb64u(doc["recipient"]["x25519Secret"])
     pk = unb64u(doc["recipient"]["x25519Public"])
     check("sealed: the recipient public key is the X25519 public key of its secret",
@@ -225,7 +227,7 @@ def sealed_file() -> None:
 
 
 def ceremony_file() -> None:
-    doc = json.loads((HERE / "pairing-ceremony.json").read_text(encoding="utf-8"))
+    doc = json.loads((FIXDIR / "pairing-ceremony.json").read_text(encoding="utf-8"))
     a3 = vec["A3"]
     steps = doc["steps"]
     check("ceremony: six steps", len(steps) == 6)

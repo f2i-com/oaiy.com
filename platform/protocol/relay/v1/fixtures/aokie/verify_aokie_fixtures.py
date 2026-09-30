@@ -175,10 +175,10 @@ TURN_I = 1                                       # iceServers[1] is the TURN ent
 n_plugin_neg = 0
 
 
-def plugin_refused(label, doc):
+def plugin_refused(label, doc, expect=None):
     global n_plugin_neg
     n_plugin_neg += 1
-    refuses("plugin AdmissionResponse refuses " + label, lambda: D.plugin_admission(doc, P_EXPECT, NOW))
+    refuses("plugin AdmissionResponse refuses " + label, lambda: D.plugin_admission(doc, expect or P_EXPECT, NOW))
 
 
 def plugin_degrades(label, doc):
@@ -210,6 +210,18 @@ for v in (0, 10):
 plugin_refused("expiresIn 301", mut(PB, "expiresIn", 301))
 plugin_refused("expiresIn as a string", mut(PB, "expiresIn", "90"))
 plugin_refused("expiresIn as a float", mut(PB, "expiresIn", 90.0))
+plugin_refused("expiresIn as true (a bool is not a u64)", mut(PB, "expiresIn", True))
+plugin_refused("expiresAt as true", mut(PB, "expiresAt", True))
+plugin_refused("a roster revision of true where the plugin sent 1 (Python says True == 1; a u64 does not)", dict(PB, peerRosterRevision=True), dict(P_EXPECT, peerRosterRevision=1))
+# Damaged keys that the plugin sent itself (so the echo comparison cannot be what refuses them): only the key's own rules can.
+BAD_TH = dict(PB["endpointPublicKey"], thumbprint="A" * 43)
+plugin_refused("an endpoint key whose thumbprint does not recompute, echoed as sent",
+               dict(PB, endpointPublicKey=BAD_TH, holderKeyThumbprint=BAD_TH["thumbprint"]), dict(P_EXPECT, endpointPublicKey=BAD_TH))
+BAD_ALG = dict(PB["endpointPublicKey"], algorithm="Ed25519")
+plugin_refused("an endpoint key with the algorithm in capitals, echoed as sent",
+               dict(PB, endpointPublicKey=BAD_ALG), dict(P_EXPECT, endpointPublicKey=BAD_ALG))
+plugin_refused("a padded endpoint public key, echoed as sent", dict(PB, endpointPublicKey=dict(PB["endpointPublicKey"], publicKey=PB["endpointPublicKey"]["publicKey"] + "=")),
+               dict(P_EXPECT, endpointPublicKey=dict(PB["endpointPublicKey"], publicKey=PB["endpointPublicKey"]["publicKey"] + "=")))
 plugin_refused("expiresAt 10 seconds ahead", mut(PB, "expiresAt", NOW + 10))
 plugin_refused("expiresAt 301 seconds ahead", mut(PB, "expiresAt", NOW + 301))
 plugin_refused("expiresAt in the past", mut(PB, "expiresAt", NOW - 5))
@@ -240,6 +252,7 @@ plugin_refused("an ICE server without urls", mut(PB, "iceServers.0.urls", []))
 plugin_refused("an ICE server with nine urls", mut(PB, "iceServers.0.urls", [f"stun:s{i}.example.com" for i in range(9)]))
 plugin_refused("an ICE url that is https", mut(PB, "iceServers.0.urls", ["https://stun.example.com"]))
 plugin_refused("nine ICE servers", mut(PB, "iceServers", [PB["iceServers"][0]] * 9))
+plugin_refused("nine STUN-only ICE servers with no TURN promised (only the count is wrong)", dict(PB, iceServers=[PB["iceServers"][0]] * 9, turnCredentialExpiresAt=None))
 plugin_refused("a STUN and a TURN url in one entry", mut(PB, "iceServers.0.urls", ["stun:stun.example.com:3478", "turn:turn.example.com:3478"]))
 plugin_refused("relayOnly true with no TURN entry", dict(PB, relayOnly=True, iceServers=[PB["iceServers"][0]], turnCredentialExpiresAt=None))
 plugin_refused("an endpoint key with another algorithm", mut(PB, "endpointPublicKey.algorithm", "Ed25519"))
@@ -253,6 +266,7 @@ plugin_degrades("a relay member without streamUrl", mut(PB, "relay.streamUrl", D
 plugin_degrades("a relay URL on http", mut(PB, "relay.streamUrl", "http://relay.example.com/v1/aokie-companion/relay/stream"))
 plugin_degrades("relay URLs on two origins", mut(PB, "relay.framesUrl", "https://elsewhere.example.com/v1/aokie-companion/relay/frames"))
 plugin_degrades("relay URLs on two ports", mut(PB, "relay.framesUrl", "https://relay.example.com:8443/v1/aokie-companion/relay/frames"))
+plugin_degrades("relay URLs that are all on http (one origin, but not https)", dict(PB, relay={k: v.replace("https://", "http://") for k, v in PB["relay"].items()}))
 plugin_degrades("a relay URL with credentials", mut(PB, "relay.challengeUrl", "https://u:p@relay.example.com/v1/aokie-companion/relay/challenge"))
 plugin_degrades("a relay URL with a fragment", mut(PB, "relay.challengeUrl", "https://relay.example.com/v1/aokie-companion/relay/challenge#x"))
 plugin_degrades("a relay URL that is not absolute", mut(PB, "relay.challengeUrl", "/v1/aokie-companion/relay/challenge"))
@@ -316,6 +330,21 @@ phone_refused("turnCredentialExpiresAt that is not the TURN expiry", mut(MB, "tu
 phone_refused("a session holder that is not the phone's key", MB, holder=IDS["phoneBThumbprint"])
 phone_refused("a TURN entry whose expiresAt is null (the phone reads it as none)", mut(MB, f"iceServers.{TURN_I}.expiresAt", None))
 
+# ---- the bearer itself: a damaged one is refused by a reader that checks it
+GOOD_BEARER = PB["accessToken"]
+_p = GOOD_BEARER.split(".")
+for label, tok in (("a flipped bit of the MAC", _p[0] + "." + _p[1] + "." + ("0" if _p[2][0] != "0" else "1") + _p[2][1:]),
+                   ("a claims payload with one digit changed", _p[0] + "." + _p[1][:-1] + ("0" if _p[1][-1] != "0" else "1") + "." + _p[2]),
+                   ("a MAC in capitals", _p[0] + "." + _p[1] + "." + _p[2].upper()),
+                   ("another prefix", "aokie-adm-v3." + _p[1] + "." + _p[2]),
+                   ("no MAC", _p[0] + "." + _p[1])):
+    if label == "a MAC in capitals" and _p[2] == _p[2].upper():
+        continue
+    n_plugin_neg += 1
+    refuses("the bearer reader refuses " + label, lambda tok=tok: D.read_bearer(tok, SECRET))
+n_plugin_neg += 1
+refuses("the bearer reader refuses another secret", lambda: D.read_bearer(GOOD_BEARER, bytes(32)))
+
 # ================================================================================================ challenges
 n_challenge_neg = 0
 by_bearer = {}
@@ -360,7 +389,10 @@ challenge_refused("a plugin challenge without a roster", mut(CP, "approvedPeerKe
 challenge_refused("a plugin challenge with an empty roster", mut(CP, "approvedPeerKeyThumbprints", []))
 challenge_refused("a plugin roster in the wrong order", mut(CP, "approvedPeerKeyThumbprints", list(reversed(CP["approvedPeerKeyThumbprints"]))))
 challenge_refused("a plugin roster with a duplicate", mut(CP, "approvedPeerKeyThumbprints", [CP["approvedPeerKeyThumbprints"][0]] * 2))
-challenge_refused("a plugin roster that holds the plugin's own key", mut(CP, "approvedPeerKeyThumbprints", sorted(CP["approvedPeerKeyThumbprints"] + [CP["holderKeyThumbprint"]])))
+OWN = sorted(CP["approvedPeerKeyThumbprints"] + [CP["holderKeyThumbprint"]])
+challenge_refused("a plugin roster that holds the plugin's own key (sorted, with the hash of that roster)", dict(CP, approvedPeerKeyThumbprints=OWN, peerRosterHash=D.peer_roster_hash(CP["peerRosterRevision"], OWN)))
+UNSORTED = list(reversed(CP["approvedPeerKeyThumbprints"]))
+challenge_refused("a plugin roster in the wrong order (with the hash of that order)", dict(CP, approvedPeerKeyThumbprints=UNSORTED, peerRosterHash=D.peer_roster_hash(CP["peerRosterRevision"], UNSORTED)))
 challenge_refused("a plugin challenge with a wrong roster hash", mut(CP, "peerRosterHash", "A" * 43))
 challenge_refused("a plugin challenge with revision 0", mut(CP, "peerRosterRevision", 0))
 challenge_refused("a plugin challenge without a revision", mut(CP, "peerRosterRevision", DEL))

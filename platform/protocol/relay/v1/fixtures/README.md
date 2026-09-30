@@ -11,6 +11,7 @@ box is not one of those: its ephemeral key is random, so no two are alike. The f
 | `rust-check/` | a stand-alone Rust crate that opens `sealed-token.json` with the `crypto_box` crate | a first Rust reader, to copy from |
 | `pairing-ceremony.json` | one whole pairing (Appendix A3's keys and values) as the requests a desktop and a phone make and the answers the relay gives | a Rust stub relay, a phone double, a host client |
 | `verify_fixtures.py`, `verify_fixtures.mjs` | two independent checks of the two files above, with no libsodium | the conformance suite (`../../../tests/relay_conformance.py`) |
+| `selftest_fixtures.py` | runs those two checks on sixteen damaged copies of the two files (a flipped bit, a wrong hash, a bad receipt, a good box among the refused ones, ...) and requires each to refuse each | the conformance suite |
 | `aokie/` | what the relay answers to the shipped Aokie plugin and phone (admissions, challenges, frames, streams, errors, ICE) and the rules of their decoders applied to it; its own [`README.md`](aokie/README.md) | a Rust contract test in the Aokie repository, and the conformance suite |
 
 Regenerate with `php platform/relay/tests/fixtures.php --write` (it drives the relay in a temporary directory on loopback and

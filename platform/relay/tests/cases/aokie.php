@@ -693,3 +693,28 @@ test('4.14.4 the sig lane is not reachable through the native routes: POST /v1/i
     eq([], $poll['json']['items'], 'the desktop\'s inbox holds no frame');
     eq(1, aok_count($k), 'and the frame is still where it was');
 });
+
+test('4.14.4 a delivered frame\'s grants are known names whatever is stored: an unknown name is dropped, a list of more than 16 is empty', function () {
+    [$k, $a, $b, $plug, $ta] = aok_pair();
+    eq(200, $k->send($ta, 'plugin', ['{}', '{}', '{}'])['status']);
+    $db = $k->r->ctx()->db;
+    $db->exec("UPDATE items SET grants = ? WHERE lane = 'sig' AND seq = 1", ['["state_read","delete_all","caller_read"]']);
+    $db->exec("UPDATE items SET grants = ? WHERE lane = 'sig' AND seq = 2", [json_encode(array_fill(0, 17, 'state_read'))]);
+    $db->exec("UPDATE items SET grants = ? WHERE lane = 'sig' AND seq = 3", ['not json']);
+    $got = array_column($k->read($plug, 0)['json']['frames'], 'grants');
+    eq([['state_read', 'caller_read'], [], []], $got);
+});
+
+test('4.14.4 an unexpected failure on a compatibility route is a 500 in the Aokie shape that tells nothing, and the native routes keep their own shape', function () {
+    [$k, $a, $b, $plug, $ta] = aok_pair();
+    file_put_contents($k->r->data . '/secrets/admission.hmac', 'damaged');
+    $res = aok_call($k, $ta, 'GET', 'challenge');
+    eq(500, $res['status']);
+    eq('internal', $res['json']['code']);
+    eq(['error', 'code', 'message'], array_keys($res['json']));
+    not_contains('admission.hmac', $res['body']);
+    not_contains('damaged', $res['body']);
+    $native = $k->r->call($k->desk, 'POST', '/v1/admission', $k->pluginRequest());
+    eq(500, $native['status']);
+    ok(isset($native['json']['error']['code']), 'the native path keeps the native shape');
+});

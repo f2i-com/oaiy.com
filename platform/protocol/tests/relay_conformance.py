@@ -1693,6 +1693,16 @@ for label, cmd in (("Python (no libsodium)", [sys.executable, str(FIX / "verify_
     except (OSError, subprocess.TimeoutExpired) as e:
         ok(f"independent reading of the fixtures in {label} ran", False, str(e))
 
+try:
+    proc = subprocess.run([sys.executable, str(FIX / "selftest_fixtures.py")], capture_output=True, text=True, encoding="utf-8", timeout=300)
+    m = re.search(r"(\d+) damaged copies, each refused by", proc.stdout)
+    n = int(m.group(1)) if m else 0
+    ok(f"the two readers of the pairing fixtures are not vacuous: each of {n} damaged copies is refused by both", proc.returncode == 0 and n >= 10, (proc.stdout + proc.stderr)[-500:])
+except (OSError, subprocess.TimeoutExpired) as e:
+    ok("the self-test of the pairing fixture readers ran", False, str(e))
+for f in ("sealed-token.json", "selftest_fixtures.py"):
+    ok(f"fixtures/README.md describes {f}", f"`{f}`" in fix_readme)
+
 section("recorded Aokie fixtures (fixtures/aokie/): admissions, challenges, frames, streams, errors and ICE, read by the decoders' rules")
 AOK = FIX / "aokie"
 aok = {n: json.loads((AOK / n).read_text(encoding="utf-8")) for n in ("admission.json", "challenge.json", "frames.json", "stream.json", "errors.json", "ice.json")}

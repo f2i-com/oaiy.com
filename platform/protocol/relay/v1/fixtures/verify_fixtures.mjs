@@ -11,7 +11,9 @@ import fs from 'node:fs';
 
 const here = new URL('./', import.meta.url);
 const V = JSON.parse(fs.readFileSync(new URL('../vectors.json', here), 'utf8'));
-const read = (name) => JSON.parse(fs.readFileSync(new URL(name, here), 'utf8'));
+// The two fixture files are read from OAIY_FIXTURE_DIR when it is set (selftest_fixtures.py points it at damaged copies).
+const fixdir = process.env.OAIY_FIXTURE_DIR ? new URL('file:///' + process.env.OAIY_FIXTURE_DIR.replace(/\\/g, '/').replace(/\/?$/, '/')) : here;
+const read = (name) => JSON.parse(fs.readFileSync(new URL(name, fixdir), 'utf8'));
 
 let checks = 0;
 let bad = 0;
