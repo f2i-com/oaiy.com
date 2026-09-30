@@ -247,6 +247,7 @@ final class Relay
         }
         $req = new Request($method, $path, $query, $srv, $raw, null);
         $res = (new Kernel($this->ctx()))->handle($req);
+        @set_time_limit(0); // a held request lowers the limit to its wait + 10 seconds (Windows counts wall time); the run itself has none
         $out = ['status' => $res->status, 'headers' => array_change_key_case($res->headers, CASE_LOWER), 'body' => $res->body, 'json' => null];
         if ($res->body !== '' && strncmp($out['headers']['content-type'] ?? '', 'application/json', 16) === 0) {
             $out['json'] = json_decode($res->body, true);
