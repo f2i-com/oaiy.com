@@ -127,3 +127,7 @@ const existing = doc.routes.filter((r) => r.since === 1).length;
 console.log(`\ncheck-access: ok. ${doc.routes.length} rows (${existing} for routes that existed before the access model, ${doc.routes.length - existing} added or reserved), ${scopeRows.size} scopes named by a row, ${Object.keys(doc.presets).length} presets, ${Object.keys(doc.relayTiers).length} relay tiers.`);
 if (process.argv.includes('--keep')) console.log(`routes.json: ${file}`);
 else fs.rmSync(out, { recursive: true, force: true });
+// Everything above listens on 127.0.0.1 only (the servers the boot tests start take a bind of their own, and the console's
+// tests talk to loopback). What needs a listener on a network address is opt-in, in `check-exposure.mjs --lan`, because
+// Windows Firewall asks the owner about each new path of an exe that listens beyond loopback.
+console.log('check-access: opened nothing on a network address. Not run, opt-in: the lan and proxy-only listener tests (node scripts/check-exposure.mjs --lan).');

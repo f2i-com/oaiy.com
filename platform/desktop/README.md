@@ -185,6 +185,33 @@ npm run tauri:dev   # Spawns vite + Rust dev build + opens window
 The first build takes a few minutes (downloads + compiles the Tauri
 runtime); subsequent rebuilds are cached.
 
+### Tests that open a socket on your network address are opt-in
+
+A default `cargo test` and the local checks (`scripts/check-access.mjs`, `scripts/check-exposure.mjs`,
+`scripts/e2e-exposure.mjs`) **listen and connect on loopback only**: every server binds `127.0.0.1` (or another
+`127.x.y.z` address) and every proxy or peer they pretend to be is another `127.x.y.z` address. On Windows the
+firewall asks for an exception, once per path of the exe, when a program listens on `0.0.0.0` or a LAN address, and
+every "Allow" is a permanent inbound rule for that exe (each `cargo` target folder is a new path), so nothing that
+does that runs by default.
+
+What genuinely needs a listener that is not loopback (`OAIY_SERVER_BIND=lan`, the proxy-only shape, this machine's
+network address as a peer that is neither loopback nor the proxy) is opt-in. Each such test says what it is about to do
+and then does it only when you ask for it:
+
+```pwsh
+# the #[ignore]d tests of the real program, and the opt-in scenarios of the Node proxy doubles
+node scripts/check-exposure.mjs --lan
+# or one at a time
+$env:OAIY_TEST_LAN = "1"; cargo test --no-default-features --features web --test access_exposure -- --ignored --nocapture
+$env:OAIY_TEST_LAN = "1"; node scripts/e2e-exposure.mjs --lan
+```
+
+The same behaviours are also covered without a socket beyond loopback, so a default run is not blind to them: the
+guard's tests (`src-tauri/src/auth/guard_tests.rs`, `login_tests.rs`) send requests with fake peer addresses to a guard
+built from a validated configuration (`exposure::evaluate`), and `auth::exposure` tests every startup rule. When you run a
+throwaway server of your own for a test (`mysqld`, `php -S`, a dev server) bind it to `127.0.0.1`
+(`--bind-address=127.0.0.1`, `-S 127.0.0.1:port`), for the same reason.
+
 To check the API is up:
 ```pwsh
 curl http://127.0.0.1:17972/api/health

@@ -22,9 +22,18 @@
 // real proxy reads the address of the connection). A proxy that comes from another address (a Docker bridge address,
 // 172.30.0.3) is a source address in 127.30.0.0/24 of this machine, which every 127.x.y.z is.
 //
-// The half that needs a peer address that is neither loopback nor a proxy is `tests/access_exposure.rs` (it connects to
-// this machine's own network address); the half that needs a public source address runs here only when this machine
-// has one, and says so when it does not. Exit code 0 when every check held.
+// **A default run opens nothing on a network address.** Every server here listens on 127.0.0.1 and every peer, proxy
+// and client is a 127.x.y.z address, so Windows Firewall has nothing to ask about (each new path of an exe that listens
+// on 0.0.0.0 or a LAN address gets an "allow access" prompt, and every "Allow" is a permanent inbound rule). What needs
+// a listener that is not loopback (the proxy-only shape, which is a bind beyond loopback behind a named proxy, and the
+// lan listener taking a bearer from a public address) is opt-in:
+//
+//   OAIY_TEST_LAN=1 node scripts/e2e-exposure.mjs      or      node scripts/e2e-exposure.mjs --lan
+//
+// It says what it is about to do before it does it, and the checks it did not run are listed at the end. The same rules
+// are covered without a socket by the guard's in-process tests (`auth::guard_tests`, with fake peer addresses and a
+// guard built from a validated configuration) and, as a real process on 127.0.0.1, by `tests/access_exposure.rs`.
+// Exit code 0 when every check held.
 
 import { spawn, spawnSync } from 'node:child_process';
 import fs from 'node:fs';
@@ -52,6 +61,21 @@ const FORBIDDEN = new Set([17972, 17872, 17973, 7860, 8080, 9333, 17880]);
 const TOKEN = 'e2e-exposure-token-0123456789ABCDEF';
 const root = fs.mkdtempSync(path.join(os.tmpdir(), 'oaiy-e2e-exposure-'));
 
+// The opt-in of the checks that need a listener that is not loopback.
+const LAN = process.env.OAIY_TEST_LAN === '1' || process.argv.includes('--lan');
+const LAN_NOTICE = 'this opens a socket on your LAN address (a listener on 0.0.0.0) and Windows will ask for a firewall exception for the program that listens; every "Allow" is a permanent inbound rule for that exe';
+const skipped = [];
+/** Whether a check that needs a non-loopback listener may run; says what it is about to do, or that it is skipped. */
+function optIn(name) {
+  if (LAN) {
+    console.log(`opt-in ${name}: ${LAN_NOTICE}`);
+    return true;
+  }
+  skipped.push(name);
+  console.log(`skip ${name}: opt-in (OAIY_TEST_LAN=1 or --lan): it needs a listener on 0.0.0.0`);
+  return false;
+}
+
 let checks = 0;
 const failures = [];
 function ok(cond, what, detail) {
@@ -71,10 +95,11 @@ async function freePort() {
   for (let i = 0; i < 200; i++) {
     const p = 41000 + Math.floor(Math.random() * 1000);
     if (used.has(p) || FORBIDDEN.has(p)) continue;
+    // Loopback only, even to find out that a port is free: a listener on 0.0.0.0 asks the firewall.
     const free = await new Promise((resolve) => {
       const s = net.createServer();
       s.once('error', () => resolve(false));
-      s.listen(p, '0.0.0.0', () => s.close(() => resolve(true)));
+      s.listen(p, '127.0.0.1', () => s.close(() => resolve(true)));
     });
     if (free) {
       used.add(p);
@@ -86,8 +111,15 @@ async function freePort() {
 
 // ---- a request ------------------------------------------------------------------------------------------------
 
+const isLoopbackAddress = (a) => !a || /^127\.\d+\.\d+\.\d+$/.test(a) || a === 'localhost' || a === '::1';
+
 function request({ host = '127.0.0.1', port, method = 'GET', pathname = '/', headers = {}, localAddress, body }) {
   return new Promise((resolve, reject) => {
+    // A default run connects to loopback addresses only, from loopback addresses only.
+    if (!LAN && !(isLoopbackAddress(host) && isLoopbackAddress(localAddress))) {
+      reject(new Error(`refusing to connect to ${host} from ${localAddress ?? 'the default address'}: a default run stays on loopback (OAIY_TEST_LAN=1 opts in)`));
+      return;
+    }
     const req = http.request(
       { host, port, method, path: pathname, headers, localAddress, agent: false, timeout: 20000 },
       (res) => {
@@ -110,6 +142,12 @@ function request({ host = '127.0.0.1', port, method = 'GET', pathname = '/', hea
 // ---- a server -------------------------------------------------------------------------------------------------
 
 async function startServer(name, env, { owner = false, expectExit } = {}) {
+  // A server that will listen binds loopback in a default run. (One that is expected to exit 78 never gets as far as
+  // binding, so the refusals may name any bind.)
+  const bind = (env.OAIY_SERVER_BIND ?? '').trim();
+  if (!LAN && expectExit === undefined && bind !== '' && !/^loopback$/i.test(bind) && !isLoopbackAddress(bind)) {
+    throw new Error(`${name}: OAIY_SERVER_BIND=${bind} would listen beyond loopback: a default run does not (OAIY_TEST_LAN=1 opts in)`);
+  }
   const dir = path.join(root, name);
   fs.mkdirSync(dir, { recursive: true });
   const data = path.join(dir, 'data');
@@ -240,8 +278,8 @@ async function scenario(name, fn) {
   const opened = [];
   const t0 = Date.now();
   try {
-    await fn(opened);
-    console.log(`ok   ${name} (${Date.now() - t0} ms)`);
+    const result = await fn(opened);
+    if (result !== 'skipped') console.log(`ok   ${name} (${Date.now() - t0} ms)`);
   } catch (e) {
     failures.push(`${name}: ${e.stack ?? e}`);
     console.error(`FAIL ${name}: ${e.stack ?? e}`);
@@ -366,8 +404,9 @@ await scenario('T45 Cloudflare-shaped headers: one real client entry, or every v
   eq(r.json.seen.clientIp, '198.51.100.7', 'other client-address headers are never believed');
 });
 
-// T45: a Docker-shaped peer, with and without OAIY_TRUSTED_PROXIES; proxy-only refuses what did not come through.
-await scenario('T45 a Docker-shaped peer: trusted only with the setting; direct access refused', async (opened) => {
+// T45: a Docker-shaped peer, with and without OAIY_TRUSTED_PROXIES. (The peers are addresses of 127.0.0.0/8: nothing
+// listens or connects beyond loopback.)
+await scenario('T45 a Docker-shaped peer: trusted only with the setting', async (opened) => {
   const bridge = '127.30.0.3'; // stands for 172.30.0.3: not the loopback address, so not trusted by default
   // Without the setting: the default trusts 127.0.0.1 only, so the bridge address is a client like any other.
   const plain = await startServer('t45-docker-default', PROXIED);
@@ -376,13 +415,29 @@ await scenario('T45 a Docker-shaped peer: trusted only with the setting; direct 
   opened.push(viaBridge);
   let r = await viaBridge.get('/api/auth/info', { client: '203.0.113.9' });
   eq(seenOf(r), { ip: bridge, proto: 'http', via: false, secure: false }, 'a peer that is not trusted: its word is worth nothing');
-  // With it: proxy-only (bound beyond loopback, the proxy named), and the proxy's word is taken.
+  // With the network named, the proxy's word is taken; a neighbour in the same network that is not named is a client.
+  const named = await startServer('t45-docker-named-loopback', { ...PROXIED, OAIY_TRUSTED_PROXIES: '127.30.0.0/24', OAIY_SERVER_TOKEN: TOKEN });
+  opened.push(named);
+  const proxy = await startProxy('caddy', named.port, { source: bridge });
+  const other = await startProxy('caddy', named.port, { source: '127.31.0.9' });
+  opened.push(proxy, other);
+  r = await proxy.get('/api/auth/info', { client: '203.0.113.9' });
+  eq(seenOf(r), { ip: '203.0.113.9', proto: 'https', via: true, secure: true }, 'the compose network is named: its word is taken');
+  r = await other.get('/api/auth/info', { client: '203.0.113.9' });
+  eq(seenOf(r), { ip: '127.31.0.9', proto: 'http', via: false, secure: false }, 'a peer outside the named network: its word is worth nothing');
+});
+
+// T45: the proxy-only shape (bound beyond loopback, its proxy named) refuses what did not come through the proxy.
+// Opt-in: it needs a listener on 0.0.0.0.
+await scenario('T45 proxy-only (opt-in): direct access refused', async (opened) => {
+  if (!optIn('T45 proxy-only: direct access refused')) return 'skipped';
+  const bridge = '127.30.0.3';
   const named = await startServer('t45-docker-named', { ...PROXIED, OAIY_SERVER_BIND: '0.0.0.0', OAIY_TRUSTED_PROXIES: '127.30.0.0/24', OAIY_SERVER_TOKEN: TOKEN });
   opened.push(named);
   ok(named.stderr().includes('proxy-only'), 'the banner says proxy-only', named.stderr());
   const proxy = await startProxy('caddy', named.port, { source: bridge });
   opened.push(proxy);
-  r = await proxy.get('/api/auth/info', { client: '203.0.113.9' });
+  let r = await proxy.get('/api/auth/info', { client: '203.0.113.9' });
   eq(seenOf(r), { ip: '203.0.113.9', proto: 'https', via: true, secure: true }, 'the compose network is named: its word is taken');
   // Somebody else in the same network is not the proxy: refused, whatever headers it sends.
   const other = await startProxy('caddy', named.port, { source: '127.31.0.9' });
@@ -461,13 +516,15 @@ await scenario('T45 a weak static token stops the server with exit 78, a good on
 });
 
 // A bearer from a public peer on a lan listener: needs a source address that is public, so only where this machine has one.
-await scenario('T45 a bearer from a public address on a lan listener is refused, unless the operator says otherwise', async (opened) => {
+await scenario('T45 a bearer from a public address on a lan listener is refused, unless the operator says otherwise (opt-in)', async (opened) => {
+  if (!optIn('T45 lan/public: a bearer from a public address on a lan listener')) return 'skipped';
   const isPrivate = (a) =>
     /^(10\.|127\.|192\.168\.|169\.254\.|172\.(1[6-9]|2\d|3[01])\.|100\.(6[4-9]|[7-9]\d|1[01]\d|12[0-7])\.)/.test(a) || /^(fc|fd|fe80|::1)/i.test(a);
   const publicAddr = Object.values(os.networkInterfaces()).flat().find((i) => i && !i.internal && i.family === 'IPv4' && !isPrivate(i.address))?.address;
   if (!publicAddr) {
-    console.log('skip T45 lan/public: this machine has no public IPv4 address to connect from (the in-process test t45_a_bearer_from_a_public_peer... covers the rule)');
-    return;
+    console.log('skip T45 lan/public: this machine has no public IPv4 address to connect from (the in-process tests t45_a_bearer_from_a_public_address... in auth::guard_tests cover the rule)');
+    skipped.push('T45 lan/public: no public IPv4 address on this machine');
+    return 'skipped';
   }
   const lan = await startServer('t45-lan-public', { OAIY_SERVER_BIND: '0.0.0.0', OAIY_SERVER_TOKEN: TOKEN }, { owner: true });
   opened.push(lan);
@@ -511,6 +568,9 @@ await scenario('T28 every rule of 4.5.5 stops the server with exit 78 and `check
 // ---- the end ---------------------------------------------------------------------------------------------------
 
 fs.rmSync(root, { recursive: true, force: true });
+if (skipped.length) {
+  console.log(`\ne2e-exposure: skipped as opt-in (${skipped.length}): ${skipped.join('; ')}\n  (they need a listener on 0.0.0.0: OAIY_TEST_LAN=1 or --lan; ${LAN_NOTICE})`);
+}
 if (failures.length) {
   console.error(`\ne2e-exposure: ${failures.length} of ${checks} checks failed`);
   process.exit(1);

@@ -122,6 +122,14 @@ session, and after a few runs the shim can no longer start.
 node --test scripts/fetch-zipp-release.test.mjs   # the ZIPP installer (see "ZIPP engines")
 ```
 
+**Nothing in a default run listens or connects beyond loopback.** A listener on `0.0.0.0` or a LAN address makes Windows
+Firewall ask the owner for an exception for that exe, and every "Allow" is a permanent inbound rule. The tests of the
+access model that need one (the `lan` bind, the proxy-only shape of `oaiy-server`, this machine's network address as a
+peer) are opt-in: `#[ignore]`d in `desktop/src-tauri/tests/access_exposure.rs` and checked against `OAIY_TEST_LAN=1`,
+and the same flag (`--lan`) on `desktop/scripts/e2e-exposure.mjs` and `desktop/scripts/check-exposure.mjs`. They say
+what they are about to do before they do it; a default run lists them as not run. The same behaviours are covered in
+process by `auth::guard_tests` (fake peer addresses, a guard built from `exposure::evaluate`) and `auth::login_tests`.
+
 ## API end-to-end
 
 Needs a live server and a migrated database.
