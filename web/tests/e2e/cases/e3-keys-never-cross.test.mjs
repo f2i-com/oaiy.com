@@ -124,6 +124,32 @@ describe('E3.1 no key in the app origins\' storage or memory', () => {
     await s.context.close();
   });
 
+  it('and it stays out of the app\'s process however the origin was first loaded: a 404, `/_headers`, an alias, a redirect (each answers with the header too)', async () => {
+    // Chromium keeps an origin's first answer that lacks Origin-Agent-Cluster for the life of the browsing instance, so ONE response
+    // without it, loaded before the holder, would put the holder in the app's process for good.
+    for (const first of ['/nothing-here', '/_headers', '/%69ndex.html', '/BROKER.html', '/assets', '/assets/nope.js']) {
+      const { context } = await newContext(browser);
+      try {
+        const app = await newPage(context);
+        await app.page.goto(`${world.origins.flows}/`);
+        await app.page.evaluate(async ([origin, p]) => {
+          const f = document.createElement('iframe');
+          f.hidden = true;
+          f.src = `${origin}${p}`;
+          document.body.append(f);
+          await new Promise((resolve) => f.addEventListener('load', resolve, { once: true }));
+        }, [world.origins.providers, first]);
+        const hello = await app.page.evaluate((origin) => window.oaiyTest.connect({ origin }), world.origins.providers);
+        assert.equal(hello?.t, 'hello', first);
+        const holder = app.page.frames().find((f) => f.url().startsWith(`${world.origins.providers}/broker`));
+        const outcome = await context.newCDPSession(holder).then((s) => s.detach().then(() => 'own process'), (e) => e.message);
+        assert.equal(outcome, 'own process', `the holder shares the app's process after ${first} was loaded first`);
+      } finally {
+        await context.close();
+      }
+    }
+  });
+
   it('and that is the doing of its Origin-Agent-Cluster header: without it two same-site frames share a process (control)', async () => {
     const plain = await startWorld({ providersHeaders: (rendered) => rendered.replaceAll('  Origin-Agent-Cluster: ?1\n', '') });
     const { context } = await newContext(browser);
@@ -374,7 +400,7 @@ describe('E3.4 the modal has nothing to type into', () => {
   });
 
   it('the Providers page draws no form if it is ever framed (defence in depth; the policy already forbids it)', async () => {
-    const permissive = await startWorld({ providersHeaders: (rendered) => rendered.replace("frame-ancestors 'none'", 'frame-ancestors *') });
+    const permissive = await startWorld({ providersHeaders: (rendered) => rendered.replaceAll("frame-ancestors 'none'", 'frame-ancestors *') });
     const { context } = await newContext(browser);
     try {
       const page = await newPage(context);
@@ -398,26 +424,19 @@ describe('E3.4 the modal has nothing to type into', () => {
 describe('E3.5 the policy of every document', () => {
   const folder = () => path.join(world.dir, 'providers');
 
-  it('every HTML file of the assembled folder is named by exactly one policy: the two documents an app embeds allow the apps, every other forbids all framing', () => {
+  it('the host\'s default policy forbids all framing; only the two documents an app embeds (with and without .html) allow the apps', () => {
     const rules = parseHeaders(fs.readFileSync(path.join(folder(), '_headers'), 'utf8'));
     const htmls = fs.readdirSync(folder()).filter((f) => f.endsWith('.html'));
     assert.deepEqual(htmls.sort(), ['broker.html', 'embed.html', 'index.html']);
     const apps = `${world.origins.agent} ${world.origins.flows}`;
-    for (const file of htmls) {
-      const pathname = `/${file}`;
-      const matching = rules.filter((r) => r.test.test(pathname) && r.set.some(([name]) => name === 'content-security-policy'));
-      assert.equal(matching.length, 1, `${pathname} is named by exactly one CSP rule, not ${matching.length}`);
-      const csp = headersFor(rules, pathname)['content-security-policy'];
-      const ancestors = /frame-ancestors ([^;]+)$/.exec(csp)?.[1];
-      assert.equal(ancestors, file === 'index.html' ? "'none'" : apps, pathname);
-    }
-    for (const clean of ['/broker', '/embed', '/']) assert.ok(headersFor(rules, clean)['content-security-policy'], clean);
+    const ancestors = (p) => /frame-ancestors ([^;]+)$/.exec(headersFor(rules, p)['content-security-policy'])?.[1];
+    for (const p of ['/', '/index.html', '/INDEX.HTML', '/anything', '/a/b/c.html', '/assets/x.js', '/broker.htm', '/broker.html.', '/broker/', '/_headers', '/added-later.html']) assert.equal(ancestors(p), "'none'", `${p} is denied by default`);
+    for (const p of ['/broker', '/broker.html', '/embed', '/embed.html', '/BROKER.HTML']) assert.equal(ancestors(p), apps, p);
   });
-
   it('served, each has that policy once: scripts and styles only from itself, connections to any provider, no framing but the allowed', async () => {
     const { context } = await newContext(browser);
     const { page } = await newPage(context);
-    for (const [p, ancestors] of [['/', "'none'"], ['/index.html', "'none'"], ['/broker.html', `${world.origins.agent} ${world.origins.flows}`], ['/embed.html', `${world.origins.agent} ${world.origins.flows}`], ['/broker', `${world.origins.agent} ${world.origins.flows}`]]) {
+    for (const [p, ancestors] of [['/', "'none'"], ['/index.html', "'none'"], ['/broker.html', `${world.origins.agent} ${world.origins.flows}`], ['/embed.html', `${world.origins.agent} ${world.origins.flows}`]]) {
       const response = await page.goto(`${world.origins.providers}${p}`);
       const csp = response.headers()['content-security-policy'];
       assert.ok(csp, p);

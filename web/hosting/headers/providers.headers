@@ -2,18 +2,24 @@
 #
 # It holds the provider records and the keys and makes the provider requests itself, and it is embedded by the Agent and the flow
 # editor and by nobody else. So:
-#  - frame-ancestors on the two documents an app embeds (/broker and /embed) is exactly the apps this deployment lists
-#    ({{APP_ORIGINS}}), and on every other document it is 'none': the Providers page, where a key is typed, cannot be framed by
-#    anyone, an app included. Every HTML file of the folder is named by exactly one CSP rule below (a test checks it); the rules
-#    do not overlap, because a host that JOINS the values of two rules would send two policies where one is meant. A block of a
-#    `_headers` file names ONE path, so the policy is written out for each path (with and without `.html`).
+#  - EVERY response of this host carries the whole set below, an error, a redirect, an asset and `/_headers` itself included: a
+#    response that lacked one would be a way around it (Chromium keeps an origin's first answer without Origin-Agent-Cluster for the
+#    life of the browsing instance, so one such response puts the holder in the app's process for good).
+#  - the default is DENY: `/*` says frame-ancestors 'none' and the strict policy, so a path no block below names (an alias, a
+#    spelling, a page added later) cannot be framed by anyone. Only the two documents an app embeds, /broker and /embed (with and
+#    without `.html`, because a host may serve either), say frame-ancestors {{APP_ORIGINS}}: exactly the apps this deployment lists.
+#    The Providers page, where a key is typed, is at / and /index.html and is named by nothing: it is denied to every frame.
+#  - rules apply in order and a later block replaces the same header of an earlier one, as Caddy's `header` does; a host that JOINS the
+#    values of two rules (Cloudflare Pages) needs the override written another way (WA-06's parity test).
 #  - the Agent is cross-origin isolated (COEP credentialless), so this document sends COEP credentialless too and a CORP that admits
-#    a same-site embedder. It must NOT be given the `credentialless` iframe attribute: that would put its storage in an anonymous,
-#    ephemeral partition and no key would be found.
-#  - COOP same-origin isolates a top-level visit (COOP is ignored on an iframe document).
+#    a same-site embedder. It must NOT be given the `credentialless` iframe attribute: that puts its storage in an anonymous,
+#    ephemeral partition and no key is found. The embedder does NOT delegate `cross-origin-isolated` to it either: v0 has no use for
+#    it, and an isolated holder is easier for a co-located Spectre-class attack to read. The engine (WA-09) may need it and can ask then.
+#  - COOP same-origin severs a top-level visit from its opener (it is ignored on an iframe document).
 #  - scripts only from itself (and WebAssembly for the engine, later); no inline script or style; it may call any provider address
 #    (connect-src *), because providers are arbitrary hosts; it loads no other site's script, style, font or image.
-#  - Origin-Agent-Cluster asks for an agent cluster (and, where the browser will, a process) of its own, apart from the apps.
+#  - Origin-Agent-Cluster asks for an agent cluster of its own, and (measured, Chromium 148 desktop) a process of its own, apart from
+#    the apps. That is a hardening, not a boundary: a same-process placement is a residual risk (Firefox's placement is unverified).
 /*
   X-Content-Type-Options: nosniff
   Referrer-Policy: no-referrer
@@ -24,6 +30,7 @@
   Origin-Agent-Cluster: ?1
   Permissions-Policy: camera=(), microphone=(), geolocation=(), payment=(), usb=(), serial=(), hid=(), bluetooth=(), midi=(), display-capture=()
   Cache-Control: no-cache
+  Content-Security-Policy: default-src 'none'; script-src 'self' 'wasm-unsafe-eval'; style-src 'self'; img-src 'self' data:; font-src 'self'; connect-src *; worker-src 'self' blob:; manifest-src 'self'; base-uri 'none'; form-action 'none'; object-src 'none'; frame-src 'none'; frame-ancestors 'none'
 /broker
   Content-Security-Policy: default-src 'none'; script-src 'self' 'wasm-unsafe-eval'; style-src 'self'; img-src 'self' data:; font-src 'self'; connect-src *; worker-src 'self' blob:; manifest-src 'self'; base-uri 'none'; form-action 'none'; object-src 'none'; frame-src 'none'; frame-ancestors {{APP_ORIGINS}}
 /broker.html
@@ -32,7 +39,3 @@
   Content-Security-Policy: default-src 'none'; script-src 'self' 'wasm-unsafe-eval'; style-src 'self'; img-src 'self' data:; font-src 'self'; connect-src *; worker-src 'self' blob:; manifest-src 'self'; base-uri 'none'; form-action 'none'; object-src 'none'; frame-src 'none'; frame-ancestors {{APP_ORIGINS}}
 /embed.html
   Content-Security-Policy: default-src 'none'; script-src 'self' 'wasm-unsafe-eval'; style-src 'self'; img-src 'self' data:; font-src 'self'; connect-src *; worker-src 'self' blob:; manifest-src 'self'; base-uri 'none'; form-action 'none'; object-src 'none'; frame-src 'none'; frame-ancestors {{APP_ORIGINS}}
-/
-  Content-Security-Policy: default-src 'none'; script-src 'self' 'wasm-unsafe-eval'; style-src 'self'; img-src 'self' data:; font-src 'self'; connect-src *; worker-src 'self' blob:; manifest-src 'self'; base-uri 'none'; form-action 'none'; object-src 'none'; frame-src 'none'; frame-ancestors 'none'
-/index.html
-  Content-Security-Policy: default-src 'none'; script-src 'self' 'wasm-unsafe-eval'; style-src 'self'; img-src 'self' data:; font-src 'self'; connect-src *; worker-src 'self' blob:; manifest-src 'self'; base-uri 'none'; form-action 'none'; object-src 'none'; frame-src 'none'; frame-ancestors 'none'

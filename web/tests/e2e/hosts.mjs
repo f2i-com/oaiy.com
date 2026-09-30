@@ -50,7 +50,8 @@ export function parseHeaders(text) {
     if (!raw.trim() || raw.trim().startsWith('#')) continue;
     if (!/^\s/.test(raw)) {
       const pattern = raw.trim().replace(/[.+?^${}()|[\]\\]/g, '\\$&').replace(/\*/g, '.*');
-      rule = { source: raw.trim(), test: new RegExp(`^${pattern}$`), set: [], detach: [] };
+      // Case-insensitive: a path is matched decoded and folded, so an alias is not a way past a rule.
+      rule = { source: raw.trim(), test: new RegExp(`^${pattern}$`, 'i'), set: [], detach: [] };
       rules.push(rule);
     } else if (rule) {
       const line = raw.trim();
@@ -97,13 +98,14 @@ export async function startHosts(options = {}) {
   const server = http.createServer((req, res) => {
     const host = (req.headers.host ?? '').replace(/:\d+$/, '').toLowerCase();
     const name = byHost.get(host);
-    const url = new URL(req.url, 'http://x');
+    // The path as the client wrote it: a browser normalises before it sends, another client need not.
+    const raw = (req.url ?? '/').split(/[?#]/)[0];
     const entry = {
       host,
       site: name ?? null,
       method: req.method,
-      path: url.pathname,
-      search: url.search,
+      path: raw,
+      search: (req.url ?? '').slice(raw.length),
       origin: req.headers.origin ?? null,
       referer: req.headers.referer ?? null,
       dest: req.headers['sec-fetch-dest'] ?? null,
@@ -111,31 +113,54 @@ export async function startHosts(options = {}) {
       status: 0,
     };
     log.push(entry);
-    const send = (status, headers, body) => {
+    const site = name ? sites.get(name) : undefined;
+    // EVERY response of a site carries the site's headers: a 404, a redirect, an error, `/_headers` itself. Which ones a response gets
+    // is decided by what the path says once it is decoded and folded to lower case (a host whose files are not case-sensitive would
+    // serve an alias of a document with the document's rules), and a path no rule names is the site's default, so an alias no rule
+    // names is denied, not left open.
+    const send = (status, headers, body, matched = '/__no-such-path__') => {
       entry.status = status;
-      res.writeHead(status, { 'cache-control': 'no-cache', ...headers });
+      res.writeHead(status, { 'cache-control': 'no-cache', ...(site ? headersFor(site.rules, matched) : { 'x-content-type-options': 'nosniff' }), ...headers });
       res.end(req.method === 'HEAD' ? undefined : body);
     };
-    const site = name ? sites.get(name) : undefined;
     if (!site) return send(421, { 'content-type': 'text/plain' }, `no site answers to ${host}`);
-    let pathname;
+    // A response that is not a document is given the default, whatever the path resembles.
+    const notFound = () => send(404, { 'content-type': 'text/plain' }, 'Not Found');
+    let decoded;
     try {
-      pathname = decodeURIComponent(url.pathname);
+      decoded = decodeURIComponent(raw);
     } catch {
-      return send(400, {}, 'bad path');
+      return send(400, { 'content-type': 'text/plain' }, 'bad path');
     }
-    // A `_headers` file configures a host; it is not one of the site's files.
-    if (pathname === '/_headers') return send(404, { 'content-type': 'text/plain' }, 'Not Found');
-    let file = path.join(site.root, pathname);
-    if (file !== site.root && !file.startsWith(site.root + path.sep)) return send(403, {}, 'no');
-    if (pathname.endsWith('/')) file = path.join(file, 'index.html');
-    // A path with no extension is its .html (as static hosts with clean URLs do): /broker is broker.html.
-    if (!fs.existsSync(file) && !path.extname(file) && fs.existsSync(`${file}.html`)) file = `${file}.html`;
-    const headers = headersFor(site.rules, url.pathname);
-    if (!fs.existsSync(file) || !fs.statSync(file).isFile()) return send(404, { 'content-type': 'text/plain', ...headers }, 'Not Found');
-    send(200, { 'content-type': TYPES[path.extname(file)] ?? 'application/octet-stream', ...headers }, fs.readFileSync(file));
-  });
-  await new Promise((resolve, reject) => {
+    const matched = decoded.toLowerCase();
+    // Exact paths only: no NUL, no backslash, no dot segment, no empty segment, and each name exactly as the file is named.
+    if (!decoded.startsWith('/') || /[\u0000\\]/.test(decoded)) return notFound();
+    const segments = decoded.split('/').slice(1);
+    const directory = segments[segments.length - 1] === '';
+    if (directory) segments.pop();
+    if (segments.some((s) => s === '' || s === '.' || s === '..')) return notFound();
+    let file = site.root;
+    for (const segment of segments) {
+      // A `_headers` file configures a host; it is not one of the site's files.
+      if (file === site.root && segment === '_headers') return notFound();
+      let names;
+      try {
+        names = fs.readdirSync(file);
+      } catch {
+        return notFound();
+      }
+      if (!names.includes(segment)) return notFound();
+      file = path.join(file, segment);
+    }
+    if (fs.statSync(file).isDirectory()) {
+      if (!directory && segments.length > 0) return send(301, { location: `${raw}/`, 'content-type': 'text/plain' }, 'Moved Permanently');
+      if (!fs.readdirSync(file).includes('index.html')) return notFound();
+      file = path.join(file, 'index.html');
+    } else if (directory) {
+      return notFound();
+    }
+    send(200, { 'content-type': TYPES[path.extname(file)] ?? 'application/octet-stream' }, fs.readFileSync(file), matched);
+  });  await new Promise((resolve, reject) => {
     server.once('error', reject);
     server.listen(options.port ?? 0, '127.0.0.1', resolve);
   });
