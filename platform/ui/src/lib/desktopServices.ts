@@ -36,7 +36,7 @@
 import { invalidateDynamicOptions } from 'oaiy-ui-components';
 import type { CustomService, ServiceNodeTag } from 'oaiy-core/modules/core-service/examples';
 import { getEngineBase } from './engineEndpoint';
-import { refreshDesktopStatus, subscribeDesktopStatus } from './desktopDetection';
+import { mayLookOnLoad, refreshDesktopStatus, subscribeDesktopStatus } from './desktopDetection';
 
 /** Shared contract with the compilers (core-service/contract.ts reads this key). */
 export const DESKTOP_SERVICE_STORAGE_KEY = 'oaiy.desktopServices';
@@ -414,24 +414,49 @@ function stopPoll(): void {
   setLoaded(false);
 }
 
+let unsubscribeStatus: (() => void) | null = null;
+
 /**
  * Begin syncing desktop services (and OAIY's engine) into the palette. Polls
  * only while the desktop is available, and clears the list when it's not.
  * Safe to call once at app boot (after startDesktopDetection()).
+ *
+ * Only where this page may look (see `mayLookOnLoad`): a tab in a browser that
+ * has no link to a desktop asks nothing here, and the list a session that had
+ * one left behind is cleared, so the palette does not offer the services of a
+ * desktop nobody asked about. `probeNow: false` is for a caller that has just
+ * asked (Connect) and only wants the list kept from now on.
  */
-export function startDesktopServiceSync(): void {
+export function startDesktopServiceSync(options: { probeNow?: boolean } = {}): void {
+  if (!mayLookOnLoad()) {
+    try {
+      stopPoll();
+    } catch {
+      // Storage is blocked: nothing was kept, so there is nothing to clear.
+    }
+    return;
+  }
+  if (unsubscribeStatus) return;
   // The list kept from the last session stays until the first probe has
   // answered (a flow compiled meanwhile still finds its services); the
   // desktop missing then, or going away later, clears it.
-  subscribeDesktopStatus((info) => {
+  unsubscribeStatus = subscribeDesktopStatus((info) => {
     if (info.available) startPoll();
     else if (pollTimer !== null) stopPoll();
   });
+  if (options.probeNow === false) return;
   void refreshDesktopStatus()
     .then((info) => {
       if (!info.available) stopPoll();
     })
     .catch(() => stopPoll());
+}
+
+/** Disconnect: the list of the desktop's services is dropped and no longer kept up. */
+export function stopDesktopServiceSync(): void {
+  unsubscribeStatus?.();
+  unsubscribeStatus = null;
+  stopPoll();
 }
 
 /** Ask again now (after adding a service or a model), rather than at the next tick. */

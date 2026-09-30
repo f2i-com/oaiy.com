@@ -38,6 +38,9 @@ import './dynamicModules';
 // Start the OAIY Desktop detection probe. Polls a fixed localhost
 // port for the OAIY Desktop app and re-renders any subscribed
 // component when the status flips. See lib/desktopDetection.ts.
+// Only where the page may look: OAIY's own window does, as it always has; a
+// tab in a browser sends nothing to this computer or its network until its
+// person presses Connect (or has a link from before). See lib/desktopLink.ts.
 import { startDesktopDetection } from './lib/desktopDetection';
 import { startDesktopServiceSync } from './lib/desktopServices';
 startDesktopDetection();

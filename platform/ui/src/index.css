@@ -1517,6 +1517,9 @@ select,
 }
 .oaiy-engine-get a { color: rgb(var(--accent-primary)); font-weight: 600; text-decoration: none; }
 .oaiy-engine-get a:hover { text-decoration: underline; }
+.oaiy-engine-get button { padding: 0; border: 0; background: none; font: inherit; font-weight: 600; color: rgb(var(--accent-primary)); cursor: pointer; }
+.oaiy-engine-get button:hover { text-decoration: underline; }
+.oaiy-engine-get button:disabled { opacity: 0.6; cursor: default; text-decoration: none; }
 
 .oaiy-trust {
   display: flex;

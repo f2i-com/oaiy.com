@@ -31,6 +31,7 @@ import {
 import { subscribeStorageQuota } from '../lib/storageQuota';
 import { installController, useInstallState } from '../pwa';
 import DownloadDesktop from './DownloadDesktop';
+import ConnectDesktop from './ConnectDesktop';
 import type { WorkflowGraph, GraphNode, Flow, LocalNetworkPermissionRequest, LocalNetworkPermissionResponse } from 'oaiy-core';
 import LocalNetworkPermissionDialog from './dialogs/LocalNetworkPermissionDialog';
 import { TrustDialog, DependencyDialog, PackageBrowser } from './PackageManager';
@@ -628,7 +629,7 @@ export default function OAIYApp() {
               ? `Desktop v${companion.version ?? '?'}`
               : 'Browser-only execution'
           }
-          engineAction={companion.available ? null : <DownloadDesktop variant="compact" />}
+          engineAction={<>{companion.available ? null : <DownloadDesktop variant="compact" />}<ConnectDesktop variant="compact" /></>}
           onInstall={installOffered ? () => { void installController.prompt(); } : undefined}
         />
       )}
