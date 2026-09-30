@@ -96,8 +96,8 @@ impl Log {
 /// Whether an argument's name says it holds a secret.
 pub fn secret_name(name: &str) -> bool {
     let n: String = name.chars().filter(|c| c.is_ascii_alphanumeric()).collect::<String>().to_ascii_lowercase();
-    const WORDS: [&str; 11] = [
-        "password", "passwd", "passphrase", "secret", "token", "apikey", "privatekey", "credential", "authorization", "cookie", "bearer",
+    const WORDS: [&str; 12] = [
+        "password", "passwd", "passphrase", "secret", "token", "apikey", "privatekey", "credential", "authorization", "cookie", "bearer", "csrf",
     ];
     WORDS.iter().any(|w| n.contains(w)) || n.ends_with("key") || n == "pin" || n == "otp"
 }
@@ -105,7 +105,11 @@ pub fn secret_name(name: &str) -> bool {
 /// Whether a value looks like a secret whatever it is called.
 pub fn secret_value(s: &str) -> bool {
     let s = s.trim();
-    const PREFIXES: [&str; 8] = ["sk-", "bearer ", "ghp_", "gho_", "github_pat_", "hf_", "oaiypat_", "xox"];
+    // `oaiy<kind>_` is the access model's token grammar (`auth::token`): a paired token, a session, a
+    // desktop webview's, a per-run one, the console's and the owner's device cookie.
+    const PREFIXES: [&str; 13] = [
+        "sk-", "bearer ", "ghp_", "gho_", "github_pat_", "hf_", "oaiypat_", "oaiyses_", "oaiydsk_", "oaiyrun_", "oaiycon_", "oaiydev_", "xox",
+    ];
     let lower = s.to_ascii_lowercase();
     PREFIXES.iter().any(|p| lower.starts_with(p) && s.len() > p.len() + 8)
 }

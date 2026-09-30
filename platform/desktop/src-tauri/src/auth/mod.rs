@@ -10,6 +10,8 @@
 //!   credential is valid only while its whole parent chain is, the one-process lock, and who a
 //!   request is.
 //! - [`audit`], [`scrub`]: the audit and noise logs, and the scrub every log line passes through.
+pub mod audit;
+pub mod clock;
 pub mod export;
 pub mod presets;
 pub mod principal;
