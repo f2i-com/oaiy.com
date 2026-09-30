@@ -1296,6 +1296,64 @@ fn a_session_cannot_derive_and_neither_can_a_derived_credential() {
 }
 
 #[test]
+fn a_session_a_run_the_console_and_the_legacy_owner_are_refused_by_the_kind_rule_with_valid_records(
+) {
+    // Each of these parents is alive and in the store, holds `ai.read` and asks for nothing else: the only
+    // thing wrong with it is its kind, so it is the kind rule that refuses it (and a rule that let one kind
+    // through would derive a child).
+    let clock = clock();
+    let store = memory(&clock);
+    store.set_static_present(true);
+    let ses = store.mint(session(App::Dash, Preset::Owner)).unwrap();
+    let con = store
+        .mint(MintSpec::new(Kind::Con, "console", ScopeSet::all(), DAY))
+        .unwrap();
+    let run = store
+        .derive(&Principal::static_token(), request(&["ai.read"]))
+        .unwrap();
+    let mut legacy_record = Record::blank("legacy", Kind::Pat);
+    legacy_record.expires_ms = T0 + DAY;
+    store.insert_for_tests(legacy_record);
+    let parents = [
+        ("a session", store.authenticate(&ses.token, None).unwrap()),
+        ("the console", store.authenticate(&con.token, None).unwrap()),
+        ("a run", store.authenticate(&run.token, None).unwrap()),
+        ("the legacy owner", Principal::legacy_owner()),
+    ];
+    for (name, parent) in &parents {
+        assert!(store.record(&parent.id).is_some(), "{name} has a record");
+        assert!(parent.has("ai.read"), "{name} holds what it asks for");
+        match store.derive(parent, request(&["ai.read"])) {
+            Err(DeriveError::Refused(why)) => assert!(
+                why.contains("only a desk, paired or static"),
+                "{name}: {why}"
+            ),
+            other => panic!("{name}: {other:?}"),
+        }
+    }
+    // And the three kinds that may derive, in the same store, do.
+    let desk_made = store
+        .mint(desk(App::Agent, Preset::Agent, &["http://oaiy.localhost"]))
+        .unwrap();
+    let pat_made = store.mint(native_pat(&["ai.read"])).unwrap();
+    for (name, parent) in [
+        (
+            "a desk",
+            store.authenticate(&desk_made.token, None).unwrap(),
+        ),
+        (
+            "a paired",
+            store.authenticate(&pat_made.token, None).unwrap(),
+        ),
+        ("the static", Principal::static_token()),
+    ] {
+        store
+            .derive(&parent, request(&["ai.read"]))
+            .unwrap_or_else(|e| panic!("{name}: {e}"));
+    }
+}
+
+#[test]
 fn a_derived_credential_holds_no_dangerous_scope_and_no_auth_scope_even_if_the_parent_does() {
     let clock = clock();
     let store = memory(&clock);
@@ -1513,6 +1571,54 @@ fn random_scopes(rng: &mut Rng, density: u64) -> ScopeSet {
     set
 }
 
+/// The dangerous scopes as the design lists them (4.2.1 and Appendix B: the twelve of the core catalogue and
+/// the two reserved ones marked D), typed here and not taken from `scopes.rs`.
+const DANGEROUS_BY_THE_DESIGN: [&str; 14] = [
+    "services.define",
+    "runtimes.install",
+    "plugins.install",
+    "ai.admin",
+    "control.admin",
+    "link.manage",
+    "auth.manage",
+    "companion.manage",
+    "secrets.write",
+    "system.update",
+    "system.restart",
+    "flows.approve",
+    "relay.manage",
+    "vault.admin",
+];
+
+/// The six scopes other designs reserved (4.2.1).
+const RESERVED_BY_THE_DESIGN: [&str; 6] = [
+    "relay.read",
+    "relay.manage",
+    "vault.read",
+    "vault.control",
+    "vault.admin",
+    "vault.kt",
+];
+
+#[test]
+fn the_oracle_of_the_property_test_knows_the_design_and_not_the_code() {
+    // The lists above are the design's (14 dangerous, 6 reserved); `scopes.rs` agrees with them today, and
+    // the property test would notice the day it did not.
+    assert_eq!(DANGEROUS_BY_THE_DESIGN.len(), 14);
+    assert_eq!(RESERVED_BY_THE_DESIGN.len(), 6);
+    for d in DANGEROUS_BY_THE_DESIGN {
+        assert!(scopes::is_dangerous(d), "{d}");
+    }
+    let dangerous_in_code = scopes::SCOPES
+        .iter()
+        .filter(|s| scopes::is_dangerous(s.name))
+        .count();
+    assert_eq!(dangerous_in_code, 14);
+    for r in RESERVED_BY_THE_DESIGN {
+        assert!(scopes::is_reserved(r), "{r}");
+    }
+}
+
 #[test]
 fn a_derived_credential_never_exceeds_its_parent_in_100000_random_cases() {
     let mut rng = Rng(0x9E37_79B9_7F4A_7C15);
@@ -1562,41 +1668,51 @@ fn a_derived_credential_never_exceeds_its_parent_in_100000_random_cases() {
         } else {
             format!("{i:016x}")
         };
-        // A parent that exists in the store, as a desk or paired credential would.
-        if matches!(kind, PrincipalKind::Desk | PrincipalKind::Pat) {
-            let mut rec = Record::blank(
-                &id,
-                if kind == PrincipalKind::Desk {
-                    Kind::Dsk
-                } else {
-                    Kind::Pat
-                },
-            );
+        // A parent that exists in the store, of every kind: a valid record, alive, so that a parent the
+        // kind rule refuses is refused by the rule, and not because there is no record of it.
+        let record_kind = match kind {
+            PrincipalKind::Desk => Some(Kind::Dsk),
+            PrincipalKind::Pat | PrincipalKind::Legacy => Some(Kind::Pat),
+            PrincipalKind::Session => Some(Kind::Ses),
+            PrincipalKind::Run => Some(Kind::Run),
+            PrincipalKind::Console => Some(Kind::Con),
+            PrincipalKind::Static => None,
+        };
+        if let Some(record_kind) = record_kind {
+            let mut rec = Record::blank(&id, record_kind);
             rec.created_ms = T0 - HOUR;
             rec.expires_ms = T0 + 100 * DAY;
             store.insert_for_tests(rec);
         }
         let mut parent = principal_of(kind, &id, parent_scopes.clone());
         parent.expires_ms = Some(T0 + 100 * DAY);
+        let ttl_ms = rng.below(3 * DAY);
         let req = DeriveRequest {
             scopes: request_scopes.clone(),
-            ttl_ms: Some(rng.below(3 * DAY)),
+            ttl_ms: Some(ttl_ms),
             label: "p".into(),
         };
-        let forbidden = request_scopes.names().iter().any(|n| {
-            scopes::is_dangerous(n)
-                || scopes::is_auth_scope(n)
-                || scopes::is_reserved(n)
-                || scopes::is_resource_scope(n)
+        // What the design says, worked out with plain vectors and lists typed from the design: nothing of
+        // `ScopeSet`, `is_subset_of` or `scopes::is_dangerous` decides what is expected.
+        let child: Vec<String> = request_scopes.names();
+        let held: Vec<String> = parent_scopes.names();
+        let forbidden = child.iter().any(|n| {
+            DANGEROUS_BY_THE_DESIGN.contains(&n.as_str())
+                || RESERVED_BY_THE_DESIGN.contains(&n.as_str())
+                || n.starts_with("auth.")
+                || n.starts_with("connector.")
         });
-        let expect_ok = matches!(
+        let kind_allowed = matches!(
             kind,
             PrincipalKind::Desk | PrincipalKind::Pat | PrincipalKind::Static
-        ) && !request_scopes.is_empty()
-            && request_scopes.is_subset_of(&parent_scopes)
+        );
+        let expect_ok = kind_allowed
+            && !child.is_empty()
+            && child.iter().all(|c| held.iter().any(|h| h == c))
             && !forbidden
-            && (!request_scopes.contains("control.project")
-                || request_scopes.contains("control.read"));
+            && (!child.iter().any(|n| n == "control.project")
+                || child.iter().any(|n| n == "control.read"))
+            && ttl_ms > 0;
         match store.derive(&parent, req) {
             Ok(minted) => {
                 allowed += 1;
@@ -1604,21 +1720,25 @@ fn a_derived_credential_never_exceeds_its_parent_in_100000_random_cases() {
                     expect_ok,
                     "case {i}: derived where the rules say no ({kind:?})"
                 );
+                let got: Vec<String> = minted.scopes.names();
                 assert!(
-                    minted.scopes.is_subset_of(&parent_scopes),
+                    got.iter().all(|g| held.iter().any(|h| h == g)),
                     "case {i}: the child holds more than its parent"
                 );
-                assert!(!minted.scopes.has_dangerous(), "case {i}");
                 assert!(
-                    !minted
-                        .scopes
-                        .names()
-                        .iter()
-                        .any(|n| scopes::is_auth_scope(n)),
-                    "case {i}"
+                    got.len() == child.len() && child.iter().all(|c| got.contains(c)),
+                    "case {i}: the child holds what it was asked for and nothing else"
                 );
                 assert!(
-                    minted.expires_ms > T0 && minted.expires_ms - T0 <= DAY,
+                    !got.iter()
+                        .any(|n| DANGEROUS_BY_THE_DESIGN.contains(&n.as_str())
+                            || n.starts_with("auth.")),
+                    "case {i}"
+                );
+                // A life of what was asked, at most a day, and never past the parent's (100 days).
+                assert_eq!(
+                    minted.expires_ms,
+                    T0 + ttl_ms.min(DAY),
                     "case {i}: life {}",
                     minted.expires_ms - T0
                 );
@@ -1629,6 +1749,20 @@ fn a_derived_credential_never_exceeds_its_parent_in_100000_random_cases() {
                     !expect_ok,
                     "case {i}: refused ({e}) where the rules say yes ({kind:?})"
                 );
+                // A parent of the wrong kind is refused by the kind rule, before anything else looks at it;
+                // a parent of the right kind is not refused by it.
+                let by_kind = matches!(&e, DeriveError::Refused(why) if why.contains("only a desk, paired or static"));
+                assert_eq!(by_kind, !kind_allowed, "case {i}: {kind:?} refused as {e}");
+                // More than the parent holds, or a scope no child holds (dangerous, `auth.*`, reserved,
+                // connector): refused by `derive` itself (403 `derive_refused`), not left to the grant rules of
+                // the store behind it.
+                if kind_allowed
+                    && !child.is_empty()
+                    && child.iter().all(|c| held.iter().any(|h| h == c))
+                    && forbidden
+                {
+                    assert!(matches!(e, DeriveError::Refused(_)), "case {i}: {e}");
+                }
             }
         }
     }
