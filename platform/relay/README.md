@@ -30,12 +30,22 @@ oaiy-relay/
   probe/            host-probe.php: the one-file host probe
   tests/            the test runner and the tests (not part of a release zip)
   data/             created by the installer; config, database, secrets. Outside public/
+    .htaccess       written by the installer: deny everything (Apache 2.4 and 2.2)
+    web.config      written by the installer: deny everything (IIS)
+  .htaccess         deny everything (Apache 2.4 and 2.2): this folder is never a document root
+  web.config        deny everything (IIS)
   VERSION
 ```
 
-`data/`, `src/` and `bin/` are protected only by living **above** the document root. Upload the whole folder somewhere
+`data/`, `src/` and `bin/` are protected by living **above** the document root. Upload the whole folder somewhere
 outside your web root (for example `~/oaiy-relay/`) and point the site's document root at `~/oaiy-relay/public`. The
 installer and the doctor treat any other layout as a failure.
+
+If the document root is the relay folder by mistake, three things stand between the web and your secrets, and none of them
+replaces the right layout. The `.htaccess` and `web.config` at the root and in `data/` refuse every request on Apache, LiteSpeed
+and IIS, but only where the server honours them (Apache needs `AllowOverride` for `.htaccess`; nginx ignores both, so its
+configuration below denies the folders itself). Every PHP file in `src/` and `bin/` exits at once when it is requested. And the
+installer and the doctor ask the web for a canary in `data/` and refuse or fail when they get it.
 
 ## Installing on cPanel-style hosting
 
@@ -128,11 +138,20 @@ server {
 
     location = /status.html { }                  # the static status page
 
+    # Belt and braces. With root at public/ these folders do not exist under the root; this block is what still protects them if
+    # someone later points root at the relay folder itself (nginx ignores .htaccess and web.config). It must come before the
+    # catch-all, and it matches at any depth and in any case, and the encoded and dot-dot spellings nginx has already resolved.
+    location ~* ^/(data|src|bin|probe|tests)(/|$) { return 404; }
+    location ~* ^/(\.htaccess|web\.config|INSTALL_ENABLED|VERSION)$ { return 404; }
+
     # Everything else does not exist.
     location ~ /\. { deny all; }
     location /     { return 404; }
 }
 ```
+
+The doctor's exposure probes (`/data/relay.sqlite`, `/data/secrets/relay.key`, `/src/Db.php`, `/bin/doctor.php` and more) are the
+check that this works on your server; a probe that is not answered with 403 or 404 is a failure.
 
 Do not put the relay behind a proxy that terminates TLS and that you do not control (a proxied CDN hostname sees every bearer
 token and every unsealed lane). If you must, list its addresses in `client_ip.trusted_proxies` and set `client_ip.header`, or
@@ -149,6 +168,11 @@ Not run through Apache in this repository's tests: read it as a starting point a
 - passes the `Authorization` header to PHP (`CGIPassAuth On` on Apache 2.4.13 or later, and the `SetEnvIf` / `RewriteRule`
   forms for older stacks). Without it every request is a uniform `401`, which looks like a revoked device;
 - returns 404 for anything outside `/v1/`, `/status.html` and `/install.php`, and sends `/v1/*` to `index.php`.
+
+The folder above it carries its own `.htaccess` (and `data/` gets one from the installer) that refuses everything, in Apache 2.4
+syntax (`Require all denied`) and 2.2 syntax (`Order deny,allow` and `Deny from all`), each inside an `IfModule` for the module
+that understands it. It matters only when the document root is wrong, and then only if the server lets `.htaccess` files apply
+(`AllowOverride`). `web.config` does the same on IIS. The doctor tells you which of them held.
 
 ## Configuration: `data/config.json`
 

@@ -32,6 +32,9 @@ function inst_scratch(): string
         inst_copy_tree($src . '/' . $d, $root . '/' . $d);
     }
     copy($src . '/VERSION', $root . '/VERSION');
+    foreach (['.htaccess', 'web.config'] as $guard) { // the deny-all files of the package root
+        copy($src . '/' . $guard, $root . '/' . $guard);
+    }
     return str_replace('\\', '/', $root);
 }
 
@@ -175,6 +178,54 @@ test('4.18.8 installer CLI: the secret files are mode 0600 and data/ is 0700 (PO
     }
     eq('0700', sprintf('%04o', fileperms($data) & 0777), 'data/');
     eq('0700', sprintf('%04o', fileperms($data . '/secrets') & 0777), 'data/secrets/');
+});
+
+/** The lines of an Apache configuration that are not blank and not comments. @return list<string> */
+function inst_apache_lines(string $text): array
+{
+    $out = [];
+    foreach (explode("\n", $text) as $l) {
+        $l = trim($l);
+        if ($l !== '' && $l[0] !== '#') {
+            $out[] = $l;
+        }
+    }
+    return $out;
+}
+
+test('4.18.2 the package root and data/ each refuse everything: a deny-all .htaccess in Apache 2.4 and 2.2 syntax, and a deny-all web.config', function () {
+    $root = dirname(__DIR__, 2);
+    // The files shipped at the package root are exactly what the installer writes into data/.
+    eq(Oaiy\Relay\Installer::DENY_HTACCESS, (string)file_get_contents($root . '/.htaccess'), 'root .htaccess');
+    eq(Oaiy\Relay\Installer::DENY_WEB_CONFIG, (string)file_get_contents($root . '/web.config'), 'root web.config');
+    // Apache 2.4 refuses with Require, 2.2 with Order and Deny, each only where its module is loaded, and nothing grants.
+    eq(['<IfModule mod_authz_core.c>', 'Require all denied', '</IfModule>', '<IfModule !mod_authz_core.c>', 'Order deny,allow', 'Deny from all', '</IfModule>'],
+        inst_apache_lines(Oaiy\Relay\Installer::DENY_HTACCESS));
+    not_contains('Allow from', Oaiy\Relay\Installer::DENY_HTACCESS);
+    not_contains('granted', Oaiy\Relay\Installer::DENY_HTACCESS);
+    // IIS: a well-formed file that removes every rule and denies every user.
+    if (!class_exists('DOMDocument')) {
+        skip('the dom extension is not loaded, so web.config is not parsed');
+    }
+    $d = new DOMDocument();
+    ok($d->loadXML(Oaiy\Relay\Installer::DENY_WEB_CONFIG), 'web.config is well-formed XML');
+    $xp = new DOMXPath($d);
+    eq(1, $xp->query('/configuration/system.webServer/security/authorization/add[@accessType="Deny"][@users="*"]')->length, 'denies every user');
+    eq(1, $xp->query('/configuration/system.webServer/security/authorization/remove[@users="*"]')->length, 'and removes the inherited allow rules');
+    eq(0, $xp->query('//add[@accessType="Allow"]')->length, 'and allows nobody');
+});
+
+test('4.18.2 an install writes the deny-all files into data/ before any secret, and a re-key puts back one that was removed', function () {
+    [$root, $data] = inst_installed();
+    eq(Oaiy\Relay\Installer::DENY_HTACCESS, (string)file_get_contents($data . '/.htaccess'));
+    eq(Oaiy\Relay\Installer::DENY_WEB_CONFIG, (string)file_get_contents($data . '/web.config'));
+    // Removed (an install from before they existed, or a careless clean-up), changed, or wider than they were.
+    unlink($data . '/.htaccess');
+    file_put_contents($data . '/web.config', "<configuration><system.webServer><authorization><add accessType=\"Allow\" users=\"*\"/></authorization></system.webServer></configuration>\n");
+    [$code, $out, $err] = inst_cli($root, 'install.php', ['--rekey']);
+    eq(0, $code, "stdout: $out stderr: $err");
+    eq(Oaiy\Relay\Installer::DENY_HTACCESS, (string)file_get_contents($data . '/.htaccess'), 'restored');
+    eq(Oaiy\Relay\Installer::DENY_WEB_CONFIG, (string)file_get_contents($data . '/web.config'), 'restored over the wider one');
 });
 
 test('4.18.8 installer CLI: refuses a second run, changes nothing and prints no secret', function () {

@@ -20,6 +20,58 @@ final class Installer
     public const FIRST_KEY = 'first-key.txt';
     public const ADMIN_TOKEN_FILE = 'admin-token.txt';
 
+    /**
+     * What the package root and data/ carry so that a web server that serves either of them by mistake refuses everything
+     * (Apache 2.4 and 2.2 syntax). The files at the package root are byte for byte these; a test keeps them so.
+     */
+    public const DENY_HTACCESS = <<<'HTA'
+# OAIY Relay: this folder is never a document root. Nothing in it is meant to be served; only public/ is.
+# If a web server serves this folder anyway, every request is refused (Apache 2.4 and 2.2 syntax). The same lines are
+# written to data/.htaccess by the installer. Set the site's document root to the public/ folder of the relay.
+
+<IfModule mod_authz_core.c>
+    Require all denied
+</IfModule>
+<IfModule !mod_authz_core.c>
+    Order deny,allow
+    Deny from all
+</IfModule>
+
+HTA;
+
+    /** The same for IIS. */
+    public const DENY_WEB_CONFIG = <<<'XML'
+<?xml version="1.0" encoding="UTF-8"?>
+<!--
+  OAIY Relay: this folder is never a document root; only public/ is. On IIS every request for anything in it is refused.
+  The installer writes the same file to data/web.config.
+-->
+<configuration>
+  <system.webServer>
+    <security>
+      <authorization>
+        <remove users="*" roles="" verbs="" />
+        <add accessType="Deny" users="*" />
+      </authorization>
+    </security>
+    <directoryBrowse enabled="false" />
+  </system.webServer>
+</configuration>
+
+XML;
+
+    /** Write the deny-all files into data/ (and rewrite them when they were removed or changed). Not secret, so world-readable. */
+    public static function writeGuards(string $dataDir): void
+    {
+        $dataDir = rtrim(str_replace('\\', '/', $dataDir), '/');
+        Paths::ensureDir($dataDir);
+        foreach (['.htaccess' => self::DENY_HTACCESS, 'web.config' => self::DENY_WEB_CONFIG] as $name => $content) {
+            if (@file_get_contents($dataDir . '/' . $name) !== $content) {
+                Paths::writeFile($dataDir . '/' . $name, $content, 0644);
+            }
+        }
+    }
+
     public static function isInstalled(string $dataDir): bool
     {
         return is_file(rtrim($dataDir, '/') . '/' . self::LOCK);
@@ -76,6 +128,7 @@ final class Installer
         }
         $url = Config::normaliseUrl((string)($opts['public_url'] ?? ''));
         Paths::ensureDir($dataDir);
+        self::writeGuards($dataDir); // before any secret: a web server that serves this folder by mistake refuses it
         foreach (['secrets', 'holds', 'wake', 'cache', 'backups', 'logs'] as $sub) {
             Paths::ensureDir($dataDir . '/' . $sub);
         }
@@ -134,6 +187,7 @@ final class Installer
         if (!self::isInstalled($dataDir)) {
             throw new \RuntimeException('this relay is not installed');
         }
+        self::writeGuards($dataDir); // an install from before the guard files existed gets them now
         $config = Config::load($dataDir);
         $dbh = Db::open($config);
         $dbh->assertSchema();
