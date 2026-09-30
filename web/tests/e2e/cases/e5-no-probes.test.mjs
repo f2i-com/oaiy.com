@@ -470,3 +470,27 @@ describe('E5: the flow editor', () => {
     await addressed.context.close();
   });
 });
+
+describe('E5: the Agent\'s boot (the review\'s F9)', () => {
+  const LAN = 'http://192.168.1.20:8080';
+  const KEY = 'sk-oaiy-review-key-0123456789';
+
+  it('a saved OAIY that does not answer does not hold the page back: the welcome and the desktop come while its request is still out (the review\'s F9)', async () => {
+    const DESK = 'http://127.0.0.1:17972';
+    const HELD_MS = 6000;
+    // Every request to a local address is held for HELD_MS before it is refused, the saved OAIY's among them.
+    const s = await open('agent', { refuseAfterMs: HELD_MS });
+    await ready('agent', s.page);
+    await seedOaiyLink(s.page, { origin: LAN, key: KEY });
+    await seedPairing(s.page, { origin: DESK, token: 'paired-token-0123456789' });
+    s.attempts.length = 0;
+    const began = Date.now();
+    await s.page.reload();
+    await s.page.waitForFunction(() => /Welcome!/.test(document.querySelector('.chat-log')?.textContent ?? ''), null, { timeout: 30_000 });
+    const welcomeMs = Date.now() - began;
+    assert.ok(s.attempts.includes(`GET ${LAN}/v1/discovery`), `the saved OAIY was being asked: ${s.attempts.join(', ')}`);
+    assert.ok(s.attempts.some((a) => a.startsWith(`GET ${DESK}/api/`)), `the desktop was being asked, not waiting for it: ${s.attempts.join(', ')}`);
+    assert.ok(welcomeMs < HELD_MS - 2000, `the welcome came after ${welcomeMs} ms, while the saved OAIY's request (held ${HELD_MS} ms) was still out`);
+    await s.context.close();
+  });
+});
