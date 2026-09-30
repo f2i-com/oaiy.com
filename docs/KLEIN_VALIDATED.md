@@ -13,6 +13,10 @@ The implementation and archived source inspection are documented in
 
 All runs use the same prompt, seed 747, 512x512, four steps, CFG 1, GPU 0.
 
+Exact prompt: `a simple clean vector illustration of a fox, flat colors, crisp outlines, white background`.
+Variant: distilled. OAIY's SplitMix64/Box-Muller noise is deterministic within
+this runtime; the seed does not promise identical noise to PyTorch/ComfyUI.
+
 | Run | Total seconds | Sampling seconds | PNG SHA256 |
 | --- | ---: | ---: | --- |
 | Clean baseline | 48.857 | 2.292 | `7a9b3c69528a3780de568735d15caa77c38ff29a266494f8d93bd839e8214544` |
@@ -23,6 +27,12 @@ The zero-strength control is pixel-identical **and PNG-byte-identical** to the
 clean baseline. Strength 1 changes 110,847 pixels (42.3%); mean absolute channel
 difference is 8.657/255. These are individual observed timings with different
 warm file/kernel caches, not a controlled performance benchmark.
+
+Both inspected images depict a coherent left-facing orange fox with white chest
+and tail tip, black legs and outlines, on white. The adapter changes the muzzle,
+chest fur, tail boundary and contours while preserving the composition. This
+single prompt already requests vector art; the comparison demonstrates adapter
+application, not a general quality or style improvement.
 
 All 25 transformer blocks stayed on GPU. Adding LoRA increased resident tensor
 bytes by exactly 92,405,760, the full payload of all 80 factor pairs. Memory was
@@ -58,6 +68,20 @@ Pinned URLs, sizes and hashes are in `klein-weights/provenance.json`; the offici
 Apache 2.0 weight license is retained there. No credentials were used. Existing
 Qwen3-4B, Flux2 VAE and supplied LoRA files remain at their original E: paths.
 
+Additional input SHA256 hashes, calculated read-only:
+
+- `E:\models\comfyui\models\text_encoders\qwen_3_4b.safetensors`:
+  `6c671498573ac2f7a5501502ccce8d2b08ea6ca2f661c458e708f36b36edfc5a`
+- `E:\models\comfyui\models\vae\flux2-vae.safetensors`:
+  `d64f3a68e1cc4f9f4e29b6e0da38a0204fe9a49f2d4053f0ec1fa1ca02f9c4b5`
+- `E:\stuff\SimpleFineVector_F2K4B_v1.safetensors`:
+  `135befa0ff25fa475b475d85747bb5808446eeba5a8eedf05335d07c652c8d2b`
+
+The existing encoder/VAE files' original download revisions are not established.
+The adapter header names `flux2_klein_4b`, ai-toolkit 0.7.21, step 747; it has
+80 BF16 rank-32 A/B pairs. Its training parent's base-versus-distilled identity
+is not established from metadata; distilled runtime compatibility is demonstrated.
+
 CUDA compilation succeeds with installed CUDA 12.8 and MSVC 14.44. The earlier
 `cl.exe` error was resolved with **process-local** `vcvars64.bat`; no install or
 global environment change was needed. From the isolated checkout:
@@ -75,12 +99,36 @@ Ready reproduction commands, with an authorized idle GPU:
 & '..\klein-native-tested.exe' --request '..\klein-style.request.json'
 ```
 
+For a fresh build, substitute `..\klein-cuda-target\debug\oaiy-media.exe`.
+The evidence archive includes requests; adjust their absolute input/output paths
+to your files before execution. It excludes production weights and executables.
+Apply its numbered patches in order with `git am --3way <patches>` onto an
+isolated checkout of base `36047c9002deaf465073f21d2857dd43eaae88d6`.
+The patches contain small deterministic test fixtures, not production models.
+
 The broader workspace subset excluding GPU backend packages passed **686 tests**,
 zero failures, 102 explicit ignores (`klein-regression-final.log`). All workspace
-test executables compile. The plain full-workspace run failed while linking
-pre-existing examples that share `examples/bench.exe` (Cargo warns about filename
-collisions). The full test-target run excluding examples is tracked separately;
-do not claim it passed until its log confirms completion.
+test executables compile. The GPU-inclusive full workspace **test-target** run
+then passed **774 tests**, zero failures, 121 explicit ignores, across 44 test
+binaries; its process exited 0 and no owned test process remained:
+
+```powershell
+cargo test --offline --locked --workspace --lib --bins --tests --target-dir '..\klein-target' -- --test-threads=1
+```
+
+Evidence: `klein-workspace-test-targets.log` and `klein-final-tests.json`. This
+includes CUDA kernel, CPU-vs-CUDA, packed projections, long attention and transfer
+checks. Ignored tests were not silently counted as passes. The two explicit
+local adapter/VAE tests were run separately as recorded in the initial checkpoint.
+
+The plain full-workspace command remains blocked while linking examples: Windows
+LNK1104 cannot open `examples/bench.exe`. At the original base, both
+`crates/llama-rs/examples/bench.rs` and `crates/oaiy-tts/examples/bench.rs` already
+produce that filename; `llama-rs` and `dsv41-cuda` also share `generate.exe`.
+Cargo reports these collisions in `klein-workspace-tests-final.log`. No example
+target was changed by this branch. The passing command explicitly excludes
+examples and doctests, so this is not a claim that the bare workspace command
+passes. The broader subset's log separately includes its doctest results.
 
 ## Scope
 
