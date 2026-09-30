@@ -1,4 +1,4 @@
-//! A deterministic fuzz of the recovery phrase decoder: at least 100,000 generated inputs, checked against a model and against an independent
+//! A deterministic fuzz of the recovery phrase decoder: two hundred thousand generated inputs (the test asserts at least 100,000), checked against a model and against an independent
 //! implementation (the `bip39` crate 2.2.2, `rust-bitcoin`'s), never panicking. (`cargo-fuzz` is not needed for a decoder this size; the
 //! generator is seeded, so every run is the same run.)
 //!
@@ -187,7 +187,7 @@ fn garbage(rng: &mut Rng) -> String {
 }
 
 #[test]
-fn a_hundred_and_fifty_thousand_generated_inputs_never_panic_and_agree_with_the_model_and_the_reference_crate() {
+fn two_hundred_thousand_generated_inputs_never_panic_and_agree_with_the_model_and_the_reference_crate() {
     let mut rng = Rng(0x0a17_9050_beef);
     let mut inputs = 0usize;
     let (mut ok_disguised, mut ok_mutated, mut checksum, mut length, mut word) = (0usize, 0usize, 0usize, 0usize, 0usize);
