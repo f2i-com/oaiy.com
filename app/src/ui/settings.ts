@@ -8,7 +8,7 @@ import { LOCAL_SERVERS, defaultBaseUrl, listModels, type ModelInfo } from '../ag
 import type { LocalServerKind, ProviderConfig, ProviderType } from '../agent/providers/types';
 import { contextWindow, detectContextWindow, formatTokens } from '../agent/context';
 import type { AgentSettings } from '../settings';
-import { OAIY_ORIGIN, discoverOaiy, listMediaModels, mediaAbilities, mergeDiscovered, originOf, type Discovery, type MediaSettings } from '../agent/media';
+import { EMPTY_MEDIA, OAIY_ORIGIN, discoverOaiy, listMediaModels, mediaAbilities, mergeDiscovered, originOf, type Discovery, type MediaSettings } from '../agent/media';
 import { newId } from '../vfs/projects';
 import { looksOnLoad, pageHost } from '@oaiy/shared/capabilities/host';
 import { clear, h } from './dom';
@@ -56,6 +56,21 @@ const KINDS: Array<{ value: string; label: string; type: ProviderType; serverKin
   { value: 'openai', label: 'OpenAI API', type: 'openai' },
   { value: 'custom', label: 'Other OpenAI-compatible API (OpenRouter, Groq, …)', type: 'custom' },
 ];
+
+/** Whether the address typed is (at) the origin that was found: an empty one, or one that is not an address, is not. */
+export function addressOf(typed: string, origin: string): boolean {
+  if (!typed.trim()) return false;
+  try {
+    return originOf(typed) === origin;
+  } catch {
+    return false;
+  }
+}
+
+/** What Forget OAIY leaves: nothing that was found, no address and no key for it. Whether the agent may use media stays as chosen. */
+export function forgetOaiy(media: MediaSettings): MediaSettings {
+  return { ...EMPTY_MEDIA, imageModels: [], videoModels: [], enabled: media.enabled };
+}
 
 function kindOf(p: ProviderConfig): string {
   if (p.type === 'local') return p.serverKind === 'lmstudio' ? 'lmstudio' : p.serverKind === 'ollama' ? 'ollama' : p.serverKind === 'oaiy' ? 'oaiy' : 'local-other';
@@ -256,8 +271,9 @@ export function openSettings(initial: SettingsResult): Promise<SettingsResult | 
         : media.baseUrl ? 'set up by hand' : 'not set up';
       const address = h('input', { value: media.baseUrl, placeholder: `${OAIY_ORIGIN}/v1`, oninput: () => {
         media.baseUrl = address.value.trim();
-        // A typed address is no longer the discovered one: its routes may differ.
-        if (media.discovered && media.baseUrl && originOf(media.baseUrl) !== media.discovered.origin) {
+        // The address is what makes this the OAIY that was found: another address, or none, is not that one any more (its routes may
+        // differ), and a page that has forgotten it does not ask it again when it opens or send it the key.
+        if (media.discovered && !addressOf(media.baseUrl, media.discovered.origin)) {
           media.discovered = undefined;
           media.endpoints = undefined;
         }
@@ -300,6 +316,14 @@ export function openSettings(initial: SettingsResult): Promise<SettingsResult | 
         (mediaSection.querySelector('.form-note') as HTMLElement).textContent =
           `Found ${found.service} ${found.version}: it can make ${mediaAbilities(media) || 'nothing yet'}.${chat ? ' It is in the AI providers too, for chat.' : ''}`;
       } }, 'Find OAIY');
+      // Shown while an OAIY is found: this page asks it at that address each time it opens, with the key below (if there is one).
+      const forget = h('button', { title: 'Forget the OAIY that was found: its address, what it said and the key. This page stops asking it when it opens (once you press Save).', onclick: () => {
+        const was = media.discovered?.origin;
+        const chatToo = !!was && providers.some((p) => addressOf(p.baseUrl ?? '', was));
+        media = forgetOaiy(media);
+        renderMedia();
+        (mediaSection.querySelector('.form-note') as HTMLElement).textContent = `Forgotten${was ? ` (${was})` : ''}. Press Save to keep that: this page then asks nothing of it.${chatToo ? ' Its chat provider is still in the list above; remove it there too if you do not want it.' : ''}`;
+      } }, 'Forget OAIY');
       const listButton = h('button', { title: 'Ask the server which image and video models it has', onclick: async () => {
         if (!media.baseUrl) {
           note.textContent = 'Give the address first.';
@@ -331,7 +355,7 @@ export function openSettings(initial: SettingsResult): Promise<SettingsResult | 
         h('strong', 'Images, video and audio'),
         h('p.muted', `The agent can make pictures, short videos, speech, music, sound effects and 3D models with a media service: ${lookedForOnItsOwn ? 'OAIY is found on its own' : `OAIY is looked for only when you press Find OAIY (this page never reaches out to your computer before that, and your browser may ask you to allow it)`}, and any server with OpenAI's /v1/images/generations, /v1/videos and /v1/audio/speech works. Now: ${status}${media.baseUrl ? ` (${abilities || 'no models chosen'})` : ''}.`),
         h('div.provider-form',
-          h('label', 'Address', h('div.window-picker', address, find, listButton)),
+          h('label', 'Address', h('div.window-picker', address, find, listButton, ...(media.discovered ? [forget] : []))),
           h('label', 'API key', key),
           h('label', 'Images', modelInput('image')),
           h('label', 'Video', modelInput('video')),
