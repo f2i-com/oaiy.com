@@ -30,12 +30,13 @@ final class AokieRig
     /**
      * @param array<string,mixed> $config merged into config.json (call.enabled is on unless you say otherwise)
      * @param bool $stream the calibration has passed (the host flushes), so the framed stream is offered; false leaves it unmeasured
+     * @param array<string,mixed> $provision what the installer is given (a database, for a run on MySQL)
      */
-    public static function make(array $config = [], bool $https = true, bool $stream = true): self
+    public static function make(array $config = [], bool $https = true, bool $stream = true, array $provision = []): self
     {
         $k = new self();
         $base = ['call' => ['enabled' => true], 'turn' => self::TURN, 'stun' => ['urls' => ['stun:stun.example.com:3478']]];
-        $k->r = Relay::make([], $https ? ['public_url' => 'https://relay.example.com'] : []);
+        $k->r = Relay::make([], array_merge($https ? ['public_url' => 'https://relay.example.com'] : [], $provision));
         $k->r->configure($base);
         $k->r->configure($config);
         $k->desk = $k->r->desktop('Front desk PC');
@@ -76,7 +77,7 @@ final class AokieRig
     /** A phone paired to the desktop: its device row records the desktop's endpoint thumbprint as its pin. */
     public function addPhone(string $name = 'Phone', ?array $grants = null): Actor
     {
-        $ph = $this->r->phone($this->desk, $name, ['peer_thumbprint' => $this->epThumb(), 'grants' => $grants ?? Grants::DEFAULT]);
+        $ph = $this->r->phone($this->desk, $name, ['peer_thumbprint' => $this->epThumb(), 'app_id' => $this->app, 'grants' => $grants ?? Grants::DEFAULT]);
         $this->phones[] = $ph;
         return $ph;
     }
