@@ -1,0 +1,190 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://oaiy.com/schemas/relay/v1/admin-status.schema.json",
+  "title": "Admin status",
+  "description": "200 response of GET /v1/admin/status (device token of a desktop, or the admin token). With ?diag=1 a `diag` object reports what the web SAPI sees. No secret ever appears in it.",
+  "type": "object",
+  "properties": {
+    "v": {
+      "const": 1
+    },
+    "version": {
+      "type": "string",
+      "maxLength": 32
+    },
+    "php": {
+      "type": "object",
+      "properties": {
+        "version": {
+          "type": "string"
+        },
+        "sapi": {
+          "type": "string"
+        },
+        "extensions": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        }
+      },
+      "required": [
+        "version",
+        "sapi",
+        "extensions"
+      ],
+      "additionalProperties": true
+    },
+    "db": {
+      "type": "object",
+      "properties": {
+        "driver": {
+          "enum": [
+            "sqlite",
+            "mysql"
+          ]
+        },
+        "sizeBytes": {
+          "type": "integer",
+          "minimum": 0
+        }
+      },
+      "required": [
+        "driver"
+      ],
+      "additionalProperties": true
+    },
+    "items": {
+      "type": "object",
+      "properties": {
+        "live": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "bytes": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "oldestAgeS": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "minimum": 0
+        }
+      },
+      "required": [
+        "live",
+        "bytes",
+        "oldestAgeS"
+      ],
+      "additionalProperties": true
+    },
+    "devices": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "properties": {
+          "id": {
+            "$ref": "https://oaiy.com/schemas/relay/v1/common.schema.json#/$defs/principalId"
+          },
+          "role": {
+            "$ref": "https://oaiy.com/schemas/relay/v1/common.schema.json#/$defs/role"
+          },
+          "name": {
+            "type": "string"
+          },
+          "online": {
+            "type": "boolean"
+          }
+        },
+        "required": [
+          "id",
+          "role",
+          "name",
+          "online"
+        ],
+        "additionalProperties": true
+      }
+    },
+    "holds": {
+      "type": "object",
+      "properties": {
+        "soft": {
+          "type": "integer",
+          "minimum": 1
+        },
+        "hard": {
+          "type": "integer",
+          "minimum": 1
+        },
+        "measured": {
+          "type": "boolean"
+        },
+        "byKind": {
+          "type": "object",
+          "additionalProperties": {
+            "type": "integer",
+            "minimum": 0
+          }
+        },
+        "live": {
+          "type": "integer",
+          "minimum": 0
+        }
+      },
+      "required": [
+        "soft",
+        "hard",
+        "measured",
+        "byKind",
+        "live"
+      ],
+      "additionalProperties": true
+    },
+    "rejected24h": {
+      "type": "object",
+      "additionalProperties": {
+        "type": "integer",
+        "minimum": 0
+      }
+    },
+    "noAuthHeader24h": {
+      "type": "integer",
+      "minimum": 0
+    },
+    "tokensOlderThan90d": {
+      "type": "array",
+      "items": {
+        "type": "string"
+      }
+    },
+    "warnings": {
+      "type": "array",
+      "items": {
+        "type": "string"
+      }
+    },
+    "diag": {
+      "type": "object"
+    },
+    "time": {
+      "$ref": "https://oaiy.com/schemas/relay/v1/common.schema.json#/$defs/unixTime"
+    }
+  },
+  "required": [
+    "v",
+    "version",
+    "php",
+    "db",
+    "items",
+    "devices",
+    "holds",
+    "rejected24h",
+    "noAuthHeader24h",
+    "tokensOlderThan90d",
+    "warnings",
+    "time"
+  ],
+  "additionalProperties": true
+}

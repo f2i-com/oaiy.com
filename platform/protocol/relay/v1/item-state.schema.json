@@ -1,0 +1,55 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://oaiy.com/schemas/relay/v1/item-state.schema.json",
+  "title": "Item state",
+  "description": "200 response of GET /v1/items/{id}?to=dev:<deviceId>&lane=<lane>. Only for an item the caller sent; 404 otherwise. `deliveredAt` and `ackedAt` are omitted until they happen.",
+  "type": "object",
+  "properties": {
+    "id": {
+      "$ref": "https://oaiy.com/schemas/relay/v1/common.schema.json#/$defs/itemId"
+    },
+    "lane": {
+      "$ref": "https://oaiy.com/schemas/relay/v1/common.schema.json#/$defs/lane"
+    },
+    "to": {
+      "$ref": "https://oaiy.com/schemas/relay/v1/common.schema.json#/$defs/inboxAddress"
+    },
+    "state": {
+      "enum": [
+        "queued",
+        "delivered",
+        "acked",
+        "expired"
+      ]
+    },
+    "seq": {
+      "$ref": "https://oaiy.com/schemas/relay/v1/common.schema.json#/$defs/seq"
+    },
+    "at": {
+      "$ref": "https://oaiy.com/schemas/relay/v1/common.schema.json#/$defs/unixTime"
+    },
+    "exp": {
+      "$ref": "https://oaiy.com/schemas/relay/v1/common.schema.json#/$defs/unixTime"
+    },
+    "deliveredAt": {
+      "$ref": "https://oaiy.com/schemas/relay/v1/common.schema.json#/$defs/unixTime"
+    },
+    "ackedAt": {
+      "$ref": "https://oaiy.com/schemas/relay/v1/common.schema.json#/$defs/unixTime"
+    },
+    "time": {
+      "$ref": "https://oaiy.com/schemas/relay/v1/common.schema.json#/$defs/unixTime"
+    }
+  },
+  "required": [
+    "id",
+    "lane",
+    "to",
+    "state",
+    "seq",
+    "at",
+    "exp",
+    "time"
+  ],
+  "additionalProperties": true
+}

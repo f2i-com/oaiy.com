@@ -1,0 +1,40 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://oaiy.com/schemas/relay/v1/admission-mobile-request.schema.json",
+  "title": "Mobile admission request",
+  "description": "POST /v1/admission with a phone token, as the phone sends it.",
+  "type": "object",
+  "properties": {
+    "appId": {
+      "$ref": "https://oaiy.com/schemas/relay/v1/common.schema.json#/$defs/appId"
+    },
+    "deviceId": {
+      "$ref": "https://oaiy.com/schemas/relay/v1/common.schema.json#/$defs/deviceId"
+    },
+    "displayName": {
+      "$ref": "https://oaiy.com/schemas/relay/v1/common.schema.json#/$defs/name60"
+    },
+    "holderKeyThumbprint": {
+      "$ref": "https://oaiy.com/schemas/relay/v1/common.schema.json#/$defs/thumbprint"
+    },
+    "supportedTransports": {
+      "type": "array",
+      "items": {
+        "enum": [
+          "relay",
+          "relay-poll"
+        ]
+      },
+      "minItems": 1,
+      "maxItems": 2,
+      "uniqueItems": true
+    }
+  },
+  "required": [
+    "appId",
+    "deviceId",
+    "holderKeyThumbprint",
+    "supportedTransports"
+  ],
+  "additionalProperties": true
+}

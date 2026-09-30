@@ -1,0 +1,33 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://oaiy.com/schemas/relay/v1/providers-request.schema.json",
+  "title": "Provider registration",
+  "description": "POST /v1/providers (provider token).",
+  "type": "object",
+  "properties": {
+    "name": {
+      "$ref": "https://oaiy.com/schemas/relay/v1/common.schema.json#/$defs/name60"
+    },
+    "ed25519": {
+      "$ref": "https://oaiy.com/schemas/relay/v1/common.schema.json#/$defs/key32"
+    },
+    "x25519": {
+      "$ref": "https://oaiy.com/schemas/relay/v1/common.schema.json#/$defs/key32"
+    },
+    "origins": {
+      "type": "array",
+      "items": {
+        "$ref": "https://oaiy.com/schemas/relay/v1/common.schema.json#/$defs/origin"
+      },
+      "maxItems": 4,
+      "uniqueItems": true
+    }
+  },
+  "required": [
+    "name",
+    "ed25519",
+    "x25519",
+    "origins"
+  ],
+  "additionalProperties": true
+}

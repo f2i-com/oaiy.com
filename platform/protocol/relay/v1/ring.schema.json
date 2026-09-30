@@ -1,0 +1,178 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://oaiy.com/schemas/relay/v1/ring.schema.json",
+  "title": "Ring body",
+  "description": "The body of a ring item is the FCM data map: a JSON object whose members are exactly the class's members, every value a string (the shipped Android parser forbids extra members, which is why the signature rides in hdr.sig). Time windows (expiresAt later than now and at most now + 300, or 86,400 for informational) are checked by code.",
+  "oneOf": [
+    {
+      "type": "object",
+      "properties": {
+        "aokieClass": {
+          "const": "voice_offer"
+        },
+        "schemaVersion": {
+          "const": "1"
+        },
+        "eventId": {
+          "type": "string",
+          "pattern": "^[A-Za-z0-9_.:-]{1,200}$"
+        },
+        "offerId": {
+          "type": "string",
+          "pattern": "^[A-Za-z0-9_.:-]{1,200}$"
+        },
+        "appId": {
+          "type": "string",
+          "pattern": "^[A-Za-z0-9_.:-]{1,200}$"
+        },
+        "callId": {
+          "type": "string",
+          "pattern": "^[A-Za-z0-9_.:-]{1,200}$"
+        },
+        "callEpoch": {
+          "type": "string",
+          "pattern": "^[1-9][0-9]{0,15}$"
+        },
+        "ownerEpoch": {
+          "type": "string",
+          "pattern": "^(0|[1-9][0-9]{0,15})$"
+        },
+        "expiresAt": {
+          "type": "string",
+          "pattern": "^[0-9]{1,16}$"
+        }
+      },
+      "required": [
+        "aokieClass",
+        "schemaVersion",
+        "eventId",
+        "offerId",
+        "appId",
+        "callId",
+        "callEpoch",
+        "ownerEpoch",
+        "expiresAt"
+      ],
+      "additionalProperties": false
+    },
+    {
+      "type": "object",
+      "properties": {
+        "aokieClass": {
+          "const": "voice_offer_cancel"
+        },
+        "schemaVersion": {
+          "const": "1"
+        },
+        "eventId": {
+          "type": "string",
+          "pattern": "^[A-Za-z0-9_.:-]{1,200}$"
+        },
+        "offerId": {
+          "type": "string",
+          "pattern": "^[A-Za-z0-9_.:-]{1,200}$"
+        },
+        "reason": {
+          "type": "string",
+          "pattern": "^[^\\x00-\\x1f\\x7f]{1,120}$"
+        }
+      },
+      "required": [
+        "aokieClass",
+        "schemaVersion",
+        "eventId",
+        "offerId"
+      ],
+      "additionalProperties": false
+    },
+    {
+      "type": "object",
+      "properties": {
+        "aokieClass": {
+          "const": "assistance_offer"
+        },
+        "schemaVersion": {
+          "const": "1"
+        },
+        "eventId": {
+          "type": "string",
+          "pattern": "^[A-Za-z0-9_.:-]{1,200}$"
+        },
+        "appId": {
+          "type": "string",
+          "pattern": "^[A-Za-z0-9_.:-]{1,200}$"
+        },
+        "requestId": {
+          "type": "string",
+          "pattern": "^[A-Za-z0-9_.:-]{1,200}$"
+        },
+        "callId": {
+          "type": "string",
+          "pattern": "^[A-Za-z0-9_.:-]{1,200}$"
+        },
+        "callEpoch": {
+          "type": "string",
+          "pattern": "^[1-9][0-9]{0,15}$"
+        },
+        "ownerEpoch": {
+          "type": "string",
+          "pattern": "^(0|[1-9][0-9]{0,15})$"
+        },
+        "expiresAt": {
+          "type": "string",
+          "pattern": "^[0-9]{1,16}$"
+        }
+      },
+      "required": [
+        "aokieClass",
+        "schemaVersion",
+        "eventId",
+        "appId",
+        "requestId",
+        "callId",
+        "callEpoch",
+        "ownerEpoch",
+        "expiresAt"
+      ],
+      "additionalProperties": false
+    },
+    {
+      "type": "object",
+      "properties": {
+        "aokieClass": {
+          "const": "informational"
+        },
+        "schemaVersion": {
+          "const": "1"
+        },
+        "eventId": {
+          "type": "string",
+          "pattern": "^[A-Za-z0-9_.:-]{1,200}$"
+        },
+        "title": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 80
+        },
+        "body": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 240
+        },
+        "expiresAt": {
+          "type": "string",
+          "pattern": "^[0-9]{1,16}$"
+        }
+      },
+      "required": [
+        "aokieClass",
+        "schemaVersion",
+        "eventId",
+        "title",
+        "body",
+        "expiresAt"
+      ],
+      "additionalProperties": false
+    }
+  ]
+}

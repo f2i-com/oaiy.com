@@ -1,0 +1,16 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://oaiy.com/schemas/relay/v1/devices-revoke-request.schema.json",
+  "title": "Revoke every phone",
+  "description": "POST /v1/devices/revoke (alias DELETE /v1/devices?role=phone).",
+  "type": "object",
+  "properties": {
+    "role": {
+      "const": "phone"
+    }
+  },
+  "required": [
+    "role"
+  ],
+  "additionalProperties": true
+}

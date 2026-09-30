@@ -1,0 +1,116 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://oaiy.com/schemas/relay/v1/challenge.schema.json",
+  "title": "Endpoint challenge",
+  "description": "GET /v1/aokie-companion/relay/challenge (README section 4.14.4), 25 second lifetime, built only from the bearer's own claims. The plugin's peer set and the mobile's expectedPeerKeyThumbprint are mutually exclusive.",
+  "type": "object",
+  "properties": {
+    "kind": {
+      "const": "endpoint_challenge"
+    },
+    "schemaVersion": {
+      "const": 2
+    },
+    "appId": {
+      "$ref": "https://oaiy.com/schemas/relay/v1/common.schema.json#/$defs/appId"
+    },
+    "subjectId": {
+      "$ref": "https://oaiy.com/schemas/relay/v1/common.schema.json#/$defs/appId"
+    },
+    "role": {
+      "enum": [
+        "plugin",
+        "mobile"
+      ]
+    },
+    "connectionId": {
+      "type": "string",
+      "pattern": "^relay_[0-9a-f]{32}$"
+    },
+    "challengeNonce": {
+      "type": "string",
+      "pattern": "^challenge_[0-9a-f]{32}$"
+    },
+    "admissionJti": {
+      "type": "string",
+      "pattern": "^adm_[0-9a-f]{32}$"
+    },
+    "holderKeyThumbprint": {
+      "$ref": "https://oaiy.com/schemas/relay/v1/common.schema.json#/$defs/thumbprint"
+    },
+    "approvedPeerKeyThumbprints": {
+      "type": "array",
+      "items": {
+        "$ref": "https://oaiy.com/schemas/relay/v1/common.schema.json#/$defs/thumbprint"
+      },
+      "minItems": 1,
+      "maxItems": 16,
+      "uniqueItems": true
+    },
+    "peerRosterRevision": {
+      "type": "integer",
+      "minimum": 1,
+      "maximum": 9007199254740991
+    },
+    "peerRosterHash": {
+      "$ref": "https://oaiy.com/schemas/relay/v1/common.schema.json#/$defs/key32"
+    },
+    "expectedPeerKeyThumbprint": {
+      "$ref": "https://oaiy.com/schemas/relay/v1/common.schema.json#/$defs/thumbprint"
+    },
+    "expiresAt": {
+      "$ref": "https://oaiy.com/schemas/relay/v1/common.schema.json#/$defs/unixTime"
+    }
+  },
+  "required": [
+    "kind",
+    "schemaVersion",
+    "appId",
+    "subjectId",
+    "role",
+    "connectionId",
+    "challengeNonce",
+    "admissionJti",
+    "holderKeyThumbprint",
+    "expiresAt"
+  ],
+  "additionalProperties": false,
+  "oneOf": [
+    {
+      "required": [
+        "approvedPeerKeyThumbprints",
+        "peerRosterRevision",
+        "peerRosterHash"
+      ],
+      "not": {
+        "required": [
+          "expectedPeerKeyThumbprint"
+        ]
+      }
+    },
+    {
+      "required": [
+        "expectedPeerKeyThumbprint"
+      ],
+      "not": {
+        "anyOf": [
+          {
+            "required": [
+              "approvedPeerKeyThumbprints"
+            ]
+          },
+          {
+            "required": [
+              "peerRosterRevision"
+            ]
+          },
+          {
+            "required": [
+              "peerRosterHash"
+            ]
+          }
+        ]
+      }
+    }
+  ]
+}

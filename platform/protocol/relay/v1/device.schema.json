@@ -1,0 +1,103 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://oaiy.com/schemas/relay/v1/device.schema.json",
+  "title": "Device entry",
+  "description": "One element of GET /v1/devices (desktop only): the caller's own phones and providers. Members that do not apply are null.",
+  "type": "object",
+  "properties": {
+    "id": {
+      "$ref": "https://oaiy.com/schemas/relay/v1/common.schema.json#/$defs/principalId"
+    },
+    "role": {
+      "$ref": "https://oaiy.com/schemas/relay/v1/common.schema.json#/$defs/role"
+    },
+    "name": {
+      "$ref": "https://oaiy.com/schemas/relay/v1/common.schema.json#/$defs/name60"
+    },
+    "ver": {
+      "type": [
+        "string",
+        "null"
+      ],
+      "maxLength": 32
+    },
+    "createdAt": {
+      "$ref": "https://oaiy.com/schemas/relay/v1/common.schema.json#/$defs/unixTime"
+    },
+    "lastSeen": {
+      "$ref": "https://oaiy.com/schemas/relay/v1/common.schema.json#/$defs/unixTimeOrNull"
+    },
+    "revokedAt": {
+      "$ref": "https://oaiy.com/schemas/relay/v1/common.schema.json#/$defs/unixTimeOrNull"
+    },
+    "thumbprint": {
+      "oneOf": [
+        {
+          "$ref": "https://oaiy.com/schemas/relay/v1/common.schema.json#/$defs/thumbprint"
+        },
+        {
+          "type": "null"
+        }
+      ]
+    },
+    "ownerDesktop": {
+      "oneOf": [
+        {
+          "$ref": "https://oaiy.com/schemas/relay/v1/common.schema.json#/$defs/deviceId"
+        },
+        {
+          "type": "null"
+        }
+      ]
+    },
+    "grants": {
+      "type": "array",
+      "items": {
+        "$ref": "https://oaiy.com/schemas/relay/v1/common.schema.json#/$defs/grant"
+      },
+      "maxItems": 16,
+      "uniqueItems": true
+    },
+    "flags": {
+      "type": "object",
+      "properties": {
+        "canCmd": {
+          "type": "boolean"
+        }
+      },
+      "required": [
+        "canCmd"
+      ],
+      "additionalProperties": true
+    },
+    "push": {
+      "type": "object",
+      "properties": {
+        "kind": {
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      },
+      "required": [
+        "kind"
+      ],
+      "additionalProperties": true
+    }
+  },
+  "required": [
+    "id",
+    "role",
+    "name",
+    "createdAt",
+    "lastSeen",
+    "revokedAt",
+    "thumbprint",
+    "ownerDesktop",
+    "grants",
+    "flags",
+    "push"
+  ],
+  "additionalProperties": true
+}

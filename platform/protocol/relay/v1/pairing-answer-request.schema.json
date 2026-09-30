@@ -1,0 +1,18 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://oaiy.com/schemas/relay/v1/pairing-answer-request.schema.json",
+  "title": "Post the phone's response",
+  "description": "POST /v1/pair/{pid}/response. The response text is at most 8192 bytes.",
+  "type": "object",
+  "properties": {
+    "response": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 8192
+    }
+  },
+  "required": [
+    "response"
+  ],
+  "additionalProperties": true
+}

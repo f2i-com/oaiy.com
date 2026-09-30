@@ -1,0 +1,273 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://oaiy.com/schemas/relay/v1/info.schema.json",
+  "title": "Relay info document",
+  "description": "GET /v1/info (README section 4.8). The body is static: it has no `time` member, so its Ed25519 signature (X-OAIY-Sig) can be cached, and it proves only that the bytes were once signed by the relay key. Identity is proved by a request that carries X-OAIY-Nonce (X-OAIY-Proof). `features` lists only what this relay implements and has enabled; a client uses a feature only if listed. `limits.lanes` lists only the lanes actually served.",
+  "type": "object",
+  "properties": {
+    "protocol": {
+      "const": "oaiy-relay/1"
+    },
+    "minClient": {
+      "type": "integer",
+      "minimum": 1
+    },
+    "relayId": {
+      "$ref": "https://oaiy.com/schemas/relay/v1/common.schema.json#/$defs/relayId"
+    },
+    "relayKey": {
+      "type": "object",
+      "properties": {
+        "algorithm": {
+          "const": "ed25519"
+        },
+        "publicKey": {
+          "$ref": "https://oaiy.com/schemas/relay/v1/common.schema.json#/$defs/key32"
+        },
+        "thumbprint": {
+          "$ref": "https://oaiy.com/schemas/relay/v1/common.schema.json#/$defs/thumbprint"
+        }
+      },
+      "required": [
+        "algorithm",
+        "publicKey",
+        "thumbprint"
+      ],
+      "additionalProperties": true
+    },
+    "software": {
+      "type": "object",
+      "properties": {
+        "name": {
+          "type": "string",
+          "maxLength": 64
+        },
+        "version": {
+          "type": "string",
+          "maxLength": 32
+        }
+      },
+      "required": [
+        "name",
+        "version"
+      ],
+      "additionalProperties": true
+    },
+    "features": {
+      "type": "array",
+      "items": {
+        "type": "string",
+        "pattern": "^[a-z][a-z0-9.-]*$"
+      },
+      "uniqueItems": true
+    },
+    "wait": {
+      "type": "object",
+      "properties": {
+        "default": {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 300
+        },
+        "max": {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 300
+        },
+        "pollGapMs": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "fallbackS": {
+          "type": "integer",
+          "minimum": 1
+        }
+      },
+      "required": [
+        "default",
+        "max",
+        "pollGapMs",
+        "fallbackS"
+      ],
+      "additionalProperties": true
+    },
+    "presenceWindow": {
+      "type": "integer",
+      "minimum": 1
+    },
+    "limits": {
+      "type": "object",
+      "properties": {
+        "batchItems": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 64
+        },
+        "batchBytes": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 1048576
+        },
+        "mailboxItems": {
+          "type": "integer",
+          "minimum": 1
+        },
+        "mailboxBytes": {
+          "type": "integer",
+          "minimum": 1
+        },
+        "bulkShare": {
+          "type": "number",
+          "exclusiveMinimum": 0,
+          "maximum": 1
+        },
+        "sigItems": {
+          "type": "integer",
+          "minimum": 1
+        },
+        "sigSenderShare": {
+          "type": "number",
+          "exclusiveMinimum": 0,
+          "maximum": 1
+        },
+        "lookupWait": {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 8
+        },
+        "lookupHeld": {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 4
+        },
+        "hdrBytes": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 512
+        },
+        "slotBytes": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 65536
+        },
+        "rosterMax": {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 16
+        },
+        "desktops": {
+          "type": "integer",
+          "minimum": 1
+        },
+        "held": {
+          "type": "object",
+          "properties": {
+            "soft": {
+              "type": "integer",
+              "minimum": 1
+            },
+            "hard": {
+              "type": "integer",
+              "minimum": 1
+            },
+            "measured": {
+              "type": "boolean"
+            }
+          },
+          "required": [
+            "soft",
+            "hard",
+            "measured"
+          ],
+          "additionalProperties": true
+        },
+        "lanes": {
+          "type": "object",
+          "propertyNames": {
+            "enum": [
+              "cmd",
+              "res",
+              "ai",
+              "ai.in",
+              "ai.out",
+              "pair",
+              "ring",
+              "ctl",
+              "sync",
+              "sig"
+            ]
+          },
+          "additionalProperties": {
+            "type": "object",
+            "properties": {
+              "body": {
+                "type": "integer",
+                "minimum": 1
+              },
+              "ttl": {
+                "type": "object",
+                "properties": {
+                  "default": {
+                    "type": "integer",
+                    "minimum": 1
+                  },
+                  "min": {
+                    "type": "integer",
+                    "minimum": 1
+                  },
+                  "max": {
+                    "type": "integer",
+                    "minimum": 1
+                  }
+                },
+                "required": [
+                  "default",
+                  "min",
+                  "max"
+                ],
+                "additionalProperties": true
+              }
+            },
+            "required": [
+              "body",
+              "ttl"
+            ],
+            "additionalProperties": true
+          }
+        }
+      },
+      "required": [
+        "batchItems",
+        "batchBytes",
+        "mailboxItems",
+        "mailboxBytes",
+        "hdrBytes",
+        "held",
+        "lanes"
+      ],
+      "additionalProperties": true
+    },
+    "turn": {
+      "type": "boolean"
+    },
+    "cors": {
+      "type": "array",
+      "items": {
+        "$ref": "https://oaiy.com/schemas/relay/v1/common.schema.json#/$defs/origin"
+      }
+    },
+    "time": false
+  },
+  "required": [
+    "protocol",
+    "minClient",
+    "relayId",
+    "relayKey",
+    "software",
+    "features",
+    "wait",
+    "presenceWindow",
+    "limits"
+  ],
+  "additionalProperties": true
+}

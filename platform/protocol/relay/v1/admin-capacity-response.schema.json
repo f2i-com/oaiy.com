@@ -1,0 +1,76 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://oaiy.com/schemas/relay/v1/admin-capacity-response.schema.json",
+  "title": "Calibration result response",
+  "description": "200 response of POST /v1/admin/capacity: the limits the relay derived from the measurement.",
+  "type": "object",
+  "properties": {
+    "v": {
+      "const": 1
+    },
+    "effective": {
+      "type": "object",
+      "properties": {
+        "workers": {
+          "type": "integer",
+          "minimum": 1
+        },
+        "heldSoft": {
+          "type": "integer",
+          "minimum": 1
+        },
+        "heldHard": {
+          "type": "integer",
+          "minimum": 1
+        },
+        "waitMax": {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 300
+        },
+        "streamOk": {
+          "type": "boolean"
+        },
+        "laneBodies": {
+          "type": "object",
+          "propertyNames": {
+            "enum": [
+              "cmd",
+              "res",
+              "ai",
+              "ai.in",
+              "ai.out",
+              "pair",
+              "ring",
+              "ctl",
+              "sync",
+              "sig"
+            ]
+          },
+          "additionalProperties": {
+            "type": "integer",
+            "minimum": 1
+          }
+        }
+      },
+      "required": [
+        "workers",
+        "heldSoft",
+        "heldHard",
+        "waitMax",
+        "streamOk",
+        "laneBodies"
+      ],
+      "additionalProperties": true
+    },
+    "time": {
+      "$ref": "https://oaiy.com/schemas/relay/v1/common.schema.json#/$defs/unixTime"
+    }
+  },
+  "required": [
+    "v",
+    "effective",
+    "time"
+  ],
+  "additionalProperties": true
+}

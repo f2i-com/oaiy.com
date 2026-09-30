@@ -1,0 +1,107 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://oaiy.com/schemas/relay/v1/result.schema.json",
+  "title": "Result document",
+  "description": "The signed bytes of a desktop result, signed by the host identity and sealed to the provider's X25519 key. `re` equals the command id. A done result has no error; a failed one has a coded error.",
+  "type": "object",
+  "properties": {
+    "v": {
+      "const": 1
+    },
+    "re": {
+      "$ref": "https://oaiy.com/schemas/relay/v1/common.schema.json#/$defs/itemId"
+    },
+    "dev": {
+      "$ref": "https://oaiy.com/schemas/relay/v1/common.schema.json#/$defs/deviceId"
+    },
+    "status": {
+      "enum": [
+        "done",
+        "failed"
+      ]
+    },
+    "result": {
+      "type": [
+        "object",
+        "null"
+      ]
+    },
+    "error": {
+      "oneOf": [
+        {
+          "type": "null"
+        },
+        {
+          "type": "object",
+          "properties": {
+            "code": {
+              "type": "string",
+              "pattern": "^[a-z][a-z0-9_]{0,63}$"
+            },
+            "message": {
+              "type": "string",
+              "maxLength": 200
+            }
+          },
+          "required": [
+            "code"
+          ],
+          "additionalProperties": true
+        }
+      ]
+    },
+    "at": {
+      "$ref": "https://oaiy.com/schemas/relay/v1/common.schema.json#/$defs/unixTime"
+    }
+  },
+  "required": [
+    "v",
+    "re",
+    "dev",
+    "status",
+    "result",
+    "error",
+    "at"
+  ],
+  "additionalProperties": true,
+  "allOf": [
+    {
+      "if": {
+        "properties": {
+          "status": {
+            "const": "done"
+          }
+        },
+        "required": [
+          "status"
+        ]
+      },
+      "then": {
+        "properties": {
+          "error": {
+            "type": "null"
+          }
+        }
+      }
+    },
+    {
+      "if": {
+        "properties": {
+          "status": {
+            "const": "failed"
+          }
+        },
+        "required": [
+          "status"
+        ]
+      },
+      "then": {
+        "properties": {
+          "error": {
+            "type": "object"
+          }
+        }
+      }
+    }
+  ]
+}

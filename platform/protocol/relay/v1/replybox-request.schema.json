@@ -1,0 +1,25 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://oaiy.com/schemas/relay/v1/replybox-request.schema.json",
+  "title": "Create a reply box",
+  "description": "POST /v1/replyboxes with Authorization: Bearer <ticket>. `h` is b64u of the SHA-256 of a 32-byte secret the browser keeps.",
+  "type": "object",
+  "properties": {
+    "rid": {
+      "$ref": "https://oaiy.com/schemas/relay/v1/common.schema.json#/$defs/rid"
+    },
+    "h": {
+      "$ref": "https://oaiy.com/schemas/relay/v1/common.schema.json#/$defs/key32"
+    },
+    "ttl": {
+      "type": "integer",
+      "minimum": 1,
+      "maximum": 900
+    }
+  },
+  "required": [
+    "rid",
+    "h"
+  ],
+  "additionalProperties": true
+}

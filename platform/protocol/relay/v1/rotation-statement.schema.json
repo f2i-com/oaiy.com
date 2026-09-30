@@ -1,0 +1,55 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://oaiy.com/schemas/relay/v1/rotation-statement.schema.json",
+  "title": "Provider rotation statement",
+  "description": "The shipped bytes of a provider key rotation (README section 4.11), signed by the currently pinned key with domain \"oaiy/relay/1/provider-rotate\". exp - iat is at most 24 hours (checked by code).",
+  "type": "object",
+  "properties": {
+    "v": {
+      "const": 1
+    },
+    "prev": {
+      "$ref": "https://oaiy.com/schemas/relay/v1/common.schema.json#/$defs/thumbprint"
+    },
+    "new": {
+      "type": "object",
+      "properties": {
+        "ed25519": {
+          "$ref": "https://oaiy.com/schemas/relay/v1/common.schema.json#/$defs/key32"
+        },
+        "thumbprint": {
+          "$ref": "https://oaiy.com/schemas/relay/v1/common.schema.json#/$defs/thumbprint"
+        },
+        "x25519": {
+          "$ref": "https://oaiy.com/schemas/relay/v1/common.schema.json#/$defs/key32"
+        }
+      },
+      "required": [
+        "ed25519",
+        "thumbprint",
+        "x25519"
+      ],
+      "additionalProperties": false
+    },
+    "serial": {
+      "type": "integer",
+      "minimum": 1,
+      "maximum": 9007199254740991
+    },
+    "iat": {
+      "$ref": "https://oaiy.com/schemas/relay/v1/common.schema.json#/$defs/unixTime"
+    },
+    "exp": {
+      "$ref": "https://oaiy.com/schemas/relay/v1/common.schema.json#/$defs/unixTime"
+    }
+  },
+  "required": [
+    "v",
+    "prev",
+    "new",
+    "serial",
+    "iat",
+    "exp"
+  ],
+  "additionalProperties": false
+}

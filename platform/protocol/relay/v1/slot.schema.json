@@ -1,0 +1,41 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://oaiy.com/schemas/relay/v1/slot.schema.json",
+  "title": "Slot",
+  "description": "200 response of GET /v1/slots/{deviceId}/{name}, sent with the same ETag header; If-None-Match gives 304.",
+  "type": "object",
+  "properties": {
+    "name": {
+      "$ref": "https://oaiy.com/schemas/relay/v1/common.schema.json#/$defs/slotName"
+    },
+    "dev": {
+      "$ref": "https://oaiy.com/schemas/relay/v1/common.schema.json#/$defs/deviceId"
+    },
+    "body": {
+      "type": "string",
+      "maxLength": 65536
+    },
+    "ct": {
+      "$ref": "https://oaiy.com/schemas/relay/v1/common.schema.json#/$defs/ct"
+    },
+    "at": {
+      "$ref": "https://oaiy.com/schemas/relay/v1/common.schema.json#/$defs/unixTime"
+    },
+    "exp": {
+      "$ref": "https://oaiy.com/schemas/relay/v1/common.schema.json#/$defs/unixTime"
+    },
+    "time": {
+      "$ref": "https://oaiy.com/schemas/relay/v1/common.schema.json#/$defs/unixTime"
+    }
+  },
+  "required": [
+    "name",
+    "dev",
+    "body",
+    "ct",
+    "at",
+    "exp",
+    "time"
+  ],
+  "additionalProperties": true
+}

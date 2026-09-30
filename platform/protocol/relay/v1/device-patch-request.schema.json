@@ -1,0 +1,31 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://oaiy.com/schemas/relay/v1/device-patch-request.schema.json",
+  "title": "Device patch",
+  "description": "POST /v1/devices/{id} (alias PATCH), desktop only. Grants are patchable so a takeover tier does not need a re-pair; the next admission carries the new scopes.",
+  "type": "object",
+  "properties": {
+    "name": {
+      "$ref": "https://oaiy.com/schemas/relay/v1/common.schema.json#/$defs/name60"
+    },
+    "flags": {
+      "type": "object",
+      "properties": {
+        "canCmd": {
+          "type": "boolean"
+        }
+      },
+      "additionalProperties": true
+    },
+    "grants": {
+      "type": "array",
+      "items": {
+        "$ref": "https://oaiy.com/schemas/relay/v1/common.schema.json#/$defs/grant"
+      },
+      "maxItems": 16,
+      "uniqueItems": true
+    }
+  },
+  "additionalProperties": true,
+  "minProperties": 1
+}

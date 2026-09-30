@@ -1,0 +1,29 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://oaiy.com/schemas/relay/v1/roster-request.schema.json",
+  "title": "Roster push",
+  "description": "POST /v1/roster (desktop token): the desktop's authoritative roster for one app. `thumbprints` is strictly ascending bytewise (sorted, unique), holds at most limits.rosterMax (16) entries and may be empty; the strict ordering is checked by code. `revision` is metadata: a value lower than the stored one from the same desktop is accepted.",
+  "type": "object",
+  "properties": {
+    "appId": {
+      "$ref": "https://oaiy.com/schemas/relay/v1/common.schema.json#/$defs/appId"
+    },
+    "revision": {
+      "$ref": "https://oaiy.com/schemas/relay/v1/common.schema.json#/$defs/uint53"
+    },
+    "thumbprints": {
+      "type": "array",
+      "items": {
+        "$ref": "https://oaiy.com/schemas/relay/v1/common.schema.json#/$defs/thumbprint"
+      },
+      "maxItems": 16,
+      "uniqueItems": true
+    }
+  },
+  "required": [
+    "appId",
+    "revision",
+    "thumbprints"
+  ],
+  "additionalProperties": true
+}

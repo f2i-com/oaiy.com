@@ -1,0 +1,47 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://oaiy.com/schemas/relay/v1/item.schema.json",
+  "title": "Delivered item",
+  "description": "An element of `items` in a poll response (README section 4.3). `seq` is per mailbox. `body` is the opaque string exactly as posted; the relay never parses, re-encodes or trims it. `from` is a hint for routing and logs, never an authority.",
+  "type": "object",
+  "properties": {
+    "seq": {
+      "$ref": "https://oaiy.com/schemas/relay/v1/common.schema.json#/$defs/seq"
+    },
+    "id": {
+      "$ref": "https://oaiy.com/schemas/relay/v1/common.schema.json#/$defs/itemId"
+    },
+    "lane": {
+      "$ref": "https://oaiy.com/schemas/relay/v1/common.schema.json#/$defs/lane"
+    },
+    "from": {
+      "$ref": "https://oaiy.com/schemas/relay/v1/common.schema.json#/$defs/from"
+    },
+    "at": {
+      "$ref": "https://oaiy.com/schemas/relay/v1/common.schema.json#/$defs/unixTime"
+    },
+    "exp": {
+      "$ref": "https://oaiy.com/schemas/relay/v1/common.schema.json#/$defs/unixTime"
+    },
+    "hdr": {
+      "$ref": "https://oaiy.com/schemas/relay/v1/common.schema.json#/$defs/hdr"
+    },
+    "body": {
+      "type": "string"
+    },
+    "rp": {
+      "$ref": "https://oaiy.com/schemas/relay/v1/common.schema.json#/$defs/rid"
+    }
+  },
+  "required": [
+    "seq",
+    "id",
+    "lane",
+    "from",
+    "at",
+    "exp",
+    "hdr",
+    "body"
+  ],
+  "additionalProperties": true
+}

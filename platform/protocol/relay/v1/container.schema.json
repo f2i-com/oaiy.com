@@ -1,0 +1,29 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://oaiy.com/schemas/relay/v1/container.schema.json",
+  "title": "sealed1 container",
+  "description": "The container that is sealed with crypto_box_seal (README section 4.12): k is the signer's key thumbprint, b the exact signed bytes (b64u), s the Ed25519 signature over domain || 0x00 || bytes, p optional random padding that verifiers ignore. No other member is allowed.",
+  "type": "object",
+  "properties": {
+    "k": {
+      "$ref": "https://oaiy.com/schemas/relay/v1/common.schema.json#/$defs/thumbprint"
+    },
+    "b": {
+      "type": "string",
+      "pattern": "^[A-Za-z0-9_-]+$",
+      "minLength": 1
+    },
+    "s": {
+      "$ref": "https://oaiy.com/schemas/relay/v1/common.schema.json#/$defs/signature"
+    },
+    "p": {
+      "$ref": "https://oaiy.com/schemas/relay/v1/common.schema.json#/$defs/b64u"
+    }
+  },
+  "required": [
+    "k",
+    "b",
+    "s"
+  ],
+  "additionalProperties": false
+}

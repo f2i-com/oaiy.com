@@ -1,0 +1,64 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://oaiy.com/schemas/relay/v1/admission-plugin-request.schema.json",
+  "title": "Plugin admission request",
+  "description": "POST /v1/admission with the desktop token: exactly what the host's admission_request_body produces plus supportedTransports. The roster is the roster the plugin holds; approvedPeerKeyThumbprints is strictly ascending (checked by code) and holds 1 to 16 entries.",
+  "type": "object",
+  "properties": {
+    "appId": {
+      "$ref": "https://oaiy.com/schemas/relay/v1/common.schema.json#/$defs/appId"
+    },
+    "pluginId": {
+      "$ref": "https://oaiy.com/schemas/relay/v1/common.schema.json#/$defs/appId"
+    },
+    "displayName": {
+      "$ref": "https://oaiy.com/schemas/relay/v1/common.schema.json#/$defs/name60"
+    },
+    "endpointPublicKey": {
+      "$ref": "https://oaiy.com/schemas/relay/v1/common.schema.json#/$defs/endpointPublicKey"
+    },
+    "holderKeyThumbprint": {
+      "$ref": "https://oaiy.com/schemas/relay/v1/common.schema.json#/$defs/thumbprint"
+    },
+    "approvedPeerKeyThumbprints": {
+      "type": "array",
+      "items": {
+        "$ref": "https://oaiy.com/schemas/relay/v1/common.schema.json#/$defs/thumbprint"
+      },
+      "minItems": 1,
+      "maxItems": 16,
+      "uniqueItems": true
+    },
+    "peerRosterRevision": {
+      "type": "integer",
+      "minimum": 1,
+      "maximum": 9007199254740991
+    },
+    "peerRosterHash": {
+      "$ref": "https://oaiy.com/schemas/relay/v1/common.schema.json#/$defs/key32"
+    },
+    "supportedTransports": {
+      "type": "array",
+      "items": {
+        "enum": [
+          "relay",
+          "relay-poll"
+        ]
+      },
+      "minItems": 1,
+      "maxItems": 2,
+      "uniqueItems": true
+    }
+  },
+  "required": [
+    "appId",
+    "pluginId",
+    "endpointPublicKey",
+    "holderKeyThumbprint",
+    "approvedPeerKeyThumbprints",
+    "peerRosterRevision",
+    "peerRosterHash",
+    "supportedTransports"
+  ],
+  "additionalProperties": true
+}

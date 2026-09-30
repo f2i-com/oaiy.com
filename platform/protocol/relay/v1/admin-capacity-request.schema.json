@@ -1,0 +1,31 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://oaiy.com/schemas/relay/v1/admin-capacity-request.schema.json",
+  "title": "Calibration result",
+  "description": "POST /v1/admin/capacity: what the calibration measured through the host's own stack.",
+  "type": "object",
+  "properties": {
+    "workers": {
+      "type": "integer",
+      "minimum": 1
+    },
+    "streamOk": {
+      "type": "boolean"
+    },
+    "maxBody": {
+      "type": "integer",
+      "minimum": 1
+    },
+    "maxHold": {
+      "type": "integer",
+      "minimum": 0
+    }
+  },
+  "required": [
+    "workers",
+    "streamOk",
+    "maxBody",
+    "maxHold"
+  ],
+  "additionalProperties": true
+}

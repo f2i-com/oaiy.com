@@ -1,0 +1,28 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://oaiy.com/schemas/relay/v1/keys-response.schema.json",
+  "title": "Provider key response",
+  "description": "201 response of POST /v1/keys.",
+  "type": "object",
+  "properties": {
+    "uri": {
+      "$ref": "https://oaiy.com/schemas/relay/v1/common.schema.json#/$defs/enrollUri"
+    },
+    "kid": {
+      "$ref": "https://oaiy.com/schemas/relay/v1/common.schema.json#/$defs/kid"
+    },
+    "exp": {
+      "$ref": "https://oaiy.com/schemas/relay/v1/common.schema.json#/$defs/unixTime"
+    },
+    "time": {
+      "$ref": "https://oaiy.com/schemas/relay/v1/common.schema.json#/$defs/unixTime"
+    }
+  },
+  "required": [
+    "uri",
+    "kid",
+    "exp",
+    "time"
+  ],
+  "additionalProperties": true
+}

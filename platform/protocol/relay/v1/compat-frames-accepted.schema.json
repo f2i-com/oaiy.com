@@ -1,0 +1,22 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://oaiy.com/schemas/relay/v1/compat-frames-accepted.schema.json",
+  "title": "Aokie frames post response",
+  "description": "200 response of the frames post.",
+  "type": "object",
+  "properties": {
+    "accepted": {
+      "type": "integer",
+      "minimum": 0,
+      "maximum": 64
+    },
+    "seq": {
+      "$ref": "https://oaiy.com/schemas/relay/v1/common.schema.json#/$defs/uint53"
+    }
+  },
+  "required": [
+    "accepted",
+    "seq"
+  ],
+  "additionalProperties": true
+}

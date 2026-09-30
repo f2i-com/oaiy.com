@@ -1,0 +1,27 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://oaiy.com/schemas/relay/v1/devices-list.schema.json",
+  "title": "Device list",
+  "description": "200 response of GET /v1/devices.",
+  "type": "object",
+  "properties": {
+    "v": {
+      "const": 1
+    },
+    "devices": {
+      "type": "array",
+      "items": {
+        "$ref": "https://oaiy.com/schemas/relay/v1/device.schema.json"
+      }
+    },
+    "time": {
+      "$ref": "https://oaiy.com/schemas/relay/v1/common.schema.json#/$defs/unixTime"
+    }
+  },
+  "required": [
+    "v",
+    "devices",
+    "time"
+  ],
+  "additionalProperties": true
+}

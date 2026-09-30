@@ -1,0 +1,37 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://oaiy.com/schemas/relay/v1/approval-receipt.schema.json",
+  "title": "Approval receipt document",
+  "description": "The JSON the desktop endpoint key signs with domain \"oaiy/pairing/3/approval\" (canonical form). `grants` is sorted ascending (checked by code).",
+  "type": "object",
+  "properties": {
+    "appId": {
+      "$ref": "https://oaiy.com/schemas/relay/v1/common.schema.json#/$defs/appId"
+    },
+    "grants": {
+      "type": "array",
+      "items": {
+        "$ref": "https://oaiy.com/schemas/relay/v1/common.schema.json#/$defs/grant"
+      },
+      "maxItems": 16,
+      "uniqueItems": true
+    },
+    "issuedAt": {
+      "$ref": "https://oaiy.com/schemas/relay/v1/common.schema.json#/$defs/unixTime"
+    },
+    "phoneThumbprint": {
+      "$ref": "https://oaiy.com/schemas/relay/v1/common.schema.json#/$defs/thumbprint"
+    },
+    "pid": {
+      "$ref": "https://oaiy.com/schemas/relay/v1/common.schema.json#/$defs/pid"
+    }
+  },
+  "required": [
+    "appId",
+    "grants",
+    "issuedAt",
+    "phoneThumbprint",
+    "pid"
+  ],
+  "additionalProperties": false
+}

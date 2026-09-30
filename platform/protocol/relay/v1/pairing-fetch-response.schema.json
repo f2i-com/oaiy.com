@@ -1,0 +1,104 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://oaiy.com/schemas/relay/v1/pairing-fetch-response.schema.json",
+  "title": "Rendezvous state",
+  "description": "200 response of GET /v1/pair/{pid}. An unknown or expired pid is one 404 with an identical body and timing.",
+  "type": "object",
+  "properties": {
+    "v": {
+      "const": 1
+    },
+    "state": {
+      "enum": [
+        "open",
+        "answered",
+        "approved",
+        "denied"
+      ]
+    },
+    "offer": {
+      "type": "string",
+      "maxLength": 4096
+    },
+    "mac": {
+      "$ref": "https://oaiy.com/schemas/relay/v1/common.schema.json#/$defs/key32"
+    },
+    "exp": {
+      "$ref": "https://oaiy.com/schemas/relay/v1/common.schema.json#/$defs/unixTime"
+    },
+    "deviceId": {
+      "$ref": "https://oaiy.com/schemas/relay/v1/common.schema.json#/$defs/deviceId"
+    },
+    "sealedToken": {
+      "$ref": "https://oaiy.com/schemas/relay/v1/common.schema.json#/$defs/b64u"
+    },
+    "receipt": {
+      "type": "object",
+      "properties": {
+        "issuedAt": {
+          "$ref": "https://oaiy.com/schemas/relay/v1/common.schema.json#/$defs/unixTime"
+        },
+        "signature": {
+          "$ref": "https://oaiy.com/schemas/relay/v1/common.schema.json#/$defs/signature"
+        }
+      },
+      "required": [
+        "issuedAt",
+        "signature"
+      ],
+      "additionalProperties": true
+    },
+    "time": {
+      "$ref": "https://oaiy.com/schemas/relay/v1/common.schema.json#/$defs/unixTime"
+    }
+  },
+  "required": [
+    "v",
+    "state",
+    "time"
+  ],
+  "additionalProperties": true,
+  "allOf": [
+    {
+      "if": {
+        "properties": {
+          "state": {
+            "enum": [
+              "open",
+              "answered"
+            ]
+          }
+        },
+        "required": [
+          "state"
+        ]
+      },
+      "then": {
+        "required": [
+          "offer",
+          "mac",
+          "exp"
+        ]
+      }
+    },
+    {
+      "if": {
+        "properties": {
+          "state": {
+            "const": "approved"
+          }
+        },
+        "required": [
+          "state"
+        ]
+      },
+      "then": {
+        "required": [
+          "deviceId",
+          "sealedToken",
+          "receipt"
+        ]
+      }
+    }
+  ]
+}

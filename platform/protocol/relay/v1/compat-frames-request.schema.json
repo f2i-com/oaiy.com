@@ -1,0 +1,26 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://oaiy.com/schemas/relay/v1/compat-frames-request.schema.json",
+  "title": "Aokie frames post",
+  "description": "POST /v1/aokie-companion/relay/frames: 1 to 64 frames; a mobile may address only plugin, the plugin only phones in its admission's roster.",
+  "type": "object",
+  "properties": {
+    "to": {
+      "type": "string",
+      "pattern": "^(plugin|mobile:[A-Za-z0-9_-]{43})$"
+    },
+    "frames": {
+      "type": "array",
+      "items": {
+        "type": "object"
+      },
+      "minItems": 1,
+      "maxItems": 64
+    }
+  },
+  "required": [
+    "to",
+    "frames"
+  ],
+  "additionalProperties": true
+}

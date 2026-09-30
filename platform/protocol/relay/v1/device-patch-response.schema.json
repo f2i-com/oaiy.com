@@ -1,0 +1,24 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://oaiy.com/schemas/relay/v1/device-patch-response.schema.json",
+  "title": "Device patch response",
+  "description": "200 response of POST /v1/devices/{id}.",
+  "type": "object",
+  "properties": {
+    "v": {
+      "const": 1
+    },
+    "device": {
+      "$ref": "https://oaiy.com/schemas/relay/v1/device.schema.json"
+    },
+    "time": {
+      "$ref": "https://oaiy.com/schemas/relay/v1/common.schema.json#/$defs/unixTime"
+    }
+  },
+  "required": [
+    "v",
+    "device",
+    "time"
+  ],
+  "additionalProperties": true
+}

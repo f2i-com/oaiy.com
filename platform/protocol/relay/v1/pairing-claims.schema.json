@@ -1,0 +1,57 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://oaiy.com/schemas/relay/v1/pairing-claims.schema.json",
+  "title": "Pairing response claims v3",
+  "description": "The claims a phone signs (canonical JSON, domain \"oaiy/pairing/3/response\"). Exactly these members. expiresAt is at most issuedAt + 120 (checked by code).",
+  "type": "object",
+  "properties": {
+    "appId": {
+      "$ref": "https://oaiy.com/schemas/relay/v1/common.schema.json#/$defs/appId"
+    },
+    "desktopConnectionId": {
+      "$ref": "https://oaiy.com/schemas/relay/v1/common.schema.json#/$defs/deviceId"
+    },
+    "desktopKeyThumbprint": {
+      "$ref": "https://oaiy.com/schemas/relay/v1/common.schema.json#/$defs/thumbprint"
+    },
+    "deviceId": {
+      "$ref": "https://oaiy.com/schemas/relay/v1/common.schema.json#/$defs/deviceId"
+    },
+    "displayName": {
+      "type": "string",
+      "maxLength": 60
+    },
+    "mobileEndpointKey": {
+      "$ref": "https://oaiy.com/schemas/relay/v1/common.schema.json#/$defs/endpointPublicKey"
+    },
+    "mobileX25519": {
+      "$ref": "https://oaiy.com/schemas/relay/v1/common.schema.json#/$defs/key32"
+    },
+    "pairingNonce": {
+      "$ref": "https://oaiy.com/schemas/relay/v1/common.schema.json#/$defs/key32"
+    },
+    "jti": {
+      "type": "string",
+      "pattern": "^pair-[A-Za-z0-9_-]{1,64}$"
+    },
+    "issuedAt": {
+      "$ref": "https://oaiy.com/schemas/relay/v1/common.schema.json#/$defs/unixTime"
+    },
+    "expiresAt": {
+      "$ref": "https://oaiy.com/schemas/relay/v1/common.schema.json#/$defs/unixTime"
+    }
+  },
+  "required": [
+    "appId",
+    "desktopConnectionId",
+    "desktopKeyThumbprint",
+    "deviceId",
+    "mobileEndpointKey",
+    "mobileX25519",
+    "pairingNonce",
+    "jti",
+    "issuedAt",
+    "expiresAt"
+  ],
+  "additionalProperties": false
+}

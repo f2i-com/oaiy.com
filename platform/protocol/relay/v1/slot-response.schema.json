@@ -1,0 +1,24 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://oaiy.com/schemas/relay/v1/slot-response.schema.json",
+  "title": "Slot publish response",
+  "description": "200 response of POST /v1/slots/{name}. `etag` is the strong validator used with If-Match for compare-and-set.",
+  "type": "object",
+  "properties": {
+    "etag": {
+      "$ref": "https://oaiy.com/schemas/relay/v1/common.schema.json#/$defs/etag"
+    },
+    "exp": {
+      "$ref": "https://oaiy.com/schemas/relay/v1/common.schema.json#/$defs/unixTime"
+    },
+    "time": {
+      "$ref": "https://oaiy.com/schemas/relay/v1/common.schema.json#/$defs/unixTime"
+    }
+  },
+  "required": [
+    "etag",
+    "exp",
+    "time"
+  ],
+  "additionalProperties": true
+}

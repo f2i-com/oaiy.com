@@ -1,0 +1,39 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://oaiy.com/schemas/relay/v1/pairing-create-request.schema.json",
+  "title": "Open a rendezvous",
+  "description": "POST /v1/pair (desktop token). The relay parses the offer text only to check that appId and desktopEndpointKey.thumbprint equal the two fields here.",
+  "type": "object",
+  "properties": {
+    "pid": {
+      "$ref": "https://oaiy.com/schemas/relay/v1/common.schema.json#/$defs/pid"
+    },
+    "offer": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 4096
+    },
+    "mac": {
+      "$ref": "https://oaiy.com/schemas/relay/v1/common.schema.json#/$defs/key32"
+    },
+    "ttl": {
+      "type": "integer",
+      "minimum": 1,
+      "maximum": 900
+    },
+    "appId": {
+      "$ref": "https://oaiy.com/schemas/relay/v1/common.schema.json#/$defs/appId"
+    },
+    "desktopThumbprint": {
+      "$ref": "https://oaiy.com/schemas/relay/v1/common.schema.json#/$defs/thumbprint"
+    }
+  },
+  "required": [
+    "pid",
+    "offer",
+    "mac",
+    "appId",
+    "desktopThumbprint"
+  ],
+  "additionalProperties": true
+}

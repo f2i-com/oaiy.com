@@ -1,0 +1,89 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://oaiy.com/schemas/relay/v1/pairing-decision.schema.json",
+  "title": "Pairing decision",
+  "description": "POST /v1/pair/{pid}/decision (desktop token). Approval carries the phone's keys, the grants and the desktop-signed receipt. The default grants exclude monitor, consult and takeover.",
+  "type": "object",
+  "properties": {
+    "approve": {
+      "type": "boolean"
+    },
+    "phone": {
+      "type": "object",
+      "properties": {
+        "ed25519": {
+          "$ref": "https://oaiy.com/schemas/relay/v1/common.schema.json#/$defs/key32"
+        },
+        "x25519": {
+          "$ref": "https://oaiy.com/schemas/relay/v1/common.schema.json#/$defs/key32"
+        },
+        "thumbprint": {
+          "$ref": "https://oaiy.com/schemas/relay/v1/common.schema.json#/$defs/thumbprint"
+        }
+      },
+      "required": [
+        "ed25519",
+        "x25519",
+        "thumbprint"
+      ],
+      "additionalProperties": true
+    },
+    "name": {
+      "$ref": "https://oaiy.com/schemas/relay/v1/common.schema.json#/$defs/name60"
+    },
+    "appId": {
+      "$ref": "https://oaiy.com/schemas/relay/v1/common.schema.json#/$defs/appId"
+    },
+    "grants": {
+      "type": "array",
+      "items": {
+        "$ref": "https://oaiy.com/schemas/relay/v1/common.schema.json#/$defs/grant"
+      },
+      "maxItems": 16,
+      "uniqueItems": true
+    },
+    "receipt": {
+      "type": "object",
+      "properties": {
+        "issuedAt": {
+          "$ref": "https://oaiy.com/schemas/relay/v1/common.schema.json#/$defs/unixTime"
+        },
+        "signature": {
+          "$ref": "https://oaiy.com/schemas/relay/v1/common.schema.json#/$defs/signature"
+        }
+      },
+      "required": [
+        "issuedAt",
+        "signature"
+      ],
+      "additionalProperties": true
+    }
+  },
+  "required": [
+    "approve"
+  ],
+  "additionalProperties": true,
+  "allOf": [
+    {
+      "if": {
+        "properties": {
+          "approve": {
+            "const": true
+          }
+        },
+        "required": [
+          "approve"
+        ]
+      },
+      "then": {
+        "required": [
+          "phone",
+          "name",
+          "appId",
+          "grants",
+          "receipt"
+        ]
+      }
+    }
+  ]
+}

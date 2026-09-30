@@ -1,0 +1,66 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://oaiy.com/schemas/relay/v1/command.schema.json",
+  "title": "Command document",
+  "description": "The signed bytes of a provider command (README section 4.12). Any valid JSON; these members are the contract. `dep` is reserved: a v1 signer never sets it and a v1 verifier refuses a document that carries it. exp - iat is at most 300 (checked by code). call.* commands carry payload.callId (checked by the desktop's allow-list step).",
+  "type": "object",
+  "properties": {
+    "v": {
+      "const": 1
+    },
+    "id": {
+      "$ref": "https://oaiy.com/schemas/relay/v1/common.schema.json#/$defs/itemId"
+    },
+    "dev": {
+      "$ref": "https://oaiy.com/schemas/relay/v1/common.schema.json#/$defs/deviceId"
+    },
+    "to": {
+      "type": "string",
+      "pattern": "^[A-Za-z0-9._-]{1,128}$"
+    },
+    "connector": {
+      "type": "string",
+      "pattern": "^[a-z][a-z0-9_-]{0,63}$"
+    },
+    "command": {
+      "type": "string",
+      "pattern": "^[a-z][a-z0-9_.-]{0,127}$"
+    },
+    "payload": {
+      "type": "object"
+    },
+    "idem": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 128
+    },
+    "iat": {
+      "$ref": "https://oaiy.com/schemas/relay/v1/common.schema.json#/$defs/unixTime"
+    },
+    "exp": {
+      "$ref": "https://oaiy.com/schemas/relay/v1/common.schema.json#/$defs/unixTime"
+    },
+    "src": {
+      "$ref": "https://oaiy.com/schemas/relay/v1/common.schema.json#/$defs/providerId"
+    },
+    "uid": {
+      "type": "string",
+      "maxLength": 64
+    },
+    "dep": false
+  },
+  "required": [
+    "v",
+    "id",
+    "dev",
+    "to",
+    "connector",
+    "command",
+    "payload",
+    "idem",
+    "iat",
+    "exp",
+    "src"
+  ],
+  "additionalProperties": true
+}
