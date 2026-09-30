@@ -41,6 +41,7 @@ pub mod container;
 pub mod create;
 pub mod desk;
 pub mod manifest;
+pub mod parts;
 pub mod restore;
 pub mod review;
 pub mod routes;

@@ -30,8 +30,9 @@ use zip::write::SimpleFileOptions;
 use zip::{CompressionMethod, ZipWriter};
 
 use super::container::{self, Archive};
+use super::parts::{short, NoteBook, Parts};
 use super::review::{clip, key_item, show_value, NotRestored, RestoreClass, ReviewItem, Ticks};
-use super::table::{filter_json, filter_json_exact, table, Class, KeyRow, Row, ValueType, Why};
+use super::table::{filter_json, filter_json_exact, table, Class, KeyRow, Left, Row, ValueType, Why};
 use super::{BackupError, Budget, ErrorKind, Limits, Result};
 use crate::secret_file;
 
@@ -379,7 +380,13 @@ fn planner_reasons() -> &'static [String] {
 /// (For the tests: how a campaign is described.)
 #[cfg(test)]
 pub fn describe_campaign_for_test(kept: &super::table::Filtered, rebuilt: &Rebuilt, was: Option<&str>) -> String {
-    describe_campaign(kept, rebuilt, was)
+    describe_campaign_item_for_test(kept, rebuilt, was).what
+}
+
+/// (For the tests: how a campaign is described, with its parts.)
+#[cfg(test)]
+pub fn describe_campaign_item_for_test(kept: &super::table::Filtered, rebuilt: &Rebuilt, was: Option<&str>) -> super::parts::ReviewItem {
+    describe_campaign(kept, rebuilt, was).item(RestoreClass::Outreach, "test", "test")
 }
 
 /// The most people of a campaign the dry run names one by one, with what a model reads of each (the rest are counted), and the most
@@ -394,11 +401,24 @@ const MAX_VALUE_TEXT: usize = 100;
 const MAX_ENTRIES_SAID: usize = 3;
 const MAX_ENTRY_TEXT: usize = 50;
 
-/// The most a campaign's description says. It is a bound that is never reached: what comes of the campaign, every key of the campaign itself
-/// (each value cut), eight questions, and ten people and ten set aside (each value of each cut) come to about twenty-two thousand characters
-/// when every key of every one is as long as it may be (a test builds that), and the description is not cut at the end, or anywhere,
-/// for how many questions or people there are.
-pub(crate) const MAX_CAMPAIGN_TEXT: usize = 24_000;
+/// The most characters of the front desk's brief that the dry run quotes (it says how long the brief is in all when it is cut).
+const BRIEF_QUOTE: usize = 700;
+
+/// The classes of the notes a restore says of the Agent's archive (each has a budget of its own: see [`NoteBook`]).
+const NOTE_SETTINGS: &str = "the Agent's settings";
+const NOTE_CAMPAIGNS: &str = "campaigns";
+const NOTE_DNC: &str = "numbers not to be contacted";
+const NOTE_KINDS: &str = "what was not brought back";
+const NOTE_WORDS: &str = "files with hidden text";
+
+/// The largest file of words (the brief, a knowledge file) that is read to see whether it hides text, and the reason it is not brought back
+/// when it does (see [`super::parts::text_problem`]). A file that is larger is not read for this.
+const MOST_WORDS_SCANNED: u64 = 1 << 20;
+
+/// Why a file of words that a model reads is not brought back, or `None`: the text in it is one that hides more than it shows.
+fn hidden_text_of(archive: &mut Archive, entry: &Entry) -> Result<Option<String>> {
+    Ok(read_small(archive, entry, MOST_WORDS_SCANNED)?.and_then(|bytes| super::parts::text_problem(&String::from_utf8_lossy(&bytes))))
+}
 
 /// What a rebuilt person holds that is not something a model reads or that is not said of them another way (their number is what
 /// names them): not listed as their words.
@@ -425,14 +445,7 @@ fn campaign_key(kept: &super::table::Kept) -> String {
 /// A value of a person as it is said: text is cut to `cut` characters, with how long it is in all.
 fn said(value: &Value, cut: usize) -> String {
     match value {
-        Value::String(text) => {
-            let length = text.chars().count();
-            if length > cut {
-                format!("\"{}\" ({length} characters in all)", clip(text, cut))
-            } else {
-                format!("\"{text}\"")
-            }
-        }
+        Value::String(text) => super::parts::quoted(text, cut),
         other => show_value(other),
     }
 }
@@ -466,86 +479,102 @@ fn person_words(person: &Value) -> String {
     parts.join("; ")
 }
 
-/// How a rebuilt campaign is described: by name, with how many people it would contact, and then EVERY key of it that acts, by
-/// its value (cut, with how long it is): what it says to them (the objective, the text, the opening line, the questions, the
-/// voicemail), what it does afterwards, who it speaks as, who started it, when it tries and how often. It is made from the key
-/// table, so a key added to the table is listed by construction. The people follow: for the first few, everything a model reads of
-/// them (their name, notes and details, and for one who was done how it ended, what they said and answered), and for the people
-/// skipped at planning their name and why; the rest are counted.
-fn describe_campaign(kept: &super::table::Filtered, rebuilt: &Rebuilt, was: Option<&str>) -> String {
+/// How a rebuilt campaign is described, as parts (see [`super::parts`]): what comes of it and what was left out of it first; then EVERY key
+/// of the campaign itself that acts, one part each, in the order of the table (what it says to them, how it tries, who it speaks as, who
+/// started it), each with a cut of its own; then, as samples, the first few questions, the first few people (everything a model reads of
+/// each) and the first few set aside at planning, each with a count of the rest. It is made from the key table, so a key added to the
+/// table is a part by construction.
+fn describe_campaign(kept: &super::table::Filtered, rebuilt: &Rebuilt, was: Option<&str>) -> Parts {
     let campaign = &rebuilt.campaign;
     let people = campaign.get("people").and_then(Value::as_array).map(Vec::as_slice).unwrap_or(&[]);
     let count = |state: &str| people.iter().filter(|p| p.get("state").and_then(Value::as_str) == Some(state)).count();
     let (queued, done) = (count("queued"), count("done"));
     let set_aside = count("skipped");
     let kind = if campaign.get("kind").and_then(Value::as_str) == Some("text") { "text messages" } else { "phone calls" };
-    let mut what = format!(
-        "{kind} to {} ({queued} not yet contacted, {done} finished, {set_aside} set aside).",
-        plural(people.len(), "person", "people")
-    );
-    // What comes of the campaign, before anything long: the description is cut at the end.
+    let mut what = format!("{kind} to {} ({queued} not yet contacted, {done} finished, {set_aside} set aside).", plural(people.len(), "person", "people"));
+    // What comes of the campaign, before anything else.
     match was {
         Some("running") => what.push_str(" It was RUNNING when the backup was made; it comes back PAUSED, and nothing is sent or called until you start it."),
         _ if campaign.get("state").and_then(Value::as_str) != Some("paused") => what.push_str(" It had finished, and comes back as it was: nothing more is sent or called."),
         _ => what.push_str(" It comes back PAUSED: nothing is sent or called until you start it."),
     }
+    let mut parts = Parts::new("campaign").fixed("comes-back", what);
+    let mut left = String::new();
     if rebuilt.bad_numbers > 0 {
-        what.push_str(&format!(" {} without a full phone number {} left out.", plural(rebuilt.bad_numbers, "person", "people"), if rebuilt.bad_numbers == 1 { "was" } else { "were" }));
+        left.push_str(&format!("{} without a full phone number {} left out.", plural(rebuilt.bad_numbers, "person", "people"), if rebuilt.bad_numbers == 1 { "was" } else { "were" }));
     }
     if rebuilt.other_reasons > 0 {
-        what.push(' ');
-        what.push_str(&other_reasons_said(rebuilt.other_reasons));
+        if !left.is_empty() {
+            left.push(' ');
+        }
+        left.push_str(&other_reasons_said(rebuilt.other_reasons));
     }
-    // Everything it says or does, by value: every key of the campaign itself that the table lets through, in the table's order (what it
-    // says to the people, then how it tries, then who it speaks as), and each with a cut of its own. These are the keys the table has, so
-    // there are no more of them than it has and none is left out for how many questions or people the campaign has (the questions and
-    // the people are collections, said below, as a sample).
-    let mut fixed: Vec<&super::table::Kept> = kept.kept.iter().filter(|k| k.row.class == Class::Runs && !is_collection_key(&k.path) && !CAMPAIGN_KEYS_NOT_LISTED.contains(&k.path.as_str())).collect();
-    fixed.sort_by_key(|k| table().key_table("agent.campaign").and_then(|kt| kt.keys.iter().position(|r| r.path == k.path)).unwrap_or(usize::MAX));
-    for k in fixed {
+    // Values the table refused (too long, of another kind, or text that hides more than it shows): said, with the first, so that what a
+    // person reads of the campaign is not taken for all of it.
+    let refused: Vec<&super::table::Left> = kept.left.iter().filter(|l| matches!(l.why, Why::BadValue(_)) && l.path != "skipped[].why").collect();
+    if let Some(Left { path, why: Why::BadValue(why), .. }) = refused.first().copied() {
+        if !left.is_empty() {
+            left.push(' ');
+        }
+        left.push_str(&format!("{} of its values {} not brought back, for they are not ones this version accepts (the first: {path}, {why}).", refused.len(), if refused.len() == 1 { "was" } else { "were" }));
+    }
+    if !left.is_empty() {
+        parts = parts.fixed("left-out", left);
+    }
+    let position = |path: &str| table().key_table("agent.campaign").and_then(|kt| kt.keys.iter().position(|r| r.path == path)).unwrap_or(usize::MAX);
+    // The campaign's own keys: there are no more of them than the table has, and none is left out for how many questions or people the
+    // campaign has (they are collections, said below as samples).
+    let mut own: Vec<&super::table::Kept> = kept.kept.iter().filter(|k| k.row.class == Class::Runs && !is_collection_key(&k.path) && !CAMPAIGN_KEYS_NOT_LISTED.contains(&k.path.as_str())).collect();
+    own.sort_by_key(|k| position(&k.path));
+    for k in own {
         if matches!(&k.value, Value::String(s) if s.is_empty()) || matches!(&k.value, Value::Array(a) if a.is_empty()) {
             continue;
         }
         let note = if k.path.starts_with("origin.") { " (it comes back started by the front desk)" } else { "" };
-        what.push_str(&format!(" {}, {}: {}{note}.", campaign_key(k), k.row.what.to_lowercase(), show_value(&k.value)));
+        parts = parts.fixed(&k.path, format!("{}, {}: {}{note}.", campaign_key(k), k.row.what.to_lowercase(), show_value(&k.value)));
     }
-    // The questions: every key of each of the first few (they are said to each person), and the rest counted. A campaign may ask fifty, of
-    // five keys each, and what follows must not depend on how many.
+    // The questions: every key of each of the first few (they are said to each person), and the rest counted.
     let asked = campaign.get("collect").and_then(Value::as_array).map_or(0, Vec::len);
     if asked > MAX_QUESTIONS_LISTED {
-        what.push_str(&format!(" The questions below are a sample: the first {MAX_QUESTIONS_LISTED} of {asked}."));
+        parts = parts.sample("questions", format!("The questions below are a sample: the first {MAX_QUESTIONS_LISTED} of {asked}."));
     }
-    for k in kept.kept.iter().filter(|k| k.row.class == Class::Runs && k.path.starts_with("collect[]") && k.at.first().is_some_and(|at| *at < MAX_QUESTIONS_LISTED)) {
-        if matches!(&k.value, Value::String(s) if s.is_empty()) || matches!(&k.value, Value::Array(a) if a.is_empty()) {
-            continue;
+    for question in 0..MAX_QUESTIONS_LISTED.min(asked) {
+        let mut keys: Vec<&super::table::Kept> = kept.kept.iter().filter(|k| k.row.class == Class::Runs && k.path.starts_with("collect[]") && k.at.first() == Some(&question)).collect();
+        keys.sort_by_key(|k| position(&k.path));
+        let said: Vec<String> = keys
+            .iter()
+            .filter(|k| !(matches!(&k.value, Value::String(s) if s.is_empty()) || matches!(&k.value, Value::Array(a) if a.is_empty())))
+            .map(|k| format!("{}, {}: {}.", campaign_key(k), k.row.what.to_lowercase(), said(&k.value, MAX_VALUE_TEXT)))
+            .collect();
+        if !said.is_empty() {
+            parts = parts.sample("question", said.join(" "));
         }
-        what.push_str(&format!(" {}, {}: {}.", campaign_key(k), k.row.what.to_lowercase(), said(&k.value, MAX_VALUE_TEXT)));
     }
     if asked > MAX_QUESTIONS_LISTED {
-        what.push_str(&format!(" {} more questions are not listed here; each is asked in the same way.", asked - MAX_QUESTIONS_LISTED));
+        parts = parts.sample("questions", format!("{} more questions are not listed here; each is asked in the same way.", asked - MAX_QUESTIONS_LISTED));
     }
     // The people: what a model reads of each of the first few, and the rest counted. Said plainly for a list that is longer: it is a sample.
     if people.len() > MAX_PEOPLE_LISTED {
-        what.push_str(&format!(" The people below are a sample: the first {MAX_PEOPLE_LISTED} of {}.", people.len()));
+        parts = parts.sample("people", format!("The people below are a sample: the first {MAX_PEOPLE_LISTED} of {}.", people.len()));
     }
     for (at, p) in people.iter().enumerate().take(MAX_PEOPLE_LISTED) {
-        what.push_str(&format!(" Person {} ({}): {}.", at + 1, p.get("number").and_then(Value::as_str).unwrap_or("?"), person_words(p)));
+        parts = parts.sample("person", format!("Person {} ({}): {}.", at + 1, p.get("number").and_then(Value::as_str).unwrap_or("?"), person_words(p)));
     }
     if people.len() > MAX_PEOPLE_LISTED {
-        what.push_str(&format!(" {} more people are not listed here; what a model reads of them (their names, notes, details and results) comes back with them, and is read in the same way.", people.len() - MAX_PEOPLE_LISTED));
+        parts = parts.sample("people", format!("{} more people are not listed here; what a model reads of them (their names, notes, details and results) comes back with them, and is read in the same way.", people.len() - MAX_PEOPLE_LISTED));
     }
     // The people skipped at planning: their names and why, which the report says to the Agent.
     let skipped = campaign.get("skipped").and_then(Value::as_array).map(Vec::as_slice).unwrap_or(&[]);
     if skipped.len() > MAX_PEOPLE_LISTED {
-        what.push_str(&format!(" The people skipped at planning below are a sample: the first {MAX_PEOPLE_LISTED} of {}.", skipped.len()));
+        parts = parts.sample("set-aside", format!("The people skipped at planning below are a sample: the first {MAX_PEOPLE_LISTED} of {}.", skipped.len()));
     }
     for (at, s) in skipped.iter().enumerate().take(MAX_PEOPLE_LISTED) {
-        what.push_str(&format!(" Skipped at planning {} ({}): {}.", at + 1, s.get("number").and_then(Value::as_str).unwrap_or("?"), person_words(s)));
+        parts = parts.sample("skipped", format!("Skipped at planning {} ({}): {}.", at + 1, s.get("number").and_then(Value::as_str).unwrap_or("?"), person_words(s)));
     }
     if skipped.len() > MAX_PEOPLE_LISTED {
-        what.push_str(&format!(" {} more people skipped at planning are not listed here (their reasons are one of the Agent's, or \"{REASON_OTHER}\").", skipped.len() - MAX_PEOPLE_LISTED));
+        parts = parts.sample("set-aside", format!("{} more people skipped at planning are not listed here (their reasons are one of the Agent's, or \"{REASON_OTHER}\").", skipped.len() - MAX_PEOPLE_LISTED));
     }
-    what
+    parts
 }
 
 /// The numbers not to be contacted, cleaned.
@@ -695,13 +724,14 @@ pub fn describe(path: &Path, listing: &Listing, limits: &Limits, budget: &Budget
             }
             "agent-desk-brief" => {
                 let quoted = read_small(&mut archive, entry, MAX_QUOTE_BYTES)?.map(|b| String::from_utf8_lossy(&b).into_owned());
-                let says = quoted.map(|t| format!(" Says: {}", show_value(&Value::String(t)))).unwrap_or_else(|| " (too large to quote)".to_string());
-                items.push(ReviewItem {
-                    class,
-                    name: shown,
-                    title: "The front desk's brief".to_string(),
-                    what: clip(&format!("{}. Every call, text and task reads it before each reply, and it wins over what the phone's agents would otherwise say.{says}", kb(entry.size)), 700),
-                });
+                let says = quoted.map(|t| format!("Says: \"{}\"", short(&t, BRIEF_QUOTE))).unwrap_or_else(|| "Says: (too large to quote)".to_string());
+                let mut parts = Parts::new("brief")
+                    .fixed("reads", format!("{}. Every call, text and task reads it before each reply, and it wins over what the phone's agents would otherwise say.", kb(entry.size)))
+                    .fixed("says", says);
+                if let Some(why) = hidden_text_of(&mut archive, entry)? {
+                    parts = parts.fixed("left-out", format!("Not brought back: {why}."));
+                }
+                items.push(parts.item(class, &shown, "The front desk's brief"));
             }
             "agent-desk-knowledge" => knowledge.push(entry),
             "agent-desk-files" => {
@@ -714,7 +744,7 @@ pub fn describe(path: &Path, listing: &Listing, limits: &Limits, budget: &Budget
             }
             "agent-desk-meta" => {}
             "agent-desk-chat" => {
-                items.push(ReviewItem { class, name: shown, title: "The front desk's own conversation".to_string(), what: format!("{}: loaded as what was said before.", kb(entry.size)) });
+                items.push(Parts::new("desk-chat").fixed("size", format!("{}: loaded as what was said before.", kb(entry.size))).item(class, &shown, "The front desk's own conversation"));
             }
             "agent-desk-callers" => {
                 let count = read_small(&mut archive, entry, limits.max_agent_read_bytes)?
@@ -724,12 +754,12 @@ pub fn describe(path: &Path, listing: &Listing, limits: &Limits, budget: &Budget
                     Some(n) => format!("{}: the facts and notes that the phone's agents read about a person before they answer them.", plural(n, "entry", "entries")),
                     None => format!("{} that OAIY could not read as a list, or that is too large to look at.", kb(entry.size)),
                 };
-                items.push(ReviewItem { class, name: shown, title: "What the phone's agents remember about people".to_string(), what });
+                items.push(Parts::new("desk-callers").fixed("entries", what).item(class, &shown, "What the phone's agents remember about people"));
             }
             "agent-outreach-campaign" => {
                 let bytes = read_small(&mut archive, entry, limits.max_agent_read_bytes)?;
                 let Some(bytes) = bytes else {
-                    items.push(ReviewItem { class, name: shown, title: clip(parts.last().copied().unwrap_or("campaign"), 120), what: super::review::TOO_LARGE.to_string() });
+                    items.push(super::review::too_large(class, &shown, parts.last().copied().unwrap_or("campaign")));
                     continue;
                 };
                 let outcome = serde_json::from_slice::<Value>(strip_bom(&bytes)).map_err(|_| "it is not valid JSON".to_string()).and_then(|v| {
@@ -739,13 +769,9 @@ pub fn describe(path: &Path, listing: &Listing, limits: &Limits, budget: &Budget
                     rebuild_campaign(&kept.value, was.as_deref()).map(|c| (kept, c, was))
                 });
                 match outcome {
-                    Ok((kept, rebuilt, was)) => items.push(ReviewItem {
-                        class,
-                        name: shown,
-                        title: clip(&format!("Campaign \"{}\"", rebuilt.campaign.get("name").and_then(Value::as_str).unwrap_or("?")), 120),
-                        what: clip(&describe_campaign(&kept, &rebuilt, was.as_deref()), MAX_CAMPAIGN_TEXT),
-                    }),
-                    Err(why) => items.push(ReviewItem { class, name: shown, title: clip(parts.last().copied().unwrap_or("campaign"), 120), what: format!("Could not be read ({why}): OAIY would not load it, so it is not brought back.") }),
+                    // (The title says how long the name is when it is cut: the Agent's report of a campaign says the name as it is.)
+                    Ok((kept, rebuilt, was)) => items.push(describe_campaign(&kept, &rebuilt, was.as_deref()).item(class, &shown, &format!("Campaign \"{}\"", rebuilt.campaign.get("name").and_then(Value::as_str).unwrap_or("?")))),
+                    Err(why) => items.push(super::review::unreadable_as(class, &shown, parts.last().copied().unwrap_or("campaign"), &why)),
                 }
             }
             "agent-outreach-index" => {}
@@ -753,7 +779,7 @@ pub fn describe(path: &Path, listing: &Listing, limits: &Limits, budget: &Budget
                 if let Some(bytes) = read_small(&mut archive, entry, limits.max_agent_read_bytes)? {
                     items.extend(describe_settings(&bytes, &mut not_restored));
                 } else {
-                    items.push(ReviewItem { class, name: shown, title: "The Agent's settings".to_string(), what: super::review::TOO_LARGE.to_string() });
+                    items.push(super::review::too_large(class, &shown, "The Agent's settings"));
                 }
             }
             _ => {}
@@ -780,51 +806,50 @@ pub fn describe(path: &Path, listing: &Listing, limits: &Limits, budget: &Budget
             what.push_str(&format!(", {}", plural(p.sessions, "phone conversation file", "phone conversation files")));
         }
         what.push_str(". The Agent reads a project's files and conversation as context when it is opened.");
-        items.push(ReviewItem { class: RestoreClass::AgentData, name: format!("agent/projects/{id}"), title: clip(&title, 120), what });
+        items.push(Parts::new("project").fixed("files", what).item(RestoreClass::AgentData, &format!("agent/projects/{id}"), &title));
     }
     if projects.len() > shown_projects {
         let (files, bytes) = projects.values().skip(shown_projects).fold((0usize, 0u64), |(f, b), p| (f + p.files, b + p.bytes));
-        items.push(ReviewItem {
-            class: RestoreClass::AgentData,
-            name: "agent/projects".to_string(),
-            title: "More projects".to_string(),
-            what: format!(
-                "{} more {}, with {} ({}).",
-                projects.len() - shown_projects,
-                if projects.len() - shown_projects == 1 { "project" } else { "projects" },
-                plural(files, "file", "files"),
-                kb(bytes)
-            ),
-        });
+        items.push(
+            Parts::new("more")
+                .fixed(
+                    "count",
+                    format!(
+                        "{} more {}, with {} ({}).",
+                        projects.len() - shown_projects,
+                        if projects.len() - shown_projects == 1 { "project" } else { "projects" },
+                        plural(files, "file", "files"),
+                        kb(bytes)
+                    ),
+                )
+                .item(RestoreClass::AgentData, "agent/projects", "More projects"),
+        );
     }
     // The knowledge files, each by name.
     for entry in knowledge.iter().take(MAX_NAMED) {
-        items.push(ReviewItem {
-            class: RestoreClass::AgentData,
-            name: display(&entry.name),
-            title: clip(entry.name.rsplit('/').next().unwrap_or(&entry.name), 120),
-            what: format!("{}. The phone's agents read it to answer callers.", kb(entry.size)),
-        });
+        let mut parts = Parts::new("knowledge").fixed("size", format!("{}. The phone's agents read it to answer callers.", kb(entry.size)));
+        if let Some(why) = hidden_text_of(&mut archive, entry)? {
+            parts = parts.fixed("left-out", format!("Not brought back: {why}."));
+        }
+        items.push(parts.item(RestoreClass::AgentData, &display(&entry.name), entry.name.rsplit('/').next().unwrap_or(&entry.name)));
     }
     if knowledge.len() > MAX_NAMED {
         let rest: u64 = knowledge[MAX_NAMED..].iter().map(|e| e.size).sum();
-        items.push(ReviewItem { class: RestoreClass::AgentData, name: "agent/front-desk/files/knowledge".to_string(), title: "More knowledge files".to_string(), what: format!("{} more ({}).", plural(knowledge.len() - MAX_NAMED, "file", "files"), kb(rest)) });
+        items.push(Parts::new("more").fixed("count", format!("{} more ({}).", plural(knowledge.len() - MAX_NAMED, "file", "files"), kb(rest))).item(RestoreClass::AgentData, "agent/front-desk/files/knowledge", "More knowledge files"));
     }
     if other_desk > 0 {
-        items.push(ReviewItem {
-            class: RestoreClass::AgentData,
-            name: "agent/front-desk/files".to_string(),
-            title: "Other files at the front desk".to_string(),
-            what: format!("{} ({}): outreach results and other files the Agent made.", plural(other_desk, "file", "files"), kb(other_desk_bytes)),
-        });
+        items.push(
+            Parts::new("desk-files")
+                .fixed("files", format!("{} ({}): outreach results and other files the Agent made.", plural(other_desk, "file", "files"), kb(other_desk_bytes)))
+                .item(RestoreClass::AgentData, "agent/front-desk/files", "Other files at the front desk"),
+        );
     }
     if desk_sessions > 0 {
-        items.push(ReviewItem {
-            class: RestoreClass::Conversations,
-            name: "agent/front-desk/sessions".to_string(),
-            title: "The phone's conversations".to_string(),
-            what: format!("{} ({}): each call and text thread, loaded as what was said before.", plural(desk_sessions, "file", "files"), kb(desk_session_bytes)),
-        });
+        items.push(
+            Parts::new("desk-sessions")
+                .fixed("files", format!("{} ({}): each call and text thread, loaded as what was said before.", plural(desk_sessions, "file", "files"), kb(desk_session_bytes)))
+                .item(RestoreClass::Conversations, "agent/front-desk/sessions", "The phone's conversations"),
+        );
     }
     if unknown > MAX_NAMED {
         not_restored.push(NotRestored { name: format!("and {} more", unknown - MAX_NAMED), why: "not restored: unknown item".to_string() });
@@ -843,12 +868,7 @@ pub fn describe_settings(bytes: &[u8], not_restored: &mut Vec<NotRestored>) -> V
     const FILE: &str = "agent/idb/settings.json";
     let Some(kt) = table().key_table("agent.settings") else { return Vec::new() };
     let Ok(value) = serde_json::from_slice::<Value>(strip_bom(bytes)) else {
-        return vec![ReviewItem {
-            class: RestoreClass::AgentSettings,
-            name: FILE.to_string(),
-            title: "The Agent's settings".to_string(),
-            what: "Could not be read (it is not valid JSON): OAIY would not load it, so it is not brought back.".to_string(),
-        }];
+        return vec![super::review::unreadable_as(RestoreClass::AgentSettings, FILE, "The Agent's settings", "it is not valid JSON")];
     };
     let found = filter_json(kt, &value, &|_| true);
     let mut items: Vec<ReviewItem> = Vec::new();
@@ -862,21 +882,21 @@ pub fn describe_settings(bytes: &[u8], not_restored: &mut Vec<NotRestored>) -> V
     for (_, keys) in providers {
         let get = |path: &str| keys.iter().find(|k| k.path == format!("providers[].{path}")).and_then(|k| k.value.as_str());
         let id = get("id").unwrap_or("(no id)");
-        let key = if get("apiKey").is_some_and(|k| !k.trim().is_empty()) { "; has an API key (brought back only with the keys box, and only where yours has none)" } else { "" };
-        items.push(ReviewItem {
-            class: RestoreClass::AgentSettings,
-            name: format!("{FILE}#providers"),
-            title: clip(&format!("{} ({id})", get("name").unwrap_or(id)), 120),
-            what: clip(
-                &format!(
-                    "Agent provider of type {} at {}{}{key}. If yours of the same id is at another address, this one arrives beside it, without a key.",
-                    get("type").unwrap_or("?"),
-                    get("baseUrl").unwrap_or("(default address)"),
-                    get("modelId").map(|m| format!(", model {m}")).unwrap_or_default()
-                ),
-                500,
-            ),
-        });
+        // What it is, which model, whether it has a key and what happens if yours is at another address come first, each cut on its own;
+        // the address, which can be as long as an address can be, is the last thing said and is cut on its own.
+        let mut parts = Parts::new("agent-provider").fixed("type", format!("Agent provider of type {}.", get("type").unwrap_or("?")));
+        if let Some(model) = get("modelId") {
+            parts = parts.fixed("model", format!("Model {model}."));
+        }
+        if get("apiKey").is_some_and(|k| !k.trim().is_empty()) {
+            parts = parts.fixed("key", "It has an API key (brought back only with the keys box, and only where yours has none).");
+        }
+        items.push(
+            parts
+                .fixed("beside", "If yours of the same id is at another address, this one arrives beside it, without a key.")
+                .sample("address", format!("Address: {}.", get("baseUrl").unwrap_or("(default address)")))
+                .item(RestoreClass::AgentSettings, &format!("{FILE}#providers"), &format!("{} ({id})", get("name").unwrap_or(id))),
+        );
     }
     for k in found.kept.iter().filter(|k| k.row.class == Class::Runs && !k.path.starts_with("providers[]") && !k.row.secret && !matches!(k.value, Value::Object(_))) {
         items.push(key_item(FILE, k));
@@ -937,6 +957,7 @@ pub fn filter(nested: &Path, out: &Path, scratch: &Path, ticks: &Ticks, mode: Mo
     let listing = read_listing(nested, limits)?;
     let mut archive = open(nested, limits)?;
     let mut prepared = Prepared::default();
+    let mut book = NoteBook::default();
     let mut plan: Vec<(String, String, Source)> = Vec::new();
     let mut left_out: BTreeMap<RestoreClass, usize> = BTreeMap::new();
     let mut unknown = 0usize;
@@ -979,14 +1000,21 @@ pub fn filter(nested: &Path, out: &Path, scratch: &Path, ticks: &Ticks, mode: Mo
                 continue;
             }
         }
+        // Words a model reads that hide more than they show are not brought back (an undo puts back the person's own, whatever it holds).
+        if mode == Mode::Restore && matches!(row.id.as_str(), "agent-desk-brief" | "agent-desk-knowledge") {
+            if let Some(why) = hidden_text_of(&mut archive, entry)? {
+                book.push(NOTE_WORDS, format!("{} was not brought back: {why}.", clip(&display(&entry.name), 120)));
+                continue;
+            }
+        }
         match (row.keys.as_deref(), row.merge.as_deref()) {
             (Some("agent.settings"), _) => {
                 let Some(bytes) = read_small(&mut archive, entry, limits.max_agent_read_bytes)? else {
-                    prepared.notes.push("The Agent's settings were not brought back: the file is too large to be read.".to_string());
+                    book.push(NOTE_SETTINGS, "The Agent's settings were not brought back: the file is too large to be read.".to_string());
                     continue;
                 };
                 let Ok(value) = serde_json::from_slice::<Value>(strip_bom(&bytes)) else {
-                    prepared.notes.push("The Agent's settings were not brought back: the file is not valid JSON.".to_string());
+                    book.push(NOTE_SETTINGS, "The Agent's settings were not brought back: the file is not valid JSON.".to_string());
                     continue;
                 };
                 let Some(kt) = table().key_table("agent.settings") else { continue };
@@ -997,7 +1025,7 @@ pub fn filter(nested: &Path, out: &Path, scratch: &Path, ticks: &Ticks, mode: Mo
                 let keys_without_address = found.left.iter().filter(|l| l.why == Why::KeyWithoutAddress).count();
                 if keys_without_address > 0 {
                     let one = keys_without_address == 1;
-                    prepared.notes.push(format!(
+                    book.push(NOTE_SETTINGS, format!(
                         "{} of the Agent's {} left out: {} come back (a name and password or a key in it, or it is not a web address), and a key goes only with the address it was kept for. Enter {} again as the key of {}.",
                         plural(keys_without_address, "API key", "API keys"),
                         if one { "was" } else { "were" },
@@ -1009,12 +1037,12 @@ pub fn filter(nested: &Path, out: &Path, scratch: &Path, ticks: &Ticks, mode: Mo
                 let left = found.left.len() + found.left_more - keys_without_address;
                 if found.kept.is_empty() {
                     if left > 0 {
-                        prepared.notes.push(format!("Nothing in the Agent's settings comes back without its tick ({left} setting{} left out).", if left == 1 { "" } else { "s" }));
+                        book.push(NOTE_SETTINGS, format!("Nothing in the Agent's settings comes back without its tick ({left} setting{} left out).", if left == 1 { "" } else { "s" }));
                     }
                     continue;
                 }
                 if left > 0 {
-                    prepared.notes.push(format!("{left} setting{} of the Agent's not brought back (addresses that were read from a service, a project that was open on another computer, and anything not in the table are never restored; the rest need their tick).", if left == 1 { " was" } else { "s were" }));
+                    book.push(NOTE_SETTINGS, format!("{left} setting{} of the Agent's not brought back (addresses that were read from a service, a project that was open on another computer, and anything not in the table are never restored; the rest need their tick).", if left == 1 { " was" } else { "s were" }));
                 }
                 let bytes = serde_json::to_vec(&found.value).map_err(|_| BackupError::new(ErrorKind::Damaged, "The Agent's settings could not be written."))?;
                 plan.push((entry.name.clone(), "settings".to_string(), Source::Temp(temp_file(&bytes)?)));
@@ -1022,7 +1050,7 @@ pub fn filter(nested: &Path, out: &Path, scratch: &Path, ticks: &Ticks, mode: Mo
             }
             (_, Some("campaign")) => {
                 let Some(bytes) = read_small(&mut archive, entry, limits.max_agent_read_bytes)? else {
-                    prepared.notes.push(format!("{} was not brought back: it is too large to be read.", clip(&display(&entry.name), 120)));
+                    book.push(NOTE_CAMPAIGNS, format!("{} was not brought back: it is too large to be read.", clip(&display(&entry.name), 120)));
                     continue;
                 };
                 let rebuilt = serde_json::from_slice::<Value>(strip_bom(&bytes)).map_err(|_| "it is not valid JSON".to_string()).and_then(|v| {
@@ -1034,23 +1062,23 @@ pub fn filter(nested: &Path, out: &Path, scratch: &Path, ticks: &Ticks, mode: Mo
                         let id = campaign.get("id").and_then(Value::as_str).unwrap_or_default().to_string();
                         // The file is named for its campaign: a campaign cannot be written over another's file.
                         if entry.name != format!("opfs/front-desk/outreach/{id}.json") {
-                            prepared.notes.push(format!("{} was not brought back: its name is not its campaign's.", clip(&display(&entry.name), 120)));
+                            book.push(NOTE_CAMPAIGNS, format!("{} was not brought back: its name is not its campaign's.", clip(&display(&entry.name), 120)));
                             continue;
                         }
                         if bad_numbers > 0 {
-                            prepared.notes.push(format!("{}: {} without a full phone number {} left out.", clip(&display(&entry.name), 120), plural(bad_numbers, "person", "people"), if bad_numbers == 1 { "was" } else { "were" }));
+                            book.push(NOTE_CAMPAIGNS, format!("{}: {} without a full phone number {} left out.", clip(&display(&entry.name), 120), plural(bad_numbers, "person", "people"), if bad_numbers == 1 { "was" } else { "were" }));
                         }
                         if other_reasons > 0 {
-                            prepared.notes.push(format!("{}: {}", clip(&display(&entry.name), 120), other_reasons_said(other_reasons)));
+                            book.push(NOTE_CAMPAIGNS, format!("{}: {}", clip(&display(&entry.name), 120), other_reasons_said(other_reasons)));
                         }
                         if let Some((project, _)) = &started_by {
-                            prepared.notes.push(format!("{}: it said it was started by the project \"{}\"; it comes back started by the front desk.", clip(&display(&entry.name), 120), clip(project, 60)));
+                            book.push(NOTE_CAMPAIGNS, format!("{}: it said it was started by the project \"{}\"; it comes back started by the front desk.", clip(&display(&entry.name), 120), clip(project, 60)));
                         }
                         campaigns.push(id);
                         let bytes = serde_json::to_vec(&campaign).map_err(|_| BackupError::new(ErrorKind::Damaged, "A campaign could not be written."))?;
                         plan.push((entry.name.clone(), "campaign".to_string(), Source::Temp(temp_file(&bytes)?)));
                     }
-                    Err(why) => prepared.notes.push(format!("{} was not brought back: {why}.", clip(&display(&entry.name), 120))),
+                    Err(why) => book.push(NOTE_CAMPAIGNS, format!("{} was not brought back: {why}.", clip(&display(&entry.name), 120))),
                 }
             }
             (_, Some("campaign-index")) => {
@@ -1058,18 +1086,18 @@ pub fn filter(nested: &Path, out: &Path, scratch: &Path, ticks: &Ticks, mode: Mo
             }
             (_, Some("union")) => {
                 let Some(bytes) = read_small(&mut archive, entry, limits.max_agent_read_bytes)? else {
-                    prepared.notes.push("The list of numbers not to be contacted was not brought back: it is too large to be read.".to_string());
+                    book.push(NOTE_DNC, "The list of numbers not to be contacted was not brought back: it is too large to be read.".to_string());
                     continue;
                 };
                 let Some(list) = serde_json::from_slice::<Value>(strip_bom(&bytes)).ok().as_ref().and_then(clean_do_not_contact) else {
-                    prepared.notes.push("The list of numbers not to be contacted was not brought back: it is not a list of numbers.".to_string());
+                    book.push(NOTE_DNC, "The list of numbers not to be contacted was not brought back: it is not a list of numbers.".to_string());
                     continue;
                 };
                 if list.repeated > 0 {
-                    prepared.notes.push(format!("{} in the list of numbers not to be contacted repeated a number and {} counted once.", plural(list.repeated, "entry", "entries"), if list.repeated == 1 { "was" } else { "were" }));
+                    book.push(NOTE_DNC, format!("{} in the list of numbers not to be contacted repeated a number and {} counted once.", plural(list.repeated, "entry", "entries"), if list.repeated == 1 { "was" } else { "were" }));
                 }
                 if list.over > 0 {
-                    prepared.notes.push(format!("{} more of the numbers not to be contacted were left out: at most {MAX_DO_NOT_CONTACT} come back in one restore.", list.over));
+                    book.push(NOTE_DNC, format!("{} more of the numbers not to be contacted were left out: at most {MAX_DO_NOT_CONTACT} come back in one restore.", list.over));
                 }
                 if list.entries.is_empty() {
                     continue;
@@ -1087,14 +1115,14 @@ pub fn filter(nested: &Path, out: &Path, scratch: &Path, ticks: &Ticks, mode: Mo
     }
 
     for (class, n) in &left_out {
-        prepared.notes.push(format!("Not brought back (not ticked): the Agent's {} ({}).", class.label().to_lowercase(), plural(*n, "file", "files")));
+        book.push(NOTE_KINDS, format!("Not brought back (not ticked): the Agent's {} ({}).", class.label().to_lowercase(), plural(*n, "file", "files")));
     }
     if unknown > 0 {
-        prepared.notes.push(format!("Not restored: {} in the Agent's storage that this version of OAIY does not know (unknown items are never restored).", plural(unknown, "item", "items")));
+        book.push(NOTE_KINDS, format!("Not restored: {} in the Agent's storage that this version of OAIY does not know (unknown items are never restored).", plural(unknown, "item", "items")));
     }
     for (id, n) in &excluded {
         let reason = table().agent.iter().find(|r| r.id == *id).map(|r| r.reason.clone()).unwrap_or_default();
-        prepared.notes.push(clip(&format!("Not restored ({}): {reason}", plural(*n, "file", "files")), 400));
+        book.push(NOTE_KINDS, clip(&format!("Not restored ({}): {reason}", plural(*n, "file", "files")), 400));
     }
 
     // Written: the record first, then each item.
@@ -1145,5 +1173,6 @@ pub fn filter(nested: &Path, out: &Path, scratch: &Path, ticks: &Ticks, mode: Mo
     let buffered = writer.finish().map_err(zip_err)?;
     let file = buffered.into_inner().map_err(|e| BackupError::io("Could not stage the Agent's storage", &e.into_error()))?;
     file.sync_all().map_err(|e| BackupError::io("Could not stage the Agent's storage", &e))?;
+    prepared.notes = book.finish();
     Ok(prepared)
 }

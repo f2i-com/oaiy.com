@@ -634,11 +634,124 @@ More rules that a tick does not change:
   by the permissions it asks for, not only the address that is prefilled.
 - A backup with more items to look through than a person can (2,000) is refused.
 - Names and text a backup carries are cut to what a panel shows before they are displayed or
-  recorded.
+  recorded, each on its own and with how long it was, and are shown with the characters a person
+  cannot see made visible (see "What the dry run says of each thing, and where it cuts").
 
 **Nothing that is not in the backup is deleted**: a restore only adds and replaces. It never
 touches what a backup leaves out: a restore onto a computer that is linked to FormLogic keeps
 that link, its provider keys (unless you tick the keys) and its models.
+
+### What the dry run says of each thing, and where it cuts
+
+The dry run is where you decide, so what it says of a thing must not depend on how much else it
+says. It is built so that a long address, a padded name or a thousand entries cannot push out what
+a thing does:
+
+- **What it says of one thing is a set of labelled parts, each with a budget of its own.** The
+  **fixed parts** come first, in a fixed order, and are what the thing acts by: what it does, where
+  it sends, what it may reach, the model, whether it has a key, the permissions and scopes, and the
+  hosts it signs in to, sends events and heartbeats to, and asks after it starts. The **sample
+  parts** come after them: free text and collections, as a sample and a count. **A part is cut on
+  its own** and says so ("... (cut, 5000 characters in all)"): there is no cut of a whole item, so
+  what one part holds cannot push another out. An address, which can be as long as its author
+  likes, is said last in its item with a cut of its own, after what the thing does with it.
+- **The parts of every kind are one table in the code** (`backup/parts.rs`), and the table below is
+  made from it. A description can say only a part of its kind and only in the kind's order (it
+  panics otherwise), a thing of the dry run can be made only from parts (a test reads the source for
+  one made any other way), and **one test builds every kind with every field padded** (fifty
+  questions, five thousand entries, values of five thousand characters, addresses of four and six
+  hundred characters) and looks for every fixed part of it in what the dry run says. A kind that is
+  added to the table without a fixture fails that test.
+- **A kind whose items are each long is described in full up to a number** (campaigns 50, connectors
+  100, templates 400): the rest are named, with how many there are, so that a backup of three
+  hundred campaigns as long as one can be does not make a preview of many megabytes.
+- **The characters you cannot see are made visible**, wherever the dry run prints a value: a run of
+  them is said as what it is and how many there are (`[25 invisible characters: U+E0041 ...]`),
+  by the desktop before the text is counted and cut, and again by the dashboard on every text of a
+  dry run whoever sent it. And a value a model could read is **not brought back, and said not to be,
+  when it hides text**: it holds a control character (a line break and a tab are not), a
+  text-direction override, embedding or isolate, a tag character that is not the end of a flag,
+  more than three invisible characters that nothing explains, a run of six or more joiners,
+  selectors or direction marks, or is mostly invisible (more than eight, and more than half).
+  Nothing is stripped: a value that holds hidden text is left out whole. A flag, a joined emoji, a
+  right-to-left mark and Persian text pass (tests of both kinds). The dry run reads the brief and
+  the knowledge files (up to 1 MiB each) and every value of the table for this; the conversations,
+  projects and sessions it lists by name and size are not read, and are not restored without their
+  own tick.
+- **What a restore says of what it left out or changed is kept by class**: at most eight notes of
+  one class (a campaign for each, a file for each), then one that says how many more there were,
+  so no class of note crowds out another.
+
+<!-- BEGIN GENERATED: dry-run-places (from parts.rs: do not edit by hand) -->
+
+| Place | Fixed parts, said first and in this order (budget) | Sample parts, said after them (budget) | Described in full |
+|---|---|---|---|
+| a service that starts with OAIY (services-autostart.json) (`autostart`) | `starts` (300) | - | all (each is small) |
+| a trigger (triggers.json) (`trigger`) | `mode` (80), `state` (80), `runs` (240), `when` (240) | `condition` (200) | all (each is small) |
+| the run history (bridge/ledger.jsonl) (`ledger`) | `records` (300) | - | all (each is small) |
+| a provider of the gateway (ai/providers.json) (`provider-list`) | `protocol` (80), `key` (160), `local` (120) | `address` (190) | all (each is small) |
+| the Agent's switch (control.json) (`control`) | `switch` (160) | - | all (each is small) |
+| the setup record (setup.json) (`setup`) | `accepted` (160) | `names` (500) | all (each is small) |
+| the Agent's model (agent.json) (`agent-model`) | `model` (240) | - | all (each is small) |
+| a service template (templates/) (`template`) | `autostart` (80), `replaces` (80), `runs` (360), `install` (220), `writes` (280), `deletes` (240), `env` (240), `cwd` (160), `marker` (160), `health` (160), `docs` (160) | - | 400, the rest named and counted |
+| a flow (flows/) (`flow`) | `steps` (80), `tool` (200), `tool-description` (400), `tool-inputs` (300), `hook` (240) | `kinds` (360) | all (each is small) |
+| a connector descriptor (connectors/) (`connector`) | `replaces` (100), `prefilled` (260), `scopes` (320), `auth` (520), `health` (260), `heartbeat` (260), `relay` (420), `desktopFlows` (420), `desktopAi` (520), `flows` (520), `appLogic` (420), `dataNode` (320), `scriptProfile` (260), `docs` (260) | `summary` (240), `other-places` (500) | 100, the rest named and counted |
+| what is remembered about callers (callers.json) (`callers`) | `entries` (320) | - | all (each is small) |
+| a key that acts in a settings file (the calendar's, a plugin's, the Agent's) (`setting`) | `sets` (480) | `why` (320) | all (each is small) |
+| a service of the calendar (`calendar-service`) | `about` (200), then each of the 5 keys of the table `calendar` that acts under `settings.services[].` (320 each) | - | all (each is small) |
+| an appointment of the calendar (`calendar-appointment`) | `about` (300), then each of the 11 keys of the table `calendar` that acts under `appointments[].` (320 each) | - | all (each is small) |
+| a voice clip (voices/) (`voice`) | `file` (200) | - | all (each is small) |
+| a file that could not be read (`unreadable`) | `problem` (320) | - | all (each is small) |
+| a settings file that holds nothing OAIY restores (`nothing`) | `nothing` (240) | - | all (each is small) |
+| the things of a kind that are only counted (`more`) | `count` (400) | - | all (each is small) |
+| a project of the Agent (`project`) | `files` (320) | - | all (each is small) |
+| the front desk's brief (`brief`) | `reads` (260), `says` (800), `left-out` (300) | - | all (each is small) |
+| a knowledge file of the front desk (`knowledge`) | `size` (240), `left-out` (300) | - | all (each is small) |
+| the other files of the front desk (`desk-files`) | `files` (240) | - | all (each is small) |
+| the phone's conversations (`desk-sessions`) | `files` (240) | - | all (each is small) |
+| the front desk's own conversation (`desk-chat`) | `size` (160) | - | all (each is small) |
+| what the phone's agents remember about people (`desk-callers`) | `entries` (320) | - | all (each is small) |
+| an outreach campaign (`campaign`) | `comes-back` (480), `left-out` (320), then each of the 17 keys of the table `agent.campaign` that acts (400 each) | `questions` (240), `question` (900), `people` (240), `person` (2000), `set-aside` (240), `skipped` (500) | 50, the rest named and counted |
+| a provider of the Agent (`agent-provider`) | `type` (80), `model` (260), `key` (200), `beside` (200) | `address` (190) | all (each is small) |
+
+<!-- END GENERATED: dry-run-places -->
+
+#### Where else the backup cuts
+
+Every cap of the backup module is a named constant, and every cut written as a number in the code
+is listed here (a test reads the source, and fails for a cap or a cut that has no row). A row says
+what is cut and why it cannot hide something that acts: what is refused whole is never shown in
+part, what is counted says how many, and what is inside one part is cut inside that part alone.
+
+| Place | What is cut or capped | Why it hides nothing that acts |
+|---|---|---|
+| `parts::cut` (with `short` and `review::clip`) | Every part and every value of the dry run, to a number of characters, after the invisible ones are made visible | It is the one function that cuts; it says how long the text was; a part is cut alone |
+| `KINDS` (the table above) | The budget of each part of each kind | Fixed parts first, each cut alone; the test that builds every kind with everything padded |
+| `MAX_REVIEW_ITEMS` (2,000) | Things of the dry run | Over it the backup is refused whole and is not shown in part |
+| `MAX_REVIEW_BYTES` (2 MiB), `MAX_REVIEW_TOTAL` (128 MiB), `MAX_JSON_BYTES` (16 MiB) | What is read of one file, of all of them, and of one JSON file | A file over it is said to be too large to look at and is not restored; a backup over the total is refused whole |
+| `MOST_WORDS_SCANNED` (1 MiB), `MAX_QUOTE_BYTES` (64 KiB), `BRIEF_QUOTE` (700) | The brief and knowledge files scanned for hidden text; the brief read to be quoted; the quote | A file over the first is not restored; over the second is said "too large to quote" (the size is said); the quote is inside the part `says`, which comes after `reads` |
+| `MAX_NAMED` (300) | Projects, knowledge files and unknown items named | The rest are counted in a thing of their own (kind `more`), and "and N more" |
+| `MAX_NOT_RESTORED` (300), `MOST_EXCLUDED_NAMED` (300), `MOST_LINES_NAMED` (50) | The names of what is not restored, the patterns the backup left out, and the lines of what was left out and what to do again | Each says how many more there were in a last line |
+| `MOST_KEYS_OF_ONE_OBJECT` (30), `MAX_OTHER_PLACES` (12), `MAX_HOSTS_SAMPLED` (4) | A connector's collections of addresses, its unknown places, and the hosts said for a place | The keys that act (scopes, sign-in, events, heartbeat, health, relay, flows) are parts of their own, said before these; the rest are counted, with a sample of hosts |
+| `MAX_ACCEPTED_NAMED` (10), `MAX_INPUTS_NAMED` (8), `MAX_CALENDAR_LISTED` (40) | The plugins the setup record marks accepted, the inputs a flow asks its model for, the services and appointments of the calendar | Each is a sample after a count, in a part of its own |
+| `MAX_QUESTIONS_LISTED` (8), `MAX_PEOPLE_LISTED` (10), `MAX_VALUE_TEXT` (100), `MAX_ENTRIES_SAID` (3), `MAX_ENTRY_TEXT` (50) | A campaign's questions and people, and the text of a value or of an entry of one | The campaign's own keys are fixed parts said first; a question or a person is a part of its own and a value is cut inside it, with how long it is |
+| `MOST_NOTES_PER_CLASS` (8), `MOST_NOTES` (150) | The notes of a restore, by class, and all of them | A class says how many more of it there were; the total is above what the classes make, and says how many more if it is ever reached |
+| `MAX_DO_NOT_CONTACT` (50,000) | The numbers not to be contacted that come back | The first come back; the dry run, the staging and the result say how many do not |
+| `MAX_APPOINTMENTS` (10,000) | The appointments of the calendar after a restore | Those over are not added, and the result says how many |
+| `MAX_ADDED` (20,000), `MAX_ADDED_NAME` (1,024) | The names a restore adds to the Agent's storage, kept for the undo | Not shown; a name that is not plain, or over the count, is not one the undo takes away |
+| `MAX_EXPORT_BYTES`, `IMPORT_MAX`, `MAX_HEADER_BYTES`, `ENTRY_RECORD_MAX` | The size of the Agent's storage, of a header and of an archive's record | Over is refused; nothing is shown in part |
+| `MAX_LEFT` (500), `MAX_DEPTH` (8), `MAX_NODES` (200,000), `MAX_KEY_CHARS` (128) | The walk of a JSON file against its key table: the values named as left out, how deep, how many, how long a key | The values left out are counted (`left_more`); a value too deep, too many or with a key too long is left out (default-deny) and is never brought back |
+| `.take(6)` of a template's files (literal cut) | The script files a template writes, named | The part `writes` says how many there are before it names six |
+| `.take(3)` of a template's paths (literal cut) | The paths a template deletes | The part `deletes` says how many there are before it names three |
+| `.take(6)` of a template's variables (literal cut) | The environment variables a template sets | The part `env` says how many there are before it names six |
+| `.take(8)` of a flow's kinds (literal cut) | The kinds of a flow's steps | A sample part after every fixed part, with "and N more" |
+| `.take(5)` of a list-valued setting (literal cut) | The entries of the network gate's lists | The entries of a list are one kind of value; it says its first five and "and N more" |
+| `.take(6)` of a run of invisible characters (literal cut) | The characters of a run that are named | It says how many there are, and names the first six |
+| `.take(50)` of the keys a backup leaves out (literal cut) | The keys of one file named as left out when it is made | A last record says how many more there were |
+| `.take(10)` of the files that could not be put back (literal cut) | The files a rollback names | It says "and N more" |
+| `.take(64)` of a campaign's id (literal cut) | The id a rebuilt campaign is given when the backup's is not plain | A restore-time value, not shown as a description: the campaign is listed by its own name |
+| `.take(300)` of a reason to not contact (literal cut) | The reason kept beside a number not to be contacted | A restore-time value that a model never reads |
+| `.take(24)` of what a key is (literal cut) | The comparison of a reason with the words of a key | A comparison in the generator of the documents, not text a person reads |
 
 ### After a restore
 
@@ -712,18 +825,19 @@ in parts through internal routes with a secret made for that one backup.
   the restore is applied (a copy that was swapped stops the restore, and nothing is changed), again
   when it is handed to the page (the result says that it was not), and where the page first asks
   for it (a hand-over that changed on the disk is dropped, and the result says so).
-- **The dry run never cuts what a thing itself says by position.** Each thing it lists has its own
-  keys and, beside them, collections: a campaign's questions, people and people set aside; a flow's
-  steps; a connector's addresses; a template's files, paths and variables; the setup record's
-  plugins; the calendar's services and appointments; the Agent's providers and the entries of a
-  list-valued setting. **The thing's own keys are said first, each with a cut of its own, and a
-  collection is said as a sample with its count** ("the first 8 of 50 questions"; a flow says what it
-  does to the Agent before the kinds of its steps; a connector says every host its addresses go to,
-  the ones its own keys hold first, then by place; the setup record says how many plugins it marks as
-  accepted and names ten). A list-valued setting (the network gate's two lists) says its first five
-  entries and how many more. A test builds each of these with fifty questions or five thousand entries
-  of the padding kind and looks for every fixed key in the text of the dry run. **A backup that holds
-  more than 2,000 things to look at is refused, and is not shown in part.**
+- **The dry run says a thing by its parts, and cuts none of them for another.** Each thing it lists
+  has its own keys and, beside them, collections: a campaign's questions, people and people set
+  aside; a flow's steps; a connector's addresses; a template's files, paths and variables; the
+  setup record's plugins; the calendar's services and appointments; the Agent's providers and the
+  entries of a list-valued setting. **What the thing does is said first, in a fixed order, each part
+  with a budget of its own, and a collection is said after it as a sample with its count** ("the
+  first 8 of 50 questions"; a flow says the tool description its model reads and what it does to the
+  Agent before the kinds of its steps; a connector says its scopes and its sign-in, event,
+  heartbeat and health hosts each by its own key before any other address; an address is said last,
+  cut on its own). The parts of every kind, and how much of each is said, are in the table of
+  "What the dry run says of each thing, and where it cuts", which is made from the code, and a test
+  builds each kind with everything padded and looks for every fixed part in what the dry run says.
+  **A backup that holds more than 2,000 things to look at is refused, and is not shown in part.**
 - **Nothing ticked** brings back only the numbers not to be called or texted again (which are
   *added* to yours: none of yours is ever taken away, on a restore or an undo). At most **50,000**
   numbers come back in one restore, each once (the same digits written another way are one

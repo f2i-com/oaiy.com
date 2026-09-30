@@ -790,12 +790,12 @@ const MAX_KEY_CHARS: usize = 128;
 
 /// Text a person could have typed: no control characters but line breaks and tabs.
 fn plain_text(text: &str) -> bool {
-    !text.chars().any(|c| c.is_control() && !matches!(c, '\n' | '\r' | '\t'))
+    super::parts::text_problem(text).is_none()
 }
 
 fn plain_url(text: &str, max_chars: usize) -> bool {
     let lower = text.get(..8).unwrap_or(text).to_ascii_lowercase();
-    text.chars().count() <= max_chars && !text.chars().any(|c| c.is_control() || c.is_whitespace()) && (lower.starts_with("http://") || lower.starts_with("https://")) && text.len() > 8 && holds_no_credential(text)
+    text.chars().count() <= max_chars && !text.chars().any(|c| c.is_control() || c.is_whitespace() || super::parts::is_invisible(c)) && (lower.starts_with("http://") || lower.starts_with("https://")) && text.len() > 8 && holds_no_credential(text)
 }
 
 /// The only parameters an address may carry in its query: the version of an API (an Azure address names one). Any other could be a key
@@ -871,8 +871,8 @@ fn check_value(ty: &ValueType, value: &Value, is_a_key: bool, exact: bool) -> Re
         (ValueType::Str { max_chars }, Value::String(s)) => {
             if s.chars().count() > *max_chars {
                 Err(format!("longer than {max_chars} characters"))
-            } else if !plain_text(s) {
-                Err("it has control characters".to_string())
+            } else if let Some(why) = super::parts::text_problem(s) {
+                Err(why)
             } else if looks_secret(s) && !is_a_key {
                 Err("it looks like a key or a sealed value".to_string())
             } else {

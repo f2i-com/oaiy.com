@@ -29,6 +29,7 @@ use std::path::{Path, PathBuf};
 use serde::{Deserialize, Serialize};
 
 use super::manifest::{Entry, Manifest};
+use super::parts::NoteBook;
 use super::review::{self, ClassInfo, Local, RestoreClass, ReviewItem, Ticks};
 use super::rules::{self, Category, Excluded};
 use super::{agent, agentzip, container, free_space, restore_dir, Budget, scratch_dir, sha256_file, BackupError, ErrorKind, Limits, Result, TempFolder, AGENT_ENTRY};
@@ -494,9 +495,29 @@ const MAX_REVIEW_TOTAL: u64 = 128 << 20;
 /// The most items the dry run names as not restored (the rest are counted).
 const MAX_NOT_RESTORED: usize = 300;
 
-/// Cut a hostile string to what a panel can show, and a list to a length.
+/// The most excluded patterns of a backup's record that the dry run names (the rest are counted).
+const MOST_EXCLUDED_NAMED: usize = 300;
+
+/// The most lines of the backup's own list of what it left out (`partial`) or what to do again (`redo`) that the dry run says.
+const MOST_LINES_NAMED: usize = 50;
+
+/// Cut a hostile string to what a panel can show, and a list to a length, with a last line that says how many more there were.
 fn clipped(lines: &[String], count: usize, each: usize) -> Vec<String> {
-    lines.iter().take(count).map(|l| review::clip(l, each)).collect()
+    super::parts::lines_of(lines, count, each)
+}
+
+/// The patterns a backup's record says it left out, the first [`MOST_EXCLUDED_NAMED`] with a line that says how many more there were.
+fn excluded_of(manifest: &Manifest) -> Vec<Excluded> {
+    let mut out: Vec<Excluded> = manifest
+        .excluded
+        .iter()
+        .take(MOST_EXCLUDED_NAMED)
+        .map(|e| Excluded { pattern: review::clip(&e.pattern, 200), reason: review::clip(&e.reason, 400), redo: e.redo.as_ref().map(|r| review::clip(r, 400)) })
+        .collect();
+    if manifest.excluded.len() > MOST_EXCLUDED_NAMED {
+        out.push(Excluded { pattern: format!("and {} more", manifest.excluded.len() - MOST_EXCLUDED_NAMED), reason: "left out of this backup, and not listed here".to_string(), redo: None });
+    }
+    out
 }
 
 /// The name an item of the Agent's storage goes by in [`Inspection::restorable`].
@@ -609,7 +630,7 @@ fn preview_of(data_dir: &Path, verified: &container::Verified, scratch: &Path, f
                         not_restored.extend(review::keys_not_restored(&entry.name, keys, bytes));
                     }
                 }
-                None => items.push(ReviewItem { class, name: entry.name.clone(), title: review::clip(entry.name.rsplit('/').next().unwrap_or(&entry.name), 120), what: review::TOO_LARGE.to_string() }),
+                None => items.push(review::too_large(class, &entry.name, entry.name.rsplit('/').next().unwrap_or(&entry.name))),
             }
         }
         if items.len() > review::MAX_REVIEW_ITEMS {
@@ -632,6 +653,8 @@ fn preview_of(data_dir: &Path, verified: &container::Verified, scratch: &Path, f
     if items.len() > review::MAX_REVIEW_ITEMS {
         return Err(BackupError::new(ErrorKind::TooLarge, "This backup holds more things that can run or reconfigure OAIY than can be looked through, so it is refused."));
     }
+    // A kind whose items are each long is described in full up to a number of them, and the rest are named (see `parts::cap_full`).
+    let items = super::parts::cap_full(items);
     let classes: Vec<ClassInfo> = RestoreClass::ALL
         .iter()
         .filter_map(|c| {
@@ -664,9 +687,9 @@ fn preview_of(data_dir: &Path, verified: &container::Verified, scratch: &Path, f
         includes_keys: manifest.includes_keys,
         categories,
         lacks,
-        partial: clipped(&manifest.partial, 50, 400),
-        excluded: manifest.excluded.iter().take(300).map(|e| Excluded { pattern: review::clip(&e.pattern, 200), reason: review::clip(&e.reason, 400), redo: e.redo.as_ref().map(|r| review::clip(r, 400)) }).collect(),
-        redo: clipped(&redo_of(manifest), 50, 400),
+        partial: clipped(&manifest.partial, MOST_LINES_NAMED, 400),
+        excluded: excluded_of(manifest),
+        redo: clipped(&redo_of(manifest), MOST_LINES_NAMED, 400),
         total_files: manifest.entries.len() as u64,
         total_bytes: manifest.entries.iter().map(|e| e.size).sum(),
         classes,
@@ -675,7 +698,32 @@ fn preview_of(data_dir: &Path, verified: &container::Verified, scratch: &Path, f
         keys: KeysInfo { in_backup: manifest.includes_keys },
         notes,
     };
-    Ok((preview, agent_names))
+    Ok((in_plain_sight(preview), agent_names))
+}
+
+/// The preview with every text in it that a person reads made visible: the characters they cannot see (a tag, a zero-width or a
+/// direction character) are said as what they are, with how many. Every description, title, name and note is made this way where it is
+/// built; this is the last place, so that nothing that reaches the person is drawn as it is written.
+fn in_plain_sight(mut preview: Preview) -> Preview {
+    let seen = super::parts::visible;
+    for item in &mut preview.items {
+        item.name = seen(&item.name);
+        item.title = seen(&item.title);
+        item.what = seen(&item.what);
+    }
+    for n in &mut preview.not_restored {
+        n.name = seen(&n.name);
+        n.why = seen(&n.why);
+    }
+    for list in [&mut preview.notes, &mut preview.partial, &mut preview.redo] {
+        *list = list.iter().map(|n| seen(n)).collect();
+    }
+    for e in &mut preview.excluded {
+        e.pattern = seen(&e.pattern);
+        e.reason = seen(&e.reason);
+        e.redo = e.redo.as_deref().map(seen);
+    }
+    preview
 }
 
 /// What a look at a backup found, kept to hold the restore that follows to it: the SHA-256 of the decrypted
@@ -856,12 +904,12 @@ fn stage_inner(data_dir: &Path, file: &Path, passphrase: &str, ticks: &Ticks, op
                 backup_created_at: review::clip(&manifest.created_at, 40),
                 ticked: ticks.ids(),
                 keys: ticks.keys,
-                notes: notes.iter().map(|n| review::clip(n, 400)).take(50).collect(),
+                notes: clipped(&notes, MOST_NOTES, 400),
                 source: source.clone(),
                 files,
                 removals: Vec::new(),
                 agent,
-                redo: clipped(&redo_of(manifest), 50, 400),
+                redo: clipped(&redo_of(manifest), MOST_LINES_NAMED, 400),
                 merges,
                 bytes,
             },
@@ -889,7 +937,7 @@ fn stage_inner(data_dir: &Path, file: &Path, passphrase: &str, ticks: &Ticks, op
         bytes: marker.bytes,
         agent_storage: marker.agent.is_some(),
         redo: marker.redo,
-        skipped: clipped(&skipped, 100, 400),
+        skipped: clipped(&skipped, MOST_NOTES, 400),
     })
 }
 
@@ -901,7 +949,8 @@ fn stage_inner(data_dir: &Path, file: &Path, passphrase: &str, ticks: &Ticks, op
 /// remain, what was said about the rest, and the files that were merged with what is here (see [`MarkerMerge`]).
 pub(crate) fn clean_staged(data_dir: &Path, files_root: &Path, names: &[String], ticks: &Ticks, limits: &Limits) -> Result<Cleaned> {
     let mut kept = Vec::new();
-    let mut notes = Vec::new();
+    // What is said of the files, by class: a class has a budget of its own, so files of one kind cannot crowd out what is said of another.
+    let mut notes = NoteBook::default();
     let mut merges: Vec<MarkerMerge> = Vec::new();
     // A staged file is measured before it is read: what a backup declares is checked when it is read, but a file
     // is only ever read whole when it is no larger than the most a file of its kind may be.
@@ -921,7 +970,7 @@ pub(crate) fn clean_staged(data_dir: &Path, files_root: &Path, names: &[String],
                 let (local, here) = (local_json(data_dir, name, limits), here_state(data_dir, name));
                 Some(read(&path).and_then(|b| {
                     let (bytes, more) = merge_file(name, local.as_ref(), &b, ticks)?;
-                    notes.extend(more);
+                    notes.extend(NOTE_MERGED, more);
                     // What it was merged from is kept as it came, so that it can be merged again with what is here when it is applied.
                     let theirs = files_root.parent().unwrap_or(files_root).join("theirs").join(native(name));
                     if let Some(parent) = theirs.parent() {
@@ -936,10 +985,10 @@ pub(crate) fn clean_staged(data_dir: &Path, files_root: &Path, names: &[String],
             (Some(Category::Providers), _) => Some(read(&path).and_then(|b| {
                 super::sanitize::providers_for_restore(&b, ticks.keys).map(|(c, removed, cleaned)| {
                     if removed > 0 {
-                        notes.push(format!("{removed} API key(s) in the provider list were left out: you did not tick the keys."));
+                        notes.push(NOTE_PROVIDERS, format!("{removed} API key(s) in the provider list were left out: you did not tick the keys."));
                     }
                     if cleaned > 0 {
-                        notes.push(format!("{cleaned} address{} in the provider list held a name and password, or a key, which a backup never brings back: {} saved without {}; enter {} again as the provider's key.", if cleaned == 1 { "" } else { "es" }, if cleaned == 1 { "it was" } else { "they were" }, if cleaned == 1 { "it" } else { "them" }, if cleaned == 1 { "it" } else { "them" }));
+                        notes.push(NOTE_PROVIDERS, format!("{cleaned} address{} in the provider list held a name and password, or a key, which a backup never brings back: {} saved without {}; enter {} again as the provider's key.", if cleaned == 1 { "" } else { "es" }, if cleaned == 1 { "it was" } else { "they were" }, if cleaned == 1 { "it" } else { "them" }, if cleaned == 1 { "it" } else { "them" }));
                     }
                     c
                 })
@@ -947,7 +996,7 @@ pub(crate) fn clean_staged(data_dir: &Path, files_root: &Path, names: &[String],
             (Some(Category::Flows), "bridge/ledger.jsonl") => Some(read(&path).map(|b| {
                 let (c, left_out) = super::sanitize::ledger_finished_only(&b);
                 if left_out > 0 {
-                    notes.push(format!("{left_out} run record(s) of runs that were waiting or running were left out: nothing starts by itself."));
+                    notes.push(NOTE_JOURNAL, format!("{left_out} run record(s) of runs that were waiting or running were left out: nothing starts by itself."));
                 }
                 c
             })),
@@ -961,7 +1010,7 @@ pub(crate) fn clean_staged(data_dir: &Path, files_root: &Path, names: &[String],
             }
             Some(Err(why)) => {
                 let _ = std::fs::remove_file(&path);
-                notes.push(format!("{name} was not brought back: {why}."));
+                notes.push(NOTE_LEFT_OUT, format!("{name} was not brought back: {why}."));
             }
         }
     }
@@ -986,7 +1035,7 @@ pub(crate) fn clean_staged(data_dir: &Path, files_root: &Path, names: &[String],
         match unreadable {
             Some(why) => {
                 let _ = std::fs::remove_file(&path);
-                notes.push(format!("{name} was not brought back. {why}"));
+                notes.push(NOTE_LEFT_OUT, format!("{name} was not brought back. {why}"));
             }
             None => readable.push(name),
         }
@@ -1007,19 +1056,30 @@ pub(crate) fn clean_staged(data_dir: &Path, files_root: &Path, names: &[String],
             Ok((bytes, dropped)) => {
                 secret_file::write(&path, bytes).map_err(|e| BackupError::io("Could not clean a staged file", &e))?;
                 if !dropped.is_empty() {
-                    notes.push(format!("These services were not set to start with OAIY, because OAIY has no template for them: {}.", dropped.iter().take(20).map(|d| review::clip(d, 60)).collect::<Vec<_>>().join(", ")));
+                    notes.push(NOTE_SERVICES, format!("These services were not set to start with OAIY, because OAIY has no template for them: {}.", super::parts::some_of(&dropped, 20, 60)));
                 }
             }
             Err(why) => {
                 let _ = std::fs::remove_file(&path);
                 kept.retain(|n| n != "services-autostart.json");
-                notes.push(format!("services-autostart.json was not brought back: {why}."));
+                notes.push(NOTE_SERVICES, format!("services-autostart.json was not brought back: {why}."));
             }
         }
     }
     merges.retain(|m| kept.contains(&m.name));
-    Ok(Cleaned { kept, notes, merges })
+    Ok(Cleaned { kept, notes: notes.finish(), merges })
 }
+
+/// The most notes a restore keeps in its record and says in its result. It has room for every class at its budget (see [`NoteBook`]) and
+/// the notes that are one line each: nine classes of nine notes and a few dozen more.
+const MOST_NOTES: usize = 150;
+
+/// The classes of the notes said of the staged files.
+const NOTE_MERGED: &str = "merged files";
+const NOTE_PROVIDERS: &str = "the provider list";
+const NOTE_JOURNAL: &str = "the run journal";
+const NOTE_LEFT_OUT: &str = "files not brought back";
+const NOTE_SERVICES: &str = "services that start with OAIY";
 
 /// What [`clean_staged`] leaves: the names that come back, what was said, and the files that were merged with what is here.
 pub(crate) struct Cleaned {
@@ -1131,7 +1191,7 @@ fn merge_again(data_dir: &Path, marker: &mut Marker, limits: &Limits) -> std::re
             entry.here_sha256 = here;
         }
     }
-    marker.notes.truncate(50);
+    marker.notes = clipped(&marker.notes, MOST_NOTES, 400);
     if changed {
         write_json(&marker_path(data_dir), marker).map_err(|e| format!("Could not record the restore again ({e})."))?;
     }
@@ -1843,8 +1903,8 @@ pub(crate) fn record_agent_result(data_dir: &Path, id: &str, ok: bool, error: Op
         return;
     }
     // What the page left out or could not do goes where the person reads the result, cut to what a panel shows.
-    for warning in warnings.iter().take(20) {
-        let line = format!("Agent: {}", review::clip(warning, 300));
+    for warning in super::parts::lines_of(warnings, 20, 300) {
+        let line = format!("Agent: {warning}");
         if !last.notes.contains(&line) {
             last.notes.push(line);
         }

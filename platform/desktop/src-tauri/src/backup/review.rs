@@ -14,6 +14,8 @@ use std::path::Path;
 use serde::Serialize;
 use serde_json::Value;
 
+pub use super::parts::ReviewItem;
+use super::parts::{quoted, short, Parts};
 use super::table::{filter_json, table, Class, Why};
 use super::{BackupError, ErrorKind, Result};
 
@@ -164,17 +166,6 @@ impl Ticks {
     }
 }
 
-/// One thing a restore could bring back that can act, described for the person.
-#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
-pub struct ReviewItem {
-    pub class: RestoreClass,
-    /// Where it is in the backup.
-    pub name: String,
-    pub title: String,
-    /// What it does, in a sentence.
-    pub what: String,
-}
-
 /// A class as the dry run lists it.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize)]
 pub struct ClassInfo {
@@ -187,15 +178,10 @@ pub struct ClassInfo {
 /// The most items of these classes one backup may hold and still be reviewed.
 pub const MAX_REVIEW_ITEMS: usize = 2000;
 
-/// Cut `text` to `max` characters.
+/// Cut `text` to `max` characters, with how long it was in all when it is cut, and the characters a person cannot see made visible (it is
+/// [`short`]: there is one way the dry run cuts a text).
 pub fn clip(text: &str, max: usize) -> String {
-    if text.chars().count() <= max {
-        text.to_string()
-    } else {
-        let mut cut: String = text.chars().take(max.saturating_sub(1)).collect();
-        cut.push('…');
-        cut
-    }
+    short(text, max)
 }
 
 fn s<'a>(v: &'a Value, key: &str) -> Option<&'a str> {
@@ -236,7 +222,17 @@ const UNREADABLE: &str = "Could not be read (";
 pub const TOO_LARGE: &str = "Too large to look at: it is not brought back.";
 
 fn unreadable(class: RestoreClass, name: &str, why: &str) -> ReviewItem {
-    ReviewItem { class, name: name.to_string(), title: clip(name.rsplit('/').next().unwrap_or(name), 120), what: format!("{UNREADABLE}{why}): OAIY would not load it, so it is not brought back.") }
+    unreadable_as(class, name, name.rsplit('/').next().unwrap_or(name), why)
+}
+
+/// A thing that could not be read, listed under this title: said so, and not brought back.
+pub fn unreadable_as(class: RestoreClass, name: &str, title: &str, why: &str) -> ReviewItem {
+    Parts::new("unreadable").fixed("problem", format!("{UNREADABLE}{why}): OAIY would not load it, so it is not brought back.")).item(class, name, title)
+}
+
+/// A thing that is too large to look at: said so, and not brought back.
+pub fn too_large(class: RestoreClass, name: &str, title: &str) -> ReviewItem {
+    Parts::new("unreadable").fixed("problem", TOO_LARGE).item(class, name, title)
 }
 
 /// Whether the description says its file is not brought back because it could not be read (or is too
@@ -245,24 +241,18 @@ pub fn is_unreadable(item: &ReviewItem) -> bool {
     item.what.starts_with(UNREADABLE) || item.what == TOO_LARGE
 }
 
-/// The addresses of one place in a descriptor (one of its top-level keys): how many, the first of them, and the hosts they go to.
-#[derive(Default)]
-struct Lane {
-    count: usize,
-    first: Option<(String, String)>,
-    /// The hosts of addresses that are keys of the descriptor itself, and (apart) of those that are entries of a collection (an array, or an
-    /// object with more keys than a descriptor has): the first are named first, so that no collection can push one out.
-    fixed_hosts: std::collections::BTreeSet<String>,
-    bulk_hosts: std::collections::BTreeSet<String>,
+/// `3 places`, `1 place`.
+fn words(n: usize, one: &str, many: &str) -> String {
+    format!("{n} {}", if n == 1 { one } else { many })
 }
 
-impl Lane {
-    /// The hosts in the order they are named (the descriptor's own keys' first) and how many there are.
-    fn hosts(&self) -> (Vec<&String>, usize) {
-        let all: Vec<&String> = self.fixed_hosts.iter().chain(self.bulk_hosts.difference(&self.fixed_hosts)).collect();
-        let n = all.len();
-        (all, n)
-    }
+/// One address of a descriptor, and where it is.
+struct Address {
+    path: String,
+    value: String,
+    /// Whether it is an entry of a collection (an array, or an object of more keys than a descriptor has) and not a key of the
+    /// descriptor itself.
+    collection: bool,
 }
 
 /// An object with more keys than this is a collection (a map): a descriptor has fewer keys of its own in any one object.
@@ -275,71 +265,142 @@ fn host_of(address: &str) -> String {
     reqwest::Url::parse(&full).ok().and_then(|u| u.host_str().map(|h| h.to_lowercase())).unwrap_or_else(|| "(not an address)".to_string())
 }
 
-/// Every address in a JSON document, by the place (top-level key) it is in: a value under a key that ends in `Url` or `url`, and a value
-/// under a key that ends in `Path` or `path` when it is itself an address (it names a host, or starts with `//`). Every one is counted
-/// and its host kept, however many a place holds (an array of five thousand steps is one place with five thousand addresses), so that no
-/// number of addresses in one place can hide another place; only the first of a place is kept whole.
-fn collect_addresses(value: &Value, at: &str, in_collection: bool, lane: &mut Lane, visited: &mut usize) {
+/// Whether a value is an address: a text under a key that ends in `Url` or `url`, or one under a key that ends in `Path` or `path` when it
+/// is itself an address (it names a host, or starts with `//`).
+fn is_address(key: &str, value: &Value) -> bool {
+    let lower = key.to_lowercase();
+    matches!(value, Value::String(text) if lower.ends_with("url") || (lower.ends_with("path") && (text.contains("://") || text.starts_with("//"))))
+}
+
+/// Every address in a JSON document, with where it is. Every one is kept, however many a place holds (an array of five thousand steps is
+/// five thousand addresses of a collection), so that what is said of a place can count them and name their hosts.
+fn collect_addresses(value: &Value, at: &str, in_collection: bool, out: &mut Vec<Address>, visited: &mut usize) {
     *visited += 1;
     if *visited > 200_000 {
         return;
     }
-    let is_address = |key: &str, v: &Value| matches!(v, Value::String(text) if key.to_lowercase().ends_with("url") || (key.to_lowercase().ends_with("path") && (text.contains("://") || text.starts_with("//"))));
     match value {
         Value::Object(map) => {
             let bulk = in_collection || map.len() > MOST_KEYS_OF_ONE_OBJECT;
             for (key, v) in map {
                 let here = if at.is_empty() { key.clone() } else { format!("{at}.{key}") };
                 match v {
-                    Value::String(text) if is_address(key, v) => {
-                        lane.count += 1;
-                        let hosts = if bulk { &mut lane.bulk_hosts } else { &mut lane.fixed_hosts };
-                        hosts.insert(host_of(text));
-                        if lane.first.is_none() {
-                            lane.first = Some((here, text.clone()));
-                        }
-                    }
-                    _ => collect_addresses(v, &here, bulk, lane, visited),
+                    Value::String(text) if is_address(key, v) => out.push(Address { path: here, value: text.clone(), collection: bulk }),
+                    _ => collect_addresses(v, &here, bulk, out, visited),
                 }
             }
         }
         Value::Array(items) => {
             for (i, v) in items.iter().enumerate() {
-                collect_addresses(v, &format!("{at}[{i}]"), true, lane, visited);
+                collect_addresses(v, &format!("{at}[{i}]"), true, out, visited);
             }
         }
         _ => {}
     }
 }
 
-/// The addresses of a descriptor by place, in the order of the keys: (the place, what it holds).
-fn address_lanes(descriptor: &Value) -> Vec<(String, Lane)> {
+/// The addresses of a descriptor by the place (top-level key) they are in, for the places that have any.
+fn addresses_by_place(descriptor: &Value) -> Vec<(String, Vec<Address>)> {
     let Value::Object(map) = descriptor else { return Vec::new() };
     let mut visited = 0usize;
-    let mut lanes = Vec::new();
+    let mut places = Vec::new();
     for (key, v) in map {
-        let mut lane = Lane::default();
-        let lower = key.to_lowercase();
+        let mut here = Vec::new();
         match v {
-            Value::String(text) if lower.ends_with("url") || (lower.ends_with("path") && (text.contains("://") || text.starts_with("//"))) => {
-                lane.count = 1;
-                lane.fixed_hosts.insert(host_of(text));
-                lane.first = Some((key.clone(), text.clone()));
-            }
-            _ => collect_addresses(v, key, false, &mut lane, &mut visited),
+            Value::String(text) if is_address(key, v) => here.push(Address { path: key.clone(), value: text.clone(), collection: false }),
+            _ => collect_addresses(v, key, false, &mut here, &mut visited),
         }
-        if lane.count > 0 {
-            lanes.push((key.clone(), lane));
+        if !here.is_empty() {
+            places.push((key.clone(), here));
         }
     }
-    lanes
+    places
 }
 
-/// How many of the places of a descriptor are named, and how many hosts: the descriptor's own keys' hosts (a descriptor has a handful),
-/// and the hosts of its collections (the rest of both are counted).
-const MAX_LANES_NAMED: usize = 40;
-const MAX_FIXED_HOSTS_NAMED: usize = 60;
-const MAX_HOSTS_NAMED: usize = 20;
+/// The keys of a descriptor that are addresses by their names (`...Url`, `...Path`), by place, as the descriptor OAIY ships has them: what
+/// a descriptor of its own has, said first and by name whatever it holds. (Most of them are relative paths there; a descriptor that puts
+/// an address in one is the case.) A key added to the shipped descriptor is one of them. Only keys of the descriptor itself: an entry of
+/// an array is not.
+fn reference_keys() -> &'static std::collections::BTreeMap<String, Vec<String>> {
+    static KEYS: std::sync::OnceLock<std::collections::BTreeMap<String, Vec<String>>> = std::sync::OnceLock::new();
+    fn named_like_addresses(value: &Value, at: &str, out: &mut Vec<String>) {
+        if let Value::Object(map) = value {
+            for (key, v) in map {
+                let here = if at.is_empty() { key.clone() } else { format!("{at}.{key}") };
+                let lower = key.to_lowercase();
+                match v {
+                    Value::String(_) if lower.ends_with("url") || lower.ends_with("path") => out.push(here),
+                    _ => named_like_addresses(v, &here, out),
+                }
+            }
+        }
+    }
+    KEYS.get_or_init(|| {
+        let reference: Value = serde_json::from_str(include_str!("../../resources/connectors/formlogic.json")).unwrap_or(Value::Null);
+        let mut by_place = std::collections::BTreeMap::new();
+        if let Value::Object(map) = &reference {
+            for (place, v) in map {
+                let mut keys = Vec::new();
+                match v {
+                    Value::String(_) if place.to_lowercase().ends_with("url") || place.to_lowercase().ends_with("path") => keys.push(place.clone()),
+                    _ => named_like_addresses(v, place, &mut keys),
+                }
+                by_place.insert(place.clone(), keys);
+            }
+        }
+        by_place
+    })
+}
+/// The places of a connector that are parts of its description, by the key of the descriptor and the label of the part, in the order they are
+/// said (the address it is prefilled with is a part of its own).
+const KNOWN_PLACES: [(&str, &str); 11] = [
+    ("auth", "auth"),
+    ("healthPath", "health"),
+    ("heartbeat", "heartbeat"),
+    ("relay", "relay"),
+    ("desktopFlows", "desktopFlows"),
+    ("desktopAi", "desktopAi"),
+    ("flows", "flows"),
+    ("appLogic", "appLogic"),
+    ("dataNode", "dataNode"),
+    ("scriptProfile", "scriptProfile"),
+    ("docsUrl", "docs"),
+];
+
+/// How many other places (a key of the descriptor that is not one of those it has) are named, and how many hosts of a place.
+const MAX_OTHER_PLACES: usize = 12;
+const MAX_HOSTS_SAMPLED: usize = 4;
+
+/// The hosts some addresses go to: the first few, and how many more.
+fn hosts_said(addresses: &[&Address]) -> String {
+    let hosts: BTreeSet<String> = addresses.iter().map(|a| host_of(&a.value)).collect();
+    let named = hosts.iter().take(MAX_HOSTS_SAMPLED).map(|h| short(h, 80)).collect::<Vec<_>>().join(", ");
+    if hosts.len() > MAX_HOSTS_SAMPLED {
+        format!("{named} and {} more hosts", hosts.len() - MAX_HOSTS_SAMPLED)
+    } else {
+        named
+    }
+}
+
+/// What one place of a descriptor sends to: the addresses of its own keys, by key, those the shipped descriptor has first and in its order
+/// (a place with thirty more keys of its own cannot push one of them out), then how many addresses its lists and maps hold and their hosts.
+fn place_said(place: &str, all: &[Address]) -> String {
+    let reference = reference_keys().get(place).cloned().unwrap_or_default();
+    // A key the shipped descriptor has is one of the descriptor's own wherever it sits: thirty more keys in its object do not make it an entry
+    // of a collection.
+    let own: Vec<&Address> = all.iter().filter(|a| !a.collection || reference.contains(&a.path)).collect();
+    let mut ordered: Vec<&Address> = reference.iter().filter_map(|k| own.iter().copied().find(|a| a.path == *k)).collect();
+    ordered.extend(own.iter().copied().filter(|a| !reference.contains(&a.path)));
+    let mut text = ordered.iter().map(|a| format!("{} = {}", a.path, short(&a.value, 100))).collect::<Vec<_>>().join("; ");
+    let bulk: Vec<&Address> = all.iter().filter(|a| a.collection && !reference.contains(&a.path)).collect();
+    if !bulk.is_empty() {
+        if !text.is_empty() {
+            text.push_str("; ");
+        }
+        text.push_str(&format!("{} in lists or maps, to {}", words(bulk.len(), "address", "addresses"), hosts_said(&bulk)));
+    }
+    format!("{text}.")
+}
 
 /// Describe one restorable file of a class that can act.
 pub fn describe(class: RestoreClass, name: &str, bytes: &[u8], local: &Local, backup_templates: &HashSet<String>) -> Vec<ReviewItem> {
@@ -356,7 +417,7 @@ pub fn describe(class: RestoreClass, name: &str, bytes: &[u8], local: &Local, ba
                     } else {
                         "it has no template, so it is left out"
                     };
-                    ReviewItem { class, name: name.to_string(), title: clip(&id, 120), what: format!("Starts with OAIY at every start ({known}).") }
+                    Parts::new("autostart").fixed("starts", format!("Starts with OAIY at every start ({known}).")).item(class, name, &id)
                 })
                 .collect(),
             Err(_) => vec![unreadable(class, name, "it is not a list of services")],
@@ -371,14 +432,17 @@ pub fn describe(class: RestoreClass, name: &str, bytes: &[u8], local: &Local, ba
                     match serde_json::from_value::<crate::bridge::triggers::TriggerBinding>(row.clone()) {
                         Ok(b) => {
                             let mode = format!("{:?}", b.mode).to_lowercase();
-                            let off = if b.enabled { "" } else { ", switched off" };
-                            let when = b.condition.as_deref().filter(|c| !c.trim().is_empty()).map(|c| format!(" and only if this holds: {}", clip(c, 120))).unwrap_or_default();
-                            items.push(ReviewItem {
-                                class,
-                                name: name.to_string(),
-                                title: clip(&b.id, 120),
-                                what: clip(&format!("When \"{}\" happens{when}, runs the flow \"{}\" ({mode}{off}).", b.event, b.flow_id), 500),
-                            });
+                            // How it runs and whether it is on come first, each a part of its own, then which flow it runs, then what starts it, then
+                            // what it waits for: an event, a flow or a condition written as long as it may be cannot push another out.
+                            let mut parts = Parts::new("trigger").fixed("mode", format!("Runs in the mode {mode}."));
+                            if !b.enabled {
+                                parts = parts.fixed("state", "It is switched off.");
+                            }
+                            parts = parts.fixed("runs", format!("Runs the flow \"{}\".", b.flow_id)).fixed("when", format!("When \"{}\" happens.", b.event));
+                            if let Some(c) = b.condition.as_deref().filter(|c| !c.trim().is_empty()) {
+                                parts = parts.sample("condition", format!("Only if this holds: {c}."));
+                            }
+                            items.push(parts.item(class, name, &b.id));
                         }
                         Err(_) => ignored += 1,
                     }
@@ -387,12 +451,11 @@ pub fn describe(class: RestoreClass, name: &str, bytes: &[u8], local: &Local, ba
                     vec![unreadable(class, name, &format!("none of its {ignored} entries is a trigger OAIY would load"))]
                 } else {
                     if ignored > 0 {
-                        items.push(ReviewItem {
-                            class,
-                            name: name.to_string(),
-                            title: "Entries that will not load".to_string(),
-                            what: format!("{ignored} entr{} in the file {} not triggers OAIY would load, and {} ignored.", if ignored == 1 { "y" } else { "ies" }, if ignored == 1 { "is" } else { "are" }, if ignored == 1 { "is" } else { "are" }),
-                        });
+                        items.push(
+                            Parts::new("more")
+                                .fixed("count", format!("{ignored} entr{} in the file {} not triggers OAIY would load, and {} ignored.", if ignored == 1 { "y" } else { "ies" }, if ignored == 1 { "is" } else { "are" }, if ignored == 1 { "is" } else { "are" }))
+                                .item(class, name, "Entries that will not load"),
+                        );
                     }
                     items
                 }
@@ -402,12 +465,9 @@ pub fn describe(class: RestoreClass, name: &str, bytes: &[u8], local: &Local, ba
         "bridge/ledger.jsonl" => {
             let (kept, left_out) = super::sanitize::ledger_finished_only(bytes);
             let finished = kept.iter().filter(|b| **b == b'\n').count();
-            vec![ReviewItem {
-                class,
-                name: name.to_string(),
-                title: "Run history".to_string(),
-                what: format!("{finished} finished run records are brought back. {left_out} records of runs that were waiting or running are left out, so nothing starts by itself."),
-            }]
+            vec![Parts::new("ledger")
+                .fixed("records", format!("{finished} finished run records are brought back. {left_out} records of runs that were waiting or running are left out, so nothing starts by itself."))
+                .item(class, name, "Run history")]
         }
         "ai/providers.json" => match value() {
             Ok(v) => v
@@ -418,14 +478,15 @@ pub fn describe(class: RestoreClass, name: &str, bytes: &[u8], local: &Local, ba
                         .iter()
                         .map(|p| {
                             let id = s(p, "id").unwrap_or("(no id)");
-                            let key = if s(p, "apiKey").is_some_and(|k| !k.trim().is_empty()) { "; has an API key (brought back only with the keys box)" } else { "; no key" };
-                            let local_net = if p.get("allowLocal").and_then(Value::as_bool).unwrap_or(false) { "; may use this computer's own addresses" } else { "" };
-                            ReviewItem {
-                                class,
-                                name: name.to_string(),
-                                title: clip(&format!("{} ({id})", s(p, "name").unwrap_or(id)), 120),
-                                what: clip(&format!("{} requests go to {}{key}{local_net}.", s(p, "protocol").unwrap_or("openai"), s(p, "baseUrl").unwrap_or("(no address)")), 300),
+                            // Where it goes is the last thing said, cut on its own: a long address cannot push out what it may reach (its own
+                            // computer's addresses, which relaxes the network guard) or whether it has a key.
+                            let mut parts = Parts::new("provider-list")
+                                .fixed("protocol", format!("Protocol: {}.", s(p, "protocol").unwrap_or("openai")))
+                                .fixed("key", if s(p, "apiKey").is_some_and(|k| !k.trim().is_empty()) { "It has an API key (brought back only with the keys box)." } else { "No key." });
+                            if p.get("allowLocal").and_then(Value::as_bool).unwrap_or(false) {
+                                parts = parts.fixed("local", "May use this computer's own addresses.");
                             }
+                            parts.sample("address", format!("Requests go to {}.", s(p, "baseUrl").unwrap_or("(no address)"))).item(class, name, &format!("{} ({id})", s(p, "name").unwrap_or(id)))
                         })
                         .collect()
                 })
@@ -434,12 +495,7 @@ pub fn describe(class: RestoreClass, name: &str, bytes: &[u8], local: &Local, ba
         },
         "control.json" => {
             let on = value().ok().and_then(|v| v.get("agentMayChange").and_then(Value::as_bool)).unwrap_or(false);
-            vec![ReviewItem {
-                class,
-                name: name.to_string(),
-                title: "The Agent's switch".to_string(),
-                what: if on { "Lets the Agent set up and change OAIY for you: ON.".to_string() } else { "Lets the Agent set up and change OAIY for you: off.".to_string() },
-            }]
+            vec![Parts::new("control").fixed("switch", if on { "Lets the Agent set up and change OAIY for you: ON." } else { "Lets the Agent set up and change OAIY for you: off." }).item(class, name, "The Agent's switch")]
         }
         "setup.json" => match value() {
             Ok(v) => {
@@ -447,28 +503,22 @@ pub fn describe(class: RestoreClass, name: &str, bytes: &[u8], local: &Local, ba
                 let accepted: Vec<String> = plugins
                     .map(|m| m.iter().filter(|(_, p)| p.get("permissionsAccepted").is_some_and(|a| a.as_array().is_some_and(|a| !a.is_empty()))).map(|(id, _)| id.clone()).collect())
                     .unwrap_or_default();
-                vec![ReviewItem {
-                    class,
-                    name: name.to_string(),
-                    title: "Setup record".to_string(),
-                    what: clip(
-                        &if accepted.is_empty() {
-                            "Records how far setup got. No plugin permissions are marked as accepted.".to_string()
-                        } else {
-                            // How many first, then the first few by name: a list of hundreds of plugins is a sample, and says how long it is.
-                            let named = accepted.iter().take(10).map(|id| clip(id, 40)).collect::<Vec<_>>().join(", ");
-                            let more = if accepted.len() > 10 { format!(" and {} more", accepted.len() - 10) } else { String::new() };
-                            format!("Records how far setup got and marks the permissions of {} as ACCEPTED: {named}{more}.", if accepted.len() == 1 { "1 plugin".to_string() } else { format!("{} plugins", accepted.len()) })
-                        },
-                        300,
-                    ),
-                }]
+                let parts = Parts::new("setup");
+                let parts = if accepted.is_empty() {
+                    parts.fixed("accepted", "Records how far setup got. No plugin permissions are marked as accepted.")
+                } else {
+                    // How many first, and then the first few by name: a list of hundreds of plugins is a sample, and says how long it is.
+                    let named = accepted.iter().take(MAX_ACCEPTED_NAMED).map(|id| short(id, 40)).collect::<Vec<_>>().join(", ");
+                    let more = if accepted.len() > MAX_ACCEPTED_NAMED { format!(" and {} more", accepted.len() - MAX_ACCEPTED_NAMED) } else { String::new() };
+                    parts.fixed("accepted", format!("Records how far setup got and marks the permissions of {} as ACCEPTED.", words(accepted.len(), "plugin", "plugins"))).sample("names", format!("They are: {named}{more}."))
+                };
+                vec![parts.item(class, name, "Setup record")]
             }
             Err(_) => vec![unreadable(class, name, "it is not valid JSON")],
         },
         "agent.json" => {
             let source = value().ok().and_then(|v| v.get("model").and_then(|m| s(m, "source").map(str::to_string))).unwrap_or_else(|| "(not set)".to_string());
-            vec![ReviewItem { class, name: name.to_string(), title: "The Agent's model".to_string(), what: clip(&format!("The Agent thinks with: {source}."), 200) }]
+            vec![Parts::new("agent-model").fixed("model", format!("The Agent thinks with: {source}.")).item(class, name, "The Agent's model")]
         }
         _ if name.starts_with("templates/") => match value() {
             Ok(v) => {
@@ -476,43 +526,42 @@ pub fn describe(class: RestoreClass, name: &str, bytes: &[u8], local: &Local, ba
                 let run = v.get("run");
                 let command = run.and_then(|r| s(r, "command")).unwrap_or("(none)");
                 let args: Vec<String> = run.and_then(|r| r.get("args")).and_then(Value::as_array).map(|a| a.iter().filter_map(Value::as_str).map(str::to_string).collect()).unwrap_or_default();
-                // What it does is said first and cut to a length; every warning about what else it does is a note of its
-                // own, worked out before anything is cut and always shown, so a long command line hides nothing.
-                let runs = format!("Runs \"{}{}\"", clip(command, 120), if args.is_empty() { String::new() } else { format!(" {}", clip(&args.join(" "), 200)) });
-                let mut notes: Vec<String> = Vec::new();
-                if let Some(install) = v.get("install").filter(|i| s(i, "kind") == Some("script")) {
-                    notes.push(format!("install script {}", clip(&[s(install, "windows"), s(install, "unix")].into_iter().flatten().collect::<Vec<_>>().join(" / "), 160)));
-                }
-                if let Some(files) = v.get("files").and_then(Value::as_object).filter(|f| !f.is_empty()) {
-                    let listed: Vec<String> = files.iter().take(6).map(|(k, body)| format!("{} ({} bytes)", clip(k, 40), body.as_str().map(str::len).unwrap_or(0))).collect();
-                    notes.push(format!("writes {} script file(s): {}", files.len(), clip(&listed.join(", "), 200)));
-                }
-                if let Some(paths) = v.get("uninstall").and_then(|u| u.get("paths")).and_then(Value::as_array).filter(|p| !p.is_empty()) {
-                    notes.push(format!("deletes {} path(s) when uninstalled: {}", paths.len(), clip(&paths.iter().filter_map(Value::as_str).take(3).collect::<Vec<_>>().join(", "), 160)));
-                }
-                if let Some(env) = run.and_then(|r| r.get("env")).and_then(Value::as_object).filter(|e| !e.is_empty()) {
-                    notes.push(format!("sets {} environment variable(s): {}", env.len(), clip(&env.keys().take(6).cloned().collect::<Vec<_>>().join(", "), 160)));
-                }
-                if let Some(cwd) = run.and_then(|r| s(r, "cwd")) {
-                    notes.push(format!("runs in {}", clip(cwd, 120)));
-                }
-                if let Some(marker) = s(&v, "installedMarker").filter(|m| !m.is_empty()) {
-                    notes.push(format!("writes a marker file at {}", clip(marker, 120)));
-                }
-                if let Some(health) = v.get("health").and_then(|h| s(h, "url")) {
-                    notes.push(format!("asks {} after it starts", clip(health, 120)));
-                }
-                if let Some(docs) = s(&v, "docsUrl").filter(|d| !d.is_empty()) {
-                    notes.push(format!("links to {}", clip(docs, 120)));
-                }
+                // Every fact about what it does is a part of its own, worked out before anything is cut and said in a fixed order, so a
+                // long command line, or thousands of files, paths and variables, hide nothing: each part is cut on its own.
+                let mut parts = Parts::new("template");
                 if v.get("autostart").and_then(Value::as_bool).unwrap_or(false) {
-                    notes.push("STARTS with OAIY once installed".to_string());
+                    parts = parts.fixed("autostart", "STARTS with OAIY once installed.");
                 }
                 if !id.is_empty() && local.template_ids.contains(id) {
-                    notes.push("replaces your template of the same id".to_string());
+                    parts = parts.fixed("replaces", "Replaces your template of the same id.");
                 }
-                let what = if notes.is_empty() { runs } else { format!("{runs}; {}", notes.join("; ")) };
-                vec![ReviewItem { class, name: name.to_string(), title: clip(&format!("{} ({id})", s(&v, "name").unwrap_or(id)), 120), what: clip(&what, 2600) }]
+                parts = parts.fixed("runs", format!("Runs \"{}{}\".", short(command, 120), if args.is_empty() { String::new() } else { format!(" {}", short(&args.join(" "), 200)) }));
+                if let Some(install) = v.get("install").filter(|i| s(i, "kind") == Some("script")) {
+                    parts = parts.fixed("install", format!("Install script {}.", short(&[s(install, "windows"), s(install, "unix")].into_iter().flatten().collect::<Vec<_>>().join(" / "), 160)));
+                }
+                if let Some(files) = v.get("files").and_then(Value::as_object).filter(|f| !f.is_empty()) {
+                    let listed: Vec<String> = files.iter().take(6).map(|(k, body)| format!("{} ({} bytes)", short(k, 40), body.as_str().map(str::len).unwrap_or(0))).collect();
+                    parts = parts.fixed("writes", format!("Writes {} script file(s): {}.", files.len(), listed.join(", ")));
+                }
+                if let Some(paths) = v.get("uninstall").and_then(|u| u.get("paths")).and_then(Value::as_array).filter(|p| !p.is_empty()) {
+                    parts = parts.fixed("deletes", format!("Deletes {} path(s) when uninstalled: {}.", paths.len(), paths.iter().filter_map(Value::as_str).take(3).map(|p| short(p, 60)).collect::<Vec<_>>().join(", ")));
+                }
+                if let Some(env) = run.and_then(|r| r.get("env")).and_then(Value::as_object).filter(|e| !e.is_empty()) {
+                    parts = parts.fixed("env", format!("Sets {} environment variable(s): {}.", env.len(), env.keys().take(6).map(|k| short(k, 30)).collect::<Vec<_>>().join(", ")));
+                }
+                if let Some(cwd) = run.and_then(|r| s(r, "cwd")) {
+                    parts = parts.fixed("cwd", format!("Runs in {}.", short(cwd, 120)));
+                }
+                if let Some(marker) = s(&v, "installedMarker").filter(|m| !m.is_empty()) {
+                    parts = parts.fixed("marker", format!("Writes a marker file at {}.", short(marker, 120)));
+                }
+                if let Some(health) = v.get("health").and_then(|h| s(h, "url")) {
+                    parts = parts.fixed("health", format!("Asks {} after it starts.", short(health, 120)));
+                }
+                if let Some(docs) = s(&v, "docsUrl").filter(|d| !d.is_empty()) {
+                    parts = parts.fixed("docs", format!("Links to {}.", short(docs, 120)));
+                }
+                vec![parts.item(class, name, &format!("{} ({id})", s(&v, "name").unwrap_or(id)))]
             }
             Err(_) => vec![unreadable(class, name, "it is not valid JSON")],
         },
@@ -523,73 +572,77 @@ pub fn describe(class: RestoreClass, name: &str, bytes: &[u8], local: &Local, ba
                 let mut kinds: Vec<String> = v.get("nodes").and_then(Value::as_array).map(|n| n.iter().filter_map(|x| s(x, "type").or_else(|| x.get("data").and_then(|d| s(d, "type"))).map(str::to_string)).collect()).unwrap_or_default();
                 kinds.sort();
                 kinds.dedup();
-                // A flow can also be offered to the Agent as a tool, or run before or after one of the Agent's own tools.
-                let mut extra = String::new();
+                // What the flow does to the Agent (a tool it offers, and what the model is told of it, a tool it runs around) comes first, each
+                // part cut on its own; the kinds of its steps are a sample after them.
+                let mut parts = Parts::new("flow").fixed("steps", format!("A flow with {nodes} step(s)."));
                 if let Some(tool) = v.get("oaiyTool") {
-                    extra.push_str(&format!(" It is offered to the Agent as the tool \"{}\".", clip(s(tool, "name").unwrap_or("?"), 60)));
+                    parts = parts.fixed("tool", format!("It is offered to the Agent as the tool \"{}\".", short(s(tool, "name").unwrap_or("?"), 60)));
+                    if let Some(description) = s(tool, "description").map(str::trim).filter(|d| !d.is_empty()) {
+                        parts = parts.fixed("tool-description", format!("The model is told: \"{description}\"."));
+                    }
+                    // What the model is asked for: the labels of the flow's inputs.
+                    let labels: Vec<String> = v
+                        .get("nodes")
+                        .and_then(Value::as_array)
+                        .map(|n| n.iter().filter(|x| s(x, "type").is_some_and(|t| ["input_text", "input_file", "input_folder", "input_audio", "input_video"].contains(&t))).map(|x| x.get("data").and_then(|d| s(d, "label")).or_else(|| s(x, "id")).unwrap_or("?").to_string()).collect())
+                        .unwrap_or_default();
+                    if !labels.is_empty() {
+                        let named = labels.iter().take(MAX_INPUTS_NAMED).map(|l| short(l, 40)).collect::<Vec<_>>().join(", ");
+                        parts = parts.fixed("tool-inputs", format!("The model is asked for {}: {named}{}.", words(labels.len(), "input", "inputs"), if labels.len() > MAX_INPUTS_NAMED { format!(" and {} more", labels.len() - MAX_INPUTS_NAMED) } else { String::new() }));
+                    }
                 }
                 if let Some(hook) = v.get("oaiyToolHook") {
-                    extra.push_str(&format!(" It runs {} the Agent's \"{}\" tool.", clip(s(hook, "mode").unwrap_or("around"), 20), clip(s(hook, "tool").unwrap_or("?"), 60)));
+                    parts = parts.fixed("hook", format!("It runs {} the Agent's \"{}\" tool.", short(s(hook, "mode").unwrap_or("around"), 20), short(s(hook, "tool").unwrap_or("?"), 60)));
                 }
-                // What the flow does to the Agent (a tool it offers, a tool it runs around) is said before the kinds of its steps, and each
-                // kind is cut: a flow of five thousand steps with long names cannot push what it does to the Agent out of the description.
-                let kinds_said = if kinds.is_empty() {
-                    String::new()
-                } else {
-                    format!(" Its steps are of the kinds: {}{}.", kinds.iter().take(8).map(|k| clip(k, 30)).collect::<Vec<_>>().join(", "), if kinds.len() > 8 { format!(" and {} more", kinds.len() - 8) } else { String::new() })
-                };
-                vec![ReviewItem { class, name: name.to_string(), title: clip(title, 120), what: clip(&format!("A flow with {nodes} step(s).{extra}{kinds_said}"), 700) }]
+                if !kinds.is_empty() {
+                    parts = parts.sample("kinds", format!("Its steps are of the kinds: {}{}.", kinds.iter().take(8).map(|k| short(k, 30)).collect::<Vec<_>>().join(", "), if kinds.len() > 8 { format!(" and {} more", kinds.len() - 8) } else { String::new() }));
+                }
+                vec![parts.item(class, name, title)]
             }
             Err(_) => vec![unreadable(class, name, "it is not valid JSON")],
         },
         _ if name.starts_with("connectors/") => match value() {
             Ok(v) => {
                 let id = s(&v, "id").unwrap_or("(no id)");
-                let overrides = if local.builtin_connectors.contains(id) { "; REPLACES the connector OAIY ships with this id" } else { "" };
-                // Every address it holds, wherever it is in the descriptor: where a link goes, where it signs in, where it sends events. The
-                // hosts they go to are said first, all of them, the descriptor's own keys' first (a collection with thousands of addresses
-                // cannot push one out), then each place that has an address, by the first of its addresses or by how many it has and the hosts.
-                let lanes = address_lanes(&v);
-                let total: usize = lanes.iter().map(|(_, l)| l.count).sum();
-                let fixed: std::collections::BTreeSet<&String> = lanes.iter().flat_map(|(_, l)| l.fixed_hosts.iter()).collect();
-                let bulk: std::collections::BTreeSet<&String> = lanes.iter().flat_map(|(_, l)| l.bulk_hosts.iter()).filter(|h| !fixed.contains(*h)).collect();
-                let scopes = v.pointer("/auth/scopes").and_then(Value::as_array).map(|a| a.iter().filter_map(Value::as_str).collect::<Vec<_>>().join(" ")).filter(|s| !s.is_empty());
-                let count = |n: usize, one: &str, many: &str| format!("{n} {}", if n == 1 { one } else { many });
-                let mut what = format!("A link to a provider, prefilled with the address {}{overrides}", clip(s(&v, "defaultBaseUrl").unwrap_or("(none)"), 160));
+                let places = addresses_by_place(&v);
+                let place = |key: &str| places.iter().find(|(k, _)| k == key).map(|(_, a)| a.as_slice());
+                // What replaces one OAIY ships, the address it is prefilled with and what it asks to be allowed come first; then each place it
+                // sends to, by its own key, in a fixed order, each cut on its own: where it signs in, its health check, its heartbeat, where
+                // it sends events. A place with thousands of addresses (or thirty more keys of its own) cannot push another out.
+                let mut parts = Parts::new("connector");
+                if local.builtin_connectors.contains(id) {
+                    parts = parts.fixed("replaces", "REPLACES the connector OAIY ships with this id.");
+                }
+                parts = parts.fixed("prefilled", format!("A link to a provider, prefilled with the address {}.", short(s(&v, "defaultBaseUrl").unwrap_or("(none)"), 160)));
+                if let Some(scopes) = v.pointer("/auth/scopes").and_then(Value::as_array).map(|a| a.iter().filter_map(Value::as_str).collect::<Vec<_>>()).filter(|s| !s.is_empty()) {
+                    parts = parts.fixed("scopes", format!("Asks to be allowed ({}): {}.", scopes.len(), scopes.join(" ")));
+                }
+                for (key, label) in KNOWN_PLACES {
+                    if let Some(all) = place(key) {
+                        parts = parts.fixed(label, place_said(key, all));
+                    }
+                }
+                let total: usize = places.iter().map(|(_, a)| a.len()).sum();
                 if total > 0 {
-                    let named: Vec<String> = fixed.iter().take(MAX_FIXED_HOSTS_NAMED).chain(bulk.iter().take(MAX_HOSTS_NAMED)).map(|h| clip(h, 80)).collect();
-                    let unnamed = fixed.len() + bulk.len() - named.len();
-                    what.push_str(&format!("; it holds {} in {}, to {}: {}{}", count(total, "address", "addresses"), count(lanes.len(), "place", "places"), count(fixed.len() + bulk.len(), "host", "hosts"), named.join(", "), if unnamed > 0 { format!(" and {unnamed} more") } else { String::new() }));
-                    let places: Vec<String> = lanes
-                        .iter()
-                        .take(MAX_LANES_NAMED)
-                        .map(|(place, lane)| match (&lane.first, lane.count) {
-                            (Some((path, address)), 1) => clip(&format!("{path} = {address}"), 120),
-                            _ => {
-                                let (all, n) = lane.hosts();
-                                format!("{}: {} addresses, to {}{}", clip(place, 40), lane.count, all.iter().take(4).map(|h| clip(h, 60)).collect::<Vec<_>>().join(", "), if n > 4 { format!(" and {} more hosts", n - 4) } else { String::new() })
-                            }
-                        })
-                        .collect();
-                    what.push_str(&format!("; by place: {}{}", places.join("; "), if lanes.len() > MAX_LANES_NAMED { format!(" and {} more places", lanes.len() - MAX_LANES_NAMED) } else { String::new() }));
+                    let everything: Vec<&Address> = places.iter().flat_map(|(_, a)| a.iter()).collect();
+                    let hosts: BTreeSet<String> = everything.iter().map(|a| host_of(&a.value)).collect();
+                    parts = parts.sample("summary", format!("It holds {} in {}, to {}.", words(total, "address", "addresses"), words(places.len(), "place", "places"), words(hosts.len(), "host", "hosts")));
                 }
-                if let Some(scopes) = scopes {
-                    what.push_str(&format!("; asks to be allowed: {}", clip(&scopes, 160)));
+                let others: Vec<&(String, Vec<Address>)> = places.iter().filter(|(k, _)| k != "defaultBaseUrl" && !KNOWN_PLACES.iter().any(|(n, _)| n == k)).collect();
+                if !others.is_empty() {
+                    let said = others.iter().take(MAX_OTHER_PLACES).map(|(k, a)| format!("{}: {} to {}", short(k, 40), words(a.len(), "address", "addresses"), hosts_said(&a.iter().collect::<Vec<_>>()))).collect::<Vec<_>>().join("; ");
+                    parts = parts.sample("other-places", format!("Other places it sends to: {said}{}.", if others.len() > MAX_OTHER_PLACES { format!(" and {} more places", others.len() - MAX_OTHER_PLACES) } else { String::new() }));
                 }
-                what.push('.');
-                vec![ReviewItem { class, name: name.to_string(), title: clip(&format!("{} ({id})", s(&v, "name").unwrap_or(id)), 120), what: clip(&what, 6000) }]
+                vec![parts.item(class, name, &format!("{} ({id})", s(&v, "name").unwrap_or(id)))]
             }
             Err(_) => vec![unreadable(class, name, "it is not valid JSON")],
         },
         "callers.json" => match value() {
             Ok(v) => {
                 let entries = v.get("contacts").and_then(Value::as_array).map(Vec::len).or_else(|| v.as_array().map(Vec::len)).or_else(|| v.as_object().map(|o| o.len())).unwrap_or(0);
-                vec![ReviewItem {
-                    class,
-                    name: name.to_string(),
-                    title: "Contacts and what is remembered about callers".to_string(),
-                    what: format!("{entries} entr{}: the names, facts and notes that the receptionist and the Agent read about a person before they answer them.", if entries == 1 { "y" } else { "ies" }),
-                }]
+                vec![Parts::new("callers")
+                    .fixed("entries", format!("{entries} entr{}: the names, facts and notes that the receptionist and the Agent read about a person before they answer them.", if entries == 1 { "y" } else { "ies" }))
+                    .item(class, name, "Contacts and what is remembered about callers")]
             }
             Err(_) => vec![unreadable(class, name, "it is not valid JSON")],
         },
@@ -605,7 +658,7 @@ pub fn describe(class: RestoreClass, name: &str, bytes: &[u8], local: &Local, ba
                         let found = filter_json(keys, &v, &|_| true);
                         let mut items: Vec<ReviewItem> = found.kept.iter().filter(|k| k.row.class == Class::Runs && !matches!(k.value, Value::Object(_))).map(|k| key_item(name, k)).collect();
                         if items.is_empty() {
-                            items.push(ReviewItem { class, name: name.to_string(), title: clip(&format!("Settings of the \"{plugin}\" plugin"), 120), what: "Nothing in it is a setting OAIY restores: what is not left out is call handling, and none of it is in this file.".to_string() });
+                            items.push(Parts::new("nothing").fixed("nothing", "Nothing in it is a setting OAIY restores: what is not left out is call handling, and none of it is in this file.").item(class, name, &format!("Settings of the \"{plugin}\" plugin")));
                         }
                         items
                     }
@@ -617,6 +670,10 @@ pub fn describe(class: RestoreClass, name: &str, bytes: &[u8], local: &Local, ba
         _ => Vec::new(),
     }
 }
+
+/// How many of the plugins a setup record marks as accepted, and of a flow's inputs, are named (the rest are counted).
+const MAX_ACCEPTED_NAMED: usize = 10;
+const MAX_INPUTS_NAMED: usize = 8;
 
 /// The most services and appointments the dry run lists one by one (the rest are counted).
 const MAX_CALENDAR_LISTED: usize = 40;
@@ -635,31 +692,41 @@ fn describe_calendar(class: RestoreClass, name: &str, document: &Value) -> Vec<R
             groups.entry((if list == "appointments" { "appointments" } else { "settings.services" }, *at)).or_default().push(kept);
         }
     }
+    let position = |path: &str| keys.keys.iter().position(|r| r.path == path).unwrap_or(usize::MAX);
     for list in ["settings.services", "appointments"] {
         let mut total = 0usize;
-        let mut words = 0usize;
+        let mut words_of = 0usize;
         for ((_, at), kept) in groups.iter().filter(|((l, _), _)| *l == list) {
             total += 1;
-            let says: Vec<String> = kept.iter().filter(|k| k.row.class == Class::Runs).map(|k| format!("{} {}", clip(&k.row.what.to_lowercase(), 60), show_value(&k.value))).collect();
+            let mut says: Vec<&&super::table::Kept> = kept.iter().filter(|k| k.row.class == Class::Runs).collect();
+            says.sort_by_key(|k| position(&k.path));
             if says.is_empty() {
                 continue;
             }
-            words += 1;
-            if words > MAX_CALENDAR_LISTED {
+            words_of += 1;
+            if words_of > MAX_CALENDAR_LISTED {
                 continue;
             }
-            let when = kept.iter().find(|k| k.path.ends_with(".start")).and_then(|k| k.value.as_str()).map(|s| format!(" at {}", clip(s, 20))).unwrap_or_default();
-            let (title, what) = if list == "appointments" { (format!("Appointment {}{when}", at + 1), "The receptionist tells the caller who booked it what it is for, the Agent reads its name and notes, and the phone sends it to your linked FormLogic account") } else { (format!("Service {}", at + 1), "The receptionist reads it before it answers and says it to callers") };
-            items.push(ReviewItem { class, name: format!("{name}#{list}[{at}]"), title, what: clip(&format!("{what}: {}.", says.join("; ")), 1600) });
+            let when = kept.iter().find(|k| k.path.ends_with(".start")).and_then(|k| k.value.as_str()).map(|s| format!(" at {}", short(s, 20))).unwrap_or_default();
+            let (title, parts, what) = if list == "appointments" {
+                (format!("Appointment {}{when}", at + 1), Parts::new("calendar-appointment"), "The receptionist tells the caller who booked it what it is for, the Agent reads its name and notes, and the phone sends it to your linked FormLogic account.")
+            } else {
+                (format!("Service {}", at + 1), Parts::new("calendar-service"), "The receptionist reads it before it answers and says it to callers.")
+            };
+            let mut parts = parts.fixed("about", what);
+            for k in says {
+                parts = parts.fixed(&k.path, format!("{}: {}.", k.row.what, show_value(&k.value)));
+            }
+            items.push(parts.item(class, &format!("{name}#{list}[{at}]"), &title));
         }
-        if words > MAX_CALENDAR_LISTED {
-            let more = words - MAX_CALENDAR_LISTED;
-            items.push(ReviewItem {
-                class,
-                name: format!("{name}#{list}"),
-                title: format!("and {more} more {}", if list == "appointments" { "appointments" } else { "services" }),
-                what: format!("{more} more of the {total} {} have words in them that are read in the same way; they come back with the same tick.", if list == "appointments" { "appointments" } else { "services" }),
-            });
+        if words_of > MAX_CALENDAR_LISTED {
+            let more = words_of - MAX_CALENDAR_LISTED;
+            let noun = if list == "appointments" { "appointments" } else { "services" };
+            items.push(
+                Parts::new("more")
+                    .fixed("count", format!("{more} more of the {total} {noun} have words in them that are read in the same way; they come back with the same tick."))
+                    .item(class, &format!("{name}#{list}"), &format!("and {more} more {noun}")),
+            );
         }
     }
     // (A calendar with no words in it, only hours and times, has nothing to tick: it says nothing here.)
@@ -668,20 +735,14 @@ fn describe_calendar(class: RestoreClass, name: &str, document: &Value) -> Vec<R
 
 /// A voice file, by its name and size: it is audio, and is never read.
 pub fn describe_voice(class: RestoreClass, name: &str, size: u64) -> ReviewItem {
-    ReviewItem { class, name: name.to_string(), title: clip(name.rsplit('/').next().unwrap_or(name), 120), what: format!("A voice file ({} KB): what your callers hear.", size.div_ceil(1024)) }
+    Parts::new("voice").fixed("file", format!("A voice file ({} KB): what your callers hear.", size.div_ceil(1024))).item(class, name, name.rsplit('/').next().unwrap_or(name))
 }
 
 /// A value as a person is shown it: text is cut, with how long it is.
 pub fn show_value(value: &Value) -> String {
     match value {
-        Value::String(text) => {
-            let length = text.chars().count();
-            if length > 160 {
-                format!("\"{}\" ({length} characters in all)", clip(text, 160))
-            } else {
-                format!("\"{text}\"")
-            }
-        }
+        // What a person reads: the characters they cannot see are made visible before the length is counted.
+        Value::String(text) => quoted(text, 160),
         Value::Array(items) if items.is_empty() => "an empty list".to_string(),
         Value::Array(items) if items.iter().all(Value::is_string) => {
             let shown: Vec<String> = items.iter().take(5).filter_map(Value::as_str).map(|s| clip(s, 40)).collect();
@@ -697,12 +758,12 @@ pub fn show_value(value: &Value) -> String {
 /// What one key that acts is, for the dry run: by its key, its name and its value.
 pub fn key_item(file: &str, kept: &super::table::Kept) -> ReviewItem {
     let class = kept.row.tick.unwrap_or(RestoreClass::Settings);
-    let mut what = format!("Sets {} to {}.", kept.path, show_value(&kept.value));
+    // The value is the fixed part; why it matters is a sample after it, each cut on its own.
+    let mut parts = Parts::new("setting").fixed("sets", format!("Sets {} to {}.", kept.path, show_value(&kept.value)));
     if !kept.row.reason.is_empty() {
-        what.push(' ');
-        what.push_str(&kept.row.reason);
+        parts = parts.sample("why", &kept.row.reason);
     }
-    ReviewItem { class, name: format!("{file}#{}", kept.path), title: clip(&kept.row.what, 120), what: clip(&what, 700) }
+    parts.item(class, &format!("{file}#{}", kept.path), &kept.row.what)
 }
 
 /// Something in a backup that is not brought back, and why: for the list of what is not restored.

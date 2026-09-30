@@ -273,7 +273,7 @@ fn run(opts: &CreateOptions<'_>) -> Result<CreateResult> {
                         counts.agent_conversations = got.done.counts.conversations;
                         counts.agent_files = got.done.counts.files;
                         // What the page says is cut to what a panel shows, and there is only so much of it.
-                        partial.extend(got.done.warnings.iter().take(20).map(|w| format!("Agent: {}", super::review::clip(w, 300))));
+                        partial.extend(super::parts::lines_of(&got.done.warnings, 20, 300).into_iter().map(|w| format!("Agent: {w}")));
                     }
                 }
                 Err(why) => {

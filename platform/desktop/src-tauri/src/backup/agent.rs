@@ -674,7 +674,9 @@ fn added_by_the_import(data_dir: &Path, id: &str) -> Option<(Vec<String>, usize)
 /// `POST .../done`: the page has imported (or could not). Which files it added is worked out here, not taken from the page.
 pub fn import_done(data_dir: &Path, id: &str, token: &str, report: &ImportReport) -> Result<(), PartError> {
     check_import(data_dir, id, token)?;
-    let mut warnings = report.warnings.clone();
+    // What the desktop itself has to say comes first: it is about what an undo can do, and the page's own warnings (of which there may be
+    // hundreds) are a sample after it, so they cannot crowd it out of the result.
+    let mut warnings: Vec<String> = Vec::new();
     match added_by_the_import(data_dir, id) {
         Some((added, over)) => {
             keep_added(data_dir, id, &added);
@@ -685,6 +687,7 @@ pub fn import_done(data_dir: &Path, id: &str, token: &str, report: &ImportReport
         None if report.ok => warnings.push("No copy of the Agent's storage from before was kept, so an undo cannot take away what was added.".to_string()),
         None => {}
     }
+    warnings.extend(report.warnings.iter().cloned());
     drop_pending_import(data_dir);
     super::restore::record_agent_result(data_dir, id, report.ok, report.error.as_deref(), &warnings);
     Ok(())

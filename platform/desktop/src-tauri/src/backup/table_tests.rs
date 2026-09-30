@@ -797,7 +797,7 @@ fn the_backup_docs_are_generated_from_the_table() {
     let t = table();
     let path = docs_path();
     let doc = lf(&std::fs::read_to_string(&path).expect("docs/BACKUP.md"));
-    let blocks = [("classification-table", t.render_table()), ("tick-kinds", t.render_kinds()), ("audit", t.render_audit())];
+    let blocks = [("classification-table", t.render_table()), ("tick-kinds", t.render_kinds()), ("audit", t.render_audit()), ("dry-run-places", super::parts::render_places())];
     let mut expected = doc.clone();
     for (name, block) in &blocks {
         expected = splice_generated(&expected, name, block).unwrap_or_else(|| panic!("docs/BACKUP.md has no <!-- BEGIN GENERATED: {name} --> ... <!-- END GENERATED: {name} --> block"));
