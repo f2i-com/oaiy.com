@@ -30,7 +30,7 @@ import {
 import { DEFAULT_AGENT_SETTINGS, DEFAULT_MESSAGE_SETTINGS, type Settings } from '../../src/settings';
 import { EMPTY_MEDIA } from '../../src/agent/media';
 import type { Desktop } from '../../src/desktop/bridge';
-import { Outreach, type Campaign, type DoNotContact } from '../../src/outreach';
+import { Outreach, planOutreach, type Campaign, type DoNotContact } from '../../src/outreach';
 import { PhoneLine } from '../../src/phoneLine';
 import { setLocalCountry } from '../../src/phoneNumbers';
 import { Vfs } from '../../src/vfs/vfs';
@@ -435,6 +435,34 @@ describe('exporting the Agent storage', () => {
     for (const value of ['', 'v1', 'x', 'abcdefgh', 'sk-abcdefghijklmnopqrstuvwxyz', '12345', '1234567890123456', '2024-2-15', '2024-02-15-Preview', '2024-02-15-preview-preview', '2024-02-15.1', '1.2.3.4.5', '1.', '.1', '1..2', '-preview', '\u0662\u0660\u0662\u0664-\u0660\u0662-\u0661\u0665', '2024-02-15\n', '1 ', 'a%2Fb']) {
       expect(addressWithoutCredentials(`https://gw.example/v1?api-version=${value.replace(/[\n ]/g, (c) => encodeURIComponent(c))}`), JSON.stringify(value)).toEqual({ address: 'https://gw.example/v1', changed: true });
     }
+  });
+
+  it('every reason the planner gives for setting someone aside is in the desktop\u2019s list of them (skipped[].why), which is all a restore brings back', () => {
+    const table = JSON.parse(TABLE) as { keyTables: Record<string, { keys: Array<{ path: string; type?: string; options?: string[] }> }> };
+    const row = table.keyTables['agent.campaign'].keys.find((k) => k.path === 'skipped[].why');
+    expect(row?.type).toBe('enum');
+    const listed = row!.options!;
+    expect(listed).toContain('other');
+    // One of each kind of person the planner sets aside, in a list of calls and in a list of texts.
+    const identity = { business: 'Greenleaf Lawns', receptionist: 'Aokie' };
+    const ctx = {
+      identity,
+      screening: { acceptPattern: '^\\s*(\\+?61|\\(?0[1-9])', blockedNumbers: '0400000004', rejectPrivate: false },
+      doNotContact: [{ number: '+61400000005', at: 0, why: 'texted STOP' }],
+      inTextCampaign: (): string | null => null,
+      slugs: new Set<string>(),
+    };
+    const call = { kind: 'call', name: 'Reasons', objective: 'Ask.', openingLine: 'Hi, it is Aokie from Greenleaf Lawns.', collect: [{ key: 'ok', question: 'Fine?', type: 'yes_no' }] };
+    const people = [{ name: 'Fine', number: '0412345678' }, { name: 'Short', number: '0412 000' }, { name: 'Blocked', number: '0400 000 004' }, { name: 'Asked', number: '0400 000 005' }, { name: 'Abroad', number: '+1 415 555 0100' }];
+    const plan = planOutreach({ ...call, people }, ctx);
+    if (typeof plan === 'string') throw new Error(plan);
+    const given = new Set(plan.skipped.map((s) => s.why));
+    expect(given.size, `the planner gave ${[...given].join(' / ')}`).toBe(4);
+    for (const why of given) expect(listed, why).toContain(why);
+    // The one reason that names something (another campaign) is not in the list: it comes back as "other" (it is not fixed words).
+    const text = planOutreach({ kind: 'text', name: 'Texts', objective: 'Ask.', textTemplate: 'Hi from Greenleaf Lawns.', collect: [], people: [{ name: 'Waiting', number: '0412345678' }] }, { ...ctx, inTextCampaign: () => 'Friday reminders' });
+    expect(typeof text === 'string' ? text : '').toContain('already texted in "Friday reminders", waiting for their reply');
+    expect(listed.some((r) => r.startsWith('already texted'))).toBe(false);
   });
 
   it('leaves out the browser\u2019s temporary write files', async () => {

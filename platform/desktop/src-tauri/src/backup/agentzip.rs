@@ -31,7 +31,7 @@ use zip::{CompressionMethod, ZipWriter};
 
 use super::container::{self, Archive};
 use super::review::{clip, key_item, show_value, NotRestored, RestoreClass, ReviewItem, Ticks};
-use super::table::{filter_json, filter_json_exact, table, Class, KeyRow, Row, Why};
+use super::table::{filter_json, filter_json_exact, table, Class, KeyRow, Row, ValueType, Why};
 use super::{BackupError, Budget, ErrorKind, Limits, Result};
 use crate::secret_file;
 
@@ -193,6 +193,8 @@ pub struct Rebuilt {
     pub campaign: Value,
     /// People whose number is not a full phone number (E.164, `+` and 7 to 15 digits), which the Agent never writes: left out.
     pub bad_numbers: usize,
+    /// People set aside at planning whose reason was not one the Agent gives: it comes back as "other" (a reason is said to the Agent as it is).
+    pub other_reasons: usize,
     /// Who the backup said started it (the project's id and name): a restored campaign is started by the front desk, whoever it says.
     pub started_by: Option<(String, String)>,
 }
@@ -334,8 +336,44 @@ pub fn rebuild_campaign(found: &Value, was: Option<&str>) -> std::result::Result
     out.insert("report".into(), json!({ "text": "", "pending": false, "delivered": true }));
     out.insert("lines".into(), json!([]));
     out.insert("people".into(), Value::Array(people));
-    out.insert("skipped".into(), c.get("skipped").filter(|v| v.is_array()).cloned().unwrap_or_else(|| json!([])));
-    Ok(Rebuilt { campaign: Value::Object(out), bad_numbers, started_by })
+    // The people set aside at planning come back with one of the reasons the Agent gives (the table's list) and never other words: the
+    // Agent's report of a campaign says these reasons to it as they are. Any other text, or none, is "other", and is counted.
+    let reasons = planner_reasons();
+    let mut other_reasons = 0usize;
+    let skipped: Vec<Value> = c
+        .get("skipped")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .map(|s| {
+            let mut s = s.clone();
+            if let Value::Object(entry) = &mut s {
+                if !entry.get("why").and_then(Value::as_str).is_some_and(|w| reasons.iter().any(|r| r == w)) {
+                    entry.insert("why".to_string(), json!(REASON_OTHER));
+                    other_reasons += 1;
+                }
+            }
+            s
+        })
+        .collect();
+    out.insert("skipped".into(), Value::Array(skipped));
+    Ok(Rebuilt { campaign: Value::Object(out), bad_numbers, other_reasons, started_by })
+}
+
+/// What a reason that is not one the Agent gives comes back as (it is one of the table's reasons, so a restored campaign restores again).
+const REASON_OTHER: &str = "other";
+
+/// What is said of the reasons that came back as "other" (at a restore, and in the dry run).
+fn other_reasons_said(n: usize) -> String {
+    format!("{} for setting {} aside at planning {} not {} the Agent gives, so {} back as \"{REASON_OTHER}\".", plural(n, "reason", "reasons"), if n == 1 { "someone" } else { "people" }, if n == 1 { "was" } else { "were" }, if n == 1 { "one" } else { "ones" }, if n == 1 { "it comes" } else { "they come" })
+}
+
+/// The reasons the Agent gives for setting a person aside when it plans a campaign, as the table lists them (`skipped[].why`).
+fn planner_reasons() -> &'static [String] {
+    match table().key_table("agent.campaign").and_then(|kt| kt.row("skipped[].why")).and_then(|row| row.ty.as_ref()) {
+        Some(ValueType::Enum(options)) => options,
+        _ => &[],
+    }
 }
 
 /// (For the tests: how a campaign is described.)
@@ -420,6 +458,10 @@ fn describe_campaign(kept: &super::table::Filtered, rebuilt: &Rebuilt, was: Opti
     }
     if rebuilt.bad_numbers > 0 {
         what.push_str(&format!(" {} without a full phone number {} left out.", plural(rebuilt.bad_numbers, "person", "people"), if rebuilt.bad_numbers == 1 { "was" } else { "were" }));
+    }
+    if rebuilt.other_reasons > 0 {
+        what.push(' ');
+        what.push_str(&other_reasons_said(rebuilt.other_reasons));
     }
     // Everything it says or does, by value: each key that the table lets through and that is not a person (listed below).
     let mut listed = 0usize;
@@ -909,7 +951,7 @@ pub fn filter(nested: &Path, out: &Path, scratch: &Path, ticks: &Ticks, mode: Mo
                     rebuild_campaign(&filter_json(kt, &v, &|_| true).value, v.get("state").and_then(Value::as_str))
                 });
                 match rebuilt {
-                    Ok(Rebuilt { campaign, bad_numbers, started_by }) => {
+                    Ok(Rebuilt { campaign, bad_numbers, other_reasons, started_by }) => {
                         let id = campaign.get("id").and_then(Value::as_str).unwrap_or_default().to_string();
                         // The file is named for its campaign: a campaign cannot be written over another's file.
                         if entry.name != format!("opfs/front-desk/outreach/{id}.json") {
@@ -918,6 +960,9 @@ pub fn filter(nested: &Path, out: &Path, scratch: &Path, ticks: &Ticks, mode: Mo
                         }
                         if bad_numbers > 0 {
                             prepared.notes.push(format!("{}: {} without a full phone number {} left out.", clip(&display(&entry.name), 120), plural(bad_numbers, "person", "people"), if bad_numbers == 1 { "was" } else { "were" }));
+                        }
+                        if other_reasons > 0 {
+                            prepared.notes.push(format!("{}: {}", clip(&display(&entry.name), 120), other_reasons_said(other_reasons)));
                         }
                         if let Some((project, _)) = &started_by {
                             prepared.notes.push(format!("{}: it said it was started by the project \"{}\"; it comes back started by the front desk.", clip(&display(&entry.name), 120), clip(project, 60)));

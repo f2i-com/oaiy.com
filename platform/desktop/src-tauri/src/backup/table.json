@@ -694,7 +694,7 @@
         { "path": "skipped", "class": "runs", "tick": "outreach", "type": "objects", "maxItems": 5000, "what": "People skipped at planning" },
         { "path": "skipped[].name", "class": "runs", "tick": "outreach", "type": "string", "maxChars": 200, "what": "A skipped person" },
         { "path": "skipped[].number", "class": "runs", "tick": "outreach", "type": "string", "maxChars": 40, "what": "Their number" },
-        { "path": "skipped[].why", "class": "runs", "tick": "outreach", "type": "string", "maxChars": 300, "what": "Why" },
+        { "path": "skipped[].why", "class": "runs", "tick": "outreach", "type": "enum", "options": ["not a full phone number", "on the phone's blocked list", "not a number the phone answers (its filter)", "asked not to be contacted", "other"], "what": "Why", "reason": "One of the reasons the Agent gives when it plans a campaign; any other words (a reason that names another campaign, or one that was written by someone else) come back as \"other\". The Agent's report of the campaign says these reasons to it as they are, so they are not free text." },
         { "path": "people", "class": "runs", "tick": "outreach", "type": "objects", "maxItems": 5000, "what": "The people to contact" },
         { "path": "people[].id", "class": "runs", "tick": "outreach", "type": "string", "maxChars": 128, "what": "A person's id" },
         { "path": "people[].name", "class": "runs", "tick": "outreach", "type": "string", "maxChars": 80, "what": "A person's name" },

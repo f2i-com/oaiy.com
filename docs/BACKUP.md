@@ -202,7 +202,7 @@ One outreach campaign. Its run state (running, in flight, retry timers, attempts
 | `skipped` | runs | Only with the tick "Outreach campaigns (texts and calls to a list of people)" | People skipped at planning |
 | `skipped[].name` | runs | Only with the tick "Outreach campaigns (texts and calls to a list of people)" | A skipped person |
 | `skipped[].number` | runs | Only with the tick "Outreach campaigns (texts and calls to a list of people)" | Their number |
-| `skipped[].why` | runs | Only with the tick "Outreach campaigns (texts and calls to a list of people)" | Why |
+| `skipped[].why` | runs | Only with the tick "Outreach campaigns (texts and calls to a list of people)" | Why: One of the reasons the Agent gives when it plans a campaign; any other words (a reason that names another campaign, or one that was written by someone else) come back as "other". The Agent's report of the campaign says these reasons to it as they are, so they are not free text. |
 | `people` | runs | Only with the tick "Outreach campaigns (texts and calls to a list of people)" | The people to contact |
 | `people[].id` | runs | Only with the tick "Outreach campaigns (texts and calls to a list of people)" | A person's id |
 | `people[].name` | runs | Only with the tick "Outreach campaigns (texts and calls to a list of people)" | A person's name |
@@ -681,7 +681,11 @@ in parts through internal routes with a secret made for that one backup.
   what a model reads of the people: the name, notes and details of each, and for one who was
   done how it ended, what they said and what they answered, for ten of them, and the same for ten
   of the people skipped at planning (their names and why, which the report of the campaign says to
-  the Agent), with the rest of each counted), and the Agent's
+  the Agent), with the rest of each counted; **why is never free text**: it is one of the reasons the
+  Agent gives when it plans a campaign (not a full phone number, on the phone's blocked list, not a
+  number the phone answers, asked not to be contacted) or `other`, for every person set aside and
+  not only the ones the dry run shows, and the dry run and the result say how many were replaced.
+  A reason that names another campaign ("already texted in ...") comes back as `other`), and the Agent's
   settings key by key with their values (the instructions with their full length). It says what is not restored
   and why, and every name it does not know is "not restored: unknown item". The archive that is
   prepared is recorded with its size and SHA-256 and held to them like a staged data file is: when
