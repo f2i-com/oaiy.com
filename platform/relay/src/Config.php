@@ -214,6 +214,7 @@ final class Config
                 throw self::bad('cors.extra_origins');
             }
         }
+        Ice::validate($c);
     }
 
     /**
@@ -296,6 +297,25 @@ final class Config
     public function pepper(): ?string
     {
         return $this->c['token_pepper'];
+    }
+
+    /** @return array{urls:list<string>,secret:?string,ttl:int,relay_only:bool} the TURN section, validated (see Ice) */
+    public function turn(): array
+    {
+        $t = $this->c['turn'];
+        return ['urls' => array_values($t['urls']), 'secret' => $t['secret'], 'ttl' => (int)$t['ttl'], 'relay_only' => (bool)$t['relay_only']];
+    }
+
+    /** @return list<string> */
+    public function stunUrls(): array
+    {
+        return array_values($this->c['stun']['urls']);
+    }
+
+    /** `auto`, `on`, `off` or `force`: whether the framed stream is offered (see Info::features). */
+    public function compatSse(): string
+    {
+        return (string)$this->c['compat']['sse'];
     }
 
     public function wakeMode(): string

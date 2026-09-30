@@ -120,14 +120,14 @@ final class Kernel
             $res = $this->dispatch($req);
         } catch (ApiError $e) {
             $code = $e->errorCode;
-            $res = Response::error($e);
+            $res = Facade::isCompatPath($req->path) ? Facade::error($e) : Response::error($e);
             if ($e->status === 405) {
                 $res->headers['Allow'] = 'GET, POST, PUT, PATCH, DELETE';
             }
         } catch (\Throwable $e) {
             Log::error($e, $this->route);
             $code = 'internal';
-            $res = Response::error(ApiError::make('internal'));
+            $res = Facade::isCompatPath($req->path) ? Facade::error(ApiError::make('internal')) : Response::error(ApiError::make('internal'));
         }
         if ($code !== null && $code !== 'rate_limited') {
             $this->ctx->limiter->bump('rej:' . $code);

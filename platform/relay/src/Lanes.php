@@ -39,12 +39,15 @@ final class Lanes
         return self::TABLE[$lane]['bulk'] ?? false;
     }
 
-    /** Lanes listed in info.limits.lanes for this relay (those a client can post to and this build serves). */
+    /**
+     * Lanes listed in info.limits.lanes for this relay: those a client can post to and this build serves, and, with call
+     * features on, `sig`, which is reached only through the compatibility routes.
+     */
     public static function advertised(bool $callEnabled): array
     {
         $out = [];
         foreach (self::TABLE as $name => $l) {
-            if ($l['client'] && (!$l['call'] || $callEnabled)) {
+            if (($l['client'] || $name === 'sig') && (!$l['call'] || $callEnabled)) {
                 $out[] = $name;
             }
         }

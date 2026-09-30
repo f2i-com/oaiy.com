@@ -249,9 +249,9 @@ test('4.4 the lane table equals the vectors\' table (caps, default, minimum and 
     eq(['ai', 'ai.in', 'ai.out', 'sync'], array_values(array_filter(array_keys(Lanes::TABLE), 'Oaiy\Relay\Lanes::isBulk')));
 });
 
-test('4.4 advertised lanes are the ones a client can post to; ring only with call features', function () {
+test('4.4 advertised lanes are the ones a client can post to; ring only with call features, and sig (reached through the compatibility routes only) with them', function () {
     eq(['cmd', 'res', 'ctl', 'sync'], Lanes::advertised(false));
-    eq(['cmd', 'res', 'ring', 'ctl', 'sync'], Lanes::advertised(true));
+    eq(['cmd', 'res', 'ring', 'ctl', 'sync', 'sig'], Lanes::advertised(true));
 });
 
 // ------------------------------------------------------------------------------------------------ 4.7.1 client address

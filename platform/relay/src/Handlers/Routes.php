@@ -7,14 +7,17 @@ use Oaiy\Relay\Kernel;
 
 defined('OAIY_RELAY') or exit;
 
-/** Routes of enrolment, devices, presence, tokens, the roster and calibration (RL-03a), and of pairing (RL-06). */
+/**
+ * Routes of enrolment, devices, presence, tokens, the roster and calibration (RL-03a), of pairing (RL-06), and of the admission
+ * issuer (RL-07).
+ */
 final class Routes
 {
     /** @return list<array{0:list<string>,1:string,2:string,3:string,4:?list<string>,5:callable}> */
     public static function all(string $dev): array
     {
         $desktop = ['desktop'];
-        return array_merge(self::devices($dev, $desktop), PairingApi::routes());
+        return array_merge(self::devices($dev, $desktop), PairingApi::routes(), AdmissionApi::routes());
     }
 
     /**

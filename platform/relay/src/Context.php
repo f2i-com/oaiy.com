@@ -20,6 +20,7 @@ final class Context
     public Poll $poll;
     public Gc $gc;
     private ?Info $info = null;
+    private ?string $admissionSecret = null;
 
     public static function open(string $dataDir): self
     {
@@ -53,6 +54,15 @@ final class Context
             throw new \RuntimeException('relay id missing');
         }
         return $id;
+    }
+
+    /** The admission secret (32 bytes), read once per request and only by the routes that mint or verify an admission. */
+    public function admissionSecret(): string
+    {
+        if ($this->admissionSecret === null) {
+            $this->admissionSecret = Admission::loadSecret($this->dataDir);
+        }
+        return $this->admissionSecret;
     }
 
     public function info(): Info

@@ -97,8 +97,10 @@ test('4.8 info lists only what this build implements: poll, items, presence, pai
     eq(2, $doc['limits']['desktops']);
     $r->configure(['call' => ['enabled' => true]]);
     $doc = $r->call(null, 'GET', '/v1/info')['json'];
-    eq(['cmd', 'res', 'ring', 'ctl', 'sync'], array_keys($doc['limits']['lanes']));
-    ok(!in_array('call', $doc['features'], true), 'call is listed only when the admission routes exist');
+    eq(['cmd', 'res', 'ring', 'ctl', 'sync', 'sig'], array_keys($doc['limits']['lanes']));
+    eq(['body' => 196608, 'ttl' => ['default' => 120, 'min' => 1, 'max' => 300]], $doc['limits']['lanes']['sig']);
+    eq(['poll', 'items', 'presence', 'pairing.v3', 'methods.post-forms', 'call', 'admission.aokie-adm-v2', 'compat.aokie-companion-relay'], $doc['features'],
+        'call features list the issuer and the compatibility routes, and the stream only after a probe passed');
 });
 
 test('4.8 info: the config narrows what is advertised, never widens it', function () {
