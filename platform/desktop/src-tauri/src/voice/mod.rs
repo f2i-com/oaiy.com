@@ -22,6 +22,7 @@ pub mod voices;
 use std::collections::{HashMap, VecDeque};
 use std::convert::Infallible;
 use std::net::SocketAddr;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, OnceLock, RwLock};
 use std::time::{Duration, Instant};
 
@@ -64,6 +65,12 @@ pub fn gateway_token() -> &'static str {
 /// Who a call is with: from the plugin's `call.incoming` / `call.caller_id` events.
 type CallerOf = dyn Fn(&str) -> Option<(String, String)> + Send + Sync;
 
+/// Which session a call's registration belongs to. A second session for a call that is still live (the phone's stream dropped and came back before the
+/// first was found out) takes the call over, and the first, which ends because its commands stop, must leave what is now the second's alone: the
+/// registration, the record of the call and what the app is told. Only the session that still holds the call may end it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct Registration(u64);
+
 #[derive(Clone)]
 pub struct VoiceHub {
     inner: Arc<Inner>,
@@ -72,7 +79,11 @@ pub struct VoiceHub {
 struct Inner {
     engines: Engines,
     events: broadcast::Sender<Value>,
-    calls: Mutex<HashMap<String, mpsc::UnboundedSender<CallCommand>>>,
+    /// The session that carries each live call: its commands, and the [`Registration`] that says which session it is (a second session for the same
+    /// call takes the call over, and the first must not remove what is no longer its own).
+    calls: Mutex<HashMap<String, (Registration, mpsc::UnboundedSender<CallCommand>)>>,
+    /// The last [`Registration`] given out.
+    registrations: AtomicU64,
     caller_of: Box<CallerOf>,
     /// What this desktop itself knows of each call (who rang, what they said), for the calls
     /// that are live and those that ended lately: it is what a message or a transfer is judged
@@ -203,6 +214,7 @@ impl VoiceHub {
             engines,
             events,
             calls: Mutex::new(HashMap::new()),
+            registrations: AtomicU64::new(0),
             caller_of: Box::new(caller_of),
             records: Mutex::new(HashMap::new()),
             ring: RwLock::new(ring.clone()),
@@ -312,10 +324,15 @@ impl VoiceHub {
         }
     }
 
-    /// The session that carried `call` ends because the owner takes it: its commands are gone, and the call goes on.
-    fn release_for_handoff(&self, call: &str, reason: &str) {
-        self.inner.calls.lock().unwrap().remove(call);
+    /// The session that carried `call` ends because the owner takes it: its commands are gone, and the call goes on. Whether it was that session's
+    /// call to release: a session another has taken the call from (see [`Registration`]) releases nothing, and the owner has not taken what that
+    /// other session carries.
+    fn release_for_handoff(&self, call: &str, registration: Registration, reason: &str) -> bool {
+        if !self.forget(call, registration) {
+            return false;
+        }
         self.enter_handoff(call, reason);
+        true
     }
 
     /// The call is ours again (a new session for it began).
@@ -493,7 +510,7 @@ impl VoiceHub {
         self.emit(event);
         // Nobody to answer them: the call decides what to do (it never hangs up on a caller while the owner is being rung).
         if !self.page_answers() && !self.in_handoff(call) {
-            if let Some(tx) = self.inner.calls.lock().unwrap().get(call) {
+            if let Some((_, tx)) = self.inner.calls.lock().unwrap().get(call) {
                 let _ = tx.send(CallCommand::NoAnswerer);
             }
         }
@@ -503,17 +520,37 @@ impl VoiceHub {
         (self.inner.caller_of)(call)
     }
 
-    fn register(&self, call: &str, tx: mpsc::UnboundedSender<CallCommand>) {
-        self.inner.calls.lock().unwrap().insert(call.to_string(), tx);
+    /// A session carries `call` from now on. One that was carrying it (the call's stream came back before the old one was found to be gone) loses its
+    /// commands, and ends; what it leaves undone is left to this one ([`VoiceHub::unregister`]).
+    fn register(&self, call: &str, tx: mpsc::UnboundedSender<CallCommand>) -> Registration {
+        let registration = Registration(self.inner.registrations.fetch_add(1, Ordering::SeqCst) + 1);
+        self.inner.calls.lock().unwrap().insert(call.to_string(), (registration, tx));
+        registration
     }
 
-    fn unregister(&self, call: &str) {
-        self.inner.calls.lock().unwrap().remove(call);
+    /// The session `registration` no longer carries `call`, if it did: whether it did. A session that was displaced by another does not end the call, and
+    /// neither the record of the call nor the app is told it did (the call is going on, on the session that took it).
+    fn forget(&self, call: &str, registration: Registration) -> bool {
+        let mut calls = self.inner.calls.lock().unwrap();
+        if calls.get(call).is_some_and(|(held, _)| *held == registration) {
+            calls.remove(call);
+            true
+        } else {
+            false
+        }
+    }
+
+    /// The session `registration` ends the call it carried: whether it was the one that carried it (and the call is over), and if not, nothing is done.
+    fn unregister(&self, call: &str, registration: Registration) -> bool {
+        if !self.forget(call, registration) {
+            return false;
+        }
         self.note_ended(call);
+        true
     }
 
     fn command(&self, call: &str) -> Option<mpsc::UnboundedSender<CallCommand>> {
-        self.inner.calls.lock().unwrap().get(call).cloned()
+        self.inner.calls.lock().unwrap().get(call).map(|(_, tx)| tx.clone())
     }
 
     /// The calls going on now: those we answer, and those the owner has taken.
@@ -1005,10 +1042,10 @@ mod tests {
         // (Other tests hold calls on hubs of their own at the same time, so this asserts only what a call of ours guarantees.)
         let hub = VoiceHub::new(Engines::at("http://127.0.0.1:9", "http://127.0.0.1:9"), |_| None);
         let (tx, _rx) = mpsc::unbounded_channel();
-        hub.register("update_test_call", tx);
+        let held = hub.register("update_test_call", tx);
         assert_eq!(hub.live_calls(), vec!["update_test_call".to_string()]);
         assert!(live_call_count() >= 1, "a live call is counted without being handed the hub");
-        hub.unregister("update_test_call");
+        assert!(hub.unregister("update_test_call", held));
         assert!(hub.live_calls().is_empty());
         // A hub that is gone leaves the count (its calls went with it).
         drop(hub);
@@ -1065,6 +1102,36 @@ mod tests {
         assert!(rx.try_recv().is_err());
     }
 
+    /// A second session for a call that is still live (the phone's stream came back before the old one was found gone) takes the call over. The first
+    /// ends because its commands stop, and that must not end the call, hand it to the owner, or take the second's registration with it.
+    #[test]
+    fn a_session_another_has_taken_the_call_from_leaves_the_call_and_its_registration_alone() {
+        let hub = VoiceHub::new(Engines::at("http://127.0.0.1:9", "http://127.0.0.1:9"), |_| None);
+        hub.note_call("call_1", "+61491570006", "Alex");
+        let (first_tx, _first_rx) = mpsc::unbounded_channel();
+        let first = hub.register("call_1", first_tx);
+        let (second_tx, mut second_rx) = mpsc::unbounded_channel();
+        let second = hub.register("call_1", second_tx);
+        assert_ne!(first, second, "each session's registration is its own");
+        // The first ends: it ends nothing.
+        assert!(!hub.unregister("call_1", first), "it no longer carries the call");
+        assert!(!hub.release_for_handoff("call_1", first, "handoff:takeover"), "nor could the owner have taken what it carries no more");
+        assert!(!hub.in_handoff("call_1") && !hub.call_over("call_1"), "the call goes on");
+        assert_eq!(hub.live_calls(), ["call_1"]);
+        hub.command("call_1").expect("the call still takes commands").send(CallCommand::Hush).unwrap();
+        assert!(matches!(second_rx.try_recv(), Ok(CallCommand::Hush)), "and they are the second session's");
+        // The second ends it, once.
+        assert!(hub.unregister("call_1", second));
+        assert!(hub.call_over("call_1") && hub.live_calls().is_empty());
+        assert!(!hub.unregister("call_1", second), "and it is over once");
+        // The session that holds the call is the one the owner takes it from.
+        hub.note_call("call_2", "+61491570156", "Sam");
+        let (tx, _rx) = mpsc::unbounded_channel();
+        let held = hub.register("call_2", tx);
+        assert!(hub.release_for_handoff("call_2", held, "handoff:takeover"));
+        assert!(hub.in_handoff("call_2") && hub.command("call_2").is_none() && !hub.call_over("call_2"));
+    }
+
     #[test]
     fn a_call_with_the_owner_is_a_live_call_for_an_update_and_for_what_holds_a_backup_back() {
         let hub = VoiceHub::new(Engines::at("http://127.0.0.1:9", "http://127.0.0.1:9"), |_| None);
@@ -1081,15 +1148,15 @@ mod tests {
         assert!(blocked(live_calls_on(&ours)), "and the updater is held back by it, with the reason it gives for a call");
         // A call with a session as well as one with the owner: two calls.
         let (tx, _rx) = mpsc::unbounded_channel();
-        hub.register("call_live", tx);
+        let live = hub.register("call_live", tx);
         assert_eq!(live_calls_on(&ours), 2);
         // The same call in both (the session came back before the handoff was cleared) is one call.
         let (tx, _rx2) = mpsc::unbounded_channel();
-        hub.register("call_owner", tx);
+        let owner = hub.register("call_owner", tx);
         assert_eq!(live_calls_on(&ours), 2, "counted once");
         // The call ends: nothing holds anything back.
-        hub.unregister("call_live");
-        hub.unregister("call_owner");
+        assert!(hub.unregister("call_live", live));
+        assert!(hub.unregister("call_owner", owner));
         hub.end_handoff("call_owner", "ended_during_handoff");
         assert_eq!(live_calls_on(&ours), 0);
         assert!(!blocked(live_calls_on(&ours)));
@@ -1218,7 +1285,9 @@ mod tests {
         let (base, hub, _) = serve_messages(true).await;
         let client = reqwest::Client::new();
         hub.note_call("call_1", "+61491570006", "");
-        hub.unregister("call_1");
+        let (tx, _rx) = mpsc::unbounded_channel();
+        let held = hub.register("call_1", tx);
+        assert!(hub.unregister("call_1", held));
         assert_eq!(hub.call_facts("call_1"), Some(("+61491570006".into(), String::new())), "ended, but lately");
         assert_eq!(client.post(format!("{base}/api/voice/calls/call_1/message")).json(&json!({"message": "Hung up mid-sentence."})).send().await.unwrap().status(), 200);
         // Ended more than ten minutes ago: gone.
@@ -1237,7 +1306,9 @@ mod tests {
         assert!(!hub.call_over("call_1") && !calls.is_over("call_1"), "a call this desktop never heard of is not one that ended");
         hub.note_call("call_1", "+61491570006", "");
         assert!(!hub.call_over("call_1") && !calls.is_over("call_1"), "a call that is going is not over");
-        hub.unregister("call_1");
+        let (tx, _rx) = mpsc::unbounded_channel();
+        let held = hub.register("call_1", tx);
+        assert!(hub.unregister("call_1", held));
         assert!(hub.call_over("call_1") && calls.is_over("call_1"), "the caller hung up");
         assert!(hub.call_facts("call_1").is_some(), "though it is remembered a while");
         // It begins again (the owner handed the caller back): it is a call like any other.

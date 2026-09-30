@@ -1231,6 +1231,49 @@ async fn a_request_the_phone_refused_is_tried_again_on_the_same_ask_after_the_ca
     drop(retried);
 }
 
+/// The phone opens a second stream for a call that is still live, before the first is found to be gone: the second session takes the call, and the
+/// first, whose commands stop, ends alone. It used to end both: it removed the second's registration, marked the call over (so the next request for the
+/// owner was refused as a call that ended), told the app the call ended, and ended what rang for it.
+#[tokio::test]
+async fn a_second_session_for_a_call_that_is_still_live_takes_the_call_and_the_first_ends_alone() {
+    let mut f = flow(owner_settings(true)).await;
+    f.caller_says(ASKED);
+    f.ring_through("assist_1", 30).await;
+    assert_eq!(f.dialog().await.len(), 1, "the owner is being rung");
+    // The stream comes back: a second session for the same call, with the first not stopped.
+    let mut again = f.aokie.restart(json!({"allowTransfer": true, "generation": 2, "greeting": "Sorry about that."})).await;
+    again.begin(json!({}));
+    again.event("call.started", secs(3)).await.expect("the call began again");
+    // The first session ends (its stream is closed)...
+    loop {
+        match tokio::time::timeout(secs(3), f.aokie.from_desktop.recv()).await {
+            Ok(None) => break,
+            Ok(Some(_)) => {}
+            Err(_) => panic!("the first session did not end when the second took the call"),
+        }
+    }
+    // ...and that is all that ended: the call is not over, nobody is told it ended, the second session has the call's commands and what rings goes on.
+    assert!(again.event("call.ended", Duration::from_millis(600)).await.is_none(), "the call did not end");
+    assert!(!again.hub.call_over(&again.call), "and it is not recorded as over");
+    assert!(again.hub.live_calls().contains(&again.call), "it is a live call");
+    assert_eq!(f.dialog().await.len(), 1, "the ring for it goes on");
+    assert!(again.say("Are you still there?").await.is_ok(), "the second session has the call's commands");
+    assert!(spoken_within(&again, "Are you still there?", secs(3)).await, "and says what it is asked to: {:?}", again.speech.spoken());
+    // The second ends the call, and that is the end of it: the app is told once, the record has it over, and what rang is over.
+    again.send(json!({"type": "formlogic.realtime.stop", "callId": again.call, "generation": 2, "reason": "the caller hung up"}));
+    let ended = again.event("call.ended", secs(3)).await.expect("the end is told, by the session that carried the call");
+    assert_eq!(ended["callId"], json!(again.call), "{ended}");
+    assert!(again.hub.call_over(&again.call) && again.hub.live_calls().is_empty());
+    for _ in 0..40 {
+        if f.dialog().await.is_empty() {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    assert_eq!(f.dialog().await.len(), 0, "what rang for a call that is over is over");
+    assert!(again.event("call.ended", Duration::from_millis(300)).await.is_none(), "and it was told once");
+}
+
 /// The other scenario: a ring the owner declined, a minute and a bit on, and the caller says only "No, just take a message please." Nothing
 /// about the gap between tries having passed makes that an ask.
 #[tokio::test]

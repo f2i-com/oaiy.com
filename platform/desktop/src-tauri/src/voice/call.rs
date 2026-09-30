@@ -941,12 +941,8 @@ where
     let (cmd_tx, mut cmd_rx) = mpsc::unbounded_channel::<CallCommand>();
     // A line only to be said is not a call the app answers: it is not listed, and takes no commands
     // (its sender is kept here, as a closed channel would end the call).
-    let _unlisted = if speak_only {
-        Some(cmd_tx)
-    } else {
-        hub.register(&ids.call, cmd_tx);
-        None
-    };
+    // (A session that is listed is told which one it is, so that it ends only what is its own: see `Registration`.)
+    let (_unlisted, registration) = if speak_only { (Some(cmd_tx), None) } else { (None, Some(hub.register(&ids.call, cmd_tx))) };
     // Speech is ready before the caller first speaks.
     {
         let (engines, hub, call) = (engines.clone(), hub.clone(), ids.call.clone());
@@ -1554,18 +1550,24 @@ where
         }
     };
 
-    if speak_only {
+    // Whether this session still carried the call as it ended: one that another session has taken the call from (the phone opened a second stream for
+    // a call that was still live) ends alone. It does not end the call, hand it to the owner, tell the app it ended or end what rings for it: the call
+    // goes on with the session that took it.
+    let carried = if speak_only {
         // A line only to be said is not a call, and its call id may be that of a live call (an apology after
         // the live session failed): it neither detaches that call's commands nor says that call ended.
+        false
     } else if reason.starts_with(transfer::HANDOFF_PREFIX) {
         // The owner has the call: this session is over, and the call is not. The app is told (`call.handoff`), not that
         // it ended; it ends when the phone says so (`aokie.call.ended`) or is handed back (a new session for it).
-        hub.release_for_handoff(&ids.call, &reason);
-    } else {
-        hub.unregister(&ids.call);
+        registration.is_some_and(|held| hub.release_for_handoff(&ids.call, held, &reason))
+    } else if registration.is_some_and(|held| hub.unregister(&ids.call, held)) {
         hub.emit(json!({"type": "call.ended", "callId": ids.call, "reason": reason}));
-    }
-    if !speak_only {
+        true
+    } else {
+        false
+    };
+    if carried {
         // Whatever still rings for this call on this desktop is over.
         ring.call_finished(&ids.call);
     }

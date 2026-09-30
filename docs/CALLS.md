@@ -232,6 +232,12 @@ agent : "I'll try to reach them, please stay with me."  (it is trying: it does n
   (`call.ended`, `ended_during_handoff`). If the phone's word that the call ended is lost, the call is
   let go after 4 hours (`call.ended`, `handoff_expired`), so it does not hold an update back for ever. A
   call in handoff counts as a live call for the updater.
+- **A second session for a call that is still live takes it over.** If the phone opens a new stream for a call id whose
+  first session has not ended (its stream dropped and the desktop has not found out), the new session is the one that
+  carries the call from then on, and the first ends alone: it ends without ending the call (the record of the call,
+  what the app is told, what rings for it and the new session's own commands are all left as they are), and a stop it
+  might still be given for a hand-over does not hand the call to the owner. Each session's registration is its own, and
+  only the session that holds it can end the call, hand it over or say it ended.
 - **A line that promises a transfer is not said before it happens.** Until an owner device has accepted, a line the
   model writes that tells the caller they are being connected, transferred, put through or handed over, in any of the
   forms a model uses ("connecting you now", "I'm transferring you", "I'll transfer you", "let me put you through",
