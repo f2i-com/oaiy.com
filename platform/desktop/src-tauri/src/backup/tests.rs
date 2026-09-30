@@ -6306,7 +6306,7 @@ fn a_connector_is_described_by_every_address_it_holds() {
         "relay": { "path": "https://relay.attacker.example/queue" }
     });
     put(&src.0, "connectors/formlogic.json", descriptor.to_string().as_bytes());
-    // A descriptor with more addresses than are listed: the first eight are, and the rest are counted.
+    // A descriptor with many addresses in one place: they are counted, and every host they go to is named.
     let mirrors: serde_json::Map<String, serde_json::Value> = (0..12).map(|i| (format!("m{i:02}Url"), serde_json::Value::String(format!("https://mirror{i}.example/x")))).collect();
     put(&src.0, "connectors/many.json", serde_json::json!({ "id": "many", "name": "Many", "defaultBaseUrl": "https://one.example", "mirrors": mirrors }).to_string().as_bytes());
     let out = TempDir::new("connector-out");
@@ -6320,8 +6320,12 @@ fn a_connector_is_described_by_every_address_it_holds() {
     }
     assert!(!item.what.contains("auth.tokenPath"), "a relative path is not an address: {}", item.what);
     let many = preview.items.iter().find(|i| i.name == "connectors/many.json").unwrap();
-    assert!(many.what.contains("mirrors.m06Url = https://mirror6.example/x") && !many.what.contains("m07Url"), "eight are listed: {}", many.what);
-    assert!(many.what.contains("and 5 more"), "and the other five are counted: {}", many.what);
+    assert!(many.what.contains("it holds 13 addresses in 2 places, to 13 hosts: "), "{}", many.what);
+    for i in 0..12 {
+        assert!(many.what.contains(&format!("mirror{i}.example")), "the host of mirror {i} is named: {}", many.what);
+    }
+    assert!(many.what.contains("mirrors: 12 addresses, to mirror0.example, mirror1.example, mirror10.example, mirror11.example and 8 more hosts"), "and the place that holds them says how many: {}", many.what);
+    assert!(many.what.contains("defaultBaseUrl = https://one.example"), "{}", many.what);
 }
 
 /// The restart that applies a restore asks what is in the way twice, the second time with nothing between it and the restart.
@@ -7495,6 +7499,156 @@ fn a_campaigns_own_words_are_in_the_dry_run_whatever_number_of_questions_it_asks
             assert!(at("MARK-IDENTITY-BUSINESS-9") < at("collect[1].key"), "the campaign's own keys come before its questions: {said}");
         }
     }
+}
+
+/// A document made from a key table: in each key of it that acts (class `runs`, not a secret, not inside a list) a marker, or a value
+/// that the dry run says by its key. Returns it and what the dry run must say: the marker of a key that is words or an address, and the
+/// path of any other.
+fn marked_document(table_name: &str, skip: &[&str]) -> (serde_json::Value, Vec<String>) {
+    use super::table::{Class, ValueType};
+    let keys = super::table::table().key_table(table_name).unwrap();
+    let mut doc = serde_json::json!({});
+    let mut needles = Vec::new();
+    for (n, key) in keys.keys.iter().enumerate().filter(|(_, k)| k.class == Class::Runs && !k.secret && !k.path.contains("[]") && !skip.contains(&k.path.as_str())) {
+        let marker = format!("MK{n:03}X");
+        let value = match key.ty.as_ref().unwrap() {
+            ValueType::Str { max_chars } if *max_chars >= marker.len() => {
+                needles.push(marker.clone());
+                serde_json::json!(marker)
+            }
+            ValueType::Url { .. } => {
+                needles.push(format!("mk{n:03}x.example"));
+                serde_json::json!(format!("https://mk{n:03}x.example/v1"))
+            }
+            ValueType::Strings { .. } => {
+                needles.push(marker.clone());
+                serde_json::json!([marker])
+            }
+            ValueType::Enum(options) => {
+                needles.push(key.path.clone());
+                serde_json::json!(options.last().unwrap())
+            }
+            ValueType::Bool => {
+                needles.push(key.path.clone());
+                serde_json::json!(true)
+            }
+            ValueType::Int { min, .. } => {
+                needles.push(key.path.clone());
+                serde_json::json!(*min)
+            }
+            _ => continue,
+        };
+        put_at(&mut doc, &key.path.split('.').collect::<Vec<_>>(), &value);
+    }
+    (doc, needles)
+}
+
+/// The reviewer's x6f, made general: every key of a document that acts is in the dry run whatever a collection beside it holds. Each place
+/// the dry run lists something has a fixed part (the keys of the thing itself) and a collection (questions, people, steps, addresses,
+/// files, appointments, providers, plugins): this builds every one of them with fifty questions or five thousand entries of the padding
+/// kind, in the hope of pushing a fixed key out by position or by length, and looks for the marker of each fixed key in the text of the
+/// dry run. A place that can lose one fails here (the campaign's keys after its questions; a flow's tool after the kinds of its steps;
+/// a connector's sign-in after its collection of addresses).
+#[test]
+fn every_fixed_key_that_acts_is_in_the_dry_run_whatever_the_collections_beside_it_hold() {
+    let saying = |preview: &restore::Preview| -> String {
+        let mut text = preview.items.iter().map(|i| format!("{} | {} | {}\n", i.name, i.title, i.what)).collect::<String>();
+        text.push_str(&preview.notes.join("\n"));
+        text
+    };
+    let missing = |what: &str, text: &str, needles: &[String]| {
+        let absent: Vec<&String> = needles.iter().filter(|n| !text.contains(n.as_str())).collect();
+        assert!(absent.is_empty(), "{what}: not in the dry run: {absent:?}\n{}", &text[..text.len().min(3000)]);
+    };
+
+    // ---- the desktop's own files: a flow, a connector, a template, the setup record, the calendar and a plugin's settings
+    let flow = serde_json::json!({
+        "name": "Padded", "nodes": (0..5000).map(|i| serde_json::json!({ "type": format!("AAA-PADKIND-{i:05}-{}", "k".repeat(90)) })).collect::<Vec<_>>(),
+        "oaiyTool": { "name": "MARK-FLOW-TOOL" }, "oaiyToolHook": { "mode": "before", "tool": "MARK-FLOW-HOOK" },
+    });
+    let connector = serde_json::json!({
+        "id": "formlogic", "name": "Padded link", "defaultBaseUrl": "https://mark-default.example", "docsUrl": "https://mark-docs.example/how",
+        "auth": { "kind": "oauth2_pkce", "clientId": "x", "authorizePath": "https://mark-auth.example/authorize", "tokenPath": "//mark-token.example/token", "scopes": ["MARK-SCOPE"] },
+        "healthPath": "https://mark-health.example/h", "relay": { "pendingPath": "https://mark-relay.example/p" }, "heartbeat": { "path": "https://mark-heartbeat.example/h" },
+        "scriptProfile": { "path": "https://mark-profile.example/p" }, "dataNode": { "registerPath": "https://mark-node.example/r" },
+        "flows": { "bindingsPath": "https://mark-flows.example/b", "nodes": (0..5000).map(|i| serde_json::json!({ "path": format!("https://aaa-pad{i:05}.example/x") })).collect::<Vec<_>>() },
+        "appLogic": { "fields": (0..300).map(|i| (format!("f{i:04}Url"), serde_json::json!(format!("https://aaa-map{i:04}.example/x")))).collect::<serde_json::Map<_, _>>(), "path": "https://mark-logic.example/l" },
+    });
+    let template = serde_json::json!({
+        "id": "pad", "name": "Padded", "docsUrl": "https://mark-template-docs.example", "autostart": true, "installedMarker": "MARK-TEMPLATE-MARKER",
+        "run": { "command": "MARK-TEMPLATE-COMMAND", "args": (0..500).map(|i| format!("--flag-{i}-aaaaaaaaaaaaaaaa")).collect::<Vec<_>>(), "cwd": "MARK-TEMPLATE-CWD", "env": (0..5000).map(|i| (format!("ENV_{i:05}"), serde_json::json!("v"))).collect::<serde_json::Map<_, _>>() },
+        "install": { "kind": "script", "unix": "MARK-TEMPLATE-INSTALL" }, "health": { "url": "http://127.0.0.1/MARK-TEMPLATE-HEALTH" },
+        "files": (0..5000).map(|i| (format!("f{i:05}.sh"), serde_json::json!("x"))).collect::<serde_json::Map<_, _>>(),
+        "uninstall": { "paths": (0..5000).map(|i| format!("p{i:05}")).collect::<Vec<_>>() },
+    });
+    let setup = serde_json::json!({ "plugins": (0..5000).map(|i| (format!("plugin{i:05}"), serde_json::json!({ "permissionsAccepted": ["calls"] }))).collect::<serde_json::Map<_, _>>() });
+    let (mut calendar, calendar_needles) = marked_document("calendar", &[]);
+    calendar["settings"]["services"] = (0..100).map(|i| serde_json::json!({ "id": format!("s{i}"), "name": format!("Service {i}"), "minutes": 30, "description": "d".repeat(500), "price": "$1" })).collect();
+    calendar["appointments"] = (0..3000).map(|i| serde_json::json!({ "id": format!("appt_{i:032x}"), "service": "Service 1", "start": "2026-10-05T10:00", "minutes": 30, "status": "confirmed", "name": format!("Booker {i}"), "phone": "0491 570 006", "notes": "n".repeat(500), "source": "call", "createdAt": "2026-09-01T00:00:00Z", "updatedAt": "2026-09-01T00:00:00Z" })).collect();
+    let (plugin, plugin_needles) = marked_document("plugin.aokie", &[]);
+    let texts: Vec<(&str, String)> = vec![
+        ("flows/pad.json", flow.to_string()),
+        ("connectors/formlogic.json", connector.to_string()),
+        ("templates/pad.json", template.to_string()),
+        ("setup.json", setup.to_string()),
+        ("calendar/calendar.json", calendar.to_string()),
+        ("plugin-data/aokie/settings.json", plugin.to_string()),
+    ];
+    let files: Vec<(&str, &[u8])> = texts.iter().map(|(n, t)| (*n, t.as_bytes())).collect();
+    let out = TempDir::new("every-fixed-out");
+    let file = out.0.join("d.oaiybackup");
+    craft(&file, &manifest_for(&files), &files, true);
+    let dst = TempDir::new("every-fixed-dst");
+    let desktop = saying(&restore::inspect(&dst.0, &file, PASS, &options()).unwrap());
+    missing("the flow", &desktop, &["MARK-FLOW-TOOL".into(), "MARK-FLOW-HOOK".into()]);
+    let hosts: Vec<String> = ["default", "docs", "auth", "token", "health", "relay", "heartbeat", "profile", "node", "flows", "logic"].iter().map(|h| format!("mark-{h}.example")).collect();
+    missing("the connector", &desktop, &[hosts, vec!["MARK-SCOPE".to_string(), "REPLACES the connector OAIY ships".to_string()]].concat());
+    let template_needles: Vec<String> = ["mark-template-docs.example", "MARK-TEMPLATE-MARKER", "MARK-TEMPLATE-COMMAND", "MARK-TEMPLATE-CWD", "MARK-TEMPLATE-INSTALL", "MARK-TEMPLATE-HEALTH", "STARTS with OAIY once installed", "writes 5000 script file(s)", "deletes 5000 path(s)", "sets 5000 environment variable(s)"].iter().map(|s| s.to_string()).collect();
+    missing("the template", &desktop, &template_needles);
+    missing("the setup record", &desktop, &["marks the permissions of 5000 plugins as ACCEPTED".to_string()]);
+    assert!(calendar_needles.len() >= 3 && plugin_needles.len() >= 20, "{calendar_needles:?} {plugin_needles:?}");
+    missing("the calendar", &desktop, &calendar_needles);
+    missing("the plugin's settings", &desktop, &plugin_needles);
+
+    // A backup of more things than the dry run can look through is refused, and is not partly said.
+    let ids: String = serde_json::to_string(&(0..2500).map(|i| format!("service-{i}")).collect::<Vec<_>>()).unwrap();
+    let many: Vec<(&str, &[u8])> = vec![("services-autostart.json", ids.as_bytes())];
+    let file = out.0.join("m.oaiybackup");
+    craft(&file, &manifest_for(&many), &many, true);
+    let refusal = restore::inspect(&TempDir::new("every-fixed-many").0, &file, PASS, &options()).err().expect("too many to look through is refused");
+    assert!(refusal.message.contains("more things that can run or reconfigure OAIY than can be looked through"), "{}", refusal.message);
+
+    // ---- the Agent's archive: a campaign, its settings, the brief
+    let keys = super::table::table().key_table("agent.campaign").unwrap();
+    let (mut campaign, campaign_keys) = campaign_of_the_table(50);
+    campaign["people"] = (0..5000).map(|i| serde_json::json!({ "id": format!("p{i}"), "name": format!("Pad {i} {}", "n".repeat(60)), "number": format!("+6140{i:07}"), "state": "queued", "notes": "n".repeat(250) })).collect();
+    campaign["skipped"] = (0..5000).map(|i| serde_json::json!({ "name": format!("Aside {i} {}", "k".repeat(150)), "number": format!("+6150{i:07}"), "why": "other" })).collect();
+    let (mut settings, settings_needles) = marked_document("agent.settings", &["lastProjectId", "lastKeptProjectId"]);
+    settings["providers"] = (0..100).map(|i| serde_json::json!({ "id": format!("p{i}"), "type": "custom", "name": format!("Provider {i}"), "baseUrl": format!("https://pad{i}.example/v1"), "modelId": "m" })).collect();
+    // (The two lists of the network gate are keys that hold entries: each says its first entries and how many more, so what is looked for is
+    // the key and its first entry, and the marker that the document made for it is put first.)
+    for (list, pad) in [("allow", "pad"), ("deny", "no")] {
+        let first = settings["gate"][list][0].clone();
+        settings["gate"][list] = std::iter::once(first).chain((0..500).map(|i| serde_json::json!(format!("{pad}{i}.example")))).collect();
+    }
+    let mut entries: Vec<(String, Vec<u8>)> = vec![
+        ("opfs/front-desk/outreach/c1.json".into(), campaign.to_string().into_bytes()),
+        ("idb/settings.json".into(), settings.to_string().into_bytes()),
+        ("opfs/front-desk/files/brief.md".into(), b"MARK-BRIEF says to every caller".to_vec()),
+    ];
+    entries.extend((0..2000).map(|i| (format!("opfs/front-desk/files/knowledge/k{i}.md"), b"a knowledge file".to_vec())));
+    entries.extend((0..2000).map(|i| (format!("opfs/projects/p{i}/project.json"), format!("{{\"id\":\"p{i}\",\"name\":\"Project {i}\"}}").into_bytes())));
+    let refs: Vec<(&str, &[u8])> = entries.iter().map(|(n, b)| (n.as_str(), b.as_slice())).collect();
+    let src = TempDir::new("every-fixed-agent-src");
+    let out2 = TempDir::new("every-fixed-agent-out");
+    let file = backup_with_agent(&src.0, &out2.0, "a.oaiybackup", agent_archive(&refs), false);
+    let agent = saying(&restore::inspect(&TempDir::new("every-fixed-agent-dst").0, &file, PASS, &options()).unwrap());
+    let campaign_needles: Vec<String> = campaign_keys.iter().flat_map(|(path, marker)| [format!(" {path}, ")].into_iter().chain(marker.clone())).collect();
+    assert!(campaign_needles.len() >= 25 && keys.row("collect").is_some(), "{campaign_needles:?}");
+    missing("the campaign", &agent, &campaign_needles);
+    assert!(settings_needles.len() >= 15, "{settings_needles:?}");
+    missing("the Agent's settings", &agent, &settings_needles);
+    missing("the brief", &agent, &["MARK-BRIEF says to every caller".to_string()]);
 }
 
 /// A list of people that is longer than the ten the dry run says is a sample, and it is said so plainly (a list of ten or fewer is not).

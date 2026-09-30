@@ -245,32 +245,101 @@ pub fn is_unreadable(item: &ReviewItem) -> bool {
     item.what.starts_with(UNREADABLE) || item.what == TOO_LARGE
 }
 
-/// Every address in a JSON document, with where it is: a value under a key that ends in `Url` or `url`, and a value under a key
-/// that ends in `Path` or `path` when it is itself an address (it names a host, or starts with `//`).
-fn collect_addresses(value: &Value, at: &str, out: &mut Vec<String>) {
-    const MAX: usize = 200;
+/// The addresses of one place in a descriptor (one of its top-level keys): how many, the first of them, and the hosts they go to.
+#[derive(Default)]
+struct Lane {
+    count: usize,
+    first: Option<(String, String)>,
+    /// The hosts of addresses that are keys of the descriptor itself, and (apart) of those that are entries of a collection (an array, or an
+    /// object with more keys than a descriptor has): the first are named first, so that no collection can push one out.
+    fixed_hosts: std::collections::BTreeSet<String>,
+    bulk_hosts: std::collections::BTreeSet<String>,
+}
+
+impl Lane {
+    /// The hosts in the order they are named (the descriptor's own keys' first) and how many there are.
+    fn hosts(&self) -> (Vec<&String>, usize) {
+        let all: Vec<&String> = self.fixed_hosts.iter().chain(self.bulk_hosts.difference(&self.fixed_hosts)).collect();
+        let n = all.len();
+        (all, n)
+    }
+}
+
+/// An object with more keys than this is a collection (a map): a descriptor has fewer keys of its own in any one object.
+const MOST_KEYS_OF_ONE_OBJECT: usize = 30;
+
+/// The host an address goes to (`//host/path` is read as `https://host/path`), or `(not an address)`.
+fn host_of(address: &str) -> String {
+    let text = address.trim();
+    let full = if text.starts_with("//") { format!("https:{text}") } else { text.to_string() };
+    reqwest::Url::parse(&full).ok().and_then(|u| u.host_str().map(|h| h.to_lowercase())).unwrap_or_else(|| "(not an address)".to_string())
+}
+
+/// Every address in a JSON document, by the place (top-level key) it is in: a value under a key that ends in `Url` or `url`, and a value
+/// under a key that ends in `Path` or `path` when it is itself an address (it names a host, or starts with `//`). Every one is counted
+/// and its host kept, however many a place holds (an array of five thousand steps is one place with five thousand addresses), so that no
+/// number of addresses in one place can hide another place; only the first of a place is kept whole.
+fn collect_addresses(value: &Value, at: &str, in_collection: bool, lane: &mut Lane, visited: &mut usize) {
+    *visited += 1;
+    if *visited > 200_000 {
+        return;
+    }
+    let is_address = |key: &str, v: &Value| matches!(v, Value::String(text) if key.to_lowercase().ends_with("url") || (key.to_lowercase().ends_with("path") && (text.contains("://") || text.starts_with("//"))));
     match value {
         Value::Object(map) => {
+            let bulk = in_collection || map.len() > MOST_KEYS_OF_ONE_OBJECT;
             for (key, v) in map {
-                if out.len() >= MAX {
-                    return;
-                }
                 let here = if at.is_empty() { key.clone() } else { format!("{at}.{key}") };
-                let lower = key.to_lowercase();
                 match v {
-                    Value::String(text) if lower.ends_with("url") || (lower.ends_with("path") && (text.contains("://") || text.starts_with("//"))) => out.push(format!("{here} = {text}")),
-                    _ => collect_addresses(v, &here, out),
+                    Value::String(text) if is_address(key, v) => {
+                        lane.count += 1;
+                        let hosts = if bulk { &mut lane.bulk_hosts } else { &mut lane.fixed_hosts };
+                        hosts.insert(host_of(text));
+                        if lane.first.is_none() {
+                            lane.first = Some((here, text.clone()));
+                        }
+                    }
+                    _ => collect_addresses(v, &here, bulk, lane, visited),
                 }
             }
         }
         Value::Array(items) => {
-            for (i, v) in items.iter().enumerate().take(50) {
-                collect_addresses(v, &format!("{at}[{i}]"), out);
+            for (i, v) in items.iter().enumerate() {
+                collect_addresses(v, &format!("{at}[{i}]"), true, lane, visited);
             }
         }
         _ => {}
     }
 }
+
+/// The addresses of a descriptor by place, in the order of the keys: (the place, what it holds).
+fn address_lanes(descriptor: &Value) -> Vec<(String, Lane)> {
+    let Value::Object(map) = descriptor else { return Vec::new() };
+    let mut visited = 0usize;
+    let mut lanes = Vec::new();
+    for (key, v) in map {
+        let mut lane = Lane::default();
+        let lower = key.to_lowercase();
+        match v {
+            Value::String(text) if lower.ends_with("url") || (lower.ends_with("path") && (text.contains("://") || text.starts_with("//"))) => {
+                lane.count = 1;
+                lane.fixed_hosts.insert(host_of(text));
+                lane.first = Some((key.clone(), text.clone()));
+            }
+            _ => collect_addresses(v, key, false, &mut lane, &mut visited),
+        }
+        if lane.count > 0 {
+            lanes.push((key.clone(), lane));
+        }
+    }
+    lanes
+}
+
+/// How many of the places of a descriptor are named, and how many hosts: the descriptor's own keys' hosts (a descriptor has a handful),
+/// and the hosts of its collections (the rest of both are counted).
+const MAX_LANES_NAMED: usize = 40;
+const MAX_FIXED_HOSTS_NAMED: usize = 60;
+const MAX_HOSTS_NAMED: usize = 20;
 
 /// Describe one restorable file of a class that can act.
 pub fn describe(class: RestoreClass, name: &str, bytes: &[u8], local: &Local, backup_templates: &HashSet<String>) -> Vec<ReviewItem> {
@@ -386,7 +455,10 @@ pub fn describe(class: RestoreClass, name: &str, bytes: &[u8], local: &Local, ba
                         &if accepted.is_empty() {
                             "Records how far setup got. No plugin permissions are marked as accepted.".to_string()
                         } else {
-                            format!("Records how far setup got and marks the permissions of these plugins as ACCEPTED: {}.", accepted.join(", "))
+                            // How many first, then the first few by name: a list of hundreds of plugins is a sample, and says how long it is.
+                            let named = accepted.iter().take(10).map(|id| clip(id, 40)).collect::<Vec<_>>().join(", ");
+                            let more = if accepted.len() > 10 { format!(" and {} more", accepted.len() - 10) } else { String::new() };
+                            format!("Records how far setup got and marks the permissions of {} as ACCEPTED: {named}{more}.", if accepted.len() == 1 { "1 plugin".to_string() } else { format!("{} plugins", accepted.len()) })
                         },
                         300,
                     ),
@@ -459,12 +531,14 @@ pub fn describe(class: RestoreClass, name: &str, bytes: &[u8], local: &Local, ba
                 if let Some(hook) = v.get("oaiyToolHook") {
                     extra.push_str(&format!(" It runs {} the Agent's \"{}\" tool.", clip(s(hook, "mode").unwrap_or("around"), 20), clip(s(hook, "tool").unwrap_or("?"), 60)));
                 }
-                vec![ReviewItem {
-                    class,
-                    name: name.to_string(),
-                    title: clip(title, 120),
-                    what: clip(&format!("A flow with {nodes} step(s){}.{extra}", if kinds.is_empty() { String::new() } else { format!(": {}", kinds.into_iter().take(8).collect::<Vec<_>>().join(", ")) }), 500),
-                }]
+                // What the flow does to the Agent (a tool it offers, a tool it runs around) is said before the kinds of its steps, and each
+                // kind is cut: a flow of five thousand steps with long names cannot push what it does to the Agent out of the description.
+                let kinds_said = if kinds.is_empty() {
+                    String::new()
+                } else {
+                    format!(" Its steps are of the kinds: {}{}.", kinds.iter().take(8).map(|k| clip(k, 30)).collect::<Vec<_>>().join(", "), if kinds.len() > 8 { format!(" and {} more", kinds.len() - 8) } else { String::new() })
+                };
+                vec![ReviewItem { class, name: name.to_string(), title: clip(title, 120), what: clip(&format!("A flow with {nodes} step(s).{extra}{kinds_said}"), 700) }]
             }
             Err(_) => vec![unreadable(class, name, "it is not valid JSON")],
         },
@@ -472,22 +546,38 @@ pub fn describe(class: RestoreClass, name: &str, bytes: &[u8], local: &Local, ba
             Ok(v) => {
                 let id = s(&v, "id").unwrap_or("(no id)");
                 let overrides = if local.builtin_connectors.contains(id) { "; REPLACES the connector OAIY ships with this id" } else { "" };
-                // Every address it holds, wherever it is in the descriptor: where a link goes, where it signs in, where it sends events.
-                let mut addresses: Vec<String> = Vec::new();
-                collect_addresses(&v, "", &mut addresses);
-                let more = addresses.len().saturating_sub(8);
-                let listed = addresses.iter().take(8).map(|a| clip(a, 120)).collect::<Vec<_>>().join("; ");
+                // Every address it holds, wherever it is in the descriptor: where a link goes, where it signs in, where it sends events. The
+                // hosts they go to are said first, all of them, the descriptor's own keys' first (a collection with thousands of addresses
+                // cannot push one out), then each place that has an address, by the first of its addresses or by how many it has and the hosts.
+                let lanes = address_lanes(&v);
+                let total: usize = lanes.iter().map(|(_, l)| l.count).sum();
+                let fixed: std::collections::BTreeSet<&String> = lanes.iter().flat_map(|(_, l)| l.fixed_hosts.iter()).collect();
+                let bulk: std::collections::BTreeSet<&String> = lanes.iter().flat_map(|(_, l)| l.bulk_hosts.iter()).filter(|h| !fixed.contains(*h)).collect();
                 let scopes = v.pointer("/auth/scopes").and_then(Value::as_array).map(|a| a.iter().filter_map(Value::as_str).collect::<Vec<_>>().join(" ")).filter(|s| !s.is_empty());
-                let mut what = format!("A link to a provider, prefilled with the address {}", clip(s(&v, "defaultBaseUrl").unwrap_or("(none)"), 160));
-                if !listed.is_empty() {
-                    what.push_str(&format!("; every address it holds: {listed}{}", if more > 0 { format!(" and {more} more") } else { String::new() }));
+                let count = |n: usize, one: &str, many: &str| format!("{n} {}", if n == 1 { one } else { many });
+                let mut what = format!("A link to a provider, prefilled with the address {}{overrides}", clip(s(&v, "defaultBaseUrl").unwrap_or("(none)"), 160));
+                if total > 0 {
+                    let named: Vec<String> = fixed.iter().take(MAX_FIXED_HOSTS_NAMED).chain(bulk.iter().take(MAX_HOSTS_NAMED)).map(|h| clip(h, 80)).collect();
+                    let unnamed = fixed.len() + bulk.len() - named.len();
+                    what.push_str(&format!("; it holds {} in {}, to {}: {}{}", count(total, "address", "addresses"), count(lanes.len(), "place", "places"), count(fixed.len() + bulk.len(), "host", "hosts"), named.join(", "), if unnamed > 0 { format!(" and {unnamed} more") } else { String::new() }));
+                    let places: Vec<String> = lanes
+                        .iter()
+                        .take(MAX_LANES_NAMED)
+                        .map(|(place, lane)| match (&lane.first, lane.count) {
+                            (Some((path, address)), 1) => clip(&format!("{path} = {address}"), 120),
+                            _ => {
+                                let (all, n) = lane.hosts();
+                                format!("{}: {} addresses, to {}{}", clip(place, 40), lane.count, all.iter().take(4).map(|h| clip(h, 60)).collect::<Vec<_>>().join(", "), if n > 4 { format!(" and {} more hosts", n - 4) } else { String::new() })
+                            }
+                        })
+                        .collect();
+                    what.push_str(&format!("; by place: {}{}", places.join("; "), if lanes.len() > MAX_LANES_NAMED { format!(" and {} more places", lanes.len() - MAX_LANES_NAMED) } else { String::new() }));
                 }
                 if let Some(scopes) = scopes {
                     what.push_str(&format!("; asks to be allowed: {}", clip(&scopes, 160)));
                 }
-                what.push_str(overrides);
                 what.push('.');
-                vec![ReviewItem { class, name: name.to_string(), title: clip(&format!("{} ({id})", s(&v, "name").unwrap_or(id)), 120), what: clip(&what, 1500) }]
+                vec![ReviewItem { class, name: name.to_string(), title: clip(&format!("{} ({id})", s(&v, "name").unwrap_or(id)), 120), what: clip(&what, 6000) }]
             }
             Err(_) => vec![unreadable(class, name, "it is not valid JSON")],
         },

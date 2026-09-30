@@ -712,6 +712,18 @@ in parts through internal routes with a secret made for that one backup.
   the restore is applied (a copy that was swapped stops the restore, and nothing is changed), again
   when it is handed to the page (the result says that it was not), and where the page first asks
   for it (a hand-over that changed on the disk is dropped, and the result says so).
+- **The dry run never cuts what a thing itself says by position.** Each thing it lists has its own
+  keys and, beside them, collections: a campaign's questions, people and people set aside; a flow's
+  steps; a connector's addresses; a template's files, paths and variables; the setup record's
+  plugins; the calendar's services and appointments; the Agent's providers and the entries of a
+  list-valued setting. **The thing's own keys are said first, each with a cut of its own, and a
+  collection is said as a sample with its count** ("the first 8 of 50 questions"; a flow says what it
+  does to the Agent before the kinds of its steps; a connector says every host its addresses go to,
+  the ones its own keys hold first, then by place; the setup record says how many plugins it marks as
+  accepted and names ten). A list-valued setting (the network gate's two lists) says its first five
+  entries and how many more. A test builds each of these with fifty questions or five thousand entries
+  of the padding kind and looks for every fixed key in the text of the dry run. **A backup that holds
+  more than 2,000 things to look at is refused, and is not shown in part.**
 - **Nothing ticked** brings back only the numbers not to be called or texted again (which are
   *added* to yours: none of yours is ever taken away, on a restore or an undo). At most **50,000**
   numbers come back in one restore, each once (the same digits written another way are one
