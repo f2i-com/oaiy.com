@@ -416,7 +416,11 @@ fn every_row_of_the_table_is_behind_the_guard_in_scoped_mode() {
         // The public routes that are built: what existed, info, and (with the web login) the four of the login.
         let public_and_built = a.row.class == Class::Public
             && (a.row.since == 1 || built_public_routes().contains(&a.row.pattern));
-        if public_and_built {
+        // With the web login and no owner yet the server is in setup-only mode (design 4.7.1): the public routes of the
+        // bridge (pairing, capabilities) are refused with 401 like everything else until there is an owner.
+        let closed_until_there_is_an_owner =
+            cfg!(feature = "web") && a.row.pattern.starts_with("/api/bridge/");
+        if public_and_built && !closed_until_there_is_an_owner {
             if matches!(a.status, 401 | 403 | 421) {
                 answered.push(format!("public {} -> {}", a.name(), a.status));
             }

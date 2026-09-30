@@ -843,16 +843,24 @@ async fn with_no_owner_an_anonymous_call_is_setup_required_and_a_bearer_is_unaff
             "Bearer realm=\"oaiy\""
         );
     }
-    // Public routes are what they were.
+    // The short list stays open (design 4.7.1): health and what says whether there is a login. The public routes of the
+    // model that are not on it, the bridge's, are closed until there is an owner.
+    assert_eq!(
+        go(&e, send(&DASH_PROXIED, Method::GET, "/api/health"))
+            .await
+            .status,
+        200
+    );
     for (m, p) in [
-        (Method::GET, "/api/health"),
         (Method::GET, "/api/bridge/capabilities"),
         (Method::GET, "/api/bridge/pairing/x"),
+        (Method::POST, "/api/bridge/pairing"),
     ] {
+        let r = go(&e, send(&DASH_PROXIED, m.clone(), p)).await;
         assert_eq!(
-            go(&e, send(&DASH_PROXIED, m.clone(), p)).await.status,
-            200,
-            "{p}"
+            (r.status, r.code().as_deref()),
+            (401, Some("setup_required")),
+            "{m} {p}"
         );
     }
     // A bearer credential: as ever. A wrong one is a wrong one, not "setup required".

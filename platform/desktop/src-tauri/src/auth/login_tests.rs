@@ -32,7 +32,7 @@ use super::guard::{scoped_cors, scoped_guard, Guard, GuardConfig};
 use super::login::{self, LoginOptions, LoginState};
 use super::mode::AccessMode;
 use super::password::{Argon2Engine, Cost, HashError, PasswordEngine, Verdict};
-use super::routes::ROUTES;
+use super::routes::{Class, Verb, ROUTES};
 use super::session::LoginFacts;
 use super::store::{AuthStore, FileWriter, Host, MintSpec, SecureWriter};
 use super::token::{self, Kind};
@@ -2606,6 +2606,134 @@ async fn the_status_says_what_is_going_on_and_holds_no_secret() {
     assert!(!text.contains("argon2"), "nor the password hash");
 }
 
+// ==================================== setup-only mode =================================================
+
+#[tokio::test]
+async fn an_install_with_no_owner_answers_401_setup_required_to_every_public_route_but_the_short_list(
+) {
+    let e = env();
+    // The routes setup-only mode leaves open (design 4.7.1): health, whether there is a login and who you are, and the
+    // ways to make one (a login and a link answer 409 setup_required themselves).
+    let open = [
+        ("GET", "/api/health"),
+        ("GET", "/api/auth/info"),
+        ("GET", "/api/auth/session"),
+        ("POST", "/api/auth/setup"),
+        ("POST", "/api/auth/login"),
+        ("POST", "/api/auth/link"),
+    ];
+    let concrete = |pattern: &str| -> String {
+        pattern
+            .split('/')
+            .map(|s| {
+                if s.starts_with(':') || s.starts_with('*') {
+                    "x"
+                } else {
+                    s
+                }
+            })
+            .collect::<Vec<_>>()
+            .join("/")
+    };
+    let public: Vec<_> = ROUTES.iter().filter(|r| r.class == Class::Public).collect();
+    let asked = |e: &Env, row: &super::routes::Route| {
+        let method = match row.method {
+            Verb::Get => Method::GET,
+            Verb::Post => Method::POST,
+            other => panic!("a public row with {other:?}"),
+        };
+        req(e, method, &concrete(row.pattern)).json(json!({}))
+    };
+    let mut closed = Vec::new();
+    for row in &public {
+        let r = go(&e, asked(&e, row)).await;
+        let says_setup = r.status == 401 && r.code().as_deref() == Some("setup_required");
+        if open.contains(&(row.method.as_str(), row.pattern)) {
+            assert!(
+                !says_setup,
+                "{} {} is open: {}",
+                row.method.as_str(),
+                row.pattern,
+                r.text
+            );
+        } else {
+            assert!(
+                says_setup,
+                "{} {}: {} {}",
+                row.method.as_str(),
+                row.pattern,
+                r.status,
+                r.text
+            );
+            closed.push(format!("{} {}", row.method.as_str(), row.pattern));
+        }
+    }
+    // A HEAD is a GET.
+    for path in ["/api/health", "/api/auth/info", "/api/auth/session"] {
+        let r = go(&e, req(&e, Method::HEAD, path)).await;
+        assert_ne!(r.status, 401, "HEAD {path}");
+    }
+    // The ones the design had open and this mode closes are the bridge's, and the callback.
+    for name in [
+        "GET /api/bridge/capabilities",
+        "POST /api/bridge/pairing",
+        "GET /api/bridge/pairing/:id",
+    ] {
+        assert!(closed.iter().any(|c| c == name), "{name} in {closed:?}");
+    }
+    // An OPTIONS preflight is not a request for the route: it carries no credential and holds nothing, so it is
+    // not turned into a demand to set up.
+    let pre = go(&e, req(&e, Method::OPTIONS, "/api/bridge/capabilities")).await;
+    assert_ne!(pre.status, 401, "{}", pre.text);
+    // With an owner they are the public routes the table says.
+    make_owner(&e, PASSWORD).await;
+    for row in &public {
+        let r = go(&e, asked(&e, row)).await;
+        assert!(
+            !(r.status == 401 && r.code().as_deref() == Some("setup_required")),
+            "{} {} still says setup_required with an owner: {}",
+            row.method.as_str(),
+            row.pattern,
+            r.text
+        );
+    }
+    // A bearer is not held back by it (the console's credential, tokens the console made).
+    let con = console_token(&e);
+    let r = go(
+        &e,
+        req(&e, Method::GET, "/api/auth/console/status").bearer(&con),
+    )
+    .await;
+    assert_eq!(r.status, 200);
+}
+
+#[tokio::test]
+async fn setup_only_mode_lets_a_console_credential_through_before_there_is_an_owner() {
+    let e = env();
+    assert!(!e.state.owner_configured());
+    let con = console_token(&e);
+    let r = go(
+        &e,
+        req(&e, Method::GET, "/api/auth/console/status").bearer(&con),
+    )
+    .await;
+    assert_eq!(r.status, 200, "{}", r.text);
+    // A route that needs a credential says setup_required to a stranger, and a route that is not there says it too.
+    for (m, path) in [
+        (Method::GET, "/api/config"),
+        (Method::GET, "/api/services"),
+        (Method::POST, "/api/auth/logout"),
+        (Method::GET, "/api/no/such/route"),
+    ] {
+        let r = go(&e, req(&e, m.clone(), path)).await;
+        assert_eq!(
+            (r.status, r.code().as_deref()),
+            (401, Some("setup_required")),
+            "{m} {path}: {}",
+            r.text
+        );
+    }
+}
 // ==================================== the memory bound and the allow-list =============================
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]

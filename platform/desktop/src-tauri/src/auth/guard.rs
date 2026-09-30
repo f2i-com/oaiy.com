@@ -348,6 +348,24 @@ impl Denial {
     }
 }
 
+/// The routes an install with no owner still answers (design 4.7.1): health, what says whether there is a login and
+/// what the session is, and the ways to make one (setup, and the login and link routes, which answer `409
+/// setup_required` themselves, so that a login never says whether a setup exists in any other way). `HEAD` is a
+/// `GET`.
+#[cfg(feature = "web")]
+fn setup_only_open(method: &Method, pattern: &str) -> bool {
+    matches!(
+        (method.as_str(), pattern),
+        (
+            "GET" | "HEAD",
+            "/api/health" | "/api/auth/info" | "/api/auth/session"
+        ) | (
+            "POST",
+            "/api/auth/setup" | "/api/auth/login" | "/api/auth/link"
+        )
+    )
+}
+
 // ---- authorization: the class of the route against the principal ------------------------------
 
 /// What the guard concludes for a route's class and a principal.
@@ -997,6 +1015,19 @@ impl Guard {
         };
         let no_route = matched.is_none();
 
+        // Setup-only mode (design 4.7.1): an install with a web login and no owner answers only the short list of
+        // routes that say whether there is a login and make one, and 401 `setup_required` to everything else,
+        // however public the model would have that route be (the bridge's pairing and capabilities are not open
+        // until there is an owner to pair with).
+        #[cfg(feature = "web")]
+        if class == Class::Public && !no_route && self.in_setup_only() {
+            if let Some(m) = &matched {
+                if !setup_only_open(&method, m) {
+                    return Err(fail(Denial::setup_required()));
+                }
+            }
+        }
+
         // 7-9. the credential, if there is one
         let principal = if class == Class::Public {
             None
@@ -1047,10 +1078,16 @@ impl Guard {
     /// (they never reach this), and every other refusal stands as it is.
     fn setup_only(&self, denial: Denial) -> Denial {
         #[cfg(feature = "web")]
-        if denial.code == "auth_required" && self.login().is_some_and(|l| !l.owner_configured()) {
+        if denial.code == "auth_required" && self.in_setup_only() {
             return Denial::setup_required();
         }
         denial
+    }
+
+    /// Whether this is a server with a web login and no owner yet.
+    #[cfg(feature = "web")]
+    fn in_setup_only(&self) -> bool {
+        self.login().is_some_and(|l| !l.owner_configured())
     }
 
     /// The failed-bearer throttle does not apply to loopback peers of a local install: a desktop's own
