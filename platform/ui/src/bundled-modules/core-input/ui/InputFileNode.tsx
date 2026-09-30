@@ -1,6 +1,7 @@
 import { memo, useState, useRef, useEffect, useCallback, useMemo } from 'react';
 import { Position } from '@xyflow/react';
 import { CollapsibleNodeWrapper, type HandleConfig } from 'oaiy-ui-components';
+import { BLOCKED_MEDIA_WORDS, mediaUrlBlocked } from '../../../lib/localMedia';
 
 interface InputFileNodeData {
   fileName?: string;
@@ -243,7 +244,9 @@ function InputFileNode({ data }: InputFileNodeProps) {
                 </svg>
               </div>
             ) : hasFile ? (
-              isImage && data.imagePreview ? (
+              isImage && data.imagePreview && mediaUrlBlocked(data.imagePreview) ? (
+                <span className="text-amber-600 dark:text-amber-400 text-[10px] p-2" data-blocked-media>{BLOCKED_MEDIA_WORDS}</span>
+              ) : isImage && data.imagePreview ? (
                 <img src={data.imagePreview} alt={data.fileName} className="max-w-full max-h-full object-contain rounded" />
               ) : (
                 <div className="text-center px-2">

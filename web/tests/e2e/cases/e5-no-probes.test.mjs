@@ -521,27 +521,31 @@ describe('E5: the flow editor\'s media (the review\'s F4)', () => {
     imageSave: 'http://10.9.9.9/save.png',
     videoSave: 'http://172.16.4.4/clip.mp4',
   };
+  // The picture an Input File node shows is not a run output (it is what the person chose; it is kept in the flow), so an import leaves it and
+  // only the node's guard holds it back in a tab with no link.
+  const PREVIEW = 'http://192.168.77.10/photo.png';
   const node = (id, type, x, y, data) => ({ id, type, position: { x, y }, data });
-  const NODES = [
+  const RUN_NODES = [
     node('out-image', 'output', 40, 40, { label: 'Result image', outputValue: MEDIA.outputImage }),
     node('out-video', 'output', 380, 40, { label: 'Result video', outputValue: MEDIA.outputVideo }),
     node('view', 'image_view', 720, 40, { imageUrl: MEDIA.imageView }),
     node('save', 'image_save', 40, 420, { imageUrl: MEDIA.imageSave, filename: 'kept' }),
     node('clip', 'video_save', 380, 420, { videoUrl: MEDIA.videoSave, filename: 'clip' }),
   ];
-  const project = (name = 'Shared flow') => ({ version: '1.0.0', name, description: '', createdAt: '2026-01-01T00:00:00Z', updatedAt: '2026-01-01T00:00:00Z', flows: [{ id: 'shared-flow', name: 'Shared flow', description: '', createdAt: '2026-01-01T00:00:00Z', updatedAt: '2026-01-01T00:00:00Z', graph: { nodes: NODES, edges: [] } }], settings: {}, constants: [], llmEndpoints: [], imageGenEndpoints: [], httpPresets: [] });
-  const asked = (attempts) => attempts.filter((a) => Object.values(MEDIA).some((url) => a === `GET ${url}`));
+  const FILE_NODE = node('file', 'input_file', 720, 420, { fileName: 'photo.png', fileType: 'image', fileContent: 'x', imagePreview: PREVIEW });
+  const project = (name = 'Shared flow', nodes = [...RUN_NODES, FILE_NODE]) => ({ version: '1.0.0', name, description: '', createdAt: '2026-01-01T00:00:00Z', updatedAt: '2026-01-01T00:00:00Z', flows: [{ id: 'shared-flow', name: 'Shared flow', description: '', createdAt: '2026-01-01T00:00:00Z', updatedAt: '2026-01-01T00:00:00Z', graph: { nodes, edges: [] } }], settings: {}, constants: [], llmEndpoints: [], imageGenEndpoints: [], httpPresets: [] });
+  const asked = (attempts) => attempts.filter((a) => [...Object.values(MEDIA), PREVIEW].some((url) => a === `GET ${url}`));
   const shown = (page) => page.locator('.react-flow__node').count();
 
   it('a project that carries local addresses opens in a visitor\'s browser without one request to them, and the nodes say why', async () => {
     const { context, page, attempts, errors } = await open('flows', { storage: { oaiy_project: JSON.stringify(project()) } });
     await ready('flows', page);
-    await page.waitForFunction(() => document.querySelectorAll('.react-flow__node').length >= 5, null, { timeout: 15_000 });
+    await page.waitForFunction(() => document.querySelectorAll('.react-flow__node').length >= 6, null, { timeout: 15_000 });
     await sleep(1500);
-    assert.equal(await shown(page), 5, 'the flow is there');
+    assert.equal(await shown(page), 6, 'the flow is there');
     assert.deepEqual(asked(attempts), [], `nothing was asked of those addresses: ${attempts.join(', ')}`);
     assert.deepEqual(attempts, [], 'and nothing else of this computer or its network either');
-    assert.ok((await page.locator('[data-blocked-media]').count()) >= 4, 'each node that would have loaded one says it did not');
+    assert.ok((await page.locator('[data-blocked-media]').count()) >= 5, 'each node that would have loaded one says it did not');
     assert.match(await page.locator('[data-blocked-media]').first().textContent(), /^Blocked: this address is on your computer or network, and this page is not linked to OAIY Desktop\. Connect it in Settings/);
     assert.deepEqual(errors, []);
     await context.close();
@@ -551,10 +555,10 @@ describe('E5: the flow editor\'s media (the review\'s F4)', () => {
     for (const how of [{ storage: { oaiy_project: JSON.stringify(project()), 'oaiy.desktopLinked': '1' } }, { desktop: OAIY_WINDOW, storage: { oaiy_project: JSON.stringify(project()) } }]) {
       const { context, page, attempts } = await open('flows', how);
       await ready('flows', page);
-      await page.waitForFunction(() => document.querySelectorAll('.react-flow__node').length >= 5, null, { timeout: 15_000 });
+      await page.waitForFunction(() => document.querySelectorAll('.react-flow__node').length >= 6, null, { timeout: 15_000 });
       await sleep(1500);
       const got = asked(attempts);
-      for (const url of Object.values(MEDIA)) assert.ok(got.includes(`GET ${url}`), `${url} was asked for (${Object.keys(how).join('+')}): ${attempts.join(', ')}`);
+      for (const url of [...Object.values(MEDIA), PREVIEW]) assert.ok(got.includes(`GET ${url}`), `${url} was asked for (${Object.keys(how).join('+')}): ${attempts.join(', ')}`);
       assert.equal(await page.locator('[data-blocked-media]').count(), 0, 'and nothing says it is blocked');
       await context.close();
     }
@@ -564,7 +568,7 @@ describe('E5: the flow editor\'s media (the review\'s F4)', () => {
     const { context, page, attempts } = await open('flows', { storage: { 'oaiy.desktopLinked': '1' } });
     await ready('flows', page);
     await page.locator('button[aria-label="Import or export"]').click();
-    await page.locator('input[type="file"][accept="application/json,.json"]').setInputFiles({ name: 'shared.json', mimeType: 'application/json', buffer: Buffer.from(JSON.stringify(project('Imported'))) });
+    await page.locator('input[type="file"][accept="application/json,.json"]').setInputFiles({ name: 'shared.json', mimeType: 'application/json', buffer: Buffer.from(JSON.stringify(project('Imported', RUN_NODES))) });
     await page.getByRole('button', { name: 'Replace and import' }).click();
     await page.waitForFunction(() => document.querySelectorAll('.react-flow__node').length >= 5, null, { timeout: 15_000 });
     await sleep(1500);
