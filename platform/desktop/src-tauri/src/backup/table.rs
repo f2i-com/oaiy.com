@@ -644,7 +644,7 @@ impl Table {
                 // A secret that goes with an address names one that is in the table, beside it, and is one.
                 if let Some(partner) = &key.goes_with {
                     let sibling = sibling_path(&key.path, partner);
-                    if !matches!(kt.row(&sibling), Some(KeyRow { class: Class::Runs | Class::Data, ty: Some(ValueType::Url { .. }), .. })) {
+                    if !matches!(kt.row(&sibling), Some(KeyRow { ty: Some(ValueType::Url { .. }), .. })) {
                         out.push(format!("key table {name}: \"{}\" goes with \"{sibling}\", which is not an address that comes back", key.path));
                     }
                 }
