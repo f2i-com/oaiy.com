@@ -28,7 +28,9 @@ const ALLOWED_ORIGINS_ENV: &str = "OAIY_ALLOWED_ORIGINS";
 /// What `OAIY_ALLOWED_ORIGINS` holds: in an app with windows, the exact origins
 /// of the Agent's window and the flow editor's (`http::embedded_window_origins`);
 /// in the headless server, which has none, nothing, so no web page may call the
-/// browser service there at all.
+/// browser service there at all. (An origin is a name, not proof of who holds
+/// it: a local web server answering `oaiy.localhost` on port 80 could serve a
+/// page with one of these, as for the API guard; see the desktop README.)
 fn allowed_origins_env(has_windows: bool, on_windows: bool) -> String {
     if has_windows {
         crate::http::embedded_window_origins(on_windows).join(",")

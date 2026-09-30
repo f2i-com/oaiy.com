@@ -29,7 +29,9 @@ Override the folder with `SERVICE_LIBRARY_DIR` (absolute path) in `api/.env`.
 | `files` | `{filename: contents}` — bundled scripts written to the scripts dir (self-contained package) |
 
 **Placeholders** (in `run` + `health`): `${port}`, `${dataDir}`, `${binDir}`,
-`${modelsDir}`, `${modelDirs}`.
+`${modelsDir}`, `${modelDirs}`, `${allowedOrigins}` (the origins of OAIY
+Desktop's own windows, comma-separated: for a server that lets web pages call it,
+as `OAIY_ALLOWED_ORIGINS`).
 **Env vars** (in install scripts): `OAIY_DATA_DIR`, `OAIY_VENVS_DIR`,
 `OAIY_BIN_DIR`, `OAIY_MODELS_DIR`, `OAIY_SCRIPTS_DIR`.
 

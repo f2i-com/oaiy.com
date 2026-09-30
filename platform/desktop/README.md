@@ -42,6 +42,40 @@ config dir on first run; edit there to customise without rebuilding):
 | **Aokie Speech-to-Text** / **Aokie Text-to-Speech** | The Aokie receptionist's ears and voice; their program lives in the Aokie plugin. Serve on `:8781` / `:8782`. |
 | **Playwright Browser** | Headless Chromium backend for the `browser_*` nodes (goto/extract/click/screenshot). Installs Playwright into a venv reusing OAIY Desktop's Python. Serves on `:17880`, and answers only its own `Host` and OAIY's own windows (the Agent and the Flows page, named in `OAIY_ALLOWED_ORIGINS`) or programs that send no `Origin`; any other web page gets 403 or 421. |
 
+### Who may call the Playwright Browser server
+
+It drives a real browser (it can open a `file://` address, run script in a page and
+read cookies), and any web page open on the machine can send requests to a loopback
+port, so it answers by rule (`resources/scripts/playwright_server.py`):
+
+- `Host` must be `127.0.0.1:<port>`, `localhost:<port>` or `[::1]:<port>` (its own
+  port), else `421`; that stops a name rebound to `127.0.0.1`.
+- A request that carries an `Origin`, or a `Sec-Fetch-Site` of another site, is `403`
+  unless its `Origin` is listed in `OAIY_ALLOWED_ORIGINS`. That variable is the
+  exact origins of OAIY's Agent and Flows windows, which OAIY passes
+  (`${allowedOrigins}` in the template); the reply echoes that origin, never `*`, and
+  no Private Network Access answer is given. Programs that send no `Origin` (OAIY
+  itself, `curl`, scripts, `oaiy run`) need no entry.
+- To let another page call it (say a `vite dev` tab of the flow editor at
+  `http://localhost:5173`), edit your copy of the template on disk
+  (`templates/playwright-browser.json` in the data folder; OAIY leaves an edited copy
+  alone) and set `"OAIY_ALLOWED_ORIGINS": "http://localhost:5173"` in `run.env`, then
+  restart the service. Give the exact origins, comma-separated (add the two windows'
+  if they should keep working): `*`, `null` and entries with a path are ignored. A
+  value set in an edited copy replaces OAIY's; a copy without the variable is given
+  OAIY's windows.
+- The headless `oaiy-server` has no windows and passes an empty list: no web page may
+  call the service there.
+
+**Known residual.** An origin is a name, not a proof of who holds it. On Windows the
+windows' origins are `http://oaiy.localhost` and `http://oaiyflows.localhost`, and
+`*.localhost` names resolve to the machine itself in a browser, so any program
+listening on `127.0.0.1:80` that answers such a name (a local web server such as WAMP,
+which can be installed on this machine) can serve a page whose `Origin` is allowed.
+OAIY's own guard for its API on port 17972 has the same limit. The design considered
+sending a token in a header instead (access model A5) and declined it, so it is not
+done here; a local program can also call the server directly, as it always could.
+
 Models are not services: OAIY's own engine runs them (OAIY → **Engines**). Krea-2
 Turbo, Lance, Llama.cpp Server, Ollama and LTX-2.3 Video used to be built in; at
 startup OAIY removes the copies it seeded from the templates folder (and drops
