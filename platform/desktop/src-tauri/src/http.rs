@@ -2065,6 +2065,50 @@ mod tests {
         }
     }
 
+    /// The encrypted backup's eight routes (`backup/routes.rs`) have a row each in the access table, and each is `since: 1` (the routes exist, and `legacy`
+    /// mode keeps the guard they were built with, the lines of `is_backup_path`): the status is `system.read`, beside the update status, and the seven of
+    /// the Agent page's hand-over of its own storage are `agent.serve`, which the `agent` and `owner` presets hold and no other does; none of the
+    /// scopes is dangerous (none of the routes restores or overwrites a setting: what a restore brings back is prepared from files the owner looked at and
+    /// ticked, and applied by the desktop at its next start). The scoped CORS answers a paired page's preflight for each method and no page that has not
+    /// paired. Every route `backup/routes.rs` registers is one of those, and every one of those is registered there.
+    #[test]
+    fn the_backups_routes_take_the_scope_of_their_kind_and_the_scoped_cors_lets_a_paired_page_use_them() {
+        use crate::auth::presets::{Preset, ALL_PRESETS};
+        use crate::auth::routes::{pattern_existed_before, route_class, Class};
+        use crate::auth::scopes::ScopeSet;
+        let paired: std::collections::BTreeSet<String> = ["https://app.oaiy.com".to_string()].into();
+        let routes = [
+            (Method::GET, "/api/backup/status", "system.read"),
+            (Method::POST, "/api/backup/agent/:id/part", "agent.serve"),
+            (Method::POST, "/api/backup/agent/:id/done", "agent.serve"),
+            (Method::GET, "/api/backup/agent-import", "agent.serve"),
+            (Method::GET, "/api/backup/agent-import/:id/part/:index", "agent.serve"),
+            (Method::POST, "/api/backup/agent-import/:id/undo-part", "agent.serve"),
+            (Method::POST, "/api/backup/agent-import/:id/undo-done", "agent.serve"),
+            (Method::POST, "/api/backup/agent-import/:id/done", "agent.serve"),
+        ];
+        for (method, pattern, scope) in &routes {
+            assert_eq!(route_class(method, pattern), Class::Scope(scope), "{method} {pattern}");
+            assert!(pattern_existed_before(pattern), "{pattern}: the guard these routes were built with is the one `legacy` mode keeps");
+            assert!(!ScopeSet::of(&[*scope]).has_dangerous(), "{scope}: no route of the backup is behind a dangerous scope");
+            let cors = crate::auth::cors::decide(method, Some(pattern), Some("https://app.oaiy.com"), &paired, false);
+            assert_eq!(cors.get("access-control-allow-origin"), Some("https://app.oaiy.com"), "{method} {pattern}: a paired page's preflight is answered");
+            assert!(cors.get("access-control-allow-methods").is_some_and(|m| m.split(", ").any(|m| m == method.as_str())), "{method} {pattern}: {:?}", cors.get("access-control-allow-methods"));
+            assert!(crate::auth::cors::decide(method, Some(pattern), Some("https://evil.example"), &paired, false).is_empty(), "{method} {pattern}: a page that has not paired gets nothing");
+        }
+        // Who holds them: the Agent's hand-over is for the Agent page and the owner alone, the status is for whoever may read the system.
+        let holders = |scope: &str| ALL_PRESETS.iter().copied().filter(|p| p.scopes().contains(scope)).collect::<Vec<Preset>>();
+        assert_eq!(holders("agent.serve"), [Preset::Owner, Preset::Agent]);
+        assert_eq!(holders("system.read"), [Preset::Owner, Preset::Cli, Preset::CliAdmin, Preset::Readonly]);
+        // The routes of the table are the routes of the module, both ways (a route added to `backup/routes.rs` needs its row and its line here).
+        let ours: std::collections::BTreeSet<(String, String)> = routes.iter().map(|(m, p, _)| (m.as_str().to_string(), p.to_string())).collect();
+        let module: std::collections::BTreeSet<(String, String)> = crate::backup::routes::ROUTES.iter().map(|(m, p)| (m.to_string(), p.to_string())).collect();
+        assert_eq!(ours, module, "the routes `backup/routes.rs` lists are the ones this test holds to the table");
+        let scanned = crate::auth::route_coverage::scan_main_router().found;
+        let registered: std::collections::BTreeSet<(String, String)> = scanned.iter().filter(|f| f.file.starts_with("backup/routes.rs")).map(|f| (f.verb.as_str().to_string(), f.pattern.clone())).collect();
+        assert_eq!(registered, ours, "the routes `backup/routes.rs` registers are the ones this test holds to the table");
+    }
+
     /// Every HTTP method the dashboard's and the Agent's sources send to this API (`method: 'PATCH'`; tests excluded). Read at test time, so a
     /// verb added to a page later is held to the layer with no edit here.
     fn methods_the_pages_send() -> std::collections::BTreeMap<String, Vec<String>> {
