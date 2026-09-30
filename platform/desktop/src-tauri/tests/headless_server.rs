@@ -19,7 +19,9 @@ use std::time::{Duration, Instant};
 
 use serde_json::{json, Value};
 
-const TOKEN: &str = "integration-test-token";
+/// The shape the server requires of OAIY_SERVER_TOKEN (design 4.1): 32 to 256 printable characters, at least 16
+/// different. A shorter one stops the server with exit 78.
+const TOKEN: &str = "integration-test-token-0123456789ABCDEF";
 
 /// A folder of the test's own, removed when the test ends.
 struct Scratch(PathBuf);
