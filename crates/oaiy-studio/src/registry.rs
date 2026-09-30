@@ -133,6 +133,9 @@ fn companion(cfg: &Json, section: &str, entry: &Json, missing: &str, picked: &Pa
     }
     let want: &dyn Fn(&Detected) -> bool = match (section, missing) {
         ("image", "base") => &|d| d.format == "diffusers" && field_of(d, "base").is_some(),
+        ("image", "tokenizer") if arch == "flux2-klein-4b" => &|d| d.kind() == "klein_tokenizer",
+        ("image", "text_encoder") if arch == "flux2-klein-4b" => &|d| d.kind() == "klein_text_encoder",
+        ("image", "vae") if arch == "flux2-klein-4b" => &|d| d.kind() == "flux2_vae",
         ("image", "tokenizer") => &|d| d.kind() == "clip_tokenizer",
         ("video", "tokenizer") => &|d| d.kind() == "tokenizer",
         ("video", "vae") => &|d| d.kind() == "vae",
@@ -366,6 +369,20 @@ fn attach(cfg: &mut Json, d: &Detected, target: Option<(&str, &str)>, picked: &P
     let (section, field, fits): (&str, &str, Fits) = match d.kind() {
         "vision_projector" => ("llm", "vision_projector", Box::new(|_| true)),
         "adapter" => ("image", "adapter", Box::new(|m| str_or(m, "architecture", "qwen-image") == "qwen-image")),
+        "klein_lora" => {
+            let Some(Json::Obj(models)) = obj_mut(cfg, &["media", "image", "models"]) else { return Err("no image models".into()) };
+            let (name, model) = models.iter_mut().find(|(n,m)| str_or(m,"architecture","") == "flux2-klein-4b" && target.is_none_or(|(_,t)| n == t))
+                .ok_or("add or select a Klein 4B image model before its style LoRA")?;
+            let mut list = model.get("loras").and_then(Json::as_array).unwrap_or(&[]).to_vec();
+            let added = field_of(d,"loras").ok_or("detected Klein LoRA has no path")?;
+            for value in added.as_array().ok_or("detected LoRA list is invalid")? { if !list.contains(value) { list.push(value.clone()); } }
+            set(model,"loras",Json::Arr(list));
+            let missing = missing_fields("image",model);
+            return Ok(Added { section:"image", name:name.clone(), enabled:missing.is_empty(), missing });
+        }
+        "klein_text_encoder" => ("image", "text_encoder", Box::new(|m| str_or(m, "architecture", "") == "flux2-klein-4b")),
+        "klein_tokenizer" => ("image", "tokenizer", Box::new(|m| str_or(m, "architecture", "") == "flux2-klein-4b")),
+        "flux2_vae" => ("image", "vae", Box::new(|m| str_or(m, "architecture", "") == "flux2-klein-4b")),
         "image_base" => ("image", "base", Box::new(|m| str_or(m, "architecture", "qwen-image") == "qwen-image")),
         "text_encoder" => ("image", "text_encoder", Box::new(|m| str_or(m, "architecture", "qwen-image") == "qwen-image")),
         "clip_tokenizer" => ("image", "tokenizer", Box::new(|m| str_or(m, "architecture", "") == "sdxl")),
@@ -434,6 +451,7 @@ fn attach(cfg: &mut Json, d: &Detected, target: Option<(&str, &str)>, picked: &P
         .or_else(|| models.iter().position(|(_, m)| fits(m) && lacks(m)))
         .ok_or_else(|| format!("{}: no {section} model is missing this part; add the model first, or pick the part from the model's own field", d.summary))?;
     let (name, model) = &mut models[chosen];
+    if !fits(model) { return Err(format!("{} is incompatible with the selected model", d.summary)); }
     set(model, field, value);
     let missing = missing_fields(section, model);
     let enabled = missing.is_empty();
@@ -448,6 +466,8 @@ pub fn missing_fields(section: &str, m: &Json) -> Vec<String> {
     if section == "image" {
         if str_or(m, "architecture", "qwen-image") == "sdxl" {
             out.extend(["checkpoint", "tokenizer"].into_iter().filter(|k| empty(k)).map(String::from));
+        } else if str_or(m, "architecture", "qwen-image") == "flux2-klein-4b" {
+            out.extend(["transformer", "text_encoder", "vae", "tokenizer"].into_iter().filter(|k| empty(k)).map(String::from));
         } else {
             if empty("base") {
                 out.push("base".into());
@@ -569,7 +589,7 @@ pub fn add(cfg: &mut Json, path: &Path, name: Option<&str>, target: Option<(&str
 
 /// Keys holding file paths, per section, for export and import.
 const LLM_PATHS: [&str; 3] = ["path", "vision_projector", "lora"];
-const IMAGE_PATHS: [&str; 7] = ["base", "transformer", "safetensors_transformer", "adapter", "text_encoder", "checkpoint", "tokenizer"];
+const IMAGE_PATHS: [&str; 8] = ["base", "transformer", "safetensors_transformer", "adapter", "text_encoder", "checkpoint", "tokenizer", "vae"];
 const VIDEO_PATHS: [&str; 5] = ["transformer", "text_encoder", "vae", "tokenizer", "audio_vae"];
 /// Media settings that travel with the models.
 const MEDIA_SETTINGS: [&str; 4] = ["memory", "ram_gb", "vram_gb", "default_model"];

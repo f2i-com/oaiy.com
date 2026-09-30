@@ -190,7 +190,7 @@ impl Request {
 }
 
 /// `loras`: LoRA adapters as `[{"path": …, "strength": 0.8}]` (strength 1 when left out), or plain paths.
-fn parse_loras(j: &Json) -> std::result::Result<Vec<(PathBuf, f64)>, String> {
+pub(crate) fn parse_loras(j: &Json) -> std::result::Result<Vec<(PathBuf, f64)>, String> {
     let Some(list) = j.get("loras") else { return Ok(Vec::new()) };
     if matches!(list, Json::Null) {
         return Ok(Vec::new());

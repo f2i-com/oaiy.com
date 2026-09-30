@@ -144,6 +144,36 @@ impl Loras {
         self.adapters.is_empty()
     }
 
+    /// Strict architecture preflight without reading adapter payloads. Klein
+    /// uses the original fused BFL projection names, including fused QKV/MLP.
+    pub fn validate_modules(&self, expected: &[(String, usize, usize)]) -> Result<()> {
+        for adapter in &self.adapters {
+            if !adapter.strength.is_finite() || !(-4. ..=4.).contains(&adapter.strength) {
+                candle_core::bail!("LoRA strength must be finite and between -4 and 4");
+            }
+            let mut found = BTreeSet::new();
+            for (module, out, input) in expected {
+                for keys in layouts(module) {
+                    if adapter.weights.has(&keys.down) {
+                        let down = adapter.weights.shape(&keys.down)?;
+                        let up = adapter.weights.shape(&keys.up)?;
+                        if down.len() != 2 || up.len() != 2 || down[0] == 0 ||
+                            down[1] != *input || up[0] != *out || up[1] != down[0] {
+                            candle_core::bail!("LoRA {} does not fit {module}: {up:?} x {down:?}; expected [{out}, {input}]", adapter.path.display());
+                        }
+                        found.insert(module.clone());
+                        break;
+                    }
+                }
+            }
+            if found.is_empty() || adapter.modules.iter().any(|m| !found.contains(m) &&
+                !found.iter().any(|u| format!("lora_unet_{}", u.replace('.', "_")) == *m)) {
+                candle_core::bail!("LoRA {} contains projections outside the selected architecture", adapter.path.display());
+            }
+        }
+        Ok(())
+    }
+
     /// Whether the first adapter (the turbo one, when there is one) adapts `module`.
     pub fn first_adapts(&self, module: &str) -> bool {
         self.adapters.first().is_some_and(|a| a.adapts(module))

@@ -21,7 +21,7 @@ pub const TARGETS: [&str; 16] = ["chat", "completions", "models", "images", "edi
 pub const SPECS: [&str; 2] = ["openai", "oaiy"];
 pub const MEMORY: [&str; 4] = ["auto", "gpu", "ram", "ssd"];
 pub const VIDEO_FAMILIES: [&str; 3] = ["ltx-2.3", "ltx-2.5", "sulphur-2"];
-pub const IMAGE_ARCHITECTURES: [&str; 2] = ["qwen-image", "sdxl"];
+pub const IMAGE_ARCHITECTURES: [&str; 3] = ["qwen-image", "sdxl", "flux2-klein-4b"];
 /// How media jobs share GPUs with the LLM: `auto` pauses the LLM only when the
 /// media device is one of its devices; `pause_llm` always; `coexist` never.
 pub const LLM_POLICIES: [&str; 3] = ["auto", "pause_llm", "coexist"];
@@ -498,13 +498,17 @@ pub fn validate(v: &Json) -> Result<(), String> {
     for (name, m) in image_models.members() {
         let arch = str_or(m, "architecture", "qwen-image");
         if !IMAGE_ARCHITECTURES.contains(&arch) {
-            return Err(format!("image model {name}: architecture must be qwen-image or sdxl"));
+            return Err(format!("image model {name}: architecture must be one of {}", IMAGE_ARCHITECTURES.join(", ")));
         }
         // A disabled entry may be incomplete: a picked file waiting for its parts.
         if !bool_or(m, "enabled", true) {
             continue;
         }
-        let required: &[&str] = if arch == "sdxl" { &["checkpoint", "tokenizer"] } else { &["base"] };
+        let required: &[&str] = match arch {
+            "sdxl" => &["checkpoint", "tokenizer"],
+            "flux2-klein-4b" => &["transformer", "text_encoder", "vae", "tokenizer"],
+            _ => &["base"],
+        };
         for key in required {
             if str_or(m, key, "").trim().is_empty() {
                 return Err(format!("image model {name} needs {key}"));

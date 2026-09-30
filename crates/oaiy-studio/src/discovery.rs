@@ -113,7 +113,7 @@ fn names(section: Option<&Json>) -> Vec<(String, Json)> {
 
 /// The files each kind of model names, by field (what `missing_files` checks).
 const LLM_FILES: [&str; 3] = ["path", "vision_projector", "lora"];
-const IMAGE_FILES: [&str; 7] = ["base", "transformer", "safetensors_transformer", "adapter", "text_encoder", "checkpoint", "tokenizer"];
+const IMAGE_FILES: [&str; 8] = ["base", "transformer", "safetensors_transformer", "adapter", "text_encoder", "checkpoint", "tokenizer", "vae"];
 const VIDEO_FILES: [&str; 8] = ["transformer", "text_encoder", "vae", "tokenizer", "audio_vae", "dev_transformer", "spatial_upscaler", "id_lora"];
 const SPEECH_FILES: [&str; 3] = ["design", "base", "breeze"];
 const MUSIC_FILES: [&str; 2] = ["path", "language_model"];
@@ -214,14 +214,16 @@ pub fn document(studio: &Studio, base: &str, authorized: bool) -> Json {
     let image_models: Vec<Json> = names(image)
         .into_iter()
         .map(|(name, m)| {
-            let sdxl = str_or(&m, "architecture", "qwen-image") == "sdxl";
+            let arch = str_or(&m, "architecture", "qwen-image");
+            let sdxl = arch == "sdxl";
+            let edits = arch == "qwen-image";
             let entry = Json::obj([
                 ("id", Json::str(&name)),
                 ("default", Json::Bool(name == image_default)),
-                ("architecture", Json::str(if sdxl { "sdxl" } else { "qwen-image" })),
-                ("edits", Json::Bool(!sdxl)),
-                ("max_references", Json::Int(if sdxl { 0 } else { 3 })),
-                ("size_step", Json::Int(if sdxl { 64 } else { 32 })),
+                ("architecture", Json::str(arch)),
+                ("edits", Json::Bool(edits)),
+                ("max_references", Json::Int(if edits { 3 } else { 0 })),
+                ("size_step", Json::Int(if sdxl { 64 } else if arch == "flux2-klein-4b" { 16 } else { 32 })),
                 ("default_size", Json::str(format!("{}x{}", int_or(&m, "width", 1024), int_or(&m, "height", 1024)))),
                 ("negative_prompt", Json::Bool(sdxl)),
             ]);

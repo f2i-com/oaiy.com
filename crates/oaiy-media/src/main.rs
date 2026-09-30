@@ -30,6 +30,18 @@ fn run() -> candle_core::Result<()> {
         candle_core::bail!("request exceeds 2 MiB");
     }
     let j = Json::parse(&bytes).map_err(candle_core::Error::wrap)?;
+    if let Some(a) = j.get("architecture") {
+        if !a.as_str().is_some_and(|s| ["qwen-image", "sdxl", "flux2-klein-4b"].contains(&s)) {
+            candle_core::bail!("unsupported architecture; use qwen-image, sdxl or flux2-klein-4b");
+        }
+    }
+    if j.get("architecture").and_then(Json::as_str) == Some("flux2-klein-4b") {
+        let r = oaiy_media::klein::Request::parse(&j).map_err(candle_core::Error::Msg)?;
+        configure_cache(&r.output)?;
+        let result = oaiy_media::klein::generate(&r, |event| eprintln!("{}", event.to_json()))?;
+        writeln!(std::io::stdout(), "{}", result.to_json())?;
+        return Ok(());
+    }
     if j.get("architecture").and_then(Json::as_str) == Some("sdxl") {
         let r = oaiy_media::sdxl::Request::parse(&j).map_err(candle_core::Error::Msg)?;
         configure_cache(&r.output)?;

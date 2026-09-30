@@ -19,6 +19,7 @@ pub struct Config {
     pub image_model: Option<String>,
     pub text_encoder: Option<PathBuf>,
     pub sdxl: Option<Json>,
+    pub klein: Option<Json>,
     /// Image weight residency defaults and caps from the catalog: `memory`
     /// (auto|gpu|ram|ssd), `ram_gb`, `vram_gb`. An object; empty when unset.
     pub image_memory: Json,
@@ -93,6 +94,7 @@ impl Config {
             image_model: None,
             text_encoder: None,
             sdxl: None,
+            klein: None,
             image_memory: Json::obj([] as [(&str, Json); 0]),
             worker: s("worker")?.into(),
             base: s("base")?.into(),
@@ -727,6 +729,54 @@ fn prepare_sdxl(c: &Config, settings: &Json, body: &Json) -> Result<Json, String
     Ok(request)
 }
 
+fn prepare_klein(c: &Config, settings: &Json, body: &Json) -> Result<Json, String> {
+    let value = |key| body.get(key).or_else(|| settings.get(key));
+    let integer = |key, default, min, max| -> Result<i64, String> {
+        let n = match value(key) { None => default, Some(v) => v.as_i64().ok_or_else(|| format!("{key} must be an integer"))? };
+        if !(min..=max).contains(&n) { return Err(format!("{key} must be between {min} and {max}")); }
+        Ok(n)
+    };
+    let n = integer("n", 1, 1, 1000)?;
+    let width = integer("width", 1024, 256, 2048)?;
+    let height = integer("height", 1024, 256, 2048)?;
+    if width % 16 != 0 || height % 16 != 0 { return Err("Klein dimensions must be multiples of 16".into()); }
+    let valid_prompt = |v: &Json| v.as_str().is_some_and(|s| !s.trim().is_empty() && s.len() <= 16384);
+    match body.get("prompts") {
+        Some(v) => {
+            let a = v.as_array().ok_or("prompts must be an array")?;
+            if (a.len() != 1 && a.len() != n as usize) || a.iter().any(|v| !valid_prompt(v)) { return Err("provide one prompt or n nonempty prompts up to 16384 bytes each".into()); }
+        }
+        None => if !body.get("prompt").is_some_and(valid_prompt) { return Err("prompt must be nonempty and at most 16384 bytes".into()); },
+    }
+    for key in ["image", "images", "input_image", "input_reference", "adapter", "negative_prompt"] {
+        if body.get(key).is_some_and(|v| !matches!(v, Json::Null) && !v.as_array().is_some_and(|a| a.is_empty())) { return Err("native Klein currently supports text-to-image without reference images or negative prompts".into()); }
+    }
+    if body.get("turbo").is_some_and(|v| v.as_bool() != Some(false)) { return Err("Klein does not use Qwen turbo".into()); }
+    let variant = settings.get("variant").and_then(Json::as_str).unwrap_or("distilled");
+    if !["distilled", "base"].contains(&variant) { return Err("Klein variant must be distilled or base".into()); }
+    let distilled = variant == "distilled";
+    let steps = integer("steps", if distilled { 4 } else { 50 }, 1, 100)?;
+    let cfg = match value("cfg") { None => if distilled { 1.0 } else { 4.0 }, Some(v) => v.as_f64().ok_or("cfg must be numeric")? };
+    if !cfg.is_finite() || !(1.0..=10.0).contains(&cfg) || (distilled && (steps != 4 || cfg != 1.0)) { return Err("distilled Klein requires four steps and cfg 1; base cfg must be between 1 and 10".into()); }
+    let mut fields = vec![
+        ("architecture".into(), Json::str("flux2-klein-4b")), ("variant".into(), Json::str(variant)),
+        ("n".into(), Json::Int(n)), ("width".into(), Json::Int(width)), ("height".into(), Json::Int(height)),
+        ("steps".into(), Json::Int(steps)), ("cfg".into(), Json::Num(cfg)),
+        ("seed".into(), Json::Int(integer("seed", 0, 0, i64::MAX - n)?)),
+        ("device".into(), Json::Int(c.image_device as i64)),
+        ("output_dir".into(), Json::str(output_directory(c, body, "images")?.to_string_lossy())),
+    ];
+    for key in ["transformer", "text_encoder", "vae", "tokenizer"] { fields.push((key.into(), settings.get(key).cloned().ok_or_else(|| format!("missing Klein {key}"))?)); }
+    let enabled = match body.get("use_loras") { None => true, Some(v) => v.as_bool().ok_or("use_loras must be boolean")? };
+    fields.push(("loras".into(), if enabled { Json::Arr(c.loras.iter().map(|(p, s)| Json::obj([("path", Json::str(p.to_string_lossy())), ("strength", Json::Num(*s))])).collect()) } else { Json::Arr(Vec::new()) }));
+    if let Some(model) = &c.image_model { fields.push(("model".into(), Json::str(model))); }
+    fields.extend(image_memory(c, body)?);
+    for key in ["prompt", "prompts"] { if let Some(v) = body.get(key) { fields.push((key.into(), v.clone())); } }
+    let request = Json::Obj(fields);
+    if request.to_json().len() > 2 * 1024 * 1024 { return Err("image request exceeds 2 MiB".into()); }
+    Ok(request)
+}
+
 fn prepare(c: &Config, body: &Json) -> Result<Json, String> {
     let selected = match body.get("model") {
         None => None,
@@ -734,6 +784,7 @@ fn prepare(c: &Config, body: &Json) -> Result<Json, String> {
     };
     let current = crate::media_catalog::image(c, selected)?;
     let c = &current;
+    if let Some(settings) = &c.klein { return prepare_klein(c, settings, body); }
     if let Some(settings) = &c.sdxl {
         return prepare_sdxl(c, settings, body);
     }
@@ -1096,6 +1147,7 @@ mod tests {
             image_model: None,
             text_encoder: None,
             sdxl: None,
+            klein: None,
             image_memory: Json::obj([] as [(&str, Json); 0]),
             worker: "worker".into(),
             base: "base".into(),

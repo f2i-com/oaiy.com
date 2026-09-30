@@ -60,6 +60,16 @@ impl Weights {
         self.resolve(name).is_ok()
     }
 
+    /// Inspect dimensions without materializing tensor payloads.
+    pub fn shape(&self, name: &str) -> Result<Vec<usize>> {
+        let key = self.resolve(name)?;
+        match self {
+            Self::Safe(s) => Ok(s.info(&key).map_err(candle_core::Error::wrap)?.shape.clone()),
+            Self::Gguf { content, .. } => Ok(content.tensor_infos.get(&key)
+                .ok_or_else(|| candle_core::Error::Msg(format!("missing tensor {key}")))?.shape.dims().to_vec()),
+        }
+    }
+
     pub fn tensor(&mut self, name: &str, dev: &Device, dtype: DType) -> Result<Tensor> {
         // Comfy's fused Qwen 2.1 MLP stores gate rows followed by up rows.
         // Read only the requested half, preserving the original logical LoRA keys.

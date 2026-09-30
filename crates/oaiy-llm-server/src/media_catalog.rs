@@ -73,6 +73,7 @@ pub(crate) fn read_directory(root: &Path) -> Result<Config, String> {
         image_model: None,
         text_encoder: None,
         sdxl: None,
+        klein: None,
         image_memory: Json::obj([] as [(&str, Json); 0]),
     };
     if c.controller_device == c.image_device {
@@ -125,7 +126,23 @@ pub(crate) fn image(c: &Config, selected: Option<&str>) -> Result<Config, String
             .collect(),
     );
     match j.get("architecture").and_then(Json::as_str).unwrap_or("qwen-image") {
+        "flux2-klein-4b" => {
+            let mut fields = Vec::new();
+            for key in ["transformer", "text_encoder", "vae", "tokenizer"] {
+                let p = required_path(root, &j, key)?;
+                if !p.is_file() { return Err(format!("Klein {key} must be a file")); }
+                fields.push((key.into(), Json::str(p.to_string_lossy())));
+            }
+            for key in ["variant", "steps", "cfg"] { if let Some(v) = j.get(key) { fields.push((key.into(), v.clone())); } }
+            snapshot.klein = Some(Json::Obj(fields));
+            snapshot.sdxl = None;
+            snapshot.loras = crate::images::loras(Some(root), &j)?;
+            snapshot.adapter = None;
+            snapshot.default_weights = "safetensors".into();
+            return Ok(snapshot);
+        }
         "sdxl" => {
+            snapshot.klein = None;
             let checkpoint = required_path(root, &j, "checkpoint")?;
             let tokenizer = required_path(root, &j, "tokenizer")?;
             if !checkpoint.is_file() || !tokenizer.is_file() {
@@ -146,8 +163,8 @@ pub(crate) fn image(c: &Config, selected: Option<&str>) -> Result<Config, String
             snapshot.text_encoder = None;
             return Ok(snapshot);
         }
-        "qwen-image" => snapshot.sdxl = None,
-        _ => return Err("unsupported image architecture; use qwen-image or sdxl".into()),
+        "qwen-image" => { snapshot.sdxl = None; snapshot.klein = None; },
+        _ => return Err("unsupported image architecture; use qwen-image, sdxl or flux2-klein-4b".into()),
     }
     snapshot.text_encoder = optional_path(root, &j, "text_encoder")?;
     snapshot.base = required_path(root, &j, "base")?;

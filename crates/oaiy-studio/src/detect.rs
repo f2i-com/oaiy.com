@@ -323,8 +323,25 @@ fn classify_header(h: &Header, path: &Path, format: &'static str) -> Result<Dete
     let spec = h.metadata.get("modelspec.architecture").and_then(Json::as_str).unwrap_or("");
     let config = h.metadata.get("config").and_then(Json::as_str).unwrap_or("");
     if has(h, ".lora_A.") || has(h, ".lora_down.") || h.metadata.get("lora_adapter_metadata").is_some() {
+        if h.metadata.get("ss_base_model_version").and_then(Json::as_str) == Some("flux2_klein_4b") {
+            return Ok(detected(Role::Component { kind: "klein_lora" }, format,
+                format!("FLUX.2 Klein 4B style LoRA ({label})"), vec![("loras", Json::Arr(vec![p]))]));
+        }
         return Ok(detected(Role::Component { kind: "adapter" }, format,
             format!("LoRA adapter ({label}); attach it to a Qwen Image model as its turbo adapter"), vec![("adapter", p)]));
+    }
+    if shape_of(h, "img_in.weight") == Some(&[3072, 128]) && shape_of(h, "txt_in.weight") == Some(&[3072, 7680])
+        && has(h, "double_blocks.4.img_attn.qkv.weight") && has(h, "single_blocks.19.linear1.weight") {
+        let mut d = detected(Role::Image { architecture: "flux2-klein-4b" }, format, format!("FLUX.2 Klein 4B transformer ({label}); select base variant explicitly for base weights"),
+            vec![("architecture", Json::str("flux2-klein-4b")), ("transformer", p), ("variant", Json::str("distilled")), ("steps", Json::Int(4)), ("cfg", Json::Num(1.0))]);
+        d.missing.extend(["text_encoder", "vae", "tokenizer"].into_iter().map(String::from));
+        return Ok(d);
+    }
+    if shape_of(h, "embed_tokens.weight") == Some(&[151936, 2560]) && shape_of(h, "layers.0.self_attn.q_proj.weight") == Some(&[4096, 2560]) {
+        return Ok(detected(Role::Component { kind: "klein_text_encoder" }, format, format!("Qwen3-4B text conditioner for Klein ({label})"), vec![("text_encoder", p)]));
+    }
+    if shape_of(h, "bn.running_mean") == Some(&[128]) && shape_of(h, "decoder.conv_in.weight") == Some(&[512, 32, 3, 3]) {
+        return Ok(detected(Role::Component { kind: "flux2_vae" }, format, format!("FLUX.2 VAE ({label})"), vec![("vae", p)]));
     }
     if spec.contains("stable-diffusion-xl") || (has(h, "conditioner.embedders.1.model.") && has(h, "model.diffusion_model.input_blocks.")) {
         let mut d = detected(Role::Image { architecture: "sdxl" }, format, format!("SDXL checkpoint ({label})"),
@@ -413,6 +430,9 @@ fn tokenizer_file(path: &Path) -> Result<Detected, String> {
     let mut head = vec![0; meta.len().min(4 << 20) as usize];
     File::open(path).and_then(|mut f| f.read_exact(&mut head)).map_err(|e| e.to_string())?;
     let text = String::from_utf8_lossy(&head);
+    if text.contains("<|im_start|>") && text.contains("<|endoftext|>") {
+        return Ok(detected(Role::Component { kind: "klein_tokenizer" }, "tokenizer", "Qwen tokenizer (for Klein's Qwen3-4B conditioner)".into(), vec![("tokenizer", path_json(path))]));
+    }
     if text.contains("<|startoftext|>") {
         return Ok(detected(Role::Component { kind: "clip_tokenizer" }, "tokenizer", "CLIP tokenizer (for SDXL)".into(), vec![("tokenizer", path_json(path))]));
     }
@@ -653,6 +673,23 @@ mod tests {
         let mut bytes = (header.len() as u64).to_le_bytes().to_vec();
         bytes.extend_from_slice(header.as_bytes());
         std::fs::write(path, bytes).unwrap();
+    }
+
+    #[test]
+    fn klein_and_its_components_are_distinct_from_qwen_image_and_turbo() {
+        let tensor=|name:&str,shape:&[i64]| (name.to_owned(),Json::obj([("shape",Json::Arr(shape.iter().map(|n|Json::Int(*n)).collect()))]));
+        let classify=|fields:Vec<(String,Json)>| {
+            let h=Header {tensors:fields.iter().map(|(n,v)|(n.clone(),v.get("shape").unwrap().as_array().unwrap().iter().map(|x|x.as_i64().unwrap()).collect())).collect(),metadata:Json::Null};
+            classify_header(&h,Path::new("model.safetensors"),"safetensors").unwrap()
+        };
+        let d=classify(vec![tensor("img_in.weight",&[3072,128]),tensor("txt_in.weight",&[3072,7680]),tensor("double_blocks.4.img_attn.qkv.weight",&[9216,3072]),tensor("single_blocks.19.linear1.weight",&[27648,3072])]);
+        assert!(matches!(d.role,Role::Image {architecture:"flux2-klein-4b"}));
+        assert_eq!(classify(vec![tensor("model.embed_tokens.weight",&[151936,2560]),tensor("model.layers.0.self_attn.q_proj.weight",&[4096,2560])]).kind(),"klein_text_encoder");
+        assert_eq!(classify(vec![tensor("bn.running_mean",&[128]),tensor("decoder.conv_in.weight",&[512,32,3,3])]).kind(),"flux2_vae");
+        let h=Header {tensors:vec![("diffusion_model.double_blocks.0.img_attn.qkv.lora_A.weight".into(),vec![32,3072])],metadata:Json::obj([("ss_base_model_version",Json::str("flux2_klein_4b"))])};
+        let d=classify_header(&h,Path::new("style.safetensors"),"safetensors").unwrap();
+        assert_eq!(d.kind(),"klein_lora");
+        assert!(!d.fields.iter().any(|(k,_)|k=="adapter"));
     }
 
     fn gguf(path: &Path, kv: &[(&str, &str)], tensors: &[&str]) {

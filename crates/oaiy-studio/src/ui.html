@@ -1275,6 +1275,7 @@ function missingOf(section, m) {
   if (section === "speech") return empty("design") && empty("base") && empty("breeze") ? ["design"] : [];
   if (section === "music" || section === "sound") return empty("path") ? ["path"] : [];
   if (section === "model3d") return ["path", "dino", "naf"].filter(empty);
+  if (section === "image" && m.architecture === "flux2-klein-4b") return ["transformer", "text_encoder", "vae", "tokenizer"].filter(empty);
   if (section === "image") return (m.architecture || "qwen-image") === "sdxl" ? ["checkpoint", "tokenizer"].filter(empty)
     : [...(empty("base") ? ["base"] : []), ...(empty("transformer") && empty("safetensors_transformer") ? ["transformer"] : [])];
   return [...["transformer", "text_encoder", "vae"].filter(empty), ...(m.family !== "ltx-2.5" && empty("tokenizer") ? ["tokenizer"] : [])];
@@ -1303,14 +1304,20 @@ function renderModels() {
 
   const img = Object.entries(cfg.media.image.models);
   $("#m-image").innerHTML = img.length ? img.map(([name, m]) => {
-    const sdxl = m.architecture === "sdxl", miss = missingOf("image", m);
-    const fields = sdxl
+    const sdxl = m.architecture === "sdxl", klein = m.architecture === "flux2-klein-4b", miss = missingOf("image", m);
+    const fields = klein
+      ? field("Klein 4B transformer (.safetensors)", "image", name, "transformer", m.transformer, {missing: miss.includes("transformer")})
+        + field("Qwen3-4B text encoder", "image", name, "text_encoder", m.text_encoder, {missing: miss.includes("text_encoder")})
+        + field("FLUX.2 VAE", "image", name, "vae", m.vae, {missing: miss.includes("vae")})
+        + field("Qwen3 tokenizer.json", "image", name, "tokenizer", m.tokenizer, {missing: miss.includes("tokenizer")})
+        + loraList("image", name, m.loras)
+      : sdxl
       ? field("Checkpoint", "image", name, "checkpoint", m.checkpoint, {missing: miss.includes("checkpoint")}) + field("CLIP tokenizer.json", "image", name, "tokenizer", m.tokenizer, {missing: miss.includes("tokenizer")})
       : field("Base folder (diffusers)", "image", name, "base", m.base, {dir: true, missing: miss.includes("base")}) + field("Transformer (.gguf)", "image", name, "transformer", m.transformer, {missing: miss.includes("transformer")})
         + field("Transformer (.safetensors)", "image", name, "safetensors_transformer", m.safetensors_transformer) + field("Turbo adapter (optional)", "image", name, "adapter", m.adapter)
         + field("Text encoder override (optional)", "image", name, "text_encoder", m.text_encoder)
         + loraList("image", name, m.loras);
-    return mediaItem("image", name, m, sdxl ? "SDXL" : "Qwen Image", miss, fields);
+    return mediaItem("image", name, m, klein ? "FLUX.2 Klein 4B" : sdxl ? "SDXL" : "Qwen Image", miss, fields);
   }).join("") : '<div class="empty">No image model yet. Add an SDXL checkpoint, a Qwen Image .gguf or .safetensors file, or a diffusers folder.</div>';
 
   const sp = Object.entries(cfg.media.speech?.models || {});

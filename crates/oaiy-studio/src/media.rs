@@ -396,7 +396,14 @@ pub fn image_request(cfg: &Json, root: &Path, output_root: &Path, body: &Json, a
         Some(v) => v.as_i64().filter(|n| (1..=16).contains(n)).ok_or("n must be between 1 and 16")?,
     };
     let arch = str_or(model, "architecture", "qwen-image");
-    let step = if arch == "sdxl" { 64 } else { 32 };
+    let step = if arch == "sdxl" { 64 } else if arch == "flux2-klein-4b" { 16 } else { 32 };
+    if arch == "flux2-klein-4b" {
+        for key in ["image", "images", "input_image", "input_reference", "adapter", "negative_prompt"] {
+            if body.get(key).is_some_and(|v| !matches!(v, Json::Null) && !v.as_array().is_some_and(|a| a.is_empty())) {
+                return Err("native Klein currently supports text-to-image without reference images or negative prompts".into());
+            }
+        }
+    }
     let refs = references(body, output_root, allow_local)?;
     if !refs.is_empty() && arch == "sdxl" {
         return Err(format!("{name} is an SDXL model, which cannot edit images; pick a Qwen Image model"));
@@ -441,6 +448,38 @@ pub fn image_request(cfg: &Json, root: &Path, output_root: &Path, body: &Json, a
         let negative = body.get("negative_prompt").and_then(Json::as_str).unwrap_or(str_or(model, "negative_prompt", ""));
         f.push(("negative_prompt".into(), Json::str(negative)));
         f.push(("clip_skip".into(), Json::Int(int_or(model, "clip_skip", 1))));
+    } else if arch == "flux2-klein-4b" {
+        f.push(("architecture".into(), Json::str(arch)));
+        for key in ["transformer", "text_encoder", "vae", "tokenizer"] {
+            f.push((key.into(), Json::str(path_field(root, model, key).ok_or_else(|| format!("Klein model needs {key}"))?)));
+        }
+        let variant = str_or(model, "variant", "distilled");
+        if !["distilled", "base"].contains(&variant) { return Err("Klein variant must be distilled or base".into()); }
+        let distilled = variant == "distilled";
+        let count = steps(if distilled { 4 } else { 50 }, 1, 100)?;
+        let cfg_scale = match body.get("cfg").or_else(|| model.get("cfg")) {
+            None => if distilled { 1.0 } else { 4.0 },
+            Some(v) => v.as_f64().ok_or("cfg must be numeric")?,
+        };
+        if !cfg_scale.is_finite() || !(1.0..=10.0).contains(&cfg_scale) || (distilled && (count != 4 || cfg_scale != 1.0)) {
+            return Err("distilled Klein requires four steps and cfg 1; base cfg must be between 1 and 10".into());
+        }
+        f.push(("variant".into(), Json::str(variant)));
+        f.push(("steps".into(), Json::Int(count)));
+        f.push(("cfg".into(), Json::Num(cfg_scale)));
+        let enabled = match body.get("use_loras") { None => true, Some(v) => v.as_bool().ok_or("use_loras must be boolean")? };
+        if enabled {
+            let mut loras = Vec::new();
+            if let Some(list) = model.get("loras") {
+                for l in list.as_array().ok_or("loras must be an array")? {
+                    let p = l.as_str().or_else(|| l.get("path").and_then(Json::as_str)).filter(|s| !s.trim().is_empty()).ok_or("LoRA needs a path")?;
+                    let strength = match l.get("strength") { None => 1.0, Some(v) => v.as_f64().ok_or("LoRA strength must be numeric")? };
+                    if !strength.is_finite() || !(-4.0..=4.0).contains(&strength) { return Err("LoRA strength must be between -4 and 4".into()); }
+                    loras.push(Json::obj([("path", Json::str(config::resolve(root, p).to_string_lossy())), ("strength", Json::Num(strength))]));
+                }
+            }
+            f.push(("loras".into(), Json::Arr(loras)));
+        }
     } else {
         f.push(("base".into(), Json::str(path_field(root, model, "base").ok_or("Qwen Image model needs its base folder")?)));
         let gguf = path_field(root, model, "transformer");
@@ -1407,6 +1446,32 @@ mod tests {
 
     fn body(s: &str) -> Json {
         Json::parse(s.as_bytes()).unwrap()
+    }
+
+    #[test]
+    fn klein_requests_use_native_paths_fixed_distilled_recipe_and_optional_style_loras() {
+        let mut c=cfg("","");
+        let m=body(r#"{"architecture":"flux2-klein-4b","transformer":"klein.safetensors","text_encoder":"qwen_3_4b.safetensors","vae":"flux2-vae.safetensors","tokenizer":"qwen-tokenizer.json","loras":[{"path":"style.safetensors","strength":0.75}]}"#);
+        let mut media=c.get("media").unwrap().clone();
+        let mut image=media.get("image").unwrap().clone();
+        let mut models=image.get("models").unwrap().clone();
+        crate::util::set(&mut models,"klein",m);
+        crate::util::set(&mut image,"models",models);
+        crate::util::set(&mut media,"image",image);
+        crate::util::set(&mut c,"media",media);
+        config::validate(&c).unwrap();
+        let root=Path::new("/install");
+        let (r,..)=image_request(&c,root,Path::new("/install/outputs"),&body(r#"{"model":"klein","prompt":"a fox","width":512,"height":512}"#),false).unwrap();
+        assert_eq!(r.get("architecture").and_then(Json::as_str),Some("flux2-klein-4b"));
+        assert_eq!(r.get("steps").and_then(Json::as_i64),Some(4));
+        assert_eq!(r.get("cfg").and_then(Json::as_f64),Some(1.0));
+        assert_eq!(r.get("loras").and_then(Json::as_array).unwrap().len(),1);
+        assert!(r.get("base").is_none()&&r.get("adapter").is_none());
+        let (baseline,..)=image_request(&c,root,root,&body(r#"{"model":"klein","prompt":"a fox","use_loras":false}"#),false).unwrap();
+        assert!(baseline.get("loras").is_none());
+        for bad in [r#"{"model":"klein","prompt":"x","steps":8}"#,r#"{"model":"klein","prompt":"x","cfg":4}"#,r#"{"model":"klein","prompt":"x","image":"data:image/png;base64,a"}"#,r#"{"model":"klein","prompt":"x","negative_prompt":"blur"}"#] {
+            assert!(image_request(&c,root,root,&body(bad),false).is_err(),"{bad}");
+        }
     }
 
     #[test]
