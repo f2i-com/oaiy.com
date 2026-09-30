@@ -241,6 +241,21 @@ mod tests {
     use oaiy_engine::json::Json;
     #[test]
     fn full_tiny_transformer_matches_published_bfl_forward_on_every_residency_tier() -> Result<()> {
+        check_published_forward(&Device::Cpu)
+    }
+
+    #[cfg(feature = "cuda")]
+    #[test]
+    #[ignore = "requires an explicitly selected idle OAIY_KLEIN_TEST_CUDA_DEVICE"]
+    fn cuda_tiny_transformer_matches_published_bfl_forward_on_every_residency_tier() -> Result<()> {
+        let device = std::env::var("OAIY_KLEIN_TEST_CUDA_DEVICE")
+            .map_err(candle_core::Error::wrap)?
+            .parse::<usize>()
+            .map_err(candle_core::Error::wrap)?;
+        check_published_forward(&Device::new_cuda(device)?)
+    }
+
+    fn check_published_forward(device: &Device) -> Result<()> {
         let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/klein");
         let j = Json::parse(&std::fs::read(root.join("expected.json"))?)
             .map_err(candle_core::Error::wrap)?;
@@ -265,8 +280,8 @@ mod tests {
             channels: 8,
             axes: [2; 4],
         };
-        let x = Tensor::from_vec(values("input")?, (1, 4, 8), &Device::Cpu)?;
-        let context = Tensor::from_vec(values("context")?, (1, 3, 6), &Device::Cpu)?;
+        let x = Tensor::from_vec(values("input")?, (1, 4, 8), device)?;
+        let context = Tensor::from_vec(values("context")?, (1, 3, 6), device)?;
         let expected = values("output")?;
         for memory in [
             crate::residency::Memory::Gpu,
@@ -280,7 +295,7 @@ mod tests {
             let mut model = Transformer::load_config(
                 &root.join("tiny.safetensors"),
                 &[],
-                &Device::Cpu,
+                device,
                 DType::F32,
                 &budget,
                 cfg,

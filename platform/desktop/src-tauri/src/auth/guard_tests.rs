@@ -273,6 +273,30 @@ fn table() -> Vec<(Method, String, Class, &'static str)> {
 
 // ==================================== T1: the guard matrix =======================================
 
+/// Model selection and style switches do not turn image inference into a read.
+/// This exercises the real scoped guard with in-memory credentials; the table's
+/// stub handler checks authorization only, not image synthesis.
+#[tokio::test]
+async fn native_klein_image_gateway_requires_ai_use_for_baseline_and_lora() {
+    let e = env(AccessMode::Scoped);
+    let read = native_pat(&e, ScopeSet::of(&["models.read", "ai.read"]), DAY);
+    let infer = native_pat(&e, ScopeSet::of(&["ai.use"]), DAY);
+    for use_loras in [false, true] {
+        let body = serde_json::json!({
+            "model": "klein", "prompt": "fox", "seed": 747,
+            "width": 512, "height": 512, "steps": 4, "cfg": 1,
+            "use_loras": use_loras
+        }).to_string();
+        let request = send(Method::POST, "/api/ai/engine/gateway/v1/images/generations")
+            .json(&body);
+        let anonymous = go(&e, request.clone()).await;
+        assert_eq!((anonymous.status, anonymous.code().as_deref()), (401, Some("auth_required")));
+        let denied = go(&e, request.clone().bearer(&read)).await;
+        assert_eq!((denied.status, denied.code().as_deref()), (403, Some("insufficient_scope")));
+        assert_eq!(go(&e, request.bearer(&infer)).await.status, 200);
+    }
+}
+
 #[tokio::test]
 async fn t1_no_credential_gets_401_on_every_route_that_is_not_public_and_the_public_ones_answer() {
     for mode in [AccessMode::Scoped, AccessMode::Shadow] {
