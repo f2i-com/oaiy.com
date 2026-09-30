@@ -53,7 +53,8 @@ export { shellNavItems } from './src/components/chrome/ShellChrome.tsx';
 export { currentCaps } from './src/lib/caps.ts';
 export { currentAvailabilityEnv } from './src/lib/availabilityEnv.ts';
 export { paletteShowsNode, nodeNotice } from './src/lib/nodeAvailability.ts';
-export { hasSavedDesktopLink } from './src/lib/desktopLink.ts';`,
+export { hasSavedDesktopLink } from './src/lib/desktopLink.ts';
+export { forgetPageHost } from '@oaiy/shared/capabilities/host';`,
     resolveDir: UI,
     loader: 'ts',
   },
@@ -66,7 +67,7 @@ export { hasSavedDesktopLink } from './src/lib/desktopLink.ts';`,
   plugins: [{ name: 'oaiy-ui-components', setup: (build) => build.onResolve({ filter: /^oaiy-ui-components$/ }, () => ({ path: uiStub })) }],
 });
 fs.rmSync(uiStub, { force: true });
-const { flowKey, fromDoc, reconcile, shared, desktopTheme, taskText, shellNavItems, currentCaps, currentAvailabilityEnv, paletteShowsNode, nodeNotice, hasSavedDesktopLink } = await import(pathToFileURL(bundlePath).href);
+const { flowKey, fromDoc, reconcile, shared, desktopTheme, taskText, shellNavItems, currentCaps, currentAvailabilityEnv, paletteShowsNode, nodeNotice, hasSavedDesktopLink, forgetPageHost } = await import(pathToFileURL(bundlePath).href);
 fs.rmSync(bundlePath, { force: true });
 
 const flow = (extra = {}) => ({ id: 'f1', name: 'Greeting', createdAt: '', updatedAt: '', graph: { nodes: [], edges: [] }, ...extra });
@@ -151,6 +152,7 @@ check('the theme is the one OAIY said last', () => {
 // ---------------------------------------------------------------------------
 // In a browser `window` is the page's global object; here it is a stand-in, so the page's globals get the same desktop (readHost reads them).
 globalThis.__OAIY_DESKTOP__ = window.__OAIY_DESKTOP__;
+forgetPageHost();
 const store = new Map();
 globalThis.localStorage = { getItem: (k) => (store.has(k) ? store.get(k) : null), setItem: (k, v) => store.set(k, String(v)), removeItem: (k) => store.delete(k) };
 const SECTIONS = ['workflows', 'data', 'queue', 'packages'];
@@ -162,13 +164,16 @@ function asTab(fn) {
   const given = window.__OAIY_DESKTOP__;
   delete window.__OAIY_DESKTOP__;
   delete globalThis.__OAIY_DESKTOP__;
-  globalThis.location = { hostname: 'flows.example.org', protocol: 'https:', origin: 'https://flows.example.org' };
+  globalThis.location = { hostname: 'flows.example.org', protocol: 'https:', port: '', origin: 'https://flows.example.org', href: 'https://flows.example.org/app.html' };
+  // The window is read once per page; this page becomes another one, so it is read again.
+  forgetPageHost();
   try {
     return fn();
   } finally {
     window.__OAIY_DESKTOP__ = given;
     globalThis.__OAIY_DESKTOP__ = given;
     delete globalThis.location;
+    forgetPageHost();
     store.clear();
   }
 }

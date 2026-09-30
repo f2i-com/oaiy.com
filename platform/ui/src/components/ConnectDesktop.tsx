@@ -1,5 +1,5 @@
 import { useEffect, useReducer, useState } from 'react';
-import { looksOnLoad, readHost } from '@oaiy/shared/capabilities/host';
+import { looksOnLoad, pageHost } from '@oaiy/shared/capabilities/host';
 import { connectDesktop, disconnectDesktop } from '../lib/desktopConnect';
 import { subscribeDesktopStatus, type DesktopInfo } from '../lib/desktopDetection';
 import { linkedByConnect, subscribeDesktopLink } from '../lib/desktopLink';
@@ -27,7 +27,7 @@ export default function ConnectDesktop({ variant }: { variant: 'card' | 'compact
   const [, refresh] = useReducer((n: number) => n + 1, 0);
   useEffect(() => subscribeDesktopStatus(setStatus), []);
   useEffect(() => subscribeDesktopLink(refresh), []);
-  if (looksOnLoad(readHost())) return null;
+  if (looksOnLoad(pageHost())) return null;
 
   const base = status?.baseUrl ?? getEngineBase();
   const connected = status?.available === true;

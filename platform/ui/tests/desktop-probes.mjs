@@ -58,7 +58,7 @@ let n = 0;
  * A page of its own: the globals a browser gives it (its address, storage, a fetch that records, an interval that only records),
  * and a fresh copy of the modules. `desktop` is what OAIY's window gives its pages before they run.
  */
-async function page({ hostname = 'flows.example.org', protocol = 'https:', desktop = null, storage = {}, health = 'answers' } = {}) {
+async function page({ hostname = 'flows.example.org', protocol = 'https:', port = '', desktop = null, tauri = false, shim = false, storage = {}, health = 'answers' } = {}) {
   const store = new Map(Object.entries(storage));
   const requests = [];
   const timers = new Map();
@@ -66,7 +66,8 @@ async function page({ hostname = 'flows.example.org', protocol = 'https:', deskt
   for (const key of ['__OAIY_DESKTOP__', '__OAIY_WEB_SHIM__', '__TAURI_INTERNALS__']) delete globalThis[key];
   globalThis.window = globalThis;
   globalThis.localStorage = { getItem: (k) => (store.has(k) ? store.get(k) : null), setItem: (k, v) => store.set(k, String(v)), removeItem: (k) => store.delete(k) };
-  Object.defineProperty(globalThis, 'location', { value: { hostname, protocol, origin: `${protocol}//${hostname}` }, configurable: true, writable: true });
+  const origin = `${protocol}//${hostname}${port ? `:${port}` : ''}`;
+  Object.defineProperty(globalThis, 'location', { value: { hostname, protocol, port, origin, href: `${origin}/app.html` }, configurable: true, writable: true });
   // Node's own setInterval is replaced by one that records: nothing ticks by itself.
   globalThis.setInterval = (fn, ms) => {
     timers.set(++timerId, { fn, ms });
@@ -74,6 +75,9 @@ async function page({ hostname = 'flows.example.org', protocol = 'https:', deskt
   };
   globalThis.clearInterval = (id) => timers.delete(id);
   if (desktop) globalThis.__OAIY_DESKTOP__ = desktop;
+  // Tauri's global and the flow editor's shim marker, as the page has them when it loads: the window is read as the modules load.
+  if (tauri) globalThis.__TAURI_INTERNALS__ = {};
+  if (shim) globalThis.__OAIY_WEB_SHIM__ = true;
   const json = (body) => ({ ok: true, status: 200, headers: { get: () => 'application/json' }, json: async () => body, text: async () => JSON.stringify(body) });
   globalThis.fetch = async (url, init) => {
     const u = String(url);
@@ -132,6 +136,19 @@ await check('a tab with no link and storage that throws still opens: nothing to 
   });
   await p.settle();
   assert.deepEqual(p.requests, []);
+});
+
+await check("a script that sets __OAIY_DESKTOP__ or Tauri's global after the page has loaded does not turn the tab into OAIY's window: the editor still looks at nothing (the review's F8)", async () => {
+  const p = await page({ storage: { [KEYS.services]: STALE } });
+  // What a flow's code, a model-written page or an injected script can do once the page is running.
+  globalThis.__OAIY_DESKTOP__ = Object.freeze({ origin: 'http://192.168.1.1:17972', token: 'x', theme: 'dark' });
+  globalThis.__TAURI_INTERNALS__ = {};
+  assert.equal(p.detection.mayLookOnLoad(), false);
+  p.detection.startDesktopDetection();
+  p.services.startDesktopServiceSync();
+  await p.settle();
+  assert.deepEqual(p.requests, []);
+  assert.equal(p.timers.size, 0);
 });
 
 await check('starting the detection twice is one poll, and asking on purpose (refreshDesktopStatus) is always allowed: it is the person asking', async () => {
@@ -195,17 +212,14 @@ await check('a tab whose engine has an address of its own (Settings) looks there
 });
 
 await check('the desktop shell is one of OAIY\'s own places: it looks as it opens (a page of the Tauri shell has Tauri behind it)', async () => {
-  const p = await page({ hostname: 'localhost', protocol: 'http:' });
-  globalThis.__TAURI_INTERNALS__ = {};
+  const p = await page({ hostname: 'localhost', protocol: 'http:', tauri: true });
   p.detection.startDesktopDetection();
   await p.settle();
   assert.equal(p.health().length, 1);
 });
 
 await check("the editor's browser shim defines Tauri's global as well, and that does not make a tab into a window that looks", async () => {
-  const p = await page();
-  globalThis.__TAURI_INTERNALS__ = {};
-  globalThis.__OAIY_WEB_SHIM__ = true;
+  const p = await page({ tauri: true, shim: true });
   p.detection.startDesktopDetection();
   p.services.startDesktopServiceSync();
   await p.settle();

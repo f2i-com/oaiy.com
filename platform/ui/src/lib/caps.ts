@@ -7,15 +7,18 @@
  * the node notices say what is missing. A link is what was saved, not whether the desktop answers this minute.
  */
 import { derive, type Caps, type Link } from '@oaiy/shared/capabilities/derive';
-import { readHost } from '@oaiy/shared/capabilities/host';
+import { pageHost } from '@oaiy/shared/capabilities/host';
 import { hasSavedDesktopLink, subscribeDesktopLink } from './desktopLink';
 import { getEngineBase } from './engineEndpoint';
+
+// Which window this is, read as the page loads, before any flow or other script of the person's runs (shared/capabilities/host.ts).
+pageHost();
 
 let cached: { key: string; caps: Caps } | null = null;
 
 /** The editor's capabilities now. The same object is returned until something that decides them changes (a React snapshot needs that). */
 export function currentCaps(): Caps {
-  const host = readHost();
+  const host = pageHost();
   const links: Link[] = hasSavedDesktopLink() ? [{ kind: 'desktop', base: getEngineBase() }] : [];
   const key = `${host.kind}|${host.hosted ?? ''}|${links.map((l) => `${l.kind}@${l.base}`).join(',')}`;
   if (cached?.key !== key) cached = { key, caps: derive({ host, links }) };

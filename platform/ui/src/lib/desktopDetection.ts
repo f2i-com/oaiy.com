@@ -35,9 +35,12 @@
  * `refreshDesktopStatus()` is the person asking, and always asks.
  */
 
-import { looksOnLoad, readHost } from '@oaiy/shared/capabilities/host';
+import { looksOnLoad, pageHost } from '@oaiy/shared/capabilities/host';
 import { getEngineBase, subscribeEngineBase } from './engineEndpoint';
 import { hasSavedDesktopLink } from './desktopLink';
+
+// Which window this is, read as the page loads, before any flow or other script of the person's runs (shared/capabilities/host.ts).
+pageHost();
 
 const POLL_INTERVAL_MS = 10_000;
 const FETCH_TIMEOUT_MS = 1500;
@@ -160,7 +163,7 @@ function publish(next: DesktopInfo): void {
  * browser only where its person has said (a link kept from Connect, or an engine address given in Settings).
  */
 export function mayLookOnLoad(): boolean {
-  return looksOnLoad(readHost()) || hasSavedDesktopLink();
+  return looksOnLoad(pageHost()) || hasSavedDesktopLink();
 }
 
 /**
