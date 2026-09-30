@@ -9,8 +9,9 @@ defined('OAIY_RELAY') or exit;
  * The devices table: creating a device with its first token, presenting a row to a client, and revoking.
  *
  * Revocation is immediate and complete (section 4.5): the device is marked revoked, its tokens are marked revoked (the
- * rows stay, so the device learns "revoked" instead of a blank 401, and only after its secret verified), its inbox and
- * pending items are purged, its party mailboxes, slots and push registration go, and any hold it has ends with
+ * rows stay, so the device learns "revoked" instead of a blank 401, and only after its secret verified), its inbox is
+ * purged, the items it had already posted to other mailboxes are retired (they are not delivered afterwards), its party
+ * mailboxes, slots and push registration go, and any hold it has ends with
  * `401 revoked` within 250 ms because a marker file tells the waiting request.
  */
 final class Devices
@@ -76,6 +77,7 @@ final class Devices
                 }
                 $db->exec('UPDATE devices SET revoked_at = ?, push_kind = NULL, push_token = NULL WHERE id = ?', [$now, $one]);
                 $db->exec('UPDATE tokens SET revoked_at = ? WHERE device_id = ? AND revoked_at IS NULL', [$now, $one]);
+                $ctx->mb->retireSenderInTx($db, $one); // what it already posted to others is not delivered after this
                 $ctx->mb->purgeInTx($db, 'dev:' . $one);
                 if ($row['app_id'] !== null && $row['owner_desktop'] !== null && $row['thumbprint'] !== null) {
                     $ctx->mb->purgeInTx($db, 'app:' . $row['app_id'] . '@' . $row['owner_desktop'] . '/mobile:' . $row['thumbprint']);

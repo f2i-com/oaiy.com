@@ -196,6 +196,24 @@ final class Mailbox
         return $items;
     }
 
+    /**
+     * Retire every live item a device sent, in every mailbox it sent to (a revoked device: what it has already posted must
+     * not be delivered after the revocation). The bodies go, the metadata stays for the usual ten minutes, and each
+     * recipient's counters are fixed by the same retirement as an ack. Mailboxes are taken in sorted order, so two
+     * revocations that touch the same mailboxes cannot wait for each other. Call inside write().
+     * @return int the number of items retired
+     */
+    public function retireSenderInTx(Db $db, string $sender): int
+    {
+        $boxes = array_map(static fn(array $r): string => (string)$r['mailbox'], $db->all('SELECT DISTINCT mailbox FROM items WHERE sender = ? AND state IN (0, 1)', [$sender]));
+        sort($boxes, SORT_STRING);
+        $n = 0;
+        foreach ($boxes as $box) {
+            $n += $this->retireInTx($db, $box, 'sender = ?', [$sender], 'UPDATE items SET body = NULL, state = 3 WHERE mailbox = ? AND state IN (0, 1) AND sender = ?', [$box, $sender]);
+        }
+        return $n;
+    }
+
     /** Record that these items were returned to a consumer. Call inside write(). @param list<int> $seqs */
     public function markDeliveredInTx(Db $db, string $mailbox, array $seqs, int $now): void
     {

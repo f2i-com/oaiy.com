@@ -224,6 +224,76 @@ test('4.5 revoke: immediate and complete - tokens, inbox and pending items, part
     eq(0, (int)$r->ctx()->db->val('SELECT COUNT(*) FROM mailboxes WHERE id = ?', [$ph->inbox()]));
 });
 
+test('4.5 revoke: what the revoked device had already posted to other inboxes is not delivered afterwards, delivered-but-unacknowledged items included, and the recipients\' counters follow', function () {
+    $r = Relay::make();
+    $d = $r->desktop();
+    $d2 = $r->desktop('Second desk');
+    $ph = $r->phone($d, 'Phone', ['flags' => ['canCmd' => true]]);
+    $ph2 = $r->phone($d, 'Other phone', ['flags' => ['canCmd' => true]]);
+    $prov = $r->provider();
+    // The phone posts a command to its desktop, the provider posts to both desktops, and another phone posts one too.
+    $res = $r->call($ph, 'POST', '/v1/items', ['items' => [['to' => $d->inbox(), 'lane' => 'cmd', 'id' => 'from-phone-1', 'ttl' => 300, 'body' => 'phone command one']]]);
+    eq('queued', $res['json']['results'][0]['status'], $res['body']);
+    $res = $r->call($ph2, 'POST', '/v1/items', ['items' => [['to' => $d->inbox(), 'lane' => 'cmd', 'id' => 'from-phone-2', 'ttl' => 300, 'body' => 'other phone']]]);
+    eq('queued', $res['json']['results'][0]['status'], $res['body']);
+    $res = $r->call($prov, 'POST', '/v1/items', ['items' => [
+        ['to' => $d->inbox(), 'lane' => 'cmd', 'id' => 'from-prov-1', 'ttl' => 300, 'body' => 'provider one'],
+        ['to' => $d2->inbox(), 'lane' => 'cmd', 'id' => 'from-prov-2', 'ttl' => 300, 'body' => 'provider two'],
+    ]]);
+    eq(['queued', 'queued'], array_column($res['json']['results'], 'status'), $res['body']);
+    // The desktop has been handed the phone's and the provider's commands but has not acknowledged them.
+    $got = $r->call($d, 'GET', '/v1/poll')['json']['items'];
+    eq(['from-phone-1', 'from-phone-2', 'from-prov-1'], array_column($got, 'id'));
+    $db = $r->ctx()->db;
+    eq([1, 1, 1], [(int)$db->val('SELECT state FROM items WHERE id = ?', ['from-phone-1']), (int)$db->val('SELECT state FROM items WHERE id = ?', ['from-phone-2']), (int)$db->val('SELECT state FROM items WHERE id = ?', ['from-prov-1'])], 'delivered, not acknowledged');
+    // The phone is revoked: its command is not delivered again, the other phone's and the provider's are.
+    eq(204, $r->call($d, 'POST', '/v1/devices/' . $ph->id . '/revoke')['status']);
+    $again = $r->call($d, 'GET', '/v1/poll')['json']['items'];
+    eq(['from-phone-2', 'from-prov-1'], array_column($again, 'id'), 'the revoked phone\'s command is gone');
+    eq(1, (int)$r->ctx()->db->val('SELECT COUNT(*) FROM items WHERE id = ? AND body IS NULL', ['from-phone-1']), 'its body is deleted');
+    // The provider is revoked: its commands to both desktops go.
+    Oaiy\Relay\Devices::revoke($r->ctx(), $prov->id);
+    eq(['from-phone-2'], array_column($r->call($d, 'GET', '/v1/poll')['json']['items'], 'id'));
+    eq([], $r->call($d2, 'GET', '/v1/poll')['json']['items'], 'the second desktop gets nothing from the revoked provider');
+    $db = $r->ctx()->db;
+    eq([1, strlen('other phone')], [(int)$db->val('SELECT live_items FROM mailboxes WHERE id = ?', [$d->inbox()]), (int)$db->val('SELECT live_bytes FROM mailboxes WHERE id = ?', [$d->inbox()])], 'the desktop\'s counters hold only the one live item');
+    eq([0, 0], [(int)$db->val('SELECT live_items FROM mailboxes WHERE id = ?', [$d2->inbox()]), (int)$db->val('SELECT live_bytes FROM mailboxes WHERE id = ?', [$d2->inbox()])]);
+    eq([], $r->counterDrift());
+});
+
+test('4.5 revoke: a revocation and a post to the same inbox at once leave the counters equal to a recount', function () {
+    $r = Relay::make();
+    $d = $r->desktop();
+    $prov = $r->provider();
+    $ctx = $r->ctx();
+    for ($i = 0; $i < 6; $i++) {
+        $ctx->mb->post($d->inbox(), 'cmd', "c$i", $prov->id, 300, '{}', null, null, 'body' . $i);
+    }
+    $script = $r->dir . '/poster.php';
+    file_put_contents($script, '<?php
+define("OAIY_RELAY", true);
+require ' . var_export(dirname(__DIR__, 2) . '/src/autoload.php', true) . ';
+$ctx = Oaiy\Relay\Context::open($argv[1]);
+for ($i = 0; $i < 30; $i++) {
+    try { $ctx->mb->post($argv[2], "cmd", "n" . $i . "-" . $argv[3], $argv[4], 300, "{}", null, null, "late" . $i); } catch (Throwable $e) { }
+    usleep(random_int(0, 4000));
+}
+');
+    $procs = [];
+    foreach (['a', 'b'] as $who) {
+        $p = proc_open(array_merge([PHP_BINARY], Server::phpFlags(), ['-d', 'auto_prepend_file=' . dirname(__DIR__) . '/prepend.php', $script, $r->data, $d->inbox(), $who, $prov->id]), [1 => ['pipe', 'w'], 2 => ['pipe', 'w']], $pipes, null, array_merge(getenv(), ['OAIY_TEST_CLOCK' => Tmp::clockFile()]));
+        $procs[] = [$p, $pipes];
+    }
+    usleep(40000);
+    Oaiy\Relay\Devices::revoke($r->ctx(), $prov->id);
+    foreach ($procs as [$p, $pipes]) {
+        stream_get_contents($pipes[1]);
+        eq('', trim((string)stream_get_contents($pipes[2])));
+        proc_close($p);
+    }
+    eq([], $r->counterDrift());
+});
+
 test('4.5 revoke: a marker file tells held requests, and it is written by the revoke, not by anything a client sends', function () {
     $r = Relay::make();
     $d = $r->desktop();
