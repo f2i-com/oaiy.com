@@ -270,6 +270,45 @@ fn every_setting_in_aokies_schema_is_classified_and_typed_as_the_schema_says() {
 
 /// The audit found that every setting of the phone plugin is call handling (what callers hear, who is answered, when a call ends):
 /// no key of its table comes back without a tick. A key added to the table as data has to be argued for in the audit's terms.
+/// Transfer policy is behaviour: every key the program that reads `ring.json` writes (`RingSettings`, as it writes them) is in the table, every key of the
+/// table is one it writes, none of them is data (nothing comes back without the tick), each that comes back has the transfers tick, and the ones that never
+/// come back are the file's version, a timed away and the two lists of devices. A key added to the program's settings fails here until it is decided.
+#[test]
+fn every_key_of_the_transfer_settings_is_classified_and_none_comes_back_without_its_tick() {
+    use crate::ring::settings::RingSettings;
+    fn paths(prefix: &str, value: &Value, out: &mut Vec<String>) {
+        if let Value::Object(map) = value {
+            for (key, inner) in map {
+                let path = if prefix.is_empty() { key.clone() } else { format!("{prefix}.{key}") };
+                out.push(path.clone());
+                paths(&path, inner, out);
+            }
+        }
+    }
+    let settings = RingSettings { away_until: Some(1), ..RingSettings::default() };
+    let mut doc = serde_json::to_value(&settings).unwrap();
+    doc["version"] = json!(1);
+    let keys = table().key_table("ring").unwrap();
+    let mut written = Vec::new();
+    paths("", &doc, &mut written);
+    assert!(written.len() >= 24, "the program's settings were read: {written:?}");
+    for path in &written {
+        assert!(keys.row(path).is_some(), "{path} is written by the program and is not in the table: decide what a restore does with it");
+    }
+    let in_table: BTreeSet<&str> = keys.keys.iter().map(|k| k.path.as_str()).collect();
+    let in_program: BTreeSet<&str> = written.iter().map(String::as_str).collect();
+    assert_eq!(in_table, in_program, "the table and the program's settings name the same keys");
+    let never: BTreeSet<&str> = keys.keys.iter().filter(|k| k.class == Class::Excluded).map(|k| k.path.as_str()).collect();
+    assert_eq!(never, BTreeSet::from(["version", "awayUntil", "windowsCompanions", "excludedDevices"]), "what never comes back");
+    for key in keys.keys.iter().filter(|k| k.class != Class::Excluded) {
+        assert_eq!((key.class, key.tick), (Class::Runs, Some(RestoreClass::Transfers)), "{}: a key of the transfer policy comes back only with the transfers tick", key.path);
+    }
+    let without = filter_json(keys, &doc, &|row| row.class == Class::Data);
+    assert!(without.kept.is_empty(), "with nothing ticked nothing of the policy comes back: {:?}", without.kept.iter().map(|k| k.path.as_str()).collect::<Vec<_>>());
+    let ticked = filter_json(keys, &doc, &|row| row.class == Class::Data || row.tick == Some(RestoreClass::Transfers));
+    assert!(ticked.kept.iter().all(|k| !never.contains(k.path.as_str())) && ticked.kept.len() >= 20, "{:?}", ticked.kept.iter().map(|k| k.path.as_str()).collect::<Vec<_>>());
+}
+
 #[test]
 fn no_key_of_the_phone_plugins_settings_comes_back_without_a_tick() {
     let keys = table().key_table("plugin.aokie").unwrap();
