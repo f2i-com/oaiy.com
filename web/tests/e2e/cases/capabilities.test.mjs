@@ -30,12 +30,27 @@ const open = (app, options) => openApp(env, app, options);
 const ready = (app, page) => appReady(app, page, 1000);
 const BROWSER_NODES = /Browser (Session|Page|Extract|Action)/;
 
-/** What the node palette lists for a search (the flow must be open). */
+/** What the node palette lists for a search (the flow must be open): read when two reads, a moment apart, say the same. */
 async function paletteFor(page, query) {
   const search = page.locator('[data-testid="node-palette"] input[placeholder="Search nodes"]');
   await search.fill(query);
-  await sleep(300);
-  return (await page.locator('[data-testid="node-palette"]').textContent()) ?? '';
+  const read = async () => (await page.locator('[data-testid="node-palette"]').textContent()) ?? '';
+  let text = await read();
+  for (let i = 0; i < 20; i++) {
+    await sleep(250);
+    const next = await read();
+    if (next === text) return next;
+    text = next;
+  }
+  return text;
+}
+
+/** The palette for a search once it matches (what a link to a desktop brings arrives a moment after the desktop answers), or what it last said. */
+async function paletteWhen(page, query, pattern, timeoutMs = 15_000) {
+  const until = Date.now() + timeoutMs;
+  let text = await paletteFor(page, query);
+  while (!pattern.test(text) && Date.now() < until) text = await paletteFor(page, query);
+  return text;
 }
 
 /** A new flow, so the palette is open. `sidebar`: the web rail's button, else the sections' bar in OAIY's window. */
@@ -97,12 +112,12 @@ describe('the flow editor in a tab', () => {
     await page.locator('aside [data-connect-desktop]').click();
     await page.locator('.oaiy-dock').waitFor({ timeout: 15_000 });
     assert.match(await page.locator('.oaiy-dock').textContent(), /companion connected/);
-    assert.match(await paletteFor(page, 'Browser'), BROWSER_NODES, 'after Connect the browser nodes are offered');
-    assert.match(await paletteFor(page, 'Ask the'), /Ask the Agent/);
-    assert.match(await paletteFor(page, 'Folder'), /Folder Input/);
+    assert.match(await paletteWhen(page, 'Browser', BROWSER_NODES), BROWSER_NODES, 'after Connect the browser nodes are offered');
+    assert.match(await paletteWhen(page, 'Ask the', /Ask the Agent/), /Ask the Agent/);
+    assert.match(await paletteWhen(page, 'Folder', /Folder Input/), /Folder Input/);
     const nav = await page.locator('.oaiy-nav button').evaluateAll((els) => els.map((e) => e.getAttribute('aria-label')));
     assert.deepEqual(nav, ['Workflows', 'Data', 'Queue'], 'Packages need the desktop\'s own commands, which no link gives a tab');
-    assert.match(await paletteFor(page, 'Python'), /Python rig/, "and the desktop's service is in the palette");
+    assert.match(await paletteWhen(page, 'Python', /Python rig/), /Python rig/, "and the desktop's service is in the palette");
     await page.locator('aside button', { hasText: 'Disconnect' }).click();
     await page.waitForFunction(() => document.querySelectorAll('.oaiy-dock').length === 0, null, { timeout: 5000 });
     assert.doesNotMatch(await paletteFor(page, 'Browser'), BROWSER_NODES, 'after Disconnect they are gone');
