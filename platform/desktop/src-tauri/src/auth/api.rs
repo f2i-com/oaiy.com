@@ -120,7 +120,7 @@ struct DeriveBody {
 }
 
 /// A `Content-Type` of `application/json` (with or without parameters).
-fn is_json(headers: &HeaderMap) -> bool {
+pub(super) fn is_json(headers: &HeaderMap) -> bool {
     headers
         .get(header::CONTENT_TYPE)
         .and_then(|v| v.to_str().ok())

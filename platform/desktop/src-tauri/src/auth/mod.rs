@@ -22,6 +22,8 @@ pub mod chain;
 pub mod clientip;
 pub mod clock;
 #[cfg(feature = "web")]
+pub mod console;
+#[cfg(feature = "web")]
 pub mod cookie;
 pub mod cors;
 #[cfg(feature = "web")]
@@ -33,6 +35,8 @@ pub mod host;
 #[cfg(feature = "web")]
 pub mod lanes;
 pub mod lock;
+#[cfg(feature = "web")]
+pub mod login;
 pub mod mode;
 #[cfg(feature = "web")]
 pub mod owner;
@@ -67,6 +71,8 @@ mod conformance;
 mod cookie_guard_tests;
 #[cfg(test)]
 mod guard_tests;
+#[cfg(test)]
+mod login_tests;
 #[cfg(test)]
 pub(crate) mod route_coverage;
 #[cfg(test)]
