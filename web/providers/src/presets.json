@@ -1,0 +1,79 @@
+{
+  "version": 1,
+  "presets": [
+    {
+      "id": "openai",
+      "label": "OpenAI",
+      "dialect": "openai",
+      "kind": "external",
+      "baseUrl": "https://api.openai.com/v1",
+      "browser": "unverified",
+      "keyUrl": "https://platform.openai.com/api-keys",
+      "keyHint": "Create a secret key in your OpenAI account and paste it here.",
+      "note": "OpenAI answers browsers today, but does not document it. A wrong key shows up as “the browser could not read the answer” on a chat request; the connection check reads the model list first, which says so plainly.",
+      "extraHeaders": ["OpenAI-Organization"]
+    },
+    {
+      "id": "anthropic",
+      "label": "Anthropic (Claude)",
+      "dialect": "anthropic",
+      "kind": "external",
+      "baseUrl": "https://api.anthropic.com/v1",
+      "browser": "ok",
+      "keyUrl": "https://console.anthropic.com/settings/keys",
+      "keyHint": "Create an API key in the Anthropic console and paste it here.",
+      "note": "Anthropic accepts calls from a browser page when they say so with a header, which is added for you.",
+      "extraHeaders": ["anthropic-beta"]
+    },
+    {
+      "id": "gemini",
+      "label": "Google Gemini",
+      "dialect": "openai",
+      "kind": "external",
+      "baseUrl": "https://generativelanguage.googleapis.com/v1beta/openai",
+      "browser": "ok",
+      "keyUrl": "https://aistudio.google.com/apikey",
+      "keyHint": "Create a key in Google AI Studio and paste it here.",
+      "note": "Uses Google's OpenAI-compatible address. Google advises keeping keys for a production service on a server of your own."
+    },
+    {
+      "id": "openrouter",
+      "label": "OpenRouter",
+      "dialect": "openai",
+      "kind": "external",
+      "baseUrl": "https://openrouter.ai/api/v1",
+      "browser": "ok",
+      "keyUrl": "https://openrouter.ai/keys",
+      "keyHint": "Create a key at OpenRouter and paste it here. Set a spending limit on the key there.",
+      "note": "One key for many vendors' models. HTTP-Referer and X-Title are how OpenRouter credits an app; they are optional.",
+      "extraHeaders": ["HTTP-Referer", "X-Title"]
+    },
+    {
+      "id": "local-server",
+      "label": "A server on this computer",
+      "dialect": "openai",
+      "kind": "local-server",
+      "baseUrl": "http://localhost:11434/v1",
+      "browser": "needs-setup",
+      "keyHint": "Most local servers need no key: leave it empty. Enter one only if you switched on a key in the server.",
+      "note": "The server has to allow this page ({origin}) to call it, and your browser may ask for permission to reach devices on your local network.",
+      "serverKinds": [
+        { "id": "ollama", "label": "Ollama", "baseUrl": "http://localhost:11434/v1", "help": "Start Ollama with OLLAMA_ORIGINS=\"{origin}\" and pull at least one model." },
+        { "id": "lmstudio", "label": "LM Studio", "baseUrl": "http://localhost:1234/v1", "help": "Load a model, then start the server in the Developer tab with “Enable CORS” switched on." },
+        { "id": "oaiy", "label": "OAIY", "baseUrl": "http://127.0.0.1:8080/v1", "help": "Add {origin} to gateway.cors_origins in OAIY's config, or set an API key there and enter it here." },
+        { "id": "other", "label": "llama.cpp or another server", "baseUrl": "http://localhost:8080/v1", "help": "Any server that speaks the OpenAI chat completions API. For llama.cpp: --cors-origins {origin} --cors-headers Authorization,Content-Type, and --api-key." }
+      ]
+    },
+    {
+      "id": "custom",
+      "label": "Another OpenAI-compatible service",
+      "dialect": "openai",
+      "kind": "external",
+      "baseUrl": "",
+      "editableBase": true,
+      "browser": "unknown",
+      "keyHint": "Paste the key the service gave you.",
+      "note": "Any service that speaks the OpenAI chat completions API, at an https address ending in its version (for example /v1). It has to allow calls from a browser page."
+    }
+  ]
+}
