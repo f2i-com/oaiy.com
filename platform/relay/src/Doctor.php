@@ -54,9 +54,14 @@ final class Doctor
     /** @return list<array{name:string,level:string,message:string}> */
     public static function phpVersion(string $version): array
     {
-        return version_compare($version, '8.0.0', '>=')
-            ? [self::row('php.version', self::OK, 'PHP ' . $version)]
-            : [self::row('php.version', self::FAIL, 'PHP ' . $version . ' is too old; the relay needs PHP 8.0 or later (8.2 is recommended)')];
+        if (version_compare($version, '8.0.0', '<')) {
+            return [self::row('php.version', self::FAIL, 'PHP ' . $version . ' is too old; the relay needs PHP 8.0 or later (8.2 or later is recommended)')];
+        }
+        if (version_compare($version, '8.2.0', '<')) {
+            // The relay runs on 8.0 and 8.1 (shared hosts are slow to move) but neither is supported by PHP any more.
+            return [self::row('php.version', self::WARN, 'PHP ' . $version . ' works, but PHP ' . substr($version, 0, 3) . ' is end of life and gets no security fixes; choose PHP 8.2 or later in the host\'s PHP selector')];
+        }
+        return [self::row('php.version', self::OK, 'PHP ' . $version)];
     }
 
     /**

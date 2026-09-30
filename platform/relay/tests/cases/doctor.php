@@ -56,13 +56,29 @@ function doc_data(): string
 
 // ------------------------------------------------------------------------------------------------ synthetic facts
 
-test('4.18.1 doctor: PHP older than 8.0 fails, 8.0 and later pass', function () {
+test('4.18.1 doctor: PHP older than 8.0 fails, 8.0 and 8.1 work but warn that they are end of life and name 8.2, 8.2 and later pass', function () {
     eq('fail', doc_level(Doctor::phpVersion('7.4.33'), 'php.version'));
     eq('fail', doc_level(Doctor::phpVersion('5.6.40'), 'php.version'));
-    eq('ok', doc_level(Doctor::phpVersion('8.0.0'), 'php.version'));
-    eq('ok', doc_level(Doctor::phpVersion('8.0.30'), 'php.version'));
-    eq('ok', doc_level(Doctor::phpVersion('8.4.15'), 'php.version'));
+    eq('fail', doc_level(Doctor::phpVersion('7.99.0'), 'php.version'));
+    foreach (['8.0.0', '8.0.30', '8.1.0', '8.1.34'] as $v) {
+        eq('warn', doc_level(Doctor::phpVersion($v), 'php.version'), $v);
+        contains('end of life', doc_msg(Doctor::phpVersion($v), 'php.version'));
+        contains('8.2', doc_msg(Doctor::phpVersion($v), 'php.version'));
+        contains('PHP ' . substr($v, 0, 3), doc_msg(Doctor::phpVersion($v), 'php.version'));
+    }
+    foreach (['8.2.0', '8.2.30', '8.3.6', '8.4.15', '9.0.0'] as $v) {
+        eq('ok', doc_level(Doctor::phpVersion($v), 'php.version'), $v);
+        not_contains('end of life', doc_msg(Doctor::phpVersion($v), 'php.version'));
+    }
     contains('8.0', doc_msg(Doctor::phpVersion('7.4.33'), 'php.version'));
+    contains('8.2', doc_msg(Doctor::phpVersion('7.4.33'), 'php.version'));
+});
+
+test('4.18.1 doctor: the run on this PHP reports its version as ok on 8.2 or later and as a warning, never a failure, on 8.0 and 8.1', function () {
+    $data = doc_data();
+    $rows = Doctor::run(['dataDir' => $data, 'web' => false]);
+    eq(version_compare(PHP_VERSION, '8.2.0', '>=') ? 'ok' : 'warn', doc_level($rows, 'php.version'));
+    eq([], doc_failures($rows));
 });
 
 test('4.18.1 doctor: a missing sodium, json, hash or database driver fails; a missing openssl or curl only warns', function () {

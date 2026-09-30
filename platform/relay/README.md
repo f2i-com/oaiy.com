@@ -11,7 +11,7 @@ The wire protocol is [`platform/protocol/relay/v1/`](../protocol/relay/v1/README
 
 | | |
 |---|---|
-| PHP | 8.0 or later (8.2 recommended). Tested on 8.0.30 and 8.4.15. |
+| PHP | 8.0 or later; **8.2 or later is recommended** (PHP 8.0 and 8.1 are end of life, and the doctor warns on both). Tested on 8.0.30 and 8.4.15. |
 | Extensions | `sodium` (bundled with PHP since 7.2), `json`, `hash`, and `pdo_sqlite` (the default store) or `pdo_mysql`. `openssl` and `curl` matter only to the optional FCM sender, which is not part of this build. |
 | Disk | A writable `data/` folder on a **local** filesystem (SQLite's write-ahead log is unsafe on NFS and similar). |
 | HTTPS | A publicly trusted certificate on a hostname of its own (a subdomain such as `relay.example.com`, not a path on a site that hosts anything else). The desktop and the phone use the bundled web roots and cannot use a private CA. |
@@ -49,7 +49,7 @@ installer and the doctor ask the web for a canary in `data/` and refuse or fail 
 
 ## Installing on cPanel-style hosting
 
-1. Choose PHP 8.0 or later in the host's PHP selector and make sure `sodium` and `pdo_sqlite` are enabled (both usually are).
+1. Choose PHP 8.2 or later in the host's PHP selector (8.0 works but is end of life) and make sure `sodium` and `pdo_sqlite` are enabled (both usually are).
 2. Upload and extract the relay **above** the web root, for example `~/oaiy-relay/`.
 3. Create a subdomain (`relay.example.com`) whose document root is `~/oaiy-relay/public`, and turn on AutoSSL.
 4. Install, in one of two ways.
