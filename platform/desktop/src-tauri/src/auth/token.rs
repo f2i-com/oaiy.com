@@ -313,6 +313,93 @@ pub fn bearer_from_headers<'a>(values: &[&'a [u8]]) -> Result<Option<&'a str>, B
     Ok(Some(token))
 }
 
+/// The shortest static token (`OAIY_SERVER_TOKEN`) the design allows.
+pub const STATIC_TOKEN_MIN_LEN: usize = 32;
+/// The longest.
+pub const STATIC_TOKEN_MAX_LEN: usize = 256;
+/// The fewest distinct characters it may be made of.
+pub const STATIC_TOKEN_MIN_DISTINCT: usize = 16;
+
+/// Why a value is not a static token of the shape the design gives it (`^[\x21-\x7e]{32,256}$` with at
+/// least 16 distinct characters, design 4.1).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum StaticTokenShape {
+    TooShort,
+    TooLong,
+    /// A space, a control character, a byte over 0x7e.
+    BadCharacter,
+    TooFewDistinct,
+}
+
+impl StaticTokenShape {
+    pub fn message(self) -> &'static str {
+        match self {
+            StaticTokenShape::TooShort => "OAIY_SERVER_TOKEN is shorter than 32 characters",
+            StaticTokenShape::TooLong => "OAIY_SERVER_TOKEN is longer than 256 characters",
+            StaticTokenShape::BadCharacter => {
+                "OAIY_SERVER_TOKEN has a space, a control character or a non-ASCII character"
+            }
+            StaticTokenShape::TooFewDistinct => {
+                "OAIY_SERVER_TOKEN is made of fewer than 16 different characters"
+            }
+        }
+    }
+}
+
+/// Whether `token` has the shape of a static token: 32 to 256 printable ASCII characters (0x21 to 0x7e),
+/// at least 16 of them different. Nothing acts on a `Err` yet (a later step makes it a startup refusal); it
+/// decides which wide tokens [`bearer_or_static`] takes.
+pub fn check_static_token_shape(token: &str) -> Result<(), StaticTokenShape> {
+    let bytes = token.as_bytes();
+    if !bytes.iter().all(|b| (0x21..=0x7e).contains(b)) {
+        return Err(StaticTokenShape::BadCharacter);
+    }
+    if bytes.len() < STATIC_TOKEN_MIN_LEN {
+        return Err(StaticTokenShape::TooShort);
+    }
+    if bytes.len() > STATIC_TOKEN_MAX_LEN {
+        return Err(StaticTokenShape::TooLong);
+    }
+    let mut seen = [false; 256];
+    for b in bytes {
+        seen[*b as usize] = true;
+    }
+    if seen.iter().filter(|s| **s).count() < STATIC_TOKEN_MIN_DISTINCT {
+        return Err(StaticTokenShape::TooFewDistinct);
+    }
+    Ok(())
+}
+
+/// [`bearer_from_headers`], except that the operator's own static token is a bearer whatever its shape
+/// within design 4.1's rule for it: `[\x21-\x7e]{32,256}` is wider than the strict bearer rule
+/// (`[A-Za-z0-9._~+/=-]` and 128 bytes), and a token with a `$` in it, or one of 200 characters, must not be
+/// a `400` in front of a server that was configured with it. Only a bearer that is exactly the configured
+/// token, compared in constant time, gets this; every other bearer is held to the strict rule, so nothing
+/// hostile that is not the operator's own token gets past it.
+pub fn bearer_or_static<'a>(
+    values: &[&'a [u8]],
+    static_token: Option<&str>,
+) -> Result<Option<&'a str>, BearerError> {
+    match bearer_from_headers(values) {
+        Err(e @ (BearerError::TooLong | BearerError::BadCharset)) => {
+            if let ([one], Some(want)) = (values, static_token) {
+                if let Some(rest) = one.strip_prefix(b"Bearer ") {
+                    if check_static_token_shape(want).is_ok()
+                        && secrets_equal(rest, want.as_bytes())
+                    {
+                        // Printable ASCII, by the shape.
+                        return std::str::from_utf8(rest)
+                            .map(Some)
+                            .map_err(|_| BearerError::BadCharset);
+                    }
+                }
+            }
+            Err(e)
+        }
+        other => other,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -638,5 +725,160 @@ mod tests {
         ] {
             assert!(!e.message().is_empty());
         }
+    }
+
+    /// `len` printable characters, all of them different for as long as the alphabet lasts.
+    fn printable(len: usize) -> String {
+        ('!'..='~').cycle().take(len).collect()
+    }
+
+    #[test]
+    fn a_static_token_has_the_shape_of_the_design_or_is_named_for_why_not() {
+        assert_eq!(check_static_token_shape(&printable(32)), Ok(()));
+        // The two ends of the length, and one over each.
+        for (len, want) in [
+            (0, Err(StaticTokenShape::TooShort)),
+            (31, Err(StaticTokenShape::TooShort)),
+            (32, Ok(())),
+            (100, Ok(())),
+            (256, Ok(())),
+            (257, Err(StaticTokenShape::TooLong)),
+            (1000, Err(StaticTokenShape::TooLong)),
+        ] {
+            assert_eq!(check_static_token_shape(&printable(len)), want, "{len}");
+        }
+        // Every byte: printable ASCII (0x21 to 0x7e) is allowed, and nothing else is.
+        for b in 0u32..=0x2FF {
+            let Some(c) = char::from_u32(b) else { continue };
+            let mut token = printable(31);
+            token.push(c);
+            let printable_ascii = (0x21..=0x7e).contains(&b);
+            assert_eq!(
+                check_static_token_shape(&token),
+                if printable_ascii {
+                    Ok(())
+                } else {
+                    Err(StaticTokenShape::BadCharacter)
+                },
+                "U+{b:04X}"
+            );
+        }
+        // At least 16 different characters.
+        let fifteen: String = ('a'..='o').cycle().take(40).collect();
+        let sixteen: String = ('a'..='p').cycle().take(40).collect();
+        assert_eq!(
+            check_static_token_shape(&fifteen),
+            Err(StaticTokenShape::TooFewDistinct)
+        );
+        assert_eq!(check_static_token_shape(&sixteen), Ok(()));
+        assert_eq!(
+            check_static_token_shape(&"a".repeat(64)),
+            Err(StaticTokenShape::TooFewDistinct)
+        );
+        for reason in [
+            StaticTokenShape::TooShort,
+            StaticTokenShape::TooLong,
+            StaticTokenShape::BadCharacter,
+            StaticTokenShape::TooFewDistinct,
+        ] {
+            assert!(reason.message().starts_with("OAIY_SERVER_TOKEN"));
+        }
+    }
+
+    #[test]
+    fn the_static_token_is_a_bearer_in_the_shape_the_design_gives_it() {
+        // Outside the strict bearer rule (`[A-Za-z0-9._~+/=-]`, 128 bytes) and inside the static token's
+        // (`[\x21-\x7e]{32,256}`): a `$` and a `!`, 129 and 256 characters, every punctuation mark.
+        let with_dollar = "Sup3r$ecret!Zq7kLm9VbNw2XyHdFg5!ab".to_string();
+        let long_129: String = printable(129);
+        let long_256: String = printable(256);
+        let marks: String = format!("{}\"'(){{}}[]<>|^`,;:@#%&*?\\", printable(20));
+        for token in [with_dollar, long_129, long_256, marks] {
+            assert_eq!(check_static_token_shape(&token), Ok(()), "{token}");
+            let header = format!("Bearer {token}");
+            let values: &[&[u8]] = &[header.as_bytes()];
+            assert!(
+                bearer_from_headers(values).is_err(),
+                "the strict rule alone refuses it: {token}"
+            );
+            assert_eq!(
+                bearer_or_static(values, Some(&token)),
+                Ok(Some(token.as_str())),
+                "{token}"
+            );
+            // Configured with nothing, or another token of the same shape: the strict rule's refusal.
+            let other = printable(40);
+            for configured in [None, Some(other.as_str())] {
+                assert!(
+                    matches!(
+                        bearer_or_static(values, configured),
+                        Err(BearerError::TooLong | BearerError::BadCharset)
+                    ),
+                    "{token} against {configured:?}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn nothing_but_the_exact_static_token_gets_past_the_strict_bearer_rule() {
+        let token = "Sup3r$ecret!Zq7kLm9VbNw2XyHdFg5!ab";
+        let one = |presented: &str| {
+            let header = format!("Bearer {presented}");
+            bearer_or_static(&[header.as_bytes()], Some(token)).map(|o| o.map(str::to_string))
+        };
+        assert_eq!(one(token), Ok(Some(token.to_string())));
+        // One character more, one less, one changed, another case: not the token.
+        for near in [
+            format!("{token}x"),
+            token[..token.len() - 1].to_string(),
+            token.replace("Sup3r", "sup3r"),
+            token.replace("ab", "ac"),
+            token.replace('$', "%"),
+        ] {
+            assert_eq!(one(&near), Err(BearerError::BadCharset), "{near}");
+        }
+        // A wide token of 129 bytes that is not the static token.
+        assert_eq!(one(&"$".repeat(129)), Err(BearerError::TooLong));
+        // What the static token can never contain is refused, configured or not.
+        for hostile in ["a b", "a\tb", "a\u{7f}b", "caf\u{e9}", "a\nb", "a\rb", ""] {
+            assert_eq!(one(hostile), Err(BearerError::BadCharset), "{hostile:?}");
+        }
+        // The other rules stand: two headers, another scheme, the scheme in another case, a session token.
+        let good = format!("Bearer {token}");
+        assert_eq!(
+            bearer_or_static(&[good.as_bytes(), good.as_bytes()], Some(token)),
+            Err(BearerError::Multiple)
+        );
+        assert_eq!(
+            bearer_or_static(&[format!("bearer {token}").as_bytes()], Some(token)),
+            Err(BearerError::NotBearer)
+        );
+        assert_eq!(bearer_or_static(&[], Some(token)), Ok(None));
+        // A session token never travels as a bearer, even if the operator configured one (32 characters).
+        let session_like = "oaiyses_Zq7kLm9VbNw2XyHdFg5Sup3r";
+        assert_eq!(check_static_token_shape(session_like), Ok(()));
+        let header = format!("Bearer {session_like}");
+        assert_eq!(
+            bearer_or_static(&[header.as_bytes()], Some(session_like)),
+            Err(BearerError::CookieOnlyKind)
+        );
+        // A token that fails the shape rule is not widened: it is what the strict rule says it is.
+        let short = "ab$cd";
+        assert_eq!(
+            bearer_or_static(&[b"Bearer ab$cd"], Some(short)),
+            Err(BearerError::BadCharset)
+        );
+        let too_long = format!("{}$", printable(256));
+        let header = format!("Bearer {too_long}");
+        assert_eq!(
+            bearer_or_static(&[header.as_bytes()], Some(&too_long)),
+            Err(BearerError::TooLong)
+        );
+        // A token inside the strict rule is a bearer as before, configured or not.
+        assert_eq!(
+            bearer_or_static(&[b"Bearer abc.DEF_123~+/=-"], None),
+            Ok(Some("abc.DEF_123~+/=-"))
+        );
     }
 }

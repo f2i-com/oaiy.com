@@ -2396,6 +2396,98 @@ async fn in_scoped_and_shadow_mode_the_new_guard_claims_every_request() {
     }
 }
 
+// ============================= F4: the static token in the shape the design gives it ==============
+
+/// Tokens of the static token's shape (`[\x21-\x7e]{32,256}`, 16 different characters) that the strict bearer
+/// rule (`[A-Za-z0-9._~+/=-]`, 128 bytes) alone would refuse.
+fn wide_static_tokens() -> Vec<(&'static str, String)> {
+    let printable = |len: usize| -> String { ('!'..='~').cycle().take(len).collect() };
+    vec![
+        (
+            "36 characters with a dollar sign and an exclamation mark",
+            "Sup3r$ecret!Zq7kLm9VbNw2XyHdFg5!".to_string(),
+        ),
+        ("129 characters", printable(129)),
+        ("256 characters", printable(256)),
+    ]
+}
+
+#[tokio::test]
+async fn f4_a_static_token_of_the_designs_shape_is_a_bearer_in_every_mode_and_a_hostile_one_is_still_400(
+) {
+    for (what, token) in wide_static_tokens() {
+        for mode in [AccessMode::Scoped, AccessMode::Shadow] {
+            let e = env_with(mode, &[], false, true, Some(&token));
+            // The configured token: the `cli` preset, as for any other shape.
+            let r = go(&e, send(Method::GET, "/api/config").bearer(&token)).await;
+            assert_eq!(r.status, 200, "{mode:?} {what}: {}", r.text);
+            let me = go(&e, send(Method::GET, "/api/auth/whoami").bearer(&token)).await;
+            assert_eq!(me.status, 200, "{mode:?} {what}");
+            assert_eq!(me.json()["kind"], "static");
+            assert_eq!(me.json()["scopes"].as_array().map(Vec::len), Some(15));
+            // Another token of the same shape is not the operator's, so it is held to the strict rule.
+            let mut wrong = token.clone();
+            wrong.replace_range(..1, if token.starts_with('Z') { "Y" } else { "Z" });
+            let r = go(&e, send(Method::GET, "/api/config").bearer(&wrong)).await;
+            assert_eq!(
+                (r.status, r.code().as_deref()),
+                (400, Some("bad_request")),
+                "{mode:?} {what}"
+            );
+            // A bearer that is not the token stays under the strict rule: 129 bytes, a space, a comma.
+            for hostile in ["a".repeat(129), "a b".to_string(), "abc,def".to_string()] {
+                let r = go(
+                    &e,
+                    send(Method::GET, "/api/config")
+                        .h("authorization", &format!("Bearer {hostile}")),
+                )
+                .await;
+                assert_eq!(
+                    (r.status, r.code().as_deref()),
+                    (400, Some("bad_request")),
+                    "{mode:?} {what}: {hostile:?}"
+                );
+            }
+        }
+    }
+}
+
+#[tokio::test]
+async fn f4_in_legacy_mode_the_new_routes_take_a_static_token_of_the_designs_shape_too() {
+    // `whoami` is judged by the new guard even in `legacy` (it is a route the model adds); the old guard's
+    // routes take any token, as they always did.
+    for (what, token) in wide_static_tokens() {
+        let e = env_with(AccessMode::Legacy, &[], false, false, Some(&token));
+        let r = go(&e, send(Method::GET, "/api/auth/whoami").bearer(&token)).await;
+        assert_eq!(r.status, 200, "{what}: {}", r.text);
+        assert_eq!(r.json()["kind"], "static");
+    }
+}
+
+#[tokio::test]
+async fn f4_a_static_token_that_fails_the_shape_rule_is_still_accepted_until_the_startup_rule_exists(
+) {
+    // ACC-14 (`validate_config`) makes a static token that fails the shape rule of design 4.1 a startup
+    // refusal (exit 78 in `oaiy-server`, ignored with a warning in the desktop). Until then it is what it was:
+    // a bearer, the `cli` preset. When ACC-14 lands this test changes on purpose.
+    for token in ["short", "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", "change-me"] {
+        assert!(
+            super::token::check_static_token_shape(token).is_err(),
+            "{token} fails the shape rule"
+        );
+        for mode in [AccessMode::Scoped, AccessMode::Shadow, AccessMode::Legacy] {
+            let e = env_with(mode, &[], false, true, Some(token));
+            let r = go(&e, send(Method::GET, "/api/auth/whoami").bearer(token)).await;
+            assert_eq!(r.status, 200, "{mode:?} {token}: {}", r.text);
+            assert_eq!(r.json()["kind"], "static");
+        }
+    }
+    // What is refused is a short token outside the strict charset: neither rule takes it.
+    let e = env_with(AccessMode::Scoped, &[], false, true, Some("ab$cd"));
+    let r = go(&e, send(Method::GET, "/api/config").bearer("ab$cd")).await;
+    assert_eq!(r.status, 400);
+}
+
 // ================================= F2: OPTIONS that is not a preflight ================================
 
 /// A router with a probe on the engine gateway (an `any` route: its handler runs for every method, and

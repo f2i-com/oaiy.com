@@ -597,6 +597,80 @@ fn a_bare_options_on_a_scoped_server_runs_no_handler_and_tells_no_path_from_anot
 }
 
 #[test]
+fn a_scoped_server_takes_the_static_token_in_the_shape_the_design_gives_it() {
+    // `OAIY_SERVER_TOKEN` is 32 to 256 printable characters (design 4.1), which is wider than the strict
+    // bearer rule (`[A-Za-z0-9._~+/=-]`, 128 bytes): a token with a `$` in it, or one of 200 characters, must
+    // not be a `400` in front of the server that was configured with it.
+    let long: String = ('!'..='~').cycle().take(200).collect();
+    for (i, token) in ["Sup3r$ecret!Zq7kLm9VbNw2XyHdFg5!", long.as_str()]
+        .into_iter()
+        .enumerate()
+    {
+        let scratch = Scratch::new(&format!("boot-scoped-wide-token-{i}"));
+        let server = Server::start(
+            &scratch,
+            &[("OAIY_ACCESS_MODE", "scoped"), ("OAIY_SERVER_TOKEN", token)],
+        );
+        let (status, _) = server.call(reqwest::Method::GET, "/api/config", Some(token));
+        assert_eq!(status, 200, "a token of {} characters", token.len());
+        let (status, me) = server.call(reqwest::Method::GET, "/api/auth/whoami", Some(token));
+        assert_eq!((status, me["kind"].as_str()), (200, Some("static")));
+        // Another bearer of that shape is not the operator's, and stays under the strict rule.
+        let other = format!("Z{}", &token[1..]);
+        let (status, body) = server.call(reqwest::Method::GET, "/api/config", Some(&other));
+        assert_eq!(
+            (status, body["error"]["code"].as_str()),
+            (400, Some("bad_request"))
+        );
+    }
+}
+
+#[test]
+fn the_startup_refusals_of_design_4_5_5_that_are_not_made_yet_are_pinned() {
+    // ACC-14 (`validate_config`) refuses each of these configurations at startup: exit 78, one line saying
+    // what to change. Until it does, each of these servers starts, and this test says so, so that the step
+    // that adds the refusals flips it on purpose. (Refusals 6 and 7, the mode and the data folder, are made:
+    // see the tests above.)
+    let cases: [(&str, Vec<(&str, &str)>); 5] = [
+        (
+            "1: OAIY_SERVER_BIND is not loopback, lan or an address",
+            vec![("OAIY_SERVER_BIND", "bogus")],
+        ),
+        (
+            "2: a lan bind and no owner.json (`oaiy-server auth init` has not run)",
+            vec![("OAIY_SERVER_BIND", "lan")],
+        ),
+        (
+            "3: OAIY_PUBLIC_URL with a path",
+            vec![("OAIY_PUBLIC_URL", "https://dash.example.com/some/path")],
+        ),
+        (
+            "4: a network bind with OAIY_PUBLIC_URL and no OAIY_TRUSTED_PROXIES",
+            vec![
+                ("OAIY_SERVER_BIND", "lan"),
+                ("OAIY_PUBLIC_URL", "https://dash.example.com"),
+            ],
+        ),
+        (
+            "5: OAIY_SERVER_TOKEN that fails the shape rule of design 4.1",
+            vec![("OAIY_SERVER_TOKEN", "short")],
+        ),
+    ];
+    for (i, (what, extra)) in cases.iter().enumerate() {
+        let scratch = Scratch::new(&format!("boot-pin-4-5-5-{i}"));
+        let mut env = vec![("OAIY_ACCESS_MODE", "scoped")];
+        env.extend(extra.iter().copied());
+        let mut server = Server::spawn(&scratch, &env, "server");
+        // `wait_until_up` panics when the server exits (78 is the day this changes).
+        server.wait_until_up();
+        assert!(
+            server.child.try_wait().unwrap().is_none(),
+            "{what}: the server stopped"
+        );
+    }
+}
+
+#[test]
 fn a_mode_that_is_not_one_stops_the_server_with_exit_78() {
     let scratch = Scratch::new("boot-badmode");
     let mut server = Server::spawn(&scratch, &[("OAIY_ACCESS_MODE", "scopd")], "server");

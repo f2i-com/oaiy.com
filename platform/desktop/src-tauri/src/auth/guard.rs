@@ -849,7 +849,7 @@ impl Guard {
             .iter()
             .map(|v| v.as_bytes())
             .collect();
-        let presented = match token::bearer_from_headers(&values) {
+        let presented = match token::bearer_or_static(&values, self.static_token.as_deref()) {
             Ok(None) => return Ok(None),
             Ok(Some(t)) => t,
             Err(e) => return Err(Denial::bad_request(e.message())),
