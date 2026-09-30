@@ -158,7 +158,7 @@ What happens, every way it can go:
 The receptionist never promises a callback time, never says why you are not available, and has no
 number of yours to give. What the caller hears does not depend on the model or the Agent page
 working: the desktop says short fixed lines itself, on its own clocks. The longest silence a caller can hear
-is about 25 seconds, and only while a connection you accepted is being made (see below).
+is about 24 seconds, and only while a connection you accepted is being made (see below).
 
 - **While the phone has not yet answered the request**, if the receptionist has said nothing, a hold line six
   seconds after the request was made and another 15 seconds after that (counted from the request, so a phone that never

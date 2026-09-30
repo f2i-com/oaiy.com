@@ -122,7 +122,7 @@ unchanged and checked by `scripts/check-transfer-contract.mjs`; what only OAIY d
 next to it); the code is `voice/transfer.rs`, `voice/call.rs` and
 `ring/`. **Consent is not signed on this computer** (a plugin could flip a scope), so the owner's switch is
 best kept off unless every installed plugin is trusted: the Transfers page and `RECEPTIONIST.md` say so. The rule for
-all of it: **a caller is never left in silence for long, and never told a lie.** The longest silence there can be is about 25
+all of it: **a caller is never left in silence for long, and never told a lie.** The longest silence there can be is about 24
 seconds, and only while a takeover the owner accepted is being made. After the owner has accepted, the receptionist says
 "Connecting you now", then, while the takeover is still set up, at most two short holding lines about 15 and 30 seconds later, and
 nothing at all once the owner has the call (the phone stops the session) or the takeover has failed: 15 seconds before the first
@@ -189,8 +189,9 @@ agent : "I'll try to reach them, please stay with me."  (it is trying: it does n
 - **Who can change the settings, decline a ring or delete a message.** `/api/ring/*` and `/api/messages/*` are in
   `is_personal_path` (`http.rs`): a read is a restricted read, a change takes the privileged gate, the strictest
   class the local address has (the class of `POST /api/bridge/runs` and `POST /api/voice/calls/{id}/say`; the
-  updater's install is stricter only because it is a Tauri command that checks the webview's label, not a route,
-  and the dashboard's Transfers page is served over HTTP so that it works headless too). A web page is refused, a
+  updater's install is stricter only because it is a Tauri command that checks the webview's label, not a route;
+  these routes are mounted by the same `serve` in `http.rs` that the headless server uses, where there is no window to
+  check). A web page is refused, a
   caller with no origin is refused, and a headless server takes the token alone; what is let in is the window's own
   origin, `oaiy.com` and (debug builds only) any loopback page, or a bearer that is the configured, the internal or
   a paired token. Plugins are not handed the internal token. So a program on this computer that sends the window's
