@@ -1686,6 +1686,40 @@ mod tests {
     }
 
     #[test]
+    fn this_desktops_word_classifier_is_the_shared_fixtures_backchannel_rule_on_every_case_it_lists() {
+        // The phone plugin drops the acknowledgements from the caller's turns by their words (it cannot hear when they were said); this
+        // desktop reads the same words, for what is said over us, and the shared caller-asked fixture lists what it does with them. Its
+        // rule's words are this desktop's, and every case it lists comes out as it says, however many it lists.
+        use crate::ring::phrases::{caller_asked, TURNS_READ};
+        let v = shared("caller-asked");
+        let b = &v["backchannel"];
+        let strings = |v: &Value| -> Vec<String> { v.as_array().unwrap().iter().map(|s| s.as_str().unwrap().to_string()).collect() };
+        assert_eq!(strings(&b["words"]), ACK_WORDS.iter().map(|w| w.to_string()).collect::<Vec<_>>(), "the words");
+        assert_eq!(strings(&b["pairs"]), ACK_PAIRS.iter().map(|w| w.to_string()).collect::<Vec<_>>(), "the pairs");
+        assert_eq!(b["atMost"], 3, "at most three of them");
+        let mut checked = 0;
+        for said in strings(&b["acknowledgements"]) {
+            assert!(is_backchannel(&said), "{said:?} is an acknowledgement");
+            checked += 1;
+        }
+        for said in strings(&b["notAcknowledgements"]) {
+            assert!(!is_backchannel(&said), "{said:?} is not one (\"Of course.\" and \"Go on.\" only when said quickly: `acknowledges`)");
+            checked += 1;
+        }
+        assert!(checked > 0, "the lists are not empty: the test would check nothing");
+        // The turns that remain once the acknowledgements are dropped, the last three of them, and whether they ask.
+        for case in b["cases"].as_array().unwrap() {
+            let kept: Vec<String> = strings(&case["turns"]).into_iter().filter(|t| !is_backchannel(t)).collect();
+            let window = kept[kept.len().saturating_sub(TURNS_READ)..].to_vec();
+            assert_eq!(window, strings(&case["window"]), "{}: the turns that remain", case["name"]);
+            assert_eq!(caller_asked(&window), case["asked"].as_bool().unwrap(), "{}: {window:?}", case["name"]);
+            checked += 1;
+        }
+        assert!(checked as usize >= b["cases"].as_array().unwrap().len() + strings(&b["acknowledgements"]).len() + strings(&b["notAcknowledgements"]).len());
+        eprintln!("shared backchannel checks: {checked} ({} cases)", b["cases"].as_array().unwrap().len());
+    }
+
+    #[test]
     fn words_that_ask_us_to_stop_are_not_a_backchannel() {
         for said in ["Stop.", "Wait", "No", "Sorry?", "Hold on.", "Hang on", "Yeah, but wait", "Okay stop", "Yes please", "What?", "", "...", "Got", "I", "Tuesday"] {
             assert!(!is_backchannel(said), "{said:?} is not an acknowledgement");
