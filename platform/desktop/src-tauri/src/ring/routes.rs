@@ -78,7 +78,7 @@ async fn respond(State(ring): State<Arc<Ring>>, Path(id): Path<String>, Json(bod
 
 fn shown(ring: &Ring) -> Value {
     let settings = ring.settings.get();
-    json!({"settings": settings, "features": ring.features(), "loadProblem": ring.settings.load_problem()})
+    json!({"settings": settings, "features": ring.features(), "loadProblem": ring.settings.load_problem().or_else(|| ring.attempts.lock().unwrap_or_else(|e| e.into_inner()).problem())})
 }
 
 async fn get_settings(State(ring): State<Arc<Ring>>) -> Json<Value> {
@@ -114,6 +114,22 @@ mod tests {
         assert!(read["loadProblem"].as_str().is_some_and(|p| p.contains("ring.json.corrupt")), "{read}");
         let clean = TempDir::new("ring-routes-no-problem");
         let base = serve(Ring::open(&clean.0)).await;
+        let read: Value = reqwest::get(format!("{base}/api/ring/settings")).await.unwrap().json().await.unwrap();
+        assert!(read["loadProblem"].is_null(), "{read}");
+    }
+
+    /// The Transfers page is told when the ring's tries could not be read (a file another program holds, say): they are counted in memory, and it says so.
+    #[tokio::test]
+    async fn the_page_is_told_when_the_tries_could_not_be_read_and_told_no_more_once_they_can() {
+        let dir = TempDir::new("ring-routes-attempts");
+        let file = dir.0.join(crate::ring::limits::FILE_NAME);
+        std::fs::create_dir(&file).unwrap(); // a read fails where the file belongs
+        let ring = Ring::with(crate::ring::settings::SettingsStore::open(&dir.0), crate::ring::limits::Attempts::open_patiently(&dir.0, crate::secret_file::Patience { start: vec![], later: vec![std::time::Duration::from_millis(1)], window: std::time::Duration::ZERO }));
+        let base = serve(ring).await;
+        let read: Value = reqwest::get(format!("{base}/api/ring/settings")).await.unwrap().json().await.unwrap();
+        assert!(read["loadProblem"].as_str().is_some_and(|p| p.contains("ring-attempts.json") && p.contains("trying again")), "{read}");
+        std::fs::remove_dir(&file).unwrap();
+        tokio::time::sleep(std::time::Duration::from_millis(30)).await;
         let read: Value = reqwest::get(format!("{base}/api/ring/settings")).await.unwrap().json().await.unwrap();
         assert!(read["loadProblem"].is_null(), "{read}");
     }

@@ -179,6 +179,86 @@ pub fn read_text(path: &Path) -> Text {
     }
 }
 
+/// How a store waits for a file that another program holds for a moment (an antivirus scan, an indexer, a backup): it is read again after each of the
+/// `start` pauses before the store gives up for now, and then, in memory meanwhile, after each of the `later` ones (the last for ever) until it reads.
+/// `window` is how long from the first failure the messages the receptionist takes are kept in memory, to be written when the file can be read.
+#[derive(Clone, Debug)]
+pub struct Patience {
+    pub start: Vec<std::time::Duration>,
+    pub later: Vec<std::time::Duration>,
+    pub window: std::time::Duration,
+}
+
+impl Default for Patience {
+    /// About three seconds at the start, then every 2, 5, 10 and then 30 seconds; messages are kept in memory for the first fifteen.
+    #[cfg(not(test))]
+    fn default() -> Self {
+        let ms = std::time::Duration::from_millis;
+        Self { start: vec![ms(100), ms(200), ms(400), ms(800), ms(1_600)], later: vec![ms(2_000), ms(5_000), ms(10_000), ms(30_000)], window: ms(15_000) }
+    }
+
+    /// Tests do not wait, do not go back to a file on their own and do not keep messages in memory, unless one says (`Patience { .. }`).
+    #[cfg(test)]
+    fn default() -> Self {
+        let ms = std::time::Duration::from_millis;
+        Self { start: vec![ms(1)], later: vec![std::time::Duration::from_secs(3_600)], window: std::time::Duration::ZERO }
+    }
+}
+
+/// When a file that stayed busy is read again: a store holds one from the first failure until it reads.
+#[derive(Debug)]
+pub struct Retry {
+    later: Vec<std::time::Duration>,
+    tries: usize,
+    since: std::time::Instant,
+    next: std::time::Instant,
+    window: std::time::Duration,
+}
+
+impl Retry {
+    /// The file was busy just now.
+    pub fn began(patience: &Patience) -> Self {
+        let now = std::time::Instant::now();
+        let mut retry = Self { later: patience.later.clone(), tries: 0, since: now, next: now, window: patience.window };
+        retry.next = now + retry.pause();
+        retry
+    }
+
+    fn pause(&self) -> std::time::Duration {
+        self.later.get(self.tries).or_else(|| self.later.last()).copied().unwrap_or(std::time::Duration::from_secs(30))
+    }
+
+    /// It was read again and was still busy.
+    pub fn failed(&mut self) {
+        self.tries += 1;
+        self.next = std::time::Instant::now() + self.pause();
+    }
+
+    /// Whether it is time to read it again.
+    pub fn due(&self) -> bool {
+        std::time::Instant::now() >= self.next
+    }
+
+    /// Whether what is taken meanwhile is still kept in memory (the first moments after it was found busy).
+    pub fn in_window(&self) -> bool {
+        self.since.elapsed() < self.window
+    }
+}
+
+/// [`read_text`], but a file that cannot be read (it is held by another program, for a moment) is read again after each of `pauses`: the last answer is
+/// the answer.
+pub fn read_text_patiently(path: &Path, pauses: &[std::time::Duration]) -> Text {
+    let mut text = read_text(path);
+    for pause in pauses {
+        if !matches!(text, Text::Unreadable(_)) {
+            break;
+        }
+        std::thread::sleep(*pause);
+        text = read_text(path);
+    }
+    text
+}
+
 /// `bytes` as text: UTF-16 (little or big endian) when they start with its byte order mark, otherwise UTF-8 with a
 /// leading mark taken off. Nothing is guessed and nothing is replaced: a byte sequence that is not valid is an error.
 pub fn decode_text(bytes: &[u8]) -> Result<String, String> {

@@ -372,6 +372,66 @@ fn a_messages_file_that_cannot_be_read_is_left_alone_and_not_written_over() {
     assert_eq!(Store::open(&dir.0).list(None, "").len(), 1, "read again once it can be");
 }
 
+/// A file another program holds for a moment at start-up (an antivirus scan, an indexer) does not turn message keeping off until the next start: the
+/// store opens without it, tells the owner on the Messages page, keeps what the receptionist takes in its first moments in memory, reads the file again
+/// every so often, and merges when it can (nothing is written over what was in the file, nothing taken is lost).
+#[test]
+fn a_messages_file_that_is_busy_at_start_is_read_again_and_what_was_taken_meanwhile_is_merged_into_it() {
+    use crate::secret_file::Patience;
+    let ms = std::time::Duration::from_millis;
+    let dir = TempDir::new("messages-busy");
+    let folder = dir.0.join("messages");
+    let first = Store::open(&dir.0);
+    let old = first.add(new("call_1", "+61491570006", "Ring me about Friday.")).unwrap();
+    let file = folder.join(FILE_NAME);
+    std::fs::rename(&file, folder.join("held.json")).unwrap();
+    std::fs::create_dir(&file).unwrap(); // a read fails where the file belongs
+    let store = Store::open_patiently(&dir.0, Patience { start: vec![ms(1)], later: vec![ms(20)], window: std::time::Duration::from_secs(60) });
+    assert!(store.notice().is_some_and(|n| n.contains("could not be read") && n.contains("trying again")), "the owner is told: {:?}", store.notice());
+    // A message taken meanwhile is kept, in memory, and the file is not touched.
+    let meanwhile = store.add(new("call_2", "+61491570156", "Another one.")).expect("kept in memory while the file is busy");
+    assert_eq!(store.list(None, "").len(), 1);
+    assert!(std::fs::metadata(&file).unwrap().is_dir(), "nothing was written over it");
+    // The file can be read again: it is merged with what is in memory, and written.
+    std::fs::remove_dir(&file).unwrap();
+    std::fs::rename(folder.join("held.json"), &file).unwrap();
+    std::thread::sleep(ms(60));
+    assert_eq!(store.notice(), None, "read again, and nothing is wrong");
+    let ids: Vec<String> = store.list(None, "").into_iter().map(|m| m.id).collect();
+    assert_eq!(ids.len(), 2, "{ids:?}");
+    assert!(ids.contains(&old.id) && ids.contains(&meanwhile.id), "what the file held and what was taken meanwhile");
+    let reopened = Store::open(&dir.0);
+    assert_eq!(reopened.list(None, "").len(), 2, "both are written");
+    assert!(reopened.get(&meanwhile.id).is_some() && reopened.get(&old.id).is_some());
+    // Keeping messages works as ever.
+    assert!(store.add(new("call_3", "+61491570006", "A third.")).is_ok());
+}
+
+/// After those first moments a message that cannot be written is refused, as it always was, and the receptionist says so; the file is still read again.
+#[test]
+fn a_messages_file_that_stays_busy_refuses_messages_once_the_first_moments_have_passed_and_is_still_read_again() {
+    use crate::secret_file::Patience;
+    let ms = std::time::Duration::from_millis;
+    let dir = TempDir::new("messages-busy-long");
+    let folder = dir.0.join("messages");
+    Store::open(&dir.0).add(new("call_1", "+61491570006", "Ring me about Friday.")).unwrap();
+    let file = folder.join(FILE_NAME);
+    std::fs::rename(&file, folder.join("held.json")).unwrap();
+    std::fs::create_dir(&file).unwrap();
+    let store = Store::open_patiently(&dir.0, Patience { start: vec![ms(1)], later: vec![ms(20)], window: ms(30) });
+    assert!(store.add(new("call_2", "+61491570156", "In the first moments.")).is_ok());
+    std::thread::sleep(ms(80));
+    let e = store.add(new("call_3", "+61491570157", "Too late.")).unwrap_err();
+    assert_eq!((e.status, e.code), (500, "save_failed"), "{}", e.message);
+    assert!(store.notice().is_some_and(|n| n.contains("could not be read")), "still told");
+    std::fs::remove_dir(&file).unwrap();
+    std::fs::rename(folder.join("held.json"), &file).unwrap();
+    std::thread::sleep(ms(60));
+    assert_eq!(store.notice(), None);
+    assert_eq!(store.list(None, "").len(), 2, "the file's, and the one taken in the first moments; not the refused one");
+    assert!(store.add(new("call_4", "+61491570158", "Back to normal.")).is_ok());
+}
+
 #[test]
 fn the_messages_page_is_told_where_a_file_that_could_not_be_used_is_kept() {
     let dir = TempDir::new("messages-told");

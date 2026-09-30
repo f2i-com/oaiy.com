@@ -50,8 +50,13 @@ struct File {
 pub struct Attempts {
     path: Option<PathBuf>,
     entries: Vec<Attempt>,
-    /// The file could not be read, or could not be put aside: the tries are counted in memory, and the file is left as it is.
+    /// The file could not be read, or could not be put aside: the tries are counted in memory, and the file is left as it is. A file that could not
+    /// be read is read again (see `retry`), and the tries counted meanwhile are added to it when it can be.
     protected: bool,
+    patience: crate::secret_file::Patience,
+    retry: Option<crate::secret_file::Retry>,
+    /// In plain words, why the tries are only in memory (for the Transfers page), when they are.
+    problem: Option<String>,
 }
 
 impl Attempts {
@@ -59,40 +64,95 @@ impl Attempts {
     /// that is not the tries, or is not text, is put aside as `ring-attempts.json.corrupt` (and so on) and the count starts
     /// again; one that cannot be read or put aside is left as it is, and is not written over.
     pub fn open(dir: &Path) -> Self {
-        use crate::secret_file::{read_text, Text};
+        Self::open_patiently(dir, crate::secret_file::Patience::default())
+    }
+
+    /// [`Attempts::open`], waiting for a file that is busy as `patience` says: it is read again after each of its short pauses, and if it is still busy the
+    /// tries are counted in memory (the owner is told on the Transfers page), the file is read again every so often, and the tries counted meanwhile are
+    /// added to it when it can be.
+    pub fn open_patiently(dir: &Path, patience: crate::secret_file::Patience) -> Self {
         let path = dir.join(FILE_NAME);
-        let mut attempts = Self { path: Some(path.clone()), entries: Vec::new(), protected: false };
-        let why = match read_text(&path) {
+        let mut attempts = Self { path: Some(path.clone()), entries: Vec::new(), protected: false, patience: patience.clone(), retry: None, problem: None };
+        attempts.load(&path, &patience.start);
+        attempts
+    }
+
+    /// Read the file into the tries, waiting as `pauses` say for one that is busy. What was counted meanwhile is added to what it holds, and written.
+    fn load(&mut self, path: &Path, pauses: &[std::time::Duration]) {
+        use crate::secret_file::{read_text_patiently, Retry, Text};
+        let held = std::mem::take(&mut self.entries);
+        let mut from_file = Vec::new();
+        let why = match read_text_patiently(path, pauses) {
             Text::Missing => None,
             Text::Text(text) => match serde_json::from_str::<File>(&text) {
                 Ok(file) => {
-                    attempts.entries = file.attempts;
+                    from_file = file.attempts;
                     None
                 }
                 Err(e) => Some(e.to_string()),
             },
             Text::Undecodable(why) => Some(why),
             Text::Unreadable(e) => {
-                log::warn!("ring: {} could not be read ({e}); the tries are counted in memory only", path.display());
-                attempts.protected = true;
-                None
+                self.entries = held;
+                let first = self.retry.is_none();
+                match &mut self.retry {
+                    Some(retry) => retry.failed(),
+                    None => self.retry = Some(Retry::began(&self.patience)),
+                }
+                if first {
+                    log::warn!("ring: {} could not be read ({e}); the tries are counted in memory only, and it is read again every so often", path.display());
+                }
+                self.protected = true;
+                self.problem = Some(format!("{FILE_NAME} could not be read ({e}): another program may have it open. OAIY is trying again; the tries are counted in memory until it can be read, so a restart in the meantime forgets them."));
+                return;
             }
         };
         if let Some(why) = why {
-            match crate::secret_file::keep_aside(&path) {
+            match crate::secret_file::keep_aside(path) {
                 Ok(aside) => log::warn!("ring: {} is not usable ({why}); it is kept as {}", path.display(), aside.display()),
                 Err(e) => {
                     log::warn!("ring: {} is not usable ({why}) and could not be put aside ({e}); the tries are counted in memory only", path.display());
-                    attempts.protected = true;
+                    self.entries = held;
+                    self.protected = true;
+                    self.problem = Some(format!("{FILE_NAME} could not be used ({why}) and could not be put aside ({e}): the tries are counted in memory only, and it has not been changed."));
+                    return;
                 }
             }
         }
-        attempts
+        let recovering = self.retry.take().is_some();
+        let new_ones = held.iter().filter(|a| !from_file.contains(a)).count();
+        self.entries = from_file;
+        let extra: Vec<Attempt> = held.into_iter().filter(|a| !self.entries.contains(a)).collect();
+        self.entries.extend(extra);
+        self.entries.sort_by_key(|a| a.at);
+        if recovering {
+            log::info!("ring: {} could be read again", path.display());
+            if new_ones > 0 {
+                self.keep();
+            }
+        }
+    }
+
+    /// Read the file again if it was busy and it is time to try.
+    fn recover_if_due(&mut self) {
+        if !self.retry.as_ref().is_some_and(|r| r.due()) {
+            return;
+        }
+        let Some(path) = self.path.clone() else { return };
+        self.protected = false;
+        self.problem = None;
+        self.load(&path, &[]);
+    }
+
+    /// In plain words, why the tries are only in memory, or None.
+    pub fn problem(&mut self) -> Option<String> {
+        self.recover_if_due();
+        self.problem.clone()
     }
 
     /// Tries held in memory only.
     pub fn in_memory() -> Self {
-        Self { path: None, entries: Vec::new(), protected: false }
+        Self { path: None, entries: Vec::new(), protected: false, patience: crate::secret_file::Patience::default(), retry: None, problem: None }
     }
 
     /// The counters for `call` and its `caller` at `now` (Unix seconds).
@@ -110,6 +170,7 @@ impl Attempts {
     /// Give back the latest try counted for `call`: the request it was counted for never came to a ring (the plugin refused it),
     /// so it must not start the gap between tries or use up an hour's allowance. Whether there was one.
     pub fn forget_last(&mut self, call: &str) -> bool {
+        self.recover_if_due();
         let Some(at) = self.entries.iter().rposition(|a| a.call == call) else { return false };
         self.entries.remove(at);
         self.keep();
@@ -127,6 +188,7 @@ impl Attempts {
 
     /// Count a try at `now`, and keep the ledger (tries older than the hour are let go).
     pub fn record(&mut self, call: &str, caller: &str, now: u64) {
+        self.recover_if_due();
         self.entries.retain(|a| now.saturating_sub(a.at) < WINDOW_SECONDS);
         self.entries.push(Attempt { at: now, call: call.to_string(), caller: caller.to_string() });
         if self.entries.len() > MAX_KEPT {
@@ -273,5 +335,33 @@ mod tests {
         a.record("call_1", "491570006", 5_000);
         assert_eq!(a.counters("call_1", "491570006", 5_010).attempts_this_call, 1, "the limits still hold in memory");
         assert_eq!(std::fs::read(dir.0.join(FILE_NAME)).unwrap(), bytes, "the file is as it was");
+    }
+
+    /// A file another program holds for a moment at start-up is read again: the tries counted meanwhile are kept in memory and added to it when it can
+    /// be read, and the owner is told (the Transfers page) while it cannot.
+    #[test]
+    fn a_ledger_that_is_busy_at_start_is_read_again_and_what_was_counted_meanwhile_is_added_to_it() {
+        use crate::secret_file::Patience;
+        use std::time::Duration;
+        let dir = TempDir::new("ring-attempts-busy");
+        let mut first = Attempts::open(&dir.0);
+        first.record("call_old", "491570006", 4_000);
+        let file = dir.0.join(FILE_NAME);
+        std::fs::rename(&file, dir.0.join("held.json")).unwrap();
+        std::fs::create_dir(&file).unwrap(); // a read fails where the file belongs
+        let patience = Patience { start: vec![Duration::from_millis(1)], later: vec![Duration::from_millis(20)], window: Duration::ZERO };
+        let mut a = Attempts::open_patiently(&dir.0, patience);
+        assert!(a.problem().is_some_and(|p| p.contains("trying again") && p.contains("could not be read")), "{:?}", a.problem());
+        a.record("call_new", "491570156", 5_000);
+        assert_eq!(a.counters("call_new", "491570156", 5_010).attempts_this_call, 1, "counted in memory meanwhile");
+        assert!(std::fs::metadata(&file).unwrap().is_dir(), "nothing was written over it");
+        // The file can be read again.
+        std::fs::remove_dir(&file).unwrap();
+        std::fs::rename(dir.0.join("held.json"), &file).unwrap();
+        std::thread::sleep(Duration::from_millis(60));
+        assert_eq!(a.problem(), None, "read again, and nothing is wrong");
+        assert_eq!(a.counters("call_old", "491570006", 5_010).attempts_this_call, 1, "what the file held");
+        assert_eq!(a.counters("call_new", "491570156", 5_010).attempts_this_call, 1, "and what was counted meanwhile");
+        assert_eq!(Attempts::open(&dir.0).counters("call_new", "491570156", 5_010).attempts_this_call, 1, "which is written too");
     }
 }

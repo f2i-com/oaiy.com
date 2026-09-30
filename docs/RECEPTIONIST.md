@@ -102,11 +102,16 @@ Messages page says so until you handle some.
 The file is read as UTF-8 or as UTF-16 with its byte order mark (what Windows PowerShell 5.1's `>` writes), so
 a file another program has touched is still your messages. A file that cannot be used (bytes that are not text,
 not messages, or from a newer OAIY) is never written over: it is kept beside the messages as `messages.json.corrupt`
-(`.corrupt.1` and so on for a later one, and none replaces an earlier), new messages go to a fresh file, and the
-Messages page says where it is kept. A file that cannot be read at all (another program holds it open, its permissions
-say no) is left exactly as it is and no message is kept until that is put right: the receptionist is told it could
-not be saved, and says so. The Transfers settings (`ring.json`) and the record of tries (`ring-attempts.json`) are
-treated the same way; with the settings unreadable everything stays off, and the Transfers page says why.
+(`.corrupt.1` and so on for a later one, and none replaces an earlier; once 32 names are taken the oldest copies but the
+first are let go, so a bad file is never refused a place), new messages go to a fresh file, and the Messages page says
+where it is kept. A file that cannot be read at all (another program holds it open, its permissions say no) is left
+exactly as it is, and is not put aside as if it were garbage. One that is only busy for a moment at start-up (an antivirus
+scan, an indexer) is read again: at once a few times over about three seconds, and then every 2, 5, 10 and 30 seconds for as
+long as it stays busy, with the Messages page saying so meanwhile. Messages the receptionist takes in the first fifteen
+seconds are kept in memory and written, merged with what the file held, when it can be read; after that no message is kept
+until it can be (the receptionist is told it could not be saved, and says so). The Transfers settings (`ring.json`) and the
+record of tries (`ring-attempts.json`) are treated the same way; with the settings unreadable everything stays off, and the
+Transfers page says why and that it is trying again; the tries are counted in memory until theirs reads, and the page says so.
 
 ### Transfers
 

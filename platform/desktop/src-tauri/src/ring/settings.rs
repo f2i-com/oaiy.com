@@ -270,8 +270,11 @@ struct Inner {
     /// Why the file was not used, in plain words (and where it is kept), when it was not.
     problem: Option<String>,
     /// The file could not be read, or could not be put aside: it is all that is left of what the owner set, so no
-    /// change is written over it.
+    /// change is written over it. A file that could not be read is read again (see `retry`), and is no longer protected when it can be.
     protected: bool,
+    patience: crate::secret_file::Patience,
+    /// Set while the file could not be read: when it is read again. Everything stays off meanwhile.
+    retry: Option<crate::secret_file::Retry>,
 }
 
 impl SettingsStore {
@@ -280,40 +283,16 @@ impl SettingsStore {
     /// (`.corrupt.1`, and so on: no earlier one is replaced), everything off. A file that cannot be read, or put aside:
     /// everything off, and no change is written over it (a change is refused and says why).
     pub fn open(dir: &Path) -> Self {
-        use crate::secret_file::{read_text, Text};
+        Self::open_patiently(dir, crate::secret_file::Patience::default())
+    }
+
+    /// [`SettingsStore::open`], waiting for a file that is busy as `patience` says: it is read again after each of its short pauses, and if it is still
+    /// busy everything stays off (never on for want of a read), the owner is told, and it is read again every so often until it can be. A transient lock at
+    /// start-up (an antivirus scan, an indexer) does not leave the settings off until the next start.
+    pub fn open_patiently(dir: &Path, patience: crate::secret_file::Patience) -> Self {
         let path = dir.join(FILE_NAME);
-        let mut inner = Inner { path: Some(path.clone()), settings: RingSettings::default(), problem: None, protected: false };
-        let why = match read_text(&path) {
-            Text::Missing => None,
-            Text::Text(text) => match parse(&text) {
-                Ok(settings) => {
-                    inner.settings = settings;
-                    None
-                }
-                Err(why) => Some(why),
-            },
-            Text::Undecodable(why) => Some(format!("it is not text ({why})")),
-            Text::Unreadable(e) => {
-                log::warn!("ring settings: {} could not be read ({e}); everything stays off and nothing will be written over it", path.display());
-                inner.protected = true;
-                inner.problem = Some(format!("{FILE_NAME} could not be read ({e}), so everything stays off, and a change is refused until that is put right. It has not been changed."));
-                None
-            }
-        };
-        if let Some(why) = why {
-            match crate::secret_file::keep_aside(&path) {
-                Ok(aside) => {
-                    let name = aside.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
-                    log::warn!("ring settings: {} is not usable ({why}); it is kept as {name} and everything stays off", path.display());
-                    inner.problem = Some(format!("{FILE_NAME} could not be used ({why}), so everything is off. It is kept as {name} beside it."));
-                }
-                Err(e) => {
-                    log::warn!("ring settings: {} is not usable ({why}) and could not be put aside ({e}); everything stays off and nothing will be written over it", path.display());
-                    inner.protected = true;
-                    inner.problem = Some(format!("{FILE_NAME} could not be used ({why}) and could not be put aside ({e}), so everything is off, and a change is refused until that is put right. It has not been changed."));
-                }
-            }
-        }
+        let mut inner = Inner { path: Some(path.clone()), settings: RingSettings::default(), problem: None, protected: false, patience: patience.clone(), retry: None };
+        inner.load(&path, &patience.start);
         Self { inner: Arc::new(Mutex::new(inner)) }
     }
 
@@ -321,7 +300,7 @@ impl SettingsStore {
     pub fn in_memory(settings: RingSettings) -> Self {
         let mut settings = settings;
         settings.sanitize();
-        Self { inner: Arc::new(Mutex::new(Inner { path: None, settings, problem: None, protected: false })) }
+        Self { inner: Arc::new(Mutex::new(Inner { path: None, settings, problem: None, protected: false, patience: crate::secret_file::Patience::default(), retry: None })) }
     }
 
     /// In plain words, why the settings file was not used at the start (and where it is kept), or None.
@@ -329,8 +308,13 @@ impl SettingsStore {
         self.lock().problem.clone()
     }
 
+    /// The settings, read again first if their file was busy and it is time to try (each use is a chance to).
     fn lock(&self) -> std::sync::MutexGuard<'_, Inner> {
-        self.inner.lock().unwrap_or_else(|e| e.into_inner())
+        let mut inner = self.inner.lock().unwrap_or_else(|e| e.into_inner());
+        if inner.retry.as_ref().is_some_and(|r| r.due()) {
+            inner.recover();
+        }
+        inner
     }
 
     pub fn get(&self) -> RingSettings {
@@ -360,6 +344,62 @@ impl SettingsStore {
         }
         inner.settings = next.clone();
         Ok(next)
+    }
+}
+
+impl Inner {
+    /// Read the file into the settings, waiting as `pauses` say for one that is busy. Everything stays off until it is read.
+    fn load(&mut self, path: &Path, pauses: &[std::time::Duration]) {
+        use crate::secret_file::{read_text_patiently, Retry, Text};
+        let why = match read_text_patiently(path, pauses) {
+            Text::Missing => None,
+            Text::Text(text) => match parse(&text) {
+                Ok(settings) => {
+                    self.settings = settings;
+                    None
+                }
+                Err(why) => Some(why),
+            },
+            Text::Undecodable(why) => Some(format!("it is not text ({why})")),
+            Text::Unreadable(e) => {
+                let first = self.retry.is_none();
+                match &mut self.retry {
+                    Some(retry) => retry.failed(),
+                    None => self.retry = Some(Retry::began(&self.patience)),
+                }
+                if first {
+                    log::warn!("ring settings: {} could not be read ({e}); everything stays off and nothing will be written over it, and it is read again every so often", path.display());
+                }
+                self.protected = true;
+                self.problem = Some(format!("{FILE_NAME} could not be read ({e}): another program may have it open. OAIY is trying again, so everything stays off, and a change is refused, until it can be read. It has not been changed."));
+                return;
+            }
+        };
+        if let Some(why) = why {
+            match crate::secret_file::keep_aside(path) {
+                Ok(aside) => {
+                    let name = aside.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
+                    log::warn!("ring settings: {} is not usable ({why}); it is kept as {name} and everything stays off", path.display());
+                    self.problem = Some(format!("{FILE_NAME} could not be used ({why}), so everything is off. It is kept as {name} beside it."));
+                }
+                Err(e) => {
+                    log::warn!("ring settings: {} is not usable ({why}) and could not be put aside ({e}); everything stays off and nothing will be written over it", path.display());
+                    self.protected = true;
+                    self.problem = Some(format!("{FILE_NAME} could not be used ({why}) and could not be put aside ({e}), so everything is off, and a change is refused until that is put right. It has not been changed."));
+                }
+            }
+        }
+        if self.retry.take().is_some() {
+            log::info!("ring settings: {} could be read again", path.display());
+        }
+    }
+
+    /// The file could not be read at the last try, and it is time to read it again.
+    fn recover(&mut self) {
+        let Some(path) = self.path.clone() else { return };
+        self.protected = false;
+        self.problem = None;
+        self.load(&path, &[]);
     }
 }
 
@@ -531,6 +571,58 @@ mod tests {
         drop(lock);
         assert_eq!(std::fs::read(dir.0.join(FILE_NAME)).unwrap(), before, "and it is as it was");
         assert_eq!(SettingsStore::open(&dir.0).get().ring_seconds, 55, "read again once it can be");
+    }
+
+    /// A file another program holds for a moment at start-up (an antivirus scan, an indexer) does not leave the settings off until the next start: it is
+    /// read again at once a few times, and if it is still busy everything stays off (never on for want of a read), the owner is told, a change is
+    /// refused, and it is read again every so often until it can be.
+    #[test]
+    fn a_settings_file_that_is_busy_at_start_is_read_again_and_the_settings_come_on_when_it_can_be() {
+        use crate::secret_file::Patience;
+        use std::time::Duration;
+        let ms = Duration::from_millis;
+        let dir = TempDir::new("ring-busy");
+        SettingsStore::open(&dir.0).change(&json!({"enabled": true, "ringSeconds": 55})).unwrap();
+        let file = dir.0.join(FILE_NAME);
+        std::fs::rename(&file, dir.0.join("held.json")).unwrap();
+        std::fs::create_dir(&file).unwrap(); // a read fails where the file belongs
+        let store = SettingsStore::open_patiently(&dir.0, Patience { start: vec![ms(1)], later: vec![ms(20)], window: Duration::ZERO });
+        assert_eq!(store.get(), RingSettings::default(), "everything stays off while nothing can be read");
+        assert!(store.load_problem().is_some_and(|p| p.contains("could not be read") && p.contains("trying again")), "{:?}", store.load_problem());
+        assert!(store.change(&json!({"ringSeconds": 60})).is_err(), "a change is refused meanwhile");
+        // The file can be read again: the next look at the settings reads it.
+        std::fs::remove_dir(&file).unwrap();
+        std::fs::rename(dir.0.join("held.json"), &file).unwrap();
+        std::thread::sleep(ms(60));
+        let now = store.get();
+        assert!(now.enabled && now.ring_seconds == 55, "the owner's settings are in force again: {now:?}");
+        assert_eq!(store.load_problem(), None, "and nothing is wrong");
+        assert!(store.change(&json!({"ringSeconds": 60})).is_ok(), "a change is kept again");
+        assert_eq!(SettingsStore::open(&dir.0).get().ring_seconds, 60);
+    }
+
+    /// The waits at the start are for real: a file that is free again within them is read by the open itself.
+    #[test]
+    fn a_settings_file_that_is_free_again_within_the_short_waits_is_read_by_the_open_itself() {
+        use crate::secret_file::Patience;
+        use std::time::Duration;
+        let ms = Duration::from_millis;
+        let dir = TempDir::new("ring-busy-short");
+        SettingsStore::open(&dir.0).change(&json!({"enabled": true, "ringSeconds": 45})).unwrap();
+        // Held by another program (it cannot be read while it is), and let go a little later.
+        let Some(lock) = crate::secret_file::testing::make_unreadable(&dir.0.join(FILE_NAME)) else {
+            eprintln!("skipped: this user reads every file");
+            return;
+        };
+        let fixer = std::thread::spawn(move || {
+            std::thread::sleep(ms(80));
+            drop(lock);
+        });
+        // (Nothing later would read it again in this test, so what is read is what the open itself read.)
+        let store = SettingsStore::open_patiently(&dir.0, Patience { start: vec![ms(30); 20], later: vec![Duration::from_secs(3_600)], window: Duration::ZERO });
+        fixer.join().unwrap();
+        assert!(store.get().enabled && store.get().ring_seconds == 45, "read by the open itself");
+        assert_eq!(store.load_problem(), None);
     }
 
     #[test]

@@ -167,8 +167,96 @@ struct Inner {
     problem: Option<String>,
     /// The file could not be read and could not be put aside either: it is all that is left of what was in it, so
     /// nothing is written until the owner has dealt with it (every message offered is refused, and the receptionist
-    /// says it could not be kept).
+    /// says it could not be kept). A file that could not be read is read again (see `retry`), and it stops being protected when it can be.
     protected: bool,
+    /// How long the file is waited for, and how the messages taken meanwhile are held.
+    patience: crate::secret_file::Patience,
+    /// Set while the file could not be read: when it is read again. The messages taken in its first moments are kept in memory and written when it is.
+    retry: Option<crate::secret_file::Retry>,
+}
+
+impl Inner {
+    /// Read the file into the store, waiting as `pauses` say for one that is busy. What the store holds already (messages taken while it could not be
+    /// read) is merged with what is in it, and written if any was not there.
+    fn load(&mut self, path: &Path, pauses: &[std::time::Duration]) {
+        use crate::secret_file::{read_text_patiently, Retry, Text};
+        let held = std::mem::take(&mut self.messages);
+        let mut from_file = Vec::new();
+        let why = match read_text_patiently(path, pauses) {
+            Text::Missing => None,
+            Text::Text(text) => match serde_json::from_str::<File>(&text) {
+                Ok(file) if file.version <= VERSION => {
+                    from_file = file.messages;
+                    None
+                }
+                Ok(file) => Some(format!("it is from a newer OAIY (version {})", file.version)),
+                Err(e) => Some(format!("it is not messages ({e})")),
+            },
+            Text::Undecodable(why) => Some(format!("it is not text ({why})")),
+            Text::Unreadable(e) => {
+                self.messages = held;
+                let first = self.retry.is_none();
+                match &mut self.retry {
+                    Some(retry) => retry.failed(),
+                    None => self.retry = Some(Retry::began(&self.patience)),
+                }
+                if first {
+                    log::warn!("messages: {} could not be read ({e}); nothing will be written over it, and it is read again every so often", path.display());
+                }
+                self.quarantined = true;
+                self.protected = true;
+                self.problem = Some(format!(
+                    "The file of saved messages could not be read ({e}): another program may have it open. OAIY is trying again; messages taken in the first few seconds are kept in memory and written when it can be, and after that no new message can be kept until it can be read. The file has not been changed."
+                ));
+                return;
+            }
+        };
+        if let Some(why) = why {
+            self.quarantined = true;
+            match crate::secret_file::keep_aside(path) {
+                Ok(aside) => {
+                    let name = aside.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
+                    log::warn!("messages: {} is not usable ({why}); it is kept as {name}", path.display());
+                    self.problem = Some(format!("The file of saved messages could not be used ({why}). It is kept as {name} beside it, and new messages are kept in a new file."));
+                }
+                Err(e) => {
+                    log::warn!("messages: {} is not usable ({why}) and could not be put aside ({e}); nothing will be written over it", path.display());
+                    self.messages = held;
+                    self.protected = true;
+                    self.problem = Some(format!("The file of saved messages could not be used ({why}) and could not be put aside ({e}), so no new message can be kept until that is put right. It has not been changed."));
+                    return;
+                }
+            }
+        }
+        // The file is read (or is not there, or was put aside): whatever was taken while it could not be is added to what it held, and written.
+        let recovering = self.retry.take().is_some();
+        let new_ones = held.iter().filter(|m| !from_file.iter().any(|f| f.id == m.id)).count();
+        self.messages = from_file;
+        let extra: Vec<Message> = held.into_iter().filter(|m| !self.messages.iter().any(|f| f.id == m.id)).collect();
+        self.messages.extend(extra);
+        if recovering {
+            log::info!("messages: {} could be read again", path.display());
+            if new_ones > 0 {
+                if let Err(e) = Store::save(self) {
+                    log::warn!("messages: the {new_ones} taken while the file could not be read could not be written: {}", e.message);
+                }
+            }
+        }
+    }
+
+    /// The file could not be read at the last try, and it is time to read it again.
+    fn recover(&mut self) {
+        let Some(path) = self.path.clone() else { return };
+        self.protected = false;
+        self.quarantined = false;
+        self.problem = None;
+        self.load(&path, &[]);
+    }
+
+    /// Messages taken now are kept in memory, to be written when the file can be read: it is busy, and it was only just found so.
+    fn holds_in_memory(&self) -> bool {
+        self.protected && self.retry.as_ref().is_some_and(|r| r.in_window())
+    }
 }
 
 /// `text` as it may be shown and kept: control and direction-changing characters removed, tabs and
@@ -216,43 +304,16 @@ impl Store {
     /// `.corrupt.1`, and so on: never written over, and no earlier one replaced) and the store starts empty. A file that
     /// cannot be read at all is not touched, and nothing is written over it: see `protected`.
     pub fn open(data_dir: &Path) -> Store {
-        use crate::secret_file::{read_text, Text};
+        Store::open_patiently(data_dir, crate::secret_file::Patience::default())
+    }
+
+    /// [`Store::open`], waiting for a file that is busy as `patience` says: it is read again after each of its short pauses, and if it is still busy the
+    /// store opens without it (the owner is told on the Messages page, and it is logged), is read again every so often, and merges what was taken in memory
+    /// meanwhile when it can be. A transient lock at start-up (an antivirus scan, an indexer) does not turn message keeping off until the next start.
+    pub fn open_patiently(data_dir: &Path, patience: crate::secret_file::Patience) -> Store {
         let path = data_dir.join("messages").join(FILE_NAME);
-        let mut inner = Inner { path: Some(path.clone()), ..Inner::default() };
-        let why = match read_text(&path) {
-            Text::Missing => None,
-            Text::Text(text) => match serde_json::from_str::<File>(&text) {
-                Ok(file) if file.version <= VERSION => {
-                    inner.messages = file.messages;
-                    None
-                }
-                Ok(file) => Some(format!("it is from a newer OAIY (version {})", file.version)),
-                Err(e) => Some(format!("it is not messages ({e})")),
-            },
-            Text::Undecodable(why) => Some(format!("it is not text ({why})")),
-            Text::Unreadable(e) => {
-                log::warn!("messages: {} could not be read ({e}); nothing will be written over it", path.display());
-                inner.quarantined = true;
-                inner.protected = true;
-                inner.problem = Some(format!("The file of saved messages could not be read ({e}), so no new message can be kept until that is put right. It has not been changed."));
-                None
-            }
-        };
-        if let Some(why) = why {
-            inner.quarantined = true;
-            match crate::secret_file::keep_aside(&path) {
-                Ok(aside) => {
-                    let name = aside.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
-                    log::warn!("messages: {} is not usable ({why}); it is kept as {name}", path.display());
-                    inner.problem = Some(format!("The file of saved messages could not be used ({why}). It is kept as {name} beside it, and new messages are kept in a new file."));
-                }
-                Err(e) => {
-                    log::warn!("messages: {} is not usable ({why}) and could not be put aside ({e}); nothing will be written over it", path.display());
-                    inner.protected = true;
-                    inner.problem = Some(format!("The file of saved messages could not be used ({why}) and could not be put aside ({e}), so no new message can be kept until that is put right. It has not been changed."));
-                }
-            }
-        }
+        let mut inner = Inner { path: Some(path.clone()), patience: patience.clone(), ..Inner::default() };
+        inner.load(&path, &patience.start);
         Store { inner: Arc::new(Mutex::new(inner)) }
     }
 
@@ -261,8 +322,13 @@ impl Store {
         Store::default()
     }
 
+    /// The store, read again first if its file was busy and it is time to try (each use is a chance to).
     fn lock(&self) -> std::sync::MutexGuard<'_, Inner> {
-        self.inner.lock().unwrap_or_else(|e| e.into_inner())
+        let mut inner = self.inner.lock().unwrap_or_else(|e| e.into_inner());
+        if inner.retry.as_ref().is_some_and(|r| r.due()) {
+            inner.recover();
+        }
+        inner
     }
 
     fn save(inner: &Inner) -> Result<(), Error> {
@@ -351,6 +417,11 @@ impl Store {
         };
         inner.messages.push(message.clone());
         if let Err(e) = Self::save(&inner) {
+            // The file is busy and was only just found so: the message is kept in memory and written when it can be read (the owner is told, on the
+            // Messages page, that it could not be yet). After those first moments a message that cannot be written is refused, as it always was.
+            if inner.holds_in_memory() {
+                return Ok(message);
+            }
             inner.messages.pop();
             return Err(e);
         }
