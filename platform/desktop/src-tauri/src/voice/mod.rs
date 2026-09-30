@@ -90,6 +90,9 @@ struct Inner {
     handoffs: Mutex<HashMap<String, Instant>>,
     /// The clocks of a request to reach the owner (a test runs them fast).
     timing: RwLock<transfer::Timing>,
+    /// The calls a request to reach the owner has been sent for through the app's route and not yet been answered: what waits behind it
+    /// waits for it (see [`VoiceHub::route_wait`]).
+    transfers_asked: Mutex<std::collections::HashSet<String>>,
 }
 
 /// The hub as the ring sees it: what this desktop heard of a call. Held weakly: the hub holds the ring.
@@ -196,6 +199,7 @@ impl VoiceHub {
             page: RwLock::new(None),
             handoffs: Mutex::new(HashMap::new()),
             timing: RwLock::new(transfer::Timing::default()),
+            transfers_asked: Mutex::new(std::collections::HashSet::new()),
         });
         HUBS.lock().unwrap_or_else(|e| e.into_inner()).push(Arc::downgrade(&inner));
         let hub = Self { inner };
@@ -246,6 +250,22 @@ impl VoiceHub {
     /// Run the clocks of calls that begin from now on at `timing` (tests).
     pub fn set_transfer_timing(&self, timing: transfer::Timing) {
         *self.inner.timing.write().unwrap_or_else(|e| e.into_inner()) = timing;
+    }
+
+    /// How long the app's route waits for the call's answer to `name` on `call`. A request to reach the owner is answered by the call itself
+    /// as unavailable (`no_answer`) once the phone has not answered it for [`transfer::Timing::tool_answer`], so the route waits longer than that
+    /// (it used to give up first, and the app was told the call refused it, with the request live a while longer). A tool sent while one is
+    /// unanswered waits behind it, and is waited for that long too.
+    fn route_wait(&self, call: &str, name: &str) -> Duration {
+        let timing = self.transfer_timing();
+        let behind_a_transfer = self.inner.transfers_asked.lock().unwrap_or_else(|e| e.into_inner()).contains(call);
+        if name == transfer::TOOL {
+            timing.route_wait.max(timing.tool_answer + timing.route_slack)
+        } else if behind_a_transfer {
+            timing.route_wait + timing.tool_answer + timing.route_slack
+        } else {
+            timing.route_wait
+        }
     }
 
     /// The call goes to the owner: the session that carried it has ended, and the call has not.
@@ -730,6 +750,25 @@ async fn say(State(hub): State<VoiceHub>, Path(id): Path<String>, Json(body): Js
     answer(rx.await.unwrap_or_else(|_| Err("the call ended".into())).map(|item| if item.is_empty() { json!({"skipped": true}) } else { json!({"itemId": item}) }))
 }
 
+/// A request to reach the owner that the app's route has sent for `call` and not yet been answered: held while the route waits.
+struct TransferAsked {
+    inner: Arc<Inner>,
+    call: String,
+}
+
+impl TransferAsked {
+    fn new(hub: &VoiceHub, call: &str) -> Self {
+        hub.inner.transfers_asked.lock().unwrap_or_else(|e| e.into_inner()).insert(call.to_string());
+        Self { inner: hub.inner.clone(), call: call.to_string() }
+    }
+}
+
+impl Drop for TransferAsked {
+    fn drop(&mut self) {
+        self.inner.transfers_asked.lock().unwrap_or_else(|e| e.into_inner()).remove(&self.call);
+    }
+}
+
 #[derive(Deserialize)]
 struct ToolBody {
     name: String,
@@ -741,10 +780,13 @@ async fn tool(State(hub): State<VoiceHub>, Path(id): Path<String>, Json(body): J
     let Some(tx) = hub.command(&id) else { return no_call(&id) };
     let (reply, rx) = oneshot::channel();
     let arguments = if body.arguments.is_object() { body.arguments } else { json!({}) };
+    let wait = hub.route_wait(&id, &body.name);
+    // A request to reach the owner is asked for until it is answered (or this route gives up): what is sent while it is waits behind it.
+    let _asked = (body.name == transfer::TOOL).then(|| TransferAsked::new(&hub, &id));
     if tx.send(CallCommand::Tool { name: body.name, arguments, reply }).is_err() {
         return no_call(&id);
     }
-    answer(match tokio::time::timeout(Duration::from_secs(20), rx).await {
+    answer(match tokio::time::timeout(wait, rx).await {
         Ok(r) => r.unwrap_or_else(|_| Err("the call ended".into())),
         Err(_) => Err("the phone did not answer the tool in time".into()),
     })
@@ -759,10 +801,11 @@ struct FinishBody {
 async fn finish(State(hub): State<VoiceHub>, Path(id): Path<String>, Json(body): Json<FinishBody>) -> axum::response::Response {
     let Some(tx) = hub.command(&id) else { return no_call(&id) };
     let (reply, rx) = oneshot::channel();
+    let wait = hub.route_wait(&id, "finish_call");
     if tx.send(CallCommand::Finish { goodbye: body.goodbye, reply }).is_err() {
         return no_call(&id);
     }
-    answer(match tokio::time::timeout(Duration::from_secs(20), rx).await {
+    answer(match tokio::time::timeout(wait, rx).await {
         Ok(r) => r.unwrap_or_else(|_| Err("the call ended".into())),
         Err(_) => Err("the phone did not answer in time".into()),
     })
@@ -1169,6 +1212,30 @@ mod tests {
         let resp = reqwest::Client::new().post(format!("{base}/api/voice/calls/call_1/message")).json(&json!({"message": "Ring me."})).send().await.unwrap();
         assert_eq!(resp.status(), 409);
         assert_eq!(resp.json::<Value>().await.unwrap()["error"]["code"], "module_disabled");
+    }
+
+    #[test]
+    fn the_app_waits_for_a_transfer_longer_than_the_call_does_and_for_what_waits_behind_it_as_long_and_for_no_other_tool_longer() {
+        let hub = VoiceHub::new(Engines::at("http://127.0.0.1:9", "http://127.0.0.1:9"), |_| None);
+        // A real call: the call answers a request the phone has not answered `no_answer` at 25 s; the route waits 2 s more, and a tool the
+        // phone answers 20 s.
+        let t = hub.transfer_timing();
+        assert_eq!((t.tool_answer, t.route_wait, t.route_slack), (Duration::from_secs(25), Duration::from_secs(20), Duration::from_secs(2)));
+        assert_eq!(hub.route_wait("call_1", transfer::TOOL), Duration::from_secs(27), "the typed no_answer is what comes back, never the route giving up first");
+        assert_eq!(hub.route_wait("call_1", "lookup_business_data"), Duration::from_secs(20));
+        assert_eq!(hub.route_wait("call_1", "finish_call"), Duration::from_secs(20));
+        // While a request for the owner is unanswered on a call, what is sent on that call waits behind it: for it, and then for its own answer.
+        let asked = TransferAsked::new(&hub, "call_1");
+        assert_eq!(hub.route_wait("call_1", "finish_call"), Duration::from_secs(47));
+        assert_eq!(hub.route_wait("call_1", "lookup_business_data"), Duration::from_secs(47));
+        assert_eq!(hub.route_wait("call_2", "lookup_business_data"), Duration::from_secs(20), "another call is not behind it");
+        drop(asked);
+        assert_eq!(hub.route_wait("call_1", "lookup_business_data"), Duration::from_secs(20), "and once it is answered nothing is");
+        // Whatever the clocks are, the route outlasts a transfer's own limit.
+        for tool_answer in [1, 5, 25, 60] {
+            hub.set_transfer_timing(transfer::Timing { tool_answer: Duration::from_secs(tool_answer), ..transfer::Timing::default() });
+            assert!(hub.route_wait("call_1", transfer::TOOL) >= Duration::from_secs(tool_answer + 2), "{tool_answer}");
+        }
     }
 
     #[test]

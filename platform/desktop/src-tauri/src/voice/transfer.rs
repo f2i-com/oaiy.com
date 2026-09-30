@@ -62,6 +62,12 @@ pub const ANSWER_GAP: Duration = Duration::from_secs(3);
 /// A transfer request the phone has not answered in this long is answered for it, as unavailable, and no longer holds back the
 /// tools and the goodbye behind it (the phone answers it in a second or two: it waits only for the line the model spoke to drain).
 pub const TOOL_ANSWER_LIMIT: Duration = Duration::from_secs(25);
+/// The app's route for a tool call waits this long for the call's answer to a tool the phone answers (a lookup, a booking, a goodbye).
+pub const TOOL_ROUTE_WAIT: Duration = Duration::from_secs(20);
+/// ...and for a transfer request, this much longer than the request's own answer limit ([`TOOL_ANSWER_LIMIT`]), which is when the call answers it
+/// `no_answer`: the route outlasts it, so what the app is told is that typed answer and never a refusal of the call before it. What waits behind an
+/// unanswered transfer waits for it too.
+pub const ROUTE_SLACK: Duration = Duration::from_secs(2);
 /// The most hold lines said for one ring (three wordings, twice: a ring lasts up to 90 seconds).
 pub const HOLD_MAX: u32 = 6;
 /// The most holding lines said while a takeover is set up, after "Connecting you now": one about fifteen seconds after the acceptance and
@@ -101,6 +107,11 @@ pub struct Timing {
     pub setup_limit: Duration,
     pub cancel_wait: Duration,
     pub tool_answer: Duration,
+    /// How long the app's route for a tool call waits for the call's answer to a tool the phone answers.
+    pub route_wait: Duration,
+    /// ...and how much longer than a transfer request's own answer limit ([`Timing::tool_answer`]) it waits for a transfer, so the call's typed `no_answer` is
+    /// what comes back.
+    pub route_slack: Duration,
 }
 
 impl Default for Timing {
@@ -117,6 +128,8 @@ impl Default for Timing {
             setup_limit: SETUP_LIMIT,
             cancel_wait: CANCEL_WAIT,
             tool_answer: TOOL_ANSWER_LIMIT,
+            route_wait: TOOL_ROUTE_WAIT,
+            route_slack: ROUTE_SLACK,
         }
     }
 }
@@ -1482,6 +1495,9 @@ mod tests {
         // ending, and the takeover given fifty-five seconds. A change to one of these is a change to what a caller is promised.
         assert_eq!((HOLD_AFTER, HOLD_EVERY, OFFER_AFTER, SETUP_LIMIT, CANCEL_WAIT), (Duration::from_secs(5), Duration::from_secs(15), Duration::from_secs(4), Duration::from_secs(55), Duration::from_secs(2)));
         assert_eq!((REQUEST_HOLD_AFTER, FAILED_AFTER, TOOL_ANSWER_LIMIT), (Duration::from_secs(6), Duration::from_secs(2), Duration::from_secs(25)));
+        // The app's route for a transfer waits two seconds longer than the call's own answer limit for it (it gave up at 20 s, five before).
+        assert_eq!((TOOL_ROUTE_WAIT, ROUTE_SLACK), (Duration::from_secs(20), Duration::from_secs(2)));
+        assert!(TOOL_ROUTE_WAIT.max(TOOL_ANSWER_LIMIT + ROUTE_SLACK) >= TOOL_ANSWER_LIMIT + Duration::from_secs(2));
         assert_eq!((HOLD_MAX, CONNECT_MAX), (6, 2));
         // Two holding lines while a takeover is set up. The longest silence there is the fifteen seconds before the first, the fifteen
         // between the two, and after the second (said thirty seconds in, and about three seconds long) the takeover's fifty-five seconds
@@ -1506,7 +1522,9 @@ mod tests {
                 give_up_after: GIVE_UP_AFTER,
                 setup_limit: SETUP_LIMIT,
                 cancel_wait: CANCEL_WAIT,
-                tool_answer: TOOL_ANSWER_LIMIT
+                tool_answer: TOOL_ANSWER_LIMIT,
+                route_wait: TOOL_ROUTE_WAIT,
+                route_slack: ROUTE_SLACK
             }
         );
     }

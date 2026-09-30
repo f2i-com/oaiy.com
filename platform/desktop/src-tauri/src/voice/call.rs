@@ -2782,6 +2782,8 @@ mod tests {
             setup_limit: Duration::from_millis(600),
             cancel_wait: Duration::from_millis(500),
             tool_answer: Duration::from_millis(2_500),
+            route_wait: Duration::from_millis(1_500),
+            route_slack: Duration::from_millis(300),
         }
     }
 

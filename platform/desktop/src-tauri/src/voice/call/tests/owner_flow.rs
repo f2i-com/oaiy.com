@@ -1157,6 +1157,83 @@ async fn after_a_ring_the_caller_who_says_they_will_leave_a_message_has_not_aske
     drop(asked);
 }
 
+/// The call routes of the app's API on the hub of a call, as the app reaches them.
+async fn serve_voice(hub: &VoiceHub) -> String {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let app = crate::voice::app_router(hub.clone());
+    tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+    format!("http://{addr}")
+}
+
+/// The reviewer's case, through the real route: a transfer the phone never answers is answered by the call as unavailable (`no_answer`) after
+/// the request's own limit (25 s in a real call, 2.5 s here). The route used to give up at 20 s (0.5 s here), so the app was told the call
+/// refused it, 409, five seconds before the typed answer the contract promises, and the request stayed live behind that.
+#[tokio::test]
+async fn the_tool_route_answers_a_transfer_the_phone_never_answers_with_the_typed_no_answer_and_not_a_conflict_before_it() {
+    let _on = crate::modules::test_gate::enable(&[crate::modules::PHONE]);
+    let timing = transfer::Timing { route_wait: Duration::from_millis(500), route_slack: Duration::from_millis(300), tool_answer: Duration::from_millis(2_500), ..quick() };
+    let mut f = flow_full(owner_settings(true), None, crate::ring::testing::at_the_pc(), timing).await;
+    f.caller_says(ASKED);
+    let base = serve_voice(&f.aokie.hub).await;
+    let url = format!("{base}/api/voice/calls/{}/tool", f.aokie.call);
+    let began = std::time::Instant::now();
+    let posted = tokio::spawn(async move { reqwest::Client::new().post(url).json(&json!({"name": "transfer_to_owner", "arguments": {"reason": "caller_asked"}})).send().await.unwrap() });
+    f.aokie.text("formlogic.realtime.tool_call", secs(3)).await.expect("the tool call reached the phone, which says nothing");
+    let response = posted.await.unwrap();
+    let took = began.elapsed();
+    let status = response.status();
+    let body: Value = response.json().await.unwrap();
+    assert_eq!(status, 200, "the call answered it: {body}");
+    assert_eq!((body["result"]["ok"].clone(), body["result"]["output"]["status"].clone(), body["result"]["output"]["reason"].clone()), (json!(false), json!("unavailable"), json!("no_answer")), "{body}");
+    assert!(took >= Duration::from_millis(2_400), "not before the request's own limit: {took:?}");
+    assert!(took < Duration::from_millis(3_800), "and not long after it: {took:?}");
+}
+
+/// What waits behind an unanswered transfer waits for it: a lookup or a goodbye sent to the route while the request is on the wire is not given
+/// up on at the route's own patience, or the goodbye that should go a moment after the request's `no_answer` would be reported as failed first.
+#[tokio::test]
+async fn a_tool_that_waits_behind_a_transfer_the_phone_never_answers_is_waited_for_as_long_as_the_transfer_is() {
+    let _on = crate::modules::test_gate::enable(&[crate::modules::PHONE]);
+    let timing = transfer::Timing { route_wait: Duration::from_millis(500), route_slack: Duration::from_millis(300), tool_answer: Duration::from_millis(2_500), ..quick() };
+    let mut f = flow_full(owner_settings(true), None, crate::ring::testing::at_the_pc(), timing).await;
+    f.caller_says(ASKED);
+    let base = serve_voice(&f.aokie.hub).await;
+    let (transfer_url, lookup_url) = (format!("{base}/api/voice/calls/{}/tool", f.aokie.call), format!("{base}/api/voice/calls/{}/tool", f.aokie.call));
+    let _transfer = tokio::spawn(async move { reqwest::Client::new().post(transfer_url).json(&json!({"name": "transfer_to_owner", "arguments": {"reason": "caller_asked"}})).send().await.unwrap() });
+    f.aokie.text("formlogic.realtime.tool_call", secs(3)).await.expect("the transfer reached the phone");
+    let began = std::time::Instant::now();
+    let lookup = tokio::spawn(async move { reqwest::Client::new().post(lookup_url).json(&json!({"name": "lookup_business_data", "arguments": {"question": "What are your hours?"}})).send().await.unwrap() });
+    // It goes to the phone once the transfer has been given up on (2.5 s), and not before.
+    let sent = f.aokie.text("formlogic.realtime.tool_call", secs(5)).await.expect("the lookup reached the phone when the transfer was given up on");
+    assert_eq!(sent["name"], "lookup_business_data");
+    assert!(began.elapsed() >= Duration::from_millis(2_000), "{:?}", began.elapsed());
+    // The phone answers it: the route was still waiting, and hands the answer on.
+    f.aokie.send(json!({"type": "formlogic.realtime.tool_result", "callId": f.aokie.call, "generation": 1, "toolCallId": sent["toolCallId"], "ok": true, "output": {"answer": "Nine to five."}}));
+    let response = lookup.await.unwrap();
+    let body: Value = response.json().await.unwrap();
+    assert_eq!(body["result"]["output"]["answer"], "Nine to five.", "{body}");
+}
+
+/// The longer wait is for a transfer and for what waits behind one, and no other: a lookup or a goodbye the phone never answers, with no
+/// request for the owner going, is given up on at the route's own patience (20 s in a real call, 0.5 s here), as it always was.
+#[tokio::test]
+async fn a_tool_or_a_goodbye_the_phone_never_answers_is_given_up_on_at_the_routes_own_patience_when_no_transfer_is_going() {
+    let _on = crate::modules::test_gate::enable(&[crate::modules::PHONE]);
+    let timing = transfer::Timing { route_wait: Duration::from_millis(500), route_slack: Duration::from_millis(300), tool_answer: Duration::from_millis(2_500), ..quick() };
+    let mut f = flow_full(owner_settings(true), None, crate::ring::testing::at_the_pc(), timing).await;
+    let base = serve_voice(&f.aokie.hub).await;
+    let began = std::time::Instant::now();
+    let lookup = reqwest::Client::new().post(format!("{base}/api/voice/calls/{}/tool", f.aokie.call)).json(&json!({"name": "lookup_business_data", "arguments": {"question": "What are your hours?"}})).send().await.unwrap();
+    assert_eq!(lookup.status(), 409, "the phone said nothing");
+    assert!(began.elapsed() < Duration::from_millis(1_800), "{:?}", began.elapsed());
+    f.aokie.text("formlogic.realtime.tool_call", secs(3)).await.expect("the lookup reached the phone");
+    let began = std::time::Instant::now();
+    let goodbye = reqwest::Client::new().post(format!("{base}/api/voice/calls/{}/finish", f.aokie.call)).json(&json!({"goodbye": "Thanks for calling."})).send().await.unwrap();
+    assert_eq!(goodbye.status(), 409, "the phone said nothing");
+    assert!(began.elapsed() < Duration::from_millis(1_800), "{:?}", began.elapsed());
+}
+
 #[tokio::test]
 async fn a_second_try_at_once_is_refused_and_so_is_a_fourth_call_from_one_number_in_an_hour() {
     let mut f = flow(owner_settings(true)).await;

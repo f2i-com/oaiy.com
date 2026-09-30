@@ -241,7 +241,10 @@ agent : "I'll try to reach them, please stay with me."  (it is trying: it does n
   still be caught). When a line is swapped the app is told the item that was said, not the text: it does not learn that
   its words were replaced (a follow-up).
 - **Nothing waits for ever.** A transfer request the phone never answers is answered to the model as
-  unavailable (`no_answer`) after 25 seconds, and the tools and the goodbye that waited behind it go. Meanwhile the
+  unavailable (`no_answer`) after 25 seconds (the app's route for the tool waits 27, so that typed answer is what it is told, never
+  a refusal before it; a tool sent while a request is unanswered waits behind it and is waited for that long too, and a tool the
+  phone does not answer with no request going is still given up on after 20 seconds), and the tools and the goodbye that waited
+  behind it go. Meanwhile the
   caller hears hold lines from the request (6 and 21 seconds after it), and if the receptionist then says nothing
   they are offered a message 4 seconds after it is given up on. A
   request the phone cancels on its own (consent taken back, say) while the caller is still there ends
