@@ -44,7 +44,7 @@ final class AddressHolds
             if ($mt === false) {
                 continue;
             }
-            if ($mt + (int)$m[1] + 5 < $now) {
+            if (self::stale($mt, (int)$m[1], $now)) {
                 @unlink($f);
                 continue;
             }
@@ -69,7 +69,7 @@ final class AddressHolds
         foreach (glob(rtrim($dataDir, '/') . '/holds/addr-*/*', GLOB_ONLYDIR) ?: [] as $dir) {
             foreach (glob($dir . '/*') ?: [] as $f) {
                 $mt = @filemtime($f);
-                if ($mt !== false && preg_match('/^(\d{1,4})\.[0-9a-f]{12}$/D', basename($f), $m) && $mt + (int)$m[1] + 5 < $now && @unlink($f)) {
+                if ($mt !== false && preg_match('/^(\d{1,4})\.[0-9a-f]{12}$/D', basename($f), $m) && self::stale($mt, (int)$m[1], $now) && @unlink($f)) {
                     $removed++;
                 }
             }
@@ -85,10 +85,19 @@ final class AddressHolds
         $live = 0;
         $now = time();
         foreach (glob($dir . '/*') ?: [] as $f) {
-            if (preg_match('/^(\d{1,4})\.[0-9a-f]{12}$/D', basename($f), $m) && ($mt = @filemtime($f)) !== false && $mt + (int)$m[1] + 5 >= $now) {
+            if (preg_match('/^(\d{1,4})\.[0-9a-f]{12}$/D', basename($f), $m) && ($mt = @filemtime($f)) !== false && !self::stale($mt, (int)$m[1], $now)) {
                 $live++;
             }
         }
         return $live;
+    }
+
+    /**
+     * A marker is stale once it is older than its cap plus five seconds, or stamped more than a minute ahead of now (a clock that
+     * stepped back: such a marker would otherwise count for as long as the step is long, and lock an address out of its waits).
+     */
+    private static function stale(int $mtime, int $capS, int $now): bool
+    {
+        return $mtime + $capS + 5 < $now || $mtime > $now + 60;
     }
 }

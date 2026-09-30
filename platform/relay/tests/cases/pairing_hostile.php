@@ -180,6 +180,31 @@ test('4.7.1 at most 4 pairing waits are held at once per client address: the 5th
     eq([], glob($r->data . '/holds/addr-pair/' . Signals::hash($addr) . '/*') ?: [], 'the stale ones were removed and this request removed its own');
 });
 
+test('4.7.1 a pairing-wait marker stamped more than a minute ahead (a clock that stepped back) does not count and is removed, so the address is not locked out for as long as the step; one a few seconds ahead still counts', function () {
+    [$r, $d, $c] = pair_setup(['wait' => ['max' => 1]]);
+    $c->open();
+    $addr = '203.0.113.30';
+    for ($i = 0; $i < 4; $i++) {
+        pairh_marker($r, 'addr-pair', $addr);
+    }
+    $files = glob($r->data . '/holds/addr-pair/' . Signals::hash($addr) . '/*');
+    eq(4, count($files));
+    eq(429, $c->get(['wait' => '1'], ['REMOTE_ADDR' => $addr])['status'], 'four live markers refuse the fifth');
+    touch($files[0], time() + 30);
+    eq(4, \Oaiy\Relay\AddressHolds::count($r->data, 'pair', $addr), 'thirty seconds ahead is clock noise, not a step');
+    foreach ($files as $f) {
+        touch($f, time() + 7200);
+    }
+    eq(0, \Oaiy\Relay\AddressHolds::count($r->data, 'pair', $addr), 'two hours ahead is stale');
+    eq(200, $c->get(['wait' => '1'], ['REMOTE_ADDR' => $addr])['status'], 'the address can hold again');
+    eq([], glob($r->data . '/holds/addr-pair/' . Signals::hash($addr) . '/*') ?: [], 'the stale markers were removed');
+    pairh_marker($r, 'addr-pair', $addr);
+    $left = glob($r->data . '/holds/addr-pair/' . Signals::hash($addr) . '/*');
+    eq(1, count($left));
+    touch($left[0], time() + 7200);
+    eq(1, \Oaiy\Relay\AddressHolds::collect($r->data), 'the collector removes it too');
+});
+
 test('4.7.1 the address limit is 4 held waits, not 4 requests: a request that only asked for wait=0 or for a state that had already changed holds no slot', function () {
     [$r, $d, $c] = pair_setup(['wait' => ['max' => 1]]);
     $c->open();
