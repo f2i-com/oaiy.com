@@ -194,6 +194,44 @@ pub fn carries(headers: &HeaderMap, name: &str) -> bool {
     !matches!(find(headers, name), Lookup::Absent)
 }
 
+/// Whether `name` is the name of one of this server's session cookies, in either style: `__Host-oaiy_<app>` or
+/// `oaiy_<app>_<port>`.
+fn is_session_cookie_name(name: &str) -> bool {
+    [App::Dash, App::Agent, App::Flows].iter().any(|app| {
+        let app = app.name();
+        name.strip_prefix("__Host-oaiy_") == Some(app)
+            || name
+                .strip_prefix("oaiy_")
+                .and_then(|rest| rest.strip_prefix(app))
+                .and_then(|rest| rest.strip_prefix('_'))
+                .is_some_and(|port| !port.is_empty() && port.bytes().all(|b| b.is_ascii_digit()))
+    })
+}
+
+/// Whether a request presents a session cookie of ours (any app, either style), for a host that serves no app:
+/// there is no cookie to read there, and on a connection that cannot carry one the request is refused for it.
+pub fn carries_a_session_cookie(headers: &HeaderMap) -> bool {
+    let mut total = 0usize;
+    for value in headers.get_all(header::COOKIE) {
+        total = total.saturating_add(value.len());
+        if total > MAX_COOKIE_HEADER {
+            return false;
+        }
+        let Ok(text) = value.to_str() else {
+            continue;
+        };
+        for pair in text.split(';') {
+            let pair = pair.trim_matches(|c| c == ' ' || c == '\t');
+            if let Some((name, _)) = pair.split_once('=') {
+                if is_session_cookie_name(name) {
+                    return true;
+                }
+            }
+        }
+    }
+    false
+}
+
 // ---- the checks of 4.5.2 ----------------------------------------------------------------------
 
 /// Why a cookie request was refused (all `403 csrf`).

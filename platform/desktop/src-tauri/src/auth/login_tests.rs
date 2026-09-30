@@ -306,6 +306,8 @@ impl Drop for LetGo {
 
 struct Build {
     proxied: bool,
+    /// A listener bound beyond loopback with no public URL: plain HTTP, bearer only.
+    lan: bool,
     login_allow: Option<&'static str>,
     /// Reuse a data folder (a restart).
     dir: Option<TempDir>,
@@ -318,6 +320,7 @@ impl Default for Build {
     fn default() -> Self {
         Build {
             proxied: true,
+            lan: false,
             login_allow: None,
             dir: None,
             at: T0,
@@ -348,7 +351,7 @@ fn build(b: Build) -> Env {
     }
     let env_vars = vars.clone();
     let (config, warnings) =
-        GuardConfig::from_env(&move |n| vars.get(n).cloned(), false, false, 41000);
+        GuardConfig::from_env(&move |n| vars.get(n).cloned(), b.lan, false, 41000);
     assert!(warnings.is_empty(), "{warnings:?}");
     let auth = dir.0.join("auth");
     let audit = Arc::new(AuditLog::open(&auth, clock.clone(), false));
@@ -3184,6 +3187,207 @@ async fn the_login_allow_list_refuses_other_addresses_before_any_hashing() {
     );
     assert_eq!(e.engine.hashes.load(Ordering::SeqCst), hashed);
     assert_eq!(login_as(&e, PASSWORD, "2001:db8:1::5").await.status, 200);
+}
+
+// ==================================== ACC-14: a lan listener has no login ============================
+
+const LAN_TOKEN: &str = "abcdefghijklmnopqrstuvwxyz0123456789ABCD";
+
+/// The same data folder, started again as a listener bound beyond loopback with no public URL (design 3.4: plain
+/// HTTP, bearer only). The owner exists (a lan install cannot start without one).
+fn as_lan(e: Env) -> Env {
+    let at = e.clock.now_ms() + MIN;
+    let Env {
+        app,
+        state,
+        guard,
+        store,
+        dir,
+        ..
+    } = e;
+    drop((app, state, guard, store));
+    build(Build {
+        dir: Some(dir),
+        at,
+        proxied: false,
+        lan: true,
+        static_token: Some(LAN_TOKEN),
+        ..Build::default()
+    })
+}
+
+/// A request from another machine on the network to the listener's address.
+fn lan_req(e: &Env, method: Method, path: &str) -> Req {
+    req(e, method, path)
+        .host("192.168.1.5:41000")
+        .from("192.168.1.9")
+}
+
+#[tokio::test]
+async fn t45_a_lan_listener_refuses_the_sign_in_and_says_it_needs_https_and_runs_no_hash() {
+    let e = env();
+    make_owner(&e, PASSWORD).await;
+    let e = as_lan(e);
+    assert!(
+        e.guard.login_configured(),
+        "a lan install starts only with an owner"
+    );
+    for (path, body) in [
+        ("/api/auth/login", json!({ "password": PASSWORD })),
+        (
+            "/api/auth/setup",
+            json!({ "code": "M6SC-7N75-YR3H", "password": PASSWORD }),
+        ),
+        ("/api/auth/link", json!({ "code": "x".repeat(43) })),
+    ] {
+        for browser in [false, true] {
+            let mut r = lan_req(&e, Method::POST, path).json(body.clone());
+            if browser {
+                r = r
+                    .h("origin", "http://192.168.1.5:41000")
+                    .h("sec-fetch-site", "same-origin");
+            }
+            let reply = go(&e, r).await;
+            assert_eq!(
+                (reply.status, reply.code().as_deref()),
+                (403, Some("secure_channel_required")),
+                "{path} browser {browser}: {}",
+                reply.text
+            );
+            assert!(
+                reply.cookies().is_empty(),
+                "{path}: no cookie is set on plain HTTP"
+            );
+        }
+    }
+    assert_eq!(
+        (
+            e.engine.verifies.load(Ordering::SeqCst),
+            e.engine.hashes.load(Ordering::SeqCst)
+        ),
+        (0, 0),
+        "refused before any hashing"
+    );
+    // The same routes from the machine itself under a loopback name are a host that serves no app: the answer they
+    // always gave.
+    let r = go(
+        &e,
+        lan_req(&e, Method::POST, "/api/auth/login")
+            .host("127.0.0.1:41000")
+            .json(json!({ "password": PASSWORD })),
+    )
+    .await;
+    assert_eq!(r.status, 404);
+}
+
+#[tokio::test]
+async fn t45_a_lan_listener_refuses_a_session_cookie_rather_than_ignoring_it_and_a_bearer_needs_none(
+) {
+    let e = env();
+    make_owner(&e, PASSWORD).await;
+    let signed_in = login_as(&e, PASSWORD, "127.0.0.1").await;
+    let b = browser_from(&e, &signed_in);
+    let e = as_lan(e);
+    let cookie = |name: &str| format!("{name}={}", b.session);
+    // Every way a session cookie of ours can be named: refused, said why, on a route that needs a credential.
+    for name in [
+        "oaiy_dash_41000",
+        "oaiy_agent_41000",
+        "oaiy_flows_8080",
+        "__Host-oaiy_dash",
+        "__Host-oaiy_agent",
+        "__Host-oaiy_flows",
+    ] {
+        let r = go(
+            &e,
+            lan_req(&e, Method::GET, "/api/services").cookie(&cookie(name)),
+        )
+        .await;
+        assert_eq!(
+            (r.status, r.code().as_deref()),
+            (403, Some("secure_channel_required")),
+            "{name}: {}",
+            r.text
+        );
+    }
+    // Among other cookies too.
+    let r = go(
+        &e,
+        lan_req(&e, Method::GET, "/api/services")
+            .cookie("theme=dark")
+            .cookie(&cookie("oaiy_dash_41000"))
+            .cookie("lang=en"),
+    )
+    .await;
+    assert_eq!(r.code().as_deref(), Some("secure_channel_required"));
+    // What is not a session cookie is not refused, only anonymous: another site's cookie, the device cookie, a name
+    // that only looks like ours.
+    for pair in [
+        "theme=dark",
+        "oaiy_dev_41000=x",
+        "__Host-oaiy_dev=x",
+        "oaiy_dash_=x",
+        "oaiy_dash_4x=x",
+        "oaiy_dashboard_41000=x",
+        "xoaiy_dash_41000=x",
+        "OAIY_DASH_41000=x",
+    ] {
+        let r = go(&e, lan_req(&e, Method::GET, "/api/services").cookie(pair)).await;
+        assert_eq!(
+            (r.status, r.code().as_deref()),
+            (401, Some("auth_required")),
+            "{pair}: {}",
+            r.text
+        );
+    }
+    // A bearer wins over a cookie, as everywhere: the token is honoured and the cookie never looked at.
+    let r = go(
+        &e,
+        lan_req(&e, Method::GET, "/api/auth/whoami")
+            .h("authorization", &format!("Bearer {LAN_TOKEN}"))
+            .cookie(&cookie("oaiy_dash_41000")),
+    )
+    .await;
+    assert_eq!(r.status, 200, "{}", r.text);
+    assert_eq!(r.json()["kind"], "static");
+    // A public route reads no cookie: the anonymous answer, and it says the channel is not secure.
+    let r = go(
+        &e,
+        lan_req(&e, Method::GET, "/api/auth/session").cookie(&cookie("oaiy_dash_41000")),
+    )
+    .await;
+    assert_eq!(
+        (r.status, r.json()["authenticated"].clone()),
+        (200, json!(false))
+    );
+    let r = go(&e, lan_req(&e, Method::GET, "/api/auth/info")).await;
+    assert_eq!(
+        (
+            r.json()["secureChannel"].as_bool(),
+            r.json()["loginConfigured"].as_bool()
+        ),
+        (Some(false), Some(true))
+    );
+    // Nothing is a UI here: the routes of the API are all there is (the static hosts are a later step's, and answer
+    // an insecure channel with a page that says so).
+    for path in ["/", "/index.html", "/apps/dash", "/login"] {
+        let r = go(&e, lan_req(&e, Method::GET, path)).await;
+        assert_eq!(r.status, 404, "{path}");
+        assert!(!r.text.contains("<html"), "{path}");
+    }
+}
+
+#[tokio::test]
+async fn t45_the_same_cookie_on_a_secure_channel_is_still_a_session() {
+    // The refusal is about the channel, not the cookie: behind the proxy over https, and from the machine itself on
+    // a loopback name, the cookie of the host's app works as it did.
+    let e = env();
+    make_owner(&e, PASSWORD).await;
+    let r = login_as(&e, PASSWORD, "203.0.113.9").await;
+    let b = browser_from(&e, &r);
+    let r = go(&e, as_page(&e, &b, Method::GET, "/api/auth/whoami")).await;
+    assert_eq!(r.status, 200, "{}", r.text);
+    assert_eq!(r.json()["kind"], "session");
 }
 
 // ==================================== nothing secret is written ======================================

@@ -484,6 +484,15 @@ impl LoginState {
             return Err(not_found());
         };
         let Some(ch) = CookieHost::of(&info) else {
+            // A host that serves no app is `404` for a login, except on a connection that can carry none at all
+            // (plain HTTP from the network: a lan listener, which has no sign-in): that one is told why.
+            if info.channel == super::host::Channel::Insecure {
+                return Err(denial(
+                    StatusCode::FORBIDDEN,
+                    "secure_channel_required",
+                    "Sign in over https, or from the machine itself.",
+                ));
+            }
             return Err(not_found());
         };
         if ch.app != App::Dash {
