@@ -204,14 +204,18 @@ is an error, not a default. Keys this build understands (unknown keys are ignore
 | `limits.batchItems`, `limits.batchBytes`, `limits.hdrBytes` | 64, 1 MiB, 512 | Post batch and header bounds |
 | `limits.lookupWait`, `limits.lookupHeld` | 8, 4 | Waiting lookups (providers only) |
 | `limits.lanes.<lane>.body`, `.ttl.default`, `.ttl.max` | the protocol's | Narrow a lane's size cap or lifetime; never widen |
-| `call.enabled` | false | Call features (ring lane and, later, admission and signalling) |
+| `call.enabled` | false | Call features: the ring lane, the admission issuer and the Aokie compatibility routes (see below) |
+| `apps` | unset (any) | The app ids this relay issues admissions for (a list); another is `403` |
+| `compat.sse` | `auto` | `auto`/`on`: offer the framed stream only after the calibration proved the host flushes; `force`: offer it regardless; `off`: never |
+| `turn.urls`, `turn.secret`, `turn.ttl`, `turn.relay_only` | none, none, 600, false | The TURN server of your coturn (`turn:` and `turns:` urls, at most 8), its `static-auth-secret` (32 to 4,096 bytes, not a placeholder), the credential lifetime (60 to 3,600 s) and whether every route must use TURN |
+| `stun.urls` | none | STUN urls (`stun:`, `stuns:`, at most 8) |
+| `limits.sigItems`, `limits.sigSenderShare` | 1024, 0.25 | Frames in one Aokie party mailbox (at most 1,024), and the share of a mailbox and of `limits.mailboxBytes` one phone may use in the plugin's |
 | `token_pepper` | none | Optional HMAC pepper (16 characters or more) for token hashes; set it before issuing tokens |
 | `wake.mode`, `wake.safety_ms` | `file`, 2000 | `file` (shard files, with a database fetch every `safety_ms`) or `db` (poll the database) |
 | `client_ip.header`, `client_ip.trusted_proxies` | none | Honoured only when `REMOTE_ADDR` is a trusted proxy |
 | `cors.extra_origins` | none | Extra https origins listed in `info` |
 
-Accepted and validated now, used by later parts of the relay: `apps`, `compat.sse`, `turn.*`, `stun.*`, `push.fcm.*`,
-`limits.slotBytes`, `limits.sigItems`, `limits.sigSenderShare`.
+Accepted and validated now, used by a later part of the relay: `push.fcm.*` and `limits.slotBytes`.
 
 ## The doctor
 
@@ -282,6 +286,41 @@ the relay only stores and forwards. The steps and their answers are in the proto
 `fixtures/sealed-token.json` holds sealed tokens the real relay produced, with the recipient key and the checks a reader must
 make; `php tests/fixtures.php --check` verifies them and `--write` records them again.
 
+## Call features: admissions, TURN and the Aokie routes
+
+With `call.enabled` on (the installer asks; the default is no, and everything below answers `403 feature_disabled` until it is
+on) the relay does what FormLogic does for the shipped Aokie plugin and phone, so they can signal a call through it:
+
+- **Admissions.** `POST /v1/admission` (alias `/v1/aokie-companion/admission`) mints the 90 second bearer for the plugin when the
+  desktop's token asks and for a phone when the phone asks for itself, with the phone's checks (its own device and key, a live
+  desktop, a roster that lists it, `state_read`) and short-lived ICE credentials. Nothing an admission does changes what the relay
+  stores. The admission secret is `data/secrets/admission.hmac`, made by the installer, never in an answer, a log or the status page.
+- **Signalling.** `GET .../relay/challenge`, `POST` and `GET .../relay/frames` and `GET .../relay/stream` under
+  `/v1/aokie-companion/`: a mailbox per party (the plugin, and each phone), frames that live 120 seconds and are never
+  acknowledged, and the stream the shipped carriers open. Every request re-reads the device row, so removing a phone from the
+  desktop's roster or revoking it ends its access at its next request and its held stream within a fraction of a second.
+- **Errors** on these routes have FormLogic's three members, `{"error":true,"code","message"}`, and a wait is the `Retry-After` header.
+
+**TURN.** Put a coturn beside the relay (a phone on a carrier network needs it: the status page warns when none is configured) with
+`use-auth-secret`, `static-auth-secret=<the same string as turn.secret>` and a `realm`, and list its urls in `turn.urls`. Every
+admission carries its own credential: `username = <expiry>:<opaque id>`, `credential = base64(HMAC-SHA1(secret, username))`, the id a
+keyed hash of the endpoint (FormLogic's), so no device id reaches coturn's log. A bad `turn.*` or `stun.*` section stops the relay
+at the next request instead of issuing credentials that the plugin's decoder would refuse.
+
+**The stream and the calibration.** The framed stream needs a host that sends the first bytes of a response before it ends, which
+a shared host's proxy may not (output buffering, FastCGI, a CDN). The relay writes the preamble at once, a keepalive every two
+seconds and always ends with an `end` event, but whether the bytes reach the client is the host's business: OAIY's "Test this relay"
+runs `GET /v1/admin/stream-probe`, and only a passing probe makes an admission advertise `relay` (and `info` list
+`compat.sse-framed-poll`). On a host where it fails the shipped plugin is answered `422` and call signalling does not work there;
+`compat.sse: "force"` overrides the probe at your own risk. A stream takes one worker of the pool for up to 20 seconds (or
+`wait.max`, if lower), one per party; when the pool is at its hard limit a stream is refused with `503` and a frames wait becomes
+a short poll.
+
+The rules and their numbers are in the protocol package (`README.md` section 10.6 and interpretations 36 to 45), and the answers
+of the real relay to the plugin's and the phone's requests are recorded under
+[`fixtures/aokie/`](../protocol/relay/v1/fixtures/aokie/README.md), with the rules of the shipped decoders transcribed and applied
+to them (`php tests/fixtures.php --check` and the conformance suite run that).
+
 ### `php bin/relay.php`, the administration commands
 
 Run on the host, with shell access to `data/` (which is the relay's trust root). None of it is reachable from the network, and
@@ -348,7 +387,21 @@ through the web. The relay's own rules (authentication, items, the poll, holds, 
 SQLite, and the same suite runs unchanged on MySQL 8.4.7 and MariaDB 11.4.9 (`OAIY_TEST_DB`), which also has its own tests of
 the schema (case-sensitive ids, `MEDIUMTEXT` bodies, strict mode) and of concurrent posts.
 
+The pairing rendezvous and the sealed token (RL-06), and the admission issuer, the Aokie routes and the stream (RL-07) have their
+own tests: every rule of the design's sections 4.10 and 4.14 is named by one, the two are run against fleets of `php -S` servers
+for the races (two responders to one pid, an approval racing a burn, a newer stream replacing an older one within a step, a
+revocation ending a held stream) and against a fake clock for every lifetime, the bearers and credentials are checked against the
+design's vectors and against FormLogic's own known answers, and mutation testing broke the rules that carry safety one at a time.
+
 **Not run:**
+
+- **No Aokie code was run.** The plugin's and the phone's decoders were read, not compiled: the fixtures are checked by a Python
+  transcription of their rules (`fixtures/aokie/aokie_decoders.py`), which can be wrong where the Rust differs from my reading.
+  A Rust contract test against the same fixtures is listed in `fixtures/aokie/README.md` and was not written.
+- **No coturn was run**, so no real allocation was made with these credentials; the credential is the HMAC that coturn's
+  `use-auth-secret` computes, and it agrees with FormLogic's own computed answers and with Python's `hmac`.
+- The framed stream was tested against `php -S` on Windows only. How a real host's web server, PHP-FPM, LiteSpeed or a CDN buffers
+  it, and how they report a client that hung up, was not tried: the calibration's probe is what decides, on your host.
 
 - `public/.htaccess` was **not** run through Apache or LiteSpeed. The nginx snippet above was **not** run through nginx or PHP-FPM.
   Both are written from the design and from general knowledge of those servers; the doctor's exposure and Authorization probes
