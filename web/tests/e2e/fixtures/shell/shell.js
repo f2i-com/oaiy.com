@@ -8,7 +8,9 @@
 (() => {
   'use strict';
   const now = () => performance.now();
-  const DEFAULT_ALLOW = 'cross-origin-isolated; local-network-access; local-network; loopback-network';
+  // What an app delegates to the providers frame. Not `cross-origin-isolated`: v0 has no use for an isolated holder (that is for the
+  // on-device engine, WA-09) and an isolated holder is easier for a co-located Spectre-class attack to read.
+  const DEFAULT_ALLOW = 'local-network-access; local-network; loopback-network';
 
   const holder = { iframe: null, port: null, next: 1, waiting: new Map(), streams: new Map(), pushes: [], hello: null, helloWaiter: null, log: [], dump: [] };
 

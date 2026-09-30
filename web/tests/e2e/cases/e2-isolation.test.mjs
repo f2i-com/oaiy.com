@@ -3,9 +3,11 @@
  * credentialless) and stays so with the providers frame embedded, because that frame sends COEP and a CORP that admits it; the flow
  * editor is not isolated and embeds the same frame without any of that.
  *
- * Inside the frame, `crossOriginIsolated` is a CHECK, not a verdict (the design says so): it is true under the Agent when the app
- * delegates the feature with `allow="cross-origin-isolated"` and false under the flow editor. If it were true without the delegation
- * the token would go from the handshake; what is observed is asserted below, and the assertion says what to do if it changes.
+ * Inside the frame, `crossOriginIsolated` is a CHECK, not a verdict (the design says so): what is observed is asserted below. It is true
+ * under the Agent only when the app delegates the feature with `allow="cross-origin-isolated"`, and false under the flow editor. The
+ * apps do NOT delegate it in v0: an isolated holder has no use yet (the on-device engine, WA-09, may need one) and is easier for a
+ * co-located Spectre-class attack to read, so the holder stays UNISOLATED, and the last test of the group below fails if a default
+ * handshake ever delegates it.
  */
 import assert from 'node:assert/strict';
 import { after, before, describe, it } from 'node:test';
@@ -47,12 +49,13 @@ describe('E2 isolation', () => {
     await context.close();
   });
 
-  it('inside the frame: isolated under the Agent (the app delegates it), not under the flow editor', async () => {
+  it('inside the frame: NOT isolated, under the Agent or under the flow editor (v0 does not delegate the feature)', async () => {
     const { context } = await newContext(browser);
     const agent = await newPage(context);
     await agent.page.goto(`${world.origins.agent}/`);
     await agent.page.evaluate((origin) => window.oaiyTest.connect({ origin }), world.origins.providers);
-    assert.equal(await (await frameOf(agent.page)).evaluate(() => crossOriginIsolated), true, 'under the Agent');
+    assert.equal(await (await frameOf(agent.page)).evaluate(() => crossOriginIsolated), false, 'under the Agent');
+    assert.equal(await (await frameOf(agent.page)).evaluate(() => typeof SharedArrayBuffer), 'undefined', 'and with no SharedArrayBuffer to share a co-located reader');
 
     const flows = await newPage(context);
     await flows.page.goto(`${world.origins.flows}/`);
@@ -62,16 +65,15 @@ describe('E2 isolation', () => {
     await context.close();
   });
 
-  it('without the delegation the frame is not isolated under the Agent: the token is needed (if this fails, the token goes from the handshake)', async () => {
+  it('the feature could be delegated (the engine, WA-09, may want it): with the token the frame IS isolated under the Agent, so it is the embedder\'s choice that keeps it off', async () => {
     const { context } = await newContext(browser);
     const { page } = await newPage(context);
     await page.goto(`${world.origins.agent}/`);
-    const hello = await page.evaluate((origin) => window.oaiyTest.connect({ origin, allow: 'local-network-access' }), world.origins.providers);
+    const hello = await page.evaluate((origin) => window.oaiyTest.connect({ origin, allow: 'cross-origin-isolated' }), world.origins.providers);
     assert.equal(hello?.t, 'hello');
-    assert.equal(await (await frameOf(page)).evaluate(() => crossOriginIsolated), false);
+    assert.equal(await (await frameOf(page)).evaluate(() => crossOriginIsolated), true);
     await context.close();
   });
-
   it('an embedder that gives the frame the `credentialless` attribute gets an anonymous, empty store, so the frame must not be given it (3.1 requirement 2)', async () => {
     const fake = await startFakeProvider({ cors: { allowOrigins: [world.origins.providers] } });
     const { context } = await newContext(browser);
