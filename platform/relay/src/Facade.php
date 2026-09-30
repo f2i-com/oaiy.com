@@ -136,10 +136,15 @@ final class Facade
             $f->party = 'mobile:' . $f->holder;
             $f->expectedPeer = (string)$c['expectedPeerKeyThumbprint'];
             $f->deviceId = $f->subjectId;
-            $row = $ctx->db->one("SELECT id, revoked_at, owner_desktop, app_id, thumbprint FROM devices WHERE id = ? AND role = 'phone'", [$f->subjectId]);
+            $row = $ctx->db->one("SELECT id, revoked_at, owner_desktop, app_id, thumbprint, grants FROM devices WHERE id = ? AND role = 'phone'", [$f->subjectId]);
             if ($row === null || $row['owner_desktop'] !== $f->dsk || $row['app_id'] !== $f->appId || $row['thumbprint'] !== $f->holder) {
                 throw self::refuse($ctx, $req);
             }
+            // What the bearer asserts is at most what the desktop grants the phone NOW: a grant taken away (a phone cut from takeover and
+            // monitor to state_read) stops being asserted at the next request, not when the 90 second bearer runs out. The bearer's own
+            // order is kept; a grant the bearer never had is never added.
+            $current = json_decode((string)$row['grants'], true);
+            $f->scopes = array_values(array_filter($f->scopes, static fn($g): bool => is_array($current) && in_array($g, $current, true)));
         }
         if ($row['revoked_at'] !== null) {
             throw new ApiError(401, 'revoked', 'This device was removed; pair it again.');

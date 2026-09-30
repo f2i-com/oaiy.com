@@ -480,6 +480,29 @@ test('4.14.4 the frame\'s sender, subject and grants are the relay\'s own record
     eq(['plugin', 'aokie', ['state_read', 'rtc_signal']], [$back['from'], $back['subjectId'], $back['grants']]);
 });
 
+test('4.14.4 a grant the desktop takes away stops being asserted in the phone\'s frames at its next request, not when its 90 second bearer ends; a grant it never had is never added', function () {
+    $k = AokieRig::make();
+    $a = $k->addPhone('A', ['state_read', 'caller_read', 'monitor', 'takeover']);
+    $k->pushRoster();
+    $plug = $k->pluginToken();
+    $ta = $k->mobileToken($a);
+    eq(['state_read', 'caller_read', 'monitor', 'takeover'], Admission::verify(aok_secret($k), $ta, Relay::T0)['scopes'], 'the bearer carries all four');
+    eq(200, $k->send($ta, 'plugin', [['n' => 1]])['status']);
+    // The desktop cuts the phone down to state_read (POST /v1/devices/{id}), with the same bearer still in the phone's hand.
+    $res = $k->r->call($k->desk, 'POST', '/v1/devices/' . $a->id, ['grants' => ['state_read']]);
+    eq(200, $res['status'], $res['body']);
+    eq(200, $k->send($ta, 'plugin', [['n' => 2]])['status']);
+    // Widening does not widen the old bearer: it never had that grant.
+    $k->r->call($k->desk, 'POST', '/v1/devices/' . $a->id, ['grants' => ['state_read', 'caller_read', 'consult']]);
+    eq(200, $k->send($ta, 'plugin', [['n' => 3]])['status']);
+    $frames = $k->read($plug, 0)['json']['frames'];
+    eq([['state_read', 'caller_read', 'monitor', 'takeover'], ['state_read'], ['state_read', 'caller_read']], array_column($frames, 'grants'));
+    eq(['mobile:' . $k->thumb($a)], array_values(array_unique(array_column($frames, 'from'))));
+    // The next admission is the new grants.
+    Tmp::setClock(Relay::T0 + 61);
+    eq(['state_read', 'caller_read', 'consult'], Admission::verify(aok_secret($k), $k->mobileToken($a), Relay::T0 + 61)['scopes']);
+});
+
 // ------------------------------------------------------------------------------------------------ POST frames: hostile shapes
 
 test('4.14.4 a malformed frames request is a plain 400 invalid_request and nothing is stored: bodies, targets, frame lists and frames', function () {
