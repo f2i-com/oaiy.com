@@ -819,6 +819,9 @@ mod tests {
         most_all: AtomicUsize,
         all: AtomicUsize,
         calls: AtomicUsize,
+        /// While this is true a call waits (for the test to say when a pass ends) instead of taking its moment.
+        held: std::sync::Mutex<bool>,
+        go: std::sync::Condvar,
     }
 
     impl Gauge {
@@ -829,7 +832,19 @@ mod tests {
                 most_all: AtomicUsize::new(0),
                 all: AtomicUsize::new(0),
                 calls: AtomicUsize::new(0),
+                held: std::sync::Mutex::new(false),
+                go: std::sync::Condvar::new(),
             })
+        }
+
+        /// From now on every call waits until `release`.
+        fn hold(&self) {
+            *self.held.lock().unwrap_or_else(|e| e.into_inner()) = true;
+        }
+
+        fn release(&self) {
+            *self.held.lock().unwrap_or_else(|e| e.into_inner()) = false;
+            self.go.notify_all();
         }
 
         fn run(&self, lane: usize) {
@@ -838,9 +853,47 @@ mod tests {
             self.most[lane].fetch_max(n, Ordering::SeqCst);
             let all = self.all.fetch_add(1, Ordering::SeqCst) + 1;
             self.most_all.fetch_max(all, Ordering::SeqCst);
-            std::thread::sleep(Duration::from_millis(25));
+            let until = std::time::Instant::now() + Duration::from_secs(60);
+            let mut held = self.held.lock().unwrap_or_else(|e| e.into_inner());
+            if *held {
+                while *held {
+                    let left = until.saturating_duration_since(std::time::Instant::now());
+                    if left.is_zero() {
+                        break;
+                    }
+                    held = self
+                        .go
+                        .wait_timeout(held, left)
+                        .unwrap_or_else(|e| e.into_inner())
+                        .0;
+                }
+            } else {
+                drop(held);
+                std::thread::sleep(Duration::from_millis(25));
+            }
             self.all.fetch_sub(1, Ordering::SeqCst);
             self.now[lane].fetch_sub(1, Ordering::SeqCst);
+        }
+    }
+
+    /// Lets go of what a test held when the test ends, however it ends (a thread that waits keeps the run alive).
+    struct LetGo(Arc<Gauge>);
+
+    impl Drop for LetGo {
+        fn drop(&mut self) {
+            self.0.release();
+        }
+    }
+
+    /// Wait until `done` (looking every few milliseconds); fail, saying what for, if it does not happen in thirty seconds.
+    async fn eventually(what: &str, done: impl Fn() -> bool) {
+        let until = std::time::Instant::now() + Duration::from_secs(30);
+        while !done() {
+            assert!(
+                std::time::Instant::now() < until,
+                "timed out waiting for {what}"
+            );
+            tokio::time::sleep(Duration::from_millis(2)).await;
         }
     }
 
@@ -981,41 +1034,64 @@ mod tests {
     async fn the_fence_goes_on_counting_a_pass_whose_caller_went_away() {
         for hashing in [false, true] {
             let gauge = Gauge::new();
+            let _let_go = LetGo(gauge.clone());
             let hasher = Hasher::new(gauge.clone());
-            let mut gave_up = 0;
-            for _ in 0..12 {
-                let hasher = hasher.clone();
-                let calls_before = gauge.calls.load(Ordering::SeqCst);
-                let caller = tokio::spawn(async move {
-                    let pw = Zeroizing::new("A pw".to_string());
-                    if hashing {
-                        let _ = hasher.hash(pw).await;
-                    } else {
-                        let _ = hasher.verify(pw, "x".into()).await;
-                    }
-                });
-                // The caller goes away as soon as its pass has begun (or, when the fence is full and it is still
-                // waiting for a place, after a moment): its pass (25 ms) runs on without it.
-                let waited = std::time::Instant::now();
-                while gauge.calls.load(Ordering::SeqCst) == calls_before
-                    && waited.elapsed() < Duration::from_millis(30)
-                {
-                    tokio::task::yield_now().await;
-                }
+            // The passes end when the test says so: until then they are running, whoever is waiting for them.
+            gauge.hold();
+            let callers = |n: usize| {
+                (0..n)
+                    .map(|_| {
+                        let hasher = hasher.clone();
+                        tokio::spawn(async move {
+                            let pw = Zeroizing::new("A pw".to_string());
+                            if hashing {
+                                let _ = hasher.hash(pw).await;
+                            } else {
+                                let _ = hasher.verify(pw, "x".into()).await;
+                            }
+                        })
+                    })
+                    .collect::<Vec<_>>()
+            };
+            // The fence lets three begin; the callers go away while their passes run.
+            let first = callers(6);
+            eventually("the fence's three passes to begin", || {
+                gauge.calls.load(Ordering::SeqCst) >= FENCE
+            })
+            .await;
+            for caller in first {
                 caller.abort();
-                gave_up += 1;
+                let _ = caller.await;
             }
-            tokio::time::sleep(Duration::from_millis(400)).await;
-            assert_eq!(gave_up, 12, "the callers went away");
-            assert!(
-                gauge.calls.load(Ordering::SeqCst) >= 1,
-                "and their passes began ({})",
-                gauge.calls.load(Ordering::SeqCst)
+            // New callers come while those three passes run on without anyone: the fence has no place for them. (A
+            // fence that gave the places back when the callers went away begins them at once.)
+            let second = callers(6);
+            let began = std::time::Instant::now();
+            while gauge.calls.load(Ordering::SeqCst) == FENCE
+                && began.elapsed() < Duration::from_millis(300)
+            {
+                tokio::time::sleep(Duration::from_millis(2)).await;
+            }
+            assert_eq!(
+                gauge.calls.load(Ordering::SeqCst),
+                FENCE,
+                "{} passes began ({}): the fence let a new one begin while the passes of callers that left were running",
+                gauge.calls.load(Ordering::SeqCst),
+                if hashing { "hash" } else { "verify" }
             );
-            assert!(
-                gauge.most_all.load(Ordering::SeqCst) <= FENCE,
-                "{} passes at once ({}): the fence let a new one start while a pass of a caller that left was still running",
+            gauge.release();
+            for caller in second {
+                caller.await.unwrap();
+            }
+            eventually("the passes to end", || {
+                gauge.all.load(Ordering::SeqCst) == 0
+            })
+            .await;
+            assert_eq!(gauge.calls.load(Ordering::SeqCst), FENCE + 6);
+            assert_eq!(
                 gauge.most_all.load(Ordering::SeqCst),
+                FENCE,
+                "{}: the passes of callers that left were running, and counted",
                 if hashing { "hash" } else { "verify" }
             );
         }
