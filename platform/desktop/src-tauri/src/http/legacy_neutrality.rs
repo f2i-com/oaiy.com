@@ -543,7 +543,7 @@ async fn a_handler_that_reads_the_principal_gets_the_legacy_owner_in_legacy_mode
     .await;
     assert_eq!(
         String::from_utf8_lossy(&a.body),
-        // (The legacy owner holds every scope there is: 55 now, and never a number written here.)
+        // (The legacy owner holds every scope there is: 56 now, and never a number written here.)
         format!("{:?}:{}", PrincipalKind::Legacy, crate::auth::scopes::SCOPES.len())
     );
     // Refused requests never reach the handler, so nothing is handed to a caller who did not pass.

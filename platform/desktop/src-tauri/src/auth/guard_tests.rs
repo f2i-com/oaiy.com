@@ -514,6 +514,46 @@ async fn a_credential_that_is_not_the_owners_cannot_read_or_rewrite_the_transfer
     }
 }
 
+/// What callers left and the rings going are the owner's to act on: a credential of the Agent page's preset can read the messages and keep the one
+/// the receptionist takes, and is refused (403, with `calls.manage`) when it marks a message, deletes one (which the review did: the message was
+/// gone), declines a ring or puts a notice away; so is the interim companion preset, which reads. The owner's dashboard credential is let through.
+#[tokio::test]
+async fn an_agent_can_read_the_messages_and_keep_one_and_cannot_mark_or_delete_them_or_answer_a_ring() {
+    let e = env(AccessMode::Scoped);
+    let agent = native_pat(&e, Preset::Agent.scopes(), DAY);
+    let companion = native_pat(&e, Preset::Companion.scopes(), DAY);
+    let owner = desk(&e, App::Dash, Preset::Owner, &[DESK_ORIGIN]);
+    let actions = [
+        (Method::PATCH, "/api/messages/msg_1", r#"{"state":"handled"}"#),
+        (Method::DELETE, "/api/messages/msg_1", ""),
+        (Method::POST, "/api/ring/active/assist_1/respond", r#"{"action":"decline"}"#),
+        (Method::POST, "/api/ring/notices/notice_1/dismiss", ""),
+    ];
+    for (who, token) in [("agent", &agent), ("companion", &companion)] {
+        for (m, path, body) in &actions {
+            let r = go(&e, send(m.clone(), path).bearer(token).json(body)).await;
+            assert_eq!(
+                (r.status, r.code().as_deref(), r.json()["required"].as_str().map(str::to_owned)),
+                (403, Some("insufficient_scope"), Some("calls.manage".to_string())),
+                "{who}: {m} {path}: {}",
+                r.text
+            );
+        }
+    }
+    // What it may still do: read, and keep the message the receptionist takes (the Agent page answers calls).
+    for path in ["/api/messages", "/api/messages/msg_1", "/api/ring/preview", "/api/ring/active"] {
+        assert_eq!(go(&e, send(Method::GET, path).bearer(&agent)).await.status, 200, "agent: GET {path}");
+        assert_eq!(go(&e, send(Method::GET, path).bearer(&companion)).await.status, 200, "companion: GET {path}");
+    }
+    assert_eq!(go(&e, send(Method::POST, "/api/voice/calls/call_1/message").bearer(&agent).json("{}")).await.status, 200);
+    assert_eq!(go(&e, send(Method::POST, "/api/voice/calls/call_1/message").bearer(&companion).json("{}")).await.status, 403, "the companion holds no calls.write");
+    // The owner's own credential gets through on every one.
+    for (m, path, body) in &actions {
+        let r = go(&e, send(m.clone(), path).bearer(&owner).h("origin", DESK_ORIGIN).json(body)).await;
+        assert_eq!(r.status, 200, "owner: {m} {path}");
+    }
+}
+
 #[tokio::test]
 async fn t1_the_environment_token_is_the_cli_preset_on_every_install_and_never_more() {
     let e = env(AccessMode::Scoped);
@@ -1930,7 +1970,7 @@ async fn whoami_says_who_and_what() {
         (v["kind"].as_str(), v["elevated"].as_bool()),
         (Some("desk"), Some(true))
     );
-    assert_eq!(v["scopes"].as_array().unwrap().len(), 55);
+    assert_eq!(v["scopes"].as_array().unwrap().len(), 56);
 }
 
 #[tokio::test]

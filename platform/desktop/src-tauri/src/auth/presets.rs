@@ -10,7 +10,7 @@ use super::scopes::ScopeSet;
 /// A named bundle.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum Preset {
-    /// All 55. The dashboard's `desk`, and a cookie session on the dashboard host (dangerous scopes
+    /// All 56. The dashboard's `desk`, and a cookie session on the dashboard host (dangerous scopes
     /// then need step-up). Not grantable to a token.
     Owner,
     /// The Agent page.
@@ -309,7 +309,8 @@ impl RelayTier {
             "control.read",
             "connectors.use",
         ]);
-        let call_control = read.union(&ScopeSet::of(&["calls.write", "agent.tasks"]));
+        // (A phone that may control a call marks the messages and declines a ring: mobile.md gives it those, and `calls.manage` is where they are.)
+        let call_control = read.union(&ScopeSet::of(&["calls.write", "calls.manage", "agent.tasks"]));
         match self {
             RelayTier::Read => read,
             RelayTier::CallControl => call_control,
@@ -354,7 +355,7 @@ mod tests {
         assert_eq!(
             sizes,
             [
-                ("owner", 55),
+                ("owner", 56),
                 ("agent", 20),
                 ("flows", 14),
                 ("flows-host", 11),
@@ -444,14 +445,15 @@ mod tests {
             RelayTier::CallControl.scopes(),
             RelayTier::Admin.scopes(),
         );
-        assert_eq!((read.len(), call.len(), admin.len()), (9, 11, 13));
+        assert_eq!((read.len(), call.len(), admin.len()), (9, 12, 14));
         assert!(read.is_subset_of(&call) && call.is_subset_of(&admin));
         assert_eq!(
             call.names()
                 .into_iter()
                 .filter(|n| !read.contains(n))
                 .collect::<Vec<_>>(),
-            ["calls.write", "agent.tasks"]
+            ["calls.write", "agent.tasks", "calls.manage"],
+            "in table order"
         );
         assert!(admin.contains("control.project") && !call.contains("control.project"));
         assert!(admin.contains("calls.settings") && !call.contains("calls.settings"), "only the admin tier may change the transfer settings");
@@ -486,6 +488,48 @@ mod tests {
             });
             assert_eq!(reaches, name == "owner" || name == "relay:admin", "{name}");
         }
+    }
+
+    /// Acting on what callers left and on the rings going (a message marked or deleted, a ring declined, a notice put away) is the owner's and a
+    /// phone's that may control a call (mobile.md gives the call-control tier the messages and the rings): `calls.manage` is held by the `owner`
+    /// preset and the relay's call-control tier (and the admin tier above it) and by no other bundle, the Agent page's `agent` among them, which
+    /// keeps `calls.write` for the receptionist's own `take_message` and the rest of what it does on a call. It is not a dangerous scope.
+    #[test]
+    fn the_actions_on_messages_and_rings_are_held_by_the_owner_and_the_phones_call_control_and_by_nothing_else()
+    {
+        for (name, scopes) in all_bundles() {
+            assert_eq!(
+                scopes.contains("calls.manage"),
+                matches!(name.as_str(), "owner" | "relay:call-control" | "relay:admin"),
+                "{name}"
+            );
+        }
+        assert!(!is_dangerous("calls.manage"));
+        let actions = [
+            ("PATCH", "/api/messages/:id"),
+            ("DELETE", "/api/messages/:id"),
+            ("POST", "/api/ring/active/:id/respond"),
+            ("POST", "/api/ring/notices/:id/dismiss"),
+        ];
+        for (method, pattern) in actions {
+            let row = ROUTES
+                .iter()
+                .find(|r| r.method.as_str() == method && r.pattern == pattern)
+                .unwrap_or_else(|| panic!("{method} {pattern}"));
+            assert_eq!(row.class, Class::Scope("calls.manage"), "{}", row.key());
+        }
+        // What that is worth: the Agent page's preset reaches none of them, and still keeps the message the receptionist takes.
+        let agent = Preset::Agent.scopes();
+        for (method, pattern) in actions {
+            let reaches = ROUTES.iter().any(|r| {
+                r.method.as_str() == method
+                    && r.pattern == pattern
+                    && matches!(r.class, Class::Scope(s) if agent.contains(s))
+            });
+            assert!(!reaches, "{method} {pattern}");
+        }
+        assert!(ROUTES.iter().any(|r| r.pattern == "/api/voice/calls/:id/message"
+            && matches!(r.class, Class::Scope(s) if agent.contains(s))));
     }
 
     #[test]
@@ -567,10 +611,11 @@ mod tests {
     /// scope, gain a route and `readonly` loses the one it had), the Agent's flush acknowledgement
     /// (`agent.serve`) and the plugin trust route (`plugins.install`), and the eleven routes of the
     /// receptionist's transfers and messages, which are `calls.read` (four: the messages, one message, the
-    /// ring's preview and the rings going now), `calls.write` (five) or `calls.settings` (the ring's
-    /// settings, read and changed: two, the owner's alone): so `owner`, which holds every scope, reaches
-    /// eleven more, `agent`, which holds the first two, nine, and `companion` (the interim LAN preset), which
-    /// holds `calls.read` alone, four. No other preset holds any of them.
+    /// ring's preview and the rings going now), `calls.write` (one: the receptionist's own `take_message`),
+    /// `calls.manage` (four: a message marked or deleted, a ring declined, a notice put away) or
+    /// `calls.settings` (the ring's settings, read and changed: two, the owner's alone): so `owner`, which
+    /// holds every scope, reaches eleven more, `agent`, which holds the first two, five, and `companion` (the
+    /// interim LAN preset), which holds `calls.read` alone, four. No other preset holds any of them.
     #[test]
     fn what_each_preset_reaches_of_the_routes_that_existed() {
         let reaches: Vec<(&str, usize)> = ALL_PRESETS
@@ -581,7 +626,7 @@ mod tests {
             reaches,
             [
                 ("owner", 165 + 11),
-                ("agent", 78 + 9),
+                ("agent", 78 + 5),
                 ("flows", 64),
                 ("flows-host", 54),
                 ("flows-web", 38),

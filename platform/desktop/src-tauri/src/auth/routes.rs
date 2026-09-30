@@ -409,11 +409,15 @@ pub static ROUTES: &[Route] = &[
     // - Reading the messages (callers' words and numbers), the rings going now (who is asking for the owner and
     //   what they said) and what a caller would get now is `calls.read`, the scope of the call events and the
     //   calls list: the same words and the same numbers, from the same callers.
-    // - A message marked seen or handled, or deleted, a ring declined (or a message offered in its place), a
-    //   notice put away and the receptionist's own `take_message` on its call are `calls.write`: they act on what
-    //   callers said and on what happens to a live call, as `say`, `finish` and the voice settings do. Deleting a
-    //   message is no more dangerous than deleting a contact or an appointment (`contacts.write`,
-    //   `calendar.write`), and none of them takes the call to the owner: only the Companion does that, and no route
+    // - The receptionist's own `take_message` on its call is `calls.write`, beside `say`, `tool`, `finish` and
+    //   `hush`: the Agent page answers calls, and this is how what a caller leaves is kept.
+    // - Acting on what callers left and on the rings that are going (a message marked seen or handled, or deleted, a
+    //   ring declined or a message offered in its place, a notice put away) is `calls.manage`, a scope of its own that
+    //   the `owner` preset and the relay's call-control tier (a phone that may control a call, which marks messages and
+    //   declines rings: mobile.md) hold, and the Agent page's `agent` preset does not: what a caller left is the
+    //   owner's record, and a page that may be untrusted must not be able to clear it, or to decline the owner's
+    //   rings. Deleting a message is no more dangerous than deleting a contact or an appointment (`contacts.write`,
+    //   `calendar.write`), and none of these takes the call to the owner: only the Companion does that, and no route
     //   here accepts.
     // - The owner's transfer settings (`GET` and `PUT /api/ring/settings`: whether transfers are on at all, whom
     //   they may be put through to, the VIP numbers that are exempt from the limits and the quiet hours, which
@@ -438,10 +442,11 @@ pub static ROUTES: &[Route] = &[
     scope(Verb::Delete, "/api/voice/voices/:name", "calls.write"),
     scope(Verb::Post, "/api/voice/voices/:name/try", "calls.write"),
     scope(Verb::Post, "/api/voice/calls/:id/message", "calls.write"),
-    scope(Verb::Patch, "/api/messages/:id", "calls.write"),
-    scope(Verb::Delete, "/api/messages/:id", "calls.write"),
-    scope(Verb::Post, "/api/ring/active/:id/respond", "calls.write"),
-    scope(Verb::Post, "/api/ring/notices/:id/dismiss", "calls.write"),
+    // calls.manage
+    scope(Verb::Patch, "/api/messages/:id", "calls.manage"),
+    scope(Verb::Delete, "/api/messages/:id", "calls.manage"),
+    scope(Verb::Post, "/api/ring/active/:id/respond", "calls.manage"),
+    scope(Verb::Post, "/api/ring/notices/:id/dismiss", "calls.manage"),
     // calls.settings
     scope(Verb::Get, "/api/ring/settings", "calls.settings"),
     scope(Verb::Put, "/api/ring/settings", "calls.settings"),
@@ -1064,11 +1069,13 @@ mod tests {
             let row = ROUTES.iter().find(|r| r.key() == key).unwrap_or_else(|| panic!("{key}"));
             assert_eq!(row.since, 1, "{key}: built, so no longer reserved");
         }
-        // ...and the scope of two of them is not the design's: the owner's transfer settings are `calls.settings`, which the `agent`
-        // preset does not hold (see the comment on the rows in `routes.rs`).
+        // ...and the scope of three of them is not the design's: the owner's transfer settings are `calls.settings`, and marking a message is
+        // `calls.manage`, which the `agent` preset holds neither of (see the comment on the rows in `routes.rs`).
+        let mut rescoped = rescoped;
+        rescoped.sort();
         assert_eq!(
             rescoped,
-            ["GET /api/ring/settings", "PUT /api/ring/settings"],
+            ["GET /api/ring/settings", "PATCH /api/messages/:id", "PUT /api/ring/settings"],
             "the rows whose scope is not the appendix's are the ones the file lists"
         );
         let mut unique = want.clone();

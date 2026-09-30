@@ -175,7 +175,7 @@ mod tests {
     #[test]
     fn the_legacy_owner_holds_everything_and_is_elevated_and_holds_no_secret() {
         let p = Principal::legacy_owner();
-        assert_eq!(p.scopes.len(), 55);
+        assert_eq!(p.scopes.len(), 56);
         assert!(p.elevated && p.has("plugins.install") && p.has("vault.kt"));
         assert_eq!(p.kind, PrincipalKind::Legacy);
         assert!(!p.is_bound());

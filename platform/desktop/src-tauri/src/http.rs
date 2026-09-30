@@ -1966,8 +1966,9 @@ mod tests {
     }
 
     /// The access model's table (`auth/routes.rs`) has a row for each route of the receptionist's transfers and messages, in the scope of its kind
-    /// (reading callers' words and numbers is `calls.read`, as the call events are; acting on a message or a ring is `calls.write`, as `say` and
-    /// `finish` are; the owner's transfer settings are `calls.settings`, which the Agent page's preset does not hold), with `since: 1` (the routes exist, and `legacy` mode keeps the guard they were built with), and the
+    /// (reading callers' words and numbers is `calls.read`, as the call events are; the receptionist's own `take_message` is `calls.write`, as `say` and
+    /// `finish` are; acting on a message or a ring is `calls.manage` and the owner's transfer settings are `calls.settings`, which the Agent page's
+    /// preset holds neither of), with `since: 1` (the routes exist, and `legacy` mode keeps the guard they were built with), and the
     /// scoped CORS answers a paired page's preflight for each method, PATCH and DELETE included, and no page that has not paired.
     #[test]
     fn the_receptionists_routes_take_the_scope_of_their_kind_and_the_scoped_cors_lets_a_paired_page_use_them() {
@@ -1976,14 +1977,14 @@ mod tests {
         let routes = [
             (Method::GET, "/api/messages", "calls.read"),
             (Method::GET, "/api/messages/:id", "calls.read"),
-            (Method::PATCH, "/api/messages/:id", "calls.write"),
-            (Method::DELETE, "/api/messages/:id", "calls.write"),
+            (Method::PATCH, "/api/messages/:id", "calls.manage"),
+            (Method::DELETE, "/api/messages/:id", "calls.manage"),
             (Method::GET, "/api/ring/settings", "calls.settings"),
             (Method::PUT, "/api/ring/settings", "calls.settings"),
             (Method::GET, "/api/ring/preview", "calls.read"),
             (Method::GET, "/api/ring/active", "calls.read"),
-            (Method::POST, "/api/ring/active/:id/respond", "calls.write"),
-            (Method::POST, "/api/ring/notices/:id/dismiss", "calls.write"),
+            (Method::POST, "/api/ring/active/:id/respond", "calls.manage"),
+            (Method::POST, "/api/ring/notices/:id/dismiss", "calls.manage"),
             (Method::POST, "/api/voice/calls/:id/message", "calls.write"),
         ];
         for (method, pattern, scope) in &routes {

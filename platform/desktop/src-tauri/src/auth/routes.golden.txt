@@ -23,11 +23,16 @@
 #       before the access model merged (marked "built since the appendix"): GET /api/messages and
 #       GET /api/ring/settings, PATCH /api/messages/:id and PUT /api/ring/settings. Their since is 1 now, because
 #       the routes exist and `legacy` mode keeps the guard they were built with;
-#   ! two of those rows have a scope the design does not have (marked "scope changed since the appendix"): the
-#       owner's transfer settings, GET and PUT /api/ring/settings, are `calls.settings` (an act scope, not dangerous,
-#       held by the `owner` preset and the relay's admin tier alone), where the design has calls.read and calls.write.
-#       The design's other routes of `calls.write` are held by the `agent` preset, which is the Agent page: a page that
-#       may be untrusted must not be able to turn transfers on, name VIP numbers or silence the owner's phones;
+#   ! three of those rows have a scope the design does not have (marked "scope changed since the appendix"):
+#       the owner's transfer settings, GET and PUT /api/ring/settings, are `calls.settings` (an act scope, not
+#       dangerous, held by the `owner` preset and the relay's admin tier alone), where the design has calls.read
+#       and calls.write; and PATCH /api/messages/:id, with the three routes that act on a message or a ring
+#       (DELETE /api/messages/:id, POST /api/ring/active/:id/respond, POST /api/ring/notices/:id/dismiss, which the
+#       design does not have), is `calls.manage` (an act scope, not dangerous, held by the `owner` preset and the
+#       relay's call-control tier), where the design has calls.write. The design's routes of `calls.write` are held
+#       by the `agent` preset, which is the Agent page: a page that may be untrusted must not be able to turn
+#       transfers on, name VIP numbers, silence the owner's phones, clear what callers left or decline the owner's
+#       rings;
 #   - GET /api/update, the updater design's reserved row: it was built as GET /api/update/status;
 #   - control.project (the change level of POST /api/mcp) and every other /api/relay/* route the relay design
 #     adds are not rows: no route exists for them yet.
@@ -166,7 +171,7 @@ POST /api/voice/voices scope:calls.write 1 all
 PUT /api/voice/voices/chosen scope:calls.write 1 all
 DELETE /api/voice/voices/:name scope:calls.write 1 all
 POST /api/voice/voices/:name/try scope:calls.write 1 all
-PATCH /api/messages/:id scope:calls.write 1 all  # built since the appendix
+PATCH /api/messages/:id scope:calls.manage 1 all  # built since the appendix; scope changed since the appendix (the design: calls.write)
 PUT /api/ring/settings scope:calls.settings 1 all  # built since the appendix; scope changed since the appendix (the design: calls.write)
 GET /api/calendar scope:calendar.read 1 all
 GET /api/calendar/free scope:calendar.read 1 all
@@ -298,9 +303,9 @@ POST /api/update/check scope:services.control 1 all  # added since the appendix
 POST /api/update/agent-flushed scope:agent.serve 1 all  # added since the appendix
 POST /api/plugins/:id/trust scope:plugins.install 1 all  # added since the appendix
 GET /api/messages/:id scope:calls.read 1 all  # added since the appendix
-DELETE /api/messages/:id scope:calls.write 1 all  # added since the appendix
+DELETE /api/messages/:id scope:calls.manage 1 all  # added since the appendix
 GET /api/ring/preview scope:calls.read 1 all  # added since the appendix
 GET /api/ring/active scope:calls.read 1 all  # added since the appendix
-POST /api/ring/active/:id/respond scope:calls.write 1 all  # added since the appendix
-POST /api/ring/notices/:id/dismiss scope:calls.write 1 all  # added since the appendix
+POST /api/ring/active/:id/respond scope:calls.manage 1 all  # added since the appendix
+POST /api/ring/notices/:id/dismiss scope:calls.manage 1 all  # added since the appendix
 POST /api/voice/calls/:id/message scope:calls.write 1 all  # added since the appendix
