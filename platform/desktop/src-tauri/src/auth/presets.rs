@@ -10,7 +10,7 @@ use super::scopes::ScopeSet;
 /// A named bundle.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum Preset {
-    /// All 54. The dashboard's `desk`, and a cookie session on the dashboard host (dangerous scopes
+    /// All 55. The dashboard's `desk`, and a cookie session on the dashboard host (dangerous scopes
     /// then need step-up). Not grantable to a token.
     Owner,
     /// The Agent page.
@@ -313,7 +313,8 @@ impl RelayTier {
         match self {
             RelayTier::Read => read,
             RelayTier::CallControl => call_control,
-            RelayTier::Admin => call_control.union(&ScopeSet::of(&["control.project"])),
+            // (Their transfer settings are the admin tier's too: mobile.md gives a phone the ring settings only with a confirmed step-up.)
+            RelayTier::Admin => call_control.union(&ScopeSet::of(&["control.project", "calls.settings"])),
         }
     }
 }
@@ -353,7 +354,7 @@ mod tests {
         assert_eq!(
             sizes,
             [
-                ("owner", 54),
+                ("owner", 55),
                 ("agent", 20),
                 ("flows", 14),
                 ("flows-host", 11),
@@ -443,7 +444,7 @@ mod tests {
             RelayTier::CallControl.scopes(),
             RelayTier::Admin.scopes(),
         );
-        assert_eq!((read.len(), call.len(), admin.len()), (9, 11, 12));
+        assert_eq!((read.len(), call.len(), admin.len()), (9, 11, 13));
         assert!(read.is_subset_of(&call) && call.is_subset_of(&admin));
         assert_eq!(
             call.names()
@@ -453,6 +454,38 @@ mod tests {
             ["calls.write", "agent.tasks"]
         );
         assert!(admin.contains("control.project") && !call.contains("control.project"));
+        assert!(admin.contains("calls.settings") && !call.contains("calls.settings"), "only the admin tier may change the transfer settings");
+    }
+
+    /// The owner's transfer settings (whether transfers are on, whom they may be put through to, the VIP numbers, which devices ring) are theirs
+    /// alone: only the `owner` preset and the relay's admin tier hold `calls.settings`, so that a credential of the Agent page, or any other that
+    /// holds `calls.write`, cannot rewrite the policy the host judges a caller by. It is not a dangerous scope (no relay tier may hold one).
+    #[test]
+    fn the_transfer_settings_are_held_by_the_owner_and_the_relays_admin_tier_and_by_nothing_else() {
+        for (name, scopes) in all_bundles() {
+            assert_eq!(
+                scopes.contains("calls.settings"),
+                name == "owner" || name == "relay:admin",
+                "{name}"
+            );
+        }
+        assert!(!is_dangerous("calls.settings"));
+        // What that is worth: the routes of the ring's settings are unreachable to every other bundle, `agent` and the phone's call-control included.
+        let rows: Vec<_> = ROUTES
+            .iter()
+            .filter(|r| r.pattern == "/api/ring/settings")
+            .collect();
+        assert_eq!(rows.len(), 2, "GET and PUT");
+        for r in rows {
+            assert_eq!(r.class, Class::Scope("calls.settings"), "{}", r.key());
+        }
+        for (name, scopes) in all_bundles() {
+            let reaches = ROUTES.iter().any(|r| {
+                r.pattern == "/api/ring/settings"
+                    && matches!(r.class, Class::Scope(s) if scopes.contains(s))
+            });
+            assert_eq!(reaches, name == "owner" || name == "relay:admin", "{name}");
+        }
     }
 
     #[test]
@@ -533,10 +566,11 @@ mod tests {
     /// GitHub, so the `flows`, `flows-host`, `flows-web`, `formlogic` and `run` presets, which hold that
     /// scope, gain a route and `readonly` loses the one it had), the Agent's flush acknowledgement
     /// (`agent.serve`) and the plugin trust route (`plugins.install`), and the eleven routes of the
-    /// receptionist's transfers and messages, which are `calls.read` (five: the messages, one message, the
-    /// ring's settings, its preview and the rings going now) or `calls.write` (six): so `owner` and `agent`,
-    /// which hold both, reach eleven more, and `companion` (the interim LAN preset), which holds
-    /// `calls.read` alone, five more. No other preset holds either scope.
+    /// receptionist's transfers and messages, which are `calls.read` (four: the messages, one message, the
+    /// ring's preview and the rings going now), `calls.write` (five) or `calls.settings` (the ring's
+    /// settings, read and changed: two, the owner's alone): so `owner`, which holds every scope, reaches
+    /// eleven more, `agent`, which holds the first two, nine, and `companion` (the interim LAN preset), which
+    /// holds `calls.read` alone, four. No other preset holds any of them.
     #[test]
     fn what_each_preset_reaches_of_the_routes_that_existed() {
         let reaches: Vec<(&str, usize)> = ALL_PRESETS
@@ -547,7 +581,7 @@ mod tests {
             reaches,
             [
                 ("owner", 165 + 11),
-                ("agent", 78 + 11),
+                ("agent", 78 + 9),
                 ("flows", 64),
                 ("flows-host", 54),
                 ("flows-web", 38),
@@ -556,7 +590,7 @@ mod tests {
                 ("cli-admin", 86),
                 ("mcp", 7),
                 ("readonly", 28),
-                ("companion", 17 + 5),
+                ("companion", 17 + 4),
                 ("run", 32),
                 ("ceremony", 4),
             ]

@@ -1,6 +1,7 @@
 //! The scopes: exact strings, never patterns.
 //!
-//! There are 48 core scopes (18 read, 18 act, 12 dangerous) and 6 that other designs reserved.
+//! There are 49 core scopes (18 read, 19 act, 12 dangerous) and 6 that other designs reserved (the design counts 48: 18, 18, 12;
+//! `calls.settings` is the one this code adds, for the owner's transfer settings).
 //! Wildcards and bundles are expanded when a credential is created and never matched at request
 //! time: the guard asks whether a credential holds the route's exact scope.
 //!
@@ -38,7 +39,7 @@ const fn info(name: &'static str, group: Group, dangerous: bool) -> ScopeInfo {
 
 /// Every scope. The position is the scope's bit in a [`ScopeSet`]; appending is safe, reordering
 /// is not (nothing persists a bit, but the tests pin the order).
-pub const SCOPES: [ScopeInfo; 54] = [
+pub const SCOPES: [ScopeInfo; 55] = [
     // Read (18)
     info("system.read", Group::Read, false),
     info("logs.read", Group::Read, false),
@@ -58,7 +59,7 @@ pub const SCOPES: [ScopeInfo; 54] = [
     info("companion.read", Group::Read, false),
     info("auth.read", Group::Read, false),
     info("control.read", Group::Read, false),
-    // Act (18)
+    // Act (19)
     info("services.control", Group::Act, false),
     info("models.write", Group::Act, false),
     info("plugins.control", Group::Act, false),
@@ -77,6 +78,9 @@ pub const SCOPES: [ScopeInfo; 54] = [
     info("control.project", Group::Act, false),
     info("ui.events", Group::Act, false),
     info("auth.revoke", Group::Act, false),
+    // The owner's transfer settings (`/api/ring/settings`: whom the receptionist may put through, the VIP numbers, quiet hours, which
+    // devices ring). Not the Agent's: the host's policy must hold if the Agent page is untrusted, as `agent.settings` is off its preset.
+    info("calls.settings", Group::Act, false),
     // Dangerous (12)
     info("services.define", Group::Dangerous, true),
     info("runtimes.install", Group::Dangerous, true),
@@ -128,7 +132,7 @@ fn index_of(name: &str) -> Option<usize> {
     SCOPES.iter().position(|s| s.name == name)
 }
 
-/// The scope named `name`, if it is one of the 54.
+/// The scope named `name`, if it is one of the 55.
 pub fn info_of(name: &str) -> Option<&'static ScopeInfo> {
     index_of(name).map(|i| &SCOPES[i])
 }
@@ -178,7 +182,7 @@ pub fn is_resource_scope(name: &str) -> bool {
 /// Why a name is not a scope.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum ScopeError {
-    /// Not one of the 54, and not a resource scope.
+    /// Not one of the 55, and not a resource scope.
     Unknown(String),
 }
 
@@ -192,7 +196,7 @@ impl std::fmt::Display for ScopeError {
 
 impl std::error::Error for ScopeError {}
 
-/// A set of scopes: the 54 by a bit each, everything else (resource scopes, and names a newer OAIY
+/// A set of scopes: the 55 by a bit each, everything else (resource scopes, and names a newer OAIY
 /// wrote that this one does not know) by name. A name this build does not know never matches a
 /// route, so keeping it costs nothing and loses nothing when the file goes back to the newer build.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
@@ -206,7 +210,7 @@ impl ScopeSet {
         Self::default()
     }
 
-    /// All 54.
+    /// All 55.
     pub fn all() -> Self {
         Self {
             bits: (1u64 << SCOPES.len()) - 1,
@@ -357,8 +361,8 @@ mod tests {
     use super::*;
 
     #[test]
-    fn there_are_54_scopes_of_the_kinds_the_design_counts() {
-        assert_eq!(SCOPES.len(), 54);
+    fn there_are_55_scopes_of_the_kinds_the_design_counts_and_the_one_this_code_adds() {
+        assert_eq!(SCOPES.len(), 55);
         let count = |g: Group| SCOPES.iter().filter(|s| s.group == g).count();
         assert_eq!(
             (
@@ -367,7 +371,8 @@ mod tests {
                 count(Group::Dangerous),
                 count(Group::Reserved)
             ),
-            (18, 18, 12, 6)
+            (18, 19, 12, 6),
+            "the design's 18, 18, 12 and 6, and `calls.settings`, an act scope"
         );
         assert_eq!(
             SCOPES.iter().filter(|s| s.dangerous).count(),
@@ -377,7 +382,7 @@ mod tests {
         let mut names: Vec<_> = SCOPES.iter().map(|s| s.name).collect();
         names.sort_unstable();
         names.dedup();
-        assert_eq!(names.len(), 54, "no duplicate scope");
+        assert_eq!(names.len(), 55, "no duplicate scope");
         for s in &SCOPES {
             assert!(
                 s.name.split('.').count() == 2
@@ -524,7 +529,7 @@ mod tests {
         assert!(ScopeSet::empty().is_subset_of(&ScopeSet::empty()));
         assert!(a.has_dangerous() && !a.without_dangerous().has_dangerous());
         assert_eq!(a.without_dangerous(), ScopeSet::of(&["ai.read", "ai.use"]));
-        assert_eq!(ScopeSet::all().len(), 54);
+        assert_eq!(ScopeSet::all().len(), 55);
         assert!(ScopeSet::all().contains("vault.kt") && ScopeSet::all().contains("system.read"));
         assert!(ScopeSet::all().extra.is_empty());
         // A subset check must look at resource scopes too.

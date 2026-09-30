@@ -21,9 +21,13 @@
 #       POST /api/voice/calls/:id/message (calls.write), each classified on purpose in src/auth/routes.rs;
 #   ~ four rows the design reserved (since 2, "(rsv)": the routes were not built) and the code built since,
 #       before the access model merged (marked "built since the appendix"): GET /api/messages and
-#       GET /api/ring/settings (calls.read), PATCH /api/messages/:id and PUT /api/ring/settings (calls.write).
-#       Their scope is the design's; their since is 1 now, because the routes exist and `legacy` mode keeps the
-#       guard they were built with;
+#       GET /api/ring/settings, PATCH /api/messages/:id and PUT /api/ring/settings. Their since is 1 now, because
+#       the routes exist and `legacy` mode keeps the guard they were built with;
+#   ! two of those rows have a scope the design does not have (marked "scope changed since the appendix"): the
+#       owner's transfer settings, GET and PUT /api/ring/settings, are `calls.settings` (an act scope, not dangerous,
+#       held by the `owner` preset and the relay's admin tier alone), where the design has calls.read and calls.write.
+#       The design's other routes of `calls.write` are held by the `agent` preset, which is the Agent page: a page that
+#       may be untrusted must not be able to turn transfers on, name VIP numbers or silence the owner's phones;
 #   - GET /api/update, the updater design's reserved row: it was built as GET /api/update/status;
 #   - control.project (the change level of POST /api/mcp) and every other /api/relay/* route the relay design
 #     adds are not rows: no route exists for them yet.
@@ -151,7 +155,7 @@ GET /api/voice/calls scope:calls.read 1 all
 GET /api/voice/voices scope:calls.read 1 all
 GET /api/voice/settings scope:calls.read 1 all
 GET /api/messages scope:calls.read 1 all  # built since the appendix
-GET /api/ring/settings scope:calls.read 1 all  # built since the appendix
+GET /api/ring/settings scope:calls.settings 1 all  # built since the appendix; scope changed since the appendix (the design: calls.read)
 POST /api/voice/calls/:id/say scope:calls.write 1 all
 POST /api/voice/calls/:id/tool scope:calls.write 1 all
 POST /api/voice/calls/:id/finish scope:calls.write 1 all
@@ -163,7 +167,7 @@ PUT /api/voice/voices/chosen scope:calls.write 1 all
 DELETE /api/voice/voices/:name scope:calls.write 1 all
 POST /api/voice/voices/:name/try scope:calls.write 1 all
 PATCH /api/messages/:id scope:calls.write 1 all  # built since the appendix
-PUT /api/ring/settings scope:calls.write 1 all  # built since the appendix
+PUT /api/ring/settings scope:calls.settings 1 all  # built since the appendix; scope changed since the appendix (the design: calls.write)
 GET /api/calendar scope:calendar.read 1 all
 GET /api/calendar/free scope:calendar.read 1 all
 GET /api/calendar/sync scope:calendar.read 1 all
