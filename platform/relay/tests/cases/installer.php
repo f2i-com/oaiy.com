@@ -46,6 +46,22 @@ function inst_scratch(): string
  */
 function inst_cli(string $root, string $script, array $args = [], array $env = [], string $stdin = ''): array
 {
+    // The installer asks the web about data/ at the relay's own address by default. The tests must not make network requests
+    // to relay.example.com, so a call that does not say how to probe (--probe-url, --no-probe) and whose --url is not a
+    // loopback address gets --no-probe; the tests of the probe itself name a loopback address or --probe-url.
+    $keep = isset($env['INST_PROBE']); // a test that wants the probe on a call that names no address (a re-key) says so
+    unset($env['INST_PROBE']);
+    if ($script === 'install.php' && !$keep) {
+        $says = false;
+        foreach ($args as $a) {
+            if (strpos($a, '--probe-url=') === 0 || $a === '--no-probe' || strpos($a, '--url=http://127.0.0.1') === 0) {
+                $says = true;
+            }
+        }
+        if (!$says) {
+            $args[] = '--no-probe';
+        }
+    }
     $cmd = array_merge([PHP_BINARY], Server::phpFlags(), [$root . '/bin/' . $script], $args);
     $e = getenv();
     unset($e['OAIY_TEST_DATA'], $e['OAIY_RELAY_DATA']);
@@ -135,9 +151,20 @@ function inst_web(string $token = INST_TOKEN): array
     return [$root, $srv];
 }
 
-/** @return array<string,mixed> */
+/**
+ * POST a form to the web installer. Like the command line helper, a post that names no loopback address does not ask the web
+ * about data/ (the tests make no network requests to relay.example.com); pass 'no_probe' => '0' to leave the probe on.
+ * @return array<string,mixed>
+ */
 function inst_post(Server $srv, array $fields, string $path = '/install.php'): array
 {
+    $loopback = isset($fields['public_url']) && is_string($fields['public_url']) && strpos($fields['public_url'], 'http://127.0.0.1') === 0;
+    if (!array_key_exists('no_probe', $fields) && !$loopback) {
+        $fields['no_probe'] = '1';
+    }
+    if (($fields['no_probe'] ?? null) === '0') {
+        unset($fields['no_probe']);
+    }
     return $srv->request('POST', $path, ['Content-Type' => 'application/x-www-form-urlencoded'], http_build_query($fields));
 }
 
@@ -278,6 +305,121 @@ test('4.18.8 installer CLI: a --probe-url that cannot be reached is a note, not 
     eq(0, $code, "stdout: $out stderr: $err");
     contains('could not be reached', $err);
     not_contains($dead, $err . $out, 'the probe URL is not echoed');
+});
+
+// The exposure probe is on by default: it asks the web about data/ at the relay's own address, so a document root that is
+// the relay folder is refused before any secret is written, with nothing to remember to switch on. The addresses below are
+// php -S servers on loopback: one whose document root is public/ (the right layout) and one whose document root is the
+// relay folder (the wrong one, where /data/... is served).
+
+test('4.18.2 installer CLI: with no --probe-url the probe asks at the --url address, and a document root that is the relay folder is refused with nothing written', function () {
+    $root = inst_scratch();
+    $srv = Server::start($root, ['prepend' => false, 'name' => 'inst-root']);
+    [$code, $out, $err] = inst_cli($root, 'install.php', ['--url=' . $srv->base()]);
+    eq(1, $code, "stdout: $out stderr: $err");
+    contains('install refused', $err);
+    contains('can be read through the web', $err);
+    not_contains($srv->base(), $err . $out, 'the address is not echoed');
+    foreach (['installed.lock', 'config.json', 'first-key.txt', 'admin-token.txt', 'relay.sqlite', 'secrets/relay.key', '.htaccess'] as $f) {
+        ok(!file_exists($root . '/data/' . $f), "$f was not written");
+    }
+    ok(!file_exists($root . '/data'), 'and the empty data/ the probe made is gone');
+    // The proof that the refusal mattered: the same folder, served this way, hands out a file placed in data/.
+    mkdir($root . '/data');
+    file_put_contents($root . '/data/first-key.txt', "not a real key\n");
+    eq(200, $srv->request('GET', '/data/first-key.txt')['status'], 'this layout really does serve data/');
+});
+
+test('4.18.2 installer CLI: with public/ as the document root the default probe finds data/ unreachable, says so, and the secret files cannot be fetched', function () {
+    $root = inst_scratch();
+    $srv = Server::start($root . '/public', ['prepend' => false, 'name' => 'inst-pub']);
+    [$code, $out, $err] = inst_cli($root, 'install.php', ['--url=' . $srv->base()]);
+    eq(0, $code, "stdout: $out stderr: $err");
+    contains('data/ is not readable through the web', $out);
+    not_contains('not checked', $err);
+    ok(is_file($root . '/data/first-key.txt') && is_file($root . '/data/admin-token.txt'), 'the two secret files are there');
+    foreach (['/data/first-key.txt', '/data/admin-token.txt', '/data/relay.sqlite', '/data/secrets/relay.key', '/data/config.json'] as $p) {
+        eq(404, $srv->request('GET', $p)['status'], $p);
+    }
+});
+
+test('4.18.2 installer CLI: an --url that cannot be reached is a note saying the exposure was not checked, never a silent pass; --no-probe says the same and skips the probe', function () {
+    $root = inst_scratch();
+    $dead = 'http://127.0.0.1:' . Server::freePort();
+    [$code, $out, $err] = inst_cli($root, 'install.php', ['--url=' . $dead]);
+    eq(0, $code, "stdout: $out stderr: $err");
+    contains('could not be reached', $err);
+    contains('not checked', $err);
+    contains('bin/doctor.php', $err);
+    not_contains('not readable through the web', $out, 'it does not claim a check that did not happen');
+    // --no-probe: the probe is not made even where it would have refused, and the note says so.
+    $root2 = inst_scratch();
+    $srv = Server::start($root2, ['prepend' => false, 'name' => 'inst-root']);
+    [$code, $out, $err] = inst_cli($root2, 'install.php', ['--url=' . $srv->base(), '--no-probe']);
+    eq(0, $code, "stdout: $out stderr: $err");
+    contains('--no-probe', $err);
+    contains('not checked', $err);
+    // The two cannot be combined.
+    [$code, , $err] = inst_cli(inst_scratch(), 'install.php', ['--url=https://relay.example.com', '--no-probe', '--probe-url=' . $srv->base()]);
+    eq(2, $code);
+    contains('do not go together', $err);
+});
+
+test('4.18.2 installer CLI: --rekey goes through the same probe, at the address in config.json, and refuses to put a key where the web serves it', function () {
+    $root = inst_scratch();
+    // Installed while nothing served it (the probe was skipped), so the config names the address of the wrong layout.
+    $wrong = Server::start($root, ['prepend' => false, 'name' => 'inst-root']);
+    [$code, $out, $err] = inst_cli($root, 'install.php', ['--url=' . $wrong->base(), '--no-probe']);
+    eq(0, $code, "stdout: $out stderr: $err");
+    $before = (string)file_get_contents($root . '/data/first-key.txt');
+    [$code, $out, $err] = inst_cli($root, 'install.php', ['--rekey'], ['INST_PROBE' => '1']);
+    eq(1, $code, "stdout: $out stderr: $err");
+    contains('can be read through the web', $err);
+    eq($before, (string)file_get_contents($root . '/data/first-key.txt'), 'the key file was not rewritten');
+    inst_no_secrets($out . $err, inst_secrets($root . '/data'), 'the refused re-key output');
+    ok(glob($root . '/data/canary-*') === [], 'no canary left behind');
+    // With --no-probe the owner has been told it is on them.
+    [$code, , $err] = inst_cli($root, 'install.php', ['--rekey', '--no-probe']);
+    eq(0, $code);
+});
+
+test('4.18.2 installer (both, and a re-key): one guard refuses data/ inside public/, inside the server\'s own document root and a served canary, before anything is written', function () {
+    $root = inst_scratch();
+    $data = $root . '/data';
+    $refuse = function (array $opts, string $kind, string $needle) use ($data): void {
+        $e = throws(fn() => Oaiy\Relay\Installer::provision($data, ['public_url' => 'https://relay.example.com'] + $opts), Oaiy\Relay\InstallRefused::class);
+        eq($kind, $e->kind);
+        contains($needle, $e->getMessage());
+        foreach (['config.json', 'first-key.txt', 'admin-token.txt', 'relay.sqlite', '.htaccess', 'secrets'] as $f) {
+            ok(!file_exists($data . '/' . $f), "$f was not written after a $kind refusal");
+        }
+    };
+    $refuse(['publicDir' => $root], 'webroot', 'inside the web root');
+    $refuse(['documentRoot' => $root], 'docroot', 'document root');
+    $refuse(['documentRoot' => dirname($root)], 'docroot', 'document root');
+    $srv = Server::start($root, ['prepend' => false, 'name' => 'inst-root']);
+    $refuse(['probeUrl' => $srv->base()], 'reachable', 'can be read through the web');
+    // guard() alone gives the same answers, and what it does not refuse it reports.
+    $e = throws(fn() => Oaiy\Relay\Installer::guard($data, ['documentRoot' => $root]), Oaiy\Relay\InstallRefused::class);
+    eq('docroot', $e->kind);
+    eq(['notes' => [], 'checked' => false], Oaiy\Relay\Installer::guard($data, ['publicDir' => $root . '/public']), 'no probe asked, nothing to say');
+    $pub = Server::start($root . '/public', ['prepend' => false, 'name' => 'inst-pub']);
+    eq(['notes' => [], 'checked' => true], Oaiy\Relay\Installer::guard($data, ['publicDir' => $root . '/public', 'probeUrl' => $pub->base()]));
+    $dead = Oaiy\Relay\Installer::guard($data, ['probeUrl' => 'http://127.0.0.1:' . Server::freePort()]);
+    eq(false, $dead['checked']);
+    eq(1, count($dead['notes']));
+    contains('not checked', $dead['notes'][0]);
+    // A caller that has already asked the web says so and the web is not asked again (the address below would refuse).
+    Oaiy\Relay\Installer::provision($data, ['public_url' => 'https://relay.example.com', 'probeUrl' => $srv->base(), 'guarded' => true]);
+    ok(is_file($data . '/installed.lock'), 'installed: with guarded the probe is not repeated');
+    // And a re-key: same guard, on an installed relay, at the address the config names.
+    $before = (string)file_get_contents($data . '/first-key.txt');
+    $e = throws(fn() => Oaiy\Relay\Installer::rekey($data, ['documentRoot' => $root]), Oaiy\Relay\InstallRefused::class);
+    eq('docroot', $e->kind);
+    $e = throws(fn() => Oaiy\Relay\Installer::rekey($data, ['probeUrl' => $srv->base()]), Oaiy\Relay\InstallRefused::class);
+    eq('reachable', $e->kind);
+    eq($before, (string)file_get_contents($data . '/first-key.txt'), 'no key was written by a refused re-key');
+    Tmp::after('gc_collect_cycles');
 });
 
 test('4.18.8 installer CLI: call features are off by default and by --yes, on only with --call-features=yes, and a bad value is a usage error', function () {
@@ -493,6 +635,64 @@ test('4.18.8 installer web: refuses when the server\'s own document root contain
     contains('document root', $r['body']);
     ok(!is_file($root . '/data/installed.lock'), 'not installed');
     ok(!is_file($root . '/data/config.json'), 'no config written');
+});
+
+test('4.18.2 installer web: it asks the web at the public address whether data/ can be read, and refuses with nothing written when it can', function () {
+    [$root, $srv] = inst_web();
+    // The public address the owner types is served by a second server whose document root is the relay folder.
+    $wrong = Server::start($root, ['prepend' => false, 'name' => 'inst-root']);
+    $r = inst_post($srv, ['token' => INST_TOKEN, 'public_url' => $wrong->base()]);
+    eq(409, $r['status'], $r['body']);
+    contains('can be read through the web', $r['body']);
+    contains('document root', $r['body']);
+    not_contains($wrong->base(), $r['body'], 'the address is not echoed');
+    foreach (['installed.lock', 'config.json', 'first-key.txt', 'admin-token.txt', 'relay.sqlite', '.htaccess'] as $f) {
+        ok(!file_exists($root . '/data/' . $f), "$f was not written");
+    }
+    ok(is_file($root . '/INSTALL_ENABLED'), 'the flag stays for another try');
+});
+
+test('4.18.2 installer web: an address that serves public/ passes the probe and the page says it was checked; one that cannot be reached, or a skipped check, is said out loud', function () {
+    [$root, $srv] = inst_web();
+    $pub = Server::start($root . '/public', ['prepend' => false, 'name' => 'inst-pub']);
+    $r = inst_post($srv, ['token' => INST_TOKEN, 'public_url' => $pub->base()]);
+    eq(200, $r['status'], $r['body']);
+    contains('Checked:', $r['body']);
+    ok(is_file($root . '/data/installed.lock'), 'installed');
+    foreach (['/data/first-key.txt', '/data/admin-token.txt', '/data/relay.sqlite'] as $p) {
+        eq(404, $pub->request('GET', $p)['status'], $p);
+    }
+    // Unreachable: installed, and the page says the exposure was not checked and how to check it.
+    [$root2, $srv2] = inst_web();
+    $dead = 'http://127.0.0.1:' . Server::freePort();
+    $r = inst_post($srv2, ['token' => INST_TOKEN, 'public_url' => $dead]);
+    eq(200, $r['status'], $r['body']);
+    contains('could not be reached', $r['body']);
+    contains('not checked', $r['body']);
+    contains('bin/doctor.php', $r['body']);
+    not_contains('Checked:', $r['body']);
+    not_contains($dead, $r['body']);
+    // Skipped on purpose: the page says so.
+    [$root3, $srv3] = inst_web();
+    $wrong = Server::start($root3, ['prepend' => false, 'name' => 'inst-root']);
+    $r = inst_post($srv3, ['token' => INST_TOKEN, 'public_url' => $wrong->base(), 'no_probe' => '1']);
+    eq(200, $r['status'], $r['body']);
+    contains('not checked', $r['body']);
+    not_contains('Checked:', $r['body']);
+});
+
+test('4.18.2 installer web: a re-key asks the same question at the address in config.json and writes no key where the web can read it', function () {
+    [$root, $srv] = inst_web();
+    $wrong = Server::start($root, ['prepend' => false, 'name' => 'inst-root']);
+    eq(200, inst_post($srv, ['token' => INST_TOKEN, 'public_url' => $wrong->base(), 'no_probe' => '1'])['status']);
+    $before = (string)file_get_contents($root . '/data/first-key.txt');
+    file_put_contents($root . '/INSTALL_ENABLED', INST_TOKEN . "\n");
+    $r = inst_post($srv, ['mode' => 'rekey', 'token' => INST_TOKEN, 'no_probe' => '0']);
+    eq(409, $r['status'], $r['body']);
+    contains('No key written', $r['body']);
+    contains('can be read through the web', $r['body']);
+    eq($before, (string)file_get_contents($root . '/data/first-key.txt'), 'the key file was not rewritten');
+    ok(is_file($root . '/INSTALL_ENABLED'), 'the flag stays');
 });
 
 test('4.18.8 installer web: mode=rekey needs the flag, the token and an installed relay, writes only a new first key, and names only its path', function () {

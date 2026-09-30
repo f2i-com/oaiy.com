@@ -23,6 +23,7 @@ require dirname(__DIR__) . '/src/autoload.php';
 
 use Oaiy\Relay\Config;
 use Oaiy\Relay\Doctor;
+use Oaiy\Relay\InstallRefused;
 use Oaiy\Relay\Installer;
 use Oaiy\Relay\Paths;
 
@@ -107,6 +108,8 @@ if ($method === 'GET') {
             . '<p class="warn">' . oaiy_web_esc($callText) . '</p>'
             . '<label><input type="checkbox" name="call" value="1"> Enable call features (the default is off)</label>';
     }
+    $form .= '<p>Before it writes a key the installer asks the web, at the relay\'s public address, whether the <code>data</code> folder can be read, and refuses if it can.</p>'
+        . '<label><input type="checkbox" name="no_probe" value="1"> Do not ask (only if this host cannot reach its own address; then run <code>php bin/doctor.php --url=...</code> afterwards)</label>';
     $form .= '<p><button type="submit">' . ($mode === 'rekey' ? 'Write a new key' : 'Install') . '</button></p></form>';
     oaiy_web_page(200, 'OAIY Relay installer', $form);
 }
@@ -120,12 +123,33 @@ if (strlen($owner) < 16 || $given === '' || !hash_equals($owner, $given)) {
     exit;
 }
 
+/** What the exposure check found, for the page that reports success: nothing is left unsaid. @param array{notes:list<string>,checked:bool}|null $guard */
+function oaiy_web_exposure(?array $guard, bool $skipped): string
+{
+    if ($skipped) {
+        return '<p class="warn">You chose not to ask the web whether <code>data</code> can be read, so that was <strong>not checked</strong>. Run <code>php bin/doctor.php --url=...</code> once the site is up.</p>';
+    }
+    $out = '';
+    foreach ($guard['notes'] ?? [] as $note) {
+        $out .= '<p class="warn">' . oaiy_web_esc(ucfirst($note)) . '.</p>';
+    }
+    if (!empty($guard['checked'])) {
+        $out .= '<p>Checked: a file the installer put in <code>data</code> was requested at the relay\'s public address and refused, so <code>data</code> is not readable through the web.</p>';
+    }
+    return $out;
+}
+
 try {
+    // data/ must not be inside the folder the web server serves: public/, or the document root the server itself reports.
+    $doc = isset($_SERVER['DOCUMENT_ROOT']) && is_string($_SERVER['DOCUMENT_ROOT']) ? $_SERVER['DOCUMENT_ROOT'] : '';
+    $noProbe = isset($_POST['no_probe']) && $_POST['no_probe'] === '1';
+    $guard = null;
     if ($mode === 'rekey') {
-        $path = Installer::rekey($data);
+        $path = Installer::rekey($data, ['documentRoot' => $doc, 'probe' => !$noProbe], $guard);
         $removed = @unlink($flag);
         oaiy_web_page(200, 'New key written', '<p>A new desktop enrolment key was written to</p><p><code>' . oaiy_web_esc($path) . '</code></p>'
             . '<p>Open that file in your file manager or over SSH, paste the key into OAIY within an hour, then delete the file.</p>'
+            . oaiy_web_exposure($guard, $noProbe)
             . ($removed ? '' : '<p class="warn">Delete <code>INSTALL_ENABLED</code> yourself: it could not be removed.</p>'));
     }
     $url = isset($_POST['public_url']) && is_string($_POST['public_url']) ? $_POST['public_url'] : '';
@@ -134,20 +158,22 @@ try {
     } catch (\Throwable $e) {
         oaiy_web_page(400, 'Not installed', '<p>The public address must be https, with a host and no path, for example <code>https://relay.example.com</code>.</p>');
     }
-    // data/ must not be inside the folder the web server serves: public/, or the document root the server itself reports.
-    $doc = isset($_SERVER['DOCUMENT_ROOT']) && is_string($_SERVER['DOCUMENT_ROOT']) ? $_SERVER['DOCUMENT_ROOT'] : '';
-    if (Doctor::isInsideLoose($data, Paths::publicDir()) || ($doc !== '' && Doctor::isInsideLoose($data, $doc))) {
-        oaiy_web_page(409, 'Not installed', '<p>The data folder lies inside the folder this web server serves. Set the site\'s document root to the <code>public</code> folder of the relay, so that <code>data</code> is outside it, and try again.</p>');
-    }
     $call = isset($_POST['call']) && $_POST['call'] === '1';
-    $paths = Installer::provision($data, ['public_url' => $publicUrl, 'call_enabled' => $call]);
+    $paths = Installer::provision($data, ['public_url' => $publicUrl, 'call_enabled' => $call, 'documentRoot' => $doc, 'probeUrl' => $noProbe ? null : $publicUrl], $guard);
     $removed = @unlink($flag);
     oaiy_web_page(200, 'OAIY Relay installed', '<p>The relay is installed. Two files hold what you need; open them in your file manager or over SSH:</p><ul>'
         . '<li>the first desktop enrolment key: <code>' . oaiy_web_esc($paths['firstKey']) . '</code> (paste it into OAIY, Connections, Remote access, within an hour, then delete the file)</li>'
         . '<li>the admin token: <code>' . oaiy_web_esc($paths['adminToken']) . '</code> (for the status page and the doctor; keep it safe and delete this copy)</li></ul>'
         . '<p>Call features are <strong>' . ($call ? 'on' : 'off') . '</strong>.</p>'
+        . oaiy_web_exposure($guard, $noProbe)
         . ($removed ? '' : '<p class="warn">Delete <code>INSTALL_ENABLED</code> yourself: it could not be removed.</p>')
         . '<p>Then run <code>php bin/doctor.php</code> if you have a shell.</p>');
+} catch (InstallRefused $e) {
+    // Nothing was written. The message names what to fix; it holds no secret.
+    $more = $e->kind === 'reachable'
+        ? '<p>A file the installer put in <code>data</code> could be fetched at your public address, so a key written there would be readable by anyone. Set the site\'s document root to the <code>public</code> folder of the relay, so that <code>data</code> is outside it, and try again.</p>'
+        : '<p>Set the site\'s document root to the <code>public</code> folder of the relay, so that <code>data</code> is outside it, and try again.</p>';
+    oaiy_web_page(409, $mode === 'rekey' ? 'No key written' : 'Not installed', '<p>' . oaiy_web_esc(ucfirst(Doctor::safe($e->getMessage()))) . '.</p>' . $more);
 } catch (\Throwable $e) {
     oaiy_web_page(500, 'Not finished', '<p>The installer stopped: ' . oaiy_web_esc(Doctor::safe($e->getMessage())) . '</p>');
 }

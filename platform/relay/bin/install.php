@@ -8,15 +8,18 @@ if (PHP_SAPI !== 'cli') {
 /**
  * php bin/install.php --url=https://relay.example.com [--call-features=yes|no] [--yes]
  *                     [--db=sqlite|mysql --dsn=DSN --db-user=USER --db-pass-file=PATH]
- *                     [--probe-url=URL] [--rekey]
+ *                     [--probe-url=URL | --no-probe] [--rekey]
  *
  * Installs the relay into data/ (or OAIY_RELAY_DATA). It writes the relay key, the admission secret, the admin token and
  * the first desktop enrolment key into FILES with mode 0600 and prints only the paths of the two files the owner needs
  * (data/first-key.txt and data/admin-token.txt): read them in the file manager or over SSH, paste the key into OAIY, and
  * delete both. No secret is ever printed, to stdout or to stderr, including on an error.
  *
- * It refuses when data/ lies inside public/, when --probe-url shows a canary in data/ being served, and when the relay
- * is already installed. --rekey writes a new first key (after a lost one) and changes nothing else.
+ * It refuses when data/ lies inside public/, when a canary file put in data/ is served over the web, and when the relay is
+ * already installed. The canary is requested at the --url address unless --probe-url names another one (a host whose own
+ * address is not reachable from itself yet) or --no-probe skips it; an address that cannot be reached is a note that says
+ * the exposure was not checked, never a silent pass. --rekey writes a new first key (after a lost one) through the same
+ * checks and changes nothing else.
  *
  * Exit codes: 0 done, 1 refused or failed, 2 usage.
  */
@@ -25,6 +28,7 @@ require dirname(__DIR__) . '/src/autoload.php';
 
 use Oaiy\Relay\Config;
 use Oaiy\Relay\Doctor;
+use Oaiy\Relay\InstallRefused;
 use Oaiy\Relay\Installer;
 use Oaiy\Relay\Paths;
 
@@ -34,7 +38,7 @@ function oaiy_install_usage(): string
 {
     return "usage: php bin/install.php --url=https://relay.example.com [--call-features=yes|no] [--yes]\n"
         . "                           [--db=sqlite|mysql --dsn=DSN --db-user=USER --db-pass-file=PATH]\n"
-        . "                           [--probe-url=URL] [--rekey]\n";
+        . "                           [--probe-url=URL | --no-probe] [--rekey]\n";
 }
 
 /** The answer to the call-features question: only "y" or "yes" (any case) is a yes. */
@@ -49,7 +53,7 @@ function oaiy_install_yes(string $line): bool
  */
 function oaiy_install_args(array $argv)
 {
-    $o = ['url' => null, 'call' => null, 'yes' => false, 'db' => 'sqlite', 'dsn' => null, 'dbUser' => null, 'dbPassFile' => null, 'probe' => null, 'rekey' => false];
+    $o = ['url' => null, 'call' => null, 'yes' => false, 'db' => 'sqlite', 'dsn' => null, 'dbUser' => null, 'dbPassFile' => null, 'probe' => null, 'noProbe' => false, 'rekey' => false];
     foreach (array_slice($argv, 1) as $arg) {
         if (strpos($arg, '--url=') === 0) {
             $o['url'] = substr($arg, 6);
@@ -74,11 +78,16 @@ function oaiy_install_args(array $argv)
             $o['dbPassFile'] = substr($arg, 15);
         } elseif (strpos($arg, '--probe-url=') === 0) {
             $o['probe'] = substr($arg, 12);
+        } elseif ($arg === '--no-probe') {
+            $o['noProbe'] = true;
         } elseif ($arg === '--rekey') {
             $o['rekey'] = true;
         } else {
             return 'unknown argument';
         }
+    }
+    if ($o['noProbe'] && $o['probe'] !== null) {
+        return '--probe-url and --no-probe do not go together';
     }
     if (!$o['rekey'] && ($o['url'] === null || $o['url'] === '')) {
         return '--url is required';
@@ -122,11 +131,15 @@ function oaiy_install_main(array $argv): int
     $data = Paths::dataDir();
 
     if ($o['rekey']) {
+        $guard = null;
         try {
-            $path = Installer::rekey($data);
+            $path = Installer::rekey($data, ['probe' => !$o['noProbe'], 'probeUrl' => ($o['probe'] !== null && $o['probe'] !== '') ? (string)$o['probe'] : null], $guard);
         } catch (\Throwable $e) {
             oaiy_install_err('re-key refused: ' . Doctor::safe($e->getMessage()) . "\n");
             return 1;
+        }
+        foreach ($guard['notes'] ?? [] as $note) {
+            oaiy_install_err('note: ' . $note . "\n");
         }
         oaiy_install_out("A new desktop enrolment key was written to:\n  " . $path . "\nOpen it, paste the key into OAIY (Connections, Remote access) within an hour, then delete the file.\n");
         return 0;
@@ -142,20 +155,20 @@ function oaiy_install_main(array $argv): int
         oaiy_install_err("install refused: this relay is already installed (use --rekey to write a new first key)\n");
         return 1;
     }
-    // Refuse before writing anything when data/ is served: inside public/.
-    if (Doctor::isInsideLoose($data, Paths::publicDir())) {
-        oaiy_install_err("install refused: the data folder is inside the web root (public/); move the relay so that only public/ is served\n");
+    // Refuse before asking anything or writing anything when data/ can be read over the web: the one guard both installers
+    // and the re-key share (inside public/, or a canary in data/ served at the relay's address or at --probe-url).
+    $probeUrl = $o['noProbe'] ? null : (($o['probe'] !== null && $o['probe'] !== '') ? (string)$o['probe'] : $publicUrl);
+    try {
+        $guard = Installer::guard($data, ['probeUrl' => $probeUrl]);
+    } catch (InstallRefused $e) {
+        oaiy_install_err('install refused: ' . Doctor::safe($e->getMessage()) . "\n");
         return 1;
     }
-    if ($o['probe'] !== null && $o['probe'] !== '') {
-        $reach = Installer::canaryReachable($data, (string)$o['probe']);
-        if ($reach === true) {
-            oaiy_install_err("install refused: the data folder can be read through the web at the --probe-url; fix the document root first\n");
-            return 1;
-        }
-        if ($reach === null) {
-            oaiy_install_err("note: the --probe-url could not be reached, so the exposure of data/ was not checked; run php bin/doctor.php --url=... once the web server is set up\n");
-        }
+    foreach ($guard['notes'] as $note) {
+        oaiy_install_err('note: ' . $note . "\n");
+    }
+    if ($probeUrl === null) {
+        oaiy_install_err("note: --no-probe: whether data/ can be read through the web was not checked; run php bin/doctor.php --url=" . $publicUrl . " once the web server is set up\n");
     }
 
     $call = $o['call'];
@@ -180,7 +193,10 @@ function oaiy_install_main(array $argv): int
     }
 
     try {
-        $paths = Installer::provision($data, ['public_url' => $publicUrl, 'call_enabled' => (bool)$call, 'db' => $db]);
+        $paths = Installer::provision($data, ['public_url' => $publicUrl, 'call_enabled' => (bool)$call, 'db' => $db, 'guarded' => true]);
+    } catch (InstallRefused $e) {
+        oaiy_install_err('install refused: ' . Doctor::safe($e->getMessage()) . "\n");
+        return 1;
     } catch (\Throwable $e) {
         oaiy_install_err('install failed: ' . Doctor::safe($e->getMessage()) . "\n");
         return 1;
@@ -188,6 +204,9 @@ function oaiy_install_main(array $argv): int
 
     oaiy_install_out("OAIY Relay installed.\n");
     oaiy_install_out('  data folder    ' . $paths['data'] . "\n");
+    if ($guard['checked']) {
+        oaiy_install_out("  exposure       data/ is not readable through the web (a canary file was requested and refused)\n");
+    }
     oaiy_install_out('  first key      ' . $paths['firstKey'] . "  (open it, paste the key into OAIY: Connections, Remote access, within an hour; then delete the file)\n");
     oaiy_install_out('  admin token    ' . $paths['adminToken'] . "  (the status page and the doctor use it; keep it somewhere safe and delete this copy)\n");
     oaiy_install_out('  call features  ' . ($call ? 'ON: whoever administers this host can read call captions and act as your phone on call control' : 'off') . "\n");

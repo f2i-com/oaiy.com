@@ -70,8 +70,14 @@ A lost first key is re-armed, never re-issued over the network: create `INSTALL_
 
 - It never prints or sends a token, key or secret: not to the screen, not in an HTTP response or header, not in an error.
   It writes them to files (mode 0600, `data/` mode 0700) and names the files.
-- It refuses to run when `data/` is inside `public/`, when the web server's own document root contains `data/`, and (with
-  `--probe-url=URL`) when a canary file it puts in `data/` can be fetched through that URL. It refuses a second run.
+- It refuses to write a secret where the web can read it, and it decides that in one place for the command line installer, the
+  web installer and a re-key alike: `data/` inside `public/`, `data/` inside the document root the web server itself reports
+  (the web installer knows it), or a canary file put in `data/` that is served over the web. **The canary probe is on by
+  default**: the command line asks at the `--url` address (or at `--probe-url` if you name another), the web installer at the
+  public address you type, a re-key at the address in `config.json`. Refusal happens before any question is asked and before
+  anything is written, so a document root that is the relay folder leaves no key behind. An address that cannot be reached is
+  never a silent pass: the installer says the exposure of `data/` was **not checked** and to run the doctor once the site is up.
+  `--no-probe` (and the web form's "do not ask" box) skips the probe on purpose, and says so. It refuses a second run.
 - The web installer works only while `INSTALL_ENABLED` exists and the relay is not installed; a wrong or missing token is a
   bare 403 after a 250 ms delay; every other request is a bare 404.
 - The call-features question (default **no**) is asked on a terminal, or set with `--call-features=yes|no`, or by the checkbox
@@ -80,8 +86,8 @@ A lost first key is re-armed, never re-issued over the network: create `INSTALL_
 
 `bin/install.php` options: `--url=` (required, `https://host`, no path), `--call-features=yes|no`, `--yes` (never ask),
 `--db=sqlite|mysql`, `--dsn=`, `--db-user=`, `--db-pass-file=PATH` (the password comes from a file, never the command line),
-`--probe-url=URL`, `--rekey`. Set `OAIY_RELAY_DATA` to keep `data/` elsewhere (the command line only). Exit codes: 0 done,
-1 refused or failed, 2 usage.
+`--probe-url=URL` or `--no-probe`, `--rekey`. Set `OAIY_RELAY_DATA` to keep `data/` elsewhere (the command line only). Exit codes:
+0 done, 1 refused or failed, 2 usage.
 
 ## Installing on a VPS
 
