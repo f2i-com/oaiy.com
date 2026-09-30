@@ -385,14 +385,22 @@
       "id": "agent-desk-meta",
       "class": "runs",
       "tick": "agentData",
-      "paths": ["opfs/front-desk/project.json", "opfs/front-desk/chat.json"],
-      "what": "The front desk's own record and its conversation",
+      "paths": ["opfs/front-desk/project.json"],
+      "what": "The front desk's own record",
+      "reason": "The front desk is a project like the others: its record names it."
+    },
+    {
+      "id": "agent-desk-chat",
+      "class": "runs",
+      "tick": "conversations",
+      "paths": ["opfs/front-desk/chat.json"],
+      "what": "The front desk's own conversation",
       "reason": "A conversation is loaded as what was said before, and the Agent goes on from it."
     },
     {
       "id": "agent-desk-sessions",
       "class": "runs",
-      "tick": "agentData",
+      "tick": "conversations",
       "paths": ["opfs/front-desk/sessions/**"],
       "what": "The phone's conversations (each call and text thread)",
       "reason": "A conversation is loaded as what was said before, and the Agent goes on from it.",

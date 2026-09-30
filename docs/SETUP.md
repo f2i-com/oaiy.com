@@ -96,6 +96,6 @@ tick them again when you restore. A restore is default-deny: only what carries n
 nothing (opening hours, the time of each appointment, numbers not to be contacted) comes back on
 its own. Everything a model reads or that is said to callers or sent to anyone (the calendar's
 words, service templates, flows, triggers, AI providers, settings, the phone plugin's settings,
-what is remembered about people, voices, the Agent's brief, knowledge, conversations and
+what is remembered about people, earlier conversations, voices, the Agent's brief, knowledge and
 projects, outreach campaigns) is listed by name and value and comes back only for the kinds you
 tick, and anything OAIY does not recognise is not restored at all. See [BACKUP.md](BACKUP.md).

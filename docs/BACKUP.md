@@ -120,7 +120,7 @@ A path is matched without regard to case. The first row that matches counts; a p
 | `desktop-config.json` | excluded | Never | This computer's start-up pointer: Where this computer's data folder is, its extra model folders and its Hugging Face token: they belong to this computer. To do again: Choose your model folders again and enter your Hugging Face token if you use one. |
 | `relay-log.jsonl, relay-reads.jsonl` | excluded | Never | The audit log of relayed commands: The record this computer keeps of what a website or app asked its plugins to do: an audit trail of this computer, which starts again. |
 | `restore/**, backup/**` | excluded | Never | The backup's and restore's own working folders. |
-| `callers.json` | runs | Only with the tick "Contacts and what is remembered about people" | Contacts and what is remembered about callers: The receptionist and the Agent read these facts and notes about a person before they answer them ("the person's notes for the receptionist"), so they are read as instructions: a file that was not made by you could steer what they say. |
+| `callers.json` | runs | Only with the tick "Contacts and notes your receptionist reads" | Contacts and what is remembered about callers: The receptionist and the Agent read these facts and notes about a person before they answer them ("the person's notes for the receptionist"), so they are read as instructions: a file that was not made by you could steer what they say. |
 | `calendar/calendar.json` | runs | Key by key (see the table of its keys) | The calendar, key by key (see the calendar table): The receptionist reads the business's name, the services and a caller's appointments before it answers, and says them to callers; the Agent reads each appointment's name and notes. Those words need the tick. Opening hours and an appointment's time, length and state are typed values that carry no words and come back without one. The sync with FormLogic is never restored. |
 | `triggers.json` | runs | Only with the tick "Flows, triggers and run history" | Triggers: which event starts which flow: A trigger starts a flow whenever its event happens. |
 | `flows/**` | runs | Only with the tick "Flows, triggers and run history" | Flows: A flow runs when it is triggered and can call your AI providers, send messages and run scripts. |
@@ -145,20 +145,21 @@ These are names inside the archive the Agent's page makes of its browser storage
 | Name | Class | Comes back | What it is, why, and what to do again |
 |---|---|---|---|
 | `idb/settings.json` | runs | Key by key (see the table of its keys) | The Agent's settings, key by key (see the Agent settings table): Only the keys listed in the Agent settings table come back. Every one of them is read by the Agent or by a call (where requests go, what is answered and how, how numbers are read), so every one needs the tick. |
-| `opfs/front-desk/files/brief.md` | runs | Only with the tick "The Agent's projects, conversations, brief and knowledge files" | The front desk's brief: Every call, text and task reads the brief before each reply, and it wins over what the phone's agents would otherwise say: it is read as instructions. |
-| `opfs/front-desk/files/knowledge/**` | runs | Only with the tick "The Agent's projects, conversations, brief and knowledge files" | The front desk's knowledge files: The phone's agents read these files to answer callers: they are read as instructions and facts. |
-| `opfs/front-desk/files/**` | runs | Only with the tick "The Agent's projects, conversations, brief and knowledge files" | The other files the Agent keeps at the front desk (outreach results and the like): Files the Agent reads and writes: it can be told what to do by what they say. |
-| `opfs/front-desk/project.json, opfs/front-desk/chat.json` | runs | Only with the tick "The Agent's projects, conversations, brief and knowledge files" | The front desk's own record and its conversation: A conversation is loaded as what was said before, and the Agent goes on from it. |
-| `opfs/front-desk/sessions/**` | runs | Only with the tick "The Agent's projects, conversations, brief and knowledge files" | The phone's conversations (each call and text thread): A conversation is loaded as what was said before, and the Agent goes on from it. |
-| `opfs/front-desk/callers.json, opfs/front-desk/contacts-moved.json` | runs | Only with the tick "Contacts and what is remembered about people" | What the phone's agents remember about people: The receptionist and the Agent read these facts and notes about a person before they answer them: they are read as instructions. |
+| `opfs/front-desk/files/brief.md` | runs | Only with the tick "The Agent's projects, brief and knowledge files" | The front desk's brief: Every call, text and task reads the brief before each reply, and it wins over what the phone's agents would otherwise say: it is read as instructions. |
+| `opfs/front-desk/files/knowledge/**` | runs | Only with the tick "The Agent's projects, brief and knowledge files" | The front desk's knowledge files: The phone's agents read these files to answer callers: they are read as instructions and facts. |
+| `opfs/front-desk/files/**` | runs | Only with the tick "The Agent's projects, brief and knowledge files" | The other files the Agent keeps at the front desk (outreach results and the like): Files the Agent reads and writes: it can be told what to do by what they say. |
+| `opfs/front-desk/project.json` | runs | Only with the tick "The Agent's projects, brief and knowledge files" | The front desk's own record: The front desk is a project like the others: its record names it. |
+| `opfs/front-desk/chat.json` | runs | Only with the tick "Earlier conversations (calls and texts)" | The front desk's own conversation: A conversation is loaded as what was said before, and the Agent goes on from it. |
+| `opfs/front-desk/sessions/**` | runs | Only with the tick "Earlier conversations (calls and texts)" | The phone's conversations (each call and text thread): A conversation is loaded as what was said before, and the Agent goes on from it. |
+| `opfs/front-desk/callers.json, opfs/front-desk/contacts-moved.json` | runs | Only with the tick "Contacts and notes your receptionist reads" | What the phone's agents remember about people: The receptionist and the Agent read these facts and notes about a person before they answer them: they are read as instructions. |
 | `opfs/front-desk/callbacks.json` | excluded | Never | Missed calls waiting to be rung back: A missed call is rung back only within 24 hours of it, so a list from a backup is stale, and restoring one would ring numbers on your phone. |
 | `opfs/front-desk/outreach/do-not-contact.json` | data | Yes, without a tick; added to yours, none of yours is ever taken away | Numbers not to be called or texted again: It can only stop contact: the numbers in the backup are added to yours and none of yours is ever taken away. |
 | `opfs/front-desk/outreach/index.json` | runs | Only with the tick "Outreach campaigns (texts and calls to a list of people)"; the list of campaigns, without one that is running | The list of outreach campaigns: It names the campaigns that the outreach engine loads. |
 | `opfs/front-desk/outreach/*.json` | runs | Key by key (see the table of its keys); as a paused campaign, never running | Outreach campaigns (texts or calls to a list of people): A campaign texts or calls people. It comes back PAUSED, never running and never scheduled: you start it yourself. |
 | `opfs/*/.backup-*/**` | excluded | Never | Copies of conversations the Agent made before it changed them: A safety copy the Agent made on that computer before it regrouped its conversations; its callbacks are stale and the rest is in the conversations themselves. |
-| `opfs/projects/*/project.json, opfs/projects/*/chat.json` | runs | Only with the tick "The Agent's projects, conversations, brief and knowledge files" | A project's record and its conversation: A conversation is loaded as what was said before, and the Agent goes on from it. |
-| `opfs/projects/*/files/**` | runs | Only with the tick "The Agent's projects, conversations, brief and knowledge files" | A project's files: Files of a project: pages and programs that the preview runs, and text the Agent reads and is told what to do by. |
-| `opfs/projects/*/sessions/**` | runs | Only with the tick "The Agent's projects, conversations, brief and knowledge files" | A project's other conversations: A conversation is loaded as what was said before, and the Agent goes on from it. |
+| `opfs/projects/*/project.json, opfs/projects/*/chat.json` | runs | Only with the tick "The Agent's projects, brief and knowledge files" | A project's record and its conversation: A conversation is loaded as what was said before, and the Agent goes on from it. |
+| `opfs/projects/*/files/**` | runs | Only with the tick "The Agent's projects, brief and knowledge files" | A project's files: Files of a project: pages and programs that the preview runs, and text the Agent reads and is told what to do by. |
+| `opfs/projects/*/sessions/**` | runs | Only with the tick "The Agent's projects, brief and knowledge files" | A project's other conversations: A conversation is loaded as what was said before, and the Agent goes on from it. |
 
 #### Keys of `opfs/front-desk/outreach/<id>.json` (agent.campaign)
 
@@ -489,10 +490,14 @@ backup waits (the reasons are the update's, plus a backup already being made).
 
 ### What comes back by default, and what needs your tick
 
-**Only data comes back without a tick**: the class *data* of the table above (numbers not to be
-contacted, which are only ever added to yours). The Agent's change log and the events that could
-not be delivered are not restored at all: the first is an audit trail and the second is sent
-again by a button. A restore adds and replaces these, and deletes nothing.
+**Only data comes back without a tick**: the class *data* of the table above, which is what
+carries no words and that no code turns into behaviour (the audit below finds eleven typed values
+of the calendar: the opening hours, the step between times, and the time, length and state of
+each appointment; and the numbers not to be contacted, which are only ever added to yours). It
+does not replace what you have that carries words: an appointment of yours is kept exactly as it
+is, and the calendar's business name, services, and each appointment's name, number and notes come
+only with the calendar tick. The Agent's change log and the events that could not be delivered are
+not restored at all: the first is an audit trail and the second is sent again by a button.
 
 **Everything that can act needs a tick.** A backup file is protected by its passphrase, but
 nothing proves who made it, and a restore is not always of a file you made yourself (a shared
@@ -513,10 +518,11 @@ yours to tick or not.
 | Plugin settings | Some keys of plugin-data/aokie/settings.json | The settings of a plugin. PINs, keys and values sealed to another computer are never in them. |
 | The Agent's own settings (its providers, network gate, and how it answers calls and texts) | Some keys of idb/settings.json | Which servers the Agent talks to, whether its network gate is open, whether it answers calls and texts by itself, and the instructions it answers them by. A provider at another address arrives without a key, beside yours. |
 | Voices your callers hear | Voices | A voice is what your callers hear. A sample or a setting from a file that was not made by you would speak to them in your name. |
-| Contacts and what is remembered about people | Contacts and what is remembered about callers; What the phone's agents remember about people | The receptionist and the Agent read what is remembered about a person, and the notes for the receptionist, before they answer them. It is read as instructions, so a file that was not made by you could steer what they say. |
+| Contacts and notes your receptionist reads | Contacts and what is remembered about callers; What the phone's agents remember about people | The receptionist and the Agent read what is remembered about a person, and the notes for the receptionist, before they answer them. It is read as instructions, so a file that was not made by you could steer what they say. |
 | Calendar text your receptionist reads | Some keys of calendar/calendar.json | The receptionist reads the business's name, the services (their names, prices and descriptions) and, for a caller, their appointments before it answers, says them to callers, and the Agent reads each appointment's name and notes. Opening hours, the length of a step and an appointment's time, length and state are brought back without a tick. An appointment that comes back without the tick has only its time: no name, number, service or notes. |
+| Earlier conversations (calls and texts) | The front desk's own conversation; The phone's conversations (each call and text thread) | Every call and text thread is loaded into the model as what was said before, and the earlier_conversations tool hands what was said in earlier calls and texts back to it, so a conversation from a file that was not made by you could steer what the receptionist says next. Each is listed by size. |
 | Outreach campaigns (texts and calls to a list of people) | The list of outreach campaigns; Some keys of opfs/front-desk/outreach/<id>.json | A campaign texts or calls the people on its list. A restored campaign is always PAUSED: it is never running and nothing is scheduled. It is listed by name with the number of people, and you start each one yourself. |
-| The Agent's projects, conversations, brief and knowledge files | The front desk's brief; The front desk's knowledge files; The other files the Agent keeps at the front desk (outreach results and the like); The front desk's own record and its conversation; The phone's conversations (each call and text thread); A project's record and its conversation; A project's files; A project's other conversations | The Agent reads its projects, conversations, the front desk's brief and its knowledge files as context and instructions: the brief wins over what the phone's agents would otherwise say. Each project and file is listed by name and size. |
+| The Agent's projects, brief and knowledge files | The front desk's brief; The front desk's knowledge files; The other files the Agent keeps at the front desk (outreach results and the like); The front desk's own record; A project's record and its conversation; A project's files; A project's other conversations | The Agent reads its projects (their files and their own conversations), the front desk's brief and its knowledge files as context and instructions: the brief wins over what the phone's agents would otherwise say. Each project and file is listed by name and size. |
 
 <!-- END GENERATED: tick-kinds -->
 
@@ -664,9 +670,10 @@ in parts through internal routes with a secret made for that one backup.
   page then adds the ones that are not already on your list, person by person, in constant time
   each: a list of a hundred thousand is a moment's work for it, where comparing each number with
   the whole list took 40 seconds for 8,000, in a page that opens nothing until it is done.
-  **Agent data** (projects, conversations, the brief and knowledge files) and
-  **Memory** (what the phone's agents remember about people, which they read as instructions) and
-  **Outreach** each need their own tick.
+  **Agent data** (projects, the brief and knowledge files), **Earlier conversations** (the phone's
+  call and text threads, which the receptionist loads as what was said before), **Memory** (what
+  the phone's agents remember about people, which they read as instructions) and **Outreach**
+  each need their own tick.
 - **Campaigns never come back running.** With Outreach ticked, a campaign is rebuilt from the keys
   the table lets through and comes back **paused**, with nothing scheduled: you start it yourself,
   with Resume on its card (the Agent cannot start one that came from a backup: it is told to ask
@@ -745,11 +752,15 @@ in parts through internal routes with a secret made for that one backup.
 - **Only restore a backup you made yourself, and look at the dry run.** A backup is protected by
   its passphrase, but nothing proves who made it: anyone can make a valid `.oaiybackup` with a
   passphrase of their own. A restore refuses anything a backup should never hold (credentials,
-  programs, names that leave the folder, names that hide behind an NTFS short name), and what could
-  run or reconfigure things (templates, flows, triggers, providers, settings) comes back only when
-  you tick it, after it has been listed by name. A file made by mistake or by someone else cannot
-  start a program, point a key at another server, change what the Agent may do, or overwrite what
-  you did not tick.
+  programs, names that leave the folder, names that hide behind an NTFS short name), and anything
+  a model reads, that is spoken or sent to someone, that chooses where something is sent, that
+  changes how calls are handled, or that acts when you press a button (templates, flows, triggers,
+  providers, settings, the phone plugin's settings, the calendar's words, contacts and notes,
+  conversations, the brief and knowledge, campaigns, voices) comes back only when you tick its
+  kind, after it has been listed by name and value. A file made by mistake or by someone else
+  cannot start a program, point a key at another server, change what the Agent may do, put words
+  in front of a model, or overwrite what you have that carries words; the little that comes back
+  without a tick is typed, carries no words, and is listed with what reads it in the audit above.
 - The passphrase travels only as an argument of the dashboard's own commands, and is wiped from
   memory when the command is done with it. Only the dashboard's window (`main`) can make a backup
   or restore one; the Agent's page and the flow editor cannot, and the HTTP interface cannot: it

@@ -1395,7 +1395,7 @@ export interface RestoreCategory {
  * The kinds of thing in a backup that can run programs, send messages, point OAIY at another
  * server or change what OAIY and the Agent may do. Each is brought back only when it is ticked.
  */
-export type RestoreClassId = 'settings' | 'templates' | 'flows' | 'providers' | 'connections' | 'plugins' | 'agentSettings' | 'voices' | 'memory' | 'calendar' | 'outreach' | 'agentData';
+export type RestoreClassId = 'settings' | 'templates' | 'flows' | 'providers' | 'connections' | 'plugins' | 'agentSettings' | 'voices' | 'memory' | 'calendar' | 'conversations' | 'outreach' | 'agentData';
 
 /** One such kind, and how many items of it the backup holds. */
 export interface RestoreClass {
@@ -1484,6 +1484,8 @@ export interface BackupStatus {
     agentStorage: boolean;
     /** The kinds of item the person ticked (ids), for a restore. */
     classes: string[];
+    /** The same, in the words the desktop calls them by (the labels of the kinds the dry run listed). */
+    classLabels?: string[];
   };
   /** How the last restore (or undo) went, reported at the start that applied it (or refused to). */
   lastRestore: null | {

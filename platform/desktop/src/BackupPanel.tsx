@@ -65,22 +65,6 @@ export function agoWords(iso: string, now: Date | number = new Date()): string {
   return `${Math.floor(hours / 24)} days ago`;
 }
 
-/** The kinds of item a restore can bring back on request, by the words the person reads. */
-const CLASS_LABELS: Record<string, string> = {
-  settings: 'Settings that decide what OAIY may do',
-  templates: 'Service templates and what starts with OAIY',
-  flows: 'Flows, triggers and runs',
-  providers: 'AI providers',
-  connections: 'Connections',
-  plugins: 'Plugin data',
-  agentSettings: 'The Agent’s settings',
-  voices: 'Voices your callers hear',
-  memory: 'What is remembered about people',
-  calendar: 'Calendar text your receptionist reads',
-  outreach: 'Outreach campaigns',
-  agentData: 'The Agent’s projects, conversations, brief and knowledge',
-};
-
 /** The number of characters as a person counts them (an emoji is one, not two). */
 const length = (text: string): number => Array.from(text).length;
 
@@ -242,7 +226,7 @@ type PendingRestore = NonNullable<BackupStatus['pendingRestore']>;
  * A restore or undo the desktop has just made ready, as the pending banner reads it (until the
  * desktop's own status says it). A prepared restore is thrown away after a day.
  */
-function stagedNow(staged: StagedRestore, classes: string[] = []): PendingRestore {
+function stagedNow(staged: StagedRestore, classes: string[] = [], classLabels: string[] = classes): PendingRestore {
   const now = Date.now();
   return {
     id: staged.id,
@@ -253,6 +237,7 @@ function stagedNow(staged: StagedRestore, classes: string[] = []): PendingRestor
     files: staged.files,
     agentStorage: staged.agentStorage,
     classes,
+    classLabels,
   };
 }
 
@@ -394,7 +379,7 @@ export function BackupSection() {
         RESTORE_TIMEOUT_MS,
         'That took too long: the restore was not prepared, try again.',
       );
-      staged = stagedNow(made, classes);
+      staged = stagedNow(made, classes, preview.classes.filter((c) => ticked.includes(c.id)).map((c) => c.label));
       if (mounted.current) {
         setPreview(null);
         setTicked([]);
@@ -521,7 +506,7 @@ export function BackupSection() {
           {pending.kind !== 'undo' && (
             <p style={{ margin: '6px 0 0' }}>
               {(pending.classes ?? []).length > 0
-                ? `You ticked: ${(pending.classes ?? []).map((id) => CLASS_LABELS[id] ?? id).join(', ')}.`
+                ? `You ticked: ${(pending.classLabels ?? pending.classes ?? []).join(', ')}.`
                 : 'Only your data is brought back: nothing that can run or change settings was ticked.'}
             </p>
           )}

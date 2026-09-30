@@ -42,6 +42,9 @@ pub enum RestoreClass {
     /// The calendar's words: the business's name, the services and the appointments' names and notes, which the receptionist
     /// reads before it answers and says to callers.
     Calendar,
+    /// The phone's earlier conversations (each call and text thread): loaded into a model as what was said before, and
+    /// handed back to it by the earlier_conversations tool.
+    Conversations,
     /// Outreach campaigns: texts and calls to a list of people. They come back paused.
     Outreach,
     /// The Agent's projects, conversations, brief and knowledge files: read by the Agent as its context
@@ -50,7 +53,7 @@ pub enum RestoreClass {
 }
 
 impl RestoreClass {
-    pub const ALL: [RestoreClass; 12] = [
+    pub const ALL: [RestoreClass; 13] = [
         RestoreClass::Settings,
         RestoreClass::Templates,
         RestoreClass::Flows,
@@ -61,6 +64,7 @@ impl RestoreClass {
         RestoreClass::Voices,
         RestoreClass::Memory,
         RestoreClass::Calendar,
+        RestoreClass::Conversations,
         RestoreClass::Outreach,
         RestoreClass::AgentData,
     ];
@@ -77,6 +81,7 @@ impl RestoreClass {
             RestoreClass::Voices => "voices",
             RestoreClass::Memory => "memory",
             RestoreClass::Calendar => "calendar",
+            RestoreClass::Conversations => "conversations",
             RestoreClass::Outreach => "outreach",
             RestoreClass::AgentData => "agentData",
         }
@@ -96,10 +101,11 @@ impl RestoreClass {
             RestoreClass::Plugins => "Plugin settings",
             RestoreClass::AgentSettings => "The Agent's own settings (its providers, network gate, and how it answers calls and texts)",
             RestoreClass::Voices => "Voices your callers hear",
-            RestoreClass::Memory => "Contacts and what is remembered about people",
+            RestoreClass::Memory => "Contacts and notes your receptionist reads",
             RestoreClass::Calendar => "Calendar text your receptionist reads",
+            RestoreClass::Conversations => "Earlier conversations (calls and texts)",
             RestoreClass::Outreach => "Outreach campaigns (texts and calls to a list of people)",
-            RestoreClass::AgentData => "The Agent's projects, conversations, brief and knowledge files",
+            RestoreClass::AgentData => "The Agent's projects, brief and knowledge files",
         }
     }
 
@@ -115,8 +121,9 @@ impl RestoreClass {
             RestoreClass::Voices => "A voice is what your callers hear. A sample or a setting from a file that was not made by you would speak to them in your name.",
             RestoreClass::Memory => "The receptionist and the Agent read what is remembered about a person, and the notes for the receptionist, before they answer them. It is read as instructions, so a file that was not made by you could steer what they say.",
             RestoreClass::Calendar => "The receptionist reads the business's name, the services (their names, prices and descriptions) and, for a caller, their appointments before it answers, says them to callers, and the Agent reads each appointment's name and notes. Opening hours, the length of a step and an appointment's time, length and state are brought back without a tick. An appointment that comes back without the tick has only its time: no name, number, service or notes.",
+            RestoreClass::Conversations => "Every call and text thread is loaded into the model as what was said before, and the earlier_conversations tool hands what was said in earlier calls and texts back to it, so a conversation from a file that was not made by you could steer what the receptionist says next. Each is listed by size.",
             RestoreClass::Outreach => "A campaign texts or calls the people on its list. A restored campaign is always PAUSED: it is never running and nothing is scheduled. It is listed by name with the number of people, and you start each one yourself.",
-            RestoreClass::AgentData => "The Agent reads its projects, conversations, the front desk's brief and its knowledge files as context and instructions: the brief wins over what the phone's agents would otherwise say. Each project and file is listed by name and size.",
+            RestoreClass::AgentData => "The Agent reads its projects (their files and their own conversations), the front desk's brief and its knowledge files as context and instructions: the brief wins over what the phone's agents would otherwise say. Each project and file is listed by name and size.",
         }
     }
 }

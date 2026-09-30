@@ -151,6 +151,8 @@ pub struct PendingInfo {
     pub agent_storage: bool,
     /// The classes that were ticked.
     pub classes: Vec<String>,
+    /// The same, as the person reads them (the words of [`RestoreClass::label`]).
+    pub class_labels: Vec<String>,
 }
 
 /// How the last restore or undo went (camelCase).
@@ -1656,6 +1658,7 @@ pub fn pending_info(data_dir: &Path) -> Option<PendingInfo> {
         staged_at: marker.staged_at,
         files: (marker.files.len() + marker.removals.len()) as u64,
         agent_storage: marker.agent.is_some(),
+        class_labels: marker.ticked.iter().map(|id| RestoreClass::from_id(id).map(|c| c.label().to_string()).unwrap_or_else(|| id.clone())).collect(),
         classes: marker.ticked,
     })
 }

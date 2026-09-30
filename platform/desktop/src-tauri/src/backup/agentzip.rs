@@ -532,10 +532,9 @@ pub fn describe(path: &Path, listing: &Listing, limits: &Limits, budget: &Budget
                 desk_sessions += 1;
                 desk_session_bytes += entry.size;
             }
-            "agent-desk-meta" => {
-                if parts.last() == Some(&"chat.json") {
-                    items.push(ReviewItem { class, name: shown, title: "The front desk's own conversation".to_string(), what: format!("{}: loaded as what was said before.", kb(entry.size)) });
-                }
+            "agent-desk-meta" => {}
+            "agent-desk-chat" => {
+                items.push(ReviewItem { class, name: shown, title: "The front desk's own conversation".to_string(), what: format!("{}: loaded as what was said before.", kb(entry.size)) });
             }
             "agent-desk-callers" => {
                 let count = read_small(&mut archive, entry, limits.max_agent_read_bytes)?
@@ -641,7 +640,7 @@ pub fn describe(path: &Path, listing: &Listing, limits: &Limits, budget: &Budget
     }
     if desk_sessions > 0 {
         items.push(ReviewItem {
-            class: RestoreClass::AgentData,
+            class: RestoreClass::Conversations,
             name: "agent/front-desk/sessions".to_string(),
             title: "The phone's conversations".to_string(),
             what: format!("{} ({}): each call and text thread, loaded as what was said before.", plural(desk_sessions, "file", "files"), kb(desk_session_bytes)),

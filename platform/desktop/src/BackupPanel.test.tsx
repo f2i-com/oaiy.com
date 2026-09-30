@@ -686,7 +686,8 @@ describe('restoring: what can run or change settings needs a tick', () => {
     await click(buttonWith('Prepare restore'));
     expect(input('Passphrase of the backup to restore').value).toBe('');
     expect(host.innerHTML).not.toContain(PASS);
-    expect(text()).toContain('You ticked: Service templates and what starts with OAIY.');
+    // (The words are the desktop's own: the label of the kind in the dry run.)
+    expect(text()).toContain('You ticked: Service templates.');
     expect(text()).toContain('Autostart entries without a template were skipped: evil');
     expect(text()).toContain('Flows were not ticked, so they were left out.');
   });
@@ -702,10 +703,16 @@ describe('restoring: what can run or change settings needs a tick', () => {
 describe('a prepared restore', () => {
   it('says how long ago it was prepared and when it is thrown away', async () => {
     const stagedAt = new Date(Date.now() - 3 * 3_600_000).toISOString();
-    h.status.mockResolvedValue(status({ pendingRestore: pendingOf({ stagedAt, expiresAt: '2026-10-01T00:00:00Z', classes: ['flows', 'providers'] }) }));
+    h.status.mockResolvedValue(status({ pendingRestore: pendingOf({ stagedAt, expiresAt: '2026-10-01T00:00:00Z', classes: ['flows', 'providers'], classLabels: ['Flows, triggers and run history', 'AI providers (the addresses OAIY sends your AI requests to)'] }) }));
     await mount();
     expect(text()).toContain('Prepared 3 hours ago; it is discarded, not applied, at the next start after [2026-10-01T00:00:00Z].');
-    expect(text()).toContain('You ticked: Flows, triggers and runs, AI providers.');
+    expect(text()).toContain('You ticked: Flows, triggers and run history, AI providers (the addresses OAIY sends your AI requests to).');
+  });
+
+  it('names a kind by its id when the desktop did not give its words (an older desktop)', async () => {
+    h.status.mockResolvedValue(status({ pendingRestore: pendingOf({ classes: ['calendar', 'conversations'] }) }));
+    await mount();
+    expect(text()).toContain('You ticked: calendar, conversations.');
   });
 
   it('says it will not be applied when it has waited more than a day, and does not offer the restart', async () => {
