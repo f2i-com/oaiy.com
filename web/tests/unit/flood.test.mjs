@@ -244,6 +244,10 @@ describe('connections an app holds', () => {
 });
 
 describe('a flood of hellos', () => {
+  // Every port a flood made is closed when the test ends, pass or fail: a port the holder took keeps this process alive, and a failing test
+  // (a mutant that takes all 20,000) must not leave the run hanging.
+  const floods = [];
+  after(() => floods.forEach((f) => f.done()));
   const flood = (w, times) => {
     const channels = [];
     let accepted = 0;
@@ -252,7 +256,9 @@ describe('a flood of hellos', () => {
       channels.push(channel);
       if (w.broker.onWindowMessage({ origin: AGENT, source: w.parent, data: { op: 'hello', v: 1 }, ports: [channel.port2] })) accepted++;
     }
-    return { accepted, channels, done: () => channels.forEach((c) => c.port1.close()) };
+    const made = { accepted, channels, done: () => channels.forEach((c) => c.port1.close()) };
+    floods.push(made);
+    return made;
   };
 
   it('does not push out the honest connection of the same frame, and makes no more than a burst of connections (the review: 20,000 hellos in 110 ms)', async () => {
