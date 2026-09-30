@@ -90,10 +90,21 @@ takes no keyboard focus, so a key you press while typing elsewhere never reaches
 A call keeps at most 3 messages, one number 20 a day and 40 waiting at once, each at most 600
 characters. Callers who hide their number (or give one that is not a number) share one small
 allowance between them, 6 a day and 100 kept, so hiding does not give every call a limit of its
-own. Messages are kept in `<data>/messages/messages.json`, readable by you only; a handled one is
+own. Messages are kept in `<data>/messages/messages.json`, which is made for its owner alone on Linux and
+macOS; on Windows OAIY sets no permissions of its own, so the file has those of the data folder (by default
+a folder under your user profile, which other accounts cannot read). A handled message is
 let go after 90 days, and a message nobody has handled is never dropped to make room: when the
 store (or the hidden callers' share of it) is full of unhandled ones, new ones are refused and the
 Messages page says so until you handle some.
+
+The file is read as UTF-8 or as UTF-16 with its byte order mark (what Windows PowerShell 5.1's `>` writes), so
+a file another program has touched is still your messages. A file that cannot be used (bytes that are not text,
+not messages, or from a newer OAIY) is never written over: it is kept beside the messages as `messages.json.corrupt`
+(`.corrupt.1` and so on for a later one, and none replaces an earlier), new messages go to a fresh file, and the
+Messages page says where it is kept. A file that cannot be read at all (another program holds it open, its permissions
+say no) is left exactly as it is and no message is kept until that is put right: the receptionist is told it could
+not be saved, and says so. The Transfers settings (`ring.json`) and the record of tries (`ring-attempts.json`) are
+treated the same way; with the settings unreadable everything stays off, and the Transfers page says why.
 
 ### Transfers
 

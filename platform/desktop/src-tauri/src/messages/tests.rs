@@ -270,6 +270,120 @@ fn the_file_is_owner_only_survives_a_restart_and_a_bad_file_is_kept_aside() {
     assert!(Store::open(&newer.0).was_quarantined());
 }
 
+/// A messages file as another program saves it: PowerShell 5.1's `>` writes UTF-16 with a byte order mark, an editor may add one to UTF-8. The
+/// owner's own messages are read, not put aside as if they were garbage and then written over by the next one that comes in.
+#[test]
+fn a_messages_file_saved_by_another_program_as_utf16_or_with_a_byte_order_mark_is_read_and_not_lost() {
+    let dir = TempDir::new("messages-utf16");
+    let store = Store::open(&dir.0);
+    let m = store.add(new("call_1", "+61491570006", "Ring me about Friday.")).unwrap();
+    let file = dir.0.join("messages").join(FILE_NAME);
+    let text = std::fs::read_to_string(&file).unwrap();
+    let le: Vec<u8> = [0xFF, 0xFE].into_iter().chain(text.encode_utf16().flat_map(|u| u.to_le_bytes())).collect();
+    let be: Vec<u8> = [0xFE, 0xFF].into_iter().chain(text.encode_utf16().flat_map(|u| u.to_be_bytes())).collect();
+    let utf8_with_mark: Vec<u8> = [0xEF, 0xBB, 0xBF].into_iter().chain(text.bytes()).collect();
+    for (tag, bytes) in [("utf-16 le", le), ("utf-16 be", be), ("utf-8 with a mark", utf8_with_mark)] {
+        std::fs::write(&file, &bytes).unwrap();
+        let read = Store::open(&dir.0);
+        assert_eq!(read.get(&m.id).as_ref().map(|m| m.message.as_str()), Some("Ring me about Friday."), "{tag}");
+        assert!(!read.was_quarantined(), "{tag}");
+        assert!(!dir.0.join("messages").join("messages.json.corrupt").exists(), "{tag}: it was read, not put aside");
+        // A message that comes in keeps the earlier one: the file is written again as UTF-8, with both.
+        read.add(new("call_2", "+61491570156", "Another one.")).unwrap();
+        assert_eq!(Store::open(&dir.0).list(None, "").len(), 2, "{tag}");
+        assert!(std::fs::read(&file).unwrap().starts_with(b"{"), "{tag}");
+    }
+}
+
+/// A file that cannot be decoded at all is not read, and it is not lost either: it is kept as it was, and what comes in after goes to a file
+/// of its own. Before, only a file that would not parse was put aside: bytes that are not UTF-8 left the file where it was, the store started
+/// empty, and the next message overwrote it (a UTF-16 file of messages was gone after one).
+#[test]
+fn a_messages_file_that_cannot_be_decoded_is_kept_as_it_was_and_never_written_over() {
+    let dir = TempDir::new("messages-undecodable");
+    let file = dir.0.join("messages").join(FILE_NAME);
+    std::fs::create_dir_all(file.parent().unwrap()).unwrap();
+    let first: &[u8] = &[b'{', 0xC3, 0x28, b'"', 0xFF, b'}'];
+    std::fs::write(&file, first).unwrap();
+    let store = Store::open(&dir.0);
+    assert!(store.was_quarantined() && store.list(None, "").is_empty());
+    let aside = dir.0.join("messages").join("messages.json.corrupt");
+    assert_eq!(std::fs::read(&aside).unwrap(), first, "the original is kept as it was");
+    // A message that comes in now is kept in a file of its own, and does not touch it.
+    let m = store.add(new("call_1", "+61491570006", "Ring me.")).unwrap();
+    assert_eq!(std::fs::read(&aside).unwrap(), first);
+    assert_eq!(Store::open(&dir.0).get(&m.id).map(|m| m.message), Some("Ring me.".to_string()));
+    // UTF-16 with a lone surrogate, which no text can be made of: the same. And a second bad file does not take the first one's place.
+    let second: Vec<u8> = vec![0xFF, 0xFE, 0x7B, 0x00, 0x00, 0xD8, 0x7D, 0x00];
+    std::fs::write(&file, &second).unwrap();
+    assert!(Store::open(&dir.0).was_quarantined());
+    assert_eq!(std::fs::read(&aside).unwrap(), first, "the first is where it was");
+    assert_eq!(std::fs::read(dir.0.join("messages").join("messages.json.corrupt.1")).unwrap(), second, "and the second beside it");
+    // A file that decodes but is not messages, or is from a newer OAIY, is kept the same way.
+    std::fs::write(&file, b"{not json").unwrap();
+    assert!(Store::open(&dir.0).was_quarantined());
+    assert_eq!(std::fs::read(dir.0.join("messages").join("messages.json.corrupt.2")).unwrap(), b"{not json");
+}
+
+/// A file that can neither be read nor put aside is not written over: the store says every message it is given could not be saved (so the
+/// receptionist does not say it was kept), and the file is as it was.
+#[test]
+fn a_messages_file_that_cannot_be_put_aside_is_not_written_over() {
+    let dir = TempDir::new("messages-protected");
+    let folder = dir.0.join("messages");
+    std::fs::create_dir_all(&folder).unwrap();
+    let bytes: &[u8] = &[b'{', 0xC3, 0x28];
+    std::fs::write(folder.join(FILE_NAME), bytes).unwrap();
+    // Every name a file could be put aside under is taken (by folders: nothing is renamed onto them).
+    std::fs::create_dir_all(folder.join("messages.json.corrupt")).unwrap();
+    for n in 1..40 {
+        std::fs::create_dir_all(folder.join(format!("messages.json.corrupt.{n}"))).unwrap();
+    }
+    let store = Store::open(&dir.0);
+    assert!(store.was_quarantined());
+    let e = store.add(new("call_1", "+61491570006", "Ring me.")).unwrap_err();
+    assert_eq!((e.status, e.code), (500, "save_failed"), "{}", e.message);
+    assert!(store.list(None, "").is_empty(), "it is not listed as if it were kept");
+    assert_eq!(std::fs::read(folder.join(FILE_NAME)).unwrap(), bytes, "the file is as it was");
+}
+
+/// A file that cannot be read for the moment (another program has it open, or its permissions say no) may be perfectly good: it is not
+/// put aside as if it were garbage, and nothing is written over it, though a replace would have worked.
+#[test]
+fn a_messages_file_that_cannot_be_read_is_left_alone_and_not_written_over() {
+    let dir = TempDir::new("messages-unreadable");
+    let folder = dir.0.join("messages");
+    let first = Store::open(&dir.0);
+    first.add(new("call_1", "+61491570006", "Ring me about Friday.")).unwrap();
+    let before = std::fs::read(folder.join(FILE_NAME)).unwrap();
+    let Some(lock) = crate::secret_file::testing::make_unreadable(&folder.join(FILE_NAME)) else {
+        eprintln!("skipped: this user reads every file");
+        return;
+    };
+    let store = Store::open(&dir.0);
+    assert!(store.was_quarantined());
+    assert!(store.notice().is_some_and(|n| n.contains("could not be read")), "{:?}", store.notice());
+    let e = store.add(new("call_2", "+61491570156", "Another one.")).unwrap_err();
+    assert_eq!((e.status, e.code), (500, "save_failed"), "{}", e.message);
+    assert!(store.list(None, "").is_empty());
+    assert!(!folder.join("messages.json.corrupt").exists(), "a file that may be good is not put aside");
+    drop(lock);
+    assert_eq!(std::fs::read(folder.join(FILE_NAME)).unwrap(), before, "and it is as it was");
+    assert_eq!(Store::open(&dir.0).list(None, "").len(), 1, "read again once it can be");
+}
+
+#[test]
+fn the_messages_page_is_told_where_a_file_that_could_not_be_used_is_kept() {
+    let dir = TempDir::new("messages-told");
+    let folder = dir.0.join("messages");
+    std::fs::create_dir_all(&folder).unwrap();
+    std::fs::write(folder.join(FILE_NAME), [0xC3, 0x28]).unwrap();
+    let store = Store::open(&dir.0);
+    let told = store.notice().expect("the Messages page is told");
+    assert!(told.contains("messages.json.corrupt") && told.contains("not text"), "{told}");
+    assert_eq!(Store::open(&dir.0).notice(), None, "and at the next start, with nothing to read, nothing is wrong");
+}
+
 #[test]
 fn a_message_that_cannot_be_saved_is_not_kept_and_the_caller_is_told() {
     let dir = TempDir::new("messages-unsaved");

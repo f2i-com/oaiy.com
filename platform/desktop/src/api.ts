@@ -1761,7 +1761,8 @@ export interface RingPreview {
 }
 
 export const ring = {
-  settings: () => request<{ settings: RingSettings; features: RingFeatures }>('/api/ring/settings'),
+  /** `loadProblem` is set when the file of settings could not be used at the start (everything is then off), in plain words and with where it is kept. */
+  settings: () => request<{ settings: RingSettings; features: RingFeatures; loadProblem?: string | null }>('/api/ring/settings'),
   /** Change some settings (any of them; `quietHours` and `limits` member by member). */
   save: (change: Partial<Omit<RingSettings, 'quietHours' | 'limits'>> & { quietHours?: Partial<QuietHours>; limits?: Partial<RingSettings['limits']> }) =>
     request<{ settings: RingSettings; features: RingFeatures }>('/api/ring/settings', { method: 'PUT', body: JSON.stringify(change) }),

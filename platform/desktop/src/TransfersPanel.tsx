@@ -36,6 +36,8 @@ export default function TransfersPanel() {
   const [draft, setDraft] = useState<RingSettings | null>(null);
   const [features, setFeatures] = useState<RingFeatures | null>(null);
   const [missing, setMissing] = useState(false);
+  /** Why the desktop could not use the file the settings are kept in (it says where the file is kept), when it could not. */
+  const [loadProblem, setLoadProblem] = useState<string | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [saving, setSaving] = useState(false);
   const [justSaved, setJustSaved] = useState(false);
@@ -57,7 +59,11 @@ export default function TransfersPanel() {
   useEffect(() => {
     let live = true;
     ring.settings().then(
-      (r) => live && adopt(r.settings, r.features),
+      (r) => {
+        if (!live) return;
+        adopt(r.settings, r.features);
+        setLoadProblem(r.loadProblem ?? null);
+      },
       (e) => {
         if (!live) return;
         if (isNotFound(e)) setMissing(true);
@@ -187,6 +193,12 @@ export default function TransfersPanel() {
             </small>
           </span>
         </label>
+        {loadProblem && (
+          <div className="transfers-warning" role="alert" data-testid="settings-problem">
+            <TriangleAlert size={14} aria-hidden />
+            <span>{loadProblem}</span>
+          </div>
+        )}
         {nothingRings && (
           <div className="transfers-warning" data-testid="nothing-would-ring">
             <TriangleAlert size={14} aria-hidden />

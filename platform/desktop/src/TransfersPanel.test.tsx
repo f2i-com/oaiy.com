@@ -266,6 +266,24 @@ describe('Transfers', () => {
     expect(host.querySelector('[data-testid=plugin-state]')?.textContent).toContain('consent settings');
   });
 
+  it('says when the file the settings are kept in could not be used, and where it is kept, and nothing otherwise', async () => {
+    await mount();
+    expect(host.querySelector('[data-testid=settings-problem]')).toBeNull();
+    await act(async () => root.unmount());
+    root = createRoot(host);
+    api.settings.mockResolvedValue({ settings: OFF, features: features(OFF), loadProblem: 'ring.json could not be used (it is not text), so everything is off. It is kept as ring.json.corrupt beside it.' });
+    await mount();
+    const problem = host.querySelector('[data-testid=settings-problem]')!;
+    expect(problem.getAttribute('role')).toBe('alert');
+    expect(problem.textContent).toContain('It is kept as ring.json.corrupt beside it.');
+    // A desktop that says nothing of it (an older one) shows nothing.
+    await act(async () => root.unmount());
+    root = createRoot(host);
+    api.settings.mockResolvedValue({ settings: OFF, features: features(OFF), loadProblem: null });
+    await mount();
+    expect(host.querySelector('[data-testid=settings-problem]')).toBeNull();
+  });
+
   it('says nothing while transfers are off, or when nothing is wrong', async () => {
     approve(PIXEL);
     await mount();

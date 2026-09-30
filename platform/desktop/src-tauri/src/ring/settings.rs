@@ -266,39 +266,66 @@ pub struct SettingsStore {
 struct Inner {
     path: Option<PathBuf>,
     settings: RingSettings,
+    /// Why the file was not used, in plain words (and where it is kept), when it was not.
+    problem: Option<String>,
+    /// The file could not be read, or could not be put aside: it is all that is left of what the owner set, so no
+    /// change is written over it.
+    protected: bool,
 }
 
 impl SettingsStore {
-    /// Settings kept in `<dir>/ring.json`, read now. No file: everything off. A file that is not
-    /// settings: put aside as `ring.json.corrupt`, everything off.
+    /// Settings kept in `<dir>/ring.json` (UTF-8, or UTF-16 with its byte order mark, as another program may have saved it),
+    /// read now. No file: everything off. A file that is not settings, or is not text: put aside as `ring.json.corrupt`
+    /// (`.corrupt.1`, and so on: no earlier one is replaced), everything off. A file that cannot be read, or put aside:
+    /// everything off, and no change is written over it (a change is refused and says why).
     pub fn open(dir: &Path) -> Self {
+        use crate::secret_file::{read_text, Text};
         let path = dir.join(FILE_NAME);
-        let settings = match std::fs::read_to_string(&path) {
-            Ok(text) => match parse(&text) {
-                Ok(s) => s,
-                Err(why) => {
-                    log::warn!("ring settings: {} is not usable ({why}); everything stays off", path.display());
-                    let aside = path.with_extension("json.corrupt");
-                    if let Err(e) = std::fs::rename(&path, &aside) {
-                        log::warn!("ring settings: could not keep the original beside it: {e}");
-                    }
-                    RingSettings::default()
+        let mut inner = Inner { path: Some(path.clone()), settings: RingSettings::default(), problem: None, protected: false };
+        let why = match read_text(&path) {
+            Text::Missing => None,
+            Text::Text(text) => match parse(&text) {
+                Ok(settings) => {
+                    inner.settings = settings;
+                    None
                 }
+                Err(why) => Some(why),
             },
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => RingSettings::default(),
-            Err(e) => {
-                log::warn!("ring settings: {} could not be read ({e}); everything stays off", path.display());
-                RingSettings::default()
+            Text::Undecodable(why) => Some(format!("it is not text ({why})")),
+            Text::Unreadable(e) => {
+                log::warn!("ring settings: {} could not be read ({e}); everything stays off and nothing will be written over it", path.display());
+                inner.protected = true;
+                inner.problem = Some(format!("{FILE_NAME} could not be read ({e}), so everything stays off, and a change is refused until that is put right. It has not been changed."));
+                None
             }
         };
-        Self { inner: Arc::new(Mutex::new(Inner { path: Some(path), settings })) }
+        if let Some(why) = why {
+            match crate::secret_file::keep_aside(&path) {
+                Ok(aside) => {
+                    let name = aside.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
+                    log::warn!("ring settings: {} is not usable ({why}); it is kept as {name} and everything stays off", path.display());
+                    inner.problem = Some(format!("{FILE_NAME} could not be used ({why}), so everything is off. It is kept as {name} beside it."));
+                }
+                Err(e) => {
+                    log::warn!("ring settings: {} is not usable ({why}) and could not be put aside ({e}); everything stays off and nothing will be written over it", path.display());
+                    inner.protected = true;
+                    inner.problem = Some(format!("{FILE_NAME} could not be used ({why}) and could not be put aside ({e}), so everything is off, and a change is refused until that is put right. It has not been changed."));
+                }
+            }
+        }
+        Self { inner: Arc::new(Mutex::new(inner)) }
     }
 
     /// Settings held in memory only (tests, and a desktop whose data folder is not known).
     pub fn in_memory(settings: RingSettings) -> Self {
         let mut settings = settings;
         settings.sanitize();
-        Self { inner: Arc::new(Mutex::new(Inner { path: None, settings })) }
+        Self { inner: Arc::new(Mutex::new(Inner { path: None, settings, problem: None, protected: false })) }
+    }
+
+    /// In plain words, why the settings file was not used at the start (and where it is kept), or None.
+    pub fn load_problem(&self) -> Option<String> {
+        self.lock().problem.clone()
     }
 
     fn lock(&self) -> std::sync::MutexGuard<'_, Inner> {
@@ -322,7 +349,10 @@ impl SettingsStore {
         let mut next: RingSettings = serde_json::from_value(merged).map_err(|e| SettingsError(format!("that is not a valid setting: {e}")))?;
         next.sanitize();
         if let Some(path) = &inner.path {
-            let mut file = serde_json::to_value(&next).map_err(|e| SettingsError(e.to_string()))?;
+            if inner.protected {
+                return Err(SettingsError(format!("the settings could not be saved: {FILE_NAME} could not be read or put aside, and is not written over")));
+            }
+            let mut file =serde_json::to_value(&next).map_err(|e| SettingsError(e.to_string()))?;
             file["version"] = json!(VERSION);
             let body = serde_json::to_string_pretty(&file).map_err(|e| SettingsError(e.to_string()))?;
             crate::secret_file::write(path, body).map_err(|e| SettingsError(format!("the settings could not be saved: {e}")))?;
@@ -436,6 +466,88 @@ mod tests {
             assert_eq!(std::fs::read_to_string(dir.0.join("ring.json.corrupt")).unwrap(), text, "{tag}: the original is kept");
             assert!(!dir.0.join(FILE_NAME).exists(), "{tag}");
         }
+    }
+
+    #[test]
+    fn a_settings_file_saved_by_another_program_as_utf16_or_with_a_byte_order_mark_is_read_and_not_lost() {
+        let dir = TempDir::new("ring-utf16");
+        let text = r#"{"version": 1, "enabled": true, "ringSeconds": 55}"#;
+        let le: Vec<u8> = [0xFF, 0xFE].into_iter().chain(text.encode_utf16().flat_map(|u| u.to_le_bytes())).collect();
+        let be: Vec<u8> = [0xFE, 0xFF].into_iter().chain(text.encode_utf16().flat_map(|u| u.to_be_bytes())).collect();
+        let utf8_with_mark: Vec<u8> = [0xEF, 0xBB, 0xBF].into_iter().chain(text.bytes()).collect();
+        for (tag, bytes) in [("utf-16 le", le), ("utf-16 be", be), ("utf-8 with a mark", utf8_with_mark)] {
+            std::fs::write(dir.0.join(FILE_NAME), &bytes).unwrap();
+            let store = SettingsStore::open(&dir.0);
+            assert_eq!((store.get().enabled, store.get().ring_seconds), (true, 55), "{tag}: the owner's own settings are read");
+            assert!(store.load_problem().is_none(), "{tag}");
+            assert!(!dir.0.join("ring.json.corrupt").exists(), "{tag}: it was read, not put aside");
+            // A change keeps the rest, and the file is written again as UTF-8.
+            store.change(&json!({"ringSeconds": 60})).unwrap();
+            assert_eq!(SettingsStore::open(&dir.0).get().ring_seconds, 60, "{tag}");
+        }
+    }
+
+    #[test]
+    fn a_settings_file_that_cannot_be_decoded_is_kept_as_it_was_and_never_written_over() {
+        let dir = TempDir::new("ring-undecodable");
+        let first: &[u8] = &[b'{', 0xC3, 0x28, b'"', 0xFF, b'}'];
+        std::fs::write(dir.0.join(FILE_NAME), first).unwrap();
+        let store = SettingsStore::open(&dir.0);
+        assert_eq!(store.get(), RingSettings::default(), "everything stays off");
+        assert!(store.load_problem().is_some_and(|p| p.contains("ring.json.corrupt")), "{:?}", store.load_problem());
+        assert_eq!(std::fs::read(dir.0.join("ring.json.corrupt")).unwrap(), first, "the original is kept as it was");
+        // The owner sets things again: that is a file of its own, and the original is untouched.
+        store.change(&json!({"enabled": true})).unwrap();
+        assert_eq!(std::fs::read(dir.0.join("ring.json.corrupt")).unwrap(), first);
+        assert!(SettingsStore::open(&dir.0).get().enabled);
+        // UTF-16 with a lone surrogate: no text can be made of it, and the first is not replaced by it.
+        let second: Vec<u8> = vec![0xFF, 0xFE, 0x7B, 0x00, 0x00, 0xD8, 0x7D, 0x00];
+        std::fs::write(dir.0.join(FILE_NAME), &second).unwrap();
+        let again = SettingsStore::open(&dir.0);
+        assert_eq!(again.get(), RingSettings::default(), "a broken file never turns a transfer on");
+        assert_eq!(std::fs::read(dir.0.join("ring.json.corrupt")).unwrap(), first);
+        assert_eq!(std::fs::read(dir.0.join("ring.json.corrupt.1")).unwrap(), second);
+    }
+
+    /// A file that cannot be read for the moment may be perfectly good: it is not put aside as garbage, and a change does not replace it
+    /// (a replace would have worked: the owner's settings would have been gone).
+    #[test]
+    fn a_settings_file_that_cannot_be_read_is_left_alone_and_a_change_is_refused() {
+        let dir = TempDir::new("ring-unreadable");
+        let first = SettingsStore::open(&dir.0);
+        first.change(&json!({"enabled": true, "ringSeconds": 55})).unwrap();
+        let before = std::fs::read(dir.0.join(FILE_NAME)).unwrap();
+        let Some(lock) = crate::secret_file::testing::make_unreadable(&dir.0.join(FILE_NAME)) else {
+            eprintln!("skipped: this user reads every file");
+            return;
+        };
+        let store = SettingsStore::open(&dir.0);
+        assert_eq!(store.get(), RingSettings::default(), "everything stays off while nothing can be read");
+        assert!(store.load_problem().is_some_and(|p| p.contains("could not be read")), "{:?}", store.load_problem());
+        let e = store.change(&json!({"ringSeconds": 60})).unwrap_err();
+        assert!(e.to_string().contains(FILE_NAME), "{e}");
+        assert!(!dir.0.join("ring.json.corrupt").exists(), "a file that may be good is not put aside");
+        drop(lock);
+        assert_eq!(std::fs::read(dir.0.join(FILE_NAME)).unwrap(), before, "and it is as it was");
+        assert_eq!(SettingsStore::open(&dir.0).get().ring_seconds, 55, "read again once it can be");
+    }
+
+    #[test]
+    fn a_settings_file_that_cannot_be_put_aside_is_not_written_over_and_a_change_says_why() {
+        let dir = TempDir::new("ring-protected");
+        let bytes: &[u8] = &[b'{', 0xC3, 0x28];
+        std::fs::write(dir.0.join(FILE_NAME), bytes).unwrap();
+        std::fs::create_dir_all(dir.0.join("ring.json.corrupt")).unwrap();
+        for n in 1..40 {
+            std::fs::create_dir_all(dir.0.join(format!("ring.json.corrupt.{n}"))).unwrap();
+        }
+        let store = SettingsStore::open(&dir.0);
+        assert_eq!(store.get(), RingSettings::default());
+        assert!(store.load_problem().is_some());
+        let e = store.change(&json!({"enabled": true})).unwrap_err();
+        assert!(e.to_string().contains("ring.json"), "{e}");
+        assert!(!store.get().enabled, "a change that could not be kept is not made");
+        assert_eq!(std::fs::read(dir.0.join(FILE_NAME)).unwrap(), bytes, "the file is as it was");
     }
 
     #[test]

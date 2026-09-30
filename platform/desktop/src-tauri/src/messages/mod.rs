@@ -162,6 +162,12 @@ struct Inner {
     messages: Vec<Message>,
     /// The file could not be read as messages and was put aside: nothing is lost by starting empty.
     quarantined: bool,
+    /// What the Messages page says about the file that could not be used, in plain words.
+    problem: Option<String>,
+    /// The file could not be read and could not be put aside either: it is all that is left of what was in it, so
+    /// nothing is written until the owner has dealt with it (every message offered is refused, and the receptionist
+    /// says it could not be kept).
+    protected: bool,
 }
 
 /// `text` as it may be shown and kept: control and direction-changing characters removed, tabs and
@@ -204,26 +210,46 @@ fn now() -> chrono::DateTime<chrono::Utc> {
 }
 
 impl Store {
-    /// The messages kept in `<data>/messages/messages.json`. A file that is not messages is put aside as
-    /// `messages.json.corrupt` (never written over) and the store starts empty.
+    /// The messages kept in `<data>/messages/messages.json` (UTF-8, or UTF-16 with its byte order mark, as another program
+    /// may have saved it). A file that is not messages, or is not text, is put aside as `messages.json.corrupt` (or
+    /// `.corrupt.1`, and so on: never written over, and no earlier one replaced) and the store starts empty. A file that
+    /// cannot be read at all is not touched, and nothing is written over it: see `protected`.
     pub fn open(data_dir: &Path) -> Store {
+        use crate::secret_file::{read_text, Text};
         let path = data_dir.join("messages").join(FILE_NAME);
         let mut inner = Inner { path: Some(path.clone()), ..Inner::default() };
-        match std::fs::read_to_string(&path) {
-            Ok(text) => match serde_json::from_str::<File>(&text) {
-                Ok(file) if file.version <= VERSION => inner.messages = file.messages,
-                _ => {
-                    log::warn!("messages: {} is not usable; it is kept as messages.json.corrupt", path.display());
-                    if std::fs::rename(&path, path.with_extension("json.corrupt")).is_err() {
-                        log::warn!("messages: the original could not be put aside");
-                    }
-                    inner.quarantined = true;
+        let why = match read_text(&path) {
+            Text::Missing => None,
+            Text::Text(text) => match serde_json::from_str::<File>(&text) {
+                Ok(file) if file.version <= VERSION => {
+                    inner.messages = file.messages;
+                    None
                 }
+                Ok(file) => Some(format!("it is from a newer OAIY (version {})", file.version)),
+                Err(e) => Some(format!("it is not messages ({e})")),
             },
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
-            Err(e) => {
-                log::warn!("messages: {} could not be read ({e})", path.display());
+            Text::Undecodable(why) => Some(format!("it is not text ({why})")),
+            Text::Unreadable(e) => {
+                log::warn!("messages: {} could not be read ({e}); nothing will be written over it", path.display());
                 inner.quarantined = true;
+                inner.protected = true;
+                inner.problem = Some(format!("The file of saved messages could not be read ({e}), so no new message can be kept until that is put right. It has not been changed."));
+                None
+            }
+        };
+        if let Some(why) = why {
+            inner.quarantined = true;
+            match crate::secret_file::keep_aside(&path) {
+                Ok(aside) => {
+                    let name = aside.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
+                    log::warn!("messages: {} is not usable ({why}); it is kept as {name}", path.display());
+                    inner.problem = Some(format!("The file of saved messages could not be used ({why}). It is kept as {name} beside it, and new messages are kept in a new file."));
+                }
+                Err(e) => {
+                    log::warn!("messages: {} is not usable ({why}) and could not be put aside ({e}); nothing will be written over it", path.display());
+                    inner.protected = true;
+                    inner.problem = Some(format!("The file of saved messages could not be used ({why}) and could not be put aside ({e}), so no new message can be kept until that is put right. It has not been changed."));
+                }
             }
         }
         Store { inner: Arc::new(Mutex::new(inner)) }
@@ -240,7 +266,10 @@ impl Store {
 
     fn save(inner: &Inner) -> Result<(), Error> {
         let Some(path) = &inner.path else { return Ok(()) };
-        let body = serde_json::to_string_pretty(&File { version: VERSION, messages: inner.messages.clone() }).map_err(|e| Error::new(500, "save_failed", e.to_string()))?;
+        if inner.protected {
+            return Err(Error::new(500, "save_failed", "the message could not be saved: the file of saved messages could not be read or put aside, and is not written over"));
+        }
+        let body =serde_json::to_string_pretty(&File { version: VERSION, messages: inner.messages.clone() }).map_err(|e| Error::new(500, "save_failed", e.to_string()))?;
         crate::secret_file::write(path, body).map_err(|e| Error::new(500, "save_failed", format!("the message could not be saved: {e}")))
     }
 
@@ -350,10 +379,13 @@ impl Store {
         found
     }
 
-    /// A plain word for the Messages page when new messages are being refused because the owner has not handled the ones
-    /// waiting (none when there is room).
+    /// A plain word for the Messages page when the file of messages could not be used (and where it is kept), or when new
+    /// messages are being refused because the owner has not handled the ones waiting (none when all is well).
     pub fn notice(&self) -> Option<String> {
         let inner = self.lock();
+        if let Some(problem) = &inner.problem {
+            return Some(problem.clone());
+        }
         let waiting = inner.messages.iter().filter(|m| m.state != State::Handled).count();
         let hidden = inner.messages.iter().filter(|m| crate::voice::contacts::key(&m.from).is_none());
         let (hidden_all, hidden_waiting) = hidden.fold((0, 0), |(all, waiting), m| (all + 1, waiting + usize::from(m.state != State::Handled)));

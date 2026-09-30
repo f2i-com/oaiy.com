@@ -78,7 +78,7 @@ async fn respond(State(ring): State<Arc<Ring>>, Path(id): Path<String>, Json(bod
 
 fn shown(ring: &Ring) -> Value {
     let settings = ring.settings.get();
-    json!({"settings": settings, "features": ring.features()})
+    json!({"settings": settings, "features": ring.features(), "loadProblem": ring.settings.load_problem()})
 }
 
 async fn get_settings(State(ring): State<Arc<Ring>>) -> Json<Value> {
@@ -102,6 +102,20 @@ mod tests {
         let addr = listener.local_addr().unwrap();
         tokio::spawn(async move { axum::serve(listener, router(ring)).await.unwrap() });
         format!("http://{addr}")
+    }
+
+    #[tokio::test]
+    async fn the_settings_say_when_their_file_could_not_be_used_and_where_it_is_kept() {
+        let dir = TempDir::new("ring-routes-problem");
+        std::fs::write(dir.0.join(crate::ring::settings::FILE_NAME), [0xC3, 0x28]).unwrap();
+        let base = serve(Ring::open(&dir.0)).await;
+        let read: Value = reqwest::get(format!("{base}/api/ring/settings")).await.unwrap().json().await.unwrap();
+        assert_eq!(read["settings"]["enabled"], false);
+        assert!(read["loadProblem"].as_str().is_some_and(|p| p.contains("ring.json.corrupt")), "{read}");
+        let clean = TempDir::new("ring-routes-no-problem");
+        let base = serve(Ring::open(&clean.0)).await;
+        let read: Value = reqwest::get(format!("{base}/api/ring/settings")).await.unwrap().json().await.unwrap();
+        assert!(read["loadProblem"].is_null(), "{read}");
     }
 
     #[tokio::test]

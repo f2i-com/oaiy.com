@@ -151,6 +151,88 @@ fn rename_over(from: &Path, to: &Path) -> io::Result<()> {
     std::fs::rename(from, to)
 }
 
+/// What [`read_text`] found at a path.
+#[derive(Debug)]
+pub enum Text {
+    /// There is no file.
+    Missing,
+    /// The file's text: UTF-8 (a byte order mark taken off) or UTF-16 with its byte order mark.
+    Text(String),
+    /// The file is there and was read, but its bytes are not text (not UTF-8, and not UTF-16 with a mark). It is not
+    /// the store's to write over: see [`keep_aside`].
+    Undecodable(String),
+    /// The file could not be read (another program holds it, or its permissions say no): what is in it is not known,
+    /// so it may be perfectly good and must not be written over.
+    Unreadable(io::Error),
+}
+
+/// A file of settings or messages as text. Windows PowerShell 5.1's `>` and `Out-File` write UTF-16 with a byte order
+/// mark, and some editors write UTF-8 with one: both are read (a store that reads only plain UTF-8 took the owner's
+/// own file for garbage, and the next write replaced it).
+pub fn read_text(path: &Path) -> Text {
+    match std::fs::read(path) {
+        Ok(bytes) => match decode_text(&bytes) {
+            Ok(text) => Text::Text(text),
+            Err(why) => Text::Undecodable(why),
+        },
+        Err(e) if e.kind() == io::ErrorKind::NotFound => Text::Missing,
+        Err(e) => Text::Unreadable(e),
+    }
+}
+
+/// `bytes` as text: UTF-16 (little or big endian) when they start with its byte order mark, otherwise UTF-8 with a
+/// leading mark taken off. Nothing is guessed and nothing is replaced: a byte sequence that is not valid is an error.
+pub fn decode_text(bytes: &[u8]) -> Result<String, String> {
+    if let Some(body) = bytes.strip_prefix(&[0xFF, 0xFE]) {
+        return utf16(body, u16::from_le_bytes);
+    }
+    if let Some(body) = bytes.strip_prefix(&[0xFE, 0xFF]) {
+        return utf16(body, u16::from_be_bytes);
+    }
+    let body = bytes.strip_prefix(&[0xEF, 0xBB, 0xBF]).unwrap_or(bytes);
+    String::from_utf8(body.to_vec()).map_err(|e| format!("not valid UTF-8 (at byte {})", e.utf8_error().valid_up_to()))
+}
+
+fn utf16(body: &[u8], unit: fn([u8; 2]) -> u16) -> Result<String, String> {
+    if body.len() % 2 != 0 {
+        return Err("UTF-16 with a byte missing".into());
+    }
+    let units: Vec<u16> = body.chunks_exact(2).map(|pair| unit([pair[0], pair[1]])).collect();
+    String::from_utf16(&units).map_err(|_| "not valid UTF-16".into())
+}
+
+/// How many names a file is put aside under (`x.corrupt`, `x.corrupt.1`, ...): one that has so many already is not
+/// one to keep adding to.
+const ASIDE_NAMES: u32 = 32;
+
+/// Put the file at `path` aside as `<name>.corrupt` (`.corrupt.1`, `.corrupt.2` ... when that is taken: an earlier bad
+/// file is never replaced by a later one), so that what is in it is kept while the store starts a new file at `path`.
+/// Answers where it went. If the file cannot be moved, its bytes are copied there (the original stays, and is safe to
+/// replace once a copy exists). When neither works the answer is an error, and the caller must not write to `path`: the
+/// file is all that is left of what was in it.
+pub fn keep_aside(path: &Path) -> io::Result<PathBuf> {
+    let name = path
+        .file_name()
+        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, format!("{} has no file name", path.display())))?
+        .to_string_lossy()
+        .into_owned();
+    for n in 0..ASIDE_NAMES {
+        let aside = path.with_file_name(if n == 0 { format!("{name}.corrupt") } else { format!("{name}.corrupt.{n}") });
+        // `rename` replaces what is there on every platform: a name in use is passed over, not replaced.
+        if std::fs::symlink_metadata(&aside).is_ok() {
+            continue;
+        }
+        return match std::fs::rename(path, &aside) {
+            Ok(()) => Ok(aside),
+            Err(rename_failed) => match std::fs::copy(path, &aside) {
+                Ok(_) => Ok(aside),
+                Err(_) => Err(rename_failed),
+            },
+        };
+    }
+    Err(io::Error::new(io::ErrorKind::AlreadyExists, format!("{ASIDE_NAMES} files kept aside as {name}.corrupt are there already")))
+}
+
 /// Make `dir`, and any of its parents that are missing, for a secret to live in: owner-only (unix
 /// mode 0700) for every folder this call creates.
 ///
@@ -238,6 +320,39 @@ pub(crate) mod testing {
             use std::os::unix::fs::PermissionsExt as _;
             let mode = std::fs::metadata(dir).unwrap().permissions().mode() & 0o777;
             assert_eq!(mode, 0o700, "{} is mode {mode:o}, not 700", dir.display());
+        }
+    }
+
+    /// A file that cannot be read but can still be replaced: on Windows another program holding it open with only delete
+    /// sharing (read is refused, a rename over it is not), elsewhere no read permission (a folder that can still be written
+    /// to). Held until dropped. `None` where it cannot be made so (a user who reads everything).
+    pub(crate) struct Unreadable {
+        #[cfg(windows)]
+        _held: std::fs::File,
+        #[cfg(unix)]
+        path: std::path::PathBuf,
+    }
+
+    #[cfg(windows)]
+    pub(crate) fn make_unreadable(path: &Path) -> Option<Unreadable> {
+        use std::os::windows::fs::OpenOptionsExt as _;
+        let held = std::fs::OpenOptions::new().read(true).share_mode(4).open(path).ok()?; // FILE_SHARE_DELETE
+        std::fs::read(path).is_err().then_some(Unreadable { _held: held })
+    }
+
+    #[cfg(unix)]
+    pub(crate) fn make_unreadable(path: &Path) -> Option<Unreadable> {
+        use std::os::unix::fs::PermissionsExt as _;
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o000)).ok()?;
+        let guard = Unreadable { path: path.to_path_buf() };
+        std::fs::read(path).is_err().then_some(guard)
+    }
+
+    #[cfg(unix)]
+    impl Drop for Unreadable {
+        fn drop(&mut self) {
+            use std::os::unix::fs::PermissionsExt as _;
+            let _ = std::fs::set_permissions(&self.path, std::fs::Permissions::from_mode(0o600));
         }
     }
 
@@ -500,6 +615,89 @@ mod tests {
         }
         assert!(std::fs::read_to_string(&path).unwrap().starts_with("writer "));
         assert_eq!(names(&dir.0), ["pairings.json"]);
+    }
+
+    #[test]
+    fn text_is_read_as_utf8_with_or_without_a_mark_and_as_utf16_with_one_and_nothing_else_is_guessed() {
+        let words = "Ring me back \u{2014} caf\u{e9} \u{1f4de}";
+        let le: Vec<u8> = [0xFF, 0xFE].into_iter().chain(words.encode_utf16().flat_map(u16::to_le_bytes)).collect();
+        let be: Vec<u8> = [0xFE, 0xFF].into_iter().chain(words.encode_utf16().flat_map(u16::to_be_bytes)).collect();
+        let marked: Vec<u8> = [0xEF, 0xBB, 0xBF].into_iter().chain(words.bytes()).collect();
+        for (tag, bytes) in [("plain", words.as_bytes().to_vec()), ("utf-16 le", le), ("utf-16 be", be), ("marked utf-8", marked)] {
+            assert_eq!(decode_text(&bytes).as_deref(), Ok(words), "{tag}");
+        }
+        assert_eq!(decode_text(b""), Ok(String::new()));
+        assert!(decode_text(&[b'{', 0xC3, 0x28]).is_err(), "bytes that are not UTF-8 are refused, not replaced");
+        assert!(decode_text(&[0xFF, 0xFE, 0x7B]).is_err(), "half a UTF-16 unit");
+        assert!(decode_text(&[0xFF, 0xFE, 0x00, 0xD8, 0x7B, 0x00]).is_err(), "a lone surrogate");
+        assert!(decode_text(&[0xFE, 0xFF, 0xD8, 0x00, 0x00, 0x7B]).is_err(), "and the same the other way round");
+    }
+
+    #[test]
+    fn read_text_tells_a_missing_file_from_text_from_bytes_and_from_a_file_that_cannot_be_read() {
+        let dir = TempDir::new("read-text");
+        let path = dir.0.join("ring.json");
+        assert!(matches!(read_text(&path), Text::Missing));
+        std::fs::write(&path, "{}").unwrap();
+        assert!(matches!(read_text(&path), Text::Text(t) if t == "{}"));
+        std::fs::write(&path, [0xC3, 0x28]).unwrap();
+        assert!(matches!(read_text(&path), Text::Undecodable(_)));
+        std::fs::remove_file(&path).unwrap();
+        std::fs::create_dir(&path).unwrap();
+        assert!(matches!(read_text(&path), Text::Unreadable(_)), "a folder where the file belongs is not a missing file");
+    }
+
+    #[test]
+    fn a_file_put_aside_is_kept_byte_for_byte_and_no_earlier_one_is_replaced() {
+        let dir = TempDir::new("aside");
+        let path = dir.0.join("messages.json");
+        let mut kept = Vec::new();
+        for n in 0..3u8 {
+            std::fs::write(&path, [0xC3, 0x28, n]).unwrap();
+            let aside = keep_aside(&path).unwrap();
+            assert!(!path.exists(), "the file has moved");
+            kept.push(aside);
+        }
+        let names: Vec<String> = kept.iter().map(|p| p.file_name().unwrap().to_string_lossy().into_owned()).collect();
+        assert_eq!(names, ["messages.json.corrupt", "messages.json.corrupt.1", "messages.json.corrupt.2"]);
+        for (n, aside) in kept.iter().enumerate() {
+            assert_eq!(std::fs::read(aside).unwrap(), [0xC3, 0x28, n as u8]);
+        }
+    }
+
+    /// A file another program holds open (a virus scanner, an indexer) cannot be moved, but it can be read: what is in it
+    /// is copied, so it is kept even where the original stays.
+    #[cfg(windows)]
+    #[test]
+    fn a_file_that_cannot_be_moved_is_copied_aside_instead() {
+        use std::os::windows::fs::OpenOptionsExt as _;
+        let dir = TempDir::new("aside-held");
+        let path = dir.0.join("ring.json");
+        std::fs::write(&path, [0xC3, 0x28, 0x29]).unwrap();
+        let held = std::fs::OpenOptions::new().read(true).share_mode(1).open(&path).unwrap(); // FILE_SHARE_READ: no delete, no rename
+        let moved = std::fs::rename(dir.0.join("ring.json"), dir.0.join("elsewhere.json"));
+        assert!(moved.is_err(), "the test needs a file that cannot be moved");
+        let aside = keep_aside(&path).unwrap();
+        assert_eq!(aside.file_name().unwrap(), "ring.json.corrupt");
+        assert_eq!(std::fs::read(&aside).unwrap(), [0xC3, 0x28, 0x29], "a copy is kept");
+        assert!(path.exists(), "and the original is where it was");
+        drop(held);
+    }
+
+    #[test]
+    fn a_file_with_every_name_to_be_put_aside_under_taken_is_left_where_it_is_and_says_so() {
+        let dir = TempDir::new("aside-full");
+        let path = dir.0.join("messages.json");
+        std::fs::write(&path, "the only copy").unwrap();
+        std::fs::create_dir(dir.0.join("messages.json.corrupt")).unwrap();
+        for n in 1..ASIDE_NAMES {
+            std::fs::write(dir.0.join(format!("messages.json.corrupt.{n}")), "an earlier one").unwrap();
+        }
+        let err = keep_aside(&path).unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::AlreadyExists, "{err}");
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "the only copy");
+        assert_eq!(std::fs::read_to_string(dir.0.join("messages.json.corrupt.1")).unwrap(), "an earlier one", "none was replaced");
+        assert!(keep_aside(Path::new("/")).is_err(), "no file name, no name to keep it under");
     }
 
     #[test]

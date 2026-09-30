@@ -49,23 +49,49 @@ struct File {
 pub struct Attempts {
     path: Option<PathBuf>,
     entries: Vec<Attempt>,
+    /// The file could not be read, or could not be put aside: the tries are counted in memory, and the file is left as it is.
+    protected: bool,
 }
 
 impl Attempts {
-    /// The tries kept in `<dir>/ring-attempts.json` (none when there is no usable file).
+    /// The tries kept in `<dir>/ring-attempts.json` (UTF-8, or UTF-16 with its byte order mark). No file: none. A file
+    /// that is not the tries, or is not text, is put aside as `ring-attempts.json.corrupt` (and so on) and the count starts
+    /// again; one that cannot be read or put aside is left as it is, and is not written over.
     pub fn open(dir: &Path) -> Self {
+        use crate::secret_file::{read_text, Text};
         let path = dir.join(FILE_NAME);
-        let entries = std::fs::read_to_string(&path)
-            .ok()
-            .and_then(|text| serde_json::from_str::<File>(&text).ok())
-            .map(|f| f.attempts)
-            .unwrap_or_default();
-        Self { path: Some(path), entries }
+        let mut attempts = Self { path: Some(path.clone()), entries: Vec::new(), protected: false };
+        let why = match read_text(&path) {
+            Text::Missing => None,
+            Text::Text(text) => match serde_json::from_str::<File>(&text) {
+                Ok(file) => {
+                    attempts.entries = file.attempts;
+                    None
+                }
+                Err(e) => Some(e.to_string()),
+            },
+            Text::Undecodable(why) => Some(why),
+            Text::Unreadable(e) => {
+                log::warn!("ring: {} could not be read ({e}); the tries are counted in memory only", path.display());
+                attempts.protected = true;
+                None
+            }
+        };
+        if let Some(why) = why {
+            match crate::secret_file::keep_aside(&path) {
+                Ok(aside) => log::warn!("ring: {} is not usable ({why}); it is kept as {}", path.display(), aside.display()),
+                Err(e) => {
+                    log::warn!("ring: {} is not usable ({why}) and could not be put aside ({e}); the tries are counted in memory only", path.display());
+                    attempts.protected = true;
+                }
+            }
+        }
+        attempts
     }
 
     /// Tries held in memory only.
     pub fn in_memory() -> Self {
-        Self { path: None, entries: Vec::new() }
+        Self { path: None, entries: Vec::new(), protected: false }
     }
 
     /// The counters for `call` and its `caller` at `now` (Unix seconds).
@@ -90,7 +116,7 @@ impl Attempts {
     }
 
     fn keep(&self) {
-        if let Some(path) = &self.path {
+        if let Some(path) = self.path.as_ref().filter(|_| !self.protected) {
             let body = serde_json::to_string(&File { attempts: self.entries.clone() }).unwrap_or_default();
             if let Err(e) = crate::secret_file::write(path, body) {
                 log::warn!("ring: the attempts could not be kept: {e}");
@@ -188,5 +214,63 @@ mod tests {
             a.record("c", "k", 10 + n);
         }
         assert_eq!(a.entries.len(), MAX_KEPT);
+        assert_eq!(std::fs::read(dir.0.join("ring-attempts.json.corrupt")).unwrap(), b"{nope", "the file that would not read is kept, not written over");
+    }
+
+    /// The hour's tries are read as another program may have saved them, and a file that is not text is kept, like the settings and the messages.
+    #[test]
+    fn a_ledger_saved_as_utf16_is_read_and_one_that_is_not_text_is_kept_aside() {
+        let dir = TempDir::new("ring-attempts-utf16");
+        let mut a = Attempts::open(&dir.0);
+        a.record("call_1", "491570006", 5_000);
+        let text = std::fs::read_to_string(dir.0.join(FILE_NAME)).unwrap();
+        let le: Vec<u8> = [0xFF, 0xFE].into_iter().chain(text.encode_utf16().flat_map(u16::to_le_bytes)).collect();
+        std::fs::write(dir.0.join(FILE_NAME), le).unwrap();
+        let read = Attempts::open(&dir.0);
+        assert_eq!(read.counters("call_1", "491570006", 5_010).global_attempts_last_hour, 1, "the try is counted, not forgotten");
+        assert!(!dir.0.join("ring-attempts.json.corrupt").exists());
+        let bytes: &[u8] = &[b'{', 0xC3, 0x28];
+        std::fs::write(dir.0.join(FILE_NAME), bytes).unwrap();
+        let mut bad = Attempts::open(&dir.0);
+        assert_eq!(bad.counters("call_1", "491570006", 5_010), Counters::default());
+        assert_eq!(std::fs::read(dir.0.join("ring-attempts.json.corrupt")).unwrap(), bytes);
+        bad.record("call_2", "491570156", 5_020);
+        assert_eq!(std::fs::read(dir.0.join("ring-attempts.json.corrupt")).unwrap(), bytes, "and later tries do not touch it");
+    }
+
+    /// A ledger that cannot be read for the moment may be perfectly good: it is not put aside, and the tries since are counted in memory and do not replace it.
+    #[test]
+    fn a_ledger_that_cannot_be_read_is_left_alone_and_not_written_over() {
+        let dir = TempDir::new("ring-attempts-unreadable");
+        let mut first = Attempts::open(&dir.0);
+        first.record("call_1", "491570006", 5_000);
+        let before = std::fs::read(dir.0.join(FILE_NAME)).unwrap();
+        let Some(lock) = crate::secret_file::testing::make_unreadable(&dir.0.join(FILE_NAME)) else {
+            eprintln!("skipped: this user reads every file");
+            return;
+        };
+        let mut a = Attempts::open(&dir.0);
+        assert_eq!(a.counters("call_1", "491570006", 5_010).attempts_this_call, 0, "what is in it is not known");
+        a.record("call_2", "491570156", 5_020);
+        assert_eq!(a.counters("call_2", "491570156", 5_030).attempts_this_call, 1, "the limits still hold in memory");
+        assert!(!dir.0.join("ring-attempts.json.corrupt").exists(), "a file that may be good is not put aside");
+        drop(lock);
+        assert_eq!(std::fs::read(dir.0.join(FILE_NAME)).unwrap(), before, "and it is as it was");
+        assert_eq!(Attempts::open(&dir.0).counters("call_1", "491570006", 5_040).attempts_this_call, 1, "read again once it can be");
+    }
+
+    #[test]
+    fn a_ledger_that_cannot_be_read_or_put_aside_is_not_written_over_and_still_counts_in_memory() {
+        let dir = TempDir::new("ring-attempts-protected");
+        let bytes: &[u8] = &[b'{', 0xC3, 0x28];
+        std::fs::write(dir.0.join(FILE_NAME), bytes).unwrap();
+        std::fs::create_dir_all(dir.0.join("ring-attempts.json.corrupt")).unwrap();
+        for n in 1..40 {
+            std::fs::create_dir_all(dir.0.join(format!("ring-attempts.json.corrupt.{n}"))).unwrap();
+        }
+        let mut a = Attempts::open(&dir.0);
+        a.record("call_1", "491570006", 5_000);
+        assert_eq!(a.counters("call_1", "491570006", 5_010).attempts_this_call, 1, "the limits still hold in memory");
+        assert_eq!(std::fs::read(dir.0.join(FILE_NAME)).unwrap(), bytes, "the file is as it was");
     }
 }
