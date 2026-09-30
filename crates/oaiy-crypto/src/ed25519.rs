@@ -21,7 +21,7 @@ use zeroize::ZeroizeOnDrop;
 
 use crate::canon::{join_pipe, Separator};
 use crate::error::Error;
-use crate::zeroize::Secret;
+use crate::zeroize::{scrub_stack, Secret};
 
 /// What a signing key is for.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -220,6 +220,14 @@ pub struct SigningKey {
 impl SigningKey {
     /// From a 32-byte seed (RFC 8032 section 5.1.5; libsodium's `crypto_sign_seed_keypair`).
     pub fn from_seed(role: KeyRole, seed: &Secret<32>) -> SigningKey {
+        let key = SigningKey::expand(role, seed);
+        // the expansion leaves copies of the seed in the frames it gave back (found in an optimised build by the dead-stack probe; review L-7)
+        scrub_stack();
+        key
+    }
+
+    #[inline(never)]
+    fn expand(role: KeyRole, seed: &Secret<32>) -> SigningKey {
         SigningKey { inner: DalekSigningKey::from_bytes(seed.expose()), role }
     }
 

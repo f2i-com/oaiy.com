@@ -19,7 +19,7 @@ use sha2::{Digest, Sha256};
 use zeroize::Zeroize;
 
 use crate::error::Error;
-use crate::zeroize::Secret;
+use crate::zeroize::{scrub_stack, Secret};
 
 /// The eight-character context of a `crypto_kdf` derivation: ASCII `[a-z0-9]`, exactly eight of them.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -170,7 +170,18 @@ pub fn derive_subkey_into(master: &Secret<32>, id: u64, context: &Context, out: 
     derive_into(master, id, context, out)
 }
 
+/// `kdf(id, ctx, key)` into `out`, and then the stack the computation used is overwritten (review L-7): the BLAKE2b state copies the master key into a block when
+/// it is built and is moved into `finalize`, which copies it again; dropping the state wipes one place, and the copies the moves left in the frames of the functions
+/// that have returned stayed in the dead stack, where a memory scan finds them (four copies of the 32-byte master key after `kdf::derive`; the design's test P9, "no UMK
+/// in a memory scan after connect", would have tripped). See [`scrub_stack`].
 fn derive_into(master: &Secret<32>, id: u64, context: &Context, out: &mut [u8]) -> Result<(), Error> {
+    let result = derive_unscrubbed(master, id, context, out);
+    scrub_stack();
+    result
+}
+
+#[inline(never)]
+fn derive_unscrubbed(master: &Secret<32>, id: u64, context: &Context, out: &mut [u8]) -> Result<(), Error> {
     let mut salt = [0u8; 16];
     salt[..8].copy_from_slice(&id.to_le_bytes());
     let mut personal = [0u8; 16];
@@ -201,6 +212,13 @@ pub fn hkdf_sha256(ikm: &[u8], salt: Option<&[u8]>, info: &[u8], out: &mut [u8])
     if out.len() > HKDF_SHA256_MAX_OUTPUT {
         return Err(Error::HkdfLength);
     }
+    let result = hkdf_unscrubbed(ikm, salt, info, out);
+    scrub_stack(); // the key material passed through the frames of the hash (see `scrub_stack`)
+    result
+}
+
+#[inline(never)]
+fn hkdf_unscrubbed(ikm: &[u8], salt: Option<&[u8]>, info: &[u8], out: &mut [u8]) -> Result<(), Error> {
     Hkdf::<Sha256>::new(salt, ikm).expand(info, out).map_err(|_| Error::HkdfLength)
 }
 
@@ -216,6 +234,13 @@ pub fn hkdf_sha256_secret<const N: usize>(ikm: &[u8], salt: Option<&[u8]>, info:
 /// HMAC-SHA256. HMAC takes a key of any length, so the error is never returned; it is mapped, not unwrapped, so that
 /// nothing here can panic.
 pub fn hmac_sha256(key: &[u8], message: &[u8]) -> Result<[u8; 32], Error> {
+    let tag = hmac_unscrubbed(key, message);
+    scrub_stack(); // the key was in the frames of the hash (see `scrub_stack`)
+    tag
+}
+
+#[inline(never)]
+fn hmac_unscrubbed(key: &[u8], message: &[u8]) -> Result<[u8; 32], Error> {
     let mut mac = <Hmac<Sha256> as Mac>::new_from_slice(key).map_err(|_| Error::InvalidLength("hmac key"))?;
     mac.update(message);
     Ok(mac.finalize().into_bytes().into())
@@ -223,6 +248,13 @@ pub fn hmac_sha256(key: &[u8], message: &[u8]) -> Result<[u8; 32], Error> {
 
 /// Verifies an HMAC-SHA256 tag in constant time. A tag of the wrong length is a mismatch.
 pub fn hmac_sha256_verify(key: &[u8], message: &[u8], tag: &[u8]) -> bool {
+    let verdict = hmac_verify_unscrubbed(key, message, tag);
+    scrub_stack();
+    verdict
+}
+
+#[inline(never)]
+fn hmac_verify_unscrubbed(key: &[u8], message: &[u8], tag: &[u8]) -> bool {
     match <Hmac<Sha256> as Mac>::new_from_slice(key) {
         Ok(mut mac) => {
             mac.update(message);

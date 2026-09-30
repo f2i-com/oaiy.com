@@ -134,6 +134,21 @@ pub fn ct_eq(a: &[u8], b: &[u8]) -> bool {
     a.ct_eq(b).into()
 }
 
+/// How much of the stack below the caller is overwritten by [`scrub_stack`]: as much as a computation on a key can have used. The frames of a debug build are very large
+/// (the BLAKE2b computation reaches about 80 KiB down; the computation needs that much stack itself, so scrubbing it asks for nothing new), those of an optimised build
+/// a few hundred bytes.
+const SCRUB_DEPTH: usize = if cfg!(debug_assertions) { 96 * 1024 } else { 4 * 1024 };
+
+/// Overwrites the stack below its caller with zeros. A function that has worked on a key leaves, in the stack space it has given back, the copies that moves made
+/// (Rust cannot name them and `zeroize` cannot reach them: a state that is moved into a function is copied, and dropping wipes one of the places). Calling this, from
+/// the same frame that called the function, right after it returns, puts its own frame where the frames of the computation were and overwrites them as a whole.
+/// It is `#[inline(never)]` so that its frame is a frame of its own; the dead-stack probe in `tests/zeroize_stack.rs` is what shows that it reaches the copies.
+#[inline(never)]
+pub(crate) fn scrub_stack() {
+    let mut pad = [0u8; SCRUB_DEPTH];
+    core::hint::black_box(&mut pad);
+}
+
 /// A secret `String` (a recovery phrase, a kit code) that overwrites itself when dropped, and prints nothing.
 pub struct SecretString(Zeroizing<String>);
 
