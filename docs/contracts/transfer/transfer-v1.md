@@ -19,7 +19,7 @@ step with the OAIY repository's copy. The digests are in [SHA256SUMS](SHA256SUMS
 | [transfer-v1.start-ready.fixture.json](transfer-v1.start-ready.fixture.json) | `start.allowTransfer`, `ready.features`, `start.resume`, the `handoff:takeover` stop, and the compatibility matrix. |
 | [transfer-v1.ring-plan.fixture.json](transfer-v1.ring-plan.fixture.json) | The two plugin-to-host requests `oaiy.ring.plan` and `oaiy.ring.opened`. |
 | [transfer-v1.reserved-offer-id.fixture.json](transfer-v1.reserved-offer-id.fixture.json) | The reserved transfer offer id and its generations (vector V2). |
-| [transfer-v1.caller-asked.fixture.json](transfer-v1.caller-asked.fixture.json) | The "caller asked" phrase check: the normaliser, every rule and block, 78 positive and 92 negative cases, the windows, and the turns that only acknowledge the AI. |
+| [transfer-v1.caller-asked.fixture.json](transfer-v1.caller-asked.fixture.json) | The "caller asked" phrase check: the normaliser, every rule and block, 103 positive and 115 negative cases, the windows, the refusals a pause splits, and the turns that only acknowledge the AI. |
 
 ## How a transfer runs
 
@@ -155,7 +155,26 @@ Checks, in this order; each refusal is an ordinary `ok: false` result:
    what someone else said, a caller who is talking to somebody now ("I'm
    talking to someone else", though "can I speak to someone else" is an ask),
    a caller telling the receptionist what to say) and the cases are the caller-asked
-   fixture, the one source both ends are tested against; the plugin's check is
+   fixture, the one source both ends are tested against. A refusal a pause
+   splits is still a refusal: a sentence that ends in a refusal the caller has
+   begun and not finished ("I don't want to", "no need to", "please do not", "I
+   can't...") is carried to the sentence after it, in the same turn or the next,
+   and that sentence, when it begins with the verb the refusal is about
+   (speak, talk, chat, transfer, put, patch or connect, with a "to" or a "be"
+   before it if the refusal runs on with one), is read joined to it, and only
+   joined, so "I don't want to" then "speak to the owner" is not an ask. A
+   sentence that begins any other way is a sentence of its own and is read
+   alone, as it always was: an answer left without its full stop ("I can't",
+   "No need to.") does not swallow the ask that follows it ("Can I speak to the
+   owner?", "I want to speak to the owner"). Nothing else is carried and no
+   ask is ever looked for across a join otherwise ("No thanks." then "Can I
+   speak to the owner?" is an ask, as is "Hi" then the same). How a sentence
+   ends decides it: a question or exclamation mark or a line end finishes it;
+   a full stop finishes what could be a whole answer ("I can't.") but not what
+   needs a verb ("I don't want to."); no ending, or an ellipsis, finishes
+   neither. The fixture's `unfinished` object and `algorithm` say exactly how;
+   the read window is that of the last three turns, so the two sentences are
+   read as one only within it. The plugin's check is
    meant never to be stricter than the host's (what the host counts, the
    plugin lets through), because it runs first, with two differences that are
    stated here. It has no names in it: a caller who asks
@@ -172,7 +191,19 @@ Checks, in this order; each refusal is an ordinary `ok: false` result:
    acknowledgement-only turn can never be what asks, so dropping more of them
    only lets the last three reach further back); the one way it can be
    stricter is a turn the host drops for its timing that the plugin keeps,
-   which uses one of the plugin's three places. The floor is also looser than
+   which uses one of the plugin's three places. An ask counts for **one
+   request**. The turns this check reads are the turns not yet spent: the turns
+   said up to the tool call are spent when the request they asked for **opens**
+   (the host's plan authorised the ring and the request is open) and when the AI
+   has the caller back (the fresh session after a takeover or a hold). A request
+   that stops short of opening spends nothing: one refused before the host is
+   asked (a busy mailbox, a ceiling), a plan that refuses or offers a message
+   only, a host that does not answer or whose plan cannot be read, a call that
+   ends or changes while the host plans; the ask stands, and the model's retry
+   is judged on it. What the caller says after the tool call (while the host
+   plans, or later) is not spent by it: it is what the next request rests on,
+   so "Thanks, that is all sorted now" after a ring or a takeover is judged on
+   its own and not on the ask before it. The floor is also looser than
    the host for what only the host reads (an ask taken back, being told to say
    it, a different target such as billing, someone else in the room), which the
    host refuses after the floor has let it through; and the one difference of
@@ -347,9 +378,12 @@ The plan names devices by endpoint-key thumbprint (`phones` and
   design's vector V01 (the owner at the PC) therefore needs the Windows
   Companion **named**: the host puts the thumbprint of every paired Windows
   Companion it wants offered the call in `desktopCompanions`, including one that
-  is not running yet (the toast starts it, and it is offered the request when it
-  connects inside the ring window). A plan that sets `desktopToast` and leaves
-  `desktopCompanions` empty gets `no_endpoint` and no toast.
+  is not running. Nothing launches a Companion today (the desktop toast shows a
+  notification and raises the host's window, and that is all): a Companion the
+  plan names is assumed reachable for the whole ring window, and is offered the
+  request if it connects (its hello registers it) inside that window. A plan
+  that sets `desktopToast` and leaves `desktopCompanions` empty gets
+  `no_endpoint` and no toast.
 
 On the **relay carrier** the plugin publishes the offers, so it publishes them
 only to the named devices (a device outside the plan is offered no takeover of
@@ -383,9 +417,13 @@ therefore see that a transfer request is open, and is offered nothing to accept.
 
 The signed offer on the native call surface
 (`voice_system_ui`) has a reserved id, `toffer_` plus 26 characters of base32 of a
-hash of the request id and the device's thumbprint, so a ring hint posted by the
-host names the same offer that later reaches the phone
-([fixture](transfer-v1.reserved-offer-id.fixture.json)). A retired offer is never
+hash of the request id and the device's thumbprint, so that a ring hint, if a
+host posts one, names the same offer that later reaches the phone
+([fixture](transfer-v1.reserved-offer-id.fixture.json)). **No host posts a ring
+hint yet**, and none wakes a sleeping phone: the id is defined and
+vector-tested, the plugin publishes the offer under it, and a phone learns of
+the request from that offer alone. A phone in the roster is assumed reachable
+for the whole ring window. A retired offer is never
 published again under the same id: the id carries a generation that the plugin
 increments on every retirement.
 
@@ -461,12 +499,16 @@ and a responding device id, and no text from the call or the owner.
   `oaiy.ring.plan` and `oaiy.ring.opened`. Without it the plugin never offers
   transfer.
 * Run the caller-asked phrase check as the caller-asked fixture describes it
-  (its normaliser, rules, blocks, sentences, turn blocks and 300-character
+  (its normaliser, rules, blocks, sentences, the unfinished refusal carried to
+  the sentence after it when that begins with the verb it is about, turn blocks and 300-character
   reading; the fixture is the plugin's floor as well, so a request the host
   counts is never refused first, names aside), run it on the host's own record
   of what the caller said, which leaves out an acknowledgement said over the AI
   (the plugin, which cannot see that timing, drops every acknowledgement-only
-  turn from the `recentCallerTurns` of a plan request), and put
+  turn from the `recentCallerTurns` of a plan request), count an ask for one
+  request only (a turn is spent by the request that opened and by the AI
+  getting the caller back, as step 6 says: the host's own record too must not
+  let an ask from before authorise the next request), and put
   `"reasonAllowed": true` in the
   plan only when the host itself has confirmed the `urgent` or `policy_rule`
   reason for this call; without it those reasons also need the caller to have
@@ -487,13 +529,17 @@ and a responding device id, and no text from the call or the owner.
     names it: it has to be enrolled as an approved endpoint like a phone.
   * List the paired Windows Companion **whether or not it is online**. The
     design's reference `plan()` puts a Windows Companion in `desktopCompanions`
-    only while it is online (`d.online`); the toast exists to start a Companion
-    that is not running yet, so that plan emits an empty list at exactly the
-    moment it matters and the plugin now answers `no_endpoint`. Drop the online
-    filter for Windows Companions (keep `callAuthority`, `canTake` and the
-    availability rules). A Companion the plan named before it was running is
-    offered the request, on both surfaces and with the reserved id, when its
-    hello registers it inside the ring window.
+    only while it is online (`d.online`), so that plan emits an empty list
+    whenever the Companion is not connected at that moment and the plugin
+    answers `no_endpoint`, though it might connect inside the ring window. Drop
+    the online filter for Windows Companions (keep `callAuthority`, `canTake`
+    and the availability rules). A Companion the plan named before it was
+    running is offered the request, on both surfaces and with the reserved id,
+    when its hello registers it inside the ring window. Do not read more into
+    that than it says: nothing in the host launches a Companion (the toast is a
+    notification and raises the window) or wakes a sleeping phone (the plan's
+    `wake` list is not acted on: no ring hint or wake push is posted), so what
+    is offered is what is connected, or connects, inside the window.
 * `oaiy.ring.plan` may wait 1.5 s, and the answer to the tool call reaches the
   model only after the line it spoke before calling has drained (like every tool
   result), so the model's "I'll see if they are free" is not cut off.

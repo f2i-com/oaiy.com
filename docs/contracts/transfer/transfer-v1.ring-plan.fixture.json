@@ -2,7 +2,7 @@
   "contract": "transfer_v1",
   "kind": "ring_plan",
   "direction": "aokie_to_oaiy_host",
-  "about": "Two plugin-to-host requests, sent over the plugin's stdio like flow.run. The host announces ringPlan in plugin.init.features when it answers them; without it the plugin never offers transfer. oaiy.ring.plan asks who may be rung and for how long (the host's ring policy decides; the plugin enforces the answer). oaiy.ring.opened tells the host the request is open so it can start delivery (desktop toast, ring items); nothing waits for its answer. A host that does not answer the plan within 1.5 s, or answers something unusable, means nobody is rung: the tool result is unavailable with reason plan_unavailable.",
+  "about": "Two plugin-to-host requests, sent over the plugin's stdio like flow.run. The host announces ringPlan in plugin.init.features when it answers them; without it the plugin never offers transfer. oaiy.ring.plan asks who may be rung and for how long (the host's ring policy decides; the plugin enforces the answer). oaiy.ring.opened tells the host the request is open so that it can act on it (today OAIY shows a desktop toast and raises its window; no host posts ring hints, wakes a phone or launches a Companion yet); nothing waits for its answer. A host that does not answer the plan within 1.5 s, or answers something unusable, means nobody is rung: the tool result is unavailable with reason plan_unavailable.",
   "planWaitMillis": 1500,
   "init": {
     "method": "plugin.init",
@@ -89,7 +89,7 @@
         "turn 4"
       ]
     },
-    "paramsRules": "At most the last three caller turns that are not only acknowledgements of the AI (\"mm-hmm\", \"yeah, okay\": see backchannel in the caller-asked fixture), each cut to its last 300 characters (a turn is read from its end); callerNumber is left out when unknown. The turns never leave the machine: the host runs the phrase checks on them.",
+    "paramsRules": "At most the last three caller turns that are not only acknowledgements of the AI (\"mm-hmm\", \"yeah, okay\": see backchannel in the caller-asked fixture), each cut to its last 300 characters (a turn is read from its end), and only what was said after the last request the plugin opened (the host authorised the ring and the request is open; a plan that was refused, unanswered or unusable spends nothing, so the same ask can be planned again) and after the last time the AI got the caller back (an ask counts for one request); callerNumber is left out when unknown. The turns never leave the machine: the host runs the phrase checks on them.",
     "results": [
       {
         "name": "ring the planned phone",
@@ -304,7 +304,7 @@
         "plugin": "Answers unavailable, reason no_endpoint, opens nothing and does not send oaiy.ring.opened, so no toast follows: a toast is a notification, not a target. A plan for the owner at the PC names the Windows Companion in desktopCompanions (see the next case)."
       },
       {
-        "name": "the owner is at the PC: the toast, and the Windows Companion it starts named by its thumbprint",
+        "name": "the owner is at the PC: the toast, and the Windows Companion named by its thumbprint (nothing launches it)",
         "result": {
           "planId": "plan_0007b",
           "decision": "ring",
@@ -456,7 +456,7 @@
       "ownerEpoch": 4,
       "expiresAt": 1789000040
     },
-    "paramsRules": "expiresAt is Unix seconds: when the ring window ends. The host derives the reserved offer id of every phone in the plan from requestId and the phone's endpoint-key thumbprint (transfer-v1.reserved-offer-id.fixture.json), posts the ring items, and posts cancels when the request resolves.",
+    "paramsRules": "expiresAt is Unix seconds: when the ring window ends. A host that posts ring hints derives the reserved offer id of every phone in the plan from requestId and the phone's endpoint-key thumbprint (transfer-v1.reserved-offer-id.fixture.json), posts the ring items, and posts cancels when the request resolves. No host does yet: the id is defined and vector-tested, the plugin publishes the offer under it, and nothing else names it.",
     "result": {
       "ok": true
     }

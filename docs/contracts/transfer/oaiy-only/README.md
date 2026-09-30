@@ -107,10 +107,22 @@ The plan reasons OAIY puts in an `oaiy.ring.plan` answer are exactly the plugin'
     hyphen is removed outright, as the shared normaliser removes it.
 
   When the gate refuses a caller who did ask, the model is told to offer a message, so the caller has one or the other.
+* **A refusal that a pause splits** ("I don't want to" ... "speak to the owner") is read as the shared file's `unfinished` object says,
+  with its patterns and its endings held equal to the fixture's by a test: an unfinished refusal at the end of a sentence is carried to the
+  sentence after it, in the turn or the next, and read joined to it only when that begins with the verb the refusal is about. This desktop
+  reads it across the turns it has not spent, in the last three of them (a turn a ring has used up is not there to be read, so a refusal in
+  it is not carried into what is said after), and what is around it as it always read it: a turn that says nothing, tells the receptionist
+  what to say, or is a role marker is not read and drops what was carried; an ask before the refusal stands, and "never mind" after it takes
+  it back. An acknowledgement that this desktop records as a turn (said in a pause) is not the verb the refusal is about, so it ends the
+  carry here; the phone drops it by its words and joins the refusal to what follows, so **for that one sequence the floor refuses what this
+  desktop would count**, which is the allowed way round (its own case is in `phrases-oaiy.json`). The carry is the shared one and no wider:
+  a refusal this desktop's blocks know that the shared patterns do not (`couldn't`, `no way`, `not looking to`) is refused when it is in
+  one sentence and is not carried across a pause.
 * **Where the floor accepts and this desktop refuses.** `phrases-oaiy.json` holds only what the shared file does not have as
-  written: 35 requests, 49 that are not, and the 10 and 7 named ones (a case the shared file has is not repeated here, and a test
-  fails if one is). The phone's floor runs first, so a caller must pass both checks. Every way of asking that this desktop counts
-  is in the shared file (since Aokie's `f34dda2`), so the floor is never the stricter of the two for an ask. It is looser for what
+  written: 37 requests, 49 that are not, and the 10 and 8 named ones (a case the shared file has is not repeated here, and a test
+  fails if one is; of the two positives about a refusal split by a pause the floor accepts the one about being told what to say, and does
+  not accept the one about an acknowledgement, the one sequence where it is stricter). The phone's floor runs first, so a caller must pass both checks. Every way of asking that this desktop
+  counts is in the shared file, so the floor is never the stricter of the two for an ask, except for that acknowledgement. It is looser for what
   this desktop refuses besides: the say and write commands, an ask taken back, a different target, "do I have to talk to", and
   the contractions below. That is allowed. **The floor accepts these, this desktop refuses**, because they are not asks (each is an
   OAIY-only non-request, and each was checked to be accepted by the floor):

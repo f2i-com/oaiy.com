@@ -274,11 +274,18 @@ agent : "I'll try to reach them, please stay with me."  (it is trying: it does n
   further (what they said while the request was being planned and sent is the next request's own), and when the owner hands
   the caller back to the receptionist (`resume.afterHandoff`, or this desktop's own record of the handoff) every turn so far is
   used up: the next request is judged on what the caller says after that, so "Thanks, that is all sorted now" or "No, just take a
-  message please" after a ring, however much later, is never taken for asking again. A request that was refused, or that the phone
-  refused before anything rang, acted on nothing, and its ask stands, and so does it when the call's session is made anew for
-  the same call with no owner between (the phone's stream dropped and came back): the retry is judged on the same ask. A plan is
-  for one beginning of the call: if the call began again since it was allowed, the request is refused as a call that changed
-  (`call_changed`, the try given back), and one plan opens one ring.
+  message please" after a ring, however much later, is never taken for asking again. This is the contract's rule (`transfer-v1.md`, the
+  caller-asked check): an ask is spent when the request **opens** (the plan authorised the ring and the request is open) and when the AI
+  has the caller back, and by nothing that stops short of that. The ask **stands**, and the retry is judged on it, after: a request this
+  desktop refused at its own gate (a limit, the owner's settings, quiet hours: the plan that is only a message); a request the phone
+  refused before anything rang (consent taken back, a busy mailbox or a ceiling, an arguments or plan error: the try is given back); a host
+  that never answers the plan or the request, or whose plan cannot be read (given up on as `no_answer`; the gap between tries still holds);
+  a caller who hangs up, or a call that changes, while the host plans (`call_ended`, `call_changed`: nothing rings); and a session made
+  anew for the same call with no owner between (the phone's stream dropped and came back). What the caller says after the tool call, while
+  the host plans or later, is not spent by the ring that opens on it: the mark is taken at the tool call (the gate's own judgement, which the
+  plugin's question about the same request is answered with), and a plan the plugin asks about that this desktop had not allowed at the gate is
+  judged when it is asked. A plan is for one beginning of the call: if the call began again since it was allowed, the request is refused as a
+  call that changed (`call_changed`, the try given back), and one plan opens one ring.
 - **Take a message.** `take_message` goes to `POST /api/voice/calls/{id}/message`, on the call's own
   route: the number comes from this desktop's record of the call, and the message is refused when the
   owner has not allowed messages, or a limit is reached. The receptionist says the owner "will be

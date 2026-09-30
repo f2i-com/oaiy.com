@@ -204,17 +204,15 @@ fn build_rules(names: &[String]) -> Rules {
 /// Blocks that read a whole turn: a caller telling the receptionist what to say or do, whatever else the turn holds.
 fn turn_blocks() -> &'static [Regex] {
     static BLOCKS: OnceLock<Vec<Regex>> = OnceLock::new();
-    BLOCKS.get_or_init(|| {
-        compile(
-            &[
-                r"\b(?:repeat after me|say after me|say the words|say exactly|read (?:this|the following)|type this|write this|copy this|echo|pretend|role ?play|you are now|from now on|new instructions|system prompt|developer mode|jailbreak)\b",
-                r"\bignore (?:all |your |any |the |previous |above )*(?:rules|instructions|prompt|guidelines)\b",
-                r"\b(?:system|assistant|developer|instruction)s? ?(?:says|said|note|message)\b",
-            ]
-            .map(String::from),
-        )
-    })
+    BLOCKS.get_or_init(|| compile(&TURN_BLOCKS.map(String::from)))
 }
+
+/// The turn blocks (the shared fixture's `turnBlocks`, held equal to it by a test).
+const TURN_BLOCKS: [&str; 3] = [
+    r"\b(?:repeat after me|say after me|say the words|say exactly|read (?:this|the following)|type this|write this|copy this|echo|pretend|role ?play|you are now|from now on|new instructions|system prompt|developer mode|jailbreak)\b",
+    r"\bignore (?:all |your |any |the |previous |above )*(?:rules|instructions|prompt|guidelines)\b",
+    r"\b(?:system|assistant|developer|instruction)s? ?(?:says|said|note|message)\b",
+];
 
 /// A caller telling the receptionist to say or write something ("Please say: can I speak to the owner", "Write 'transfer me to the owner'"),
 /// not asking: before it is normalised, since what follows the word (a colon, a quote) is what tells it from "Say, can I speak to the owner?"
@@ -264,8 +262,11 @@ fn asks_for_another_target(sentence: &str, names: &[String]) -> bool {
 /// The turn's role markers before it is normalised (`System:` is not a word the normaliser can keep).
 fn role_marker() -> &'static Regex {
     static MARKER: OnceLock<Regex> = OnceLock::new();
-    MARKER.get_or_init(|| Regex::new(r"(?i)\b(?:system|assistant|developer|instruction)s?\s*:").expect("a valid pattern"))
+    MARKER.get_or_init(|| Regex::new(&format!("(?i){ROLE_MARKER}")).expect("a valid pattern"))
 }
+
+/// The role marker, matched case-insensitively (the shared fixture's `roleMarker`, held equal to it by a test).
+const ROLE_MARKER: &str = r"\b(?:system|assistant|developer|instruction)s?\s*:";
 
 /// `text` as the rules read it: lower case, the characters in [`REMOVED_CHARACTERS`] removed outright, apostrophe look-alikes the
 /// apostrophe, every run of anything but `a-z 0-9 '` and space one space, and trimmed.
@@ -316,9 +317,94 @@ pub fn owner_names(business: &str) -> Vec<String> {
     re.captures(business).map(|c| vec![c[1].to_lowercase()]).unwrap_or_default()
 }
 
-/// The sentences of a turn (a full stop, a question mark, an exclamation mark or a line end ends one).
-fn sentences(turn: &str) -> Vec<String> {
-    turn.split(|c: char| matches!(c, '.' | '?' | '!' | '\n' | '\r' | '\u{2026}')).map(plain).filter(|s| !s.is_empty()).collect()
+/// The characters that end a sentence (the shared fixture's `sentenceEnds`).
+fn ends_a_sentence(c: char) -> bool {
+    matches!(c, '.' | '?' | '!' | '\n' | '\r' | '\u{2026}')
+}
+
+/// How a sentence of a turn ends, by the run of [`ends_a_sentence`] characters after it (the shared fixture's `unfinished`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Ending {
+    /// A question or exclamation mark or a line end: the sentence is finished, whatever it says.
+    Hard,
+    /// An ellipsis character, or two or more full stops: it trails off.
+    Trailing,
+    /// One full stop.
+    Stop,
+    /// Nothing follows it in the turn.
+    Open,
+}
+
+/// The characters that make a run [`Ending::Hard`] (the fixture's `unfinished.hard`), the one that makes it trailing (`unfinished.trailing`), and how
+/// many full stops make it trail off (`unfinished.trailingDots`): a test holds them to the fixture's.
+const HARD_ENDS: [char; 4] = ['?', '!', '\n', '\r'];
+const TRAILING_ENDS: [char; 1] = ['\u{2026}'];
+const TRAILING_DOTS: usize = 2;
+
+/// What a refusal the caller has begun and left unfinished ("I don't want to", "no need to", "please do not", "I can't...") looks like, and what
+/// finishes it (the shared fixture's `unfinished`: `always`, `bare` and `joins`, held equal to it by a test). A read sentence that is unfinished is
+/// carried to the sentence after it, in the turn or the next, and that sentence, when it begins with the verb the refusal is about, is read joined to
+/// it and only joined, so a pause does not turn what follows a refusal into an ask; one that begins any other way is read alone, and the carried one
+/// is dropped: an answer left without its full stop ("I can't", "No need to.") does not swallow the ask after it ("Can I speak to the owner?").
+const UNFINISHED_ALWAYS: &str = r"\b(?:(?:do not|don't|dont|does not|doesn't|did not|didn't|will not|won't|wont|would not|wouldn't|should not|shouldn't|can not|can't|cant|cannot) (?:want|wanna|need|have|like|wish|try|ask|expect|intend|going|gonna|able)(?: to)?|no need to|no wish to|not going to|not gonna|not able to|unable to|refuse to|rather not)$";
+const UNFINISHED_BARE: &str = r"\b(?:do not|don't|dont|does not|doesn't|did not|didn't|will not|won't|wont|would not|wouldn't|should not|shouldn't|can not|can't|cant|cannot)$";
+const UNFINISHED_JOINS: &str = r"^(?:to )?(?:be )?(?:speak|talk|chat|transfer|put|patch|connect)\w*\b";
+
+fn unfinished_patterns() -> &'static [Regex; 3] {
+    static PATTERNS: OnceLock<[Regex; 3]> = OnceLock::new();
+    PATTERNS.get_or_init(|| [UNFINISHED_ALWAYS, UNFINISHED_BARE, UNFINISHED_JOINS].map(|p| Regex::new(p).expect("a valid pattern")))
+}
+
+/// How the run of sentence-end characters after a sentence leaves it.
+fn ending_of(run: &[char]) -> Ending {
+    if run.iter().any(|c| HARD_ENDS.contains(c)) {
+        Ending::Hard
+    } else if run.iter().any(|c| TRAILING_ENDS.contains(c)) || run.iter().filter(|c| **c == '.').count() >= TRAILING_DOTS {
+        Ending::Trailing
+    } else {
+        Ending::Stop
+    }
+}
+
+/// The sentences of a turn, each made plain (the empty ones dropped) with how it ends: the pieces of the turn between runs of characters that end
+/// a sentence, and the last of them open when the turn does not end in one.
+fn sentences(turn: &str) -> Vec<(String, Ending)> {
+    let chars: Vec<char> = turn.chars().collect();
+    let mut out = Vec::new();
+    let mut piece = String::new();
+    let mut i = 0;
+    let mut keep = |piece: &mut String, ending: Ending| {
+        let plain = plain(piece);
+        piece.clear();
+        if !plain.is_empty() {
+            out.push((plain, ending));
+        }
+    };
+    while i < chars.len() {
+        if ends_a_sentence(chars[i]) {
+            let start = i;
+            while i < chars.len() && ends_a_sentence(chars[i]) {
+                i += 1;
+            }
+            keep(&mut piece, ending_of(&chars[start..i]));
+        } else {
+            piece.push(chars[i]);
+            i += 1;
+        }
+    }
+    keep(&mut piece, Ending::Open);
+    out
+}
+
+/// Whether a read sentence that ends as `ending` leaves a refusal unfinished: one that ends hard never does; one that ends in a full stop does when
+/// it needs a verb ("I don't want to."), not when it could be a whole answer ("I can't."); one that ends in nothing, or trails off, does either way.
+fn is_unfinished(read: &str, ending: Ending) -> bool {
+    let [always, bare, _] = unfinished_patterns();
+    match ending {
+        Ending::Hard => false,
+        Ending::Stop => always.is_match(read),
+        Ending::Open | Ending::Trailing => always.is_match(read) || bare.is_match(read),
+    }
 }
 
 /// Characters nobody sees (joiners, marks, the soft hyphen), which a caller's speech engine never writes and a typed text may hide a word
@@ -332,26 +418,45 @@ fn sentence_asks(sentence: &str, rules: &Rules, names: &[String]) -> bool {
     !rules.blocks.iter().any(|b| b.is_match(sentence)) && rules.rules.iter().any(|r| r.is_match(sentence)) && !asks_for_another_target(sentence, names)
 }
 
-/// Where `asked` stands after one more turn: a turn that asks for a person makes it so, one that takes it back ("never mind") makes it not,
-/// in the order it says them, and one that is the caller telling the receptionist what to say (or a role marker, or an instruction to
-/// ignore) changes nothing.
-fn fold_turn(asked: bool, turn: &str, rules: &Rules, names: &[String]) -> bool {
+/// Where the reading of the caller's turns stands: whether they have asked, and the unfinished refusal carried to the next sentence read, if there is one.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+struct Reading {
+    asked: bool,
+    /// A read sentence that is unfinished (see [`UNFINISHED_ALWAYS`]), which the next sentence read is joined to if it begins with the verb the refusal
+    /// is about.
+    carried: Option<String>,
+}
+
+/// Where the reading stands after one more turn. A turn that is not read (a role marker, the caller telling the receptionist what to say, an instruction
+/// to ignore, nothing said) changes nothing and drops what was carried. Otherwise it is read a sentence at a time, in order: a sentence is read as it is, or,
+/// when a refusal was carried and it begins with the verb that refusal is about, as the carried sentence, a space and this one (the carried one is not read
+/// again and this one is not read alone); a read sentence that asks makes it so, one that takes it back ("never mind") makes it not; and one that is
+/// unfinished is carried to the next, in the turn or the next turn read, and anything else is not.
+fn fold_turn(reading: Reading, turn: &str, rules: &Rules, names: &[String]) -> Reading {
     let turn = strip_unseen(turn);
+    let not_read = Reading { asked: reading.asked, carried: None };
     if role_marker().is_match(&turn) || is_command(&turn) {
-        return asked;
+        return not_read;
     }
     let whole = plain(&turn);
     if whole.is_empty() || turn_blocks().iter().any(|b| b.is_match(&whole)) {
-        return asked;
+        return not_read;
     }
-    sentences(&turn).iter().fold(asked, |asked, s| {
-        if sentence_asks(s, rules, names) {
+    let [_, _, joins] = unfinished_patterns();
+    sentences(&turn).into_iter().fold(reading, |reading, (sentence, ending)| {
+        let read = match reading.carried {
+            Some(carried) if joins.is_match(&sentence) => format!("{carried} {sentence}"),
+            _ => sentence,
+        };
+        let asked = if sentence_asks(&read, rules, names) {
             true
-        } else if retracts().is_match(s) {
+        } else if retracts().is_match(&read) {
             false
         } else {
-            asked
-        }
+            reading.asked
+        };
+        let carried = is_unfinished(&read, ending).then_some(read);
+        Reading { asked, carried }
     })
 }
 
@@ -363,7 +468,7 @@ pub fn caller_asked<S: AsRef<str>>(turns: &[S]) -> bool {
 /// ...or for one of `names` (lower case), the owner's.
 pub fn caller_asked_for<S: AsRef<str>>(turns: &[S], names: &[String]) -> bool {
     let rules = rules(names);
-    recent(turns).iter().fold(false, |asked, t| fold_turn(asked, t, &rules, names))
+    recent(turns).iter().fold(Reading::default(), |reading, t| fold_turn(reading, t, &rules, names)).asked
 }
 
 /// One urgent phrase's rules: where it is said, and what makes saying it not a statement that it is so.
@@ -506,6 +611,115 @@ mod tests {
         group
     }
 
+    /// The contract's own document says how many cases the fixture holds ("103 positive and 115 negative cases"): the fixture holds what the document says.
+    #[test]
+    fn the_contract_document_counts_the_cases_the_fixture_holds() {
+        let document = include_str!("../../../../../docs/contracts/transfer/transfer-v1.md");
+        let said = Regex::new(r"(\d+) positive and (\d+) negative cases").unwrap().captures(document).expect("the document counts the cases");
+        let v: Value = serde_json::from_str(SHARED).unwrap();
+        let (positive, negative) = (v["positive"].as_array().unwrap().len(), v["negative"].as_array().unwrap().len());
+        assert_eq!((said[1].parse::<usize>().unwrap(), said[2].parse::<usize>().unwrap()), (positive, negative));
+        // Every group the fixture has is read below, whatever its size: none of them may be empty.
+        for group in ["positive", "negative", "window"] {
+            assert!(!v[group].as_array().unwrap().is_empty(), "{group}");
+        }
+        assert!(!v["backchannel"]["cases"].as_array().unwrap().is_empty());
+    }
+
+    /// The reading of a refusal that a pause splits is the fixture's: its patterns, its endings and its turn blocks are the ones written here, character
+    /// for character (a pattern changed on one side only, or one verb more or fewer, is a different reading).
+    #[test]
+    fn the_carry_and_the_turn_blocks_are_the_fixtures_own() {
+        let v: Value = serde_json::from_str(SHARED).unwrap();
+        let unfinished = &v["unfinished"];
+        assert_eq!(UNFINISHED_ALWAYS, unfinished["always"].as_str().unwrap());
+        assert_eq!(UNFINISHED_BARE, unfinished["bare"].as_str().unwrap());
+        assert_eq!(UNFINISHED_JOINS, unfinished["joins"].as_str().unwrap());
+        assert_eq!(HARD_ENDS.iter().map(char::to_string).collect::<Vec<_>>(), strings(&unfinished["hard"]));
+        assert_eq!(TRAILING_ENDS.iter().map(char::to_string).collect::<Vec<_>>(), strings(&unfinished["trailing"]));
+        assert_eq!(TRAILING_DOTS as u64, unfinished["trailingDots"].as_u64().unwrap());
+        // The verbs the refusal is about: the fixture's seven, each of which a case of the fixture tells from the others.
+        let verbs = Regex::new(r"\(\?:((?:\w+\|)+\w+)\)\\w\*").unwrap().captures(unfinished["joins"].as_str().unwrap()).expect("the joining verbs")[1].to_string();
+        assert_eq!(verbs, "speak|talk|chat|transfer|put|patch|connect");
+        assert_eq!(TURN_BLOCKS.to_vec(), strings(&v["turnBlocks"]));
+        assert_eq!(ROLE_MARKER, v["roleMarker"].as_str().unwrap());
+        // The characters that end a sentence are the fixture's `sentenceEnds`, and no others.
+        let ends: Vec<char> = strings(&v["sentenceEnds"]).iter().map(|s| s.chars().next().unwrap()).collect();
+        assert_eq!(ends.len(), 6);
+        for c in ends {
+            assert!(ends_a_sentence(c), "{c:?}");
+        }
+        for c in [',', ';', ':', '-', '\u{2014}', ' ', 'a'] {
+            assert!(!ends_a_sentence(c), "{c:?} does not end a sentence");
+        }
+    }
+
+    /// The fixture's own cases run the carry (the shared groups below). What this desktop adds to it is what the contract leaves to the host: the
+    /// reading around it. A sentence that ends in a run of end characters ends as the run leaves it, whatever else is in the run.
+    #[test]
+    fn a_sentence_ends_as_the_run_after_it_leaves_it() {
+        use Ending::{Hard, Open, Stop, Trailing};
+        let read = |turn: &str| sentences(turn);
+        assert_eq!(read("I don't want to... speak to the owner."), [("i don't want to".to_string(), Trailing), ("speak to the owner".to_string(), Stop)]);
+        assert_eq!(read("Well\u{2026} ok"), [("well".to_string(), Trailing), ("ok".to_string(), Open)]);
+        assert_eq!(read("Yes. No! Maybe? Fine\nSure"), [("yes".to_string(), Stop), ("no".to_string(), Hard), ("maybe".to_string(), Hard), ("fine".to_string(), Hard), ("sure".to_string(), Open)]);
+        assert_eq!(read("What?! ok"), [("what".to_string(), Hard), ("ok".to_string(), Open)], "a hard end anywhere in the run");
+        assert_eq!(read("Well.. right"), [("well".to_string(), Trailing), ("right".to_string(), Open)], "two full stops trail off");
+        assert_eq!(read("Hmm.. right"), [("right".to_string(), Open)], "a filler alone is nothing, and what is left of it is dropped");
+        // What is left of an empty piece is dropped, and so is the run after it; a turn that ends in a run has nothing open after it.
+        assert_eq!(read("One. . Two."), [("one".to_string(), Stop), ("two".to_string(), Stop)]);
+        assert_eq!(read("..."), Vec::<(String, Ending)>::new());
+        assert_eq!(read("no ending"), [("no ending".to_string(), Open)]);
+        // A comma, a dash, a semicolon end nothing.
+        assert_eq!(read("I don't want to - speak, ok; fine"), [("i don't want to speak ok fine".to_string(), Open)]);
+    }
+
+    /// A refusal a pause splits is read joined to what follows only when what follows begins with the verb it is about, inside a turn and across turns,
+    /// and what this desktop does around that: the earlier ask stands, an empty piece or a turn that is not read is what it is.
+    #[test]
+    fn a_refusal_that_a_pause_splits_is_joined_only_to_the_verb_it_is_about_and_what_is_around_it_reads_as_it_did() {
+        // Across a full stop that needs a verb, an ellipsis, a dash-less run, in a turn and between turns.
+        for turns in [
+            vec!["I don't want to. Speak to the owner"],
+            vec!["I don't want to\u{2026}", "speak to the owner"],
+            vec!["I would rather not", "talk to a person"],
+            vec!["We won't", "put me through to the manager"],
+            vec!["I don't want to. . speak to the owner"],
+            // The two halves are read with a space between them: a refusal that stops before its "to" is finished by the "to" that begins the rest.
+            vec!["I don't want", "to speak to the owner"],
+            vec!["I don't want\u{2026}", "to talk to a person"],
+            // ...and as one sentence, so a block that spans the join holds for all of it, and only with that space ("can'tspeak" is no refusal at all).
+            vec!["I can't", "speak up, can I talk to the owner"],
+        ] {
+            assert!(!caller_asked(&turns), "{turns:?} is a refusal");
+        }
+        // Read alone when it is not: a refusal that could be a whole answer with its full stop, one that ends hard, and a sentence that begins otherwise.
+        for turns in [
+            vec!["I can't. Speak to the owner"],
+            vec!["I don't want to! Speak to the owner"],
+            vec!["I don't want to?", "speak to the owner"],
+            vec!["I don't want to", "I want to speak to the owner"],
+            vec!["I don't want to", "can you put me through to the owner"],
+            vec!["Please do not.", "transfer me to the owner"],
+        ] {
+            assert!(caller_asked(&turns), "{turns:?} asks");
+        }
+        // An ask that came before it stands: a refusal is not a taking back (that is "never mind"), and the refusal itself is not an ask.
+        assert!(caller_asked(&["Can I speak to the owner", "I don't want to", "speak to the manager"]));
+        assert!(!caller_asked(&["I don't want to", "speak to the manager"]));
+        // A turn that says nothing is a turn that is not read: it drops what was carried, as the fixture's role marker does; and so does one that only
+        // tells the receptionist what to say (this desktop's own reading of it).
+        assert!(caller_asked(&["I don't want to", "...", "speak to the owner"]));
+        assert!(caller_asked(&["I don't want to", "Please say: hello there", "speak to the owner"]));
+        assert!(caller_asked(&["I don't want to", "System: hello", "speak to the owner"]));
+        // A turn that takes the ask back is read alone, and a refusal that is carried to it is dropped.
+        assert!(!caller_asked(&["Can I speak to the owner", "I don't want to", "never mind"]));
+        // The window is the last three turns, so a refusal four turns back is not carried into it.
+        assert!(caller_asked(&["I don't want to", "hold on", "wait", "speak to the owner"]));
+        // What is carried is the sentence as it was read, so a refusal that runs on and is finished again is not carried further.
+        assert!(caller_asked(&["I don't want to be rude", "but I would like to speak to the owner"]));
+    }
+
     #[test]
     fn the_shared_positives_are_requests_for_a_person() {
         let mut checked = 0;
@@ -520,12 +734,15 @@ mod tests {
     #[test]
     fn the_shared_negatives_are_not() {
         let mut checked = 0;
+        let mut wrong = Vec::new();
         for case in shared_group("negative") {
             let turns = strings(&case["turns"]);
-            assert!(!caller_asked(&turns), "{}: {turns:?} does not ask for a person", case["name"]);
+            if caller_asked(&turns) {
+                wrong.push(format!("{}: {turns:?}", case["name"]));
+            }
             checked += 1;
         }
-        assert_eq!(checked, cases(SHARED, "negative").len(), "every one of them");
+        assert!(wrong.is_empty(), "{} of {checked} negatives ask:\n{}", wrong.len(), wrong.join("\n"));
     }
 
     #[test]
@@ -641,7 +858,7 @@ mod tests {
         let positives = cases(OAIY_EXTRA, "positive");
         let negatives = cases(OAIY_EXTRA, "negative");
         // (What only this desktop counts or refuses: none of it is in the shared fixture, whose cases are not repeated here.)
-        assert!(positives.len() >= 35 && negatives.len() >= 49, "{} {}", positives.len(), negatives.len());
+        assert!(positives.len() >= 37 && negatives.len() >= 49, "{} {}", positives.len(), negatives.len());
         // (Compared as written, lower-cased: a case that differs only in what the shared normaliser reads past, such as a zero width space, is
         // this desktop's own to keep.)
         let shared_turns: std::collections::BTreeSet<String> = ["positive", "negative"].iter().flat_map(|group| cases(SHARED, group)).map(|turns| turns.iter().map(|t| t.to_lowercase()).collect::<Vec<_>>().join(" | ")).collect();

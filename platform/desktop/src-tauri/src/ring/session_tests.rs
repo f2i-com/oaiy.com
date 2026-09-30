@@ -1006,6 +1006,31 @@ fn a_ring_uses_up_the_ask_it_was_made_on_and_the_next_request_needs_an_ask_of_it
     assert!(r.ring.authorise(CALL, Reason::CallerAsked).rings(), "the same ask, judged again");
 }
 
+/// A refusal the caller began and a pause split is read joined to the words after it: only across what has not been spent. Turns a ring has used up are
+/// not read again (the call does not give them), so an unfinished refusal among them is not carried into what is said after.
+#[test]
+fn a_refusal_that_a_ring_has_used_up_is_not_carried_into_the_words_after_it() {
+    let judged = |turns: &[&str]| {
+        let r = rig(Presence::Active);
+        r.calls.info.lock().unwrap().clear();
+        r.calls.info.lock().unwrap().push((CALL.into(), CallInfo { from: "+61491570006".into(), name: "Alex".into(), turns: turns.iter().map(|t| t.to_string()).collect(), ..Default::default() }));
+        r.ring.authorise(CALL, Reason::CallerAsked)
+    };
+    // Not spent: the refusal and what follows it are read together, and it is not an ask.
+    let joined = judged(&["Hi", "I don't want to", "speak to the owner"]);
+    assert_eq!((joined.plan.decision, joined.plan.reason), (Decision::Refused, PlanReason::CallerDidNotAsk), "{:?}", joined.plan);
+    // Spent by a ring that opened: what the caller says after is its own, and it is read alone (the words the fixture reads joined are not there to be).
+    let r = rig(Presence::Active);
+    r.calls.consuming.store(true, std::sync::atomic::Ordering::SeqCst);
+    r.calls.info.lock().unwrap().clear();
+    r.calls.info.lock().unwrap().push((CALL.into(), CallInfo { from: "+61491570006".into(), name: "Alex".into(), turns: vec!["Hi".into(), "I don't want to".into()], ..Default::default() }));
+    r.ring.use_up_asked_turns(CALL, 2);
+    assert!(r.calls.info.lock().unwrap()[0].1.turns.is_empty(), "the call gives no spent turns");
+    r.calls.info.lock().unwrap()[0].1.turns.push("speak to the owner".into());
+    let alone = r.ring.authorise(CALL, Reason::CallerAsked);
+    assert!(alone.rings(), "read alone, it asks: {:?}", alone.plan);
+}
+
 #[test]
 fn a_caller_who_asks_for_the_owner_by_name_rings_only_when_the_desktop_knows_that_name() {
     let r = rig(Presence::Active);
