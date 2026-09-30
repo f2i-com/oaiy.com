@@ -206,8 +206,11 @@ impl SetupCode {
             wrong_left: WRONG_GUESSES,
             extra: Map::new(),
         };
+        // The file and the memory change together, under the lock, as every count does: a count of the code before
+        // this one, written slowly, cannot land after it.
+        let mut state = self.lock();
         self.write(&stored).map_err(MakeError::Io)?;
-        *self.lock() = Some(stored);
+        *state = Some(stored);
         Ok(display(&code))
     }
 
@@ -264,19 +267,17 @@ impl SetupCode {
         }
         stored.wrong_left = stored.wrong_left.saturating_sub(1);
         let left = stored.wrong_left;
+        // Written (or deleted) under the lock: two guesses cannot write their counts out of order, and a count
+        // written slowly cannot land after a newer one and give a guess back at the next restart.
         if left == 0 {
             *guard = None;
-            drop(guard);
             self.delete();
-        } else {
-            let snapshot = stored.clone();
-            drop(guard);
-            if let Err(e) = self.write(&snapshot) {
-                warn(format!(
-                    "auth: the setup code's count could not be written: {e}"
-                ));
-            }
+        } else if let Err(e) = self.write(stored) {
+            warn(format!(
+                "auth: the setup code's count could not be written: {e}"
+            ));
         }
+        drop(guard);
         Check::Wrong {
             attempts_left: left,
         }
@@ -284,7 +285,8 @@ impl SetupCode {
 
     /// The code was used: it is gone.
     pub fn consume(&self) {
-        *self.lock() = None;
+        let mut state = self.lock();
+        *state = None;
         self.delete();
     }
 }
@@ -609,6 +611,96 @@ mod tests {
             Check::Wrong { attempts_left: 99 }
         );
         assert_eq!(code.attempts_left(), Some(99), "memory is authoritative");
+    }
+
+    /// A writer for which the write of one particular text is slow.
+    struct Slow {
+        marker: &'static str,
+        wait: std::time::Duration,
+    }
+
+    impl FileWriter for Slow {
+        fn write(&self, path: &Path, bytes: &[u8]) -> io::Result<()> {
+            if String::from_utf8_lossy(bytes).contains(self.marker) {
+                std::thread::sleep(self.wait);
+            }
+            SecureWriter.write(path, bytes)
+        }
+    }
+
+    fn slow_setup(marker: &'static str) -> (TempDir, SetupCode) {
+        let dir = TempDir::new("setup-slow");
+        std::fs::create_dir_all(dir.0.join("auth")).unwrap();
+        let writer = Arc::new(Slow {
+            marker,
+            wait: std::time::Duration::from_millis(300),
+        });
+        let clock = Arc::new(ManualClock::new(T0));
+        let code = SetupCode::open(&dir.0.join("auth"), clock, writer).unwrap();
+        (dir, code)
+    }
+
+    fn on_disk(dir: &TempDir) -> Value {
+        serde_json::from_str(
+            &std::fs::read_to_string(dir.0.join("auth").join("setup-code.json")).unwrap(),
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn two_wrong_guesses_at_once_leave_the_newer_count_on_disk_however_slow_the_older_write_is() {
+        // The count after the first wrong guess (99) is written slowly; the second guess (98) counts and writes while
+        // it sleeps. The file must end with 98: an older count landing last would give a guess back at a restart.
+        let (dir, code) = slow_setup("\"wrong_left\":99");
+        code.make(&fixed(VECTOR_BYTES)).unwrap();
+        std::thread::scope(|s| {
+            s.spawn(|| code.check("AAAA-AAAA-AAAA"));
+            std::thread::sleep(std::time::Duration::from_millis(100));
+            s.spawn(|| code.check("BBBB-BBBB-BBBB"));
+        });
+        assert_eq!(code.attempts_left(), Some(98));
+        assert_eq!(
+            on_disk(&dir)["wrong_left"],
+            98,
+            "the file agrees with memory"
+        );
+    }
+
+    #[test]
+    fn forty_wrong_guesses_at_once_are_all_on_disk_and_a_restart_gives_none_back() {
+        let dir = TempDir::new("setup-forty");
+        std::fs::create_dir_all(dir.0.join("auth")).unwrap();
+        let clock = Arc::new(ManualClock::new(T0));
+        let code = open(&dir, &clock);
+        code.make(&fixed(VECTOR_BYTES)).unwrap();
+        std::thread::scope(|s| {
+            for i in 0..40 {
+                let code = &code;
+                s.spawn(move || code.check(&format!("AAAA-AAAA-{i:04}")));
+            }
+        });
+        assert_eq!(code.attempts_left(), Some(60));
+        assert_eq!(on_disk(&dir)["wrong_left"], 60);
+        assert_eq!(open(&dir, &clock).attempts_left(), Some(60));
+    }
+
+    #[test]
+    fn a_new_code_is_the_one_on_disk_whatever_an_older_count_write_is_doing() {
+        // A count of the first code is being written slowly when the next code is made: the file must end as the
+        // next code (an older count landing after it would bring the first code back at a restart).
+        let (dir, code) = slow_setup("\"wrong_left\":99");
+        code.make(&fixed(VECTOR_BYTES)).unwrap();
+        let second = std::thread::scope(|s| {
+            s.spawn(|| code.check("AAAA-AAAA-AAAA"));
+            std::thread::sleep(std::time::Duration::from_millis(100));
+            code.make(&counting()).unwrap()
+        });
+        assert_eq!(
+            on_disk(&dir)["hash"],
+            hash(&normalise(&second).unwrap()),
+            "the file holds the newer code"
+        );
+        assert_eq!(on_disk(&dir)["wrong_left"], 100);
     }
 
     #[test]
