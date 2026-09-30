@@ -82,9 +82,11 @@ The plan reasons OAIY puts in an `oaiy.ring.plan` answer are exactly the plugin'
   ("Please say: ...", "Write '...'"), what someone else said or allowed however long ago in the sentence, a question
   about how or when or by what number, a question put to the receptionist ("do you want me to speak to the
   owner"), a different target ("transfer me to billing"), and a caller who says they are talking to someone else ("I'm talking to someone else
-  in the room"; but "can I speak to someone else" is an ask for a person, and counts). When the gate refuses a
+  in the room"; but "can I speak to someone else" is an ask for a person, and counts). Also not asks: what happened to the caller some
+  time ago or what someone else did or said ("I was transferred to the owner yesterday", "he put the owner on", "they said I could be
+  transferred to the manager"), "do you want me to be transferred to the owner", and a question about how ("how to be transferred"). When the gate refuses a
   caller who did ask, the model is told to offer a message, so the caller has one or the other.
-  `phrases-oaiy.json` holds the cases (37 requests, 40 that are not, and the 10 and 7 named ones), none of them in the
+  `phrases-oaiy.json` holds the cases (42 requests, 52 that are not, and the 10 and 7 named ones), none of them in the
   shared file as written. The phone's floor runs first: the same algorithm as this desktop's over the rules of the shared file
   (`transfer-v1.caller-asked.fixture.json`), with no names. This desktop passes that file in full: every positive, negative,
   window and backchannel case, and its word lists for the acknowledgements, however many the file has. The floor has every way
@@ -93,7 +95,25 @@ The plan reasons OAIY puts in an `oaiy.ring.plan` answer are exactly the plugin'
   a different target such as billing, an ask taken back, what someone else said however long ago, "do you want me to"), which is
   allowed. The two normalisers agree on the soft hyphen (U+00AD, removed outright, so a word with one inside it reads as the word);
   this desktop also does not see zero-width joiners and marks, which the floor turns into spaces. Adding rules to the shared file
-  is Aokie's change.* **What OAIY reads as the caller's turns.** The plugin drops from the caller's history, by their words alone, every turn that
+  is Aokie's change.* **Blocks this desktop has that the shared file could adopt.** Each is a block in the fixture's syntax (matched against one
+  sentence made plain), and each has cases in `phrases-oaiy.json`; the floor accepts all of those cases today, and this desktop
+  refuses them. Five asks that both accepted, and are not asks: "I was transferred to the owner yesterday", "he put the owner
+  on", "they said I could be transferred to the manager", "do you want me to be transferred to the owner", "can you tell me how
+  to be transferred to the owner". The blocks:
+  * what was done some time ago, in the shape of an ask, and by someone else:
+    `\b(?:was|were|been|had been|has been|have been) (?:\w+ ){0,2}(?:transferred (?:to|over to|through to)|(?:put|patched) (?:through|thru|thro))\b`
+    and `\b(?:he|she|they) (?:\w+ )?(?:put|patched|handed|connected|transferred) (?:the |your )?(?:owner|manager|boss|proprietor)\b`
+    (not "I was transferred three times, can I speak to the manager" or "they put me on hold, can I speak to the owner", which go on to an ask);
+  * what someone said: the shared `said` block with its verbs read in the past, `(?:speak|talk|transfer(?:red)?|put|patch(?:ed)?|connect(?:ed)?|get)`
+    in place of `(?:speak|talk|transfer|put|patch|connect|get)` (so "connection" is still no verb);
+  * a question put to the receptionist: `\b(?:do|would|shall|should|can|could) (?:you|they) (?:want|like|need|prefer) (?:me|us) to (?:be )?(?:speak|talk|chat|transfer|put)\w*\b`;
+  * a question about how: `\bhow to (?:\w+ ){0,2}(?:speak|talk|chat|reach|contact|get hold of|get through|transfer|put|connect)\w*\b`
+    (a short way on, so "I don't know how to say this but can I speak to the owner" goes on to its ask).
+
+  Two smaller things in the shared blocks: `(?:i m|i am|we re|we are)` never matches "I'm" or "we're" (the apostrophe stays in a
+  word, so it needs `(?:i m|i'm|i am|we re|we're|we are)`; without it "I'm talking to the owner, right?" is an ask), and
+  "can I speak to someone else" is an ask for a person, which a block for `(?:speak|talk|chat)(?:ing)? (?:to|with) (?:\w+ ){0,2}else`
+  would refuse: this desktop's reads only the participle, `\b(?:speaking|talking|chatting) (?:to|with) (?:\w+ ){0,2}else\b`.* **What OAIY reads as the caller's turns.** The plugin drops from the caller's history, by their words alone, every turn that
   is only an acknowledgement ("mm-hmm", "yeah, okay": at most three of a fixed list), because it cannot hear when they were
   said; that is the `backchannel` group of the shared caller-asked fixture. OAIY hears the audio, and leaves an acknowledgement
   out of its own record only when it was said over the receptionist while it was still speaking (an "mm-hmm", or short

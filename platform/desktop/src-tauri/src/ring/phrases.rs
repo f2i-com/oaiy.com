@@ -125,6 +125,9 @@ fn rules(names: &[String]) -> Rules {
         r"\b(?:without|instead of|rather than|as opposed to|in place of) (?:\w+ ){0,2}(?:speak|talk|chat|transfer|put|patch|connect)\w*\b".to_string(),
         // A question about how, or when, or by what number, not a request: "how do I speak to the owner", "what number can I use to talk to them".
         r"\b(?:how (?:do|can|could|would|should|might) (?:i|we)|what (?:number|way|time|day|hours?)|when (?:can|could|do|does|is|will)|where (?:do|can|could)) (?:\w+ ){0,6}(?:speak|talk|chat|reach|contact|get hold of|get through|transfer|put)\w*\b".to_string(),
+        // A question about how to be put through, not an ask: "can you tell me how to be transferred to the owner". (A short way on, so "I don't
+        // know how to say this but can I speak to the owner" goes on to its ask.)
+        r"\bhow to (?:\w+ ){0,2}(?:speak|talk|chat|reach|contact|get hold of|get through|transfer|put|connect)\w*\b".to_string(),
         // Who they are speaking to now, and someone else: "I'm talking to someone else in the room", "talking to someone else, hold on". Only
         // the participle: "can I speak to someone else" and "can I talk to somebody else about this" are plain asks for a person.
         r"\b(?:speaking|talking|chatting) (?:to|with) (?:\w+ ){0,2}else\b".to_string(),
@@ -134,15 +137,20 @@ fn rules(names: &[String]) -> Rules {
         r"\bi(?:'ll| will| shall|'m going to| am going to|'m gonna| am gonna) (?:\w+ ){0,2}(?:speak|talk|chat|call|ring)\b".to_string(),
         r"\b(?:speak|talk|chat)(?:ing)? (?:to|with) (?:\w+ ){0,3}myself\b".to_string(),
         r"\b(?:was|were|been|had been) (?:\w+ )?(?:speak|talk|chat)(?:ing)?\b".to_string(),
+        // What was done to them, some time ago, in the shape of an ask: "I was transferred to the owner yesterday", "I had been put through to
+        // the manager". (Not "I was transferred three times, can I speak to the manager", and not "I was put on hold": those go on to an ask.)
+        r"\b(?:was|were|been|had been|has been|have been) (?:\w+ ){0,2}(?:transferred (?:to|over to|through to)|(?:put|patched) (?:through|thru|thro))\b".to_string(),
+        // What someone else did: "he put the owner on", "they patched the manager through".
+        r"\b(?:he|she|they) (?:\w+ )?(?:put|patched|handed|connected|transferred) (?:the |your )?(?:owner|manager|boss|proprietor)\b".to_string(),
         // Asking what the receptionist is, or who they are speaking to.
         r"\b(?:am i|are we) (?:speaking|talking|chatting) (?:to|with)\b".to_string(),
         r"\b(?:are|is|am) (?:you|this|that|it|i) (?:\w+ ){0,2}(?:real|actual|live|human|person|robot|machine|bot|ai|recording|computer)\b".to_string(),
         // What someone else said, or a caller who is not the caller.
-        r"\b(?:said|says|told|tells|allowed|allows|permitted|approved|okayed) (?:\w+ ){0,8}(?:speak|talk|transfer|put|patch|connect|get)\b".to_string(),
+        r"\b(?:said|says|told|tells|allowed|allows|permitted|approved|okayed) (?:\w+ ){0,8}(?:speak|talk|transfer(?:red)?|put|patch(?:ed)?|connect(?:ed)?|get)\b".to_string(),
         // What someone else allowed or said, however long: "the owner said it is absolutely fine to transfer me".
-        r"\b(?:owner|manager|boss|he|she|they|someone|somebody|everyone|people|staff|it) (?:\w+ )?(?:said|says|told|tells|allowed|allows|permitted|approved|okayed)\b (?:\w+ ){0,14}(?:speak|talk|transfer|put|patch|connect|get)\b".to_string(),
+        r"\b(?:owner|manager|boss|he|she|they|someone|somebody|everyone|people|staff|it) (?:\w+ )?(?:said|says|told|tells|allowed|allows|permitted|approved|okayed)\b (?:\w+ ){0,14}(?:speak|talk|transfer(?:red)?|put|patch(?:ed)?|connect(?:ed)?|get)\b".to_string(),
         // A question put to the receptionist, not an ask: "do you want me to speak to the owner", "do I have to talk to the manager".
-        r"\b(?:do|would|shall|should|can|could) (?:you|they) (?:want|like|need|prefer) (?:me|us) to (?:speak|talk|chat|transfer|put)\w*\b".to_string(),
+        r"\b(?:do|would|shall|should|can|could) (?:you|they) (?:want|like|need|prefer) (?:me|us) to (?:be )?(?:speak|talk|chat|transfer|put)\w*\b".to_string(),
         r"\b(?:do|should|must|shall|does) (?:i|we) (?:need |have |want )?to (?:speak|talk|chat)\w*\b".to_string(),
         r"\bthe caller\b".to_string(),
         r"\b(?:wants|want|asked|asks|tells|told) you to\b".to_string(),
@@ -490,7 +498,7 @@ mod tests {
         let positives = cases(OAIY_EXTRA, "positive");
         let negatives = cases(OAIY_EXTRA, "negative");
         // (What only this desktop counts or refuses: none of it is in the shared fixture, whose cases are not repeated here.)
-        assert!(positives.len() >= 37 && negatives.len() >= 40, "{} {}", positives.len(), negatives.len());
+        assert!(positives.len() >= 42 && negatives.len() >= 52, "{} {}", positives.len(), negatives.len());
         // (Compared as written, lower-cased: a case that differs only in what the shared normaliser reads past, such as a zero width space, is
         // this desktop's own to keep.)
         let shared_turns: std::collections::BTreeSet<String> = ["positive", "negative"].iter().flat_map(|group| cases(SHARED, group)).map(|turns| turns.iter().map(|t| t.to_lowercase()).collect::<Vec<_>>().join(" | ")).collect();
@@ -526,6 +534,44 @@ mod tests {
         // apostrophe stays in a word, so "I'm" and "we're" are read as the words they are.)
         for said in ["I'm talking to someone else in the room, hold on", "talking to someone else, hold on", "I'm speaking to someone else right now", "we are chatting with someone else", "I am talking to somebody else", "hold on I'm talking with someone else here", "I'm talking to the owner, right?", "We're speaking to the manager now", "we\u{2019}re talking to the boss"] {
             assert!(!caller_asked(&[said]), "{said}");
+        }
+    }
+
+    #[test]
+    fn what_was_done_or_said_or_asked_about_being_transferred_is_not_an_ask_and_an_ask_that_follows_a_complaint_is() {
+        // Not asks, though the rules for "be transferred" and "put the owner on" match them: what happened to the caller some time ago, what
+        // someone else did or said, a question put to the receptionist, and a question about how.
+        for said in [
+            "I was transferred to the owner yesterday",
+            "I had been put through to the manager before",
+            "we were transferred to a person last time",
+            "he put the owner on",
+            "she just patched the manager through",
+            "they said I could be transferred to the manager",
+            "the owner told me last week that on a day like this I could be transferred to a person",
+            "they said we could be put through to the owner",
+            "you said I could be transferred to the owner",
+            "I was told I could be connected to the manager",
+            "do you want me to be transferred to the owner",
+            "would you like me to be transferred to the manager",
+            "can you tell me how to be transferred to the owner",
+            "how to get through to the owner",
+            "how to speak to the manager",
+        ] {
+            assert!(!caller_asked(&[said]), "{said}");
+        }
+        // Asks, all the same: to be transferred, and an ask that comes after a complaint about what was done to them.
+        for said in [
+            "I want to be transferred to the owner",
+            "I would like to be transferred to a person",
+            "can I be transferred to the manager",
+            "I was transferred three times, can I speak to the manager",
+            "They put me on hold for an hour, can I speak to the owner",
+            "I've been put on hold, put me through to the owner",
+            "I was put on hold and I want to speak to a person",
+            "I don't know how to say this but can I speak to the owner",
+        ] {
+            assert!(caller_asked(&[said]), "{said}");
         }
     }
 
