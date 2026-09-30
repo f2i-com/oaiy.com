@@ -1,0 +1,52 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://oaiy.com/schemas/relay/v1/compat-error.schema.json",
+  "title": "Aokie compatibility error",
+  "description": "Error body of the Aokie compatibility routes (README section 4.14), which keep FormLogic's shape so shipped clients behave as they do today: {\"error\":true,\"code\":...,\"message\":...}. These codes and this shape appear on those routes only.",
+  "type": "object",
+  "properties": {
+    "error": {
+      "const": true
+    },
+    "code": {
+      "enum": [
+        "invalid_token",
+        "relay_target_forbidden",
+        "relay_frame_too_large",
+        "relay_backpressure",
+        "companion_unavailable",
+        "invalid_request",
+        "invalid_item",
+        "unauthorized",
+        "revoked",
+        "forbidden",
+        "feature_disabled",
+        "not_found",
+        "method_not_allowed",
+        "conflict",
+        "already_answered",
+        "expired",
+        "precondition_failed",
+        "item_too_large",
+        "unsupported_media_type",
+        "unprocessable",
+        "upgrade_required",
+        "rate_limited",
+        "quota_exceeded",
+        "internal",
+        "unavailable"
+      ]
+    },
+    "message": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 200
+    }
+  },
+  "required": [
+    "error",
+    "code",
+    "message"
+  ],
+  "additionalProperties": true
+}

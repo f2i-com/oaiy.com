@@ -1,0 +1,48 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://oaiy.com/schemas/relay/v1/enroll-request.schema.json",
+  "title": "Enrolment request",
+  "description": "POST /v1/enroll (README section 4.11). The body is sent with header X-OAIY-Proof = b64u(Ed25519(seed, \"oaiy/relay/1/enroll\" || 0x00 || raw request body bytes)); the proof is verified over the bytes received, before parsing. The secret is never transmitted.",
+  "type": "object",
+  "properties": {
+    "kid": {
+      "$ref": "https://oaiy.com/schemas/relay/v1/common.schema.json#/$defs/kid"
+    },
+    "role": {
+      "enum": [
+        "desktop",
+        "provider"
+      ]
+    },
+    "name": {
+      "$ref": "https://oaiy.com/schemas/relay/v1/common.schema.json#/$defs/name60"
+    },
+    "n": {
+      "$ref": "https://oaiy.com/schemas/relay/v1/common.schema.json#/$defs/b64u16"
+    },
+    "keys": {
+      "type": "object",
+      "properties": {
+        "ed25519": {
+          "$ref": "https://oaiy.com/schemas/relay/v1/common.schema.json#/$defs/key32"
+        },
+        "x25519": {
+          "$ref": "https://oaiy.com/schemas/relay/v1/common.schema.json#/$defs/key32"
+        }
+      },
+      "required": [
+        "ed25519",
+        "x25519"
+      ],
+      "additionalProperties": true
+    }
+  },
+  "required": [
+    "kid",
+    "role",
+    "name",
+    "n",
+    "keys"
+  ],
+  "additionalProperties": true
+}

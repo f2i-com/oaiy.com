@@ -1,0 +1,51 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://oaiy.com/schemas/relay/v1/rbx-item-request.schema.json",
+  "title": "Reply box item",
+  "description": "POST /v1/rbx/{rid}/items with the reply secret: a request (ai) or input (ai.in) for the desktop. hdr.ct is tunnel1 and hdr.eph is the tunnel's ephPub in standard base64.",
+  "type": "object",
+  "properties": {
+    "lane": {
+      "enum": [
+        "ai",
+        "ai.in"
+      ]
+    },
+    "id": {
+      "$ref": "https://oaiy.com/schemas/relay/v1/common.schema.json#/$defs/itemId"
+    },
+    "ttl": {
+      "type": "integer",
+      "minimum": 1,
+      "maximum": 600
+    },
+    "hdr": {
+      "type": "object",
+      "properties": {
+        "ct": {
+          "const": "tunnel1"
+        },
+        "eph": {
+          "type": "string",
+          "pattern": "^[A-Za-z0-9+/]{43}=$"
+        }
+      },
+      "required": [
+        "ct"
+      ],
+      "additionalProperties": true,
+      "maxProperties": 7
+    },
+    "body": {
+      "type": "string",
+      "maxLength": 393216
+    }
+  },
+  "required": [
+    "lane",
+    "id",
+    "hdr",
+    "body"
+  ],
+  "additionalProperties": true
+}

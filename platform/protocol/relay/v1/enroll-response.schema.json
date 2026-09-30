@@ -1,0 +1,28 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://oaiy.com/schemas/relay/v1/enroll-response.schema.json",
+  "title": "Enrolment response",
+  "description": "201 response of POST /v1/enroll. `deviceId` is dev-... for a desktop and prov-... for a provider.",
+  "type": "object",
+  "properties": {
+    "deviceId": {
+      "$ref": "https://oaiy.com/schemas/relay/v1/common.schema.json#/$defs/principalId"
+    },
+    "token": {
+      "$ref": "https://oaiy.com/schemas/relay/v1/common.schema.json#/$defs/token"
+    },
+    "relayId": {
+      "$ref": "https://oaiy.com/schemas/relay/v1/common.schema.json#/$defs/relayId"
+    },
+    "time": {
+      "$ref": "https://oaiy.com/schemas/relay/v1/common.schema.json#/$defs/unixTime"
+    }
+  },
+  "required": [
+    "deviceId",
+    "token",
+    "relayId",
+    "time"
+  ],
+  "additionalProperties": true
+}

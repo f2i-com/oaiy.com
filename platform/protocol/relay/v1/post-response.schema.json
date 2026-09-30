@@ -1,0 +1,111 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://oaiy.com/schemas/relay/v1/post-response.schema.json",
+  "title": "Post response",
+  "description": "200 response of POST /v1/items. Partial success is normal: a `duplicate` carries the original seq; a `rejected` carries the error. Errors that concern the request as a whole use the ordinary error shape instead.",
+  "type": "object",
+  "properties": {
+    "v": {
+      "const": 1
+    },
+    "results": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "properties": {
+          "id": {
+            "$ref": "https://oaiy.com/schemas/relay/v1/common.schema.json#/$defs/itemId"
+          },
+          "status": {
+            "enum": [
+              "queued",
+              "duplicate",
+              "rejected"
+            ]
+          },
+          "seq": {
+            "$ref": "https://oaiy.com/schemas/relay/v1/common.schema.json#/$defs/seq"
+          },
+          "error": {
+            "type": "object",
+            "properties": {
+              "code": {
+                "$ref": "https://oaiy.com/schemas/relay/v1/common.schema.json#/$defs/errorCode"
+              },
+              "message": {
+                "type": "string",
+                "minLength": 1,
+                "maxLength": 200
+              },
+              "retryAfter": {
+                "type": "integer",
+                "minimum": 0,
+                "maximum": 86400
+              }
+            },
+            "required": [
+              "code",
+              "message"
+            ],
+            "additionalProperties": true
+          }
+        },
+        "required": [
+          "id",
+          "status"
+        ],
+        "additionalProperties": true,
+        "allOf": [
+          {
+            "if": {
+              "properties": {
+                "status": {
+                  "enum": [
+                    "queued",
+                    "duplicate"
+                  ]
+                }
+              },
+              "required": [
+                "status"
+              ]
+            },
+            "then": {
+              "required": [
+                "seq"
+              ]
+            }
+          },
+          {
+            "if": {
+              "properties": {
+                "status": {
+                  "const": "rejected"
+                }
+              },
+              "required": [
+                "status"
+              ]
+            },
+            "then": {
+              "required": [
+                "error"
+              ]
+            }
+          }
+        ]
+      },
+      "minItems": 1,
+      "maxItems": 64
+    },
+    "time": {
+      "$ref": "https://oaiy.com/schemas/relay/v1/common.schema.json#/$defs/unixTime"
+    }
+  },
+  "required": [
+    "v",
+    "results",
+    "time"
+  ],
+  "additionalProperties": true
+}

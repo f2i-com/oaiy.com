@@ -1,0 +1,175 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://oaiy.com/schemas/relay/v1/ctl.schema.json",
+  "title": "ctl message",
+  "description": "The body of a ctl item: JSON text of at most 4,096 bytes, hints only, none grants authority. A receiver ignores a `t` it does not know, so an unknown t validates. A client renders relay.notice as plain text under the label \"message from your relay (unverified)\".",
+  "type": "object",
+  "properties": {
+    "t": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 64
+    }
+  },
+  "required": [
+    "t"
+  ],
+  "additionalProperties": true,
+  "allOf": [
+    {
+      "if": {
+        "properties": {
+          "t": {
+            "const": "provider.updated"
+          }
+        },
+        "required": [
+          "t"
+        ]
+      },
+      "then": {
+        "type": "object",
+        "properties": {
+          "t": {
+            "const": "provider.updated"
+          },
+          "id": {
+            "$ref": "https://oaiy.com/schemas/relay/v1/common.schema.json#/$defs/providerId"
+          }
+        },
+        "required": [
+          "t",
+          "id"
+        ],
+        "additionalProperties": true
+      }
+    },
+    {
+      "if": {
+        "properties": {
+          "t": {
+            "const": "provider.rotated"
+          }
+        },
+        "required": [
+          "t"
+        ]
+      },
+      "then": {
+        "type": "object",
+        "properties": {
+          "t": {
+            "const": "provider.rotated"
+          },
+          "b": {
+            "$ref": "https://oaiy.com/schemas/relay/v1/common.schema.json#/$defs/b64u"
+          },
+          "s": {
+            "$ref": "https://oaiy.com/schemas/relay/v1/common.schema.json#/$defs/signature"
+          }
+        },
+        "required": [
+          "t",
+          "b",
+          "s"
+        ],
+        "additionalProperties": true
+      }
+    },
+    {
+      "if": {
+        "properties": {
+          "t": {
+            "const": "device.revoked"
+          }
+        },
+        "required": [
+          "t"
+        ]
+      },
+      "then": {
+        "type": "object",
+        "properties": {
+          "t": {
+            "const": "device.revoked"
+          },
+          "id": {
+            "$ref": "https://oaiy.com/schemas/relay/v1/common.schema.json#/$defs/deviceId"
+          }
+        },
+        "required": [
+          "t",
+          "id"
+        ],
+        "additionalProperties": true
+      }
+    },
+    {
+      "if": {
+        "properties": {
+          "t": {
+            "const": "token.age"
+          }
+        },
+        "required": [
+          "t"
+        ]
+      },
+      "then": {
+        "type": "object",
+        "properties": {
+          "t": {
+            "const": "token.age"
+          },
+          "days": {
+            "type": "integer",
+            "minimum": 0,
+            "maximum": 36500
+          }
+        },
+        "required": [
+          "t",
+          "days"
+        ],
+        "additionalProperties": true
+      }
+    },
+    {
+      "if": {
+        "properties": {
+          "t": {
+            "const": "relay.notice"
+          }
+        },
+        "required": [
+          "t"
+        ]
+      },
+      "then": {
+        "type": "object",
+        "properties": {
+          "t": {
+            "const": "relay.notice"
+          },
+          "level": {
+            "enum": [
+              "info",
+              "warn"
+            ]
+          },
+          "message": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 200
+          }
+        },
+        "required": [
+          "t",
+          "level",
+          "message"
+        ],
+        "additionalProperties": true
+      }
+    }
+  ]
+}

@@ -1,0 +1,343 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://oaiy.com/schemas/relay/v1/common.schema.json",
+  "title": "Relay common definitions",
+  "description": "Shared building blocks of oaiy-relay/1 (README sections 4.1 and 4.2). This file validates nothing by itself: every other schema points into its `$defs`. Patterns are the wire contract for identifiers; length limits given in bytes elsewhere in the README (a header of at most 512 bytes, a body of at most the lane cap) are checked by code because JSON Schema counts characters, and a character count is never larger than a byte count, so a `maxLength` here is a safe lower bound on the byte rule and never a looser one.",
+  "$defs": {
+    "b64u": {
+      "type": "string",
+      "pattern": "^[A-Za-z0-9_-]+$",
+      "description": "base64url without padding (RFC 4648 section 5). Padding, whitespace and characters outside the alphabet are refused."
+    },
+    "b64u8": {
+      "type": "string",
+      "pattern": "^[A-Za-z0-9_-]{11}$",
+      "description": "base64url of 8 bytes (11 characters): a token id, an enrolment key id, an epoch."
+    },
+    "b64u16": {
+      "type": "string",
+      "pattern": "^[A-Za-z0-9_-]{22}$",
+      "description": "base64url of 16 bytes (22 characters): a pid, a rid, the random part of a device id."
+    },
+    "key32": {
+      "type": "string",
+      "pattern": "^[A-Za-z0-9_-]{43}$",
+      "description": "base64url of 32 bytes (43 characters): a public key, a thumbprint, a SHA-256 or HMAC-SHA-256 output."
+    },
+    "thumbprint": {
+      "type": "string",
+      "pattern": "^[A-Za-z0-9_-]{43}$",
+      "description": "b64u(SHA-256 of the canonical JWK {\"crv\":\"Ed25519\",\"kty\":\"OKP\",\"x\":\"<b64u>\"}), 43 characters."
+    },
+    "signature": {
+      "type": "string",
+      "pattern": "^[A-Za-z0-9_-]{86}$",
+      "description": "base64url of a 64-byte Ed25519 signature (86 characters)."
+    },
+    "relayId": {
+      "type": "string",
+      "pattern": "^rly-[A-Za-z0-9_-]{22}$",
+      "description": "rly- plus 22 characters (128 random bits)."
+    },
+    "deviceId": {
+      "type": "string",
+      "pattern": "^dev-[A-Za-z0-9_-]{22}$",
+      "description": "dev- plus 22 characters. The only form a desktop or the provider may put into a URL or a capability."
+    },
+    "providerId": {
+      "type": "string",
+      "pattern": "^prov-[A-Za-z0-9_-]{22}$",
+      "description": "prov- plus 22 characters."
+    },
+    "principalId": {
+      "type": "string",
+      "pattern": "^(dev|prov)-[A-Za-z0-9_-]{22}$",
+      "description": "A device id or a provider id."
+    },
+    "pid": {
+      "type": "string",
+      "pattern": "^[A-Za-z0-9_-]{22}$",
+      "description": "Pairing rendezvous id: b64u of 16 bytes (HKDF of the pairing secret)."
+    },
+    "rid": {
+      "type": "string",
+      "pattern": "^[A-Za-z0-9_-]{22}$",
+      "description": "Reply box id: b64u of 16 bytes chosen by the browser."
+    },
+    "itemId": {
+      "type": "string",
+      "pattern": "^[A-Za-z0-9._-]{1,128}$",
+      "not": {
+        "enum": [
+          ".",
+          ".."
+        ]
+      },
+      "description": "Item id chosen by the sender. Unique per (mailbox, lane, sender) while the relay remembers it. The ids . and .. match the pattern and are refused (README, Interpretations)."
+    },
+    "appId": {
+      "type": "string",
+      "pattern": "^[A-Za-z0-9_.:-]{1,64}$",
+      "description": "App or plugin id, at most 64 characters (narrowed from Aokie's 200 so a party mailbox name fits a 255 byte indexed column)."
+    },
+    "token": {
+      "type": "string",
+      "pattern": "^oaiyrt1\\.[A-Za-z0-9_-]{11}\\.[A-Za-z0-9_-]{43}$",
+      "description": "Device capability token, always 63 characters. The pattern is necessary, not sufficient: the last character of each part must also be canonical (its unused low bits zero), which only code can check."
+    },
+    "adminToken": {
+      "type": "string",
+      "pattern": "^oaiyadm1\\.[A-Za-z0-9_-]{11}\\.[A-Za-z0-9_-]{43}$",
+      "description": "Relay admin token."
+    },
+    "epoch": {
+      "type": "string",
+      "pattern": "^[A-Za-z0-9_-]{11}$",
+      "description": "Relay epoch: b64u of 8 random bytes."
+    },
+    "kid": {
+      "type": "string",
+      "pattern": "^[A-Za-z0-9_-]{11}$",
+      "description": "Enrolment key id: b64u of 8 bytes."
+    },
+    "unixTime": {
+      "type": "integer",
+      "minimum": 0,
+      "maximum": 9007199254740991,
+      "description": "Unix seconds."
+    },
+    "uint53": {
+      "type": "integer",
+      "minimum": 0,
+      "maximum": 9007199254740991,
+      "description": "Unsigned integer below 2^53."
+    },
+    "seq": {
+      "type": "integer",
+      "minimum": 1,
+      "maximum": 9007199254740991,
+      "description": "Per-mailbox sequence number. The first item of a mailbox has seq 1; gaps are allowed."
+    },
+    "lane": {
+      "enum": [
+        "cmd",
+        "res",
+        "ai",
+        "ai.in",
+        "ai.out",
+        "pair",
+        "ring",
+        "ctl",
+        "sync",
+        "sig"
+      ],
+      "description": "The lanes a relay serves. flow, flow.in and flow.out are reserved and not served in v1."
+    },
+    "role": {
+      "enum": [
+        "desktop",
+        "phone",
+        "provider",
+        "web"
+      ],
+      "description": "Device roles. web is reserved."
+    },
+    "ct": {
+      "enum": [
+        "text",
+        "json",
+        "sealed1",
+        "tunnel1",
+        "noise1"
+      ],
+      "description": "Body content type in hdr.ct."
+    },
+    "errorCode": {
+      "enum": [
+        "invalid_request",
+        "invalid_item",
+        "unauthorized",
+        "revoked",
+        "forbidden",
+        "feature_disabled",
+        "not_found",
+        "method_not_allowed",
+        "conflict",
+        "already_answered",
+        "expired",
+        "precondition_failed",
+        "item_too_large",
+        "unsupported_media_type",
+        "unprocessable",
+        "upgrade_required",
+        "rate_limited",
+        "quota_exceeded",
+        "internal",
+        "unavailable"
+      ],
+      "description": "The closed error code set."
+    },
+    "grant": {
+      "type": "string",
+      "pattern": "^[a-z][a-z0-9_]{0,31}$",
+      "description": "A phone grant such as state_read or caller_read."
+    },
+    "origin": {
+      "type": "string",
+      "pattern": "^https://[A-Za-z0-9.-]+(:[0-9]{1,5})?$",
+      "description": "An https origin: scheme, host and optional port, no path."
+    },
+    "publicUrl": {
+      "type": "string",
+      "pattern": "^https://[A-Za-z0-9.-]+(:[0-9]{1,5})?$",
+      "description": "A relay base URL: https, path-free, no trailing slash, no userinfo, query or fragment."
+    },
+    "inboxAddress": {
+      "type": "string",
+      "pattern": "^(dev:dev-[A-Za-z0-9_-]{22}|rbx:[A-Za-z0-9_-]{22})$",
+      "description": "Where a POST /v1/items item may go: a device inbox or a reply box."
+    },
+    "mailbox": {
+      "type": "string",
+      "pattern": "^(dev:dev-[A-Za-z0-9_-]{22}|rbx:[A-Za-z0-9_-]{22}|app:[A-Za-z0-9_.:-]{1,64}@dev-[A-Za-z0-9_-]{22}/(plugin|mobile:[A-Za-z0-9_-]{43}))$",
+      "description": "Any mailbox address. The app: forms exist only behind the Aokie compatibility routes."
+    },
+    "from": {
+      "type": "string",
+      "pattern": "^((dev|prov)-[A-Za-z0-9_-]{22}|rbx:[A-Za-z0-9_-]{22}|relay)$",
+      "description": "Sender hint: a device or provider id, rbx:<rid>, or relay. Routing information, never authority."
+    },
+    "hdr": {
+      "type": "object",
+      "properties": {
+        "re": {
+          "$ref": "https://oaiy.com/schemas/relay/v1/common.schema.json#/$defs/itemId"
+        },
+        "ct": {
+          "$ref": "https://oaiy.com/schemas/relay/v1/common.schema.json#/$defs/ct"
+        },
+        "eph": {
+          "type": "string",
+          "pattern": "^[A-Za-z0-9+/]{43}=$",
+          "description": "For tunnel1: the browser's ephemeral public key, standard base64 with padding, 44 characters."
+        },
+        "kid": {
+          "type": "string",
+          "pattern": "^[A-Za-z0-9._-]{1,64}$",
+          "description": "An id of at most 64 characters."
+        },
+        "prio": {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 1
+        },
+        "n": {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 9007199254740991
+        },
+        "sig": {
+          "type": "string",
+          "pattern": "^[A-Za-z0-9_-]{1,88}$",
+          "description": "b64u of an Ed25519 signature, at most 88 characters; used on ring items."
+        }
+      },
+      "additionalProperties": false,
+      "description": "Routing header. Keys outside this list are invalid_item. The serialised form (compact JSON, unescaped slashes and unicode, UTF-8) is at most 512 bytes; that is a byte limit and is checked by code.",
+      "maxProperties": 7
+    },
+    "jws": {
+      "type": "string",
+      "pattern": "^[A-Za-z0-9_-]+\\.[A-Za-z0-9_-]+\\.[A-Za-z0-9_-]+$",
+      "description": "JWS Compact Serialization: exactly two dots."
+    },
+    "etag": {
+      "type": "string",
+      "pattern": "^\"[A-Za-z0-9_-]{22}\"$",
+      "description": "Slot ETag: a quoted b64u of the first 16 bytes of SHA-256(body || 0x00 || ct)."
+    },
+    "slotName": {
+      "type": "string",
+      "pattern": "^[a-z0-9][a-z0-9._-]{0,63}$",
+      "description": "Slot name."
+    },
+    "sha256Hex": {
+      "type": "string",
+      "pattern": "^[0-9a-f]{64}$"
+    },
+    "typedCode": {
+      "type": "string",
+      "pattern": "^[0-9A-HJKMNP-TV-Z]{4}(-[0-9A-HJKMNP-TV-Z]{4}){6}$",
+      "description": "Typed pairing code: 28 Crockford base32 characters in seven groups. The two check characters are verified by code."
+    },
+    "sasCode": {
+      "type": "string",
+      "pattern": "^[0-9A-HJKMNP-TV-Z]{4}-[0-9A-HJKMNP-TV-Z]{4}-[0-9A-HJKMNP-TV-Z]{4}-[0-9A-HJKMNP-TV-Z]$",
+      "description": "The 13 character short authentication string as shown, grouped XXXX-XXXX-XXXX-C."
+    },
+    "pairingUri": {
+      "type": "string",
+      "pattern": "^oaiy://pair\\?v=3&u=[^&\\s]+(&f=[A-Za-z0-9_-]{43})?&s=[A-Za-z0-9_-]{22}(&x=[0-9]+)?$",
+      "description": "Pairing key. Parameter order is the canonical writer order; a reader accepts any order and ignores unknown parameters (README section 4.10.2)."
+    },
+    "enrollUri": {
+      "type": "string",
+      "pattern": "^oaiy://enroll\\?v=1&u=[^&\\s]+&f=[A-Za-z0-9_-]{43}&k=[A-Za-z0-9_-]{11}&s=[A-Za-z0-9_-]{22}&r=(desktop|provider)&x=[0-9]+$",
+      "description": "Enrolment key."
+    },
+    "endpointPublicKey": {
+      "type": "object",
+      "properties": {
+        "algorithm": {
+          "const": "ed25519"
+        },
+        "publicKey": {
+          "$ref": "https://oaiy.com/schemas/relay/v1/common.schema.json#/$defs/key32"
+        },
+        "thumbprint": {
+          "$ref": "https://oaiy.com/schemas/relay/v1/common.schema.json#/$defs/thumbprint"
+        }
+      },
+      "required": [
+        "algorithm",
+        "publicKey",
+        "thumbprint"
+      ],
+      "additionalProperties": false,
+      "description": "EndpointPublicKey as the Aokie protocol writes it."
+    },
+    "hostIdentity": {
+      "type": "object",
+      "properties": {
+        "ed25519": {
+          "$ref": "https://oaiy.com/schemas/relay/v1/common.schema.json#/$defs/key32"
+        },
+        "thumbprint": {
+          "$ref": "https://oaiy.com/schemas/relay/v1/common.schema.json#/$defs/thumbprint"
+        },
+        "x25519": {
+          "$ref": "https://oaiy.com/schemas/relay/v1/common.schema.json#/$defs/key32"
+        }
+      },
+      "required": [
+        "ed25519",
+        "thumbprint",
+        "x25519"
+      ],
+      "additionalProperties": false
+    },
+    "name60": {
+      "type": "string",
+      "maxLength": 60,
+      "description": "Display name, at most 60 characters."
+    },
+    "unixTimeOrNull": {
+      "type": [
+        "integer",
+        "null"
+      ],
+      "minimum": 0,
+      "maximum": 9007199254740991
+    }
+  }
+}

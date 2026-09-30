@@ -1,0 +1,38 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://oaiy.com/schemas/relay/v1/error.schema.json",
+  "title": "Relay error",
+  "description": "Every non-2xx response of a native route (README section 4.6). The set of codes is closed; a client that meets an unknown code treats it by HTTP status. `message` is one sentence safe to show a person, at most 200 characters, never a stack trace, a credential or an internal path. `retryAfter` and the Retry-After header appear on 429 and 503.",
+  "type": "object",
+  "properties": {
+    "error": {
+      "type": "object",
+      "properties": {
+        "code": {
+          "$ref": "https://oaiy.com/schemas/relay/v1/common.schema.json#/$defs/errorCode"
+        },
+        "message": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 200,
+          "description": "One sentence, safe to show a person."
+        },
+        "retryAfter": {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 86400,
+          "description": "Seconds. Present on 429 and 503."
+        }
+      },
+      "required": [
+        "code",
+        "message"
+      ],
+      "additionalProperties": true
+    }
+  },
+  "required": [
+    "error"
+  ],
+  "additionalProperties": true
+}

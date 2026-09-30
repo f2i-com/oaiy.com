@@ -1,0 +1,24 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://oaiy.com/schemas/relay/v1/ticket-header.schema.json",
+  "title": "Ticket protected header",
+  "description": "The JWS protected header of a provider ticket (README section 4.9.2). alg is exactly EdDSA, so none, HS256 and every other algorithm confusion is refused; crit, jku, jwk, x5u and x5c are refused (no other member is allowed).",
+  "type": "object",
+  "properties": {
+    "alg": {
+      "const": "EdDSA"
+    },
+    "typ": {
+      "const": "oaiy-ticket+jwt"
+    },
+    "kid": {
+      "$ref": "https://oaiy.com/schemas/relay/v1/common.schema.json#/$defs/thumbprint"
+    }
+  },
+  "required": [
+    "alg",
+    "typ",
+    "kid"
+  ],
+  "additionalProperties": false
+}

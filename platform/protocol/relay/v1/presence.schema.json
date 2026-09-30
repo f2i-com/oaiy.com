@@ -1,0 +1,64 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://oaiy.com/schemas/relay/v1/presence.schema.json",
+  "title": "Presence",
+  "description": "200 response of GET /v1/presence. `online` means a consumer poll (not a lookup) is held now or started within max(presenceWindow, wait.max + 5) seconds. A provider sees only desktops, a phone sees its desktop, a desktop sees all.",
+  "type": "object",
+  "properties": {
+    "v": {
+      "const": 1
+    },
+    "devices": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "properties": {
+          "id": {
+            "$ref": "https://oaiy.com/schemas/relay/v1/common.schema.json#/$defs/principalId"
+          },
+          "role": {
+            "$ref": "https://oaiy.com/schemas/relay/v1/common.schema.json#/$defs/role"
+          },
+          "name": {
+            "$ref": "https://oaiy.com/schemas/relay/v1/common.schema.json#/$defs/name60"
+          },
+          "online": {
+            "type": "boolean"
+          },
+          "changedAt": {
+            "$ref": "https://oaiy.com/schemas/relay/v1/common.schema.json#/$defs/unixTimeOrNull"
+          },
+          "ver": {
+            "type": "string",
+            "maxLength": 32
+          },
+          "caps": {
+            "type": "array",
+            "items": {
+              "type": "string",
+              "minLength": 1,
+              "maxLength": 64
+            },
+            "maxItems": 32
+          }
+        },
+        "required": [
+          "id",
+          "role",
+          "name",
+          "online"
+        ],
+        "additionalProperties": true
+      }
+    },
+    "time": {
+      "$ref": "https://oaiy.com/schemas/relay/v1/common.schema.json#/$defs/unixTime"
+    }
+  },
+  "required": [
+    "v",
+    "devices",
+    "time"
+  ],
+  "additionalProperties": true
+}

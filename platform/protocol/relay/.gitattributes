@@ -1,0 +1,3 @@
+# The relay protocol package is byte-sensitive (vectors, signed texts). Keep every
+# file LF on every platform so a checkout with core.autocrlf cannot change bytes.
+* text eol=lf

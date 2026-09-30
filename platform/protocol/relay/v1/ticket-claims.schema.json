@@ -1,0 +1,56 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://oaiy.com/schemas/relay/v1/ticket-claims.schema.json",
+  "title": "Ticket claims",
+  "description": "The claims of a provider ticket. exp - iat is at most 300 (checked by code). `eph` is b64u of SHA-256 of the browser's ephemeral X25519 public key. `lane` is ai in v1.",
+  "type": "object",
+  "properties": {
+    "iss": {
+      "$ref": "https://oaiy.com/schemas/relay/v1/common.schema.json#/$defs/providerId"
+    },
+    "aud": {
+      "$ref": "https://oaiy.com/schemas/relay/v1/common.schema.json#/$defs/relayId"
+    },
+    "sub": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 64
+    },
+    "iat": {
+      "$ref": "https://oaiy.com/schemas/relay/v1/common.schema.json#/$defs/unixTime"
+    },
+    "exp": {
+      "$ref": "https://oaiy.com/schemas/relay/v1/common.schema.json#/$defs/unixTime"
+    },
+    "jti": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 64
+    },
+    "lane": {
+      "const": "ai"
+    },
+    "dev": {
+      "$ref": "https://oaiy.com/schemas/relay/v1/common.schema.json#/$defs/deviceId"
+    },
+    "org": {
+      "$ref": "https://oaiy.com/schemas/relay/v1/common.schema.json#/$defs/origin"
+    },
+    "eph": {
+      "$ref": "https://oaiy.com/schemas/relay/v1/common.schema.json#/$defs/key32"
+    }
+  },
+  "required": [
+    "iss",
+    "aud",
+    "sub",
+    "iat",
+    "exp",
+    "jti",
+    "lane",
+    "dev",
+    "org",
+    "eph"
+  ],
+  "additionalProperties": false
+}

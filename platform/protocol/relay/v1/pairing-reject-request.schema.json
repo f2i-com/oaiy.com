@@ -1,0 +1,14 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://oaiy.com/schemas/relay/v1/pairing-reject-request.schema.json",
+  "title": "Reject a response",
+  "description": "POST /v1/pair/{pid}/reject: returns the rendezvous to open while fewer than 3 rejects have happened.",
+  "type": "object",
+  "properties": {
+    "reason": {
+      "type": "string",
+      "maxLength": 200
+    }
+  },
+  "additionalProperties": true
+}

@@ -1,0 +1,331 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://oaiy.com/schemas/relay/v1/post-request.schema.json",
+  "title": "Post request",
+  "description": "POST /v1/items (README sections 4.3 to 4.5): 1 to 64 items, at most 1 MiB. `ttl` is an integer number of seconds from 1 to the lane maximum; absent means the lane default; zero, negative, fractional, non-numeric, null or above the maximum is invalid_item (no clamping). A ring item must carry hdr.sig. Lane body caps below are character counts; the byte cap is enforced by code.",
+  "type": "object",
+  "properties": {
+    "items": {
+      "type": "array",
+      "items": {
+        "$ref": "#/$defs/postItem"
+      },
+      "minItems": 1,
+      "maxItems": 64
+    }
+  },
+  "required": [
+    "items"
+  ],
+  "additionalProperties": true,
+  "$defs": {
+    "postItem": {
+      "type": "object",
+      "properties": {
+        "to": {
+          "$ref": "https://oaiy.com/schemas/relay/v1/common.schema.json#/$defs/inboxAddress"
+        },
+        "lane": {
+          "$ref": "https://oaiy.com/schemas/relay/v1/common.schema.json#/$defs/lane"
+        },
+        "id": {
+          "$ref": "https://oaiy.com/schemas/relay/v1/common.schema.json#/$defs/itemId"
+        },
+        "ttl": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 86400
+        },
+        "hdr": {
+          "$ref": "https://oaiy.com/schemas/relay/v1/common.schema.json#/$defs/hdr"
+        },
+        "body": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "to",
+        "lane",
+        "id",
+        "body"
+      ],
+      "additionalProperties": true,
+      "allOf": [
+        {
+          "if": {
+            "properties": {
+              "lane": {
+                "const": "cmd"
+              }
+            },
+            "required": [
+              "lane"
+            ]
+          },
+          "then": {
+            "properties": {
+              "ttl": {
+                "type": "integer",
+                "minimum": 1,
+                "maximum": 300
+              },
+              "body": {
+                "type": "string",
+                "maxLength": 32768
+              }
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "lane": {
+                "const": "res"
+              }
+            },
+            "required": [
+              "lane"
+            ]
+          },
+          "then": {
+            "properties": {
+              "ttl": {
+                "type": "integer",
+                "minimum": 1,
+                "maximum": 3600
+              },
+              "body": {
+                "type": "string",
+                "maxLength": 98304
+              }
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "lane": {
+                "const": "ai"
+              }
+            },
+            "required": [
+              "lane"
+            ]
+          },
+          "then": {
+            "properties": {
+              "ttl": {
+                "type": "integer",
+                "minimum": 1,
+                "maximum": 600
+              },
+              "body": {
+                "type": "string",
+                "maxLength": 393216
+              }
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "lane": {
+                "const": "ai.in"
+              }
+            },
+            "required": [
+              "lane"
+            ]
+          },
+          "then": {
+            "properties": {
+              "ttl": {
+                "type": "integer",
+                "minimum": 1,
+                "maximum": 600
+              },
+              "body": {
+                "type": "string",
+                "maxLength": 65536
+              }
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "lane": {
+                "const": "ai.out"
+              }
+            },
+            "required": [
+              "lane"
+            ]
+          },
+          "then": {
+            "properties": {
+              "ttl": {
+                "type": "integer",
+                "minimum": 1,
+                "maximum": 900
+              },
+              "body": {
+                "type": "string",
+                "maxLength": 393216
+              }
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "lane": {
+                "const": "pair"
+              }
+            },
+            "required": [
+              "lane"
+            ]
+          },
+          "then": {
+            "properties": {
+              "ttl": {
+                "type": "integer",
+                "minimum": 1,
+                "maximum": 900
+              },
+              "body": {
+                "type": "string",
+                "maxLength": 16384
+              }
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "lane": {
+                "const": "ring"
+              }
+            },
+            "required": [
+              "lane"
+            ]
+          },
+          "then": {
+            "properties": {
+              "ttl": {
+                "type": "integer",
+                "minimum": 1,
+                "maximum": 300
+              },
+              "body": {
+                "type": "string",
+                "maxLength": 4096
+              }
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "lane": {
+                "const": "ctl"
+              }
+            },
+            "required": [
+              "lane"
+            ]
+          },
+          "then": {
+            "properties": {
+              "ttl": {
+                "type": "integer",
+                "minimum": 1,
+                "maximum": 86400
+              },
+              "body": {
+                "type": "string",
+                "maxLength": 4096
+              }
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "lane": {
+                "const": "sync"
+              }
+            },
+            "required": [
+              "lane"
+            ]
+          },
+          "then": {
+            "properties": {
+              "ttl": {
+                "type": "integer",
+                "minimum": 1,
+                "maximum": 86400
+              },
+              "body": {
+                "type": "string",
+                "maxLength": 65536
+              }
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "lane": {
+                "const": "sig"
+              }
+            },
+            "required": [
+              "lane"
+            ]
+          },
+          "then": {
+            "properties": {
+              "ttl": {
+                "type": "integer",
+                "minimum": 1,
+                "maximum": 300
+              },
+              "body": {
+                "type": "string",
+                "maxLength": 196608
+              }
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "lane": {
+                "const": "ring"
+              }
+            },
+            "required": [
+              "lane"
+            ]
+          },
+          "then": {
+            "required": [
+              "hdr"
+            ],
+            "properties": {
+              "hdr": {
+                "required": [
+                  "sig"
+                ]
+              }
+            }
+          }
+        }
+      ]
+    }
+  }
+}

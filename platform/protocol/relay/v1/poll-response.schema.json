@@ -1,0 +1,99 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://oaiy.com/schemas/relay/v1/poll-response.schema.json",
+  "title": "Poll response",
+  "description": "200 response of GET /v1/poll (README section 4.5). `hold` appears only when the request asked for wait > 0. `reset` appears only, and is true, when the client's epoch differs or its cursor is above the mailbox's highest seq; a reset answer carries no items and `cursor` is then the server's. On any other non-empty answer a client ignores `cursor` and keeps the highest seq of the items it accepted.",
+  "type": "object",
+  "properties": {
+    "v": {
+      "const": 1
+    },
+    "epoch": {
+      "$ref": "https://oaiy.com/schemas/relay/v1/common.schema.json#/$defs/epoch"
+    },
+    "cursor": {
+      "$ref": "https://oaiy.com/schemas/relay/v1/common.schema.json#/$defs/uint53"
+    },
+    "items": {
+      "type": "array",
+      "items": {
+        "$ref": "https://oaiy.com/schemas/relay/v1/item.schema.json"
+      },
+      "maxItems": 64
+    },
+    "more": {
+      "type": "boolean"
+    },
+    "time": {
+      "$ref": "https://oaiy.com/schemas/relay/v1/common.schema.json#/$defs/unixTime"
+    },
+    "reset": {
+      "const": true
+    },
+    "hold": {
+      "oneOf": [
+        {
+          "type": "object",
+          "properties": {
+            "granted": {
+              "const": true
+            },
+            "superseded": {
+              "const": true
+            }
+          },
+          "required": [
+            "granted"
+          ],
+          "additionalProperties": true
+        },
+        {
+          "type": "object",
+          "properties": {
+            "refused": {
+              "const": true
+            },
+            "retryAfter": {
+              "type": "integer",
+              "minimum": 1,
+              "maximum": 120
+            }
+          },
+          "required": [
+            "refused",
+            "retryAfter"
+          ],
+          "additionalProperties": true
+        }
+      ]
+    }
+  },
+  "required": [
+    "v",
+    "epoch",
+    "cursor",
+    "items",
+    "more",
+    "time"
+  ],
+  "additionalProperties": true,
+  "allOf": [
+    {
+      "if": {
+        "required": [
+          "reset"
+        ]
+      },
+      "then": {
+        "properties": {
+          "items": {
+            "maxItems": 0
+          },
+          "more": {
+            "const": false
+          }
+        }
+      }
+    }
+  ]
+}

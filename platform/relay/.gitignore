@@ -1,0 +1,3 @@
+# A relay's own state: never committed
+/data/
+/INSTALL_ENABLED

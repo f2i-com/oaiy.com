@@ -1,0 +1,133 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://oaiy.com/schemas/relay/v1/admission-plugin-response.schema.json",
+  "title": "Plugin admission response",
+  "description": "Exactly the members the plugin's decoder reads and no others: the decoder is deny_unknown_fields. It never carries desktopConnection or scopeCompatibility. `relay` is present because this issuer advertises only transports it can serve. The three relay URLs are byte-identical in every admission.",
+  "type": "object",
+  "properties": {
+    "accessToken": {
+      "type": "string",
+      "pattern": "^aokie-adm-v2\\.[0-9a-f]+\\.[0-9a-f]{64}$",
+      "maxLength": 8192
+    },
+    "tokenType": {
+      "const": "Bearer"
+    },
+    "expiresIn": {
+      "type": "integer",
+      "minimum": 31,
+      "maximum": 300
+    },
+    "expiresAt": {
+      "$ref": "https://oaiy.com/schemas/relay/v1/common.schema.json#/$defs/unixTime"
+    },
+    "gatewayUrl": {
+      "type": "string",
+      "pattern": "^wss://[A-Za-z0-9.-]+(:[0-9]{1,5})?/v2/realtime$"
+    },
+    "appId": {
+      "$ref": "https://oaiy.com/schemas/relay/v1/common.schema.json#/$defs/appId"
+    },
+    "scopes": {
+      "type": "array",
+      "items": {
+        "$ref": "https://oaiy.com/schemas/relay/v1/common.schema.json#/$defs/grant"
+      },
+      "minItems": 1,
+      "maxItems": 16,
+      "uniqueItems": true
+    },
+    "iceServers": {
+      "type": "array",
+      "items": {
+        "$ref": "https://oaiy.com/schemas/relay/v1/ice-server.schema.json"
+      }
+    },
+    "relayOnly": {
+      "type": "boolean"
+    },
+    "turnCredentialExpiresAt": {
+      "$ref": "https://oaiy.com/schemas/relay/v1/common.schema.json#/$defs/unixTimeOrNull"
+    },
+    "holderKeyThumbprint": {
+      "$ref": "https://oaiy.com/schemas/relay/v1/common.schema.json#/$defs/thumbprint"
+    },
+    "relay": {
+      "type": "object",
+      "properties": {
+        "challengeUrl": {
+          "type": "string",
+          "pattern": "^https://"
+        },
+        "framesUrl": {
+          "type": "string",
+          "pattern": "^https://"
+        },
+        "streamUrl": {
+          "type": "string",
+          "pattern": "^https://"
+        },
+        "mode": {
+          "const": "poll"
+        }
+      },
+      "required": [
+        "challengeUrl",
+        "framesUrl",
+        "streamUrl"
+      ],
+      "additionalProperties": false
+    },
+    "subjectId": {
+      "$ref": "https://oaiy.com/schemas/relay/v1/common.schema.json#/$defs/appId"
+    },
+    "role": {
+      "const": "plugin"
+    },
+    "device": {
+      "type": "object"
+    },
+    "endpointPublicKey": {
+      "$ref": "https://oaiy.com/schemas/relay/v1/common.schema.json#/$defs/endpointPublicKey"
+    },
+    "approvedPeerKeyThumbprints": {
+      "type": "array",
+      "items": {
+        "$ref": "https://oaiy.com/schemas/relay/v1/common.schema.json#/$defs/thumbprint"
+      },
+      "minItems": 1,
+      "maxItems": 16,
+      "uniqueItems": true
+    },
+    "peerRosterRevision": {
+      "type": "integer",
+      "minimum": 1,
+      "maximum": 9007199254740991
+    },
+    "peerRosterHash": {
+      "$ref": "https://oaiy.com/schemas/relay/v1/common.schema.json#/$defs/key32"
+    }
+  },
+  "required": [
+    "accessToken",
+    "tokenType",
+    "expiresIn",
+    "expiresAt",
+    "gatewayUrl",
+    "appId",
+    "subjectId",
+    "role",
+    "scopes",
+    "device",
+    "iceServers",
+    "relayOnly",
+    "turnCredentialExpiresAt",
+    "endpointPublicKey",
+    "holderKeyThumbprint",
+    "approvedPeerKeyThumbprints",
+    "peerRosterRevision",
+    "peerRosterHash",
+    "relay"
+  ],
+  "additionalProperties": false
+}

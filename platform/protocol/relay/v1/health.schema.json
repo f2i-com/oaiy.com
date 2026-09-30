@@ -1,0 +1,24 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://oaiy.com/schemas/relay/v1/health.schema.json",
+  "title": "Relay health",
+  "description": "GET /v1/health. Unauthenticated liveness probe. `authHeaderSeen` is true when the request carried any Authorization header through the web stack, so a host that strips it can be told apart from a revoked device.",
+  "type": "object",
+  "properties": {
+    "ok": {
+      "const": true
+    },
+    "time": {
+      "$ref": "https://oaiy.com/schemas/relay/v1/common.schema.json#/$defs/unixTime"
+    },
+    "authHeaderSeen": {
+      "type": "boolean"
+    }
+  },
+  "required": [
+    "ok",
+    "time",
+    "authHeaderSeen"
+  ],
+  "additionalProperties": false
+}

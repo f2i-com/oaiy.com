@@ -1,0 +1,27 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://oaiy.com/schemas/relay/v1/devices-revoke-response.schema.json",
+  "title": "Revoke every phone response",
+  "description": "200 response listing the phones that were revoked.",
+  "type": "object",
+  "properties": {
+    "v": {
+      "const": 1
+    },
+    "revoked": {
+      "type": "array",
+      "items": {
+        "$ref": "https://oaiy.com/schemas/relay/v1/common.schema.json#/$defs/deviceId"
+      }
+    },
+    "time": {
+      "$ref": "https://oaiy.com/schemas/relay/v1/common.schema.json#/$defs/unixTime"
+    }
+  },
+  "required": [
+    "v",
+    "revoked",
+    "time"
+  ],
+  "additionalProperties": true
+}

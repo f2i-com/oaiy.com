@@ -1,0 +1,79 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://oaiy.com/schemas/relay/v1/pairing-offer.schema.json",
+  "title": "Pairing offer v3",
+  "description": "The offer of pairing v3, stored on the relay as the exact text. The text is canonical JSON (keys sorted bytewise, no whitespace, integers only) and is MACed as received, never re-serialised. Exactly these members; `schemaVersion` is 3 so a v2 phone can never mistake it for its own. expiresAt - issuedAt is 600 (checked by code).",
+  "type": "object",
+  "properties": {
+    "kind": {
+      "const": "aokie_mobile_pairing"
+    },
+    "schemaVersion": {
+      "const": 3
+    },
+    "appId": {
+      "$ref": "https://oaiy.com/schemas/relay/v1/common.schema.json#/$defs/appId"
+    },
+    "desktopConnectionId": {
+      "$ref": "https://oaiy.com/schemas/relay/v1/common.schema.json#/$defs/deviceId"
+    },
+    "desktopName": {
+      "type": "string",
+      "maxLength": 60
+    },
+    "desktopEndpointKey": {
+      "$ref": "https://oaiy.com/schemas/relay/v1/common.schema.json#/$defs/endpointPublicKey"
+    },
+    "desktopX25519": {
+      "$ref": "https://oaiy.com/schemas/relay/v1/common.schema.json#/$defs/key32"
+    },
+    "hostIdentity": {
+      "$ref": "https://oaiy.com/schemas/relay/v1/common.schema.json#/$defs/hostIdentity"
+    },
+    "nonce": {
+      "$ref": "https://oaiy.com/schemas/relay/v1/common.schema.json#/$defs/key32"
+    },
+    "jti": {
+      "type": "string",
+      "pattern": "^pair-[A-Za-z0-9_-]{1,64}$"
+    },
+    "issuedAt": {
+      "$ref": "https://oaiy.com/schemas/relay/v1/common.schema.json#/$defs/unixTime"
+    },
+    "expiresAt": {
+      "$ref": "https://oaiy.com/schemas/relay/v1/common.schema.json#/$defs/unixTime"
+    },
+    "relay": {
+      "type": "object",
+      "properties": {
+        "url": {
+          "$ref": "https://oaiy.com/schemas/relay/v1/common.schema.json#/$defs/publicUrl"
+        },
+        "fingerprint": {
+          "$ref": "https://oaiy.com/schemas/relay/v1/common.schema.json#/$defs/thumbprint"
+        }
+      },
+      "required": [
+        "url",
+        "fingerprint"
+      ],
+      "additionalProperties": false
+    }
+  },
+  "required": [
+    "kind",
+    "schemaVersion",
+    "appId",
+    "desktopConnectionId",
+    "desktopName",
+    "desktopEndpointKey",
+    "desktopX25519",
+    "hostIdentity",
+    "nonce",
+    "jti",
+    "issuedAt",
+    "expiresAt",
+    "relay"
+  ],
+  "additionalProperties": false
+}

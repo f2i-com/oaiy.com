@@ -1,0 +1,24 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://oaiy.com/schemas/relay/v1/replybox-response.schema.json",
+  "title": "Create a reply box response",
+  "description": "201 response of POST /v1/replyboxes.",
+  "type": "object",
+  "properties": {
+    "rid": {
+      "$ref": "https://oaiy.com/schemas/relay/v1/common.schema.json#/$defs/rid"
+    },
+    "exp": {
+      "$ref": "https://oaiy.com/schemas/relay/v1/common.schema.json#/$defs/unixTime"
+    },
+    "time": {
+      "$ref": "https://oaiy.com/schemas/relay/v1/common.schema.json#/$defs/unixTime"
+    }
+  },
+  "required": [
+    "rid",
+    "exp",
+    "time"
+  ],
+  "additionalProperties": true
+}

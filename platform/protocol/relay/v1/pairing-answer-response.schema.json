@@ -1,0 +1,20 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://oaiy.com/schemas/relay/v1/pairing-answer-response.schema.json",
+  "title": "Response accepted",
+  "description": "202 response of POST /v1/pair/{pid}/response.",
+  "type": "object",
+  "properties": {
+    "state": {
+      "const": "answered"
+    },
+    "time": {
+      "$ref": "https://oaiy.com/schemas/relay/v1/common.schema.json#/$defs/unixTime"
+    }
+  },
+  "required": [
+    "state",
+    "time"
+  ],
+  "additionalProperties": true
+}

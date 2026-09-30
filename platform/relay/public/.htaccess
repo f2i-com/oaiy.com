@@ -1,0 +1,44 @@
+# OAIY Relay. The document root of the site must be THIS folder (public/); data/, src/ and bin/ live above it.
+# Not run through Apache in this repository's tests: read it as a starting point and check it with `php bin/doctor.php --url=...`.
+
+Options -Indexes
+DirectoryIndex index.php
+
+# Never serve dotfiles.
+<FilesMatch "^\.">
+    Require all denied
+</FilesMatch>
+
+# Only index.php, install.php and status.html are PHP or HTML that belongs here.
+<FilesMatch "\.(?!php$|html$)[A-Za-z0-9]+$">
+    Require all denied
+</FilesMatch>
+
+# The Authorization header carries every device token. FastCGI-family handlers drop it unless it is passed on.
+<IfModule mod_version.c>
+    <IfVersion >= 2.4.13>
+        CGIPassAuth On
+    </IfVersion>
+</IfModule>
+<IfModule mod_setenvif.c>
+    SetEnvIf Authorization "(.*)" HTTP_AUTHORIZATION=$1
+</IfModule>
+
+<IfModule mod_rewrite.c>
+    RewriteEngine On
+    RewriteRule .* - [E=HTTP_AUTHORIZATION:%{HTTP:Authorization}]
+
+    # Dotfiles and anything outside /v1/, /status.html and /install.php are not found.
+    RewriteRule (^|/)\. - [R=404,L]
+    RewriteCond %{REQUEST_URI} !^/(v1/|status\.html$|install\.php$)
+    RewriteRule ^ - [R=404,L]
+
+    # Everything under /v1/ is the front controller.
+    RewriteCond %{REQUEST_URI} ^/v1/
+    RewriteRule ^ index.php [L]
+</IfModule>
+
+<IfModule mod_headers.c>
+    Header always set X-Content-Type-Options "nosniff"
+    Header always set Referrer-Policy "no-referrer"
+</IfModule>

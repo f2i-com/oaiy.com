@@ -1,0 +1,41 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://oaiy.com/schemas/relay/v1/push-register-request.schema.json",
+  "title": "Push registration",
+  "description": "POST /v1/devices/self/push (phone). Either register an FCM token or remove the registration.",
+  "oneOf": [
+    {
+      "type": "object",
+      "properties": {
+        "kind": {
+          "const": "fcm"
+        },
+        "token": {
+          "type": "string",
+          "pattern": "^[\\x20-\\x7e]{16,4096}$"
+        },
+        "project": {
+          "type": "string",
+          "maxLength": 128
+        }
+      },
+      "required": [
+        "kind",
+        "token"
+      ],
+      "additionalProperties": true
+    },
+    {
+      "type": "object",
+      "properties": {
+        "remove": {
+          "const": true
+        }
+      },
+      "required": [
+        "remove"
+      ],
+      "additionalProperties": true
+    }
+  ]
+}

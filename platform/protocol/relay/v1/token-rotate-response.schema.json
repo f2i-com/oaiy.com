@@ -1,0 +1,24 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://oaiy.com/schemas/relay/v1/token-rotate-response.schema.json",
+  "title": "Token rotation response",
+  "description": "200 response of POST /v1/tokens/rotate. The old token keeps working until graceUntil (now + 600); a second rotation during the grace is 409 conflict.",
+  "type": "object",
+  "properties": {
+    "token": {
+      "$ref": "https://oaiy.com/schemas/relay/v1/common.schema.json#/$defs/token"
+    },
+    "graceUntil": {
+      "$ref": "https://oaiy.com/schemas/relay/v1/common.schema.json#/$defs/unixTime"
+    },
+    "time": {
+      "$ref": "https://oaiy.com/schemas/relay/v1/common.schema.json#/$defs/unixTime"
+    }
+  },
+  "required": [
+    "token",
+    "graceUntil",
+    "time"
+  ],
+  "additionalProperties": true
+}

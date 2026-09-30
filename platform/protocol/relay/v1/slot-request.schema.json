@@ -1,0 +1,35 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://oaiy.com/schemas/relay/v1/slot-request.schema.json",
+  "title": "Slot publish",
+  "description": "POST /v1/slots/{name} (desktop only). `readers` is a list of at most 8 entries; absent or empty means only the writer, and a name starting private. is writer-only whatever `readers` says. `body` is at most 65,536 bytes (a character count here).",
+  "type": "object",
+  "properties": {
+    "body": {
+      "type": "string",
+      "maxLength": 65536
+    },
+    "ttl": {
+      "type": "integer",
+      "minimum": 1,
+      "maximum": 3600
+    },
+    "ct": {
+      "$ref": "https://oaiy.com/schemas/relay/v1/common.schema.json#/$defs/ct"
+    },
+    "readers": {
+      "type": "array",
+      "items": {
+        "type": "string",
+        "pattern": "^(provider|desktop|phone|phone:[a-z][a-z0-9_]{0,31})$"
+      },
+      "maxItems": 8,
+      "uniqueItems": true
+    }
+  },
+  "required": [
+    "body",
+    "ct"
+  ],
+  "additionalProperties": true
+}

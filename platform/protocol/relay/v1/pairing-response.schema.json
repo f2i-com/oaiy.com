@@ -1,0 +1,32 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://oaiy.com/schemas/relay/v1/pairing-response.schema.json",
+  "title": "Pairing response v3",
+  "description": "The phone's response document: claims, an Ed25519 signature (proves possession of the phone's key) and an HMAC (proves knowledge of the pairing secret). Both are required.",
+  "type": "object",
+  "properties": {
+    "kind": {
+      "const": "aokie_mobile_pairing_response"
+    },
+    "schemaVersion": {
+      "const": 3
+    },
+    "claims": {
+      "$ref": "https://oaiy.com/schemas/relay/v1/pairing-claims.schema.json"
+    },
+    "signature": {
+      "$ref": "https://oaiy.com/schemas/relay/v1/common.schema.json#/$defs/signature"
+    },
+    "mac": {
+      "$ref": "https://oaiy.com/schemas/relay/v1/common.schema.json#/$defs/key32"
+    }
+  },
+  "required": [
+    "kind",
+    "schemaVersion",
+    "claims",
+    "signature",
+    "mac"
+  ],
+  "additionalProperties": false
+}

@@ -1,0 +1,1099 @@
+{
+ "protocol": "oaiy-relay/1",
+ "generator": "generate_vectors.py",
+ "note": "Known-answer vectors of Appendix A0 to A12 plus extras. Text values are exact; signed and MACed texts are stored as strings and rebuilt from the recorded objects by the verifiers. All keys are fixed public test seeds.",
+ "anchors": {
+  "rfc5869_tc1": {
+   "ikm": "0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b",
+   "salt": "000102030405060708090a0b0c",
+   "info": "f0f1f2f3f4f5f6f7f8f9",
+   "length": 42,
+   "okm": "3cb25f25faacd57a90434f64d0362f2a2d2d0a90cf1a5a4c5db02d56ecc4c5bf34007208d5b887185865"
+  },
+  "rfc4231_tc1_hmac_sha256": {
+   "key": "0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b",
+   "data": "Hi There",
+   "mac": "b0344c61d8db38535ca8afceaf0bf12b881dc200c9833da726e9376c2e32cff7"
+  },
+  "rfc2202_tc1_hmac_sha1": {
+   "key": "0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b",
+   "data": "Hi There",
+   "mac": "b617318655057264e28bc0b6fb378c8ef146be00"
+  },
+  "rfc8032_test1": {
+   "seed": "9d61b19deffd5a60ba844af492ec2cc44449c5697b326919703bac031cae7f60",
+   "public": "d75a980182b10ab7d54bfed3c964073a0ee172f3daa62325af021a68f707511a",
+   "message": "",
+   "signature": "e5564300c360ac729086e2cc806e828a84877f1eb8e5d974d873e065224901555fb8821590a33bacc61e39701cf9b46bd25bf5f0595bbe24655141438e7a100b"
+  },
+  "rfc7748_6_1": {
+   "alicePrivate": "77076d0a7318a57d3c16c17251b26645df4c2f87ebc0992ab177fba51db92c2a",
+   "alicePublic": "8520f0098930a754748b7ddcb43ef75a0dbf3a0d26381af4eba4a98eaa9b4e6a",
+   "bobPrivate": "5dab087e624a8a4b79e17f8b83800ee66f3bb1292618b6fd1c2f8b27ff88e0eb",
+   "bobPublic": "de9edb7d7b7dc1b4d35b61c2ece435373f8343c85b78674dadfc7e146f882b4f",
+   "shared": "4a5d9d5ba4ce2de1728e3bf480350f25e07e21c947d19e3376f09b3c1e161742"
+  }
+ },
+ "keys": {
+  "ed25519Seeds": {
+   "desktopEndpoint": "0909090909090909090909090909090909090909090909090909090909090909",
+   "phone": "0707070707070707070707070707070707070707070707070707070707070707",
+   "relay": "3333333333333333333333333333333333333333333333333333333333333333",
+   "host": "0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b",
+   "provider": "5151515151515151515151515151515151515151515151515151515151515151",
+   "provider2": "5252525252525252525252525252525252525252525252525252525252525252"
+  },
+  "x25519Secrets": {
+   "plugin": "d1d1d1d1d1d1d1d1d1d1d1d1d1d1d1d1d1d1d1d1d1d1d1d1d1d1d1d1d1d1d1d1",
+   "phone": "e2e2e2e2e2e2e2e2e2e2e2e2e2e2e2e2e2e2e2e2e2e2e2e2e2e2e2e2e2e2e2e2",
+   "host": "c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3",
+   "provider": "a4a4a4a4a4a4a4a4a4a4a4a4a4a4a4a4a4a4a4a4a4a4a4a4a4a4a4a4a4a4a4a4",
+   "provider2": "a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5",
+   "browserEphemeral": "6666666666666666666666666666666666666666666666666666666666666666"
+  },
+  "idBytes": {
+   "desktopDevice": "a0a1a2a3a4a5a6a7a8a9aaabacadaeaf",
+   "phoneDevice": "b0b1b2b3b4b5b6b7b8b9babbbcbdbebf",
+   "provider": "c0c1c2c3c4c5c6c7c8c9cacbcccdcecf",
+   "relay": "d0d1d2d3d4d5d6d7d8d9dadbdcdddedf"
+  },
+  "ids": {
+   "desktopDevice": "dev-oKGio6SlpqeoqaqrrK2urw",
+   "phoneDevice": "dev-sLGys7S1tre4ubq7vL2-vw",
+   "provider": "prov-wMHCw8TFxsfIycrLzM3Ozw",
+   "relay": "rly-0NHS09TV1tfY2drb3N3e3w"
+  },
+  "ed25519Public": {
+   "desktopEndpoint": {
+    "publicKey": "_RckOFqgx1tk-3jNYC-h2ZH96_drE8WO1wLqyDXp9hg",
+    "thumbprint": "atZR63tNG3W2GhPpVleKnfrw1N7N6LAqOe5grE2SBR4"
+   },
+   "phone": {
+    "publicKey": "6kpsY-KcUgq-9VB7Ey7F-ZVHdq6-vnuSQh7qaRRG0iw",
+    "thumbprint": "--6IM5l0OosLj9yWskISYhUA3n_3CURQkmrYMSha_ck"
+   },
+   "relay": {
+    "publicKey": "F8t5-ytBIPKx7GXkGY1uCLKOgT_rAeSkAIObheGAgM4",
+    "thumbprint": "b7dKD2-DlMApkGljz-RJwDdNcyxwyFBpSmhz2cRBnaw"
+   },
+   "host": {
+    "publicKey": "Zr5-Myx6RTMyvZ0Kf32wVfXF7xoGraZtmLOftoEMRzo",
+    "thumbprint": "8TlG3IhiRH5sWhsIGSSRnAqf9zyhEl1ir4t4cbTRCk0"
+   },
+   "provider": {
+    "publicKey": "wFDFY3pE-oYp__PMzOIwDLNipj2Z2V_FQUUmb0MyRFo",
+    "thumbprint": "hlqNnvnuw_g7uAgV8Sy2kR0hH3orMop9alO-BBtaWo4"
+   },
+   "provider2": {
+    "publicKey": "IBLLkMpg6OXY2vZuInLSIz4EhtVX6MZhQe2JIBd9frc",
+    "thumbprint": "SWUejy55xcz8xgSi-GX15ERZzyuXnb6voSaopq2Jakw"
+   }
+  },
+  "x25519Public": {
+   "plugin": "fmmObAT_fOZaBcblwdAzh4LSI8Y5DbIaucckFsAO720",
+   "phone": "GdgCBL-F8-ERjhsjQQyI8NDuztUVb0xb3zR7FO1-xj8",
+   "host": "v9o3aPkn21Kf6fD27kukaeQyyTu2-7jtXQToftCkXXs",
+   "provider": "1qJSfAGN_OCFpKUK1m4AEN00E76Uy7CnUjMpmmr-GAA",
+   "provider2": "X-8T_HYCOp7m3tmHtqqTlYzcIJfvn8hF1TGcnKEA014",
+   "browserEphemeral": "IZ5NgA2paNKl_LAJx4T0dGxxOO257khEtznoMLBc9CQ"
+  }
+ },
+ "A0": {
+  "inputs": {
+   "peerRosterRevision": 7,
+   "approvedPeerKeyThumbprints": [
+    "mobile_thumbprint_a",
+    "mobile_thumbprint_b"
+   ],
+   "domain": "aokie/v2/peer-roster",
+   "hashedText": "{\"approvedPeerKeyThumbprints\":[\"mobile_thumbprint_a\",\"mobile_thumbprint_b\"],\"peerRosterRevision\":7}"
+  },
+  "expected": {
+   "peerRosterHash": "tsKgPP1ruPCU23HfLYaUChe9jHYHCtubve77gnlfyDw",
+   "aokieReadmeValue": "tsKgPP1ruPCU23HfLYaUChe9jHYHCtubve77gnlfyDw"
+  }
+ },
+ "A1": {
+  "inputs": {
+   "privateKey": "nWGxne_9WmC6hEr0kuwsxERJxWl7MmkZcDusAxyuf2A",
+   "publicKey": "11qYAYKxCrfVS_7TyWQHOg7hcvPapiMlrwIaaPcHURo",
+   "signingInput": "eyJhbGciOiJFZERTQSJ9.RXhhbXBsZSBvZiBFZDI1NTE5IHNpZ25pbmc"
+  },
+  "expected": {
+   "signature": "hgyY0il_MGCjP0JzlnLWG1PPOt7-09PGcvMg3AIbQR6dWbhijcNR4ki4iylGjg5BhVsPt9g7sVvpAr_MuM0KAg"
+  }
+ },
+ "A2": {
+  "inputs": {
+   "idHex": "0102030405060708",
+   "secretHex": "202122232425262728292a2b2c2d2e2f303132333435363738393a3b3c3d3e3f",
+   "prefix": "oaiyrt1."
+  },
+  "expected": {
+   "token": "oaiyrt1.AQIDBAUGBwg.ICEiIyQlJicoKSorLC0uLzAxMjM0NTY3ODk6Ozw9Pj8",
+   "length": 63,
+   "secretSha256": "72dbb7336c76780023f83da4c355f2eeea85733b13d3477697917790c1229084"
+  }
+ },
+ "A3": {
+  "inputs": {
+   "secretHex": "a1b2c3d4e5f60718293a4b5c6d7e8f90",
+   "nonceHex": "404142434445464748494a4b4c4d4e4f505152535455565758595a5b5c5d5e5f",
+   "hkdfSalt": "oaiy/pairing/3",
+   "relayUrl": "https://relay.example.com",
+   "expiresAtParam": 1790000600,
+   "offer": {
+    "kind": "aokie_mobile_pairing",
+    "schemaVersion": 3,
+    "appId": "aokie",
+    "desktopConnectionId": "dev-oKGio6SlpqeoqaqrrK2urw",
+    "desktopName": "Front desk PC",
+    "desktopEndpointKey": {
+     "algorithm": "ed25519",
+     "publicKey": "_RckOFqgx1tk-3jNYC-h2ZH96_drE8WO1wLqyDXp9hg",
+     "thumbprint": "atZR63tNG3W2GhPpVleKnfrw1N7N6LAqOe5grE2SBR4"
+    },
+    "desktopX25519": "fmmObAT_fOZaBcblwdAzh4LSI8Y5DbIaucckFsAO720",
+    "hostIdentity": {
+     "ed25519": "Zr5-Myx6RTMyvZ0Kf32wVfXF7xoGraZtmLOftoEMRzo",
+     "thumbprint": "8TlG3IhiRH5sWhsIGSSRnAqf9zyhEl1ir4t4cbTRCk0",
+     "x25519": "v9o3aPkn21Kf6fD27kukaeQyyTu2-7jtXQToftCkXXs"
+    },
+    "nonce": "QEFCQ0RFRkdISUpLTE1OT1BRUlNUVVZXWFlaW1xdXl8",
+    "jti": "pair-0001",
+    "issuedAt": 1790000000,
+    "expiresAt": 1790000600,
+    "relay": {
+     "url": "https://relay.example.com",
+     "fingerprint": "b7dKD2-DlMApkGljz-RJwDdNcyxwyFBpSmhz2cRBnaw"
+    }
+   },
+   "claims": {
+    "appId": "aokie",
+    "desktopConnectionId": "dev-oKGio6SlpqeoqaqrrK2urw",
+    "desktopKeyThumbprint": "atZR63tNG3W2GhPpVleKnfrw1N7N6LAqOe5grE2SBR4",
+    "deviceId": "dev-sLGys7S1tre4ubq7vL2-vw",
+    "displayName": "Test phone",
+    "mobileEndpointKey": {
+     "algorithm": "ed25519",
+     "publicKey": "6kpsY-KcUgq-9VB7Ey7F-ZVHdq6-vnuSQh7qaRRG0iw",
+     "thumbprint": "--6IM5l0OosLj9yWskISYhUA3n_3CURQkmrYMSha_ck"
+    },
+    "mobileX25519": "GdgCBL-F8-ERjhsjQQyI8NDuztUVb0xb3zR7FO1-xj8",
+    "pairingNonce": "QEFCQ0RFRkdISUpLTE1OT1BRUlNUVVZXWFlaW1xdXl8",
+    "jti": "pair-0001",
+    "issuedAt": 1790000030,
+    "expiresAt": 1790000150
+   },
+   "receiptDocument": {
+    "appId": "aokie",
+    "grants": [
+     "assistance_read",
+     "assistance_respond",
+     "caller_read",
+     "captions_read",
+     "rtc_signal",
+     "state_read"
+    ],
+    "issuedAt": 1790000040,
+    "phoneThumbprint": "--6IM5l0OosLj9yWskISYhUA3n_3CURQkmrYMSha_ck",
+    "pid": "b5YkfMcTvJb0g1GTv3kNNQ"
+   }
+  },
+  "expected": {
+   "secretB64u": "obLD1OX2BxgpOktcbX6PkA",
+   "typedCode": "M6SC-7N75-YR3H-GA9T-9DE6-TZMF-J0RW",
+   "pid": "b5YkfMcTvJb0g1GTv3kNNQ",
+   "pidHex": "6f96247cc713bc96f4835193bf790d35",
+   "macKeyHex": "0a32adef7f346a81bee7534af43c154ea1f7418433de1da4b18182ab4244880d",
+   "pairingUri": "oaiy://pair?v=3&u=https%3A%2F%2Frelay.example.com&f=b7dKD2-DlMApkGljz-RJwDdNcyxwyFBpSmhz2cRBnaw&s=obLD1OX2BxgpOktcbX6PkA&x=1790000600",
+   "offerText": "{\"appId\":\"aokie\",\"desktopConnectionId\":\"dev-oKGio6SlpqeoqaqrrK2urw\",\"desktopEndpointKey\":{\"algorithm\":\"ed25519\",\"publicKey\":\"_RckOFqgx1tk-3jNYC-h2ZH96_drE8WO1wLqyDXp9hg\",\"thumbprint\":\"atZR63tNG3W2GhPpVleKnfrw1N7N6LAqOe5grE2SBR4\"},\"desktopName\":\"Front desk PC\",\"desktopX25519\":\"fmmObAT_fOZaBcblwdAzh4LSI8Y5DbIaucckFsAO720\",\"expiresAt\":1790000600,\"hostIdentity\":{\"ed25519\":\"Zr5-Myx6RTMyvZ0Kf32wVfXF7xoGraZtmLOftoEMRzo\",\"thumbprint\":\"8TlG3IhiRH5sWhsIGSSRnAqf9zyhEl1ir4t4cbTRCk0\",\"x25519\":\"v9o3aPkn21Kf6fD27kukaeQyyTu2-7jtXQToftCkXXs\"},\"issuedAt\":1790000000,\"jti\":\"pair-0001\",\"kind\":\"aokie_mobile_pairing\",\"nonce\":\"QEFCQ0RFRkdISUpLTE1OT1BRUlNUVVZXWFlaW1xdXl8\",\"relay\":{\"fingerprint\":\"b7dKD2-DlMApkGljz-RJwDdNcyxwyFBpSmhz2cRBnaw\",\"url\":\"https://relay.example.com\"},\"schemaVersion\":3}",
+   "offerTextBytes": 778,
+   "offerMac": "NVXJRqSryFOpH6fU5kmvLpQzv0-rM1wzDXd8BiMoDWk",
+   "claimsCanonical": "{\"appId\":\"aokie\",\"desktopConnectionId\":\"dev-oKGio6SlpqeoqaqrrK2urw\",\"desktopKeyThumbprint\":\"atZR63tNG3W2GhPpVleKnfrw1N7N6LAqOe5grE2SBR4\",\"deviceId\":\"dev-sLGys7S1tre4ubq7vL2-vw\",\"displayName\":\"Test phone\",\"expiresAt\":1790000150,\"issuedAt\":1790000030,\"jti\":\"pair-0001\",\"mobileEndpointKey\":{\"algorithm\":\"ed25519\",\"publicKey\":\"6kpsY-KcUgq-9VB7Ey7F-ZVHdq6-vnuSQh7qaRRG0iw\",\"thumbprint\":\"--6IM5l0OosLj9yWskISYhUA3n_3CURQkmrYMSha_ck\"},\"mobileX25519\":\"GdgCBL-F8-ERjhsjQQyI8NDuztUVb0xb3zR7FO1-xj8\",\"pairingNonce\":\"QEFCQ0RFRkdISUpLTE1OT1BRUlNUVVZXWFlaW1xdXl8\"}",
+   "responseSignature": "uoCR5b9NLDUwK2QBH-pXtm-6I5Kj4FqM4F_BhuGDxr_qKomo7Kq1O1H14s8YyPuie14oCoaoTzHvX0KoT5UwAQ",
+   "responseMac": "0Nw8sxSLeI6x5islDA7m0Gi_s_qP4LrHWrbPIMwxdoQ",
+   "sasRawHex": "3563599914bdf7f9",
+   "sas12": "6NHNK68MQQVZ",
+   "sasCheckChar": "5",
+   "sasDisplay": "6NHN-K68M-QQVZ-5",
+   "receiptText": "{\"appId\":\"aokie\",\"grants\":[\"assistance_read\",\"assistance_respond\",\"caller_read\",\"captions_read\",\"rtc_signal\",\"state_read\"],\"issuedAt\":1790000040,\"phoneThumbprint\":\"--6IM5l0OosLj9yWskISYhUA3n_3CURQkmrYMSha_ck\",\"pid\":\"b5YkfMcTvJb0g1GTv3kNNQ\"}",
+   "receiptSignature": "FU2PKdtj23VkPpxZfw-DcqwSBNWlL8OvFfPFiJ-kSufrDGbpBPKfKy0c9MfhD3IZyM_5pVgAmeiMGNep93mtDg"
+  }
+ },
+ "A4": {
+  "inputs": {
+   "secretHex": "0101010101010101010101010101010101010101010101010101010101010101",
+   "claims": {
+    "aud": "aokie-v2-gateway",
+    "appId": "aokie",
+    "subjectId": "dev-sLGys7S1tre4ubq7vL2-vw",
+    "role": "mobile",
+    "holderKeyThumbprint": "--6IM5l0OosLj9yWskISYhUA3n_3CURQkmrYMSha_ck",
+    "expectedPeerKeyThumbprint": "atZR63tNG3W2GhPpVleKnfrw1N7N6LAqOe5grE2SBR4",
+    "scopes": [
+     "state_read",
+     "caller_read",
+     "captions_read",
+     "rtc_signal"
+    ],
+    "dsk": "dev-oKGio6SlpqeoqaqrrK2urw",
+    "exp": 1790000090,
+    "jti": "adm_00000000000000000000000000000001"
+   }
+  },
+  "expected": {
+   "payload": "{\"aud\":\"aokie-v2-gateway\",\"appId\":\"aokie\",\"subjectId\":\"dev-sLGys7S1tre4ubq7vL2-vw\",\"role\":\"mobile\",\"holderKeyThumbprint\":\"--6IM5l0OosLj9yWskISYhUA3n_3CURQkmrYMSha_ck\",\"expectedPeerKeyThumbprint\":\"atZR63tNG3W2GhPpVleKnfrw1N7N6LAqOe5grE2SBR4\",\"scopes\":[\"state_read\",\"caller_read\",\"captions_read\",\"rtc_signal\"],\"dsk\":\"dev-oKGio6SlpqeoqaqrrK2urw\",\"exp\":1790000090,\"jti\":\"adm_00000000000000000000000000000001\"}",
+   "token": "aokie-adm-v2.7b22617564223a22616f6b69652d76322d67617465776179222c226170704964223a22616f6b6965222c227375626a6563744964223a226465762d734c4779733753317472653475627137764c322d7677222c22726f6c65223a226d6f62696c65222c22686f6c6465724b65795468756d627072696e74223a222d2d36494d356c304f6f734c6a397957736b495359685541336e5f33435552516b6d72594d5368615f636b222c226578706563746564506565724b65795468756d627072696e74223a2261745a523633744e4733573247685070566c654b6e667277314e374e364c41714f65356772453253425234222c2273636f706573223a5b2273746174655f72656164222c2263616c6c65725f72656164222c2263617074696f6e735f72656164222c227274635f7369676e616c225d2c2264736b223a226465762d6f4b47696f36536c7071656f71617172724b32757277222c22657870223a313739303030303039302c226a7469223a2261646d5f3030303030303030303030303030303030303030303030303030303030303031227d.fa070168b95bc239a6ce8e23075e0dec97919e3739e9259feed7c50b640eca96",
+   "length": 888
+  }
+ },
+ "A4b": {
+  "inputs": {
+   "secretHex": "0101010101010101010101010101010101010101010101010101010101010101",
+   "pluginId": "aokie",
+   "holderThumbprint": "atZR63tNG3W2GhPpVleKnfrw1N7N6LAqOe5grE2SBR4",
+   "peerRosterRevision": 7,
+   "scopes": [
+    "state_read",
+    "rtc_signal"
+   ],
+   "dsk": "dev-oKGio6SlpqeoqaqrrK2urw",
+   "exp": 1790000090,
+   "jti": "adm_00000000000000000000000000000001",
+   "peerThumbprintOf": "b64u(SHA-256(byte(i))) for i in 0..n-1, then sorted ascending"
+  },
+  "expected": {
+   "lengthByPhones": {
+    "1": 964,
+    "3": 1148,
+    "8": 1608,
+    "16": 2344,
+    "32": 3816,
+    "64": 6760
+   },
+   "perPhoneCharacters": 92,
+   "tokenForOnePhone": "aokie-adm-v2.7b22617564223a22616f6b69652d76322d67617465776179222c226170704964223a22616f6b6965222c227375626a6563744964223a22616f6b6965222c22726f6c65223a22706c7567696e222c22686f6c6465724b65795468756d627072696e74223a2261745a523633744e4733573247685070566c654b6e667277314e374e364c41714f65356772453253425234222c22617070726f766564506565724b65795468756d627072696e7473223a5b22626a514c6e502d7a657069637055546d7533674b4c48695148542d7a4e7a68326852476a426865766f4230225d2c2270656572526f737465725265766973696f6e223a372c2270656572526f7374657248617368223a22476d55333973534f3447514878793533433463634b56305170685265386b337932564c626a6c4778313934222c2273636f706573223a5b2273746174655f72656164222c227274635f7369676e616c225d2c2264736b223a226465762d6f4b47696f36536c7071656f71617172724b32757277222c22657870223a313739303030303039302c226a7469223a2261646d5f3030303030303030303030303030303030303030303030303030303030303031227d.b36c0e251cfc80ce2d6b22476cdad350aa663aed386bd348846123b84e2d04d7"
+  }
+ },
+ "A5": {
+  "inputs": {
+   "secret": "0123456789abcdef0123456789abcdef",
+   "expiry": 1790000600,
+   "subjectId": "dev-sLGys7S1tre4ubq7vL2-vw"
+  },
+  "expected": {
+   "username": "1790000600:dev-sLGys7S1tre4ubq7vL2-vw",
+   "credential": "T2oDhW95dkDEbEXjdHRbKL5eh7g="
+  }
+ },
+ "A6": {
+  "inputs": {
+   "body": "{\"protocol\":\"oaiy-relay/1\",\"relayId\":\"rly-0NHS09TV1tfY2drb3N3e3w\"}",
+   "nonce": "EBESExQVFhcYGRobHB0eHw",
+   "time": 1790000000
+  },
+  "expected": {
+   "bodySha256": "50c0fd16de03abb48ae864b6379836b71f10025f91d0976b2198885617a09883",
+   "proof": "4o_XJ-1EjzwrHgisbfhHOeJ7WymUeJWqN8WmjLf0lllRTAlNTNSmFygY9Al5HncmJRTVDv82GcI4eur-D_f_Bg",
+   "staticSignature": "Ev4PROe-bST4Z_BQLcuEVkBJQwj82o6zdeaFMOTUxiyjcUBRu6dTBCXnfUzsxNTcTdoNiUSfxE-4wCBpYMNlDA"
+  }
+ },
+ "A6b": {
+  "inputs": {
+   "info": {
+    "protocol": "oaiy-relay/1",
+    "minClient": 1,
+    "relayId": "rly-0NHS09TV1tfY2drb3N3e3w",
+    "relayKey": {
+     "algorithm": "ed25519",
+     "publicKey": "F8t5-ytBIPKx7GXkGY1uCLKOgT_rAeSkAIObheGAgM4",
+     "thumbprint": "b7dKD2-DlMApkGljz-RJwDdNcyxwyFBpSmhz2cRBnaw"
+    },
+    "software": {
+     "name": "oaiy-relay",
+     "version": "0.1.0"
+    },
+    "features": [
+     "poll",
+     "items",
+     "slots",
+     "presence",
+     "replyboxes",
+     "tickets",
+     "pairing.v3",
+     "methods.post-forms",
+     "call",
+     "admission.aokie-adm-v2",
+     "compat.aokie-companion-relay",
+     "compat.sse-framed-poll",
+     "push.fcm"
+    ],
+    "wait": {
+     "default": 20,
+     "max": 20,
+     "pollGapMs": 250,
+     "fallbackS": 5
+    },
+    "presenceWindow": 60,
+    "limits": {
+     "batchItems": 64,
+     "batchBytes": 1048576,
+     "mailboxItems": 512,
+     "mailboxBytes": 8388608,
+     "bulkShare": 0.75,
+     "sigItems": 1024,
+     "sigSenderShare": 0.25,
+     "lookupWait": 8,
+     "lookupHeld": 4,
+     "hdrBytes": 512,
+     "slotBytes": 65536,
+     "rosterMax": 16,
+     "held": {
+      "soft": 3,
+      "hard": 4,
+      "measured": false
+     },
+     "lanes": {
+      "cmd": {
+       "body": 32768,
+       "ttl": {
+        "default": 60,
+        "min": 1,
+        "max": 300
+       }
+      },
+      "res": {
+       "body": 98304,
+       "ttl": {
+        "default": 300,
+        "min": 1,
+        "max": 3600
+       }
+      },
+      "ai": {
+       "body": 393216,
+       "ttl": {
+        "default": 300,
+        "min": 1,
+        "max": 600
+       }
+      },
+      "ai.in": {
+       "body": 65536,
+       "ttl": {
+        "default": 300,
+        "min": 1,
+        "max": 600
+       }
+      },
+      "ai.out": {
+       "body": 393216,
+       "ttl": {
+        "default": 360,
+        "min": 1,
+        "max": 900
+       }
+      },
+      "ring": {
+       "body": 4096,
+       "ttl": {
+        "default": 30,
+        "min": 1,
+        "max": 300
+       }
+      },
+      "sync": {
+       "body": 65536,
+       "ttl": {
+        "default": 21600,
+        "min": 1,
+        "max": 86400
+       }
+      },
+      "sig": {
+       "body": 196608,
+       "ttl": {
+        "default": 120,
+        "min": 1,
+        "max": 300
+       }
+      }
+     }
+    },
+    "turn": true,
+    "cors": [
+     "https://app.example.com"
+    ]
+   },
+   "nonce": "EBESExQVFhcYGRobHB0eHw",
+   "time": 1790000000
+  },
+  "expected": {
+   "bodyText": "{\"protocol\":\"oaiy-relay/1\",\"minClient\":1,\"relayId\":\"rly-0NHS09TV1tfY2drb3N3e3w\",\"relayKey\":{\"algorithm\":\"ed25519\",\"publicKey\":\"F8t5-ytBIPKx7GXkGY1uCLKOgT_rAeSkAIObheGAgM4\",\"thumbprint\":\"b7dKD2-DlMApkGljz-RJwDdNcyxwyFBpSmhz2cRBnaw\"},\"software\":{\"name\":\"oaiy-relay\",\"version\":\"0.1.0\"},\"features\":[\"poll\",\"items\",\"slots\",\"presence\",\"replyboxes\",\"tickets\",\"pairing.v3\",\"methods.post-forms\",\"call\",\"admission.aokie-adm-v2\",\"compat.aokie-companion-relay\",\"compat.sse-framed-poll\",\"push.fcm\"],\"wait\":{\"default\":20,\"max\":20,\"pollGapMs\":250,\"fallbackS\":5},\"presenceWindow\":60,\"limits\":{\"batchItems\":64,\"batchBytes\":1048576,\"mailboxItems\":512,\"mailboxBytes\":8388608,\"bulkShare\":0.75,\"sigItems\":1024,\"sigSenderShare\":0.25,\"lookupWait\":8,\"lookupHeld\":4,\"hdrBytes\":512,\"slotBytes\":65536,\"rosterMax\":16,\"held\":{\"soft\":3,\"hard\":4,\"measured\":false},\"lanes\":{\"cmd\":{\"body\":32768,\"ttl\":{\"default\":60,\"min\":1,\"max\":300}},\"res\":{\"body\":98304,\"ttl\":{\"default\":300,\"min\":1,\"max\":3600}},\"ai\":{\"body\":393216,\"ttl\":{\"default\":300,\"min\":1,\"max\":600}},\"ai.in\":{\"body\":65536,\"ttl\":{\"default\":300,\"min\":1,\"max\":600}},\"ai.out\":{\"body\":393216,\"ttl\":{\"default\":360,\"min\":1,\"max\":900}},\"ring\":{\"body\":4096,\"ttl\":{\"default\":30,\"min\":1,\"max\":300}},\"sync\":{\"body\":65536,\"ttl\":{\"default\":21600,\"min\":1,\"max\":86400}},\"sig\":{\"body\":196608,\"ttl\":{\"default\":120,\"min\":1,\"max\":300}}}},\"turn\":true,\"cors\":[\"https://app.example.com\"]}",
+   "bodyBytes": 1390,
+   "bodySha256": "72ac3613e1147706baeb6a69264f769a97dbc27e33c46edbbd4fff6c4773fa3f",
+   "proof": "76yVwPuNKgzidflClcmeYuQu4AS3mEcfAod5CNb9EEKmqoV2wyCCaDauBKyU485O6GE_b6RWEfSamQnqbrA1Ag",
+   "staticSignature": "1L54kvFOvQQ4c7t-zQYNDz_aKDb3foXEUuVoSWEQV9YbZ1tAlStL1Vj0BaMF9EpZnLZsRpDVp9oYqeFHzhqaBg"
+  }
+ },
+ "A7": {
+  "inputs": {
+   "secretHex": "00112233445566778899aabbccddeeff",
+   "hkdfSalt": "oaiy/enroll/1",
+   "request": {
+    "kid": "OJttnmp91Xo",
+    "role": "desktop",
+    "name": "Front desk PC",
+    "n": "cHFyc3R1dnd4eXp7fH1-fw",
+    "keys": {
+     "ed25519": "Zr5-Myx6RTMyvZ0Kf32wVfXF7xoGraZtmLOftoEMRzo",
+     "x25519": "v9o3aPkn21Kf6fD27kukaeQyyTu2-7jtXQToftCkXXs"
+    }
+   },
+   "relayUrl": "https://relay.example.com",
+   "expiry": 1790003600
+  },
+  "expected": {
+   "kid": "OJttnmp91Xo",
+   "derivedPublic": "UbdzJGbsg68-cAFQVB7FTivyuuaHUyJg7M_67QU97AA",
+   "requestBody": "{\"kid\":\"OJttnmp91Xo\",\"role\":\"desktop\",\"name\":\"Front desk PC\",\"n\":\"cHFyc3R1dnd4eXp7fH1-fw\",\"keys\":{\"ed25519\":\"Zr5-Myx6RTMyvZ0Kf32wVfXF7xoGraZtmLOftoEMRzo\",\"x25519\":\"v9o3aPkn21Kf6fD27kukaeQyyTu2-7jtXQToftCkXXs\"}}",
+   "proof": "uUkVKr8zengn6paFCcBgs_uBFU8S7rUEDg2w3t_5279ALMEeR_WqRWBZ0lxnyiwWffD0L-qbR6k3bfbVlyK0Cg",
+   "uri": "oaiy://enroll?v=1&u=https%3A%2F%2Frelay.example.com&f=b7dKD2-DlMApkGljz-RJwDdNcyxwyFBpSmhz2cRBnaw&k=OJttnmp91Xo&s=ABEiM0RVZneImaq7zN3u_w&r=desktop&x=1790003600",
+   "secretB64u": "ABEiM0RVZneImaq7zN3u_w"
+  }
+ },
+ "A8": {
+  "inputs": {
+   "command": {
+    "v": 1,
+    "id": "cmd-0001",
+    "dev": "dev-oKGio6SlpqeoqaqrrK2urw",
+    "to": "oaiy-desk-1",
+    "connector": "aokie",
+    "command": "call.hangup",
+    "payload": {
+     "callId": "call_0123"
+    },
+    "idem": "idem-0001",
+    "iat": 1790000000,
+    "exp": 1790000015,
+    "src": "prov-wMHCw8TFxsfIycrLzM3Ozw",
+    "uid": "u-42"
+   }
+  },
+  "expected": {
+   "signedBytes": "{\"v\":1,\"id\":\"cmd-0001\",\"dev\":\"dev-oKGio6SlpqeoqaqrrK2urw\",\"to\":\"oaiy-desk-1\",\"connector\":\"aokie\",\"command\":\"call.hangup\",\"payload\":{\"callId\":\"call_0123\"},\"idem\":\"idem-0001\",\"iat\":1790000000,\"exp\":1790000015,\"src\":\"prov-wMHCw8TFxsfIycrLzM3Ozw\",\"uid\":\"u-42\"}",
+   "signature": "rDvULKFLe_i0a7wyxkd7teh1B4bg2fZtBbBXMempJmp26BnyUg-RhOXP0U_AeV_DHt_rICqrwO_2803WnS9dDw",
+   "container": "{\"k\":\"hlqNnvnuw_g7uAgV8Sy2kR0hH3orMop9alO-BBtaWo4\",\"b\":\"eyJ2IjoxLCJpZCI6ImNtZC0wMDAxIiwiZGV2IjoiZGV2LW9LR2lvNlNscHFlb3FhcXJySzJ1cnciLCJ0byI6Im9haXktZGVzay0xIiwiY29ubmVjdG9yIjoiYW9raWUiLCJjb21tYW5kIjoiY2FsbC5oYW5ndXAiLCJwYXlsb2FkIjp7ImNhbGxJZCI6ImNhbGxfMDEyMyJ9LCJpZGVtIjoiaWRlbS0wMDAxIiwiaWF0IjoxNzkwMDAwMDAwLCJleHAiOjE3OTAwMDAwMTUsInNyYyI6InByb3Ytd01IQ3c4VEZ4c2ZJeWNyTHpNM096dyIsInVpZCI6InUtNDIifQ\",\"s\":\"rDvULKFLe_i0a7wyxkd7teh1B4bg2fZtBbBXMempJmp26BnyUg-RhOXP0U_AeV_DHt_rICqrwO_2803WnS9dDw\"}",
+   "containerBytes": 493
+  }
+ },
+ "A9": {
+  "inputs": {
+   "header": {
+    "alg": "EdDSA",
+    "typ": "oaiy-ticket+jwt",
+    "kid": "hlqNnvnuw_g7uAgV8Sy2kR0hH3orMop9alO-BBtaWo4"
+   },
+   "claims": {
+    "iss": "prov-wMHCw8TFxsfIycrLzM3Ozw",
+    "aud": "rly-0NHS09TV1tfY2drb3N3e3w",
+    "sub": "member-42",
+    "iat": 1790000000,
+    "exp": 1790000300,
+    "jti": "tkt-0001",
+    "lane": "ai",
+    "dev": "dev-oKGio6SlpqeoqaqrrK2urw",
+    "org": "https://app.example.com",
+    "eph": "Qn_yvQjAxpTH9UI5n64Pu0Lbh4P6kThgr8LVngR0sjU"
+   }
+  },
+  "expected": {
+   "ephemeralPublic": "IZ5NgA2paNKl_LAJx4T0dGxxOO257khEtznoMLBc9CQ",
+   "signingInput": "eyJhbGciOiJFZERTQSIsInR5cCI6Im9haXktdGlja2V0K2p3dCIsImtpZCI6ImhscU5udm51d19nN3VBZ1Y4U3kya1IwaEgzb3JNb3A5YWxPLUJCdGFXbzQifQ.eyJpc3MiOiJwcm92LXdNSEN3OFRGeHNmSXljckx6TTNPenciLCJhdWQiOiJybHktME5IUzA5VFYxdGZZMmRyYjNOM2UzdyIsInN1YiI6Im1lbWJlci00MiIsImlhdCI6MTc5MDAwMDAwMCwiZXhwIjoxNzkwMDAwMzAwLCJqdGkiOiJ0a3QtMDAwMSIsImxhbmUiOiJhaSIsImRldiI6ImRldi1vS0dpbzZTbHBxZW9xYXFycksydXJ3Iiwib3JnIjoiaHR0cHM6Ly9hcHAuZXhhbXBsZS5jb20iLCJlcGgiOiJRbl95dlFqQXhwVEg5VUk1bjY0UHUwTGJoNFA2a1RoZ3I4TFZuZ1Iwc2pVIn0",
+   "signature": "8uLJTXCapVZ23JG5kVDni_qaS71qsZ1T0aomu7RrPiU0rUwrYhytLu-NFDDhJvssKzfTP5XwcuGLRr45_5TAAQ",
+   "ticket": "eyJhbGciOiJFZERTQSIsInR5cCI6Im9haXktdGlja2V0K2p3dCIsImtpZCI6ImhscU5udm51d19nN3VBZ1Y4U3kya1IwaEgzb3JNb3A5YWxPLUJCdGFXbzQifQ.eyJpc3MiOiJwcm92LXdNSEN3OFRGeHNmSXljckx6TTNPenciLCJhdWQiOiJybHktME5IUzA5VFYxdGZZMmRyYjNOM2UzdyIsInN1YiI6Im1lbWJlci00MiIsImlhdCI6MTc5MDAwMDAwMCwiZXhwIjoxNzkwMDAwMzAwLCJqdGkiOiJ0a3QtMDAwMSIsImxhbmUiOiJhaSIsImRldiI6ImRldi1vS0dpbzZTbHBxZW9xYXFycksydXJ3Iiwib3JnIjoiaHR0cHM6Ly9hcHAuZXhhbXBsZS5jb20iLCJlcGgiOiJRbl95dlFqQXhwVEg5VUk1bjY0UHUwTGJoNFA2a1RoZ3I4TFZuZ1Iwc2pVIn0.8uLJTXCapVZ23JG5kVDni_qaS71qsZ1T0aomu7RrPiU0rUwrYhytLu-NFDDhJvssKzfTP5XwcuGLRr45_5TAAQ"
+  }
+ },
+ "A10": {
+  "inputs": {
+   "statement": {
+    "v": 1,
+    "prev": "hlqNnvnuw_g7uAgV8Sy2kR0hH3orMop9alO-BBtaWo4",
+    "new": {
+     "ed25519": "IBLLkMpg6OXY2vZuInLSIz4EhtVX6MZhQe2JIBd9frc",
+     "thumbprint": "SWUejy55xcz8xgSi-GX15ERZzyuXnb6voSaopq2Jakw",
+     "x25519": "X-8T_HYCOp7m3tmHtqqTlYzcIJfvn8hF1TGcnKEA014"
+    },
+    "serial": 1,
+    "iat": 1790000000,
+    "exp": 1790086400
+   }
+  },
+  "expected": {
+   "statementText": "{\"v\":1,\"prev\":\"hlqNnvnuw_g7uAgV8Sy2kR0hH3orMop9alO-BBtaWo4\",\"new\":{\"ed25519\":\"IBLLkMpg6OXY2vZuInLSIz4EhtVX6MZhQe2JIBd9frc\",\"thumbprint\":\"SWUejy55xcz8xgSi-GX15ERZzyuXnb6voSaopq2Jakw\",\"x25519\":\"X-8T_HYCOp7m3tmHtqqTlYzcIJfvn8hF1TGcnKEA014\"},\"serial\":1,\"iat\":1790000000,\"exp\":1790086400}",
+   "signature": "uvf5l5xuyHGkuNhz4ycg07tAbHxqDETo-4rY7ruIVNQVSUjHgpvwXS_I1006bpwM4qOOSYePS165g5zNLQRRDg"
+  }
+ },
+ "A11": {
+  "inputs": {
+   "body": {
+    "aokieClass": "voice_offer",
+    "schemaVersion": "1",
+    "eventId": "evt_ring_0001",
+    "offerId": "toffer_0001",
+    "appId": "aokie",
+    "callId": "call_0123",
+    "callEpoch": "7",
+    "ownerEpoch": "4",
+    "expiresAt": "1790000040"
+   }
+  },
+  "expected": {
+   "bodyText": "{\"aokieClass\":\"voice_offer\",\"schemaVersion\":\"1\",\"eventId\":\"evt_ring_0001\",\"offerId\":\"toffer_0001\",\"appId\":\"aokie\",\"callId\":\"call_0123\",\"callEpoch\":\"7\",\"ownerEpoch\":\"4\",\"expiresAt\":\"1790000040\"}",
+   "hdrSig": "0lTc0PX9bX8oBmi8-jriiGEPBTD4MNP35n1GEPNNj0N3-mDwWkv0hJjOaXgiC8s_5fIz91jrtL15Eejz5H6tAQ"
+  }
+ },
+ "A12": {
+  "inputs": {
+   "staticKeyHex": "0102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f20",
+   "encodings": {
+    "zero": "0000000000000000000000000000000000000000000000000000000000000000",
+    "one": "0100000000000000000000000000000000000000000000000000000000000000",
+    "order8-a": "e0eb7a7c3b41b8ae1656e3faf19fc46ada098deb9c32b1fd866205165f49b800",
+    "order8-b": "5f9c95bca3508c24b1d0b1559c83ef5b04445cc4581c8e86d8224eddd09f1157",
+    "p-1": "ecffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff7f",
+    "p": "edffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff7f",
+    "p+1": "eeffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff7f"
+   },
+   "withBit255": {
+    "zero": "0000000000000000000000000000000000000000000000000000000000000080",
+    "one": "0100000000000000000000000000000000000000000000000000000000000080",
+    "order8-a": "e0eb7a7c3b41b8ae1656e3faf19fc46ada098deb9c32b1fd866205165f49b880",
+    "order8-b": "5f9c95bca3508c24b1d0b1559c83ef5b04445cc4581c8e86d8224eddd09f11d7",
+    "p-1": "ecffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff",
+    "p": "edffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff",
+    "p+1": "eeffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff"
+   },
+   "rule": "a peer key is refused when, after masking bit 255, its value reduced modulo p is 0, 1, p-1, or one of the two order-8 encodings; equivalently when the shared secret would be all zero"
+  },
+  "expected": {
+   "allGiveZeroSharedSecret": true,
+   "controlBasePointGivesNonZero": true
+  }
+ },
+ "extras": {
+  "canonical": {
+   "cases": [
+    {
+     "label": "keys are sorted",
+     "input": "{\"b\":1,\"a\":2}",
+     "output": "{\"a\":2,\"b\":1}"
+    },
+    {
+     "label": "whitespace is dropped, nesting is sorted",
+     "input": "{ \"z\" : [ 3 , 1 , {\"y\":true,\"x\":null} ] , \"a\" : { } }",
+     "output": "{\"a\":{},\"z\":[3,1,{\"x\":null,\"y\":true}]}"
+    },
+    {
+     "label": "order is bytewise on the UTF-8 of the key",
+     "input": "{\"B\":1,\"a\":2,\"_\":3,\"1\":4}",
+     "output": "{\"1\":4,\"B\":1,\"_\":3,\"a\":2}"
+    },
+    {
+     "label": "non-ASCII stays UTF-8, only quote, backslash and controls are escaped, slash is not",
+     "input": "{\"z\":\"é\",\"a\":\"日本\",\"k\":\"\\u0001\\n\\\"\\\\\\/\"}",
+     "output": "{\"a\":\"日本\",\"k\":\"\\u0001\\n\\\"\\\\/\",\"z\":\"é\"}"
+    },
+    {
+     "label": "integers up to the 64-bit limits",
+     "input": "{\"a\":9007199254740991,\"b\":9223372036854775807,\"c\":18446744073709551615,\"d\":-9223372036854775808,\"e\":0}",
+     "output": "{\"a\":9007199254740991,\"b\":9223372036854775807,\"c\":18446744073709551615,\"d\":-9223372036854775808,\"e\":0}"
+    },
+    {
+     "label": "empty containers, booleans and null",
+     "input": "{\"c\":null,\"b\":true,\"a\":[],\"d\":{},\"e\":false}",
+     "output": "{\"a\":[],\"b\":true,\"c\":null,\"d\":{},\"e\":false}"
+    },
+    {
+     "label": "0 and negative integers are accepted; only the spelling -0 is not",
+     "input": "{\"a\":0,\"b\":-1,\"c\":-10,\"d\":10}",
+     "output": "{\"a\":0,\"b\":-1,\"c\":-10,\"d\":10}"
+    }
+   ],
+   "refused": [
+    {
+     "label": "a fraction",
+     "input": "{\"n\":0.5}"
+    },
+    {
+     "label": "1.0 is a float even though its value is integral",
+     "input": "{\"n\":1.0}"
+    },
+    {
+     "label": "an exponent",
+     "input": "{\"n\":1e2}"
+    },
+    {
+     "label": "a float nested in an array",
+     "input": "{\"a\":[1,2,3.5]}"
+    },
+    {
+     "label": "an integer above the unsigned 64-bit range",
+     "input": "{\"n\":18446744073709551616}"
+    },
+    {
+     "label": "an integer below the signed 64-bit range",
+     "input": "{\"n\":-9223372036854775809}"
+    },
+    {
+     "label": "-0 is not a canonical spelling of the integer 0 (every integer has exactly one spelling)",
+     "input": "{\"n\":-0}"
+    },
+    {
+     "label": "-0 nested in an array",
+     "input": "{\"a\":[1,-0,3]}"
+    }
+   ]
+  },
+  "tokens": {
+   "valid": [
+    "oaiyrt1.AQIDBAUGBwg.ICEiIyQlJicoKSorLC0uLzAxMjM0NTY3ODk6Ozw9Pj8",
+    "oaiyrt1.__________8.AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
+    "oaiyrt1.AAECAwQFBgc.AAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8"
+   ],
+   "invalid": [
+    {
+     "token": "oaiyrt2.AQIDBAUGBwg.ICEiIyQlJicoKSorLC0uLzAxMjM0NTY3ODk6Ozw9Pj8",
+     "reason": "wrong prefix"
+    },
+    {
+     "token": "OAIYRT1.AQIDBAUGBwg.ICEiIyQlJicoKSorLC0uLzAxMjM0NTY3ODk6Ozw9Pj8",
+     "reason": "prefix is case sensitive"
+    },
+    {
+     "token": "AQIDBAUGBwg.ICEiIyQlJicoKSorLC0uLzAxMjM0NTY3ODk6Ozw9Pj8",
+     "reason": "prefix missing"
+    },
+    {
+     "token": "oaiyrt1.AQIDBAUGBw.ICEiIyQlJicoKSorLC0uLzAxMjM0NTY3ODk6Ozw9Pj8",
+     "reason": "id one character short"
+    },
+    {
+     "token": "oaiyrt1.AQIDBAUGBwgA.ICEiIyQlJicoKSorLC0uLzAxMjM0NTY3ODk6Ozw9Pj8",
+     "reason": "id one character long"
+    },
+    {
+     "token": "oaiyrt1.AQIDBAUGBwg.ICEiIyQlJicoKSorLC0uLzAxMjM0NTY3ODk6Ozw9Pj",
+     "reason": "secret one character short"
+    },
+    {
+     "token": "oaiyrt1.AQIDBAUGBwg.ICEiIyQlJicoKSorLC0uLzAxMjM0NTY3ODk6Ozw9Pj8A",
+     "reason": "secret one character long"
+    },
+    {
+     "token": "oaiyrt1AQIDBAUGBwgICEiIyQlJicoKSorLC0uLzAxMjM0NTY3ODk6Ozw9Pj8",
+     "reason": "no dots"
+    },
+    {
+     "token": "oaiyrt1.AQIDBAUGBwg.ICEiIyQlJicoKSorLC0uLzAxMjM0NTY3ODk6Ozw9Pj8.AAAA",
+     "reason": "a third dot and segment"
+    },
+    {
+     "token": "oaiyrt1.AQIDBAUGBwg.+CEiIyQlJicoKSorLC0uLzAxMjM0NTY3ODk6Ozw9Pj8",
+     "reason": "standard base64 character"
+    },
+    {
+     "token": "oaiyrt1.AQIDBAUGBwg.ICEiIyQlJicoKSorLC0uLzAxMjM0NTY3ODk6Ozw9Pj8=",
+     "reason": "padding"
+    },
+    {
+     "token": "oaiyrt1.AQIDBAUGBwg.ICEiIyQlJicoKSorLC0uLzAxMjM0NTY3ODk6Ozw9Pj/",
+     "reason": "slash in the secret"
+    },
+    {
+     "token": " oaiyrt1.AQIDBAUGBwg.ICEiIyQlJicoKSorLC0uLzAxMjM0NTY3ODk6Ozw9Pj8",
+     "reason": "leading space"
+    },
+    {
+     "token": "oaiyrt1.AQIDBAUGBwg.ICEiIyQlJicoKSorLC0uLzAxMjM0NTY3ODk6Ozw9Pj8\n",
+     "reason": "trailing newline"
+    },
+    {
+     "token": "",
+     "reason": "empty"
+    },
+    {
+     "token": "oaiyrt1.AQIDBAUGBwg.ICEiIyQlJicoKSorLC0uLzAxMjM0NTY3ODk6Ozw9Pj9",
+     "reason": "last character of the secret is not canonical (unused low bits set)"
+    },
+    {
+     "token": "oaiyrt1.AQIDBAUGBwh.ICEiIyQlJicoKSorLC0uLzAxMjM0NTY3ODk6Ozw9Pj8",
+     "reason": "last character of the id is not canonical (unused low bits set)"
+    }
+   ],
+   "canonicalLastCharacters": "a 43 character secret and an 11 character id carry 2 unused bits, so the last character must be one of A E I M Q U Y c g k o s w 0 4 8"
+  },
+  "thumbprints": [
+   {
+    "seed": "0909090909090909090909090909090909090909090909090909090909090909",
+    "publicKey": "_RckOFqgx1tk-3jNYC-h2ZH96_drE8WO1wLqyDXp9hg",
+    "jwk": "{\"crv\":\"Ed25519\",\"kty\":\"OKP\",\"x\":\"_RckOFqgx1tk-3jNYC-h2ZH96_drE8WO1wLqyDXp9hg\"}",
+    "thumbprint": "atZR63tNG3W2GhPpVleKnfrw1N7N6LAqOe5grE2SBR4"
+   },
+   {
+    "seed": "0707070707070707070707070707070707070707070707070707070707070707",
+    "publicKey": "6kpsY-KcUgq-9VB7Ey7F-ZVHdq6-vnuSQh7qaRRG0iw",
+    "jwk": "{\"crv\":\"Ed25519\",\"kty\":\"OKP\",\"x\":\"6kpsY-KcUgq-9VB7Ey7F-ZVHdq6-vnuSQh7qaRRG0iw\"}",
+    "thumbprint": "--6IM5l0OosLj9yWskISYhUA3n_3CURQkmrYMSha_ck"
+   },
+   {
+    "seed": "3333333333333333333333333333333333333333333333333333333333333333",
+    "publicKey": "F8t5-ytBIPKx7GXkGY1uCLKOgT_rAeSkAIObheGAgM4",
+    "jwk": "{\"crv\":\"Ed25519\",\"kty\":\"OKP\",\"x\":\"F8t5-ytBIPKx7GXkGY1uCLKOgT_rAeSkAIObheGAgM4\"}",
+    "thumbprint": "b7dKD2-DlMApkGljz-RJwDdNcyxwyFBpSmhz2cRBnaw"
+   }
+  ],
+  "typedCode": {
+   "samples": [
+    {
+     "secretHex": "a1b2c3d4e5f60718293a4b5c6d7e8f90",
+     "typed": "M6SC-7N75-YR3H-GA9T-9DE6-TZMF-J0RW"
+    },
+    {
+     "secretHex": "4bf5122f344554c53bde2ebb8cd2b7e3",
+     "typed": "9FTH-4BSM-8NAC-AEYY-5TXR-SMNQ-WCES"
+    },
+    {
+     "secretHex": "dbc1b4c900ffe48d575b5da5c6380401",
+     "typed": "VF0V-9J80-ZZJ8-TNTV-BPJW-CE04-04TY"
+    },
+    {
+     "secretHex": "084fed08b978af4d7d196a7446a86b58",
+     "typed": "117Y-T25S-F2QM-TZ8S-D9T4-DA3B-B03W"
+    },
+    {
+     "secretHex": "e52d9c508c502347344d8c07ad91cbd6",
+     "typed": "WMPS-RM4C-A0HM-ED2D-HG3T-V4EB-TRBT"
+    },
+    {
+     "secretHex": "e77b9a9ae9e30b0dbdb6f510a264ef9d",
+     "typed": "WXXS-N6Q9-WC5G-VFDP-YM8A-4S7F-KMSN"
+    }
+   ],
+   "normalise": [
+    {
+     "input": "m6sc-7n75-yr3h-ga9t-9de6-tzmf-j0rw",
+     "output": "M6SC7N75YR3HGA9T9DE6TZMFJ0RW"
+    },
+    {
+     "input": "M6SC 7N75 YR3H GA9T 9DE6 TZMF J0RW",
+     "output": "M6SC7N75YR3HGA9T9DE6TZMFJ0RW"
+    },
+    {
+     "input": "M6SC-7N75-YR3H-GA9T-9DE6-TZMF-JORW",
+     "output": "M6SC7N75YR3HGA9T9DE6TZMFJ0RW"
+    },
+    {
+     "input": "il1O0oLI",
+     "output": "11100011"
+    },
+    {
+     "input": "M6SC-7N75-YR3H-GA9T-9DE6-TZMF-J0RU",
+     "output": null,
+     "reason": "U is refused"
+    },
+    {
+     "input": "M6SC-7N75-YR3H-GA9T-9DE6-TZMF-J0R!",
+     "output": null,
+     "reason": "outside the alphabet"
+    }
+   ],
+   "algorithm": "26 characters carry s (128 bits, two zero bits of padding), then 2 characters carry the first 10 bits of SHA-256(\"oaiy/pairing/3/typed\" || 0x00 || s)"
+  },
+  "sasCheck": {
+   "samples": [
+    {
+     "sas12": "6NHNK68MQQVZ",
+     "check": "5"
+    },
+    {
+     "sas12": "3P8VVXBPSYYN",
+     "check": "B"
+    },
+    {
+     "sas12": "8D47W7XJQDS0",
+     "check": "6"
+    },
+    {
+     "sas12": "EDN6328D9EK3",
+     "check": "K"
+    },
+    {
+     "sas12": "RDRFMHHJRJPX",
+     "check": "F"
+    },
+    {
+     "sas12": "JHDE4FN8BZ2Z",
+     "check": "R"
+    },
+    {
+     "sas12": "W4FT1PQ4YZZ5",
+     "check": "T"
+    },
+    {
+     "sas12": "DW01HQRD83Y9",
+     "check": "H"
+    }
+   ],
+   "algorithm": "ALPHABET[SHA-256(\"oaiy/pairing/3/sas-check\" || 0x00 || the 12 characters as ASCII)[0] >> 3]"
+  },
+  "sasNegative": {
+   "note": "The inputs are those of A3. The SAS is computed from the RAW 16 bytes of pid. The two wrong readings below are what an implementation gets when it takes pid as text; neither may ever be produced or accepted.",
+   "inputs": {
+    "desktopEndpointPublicHex": "fd1724385aa0c75b64fb78cd602fa1d991fdebf76b13c58ed702eac835e9f618",
+    "phoneEndpointPublicHex": "ea4a6c63e29c520abef5507b132ec5f9954776aebebe7b92421eea691446d22c",
+    "nonceHex": "404142434445464748494a4b4c4d4e4f505152535455565758595a5b5c5d5e5f",
+    "pidHex": "6f96247cc713bc96f4835193bf790d35",
+    "pidB64u": "b5YkfMcTvJb0g1GTv3kNNQ"
+   },
+   "algorithm": "sas_raw = HKDF-SHA256(IKM = desktopEndpointPublic || phoneEndpointPublic, salt = nonce, info = \"oaiy/pairing/3/sas\" || 0x00 || PID, L = 8); sas12 = the top 60 bits as 12 Crockford base32 characters",
+   "correct": {
+    "reading": "PID = the 16 raw bytes of pid",
+    "infoHex": "6f6169792f70616972696e672f332f736173006f96247cc713bc96f4835193bf790d35",
+    "infoLength": 35,
+    "sasRawHex": "3563599914bdf7f9",
+    "sas12": "6NHNK68MQQVZ",
+    "sasDisplay": "6NHN-K68M-QQVZ-5"
+   },
+   "wrong": [
+    {
+     "reading": "PID = the 22 ASCII characters of the b64u text of pid",
+     "mustNotProduce": true,
+     "infoHex": "6f6169792f70616972696e672f332f736173006235596b664d6354764a62306731475476336b4e4e51",
+     "infoLength": 41,
+     "sasRawHex": "24b574fd2e0d1e24",
+     "sas12": "4JTQ9Z9E1MF2",
+     "sasDisplay": "4JTQ-9Z9E-1MF2-6"
+    },
+    {
+     "reading": "PID = the 32 ASCII characters of the lower-case hex of pid",
+     "mustNotProduce": true,
+     "infoHex": "6f6169792f70616972696e672f332f736173003666393632343763633731336263393666343833353139336266373930643335",
+     "infoLength": 51,
+     "sasRawHex": "450a6e7283157c37",
+     "sas12": "8M56WWM32NY3",
+     "sasDisplay": "8M56-WWM3-2NY3-6"
+    }
+   ]
+  },
+  "errors": [
+   {
+    "status": 400,
+    "code": "invalid_request",
+    "retry": "no"
+   },
+   {
+    "status": 400,
+    "code": "invalid_item",
+    "retry": "no"
+   },
+   {
+    "status": 401,
+    "code": "unauthorized",
+    "retry": "no"
+   },
+   {
+    "status": 401,
+    "code": "revoked",
+    "retry": "no"
+   },
+   {
+    "status": 403,
+    "code": "forbidden",
+    "retry": "no"
+   },
+   {
+    "status": 403,
+    "code": "feature_disabled",
+    "retry": "no"
+   },
+   {
+    "status": 404,
+    "code": "not_found",
+    "retry": "no"
+   },
+   {
+    "status": 405,
+    "code": "method_not_allowed",
+    "retry": "no"
+   },
+   {
+    "status": 409,
+    "code": "conflict",
+    "retry": "no"
+   },
+   {
+    "status": 409,
+    "code": "already_answered",
+    "retry": "no"
+   },
+   {
+    "status": 410,
+    "code": "expired",
+    "retry": "no"
+   },
+   {
+    "status": 412,
+    "code": "precondition_failed",
+    "retry": "after a re-read"
+   },
+   {
+    "status": 413,
+    "code": "item_too_large",
+    "retry": "no"
+   },
+   {
+    "status": 415,
+    "code": "unsupported_media_type",
+    "retry": "no"
+   },
+   {
+    "status": 422,
+    "code": "unprocessable",
+    "retry": "no"
+   },
+   {
+    "status": 426,
+    "code": "upgrade_required",
+    "retry": "after upgrade"
+   },
+   {
+    "status": 429,
+    "code": "rate_limited",
+    "retry": "after Retry-After"
+   },
+   {
+    "status": 429,
+    "code": "quota_exceeded",
+    "retry": "after the consumer drains"
+   },
+   {
+    "status": 500,
+    "code": "internal",
+    "retry": "backoff"
+   },
+   {
+    "status": 503,
+    "code": "unavailable",
+    "retry": "after Retry-After"
+   }
+  ],
+  "compatErrors": [
+   {
+    "status": 401,
+    "code": "invalid_token"
+   },
+   {
+    "status": 403,
+    "code": "relay_target_forbidden"
+   },
+   {
+    "status": 413,
+    "code": "relay_frame_too_large"
+   },
+   {
+    "status": 429,
+    "code": "relay_backpressure"
+   },
+   {
+    "status": 503,
+    "code": "companion_unavailable"
+   }
+  ],
+  "lanes": {
+   "cmd": {
+    "body": 32768,
+    "ttl": {
+     "default": 60,
+     "min": 1,
+     "max": 300
+    }
+   },
+   "res": {
+    "body": 98304,
+    "ttl": {
+     "default": 300,
+     "min": 1,
+     "max": 3600
+    }
+   },
+   "ai": {
+    "body": 393216,
+    "ttl": {
+     "default": 300,
+     "min": 1,
+     "max": 600
+    }
+   },
+   "ai.in": {
+    "body": 65536,
+    "ttl": {
+     "default": 300,
+     "min": 1,
+     "max": 600
+    }
+   },
+   "ai.out": {
+    "body": 393216,
+    "ttl": {
+     "default": 360,
+     "min": 1,
+     "max": 900
+    }
+   },
+   "pair": {
+    "body": 16384,
+    "ttl": {
+     "default": 900,
+     "min": 1,
+     "max": 900
+    }
+   },
+   "ring": {
+    "body": 4096,
+    "ttl": {
+     "default": 30,
+     "min": 1,
+     "max": 300
+    }
+   },
+   "ctl": {
+    "body": 4096,
+    "ttl": {
+     "default": 3600,
+     "min": 1,
+     "max": 86400
+    }
+   },
+   "sync": {
+    "body": 65536,
+    "ttl": {
+     "default": 21600,
+     "min": 1,
+     "max": 86400
+    }
+   },
+   "sig": {
+    "body": 196608,
+    "ttl": {
+     "default": 120,
+     "min": 1,
+     "max": 300
+    }
+   }
+  },
+  "pollGapMs": 250
+ }
+}

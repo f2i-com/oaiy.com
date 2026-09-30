@@ -1,0 +1,54 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://oaiy.com/schemas/relay/v1/compat-frames-page.schema.json",
+  "title": "Aokie frames page",
+  "description": "GET /v1/aokie-companion/relay/frames?since=&wait=: at most 128 frames and 1 MiB (the first frame is always returned). Facade reads do not acknowledge.",
+  "type": "object",
+  "properties": {
+    "frames": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "properties": {
+          "seq": {
+            "$ref": "https://oaiy.com/schemas/relay/v1/common.schema.json#/$defs/seq"
+          },
+          "from": {
+            "type": "string",
+            "pattern": "^(plugin|mobile:[A-Za-z0-9_-]{43})$"
+          },
+          "subjectId": {
+            "$ref": "https://oaiy.com/schemas/relay/v1/common.schema.json#/$defs/appId"
+          },
+          "grants": {
+            "type": "array",
+            "items": {
+              "$ref": "https://oaiy.com/schemas/relay/v1/common.schema.json#/$defs/grant"
+            },
+            "maxItems": 16
+          },
+          "frame": {
+            "type": "object"
+          }
+        },
+        "required": [
+          "seq",
+          "from",
+          "subjectId",
+          "grants",
+          "frame"
+        ],
+        "additionalProperties": true
+      },
+      "maxItems": 128
+    },
+    "lastSeq": {
+      "$ref": "https://oaiy.com/schemas/relay/v1/common.schema.json#/$defs/uint53"
+    }
+  },
+  "required": [
+    "frames",
+    "lastSeq"
+  ],
+  "additionalProperties": true
+}

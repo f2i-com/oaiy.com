@@ -1,0 +1,31 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://oaiy.com/schemas/relay/v1/roster-response.schema.json",
+  "title": "Roster push response",
+  "description": "200 response of POST /v1/roster.",
+  "type": "object",
+  "properties": {
+    "v": {
+      "const": 1
+    },
+    "hash": {
+      "$ref": "https://oaiy.com/schemas/relay/v1/common.schema.json#/$defs/key32"
+    },
+    "revoked": {
+      "type": "array",
+      "items": {
+        "$ref": "https://oaiy.com/schemas/relay/v1/common.schema.json#/$defs/deviceId"
+      }
+    },
+    "time": {
+      "$ref": "https://oaiy.com/schemas/relay/v1/common.schema.json#/$defs/unixTime"
+    }
+  },
+  "required": [
+    "v",
+    "hash",
+    "revoked",
+    "time"
+  ],
+  "additionalProperties": true
+}

@@ -1,0 +1,24 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://oaiy.com/schemas/relay/v1/keys-request.schema.json",
+  "title": "Provider key request",
+  "description": "POST /v1/keys (desktop token). Only role provider can be minted over the network.",
+  "type": "object",
+  "properties": {
+    "role": {
+      "const": "provider"
+    },
+    "ttl": {
+      "type": "integer",
+      "minimum": 1,
+      "maximum": 86400
+    },
+    "name": {
+      "$ref": "https://oaiy.com/schemas/relay/v1/common.schema.json#/$defs/name60"
+    }
+  },
+  "required": [
+    "role"
+  ],
+  "additionalProperties": true
+}

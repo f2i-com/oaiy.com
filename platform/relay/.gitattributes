@@ -1,0 +1,6 @@
+# The relay is uploaded to Linux hosts as it is: every file keeps LF endings on every checkout.
+* text eol=lf
+
+# The release zip (git archive) carries no tests: the test clock hook lives there and must never ship.
+/tests export-ignore
+/.gitattributes export-ignore

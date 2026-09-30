@@ -23,6 +23,7 @@ for what OAIY is and how to build it.
 | [OAIY Desktop](../platform/desktop/README.md) | The desktop host (Tauri 2 and axum on `127.0.0.1:17972`): its HTTP API, service templates, the headless `oaiy-server`, the data folder. |
 | [UPDATES.md](UPDATES.md) | How OAIY finds, downloads, verifies and installs a newer release, when it will not, the headless server's manual upgrade, and the signing key. |
 | [The bridge protocol](../platform/protocol/README.md) | OAIY Bridge Protocol v1: how apps discover, run and follow flows on a desktop, with its JSON schemas and conformance suite. |
+| [relay-hosting-matrix.md](relay-hosting-matrix.md) | What a PHP host must do before the OAIY Relay can run on it, the one-file host probe that finds out in ten minutes, and what has been measured so far. |
 | [ecosystem/OAIY_PLATFORM.md](ecosystem/OAIY_PLATFORM.md) | A survey of `platform/` (the previous OAIY) as it was when it joined: what it does and where. |
 | [ecosystem/FORMLOGIC_CONTRACT.md](ecosystem/FORMLOGIC_CONTRACT.md) | What OAIY must stay compatible with for FormLogic: the browser and a local OAIY, the FormLogic server's API, automations, and Aokie on the FormLogic side. |
 | [zipp-app-bridge.md](../app/docs/zipp-app-bridge.md) | How the Agent's sandbox reaches the page from the Zipp VM today, and the bridge that would replace it. |

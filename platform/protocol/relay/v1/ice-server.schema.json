@@ -1,0 +1,56 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://oaiy.com/schemas/relay/v1/ice-server.schema.json",
+  "title": "ICE server entry",
+  "description": "An iceServers element (README section 4.14.3). A STUN entry carries urls and nothing else (credentials on it are refused by the decoders); a TURN entry carries a REST credential: username = <expiry>:<subjectId>, credential = base64(HMAC-SHA1(secret, username)), expiresAt = expiry.",
+  "oneOf": [
+    {
+      "type": "object",
+      "properties": {
+        "urls": {
+          "type": "array",
+          "items": {
+            "type": "string",
+            "pattern": "^stun:[^\\s]+$"
+          },
+          "minItems": 1
+        }
+      },
+      "required": [
+        "urls"
+      ],
+      "additionalProperties": false
+    },
+    {
+      "type": "object",
+      "properties": {
+        "urls": {
+          "type": "array",
+          "items": {
+            "type": "string",
+            "pattern": "^turns?:[^\\s]+$"
+          },
+          "minItems": 1
+        },
+        "username": {
+          "type": "string",
+          "pattern": "^[0-9]+:[A-Za-z0-9._:-]+$"
+        },
+        "credential": {
+          "type": "string",
+          "pattern": "^[A-Za-z0-9+/]{27}=$"
+        },
+        "expiresAt": {
+          "$ref": "https://oaiy.com/schemas/relay/v1/common.schema.json#/$defs/unixTime"
+        }
+      },
+      "required": [
+        "urls",
+        "username",
+        "credential",
+        "expiresAt"
+      ],
+      "additionalProperties": false
+    }
+  ]
+}

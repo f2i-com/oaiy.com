@@ -1,0 +1,24 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://oaiy.com/schemas/relay/v1/providers-response.schema.json",
+  "title": "Provider registration response",
+  "description": "200 response of POST /v1/providers.",
+  "type": "object",
+  "properties": {
+    "providerId": {
+      "$ref": "https://oaiy.com/schemas/relay/v1/common.schema.json#/$defs/providerId"
+    },
+    "thumbprint": {
+      "$ref": "https://oaiy.com/schemas/relay/v1/common.schema.json#/$defs/thumbprint"
+    },
+    "time": {
+      "$ref": "https://oaiy.com/schemas/relay/v1/common.schema.json#/$defs/unixTime"
+    }
+  },
+  "required": [
+    "providerId",
+    "thumbprint",
+    "time"
+  ],
+  "additionalProperties": true
+}

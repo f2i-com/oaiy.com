@@ -1,0 +1,33 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://oaiy.com/schemas/relay/v1/device-meta-request.schema.json",
+  "title": "Device meta",
+  "description": "POST /v1/devices/self/meta. Keys are recorded with a keysChangedAt; peers that pinned a fingerprint notice a change.",
+  "type": "object",
+  "properties": {
+    "name": {
+      "$ref": "https://oaiy.com/schemas/relay/v1/common.schema.json#/$defs/name60"
+    },
+    "ver": {
+      "type": "string",
+      "maxLength": 32
+    },
+    "caps": {
+      "type": "array",
+      "items": {
+        "type": "string",
+        "minLength": 1,
+        "maxLength": 64
+      },
+      "maxItems": 32
+    },
+    "ed25519": {
+      "$ref": "https://oaiy.com/schemas/relay/v1/common.schema.json#/$defs/key32"
+    },
+    "x25519": {
+      "$ref": "https://oaiy.com/schemas/relay/v1/common.schema.json#/$defs/key32"
+    }
+  },
+  "additionalProperties": true,
+  "minProperties": 1
+}
