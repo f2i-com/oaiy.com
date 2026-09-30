@@ -5,3 +5,6 @@
 //! refused. See the route table's own documentation for the classes.
 
 pub mod routes;
+
+#[cfg(test)]
+mod route_coverage;
