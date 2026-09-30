@@ -563,6 +563,9 @@ export const TRANSFER_NOTES = {
   nobody: '[OAIY] Nobody could take the call. Offer to take a message (take_message). Do not promise a callback time.',
   cancelled: '[OAIY] The transfer request was withdrawn and nobody has the call. Offer to take a message (take_message). Do not promise a callback time.',
   handoff: '[OAIY] The owner took the call. Say nothing more.',
+  /** The desktop did not say a line that promised a transfer nobody has accepted, and said its own in its place. */
+  replaced: (wanted: string, said: string) =>
+    `[OAIY] Your line "${wanted}" was not said: nobody has accepted the call, so nothing is being put through. The caller heard "${said}" instead. Do not tell them they are being connected.`,
   back: (held: string) => `[OAIY] The owner handed the call back after ${held}. Continue helping, and do not greet the caller again.`,
   /** In the note that starts a call: whether the owner can be rung on it. */
   available: 'The owner can be reached on this call: if the caller asks for them, use transfer_to_owner.',
@@ -1920,6 +1923,17 @@ export class Sessions {
       case 'call.transfer':
         this.transferOutcome(session, callId, event);
         break;
+      // The desktop did not say a line of ours that told the caller they were being put through (nobody has accepted), and said its own in its
+      // place: the caller never heard ours, and we are told with their next words, so we do not go on as if they had.
+      case 'call.line_replaced': {
+        const wanted = typeof event.wanted === 'string' ? event.wanted.trim() : '';
+        const said = typeof event.said === 'string' ? event.said.trim() : '';
+        if (!wanted || !said) break;
+        session.speech?.unsay([wanted]);
+        if (session.speech) session.speech.reply = session.speech.reply.filter((line) => line !== wanted);
+        (session.aside ??= []).push(TRANSFER_NOTES.replaced(wanted, said));
+        break;
+      }
       // The owner took the call: no session of the desktop carries it now, and it has not ended, so no end is written
       // (an outreach call's result is not recorded as if it had ended), and nothing more is said.
       case 'call.handoff':

@@ -255,8 +255,12 @@ agent : "I'll try to reach them, please stay with me."  (it is trying: it does n
   "I'll connect you with our online booking page"), or a transfer of something else ("I'll transfer the booking to
   Wednesday", "I'll forward your call details to the owner") is never touched: the take-a-message confirmation reaches the
   caller as written. `transfer.rs` holds the corpus (more than sixty ordinary lines that must pass, and the promises that must
-  still be caught). When a line is swapped the app is told the item that was said, not the text: it does not learn that
-  its words were replaced (a follow-up).
+  still be caught). When a line is swapped the app is told, truthfully, with `call.line_replaced {wanted, said}` (the
+  words it sent and the line the caller hears in their place), sent when the line in its place is on its way and never when
+  nothing was said (a call that has not begun answers the say with an error and reports no swap): the app takes the
+  model's line out of what it counts as said, and its model is told with the caller's next words that the line was not
+  said, that nobody has accepted the call and what the caller heard instead, so it does not go on as if they had been
+  put through.
 - **Nothing waits for ever.** A transfer request the phone never answers is answered to the model as
   unavailable (`no_answer`) after 25 seconds (the app's route for the tool waits 27, so that typed answer is what it is told, never
   a refusal before it; a tool sent while a request is unanswered waits behind it and is waited for that long too, and a tool the
@@ -300,7 +304,8 @@ agent : "I'll try to reach them, please stay with me."  (it is trying: it does n
   `hello` and `voice.features` carry what the owner allows, and `call.transfer`
   `{requestId, outcome, message?, source}` says how a request came out (`source` is `phone`,
   `watchdog` when the desktop's clock ended it, or `desktop` when the phone did not answer the withdrawal
-  the owner asked for in the dialog).
+  the owner asked for in the dialog), and `call.line_replaced` `{wanted, said}` says a line that promised a
+  transfer was not said and what the caller heard instead (see above).
 - **Withdrawing a request.** The owner declining in the dialog, and this desktop giving up on a request
   that ran out, send the phone `formlogic.realtime.transfer_cancel {requestId, reason}` on the call's own
   stream (`owner_declined`, `message_instead`, `gave_up`). For a decline the phone's answer decides what

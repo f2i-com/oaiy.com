@@ -294,6 +294,64 @@ describe('a request to reach the owner', () => {
     expect(fake.bodies).toHaveLength(3);
   });
 
+  it('is told, with the caller’s next words, that a line which promised a transfer was not said, and what they heard instead', async () => {
+    const wanted = 'Putting you through now.';
+    const said = "I'll try to reach them.";
+    const fake = fakeProvider('openai', [{ text: wanted }, { text: 'Sorry, I am still trying to reach them.' }]);
+    const { sessions } = setup();
+    await sessions.callEvent(ALLOWED);
+    const call = (await sessions.callEvent(START))!;
+    await sessions.callEvent({ type: 'call.caller', callId: 'call_o', text: 'Can I speak to the owner?' });
+    await settled(sessions);
+    expect(fake.bodies).toHaveLength(1);
+    // The desktop swapped the line for its own: nothing yet for the model to answer, and a note kept for the caller's next words.
+    await sessions.callEvent({ type: 'call.line_replaced', callId: 'call_o', wanted, said });
+    expect(fake.bodies).toHaveLength(1);
+    expect(call.aside).toEqual([TRANSFER_NOTES.replaced(wanted, said)]);
+    // The caller never heard it: it is not among what the agent had said that a cut would list as unsaid.
+    expect(call.speech?.reply ?? []).not.toContain(wanted);
+    await sessions.callEvent({ type: 'call.caller', callId: 'call_o', text: 'Hello? Are you still there?' });
+    await settled(sessions);
+    expect(fake.bodies).toHaveLength(2);
+    const read = JSON.stringify(fake.bodies[1].messages);
+    expect(read).toContain(TRANSFER_NOTES.replaced(wanted, said).replace(/"/g, '\\"'));
+    expect(read).toContain('Hello? Are you still there?');
+    // The note says what is true: nothing is being put through, and the caller is not to be told it is.
+    expect(TRANSFER_NOTES.replaced(wanted, said)).toContain('nobody has accepted the call');
+    expect(TRANSFER_NOTES.replaced(wanted, said)).toContain(said);
+    // It is read once, with those words, and not again.
+    expect(call.aside).toEqual([]);
+  });
+
+  it('a line that was not said counts as never heard: said again, it is sent again (the desktop decides what is said)', async () => {
+    const wanted = 'Putting you through now.';
+    // (A sentence said before is held back when the reply has something new; one never heard is not held back.)
+    fakeProvider('openai', [{ text: wanted }, { text: `${wanted} Please give me a moment.` }]);
+    const { sessions, said } = setup();
+    await sessions.callEvent(ALLOWED);
+    await sessions.callEvent(START);
+    await sessions.callEvent({ type: 'call.caller', callId: 'call_o', text: 'Can I speak to the owner?' });
+    await settled(sessions);
+    expect(said.filter((s) => s === wanted)).toHaveLength(1);
+    await sessions.callEvent({ type: 'call.line_replaced', callId: 'call_o', wanted, said: "I'll try to reach them." });
+    await sessions.callEvent({ type: 'call.caller', callId: 'call_o', text: 'Hello?' });
+    await settled(sessions);
+    expect(said.filter((s) => s === wanted)).toHaveLength(2);
+  });
+
+  it('a note of a line not said that names no line, or no words in its place, or comes for a call it does not follow, is nothing', async () => {
+    const fake = fakeProvider('openai', [{ text: 'Hello.' }]);
+    const { sessions } = setup();
+    await sessions.callEvent(ALLOWED);
+    const call = (await sessions.callEvent(START))!;
+    await sessions.callEvent({ type: 'call.line_replaced', callId: 'call_o', wanted: 'Putting you through.' });
+    await sessions.callEvent({ type: 'call.line_replaced', callId: 'call_o', said: 'I will try.' });
+    await sessions.callEvent({ type: 'call.line_replaced', callId: 'call_o', wanted: '  ', said: 'I will try.' });
+    await sessions.callEvent({ type: 'call.line_replaced', callId: 'call_x', wanted: 'Putting you through.', said: 'I will try.' });
+    expect(call.aside ?? []).toEqual([]);
+    expect(fake.bodies).toHaveLength(0);
+  });
+
   it('a ring the desktop never reports the end of is ended for the model too, after its time and a grace', async () => {
     const fake = fakeProvider('openai', [
       { calls: [{ name: 'transfer_to_owner', input: { reason: 'caller_asked' } }] },

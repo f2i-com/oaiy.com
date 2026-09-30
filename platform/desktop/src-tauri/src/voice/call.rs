@@ -1274,6 +1274,12 @@ where
                             } else {
                                 Ok(speak(line.to_string(), false, None))
                             };
+                            // The app is told, when the line that stands in its place is on its way (an error is not: nothing was said in its place, and it
+                            // is answered as an error): its words were not said, and what the caller hears is this. It says so to the model, with the
+                            // caller's next words, so that it does not go on as if they had been heard.
+                            if said.is_ok() {
+                                hub.emit(json!({"type": "call.line_replaced", "callId": ids.call, "wanted": text, "said": line}));
+                            }
                             let _ = reply.send(said);
                             continue;
                         }

@@ -313,10 +313,16 @@ async fn no_line_that_promises_a_transfer_is_said_before_an_owner_device_accepts
     // Before any request: there is nothing being tried, so what is said in its place is a plain one moment, not that anything is.
     assert!(f.aokie.say("Sure, I'm transferring you to the owner now.").await.is_ok());
     assert!(spoken_within(&f.aokie, transfer::WAIT_LINE, secs(3)).await, "{:?}", f.aokie.speech.spoken());
+    // The app is told which line was not said and what the caller heard instead, so its model does not go on as if they had heard it.
+    let replaced = f.aokie.event("call.line_replaced", secs(3)).await.expect("the app is told the line was swapped");
+    assert_eq!((replaced["callId"].clone(), replaced["wanted"].clone(), replaced["said"].clone()), (json!(f.aokie.call), json!("Sure, I'm transferring you to the owner now."), json!(transfer::WAIT_LINE)), "{replaced}");
     f.ring_through("assist_1", 30).await;
     // While it rings: the hold line, whatever way it is put.
     for line in ["I'll transfer you now.", "Let me put you through to the owner.", "You will be connected in a moment.", "Transferring you now."] {
         assert!(f.aokie.say(line).await.is_ok(), "{line}");
+        let replaced = f.aokie.event("call.line_replaced", secs(3)).await.unwrap_or_else(|| panic!("the app is told {line} was swapped"));
+        assert_eq!(replaced["wanted"], line, "{replaced}");
+        assert!(transfer::HOLD_LINES.contains(&replaced["said"].as_str().unwrap_or_default()), "what the caller hears instead is a hold line: {replaced}");
         tokio::time::sleep(Duration::from_millis(400)).await;
     }
     tokio::time::sleep(secs(1)).await;
@@ -352,6 +358,27 @@ async fn the_lines_of_an_ordinary_call_reach_the_caller_as_written_with_transfer
         assert!(spoken.iter().filter(|l| *l == line).count() >= 2, "said as written, while it rings too: {line}: {spoken:?}");
     }
     assert!(!spoken.iter().any(|l| l == transfer::WAIT_LINE), "no line was swapped for a plain one moment: {spoken:?}");
+    // ...and the app is told of no swap: a line said as written is not one that was replaced.
+    assert!(f.aokie.event("call.line_replaced", Duration::from_millis(300)).await.is_none(), "nothing was replaced");
+}
+
+/// The app is told a line was replaced only when the line in its place is on its way: a line that promised a transfer before the call had begun has
+/// nothing said in its place (the call answers that it has not begun), so nothing is reported as replaced.
+#[tokio::test]
+async fn a_line_that_could_not_be_said_in_place_of_a_promise_is_not_reported_as_replaced() {
+    let mut aokie = Aokie::start_with(json!({"from": RANG_FROM, "callerName": "Alex", "allowTransfer": true}), |hub| {
+        hub.set_ring(crate::ring::Ring::in_memory(owner_settings(true)));
+    })
+    .await;
+    // Not begun: the call is listed, and cannot say a line yet.
+    let refused = aokie.say("I'll transfer you now.").await;
+    assert!(refused.is_err(), "the call has not begun: {refused:?}");
+    assert!(aokie.event("call.line_replaced", Duration::from_millis(400)).await.is_none(), "nothing was said in its place, so nothing was replaced");
+    // Begun, the same line is swapped, and reported.
+    aokie.begin(json!({}));
+    aokie.event("call.started", secs(3)).await.expect("the call started");
+    assert!(aokie.say("I'll transfer you now.").await.is_ok());
+    assert!(aokie.event("call.line_replaced", secs(3)).await.is_some());
 }
 
 #[tokio::test]

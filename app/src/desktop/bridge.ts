@@ -225,7 +225,9 @@ export class Desktop {
    * `call.said`, `call.speech_started`, `call.interrupted`, `call.error`,
    * `call.ended`; and, when the owner lets the receptionist try to reach them,
    * `call.transfer` (how a request came out), `call.handoff` (the owner took the
-   * call) and `voice.features` (what the receptionist may do)) until `signal`
+   * call), `call.line_replaced` (a line of ours that promised a transfer was not
+   * said, and the desktop's own was, in its place) and `voice.features` (what
+   * the receptionist may do)) until `signal`
    * aborts or the stream ends.
    */
   async voiceEvents(onEvent: (event: Record<string, unknown>) => void, signal: AbortSignal): Promise<void> {

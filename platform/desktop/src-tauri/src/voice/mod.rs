@@ -609,7 +609,9 @@ fn prune(records: &mut HashMap<String, CallRecord>) {
 /// `GET /api/voice/events` (server-sent events: `call.started`, `call.caller`,
 /// `call.said`, `call.speech_started`, `call.interrupted`, `call.resumed` (a
 /// reply cut off by an acknowledgement goes on: `itemId`, `fromSentence`,
-/// `sentences`), `call.error`, `call.ended`), `GET /api/voice/calls`, and per
+/// `sentences`), `call.line_replaced` (a line that promised a transfer nobody has
+/// accepted was not said, and this was: `wanted`, `said`), `call.error`,
+/// `call.ended`), `GET /api/voice/calls`, and per
 /// call `say`, `tool`, `finish`, `hush`.
 /// `PUT /api/voice/callers` keeps the name a caller is greeted by (the
 /// receptionist's: never over a name the person set in Contacts, see
