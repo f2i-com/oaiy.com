@@ -21,10 +21,13 @@ import {
   MAX_CONNECTIONS_PER_APP,
   MAX_IN_FLIGHT,
   MAX_PENDING_OPS,
+  HELLOS_PER_SECOND,
+  HELLO_BURST,
   OPS,
   OPS_BURST,
   OPS_PER_SECOND,
   PROTOCOL_VERSION,
+  RECENT_ACTIVITY_MS,
   REFUSALS_ANSWERED_PER_SECOND,
   appForOrigin,
   errorBody,
@@ -101,13 +104,36 @@ export function createBroker(deps: BrokerDeps): Broker {
   const connections = new Map<PortLike, Connection>();
   const fetcher = createFetcher({ store: deps.store, budget: deps.budget, fetchImpl: deps.fetchImpl, page: deps.page });
 
-  function attach(port: PortLike, app: string): void {
+  /**
+   * Whether an app may say hello now: a bucket for each app (a burst, then a few a second). Every hello that is let in makes a connection
+   * and costs the holder a port, so a flood of them is bounded before it is looked at any further.
+   */
+  const helloBuckets = new Map<string, { tokens: number; refilled: number }>();
+  function helloAllowed(app: string): boolean {
+    const at = now();
+    const bucket = helloBuckets.get(app) ?? { tokens: HELLO_BURST, refilled: at };
+    bucket.tokens = Math.min(HELLO_BURST, bucket.tokens + ((at - bucket.refilled) / 1000) * HELLOS_PER_SECOND);
+    bucket.refilled = at;
+    helloBuckets.set(app, bucket);
+    if (bucket.tokens < 1) return false;
+    bucket.tokens -= 1;
+    return true;
+  }
+
+  /** Whether a connection is being used: it said something lately, or a request of it is being worked on. */
+  const inUse = (c: Connection): boolean => now() - c.lastActive <= RECENT_ACTIVITY_MS || c.working();
+
+  /** Makes the connection, or returns false when the app already holds its share and every one of them is in use. */
+  function attach(port: PortLike, app: string): boolean {
     // An app that holds too many connections loses its least recently active: a page that has gone leaves its port behind, and a
-    // hostile one that opens many is held to its own share.
+    // hostile one that opens many is held to its own share. A connection that is in use is never closed to make room for a new hello:
+    // a flood of hellos must not push out the honest connection that is in the same frame. If none can be closed, the new one is refused.
     const mine = [...connections.entries()].filter(([, c]) => c.app === app);
     if (mine.length >= MAX_CONNECTIONS_PER_APP) {
-      mine.sort((a, b) => a[1].lastActive - b[1].lastActive);
-      for (const [, c] of mine.slice(0, mine.length - MAX_CONNECTIONS_PER_APP + 1)) c.close('replaced');
+      const needed = mine.length - MAX_CONNECTIONS_PER_APP + 1;
+      const idle = mine.filter(([, c]) => !inUse(c)).sort((a, b) => a[1].lastActive - b[1].lastActive);
+      if (idle.length < needed) return false;
+      for (const [, c] of idle.slice(0, needed)) c.close('replaced');
     }
 
     const inFlight = new Map<number, AbortController>();
@@ -274,6 +300,7 @@ export function createBroker(deps: BrokerDeps): Broker {
     };
     port.start?.();
     send({ t: 'hello', v: PROTOCOL_VERSION, ops: OPS, app });
+    return true;
   }
 
   return {
@@ -285,8 +312,19 @@ export function createBroker(deps: BrokerDeps): Broker {
       if (event.source !== deps.parent) return false;
       if (parseHello(event.data) === null) return false;
       if (event.ports.length !== 1) return false;
-      attach(event.ports[0], app);
-      return true;
+      const port = event.ports[0];
+      const drop = (answer?: Push): false => {
+        try {
+          if (answer) port.postMessage(answer);
+          port.close?.();
+        } catch {
+          // a port whose page has gone
+        }
+        return false;
+      };
+      // Past an app's rate of hellos none is answered at all (cheaper than a refusal); and an app whose connections are all in use is told so.
+      if (!helloAllowed(app)) return drop();
+      return attach(port, app) || drop({ t: 'refused', reason: 'too-many' });
     },
 
     notifyChanged() {

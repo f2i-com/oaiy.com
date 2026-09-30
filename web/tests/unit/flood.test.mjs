@@ -8,15 +8,18 @@
  */
 import assert from 'node:assert/strict';
 import { after, describe, it } from 'node:test';
-import { FLOWS, brokerWorld, jsonResponse, streamResponse } from '../support/broker-world.mjs';
+import { AGENT, FLOWS, brokerWorld, jsonResponse, streamResponse } from '../support/broker-world.mjs';
 import { M, sleep } from '../support/holder.mjs';
 
 const {
+  HELLOS_PER_SECOND,
+  HELLO_BURST,
   IDLE_CLOSE_MS,
   MAX_CONNECTIONS_PER_APP,
   MAX_PENDING_OPS,
   OPS_BURST,
   OPS_PER_SECOND,
+  RECENT_ACTIVITY_MS,
   REFUSALS_ANSWERED_PER_SECOND,
 } = M.sharedProtocol;
 
@@ -169,10 +172,12 @@ describe('connections an app holds', () => {
     const mine = [];
     for (let i = 0; i < MAX_CONNECTIONS_PER_APP; i++) {
       mine.push(await w.connect());
-      at.advance(10);
+      at.advance(1000);
     }
     assert.equal(w.broker.connections(), MAX_CONNECTIONS_PER_APP + 1);
-    // The first has been used since: the second is now the one that has been quiet the longest.
+    // They have all been quiet for longer than a connection in use is (a new hello does not push out one that was used lately).
+    at.advance(RECENT_ACTIVITY_MS + 1000);
+    // The first is used again: the second is now the one that has been quiet the longest.
     assert.equal((await mine[0].call({ op: 'list' })).ok, true);
     at.advance(10);
     const newest = await w.connect();
@@ -196,9 +201,98 @@ describe('connections an app holds', () => {
     const w = await world({ brokerNow: at });
     for (let i = 0; i < 100; i++) {
       await w.connect();
-      at.advance(1);
+      at.advance(RECENT_ACTIVITY_MS + 1000);
     }
     assert.equal(w.broker.connections(), MAX_CONNECTIONS_PER_APP);
+  });
+
+  it('one that was used lately, or has a request open, is never closed to make room: the new hello is refused, and told', async () => {
+    const at = clock();
+    let opened = 0;
+    const w = await world({ brokerNow: at, handler: () => { opened++; return streamResponse(Array.from({ length: 400 }, (_, i) => `d${i}`), { gapMs: 20 }); } });
+    const mine = [];
+    for (let i = 0; i < MAX_CONNECTIONS_PER_APP; i++) {
+      mine.push(await w.connect());
+      at.advance(1000);
+    }
+    // The first has a request open and has said nothing for a long while; the rest are quiet for less than that.
+    const id = mine[0].start({ provider: w.record.id, path: '/chat/completions', method: 'POST', body: '{"stream":true}' });
+    await mine[0].waitFor((m) => m.id === id && m.t === 'chunk');
+    assert.equal(opened, 1);
+    at.advance(IDLE_CLOSE_MS + 1000);
+    assert.equal(w.broker.sweep(), MAX_CONNECTIONS_PER_APP - 1, 'the others were quiet for long: the sweep closes them; the one with a request open stays');
+    // Fill the app's connections again, all in use.
+    const again = [];
+    for (let i = 0; i < MAX_CONNECTIONS_PER_APP - 1; i++) {
+      again.push(await w.connect());
+      at.advance(1000);
+    }
+    assert.equal(w.broker.connections(), MAX_CONNECTIONS_PER_APP);
+    at.advance(RECENT_ACTIVITY_MS - 20_000);
+    const channel = new MessageChannel();
+    const got = [];
+    channel.port1.onmessage = (event) => got.push(event.data);
+    const accepted = w.broker.onWindowMessage({ origin: AGENT, source: w.parent, data: { op: 'hello', v: 1 }, ports: [channel.port2] });
+    await sleep(60);
+    assert.equal(accepted, false);
+    assert.deepEqual(got, [{ t: 'refused', reason: 'too-many' }]);
+    assert.equal(w.broker.connections(), MAX_CONNECTIONS_PER_APP, 'none was closed for it');
+    for (const c of [mine[0], ...again]) assert.equal(count(c, (m) => m.t === 'closed'), 0);
+    channel.port1.close();
+    await mine[0].call({ op: 'abort', target: id });
+  });
+});
+
+describe('a flood of hellos', () => {
+  const flood = (w, times) => {
+    const channels = [];
+    let accepted = 0;
+    for (let i = 0; i < times; i++) {
+      const channel = new MessageChannel();
+      channels.push(channel);
+      if (w.broker.onWindowMessage({ origin: AGENT, source: w.parent, data: { op: 'hello', v: 1 }, ports: [channel.port2] })) accepted++;
+    }
+    return { accepted, channels, done: () => channels.forEach((c) => c.port1.close()) };
+  };
+
+  it('does not push out the honest connection of the same frame, and makes no more than a burst of connections (the review: 20,000 hellos in 110 ms)', async () => {
+    const at = clock();
+    const w = await world({ brokerNow: at });
+    const honest = await w.connect();
+    assert.equal((await honest.call({ op: 'list' })).ok, true);
+    at.advance(RECENT_ACTIVITY_MS + 1000); // quiet for a while: the worst case for the honest one, the first to go on a least-recently-used rule
+    const started = Date.now();
+    const burst = flood(w, 20_000);
+    const took = Date.now() - started;
+    assert.ok(burst.accepted <= HELLO_BURST, `${burst.accepted} of 20,000 hellos made a connection (${took} ms)`);
+    assert.ok(w.broker.connections() <= MAX_CONNECTIONS_PER_APP);
+    assert.equal(count(honest, (m) => m.t === 'closed'), 0, 'the honest connection was not closed');
+    assert.equal((await honest.call({ op: 'list' })).ok, true, 'and still answers');
+    burst.done();
+  });
+
+  it('is a burst, then a few a second: time gives more, an hour gives a burst and not an hour of them', async () => {
+    const at = clock();
+    const w = await world({ brokerNow: at });
+    const first = flood(w, 100);
+    assert.equal(first.accepted, HELLO_BURST);
+    at.advance(1000);
+    const second = flood(w, 100);
+    assert.equal(second.accepted, HELLOS_PER_SECOND);
+    at.advance(60 * 60 * 1000);
+    const third = flood(w, 100);
+    assert.equal(third.accepted, HELLO_BURST);
+    for (const f of [first, second, third]) f.done();
+  });
+
+  it('is counted for each app: one app\'s flood leaves another\'s hello alone', async () => {
+    const at = clock();
+    const w = await world({ brokerNow: at });
+    const hostile = flood(w, 100);
+    assert.equal(hostile.accepted, HELLO_BURST);
+    const flows = await w.connect({ origin: FLOWS });
+    assert.equal(flows.inbox[0].app, 'flows');
+    hostile.done();
   });
 });
 
@@ -240,20 +334,4 @@ describe('a quiet connection', () => {
     assert.equal(w.broker.sweep(), 1);
   });
 
-  it('a closed connection had its requests ended: nothing goes on being paid for', async () => {
-    const at = clock();
-    let signal;
-    const w = await world({ brokerNow: at, handler: (call) => { signal = call.signal; return streamResponse(Array.from({ length: 400 }, (_, i) => `d${i}`), { gapMs: 20 }); } });
-    const flows = await w.connect({ origin: FLOWS });
-    const first = await w.connect();
-    const id = first.start({ provider: w.record.id, path: '/chat/completions', method: 'POST', body: '{"stream":true}' });
-    await first.waitFor((m) => m.id === id && m.t === 'chunk');
-    for (let i = 0; i < MAX_CONNECTIONS_PER_APP; i++) {
-      at.advance(5);
-      await w.connect();
-    }
-    await first.waitFor((m) => m.t === 'closed');
-    assert.equal(signal.aborted, true, 'the request the closed connection had open was aborted');
-    assert.equal(count(flows, (m) => m.t === 'closed'), 0);
-  });
 });

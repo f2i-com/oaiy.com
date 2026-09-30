@@ -336,6 +336,20 @@ const MUTATIONS = [
     files: { 'web/providers/src/protocol.ts': [{ find: 'const now = deps.now ?? (() => performance.now());', replace: 'const now = deps.now ?? Date.now;' }] },
     caught: ['a wall clock set back an hour does not lock the connections that exist', 'the idle sweep closes a quiet connection when the wall clock has been set back'],
   },
+  {
+    name: 'L2 no rate on hellos',
+    what: 'every hello makes a connection, however many an app says',
+    tests: ['tests/unit/flood.test.mjs'],
+    files: { 'web/providers/src/protocol.ts': [{ find: '      if (!helloAllowed(app)) return drop();\n', replace: '' }] },
+    caught: ['is a burst, then a few a second', 'makes no more than a burst of connections'],
+  },
+  {
+    name: 'L2 a connection in use is closed for a new hello',
+    what: 'the least recently active connection is closed to make room even when it was used a moment ago or has a request open',
+    tests: ['tests/unit/flood.test.mjs'],
+    files: { 'web/providers/src/protocol.ts': [{ find: 'const idle = mine.filter(([, c]) => !inUse(c))', replace: 'const idle = mine.filter(() => true)' }] },
+    caught: ['one that was used lately, or has a request open, is never closed to make room'],
+  },
   // Leaks the scans must find. They put the key where a scan of TEXT does not look (the reviewer's two: a Uint8Array, and reversed).
   {
     name: 'H1 leak: list returns the key as a Uint8Array',

@@ -57,6 +57,15 @@ export const OPS_BURST = 100;
 export const OPS_PER_SECOND = 50;
 export const MAX_CONNECTIONS_PER_APP = 16;
 export const IDLE_CLOSE_MS = 15 * 60 * 1000;
+/**
+ * A `hello` makes a connection, so hellos are bounded too: an app may say hello in a burst and then a few times a second (past that none is
+ * answered), and a connection that was used in the last `RECENT_ACTIVITY_MS`, or has a request open, is never closed to make room for a
+ * new one: when all of an app's connections are in use the new hello is refused (`{t:'refused', reason:'too-many'}`). A flood of hellos
+ * cannot push out the honest connection that is in the same frame.
+ */
+export const HELLO_BURST = 10;
+export const HELLOS_PER_SECOND = 2;
+export const RECENT_ACTIVITY_MS = 30_000;
 /** Refusals a connection is answered for in a second; past that a flood is dropped without an answer, which is cheaper still. */
 export const REFUSALS_ANSWERED_PER_SECOND = 100;
 /** The default number of provider requests an app may make in an hour. */
@@ -321,9 +330,10 @@ export type StreamBody = StreamEvent extends infer E ? (E extends unknown ? Omit
 
 /**
  * Sent to an app without being asked. `changed` means the list of providers did. `closed` means the holder has dropped this connection
- * (it was quiet for too long, or the app opened too many): the app says hello again if it still wants one.
+ * (it was quiet for too long, or the app opened too many): the app says hello again if it still wants one. `refused` is the answer to a
+ * hello the holder did not take because every connection the app holds is in use (a hello past the app's rate is not answered at all).
  */
-export type Push = { t: 'changed' } | { t: 'closed'; reason: 'idle' | 'replaced' };
+export type Push = { t: 'changed' } | { t: 'closed'; reason: 'idle' | 'replaced' } | { t: 'refused'; reason: 'too-many' };
 
 export type ListResult = ProviderSummary[];
 
