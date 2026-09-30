@@ -18,23 +18,29 @@ afterEach(() => vi.unstubAllGlobals());
 
 type Sent = Array<[string, string, unknown]>;
 
+/** What a project keeps of its conversations: a page that is reloaded reads it again (`setup(overrides, store)`). */
+interface Store {
+  chats: Map<string, Turn[]>;
+  index: SessionInfo[];
+  callers: CallerNote[];
+}
+const newStore = (): Store => ({ chats: new Map(), index: [], callers: [] });
+
 /** Sessions on a fake desktop that records what it is asked and answers a request to reach the owner as `ringing`. */
-function setup(overrides: Record<string, unknown> = {}) {
-  const chats = new Map<string, Turn[]>();
-  let index: SessionInfo[] = [];
+function setup(overrides: Record<string, unknown> = {}, store: Store = newStore()) {
+  const { chats } = store;
   const project = {
-    loadSessions: async () => index,
+    loadSessions: async () => store.index,
     saveSessions: async (list: SessionInfo[]) => {
-      index = list;
+      store.index = list;
     },
     loadSessionChat: async (id: string) => chats.get(id) ?? [],
     saveSessionChat: async (id: string, turns: Turn[]) => {
       chats.set(id, turns);
     },
-    callers: [] as CallerNote[],
-    loadCallers: async () => project.callers,
+    loadCallers: async () => store.callers,
     saveCallers: async (list: CallerNote[]) => {
-      project.callers = list;
+      store.callers = list;
     },
   };
   const sent: Sent = [];
@@ -64,7 +70,7 @@ function setup(overrides: Record<string, unknown> = {}) {
     () => desktop as unknown as Desktop,
     { changed: () => {}, event: () => {} },
   );
-  return { sessions, sent, said, chats };
+  return { sessions, sent, said, chats, store };
 }
 
 async function settled(sessions: Sessions): Promise<void> {
@@ -367,6 +373,105 @@ describe('a call the owner takes', () => {
     expect(call.callId).toBeUndefined();
     expect(call.handoff).toBeUndefined();
     expect(call.agent.turns.at(-1)).toMatchObject({ text: '[OAIY] 📞 The call ended.' });
+  });
+
+  /** A call the owner has taken, and this page reloaded meanwhile: what a new page reads of what the old one kept. */
+  async function reloadedDuringHandoff(script: Parameters<typeof fakeProvider>[1]) {
+    const fake = fakeProvider('openai', script);
+    const first = setup();
+    await first.sessions.callEvent(ALLOWED);
+    await first.sessions.callEvent(START);
+    await first.sessions.callEvent({ type: 'call.caller', callId: 'call_o', text: 'Can I speak to the owner?' });
+    await settled(first.sessions);
+    await first.sessions.callEvent({ type: 'call.transfer', callId: 'call_o', requestId: 'assist_1', outcome: 'accepted' });
+    await first.sessions.callEvent({ type: 'call.handoff', callId: 'call_o', phase: 'to_human', reason: 'handoff:takeover' });
+    await settled(first.sessions);
+    // The page is closed and opened again: a new Sessions over what the project kept. Nothing else is remembered.
+    const page = setup({}, first.store);
+    await page.sessions.load();
+    return { fake, page, sessions: page.sessions, said: page.said, before: fake.bodies.length };
+  }
+  const BACK = { type: 'call.started', callId: 'call_o', from: '+61491570006', name: 'Alex', allowTransfer: true, instructions: 'Be kind.', greeting: 'Thank you for waiting.', resume: { afterHandoff: true, handoffSeconds: 42, via: 'return' } };
+  const callStarts = (turns: Turn[]) => turns.filter((t) => t.role === 'user' && t.text.startsWith('[OAIY] 📞 A call from')).length;
+
+  it('goes on when this page was reloaded while the owner had it, in the conversation it saved: not greeted again, not dropped, and the caller is answered', async () => {
+    const { fake, sessions, said, before } = await reloadedDuringHandoff([
+      { calls: [{ name: 'transfer_to_owner', input: { reason: 'caller_asked' } }] },
+      { text: 'Please hold.' },
+      (body) => {
+        const seen = JSON.stringify(body.messages);
+        // It has the conversation from before the handoff, that the owner took the call, and that it is back and not to greet.
+        expect(seen).toContain('Can I speak to the owner?');
+        expect(seen).toContain(TRANSFER_NOTES.handoff);
+        expect(seen).toContain('do not greet the caller again');
+        expect(seen).toContain('handed the call back after 0:42');
+        return { text: 'Anything else I can help with?' };
+      },
+    ]);
+    expect(before).toBe(2);
+    await sessions.callEvent({ type: 'hello', calls: ['call_o'], features: { transfer: true, messages: true } });
+    const back = await sessions.callEvent(BACK);
+    // The conversation is the one from before: not a new call's start.
+    expect(back).not.toBeNull();
+    expect(sessions.list.filter((s) => s.kind === 'call')).toHaveLength(1);
+    expect(callStarts(back!.agent.turns)).toBe(1);
+    expect(back!.callId).toBe('call_o');
+    expect(back!.canTransfer).toBe(true);
+    expect(back!.handingOver).toBe(false);
+    expect(lastUser(back!.agent.turns)?.text).toBe(TRANSFER_NOTES.back('0:42'));
+    // It says nothing until the caller does (the phone said its own line as they came back).
+    await settled(sessions);
+    expect(fake.bodies).toHaveLength(before);
+    expect(said).toEqual([]);
+    // The caller speaks: the call is answered, and can still reach the owner or take a message.
+    await sessions.callEvent({ type: 'call.caller', callId: 'call_o', text: 'Thanks, one more thing.' });
+    await settled(sessions);
+    expect(said.join(' ')).toBe('Anything else I can help with?');
+    expect(fake.bodies).toHaveLength(before + 1);
+    expect(toolNames(fake.bodies[before])).toEqual(expect.arrayContaining(['transfer_to_owner', 'take_message']));
+  });
+
+  it('is told by the phone alone, on a page that still has the call but did not see the handoff, and not by anything that is not exactly resume.afterHandoff', async () => {
+    fakeProvider('openai', [{ text: 'Hello.' }, { text: 'Hello again.' }, { text: 'Hello again.' }]);
+    const { sessions } = setup();
+    await sessions.callEvent(ALLOWED);
+    const call = (await sessions.callEvent(START))!;
+    expect(call.handoff).toBeUndefined();
+    const starts = callStarts(call.agent.turns);
+    // What was played before, by the first run's clock, and when that clock began.
+    await sessions.callEvent({ type: 'call.said', callId: 'call_o', text: 'Thanks for calling!', startMs: 0, endMs: 2_000 });
+    expect(call.played).toHaveLength(1);
+    const zero = call.clockZero!;
+    await new Promise((r) => setTimeout(r, 15));
+    // (A page that saw the phone begin the call, and not the handoff: the phone's word is enough.)
+    expect(await sessions.callEvent(BACK)).toBe(call);
+    expect(callStarts(call.agent.turns)).toBe(starts);
+    expect(lastUser(call.agent.turns)?.text).toBe(TRANSFER_NOTES.back('0:42'));
+    // The desktop's clock for the call began again as it went on: what was played by the old one means nothing on it.
+    expect(call.played).toEqual([]);
+    expect(call.clockZero).toBeGreaterThan(zero);
+    // Anything else is a call beginning: its start is written, as ever (a resume that is not after a handoff, a flag that is not true).
+    for (const resume of [{ afterHandoff: false }, { afterHandoff: 'true' }, {}, null, 'yes']) {
+      await sessions.callEvent({ type: 'call.ended', callId: 'call_o' });
+      const again = (await sessions.callEvent({ ...BACK, resume }))!;
+      expect(callStarts(again.agent.turns)).toBeGreaterThan(starts);
+      expect(lastUser(again.agent.turns)?.text).toContain('A call from');
+    }
+  });
+
+  it('is ended as any call is when it ends while the owner had it and this page was reloaded: nothing of it opens here again', async () => {
+    const { sessions, said, before, fake } = await reloadedDuringHandoff([
+      { calls: [{ name: 'transfer_to_owner', input: { reason: 'caller_asked' } }] },
+      { text: 'Please hold.' },
+    ]);
+    await sessions.callEvent({ type: 'hello', calls: [], features: { transfer: true, messages: true } });
+    await sessions.callEvent({ type: 'call.ended', callId: 'call_o', reason: 'ended_during_handoff' });
+    // The caller's last words, after the end, are kept in their conversation and not answered.
+    await sessions.callEvent({ type: 'call.caller', callId: 'call_o', text: 'Hello? Anyone?' });
+    await settled(sessions);
+    expect(fake.bodies).toHaveLength(before);
+    expect(said).toEqual([]);
+    expect(sessions.list.filter((s) => s.kind === 'call' && s.callId)).toHaveLength(0);
   });
 });
 

@@ -196,7 +196,10 @@ agent : "I'll try to reach them, please stay with me."  (it is trying: it does n
   `GET /api/voice/calls`). If the owner hands the caller back, or the takeover fails and the call
   returns, the phone opens a new session for the same call id with `resume`: the app takes it as the
   same call in the same conversation, does not greet again, and the greeting spoken is the phone's own
-  return line. If the phone hangs up meanwhile, the desktop ends the call itself
+  return line. The phone's `resume.afterHandoff` alone says so, so it holds when the Agent page was
+  reloaded while the owner had the call (a page keeps a call's handoff only while it is open): the page
+  takes the call up in the caller's saved conversation, notes the return, and says nothing until the caller
+  does. If the phone hangs up meanwhile, the desktop ends the call itself
   (`call.ended`, `ended_during_handoff`). If the phone's word that the call ended is lost, the call is
   let go after 4 hours (`call.ended`, `handoff_expired`), so it does not hold an update back for ever. A
   call in handoff counts as a live call for the updater.

@@ -569,6 +569,12 @@ export const TRANSFER_NOTES = {
   unavailable: 'The owner cannot be rung on this call: if the caller asks for them, offer to take a message.',
 };
 
+/** A call's start that the phone says is the same call going on after the owner had it (`resume.afterHandoff`), and no other. */
+export function isResumeAfterHandoff(event: Record<string, unknown>): boolean {
+  const resume = event.resume;
+  return !!resume && typeof resume === 'object' && (resume as Record<string, unknown>).afterHandoff === true;
+}
+
 /** A time on a call, from its start ("0:42", "12:05"). */
 export function callClock(ms: number): string {
   const s = Math.max(0, Math.round(ms / 1000));
@@ -1739,8 +1745,10 @@ export class Sessions {
     }
     let session = this.list.find((s) => s.callId === callId) ?? null;
     // The owner had this call and hands it back: the same call goes on. Not a new call (its greeting was said, and what
-    // was said is still the conversation), so nothing of it begins again.
-    if (type === 'call.started' && session?.handoff) return this.resumeAfterHandoff(session, event);
+    // was said is still the conversation), so nothing of it begins again. The phone says so itself (`resume.afterHandoff`), so
+    // this page need not have seen the handoff: a page reloaded while the owner had the call has lost that (a session's
+    // handoff and call are kept only while the page is open), and must not greet the caller again, or drop them.
+    if (type === 'call.started' && (session?.handoff || isResumeAfterHandoff(event))) return this.resumeAfterHandoff(session, event, callId);
     if (type === 'call.started' || (!session && type === 'call.caller')) {
       // A hidden number ("", "Private", "Withheld"): a conversation of its own for this call (never shared with another hidden caller), named as such.
       const hidden = isHidden(String(event.from ?? ''));
@@ -1944,13 +1952,28 @@ export class Sessions {
    * agent is told, and told not to greet the caller again (the phone said its own line as they returned); it says nothing
    * until the caller does.
    */
-  private async resumeAfterHandoff(session: Session, event: Record<string, unknown>): Promise<Session> {
+  private async resumeAfterHandoff(known: Session | null, event: Record<string, unknown>, callId: string): Promise<Session> {
     const resume = event.resume && typeof event.resume === 'object' ? (event.resume as Record<string, unknown>) : {};
+    // A page reloaded while the owner had the call knows nothing of the call: its conversation with this caller is the
+    // one it saved (what was said, and the note that the owner took it), and the call goes on in that.
+    let session = known;
+    if (!session) {
+      const hidden = isHidden(String(event.from ?? ''));
+      const from = hidden ? callId : String(event.from);
+      session = await this.conversationWith(from, hidden ? 'Hidden number' : String(event.name ?? '') || this.outreach?.forCall(callId, from)?.person || '', 'call', hidden);
+      session.outreach = !hidden ? this.outreach?.forCall(callId, from) : undefined;
+    }
+    session.callId = callId;
+    if (typeof event.instructions === 'string') session.brief = event.instructions;
     const seconds = typeof resume.handoffSeconds === 'number' ? resume.handoffSeconds : Math.max(0, Math.round((Date.now() - (session.handoff?.at ?? Date.now())) / 1000));
     session.handoff = undefined;
     session.handingOver = false;
     session.canTransfer = event.allowTransfer === true;
     session.callerSpeaking = false;
+    // The desktop starts the call's clock again as it goes on (its times are from now): what was played on the old one has
+    // times that mean nothing on the new one.
+    session.clockZero = Date.now();
+    session.played = [];
     session.agent.turns.push({ role: 'user', text: TRANSFER_NOTES.back(callClock(seconds * 1000)), automatic: true, at: Date.now() });
     await this.save(session);
     this.hooks.changed();

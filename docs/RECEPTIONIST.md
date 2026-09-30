@@ -165,7 +165,8 @@ is 25 seconds, and only while a connection you accepted is being made (see below
 - **If the Agent page is closed or reloaded** while you are rung (nothing is answering calls), a
   caller who speaks is not hung up on: they hear the hold line or the offer of
   a message, whichever fits, straight away (not more than one every 3 seconds); after you accept their words are not answered with more lines, only the two timed ones above. Only a call with no
-  request going is finished for want of a page, as it always was.
+  request going is finished for want of a page, as it always was. A page reloaded while you have the call
+  takes it up again when you hand it back, in the caller's saved conversation, and does not greet them again.
 
 What it does not cover: a phone plugin that is not running or has lost its connection to this
 computer, in which case the call is not on this computer to speak to.
