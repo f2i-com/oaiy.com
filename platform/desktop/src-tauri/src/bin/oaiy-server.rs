@@ -32,8 +32,9 @@
 //!
 //! A configuration that breaks a rule of the design (an unreadable bind, a lan bind with no owner,
 //! a public URL with a path, a proxy not named, a weak token, a mode that is not allowed there)
-//! stops the server with exit 78, which the shipped unit does not restart, and one line saying
-//! what to change. `oaiy-server check` lists every violation at once.
+//! stops the server with exit 78, and one line saying what to change. The shipped unit does not restart
+//! that (`RestartPreventExitStatus=78`, and it runs `oaiy-server check` first, which lists every
+//! violation at once; `scripts/check-release.mjs` holds the unit to both).
 //!   OAIY_HF_TOKEN        HuggingFace token for this server's own gated
 //!                       downloads (not passed on to services)    [none]
 //!   OAIY_ENGINES_UI      the engines' control pages, when oaiy-studio runs beside
