@@ -101,9 +101,22 @@ fn the_phrase_decoder_agrees_with_the_browser_code_on_every_entry_of_the_corpus(
     let corpus = json(CORPUS);
     let entries = corpus["phrase"].as_array().unwrap();
     let mut verdicts = std::collections::BTreeMap::new();
+    let mut stricter = 0;
     for entry in entries {
         let (input, note) = (entry["input"].as_str().unwrap(), entry["note"].as_str().unwrap());
         let js = entry["verdict"].as_str().unwrap();
+        let (class, pure) = (entry["class"].as_str().unwrap(), entry["js_verdict"].as_str().unwrap());
+        // `same`: the browser code and this decoder say the same. `stricter`: they differ, and only above the byte cap, which this decoder has (design 4.3) and the browser's pure
+        // code does not: the entry says what each says.
+        match class {
+            "same" => assert_eq!(pure, js, "{note}: a `same` entry whose verdicts differ"),
+            "stricter" => {
+                assert_ne!(pure, js, "{note}: a `stricter` entry whose verdicts agree");
+                assert!(input.len() > bip39::MAX_INPUT_BYTES, "{note}: a difference below the cap ({} bytes)", input.len());
+                stricter += 1;
+            }
+            other => panic!("unknown class {other}"),
+        }
         let ours = match bip39::decode(input) {
             Ok(entropy) => {
                 assert_eq!(Some(hex(entropy.expose()).as_str()), entry["entropy"].as_str(), "{note}: the same phrase, other entropy");
@@ -118,6 +131,7 @@ fn the_phrase_decoder_agrees_with_the_browser_code_on_every_entry_of_the_corpus(
         *verdicts.entry(js).or_insert(0) += 1;
     }
     assert!(verdicts["ok"] >= 100 && verdicts["length"] >= 30 && verdicts["word"] >= 10 && verdicts["checksum"] >= 5, "{verdicts:?}");
+    assert!(stricter >= 4, "the corpus has the entries above the cap that the browser code would read ({stricter})");
 }
 
 /// U+0085 (next line) is white space to Unicode and to Rust and not to JavaScript: it used to split a phrase here, and does not now (review M52: the mutant that

@@ -1952,1033 +1952,1417 @@
   {
    "input": "abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon about",
    "note": "plain",
+   "class": "same",
    "verdict": "ok",
+   "js_verdict": "ok",
    "entropy": "00000000000000000000000000000000"
   },
   {
    "input": "ABANDON ABANDON ABANDON ABANDON ABANDON ABANDON ABANDON ABANDON ABANDON ABANDON ABANDON ABOUT",
    "note": "upper case",
+   "class": "same",
    "verdict": "ok",
+   "js_verdict": "ok",
    "entropy": "00000000000000000000000000000000"
   },
   {
    "input": "abandon  \tabandon  \tabandon  \tabandon  \tabandon  \tabandon  \tabandon  \tabandon  \tabandon  \tabandon  \tabandon  \tabout",
    "note": "mixed white space",
+   "class": "same",
    "verdict": "ok",
+   "js_verdict": "ok",
    "entropy": "00000000000000000000000000000000"
   },
   {
    "input": "  abandon\nabandon\nabandon\nabandon\nabandon\nabandon\nabandon\nabandon\nabandon\nabandon\nabandon\nabout  ",
    "note": "line breaks and ends",
+   "class": "same",
    "verdict": "ok",
+   "js_verdict": "ok",
    "entropy": "00000000000000000000000000000000"
   },
   {
    "input": "Abandon Abandon Abandon Abandon Abandon Abandon Abandon Abandon Abandon Abandon Abandon About",
    "note": "capitalised",
+   "class": "same",
    "verdict": "ok",
+   "js_verdict": "ok",
    "entropy": "00000000000000000000000000000000"
   },
   {
    "input": "\uff41\uff42\uff41\uff4e\uff44\uff4f\uff4e \uff41\uff42\uff41\uff4e\uff44\uff4f\uff4e \uff41\uff42\uff41\uff4e\uff44\uff4f\uff4e \uff41\uff42\uff41\uff4e\uff44\uff4f\uff4e \uff41\uff42\uff41\uff4e\uff44\uff4f\uff4e \uff41\uff42\uff41\uff4e\uff44\uff4f\uff4e \uff41\uff42\uff41\uff4e\uff44\uff4f\uff4e \uff41\uff42\uff41\uff4e\uff44\uff4f\uff4e \uff41\uff42\uff41\uff4e\uff44\uff4f\uff4e \uff41\uff42\uff41\uff4e\uff44\uff4f\uff4e \uff41\uff42\uff41\uff4e\uff44\uff4f\uff4e \uff41\uff42\uff4f\uff55\uff54",
    "note": "full-width letters",
+   "class": "same",
    "verdict": "ok",
+   "js_verdict": "ok",
    "entropy": "00000000000000000000000000000000"
   },
   {
    "input": "abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon about",
    "note": "fi ligature",
+   "class": "same",
    "verdict": "ok",
+   "js_verdict": "ok",
    "entropy": "00000000000000000000000000000000"
   },
   {
    "input": "abandon\u00a0abandon\u00a0abandon\u00a0abandon\u00a0abandon\u00a0abandon\u00a0abandon\u00a0abandon\u00a0abandon\u00a0abandon\u00a0abandon\u00a0about",
    "note": "no-break spaces",
+   "class": "same",
    "verdict": "ok",
+   "js_verdict": "ok",
    "entropy": "00000000000000000000000000000000"
   },
   {
    "input": "abandon\u3000abandon\u3000abandon\u3000abandon\u3000abandon\u3000abandon\u3000abandon\u3000abandon\u3000abandon\u3000abandon\u3000abandon\u3000about",
    "note": "ideographic spaces",
+   "class": "same",
    "verdict": "ok",
+   "js_verdict": "ok",
    "entropy": "00000000000000000000000000000000"
   },
   {
    "input": "abandon\ufeffabandon\ufeffabandon\ufeffabandon\ufeffabandon\ufeffabandon\ufeffabandon\ufeffabandon\ufeffabandon\ufeffabandon\ufeffabandon\ufeffabout",
    "note": "BOM between the words",
+   "class": "same",
    "verdict": "ok",
+   "js_verdict": "ok",
    "entropy": "00000000000000000000000000000000"
   },
   {
    "input": "abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abou",
    "note": "last letter missing",
+   "class": "same",
    "verdict": "word",
+   "js_verdict": "word",
    "entropy": null
   },
   {
    "input": "abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon about abandon",
    "note": "thirteen words",
+   "class": "same",
    "verdict": "length",
+   "js_verdict": "length",
    "entropy": null
   },
   {
    "input": "abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon",
    "note": "eleven words",
+   "class": "same",
    "verdict": "length",
+   "js_verdict": "length",
    "entropy": null
   },
   {
    "input": "abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abouu",
    "note": "an unknown word",
+   "class": "same",
    "verdict": "word",
+   "js_verdict": "word",
    "entropy": null
   },
   {
    "input": "abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon",
    "note": "a wrong last word",
+   "class": "same",
    "verdict": "checksum",
+   "js_verdict": "checksum",
    "entropy": null
   },
   {
    "input": "legal winner thank year wave sausage worth useful legal winner thank yellow",
    "note": "plain",
+   "class": "same",
    "verdict": "ok",
+   "js_verdict": "ok",
    "entropy": "7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f"
   },
   {
    "input": "LEGAL WINNER THANK YEAR WAVE SAUSAGE WORTH USEFUL LEGAL WINNER THANK YELLOW",
    "note": "upper case",
+   "class": "same",
    "verdict": "ok",
+   "js_verdict": "ok",
    "entropy": "7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f"
   },
   {
    "input": "legal  \twinner  \tthank  \tyear  \twave  \tsausage  \tworth  \tuseful  \tlegal  \twinner  \tthank  \tyellow",
    "note": "mixed white space",
+   "class": "same",
    "verdict": "ok",
+   "js_verdict": "ok",
    "entropy": "7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f"
   },
   {
    "input": "  legal\nwinner\nthank\nyear\nwave\nsausage\nworth\nuseful\nlegal\nwinner\nthank\nyellow  ",
    "note": "line breaks and ends",
+   "class": "same",
    "verdict": "ok",
+   "js_verdict": "ok",
    "entropy": "7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f"
   },
   {
    "input": "Legal Winner Thank Year Wave Sausage Worth Useful Legal Winner Thank Yellow",
    "note": "capitalised",
+   "class": "same",
    "verdict": "ok",
+   "js_verdict": "ok",
    "entropy": "7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f"
   },
   {
    "input": "\uff4c\uff45\uff47\uff41\uff4c \uff57\uff49\uff4e\uff4e\uff45\uff52 \uff54\uff48\uff41\uff4e\uff4b \uff59\uff45\uff41\uff52 \uff57\uff41\uff56\uff45 \uff53\uff41\uff55\uff53\uff41\uff47\uff45 \uff57\uff4f\uff52\uff54\uff48 \uff55\uff53\uff45\uff46\uff55\uff4c \uff4c\uff45\uff47\uff41\uff4c \uff57\uff49\uff4e\uff4e\uff45\uff52 \uff54\uff48\uff41\uff4e\uff4b \uff59\uff45\uff4c\uff4c\uff4f\uff57",
    "note": "full-width letters",
+   "class": "same",
    "verdict": "ok",
+   "js_verdict": "ok",
    "entropy": "7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f"
   },
   {
    "input": "legal winner thank year wave sausage worth useful legal winner thank yellow",
    "note": "fi ligature",
+   "class": "same",
    "verdict": "ok",
+   "js_verdict": "ok",
    "entropy": "7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f"
   },
   {
    "input": "legal\u00a0winner\u00a0thank\u00a0year\u00a0wave\u00a0sausage\u00a0worth\u00a0useful\u00a0legal\u00a0winner\u00a0thank\u00a0yellow",
    "note": "no-break spaces",
+   "class": "same",
    "verdict": "ok",
+   "js_verdict": "ok",
    "entropy": "7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f"
   },
   {
    "input": "legal\u3000winner\u3000thank\u3000year\u3000wave\u3000sausage\u3000worth\u3000useful\u3000legal\u3000winner\u3000thank\u3000yellow",
    "note": "ideographic spaces",
+   "class": "same",
    "verdict": "ok",
+   "js_verdict": "ok",
    "entropy": "7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f"
   },
   {
    "input": "legal\ufeffwinner\ufeffthank\ufeffyear\ufeffwave\ufeffsausage\ufeffworth\ufeffuseful\ufefflegal\ufeffwinner\ufeffthank\ufeffyellow",
    "note": "BOM between the words",
+   "class": "same",
    "verdict": "ok",
+   "js_verdict": "ok",
    "entropy": "7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f"
   },
   {
    "input": "legal winner thank year wave sausage worth useful legal winner thank yello",
    "note": "last letter missing",
+   "class": "same",
    "verdict": "word",
+   "js_verdict": "word",
    "entropy": null
   },
   {
    "input": "legal winner thank year wave sausage worth useful legal winner thank yellow legal",
    "note": "thirteen words",
+   "class": "same",
    "verdict": "length",
+   "js_verdict": "length",
    "entropy": null
   },
   {
    "input": "legal winner thank year wave sausage worth useful legal winner thank",
    "note": "eleven words",
+   "class": "same",
    "verdict": "length",
+   "js_verdict": "length",
    "entropy": null
   },
   {
    "input": "legal winner thank year wave sausage worth useful legal winner thank abouu",
    "note": "an unknown word",
+   "class": "same",
    "verdict": "word",
+   "js_verdict": "word",
    "entropy": null
   },
   {
    "input": "legal winner thank year wave sausage worth useful legal winner thank abandon",
    "note": "a wrong last word",
+   "class": "same",
    "verdict": "checksum",
+   "js_verdict": "checksum",
    "entropy": null
   },
   {
    "input": "zoo zoo zoo zoo zoo zoo zoo zoo zoo zoo zoo wrong",
    "note": "plain",
+   "class": "same",
    "verdict": "ok",
+   "js_verdict": "ok",
    "entropy": "ffffffffffffffffffffffffffffffff"
   },
   {
    "input": "ZOO ZOO ZOO ZOO ZOO ZOO ZOO ZOO ZOO ZOO ZOO WRONG",
    "note": "upper case",
+   "class": "same",
    "verdict": "ok",
+   "js_verdict": "ok",
    "entropy": "ffffffffffffffffffffffffffffffff"
   },
   {
    "input": "zoo  \tzoo  \tzoo  \tzoo  \tzoo  \tzoo  \tzoo  \tzoo  \tzoo  \tzoo  \tzoo  \twrong",
    "note": "mixed white space",
+   "class": "same",
    "verdict": "ok",
+   "js_verdict": "ok",
    "entropy": "ffffffffffffffffffffffffffffffff"
   },
   {
    "input": "  zoo\nzoo\nzoo\nzoo\nzoo\nzoo\nzoo\nzoo\nzoo\nzoo\nzoo\nwrong  ",
    "note": "line breaks and ends",
+   "class": "same",
    "verdict": "ok",
+   "js_verdict": "ok",
    "entropy": "ffffffffffffffffffffffffffffffff"
   },
   {
    "input": "Zoo Zoo Zoo Zoo Zoo Zoo Zoo Zoo Zoo Zoo Zoo Wrong",
    "note": "capitalised",
+   "class": "same",
    "verdict": "ok",
+   "js_verdict": "ok",
    "entropy": "ffffffffffffffffffffffffffffffff"
   },
   {
    "input": "\uff5a\uff4f\uff4f \uff5a\uff4f\uff4f \uff5a\uff4f\uff4f \uff5a\uff4f\uff4f \uff5a\uff4f\uff4f \uff5a\uff4f\uff4f \uff5a\uff4f\uff4f \uff5a\uff4f\uff4f \uff5a\uff4f\uff4f \uff5a\uff4f\uff4f \uff5a\uff4f\uff4f \uff57\uff52\uff4f\uff4e\uff47",
    "note": "full-width letters",
+   "class": "same",
    "verdict": "ok",
+   "js_verdict": "ok",
    "entropy": "ffffffffffffffffffffffffffffffff"
   },
   {
    "input": "zoo zoo zoo zoo zoo zoo zoo zoo zoo zoo zoo wrong",
    "note": "fi ligature",
+   "class": "same",
    "verdict": "ok",
+   "js_verdict": "ok",
    "entropy": "ffffffffffffffffffffffffffffffff"
   },
   {
    "input": "zoo\u00a0zoo\u00a0zoo\u00a0zoo\u00a0zoo\u00a0zoo\u00a0zoo\u00a0zoo\u00a0zoo\u00a0zoo\u00a0zoo\u00a0wrong",
    "note": "no-break spaces",
+   "class": "same",
    "verdict": "ok",
+   "js_verdict": "ok",
    "entropy": "ffffffffffffffffffffffffffffffff"
   },
   {
    "input": "zoo\u3000zoo\u3000zoo\u3000zoo\u3000zoo\u3000zoo\u3000zoo\u3000zoo\u3000zoo\u3000zoo\u3000zoo\u3000wrong",
    "note": "ideographic spaces",
+   "class": "same",
    "verdict": "ok",
+   "js_verdict": "ok",
    "entropy": "ffffffffffffffffffffffffffffffff"
   },
   {
    "input": "zoo\ufeffzoo\ufeffzoo\ufeffzoo\ufeffzoo\ufeffzoo\ufeffzoo\ufeffzoo\ufeffzoo\ufeffzoo\ufeffzoo\ufeffwrong",
    "note": "BOM between the words",
+   "class": "same",
    "verdict": "ok",
+   "js_verdict": "ok",
    "entropy": "ffffffffffffffffffffffffffffffff"
   },
   {
    "input": "zoo zoo zoo zoo zoo zoo zoo zoo zoo zoo zoo wron",
    "note": "last letter missing",
+   "class": "same",
    "verdict": "word",
+   "js_verdict": "word",
    "entropy": null
   },
   {
    "input": "zoo zoo zoo zoo zoo zoo zoo zoo zoo zoo zoo wrong zoo",
    "note": "thirteen words",
+   "class": "same",
    "verdict": "length",
+   "js_verdict": "length",
    "entropy": null
   },
   {
    "input": "zoo zoo zoo zoo zoo zoo zoo zoo zoo zoo zoo",
    "note": "eleven words",
+   "class": "same",
    "verdict": "length",
+   "js_verdict": "length",
    "entropy": null
   },
   {
    "input": "zoo zoo zoo zoo zoo zoo zoo zoo zoo zoo zoo abouu",
    "note": "an unknown word",
+   "class": "same",
    "verdict": "word",
+   "js_verdict": "word",
    "entropy": null
   },
   {
    "input": "zoo zoo zoo zoo zoo zoo zoo zoo zoo zoo zoo abandon",
    "note": "a wrong last word",
+   "class": "same",
    "verdict": "checksum",
+   "js_verdict": "checksum",
    "entropy": null
   },
   {
    "input": "depth zero twist noodle later tuition gorilla trust oak local trash earn",
    "note": "plain",
+   "class": "same",
    "verdict": "ok",
+   "js_verdict": "ok",
    "entropy": "3b3ff7ae4b07d5d4592f4d97d06b9da2"
   },
   {
    "input": "DEPTH ZERO TWIST NOODLE LATER TUITION GORILLA TRUST OAK LOCAL TRASH EARN",
    "note": "upper case",
+   "class": "same",
    "verdict": "ok",
+   "js_verdict": "ok",
    "entropy": "3b3ff7ae4b07d5d4592f4d97d06b9da2"
   },
   {
    "input": "depth  \tzero  \ttwist  \tnoodle  \tlater  \ttuition  \tgorilla  \ttrust  \toak  \tlocal  \ttrash  \tearn",
    "note": "mixed white space",
+   "class": "same",
    "verdict": "ok",
+   "js_verdict": "ok",
    "entropy": "3b3ff7ae4b07d5d4592f4d97d06b9da2"
   },
   {
    "input": "  depth\nzero\ntwist\nnoodle\nlater\ntuition\ngorilla\ntrust\noak\nlocal\ntrash\nearn  ",
    "note": "line breaks and ends",
+   "class": "same",
    "verdict": "ok",
+   "js_verdict": "ok",
    "entropy": "3b3ff7ae4b07d5d4592f4d97d06b9da2"
   },
   {
    "input": "Depth Zero Twist Noodle Later Tuition Gorilla Trust Oak Local Trash Earn",
    "note": "capitalised",
+   "class": "same",
    "verdict": "ok",
+   "js_verdict": "ok",
    "entropy": "3b3ff7ae4b07d5d4592f4d97d06b9da2"
   },
   {
    "input": "\uff44\uff45\uff50\uff54\uff48 \uff5a\uff45\uff52\uff4f \uff54\uff57\uff49\uff53\uff54 \uff4e\uff4f\uff4f\uff44\uff4c\uff45 \uff4c\uff41\uff54\uff45\uff52 \uff54\uff55\uff49\uff54\uff49\uff4f\uff4e \uff47\uff4f\uff52\uff49\uff4c\uff4c\uff41 \uff54\uff52\uff55\uff53\uff54 \uff4f\uff41\uff4b \uff4c\uff4f\uff43\uff41\uff4c \uff54\uff52\uff41\uff53\uff48 \uff45\uff41\uff52\uff4e",
    "note": "full-width letters",
+   "class": "same",
    "verdict": "ok",
+   "js_verdict": "ok",
    "entropy": "3b3ff7ae4b07d5d4592f4d97d06b9da2"
   },
   {
    "input": "depth zero twist noodle later tuition gorilla trust oak local trash earn",
    "note": "fi ligature",
+   "class": "same",
    "verdict": "ok",
+   "js_verdict": "ok",
    "entropy": "3b3ff7ae4b07d5d4592f4d97d06b9da2"
   },
   {
    "input": "depth\u00a0zero\u00a0twist\u00a0noodle\u00a0later\u00a0tuition\u00a0gorilla\u00a0trust\u00a0oak\u00a0local\u00a0trash\u00a0earn",
    "note": "no-break spaces",
+   "class": "same",
    "verdict": "ok",
+   "js_verdict": "ok",
    "entropy": "3b3ff7ae4b07d5d4592f4d97d06b9da2"
   },
   {
    "input": "depth\u3000zero\u3000twist\u3000noodle\u3000later\u3000tuition\u3000gorilla\u3000trust\u3000oak\u3000local\u3000trash\u3000earn",
    "note": "ideographic spaces",
+   "class": "same",
    "verdict": "ok",
+   "js_verdict": "ok",
    "entropy": "3b3ff7ae4b07d5d4592f4d97d06b9da2"
   },
   {
    "input": "depth\ufeffzero\ufefftwist\ufeffnoodle\ufefflater\ufefftuition\ufeffgorilla\ufefftrust\ufeffoak\ufefflocal\ufefftrash\ufeffearn",
    "note": "BOM between the words",
+   "class": "same",
    "verdict": "ok",
+   "js_verdict": "ok",
    "entropy": "3b3ff7ae4b07d5d4592f4d97d06b9da2"
   },
   {
    "input": "depth zero twist noodle later tuition gorilla trust oak local trash ear",
    "note": "last letter missing",
+   "class": "same",
    "verdict": "word",
+   "js_verdict": "word",
    "entropy": null
   },
   {
    "input": "depth zero twist noodle later tuition gorilla trust oak local trash earn depth",
    "note": "thirteen words",
+   "class": "same",
    "verdict": "length",
+   "js_verdict": "length",
    "entropy": null
   },
   {
    "input": "depth zero twist noodle later tuition gorilla trust oak local trash",
    "note": "eleven words",
+   "class": "same",
    "verdict": "length",
+   "js_verdict": "length",
    "entropy": null
   },
   {
    "input": "depth zero twist noodle later tuition gorilla trust oak local trash abouu",
    "note": "an unknown word",
+   "class": "same",
    "verdict": "word",
+   "js_verdict": "word",
    "entropy": null
   },
   {
    "input": "depth zero twist noodle later tuition gorilla trust oak local trash abandon",
    "note": "a wrong last word",
+   "class": "same",
    "verdict": "checksum",
+   "js_verdict": "checksum",
    "entropy": null
   },
   {
    "input": "adult follow display rate orphan tail eight order bargain eyebrow gloom sing",
    "note": "plain",
+   "class": "same",
    "verdict": "ok",
+   "js_verdict": "ok",
    "entropy": "03cb54fe5919cdba91bce112aa298de4"
   },
   {
    "input": "ADULT FOLLOW DISPLAY RATE ORPHAN TAIL EIGHT ORDER BARGAIN EYEBROW GLOOM SING",
    "note": "upper case",
+   "class": "same",
    "verdict": "ok",
+   "js_verdict": "ok",
    "entropy": "03cb54fe5919cdba91bce112aa298de4"
   },
   {
    "input": "adult  \tfollow  \tdisplay  \trate  \torphan  \ttail  \teight  \torder  \tbargain  \teyebrow  \tgloom  \tsing",
    "note": "mixed white space",
+   "class": "same",
    "verdict": "ok",
+   "js_verdict": "ok",
    "entropy": "03cb54fe5919cdba91bce112aa298de4"
   },
   {
    "input": "  adult\nfollow\ndisplay\nrate\norphan\ntail\neight\norder\nbargain\neyebrow\ngloom\nsing  ",
    "note": "line breaks and ends",
+   "class": "same",
    "verdict": "ok",
+   "js_verdict": "ok",
    "entropy": "03cb54fe5919cdba91bce112aa298de4"
   },
   {
    "input": "Adult Follow Display Rate Orphan Tail Eight Order Bargain Eyebrow Gloom Sing",
    "note": "capitalised",
+   "class": "same",
    "verdict": "ok",
+   "js_verdict": "ok",
    "entropy": "03cb54fe5919cdba91bce112aa298de4"
   },
   {
    "input": "\uff41\uff44\uff55\uff4c\uff54 \uff46\uff4f\uff4c\uff4c\uff4f\uff57 \uff44\uff49\uff53\uff50\uff4c\uff41\uff59 \uff52\uff41\uff54\uff45 \uff4f\uff52\uff50\uff48\uff41\uff4e \uff54\uff41\uff49\uff4c \uff45\uff49\uff47\uff48\uff54 \uff4f\uff52\uff44\uff45\uff52 \uff42\uff41\uff52\uff47\uff41\uff49\uff4e \uff45\uff59\uff45\uff42\uff52\uff4f\uff57 \uff47\uff4c\uff4f\uff4f\uff4d \uff53\uff49\uff4e\uff47",
    "note": "full-width letters",
+   "class": "same",
    "verdict": "ok",
+   "js_verdict": "ok",
    "entropy": "03cb54fe5919cdba91bce112aa298de4"
   },
   {
    "input": "adult follow display rate orphan tail eight order bargain eyebrow gloom sing",
    "note": "fi ligature",
+   "class": "same",
    "verdict": "ok",
+   "js_verdict": "ok",
    "entropy": "03cb54fe5919cdba91bce112aa298de4"
   },
   {
    "input": "adult\u00a0follow\u00a0display\u00a0rate\u00a0orphan\u00a0tail\u00a0eight\u00a0order\u00a0bargain\u00a0eyebrow\u00a0gloom\u00a0sing",
    "note": "no-break spaces",
+   "class": "same",
    "verdict": "ok",
+   "js_verdict": "ok",
    "entropy": "03cb54fe5919cdba91bce112aa298de4"
   },
   {
    "input": "adult\u3000follow\u3000display\u3000rate\u3000orphan\u3000tail\u3000eight\u3000order\u3000bargain\u3000eyebrow\u3000gloom\u3000sing",
    "note": "ideographic spaces",
+   "class": "same",
    "verdict": "ok",
+   "js_verdict": "ok",
    "entropy": "03cb54fe5919cdba91bce112aa298de4"
   },
   {
    "input": "adult\ufefffollow\ufeffdisplay\ufeffrate\ufefforphan\ufefftail\ufeffeight\ufefforder\ufeffbargain\ufeffeyebrow\ufeffgloom\ufeffsing",
    "note": "BOM between the words",
+   "class": "same",
    "verdict": "ok",
+   "js_verdict": "ok",
    "entropy": "03cb54fe5919cdba91bce112aa298de4"
   },
   {
    "input": "adult follow display rate orphan tail eight order bargain eyebrow gloom sin",
    "note": "last letter missing",
+   "class": "same",
    "verdict": "word",
+   "js_verdict": "word",
    "entropy": null
   },
   {
    "input": "adult follow display rate orphan tail eight order bargain eyebrow gloom sing adult",
    "note": "thirteen words",
+   "class": "same",
    "verdict": "length",
+   "js_verdict": "length",
    "entropy": null
   },
   {
    "input": "adult follow display rate orphan tail eight order bargain eyebrow gloom",
    "note": "eleven words",
+   "class": "same",
    "verdict": "length",
+   "js_verdict": "length",
    "entropy": null
   },
   {
    "input": "adult follow display rate orphan tail eight order bargain eyebrow gloom abouu",
    "note": "an unknown word",
+   "class": "same",
    "verdict": "word",
+   "js_verdict": "word",
    "entropy": null
   },
   {
    "input": "adult follow display rate orphan tail eight order bargain eyebrow gloom abandon",
    "note": "a wrong last word",
+   "class": "same",
    "verdict": "checksum",
+   "js_verdict": "checksum",
    "entropy": null
   },
   {
    "input": "distance brave praise hover west myself announce push multiply vehicle net deer",
    "note": "plain",
+   "class": "same",
    "verdict": "ok",
+   "js_verdict": "ok",
    "entropy": "3fa36aa6373f9724825575917e3e529c"
   },
   {
    "input": "DISTANCE BRAVE PRAISE HOVER WEST MYSELF ANNOUNCE PUSH MULTIPLY VEHICLE NET DEER",
    "note": "upper case",
+   "class": "same",
    "verdict": "ok",
+   "js_verdict": "ok",
    "entropy": "3fa36aa6373f9724825575917e3e529c"
   },
   {
    "input": "distance  \tbrave  \tpraise  \thover  \twest  \tmyself  \tannounce  \tpush  \tmultiply  \tvehicle  \tnet  \tdeer",
    "note": "mixed white space",
+   "class": "same",
    "verdict": "ok",
+   "js_verdict": "ok",
    "entropy": "3fa36aa6373f9724825575917e3e529c"
   },
   {
    "input": "  distance\nbrave\npraise\nhover\nwest\nmyself\nannounce\npush\nmultiply\nvehicle\nnet\ndeer  ",
    "note": "line breaks and ends",
+   "class": "same",
    "verdict": "ok",
+   "js_verdict": "ok",
    "entropy": "3fa36aa6373f9724825575917e3e529c"
   },
   {
    "input": "Distance Brave Praise Hover West Myself Announce Push Multiply Vehicle Net Deer",
    "note": "capitalised",
+   "class": "same",
    "verdict": "ok",
+   "js_verdict": "ok",
    "entropy": "3fa36aa6373f9724825575917e3e529c"
   },
   {
    "input": "\uff44\uff49\uff53\uff54\uff41\uff4e\uff43\uff45 \uff42\uff52\uff41\uff56\uff45 \uff50\uff52\uff41\uff49\uff53\uff45 \uff48\uff4f\uff56\uff45\uff52 \uff57\uff45\uff53\uff54 \uff4d\uff59\uff53\uff45\uff4c\uff46 \uff41\uff4e\uff4e\uff4f\uff55\uff4e\uff43\uff45 \uff50\uff55\uff53\uff48 \uff4d\uff55\uff4c\uff54\uff49\uff50\uff4c\uff59 \uff56\uff45\uff48\uff49\uff43\uff4c\uff45 \uff4e\uff45\uff54 \uff44\uff45\uff45\uff52",
    "note": "full-width letters",
+   "class": "same",
    "verdict": "ok",
+   "js_verdict": "ok",
    "entropy": "3fa36aa6373f9724825575917e3e529c"
   },
   {
    "input": "distance brave praise hover west myself announce push multiply vehicle net deer",
    "note": "fi ligature",
+   "class": "same",
    "verdict": "ok",
+   "js_verdict": "ok",
    "entropy": "3fa36aa6373f9724825575917e3e529c"
   },
   {
    "input": "distance\u00a0brave\u00a0praise\u00a0hover\u00a0west\u00a0myself\u00a0announce\u00a0push\u00a0multiply\u00a0vehicle\u00a0net\u00a0deer",
    "note": "no-break spaces",
+   "class": "same",
    "verdict": "ok",
+   "js_verdict": "ok",
    "entropy": "3fa36aa6373f9724825575917e3e529c"
   },
   {
    "input": "distance\u3000brave\u3000praise\u3000hover\u3000west\u3000myself\u3000announce\u3000push\u3000multiply\u3000vehicle\u3000net\u3000deer",
    "note": "ideographic spaces",
+   "class": "same",
    "verdict": "ok",
+   "js_verdict": "ok",
    "entropy": "3fa36aa6373f9724825575917e3e529c"
   },
   {
    "input": "distance\ufeffbrave\ufeffpraise\ufeffhover\ufeffwest\ufeffmyself\ufeffannounce\ufeffpush\ufeffmultiply\ufeffvehicle\ufeffnet\ufeffdeer",
    "note": "BOM between the words",
+   "class": "same",
    "verdict": "ok",
+   "js_verdict": "ok",
    "entropy": "3fa36aa6373f9724825575917e3e529c"
   },
   {
    "input": "distance brave praise hover west myself announce push multiply vehicle net dee",
    "note": "last letter missing",
+   "class": "same",
    "verdict": "word",
+   "js_verdict": "word",
    "entropy": null
   },
   {
    "input": "distance brave praise hover west myself announce push multiply vehicle net deer distance",
    "note": "thirteen words",
+   "class": "same",
    "verdict": "length",
+   "js_verdict": "length",
    "entropy": null
   },
   {
    "input": "distance brave praise hover west myself announce push multiply vehicle net",
    "note": "eleven words",
+   "class": "same",
    "verdict": "length",
+   "js_verdict": "length",
    "entropy": null
   },
   {
    "input": "distance brave praise hover west myself announce push multiply vehicle net abouu",
    "note": "an unknown word",
+   "class": "same",
    "verdict": "word",
+   "js_verdict": "word",
    "entropy": null
   },
   {
    "input": "distance brave praise hover west myself announce push multiply vehicle net abandon",
    "note": "a wrong last word",
+   "class": "same",
    "verdict": "checksum",
+   "js_verdict": "checksum",
    "entropy": null
   },
   {
    "input": "depth\tzero\ttwist\tnoodle\tlater\ttuition\tgorilla\ttrust\toak\tlocal\ttrash\tearn",
    "note": "U+0009 between the words",
+   "class": "same",
    "verdict": "ok",
+   "js_verdict": "ok",
    "entropy": "3b3ff7ae4b07d5d4592f4d97d06b9da2"
   },
   {
    "input": "\tdepth zero twist noodle later tuition gorilla trust oak local trash earn\t",
    "note": "U+0009 at both ends",
+   "class": "same",
    "verdict": "ok",
+   "js_verdict": "ok",
    "entropy": "3b3ff7ae4b07d5d4592f4d97d06b9da2"
   },
   {
    "input": "depth\nzero\ntwist\nnoodle\nlater\ntuition\ngorilla\ntrust\noak\nlocal\ntrash\nearn",
    "note": "U+000A between the words",
+   "class": "same",
    "verdict": "ok",
+   "js_verdict": "ok",
    "entropy": "3b3ff7ae4b07d5d4592f4d97d06b9da2"
   },
   {
    "input": "\ndepth zero twist noodle later tuition gorilla trust oak local trash earn\n",
    "note": "U+000A at both ends",
+   "class": "same",
    "verdict": "ok",
+   "js_verdict": "ok",
    "entropy": "3b3ff7ae4b07d5d4592f4d97d06b9da2"
   },
   {
    "input": "depth\u000bzero\u000btwist\u000bnoodle\u000blater\u000btuition\u000bgorilla\u000btrust\u000boak\u000blocal\u000btrash\u000bearn",
    "note": "U+000B between the words",
+   "class": "same",
    "verdict": "ok",
+   "js_verdict": "ok",
    "entropy": "3b3ff7ae4b07d5d4592f4d97d06b9da2"
   },
   {
    "input": "\u000bdepth zero twist noodle later tuition gorilla trust oak local trash earn\u000b",
    "note": "U+000B at both ends",
+   "class": "same",
    "verdict": "ok",
+   "js_verdict": "ok",
    "entropy": "3b3ff7ae4b07d5d4592f4d97d06b9da2"
   },
   {
    "input": "depth\fzero\ftwist\fnoodle\flater\ftuition\fgorilla\ftrust\foak\flocal\ftrash\fearn",
    "note": "U+000C between the words",
+   "class": "same",
    "verdict": "ok",
+   "js_verdict": "ok",
    "entropy": "3b3ff7ae4b07d5d4592f4d97d06b9da2"
   },
   {
    "input": "\fdepth zero twist noodle later tuition gorilla trust oak local trash earn\f",
    "note": "U+000C at both ends",
+   "class": "same",
    "verdict": "ok",
+   "js_verdict": "ok",
    "entropy": "3b3ff7ae4b07d5d4592f4d97d06b9da2"
   },
   {
    "input": "depth\rzero\rtwist\rnoodle\rlater\rtuition\rgorilla\rtrust\roak\rlocal\rtrash\rearn",
    "note": "U+000D between the words",
+   "class": "same",
    "verdict": "ok",
+   "js_verdict": "ok",
    "entropy": "3b3ff7ae4b07d5d4592f4d97d06b9da2"
   },
   {
    "input": "\rdepth zero twist noodle later tuition gorilla trust oak local trash earn\r",
    "note": "U+000D at both ends",
+   "class": "same",
    "verdict": "ok",
+   "js_verdict": "ok",
    "entropy": "3b3ff7ae4b07d5d4592f4d97d06b9da2"
   },
   {
    "input": "depth zero twist noodle later tuition gorilla trust oak local trash earn",
    "note": "U+0020 between the words",
+   "class": "same",
    "verdict": "ok",
+   "js_verdict": "ok",
    "entropy": "3b3ff7ae4b07d5d4592f4d97d06b9da2"
   },
   {
    "input": " depth zero twist noodle later tuition gorilla trust oak local trash earn ",
    "note": "U+0020 at both ends",
+   "class": "same",
    "verdict": "ok",
+   "js_verdict": "ok",
    "entropy": "3b3ff7ae4b07d5d4592f4d97d06b9da2"
   },
   {
    "input": "depth\u00a0zero\u00a0twist\u00a0noodle\u00a0later\u00a0tuition\u00a0gorilla\u00a0trust\u00a0oak\u00a0local\u00a0trash\u00a0earn",
    "note": "U+00A0 between the words",
+   "class": "same",
    "verdict": "ok",
+   "js_verdict": "ok",
    "entropy": "3b3ff7ae4b07d5d4592f4d97d06b9da2"
   },
   {
    "input": "\u00a0depth zero twist noodle later tuition gorilla trust oak local trash earn\u00a0",
    "note": "U+00A0 at both ends",
+   "class": "same",
    "verdict": "ok",
+   "js_verdict": "ok",
    "entropy": "3b3ff7ae4b07d5d4592f4d97d06b9da2"
   },
   {
    "input": "depth\u1680zero\u1680twist\u1680noodle\u1680later\u1680tuition\u1680gorilla\u1680trust\u1680oak\u1680local\u1680trash\u1680earn",
    "note": "U+1680 between the words",
+   "class": "same",
    "verdict": "ok",
+   "js_verdict": "ok",
    "entropy": "3b3ff7ae4b07d5d4592f4d97d06b9da2"
   },
   {
    "input": "\u1680depth zero twist noodle later tuition gorilla trust oak local trash earn\u1680",
    "note": "U+1680 at both ends",
+   "class": "same",
    "verdict": "ok",
+   "js_verdict": "ok",
    "entropy": "3b3ff7ae4b07d5d4592f4d97d06b9da2"
   },
   {
    "input": "depth\u2000zero\u2000twist\u2000noodle\u2000later\u2000tuition\u2000gorilla\u2000trust\u2000oak\u2000local\u2000trash\u2000earn",
    "note": "U+2000 between the words",
+   "class": "same",
    "verdict": "ok",
+   "js_verdict": "ok",
    "entropy": "3b3ff7ae4b07d5d4592f4d97d06b9da2"
   },
   {
    "input": "\u2000depth zero twist noodle later tuition gorilla trust oak local trash earn\u2000",
    "note": "U+2000 at both ends",
+   "class": "same",
    "verdict": "ok",
+   "js_verdict": "ok",
    "entropy": "3b3ff7ae4b07d5d4592f4d97d06b9da2"
   },
   {
    "input": "depth\u2001zero\u2001twist\u2001noodle\u2001later\u2001tuition\u2001gorilla\u2001trust\u2001oak\u2001local\u2001trash\u2001earn",
    "note": "U+2001 between the words",
+   "class": "same",
    "verdict": "ok",
+   "js_verdict": "ok",
    "entropy": "3b3ff7ae4b07d5d4592f4d97d06b9da2"
   },
   {
    "input": "\u2001depth zero twist noodle later tuition gorilla trust oak local trash earn\u2001",
    "note": "U+2001 at both ends",
+   "class": "same",
    "verdict": "ok",
+   "js_verdict": "ok",
    "entropy": "3b3ff7ae4b07d5d4592f4d97d06b9da2"
   },
   {
    "input": "depth\u2002zero\u2002twist\u2002noodle\u2002later\u2002tuition\u2002gorilla\u2002trust\u2002oak\u2002local\u2002trash\u2002earn",
    "note": "U+2002 between the words",
+   "class": "same",
    "verdict": "ok",
+   "js_verdict": "ok",
    "entropy": "3b3ff7ae4b07d5d4592f4d97d06b9da2"
   },
   {
    "input": "\u2002depth zero twist noodle later tuition gorilla trust oak local trash earn\u2002",
    "note": "U+2002 at both ends",
+   "class": "same",
    "verdict": "ok",
+   "js_verdict": "ok",
    "entropy": "3b3ff7ae4b07d5d4592f4d97d06b9da2"
   },
   {
    "input": "depth\u2003zero\u2003twist\u2003noodle\u2003later\u2003tuition\u2003gorilla\u2003trust\u2003oak\u2003local\u2003trash\u2003earn",
    "note": "U+2003 between the words",
+   "class": "same",
    "verdict": "ok",
+   "js_verdict": "ok",
    "entropy": "3b3ff7ae4b07d5d4592f4d97d06b9da2"
   },
   {
    "input": "\u2003depth zero twist noodle later tuition gorilla trust oak local trash earn\u2003",
    "note": "U+2003 at both ends",
+   "class": "same",
    "verdict": "ok",
+   "js_verdict": "ok",
    "entropy": "3b3ff7ae4b07d5d4592f4d97d06b9da2"
   },
   {
    "input": "depth\u2004zero\u2004twist\u2004noodle\u2004later\u2004tuition\u2004gorilla\u2004trust\u2004oak\u2004local\u2004trash\u2004earn",
    "note": "U+2004 between the words",
+   "class": "same",
    "verdict": "ok",
+   "js_verdict": "ok",
    "entropy": "3b3ff7ae4b07d5d4592f4d97d06b9da2"
   },
   {
    "input": "\u2004depth zero twist noodle later tuition gorilla trust oak local trash earn\u2004",
    "note": "U+2004 at both ends",
+   "class": "same",
    "verdict": "ok",
+   "js_verdict": "ok",
    "entropy": "3b3ff7ae4b07d5d4592f4d97d06b9da2"
   },
   {
    "input": "depth\u2005zero\u2005twist\u2005noodle\u2005later\u2005tuition\u2005gorilla\u2005trust\u2005oak\u2005local\u2005trash\u2005earn",
    "note": "U+2005 between the words",
+   "class": "same",
    "verdict": "ok",
+   "js_verdict": "ok",
    "entropy": "3b3ff7ae4b07d5d4592f4d97d06b9da2"
   },
   {
    "input": "\u2005depth zero twist noodle later tuition gorilla trust oak local trash earn\u2005",
    "note": "U+2005 at both ends",
+   "class": "same",
    "verdict": "ok",
+   "js_verdict": "ok",
    "entropy": "3b3ff7ae4b07d5d4592f4d97d06b9da2"
   },
   {
    "input": "depth\u2006zero\u2006twist\u2006noodle\u2006later\u2006tuition\u2006gorilla\u2006trust\u2006oak\u2006local\u2006trash\u2006earn",
    "note": "U+2006 between the words",
+   "class": "same",
    "verdict": "ok",
+   "js_verdict": "ok",
    "entropy": "3b3ff7ae4b07d5d4592f4d97d06b9da2"
   },
   {
    "input": "\u2006depth zero twist noodle later tuition gorilla trust oak local trash earn\u2006",
    "note": "U+2006 at both ends",
+   "class": "same",
    "verdict": "ok",
+   "js_verdict": "ok",
    "entropy": "3b3ff7ae4b07d5d4592f4d97d06b9da2"
   },
   {
    "input": "depth\u2007zero\u2007twist\u2007noodle\u2007later\u2007tuition\u2007gorilla\u2007trust\u2007oak\u2007local\u2007trash\u2007earn",
    "note": "U+2007 between the words",
+   "class": "same",
    "verdict": "ok",
+   "js_verdict": "ok",
    "entropy": "3b3ff7ae4b07d5d4592f4d97d06b9da2"
   },
   {
    "input": "\u2007depth zero twist noodle later tuition gorilla trust oak local trash earn\u2007",
    "note": "U+2007 at both ends",
+   "class": "same",
    "verdict": "ok",
+   "js_verdict": "ok",
    "entropy": "3b3ff7ae4b07d5d4592f4d97d06b9da2"
   },
   {
    "input": "depth\u2008zero\u2008twist\u2008noodle\u2008later\u2008tuition\u2008gorilla\u2008trust\u2008oak\u2008local\u2008trash\u2008earn",
    "note": "U+2008 between the words",
+   "class": "same",
    "verdict": "ok",
+   "js_verdict": "ok",
    "entropy": "3b3ff7ae4b07d5d4592f4d97d06b9da2"
   },
   {
    "input": "\u2008depth zero twist noodle later tuition gorilla trust oak local trash earn\u2008",
    "note": "U+2008 at both ends",
+   "class": "same",
    "verdict": "ok",
+   "js_verdict": "ok",
    "entropy": "3b3ff7ae4b07d5d4592f4d97d06b9da2"
   },
   {
    "input": "depth\u2009zero\u2009twist\u2009noodle\u2009later\u2009tuition\u2009gorilla\u2009trust\u2009oak\u2009local\u2009trash\u2009earn",
    "note": "U+2009 between the words",
+   "class": "same",
    "verdict": "ok",
+   "js_verdict": "ok",
    "entropy": "3b3ff7ae4b07d5d4592f4d97d06b9da2"
   },
   {
    "input": "\u2009depth zero twist noodle later tuition gorilla trust oak local trash earn\u2009",
    "note": "U+2009 at both ends",
+   "class": "same",
    "verdict": "ok",
+   "js_verdict": "ok",
    "entropy": "3b3ff7ae4b07d5d4592f4d97d06b9da2"
   },
   {
    "input": "depth\u200azero\u200atwist\u200anoodle\u200alater\u200atuition\u200agorilla\u200atrust\u200aoak\u200alocal\u200atrash\u200aearn",
    "note": "U+200A between the words",
+   "class": "same",
    "verdict": "ok",
+   "js_verdict": "ok",
    "entropy": "3b3ff7ae4b07d5d4592f4d97d06b9da2"
   },
   {
    "input": "\u200adepth zero twist noodle later tuition gorilla trust oak local trash earn\u200a",
    "note": "U+200A at both ends",
+   "class": "same",
    "verdict": "ok",
+   "js_verdict": "ok",
    "entropy": "3b3ff7ae4b07d5d4592f4d97d06b9da2"
   },
   {
    "input": "depth\u2028zero\u2028twist\u2028noodle\u2028later\u2028tuition\u2028gorilla\u2028trust\u2028oak\u2028local\u2028trash\u2028earn",
    "note": "U+2028 between the words",
+   "class": "same",
    "verdict": "ok",
+   "js_verdict": "ok",
    "entropy": "3b3ff7ae4b07d5d4592f4d97d06b9da2"
   },
   {
    "input": "\u2028depth zero twist noodle later tuition gorilla trust oak local trash earn\u2028",
    "note": "U+2028 at both ends",
+   "class": "same",
    "verdict": "ok",
+   "js_verdict": "ok",
    "entropy": "3b3ff7ae4b07d5d4592f4d97d06b9da2"
   },
   {
    "input": "depth\u2029zero\u2029twist\u2029noodle\u2029later\u2029tuition\u2029gorilla\u2029trust\u2029oak\u2029local\u2029trash\u2029earn",
    "note": "U+2029 between the words",
+   "class": "same",
    "verdict": "ok",
+   "js_verdict": "ok",
    "entropy": "3b3ff7ae4b07d5d4592f4d97d06b9da2"
   },
   {
    "input": "\u2029depth zero twist noodle later tuition gorilla trust oak local trash earn\u2029",
    "note": "U+2029 at both ends",
+   "class": "same",
    "verdict": "ok",
+   "js_verdict": "ok",
    "entropy": "3b3ff7ae4b07d5d4592f4d97d06b9da2"
   },
   {
    "input": "depth\u202fzero\u202ftwist\u202fnoodle\u202flater\u202ftuition\u202fgorilla\u202ftrust\u202foak\u202flocal\u202ftrash\u202fearn",
    "note": "U+202F between the words",
+   "class": "same",
    "verdict": "ok",
+   "js_verdict": "ok",
    "entropy": "3b3ff7ae4b07d5d4592f4d97d06b9da2"
   },
   {
    "input": "\u202fdepth zero twist noodle later tuition gorilla trust oak local trash earn\u202f",
    "note": "U+202F at both ends",
+   "class": "same",
    "verdict": "ok",
+   "js_verdict": "ok",
    "entropy": "3b3ff7ae4b07d5d4592f4d97d06b9da2"
   },
   {
    "input": "depth\u205fzero\u205ftwist\u205fnoodle\u205flater\u205ftuition\u205fgorilla\u205ftrust\u205foak\u205flocal\u205ftrash\u205fearn",
    "note": "U+205F between the words",
+   "class": "same",
    "verdict": "ok",
+   "js_verdict": "ok",
    "entropy": "3b3ff7ae4b07d5d4592f4d97d06b9da2"
   },
   {
    "input": "\u205fdepth zero twist noodle later tuition gorilla trust oak local trash earn\u205f",
    "note": "U+205F at both ends",
+   "class": "same",
    "verdict": "ok",
+   "js_verdict": "ok",
    "entropy": "3b3ff7ae4b07d5d4592f4d97d06b9da2"
   },
   {
    "input": "depth\u3000zero\u3000twist\u3000noodle\u3000later\u3000tuition\u3000gorilla\u3000trust\u3000oak\u3000local\u3000trash\u3000earn",
    "note": "U+3000 between the words",
+   "class": "same",
    "verdict": "ok",
+   "js_verdict": "ok",
    "entropy": "3b3ff7ae4b07d5d4592f4d97d06b9da2"
   },
   {
    "input": "\u3000depth zero twist noodle later tuition gorilla trust oak local trash earn\u3000",
    "note": "U+3000 at both ends",
+   "class": "same",
    "verdict": "ok",
+   "js_verdict": "ok",
    "entropy": "3b3ff7ae4b07d5d4592f4d97d06b9da2"
   },
   {
    "input": "depth\ufeffzero\ufefftwist\ufeffnoodle\ufefflater\ufefftuition\ufeffgorilla\ufefftrust\ufeffoak\ufefflocal\ufefftrash\ufeffearn",
    "note": "U+FEFF between the words",
+   "class": "same",
    "verdict": "ok",
+   "js_verdict": "ok",
    "entropy": "3b3ff7ae4b07d5d4592f4d97d06b9da2"
   },
   {
    "input": "\ufeffdepth zero twist noodle later tuition gorilla trust oak local trash earn\ufeff",
    "note": "U+FEFF at both ends",
+   "class": "same",
    "verdict": "ok",
+   "js_verdict": "ok",
    "entropy": "3b3ff7ae4b07d5d4592f4d97d06b9da2"
   },
   {
    "input": "depth\u0085zero\u0085twist\u0085noodle\u0085later\u0085tuition\u0085gorilla\u0085trust\u0085oak\u0085local\u0085trash\u0085earn",
    "note": "U+0085 between the words (not white space)",
+   "class": "same",
    "verdict": "length",
+   "js_verdict": "length",
    "entropy": null
   },
   {
    "input": "depth \u0085 zero \u0085 twist \u0085 noodle \u0085 later \u0085 tuition \u0085 gorilla \u0085 trust \u0085 oak \u0085 local \u0085 trash \u0085 earn",
    "note": "U+0085 as a word of its own (not white space)",
+   "class": "same",
    "verdict": "length",
+   "js_verdict": "length",
    "entropy": null
   },
   {
    "input": "depth\u180ezero\u180etwist\u180enoodle\u180elater\u180etuition\u180egorilla\u180etrust\u180eoak\u180elocal\u180etrash\u180eearn",
    "note": "U+180E between the words (not white space)",
+   "class": "same",
    "verdict": "length",
+   "js_verdict": "length",
    "entropy": null
   },
   {
    "input": "depth \u180e zero \u180e twist \u180e noodle \u180e later \u180e tuition \u180e gorilla \u180e trust \u180e oak \u180e local \u180e trash \u180e earn",
    "note": "U+180E as a word of its own (not white space)",
+   "class": "same",
    "verdict": "length",
+   "js_verdict": "length",
    "entropy": null
   },
   {
    "input": "depth\u200bzero\u200btwist\u200bnoodle\u200blater\u200btuition\u200bgorilla\u200btrust\u200boak\u200blocal\u200btrash\u200bearn",
    "note": "U+200B between the words (not white space)",
+   "class": "same",
    "verdict": "length",
+   "js_verdict": "length",
    "entropy": null
   },
   {
    "input": "depth \u200b zero \u200b twist \u200b noodle \u200b later \u200b tuition \u200b gorilla \u200b trust \u200b oak \u200b local \u200b trash \u200b earn",
    "note": "U+200B as a word of its own (not white space)",
+   "class": "same",
    "verdict": "length",
+   "js_verdict": "length",
    "entropy": null
   },
   {
    "input": "depth\u200czero\u200ctwist\u200cnoodle\u200clater\u200ctuition\u200cgorilla\u200ctrust\u200coak\u200clocal\u200ctrash\u200cearn",
    "note": "U+200C between the words (not white space)",
+   "class": "same",
    "verdict": "length",
+   "js_verdict": "length",
    "entropy": null
   },
   {
    "input": "depth \u200c zero \u200c twist \u200c noodle \u200c later \u200c tuition \u200c gorilla \u200c trust \u200c oak \u200c local \u200c trash \u200c earn",
    "note": "U+200C as a word of its own (not white space)",
+   "class": "same",
    "verdict": "length",
+   "js_verdict": "length",
    "entropy": null
   },
   {
    "input": "depth\u200dzero\u200dtwist\u200dnoodle\u200dlater\u200dtuition\u200dgorilla\u200dtrust\u200doak\u200dlocal\u200dtrash\u200dearn",
    "note": "U+200D between the words (not white space)",
+   "class": "same",
    "verdict": "length",
+   "js_verdict": "length",
    "entropy": null
   },
   {
    "input": "depth \u200d zero \u200d twist \u200d noodle \u200d later \u200d tuition \u200d gorilla \u200d trust \u200d oak \u200d local \u200d trash \u200d earn",
    "note": "U+200D as a word of its own (not white space)",
+   "class": "same",
    "verdict": "length",
+   "js_verdict": "length",
    "entropy": null
   },
   {
    "input": "depth\u2060zero\u2060twist\u2060noodle\u2060later\u2060tuition\u2060gorilla\u2060trust\u2060oak\u2060local\u2060trash\u2060earn",
    "note": "U+2060 between the words (not white space)",
+   "class": "same",
    "verdict": "length",
+   "js_verdict": "length",
    "entropy": null
   },
   {
    "input": "depth \u2060 zero \u2060 twist \u2060 noodle \u2060 later \u2060 tuition \u2060 gorilla \u2060 trust \u2060 oak \u2060 local \u2060 trash \u2060 earn",
    "note": "U+2060 as a word of its own (not white space)",
+   "class": "same",
    "verdict": "length",
+   "js_verdict": "length",
    "entropy": null
   },
   {
    "input": "depth\u00adzero\u00adtwist\u00adnoodle\u00adlater\u00adtuition\u00adgorilla\u00adtrust\u00adoak\u00adlocal\u00adtrash\u00adearn",
    "note": "U+00AD between the words (not white space)",
+   "class": "same",
    "verdict": "length",
+   "js_verdict": "length",
    "entropy": null
   },
   {
    "input": "depth \u00ad zero \u00ad twist \u00ad noodle \u00ad later \u00ad tuition \u00ad gorilla \u00ad trust \u00ad oak \u00ad local \u00ad trash \u00ad earn",
    "note": "U+00AD as a word of its own (not white space)",
+   "class": "same",
    "verdict": "length",
+   "js_verdict": "length",
    "entropy": null
   },
   {
    "input": "depth\u001czero\u001ctwist\u001cnoodle\u001clater\u001ctuition\u001cgorilla\u001ctrust\u001coak\u001clocal\u001ctrash\u001cearn",
    "note": "U+001C between the words (not white space)",
+   "class": "same",
    "verdict": "length",
+   "js_verdict": "length",
    "entropy": null
   },
   {
    "input": "depth \u001c zero \u001c twist \u001c noodle \u001c later \u001c tuition \u001c gorilla \u001c trust \u001c oak \u001c local \u001c trash \u001c earn",
    "note": "U+001C as a word of its own (not white space)",
+   "class": "same",
    "verdict": "length",
+   "js_verdict": "length",
    "entropy": null
   },
   {
    "input": "depth\u001dzero\u001dtwist\u001dnoodle\u001dlater\u001dtuition\u001dgorilla\u001dtrust\u001doak\u001dlocal\u001dtrash\u001dearn",
    "note": "U+001D between the words (not white space)",
+   "class": "same",
    "verdict": "length",
+   "js_verdict": "length",
    "entropy": null
   },
   {
    "input": "depth \u001d zero \u001d twist \u001d noodle \u001d later \u001d tuition \u001d gorilla \u001d trust \u001d oak \u001d local \u001d trash \u001d earn",
    "note": "U+001D as a word of its own (not white space)",
+   "class": "same",
    "verdict": "length",
+   "js_verdict": "length",
    "entropy": null
   },
   {
    "input": "depth\u001ezero\u001etwist\u001enoodle\u001elater\u001etuition\u001egorilla\u001etrust\u001eoak\u001elocal\u001etrash\u001eearn",
    "note": "U+001E between the words (not white space)",
+   "class": "same",
    "verdict": "length",
+   "js_verdict": "length",
    "entropy": null
   },
   {
    "input": "depth \u001e zero \u001e twist \u001e noodle \u001e later \u001e tuition \u001e gorilla \u001e trust \u001e oak \u001e local \u001e trash \u001e earn",
    "note": "U+001E as a word of its own (not white space)",
+   "class": "same",
    "verdict": "length",
+   "js_verdict": "length",
    "entropy": null
   },
   {
    "input": "depth\u001fzero\u001ftwist\u001fnoodle\u001flater\u001ftuition\u001fgorilla\u001ftrust\u001foak\u001flocal\u001ftrash\u001fearn",
    "note": "U+001F between the words (not white space)",
+   "class": "same",
    "verdict": "length",
+   "js_verdict": "length",
    "entropy": null
   },
   {
    "input": "depth \u001f zero \u001f twist \u001f noodle \u001f later \u001f tuition \u001f gorilla \u001f trust \u001f oak \u001f local \u001f trash \u001f earn",
    "note": "U+001F as a word of its own (not white space)",
+   "class": "same",
    "verdict": "length",
+   "js_verdict": "length",
    "entropy": null
   },
   {
    "input": "depth\u007fzero\u007ftwist\u007fnoodle\u007flater\u007ftuition\u007fgorilla\u007ftrust\u007foak\u007flocal\u007ftrash\u007fearn",
    "note": "U+007F between the words (not white space)",
+   "class": "same",
    "verdict": "length",
+   "js_verdict": "length",
    "entropy": null
   },
   {
    "input": "depth \u007f zero \u007f twist \u007f noodle \u007f later \u007f tuition \u007f gorilla \u007f trust \u007f oak \u007f local \u007f trash \u007f earn",
    "note": "U+007F as a word of its own (not white space)",
+   "class": "same",
    "verdict": "length",
+   "js_verdict": "length",
    "entropy": null
   },
   {
    "input": "depth\u0000zero\u0000twist\u0000noodle\u0000later\u0000tuition\u0000gorilla\u0000trust\u0000oak\u0000local\u0000trash\u0000earn",
    "note": "U+0000 between the words (not white space)",
+   "class": "same",
    "verdict": "length",
+   "js_verdict": "length",
    "entropy": null
   },
   {
    "input": "depth \u0000 zero \u0000 twist \u0000 noodle \u0000 later \u0000 tuition \u0000 gorilla \u0000 trust \u0000 oak \u0000 local \u0000 trash \u0000 earn",
    "note": "U+0000 as a word of its own (not white space)",
+   "class": "same",
    "verdict": "length",
+   "js_verdict": "length",
    "entropy": null
   },
   {
    "input": "depth\u2063zero\u2063twist\u2063noodle\u2063later\u2063tuition\u2063gorilla\u2063trust\u2063oak\u2063local\u2063trash\u2063earn",
    "note": "U+2063 between the words (not white space)",
+   "class": "same",
    "verdict": "length",
+   "js_verdict": "length",
    "entropy": null
   },
   {
    "input": "depth \u2063 zero \u2063 twist \u2063 noodle \u2063 later \u2063 tuition \u2063 gorilla \u2063 trust \u2063 oak \u2063 local \u2063 trash \u2063 earn",
    "note": "U+2063 as a word of its own (not white space)",
+   "class": "same",
    "verdict": "length",
+   "js_verdict": "length",
    "entropy": null
   },
   {
    "input": "depth\u3164zero\u3164twist\u3164noodle\u3164later\u3164tuition\u3164gorilla\u3164trust\u3164oak\u3164local\u3164trash\u3164earn",
    "note": "U+3164 between the words (not white space)",
+   "class": "same",
    "verdict": "length",
+   "js_verdict": "length",
    "entropy": null
   },
   {
    "input": "depth \u3164 zero \u3164 twist \u3164 noodle \u3164 later \u3164 tuition \u3164 gorilla \u3164 trust \u3164 oak \u3164 local \u3164 trash \u3164 earn",
    "note": "U+3164 as a word of its own (not white space)",
+   "class": "same",
    "verdict": "length",
+   "js_verdict": "length",
    "entropy": null
   },
   {
    "input": "depth zero twist noodle later tuition gorilla trust oak local trash earn                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                        ",
    "note": "exactly 1024 bytes",
+   "class": "same",
    "verdict": "ok",
+   "js_verdict": "ok",
    "entropy": "3b3ff7ae4b07d5d4592f4d97d06b9da2"
   },
   {
    "input": "depth zero twist noodle later tuition gorilla trust oak local trash earn                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                         ",
-   "note": "1025 bytes",
+   "note": "1025 bytes: the browser code reads it, this decoder does not",
+   "class": "stricter",
    "verdict": "length",
+   "js_verdict": "ok",
+   "entropy": null
+  },
+  {
+   "input": "depth zero twist noodle later tuition gorilla trust oak local trash earn                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                        ",
+   "note": "5,000 bytes of white space after a good phrase",
+   "class": "stricter",
+   "verdict": "length",
+   "js_verdict": "ok",
+   "entropy": null
+  },
+  {
+   "input": "                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                        depth zero twist noodle later tuition gorilla trust oak local trash earn                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                        ",
+   "note": "a good phrase between two runs of white space that together pass the cap",
+   "class": "stricter",
+   "verdict": "length",
+   "js_verdict": "ok",
+   "entropy": null
+  },
+  {
+   "input": "depth zero twist noodle later tuition gorilla trust oak local trash abouu                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                            ",
+   "note": "an unknown word, and over the cap: JavaScript says word, this says length",
+   "class": "stricter",
+   "verdict": "length",
+   "js_verdict": "word",
+   "entropy": null
+  },
+  {
+   "input": "depth\u3000zero\u3000twist\u3000noodle\u3000later\u3000tuition\u3000gorilla\u3000trust\u3000oak\u3000local\u3000trash\u3000earn",
+   "note": "ideographic spaces, under the cap",
+   "class": "same",
+   "verdict": "ok",
+   "js_verdict": "ok",
+   "entropy": "3b3ff7ae4b07d5d4592f4d97d06b9da2"
+  },
+  {
+   "input": "depth\u3000zero\u3000twist\u3000noodle\u3000later\u3000tuition\u3000gorilla\u3000trust\u3000oak\u3000local\u3000trash\u3000earn\u3000\u3000\u3000\u3000\u3000\u3000\u3000\u3000\u3000\u3000\u3000\u3000\u3000\u3000\u3000\u3000\u3000\u3000\u3000\u3000\u3000\u3000\u3000\u3000\u3000\u3000\u3000\u3000\u3000\u3000\u3000\u3000\u3000\u3000\u3000\u3000\u3000\u3000\u3000\u3000\u3000\u3000\u3000\u3000\u3000\u3000\u3000\u3000\u3000\u3000\u3000\u3000\u3000\u3000\u3000\u3000\u3000\u3000\u3000\u3000\u3000\u3000\u3000\u3000\u3000\u3000\u3000\u3000\u3000\u3000\u3000\u3000\u3000\u3000\u3000\u3000\u3000\u3000\u3000\u3000\u3000\u3000\u3000\u3000\u3000\u3000\u3000\u3000\u3000\u3000\u3000\u3000\u3000\u3000\u3000\u3000\u3000\u3000\u3000\u3000\u3000\u3000\u3000\u3000\u3000\u3000\u3000\u3000\u3000\u3000\u3000\u3000\u3000\u3000\u3000\u3000\u3000\u3000\u3000\u3000\u3000\u3000\u3000\u3000\u3000\u3000\u3000\u3000\u3000\u3000\u3000\u3000\u3000\u3000\u3000\u3000\u3000\u3000\u3000\u3000\u3000\u3000\u3000\u3000\u3000\u3000\u3000\u3000\u3000\u3000\u3000\u3000\u3000\u3000\u3000\u3000\u3000\u3000\u3000\u3000\u3000\u3000\u3000\u3000\u3000\u3000\u3000\u3000\u3000\u3000\u3000\u3000\u3000\u3000\u3000\u3000\u3000\u3000\u3000\u3000\u3000\u3000\u3000\u3000\u3000\u3000\u3000\u3000\u3000\u3000\u3000\u3000\u3000\u3000\u3000\u3000\u3000\u3000\u3000\u3000\u3000\u3000\u3000\u3000\u3000\u3000\u3000\u3000\u3000\u3000\u3000\u3000\u3000\u3000\u3000\u3000\u3000\u3000\u3000\u3000\u3000\u3000\u3000\u3000\u3000\u3000\u3000\u3000\u3000\u3000\u3000\u3000\u3000\u3000\u3000\u3000\u3000\u3000\u3000\u3000\u3000\u3000\u3000\u3000\u3000\u3000\u3000\u3000\u3000\u3000\u3000\u3000\u3000\u3000\u3000\u3000\u3000\u3000\u3000\u3000\u3000\u3000\u3000\u3000\u3000\u3000\u3000\u3000\u3000\u3000\u3000\u3000\u3000\u3000\u3000\u3000\u3000\u3000\u3000\u3000\u3000\u3000\u3000\u3000\u3000\u3000\u3000\u3000\u3000\u3000\u3000\u3000\u3000\u3000\u3000\u3000\u3000\u3000\u3000\u3000\u3000\u3000\u3000\u3000\u3000\u3000\u3000\u3000\u3000\u3000\u3000\u3000\u3000\u3000\u3000\u3000\u3000\u3000\u3000\u3000",
+   "note": "ideographic spaces: 320 more make it over the cap in bytes (3 each) and under it in characters",
+   "class": "stricter",
+   "verdict": "length",
+   "js_verdict": "ok",
    "entropy": null
   }
  ]

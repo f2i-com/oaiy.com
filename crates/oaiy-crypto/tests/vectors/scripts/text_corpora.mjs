@@ -9,7 +9,8 @@
 //      `decodeRecoveryKey` and the vault's browser code split and strip on, and what the Rust decoders must mean by "white space".
 //   2. `kit`: inputs for the FLRK1 decoder with the verdict of a verbatim port of FormLogic's `decodeRecoveryKey` (formlogic/ui/src/lib/crypto/vault.ts and
 //      encoding.ts; only `sodium.crypto_hash_sha256` is node's sha256, and the exceptions are values instead of throws).
-//   3. `phrase`: inputs for the twelve-word decoder with the verdict of a port of design 4.3 written the way the browser will write it: NFKD, lower case, split
+//   3. `phrase`: inputs for the twelve-word decoder with the verdict of a port of design 4.3 written the way the browser will write it (and `js_verdict`, the same code without the
+//      1024-byte cap, which only the Rust decoder and design 4.3 have: where they differ the entry is class `stricter`): NFKD, lower case, split
 //      on /\s+/, exactly 12 words, every word in the list, the checksum (the word list is src/bip39_english.txt).
 //
 // Each kit entry has a `class`: what kind of difference it is meant to show. `same`: the Rust decoder must give exactly the verdict and the key that JavaScript gives.
@@ -221,8 +222,10 @@ function phraseOf(entropy) {
   for (let i = 0; i < 12; i++) out.push(words[parseInt(bits.slice(i * 11, i * 11 + 11), 2)]);
   return out;
 }
-function decodePhrase(input) {
-  if (Buffer.byteLength(input) > 1024) return { verdict: 'length' };
+// `cap`: the 1024-byte limit that the Rust decoder (and design 4.3) has and that the browser's pure code does not. With `cap` false this is the browser's code as it stands.
+const PHRASE_CAP = 1024;
+function decodePhrase(input, cap = true) {
+  if (cap && Buffer.byteLength(input) > PHRASE_CAP) return { verdict: 'length' };
   const list = input.normalize('NFKD').toLowerCase().split(/\s+/).filter((w) => w.length > 0);
   if (list.length !== 12) return { verdict: 'length' };
   let bits = '';
@@ -237,9 +240,14 @@ function decodePhrase(input) {
   return { verdict: 'ok', entropy: hex(entropy) };
 }
 const phrase = [];
+// `verdict` is what the Rust decoder must say (design 4.3, with the byte cap); `js_verdict` is what the browser's pure code says without it. They differ only above the cap:
+// such an entry is class `stricter` (the Rust decoder refuses what the browser would read, or says `length` where the browser says something else), every other is `same`.
 const addPhrase = (input, note) => {
   const v = decodePhrase(input);
-  phrase.push({ input, note, verdict: v.verdict, entropy: v.entropy ?? null });
+  const pure = decodePhrase(input, false);
+  const cls = v.verdict === pure.verdict ? 'same' : 'stricter';
+  if (cls === 'stricter' && Buffer.byteLength(input) <= PHRASE_CAP) throw new Error(`a difference below the cap: ${note}`);
+  phrase.push({ input, note, class: cls, verdict: v.verdict, js_verdict: pure.verdict, entropy: v.entropy ?? null });
 };
 const entropies = [new Uint8Array(16), new Uint8Array(16).fill(0x7f), new Uint8Array(16).fill(0xff), bytes(16), bytes(16), bytes(16)];
 for (const e of entropies) {
@@ -276,7 +284,12 @@ for (const cp of [0x85, 0x180e, 0x200b, 0x200c, 0x200d, 0x2060, 0x00ad, 0x1c, 0x
 // the input cap: 1024 bytes
 const p = phraseFirst.join(' ');
 addPhrase(p + ' '.repeat(1024 - Buffer.byteLength(p)), 'exactly 1024 bytes');
-addPhrase(p + ' '.repeat(1025 - Buffer.byteLength(p)), '1025 bytes');
+addPhrase(p + ' '.repeat(1025 - Buffer.byteLength(p)), '1025 bytes: the browser code reads it, this decoder does not');
+addPhrase(p + ' '.repeat(5000), '5,000 bytes of white space after a good phrase');
+addPhrase(`${' '.repeat(600)}${p}${' '.repeat(600)}`, 'a good phrase between two runs of white space that together pass the cap');
+addPhrase([...phraseFirst.slice(0, 11), 'abouu'].join(' ') + ' '.repeat(1100), 'an unknown word, and over the cap: JavaScript says word, this says length');
+addPhrase(phraseFirst.join('\u3000').repeat(1), 'ideographic spaces, under the cap');
+addPhrase(phraseFirst.join('\u3000') + '\u3000'.repeat(320), 'ideographic spaces: 320 more make it over the cap in bytes (3 each) and under it in characters');
 
 // ASCII only (every character above U+007E is written as a \u escape, so no editor or shell can change a byte of it)
 const text =

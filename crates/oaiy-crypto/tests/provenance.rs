@@ -38,10 +38,10 @@ const FILES: &[(&str, &str, &[u8])] = &[
         "58950f8861a1d11666c60817cd100dd77c58d3e8148921a7fa6aa59ae23f1fc4",
         include_bytes!("vectors/scripts/extract_public.py"),
     ),
-    ("text-corpus.json", "458493045d770ac28cca1b969a75f489f16baf31b3941096d90a1ebecd5690f9", include_bytes!("vectors/text-corpus.json")),
+    ("text-corpus.json", "e9e80980ae8bbe44cc8307f45df3f3a97407ef684fd358e09bcac4d045beb5ee", include_bytes!("vectors/text-corpus.json")),
     (
         "scripts/text_corpora.mjs",
-        "56605ec3c094b945aa900268176e47e1ae03fb73a770f870edf47c67a3ccdea5",
+        "9f12c26ce0263d0459ca4dcd508eb64f7e9a36cf18d2aecf6f9dae817ce1fa33",
         include_bytes!("vectors/scripts/text_corpora.mjs"),
     ),
     ("scripts/gen_corpus.py", "185279f152bfb2c55e9ca5de1da99b2b4aa07871686953b6f2f3bf394a4ce0dc", include_bytes!("vectors/scripts/gen_corpus.py")),
