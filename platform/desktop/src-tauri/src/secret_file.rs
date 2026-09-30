@@ -200,9 +200,44 @@ fn utf16(body: &[u8], unit: fn([u8; 2]) -> u16) -> Result<String, String> {
     String::from_utf16(&units).map_err(|_| "not valid UTF-16".into())
 }
 
-/// How many names a file is put aside under (`x.corrupt`, `x.corrupt.1`, ...): one that has so many already is not
-/// one to keep adding to.
+/// How many names a file is put aside under (`x.corrupt`, `x.corrupt.1`, ...): when they are all taken the oldest copies are let go (see
+/// [`make_room_aside`]), so that a bad file is never refused a place for want of one.
 const ASIDE_NAMES: u32 = 32;
+/// How many of the oldest copies are let go at once when every name is taken (the first, `x.corrupt`, never is): a batch, so that this is not done for each.
+const ASIDE_LET_GO: u32 = 8;
+
+fn aside_name(name: &str, n: u32) -> String {
+    if n == 0 {
+        format!("{name}.corrupt")
+    } else {
+        format!("{name}.corrupt.{n}")
+    }
+}
+
+/// Every name is taken: let the oldest copies go, and renumber the rest down so that the numbers still rise with age and the newest is the last. The
+/// first copy (`x.corrupt`) is never let go, since it is the earliest evidence of what went wrong, and the newest ones are kept. An error if one
+/// that must go cannot be removed.
+fn make_room_aside(path: &Path, name: &str) -> io::Result<()> {
+    let at = |n: u32| path.with_file_name(aside_name(name, n));
+    for n in 1..=ASIDE_LET_GO {
+        match std::fs::remove_file(at(n)) {
+            Ok(()) => {}
+            Err(e) if e.kind() == io::ErrorKind::NotFound => {}
+            Err(e) => return Err(e),
+        }
+    }
+    let mut next = 1;
+    for n in (ASIDE_LET_GO + 1)..ASIDE_NAMES {
+        if std::fs::symlink_metadata(at(n)).is_err() {
+            continue;
+        }
+        if n != next {
+            std::fs::rename(at(n), at(next))?;
+        }
+        next += 1;
+    }
+    Ok(())
+}
 
 /// Put the file at `path` aside as `<name>.corrupt` (`.corrupt.1`, `.corrupt.2` ... when that is taken: an earlier bad
 /// file is never replaced by a later one), so that what is in it is kept while the store starts a new file at `path`.
@@ -215,21 +250,23 @@ pub fn keep_aside(path: &Path) -> io::Result<PathBuf> {
         .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, format!("{} has no file name", path.display())))?
         .to_string_lossy()
         .into_owned();
-    for n in 0..ASIDE_NAMES {
-        let aside = path.with_file_name(if n == 0 { format!("{name}.corrupt") } else { format!("{name}.corrupt.{n}") });
-        // `rename` replaces what is there on every platform: a name in use is passed over, not replaced.
-        if std::fs::symlink_metadata(&aside).is_ok() {
-            continue;
+    let free = || (0..ASIDE_NAMES).map(|n| path.with_file_name(aside_name(&name, n))).find(|aside| std::fs::symlink_metadata(aside).is_err());
+    // `rename` replaces what is there on every platform: a name in use is passed over, not replaced.
+    let aside = match free() {
+        Some(aside) => aside,
+        // Every name is taken: the oldest copies are let go, so that this one has a place (or, if they cannot be, it is left where it is).
+        None => {
+            make_room_aside(path, &name).map_err(|e| io::Error::new(e.kind(), format!("{ASIDE_NAMES} files kept aside as {name}.corrupt are there already, and the oldest could not be let go: {e}")))?;
+            free().ok_or_else(|| io::Error::new(io::ErrorKind::AlreadyExists, format!("{ASIDE_NAMES} files kept aside as {name}.corrupt are there already")))?
         }
-        return match std::fs::rename(path, &aside) {
-            Ok(()) => Ok(aside),
-            Err(rename_failed) => match std::fs::copy(path, &aside) {
-                Ok(_) => Ok(aside),
-                Err(_) => Err(rename_failed),
-            },
-        };
+    };
+    match std::fs::rename(path, &aside) {
+        Ok(()) => Ok(aside),
+        Err(rename_failed) => match std::fs::copy(path, &aside) {
+            Ok(_) => Ok(aside),
+            Err(_) => Err(rename_failed),
+        },
     }
-    Err(io::Error::new(io::ErrorKind::AlreadyExists, format!("{ASIDE_NAMES} files kept aside as {name}.corrupt are there already")))
 }
 
 /// Make `dir`, and any of its parents that are missing, for a secret to live in: owner-only (unix
@@ -684,19 +721,47 @@ mod tests {
     }
 
     #[test]
-    fn a_file_with_every_name_to_be_put_aside_under_taken_is_left_where_it_is_and_says_so() {
+    fn a_file_with_every_name_to_be_put_aside_under_taken_is_left_where_it_is_when_the_oldest_cannot_be_let_go() {
         let dir = TempDir::new("aside-full");
         let path = dir.0.join("messages.json");
         std::fs::write(&path, "the only copy").unwrap();
         std::fs::create_dir(dir.0.join("messages.json.corrupt")).unwrap();
+        // The names are taken by folders that are not empty: nothing can be removed to make room, and nothing is replaced.
         for n in 1..ASIDE_NAMES {
-            std::fs::write(dir.0.join(format!("messages.json.corrupt.{n}")), "an earlier one").unwrap();
+            let taken = dir.0.join(format!("messages.json.corrupt.{n}"));
+            std::fs::create_dir(&taken).unwrap();
+            std::fs::write(taken.join("in it"), "an earlier one").unwrap();
         }
         let err = keep_aside(&path).unwrap_err();
-        assert_eq!(err.kind(), io::ErrorKind::AlreadyExists, "{err}");
+        assert!(err.to_string().contains("could not be let go"), "{err}");
         assert_eq!(std::fs::read_to_string(&path).unwrap(), "the only copy");
-        assert_eq!(std::fs::read_to_string(dir.0.join("messages.json.corrupt.1")).unwrap(), "an earlier one", "none was replaced");
+        assert_eq!(std::fs::read_to_string(dir.0.join("messages.json.corrupt.1").join("in it")).unwrap(), "an earlier one", "none was replaced");
         assert!(keep_aside(Path::new("/")).is_err(), "no file name, no name to keep it under");
+    }
+
+    /// A file that keeps going bad is never refused a place for want of a name: once they are all taken the oldest copies are let go, the first is
+    /// kept, the newest is the last, and the numbers still rise with age.
+    #[test]
+    fn a_file_put_aside_again_and_again_is_never_refused_and_the_first_and_the_newest_copies_are_kept() {
+        let dir = TempDir::new("aside-many");
+        let path = dir.0.join("messages.json");
+        let named = |n: u32| dir.0.join(aside_name("messages.json", n));
+        let mut last = PathBuf::new();
+        for i in 0..100 {
+            std::fs::write(&path, format!("copy {i}")).unwrap();
+            last = keep_aside(&path).unwrap_or_else(|e| panic!("copy {i} was refused: {e}"));
+            assert!(!path.exists(), "the file has moved");
+            if i + 1 <= ASIDE_NAMES as usize {
+                assert!((0..=i as u32).all(|n| named(n).exists()), "nothing is let go before every name is taken (copy {i})");
+            }
+        }
+        let kept: Vec<u32> = (0..ASIDE_NAMES).filter(|n| named(*n).exists()).collect();
+        assert!(kept.len() <= ASIDE_NAMES as usize && kept.len() >= 20, "{kept:?}");
+        assert_eq!(std::fs::read_to_string(named(0)).unwrap(), "copy 0", "the first is the first");
+        assert_eq!(std::fs::read_to_string(&last).unwrap(), "copy 99", "and the newest is kept");
+        let copies: Vec<u32> = kept.iter().map(|n| std::fs::read_to_string(named(*n)).unwrap().trim_start_matches("copy ").parse().unwrap()).collect();
+        assert!(copies.windows(2).all(|w| w[0] < w[1]), "the numbers rise with age: {copies:?}");
+        assert_eq!(std::fs::read_to_string(named(*kept.last().unwrap())).unwrap(), "copy 99", "the newest has the highest number");
     }
 
     #[test]
