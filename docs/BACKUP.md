@@ -591,7 +591,12 @@ in parts through internal routes with a secret made for that one backup.
   the desktop keeps the copy as plain files). An undo puts back the person's own state without a
   tick, but through the same table: an old campaign is not brought back running, stale callbacks
   and anything the table does not know are not written, and the numbers not to be contacted only
-  grow.
+  grow. **An undo makes the Agent's providers exactly the list they were before the restore**: a
+  restore only ever adds to them and never takes one away, but an undo does, so a provider the
+  restore added (or set beside one of yours) goes again, one whose address the restore changed is
+  put back at its own address without a key, and a key stays only with the provider it was kept
+  for, at the same address. The result names the providers that were taken away. (A copy whose
+  list of providers was empty is read as an empty list.)
 - **The page's secret.** Every request the page makes about a restore carries a secret the
   desktop put in the Agent's window when it started (`backupToken`, different at every start).
   No route returns it. A program or a page that only sets the Agent's `Origin` header therefore

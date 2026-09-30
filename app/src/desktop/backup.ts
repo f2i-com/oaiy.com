@@ -48,7 +48,9 @@
  * What the settings may change is what the person ticked: the desktop leaves them out of
  * the archive otherwise (`apply.keys` still says whether a key may come over). A provider
  * of the backup that points somewhere else than the one kept now never gets the kept key:
- * it arrives beside it, without one.
+ * it arrives beside it, without one. An UNDO is the one exception to "nothing is taken away": the
+ * providers become exactly the list the undo copy holds (the one from before the restore), so a
+ * provider the restore added goes again; a key that is kept stays with its provider, at the same address.
  *
  * What is never exported: an incognito project (it is designed never to leave its
  * folder), a project whose project.json cannot be read (it is skipped, not guessed
@@ -627,6 +629,14 @@ export interface MergeOptions {
   keys?: boolean;
   /** Where to say what was kept or set apart. */
   notes?: string[];
+  /**
+   * An undo: the providers become exactly the list of the backup (which is the undo copy, made before the restore that is
+   * being undone), so a provider that restore added goes again, and one that is not in the copy does not stay. A restore
+   * merges and never takes one away; only this does. A key that is kept stays with its provider only at the same address, and
+   * the copy holds none. (A copy that holds no providers key is a copy of a list that was empty: the desktop leaves an empty
+   * list out.)
+   */
+  exact?: boolean;
 }
 
 const isObject = (v: unknown): v is Record<string, unknown> => !!v && typeof v === 'object' && !Array.isArray(v);
@@ -696,6 +706,25 @@ function pickAgent(v: Record<string, unknown>): Partial<AgentSettings> {
   return out as Partial<AgentSettings>;
 }
 
+/** The providers of an undo: exactly the list of the copy, in its order. Says which of the ones here it took away. */
+function exactProviders(current: readonly ProviderConfig[], incoming: unknown, notes: string[]): ProviderConfig[] {
+  const out: ProviderConfig[] = [];
+  const seen = new Set<string>();
+  for (const raw of Array.isArray(incoming) ? incoming : []) {
+    const theirs = pickProvider(raw);
+    if (!theirs || seen.has(theirs.id)) continue;
+    seen.add(theirs.id);
+    const kept = current.find((p) => p.id === theirs.id);
+    out.push({ ...theirs, apiKey: kept && sameEndpoint(kept, theirs) ? kept.apiKey : '' });
+  }
+  const gone = current.filter((p) => !seen.has(p.id));
+  if (gone.length) {
+    const named = gone.slice(0, 10).map((p) => `“${clip(p.name || p.id)}”`);
+    notes.push(`${gone.length === 1 ? 'A provider that was' : `${gone.length} providers that were`} not there before the restore ${gone.length === 1 ? 'was' : 'were'} taken away: ${named.join(', ')}${gone.length > named.length ? ` and ${gone.length - named.length} more` : ''}.`);
+  }
+  return out;
+}
+
 /**
  * What a restore does with the settings the desktop let through. What is applied is only what this page has a
  * setting for, of the right kind (a key that is not a setting, or a value that is not one, is not carried in), and
@@ -711,8 +740,9 @@ function pickAgent(v: Record<string, unknown>): Partial<AgentSettings> {
 export function mergeSettings(current: Settings, backup: Partial<BackupSettings>, _blocked: ReadonlySet<string>, options: MergeOptions = {}): BackupSettings {
   const keys = options.keys === true;
   const notes = options.notes ?? [];
-  const providers: ProviderConfig[] = current.providers.map((p) => ({ ...p }));
-  for (const incoming of Array.isArray(backup.providers) ? backup.providers : []) {
+  const exact = options.exact === true;
+  const providers: ProviderConfig[] = exact ? exactProviders(current.providers, backup.providers, notes) : current.providers.map((p) => ({ ...p }));
+  for (const incoming of exact ? [] : Array.isArray(backup.providers) ? backup.providers : []) {
     const theirs = pickProvider(incoming);
     if (!theirs) continue;
     const backupKey = keys ? theirs.apiKey : '';
@@ -757,9 +787,11 @@ export function mergeSettings(current: Settings, backup: Partial<BackupSettings>
       media = { ...current.media, ...safe };
     }
   }
+  const named = typeof backup.activeProviderId === 'string' && providers.some((p) => p.id === backup.activeProviderId) ? backup.activeProviderId : current.activeProviderId;
   return {
     providers,
-    activeProviderId: typeof backup.activeProviderId === 'string' && providers.some((p) => p.id === backup.activeProviderId) ? backup.activeProviderId : current.activeProviderId,
+    // (An undo that took the active provider away leaves the first one that is left.)
+    activeProviderId: exact && !providers.some((p) => p.id === named) ? (providers[0]?.id ?? null) : named,
     gate: isObject(backup.gate) ? { ...current.gate, ...pickGate(backup.gate) } : current.gate,
     lastProjectId: current.lastProjectId,
     lastKeptProjectId: current.lastKeptProjectId,
@@ -1159,7 +1191,7 @@ async function doImport(desktop: DesktopRef, token: string, storage: AgentStorag
       const parsed: unknown = JSON.parse(new TextDecoder().decode(raw));
       if (!isObject(parsed)) throw new Error('it is not a settings file');
       const blockedIds = new Set(blocked.keys());
-      await storage.writeSettings(mergeSettings(await storage.readSettings(), parsed as Partial<BackupSettings>, blockedIds, { keys: pending.apply.keys, notes: warnings }));
+      await storage.writeSettings(mergeSettings(await storage.readSettings(), parsed as Partial<BackupSettings>, blockedIds, { keys: pending.apply.keys, notes: warnings, exact: pending.kind === 'undo' }));
       applied.settings = true;
     } catch (e) {
       failed++;

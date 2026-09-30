@@ -3479,6 +3479,28 @@ fn an_undo_never_resurrects_a_running_campaign_or_callbacks_and_never_shrinks_th
     assert_eq!(restored["state"], "paused", "never running");
 }
 
+/// The page puts the providers back to exactly the list of the undo copy, and treats a copy without a `providers` key as a copy
+/// of an empty list (see `mergeSettings` with `exact`). That holds only if the desktop hands over the settings of an undo whose
+/// list of providers was empty (it leaves an empty list out) and still names the settings, so that the page acts on them.
+#[test]
+fn an_undo_hands_the_page_the_settings_of_a_copy_that_had_no_providers() {
+    let src = TempDir::new("undo-empty-src");
+    let out = TempDir::new("undo-empty-out");
+    let file = backup_with_agent(&src.0, &out.0, "e.oaiybackup", agent_archive(&[("opfs/projects/p1/chat.json", b"[]")]), false);
+    let dst = TempDir::new("undo-empty-dst");
+    restore::stage(&dst.0, &file, PASS, &Ticks::all(), &options()).unwrap();
+    assert!(matches!(restore::apply_pending(&dst.0), ApplyOutcome::Applied(_)));
+    let before = serde_json::json!({ "providers": [], "gate": { "mode": "allowlist", "allow": ["api.example.com"] }, "activeProviderId": null });
+    page_takes_import(&dst.0, &agent_archive(&[("idb/settings.json", before.to_string().as_bytes())]), &[]);
+    restore::stage_undo(&dst.0, &options()).unwrap();
+    assert!(matches!(restore::apply_pending(&dst.0), ApplyOutcome::Applied(_)));
+    let handed = handed_over(&dst.0);
+    assert_eq!(zip_items(&handed).get("idb/settings.json").map(String::as_str), Some("settings"), "the settings are named, so the page acts on them");
+    let settings: serde_json::Value = serde_json::from_slice(&zip_entries(&handed)["idb/settings.json"]).unwrap();
+    assert!(settings.get("providers").is_none(), "an empty list is left out, and the page reads that as an empty list: {settings}");
+    assert_eq!(settings["gate"]["mode"], "allowlist");
+}
+
 #[test]
 fn a_second_try_at_the_undo_copy_never_replaces_the_first() {
     let src = TempDir::new("agent-twice-src");

@@ -787,7 +787,8 @@ describe('undo and redo say what they really do', () => {
     expect(asked).toHaveLength(1);
     expect(asked[0]).toBe(undoConfirmText('restore'));
     expect(asked[0]).toContain('puts back the files the last restore replaced and REMOVES the files it added');
-    expect(asked[0]).toContain('including anything you changed or added in them since');
+    expect(asked[0]).toContain('any provider the restore added is taken away');
+    expect(asked[0]).toContain('anything you changed or added in them since');
     expect(asked[0]).toContain('saved first');
     expect(asked[0]).toContain('Redo');
     expect(h.undo).not.toHaveBeenCalled();

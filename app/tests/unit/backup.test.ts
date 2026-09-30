@@ -1008,6 +1008,98 @@ describe('a restore never redirects a kept key or changes what OAIY may do witho
     expect(mergeSettings(current, backup, new Set()).providers.map((p) => p.apiKey)).toEqual(['sk-kept-same', '', '']);
   });
 
+  describe('an undo puts the providers back to exactly what they were before the restore', () => {
+    const before = [
+      { id: 'openai', type: 'openai' as const, name: 'OpenAI', apiKey: '', baseUrl: 'https://api.openai.com/v1', modelId: 'model-a' },
+      { id: 'mine', type: 'custom' as const, name: 'Mine', apiKey: '', baseUrl: 'https://mine.example/v1' },
+    ];
+    /** What the settings hold after the restore: it added two providers and the address of one changed. */
+    const after = () =>
+      settings({
+        providers: [
+          { id: 'openai', type: 'openai', name: 'OpenAI', apiKey: LOCAL_KEY, baseUrl: 'https://api.openai.com/v1', modelId: 'model-a' },
+          { id: 'mine', type: 'custom', name: 'Mine', apiKey: 'sk-mine', baseUrl: 'https://elsewhere.example/v1' },
+          { id: 'added', type: 'anthropic', name: 'Added', apiKey: 'sk-added' },
+          { id: 'openai-from-backup', type: 'openai', name: 'OpenAI (from backup)', apiKey: '', baseUrl: 'https://attacker.example/v1' },
+        ],
+        activeProviderId: 'added',
+      });
+
+    it('takes away the providers the restore added, in the order of the copy, and keeps a key only at its own address', () => {
+      const notes: string[] = [];
+      const undone = mergeSettings(after(), { providers: before, activeProviderId: 'openai' }, new Set(), { exact: true, notes });
+      expect(undone.providers.map((p) => [p.id, p.apiKey, p.baseUrl])).toEqual([
+        ['openai', LOCAL_KEY, 'https://api.openai.com/v1'],
+        ['mine', '', 'https://mine.example/v1'],
+      ]);
+      expect(undone.providers[0]).toMatchObject({ name: 'OpenAI', modelId: 'model-a' });
+      expect(undone.activeProviderId).toBe('openai');
+      expect(notes.join(' ')).toContain('2 providers that were not there before the restore were taken away: “Added”, “OpenAI (from backup)”.');
+      // A restore itself never takes one away: the same copy, merged as a restore, leaves what is here.
+      const merged = mergeSettings(after(), { providers: before, activeProviderId: 'openai' }, new Set());
+      expect(merged.providers.map((p) => p.id)).toEqual(['openai', 'mine', 'added', 'openai-from-backup', 'mine-from-backup']);
+    });
+
+    it('reads a copy without a providers key as a copy of an empty list, and names the active provider that is left', () => {
+      const emptied = mergeSettings(after(), { gate: { mode: 'open', allow: [], deny: [] } }, new Set(), { exact: true });
+      expect(emptied.providers).toEqual([]);
+      expect(emptied.activeProviderId).toBeNull();
+      // The copy's own active provider is not in its list (or none is named): the first one that is left.
+      const first = mergeSettings(after(), { providers: before, activeProviderId: 'gone' }, new Set(), { exact: true });
+      expect(first.activeProviderId).toBe('openai');
+      const named = mergeSettings(after(), { providers: before }, new Set(), { exact: true });
+      expect(named.activeProviderId).toBe('openai');
+    });
+
+    it('does not give a key to a provider that is not at the address it was kept for, and drops what it cannot read', () => {
+      const undone = mergeSettings(after(), { providers: [before[1], { id: 'x', type: 'nonsense', name: 'X' }, before[1], 'text', null] as unknown as typeof before }, new Set(), { exact: true });
+      expect(undone.providers.map((p) => [p.id, p.apiKey])).toEqual([['mine', '']]);
+    });
+
+    it('restoring and then undoing leaves the providers as they were (through the page, with the copy it took)', async () => {
+      const target = new FakeStorage();
+      target.settings = local();
+      const beforeRestore = structuredClone(target.settings.providers);
+      const source = new FakeStorage();
+      source.settings = settings({
+        providers: [
+          { id: 'openai', type: 'openai', name: 'OpenAI', apiKey: '', baseUrl: 'https://attacker.example/v1' },
+          { id: 'extra', type: 'anthropic', name: 'Extra', apiKey: '' },
+        ],
+        activeProviderId: 'extra',
+      });
+      const restoring = fakeDesktop(await archiveOf(source, false), { apply: SETTINGS_ONLY });
+      const restored = await applyPendingRestore(DESKTOP, target, { fetch: restoring.fetch });
+      expect(restored!.ok).toBe(true);
+      expect(target.settings.providers.map((p) => p.id)).toEqual(['openai', 'openai-from-backup', 'extra']);
+      // The copy the page took goes back to it as an undo (the desktop hands it back through its table: no keys, and an empty list left out).
+      const copy = unzipSync(joined(restoring.posted.undoParts));
+      const names = Object.keys(copy).filter((n) => n !== RECORD);
+      const undoArchive = zipSync({ [RECORD]: strToU8(JSON.stringify(recordFor(names))), ...Object.fromEntries(names.map((n) => [n, copy[n]])) });
+      const undone = await applyPendingRestore(DESKTOP, target, { fetch: fakeDesktop(undoArchive, { kind: 'undo' }).fetch });
+      expect(undone!.ok).toBe(true);
+      expect(target.settings.providers).toEqual(beforeRestore);
+      expect(target.settings.activeProviderId).toBe('openai');
+      expect(undone!.warnings.join('\n')).toContain('2 providers that were not there before the restore were taken away');
+
+      // The same when there was no provider at all before: the copy has an empty list, which the desktop leaves out.
+      const bare = new FakeStorage();
+      bare.settings = settings({ providers: [], activeProviderId: null });
+      const adding = fakeDesktop(await archiveOf(source, false), { apply: SETTINGS_ONLY });
+      expect((await applyPendingRestore(DESKTOP, bare, { fetch: adding.fetch }))!.ok).toBe(true);
+      expect(bare.settings.providers.map((p) => p.id)).toEqual(['openai', 'extra']);
+      const taken = unzipSync(joined(adding.posted.undoParts));
+      const settingsOfCopy = JSON.parse(dec.decode(taken['idb/settings.json'])) as Record<string, unknown>;
+      if (Array.isArray(settingsOfCopy.providers) && settingsOfCopy.providers.length === 0) delete settingsOfCopy.providers;
+      taken['idb/settings.json'] = strToU8(JSON.stringify(settingsOfCopy));
+      const bareNames = Object.keys(taken).filter((n) => n !== RECORD);
+      const bareUndo = zipSync({ [RECORD]: strToU8(JSON.stringify(recordFor(bareNames))), ...Object.fromEntries(bareNames.map((n) => [n, taken[n]])) });
+      expect((await applyPendingRestore(DESKTOP, bare, { fetch: fakeDesktop(bareUndo, { kind: 'undo' }).fetch }))!.ok).toBe(true);
+      expect(bare.settings.providers).toEqual([]);
+      expect(bare.settings.activeProviderId).toBeNull();
+    });
+  });
+
   it('the image, video and audio service follows the same rule', () => {
     const theirs = { ...EMPTY_MEDIA, baseUrl: 'https://attacker.example/v1', apiKey: 'sk-from-backup', enabled: true };
     const kept = { ...EMPTY_MEDIA, baseUrl: 'http://127.0.0.1:8080/v1', apiKey: MEDIA_KEY };

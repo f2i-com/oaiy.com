@@ -223,7 +223,8 @@ export function undoConfirmText(kind: 'restore' | 'undo' | null): string {
   }
   return (
     'Undo the last restore? This puts back the files the last restore replaced and REMOVES the files it added, ' +
-    'including anything you changed or added in them since. What it replaces or removes is saved first, so you can put it back with Redo. ' +
+    'and it puts the Agent’s AI providers back as they were: any provider the restore added is taken away. ' +
+    'That includes anything you changed or added in them since. What it replaces or removes is saved first, so you can put it back with Redo. ' +
     'It happens when you restart OAIY.'
   );
 }
