@@ -12,8 +12,10 @@
 #
 # The differences from the appendix, decided on purpose and the only ones:
 #   + the four routes the code gained since the design counted them (marked "added since the appendix"):
-#       GET /api/update/status, POST /api/update/check, POST /api/update/agent-flushed
-#       (the updater) and POST /api/plugins/:id/trust (plugin trust);
+#       GET /api/update/status (system.read), POST /api/update/check (services.control: it makes OAIY ask
+#       GitHub for a release, so a monitor's token must not do it), POST /api/update/agent-flushed
+#       (agent.serve) (the updater) and POST /api/plugins/:id/trust (plugins.install), each classified on
+#       purpose in src/auth/routes.rs;
 #   - GET /api/update, the updater design's reserved row: it was built as GET /api/update/status;
 #   - control.project (the change level of POST /api/mcp) and every other /api/relay/* route the relay design
 #     adds are not rows: no route exists for them yet.
@@ -280,6 +282,6 @@ POST /api/vault/kt/:sid/msg scope:vault.kt 2 all
 POST /api/vault/kt/:sid/approve scope:vault.kt 2 all
 POST /api/vault/kt/:sid/cancel scope:vault.kt 2 all
 GET /api/update/status scope:system.read 1 all  # added since the appendix
-POST /api/update/check scope:system.read 1 all  # added since the appendix
+POST /api/update/check scope:services.control 1 all  # added since the appendix
 POST /api/update/agent-flushed scope:agent.serve 1 all  # added since the appendix
 POST /api/plugins/:id/trust scope:plugins.install 1 all  # added since the appendix

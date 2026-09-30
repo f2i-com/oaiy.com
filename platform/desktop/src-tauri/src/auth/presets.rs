@@ -529,8 +529,10 @@ mod tests {
     }
 
     /// The design's coverage numbers (161 routes) plus what the code has gained since: the update
-    /// status and check routes (`system.read`), the Agent's flush acknowledgement (`agent.serve`)
-    /// and the plugin trust route (`plugins.install`).
+    /// status route (`system.read`), the update check (`services.control`: an action that reaches out to
+    /// GitHub, so the `flows`, `flows-host`, `flows-web`, `formlogic` and `run` presets, which hold that
+    /// scope, gain a route and `readonly` loses the one it had), the Agent's flush acknowledgement
+    /// (`agent.serve`) and the plugin trust route (`plugins.install`).
     #[test]
     fn what_each_preset_reaches_of_the_routes_that_existed() {
         let reaches: Vec<(&str, usize)> = ALL_PRESETS
@@ -542,19 +544,62 @@ mod tests {
             [
                 ("owner", 165),
                 ("agent", 78),
-                ("flows", 63),
-                ("flows-host", 53),
-                ("flows-web", 37),
-                ("formlogic", 35),
+                ("flows", 64),
+                ("flows-host", 54),
+                ("flows-web", 38),
+                ("formlogic", 36),
                 ("cli", 75),
                 ("cli-admin", 86),
                 ("mcp", 7),
-                ("readonly", 29),
+                ("readonly", 28),
                 ("companion", 17),
-                ("run", 31),
+                ("run", 32),
                 ("ceremony", 4),
             ]
         );
+    }
+
+    #[test]
+    fn the_routes_the_appendix_does_not_have_are_classified_on_purpose_and_a_monitor_reaches_only_the_read(
+    ) {
+        use crate::auth::routes::{lookup, Verb};
+        let can = |preset: Preset, verb: Verb, pattern: &str| -> bool {
+            match lookup(verb, pattern).unwrap().class {
+                Class::Scope(s) => preset.scopes().contains(s),
+                other => panic!("{other:?}"),
+            }
+        };
+        // The update check asks GitHub for a release: an action. The monitor's token cannot; the operator's
+        // (`cli`, the static token) and the dashboard's can, as `docs/UPDATES.md` shows.
+        for (preset, expected) in [
+            (Preset::Readonly, false),
+            (Preset::Mcp, false),
+            (Preset::Agent, false),
+            (Preset::Cli, true),
+            (Preset::CliAdmin, true),
+            (Preset::Owner, true),
+        ] {
+            assert_eq!(
+                can(preset, Verb::Post, "/api/update/check"),
+                expected,
+                "{}",
+                preset.name()
+            );
+        }
+        // Its status is a read: the monitor has it.
+        assert!(can(Preset::Readonly, Verb::Get, "/api/update/status"));
+        // The Agent page acknowledges "save your work" and nothing else of the updater's is its own.
+        assert!(can(Preset::Agent, Verb::Post, "/api/update/agent-flushed"));
+        assert!(!can(Preset::Cli, Verb::Post, "/api/update/agent-flushed"));
+        assert!(!can(
+            Preset::Readonly,
+            Verb::Post,
+            "/api/update/agent-flushed"
+        ));
+        // Trusting a plugin is trusting native code: dangerous, so a token of `cli` cannot and `cli-admin` can.
+        assert!(!can(Preset::Cli, Verb::Post, "/api/plugins/:id/trust"));
+        assert!(can(Preset::CliAdmin, Verb::Post, "/api/plugins/:id/trust"));
+        assert!(!can(Preset::Agent, Verb::Post, "/api/plugins/:id/trust"));
     }
 
     #[test]

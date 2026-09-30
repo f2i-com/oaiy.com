@@ -214,8 +214,18 @@ pub static ROUTES: &[Route] = &[
     scope(Verb::Get, "/api/node", "system.read"),
     scope_new(Verb::Get, "/api/system/gpus", "system.read"),
     scope_new(Verb::Get, "/api/secrets/hf-token", "system.read"),
+    // The updater merged after the design counted its routes, so three of its rows, and the plugin trust
+    // route, are not in Appendix B (`routes.golden.txt` lists them as its four differences). Each is
+    // classified here on purpose, against what the guard that was always in front of it did:
+    //
+    // - `GET /api/update/status` is `system.read`: the design lists the update status there. The desktop's old
+    //   guard kept it to OAIY's own pages and the token, because it says in words whether a call is live (the
+    //   blockers of "Restart to update"); a `system.read` holder, a `readonly` monitor too, sees that now.
+    // - `POST /api/update/check` (below, under `services.control`) makes OAIY ask GitHub for a newer release.
+    // - `POST /api/update/agent-flushed` (under `agent.serve`) is the Agent page's answer to "save your work
+    //   before an update".
+    // - `POST /api/plugins/:id/trust` (under `plugins.install`) trusts native code.
     scope(Verb::Get, "/api/update/status", "system.read"),
-    scope(Verb::Post, "/api/update/check", "system.read"),
     // logs.read
     scope(Verb::Get, "/api/node/logs", "logs.read"),
     scope(Verb::Get, "/api/python/logs", "logs.read"),
@@ -248,6 +258,14 @@ pub static ROUTES: &[Route] = &[
         "services.control",
     ),
     scope_new(Verb::Put, "/api/services/:id/gpu", "services.control"),
+    // Not in Appendix B. It makes OAIY send a request to GitHub (at most every 30 seconds), which is an action
+    // and not a read: the old guard held it as a privileged route (OAIY's own window or the token), so a
+    // `readonly` monitor's token, which the old model had no such thing as, must not be able to trigger it.
+    // No scope names the updater's check (`system.update` is the apply, and dangerous), and a new scope is a
+    // change to the design; `services.control` is the scope of the `cli` preset that keeps things installed
+    // and that a monitor lacks, so `curl -X POST -H "Authorization: Bearer $OAIY_SERVER_TOKEN"
+    // .../api/update/check` (docs/UPDATES.md) works as it did.
+    scope(Verb::Post, "/api/update/check", "services.control"),
     // services.define
     scope(Verb::Post, "/api/services", "services.define"),
     scope(Verb::Delete, "/api/services/:id", "services.define"),
