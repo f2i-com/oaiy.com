@@ -30,6 +30,15 @@ requests to 127.0.0.1. Every request, of any method, is checked before it is rea
     OAIY_ALLOWED_ORIGINS;
   - `Access-Control-Allow-Origin` echoes such an allowed origin and is never
     `*`; nothing answers a Private Network Access preflight.
+To let another page in (a `vite dev` tab, say), set OAIY_ALLOWED_ORIGINS in your
+copy of the service's template (`run.env`); see platform/desktop/README.md.
+
+Known residual: an origin is a name, not proof of who holds it. On Windows OAIY's
+windows are http://oaiy.localhost and http://oaiyflows.localhost, and a browser
+resolves any *.localhost name to this machine, so a program listening on
+127.0.0.1:80 that answers such a name (a local web server, WAMP for one) can serve a
+page whose Origin is allowed. OAIY's own API guard has the same limit; a token in a
+header instead was declined in the design (access model A5).
 
 API (all JSON; the checks above come first):
   GET    /health                       -> { ok, browser, headless }
@@ -137,6 +146,13 @@ def judge_request(hosts, origins, fetch_sites, port, allowed):
     return 200, None, None
 
 
+# A connection that sends nothing for this long is dropped (Handler.timeout).
+CONNECTION_TIMEOUT_SECS = 5
+# What a refused request's body may cost: at most this many bytes, in at most
+# this long, in all (Handler._drain_body).
+DRAIN_MAX_BYTES = 1 << 20
+DRAIN_SECS = 2.0
+
 # A page can ask in a loop; the log keeps one line about refusals per interval.
 _REFUSAL_LOG_EVERY_SECS = 30.0
 _refusal_log = {"at": None, "held": 0}
@@ -240,6 +256,14 @@ class Handler(BaseHTTPRequestHandler):
     # own Origin, when it is in ALLOWED_ORIGINS); None sends no CORS headers.
     _cors_origin = None
 
+    # How long one read or write on a connection may wait. The server takes one
+    # connection at a time (see the docstring: the Playwright sync API is bound to
+    # this thread, so a thread per connection is not an option), and a browser
+    # opens connections it never sends on (preconnect, from any page): without a
+    # limit the first of them holds every caller until the browser closes it, over
+    # a minute. With one, an idle connection costs the callers at most this long.
+    timeout = CONNECTION_TIMEOUT_SECS
+
     # Quieter logging — the companion captures stdout already.
     def log_message(self, *args):
         pass
@@ -253,6 +277,11 @@ class Handler(BaseHTTPRequestHandler):
 
     def _admit(self):
         self._cors_origin = None
+        if self.request_version == "HTTP/0.9":
+            # No headers, so no Host to judge (Python 3.13 does not even make a
+            # header object for it: a plain dict, which has no get_all).
+            self._refuse(421, f"HTTP/0.9 has no Host header: Host must be 127.0.0.1:{self.server.server_address[1]}")
+            return False
         status, reason, cors_origin = judge_request(
             self.headers.get_all("Host") or [],
             self.headers.get_all("Origin") or [],
@@ -279,17 +308,26 @@ class Handler(BaseHTTPRequestHandler):
 
     def _drain_body(self):
         # A body left unread when the connection closes can make the peer see a
-        # reset instead of the answer (Windows). Bounded in size and in time: a
-        # refused caller does not get to hold this one-at-a-time server.
+        # reset instead of the answer (Windows). Bounded in size and by ONE
+        # deadline for the whole body (a timeout per read would let a body that
+        # trickles in a byte at a time hold this one-at-a-time server for as long
+        # as it likes): a refused caller does not get to hold it.
         try:
             length = int(self.headers.get("Content-Length", 0) or 0)
         except ValueError:
             return
-        if length <= 0:
-            return
+        left = min(length, DRAIN_MAX_BYTES)
+        deadline = time.monotonic() + DRAIN_SECS
         try:
-            self.connection.settimeout(2.0)
-            self.rfile.read(min(length, 1 << 20))
+            while left > 0:
+                wait = deadline - time.monotonic()
+                if wait <= 0:
+                    return
+                self.connection.settimeout(wait)
+                chunk = self.rfile.read1(min(left, 65536))
+                if not chunk:
+                    return
+                left -= len(chunk)
         except OSError:
             pass
 

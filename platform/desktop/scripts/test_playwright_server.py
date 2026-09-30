@@ -28,10 +28,12 @@ import importlib.util
 import json
 import os
 import pathlib
+import re
 import socket
 import subprocess
 import sys
 import tempfile
+import threading
 import time
 import unittest
 
@@ -350,6 +352,7 @@ def free_port():
 
 class Reply:
     def __init__(self, raw):
+        self.raw = raw
         head, _, self.body = raw.partition(b"\r\n\r\n")
         lines = head.decode("latin-1").split("\r\n")
         self.status = int(lines[0].split()[1])
@@ -369,24 +372,68 @@ class Reply:
         return json.loads(self.body.decode("utf-8")) if self.body else None
 
 
-def raw_request(port, method, path, headers, body=None, version="HTTP/1.1"):
+def read_until_closed(sock, timeout):
+    """Everything the server sends until it closes the connection; a server that
+    keeps the connection open makes this raise (socket.timeout) instead of hang."""
+    sock.settimeout(timeout)
+    chunks = []
+    while True:
+        chunk = sock.recv(65536)
+        if not chunk:
+            return b"".join(chunks)
+        chunks.append(chunk)
+
+
+# Once an answer has been received whole, the server closes the connection at
+# once (HTTP/1.0: no keep-alive). A server that does not is a failure found here,
+# and found once: every request after it fails without waiting, so a server
+# switched to keep-alive fails the suite in seconds rather than making it wait
+# out a timeout per request.
+CLOSE_AFTER_ANSWER_SECS = 2.0
+_kept_open = []
+
+
+def _answer_is_whole(data):
+    head, sep, body = data.partition(b"\r\n\r\n")
+    length = re.search(rb"(?im)^content-length:\s*(\d+)", head) if sep else None
+    return length is not None and len(body) >= int(length.group(1))
+
+
+def read_answer(sock, timeout):
+    """One answer, and then the end of the connection."""
+    data = b""
+    while True:
+        sock.settimeout(CLOSE_AFTER_ANSWER_SECS if _answer_is_whole(data) else timeout)
+        try:
+            chunk = sock.recv(65536)
+        except socket.timeout:
+            if _answer_is_whole(data):
+                _kept_open.append(data[:40])
+                raise AssertionError("the server answered and kept the connection open: every answer must close it (HTTP/1.0)")
+            raise
+        if not chunk:
+            return data
+        data += chunk
+
+
+def raw_request(port, method, path, headers, body=None, version="HTTP/1.1", timeout=10):
     """Send exactly these header lines (a list of (name, value): repeats and a
-    missing Host are possible) and read until the server closes."""
+    missing Host are possible) and read until the server closes. `.elapsed` on
+    the reply is how long that took."""
+    if _kept_open:
+        raise AssertionError(f"an earlier answer left its connection open ({_kept_open[0]!r}); not asking again")
     payload = b"" if body is None else (body if isinstance(body, bytes) else json.dumps(body).encode("utf-8"))
     head = [f"{method} {path} {version}"] + [f"{k}: {v}" for k, v in headers]
     if payload:
         head.append(f"Content-Length: {len(payload)}")
         head.append("Content-Type: application/json")
     request = ("\r\n".join(head) + "\r\n\r\n").encode("latin-1") + payload
-    with socket.create_connection(("127.0.0.1", port), timeout=10) as s:
+    started = time.monotonic()
+    with socket.create_connection(("127.0.0.1", port), timeout=timeout) as s:
         s.sendall(request)
-        chunks = []
-        while True:
-            chunk = s.recv(65536)
-            if not chunk:
-                break
-            chunks.append(chunk)
-    return Reply(b"".join(chunks))
+        reply = Reply(read_answer(s, timeout))
+    reply.elapsed = time.monotonic() - started
+    return reply
 
 
 class RunningServer:
@@ -773,6 +820,105 @@ class EndToEnd(unittest.TestCase):
         for origin in OAIY_WINDOW_ORIGINS:
             self.assertIn(origin, out)
         self.assertRegex(out, r"refused a [A-Z]+ request: (403|421) ")
+
+
+class ConnectionLimits(unittest.TestCase):
+    """The server takes one connection at a time (the Playwright sync API is bound
+    to its thread), so what one connection may cost the callers behind it is
+    bounded, and every answer ends its connection (HTTP/1.0, no keep-alive).
+
+    Every wait here is bounded on the client's side: a server that fails a test
+    makes it fail, not hang."""
+
+    @classmethod
+    def setUpClass(cls):
+        cls.server = RunningServer(",".join(OAIY_WINDOW_ORIGINS))
+        cls.port = cls.server.port
+        cls.who = Personas(cls.port, free_port())
+
+    @classmethod
+    def tearDownClass(cls):
+        cls.server.close()
+
+    def health(self, timeout):
+        return raw_request(self.port, "GET", "/health", self.who.window("http://oaiyflows.localhost"), timeout=timeout)
+
+    def test_an_idle_connection_holds_the_server_no_longer_than_the_timeout(self):
+        # What a browser's preconnect is, from any page: a connection that never sends.
+        limit = server_module.CONNECTION_TIMEOUT_SECS
+        self.assertLessEqual(limit, 10, "the stall a page can cause is this long")
+        idle = socket.create_connection(("127.0.0.1", self.port))
+        self.addCleanup(idle.close)
+        time.sleep(0.2)  # the server has taken it and waits on it
+        reply = self.health(timeout=limit + 4)
+        self.assertEqual(reply.status, 200)
+        self.assertLess(reply.elapsed, limit + 3, "the caller behind an idle connection waited past the timeout")
+        self.assertEqual(read_until_closed(idle, 3), b"", "and it is the server that let go of the idle connection")
+
+    def test_a_refused_body_that_trickles_in_holds_the_server_for_the_drain_deadline_at_most(self):
+        # A byte every 0.4 s never trips a per-read timeout; only a deadline for the whole body ends it.
+        head = f"POST /session HTTP/1.1\r\nHost: 127.0.0.1:{self.port}\r\nOrigin: http://evil.example\r\nContent-Length: 500\r\n\r\n"
+        trickle = socket.create_connection(("127.0.0.1", self.port))
+        stop = threading.Event()
+
+        def drip():
+            while not stop.is_set():
+                try:
+                    trickle.sendall(b"x")
+                except OSError:
+                    return
+                stop.wait(0.4)
+
+        trickle.sendall(head.encode("latin-1"))
+        thread = threading.Thread(target=drip, daemon=True)
+        thread.start()
+        self.addCleanup(trickle.close)
+        self.addCleanup(thread.join, 5)
+        self.addCleanup(stop.set)
+        time.sleep(0.3)
+        reply = self.health(timeout=server_module.DRAIN_SECS + 6)
+        self.assertEqual(reply.status, 200)
+        self.assertLess(reply.elapsed, server_module.DRAIN_SECS + 3, "the trickling body held the server past its deadline")
+
+    def test_an_http_0_9_request_is_refused_cleanly(self):
+        for request in [
+            b"GET /health\r\n\r\n",
+            b"GET /session/s1/html\r\n\r\n",
+            b"GET /health\r\nHost: 127.0.0.1:%d\r\n\r\n" % self.port,  # headers it cannot have: still refused
+        ]:
+            with self.subTest(request=request):
+                with socket.create_connection(("127.0.0.1", self.port), timeout=8) as s:
+                    s.sendall(request)
+                    data = read_until_closed(s, 8)
+                # HTTP/0.9 has no status line: the answer is the bare body.
+                self.assertIn("HTTP/0.9", json.loads(data.decode("utf-8"))["error"])
+        self.assertEqual(self.health(timeout=8).status, 200, "and the server carries on")
+        self.assertNotIn("Traceback", self.server.output())
+
+    def test_a_refused_post_with_a_second_request_in_its_body_gets_one_answer_and_the_connection_closes(self):
+        inner = (
+            f"POST /session HTTP/1.1\r\nHost: 127.0.0.1:{self.port}\r\nOrigin: http://oaiyflows.localhost\r\n"
+            "Content-Type: application/json\r\nContent-Length: 2\r\n\r\n{}"
+        ).encode("latin-1")
+        before = self.server.calls()
+        reply = raw_request(self.port, "POST", "/session", self.who.page_on_another_loopback_port(), inner, timeout=3)
+        self.assertEqual(reply.status, 403)
+        self.assertEqual(reply.raw.count(b"HTTP/1."), 1, "one answer, not one for the request smuggled in the body")
+        self.assertLess(reply.elapsed, 2, "and the connection was closed, not held open for another request")
+        self.assertEqual(self.server.calls(), before, "the inner request, a window's own, did not run")
+
+    def test_every_answer_closes_its_connection(self):
+        window = self.who.window("http://oaiyflows.localhost")
+        for method, path, headers, body in [
+            ("GET", "/health", window, None),
+            ("GET", "/health", self.who.program(), None),
+            ("OPTIONS", "/session", window, None),
+            ("GET", "/health", self.who.rebound_name(), None),
+            ("POST", "/session", self.who.hosted_editor(), {"config": {}}),
+        ]:
+            with self.subTest(method=method, path=path):
+                reply = raw_request(self.port, method, path, headers, body, timeout=3)
+                self.assertLess(reply.elapsed, 2)
 
 
 class NoAllowList(unittest.TestCase):
