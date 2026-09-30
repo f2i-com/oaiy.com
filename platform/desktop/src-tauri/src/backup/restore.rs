@@ -1286,6 +1286,11 @@ pub fn sweep_leftovers(data_dir: &Path) -> usize {
     if super::create::sweep_output(data_dir) {
         removed += 1;
     }
+    // An archive left for the Agent's page that has no record, unless a restore waits with an Agent part of its own (it is finished
+    // first, and gives that archive its record or replaces it).
+    if agent::sweep_unrecorded_handover(data_dir, waiting.as_ref().is_some_and(|m| m.agent.is_some())) {
+        removed += 1;
+    }
     // The Agent's part of a restore that its page has not taken for a day: it is not kept for ever.
     if let Some(id) = agent::drop_stale_import(data_dir, std::time::Duration::from_secs(STAGED_LIFETIME_HOURS as u64 * 3600)) {
         record_agent_result(data_dir, &id, false, Some("its page did not take them within a day, so what was kept for it was deleted"), &[]);
@@ -1618,7 +1623,9 @@ fn finalize(data_dir: &Path, marker: &Marker, applied: &[(String, bool)]) -> App
         let zip = source.join(&agent_marker.file);
         // A finalize that was cut short after it handed the archive over (it moves the staged copy) is done again at the next start:
         // what waits for the page is then already the archive that was staged, and stays.
-        let handed_before = agent::read_pending_import(data_dir).is_some_and(|p| p.id == marker.id && p.size == agent_marker.size && p.sha256 == agent_marker.sha256);
+        // (An archive that was moved for the page before its record was written is given its record.)
+        let handed_before = agent::read_pending_import(data_dir).is_some_and(|p| p.id == marker.id && p.size == agent_marker.size && p.sha256 == agent_marker.sha256)
+            || agent::adopt_unrecorded_handover(data_dir, &marker.id, &marker.kind, agent_marker.size, &agent_marker.sha256, agent_marker.apply_settings, agent_marker.apply_keys, &agent_marker.remove);
         // Once more, at the last moment: the page is given what was staged, or nothing (the files are in place already, so the
         // result says what was not handed over).
         if handed_before {

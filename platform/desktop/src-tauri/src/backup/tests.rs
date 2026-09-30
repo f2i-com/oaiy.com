@@ -2357,7 +2357,10 @@ fn what_a_killed_backup_or_restore_leaves_behind_is_swept_at_the_start() {
     fs::create_dir_all(dst.0.join("restore").join("undo-cccccccccccccccc").join("files").join("sub")).unwrap();
     put(&dst.0.join("restore").join("undo-eeeeeeeeeeeeeeee"), "files/callers.json", b"the only copy of something");
     put(&dst.0.join("restore").join("undo-dddddddddddddddd"), "files/callers.json", b"a snapshot");
-    put(&dst.0.join("restore").join("agent-import"), "current.zip", b"waits for the page");
+    // (An archive that waits for the page has its record; one with none is a leftover, see `an_archive_left_for_the_page_with_no_record…`.)
+    let handed = dst.0.join("handed.zip");
+    fs::write(&handed, b"waits for the page").unwrap();
+    agent::leave_for_page(&dst.0, "0123456789abcdef", "restore", &handed, false, false, &[]).unwrap();
     let restore_dir = dst.0.join("restore");
     let pending = restore_dir.join(format!("pending-{}", staged.id));
 
@@ -2380,7 +2383,8 @@ fn what_a_killed_backup_or_restore_leaves_behind_is_swept_at_the_start() {
     assert_eq!(restore::sweep_leftovers(&dst.0), 1);
     assert!(!restore_dir.join("undo-cccccccccccccccc").exists());
     assert_eq!(fs::read(restore_dir.join("undo-eeeeeeeeeeeeeeee").join("files").join("callers.json")).unwrap(), b"the only copy of something");
-    assert!(restore_dir.join("undo-dddddddddddddddd").exists() && restore_dir.join("agent-import").join("current.zip").is_file());
+    // (The archive that waited for the page was another restore's: this apply cancelled it, see `an_undo_or_another_restore_cancels…`.)
+    assert!(restore_dir.join("undo-dddddddddddddddd").exists() && !restore_dir.join("agent-import").join("current.zip").exists());
     let _ = before;
 }
 
@@ -6409,6 +6413,67 @@ fn a_marker_is_left_alone_when_the_restore_was_not_finished_or_never_begun() {
     assert!(matches!(restore::apply_pending(&dst.0), ApplyOutcome::Applied(_)));
     let (never, _, _) = staged_with_agent_part("marker-never-begun");
     assert!(matches!(restore::apply_pending(&never.0), ApplyOutcome::Applied(_)), "a restore that was staged is applied");
+}
+
+/// The reviewer's x2: killed inside the hand-over of the Agent's archive to its page, between the move of the archive and the
+/// writing of its record, the archive stayed in the clear with no record, for ever (the sweep needs the record to know its age).
+#[test]
+fn an_archive_left_for_the_page_with_no_record_is_given_its_record_or_swept() {
+    // (a) The archive that was staged is there, moved, with no record (the steps were once in that order): the restore, finished
+    // at the next start, gives it its record and hands it over.
+    let (dst, id, zip) = staged_with_agent_part("orphan-a");
+    restore::INJECT.with(|c| c.set(Some(Inject::CrashAfterDone)));
+    assert!(matches!(restore::apply_pending(&dst.0), ApplyOutcome::None));
+    restore::INJECT.with(|c| c.set(None));
+    let import = dst.0.join("restore").join("agent-import");
+    fs::create_dir_all(&import).unwrap();
+    fs::rename(&zip, import.join("current.zip")).unwrap();
+    assert!(!import.join("current.json").exists());
+    let ApplyOutcome::Applied(last) = restore::apply_pending(&dst.0) else { panic!("finished at the next start") };
+    assert_eq!(last.agent_storage, "pending", "{last:?}");
+    assert!(!last.notes.iter().any(|n| n.contains("not handed")), "{:?}", last.notes);
+    let meta = agent::import_meta(&dst.0);
+    assert!(meta.pending && meta.id.as_deref() == Some(id.as_str()));
+    // (b) Another archive with no record, where a restore waits: it is replaced by the one that was staged.
+    let (dst, id, _) = staged_with_agent_part("orphan-b");
+    let import = dst.0.join("restore").join("agent-import");
+    fs::create_dir_all(&import).unwrap();
+    fs::write(import.join("current.zip"), b"another archive, in the clear").unwrap();
+    assert_eq!(restore::sweep_leftovers(&dst.0), 0, "a restore waits: its own hand-over is made first");
+    assert!(import.join("current.zip").exists());
+    let ApplyOutcome::Applied(last) = restore::apply_pending(&dst.0) else { panic!("applied") };
+    assert_eq!(last.agent_storage, "pending", "{last:?}");
+    let meta = agent::import_meta(&dst.0);
+    assert!(meta.pending && meta.id.as_deref() == Some(id.as_str()));
+    assert_ne!(fs::read(import.join("current.zip")).unwrap(), b"another archive, in the clear");
+    // (c) The reviewer's x2b: no restore waits and nothing names the archive: it is swept, whatever its age.
+    let data = TempDir::new("orphan-c");
+    let import = data.0.join("restore").join("agent-import");
+    fs::create_dir_all(&import).unwrap();
+    fs::write(import.join("current.zip"), b"the person's conversations, in the clear").unwrap();
+    assert!(restore::sweep_leftovers(&data.0) >= 1);
+    assert!(!import.join("current.zip").exists(), "an archive nothing names is not kept for ever");
+    // (d) With its record it is not swept (it waits for the page for as long as it is allowed to).
+    let (dst, _, _) = staged_with_agent_part("orphan-d");
+    assert!(matches!(restore::apply_pending(&dst.0), ApplyOutcome::Applied(_)));
+    assert!(agent::import_meta(&dst.0).pending);
+    restore::sweep_leftovers(&dst.0);
+    assert!(agent::import_meta(&dst.0).pending, "an archive with its record waits for the page");
+}
+
+/// The hand-over writes the record before it moves the archive, so that a kill in between leaves a record with no archive (which the
+/// restore, finished at the next start, makes whole) and never an archive with no record. A move that fails leaves neither.
+#[test]
+fn a_hand_over_that_cannot_move_the_archive_leaves_no_record() {
+    let data = TempDir::new("handover-fails");
+    let zip = data.0.join("handed.zip");
+    fs::write(&zip, agent_part()).unwrap();
+    let import = data.0.join("restore").join("agent-import");
+    fs::create_dir_all(import.join("current.zip")).unwrap(); // a folder where the archive should go
+    assert!(agent::leave_for_page(&data.0, "0123456789abcdef", "restore", &zip, false, false, &[]).is_err());
+    assert!(!import.join("current.json").exists(), "no record for an archive that is not there");
+    assert!(zip.exists(), "and the archive is where it was");
+    assert!(!agent::import_meta(&data.0).pending);
 }
 
 /// Put `value` at the path `parts` (`a[]` is the one element of the list `a`) in `node`.

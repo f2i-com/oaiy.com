@@ -416,15 +416,52 @@ pub(crate) fn read_pending_import(data_dir: &Path) -> Option<PendingImport> {
 }
 
 /// Leave `zip` (which is moved) for the page to import, replacing anything left from before.
+///
+/// The record is written before the archive is moved: a process that dies in between leaves a record with no archive (the page
+/// is not asked until the restore has been finished at the next start, which leaves the archive again), and never an archive
+/// with no record (a plaintext copy of the person's conversations that nothing names, and nothing sweeps).
 pub(crate) fn leave_for_page(data_dir: &Path, id: &str, kind: &str, zip: &Path, apply_settings: bool, apply_keys: bool, remove: &[String]) -> std::io::Result<()> {
     let dir = import_dir(data_dir);
     secret_file::create_private_dir(&dir)?;
     let (sha256, size) = sha256_file(zip)?;
     let _ = std::fs::remove_file(dir.join("current.json"));
-    secret_file::rename_over(zip, &dir.join("current.zip"))?;
+    let _ = std::fs::remove_file(dir.join("current.zip"));
     let remove = remove.iter().filter(|n| plausible_name(n)).take(MAX_ADDED).cloned().collect();
     let meta = PendingImport { id: id.to_string(), kind: kind.to_string(), size, sha256, apply_settings, apply_keys, remove };
-    secret_file::write(&dir.join("current.json"), serde_json::to_string_pretty(&meta).unwrap_or_default())
+    secret_file::write(&dir.join("current.json"), serde_json::to_string_pretty(&meta).unwrap_or_default())?;
+    if let Err(e) = secret_file::rename_over(zip, &dir.join("current.zip")) {
+        let _ = std::fs::remove_file(dir.join("current.json"));
+        return Err(e);
+    }
+    Ok(())
+}
+
+/// A hand-over that was cut short between the move of the archive and the writing of its record (the steps were once in that
+/// order): the archive is there and its record is not. When that archive is the one that was staged (its size and SHA-256 are the
+/// restore's), the record is written for it and true is returned; any other archive with no record is left to the sweep.
+pub(crate) fn adopt_unrecorded_handover(data_dir: &Path, id: &str, kind: &str, size: u64, sha256: &str, apply_settings: bool, apply_keys: bool, remove: &[String]) -> bool {
+    let dir = import_dir(data_dir);
+    let zip = dir.join("current.zip");
+    // (`symlink_metadata` says a link is not a file.)
+    if dir.join("current.json").exists() || !std::fs::symlink_metadata(&zip).is_ok_and(|m| m.is_file() && m.len() == size) {
+        return false;
+    }
+    if !matches!(sha256_file(&zip), Ok((found, _)) if found == sha256) {
+        return false;
+    }
+    let remove: Vec<String> = remove.iter().filter(|n| plausible_name(n)).take(MAX_ADDED).cloned().collect();
+    let meta = PendingImport { id: id.to_string(), kind: kind.to_string(), size, sha256: sha256.to_string(), apply_settings, apply_keys, remove };
+    secret_file::write(&dir.join("current.json"), serde_json::to_string_pretty(&meta).unwrap_or_default()).is_ok()
+}
+
+/// Remove an archive left for the page that has no record and belongs to no restore that is waiting (`keep`: one waits, and will
+/// leave its own). It is the person's conversations in the clear: nothing else would ever remove it. True when one was removed.
+pub(crate) fn sweep_unrecorded_handover(data_dir: &Path, keep: bool) -> bool {
+    let dir = import_dir(data_dir);
+    if keep || dir.join("current.json").exists() || std::fs::symlink_metadata(dir.join("current.zip")).is_err() {
+        return false;
+    }
+    std::fs::remove_file(dir.join("current.zip")).is_ok()
 }
 
 /// Drop a hand-over that has waited longer than `max_age` (the page asks at every start, so one still
