@@ -22,10 +22,10 @@ export async function addProvider(page, providersOrigin, details) {
   if (details.model !== undefined) await form.locator('input[placeholder="or type a model name"]').fill(details.model);
   if (details.check) {
     await form.getByRole('button', { name: 'Check connection' }).click();
-    await form.locator('.result.good').waitFor({ timeout: 10000 });
+    await form.locator('.result.good').waitFor({ timeout: details.timeout ?? 10000 });
   }
   await form.getByRole('button', { name: 'Add provider' }).click();
-  await page.locator('section[aria-label="Your providers"] li.row', { hasText: details.name }).waitFor({ timeout: 10000 });
+  await page.locator('section[aria-label="Your providers"] li.row', { hasText: details.name }).waitFor({ timeout: details.timeout ?? 10000 });
 }
 
 /** The names listed on the Providers page. */

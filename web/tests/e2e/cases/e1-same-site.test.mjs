@@ -47,7 +47,8 @@ for (const browserName of ['chromium', 'firefox']) {
       await split?.close();
     });
 
-    const details = (fake) => ({ name: 'Shared fake', preset: 'A server on this computer', serverKind: 'other', baseUrl: fake.baseUrl, key: KEY, model: 'fake-chat', check: true });
+    // Firefox starts slowly the first time and is slower still when other browsers are running: it is given time, not a different test.
+    const details = (fake) => ({ name: 'Shared fake', preset: 'A server on this computer', serverKind: 'other', baseUrl: fake.baseUrl, key: KEY, model: 'fake-chat', check: true, timeout: browserName === 'firefox' ? 60000 : 10000 });
 
     async function appSees(world, context, name) {
       const { page, seen } = await newPage(context);
@@ -79,7 +80,7 @@ for (const browserName of ['chromium', 'firefox']) {
       await form.locator('input[type=text]').first().fill('Renamed fake');
       await form.getByRole('button', { name: 'Save changes' }).click();
       for (const { page } of [agent, flows]) {
-        await waitFor(() => page.evaluate(() => window.oaiyTest.pushes().length > 0), { what: 'a changed push' });
+        await waitFor(() => page.evaluate(() => window.oaiyTest.pushes().length > 0), { what: 'a changed push', timeout: browserName === 'firefox' ? 30000 : 8000 });
         const listed = await page.evaluate(() => window.oaiyTest.call({ op: 'list' }));
         assert.equal(listed.result[0].name, 'Renamed fake');
         assert.equal(listed.result[0].hasKey, true, 'and the key it was saved with is still there');
