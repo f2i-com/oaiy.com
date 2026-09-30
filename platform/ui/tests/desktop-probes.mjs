@@ -434,11 +434,13 @@ await check('the words of each state: never connected sends nothing until presse
   assert.match(neverWords, /^Connect sends one request to http:\/\/127\.0\.0\.1:17972 \(GET \/api\/health\) to ask whether OAIY Desktop is running\. Until you press it this page sends nothing to your computer or your network\./);
   assert.match(neverWords, /may ask whether this site may connect to devices on your network/);
   assert.match(neverWords, /keeps the link: from then on the editor asks it again each time it opens and every 10 seconds while it is open, and reads its services\. Disconnect ends that\./, 'what one request leads to is said, not hidden');
+  // What is refused until then, and what the check cannot see (F4): the address as written, not where a redirect or a name leads.
+  assert.match(neverWords, /Until you connect, the editor also loads no picture, video or sound from an address on your computer or your network, judging by the address as written: a link that redirects there, or a name that points there, is left to your browser's own question\./);
 
   for (const [name, state] of [['connected', connected], ['offline', offline], ['address', address], ['address that answers', addressUp]]) {
     const words = W.connectWords(state);
     assert.match(words, /each time it opens and every 10 seconds while it is open/, name);
-    assert.doesNotMatch(words, /sends nothing|Until you press it/, `${name}: what is true of a tab that has never connected is not said of this one`);
+    assert.doesNotMatch(words, /sends nothing|Until you press it|loads no picture/, `${name}: what is true of a tab that has never connected is not said of this one`);
     assert.ok(words.includes(state.base), `${name}: it names where it asks`);
   }
   assert.match(W.connectWords(connected), /^Connected to http:\/\/127\.0\.0\.1:17972\. This browser keeps the link: the editor asks OAIY Desktop whether it is running, and reads its services, each time it opens and every 10 seconds while it is open\. Disconnect ends that\.$/);

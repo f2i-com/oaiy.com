@@ -30,7 +30,7 @@ const EACH = `each time it opens and every ${POLL_SECONDS} seconds while it is o
 export function connectWords(state: ConnectState): string {
   switch (state.kind) {
     case 'never':
-      return `Connect sends one request to ${state.base} (GET /api/health) to ask whether OAIY Desktop is running. Until you press it this page sends nothing to your computer or your network. Your browser may ask whether this site may connect to devices on your network: that question is this request. If the desktop answers, this browser keeps the link: from then on the editor asks it again ${EACH}, and reads its services. Disconnect ends that.`;
+      return `Connect sends one request to ${state.base} (GET /api/health) to ask whether OAIY Desktop is running. Until you press it this page sends nothing to your computer or your network. Your browser may ask whether this site may connect to devices on your network: that question is this request. Until you connect, the editor also loads no picture, video or sound from an address on your computer or your network, judging by the address as written: a link that redirects there, or a name that points there, is left to your browser's own question. If the desktop answers, this browser keeps the link: from then on the editor asks it again ${EACH}, and reads its services. Disconnect ends that.`;
     case 'connected':
       return state.available
         ? `Connected to ${state.base}. This browser keeps the link: the editor asks OAIY Desktop whether it is running, and reads its services, ${EACH}. Disconnect ends that.`
