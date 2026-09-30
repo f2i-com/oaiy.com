@@ -994,6 +994,17 @@ pub(crate) fn clean_staged(data_dir: &Path, files_root: &Path, names: &[String],
                     c
                 })
             })),
+            // The messages callers left: a message that hides text is refused first (on the file as it came, as the dry run looked at it), and the rest
+            // is cleaned as the store cleans a message it takes and held to the store's limits.
+            (Some(Category::Messages), "messages/messages.json") => Some(read(&path).and_then(|b| {
+                if let Some(why) = review::hidden_text_in(name, &b) {
+                    return Err(format!("it hides text ({why})"));
+                }
+                super::sanitize::messages_for_restore(&b).map(|(cleaned, said)| {
+                    notes.extend(NOTE_MESSAGES, said);
+                    cleaned
+                })
+            })),
             (Some(Category::Flows), "bridge/ledger.jsonl") => Some(read(&path).map(|b| {
                 let (c, left_out) = super::sanitize::ledger_finished_only(&b);
                 if left_out > 0 {
@@ -1084,6 +1095,7 @@ const NOTE_PROVIDERS: &str = "the provider list";
 const NOTE_JOURNAL: &str = "the run journal";
 const NOTE_LEFT_OUT: &str = "files not brought back";
 const NOTE_SERVICES: &str = "services that start with OAIY";
+const NOTE_MESSAGES: &str = "the messages callers left";
 
 /// What [`clean_staged`] leaves: the names that come back, what was said, and the files that were merged with what is here.
 pub(crate) struct Cleaned {
@@ -1101,11 +1113,13 @@ fn merged_with_local(name: &str, category: Option<Category>) -> bool {
 /// The file this computer has under `name`, when it is JSON of a size that is read.
 fn local_json(data_dir: &Path, name: &str, limits: &Limits) -> Option<serde_json::Value> {
     let here = data_dir.join(native(name));
+    // (Read as the stores read it: UTF-8, or UTF-16 with its byte order mark, as another program may have saved it.)
     std::fs::metadata(&here)
         .ok()
         .filter(|m| m.len() <= limits.max_json_bytes)
         .and_then(|_| std::fs::read(&here).ok())
-        .and_then(|b| serde_json::from_slice::<serde_json::Value>(b.strip_prefix(&[0xef, 0xbb, 0xbf][..]).unwrap_or(&b)).ok())
+        .and_then(|b| secret_file::decode_text(&b).ok())
+        .and_then(|text| serde_json::from_str::<serde_json::Value>(&text).ok())
 }
 
 /// The state of the file this computer has under `name`: the SHA-256 of a plain file, none when there is none (or it is not a plain file).

@@ -611,6 +611,10 @@ The receptionist's transfers and messages (the owner's settings and what callers
   from or asked to be rung on. Without the tick the messages that are here are not touched. With it the file **replaces** the messages
   that are here: the dry run says how many there are in the backup (new, seen and handled, from how many numbers), how many it replaces,
   and quotes the newest three; a message that hides text (see below) makes the whole file not come back. Undo puts the old messages back.
+  The store that reads the file enforces its limits when it *takes* a message and not when it *reads* a file, so a restore holds the file to
+  them as it stages it: each message is cleaned as the store cleans one it takes (its words to 600 characters, a name to 80, a number to
+  40, characters a message never holds taken out), what is not a message (no id, no words or no time) and an id that is there twice are left
+  out, and at most the newest 2,000 come back; each of these is said in the result of the restore, and the dry run says the cap.
 - **Transfer settings** (`ring.json`, the tick "Transfer settings") are the owner's policy for putting callers through: whether the
   receptionist may try to reach you at all (off until you turn it on), whom and when, the VIP numbers that ring whatever the limits and
   the quiet hours say, how often a caller may try. **Every key needs the tick**, so a backup that was not ticked for it cannot turn

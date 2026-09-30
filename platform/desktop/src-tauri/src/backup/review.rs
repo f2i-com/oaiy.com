@@ -228,7 +228,8 @@ impl Local {
         let builtin_connectors = crate::link::descriptor::load_all(&data_dir.join("does-not-exist")).into_iter().map(|d| d.id).collect();
         let messages_here = std::fs::read(data_dir.join("messages").join("messages.json"))
             .ok()
-            .and_then(|b| serde_json::from_slice::<Value>(b.strip_prefix(&[0xef, 0xbb, 0xbf][..]).unwrap_or(&b)).ok())
+            .and_then(|b| crate::secret_file::decode_text(&b).ok())
+            .and_then(|text| serde_json::from_str::<Value>(&text).ok())
             .and_then(|v| v.get("messages").and_then(Value::as_array).map(Vec::len))
             .unwrap_or(0);
         Self { template_ids, builtin_connectors, messages_here }
@@ -278,7 +279,7 @@ pub(crate) fn first_hidden_text(value: &Value, at: &str) -> Option<String> {
 /// Why a file of the desktop that is copied whole, and that holds words a model reads or a caller hears (a flow's descriptions and prompts,
 /// a template's, a trigger's condition, a connector's, the notes about callers, the setup, agent and control records), is not brought back:
 /// a value in it hides text. The dry run says it, and staging leaves the file out.
-fn hidden_text_in(name: &str, bytes: &[u8]) -> Option<String> {
+pub(crate) fn hidden_text_in(name: &str, bytes: &[u8]) -> Option<String> {
     let watched = name.starts_with("flows/")
         || name.starts_with("templates/")
         || name.starts_with("connectors/")
@@ -816,7 +817,7 @@ fn describe_messages(class: RestoreClass, name: &str, document: &Value, local: &
     let mut parts = Parts::new("messages").fixed(
         "count",
         format!(
-            "{} ({new} new, {seen} seen, {handled} handled) from {} and {} from a hidden number. Each holds what a caller said and the number they rang from or asked to be rung on. {here}",
+            "{} ({new} new, {seen} seen, {handled} handled) from {} and {} from a hidden number. Each holds what a caller said and the number they rang from or asked to be rung on. {here} At most the newest 2,000 come back, each cleaned as a message is when it is taken.",
             words(list.len(), "message", "messages"),
             words(numbers.len(), "number", "numbers"),
             words(hidden, "message", "messages")

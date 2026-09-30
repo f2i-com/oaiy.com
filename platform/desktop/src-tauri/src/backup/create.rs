@@ -407,7 +407,9 @@ fn copy_cleaned(from: &Path, to: &Path, rel: &str, kind: Sanitize, excluded: &mu
     let cleaned = match kind {
         Sanitize::Keys(name) => {
             let keys = table().key_table(name).ok_or_else(|| "OAIY does not know how to read this file".to_string())?;
-            let value: serde_json::Value = serde_json::from_slice(bytes.strip_prefix(&[0xef, 0xbb, 0xbf][..]).unwrap_or(&bytes)).map_err(|_| "it is not valid JSON".to_string())?;
+            // (Read as the program that owns the file reads it: UTF-8, or UTF-16 with its byte order mark, as another program may have saved it.
+            // What is backed up is written as UTF-8.)
+            let value: serde_json::Value = secret_file::decode_text(&bytes).ok().and_then(|text| serde_json::from_str(&text).ok()).ok_or_else(|| "it is not valid JSON".to_string())?;
             // Only the keys the table lets come back are copied: a PIN, an address that audio goes to, a
             // switch that grants access, or anything the table does not know stays out of the file.
             let found = filter_json(keys, &value, &|_| true);

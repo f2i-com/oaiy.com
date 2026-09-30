@@ -18,6 +18,7 @@
 //! - **The run journal** keeps only the runs that finished: a run that was waiting would start at the
 //!   next start.
 //! - **The autostart list** keeps only services whose template exists.
+//! - **The messages callers left** are cleaned as the store cleans one it takes, and held to the store's own limits ([`messages_for_restore`]).
 
 use std::collections::HashSet;
 
@@ -220,4 +221,83 @@ pub fn autostart_known_only(bytes: &[u8], known: &HashSet<String>) -> Result<(Ve
     let ids: Vec<String> = serde_json::from_slice(bytes.strip_prefix(&[0xef, 0xbb, 0xbf][..]).unwrap_or(bytes)).map_err(|_| "it is not a list of services".to_string())?;
     let (kept, dropped): (Vec<String>, Vec<String>) = ids.into_iter().partition(|id| known.contains(id));
     Ok((serde_json::to_vec_pretty(&kept).map_err(|_| "it could not be written".to_string())?, dropped))
+}
+
+/// The messages a restore brings back: each is cleaned as the store cleans a message it takes (its words, its name, its numbers and its ids), what is not
+/// a message is left out, an id that is there twice is taken once, and there are at most as many as the store holds, the newest. The store enforces
+/// its limits when a message is taken and not when its file is read, so a file that is put in place is held to them here, and what comes out is what
+/// the store would have written (it reads it without complaint: it never puts a restored file aside). Returns the file, and what was said of it.
+pub fn messages_for_restore(bytes: &[u8]) -> Result<(Vec<u8>, Vec<String>), String> {
+    use crate::messages::{clean, MAX_MESSAGE, MAX_NAME, MAX_STORED};
+    use serde_json::json;
+    let value = parse(bytes)?;
+    let Some(list) = value.get("messages").and_then(Value::as_array) else { return Err("it is not a list of messages".to_string()) };
+    // What a message says in `key`, cleaned as the store cleans it, and whether cleaning changed it.
+    let text = |m: &Value, key: &str, most: usize| -> (String, bool) {
+        let said = m.get(key).and_then(Value::as_str).unwrap_or("");
+        let cleaned = clean(said, most);
+        let changed = cleaned != said;
+        (cleaned, changed)
+    };
+    let stamp = |m: &Value, key: &str| m.get(key).and_then(Value::as_str).filter(|s| chrono::DateTime::parse_from_rfc3339(s).is_ok()).map(str::to_string);
+    let mut kept: Vec<Value> = Vec::new();
+    let mut ids: HashSet<String> = HashSet::new();
+    let (mut malformed, mut repeated, mut changed) = (0usize, 0usize, 0usize);
+    for m in list {
+        let ((id, _), (message, message_changed), at) = (text(m, "id", 100), text(m, "message", MAX_MESSAGE), stamp(m, "at"));
+        if id.is_empty() || message.is_empty() || at.is_none() {
+            malformed += 1;
+            continue;
+        }
+        if !ids.insert(id.clone()) {
+            repeated += 1;
+            continue;
+        }
+        // (The store keeps the number a caller rang from as the phone said it, and the number to ring back on as digits, or else the number they rang from:
+        // so both are kept as words, at the most the store keeps of either.)
+        let ((call_id, a), (from, b), (name, c), (callback, d)) = (text(m, "callId", 200), text(m, "from", 40), text(m, "name", MAX_NAME), text(m, "callback", 40));
+        if message_changed || a || b || c || d {
+            changed += 1;
+        }
+        let state = match m.get("state").and_then(Value::as_str) {
+            Some(s @ ("seen" | "handled")) => s,
+            _ => "new",
+        };
+        kept.push(json!({
+            "id": id, "at": at, "callId": call_id, "from": from, "name": name, "callback": callback, "message": message,
+            "urgency": if m.get("urgency").and_then(Value::as_str) == Some("urgent") { "urgent" } else { "normal" },
+            "wantsCallback": m.get("wantsCallback").and_then(Value::as_bool).unwrap_or(false), "state": state,
+            "seenAt": stamp(m, "seenAt"), "handledAt": stamp(m, "handledAt"),
+            "handledBy": m.get("handledBy").and_then(Value::as_str).map(|s| clean(s, 40)).filter(|s| !s.is_empty()),
+        }));
+    }
+    // The newest are kept (by the time each says, not by where it is in the file), and what is kept stays in the order the file had.
+    let over = kept.len().saturating_sub(MAX_STORED);
+    if over > 0 {
+        let when = |m: &Value| m["at"].as_str().and_then(|s| chrono::DateTime::parse_from_rfc3339(s).ok()).map(|t| t.timestamp_millis()).unwrap_or(i64::MIN);
+        let mut order: Vec<usize> = (0..kept.len()).collect();
+        order.sort_by_key(|&i| (when(&kept[i]), i));
+        let oldest: HashSet<usize> = order.into_iter().take(over).collect();
+        let mut i = 0;
+        kept.retain(|_| {
+            i += 1;
+            !oldest.contains(&(i - 1))
+        });
+    }
+    let messages = |n: usize| if n == 1 { "1 message".to_string() } else { format!("{n} messages") };
+    let were = |n: usize| if n == 1 { "was" } else { "were" };
+    let mut notes = Vec::new();
+    if malformed > 0 {
+        notes.push(format!("messages/messages.json: {} that {} not messages (no id, no words or no time) {} left out.", messages(malformed), were(malformed), were(malformed)));
+    }
+    if repeated > 0 {
+        notes.push(format!("messages/messages.json: {} with an id that was already in the file {} left out.", messages(repeated), were(repeated)));
+    }
+    if over > 0 {
+        notes.push(format!("messages/messages.json: the {} {} left out: OAIY keeps {MAX_STORED}.", if over == 1 { "oldest message".to_string() } else { format!("{over} oldest messages") }, were(over)));
+    }
+    if changed > 0 {
+        notes.push(format!("messages/messages.json: {} had characters a message never holds taken out, or {} cut to the length the store keeps (a message {MAX_MESSAGE} characters, a name {MAX_NAME}).", messages(changed), were(changed)));
+    }
+    Ok((serde_json::to_vec_pretty(&json!({ "version": 1, "messages": kept })).map_err(|_| "it could not be written".to_string())?, notes))
 }
