@@ -26,6 +26,7 @@ final class Pairing
     public const RESPONSES_MAX = 3;
     public const REJECTS_MAX = 3;
     public const GETS_MAX = 60;
+    public const OUTCOME_READS_PER_MINUTE = 10;
     public const TTL_DEFAULT = 600;
     public const TTL_MAX = 900;
     public const OPEN_PER_DESKTOP = 16;

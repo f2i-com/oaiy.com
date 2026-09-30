@@ -84,13 +84,24 @@ final class PairingApi
         if ($row === null) {
             throw ApiError::make('not_found');
         }
-        // Each rendezvous answers 60 GETs in its life.
-        $counted = $ctx->db->write(fn(Db $db): int => $db->exec('UPDATE pairings SET gets = gets + 1 WHERE pid = ? AND gets < ?', [$pid, Pairing::GETS_MAX]));
-        if ($counted !== 1) {
-            if (Pairing::live($ctx->db, $pid, $now) === null) {
-                throw ApiError::make('not_found');
+        // Each rendezvous answers 60 GETs while it is open or answered (the design's budget against a pid that is being guessed or hammered).
+        // A rendezvous that has ended in an outcome (approved, denied) answers reads of it without counting them: the token was
+        // already made and the roster place used, and a stranger who learns the pid must not be able to spend the budget the phone
+        // needs to read its own result. What is left to bound is the reading itself, a small bucket per address and pid.
+        if (self::isOutcome($row)) {
+            $row = self::countOutcomeRead($ctx, $req, $pid, $row, $now);
+        } else {
+            $counted = $ctx->db->write(fn(Db $db): int => $db->exec("UPDATE pairings SET gets = gets + 1 WHERE pid = ? AND gets < ? AND state IN ('open', 'answered')", [$pid, Pairing::GETS_MAX]));
+            if ($counted !== 1) {
+                $fresh = Pairing::live($ctx->db, $pid, $now);
+                if ($fresh === null) {
+                    throw ApiError::make('not_found');
+                }
+                if (!self::isOutcome($fresh)) {
+                    throw new ApiError(429, 'rate_limited', null, max(1, min(60, (int)$row['exp'] - $now)));
+                }
+                $row = self::countOutcomeRead($ctx, $req, $pid, $fresh, $now); // the outcome came while this request counted
             }
-            throw new ApiError(429, 'rate_limited', null, max(1, min(60, (int)$row['exp'] - $now)));
         }
 
         $state = (string)$row['state'];
@@ -129,6 +140,27 @@ final class PairingApi
             $body['hold'] = $holdInfo;
         }
         return Response::json(200, $body, $headers);
+    }
+
+    /** True for a rendezvous that has an outcome for the phone to read: approved or denied. @param array<string,mixed> $row */
+    private static function isOutcome(array $row): bool
+    {
+        return $row['state'] === 'approved' || $row['state'] === 'denied';
+    }
+
+    /**
+     * A read of an outcome is not counted against the rendezvous's 60; it is counted against its own bucket, per client address and
+     * pid (10 a minute: a phone reads its result once or twice), so that one address cannot make the relay do work for ever.
+     * @param array<string,mixed> $row
+     * @return array<string,mixed> the row
+     */
+    private static function countOutcomeRead(Context $ctx, Request $req, string $pid, array $row, int $now): array
+    {
+        $retry = $ctx->limiter->hit('pair.done:' . $req->client . ':' . $pid, Pairing::OUTCOME_READS_PER_MINUTE, 60);
+        if ($retry !== null) {
+            throw new ApiError(429, 'rate_limited', null, $retry);
+        }
+        return $row;
     }
 
     /**

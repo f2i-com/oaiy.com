@@ -1241,6 +1241,56 @@ test('4.10.6 a rendezvous answers 60 GETs in its life; the 61st is 429 rate_limi
     eq(202, $c->answer(null, ['REMOTE_ADDR' => '198.51.100.98'])['status'], 'the budget is for GETs: the answer still goes through');
 });
 
+test('4.10.6 the 60 GETs are for a rendezvous that is open or answered: one that has an outcome (approved, denied) answers reads without counting them, so nobody who learns the pid can spend the budget the phone needs to read its own result; a read of an outcome has its own small bucket per address and pid', function () {
+    foreach (['approved', 'denied'] as $outcome) {
+        [$r, $d, $c] = pair_setup();
+        $c->open();
+        eq(200, $c->get([], ['REMOTE_ADDR' => '198.51.100.1'])['status']);
+        $c->answer();
+        eq(200, $c->get([], ['REMOTE_ADDR' => '198.51.100.2'])['status']);
+        eq(200, $c->decide($outcome === 'approved' ? null : ['approve' => false])['status']);
+        eq(2, (int)pair_row($r, $c->pid)['gets'], 'the reads before the outcome were counted');
+        // Far more than 60 reads of the outcome, from many addresses (each is far below its own limits): every one is served, none counted.
+        for ($i = 0; $i < 150; $i++) {
+            $res = $c->get([], ['REMOTE_ADDR' => '198.51.' . (100 + intdiv($i, 100)) . '.' . (10 + $i % 100)]);
+            eq(200, $res['status'], "$outcome read $i: " . $res['body']);
+            eq($outcome, $res['json']['state']);
+        }
+        eq(2, (int)pair_row($r, $c->pid)['gets'], "$outcome: 150 reads of the outcome counted nothing");
+        ok($outcome !== 'approved' || isset($res['json']['sealedToken']), 'the token is there to read');
+        // The small bucket: 10 a minute per address and pid.
+        $a = ['REMOTE_ADDR' => '203.0.113.77'];
+        for ($i = 1; $i <= 10; $i++) {
+            eq(200, $c->get([], $a)['status'], "$outcome: read $i of the address");
+        }
+        $res = $c->get([], $a);
+        eq(429, $res['status'], $outcome . ': the 11th');
+        eq('rate_limited', pair_code($res));
+        ok((int)$res['headers']['retry-after'] >= 1 && (int)$res['headers']['retry-after'] <= 60);
+        eq(200, $c->get([], ['REMOTE_ADDR' => '203.0.113.78'])['status'], 'another address');
+        $other = Ceremony::random($r, $d);
+        $other->open();
+        $other->answer();
+        $other->decide($outcome === 'approved' ? null : ['approve' => false]);
+        eq(200, $other->get([], $a)['status'], 'the outcome of another rendezvous, from the same address: the bucket is per address and pid');
+        Tmp::setClock(Relay::T0 + 61);
+        eq(200, $c->get([], $a)['status'], 'a minute later');
+    }
+    // The budget of a rendezvous that is still open or answered is what it was: the 61st read is 429, and it stays 429 for that pid.
+    [$r, $d, $c] = pair_setup();
+    $c->open();
+    for ($i = 1; $i <= 60; $i++) {
+        eq(200, $c->get([], ['REMOTE_ADDR' => '198.51.100.' . $i])['status']);
+    }
+    eq(429, $c->get([], ['REMOTE_ADDR' => '198.51.100.99'])['status']);
+    $c->answer(null, ['REMOTE_ADDR' => '198.51.100.98']);
+    eq(429, $c->get([], ['REMOTE_ADDR' => '198.51.100.97'])['status'], 'answered is not an outcome');
+    eq(200, $c->decide()['status']);
+    $res = $c->get([], ['REMOTE_ADDR' => '198.51.100.96']);
+    eq([200, 'approved'], [$res['status'], $res['json']['state']], 'but once it has an outcome the phone can read it, whatever was spent before');
+    eq(60, (int)pair_row($r, $c->pid)['gets']);
+});
+
 test('4.7.1 ip.pair: an address gets 30 requests a minute on the phone\'s two routes (GET and response); the 31st is 429 with Retry-After, the next minute is fine, another address is not affected, and the desktop\'s own routes are not counted', function () {
     [$r, $d, $c] = pair_setup();
     $c->open();

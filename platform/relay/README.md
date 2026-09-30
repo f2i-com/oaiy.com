@@ -272,7 +272,7 @@ the relay only stores and forwards. The steps and their answers are in the proto
   body), a bad request body is `400` whatever the pid, and a wait for an unknown pid returns at once. Nothing tells a stranger
   which pids exist.
 - **Limits** (each has a test): an offer of 4,096 bytes, a response of 8,192, three responses and three rejects per rendezvous,
-  60 `GET`s in its life, at most 900 seconds of life (600 by default), 16 rendezvous open per desktop, 30 requests a minute per
+  60 `GET`s while it is open or answered (reads of an outcome are not counted; they have a bucket of 10 a minute per address and pid), at most 900 seconds of life (600 by default), 16 rendezvous open per desktop, 30 requests a minute per
   client address on the phone's two routes, and at most 4 waiting requests per address. A waiting `GET` is an edge hold: when the
   worker pool is nearly full it is answered at once with `hold.refused` and the phone short-polls.
 - **The sealed token.** On approval the relay creates the phone's device, mints its token, seals it with `sodium_crypto_box_seal`
