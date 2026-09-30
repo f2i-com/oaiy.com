@@ -22,6 +22,9 @@ defined('OAIY_RELAY') or exit;
 final class Stream
 {
     public const KEEPALIVE_S = 2.0;
+    /** How long after a keepalive the empty comment that finds a hung-up client is written, and that comment. */
+    public const PROBE_AFTER_S = 0.25;
+    public const PROBE = ":\n\n";
     public const COALESCE_MS = 50;
     public const STEP_MS = 200;
     /**
@@ -72,6 +75,7 @@ final class Stream
         }
         $lastOut = Clock::mono();
         $startedAt = $lastOut;
+        $probeAt = null;
         $wakeFile = $ctx->cfg->wakeMode() === 'file';
         $w0 = $wakeFile ? $ctx->signals->wakeRead($f->mailbox) : '';
         $safety = $wakeFile ? $ctx->cfg->wakeSafetyMs() / 1000.0 : 0.5;
@@ -116,6 +120,16 @@ final class Stream
                     return $cursor;
                 }
                 $lastOut = Clock::mono();
+                $probeAt = $lastOut + self::PROBE_AFTER_S;
+            }
+            // The first write to a connection whose client has gone succeeds (the peer's reset comes back afterwards) and only the
+            // next one fails, so a keepalive alone would find a hung-up client one keepalive later: about 4 seconds. A second, empty
+            // comment a quarter second after each keepalive finds it after about 2. (A frame that is written is a write too.)
+            if ($probeAt !== null && Clock::mono() >= $probeAt) {
+                $probeAt = null;
+                if (!$write(self::PROBE)) {
+                    return $cursor;
+                }
             }
             $left = $deadline - Clock::mono();
             if ($left <= 0) {
@@ -130,6 +144,11 @@ final class Stream
     /**
      * The frames long poll: frames after $since as they are, else wait up to $seconds for one. A wait ends early when a newer
      * one for the same party takes over (an empty page) and with 401 when the device is revoked.
+     *
+     * A wait writes nothing until it ends (a byte written now would commit the status and the headers of the answer, which are not
+     * known yet), and PHP learns that a client has hung up only when it writes, so a client that goes away is not noticed until the
+     * wait's own end (at most 20 seconds). What bounds it: a newer wait or stream of the same party ends it within a step, at most three
+     * of a party run at once, and a bucket bounds how often a party may open one. (The stream, which does write, notices in about two.)
      *
      * @param callable():bool $superseded
      * @return array{0:list<array<string,mixed>>,1:bool} the frames, and whether it was superseded

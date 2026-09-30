@@ -48,7 +48,7 @@
     },
     {
       "name": "an idle stream",
-      "note": "Nothing to say: the preamble, a keepalive comment 2 seconds in (both carriers' 45 second freshness timer is fed by it), and end.",
+      "note": "Nothing to say: the preamble, a keepalive comment 2 seconds in (both carriers' 45 second freshness timer is fed by it), an empty comment a quarter second after it (the second write, which finds a client that has hung up), and end. Both are comments: no event.",
       "request": {
         "method": "GET",
         "path": "/v1/aokie-companion/relay/stream",
@@ -57,7 +57,7 @@
           "Accept": "text/event-stream"
         }
       },
-      "body": "retry: 2000\n\n: connected\n\n: keepalive\n\nid: 0\nevent: end\ndata: {}\n\n"
+      "body": "retry: 2000\n\n: connected\n\n: keepalive\n\n:\n\nid: 0\nevent: end\ndata: {}\n\n"
     }
   ]
 }

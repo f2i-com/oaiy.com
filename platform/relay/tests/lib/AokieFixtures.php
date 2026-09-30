@@ -218,7 +218,7 @@ final class AokieFixtures
         };
         $run('the plugin\'s stream with three frames waiting', 'The preamble, one frame event per frame with id = seq, and end with the cursor. The stream lasts min(20, wait.max) seconds; this recording is cut at 0.6.', $ptok, 0, 0.6, 'the plugin');
         $run('resuming after the second', 'A carrier that saw event 2 opens with since=2 (the plugin does; Last-Event-ID does the same).', $ptok, 2, 0.6, 'the plugin');
-        $run('an idle stream', 'Nothing to say: the preamble, a keepalive comment 2 seconds in (both carriers\' 45 second freshness timer is fed by it), and end.', $btok, 0, 2.3, 'phone B');
+        $run('an idle stream', 'Nothing to say: the preamble, a keepalive comment 2 seconds in (both carriers\' 45 second freshness timer is fed by it), an empty comment a quarter second after it (the second write, which finds a client that has hung up), and end. Both are comments: no event.', $btok, 0, 2.6, 'phone B');
         $files['stream.json'] = self::head('The framed stream, recorded byte for byte',
             'The body of GET /v1/aokie-companion/relay/stream as the relay writes it (status 200, Content-Type text/event-stream; charset=utf-8, Cache-Control no-store, X-Accel-Buffering no). Feed each body to the carriers\' SseParser, whole and split at every offset.')
             + ['relay' => self::relayInfo(), 'cases' => $streams];

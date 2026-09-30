@@ -140,7 +140,7 @@ test('4.14.5 a frame posted while a stream waits arrives at once as an event (id
     eq([1, 2, 3], array_map(fn($f) => $f['frame']['n'], array_values($frames)));
     eq(['seq', 'from', 'subjectId', 'grants', 'frame'], array_keys($frames[1]));
     eq(['mobile:' . $k->thumb($a), $a->id], [$frames[1]['from'], $frames[1]['subjectId']]);
-    eq(1, preg_match('/id: 3\nevent: frame\ndata: \{"seq":3,.*\}\n\n(: keepalive\n\n)?id: 3\nevent: end\ndata: \{\}\n\n$/D', $res['body']), 'the end carries the cursor');
+    eq(1, preg_match('/id: 3\nevent: frame\ndata: \{"seq":3,.*\}\n\n(: keepalive\n\n(:\n\n)?)?id: 3\nevent: end\ndata: \{\}\n\n$/D', $res['body']), 'the end carries the cursor');
     $events = array_map(fn($e) => $e['event'] ?? ($e['comment'] ?? 'retry'), aks_events($res['body']));
     eq('end', end($events));
 });
@@ -319,7 +319,40 @@ test('4.14.5 a client that hangs up is noticed within about 2 seconds (the keepa
     }
     $took = microtime(true) - $t;
     eq(0, aks_holds($k)['stream'], 'the hold was still there after ' . round($took, 1) . ' s');
-    ok($took < 4.5, 'noticed after ' . round($took, 1) . ' s');
+    ok($took < 3.4, 'noticed after ' . round($took, 1) . ' s (about 2, and not the 4 that a keepalive alone took: the first write to a closed connection succeeds)');
+});
+
+test('4.14.5 each keepalive is followed a quarter second later by an empty comment, so that a hung-up client is found by the second write after about 2 seconds and not the fourth second: the writes, and the end at the first that fails', function () {
+    [$k, $a, $b, $plug, $ta] = aok_pair();
+    $f = $k->facade($ta);
+    $writes = [];
+    $t0 = microtime(true);
+    $took = null;
+    // A client that hung up at once: the first write to it (the preamble) and the next (the keepalive) go through, the one after
+    // fails, as on a real connection whose peer has closed.
+    Stream::run($k->r->ctx(), $f, 0, 20.0, static function (string $b) use (&$writes, $t0): bool {
+        $writes[] = [round(microtime(true) - $t0, 2), $b];
+        return count($writes) <= 2;
+    }, static fn(): bool => false);
+    $took = microtime(true) - $t0;
+    eq([Stream::PREAMBLE, ": keepalive\n\n", Stream::PROBE], array_column($writes, 1), 'preamble, keepalive, the empty comment that fails');
+    between(1.9, 2.4, $writes[1][0], 'the keepalive at 2 s');
+    between(0.2, 0.5, $writes[2][0] - $writes[1][0], 'the empty comment a quarter second after it');
+    ok($took < 3.0, 'the stream ended after ' . round($took, 2) . ' s (it would have gone on to the fourth second without the second write)');
+    eq(":\n\n", Stream::PROBE);
+    eq(0.25, Stream::PROBE_AFTER_S);
+});
+
+test('4.14.5 a frames wait writes nothing until it ends, so its answer has the status and the headers it means to: JSON, the hold header, no headers sent early by a flush', function () {
+    [$k, $a, $b, $plug, $ta] = aok_pair(['wait' => ['max' => 3]]);
+    [$srv] = $k->r->fleet(1);
+    usleep(300000);
+    $res = Relay::http($srv, $plug, 'GET', AKS_FRAMES . '?since=0&wait=3', null, [], ['timeout' => 8]);
+    eq(200, $res['status']);
+    contains('application/json', $res['headers']['content-type'] ?? '');
+    eq('granted', $res['headers']['x-oaiy-hold'] ?? '');
+    eq(['granted' => true], $res['json']['hold']);
+    ok($res['json'] !== null, 'the body is the page');
 });
 
 test('4.14.5 revoking the phone ends its stream within a step with an end event, and the next request is 401 revoked', function () {
