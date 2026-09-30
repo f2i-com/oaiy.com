@@ -198,6 +198,46 @@
       "reason": "The receptionist reads the business's name, the services and a caller's appointments before it answers, and says them to callers; the Agent reads each appointment's name and notes; and the phone sends every appointment it has no copy of at FormLogic to your linked FormLogic account. All of that needs the tick. Only the opening hours and the steps between the times offered are typed values that carry no words and come back without one. The sync with FormLogic is never restored."
     },
     {
+      "id": "messages",
+      "class": "runs",
+      "tick": "messages",
+      "category": "messages",
+      "paths": ["messages/messages.json"],
+      "what": "The messages callers left for you",
+      "reason": "Each holds what a caller said and the number they rang from or asked to be rung on. A file that was not made by you could put words in front of you, and numbers to ring back, that no caller left; and a restore replaces the messages that are here, which are your record of what callers asked and of what you did about it.",
+      "reads": "The Messages page shows them to the owner, the Agent can read them (GET /api/messages), the notifier says each new one, and a message marked seen or handled is the owner's record of what was done about it.",
+      "readers": ["platform/desktop/src-tauri/src/messages/mod.rs#FILE_NAME", "platform/desktop/src-tauri/src/messages/routes.rs#pub fn"]
+    },
+    {
+      "id": "ring",
+      "class": "runs",
+      "tick": "transfers",
+      "category": "transfers",
+      "paths": ["ring.json"],
+      "keys": "ring",
+      "what": "Transfer settings, key by key (see the transfer table)",
+      "reason": "They are the owner's policy for putting callers through: whether the receptionist may try to reach you at all (it is off until you turn it on), whom and when, which numbers ring whatever the limits and the quiet hours say, and how often. Every key needs the transfers tick, so a backup that was not ticked for it cannot turn transfers on, name a number that rings whatever the limits say, or silence your phones. Which devices ring, and a timed 'away', are never restored."
+    },
+    {
+      "id": "ring-attempts",
+      "class": "excluded",
+      "paths": ["ring-attempts.json"],
+      "what": "The tries to put callers through in the last hour",
+      "reason": "The callers' numbers and the moments of the last hour's tries: it is what enforces the hourly limits. A restored one would count tries that were made on another computer, or at another time, against callers here; it starts again.",
+      "reads": "Only the limits read it, to count a caller's tries in the last hour; it feeds no other behaviour. It is excluded because it is run state of the computer that made it, and it holds callers' numbers.",
+      "readers": ["platform/desktop/src-tauri/src/ring/limits.rs#FILE_NAME"]
+    },
+    {
+      "id": "access",
+      "class": "excluded",
+      "paths": ["auth/**"],
+      "what": "Who may use this computer: the access model's credentials, sessions, owner record, audit trail and throttle",
+      "reason": "It decides who can reach OAIY and what they may do: the paired programs and apps and what each holds, the owner's password record, the sessions and the failed attempts that are being held back. A backup never holds it and a restore never replaces it: a file that was not made here must not be able to add a credential, remove the owner or clear a block. The audit trail is the record of what was done with them. Nothing of it is brought back.",
+      "redo": "Sign in, and pair your programs and apps, again on this computer.",
+      "reads": "The guard of every route reads the credentials, the owner record and the throttle to decide who may call it; the audit trail is written by the guard and shown to the owner, and nothing reads it as an instruction. All of it is excluded because it is who may reach this computer, not a setting of it.",
+      "readers": ["platform/desktop/src-tauri/src/auth/store.rs#credentials.json", "platform/desktop/src-tauri/src/auth/audit.rs#audit.jsonl"]
+    },
+    {
       "id": "triggers",
       "class": "runs",
       "tick": "flows",
@@ -526,6 +566,39 @@
       ]
     },
 
+    "ring": {
+      "file": "ring.json",
+      "about": "The owner's settings for transferring calls and taking messages. Everything in it is off until the owner turns it on. Every key that decides whether a caller is put through, to whom, when or how often is the owner's policy on this computer and needs the transfers tick: a backup that was not ticked for it brings none of them back, so a file that was not made by you cannot turn transfers on, name a number that rings whatever the limits say, or silence your phones. The devices that ring (by thumbprint) and a timed 'away' are never restored. Every key not listed here is left out.",
+      "keys": [
+        { "path": "version", "class": "excluded", "what": "The shape of the file", "reason": "The program writes it, and a file of another shape is put aside." },
+        { "path": "enabled", "class": "runs", "tick": "transfers", "type": "bool", "what": "Transfer calls to me", "reason": "It lets the receptionist try to put a caller through to you when they ask for a person. It is off until you turn it on." },
+        { "path": "takeMessages", "class": "runs", "tick": "transfers", "type": "bool", "what": "Take messages", "reason": "It lets the receptionist record a message for you (it is on whenever transfers are)." },
+        { "path": "initiative", "class": "runs", "tick": "transfers", "type": "enum", "options": ["on_request", "on_request_or_urgent"], "what": "When the receptionist may put a caller through on its own", "reason": "It decides whether a caller who says an urgent phrase is put through without asking for a person." },
+        { "path": "urgentPhrases", "class": "runs", "tick": "transfers", "type": "strings", "maxItems": 20, "maxChars": 40, "what": "Phrases that make a request urgent", "reason": "A caller who says one is put through, when the initiative allows it." },
+        { "path": "ringSeconds", "class": "runs", "tick": "transfers", "type": "int", "min": 20, "max": 90, "what": "How long a ring lasts, in seconds", "reason": "It decides how long your devices ring." },
+        { "path": "phoneRing", "class": "runs", "tick": "transfers", "type": "enum", "options": ["when_away", "always", "never"], "what": "When phones ring", "reason": "It decides whether your phones ring: `never` silences them." },
+        { "path": "desktopRing", "class": "runs", "tick": "transfers", "type": "enum", "options": ["auto", "always", "never"], "what": "When this computer rings", "reason": "It decides whether this computer rings." },
+        { "path": "away", "class": "runs", "tick": "transfers", "type": "enum", "options": ["auto", "on", "off"], "what": "Whether you are away", "reason": "It decides whether your phones ring: `on` says you are away, `off` says you are not." },
+        { "path": "awayUntil", "class": "excluded", "what": "When a timed 'away' ends", "reason": "It is a moment on the computer the backup came from: by the time the backup is restored it has passed." },
+        { "path": "desktopActiveSeconds", "class": "runs", "tick": "transfers", "type": "int", "min": 30, "max": 900, "what": "How recent your last input counts as being at the computer, in seconds", "reason": "It decides whether this computer rings." },
+        { "path": "quietHours", "class": "runs", "tick": "transfers", "type": "object", "what": "Hours nobody is rung" },
+        { "path": "quietHours.enabled", "class": "runs", "tick": "transfers", "type": "bool", "what": "Quiet hours are on", "reason": "Switched off, nobody is kept from ringing at night." },
+        { "path": "quietHours.start", "class": "runs", "tick": "transfers", "type": "time", "what": "When the quiet hours start", "reason": "It decides when nobody is rung." },
+        { "path": "quietHours.end", "class": "runs", "tick": "transfers", "type": "time", "what": "When the quiet hours end", "reason": "It decides when nobody is rung." },
+        { "path": "quietHours.days", "class": "runs", "tick": "transfers", "type": "int", "min": 0, "max": 127, "what": "The days the quiet hours start on", "reason": "One bit a day: it decides on which days nobody is rung." },
+        { "path": "quietHours.allowUrgent", "class": "runs", "tick": "transfers", "type": "bool", "what": "An urgent request still rings in the quiet hours", "reason": "It decides whether an urgent request rings at night." },
+        { "path": "quietHours.allowVip", "class": "runs", "tick": "transfers", "type": "bool", "what": "A VIP still rings in the quiet hours", "reason": "It decides whether a VIP rings at night." },
+        { "path": "vipNumbers", "class": "runs", "tick": "transfers", "type": "strings", "maxItems": 50, "maxChars": 40, "what": "Numbers that ring whatever the limits and the quiet hours say", "reason": "A number on the list is put through when it asks, however often it has tried and whatever the hour." },
+        { "path": "limits", "class": "runs", "tick": "transfers", "type": "object", "what": "How often a caller may be put through" },
+        { "path": "limits.perCall", "class": "runs", "tick": "transfers", "type": "int", "min": 1, "max": 5, "what": "Tries on one call", "reason": "It limits how often one call may ring you." },
+        { "path": "limits.gapSeconds", "class": "runs", "tick": "transfers", "type": "int", "min": 10, "max": 600, "what": "Seconds between two tries on one call", "reason": "It limits how often one call may ring you." },
+        { "path": "limits.perCallerHour", "class": "runs", "tick": "transfers", "type": "int", "min": 1, "max": 10, "what": "Tries for one caller in an hour", "reason": "It limits how often one caller may ring you." },
+        { "path": "limits.globalHour", "class": "runs", "tick": "transfers", "type": "int", "min": 1, "max": 100, "what": "Tries in an hour, all callers", "reason": "It limits how often callers together may ring you." },
+        { "path": "windowsCompanions", "class": "excluded", "what": "Which approved companions are the Windows Companion on this computer", "reason": "They name devices by thumbprint: trust in a device belongs to the computer it was paired with, and a restored list would ring, or not ring, a device that was never paired here.", "redo": "Choose which devices ring again in the transfer settings." },
+        { "path": "excludedDevices", "class": "excluded", "what": "Which approved companions are never rung", "reason": "They name devices by thumbprint: trust in a device belongs to the computer it was paired with.", "redo": "Choose which devices ring again in the transfer settings." }
+      ]
+    },
+
     "plugin.aokie": {
       "file": "plugin-data/aokie/settings.json",
       "about": "Aokie's settings file: a document with a `settings` bag and a few fields of its own. Every key not listed here is left out.",
@@ -732,7 +805,7 @@
 
   "audit": [
     { "item": "Themes", "class": "not stored", "reads": "The page's themes ship inside the program (the folder theme is looked in, not written); a person's choice of theme lives in the browser and is not in the data folder or in the Agent's storage that a backup reads. It feeds no behaviour.", "why": "Nothing is stored that a restore could write, so there is nothing to classify.", "readers": ["platform/desktop/src-tauri/src/backup/table.json#\"theme\": \"not-a-store"] },
-    { "item": "A Messages store", "class": "not stored", "reads": "There is none: a text conversation is a conversation of the front desk (opfs/front-desk/sessions), and the texts' settings are the Agent's settings (messages.*). Both are rows of this table.", "why": "A store that appears later is refused by the scanner tests until it is classified.", "readers": ["platform/desktop/src-tauri/src/backup/table.json#agent-desk-sessions"] }
+    { "item": "A text conversation's store", "class": "not stored", "reads": "There is none of its own: a text conversation is a conversation of the front desk (opfs/front-desk/sessions), and the texts' settings are the Agent's settings (messages.*). Both are rows of this table. The messages callers leave for the owner are a store of the desktop of their own (messages/messages.json: the row `messages`, with its own tick).", "why": "A store that appears later is refused by the scanner tests until it is classified.", "readers": ["platform/desktop/src-tauri/src/backup/table.json#agent-desk-sessions"] }
   ],
 
   "scan": {
@@ -740,6 +813,7 @@
     "desktopNames": {
       ".install-markers-backfilled": "rebuilt",
       ".install.lock": "rebuilt",
+      ".lock.pid": "access",
       ".model-catalog.seed.json": "rebuilt",
       ".oaiy-server": "not-a-store: the folder the headless server keeps its data in, under the home folder: it is a place a data folder can be, not a store inside one",
       ".oaiy-write-test": "own-state",
@@ -747,11 +821,14 @@
       "Programs": "not-a-store: a Windows folder that is looked in for an installed program",
       "Scripts": "not-a-store: the folder of programs inside a Python environment, which is left out with venvs",
       "System32": "not-a-store: a Windows system folder that is looked in for a program",
+      "access": "not-a-store: the folder the access model's route export is written to for its checks, under the build's target folder: never in the data folder",
       "agent.json": "settings-files",
       "ai": "provider-list",
       "aokie-stt.json": "templates",
       "aokie-tts.json": "templates",
       "app-logic-storage.json": "link-state",
+      "audit.jsonl": "access",
+      "auth": "access",
       "auth.json": "secret-names",
       "bin": "programs",
       "calendar": "calendar",
@@ -763,6 +840,7 @@
       "completions": "link-state",
       "connector.json": "not-a-store: a file in the scratch folder of one flow run, deleted when it ends",
       "connectors": "connectors",
+      "credentials.json": "access",
       "data": "plugins",
       "data-node-signing.key": "data-node-key",
       "desktop-config.json": "machine-config",
@@ -788,18 +866,25 @@
       "logs": "logs-and-caches",
       "ltx2-video.json": "templates",
       "manifest.json": "plugins",
+      "messages": "messages",
+      "messages.json": "messages",
+      "mod.rs": "not-a-store: a source file of the access model that its conformance test reads",
       "model-catalog.json": "rebuilt",
       "models": "programs",
       "node": "programs",
+      "noise.jsonl": "access",
+      "oaiy-access": "not-a-store: the fallback folder of the access model's route export, in the system's temporary files",
       "oaiy-backup-unavailable": "not-a-store: the fallback name of a folder in the system's temporary files",
       "oaiy-control-unavailable": "not-a-store: the fallback name of a folder in the system's temporary files",
       "oaiy-desktop-fallback": "not-a-store: the fallback name of a folder in the system's temporary files",
       "oaiy-desktop.log": "logs-and-caches",
+      "oaiy-legacy-neutrality-nothing-is-made-here": "not-a-store: a folder name a test points the legacy guard at: nothing is ever made there",
       "oaiy-setup-unavailable": "not-a-store: the fallback name of a folder in the system's temporary files",
       "oaiy-studio.json": "engines",
       "oaiy-voice.json": "templates",
       "ollama.json": "templates",
       "outbox": "link-state",
+      "owner.json": "access",
       "package-manifest.json": "plugins",
       "playwright-browser.json": "templates",
       "plugin-data": "plugin-data-other",
@@ -815,7 +900,10 @@
       "resources": "not-a-store: the folder of files that ship inside the program",
       "resources/node": "not-a-store: the folder of files that ship inside the program",
       "result.json": "not-a-store: a file in the scratch folder of one job or flow run, deleted when it ends",
+      "ring-attempts.json": "ring-attempts",
+      "ring.json": "ring",
       "roster.json": "companion",
+      "routes.json": "not-a-store: the route table as the access model exports it for its checks: not a file of the data folder",
       "script-profile.json": "link-state",
       "scripts": "rebuilt",
       "services-autostart.json": "autostart",
@@ -825,6 +913,7 @@
       "src": "not-a-store: the program's own source folder, looked for when it runs from a checkout",
       "templates": "templates",
       "theme": "not-a-store: the folder of the page's themes, which ships inside the program",
+      "throttle.json": "access",
       "trusted-plugins.json": "plugins",
       "venvs": "programs",
       "voices": "voices"

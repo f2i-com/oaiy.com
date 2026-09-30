@@ -31,6 +31,8 @@ use super::table::{table, Class, Row};
 pub enum Category {
     Contacts,
     Calendar,
+    Messages,
+    Transfers,
     Flows,
     Settings,
     History,
@@ -43,9 +45,11 @@ pub enum Category {
 }
 
 impl Category {
-    pub const ALL: [Category; 11] = [
+    pub const ALL: [Category; 13] = [
         Category::Contacts,
         Category::Calendar,
+        Category::Messages,
+        Category::Transfers,
         Category::Flows,
         Category::Settings,
         Category::History,
@@ -61,6 +65,8 @@ impl Category {
         match self {
             Category::Contacts => "contacts",
             Category::Calendar => "calendar",
+            Category::Messages => "messages",
+            Category::Transfers => "transfers",
             Category::Flows => "flows",
             Category::Settings => "settings",
             Category::History => "history",
@@ -78,6 +84,8 @@ impl Category {
         match self {
             Category::Contacts => "Contacts and what is remembered about callers",
             Category::Calendar => "Calendar",
+            Category::Messages => "Messages callers left",
+            Category::Transfers => "Transfer settings",
             Category::Flows => "Flows and triggers",
             Category::Settings => "Settings and setup",
             Category::History => "Run history and the Agent's change log",

@@ -44,6 +44,11 @@ pub enum RestoreClass {
     /// The calendar's words: the business's name, the services and the appointments' names and notes, which the receptionist
     /// reads before it answers and says to callers.
     Calendar,
+    /// The messages callers left for the owner (`messages/messages.json`): a caller's words and number each.
+    Messages,
+    /// The owner's transfer policy (`ring.json`): whether the receptionist may put a caller through to the owner, whom, when and how often,
+    /// and which numbers ring whatever the limits say.
+    Transfers,
     /// The phone's earlier conversations (each call and text thread): loaded into a model as what was said before, and
     /// handed back to it by the earlier_conversations tool.
     Conversations,
@@ -55,7 +60,7 @@ pub enum RestoreClass {
 }
 
 impl RestoreClass {
-    pub const ALL: [RestoreClass; 13] = [
+    pub const ALL: [RestoreClass; 15] = [
         RestoreClass::Settings,
         RestoreClass::Templates,
         RestoreClass::Flows,
@@ -66,6 +71,8 @@ impl RestoreClass {
         RestoreClass::Voices,
         RestoreClass::Memory,
         RestoreClass::Calendar,
+        RestoreClass::Messages,
+        RestoreClass::Transfers,
         RestoreClass::Conversations,
         RestoreClass::Outreach,
         RestoreClass::AgentData,
@@ -83,6 +90,8 @@ impl RestoreClass {
             RestoreClass::Voices => "voices",
             RestoreClass::Memory => "memory",
             RestoreClass::Calendar => "calendar",
+            RestoreClass::Messages => "messages",
+            RestoreClass::Transfers => "transfers",
             RestoreClass::Conversations => "conversations",
             RestoreClass::Outreach => "outreach",
             RestoreClass::AgentData => "agentData",
@@ -105,6 +114,8 @@ impl RestoreClass {
             RestoreClass::Voices => "Voices your callers hear",
             RestoreClass::Memory => "Contacts and notes your receptionist reads",
             RestoreClass::Calendar => "Calendar text your receptionist reads",
+            RestoreClass::Messages => "Messages callers left for you",
+            RestoreClass::Transfers => "Transfer settings (whether callers may be put through to you, whom, and when)",
             RestoreClass::Conversations => "Earlier conversations (calls and texts)",
             RestoreClass::Outreach => "Outreach campaigns (texts and calls to a list of people)",
             RestoreClass::AgentData => "The Agent's projects, brief and knowledge files",
@@ -123,6 +134,8 @@ impl RestoreClass {
             RestoreClass::Voices => "A voice is what your callers hear. A sample or a setting from a file that was not made by you would speak to them in your name.",
             RestoreClass::Memory => "The receptionist and the Agent read what is remembered about a person, and the notes for the receptionist, before they answer them. It is read as instructions, so a file that was not made by you could steer what they say.",
             RestoreClass::Calendar => "The receptionist reads the business's name, the services (their names, prices and descriptions) and, for a caller, their appointments before it answers, says them to callers, and the Agent reads each appointment's name and notes. The phone also sends every appointment it has no copy of at FormLogic to your linked FormLogic account, so the appointments come only with the tick too. Opening hours and the steps between the times offered are brought back without a tick.",
+            RestoreClass::Messages => "Each message holds a caller's words and the number they rang from or asked to be rung on. The Messages page shows them to you, the Agent can read them, and a message you marked as seen or handled is your record of what was done. A file that was not made by you could put words in front of you, and numbers to ring back, that no caller left, and it replaces the messages that are here. Each is counted, and the newest are listed.",
+            RestoreClass::Transfers => "These are your policy for transferring calls: whether the receptionist may try to put a caller through to you at all (it is off until you turn it on), whom it may put through and when, which numbers ring whatever the limits and the quiet hours say, and how often a caller may try. A file that was not made by you could turn transfers on, name a number that rings whatever the limits say, or silence your phones, so every key needs this tick and is listed with its value. Which devices ring, and a timed 'away', are never brought back.",
             RestoreClass::Conversations => "Every call and text thread is loaded into the model as what was said before, and the earlier_conversations tool hands what was said in earlier calls and texts back to it, so a conversation from a file that was not made by you could steer what the receptionist says next. Each is listed by size.",
             RestoreClass::Outreach => "A campaign texts or calls the people on its list. A restored campaign is always PAUSED: it is never running and nothing is scheduled. It is listed by name with the number of people, and you start each one yourself.",
             RestoreClass::AgentData => "The Agent reads its projects (their files and their own conversations), the front desk's brief and its knowledge files as context and instructions: the brief wins over what the phone's agents would otherwise say. Each project and file is listed by name and size.",
@@ -195,6 +208,8 @@ pub struct Local {
     pub template_ids: HashSet<String>,
     /// The ids of the connectors OAIY ships.
     pub builtin_connectors: HashSet<String>,
+    /// How many messages callers left are here now (a restore with the messages tick replaces them).
+    pub messages_here: usize,
 }
 
 impl Local {
@@ -211,7 +226,12 @@ impl Local {
             }
         }
         let builtin_connectors = crate::link::descriptor::load_all(&data_dir.join("does-not-exist")).into_iter().map(|d| d.id).collect();
-        Self { template_ids, builtin_connectors }
+        let messages_here = std::fs::read(data_dir.join("messages").join("messages.json"))
+            .ok()
+            .and_then(|b| serde_json::from_slice::<Value>(b.strip_prefix(&[0xef, 0xbb, 0xbf][..]).unwrap_or(&b)).ok())
+            .and_then(|v| v.get("messages").and_then(Value::as_array).map(Vec::len))
+            .unwrap_or(0);
+        Self { template_ids, builtin_connectors, messages_here }
     }
 }
 
@@ -259,7 +279,10 @@ pub(crate) fn first_hidden_text(value: &Value, at: &str) -> Option<String> {
 /// a template's, a trigger's condition, a connector's, the notes about callers, the setup, agent and control records), is not brought back:
 /// a value in it hides text. The dry run says it, and staging leaves the file out.
 fn hidden_text_in(name: &str, bytes: &[u8]) -> Option<String> {
-    let watched = name.starts_with("flows/") || name.starts_with("templates/") || name.starts_with("connectors/") || matches!(name, "triggers.json" | "callers.json" | "setup.json" | "agent.json" | "control.json" | "services-autostart.json");
+    let watched = name.starts_with("flows/")
+        || name.starts_with("templates/")
+        || name.starts_with("connectors/")
+        || matches!(name, "triggers.json" | "callers.json" | "setup.json" | "agent.json" | "control.json" | "services-autostart.json" | "messages/messages.json");
     if !watched {
         return None;
     }
@@ -671,6 +694,25 @@ pub fn describe(class: RestoreClass, name: &str, bytes: &[u8], local: &Local, ba
             Ok(v) => describe_calendar(class, name, &v),
             Err(_) => vec![unreadable(class, name, "it is not valid JSON")],
         },
+        "messages/messages.json" => match value() {
+            Ok(v) => describe_messages(class, name, &v, local),
+            Err(_) => vec![unreadable(class, name, "it is not valid JSON")],
+        },
+        // The owner's transfer policy, key by key: every key that can act is an item with its value, and only with its tick.
+        "ring.json" => match value() {
+            Ok(v) => match table().key_table("ring") {
+                Some(keys) => {
+                    let found = filter_json(keys, &v, &|_| true);
+                    let mut items: Vec<ReviewItem> = found.kept.iter().filter(|k| k.row.class == Class::Runs && !matches!(k.value, Value::Object(_))).map(|k| key_item(name, k)).collect();
+                    if items.is_empty() {
+                        items.push(Parts::new("nothing").fixed("nothing", "Nothing in it is a transfer setting OAIY restores (which devices ring, and a timed 'away', are never brought back).").item(class, name, "Transfer settings"));
+                    }
+                    items
+                }
+                None => vec![unreadable(class, name, "OAIY does not know how to read it")],
+            },
+            Err(_) => vec![unreadable(class, name, "it is not valid JSON")],
+        },
         _ if name.starts_with("plugin-data/") => {
             let plugin = name.split('/').nth(1).unwrap_or("?");
             match table().key_table(&format!("plugin.{plugin}")) {
@@ -755,6 +797,43 @@ fn describe_calendar(class: RestoreClass, name: &str, document: &Value) -> Vec<R
     }
     // (A calendar with no words in it, only hours and times, has nothing to tick: it says nothing here.)
     items
+}
+
+/// The messages callers left: how many, in what state, from how many numbers, how many are here now (the restore replaces them), and the
+/// newest few by what the caller said and the number.
+const MAX_MESSAGES_SAMPLED: usize = 3;
+
+fn describe_messages(class: RestoreClass, name: &str, document: &Value, local: &Local) -> Vec<ReviewItem> {
+    let Some(list) = document.get("messages").and_then(Value::as_array) else { return vec![unreadable(class, name, "it is not a list of messages")] };
+    fn state_of(m: &Value) -> &str {
+        m.get("state").and_then(Value::as_str).unwrap_or("new")
+    }
+    let (new, seen, handled) = (list.iter().filter(|m| state_of(m) == "new").count(), list.iter().filter(|m| state_of(m) == "seen").count(), list.iter().filter(|m| state_of(m) == "handled").count());
+    let from = |m: &Value| s(m, "from").unwrap_or("").to_string();
+    let numbers: BTreeSet<String> = list.iter().map(from).filter(|f| !f.is_empty()).collect();
+    let hidden = list.iter().filter(|m| from(m).is_empty()).count();
+    let here = if local.messages_here == 0 { "None are here now.".to_string() } else { format!("They REPLACE the {} that are here now.", words(local.messages_here, "message", "messages")) };
+    let mut parts = Parts::new("messages").fixed(
+        "count",
+        format!(
+            "{} ({new} new, {seen} seen, {handled} handled) from {} and {} from a hidden number. Each holds what a caller said and the number they rang from or asked to be rung on. {here}",
+            words(list.len(), "message", "messages"),
+            words(numbers.len(), "number", "numbers"),
+            words(hidden, "message", "messages")
+        ),
+    );
+    // The newest few, by value: what a caller is made to have said is read here before it comes back.
+    let mut newest: Vec<&Value> = list.iter().collect();
+    newest.sort_by(|a, b| s(b, "at").unwrap_or("").cmp(s(a, "at").unwrap_or("")));
+    let said: Vec<String> = newest
+        .iter()
+        .take(MAX_MESSAGES_SAMPLED)
+        .map(|m| format!("{}, from {} ({}): {}", short(s(m, "at").unwrap_or("?"), 30), short(&from(m), 30), short(s(m, "name").unwrap_or(""), 40), quoted(s(m, "message").unwrap_or(""), 160)))
+        .collect();
+    if !said.is_empty() {
+        parts = parts.sample("newest", format!("The newest: {}.", said.join("; ")));
+    }
+    vec![parts.item(class, name, "Messages callers left")]
 }
 
 /// A voice file, by its name and size: it is audio, and is never read.
