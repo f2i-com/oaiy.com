@@ -25,7 +25,8 @@ final class Ice
     public const TTL_MIN = 60;
     public const TTL_MAX = 3600;
     public const TTL_DEFAULT = 600;
-    public const ID_DOMAIN = "oaiy-relay-turn-id\0";
+    /** FormLogic's own domain and construction (AokieCompanionIceConfiguration::opaqueId), so its unit-test vectors check this code. */
+    public const ID_DOMAIN = "aokie-turn-id\0";
 
     /** Fail closed on a bad turn or stun section of config.json. @param array<string,mixed> $c the merged configuration */
     public static function validate(array $c): void

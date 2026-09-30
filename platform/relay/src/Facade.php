@@ -45,13 +45,16 @@ final class Facade
         return strncmp($path, '/v1/aokie-companion/', 20) === 0;
     }
 
-    /** An error in the Aokie shape, with the headers the native shape sends. */
+    /**
+     * An error in the Aokie shape, with the headers the native shape sends. The body has exactly three members: the phone's
+     * decoder of an error (MobileApiError) is deny_unknown_fields, so a fourth would make it fall back to a bare status and
+     * lose the code and the message. The wait to honour is in the Retry-After header only.
+     */
     public static function error(ApiError $e): Response
     {
         $body = ['error' => true, 'code' => $e->errorCode, 'message' => $e->getMessage()];
         $h = [];
         if ($e->retryAfter !== null) {
-            $body['retryAfter'] = $e->retryAfter;
             $h['Retry-After'] = (string)$e->retryAfter;
         }
         if ($e->status === 401) {

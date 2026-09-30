@@ -236,7 +236,21 @@ test('4.14.3 the opaque TURN id is a keyed hash of role, app and subject: 32 hex
         neq($id, Ice::opaqueId(AokieRig::SECRET, $r, $a, $s), "$r $a $s");
     }
     neq($id, Ice::opaqueId(AokieRig::SECRET . 'x', 'mobile', 'aokie', 'dev-x'));
-    neq(substr(hash_hmac('sha256', "aokie-turn-id\0mobile\0aokie\0dev-x", AokieRig::SECRET), 0, 32), $id, 'not FormLogic\'s domain: one shared coturn secret does not make one id');
+});
+
+test('4.14.3 FormLogic\'s own known answers (its unit tests, computed with Python and openssl) come out byte for byte: the opaque ids and both minted admissions', function () {
+    $secret = 'turn-rest-test-secret-not-a-real-key-0123456789';
+    eq('JuQT1eNWDk2Eq9jjZeoF16I/xks=', Ice::credential($secret, '1784160600:aokie-test-opaque-id'));
+    eq('b76588edf0d149e1075b69631e94cc91', Ice::opaqueId($secret, 'mobile', 'app_test', 'device_test'));
+    eq('9ad5b440809a76e58520fa0d14e32626', Ice::opaqueId($secret, 'plugin', 'app_test', 'aokie'));
+    $turn = ['turn:turn.example.com:3478?transport=udp', 'turns:turn.example.com:5349?transport=tcp'];
+    $cfg = Config::fromArray(['public_url' => 'https://relay.example.com', 'turn' => ['urls' => $turn, 'secret' => $secret, 'ttl' => 600], 'stun' => ['urls' => ['stun:turn.example.com:3478']]], '/tmp/x');
+    $stun = ['urls' => ['stun:turn.example.com:3478'], 'username' => '', 'credential' => ''];
+    $mobile = Ice::forAdmission($cfg, 'mobile', 'app_test', 'device_test', 1784160000);
+    eq([$stun, ['urls' => $turn, 'username' => '1784160600:b76588edf0d149e1075b69631e94cc91', 'credential' => 'KHqzx1+wW92HnynGzGgLw5mZgwo=', 'expiresAt' => 1784160600]], $mobile['servers']);
+    eq([1784160600, false], [$mobile['expiresAt'], $mobile['relayOnly']]);
+    $plugin = Ice::forAdmission($cfg, 'plugin', 'app_test', 'aokie', 1784160000);
+    eq([$stun, ['urls' => $turn, 'username' => '1784160600:9ad5b440809a76e58520fa0d14e32626', 'credential' => 'Stdmtt53cR4OkoTsqwXpKqEeWas=', 'expiresAt' => 1784160600]], $plugin['servers']);
 });
 
 test('4.14.3 with no TURN configured iceServers holds only the STUN entry (or nothing) and turnCredentialExpiresAt is null; relayOnly follows the config', function () {

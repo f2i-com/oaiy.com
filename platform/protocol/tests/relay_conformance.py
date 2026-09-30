@@ -797,7 +797,7 @@ PLUGIN_TOKEN = vec["A4b"]["expected"]["tokenForOnePhone"]
 MOBILE_TOKEN = vec["A4"]["expected"]["token"]
 PHONE_TH, DESK_TH = TH["phone"], TH["desktopEndpoint"]
 ROSTER_HASH = roster_hash(7, [PHONE_TH])
-STUN = {"urls": ["stun:stun.example.com:3478"]}
+STUN = {"urls": ["stun:stun.example.com:3478"], "username": "", "credential": ""}   # the plugin decoder requires both members, empty on STUN
 TURN = {"urls": ["turn:turn.example.com:3478?transport=udp", "turns:turn.example.com:5349?transport=tcp"],
         "username": vec["A5"]["expected"]["username"], "credential": vec["A5"]["expected"]["credential"], "expiresAt": NOW + 600}
 RELAY_URLS = {"challengeUrl": "https://relay.example.com/v1/aokie-companion/relay/challenge",
@@ -807,7 +807,8 @@ ENDPOINT_KEY = {"algorithm": "ed25519", "publicKey": PUB["desktopEndpoint"], "th
 PLUGIN_RESPONSE = {
     "accessToken": PLUGIN_TOKEN, "tokenType": "Bearer", "expiresIn": 90, "expiresAt": NOW + 90,
     "gatewayUrl": "wss://relay.example.com/v2/realtime", "appId": "aokie", "subjectId": "aokie", "role": "plugin",
-    "scopes": ["state_read", "rtc_signal"], "device": {}, "iceServers": [STUN, TURN], "relayOnly": False,
+    "scopes": ["state_read", "rtc_signal"], "device": {"id": "aokie", "appId": "aokie", "subjectId": "aokie", "role": "plugin"},
+    "iceServers": [STUN, TURN], "relayOnly": False,
     "turnCredentialExpiresAt": NOW + 600, "endpointPublicKey": ENDPOINT_KEY, "holderKeyThumbprint": DESK_TH,
     "approvedPeerKeyThumbprints": [PHONE_TH], "peerRosterRevision": 7, "peerRosterHash": ROSTER_HASH, "relay": RELAY_URLS}
 MOBILE_RESPONSE = {
@@ -977,8 +978,17 @@ pos("challenge", "a plugin challenge", CHALLENGE_PLUGIN)
 pos("challenge", "a phone challenge", CHALLENGE_MOBILE)
 pos("compat-frames-request", "a frame to the plugin", {"to": "plugin", "frames": [{"type": "hello"}]})
 pos("compat-frames-request", "a frame to a phone", {"to": "mobile:" + PHONE_TH, "frames": [{"type": "state"}]})
-pos("compat-frames-accepted", "accepted", {"accepted": 1, "seq": 9})
-pos("compat-frames-page", "one frame", {"lastSeq": 9, "frames": [{"seq": 9, "from": "plugin", "subjectId": "aokie", "grants": ["state_read"], "frame": {"type": "state"}}]})
+FRAME = {"seq": 9, "from": "plugin", "subjectId": "aokie", "grants": ["state_read"], "frame": {"type": "state"}}
+pos("compat-frames-accepted", "accepted", {"accepted": 1, "seq": 9, "time": NOW})
+pos("compat-frames-accepted", "sixty-four accepted", {"accepted": 64, "seq": 2 ** 53 - 1, "time": NOW})
+pos("compat-frames-page", "one frame", {"frames": [FRAME], "lastSeq": 9, "time": NOW})
+pos("compat-frames-page", "the tail: no frames, lastSeq is the cursor asked for", {"frames": [], "lastSeq": 9, "time": NOW})
+pos("compat-frames-page", "a granted wait that found nothing", {"frames": [], "lastSeq": 9, "time": NOW, "hold": {"granted": True}})
+pos("compat-frames-page", "a wait ended by a newer one", {"frames": [], "lastSeq": 9, "time": NOW, "hold": {"granted": True, "superseded": True}})
+pos("compat-frames-page", "a wait the pool refused", {"frames": [FRAME], "lastSeq": 9, "time": NOW, "hold": {"refused": True, "retryAfter": 2}})
+pos("compat-stream-frame", "a frame from the plugin", FRAME)
+pos("compat-stream-frame", "a frame from a phone with the plugin's whole scope set", dict(FRAME, **{"from": "mobile:" + PHONE_TH, "subjectId": PHONEID, "grants": ["state_read", "caller_read", "captions_read", "assistance_read", "assistance_respond", "rtc_signal"]}))
+pos("compat-stream-frame", "a frame with empty grants (a sender with no known scope)", dict(FRAME, grants=[]))
 pos("ring", "the A11 voice offer", RING)
 pos("ring", "a cancel", {"aokieClass": "voice_offer_cancel", "schemaVersion": "1", "eventId": "evt_2", "offerId": "toffer_0001", "reason": "answered elsewhere"})
 pos("ring", "an assistance offer", {"aokieClass": "assistance_offer", "schemaVersion": "1", "eventId": "evt_3", "appId": "aokie", "requestId": "req_1", "callId": "call_0123", "callEpoch": "7", "ownerEpoch": "0", "expiresAt": "1790000040"})
@@ -1275,7 +1285,7 @@ neg("admission-plugin-request", "an empty roster", mut(PLUGIN_REQUEST, "approved
 neg("admission-plugin-response", "desktopConnection (the plugin's decoder rejects it)", dict(PLUGIN_RESPONSE, desktopConnection={}), "desktopConnection")
 neg("admission-plugin-response", "scopeCompatibility (the plugin's decoder rejects it)", dict(PLUGIN_RESPONSE, scopeCompatibility={}), "scopeCompatibility")
 neg("admission-plugin-response", "no relay member", mut(PLUGIN_RESPONSE, "relay"), "relay")
-neg("admission-plugin-response", "expiresIn 30 (below the decoder's 31)", mut(PLUGIN_RESPONSE, "expiresIn", 30), "expiresIn")
+neg("admission-plugin-response", "expiresIn 10 (the decoder needs more than its 10 second safety margin)", mut(PLUGIN_RESPONSE, "expiresIn", 10), "expiresIn")
 neg("admission-plugin-response", "expiresIn 301", mut(PLUGIN_RESPONSE, "expiresIn", 301), "expiresIn")
 neg("admission-plugin-response", "tokenType bearer in lower case", mut(PLUGIN_RESPONSE, "tokenType", "bearer"), "tokenType")
 neg("admission-plugin-response", "a gatewayUrl on ws://", mut(PLUGIN_RESPONSE, "gatewayUrl", "ws://relay.example.com/v2/realtime"), "gatewayUrl")
@@ -1298,8 +1308,61 @@ neg("challenge", "schemaVersion 3", mut(CHALLENGE_PLUGIN, "schemaVersion", 3), "
 neg("compat-frames-request", "65 frames", {"to": "plugin", "frames": [{}] * 65}, "frames")
 neg("compat-frames-request", "an address that is neither plugin nor mobile:<thumbprint>", {"to": "phone", "frames": [{}]}, "to")
 neg("compat-frames-request", "no frames", {"to": "plugin", "frames": []}, "frames")
-neg("compat-frames-accepted", "accepted above 64", {"accepted": 65, "seq": 1}, "accepted")
-neg("compat-frames-page", "129 frames", {"lastSeq": 9, "frames": [p1("compat-frames-page")["frames"][0]] * 129}, "frames")
+neg("compat-frames-accepted", "accepted above 64", {"accepted": 65, "seq": 1, "time": NOW}, "accepted")
+neg("compat-frames-page", "129 frames", {"lastSeq": 9, "time": NOW, "frames": [p1("compat-frames-page")["frames"][0]] * 129}, "frames")
+
+# --- RL-07: the members the decoders are strict about, and the rules of the compatibility routes' answers
+PAGE = p1("compat-frames-page")
+neg("ice-server", "a STUN entry without username and credential (the plugin's decoder requires both members)", {"urls": STUN["urls"]}, "oneOf")
+neg("ice-server", "a STUN entry without credential", mut(STUN, "credential"), "oneOf")
+neg("ice-server", "a STUN entry with an expiresAt", dict(STUN, expiresAt=NOW + 600), "oneOf")
+neg("ice-server", "a STUN and a TURN url in one entry (the decoders treat it as TURN)", dict(TURN, urls=STUN["urls"] + TURN["urls"]), "oneOf")
+neg("ice-server", "a TURN entry without a credential", mut(TURN, "credential"), "oneOf")
+neg("ice-server", "a TURN username of 513 characters", mut(TURN, "username", "1790000600:" + "a" * 502), "oneOf")
+neg("ice-server", "a url that is neither stun nor turn", {"urls": ["https://stun.example.com"], "username": "", "credential": ""}, "oneOf")
+neg("ice-server", "nine urls in one entry", dict(STUN, urls=["stun:s%d.example.com" % i for i in range(9)]), "oneOf")
+neg("ice-server", "an unknown member", dict(TURN, realm="example"), "oneOf")
+neg("compat-error", "a retryAfter member (the phone's error decoder refuses a fourth member)", {"error": True, "code": "rate_limited", "message": "x", "retryAfter": 5}, "retryAfter")
+neg("compat-error", "the native nesting", {"error": {"code": "rate_limited", "message": "x"}}, "error")
+neg("compat-error", "an empty message", {"error": True, "code": "rate_limited", "message": ""}, "message")
+neg("compat-frames-accepted", "no time", {"accepted": 1, "seq": 9}, "time")
+neg("compat-frames-accepted", "nothing accepted", {"accepted": 0, "seq": 9, "time": NOW}, "accepted")
+neg("compat-frames-accepted", "an extra member", {"accepted": 1, "seq": 9, "time": NOW, "ok": True}, "ok")
+neg("compat-frames-page", "no time", mut(PAGE, "time"), "time")
+neg("compat-frames-page", "a negative lastSeq", mut(PAGE, "lastSeq", -1), "lastSeq")
+neg("compat-frames-page", "an unknown member", dict(PAGE, more=True), "more")
+neg("compat-frames-page", "a frame that has no subjectId", mut(PAGE, "frames.0.subjectId"), "subjectId")
+neg("compat-frames-page", "a frame that is an array", mut(PAGE, "frames.0.frame", [1]), "frame")
+neg("compat-frames-page", "a frame element with an extra member", mut(PAGE, "frames.0.extra", 1), "extra")
+neg("compat-frames-page", "a hold that is both granted and refused", dict(PAGE, hold={"granted": True, "refused": True, "retryAfter": 2}), "hold")
+neg("compat-stream-frame", "from is a bare role", mut(FRAME, "from", "phone"), "from")
+neg("compat-stream-frame", "from names a thumbprint of 42 characters", mut(FRAME, "from", "mobile:" + "A" * 42), "from")
+neg("compat-stream-frame", "seq 0", mut(FRAME, "seq", 0), "seq")
+neg("compat-stream-frame", "no frame", mut(FRAME, "frame"), "frame")
+neg("compat-stream-frame", "a frame that is a string", mut(FRAME, "frame", "x"), "frame")
+neg("compat-stream-frame", "a subjectId with a space", mut(FRAME, "subjectId", "a b"), "subjectId")
+neg("compat-stream-frame", "seventeen grants", mut(FRAME, "grants", ["state_read"] * 17), "grants")
+neg("compat-stream-frame", "a grant that is not a grant name at all", mut(FRAME, "grants", ["state_read", "Delete All"]), "grants")
+neg("compat-stream-frame", "a grant twice", mut(FRAME, "grants", ["state_read", "state_read"]), "grants")
+neg("compat-stream-frame", "an extra member", mut(FRAME, "id", "x"), "id")
+neg("admission-plugin-response", "a device record without a role", mut(PLUGIN_RESPONSE, "device", {"id": "aokie", "appId": "aokie", "subjectId": "aokie"}), "device")
+neg("admission-plugin-response", "no endpointPublicKey", mut(PLUGIN_RESPONSE, "endpointPublicKey"), "endpointPublicKey")
+neg("admission-plugin-response", "an empty roster", mut(PLUGIN_RESPONSE, "approvedPeerKeyThumbprints", []), "approvedPeerKeyThumbprints")
+neg("admission-plugin-response", "no turnCredentialExpiresAt (a required member, null when there is no TURN)", mut(PLUGIN_RESPONSE, "turnCredentialExpiresAt"), "turnCredentialExpiresAt")
+neg("admission-plugin-response", "a STUN entry without its empty credential members", mut(PLUGIN_RESPONSE, "iceServers", [{"urls": STUN["urls"]}, TURN]), "iceServers")
+neg("admission-mobile-response", "a device record with an extra member (the phone's DeviceRecord is strict)", mut(MOBILE_RESPONSE, "device.email", "x"), "email")
+neg("admission-mobile-response", "a device displayName of 121 characters", mut(MOBILE_RESPONSE, "device.displayName", "n" * 121), "displayName")
+neg("admission-mobile-response", "an empty device displayName", mut(MOBILE_RESPONSE, "device.displayName", ""), "displayName")
+neg("admission-mobile-response", "no scopes", mut(MOBILE_RESPONSE, "scopes", []), "scopes")
+neg("admission-mobile-response", "a device record without lastSeenAt", mut(MOBILE_RESPONSE, "device.lastSeenAt"), "lastSeenAt")
+neg("admission-mobile-response", "expiresIn 0", mut(MOBILE_RESPONSE, "expiresIn", 0), "expiresIn")
+neg("admission-mobile-response", "expiresIn 301", mut(MOBILE_RESPONSE, "expiresIn", 301), "expiresIn")
+neg("challenge", "an expiresAt that is a string", mut(CHALLENGE_PLUGIN, "expiresAt", str(NOW + 25)), "expiresAt")
+neg("challenge", "a connectionId in capitals", mut(CHALLENGE_PLUGIN, "connectionId", "relay_" + "A" * 32), "connectionId")
+neg("challenge", "an admissionJti that is short", mut(CHALLENGE_PLUGIN, "admissionJti", "adm_1"), "admissionJti")
+neg("challenge", "a challengeNonce with another prefix", mut(CHALLENGE_PLUGIN, "challengeNonce", "nonce_" + "1" * 32), "challengeNonce")
+neg("challenge", "the plugin's roster hash as a thumbprint of 42 characters", mut(CHALLENGE_PLUGIN, "peerRosterHash", "A" * 42), "peerRosterHash")
+neg("challenge", "role admin", mut(CHALLENGE_PLUGIN, "role", "admin"), "role")
 
 # --- ring (4.15.1)
 neg("ring", "an extra member (the Android parser forbids it)", dict(RING, extra="x"), "oneOf")

@@ -101,6 +101,27 @@ test('4.14.4 a missing, malformed, forged, expired or foreign bearer is one 401 
     eq(0, aok_count($k), 'nothing was stored by any of them');
 });
 
+test('4.14.4 an error on a compatibility route has exactly the three members the phone\'s decoder allows (error, code, message), also when it carries a wait: that is the Retry-After header alone', function () {
+    [$k, $a, $b, $plug, $ta] = aok_pair(['limits' => ['sigItems' => 1]]);
+    $errors = [
+        aok_call($k, 'nonsense', 'GET', 'challenge'),                                       // 401
+        aok_call($k, $ta, 'POST', 'frames', '{"to":"plugin","frames":[{},{}]}'),            // 429 relay_backpressure (Retry-After 5)
+        aok_call($k, $ta, 'POST', 'frames', '{"to":"mobile:' . $k->thumb($b) . '","frames":[{}]}'), // 403
+        aok_call($k, $ta, 'POST', 'frames', 'x'),                                           // 400
+        aok_call($k, $ta, 'GET', 'nothing'),                                                 // 404 (before any handler)
+    ];
+    for ($i = 0; $i < 31; $i++) {
+        $last = $k->mobile($a); // the 30-a-minute mint limit
+    }
+    $errors[] = $last;
+    eq(429, $last['status']);
+    foreach ($errors as $i => $res) {
+        eq(['error', 'code', 'message'], array_keys($res['json']), "error $i: " . $res['body']);
+        eq(true, $res['json']['error']);
+    }
+    ok(isset($errors[1]['headers']['retry-after']) && isset($last['headers']['retry-after']), 'the wait is a header');
+});
+
 test('4.14.4 a bearer is good until exp + 30 seconds (the skew) and refused the second after', function () {
     [$k, $a, $b, $plug, $ta] = aok_pair();
     foreach ([0, 60, 90, 120] as $dt) {

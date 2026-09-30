@@ -2,7 +2,7 @@
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "$id": "https://oaiy.com/schemas/relay/v1/admission-plugin-response.schema.json",
   "title": "Plugin admission response",
-  "description": "Exactly the members the plugin's decoder reads and no others: the decoder is deny_unknown_fields. It never carries desktopConnection or scopeCompatibility. `relay` is present because this issuer advertises only transports it can serve. The three relay URLs are byte-identical in every admission.",
+  "description": "Exactly the members the plugin's decoder reads and no others: the decoder is deny_unknown_fields. It never carries desktopConnection or scopeCompatibility. `relay` is present because this issuer advertises only transports it can serve. The three relay URLs are byte-identical in every admission. expiresIn and expiresAt - now must each be above 10 and at most 300 seconds (the plugin's safety margin); the credential lifetime the plugin lives on is the least of them and the TURN expiry, and must stay above 10.",
   "type": "object",
   "properties": {
     "accessToken": {
@@ -15,7 +15,7 @@
     },
     "expiresIn": {
       "type": "integer",
-      "minimum": 31,
+      "minimum": 11,
       "maximum": 300
     },
     "expiresAt": {
@@ -85,7 +85,28 @@
       "const": "plugin"
     },
     "device": {
-      "type": "object"
+      "type": "object",
+      "description": "The plugin's decoder holds `device` as a raw value and reads nothing from it; the relay sends the plugin's own identity.",
+      "properties": {
+        "id": {
+          "$ref": "https://oaiy.com/schemas/relay/v1/common.schema.json#/$defs/appId"
+        },
+        "appId": {
+          "$ref": "https://oaiy.com/schemas/relay/v1/common.schema.json#/$defs/appId"
+        },
+        "subjectId": {
+          "$ref": "https://oaiy.com/schemas/relay/v1/common.schema.json#/$defs/appId"
+        },
+        "role": {
+          "const": "plugin"
+        }
+      },
+      "required": [
+        "id",
+        "appId",
+        "subjectId",
+        "role"
+      ]
     },
     "endpointPublicKey": {
       "$ref": "https://oaiy.com/schemas/relay/v1/common.schema.json#/$defs/endpointPublicKey"
