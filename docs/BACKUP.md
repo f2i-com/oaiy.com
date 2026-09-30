@@ -252,7 +252,7 @@ The Agent's settings as its page keeps them in IndexedDB (database bot.computer,
 | `providers[].serverKind` | runs | Only with the tick "The Agent's own settings (its providers, network gate, and how it answers calls and texts)" | A local server's kind |
 | `providers[].contextTokens` | runs | Only with the tick "The Agent's own settings (its providers, network gate, and how it answers calls and texts)" | The context window as set by you |
 | `providers[].parallelAgents` | runs | Only with the tick "The Agent's own settings (its providers, network gate, and how it answers calls and texts)" | How many agents may use it at once |
-| `providers[].apiKey` | runs | Only with the tick "The Agent's own settings (its providers, network gate, and how it answers calls and texts)" | A provider's API key: Only with the keys box, only where none is kept, only for the same address. |
+| `providers[].apiKey` | runs | Only with the tick "The Agent's own settings (its providers, network gate, and how it answers calls and texts)" | A provider's API key: Only with the keys box, only where none is kept, only for the same address, and only with an address that comes back (an address that is refused takes its key with it: the provider would arrive without an address, and a provider without one is the vendor's own). |
 | `providers[].detectedContext` | excluded | Never | The window a server reported: It is detected again from the server. |
 | `activeProviderId` | runs | Only with the tick "The Agent's own settings (its providers, network gate, and how it answers calls and texts)" | Which provider the Agent uses: It decides where the conversations go. |
 | `gate` | runs | Only with the tick "The Agent's own settings (its providers, network gate, and how it answers calls and texts)" | The network gate: It decides which sites the Agent's code may reach. |
@@ -265,7 +265,7 @@ The Agent's settings as its page keeps them in IndexedDB (database bot.computer,
 | `media` | runs | Only with the tick "The Agent's own settings (its providers, network gate, and how it answers calls and texts)" | The image, video and audio service |
 | `media.baseUrl` | runs | Only with the tick "The Agent's own settings (its providers, network gate, and how it answers calls and texts)" | The media service's address: Prompts and pictures are sent to it. |
 | `media.enabled` | runs | Only with the tick "The Agent's own settings (its providers, network gate, and how it answers calls and texts)" | The Agent may use the media service |
-| `media.apiKey` | runs | Only with the tick "The Agent's own settings (its providers, network gate, and how it answers calls and texts)" | The media service's API key: Only with the keys box, only where none is kept, only for the same address. |
+| `media.apiKey` | runs | Only with the tick "The Agent's own settings (its providers, network gate, and how it answers calls and texts)" | The media service's API key: Only with the keys box, only where none is kept, only for the same address, and only with an address that comes back (an address that is refused takes its key with it). |
 | `media.imageModel` | runs | Only with the tick "The Agent's own settings (its providers, network gate, and how it answers calls and texts)" | The picture model's name: It decides which model makes the pictures. |
 | `media.videoModel` | runs | Only with the tick "The Agent's own settings (its providers, network gate, and how it answers calls and texts)" | The video model's name: It decides which model makes the videos. |
 | `media.speechModel` | runs | Only with the tick "The Agent's own settings (its providers, network gate, and how it answers calls and texts)" | The speech model's name: It decides which model makes speech, which can be played to callers. |
@@ -751,7 +751,14 @@ in parts through internal routes with a secret made for that one backup.
   provider without a key.
 - **The Agent's provider keys** come back only if you ticked the keys, only where the Agent has no
   key for that provider, and only for a provider at the same address. An empty key in a backup
-  never replaces a key the Agent has.
+  never replaces a key the Agent has. **A key goes only with the address it was kept for**: where
+  the address of a provider (or of the image, video and audio service) is one the desktop does not
+  bring back (a name and password or a key in it, a parameter of its own, or no `http://` or `https://`
+  at the start), its key is left out with it, the dry run lists the key under what is not restored,
+  and the result says how many were left out ("enter them again as the key of their providers"). Without
+  that rule the provider would arrive with a key and no address, and the Agent takes a provider with no
+  address for the vendor's own: the key of your gateway would be sent to the vendor. A provider that
+  has no address at all, or an empty one, is the vendor's own and keeps its key.
 - The undo copy has no API keys (they were sealed with a key the browser will not give up, and
   the desktop keeps the copy as plain files). An undo puts back the person's own state without a
   tick, but through the same table: an old campaign is not brought back running, stale callbacks

@@ -276,6 +276,10 @@ pub struct KeyRow {
     pub tick: Option<RestoreClass>,
     pub ty: Option<ValueType>,
     pub secret: bool,
+    /// The address (a sibling key, of the type `url`) that a secret is for: a key comes back only with the address it was kept for,
+    /// so when that address is not brought back (it holds a credential, is not a web address, or was left out) the key is not either.
+    /// Without it a key for a gateway would arrive in a record that has no address, and the Agent takes that for the vendor's own.
+    pub goes_with: Option<String>,
     pub merge: Option<String>,
     pub what: String,
     pub reason: String,
@@ -426,6 +430,8 @@ struct RawKey {
     #[serde(default)]
     secret: bool,
     #[serde(default)]
+    goes_with: Option<String>,
+    #[serde(default)]
     merge: Option<String>,
     what: String,
     #[serde(default)]
@@ -548,7 +554,10 @@ fn key_from(raw: RawKey) -> Result<KeyRow, String> {
         (_, Some("objects")) => Some(ValueType::Objects { max_items: raw.max_items.ok_or_else(|| fail("objects has maxItems"))? }),
         (_, Some(other)) => return Err(fail(&format!("unknown type \"{other}\""))),
     };
-    Ok(KeyRow { path: raw.path.clone(), class, tick, ty, secret: raw.secret, merge: raw.merge, what: raw.what, reason: raw.reason, redo: raw.redo, reads: raw.reads, readers: raw.readers })
+    if raw.goes_with.is_some() && !raw.secret {
+        return Err(fail("only a secret goes with an address"));
+    }
+    Ok(KeyRow { path: raw.path.clone(), class, tick, ty, secret: raw.secret, goes_with: raw.goes_with, merge: raw.merge, what: raw.what, reason: raw.reason, redo: raw.redo, reads: raw.reads, readers: raw.readers })
 }
 
 impl Table {
@@ -632,6 +641,13 @@ impl Table {
                 if key.path.is_empty() || key.path.starts_with('.') || key.path.ends_with('.') || key.path.contains("..") {
                     out.push(format!("key table {name}: \"{}\" is not a path", key.path));
                 }
+                // A secret that goes with an address names one that is in the table, beside it, and is one.
+                if let Some(partner) = &key.goes_with {
+                    let sibling = sibling_path(&key.path, partner);
+                    if !matches!(kt.row(&sibling), Some(KeyRow { class: Class::Runs | Class::Data, ty: Some(ValueType::Url { .. }), .. })) {
+                        out.push(format!("key table {name}: \"{}\" goes with \"{sibling}\", which is not an address that comes back", key.path));
+                    }
+                }
                 // Every key that comes back sits under a container that is listed and comes back.
                 if let Some(parent) = parent_of(&key.path) {
                     match kt.row(&parent) {
@@ -682,6 +698,14 @@ impl Table {
 pub const FEEDS_NOTHING: &str = "feeds no behaviour";
 
 /// The key a key sits inside (`gate` for `gate.mode`, `providers` for `providers[].id`), if it sits in one.
+/// The path of a key beside `path` (in the same object): `providers[].apiKey` and `baseUrl` make `providers[].baseUrl`.
+fn sibling_path(path: &str, name: &str) -> String {
+    match path.rfind('.') {
+        Some(cut) => format!("{}{name}", &path[..=cut]),
+        None => name.to_string(),
+    }
+}
+
 fn parent_of(path: &str) -> Option<String> {
     let cut = path.rfind('.')?;
     Some(path[..cut].trim_end_matches("[]").to_string())
@@ -707,7 +731,12 @@ pub enum Why {
     NotTicked(RestoreClass),
     /// The value is not what the table allows there.
     BadValue(String),
+    /// A secret whose address (see `KeyRow::goes_with`) is not brought back: it would arrive at no address, or at another one.
+    KeyWithoutAddress,
 }
+
+/// What is said of a key that is left out because the address it was for is (see [`Why::KeyWithoutAddress`]).
+pub const KEY_WITHOUT_ADDRESS: &str = "its address is not one that comes back (a name and password or a key in it, or it is not a web address), and a key goes only with the address it was kept for";
 
 #[derive(Clone, Debug)]
 pub struct Left {
@@ -917,6 +946,25 @@ impl Walk<'_> {
         }
     }
 
+    /// Whether the address (`partner`, beside a key in `node`) is there and is not one that comes back. No address, or an empty one, is
+    /// not a refusal: the record is then for the vendor's own address, which is where its key belongs.
+    fn address_refused(&self, node: &Map<String, Value>, path: &str, partner: &str) -> bool {
+        let Some(address) = node.get(partner) else { return false };
+        match address {
+            Value::Null => return false,
+            Value::String(s) if s.trim().is_empty() => return false,
+            _ => {}
+        }
+        let sibling = if path.is_empty() { partner.to_string() } else { format!("{path}.{partner}") };
+        match self.table.row(&sibling) {
+            Some(row) if row.class != Class::Excluded => match &row.ty {
+                Some(ty) => !(self.keep)(row) || check_value(ty, address, false, self.exact).is_err(),
+                None => true,
+            },
+            _ => true,
+        }
+    }
+
     fn object(&mut self, node: &Map<String, Value>, path: &str, depth: usize) -> Map<String, Value> {
         let mut out = Map::new();
         for (key, value) in node {
@@ -950,6 +998,14 @@ impl Walk<'_> {
                 self.leave(&child, Why::Excluded, Some(row));
                 continue;
             };
+            // A key goes with the address it was kept for: where that address is not brought back, the key is not either (the record
+            // would arrive without an address, and a provider without one is the vendor's own).
+            if let Some(partner) = &row.goes_with {
+                if self.address_refused(node, path, partner) {
+                    self.leave(&child, Why::KeyWithoutAddress, Some(row));
+                    continue;
+                }
+            }
             match ty {
                 ValueType::Object => match value {
                     Value::Object(inner) => {

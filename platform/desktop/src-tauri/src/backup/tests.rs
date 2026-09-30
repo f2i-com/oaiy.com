@@ -7086,6 +7086,88 @@ fn an_undo_hands_the_page_every_address_as_the_person_had_it() {
     assert_eq!(settings["media"]["enabled"], true);
 }
 
+/// The reviewer's x7b and V6: a provider whose address the desktop refuses arrived as `{id, type: "openai", apiKey}` with no address, and the
+/// Agent takes a record with no address for the vendor's own (api.openai.com): the key of the person's gateway would point at the vendor.
+fn providers_and_a_media_service_with_keys() -> serde_json::Value {
+    serde_json::json!({
+        "providers": [
+            { "id": "gw", "type": "openai", "name": "Gateway", "apiKey": "K-gw", "baseUrl": "https://alice:pw@gw.example/v1" },
+            { "id": "tenant", "type": "openai", "name": "Tenant", "apiKey": "K-tenant", "baseUrl": "https://gw.example/v1?tenant=acme" },
+            { "id": "local", "type": "custom", "name": "Local", "apiKey": "K-local", "baseUrl": "localhost:11434" },
+            { "id": "upper", "type": "custom", "name": "Upper", "apiKey": "K-upper", "baseUrl": "HTTPS://gw.example/v1" },
+            { "id": "number", "type": "custom", "name": "Number", "apiKey": "K-number", "baseUrl": 7 },
+            { "id": "vendor", "type": "openai", "name": "Vendor", "apiKey": "K-vendor" },
+            { "id": "blank", "type": "openai", "name": "Blank", "apiKey": "K-blank", "baseUrl": "" },
+            { "id": "ok", "type": "custom", "name": "Fine", "apiKey": "K-ok", "baseUrl": "https://ok.example/v1?api-version=2024-02-01" }
+        ],
+        "media": { "baseUrl": "https://bob:pw@media.example/v1", "apiKey": "K-media", "enabled": true }
+    })
+}
+
+fn key_and_address_of(settings: &serde_json::Value, id: &str) -> (Option<String>, Option<String>) {
+    let provider = settings["providers"].as_array().unwrap().iter().find(|p| p["id"] == id).unwrap_or_else(|| panic!("provider {id} came back: {settings}"));
+    (provider.get("apiKey").and_then(|k| k.as_str()).map(str::to_string), provider.get("baseUrl").and_then(|k| k.as_str()).map(str::to_string))
+}
+
+#[test]
+fn a_key_is_left_out_with_the_address_it_was_for_when_that_address_does_not_come_back() {
+    use super::table::{filter_json, table, Why};
+    let keys = table().key_table("agent.settings").unwrap();
+    let found = filter_json(keys, &providers_and_a_media_service_with_keys(), &|_| true);
+    for gone in ["gw", "tenant", "local", "upper", "number"] {
+        assert_eq!(key_and_address_of(&found.value, gone), (None, None), "{gone}: an address that is refused takes its key with it");
+    }
+    assert_eq!(key_and_address_of(&found.value, "vendor"), (Some("K-vendor".into()), None), "no address: the vendor's own, and its key stays");
+    assert_eq!(key_and_address_of(&found.value, "blank"), (Some("K-blank".into()), None), "an empty address is no address");
+    assert_eq!(key_and_address_of(&found.value, "ok"), (Some("K-ok".into()), Some("https://ok.example/v1?api-version=2024-02-01".into())));
+    assert!(found.value["media"].get("apiKey").is_none() && found.value["media"].get("baseUrl").is_none(), "the media service too: {}", found.value["media"]);
+    assert_eq!(found.value["media"]["enabled"], true);
+    let said: Vec<&str> = found.left.iter().filter(|l| l.why == Why::KeyWithoutAddress).map(|l| l.path.as_str()).collect();
+    assert_eq!(said.iter().filter(|p| **p == "providers[].apiKey").count(), 5, "{said:?}");
+    assert_eq!(said.iter().filter(|p| **p == "media.apiKey").count(), 1, "{said:?}");
+    // Without the keys box the key is not there to be judged: it is left out for its tick, as before.
+    let unticked = filter_json(keys, &providers_and_a_media_service_with_keys(), &|row| !row.secret);
+    assert!(unticked.left.iter().all(|l| l.why != Why::KeyWithoutAddress));
+    assert!(unticked.value["providers"].as_array().unwrap().iter().all(|p| p.get("apiKey").is_none()));
+    // Only a secret goes with an address, and only with one that is in the table.
+    let table = std::fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/src/backup/table.json")).unwrap();
+    assert!(super::table::Table::parse(&table.replace("\"goesWith\": \"baseUrl\", \"what\": \"The media service's API key\"", "\"goesWith\": \"nowhere\", \"what\": \"The media service's API key\"")).err().expect("a table that does not hold together does not load").contains("goes with \"media.nowhere\""));
+    assert!(super::table::Table::parse(&table.replace("\"goesWith\": \"baseUrl\", \"what\": \"The media service's API key\"", "\"goesWith\": \"enabled\", \"what\": \"The media service's API key\"")).err().expect("a table that does not hold together does not load").contains("goes with \"media.enabled\""));
+    assert!(super::table::Table::parse(&table.replace("\"secret\": true, \"goesWith\": \"baseUrl\", \"what\": \"The media service's API key\"", "\"goesWith\": \"baseUrl\", \"what\": \"The media service's API key\"")).err().expect("a table that does not hold together does not load").contains("only a secret goes with an address"));
+}
+
+#[test]
+fn a_restore_with_the_keys_box_brings_no_key_for_an_address_it_refuses_and_says_so() {
+    let src = TempDir::new("key-address-src");
+    let out = TempDir::new("key-address-out");
+    let settings = providers_and_a_media_service_with_keys();
+    let file = backup_with_agent(&src.0, &out.0, "k.oaiybackup", agent_archive(&[("idb/settings.json", settings.to_string().as_bytes())]), true);
+    // The dry run lists each key that will not come back, with the reason, and does not say the provider has a key.
+    let dst = TempDir::new("key-address-dst");
+    let preview = restore::inspect(&dst.0, &file, PASS, &options()).unwrap();
+    let said = preview.not_restored.iter().filter(|n| n.name.ends_with("#providers[].apiKey") || n.name.ends_with("#media.apiKey")).collect::<Vec<_>>();
+    assert!(said.len() >= 2 && said.iter().all(|n| n.why.contains("a key goes only with the address it was kept for")), "{:?}", preview.not_restored);
+    assert!(!preview.items.iter().any(|i| i.title.contains("(gw)") && i.what.contains("has an API key")), "{:?}", preview.items.iter().map(|i| (&i.title, &i.what)).collect::<Vec<_>>());
+    assert!(preview.items.iter().any(|i| i.title.contains("(ok)") && i.what.contains("has an API key")));
+    // With the keys ticked, what the page is handed has no key that is not for an address it is handed.
+    restore::stage(&dst.0, &file, PASS, &ticks_of(&[RestoreClass::AgentSettings], true), &options()).unwrap();
+    assert!(matches!(restore::apply_pending(&dst.0), ApplyOutcome::Applied(_)));
+    let handed: serde_json::Value = serde_json::from_slice(&zip_entries(&handed_over(&dst.0))["idb/settings.json"]).unwrap();
+    for gone in ["gw", "tenant", "local", "upper", "number"] {
+        assert_eq!(key_and_address_of(&handed, gone), (None, None), "{gone}");
+    }
+    assert_eq!(key_and_address_of(&handed, "vendor").0.as_deref(), Some("K-vendor"));
+    assert_eq!(key_and_address_of(&handed, "ok").0.as_deref(), Some("K-ok"));
+    assert!(handed["media"].get("apiKey").is_none() && handed["media"].get("baseUrl").is_none(), "{}", handed["media"]);
+    let notes = restore::last_restore(&dst.0).unwrap().notes;
+    assert!(notes.iter().any(|n| n.starts_with("6 API keys of the Agent's were left out: their addresses do not come back") && n.contains("Enter them again as the key of their providers")), "{notes:?}");
+    // Everything that came back for the provider list is a provider with its own address or the vendor's, never a key alone.
+    let handed_text = handed.to_string();
+    for canary in ["K-gw", "K-tenant", "K-local", "K-upper", "K-number", "K-media"] {
+        assert!(!handed_text.contains(canary), "{canary} is not handed to the page");
+    }
+}
+
 /// A restore (not an undo) does not hand the page an address that is empty: an empty address in a backup is no address, and the
 /// page would take it for a service of another address than the one it keeps. (Only an undo, which puts back what there was, carries it.)
 #[test]

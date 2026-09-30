@@ -766,6 +766,7 @@ pub fn describe_settings(bytes: &[u8], not_restored: &mut Vec<NotRestored>) -> V
             (Why::Unknown, _) => "not restored: unknown item".to_string(),
             (Why::Excluded, Some(row)) => format!("not restored: {}{}", row.reason, row.redo.as_ref().map(|r| format!(" To do again: {r}")).unwrap_or_default()),
             (Why::BadValue(why), _) => format!("not restored: its value is not one this version accepts ({why})"),
+            (Why::KeyWithoutAddress, _) => format!("not restored: {}", super::table::KEY_WITHOUT_ADDRESS),
             _ => continue,
         };
         not_restored.push(NotRestored { name: clip(&format!("{FILE}#{}", l.path), 200), why: clip(&why, 400) });
@@ -870,7 +871,21 @@ pub fn filter(nested: &Path, out: &Path, scratch: &Path, ticks: &Ticks, mode: Mo
                 let Some(kt) = table().key_table("agent.settings") else { continue };
                 // An undo puts back the person's own state, empty addresses included; a restore takes what is plain.
                 let found = if mode == Mode::Undo { filter_json_exact(kt, &value, &keep_key) } else { filter_json(kt, &value, &keep_key) };
-                let left = found.left.len() + found.left_more;
+                // A key whose address does not come back is left out with it (it would arrive at no address, and a provider with none is the
+                // vendor's own): said on its own, since the person has to enter it again.
+                let keys_without_address = found.left.iter().filter(|l| l.why == Why::KeyWithoutAddress).count();
+                if keys_without_address > 0 {
+                    let one = keys_without_address == 1;
+                    prepared.notes.push(format!(
+                        "{} of the Agent's {} left out: {} come back (a name and password or a key in it, or it is not a web address), and a key goes only with the address it was kept for. Enter {} again as the key of {}.",
+                        plural(keys_without_address, "API key", "API keys"),
+                        if one { "was" } else { "were" },
+                        if one { "its address does not" } else { "their addresses do not" },
+                        if one { "it" } else { "them" },
+                        if one { "its provider" } else { "their providers" },
+                    ));
+                }
+                let left = found.left.len() + found.left_more - keys_without_address;
                 if found.kept.is_empty() {
                     if left > 0 {
                         prepared.notes.push(format!("Nothing in the Agent's settings comes back without its tick ({left} setting{} left out).", if left == 1 { "" } else { "s" }));

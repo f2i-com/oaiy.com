@@ -637,6 +637,7 @@ pub fn keys_not_restored(file: &str, table_name: &str, bytes: &[u8]) -> Vec<NotR
                     (Why::Unknown, _) => "not restored: unknown item".to_string(),
                     (Why::Excluded, Some(row)) => format!("not restored: {}{}", row.reason, row.redo.as_ref().map(|r| format!(" To do again: {r}")).unwrap_or_default()),
                     (Why::BadValue(why), _) => format!("not restored: its value is not one this version accepts ({why})"),
+                    (Why::KeyWithoutAddress, _) => format!("not restored: {}", super::table::KEY_WITHOUT_ADDRESS),
                     (Why::NotTicked(class), _) => format!("only with the tick \"{}\"", class.label()),
                     (Why::Excluded, None) => "not restored".to_string(),
                 },
