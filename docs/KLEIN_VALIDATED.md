@@ -1,5 +1,9 @@
 # Native Klein 4B validation
 
+This is the preserved original checkpoint. See [KLEIN_INTEGRATED.md](KLEIN_INTEGRATED.md)
+for the latest pinned upstream integration, scoped native HTTP runs, auth checks,
+and the independent desktop/Studio service credential contract.
+
 Native Rust/Candle inference now produces real images with the official distilled
 FLUX.2 Klein 4B transformer and the supplied SimpleFineVector LoRA. Both images
 were visually inspected: coherent vector foxes, clean outlines, white backgrounds.
