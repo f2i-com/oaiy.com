@@ -6,12 +6,12 @@ framework — they drive the real thing.
 Release publication runs the reusable verification gate (`.github/workflows/ci.yml`
 at the repository root, called by `release.yml` there at the exact tagged revision)
 before anything is uploaded:
-the web suite, the complete CLI `npm test` and `npm run typecheck`, the desktop
+the web suite, the OAIY web app's (`web/`) typecheck and unit tests, the complete CLI `npm test` and `npm run typecheck`, the desktop
 Vitest suite, and the native tests in both feature configurations, on Linux and
 Windows. The gate resolves ZIPP's latest release once and every lane installs
 that one release (see [ZIPP engines](#zipp-engines)); `release.yml` hands the
-gate the release it froze for its own builds. Each of the three npm lanes (ui,
-cli, desktop) also runs
+gate the release it froze for its own builds. Each of the four npm lanes (ui,
+web app, cli, desktop) also runs
 `npm audit --audit-level=high`: an advisory at high or above fails the lane, and
 an unreachable registry is recorded as UNKNOWN in the run summary and fails too,
 so a published artifact set always carries a completed audit

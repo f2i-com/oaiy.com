@@ -106,6 +106,22 @@ console.log('attest-release-evidence');
   const passedOn = /VERIFY_JOBS: (.+)$/m.exec(fs.readFileSync(new URL('../../.github/workflows/release.yml', import.meta.url), 'utf8'))?.[1].trim().split(',');
   ok('the default job list is every ci.yml lane, as release.yml passes it', jobs.includes('zipp') && JSON.stringify(jobs) === JSON.stringify(lanes) && JSON.stringify(passedOn) === JSON.stringify(lanes), JSON.stringify({ jobs, lanes, passedOn }));
 }
+{
+  // The evidence text names the lanes that audit dependencies (and the gate's own words name every lane's tests), so a lane added to ci.yml
+  // cannot be left out of what a release says it verified.
+  const ci = fs.readFileSync(new URL('../../.github/workflows/ci.yml', import.meta.url), 'utf8').replace(/\r\n/g, '\n');
+  const release = fs.readFileSync(new URL('../../.github/workflows/release.yml', import.meta.url), 'utf8').replace(/\r\n/g, '\n');
+  const jobsText = ci.slice(ci.indexOf('\njobs:'));
+  const blocks = jobsText.split(/\n {2}(?=[a-z][\w-]*:\s*\n)/).slice(1);
+  const auditing = blocks.filter((b) => /npm audit --audit-level=high/.test(b)).map((b) => /^([a-z][\w-]*):/.exec(b)[1]);
+  const listed = [...release.matchAll(/npm audit --audit-level=high \(ci\.yml: ([^)]+)\)/g)].map((m) => m[1].split(',').map((s) => s.trim()));
+  ok('release.yml says which ci.yml lanes audit, once per evidence record, and names all of them', auditing.length >= 4 && listed.length === 2 && listed.every((l) => l.length === auditing.length), JSON.stringify({ auditing, listed }));
+  ok('the audit lanes are ui (web), the OAIY web app (webapp), cli and desktop', JSON.stringify(auditing) === JSON.stringify(['web', 'webapp', 'cli', 'desktop']) && listed.every((l) => l.join() === 'ui,web app,cli,desktop'), JSON.stringify({ auditing, listed }));
+  const gate = /ci\.yml@" \+ process\.env\.REVISION \+ " \(([^"]+)\)"/.exec(release)?.[1] ?? '';
+  ok('the gate text names the OAIY web app\'s tests', /OAIY web app \(web\/\) typecheck \+ unit tests/.test(gate), gate);
+  const testing = fs.readFileSync(new URL('../TESTING.md', import.meta.url), 'utf8').replace(/\r\n/g, '\n');
+  ok('platform/TESTING.md names the same four audit lanes', /four npm lanes \(ui,\nweb app, cli, desktop\)/.test(testing) && /OAIY web app's \(`web\/`\) typecheck and unit tests/.test(testing));
+}
 
 console.log(`\n${passed} passed, ${failed} failed`);
 process.exit(failed ? 1 : 0);

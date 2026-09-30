@@ -320,6 +320,15 @@ const MUTATIONS = [
     files: { 'web/providers/src/probe.ts': [{ find: 'headers: { ...(underBase(url) ? withKey : withoutKey),', replace: 'headers: { ...withKey,' }] },
     caught: ['the key goes only to an address under the record'],
   },
+  {
+    // The release gate lists the CI lanes it verified. A lane in ci.yml that release.yml does not pass on makes the gate's own test fail
+    // (platform/scripts/attest-release-evidence.test.mjs), and the `web` lane runs that test.
+    name: 'B1 the release evidence leaves out the webapp lane',
+    what: 'release.yml passes on a job list without the OAIY web app lane',
+    tests: ['../platform/scripts/attest-release-evidence.test.mjs'],
+    files: { '.github/workflows/release.yml': [{ find: 'VERIFY_JOBS: revision,zipp,web,webapp,cli,', replace: 'VERIFY_JOBS: revision,zipp,web,cli,' }] },
+    caught: ['attest-release-evidence.test.mjs'],
+  },
   // Leaks the scans must find. They put the key where a scan of TEXT does not look (the reviewer's two: a Uint8Array, and reversed).
   {
     name: 'H1 leak: list returns the key as a Uint8Array',
