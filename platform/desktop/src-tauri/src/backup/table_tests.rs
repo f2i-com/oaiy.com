@@ -721,6 +721,31 @@ fn a_table_that_calls_something_data_without_the_audit_does_not_load() {
         k["reads"] = json!("Nothing reads it and it feeds no behaviour.");
         k["readers"] = json!(["platform/desktop/src-tauri/src/calendar/mod.rs#Settings"]);
     }), "can carry words");
+    // Every type that can carry words is refused as data, whatever the annotation says: a string, an address, a list of strings and
+    // a map of them or of scalars (a number and a switch are the values that carry none).
+    for (ty, extra) in [
+        ("string", json!({ "maxChars": 20 })),
+        ("url", json!({ "maxChars": 200 })),
+        ("strings", json!({ "maxItems": 3, "maxChars": 20 })),
+        ("strings-map", json!({ "maxItems": 3, "maxChars": 20 })),
+        ("scalars-map", json!({ "maxItems": 3, "maxChars": 20 })),
+    ] {
+        says(
+            broken(&|v| {
+                let k = key(v, "calendar", "settings.slotMinutes").as_object_mut().unwrap();
+                for gone in ["min", "max"] {
+                    k.remove(gone);
+                }
+                k.insert("type".into(), json!(ty));
+                for (name, value) in extra.as_object().unwrap() {
+                    k.insert(name.clone(), value.clone());
+                }
+            }),
+            "can carry words",
+        );
+    }
+    // (And the values that carry none are data when the audit is whole: the table as it is has such keys.)
+    assert!(Table::parse(TABLE_JSON).is_ok());
     says(broken(&|v| { v["agent"].as_array_mut().unwrap().iter_mut().find(|r| r["id"] == "agent-do-not-contact").unwrap().as_object_mut().unwrap().remove("keylessBecause"); }), "does not say why it needs none");
     says(broken(&|v| { v["agent"].as_array_mut().unwrap().iter_mut().find(|r| r["id"] == "agent-do-not-contact").unwrap().as_object_mut().unwrap().remove("reads"); }), "does not say what reads it");
 }

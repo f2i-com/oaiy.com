@@ -1601,21 +1601,28 @@ fn finalize(data_dir: &Path, marker: &Marker, applied: &[(String, bool)]) -> App
     let mut agent_storage = "none";
     if let Some(agent_marker) = &marker.agent {
         let zip = source.join(&agent_marker.file);
+        // A finalize that was cut short after it handed the archive over (it moves the staged copy) is done again at the next start:
+        // what waits for the page is then already the archive that was staged, and stays.
+        let handed_before = agent::read_pending_import(data_dir).is_some_and(|p| p.id == marker.id && p.size == agent_marker.size && p.sha256 == agent_marker.sha256);
         // Once more, at the last moment: the page is given what was staged, or nothing (the files are in place already, so the
         // result says what was not handed over).
-        match verify_staged_agent(&zip, agent_marker) {
-            Err(why) => {
-                log::warn!("backup: the Agent's storage was not handed over: {why}");
-                notes.push(format!("{why}, so it was not handed to the Agent's page."));
-                agent_storage = "failed";
-            }
-            Ok(()) => match agent::leave_for_page(data_dir, &marker.id, &marker.kind, &zip, agent_marker.apply_settings, agent_marker.apply_keys, &agent_marker.remove) {
-                Ok(()) => agent_storage = "pending",
-                Err(e) => {
-                    log::warn!("backup: the Agent's storage could not be handed over: {e}");
+        if handed_before {
+            agent_storage = "pending";
+        } else {
+            match verify_staged_agent(&zip, agent_marker) {
+                Err(why) => {
+                    log::warn!("backup: the Agent's storage was not handed over: {why}");
+                    notes.push(format!("{why}, so it was not handed to the Agent's page."));
                     agent_storage = "failed";
                 }
-            },
+                Ok(()) => match agent::leave_for_page(data_dir, &marker.id, &marker.kind, &zip, agent_marker.apply_settings, agent_marker.apply_keys, &agent_marker.remove) {
+                    Ok(()) => agent_storage = "pending",
+                    Err(e) => {
+                        log::warn!("backup: the Agent's storage could not be handed over: {e}");
+                        agent_storage = "failed";
+                    }
+                },
+            }
         }
     }
     let last = LastRestore {
