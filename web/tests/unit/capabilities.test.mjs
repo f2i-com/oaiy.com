@@ -25,34 +25,33 @@ const host = (kind, hosted = null) => ({ kind, hosted, automated: false });
 const desktop = { kind: 'desktop', base: 'http://127.0.0.1:17972' };
 const server = { kind: 'server', base: 'https://oaiy.example.org' };
 
-/** [name, host, links, mode, the features that are on, looks as it loads, Data is session-only] */
+/** [name, host, links, mode, the features that are on, looks as it loads] */
 const TABLE = [
   // OAIY's own window: the desktop is given, so it is paired with or without a saved link, and nothing that was there is gone.
-  ["OAIY's own window", host('oaiy-window'), [], 'paired', ALL, true, false],
-  ["OAIY's own window, with a saved link too", host('oaiy-window'), [desktop], 'paired', ALL, true, false],
+  ["OAIY's own window", host('oaiy-window'), [], 'paired', ALL, true],
+  ["OAIY's own window, with a saved link too", host('oaiy-window'), [desktop], 'paired', ALL, true],
   // The bot.computer desktop shell: the desktop is paired like a tab's, but it looks for OAIY as it loads.
-  ['the desktop shell, not paired', host('desktop-shell'), [], 'standalone', [], true, false],
-  ['the desktop shell, paired', host('desktop-shell'), [desktop], 'paired', BEHIND_A_DESKTOP, true, false],
+  ['the desktop shell, not paired', host('desktop-shell'), [], 'standalone', [], true],
+  ['the desktop shell, paired', host('desktop-shell'), [desktop], 'paired', BEHIND_A_DESKTOP, true],
   // A tab on a public host, a dev server or a local copy: nothing is on until it is linked.
-  ['a tab, no link', host('browser'), [], 'standalone', [], false, true],
-  ['a tab, paired with a desktop', host('browser'), [desktop], 'paired', BEHIND_A_DESKTOP, false, true],
-  ['a tab, linked to a server', host('browser'), [server], 'server', BEHIND_A_SERVER, false, true],
-  ['a tab, paired with a desktop and linked to a server', host('browser'), [desktop, server], 'server', BEHIND_A_DESKTOP, false, true],
-  ['a tab on a static host, no link', host('browser', 'static'), [], 'standalone', [], false, true],
-  ['a tab on a static host, paired', host('browser', 'static'), [desktop], 'paired', BEHIND_A_DESKTOP, false, true],
+  ['a tab, no link', host('browser'), [], 'standalone', [], false],
+  ['a tab, paired with a desktop', host('browser'), [desktop], 'paired', BEHIND_A_DESKTOP, false],
+  ['a tab, linked to a server', host('browser'), [server], 'server', BEHIND_A_SERVER, false],
+  ['a tab, paired with a desktop and linked to a server', host('browser'), [desktop, server], 'server', BEHIND_A_DESKTOP, false],
+  ['a tab on a static host, no link', host('browser', 'static'), [], 'standalone', [], false],
+  ['a tab on a static host, paired', host('browser', 'static'), [desktop], 'paired', BEHIND_A_DESKTOP, false],
   // A page OAIY's own server serves (its cookie is the credential): the server is behind it, and no desktop until one is paired.
-  ["a tab OAIY's server serves", host('browser', 'cookie'), [], 'server', BEHIND_A_SERVER, false, true],
-  ["a tab OAIY's server serves, paired with a desktop as well", host('browser', 'cookie'), [desktop], 'server', BEHIND_A_DESKTOP, false, true],
+  ["a tab OAIY's server serves", host('browser', 'cookie'), [], 'server', BEHIND_A_SERVER, false],
+  ["a tab OAIY's server serves, paired with a desktop as well", host('browser', 'cookie'), [desktop], 'server', BEHIND_A_DESKTOP, false],
 ];
 
 describe('what a page can do, by its host and its links', () => {
-  for (const [name, h, links, mode, on, looks, sessionOnly] of TABLE) {
+  for (const [name, h, links, mode, on, looks] of TABLE) {
     it(`${name}: ${mode}; on: ${on.length === 0 ? 'nothing' : on.join(', ')}`, () => {
       const caps = D.derive({ host: h, links });
       assert.equal(caps.mode, mode, 'mode');
       assert.deepEqual(ALL.filter((id) => caps.features[id]), ALL.filter((id) => on.includes(id)), 'features');
       assert.equal(caps.looksOnLoad, looks, 'looks as it loads');
-      assert.equal(caps.dataSessionOnly, sessionOnly, 'Data is session-only');
       assert.equal(caps.host, h.kind);
       assert.equal(caps.hosted, h.hosted);
     });

@@ -40,11 +40,6 @@ export interface Caps {
   readonly looksOnLoad: boolean;
   /** Each feature: on, or hidden because it cannot work here. */
   readonly features: Readonly<Record<FeatureId, boolean>>;
-  /**
-   * What a flow's Database nodes store lasts as long as the tab: the browser's SQLite has no persistent storage on the main thread
-   * (Chromium answers "Missing required OPFS APIs"), so it falls back to memory. OAIY's own windows run the same build.
-   */
-  readonly dataSessionOnly: boolean;
 }
 
 /** Whether a need is met, given what is behind the page. */
@@ -75,9 +70,6 @@ export function derive(input: DeriveInput): Caps {
     hosted: host.hosted,
     looksOnLoad: looksOnLoad(host),
     features: Object.freeze(features),
-    // Said of a tab. OAIY's own window runs the same build with the same limit, but it is left as it was: labelling it is a change to
-    // the desktop's window, which this one does not make.
-    dataSessionOnly: host.kind === 'browser',
   });
 }
 

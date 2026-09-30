@@ -178,12 +178,11 @@ function asTab(fn) {
   }
 }
 
-check("in OAIY's window every feature of the desktop's is on, and Data is not called session-only: nothing that was there is hidden", () => {
+check("in OAIY's window every feature of the desktop's is on: nothing that was there is hidden", () => {
   const caps = currentCaps();
   assert.equal(caps.host, 'oaiy-window');
   assert.equal(caps.mode, 'paired');
   assert.equal(caps.looksOnLoad, true);
-  assert.equal(caps.dataSessionOnly, false);
   for (const [id, on] of Object.entries(caps.features)) assert.equal(on, true, id);
   for (const id of ['phone', 'calendar', 'flowTools', 'control', 'setup', 'browserNodes', 'askAgent', 'inputFolder', 'packages', 'dock']) assert.ok(id in caps.features, `${id} is a feature the layer knows`);
 });
@@ -209,12 +208,11 @@ check("the palette in OAIY's window offers the desktop's nodes (the browser node
   }
 });
 
-check('a tab that is not linked to a desktop has no Packages section, no dock and none of the desktop\'s nodes in the palette, and says Data is kept for the session', () => {
+check('a tab that is not linked to a desktop has no Packages section, no dock and none of the desktop\'s nodes in the palette', () => {
   asTab(() => {
     const caps = currentCaps();
     assert.equal(caps.host, 'browser');
     assert.equal(caps.mode, 'standalone');
-    assert.equal(caps.dataSessionOnly, true);
     assert.equal(caps.looksOnLoad, false);
     assert.equal(hasSavedDesktopLink(), false);
     assert.deepEqual(ids(shellNavItems('workflows', () => {}, {}, caps.features)), ['workflows', 'data', 'queue']);
@@ -243,7 +241,6 @@ check('a tab linked to a desktop (Connect answered) has the desktop\'s nodes and
       assert.equal(paletteShowsNode(type, env), true, type);
       assert.equal(nodeNotice(type, {}, env), null, type);
     }
-    assert.equal(caps.dataSessionOnly, true, "the tab's own SQLite is in the tab, linked or not");
   });
 });
 
