@@ -844,7 +844,7 @@ impl LoginState {
 
     /// A device for the browser that just proved the password: kept in the owner file when it can be written and in
     /// memory always. The cookie value.
-    fn new_device(&self, _fresh: &Fresh<'_>, ip: &str) -> Option<String> {
+    fn new_device(&self, _fresh: &Fresh<'_>, ctx: &AuditContext<'_>, ip: &str) -> Option<String> {
         let mut fill = |buf: &mut [u8]| (self.random)(buf);
         let made = device::make(self.now(), ip, &mut fill).ok()?;
         {
@@ -855,6 +855,8 @@ impl LoginState {
             }
         }
         self.persist_owner_best_effort();
+        // The device is in the audit log by its id, from where it was made: the cookie's secret is not.
+        self.critical("device.created", None, ctx, json!({ "id": made.device.id }));
         Some(made.token)
     }
 
@@ -944,7 +946,9 @@ impl LoginState {
                             self.touch_device(&fresh, id, &pre.info.client_ip);
                             None
                         }
-                        Lane::Anonymous(_) => self.new_device(&fresh, &pre.info.client_ip),
+                        Lane::Anonymous(_) => {
+                            self.new_device(&fresh, &pre.ctx(), &pre.info.client_ip)
+                        }
                     };
                     self.open_login_session(&fresh, &pre, req.remember, device_cookie)?
                 };
@@ -1042,7 +1046,7 @@ impl LoginState {
         self.setup.consume();
         self.throttle.address_succeeded(&pre.info.client_key);
         // Setup is a login: a session, elevated, and the browser's device.
-        let device_cookie = self.new_device(&fresh, &pre.info.client_ip);
+        let device_cookie = self.new_device(&fresh, &pre.ctx(), &pre.info.client_ip);
         let (body, cookies, actor) = self.open_login_session(&fresh, &pre, false, device_cookie)?;
         self.critical("setup.ok", Some(&actor), &pre.ctx(), json!({}));
         Ok(json_reply(StatusCode::CREATED, body, &cookies))

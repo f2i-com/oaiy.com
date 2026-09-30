@@ -3108,6 +3108,75 @@ async fn the_audit_names_who_and_from_where_for_a_login() {
     assert_eq!(mine["userAgent"], "Mozilla/5.0 (X11; Linux x86_64) test");
 }
 
+#[tokio::test]
+async fn a_device_made_by_a_login_is_in_the_audit_log_by_its_id_and_never_by_its_secret() {
+    let e = env();
+    // The setup makes the first device.
+    let owner = make_owner(&e, PASSWORD).await;
+    let first = browser_from(&e, &owner);
+    // A login from another browser makes a second, from another address.
+    let second = browser_from(
+        &e,
+        &go(
+            &e,
+            req(&e, Method::POST, "/api/auth/login")
+                .from("203.0.113.191")
+                .h("user-agent", "Mozilla/5.0 (X11; Linux x86_64) test")
+                .browser()
+                .json(json!({ "password": PASSWORD })),
+        )
+        .await,
+    );
+    let made: Vec<Value> = audit_events(&e)
+        .into_iter()
+        .filter(|x| x["event"] == "device.created")
+        .collect();
+    assert_eq!(made.len(), 2, "one for each device: {made:?}");
+    let id = |b: &Browser| {
+        token::parse(b.device.as_ref().unwrap())
+            .unwrap()
+            .id
+            .to_string()
+    };
+    for (b, ip) in [(&first, "203.0.113.9"), (&second, "203.0.113.191")] {
+        let event = made
+            .iter()
+            .find(|x| x["detail"]["id"] == id(b).as_str())
+            .unwrap_or_else(|| panic!("no event for {}: {made:?}", id(b)));
+        assert_eq!(event["ip"], ip);
+        assert_eq!(event["host"], "dash.example.com");
+    }
+    let made_by_the_login = made.iter().find(|x| x["ip"] == "203.0.113.191").unwrap();
+    assert_eq!(
+        made_by_the_login["ua"],
+        "Mozilla/5.0 (X11; Linux x86_64) test"
+    );
+    // Not the secret of either cookie, nor the cookie.
+    let log = std::fs::read_to_string(e.dir.0.join("auth").join("audit.jsonl")).unwrap();
+    for b in [&first, &second] {
+        let cookie = b.device.as_ref().unwrap();
+        assert!(!log.contains(cookie.as_str()));
+        assert!(!log.contains(token::parse(cookie).unwrap().secret));
+    }
+    // A login that is from a known device makes none.
+    let before = made.len();
+    let again = go(
+        &e,
+        req(&e, Method::POST, "/api/auth/login")
+            .from("203.0.113.192")
+            .browser()
+            .cookie(&device_pair(&e, &first))
+            .json(json!({ "password": PASSWORD })),
+    )
+    .await;
+    assert_eq!(again.status, 200);
+    let after = audit_events(&e)
+        .into_iter()
+        .filter(|x| x["event"] == "device.created")
+        .count();
+    assert_eq!(after, before);
+}
+
 // ==================================== fuzzing =========================================================
 
 #[tokio::test]
