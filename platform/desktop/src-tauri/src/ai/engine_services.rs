@@ -519,6 +519,106 @@ mod tests {
     }
 
     /// Against the running engines (`OAIY_LIVE_GATEWAY`, e.g. http://127.0.0.1:8080):
+    /// An explicitly started isolated Studio can verify the scoped guard, the
+    /// actual forwarding function, native CUDA worker and configured style LoRA
+    /// together. Credentials live in memory and are never written to evidence.
+    #[tokio::test]
+    #[ignore = "requires OAIY_KLEIN_LOCAL_TEST_GATEWAY and idle GPU 1; creates real native PNGs"]
+    async fn isolated_native_klein_through_scoped_gateway() {
+        use crate::auth::{clock::ManualClock, guard::{scoped_guard, GuardConfig},
+            scopes::ScopeSet, store::{AuthStore, MintSpec}, token::Kind as TokenKind,
+            AccessMode, Guard};
+        use axum::{extract::ConnectInfo, http::{Method, Request as HttpRequest}, middleware};
+        use base64::Engine as _;
+        use sha2::{Digest, Sha256};
+        use std::{net::SocketAddr, path::PathBuf, sync::Arc, time::{Duration, Instant}};
+        use tower::ServiceExt;
+
+        let gateway = std::env::var("OAIY_KLEIN_LOCAL_TEST_GATEWAY").expect("isolated gateway URL");
+        let url = reqwest::Url::parse(&gateway).unwrap();
+        assert_eq!(url.host_str(), Some("127.0.0.1"));
+        assert!(url.port().is_some_and(|p| ![8080, 7860, 17972, 17872].contains(&p)));
+        let evidence = PathBuf::from(std::env::var("OAIY_KLEIN_LOCAL_TEST_EVIDENCE").expect("owned evidence folder"));
+        assert!(evidence.is_absolute());
+        std::fs::create_dir_all(&evidence).unwrap();
+        let discovery: Value = reqwest::get(format!("{gateway}/v1/discovery"))
+            .await.unwrap().json().await.unwrap();
+        const MODEL: &str = "codex-klein-integration-only-70a1e37";
+        let models = discovery["models"]["image"].as_array().unwrap();
+        assert!(models.iter().any(|m| m["id"] == MODEL), "refuse an unmarked/active gateway");
+        let services = services_from_discovery(&discovery);
+        assert!(services.iter().any(|s| s["id"] == format!("engine:image:{MODEL}")));
+
+        let clock = Arc::new(ManualClock::new(1_790_000_000_000));
+        let store = Arc::new(AuthStore::memory(clock.clone()));
+        let mint = |scopes: &[&str]| store.mint(MintSpec::new(TokenKind::Pat,
+            "isolated test", ScopeSet::of(scopes), 60_000)).unwrap().token;
+        let read = mint(&["models.read", "ai.read"]);
+        let infer = mint(&["ai.use"]);
+        let (config, warnings) = GuardConfig::from_env(&|_| None, false, false, 19379);
+        assert!(warnings.is_empty());
+        let guard = Arc::new(Guard::new(AccessMode::Scoped, config, store, None, None, clock));
+        let (g, d) = (gateway.clone(), discovery.clone());
+        let app = Router::new().route(&format!("{GATEWAY_PREFIX}/*path"),
+            any(move |req: Request| {
+                let (g, d) = (g.clone(), d.clone());
+                async move { forward_to(&g, &d, req).await }
+            })).layer(middleware::from_fn_with_state(guard, scoped_guard));
+        let mut records = Vec::new();
+        let mut hashes = Vec::new();
+        for (name, model, use_loras) in [("baseline", MODEL.to_string(), false),
+            ("style", MODEL.to_string(), true), ("zero", format!("{MODEL}-zero"), true)] {
+            let state = std::process::Command::new("nvidia-smi")
+                .args(["--query-gpu=index,memory.free,utilization.gpu", "--format=csv,noheader,nounits"])
+                .output().expect("GPU preflight");
+            assert!(state.status.success());
+            let gpu = String::from_utf8(state.stdout).unwrap();
+            let row = gpu.lines().find(|r| r.split(',').next().unwrap().trim() == "1").unwrap();
+            let values: Vec<usize> = row.split(',').map(|v| v.trim().parse().unwrap()).collect();
+            assert!(values[1] >= 20_000 && values[2] <= 5, "GPU 1 is not idle; no model will be unloaded");
+            let body = json!({"model": model,
+                "prompt": "a simple clean vector illustration of a fox, flat colors, crisp outlines, white background",
+                "size": "512x512", "seed": 747, "steps": 4, "cfg": 1,
+                "images": [], "negative_prompt": "", "use_loras": use_loras,
+                "response_format": "b64_json"});
+            let request = |token: Option<&str>| {
+                let mut b = HttpRequest::builder().method(Method::POST)
+                    .uri(format!("{GATEWAY_PREFIX}/v1/images/generations"))
+                    .header("host", "localhost:19379").header("content-type", "application/json");
+                if let Some(token) = token { b = b.header("authorization", format!("Bearer {token}")); }
+                let mut r = b.body(Body::from(body.to_string())).unwrap();
+                r.extensions_mut().insert(ConnectInfo("127.0.0.1:50000".parse::<SocketAddr>().unwrap()));
+                r
+            };
+            assert_eq!(app.clone().oneshot(request(None)).await.unwrap().status(), StatusCode::UNAUTHORIZED);
+            assert_eq!(app.clone().oneshot(request(Some(&read))).await.unwrap().status(), StatusCode::FORBIDDEN);
+            let started = Instant::now();
+            let response = tokio::time::timeout(Duration::from_secs(600), app.clone().oneshot(request(Some(&infer))))
+                .await.expect("native generation timed out").unwrap();
+            let status = response.status();
+            let bytes = axum::body::to_bytes(response.into_body(), FORWARD_BODY_LIMIT).await.unwrap();
+            assert_eq!(status, StatusCode::OK, "{}", String::from_utf8_lossy(&bytes));
+            let value: Value = serde_json::from_slice(&bytes).unwrap();
+            let png = base64::engine::general_purpose::STANDARD
+                .decode(value["data"][0]["b64_json"].as_str().expect("native PNG response")).unwrap();
+            assert_eq!(&png[..8], b"\x89PNG\r\n\x1a\n");
+            assert_eq!(u32::from_be_bytes(png[16..20].try_into().unwrap()), 512);
+            assert_eq!(u32::from_be_bytes(png[20..24].try_into().unwrap()), 512);
+            let hash = format!("{:x}", Sha256::digest(&png));
+            let path = evidence.join(format!("{name}.png"));
+            std::fs::write(&path, png).unwrap();
+            records.push(json!({"run": name, "request": body, "seconds": started.elapsed().as_secs_f64(),
+                "scope_statuses": {"anonymous":401,"read_only":403,"ai_use":200},
+                "png":path,"sha256":hash,"gpu_preflight":gpu}));
+            hashes.push(hash);
+            std::fs::write(evidence.join("scoped-native-results.json"),
+                serde_json::to_vec_pretty(&records).unwrap()).unwrap();
+        }
+        assert_ne!(hashes[0], hashes[1], "style LoRA had no effect");
+        assert_eq!(hashes[0], hashes[2], "zero-strength LoRA changed the native baseline");
+    }
+
+    /// Against the running engines (`OAIY_LIVE_GATEWAY`, e.g. http://127.0.0.1:8080):
     /// lists their models as the desktop does and serves the two routes on
     /// `OAIY_LIVE_PORT` for `OAIY_LIVE_SECONDS`, so a flow editor pointed at them
     /// runs through this code. Starts nothing itself; a client's call runs a job.

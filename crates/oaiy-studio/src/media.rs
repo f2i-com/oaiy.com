@@ -399,10 +399,13 @@ pub fn image_request(cfg: &Json, root: &Path, output_root: &Path, body: &Json, a
     let step = if arch == "sdxl" { 64 } else if arch == "flux2-klein-4b" { 16 } else { 32 };
     if arch == "flux2-klein-4b" {
         if body.get("turbo").is_some_and(|v|v.as_bool()!=Some(false)) { return Err("Klein does not use Qwen turbo".into()); }
-        for key in ["image", "images", "input_image", "input_reference", "adapter", "negative_prompt"] {
+        for key in ["image", "images", "input_image", "input_reference", "adapter"] {
             if body.get(key).is_some_and(|v| !matches!(v, Json::Null) && !v.as_array().is_some_and(|a| a.is_empty())) {
                 return Err("native Klein currently supports text-to-image without reference images or negative prompts".into());
             }
+        }
+        if body.get("negative_prompt").is_some_and(|v| !matches!(v, Json::Null) && !v.as_str().is_some_and(|s| s.trim().is_empty())) {
+            return Err("native Klein does not support negative prompt conditioning".into());
         }
     }
     let refs = references(body, output_root, allow_local)?;
@@ -1471,6 +1474,10 @@ mod tests {
         assert!(r.get("base").is_none()&&r.get("adapter").is_none());
         let (baseline,..)=image_request(&c,root,root,&body(r#"{"model":"klein","prompt":"a fox","use_loras":false}"#),false).unwrap();
         assert!(baseline.get("loras").is_none());
+        let (empty_negative,..)=image_request(&c,root,root,&body(r#"{"model":"klein","prompt":"a fox","size":"512x512","negative_prompt":" ","images":[]}"#),false).unwrap();
+        assert_eq!(empty_negative.get("width").and_then(Json::as_i64),Some(512));
+        assert_eq!(empty_negative.get("height").and_then(Json::as_i64),Some(512));
+        assert!(empty_negative.get("negative_prompt").is_none());
         for bad in [r#"{"model":"klein","prompt":"x","steps":8}"#,r#"{"model":"klein","prompt":"x","cfg":4}"#,r#"{"model":"klein","prompt":"x","image":"data:image/png;base64,a"}"#,r#"{"model":"klein","prompt":"x","negative_prompt":"blur"}"#] {
             assert!(image_request(&c,root,root,&body(bad),false).is_err(),"{bad}");
         }

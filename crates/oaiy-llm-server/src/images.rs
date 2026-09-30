@@ -748,8 +748,11 @@ fn prepare_klein(c: &Config, settings: &Json, body: &Json) -> Result<Json, Strin
         }
         None => if !body.get("prompt").is_some_and(valid_prompt) { return Err("prompt must be nonempty and at most 16384 bytes".into()); },
     }
-    for key in ["image", "images", "input_image", "input_reference", "adapter", "negative_prompt"] {
+    for key in ["image", "images", "input_image", "input_reference", "adapter"] {
         if body.get(key).is_some_and(|v| !matches!(v, Json::Null) && !v.as_array().is_some_and(|a| a.is_empty())) { return Err("native Klein currently supports text-to-image without reference images or negative prompts".into()); }
+    }
+    if body.get("negative_prompt").is_some_and(|v| !matches!(v, Json::Null) && !v.as_str().is_some_and(|s| s.trim().is_empty())) {
+        return Err("native Klein does not support negative prompt conditioning".into());
     }
     if body.get("turbo").is_some_and(|v| v.as_bool() != Some(false)) { return Err("Klein does not use Qwen turbo".into()); }
     let variant = settings.get("variant").and_then(Json::as_str).unwrap_or("distilled");
@@ -1181,6 +1184,13 @@ mod tests {
         assert_eq!(request.get("loras").and_then(Json::as_array).unwrap().len(),1);
         let baseline=prepare(&cfg,&Json::parse(br#"{"model":"klein","prompt":"fox","use_loras":false}"#).unwrap()).unwrap();
         assert!(baseline.get("loras").and_then(Json::as_array).unwrap().is_empty());
+        for negative in [Json::Null, Json::str(""), Json::str(" \t")] {
+            let r=prepare(&cfg,&Json::obj([("model",Json::str("klein")),("prompt",Json::str("fox")),("negative_prompt",negative)])).unwrap();
+            assert!(r.get("negative_prompt").is_none());
+        }
+        for negative in [Json::str("blur"), Json::Bool(false), Json::Arr(Vec::new())] {
+            assert!(prepare(&cfg,&Json::obj([("model",Json::str("klein")),("prompt",Json::str("fox")),("negative_prompt",negative)])).is_err());
+        }
         for bad in [br#"{"model":"klein","prompt":"fox","steps":8}"#.as_slice(),br#"{"model":"klein","prompt":"fox","cfg":4}"#.as_slice(),br#"{"model":"klein","prompt":"fox","input_reference":"untrusted"}"#.as_slice()] { assert!(prepare(&cfg,&Json::parse(bad).unwrap()).is_err()); }
         std::fs::remove_dir_all(root).unwrap();
     }

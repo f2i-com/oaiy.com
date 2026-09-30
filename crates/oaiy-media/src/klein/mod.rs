@@ -85,13 +85,18 @@ impl Request {
             "input_image",
             "input_reference",
             "adapter",
-            "negative_prompt",
         ] {
             if j.get(key).is_some_and(|v| {
                 !matches!(v, Json::Null) && !v.as_array().is_some_and(|a| a.is_empty())
             }) {
                 return Err("Klein currently supports text-to-image; use loras for style adapters, without Qwen turbo/reference/negative fields".into());
             }
+        }
+        // Generic image clients send an empty negative field for text-to-image.
+        if j.get("negative_prompt").is_some_and(|v| {
+            !matches!(v, Json::Null) && !v.as_str().is_some_and(|s| s.trim().is_empty())
+        }) {
+            return Err("Klein does not support negative prompt conditioning".into());
         }
         if j.get("turbo").is_some_and(|v| v.as_bool() != Some(false)) {
             return Err("Klein does not use Qwen turbo".into());
@@ -314,4 +319,29 @@ pub fn generate(r: &Request, mut event: impl FnMut(Json)) -> Result<Json> {
         ("seconds", Json::Num(clock.elapsed().as_secs_f64())),
         ("residency", model.residency()),
     ]))
+}
+
+#[cfg(test)]
+mod request_tests {
+    use super::*;
+
+    #[test]
+    fn empty_negative_from_generic_clients_is_absent_conditioning() {
+        let fixture = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/klein/tiny.safetensors");
+        let output = std::env::temp_dir().join(format!("oaiy-klein-request-{}", std::process::id()));
+        let body = |negative| Json::obj([
+            ("transformer", Json::str(fixture.to_string_lossy())),
+            ("text_encoder", Json::str(fixture.to_string_lossy())),
+            ("tokenizer", Json::str(fixture.to_string_lossy())),
+            ("vae", Json::str(fixture.to_string_lossy())),
+            ("output_dir", Json::str(output.to_string_lossy())),
+            ("prompt", Json::str("fox")), ("negative_prompt", negative),
+        ]);
+        for value in [Json::Null, Json::str(""), Json::str(" \t")] {
+            assert!(Request::parse(&body(value)).is_ok());
+        }
+        for value in [Json::str("blur"), Json::Bool(false), Json::Arr(Vec::new())] {
+            assert!(Request::parse(&body(value)).is_err());
+        }
+    }
 }
