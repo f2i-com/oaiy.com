@@ -662,10 +662,27 @@ fn is_loopback_origin(origin: &str) -> bool {
     host == "localhost" || host == "127.0.0.1"
 }
 
+/// The schemes OAIY's own pages are served from: the agent, `oaiy`, and the
+/// flow editor, `oaiyflows` (`embed.rs`, which serves them, has a test that
+/// these are its `AGENT_SCHEME` and `FLOWS_SCHEME`).
+pub const EMBEDDED_SCHEMES: [&str; 2] = ["oaiy", "oaiyflows"];
+
+/// The exact origins of the agent's window and the flow editor's window: the
+/// page of each scheme is `http://<scheme>.localhost` on Windows (WebView2 maps
+/// a custom scheme to that) and `<scheme>://localhost` elsewhere. The same in a
+/// debug build under `tauri dev` and in an installed one: both serve the pages
+/// from these schemes, not from a dev server.
+pub fn embedded_window_origins(windows: bool) -> Vec<String> {
+    EMBEDDED_SCHEMES
+        .iter()
+        .map(|s| if windows { format!("http://{s}.localhost") } else { format!("{s}://localhost") })
+        .collect()
+}
+
 /// Whether `origin` is one of the pages OAIY shows in its own window (the
 /// agent, `oaiy`; the flow editor, `oaiyflows`), served from its own schemes.
 pub fn is_embedded_origin(origin: &str) -> bool {
-    ["oaiy", "oaiyflows"].iter().any(|s| {
+    EMBEDDED_SCHEMES.iter().any(|s| {
         origin == format!("{s}://localhost") || origin == format!("http://{s}.localhost") || origin == format!("https://{s}.localhost")
     })
 }
@@ -1719,6 +1736,22 @@ mod tests {
         assert_eq!(body["product"], "oaiy-desktop");
         assert_eq!(body["status"], "ok");
         assert!(body.get("api_version").is_none(), "snake_case must not leak");
+    }
+
+    #[test]
+    fn the_windows_origins_are_the_two_pages_in_their_systems_form() {
+        assert_eq!(
+            super::embedded_window_origins(true),
+            ["http://oaiy.localhost", "http://oaiyflows.localhost"],
+            "WebView2 maps a custom scheme to http://<scheme>.localhost"
+        );
+        assert_eq!(super::embedded_window_origins(false), ["oaiy://localhost", "oaiyflows://localhost"]);
+        // The desktop's own rule for "one of OAIY's windows" knows every one of them.
+        for windows in [true, false] {
+            for origin in super::embedded_window_origins(windows) {
+                assert!(super::is_embedded_origin(&origin), "{origin}");
+            }
+        }
     }
 
     #[test]

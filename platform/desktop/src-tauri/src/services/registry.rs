@@ -13,7 +13,29 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use super::runner::{LogLine, Runner, SpawnConfig};
-use super::template::{substitute, InstallSpec, NodeSpec, ServiceTemplate, UninstallSpec};
+use super::template::{substitute, InstallSpec, NodeSpec, RunSpec, ServiceTemplate, UninstallSpec};
+
+/// The built-in service whose HTTP server (`playwright_server.py`) drives a
+/// browser and can be reached from any web page on the machine, so it is told
+/// which pages may call it. The voice services and the like are not touched.
+const BROWSER_SERVICE_ID: &str = "playwright-browser";
+
+/// The variable it reads: a comma list of the exact origins of the web pages
+/// allowed to call it. Programs that send no `Origin` (this app, `oaiy`, curl)
+/// need no entry.
+const ALLOWED_ORIGINS_ENV: &str = "OAIY_ALLOWED_ORIGINS";
+
+/// What `OAIY_ALLOWED_ORIGINS` holds: in an app with windows, the exact origins
+/// of the Agent's window and the flow editor's (`http::embedded_window_origins`);
+/// in the headless server, which has none, nothing, so no web page may call the
+/// browser service there at all.
+fn allowed_origins_env(has_windows: bool, on_windows: bool) -> String {
+    if has_windows {
+        crate::http::embedded_window_origins(on_windows).join(",")
+    } else {
+        String::new()
+    }
+}
 
 /// Built-in templates embedded at compile time. Seeded to disk on first
 /// run; users can edit the on-disk copies to customise.
@@ -1569,11 +1591,53 @@ impl Registry {
         // run.command/args/env/cwd can reference bundled scripts by
         // `${scriptsDir}/name` (matches materialize_package_files' target dir).
         m.insert("scriptsDir", self.data_dir.join("scripts").display().to_string());
+        // The web pages allowed to call a service that drives a browser (see
+        // ALLOWED_ORIGINS_ENV); the Playwright template names it in its env.
+        m.insert("allowedOrigins", allowed_origins_env(cfg!(feature = "gui"), cfg!(windows)));
         // All search roots joined by the OS path separator (`;` on Windows),
         // so a service env like `"MY_MODEL_DIRS": "${modelDirs}"` can scan
         // several drives. Primary is always first.
         m.insert("modelDirs", join_model_dirs(&self.model_dirs));
         m
+    }
+
+    /// The environment service `id` is spawned with: the template's `env` with
+    /// its placeholders resolved, plus what the registry adds.
+    fn spawn_env(&self, id: &str, run_spec: &RunSpec, ctx: &HashMap<&'static str, String>) -> HashMap<String, String> {
+        let mut env: HashMap<String, String> = run_spec
+            .env
+            .iter()
+            .map(|(k, v)| (k.clone(), substitute(v, ctx)))
+            .collect();
+        // The browser service is told which web pages may call it. The template
+        // names the variable (`${allowedOrigins}`), but a copy the person edited
+        // in the Services panel is theirs and is never refreshed from the
+        // built-in one: without this, an older copy would start a server that
+        // lets no window in. A value the copy sets itself is kept.
+        if id == BROWSER_SERVICE_ID {
+            env.entry(ALLOWED_ORIGINS_ENV.to_string())
+                .or_insert_with(|| allowed_origins_env(cfg!(feature = "gui"), cfg!(windows)));
+        }
+        // Pin to a chosen GPU if the user assigned one in the GPU picker — so e.g.
+        // OAIY Voice runs on GPU 1 while a Python rig keeps GPU 0, instead of both
+        // defaulting to GPU 0 and exhausting its VRAM. CUDA_VISIBLE_DEVICES re-indexes,
+        // so the service sees the chosen card as cuda:0 (a multi-GPU service then runs
+        // on the one card; left unset it keeps its own default placement).
+        if let Some(gpu) = self.service_gpus.get(id).copied() {
+            // The picker shows nvidia-smi indices (PCI-bus order), but CUDA defaults to
+            // CUDA_DEVICE_ORDER=FASTEST_FIRST — so on a HETEROGENEOUS box "GPU 1" could map
+            // to a different physical card than the user picked. Force PCI_BUS_ID so the two
+            // index spaces line up; don't clobber a template that set its own order.
+            env.entry("CUDA_DEVICE_ORDER".to_string())
+                .or_insert_with(|| "PCI_BUS_ID".to_string());
+            env.insert("CUDA_VISIBLE_DEVICES".to_string(), gpu.to_string());
+        }
+        // An env entry whose placeholder never resolved is not a value. Passing
+        // `SOME_PATH=${unknown}` literally would have the service try to open a
+        // file by that name and fail; dropping it is what makes an OPTIONAL
+        // template placeholder expressible at all.
+        env.retain(|_, v| !(v.contains("${") && v.contains('}')));
+        env
     }
 
     /// Spawn the service identified by `id`. Returns Err if the template
@@ -1630,32 +1694,8 @@ impl Registry {
             .iter()
             .map(|a| os_fix_path(substitute(a, &ctx)))
             .collect();
-        let mut env: HashMap<String, String> = run_spec
-            .env
-            .iter()
-            .map(|(k, v)| (k.clone(), substitute(v, &ctx)))
-            .collect();
-        // Pin to a chosen GPU if the user assigned one in the GPU picker — so e.g.
-        // OAIY Voice runs on GPU 1 while a Python rig keeps GPU 0, instead of both
-        // defaulting to GPU 0 and exhausting its VRAM. CUDA_VISIBLE_DEVICES re-indexes,
-        // so the service sees the chosen card as cuda:0 (a multi-GPU service then runs
-        // on the one card; left unset it keeps its own default placement).
-        if let Some(gpu) = self.service_gpus.get(id).copied() {
-            // The picker shows nvidia-smi indices (PCI-bus order), but CUDA defaults to
-            // CUDA_DEVICE_ORDER=FASTEST_FIRST — so on a HETEROGENEOUS box "GPU 1" could map
-            // to a different physical card than the user picked. Force PCI_BUS_ID so the two
-            // index spaces line up; don't clobber a template that set its own order.
-            env.entry("CUDA_DEVICE_ORDER".to_string())
-                .or_insert_with(|| "PCI_BUS_ID".to_string());
-            env.insert("CUDA_VISIBLE_DEVICES".to_string(), gpu.to_string());
-        }
+        let env = self.spawn_env(id, &run_spec, &ctx);
         let cwd = run_spec.cwd.as_deref().map(|c| os_fix_path(substitute(c, &ctx)));
-
-        // An env entry whose placeholder never resolved is not a value. Passing
-        // `SOME_PATH=${unknown}` literally would have the service try to open a
-        // file by that name and fail; dropping it is what makes an OPTIONAL
-        // template placeholder expressible at all.
-        env.retain(|_, v| !(v.contains("${") && v.contains('}')));
 
         // Default the working dir to the data dir (not the inherited process CWD) when the
         // template doesn't set one, for the same reason as install: a bare helper the run
@@ -2919,6 +2959,82 @@ mod tests {
                 .unwrap_or_else(|e| panic!("builtin template {name} failed to deserialize: {e}"));
             assert!(!t.id.is_empty(), "builtin template {name} has empty id");
         }
+    }
+
+    /// The environment `id` would be spawned with, from its shipped template.
+    fn env_of(reg: &Registry, id: &str) -> HashMap<String, String> {
+        let svc = reg.services.get(id).unwrap_or_else(|| panic!("no built-in service {id}"));
+        reg.spawn_env(id, &svc.template.run, &reg.ctx(svc.port))
+    }
+
+    #[test]
+    fn what_the_browser_service_is_told_is_the_windows_origins_of_this_build() {
+        assert_eq!(
+            allowed_origins_env(true, true),
+            "http://oaiy.localhost,http://oaiyflows.localhost",
+            "Windows: the Agent's window and the flow editor's"
+        );
+        assert_eq!(allowed_origins_env(true, false), "oaiy://localhost,oaiyflows://localhost");
+        assert_eq!(allowed_origins_env(false, true), "", "the headless server has no windows: no web page may call it");
+        assert_eq!(allowed_origins_env(false, false), "");
+    }
+
+    #[test]
+    fn the_registry_passes_the_browser_service_the_windows_origins() {
+        let (dir, reg) = scratch_registry("origins-env");
+        let env = env_of(&reg, "playwright-browser");
+        let expected = allowed_origins_env(cfg!(feature = "gui"), cfg!(windows));
+        assert_eq!(env.get("OAIY_ALLOWED_ORIGINS"), Some(&expected), "the variable is passed, resolved");
+        if cfg!(feature = "gui") {
+            // Not a wildcard, not a list of loopback ports: the two windows, exactly.
+            let origins: Vec<&str> = expected.split(',').collect();
+            assert_eq!(origins.len(), 2);
+            assert!(origins.iter().all(|o| crate::http::is_embedded_origin(o) && !o.contains('*')), "{expected}");
+        }
+        // Its port is still handed over the way it always was.
+        let port = reg.services["playwright-browser"].port;
+        assert_eq!(env.get("OAIY_BROWSER_PORT"), Some(&port.to_string()));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn the_shipped_browser_template_names_the_variable() {
+        let t: ServiceTemplate = serde_json::from_str(include_str!("../../resources/templates/playwright-browser.json")).unwrap();
+        assert_eq!(t.id, BROWSER_SERVICE_ID);
+        assert_eq!(t.run.env.get("OAIY_ALLOWED_ORIGINS").map(String::as_str), Some("${allowedOrigins}"));
+        assert_eq!(t.run.env.get("OAIY_BROWSER_PORT").map(String::as_str), Some("${port}"));
+    }
+
+    #[test]
+    fn a_copy_of_the_browser_template_the_person_edited_still_gets_the_variable_and_keeps_its_own() {
+        // Editing a built-in service in the Services panel rewrites its template as the person's own,
+        // and OAIY never refreshes it: one from before this variable existed must not start a server
+        // that lets no window in.
+        let (dir, reg) = scratch_registry("origins-edited");
+        let svc = &reg.services["playwright-browser"];
+        let mut older = svc.template.run.clone();
+        older.env.remove("OAIY_ALLOWED_ORIGINS");
+        let env = reg.spawn_env("playwright-browser", &older, &reg.ctx(svc.port));
+        assert_eq!(
+            env.get("OAIY_ALLOWED_ORIGINS"),
+            Some(&allowed_origins_env(cfg!(feature = "gui"), cfg!(windows)))
+        );
+        // A value the person set is theirs.
+        let mut mine = older.clone();
+        mine.env.insert("OAIY_ALLOWED_ORIGINS".into(), "http://localhost:5173".into());
+        let env = reg.spawn_env("playwright-browser", &mine, &reg.ctx(svc.port));
+        assert_eq!(env.get("OAIY_ALLOWED_ORIGINS").map(String::as_str), Some("http://localhost:5173"));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn no_other_service_is_given_the_origins() {
+        // The voice services and the rest are not hardened here (N12): they get what their templates say.
+        let (dir, reg) = scratch_registry("origins-others");
+        for id in ["oaiy-voice", "aokie-stt", "aokie-tts"] {
+            assert!(!env_of(&reg, id).contains_key("OAIY_ALLOWED_ORIGINS"), "{id}");
+        }
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

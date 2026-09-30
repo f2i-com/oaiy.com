@@ -15,7 +15,8 @@
       "${dataDir}/scripts/playwright_server.py"
     ],
     "env": {
-      "OAIY_BROWSER_PORT": "${port}"
+      "OAIY_BROWSER_PORT": "${port}",
+      "OAIY_ALLOWED_ORIGINS": "${allowedOrigins}"
     }
   },
   "health": {

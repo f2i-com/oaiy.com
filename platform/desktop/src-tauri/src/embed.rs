@@ -454,6 +454,24 @@ mod tests {
     }
 
     #[test]
+    fn the_browser_service_is_told_the_origins_these_windows_really_have() {
+        // The Playwright server lets in the origins the registry gives it (`http::embedded_window_origins`),
+        // and only these windows make requests from them. They must be the very addresses the windows
+        // are opened at, or browser nodes silently stop working in them (a page opened at an https
+        // address, a scheme renamed…). `Url::origin()` is opaque for a custom scheme; scheme and host are what a browser sends.
+        assert_eq!(crate::http::EMBEDDED_SCHEMES, [AGENT_SCHEME, FLOWS_SCHEME]);
+        let told = crate::http::embedded_window_origins(cfg!(windows));
+        let opened: Vec<String> = Page::SERVED
+            .iter()
+            .map(|page| {
+                let url = page.url();
+                format!("{}://{}", url.scheme(), url.host_str().expect("a host"))
+            })
+            .collect();
+        assert_eq!(told, opened);
+    }
+
+    #[test]
     fn a_page_is_told_its_theme() {
         assert_eq!(parse_theme("light"), Some("light"));
         assert_eq!(parse_theme("sepia"), None);
