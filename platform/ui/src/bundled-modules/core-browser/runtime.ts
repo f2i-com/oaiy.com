@@ -18,6 +18,7 @@
 import type { RuntimeContext, RuntimeModule, RuntimeMethod } from 'oaiy-core/src/module-types';
 import { MODULE_CLEANUP } from 'oaiy-core/src/module-types';
 import { getEngineBase } from '../../lib/engineEndpoint';
+import { inOaiyWindow } from '../../lib/oaiyWindow';
 import {
   extractEmailsScript,
   extractPhonesScript,
@@ -1088,7 +1089,7 @@ async function companionFetchJson<T = unknown>(
 async function resolveDesktopBrowserBase(): Promise<string> {
   if (companionBrowserBase) return companionBrowserBase;
 
-  let services: Array<{ id: string; port?: number; defaultPort?: number; status?: string }>;
+  let services: Array<{ id: string; port?: number; defaultPort?: number; status?: string; startedAt?: string }>;
   try {
     const snap = await companionFetchJson<{ services?: typeof services }>(
       `${desktopApi()}/api/services`,
@@ -1111,6 +1112,9 @@ async function resolveDesktopBrowserBase(): Promise<string> {
     );
   }
   const port = svc.port || svc.defaultPort || 17880;
+  // When the service last started: a service that was not running is started below, so from now.
+  const startedAtMs = svc.status === 'running' && svc.startedAt ? Date.parse(svc.startedAt) : NaN;
+  const upSince = Number.isFinite(startedAtMs) ? startedAtMs : Date.now();
 
   // Ask OAIY Desktop to start it if it isn't already (returns immediately —
   // the readiness poll below is what actually gates us).
@@ -1144,13 +1148,51 @@ async function resolveDesktopBrowserBase(): Promise<string> {
       lastErr = new Error(h?.error || 'browser not ready');
     } catch (e) {
       lastErr = e;
+      // A page that gets no answer from a service that has had time to open its
+      // port is one the service refused (see below): say so now, not after the
+      // whole wait.
+      if (
+        isRefusedByBrowserService(e) &&
+        Date.now() - upSince > BROWSER_SERVICE_BOOT_GRACE_MS
+      ) {
+        throw new Error(browserServiceRefusesThisPage());
+      }
     }
     await new Promise(r => setTimeout(r, 750));
   }
+  if (isRefusedByBrowserService(lastErr)) throw new Error(browserServiceRefusesThisPage());
   throw new Error(
     `[Browser] Playwright Browser service did not become ready: ${
       lastErr instanceof Error ? lastErr.message : String(lastErr)
     }`
+  );
+}
+
+/**
+ * The Playwright service answers only OAIY Desktop's own windows (the Agent and
+ * the Flows page) and programs that send no Origin: it drives a real browser, and
+ * any web page on the machine could otherwise call a loopback port. A request it
+ * refuses comes back without CORS headers, so the page cannot read the refusal (a
+ * 403 or 421): all it sees is `TypeError: Failed to fetch`, the same as a service
+ * that is not listening yet. What tells them apart is where the page is: outside
+ * OAIY's window (a hosted or paired editor at oaiy.com, a browser tab, a dev
+ * server), a network error from a service the desktop lists as running is a refusal
+ * once the service has had time to open its port: it launches its browser first,
+ * which is what the wait for `/health` above is for (about this long).
+ */
+const BROWSER_SERVICE_BOOT_GRACE_MS = 45_000;
+
+function isRefusedByBrowserService(err: unknown): boolean {
+  return !inOaiyWindow() && err instanceof TypeError;
+}
+
+function browserServiceRefusesThisPage(): string {
+  const where = typeof window !== 'undefined' && window.location?.origin ? ` at ${window.location.origin}` : '';
+  return (
+    `[Browser] OAIY Desktop's Playwright Browser service did not answer this page${where}. ` +
+    'It only answers OAIY Desktop\'s own windows (the Agent and the Flows page), not a flow editor open in a web ' +
+    'browser or on oaiy.com, so the browser nodes cannot run from here. Open this flow in OAIY Desktop\'s Flows page ' +
+    'to run it.'
   );
 }
 
