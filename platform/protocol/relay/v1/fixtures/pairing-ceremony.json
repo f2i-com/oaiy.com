@@ -1,0 +1,173 @@
+{
+  "protocol": "oaiy-relay/1",
+  "title": "The pairing ceremony of Appendix A3, recorded through the relay",
+  "about": "Every request a desktop and a phone make in one pairing, and every answer, in order, recorded from the real relay with the fixed keys and values of Appendix A3 (vectors.json). A desktop, a phone and a stub relay can replay it. Times are the relay clock the recording ran on (1790000000). The device id of the desktop is the one Appendix A3 names.",
+  "vector": "A3",
+  "relay": {
+    "url": "https://relay.example.com",
+    "clock": 1790000000
+  },
+  "pid": "b5YkfMcTvJb0g1GTv3kNNQ",
+  "sas": "6NHN-K68M-QQVZ-5",
+  "steps": [
+    {
+      "step": "desktop opens the rendezvous",
+      "from": "desktop",
+      "request": {
+        "method": "POST",
+        "path": "/v1/pair",
+        "body": {
+          "pid": "b5YkfMcTvJb0g1GTv3kNNQ",
+          "offer": "{\"appId\":\"aokie\",\"desktopConnectionId\":\"dev-oKGio6SlpqeoqaqrrK2urw\",\"desktopEndpointKey\":{\"algorithm\":\"ed25519\",\"publicKey\":\"_RckOFqgx1tk-3jNYC-h2ZH96_drE8WO1wLqyDXp9hg\",\"thumbprint\":\"atZR63tNG3W2GhPpVleKnfrw1N7N6LAqOe5grE2SBR4\"},\"desktopName\":\"Front desk PC\",\"desktopX25519\":\"fmmObAT_fOZaBcblwdAzh4LSI8Y5DbIaucckFsAO720\",\"expiresAt\":1790000600,\"hostIdentity\":{\"ed25519\":\"Zr5-Myx6RTMyvZ0Kf32wVfXF7xoGraZtmLOftoEMRzo\",\"thumbprint\":\"8TlG3IhiRH5sWhsIGSSRnAqf9zyhEl1ir4t4cbTRCk0\",\"x25519\":\"v9o3aPkn21Kf6fD27kukaeQyyTu2-7jtXQToftCkXXs\"},\"issuedAt\":1790000000,\"jti\":\"pair-0001\",\"kind\":\"aokie_mobile_pairing\",\"nonce\":\"QEFCQ0RFRkdISUpLTE1OT1BRUlNUVVZXWFlaW1xdXl8\",\"relay\":{\"fingerprint\":\"b7dKD2-DlMApkGljz-RJwDdNcyxwyFBpSmhz2cRBnaw\",\"url\":\"https://relay.example.com\"},\"schemaVersion\":3}",
+          "mac": "NVXJRqSryFOpH6fU5kmvLpQzv0-rM1wzDXd8BiMoDWk",
+          "ttl": 600,
+          "appId": "aokie",
+          "desktopThumbprint": "atZR63tNG3W2GhPpVleKnfrw1N7N6LAqOe5grE2SBR4"
+        }
+      },
+      "response": {
+        "status": 201,
+        "body": {
+          "pid": "b5YkfMcTvJb0g1GTv3kNNQ",
+          "exp": 1790000600,
+          "time": 1790000000
+        }
+      },
+      "note": "Authorization: the desktop's device token. The offer text is exactly the 778 bytes of Appendix A3."
+    },
+    {
+      "step": "phone fetches the offer",
+      "from": "phone",
+      "request": {
+        "method": "GET",
+        "path": "/v1/pair/b5YkfMcTvJb0g1GTv3kNNQ"
+      },
+      "response": {
+        "status": 200,
+        "body": {
+          "v": 1,
+          "state": "open",
+          "offer": "{\"appId\":\"aokie\",\"desktopConnectionId\":\"dev-oKGio6SlpqeoqaqrrK2urw\",\"desktopEndpointKey\":{\"algorithm\":\"ed25519\",\"publicKey\":\"_RckOFqgx1tk-3jNYC-h2ZH96_drE8WO1wLqyDXp9hg\",\"thumbprint\":\"atZR63tNG3W2GhPpVleKnfrw1N7N6LAqOe5grE2SBR4\"},\"desktopName\":\"Front desk PC\",\"desktopX25519\":\"fmmObAT_fOZaBcblwdAzh4LSI8Y5DbIaucckFsAO720\",\"expiresAt\":1790000600,\"hostIdentity\":{\"ed25519\":\"Zr5-Myx6RTMyvZ0Kf32wVfXF7xoGraZtmLOftoEMRzo\",\"thumbprint\":\"8TlG3IhiRH5sWhsIGSSRnAqf9zyhEl1ir4t4cbTRCk0\",\"x25519\":\"v9o3aPkn21Kf6fD27kukaeQyyTu2-7jtXQToftCkXXs\"},\"issuedAt\":1790000000,\"jti\":\"pair-0001\",\"kind\":\"aokie_mobile_pairing\",\"nonce\":\"QEFCQ0RFRkdISUpLTE1OT1BRUlNUVVZXWFlaW1xdXl8\",\"relay\":{\"fingerprint\":\"b7dKD2-DlMApkGljz-RJwDdNcyxwyFBpSmhz2cRBnaw\",\"url\":\"https://relay.example.com\"},\"schemaVersion\":3}",
+          "mac": "NVXJRqSryFOpH6fU5kmvLpQzv0-rM1wzDXd8BiMoDWk",
+          "exp": 1790000600,
+          "time": 1790000000
+        }
+      },
+      "note": "No credential: the pid is the capability."
+    },
+    {
+      "step": "phone posts its response",
+      "from": "phone",
+      "request": {
+        "method": "POST",
+        "path": "/v1/pair/b5YkfMcTvJb0g1GTv3kNNQ/response",
+        "body": {
+          "response": "{\"kind\":\"aokie_mobile_pairing_response\",\"schemaVersion\":3,\"claims\":{\"appId\":\"aokie\",\"desktopConnectionId\":\"dev-oKGio6SlpqeoqaqrrK2urw\",\"desktopKeyThumbprint\":\"atZR63tNG3W2GhPpVleKnfrw1N7N6LAqOe5grE2SBR4\",\"deviceId\":\"dev-sLGys7S1tre4ubq7vL2-vw\",\"displayName\":\"Test phone\",\"expiresAt\":1790000150,\"issuedAt\":1790000030,\"jti\":\"pair-0001\",\"mobileEndpointKey\":{\"algorithm\":\"ed25519\",\"publicKey\":\"6kpsY-KcUgq-9VB7Ey7F-ZVHdq6-vnuSQh7qaRRG0iw\",\"thumbprint\":\"--6IM5l0OosLj9yWskISYhUA3n_3CURQkmrYMSha_ck\"},\"mobileX25519\":\"GdgCBL-F8-ERjhsjQQyI8NDuztUVb0xb3zR7FO1-xj8\",\"pairingNonce\":\"QEFCQ0RFRkdISUpLTE1OT1BRUlNUVVZXWFlaW1xdXl8\"},\"signature\":\"uoCR5b9NLDUwK2QBH-pXtm-6I5Kj4FqM4F_BhuGDxr_qKomo7Kq1O1H14s8YyPuie14oCoaoTzHvX0KoT5UwAQ\",\"mac\":\"0Nw8sxSLeI6x5islDA7m0Gi_s_qP4LrHWrbPIMwxdoQ\"}"
+        }
+      },
+      "response": {
+        "status": 202,
+        "body": {
+          "state": "answered",
+          "time": 1790000000
+        }
+      }
+    },
+    {
+      "step": "desktop's poll returns the pair item",
+      "from": "desktop",
+      "request": {
+        "method": "GET",
+        "path": "/v1/poll"
+      },
+      "response": {
+        "status": 200,
+        "body": {
+          "v": 1,
+          "epoch": "ZX3jvMUWnvY",
+          "cursor": 1,
+          "items": [
+            {
+              "seq": 1,
+              "id": "b5YkfMcTvJb0g1GTv3kNNQ",
+              "lane": "pair",
+              "from": "relay",
+              "at": 1790000000,
+              "exp": 1790000600,
+              "hdr": {
+                "ct": "json"
+              },
+              "body": "{\"kind\":\"aokie_mobile_pairing_response\",\"schemaVersion\":3,\"claims\":{\"appId\":\"aokie\",\"desktopConnectionId\":\"dev-oKGio6SlpqeoqaqrrK2urw\",\"desktopKeyThumbprint\":\"atZR63tNG3W2GhPpVleKnfrw1N7N6LAqOe5grE2SBR4\",\"deviceId\":\"dev-sLGys7S1tre4ubq7vL2-vw\",\"displayName\":\"Test phone\",\"expiresAt\":1790000150,\"issuedAt\":1790000030,\"jti\":\"pair-0001\",\"mobileEndpointKey\":{\"algorithm\":\"ed25519\",\"publicKey\":\"6kpsY-KcUgq-9VB7Ey7F-ZVHdq6-vnuSQh7qaRRG0iw\",\"thumbprint\":\"--6IM5l0OosLj9yWskISYhUA3n_3CURQkmrYMSha_ck\"},\"mobileX25519\":\"GdgCBL-F8-ERjhsjQQyI8NDuztUVb0xb3zR7FO1-xj8\",\"pairingNonce\":\"QEFCQ0RFRkdISUpLTE1OT1BRUlNUVVZXWFlaW1xdXl8\"},\"signature\":\"uoCR5b9NLDUwK2QBH-pXtm-6I5Kj4FqM4F_BhuGDxr_qKomo7Kq1O1H14s8YyPuie14oCoaoTzHvX0KoT5UwAQ\",\"mac\":\"0Nw8sxSLeI6x5islDA7m0Gi_s_qP4LrHWrbPIMwxdoQ\"}"
+            }
+          ],
+          "more": false,
+          "time": 1790000000
+        }
+      },
+      "note": "The item id is the pid; from is \"relay\"; the body is the phone's response text, byte for byte."
+    },
+    {
+      "step": "desktop approves",
+      "from": "desktop",
+      "request": {
+        "method": "POST",
+        "path": "/v1/pair/b5YkfMcTvJb0g1GTv3kNNQ/decision",
+        "body": {
+          "approve": true,
+          "phone": {
+            "ed25519": "6kpsY-KcUgq-9VB7Ey7F-ZVHdq6-vnuSQh7qaRRG0iw",
+            "x25519": "GdgCBL-F8-ERjhsjQQyI8NDuztUVb0xb3zR7FO1-xj8",
+            "thumbprint": "--6IM5l0OosLj9yWskISYhUA3n_3CURQkmrYMSha_ck"
+          },
+          "name": "Test phone",
+          "appId": "aokie",
+          "grants": [
+            "state_read",
+            "caller_read",
+            "captions_read",
+            "assistance_read",
+            "assistance_respond",
+            "rtc_signal"
+          ],
+          "receipt": {
+            "issuedAt": 1790000040,
+            "signature": "FU2PKdtj23VkPpxZfw-DcqwSBNWlL8OvFfPFiJ-kSufrDGbpBPKfKy0c9MfhD3IZyM_5pVgAmeiMGNep93mtDg"
+          }
+        }
+      },
+      "response": {
+        "status": 200,
+        "body": {
+          "v": 1,
+          "state": "approved",
+          "deviceId": "dev-23gKo4b_nBf56Eblx51dvA",
+          "time": 1790000000
+        }
+      },
+      "note": "The receipt is the desktop endpoint key's signature of Appendix A3 over the receipt document."
+    },
+    {
+      "step": "phone reads the outcome",
+      "from": "phone",
+      "request": {
+        "method": "GET",
+        "path": "/v1/pair/b5YkfMcTvJb0g1GTv3kNNQ"
+      },
+      "response": {
+        "status": 200,
+        "body": {
+          "v": 1,
+          "state": "approved",
+          "deviceId": "dev-23gKo4b_nBf56Eblx51dvA",
+          "sealedToken": "HpCLWB0JAF3LworjHfD1HM6j_0H4-3EfcVkwpyNvxlHLxNhlpLKYs2hAbdzMT0FU_oh3fqr05V7pUPI_kEnrniG8GpMk8hXUHjV6T61xbFMRLe6htmqD--1NzRsxfBS1Ysn_0TiLc4PzH5LrUBlL",
+          "receipt": {
+            "issuedAt": 1790000040,
+            "signature": "FU2PKdtj23VkPpxZfw-DcqwSBNWlL8OvFfPFiJ-kSufrDGbpBPKfKy0c9MfhD3IZyM_5pVgAmeiMGNep93mtDg"
+          },
+          "time": 1790000000
+        }
+      },
+      "note": "sealedToken opens with the phone's X25519 key (sealed-token.json says how); the receipt verifies under the desktop key pinned from the offer."
+    }
+  ]
+}

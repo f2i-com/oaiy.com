@@ -956,6 +956,8 @@ FETCH_OPEN = POS["pairing-fetch-response"][0][1]
 pos("pairing-fetch-response", "open, after a granted wait", dict(FETCH_OPEN, hold={"granted": True}))
 pos("pairing-fetch-response", "answered, superseded by a newer wait", dict(FETCH_OPEN, state="answered", hold={"granted": True, "superseded": True}))
 pos("pairing-fetch-response", "open, the wait refused because the pool is nearly full", dict(FETCH_OPEN, hold={"refused": True, "retryAfter": 2}))
+SEALED_FIXTURE = json.loads((V1 / "fixtures" / "sealed-token.json").read_text(encoding="utf-8"))
+pos("sealed-token-fixture", "the recorded fixture", SEALED_FIXTURE)
 pos("approval-receipt", "the A3 receipt document", RECEIPT)
 pos("admission-claims", "the A4 mobile claims", vec["A4"]["inputs"]["claims"])
 pos("admission-claims", "a plugin claims set", {"aud": "aokie-v2-gateway", "appId": "aokie", "subjectId": "aokie", "role": "plugin", "holderKeyThumbprint": DESK_TH,
@@ -1248,6 +1250,11 @@ neg("pairing-fetch-response", "a hold both granted and refused", dict(p1("pairin
 neg("pairing-fetch-response", "a refused hold without retryAfter", dict(p1("pairing-fetch-response"), hold={"refused": True}), "hold")
 neg("pairing-fetch-response", "an approval without the receipt", mut(p1("pairing-fetch-response", 1), "receipt"), "receipt")
 neg("pairing-fetch-response", "an answered rendezvous without its MAC", mut(dict(p1("pairing-fetch-response"), state="answered"), "mac"), "mac")
+neg("sealed-token-fixture", "a sealed token of 147 characters", mut(SEALED_FIXTURE, "opens.0.sealedToken", SEALED_FIXTURE["opens"][0]["sealedToken"][:147]), "sealedToken")
+neg("sealed-token-fixture", "a plaintext length that is not a token's", mut(SEALED_FIXTURE, "opens.0.plaintextLength", 64), "plaintextLength")
+neg("sealed-token-fixture", "a token written into the file", mut(SEALED_FIXTURE, "opens.0.token", "oaiyrt1.AQIDBAUGBwg.ICEiIyQlJicoKSorLC0uLzAxMjM0NTY3ODk6Ozw9Pj8"), "token")
+neg("sealed-token-fixture", "no wrongRecipient", mut(SEALED_FIXTURE, "wrongRecipient"), "wrongRecipient")
+neg("sealed-token-fixture", "a refused box that is not base64url", mut(SEALED_FIXTURE, "refused.0.sealedToken", "not base64!"), "sealedToken")
 
 # --- admission (4.14)
 MOBILE_CLAIMS = vec["A4"]["inputs"]["claims"]
@@ -1588,6 +1595,40 @@ else:
     node_total = int(m.group(1)) if m else 0
     ok(f"node re-computation agrees ({node_total} checks)", proc.returncode == 0 and bool(m) and m.group(2) == "0", "\n".join(tail[-8:]) + proc.stderr[-300:])
     ok("node re-computation ran at least 217 checks (a checker that was silently thinned fails here)", node_total >= 217, str(node_total))
+
+section("recorded fixtures (fixtures/): sealed tokens and the pairing ceremony, read by two independent implementations")
+FIX = V1 / "fixtures"
+CEREMONY = json.loads((FIX / "pairing-ceremony.json").read_text(encoding="utf-8"))
+STEP_SCHEMAS = [("pairing-create-request", "pairing-create-response"), (None, "pairing-fetch-response"), ("pairing-answer-request", "pairing-answer-response"),
+                (None, "poll-response"), ("pairing-decision", "pairing-decision-response"), (None, "pairing-fetch-response")]
+n_fix_docs = 0
+for i, (step, (req_schema, res_schema)) in enumerate(zip(CEREMONY["steps"], STEP_SCHEMAS)):
+    for schema_name, body in ((req_schema, step["request"].get("body")), (res_schema, step["response"]["body"])):
+        if schema_name is None or body is None:
+            continue
+        n_fix_docs += 1
+        errs = problems(schema_name, body)
+        ok(f"ceremony step {i} ({step['step']}) validates against {schema_name}", not errs, errs[0].message[:150] if errs else "")
+print(f"\n  {n_fix_docs} documents of the recorded ceremony validated")
+ok("the ceremony's pair item body is the response text the phone posted, byte for byte",
+   CEREMONY["steps"][3]["response"]["body"]["items"][0]["body"] == CEREMONY["steps"][2]["request"]["body"]["response"])
+ok("the ceremony's offer is Appendix A3's 778 byte text", CEREMONY["steps"][0]["request"]["body"]["offer"] == A3["expected"]["offerText"])
+ok("no device token is written into any fixture file",
+   all(re.search(r"oaiyrt1\.[A-Za-z0-9_-]{11}\.[A-Za-z0-9_-]{43}", p.read_text(encoding="utf-8")) is None for p in FIX.rglob("*.json")),
+   "a token-shaped string was found")
+fix_readme = (FIX / "README.md").read_text(encoding="utf-8")
+for f in ("sealed-token.json", "pairing-ceremony.json", "verify_fixtures.py", "verify_fixtures.mjs"):
+    ok(f"fixtures/README.md describes {f}", f"`{f}`" in fix_readme)
+fix_checks = 0
+for label, cmd in (("Python (no libsodium)", [sys.executable, str(FIX / "verify_fixtures.py")]), ("Node (no libsodium)", [shutil.which("node") or "node", str(FIX / "verify_fixtures.mjs")])):
+    try:
+        proc = subprocess.run(cmd, capture_output=True, text=True, encoding="utf-8", timeout=180)
+        m = re.search(r"(\d+) checks, (\d+) mismatches", proc.stdout)
+        n = int(m.group(1)) if m else 0
+        fix_checks += n
+        ok(f"independent reading of the fixtures in {label} agrees ({n} checks)", proc.returncode == 0 and bool(m) and m.group(2) == "0", (proc.stdout + proc.stderr)[-400:])
+    except (OSError, subprocess.TimeoutExpired) as e:
+        ok(f"independent reading of the fixtures in {label} ran", False, str(e))
 
 section("vectors.json is what generate_vectors.py writes")
 proc = subprocess.run([sys.executable, str(V1 / "generate_vectors.py"), "--check"], capture_output=True, text=True, encoding="utf-8", timeout=120)

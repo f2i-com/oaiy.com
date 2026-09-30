@@ -260,7 +260,8 @@ The relay keeps a **rendezvous** for one pairing: a mailbox that holds the deskt
 decision, and that hands the phone its token sealed to its own key. It never sees the secret (the QR code or the typed code): the
 phone finds the rendezvous by an id (`pid`) derived from it, checks the offer's MAC with a key only the two ends can derive, and
 the relay only stores and forwards. The steps and their answers are in the protocol package
-([`README.md`](../protocol/relay/v1/README.md), section 10.1); what the relay adds:
+([`README.md`](../protocol/relay/v1/README.md), section 10.1, and the recorded ceremony in
+[`fixtures/pairing-ceremony.json`](../protocol/relay/v1/fixtures/pairing-ceremony.json)); what the relay adds:
 
 - **The pid is the phone's only credential.** An unknown, an expired and a burned pid answer one identical `404` (same lookup, same
   body), a bad request body is `400` whatever the pid, and a wait for an unknown pid returns at once. Nothing tells a stranger
@@ -277,6 +278,9 @@ the relay only stores and forwards. The steps and their answers are in the proto
 - **Races.** Every change of state is a conditional `UPDATE` in one immediate transaction: two responders to one pid cannot both
   win, an approval racing a burn has one winner, and the database agrees with it.
 - **Garbage collection** removes a rendezvous ten minutes after the phone read its outcome, and at expiry.
+
+`fixtures/sealed-token.json` holds sealed tokens the real relay produced, with the recipient key and the checks a reader must
+make; `php tests/fixtures.php --check` verifies them and `--write` records them again.
 
 ### `php bin/relay.php`, the administration commands
 

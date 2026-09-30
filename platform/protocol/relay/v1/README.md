@@ -16,6 +16,7 @@ later, the black-box suite that reuses those schemas against a running relay.
 | `vectors.json` | known-answer vectors: inputs and expected outputs |
 | `generate_vectors.py` | writes `vectors.json` (`--check` proves the file is current) |
 | `verify_vectors.mjs` | an independent Node re-computation of every vector (`node:crypto` only) |
+| `fixtures/` | recordings of the real relay for the code that reads it: sealed tokens, a whole pairing, the Aokie admission and frames (`fixtures/README.md`), each rechecked by an independent Python and Node reader |
 
 Test: `python ../../tests/relay_conformance.py` (from `platform/protocol/relay/v1`, or from anywhere:
 `python platform/protocol/tests/relay_conformance.py`).
@@ -384,7 +385,7 @@ Relay-side states: `open -> answered -> approved | denied`; `answered -> open` b
 | desktop `POST .../reject` | 409 | 200 (`open`, or `expired` on the third) | 409 | 409 | 410 | 410 |
 | desktop `POST .../burn` | 200 | 200 | 409 | 200 | 200 (already ended) | 410 |
 
-An unknown pid is the same 404 as an ended or expired one for the phone, and another desktop's pid is the same 404 as an unknown one for a desktop. Answers: `POST /v1/pair` `201` `{"pid","exp","time"}` (`pairing-create-response`); `GET` `pairing-fetch-response`; the response `202` `{"state":"answered","time"}`; the decision `200` `{"v":1,"state":"approved"|"denied","deviceId"?,"time"}` (`pairing-decision-response`); reject and burn `200` `{"v":1,"state":"open"|"expired","time"}` (`pairing-state-response`). The phone's two routes count against `ip.pair` (30 a minute per address); the desktop's three are its token's (`tok.req`). A held `GET` (`wait` with a live pid) is an edge hold counted once by its pid, at most 4 per address; when the pool is nearly full it is answered at once with `hold.refused`.
+An unknown pid is the same 404 as an ended or expired one for the phone, and another desktop's pid is the same 404 as an unknown one for a desktop. Answers: `POST /v1/pair` `201` `{"pid","exp","time"}` (`pairing-create-response`); `GET` `pairing-fetch-response`; the response `202` `{"state":"answered","time"}`; the decision `200` `{"v":1,"state":"approved"|"denied","deviceId"?,"time"}` (`pairing-decision-response`); reject and burn `200` `{"v":1,"state":"open"|"expired","time"}` (`pairing-state-response`). The phone's two routes count against `ip.pair` (30 a minute per address); the desktop's three are its token's (`tok.req`). A held `GET` (`wait` with a live pid) is an edge hold counted once by its pid, at most 4 per address; when the pool is nearly full it is answered at once with `hold.refused`. The recorded ceremony is `fixtures/pairing-ceremony.json`.
 
 ### 10.2 Enrolment: the desktop and the provider
 
@@ -503,6 +504,7 @@ Every deterministic value is recomputed three times: by `generate_vectors.py`, b
 | `device.schema.json`, `devices-list.schema.json`, `device-patch-request.schema.json`, `device-patch-response.schema.json`, `device-meta-request.schema.json`, `ack.schema.json`, `devices-revoke-request.schema.json`, `devices-revoke-response.schema.json` | devices |
 | `roster-request.schema.json`, `roster-response.schema.json`, `token-rotate-response.schema.json`, `keys-request.schema.json`, `keys-response.schema.json`, `providers-request.schema.json`, `providers-response.schema.json`, `push-register-request.schema.json` | roster, tokens, keys, providers, push |
 | `pairing-create-request.schema.json`, `pairing-create-response.schema.json`, `pairing-fetch-response.schema.json`, `pairing-answer-request.schema.json`, `pairing-answer-response.schema.json`, `pairing-offer.schema.json`, `pairing-claims.schema.json`, `pairing-response.schema.json`, `pairing-decision.schema.json`, `pairing-decision-response.schema.json`, `pairing-reject-request.schema.json`, `pairing-state-response.schema.json`, `approval-receipt.schema.json` | pairing v3 |
+| `sealed-token-fixture.schema.json` | the shape of `fixtures/sealed-token.json` |
 | `admission-claims.schema.json`, `admission-plugin-request.schema.json`, `admission-plugin-response.schema.json`, `admission-mobile-request.schema.json`, `admission-mobile-response.schema.json`, `ice-server.schema.json`, `challenge.schema.json`, `compat-frames-request.schema.json`, `compat-frames-accepted.schema.json`, `compat-frames-page.schema.json` | admission and the Aokie compatibility routes |
 | `ring.schema.json` | ring body |
 | `command.schema.json`, `result.schema.json`, `container.schema.json`, `rotation-statement.schema.json`, `ctl.schema.json` | authority envelopes |
@@ -529,7 +531,7 @@ Where the design is silent, ambiguous or wrong, this package makes the smallest 
 14. **`limits.lanes` in `info` lists `ctl` too**, which the design's example omits, because a desktop may post it and its TTL bounds are then part of the contract. The `A6b` vector keeps the design's example verbatim.
 15. **`Authorization` is `Bearer <credential>`** with the scheme matched case-insensitively and exactly one space; when the header arrives by more than one PHP source the first in the order `HTTP_AUTHORIZATION`, `REDIRECT_HTTP_AUTHORIZATION`, `getallheaders()` wins.
 16. **Roster `revision` may be 0** at `POST /v1/roster` (a reinstall restarts at 0) while an admission needs 1 to 2^53-1.
-17. **The design's Appendix A lists sealed-box fixtures "still to be produced by RL-01"; section 8.2 assigns them to `DK-04` and `RL-06`.** This package follows 8.2 and ships none: a randomised output cannot be a known answer, and no Rust implementation exists yet to seal the other direction.
+17. **The design's Appendix A lists sealed-box fixtures "still to be produced by RL-01"; section 8.2 assigns them to `DK-04` and `RL-06`.** A randomised output cannot be a known answer, so `vectors.json` has none. `RL-06` records the PHP-sealed direction in `fixtures/sealed-token.json` (real relay output, opened by libsodium in PHP and, without libsodium, by two independent readers in Python and Node; see `fixtures/README.md`); the Rust-sealed direction, and the composition of `A8` with a sealed box, wait for the desktop code that can seal (`DK-04`, `DK-07`).
 18. **The plugin bearer sizes of Appendix C (964 for one phone, +92 each) reproduce exactly** when the plugin subject id is `aokie` (vector `A4b`); another id changes the size by twice its length difference.
 19. **`ring` is `403 feature_disabled` while call features are off**, and a ring with an invalid `hdr.sig` is `400 invalid_item`, not `403`.
 20. **Timing of `Retry-After` values**: 1 second for the poll gap rule and lookup limit, 5 for `quota_exceeded`, 60 for `ip.authfail`, 2 for a refused hold, as the design's tables give them; other 429/503 answers use the bucket's refill time, rounded up.
