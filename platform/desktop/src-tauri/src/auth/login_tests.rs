@@ -2623,6 +2623,74 @@ async fn a_client_that_hangs_up_does_not_free_the_verification_bound_before_the_
     assert!(most >= 2, "and they did overlap ({most})");
 }
 
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_client_that_hangs_up_is_counted_and_keeps_its_place_until_its_pass_ends() {
+    let e = Arc::new(build(Build {
+        hold: Duration::from_millis(400),
+        ..Build::default()
+    }));
+    make_owner(&e, PASSWORD).await;
+    // Two attempts from one address, each dropped 25 ms in (its pass is running).
+    for _ in 0..2 {
+        let r = tokio::time::timeout(
+            Duration::from_millis(25),
+            login_as(&e, "wrong wrong wrong", "203.0.113.50"),
+        )
+        .await;
+        assert!(r.is_err(), "the request was dropped");
+    }
+    // Their passes run on, in the places of the address (two): a third attempt is turned away at once.
+    let third = login_as(&e, PASSWORD, "203.0.113.50").await;
+    assert_eq!(
+        (third.status, third.code().as_deref()),
+        (429, Some("rate_limited")),
+        "{}",
+        third.text
+    );
+    // When they end, both were counted, though nobody was left to be told.
+    tokio::time::sleep(Duration::from_millis(1000)).await;
+    assert_eq!(e.state.throttle.recent_failures(), 2);
+    // And the places are free again.
+    assert_eq!(login_as(&e, PASSWORD, "203.0.113.50").await.status, 200);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn wrong_passwords_of_a_client_that_hangs_up_still_revoke_a_session_in_the_session_lane() {
+    for (path, body) in [
+        (
+            "/api/auth/elevate",
+            json!({ "password": "wrong wrong wrong" }),
+        ),
+        (
+            "/api/auth/password",
+            json!({ "current": "wrong wrong wrong", "next": NEW_PASSWORD }),
+        ),
+    ] {
+        let e = Arc::new(build(Build {
+            hold: Duration::from_millis(100),
+            ..Build::default()
+        }));
+        let owner = make_owner(&e, PASSWORD).await;
+        let b = browser_from(&e, &owner);
+        for _ in 0..5 {
+            let r = tokio::time::timeout(
+                Duration::from_millis(25),
+                go(&e, as_page(&e, &b, Method::POST, path).json(body.clone())),
+            )
+            .await;
+            assert!(r.is_err(), "{path}: the request was dropped");
+            // Its pass ends (100 ms) before the next request is sent.
+            tokio::time::sleep(Duration::from_millis(200)).await;
+        }
+        let r = go(&e, as_page(&e, &b, Method::GET, "/api/config")).await;
+        assert_eq!(
+            (r.status, r.code().as_deref()),
+            (401, Some("session_expired")),
+            "{path}: five wrong answers, though every client hung up, revoke the session"
+        );
+    }
+}
+
 #[tokio::test]
 async fn the_login_allow_list_refuses_other_addresses_before_any_hashing() {
     let e = build(Build {

@@ -669,15 +669,37 @@ impl LoginState {
         )
     }
 
+    /// One verification, run to its end whatever becomes of the request that asked for it. A client that hangs up
+    /// drops the request's future, but a pass of Argon2 that has begun runs on, holding its 64 MiB: so the pass keeps
+    /// its place in the lane (`permit`) until it returns, and what it found is counted (`count`) by the task that ran
+    /// it, not by a request that may be gone. Hanging up neither frees a place early nor escapes being counted. The
+    /// request waits for the answer, and gets its place back with it.
+    async fn verified(
+        self: &Arc<Self>,
+        permit: Permit,
+        password: Zeroizing<String>,
+        stored: String,
+        count: impl FnOnce(&LoginState, &Verdict) + Send + 'static,
+    ) -> (Verdict, Option<Permit>) {
+        let state = self.clone();
+        let task = tokio::spawn(async move {
+            let verdict = state.hasher.verify(password, stored).await;
+            count(&state, &verdict);
+            (verdict, Some(permit))
+        });
+        // A task that panicked has no answer, and its place went with it.
+        task.await.unwrap_or((Verdict::Mismatch, None))
+    }
+
     /// A wrong password on `lane`.
-    fn failed(&self, lane: &Lane, pre: &Prelude) {
+    fn failed(&self, lane: &Lane, info: &RequestInfo) {
         let began = match lane {
             Lane::Device(id) => self.throttle.device_failed(id).blocked,
             Lane::Anonymous(key) => self.throttle.address_failed(key).blocked,
         };
-        self.noise("login.fail", &pre.info);
+        self.noise("login.fail", info);
         if began {
-            self.noise("login.blocked", &pre.info);
+            self.noise("login.blocked", info);
         }
         self.raise_alert();
     }
@@ -793,7 +815,7 @@ impl LoginState {
     // ---- the routes --------------------------------------------------------------------------
 
     async fn do_login(
-        &self,
+        self: &Arc<Self>,
         info: Option<Extension<RequestInfo>>,
         headers: HeaderMap,
         body: Body,
@@ -819,16 +841,25 @@ impl LoginState {
         };
         let permit = self.enter(&lane, &pre.info).await?;
         let password = policy::normalise(&req.password.0);
-        // One verification for every path that reaches here.
-        let verdict = self.hasher.verify(password.clone(), stored).await;
+        // One verification for every path that reaches here, counted by the pass itself (a client that hangs up
+        // during it is counted too, and its place is held until the pass ends).
+        let (verdict, permit) = {
+            let (lane, info) = (lane.clone(), pre.info.clone());
+            self.verified(
+                permit,
+                password.clone(),
+                stored,
+                move |st, verdict| match verdict {
+                    Verdict::Mismatch => st.failed(&lane, &info),
+                    Verdict::Match { .. } => st.succeeded(&lane),
+                },
+            )
+            .await
+        };
         drop(permit);
         match verdict {
-            Verdict::Mismatch => {
-                self.failed(&lane, &pre);
-                Err(invalid_credentials())
-            }
+            Verdict::Mismatch => Err(invalid_credentials()),
             Verdict::Match { rehash } => {
-                self.succeeded(&lane);
                 if rehash {
                     self.rehash(&password).await;
                 }
@@ -1058,7 +1089,7 @@ impl LoginState {
     }
 
     async fn do_elevate(
-        &self,
+        self: &Arc<Self>,
         principal: Principal,
         info: RequestInfo,
         headers: HeaderMap,
@@ -1078,18 +1109,24 @@ impl LoginState {
                 "No owner login exists.",
             ));
         };
-        let verdict = self
-            .hasher
-            .verify(policy::normalise(&req.password.0), stored)
-            .await;
+        // Counted by the pass itself, as a login is (a client that hangs up is counted too).
+        let (verdict, permit) = {
+            let (who, info) = (principal.clone(), info.clone());
+            self.verified(
+                Permit::Reserved(permit),
+                policy::normalise(&req.password.0),
+                stored,
+                move |st, verdict| match verdict {
+                    Verdict::Mismatch => st.session_wrong(&who, &info, "elevate"),
+                    Verdict::Match { .. } => st.session_lane.right(&who.id),
+                },
+            )
+            .await
+        };
         drop(permit);
         match verdict {
-            Verdict::Mismatch => {
-                self.session_wrong(&principal, &info, "elevate");
-                Err(invalid_credentials())
-            }
+            Verdict::Mismatch => Err(invalid_credentials()),
             Verdict::Match { .. } => {
-                self.session_lane.right(&principal.id);
                 let until = session::elevate(self.store(), &principal.id, self.now());
                 self.critical(
                     "elevate.ok",
@@ -1107,7 +1144,7 @@ impl LoginState {
     }
 
     async fn do_password(
-        &self,
+        self: &Arc<Self>,
         principal: Principal,
         info: RequestInfo,
         headers: HeaderMap,
@@ -1123,16 +1160,24 @@ impl LoginState {
                 "No owner login exists.",
             ));
         };
-        let verdict = self
-            .hasher
-            .verify(policy::normalise(&req.current.0), stored)
-            .await;
+        // Counted by the pass itself, as a login is (a client that hangs up is counted too).
+        let (verdict, permit) = {
+            let (who, info) = (principal.clone(), info.clone());
+            self.verified(
+                Permit::Reserved(permit),
+                policy::normalise(&req.current.0),
+                stored,
+                move |st, verdict| match verdict {
+                    Verdict::Mismatch => st.session_wrong(&who, &info, "password"),
+                    Verdict::Match { .. } => st.session_lane.right(&who.id),
+                },
+            )
+            .await
+        };
         if verdict == Verdict::Mismatch {
             drop(permit);
-            self.session_wrong(&principal, &info, "password");
             return Err(invalid_credentials());
         }
-        self.session_lane.right(&principal.id);
         let next = policy::judge(&req.next.0, &self.extra_inputs)
             .map_err(|reasons| weak_password(&reasons))?;
         let phc = self.hasher.hash(next).await.map_err(hash_denial)?;
@@ -1532,6 +1577,7 @@ fn hash_denial(e: HashError) -> Denial {
 }
 
 /// The lane of a login.
+#[derive(Clone)]
 enum Lane {
     Device(String),
     Anonymous(String),
