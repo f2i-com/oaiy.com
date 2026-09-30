@@ -205,8 +205,17 @@ agent : "I'll try to reach them, please stay with me."  (it is trying: it does n
   origin, `oaiy.com` and (debug builds only) any loopback page, or a bearer that is the configured, the internal or
   a paired token. Plugins are not handed the internal token. So a program on this computer that sends the window's
   origin, or that has been paired, can turn transfers on: it can equally run a flow, which is why the Transfers
-  page says so. `ring/routes.rs` tests hold the routes to that gate (a stranger, the token, the window), and
-  making the address itself proof against a local program is the access-model work, which this branch leaves alone.
+  page says so. `ring/routes.rs` tests hold the routes to that gate (a stranger, the token, the window). That is the
+  guard of `legacy` access mode, which the routes keep: each has a row in the access model's table
+  (`auth/routes.rs`, `since: 1`), so `scoped` mode judges it by scope, and the differential test of the legacy guard
+  compares both on them. A row is `calls.read` for what reads callers' words and numbers or the owner's settings
+  (`GET /api/messages`, `/api/messages/{id}`, `/api/ring/settings`, `/api/ring/preview`, `/api/ring/active`, the scope of
+  the call events and the calls list) and `calls.write` for what acts on them (`PATCH` and `DELETE /api/messages/{id}`,
+  `PUT /api/ring/settings`, `POST /api/ring/active/{id}/respond`, `POST /api/ring/notices/{id}/dismiss` and the
+  receptionist's `POST /api/voice/calls/{id}/message`, as `say` and `finish` are). The `agent` and `owner` presets hold
+  both, the interim `companion` preset the reads, and no other preset either; none is a dangerous scope, and none takes
+  a call to the owner, which only the Companion does. The CORS layer of each mode allows every method the pages send
+  to them, `PATCH` and `DELETE` included (in `scoped` mode to a page that has paired, and to no other).
 - **What the model is told.** The instructions and the tool list follow the owner's settings, not the
   call, so they are the same for every call and caller and the engine's prompt cache holds them (with
   the settings off, they are byte for byte what they were). Whether the owner can be rung on *this*
