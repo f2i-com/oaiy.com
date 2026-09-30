@@ -47,7 +47,8 @@ use super::clientip::{client_ip, ClientIp, TrustedProxies};
 use super::clock::Clock;
 use super::exposure_checks::{forwarded_header, is_loopback, is_public_address};
 use super::host::{
-    channel, expected_origin, Channel, HostClass, HostName, HostPolicy, ProxyMisconfigured,
+    channel, expected_origin, forwarded_proto, Channel, HostClass, HostName, HostPolicy,
+    ProxyMisconfigured,
 };
 use super::mode::{AccessMode, Exposure};
 use super::presets::App;
@@ -1086,9 +1087,14 @@ impl Guard {
                     &info.client_ip,
                 ));
             }
-            let xfp = headers
-                .get("x-forwarded-proto")
-                .and_then(|v| v.to_str().ok());
+            // The last entry of the header, across its lines: what a proxy that adds to it says, and never what a
+            // client wrote before it (the first line of two, the first entry of a list). As the client address is.
+            let xfp_lines: Vec<Option<&str>> = headers
+                .get_all("x-forwarded-proto")
+                .iter()
+                .map(|v| v.to_str().ok())
+                .collect();
+            let xfp = forwarded_proto(&xfp_lines);
             if let Some(h) = &host {
                 match channel(
                     &self.config.hosts,

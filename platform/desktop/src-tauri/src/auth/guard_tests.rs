@@ -1226,6 +1226,109 @@ async fn t45_a_forwarded_header_on_a_local_install_is_421_and_a_proxied_install_
     );
 }
 
+/// The last entry of `X-Forwarded-Proto` across all its lines, as the rightmost of `X-Forwarded-For` is the client's:
+/// a proxy that adds to the header puts its own word last, and what a client sends comes before it. The first line
+/// used to win here, so `[https, http]` was a secure channel and `[http, https]` a `400`.
+#[tokio::test]
+async fn f4_the_protocol_a_proxy_says_is_the_last_entry_of_the_header_across_its_lines() {
+    let p = env_with(
+        AccessMode::Scoped,
+        &[("OAIY_PUBLIC_URL", "https://dash.example.com")],
+        false,
+        false,
+        None,
+    );
+    let ask = |lines: &[&str]| {
+        let mut s = send(Method::GET, "/api/auth/info")
+            .h("host", "dash.example.com")
+            .add("x-forwarded-for", "203.0.113.9");
+        for line in lines {
+            s = s.add("x-forwarded-proto", line);
+        }
+        s
+    };
+    // What the server makes of it: `Some(secure)` for an answer, and `None` for the `400` of a proxy that says http.
+    for (lines, secure) in [
+        (vec!["https"], Some(true)),
+        (vec!["HTTPS"], Some(true)),
+        (vec![" https "], Some(true)),
+        (vec!["http"], None),
+        // One line, a list: the last entry is the proxy's.
+        (vec!["https, http"], None),
+        (vec!["http, https"], Some(true)),
+        (vec!["https,http,https"], Some(true)),
+        (vec!["http,https,http"], None),
+        (vec!["https,"], Some(false)),
+        // Two lines: the last line, and in it the last entry.
+        (vec!["https", "http"], None),
+        (vec!["http", "https"], Some(true)),
+        (vec!["http", "https, http"], None),
+        (vec!["https, http", "https"], Some(true)),
+        (vec!["https", ""], Some(false)),
+        (vec!["", "https"], Some(true)),
+        (vec!["https", "ws"], Some(false)),
+        // Not a word that says a channel.
+        (vec!["ws"], Some(false)),
+        (vec![""], Some(false)),
+    ] {
+        let r = go(&p, ask(&lines)).await;
+        match secure {
+            None => assert_eq!(
+                (r.status, r.code().as_deref()),
+                (400, Some("proxy_misconfigured")),
+                "{lines:?}"
+            ),
+            Some(secure) => {
+                assert_eq!(r.status, 200, "{lines:?}: {}", r.text);
+                assert_eq!(r.json()["secureChannel"], secure, "{lines:?}");
+                // What the server says it saw is the same word.
+                assert_eq!(
+                    r.json()["seen"]["proto"],
+                    if secure { "https" } else { "http" },
+                    "{lines:?}"
+                );
+            }
+        }
+    }
+    // A peer that is not the proxy says nothing that counts, in whichever order.
+    for lines in [vec!["https"], vec!["http", "https"], vec!["https, https"]] {
+        let r = go(&p, ask(&lines).peer("198.51.100.7:4000")).await;
+        assert_eq!(r.json()["secureChannel"], false, "{lines:?}");
+        assert_eq!(r.json()["seen"]["proto"], "http", "{lines:?}");
+    }
+    // A line that is not text is a header that cannot be read, wherever it is: no protocol is said.
+    for lines in [
+        vec![&b"https"[..], &b"\xff"[..]],
+        vec![&b"\xff"[..], &b"https"[..]],
+        vec![&b"https\xe9"[..]],
+    ] {
+        let mut req = Request::builder()
+            .method(Method::GET)
+            .uri("/api/auth/info")
+            .header("host", "dash.example.com")
+            .header("x-forwarded-for", "203.0.113.9");
+        for line in &lines {
+            req = req.header(
+                "x-forwarded-proto",
+                axum::http::HeaderValue::from_bytes(line).unwrap(),
+            );
+        }
+        let mut req = req.body(Body::empty()).unwrap();
+        req.extensions_mut().insert(ConnectInfo(
+            "127.0.0.1:50000".parse::<SocketAddr>().unwrap(),
+        ));
+        let response = p.app.clone().oneshot(req).await.unwrap();
+        assert_eq!(response.status().as_u16(), 200, "{lines:?}");
+        let body: Value = serde_json::from_slice(
+            &axum::body::to_bytes(response.into_body(), 1 << 20)
+                .await
+                .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(body["secureChannel"], false, "{lines:?}");
+    }
+}
+
 #[tokio::test]
 async fn t45_a_bearer_from_a_public_address_on_a_lan_listener_is_refused_unless_the_operator_says_otherwise(
 ) {

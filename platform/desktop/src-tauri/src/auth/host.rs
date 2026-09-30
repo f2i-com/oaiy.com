@@ -297,6 +297,20 @@ pub fn channel(
     Ok(Channel::Insecure)
 }
 
+/// What a trusted proxy says the protocol of the client's connection was: the last entry of `X-Forwarded-Proto`, across
+/// all its lines, each split at its commas. A proxy that adds to what it was sent puts its own word last, and what a
+/// client sends comes before it, so the last entry is the only one that is not the client's to write; it is the entry
+/// the client address is read from too (`X-Forwarded-For`, the rightmost that is not a proxy of ours). A line that
+/// is not text means the header cannot be read, and then no protocol is said (which is an insecure channel), as
+/// with the client address. `[https, http]` is `http` and `[http, https]` is `https`, one line or two.
+pub fn forwarded_proto<'a>(lines: &[Option<&'a str>]) -> Option<&'a str> {
+    let mut last: Option<&'a str> = None;
+    for line in lines {
+        last = Some((*line)?);
+    }
+    last?.rsplit(',').next().map(str::trim)
+}
+
 /// The origin a browser page served for this `Host` has, as the same-origin checks need it: `https://<host>`
 /// on a secure channel behind a proxy, `http://<host>:<port>` for the loopback names.
 pub fn expected_origin(host: &HostName, channel: Channel) -> String {
@@ -317,6 +331,31 @@ mod tests {
 
     fn h(s: &str) -> HostName {
         HostName::parse(s).unwrap_or_else(|| panic!("{s} does not parse"))
+    }
+
+    #[test]
+    fn the_protocol_a_proxy_says_is_the_last_entry_of_the_last_line() {
+        let lines = |l: &[&'static str]| l.iter().map(|s| Some(*s)).collect::<Vec<_>>();
+        for (given, want) in [
+            (vec![], None),
+            (vec!["https"], Some("https")),
+            (vec![" https "], Some("https")),
+            (vec!["https, http"], Some("http")),
+            (vec!["http, https"], Some("https")),
+            (vec!["a,b,c"], Some("c")),
+            (vec!["https", "http"], Some("http")),
+            (vec!["http", "https"], Some("https")),
+            (vec!["http", "https, http"], Some("http")),
+            (vec!["https,"], Some("")),
+            (vec!["https", ""], Some("")),
+            (vec![""], Some("")),
+        ] {
+            assert_eq!(forwarded_proto(&lines(&given)), want, "{given:?}");
+        }
+        // A line that is not text: the header cannot be read, wherever the line is.
+        assert_eq!(forwarded_proto(&[Some("https"), None]), None);
+        assert_eq!(forwarded_proto(&[None, Some("https")]), None);
+        assert_eq!(forwarded_proto(&[None]), None);
     }
 
     fn policy(exposure: Exposure, port: u16, loopback_apps: bool) -> HostPolicy {
