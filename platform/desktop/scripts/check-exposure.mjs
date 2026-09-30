@@ -67,7 +67,8 @@ if (!skipE2e) {
   const meta = spawnSync(cargo[0], [...cargo.slice(1), 'metadata', '--format-version', '1', '--no-deps'], { cwd: crate, encoding: 'utf8', shell: process.platform === 'win32', maxBuffer: 1 << 28 });
   const target = JSON.parse(meta.stdout).target_directory;
   const server = path.join(target, 'debug', process.platform === 'win32' ? 'oaiy-server.exe' : 'oaiy-server');
-  run('proxy doubles against the built server', process.execPath, [path.join(here, 'e2e-exposure.mjs')], { env: { ...process.env, OAIY_SERVER_BIN: server } });
+  // `node` by name: with a shell (Windows) the path of the running Node has a space in it.
+  run('proxy doubles against the built server', 'node', [path.join(here, 'e2e-exposure.mjs')], { env: { ...process.env, OAIY_SERVER_BIN: server } });
 }
 fs.rmSync(out, { recursive: true, force: true });
 console.log(`\ncheck-exposure: everything held (seed ${seed})`);
