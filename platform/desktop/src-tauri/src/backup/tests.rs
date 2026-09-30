@@ -2370,13 +2370,30 @@ fn hostile_header(path: &Path, body: &[u8]) {
     fs::write(path, bytes).unwrap();
 }
 
+/// Run `work` on a thread of its own and give it `limit`. A test of a limit has to FAIL when the limit is missing, and it
+/// has to fail at once: without this it would wait for the very work the limit is there to stop (minutes, for a header that
+/// age parses again after each line). The thread that is still working when the test fails ends with the test run.
+fn finishes_within<T: Send + 'static>(limit: std::time::Duration, what: &str, work: impl FnOnce() -> T + Send + 'static) -> T {
+    let (sender, receiver) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let _ = sender.send(work());
+    });
+    receiver.recv_timeout(limit).unwrap_or_else(|_| panic!("{what} did not finish within {limit:?}: the limit that should have stopped it is not there"))
+}
+
+/// How long a hostile file is given before the test says its limit is missing (a refusal takes milliseconds).
+const REFUSED_WITHIN: std::time::Duration = std::time::Duration::from_secs(10);
+
 fn assert_refused_quickly(dst: &Path, file: &Path, what: &str) {
+    let (folder, path) = (dst.to_path_buf(), file.to_path_buf());
     let started = std::time::Instant::now();
-    let err = restore::inspect(dst, file, PASS, &options()).unwrap_err();
+    let err = finishes_within(REFUSED_WITHIN, what, move || restore::inspect(&folder, &path, PASS, &options())).unwrap_err();
     assert!(matches!(err.kind, ErrorKind::Damaged | ErrorKind::Unsupported), "{what}: {err}");
     assert!(started.elapsed() < std::time::Duration::from_secs(3), "{what} took {:?}: age must never be handed a header this long", started.elapsed());
+    let (folder, path) = (dst.to_path_buf(), file.to_path_buf());
     let started = std::time::Instant::now();
-    assert!(restore::stage(dst, file, PASS, &Ticks::all(), &options()).is_err(), "{what}");
+    let staged = finishes_within(REFUSED_WITHIN, &format!("{what} (staging)"), move || restore::stage(&folder, &path, PASS, &Ticks::all(), &options()));
+    assert!(staged.is_err(), "{what}");
     assert!(started.elapsed() < std::time::Duration::from_secs(3), "{what} (staging) took {:?}", started.elapsed());
     assert_nothing_staged(dst);
 }
