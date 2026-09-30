@@ -4,7 +4,7 @@
  * that passes is what `buildRequestUrl` and `recordHeaders` will accept, and nothing else is saved. It is in shared/ so that the
  * adapters, which are there, cannot make a record that this refuses.
  */
-import { isLoopbackHost } from './errors';
+import { isLoopbackHost, isPrivateNetworkHost } from './errors';
 import { normalizeApiBase } from './endpoints';
 import { MAX_BODY_BYTES } from '../broker/protocol';
 import { EXTRA_HEADER_NAMES, PROVIDER_CAPS, type Dialect, type ExtraHeader, type ProviderCap, type ProviderKind, type ProviderRecord, type ServerKind } from './types';
@@ -69,6 +69,9 @@ export function validateRecord(input: RecordInput, id: string): Validation {
   if (baseUrl === null) errors.baseUrl = 'That is not an address a provider can be called at: use https://… (or http://… for a server on this computer), with no user name, no ?query and no #fragment.';
   else if (kind === 'external' && new URL(baseUrl).protocol === 'http:' && !isLoopbackHost(new URL(baseUrl).hostname)) {
     errors.baseUrl = 'A service on the internet has to be https: a key sent over plain http can be read on the way.';
+  } else if (kind === 'local-server' && new URL(baseUrl).protocol === 'http:' && !isPrivateNetworkHost(new URL(baseUrl).hostname)) {
+    // A server "on this computer" at plain http is one whose traffic stays here or on this network. Any other host is across the internet.
+    errors.baseUrl = 'A server can use plain http only on this computer or this network: localhost, an address such as 192.168.x.x, 10.x.x.x or 172.16–31.x.x, or a name ending .local. Anywhere else the key would cross the internet in the clear: use https://….';
   }
 
   const model = input.model === undefined || input.model === null || input.model === '' ? undefined : text(input.model);

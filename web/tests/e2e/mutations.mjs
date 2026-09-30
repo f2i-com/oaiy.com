@@ -359,6 +359,27 @@ const MUTATIONS = [
     },
     caught: ['a service on the internet: through fetch, models and test', 'a server on this computer: through fetch, models and test'],
   },
+  {
+    name: 'L4 a local server at plain http anywhere',
+    what: 'the record check lets kind local-server at plain http through on any host',
+    tests: ['tests/unit/plain-http.test.mjs'],
+    files: { 'shared/providers/records.ts': [{ find: "} else if (kind === 'local-server' && new URL(baseUrl).protocol === 'http:' && !isPrivateNetworkHost(new URL(baseUrl).hostname)) {", replace: '} else if (false as boolean) {' }] },
+    caught: ['http://api.example.com/v1 is refused', 'store.save refuses a local server at plain http on the internet'],
+  },
+  {
+    name: 'L4 a name that starts with a private address is private',
+    what: 'the dotted-address test loses its end anchor, so 192.168.1.5.evil.example is a private host',
+    tests: ['tests/unit/plain-http.test.mjs'],
+    files: { 'shared/providers/errors.ts': [{ find: 'const dotted = /^(\\d{1,3})\\.(\\d{1,3})\\.\\d{1,3}\\.\\d{1,3}$/.exec(host);', replace: 'const dotted = /^(\\d{1,3})\\.(\\d{1,3})\\./.exec(host);' }] },
+    caught: ['http://192.168.1.5.evil.example/v1 is refused', 'http://10.0.0.1.nip.io/v1 is refused'],
+  },
+  {
+    name: 'L4 a private range that is too wide',
+    what: 'the 172 range starts at 0, so 172.15.255.255 and 172.32.0.1 are private',
+    tests: ['tests/unit/plain-http.test.mjs'],
+    files: { 'shared/providers/errors.ts': [{ find: '(a === 172 && b >= 16 && b <= 31) || (a === 192 && b === 168) || (a === 169 && b === 254) || a === 127;', replace: '(a === 172) || (a === 192 && b === 168) || (a === 169 && b === 254) || a === 127;' }] },
+    caught: ['http://172.15.255.255/v1 is refused', 'http://172.32.0.1/v1 is refused'],
+  },
   // Leaks the scans must find. They put the key where a scan of TEXT does not look (the reviewer's two: a Uint8Array, and reversed).
   {
     name: 'H1 leak: list returns the key as a Uint8Array',

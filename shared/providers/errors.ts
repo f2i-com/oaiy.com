@@ -80,6 +80,30 @@ export function isLoopbackHost(hostname: string): boolean {
   return host === 'localhost' || host.endsWith('.localhost') || host === '::1' || /^127(\.\d{1,3}){3}$/.test(host);
 }
 
+/**
+ * Whether a hostname is one whose traffic stays on this computer or this network, so that a key sent to it over plain http is not sent across
+ * the internet: this computer (`localhost`, 127/8, ::1), the private ranges (10/8, 172.16/12, 192.168/16), link-local addresses
+ * (169.254/16, fe80::/10), IPv6 unique-local addresses (fc00::/7), and a name ending `.local` (mDNS). Nothing else: not 100.64/10 (which
+ * is shared address space, not a person's own network), not a single-label name, and not a name that only STARTS with an address
+ * (`192.168.1.5.evil.example`). `hostname` is what `new URL(...).hostname` says, which is where an address written as a number, in hex or
+ * in octal (`http://3232235781/`) has already been read as the dotted address it is.
+ */
+export function isPrivateNetworkHost(hostname: string): boolean {
+  const host = hostname.replace(/^\[|\]$/g, '').toLowerCase();
+  if (isLoopbackHost(host) || host.endsWith('.local')) return true;
+  const v4 = (a: number, b: number): boolean => a === 10 || (a === 172 && b >= 16 && b <= 31) || (a === 192 && b === 168) || (a === 169 && b === 254) || a === 127;
+  const dotted = /^(\d{1,3})\.(\d{1,3})\.\d{1,3}\.\d{1,3}$/.exec(host);
+  if (dotted) return v4(Number(dotted[1]), Number(dotted[2]));
+  if (!host.includes(':')) return false;
+  // An IPv4 address written into an IPv6 one (::ffff:192.168.1.5, which a URL reads as ::ffff:c0a8:105) is the IPv4 address.
+  const mapped = /^::ffff:([0-9a-f]{1,4}):([0-9a-f]{1,4})$/.exec(host);
+  if (mapped) {
+    const high = parseInt(mapped[1], 16);
+    return v4(high >> 8, high & 0xff);
+  }
+  return /^fe[89ab][0-9a-f]:/.test(host) || /^f[cd][0-9a-f]{2}:/.test(host);
+}
+
 /** Whether the address is one on this computer or this network (where a browser may ask for a permission the person can give). */
 export function isLocalAddress(url: string): boolean {
   try {

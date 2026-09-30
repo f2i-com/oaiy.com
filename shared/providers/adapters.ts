@@ -14,7 +14,7 @@
  */
 import { EXTRA_HEADER_NAMES, type ExtraHeader, type ProviderCap, type ProviderConfig, type ProviderRecord, type ProviderType } from './types';
 import { defaultBaseUrl, normalizeApiBase } from './endpoints';
-import { isLocalAddress, isLoopbackHost } from './errors';
+import { isLoopbackHost, isPrivateNetworkHost } from './errors';
 import { validateRecord } from './records';
 
 /** The Agent's kind of provider for a record: what the Agent's own code (its messages, its headers) takes it for. */
@@ -44,7 +44,7 @@ export function recordFromAgentConfig(config: ProviderConfig): { record: Provide
   // the rule for a service on the internet (https, because a key over plain http can be read on the way) is not broken by calling it
   // one. A plain-http address anywhere else stays a service on the internet, and `validateRecord` refuses it.
   const url = new URL(baseUrl);
-  const onThisNetwork = url.protocol === 'http:' && !isLoopbackHost(url.hostname) && isLocalAddress(baseUrl);
+  const onThisNetwork = url.protocol === 'http:' && !isLoopbackHost(url.hostname) && isPrivateNetworkHost(url.hostname);
   const record: ProviderRecord = {
     v: 1,
     id: config.id,
