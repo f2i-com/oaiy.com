@@ -4,7 +4,7 @@
   "node": "v24.19.0",
   "generator": "oracle.mjs",
   "cross_checked_by": "oracle_check.py: Python cryptography (OpenSSL), hashlib.blake2b, pylib HChaCha20, hand-written Salsa20/HSalsa20/XSalsa20 + OpenSSL Poly1305",
-  "checks_passed": 437,
+  "checks_passed": 467,
   "ed25519_divergences_libsodium_vs_python_openssl": [
    "small-order A [order 1, canonical 01000000], R=identity, S=0",
    "small-order A [order 1, canonical 01000000], R=A, S=0",
@@ -16,6 +16,8 @@
    "small-order A [order 4, y+p, non-canonical edffffff], R=identity, S=0",
    "small-order A [order 4, canonical 00000000], R=identity, S=0",
    "small-order A [order 8, canonical c7176a70], R=identity, S=0",
+   "mixed-order A with small-order R (k=0): the plain equation holds, strict verification refuses",
+   "mixed-order A with small-order R (k=3): the plain equation holds, strict verification refuses",
    "ed25519-speccheck case 0",
    "ed25519-speccheck case 1",
    "ed25519-speccheck case 2",
@@ -580,6 +582,24 @@
    "libsodium": false,
    "openssl": false,
    "python_openssl": false
+  },
+  {
+   "name": "mixed-order A with small-order R (k=0): the plain equation holds, strict verification refuses",
+   "pk": "b7330e18de7ca5ad739884163bf9c28f618fc74cbff3a90062535eeddba2b75d",
+   "msg": "6d697865642d6f726465722063617365203020617474656d70742031",
+   "sig": "0100000000000000000000000000000000000000000000000000000000000000cf469d355a49b6591f2f9be63dd2026a7f86023cf2876416d5954b8c1c892308",
+   "libsodium": false,
+   "openssl": false,
+   "python_openssl": true
+  },
+  {
+   "name": "mixed-order A with small-order R (k=3): the plain equation holds, strict verification refuses",
+   "pk": "b7330e18de7ca5ad739884163bf9c28f618fc74cbff3a90062535eeddba2b75d",
+   "msg": "6d697865642d6f726465722063617365203320617474656d7074203132",
+   "sig": "26e8958fc2b227b045c3f489f2ef98f0d5dfac05d3c63339b13802886d53fc053473918279bebc7fc8766c7abd8ee583986c1bd5bdfb29770d472ca738503609",
+   "libsodium": false,
+   "openssl": false,
+   "python_openssl": true
   },
   {
    "name": "garbage 0",
@@ -1373,6 +1393,106 @@
    "epk": "eeffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff",
    "recipient_seed": "6ba5963fb901e4b73882713308023f0602df7fac8ed244610eb45ef4c6301153",
    "blob": "eeffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff45d581e472b4b9258b804ab4c9f8f86c58b12d3de3",
+   "libsodium_opens": false
+  }
+ ],
+ "sealedbox_forged_low_order": [
+  {
+   "epk": "0000000000000000000000000000000000000000000000000000000000000000",
+   "recipient_seed": "0139e0d089cae6a6a649ae19ec628752dd1866d5c0bc267b5504708829e0a3d3",
+   "msg": "e9b3276879914388658eeedba58dd0aeb8401693",
+   "forged": "0000000000000000000000000000000000000000000000000000000000000000d704a28d9108a2e3ea7a2a2fd6bb67bc9ed7d2dab3912870198d196f5f00ddf77f229c89",
+   "libsodium_opens": false
+  },
+  {
+   "epk": "0000000000000000000000000000000000000000000000000000000000000080",
+   "recipient_seed": "0139e0d089cae6a6a649ae19ec628752dd1866d5c0bc267b5504708829e0a3d3",
+   "msg": "a4cc1a65459cc7b97fe8bfee43c5b1e4083b4c8f54",
+   "forged": "0000000000000000000000000000000000000000000000000000000000000080a0db977b9d621af1587a0abb2d3a481b7b1c66596df723bd570df38640e3174b248baba29f",
+   "libsodium_opens": false
+  },
+  {
+   "epk": "0100000000000000000000000000000000000000000000000000000000000000",
+   "recipient_seed": "0139e0d089cae6a6a649ae19ec628752dd1866d5c0bc267b5504708829e0a3d3",
+   "msg": "07850547ad2d5d5fd6441a98564581a767cb64b3a837",
+   "forged": "0100000000000000000000000000000000000000000000000000000000000000fd22f8a95a767c9b4c3fc402b3993ebec43d9a087a2f96bcd52769a6c7899a06a6e3738f0118",
+   "libsodium_opens": false
+  },
+  {
+   "epk": "0100000000000000000000000000000000000000000000000000000000000080",
+   "recipient_seed": "0139e0d089cae6a6a649ae19ec628752dd1866d5c0bc267b5504708829e0a3d3",
+   "msg": "51d448da8b8265accc2852769276a2dce0c7251e80e490",
+   "forged": "010000000000000000000000000000000000000000000000000000000000008048a73c64cb15dff6274441c5d2852af540b43c041745fc50431d6a30a64ea44344f4294dc9dde6",
+   "libsodium_opens": false
+  },
+  {
+   "epk": "e0eb7a7c3b41b8ae1656e3faf19fc46ada098deb9c32b1fd866205165f49b800",
+   "recipient_seed": "0139e0d089cae6a6a649ae19ec628752dd1866d5c0bc267b5504708829e0a3d3",
+   "msg": "82ef61d93e34e379e5646b99ea1072f0ee088d5844d080d4",
+   "forged": "e0eb7a7c3b41b8ae1656e3faf19fc46ada098deb9c32b1fd866205165f49b8002f67e0f16b3470087289432f78a7e4403fbafbef359f4dbfb2d19d39c1cb1490602f65d642befffd",
+   "libsodium_opens": false
+  },
+  {
+   "epk": "e0eb7a7c3b41b8ae1656e3faf19fc46ada098deb9c32b1fd866205165f49b880",
+   "recipient_seed": "0139e0d089cae6a6a649ae19ec628752dd1866d5c0bc267b5504708829e0a3d3",
+   "msg": "66b6063086f311745fb9d455bd1ff6740f93e26c7276592e92",
+   "forged": "e0eb7a7c3b41b8ae1656e3faf19fc46ada098deb9c32b1fd866205165f49b8801a48d8dd765e9a91567e169fbd5ef63eb7aa3af3db4fdc47a407363af2defe385c758141533883319b",
+   "libsodium_opens": false
+  },
+  {
+   "epk": "5f9c95bca3508c24b1d0b1559c83ef5b04445cc4581c8e86d8224eddd09f1157",
+   "recipient_seed": "0139e0d089cae6a6a649ae19ec628752dd1866d5c0bc267b5504708829e0a3d3",
+   "msg": "536d5a42eee16c84442dabf526c1897a104a095e7142595c1b56",
+   "forged": "5f9c95bca3508c24b1d0b1559c83ef5b04445cc4581c8e86d8224eddd09f1157f3634d8cbcd6e741dc92dadd4c22b82e3f29e9e482e4ba2ef73498c7fbcedcb8f9ce4259871232afbdcc",
+   "libsodium_opens": false
+  },
+  {
+   "epk": "5f9c95bca3508c24b1d0b1559c83ef5b04445cc4581c8e86d8224eddd09f11d7",
+   "recipient_seed": "0139e0d089cae6a6a649ae19ec628752dd1866d5c0bc267b5504708829e0a3d3",
+   "msg": "dbc36f82bffffff93a1647465324c69ec74bec18f2dfe8b8843b60",
+   "forged": "5f9c95bca3508c24b1d0b1559c83ef5b04445cc4581c8e86d8224eddd09f11d7ab29dc9f4508f4468a6e71d3b30f4a1d458c303fd959816926afdec6a900b38e37f6a34735315475f42d8f",
+   "libsodium_opens": false
+  },
+  {
+   "epk": "ecffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff7f",
+   "recipient_seed": "0139e0d089cae6a6a649ae19ec628752dd1866d5c0bc267b5504708829e0a3d3",
+   "msg": "aadb477eaf330937cc1efbb54780a6bbf42fe808a3b5b1ab3b085f8b",
+   "forged": "ecffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff7f8944813ae1ed87c16f7629b5e0c318ac3c453e873791138949a4e11b2a96bf619b7454e640f15cc3d4eeff56",
+   "libsodium_opens": false
+  },
+  {
+   "epk": "ecffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff",
+   "recipient_seed": "0139e0d089cae6a6a649ae19ec628752dd1866d5c0bc267b5504708829e0a3d3",
+   "msg": "168858096a693886fe820e34359f1cdffb6ab88a9edfdaf5d4b293fcc9",
+   "forged": "ecffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff85d36e0c46b47500a6b8e07e1fef5f1fc4b06f0595834713a46c5e538972f42acb59a6255b1791d8db53cd844e",
+   "libsodium_opens": false
+  },
+  {
+   "epk": "edffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff7f",
+   "recipient_seed": "0139e0d089cae6a6a649ae19ec628752dd1866d5c0bc267b5504708829e0a3d3",
+   "msg": "b1100c02d50f64b623db8cf40b2bd64135699880d174bfde9884a39d92f8",
+   "forged": "edffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff7f6fab264a446800d170f4ffa8b024366b2b0ba8abb58b2f276f002119157c6f9b5cd209532a808b85596fa8069ab6",
+   "libsodium_opens": false
+  },
+  {
+   "epk": "edffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff",
+   "recipient_seed": "0139e0d089cae6a6a649ae19ec628752dd1866d5c0bc267b5504708829e0a3d3",
+   "msg": "dd5c26baa31ca2cee77458994755454f4226dfa1b41f9011e987bcf0b3619a",
+   "forged": "edffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffc308cc73705bb3b511adf7dda87c6b59ac7e485622916555dec5c199ce5fd59aaa4bb4af3e1c86868c40df0dfacbb6",
+   "libsodium_opens": false
+  },
+  {
+   "epk": "eeffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff7f",
+   "recipient_seed": "0139e0d089cae6a6a649ae19ec628752dd1866d5c0bc267b5504708829e0a3d3",
+   "msg": "283c4a04c017a986db80677d30d0da2550e1babd5d680b0aa7c3f29fe9bfe0c7",
+   "forged": "eeffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff7fef2154d50691f4d7926dbcb3e39db682a6a94d2925eb1ef77958787dbd980dce7a86827dbeb0dd0831c307b721cd4d81",
+   "libsodium_opens": false
+  },
+  {
+   "epk": "eeffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff",
+   "recipient_seed": "0139e0d089cae6a6a649ae19ec628752dd1866d5c0bc267b5504708829e0a3d3",
+   "msg": "afdf65b9d3ff59a350e6ef94c206cbe2d5b5da743de9fc878002c6e3cdf38f9491",
+   "forged": "eeffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff3065ede58f7fc2a700c9834a22c732d6d470dce85fba560331b505fc7118e246e0830d1738614394bc5f2a55490db77fa3",
    "libsodium_opens": false
   }
  ],

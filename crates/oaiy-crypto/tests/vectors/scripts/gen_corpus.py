@@ -110,6 +110,34 @@ for s in small:
         case("small-order A [%s], %s, S=0" % (s["name"], rname), s["enc"], b"any message at all".hex(), h(R + zero_S))
 # small-order R with an honest key
 case("honest A, small-order R (identity), S = 1", ed[0]["public"], ed[0]["message"], h(ident_R + (1).to_bytes(32, "little")))
+# A public key of MIXED order (a·B + T, T of order 8) is a perfectly good key for every verifier; what strict verification adds is refusing a
+# SMALL-ORDER R. Without that, the cofactorless equation holds for a forged (R, S) whenever h·T cancels R: with R = -k·T and h = k (mod 8),
+# S = h·a gives sB = R + hA. So these two cases are accepted by plain RFC 8032 verification and refused by every strict one (libsodium, dalek's
+# verify_strict), and they are the ones that tell a strict verifier from a plain one when the key itself is acceptable.
+T8 = next(P for P, o in orders.items() if o == 8)
+def neg(P): return ((-P[0]) % p, P[1])
+def smul(k, P):
+    return mul(k % 8, P) if k % 8 else (0, 1)
+def sha512_int(b): return int.from_bytes(hashlib.sha512(b).digest(), "little")
+a_scalar = sha512_int(b"mixed-order-secret-scalar") % L
+A_mixed = add(mul(a_scalar, B), T8)
+assert mul(8, A_mixed) != (0, 1)                                    # not of small order (8*A would be the identity)
+assert mul(L, A_mixed) == mul(L % 8, T8)                            # mixed order: the prime-order part is gone after L, the torsion part remains
+A_enc = enc(*A_mixed)
+for k in (0, 3):
+    R_pt = neg(smul(k, T8)) if k else (0, 1)
+    R_enc = enc(*R_pt)
+    assert orders[R_pt] in (1, 2, 4, 8)                             # R is of small order
+    i = 0
+    while True:
+        m = b"mixed-order case %d attempt %d" % (k, i)
+        hh = sha512_int(R_enc + A_enc + m) % L
+        if hh % 8 == k: break
+        i += 1
+    S = (hh * a_scalar) % L
+    # check the cofactorless equation by hand: S*B == R + h*A
+    assert mul(S, B) == add(R_pt, mul(hh, A_mixed))
+    case("mixed-order A with small-order R (k=%d): the plain equation holds, strict verification refuses" % k, A_enc.hex(), m.hex(), (R_enc + S.to_bytes(32, "little")).hex())
 # random-looking garbage
 for i in range(4):
     g = hashlib.sha512(b"garbage%d" % i).digest()

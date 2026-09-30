@@ -107,6 +107,17 @@ for l in oracle["x25519_low_order"]:
 # ---------- sealed boxes ----------
 for s in oracle["sealedbox_kat"]:
     check(seal(H(s["msg"]), H(s["recipient_pk"]), H(s["eph_sk"])).hex() == s["sealed"], "sealed box (hand-written XSalsa20-Poly1305) = libsodium " + s["msg"][:8])
+# ---------- forged sealed boxes under a zero shared secret ----------
+k0 = hsalsa20(bytes(32), bytes(16))
+for f in oracle["sealedbox_forged_low_order"]:
+    seed = bytes.fromhex(f["recipient_seed"])
+    import hashlib as _h
+    sk = _h.sha512(seed).digest()[:32]
+    rpk = X25519PrivateKey.from_private_bytes(sk).public_key().public_bytes(RAW, RAWF)
+    epk = bytes.fromhex(f["epk"])
+    nonce = hashlib.blake2b(epk + rpk, digest_size=24).digest()
+    check(epk + secretbox(k0, nonce, bytes.fromhex(f["msg"])) == bytes.fromhex(f["forged"]), "forged low-order sealed box " + f["epk"][:16])
+    check(f["libsodium_opens"] is False, "libsodium refuses forged low-order sealed box " + f["epk"][:16])
 # ---------- crypto_kdf ----------
 for k in oracle["kdf"]:
     got = hashlib.blake2b(digest_size=k["len"], key=H(k["key"]), salt=struct.pack("<Q", int(k["id"])) + bytes(8), person=k["ctx"].encode() + bytes(8)).hexdigest()

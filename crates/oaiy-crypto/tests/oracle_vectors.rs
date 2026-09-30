@@ -1,7 +1,7 @@
 //! libsodium as the oracle (`tests/vectors/libsodium-oracle.json`, made by `scripts/oracle.mjs` with libsodium 1.0.x, and recomputed by
 //! `scripts/oracle_check.py` with Python `cryptography`, hashlib and a hand-written Salsa20 family: 456 recomputations): random-looking
 //! inputs with libsodium's outputs for `crypto_kdf`, XChaCha20-Poly1305, Ed25519 signing, X25519, Argon2id and (with OpenSSL's) HKDF,
-//! and libsodium's verdict on the Ed25519 negative corpus of 78 cases (the RFC 8032 vectors malleated in every way, every point of
+//! and libsodium's verdict on the Ed25519 negative corpus of 80 cases (the RFC 8032 vectors malleated in every way, every point of
 //! small order in every encoding, the twelve ed25519-speccheck cases). This crate must give libsodium's answer on every one of them.
 
 mod common;
@@ -107,10 +107,10 @@ fn ed25519_signatures_equal_libsodiums_and_the_libsodium_secret_key_form_is_chec
 }
 
 #[test]
-fn ed25519_negative_corpus_gives_libsodiums_verdict_on_all_78_cases() {
+fn ed25519_negative_corpus_gives_libsodiums_verdict_on_all_80_cases() {
     let o = oracle();
     let cases = o["ed25519_verify"].as_array().unwrap();
-    assert_eq!(cases.len(), 78);
+    assert_eq!(cases.len(), 80);
     let mut accepted = Vec::new();
     let mut python_accepts_we_refuse = Vec::new();
     for case in cases {
@@ -136,9 +136,34 @@ fn ed25519_negative_corpus_gives_libsodiums_verdict_on_all_78_cases() {
     // design finding A5: Python's OpenSSL accepts signatures that no strict verifier does; this crate is not one of them
     let recorded: Vec<String> =
         o["meta"]["ed25519_divergences_libsodium_vs_python_openssl"].as_array().unwrap().iter().map(|n| s(n).to_string()).collect();
-    assert_eq!(python_accepts_we_refuse.len(), 14);
+    assert_eq!(python_accepts_we_refuse.len(), 16);
     assert_eq!(python_accepts_we_refuse.len(), recorded.len());
     assert!(python_accepts_we_refuse.iter().any(|n| n.contains("[order 1, canonical 01000000]") && n.contains("R=identity")));
+}
+
+/// What strict verification buys when the public key is acceptable. A key of mixed order (a·B plus a point of order 8) is a good key for every
+/// verifier, and with a small-order R the plain cofactorless equation can be made to hold for it (the generator does it for R = identity and
+/// for R = -3T). dalek's plain `verify` accepts both; libsodium, node's OpenSSL and this crate refuse them, because R is of small order. Without
+/// `verify_strict` these two cases are the only ones in the corpus that would pass.
+#[test]
+fn a_small_order_r_under_a_key_of_mixed_order_is_what_strict_verification_refuses() {
+    use ed25519_dalek::Verifier;
+    let o = oracle();
+    let cases: Vec<&serde_json::Value> =
+        o["ed25519_verify"].as_array().unwrap().iter().filter(|c| s(&c["name"]).starts_with("mixed-order A")).collect();
+    assert_eq!(cases.len(), 2);
+    for case in cases {
+        let (pk, msg, sig) = (arr::<32>(s(&case["pk"])), unhex(s(&case["msg"])), arr::<64>(s(&case["sig"])));
+        // the key is acceptable: canonical, on the curve, not of small order
+        let key = VerifyingKey::from_bytes(&pk).expect("a key of mixed order is a valid key");
+        // the plain equation holds
+        let plain = ed25519_dalek::VerifyingKey::from_bytes(&pk).unwrap();
+        assert!(plain.verify(&msg, &ed25519_dalek::Signature::from_bytes(&sig)).is_ok(), "{}: the non-strict verifier accepts it", s(&case["name"]));
+        // and this crate refuses, as libsodium does
+        assert_eq!(key.verify_raw(&msg, &Signature::from_bytes(&sig)).unwrap_err(), Error::SignatureInvalid, "{}", s(&case["name"]));
+        assert_eq!(case["libsodium"], false);
+        assert_eq!(case["python_openssl"], true, "Python's OpenSSL accepts it: design finding A5");
+    }
 }
 
 #[test]
@@ -226,6 +251,24 @@ fn sealed_boxes_of_small_order_ephemeral_keys_are_refused_as_libsodium_refuses_t
         let blob = unhex(s(&case["blob"]));
         assert_eq!(&blob[..32], unhex(s(&case["epk"])).as_slice());
         assert_eq!(sealbox::open(&recipient, &blob).unwrap_err(), Error::DecryptFailed, "{}", s(&case["epk"]));
+    }
+}
+
+/// The forgery a small-order ephemeral key allows. The shared secret is all zero for every recipient, so the attacker knows the box key and can make
+/// a box that authenticates under it (the generator checks each one with libsodium's own `crypto_secretbox_open_easy`). `crypto_box_seal_open`
+/// refuses them; an implementation without the all-zero check would open them, and these tests are the ones that fail if this crate lost it.
+#[test]
+fn a_forged_sealed_box_under_a_small_order_ephemeral_key_is_refused() {
+    let o = oracle();
+    let cases = o["sealedbox_forged_low_order"].as_array().unwrap();
+    assert_eq!(cases.len(), 14);
+    for case in cases {
+        assert_eq!(case["libsodium_opens"], false);
+        let recipient = SecretKey::from_libsodium_seed(&secret::<32>(s(&case["recipient_seed"])));
+        let forged = unhex(s(&case["forged"]));
+        assert_eq!(&forged[..32], unhex(s(&case["epk"])).as_slice());
+        assert_eq!(forged.len(), 32 + 16 + unhex(s(&case["msg"])).len());
+        assert_eq!(sealbox::open(&recipient, &forged).unwrap_err(), Error::DecryptFailed, "epk {}", s(&case["epk"]));
     }
 }
 

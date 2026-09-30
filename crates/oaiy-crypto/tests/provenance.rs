@@ -31,26 +31,18 @@ const FILES: &[(&str, &str, &[u8])] = &[
         "7057862fbaa02012953af46eab8fb6d878b5696742e40c95956c767b100f70d3",
         include_bytes!("vectors/vault-work/vectors.json"),
     ),
-    (
-        "public-vectors.json",
-        "46023622f158077c5ce0b049215e34cf855be2159e4388c4406cf96c675fd60f",
-        include_bytes!("vectors/public-vectors.json"),
-    ),
-    (
-        "libsodium-oracle.json",
-        "db539ea65cba843b49337b668c820f962a1132e32dfb693a63a134aaffe41894",
-        include_bytes!("vectors/libsodium-oracle.json"),
-    ),
+    ("public-vectors.json", "46023622f158077c5ce0b049215e34cf855be2159e4388c4406cf96c675fd60f", include_bytes!("vectors/public-vectors.json")),
+    ("libsodium-oracle.json", "a683d250cc05128cb769153d909f3cb7f0349a115bee607669fbb5fc628c304d", include_bytes!("vectors/libsodium-oracle.json")),
     (
         "scripts/extract_public.py",
         "58950f8861a1d11666c60817cd100dd77c58d3e8148921a7fa6aa59ae23f1fc4",
         include_bytes!("vectors/scripts/extract_public.py"),
     ),
-    ("scripts/gen_corpus.py", "5695e4814fdfd8898c85c8ee1b80fa3de4e011b2f6148b7fad4462fe112c50a3", include_bytes!("vectors/scripts/gen_corpus.py")),
-    ("scripts/oracle.mjs", "f07548c1878d6f5ffdc8d2df25b4225df690db2bcd0d63dfb9ef4047ee102c3d", include_bytes!("vectors/scripts/oracle.mjs")),
+    ("scripts/gen_corpus.py", "185279f152bfb2c55e9ca5de1da99b2b4aa07871686953b6f2f3bf394a4ce0dc", include_bytes!("vectors/scripts/gen_corpus.py")),
+    ("scripts/oracle.mjs", "383c3a827ed4909857e0a10f9d2898e2f66bf242a7222ea6f68c1c6b5493fe37", include_bytes!("vectors/scripts/oracle.mjs")),
     (
         "scripts/oracle_check.py",
-        "0bde7c6a60777a4e9c113dc87b666c9f7a85d766ad459ec40ebf7d4c39dee3ea",
+        "7146c444be273f75fb670c498502e9519ebda41d65102fbbbf3e6b2db9b34c7b",
         include_bytes!("vectors/scripts/oracle_check.py"),
     ),
 ];

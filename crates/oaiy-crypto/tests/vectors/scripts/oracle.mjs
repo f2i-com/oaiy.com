@@ -105,6 +105,24 @@ out.sealedbox_low_order = lowOrder.map((l) => {
   return { epk: l.enc, recipient_seed: hex(stream('sb-low-recipient', 32)), blob: hex(blob), libsodium_opens: ok };
 });
 
+// A FORGED sealed box: what an attacker who sends a small-order ephemeral key can make. The shared secret is all zero whatever the
+// recipient's key, so the attacker knows the box key (HSalsa20 of zeros) and can produce a box that authenticates under the naive construction.
+// libsodium's crypto_box_seal_open refuses it (its scalar multiplication refuses the all-zero result); an implementation without the check
+// would open it and hand the attacker's chosen message to the recipient.
+out.sealedbox_forged_low_order = lowOrder.map((l, i) => {
+  const kp = sodium.crypto_box_seed_keypair(stream('sb-forged-recipient', 32));
+  const epk = unhex(l.enc);
+  const k0 = sodium.crypto_core_hsalsa20(new Uint8Array(16), new Uint8Array(32), null);
+  const nonce = sodium.crypto_generichash(24, cat(epk, kp.publicKey));
+  const msg = stream(`sb-forged-msg-${i}`, 20 + i);
+  const box = sodium.crypto_secretbox_easy(msg, nonce, k0);
+  // the forgery is real: it authenticates under the zero-shared-secret key
+  if (hex(sodium.crypto_secretbox_open_easy(box, nonce, k0)) !== hex(msg)) throw new Error('forgery does not authenticate');
+  const forged = cat(epk, box);
+  let opens = true; try { sodium.crypto_box_seal_open(forged, kp.publicKey, kp.privateKey); } catch { opens = false; }
+  return { epk: l.enc, recipient_seed: hex(stream('sb-forged-recipient', 32)), msg: hex(msg), forged: hex(forged), libsodium_opens: opens };
+});
+
 // ---------- crypto_kdf ----------
 const ctxs = ['flrecov1', 'flphras1', 'flbkrcp1', 'flbksig1', 'fllocal1', 'flprf001', 'abcdefgh'];
 out.kdf = [];
@@ -150,4 +168,5 @@ console.log('ed25519 cases:', out.ed25519_verify.length, ' libsodium accepts:', 
 console.log('cases libsodium accepts that are not positive controls:', bad.map((c) => c.name));
 console.log('x25519 low-order encodings:', lowOrder.length, ' all rejected by libsodium:', lowOrder.every((l) => l.libsodium_scalarmult_rejects));
 console.log('sealed-box low-order probes rejected:', out.sealedbox_low_order.every((l) => !l.libsodium_opens));
+console.log('forged low-order sealed boxes rejected by libsodium:', out.sealedbox_forged_low_order.every((l) => !l.libsodium_opens), out.sealedbox_forged_low_order.length);
 console.log('kdf', out.kdf.length, 'xchacha', out.xchacha.length, 'argon2id', out.argon2id.length, 'hkdf', out.hkdf.length, 'sealed', out.sealedbox_kat.length, 'ed sign', out.ed25519_sign.length);
