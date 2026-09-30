@@ -40,7 +40,7 @@ config dir on first run; edit there to customise without rebuilding):
 |---|---|
 | **OAIY Voice** | OAIY's own voice for calls: speech-to-text and text-to-speech in one resident process on the GPU. Its program ships with OAIY. Serves on `:8783`. |
 | **Aokie Speech-to-Text** / **Aokie Text-to-Speech** | The Aokie receptionist's ears and voice; their program lives in the Aokie plugin. Serve on `:8781` / `:8782`. |
-| **Playwright Browser** | Headless Chromium backend for the `browser_*` nodes (goto/extract/click/screenshot). Installs Playwright into a venv reusing OAIY Desktop's Python. Serves on `:17880`. |
+| **Playwright Browser** | Headless Chromium backend for the `browser_*` nodes (goto/extract/click/screenshot). Installs Playwright into a venv reusing OAIY Desktop's Python. Serves on `:17880`, and answers only its own `Host` and OAIY's own windows (the Agent and the Flows page, named in `OAIY_ALLOWED_ORIGINS`) or programs that send no `Origin`; any other web page gets 403 or 421. |
 
 Models are not services: OAIY's own engine runs them (OAIY → **Engines**). Krea-2
 Turbo, Lance, Llama.cpp Server, Ollama and LTX-2.3 Video used to be built in; at

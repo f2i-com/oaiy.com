@@ -333,6 +333,14 @@ jobs:
       - name: Desktop typecheck + web build
         working-directory: platform/desktop
         run: npm run build
+      # Who may call the Playwright server (Host, Origin, Fetch Metadata): the rules,
+      # and the script itself on a free loopback port with a stub for the playwright
+      # package, so no browser runs. Python's standard library only.
+      - name: Playwright server guard tests (Python)
+        shell: bash
+        run: |
+          py=python3; command -v python3 >/dev/null 2>&1 || py=python
+          "$py" -m unittest discover -s platform/desktop/scripts -p "test_*.py"
       # Native tests in BOTH shipped configurations: the headless server (no
       # default features) and the GUI feature set the desktop installer ships.
       - name: Native tests (headless, no default features)
