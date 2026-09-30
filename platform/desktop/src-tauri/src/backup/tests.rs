@@ -5646,12 +5646,21 @@ fn a_file_of_a_hundred_thousand_entries_is_refused_at_once() {
     assert!(peak < 64 * MIB, "{} MiB", peak / MIB);
     assert!(took < std::time::Duration::from_secs(30), "{took:?}");
     assert_nothing_staged(&dst.0);
-    // With the cap lifted the same file is worked through in a time that grows with its size, not with its square.
+    // With the cap lifted the same file is worked through in a time that grows with its size, not with its square. (Said as a ratio: four
+    // times the entries take about four times as long and not sixteen, whatever the machine does meanwhile: a fixed number of seconds is a
+    // test of the machine, which is busy when a suite runs beside others.)
     let lifted = RestoreOptions { limits: Limits { max_entries: 120_000, max_manifest_bytes: 64 << 20, ..Limits::default() }, ..options() };
     let (result, _, took) = peak::measured(|| restore::stage(&dst.0, &file, PASS, &Ticks::all(), &lifted));
     let staged = result.unwrap();
     assert_eq!(staged.files, 0, "none of it is known to the table, so none of it is staged");
-    assert!(took < std::time::Duration::from_secs(60), "100,000 entries took {took:?}");
+    let quarter: Vec<(String, u64, Fill)> = (0..25_000).map(|i| (format!("unknown/f{i:06}"), 2, Fill::Json)).collect();
+    let small = out.0.join("quarter.oaiybackup");
+    craft_streaming(&small, &quarter);
+    let (result, _, took_quarter) = peak::measured(|| restore::stage(&dst.0, &small, PASS, &Ticks::all(), &lifted));
+    assert_eq!(result.unwrap().files, 0);
+    eprintln!("25,000 entries took {took_quarter:?}, 100,000 took {took:?}");
+    assert!(took < took_quarter * 6 + std::time::Duration::from_secs(3), "four times the entries took {took:?} against {took_quarter:?}: the time grows with the square of the size");
+    assert!(took < std::time::Duration::from_secs(240), "100,000 entries took {took:?}");
 }
 
 /// The numbers the caps stand at, and why (see `Limits`): a real backup is nowhere near them.
