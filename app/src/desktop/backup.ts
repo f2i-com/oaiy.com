@@ -62,7 +62,7 @@
  */
 import { Zip, ZipDeflate, strToU8, unzipSync } from 'fflate';
 import type { ProviderConfig } from '../agent/providers/types';
-import type { MediaSettings } from '../agent/media';
+import { EMPTY_MEDIA, type MediaSettings } from '../agent/media';
 import type { NetGateSettings } from '../gate/netgate';
 import { PersonIndex } from '../phoneNumbers';
 import { DEFAULT_AGENT_SETTINGS, DEFAULT_MESSAGE_SETTINGS, loadSettings, saveAgentSettings, saveGate, saveLastKeptProject, saveLastProject, saveMedia, saveMessages, saveProviders, type AgentSettings, type MessageSettings, type Settings } from '../settings';
@@ -638,7 +638,8 @@ export interface MergeOptions {
    * being undone), so a provider that restore added goes again, and one that is not in the copy does not stay. A restore
    * merges and never takes one away; only this does. A key that is kept stays with its provider only at the same address, and
    * the copy holds none. (A copy that holds no providers key is a copy of a list that was empty: the desktop leaves an empty
-   * list out.)
+   * list out.) The image, video and audio service is put back the same way: its address is the copy's (an empty one is none, and
+   * the desktop carries it), and what a restore read from another service does not stay.
    */
   exact?: boolean;
 }
@@ -772,7 +773,15 @@ export function mergeSettings(current: Settings, backup: Partial<BackupSettings>
     notes.push(`The backup’s provider “${label}” points somewhere else than yours, so yours was kept as it is and the backup’s was added as “${record.name}”, without a key.`);
   }
   let media: MediaSettings = current.media;
-  if (isObject(backup.media)) {
+  if (exact && isObject(backup.media)) {
+    // The service as it was before the restore: its address (empty: there was none, which a restore may have filled), and the
+    // settings that are not read from the service. A key stays only with the address it was kept for, and what was read from
+    // another service (its routes, its lists of models and voices) is read again, so nothing of the one a restore set stays.
+    const address = text(backup.media.baseUrl, 2048) ?? '';
+    const same = sameEndpoint({ baseUrl: current.media.baseUrl }, { baseUrl: address });
+    media = { ...(same ? current.media : EMPTY_MEDIA), ...pickMedia(backup.media), baseUrl: address, apiKey: same ? current.media.apiKey : '' };
+    if (!same) notes.push(address ? `The image, video and audio service was put back to ${address}, without a key.` : 'The image, video and audio service was put back to none: the restore had set one.');
+  } else if (isObject(backup.media)) {
     const theirs = backup.media;
     const safe = pickMedia(theirs);
     const address = text(theirs.baseUrl, 2048);

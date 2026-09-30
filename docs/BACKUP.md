@@ -707,7 +707,14 @@ in parts through internal routes with a secret made for that one backup.
   restore only ever adds to them and never takes one away, but an undo does, so a provider the
   restore added (or set beside one of yours) goes again, one whose address the restore changed is
   put back at its own address without a key, and a key stays only with the provider it was kept
-  for, at the same address. The result names the providers that were taken away. (A copy whose
+  for, at the same address. **The rest of the Agent's settings go back the same way, key by key,
+  empty ones included**: the network gate, how it answers texts and calls, the country, the
+  numbers that tune it, and the image, video and audio service (its address goes back to the one
+  it had, and an address that was empty is none again, where a restore that has set one would
+  have left it; a key stays only with the address it was kept for, and what the restore read from
+  another service is read again). A test takes every setting the table lets an undo carry, once
+  with every value set and once with every value empty, and shows that an undo puts each back.
+  The result names the providers that were taken away. (A copy whose
   list of providers was empty is read as an empty list.)
 - **The page's secret.** Every request the page makes about a restore carries a secret the
   desktop put in the Agent's window when it started (`backupToken`, different at every start).

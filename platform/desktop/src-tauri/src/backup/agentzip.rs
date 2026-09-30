@@ -31,7 +31,7 @@ use zip::{CompressionMethod, ZipWriter};
 
 use super::container::{self, Archive};
 use super::review::{clip, key_item, show_value, NotRestored, RestoreClass, ReviewItem, Ticks};
-use super::table::{filter_json, table, Class, KeyRow, Row, Why};
+use super::table::{filter_json, filter_json_exact, table, Class, KeyRow, Row, Why};
 use super::{BackupError, Budget, ErrorKind, Limits, Result};
 use crate::secret_file;
 
@@ -738,7 +738,8 @@ pub fn filter(nested: &Path, out: &Path, scratch: &Path, ticks: &Ticks, mode: Mo
                     continue;
                 };
                 let Some(kt) = table().key_table("agent.settings") else { continue };
-                let found = filter_json(kt, &value, &keep_key);
+                // An undo puts back the person's own state, empty addresses included; a restore takes what is plain.
+                let found = if mode == Mode::Undo { filter_json_exact(kt, &value, &keep_key) } else { filter_json(kt, &value, &keep_key) };
                 let left = found.left.len() + found.left_more;
                 if found.kept.is_empty() {
                     if left > 0 {

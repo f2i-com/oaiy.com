@@ -6005,3 +6005,82 @@ fn a_swapped_staged_agent_archive_is_not_handed_to_the_page() {
     assert!(agent::import_meta(&dst.0).pending && agent::import_meta(&dst.0).id.as_deref() == Some(id.as_str()));
     assert_eq!(fs::read(dst.0.join("restore").join("agent-import").join("current.zip")).unwrap(), staged_bytes);
 }
+
+/// Put `value` at the path `parts` (`a[]` is the one element of the list `a`) in `node`.
+fn put_at(node: &mut serde_json::Value, parts: &[&str], value: &serde_json::Value) {
+    let (name, in_list) = match parts[0].strip_suffix("[]") {
+        Some(n) => (n, true),
+        None => (parts[0], false),
+    };
+    let map = node.as_object_mut().unwrap();
+    if parts.len() == 1 {
+        map.insert(name.to_string(), value.clone());
+        return;
+    }
+    let slot = map.entry(name.to_string()).or_insert(if in_list { serde_json::json!([{}]) } else { serde_json::json!({}) });
+    let child = if in_list { &mut slot.as_array_mut().unwrap()[0] } else { slot };
+    put_at(child, &parts[1..], value);
+}
+
+/// A document of every setting the table lets an undo carry (not excluded, not a key), with every value set or every value empty.
+fn every_setting_the_undo_carries(empty: bool) -> serde_json::Value {
+    use super::table::ValueType;
+    let keys = super::table::table().key_table("agent.settings").unwrap();
+    let mut root = serde_json::json!({});
+    for key in keys.keys.iter().filter(|k| k.class != super::table::Class::Excluded && !k.secret) {
+        let value = match key.ty.as_ref().unwrap() {
+            ValueType::Object | ValueType::Objects { .. } => continue,
+            ValueType::Bool => serde_json::json!(!empty),
+            ValueType::Int { min, max } => serde_json::json!(if empty { *min } else { (*min + *max) / 2 }),
+            ValueType::Number { min, max } => serde_json::json!(if empty { *min } else { (*min + *max) / 2.0 }),
+            ValueType::Str { .. } => serde_json::json!(if empty { "" } else { "text" }),
+            ValueType::Url { .. } => serde_json::json!(if empty { "" } else { "https://example.org/v1" }),
+            ValueType::Enum(options) => serde_json::json!(if empty { options.first().unwrap() } else { options.last().unwrap() }),
+            ValueType::Strings { .. } => serde_json::json!(if empty { vec![] } else { vec!["a.example"] }),
+            other => panic!("agent.settings has a value of a kind this test does not make: {other:?}"),
+        };
+        // `a.b` is a key inside `a`; `a[].b` is a key inside the one element of the list `a`.
+        put_at(&mut root, &key.path.split('.').collect::<Vec<_>>(), &value);
+    }
+    root
+}
+
+/// An undo is the identity on the settings: every value the table lets it carry comes through as it was, the empty ones too. (An
+/// empty address used to be dropped as "not a plain address", so an undo of a restore that had set the media service's address left
+/// the restore's in place.)
+#[test]
+fn an_undo_carries_every_setting_as_it_was_with_the_empty_ones() {
+    use super::table::filter_json_exact;
+    let keys = super::table::table().key_table("agent.settings").unwrap();
+    for empty in [false, true] {
+        let document = every_setting_the_undo_carries(empty);
+        let carried = filter_json_exact(keys, &document, &|row| !row.secret);
+        assert!(carried.left.is_empty(), "empty={empty}: {:?}", carried.left.iter().map(|l| (&l.path, &l.why)).collect::<Vec<_>>());
+        assert_eq!(carried.value, document, "empty={empty}: what comes through is what there was");
+        if empty {
+            assert_eq!(carried.value["media"]["baseUrl"], "");
+        }
+    }
+    // A restore takes what is plain: an empty address is not one, and a restore does not carry it.
+    let restored = super::table::filter_json(keys, &every_setting_the_undo_carries(true), &|row| !row.secret);
+    assert!(restored.value["media"].get("baseUrl").is_none() && restored.left.iter().any(|l| l.path == "media.baseUrl"));
+}
+
+/// Through the undo of a restore that has set an address: the settings the page is handed hold the empty address.
+#[test]
+fn an_undo_hands_the_page_an_empty_media_address() {
+    let src = TempDir::new("undo-media-src");
+    let out = TempDir::new("undo-media-out");
+    let file = backup_with_agent(&src.0, &out.0, "m.oaiybackup", agent_archive(&[("opfs/projects/p1/chat.json", b"[]")]), false);
+    let dst = TempDir::new("undo-media-dst");
+    restore::stage(&dst.0, &file, PASS, &Ticks::all(), &options()).unwrap();
+    assert!(matches!(restore::apply_pending(&dst.0), ApplyOutcome::Applied(_)));
+    let before = serde_json::json!({ "media": { "baseUrl": "", "enabled": true }, "gate": { "mode": "open", "allow": [], "deny": [] } });
+    page_takes_import(&dst.0, &agent_archive(&[("idb/settings.json", before.to_string().as_bytes())]), &[]);
+    restore::stage_undo(&dst.0, &options()).unwrap();
+    assert!(matches!(restore::apply_pending(&dst.0), ApplyOutcome::Applied(_)));
+    let settings: serde_json::Value = serde_json::from_slice(&zip_entries(&handed_over(&dst.0))["idb/settings.json"]).unwrap();
+    assert_eq!(settings["media"]["baseUrl"], "", "{settings}");
+    assert_eq!(settings["media"]["enabled"], true);
+    assert_eq!(settings["gate"]["allow"], serde_json::json!([]));
+}

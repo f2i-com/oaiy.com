@@ -755,8 +755,9 @@ fn looks_secret(text: &str) -> bool {
     ["dpapi", "sealed:", "flk_", "sk-", "hf_", "bearer ", "age-secret-key", "-----begin"].iter().any(|p| lower.starts_with(p)) || lower.contains("dpapi:")
 }
 
-/// Check a scalar against its type. `Err` says what is wrong, in a few words.
-fn check_value(ty: &ValueType, value: &Value, is_a_key: bool) -> Result<(), String> {
+/// Check a scalar against its type. `Err` says what is wrong, in a few words. `exact`: the value is one the person's own page
+/// held (an undo), where an address that is empty means "none" and is a value like any other.
+fn check_value(ty: &ValueType, value: &Value, is_a_key: bool, exact: bool) -> Result<(), String> {
     match (ty, value) {
         (ValueType::Bool, Value::Bool(_)) => Ok(()),
         (ValueType::Int { min, max }, Value::Number(n)) => match n.as_i64() {
@@ -779,6 +780,7 @@ fn check_value(ty: &ValueType, value: &Value, is_a_key: bool) -> Result<(), Stri
             }
         }
         (ValueType::Enum(options), Value::String(s)) => if options.iter().any(|o| o == s) { Ok(()) } else { Err("it is not one of the choices".to_string()) },
+        (ValueType::Url { .. }, Value::String(s)) if exact && s.is_empty() => Ok(()),
         (ValueType::Url { max_chars }, Value::String(s)) => {
             if plain_url(s, *max_chars) && !looks_secret(s) {
                 Ok(())
@@ -825,6 +827,8 @@ fn time_of_day(text: &str) -> Option<u32> {
 
 struct Walk<'a> {
     table: &'static KeyTable,
+    /// The document is the person's own state, put back by an undo: an empty address is "none", not a bad address.
+    exact: bool,
     at: Vec<usize>,
     keep: &'a dyn Fn(&KeyRow) -> bool,
     kept: Vec<Kept>,
@@ -959,7 +963,7 @@ impl Walk<'_> {
                     }
                     _ => self.leave(&child, Why::BadValue("an object is expected".to_string()), Some(row)),
                 },
-                scalar => match check_value(scalar, value, row.secret) {
+                scalar => match check_value(scalar, value, row.secret, self.exact) {
                     Ok(()) => {
                         self.kept.push(Kept { path: child.clone(), row, value: value.clone(), at: self.at.clone() });
                         out.insert(key.clone(), value.clone());
@@ -976,7 +980,17 @@ impl Walk<'_> {
 /// only with a value of the kind the row allows. `keep` says which rows that come back are wanted (all of
 /// them when a backup is made; the ticked ones when one is restored).
 pub fn filter_json(table: &'static KeyTable, input: &Value, keep: &dyn Fn(&KeyRow) -> bool) -> Filtered {
-    let mut walk = Walk { table, at: Vec::new(), keep, kept: Vec::new(), left: Vec::new(), left_more: 0, nodes: 0 };
+    filter_document(table, input, keep, false)
+}
+
+/// The same for the person's own state, as an undo puts it back: a value that is empty ("" for an address that was not set) is
+/// carried like any other, so that what an undo restores is what there was and not what is left when the empty ones are dropped.
+pub fn filter_json_exact(table: &'static KeyTable, input: &Value, keep: &dyn Fn(&KeyRow) -> bool) -> Filtered {
+    filter_document(table, input, keep, true)
+}
+
+fn filter_document(table: &'static KeyTable, input: &Value, keep: &dyn Fn(&KeyRow) -> bool, exact: bool) -> Filtered {
+    let mut walk = Walk { table, exact, at: Vec::new(), keep, kept: Vec::new(), left: Vec::new(), left_more: 0, nodes: 0 };
     let Value::Object(root) = input else {
         walk.leave("", Why::BadValue("it is not a JSON object".to_string()), None);
         return Filtered { value: Value::Object(Map::new()), kept: walk.kept, left: walk.left, left_more: walk.left_more };

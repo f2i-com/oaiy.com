@@ -33,6 +33,7 @@ import { Outreach, type Campaign, type DoNotContact } from '../../src/outreach';
 import { PhoneLine } from '../../src/phoneLine';
 import { setLocalCountry } from '../../src/phoneNumbers';
 import { Vfs } from '../../src/vfs/vfs';
+import TABLE from '../../../platform/desktop/src-tauri/src/backup/table.json?raw';
 
 const enc = new TextEncoder();
 const dec = new TextDecoder();
@@ -1133,6 +1134,92 @@ describe('a restore never redirects a kept key or changes what OAIY may do witho
       expect((await applyPendingRestore(DESKTOP, bare, { fetch: fakeDesktop(bareUndo, { kind: 'undo' }).fetch }))!.ok).toBe(true);
       expect(bare.settings.providers).toEqual([]);
       expect(bare.settings.activeProviderId).toBeNull();
+    });
+  });
+
+  describe('an undo puts every setting back as it was, empty ones included', () => {
+    /** Every setting the Agent keeps that a restore may write, with a value that is set (everything on, everything named) ... */
+    const SET = {
+      providers: [{ id: 'p-set', type: 'anthropic', name: 'Set', baseUrl: 'https://set.example/v1', modelId: 'model-set', followEngine: true, orgId: 'org-set', serverKind: 'ollama', contextTokens: 32000, parallelAgents: 3 }],
+      activeProviderId: 'p-set',
+      gate: { mode: 'allowlist', allow: ['set.example'], deny: ['bad.example'] },
+      agent: { compactAt: 0.6, subAgentTokens: 64000 },
+      media: { baseUrl: 'https://media.set.example/v1', enabled: false, imageModel: 'img-set', videoModel: 'vid-set', speechModel: 'speech-set', musicModel: 'music-set', soundModel: 'sound-set', model3dModel: 'model3d-set' },
+      messages: { answer: true, calls: true, callBack: true, instructions: 'set instructions', callInstructions: 'set call instructions', callBackFilter: 'any', callBackLine: 'set line', country: 'NZ' },
+    };
+    /** ... and one that is empty (everything off, every name and address empty). */
+    const EMPTY = {
+      providers: [{ id: 'p-empty', type: 'openai', name: '', baseUrl: '', modelId: '', followEngine: false, orgId: '', serverKind: '', contextTokens: 0, parallelAgents: 1 }],
+      activeProviderId: 'p-empty',
+      gate: { mode: 'open', allow: [] as string[], deny: [] as string[] },
+      agent: { compactAt: 0.05, subAgentTokens: 1000 },
+      media: { baseUrl: '', enabled: true, imageModel: '', videoModel: '', speechModel: '', musicModel: '', soundModel: '', model3dModel: '' },
+      messages: { answer: false, calls: false, callBack: false, instructions: '', callInstructions: '', callBackFilter: 'answered', callBackLine: '', country: '' },
+    };
+    const paths = (value: unknown, at = ''): string[] =>
+      Array.isArray(value) && value.length && typeof value[0] === 'object'
+        ? paths(value[0], `${at}[]`)
+        : value && typeof value === 'object' && !Array.isArray(value)
+          ? Object.entries(value).flatMap(([k, v]) => paths(v, at ? `${at}.${k}` : k))
+          : [at];
+
+    it('has a value for every setting the table lets an undo carry, so a setting added to the table cannot be left out of the test', () => {
+      const table = JSON.parse(TABLE) as { keyTables: Record<string, { keys: Array<{ path: string; class: string; secret?: boolean; type?: string }> }> };
+      const carried = table.keyTables['agent.settings'].keys.filter((k) => k.class !== 'excluded' && !k.secret && k.type !== 'object' && k.type !== 'objects').map((k) => k.path).sort();
+      expect(paths(SET).sort()).toEqual(carried);
+      expect(paths(EMPTY).sort()).toEqual(carried);
+    });
+
+    for (const [before, then, what] of [
+      [EMPTY, SET, 'from everything empty to everything set and back'],
+      [SET, EMPTY, 'from everything set to everything empty and back'],
+    ] as const) {
+      it(`puts back exactly what there was, ${what}`, () => {
+        // What the restore left (the other state, with the keys this computer holds) and what the undo copy holds (the state before, without keys).
+        const left = settings({
+          providers: then.providers.map((p) => ({ ...p, apiKey: 'sk-left-here' })) as Settings['providers'],
+          activeProviderId: then.activeProviderId,
+          gate: then.gate as Settings['gate'],
+          agent: { ...DEFAULT_AGENT_SETTINGS, ...then.agent },
+          media: { ...EMPTY_MEDIA, ...then.media, apiKey: 'media-key-left-here', endpoints: { images: 'https://media.set.example/v1/images' }, imageModels: [{ id: 'from-the-other-service' } as never] },
+          messages: { ...DEFAULT_MESSAGE_SETTINGS, ...then.messages } as Settings['messages'],
+        });
+        const copy = JSON.parse(JSON.stringify(before)) as Parameters<typeof mergeSettings>[1];
+        const notes: string[] = [];
+        const back = mergeSettings(left, copy, new Set(), { exact: true, notes });
+        expect(back.providers.map(({ apiKey, ...rest }) => rest)).toEqual(before.providers);
+        expect(back.activeProviderId).toBe(before.activeProviderId);
+        expect(back.gate).toEqual(before.gate);
+        for (const [key, value] of Object.entries(before.agent)) expect(back.agent[key as keyof typeof back.agent], `agent.${key}`).toEqual(value);
+        for (const [key, value] of Object.entries(before.media)) expect(back.media[key as keyof typeof back.media], `media.${key}`).toEqual(value);
+        for (const [key, value] of Object.entries(before.messages)) expect(back.messages[key as keyof typeof back.messages], `messages.${key}`).toEqual(value);
+        // What a restore read from another service does not stay when the address goes back, and no key follows the address it was kept for.
+        if (before.media.baseUrl !== then.media.baseUrl) {
+          expect(back.media.apiKey).toBe('');
+          expect(back.media.endpoints).toBeUndefined();
+          expect(back.media.imageModels).toEqual([]);
+        }
+        expect(back.providers.every((p) => p.apiKey === '' || p.id === then.providers[0].id)).toBe(true);
+      });
+    }
+
+    it('takes a media address a restore set out again, through the page, with the copy it took (the reviewer’s case)', async () => {
+      const target = new FakeStorage();
+      target.settings = settings({ media: { ...EMPTY_MEDIA } });
+      const source = new FakeStorage();
+      source.settings = settings({ media: { ...EMPTY_MEDIA, baseUrl: 'https://media.attacker.example/v1', enabled: true } });
+      const restoring = fakeDesktop(await archiveOf(source, false), { apply: SETTINGS_ONLY });
+      expect((await applyPendingRestore(DESKTOP, target, { fetch: restoring.fetch }))!.ok).toBe(true);
+      expect(target.settings.media.baseUrl).toBe('https://media.attacker.example/v1');
+      // The copy the page took holds an empty address, and the desktop hands an empty address back (it used to drop it).
+      const copy = unzipSync(joined(restoring.posted.undoParts));
+      const names = Object.keys(copy).filter((n) => n !== RECORD);
+      const undoArchive = zipSync({ [RECORD]: strToU8(JSON.stringify(recordFor(names))), ...Object.fromEntries(names.map((n) => [n, copy[n]])) });
+      expect(JSON.parse(dec.decode(copy['idb/settings.json'])).media.baseUrl).toBe('');
+      const undone = await applyPendingRestore(DESKTOP, target, { fetch: fakeDesktop(undoArchive, { kind: 'undo' }).fetch });
+      expect(undone!.ok).toBe(true);
+      expect(target.settings.media.baseUrl).toBe('');
+      expect(undone!.warnings.join('\n')).toContain('put back to none');
     });
   });
 
