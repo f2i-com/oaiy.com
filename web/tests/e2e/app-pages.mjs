@@ -52,17 +52,18 @@ export async function startAppWorld() {
 /**
  * A page of one of the apps, in a browser context of its own with the recorder on.
  * `desktop`: what OAIY's window gives its pages before they run. `storage`: localStorage set before the page runs.
- * `refuseAfterMs` and `answer`: see watchLocal. `at`: the host to open it at (`agent`, `flows`, or `oaiyAsAgent` / `oaiyflowsAsFlows`, the
+ * `automated`: leave `navigator.webdriver` as the browser has it (true). `refuseAfterMs` and `answer`: see watchLocal. `at`: the host to open it at (`agent`, `flows`, or `oaiyAsAgent` / `oaiyflowsAsFlows`, the
  * app at `oaiy.localhost:PORT` / `oaiyflows.localhost:PORT`: OAIY's names, on a port).
  */
-export async function openApp(env, app, { desktop = null, storage = {}, path = app === 'agent' ? '/' : '/app.html', refuseAfterMs = 0, answer = null, viewport = { width: 1440, height: 900 }, at = app } = {}) {
+export async function openApp(env, app, { desktop = null, storage = {}, path = app === 'agent' ? '/' : '/app.html', refuseAfterMs = 0, answer = null, viewport = { width: 1440, height: 900 }, at = app, automated = false } = {}) {
   const context = await env.browser.newContext({ viewport });
   const { attempts, details } = await watchLocal(context, { sites: env.sites, refuseAfterMs, answer });
   const errors = [];
   await context.addInitScript(
-    ({ desktop, storage }) => {
-      // A visitor's browser is not automated: the Agent looks for OAIY on its own only in a browser that is not.
-      Object.defineProperty(Navigator.prototype, 'webdriver', { get: () => false, configurable: true });
+    ({ desktop, storage, automated }) => {
+      // A visitor's browser is not automated: the Agent looks for OAIY on its own only in a browser that is not. (`automated`: it is, as
+      // every Playwright page is, for the case that shows what an automated browser is pointed at.)
+      if (!automated) Object.defineProperty(Navigator.prototype, 'webdriver', { get: () => false, configurable: true });
       if (desktop) window.__OAIY_DESKTOP__ = Object.freeze(desktop);
       try {
         // No splash and no first-run wizard: they cover the pages a scenario presses buttons in.
@@ -74,7 +75,7 @@ export async function openApp(env, app, { desktop = null, storage = {}, path = a
         /* blocked storage: the page still loads */
       }
     },
-    { desktop, storage },
+    { desktop, storage, automated },
   );
   const page = await context.newPage();
   page.on('pageerror', (e) => errors.push(e.message));

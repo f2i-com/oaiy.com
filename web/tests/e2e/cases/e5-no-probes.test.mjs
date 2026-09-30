@@ -115,6 +115,20 @@ describe('E5: the Agent', () => {
     await context.close();
   });
 
+  it('an automated browser is pointed by ?oaiy= at the address the link names, and the key the person typed does not go there (the review\'s F5)', async () => {
+    const STANDIN = 'http://192.168.1.99:8080';
+    const s = await open('agent', { automated: true });
+    await ready('agent', s.page);
+    await seedOaiyLink(s.page, { origin: 'http://192.168.1.20:8080', key: 'sk-oaiy-review-key-0123456789' });
+    s.attempts.length = 0;
+    s.details.length = 0;
+    await s.page.goto(`${env.world.origins.agent}/?oaiy=${encodeURIComponent(STANDIN)}`);
+    await ready('agent', s.page);
+    assert.deepEqual(s.attempts, [`GET ${STANDIN}/v1/discovery`], 'it looked where the link said, and at the saved OAIY not at all (an automated browser looks only where it is told)');
+    assert.equal(s.details[0].headers.authorization, undefined, 'and sent no key to it');
+    await s.context.close();
+  });
+
   it('a tab with an OAIY it found before (a link it saved) looks at that one, and only that', async () => {
     // The link is what the settings keep after Find OAIY: media.discovered. Saved through the page's own store, then reloaded.
     const again = await open('agent');
