@@ -469,7 +469,7 @@ pub(crate) fn cancel_pending_import(data_dir: &Path) -> Option<String> {
 
 /// Whether restore `id` has been applied and its undo record is there: only then is there a snapshot of the page's storage to keep
 /// for it. A snapshot for anything else would be a folder no record names, that nothing offers back.
-fn undo_record_exists(data_dir: &Path, id: &str) -> bool {
+pub(crate) fn undo_record_exists(data_dir: &Path, id: &str) -> bool {
     let read = std::fs::read_to_string(restore_dir(data_dir).join(format!("undo-{id}")).join("undo.json")).ok();
     read.and_then(|t| serde_json::from_str::<serde_json::Value>(&t).ok()).and_then(|v| v.get("id").and_then(|i| i.as_str().map(str::to_string))).as_deref() == Some(id)
 }

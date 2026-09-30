@@ -1355,6 +1355,16 @@ pub fn apply_pending(data_dir: &Path) -> ApplyOutcome {
     let holding = holding_of(data_dir, &marker);
     let journal_file = journal_path(data_dir);
 
+    // The marker is the last thing a finished restore removes (after the journal). A start that finds the marker of a restore whose
+    // record of what it replaced is there, and whose journal is gone, has nothing to apply and nothing to put back: it was applied,
+    // and its result is what was recorded. (With the journal there, the restore is finished again below; without the record, it
+    // was never applied.)
+    if std::fs::symlink_metadata(&journal_file).is_err() && undo_record_names(data_dir, &marker.id) {
+        let _ = std::fs::remove_file(&marker_file);
+        log::info!("backup: the record of a {} that was already applied was still there, and was removed", marker.kind);
+        return ApplyOutcome::None;
+    }
+
     // A restore prepared long ago is not applied. (One that was begun is never expired: it is finished or rolled back, below.)
     if std::fs::symlink_metadata(&journal_file).is_err() && expired(&marker.staged_at) {
         return expire(data_dir, &marker);
@@ -1398,6 +1408,11 @@ pub fn apply_pending(data_dir: &Path) -> ApplyOutcome {
             conclude_failed(data_dir, &marker, last)
         }
     }
+}
+
+/// Whether the record of what restore `id` replaced is there and names it (an apply writes it before it removes its journal).
+fn undo_record_names(data_dir: &Path, id: &str) -> bool {
+    is_id(id) && agent::undo_record_exists(data_dir, id)
 }
 
 /// A rollback that could not put everything back: say which files, where their originals are, and

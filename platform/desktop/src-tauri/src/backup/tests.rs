@@ -6332,6 +6332,85 @@ fn a_hand_over_that_is_not_the_archive_that_was_staged_is_not_left_for_the_page(
     assert!(!dir.join("agent-import").join("current.zip").exists());
 }
 
+/// A restore with an Agent part, staged and about to be applied.
+fn staged_with_agent_part(tag: &str) -> (TempDir, String, PathBuf) {
+    let src = TempDir::new(&format!("{tag}-src"));
+    let out = TempDir::new(&format!("{tag}-out"));
+    let file = backup_with_agent(&src.0, &out.0, "k.oaiybackup", agent_part(), false);
+    let dst = TempDir::new(&format!("{tag}-dst"));
+    put(&dst.0, "callers.json", b"{\"contacts\":[]}");
+    let staged = restore::stage(&dst.0, &file, PASS, &Ticks::all(), &options()).unwrap();
+    let zip = dst.0.join("restore").join(format!("pending-{}", staged.id)).join("agent-storage.zip");
+    assert!(zip.is_file());
+    (dst, staged.id, zip)
+}
+
+/// The last thing a finished restore removes is its marker. A kill between the removal of the journal and that one (the reviewer's
+/// x3 and x3b) left a marker that the next start took for a restore that had not been applied: it said the files were missing, and
+/// (for one that was old enough) that it had expired. What was recorded when it finished stands, and the marker is removed.
+#[test]
+fn a_marker_left_behind_by_a_restore_that_finished_is_removed_and_the_restore_is_not_called_failed() {
+    // With an Agent part (the staged archive is gone by then), and with none.
+    let (dst, id, _) = staged_with_agent_part("left-marker");
+    let marker = fs::read(dst.0.join("restore").join("pending.json")).unwrap();
+    assert!(matches!(restore::apply_pending(&dst.0), ApplyOutcome::Applied(_)));
+    let after_apply = snapshot(&dst.0);
+    let told = restore::last_restore(&dst.0).unwrap();
+    assert!(told.ok && told.id == id);
+    for hours in [Some(1), Some(30)] {
+        fs::write(dst.0.join("restore").join("pending.json"), &marker).unwrap();
+        stage_time(&dst.0, hours);
+        assert!(matches!(restore::apply_pending(&dst.0), ApplyOutcome::None), "{hours:?}");
+        assert!(!dst.0.join("restore").join("pending.json").exists(), "{hours:?}: the marker is removed");
+        let now = restore::last_restore(&dst.0).unwrap();
+        assert!(now.ok && now.id == id && now.error.is_none(), "{hours:?}: {now:?}");
+        assert_eq!(now.notes, told.notes, "{hours:?}: what was said is what was said");
+        assert_eq!(snapshot(&dst.0), after_apply, "{hours:?}: files are as the restore left them");
+        assert!(matches!(restore::apply_pending(&dst.0), ApplyOutcome::None));
+    }
+    // A plain data restore.
+    let src = TempDir::new("left-marker-plain-src");
+    realistic(&src.0, "A");
+    let out = TempDir::new("left-marker-plain-out");
+    let file = out.0.join("c.oaiybackup");
+    make(&src.0, &file);
+    let plain = TempDir::new("left-marker-plain-dst");
+    target(&plain.0);
+    restore::stage(&plain.0, &file, PASS, &Ticks::all(), &options()).unwrap();
+    let marker = fs::read(plain.0.join("restore").join("pending.json")).unwrap();
+    assert!(matches!(restore::apply_pending(&plain.0), ApplyOutcome::Applied(_)));
+    let after_apply = snapshot(&plain.0);
+    fs::write(plain.0.join("restore").join("pending.json"), &marker).unwrap();
+    assert!(matches!(restore::apply_pending(&plain.0), ApplyOutcome::None));
+    assert!(restore::last_restore(&plain.0).unwrap().ok);
+    assert_eq!(snapshot(&plain.0), after_apply);
+    // An undo that finished is the same.
+    restore::stage_undo(&plain.0, &options()).unwrap();
+    let undo_marker = fs::read(plain.0.join("restore").join("pending.json")).unwrap();
+    assert!(matches!(restore::apply_pending(&plain.0), ApplyOutcome::Applied(_)));
+    let after_undo = snapshot(&plain.0);
+    fs::write(plain.0.join("restore").join("pending.json"), &undo_marker).unwrap();
+    assert!(matches!(restore::apply_pending(&plain.0), ApplyOutcome::None));
+    let told = restore::last_restore(&plain.0).unwrap();
+    assert!(told.ok && told.kind == "undo", "{told:?}");
+    assert_eq!(snapshot(&plain.0), after_undo);
+}
+
+/// A restore that was not begun (no journal, and no record of what it replaced) is applied as before, and one that was begun and not
+/// finished (a journal) is still finished or put back: the removal of a marker that is left behind is only for the finished.
+#[test]
+fn a_marker_is_left_alone_when_the_restore_was_not_finished_or_never_begun() {
+    let (dst, _id, _) = staged_with_agent_part("marker-not-finished");
+    restore::INJECT.with(|c| c.set(Some(Inject::CrashAfterDone)));
+    assert!(matches!(restore::apply_pending(&dst.0), ApplyOutcome::None));
+    restore::INJECT.with(|c| c.set(None));
+    // The journal is complete and the record of what it replaced is not there yet: the restore is finished, not dropped.
+    assert!(dst.0.join("restore").join("pending.json").exists());
+    assert!(matches!(restore::apply_pending(&dst.0), ApplyOutcome::Applied(_)));
+    let (never, _, _) = staged_with_agent_part("marker-never-begun");
+    assert!(matches!(restore::apply_pending(&never.0), ApplyOutcome::Applied(_)), "a restore that was staged is applied");
+}
+
 /// Put `value` at the path `parts` (`a[]` is the one element of the list `a`) in `node`.
 fn put_at(node: &mut serde_json::Value, parts: &[&str], value: &serde_json::Value) {
     let (name, in_list) = match parts[0].strip_suffix("[]") {
