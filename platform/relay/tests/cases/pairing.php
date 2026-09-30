@@ -944,6 +944,47 @@ test('4.10.3 step 7: the phone\'s name is cleaned (control characters removed, a
     eq(str_repeat('é', 60), $r2->ctx()->db->val('SELECT name FROM devices WHERE id = ?', [$res2['json']['deviceId']]));
 });
 
+/** Names that are under 60 characters and over 120 bytes, and others that cut badly: [label => name]. @return array<string,string> */
+function pair_long_names(): array
+{
+    $family = "\u{1F468}\u{200D}\u{1F469}\u{200D}\u{1F467}"; // man, woman, girl joined: 18 bytes, one glyph
+    return [
+        'CJK, 50 characters (150 bytes)' => str_repeat("\u{65E5}", 50),
+        'emoji, 35 characters (140 bytes)' => str_repeat("\u{1F600}", 35),
+        'combining marks: a character and two accents 25 times (75 code points, 175 bytes)' => str_repeat("\u{65E5}\u{0301}\u{0302}", 25),
+        'combining marks after ASCII (cut between a base and its accent)' => str_repeat('a', 118) . "\u{0301}" . "\u{0302}",
+        'ZWJ sequences, 20 glyphs (52 characters, 360 bytes)' => str_repeat($family, 10) . str_repeat($family, 10),
+        'mixed widths cut on a three-byte character' => str_repeat('a', 119) . "\u{65E5}",
+        'mixed widths cut on a four-byte character' => str_repeat('a', 118) . "\u{1F600}" . 'zz',
+        'exactly 120 bytes of two-byte characters' => str_repeat("\u{00E9}", 60),
+        'one byte over: 59 two-byte characters and a three-byte one (121 bytes in 60 code points)' => str_repeat("\u{00E9}", 59) . "\u{65E5}",
+    ];
+}
+
+test('4.10.3 step 7: the phone\'s name is capped at 120 bytes, between code points, whatever it is made of: the shipped phone refuses a longer display name and would never connect', function () {
+    [$r, $d] = pair_setup();
+    $n = 0;
+    foreach (pair_long_names() as $label => $name) {
+        $c = Ceremony::random($r, $d);
+        $c->phoneName = $name;
+        $c->open();
+        $c->answer();
+        $res = $c->decide();
+        eq(200, $res['status'], "$label: " . $res['body']);
+        $stored = (string)$r->ctx()->db->val('SELECT name FROM devices WHERE id = ?', [$res['json']['deviceId']]);
+        ok(strlen($stored) <= 120, "$label: " . strlen($stored) . ' bytes');
+        eq(1, preg_match('//u', $stored), "$label: valid UTF-8");
+        ok($stored !== '' && strncmp(trim($name), $stored, strlen($stored)) === 0, "$label: what is kept is the start of the name");
+        preg_match('/^.{0,60}/us', trim($name), $first60); // the code point cap comes first
+        ok(strlen($stored) >= min(strlen($first60[0]), 120) - 3, "$label: at most one code point was lost to the byte cut (" . strlen($stored) . ' of ' . strlen($first60[0]) . ')');
+        $n++;
+        $kept[$label] = $stored;
+    }
+    eq(9, $n);
+    eq(str_repeat("\u{00E9}", 60), $kept['exactly 120 bytes of two-byte characters'], 'a name of exactly 120 bytes is kept whole');
+    eq(str_repeat("\u{00E9}", 59), $kept['one byte over: 59 two-byte characters and a three-byte one (121 bytes in 60 code points)'], 'and one of 121 loses its last character, not more');
+});
+
 test('4.10.6 a desktop and app hold at most 16 phones (rosterMax): the 17th approval is 409; a phone that pairs again with the same key replaces its old device instead of counting twice', function () {
     [$r, $d] = pair_setup();
     $keep = null;

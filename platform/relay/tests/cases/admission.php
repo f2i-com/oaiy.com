@@ -507,6 +507,30 @@ test('4.14.2 mobile admission: unknown grants are dropped (the phone refuses an 
     eq(400, $k->r->call($ph, 'POST', '/v1/aokie-companion/admission', 'not json')['status']);
 });
 
+test('4.14.2 the display name in a phone\'s admission is at most 120 bytes, on a code point boundary, also for a name stored before the relay capped them (the shipped phone refuses a longer one and can never connect)', function () {
+    $k = AokieRig::make();
+    $ph = $k->addPhone('A');
+    $k->pushRoster();
+    $db = $k->r->ctx()->db;
+    $n = 0;
+    foreach (pair_long_names() as $label => $name) {
+        $db->exec('UPDATE devices SET name = ? WHERE id = ?', [$name, $ph->id]); // straight into the row: as an older relay stored it
+        Tmp::setClock(Relay::T0 + 61 * $n++);
+        $res = $k->mobile($ph);
+        eq(200, $res['status'], "$label: " . $res['body']);
+        $shown = $res['json']['device']['displayName'];
+        ok(strlen($shown) <= 120, "$label: " . strlen($shown) . ' bytes');
+        eq(1, preg_match('//u', $shown), "$label: valid UTF-8");
+        ok($shown !== '' && strncmp(trim($name), $shown, strlen($shown)) === 0, "$label: the start of the name");
+    }
+    $db->exec('UPDATE devices SET name = ? WHERE id = ?', ["\x01\x02", $ph->id]);
+    Tmp::setClock(Relay::T0 + 61 * $n);
+    eq('Phone', $k->mobile($ph)['json']['device']['displayName'], 'a name that is nothing once cleaned is Phone');
+    $db->exec('UPDATE devices SET name = ? WHERE id = ?', ['0', $ph->id]);
+    Tmp::setClock(Relay::T0 + 61 * ($n + 1));
+    eq('0', $k->mobile($ph)['json']['device']['displayName'], 'and the name 0 is a name');
+});
+
 test('4.14.2 who may ask: the desktop for the plugin, a phone for itself; a provider, the admin token and no credential may not; a revoked phone is 401 revoked', function () {
     $k = AokieRig::make();
     $ph = $k->addPhone();

@@ -249,7 +249,9 @@ final class AdmissionApi
         }
         $claims = Admission::mobileClaims($appId, $p->id, $holder, $peer, $scopes, $own, $now);
         $iso = static fn(int $t): string => gmdate('Y-m-d\TH:i:s\Z', $t);
-        $name = $p->name() !== '' ? $p->name() : 'Phone';
+        // The phone refuses a display name of more than 120 bytes, and a name stored before the relay capped them may be longer.
+        $name = Ids::cleanName($p->name(), 60);
+        $name = $name !== '' ? $name : 'Phone';
         $seen = $d['last_seen_at'] ?? null;
         return [
             'role' => 'mobile', 'appId' => $appId, 'subjectId' => $p->id, 'claims' => $claims,
