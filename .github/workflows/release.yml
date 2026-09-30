@@ -46,8 +46,10 @@
 # Verification (ecosystem review OAI-01 / ECO-01): every artifact is built
 # from ONE resolved revision, and publication depends on the reusable CI gate
 # (ci.yml via workflow_call) having passed AT THAT REVISION — the web suite,
-# the complete CLI test script and typecheck, the desktop Vitest suite and the
-# native Rust tests in both the headless and GUI configurations. A manual
+# the complete CLI test script and typecheck, the desktop Vitest suite, the
+# native Rust tests in both the headless and GUI configurations, and the two vault
+# crates (oaiy-crypto and oaiy-keystore: the vault-linux and vault-windows lanes of
+# ci.yml: format, clippy, tests, memory probes and a dependency audit). A manual
 # dispatch cannot substitute an older green run: the gate runs fresh, on the
 # commit that is built. Each artifact ships with release-evidence.json naming
 # the revision, target, features, toolchain, artifact digests and the smoke
@@ -268,7 +270,7 @@ jobs:
               // incomplete or failed run therefore never claims a passing verification.
               // (No apostrophes in these comments: they sit inside a single-quoted shell string.)
               verification: { status: "unverified", gate: ".github/workflows/ci.yml@" + process.env.REVISION },
-              dependencyAudit: { status: "pending", tool: "npm audit --audit-level=high (ci.yml: ui, cli, desktop)", level: "high", revision: process.env.REVISION },
+              dependencyAudit: { status: "pending", tool: "npm audit --audit-level=high (ci.yml: ui, cli, desktop); cargo audit --deny warnings (ci.yml: vault-linux, the vault crates)", level: "high", revision: process.env.REVISION },
               artifacts: files, builtAt: new Date().toISOString(),
             }, null, 2) + "\n");
           '
@@ -511,8 +513,8 @@ jobs:
               // The Node version comes from the runtime itself (an unexported shell variable used to leave it empty).
               toolchain: { rustc: process.argv[1], cargo: process.argv[2], node: process.version },
               // Attested by the release job after the gate passed (see the note in the web job).
-              verification: { status: "unverified", gate: ".github/workflows/ci.yml@" + process.env.REVISION + " (web, cli npm test + typecheck, desktop vitest, cargo test headless + gui, npm audit high)" },
-              dependencyAudit: { status: "pending", tool: "npm audit --audit-level=high (ci.yml: ui, cli, desktop)", level: "high", revision: process.env.REVISION },
+              verification: { status: "unverified", gate: ".github/workflows/ci.yml@" + process.env.REVISION + " (web, cli npm test + typecheck, desktop vitest, cargo test headless + gui, vault crates: cargo test + clippy + memory probes, npm audit high, cargo audit of the vault crates)" },
+              dependencyAudit: { status: "pending", tool: "npm audit --audit-level=high (ci.yml: ui, cli, desktop); cargo audit --deny warnings (ci.yml: vault-linux, the vault crates)", level: "high", revision: process.env.REVISION },
               tests: {
                 cliHttpsShutdown: "node test/cli-http-exit.mjs", stagedHeadlessSmoke: "smoke-server.mjs headless-dist",
                 extractedHeadlessSmoke: "smoke-server.mjs headless-verified (fresh profile, no system Node)",
