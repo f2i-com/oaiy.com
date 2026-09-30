@@ -643,6 +643,25 @@ fn the_scan_of_the_source_follows_every_route_it_meets() {
 }
 
 #[test]
+fn every_route_of_the_main_router_is_under_api_so_that_the_guard_covers_it() {
+    // The guard judges what `axum` matched, and a path outside `/api/` that no route answers is not under it
+    // (the static UI of a later step does its own checks). A route added outside `/api/` would be served
+    // with no credential: it must be a deliberate change here.
+    let s = scan_main_router();
+    let outside: Vec<String> = s
+        .found
+        .iter()
+        .filter(|f| !f.pattern.starts_with("/api/"))
+        .map(|f| format!("{} {} ({}:{})", f.verb.as_str(), f.pattern, f.file, f.line))
+        .collect();
+    assert!(
+        outside.is_empty(),
+        "routes outside /api/ are not behind the guard:\n{}",
+        outside.join("\n")
+    );
+}
+
+#[test]
 fn every_route_in_the_source_has_a_row_in_the_table() {
     let s = scan_main_router();
     let c = compare(&s.found, ROUTES);
@@ -673,8 +692,24 @@ fn the_walker_finds_the_routes_the_design_counted_and_the_ones_added_since() {
         .map(|f| (f.verb, f.pattern.clone()))
         .collect();
     // The design's Appendix B counted 161 pairs on the main router; the four below are routes the
-    // code has gained since (the plugin trust route and three update routes).
-    assert_eq!(pairs.len(), 165, "main-router (method, path) pairs");
+    // code has gained since (the plugin trust route and three update routes), and the three routes of
+    // `/api/auth/` that the access model has built so far are the rows with `since: 2` that exist.
+    assert_eq!(pairs.len(), 165 + 3, "main-router (method, path) pairs");
+    let mut built: Vec<String> = ROUTES
+        .iter()
+        .filter(|r| r.since == 2 && pairs.contains(&(r.method, r.pattern.to_string())))
+        .map(|r| r.key())
+        .collect();
+    built.sort();
+    assert_eq!(
+        built,
+        [
+            "GET /api/auth/info",
+            "GET /api/auth/whoami",
+            "POST /api/auth/derive"
+        ],
+        "the routes of the model that exist"
+    );
     for (verb, pattern) in [
         (Verb::Get, "/api/health"),
         (Verb::Post, "/api/plugins/:id/trust"),

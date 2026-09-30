@@ -17,8 +17,19 @@ use std::path::Path;
 use super::route_coverage::{strip_test_items, tokenize, Tok, Token};
 
 /// Words in a name that say the value is, or is derived from, a secret.
-const SECRET_WORDS: [&str; 9] = [
-    "hash", "secret", "csrf", "password", "digest", "mac", "code", "token", "cookie",
+const SECRET_WORDS: [&str; 12] = [
+    "hash",
+    "secret",
+    "csrf",
+    "password",
+    "digest",
+    "mac",
+    "code",
+    "token",
+    "cookie",
+    "presented",
+    "want",
+    "expected",
 ];
 /// Endings that say the value is about a secret, not a secret: a length, a count, a kind.
 const HARMLESS_ENDINGS: [&str; 7] = ["len", "size", "count", "kind", "epoch", "ms", "id"];
@@ -306,6 +317,19 @@ fn the_comparison_helpers_are_built_on_subtles_ct_eq() {
             .iter()
             .any(|x| matches!(&x.tok, Tok::Ident(n) if n == "hashes_equal")),
         "the store must compare hashes with hashes_equal"
+    );
+}
+
+#[test]
+fn the_guard_compares_the_environment_token_in_constant_time() {
+    let (_, t) = auth_code()
+        .into_iter()
+        .find(|(n, _)| n == "guard.rs")
+        .unwrap();
+    assert!(
+        t.iter()
+            .any(|x| matches!(&x.tok, Tok::Ident(n) if n == "secrets_equal")),
+        "guard.rs must compare the static token with secrets_equal"
     );
 }
 

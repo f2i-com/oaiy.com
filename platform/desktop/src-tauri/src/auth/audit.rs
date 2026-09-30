@@ -300,6 +300,26 @@ impl AuditLog {
         self.write_noise(closed);
     }
 
+    /// Write the buckets of minutes that are over (the periodic upkeep of a running server).
+    pub fn flush_closed(&self) {
+        let now = self.clock.now_ms();
+        let minute = now - now % 60_000;
+        let closed: Vec<_> = {
+            let mut state = self.noise.lock().unwrap_or_else(|e| e.into_inner());
+            let stale: Vec<_> = state
+                .buckets
+                .keys()
+                .filter(|(_, _, m)| *m < minute)
+                .cloned()
+                .collect();
+            stale
+                .into_iter()
+                .filter_map(|k| state.buckets.remove(&k).map(|b| (k, b)))
+                .collect()
+        };
+        self.write_noise(closed);
+    }
+
     /// Write every bucket, closed or not (at shutdown, and for the tests).
     pub fn flush_noise(&self) {
         let closed: Vec<_> = {
@@ -399,7 +419,7 @@ fn global() -> &'static RwLock<Option<Arc<AuditLog>>> {
 }
 
 /// Make `log` the one [`critical`] and [`noise`] write to.
-pub fn install(log: Arc<AuditLog>) {
+pub fn use_log(log: Arc<AuditLog>) {
     *global().write().unwrap_or_else(|e| e.into_inner()) = Some(log);
 }
 
@@ -823,7 +843,7 @@ mod tests {
             !dir.0.join("auth").join("audit.jsonl").exists(),
             "nothing installed, nothing written"
         );
-        install(Arc::new(log(&dir, &clock)));
+        use_log(Arc::new(log(&dir, &clock)));
         critical(
             "relay.paired",
             Some(&actor()),

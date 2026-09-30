@@ -1,0 +1,2345 @@
+//! The new guard, end to end, in process: the pipeline of design 3.5 over a stub router built from the route
+//! table (every row answers `200 ok` when the guard lets it through), with real credentials from a real store.
+//!
+//! The rules it holds are the design's: the guard matrix (T1), no Origin trust (T2, T3), the Host allow-list
+//! (T5), bearer fuzzing (T11), origin binding (T15), CORS (T16), the failed-bearer throttle (T53), the modes
+//! (T37), the derive rules (T12) and the exposure checks (T45). The differential test of `legacy` mode is in
+//! `http/legacy_neutrality.rs`.
+
+use std::net::SocketAddr;
+use std::sync::Arc;
+
+use axum::body::Body;
+use axum::extract::ConnectInfo;
+use axum::http::{HeaderMap, Method, Request};
+use axum::middleware;
+use axum::routing::any;
+use axum::Router;
+use serde_json::Value;
+use tower::ServiceExt;
+
+use super::api;
+use super::audit::{AuditLog, LogFile};
+use super::clock::ManualClock;
+use super::guard::{scoped_cors, scoped_guard, Guard, GuardConfig};
+use super::mode::AccessMode;
+use super::presets::{App, Preset, ALL_PRESETS};
+use super::routes::{Class, DeskRole, Only, ROUTES};
+use super::scopes::ScopeSet;
+use super::store::{AuthStore, MintSpec};
+use super::token::Kind;
+use crate::secret_file::testing::TempDir;
+
+const T0: u64 = 1_790_000_000_000;
+const DAY: u64 = 86_400_000;
+const STATIC_TOKEN: &str = "abcdefghijklmnopqrstuvwxyz0123456789ABCD";
+const DESK_ORIGIN: &str = "tauri://localhost";
+
+/// The routes of the table that are real handlers (`api.rs`): the stub leaves them to it.
+const REAL: [&str; 3] = ["/api/auth/info", "/api/auth/whoami", "/api/auth/derive"];
+
+/// A route that exists and has no row: added without one.
+const UNCLASSIFIED: &str = "/api/zz/added-without-a-row";
+
+struct Env {
+    guard: Arc<Guard>,
+    store: Arc<AuthStore>,
+    clock: Arc<ManualClock>,
+    app: Router,
+    audit: Arc<AuditLog>,
+    _dir: TempDir,
+}
+
+fn env_with(
+    mode: AccessMode,
+    vars: &[(&str, &str)],
+    bind_all: bool,
+    gui: bool,
+    static_token: Option<&str>,
+) -> Env {
+    let dir = TempDir::new("guard-tests");
+    let clock = Arc::new(ManualClock::new(T0));
+    let map: std::collections::BTreeMap<String, String> = vars
+        .iter()
+        .map(|(k, v)| (k.to_string(), v.to_string()))
+        .collect();
+    let (config, warnings) =
+        GuardConfig::from_env(&move |n| map.get(n).cloned(), bind_all, gui, 17972);
+    assert!(warnings.is_empty(), "{warnings:?}");
+    let store = Arc::new(AuthStore::memory(clock.clone()));
+    let audit = Arc::new(AuditLog::open(&dir.0.join("auth"), clock.clone(), false));
+    let guard = Arc::new(Guard::new(
+        mode,
+        config,
+        store.clone(),
+        static_token.map(str::to_owned),
+        Some(audit.clone()),
+        clock.clone(),
+    ));
+    let mut patterns: Vec<&str> = ROUTES
+        .iter()
+        .map(|r| r.pattern)
+        .filter(|p| !REAL.contains(p))
+        .collect();
+    patterns.sort_unstable();
+    patterns.dedup();
+    let mut app = Router::new();
+    for p in patterns {
+        app = app.route(p, any(|| async { "ok" }));
+    }
+    let app = app
+        .route(UNCLASSIFIED, any(|| async { "ok" }))
+        .merge(api::router(guard.clone()))
+        .layer(middleware::from_fn_with_state(guard.clone(), scoped_guard))
+        .layer(middleware::from_fn_with_state(guard.clone(), scoped_cors));
+    Env {
+        guard,
+        store,
+        clock,
+        app,
+        audit,
+        _dir: dir,
+    }
+}
+
+/// A desktop-shaped install: loopback, the desktop's own windows, the static token configured.
+fn env(mode: AccessMode) -> Env {
+    env_with(mode, &[], false, true, Some(STATIC_TOKEN))
+}
+
+fn concrete(pattern: &str) -> String {
+    pattern
+        .split('/')
+        .map(|s| {
+            if s.starts_with(':') || s.starts_with('*') {
+                "x"
+            } else {
+                s
+            }
+        })
+        .collect::<Vec<_>>()
+        .join("/")
+}
+
+#[derive(Clone)]
+struct Send {
+    method: Method,
+    path: String,
+    headers: Vec<(String, String)>,
+    peer: Option<SocketAddr>,
+    body: Option<String>,
+}
+
+fn send(method: Method, path: &str) -> Send {
+    Send {
+        method,
+        path: path.to_string(),
+        headers: vec![("host".into(), "localhost:17972".into())],
+        peer: Some("127.0.0.1:50000".parse().unwrap()),
+        body: None,
+    }
+}
+
+impl Send {
+    fn h(mut self, name: &str, value: &str) -> Send {
+        self.headers.retain(|(n, _)| !n.eq_ignore_ascii_case(name));
+        self.headers.push((name.to_string(), value.to_string()));
+        self
+    }
+
+    fn add(mut self, name: &str, value: &str) -> Send {
+        self.headers.push((name.to_string(), value.to_string()));
+        self
+    }
+
+    fn bearer(self, token: &str) -> Send {
+        self.h("authorization", &format!("Bearer {token}"))
+    }
+
+    fn peer(mut self, addr: &str) -> Send {
+        self.peer = Some(addr.parse().unwrap());
+        self
+    }
+
+    fn json(mut self, body: &str) -> Send {
+        self.body = Some(body.to_string());
+        self.h("content-type", "application/json")
+    }
+}
+
+struct Reply {
+    status: u16,
+    headers: HeaderMap,
+    text: String,
+}
+
+impl Reply {
+    fn json(&self) -> Value {
+        serde_json::from_str(&self.text).unwrap_or(Value::Null)
+    }
+
+    fn code(&self) -> Option<String> {
+        self.json()["error"]["code"].as_str().map(str::to_owned)
+    }
+}
+
+async fn go(env: &Env, s: Send) -> Reply {
+    let mut req = Request::builder().method(s.method).uri(&s.path);
+    for (n, v) in &s.headers {
+        req = req.header(n.as_str(), v.as_str());
+    }
+    let mut req = req.body(Body::from(s.body.unwrap_or_default())).unwrap();
+    if let Some(peer) = s.peer {
+        req.extensions_mut().insert(ConnectInfo(peer));
+    }
+    let response = env.app.clone().oneshot(req).await.unwrap();
+    let status = response.status().as_u16();
+    let headers = response.headers().clone();
+    let text = String::from_utf8_lossy(
+        &axum::body::to_bytes(response.into_body(), 1 << 20)
+            .await
+            .unwrap(),
+    )
+    .into_owned();
+    Reply {
+        status,
+        headers,
+        text,
+    }
+}
+
+fn native_pat(env: &Env, scopes: ScopeSet, ttl: u64) -> String {
+    env.store
+        .mint(MintSpec::new(Kind::Pat, "test token", scopes, ttl))
+        .unwrap()
+        .token
+}
+
+fn browser_pat(env: &Env, origin: &str, scopes: &[&str]) -> String {
+    let mut s = MintSpec::new(Kind::Pat, "test app", ScopeSet::of(scopes), 30 * DAY);
+    s.origins = vec![origin.into()];
+    env.store.mint(s).unwrap().token
+}
+
+fn desk(env: &Env, app: App, preset: Preset, origins: &[&str]) -> String {
+    let mut s = MintSpec::new(Kind::Dsk, "webview", preset.scopes(), DAY);
+    s.app = Some(app);
+    s.preset = Some(preset);
+    s.origins = origins.iter().map(|o| o.to_string()).collect();
+    env.store.mint(s).unwrap().token
+}
+
+/// The methods a row is asked with.
+fn methods(verb: super::routes::Verb) -> Vec<Method> {
+    use super::routes::Verb;
+    match verb {
+        Verb::Get => vec![Method::GET, Method::HEAD],
+        Verb::Post => vec![Method::POST],
+        Verb::Put => vec![Method::PUT],
+        Verb::Patch => vec![Method::PATCH],
+        Verb::Delete => vec![Method::DELETE],
+        Verb::Any => vec![
+            Method::GET,
+            Method::POST,
+            Method::PUT,
+            Method::PATCH,
+            Method::DELETE,
+        ],
+    }
+}
+
+/// Every `(method, path, class)` of the table that the stub router serves.
+fn table() -> Vec<(Method, String, Class, &'static str)> {
+    let mut out = Vec::new();
+    for r in ROUTES.iter().filter(|r| !REAL.contains(&r.pattern)) {
+        for m in methods(r.method) {
+            out.push((m, concrete(r.pattern), r.class, r.pattern));
+        }
+    }
+    out
+}
+
+// ==================================== T1: the guard matrix =======================================
+
+#[tokio::test]
+async fn t1_no_credential_gets_401_on_every_route_that_is_not_public_and_the_public_ones_answer() {
+    for mode in [AccessMode::Scoped, AccessMode::Shadow] {
+        let e = env(mode);
+        let mut refused = 0;
+        for (m, p, class, pattern) in table() {
+            let r = go(&e, send(m.clone(), &p)).await;
+            if class == Class::Public {
+                assert_eq!(r.status, 200, "{mode:?} {m} {pattern}");
+            } else {
+                assert_eq!(
+                    (r.status, r.code().as_deref()),
+                    (401, Some("auth_required")),
+                    "{mode:?} {m} {pattern}: {}",
+                    r.text
+                );
+                assert_eq!(
+                    r.headers.get("www-authenticate").unwrap(),
+                    "Bearer realm=\"oaiy\""
+                );
+                refused += 1;
+            }
+        }
+        assert!(refused > 240, "{refused} routes refused");
+    }
+}
+
+#[tokio::test]
+async fn t1_a_malformed_an_unknown_a_wrong_an_expired_and_a_revoked_credential_are_told_apart_exactly(
+) {
+    let e = env(AccessMode::Scoped);
+    let good = native_pat(&e, ScopeSet::of(&["system.read"]), DAY);
+    let parsed = super::token::parse(&good).unwrap();
+    let wrong_secret = format!("oaiypat_{}_{}", parsed.id, "A".repeat(43));
+    let unknown_id = format!("oaiypat_{}_{}", "f".repeat(16), parsed.secret);
+    let expired = native_pat(&e, ScopeSet::of(&["system.read"]), 1000);
+    let revoked = e
+        .store
+        .mint(MintSpec::new(
+            Kind::Pat,
+            "r",
+            ScopeSet::of(&["system.read"]),
+            DAY,
+        ))
+        .unwrap();
+    e.store.revoke(&revoked.id, "revoked");
+    e.clock.advance(2000);
+    let mut checked = 0;
+    for (m, p, class, pattern) in table()
+        .into_iter()
+        .filter(|(_, _, c, _)| *c != Class::Public)
+    {
+        let expect = |token: &str, status: u16, code: &str| {
+            let (e, m, p, token, code) = (
+                &e,
+                m.clone(),
+                p.clone(),
+                token.to_string(),
+                code.to_string(),
+            );
+            async move {
+                let r = go(e, send(m.clone(), &p).bearer(&token)).await;
+                assert_eq!(
+                    (r.status, r.code().unwrap_or_default()),
+                    (status, code.clone()),
+                    "{m} {pattern}: {}",
+                    r.text
+                );
+                r
+            }
+        };
+        // Right id with the wrong secret and an id nobody has are the same answer, byte for byte.
+        let a = expect(&wrong_secret, 401, "token_invalid").await;
+        let b = expect(&unknown_id, 401, "token_invalid").await;
+        assert_eq!(
+            a.text, b.text,
+            "an unknown id and a wrong secret are indistinguishable"
+        );
+        let r = expect(&expired, 401, "token_expired").await;
+        assert_eq!(
+            r.headers.get("www-authenticate").unwrap(),
+            "Bearer realm=\"oaiy\", error=\"invalid_token\""
+        );
+        expect(&revoked.token, 401, "token_revoked").await;
+        assert_eq!(
+            go(&e, send(m.clone(), &p).bearer("!!bad")).await.status,
+            400
+        );
+        let _ = class;
+        checked += 1;
+        if checked > 60 {
+            break;
+        }
+    }
+}
+
+/// The scopes a preset holds, as the route rows see them.
+fn expected_status(
+    class: &Class,
+    preset: Preset,
+    kind_desk: Option<App>,
+) -> (u16, Option<&'static str>) {
+    match class {
+        Class::Public | Class::AnyCredential => (200, None),
+        Class::Console | Class::Session { .. } => (403, Some("insufficient_scope")),
+        Class::Desk { roles } => match kind_desk {
+            Some(app)
+                if roles.contains(&match app {
+                    App::Dash => DeskRole::Dashboard,
+                    App::Agent => DeskRole::Agent,
+                    App::Flows => DeskRole::Flows,
+                }) =>
+            {
+                (200, None)
+            }
+            _ => (403, Some("insufficient_scope")),
+        },
+        Class::Scope(s) => {
+            if preset.scopes().contains(s) {
+                (200, None)
+            } else {
+                (403, Some("insufficient_scope"))
+            }
+        }
+        Class::Unclassified => (403, Some("unclassified_route")),
+    }
+}
+
+#[tokio::test]
+async fn t1_exactly_the_routes_of_a_preset_succeed_for_a_credential_with_that_preset() {
+    let e = env(AccessMode::Scoped);
+    let mut total = 0usize;
+    for preset in ALL_PRESETS {
+        // Every preset but `owner` is a paired token (a native one: the dangerous scopes of `cli-admin` for a
+        // day); `owner` is the dashboard's desk credential, from loopback with its own origin. The ceremony
+        // token is browser-bound and used once.
+        let (token, origin, desk_app) = match preset {
+            Preset::Owner => (
+                desk(&e, App::Dash, Preset::Owner, &[DESK_ORIGIN]),
+                Some(DESK_ORIGIN),
+                Some(App::Dash),
+            ),
+            Preset::Ceremony => {
+                let mut s = MintSpec::new(Kind::Pat, "ceremony", preset.scopes(), 5 * 60_000);
+                s.origins = vec!["https://app.example".into()];
+                s.max_uses = Some(1);
+                (
+                    e.store.mint(s).unwrap().token,
+                    Some("https://app.example"),
+                    None,
+                )
+            }
+            _ => (native_pat(&e, preset.scopes(), DAY), None, None),
+        };
+        for (m, p, class, pattern) in table() {
+            let mut s = send(m.clone(), &p).bearer(&token);
+            if let Some(o) = origin {
+                s = s.h("origin", o);
+            }
+            let r = go(&e, s).await;
+            let (status, code) = expected_status(&class, preset, desk_app);
+            assert_eq!(
+                (r.status, r.code().as_deref()),
+                (status, code),
+                "{} {m} {pattern}: {}",
+                preset.name(),
+                r.text
+            );
+            if let Class::Scope(scope) = class {
+                if status == 403 {
+                    assert_eq!(
+                        r.json()["required"],
+                        scope,
+                        "{} {m} {pattern}",
+                        preset.name()
+                    );
+                    assert!(r
+                        .headers
+                        .get("www-authenticate")
+                        .unwrap()
+                        .to_str()
+                        .unwrap()
+                        .contains(&format!("scope=\"{scope}\"")));
+                }
+            }
+            total += 1;
+        }
+    }
+    assert!(total > 3000, "{total} requests");
+}
+
+#[tokio::test]
+async fn t1_the_environment_token_is_the_cli_preset_on_every_install_and_never_more() {
+    let e = env(AccessMode::Scoped);
+    for (m, p, class, pattern) in table() {
+        let r = go(&e, send(m.clone(), &p).bearer(STATIC_TOKEN)).await;
+        let (status, code) = expected_status(&class, Preset::Cli, None);
+        assert_eq!(
+            (r.status, r.code().as_deref()),
+            (status, code),
+            "{m} {pattern}"
+        );
+    }
+    // In particular it never reaches a dangerous route or anything under auth.
+    for (m, p) in [
+        (Method::POST, "/api/services"),
+        (Method::POST, "/api/plugins/install"),
+        (Method::GET, "/api/bridge/pairing"),
+        (Method::POST, "/api/bridge/pairing/x/approve"),
+        (Method::PUT, "/api/secrets/hf-token"),
+    ] {
+        assert_eq!(go(&e, send(m, p).bearer(STATIC_TOKEN)).await.status, 403);
+    }
+    // A wrong static-looking token is a token that is not valid.
+    assert_eq!(
+        go(
+            &e,
+            send(Method::GET, "/api/config").bearer("abcdefghijklmnopqrstuvwxyz0123456789ABCE")
+        )
+        .await
+        .code()
+        .as_deref(),
+        Some("token_invalid")
+    );
+}
+
+#[tokio::test]
+async fn t1_a_route_that_exists_without_a_row_is_refused_for_everyone_and_a_route_that_is_not_there_is_401_or_404(
+) {
+    let e = env(AccessMode::Scoped);
+    let owner = desk(&e, App::Dash, Preset::Owner, &[DESK_ORIGIN]);
+    for token in [None, Some(STATIC_TOKEN.to_string()), Some(owner)] {
+        let mut s = send(Method::GET, UNCLASSIFIED).h("origin", DESK_ORIGIN);
+        if let Some(t) = &token {
+            s = s.bearer(t);
+        }
+        let r = go(&e, s.clone()).await;
+        // The desk credential needs its origin, the environment token refuses one: judge the row, not the binding.
+        if token.as_deref() == Some(STATIC_TOKEN) {
+            assert_eq!(
+                go(&e, send(Method::GET, UNCLASSIFIED).bearer(STATIC_TOKEN))
+                    .await
+                    .code()
+                    .as_deref(),
+                Some("unclassified_route")
+            );
+        } else {
+            assert_eq!(
+                (r.status, r.code().as_deref()),
+                (403, Some("unclassified_route")),
+                "{:?}",
+                token.is_some()
+            );
+        }
+    }
+    // A path with no route at all: 401 for a stranger, 404 for someone who is who they say they are.
+    let r = go(&e, send(Method::GET, "/api/no/such/route")).await;
+    assert_eq!(
+        (r.status, r.code().as_deref()),
+        (401, Some("auth_required"))
+    );
+    let r = go(
+        &e,
+        send(Method::GET, "/api/no/such/route").bearer(STATIC_TOKEN),
+    )
+    .await;
+    assert_eq!((r.status, r.code().as_deref()), (404, Some("not_found")));
+    let r = go(&e, send(Method::POST, "/api/no/such/route").bearer("!!")).await;
+    assert_eq!(r.status, 400);
+    let r = go(
+        &e,
+        send(Method::GET, "/api/no/such/route")
+            .bearer("oaiypat_0123456789abcdef_AAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8"),
+    )
+    .await;
+    assert_eq!(
+        (r.status, r.code().as_deref()),
+        (401, Some("token_invalid")),
+        "a route that is not there does not tell a stranger it is not there"
+    );
+}
+
+#[tokio::test]
+async fn a_path_outside_the_api_that_no_route_answers_is_not_under_the_guard() {
+    let e = env(AccessMode::Scoped);
+    assert_eq!(go(&e, send(Method::GET, "/")).await.status, 404);
+    assert_eq!(go(&e, send(Method::GET, "/favicon.ico")).await.status, 404);
+    // And it gets no `no-store`: only the API does.
+    assert!(go(&e, send(Method::GET, "/"))
+        .await
+        .headers
+        .get("cache-control")
+        .is_none());
+}
+
+#[tokio::test]
+async fn every_answer_of_the_api_is_never_cached_and_never_sniffed() {
+    let e = env(AccessMode::Scoped);
+    for (m, p) in [
+        (Method::GET, "/api/health"),
+        (Method::GET, "/api/config"),
+        (Method::GET, "/api/no/such"),
+    ] {
+        let r = go(&e, send(m, p)).await;
+        assert_eq!(r.headers.get("cache-control").unwrap(), "no-store", "{p}");
+        assert_eq!(
+            r.headers.get("x-content-type-options").unwrap(),
+            "nosniff",
+            "{p}"
+        );
+    }
+    let r = go(&e, send(Method::GET, "/api/config").bearer(STATIC_TOKEN)).await;
+    assert_eq!(r.status, 200);
+    assert_eq!(r.headers.get("cache-control").unwrap(), "no-store");
+}
+
+#[tokio::test]
+async fn a_method_the_api_does_not_serve_is_405() {
+    let e = env(AccessMode::Scoped);
+    for m in ["TRACE", "CONNECT", "BREW", "PROPFIND"] {
+        let r = go(
+            &e,
+            send(Method::from_bytes(m.as_bytes()).unwrap(), "/api/config").bearer(STATIC_TOKEN),
+        )
+        .await;
+        assert_eq!(
+            (r.status, r.code().as_deref()),
+            (405, Some("method_not_allowed")),
+            "{m}"
+        );
+    }
+}
+
+// ============================= T2, T3: Origin is never a credential ==============================
+
+#[tokio::test]
+async fn t2_no_former_trusted_origin_is_a_credential_for_a_read_or_a_write() {
+    for mode in [AccessMode::Scoped, AccessMode::Shadow] {
+        let e = env(mode);
+        for origin in [
+            "https://oaiy.com",
+            "https://x.oaiy.com",
+            "http://localhost:3000",
+            "http://127.0.0.1:5173",
+            "http://tauri.localhost",
+            "tauri://localhost",
+            "http://oaiy.localhost",
+            "oaiy://localhost",
+            "http://oaiyflows.localhost",
+            "http://formlogic.local",
+            "null",
+            "http://evil.example",
+        ] {
+            for (m, p, class, pattern) in table() {
+                if class == Class::Public {
+                    continue;
+                }
+                let r = go(&e, send(m.clone(), &p).h("origin", origin)).await;
+                assert_eq!(
+                    (r.status, r.code().as_deref()),
+                    (401, Some("auth_required")),
+                    "{mode:?} origin {origin} {m} {pattern}"
+                );
+            }
+        }
+    }
+}
+
+#[tokio::test]
+async fn t3_a_mutation_with_a_forged_origin_and_no_credential_is_401_where_the_old_guard_passed_it()
+{
+    let e = env(AccessMode::Scoped);
+    // The old guard, in a GUI, let a non-privileged mutation with an allowed Origin through with no credential.
+    for (m, p) in [
+        (Method::POST, "/api/services/x/start"),
+        (Method::POST, "/api/bridge/leases/answer-calls"),
+        (Method::POST, "/api/services/ensure-by-port"),
+        (Method::POST, "/api/models/downloads/x/pause"),
+    ] {
+        for origin in [
+            "http://localhost:3000",
+            "https://x.oaiy.com",
+            "tauri://localhost",
+        ] {
+            let r = go(&e, send(m.clone(), p).h("origin", origin).json("{}")).await;
+            assert_eq!(r.status, 401, "{m} {p} {origin}");
+        }
+    }
+}
+
+// =============================================== T5: Host ========================================
+
+#[tokio::test]
+async fn t5_the_host_allow_list_stops_rebinding_and_accepts_loopback_names_on_any_port() {
+    let e = env(AccessMode::Scoped);
+    let with_host = |host: &str| {
+        send(Method::GET, "/api/config")
+            .bearer(STATIC_TOKEN)
+            .h("host", host)
+    };
+    // A rebound page carries its own name: 421, from a loopback peer.
+    for host in [
+        "evil.example:17972",
+        "evil.example",
+        "127.0.0.1.evil.example:17972",
+        "localhost.evil.example",
+    ] {
+        let r = go(&e, with_host(host)).await;
+        assert_eq!(
+            (r.status, r.code().as_deref()),
+            (421, Some("misdirected_host")),
+            "{host}"
+        );
+    }
+    // Loopback names are accepted on any port: an SSH tunnel, a Docker port mapping.
+    for host in [
+        "localhost:17972",
+        "localhost:9999",
+        "127.0.0.1:2222",
+        "127.0.0.1",
+        "[::1]:17972",
+        "LOCALHOST:8080",
+    ] {
+        assert_eq!(go(&e, with_host(host)).await.status, 200, "{host}");
+    }
+    // No Host at all, and junk.
+    let mut no_host = with_host("x");
+    no_host.headers.retain(|(n, _)| n != "host");
+    assert_eq!(go(&e, no_host).await.status, 421);
+    assert_eq!(go(&e, with_host("a b")).await.status, 421);
+    // Health is exempt: a probe's Host is a pod address.
+    let probe = send(Method::GET, "/api/health")
+        .h("host", "10.42.0.7:17972")
+        .peer("10.42.0.1:40000");
+    assert_eq!(go(&e, probe.clone()).await.status, 200);
+    assert_eq!(
+        go(
+            &e,
+            Send {
+                method: Method::HEAD,
+                ..probe
+            }
+        )
+        .await
+        .status,
+        200
+    );
+    // Nothing else is: the same address on any other route is misdirected.
+    let r = go(
+        &e,
+        send(Method::GET, "/api/bridge/capabilities")
+            .h("host", "10.42.0.7:17972")
+            .peer("10.42.0.1:40000"),
+    )
+    .await;
+    assert_eq!(r.status, 421);
+}
+
+// ================================= T11: bearer fuzzing, no lookup ================================
+
+#[tokio::test]
+async fn t11_a_hostile_authorization_header_is_a_400_before_any_lookup_and_is_never_counted_as_a_guess(
+) {
+    // A proxied install so that the throttle applies to this peer, and any lookup that fails would count.
+    let e = env_with(
+        AccessMode::Scoped,
+        &[("OAIY_PUBLIC_URL", "https://dash.example.com")],
+        false,
+        false,
+        None,
+    );
+    let secure = |m: Method, p: &str| {
+        send(m, p)
+            .peer("203.0.113.9:40000")
+            .h("host", "dash.example.com")
+            .add("x-forwarded-for", "203.0.113.9")
+            .add("x-forwarded-proto", "https")
+    };
+    let good = "oaiypat_0123456789abcdef_AAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8";
+    let cases: Vec<(&str, Vec<(String, String)>)> = vec![
+        (
+            "two headers",
+            vec![
+                ("authorization".into(), format!("Bearer {good}")),
+                ("authorization".into(), "Bearer x".into()),
+            ],
+        ),
+        (
+            "129 bytes",
+            vec![(
+                "authorization".into(),
+                format!("Bearer {}", "a".repeat(129)),
+            )],
+        ),
+        (
+            "a space inside",
+            vec![("authorization".into(), "Bearer abc def".into())],
+        ),
+        (
+            "wrong-case scheme",
+            vec![("authorization".into(), format!("bearer {good}"))],
+        ),
+        (
+            "Basic",
+            vec![("authorization".into(), "Basic dXNlcjpwYXNz".into())],
+        ),
+        (
+            "a session token as a bearer",
+            vec![(
+                "authorization".into(),
+                "Bearer oaiyses_0123456789abcdef_AAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8"
+                    .into(),
+            )],
+        ),
+        (
+            "a device token as a bearer",
+            vec![(
+                "authorization".into(),
+                "Bearer oaiydev_0123456789abcdef_AAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8"
+                    .into(),
+            )],
+        ),
+        ("no token", vec![("authorization".into(), "Bearer ".into())]),
+    ];
+    for (name, headers) in cases {
+        for _ in 0..30 {
+            let mut s = secure(Method::GET, "/api/config");
+            for (n, v) in &headers {
+                s = s.add(n, v);
+            }
+            let r = go(&e, s).await;
+            assert_eq!(
+                (r.status, r.code().as_deref()),
+                (400, Some("bad_request")),
+                "{name}: {}",
+                r.text
+            );
+        }
+    }
+    // 240 refused headers later the address is not blocked: a 400 is no guess.
+    let r = go(
+        &e,
+        secure(Method::GET, "/api/config")
+            .bearer("oaiypat_ffffffffffffffff_AAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8"),
+    )
+    .await;
+    assert_eq!(
+        (r.status, r.code().as_deref()),
+        (401, Some("token_invalid"))
+    );
+    // A control character cannot even be put in a header by a client; the parser refuses it anyway.
+    assert!(super::token::bearer_from_headers(&[b"Bearer abc\x01def"]).is_err());
+}
+
+// ====================================== T15: origin binding ======================================
+
+#[tokio::test]
+async fn t15_a_bound_credential_is_used_only_from_its_origin_and_an_unbound_one_only_without_an_origin(
+) {
+    let e = env_with(AccessMode::Scoped, &[], false, true, None);
+    let app_token = browser_pat(&e, "https://formlogic.example", &["services.read"]);
+    let native = native_pat(&e, ScopeSet::of(&["services.read"]), DAY);
+    let get = || send(Method::GET, "/api/services");
+    // Bound, right origin: yes. Another origin, no origin, `null`: no.
+    assert_eq!(
+        go(
+            &e,
+            get()
+                .bearer(&app_token)
+                .h("origin", "https://formlogic.example")
+        )
+        .await
+        .status,
+        200
+    );
+    for origin in [
+        "https://evil.example",
+        "https://formlogic.example.evil.example",
+        "http://formlogic.example",
+        "https://FORMLOGIC.example",
+        "null",
+        "https://formlogic.example/",
+    ] {
+        let r = go(&e, get().bearer(&app_token).h("origin", origin)).await;
+        assert_eq!(
+            (r.status, r.code().as_deref()),
+            (403, Some("origin_mismatch")),
+            "{origin}"
+        );
+    }
+    let r = go(&e, get().bearer(&app_token)).await;
+    assert_eq!(
+        (r.status, r.code().as_deref()),
+        (403, Some("origin_mismatch")),
+        "a bound token with no origin"
+    );
+    // The same-origin GET carries no Origin and says so with Fetch Metadata: allowed only at the bound origin's own Host.
+    let e2 = env_with(
+        AccessMode::Scoped,
+        &[("OAIY_ALLOWED_HOSTS", "formlogic.example:17972")],
+        false,
+        true,
+        None,
+    );
+    let bound_to_own_host = browser_pat(&e2, "http://formlogic.example:17972", &["services.read"]);
+    let ok = go(
+        &e2,
+        get()
+            .bearer(&bound_to_own_host)
+            .h("host", "formlogic.example:17972")
+            .h("sec-fetch-site", "same-origin"),
+    )
+    .await;
+    assert_eq!(ok.status, 200, "{}", ok.text);
+    let cross = go(
+        &e2,
+        get()
+            .bearer(&bound_to_own_host)
+            .h("host", "formlogic.example:17972")
+            .h("sec-fetch-site", "cross-site"),
+    )
+    .await;
+    assert_eq!(cross.status, 403);
+    let none = go(
+        &e2,
+        get()
+            .bearer(&bound_to_own_host)
+            .h("host", "formlogic.example:17972"),
+    )
+    .await;
+    assert_eq!(none.status, 403);
+    // Unbound: an Origin header means a browser, and a browser may not use it.
+    assert_eq!(go(&e, get().bearer(&native)).await.status, 200);
+    for origin in [
+        "https://formlogic.example",
+        "http://localhost:3000",
+        "null",
+        "tauri://localhost",
+    ] {
+        let r = go(&e, get().bearer(&native).h("origin", origin)).await;
+        assert_eq!(
+            (r.status, r.code().as_deref()),
+            (403, Some("origin_mismatch")),
+            "{origin}"
+        );
+    }
+    // The environment token is unbound too.
+    let e3 = env(AccessMode::Scoped);
+    let r = go(
+        &e3,
+        send(Method::GET, "/api/services")
+            .bearer(STATIC_TOKEN)
+            .h("origin", "https://formlogic.example"),
+    )
+    .await;
+    assert_eq!(
+        (r.status, r.code().as_deref()),
+        (403, Some("origin_mismatch"))
+    );
+}
+
+#[tokio::test]
+async fn t15_a_desk_credential_works_only_from_a_direct_loopback_peer_with_its_own_origin() {
+    let e = env(AccessMode::Scoped);
+    let dash = desk(
+        &e,
+        App::Dash,
+        Preset::Owner,
+        &[
+            "tauri://localhost",
+            "http://tauri.localhost",
+            "https://tauri.localhost",
+        ],
+    );
+    let get = || send(Method::GET, "/api/services").bearer(&dash);
+    for origin in [
+        "tauri://localhost",
+        "http://tauri.localhost",
+        "https://tauri.localhost",
+    ] {
+        assert_eq!(
+            go(&e, get().h("origin", origin)).await.status,
+            200,
+            "{origin}"
+        );
+    }
+    // Another origin: the credential is not the origin's to use.
+    assert_eq!(
+        go(&e, get().h("origin", "http://oaiy.localhost"))
+            .await
+            .code()
+            .as_deref(),
+        Some("origin_mismatch")
+    );
+    assert_eq!(
+        go(&e, get()).await.code().as_deref(),
+        Some("origin_mismatch"),
+        "no Origin: a webview always sends one"
+    );
+    // From a peer that is not loopback, or in process: worthless (copied off the machine).
+    let r = go(
+        &e,
+        get()
+            .h("origin", "tauri://localhost")
+            .peer("192.168.1.9:40000")
+            .h("host", "localhost:17972"),
+    )
+    .await;
+    assert_eq!(
+        (r.status, r.code().as_deref()),
+        (403, Some("origin_mismatch"))
+    );
+    let mut in_process = get().h("origin", "tauri://localhost");
+    in_process.peer = None;
+    in_process.headers.retain(|(n, _)| n != "host");
+    assert_eq!(
+        go(&e, in_process).await.code().as_deref(),
+        Some("origin_mismatch")
+    );
+}
+
+#[tokio::test]
+async fn t15_a_desk_or_run_credential_that_came_through_a_proxy_is_refused_however_the_proxy_is_set_up(
+) {
+    // A proxied install trusting the loopback proxy: the peer is loopback and a forwarded header is present.
+    let e = env_with(
+        AccessMode::Scoped,
+        &[("OAIY_PUBLIC_URL", "https://dash.example.com")],
+        false,
+        false,
+        Some(STATIC_TOKEN),
+    );
+    let dash = desk(&e, App::Dash, Preset::Owner, &["https://dash.example.com"]);
+    let via_proxy = |token: &str| {
+        send(Method::GET, "/api/services")
+            .bearer(token)
+            .h("host", "dash.example.com")
+            .add("x-forwarded-for", "203.0.113.9")
+            .add("x-forwarded-proto", "https")
+            .h("origin", "https://dash.example.com")
+    };
+    let r = go(&e, via_proxy(&dash)).await;
+    assert_eq!(
+        (r.status, r.code().as_deref()),
+        (403, Some("origin_mismatch")),
+        "{}",
+        r.text
+    );
+    // A derived credential inherits both rules from its parent.
+    let parent = e.store.authenticate(&dash, None).unwrap();
+    let child = e
+        .store
+        .derive(
+            &parent,
+            super::store::DeriveRequest {
+                scopes: ScopeSet::of(&["services.read"]),
+                ttl_ms: None,
+                label: "c".into(),
+            },
+        )
+        .unwrap();
+    let r = go(&e, via_proxy(&child.token)).await;
+    assert_eq!(
+        (r.status, r.code().as_deref()),
+        (403, Some("origin_mismatch"))
+    );
+    // The console and the per-run credential too.
+    let run = e
+        .store
+        .mint(MintSpec::new(
+            Kind::Run,
+            "run",
+            ScopeSet::of(&["services.read"]),
+            60_000,
+        ))
+        .unwrap();
+    assert_eq!(
+        go(&e, via_proxy(&run.token)).await.code().as_deref(),
+        Some("origin_mismatch")
+    );
+    let con = e
+        .store
+        .mint(MintSpec::new(Kind::Con, "console", ScopeSet::all(), DAY))
+        .unwrap();
+    assert_eq!(
+        go(&e, via_proxy(&con.token)).await.code().as_deref(),
+        Some("origin_mismatch")
+    );
+    // Direct from loopback (the CLI on the server, straight to the port): the run credential works, unbound.
+    let direct = go(&e, send(Method::GET, "/api/services").bearer(&run.token)).await;
+    assert_eq!(direct.status, 200, "{}", direct.text);
+    // And from a public address it does not, whatever it says.
+    let r = go(
+        &e,
+        send(Method::GET, "/api/services")
+            .bearer(&run.token)
+            .peer("203.0.113.50:5000")
+            .h("host", "dash.example.com"),
+    )
+    .await;
+    assert_eq!(
+        (r.status, r.code().as_deref()),
+        (403, Some("origin_mismatch"))
+    );
+}
+
+// ================================= exposure: proxies, LAN, forwarded ==============================
+
+#[tokio::test]
+async fn t45_a_forwarded_header_on_a_local_install_is_421_and_a_proxied_install_believes_only_its_proxy(
+) {
+    let e = env(AccessMode::Scoped);
+    for name in [
+        "x-forwarded-for",
+        "x-forwarded-host",
+        "x-forwarded-proto",
+        "forwarded",
+        "via",
+        "x-real-ip",
+        "cf-connecting-ip",
+        "true-client-ip",
+    ] {
+        let r = go(
+            &e,
+            send(Method::GET, "/api/config")
+                .bearer(STATIC_TOKEN)
+                .add(name, "203.0.113.9"),
+        )
+        .await;
+        assert_eq!(
+            (r.status, r.code().as_deref()),
+            (421, Some("proxy_detected")),
+            "{name}"
+        );
+    }
+    // Health is not exempt from this one (only from the Host check).
+    let r = go(
+        &e,
+        send(Method::GET, "/api/health").add("x-forwarded-for", "203.0.113.9"),
+    )
+    .await;
+    assert_eq!(r.status, 421);
+    // A proxied install: the same header from its proxy is fine, and `info` says what the server saw.
+    let p = env_with(
+        AccessMode::Scoped,
+        &[("OAIY_PUBLIC_URL", "https://dash.example.com")],
+        false,
+        false,
+        None,
+    );
+    let r = go(
+        &p,
+        send(Method::GET, "/api/auth/info")
+            .h("host", "dash.example.com")
+            .add("x-forwarded-for", "203.0.113.9")
+            .add("x-forwarded-proto", "https"),
+    )
+    .await;
+    assert_eq!(r.status, 200, "{}", r.text);
+    let seen = &r.json()["seen"];
+    assert_eq!(
+        (
+            seen["clientIp"].as_str(),
+            seen["proto"].as_str(),
+            seen["host"].as_str(),
+            seen["viaTrustedProxy"].as_bool()
+        ),
+        (
+            Some("203.0.113.9"),
+            Some("https"),
+            Some("dash.example.com"),
+            Some(true)
+        )
+    );
+    assert_eq!(r.json()["secureChannel"], true);
+    // The same header from a peer that is not the proxy is ignored, not believed.
+    let r = go(
+        &p,
+        send(Method::GET, "/api/auth/info")
+            .h("host", "dash.example.com")
+            .peer("198.51.100.7:4000")
+            .add("x-forwarded-for", "203.0.113.9")
+            .add("x-forwarded-proto", "https"),
+    )
+    .await;
+    assert_eq!(r.json()["seen"]["clientIp"], "198.51.100.7");
+    assert_eq!(
+        r.json()["secureChannel"],
+        false,
+        "an untrusted peer's word does not make a channel secure"
+    );
+    // A proxy that says http for the public host has a broken configuration.
+    let r = go(
+        &p,
+        send(Method::GET, "/api/auth/info")
+            .h("host", "dash.example.com")
+            .add("x-forwarded-for", "203.0.113.9")
+            .add("x-forwarded-proto", "http"),
+    )
+    .await;
+    assert_eq!(
+        (r.status, r.code().as_deref()),
+        (400, Some("proxy_misconfigured"))
+    );
+    // nginx's default `Host: 127.0.0.1:17972` through the proxy is misdirected.
+    let r = go(
+        &p,
+        send(Method::GET, "/api/config")
+            .bearer("x")
+            .h("host", "127.0.0.1:17972")
+            .add("x-forwarded-for", "203.0.113.9"),
+    )
+    .await;
+    assert_eq!(
+        (r.status, r.code().as_deref()),
+        (421, Some("misdirected_host"))
+    );
+}
+
+#[tokio::test]
+async fn t45_a_bearer_from_a_public_address_on_a_lan_listener_is_refused_unless_the_operator_says_otherwise(
+) {
+    let lan = env_with(AccessMode::Scoped, &[], true, false, Some(STATIC_TOKEN));
+    let from = |peer: &str, host: &str| {
+        send(Method::GET, "/api/config")
+            .bearer(STATIC_TOKEN)
+            .peer(peer)
+            .h("host", host)
+    };
+    // Private and loopback peers are fine; a public one is not.
+    for peer in [
+        "192.168.1.9:4000",
+        "10.0.0.7:4000",
+        "100.64.1.1:4000",
+        "[fd12::5]:4000",
+        "127.0.0.1:4000",
+    ] {
+        assert_eq!(
+            go(&lan, from(peer, "192.168.1.5:17972")).await.status,
+            200,
+            "{peer}"
+        );
+    }
+    let r = go(&lan, from("203.0.113.50:4000", "192.168.1.5:17972")).await;
+    assert_eq!(
+        (r.status, r.code().as_deref()),
+        (403, Some("plaintext_from_public_address"))
+    );
+    // No Authorization from a public address: that is just an anonymous request.
+    let r = go(
+        &lan,
+        send(Method::GET, "/api/config")
+            .peer("203.0.113.50:4000")
+            .h("host", "192.168.1.5:17972"),
+    )
+    .await;
+    assert_eq!(r.code().as_deref(), Some("auth_required"));
+    // The wrong port, or a name, is not this listener.
+    assert_eq!(
+        go(&lan, from("192.168.1.9:4000", "192.168.1.5:9999"))
+            .await
+            .status,
+        421
+    );
+    assert_eq!(
+        go(&lan, from("192.168.1.9:4000", "nas.local:17972"))
+            .await
+            .status,
+        421
+    );
+    let allowed = env_with(
+        AccessMode::Scoped,
+        &[("OAIY_ALLOW_PUBLIC_PLAINTEXT", "1")],
+        true,
+        false,
+        Some(STATIC_TOKEN),
+    );
+    assert_eq!(
+        go(&allowed, from("203.0.113.50:4000", "192.168.1.5:17972"))
+            .await
+            .status,
+        200
+    );
+}
+
+// ================================ T53: the failed-bearer throttle ================================
+
+#[tokio::test]
+async fn t53_twenty_guesses_block_an_address_and_nothing_else_is_affected() {
+    let e = env_with(
+        AccessMode::Scoped,
+        &[("OAIY_PUBLIC_URL", "https://dash.example.com")],
+        false,
+        false,
+        Some(STATIC_TOKEN),
+    );
+    let from = |ip: &str| {
+        send(Method::GET, "/api/config")
+            .peer("127.0.0.1:5000")
+            .h("host", "dash.example.com")
+            .add("x-forwarded-for", ip)
+            .add("x-forwarded-proto", "https")
+    };
+    let guess = |n: u32| format!("oaiypat_{n:016x}_AAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8");
+    for n in 0..20 {
+        let r = go(&e, from("203.0.113.9").bearer(&guess(n))).await;
+        assert_eq!(r.code().as_deref(), Some("token_invalid"), "guess {n}");
+    }
+    // The 21st is refused before any lookup: 429, with Retry-After.
+    let r = go(&e, from("203.0.113.9").bearer(&guess(99))).await;
+    assert_eq!((r.status, r.code().as_deref()), (429, Some("rate_limited")));
+    assert_eq!(r.headers.get("retry-after").unwrap(), "900");
+    assert_eq!(r.json()["retryAfterSeconds"], 900);
+    // Even the right credential is refused from a blocked address (the block is before the lookup).
+    assert_eq!(
+        go(&e, from("203.0.113.9").bearer(STATIC_TOKEN))
+            .await
+            .status,
+        429
+    );
+    // A request with no Authorization from that address is not throttled: a public route stays reachable.
+    assert_eq!(
+        go(&e, from("203.0.113.9")).await.code().as_deref(),
+        Some("auth_required")
+    );
+    assert_eq!(
+        go(
+            &e,
+            Send {
+                path: "/api/health".into(),
+                ..from("203.0.113.9")
+            }
+        )
+        .await
+        .status,
+        200,
+        "health is still answered from the blocked address"
+    );
+    // Another address, and another /64 of the same v6 range, are unaffected.
+    assert_eq!(
+        go(&e, from("203.0.113.10").bearer(STATIC_TOKEN))
+            .await
+            .status,
+        200
+    );
+    // The block ends after 15 minutes.
+    e.clock.advance(15 * 60_000);
+    assert_eq!(
+        go(&e, from("203.0.113.9").bearer(STATIC_TOKEN))
+            .await
+            .status,
+        200
+    );
+    // And is counted in the noise log, not the audit log.
+    e.audit.flush_noise();
+    let noise = e.audit.read(LogFile::Noise, 50, None, None);
+    assert!(
+        noise
+            .iter()
+            .any(|l| l["event"] == "bearer.failed" && l["ip"] == "203.0.113.9" && l["count"] == 20),
+        "{noise:?}"
+    );
+    assert!(noise.iter().any(|l| l["event"] == "bearer.blocked"));
+    assert!(
+        e.audit.read(LogFile::Audit, 50, None, None).is_empty(),
+        "a guess is anonymous traffic: it never reaches the audit file"
+    );
+}
+
+#[tokio::test]
+async fn t53_an_expired_or_revoked_credential_is_not_a_guess_and_a_local_loopback_peer_is_never_blocked(
+) {
+    let e = env_with(
+        AccessMode::Scoped,
+        &[("OAIY_PUBLIC_URL", "https://dash.example.com")],
+        false,
+        false,
+        None,
+    );
+    let from_public = |token: &str| {
+        send(Method::GET, "/api/config")
+            .peer("127.0.0.1:5000")
+            .h("host", "dash.example.com")
+            .add("x-forwarded-for", "203.0.113.9")
+            .add("x-forwarded-proto", "https")
+            .bearer(token)
+    };
+    let short = e
+        .store
+        .mint(MintSpec::new(
+            Kind::Pat,
+            "short",
+            ScopeSet::of(&["system.read"]),
+            1000,
+        ))
+        .unwrap();
+    let revoked = e
+        .store
+        .mint(MintSpec::new(
+            Kind::Pat,
+            "revoked",
+            ScopeSet::of(&["system.read"]),
+            DAY,
+        ))
+        .unwrap();
+    e.store.revoke(&revoked.id, "revoked");
+    e.clock.advance(5000);
+    for _ in 0..40 {
+        assert_eq!(
+            go(&e, from_public(&short.token)).await.code().as_deref(),
+            Some("token_expired")
+        );
+        assert_eq!(
+            go(&e, from_public(&revoked.token)).await.code().as_deref(),
+            Some("token_revoked")
+        );
+    }
+    assert_ne!(
+        go(&e, from_public(&short.token)).await.status,
+        429,
+        "a stale paired app is not an attacker"
+    );
+    // A local install: the desktop's own windows and a local script cannot be blocked by it.
+    let local = env(AccessMode::Scoped);
+    for n in 0..60u32 {
+        let bad = format!("oaiypat_{n:016x}_AAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8");
+        assert_eq!(
+            go(&local, send(Method::GET, "/api/config").bearer(&bad))
+                .await
+                .code()
+                .as_deref(),
+            Some("token_invalid")
+        );
+    }
+    assert_eq!(
+        go(
+            &local,
+            send(Method::GET, "/api/config").bearer(STATIC_TOKEN)
+        )
+        .await
+        .status,
+        200
+    );
+    // But a LAN listener's private peer is throttled: only a local install exempts loopback.
+    let lan = env_with(AccessMode::Scoped, &[], true, false, Some(STATIC_TOKEN));
+    let lan_from = |token: &str| {
+        send(Method::GET, "/api/config")
+            .peer("192.168.1.9:4000")
+            .h("host", "192.168.1.5:17972")
+            .bearer(token)
+    };
+    for n in 0..20u32 {
+        go(
+            &lan,
+            lan_from(&format!(
+                "oaiypat_{n:016x}_AAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8"
+            )),
+        )
+        .await;
+    }
+    assert_eq!(go(&lan, lan_from(STATIC_TOKEN)).await.status, 429);
+}
+
+// ======================================= T37: the modes ==========================================
+
+#[tokio::test]
+async fn t37_every_route_the_model_adds_refuses_a_stranger_in_every_mode() {
+    for mode in [AccessMode::Scoped, AccessMode::Shadow] {
+        let e = env(mode);
+        for r in ROUTES.iter().filter(|r| r.since == 2) {
+            for m in methods(r.method) {
+                let path = concrete(r.pattern);
+                let reply = go(&e, send(m.clone(), &path)).await;
+                if r.class == Class::Public {
+                    // The public ones that exist answer; the ones another step builds are the stub's `ok`.
+                    assert!(
+                        reply.status == 200 || reply.status == 400 || reply.status == 415,
+                        "{mode:?} {m} {path}: {}",
+                        reply.status
+                    );
+                } else {
+                    assert!(
+                        matches!(reply.status, 401 | 403 | 404),
+                        "{mode:?} {m} {path} answered {}",
+                        reply.status
+                    );
+                    assert_ne!(reply.status, 200);
+                }
+            }
+        }
+    }
+}
+
+#[tokio::test]
+async fn t37_shadow_lets_only_a_non_dangerous_scope_mismatch_through_and_writes_it_to_the_noise_log(
+) {
+    let e = env(AccessMode::Shadow);
+    let readonly = native_pat(&e, Preset::Readonly.scopes(), DAY);
+    // Allowed and logged: services.control is a scope the token lacks and is not dangerous.
+    let r = go(
+        &e,
+        send(Method::POST, "/api/services/x/start")
+            .bearer(&readonly)
+            .json("{}"),
+    )
+    .await;
+    assert_eq!(r.status, 200, "{}", r.text);
+    // Refused exactly as in scoped: a dangerous scope, a human-only route.
+    for (m, p) in [
+        (Method::POST, "/api/plugins/install"),
+        (Method::POST, "/api/services"),
+        (Method::DELETE, "/api/plugins/x"),
+        (Method::PUT, "/api/secrets/hf-token"),
+        (Method::POST, "/api/bridge/pairing/x/approve"),
+        (Method::POST, "/api/python/install"),
+    ] {
+        let r = go(&e, send(m.clone(), p).bearer(&readonly).json("{}")).await;
+        assert_eq!(
+            (r.status, r.code().as_deref()),
+            (403, Some("insufficient_scope")),
+            "{m} {p}"
+        );
+    }
+    // Never an authentication failure: no credential, a bad one, an expired one, a revoked one.
+    assert_eq!(
+        go(&e, send(Method::POST, "/api/services/x/start"))
+            .await
+            .status,
+        401
+    );
+    assert_eq!(
+        go(
+            &e,
+            send(Method::POST, "/api/services/x/start").bearer("nonsense")
+        )
+        .await
+        .status,
+        401
+    );
+    let expired = native_pat(&e, ScopeSet::of(&["system.read"]), 1000);
+    e.clock.advance(5000);
+    assert_eq!(
+        go(
+            &e,
+            send(Method::POST, "/api/services/x/start").bearer(&expired)
+        )
+        .await
+        .code()
+        .as_deref(),
+        Some("token_expired")
+    );
+    // Still no Origin trust, and the row rule holds: an unclassified route is refused.
+    assert_eq!(
+        go(
+            &e,
+            send(Method::POST, "/api/services/x/start").h("origin", "https://oaiy.com")
+        )
+        .await
+        .status,
+        401
+    );
+    assert_eq!(
+        go(&e, send(Method::GET, UNCLASSIFIED).bearer(&readonly))
+            .await
+            .code()
+            .as_deref(),
+        Some("unclassified_route")
+    );
+    // The mismatch that was allowed is in the noise log as `auth.shadow_denied`.
+    e.audit.flush_noise();
+    let noise = e.audit.read(LogFile::Noise, 50, None, None);
+    assert!(
+        noise
+            .iter()
+            .any(|l| l["event"] == "auth.shadow_denied" && l["count"] == 1),
+        "{noise:?}"
+    );
+    // In scoped the same request is refused.
+    let scoped = env(AccessMode::Scoped);
+    let readonly = native_pat(&scoped, Preset::Readonly.scopes(), DAY);
+    let r = go(
+        &scoped,
+        send(Method::POST, "/api/services/x/start")
+            .bearer(&readonly)
+            .json("{}"),
+    )
+    .await;
+    assert_eq!(
+        (r.status, r.code().as_deref()),
+        (403, Some("insufficient_scope"))
+    );
+}
+
+// ======================================== CORS (T16) =============================================
+
+fn preflight(path: &str, origin: &str, method: &str, asks_headers: &str) -> Send {
+    send(Method::OPTIONS, path)
+        .h("origin", origin)
+        .h("access-control-request-method", method)
+        .h("access-control-request-headers", asks_headers)
+}
+
+#[tokio::test]
+async fn t16_cors_answers_a_paired_origin_a_public_route_and_nobody_else() {
+    let e = env(AccessMode::Scoped);
+    let _paired = browser_pat(
+        &e,
+        "https://formlogic.example",
+        &["services.read", "calendar.write"],
+    );
+    // An unpaired origin: the preflight is 204 with no CORS headers, so the browser blocks the real request.
+    for (path, method) in [
+        ("/api/services", "GET"),
+        ("/api/bridge/runs", "POST"),
+        ("/api/config", "GET"),
+    ] {
+        let r = go(
+            &e,
+            preflight(path, "https://evil.example", method, "authorization"),
+        )
+        .await;
+        assert_eq!(r.status, 204);
+        assert!(
+            r.headers
+                .keys()
+                .all(|k| !k.as_str().starts_with("access-control-")),
+            "{path}: {:?}",
+            r.headers
+        );
+    }
+    // A paired origin: its own origin echoed, PATCH allowed, `authorization` listed by name.
+    let r = go(
+        &e,
+        preflight(
+            "/api/calendar/appointments/:id",
+            "https://formlogic.example",
+            "PATCH",
+            "authorization, content-type",
+        ),
+    )
+    .await;
+    assert_eq!(r.status, 204);
+    assert_eq!(
+        r.headers.get("access-control-allow-origin").unwrap(),
+        "https://formlogic.example"
+    );
+    assert_eq!(r.headers.get("vary").unwrap(), "Origin");
+    let methods = r
+        .headers
+        .get("access-control-allow-methods")
+        .unwrap()
+        .to_str()
+        .unwrap()
+        .to_string();
+    assert!(methods.split(", ").any(|m| m == "PATCH"), "{methods}");
+    let allowed = r
+        .headers
+        .get("access-control-allow-headers")
+        .unwrap()
+        .to_str()
+        .unwrap()
+        .to_string();
+    assert!(
+        allowed.split(", ").any(|h| h == "authorization"),
+        "{allowed}"
+    );
+    assert!(r.headers.get("access-control-allow-credentials").is_none());
+    // A public route answers any origin with `*`; the pairing bootstrap included.
+    let r = go(
+        &e,
+        preflight(
+            "/api/bridge/pairing",
+            "https://never-paired.example",
+            "POST",
+            "content-type",
+        ),
+    )
+    .await;
+    assert_eq!(
+        (
+            r.status,
+            r.headers
+                .get("access-control-allow-origin")
+                .unwrap()
+                .to_str()
+                .unwrap()
+        ),
+        (204, "*")
+    );
+    // `Origin: null` never matches anything but the public rows.
+    let r = go(
+        &e,
+        preflight("/api/services", "null", "GET", "authorization"),
+    )
+    .await;
+    assert!(r.headers.get("access-control-allow-origin").is_none());
+    let r = go(&e, preflight("/api/health", "null", "GET", "content-type")).await;
+    assert_eq!(r.headers.get("access-control-allow-origin").unwrap(), "*");
+    // The real request carries the headers too, so the app can read a refusal.
+    let r = go(
+        &e,
+        send(Method::GET, "/api/services").h("origin", "https://formlogic.example"),
+    )
+    .await;
+    assert_eq!(r.status, 401);
+    assert_eq!(
+        r.headers.get("access-control-allow-origin").unwrap(),
+        "https://formlogic.example"
+    );
+    assert!(r
+        .headers
+        .get("access-control-expose-headers")
+        .unwrap()
+        .to_str()
+        .unwrap()
+        .contains("www-authenticate"));
+    let r = go(
+        &e,
+        send(Method::GET, "/api/services").h("origin", "https://evil.example"),
+    )
+    .await;
+    assert!(r.headers.get("access-control-allow-origin").is_none());
+    // A path with no route, and a preflight that names no method: nothing.
+    assert!(go(
+        &e,
+        preflight("/api/no/such/route", "https://formlogic.example", "GET", "")
+    )
+    .await
+    .headers
+    .get("access-control-allow-origin")
+    .is_none());
+    // A bare OPTIONS (no requested method) is public for every path: `*`, and nothing that says more.
+    let bare = go(
+        &e,
+        send(Method::OPTIONS, "/api/services").h("origin", "https://formlogic.example"),
+    )
+    .await;
+    assert_eq!(
+        bare.headers.get("access-control-allow-origin").unwrap(),
+        "*"
+    );
+    assert!(
+        bare.headers
+            .get("access-control-allow-headers")
+            .unwrap()
+            .to_str()
+            .unwrap()
+            == "content-type"
+    );
+}
+
+#[tokio::test]
+async fn t16_private_network_access_is_answered_only_to_an_origin_that_may_have_it() {
+    let e = env(AccessMode::Scoped);
+    browser_pat(&e, "https://formlogic.example", &["services.read"]);
+    let pna = |origin: &str, path: &str| {
+        preflight(path, origin, "GET", "authorization")
+            .h("access-control-request-private-network", "true")
+    };
+    let r = go(&e, pna("https://formlogic.example", "/api/services")).await;
+    assert_eq!(
+        r.headers
+            .get("access-control-allow-private-network")
+            .unwrap(),
+        "true"
+    );
+    let r = go(&e, pna("https://evil.example", "/api/services")).await;
+    assert!(
+        r.headers
+            .get("access-control-allow-private-network")
+            .is_none(),
+        "a hostile page must not be told it may reach the port"
+    );
+    let r = go(&e, pna("https://evil.example", "/api/health")).await;
+    assert_eq!(
+        r.headers
+            .get("access-control-allow-private-network")
+            .unwrap(),
+        "true",
+        "the public row is answered for anyone"
+    );
+    // And not unless asked.
+    let r = go(
+        &e,
+        preflight(
+            "/api/services",
+            "https://formlogic.example",
+            "GET",
+            "authorization",
+        ),
+    )
+    .await;
+    assert!(r
+        .headers
+        .get("access-control-allow-private-network")
+        .is_none());
+}
+
+#[tokio::test]
+async fn t16_the_six_same_origin_routes_get_no_cors_headers_from_anyone() {
+    let e = env(AccessMode::Scoped);
+    browser_pat(&e, "https://formlogic.example", &["services.read"]);
+    for (path, method) in [
+        ("/api/auth/info", "GET"),
+        ("/api/auth/session", "GET"),
+        ("/api/auth/login", "POST"),
+        ("/api/auth/setup", "POST"),
+        ("/api/auth/link", "POST"),
+        ("/api/auth/callback", "POST"),
+    ] {
+        for origin in ["https://formlogic.example", "https://evil.example"] {
+            let r = go(&e, preflight(path, origin, method, "content-type")).await;
+            assert!(
+                r.headers
+                    .keys()
+                    .all(|k| !k.as_str().starts_with("access-control-")),
+                "{path} {origin}"
+            );
+            let real = go(
+                &e,
+                send(Method::from_bytes(method.as_bytes()).unwrap(), path)
+                    .h("origin", origin)
+                    .json("{}"),
+            )
+            .await;
+            assert!(
+                real.headers
+                    .keys()
+                    .all(|k| !k.as_str().starts_with("access-control-")),
+                "{path} {origin}"
+            );
+        }
+    }
+}
+
+// ================================= the routes: whoami, derive, info ==============================
+
+#[tokio::test]
+async fn whoami_says_who_and_what() {
+    let e = env(AccessMode::Scoped);
+    let r = go(
+        &e,
+        send(Method::GET, "/api/auth/whoami").bearer(STATIC_TOKEN),
+    )
+    .await;
+    assert_eq!(r.status, 200);
+    let v = r.json();
+    assert_eq!(
+        (
+            v["kind"].as_str(),
+            v["id"].as_str(),
+            v["elevated"].as_bool(),
+            v["controlLevel"].as_str(),
+            v["persisted"].as_bool()
+        ),
+        (
+            Some("static"),
+            Some("static"),
+            Some(false),
+            Some("none"),
+            Some(false)
+        )
+    );
+    assert_eq!(v["scopes"].as_array().unwrap().len(), 15);
+    assert!(v["origin"].is_null() && v["sessionExpiresMs"].is_null());
+    // A paired app: its own scopes, origin and expiry, and no secret in the answer.
+    let pat = browser_pat(
+        &e,
+        "https://formlogic.example",
+        &["control.read", "control.project", "ai.read"],
+    );
+    let r = go(
+        &e,
+        send(Method::GET, "/api/auth/whoami")
+            .bearer(&pat)
+            .h("origin", "https://formlogic.example"),
+    )
+    .await;
+    let v = r.json();
+    assert_eq!(
+        (
+            v["kind"].as_str(),
+            v["origin"].as_str(),
+            v["controlLevel"].as_str()
+        ),
+        (
+            Some("pat"),
+            Some("https://formlogic.example"),
+            Some("project")
+        )
+    );
+    assert_eq!(v["expiresMs"], T0 + 30 * DAY);
+    assert!(
+        !r.text.contains(&pat) && !r.text.contains("AAEC"),
+        "no secret in whoami"
+    );
+    // The desk credential of the dashboard is elevated.
+    let d = desk(&e, App::Dash, Preset::Owner, &["tauri://localhost"]);
+    let v = go(
+        &e,
+        send(Method::GET, "/api/auth/whoami")
+            .bearer(&d)
+            .h("origin", "tauri://localhost"),
+    )
+    .await
+    .json();
+    assert_eq!(
+        (v["kind"].as_str(), v["elevated"].as_bool()),
+        (Some("desk"), Some(true))
+    );
+    assert_eq!(v["scopes"].as_array().unwrap().len(), 54);
+}
+
+#[tokio::test]
+async fn derive_makes_a_child_of_at_most_what_the_caller_holds() {
+    let e = env(AccessMode::Scoped);
+    let d = |body: &str| {
+        send(Method::POST, "/api/auth/derive")
+            .bearer(STATIC_TOKEN)
+            .json(body)
+    };
+    let r = go(
+        &e,
+        d(r#"{"scopes":["ai.read","ai.use"],"ttlSeconds":600,"label":"chatgpt"}"#),
+    )
+    .await;
+    assert_eq!(r.status, 201, "{}", r.text);
+    let v = r.json();
+    assert_eq!(v["scopes"], serde_json::json!(["ai.read", "ai.use"]));
+    assert_eq!(v["expiresMs"], T0 + 600_000);
+    let token = v["token"].as_str().unwrap().to_string();
+    assert!(super::token::parse(&token).is_some_and(|p| p.kind == Kind::Run));
+    // The child works, is a `run` credential and holds only what it was given.
+    let w = go(&e, send(Method::GET, "/api/auth/whoami").bearer(&token))
+        .await
+        .json();
+    assert_eq!(
+        (
+            w["kind"].as_str(),
+            w["label"].as_str(),
+            w["scopes"].as_array().map(Vec::len)
+        ),
+        (Some("run"), Some("chatgpt"), Some(2))
+    );
+    assert_eq!(
+        go(
+            &e,
+            send(Method::POST, "/api/ai/v1/chat/completions")
+                .bearer(&token)
+                .json("{}")
+        )
+        .await
+        .status,
+        200
+    );
+    assert_eq!(
+        go(&e, send(Method::GET, "/api/config").bearer(&token))
+            .await
+            .code()
+            .as_deref(),
+        Some("insufficient_scope")
+    );
+    // A derived credential cannot derive.
+    let r = go(
+        &e,
+        send(Method::POST, "/api/auth/derive")
+            .bearer(&token)
+            .json(r#"{"scopes":["ai.read"]}"#),
+    )
+    .await;
+    assert_eq!(
+        (r.status, r.code().as_deref()),
+        (403, Some("derive_refused"))
+    );
+    // More than the parent holds, a dangerous scope, an auth scope: refused.
+    for scopes in [
+        r#"["flows.approve"]"#,
+        r#"["ai.read","auth.read"]"#,
+        r#"["services.define"]"#,
+        r#"["models.write","services.define"]"#,
+    ] {
+        let r = go(&e, d(&format!(r#"{{"scopes":{scopes}}}"#))).await;
+        assert_eq!(
+            (r.status, r.code().as_deref()),
+            (403, Some("derive_refused")),
+            "{scopes}"
+        );
+    }
+    // The static token has no `control.project`: cannot hand it on.
+    assert_eq!(
+        go(&e, d(r#"{"scopes":["control.project","control.read"]}"#))
+            .await
+            .status,
+        403
+    );
+}
+
+#[tokio::test]
+async fn derive_checks_its_request_before_it_makes_anything() {
+    let e = env(AccessMode::Scoped);
+    let d = |body: &str| {
+        send(Method::POST, "/api/auth/derive")
+            .bearer(STATIC_TOKEN)
+            .json(body)
+    };
+    for (body, status, code) in [
+        ("not json", 400, "bad_request"),
+        (r#"{"scopes":"ai.read"}"#, 400, "bad_request"),
+        (r#"{}"#, 400, "bad_request"),
+        (r#"{"scopes":[]}"#, 400, "invalid_request"),
+        (r#"{"scopes":["nonsense.scope"]}"#, 400, "invalid_request"),
+        (r#"{"scopes":["ai.*"]}"#, 400, "invalid_request"),
+        (
+            r#"{"scopes":["ai.read"],"ttlSeconds":0}"#,
+            400,
+            "invalid_request",
+        ),
+        (
+            r#"{"scopes":["ai.read"],"ttlSeconds":-5}"#,
+            400,
+            "bad_request",
+        ),
+        (
+            r#"{"scopes":["ai.read"],"label":""}"#,
+            400,
+            "invalid_request",
+        ),
+        (
+            r#"{"scopes":["ai.read"],"label":"bad\u0007label"}"#,
+            400,
+            "invalid_request",
+        ),
+    ] {
+        let r = go(&e, d(body)).await;
+        assert_eq!(
+            (r.status, r.code().as_deref()),
+            (status, Some(code)),
+            "{body}: {}",
+            r.text
+        );
+    }
+    // The label is at most 80 characters, and the scopes at most 64.
+    assert_eq!(
+        go(
+            &e,
+            d(&format!(
+                r#"{{"scopes":["ai.read"],"label":"{}"}}"#,
+                "x".repeat(81)
+            ))
+        )
+        .await
+        .status,
+        400
+    );
+    assert_eq!(
+        go(
+            &e,
+            d(&format!(
+                r#"{{"scopes":["ai.read"],"label":"{}"}}"#,
+                "x".repeat(80)
+            ))
+        )
+        .await
+        .status,
+        201
+    );
+    let many = vec!["ai.read"; 65].join("\",\"");
+    assert_eq!(
+        go(&e, d(&format!(r#"{{"scopes":["{many}"]}}"#)))
+            .await
+            .status,
+        400
+    );
+    // Content-Type must be JSON: a form post is the classic cross-site shape.
+    let r = go(
+        &e,
+        send(Method::POST, "/api/auth/derive")
+            .bearer(STATIC_TOKEN)
+            .h("content-type", "text/plain")
+            .json_body_only(r#"{"scopes":["ai.read"]}"#),
+    )
+    .await;
+    assert_eq!(
+        (r.status, r.code().as_deref()),
+        (415, Some("unsupported_media_type"))
+    );
+    let r = go(
+        &e,
+        send(Method::POST, "/api/auth/derive").bearer(STATIC_TOKEN),
+    )
+    .await;
+    assert_eq!(r.status, 415);
+    // The body is at most 16 KiB.
+    let big = format!(
+        r#"{{"scopes":["ai.read"],"label":"ok","pad":"{}"}}"#,
+        "x".repeat(20_000)
+    );
+    assert_eq!(go(&e, d(&big)).await.status, 400);
+    // A `ttlSeconds` a day or more is a day.
+    let r = go(&e, d(r#"{"scopes":["ai.read"],"ttlSeconds":999999999}"#)).await;
+    assert_eq!(r.json()["expiresMs"], T0 + DAY);
+    // Nothing was made by the refusals: only the accepted ones exist.
+    assert_eq!(e.store.live_count(Kind::Run), 2);
+}
+
+impl Send {
+    /// Set the body without changing the content type.
+    fn json_body_only(mut self, body: &str) -> Send {
+        self.body = Some(body.to_string());
+        self
+    }
+}
+
+#[tokio::test]
+async fn derive_from_a_paired_token_inherits_its_origin_binding_and_at_most_thirty_a_minute_are_made(
+) {
+    let e = env(AccessMode::Scoped);
+    let pat = browser_pat(&e, "https://formlogic.example", &["ai.read", "ai.use"]);
+    let ask = |body: &str| {
+        send(Method::POST, "/api/auth/derive")
+            .bearer(&pat)
+            .h("origin", "https://formlogic.example")
+            .json(body)
+    };
+    let r = go(&e, ask(r#"{"scopes":["ai.read"]}"#)).await;
+    assert_eq!(r.status, 201, "{}", r.text);
+    let child = r.json()["token"].as_str().unwrap().to_string();
+    // The child keeps its parent's binding and works only from the machine: the bound origin, from loopback.
+    let get = || send(Method::GET, "/api/ai/sources").bearer(&child);
+    assert_eq!(
+        go(&e, get().h("origin", "https://formlogic.example"))
+            .await
+            .status,
+        200
+    );
+    for (name, s) in [
+        ("another origin", get().h("origin", "https://evil.example")),
+        ("no origin", get()),
+        (
+            "not from loopback",
+            get()
+                .h("origin", "https://formlogic.example")
+                .peer("203.0.113.9:4000")
+                .h("host", "localhost:17972"),
+        ),
+    ] {
+        let r = go(&e, s).await;
+        assert_eq!(
+            (r.status, r.code().as_deref()),
+            (403, Some("origin_mismatch")),
+            "{name}"
+        );
+    }
+    for _ in 0..29 {
+        assert_eq!(go(&e, ask(r#"{"scopes":["ai.read"]}"#)).await.status, 201);
+    }
+    let r = go(&e, ask(r#"{"scopes":["ai.read"]}"#)).await;
+    assert_eq!((r.status, r.code().as_deref()), (429, Some("rate_limited")));
+    assert!(r.headers.get("retry-after").is_some());
+    e.clock.advance(60_000);
+    assert_eq!(go(&e, ask(r#"{"scopes":["ai.read"]}"#)).await.status, 201);
+}
+
+#[tokio::test]
+async fn info_is_public_says_what_the_server_saw_and_reveals_no_install_detail() {
+    let e = env(AccessMode::Scoped);
+    let r = go(&e, send(Method::GET, "/api/auth/info")).await;
+    assert_eq!(r.status, 200);
+    let v = r.json();
+    assert_eq!(v["scheme"], "oaiy-auth/1");
+    assert_eq!(v["apiVersion"], crate::http::API_VERSION);
+    assert_eq!(
+        (
+            v["loginConfigured"].as_bool(),
+            v["setupCode"].as_str(),
+            v["secureChannel"].as_bool()
+        ),
+        (Some(false), Some("none"), Some(true))
+    );
+    assert_eq!(v["factors"], serde_json::json!(["password"]));
+    assert_eq!(v["seen"]["clientIp"], "127.0.0.1");
+    assert_eq!(v["app"], "dash");
+    let text = r.text.to_lowercase();
+    for hidden in [
+        "exposure",
+        "proxied",
+        "trustedproxies",
+        "allowed_hosts",
+        "public_url",
+        "oaiy_",
+        "data",
+    ] {
+        assert!(
+            !text.contains(hidden),
+            "info must not say `{hidden}`: {text}"
+        );
+    }
+    // A credential, a wrong one included, changes nothing: it is a public route.
+    assert_eq!(
+        go(&e, send(Method::GET, "/api/auth/info").bearer("garbage"))
+            .await
+            .status,
+        200
+    );
+    // No CORS: same-origin by construction.
+    let r = go(
+        &e,
+        send(Method::GET, "/api/auth/info").h("origin", "https://evil.example"),
+    )
+    .await;
+    assert!(r.headers.get("access-control-allow-origin").is_none());
+}
+
+#[tokio::test]
+async fn the_new_routes_leave_a_mark_in_the_audit_log_that_holds_no_secret() {
+    let e = env(AccessMode::Scoped);
+    let r = go(
+        &e,
+        send(Method::POST, "/api/auth/derive")
+            .bearer(STATIC_TOKEN)
+            .json(r#"{"scopes":["ai.read"],"label":"chatgpt"}"#),
+    )
+    .await;
+    let token = r.json()["token"].as_str().unwrap().to_string();
+    let audit = e.audit.read(LogFile::Audit, 10, None, None);
+    assert_eq!(audit.len(), 1, "{audit:?}");
+    assert_eq!(audit[0]["event"], "credential.created");
+    assert_eq!(audit[0]["principal"]["kind"], "static");
+    assert_eq!(audit[0]["detail"]["derived"], true);
+    assert!(
+        !audit[0].to_string().contains(&token),
+        "the token is shown once and never logged"
+    );
+    assert!(!audit[0].to_string().contains(STATIC_TOKEN));
+}
+
+#[tokio::test]
+async fn refusals_are_counted_as_noise_and_never_as_audit() {
+    let e = env_with(AccessMode::Scoped, &[], false, true, Some(STATIC_TOKEN));
+    let readonly = native_pat(&e, Preset::Readonly.scopes(), DAY);
+    for _ in 0..3 {
+        assert_eq!(
+            go(
+                &e,
+                send(Method::GET, "/api/services/x/logs").bearer(&readonly)
+            )
+            .await
+            .status,
+            403
+        );
+    }
+    assert_eq!(
+        go(
+            &e,
+            send(Method::GET, "/api/config").h("host", "evil.example")
+        )
+        .await
+        .status,
+        421
+    );
+    e.audit.flush_noise();
+    let noise = e.audit.read(LogFile::Noise, 20, None, None);
+    let denied: u64 = noise
+        .iter()
+        .filter(|l| l["event"] == "auth.denied")
+        .map(|l| l["count"].as_u64().unwrap())
+        .sum();
+    assert_eq!(denied, 4, "{noise:?}");
+    assert!(e.audit.read(LogFile::Audit, 20, None, None).is_empty());
+    // A guess of the noise: the lines carry an address and a host, never a token.
+    let text = serde_json::to_string(&noise).unwrap();
+    assert!(!text.contains(&readonly) && !text.contains(STATIC_TOKEN));
+}
+
+// ============================== which requests the guard claims (legacy) ==========================
+
+/// A router that reports, for each request, whether the guard would claim it.
+fn claims_router(mode: AccessMode) -> (Router, Arc<Guard>) {
+    let e = env_with(mode, &[], false, true, Some(STATIC_TOKEN));
+    let guard = e.guard.clone();
+    let mut patterns: Vec<&str> = ROUTES.iter().map(|r| r.pattern).collect();
+    patterns.sort_unstable();
+    patterns.dedup();
+    let mut app = Router::new();
+    for p in patterns {
+        app = app.route(p, any(|| async { "ok" }));
+    }
+    let app = app.layer(middleware::from_fn_with_state(
+        guard.clone(),
+        |axum::extract::State(g): axum::extract::State<Arc<Guard>>,
+         req: axum::extract::Request,
+         next: axum::middleware::Next| async move {
+            let claims = g.claims(&req);
+            let mut response = next.run(req).await;
+            response.headers_mut().insert(
+                "x-claims",
+                axum::http::HeaderValue::from_static(if claims { "1" } else { "0" }),
+            );
+            response
+        },
+    ));
+    (app, guard)
+}
+
+#[tokio::test]
+async fn in_legacy_mode_the_new_guard_claims_exactly_the_routes_the_model_adds() {
+    let (app, _guard) = claims_router(AccessMode::Legacy);
+    let (mut claimed, mut left_alone) = (0, 0);
+    for r in ROUTES {
+        for m in methods(r.method) {
+            let req = Request::builder()
+                .method(m.clone())
+                .uri(concrete(r.pattern))
+                .body(Body::empty())
+                .unwrap();
+            let response = app.clone().oneshot(req).await.unwrap();
+            let claims = response.headers().get("x-claims").unwrap() == "1";
+            assert_eq!(claims, r.since == 2, "{m} {}: since {}", r.pattern, r.since);
+            if claims {
+                claimed += 1
+            } else {
+                left_alone += 1
+            }
+        }
+    }
+    assert!(
+        claimed > 90 && left_alone > 200,
+        "{claimed} claimed, {left_alone} left to the old guard"
+    );
+    // A path with no route, a method with no row and OPTIONS are the old guard's.
+    for (m, p) in [
+        (Method::GET, "/api/no/such/route"),
+        (Method::GET, "/"),
+        (Method::TRACE, "/api/config"),
+        (Method::OPTIONS, "/api/auth/info"),
+    ] {
+        let req = Request::builder()
+            .method(m.clone())
+            .uri(p)
+            .body(Body::empty())
+            .unwrap();
+        let response = app.clone().oneshot(req).await.unwrap();
+        assert_eq!(response.headers().get("x-claims").unwrap(), "0", "{m} {p}");
+    }
+}
+
+#[tokio::test]
+async fn in_scoped_and_shadow_mode_the_new_guard_claims_every_request() {
+    for mode in [AccessMode::Scoped, AccessMode::Shadow] {
+        let (app, _guard) = claims_router(mode);
+        for (m, p) in [
+            (Method::GET, "/api/config"),
+            (Method::GET, "/api/no/such/route"),
+            (Method::POST, "/api/services"),
+            (Method::GET, "/api/auth/info"),
+            (Method::GET, "/"),
+        ] {
+            let req = Request::builder()
+                .method(m.clone())
+                .uri(p)
+                .body(Body::empty())
+                .unwrap();
+            let response = app.clone().oneshot(req).await.unwrap();
+            assert_eq!(
+                response.headers().get("x-claims").unwrap(),
+                "1",
+                "{mode:?} {m} {p}"
+            );
+        }
+    }
+}
+
+// ========================================= startup rules ========================================
+
+#[test]
+fn the_guard_reports_its_mode_and_the_storage_state_for_health() {
+    let e = env(AccessMode::Shadow);
+    let x = e.guard.health_extras();
+    assert_eq!((x.access, x.storage), ("shadow", "ok"));
+    assert_eq!(e.guard.mode(), AccessMode::Shadow);
+    let _ = (Only::Everywhere, e.guard.config().port);
+}
