@@ -3469,19 +3469,50 @@ mod tests {
         drop((lookup, appointment));
     }
 
-    #[tokio::test]
-    async fn a_transfer_is_not_asked_for_once_the_phone_is_close_to_its_tool_limit() {
-        let mut aokie = transferable(owner_settings(true), true).await;
-        caller_asks(&aokie);
-        for n in 0..transfer::TOOLS_BEFORE_LAST {
-            let asked = asking(&aokie, "lookup_business_data", json!({"question": format!("q{n}")}));
+    /// `tools` lookups, each answered by the phone: that many tool calls have been sent on the call.
+    async fn use_tools(aokie: &mut Aokie, tools: u32) {
+        for n in 0..tools {
+            let asked = asking(aokie, "lookup_business_data", json!({"question": format!("q{n}")}));
             let call = aokie.text("formlogic.realtime.tool_call", secs(3)).await.expect("a lookup");
             aokie.send(json!({"type": "formlogic.realtime.tool_result", "callId": aokie.call, "toolCallId": call["toolCallId"], "ok": true, "output": {}}));
             answer_of(asked).await.unwrap();
         }
+    }
+
+    #[test]
+    fn the_tool_budget_for_a_transfer_is_what_the_phones_limit_leaves_and_is_said_in_the_docs() {
+        // The phone's limit is the shared fixture's: its 25th tool call of a call is `tool_limit`, so 24 are answered.
+        let cases = shared("tool-result")["toolRefusals"]["cases"].clone();
+        let case = cases.as_array().unwrap().iter().find(|c| c["output"]["error"] == "tool_limit").expect("the fixture names the limit");
+        let ordinal: u32 = case["name"].as_str().unwrap().split(|c: char| !c.is_ascii_digit()).find(|s| !s.is_empty()).expect("a number").parse().unwrap();
+        assert_eq!(transfer::PHONE_TOOL_LIMIT + 1, ordinal, "{}", case["name"]);
+        // What may still be sent once the request is out fits inside it: the request, the tools that wait behind it, and the goodbye.
+        assert_eq!(transfer::TOOLS_BEFORE_LAST + transfer::MAX_WAITING as u32 + 1, transfer::PHONE_TOOL_LIMIT);
+        assert_eq!(transfer::TOOLS_BEFORE_LAST, 19);
+        // The docs give the number, for the two places that state it.
+        let calls = std::fs::read_to_string(format!("{}/../../../docs/CALLS.md", env!("CARGO_MANIFEST_DIR"))).unwrap();
+        assert!(calls.contains("once 19 tools have been sent"), "docs/CALLS.md says when a transfer is no longer asked for");
+        assert!(calls.contains("24 the phone answers"), "and the phone's limit it follows");
+    }
+
+    #[tokio::test]
+    async fn a_transfer_is_not_asked_for_once_the_tools_left_could_meet_the_phones_limit() {
+        let mut aokie = transferable(owner_settings(true), true).await;
+        caller_asks(&aokie);
+        use_tools(&mut aokie, transfer::TOOLS_BEFORE_LAST).await;
         let a = answer_of(asking(&aokie, transfer::TOOL, json!({"reason": "caller_asked"}))).await.unwrap();
-        assert_eq!((a["output"]["status"].clone(), a["output"]["reason"].clone()), (json!("unavailable"), json!("tool_limit")), "a transfer is not asked for once six tools have been sent: one is kept for the goodbye");
+        assert_eq!((a["output"]["status"].clone(), a["output"]["reason"].clone()), (json!("unavailable"), json!("tool_limit")), "a transfer is not asked for once 19 tools have been sent");
         assert!(aokie.text("formlogic.realtime.tool_call", Duration::from_millis(300)).await.is_none());
+    }
+
+    #[tokio::test]
+    async fn a_call_that_has_used_many_tools_but_not_too_many_can_still_be_put_through() {
+        let mut aokie = transferable(owner_settings(true), true).await;
+        caller_asks(&aokie);
+        // Eighteen lookups: more than the six this desktop used to allow, and one short of the limit.
+        use_tools(&mut aokie, transfer::TOOLS_BEFORE_LAST - 1).await;
+        let answered = ring_the_owner(&mut aokie, "assist_1", 30).await;
+        assert_eq!((answered["ok"].clone(), answered["output"]["status"].clone()), (json!(true), json!("ringing")), "{answered}");
     }
 
     #[tokio::test]

@@ -42,9 +42,13 @@ pub const TOOL: &str = "transfer_to_owner";
 pub const HANDOFF_PREFIX: &str = "handoff:";
 /// Tool calls that may wait behind another.
 pub const MAX_WAITING: usize = 4;
-/// A transfer is not asked for once this many tools have been sent on a call, so one is kept for the goodbye. This desktop's own limit,
-/// well inside the phone's (its 25th tool call of a call is `tool_limit`, its 35th ends the session).
-pub const TOOLS_BEFORE_LAST: u32 = 6;
+/// The tool calls the phone answers on a call: its 25th is `tool_limit`, so 24 are, and its 35th ends the session (`transfer-v1.md`, Tool names).
+pub const PHONE_TOOL_LIMIT: u32 = 24;
+/// A transfer is not asked for once this many tools have been sent on a call: the phone allows [`PHONE_TOOL_LIMIT`], and what may still be
+/// sent after the request is kept back, so none of it meets `tool_limit`. The request itself is one, [`MAX_WAITING`] others may wait behind it
+/// and go once it is answered, and one is kept for the goodbye: 24 less 4 less 1, which is 19. So a call that has looked things up a dozen
+/// times can still be put through, where a limit of six (this desktop's own, before) refused a caller who had done nothing wrong.
+pub const TOOLS_BEFORE_LAST: u32 = PHONE_TOOL_LIMIT - MAX_WAITING as u32 - 1;
 /// The longest a caller's message from the owner is kept (characters).
 pub const MAX_OWNER_MESSAGE: usize = 320;
 
@@ -474,9 +478,11 @@ impl Transfer {
     }
 
     /// The phone answered the tool: the owner is being rung (`ringSeconds`), and the outcome is due. A request that already ended here
-    /// is not brought back by a late answer (nothing changes, and false): whatever ended it is what the caller was told.
+    /// is not brought back by a late answer (nothing changes, and false): whatever ended it is what the caller was told. Nor is one an owner
+    /// device has already taken (its acceptance came before the answer to the tool call, which waits for the line the model spoke to drain):
+    /// it does not ring here again, with hold lines said over the takeover and a clock that would give up on a call the owner has.
     pub fn ringing(&mut self, request: &str, ring_seconds: u64, now: Instant) -> bool {
-        if self.ended.iter().any(|e| e == request) {
+        if self.ended.iter().any(|e| e == request) || self.handing_over {
             return false;
         }
         self.ringing = Some(Ringing { request: request.to_string(), give_up_at: now + Duration::from_secs(ring_seconds.clamp(1, 300)) + self.timing.give_up_after });
@@ -1469,6 +1475,26 @@ mod tests {
         assert!(!t.is_stale("assist_2", Outcome::Declined) && t.is_stale("assist_1", Outcome::Declined));
         assert!(!t.outcome("assist_2", Outcome::Declined, at(210)).iter().any(|_| true));
         assert_eq!(t.due(at(210) + OFFER_AFTER), vec![Due::Say(OFFER_LINE)]);
+    }
+
+    #[test]
+    fn a_late_ringing_answer_does_not_start_a_ring_for_a_request_an_owner_device_already_has() {
+        // The owner accepted before the phone's answer to the tool call reached this call (that answer waits for the line the model spoke to drain).
+        let mut t = Transfer::default();
+        t.outcome("assist_1", Outcome::Accepted, at(2));
+        assert!(t.busy() && !t.may_speak(), "the owner has the call");
+        assert!(!t.ringing("assist_1", 40, at(3)), "the request is with an owner device: it does not ring here again");
+        assert!(!t.awaiting_owner() && !t.is_ringing("assist_1"));
+        // No hold line is said over the takeover and no clock is set to give up on a call the owner has: only the takeover's own are running.
+        assert!(t.due(at(3) + HOLD_AFTER + Duration::from_secs(1)).is_empty(), "nothing is said");
+        assert!(t.next_deadline().is_some_and(|d| d > at(3) + HOLD_AFTER), "no hold or give-up clock");
+        let later = t.due(at(2) + HOLD_EVERY);
+        assert_eq!(later, vec![Due::Connecting(STILL_CONNECTING_LINES[0])], "the takeover's own line, and no other");
+        // Any other request's answer while the owner has the call is not a ring either.
+        assert!(!t.ringing("assist_2", 40, at(4)));
+        // A takeover that failed gives the call back: the next request rings.
+        t.outcome("assist_1", Outcome::Unavailable, at(30));
+        assert!(t.ringing("assist_2", 40, at(40)) && t.is_ringing("assist_2"));
     }
 
     #[test]

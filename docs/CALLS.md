@@ -207,8 +207,10 @@ agent : "I'll try to reach them, please stay with me."  (it is trying: it does n
 - **Tools never overlap.** The phone answers a tool call made while another is unanswered `busy`, the 25th
   tool call of a call `tool_limit`, and ends the session at its 35th (`transfer-v1.md`, Tool names). Tools go to
   the phone as they always did, except that a transfer waits for any tool on the wire and any tool waits for a
-  transfer on the wire, at most four wait, and a transfer is not asked for once six tools have been sent (one is
-  kept for the goodbye): this desktop's own limit, well inside the phone's.
+  transfer on the wire, at most four wait, and a transfer is not asked for once 19 tools have been sent: the 24 the phone answers, less
+  the four that may wait behind the request and one kept for the goodbye, so nothing sent after the request meets `tool_limit`
+  (`TOOLS_BEFORE_LAST` and `PHONE_TOOL_LIMIT` in `transfer.rs`; a limit of six, this desktop's own, used to refuse a caller
+  who had done nothing wrong after a few lookups).
 - **Handed over, handed back.** The owner taking the call ends this session and not the call: the app
   is told (`call.handoff`) and the call stays in a ledger (it is in `hello.calls` and
   `GET /api/voice/calls`). If the owner hands the caller back, or the takeover fails and the call
