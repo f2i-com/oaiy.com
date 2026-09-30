@@ -8174,6 +8174,8 @@ fn a_text_is_refused_when_it_hides_more_than_it_shows_and_not_when_it_is_only_wr
         "\u{0645}\u{06CC}\u{200C}\u{062E}\u{0648}\u{0627}\u{0647}\u{0645} \u{0645}\u{06CC}\u{200C}\u{0631}\u{0648}\u{0645}".to_string(),
         "\u{FEFF}a text that starts with a byte order mark".to_string(),
         "one\u{200B}stray one".to_string(),
+        "\u{0645}\u{200C}\u{0645}\u{200C}\u{0645}\u{200C}\u{0645}\u{200C}\u{0645}\u{200C}\u{0645} five joins in Persian".to_string(),
+        "\u{0645}\u{200C}".to_string(),
     ];
     for text in &legitimate {
         assert_eq!(text_problem(text), None, "{text:?} is text a person and a model read alike");
@@ -8191,6 +8193,15 @@ fn a_text_is_refused_when_it_hides_more_than_it_shows_and_not_when_it_is_only_wr
         (format!("ab{}", "\u{200D}\u{FE0F}".repeat(5)), "a run of"),
         ("\u{200D}\u{200D}\u{200D}\u{200D}\u{200D}\u{200D}\u{200D}".to_string(), "a run of"),
         ("a\u{0007}b".to_string(), "control characters"),
+        (format!("Hi {}\u{E007F}", tags("gbeng")), "tag characters"),
+        ("a\u{200C}b\u{200C}c\u{200C}d\u{200C}e".to_string(), "characters a person cannot see"),
+        ("\u{200C}\u{200C}\u{200C}\u{200C}".to_string(), "characters a person cannot see"),
+        ("1\u{200C}2\u{200C}3\u{200C}4\u{200C}5".to_string(), "characters a person cannot see"),
+        ("a\u{200C}\u{0645} ".repeat(4), "characters a person cannot see"),
+        ("\u{0645}\u{200C}a ".repeat(4), "characters a person cannot see"),
+        ("\u{1F600}\u{200C}\u{0645} ".repeat(4), "characters a person cannot see"),
+        ("\u{0645}\u{200C}\u{1F600} ".repeat(4), "characters a person cannot see"),
+
     ];
     for (text, why) in &refused {
         let found = text_problem(text).unwrap_or_else(|| panic!("{text:?} hides text and is not refused"));
