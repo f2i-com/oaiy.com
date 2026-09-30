@@ -36,7 +36,7 @@ use std::sync::{Arc, OnceLock};
 
 use serde::Serialize;
 
-pub use host::{Authorised, CallInfo, CallSource, Clock, DeviceSource, PresenceSource, Ring};
+pub use host::{Authorised, CallInfo, CallSource, Clock, DeviceSource, PresenceSource, Ring, Withdrawal};
 pub use plan::{plan, Decision, Inputs, PlanReason, Presence, Reason, RingPlan};
 pub use session::{set_global_notifier, ActiveRing, Action, Notice, RingError, RingNotifier};
 pub use settings::{RingSettings, SettingsError, SettingsStore};

@@ -151,6 +151,26 @@ impl Flow {
         plan
     }
 
+    /// The phone plugin's real order: it tells this desktop the request is out (`oaiy.ring.opened`) as soon as it opens it, and its answer to
+    /// the model (`ringing`) is held until the line the model spoke before calling has drained. So the ring is up on this desktop while the call
+    /// has not yet heard which request rings. The model's asking, and the tool call as the phone got it.
+    async fn open_before_ringing(&mut self, request: &str, seconds: u64) -> (tokio::task::JoinHandle<Result<Value, String>>, Value) {
+        let asked = asking(&self.aokie, transfer::TOOL, json!({"reason": "caller_asked"}));
+        let call = self.aokie.text("formlogic.realtime.tool_call", secs(3)).await.expect("the tool call reached the phone");
+        let mut question = shared("ring-plan")["plan"]["params"].clone();
+        question["callId"] = json!(self.aokie.call);
+        question["recentCallerTurns"] = json!([ASKED]);
+        let plan = PluginHost::ring_request(&self.ring, "oaiy.ring.plan", question).expect("the plugin was answered");
+        let mut told = shared("ring-plan")["opened"]["input"].clone();
+        told["planId"] = plan["planId"].clone();
+        told["requestId"] = json!(request);
+        told["callId"] = json!(self.aokie.call);
+        told["expiresAt"] = json!(self.ring.clock().unix() + seconds);
+        PluginHost::ring_request(&self.ring, "oaiy.ring.opened", told).expect("the ring opened");
+        assert_eq!(self.dialog().await.len(), 1, "the dialog is up before the call has heard the request id");
+        (asked, call)
+    }
+
     async fn notices(&self) -> Vec<Value> {
         let read: Value = reqwest::get(format!("{}/api/ring/active", self.base)).await.unwrap().json().await.unwrap();
         read["notices"].as_array().unwrap().clone()
@@ -282,6 +302,119 @@ async fn a_withdrawal_the_phone_has_no_open_request_for_ends_the_wait_at_once_an
 }
 
 #[tokio::test]
+async fn a_decline_before_the_phone_names_the_request_to_the_call_is_kept_and_goes_the_moment_it_does() {
+    // The reviewer's case: the owner's likeliest click is right after the popup, before the model's line has drained and the phone's answer
+    // to the tool call has said which request rings. Nothing may be lost, and the owner is told only what is true.
+    let mut f = flow(owner_settings(true)).await;
+    f.caller_says(ASKED);
+    let (asked, call) = f.open_before_ringing("assist_1", 30).await;
+    let (status, said) = f.owner_answers("assist_1", "decline").await;
+    assert_eq!(status, 200, "{said}");
+    let note = said["note"].as_str().unwrap();
+    assert!(note.contains("Waiting for the phone to confirm") && !note.starts_with("Asking your Companion"), "never that the phone is being asked before the frame is on the wire: {note}");
+    // Nothing can go yet, and the wait for the phone's answer has not begun: longer than it, the ring is still stopping and nothing was decided.
+    assert!(f.aokie.text(transfer::CANCEL_FRAME, Duration::from_millis(900)).await.is_none(), "the call has not heard the request id");
+    let shown = f.dialog().await;
+    assert_eq!((shown.len(), shown[0]["stopping"].clone()), (1, json!(true)), "{shown:?}");
+    assert!(f.aokie.event("call.transfer", Duration::from_millis(100)).await.is_none(), "nothing is decided by the wait running out before it began");
+    // The phone's answer to the model arrives: the withdrawal goes at once, in the shared fixture's frame.
+    f.aokie.send(ringing(&f.aokie, call["toolCallId"].as_str().unwrap(), "assist_1", 30));
+    assert_eq!(answer_of(asked).await.unwrap()["output"]["status"], "ringing");
+    f.phone_is_asked_to_withdraw("assist_1", "owner_declined").await;
+    // And it is answered as any withdrawal is: the request is withdrawn, the app is told, the caller is offered a message.
+    f.aokie.send(outcome(&f.aokie, "assist_1", "cancelled", None));
+    let told = f.aokie.event("call.transfer", secs(3)).await.expect("the app is told");
+    assert_eq!((told["outcome"].clone(), told["source"].clone()), (json!("cancelled"), json!("phone")));
+    assert!(spoken_within(&f.aokie, transfer::OFFER_LINE, secs(3)).await, "{:?}", f.aokie.speech.spoken());
+    assert!(f.dialog().await.is_empty());
+    assert_eq!(f.ended(), vec![("assist_1".to_string(), "cancelled", "phone")]);
+}
+
+#[tokio::test]
+async fn the_wait_for_the_phones_answer_to_a_kept_decline_starts_when_the_request_is_named_and_not_at_the_click() {
+    let mut f = flow(owner_settings(true)).await;
+    f.caller_says(ASKED);
+    let (asked, call) = f.open_before_ringing("assist_1", 30).await;
+    assert_eq!(f.owner_answers("assist_1", "message").await.0, 200);
+    // Longer than the wait (0.5 s here, 2 s in a real call): were it counted from the click, the ring would be over.
+    tokio::time::sleep(Duration::from_millis(900)).await;
+    assert_eq!(f.dialog().await.len(), 1);
+    f.aokie.send(ringing(&f.aokie, call["toolCallId"].as_str().unwrap(), "assist_1", 30));
+    let _ = answer_of(asked).await;
+    let sent = Instant::now();
+    f.phone_is_asked_to_withdraw("assist_1", "message_instead").await;
+    // The phone says nothing: from now the wait runs, and it ends as any does, as if the owner had declined.
+    let told = f.aokie.event("call.transfer", secs(3)).await.expect("the desktop ends it itself");
+    assert_eq!((told["outcome"].clone(), told["source"].clone()), (json!("declined"), json!("desktop")));
+    assert!(sent.elapsed() >= Duration::from_millis(400), "{:?} after the frame was sent", sent.elapsed());
+    assert!(spoken_within(&f.aokie, transfer::OFFER_LINE, secs(3)).await);
+    assert!(f.dialog().await.is_empty());
+}
+
+#[tokio::test]
+async fn a_decline_for_a_request_the_phone_then_refuses_is_over_here_and_nothing_is_sent() {
+    let mut f = flow(owner_settings(true)).await;
+    f.caller_says(ASKED);
+    let (asked, call) = f.open_before_ringing("assist_1", 30).await;
+    assert_eq!(f.owner_answers("assist_1", "decline").await.0, 200);
+    // The phone refuses the tool call itself (say, consent was taken back as it was made): nothing rings on the phone to withdraw.
+    let mut refusal = on_this_call(shared("tool-result")["frame"].clone(), &f.aokie, None);
+    refusal["toolCallId"] = call["toolCallId"].clone();
+    refusal["ok"] = json!(false);
+    refusal["output"] = json!({"status": "refused", "reason": "consent", "instruction": "Offer a message."});
+    f.aokie.send(refusal);
+    let answer = answer_of(asked).await.unwrap();
+    assert_eq!((answer["ok"].clone(), answer["output"]["reason"].clone()), (json!(false), json!("consent")));
+    for _ in 0..40 {
+        if f.dialog().await.is_empty() {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    assert!(f.dialog().await.is_empty(), "the ring the owner declined is not left stopping for ever");
+    assert_eq!(f.ended(), vec![("assist_1".to_string(), "declined", "desktop")]);
+    assert!(f.aokie.text(transfer::CANCEL_FRAME, Duration::from_millis(500)).await.is_none(), "there was nothing to withdraw");
+    assert!(f.aokie.event("call.transfer", Duration::from_millis(100)).await.is_none(), "the app is not told of a request that was never made");
+}
+
+#[tokio::test]
+async fn a_decline_for_a_request_the_phone_never_named_is_sent_when_the_tool_call_is_given_up_on_and_a_late_answer_revives_nothing() {
+    let mut f = flow(owner_settings(true)).await;
+    f.caller_says(ASKED);
+    let (asked, call) = f.open_before_ringing("assist_1", 30).await;
+    assert_eq!(f.owner_answers("assist_1", "decline").await.0, 200);
+    // The phone never answers the tool call: the model is told so after 2.5 s here (25 s in a real call)...
+    let answer = answer_of(asked).await.unwrap();
+    assert_eq!((answer["ok"].clone(), answer["output"]["reason"].clone()), (json!(false), json!("no_answer")));
+    // ...and the request may have opened all the same, so the phone is told the owner declined it.
+    f.phone_is_asked_to_withdraw("assist_1", "owner_declined").await;
+    let told = f.aokie.event("call.transfer", secs(3)).await.expect("the desktop ends it itself when the phone says nothing");
+    assert_eq!((told["outcome"].clone(), told["source"].clone()), (json!("declined"), json!("desktop")));
+    assert!(f.dialog().await.is_empty());
+    // The answer that comes after all is to a tool call that was given up on: the request it names is not brought back.
+    let holds_before = said_of(&f, &transfer::HOLD_LINES).len();
+    f.aokie.send(ringing(&f.aokie, call["toolCallId"].as_str().unwrap(), "assist_1", 30));
+    tokio::time::sleep(Duration::from_millis(1_200)).await;
+    assert_eq!(said_of(&f, &transfer::HOLD_LINES).len(), holds_before, "no hold line for a request that ended: {:?}", f.aokie.speech.spoken());
+    assert!(f.aokie.event("call.transfer", Duration::from_millis(100)).await.is_none());
+    assert!(f.dialog().await.is_empty());
+}
+
+#[tokio::test]
+async fn a_call_that_ends_while_a_decline_waits_ends_the_ring_and_a_click_after_it_finds_nothing() {
+    let mut f = flow(owner_settings(true)).await;
+    f.caller_says(ASKED);
+    let (_asked, _call) = f.open_before_ringing("assist_1", 30).await;
+    assert_eq!(f.owner_answers("assist_1", "decline").await.0, 200);
+    f.aokie.send(json!({"type": "formlogic.realtime.stop", "callId": f.aokie.call, "generation": 1, "reason": "the caller hung up"}));
+    f.aokie.event("call.ended", secs(3)).await.expect("the call ended");
+    assert!(f.dialog().await.is_empty(), "what rings for a call that ended is over");
+    assert_eq!(f.ended(), vec![("assist_1".to_string(), "cancelled", "call")]);
+    assert_eq!(f.owner_answers("assist_1", "decline").await.0, 404, "a click on a ring that is over finds nothing");
+    assert!(f.aokie.text(transfer::CANCEL_FRAME, Duration::from_millis(300)).await.is_none());
+}
+
+#[tokio::test]
 async fn a_decline_that_races_an_accept_is_decided_once_by_the_phone_too_late_offers_no_message() {
     let mut f = flow(owner_settings(true)).await;
     f.caller_says(ASKED);
@@ -294,6 +427,13 @@ async fn a_decline_that_races_an_accept_is_decided_once_by_the_phone_too_late_of
     let shown = f.dialog().await;
     assert_eq!(shown.len(), 1, "the ring is not over: the acceptance is coming");
     assert!(shown[0]["stopping"] == json!(false) && shown[0]["note"].as_str().unwrap().contains("took the call just before you declined"), "{}", shown[0]);
+    // There is nothing left to decline: a second click asks the phone nothing (a withdrawal is sent once) and is told why.
+    assert_eq!(shown[0]["taken"], json!(true));
+    let (status, said) = f.owner_answers("assist_1", "decline").await;
+    assert_eq!(status, 200);
+    assert!(said["note"].as_str().unwrap().contains("took the call just before you declined"), "{said}");
+    assert!(f.aokie.text(transfer::CANCEL_FRAME, Duration::from_millis(400)).await.is_none(), "the phone was asked once");
+    assert_eq!(f.dialog().await[0]["taken"], json!(true), "and the dialog still says so");
     // Nothing is offered while the phone's acceptance comes, however long the wait would have been.
     tokio::time::sleep(Duration::from_millis(800)).await;
     assert!(!f.aokie.speech.spoken().iter().any(|l| l == transfer::OFFER_LINE), "{:?}", f.aokie.speech.spoken());

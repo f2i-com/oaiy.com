@@ -107,9 +107,25 @@ impl crate::ring::CallSource for HubCalls {
         }
     }
 
-    fn cancel_transfer(&self, call: &str, request: &str, reason: transfer::CancelReason) -> bool {
-        let Some(inner) = self.0.upgrade() else { return false };
-        (VoiceHub { inner }).command(call).is_some_and(|tx| tx.send(CallCommand::CancelTransfer { request: request.to_string(), reason }).is_ok())
+    fn cancel_transfer(&self, call: &str, request: &str, reason: transfer::CancelReason) -> tokio::sync::oneshot::Receiver<crate::ring::Withdrawal> {
+        let (reply, answer) = tokio::sync::oneshot::channel();
+        let Some(inner) = self.0.upgrade() else {
+            let _ = reply.send(crate::ring::Withdrawal::NoSession);
+            return answer;
+        };
+        match (VoiceHub { inner }).command(call) {
+            Some(tx) => {
+                if let Err(gone) = tx.send(CallCommand::CancelTransfer { request: request.to_string(), reason, reply }) {
+                    if let CallCommand::CancelTransfer { reply, .. } = gone.0 {
+                        let _ = reply.send(crate::ring::Withdrawal::NoSession);
+                    }
+                }
+            }
+            None => {
+                let _ = reply.send(crate::ring::Withdrawal::NoSession);
+            }
+        }
+        answer
     }
 }
 

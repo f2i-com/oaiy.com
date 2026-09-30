@@ -303,6 +303,8 @@ pub struct Transfer {
     cancelling: Option<Cancelling>,
     /// The request the phone was told this desktop gave up on.
     gave_up_sent: Option<String>,
+    /// The request the phone was asked to withdraw (once).
+    cancel_sent: Option<String>,
     /// The requests that ended here without an owner device taking the call, most recent last (a few: see [`Transfer::is_stale`]).
     ended: Vec<String>,
     accepted: Option<(String, Instant)>,
@@ -335,20 +337,34 @@ impl Transfer {
         !self.handing_over
     }
 
-    /// The phone answered the tool: the owner is being rung (`ringSeconds`), and the outcome is due.
-    pub fn ringing(&mut self, request: &str, ring_seconds: u64, now: Instant) {
+    /// Whether `request` is the one that rings.
+    pub fn is_ringing(&self, request: &str) -> bool {
+        self.ringing.as_ref().is_some_and(|r| r.request == request)
+    }
+
+    /// The phone answered the tool: the owner is being rung (`ringSeconds`), and the outcome is due. A request that already ended here
+    /// is not brought back by a late answer (nothing changes, and false): whatever ended it is what the caller was told.
+    pub fn ringing(&mut self, request: &str, ring_seconds: u64, now: Instant) -> bool {
+        if self.ended.iter().any(|e| e == request) {
+            return false;
+        }
         self.ringing = Some(Ringing { request: request.to_string(), give_up_at: now + Duration::from_secs(ring_seconds.clamp(1, 300)) + self.timing.give_up_after });
         self.hold_at = Some(now + self.timing.hold_after);
         self.holds_said = 0;
         self.offer_at = None;
+        true
     }
 
-    /// This desktop asks the phone to withdraw `request` (the owner declined, or it ran out): whether the frame should be sent,
-    /// which it should be for the request that rings and only once. The phone's answer is waited for up to `cancel_wait`.
+    /// This desktop asks the phone to withdraw `request` (the owner declined): whether the frame should be sent, which it should be once
+    /// ("send it once; a repeat does nothing": a second click after the phone said it was too late asks nothing more), for a request that has
+    /// not ended and that no owner device has, and that is the one that rings or one whose ringing answer never came. The phone's answer is
+    /// waited for up to `cancel_wait`.
     pub fn cancel(&mut self, request: &str, now: Instant) -> bool {
-        if self.ringing.as_ref().is_none_or(|r| r.request != request) || self.cancelling.as_ref().is_some_and(|c| c.request == request) {
+        let done = self.ended.iter().any(|e| e == request) || self.cancel_sent.as_deref() == Some(request) || self.gave_up_sent.as_deref() == Some(request) || self.accepted.as_ref().is_some_and(|(a, _)| a == request);
+        if done || self.ringing.as_ref().is_some_and(|r| r.request != request) {
             return false;
         }
+        self.cancel_sent = Some(request.to_string());
         self.cancelling = Some(Cancelling { request: request.to_string(), answer_by: now + self.timing.cancel_wait });
         true
     }
@@ -356,7 +372,7 @@ impl Transfer {
     /// The phone is told, once, that this desktop gave up on `request`, which is the one that rings (`gave_up`: nothing is
     /// waited for). Whether the frame should be sent.
     pub fn gave_up(&mut self, request: &str) -> bool {
-        if self.ringing.as_ref().is_none_or(|r| r.request != request) || self.gave_up_sent.as_deref() == Some(request) {
+        if self.ringing.as_ref().is_none_or(|r| r.request != request) || self.gave_up_sent.as_deref() == Some(request) || self.cancel_sent.as_deref() == Some(request) {
             return false;
         }
         self.gave_up_sent = Some(request.to_string());
@@ -908,6 +924,49 @@ mod tests {
         t.cancel("assist_1", at(3));
         assert_eq!(t.outcome("assist_1", Outcome::Accepted, at(4)), vec![Effect::Cut, Effect::Say(CONNECTING_LINE)]);
         assert!(!t.due(at(4) + CANCEL_WAIT).iter().any(|d| matches!(d, Due::CancelUnanswered(_))), "not still waiting");
+    }
+
+    #[test]
+    fn a_withdrawal_is_sent_once_and_only_for_a_request_that_is_not_over() {
+        // Once: a second click after the phone said it was too late (or at all) asks nothing more.
+        let mut t = Transfer::default();
+        t.ringing("assist_1", 40, at(0));
+        assert!(t.cancel("assist_1", at(3)));
+        assert!(!t.cancel("assist_1", at(3)), "while it is asked");
+        assert!(t.too_late("assist_1"));
+        assert!(!t.cancel("assist_1", at(4)), "after the phone said it was too late: a withdrawal is sent once");
+        assert!(!t.gave_up("assist_1"), "and giving up after it does not send another");
+        // A request whose ringing answer never came can be withdrawn (the phone may have opened it all the same): nothing rings here.
+        let mut t = Transfer::default();
+        assert!(t.cancel("assist_1", at(0)) && t.cancelling.is_some());
+        assert!(!t.busy(), "it does not make the call busy: nothing is going as far as this call knows");
+        // Not for a request an owner device has, or one that ended, or another request than the one that rings.
+        let mut t = Transfer::default();
+        t.ringing("assist_1", 40, at(0));
+        assert!(!t.cancel("assist_2", at(1)), "another request rings");
+        t.outcome("assist_1", Outcome::Accepted, at(2));
+        assert!(!t.cancel("assist_1", at(3)), "an owner device has it");
+        let mut t = Transfer::default();
+        t.ringing("assist_1", 40, at(0));
+        t.outcome("assist_1", Outcome::Expired, at(2));
+        assert!(!t.cancel("assist_1", at(3)), "it ended");
+    }
+
+    #[test]
+    fn a_late_answer_does_not_bring_back_a_request_that_ended_and_does_not_hide_the_ending_of_another() {
+        let mut t = Transfer::default();
+        t.ringing("assist_1", 40, at(0));
+        t.outcome("assist_1", Outcome::Declined, at(3));
+        assert!(!t.busy() && t.next_deadline().is_none_or(|d| d <= at(3) + OFFER_AFTER));
+        // The phone's answer to the tool call, late: the request it names is over here and stays over.
+        assert!(!t.ringing("assist_1", 40, at(6)), "not brought back");
+        assert!(!t.busy() && !t.awaiting_owner(), "no ring, no hold line, no give-up clock");
+        assert!(t.due(at(6) + Duration::from_secs(100)).iter().all(|d| matches!(d, Due::Say(line) if *line == OFFER_LINE)), "only the offer that was already due");
+        // A new request is a new request: it rings, and its ending is not taken for the old one's.
+        assert!(t.ringing("assist_2", 40, at(200)));
+        assert!(!t.is_stale("assist_2", Outcome::Declined) && t.is_stale("assist_1", Outcome::Declined));
+        assert!(!t.outcome("assist_2", Outcome::Declined, at(210)).iter().any(|_| true));
+        assert_eq!(t.due(at(210) + OFFER_AFTER), vec![Due::Say(OFFER_LINE)]);
     }
 
     #[test]

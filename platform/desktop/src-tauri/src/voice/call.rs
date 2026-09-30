@@ -80,10 +80,9 @@ pub enum CallCommand {
     NoAnswerer,
     /// The owner declined a ring in the dashboard's dialog (or it ran out here): the phone is asked to withdraw the request
     /// (`formlogic.realtime.transfer_cancel`), and its answer decides what the caller hears; if it does not answer in a couple of
-    /// seconds the request is over here.
-    CancelTransfer { request: String, reason: transfer::CancelReason },
-    /// A request to reach the owner came out (from a clock or the ring's own end): as if the phone had said so.
-    Outcome { request: String, outcome: Outcome, source: &'static str },
+    /// seconds the request is over here. `reply` says what came of asking (see [`crate::ring::Withdrawal`]): while the call's own
+    /// transfer request is still on the wire the phone has not named the request to it, so the frame is kept and goes the moment it does.
+    CancelTransfer { request: String, reason: transfer::CancelReason, reply: oneshot::Sender<crate::ring::Withdrawal> },
 }
 
 /// What a caller is told when nobody can answer them and no request to reach the owner is going.
@@ -627,6 +626,19 @@ where
     })
 }
 
+/// Ask the phone to withdraw `request`, if this call has not already (`transfer_cancel`: once, and its answer is waited for unless this
+/// desktop is only giving up). Whether the frame was sent.
+async fn send_withdrawal(transfer: &mut Transfer, out_tx: &mpsc::Sender<Message>, ids: &Ids, request: &str, reason: transfer::CancelReason) -> bool {
+    let send = match reason {
+        transfer::CancelReason::GaveUp => transfer.gave_up(request),
+        _ => transfer.cancel(request, Instant::now()),
+    };
+    if send {
+        let _ = out_tx.send(ids.event(transfer::CANCEL_FRAME, json!({"requestId": request, "reason": reason.as_str()}))).await;
+    }
+    send
+}
+
 /// One call, over the two halves of Aokie's stream: what goes to Aokie (`sink`) and what comes from it.
 async fn run_on<Si, St, E>(mut sink: Si, mut stream: St, hub: VoiceHub, engines: Engines)
 where
@@ -947,6 +959,9 @@ where
     let mut transfer = Transfer::new(timing);
     // What was heard of a request this turn of the loop (from the phone, or from a clock): (request, outcome, the owner's words, where from).
     let mut outcomes: Vec<(String, Outcome, Option<String>, &'static str)> = Vec::new();
+    // The owner declined a ring whose request the phone has not yet named to this call (its answer to the tool call is held until the line
+    // the model spoke drains): the withdrawal waits here, and goes when the answer comes (or, if there is none, when the tool call is given up on).
+    let mut queued_cancel: Option<(String, transfer::CancelReason)> = None;
     // A reply the caller cut off, said after all if their words were only an acknowledgement.
     let mut resume: Option<Resume> = None;
     // What they said over us, heard at a pause in it (its words come on `words_rx`, by when it was said).
@@ -1056,12 +1071,26 @@ where
                                 if tools.answered(&id).as_deref() == Some(transfer::TOOL) {
                                     if ok && output.get("status").and_then(Value::as_str) == Some("ringing") {
                                         if let Some(request) = output.get("requestId").and_then(Value::as_str) {
+                                            // A request that already ended here is not brought back by a late answer.
                                             transfer.ringing(request, output.get("ringSeconds").and_then(Value::as_u64).unwrap_or(40), Instant::now());
+                                            // The owner declined while the phone had not yet said which request rings: the withdrawal goes now,
+                                            // and its answer is waited for from now.
+                                            if let Some((queued, reason)) = queued_cancel.take() {
+                                                if queued == request {
+                                                    send_withdrawal(&mut transfer, &out_tx, &ids, request, reason).await;
+                                                } else {
+                                                    let _ = out_tx.send(ids.event(transfer::CANCEL_FRAME, json!({"requestId": queued, "reason": reason.as_str()}))).await;
+                                                }
+                                            }
                                         }
                                     } else if !ok {
                                         // The phone refused it itself (consent, a changed call, a plan it could not use) and rang nobody:
                                         // the try this desktop counted for it is given back, so a refusal does not start the gap or spend the hour.
                                         hub.ring().request_refused(&ids.call);
+                                        // A ring the owner declined for a request that was refused has nothing to withdraw: it is over here.
+                                        if let Some((queued, _)) = queued_cancel.take() {
+                                            ring.outcome_seen(&queued, Outcome::Declined, "desktop");
+                                        }
                                     }
                                 }
                                 if let Some(reply) = pending_tools.remove(&id) {
@@ -1251,7 +1280,6 @@ where
                         resume = None;
                         cut();
                     }
-                    CallCommand::Outcome { request, outcome, source } => outcomes.push((request, outcome, None, source)),
                     CallCommand::NoAnswerer => {
                         match transfer.answer_caller(Instant::now()) {
                             Some(line) => {
@@ -1267,17 +1295,22 @@ where
                             }
                         }
                     }
-                    CallCommand::CancelTransfer { request, reason } => {
-                        // Only for the request that rings, and once. The owner declining asks and waits for the phone's answer; this
+                    CallCommand::CancelTransfer { request, reason, reply } => {
+                        // Once, and only for a request that is not over. The owner declining asks and waits for the phone's answer; this
                         // desktop giving up only tells the phone, and nothing waits.
-                        let send = allow_transfer
-                            && match reason {
-                                transfer::CancelReason::GaveUp => transfer.gave_up(&request),
-                                _ => transfer.cancel(&request, Instant::now()),
-                            };
-                        if send {
-                            let _ = out_tx.send(ids.event(transfer::CANCEL_FRAME, json!({"requestId": request, "reason": reason.as_str()}))).await;
-                        }
+                        let answer = if !allow_transfer {
+                            crate::ring::Withdrawal::Nothing
+                        } else if tools.transfer_pending() && !transfer.is_ringing(&request) {
+                            // The phone has not named the request to this call yet: its answer to the tool call waits for the line the model
+                            // spoke to drain, while the request is already open and ringing. The withdrawal is kept and goes when it does.
+                            queued_cancel = Some((request, reason));
+                            crate::ring::Withdrawal::Queued
+                        } else if send_withdrawal(&mut transfer, &out_tx, &ids, &request, reason).await {
+                            crate::ring::Withdrawal::Sent
+                        } else {
+                            crate::ring::Withdrawal::Nothing
+                        };
+                        let _ = reply.send(answer);
                     }
                     CallCommand::Tool { name, arguments, reply } => {
                         match name.as_str() {
@@ -1401,6 +1434,11 @@ where
                     }
                 }
                 if !unanswered.is_empty() {
+                    // A withdrawal that waited for the phone to name the request it never named: it may have opened one all the same, so the
+                    // phone is told now, and this desktop waits for its answer as for any.
+                    if let Some((queued, reason)) = queued_cancel.take() {
+                        send_withdrawal(&mut transfer, &out_tx, &ids, &queued, reason).await;
+                    }
                     for next in tools.ready() {
                         send_waiting(next, &mut tools, &mut pending_tools, &mut finishing, &out_tx, &ids).await;
                     }

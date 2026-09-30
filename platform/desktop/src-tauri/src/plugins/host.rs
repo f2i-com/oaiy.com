@@ -2596,8 +2596,10 @@ mod tests {
             }
         }
         fn call_ended_by_phone(&self, _: &str) {}
-        fn cancel_transfer(&self, _: &str, _: &str, _: crate::voice::transfer::CancelReason) -> bool {
-            true
+        fn cancel_transfer(&self, _: &str, _: &str, _: crate::voice::transfer::CancelReason) -> tokio::sync::oneshot::Receiver<crate::ring::Withdrawal> {
+            let (reply, answer) = tokio::sync::oneshot::channel();
+            let _ = reply.send(crate::ring::Withdrawal::Sent);
+            answer
         }
     }
 

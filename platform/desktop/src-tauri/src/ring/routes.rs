@@ -62,7 +62,7 @@ async fn respond(State(ring): State<Arc<Ring>>, Path(id): Path<String>, Json(bod
     let Some(action) = super::session::Action::parse(&body.action) else {
         return (StatusCode::BAD_REQUEST, Json(json!({"error": {"code": "bad_action", "message": "the action is decline or message"}}))).into_response();
     };
-    match ring.respond(&id, action) {
+    match ring.respond(&id, action).await {
         Ok(r) => Json(json!({"ok": r.ok, "note": r.note})).into_response(),
         Err(e) => (StatusCode::from_u16(e.status).unwrap_or(StatusCode::INTERNAL_SERVER_ERROR), Json(json!({"error": {"code": e.code, "message": e.message}}))).into_response(),
     }

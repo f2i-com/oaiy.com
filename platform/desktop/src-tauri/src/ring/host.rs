@@ -65,9 +65,26 @@ pub trait CallSource: Send + Sync {
     /// The phone says the call ended (the plugin's own event): the hub ends one that was handed to the owner.
     fn call_ended_by_phone(&self, call: &str);
     /// The phone is asked to withdraw `request` on `call` (the owner declined in the dialog, or it ran out): the call sends
-    /// `transfer_cancel` on its stream, waits for the phone's answer and acts on it. Whether the call has a live session to
-    /// carry it; if not, nothing can be told and the ring is over here.
-    fn cancel_transfer(&self, call: &str, request: &str, reason: crate::voice::transfer::CancelReason) -> bool;
+    /// `transfer_cancel` on its stream, waits for the phone's answer and acts on it. What came of the asking is the answer: the frame
+    /// is on the wire, or is waiting for the phone to name the request to the call, or there was nothing to withdraw, or no session.
+    fn cancel_transfer(&self, call: &str, request: &str, reason: crate::voice::transfer::CancelReason) -> tokio::sync::oneshot::Receiver<Withdrawal>;
+}
+
+/// What came of asking the phone to withdraw a request (see [`CallSource::cancel_transfer`]): what the owner is told is never more than
+/// this.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Withdrawal {
+    /// The frame is on the call's stream, and its answer is being waited for.
+    Sent,
+    /// The phone has not yet named the request to the call (its answer to the tool call waits for the line the model spoke to drain):
+    /// the frame goes the moment it does, and its answer is waited for from then.
+    Queued,
+    /// The call has no such request to withdraw (it ended here, or an owner device has it, or this call never asked): nothing was sent.
+    Nothing,
+    /// The call has no live session to carry it.
+    NoSession,
+    /// The call did not say in time.
+    Unknown,
 }
 
 struct Absent;
@@ -184,9 +201,16 @@ impl Ring {
         get(&self.notifier).or_else(super::session::global_notifier)
     }
 
-    /// Ask the phone, through the call, to withdraw `request` (see [`CallSource::cancel_transfer`]). Whether the call could carry it.
-    pub fn cancel_on_call(&self, call: &str, request: &str, reason: crate::voice::transfer::CancelReason) -> bool {
-        get(&self.calls).is_some_and(|calls| calls.cancel_transfer(call, request, reason))
+    /// Ask the phone, through the call, to withdraw `request` (see [`CallSource::cancel_transfer`]): what came of it, when the call says.
+    pub fn cancel_on_call(&self, call: &str, request: &str, reason: crate::voice::transfer::CancelReason) -> tokio::sync::oneshot::Receiver<Withdrawal> {
+        match get(&self.calls) {
+            Some(calls) => calls.cancel_transfer(call, request, reason),
+            None => {
+                let (reply, answer) = tokio::sync::oneshot::channel();
+                let _ = reply.send(Withdrawal::NoSession);
+                answer
+            }
+        }
     }
 
     /// How long a ring waits past its time to hear how it came out (a test shortens it).

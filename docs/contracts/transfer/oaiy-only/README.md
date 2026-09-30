@@ -49,7 +49,10 @@ The plan reasons OAIY puts in an `oaiy.ring.plan` answer are exactly the plugin'
   call's stream (`owner_declined`, `message_instead`) and waits up to two seconds: `cancelled` offers the caller a
   message; `too_late` offers nothing and the ring goes on; `unknown_request` ends the wait at once as a decline; no
   answer in two seconds is treated as a decline. A ring that has run out and was never heard of again sends
-  `gave_up` and waits for nothing.
+  `gave_up` and waits for nothing. The plugin opens a request before its answer to the tool call is sent (that
+  answer waits for the line the model spoke to drain), so a decline can come before the call has heard the request
+  id: it is kept, and goes with the two seconds counted from the moment the answer names the request. It is sent
+  once.
 * **The plan.** The desktop judges a request on its own record of the call (what it heard, and who rang), and
   uses what the plugin says of the call only for a call it has no record of. It names every paired Windows
   Companion whether or not it is running, and never plans a `ring` that names nobody. `reasonAllowed` is true

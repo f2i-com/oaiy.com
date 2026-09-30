@@ -219,7 +219,13 @@ agent : "I'll try to reach them, please stay with me."  (it is trying: it does n
   the caller hears, within two seconds: `cancelled` and the caller is offered a message; a notice that it
   is too late (a device already took the call) and nothing is offered while the acceptance goes on; no
   answer and the request is over here (a device that accepts later is obeyed). The dialog shows the ring
-  as stopping meanwhile.
+  as stopping meanwhile. The phone opens the request and tells this desktop (`oaiy.ring.opened`) before its
+  answer to the call's tool call, which waits for the line the model spoke to drain, so the dialog can be up
+  while the call has not yet heard which request rings: a decline in that window is kept (the dialog says it is
+  waiting for the phone to confirm, never that the phone is being asked), goes the moment the answer names the
+  request, and its two seconds are counted from then. If the phone refuses the tool call, nothing rings on it
+  and the ring is over here; if it never answers (25 seconds), the withdrawal goes then, in case it opened one
+  all the same. A withdrawal is sent once: after "too late" the dialog offers no Decline.
 
 The spoken lines of a transfer are the agent's own (it holds the conversation and the voice). They are
 not said in the speak-only mode below: that mode, used on a live call's id, would detach the live call,

@@ -24,7 +24,7 @@ use std::time::Duration;
 use serde::Serialize;
 
 use super::contract::OpenedParams;
-use super::host::Ring;
+use super::host::{Ring, Withdrawal};
 use super::plan::RingPlan;
 use crate::voice::transfer::{CancelReason, Outcome};
 
@@ -78,6 +78,9 @@ pub struct ActiveRing {
     pub devices: Vec<String>,
     /// The owner declined and the phone is being asked to withdraw the request: the dialog waits for its answer.
     pub stopping: bool,
+    /// The phone said an owner device had already taken the call when the owner declined: it is being connected, there is nothing left
+    /// to decline, and the dialog offers no more to click.
+    pub taken: bool,
     /// What the owner was last told about what they asked here.
     pub note: String,
 }
@@ -99,6 +102,8 @@ pub struct Ended {
 
 /// What the owner is told when somebody asked for them and no ring could be made for want of a device.
 pub const NO_DEVICE_TEXT: &str = "Someone asked for you. No device is set up to take a transfer, so they were offered a message.";
+/// What the owner is told when the phone said an owner device had already taken the call as they declined it.
+pub const TAKEN_NOTE: &str = "An owner device took the call just before you declined: it is being connected.";
 /// The most notices kept, and how long each is shown (milliseconds).
 const NOTICES_KEPT: usize = 5;
 const NOTICE_MS: u64 = 15 * 60 * 1000;
@@ -208,6 +213,7 @@ impl Ring {
             now,
             devices,
             stopping: false,
+            taken: false,
             note: String::new(),
         };
         {
@@ -235,7 +241,8 @@ impl Ring {
             if let Some(ring) = Weak::upgrade(&weak) {
                 // Nothing was heard of how it came out: it is over here, and the phone is asked to drop what it may still hold.
                 if ring.resolve(&id, Outcome::Expired, "timer") {
-                    ring.cancel_on_call(&call, &id, CancelReason::GaveUp);
+                    // Nothing is waited for: the answer, if any, is not read.
+                    let _ = ring.cancel_on_call(&call, &id, CancelReason::GaveUp);
                 }
             }
         });
@@ -338,16 +345,36 @@ impl Ring {
         changed
     }
 
-    /// The phone says it was too late to withdraw the request: an owner device took it. The ring goes on until the phone says so.
-    pub fn cancel_refused(&self, request: &str) {
-        self.set_stopping(request, false, "An owner device took the call just before you declined: it is being connected.");
+    /// Set the note of a ring that is being stopped, unless the phone has said since that an owner device took the call.
+    fn note_stopping(&self, request: &str, note: &str) {
+        let mut sessions = self.sessions.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(l) = sessions.live.iter_mut().find(|l| l.ring.id == request && l.ring.stopping && !l.ring.taken) {
+            l.ring.note = note.to_string();
+        }
     }
 
-    /// The owner answers a ring in the dialog. See the module docs for what each answer is.
-    pub fn respond(&self, request: &str, action: Action) -> Result<Responded, RingError> {
-        let Some(call) = self.sessions.lock().unwrap_or_else(|e| e.into_inner()).live.iter().find(|l| l.ring.id == request).map(|l| l.ring.call_id.clone()) else {
+    /// The phone says it was too late to withdraw the request: an owner device took it. The ring goes on until the phone says so, and
+    /// there is nothing left to decline: a second click asks the phone nothing (the contract sends a withdrawal once).
+    pub fn cancel_refused(&self, request: &str) {
+        let mut sessions = self.sessions.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(l) = sessions.live.iter_mut().find(|l| l.ring.id == request) {
+            l.ring.stopping = false;
+            l.ring.taken = true;
+            l.ring.note = TAKEN_NOTE.to_string();
+        }
+    }
+
+    /// The owner answers a ring in the dialog. See the module docs for what each answer is. What the owner is told is what came of
+    /// asking, and never more: not that the phone is being asked before the frame is on the call's stream (or, while the phone has not
+    /// yet named the request to the call, that it is waiting to go, which is said).
+    pub async fn respond(&self, request: &str, action: Action) -> Result<Responded, RingError> {
+        let Some((call, taken)) = self.sessions.lock().unwrap_or_else(|e| e.into_inner()).live.iter().find(|l| l.ring.id == request).map(|l| (l.ring.call_id.clone(), l.ring.taken)) else {
             return Err(error(404, "no_ring", "that ring is over"));
         };
+        // An owner device already has the call: there is nothing to decline, and the phone is asked nothing.
+        if taken {
+            return Ok(Responded { ok: true, note: TAKEN_NOTE.to_string() });
+        }
         let reason = match action {
             Action::Decline => CancelReason::OwnerDeclined,
             Action::Message => CancelReason::MessageInstead,
@@ -357,12 +384,27 @@ impl Ring {
             return Ok(Responded { ok: true, note: "Already asking your Companion to stop ringing.".to_string() });
         }
         // The phone is asked, on the call's own stream, and its answer decides what the caller hears: cancelled, and a message
-        // is offered; too late, and an owner device has the call. With no live session to carry the question there is no call
-        // to speak to: the ring is over here.
-        if !self.cancel_on_call(&call, request, reason) {
-            self.resolve(request, Outcome::Declined, "desktop");
-            return Ok(Responded { ok: true, note: "Declined. The call is not on this computer any more.".to_string() });
-        }
-        Ok(Responded { ok: true, note: "Asking your Companion to stop ringing. The receptionist will offer the caller a message.".to_string() })
+        // is offered; too late, and an owner device has the call. The call says what came of asking.
+        let answer = match tokio::time::timeout(Duration::from_secs(3), self.cancel_on_call(&call, request, reason)).await {
+            Ok(Ok(answer)) => answer,
+            _ => Withdrawal::Unknown,
+        };
+        let note = match answer {
+            Withdrawal::Sent => "Asking your Companion to stop ringing. The receptionist will offer the caller a message.",
+            Withdrawal::Queued => "Waiting for the phone to confirm the request, then asking your Companion to stop ringing. The receptionist will offer the caller a message.",
+            Withdrawal::Unknown => "Asked; the call has not confirmed that yet. The ring ends when it does.",
+            // With no live session to carry the question there is no call to speak to, and with nothing to withdraw there is nothing
+            // to wait for: the ring is over here.
+            Withdrawal::NoSession => {
+                self.resolve(request, Outcome::Declined, "desktop");
+                return Ok(Responded { ok: true, note: "Declined. The call is not on this computer any more.".to_string() });
+            }
+            Withdrawal::Nothing => {
+                self.resolve(request, Outcome::Declined, "desktop");
+                return Ok(Responded { ok: true, note: "Declined. There was nothing left to stop for this call.".to_string() });
+            }
+        };
+        self.note_stopping(request, note);
+        Ok(Responded { ok: true, note: note.to_string() })
     }
 }

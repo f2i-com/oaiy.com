@@ -23,12 +23,19 @@ struct Calls {
     ended: Mutex<Vec<String>>,
     /// The call has a live session that can carry the question to the phone.
     live: std::sync::atomic::AtomicBool,
+    /// What the call says of the withdrawal when it has a live session (the frame sent, kept for the phone to name the request, or nothing to withdraw).
+    answer: Mutex<Withdrawal>,
 }
 
 impl Default for Calls {
     fn default() -> Self {
-        Self { info: Mutex::default(), cancels: Mutex::default(), ended: Mutex::default(), live: std::sync::atomic::AtomicBool::new(true) }
+        Self { info: Mutex::default(), cancels: Mutex::default(), ended: Mutex::default(), live: std::sync::atomic::AtomicBool::new(true), answer: Mutex::new(Withdrawal::Sent) }
     }
+}
+
+/// `ring.respond` from a test that is not async: on a runtime of its own.
+fn respond(ring: &Ring, request: &str, action: Action) -> Result<crate::ring::session::Responded, RingError> {
+    tokio::runtime::Builder::new_current_thread().enable_time().build().unwrap().block_on(ring.respond(request, action))
 }
 
 impl CallSource for Calls {
@@ -38,9 +45,11 @@ impl CallSource for Calls {
     fn call_ended_by_phone(&self, call: &str) {
         self.ended.lock().unwrap().push(call.to_string());
     }
-    fn cancel_transfer(&self, call: &str, request: &str, reason: CancelReason) -> bool {
+    fn cancel_transfer(&self, call: &str, request: &str, reason: CancelReason) -> tokio::sync::oneshot::Receiver<Withdrawal> {
         self.cancels.lock().unwrap().push((call.to_string(), request.to_string(), reason));
-        self.live.load(std::sync::atomic::Ordering::SeqCst)
+        let (reply, answer) = tokio::sync::oneshot::channel();
+        let _ = reply.send(if self.live.load(std::sync::atomic::Ordering::SeqCst) { *self.answer.lock().unwrap() } else { Withdrawal::NoSession });
+        answer
     }
 }
 
@@ -225,7 +234,7 @@ fn the_first_word_about_a_ring_ends_it_and_later_words_change_nothing() {
     assert_eq!(r.notified.ended.lock().unwrap().as_slice(), [("assist_1".to_string(), "accepted".to_string())], "the notification is closed once, with how it came out");
     assert_eq!(ended_as(&r.ring), vec![("accepted", "phone")]);
     // The owner's answer that arrives after: the ring is over, and the call is told nothing.
-    assert_eq!(r.ring.respond("assist_1", Action::Decline).unwrap_err().code, "no_ring");
+    assert_eq!(respond(&r.ring, "assist_1", Action::Decline).unwrap_err().code, "no_ring");
     assert!(r.calls.cancels.lock().unwrap().is_empty(), "the phone was asked nothing about a ring that was over");
 }
 
@@ -246,7 +255,7 @@ fn declining_asks_the_phone_to_withdraw_the_request_and_the_ring_stays_until_the
     for (action, why) in [(Action::Decline, CancelReason::OwnerDeclined), (Action::Message, CancelReason::MessageInstead)] {
         let r = rig(Presence::Active);
         open(&r);
-        let said = r.ring.respond("assist_1", action).unwrap();
+        let said = respond(&r.ring, "assist_1", action).unwrap();
         assert!(said.ok && said.note.contains("Asking your Companion to stop ringing") && said.note.contains("offer the caller a message"), "{}", said.note);
         assert_eq!(r.calls.cancels.lock().unwrap().as_slice(), [(CALL.to_string(), "assist_1".to_string(), why)], "{action:?}: the phone is asked, and why");
         // Nothing is decided here: it is stopping, and shown so, until the phone answers.
@@ -255,7 +264,7 @@ fn declining_asks_the_phone_to_withdraw_the_request_and_the_ring_stays_until_the
         assert!(shown[0].stopping && shown[0].note == said.note, "{:?}", shown[0]);
         assert!(r.notified.ended.lock().unwrap().is_empty());
         // A second click asks nothing more.
-        let again = r.ring.respond("assist_1", action).unwrap();
+        let again = respond(&r.ring, "assist_1", action).unwrap();
         assert!(again.ok && again.note.contains("Already asking"), "{}", again.note);
         assert_eq!(r.calls.cancels.lock().unwrap().len(), 1, "{action:?}: once");
         // The phone answers that it withdrew it: the ring is over.
@@ -270,7 +279,7 @@ fn declining_asks_the_phone_to_withdraw_the_request_and_the_ring_stays_until_the
 fn too_late_to_withdraw_means_a_device_has_it_the_ring_goes_on_and_the_owner_is_told() {
     let r = rig(Presence::Active);
     open(&r);
-    r.ring.respond("assist_1", Action::Decline).unwrap();
+    respond(&r.ring, "assist_1", Action::Decline).unwrap();
     r.ring.cancel_refused("assist_1");
     let shown = r.ring.active();
     assert_eq!(shown.len(), 1, "the ring is not over: the acceptance is coming");
@@ -281,11 +290,55 @@ fn too_late_to_withdraw_means_a_device_has_it_the_ring_goes_on_and_the_owner_is_
 }
 
 #[test]
+fn what_the_owner_is_told_is_what_came_of_asking_the_phone_and_never_more() {
+    // Kept for the phone to name the request to the call: said, and the ring waits, stopping.
+    let r = rig(Presence::Active);
+    *r.calls.answer.lock().unwrap() = Withdrawal::Queued;
+    open(&r);
+    let said = respond(&r.ring, "assist_1", Action::Decline).unwrap();
+    assert!(said.note.contains("Waiting for the phone to confirm") && !said.note.starts_with("Asking your Companion"), "{}", said.note);
+    let shown = r.ring.active();
+    assert!(shown.len() == 1 && shown[0].stopping && !shown[0].taken && shown[0].note == said.note, "{:?}", shown[0]);
+    // The call did not say in time: not that it was sent.
+    let r = rig(Presence::Active);
+    *r.calls.answer.lock().unwrap() = Withdrawal::Unknown;
+    open(&r);
+    let said = respond(&r.ring, "assist_1", Action::Decline).unwrap();
+    assert!(said.note.contains("has not confirmed") && r.ring.active()[0].stopping, "{}", said.note);
+    // Nothing to withdraw: the ring is over here, and the owner is told there was nothing to stop.
+    let r = rig(Presence::Active);
+    *r.calls.answer.lock().unwrap() = Withdrawal::Nothing;
+    open(&r);
+    let said = respond(&r.ring, "assist_1", Action::Message).unwrap();
+    assert!(said.ok && said.note.contains("nothing left to stop"), "{}", said.note);
+    assert!(r.ring.active().is_empty());
+    assert_eq!(ended_as(&r.ring), vec![("declined", "desktop")]);
+}
+
+#[test]
+fn once_the_phone_says_an_owner_device_has_the_call_a_click_asks_it_nothing_more() {
+    let r = rig(Presence::Active);
+    open(&r);
+    respond(&r.ring, "assist_1", Action::Decline).unwrap();
+    r.ring.cancel_refused("assist_1");
+    let shown = r.ring.active();
+    assert!(shown[0].taken && !shown[0].stopping, "{:?}", shown[0]);
+    for action in [Action::Decline, Action::Message, Action::Decline] {
+        let said = respond(&r.ring, "assist_1", action).unwrap();
+        assert!(said.ok && said.note.contains("took the call just before you declined"), "{}", said.note);
+    }
+    assert_eq!(r.calls.cancels.lock().unwrap().len(), 1, "the phone was asked once, whatever was clicked after");
+    // A note that arrives late does not undo it.
+    r.ring.outcome_seen("assist_1", Outcome::Accepted, "phone");
+    assert!(r.ring.active().is_empty());
+}
+
+#[test]
 fn a_call_with_no_live_session_has_nobody_to_ask_so_the_ring_is_over_here() {
     let r = rig(Presence::Active);
     r.calls.live.store(false, std::sync::atomic::Ordering::SeqCst);
     open(&r);
-    let said = r.ring.respond("assist_1", Action::Decline).unwrap();
+    let said = respond(&r.ring, "assist_1", Action::Decline).unwrap();
     assert!(said.ok && said.note.contains("not on this computer any more"), "{}", said.note);
     assert!(r.ring.active().is_empty());
     assert_eq!(ended_as(&r.ring), vec![("declined", "desktop")]);
@@ -297,7 +350,7 @@ fn a_decline_that_loses_to_the_phone_reaches_nobody() {
     open(&r);
     // The phone says accepted between the owner's click and the desktop hearing it.
     r.ring.outcome_seen("assist_1", Outcome::Accepted, "phone");
-    let late = r.ring.respond("assist_1", Action::Decline).unwrap_err();
+    let late = respond(&r.ring, "assist_1", Action::Decline).unwrap_err();
     assert_eq!((late.status, late.code), (404, "no_ring"));
     assert!(r.calls.cancels.lock().unwrap().is_empty(), "the phone was not asked to withdraw a call an owner device took");
 }
