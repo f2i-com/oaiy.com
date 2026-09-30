@@ -1693,6 +1693,67 @@ for label, cmd in (("Python (no libsodium)", [sys.executable, str(FIX / "verify_
     except (OSError, subprocess.TimeoutExpired) as e:
         ok(f"independent reading of the fixtures in {label} ran", False, str(e))
 
+section("recorded Aokie fixtures (fixtures/aokie/): admissions, challenges, frames, streams, errors and ICE, read by the decoders' rules")
+AOK = FIX / "aokie"
+aok = {n: json.loads((AOK / n).read_text(encoding="utf-8")) for n in ("admission.json", "challenge.json", "frames.json", "stream.json", "errors.json", "ice.json")}
+n_aok_docs = 0
+
+
+def aok_valid(schema_name: str, body, label: str) -> None:
+    global n_aok_docs
+    n_aok_docs += 1
+    errs = problems(schema_name, body)
+    ok(f"aokie fixture {label} validates against {schema_name}", not errs, errs[0].message[:150] if errs else "")
+
+
+for c in aok["admission.json"]["cases"]:
+    plug = c["role"] == "plugin"
+    aok_valid("admission-plugin-request" if plug else "admission-mobile-request", c["request"]["body"], f"admission request '{c['name']}'")
+    aok_valid(("admission-plugin-response" if plug else "admission-mobile-response") if c["response"]["status"] == 200 else "compat-error", c["response"]["body"], f"admission answer '{c['name']}'")
+    for s_ in (c["response"]["body"].get("iceServers", []) if c["response"]["status"] == 200 else []):
+        aok_valid("ice-server", s_, f"ICE entry of '{c['name']}'")
+for c in aok["challenge.json"]["cases"]:
+    aok_valid("challenge", c["response"]["body"], f"challenge '{c['name']}'")
+for st in aok["frames.json"]["steps"]:
+    post = st["request"]["method"] == "POST"
+    if post:
+        aok_valid("compat-frames-request", st["request"]["body"], f"frames request '{st['step']}'")
+    aok_valid("compat-frames-accepted" if post else "compat-frames-page", st["response"]["body"], f"frames answer '{st['step']}'")
+for c in aok["stream.json"]["cases"]:
+    events = [b for b in c["body"].split("\n\n") if b]
+    for b in events:
+        lines = dict(l.split(": ", 1) for l in b.split("\n") if ": " in l and not l.startswith(":"))
+        if lines.get("event") == "frame":
+            aok_valid("compat-stream-frame", json.loads(lines["data"]), f"stream event id {lines['id']} of '{c['name']}'")
+        elif lines.get("event") == "end":
+            ok(f"stream '{c['name']}': the end event's data is an empty object", lines["data"] == "{}")
+for c in aok["errors.json"]["cases"]:
+    if c["response"]["status"] >= 400:
+        aok_valid("compat-error", c["response"]["body"], f"error '{c['name']}'")
+    else:
+        aok_valid("compat-frames-page", c["response"]["body"], f"answer '{c['name']}'")
+for c in aok["ice.json"]["cases"]:
+    for s_ in c["expected"]["iceServers"]:
+        aok_valid("ice-server", s_, f"ICE entry of '{c['name']}'")
+print(f"\n  {n_aok_docs} documents of the Aokie fixtures validated")
+aok_readme = (AOK / "README.md").read_text(encoding="utf-8")
+for f in ("admission.json", "challenge.json", "frames.json", "stream.json", "errors.json", "ice.json", "aokie_decoders.py", "verify_aokie_fixtures.py"):
+    ok(f"fixtures/aokie/README.md describes {f}", f"`{f}`" in aok_readme)
+ok("every admission of the Aokie fixtures carries the same three relay URLs (the plugin's cursor domain)",
+   len({json.dumps({k: v for k, v in c["response"]["body"]["relay"].items() if k != "mode"}, sort_keys=True) for c in aok["admission.json"]["cases"] if c["response"]["status"] == 200}) == 1)
+aok_neg = 0
+try:
+    proc = subprocess.run([sys.executable, str(AOK / "verify_aokie_fixtures.py")], capture_output=True, text=True, encoding="utf-8", timeout=180)
+    m = re.search(r"(\d+) checks, (\d+) mismatches", proc.stdout)
+    n = int(m.group(1)) if m else 0
+    fix_checks += n
+    ok(f"the decoders' rules, transcribed in Python, accept the Aokie fixtures and refuse every damaged copy ({n} checks)", proc.returncode == 0 and bool(m) and m.group(2) == "0", (proc.stdout + proc.stderr)[-500:])
+    m2 = re.search(r"(\d+) damaged documents refused", proc.stdout)
+    aok_neg = int(m2.group(1)) if m2 else 0
+    ok("at least a hundred damaged copies of the Aokie fixtures were refused", aok_neg >= 100)
+except (OSError, subprocess.TimeoutExpired) as e:
+    ok("the Aokie fixture verifier ran", False, str(e))
+
 section("vectors.json is what generate_vectors.py writes")
 proc = subprocess.run([sys.executable, str(V1 / "generate_vectors.py"), "--check"], capture_output=True, text=True, encoding="utf-8", timeout=120)
 ok("vectors.json is current", proc.returncode == 0, (proc.stdout + proc.stderr)[-300:])
@@ -1726,7 +1787,7 @@ print("\n" + "-" * 60)
 n_vec_neg = len(ex["tokens"]["invalid"]) + len(ex["canonical"]["refused"]) + 2 * len(a12["inputs"]["encodings"]) + len(ex["sasNegative"]["wrong"])
 print(f"negative documents: {n_neg_schema} by schema + {n_rules} by reference rule "
       f"({n_vec_neg} of the rules replay the vectors' invalid tokens, refused numbers, wrong SAS readings and small-order keys) "
-      f"= {n_neg_schema + n_rules}")
+      f"= {n_neg_schema + n_rules}, and {aok_neg} damaged copies of the Aokie fixtures refused by the decoders' rules")
 print(f"positive documents: {n_pos}; vector values recomputed in Python: {recomputed}; node checks: {node_total}")
 print(f"relay protocol conformance: {passed} passed, {len(failures)} failed")
 if failures:

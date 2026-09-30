@@ -4,6 +4,7 @@
  *
  *   php tests/fixtures.php --check     verify the committed fixtures without changing them (the default)
  *   php tests/fixtures.php --write     record them again from the real relay code (new random values: commit the result)
+ *   php tests/fixtures.php --write aokie     only the Aokie set (fixtures/aokie/); `pairing` only the pairing ceremony and sealed tokens
  *
  * The fixtures are recorded by driving the relay in temporary directories on loopback, like the test suite does: nothing
  * outside the temporary tree is touched. Sealed boxes and tokens are random, so a rewrite changes them; a check never
@@ -43,8 +44,9 @@ foreach (glob($testsDir . '/lib/*.php') as $f) {
 }
 
 $mode = $argv[1] ?? '--check';
-if (!in_array($mode, ['--check', '--write'], true)) {
-    fwrite(STDERR, "usage: php tests/fixtures.php [--check|--write]\n");
+$which = $argv[2] ?? 'all';
+if (!in_array($mode, ['--check', '--write'], true) || !in_array($which, ['all', 'pairing', 'aokie'], true)) {
+    fwrite(STDERR, "usage: php tests/fixtures.php [--check|--write [all|pairing|aokie]]\n");
     exit(2);
 }
 $dir = \OaiyTest\Fixtures::dir();
@@ -52,9 +54,11 @@ $files = [];
 $exit = 0;
 try {
     if ($mode === '--write') {
-        $made = \OaiyTest\Fixtures::pairing();
-        $files['pairing-ceremony.json'] = $made['ceremony'];
-        $files['sealed-token.json'] = $made['sealed'];
+        if ($which !== 'aokie') {
+            $made = \OaiyTest\Fixtures::pairing();
+            $files['pairing-ceremony.json'] = $made['ceremony'];
+            $files['sealed-token.json'] = $made['sealed'];
+        }
         foreach ($files as $name => $doc) {
             $bad = $name === 'sealed-token.json' ? \OaiyTest\Fixtures::checkSealed($doc) : \OaiyTest\Fixtures::checkCeremony($doc);
             if ($bad) {
@@ -67,6 +71,20 @@ try {
         foreach ($files as $name => $doc) {
             file_put_contents($dir . '/' . $name, \OaiyTest\Fixtures::encode($doc));
             echo "wrote $name\n";
+        }
+        if ($which !== 'pairing') {
+            $aokie = \OaiyTest\AokieFixtures::record();
+            $bad = \OaiyTest\AokieFixtures::check(\OaiyTest\AokieFixtures::roundTrip($aokie));
+            if ($bad) {
+                throw new RuntimeException('the Aokie recording would not pass its own check: ' . implode('; ', $bad));
+            }
+            if (!is_dir(\OaiyTest\AokieFixtures::dir())) {
+                mkdir(\OaiyTest\AokieFixtures::dir(), 0755, true);
+            }
+            foreach ($aokie as $name => $doc) {
+                file_put_contents(\OaiyTest\AokieFixtures::dir() . '/' . $name, \OaiyTest\AokieFixtures::encode($doc));
+                echo "wrote aokie/$name\n";
+            }
         }
     } else {
         foreach (['pairing-ceremony.json' => 'checkCeremony', 'sealed-token.json' => 'checkSealed'] as $name => $check) {
@@ -84,6 +102,19 @@ try {
             echo $bad ? "FAIL $name: " . implode('; ', $bad) . "\n" : "ok   $name\n";
             $exit = $exit || $bad ? 1 : 0;
         }
+        $aokie = \OaiyTest\AokieFixtures::load();
+        $bad = [];
+        foreach (\OaiyTest\AokieFixtures::FILES as $name) {
+            $raw = @file_get_contents(\OaiyTest\AokieFixtures::dir() . '/' . $name);
+            if (!is_string($raw) || !is_array($aokie[$name])) {
+                $bad[] = "aokie/$name is missing";
+            } elseif ($raw !== \OaiyTest\AokieFixtures::encode(json_decode($raw, false))) {
+                $bad[] = "aokie/$name is not written the way the package writes it";
+            }
+        }
+        $bad = array_merge($bad, $bad ? [] : \OaiyTest\AokieFixtures::check($aokie));
+        echo $bad ? 'FAIL aokie/: ' . implode('; ', $bad) . "\n" : "ok   aokie/ (" . count(\OaiyTest\AokieFixtures::FILES) . " files)\n";
+        $exit = $exit || $bad ? 1 : 0;
     }
 } finally {
     \OaiyTest\Tmp::cleanup();

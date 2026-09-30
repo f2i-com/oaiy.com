@@ -1,0 +1,375 @@
+{
+  "protocol": "oaiy-relay/1",
+  "title": "Errors of the compatibility routes",
+  "about": "Every error has exactly three members, error (true), code and message: the phone's error decoder is deny_unknown_fields. A wait is the Retry-After header. The shape covers what fails before a handler runs as well.",
+  "relay": {
+    "url": "https://relay.example.com",
+    "clock": 1790000000,
+    "stunUrls": [
+      "stun:stun.example.com:3478"
+    ],
+    "turnUrls": [
+      "turn:turn.example.com:3478?transport=udp",
+      "turns:turn.example.com:5349?transport=tcp"
+    ],
+    "turnSecret": "0123456789abcdef0123456789abcdef",
+    "turnTtl": 600,
+    "admissionSecretHex": "0101010101010101010101010101010101010101010101010101010101010101"
+  },
+  "cases": [
+    {
+      "name": "a bearer this relay never issued",
+      "request": {
+        "method": "GET",
+        "path": "/v1/aokie-companion/relay/challenge",
+        "auth": "Bearer nonsense"
+      },
+      "response": {
+        "status": 401,
+        "headers": {
+          "www-authenticate": "Bearer realm=\"oaiy-relay\"",
+          "cache-control": "no-store"
+        },
+        "body": {
+          "error": true,
+          "code": "invalid_token",
+          "message": "The admission token is invalid or expired; ask for a new admission."
+        }
+      },
+      "note": "One 401 whatever was wrong (forged, expired, malformed, another kind of token)."
+    },
+    {
+      "name": "a phone addressing a phone",
+      "request": {
+        "method": "POST",
+        "path": "/v1/aokie-companion/relay/frames",
+        "auth": "Bearer of phone A",
+        "body": {
+          "to": "mobile:E916XTjJCK82vAibEGGhB3lDV7wANvlLfxiCNTqfo_c",
+          "frames": [
+            {}
+          ]
+        },
+        "bodyText": "{\"to\":\"mobile:E916XTjJCK82vAibEGGhB3lDV7wANvlLfxiCNTqfo_c\",\"frames\":[{}]}"
+      },
+      "response": {
+        "status": 403,
+        "headers": {
+          "cache-control": "no-store"
+        },
+        "body": {
+          "error": true,
+          "code": "relay_target_forbidden",
+          "message": "A phone may only send frames to the plugin."
+        }
+      }
+    },
+    {
+      "name": "a frame over the cap",
+      "request": {
+        "method": "POST",
+        "path": "/v1/aokie-companion/relay/frames",
+        "auth": "Bearer of phone A",
+        "bodyNote": "one frame of 196,618 bytes once encoded (the cap is 196,608): {\"to\":\"plugin\",\"frames\":[{\"p\":\"xxx... 196,610 x characters ...\"}]}"
+      },
+      "response": {
+        "status": 413,
+        "headers": {
+          "cache-control": "no-store"
+        },
+        "body": {
+          "error": true,
+          "code": "relay_frame_too_large",
+          "message": "Each frame must be at most 196608 bytes once encoded."
+        }
+      }
+    },
+    {
+      "name": "no frames",
+      "request": {
+        "method": "POST",
+        "path": "/v1/aokie-companion/relay/frames",
+        "auth": "Bearer of phone A",
+        "body": {
+          "to": "plugin",
+          "frames": []
+        },
+        "bodyText": "{\"to\":\"plugin\",\"frames\":[]}"
+      },
+      "response": {
+        "status": 400,
+        "headers": {
+          "cache-control": "no-store"
+        },
+        "body": {
+          "error": true,
+          "code": "invalid_request",
+          "message": "The request is malformed."
+        }
+      }
+    },
+    {
+      "name": "an admission for a transport this relay cannot serve",
+      "request": {
+        "method": "POST",
+        "path": "/v1/aokie-companion/admission",
+        "auth": "the phone's device token",
+        "body": {
+          "appId": "aokie",
+          "deviceId": "dev-sLGys7S1tre4ubq7vL2-vw",
+          "displayName": "Aokie Companion",
+          "holderKeyThumbprint": "--6IM5l0OosLj9yWskISYhUA3n_3CURQkmrYMSha_ck",
+          "supportedTransports": [
+            "websocket"
+          ]
+        }
+      },
+      "response": {
+        "status": 422,
+        "headers": {
+          "cache-control": "no-store"
+        },
+        "body": {
+          "error": true,
+          "code": "unprocessable",
+          "message": "This relay cannot serve the transport that was asked for."
+        }
+      }
+    },
+    {
+      "name": "an admission naming another phone",
+      "request": {
+        "method": "POST",
+        "path": "/v1/aokie-companion/admission",
+        "auth": "the phone's device token",
+        "body": {
+          "appId": "aokie",
+          "deviceId": "dev-CAgICAgICAgICAgICAgICA",
+          "displayName": "Aokie Companion",
+          "holderKeyThumbprint": "--6IM5l0OosLj9yWskISYhUA3n_3CURQkmrYMSha_ck",
+          "supportedTransports": [
+            "relay"
+          ]
+        }
+      },
+      "response": {
+        "status": 403,
+        "headers": {
+          "cache-control": "no-store"
+        },
+        "body": {
+          "error": true,
+          "code": "forbidden",
+          "message": "This is not allowed for this credential."
+        }
+      }
+    },
+    {
+      "name": "a wrong method",
+      "request": {
+        "method": "POST",
+        "path": "/v1/aokie-companion/relay/challenge",
+        "auth": "Bearer of the plugin",
+        "body": {},
+        "bodyText": "{}"
+      },
+      "response": {
+        "status": 405,
+        "headers": {
+          "cache-control": "no-store"
+        },
+        "body": {
+          "error": true,
+          "code": "method_not_allowed",
+          "message": "That method is not allowed here."
+        }
+      },
+      "note": "Refused before any handler runs, and still in the Aokie shape."
+    },
+    {
+      "name": "an unknown route under the prefix",
+      "request": {
+        "method": "GET",
+        "path": "/v1/aokie-companion/relay/nothing",
+        "auth": "Bearer of the plugin"
+      },
+      "response": {
+        "status": 404,
+        "headers": {
+          "cache-control": "no-store"
+        },
+        "body": {
+          "error": true,
+          "code": "not_found",
+          "message": "Not found."
+        }
+      }
+    },
+    {
+      "name": "a batch that would overflow the mailbox",
+      "request": {
+        "method": "POST",
+        "path": "/v1/aokie-companion/relay/frames",
+        "auth": "Bearer of phone A",
+        "body": {
+          "to": "plugin",
+          "frames": [
+            {},
+            {},
+            {}
+          ]
+        },
+        "bodyText": "{\"to\":\"plugin\",\"frames\":[{},{},{}]}"
+      },
+      "response": {
+        "status": 429,
+        "headers": {
+          "retry-after": "5",
+          "cache-control": "no-store"
+        },
+        "body": {
+          "error": true,
+          "code": "relay_backpressure",
+          "message": "The relay mailbox is full; the frames were not stored."
+        }
+      },
+      "note": "All or none: nothing was stored. Retry-After is a header only; the body has three members."
+    },
+    {
+      "name": "a stream when the host has no worker to spare",
+      "request": {
+        "method": "GET",
+        "path": "/v1/aokie-companion/relay/stream",
+        "auth": "Bearer of phone A"
+      },
+      "response": {
+        "status": 503,
+        "headers": {
+          "retry-after": "2",
+          "cache-control": "no-store"
+        },
+        "body": {
+          "error": true,
+          "code": "companion_unavailable",
+          "message": "The relay is busy; try again shortly."
+        }
+      },
+      "note": "The pool is at its hard limit. The plugin maps 503 to \"unavailable for this app\" (a re-bootstrap), so this is a last resort."
+    },
+    {
+      "name": "a frames wait when the host has no worker to spare (not an error)",
+      "request": {
+        "method": "GET",
+        "path": "/v1/aokie-companion/relay/frames",
+        "query": {
+          "since": "0",
+          "wait": "2"
+        },
+        "auth": "Bearer of phone A"
+      },
+      "response": {
+        "status": 200,
+        "headers": {
+          "x-oaiy-hold": "refused",
+          "cache-control": "no-store"
+        },
+        "body": {
+          "frames": [
+            {
+              "seq": 1,
+              "from": "plugin",
+              "subjectId": "aokie",
+              "grants": [
+                "state_read",
+                "rtc_signal"
+              ],
+              "frame": {
+                "kind": "plugin_idle"
+              }
+            },
+            {
+              "seq": 2,
+              "from": "plugin",
+              "subjectId": "aokie",
+              "grants": [
+                "state_read",
+                "rtc_signal"
+              ],
+              "frame": {
+                "kind": "lease_granted",
+                "deviceId": "dev-sLGys7S1tre4ubq7vL2-vw"
+              }
+            }
+          ],
+          "lastSeq": 2,
+          "time": 1790000000,
+          "hold": {
+            "refused": true,
+            "retryAfter": 2
+          }
+        }
+      },
+      "note": "A refused wait is 200 with hold.refused: the carrier degrades to a short poll."
+    },
+    {
+      "name": "a phone the desktop's roster no longer lists",
+      "request": {
+        "method": "GET",
+        "path": "/v1/aokie-companion/relay/challenge",
+        "auth": "Bearer of phone B"
+      },
+      "response": {
+        "status": 403,
+        "headers": {
+          "cache-control": "no-store"
+        },
+        "body": {
+          "error": true,
+          "code": "forbidden",
+          "message": "Your PC no longer lists this phone."
+        }
+      }
+    },
+    {
+      "name": "a phone that was removed",
+      "request": {
+        "method": "GET",
+        "path": "/v1/aokie-companion/relay/challenge",
+        "auth": "Bearer of phone B"
+      },
+      "response": {
+        "status": 401,
+        "headers": {
+          "www-authenticate": "Bearer realm=\"oaiy-relay\"",
+          "cache-control": "no-store"
+        },
+        "body": {
+          "error": true,
+          "code": "revoked",
+          "message": "This device was removed; pair it again."
+        }
+      },
+      "note": "Held streams and waits of that phone end the same way."
+    },
+    {
+      "name": "call features off",
+      "request": {
+        "method": "GET",
+        "path": "/v1/aokie-companion/relay/challenge",
+        "auth": "Bearer of the plugin"
+      },
+      "response": {
+        "status": 403,
+        "headers": {
+          "cache-control": "no-store"
+        },
+        "body": {
+          "error": true,
+          "code": "feature_disabled",
+          "message": "This feature is switched off on this relay."
+        }
+      },
+      "note": "The default: the whole family answers 403 feature_disabled."
+    }
+  ]
+}

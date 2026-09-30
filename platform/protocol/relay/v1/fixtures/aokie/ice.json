@@ -1,0 +1,314 @@
+{
+  "protocol": "oaiy-relay/1",
+  "title": "ICE and TURN credentials for fixed inputs",
+  "about": "What Ice::forAdmission returns for a configuration, an endpoint and a time, including FormLogic's own known answers (its unit tests computed them with Python and openssl): username = <expiry>:<first 32 hex characters of HMAC-SHA256(secret, \"aokie-turn-id\" NUL role NUL appId NUL subjectId)>, credential = base64(HMAC-SHA1(secret, username)). The verifier recomputes every value with hmac and hashlib alone.",
+  "cases": [
+    {
+      "name": "FormLogic's phone case",
+      "note": "Known answers computed by FormLogic's own unit tests (Python hmac and openssl): AokieCompanionIceConfigurationTest::testAMobileAdmissionCarriesItsOwnMintedCredential.",
+      "config": {
+        "stunUrls": [
+          "stun:turn.example.com:3478"
+        ],
+        "turnUrls": [
+          "turn:turn.example.com:3478?transport=udp",
+          "turns:turn.example.com:5349?transport=tcp"
+        ],
+        "turnSecret": "turn-rest-test-secret-not-a-real-key-0123456789",
+        "turnTtl": 600,
+        "relayOnly": false
+      },
+      "endpoint": {
+        "role": "mobile",
+        "appId": "app_test",
+        "subjectId": "device_test"
+      },
+      "now": 1784160000,
+      "expected": {
+        "iceServers": [
+          {
+            "urls": [
+              "stun:turn.example.com:3478"
+            ],
+            "username": "",
+            "credential": ""
+          },
+          {
+            "urls": [
+              "turn:turn.example.com:3478?transport=udp",
+              "turns:turn.example.com:5349?transport=tcp"
+            ],
+            "username": "1784160600:b76588edf0d149e1075b69631e94cc91",
+            "credential": "KHqzx1+wW92HnynGzGgLw5mZgwo=",
+            "expiresAt": 1784160600
+          }
+        ],
+        "relayOnly": false,
+        "turnCredentialExpiresAt": 1784160600
+      }
+    },
+    {
+      "name": "FormLogic's plugin case",
+      "note": "The same secret for the plugin: another id, another credential (testAPluginAdmissionGetsAnotherCredentialFromTheSameSecret).",
+      "config": {
+        "stunUrls": [
+          "stun:turn.example.com:3478"
+        ],
+        "turnUrls": [
+          "turn:turn.example.com:3478?transport=udp",
+          "turns:turn.example.com:5349?transport=tcp"
+        ],
+        "turnSecret": "turn-rest-test-secret-not-a-real-key-0123456789",
+        "turnTtl": 600,
+        "relayOnly": false
+      },
+      "endpoint": {
+        "role": "plugin",
+        "appId": "app_test",
+        "subjectId": "aokie"
+      },
+      "now": 1784160000,
+      "expected": {
+        "iceServers": [
+          {
+            "urls": [
+              "stun:turn.example.com:3478"
+            ],
+            "username": "",
+            "credential": ""
+          },
+          {
+            "urls": [
+              "turn:turn.example.com:3478?transport=udp",
+              "turns:turn.example.com:5349?transport=tcp"
+            ],
+            "username": "1784160600:9ad5b440809a76e58520fa0d14e32626",
+            "credential": "Stdmtt53cR4OkoTsqwXpKqEeWas=",
+            "expiresAt": 1784160600
+          }
+        ],
+        "relayOnly": false,
+        "turnCredentialExpiresAt": 1784160600
+      }
+    },
+    {
+      "name": "the relay's test phone",
+      "note": "Appendix A5's secret with the vectors' phone.",
+      "config": {
+        "stunUrls": [
+          "stun:stun.example.com:3478"
+        ],
+        "turnUrls": [
+          "turn:turn.example.com:3478?transport=udp",
+          "turns:turn.example.com:5349?transport=tcp"
+        ],
+        "turnSecret": "0123456789abcdef0123456789abcdef",
+        "turnTtl": 600,
+        "relayOnly": false
+      },
+      "endpoint": {
+        "role": "mobile",
+        "appId": "aokie",
+        "subjectId": "dev-sLGys7S1tre4ubq7vL2-vw"
+      },
+      "now": 1790000000,
+      "expected": {
+        "iceServers": [
+          {
+            "urls": [
+              "stun:stun.example.com:3478"
+            ],
+            "username": "",
+            "credential": ""
+          },
+          {
+            "urls": [
+              "turn:turn.example.com:3478?transport=udp",
+              "turns:turn.example.com:5349?transport=tcp"
+            ],
+            "username": "1790000600:7ff63462c30fe39275b3a7c6ac580ce2",
+            "credential": "x4zr15hpi6xJVK29djMqDln7j7M=",
+            "expiresAt": 1790000600
+          }
+        ],
+        "relayOnly": false,
+        "turnCredentialExpiresAt": 1790000600
+      }
+    },
+    {
+      "name": "the shortest credential",
+      "note": "turn.ttl 60: the decoders need more than 30 seconds.",
+      "config": {
+        "stunUrls": [],
+        "turnUrls": [
+          "turn:turn.example.com:3478"
+        ],
+        "turnSecret": "0123456789abcdef0123456789abcdef",
+        "turnTtl": 60,
+        "relayOnly": false
+      },
+      "endpoint": {
+        "role": "mobile",
+        "appId": "aokie",
+        "subjectId": "dev-sLGys7S1tre4ubq7vL2-vw"
+      },
+      "now": 1790000000,
+      "expected": {
+        "iceServers": [
+          {
+            "urls": [
+              "turn:turn.example.com:3478"
+            ],
+            "username": "1790000060:7ff63462c30fe39275b3a7c6ac580ce2",
+            "credential": "oqYNOP72Jmns/PkeStvTMh2RK8M=",
+            "expiresAt": 1790000060
+          }
+        ],
+        "relayOnly": false,
+        "turnCredentialExpiresAt": 1790000060
+      }
+    },
+    {
+      "name": "the longest credential",
+      "note": "turn.ttl 3600: an hour, below the decoders' 24 hours.",
+      "config": {
+        "stunUrls": [
+          "stun:stun.example.com:3478"
+        ],
+        "turnUrls": [
+          "turns:turn.example.com:5349?transport=tcp"
+        ],
+        "turnSecret": "0123456789abcdef0123456789abcdef",
+        "turnTtl": 3600,
+        "relayOnly": false
+      },
+      "endpoint": {
+        "role": "plugin",
+        "appId": "aokie",
+        "subjectId": "aokie"
+      },
+      "now": 1790000000,
+      "expected": {
+        "iceServers": [
+          {
+            "urls": [
+              "stun:stun.example.com:3478"
+            ],
+            "username": "",
+            "credential": ""
+          },
+          {
+            "urls": [
+              "turns:turn.example.com:5349?transport=tcp"
+            ],
+            "username": "1790003600:e8e8d6685ab52d2b50f62b7235f0633c",
+            "credential": "o7CoNQJgJm0iE1aPaHAMIdYl5Ak=",
+            "expiresAt": 1790003600
+          }
+        ],
+        "relayOnly": false,
+        "turnCredentialExpiresAt": 1790003600
+      }
+    },
+    {
+      "name": "relay only",
+      "note": "relayOnly needs a TURN entry.",
+      "config": {
+        "stunUrls": [
+          "stun:stun.example.com:3478"
+        ],
+        "turnUrls": [
+          "turn:turn.example.com:3478?transport=udp",
+          "turns:turn.example.com:5349?transport=tcp"
+        ],
+        "turnSecret": "0123456789abcdef0123456789abcdef",
+        "turnTtl": 600,
+        "relayOnly": true
+      },
+      "endpoint": {
+        "role": "mobile",
+        "appId": "aokie",
+        "subjectId": "dev-sLGys7S1tre4ubq7vL2-vw"
+      },
+      "now": 1790000000,
+      "expected": {
+        "iceServers": [
+          {
+            "urls": [
+              "stun:stun.example.com:3478"
+            ],
+            "username": "",
+            "credential": ""
+          },
+          {
+            "urls": [
+              "turn:turn.example.com:3478?transport=udp",
+              "turns:turn.example.com:5349?transport=tcp"
+            ],
+            "username": "1790000600:7ff63462c30fe39275b3a7c6ac580ce2",
+            "credential": "x4zr15hpi6xJVK29djMqDln7j7M=",
+            "expiresAt": 1790000600
+          }
+        ],
+        "relayOnly": true,
+        "turnCredentialExpiresAt": 1790000600
+      }
+    },
+    {
+      "name": "STUN only",
+      "note": "No TURN configured: turnCredentialExpiresAt is null.",
+      "config": {
+        "stunUrls": [
+          "stun:stun.example.com:3478",
+          "stuns:stun.example.com:5349"
+        ],
+        "turnUrls": [],
+        "turnSecret": null,
+        "turnTtl": 600,
+        "relayOnly": false
+      },
+      "endpoint": {
+        "role": "mobile",
+        "appId": "aokie",
+        "subjectId": "dev-sLGys7S1tre4ubq7vL2-vw"
+      },
+      "now": 1790000000,
+      "expected": {
+        "iceServers": [
+          {
+            "urls": [
+              "stun:stun.example.com:3478",
+              "stuns:stun.example.com:5349"
+            ],
+            "username": "",
+            "credential": ""
+          }
+        ],
+        "relayOnly": false,
+        "turnCredentialExpiresAt": null
+      }
+    },
+    {
+      "name": "nothing configured",
+      "note": "iceServers is an empty list.",
+      "config": {
+        "stunUrls": [],
+        "turnUrls": [],
+        "turnSecret": null,
+        "turnTtl": 600,
+        "relayOnly": false
+      },
+      "endpoint": {
+        "role": "plugin",
+        "appId": "aokie",
+        "subjectId": "aokie"
+      },
+      "now": 1790000000,
+      "expected": {
+        "iceServers": [],
+        "relayOnly": false,
+        "turnCredentialExpiresAt": null
+      }
+    }
+  ]
+}
