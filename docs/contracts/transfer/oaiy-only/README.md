@@ -109,9 +109,12 @@ The plan reasons OAIY puts in an `oaiy.ring.plan` answer are exactly the plugin'
     "told"), and "do I have to talk to the manager" is a question put to the receptionist;
   * a person asked for by name counts when the name is the owner's. The desktop has no setting for the owner's name, so the
     possessive that begins the business's name ("Dave's Lawn Care" gives "dave") is taken as the person to be asked for, and
-    asking for the owner by first name rings for no other business name;
+    asking for the owner by first name rings for no other business name. The phone's floor has no names, so for a first name it
+    is the stricter of the two: it answers `caller_did_not_ask` and the caller is offered a message (`transfer-v1.md`, step 6);
   * a zero-width joiner or mark is not seen, and a zero-width space is a space (so a word cut by one is not read). The soft
-    hyphen is removed outright, as the shared normaliser removes it.
+    hyphen is removed outright, as the shared normaliser removes it. The phone's floor turns the joiners and marks into a space,
+    so a word cut by one in typed text (a speech engine never writes them) is two words to it, and it can refuse what this
+    desktop counts: the second of the cases in which `transfer-v1.md` (step 6) says the floor is stricter.
 
   When the gate refuses a caller who did ask, the model is told to offer a message, so the caller has one or the other.
 * **A refusal that a pause splits** ("I don't want to" ... "speak to the owner") is read as the shared file's `unfinished` object says,
@@ -121,20 +124,24 @@ The plan reasons OAIY puts in an `oaiy.ring.plan` answer are exactly the plugin'
   it is not carried into what is said after), and what is around it as it always read it: a turn that says nothing, tells the receptionist
   what to say, or is a role marker is not read and drops what was carried; an ask before the refusal stands, and "never mind" after it takes
   it back. An acknowledgement that this desktop records as a turn (said in a pause) is not the verb the refusal is about, so it ends the
-  carry here; the phone drops it by its words and joins the refusal to what follows, so **for that one sequence the floor refuses what this
-  desktop would count**. That is the wrong way round for a floor, which is meant never to be stricter than the host, and it is a stated
-  difference and not the allowed one: a caller who begins a refusal, says an acknowledgement in a pause after the receptionist had finished,
-  and then goes on with the verb ("I don't want to", "mm-hmm", "speak to the owner") is answered `caller_did_not_ask` by the phone and offered
-  a message, where this desktop would have rung. It errs towards a message and never towards a ring nobody asked for (its own case is in
-  `phrases-oaiy.json`). The carry is the shared one and no wider:
+  carry here; the phone drops it by its words and joins the refusal to what follows, so **for that sequence the floor refuses what this
+  desktop would count**. That is the wrong way round for a floor, which is meant to be no stricter than the host, and `transfer-v1.md`
+  (step 6) states it as one of the cases in which it is (with a first name, an invisible joiner or mark inside a word, and a turn the
+  host drops for its timing that the plugin keeps; it says no other is known): a caller who begins a refusal, says an acknowledgement in a
+  pause after the receptionist had finished, and then goes on with the verb ("I don't want to", "mm-hmm", "speak to the owner") is
+  answered `caller_did_not_ask` by the phone and offered a message, where this desktop would have rung; a thinking noise said alone
+  ("um", "uh"), and up to three acknowledgements in one turn, do the same. It errs towards a message and never towards a ring nobody asked
+  for (its own case is in `phrases-oaiy.json`). The carry is the shared one and no wider:
   a refusal this desktop's blocks know that the shared patterns do not (`couldn't`, `no way`, `not looking to`) is refused when it is in
   one sentence and is not carried across a pause.
 * **Where the floor accepts and this desktop refuses.** `phrases-oaiy.json` holds only what the shared file does not have as
   written: 37 requests, 49 that are not, and the 10 and 8 named ones (a case the shared file has is not repeated here, and a test
   fails if one is; of the two positives about a refusal split by a pause the floor accepts the one about being told what to say, and does
-  not accept the one about an acknowledgement: a refusal, an acknowledgement in a pause, then the tail, the one sequence where the floor is
-  stricter than this desktop, as described above). The phone's floor runs first, so a caller must pass both checks. Every way of asking that
-  this desktop counts is in the shared file, so the floor is never the stricter of the two for an ask, except for that sequence. It is looser for what
+  not accept the one about an acknowledgement: a refusal, an acknowledgement in a pause, then the tail, one of the cases in which the floor
+  is stricter than this desktop, as described above). The phone's floor runs first, so a caller must pass both checks. Every way of asking
+  that this desktop counts is in the shared file, so the floor is the stricter of the two for an ask only in the cases `transfer-v1.md`
+  states (step 6): a first name, an invisible joiner or mark inside a word, an acknowledgement between a refusal and its words, and a turn
+  this desktop drops for its timing that the plugin keeps (which uses one of the plugin's three places). It is looser for what
   this desktop refuses besides: the say and write commands, an ask taken back, a different target, "do I have to talk to", and
   the contractions below. That is allowed. **The floor accepts these, this desktop refuses**, because they are not asks (each is an
   OAIY-only non-request, and each was checked to be accepted by the floor):
@@ -144,9 +151,10 @@ The plan reasons OAIY puts in an `oaiy.ring.plan` answer are exactly the plugin'
   * "I wouldnt speak to the manager"
   * "I couldn't speak to the owner earlier"
 
-  (The first, second and fourth are the three forms `transfer-v1.md` lists as ones no block names on either end, and it says both ends
-  let them through. That is true of the phone's floor and not of this desktop: the host has to refuse them, and does, so no form of
-  that list is let through here. A test reads the list from the contract and fails if one of its forms asks or is not a case here. The
+  (The first, second and fourth are the three forms `transfer-v1.md` lists as ones the shared blocks do not name: it says the floor lets
+  them through and the host refuses them, its own blocks being wider (the allowed direction, and what this desktop does: no form of
+  that list is let through here, and no case can be shared for them until the shared blocks name them). A test reads the list from the
+  contract and fails if one of its forms asks or is not a case here. The
   four things the contract says only the host reads, an ask taken back, being told to say it, a different target such as billing and
   someone else in the room, each have named cases in this file, and the same test holds them to it.)
 
@@ -167,9 +175,11 @@ The plan reasons OAIY puts in an `oaiy.ring.plan` answer are exactly the plugin'
   is said is a turn, said before the greeting or not ("Hi, can I speak to the owner?" said first is asked for); it does not read
   words for the rest of this. An acknowledgement said in a pause after the receptionist had
   finished ("Yeah, sure." after "Is that all right?") is a turn in its record and keeps its place among the last three. So the
-  plugin can drop more than OAIY does, which only lets its last three reach further back (allowed: its check is a floor), and
-  the one way it can be stricter is a turn OAIY drops for its timing that the plugin keeps. The shared `backchannel` cases give
-  the turns that remain; this desktop is tested on them.
+  plugin can drop more than OAIY does, which mostly only lets its last three reach further back (allowed: its check is a floor). It
+  can be stricter in two ways, which `transfer-v1.md` states: a turn OAIY drops for its timing that the plugin keeps (it uses one of the
+  plugin's three places), and an acknowledgement, or a thinking noise said alone, between a refusal and the words that would finish it,
+  which the plugin drops and OAIY keeps as a turn of its own (the sequence above). The shared `backchannel` cases give the turns that
+  remain; this desktop is tested on them.
 
 ## What the desktop needs of the plugin besides the contract
 

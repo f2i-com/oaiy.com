@@ -971,6 +971,32 @@ mod tests {
         }
     }
 
+    /// transfer-v1.md (step 6) says where the phone's floor is stricter than a host reading its own record: a first name, an invisible joiner or mark inside
+    /// a word, an acknowledgement between a refusal and its words, and a turn the host drops for its timing. The README of what only this desktop has
+    /// says the same four, and no longer says that the floor is never stricter, or stricter in one sequence only, or that both ends let the forms
+    /// no block names through.
+    #[test]
+    fn the_readme_says_where_the_floor_is_stricter_as_the_contract_does() {
+        let flat = |text: &str| text.split_whitespace().collect::<Vec<_>>().join(" ");
+        let document = flat(include_str!("../../../../../docs/contracts/transfer/transfer-v1.md"));
+        let readme = flat(include_str!("../../../../../docs/contracts/transfer/oaiy-only/README.md"));
+        // (The words each says it in: the contract's, and the README's own.)
+        for (contract, ours) in [
+            ("by first name", "first name"),
+            ("invisible joiners and marks", "invisible joiner or mark"),
+            ("an acknowledgement, and the words that would finish it", "an acknowledgement between a refusal and its words"),
+            ("the host drops a turn for its timing", "drops for its timing"),
+        ] {
+            assert!(document.contains(contract), "the contract no longer says {contract:?}: is the list of where the floor is stricter still what it says?");
+            assert!(readme.contains(ours), "the README does not say {ours:?}, where the floor is stricter than this desktop");
+        }
+        assert!(readme.contains("`transfer-v1.md` (step 6)") || readme.contains("`transfer-v1.md`, step 6"), "and where the contract says it");
+        for stale in ["meant never to be stricter", "the one sequence where the floor is", "for that one sequence", "the one way it can be stricter", "no block names on either end", "let them through. That is true of the phone's floor and not"] {
+            assert!(!readme.contains(stale), "the README still says {stale:?}, which the contract no longer does");
+        }
+        assert!(!document.contains("meant never to be stricter") && !document.contains("no block names on either end"), "the contract itself has gone back to what it said");
+    }
+
     #[test]
     fn someone_else_is_a_person_to_ask_for_and_a_caller_who_is_talking_to_someone_else_is_not_asking() {
         // "Someone else" is a plain ask for a person (the caller wants to be put through to another person than the one they have), in every
