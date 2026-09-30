@@ -186,6 +186,17 @@ agent : "I'll try to reach them, please stay with me."  (it is trying: it does n
   what a caller would get now (nothing is counted) and adds what the phone plugin did with the calls that
   began while transfers were on (offered for transfer, or not: too old, no Companion approved, or its
   consent); the Transfers page shows both.
+- **Who can change the settings, decline a ring or delete a message.** `/api/ring/*` and `/api/messages/*` are in
+  `is_personal_path` (`http.rs`): a read is a restricted read, a change takes the privileged gate, the strictest
+  class the local address has (the class of `POST /api/bridge/runs` and `POST /api/voice/calls/{id}/say`; the
+  updater's install is stricter only because it is a Tauri command that checks the webview's label, not a route,
+  and the dashboard's Transfers page is served over HTTP so that it works headless too). A web page is refused, a
+  caller with no origin is refused, and a headless server takes the token alone; what is let in is the window's own
+  origin, `oaiy.com` and (debug builds only) any loopback page, or a bearer that is the configured, the internal or
+  a paired token. Plugins are not handed the internal token. So a program on this computer that sends the window's
+  origin, or that has been paired, can turn transfers on: it can equally run a flow, which is why the Transfers
+  page says so. `ring/routes.rs` tests hold the routes to that gate (a stranger, the token, the window), and
+  making the address itself proof against a local program is the access-model work, which this branch leaves alone.
 - **What the model is told.** The instructions and the tool list follow the owner's settings, not the
   call, so they are the same for every call and caller and the engine's prompt cache holds them (with
   the settings off, they are byte for byte what they were). Whether the owner can be rung on *this*

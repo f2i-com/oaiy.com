@@ -1957,6 +1957,22 @@ mod tests {
     }
 
     #[test]
+    fn a_page_on_loopback_is_trusted_with_a_privileged_route_by_a_debug_build_only_and_a_page_that_only_ends_like_ours_never() {
+        // What ships (a release build) trusts OAIY's own window and oaiy.com; a debug build (the dev UI is served from a loopback port,
+        // and the owner's `tauri dev` is one) trusts any loopback page too. The routes for the ring and the messages take that
+        // gate like every route of their class, so this is what stands between them and a page the owner has open.
+        for origin in ["http://localhost:3000", "http://127.0.0.1:5173"] {
+            assert_eq!(is_allowed_origin_privileged(origin), cfg!(debug_assertions), "{origin}");
+        }
+        for origin in ["tauri://localhost", "https://oaiy.com", "https://app.oaiy.com"] {
+            assert!(is_allowed_origin_privileged(origin), "{origin}");
+        }
+        for origin in ["https://evil.example", "null", "https://oaiy.com.evil.example", "https://evil.example/oaiy.com", "https://notoaiy.com", "http://oaiy.com", "tauri://localhost.evil.example"] {
+            assert!(!is_allowed_origin_privileged(origin), "{origin}");
+        }
+    }
+
+    #[test]
     fn companion_routes_are_privileged() {
         // These decide which phones may carry a live call's audio, and rotation
         // invalidates every existing pairing. A local web page must not reach

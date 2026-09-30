@@ -105,6 +105,17 @@ switches are **off** until you turn them on, and with them off the phone answers
 > calls, and this build does not sign that consent, so a plugin that can reach it could change what
 > it allows. The Transfers page says so beside the switch.
 
+> **A program on this computer that OAIY has paired can also change these settings, and turn transfers on.**
+> The Transfers page says so under the switch. These settings, declining a ring and deleting a message are
+> reached over OAIY's local address, in the strictest class that address has (the one that runs a flow or
+> speaks on a live call): a web page is refused, a caller with no origin is refused, and a headless server takes
+> the administrator's token alone. What is let in is OAIY's own window, `oaiy.com` (and, in a debug build only,
+> any page on this computer's loopback), and a program that presents a token OAIY gave it (the pairing you
+> approve, or the token of the process OAIY started).
+> A program on this computer that sends the window's address as its origin is let in too, as it is for every
+> route in that class; plugins are not given the token. Keeping that out is work on the whole address, not on
+> these routes, and is not done here.
+
 
 - **Transfer calls to me.** When a caller asks for you, the receptionist says it will *try* to
   reach you, and this computer tells you: a notification, and a dialog with the caller's name and

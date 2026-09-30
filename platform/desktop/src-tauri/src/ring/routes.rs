@@ -137,4 +137,83 @@ mod tests {
         assert!(!ring.settings.get().enabled);
         assert!(!dir.0.join(super::super::settings::FILE_NAME).exists(), "nothing was written");
     }
+
+    /// One request to `app` as the gate sees it, and what came back.
+    async fn send(app: &Router, method: axum::http::Method, path: &str, headers: &[(&str, &str)], body: Option<Value>) -> (StatusCode, Value) {
+        use tower::ServiceExt;
+        let mut request = axum::http::Request::builder().method(method).uri(path);
+        for (k, v) in headers {
+            request = request.header(*k, *v);
+        }
+        if body.is_some() {
+            request = request.header("content-type", "application/json");
+        }
+        let response = app.clone().oneshot(request.body(body.map_or_else(axum::body::Body::empty, |b| axum::body::Body::from(b.to_string()))).unwrap()).await.unwrap();
+        let status = response.status();
+        let bytes = axum::body::to_bytes(response.into_body(), 1 << 20).await.unwrap();
+        (status, serde_json::from_slice(&bytes).unwrap_or(Value::Null))
+    }
+
+    /// Who can turn transfers on, decline a ring or delete a message, as the desktop serves the routes (behind the gate `http.rs` puts in front
+    /// of everything, the class of `/api/voice/*` and `/api/contacts`): the token, or OAIY's own window; not a web page, not a caller with no
+    /// origin, and a headless server trusts the token alone. It is the strictest class the routes have; a program on this computer that
+    /// presents the window's origin, as any local program can, is inside it, as it is for every route in that class.
+    #[tokio::test]
+    async fn the_ring_and_the_messages_are_closed_to_a_stranger_and_open_to_the_token_and_the_window() {
+        use axum::http::Method;
+        let dir = TempDir::new("ring-gate");
+        let ring = Ring::open(&dir.0);
+        let store = crate::messages::Store::default();
+        let routes = || router(ring.clone()).merge(crate::messages::routes::router(store.clone()));
+        let turn_on = || Some(json!({"enabled": true}));
+        let every = [
+            (Method::GET, "/api/ring/settings", None),
+            (Method::PUT, "/api/ring/settings", turn_on()),
+            (Method::GET, "/api/ring/preview", None),
+            (Method::GET, "/api/ring/active", None),
+            (Method::POST, "/api/ring/active/assist_1/respond", Some(json!({"action": "decline"}))),
+            (Method::POST, "/api/ring/notices/notice_1/dismiss", None),
+            (Method::GET, "/api/messages", None),
+            (Method::PATCH, "/api/messages/msg_1", Some(json!({"state": "handled"}))),
+            (Method::DELETE, "/api/messages/msg_1", None),
+        ];
+
+        // A headless server: the token or nothing, whatever origin is presented.
+        let headless = crate::http::guarded_for_tests(routes(), Some("desk-token".into()), false);
+        for (m, path, body) in &every {
+            for headers in [vec![], vec![("Authorization", "Bearer wrong")], vec![("Origin", "tauri://localhost")], vec![("Origin", "tauri://localhost"), ("Authorization", "Bearer wrong")]] {
+                let (status, ..) = send(&headless, m.clone(), path, &headers, body.clone()).await;
+                assert_eq!(status, StatusCode::FORBIDDEN, "{m} {path} {headers:?}");
+            }
+            let (status, ..) = send(&headless, m.clone(), path, &[("Authorization", "Bearer desk-token")], body.clone()).await;
+            assert_ne!(status, StatusCode::FORBIDDEN, "{m} {path} with the token");
+        }
+        assert!(ring.settings.get().enabled, "the token turned transfers on");
+        ring.change_settings(&json!({"enabled": false})).unwrap();
+
+        // The desktop's window: a web page, a page whose address only ends like ours, and a caller with no origin are all shut out, of
+        // reads and changes alike, and nothing was turned on.
+        let gui = crate::http::guarded_for_tests(routes(), None, true);
+        for origin in ["https://evil.example", "null", "https://oaiy.com.evil.example", "https://evil.example/oaiy.com", "http://tauri.localhost.evil.example", "tauri://localhost.evil.example"] {
+            for (m, path, body) in &every {
+                let (status, ..) = send(&gui, m.clone(), path, &[("Origin", origin)], body.clone()).await;
+                assert_eq!(status, StatusCode::FORBIDDEN, "{m} {path} from {origin}");
+            }
+        }
+        for (m, path, body) in every.iter().filter(|(m, ..)| m != Method::GET) {
+            let (status, ..) = send(&gui, m.clone(), path, &[], body.clone()).await;
+            assert_eq!(status, StatusCode::FORBIDDEN, "{m} {path}: a change fails closed with no origin");
+        }
+        assert!(!ring.settings.get().enabled, "no stranger turned transfers on");
+        // The window reads and changes: it turns transfers on, declines a ring that is not there, and finds no message to delete.
+        let window = [("Origin", "tauri://localhost")];
+        let (status, v) = send(&gui, Method::PUT, "/api/ring/settings", &window, turn_on()).await;
+        assert_eq!((status, v["settings"]["enabled"].clone()), (StatusCode::OK, json!(true)));
+        let (status, v) = send(&gui, Method::POST, "/api/ring/active/assist_1/respond", &window, Some(json!({"action": "decline"}))).await;
+        assert_eq!((status, v["error"]["code"].as_str()), (StatusCode::NOT_FOUND, Some("no_ring")));
+        let (status, v) = send(&gui, Method::DELETE, "/api/messages/msg_1", &window, None).await;
+        assert_eq!(status, StatusCode::NOT_FOUND, "{v}");
+        let (status, v) = send(&gui, Method::GET, "/api/ring/preview", &window, None).await;
+        assert_eq!((status, v["enabled"].clone()), (StatusCode::OK, json!(true)));
+    }
 }
