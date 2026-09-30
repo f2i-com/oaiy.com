@@ -17,6 +17,7 @@ pub mod presets;
 pub mod principal;
 pub mod routes;
 pub mod scopes;
+pub mod scrub;
 
 #[cfg(test)]
 mod route_coverage;
