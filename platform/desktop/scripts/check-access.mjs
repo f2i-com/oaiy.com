@@ -6,8 +6,9 @@
 //
 // What it does:
 //   1. `cargo test` for the access model's unit tests: the route table, the source walk that fails
-//      when a route has no row, the exported file, and everything else under `auth::`.
-//   2. The boot test, which starts `oaiy-server` on a port the system picks (never 17972, 17872 or
+//      when a route has no row, the exported file, and everything else under `auth::`; and again with the
+//      `web` feature (the login of `oaiy-server`: its parts, the in-process tests of the whole login).
+//   2. The boot test (also with the `web` feature, and `login_e2e`: the real server and its console), which starts `oaiy-server` on a port the system picks (never 17972, 17872 or
 //      any other fixed port) and sends an anonymous request to every row of the table.
 //   3. Reads the `routes.json` the tests wrote and checks it against itself, in JavaScript, so that a
 //      mistake in the Rust tables that its own tests share cannot hide: no duplicate row, every row
@@ -49,7 +50,14 @@ function run(label, args) {
 }
 
 run('access model: unit tests', ['test', '--locked', '--no-default-features', '--lib', '--', 'auth::', '--skip', 'oauth::']);
-if (!skipBoot) run('access model: every route behind the guard (boot test)', ['test', '--locked', '--no-default-features', '--test', 'access_boot']);
+// The web login of oaiy-server is behind the `web` feature: its unit tests, the in-process tests of the login over a real
+// store, and (with the boot tests) the real program driven over HTTP with its console.
+run('access model: the web login (unit and in-process tests)', ['test', '--locked', '--no-default-features', '--features', 'web', '--lib', '--', 'auth::', '--skip', 'oauth::']);
+if (!skipBoot) {
+  run('access model: every route behind the guard (boot test)', ['test', '--locked', '--no-default-features', '--test', 'access_boot']);
+  run('access model: every route behind the guard, with the web login (boot test)', ['test', '--locked', '--no-default-features', '--features', 'web', '--test', 'access_boot']);
+  run('web login: the real server and its console', ['test', '--locked', '--no-default-features', '--features', 'web', '--test', 'login_e2e']);
+}
 
 const file = path.join(out, 'routes.json');
 const problems = [];

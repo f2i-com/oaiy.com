@@ -126,8 +126,37 @@ fn auth_token_is_empty() -> bool {
     std::env::var("OAIY_SERVER_TOKEN").map(|s| s.trim().is_empty()).unwrap_or(true)
 }
 
-#[tokio::main]
-async fn main() {
+/// `oaiy-server auth ...`, `oaiy-server check` and `oaiy-server flows ...`: the console (design 4.7.9). They run
+/// before the server's runtime exists, and never start the server.
+fn main() {
+    let args: Vec<String> = std::env::args().skip(1).collect();
+    if let Some(first) = args.first().map(String::as_str) {
+        if matches!(first, "auth" | "check" | "flows") {
+            std::process::exit(console(&args));
+        }
+    }
+    tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()
+        .expect("the async runtime starts")
+        .block_on(server_main());
+}
+
+#[cfg(feature = "web")]
+fn console(args: &[String]) -> i32 {
+    oaiy_desktop_lib::auth::console_cli::run_process(args)
+}
+
+#[cfg(not(feature = "web"))]
+fn console(args: &[String]) -> i32 {
+    eprintln!(
+        "oaiy-server {}: this build has no web login (it was built without the `web` feature), so it has no console",
+        args.first().map_or("", String::as_str)
+    );
+    2
+}
+
+async fn server_main() {
     let _ = log::set_logger(&LOGGER);
     log::set_max_level(log::LevelFilter::Info);
 
@@ -180,10 +209,17 @@ async fn main() {
     }
 
     // A mode nobody chose must not be guessed: a value that is not one of the three stops the server
-    // (exit 78, which the shipped unit does not restart).
-    let access_mode = match oaiy_desktop_lib::auth::AccessMode::from_env(
+    // (exit 78, which the shipped unit does not restart). A server with the web login defaults to `scoped` and
+    // refuses `legacy`: the login needs the store on disk, which `legacy` never opens.
+    #[cfg(feature = "web")]
+    let mode_from_env = oaiy_desktop_lib::auth::login::server_mode(
         std::env::var("OAIY_ACCESS_MODE").ok().as_deref(),
-    ) {
+    );
+    #[cfg(not(feature = "web"))]
+    let mode_from_env = oaiy_desktop_lib::auth::AccessMode::from_env(
+        std::env::var("OAIY_ACCESS_MODE").ok().as_deref(),
+    );
+    let access_mode = match mode_from_env {
         Ok(mode) => mode,
         Err(refusal) => {
             eprintln!("oaiy-server: {refusal}");
@@ -310,12 +346,18 @@ async fn main() {
     {
         let registry = registry.clone();
         let plugin_host = plugin_host.clone();
+        #[cfg(feature = "web")]
+        let auth_dir = data_dir.join("auth");
         tokio::spawn(async move {
             shutdown_signal().await;
             log::info!("oaiy-server: shutting down — stopping plugins and all services");
             stop_children(registry, plugin_host.get().cloned()).await;
             // The credential store's last-used times and the noise counted so far, before the process ends.
             oaiy_desktop_lib::auth::flush_installed();
+            // The console's credential dies with the server: its files are removed (what a crash leaves holds a
+            // credential that is already dead).
+            #[cfg(feature = "web")]
+            oaiy_desktop_lib::auth::console::remove_files(&auth_dir);
             std::process::exit(0);
         });
     }
