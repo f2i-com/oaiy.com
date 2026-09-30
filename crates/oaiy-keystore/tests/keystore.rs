@@ -1,0 +1,615 @@
+//! K1 (design 4.5.1, work package V-02) through its public API, for every provider this platform has: the keyfile everywhere, and DPAPI on Windows.
+//!
+//! Every test makes its own scratch folder under the system temp folder with a unique name and removes it when it ends (the folder is removed
+//! by a guard, so a failed assertion cleans up too). Nothing here touches the real `<data>/keys`.
+
+use std::fs;
+use std::path::{Path, PathBuf};
+use std::sync::Arc;
+use std::thread;
+
+use oaiy_keystore::{names, open_at, KeyError, KeyStore, Name, ProviderChoice, Strength, ENV_PROVIDER, MAX_VALUE_LEN};
+
+struct Scratch(PathBuf);
+
+impl Scratch {
+    fn new(tag: &str) -> Scratch {
+        let nanos = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_nanos()).unwrap_or(0);
+        let dir = std::env::temp_dir().join(format!("oaiy-keystore-test-{tag}-{}-{nanos}", std::process::id()));
+        fs::create_dir_all(&dir).unwrap();
+        Scratch(dir)
+    }
+
+    fn keys(&self) -> PathBuf {
+        self.0.join("keys")
+    }
+}
+
+impl Drop for Scratch {
+    fn drop(&mut self) {
+        let _ = fs::remove_dir_all(&self.0);
+    }
+}
+
+/// The providers this platform has, with the extension their files carry.
+fn providers() -> Vec<(ProviderChoice, &'static str)> {
+    let mut list = vec![(ProviderChoice::Keyfile, "kf")];
+    if cfg!(windows) {
+        list.push((ProviderChoice::DpapiFile, "ks"));
+    }
+    list
+}
+
+fn store(scratch: &Scratch, choice: ProviderChoice) -> Box<dyn KeyStore> {
+    open_at(scratch.keys(), choice).unwrap()
+}
+
+fn name(text: &str) -> Name {
+    Name::new(text).unwrap()
+}
+
+/// A run of bytes that appears nowhere else: every value in these tests is one of them, so a scan for it finds a leak and only a leak.
+fn canary(seed: u8, len: usize) -> Vec<u8> {
+    let mut state = u64::from(seed).wrapping_mul(0x9e37_79b9_7f4a_7c15) | 1;
+    (0..len)
+        .map(|_| {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            (state >> 24) as u8
+        })
+        .collect()
+}
+
+fn get(store: &dyn KeyStore, n: &Name) -> Option<Vec<u8>> {
+    store.get(n).unwrap().map(|v| v.to_vec())
+}
+
+fn all_files(dir: &Path) -> Vec<PathBuf> {
+    let mut out = Vec::new();
+    for entry in fs::read_dir(dir).unwrap() {
+        let path = entry.unwrap().path();
+        if path.is_dir() {
+            out.extend(all_files(&path));
+        } else {
+            out.push(path);
+        }
+    }
+    out.sort();
+    out
+}
+
+fn contains(haystack: &[u8], needle: &[u8]) -> bool {
+    needle.len() <= haystack.len() && haystack.windows(needle.len()).any(|w| w == needle)
+}
+
+/// Files under `dir` (every one, dot files and temporaries included) whose bytes contain `needle`.
+fn files_containing(dir: &Path, needle: &[u8]) -> Vec<String> {
+    all_files(dir)
+        .into_iter()
+        .filter(|p| contains(&fs::read(p).unwrap(), needle))
+        .map(|p| p.file_name().unwrap().to_string_lossy().into_owned())
+        .collect()
+}
+
+fn file_of(scratch: &Scratch, n: &str, ext: &str) -> PathBuf {
+    scratch.keys().join(format!("{n}.{ext}"))
+}
+
+#[test]
+fn round_trip_overwrite_delete_and_list_for_every_provider() {
+    for (choice, ext) in providers() {
+        let scratch = Scratch::new("roundtrip");
+        let store = store(&scratch, choice);
+        let info = store.provider();
+        match choice {
+            ProviderChoice::Keyfile => assert_eq!((info.id, info.strength), ("keyfile", Strength::FilePermissions)),
+            _ => assert_eq!((info.id, info.strength), ("windows-dpapi-file", Strength::OsAccount)),
+        }
+        let a = name(names::ARCHIVE_WRITER);
+        store.put(&a, &canary(1, 32)).unwrap();
+        assert_eq!(get(&*store, &a), Some(canary(1, 32)));
+        store.put(&a, &canary(2, 48)).unwrap();
+        assert_eq!(get(&*store, &a), Some(canary(2, 48)), "{ext}: overwritten");
+
+        for (n, seed) in [("vault.fk.f2", 4u8), ("vault.fk.f1", 5), ("vault.pins", 6), ("backup.sig", 7)] {
+            store.put(&name(n), &canary(seed, 32)).unwrap();
+        }
+        let listed = |prefix: &str| -> Vec<String> { store.list(prefix).unwrap().into_iter().map(|n| n.to_string()).collect() };
+        assert_eq!(listed(""), ["archive.writer", "backup.sig", "vault.fk.f1", "vault.fk.f2", "vault.pins"]);
+        assert_eq!(listed(names::VAULT_FK_PREFIX), ["vault.fk.f1", "vault.fk.f2"]);
+        assert_eq!(listed("vault."), ["vault.fk.f1", "vault.fk.f2", "vault.pins"]);
+        assert!(listed("relay.").is_empty());
+        assert_eq!(listed("archive.writer"), ["archive.writer"]);
+
+        store.delete(&a).unwrap();
+        assert_eq!(get(&*store, &a), None);
+        store.delete(&a).unwrap();
+        assert_eq!(listed(""), ["backup.sig", "vault.fk.f1", "vault.fk.f2", "vault.pins"]);
+
+        // every size from one byte to the cap, with zero bytes and 0xff in them
+        for len in [1usize, 2, 15, 16, 17, 63, 64, 65, 255, 256, 4095, 4096, 65535, MAX_VALUE_LEN] {
+            let mut value = canary(9, len);
+            value[0] = 0;
+            *value.last_mut().unwrap() = 0xff;
+            let n = name("size.check");
+            store.put(&n, &value).unwrap();
+            assert_eq!(get(&*store, &n), Some(value), "{ext}: {len} bytes");
+        }
+    }
+}
+
+#[test]
+fn a_name_that_was_never_stored_is_none_not_an_error() {
+    for (choice, _) in providers() {
+        let scratch = Scratch::new("none");
+        let store = store(&scratch, choice);
+        assert_eq!(get(&*store, &name("never.stored")), None);
+        assert!(store.list("").unwrap().is_empty());
+        store.delete(&name("never.stored")).unwrap();
+        store.put(&name("other"), b"x").unwrap();
+        assert_eq!(get(&*store, &name("never.stored")), None, "another name exists, this one still does not");
+        store.delete(&name("other")).unwrap();
+        assert_eq!(get(&*store, &name("other")), None, "deleted is the same as never stored");
+    }
+}
+
+#[test]
+fn a_store_that_cannot_read_its_key_is_an_error_and_never_none() {
+    for (choice, ext) in providers() {
+        let scratch = Scratch::new("errors");
+        let store = store(&scratch, choice);
+        let n = name("archive.writer");
+        let value = canary(3, 40);
+        store.put(&n, &value).unwrap();
+        let path = file_of(&scratch, "archive.writer", ext);
+        let blob = fs::read(&path).unwrap();
+
+        // not a blob at all, and an empty file
+        for junk in [&b"not a blob"[..], b"", &[0u8; 200][..], &blob[..8]] {
+            fs::write(&path, junk).unwrap();
+            let error = store.get(&n).expect_err(&format!("{ext}: a file of {} bytes of junk", junk.len()));
+            assert!(matches!(error, KeyError::Corrupt(_) | KeyError::Os(..)), "{error:?}");
+        }
+        // every truncation of a real blob
+        for len in 0..blob.len() {
+            fs::write(&path, &blob[..len]).unwrap();
+            assert!(store.get(&n).is_err(), "{ext}: truncated to {len} of {} bytes read as a secret or as nothing", blob.len());
+        }
+        // every single bit of a real blob flipped: an error, or (only where a provider ignores a field) the very same value; never None, never another value
+        let mut tolerated = 0;
+        for bit in 0..blob.len() * 8 {
+            let mut bad = blob.clone();
+            bad[bit / 8] ^= 1 << (bit % 8);
+            fs::write(&path, &bad).unwrap();
+            match store.get(&n) {
+                Err(_) => {}
+                Ok(Some(v)) => {
+                    assert_eq!(&*v, value.as_slice(), "{ext}: bit {bit} changed the value that was read");
+                    tolerated += 1;
+                }
+                Ok(None) => panic!("{ext}: a damaged file (bit {bit}) was read as 'never stored'"),
+            }
+        }
+        if ext == "kf" {
+            assert_eq!(tolerated, 0, "the keyfile check covers every byte");
+        }
+        // an extended blob
+        let mut longer = blob.clone();
+        longer.push(0);
+        fs::write(&path, &longer).unwrap();
+        match store.get(&n) {
+            Err(_) => {}
+            Ok(Some(v)) => assert_eq!(&*v, value.as_slice()),
+            Ok(None) => panic!("{ext}: an extended file was read as 'never stored'"),
+        }
+        // a directory where the file should be, and a put over it
+        fs::remove_file(&path).unwrap();
+        fs::create_dir(&path).unwrap();
+        assert!(matches!(store.get(&n), Err(KeyError::Io { .. } | KeyError::Permissions(_))), "{ext}: a directory in place of a key file");
+        assert!(store.put(&n, b"replacement").is_err());
+        assert!(all_files(&scratch.keys()).is_empty(), "{ext}: the failed put left a file behind");
+        fs::remove_dir(&path).unwrap();
+        // the store is fine afterwards
+        store.put(&n, &value).unwrap();
+        assert_eq!(get(&*store, &n), Some(value));
+    }
+}
+
+#[test]
+fn a_keys_directory_that_has_gone_is_an_error_not_an_empty_store() {
+    for (choice, _) in providers() {
+        let scratch = Scratch::new("nodir");
+        let store = store(&scratch, choice);
+        let n = name("vault.pins");
+        store.put(&n, b"pins").unwrap();
+        fs::remove_dir_all(scratch.keys()).unwrap();
+        assert!(matches!(store.get(&n), Err(KeyError::Io { .. })), "get");
+        assert!(matches!(store.put(&n, b"pins"), Err(KeyError::Io { .. })), "put");
+        assert!(matches!(store.list(""), Err(KeyError::Io { .. })), "list");
+        assert!(matches!(store.delete(&n), Err(KeyError::Io { .. })), "delete");
+        // and a store opened again finds the folder empty: that is a new store, and the caller learns it from `None` only now
+        let reopened = open_at(scratch.keys(), choice).unwrap();
+        assert_eq!(get(&*reopened, &n), None);
+    }
+}
+
+#[cfg(windows)]
+#[test]
+fn a_locked_file_is_an_error_and_a_locked_destination_makes_put_fail_and_keep_the_old_value() {
+    use std::fs::OpenOptions;
+    use std::os::windows::fs::OpenOptionsExt;
+    for (choice, ext) in providers() {
+        let scratch = Scratch::new("locked");
+        let store = store(&scratch, choice);
+        let n = name("relay.token");
+        store.put(&n, b"before").unwrap();
+        let path = file_of(&scratch, "relay.token", ext);
+        {
+            // an exclusive handle (share mode 0), as an antivirus scan or another process might hold
+            let _lock = OpenOptions::new().read(true).share_mode(0).open(&path).unwrap();
+            assert!(matches!(store.get(&n), Err(KeyError::Io { .. })), "{ext}: a sharing violation is an error, not 'never stored'");
+            assert!(store.put(&n, b"after").is_err(), "{ext}: the rename over a locked file fails");
+            assert!(store.delete(&n).is_err());
+        }
+        assert_eq!(get(&*store, &n), Some(b"before".to_vec()), "{ext}: the previous value survived");
+        assert_eq!(all_files(&scratch.keys()).len(), 1, "{ext}: no temporary file of the failed put");
+    }
+}
+
+#[test]
+fn a_blob_copied_or_moved_to_another_name_fails_and_never_yields_the_other_secret() {
+    for (choice, ext) in providers() {
+        let scratch = Scratch::new("moved");
+        let store = store(&scratch, choice);
+        let (a, b) = (name("archive.writer"), name("backup.sig"));
+        store.put(&a, &canary(1, 32)).unwrap();
+        store.put(&b, &canary(2, 32)).unwrap();
+
+        // a copy under a new name
+        fs::copy(file_of(&scratch, "archive.writer", ext), file_of(&scratch, "vault.pins", ext)).unwrap();
+        let moved = store.get(&name("vault.pins")).expect_err("a blob under another name");
+        match choice {
+            ProviderChoice::Keyfile => assert!(matches!(moved, KeyError::WrongName), "{moved:?}"),
+            _ => assert!(matches!(moved, KeyError::Os(..)), "{moved:?}"),
+        }
+        // one secret's file over another's
+        fs::copy(file_of(&scratch, "archive.writer", ext), file_of(&scratch, "backup.sig", ext)).unwrap();
+        assert!(store.get(&b).is_err(), "{ext}: the file of another name was read as this name");
+        // and the two swapped
+        fs::write(file_of(&scratch, "archive.writer", ext), fs::read(file_of(&scratch, "vault.pins", ext)).unwrap()).unwrap();
+        assert_eq!(get(&*store, &a), Some(canary(1, 32)), "{ext}: a file under its own name still reads");
+        // a rename, the way a person might tidy up
+        fs::rename(file_of(&scratch, "vault.pins", ext), file_of(&scratch, "relay.host_identity", ext)).unwrap();
+        assert!(store.get(&name("relay.host_identity")).is_err());
+    }
+}
+
+#[test]
+fn no_plaintext_beside_the_blob() {
+    for (choice, ext) in providers() {
+        let scratch = Scratch::new("plaintext");
+        let store = store(&scratch, choice);
+        let n = name("archive.writer");
+        let (first, second) = (canary(21, 96), canary(22, 96));
+        store.put(&n, &first).unwrap();
+        let holders = files_containing(&scratch.keys(), &first);
+        match choice {
+            // the keyfile is a plaintext provider: the value is in its own file and in no other
+            ProviderChoice::Keyfile => assert_eq!(holders, ["archive.writer.kf"]),
+            _ => assert!(holders.is_empty(), "{ext}: DPAPI files hold the value in the clear: {holders:?}"),
+        }
+        assert_eq!(all_files(&scratch.keys()).len(), 1, "{ext}: exactly one file per secret, no temporary");
+
+        // an overwrite leaves no trace of the old value anywhere
+        store.put(&n, &second).unwrap();
+        assert!(files_containing(&scratch.keys(), &first).is_empty(), "{ext}: the old value is still in a file");
+        assert_eq!(all_files(&scratch.keys()).len(), 1);
+
+        // a failed put leaves nothing either (a directory sits where the file would go, so the rename fails after the temporary file was written and verified)
+        let blocker = name("blocked.name");
+        fs::create_dir(file_of(&scratch, "blocked.name", ext)).unwrap();
+        let third = canary(23, 96);
+        assert!(store.put(&blocker, &third).is_err());
+        assert!(files_containing(&scratch.keys(), &third).is_empty(), "{ext}: the failed put left the value in a file");
+        assert!(files_containing(&scratch.keys(), &second).len() <= 1);
+        fs::remove_dir(file_of(&scratch, "blocked.name", ext)).unwrap();
+
+        // and a delete removes everything
+        store.delete(&n).unwrap();
+        assert!(all_files(&scratch.keys()).is_empty(), "{ext}: files remain after the only secret was deleted");
+        assert!(files_containing(&scratch.keys(), &second).is_empty());
+    }
+}
+
+#[test]
+fn values_are_one_byte_to_sixty_four_kib() {
+    for (choice, _) in providers() {
+        let scratch = Scratch::new("bounds");
+        let store = store(&scratch, choice);
+        let n = name("bounds");
+        let secret = canary(31, 70_000);
+        assert!(matches!(store.put(&n, b""), Err(KeyError::InvalidValue(_))));
+        assert!(matches!(store.put(&n, &secret[..MAX_VALUE_LEN + 1]), Err(KeyError::InvalidValue(_))));
+        assert!(matches!(store.put(&n, &secret), Err(KeyError::InvalidValue(_))));
+        assert_eq!(get(&*store, &n), None, "a refused put stored nothing");
+        store.put(&n, &secret[..MAX_VALUE_LEN]).unwrap();
+        assert_eq!(get(&*store, &n).unwrap().len(), MAX_VALUE_LEN);
+        // an error names the problem and never carries the value
+        let error = store.put(&n, &secret).unwrap_err();
+        let text = format!("{error} / {error:?}");
+        assert!(!contains(text.as_bytes(), &secret[..16]) && !text.contains("70000"), "{text}");
+        assert_eq!(error.code(), "key_invalid_value");
+    }
+}
+
+#[test]
+fn a_file_that_is_far_larger_than_any_secret_is_refused_without_being_read_into_memory() {
+    for (choice, ext) in providers() {
+        let scratch = Scratch::new("huge");
+        let store = store(&scratch, choice);
+        let n = name("huge.file");
+        let file = fs::File::create(file_of(&scratch, "huge.file", ext)).unwrap();
+        file.set_len(300 * 1024 * 1024).unwrap(); // sparse: 300 MiB that costs nothing
+        drop(file);
+        #[cfg(unix)]
+        {
+            // the mode is checked before the size: make it a permissible file so that it is the size that is refused
+            use std::os::unix::fs::PermissionsExt;
+            fs::set_permissions(file_of(&scratch, "huge.file", ext), fs::Permissions::from_mode(0o600)).unwrap();
+        }
+        assert!(matches!(store.get(&n), Err(KeyError::Corrupt(_))), "{ext}");
+    }
+}
+
+#[test]
+fn the_error_codes_are_stable_and_no_error_prints_a_secret() {
+    let all = [
+        (KeyError::InvalidName, "key_invalid_name"),
+        (KeyError::InvalidValue("empty"), "key_invalid_value"),
+        (KeyError::Corrupt("x"), "key_corrupt"),
+        (KeyError::WrongName, "key_wrong_name"),
+        (KeyError::Os("CryptUnprotectData", 13), "key_os"),
+        (KeyError::Permissions("mode".into()), "key_permissions"),
+        (KeyError::Verify, "key_verify_failed"),
+        (KeyError::ProviderUnavailable("x"), "key_provider_unavailable"),
+        (KeyError::InvalidProvider("x".into()), "key_invalid_provider"),
+    ];
+    for (error, code) in all {
+        assert_eq!(error.code(), code);
+        assert!(error.to_string().starts_with(code), "{error}");
+    }
+    assert!(Name::new("Bad Name").is_err());
+}
+
+#[test]
+fn the_provider_is_chosen_on_purpose_and_a_typo_is_an_error() {
+    assert_eq!(ProviderChoice::parse("auto").unwrap(), ProviderChoice::Auto);
+    assert_eq!(ProviderChoice::parse("keyfile").unwrap(), ProviderChoice::Keyfile);
+    assert_eq!(ProviderChoice::parse("windows-dpapi-file").unwrap(), ProviderChoice::DpapiFile);
+    assert_eq!(ProviderChoice::parse("os-keyring").unwrap(), ProviderChoice::OsKeyring);
+    for bad in ["", "KEYFILE", "Keyfile", "key-file", "dpapi", "plain", "none", "auto ", " keyfile", "file", "keyring"] {
+        assert!(matches!(ProviderChoice::parse(bad), Err(KeyError::InvalidProvider(_))), "{bad:?}");
+    }
+    // the variable: unset is Auto, a value is parsed, a bad one is an error and never Auto (this is the only test that touches the variable)
+    std::env::remove_var(ENV_PROVIDER);
+    assert_eq!(ProviderChoice::from_env().unwrap(), ProviderChoice::Auto);
+    std::env::set_var(ENV_PROVIDER, "keyfile");
+    assert_eq!(ProviderChoice::from_env().unwrap(), ProviderChoice::Keyfile);
+    std::env::set_var(ENV_PROVIDER, "keyfil");
+    assert!(matches!(ProviderChoice::from_env(), Err(KeyError::InvalidProvider(_))));
+    std::env::remove_var(ENV_PROVIDER);
+
+    // Auto is DPAPI on Windows and nothing anywhere else: no silent fallback to a file
+    if cfg!(windows) {
+        assert_eq!(ProviderChoice::Auto.resolve().unwrap(), ProviderChoice::DpapiFile);
+        let scratch = Scratch::new("auto");
+        let store = open_at(scratch.keys(), ProviderChoice::Auto).unwrap();
+        assert_eq!(store.provider().id, "windows-dpapi-file");
+    } else {
+        assert!(matches!(ProviderChoice::Auto.resolve(), Err(KeyError::ProviderUnavailable(_))));
+        let scratch = Scratch::new("auto");
+        assert!(matches!(open_at(scratch.keys(), ProviderChoice::Auto), Err(KeyError::ProviderUnavailable(_))));
+        assert!(!scratch.keys().exists(), "a refusal creates nothing");
+        assert!(matches!(open_at(scratch.keys(), ProviderChoice::DpapiFile), Err(KeyError::ProviderUnavailable(_))));
+    }
+    // the Secret Service is named, is not built, and does not fall back
+    let scratch = Scratch::new("keyring");
+    assert!(matches!(open_at(scratch.keys(), ProviderChoice::OsKeyring), Err(KeyError::ProviderUnavailable(_))));
+    assert!(!scratch.keys().exists());
+}
+
+#[test]
+fn list_shows_only_names_and_only_files_of_its_own_provider() {
+    for (choice, ext) in providers() {
+        let scratch = Scratch::new("list");
+        let store = store(&scratch, choice);
+        store.put(&name("b.two"), b"2").unwrap();
+        store.put(&name("a.one"), b"1").unwrap();
+        let dir = scratch.keys();
+        // things that are not names, not files, not of this provider, or temporaries
+        for junk in [
+            format!("Bad Name.{ext}"),
+            format!("UPPER.{ext}"),
+            format!(".hidden.{ext}"),
+            "notes.txt".into(),
+            format!("con.{ext}"),
+            format!("x.{ext}.bak"),
+            ".a.0123456789abcdef.tmp".into(),
+        ] {
+            fs::write(dir.join(junk), b"x").unwrap();
+        }
+        fs::create_dir(dir.join(format!("adir.{ext}"))).unwrap();
+        let other = if ext == "kf" { "ks" } else { "kf" };
+        fs::write(dir.join(format!("other.provider.{other}")), b"x").unwrap();
+        let listed: Vec<String> = store.list("").unwrap().into_iter().map(|n| n.to_string()).collect();
+        assert_eq!(listed, ["a.one", "b.two"], "{ext}");
+        // the other provider's file is not ours to read either
+        assert_eq!(get(&*store, &name("other.provider")), None);
+    }
+}
+
+#[test]
+fn many_threads_reading_and_writing_never_see_a_torn_value() {
+    for (choice, _) in providers() {
+        let scratch = Scratch::new("threads");
+        let store: Arc<dyn KeyStore> = Arc::from(store(&scratch, choice));
+        let shared = name("shared.value");
+        let candidates: Vec<Vec<u8>> = (0..4u8).map(|i| canary(40 + i, 200 + usize::from(i) * 50)).collect();
+        store.put(&shared, &candidates[0]).unwrap();
+        let mut handles = Vec::new();
+        for t in 0..8u8 {
+            let store = Arc::clone(&store);
+            let candidates = candidates.clone();
+            let shared = shared.clone();
+            handles.push(thread::spawn(move || {
+                let own = name(&format!("thread.{t}"));
+                for i in 0..20usize {
+                    let value = canary(100 + t, 64 + i);
+                    store.put(&own, &value).unwrap();
+                    assert_eq!(store.get(&own).unwrap().unwrap().to_vec(), value);
+                    if t % 2 == 0 {
+                        store.put(&shared, &candidates[(i + usize::from(t)) % 4]).unwrap();
+                    }
+                    let seen = store.get(&shared).unwrap().expect("the shared name is never absent");
+                    assert!(candidates.iter().any(|c| c.as_slice() == *seen), "a torn or foreign value was read");
+                }
+            }));
+        }
+        for h in handles {
+            h.join().unwrap();
+        }
+        assert_eq!(store.list("thread.").unwrap().len(), 8);
+        assert!(all_files(&scratch.keys()).len() == 9, "no temporary file survives the run");
+    }
+}
+
+/// DPAPI specifics: what is on disk, and what "another user's key" does.
+#[cfg(windows)]
+mod dpapi {
+    use super::*;
+
+    #[test]
+    fn the_file_is_a_dpapi_blob_with_the_magic_and_no_plaintext() {
+        let scratch = Scratch::new("dpapi-file");
+        let store = store(&scratch, ProviderChoice::DpapiFile);
+        let value = canary(50, 64);
+        store.put(&name("vault.wrapper"), &value).unwrap();
+        let bytes = fs::read(file_of(&scratch, "vault.wrapper", "ks")).unwrap();
+        assert_eq!(&bytes[..8], b"OAIYKS1\x01");
+        assert!(!contains(&bytes, &value));
+        // DPAPI blobs start with version 1 and the DPAPI provider GUID df9d8cd0-1501-11d1-8c7a-00c04fc297eb
+        assert_eq!(&bytes[8..12], &[1, 0, 0, 0]);
+        assert_eq!(&bytes[12..28], &[0xd0, 0x8c, 0x9d, 0xdf, 0x01, 0x15, 0xd1, 0x11, 0x8c, 0x7a, 0x00, 0xc0, 0x4f, 0xc2, 0x97, 0xeb]);
+        // the same value stored twice gives different blobs (DPAPI salts every one)
+        store.put(&name("vault.wrapper"), &value).unwrap();
+        assert_ne!(fs::read(file_of(&scratch, "vault.wrapper", "ks")).unwrap(), bytes);
+    }
+
+    /// The master key that protected a blob is named inside it (its GUID). A blob made under another user's master key names a key this user does not have: the
+    /// same failure as another user's blob, produced without a second account by pointing a real blob at a master key that does not exist.
+    #[test]
+    fn a_blob_that_names_a_master_key_this_user_does_not_hold_is_an_error() {
+        let scratch = Scratch::new("dpapi-guid");
+        let store = store(&scratch, ProviderChoice::DpapiFile);
+        let n = name("archive.writer");
+        let value = canary(51, 32);
+        store.put(&n, &value).unwrap();
+        let path = file_of(&scratch, "archive.writer", "ks");
+        let good = fs::read(&path).unwrap();
+        // offset: 8 (our magic) + 4 (version) + 16 (provider GUID) + 4 (master key version) = the master key GUID
+        for byte in 0..16 {
+            let mut foreign = good.clone();
+            foreign[8 + 24 + byte] ^= 0xa5;
+            fs::write(&path, &foreign).unwrap();
+            match store.get(&n) {
+                Err(KeyError::Os(_, _)) => {}
+                other => panic!("master key GUID byte {byte}: {other:?}"),
+            }
+        }
+        fs::write(&path, &good).unwrap();
+        assert_eq!(get(&*store, &n), Some(value));
+    }
+
+    /// The real other-user test. It needs a blob that another Windows account made with this crate, so it is `#[ignore]`d and never runs by itself:
+    ///
+    /// 1. as a *different* Windows user, run `cargo run -p oaiy-keystore --example write_blob -- <folder> foreign.secret` (the example stores a fixed value under that name with the DPAPI provider);
+    /// 2. as the normal user, `set OAIY_KS_FOREIGN_BLOB=<folder>\keys\foreign.secret.ks` and `cargo test -p oaiy-keystore -- --ignored another_users_blob`.
+    ///
+    /// The test copies the blob into a scratch folder under a unique name, expects `get` to fail (an error, not `None` and not a value), and removes the copy.
+    #[test]
+    #[ignore = "needs a blob written by another Windows user: see the doc comment"]
+    fn another_users_blob_fails() {
+        let Some(source) = std::env::var_os("OAIY_KS_FOREIGN_BLOB") else {
+            panic!("set OAIY_KS_FOREIGN_BLOB to the path of foreign.secret.ks written by another Windows user (see the test's documentation)");
+        };
+        let scratch = Scratch::new("dpapi-foreign");
+        let store = store(&scratch, ProviderChoice::DpapiFile);
+        fs::copy(&source, file_of(&scratch, "foreign.secret", "ks")).unwrap();
+        match store.get(&name("foreign.secret")) {
+            Err(KeyError::Os(_, _)) => {}
+            other => panic!("another user's blob: {other:?}"),
+        }
+        assert_eq!(get(&*store, &name("never.stored")), None);
+    }
+}
+
+/// The keyfile's permission rules on a real Unix file system. (Compiled everywhere Unix is; run wherever the tests run on Unix.)
+#[cfg(unix)]
+mod unix {
+    use super::*;
+    use std::os::unix::fs::{symlink, PermissionsExt};
+
+    fn mode_of(path: &Path) -> u32 {
+        fs::metadata(path).unwrap().permissions().mode() & 0o7777
+    }
+
+    #[test]
+    fn a_new_store_is_0700_and_its_files_are_0600() {
+        let scratch = Scratch::new("modes");
+        let store = store(&scratch, ProviderChoice::Keyfile);
+        assert_eq!(mode_of(&scratch.keys()), 0o700);
+        store.put(&name("vault.pins"), b"pins").unwrap();
+        assert_eq!(mode_of(&file_of(&scratch, "vault.pins", "kf")), 0o600);
+        assert_eq!(get(&*store, &name("vault.pins")), Some(b"pins".to_vec()));
+    }
+
+    #[test]
+    fn a_directory_or_file_with_any_group_or_other_permission_is_refused_and_never_repaired() {
+        let scratch = Scratch::new("loose");
+        let store = store(&scratch, ProviderChoice::Keyfile);
+        store.put(&name("vault.pins"), b"pins").unwrap();
+        let file = file_of(&scratch, "vault.pins", "kf");
+        for loose in [0o644, 0o640, 0o604, 0o660, 0o666, 0o700, 0o4600] {
+            fs::set_permissions(&file, fs::Permissions::from_mode(loose)).unwrap();
+            assert!(matches!(store.get(&name("vault.pins")), Err(KeyError::Permissions(_))), "file {loose:04o}");
+            assert_eq!(mode_of(&file), loose, "the provider does not repair a mode");
+        }
+        fs::set_permissions(&file, fs::Permissions::from_mode(0o600)).unwrap();
+        assert!(store.get(&name("vault.pins")).unwrap().is_some());
+        for loose in [0o755, 0o750, 0o705, 0o777, 0o2700] {
+            fs::set_permissions(scratch.keys(), fs::Permissions::from_mode(loose)).unwrap();
+            assert!(matches!(store.get(&name("vault.pins")), Err(KeyError::Permissions(_))), "directory {loose:04o}");
+            assert!(matches!(store.put(&name("vault.pins"), b"x"), Err(KeyError::Permissions(_))));
+            assert!(matches!(store.list(""), Err(KeyError::Permissions(_))));
+            assert!(matches!(open_at(scratch.keys(), ProviderChoice::Keyfile), Err(KeyError::Permissions(_))), "opening a loose directory");
+        }
+        fs::set_permissions(scratch.keys(), fs::Permissions::from_mode(0o700)).unwrap();
+        assert!(store.get(&name("vault.pins")).unwrap().is_some());
+    }
+
+    #[test]
+    fn a_symbolic_link_in_place_of_the_file_or_the_directory_is_refused() {
+        let scratch = Scratch::new("symlink");
+        let store = store(&scratch, ProviderChoice::Keyfile);
+        store.put(&name("real.secret"), b"real").unwrap();
+        symlink(file_of(&scratch, "real.secret", "kf"), file_of(&scratch, "linked.secret", "kf")).unwrap();
+        assert!(matches!(store.get(&name("linked.secret")), Err(KeyError::Permissions(_))));
+        let elsewhere = Scratch::new("symlink-target");
+        fs::create_dir(elsewhere.0.join("keys")).unwrap();
+        fs::set_permissions(elsewhere.0.join("keys"), fs::Permissions::from_mode(0o700)).unwrap();
+        let link_parent = Scratch::new("symlink-dir");
+        symlink(elsewhere.0.join("keys"), link_parent.0.join("keys")).unwrap();
+        assert!(matches!(open_at(link_parent.0.join("keys"), ProviderChoice::Keyfile), Err(KeyError::Permissions(_))));
+    }
+}
