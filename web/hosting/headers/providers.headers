@@ -1,0 +1,38 @@
+# providers.D: the shared providers origin (design 3.1 and 3.2). Tokens are filled in by web/scripts/headers.mjs.
+#
+# It holds the provider records and the keys and makes the provider requests itself, and it is embedded by the Agent and the flow
+# editor and by nobody else. So:
+#  - frame-ancestors on the two documents an app embeds (/broker and /embed) is exactly the apps this deployment lists
+#    ({{APP_ORIGINS}}), and on every other document it is 'none': the Providers page, where a key is typed, cannot be framed by
+#    anyone, an app included. Every HTML file of the folder is named by exactly one CSP rule below (a test checks it); the rules
+#    do not overlap, because a host that JOINS the values of two rules would send two policies where one is meant. A block of a
+#    `_headers` file names ONE path, so the policy is written out for each path (with and without `.html`).
+#  - the Agent is cross-origin isolated (COEP credentialless), so this document sends COEP credentialless too and a CORP that admits
+#    a same-site embedder. It must NOT be given the `credentialless` iframe attribute: that would put its storage in an anonymous,
+#    ephemeral partition and no key would be found.
+#  - COOP same-origin isolates a top-level visit (COOP is ignored on an iframe document).
+#  - scripts only from itself (and WebAssembly for the engine, later); no inline script or style; it may call any provider address
+#    (connect-src *), because providers are arbitrary hosts; it loads no other site's script, style, font or image.
+#  - Origin-Agent-Cluster asks for an agent cluster (and, where the browser will, a process) of its own, apart from the apps.
+/*
+  X-Content-Type-Options: nosniff
+  Referrer-Policy: no-referrer
+  Strict-Transport-Security: max-age=86400
+  Cross-Origin-Opener-Policy: same-origin
+  Cross-Origin-Embedder-Policy: credentialless
+  Cross-Origin-Resource-Policy: same-site
+  Origin-Agent-Cluster: ?1
+  Permissions-Policy: camera=(), microphone=(), geolocation=(), payment=(), usb=(), serial=(), hid=(), bluetooth=(), midi=(), display-capture=()
+  Cache-Control: no-cache
+/broker
+  Content-Security-Policy: default-src 'none'; script-src 'self' 'wasm-unsafe-eval'; style-src 'self'; img-src 'self' data:; font-src 'self'; connect-src *; worker-src 'self' blob:; manifest-src 'self'; base-uri 'none'; form-action 'none'; object-src 'none'; frame-src 'none'; frame-ancestors {{APP_ORIGINS}}
+/broker.html
+  Content-Security-Policy: default-src 'none'; script-src 'self' 'wasm-unsafe-eval'; style-src 'self'; img-src 'self' data:; font-src 'self'; connect-src *; worker-src 'self' blob:; manifest-src 'self'; base-uri 'none'; form-action 'none'; object-src 'none'; frame-src 'none'; frame-ancestors {{APP_ORIGINS}}
+/embed
+  Content-Security-Policy: default-src 'none'; script-src 'self' 'wasm-unsafe-eval'; style-src 'self'; img-src 'self' data:; font-src 'self'; connect-src *; worker-src 'self' blob:; manifest-src 'self'; base-uri 'none'; form-action 'none'; object-src 'none'; frame-src 'none'; frame-ancestors {{APP_ORIGINS}}
+/embed.html
+  Content-Security-Policy: default-src 'none'; script-src 'self' 'wasm-unsafe-eval'; style-src 'self'; img-src 'self' data:; font-src 'self'; connect-src *; worker-src 'self' blob:; manifest-src 'self'; base-uri 'none'; form-action 'none'; object-src 'none'; frame-src 'none'; frame-ancestors {{APP_ORIGINS}}
+/
+  Content-Security-Policy: default-src 'none'; script-src 'self' 'wasm-unsafe-eval'; style-src 'self'; img-src 'self' data:; font-src 'self'; connect-src *; worker-src 'self' blob:; manifest-src 'self'; base-uri 'none'; form-action 'none'; object-src 'none'; frame-src 'none'; frame-ancestors 'none'
+/index.html
+  Content-Security-Policy: default-src 'none'; script-src 'self' 'wasm-unsafe-eval'; style-src 'self'; img-src 'self' data:; font-src 'self'; connect-src *; worker-src 'self' blob:; manifest-src 'self'; base-uri 'none'; form-action 'none'; object-src 'none'; frame-src 'none'; frame-ancestors 'none'

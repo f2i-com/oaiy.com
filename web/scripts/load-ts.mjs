@@ -1,7 +1,7 @@
 /**
- * Load a TypeScript module of this repository into a Node test.
+ * Load a TypeScript module of this repository into a Node script or test.
  *
- * The suites bundle what they test with esbuild (as platform/ui/tests/support/loadTs.mjs does): no compile step of their
+ * The tests and scripts bundle what they use with esbuild (as platform/ui/tests/support/loadTs.mjs does): no compile step of their
  * own, and the module under test is the source file, not a copy. `@oaiy/shared/...` is the repository's `shared/` folder.
  * The bundle is imported from a data: URL, so nothing is written to disk; it has no imports of its own except Node's.
  */
@@ -10,7 +10,7 @@ import { fileURLToPath } from 'node:url';
 import * as esbuild from 'esbuild';
 
 /** `web/` */
-export const WEB = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..', '..');
+export const WEB = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
 /** The repository root. */
 export const ROOT = path.resolve(WEB, '..');
 export const SHARED = path.join(ROOT, 'shared');

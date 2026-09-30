@@ -19,7 +19,7 @@ let world;
 let browser;
 
 before(async () => {
-  world = await startWorld();
+  world = await startWorld({ providers: false });
   // The providers site is not built in this test: a shell stands in for it where a page needs something to fetch.
   world.hosts.setSite('providers', { root: path.join(world.dir, 'agent'), headers: '' });
   browser = await launchBrowser({});

@@ -16,12 +16,32 @@ import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
-import { chromium } from 'playwright';
+import { chromium, firefox } from 'playwright';
+import { assembleProviders } from '../../scripts/assemble.mjs';
 import { readTemplate, renderHeaders } from '../../scripts/headers.mjs';
 import { startHosts } from './hosts.mjs';
 
 const HERE = path.dirname(fileURLToPath(import.meta.url));
 export const FIXTURES = path.join(HERE, 'fixtures');
+
+/** The features Playwright 1.60 disables in the Chromium it launches (chromiumSwitches.ts), except ThirdPartyStoragePartitioning. */
+const PLAYWRIGHT_DISABLED_FEATURES = [
+  'AvoidUnnecessaryBeforeUnloadCheckSync',
+  'BoundaryEventDispatchTracksNodeRemoval',
+  'DestroyProfileOnBrowserClose',
+  'DialMediaRouteProvider',
+  'GlobalMediaControls',
+  'HttpsUpgrades',
+  'LensOverlay',
+  'MediaRouter',
+  'PaintHolding',
+  'Translate',
+  'AutoDeElevate',
+  'RenderDocument',
+  'OptimizationHints',
+  'msForceBrowserSignIn',
+  'msEdgeUpdateLaunchServicesPreferredVersion',
+];
 
 /** The product's own ports: never reached from here. */
 export const OWN_PORTS = new Set(['17972', '17872', '17973', '8080', '7860', '8783', '9333']);
@@ -44,12 +64,50 @@ export async function waitFor(fn, { timeout = 8000, interval = 50, what = 'the c
  * frame is then out of process from the app that embeds it, which is what a test that reads the APP's memory needs (two
  * same-site frames share a renderer, and so a heap, by default).
  */
-export async function launchBrowser({ isolateOrigins = [], headless = true } = {}) {
+export async function launchBrowser({ isolateOrigins = [], headless = true, browserName = 'chromium' } = {}) {
+  if (browserName === 'firefox') return launchFirefox({ headless });
   const args = [];
   if (isolateOrigins.length > 0) args.push(`--isolate-origins=${isolateOrigins.join(',')}`);
+  // Playwright turns third-party storage partitioning OFF in the Chromium it launches (its issue 32230), whichever channel, and every
+  // real Chrome and Edge has it on. With it off, a frame under an app on another domain shares the top-level window's storage, which
+  // no visitor's browser does, and E1's "another registrable domain must NOT share the store" cannot be shown. This is Playwright's
+  // own list of disabled features without that one; a later `--disable-features` replaces the earlier one.
+  args.push(`--disable-features=${PLAYWRIGHT_DISABLED_FEATURES.join(',')}`);
   const channel = process.env.WEB_E2E_CHANNEL || 'chromium';
   const browser = await chromium.launch({ headless, channel, args });
   return browser;
+}
+
+/**
+ * Firefox, for E1 (design 8 names Chromium and Firefox). Playwright's own Firefox build is what it wants; where the installed
+ * one is another revision (Playwright 1.60 asks for 1522 and %LOCALAPPDATA%\ms-playwright may hold 1543) the newest installed one is
+ * used. Nothing is downloaded. Returns null when no Firefox can be started, so a test can say it was not run.
+ */
+async function launchFirefox({ headless }) {
+  // Playwright's Firefox starts with cookie behaviour 0 (no partitioning); a real Firefox has 5 (reject trackers and partition
+  // third-party state) by default, which is what puts a frame under another site's storage in another partition.
+  const firefoxUserPrefs = { 'network.cookie.cookieBehavior': 5 };
+  try {
+    return await firefox.launch({ headless, firefoxUserPrefs });
+  } catch {
+    // fall through to an installed revision
+  }
+  const root = path.join(process.env.LOCALAPPDATA ?? path.join(os.homedir(), '.cache'), 'ms-playwright');
+  const found = fs.existsSync(root)
+    ? fs.readdirSync(root).filter((d) => /^firefox-\d+$/.test(d)).sort((a, b) => Number(b.split('-')[1]) - Number(a.split('-')[1]))
+    : [];
+  for (const dir of found) {
+    for (const exe of ['firefox/firefox.exe', 'firefox/firefox', 'firefox/Nightly.app/Contents/MacOS/firefox']) {
+      const executablePath = path.join(root, dir, exe);
+      if (!fs.existsSync(executablePath)) continue;
+      try {
+        return await firefox.launch({ headless, executablePath, firefoxUserPrefs });
+      } catch {
+        // try the next
+      }
+    }
+  }
+  return null;
 }
 
 /** A fresh context with the recorder on. `blocked` lists what it refused. */
@@ -89,10 +147,11 @@ function shellFolder(root, name) {
 /**
  * The world of a test: the hosts server with the Agent, the flow editor, an evil page on the same site and an app on another
  * domain (the shells of fixtures/shell, each with the headers of its host as web/hosting/headers/ writes them), and the providers
- * origin from `assembleProviders`, given the origins that are now known.
+ * origin assembled from its build (`npm run build`) with the origins that are now known.
  *
- * @param {{ assembleProviders?: (origins: Record<string,string>, dir: string) => Promise<string> | string, apps?: string[] }} [options]
- *   `apps` names the sites allowed to embed the providers origin (default agent and flows); the callback returns its folder.
+ * @param {{ providers?: boolean, apps?: string[], providersHeaders?: (rendered: string, origins: Record<string,string>) => string }} [options]
+ *   `providers: false` leaves the providers site out (the harness tests); `apps` names the sites allowed to embed the providers
+ *   origin (default agent and flows); `providersHeaders` changes its rendered `_headers` (a test that needs a variant).
  */
 export async function startWorld(options = {}) {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'oaiy-web-e2e-'));
@@ -104,9 +163,10 @@ export async function startWorld(options = {}) {
   hosts.setSite('flows', withHeaders('flows'));
   hosts.setSite('foreign', withHeaders('foreign'));
   hosts.setSite('evil', { root: shellFolder(dir, 'evil'), headers: '' });
-  if (options.assembleProviders) {
-    const providersRoot = await options.assembleProviders(origins, path.join(dir, 'providers'));
-    hosts.setSite('providers', { root: providersRoot });
+  if (options.providers !== false) {
+    const apps = Object.fromEntries((options.apps ?? ['agent', 'flows']).map((name) => [name, origins[name]]));
+    const root = await assembleProviders({ outDir: path.join(dir, 'providers'), providers: origins.providers, apps, headers: options.providersHeaders ? (rendered) => options.providersHeaders(rendered, origins) : undefined });
+    hosts.setSite('providers', { root });
   }
   return {
     hosts,

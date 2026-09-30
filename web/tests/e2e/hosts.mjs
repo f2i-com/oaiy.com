@@ -124,6 +124,8 @@ export async function startHosts(options = {}) {
     } catch {
       return send(400, {}, 'bad path');
     }
+    // A `_headers` file configures a host; it is not one of the site's files.
+    if (pathname === '/_headers') return send(404, { 'content-type': 'text/plain' }, 'Not Found');
     let file = path.join(site.root, pathname);
     if (file !== site.root && !file.startsWith(site.root + path.sep)) return send(403, {}, 'no');
     if (pathname.endsWith('/')) file = path.join(file, 'index.html');
