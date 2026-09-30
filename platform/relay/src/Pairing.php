@@ -133,6 +133,9 @@ final class Pairing
         $exp = $now + $ttl;
         try {
             $ctx->db->write(function (Db $db) use ($p, $pid, $offer, $mac, $appId, $thumb, $now, $exp): void {
+                // The count below is of rows that do not exist yet: two opens by one desktop must not both count 15 and both make the
+                // 16th and 17th. The gate is taken first, before any read, so the second waits for the first to commit and counts it.
+                $db->gate('pair:' . $p->id);
                 // A finished rendezvous the garbage collector has not reached yet does not hold its pid.
                 $db->exec('DELETE FROM pairings WHERE pid = ? AND (exp <= ? OR state = ?)', [$pid, $now, 'expired']);
                 $open = (int)$db->val("SELECT COUNT(*) FROM pairings WHERE desktop_dev = ? AND exp > ? AND state IN ('open', 'answered')", [$p->id, $now]);
@@ -181,8 +184,10 @@ final class Pairing
             if ($row['state'] !== 'open' || $row['responses'] >= self::RESPONSES_MAX) {
                 throw ApiError::make('already_answered');
             }
+            // The row is locked by the read above; the state, the count of responses and the change are still one statement, so a
+            // second response can neither pass the state test nor take a fourth place, whatever the isolation level shows.
             $n = $row['responses'] + 1;
-            if ($db->exec("UPDATE pairings SET state = 'answered', response = ?, responses = ? WHERE pid = ? AND state = 'open'", [$text, $n, $pid]) !== 1) {
+            if ($db->exec("UPDATE pairings SET state = 'answered', response = ?, responses = responses + 1 WHERE pid = ? AND state = 'open' AND responses < ?", [$text, $pid, self::RESPONSES_MAX]) !== 1) {
                 throw ApiError::make('already_answered');
             }
             // The first response carries the pid as its item id; a later one (after a reject) needs an id of its own.
@@ -239,6 +244,16 @@ final class Pairing
                 throw ApiError::make('conflict');
             }
             $phone = self::approval($row, $doc);
+            // What follows counts phones that may not exist yet and makes one: two approvals for two of one desktop's pairings must
+            // not both count the same phones (the 17th), nor both find no earlier device of one key (two active devices for it).
+            // The gate is taken before any read of devices, so the second approval waits for the first to commit and counts it.
+            $db->gate('roster:' . $row['desktop_dev']);
+            // A desktop revoked while its owner was deciding gets no new phone: the revocation locks this row first, so it either
+            // finished before this read (refused here) or waits for this commit.
+            $owner = $db->one("SELECT revoked_at FROM devices WHERE id = ? AND role = 'desktop'" . $db->forUpdate(), [(string)$row['desktop_dev']]);
+            if ($owner === null || $owner['revoked_at'] !== null) {
+                throw ApiError::make('revoked');
+            }
             // The roster holds at most rosterMax phones for one desktop and app; a phone that pairs again with the SAME key
             // replaces its old device instead of counting twice.
             $same = [];

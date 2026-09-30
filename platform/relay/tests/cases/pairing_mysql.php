@@ -6,6 +6,7 @@ use Oaiy\Relay\B64;
 use OaiyTest\AokieRig;
 use OaiyTest\Ceremony;
 use OaiyTest\MysqlServer;
+use OaiyTest\PendingHttp;
 use OaiyTest\Relay;
 use OaiyTest\Server;
 
@@ -22,6 +23,48 @@ function pmy_db(string $flavour): array
 {
     $srv = MysqlServer::for($flavour);
     return ['db' => ['driver' => 'mysql', 'dsn' => $srv->dsn($srv->newDatabase()), 'user' => 'root', 'pass' => '']];
+}
+
+/**
+ * A second connection that holds a gate the way a writer midway through its check does (Db::gate: a row of meta, locked), until the
+ * returned function is called. While it is held, a request that takes the gate first cannot pass it, which is what makes the tests
+ * of the gates certain instead of a matter of two requests happening to overlap.
+ * @param array{db:array<string,string>} $prov
+ * @return callable():void the release
+ */
+function pmy_hold_gate(array $prov, string $name): callable
+{
+    $c = $prov['db'];
+    $pdo = new \PDO($c['dsn'], $c['user'], $c['pass'], [\PDO::ATTR_ERRMODE => \PDO::ERRMODE_EXCEPTION]);
+    $pdo->exec('START TRANSACTION');
+    $pdo->prepare('INSERT INTO meta (k, v, s) VALUES (?, 0, NULL) ON DUPLICATE KEY UPDATE k = k')->execute(['gate:' . $name]);
+    $st = $pdo->prepare('SELECT v FROM meta WHERE k = ? FOR UPDATE');
+    $st->execute(['gate:' . $name]);
+    $st->fetchAll();
+    return function () use ($pdo): void {
+        $pdo->exec('COMMIT');
+    };
+}
+
+/**
+ * With a gate held ($release given): none of the requests answers while it is held (half a second is far longer than any of them takes
+ * when nothing holds them), then the gate is released. Without one nothing is checked or done.
+ * @param list<PendingHttp> $requests
+ */
+function pmy_expect_blocked(array $requests, ?callable $release): void
+{
+    if ($release === null) {
+        return;
+    }
+    foreach ($requests as $p) {
+        $p->pump(0.5);
+    }
+    $heard = '';
+    foreach ($requests as $p) {
+        $heard .= $p->received();
+    }
+    $release();
+    eq('', $heard, 'every request waited at the gate while another writer held it');
 }
 
 foreach (['mysql', 'mariadb'] as $flavour) {
@@ -243,5 +286,162 @@ echo $bad, "\n";
         eq(403, $k->mobile($a)['status'], 'a phone the roster dropped');
         eq(200, $k->mobile($b)['status']);
         eq(403, $k->call($ma['json']['accessToken'], 'GET', 'challenge')['status'], 'and its bearer is refused at its next request');
+    });
+
+    slow_test("4.10.3 $tag: two rendezvous opened together by a desktop that has 15 open are counted through the gate: one is 201, the other 429, and never 17 are open", function () use ($flavour) {
+        if (!MysqlServer::available($flavour)) {
+            skip("no $flavour server binary here");
+        }
+        $prov = pmy_db($flavour);
+        $r = Relay::make([], $prov);
+        $d = $r->desktop();
+        for ($i = 0; $i < 15; $i++) {
+            eq(201, Ceremony::random($r, $d)->open()['status'], "open $i");
+        }
+        [$a, $b] = $r->fleet(2);
+        $h = ['Content-Type' => 'application/json', 'Authorization' => 'Bearer ' . $d->token];
+        for ($round = 1; $round <= 3; $round++) {
+            $x = Ceremony::random($r, $d);
+            $y = Ceremony::random($r, $d);
+            // Round 1 is decided by the test: another writer holds the desktop's gate while both requests arrive, so both must wait at
+            // it (a request that does not wait has no gate), and then count one after the other. The later rounds just race.
+            $release = $round === 1 ? pmy_hold_gate($prov, 'pair:' . $d->id) : null;
+            $p1 = $a->begin('POST', '/v1/pair', $h, json_encode($x->createDoc()));
+            $p2 = $b->begin('POST', '/v1/pair', $h, json_encode($y->createDoc()));
+            pmy_expect_blocked([$p1, $p2], $release);
+            $s = [$p1->finish(15)['status'], $p2->finish(15)['status']];
+            sort($s);
+            eq([201, 429], $s, "round $round");
+            eq(16, (int)$r->ctx()->db->val("SELECT COUNT(*) FROM pairings WHERE desktop_dev = ? AND state = 'open'", [$d->id]), "round $round: sixteen are open, not seventeen");
+            // Free the place again for the next round: burn whichever was made.
+            $made = (int)$r->ctx()->db->val('SELECT COUNT(*) FROM pairings WHERE pid = ?', [$x->pid]) === 1 ? $x : $y;
+            eq(200, $r->call($d, 'POST', '/v1/pair/' . $made->pid . '/burn')['status']);
+        }
+    });
+
+    slow_test("4.10.6 $tag: two approvals for two rendezvous of one desktop with 15 phones are counted through the gate: one is 200, the other 409, and never 17 phones are active", function () use ($flavour) {
+        if (!MysqlServer::available($flavour)) {
+            skip("no $flavour server binary here");
+        }
+        $prov = pmy_db($flavour);
+        $r = Relay::make([], $prov);
+        $d = $r->desktop();
+        for ($i = 0; $i < 15; $i++) {
+            eq('approved', Ceremony::random($r, $d)->complete()['json']['state'], "phone $i");
+        }
+        [$a, $b] = $r->fleet(2);
+        $h = ['Content-Type' => 'application/json', 'Authorization' => 'Bearer ' . $d->token];
+        $active = fn(): int => (int)$r->ctx()->db->val("SELECT COUNT(*) FROM devices WHERE role = 'phone' AND owner_desktop = ? AND revoked_at IS NULL", [$d->id]);
+        for ($round = 1; $round <= 3; $round++) {
+            $x = Ceremony::random($r, $d);
+            $y = Ceremony::random($r, $d);
+            foreach ([$x, $y] as $c) {
+                eq(201, $c->open()['status']);
+                eq(202, $c->answer()['status']);
+            }
+            $release = $round === 1 ? pmy_hold_gate($prov, 'roster:' . $d->id) : null; // round 1: both must wait at the gate (see the test above)
+            $p1 = $a->begin('POST', '/v1/pair/' . $x->pid . '/decision', $h, json_encode($x->decisionDoc()));
+            $p2 = $b->begin('POST', '/v1/pair/' . $y->pid . '/decision', $h, json_encode($y->decisionDoc()));
+            pmy_expect_blocked([$p1, $p2], $release);
+            $s = [$p1->finish(15)['status'], $p2->finish(15)['status']];
+            sort($s);
+            eq([200, 409], $s, "round $round");
+            eq(16, $active(), "round $round: sixteen phones, not seventeen");
+            // Take the phone that was made away again, so that the next round starts from fifteen.
+            $mine = $r->ctx()->db->all("SELECT id FROM devices WHERE role = 'phone' AND owner_desktop = ? AND revoked_at IS NULL AND thumbprint IN (?, ?)", [$d->id, $x->phoneThumb(), $y->phoneThumb()]);
+            eq(1, count($mine));
+            \Oaiy\Relay\Devices::revoke($r->ctx(), (string)$mine[0]['id']);
+            eq(15, $active());
+        }
+    });
+
+    slow_test("4.10.6 $tag: two approvals of one phone key for two rendezvous leave one active device for that key (the second replaces the first), whatever their order", function () use ($flavour) {
+        if (!MysqlServer::available($flavour)) {
+            skip("no $flavour server binary here");
+        }
+        $prov = pmy_db($flavour);
+        $r = Relay::make([], $prov);
+        $d = $r->desktop();
+        [$a, $b] = $r->fleet(2);
+        $h = ['Content-Type' => 'application/json', 'Authorization' => 'Bearer ' . $d->token];
+        for ($round = 1; $round <= 3; $round++) {
+            $x = Ceremony::random($r, $d);
+            $y = Ceremony::random($r, $d);
+            foreach (['phoneSeed', 'phoneXSecret', 'phonePk', 'phoneXPk'] as $f) {
+                $y->$f = $x->$f;
+            }
+            foreach ([$x, $y] as $c) {
+                eq(201, $c->open()['status']);
+                eq(202, $c->answer()['status']);
+            }
+            $release = $round === 1 ? pmy_hold_gate($prov, 'roster:' . $d->id) : null;
+            $p1 = $a->begin('POST', '/v1/pair/' . $x->pid . '/decision', $h, json_encode($x->decisionDoc()));
+            $p2 = $b->begin('POST', '/v1/pair/' . $y->pid . '/decision', $h, json_encode($y->decisionDoc()));
+            pmy_expect_blocked([$p1, $p2], $release);
+            $s = [$p1->finish(15)['status'], $p2->finish(15)['status']];
+            eq([200, 200], $s, "round $round");
+            eq(1, (int)$r->ctx()->db->val('SELECT COUNT(*) FROM devices WHERE thumbprint = ? AND revoked_at IS NULL', [$x->phoneThumb()]), "round $round: one active device for the key");
+            eq(2, (int)$r->ctx()->db->val('SELECT COUNT(*) FROM devices WHERE thumbprint = ?', [$x->phoneThumb()]), "round $round: each approval made a device, the older one is revoked");
+        }
+    });
+
+    slow_test("4.10.6 $tag: an approval that reaches its transaction while the desktop's revocation is in flight waits for it, is 401 revoked, makes no phone and leaves the rendezvous answered", function () use ($flavour) {
+        if (!MysqlServer::available($flavour)) {
+            skip("no $flavour server binary here");
+        }
+        $prov = pmy_db($flavour);
+        $r = Relay::make([], $prov);
+        $d = $r->desktop();
+        $c = Ceremony::random($r, $d);
+        eq(201, $c->open()['status']);
+        eq(202, $c->answer()['status']);
+        [$a] = $r->fleet(1);
+        // The revocation of the desktop, half done: its row is changed and locked, not yet committed. The request's own credential
+        // check reads the committed row, so it passes; it meets the revocation at the desktop's row inside its transaction.
+        $db = $prov['db'];
+        $rev = new \PDO($db['dsn'], $db['user'], $db['pass'], [\PDO::ATTR_ERRMODE => \PDO::ERRMODE_EXCEPTION]);
+        $rev->exec('START TRANSACTION');
+        $rev->prepare('UPDATE devices SET revoked_at = ? WHERE id = ?')->execute([Relay::T0, $d->id]);
+        $p = $a->begin('POST', '/v1/pair/' . $c->pid . '/decision', ['Content-Type' => 'application/json', 'Authorization' => 'Bearer ' . $d->token], json_encode($c->decisionDoc()));
+        $p->pump(0.6);
+        $heard = $p->received();
+        $rev->exec('COMMIT');
+        eq('', $heard, 'the approval waited for the desktop\'s row');
+        $res = $p->finish(15);
+        eq(401, $res['status'], $res['body']);
+        eq('revoked', json_decode($res['body'], true)['error']['code']);
+        eq(0, (int)$r->ctx()->db->val("SELECT COUNT(*) FROM devices WHERE role = 'phone'"), 'no phone was made for a revoked desktop');
+        eq('answered', $r->ctx()->db->val('SELECT state FROM pairings WHERE pid = ?', [$c->pid]), 'and the rendezvous was not changed');
+    });
+
+    slow_test("4.5 $tag: revoking a desktop with its phones lists them only after it holds the desktop's row, so a phone made while it waited (an approval in flight) is revoked with it", function () use ($flavour) {
+        if (!MysqlServer::available($flavour)) {
+            skip("no $flavour server binary here");
+        }
+        $prov = pmy_db($flavour);
+        $r = Relay::make([], $prov);
+        $d = $r->desktop();
+        $existing = $r->phone($d);
+        $db = $prov['db'];
+        $hold = new \PDO($db['dsn'], $db['user'], $db['pass'], [\PDO::ATTR_ERRMODE => \PDO::ERRMODE_EXCEPTION]);
+        $hold->exec('START TRANSACTION'); // an approval midway: it has the desktop's row
+        $st = $hold->prepare('SELECT id FROM devices WHERE id = ? FOR UPDATE');
+        $st->execute([$d->id]);
+        $st->fetchAll();
+        $script = $r->dir . '/revoke.php';
+        file_put_contents($script, '<?php
+define("OAIY_RELAY", true);
+require ' . var_export(dirname(__DIR__, 2) . '/src/autoload.php', true) . ';
+$ctx = Oaiy\Relay\Context::open($argv[1]);
+echo count(Oaiy\Relay\Devices::revoke($ctx, $argv[2], true)), "\n";
+');
+        $p = proc_open(array_merge([PHP_BINARY], Server::phpFlags(), [$script, $r->data, $d->id]), [1 => ['pipe', 'w'], 2 => ['pipe', 'w']], $pipes);
+        usleep(900000); // the revocation is waiting for the desktop's row
+        $made = $r->phone($d); // the approval's phone, committed (it does not need that row) while the revocation waits
+        $hold->exec('COMMIT');
+        eq('3', trim((string)stream_get_contents($pipes[1])), 'the desktop and both phones');
+        eq('', trim((string)stream_get_contents($pipes[2])));
+        proc_close($p);
+        eq([[$d->id, 1], [$existing->id, 1], [$made->id, 1]], array_map(fn($id) => [$id, (int)($r->ctx()->db->val('SELECT revoked_at IS NOT NULL FROM devices WHERE id = ?', [$id]))], [$d->id, $existing->id, $made->id]));
     });
 }

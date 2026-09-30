@@ -279,8 +279,12 @@ the relay only stores and forwards. The steps and their answers are in the proto
   hash and the desktop's signed **receipt**. The plaintext token exists inside that one request. The relay checks the receipt
   against the desktop key in the offer, and the approved keys against the response the phone posted, before it creates anything;
   the phone checks both again, because the relay is not trusted.
-- **Races.** Every change of state is a conditional `UPDATE` in one immediate transaction: two responders to one pid cannot both
-  win, an approval racing a burn has one winner, and the database agrees with it.
+- **Races.** Every change of state is a conditional `UPDATE` on a row read under its lock, in one immediate transaction: two
+  responders to one pid cannot both win, an approval racing a burn has one winner, and the database agrees with it. The two checks
+  that count rows that do not exist yet (16 open rendezvous per desktop; 16 phones per desktop and one active device per phone
+  key) take a named gate first, so on MySQL and MariaDB the second of two requests waits for the first to commit and counts what
+  it made; an approval also locks the desktop's row and is refused (`401 revoked`) when the desktop was revoked meanwhile. The
+  tests race real requests on both servers.
 - **Garbage collection** removes a rendezvous ten minutes after the phone read its outcome, and at expiry.
 
 `fixtures/sealed-token.json` holds sealed tokens the real relay produced, with the recipient key and the checks a reader must

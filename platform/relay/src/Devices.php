@@ -66,6 +66,10 @@ final class Devices
             $ids = [];
             $todo = [$id];
             if ($cascade) {
+                // The desktop's row is locked before the phones are listed: an approval that is making a phone for this desktop holds
+                // the same lock until it commits, so the list below (a read that sees the state as of its first statement) includes
+                // that phone, and an approval that comes after finds the desktop revoked (Pairing::decide).
+                $db->one('SELECT id FROM devices WHERE id = ?' . $db->forUpdate(), [$id]);
                 foreach ($db->all('SELECT id FROM devices WHERE owner_desktop = ? AND revoked_at IS NULL', [$id]) as $r) {
                     $todo[] = (string)$r['id'];
                 }

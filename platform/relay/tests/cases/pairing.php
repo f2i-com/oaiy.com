@@ -976,6 +976,39 @@ test('4.10.6 a desktop and app hold at most 16 phones (rosterMax): the 17th appr
     eq(200, $r->call($tok, 'GET', '/v1/poll')['status'], 'the new one works');
 });
 
+test('4.18.5 a database at schema 1 that holds an open rendezvous and an answered one with its pair item is migrated by the first request that meets it, and the ceremony goes on: the approval, the token, the pair item under the key that has the sender', function () {
+    [$r, $d, $c] = pair_setup();
+    $c->open();
+    $c->answer();
+    $waiting = Ceremony::random($r, $d);
+    $waiting->open();
+    eq(1, count(pair_items($r, $d)));
+    // Make it a schema 1 database: the old key of an item (no sender), and the old version.
+    $raw = \Oaiy\Relay\Db::open(\Oaiy\Relay\Config::load($r->data));
+    if ($raw->driver === 'mysql') {
+        $raw->exec('ALTER TABLE items DROP INDEX items_dedupe, ADD UNIQUE KEY items_dedupe (mailbox, lane, id)');
+    } else {
+        $raw->exec('DROP INDEX items_dedupe');
+        $raw->exec('CREATE UNIQUE INDEX items_dedupe ON items(mailbox, lane, id)');
+    }
+    $raw->exec("UPDATE meta SET v = 1 WHERE k = 'schema_version'");
+    eq(1, $raw->schemaVersion());
+    $res = $c->decide();
+    eq(200, $res['status'], $res['body']);
+    eq(2, $r->ctx()->db->schemaVersion(), 'the request that met the old database migrated it');
+    eq('approved', $c->get()['json']['state']);
+    $token = $c->openToken((string)$c->get()['json']['sealedToken']);
+    eq(200, $r->call($token, 'GET', '/v1/poll')['status'], 'the new phone\'s token works');
+    $rows = pair_items($r, $d);
+    eq([$c->pid], array_column($rows, 'id'));
+    eq(['relay'], array_column($rows, 'sender'));
+    // The rendezvous that was open answers as before, and its item lands beside the first one.
+    eq(202, $waiting->answer()['status']);
+    eq([$c->pid, $waiting->pid], array_column(pair_items($r, $d), 'id'));
+    eq(200, $waiting->decide()['status']);
+    eq('approved', $waiting->get()['json']['state']);
+});
+
 // ------------------------------------------------------------------------------------------------ the desktop's routes: ownership and authority
 
 test('4.10.3 the decision, reject and burn are the desktop\'s: another desktop and an unknown pid are the same 404, a phone or provider is 403, no credential is 401, the pid itself is no credential', function () {
