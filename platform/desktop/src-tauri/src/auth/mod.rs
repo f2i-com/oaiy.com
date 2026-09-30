@@ -40,6 +40,8 @@ pub mod routes;
 pub mod runtime;
 pub mod scopes;
 pub mod scrub;
+#[cfg(feature = "web")]
+pub mod setup;
 pub mod store;
 pub mod token;
 #[cfg(feature = "web")]
