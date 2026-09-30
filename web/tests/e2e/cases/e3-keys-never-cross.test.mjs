@@ -12,10 +12,13 @@
  *   5. the embedded modal has no input at all, and the Providers page has the password and address inputs it should;
  *   6. the policy of every document is the one that makes 4 hold.
  *
- * `npm run test:mutations` breaks five things on purpose (drops frame-ancestors, accepts a baseUrl from the message, accepts
- * //evil.example/x, skips the origin check, adds a getKey operation) and requires the tests below to fail for each.
+ * `npm run test:mutations` breaks things on purpose (drops frame-ancestors, accepts a baseUrl from the message, accepts
+ * //evil.example/x, skips the origin check, adds a getKey operation, skips the source check, and two leaks that a scan of text does not
+ * see: the key as a Uint8Array in `list`, and reversed in `status`) and requires the tests to fail for each.
  *
- * A search that finds nothing proves nothing, so the storage and memory scans are shown to find a key that is there (the controls).
+ * A search that finds nothing proves nothing, so the storage and memory scans are shown to find a key that is there (the controls), in
+ * each shape they claim to. What a scan of strings cannot show is stated in leakscan.mjs: it is the rule (nothing the port says depends
+ * on a key) that the scans check, and they cannot prove the absence of a leak in a shape they do not look for.
  */
 import assert from 'node:assert/strict';
 import fs from 'node:fs';
@@ -24,12 +27,16 @@ import { after, before, describe, it } from 'node:test';
 import { browserVersion, launchBrowser, newContext, newPage, startWorld, waitFor } from '../harness.mjs';
 import { parseHeaders, headersFor } from '../hosts.mjs';
 import { startCollector, startFakeProvider } from '../fake-provider.mjs';
-import { findInStorage, forms, heapHolds } from '../leakscan.mjs';
+import { buffersHold, findInReceived, findInStorage, findInText, heapHolds, needlesFor } from '../leakscan.mjs';
 import { addProvider } from '../providers-page.mjs';
 
 const KEY = 'sk-e3-Zq7Rk2Lm9XvB4nT8wYc1HdJf6PsA3GuE5oIiN0-QeUxVtWyMaS';
-/** The key in every form a page might hold it in, and long pieces of it (a prefix, a suffix, a middle). */
-const NEEDLES = [...forms(KEY), KEY.slice(0, 14), KEY.slice(-14), KEY.slice(12, 30)];
+/**
+ * The key in every shape a page might hold it in (as it is, reversed, base64, hex, percent-encoded, character codes, and any 20 characters
+ * of it): see leakscan.mjs, which also says what a scan of this kind cannot show. The rule that a key never crosses is the port's (nothing
+ * it says depends on a key); these scans are what would show that rule broken in the ordinary ways, and the controls show they can.
+ */
+const NEEDLES = needlesFor(KEY);
 
 let world;
 let browser;
@@ -101,15 +108,34 @@ describe('E3.1 no key in the app origins\' storage or memory', () => {
       // Its storage, everything it received, and its memory.
       const dump = await page.evaluate(() => window.oaiyTest.dumpStorage());
       assert.deepEqual(findInStorage(dump, NEEDLES), [], 'storage');
-      assert.deepEqual(findInStorage({ indexedDB: [], localStorage: {}, sessionStorage: {}, caches: [], cookies: await page.evaluate(() => window.oaiyTest.received()) }, NEEDLES), [], 'everything received over the port');
-      assert.deepEqual(await heapHolds(s.context, page, NEEDLES), [], 'memory');
-      // The scans above are not deaf: the same calls find the key in a page that was handed it.
-      await page.evaluate((key) => {
-        window.__planted = { key };
-        localStorage.setItem('planted', key);
-      }, KEY);
+      assert.deepEqual(dump.serviceWorkers, [], 'the page registered no service worker (whose cache or script this scan would not see)');
+      assert.deepEqual(page.workers(), [], 'and started no worker (whose heap this scan does not read)');
+      assert.deepEqual(findInReceived(await page.evaluate(() => window.oaiyTest.received()), NEEDLES), [], 'everything received over the port, as text, bytes and character codes');
+      assert.deepEqual(await heapHolds(s.context, page, NEEDLES), [], 'memory: strings');
+      assert.deepEqual(await buffersHold(s.context, page, NEEDLES), [], 'memory: typed arrays and ArrayBuffers');
+      // The scans above are not deaf: the same calls find the key in a page that was handed it, in each place and shape they look.
+      await page.evaluate(
+        async (key) => {
+          window.__planted = { key };
+          localStorage.setItem('planted', key);
+          window.__plantedBytes = new TextEncoder().encode(key);
+          window.__plantedReversed = new TextEncoder().encode([...key].reverse().join(''));
+          window.__plantedWide = Uint16Array.from([...key].map((c) => c.charCodeAt(0)));
+          window.__plantedText = [...key].reverse().join('');
+          const root = await navigator.storage.getDirectory();
+          const file = await root.getFileHandle('planted.bin', { create: true });
+          const writable = await file.createWritable();
+          await writable.write(new TextEncoder().encode(key));
+          await writable.close();
+        },
+        KEY,
+      );
       assert.notDeepEqual(findInStorage(await page.evaluate(() => window.oaiyTest.dumpStorage()), NEEDLES), [], 'control: storage scan');
+      assert.ok(findInStorage(await page.evaluate(() => window.oaiyTest.dumpStorage()), NEEDLES).some((f) => f.startsWith('opfs /planted.bin')), 'control: the file system scan');
       assert.deepEqual(await heapHolds(s.context, page, [KEY]), [KEY], 'control: heap scan');
+      assert.ok((await heapHolds(s.context, page, [[...KEY].reverse().join('')])).length === 1, 'control: heap scan, reversed');
+      const inBuffers = await buffersHold(s.context, page, NEEDLES);
+      assert.ok(inBuffers.includes(KEY) && inBuffers.includes([...KEY].reverse().join('')), `control: typed array scan finds the bytes, forward and reversed (${inBuffers.length} needles)`);
       await s.context.close();
     });
   }
@@ -208,7 +234,7 @@ describe('E3.2 a hostile script in the flow editor tries every operation', () =>
     assert.equal(after.name, 'Fake', 'no name was changed');
     assert.equal(after.host, new URL(fake.baseUrl).host, 'no address was changed');
     const text = await s.app.page.evaluate(() => window.oaiyTest.received());
-    assert.deepEqual(NEEDLES.filter((n) => text.includes(n)), [], 'and nothing said back holds the key');
+    assert.deepEqual(findInText(text, NEEDLES), [], 'and nothing said back holds the key');
     assert.equal(collector.log.length, 0, 'nothing went anywhere else');
     await s.context.close();
   });

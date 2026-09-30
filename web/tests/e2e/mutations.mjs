@@ -116,6 +116,30 @@ const MUTATIONS = [
     files: { 'web/providers/src/store.ts': [{ find: "if (by !== undefined && (record.model ?? '') !== model && !(Array.isArray(known) && known.includes(model))) return 'unknown-model' as const;", replace: '' }] },
     caught: ['an app may choose only a model the provider listed', 'a model no provider listed is refused'],
   },
+  // Leaks the scans must find. They put the key where a scan of TEXT does not look (the reviewer's two: a Uint8Array, and reversed).
+  {
+    name: 'H1 leak: list returns the key as a Uint8Array',
+    what: 'every provider summary carries a note that is the key\'s bytes',
+    files: {
+      'web/providers/src/protocol.ts': [
+        { find: '            return ok(id, await deps.store.summaries());', replace: '            return ok(id, await Promise.all((await deps.store.summaries()).map(async (r) => ({ ...r, note: new TextEncoder().encode(await deps.store.key(r.id)) }))));' },
+      ],
+    },
+    caught: ['after the page used the key through every operation, nothing of it is in its storage, its port traffic or its memory'],
+  },
+  {
+    name: 'H2 leak: status returns the key reversed',
+    what: 'the status reply names the key backwards as the engine\'s model',
+    files: {
+      'web/providers/src/protocol.ts': [
+        {
+          find: "const body: StatusBody = { mode: state.mode, locked: state.locked, engine: { state: 'none', model: null, progress: null } };",
+          replace: "const first = (await deps.store.list())[0];\n            const rev = first ? [...(await deps.store.key(first.id))].reverse().join('') : '';\n            const body = { mode: state.mode, locked: state.locked, engine: { state: 'none', model: rev, progress: null } } as unknown as StatusBody;",
+        },
+      ],
+    },
+    caught: ['after the page used the key through every operation, nothing of it is in its storage, its port traffic or its memory'],
+  },
   {
     name: 'F5 no cap on operations being worked on',
     what: 'a further operation is queued behind the others, as before the fix',

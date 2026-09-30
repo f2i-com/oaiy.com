@@ -2,6 +2,7 @@
  * The holder's port protocol in one process: a broker over a fake IndexedDB, a `fetch` the test controls, and a client on the other
  * end of a real MessageChannel.
  */
+import { dumpText } from '../e2e/leakscan.mjs';
 import { KEY, M, input, makeHolder } from './holder.mjs';
 
 export const AGENT = 'https://agent.example';
@@ -87,8 +88,11 @@ function makeClient(port) {
     },
     raw: (data) => port.postMessage(data),
     waitFor,
-    /** Everything received so far, as one string: for "the key is nowhere in it". */
-    everything: () => JSON.stringify(inbox, (k, v) => (v instanceof ArrayBuffer ? Buffer.from(v).toString('latin1') : v)),
+    /**
+     * Everything received so far, as one string: for "the key is nowhere in it". The bytes of an ArrayBuffer or a typed array are in it as
+     * text and as character codes (leakscan.mjs `dumpText`: `JSON.stringify` alone would make a Uint8Array of the key into numbered keys).
+     */
+    everything: () => dumpText(inbox),
     close: () => port.close(),
   };
 }

@@ -14,12 +14,48 @@
 
   const holder = { iframe: null, port: null, next: 1, waiting: new Map(), streams: new Map(), pushes: [], hello: null, helloWaiter: null, log: [], dump: [] };
 
+  const latin1 = (bytes) => {
+    let out = '';
+    for (let i = 0; i < bytes.length; i += 8192) out += String.fromCharCode.apply(null, bytes.subarray(i, i + 8192));
+    return out;
+  };
+  /**
+   * A value as text a scan can search (the same algorithm as `encodeForScan` in leakscan.mjs, which a page cannot import): the bytes of
+   * every ArrayBuffer and typed array as text and as a list of character codes, and an array of characters joined. `JSON.stringify` alone
+   * turns a Uint8Array into {"0":115,"1":107,...}, which no scan for a key finds.
+   */
+  function encode(value, seen = new WeakSet()) {
+    if (value === null || typeof value !== 'object') return typeof value === 'bigint' ? String(value) : value;
+    if (value instanceof ArrayBuffer || ArrayBuffer.isView(value)) {
+      const bytes = value instanceof ArrayBuffer ? new Uint8Array(value) : new Uint8Array(value.buffer, value.byteOffset, value.byteLength);
+      const encoded = { $bytes: latin1(bytes), $codes: Array.from(bytes).join(',') };
+      if (ArrayBuffer.isView(value) && value.BYTES_PER_ELEMENT > 1 && !(value instanceof DataView)) {
+        const units = Array.from(value).map(Number);
+        encoded.$units = units.join(',');
+        encoded.$chars = units.map((u) => (Number.isInteger(u) && u >= 0 && u <= 0x10ffff ? String.fromCodePoint(u) : '')).join('');
+      }
+      return encoded;
+    }
+    if (seen.has(value)) return '[cycle]';
+    seen.add(value);
+    if (value instanceof Map) return { $map: [...value].map(([k, v]) => [encode(k, seen), encode(v, seen)]) };
+    if (value instanceof Set) return { $set: [...value].map((v) => encode(v, seen)) };
+    if (Array.isArray(value)) {
+      const out = value.map((v) => encode(v, seen));
+      if (value.length >= 8 && value.every((v) => typeof v === 'string' && v.length <= 2)) return { $items: out, $joined: value.join('') };
+      return out;
+    }
+    const out = {};
+    for (const [k, v] of Object.entries(value)) out[k] = encode(v, seen);
+    return out;
+  }
+
   function onMessage(event) {
     const m = event.data;
     holder.log.push({ at: now(), data: m && typeof m === 'object' ? { t: m.t, id: m.id, ok: m.ok } : m });
     // Everything received, whole, as text: for a test that looks for a secret in it.
     try {
-      holder.dump.push(JSON.stringify(m, (k, v) => (v instanceof ArrayBuffer ? new TextDecoder('latin1').decode(v) : v)));
+      holder.dump.push(JSON.stringify(encode(m)));
     } catch {
       holder.dump.push('[unprintable]');
     }
@@ -183,15 +219,35 @@
     },
     /** Everything this page's own origin stores, and the words of the key it is hunting for (see leakscan.mjs). */
     async dumpStorage() {
-      const out = { indexedDB: [], localStorage: {}, sessionStorage: {}, caches: [], cookies: document.cookie };
+      const out = { indexedDB: [], localStorage: {}, sessionStorage: {}, caches: [], cookies: document.cookie, opfs: [], serviceWorkers: [] };
       for (const [store, target] of [[localStorage, out.localStorage], [sessionStorage, out.sessionStorage]]) {
         for (let i = 0; i < store.length; i++) target[store.key(i)] = store.getItem(store.key(i));
       }
       for (const name of await caches.keys()) {
         const cache = await caches.open(name);
         const items = [];
-        for (const request of await cache.keys()) items.push({ url: request.url, body: await (await cache.match(request)).text() });
+        for (const request of await cache.keys()) {
+          const bytes = new Uint8Array(await (await cache.match(request)).arrayBuffer());
+          items.push({ url: request.url, body: new TextDecoder().decode(bytes), bytes: latin1(bytes), codes: Array.from(bytes).join(',') });
+        }
         out.caches.push({ name, items });
+      }
+      // The origin private file system, every file in it, as text and as character codes.
+      const walk = async (directory, prefix) => {
+        for await (const [name, handle] of directory.entries()) {
+          if (handle.kind === 'file') {
+            const bytes = new Uint8Array(await (await handle.getFile()).arrayBuffer());
+            out.opfs.push({ path: `${prefix}${name}`, text: latin1(bytes), codes: Array.from(bytes).join(',') });
+          } else await walk(handle, `${prefix}${name}/`);
+        }
+      };
+      try {
+        await walk(await navigator.storage.getDirectory(), '/');
+      } catch {
+        // an origin with no file system to read
+      }
+      for (const registration of (await navigator.serviceWorker?.getRegistrations?.()) ?? []) {
+        out.serviceWorkers.push((registration.active ?? registration.waiting ?? registration.installing)?.scriptURL ?? registration.scope);
       }
       const databases = (await indexedDB.databases?.()) ?? [];
       for (const { name } of databases) {
@@ -209,7 +265,7 @@
           });
           dump.stores[storeName] = values.map((v) => {
             try {
-              return JSON.stringify(v, (k, x) => (x instanceof ArrayBuffer ? Array.from(new Uint8Array(x)) : ArrayBuffer.isView(x) ? Array.from(new Uint8Array(x.buffer)) : x));
+              return JSON.stringify(encode(v));
             } catch {
               return '[unreadable]';
             }

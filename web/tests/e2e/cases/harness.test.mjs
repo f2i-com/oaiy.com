@@ -11,7 +11,7 @@ import path from 'node:path';
 import { after, before, describe, it } from 'node:test';
 import { browserVersion, launchBrowser, newContext, newPage, startWorld, waitFor } from '../harness.mjs';
 import { deadPort, maskKey, startCollector, startFakeProvider } from '../fake-provider.mjs';
-import { findInStorage, forms, heapHolds } from '../leakscan.mjs';
+import { buffersHold, findInStorage, heapHolds, needlesFor } from '../leakscan.mjs';
 
 const KEY = 'sk-test-9f3c1b7a5d2e48a0b6c4d8e1f2a3b4c5';
 
@@ -265,7 +265,7 @@ describe('the leak scans find a secret that is there', () => {
     const { context } = await newContext(browser);
     const { page } = await newPage(context);
     await page.goto(`${world.origins.flows}/`);
-    const needles = forms(KEY);
+    const needles = needlesFor(KEY);
     const clean = findInStorage(await page.evaluate(() => window.oaiyTest.dumpStorage()), needles);
     assert.deepEqual(clean, [], 'a clean page holds nothing');
     await page.evaluate(async (key) => {
@@ -274,21 +274,31 @@ describe('the leak scans find a secret that is there', () => {
       document.cookie = `c=${encodeURIComponent(key)}; path=/`;
       const cache = await caches.open('leak');
       await cache.put('/leaked', new Response(`body ${key}`));
+      // Bytes, not text: a cache body and a file that hold the key REVERSED, and a database value that holds it as a Uint8Array.
+      await cache.put('/leaked-bytes', new Response(new TextEncoder().encode([...key].reverse().join(''))));
+      const root = await navigator.storage.getDirectory();
+      const sub = await root.getDirectoryHandle('deeper', { create: true });
+      const file = await sub.getFileHandle('leak.bin', { create: true });
+      const writable = await file.createWritable();
+      await writable.write(new TextEncoder().encode(key));
+      await writable.close();
       await new Promise((resolve, reject) => {
         const open = indexedDB.open('leaky', 1);
         open.onupgradeneeded = () => open.result.createObjectStore('s');
         open.onsuccess = () => {
           const tx = open.result.transaction('s', 'readwrite');
           tx.objectStore('s').put({ secret: key }, 'k');
+          tx.objectStore('s').put({ secret: new TextEncoder().encode(key) }, 'bytes');
           tx.oncomplete = () => resolve();
           tx.onerror = () => reject(tx.error);
         };
       });
     }, KEY);
     const found = findInStorage(await page.evaluate(() => window.oaiyTest.dumpStorage()), needles);
-    for (const where of ['localStorage[a]', 'sessionStorage[b]', 'cache leak', 'indexedDB leaky/s[0]', 'document.cookie']) {
+    for (const where of ['localStorage[a]', 'sessionStorage[b]', 'cache leak', 'cache leak http://', 'indexedDB leaky/s[0]', 'indexedDB leaky/s[1]', 'document.cookie', 'opfs /deeper/leak.bin']) {
       assert.ok(found.some((f) => f.startsWith(where)), `${where} was found: ${found}`);
     }
+    assert.ok(found.some((f) => f.includes('/leaked-bytes')), 'a cache body of reversed bytes was found');
     await context.close();
   });
 
@@ -303,6 +313,32 @@ describe('the leak scans find a secret that is there', () => {
     assert.deepEqual(await heapHolds(context, page, [KEY]), [KEY], 'the search finds it once it is there');
     await page.evaluate(() => {
       window.__held = null;
+    });
+    await context.close();
+  });
+
+  it('memory: a typed array is not in a heap snapshot, so it has a scan of its own; it finds bytes, reversed bytes, 16-bit characters and an ArrayBuffer, and nothing on a clean page', async () => {
+    const { context } = await newContext(browser);
+    const { page } = await newPage(context);
+    await page.goto(`${world.origins.flows}/`);
+    const needles = needlesFor(KEY);
+    assert.deepEqual(await buffersHold(context, page, needles), [], 'nothing before');
+    // Built from character codes, so that no string of the key is ever in the page (the snapshot below must have none).
+    await page.evaluate((codes) => {
+      window.__bytes = Uint8Array.from(codes);
+      window.__reversed = Uint8Array.from(codes).reverse();
+      window.__wide = Uint16Array.from(codes);
+      window.__buffer = Uint8Array.from([32, 32, 32, ...codes, 32, 32]).buffer;
+    }, Array.from(Buffer.from(KEY)));
+    const report = {};
+    const found = await buffersHold(context, page, needles, report);
+    assert.ok(report.read >= 4, `the four buffers were read (${JSON.stringify(report)})`);
+    assert.ok(found.includes(KEY), 'the key as bytes');
+    assert.ok(found.includes([...KEY].reverse().join('')), 'the key reversed');
+    // A heap snapshot alone would have said "nothing" here: that is the hole the second scan closes.
+    assert.deepEqual(await heapHolds(context, page, [KEY]), [], 'the snapshot holds no string of it');
+    await page.evaluate(() => {
+      window.__bytes = window.__reversed = window.__wide = window.__buffer = null;
     });
     await context.close();
   });

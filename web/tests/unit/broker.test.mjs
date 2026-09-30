@@ -10,6 +10,7 @@
  */
 import assert from 'node:assert/strict';
 import { after, describe, it } from 'node:test';
+import { findInText, needlesFor } from '../e2e/leakscan.mjs';
 import { AGENT, FLOWS, APPS, brokerWorld, jsonResponse, streamResponse } from '../support/broker-world.mjs';
 import { KEY, M, input, sleep } from '../support/holder.mjs';
 
@@ -23,8 +24,9 @@ after(async () => {
   for (const w of worlds) await w.close();
 });
 
-const ALL_PIECES = [KEY, KEY.slice(0, 12), KEY.slice(-12), KEY.slice(10, 30)];
-const leaks = (text) => ALL_PIECES.filter((piece) => text.includes(piece));
+// The key, and pieces of it, in every shape a page might be handed one (leakscan.mjs: reversed, base64, hex, character codes, ...).
+const NEEDLES = needlesFor(KEY);
+const leaks = (text) => findInText(text, NEEDLES);
 
 describe('who may speak', () => {
   it('an allowed page, from its parent, with one port and a hello, is answered with the version and the operations there are', async () => {
