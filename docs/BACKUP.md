@@ -629,9 +629,11 @@ More rules that a tick does not change:
   whatever the length of its command line: its install script, the script files it writes (with
   their sizes), what it deletes when uninstalled, the marker file it writes, the address it asks
   after it starts, the link it shows, that it starts with OAIY, and that it replaces a template of
-  yours of the same id. A connector descriptor is described by every address it holds (its
-  documentation link, every path that is itself an address, wherever it sits in the descriptor) and
-  by the permissions it asks for, not only the address that is prefilled.
+  yours of the same id. A connector descriptor says every address key that the connector OAIY ships has
+  (its documentation link, where it signs in, its health check, heartbeat and events, what it does for
+  flows and the Agent, each by name and with its host, in the part of its own place), counts every other
+  address it holds with a sample of the hosts they go to, and says the permissions it asks for, not
+  only the address that is prefilled.
 - A backup with more items to look through than a person can (2,000) is refused.
 - Names and text a backup carries are cut to what a panel shows before they are displayed or
   recorded, each on its own and with how long it was, and are shown with the characters a person
@@ -662,6 +664,12 @@ a thing does:
   questions, five thousand entries, values of five thousand characters, addresses of four and six
   hundred characters) and looks for every fixed part of it in what the dry run says. A kind that is
   added to the table without a fixture fails that test.
+- **A fixed part is either bounded or one free text.** What a fixed part says that is bounded (a count, a
+  host, a sentence of the code, a value that is cut inside it, the first few names of a collection and how many
+  more) is sized to hold the most it can be, so it is never cut and nothing beside it in the part can be
+  pushed out; a fixed part that holds one free text (an event, a flow's id, a tool's description, a model's name)
+  is cut alone. A test builds each kind with everything padded and fails for a fixed part of bounded text that
+  is cut.
 - **A kind whose items are each long is described in full up to a number** (campaigns 50, connectors
   100, templates 400): the rest are named, with how many there are, so that a backup of three
   hundred campaigns as long as one can be does not make a preview of many megabytes.
@@ -693,13 +701,13 @@ a thing does:
 | the Agent's switch (control.json) (`control`) | `switch` (160) | - | all (each is small) |
 | the setup record (setup.json) (`setup`) | `accepted` (160) | `names` (500) | all (each is small) |
 | the Agent's model (agent.json) (`agent-model`) | `model` (240) | - | all (each is small) |
-| a service template (templates/) (`template`) | `autostart` (80), `replaces` (80), `runs` (360), `install` (220), `writes` (280), `deletes` (240), `env` (240), `cwd` (160), `marker` (160), `health` (160), `docs` (160) | - | 400, the rest named and counted |
-| a flow (flows/) (`flow`) | `steps` (80), `tool` (200), `tool-description` (400), `tool-inputs` (300), `hook` (240) | `kinds` (360) | all (each is small) |
-| a connector descriptor (connectors/) (`connector`) | `replaces` (100), `prefilled` (260), `scopes` (320), `auth` (520), `health` (260), `heartbeat` (260), `relay` (420), `desktopFlows` (420), `desktopAi` (520), `flows` (520), `appLogic` (420), `dataNode` (320), `scriptProfile` (260), `docs` (260) | `summary` (240), `other-places` (500) | 100, the rest named and counted |
+| a service template (templates/) (`template`) | `autostart` (80), `replaces` (80), `runs` (420), `install` (240), `writes` (640), `deletes` (360), `env` (480), `cwd` (180), `marker` (200), `health` (200), `docs` (180) | - | 400, the rest named and counted |
+| a flow (flows/) (`flow`) | `steps` (80), `tool` (200), `tool-description` (400), `tool-inputs` (720), `hook` (240) | `kinds` (620) | all (each is small) |
+| a connector descriptor (connectors/) (`connector`) | `replaces` (100), `prefilled` (260), `scopes` (1840), `auth` (1100), `health` (760), `heartbeat` (760), `relay` (1100), `desktopFlows` (1100), `desktopAi` (2000), `flows` (2000), `appLogic` (1300), `dataNode` (940), `scriptProfile` (760), `docs` (760) | `summary` (240), `other-places` (7400) | 100, the rest named and counted |
 | what is remembered about callers (callers.json) (`callers`) | `entries` (320) | - | all (each is small) |
-| a key that acts in a settings file (the calendar's, a plugin's, the Agent's) (`setting`) | `sets` (480) | `why` (320) | all (each is small) |
-| a service of the calendar (`calendar-service`) | `about` (200), then each of the 5 keys of the table `calendar` that acts under `settings.services[].` (320 each) | - | all (each is small) |
-| an appointment of the calendar (`calendar-appointment`) | `about` (300), then each of the 11 keys of the table `calendar` that acts under `appointments[].` (320 each) | - | all (each is small) |
+| a key that acts in a settings file (the calendar's, a plugin's, the Agent's) (`setting`) | `sets` (520) | `why` (320) | all (each is small) |
+| a service of the calendar (`calendar-service`) | `about` (200), then each of the 5 keys of the table `calendar` that acts under `settings.services[].` (560 each) | - | all (each is small) |
+| an appointment of the calendar (`calendar-appointment`) | `about` (300), then each of the 11 keys of the table `calendar` that acts under `appointments[].` (560 each) | - | all (each is small) |
 | a voice clip (voices/) (`voice`) | `file` (200) | - | all (each is small) |
 | a file that could not be read (`unreadable`) | `problem` (320) | - | all (each is small) |
 | a settings file that holds nothing OAIY restores (`nothing`) | `nothing` (240) | - | all (each is small) |
@@ -711,7 +719,7 @@ a thing does:
 | the phone's conversations (`desk-sessions`) | `files` (240) | - | all (each is small) |
 | the front desk's own conversation (`desk-chat`) | `size` (160) | - | all (each is small) |
 | what the phone's agents remember about people (`desk-callers`) | `entries` (320) | - | all (each is small) |
-| an outreach campaign (`campaign`) | `comes-back` (480), `left-out` (320), then each of the 17 keys of the table `agent.campaign` that acts (400 each) | `questions` (240), `question` (900), `people` (240), `person` (2000), `set-aside` (240), `skipped` (500) | 50, the rest named and counted |
+| an outreach campaign (`campaign`) | `comes-back` (480), `left-out` (520), then each of the 17 keys of the table `agent.campaign` that acts (640 each) | `questions` (240), `question` (900), `people` (240), `person` (2000), `set-aside` (240), `skipped` (500) | 50, the rest named and counted |
 | a provider of the Agent (`agent-provider`) | `type` (80), `model` (260), `key` (200), `beside` (200) | `address` (190) | all (each is small) |
 
 <!-- END GENERATED: dry-run-places -->
@@ -732,8 +740,8 @@ part, what is counted says how many, and what is inside one part is cut inside t
 | `MOST_WORDS_SCANNED` (1 MiB), `MAX_QUOTE_BYTES` (64 KiB), `BRIEF_QUOTE` (700) | The brief and knowledge files scanned for hidden text; the brief read to be quoted; the quote | A file over the first is not restored; over the second is said "too large to quote" (the size is said); the quote is inside the part `says`, which comes after `reads` |
 | `MAX_NAMED` (300) | Projects, knowledge files and unknown items named | The rest are counted in a thing of their own (kind `more`), and "and N more" |
 | `MAX_NOT_RESTORED` (300), `MOST_EXCLUDED_NAMED` (300), `MOST_LINES_NAMED` (50) | The names of what is not restored, the patterns the backup left out, and the lines of what was left out and what to do again | Each says how many more there were in a last line |
-| `MOST_KEYS_OF_ONE_OBJECT` (30), `MAX_OTHER_PLACES` (12), `MAX_HOSTS_SAMPLED` (4) | A connector's collections of addresses, its unknown places, and the hosts said for a place | The keys that act (scopes, sign-in, events, heartbeat, health, relay, flows) are parts of their own, said before these; the rest are counted, with a sample of hosts |
-| `MAX_ACCEPTED_NAMED` (10), `MAX_INPUTS_NAMED` (8), `MAX_CALENDAR_LISTED` (40) | The plugins the setup record marks accepted, the inputs a flow asks its model for, the services and appointments of the calendar | Each is a sample after a count, in a part of its own |
+| `MAX_OTHER_PLACES` (12), `MAX_HOSTS_SAMPLED` (4), `MAX_SCOPES_NAMED` (20) | A connector's places the shipped descriptor has not, the hosts said for the addresses of a place that it has not a key for, and the scopes it asks for | Every address key the shipped descriptor has (sign-in, health, heartbeat, events, flows, and the rest) is said by name and host in the part of its own place, sized to hold them all at the most an address is cut to, before any of these; the rest are counted, with a sample of hosts; the scopes are a count and a sample |
+| `MAX_ACCEPTED_NAMED` (10), `MAX_INPUTS_NAMED` (8), `MAX_KINDS_NAMED` (8), `MAX_CALENDAR_LISTED` (40) | The plugins the setup record marks accepted, the inputs a flow asks its model for, the kinds of a flow's steps, the services and appointments of the calendar | Each is a sample after a count, in a part of its own |
 | `MAX_QUESTIONS_LISTED` (8), `MAX_PEOPLE_LISTED` (10), `MAX_VALUE_TEXT` (100), `MAX_ENTRIES_SAID` (3), `MAX_ENTRY_TEXT` (50) | A campaign's questions and people, and the text of a value or of an entry of one | The campaign's own keys are fixed parts said first; a question or a person is a part of its own and a value is cut inside it, with how long it is |
 | `MOST_NOTES_PER_CLASS` (8), `MOST_NOTES` (150) | The notes of a restore, by class, and all of them | A class says how many more of it there were; the total is above what the classes make, and says how many more if it is ever reached |
 | `MAX_DO_NOT_CONTACT` (50,000) | The numbers not to be contacted that come back | The first come back; the dry run, the staging and the result say how many do not |
@@ -741,10 +749,10 @@ part, what is counted says how many, and what is inside one part is cut inside t
 | `MAX_ADDED` (20,000), `MAX_ADDED_NAME` (1,024) | The names a restore adds to the Agent's storage, kept for the undo | Not shown; a name that is not plain, or over the count, is not one the undo takes away |
 | `MAX_EXPORT_BYTES`, `IMPORT_MAX`, `MAX_HEADER_BYTES`, `ENTRY_RECORD_MAX` | The size of the Agent's storage, of a header and of an archive's record | Over is refused; nothing is shown in part |
 | `MAX_LEFT` (500), `MAX_DEPTH` (8), `MAX_NODES` (200,000), `MAX_KEY_CHARS` (128) | The walk of a JSON file against its key table: the values named as left out, how deep, how many, how long a key | The values left out are counted (`left_more`); a value too deep, too many or with a key too long is left out (default-deny) and is never brought back |
+| The dashboard (`BackupPanel.tsx`, `api.ts`, `visibleText.ts`) | Nothing of what the desktop says is cut: every item is drawn whole in a list that scrolls (a height of 220 pixels and `overflow-y: auto`, and words that wrap anywhere), and the only slice in these files is the six characters named in a run of invisible ones (which says how many there were) | What the desktop sends is what is drawn, with the invisible characters made visible again |
 | `.take(6)` of a template's files (literal cut) | The script files a template writes, named | The part `writes` says how many there are before it names six |
 | `.take(3)` of a template's paths (literal cut) | The paths a template deletes | The part `deletes` says how many there are before it names three |
 | `.take(6)` of a template's variables (literal cut) | The environment variables a template sets | The part `env` says how many there are before it names six |
-| `.take(8)` of a flow's kinds (literal cut) | The kinds of a flow's steps | A sample part after every fixed part, with "and N more" |
 | `.take(5)` of a list-valued setting (literal cut) | The entries of the network gate's lists | The entries of a list are one kind of value; it says its first five and "and N more" |
 | `.take(6)` of a run of invisible characters (literal cut) | The characters of a run that are named | It says how many there are, and names the first six |
 | `.take(50)` of the keys a backup leaves out (literal cut) | The keys of one file named as left out when it is made | A last record says how many more there were |

@@ -6343,7 +6343,7 @@ fn a_connector_is_described_by_every_address_it_holds() {
     let dst = TempDir::new("connector-dst");
     let preview = restore::inspect(&dst.0, &file, PASS, &options()).unwrap();
     let item = preview.items.iter().find(|i| i.name == "connectors/formlogic.json").unwrap();
-    for must in ["prefilled with the address https://attacker.example", "docsUrl = https://docs.attacker.example/how", "auth.authorizePath = //login.attacker.example/authorize", "relay.path = https://relay.attacker.example/queue", "Asks to be allowed (2): read write", "REPLACES the connector OAIY ships"] {
+    for must in ["prefilled with the address https://attacker.example", "docsUrl = https://docs.attacker.example/how", "auth.authorizePath = //login.attacker.example/authorize", "1 other address besides, to relay.attacker.example", "Asks to be allowed (2): read, write", "REPLACES the connector OAIY ships"] {
         assert!(item.what.contains(must), "{must:?} is said: {}", item.what);
     }
     assert!(!item.what.contains("auth.tokenPath"), "a relative path is not an address: {}", item.what);
@@ -7571,13 +7571,13 @@ fn marked_document(table_name: &str, skip: &[&str]) -> (serde_json::Value, Vec<S
 }
 
 /// A connector descriptor built to push out what it does: its own places (sign-in, health, heartbeat, events) with a marker each, and beside
-/// them three unknown places of exactly thirty address keys (the most an object of a descriptor's own may have) with sixty-character host
+/// them three unknown places of thirty address keys each with sixty-character host
 /// names, an array of forty addresses, an array of five thousand under `flows` and a map of three hundred under `appLogic`, all of which sort
 /// before the places that matter; and a scope among five thousand.
 fn padded_connector() -> serde_json::Value {
     let thirty = |prefix: &str| (0..30).map(|i| (format!("k{i:02}Url"), serde_json::json!(format!("https://{prefix}{i:02}-{}.example/x", "h".repeat(50))))).collect::<serde_json::Map<_, _>>();
     let mut scopes: Vec<String> = vec!["MARK-SCOPE-SEND-EVERYTHING".to_string()];
-    scopes.extend((0..5000).map(|i| format!("scope-{i}")));
+    scopes.extend((0..5000).map(|i| format!("scope-{i}-{}", "s".repeat(60))));
     serde_json::json!({
         "id": "formlogic", "name": "Padded link", "defaultBaseUrl": "https://mark-default.example", "docsUrl": "https://mark-docs.example/how",
         "auth": { "kind": "oauth2_pkce", "clientId": "x", "authorizePath": "https://mark-auth.example/authorize", "tokenPath": "//mark-token.example/token", "scopes": scopes },
@@ -7590,6 +7590,10 @@ fn padded_connector() -> serde_json::Value {
         "actions": (0..40).map(|i| serde_json::json!({ "url": format!("https://aaa-action{i:02}.example/x") })).collect::<Vec<_>>(),
     })
 }
+
+/// The fixed parts whose text is free, of any length a person likes, so that they are cut alone when it is long: (kind, part). Every other
+/// fixed part says something bounded and is never cut (see the generic test).
+const FREE_TEXT_FIXED_PARTS: &[(&str, &str)] = &[("trigger", "runs"), ("trigger", "when"), ("provider-list", "protocol"), ("agent-model", "model"), ("flow", "tool-description"), ("agent-provider", "type"), ("agent-provider", "model")];
 
 /// The reviewer's x6f, made general and driven by the kinds: every kind of thing the dry run describes ([`super::parts::KINDS`]) is built
 /// here with every field padded (fifty questions, five thousand entries, five-thousand-character values, addresses of four hundred and six
@@ -7612,21 +7616,21 @@ fn every_kind_of_thing_the_dry_run_describes_says_every_fixed_part_whatever_is_p
     let flow = serde_json::json!({
         "name": "Padded",
         "nodes": (0..5000).map(|i| serde_json::json!({ "type": format!("AAA-PADKIND-{i:05}-{}", "k".repeat(90)) })).chain((0..10).map(|i| serde_json::json!({ "id": format!("in{i}"), "type": "input_text", "data": { "label": format!("MARK-INPUT-{i}-{}", "l".repeat(80)) } }))).collect::<Vec<_>>(),
-        "oaiyTool": { "name": "MARK-FLOW-TOOL", "description": pad("MARK-TOOL-DESCRIPTION", 3000) }, "oaiyToolHook": { "mode": "before", "tool": "MARK-FLOW-HOOK" },
+        "oaiyTool": { "name": pad("MARK-FLOW-TOOL", 200), "description": pad("MARK-TOOL-DESCRIPTION", 3000) }, "oaiyToolHook": { "mode": "before", "tool": pad("MARK-FLOW-HOOK", 200) },
     });
     need("flow", &["MARK-FLOW-TOOL", "MARK-FLOW-HOOK", "MARK-TOOL-DESCRIPTION", "MARK-INPUT-0-", "The model is asked for 10 inputs", "A flow with 5010 step(s)."]);
     let connector = padded_connector();
     need("connector", &["REPLACES the connector OAIY ships", "mark-default.example", "MARK-SCOPE-SEND-EVERYTHING", "Asks to be allowed (5001)"]);
     need("connector", &["default", "docs", "auth", "token", "health", "relay", "heartbeat", "dflows", "dai", "flows", "logic", "node", "profile"].map(|h| format!("mark-{h}.example")).iter().map(String::as_str).collect::<Vec<_>>());
     let template = serde_json::json!({
-        "id": "pad", "name": "Padded", "docsUrl": "https://mark-template-docs.example", "autostart": true, "installedMarker": "MARK-TEMPLATE-MARKER",
-        "run": { "command": "MARK-TEMPLATE-COMMAND", "args": (0..500).map(|i| format!("--flag-{i}-aaaaaaaaaaaaaaaa")).collect::<Vec<_>>(), "cwd": "MARK-TEMPLATE-CWD", "env": (0..5000).map(|i| (format!("ENV_{i:05}"), serde_json::json!("v"))).collect::<serde_json::Map<_, _>>() },
-        "install": { "kind": "script", "unix": "MARK-TEMPLATE-INSTALL" }, "health": { "url": "http://127.0.0.1/MARK-TEMPLATE-HEALTH" },
-        "files": (0..5000).map(|i| (format!("f{i:05}.sh"), serde_json::json!("x"))).collect::<serde_json::Map<_, _>>(),
-        "uninstall": { "paths": (0..5000).map(|i| format!("p{i:05}")).collect::<Vec<_>>() },
+        "id": "pad", "name": "Padded", "docsUrl": format!("https://mark-template-docs.example/{}", "d".repeat(400)), "autostart": true, "installedMarker": pad("MARK-TEMPLATE-MARKER", 400),
+        "run": { "command": pad("MARK-TEMPLATE-COMMAND", 400), "args": (0..500).map(|i| format!("--flag-{i}-aaaaaaaaaaaaaaaa")).collect::<Vec<_>>(), "cwd": pad("MARK-TEMPLATE-CWD", 400), "env": (0..5000).map(|i| (format!("ENV_{i:05}_{}", "e".repeat(80)), serde_json::json!("v"))).collect::<serde_json::Map<_, _>>() },
+        "install": { "kind": "script", "unix": pad("MARK-TEMPLATE-INSTALL", 400) }, "health": { "url": format!("http://127.0.0.1/MARK-TEMPLATE-HEALTH{}", "h".repeat(400)) },
+        "files": (0..5000).map(|i| (format!("f{i:05}-{}.sh", "n".repeat(80)), serde_json::json!("x"))).collect::<serde_json::Map<_, _>>(),
+        "uninstall": { "paths": (0..5000).map(|i| format!("p{i:05}-{}", "d".repeat(120))).collect::<Vec<_>>() },
     });
     need("template", &["mark-template-docs.example", "MARK-TEMPLATE-MARKER", "MARK-TEMPLATE-COMMAND", "MARK-TEMPLATE-CWD", "MARK-TEMPLATE-INSTALL", "MARK-TEMPLATE-HEALTH", "STARTS with OAIY once installed", "Writes 5000 script file(s)", "Deletes 5000 path(s)", "Sets 5000 environment variable(s)", "Replaces your template of the same id"]);
-    let setup = serde_json::json!({ "plugins": (0..5000).map(|i| (format!("plugin{i:05}"), serde_json::json!({ "permissionsAccepted": ["calls"] }))).collect::<serde_json::Map<_, _>>() });
+    let setup = serde_json::json!({ "plugins": (0..5000).map(|i| (format!("plugin{i:05}-{}", "p".repeat(80)), serde_json::json!({ "permissionsAccepted": ["calls"] }))).collect::<serde_json::Map<_, _>>() });
     need("setup", &["marks the permissions of 5000 plugins as ACCEPTED", "plugin00000"]);
     let (mut calendar, calendar_needles) = marked_document("calendar", &[]);
     calendar["settings"]["services"] = (0..100).map(|i| serde_json::json!({ "id": format!("s{i}"), "name": format!("Service {i}"), "minutes": 30, "description": "d".repeat(500), "price": "$1" })).collect();
@@ -7702,7 +7706,7 @@ fn every_kind_of_thing_the_dry_run_describes_says_every_fixed_part_whatever_is_p
     // the key and its first entry, and the marker that the document made for it is put first.)
     for (list, pad) in [("allow", "pad"), ("deny", "no")] {
         let first = settings["gate"][list][0].clone();
-        settings["gate"][list] = std::iter::once(first).chain((0..500).map(|i| serde_json::json!(format!("{pad}{i}.example")))).collect();
+        settings["gate"][list] = std::iter::once(first).chain((0..500).map(|i| serde_json::json!(format!("{pad}{i}.example{}", "x".repeat(80))))).collect();
     }
     need("setting", &settings_needles.iter().map(String::as_str).collect::<Vec<_>>());
     need("agent-provider", &["Agent provider of type custom", "Model MARK-MODEL-X", "It has an API key", "this one arrives beside it", "Address: https://mark-agent-provider.example/"]);
@@ -7737,6 +7741,7 @@ fn every_kind_of_thing_the_dry_run_describes_says_every_fixed_part_whatever_is_p
     need("campaign", &["comes back PAUSED", "The people below are a sample: the first 10 of 5000.", "The questions below are a sample: the first 8 of 50."]);
 
     // ---- every kind is built, says its markers, and says every fixed part it has
+    let mut bounded_cuts: Vec<String> = Vec::new();
     for kind in KINDS {
         let mine: Vec<&review::ReviewItem> = items.iter().filter(|i| i.kind == kind.id).collect();
         assert!(!mine.is_empty(), "no fixture builds a thing of the kind {:?}: build one with every field padded, so that its fixed parts are looked for", kind.id);
@@ -7758,12 +7763,21 @@ fn every_kind_of_thing_the_dry_run_describes_says_every_fixed_part_whatever_is_p
                 assert!(labels.contains(&path.as_str()), "{}: no fixture fills the key {path:?} of the table {}", kind.id, keys.table);
             }
         }
+        // A fixed part is cut only when its text is free (a description, an event, a name of any length); every part that says something
+        // bounded (a count, a host, a sentence of the code, a value cut inside it) fits its budget whatever is padded, so that a cut in a
+        // fixed part is always the cut of one free text and never hides another thing that acts beside it.
+        let cut_fixed: Vec<(String, usize)> = mine.iter().flat_map(|i| i.parts.iter().filter(|p| p.fixed && p.cut_from.is_some()).map(|p| (p.label.clone(), p.cut_from.unwrap_or(0)))).collect();
+        let surprising: Vec<&(String, usize)> = cut_fixed.iter().filter(|(label, _)| !FREE_TEXT_FIXED_PARTS.contains(&(kind.id, label.as_str()))).collect();
+        if !surprising.is_empty() {
+            bounded_cuts.push(format!("{}: {surprising:?}", kind.id));
+        }
         let markers: Vec<&String> = needles.iter().filter(|(k, _)| *k == kind.id).map(|(_, m)| m).collect();
         assert!(!markers.is_empty(), "no markers are looked for in a thing of the kind {:?}", kind.id);
         let text: String = mine.iter().map(|i| format!("{} | {}\n", i.title, i.what)).collect();
         let absent: Vec<&&String> = markers.iter().filter(|m| !text.contains(m.as_str())).collect();
         assert!(absent.is_empty(), "{}: not in the dry run: {absent:?}\n{}", kind.id, &text[..text.len().min(2500)]);
     }
+    assert!(bounded_cuts.is_empty(), "a fixed part of bounded text is cut: give it a budget that holds it, or say that it is free text in FREE_TEXT_FIXED_PARTS: {bounded_cuts:#?}");
     assert!(!said.is_empty());
 
     // A backup of more things than the dry run can look through is refused, and is not partly said.
@@ -7974,18 +7988,72 @@ fn every_number_the_dry_run_names_is_held_on_both_sides() {
     assert!(twelve_places.contains("zz11: 1 address to zz11.example") && !twelve_places.contains("more places"), "{twelve_places}");
     let fourteen = what_of(&inspect_desktop_files(&[("connectors/own.json", with_places(14))], false), "connectors/own.json");
     assert!(fourteen.contains("zz11: 1 address") && !fourteen.contains("zz12: ") && fourteen.contains("and 2 more places"), "{fourteen}");
-    // A key of the shipped descriptor is one of the descriptor's own wherever it sits: an object of thirty keys of its own, or of thirty-one
-    // (which is a map, and so a collection), says it by name.
+    // A key of the shipped descriptor is said by name, first and in its order, whatever else its object holds (thirty keys, thirty-one, five
+    // thousand); every other address of the place is counted, with a sample of the hosts they go to.
     let relay = |extra: usize| {
         serde_json::json!({ "id": "own", "name": "O", "relay": std::iter::once(("pendingPath".to_string(), serde_json::json!("https://mark-relay.example/p"))).chain((0..extra).map(|i| (format!("x{i:02}Url"), serde_json::json!(format!("https://pad{i:02}.example/x")))))
             .collect::<serde_json::Map<_, _>>() })
         .to_string()
     };
-    let thirty = what_of(&inspect_desktop_files(&[("connectors/own.json", relay(29))], false), "connectors/own.json");
-    assert!(thirty.contains("relay.pendingPath = https://mark-relay.example/p") && thirty.contains("relay.x00Url = https://pad00.example/x") && thirty.contains("(cut, ") && !thirty.contains("in lists or maps"), "the twenty-nine keys of its own are said by name until the part is cut, the known one first: {thirty}");
-    let thirty_one = what_of(&inspect_desktop_files(&[("connectors/own.json", relay(30))], false), "connectors/own.json");
-    assert!(thirty_one.contains("relay.pendingPath = https://mark-relay.example/p") && thirty_one.contains("30 addresses in lists or maps, to pad00.example"), "{thirty_one}");
-    assert!(!thirty_one.contains("relay.x29Url"), "the thirty padding keys are a map, said as a count: {thirty_one}");
+    for extra in [0usize, 5, 29, 30, 31, 5000] {
+        let said = what_of(&inspect_desktop_files(&[("connectors/own.json", relay(extra))], false), "connectors/own.json");
+        assert!(said.contains("relay.pendingPath = https://mark-relay.example/p"), "{extra}: {said}");
+        assert!(!said.contains("relay.x00Url"), "{extra}: the keys the shipped descriptor has not are counted and not named: {said}");
+        if extra == 0 {
+            assert!(!said.contains("besides"), "{said}");
+        } else {
+            let hosts = "pad00.example, pad01.example, pad02.example, pad03.example";
+            let more = if extra > 4 { format!(" and {} more hosts", extra - 4) } else { String::new() };
+            assert!(said.contains(&format!("{extra} other addresses besides, to {hosts}{more}")), "{extra}: {said}");
+        }
+    }
+}
+
+/// The reviewer's B1 as it can be made worst: every address key the shipped connector has, and every place, holds an address of six hundred
+/// characters, and every place has a key it has not and five thousand entries of a list beside them. Each key of the shipped descriptor is
+/// still said by name with its host, in its own part, and no part of what it does is cut; the keys it has not are counted, with their hosts.
+#[test]
+fn every_address_key_of_the_shipped_connector_is_said_by_name_however_long_and_however_much_is_beside_it() {
+    fn pad(value: &mut serde_json::Value, at: &str, hosts: &mut Vec<(String, String)>) {
+        let serde_json::Value::Object(map) = value else { return };
+        let keys: Vec<String> = map.keys().cloned().collect();
+        for key in keys {
+            let here = if at.is_empty() { key.clone() } else { format!("{at}.{key}") };
+            let lower = key.to_lowercase();
+            if map[&key].is_string() && (lower.ends_with("url") || lower.ends_with("path")) {
+                let host = format!("h-{}.example", here.replace('.', "-").to_lowercase());
+                map.insert(key.clone(), serde_json::json!(format!("https://{host}/{}", "p".repeat(600))));
+                hosts.push((here, host));
+            } else {
+                pad(map.get_mut(&key).unwrap(), &here, hosts);
+            }
+        }
+    }
+    let mut shipped: serde_json::Value = serde_json::from_str(include_str!("../../resources/connectors/formlogic.json")).unwrap();
+    let mut hosts: Vec<(String, String)> = Vec::new();
+    pad(&mut shipped, "", &mut hosts);
+    assert!(hosts.len() >= 30, "the shipped connector has its address keys: {}", hosts.len());
+    let places: Vec<String> = shipped.as_object().unwrap().iter().filter(|(_, v)| v.is_object()).map(|(k, _)| k.clone()).collect();
+    for place in &places {
+        shipped[place.as_str()]["zzExtraUrl"] = serde_json::json!(format!("https://extra-{}.example/x", place.to_lowercase()));
+    }
+    shipped["flows"]["nodes"] = (0..5000).map(|i| serde_json::json!({ "path": format!("https://aaa-pad{i:05}.example/x") })).collect();
+    shipped["auth"]["scopes"] = (0..5000).map(|i| serde_json::json!(format!("scope-{i}-{}", "s".repeat(60)))).collect();
+    shipped["name"] = serde_json::json!("Worst");
+    let items = inspect_desktop_files(&[("connectors/formlogic.json", shipped.to_string())], false);
+    let item = items.iter().find(|i| i.kind == "connector").expect("the connector is listed");
+    for (key, host) in &hosts {
+        assert!(item.what.contains(host.as_str()), "{key} ({host}) is said: {}", item.what);
+    }
+    for place in places.iter().filter(|p| *p != "flows") {
+        assert!(item.what.contains(&format!("extra-{}.example", place.to_lowercase())), "the key of {place} that the shipped descriptor has not is counted with its host: {}", item.what);
+    }
+    // (The place that holds five thousand entries of a list says how many other addresses there are, and samples their hosts.)
+    assert!(item.what.contains("flows.bindingsPath = https://h-flows-bindingspath.example/") && item.what.contains("5001 other addresses besides, to "), "{}", item.what);
+    let cut: Vec<&str> = item.parts.iter().filter(|p| p.fixed && p.cut_from.is_some()).map(|p| p.label.as_str()).collect();
+    assert!(cut.is_empty(), "no fixed part of a connector is cut, whatever is padded: {cut:?}");
+    // The scopes are a sample and a count (a real descriptor asks for a handful), and the rest of what it does is said.
+    assert!(item.what.contains("Asks to be allowed (5000): scope-0-") && item.what.contains(" and 4980 more."), "{}", item.what);
 }
 
 /// The address of a provider can be as long as an address can be: it is said last and cut on its own, and what it may reach (its own

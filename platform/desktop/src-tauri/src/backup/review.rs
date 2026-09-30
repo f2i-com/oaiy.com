@@ -15,7 +15,7 @@ use serde::Serialize;
 use serde_json::Value;
 
 pub use super::parts::ReviewItem;
-use super::parts::{quoted, short, Parts};
+use super::parts::{quoted, short, some_of, Parts};
 use super::table::{filter_json, table, Class, Why};
 use super::{BackupError, ErrorKind, Result};
 
@@ -250,13 +250,7 @@ fn words(n: usize, one: &str, many: &str) -> String {
 struct Address {
     path: String,
     value: String,
-    /// Whether it is an entry of a collection (an array, or an object of more keys than a descriptor has) and not a key of the
-    /// descriptor itself.
-    collection: bool,
 }
-
-/// An object with more keys than this is a collection (a map): a descriptor has fewer keys of its own in any one object.
-const MOST_KEYS_OF_ONE_OBJECT: usize = 30;
 
 /// The host an address goes to (`//host/path` is read as `https://host/path`), or `(not an address)`.
 fn host_of(address: &str) -> String {
@@ -273,26 +267,25 @@ fn is_address(key: &str, value: &Value) -> bool {
 }
 
 /// Every address in a JSON document, with where it is. Every one is kept, however many a place holds (an array of five thousand steps is
-/// five thousand addresses of a collection), so that what is said of a place can count them and name their hosts.
-fn collect_addresses(value: &Value, at: &str, in_collection: bool, out: &mut Vec<Address>, visited: &mut usize) {
+/// five thousand addresses), so that what is said of a place can count them and name their hosts.
+fn collect_addresses(value: &Value, at: &str, out: &mut Vec<Address>, visited: &mut usize) {
     *visited += 1;
     if *visited > 200_000 {
         return;
     }
     match value {
         Value::Object(map) => {
-            let bulk = in_collection || map.len() > MOST_KEYS_OF_ONE_OBJECT;
             for (key, v) in map {
                 let here = if at.is_empty() { key.clone() } else { format!("{at}.{key}") };
                 match v {
-                    Value::String(text) if is_address(key, v) => out.push(Address { path: here, value: text.clone(), collection: bulk }),
-                    _ => collect_addresses(v, &here, bulk, out, visited),
+                    Value::String(text) if is_address(key, v) => out.push(Address { path: here, value: text.clone() }),
+                    _ => collect_addresses(v, &here, out, visited),
                 }
             }
         }
         Value::Array(items) => {
             for (i, v) in items.iter().enumerate() {
-                collect_addresses(v, &format!("{at}[{i}]"), true, out, visited);
+                collect_addresses(v, &format!("{at}[{i}]"), out, visited);
             }
         }
         _ => {}
@@ -307,8 +300,8 @@ fn addresses_by_place(descriptor: &Value) -> Vec<(String, Vec<Address>)> {
     for (key, v) in map {
         let mut here = Vec::new();
         match v {
-            Value::String(text) if is_address(key, v) => here.push(Address { path: key.clone(), value: text.clone(), collection: false }),
-            _ => collect_addresses(v, key, false, &mut here, &mut visited),
+            Value::String(text) if is_address(key, v) => here.push(Address { path: key.clone(), value: text.clone() }),
+            _ => collect_addresses(v, key, &mut here, &mut visited),
         }
         if !here.is_empty() {
             places.push((key.clone(), here));
@@ -318,9 +311,9 @@ fn addresses_by_place(descriptor: &Value) -> Vec<(String, Vec<Address>)> {
 }
 
 /// The keys of a descriptor that are addresses by their names (`...Url`, `...Path`), by place, as the descriptor OAIY ships has them: what
-/// a descriptor of its own has, said first and by name whatever it holds. (Most of them are relative paths there; a descriptor that puts
-/// an address in one is the case.) A key added to the shipped descriptor is one of them. Only keys of the descriptor itself: an entry of
-/// an array is not.
+/// a descriptor of its own has, each said by name and in this order whatever else its object holds. (Most of them are relative paths
+/// there; a descriptor that puts an address in one is the case.) A key added to the shipped descriptor is one of them. Only keys of the
+/// descriptor itself: an entry of an array is not.
 fn reference_keys() -> &'static std::collections::BTreeMap<String, Vec<String>> {
     static KEYS: std::sync::OnceLock<std::collections::BTreeMap<String, Vec<String>>> = std::sync::OnceLock::new();
     fn named_like_addresses(value: &Value, at: &str, out: &mut Vec<String>) {
@@ -382,22 +375,20 @@ fn hosts_said(addresses: &[&Address]) -> String {
     }
 }
 
-/// What one place of a descriptor sends to: the addresses of its own keys, by key, those the shipped descriptor has first and in its order
-/// (a place with thirty more keys of its own cannot push one of them out), then how many addresses its lists and maps hold and their hosts.
+/// What one place of a descriptor sends to: the addresses of the keys the shipped descriptor has, each by its key and in its order
+/// (whatever else the object of a key holds), then every other address of the place (a key the shipped descriptor has not, an entry of a
+/// list or a map) as a count and a sample of the hosts they go to. What is said before the count is bounded by the shipped descriptor, so
+/// no number of other addresses, and no length of any, can push one of its own keys out.
 fn place_said(place: &str, all: &[Address]) -> String {
     let reference = reference_keys().get(place).cloned().unwrap_or_default();
-    // A key the shipped descriptor has is one of the descriptor's own wherever it sits: thirty more keys in its object do not make it an entry
-    // of a collection.
-    let own: Vec<&Address> = all.iter().filter(|a| !a.collection || reference.contains(&a.path)).collect();
-    let mut ordered: Vec<&Address> = reference.iter().filter_map(|k| own.iter().copied().find(|a| a.path == *k)).collect();
-    ordered.extend(own.iter().copied().filter(|a| !reference.contains(&a.path)));
-    let mut text = ordered.iter().map(|a| format!("{} = {}", a.path, short(&a.value, 100))).collect::<Vec<_>>().join("; ");
-    let bulk: Vec<&Address> = all.iter().filter(|a| a.collection && !reference.contains(&a.path)).collect();
-    if !bulk.is_empty() {
+    let named: Vec<&Address> = reference.iter().filter_map(|k| all.iter().find(|a| a.path == *k)).collect();
+    let mut text = named.iter().map(|a| format!("{} = {}", a.path, short(&a.value, 100))).collect::<Vec<_>>().join("; ");
+    let other: Vec<&Address> = all.iter().filter(|a| !reference.contains(&a.path)).collect();
+    if !other.is_empty() {
         if !text.is_empty() {
             text.push_str("; ");
         }
-        text.push_str(&format!("{} in lists or maps, to {}", words(bulk.len(), "address", "addresses"), hosts_said(&bulk)));
+        text.push_str(&format!("{} besides, to {}", words(other.len(), "other address", "other addresses"), hosts_said(&other)));
     }
     format!("{text}.")
 }
@@ -508,9 +499,7 @@ pub fn describe(class: RestoreClass, name: &str, bytes: &[u8], local: &Local, ba
                     parts.fixed("accepted", "Records how far setup got. No plugin permissions are marked as accepted.")
                 } else {
                     // How many first, and then the first few by name: a list of hundreds of plugins is a sample, and says how long it is.
-                    let named = accepted.iter().take(MAX_ACCEPTED_NAMED).map(|id| short(id, 40)).collect::<Vec<_>>().join(", ");
-                    let more = if accepted.len() > MAX_ACCEPTED_NAMED { format!(" and {} more", accepted.len() - MAX_ACCEPTED_NAMED) } else { String::new() };
-                    parts.fixed("accepted", format!("Records how far setup got and marks the permissions of {} as ACCEPTED.", words(accepted.len(), "plugin", "plugins"))).sample("names", format!("They are: {named}{more}."))
+                    parts.fixed("accepted", format!("Records how far setup got and marks the permissions of {} as ACCEPTED.", words(accepted.len(), "plugin", "plugins"))).sample("names", format!("They are: {}.", some_of(&accepted, MAX_ACCEPTED_NAMED, 40)))
                 };
                 vec![parts.item(class, name, "Setup record")]
             }
@@ -587,15 +576,14 @@ pub fn describe(class: RestoreClass, name: &str, bytes: &[u8], local: &Local, ba
                         .map(|n| n.iter().filter(|x| s(x, "type").is_some_and(|t| ["input_text", "input_file", "input_folder", "input_audio", "input_video"].contains(&t))).map(|x| x.get("data").and_then(|d| s(d, "label")).or_else(|| s(x, "id")).unwrap_or("?").to_string()).collect())
                         .unwrap_or_default();
                     if !labels.is_empty() {
-                        let named = labels.iter().take(MAX_INPUTS_NAMED).map(|l| short(l, 40)).collect::<Vec<_>>().join(", ");
-                        parts = parts.fixed("tool-inputs", format!("The model is asked for {}: {named}{}.", words(labels.len(), "input", "inputs"), if labels.len() > MAX_INPUTS_NAMED { format!(" and {} more", labels.len() - MAX_INPUTS_NAMED) } else { String::new() }));
+                        parts = parts.fixed("tool-inputs", format!("The model is asked for {}: {}.", words(labels.len(), "input", "inputs"), some_of(&labels, MAX_INPUTS_NAMED, 40)));
                     }
                 }
                 if let Some(hook) = v.get("oaiyToolHook") {
                     parts = parts.fixed("hook", format!("It runs {} the Agent's \"{}\" tool.", short(s(hook, "mode").unwrap_or("around"), 20), short(s(hook, "tool").unwrap_or("?"), 60)));
                 }
                 if !kinds.is_empty() {
-                    parts = parts.sample("kinds", format!("Its steps are of the kinds: {}{}.", kinds.iter().take(8).map(|k| short(k, 30)).collect::<Vec<_>>().join(", "), if kinds.len() > 8 { format!(" and {} more", kinds.len() - 8) } else { String::new() }));
+                    parts = parts.sample("kinds", format!("Its steps are of the kinds: {}.", some_of(&kinds, MAX_KINDS_NAMED, 30)));
                 }
                 vec![parts.item(class, name, title)]
             }
@@ -615,7 +603,8 @@ pub fn describe(class: RestoreClass, name: &str, bytes: &[u8], local: &Local, ba
                 }
                 parts = parts.fixed("prefilled", format!("A link to a provider, prefilled with the address {}.", short(s(&v, "defaultBaseUrl").unwrap_or("(none)"), 160)));
                 if let Some(scopes) = v.pointer("/auth/scopes").and_then(Value::as_array).map(|a| a.iter().filter_map(Value::as_str).collect::<Vec<_>>()).filter(|s| !s.is_empty()) {
-                    parts = parts.fixed("scopes", format!("Asks to be allowed ({}): {}.", scopes.len(), scopes.join(" ")));
+                    // How many first, and then the first few by name: a real descriptor asks for a handful.
+                    parts = parts.fixed("scopes", format!("Asks to be allowed ({}): {}.", scopes.len(), some_of(&scopes, MAX_SCOPES_NAMED, 50)));
                 }
                 for (key, label) in KNOWN_PLACES {
                     if let Some(all) = place(key) {
@@ -671,9 +660,12 @@ pub fn describe(class: RestoreClass, name: &str, bytes: &[u8], local: &Local, ba
     }
 }
 
-/// How many of the plugins a setup record marks as accepted, and of a flow's inputs, are named (the rest are counted).
+/// How many of the scopes a connector asks for, of the plugins a setup record marks as accepted, and of a flow's inputs, are named (the rest
+/// are counted).
+const MAX_SCOPES_NAMED: usize = 20;
 const MAX_ACCEPTED_NAMED: usize = 10;
 const MAX_INPUTS_NAMED: usize = 8;
+const MAX_KINDS_NAMED: usize = 8;
 
 /// The most services and appointments the dry run lists one by one (the rest are counted).
 const MAX_CALENDAR_LISTED: usize = 40;

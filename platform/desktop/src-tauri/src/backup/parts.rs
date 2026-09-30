@@ -5,7 +5,10 @@
 //! So there is no whole-item cut. Every kind of thing the dry run describes is a [`Kind`] with:
 //!
 //! - **fixed parts**, in a fixed order, that always come first: what it does, where it sends, what it may reach, the model, the key,
-//!   the permissions. Each is cut on its own, at the budget the kind gives it, and says how long it was when it is cut;
+//!   the permissions. Each is cut on its own, at the budget the kind gives it, and says how long it was when it is cut. A fixed part is
+//!   either bounded (a count, a host, a sentence of the code, a value cut inside it, the first few names of a collection and how many
+//!   more), and then its budget holds the most it can say and it is never cut, or it holds one free text (an event, a description), and
+//!   then it is cut alone: nothing else in it can be pushed out;
 //! - **sample parts** after them: free text and collections, a sample and a count, each cut on its own the same way.
 //!
 //! The kinds, their parts and their budgets are the table [`KINDS`]: nothing that describes a thing can name a part that is not in it
@@ -66,42 +69,42 @@ pub const KINDS: &[Kind] = &[
     Kind {
         id: "template",
         place: "a service template (templates/)",
-        fixed: &[part("autostart", 80), part("replaces", 80), part("runs", 360), part("install", 220), part("writes", 280), part("deletes", 240), part("env", 240), part("cwd", 160), part("marker", 160), part("health", 160), part("docs", 160)],
+        fixed: &[part("autostart", 80), part("replaces", 80), part("runs", 420), part("install", 240), part("writes", 640), part("deletes", 360), part("env", 480), part("cwd", 180), part("marker", 200), part("health", 200), part("docs", 180)],
         keys: NO_KEYS,
         sample: &[],
         full: Some(400),
     },
-    Kind { id: "flow", place: "a flow (flows/)", fixed: &[part("steps", 80), part("tool", 200), part("tool-description", 400), part("tool-inputs", 300), part("hook", 240)], keys: NO_KEYS, sample: &[part("kinds", 360)], full: None },
+    Kind { id: "flow", place: "a flow (flows/)", fixed: &[part("steps", 80), part("tool", 200), part("tool-description", 400), part("tool-inputs", 720), part("hook", 240)], keys: NO_KEYS, sample: &[part("kinds", 620)], full: None },
     Kind {
         id: "connector",
         place: "a connector descriptor (connectors/)",
         fixed: &[
             part("replaces", 100),
             part("prefilled", 260),
-            part("scopes", 320),
-            part("auth", 520),
-            part("health", 260),
-            part("heartbeat", 260),
-            part("relay", 420),
-            part("desktopFlows", 420),
-            part("desktopAi", 520),
-            part("flows", 520),
-            part("appLogic", 420),
-            part("dataNode", 320),
-            part("scriptProfile", 260),
-            part("docs", 260),
+            part("scopes", 1840),
+            part("auth", 1100),
+            part("health", 760),
+            part("heartbeat", 760),
+            part("relay", 1100),
+            part("desktopFlows", 1100),
+            part("desktopAi", 2000),
+            part("flows", 2000),
+            part("appLogic", 1300),
+            part("dataNode", 940),
+            part("scriptProfile", 760),
+            part("docs", 760),
         ],
         keys: NO_KEYS,
-        sample: &[part("summary", 240), part("other-places", 500)],
+        sample: &[part("summary", 240), part("other-places", 7400)],
         full: Some(100),
     },
     Kind { id: "callers", place: "what is remembered about callers (callers.json)", fixed: &[part("entries", 320)], keys: NO_KEYS, sample: &[], full: None },
-    Kind { id: "setting", place: "a key that acts in a settings file (the calendar's, a plugin's, the Agent's)", fixed: &[part("sets", 480)], keys: NO_KEYS, sample: &[part("why", 320)], full: None },
+    Kind { id: "setting", place: "a key that acts in a settings file (the calendar's, a plugin's, the Agent's)", fixed: &[part("sets", 520)], keys: NO_KEYS, sample: &[part("why", 320)], full: None },
     Kind {
         id: "calendar-service",
         place: "a service of the calendar",
         fixed: &[part("about", 200)],
-        keys: Some(KeyParts { table: "calendar", under: "settings.services[].", except: &[], budget: 320 }),
+        keys: Some(KeyParts { table: "calendar", under: "settings.services[].", except: &[], budget: 560 }),
         sample: &[],
         full: None,
     },
@@ -109,7 +112,7 @@ pub const KINDS: &[Kind] = &[
         id: "calendar-appointment",
         place: "an appointment of the calendar",
         fixed: &[part("about", 300)],
-        keys: Some(KeyParts { table: "calendar", under: "appointments[].", except: &[], budget: 320 }),
+        keys: Some(KeyParts { table: "calendar", under: "appointments[].", except: &[], budget: 560 }),
         sample: &[],
         full: None,
     },
@@ -127,8 +130,8 @@ pub const KINDS: &[Kind] = &[
     Kind {
         id: "campaign",
         place: "an outreach campaign",
-        fixed: &[part("comes-back", 480), part("left-out", 320)],
-        keys: Some(KeyParts { table: "agent.campaign", under: "", except: &["collect[]", "people[]", "skipped[]", "id", "slug", "createdAt", "resultsPath", "name"], budget: 400 }),
+        fixed: &[part("comes-back", 480), part("left-out", 520)],
+        keys: Some(KeyParts { table: "agent.campaign", under: "", except: &["collect[]", "people[]", "skipped[]", "id", "slug", "createdAt", "resultsPath", "name"], budget: 640 }),
         sample: &[part("questions", 240), part("question", 900), part("people", 240), part("person", 2000), part("set-aside", 240), part("skipped", 500)],
         full: Some(50),
     },
