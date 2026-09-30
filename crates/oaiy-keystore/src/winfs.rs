@@ -1,5 +1,5 @@
 //! Two questions about an open Windows handle that `std` answers only on nightly (`windows_by_handle`) or not at all: **which file is this** (the volume and the
-//! file index, what the operating system itself says two handles have in common when they are one file; and its attributes), and **where is it really** (the final path, with every
+//! file index, what the operating system itself says two handles have in common when they are one file), and **where is it really** (the final path, with every
 //! junction and symbolic link on the way resolved). The keystore holds its keys folder open and needs both (review M-1): to compare the folder it holds with the
 //! folder its path leads to now, and to work in the folder it holds, by its real path, and not in whatever a path with a junction in it leads to at this moment.
 //!
@@ -34,6 +34,8 @@ pub(crate) struct FileId {
 pub(crate) struct Info {
     /// Which file.
     pub id: FileId,
+    /// How many names the file has (hard links). A folder has one.
+    pub links: u32,
     /// The attribute bits (`FILE_ATTRIBUTE_*`).
     pub attributes: u32,
 }
@@ -42,7 +44,7 @@ fn handle_of(file: &File) -> HANDLE {
     file.as_raw_handle() as HANDLE
 }
 
-/// The id and the attributes of an open file or folder. The id is the 128-bit file id where the file system has one (NTFS and ReFS do, from
+/// The id, the link count and the attributes of an open file or folder. The id is the 128-bit file id where the file system has one (NTFS and ReFS do, from
 /// Windows 8 on) and the 64-bit index otherwise.
 pub(crate) fn info(file: &File) -> io::Result<Info> {
     let handle = handle_of(file);
@@ -63,7 +65,7 @@ pub(crate) fn info(file: &File) -> io::Result<Info> {
     } else {
         FileId { volume: u64::from(basic.dwVolumeSerialNumber), index: (u128::from(basic.nFileIndexHigh) << 32) | u128::from(basic.nFileIndexLow) }
     };
-    Ok(Info { id, attributes: basic.dwFileAttributes })
+    Ok(Info { id, links: basic.nNumberOfLinks, attributes: basic.dwFileAttributes })
 }
 
 /// The real path of an open file or folder: the name the file system knows it by, from the root of its volume, with no junction and no symbolic link in it
@@ -108,9 +110,9 @@ mod tests {
         OpenOptions::new().read(true).share_mode(7).custom_flags(0x0200_0000 | 0x0020_0000).open(path).unwrap()
     }
 
-    /// Two handles to one file have one id, however they were opened; two files have two; a hard link is another name of the same file.
+    /// Two handles to one file have one id, however they were opened; two files have two; a hard link is another name of the same file and says so.
     #[test]
-    fn the_id_is_the_file_and_a_hard_link_is_the_same_file() {
+    fn the_id_is_the_file_and_the_link_count_is_its_names() {
         let dir = scratch("id");
         let (a, b) = (dir.join("a"), dir.join("b"));
         std::fs::write(&a, b"x").unwrap();
@@ -119,13 +121,16 @@ mod tests {
         let other = File::open(&b).unwrap();
         assert_eq!(info(&first).unwrap().id, info(&second).unwrap().id);
         assert_ne!(info(&first).unwrap().id, info(&other).unwrap().id);
+        assert_eq!(info(&first).unwrap().links, 1);
         std::fs::hard_link(&a, dir.join("a2")).unwrap();
         let linked = File::open(dir.join("a2")).unwrap();
+        assert_eq!(info(&first).unwrap().links, 2, "the count is read when it is asked, not when the handle was opened");
         assert_eq!(info(&linked).unwrap().id, info(&first).unwrap().id, "a hard link is the same file");
-        // a folder is a folder: the directory attribute, and its own id
+        // a folder is a folder: the directory attribute, one name, and its own id
         let held = folder(&dir);
         let dir_info = info(&held).unwrap();
         assert_ne!(dir_info.attributes & 0x10, 0);
+        assert_eq!(dir_info.links, 1);
         assert_ne!(dir_info.id, info(&first).unwrap().id);
         drop((first, second, other, linked, held));
         std::fs::remove_dir_all(&dir).unwrap();

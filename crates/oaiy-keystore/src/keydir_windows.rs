@@ -65,11 +65,15 @@ fn require_directory(info: &Info, what: &str) -> Result<(), KeyError> {
     Ok(())
 }
 
-/// A key file is a file: a reparse point and a folder are refused.
-fn require_file(info: &Info, what: &str) -> Result<(), KeyError> {
+/// A key file is a file with one name: a reparse point, a folder and a file that has another hard link (another way to reach the same bytes, from a place this
+/// store does not look after) are refused.
+fn require_file(info: &Info, what: &str, one_name: bool) -> Result<(), KeyError> {
     refuse_reparse_point(info, what)?;
     if info.attributes & FILE_ATTRIBUTE_DIRECTORY != 0 {
         return Err(KeyError::Permissions(format!("{what}: is a directory")));
+    }
+    if one_name && info.links > 1 {
+        return Err(KeyError::Permissions(format!("{what}: has {} names (hard links): a key file has exactly one", info.links)));
     }
     Ok(())
 }
@@ -177,7 +181,7 @@ impl KeyDir {
             .open(&path)
             .map_err(|e| KeyError::io("open the lock file", e))?;
         let info = winfs::info(&file).map_err(|e| KeyError::io("inspect the lock file", e))?;
-        require_file(&info, &self.shown(LOCK_FILE))?;
+        require_file(&info, &self.shown(LOCK_FILE), false)?;
         DirLock::acquire(file, exclusive, self.lock_wait)
     }
 
@@ -195,7 +199,7 @@ impl KeyDir {
             Err(e) => return Err(KeyError::io("open a key file", e)),
         };
         let info = winfs::info(&file).map_err(|e| KeyError::io("inspect a key file", e))?;
-        require_file(&info, &self.shown(name))?;
+        require_file(&info, &self.shown(name), true)?;
         read_blob(file).map(Some)
     }
 
@@ -219,7 +223,7 @@ impl KeyDir {
         let path = self.at(name);
         let Ok(file) = OpenOptions::new().read(true).write(true).custom_flags(FILE_FLAG_OPEN_REPARSE_POINT).open(&path) else { return false };
         let Ok(info) = winfs::info(&file) else { return false };
-        if require_file(&info, "").is_err() || !claim_if_stale(&file, min_age) {
+        if require_file(&info, "", false).is_err() || !claim_if_stale(&file, min_age) {
             return false;
         }
         fs::remove_file(&path).is_ok()

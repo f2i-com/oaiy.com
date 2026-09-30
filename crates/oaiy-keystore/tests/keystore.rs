@@ -1082,6 +1082,26 @@ mod unix {
         assert_eq!(get(&*store, &name("piped.secret")), Some(b"now a file".to_vec()));
     }
 
+    /// A key file has one name: a hard link to it (from the same folder or another) is refused until the extra name is gone, and a put, which renames a new file over
+    /// it, repairs it.
+    #[test]
+    fn a_key_file_with_another_hard_link_is_refused_until_the_extra_name_is_gone() {
+        let scratch = Scratch::new("hardlink");
+        let store = store(&scratch, ProviderChoice::Keyfile);
+        let n = name("vault.pins");
+        store.put(&n, b"pins").unwrap();
+        let elsewhere = scratch.0.join("another-name");
+        fs::hard_link(file_of(&scratch, "vault.pins", "kf"), &elsewhere).unwrap();
+        let error = store.get(&n).expect_err("two names for one key file");
+        assert!(matches!(&error, KeyError::Permissions(why) if why.contains("hard links")), "{error:?}");
+        fs::remove_file(&elsewhere).unwrap();
+        assert_eq!(get(&*store, &n), Some(b"pins".to_vec()));
+        fs::hard_link(file_of(&scratch, "vault.pins", "kf"), &elsewhere).unwrap();
+        store.put(&n, b"pins again").unwrap();
+        assert_eq!(get(&*store, &n), Some(b"pins again".to_vec()), "a put replaces the file with one that has one name");
+        fs::remove_file(&elsewhere).unwrap();
+    }
+
     /// The directories above the keys folder: whoever can rename the folder can put another in its place (the reviewer's attacker did it 1.1 million times
     /// in 40 seconds against a check-then-open store). World- or group-writable and not sticky, or another user's, is refused; sticky (as `/tmp` is) is not.
     #[test]
@@ -1264,6 +1284,29 @@ mod windows {
                 assert!(fs::remove_dir(&folder).is_err(), "{} was removed under the store", folder.display());
             }
             assert_eq!(get(&*store, &name("a.one")), Some(b"1".to_vec()));
+        }
+    }
+
+    /// A key file has one name. A second name for the same bytes (a hard link) is a way to reach the secret from a place this store does not look after, and what the
+    /// store reads is no longer "the file of this name". It is refused, for every provider, until the extra name is gone.
+    #[test]
+    fn a_key_file_with_another_hard_link_is_refused_until_the_extra_name_is_gone() {
+        for (choice, ext) in providers() {
+            let scratch = Scratch::new("hardlink");
+            let store = store(&scratch, choice);
+            let n = name("vault.pins");
+            store.put(&n, b"pins").unwrap();
+            let elsewhere = scratch.0.join("another-name");
+            fs::hard_link(file_of(&scratch, "vault.pins", ext), &elsewhere).unwrap();
+            let error = store.get(&n).expect_err("two names for one key file");
+            assert!(matches!(&error, KeyError::Permissions(why) if why.contains("hard links")), "{ext}: {error:?}");
+            fs::remove_file(&elsewhere).unwrap();
+            assert_eq!(get(&*store, &n), Some(b"pins".to_vec()), "{ext}: the same file with one name again");
+            // a put replaces the file by renaming a new one over it, which has one name: a put repairs it
+            fs::hard_link(file_of(&scratch, "vault.pins", ext), &elsewhere).unwrap();
+            store.put(&n, b"pins again").unwrap();
+            assert_eq!(get(&*store, &n), Some(b"pins again".to_vec()));
+            fs::remove_file(&elsewhere).unwrap();
         }
     }
 }

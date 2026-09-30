@@ -45,6 +45,8 @@ pub struct Meta {
     pub mode: u32,
     /// The owner.
     pub uid: u32,
+    /// How many names the file has (hard links). Only a file's count is judged: a key file has exactly one.
+    pub links: u64,
 }
 
 /// Applies the rule. `expected_uid` is the user this process runs as, when known.
@@ -66,6 +68,9 @@ pub fn check(kind: Kind, meta: &Meta, expected_uid: Option<u32>) -> Result<(), S
         if meta.uid != uid {
             return Err("belongs to another user".into());
         }
+    }
+    if kind == Kind::File && meta.links > 1 {
+        return Err(format!("has {} names (hard links): a key file has exactly one", meta.links));
     }
     Ok(())
 }
@@ -99,7 +104,7 @@ pub(crate) fn meta_of(m: &std::fs::Metadata) -> Meta {
     } else {
         FileKind::Other
     };
-    Meta { kind, mode: m.mode() & 0o7777, uid: m.uid() }
+    Meta { kind, mode: m.mode() & 0o7777, uid: m.uid(), links: m.nlink() }
 }
 
 #[cfg(test)]
@@ -107,11 +112,11 @@ mod tests {
     use super::*;
 
     fn file(mode: u32) -> Meta {
-        Meta { kind: FileKind::Regular, mode, uid: 1000 }
+        Meta { kind: FileKind::Regular, mode, uid: 1000, links: 1 }
     }
 
     fn dir(mode: u32) -> Meta {
-        Meta { kind: FileKind::Directory, mode, uid: 1000 }
+        Meta { kind: FileKind::Directory, mode, uid: 1000, links: 1 }
     }
 
     /// The whole table of modes: exactly 0600 and 0400 pass for a file, exactly 0700 (and the stricter ones) for a directory.
@@ -157,11 +162,27 @@ mod tests {
         assert!(message.contains("0644") && message.contains("0600"), "{message}");
     }
 
+    /// A key file has one name (a hard link is a second way to reach the same bytes, from a place this store does not look after); a folder is not judged by its count.
+    #[test]
+    fn a_key_file_with_more_than_one_name_is_refused_and_a_folder_is_not_judged_by_its_count() {
+        for links in [0u64, 1] {
+            assert!(check(Kind::File, &Meta { links, ..file(0o600) }, Some(1000)).is_ok(), "{links} links");
+        }
+        for links in [2u64, 3, 65_000] {
+            let message = check(Kind::File, &Meta { links, ..file(0o600) }, Some(1000)).unwrap_err();
+            assert!(message.contains("hard links") && message.contains(&links.to_string()), "{message}");
+        }
+        // a directory has 2 links and one more for each folder inside it
+        for links in [1u64, 2, 7, 65_000] {
+            assert!(check(Kind::Dir, &Meta { links, ..dir(0o700) }, Some(1000)).is_ok(), "directory with {links} links");
+        }
+    }
+
     /// A FIFO, a socket or a device with mode 0600 is not a key file: opening a FIFO for reading blocks until a writer appears, so a `get` on one would
     /// never return.
     #[test]
     fn anything_that_is_not_a_regular_file_is_refused_however_good_its_mode() {
-        let other = Meta { kind: FileKind::Other, mode: 0o600, uid: 1000 };
+        let other = Meta { kind: FileKind::Other, mode: 0o600, uid: 1000, links: 1 };
         let message = check(Kind::File, &other, Some(1000)).unwrap_err();
         assert!(message.contains("not a regular file"), "{message}");
         assert!(check(Kind::Dir, &other, Some(1000)).is_err());
@@ -186,15 +207,15 @@ mod tests {
             (0o1777, 1001, false),
             (0o700, 65534, false),
         ] {
-            let meta = Meta { kind: FileKind::Directory, mode, uid };
+            let meta = Meta { kind: FileKind::Directory, mode, uid, links: 1 };
             assert_eq!(check_ancestor(&meta, me).is_ok(), ok, "mode {mode:04o} uid {uid}");
         }
-        let not_dir = Meta { kind: FileKind::Regular, mode: 0o755, uid: me };
+        let not_dir = Meta { kind: FileKind::Regular, mode: 0o755, uid: me, links: 1 };
         assert!(check_ancestor(&not_dir, me).is_err());
         // the message says which rule was broken
-        let writable = Meta { kind: FileKind::Directory, mode: 0o777, uid: me };
+        let writable = Meta { kind: FileKind::Directory, mode: 0o777, uid: me, links: 1 };
         assert!(check_ancestor(&writable, me).unwrap_err().contains("not sticky"));
-        let foreign = Meta { kind: FileKind::Directory, mode: 0o755, uid: 1001 };
+        let foreign = Meta { kind: FileKind::Directory, mode: 0o755, uid: 1001, links: 1 };
         assert!(check_ancestor(&foreign, me).unwrap_err().contains("another user"));
     }
 
