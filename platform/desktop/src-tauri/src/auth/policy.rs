@@ -3,10 +3,12 @@
 //! A password is Unicode NFKC-normalised, then taken as UTF-8: that is what is hashed and what is judged, so
 //! two ways of typing the same text (a full-width letter, a composed and a decomposed accent) are one password.
 //! It must be **16 to 128 scalar values** of the normalised text, and a strength estimate must pass: `zxcvbn`
-//! score 3 or more, computed on the normalised text with the extra inputs `oaiy`, `admin` and the install's own
-//! host names. Score 3 is an estimated 10^8 guesses or more; at the 17,280 guesses a day that slow mode allows
-//! (4.7.4) that is 15.9 years. There are no composition rules (no "one digit and a capital"): they push people
-//! towards `Passw0rd!` and not towards length.
+//! score **4**, computed on the normalised text with the extra inputs `oaiy`, `admin` and the install's own
+//! host names. Score 4 is an estimated 10^10 guesses or more; at the 17,280 guesses a day that slow mode allows
+//! (4.7.4) that is 1,585 years. (The design says score 3, 10^8 guesses. That floor lets through hybrids that the
+//! estimate puts a hair above it: `Password1234567890!` at 100,150,000 guesses, `zoo-zoo-zoo-zoo-zoo-zoo` at
+//! 100,020,000. Score 4 is the smallest change that refuses them without a list of patterns of our own.) There are no
+//! composition rules (no "one digit and a capital"): they push people towards `Passw0rd!` and not towards length.
 //!
 //! The reasons a password is refused are three fixed words, `too_short`, `too_long` and `too_guessable`, and never
 //! a hint about the password itself. A length failure is answered without running the estimate (nobody without a
@@ -25,7 +27,7 @@ use super::wordlist;
 pub const MIN_LEN: usize = 16;
 pub const MAX_LEN: usize = 128;
 /// The score at which a password passes.
-pub const MIN_SCORE: u8 = 3;
+pub const MIN_SCORE: u8 = 4;
 /// The words of a generated passphrase.
 pub const WORDS: usize = 6;
 
@@ -281,9 +283,8 @@ mod tests {
     }
 
     #[test]
-    fn a_score_of_two_is_refused_and_three_is_the_first_that_passes() {
-        // Long enough for the length rule; only the estimate differs (the crate is pinned by Cargo.lock, and the
-        // guesses are checked against the design's 10^8 as well).
+    fn a_score_of_three_is_refused_and_four_is_the_first_that_passes() {
+        // Long enough for the length rule; only the estimate differs (the crate is pinned by Cargo.lock).
         let extra = none();
         for (text, want) in [
             ("sunshinemonkey99", 2),
@@ -292,20 +293,46 @@ mod tests {
             ("sunshinewelcome!", 3),
             ("sunshinemonkey2020", 3),
             ("sunshinelondon2020", 3),
+            ("Password1234567890!", 3),
+            ("zoo-zoo-zoo-zoo-zoo-zoo", 3),
+            ("correcthorsebatterystaple", 4),
+            ("tr0ub4dor&3xkcdxkcd", 4),
         ] {
             assert!(length(&normalise(text)) >= MIN_LEN, "{text}");
             assert_eq!(score(text, &extra), want, "{text}");
             let verdict = judge(text, &extra);
-            if want >= 3 {
+            if want >= 4 {
                 assert!(verdict.is_ok(), "{text}");
-                assert!(estimated_guesses(text, &extra) >= 100_000_005, "{text}");
+                assert!(estimated_guesses(text, &extra) >= 10_000_000_000, "{text}");
             } else {
                 assert_eq!(code(&verdict), ["too_guessable"], "{text}");
-                assert!(estimated_guesses(text, &extra) < 100_000_005, "{text}");
+                assert!(estimated_guesses(text, &extra) < 10_000_000_000, "{text}");
             }
         }
     }
 
+    #[test]
+    fn the_hybrids_that_the_estimate_puts_a_hair_over_the_design_floor_are_refused() {
+        // Both were accepted by the design's floor of score 3 (10^8 guesses): a dictionary word with a run of
+        // digits and a mark, and one short word repeated with a separator.
+        let extra = none();
+        for (text, guesses) in [
+            ("Password1234567890!", 100_150_000),
+            ("zoo-zoo-zoo-zoo-zoo-zoo", 100_020_000),
+        ] {
+            assert_eq!(estimated_guesses(text, &extra), guesses, "{text}");
+            assert!(guesses > 100_000_000, "just over the design's floor");
+            assert_eq!(code(&judge(text, &extra)), ["too_guessable"], "{text}");
+        }
+        // The floor is a score, not a list: what the estimate calls strong is still taken, spaces and all.
+        for text in [
+            "k7Qz!mV3#pW9xLd2 rn8Tb",
+            "correct horse battery staple",
+            "abandon-ability-able-about-above-absent",
+        ] {
+            assert!(judge(text, &extra).is_ok(), "{text}");
+        }
+    }
     // The generator ---------------------------------------------------------------------------------
 
     /// A deterministic stream of bytes, so that the 10,000 draws are the same every run.

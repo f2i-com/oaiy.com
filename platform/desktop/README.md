@@ -287,6 +287,10 @@ restarted). First run: `oaiyctl auth setup-code`, open the dashboard's `/setup` 
 an install that has never run): a console that looks at the wrong folder says so instead of making an owner there.
 An install made with the earlier unit (`Environment=OAIY_DATA_DIR=...` in the unit) moves those lines into the file.
 
+**The password** is 16 to 128 characters and must be estimated (zxcvbn, with `oaiy`, `admin` and the install's host
+names counted as guessable) at 10^10 guesses or more, score 4. There are no composition rules; `oaiyctl auth init
+--generate` and the dashboard offer six words of the BIP-39 list, which pass with room to spare.
+
 **Limits to know before exposing a login** (they are recorded here so that nobody finds them by accident):
 
 - **Flows.** Until flow authority (ACC-05) exists, a signed-in dashboard session can write and run flows
