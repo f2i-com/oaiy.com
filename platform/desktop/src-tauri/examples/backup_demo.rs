@@ -57,7 +57,7 @@ fn main() {
     put(&source, "voices/receptionist.wav", &vec![7u8; 5000]);
     put(&source, "templates/my-rig.json", b"{\"id\":\"my-rig\",\"name\":\"My rig\",\"run\":{\"command\":\"my-rig.exe\",\"args\":[\"--serve\"]},\"autostart\":true}");
     put(&source, "services-autostart.json", b"[\"my-rig\"]");
-    put(&source, "plugin-data/aokie/settings.json", b"{\"greeting\":\"hello\"}");
+    put(&source, "plugin-data/aokie/settings.json", b"{\"settings\":{\"greeting\":\"hello, this is the front desk\",\"bargeSensitivity\":100,\"outboundEnabled\":true}}");
     put(&source, "plugin-data/aokie/pairing.json", b"{\"phone\":\"paired\"}");
     put(&source, "ai/providers.json", b"{\"providers\":[{\"apiKey\":\"sk-not-a-real-key\"}]}");
     put(&source, "ai/codex-home/auth.json", b"{\"tokens\":\"x\"}");
