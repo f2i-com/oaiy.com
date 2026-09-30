@@ -12,6 +12,7 @@
 //! - [`audit`], [`scrub`]: the audit and noise logs, and the scrub every log line passes through.
 pub mod export;
 pub mod presets;
+pub mod principal;
 pub mod routes;
 pub mod scopes;
 
