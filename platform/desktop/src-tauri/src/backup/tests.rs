@@ -5270,7 +5270,7 @@ fn a_template_says_what_it_installs_writes_and_replaces_however_long_its_command
     let preview = restore::inspect(&dst.0, &file, PASS, &options()).unwrap();
     let item = preview.items.iter().find(|i| i.name == "templates/rig.json").unwrap();
     for must in [
-        "install script install-rig.ps1", "writes 2 script file(s)", "deletes 2 path(s) when uninstalled", "sets 1 environment variable(s): LD_PRELOAD", "runs in C:/work",
+        "install script install-rig.ps1", "writes 2 script file(s): install-rig.ps1 (7 bytes), second.ps1 (8 bytes)", "deletes 2 path(s) when uninstalled", "sets 1 environment variable(s): LD_PRELOAD", "runs in C:/work",
         "writes a marker file at", "asks http://attacker.example/steal after it starts", "links to https://docs.example/rig", "STARTS with OAIY once installed", "replaces your template of the same id",
     ] {
         assert!(item.what.contains(must), "{must:?} is said: {}", item.what);
@@ -5291,6 +5291,9 @@ fn a_connector_is_described_by_every_address_it_holds() {
         "relay": { "path": "https://relay.attacker.example/queue" }
     });
     put(&src.0, "connectors/formlogic.json", descriptor.to_string().as_bytes());
+    // A descriptor with more addresses than are listed: the first eight are, and the rest are counted.
+    let mirrors: serde_json::Map<String, serde_json::Value> = (0..12).map(|i| (format!("m{i:02}Url"), serde_json::Value::String(format!("https://mirror{i}.example/x")))).collect();
+    put(&src.0, "connectors/many.json", serde_json::json!({ "id": "many", "name": "Many", "defaultBaseUrl": "https://one.example", "mirrors": mirrors }).to_string().as_bytes());
     let out = TempDir::new("connector-out");
     let file = out.0.join("c.oaiybackup");
     make(&src.0, &file);
@@ -5301,6 +5304,9 @@ fn a_connector_is_described_by_every_address_it_holds() {
         assert!(item.what.contains(must), "{must:?} is said: {}", item.what);
     }
     assert!(!item.what.contains("auth.tokenPath"), "a relative path is not an address: {}", item.what);
+    let many = preview.items.iter().find(|i| i.name == "connectors/many.json").unwrap();
+    assert!(many.what.contains("mirrors.m06Url = https://mirror6.example/x") && !many.what.contains("m07Url"), "eight are listed: {}", many.what);
+    assert!(many.what.contains("and 5 more"), "and the other five are counted: {}", many.what);
 }
 
 /// The restart that applies a restore asks what is in the way twice, the second time with nothing between it and the restart.
