@@ -11,6 +11,7 @@ import {
   type RestorePreview,
   type StagedRestore,
 } from './api';
+import { visibleText } from './visibleText';
 
 /**
  * Backup and restore: one encrypted file with the person's OAIY setup, made and read back here.
@@ -187,7 +188,7 @@ function Sentences({ items }: { items: string[] }) {
   return (
     <ul style={{ margin: '6px 0 0', paddingLeft: 18 }}>
       {items.map((t, i) => (
-        <li key={i}>{t}</li>
+        <li key={i}>{visibleText(t)}</li>
       ))}
     </ul>
   );
@@ -761,7 +762,7 @@ export function BackupSection() {
               <ul style={{ margin: '4px 0 0', paddingLeft: 18, maxHeight: 220, overflowY: 'auto' }}>
                 {preview.notRestored.map((n, i) => (
                   <li key={`${n.name}-${i}`}>
-                    <code className="path-code">{n.name}</code>: {n.why}
+                    <code className="path-code">{visibleText(n.name)}</code>: {visibleText(n.why)}
                   </li>
                 ))}
               </ul>
@@ -817,7 +818,7 @@ export function BackupSection() {
                         <ul style={{ margin: '4px 0 0', paddingLeft: 18, maxHeight: 220, overflowY: 'auto' }}>
                           {items.map((i, n) => (
                             <li key={`${i.name}-${n}`}>
-                              <code className="path-code">{i.name}</code> — {i.title}: {i.what}
+                              <code className="path-code">{visibleText(i.name)}</code> — {visibleText(i.title)}: {visibleText(i.what)}
                             </li>
                           ))}
                         </ul>

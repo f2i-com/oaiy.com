@@ -37,6 +37,7 @@ vi.mock('./api', () => ({
 
 import { BackupSection, RESTORE_TIMEOUT_MS, agoWords, undoConfirmText } from './BackupPanel';
 import type { BackupCreateResult, BackupStatus, RestoreClass, RestorePreview, ReviewItem, StagedRestore } from './api';
+import { isInvisible } from './visibleText';
 
 const PASS = 'correct horse battery';
 const PASS2 = 'another long passphrase';
@@ -583,6 +584,22 @@ describe('restoring: what can run or change settings needs a tick', () => {
     await check({ classes: [{ id: 'flows', label: 'Flows and triggers', description: 'They can send messages.', count: 75 }], items: many });
     for (let n = 0; n < 75; n++) expect(text()).toContain(`flows/flow-${n}.json`);
     expect(text()).toContain('The 75 items');
+  });
+
+  it('draws no character a person cannot see: a tag, a zero-width or a direction character is said as what it is, whoever sent it', async () => {
+    const tags = Array.from({ length: 25 }, (_, i) => String.fromCodePoint(0xe0041 + i)).join('');
+    await check({
+      classes: [{ id: 'agentData', label: 'Agent data', description: 'The Agent reads it.', count: 1 }],
+      items: [{ class: 'agentData', name: `agent/brief${tags}`, title: `The front desk's brief${tags}`, what: `Says: "Ask how the visit went${tags}" and ‮elbat​` }],
+      notes: [`A note${tags}`],
+      notRestored: [{ name: `mystery${tags}`, why: `not restored: unknown item${tags}` }],
+    });
+    const shown = host.textContent ?? '';
+    expect([...shown].some((ch) => isInvisible(ch.codePointAt(0) ?? 0) && ch !== '\n' && ch !== '\t')).toBe(false);
+    expect(shown).toContain('Ask how the visit went[25 invisible characters: U+E0041');
+    expect(shown).toContain('[1 invisible character: U+202E]elbat[1 invisible character: U+200B]');
+    expect(shown).toContain('A note[25 invisible characters');
+    expect(shown).toContain('mystery[25 invisible characters');
   });
 
   it('starts with nothing ticked, and says only the data comes back', async () => {
