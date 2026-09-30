@@ -57,7 +57,11 @@ unsafe fn holds_needle(ptr: *const u8, len: usize) -> bool {
 // still allocated and valid for `layout.size()` bytes (the caller of `dealloc` and `realloc` guarantees that).
 unsafe impl GlobalAlloc for Scan {
     unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
-        System.alloc(layout)
+        let block = System.alloc(layout);
+        if !block.is_null() && ARMED.load(Ordering::SeqCst) {
+            std::ptr::write_bytes(block, 0, layout.size()); // see the note above `probe`
+        }
+        block
     }
     unsafe fn dealloc(&self, ptr: *mut u8, layout: Layout) {
         if ARMED.load(Ordering::SeqCst) && holds_needle(ptr, layout.size()) {
@@ -71,6 +75,9 @@ unsafe impl GlobalAlloc for Scan {
     unsafe fn realloc(&self, ptr: *mut u8, layout: Layout, new_size: usize) -> *mut u8 {
         let had = ARMED.load(Ordering::SeqCst) && holds_needle(ptr, layout.size());
         let moved = System.realloc(ptr, layout, new_size);
+        if !moved.is_null() && new_size > layout.size() && ARMED.load(Ordering::SeqCst) {
+            std::ptr::write_bytes(moved.add(layout.size()), 0, new_size - layout.size());
+        }
         if had && moved != ptr {
             record(layout.size()); // the old block was freed with the needle in it
         }
@@ -82,6 +89,10 @@ unsafe impl GlobalAlloc for Scan {
 static ALLOCATOR: Scan = Scan;
 
 /// Runs `f` with the probe looking for `needle`; returns how many freed or moved blocks still held it, and their sizes.
+///
+/// While the probe is armed a block that is handed out is first filled with zeros (and so is the new tail of a block that `realloc` grows): memory that nobody has
+/// written since it was allocated can hold what an earlier user of the same chunk left, such as the unwiped copies that the controls make on purpose, and a probe
+/// that looked at it would report the control's leak as the code's. What is found in a block is what the code wrote into it while the probe was looking.
 fn probe(needle: &[u8], f: impl FnOnce()) -> (usize, Vec<usize>) {
     assert!(needle.len() <= NEEDLE_MAX);
     for (i, b) in needle.iter().enumerate() {

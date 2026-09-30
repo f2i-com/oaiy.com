@@ -52,10 +52,17 @@ fn look(ptr: *mut u8, size: usize) {
     }
 }
 
-// SAFETY: every method forwards to the system allocator with the arguments it was given; `dealloc` and `realloc` first look at the old block.
+// SAFETY: every method forwards to the system allocator with the arguments it was given; `dealloc` and `realloc` first look at the old block. While the probe is
+// armed, a block that is handed out is first filled with zeros (`alloc`, and the new tail of a `realloc`): memory that nobody has written since it was allocated can
+// hold what an earlier user of the same chunk left (the unwiped copies the controls make on purpose, a path buffer with room to spare), and a probe that looked at
+// it would report that as a leak of the code under test. What is found in a block is what the code wrote into it while the probe was looking.
 unsafe impl GlobalAlloc for Probe {
     unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
-        System.alloc(layout)
+        let block = System.alloc(layout);
+        if !block.is_null() && ARMED.load(Ordering::SeqCst) {
+            std::ptr::write_bytes(block, 0, layout.size());
+        }
+        block
     }
     unsafe fn dealloc(&self, ptr: *mut u8, layout: Layout) {
         look(ptr, layout.size());
@@ -66,7 +73,11 @@ unsafe impl GlobalAlloc for Probe {
     }
     unsafe fn realloc(&self, ptr: *mut u8, layout: Layout, new_size: usize) -> *mut u8 {
         look(ptr, layout.size());
-        System.realloc(ptr, layout, new_size)
+        let block = System.realloc(ptr, layout, new_size);
+        if !block.is_null() && new_size > layout.size() && ARMED.load(Ordering::SeqCst) {
+            std::ptr::write_bytes(block.add(layout.size()), 0, new_size - layout.size());
+        }
+        block
     }
 }
 
