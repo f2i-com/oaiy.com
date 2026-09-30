@@ -15,16 +15,33 @@ import { fileURLToPath } from 'node:url';
 
 const ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..', '..', '..');
 
-function build(cwd, outDir) {
+function build(cwd, outDir, env = {}) {
   const vite = path.join(cwd, 'node_modules', 'vite', 'bin', 'vite.js');
   return new Promise((resolve, reject) => {
-    const child = spawn(process.execPath, [vite, 'build', '--outDir', outDir, '--emptyOutDir'], { cwd, stdio: ['ignore', 'pipe', 'pipe'] });
+    const child = spawn(process.execPath, [vite, 'build', '--outDir', outDir, '--emptyOutDir'], { cwd, stdio: ['ignore', 'pipe', 'pipe'], env: { ...process.env, ...env } });
     let output = '';
     child.stdout.on('data', (d) => (output += d));
     child.stderr.on('data', (d) => (output += d));
     child.once('error', reject);
     child.once('close', (code) => (code === 0 ? resolve() : reject(new Error(`vite build failed in ${cwd} (exit ${code}):\n${output.slice(-2000)}`))));
   });
+}
+
+/**
+ * The flow editor built to share flows through a backend at `apiBase` (`VITE_API_BASE`, read at build time): what a `?flow=<hash>` link
+ * opens. Returns its folder and `remove()`. `WEB_E2E_APPS` may hold a `flows-share/` build of it.
+ */
+export async function buildSharingFlows(apiBase) {
+  const given = process.env.WEB_E2E_APPS;
+  if (given) {
+    const dir = path.join(given, 'flows-share');
+    if (!fs.existsSync(path.join(dir, 'index.html'))) throw new Error(`WEB_E2E_APPS: ${dir} holds no build`);
+    return { dir, remove() {} };
+  }
+  const base = fs.mkdtempSync(path.join(os.tmpdir(), 'oaiy-web-e2e-share-'));
+  const dir = path.join(base, 'flows-share');
+  await build(path.join(ROOT, 'platform', 'ui'), dir, { VITE_API_BASE: apiBase });
+  return { dir, remove: () => fs.rmSync(base, { recursive: true, force: true }) };
 }
 
 /** Build the Agent and the flow editor. Returns their folders and `remove()`. */

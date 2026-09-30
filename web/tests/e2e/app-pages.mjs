@@ -7,7 +7,7 @@
  * its own with the recorder on (tests/e2e/local-ranges.mjs), so every request to this computer or its network is seen and refused.
  */
 import { readTemplate, renderHeaders } from '../../scripts/headers.mjs';
-import { buildApps } from './apps.mjs';
+import { buildApps, buildSharingFlows } from './apps.mjs';
 import { browserVersion, launchBrowser, sleep } from './harness.mjs';
 import { startHosts } from './hosts.mjs';
 import { watchLocal } from './local-ranges.mjs';
@@ -21,13 +21,16 @@ export const OAIY_WINDOW = { origin: DESKTOP, token: 'window-token', theme: 'dar
 /** How long a page is given to send whatever it is going to send as it loads (its probes fire in the first moments). */
 export const SETTLE_MS = 3000;
 
+/** Where the flow editor built by addSharing finds its sharing backend: a public name that nothing answers, so a case answers it inside the browser. */
+export const SHARE_API = 'http://share-api.example';
+
 export async function startAppWorld() {
   const apps = await buildApps();
   // The two apps on their own hosts, and each again at the name OAIY's own window is served from: a browser resolves every
   // `*.localhost` name to this computer, so a page at `oaiy.localhost:PORT` is whatever answers on that port. It is not OAIY's window
   // (which has no port and is given the desktop): the cases that show the apps do not take it for one open these two.
-  const hosts = await startHosts({ hostNames: { oaiyAsAgent: 'oaiy.localhost', oaiyflowsAsFlows: 'oaiyflows.localhost' } });
-  const names = ['agent', 'flows', 'providers', 'oaiyAsAgent', 'oaiyflowsAsFlows'];
+  const hosts = await startHosts({ hostNames: { oaiyAsAgent: 'oaiy.localhost', oaiyflowsAsFlows: 'oaiyflows.localhost', flowsShare: 'flowsshare.web.localhost' } });
+  const names = ['agent', 'flows', 'providers', 'oaiyAsAgent', 'oaiyflowsAsFlows', 'flowsShare'];
   const origins = Object.fromEntries(names.map((name) => [name, hosts.origin(name)]));
   const headers = { agent: renderHeaders(readTemplate('agent'), { ...origins, apps: [] }), flows: renderHeaders(readTemplate('flows'), { ...origins, apps: [] }) };
   hosts.setSite('agent', { root: apps.agent, headers: headers.agent });
@@ -37,14 +40,23 @@ export async function startAppWorld() {
   const sites = names.map((name) => `${hosts.host(name)}:${hosts.port}`);
   const browser = await launchBrowser({});
   console.log(`# browser: ${await browserVersion(browser)}`);
+  const later = [];
   return {
     world: { hosts, origins },
     sites,
     browser,
+    headers,
+    /** Builds and serves the flow editor with a sharing backend at SHARE_API (a ?flow=<hash> link opens a flow from it), at the flowsShare host. */
+    async addSharing() {
+      const built = await buildSharingFlows(SHARE_API);
+      later.push(built.remove);
+      hosts.setSite('flowsShare', { root: built.dir, headers: headers.flows });
+    },
     async close() {
       await browser.close();
       await hosts.close();
       apps.remove();
+      for (const remove of later) remove();
     },
   };
 }
@@ -52,12 +64,14 @@ export async function startAppWorld() {
 /**
  * A page of one of the apps, in a browser context of its own with the recorder on.
  * `desktop`: what OAIY's window gives its pages before they run. `storage`: localStorage set before the page runs.
- * `automated`: leave `navigator.webdriver` as the browser has it (true). `refuseAfterMs` and `answer`: see watchLocal. `at`: the host to open it at (`agent`, `flows`, or `oaiyAsAgent` / `oaiyflowsAsFlows`, the
- * app at `oaiy.localhost:PORT` / `oaiyflows.localhost:PORT`: OAIY's names, on a port).
+ * `setup`: run with the browser context before the page opens (routes for what answers inside the browser). `automated`: leave `navigator.webdriver` as the browser has it (true).
+ * `refuseAfterMs` and `answer`: see watchLocal. `at`: the host to open it at (`agent`, `flows`, or `oaiyAsAgent` / `oaiyflowsAsFlows`, the
+ * app at `oaiy.localhost:PORT` / `oaiyflows.localhost:PORT`: OAIY's names, on a port; or `flowsShare`, after `addSharing`).
  */
-export async function openApp(env, app, { desktop = null, storage = {}, path = app === 'agent' ? '/' : '/app.html', refuseAfterMs = 0, answer = null, viewport = { width: 1440, height: 900 }, at = app, automated = false } = {}) {
+export async function openApp(env, app, { desktop = null, storage = {}, path = app === 'agent' ? '/' : '/app.html', refuseAfterMs = 0, answer = null, viewport = { width: 1440, height: 900 }, at = app, automated = false, setup = null } = {}) {
   const context = await env.browser.newContext({ viewport });
   const { attempts, details } = await watchLocal(context, { sites: env.sites, refuseAfterMs, answer });
+  if (setup) await setup(context);
   const errors = [];
   await context.addInitScript(
     ({ desktop, storage, automated }) => {

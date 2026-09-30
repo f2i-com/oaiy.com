@@ -20,7 +20,7 @@
 import assert from 'node:assert/strict';
 import { after, before, describe, it } from 'node:test';
 import { sleep } from '../harness.mjs';
-import { DESKTOP, OAIY, OAIY_WINDOW, appReady as ready, fakeDesktop, healthOf as health, openApp, readStored, seedMediaAddress, seedOaiyLink, seedPairing, startAppWorld } from '../app-pages.mjs';
+import { DESKTOP, OAIY, OAIY_WINDOW, SHARE_API, appReady as ready, fakeDesktop, healthOf as health, openApp, readStored, seedMediaAddress, seedOaiyLink, seedPairing, startAppWorld } from '../app-pages.mjs';
 
 let env;
 
@@ -725,4 +725,51 @@ describe('E5: the flow editor\'s media (the review\'s F4)', () => {
     assert.equal(carried, null, 'nor kept in the project it was saved to');
     await context.close();
   });
+});
+
+describe('E5: a flow that a shared link brings (?flow=) arrives without the run outputs its author left in its nodes', () => {
+  // The flow editor built with a sharing backend (SHARE_API), which the browser answers with a shared flow whose nodes carry addresses on
+  // this computer and its network. In OAIY's own window and in a tab linked to a desktop the guard on media addresses lets them through, so
+  // what keeps the page from asking them as the flow opens is that they are not in the flow it kept.
+  const MEDIA = ['http://192.168.77.7:8188/view?filename=shared-a.png', 'http://192.168.77.8/shared-b.png', 'http://127.0.0.1:8188/view?filename=shared-c.mp4'];
+  const now = '2026-01-01T00:00:00Z';
+  const node = (id, type, x, data) => ({ id, type, position: { x, y: 40 }, data });
+  const share = {
+    id: 1, hash_view: 'HASH123', hash_edit: null, title: 'A shared flow', created_at: now, updated_at: now,
+    flow_json: { flows: [{ id: 'sf', name: 'Shared flow', createdAt: now, updatedAt: now, graph: { nodes: [
+      node('a', 'output', 40, { label: 'a', outputValue: MEDIA[0] }),
+      node('b', 'image_view', 380, { label: 'b', imageUrl: MEDIA[1] }),
+      node('c', 'video_save', 720, { label: 'c', videoUrl: MEDIA[2] }),
+    ], edges: [] } }], settings: {}, constants: [] },
+  };
+  const backend = (context) => context.route((url) => url.hostname === new URL(SHARE_API).hostname, (route) => {
+    const found = new URL(route.request().url()).pathname === '/api/flows/HASH123';
+    return route.fulfill({ status: found ? 200 : 404, contentType: 'application/json', headers: { 'access-control-allow-origin': '*' }, body: JSON.stringify(found ? share : {}) });
+  });
+
+  before(async () => {
+    await env.addSharing();
+  });
+
+  for (const [name, how] of [['OAIY\'s own window', { desktop: OAIY_WINDOW }], ['a tab linked to a desktop', { storage: { 'oaiy.desktopLinked': '1' } }], ['a visitor\'s tab', {}]]) {
+    it(`${name}: the shared flow is opened and kept without the addresses in its nodes, and none of them is asked`, async () => {
+      const { context, page, attempts, errors } = await open('flows', { at: 'flowsShare', path: '/app.html?flow=HASH123', setup: backend, ...how });
+      await ready('flows', page);
+      const kept = await page.evaluate(() => {
+        const project = JSON.parse(localStorage.getItem('oaiy_project') ?? 'null');
+        return project ? { name: project.name, untrusted: project.untrusted, nodes: (project.flows?.[0]?.graph?.nodes ?? []).map((n) => ({ id: n.id, keys: Object.keys(n.data ?? {}).sort() })) } : null;
+      });
+      assert.equal(kept?.name, 'A shared flow', 'the flow came from the backend and was kept');
+      assert.equal(kept.untrusted, true, 'as an untrusted one');
+      assert.deepEqual(kept.nodes, [{ id: 'a', keys: ['label'] }, { id: 'b', keys: ['label'] }, { id: 'c', keys: ['label'] }], 'without the run outputs');
+      await page.waitForFunction(() => document.querySelectorAll('.react-flow__node').length >= 3, null, { timeout: 15_000 }).catch(async () => {
+        await page.locator('text=Shared flow').first().click({ timeout: 5000 }).catch(() => {});
+      });
+      await sleep(2000);
+      assert.equal(await page.locator('.react-flow__node').count(), 3, 'the flow is on the canvas');
+      assert.deepEqual(attempts.filter((a) => MEDIA.some((url) => a === `GET ${url}`)), [], `none of its addresses was asked: ${attempts.join(', ')}`);
+      assert.deepEqual(errors, []);
+      await context.close();
+    });
+  }
 });
