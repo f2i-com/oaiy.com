@@ -1,14 +1,17 @@
 //! The differential test: in `legacy` mode (the default), every route that existed before the access model is
 //! answered exactly as the guard of commit 2ea1ee8 answered it.
 //!
-//! Two routers are built from the same stub routes (one for every route of the table that existed before the
-//! model, each answering `200 ok`). One has the live guard of the listener in front of it: `access_guard` with
-//! the access mode `legacy`, as `serve` builds it. The other has the frozen copy of the old guard
-//! (`frozen_guard.rs`). Every request of a large matrix goes to both, and status, content type and body must be
-//! identical. The matrix is generated from the route table:
+//! Two routers are built from the same stub routes: the routes of the real router (the scan of the source that
+//! `route_coverage` holds to the table) that existed before the model, each answering `200 ok` to exactly the
+//! methods the real router registers on it. One has the live guard of the listener in front of it:
+//! `access_guard` with the access mode `legacy`, as `serve` builds it. The other has the frozen copy of the old
+//! guard (`frozen_guard.rs`). Every request of a large matrix goes to both, and status, every header but `date`
+//! and the body must be identical. The matrix is generated from the route table:
 //!
-//! - every route of the table with `since: 1`, by every method it has (a `HEAD` for each `GET`), with concrete
-//!   path parameters (the old predicates look at prefixes and suffixes);
+//! - every standard method (`GET`, `HEAD`, `POST`, `PUT`, `PATCH`, `DELETE`, `OPTIONS`) to every path the
+//!   table knows, so that the methods a route has, the methods it does not have (`405` after the guard) and the
+//!   methods the table adds to a route that existed before (`DELETE /api/bridge/pairing`) are all asked, with
+//!   concrete path parameters (the old predicates look at prefixes and suffixes);
 //! - credentials: none, the configured token, a wrong one, the process-internal token, a real paired token, a
 //!   wrong paired-looking one, a token of the new grammar, an empty bearer, a lowercase scheme and a doubled
 //!   space;
@@ -23,7 +26,7 @@ use std::sync::{Arc, Mutex};
 use axum::body::Body;
 use axum::http::{Method, Request};
 use axum::middleware;
-use axum::routing::any;
+use axum::routing::{any, MethodRouter};
 use axum::Router;
 use tower::ServiceExt;
 
@@ -48,43 +51,72 @@ fn concrete(pattern: &str) -> String {
         .join("/")
 }
 
-/// Every route that existed before the access model, answering `200 ok` to any method.
+async fn ok() -> &'static str {
+    "ok"
+}
+
+/// The routes of the real router (the scan of the source, the same one `route_coverage` holds to the table)
+/// that existed before the access model, each answering `200 ok` to exactly the methods the real router
+/// registers on it and `405` to the others, as the real router does after the guard. A route that only the
+/// model adds is left out: the new guard judges those, by design, and a request for one is then a path that
+/// does not exist, which both guards must treat alike.
 fn stub_routes() -> Router {
-    let mut patterns: Vec<&str> = ROUTES
-        .iter()
-        .filter(|r| r.since == 1)
-        .map(|r| r.pattern)
-        .collect();
-    patterns.sort_unstable();
-    patterns.dedup();
+    static STUBS: std::sync::OnceLock<Router> = std::sync::OnceLock::new();
+    STUBS.get_or_init(build_stub_routes).clone()
+}
+
+fn build_stub_routes() -> Router {
+    let mut methods = std::collections::BTreeMap::<String, std::collections::BTreeSet<Verb>>::new();
+    for f in crate::auth::route_coverage::scan_main_router().found {
+        if crate::auth::routes::pattern_existed_before(&f.pattern) {
+            methods.entry(f.pattern).or_default().insert(f.verb);
+        }
+    }
     let mut app = Router::new();
-    for p in patterns {
-        app = app.route(p, any(|| async { "ok" }));
+    for (pattern, verbs) in methods {
+        let mut method_router = if verbs.contains(&Verb::Any) {
+            any(ok)
+        } else {
+            MethodRouter::new()
+        };
+        for v in verbs {
+            method_router = match v {
+                Verb::Get => method_router.get(ok),
+                Verb::Post => method_router.post(ok),
+                Verb::Put => method_router.put(ok),
+                Verb::Patch => method_router.patch(ok),
+                Verb::Delete => method_router.delete(ok),
+                Verb::Any => method_router,
+            };
+        }
+        app = app.route(&pattern, method_router);
     }
     app
 }
 
-/// Where a request is sent: `(method, path)` for every method of every old route, and a `HEAD` for each `GET`.
+/// Every path pattern the table knows, old or new, as a request path.
+fn all_patterns() -> Vec<String> {
+    let mut patterns: Vec<String> = ROUTES.iter().map(|r| concrete(r.pattern)).collect();
+    patterns.sort_unstable();
+    patterns.dedup();
+    patterns
+}
+
+/// Where a request is sent: every standard method to every path the table knows (so the methods a route has,
+/// the methods it does not have, and the methods the table adds to an old route are all asked), and paths that
+/// do not exist.
 fn requests() -> Vec<(Method, String)> {
     let mut out = Vec::new();
-    for r in ROUTES.iter().filter(|r| r.since == 1) {
-        let path = concrete(r.pattern);
-        let methods: Vec<Method> = match r.method {
-            Verb::Get => vec![Method::GET, Method::HEAD],
-            Verb::Post => vec![Method::POST],
-            Verb::Put => vec![Method::PUT],
-            Verb::Patch => vec![Method::PATCH],
-            Verb::Delete => vec![Method::DELETE],
-            Verb::Any => vec![
-                Method::GET,
-                Method::HEAD,
-                Method::POST,
-                Method::PUT,
-                Method::PATCH,
-                Method::DELETE,
-            ],
-        };
-        for m in methods {
+    for path in all_patterns() {
+        for m in [
+            Method::GET,
+            Method::HEAD,
+            Method::POST,
+            Method::PUT,
+            Method::PATCH,
+            Method::DELETE,
+            Method::OPTIONS,
+        ] {
             out.push((m, path.clone()));
         }
     }
@@ -156,11 +188,13 @@ fn frozen(gui: bool, token: Option<&str>, pairing: crate::bridge::PairingHandle)
     ))
 }
 
-/// What an answer is, for comparing.
+/// What an answer is, for comparing: the status, every header but `date` (sorted, so an added or a changed
+/// header is a difference) and the body.
 #[derive(Debug, PartialEq, Eq)]
 struct Answer {
     status: u16,
     content_type: Option<String>,
+    headers: Vec<(String, String)>,
     body: Vec<u8>,
 }
 
@@ -189,6 +223,18 @@ async fn ask(
         .get("content-type")
         .and_then(|v| v.to_str().ok())
         .map(str::to_owned);
+    let mut headers: Vec<(String, String)> = response
+        .headers()
+        .iter()
+        .filter(|(n, _)| n.as_str() != "date")
+        .map(|(n, v)| {
+            (
+                n.as_str().to_owned(),
+                String::from_utf8_lossy(v.as_bytes()).into_owned(),
+            )
+        })
+        .collect();
+    headers.sort();
     let body = axum::body::to_bytes(response.into_body(), 1 << 20)
         .await
         .unwrap()
@@ -196,6 +242,7 @@ async fn ask(
     Answer {
         status,
         content_type,
+        headers,
         body,
     }
 }
@@ -231,7 +278,7 @@ async fn in_legacy_mode_every_route_that_existed_before_the_access_model_is_answ
     let (pairing, paired) = a_paired_token();
     let internal = crate::internal_token().to_string();
     assert!(!internal.is_empty(), "the process has an internal token");
-    let credentials: Vec<Option<String>> = vec![
+    let credentials: Arc<Vec<Option<String>>> = Arc::new(vec![
         None,
         Some(format!("Bearer {STATIC_TOKEN}")),
         Some("Bearer wrong-token".into()),
@@ -242,37 +289,68 @@ async fn in_legacy_mode_every_route_that_existed_before_the_access_model_is_answ
         Some("Bearer ".into()),
         Some(format!("bearer {STATIC_TOKEN}")),
         Some(format!("Bearer  {STATIC_TOKEN}")),
-    ];
-    let requests = requests();
+    ]);
+    let requests = Arc::new(requests());
     assert!(
-        requests.len() > 250,
+        requests.len() > 1400,
         "{} requests per combination",
         requests.len()
     );
+    // The methods the table adds to a route that existed before are asked: the class of mistake that a table
+    // row with `since: 2` on an old pattern makes (`DELETE /api/bridge/pairing` next to the old `GET`/`POST`).
+    for r in ROUTES
+        .iter()
+        .filter(|r| r.since == 2 && crate::auth::routes::pattern_existed_before(r.pattern))
+    {
+        assert!(
+            requests.contains(&(
+                Method::from_bytes(r.method.as_str().as_bytes()).unwrap_or(Method::GET),
+                concrete(r.pattern)
+            )),
+            "{} is not asked",
+            r.key()
+        );
+    }
 
-    let mut compared = 0usize;
-    let mut statuses = std::collections::BTreeMap::<u16, usize>::new();
-    let mut differences = Vec::new();
+    let mut tasks = Vec::new();
     for gui in [true, false] {
         for token in [Some(STATIC_TOKEN), None] {
             let (new, old) = (
                 live(gui, token, pairing.clone()),
                 frozen(gui, token, pairing.clone()),
             );
-            for (method, path) in &requests {
-                for credential in &credentials {
-                    for origin in ORIGINS {
-                        let a = ask(&new, method, path, credential.as_deref(), origin).await;
-                        let b = ask(&old, method, path, credential.as_deref(), origin).await;
-                        compared += 1;
-                        *statuses.entry(b.status).or_default() += 1;
-                        if a != b && differences.len() < 20 {
-                            differences.push(format!("gui={gui} token={token:?} {method} {path} auth={credential:?} origin={origin:?}: live {} {:?} / old {} {:?}", a.status, String::from_utf8_lossy(&a.body), b.status, String::from_utf8_lossy(&b.body)));
+            let (requests, credentials) = (requests.clone(), credentials.clone());
+            tasks.push(tokio::spawn(async move {
+                let mut compared = 0usize;
+                let mut statuses = std::collections::BTreeMap::<u16, usize>::new();
+                let mut differences = Vec::new();
+                for (method, path) in requests.iter() {
+                    for credential in credentials.iter() {
+                        for origin in ORIGINS {
+                            let a = ask(&new, method, path, credential.as_deref(), origin).await;
+                            let b = ask(&old, method, path, credential.as_deref(), origin).await;
+                            compared += 1;
+                            *statuses.entry(b.status).or_default() += 1;
+                            if a != b && differences.len() < 20 {
+                                differences.push(format!("gui={gui} token={token:?} {method} {path} auth={credential:?} origin={origin:?}: live {} {:?} {:?} / old {} {:?} {:?}", a.status, a.headers, String::from_utf8_lossy(&a.body), b.status, b.headers, String::from_utf8_lossy(&b.body)));
+                            }
                         }
                     }
                 }
-            }
+                (compared, statuses, differences)
+            }));
         }
+    }
+    let mut compared = 0usize;
+    let mut statuses = std::collections::BTreeMap::<u16, usize>::new();
+    let mut differences = Vec::new();
+    for task in tasks {
+        let (c, s, d) = task.await.unwrap();
+        compared += c;
+        for (status, n) in s {
+            *statuses.entry(status).or_default() += n;
+        }
+        differences.extend(d);
     }
     assert!(
         differences.is_empty(),
@@ -280,8 +358,8 @@ async fn in_legacy_mode_every_route_that_existed_before_the_access_model_is_answ
         differences.len(),
         differences.join("\n")
     );
-    // The matrix reached both families of answer: it is not comparing two refusals.
-    assert!(compared > 100_000, "{compared} answers compared");
+    // The matrix reached every family of answer: it is not comparing two refusals.
+    assert!(compared > 600_000, "{compared} answers compared");
     assert!(
         statuses.get(&200).copied().unwrap_or(0) > 20_000,
         "{statuses:?}"
@@ -291,6 +369,10 @@ async fn in_legacy_mode_every_route_that_existed_before_the_access_model_is_answ
         "{statuses:?}"
     );
     assert!(statuses.contains_key(&404), "{statuses:?}");
+    assert!(
+        statuses.get(&405).copied().unwrap_or(0) > 20_000,
+        "the methods a route does not have are asked: {statuses:?}"
+    );
 }
 
 #[tokio::test]

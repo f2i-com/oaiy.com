@@ -2269,6 +2269,13 @@ fn claims_router(mode: AccessMode) -> (Router, Arc<Guard>) {
 async fn in_legacy_mode_the_new_guard_claims_exactly_the_routes_the_model_adds() {
     let (app, _guard) = claims_router(AccessMode::Legacy);
     let (mut claimed, mut left_alone) = (0, 0);
+    // The patterns that existed before the model, worked out here from the rows and not from the helper the
+    // guard uses.
+    let old_patterns: std::collections::BTreeSet<&str> = ROUTES
+        .iter()
+        .filter(|r| r.since == 1)
+        .map(|r| r.pattern)
+        .collect();
     for r in ROUTES {
         for m in methods(r.method) {
             let req = Request::builder()
@@ -2278,7 +2285,13 @@ async fn in_legacy_mode_the_new_guard_claims_exactly_the_routes_the_model_adds()
                 .unwrap();
             let response = app.clone().oneshot(req).await.unwrap();
             let claims = response.headers().get("x-claims").unwrap() == "1";
-            assert_eq!(claims, r.since == 2, "{m} {}: since {}", r.pattern, r.since);
+            assert_eq!(
+                claims,
+                r.since == 2 && !old_patterns.contains(r.pattern),
+                "{m} {}: since {}",
+                r.pattern,
+                r.since
+            );
             if claims {
                 claimed += 1
             } else {
@@ -2305,6 +2318,59 @@ async fn in_legacy_mode_the_new_guard_claims_exactly_the_routes_the_model_adds()
         let response = app.clone().oneshot(req).await.unwrap();
         assert_eq!(response.headers().get("x-claims").unwrap(), "0", "{m} {p}");
     }
+}
+
+#[tokio::test]
+async fn f1_in_legacy_mode_a_method_the_table_adds_to_an_old_route_is_the_old_guards_not_the_new_ones(
+) {
+    // `DELETE /api/bridge/pairing` is a row with `since: 2` on the pattern of the old `GET` and `POST`
+    // `/api/bridge/pairing`: every method of an old route keeps the guard the route always had.
+    let (app, _guard) = claims_router(AccessMode::Legacy);
+    for m in [
+        Method::GET,
+        Method::HEAD,
+        Method::POST,
+        Method::PUT,
+        Method::PATCH,
+        Method::DELETE,
+        Method::OPTIONS,
+    ] {
+        let req = Request::builder()
+            .method(m.clone())
+            .uri("/api/bridge/pairing")
+            .body(Body::empty())
+            .unwrap();
+        let response = app.clone().oneshot(req).await.unwrap();
+        assert_eq!(
+            response.headers().get("x-claims").unwrap(),
+            "0",
+            "{m} /api/bridge/pairing is an old route"
+        );
+    }
+    // Every row of that kind is on an old pattern, and there is at least the one the reviewer found.
+    let on_old_pattern: Vec<String> = ROUTES
+        .iter()
+        .filter(|r| {
+            r.since == 2
+                && ROUTES
+                    .iter()
+                    .any(|o| o.since == 1 && o.pattern == r.pattern)
+        })
+        .map(|r| r.key())
+        .collect();
+    assert!(
+        on_old_pattern.contains(&"DELETE /api/bridge/pairing".to_string()),
+        "{on_old_pattern:?}"
+    );
+    // In scoped mode the same request is the new guard's.
+    let (scoped, _g) = claims_router(AccessMode::Scoped);
+    let req = Request::builder()
+        .method(Method::DELETE)
+        .uri("/api/bridge/pairing")
+        .body(Body::empty())
+        .unwrap();
+    let response = scoped.oneshot(req).await.unwrap();
+    assert_eq!(response.headers().get("x-claims").unwrap(), "1");
 }
 
 #[tokio::test]

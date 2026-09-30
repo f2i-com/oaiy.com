@@ -51,7 +51,7 @@ use super::host::{
 use super::mode::{AccessMode, Exposure};
 use super::presets::App;
 use super::principal::{Principal, PrincipalKind};
-use super::routes::{lookup, route_class, Class, DeskRole, Verb};
+use super::routes::{lookup, pattern_existed_before, route_class, Class, DeskRole, Verb};
 use super::scopes::is_dangerous;
 use super::store::{AuthError, AuthStore};
 use super::token;
@@ -567,7 +567,8 @@ impl Guard {
 
     /// Whether this guard decides the request (see the module documentation): always in `scoped` and
     /// `shadow`; in `legacy` only for a route the access model adds. A request for a route that existed
-    /// before, and a request for a route that does not exist, are the old guard's.
+    /// before (any method of it: a method the table adds to an old route is the old guard's too), and a
+    /// request for a route that does not exist, are the old guard's.
     pub fn claims(&self, req: &Request) -> bool {
         if self.mode.is_enforcing() {
             return true;
@@ -578,7 +579,8 @@ impl Guard {
         let Some(verb) = Verb::of_method(req.method()) else {
             return false;
         };
-        lookup(verb, matched.as_str()).is_some_and(|row| row.since == 2)
+        lookup(verb, matched.as_str())
+            .is_some_and(|row| row.since == 2 && !pattern_existed_before(matched.as_str()))
     }
 
     fn note(&self, event: &str, ip: &str, host: &str) {

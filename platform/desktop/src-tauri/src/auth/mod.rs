@@ -46,6 +46,6 @@ mod conformance;
 #[cfg(test)]
 mod guard_tests;
 #[cfg(test)]
-mod route_coverage;
+pub(crate) mod route_coverage;
 #[cfg(test)]
 mod store_tests;

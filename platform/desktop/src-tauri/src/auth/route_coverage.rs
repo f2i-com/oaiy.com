@@ -306,7 +306,7 @@ pub(super) fn strip_test_items(t: &[Token]) -> (Vec<Token>, Vec<String>) {
 // ---------------------------------------------------------------------------------------------
 
 #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
-pub(super) struct Found {
+pub(crate) struct Found {
     pub file: String,
     pub line: usize,
     pub verb: Verb,
@@ -421,7 +421,7 @@ fn route_verbs(arg: &[Token]) -> Result<Vec<Verb>, String> {
 
 /// Everything the scan found and everything it could not follow.
 #[derive(Debug, Default)]
-pub(super) struct Scan {
+pub(crate) struct Scan {
     pub found: Vec<Found>,
     pub problems: Vec<String>,
 }
@@ -608,7 +608,7 @@ fn source_files() -> Vec<(String, String)> {
 }
 
 /// The scan of the real source, with the routes that are not on the main router taken out.
-fn scan_main_router() -> Scan {
+pub(crate) fn scan_main_router() -> Scan {
     let mut s = scan(&source_files());
     let listed: BTreeSet<(&str, &str)> = NOT_ON_MAIN_ROUTER.iter().copied().collect();
     let mut seen = BTreeSet::new();

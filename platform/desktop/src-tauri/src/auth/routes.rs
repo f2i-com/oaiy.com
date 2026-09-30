@@ -633,6 +633,21 @@ pub fn lookup(method: Verb, pattern: &str) -> Option<&'static Route> {
         .copied()
 }
 
+/// Whether any method of the route `pattern` has a row with `since: 1`: the route existed before the access
+/// model, so the guard that was always in front of it stays in front of every method of it, including a
+/// method the table adds later (`DELETE /api/bridge/pairing` next to the old `GET` and `POST`).
+pub fn pattern_existed_before(pattern: &str) -> bool {
+    static OLD: OnceLock<std::collections::HashSet<&'static str>> = OnceLock::new();
+    OLD.get_or_init(|| {
+        ROUTES
+            .iter()
+            .filter(|r| r.since == 1)
+            .map(|r| r.pattern)
+            .collect()
+    })
+    .contains(pattern)
+}
+
 /// What a request for `method` on the matched route `matched_path` takes. `OPTIONS` is public for
 /// every path (the CORS layer answers it); a method the API does not serve, and a route with no
 /// row, are [`Class::Unclassified`], which every caller must refuse.
