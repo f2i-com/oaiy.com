@@ -108,14 +108,15 @@ mod tests {
     /// moment a caller rings. (There is no window to make here, so the functions' own text is what is read.)
     #[test]
     fn a_ring_shows_the_window_and_flashes_its_button_and_never_focuses_it() {
-        let source = include_str!("tray.rs");
+        // (Read with its line endings as LF: a checkout on Windows, where git converts them, has CRLF, and the search below is for "\n}\n".)
+        let source = include_str!("tray.rs").replace("\r\n", "\n");
         let start = source.find("pub fn show_main_for_a_ring").expect("the function");
         let end = source[start..].find("\n}\n").expect("its end") + start;
         let body = &source[start..end];
         assert!(!body.contains("set_focus"), "{body}");
         assert!(body.contains("request_user_attention") && body.contains(".show()") && body.contains("unminimize"), "{body}");
         // What the ring's notifier calls is that function, and not the one that focuses.
-        let notify = include_str!("notify.rs");
+        let notify = include_str!("notify.rs").replace("\r\n", "\n");
         let of = notify.find("pub fn of(app: AppHandle) -> Self").expect("GuiRing::of");
         let of_end = notify[of..].find("\n    }\n").expect("its end") + of;
         let of_body = &notify[of..of_end];
