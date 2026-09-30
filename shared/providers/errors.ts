@@ -47,6 +47,11 @@ export interface ErrorContext {
   pageOrigin?: string;
   /** The provider's own words, when it sent any. */
   detail?: string;
+  /**
+   * Say the address as its origin only. For a message an app will read: the base path of an address can hold an account or a tenant id,
+   * and the list an app is given shows it no more than the host.
+   */
+  omitAddressPath?: boolean;
 }
 
 function isLocalType(type: ProviderType): boolean {
@@ -130,7 +135,7 @@ export function describeConnectionError(kind: ConnectionErrorKind, context: Erro
         ? `${who} is too busy to answer (429). Wait a moment and test again.${detail}`
         : `${who} is refusing requests for now (429). On a new account this usually means no credit or billing is set up; otherwise it is a rate limit. Check billing and usage in the ${who} console, then test again.${detail}`;
     case 'not-found':
-      return `Nothing answered at ${context.url} (404). Check the address: it should be the server’s base, such as ${local ? LOCAL_SERVERS[context.serverKind ?? 'ollama'].baseUrl : CLOUD_BASE[context.type] ?? 'https://…/v1'}, without /chat/completions at the end.${detail}`;
+      return `Nothing answered at ${context.omitAddressPath ? originOf(context.url) : context.url} (404). Check the address: it should be the server’s base, such as ${local ? LOCAL_SERVERS[context.serverKind ?? 'ollama'].baseUrl : CLOUD_BASE[context.type] ?? 'https://…/v1'}, without /chat/completions at the end.${detail}`;
     case 'server':
       return `${who} had an error of its own (${status ?? 'server error'}). Try again in a moment.${detail}`;
     case 'http':

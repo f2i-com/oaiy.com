@@ -350,6 +350,15 @@ const MUTATIONS = [
     files: { 'web/providers/src/protocol.ts': [{ find: 'const idle = mine.filter(([, c]) => !inUse(c))', replace: 'const idle = mine.filter(() => true)' }] },
     caught: ['one that was used lately, or has a request open, is never closed to make room'],
   },
+  {
+    name: 'L3 a 404 says the whole address',
+    what: 'the words an app reads for a 404 (fetch, and the model list) carry the base path, which can hold an account id',
+    tests: ['tests/unit/address-text.test.mjs'],
+    files: {
+      'shared/providers/errors.ts': [{ find: 'Nothing answered at ${context.omitAddressPath ? originOf(context.url) : context.url} (404).', replace: 'Nothing answered at ${context.url} (404).' }],
+    },
+    caught: ['a service on the internet: through fetch, models and test', 'a server on this computer: through fetch, models and test'],
+  },
   // Leaks the scans must find. They put the key where a scan of TEXT does not look (the reviewer's two: a Uint8Array, and reversed).
   {
     name: 'H1 leak: list returns the key as a Uint8Array',

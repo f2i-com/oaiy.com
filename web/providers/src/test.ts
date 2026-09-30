@@ -101,7 +101,7 @@ export function createTester(deps: TesterDeps): Tester {
       ? { model: record.model, max_tokens: 1, messages: [{ role: 'user', content: 'Say OK.' }] }
       : { model: record.model, max_tokens: 1, messages: [{ role: 'user', content: 'Say OK.' }], tools: [DUMMY_TOOL], tool_choice: 'none' };
     const guarded = guardedFetch(record, deps.fetchImpl, deps.take);
-    const context = { type: providerTypeOf(record), serverKind: record.serverKind, url: record.baseUrl, pageOrigin: deps.page.origin };
+    const context = { type: providerTypeOf(record), serverKind: record.serverKind, url: record.baseUrl, pageOrigin: deps.page.origin, omitAddressPath: deps.providerText !== 'scrubbed' };
     let response: Response;
     try {
       const url = buildRequestUrl(record, path, 'POST');

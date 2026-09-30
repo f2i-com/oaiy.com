@@ -148,9 +148,11 @@ function readOllamaTags(body: unknown): ModelInfo[] | null {
 async function getJson(
   url: string,
   headers: Record<string, string>,
-  context: Omit<ErrorContext, 'url'>,
+  listContext: Omit<ErrorContext, 'url'>,
   options: ListModelsOptions,
 ): Promise<unknown> {
+  // Where the words are for an app (`providerText: 'omit'`), the address in them is its origin only: the base path can hold an account id.
+  const context: Omit<ErrorContext, 'url'> = options.providerText === 'omit' ? { ...listContext, omitAddressPath: true } : listContext;
   const page = options.page ?? currentPage();
   if (isBlockedMixedContent(url, page.protocol)) {
     throw new ProviderConnectionError('mixed-content', describeConnectionError('mixed-content', { ...context, url, pageOrigin: page.origin }));

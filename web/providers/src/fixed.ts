@@ -40,7 +40,8 @@ export function fixedStatusText(status: number): string {
 /** The fixed body an app gets for an error status, in the shape its dialect's clients read. */
 export function fixedErrorBody(record: ProviderRecord, status: number): Uint8Array {
   const kind = kindForStatus(status);
-  const message = describeConnectionError(kind, { type: providerTypeOf(record), serverKind: record.serverKind, url: record.baseUrl }, status);
+  // The address in the words is its origin only: the base path can hold an account or a tenant id, and the list gives an app the host alone.
+  const message = describeConnectionError(kind, { type: providerTypeOf(record), serverKind: record.serverKind, url: record.baseUrl, omitAddressPath: true }, status);
   const body =
     record.dialect === 'anthropic'
       ? { type: 'error', error: { type: kind, message } }
