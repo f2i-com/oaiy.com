@@ -1049,9 +1049,11 @@ mod unix {
         assert!(good > 0, "the victim never read its own value");
     }
 
+    /// A FIFO, made by the system's `mkfifo` (it is on every Unix this crate builds for, macOS included, where `mknodat` is not), with mode 0600.
     fn make_fifo(path: &Path) {
-        use rustix::fs::{mknodat, FileType, Mode, CWD};
-        mknodat(CWD, path, FileType::Fifo, Mode::RUSR | Mode::WUSR, 0).unwrap();
+        let status = std::process::Command::new("mkfifo").arg(path).status().expect("mkfifo runs");
+        assert!(status.success(), "mkfifo failed");
+        fs::set_permissions(path, fs::Permissions::from_mode(0o600)).unwrap();
     }
 
     /// A FIFO with a perfectly good mode in place of a key file: opening it for reading blocks until someone opens it for writing, so a store that opens the
