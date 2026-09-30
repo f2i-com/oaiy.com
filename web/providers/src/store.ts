@@ -16,6 +16,18 @@ export interface StoreEnv {
   channel?: { postMessage(message: unknown): void; addEventListener(type: 'message', listener: () => void): void; close(): void } | null;
 }
 
+/**
+ * A key is stored for a provider and cannot be opened (site data was cleared in part, or the stored item is damaged). A request that would
+ * have carried it is refused, not sent with no key: a provider that needs one answers 401 and the person is told the key is wrong, when
+ * the key is only unreadable; and a server that needs none is not the one the person set up with a key.
+ */
+export class KeyUnreadable extends Error {
+  constructor() {
+    super('The key saved for this provider cannot be read. Open the Providers page and enter it again.');
+    this.name = 'KeyUnreadable';
+  }
+}
+
 export type SaveResult =
   | { ok: true; record: ProviderRecord }
   | { ok: false; code: 'invalid'; errors: Record<string, string> }
@@ -27,7 +39,7 @@ export interface ProviderStore {
   /** What a page may be told: everything but the key. */
   summaries(): Promise<ProviderSummary[]>;
   hasKey(id: string): Promise<boolean>;
-  /** The key itself, for the holder's own requests. It never leaves this origin. */
+  /** The key itself, for the holder's own requests. It never leaves this origin. `''` when none is stored; `KeyUnreadable` when one is and cannot be opened. */
   key(id: string): Promise<string>;
   /** Add (no `id`) or edit. `key` is set only when given; changing where a keyed record points needs the key typed again. */
   save(input: RecordInput, key?: string): Promise<SaveResult>;
@@ -76,9 +88,13 @@ export function createStore(db: Db, vault: ListableVault, env: StoreEnv): Provid
     async summaries() {
       const [records, names] = await Promise.all([list(), vault.names().catch(() => [] as string[])]);
       const keyed = new Set(names);
-      return records.map(
-        (r): ProviderSummary => ({ id: r.id, name: r.name, dialect: r.dialect, host: hostOf(r.baseUrl), caps: [...r.caps], model: r.model ?? null, hasKey: keyed.has(providerKeyName(r.id)), kind: r.kind, locked: false }),
-      );
+      // A key that is stored and cannot be opened says so, rather than "key stored": the person is asked to enter it again.
+      const unreadable = new Set(await vault.unreadable(records.map((r) => providerKeyName(r.id)).filter((n) => keyed.has(n))).catch(() => [] as string[]));
+      return records.map((r): ProviderSummary => {
+        const summary: ProviderSummary = { id: r.id, name: r.name, dialect: r.dialect, host: hostOf(r.baseUrl), caps: [...r.caps], model: r.model ?? null, hasKey: keyed.has(providerKeyName(r.id)), kind: r.kind, locked: false };
+        if (unreadable.has(providerKeyName(r.id))) summary.keyUnreadable = true;
+        return summary;
+      });
     },
 
     async hasKey(id) {
@@ -86,7 +102,12 @@ export function createStore(db: Db, vault: ListableVault, env: StoreEnv): Provid
     },
 
     async key(id) {
-      return (await vault.get([providerKeyName(id)]))[providerKeyName(id)] ?? '';
+      const name = providerKeyName(id);
+      const value = (await vault.get([name]))[name];
+      if (value !== undefined) return value;
+      // Nothing came back: no key was ever saved (a server that needs none), or one was and cannot be opened. The two are not the same request.
+      if ((await vault.names()).includes(name)) throw new KeyUnreadable();
+      return '';
     },
 
     async save(input, key) {

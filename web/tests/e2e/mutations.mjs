@@ -180,6 +180,27 @@ const MUTATIONS = [
     files: { 'shared/providers/adapters.ts': [{ find: "kind: config.type === 'local' || onThisNetwork ? 'local-server' : 'external',", replace: "kind: config.type === 'local' ? 'local-server' : 'external'," }] },
     caught: ['Agent config: http on this network (192.168)', 'an Agent custom provider at http://192.168.1.5 is a server on this network'],
   },
+  {
+    name: 'F12 an unreadable key is an empty one',
+    what: 'a key that is stored and cannot be opened is read as no key, so the request goes out without it',
+    tests: ['tests/unit/unreadable-key.test.mjs'],
+    files: { 'web/providers/src/store.ts': [{ find: 'if ((await vault.names()).includes(name)) throw new KeyUnreadable();', replace: '' }] },
+    caught: ['is refused when a request would carry it', 'is refused by models, test and probe as well', 'the store\'s own reads say so'],
+  },
+  {
+    name: 'F12 an unreadable key is "key stored"',
+    what: 'the list does not say a key is unreadable',
+    tests: ['tests/unit/unreadable-key.test.mjs'],
+    files: { 'web/providers/src/store.ts': [{ find: 'if (unreadable.has(providerKeyName(r.id))) summary.keyUnreadable = true;', replace: '' }] },
+    caught: ['is said to be unreadable in the list, not "stored"'],
+  },
+  {
+    name: 'F12 a vault with no key opens everything',
+    what: 'a vault whose key is gone reports no unreadable key',
+    tests: ['tests/unit/unreadable-key.test.mjs'],
+    files: { 'web/providers/src/vault.ts': [{ find: "        if (e instanceof VaultError && e.code === 'damaged') return stored;", replace: "        if (e instanceof VaultError && e.code === 'damaged') return [];" }] },
+    caught: ['is what a vault whose key is gone leaves'],
+  },
   // Leaks the scans must find. They put the key where a scan of TEXT does not look (the reviewer's two: a Uint8Array, and reversed).
   {
     name: 'H1 leak: list returns the key as a Uint8Array',

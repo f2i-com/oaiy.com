@@ -13,7 +13,7 @@ import type { Budget } from './budget';
 import { fixedErrorBody, fixedStatusText, safeResponseHeaders } from './fixed';
 import { BodyRefused, capOutputTokens, maxBodyBytes } from './limits';
 import { bodyBytes, budgetMessage, classifyFailure, type PageInfo } from './net';
-import type { ProviderStore } from './store';
+import { KeyUnreadable, type ProviderStore } from './store';
 
 export interface FetcherDeps {
   store: ProviderStore;
@@ -43,6 +43,8 @@ export function createFetcher(deps: FetcherDeps): Fetcher {
         headers = recordHeaders(record, key, request.headers ?? []);
       } catch (e) {
         if (e instanceof RequestRefused) return fail(e.code, e.message);
+        // A key that is saved and cannot be opened: the request is not made without it (nothing leaves, nothing is counted).
+        if (e instanceof KeyUnreadable) return fail('key-unreadable', e.message);
         return fail('internal', 'The request could not be made.');
       }
 

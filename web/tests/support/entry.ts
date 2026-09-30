@@ -12,6 +12,7 @@ export * as records from '../../providers/src/records';
 export * as store from '../../providers/src/store';
 export * as tester from '../../providers/src/test';
 export * as vault from '../../providers/src/vault';
+export * as words from '../../providers/src/words';
 export * as sharedProtocol from '@oaiy/shared/broker/protocol';
 export * as sharedVault from '@oaiy/shared/secrets/vault';
 export * as endpoints from '@oaiy/shared/providers/endpoints';

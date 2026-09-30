@@ -14,6 +14,7 @@ import { fill, h } from './dom';
 import type { Context } from './context';
 import { loadPresets, inputFromPreset, withOrigin, type Preset } from './presets';
 import { createTester } from './test';
+import { keyText } from './words';
 import type { ProviderRecord, ServerKind } from '@oaiy/shared/providers/types';
 import type { TestResult } from '@oaiy/shared/broker/protocol';
 
@@ -103,7 +104,7 @@ export function mountManage(root: HTMLElement, ctx: Context): void {
       return h(
         'li',
         { class: 'row' },
-        h('div', { class: 'grow' }, h('strong', { text: s.name }), h('span', { class: 'chip', text: KIND_LABEL[s.kind] ?? s.kind }), h('br'), h('span', { class: 'fine', text: `${s.host} · ${s.model ?? 'no model chosen'}${record.modelChosenBy && s.model ? ` (chosen by ${record.modelChosenBy})` : ''} · ${s.hasKey ? 'key stored' : 'no key'}` }), result),
+        h('div', { class: 'grow' }, h('strong', { text: s.name }), h('span', { class: 'chip', text: KIND_LABEL[s.kind] ?? s.kind }), h('br'), h('span', { class: 'fine', text: `${s.host} · ${s.model ?? 'no model chosen'}${record.modelChosenBy && s.model ? ` (chosen by ${record.modelChosenBy})` : ''} · ${keyText(s)}` }), result),
         h('div', { class: 'actions' }, check, h('button', { class: 'button', text: 'Edit', on: { click: () => openForm(record) } }), remove),
       );
     });

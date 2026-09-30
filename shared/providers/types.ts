@@ -120,6 +120,11 @@ export interface ProviderSummary {
   caps: ProviderCap[];
   model: string | null;
   hasKey: boolean;
+  /**
+   * Present, and `true`, when a key IS stored and cannot be opened (site data was cleared in part, or the stored item is damaged). A request
+   * for this provider is refused (`key-unreadable`) rather than sent with no key, and the owner is asked to enter the key again.
+   */
+  keyUnreadable?: true;
   kind: ProviderKind;
   locked: boolean;
 }

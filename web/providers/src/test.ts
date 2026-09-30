@@ -17,6 +17,7 @@ import type { TestResult } from '@oaiy/shared/broker/protocol';
 import type { ProviderRecord } from '@oaiy/shared/providers/types';
 import { BudgetExhausted, budgetMessage, classifyFailure, guardedFetch, type PageInfo, type TakeResult } from './net';
 import { probeContext, type ProbeResult } from './probe';
+import { KeyUnreadable } from './store';
 
 export interface TesterDeps {
   fetchImpl: typeof fetch;
@@ -45,9 +46,17 @@ const DUMMY_TOOL = { type: 'function', function: { name: 'noop', description: 'D
 
 export function createTester(deps: TesterDeps): Tester {
   const budgetResult = (e: BudgetExhausted): TestResult => ({ ok: false, error: { kind: 'budget', message: budgetMessage(e.reason, e.limit, e.byteLimit) } });
+  const unreadableResult = (e: KeyUnreadable): TestResult => ({ ok: false, error: { kind: 'key-unreadable', message: e.message } });
 
   async function models(record: ProviderRecord): Promise<TestResult> {
-    const key = await deps.key(record);
+    let key: string;
+    try {
+      key = await deps.key(record);
+    } catch (e) {
+      // A key that is saved and cannot be opened: nothing is sent, and the person is told to enter it again.
+      if (e instanceof KeyUnreadable) return unreadableResult(e);
+      throw e;
+    }
     let exhausted: BudgetExhausted | null = null;
     const inner = guardedFetch(record, deps.fetchImpl, deps.take);
     const fetchImpl: typeof fetch = async (input, init) => {
@@ -79,7 +88,13 @@ export function createTester(deps: TesterDeps): Tester {
     if (!listed.ok || !record.model) return { ...listed, ...(listed.ok ? { tools: 'unknown' as const } : {}) };
 
     // One tiny request with the chosen model. It proves the model is one this key may use, and says whether it takes tools.
-    const key = await deps.key(record);
+    let key: string;
+    try {
+      key = await deps.key(record);
+    } catch (e) {
+      if (e instanceof KeyUnreadable) return unreadableResult(e);
+      throw e;
+    }
     const anthropic = record.dialect === 'anthropic';
     const path = anthropic ? '/messages' : '/chat/completions';
     const body = anthropic
@@ -111,7 +126,14 @@ export function createTester(deps: TesterDeps): Tester {
   }
 
   async function probe(record: ProviderRecord): Promise<ProbeResult> {
-    const key = await deps.key(record);
+    let key: string;
+    try {
+      key = await deps.key(record);
+    } catch (e) {
+      // Nothing is asked of a server with a key that cannot be opened: a probe with no key is not the request the person set up.
+      if (e instanceof KeyUnreadable) return { contextTokens: null, how: null };
+      throw e;
+    }
     return probeContext(record, key, guardedFetch(record, deps.fetchImpl, deps.take));
   }
 

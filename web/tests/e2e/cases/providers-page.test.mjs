@@ -117,6 +117,54 @@ describe('the Providers page', () => {
     await context.close();
   });
 
+  it('a key that is saved and cannot be opened says so and to enter it again; a check sends nothing; entering it again puts it right', async () => {
+    const { context } = await newContext(browser);
+    const { page } = await newPage(context);
+    await addProvider(page, world.origins.providers, details({ name: 'Damaged key' }));
+    // Damage the stored item as a profile that was partly cleared might: a bit of its ciphertext is flipped.
+    await page.evaluate(async () => {
+      const db = await new Promise((resolve, reject) => {
+        const open = indexedDB.open('oaiy-providers');
+        open.onsuccess = () => resolve(open.result);
+        open.onerror = () => reject(open.error);
+      });
+      const record = await new Promise((resolve) => {
+        const request = db.transaction('vault').objectStore('vault').get('record');
+        request.onsuccess = () => resolve(request.result);
+      });
+      const name = Object.keys(record.items)[0];
+      const ct = new Uint8Array(record.items[name].ct);
+      ct[0] ^= 0xff;
+      record.items[name].ct = ct;
+      await new Promise((resolve, reject) => {
+        const tx = db.transaction('vault', 'readwrite');
+        tx.objectStore('vault').put(record, 'record');
+        tx.oncomplete = resolve;
+        tx.onerror = () => reject(tx.error);
+      });
+      db.close();
+    });
+    await page.reload();
+    const row = page.locator('section[aria-label="Your providers"] li.row');
+    await row.getByText('key unreadable: re-enter it').waitFor({ timeout: 8000 });
+    assert.doesNotMatch(await row.innerText(), /key stored/, 'it is not called stored');
+
+    const asked = () => fake.requests((r) => r.method !== 'OPTIONS' && r.path.startsWith('/v1/')).length;
+    const before = asked();
+    await row.getByRole('button', { name: 'Check' }).click();
+    await row.locator('.result.bad', { hasText: 'cannot be read' }).waitFor({ timeout: 8000 });
+    assert.match(await row.locator('.result').innerText(), /enter it again/i);
+    assert.equal(asked(), before, 'the check sent nothing, with the key or without it');
+
+    const form = await editProvider(page, 'Damaged key');
+    await form.locator('input[type=password]').fill(KEY);
+    await form.getByRole('button', { name: 'Save changes' }).click();
+    await row.getByText('key stored').waitFor({ timeout: 8000 });
+    await row.getByRole('button', { name: 'Check' }).click();
+    await row.locator('.result.good').waitFor({ timeout: 10000 });
+    await context.close();
+  });
+
   it('each app has an hourly limit, shown with its usage and changed only here', async () => {
     const { context } = await newContext(browser);
     const { page } = await newPage(context);

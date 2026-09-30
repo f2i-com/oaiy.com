@@ -12,6 +12,7 @@ import { fill, h } from './dom';
 import type { Context } from './context';
 import { createTester } from './test';
 import { describe } from './ui';
+import { keyText } from './words';
 import type { ProviderRecord } from '@oaiy/shared/providers/types';
 
 export function mountEmbed(root: HTMLElement, ctx: Context): void {
@@ -72,7 +73,7 @@ export function mountEmbed(root: HTMLElement, ctx: Context): void {
         return h(
           'li',
           { class: 'row' },
-          h('div', { class: 'grow' }, h('strong', { text: s.name }), h('br'), h('span', { class: 'fine', text: `${s.host} · ${s.model ?? 'no model chosen'}${record.modelChosenBy && s.model ? ` (chosen by ${record.modelChosenBy})` : ''} · ${s.hasKey ? 'key stored' : 'no key'}` }), status),
+          h('div', { class: 'grow' }, h('strong', { text: s.name }), h('br'), h('span', { class: 'fine', text: `${s.host} · ${s.model ?? 'no model chosen'}${record.modelChosenBy && s.model ? ` (chosen by ${record.modelChosenBy})` : ''} · ${keyText(s)}` }), status),
           h('div', { class: 'actions' }, select, load, use, test),
         );
       }),

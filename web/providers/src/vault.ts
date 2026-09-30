@@ -31,6 +31,8 @@ export interface ListableVault extends SecretVault {
   names(): Promise<string[]>;
   /** `damaged` when the wrapping key is gone or does not open the master key (site data was cleared in part): what was sealed cannot be read. */
   health(): Promise<'ok' | 'damaged'>;
+  /** Of the names given, the ones that ARE stored and cannot be opened (a damaged item, or a vault whose key is gone). No value is returned. */
+  unreadable(names: readonly string[]): Promise<string[]>;
 }
 
 const RECORD = 'record';
@@ -229,6 +231,24 @@ export function createDeviceVault(db: Db, env: VaultEnv = { crypto: globalThis.c
         if (e instanceof VaultError && e.code === 'damaged') return 'damaged';
         throw e;
       }
+    },
+
+    async unreadable(names) {
+      await ensure();
+      const record = await readRecord();
+      const stored = [...new Set(names)].filter((n) => typeof n === 'string' && n !== '' && record !== undefined && Object.hasOwn(record.items, n));
+      if (stored.length === 0 || record === undefined) return [];
+      let key: CryptoKey;
+      try {
+        key = (await master()).key;
+      } catch (e) {
+        // Nothing can be opened: every name that is stored is unreadable.
+        if (e instanceof VaultError && e.code === 'damaged') return stored;
+        throw e;
+      }
+      const unreadable: string[] = [];
+      for (const name of stored) if ((await unseal(key, name, record.items[name])) === null) unreadable.push(name);
+      return unreadable;
     },
   };
 }

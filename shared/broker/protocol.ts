@@ -286,6 +286,7 @@ export type ErrorCode =
   | 'bad-body'
   | 'budget'
   | 'locked'
+  | 'key-unreadable'
   | 'timeout'
   | 'aborted'
   | 'network'
