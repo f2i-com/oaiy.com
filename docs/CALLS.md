@@ -254,8 +254,13 @@ agent : "I'll try to reach them, please stay with me."  (it is trying: it does n
   will be in touch"), a visit ("the owner will be there on Tuesday"), a link or a menu ("I'll put you through to the menu",
   "I'll connect you with our online booking page"), or a transfer of something else ("I'll transfer the booking to
   Wednesday", "I'll forward your call details to the owner") is never touched: the take-a-message confirmation reaches the
-  caller as written. `transfer.rs` holds the corpus (more than sixty ordinary lines that must pass, and the promises that must
-  still be caught). When a line is swapped the app is told, truthfully, with `call.line_replaced {wanted, said}` (the
+  caller as written. A verb that also takes a thing ("forward you the invoice", "put you on to our online form", "pass you a
+  link", "I've put you down for Thursday", "I'll transfer you the refund") is a promise only when a person is named after it
+  ("forward you to the owner", "put you on to the manager"); "put you through", "transfer you" and "hand you over" are
+  promises with nothing after them, and "you're through to Dave's Lawn Care" is how a call is answered. False positives are
+  worse than misses: a true line swapped for a hold line is a lie the caller hears. `voice/promise_lines/` holds the corpus,
+  a line to a line: `ordinary.txt` (285 lines, all of which must reach the caller as written) and `promises.txt` (144, all of
+  which must be caught), which a test reads. When a line is swapped the app is told, truthfully, with `call.line_replaced {wanted, said}` (the
   words it sent and the line the caller hears in their place), sent when the line in its place is on its way and never when
   nothing was said (a call that has not begun answers the say with an error and reports no swap): the app takes the
   model's line out of what it counts as said, and its model is told with the caller's next words that the line was not

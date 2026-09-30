@@ -1,0 +1,151 @@
+# What a model writes when it means to hand THIS call to a person: each must be caught, however it is put. One line each; a line that begins with # is a comment.
+# The first part is the final review of the promise filter (G2), the rest is this branch's own.
+# this branch's own: the same promises with the words a model uses for them, and the ones that name a person after a verb that also takes a thing
+I'll transfer you to the owner now.
+I'm going to connect you with the owner.
+Hold on, I'm going to transfer you to the boss.
+Ill transfer you to the manager now
+Im going to put you through to the owner
+Im gonna put you through to the owner
+Ive put you through to the owner
+Ive transferred you to the manager.
+Sure, ill connect you with the owner.
+im about to connect you to the manager
+I'll forward your call to the owner.
+I'll forward you to the owner.
+Let me forward you to the manager.
+I'm forwarding you to the owner now.
+I'm forwarding your call to the manager.
+I've forwarded your call to the owner.
+I have forwarded you to the manager.
+Let me put you on to the owner.
+I'll put you onto the manager now.
+I'm putting you on to the owner.
+I've put you on to the owner.
+Let me pass you on to the manager.
+I'll pass you along to the owner.
+I'm passing you on to the owner now.
+I've passed you on to the manager.
+I have passed your call on to the owner.
+You'll be passed on to the owner.
+You will be passed to the manager.
+You'll be forwarded to the owner shortly.
+Your call will be forwarded to the manager.
+Your call is being forwarded to the owner.
+Your call has been forwarded to the owner.
+Your call will be passed on to the owner.
+Your call has been put through to the owner.
+You are through to the owner.
+You're through to the manager now.
+You are through to a real person.
+I'm passing you over to the owner.
+I'll hand you over to the manager.
+I've handed you over to the owner.
+Let me hand your call over to the owner.
+I'll put your call through to the owner.
+I'll patch you through to the boss.
+I've patched you through to the owner.
+The owner will take your call once I confirm your name.
+The owner will take your call after I have your number.
+The manager will take your call when I've noted your name.
+Please hold, I'm connecting your call to the owner.
+Just a moment, I'm transferring your call to the manager now.
+One moment while I put you through to the owner.
+Hold on while I get the owner on the line.
+# the coordinator's six
+I'm transferring you now.
+Connecting you now.
+I'll put you through to the owner.
+I'll get the owner on the line for you.
+You will be connected in a moment.
+The owner will take your call now.
+# the earlier corpus
+Sure, I'm transferring you to the owner now.
+I'll transfer you now.
+Let me put you through to the owner.
+Transferring you now.
+I'll connect you to the owner right away.
+Let me connect you.
+I will transfer you.
+I'll put you through.
+You'll be connected in a moment.
+You will be transferred shortly.
+Please hold while I transfer your call.
+Please hold while I connect your call.
+The owner is coming to the phone.
+Putting you through now.
+Transferring your call.
+One moment while I patch you through.
+Passing you over to the owner.
+Handing you over.
+Connecting you now, one moment.
+CONNECTING YOU
+connecting  you
+Trans-ferring you
+Okay, I'm going to put you through to the manager.
+Alright, let me hand you over to the owner.
+I've put you through.
+You are now connected to the owner.
+The manager will be with you shortly.
+Hold on, I'm getting the owner for you.
+Of course. Connecting your call now.
+I can't hear you well, so let me transfer you.
+# new
+Please hold while I transfer you.
+One moment, I'm putting you through now.
+I'll get him on the phone for you.
+I'm going to transfer your call to the owner.
+You'll be put through shortly.
+Your call is being transferred.
+I have transferred you.
+Alright, connecting you to the owner.
+Let me connect you to the manager once I have your name.
+Please hold, I'll put you through after I take your name.
+I'll transfer you once I've checked the diary.
+I'll put you through to the owner after this.
+The owner will take your call once I confirm your name.
+The owner will take your call after I have your number.
+The owner will be with you shortly.
+The manager will be right with you.
+You will be speaking to the owner in a moment.
+You'll be speaking with the manager shortly.
+CONNECTING YOU NOW TO THE OWNER
+I'LL PUT YOU THROUGH TO THE OWNER
+sure hold on ill put you through to the owner now
+I’ll put you through to the owner.
+Ill put you through to the owner
+I`ll put you through to the owner.
+I'll put you through to the owner!
+Transferring you now to the owner.
+I'm just going to transfer you now.
+Let me get the owner on the line for you.
+I'll bring the owner to the phone.
+Hang on, I'm patching you through.
+I'm forwarding your call to the owner.
+I'm handing you over to the manager.
+Let me put you through to the boss.
+The owner will be right with you.
+The owner will take the call now.
+Connecting your call.
+Just a moment while I connect you.
+Thanks for waiting, I'm connecting you to the owner now.
+Great, I'll put you through to the owner now.
+One second, I'm putting your call through.
+Just a moment, I'll get the owner on the line.
+OK let me transfer you to the boss.
+Hold the line, I'm transferring you to the manager.
+I am connecting you with the owner.
+The owner is picking up the phone now.
+The owner is now on the line.
+The owner will speak with you now.
+You are through to the owner.
+You're through.
+Please wait while I put your call through to the owner.
+I'll be transferring you shortly.
+Let me just patch you through to the owner.
+Sure thing, passing you over to the owner.
+# mixed clauses
+Sorry for the wait, I'm connecting you now.
+I can't say how long, but I'm transferring you now.
+I'll take your name first and then I'll put you through to the owner.
+The owner is busy on a job, but I'm putting you through now.
