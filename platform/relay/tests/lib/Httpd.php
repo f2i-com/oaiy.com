@@ -113,9 +113,9 @@ final class Httpd
                     break;
                 }
             }
-            $c .= "Mutex file:\"$dir\"\nUser " . (function_exists('posix_getpwuid') ? (string)(posix_getpwuid(posix_geteuid())['name'] ?? 'nobody') : 'nobody') . "\n";
+            $c .= "DefaultRuntimeDir \"$dir\"\nMutex \"file:$dir\" default\n"; // everything the server writes stays in the test's own folder
         }
-        foreach (['authn_core', 'authz_core', 'authz_host', 'access_compat', 'rewrite', 'headers', 'setenvif', 'version', 'dir', 'mime', 'unixd'] as $m) {
+        foreach (['authn_core', 'authz_core', 'authz_host', 'access_compat', 'rewrite', 'headers', 'setenvif', 'version', 'dir', 'unixd'] as $m) {
             if (is_file($mods . '/mod_' . $m . '.so')) {
                 $c .= "LoadModule {$m}_module \"$mods/mod_$m.so\"\n";
             }

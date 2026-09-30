@@ -441,8 +441,8 @@ design's vectors and against FormLogic's own known answers, the sealed tokens of
 - The framed stream was tested against `php -S` on Windows only. How a real host's web server, PHP-FPM, LiteSpeed or a CDN buffers
   it, and how they report a client that hung up, was not tried: the calibration's probe is what decides, on your host.
 
-- `public/.htaccess` and the deny-all files were run through a real Apache 2.4.65 (WAMP's, static files, on Windows: which files are
-  refused and served under each layout, `tests/cases/htaccess.php`), but **not** with PHP behind it (the rewrite to `index.php` and
+- `public/.htaccess` and the deny-all files were run through a real Apache 2.4.65 (WAMP's, on Windows) and 2.4.58 (Ubuntu 24.04 under
+  WSL 2), static files: which files are refused and served under each layout, `tests/cases/htaccess.php`; **not** with PHP behind it (the rewrite to `index.php` and
   the `Authorization` pass-through), not on Apache 2.2 and not on LiteSpeed. The nginx snippet above was **not** run through nginx or
   PHP-FPM. Those are written from the design and from general knowledge of those servers; the doctor's exposure and Authorization
   probes are the check to use on your host.
