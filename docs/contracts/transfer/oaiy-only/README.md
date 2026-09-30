@@ -1,7 +1,7 @@
 # What OAIY adds to `transfer_v1`
 
 The folder above (`docs/contracts/transfer/`) is the Aokie repository's `docs/contracts/transfer/`, byte for
-byte, as of its commit `f34dda204a193f08b514988efede2a8b7a35e069`: the contract in `transfer-v1.md`, the fixtures both
+byte, as of its commit `49c46d81b0d422c6b5707cb7fbd207af6f3912e4`: the contract in `transfer-v1.md`, the fixtures both
 programs are tested against, and `SHA256SUMS`.
 Nothing in it is edited here. `node scripts/check-transfer-contract.mjs` checks the sums, and, with
 `AOKIE_TRANSFER_CONTRACTS` set to Aokie's copy of the folder, that the two are identical. When Aokie changes

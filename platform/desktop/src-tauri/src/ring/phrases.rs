@@ -498,7 +498,7 @@ mod tests {
         let positives = cases(OAIY_EXTRA, "positive");
         let negatives = cases(OAIY_EXTRA, "negative");
         // (What only this desktop counts or refuses: none of it is in the shared fixture, whose cases are not repeated here.)
-        assert!(positives.len() >= 42 && negatives.len() >= 52, "{} {}", positives.len(), negatives.len());
+        assert!(positives.len() >= 33 && negatives.len() >= 37, "{} {}", positives.len(), negatives.len());
         // (Compared as written, lower-cased: a case that differs only in what the shared normaliser reads past, such as a zero width space, is
         // this desktop's own to keep.)
         let shared_turns: std::collections::BTreeSet<String> = ["positive", "negative"].iter().flat_map(|group| cases(SHARED, group)).map(|turns| turns.iter().map(|t| t.to_lowercase()).collect::<Vec<_>>().join(" | ")).collect();
