@@ -7813,6 +7813,56 @@ fn the_kinds_of_the_dry_run_are_the_ones_its_describers_build() {
     }
 }
 
+/// The parts refuse to be misused, at once: a part that the kind does not have, a fixed part after a sample, fixed parts out of the kind's
+/// order or said twice, and a kind that is not in the table are mistakes of whoever wrote a describer, and stop it (every kind is built by a
+/// test, so a mistake is found before it is shipped).
+mod parts_are_not_misused {
+    use super::super::parts::Parts;
+
+    #[test]
+    #[should_panic(expected = "is not a fixed part of it")]
+    fn a_fixed_part_the_kind_does_not_have() {
+        let _ = Parts::new("trigger").fixed("nonsense", "x");
+    }
+
+    #[test]
+    #[should_panic(expected = "is not a sample part of it")]
+    fn a_sample_part_the_kind_does_not_have() {
+        let _ = Parts::new("trigger").sample("nonsense", "x");
+    }
+
+    #[test]
+    #[should_panic(expected = "comes before every sample")]
+    fn a_fixed_part_after_a_sample() {
+        let _ = Parts::new("trigger").sample("condition", "x").fixed("mode", "x");
+    }
+
+    #[test]
+    #[should_panic(expected = "out of its place or said twice")]
+    fn fixed_parts_out_of_the_order_of_the_kind() {
+        let _ = Parts::new("trigger").fixed("runs", "x").fixed("mode", "x");
+    }
+
+    #[test]
+    #[should_panic(expected = "out of its place or said twice")]
+    fn a_fixed_part_said_twice() {
+        let _ = Parts::new("trigger").fixed("mode", "x").fixed("mode", "y");
+    }
+
+    #[test]
+    #[should_panic(expected = "has no kind of thing called")]
+    fn a_kind_that_is_not_in_the_table() {
+        let _ = Parts::new("nonsense");
+    }
+
+    #[test]
+    fn what_is_in_order_is_said_in_order_and_an_empty_part_says_nothing() {
+        let item = Parts::new("trigger").fixed("mode", "Runs in the mode async.").fixed("state", "").fixed("runs", "Runs the flow \"f\".").sample("condition", "Only if x.").item(super::RestoreClass::Flows, "triggers.json", "t1");
+        assert_eq!(item.what, "Runs in the mode async. Runs the flow \"f\". Only if x.");
+        assert_eq!(item.parts.iter().map(|p| (p.label.as_str(), p.fixed)).collect::<Vec<_>>(), [("mode", true), ("state", true), ("runs", true), ("condition", false)]);
+    }
+}
+
 /// The source files of the backup module that are not tests, with `\n` line ends.
 fn backup_sources() -> Vec<(String, String)> {
     let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src/backup");
@@ -8249,9 +8299,12 @@ fn a_file_of_the_desktop_that_hides_text_is_not_brought_back_and_one_that_only_u
         ("callers.json", format!(r#"{{"contacts":[{{"number":"1","note":"Prefers texts{escaped}"}}]}}"#)),
         ("setup.json", serde_json::json!({ "plugins": { format!("p{}", "\u{200B}".repeat(5)): { "permissionsAccepted": ["calls"] } } }).to_string()),
         ("control.json", "{\"agentMayChange\":false}".to_string()),
+        ("agent.json", serde_json::json!({ "model": { "source": format!("chatgpt{}", "\u{200B}".repeat(5)) } }).to_string()),
+        ("services-autostart.json", serde_json::json!([format!("rig{}", "\u{200B}".repeat(5))]).to_string()),
+        ("flows/bom.json", format!("\u{FEFF}{}", flow(&format!("Look things up{hidden}")))),
     ];
     let items = inspect_desktop_files(&files, false);
-    for (name, path) in [("flows/bad.json", "oaiyTool.description"), ("templates/bad.json", "description"), ("triggers.json", "[0].condition"), ("connectors/bad.json", "name"), ("callers.json", "contacts[0].note"), ("setup.json", "a key of plugins.")] {
+    for (name, path) in [("flows/bad.json", "oaiyTool.description"), ("templates/bad.json", "description"), ("triggers.json", "[0].condition"), ("connectors/bad.json", "name"), ("callers.json", "contacts[0].note"), ("setup.json", "a key of plugins."), ("agent.json", "model.source"), ("services-autostart.json", "[0]"), ("flows/bom.json", "oaiyTool.description")] {
         let said = what_of(&items, name);
         assert!(said.starts_with("Not brought back: it hides text (") && said.contains(path), "{name}: {said}");
         assert_eq!(items.iter().filter(|i| i.name == name).count(), 1, "nothing else is said of {name}");
@@ -8267,11 +8320,11 @@ fn a_file_of_the_desktop_that_hides_text_is_not_brought_back_and_one_that_only_u
     craft(&file, &manifest_for(&refs), &refs, true);
     let dst = TempDir::new("hides-dst");
     let staged = restore::stage(&dst.0, &file, PASS, &Ticks::all(), &options()).unwrap();
-    for name in ["flows/bad.json", "templates/bad.json", "triggers.json", "connectors/bad.json", "callers.json", "setup.json"] {
-        assert!(staged.skipped.iter().any(|n| n.contains(&format!("{name} was not brought back")) && n.contains("it hides text")), "{name}: {:?}", staged.skipped);
-    }
+    // (Nine files are left out: eight are named, and the ninth is counted, as a class of notes is.)
+    assert_eq!(staged.skipped.iter().filter(|n| n.contains(" was not brought back") && n.contains("it hides text")).count(), 8, "{:?}", staged.skipped);
+    assert!(staged.skipped.iter().any(|n| n == "1 more note of this kind (files not brought back) is not listed here."), "{:?}", staged.skipped);
     assert!(matches!(restore::apply_pending(&dst.0), ApplyOutcome::Applied(_)));
-    for name in ["flows/bad.json", "templates/bad.json", "triggers.json", "connectors/bad.json", "callers.json", "setup.json"] {
+    for name in ["flows/bad.json", "templates/bad.json", "triggers.json", "connectors/bad.json", "callers.json", "setup.json", "agent.json", "services-autostart.json", "flows/bom.json"] {
         assert!(!dst.0.join(name).exists(), "{name} hides text and was brought back");
     }
     assert!(dst.0.join("flows/good.json").exists() && dst.0.join("control.json").exists(), "what hides nothing comes back");
