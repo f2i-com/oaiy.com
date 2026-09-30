@@ -930,10 +930,13 @@ pub(crate) fn clean_staged(data_dir: &Path, files_root: &Path, names: &[String],
                     Ok(bytes)
                 }))
             }
-            (Some(Category::Providers), _) if !ticks.keys => Some(read(&path).and_then(|b| {
-                super::sanitize::providers_without_keys(&b).map(|(c, removed)| {
+            (Some(Category::Providers), _) => Some(read(&path).and_then(|b| {
+                super::sanitize::providers_for_restore(&b, ticks.keys).map(|(c, removed, cleaned)| {
                     if removed > 0 {
                         notes.push(format!("{removed} API key(s) in the provider list were left out: you did not tick the keys."));
+                    }
+                    if cleaned > 0 {
+                        notes.push(format!("{cleaned} address{} in the provider list held a name and password, or a key, which a backup never brings back: {} saved without {}; enter {} again as the provider's key.", if cleaned == 1 { "" } else { "es" }, if cleaned == 1 { "it was" } else { "they were" }, if cleaned == 1 { "it" } else { "them" }, if cleaned == 1 { "it" } else { "them" }));
                     }
                     c
                 })

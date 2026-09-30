@@ -565,8 +565,9 @@ export const DO_NOT_CONTACT = `${OUTREACH}do-not-contact.json`;
 /**
  * The most numbers a restore adds to the list of numbers not to be contacted (the desktop hands over no more than this, and the page
  * holds to it). It counts the numbers that are ADDED, not the numbers that are read: a number already on the list does not use it up,
- * so a list of more than this is added a part at a time, and never stops short of a number that is new. (A list of a person's opt-outs
- * that runs to tens of thousands is a real one; a restore that could not take it all would leave someone who opted out to be contacted.)
+ * so a number that is new is added however many that are here come before it. (A list of a person's opt-outs that runs to tens of
+ * thousands is a real one; the desktop hands over no more than this many unique numbers of a file, so one of more is cut before it
+ * reaches the page, and the result says how many were left out.)
  */
 export const MAX_DO_NOT_CONTACT_ADDED = 50_000;
 /** The list of campaigns. */
@@ -640,6 +641,8 @@ function pendingFrom(value: unknown, limits: Limits): PendingParse {
  * a key (`api_key`, `key`, `token`, `sig`, `code`, or a name nobody has thought of). The desktop's table holds the same list.
  */
 export const SAFE_QUERY_NAMES: readonly string[] = ['api-version', 'api_version'];
+/** What the value of such a parameter may be (the desktop's table holds the same rule): letters, digits, `-`, `_` and `.`, at most 40. */
+const SAFE_QUERY_VALUE = /^[A-Za-z0-9._-]{0,40}$/;
 
 /**
  * An address as a backup may hold it: with no name or password before the host, no fragment, and in its query nothing but the
@@ -654,12 +657,13 @@ export function addressWithoutCredentials(raw: string): { address: string; chang
   } catch {
     return { address: raw, changed: false };
   }
-  const foreign = [...url.searchParams.keys()].filter((name) => !SAFE_QUERY_NAMES.includes(name.toLowerCase()));
-  if (!url.username && !url.password && !url.hash && foreign.length === 0) return { address: raw, changed: false };
+  // A parameter goes unless it is the version of an API with a plain value (`api-version=sk-…` is a key with a name on it).
+  const foreign = new Set([...url.searchParams].filter(([name, value]) => !SAFE_QUERY_NAMES.includes(name.toLowerCase()) || !SAFE_QUERY_VALUE.test(value)).map(([name]) => name));
+  if (!url.username && !url.password && !url.hash && foreign.size === 0) return { address: raw, changed: false };
   url.username = '';
   url.password = '';
   url.hash = '';
-  for (const name of new Set(foreign)) url.searchParams.delete(name);
+  for (const name of foreign) url.searchParams.delete(name);
   return { address: url.toString(), changed: true };
 }
 

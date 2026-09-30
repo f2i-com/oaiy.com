@@ -1012,3 +1012,22 @@ fn a_restore_that_was_not_ticked_for_the_calendar_makes_the_sync_send_nothing() 
         let _ = std::fs::remove_dir_all(dir);
     }
 }
+/// An appointment made here has an id of the shape the calendar makes, whichever way it is made: by a person, and by a record that
+/// FormLogic has (pulled here), or a call the phone recorded. (A restore takes an appointment only with an id of that shape, so an
+/// appointment of a person's own must have one: the ids of the two are one function.)
+#[test]
+fn every_appointment_made_here_has_an_id_of_the_shape_a_restore_takes() {
+    let (cal, dir) = calendar();
+    let by_hand = cal.create(new_appt("Cut", "2026-10-02T14:00", "Sam")).unwrap();
+    assert!(crate::calendar::is_appointment_id(&by_hand.id), "{}", by_hand.id);
+    let (fake, base) = formlogic();
+    fake.lock().unwrap().add(formlogic_answers("Colour", "2026-10-03", "10:00", "Ali"));
+    run(&cal, &base).unwrap();
+    let all = cal.list(None, None);
+    assert_eq!(all.len(), 2, "the record FormLogic has is pulled here");
+    for a in &all {
+        assert!(crate::calendar::is_appointment_id(&a.id), "{} ({})", a.id, a.source);
+    }
+    assert!(all.iter().any(|a| a.source == "formlogic"), "one of them came from FormLogic");
+    let _ = std::fs::remove_dir_all(dir);
+}

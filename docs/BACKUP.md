@@ -437,6 +437,11 @@ writes such an address without it (no name or password, no fragment, and in the 
 version of an API, such as `?api-version=2024-02-01`, which an Azure address needs), says so in the
 backup's warnings ("enter it again as its key"), and the desktop's table refuses to bring back an
 address that has one (the dry run lists it under what is not restored). The keys box is for the key.
+The desktop's own provider list (`ai/providers.json`, which a backup holds only when the keys box is
+ticked) has no key table: when it comes back, an address in it is saved without the name and password,
+the fragment and the parameters of the query (keeping the version of an API), keys ticked or not, and
+the result says how many. What that file holds when it goes *into* a backup is copied as it is, as its
+keys are: with the box ticked, the file is as sensitive as the keys, an address that holds a key included.
 
 ## Restoring
 
@@ -683,10 +688,13 @@ in parts through internal routes with a secret made for that one backup.
   number, and the desktop says how many it counted once and how many it left out); the Agent's
   page then adds the ones that are not already on your list, person by person, in constant time
   each, and **only the numbers it adds count against its own 50,000**, not the ones it reads (a
-  number that is on your list already uses nothing up, so a list of opt-outs that runs to tens of
-  thousands comes back whole, and one beyond that is added a part at a time; what was left out is
-  said): a list of a hundred thousand is a moment's work for it, where comparing each number with
-  the whole list took 40 seconds for 8,000, in a page that opens nothing until it is done.
+  number that is on your list already uses nothing up, so a new number that comes after any number
+  of ones that are here is still added). **A list of up to 50,000 comes back whole; beyond that the
+  rest of the file's numbers are cut, and the result says how many** (the desktop always takes the
+  first 50,000 unique numbers of the file, so restoring the same backup again brings nothing more:
+  the bound is a defence against a hostile file, and it is not a way to restore a list of more in
+  parts). A list of a hundred thousand is a moment's work for the page, where comparing each number
+  with the whole list took 40 seconds for 8,000, in a page that opens nothing until it is done.
   **Agent data** (projects, the brief and knowledge files), **Earlier conversations** (the phone's
   call and text threads, which the receptionist loads as what was said before), **Memory** (what
   the phone's agents remember about people, which they read as instructions) and **Outreach**

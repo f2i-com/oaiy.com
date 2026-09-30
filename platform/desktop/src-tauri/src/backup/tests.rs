@@ -3186,6 +3186,51 @@ fn an_address_that_holds_a_credential_does_not_come_back_and_one_that_names_an_a
     }
 }
 
+/// The same rule for the desktop's own provider list (`ai/providers.json`, which a backup holds only with the keys box, and which has
+/// no key table): an address in it comes back without a name and password, a fragment or a key in its query, with the keys ticked or not,
+/// and the result says how many.
+#[test]
+fn an_address_in_the_provider_list_that_holds_a_credential_comes_back_without_it_whatever_the_keys_box_says() {
+    use super::table::address_without_credentials;
+    for (raw, made) in [
+        ("https://alice:hunter2@gw.example/v1", Some("https://gw.example/v1")),
+        ("https://gw.example/v1?api_key=abc", Some("https://gw.example/v1")),
+        ("https://gw.example/v1?key=a&api-version=2024-02-01&token=b", Some("https://gw.example/v1?api-version=2024-02-01")),
+        ("https://gw.example/v1?api-version=sk-abcdefghijklmnopqrstuvwxyz0123456789ABCD", Some("https://gw.example/v1")),
+        ("https://gw.example/v1#token=abc", Some("https://gw.example/v1")),
+        ("https://:pw@gw.example/v1", Some("https://gw.example/v1")),
+        ("https://gw.example/v1", None),
+        ("https://gw.example/v1?api-version=2024-02-01", None),
+        ("http://127.0.0.1:8080", None),
+        ("not an address", None),
+    ] {
+        assert_eq!(address_without_credentials(raw).as_deref(), made, "{raw}");
+    }
+    let providers = serde_json::json!({ "providers": [
+        { "id": "p1", "name": "Gateway", "baseUrl": "https://alice:hunter2-CANARY@gw.example/v1?api_key=QUERYKEY-CANARY&api-version=2024-02-01", "apiKey": "sk-THE-KEY" },
+        { "id": "p2", "name": "Plain", "baseUrl": "https://plain.example/v1?api-version=2024-02-01", "apiKey": "sk-OTHER-KEY" },
+    ]});
+    let text = providers.to_string();
+    let files: Vec<(&str, &[u8])> = vec![("ai/providers.json", text.as_bytes())];
+    let out = TempDir::new("provider-addresses");
+    let file = out.0.join("p.oaiybackup");
+    craft(&file, &manifest_for(&files), &files, true);
+    for keys in [false, true] {
+        let dst = TempDir::new("provider-addresses-dst");
+        let staged = restore::stage(&dst.0, &file, PASS, &ticks_of(&[RestoreClass::Providers], keys), &options()).unwrap();
+        assert!(matches!(restore::apply_pending(&dst.0), ApplyOutcome::Applied(_)));
+        let got = json_of(&dst.0, "ai/providers.json");
+        let all = got.to_string();
+        for canary in ["hunter2-CANARY", "QUERYKEY-CANARY"] {
+            assert!(!all.contains(canary), "keys {keys}: {all}");
+        }
+        assert_eq!(got["providers"][0]["baseUrl"], "https://gw.example/v1?api-version=2024-02-01", "keys {keys}");
+        assert_eq!(got["providers"][1]["baseUrl"], "https://plain.example/v1?api-version=2024-02-01", "keys {keys}: an address with no credential is as it is");
+        assert_eq!(all.contains("sk-THE-KEY"), keys, "the keys come only with the box");
+        assert!(staged.skipped.iter().any(|n| n.contains("1 address in the provider list held a name and password, or a key")), "keys {keys}: {:?}", staged.skipped);
+    }
+}
+
 /// What is said when nothing of a file comes back is true of it: the reviewer's empty calendar with every tick set said "nothing in it
 /// comes back without its tick (0 settings left out)", which is neither.
 #[test]
@@ -7179,6 +7224,33 @@ fn a_call_campaigns_dry_run_lists_its_opening_line_and_the_voicemail_it_leaves()
     for word in ["Hello, this is a call about your unpaid bill", "Ring 1900 123 456 today", "leave_message", "Ask about the bill"] {
         assert!(said.contains(word), "{word} is said: {said}");
     }
+}
+
+/// A campaign whose description is longer than the dry run says (it is cut, at the end): what comes of the campaign is said before
+/// anything long, so no cut can take it away. Through the dry run, where the cut is made.
+#[test]
+fn what_comes_of_a_campaign_survives_the_cut_of_a_description_that_is_too_long() {
+    let people: Vec<serde_json::Value> = (0..12)
+        .map(|i| serde_json::json!({ "id": format!("p{i}"), "name": format!("Name {i} {}", "n".repeat(60)), "number": format!("+6140000{i:04}"), "state": "done", "notes": "n".repeat(300), "summary": "s".repeat(600), "outcome": "answered", "why": "w".repeat(200), "answers": { "a": "x".repeat(400), "b": "y".repeat(400) }, "fields": { "first_name": "f".repeat(200), "second_name": "g".repeat(200) } }))
+        .collect();
+    let skipped: Vec<serde_json::Value> = (0..12).map(|i| serde_json::json!({ "name": format!("Skipped {i} {}", "k".repeat(150)), "number": format!("+6150000{i:04}"), "why": "z".repeat(300) })).collect();
+    let campaign = serde_json::json!({
+        "id": "long", "kind": "call", "name": "Long", "state": "running", "objective": "o".repeat(4000), "openingLine": "l".repeat(1500), "textTemplate": "t".repeat(1500),
+        "voicemail": "leave_message", "voicemailMessage": "v".repeat(1500), "afterwards": "a".repeat(4000), "identity": { "business": "b".repeat(150), "receptionist": "r".repeat(150) },
+        "collect": (0..30).map(|i| serde_json::json!({ "key": format!("k{i}"), "question": "q".repeat(900), "type": "text" })).collect::<Vec<_>>(),
+        "people": people, "skipped": skipped,
+    });
+    let src = TempDir::new("cut-src");
+    let out = TempDir::new("cut-out");
+    let file = backup_with_agent(&src.0, &out.0, "c.oaiybackup", agent_archive(&[("opfs/front-desk/outreach/long.json", campaign.to_string().as_bytes())]), false);
+    let dst = TempDir::new("cut-dst");
+    let preview = restore::inspect(&dst.0, &file, PASS, &options()).unwrap();
+    let item = preview.items.iter().find(|i| i.name.ends_with("outreach/long.json")).expect("the campaign is listed");
+    let long = super::agentzip::MAX_CAMPAIGN_TEXT;
+    assert!(item.what.chars().count() <= long + 1 && item.what.chars().count() >= long - 200, "the description was cut to what a dry run says: {} characters", item.what.chars().count());
+    assert!(item.what.ends_with('…'), "and it was cut at the end, not at the start");
+    assert!(item.what.contains("It was RUNNING when the backup was made; it comes back PAUSED"), "what comes of the campaign is still there");
+    assert!(item.what.contains("Person 1 ("), "and the first of the people are said before the cut");
 }
 
 // ---- the kinds of tick, on the desktop and on the dashboard -----------------------------------------------

@@ -171,22 +171,31 @@ pub fn calendar_merge(local: Option<&Value>, staged: &Value, ticks: &super::revi
     Ok(CalendarMerge { bytes, notes })
 }
 
-/// The provider list without its API keys. Returns the bytes and how many keys were taken out.
-pub fn providers_without_keys(bytes: &[u8]) -> Result<(Vec<u8>, usize), String> {
+/// The provider list as it may come back: without its API keys unless `keep_keys` (the keys box), and, keys or not, with no
+/// credential in an address (a name and password before the host, a fragment, a key in the query: see
+/// `table::address_without_credentials`; the key of a provider is where a key belongs). Returns the bytes, how many keys were taken
+/// out and how many addresses were cleaned.
+pub fn providers_for_restore(bytes: &[u8], keep_keys: bool) -> Result<(Vec<u8>, usize, usize), String> {
     let mut value = parse(bytes)?;
-    let mut removed = 0;
+    let (mut removed, mut cleaned) = (0, 0);
     if let Some(Value::Array(providers)) = value.get_mut("providers") {
         for p in providers {
             if let Value::Object(o) = p {
-                for key in ["apiKey", "api_key"] {
-                    if o.remove(key).is_some_and(|v| v.as_str().is_some_and(|s| !s.trim().is_empty())) {
-                        removed += 1;
+                if !keep_keys {
+                    for key in ["apiKey", "api_key"] {
+                        if o.remove(key).is_some_and(|v| v.as_str().is_some_and(|s| !s.trim().is_empty())) {
+                            removed += 1;
+                        }
                     }
+                }
+                if let Some(address) = o.get("baseUrl").and_then(Value::as_str).and_then(super::table::address_without_credentials) {
+                    o.insert("baseUrl".to_string(), Value::String(address));
+                    cleaned += 1;
                 }
             }
         }
     }
-    Ok((serde_json::to_vec_pretty(&value).map_err(|_| "it could not be written".to_string())?, removed))
+    Ok((serde_json::to_vec_pretty(&value).map_err(|_| "it could not be written".to_string())?, removed, cleaned))
 }
 
 /// The run journal with only the runs that finished. Returns the bytes and how many lines were left out.

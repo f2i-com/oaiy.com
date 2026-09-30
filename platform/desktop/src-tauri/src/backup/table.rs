@@ -777,10 +777,32 @@ pub const SAFE_QUERY_NAMES: [&str; 2] = ["api-version", "api_version"];
 /// in its query nothing but the version of an API.
 fn holds_no_credential(text: &str) -> bool {
     let Ok(url) = reqwest::Url::parse(text) else { return false };
-    url.username().is_empty()
-        && url.password().is_none()
-        && url.fragment().is_none()
-        && url.query_pairs().all(|(name, value)| SAFE_QUERY_NAMES.contains(&name.to_lowercase().as_str()) && value.len() <= 40 && value.chars().all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.')))
+    url.username().is_empty() && url.password().is_none() && url.fragment().is_none() && url.query_pairs().all(|(name, value)| safe_query_pair(&name, &value))
+}
+
+/// A parameter of a query that may stay: the version of an API, with a plain value (letters, digits, `-`, `_` and `.`, at most 40).
+fn safe_query_pair(name: &str, value: &str) -> bool {
+    SAFE_QUERY_NAMES.contains(&name.to_lowercase().as_str()) && value.len() <= 40 && value.chars().all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.'))
+}
+
+/// An address without what an address must not hold (see [`holds_no_credential`]): the name and password, the fragment and every
+/// parameter of the query but the version of an API are taken out, and the rest stays. `None` when there is nothing to take out (or
+/// it is not an address).
+pub fn address_without_credentials(text: &str) -> Option<String> {
+    if holds_no_credential(text) {
+        return None;
+    }
+    let mut url = reqwest::Url::parse(text).ok()?;
+    let _ = url.set_username("");
+    let _ = url.set_password(None);
+    url.set_fragment(None);
+    let kept: Vec<(String, String)> = url.query_pairs().filter(|(name, value)| safe_query_pair(name, value)).map(|(name, value)| (name.into_owned(), value.into_owned())).collect();
+    if kept.is_empty() {
+        url.set_query(None);
+    } else {
+        url.query_pairs_mut().clear().extend_pairs(kept);
+    }
+    Some(url.to_string())
 }
 
 /// Whether a string is something that must never travel: a key or a value sealed to a computer.

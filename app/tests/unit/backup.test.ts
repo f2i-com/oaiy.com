@@ -403,6 +403,10 @@ describe('exporting the Agent storage', () => {
       ['https://alice:hunter2@gw.example/v1', 'https://gw.example/v1'],
       ['https://alice@gw.example/v1', 'https://gw.example/v1'],
       ['https://:pw@gw.example/v1', 'https://gw.example/v1'],
+      // The version of an API is kept only with a plain value: a key with the name of a version on it is not a version.
+      ['https://gw.example/v1?api-version=sk-abcdefghijklmnopqrstuvwxyz0123456789ABCD', 'https://gw.example/v1'],
+      ['https://gw.example/v1?api-version=a%20b&api_version=2024-02-01', 'https://gw.example/v1?api_version=2024-02-01'],
+      ['https://gw.example/v1?api-version=x%3Dy', 'https://gw.example/v1'],
       ['https://gw.example/v1?api_key=abc', 'https://gw.example/v1'],
       ['https://gw.example/v1?key=a&api-version=2024-02-01&token=b&key=c', 'https://gw.example/v1?api-version=2024-02-01'],
       ['https://gw.example/v1?sig=a#frag', 'https://gw.example/v1'],
@@ -1668,6 +1672,32 @@ describe('the numbers not to be contacted only grow', () => {
     const again = await restore(empty, many);
     expect(list(empty)).toHaveLength(1 + MAX_DO_NOT_CONTACT_ADDED);
     expect(again!.warnings.join('\n')).toContain('9 of the numbers not to be contacted in the backup were left out');
+  });
+
+  it('takes 5,000 adversarial entries into a list of 300,000 in seconds, and takes in only what a list may hold (the reviewer’s V3)', async () => {
+    const here = Array.from({ length: 300_000 }, (_, i) => ({ number: `+61${400_000_000 + i}`, at: 1, why: 'asked' }));
+    const target = new FakeStorage().put(PATH, JSON.stringify(here));
+    const evil: unknown[] = [];
+    for (let i = 0; i < 1000; i++) evil.push({ number: `+61 ${400_000_000 + i}`, at: 1, why: 'a number that is here, written another way' });
+    for (let i = 0; i < 1000; i++) evil.push({ number: '0'.repeat(41) + i, at: 1, why: 'too long' });
+    for (let i = 0; i < 1000; i++) evil.push({ number: `０４９１${String(i).padStart(3, '０')}`, at: 1, why: 'full-width digits' });
+    for (let i = 0; i < 1000; i++) evil.push({ number: `Telstra ${i}`, at: 1, why: 'x'.repeat(100_000) });
+    for (let i = 0; i < 1000; i++) evil.push({ number: `+1 555 ${String(i).padStart(7, '0')}`, at: 1e308, why: '<script>alert(1)</script>' });
+    const desk = fakeDesktop(craft({ [DO_NOT_CONTACT]: JSON.stringify(evil) }), { partSize: 1 << 20 });
+    const started = performance.now();
+    const outcome = await applyPendingRestore(DESKTOP, target, { fetch: desk.fetch });
+    const took = performance.now() - started;
+    expect(outcome!.ok).toBe(true);
+    expect(took).toBeLessThan(6000);
+    const after = list(target);
+    for (const e of after.slice(300_000)) {
+      expect(e.number.length).toBeLessThanOrEqual(40);
+      expect(e.why.length).toBeLessThanOrEqual(300);
+      expect(Number.isFinite(e.at)).toBe(true);
+    }
+    expect(after.filter((e) => e.number === '+61 400000000')).toHaveLength(0);
+    // The 1,000 that were too long are not taken; the others (that are not here) are: 1,000 + 1,000 + 1,000.
+    expect(after.length).toBe(300_000 + 3000);
   });
 
   it('adds nothing beyond what a restore may add at once, and says how many were left out', async () => {
