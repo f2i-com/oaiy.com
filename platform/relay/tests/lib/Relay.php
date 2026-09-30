@@ -56,6 +56,10 @@ final class Relay
     public string $dir;
     public string $data;
     public string $publicUrl = 'http://127.0.0.1:8099';
+    /** A test that puts items in the database by hand sets this, so the counter check at the end of the test skips it. */
+    public bool $countersMayDrift = false;
+    /** @var list<self> the relays made by the running test, checked when it ends */
+    private static array $made = [];
 
     /** True when this run is against a throwaway MySQL or MariaDB (OAIY_TEST_DB), false for the default SQLite. */
     public static function isMysql(): bool
@@ -87,7 +91,74 @@ final class Relay
         // of the rule itself set wait.gap_ms back to 250.
         $r->configure(array_replace_recursive(['wait' => ['gap_ms' => 0]], $config));
         Paths::setDataDir($r->data);
+        self::$made[] = $r;
         return $r;
+    }
+
+    /**
+     * The invariant of section 4.18.5: every mailbox's counters (live items, live bytes and their bulk-lane parts) equal
+     * what a recount of its live items gives. Returns a line for each mailbox that differs.
+     * @return list<string>
+     */
+    public function counterDrift(): array
+    {
+        $db = $this->ctx()->db;
+        $truth = [];
+        foreach ($db->all('SELECT mailbox, lane, COUNT(*) AS c, SUM(size) AS s FROM items WHERE state IN (0, 1) GROUP BY mailbox, lane') as $row) {
+            $m = (string)$row['mailbox'];
+            $t = $truth[$m] ?? [0, 0, 0, 0];
+            $t[0] += (int)$row['c'];
+            $t[1] += (int)$row['s'];
+            if (\Oaiy\Relay\Lanes::isBulk((string)$row['lane'])) {
+                $t[2] += (int)$row['c'];
+                $t[3] += (int)$row['s'];
+            }
+            $truth[$m] = $t;
+        }
+        $bad = [];
+        $seen = [];
+        foreach ($db->all('SELECT id, live_items, live_bytes, bulk_items, bulk_bytes FROM mailboxes') as $row) {
+            $m = (string)$row['id'];
+            $seen[$m] = true;
+            $have = [(int)$row['live_items'], (int)$row['live_bytes'], (int)$row['bulk_items'], (int)$row['bulk_bytes']];
+            $want = $truth[$m] ?? [0, 0, 0, 0];
+            if ($have !== $want) {
+                $bad[] = "$m: counters items/bytes/bulk items/bulk bytes " . implode('/', $have) . ' but a recount gives ' . implode('/', $want);
+            }
+        }
+        foreach ($truth as $m => $t) {
+            if (!isset($seen[$m])) {
+                $bad[] = "$m: live items but no mailbox row";
+            }
+        }
+        return $bad;
+    }
+
+    /** Called by the runner when a test has passed: every relay it made must have counters that match a recount. */
+    public static function verifyCounters(): void
+    {
+        $bad = [];
+        foreach (self::$made as $r) {
+            if ($r->countersMayDrift) {
+                continue;
+            }
+            try {
+                foreach ($r->counterDrift() as $line) {
+                    $bad[] = $line;
+                }
+            } catch (\Throwable $e) {
+                // a test that broke or removed its database on purpose has nothing to recount
+            }
+        }
+        if ($bad) {
+            throw new \AssertionError("mailbox counters drifted from a recount of the live items:\n  " . implode("\n  ", $bad));
+        }
+    }
+
+    /** Called by the runner after every test. */
+    public static function forget(): void
+    {
+        self::$made = [];
     }
 
     /** @param array<string,mixed> $patch recursive merge into config.json */

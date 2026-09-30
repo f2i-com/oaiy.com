@@ -98,6 +98,91 @@ test('4.18.5 a read-then-write transaction that meets another writer\'s commit w
     eq(101, (int)$r->ctx()->db->val("SELECT v FROM meta WHERE k = 'last_gc'"), 'both writes landed');
 });
 
+test('4.18.5 two writers retiring the same rows at once retire them once: the counters equal a recount (an ack racing an ack, on SQLite, MySQL and MariaDB)', function () {
+    $r = Relay::make();
+    $d = $r->desktop();
+    $ctx = $r->ctx();
+    for ($i = 1; $i <= 5; $i++) {
+        $ctx->mb->post($d->inbox(), 'cmd', "item$i", 's', 300, '{}', null, null, str_repeat('x', 10 * $i));
+    }
+    $ready = $r->dir . '/ready';
+    // The child asks to retire the same five items while this process is in the middle of retiring them: it has to wait for
+    // this transaction and then find nothing left. It must not take the five items off the counters a second time.
+    $child = storage_child('
+        $ctx = Oaiy\Relay\Context::open($argv[1]);
+        while (!is_file($argv[2])) { usleep(500); }
+        usleep(150000);
+        $n = $ctx->db->write(fn($db) => $ctx->mb->ackInTx($db, $argv[3], 5, Oaiy\Relay\Clock::now()));
+        echo "retired:", $n;
+    ', [$r->data, $ready, $d->inbox()]);
+    $mine = $ctx->db->write(function (Db $db) use ($ctx, $d, $ready): int {
+        $n = $ctx->mb->ackInTx($db, $d->inbox(), 5, \Oaiy\Relay\Clock::now());
+        file_put_contents($ready, '1');
+        usleep(900000);
+        return $n;
+    });
+    [$out, $err, $code] = storage_wait($child);
+    eq('', $err);
+    eq(0, $code, $out);
+    eq(5, $mine);
+    eq('retired:0', $out, 'the second writer found nothing left to retire');
+    eq([], $r->counterDrift());
+    eq([0, 0], array_map('intval', array_values($r->ctx()->db->one('SELECT live_items, live_bytes FROM mailboxes WHERE id = ?', [$d->inbox()]))));
+});
+
+test('4.18.5 an ack and a sweep of the same items, and a post that sweeps to make room, in parallel processes, leave the counters equal to a recount', function () {
+    $r = Relay::make(['limits' => ['mailboxItems' => 12]]);
+    $d = $r->desktop();
+    $ctx = $r->ctx();
+    $script = $r->dir . '/retirer.php';
+    file_put_contents($script, '<?php
+define("OAIY_RELAY", true);
+require ' . var_export(dirname(__DIR__, 2) . '/src/autoload.php', true) . ';
+$ctx = Oaiy\Relay\Context::open($argv[1]);
+$mode = $argv[3];
+for ($i = 0; $i < 40; $i++) {
+    try {
+        if ($mode === "post") {
+            $ctx->mb->post($argv[2], "cmd", "p" . $i . "-" . random_int(1, 999999), "s", 300, "{}", null, null, "body" . $i);
+        } elseif ($mode === "ack") {
+            $ctx->db->write(fn($db) => $ctx->mb->ackInTx($db, $argv[2], $ctx->mb->highestSeq($argv[2]), Oaiy\Relay\Clock::now()));
+        } else {
+            $ctx->db->write(fn($db) => $ctx->mb->sweepInTx($db, $argv[2], Oaiy\Relay\Clock::now() + 100000));
+        }
+    } catch (Throwable $e) { /* a full mailbox or a busy database is fine here; a wrong counter is not */ }
+    usleep(random_int(0, 3000));
+}
+');
+    $procs = [];
+    foreach (['post', 'post', 'ack', 'ack', 'sweep'] as $mode) {
+        $p = proc_open(array_merge([PHP_BINARY], Server::phpFlags(), ['-d', 'auto_prepend_file=' . dirname(__DIR__) . '/prepend.php', $script, $r->data, $d->inbox(), $mode]), [1 => ['pipe', 'w'], 2 => ['pipe', 'w']], $pipes, null, array_merge(getenv(), ['OAIY_TEST_CLOCK' => Tmp::clockFile()]));
+        $procs[] = [$p, $pipes];
+    }
+    foreach ($procs as [$p, $pipes]) {
+        stream_get_contents($pipes[1]);
+        eq('', trim((string)stream_get_contents($pipes[2])));
+        proc_close($p);
+    }
+    eq([], $r->counterDrift());
+});
+
+test('4.18.5 the counter check of the runner is not vacuous: a counter that is wrong by one is reported, and so is an item without a mailbox row', function () {
+    $r = Relay::make();
+    $d = $r->desktop();
+    $r->ctx()->mb->post($d->inbox(), 'cmd', 'a', 's', 300, '{}', null, null, 'hello');
+    eq([], $r->counterDrift());
+    $db = $r->ctx()->db;
+    $db->exec('UPDATE mailboxes SET live_items = live_items + 1 WHERE id = ?', [$d->inbox()]);
+    eq(1, count($r->counterDrift()));
+    $db->exec('UPDATE mailboxes SET live_items = live_items - 1, live_bytes = live_bytes - 1 WHERE id = ?', [$d->inbox()]);
+    eq(1, count($r->counterDrift()));
+    $db->exec('UPDATE mailboxes SET live_bytes = live_bytes + 1 WHERE id = ?', [$d->inbox()]);
+    eq([], $r->counterDrift());
+    $db->exec('DELETE FROM mailboxes WHERE id = ?', [$d->inbox()]);
+    eq(1, count($r->counterDrift()));
+    $r->countersMayDrift = true; // this test made the drift on purpose
+});
+
 test('4.18.5 an exception inside a write transaction rolls everything back', function () {
     $r = Relay::make();
     $db = $r->ctx()->db;

@@ -143,14 +143,34 @@ final class Mailbox
     }
 
     /**
+     * Take the mailbox row's lock, so that everything that changes this mailbox's counters (a post, an ack, a sweep, a
+     * revocation) is serialised. On SQLite BEGIN IMMEDIATE already holds the whole database and this is a plain read; on
+     * MySQL and MariaDB it is the lock that stops two writers from both counting the same live items and both taking them
+     * off the counters. Always taken before any item row, so the order is the same everywhere and cannot deadlock.
+     * Call inside write(). Returns false when the mailbox has no row (so it has no items either).
+     */
+    public function lockMailbox(Db $db, string $mailbox): bool
+    {
+        return $db->one('SELECT id FROM mailboxes WHERE id = ?' . $db->forUpdate(), [$mailbox]) !== null;
+    }
+
+    /**
      * Retire the live items (state queued or delivered) that match $cond: find them, update them, and take their
      * sizes off the mailbox counters. A mailbox holds at most a few hundred live items, so no paging is needed.
+     *
+     * The mailbox row is locked first and the items are read with a locking read, so a writer that waited for another
+     * retirement of the same rows sees them already retired and takes nothing off the counters a second time (a plain
+     * read on MySQL and MariaDB answers from a snapshot taken before that wait: the counters went negative and the quota
+     * stopped working). The number of rows the UPDATE changed must equal the number counted.
      * @param array<int,mixed> $condArgs
      * @param array<int,mixed> $updateArgs
      */
     private function retireInTx(Db $db, string $mailbox, string $cond, array $condArgs, string $updateSql, array $updateArgs): int
     {
-        $rows = $db->all('SELECT seq, size, lane FROM items WHERE mailbox = ? AND state IN (0, 1) AND ' . $cond, array_merge([$mailbox], $condArgs));
+        if (!$this->lockMailbox($db, $mailbox)) {
+            return 0;
+        }
+        $rows = $db->all('SELECT seq, size, lane FROM items WHERE mailbox = ? AND state IN (0, 1) AND ' . $cond . $db->forUpdate(), array_merge([$mailbox], $condArgs));
         if (!$rows) {
             return 0;
         }
@@ -166,7 +186,9 @@ final class Mailbox
                 $bulkBytes += $r['size'];
             }
         }
-        $db->exec($updateSql, $updateArgs);
+        if ($db->exec($updateSql, $updateArgs) !== $items) {
+            throw new \RuntimeException('retirement changed a different number of items than it counted'); // rolls back: never a wrong counter
+        }
         $db->exec(
             'UPDATE mailboxes SET live_items = live_items - ?, live_bytes = live_bytes - ?, bulk_items = bulk_items - ?, bulk_bytes = bulk_bytes - ? WHERE id = ?',
             [$items, $bytes, $bulkItems, $bulkBytes, $mailbox]

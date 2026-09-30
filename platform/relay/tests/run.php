@@ -139,6 +139,7 @@ foreach ($tests as $t) {
     try {
         \OaiyTest\Registry::current($t['name']);
         ($t['fn'])();
+        \OaiyTest\Relay::verifyCounters(); // after every test: the counters of every relay it made equal a recount
         $passed++;
         if ($verbose) {
             printf("  ok    %s (%.2fs)\n", $t['name'], microtime(true) - $t0);
@@ -154,6 +155,7 @@ foreach ($tests as $t) {
         }
     }
     \OaiyTest\Tmp::afterTest();
+    \OaiyTest\Relay::forget();
 }
 \OaiyTest\Tmp::cleanup();
 
