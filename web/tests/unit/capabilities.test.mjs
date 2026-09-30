@@ -145,6 +145,15 @@ describe('the registry', () => {
     }
   });
 
+  it('the reason Packages give claims only what is true (the review\'s F6): a tab has no native commands to load one; it does not say OAIY\'s window uses them, where the shimmed build has none either', () => {
+    const says = F.whyMissing('packages');
+    assert.match(says, /needs native commands that a browser tab does not have/);
+    assert.match(says, /where they always were/);
+    assert.doesNotMatch(says, /uses the desktop's own commands|which only OAIY's window has/);
+    // The behaviour is not the wording's business: Packages stay in OAIY's window and stay out of every tab.
+    assert.equal(F.featureSpec('packages').requires, 'own-window');
+  });
+
   it('a feature that is not in it is an error, not a silent yes', () => {
     assert.throws(() => F.featureSpec('nothing'), /no feature called nothing/);
   });

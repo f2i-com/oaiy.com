@@ -2,8 +2,8 @@
  * The features the two apps show or hide by where they are, in one table (design 3.5 and 3.6).
  *
  * Each names what it NEEDS: OAIY Desktop behind a link (the person paired the page with it, or the page is in OAIY's own window,
- * which is given the desktop), a desktop or a server, or OAIY's own window itself (things that need the desktop's native commands,
- * which no link gives a browser tab). A feature whose need is not met cannot work in that mode, so the page does not show it: no
+ * which is given the desktop), a desktop or a server, or OAIY's own window itself (a feature that has only ever been shown there, which
+ * no link gives a browser tab). A feature whose need is not met cannot work in that mode, so the page does not show it: no
  * control that does nothing. Where the person can do something about it the page shows that instead (Connect), and a node that is
  * already in a flow says what it needs (`whyMissing`).
  *
@@ -19,7 +19,7 @@ export type Requirement =
   | 'desktop'
   /** OAIY Desktop or OAIY's server. */
   | 'desktop-or-server'
-  /** OAIY's own window, whose page can call the desktop's native commands. No link gives a tab that. */
+  /** OAIY's own window, where the feature has always been shown. No link gives a tab it: the behaviour of that window is not changed. */
   | 'own-window';
 
 export type FeatureId =
@@ -53,7 +53,7 @@ export const FEATURES: readonly FeatureSpec[] = [
   { id: 'browserNodes', app: 'flows', requires: 'desktop-or-server', says: 'Browser nodes need OAIY Desktop or an OAIY server: they drive a browser that it runs.' },
   { id: 'askAgent', app: 'flows', requires: 'desktop-or-server', says: 'Ask the Agent needs OAIY Desktop or an OAIY server: the Agent that answers is its.' },
   { id: 'inputFolder', app: 'flows', requires: 'desktop-or-server', says: 'A folder input needs OAIY Desktop or an OAIY server: a browser page cannot read a folder of the computer by its path.' },
-  { id: 'packages', app: 'flows', requires: 'own-window', says: "Packages need OAIY's own window: loading a flow package uses the desktop's own commands, which a browser tab does not have." },
+  { id: 'packages', app: 'flows', requires: 'own-window', says: "Packages are offered only in OAIY's own window, where they always were: loading a flow package needs native commands that a browser tab does not have." },
   { id: 'dock', app: 'flows', requires: 'desktop', says: "The engine's dock needs OAIY Desktop: it shows the desktop's engine and its address." },
 ];
 
