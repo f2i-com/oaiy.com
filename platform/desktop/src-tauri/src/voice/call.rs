@@ -1071,6 +1071,12 @@ where
                                     }
                                 }
                                 hub.emit(started);
+                                // A request for the owner that the session before this one began, and that still rings (the line moved to this session while it
+                                // did): this session keeps the caller from silence and gives up on it as it would on its own, so that the app is told how it came
+                                // out even if the phone never says (the model was told it would be). One an owner device has taken is the takeover's, not a ring.
+                                for live in ring.active().into_iter().filter(|r| r.call_id == ids.call && !r.taken) {
+                                    transfer.ringing(&live.id, (live.expires_at.saturating_sub(live.now) / 1_000).max(1), Instant::now());
+                                }
                                 if !greeting.trim().is_empty() {
                                     // Said once the line is open: now, if the call asks for no wait.
                                     let delay = greeting_delay(&v, &start, voices::greeting_delay_ms());

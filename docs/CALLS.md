@@ -242,7 +242,8 @@ agent : "I'll try to reach them, please stay with me."  (it is trying: it does n
   accepted and what waited to be sent are told the line moved to a new session and may be asked again, and a request for
   the owner that had been sent is told the owner may still be ringing and is not to be asked again (a second request
   would be refused while it rings): the app is told how it came out (`call.transfer`) by the session that took the call,
-  as it is for any ring that session did not begin.
+  as it is for any ring that session did not begin, and if the phone never says, that session gives up on the ring when
+  it runs out, as it would on its own (the caller is offered a message).
 - **A line that promises a transfer is not said before it happens.** Until an owner device has accepted, a line the
   model writes that tells the caller they are being connected, transferred, put through or handed over, in any of the
   forms a model uses ("connecting you now", "I'm transferring you", "I'll transfer you", "let me put you through",

@@ -1372,6 +1372,50 @@ async fn what_was_in_flight_when_another_session_took_the_call_is_told_the_line_
     assert_eq!(told, "the call ended");
 }
 
+/// The model of a session that lost the call was told it would be told how a request for the owner came out. The session that took the call keeps that
+/// ring as if it were its own: the caller is kept from silence, and when the ring runs out with the phone silent it gives up on it, the app is told
+/// (`call.transfer`, expired) and the caller is offered a message.
+#[tokio::test]
+async fn a_ring_the_session_before_began_is_given_up_on_by_the_session_that_took_the_call_when_the_phone_stays_silent() {
+    let mut f = flow(owner_settings(true)).await;
+    f.caller_says(ASKED);
+    f.ring_through("assist_1", 2).await;
+    let mut again = f.aokie.restart(json!({"allowTransfer": true, "generation": 2, "greeting": "Sorry about that."})).await;
+    again.begin(json!({}));
+    again.event("call.started", secs(3)).await.expect("the call began again");
+    // The phone says nothing more of it.
+    let told = again.event("call.transfer", secs(8)).await.expect("the session that took the call gave up on the ring, and the app is told");
+    assert_eq!((told["requestId"].clone(), told["outcome"].clone()), (json!("assist_1"), json!("expired")), "{told}");
+    assert_eq!(told["source"], "watchdog", "{told}");
+    assert!(spoken_within(&again, transfer::OFFER_LINE, secs(6)).await, "the caller is offered a message: {:?}", again.speech.spoken());
+    assert_eq!(f.dialog().await.len(), 0, "and the ring is over");
+}
+
+/// What the session that took the call gives up on is the ring of that call that still rings for it: not a ring another call began (a second call on
+/// the same desktop), and not one an owner device has taken (the phone says it is being connected, and that is the takeover's to see through).
+#[tokio::test]
+async fn the_session_that_took_the_call_gives_up_on_no_ring_of_another_call_and_none_an_owner_device_has_taken() {
+    let mut f = flow(owner_settings(true)).await;
+    let (hub, speech, at) = (f.aokie.hub.clone(), f.aokie.speech.clone(), f.aokie.at.clone());
+    let mut other = Aokie::open(hub.clone(), speech, at, "call_elsewhere".to_string(), json!({"from": "+61491570156", "callerName": "Sam", "allowTransfer": true})).await;
+    other.begin(json!({}));
+    other.event("call.started", secs(3)).await.expect("the other call started");
+    hub.note_turn(&other.call, ASKED);
+    ring_through_on(&mut other, &f.ring, "assist_elsewhere", 1).await;
+    // This call's own ring, that an owner device took a moment before the line moved.
+    f.caller_says(ASKED);
+    f.ring_through("assist_1", 1).await;
+    f.ring.cancel_refused("assist_1");
+    assert_eq!(f.dialog().await.len(), 2, "both ring");
+    let mut again = f.aokie.restart(json!({"allowTransfer": true, "generation": 2, "greeting": "Sorry about that."})).await;
+    again.begin(json!({}));
+    again.event("call.started", secs(3)).await.expect("the call began again");
+    // (The other call's own session gives up on its ring, and the app is told, as it should be: what is looked for is anything said of this call.)
+    while let Some(told) = again.event("call.transfer", secs(3)).await {
+        assert_ne!(told["callId"], json!(f.aokie.call), "neither the other call's ring nor the one a device took is given up on by this call: {told}");
+    }
+}
+
 /// The other scenario: a ring the owner declined, a minute and a bit on, and the caller says only "No, just take a message please." Nothing
 /// about the gap between tries having passed makes that an ask.
 #[tokio::test]
