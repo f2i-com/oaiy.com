@@ -227,6 +227,7 @@ export async function startFakeProvider(initial = {}) {
       });
     tryListen();
   });
+  server.unref(); // a test that fails before it closes the server must not keep the test process alive
   const port = server.address().port;
 
   return {
@@ -286,6 +287,7 @@ export async function startCollector() {
     server.once('error', reject);
     server.listen(0, '127.0.0.1', resolve);
   });
+  server.unref();
   const port = server.address().port;
   return {
     port,

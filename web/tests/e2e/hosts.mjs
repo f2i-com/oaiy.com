@@ -139,6 +139,8 @@ export async function startHosts(options = {}) {
     server.once('error', reject);
     server.listen(options.port ?? 0, '127.0.0.1', resolve);
   });
+  // A test that fails before it closes the server must not keep the test process alive.
+  server.unref();
   const port = server.address().port;
 
   return {

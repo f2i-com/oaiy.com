@@ -10,11 +10,17 @@
   const now = () => performance.now();
   const DEFAULT_ALLOW = 'cross-origin-isolated; local-network-access; local-network; loopback-network';
 
-  const holder = { iframe: null, port: null, next: 1, waiting: new Map(), streams: new Map(), pushes: [], hello: null, helloWaiter: null, log: [] };
+  const holder = { iframe: null, port: null, next: 1, waiting: new Map(), streams: new Map(), pushes: [], hello: null, helloWaiter: null, log: [], dump: [] };
 
   function onMessage(event) {
     const m = event.data;
     holder.log.push({ at: now(), data: m && typeof m === 'object' ? { t: m.t, id: m.id, ok: m.ok } : m });
+    // Everything received, whole, as text: for a test that looks for a secret in it.
+    try {
+      holder.dump.push(JSON.stringify(m, (k, v) => (v instanceof ArrayBuffer ? new TextDecoder('latin1').decode(v) : v)));
+    } catch {
+      holder.dump.push('[unprintable]');
+    }
     if (m && m.t === 'hello') {
       holder.hello = m;
       holder.helloWaiter?.(m);
@@ -118,6 +124,8 @@
     /** The next replies that were not answers to a request the shell made: pushes, and everything else logged. */
     pushes: () => holder.pushes.slice(),
     log: () => holder.log.slice(),
+    /** Every message received over the port, whole, as one string. */
+    received: () => holder.dump.join('\n'),
     hello: () => holder.hello,
 
     /** Post a `hello` at the holder frame from a frame that is sandboxed (an opaque origin), and report whether anything answered. */
