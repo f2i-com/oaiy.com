@@ -12,8 +12,10 @@
 //! 1. `OAIY_SERVER_BIND` is `loopback`, `lan` (an alias of `0.0.0.0`) or an IP literal.
 //! 2. A **lan** install (a bind beyond loopback and no `OAIY_PUBLIC_URL`) needs `<data>/auth/owner.json`, a file
 //!    this server reads as an owner (`inspect_owner_file`: as the store reads it; an empty, cut-off or newer file
-//!    is a refusal named by the file, in the start and in `check`). A **proxied** install may start without one,
-//!    in setup-only mode.
+//!    is a refusal named by the file, in the start and in `check`). The shape is all it reads: a file of the full
+//!    shape satisfies the rule even when its hash matches no password (`the_owner_file_is_read_as_the_server_reads_it`
+//!    holds that), which fails closed: nobody can sign in until `auth reset-password`. A **proxied** install may
+//!    start without one, in setup-only mode.
 //! 3. `OAIY_PUBLIC_URL`, `OAIY_AGENT_URL` and `OAIY_FLOWS_URL` are each `https://<host>[:<port>]` with no path,
 //!    query or fragment, none has a loopback host, and no two share a host. An app whose URL is unset is not
 //!    served; the dashboard's URL is required by the other two.
@@ -1838,6 +1840,10 @@ mod tests {
             r#"{"v":1,"created_ms":1,"password_changed_ms":1,"min_session_epoch":3,"password":"$argon2id$x"}"#,
         );
         assert_eq!(inspect_owner_file(&auth), OwnerState::Usable);
+        // N6: the rule reads the shape and not the password: the hash above is one no password matches (the login
+        // verifies nothing against it, so nobody signs in: it fails closed), and the file still satisfies rule 2.
+        #[cfg(feature = "web")]
+        assert!(!crate::auth::password::is_usable("$argon2id$x"));
         #[cfg(feature = "web")]
         {
             put(r#"{"v":1}"#);

@@ -4,10 +4,11 @@ import os from 'node:os';
 import path from 'node:path';
 import net from 'node:net';
 import assert from 'node:assert/strict';
-import { spawn } from 'node:child_process';
-import { createHash, randomBytes } from 'node:crypto';
+import { spawn, spawnSync } from 'node:child_process';
+import { createHash } from 'node:crypto';
 import { once } from 'node:events';
 import { setTimeout as delay } from 'node:timers/promises';
+import { drawAcceptedToken } from './smoke-token.mjs';
 
 const root = path.resolve(process.argv[2]);
 const server = path.join(root, process.platform === 'win32' ? 'oaiy-server.exe' : 'oaiy-server');
@@ -23,16 +24,20 @@ socket.listen(0, '127.0.0.1');
 await once(socket, 'listening');
 const port = socket.address().port;
 await new Promise(resolve => socket.close(resolve));
-// What the server requires of OAIY_SERVER_TOKEN: 32 to 256 printable characters worth 128 bits and no pattern (no
-// word like `test`, no run like `1234`). Any random token is one nearly always: 43 base64url characters are refused
-// by chance about one time in 20,000.
-const token = randomBytes(32).toString('base64url');
-const env = {
+const baseEnv = {
   PATH: process.platform === 'win32' ? path.join(process.env.SystemRoot, 'System32') : path.join(data, 'empty-path'),
   SystemRoot: process.env.SystemRoot, TEMP: data, TMP: data, TMPDIR: data,
   USERPROFILE: data, HOME: data, APPDATA: data, LOCALAPPDATA: data,
-  OAIY_DATA_DIR: data, OAIY_SERVER_PORT: String(port), OAIY_SERVER_TOKEN: token,
+  OAIY_DATA_DIR: data, OAIY_SERVER_PORT: String(port),
 };
+// What the server requires of OAIY_SERVER_TOKEN: 32 to 256 printable characters, worth 128 bits by an estimate from the
+// alphabet and with no common pattern (no word like `test`, no run like `1234`, no phrase): a guard against the obvious.
+// A random token is nearly always taken, and now and then it is not (`0000`, `1234` and a repeat are in what random text
+// has: one time in 10,000 for 43 base64url characters), so it is drawn until the server's own `check` takes it.
+const token = drawAcceptedToken((candidate) => spawnSync(server, ['check'], {
+  cwd: root, env: { ...baseEnv, OAIY_SERVER_TOKEN: candidate }, encoding: 'utf8', windowsHide: true, timeout: 30000,
+}));
+const env = { ...baseEnv, OAIY_SERVER_TOKEN: token };
 const child = spawn(server, [], { cwd: root, env, windowsHide: true, stdio: ['ignore', 'pipe', 'pipe'] });
 let logs = '';
 child.stdout.on('data', chunk => { logs = (logs + chunk).slice(-12000); });

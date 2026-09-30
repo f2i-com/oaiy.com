@@ -355,6 +355,12 @@ violation (exit 78); a refusal to start is exit 78 too.
 | `OAIY_TRUSTED_PROXIES` | the proxies whose `X-Forwarded-*` headers are believed |
 | `OAIY_LOGIN_ALLOW` | addresses and networks a sign-in may come from (`203.0.113.7`, `203.0.113.0/24`, `2001:db8::/32`, comma-separated). **A list with any entry that is not an address or a network is refused whole** (the server does not start, `check` fails): a typo must not turn the restriction off. Unset means every address |
 
+`<data>/auth/owner.json` is judged by what the server can read, not by whether the password in it is one: startup rule 2
+(a lan install needs an owner login) is satisfied by any file of the full shape, even one whose hash matches no
+password. Such a file is written only by someone who can already write the data folder, and a hash that matches
+nothing is a server nobody can sign in to (it fails closed, and `oaiyctl auth reset-password` on the console sets a
+real one).
+
 **A service install** has one settings file, `/etc/oaiy/oaiy.env` (install it from
 `systemd/oaiy.env.example`, `root:oaiy`, `0640`), which the unit `systemd/oaiy-server.service` reads
 (`EnvironmentFile=`) and `oaiyctl` reads too: the unit sets no `OAIY_` setting of its own, so the console works in

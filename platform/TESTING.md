@@ -122,6 +122,7 @@ session, and after a few runs the shim can no longer start.
 node --test scripts/fetch-zipp-release.test.mjs   # the ZIPP installer (see "ZIPP engines")
 (cd desktop && node scripts/check-release.mjs)    # the release builds oaiy-server with --features web, CI tests that, the unit does not restart exit 78
 (cd desktop && node --test scripts/check-release.test.mjs)   # ... and that check fails for each way they lose it
+(cd desktop && node --test scripts/smoke-token.test.mjs)     # the release smoke test draws its token again when the server's own check refuses one
 ```
 
 **Nothing in a default run listens or connects beyond loopback.** A listener on `0.0.0.0` or a LAN address makes Windows
