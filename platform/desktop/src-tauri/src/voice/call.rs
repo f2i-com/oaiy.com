@@ -2775,7 +2775,7 @@ mod tests {
     }
 
     /// `frame`, a frame of the shared fixtures, as it would be on this call: its ids, and the request it is about.
-    pub(super) fn on_this_call(mut frame: Value, aokie: &Aokie, request: Option<&str>) -> Value {
+    fn on_this_call(mut frame: Value, aokie: &Aokie, request: Option<&str>) -> Value {
         frame["callId"] = json!(aokie.call);
         frame["generation"] = json!(1);
         if let Some(request) = request {
@@ -2795,7 +2795,7 @@ mod tests {
 
     /// How the phone says a request came out: the shared fixture's frame for that outcome (with the owner's words, for a decline that has
     /// them), for this call and request.
-    pub(super) fn outcome(aokie: &Aokie, request: &str, outcome: &str, message: Option<&str>) -> Value {
+    fn outcome(aokie: &Aokie, request: &str, outcome: &str, message: Option<&str>) -> Value {
         let cases = shared("outcome")["cases"].clone();
         let case = cases.as_array().unwrap().iter().find(|c| c["frame"]["outcome"] == outcome && c["frame"].get("message").is_some() == message.is_some()).unwrap_or_else(|| panic!("the shared fixture has no {outcome} case (with words: {})", message.is_some()));
         let mut frame = on_this_call(case["frame"].clone(), aokie, Some(request));

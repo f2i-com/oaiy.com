@@ -180,4 +180,42 @@ mod tests {
             let _ = OsIdle.locked();
         }
     }
+
+    /// The real clock is a clock and not a number: over a second and a bit with nobody at the keyboard it has gone up by that much, and
+    /// when somebody was at it in that time it has come back down (a constant, a frozen value or a wrong unit is none of these). Nothing is
+    /// sent to the desktop: the test only reads, and never makes the input it reads about.
+    #[cfg(windows)]
+    #[test]
+    fn the_real_idle_clock_goes_on_while_nobody_uses_the_computer_and_starts_again_when_somebody_does() {
+        let Some(first) = OsIdle.idle_seconds() else { return }; // a session with no input at all (a service) says nothing
+        std::thread::sleep(std::time::Duration::from_millis(1_200));
+        let second = OsIdle.idle_seconds().expect("a session that said a time says another");
+        assert!((first + 1..=first + 4).contains(&second) || second < first, "idle {first} s, then {second} s a second and a bit later: neither on by about that nor back to nothing");
+        // Somebody used the computer within the last few seconds: they are at an unlocked screen, and the presence says so.
+        let now = OsIdle.idle_seconds().unwrap_or(u64::MAX);
+        if now < 3 {
+            assert!(!OsIdle.locked(), "input {now} s ago and a locked screen");
+            let settings = SettingsStore::in_memory(RingSettings { desktop_active_seconds: 120, ..Default::default() });
+            assert_eq!(IdlePresence::os(settings).presence(), Presence::Active);
+        }
+    }
+
+    /// The presence over the real clock follows the owner's own window: a session that says nothing is never taken to be at the computer, and
+    /// input older than the longest window (15 minutes) is never active, whatever the window is.
+    #[cfg(windows)]
+    #[test]
+    fn the_real_presence_follows_the_owners_window_and_says_off_for_a_session_that_says_nothing() {
+        let settings = |seconds| SettingsStore::in_memory(RingSettings { desktop_active_seconds: seconds, ..Default::default() });
+        match OsIdle.idle_seconds() {
+            None => assert_eq!(IdlePresence::os(settings(900)).presence(), Presence::Off),
+            // (Nobody used it a minute past the longest window, so nobody did in the moment between the two reads.)
+            Some(idle) if idle > 900 + 60 => {
+                for window in [30, 120, 900] {
+                    let presence = IdlePresence::os(settings(window)).presence();
+                    assert!(matches!(presence, Presence::Idle | Presence::Locked), "idle {idle} s, window {window} s: {presence:?}");
+                }
+            }
+            Some(_) => {}
+        }
+    }
 }
