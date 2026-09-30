@@ -70,6 +70,12 @@ export default function RingDialog({ on = true }: { on?: boolean }) {
   const ringing = rings.filter((r) => r.expiresAt > now && !putAway.includes(r.id));
   const shown = ringing[0];
 
+  // What went wrong is about the ring it happened on: another caller's ring, or none, does not inherit it.
+  const shownId = shown?.id;
+  useEffect(() => {
+    setError(null);
+  }, [shownId]);
+
   const act = async (action: RingAction) => {
     if (!shown) return;
     setBusy(action);

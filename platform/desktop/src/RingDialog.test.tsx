@@ -243,6 +243,44 @@ describe('the ring dialog', () => {
     expect(button('Decline and take a message').disabled).toBe(false);
   });
 
+  it('does not carry the error of a failed decline to the next ring, and keeps it while the same ring shows', async () => {
+    serve({});
+    api.respond.mockRejectedValue(new Error('the ring is over'));
+    await mount();
+    await click(button('Decline and take a message'));
+    expect(host.querySelector('[role=alert]')?.textContent).toContain('the ring is over');
+    // Looked at again, still the same ring: the error stays.
+    await act(async () => {
+      vi.advanceTimersByTime(POLL_MS * 2 + 10);
+    });
+    await settle();
+    expect(host.querySelector('[role=alert]')?.textContent).toContain('the ring is over');
+    // That ring is over and another caller's is ringing: nothing is said about the last.
+    serve({ id: 'assist_2', callerName: 'Sam', callerNumber: '+61491570156' });
+    await act(async () => {
+      vi.advanceTimersByTime(POLL_MS + 10);
+    });
+    await settle();
+    expect(text()).toContain('Sam');
+    expect(host.querySelector('[role=alert]')).toBeNull();
+    // Nor does it come back with a third after a gap with no ring at all.
+    api.respond.mockRejectedValue(new Error('the phone did not answer'));
+    await click(button('Decline and take a message'));
+    expect(host.querySelector('[role=alert]')?.textContent).toContain('the phone did not answer');
+    api.active.mockResolvedValue({ rings: [], notices: [] });
+    await act(async () => {
+      vi.advanceTimersByTime(POLL_MS + 10);
+    });
+    await settle();
+    serve({ id: 'assist_3' });
+    await act(async () => {
+      vi.advanceTimersByTime(POLL_MS + 10);
+    });
+    await settle();
+    expect(host.querySelector('.ring-dialog')).not.toBeNull();
+    expect(host.querySelector('[role=alert]')).toBeNull();
+  });
+
   it('tells the owner, without a ring, that someone asked for them when no device is set up, and lets them dismiss it or go and set one up', async () => {
     api.active.mockResolvedValue({ rings: [], notices: [notice()] });
     await mount();
