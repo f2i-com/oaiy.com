@@ -45,6 +45,36 @@ describe('a 404 names the provider\'s origin, not its base path', () => {
     });
   }
 
+  it('and no other failure carries it either: every status, a 200 that is not a model list, and a call that gets no answer, on fetch, models and test', async () => {
+    const answers = {
+      '400': () => jsonResponse({ error: 'bad' }, 400),
+      '401': () => jsonResponse({ error: 'no' }, 401),
+      '403': () => jsonResponse({ error: 'no' }, 403),
+      '429': () => jsonResponse({ error: 'slow' }, 429),
+      '500': () => jsonResponse({ error: 'oops' }, 500),
+      '502': () => new Response('<html>Bad gateway</html>', { status: 502 }),
+      'a 200 with a body that is not JSON': () => new Response('<html>hello</html>', { status: 200, headers: { 'content-type': 'text/html' } }),
+      'a 200 that is JSON but not a model list': () => jsonResponse({ hello: 'world' }),
+      'no answer at all': () => {
+        throw new TypeError('Failed to fetch');
+      },
+    };
+    for (const [record_what, record] of Object.entries(BASES)) {
+      for (const [what, handler] of Object.entries(answers)) {
+        const w = await world({ record: { ...record, model: 'm' }, handler });
+        const client = await w.connect();
+        await client.fetch({ provider: w.record.id, path: '/chat/completions', method: 'POST', body: '{}' });
+        await client.fetch({ provider: w.record.id, path: '/models', method: 'GET' });
+        await client.call({ op: 'models', provider: w.record.id });
+        await client.call({ op: 'test', provider: w.record.id });
+        const seen = client.everything();
+        assert.ok(!seen.includes(TENANT), `${record_what}, ${what}: the tenant name is in what the app received`);
+        // (Words like "usually ending in /v1" are a hint about addresses in general; what must not be there is THIS address with a path.)
+        assert.ok(!/api\.example\.com\/|:65477\//.test(seen), `${record_what}, ${what}: the address with a path is in what the app received`);
+      }
+    }
+  });
+
   it('the holder\'s own pages show the whole address to the person who set it up (scrubbed text, for a page no app can read)', async () => {
     const w = await world({ record: { ...BASES['a service on the internet'], model: 'm' }, handler: notFound });
     const record = await w.store.get(w.record.id);
