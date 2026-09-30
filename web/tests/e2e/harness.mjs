@@ -60,9 +60,10 @@ export async function waitFor(fn, { timeout = 8000, interval = 50, what = 'the c
 }
 
 /**
- * A browser. `isolateOrigins` asks Chromium to give those origins a process of their own (`--isolate-origins`): the providers
- * frame is then out of process from the app that embeds it, which is what a test that reads the APP's memory needs (two
- * same-site frames share a renderer, and so a heap, by default).
+ * A browser. `isolateOrigins` asks Chromium to give those origins a process of their own (`--isolate-origins`). Two same-site frames
+ * share a renderer, and so a heap, by default; the providers documents ask for a process of their own with their own header
+ * (`Origin-Agent-Cluster: ?1`, which Chromium 148 honours: E3 shows it, and shows what happens without it), so the tests that read an
+ * APP's memory do not need the flag. It remains for a test that wants it regardless of the header.
  */
 export async function launchBrowser({ isolateOrigins = [], headless = true, browserName = 'chromium' } = {}) {
   if (browserName === 'firefox') return launchFirefox({ headless });

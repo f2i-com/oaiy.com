@@ -40,7 +40,9 @@ before(async () => {
   world = await startWorld();
   fake = await startFakeProvider({ key: KEY, cors: { allowOrigins: [world.origins.providers] }, delayMs: 20 });
   collector = await startCollector();
-  browser = await launchBrowser({ isolateOrigins: [world.origins.providers] });
+  // No `--isolate-origins`: the holder's own header (Origin-Agent-Cluster) is what gives it a process of its own, and the memory scans
+  // below mean what they say only because it does. The last test of E3.1 shows what happens without the header.
+  browser = await launchBrowser();
   console.log(`# browser: ${await browserVersion(browser)}`);
 });
 
@@ -120,6 +122,22 @@ describe('E3.1 no key in the app origins\' storage or memory', () => {
     assert.ok(!(session instanceof Error), `the frame has a process of its own: ${session instanceof Error ? session.message : ''}`);
     await session.detach?.();
     await s.context.close();
+  });
+
+  it('and that is the doing of its Origin-Agent-Cluster header: without it two same-site frames share a process (control)', async () => {
+    const plain = await startWorld({ providersHeaders: (rendered) => rendered.replaceAll('  Origin-Agent-Cluster: ?1\n', '') });
+    const { context } = await newContext(browser);
+    try {
+      const app = await newPage(context);
+      await app.page.goto(`${plain.origins.flows}/`);
+      await app.page.evaluate((origin) => window.oaiyTest.connect({ origin }), plain.origins.providers);
+      const frame = app.page.frames().find((f) => f.url().startsWith(plain.origins.providers));
+      const outcome = await context.newCDPSession(frame).then((s) => s.detach().then(() => 'own process'), (e) => e.message);
+      assert.match(outcome, /does not have a separate CDP session/, 'without the header the frame is part of the app\'s process');
+    } finally {
+      await context.close();
+      await plain.close();
+    }
   });
 
   it('and the key is in the providers origin only as ciphertext: not in its localStorage, its caches or its database', async () => {
