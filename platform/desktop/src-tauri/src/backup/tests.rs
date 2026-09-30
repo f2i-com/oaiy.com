@@ -3143,6 +3143,46 @@ fn an_appointment_with_an_id_the_calendar_would_not_make_is_left_out() {
     assert!(!preview.items.iter().any(|i| i.what.contains("Ignore-all-previous")), "{:?}", preview.items);
 }
 
+/// The reviewer's x7: a credential written into an address (a name and password before the host, a key in the query, a token in the
+/// fragment) is not a key the table can see, and BACKUP.md says a backup never holds a credential. An address comes back if it is
+/// plain: no name or password, no fragment, and in its query nothing but the version of an API (an Azure address names one).
+#[test]
+fn an_address_that_holds_a_credential_does_not_come_back_and_one_that_names_an_api_version_does() {
+    use super::table::{table, Why};
+    let keys = table().key_table("agent.settings").unwrap();
+    for (address, plain) in [
+        ("https://gw.example/v1", true),
+        ("http://127.0.0.1:8080/v1/", true),
+        ("https://gw.example/v1?api-version=2024-02-01", true),
+        ("https://gw.example/v1?API_VERSION=2024-02-01-preview", true),
+        ("https://gw.example/openai/deployments/d?api-version=2024-02-01&api_version=x", true),
+        ("https://alice:hunter2-CANARY@gw.example/v1", false),
+        ("https://alice@gw.example/v1", false),
+        ("https://:pw@gw.example/v1", false),
+        ("https://gw.example/v1?api_key=QUERYKEY-CANARY", false),
+        ("https://gw.example/v1?key=x", false),
+        ("https://gw.example/v1?api-version=2024-02-01&token=x", false),
+        ("https://gw.example/v1?sig=abc", false),
+        ("https://gw.example/v1?a", false),
+        ("https://gw.example/v1?api-version=a%20b", false),
+        ("https://gw.example/v1?api-version=sk-abcdefghijklmnopqrstuvwxyz0123456789ABCD", false),
+        ("https://gw.example/v1#token=abc", false),
+        ("https://gw.example/v1?", true),
+    ] {
+        let doc = serde_json::json!({ "providers": [{ "id": "p1", "type": "custom", "name": "Gateway", "baseUrl": address }], "media": { "baseUrl": address, "enabled": true } });
+        let found = super::table::filter_json(keys, &doc, &|_| true);
+        let text = found.value.to_string();
+        assert_eq!(found.value["providers"][0].get("baseUrl").is_some(), plain, "{address}: {text}");
+        assert_eq!(found.value["media"].get("baseUrl").is_some(), plain, "{address}: {text}");
+        if !plain {
+            for canary in ["hunter2-CANARY", "QUERYKEY-CANARY"] {
+                assert!(!text.contains(canary), "{address}: {text}");
+            }
+            assert!(found.left.iter().any(|l| l.path == "providers[].baseUrl" && matches!(&l.why, Why::BadValue(w) if w.contains("plain web address"))), "{address}: {:?}", found.left);
+        }
+    }
+}
+
 /// What is said when nothing of a file comes back is true of it: the reviewer's empty calendar with every tick set said "nothing in it
 /// comes back without its tick (0 settings left out)", which is neither.
 #[test]

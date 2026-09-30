@@ -765,7 +765,22 @@ fn plain_text(text: &str) -> bool {
 }
 
 fn plain_url(text: &str, max_chars: usize) -> bool {
-    text.chars().count() <= max_chars && !text.chars().any(|c| c.is_control() || c.is_whitespace()) && (text.starts_with("http://") || text.starts_with("https://")) && text.len() > 8
+    text.chars().count() <= max_chars && !text.chars().any(|c| c.is_control() || c.is_whitespace()) && (text.starts_with("http://") || text.starts_with("https://")) && text.len() > 8 && holds_no_credential(text)
+}
+
+/// The only parameters an address may carry in its query: the version of an API (an Azure address names one). Any other could be a key
+/// (`api_key`, `key`, `token`, `sig`, `code`, or a name nobody has thought of): a credential belongs in the key of the provider, where
+/// the keys box decides whether it travels.
+pub const SAFE_QUERY_NAMES: [&str; 2] = ["api-version", "api_version"];
+
+/// Whether an address holds no credential: no name or password before the host (`https://alice:hunter2@gw.example`), no fragment, and
+/// in its query nothing but the version of an API.
+fn holds_no_credential(text: &str) -> bool {
+    let Ok(url) = reqwest::Url::parse(text) else { return false };
+    url.username().is_empty()
+        && url.password().is_none()
+        && url.fragment().is_none()
+        && url.query_pairs().all(|(name, value)| SAFE_QUERY_NAMES.contains(&name.to_lowercase().as_str()) && value.len() <= 40 && value.chars().all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.')))
 }
 
 /// Whether a string is something that must never travel: a key or a value sealed to a computer.
@@ -804,7 +819,7 @@ fn check_value(ty: &ValueType, value: &Value, is_a_key: bool, exact: bool) -> Re
             if plain_url(s, *max_chars) && !looks_secret(s) {
                 Ok(())
             } else {
-                Err("it is not a plain web address".to_string())
+                Err("it is not a plain web address (no name or password in it, and nothing in its query but the version of an API: a key belongs in the key)".to_string())
             }
         }
         (ValueType::Time, Value::String(s)) => if time_of_day(s).is_some() { Ok(()) } else { Err("a time such as 09:30 is expected".to_string()) },

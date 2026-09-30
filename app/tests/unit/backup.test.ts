@@ -12,6 +12,7 @@ import {
   PART_BYTES,
   RESTORE_WAIT_MS,
   RECORD,
+  addressWithoutCredentials,
   applyPendingRestore,
   checkName,
   exportAgentStorage,
@@ -366,6 +367,49 @@ describe('exporting the Agent storage', () => {
     expect(exported.lastProjectId).toBeNull();
     expect(exported.lastKeptProjectId).toBeNull();
     expect(target.doneBody!.counts.incognitoSkipped).toBe(1);
+  });
+
+  it('never writes a credential into an address, whatever the keys box says (the reviewer\u2019s V5), and says so', async () => {
+    for (const includeKeys of [false, true]) {
+      const storage = populated();
+      storage.settings = settings({
+        providers: [
+          { id: 'p1', type: 'custom', name: 'Gateway', apiKey: KEY, baseUrl: 'https://alice:hunter2-CANARY@gw.example/v1?api_key=QUERYKEY-CANARY&api-version=2024-02-01', modelId: 'm' },
+          { id: 'p2', type: 'custom', name: 'Plain', apiKey: KEY, baseUrl: 'https://plain.example/v1?api-version=2024-02-01', modelId: 'm' },
+        ] as Settings['providers'],
+        media: { ...EMPTY_MEDIA, baseUrl: 'https://bob:MEDIACANARY@media.example/v1#token=FRAGMENTCANARY', apiKey: MEDIA_KEY },
+      });
+      const target = new Collector();
+      const report = await exportAgentStorage(storage, target, { includeKeys });
+      expect(report.ok).toBe(true);
+      const text = dec.decode(target.entries['idb/settings.json']);
+      for (const canary of ['hunter2-CANARY', 'QUERYKEY-CANARY', 'MEDIACANARY', 'FRAGMENTCANARY']) expect(text, `${canary} (keys ${includeKeys})`).not.toContain(canary);
+      expect(text.includes(KEY), 'the key itself travels only with the keys box').toBe(includeKeys);
+      const exported = JSON.parse(text) as { providers: Array<{ baseUrl: string }>; media: { baseUrl: string } };
+      expect(exported.providers[0].baseUrl).toBe('https://gw.example/v1?api-version=2024-02-01');
+      expect(exported.providers[1].baseUrl, 'an address that holds no credential is as it is').toBe('https://plain.example/v1?api-version=2024-02-01');
+      expect(exported.media.baseUrl).toBe('https://media.example/v1');
+      const said = report.warnings.join('\n');
+      expect(said).toContain('Provider \u201cGateway\u201d: its address held a name and password, or a key');
+      expect(said).toContain('The image, video and audio service: its address held a name and password');
+      expect(said).not.toContain('Plain');
+    }
+  });
+
+  it('takes a credential out of an address and nothing else', () => {
+    const same = ['https://gw.example/v1', 'http://127.0.0.1:8080/v1/', 'https://gw.example/v1?api-version=2024-02-01', 'https://gw.example/v1?API_VERSION=x', 'https://gw.example/v1?', 'not an address', ''];
+    for (const address of same) expect(addressWithoutCredentials(address), address).toEqual({ address, changed: false });
+    for (const [raw, made] of [
+      ['https://alice:hunter2@gw.example/v1', 'https://gw.example/v1'],
+      ['https://alice@gw.example/v1', 'https://gw.example/v1'],
+      ['https://gw.example/v1?api_key=abc', 'https://gw.example/v1'],
+      ['https://gw.example/v1?key=a&api-version=2024-02-01&token=b&key=c', 'https://gw.example/v1?api-version=2024-02-01'],
+      ['https://gw.example/v1?sig=a#frag', 'https://gw.example/v1'],
+      ['https://gw.example/v1#token=abc', 'https://gw.example/v1'],
+      ['https://u:p@gw.example/v1?a', 'https://gw.example/v1'],
+    ]) {
+      expect(addressWithoutCredentials(raw), raw).toEqual({ address: made, changed: true });
+    }
   });
 
   it('leaves out the browser\u2019s temporary write files', async () => {

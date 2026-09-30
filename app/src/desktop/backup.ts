@@ -386,14 +386,21 @@ export async function exportAgentStorage(storage: AgentStorage, target: PartTarg
       const s = await storage.readSettings();
       const inIncognito = (id: string | null) => (id !== null && incognito.has(id) ? null : id);
       const keys = options.includeKeys;
+      // A key is never written in an address: whatever the keys box says, a name and password before the host, and a key in the
+      // query, are taken out of the address (the key is what the box is for), and the person is told.
+      const clean = (who: string, address: string): string => {
+        const made = addressWithoutCredentials(address);
+        if (made.changed) warnings.push(`${clip(who)}: its address held a name and password, or a key, which a backup never holds. It was saved without them: enter them again as its key after a restore.`);
+        return made.address;
+      };
       const settings: BackupSettings = {
-        providers: s.providers.map((p) => ({ ...p, apiKey: keys ? p.apiKey : '' })),
+        providers: s.providers.map((p) => ({ ...p, apiKey: keys ? p.apiKey : '', ...(typeof p.baseUrl === 'string' ? { baseUrl: clean(`Provider “${p.name || p.id}”`, p.baseUrl) } : {}) })),
         activeProviderId: s.activeProviderId,
         gate: s.gate,
         lastProjectId: inIncognito(s.lastProjectId),
         lastKeptProjectId: inIncognito(s.lastKeptProjectId),
         agent: s.agent,
-        media: { ...s.media, apiKey: keys ? s.media.apiKey : '' },
+        media: { ...s.media, apiKey: keys ? s.media.apiKey : '', baseUrl: clean('The image, video and audio service', s.media.baseUrl) },
         messages: s.messages,
       };
       await add('idb/settings.json', strToU8(JSON.stringify(settings)));
@@ -623,6 +630,34 @@ function pendingFrom(value: unknown, limits: Limits): PendingParse {
 }
 
 /** How two provider records are told to point at the same place: the same kind of server at the same address. */
+/**
+ * The only parameters an address may carry in its query: the version of an API (an Azure address names one). Any other could be
+ * a key (`api_key`, `key`, `token`, `sig`, `code`, or a name nobody has thought of). The desktop's table holds the same list.
+ */
+export const SAFE_QUERY_NAMES: readonly string[] = ['api-version', 'api_version'];
+
+/**
+ * An address as a backup may hold it: with no name or password before the host, no fragment, and in its query nothing but the
+ * version of an API. What is taken out is a credential written into the address, and a credential is not put in a backup whatever the
+ * keys box says (the key of a provider is where it belongs). `changed` says something was taken out. Something that is not an address
+ * is left as it is (the desktop does not bring it back).
+ */
+export function addressWithoutCredentials(raw: string): { address: string; changed: boolean } {
+  let url: URL;
+  try {
+    url = new URL(raw);
+  } catch {
+    return { address: raw, changed: false };
+  }
+  const foreign = [...url.searchParams.keys()].filter((name) => !SAFE_QUERY_NAMES.includes(name.toLowerCase()));
+  if (!url.username && !url.password && !url.hash && foreign.length === 0) return { address: raw, changed: false };
+  url.username = '';
+  url.password = '';
+  url.hash = '';
+  for (const name of new Set(foreign)) url.searchParams.delete(name);
+  return { address: url.toString(), changed: true };
+}
+
 function sameEndpoint(a: { type?: unknown; baseUrl?: unknown }, b: { type?: unknown; baseUrl?: unknown }): boolean {
   const address = (u: unknown) => (typeof u === 'string' ? u.trim().replace(/\/+$/, '') : '');
   return a.type === b.type && address(a.baseUrl) === address(b.baseUrl);

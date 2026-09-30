@@ -429,6 +429,15 @@ holds keys only tells the dialog whether to offer the box), and then only for th
 provider list, and for the Agent only where it has no key of its own for a provider at the same
 address (see [The Agent's storage](#the-agents-storage)).
 
+**A key is never written in an address, with the box ticked or not.** An address of the Agent's
+providers or of its image, video and audio service may hold a name and password before the host
+(`https://alice:secret@gateway.example`), or a key in its query (`?api_key=...`). The keys box decides
+whether a provider's *key* travels, and cannot decide for a key that is part of an address, so the Agent's page
+writes such an address without it (no name or password, no fragment, and in the query nothing but the
+version of an API, such as `?api-version=2024-02-01`, which an Azure address needs), says so in the
+backup's warnings ("enter it again as its key"), and the desktop's table refuses to bring back an
+address that has one (the dry run lists it under what is not restored). The keys box is for the key.
+
 ## Restoring
 
 A restore is never done in place. It has three steps, and the first two change nothing you use:
