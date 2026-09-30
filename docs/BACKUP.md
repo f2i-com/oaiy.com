@@ -401,6 +401,10 @@ A restore is never done in place. It has three steps, and the first two change n
    `<data>/restore/pending-<id>/` (after checking the free space and every name: nothing may leave
    its folder, name a drive, appear twice, be a credential or an NTFS short-name alias such as
    `PAIRIN~1.JSO`, or pass the limits of 20,000 items and the size caps below) and writes a marker.
+   A name that appears twice is refused wherever it is written twice: in the backup's record, or in the
+   backup's own list of items (the ZIP directory, where the count in its end record is compared with
+   the items that could be read, because a reader keeps only one of two entries of a name and another
+   program may read the other), and in the Agent's storage archive, in the desktop and in the page.
    **What is prepared is what you looked at.** When you look, OAIY keeps the SHA-256 of the whole
    decrypted backup (its record and every item, the Agent's storage included) and the names of the
    items the look listed; when you prepare, the file is decrypted again and must hash the same

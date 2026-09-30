@@ -677,6 +677,44 @@ fn duplicate_names_are_refused() {
     assert_refused(&dst.0, &file, ErrorKind::Unsafe);
 }
 
+/// The backup's own list of items (its ZIP directory) names one item twice while its record names it once, and both copies are
+/// the same bytes, so nothing but the count shows it: the ZIP reader keeps one of them, and another program may read the other.
+#[test]
+fn a_backup_whose_own_list_names_an_item_twice_is_refused_even_when_the_copies_agree() {
+    let out = TempDir::new("outer-twice");
+    let body: &[u8] = b"RIFF the same bytes";
+    let files: Vec<(&str, &[u8])> = vec![("voices/a-1.wav", body)];
+    let manifest = manifest_for(&files);
+    let mut writer = zip::ZipWriter::new(Cursor::new(Vec::new()));
+    let opts = zip::write::SimpleFileOptions::default().compression_method(zip::CompressionMethod::Stored);
+    writer.start_file("manifest.json", opts).unwrap();
+    writer.write_all(&manifest.to_json()).unwrap();
+    for name in ["voices/a-1.wav", "voices/a-2.wav"] {
+        writer.start_file(name, opts).unwrap();
+        writer.write_all(body).unwrap();
+    }
+    let mut bytes = writer.finish().unwrap().into_inner();
+    // The second name, in its header and in the directory, made the first.
+    let (from, to) = (b"voices/a-2.wav", b"voices/a-1.wav");
+    let mut at = 0;
+    while let Some(i) = bytes[at..].windows(from.len()).position(|w| w == from) {
+        bytes[at + i..at + i + from.len()].copy_from_slice(to);
+        at += i + from.len();
+    }
+    // The premise: the reader shows two entries (the manifest and one voice) where the directory holds three.
+    assert_eq!(zip::ZipArchive::new(Cursor::new(bytes.clone())).map(|a| a.len()).unwrap_or(0), 2, "the reader hides the copy");
+    let plain = out.0.join("twice.zip");
+    fs::write(&plain, &bytes).unwrap();
+    let file = out.0.join("twice.oaiybackup");
+    container::encrypt_file(&plain, &file, PASS, Cost::Fixed(8)).unwrap();
+    let dst = TempDir::new("outer-twice-dst");
+    put(&dst.0, "callers.json", b"{}");
+    let err = restore::inspect(&dst.0, &file, PASS, &options()).unwrap_err();
+    assert_eq!(err.kind, ErrorKind::Unsafe, "{err}");
+    assert!(err.message.contains("lists the same item twice"), "{err}");
+    assert_refused(&dst.0, &file, ErrorKind::Unsafe);
+}
+
 #[test]
 fn a_backup_that_holds_what_a_backup_never_holds_is_refused() {
     for name in ["link/account.json", "desktop-e2e-identity.key", "companion/relay.json", "plugins/aokie/manifest.json", "models/x.gguf", "desktop-config.json", "plugin-backups/aokie/x.bak-1", "relay-log.jsonl"] {
