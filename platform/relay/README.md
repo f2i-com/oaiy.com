@@ -220,6 +220,7 @@ is an error, not a default. Keys this build understands (unknown keys are ignore
 | `limits.lookupWait`, `limits.lookupHeld` | 8, 4 | Waiting lookups (providers only) |
 | `limits.lanes.<lane>.body`, `.ttl.default`, `.ttl.max` | the protocol's | Narrow a lane's size cap or lifetime; never widen |
 | `call.enabled` | false | Call features: the ring lane, the admission issuer and the Aokie compatibility routes (see below) |
+| `call.challenge_s` | 25 | How long an Aokie endpoint challenge lives, 10 to 30 seconds. The shipped phone refuses a challenge that is more than 30 seconds ahead of its own clock or not ahead of it, so a phone clock may be `30 - challenge_s` seconds behind the relay's and `challenge_s - 1` ahead: 25 (FormLogic's and the design's) tolerates 5 behind and 24 ahead, 15 tolerates 15 behind and 14 ahead |
 | `apps` | unset (any) | The app ids this relay issues admissions for (a list); another is `403` |
 | `compat.sse` | `auto` | `auto`/`on`: offer the framed stream only after the calibration proved the host flushes; `force`: offer it regardless; `off`: never |
 | `turn.urls`, `turn.secret`, `turn.ttl`, `turn.relay_only` | none, none, 600, false | The TURN server of your coturn (`turn:` and `turns:` urls, at most 8), its `static-auth-secret` (32 to 4,096 bytes, not a placeholder), the credential lifetime (60 to 3,600 s) and whether every route must use TURN |

@@ -348,6 +348,19 @@ test('4.14.4 the plugin\'s challenge: kind, schema, identity and the roster of i
     eq(Relay::T0 + 85, aok_call($k, $plug, 'GET', 'challenge')['json']['expiresAt']);
 });
 
+test('4.14.4 the challenge lives call.challenge_s seconds (default 25; the shipped phone refuses one more than 30 seconds ahead of its clock or not ahead of it, so a phone clock may be 30 minus this many seconds behind the relay\'s and this many minus one ahead)', function () {
+    foreach ([10, 15, 30] as $life) {
+        [$k, $a, $b, $plug, $ta] = aok_pair(['call' => ['challenge_s' => $life]]);
+        eq(Relay::T0 + $life, aok_call($k, $plug, 'GET', 'challenge')['json']['expiresAt'], "the plugin's, $life seconds");
+        eq(Relay::T0 + $life, aok_call($k, $ta, 'GET', 'challenge')['json']['expiresAt'], "a phone's, $life seconds");
+        Tmp::setClock(Relay::T0 + 60);
+        eq(Relay::T0 + 60 + $life, aok_call($k, $plug, 'GET', 'challenge')['json']['expiresAt'], 'and from the clock of the moment');
+        Tmp::setClock(Relay::T0);
+    }
+    [$k, $a, $b, $plug] = aok_pair(['call' => ['challenge_s' => 25]]);
+    eq(Relay::T0 + 25, aok_call($k, $plug, 'GET', 'challenge')['json']['expiresAt']);
+});
+
 test('4.14.4 a phone\'s challenge: its own identity and the expected peer, never a roster member; the members of one role are never in the other\'s', function () {
     [$k, $a, $b, $plug, $ta] = aok_pair();
     $j = aok_call($k, $ta, 'GET', 'challenge')['json'];

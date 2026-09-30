@@ -31,8 +31,6 @@ defined('OAIY_RELAY') or exit;
  */
 final class AokieApi
 {
-    private const CHALLENGE_S = 25;
-
     /** @return list<array{0:list<string>,1:string,2:string,3:string,4:?list<string>,5:callable}> */
     public static function routes(): array
     {
@@ -65,7 +63,7 @@ final class AokieApi
             } else {
                 $doc += ['expectedPeerKeyThumbprint' => $f->expectedPeer];
             }
-            $doc['expiresAt'] = Clock::now() + self::CHALLENGE_S;
+            $doc['expiresAt'] = Clock::now() + $ctx->cfg->challengeSeconds();
             return Response::json(200, $doc, ['Pragma' => 'no-cache']);
         });
     }

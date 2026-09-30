@@ -28,7 +28,7 @@ final class Config
             'slotBytes' => 65536, 'sigItems' => 1024, 'sigSenderShare' => 0.25, 'lanes' => [],
         ],
         'apps' => null,
-        'call' => ['enabled' => false],
+        'call' => ['enabled' => false, 'challenge_s' => 25],
         'compat' => ['sse' => 'auto'],
         'turn' => ['urls' => [], 'secret' => null, 'ttl' => 600, 'relay_only' => false],
         'stun' => ['urls' => []],
@@ -39,6 +39,15 @@ final class Config
         'gc' => ['one_in' => 20],
         'client_ip' => ['header' => null, 'trusted_proxies' => []],
     ];
+
+    /**
+     * The life of an Aokie endpoint challenge, call.challenge_s: 25 is FormLogic's and the design's. The shipped phone refuses a
+     * challenge whose expiresAt is more than 30 seconds ahead of its own clock or not ahead of it at all, so 25 tolerates a phone clock
+     * 24 seconds ahead of the relay's and only 5 seconds behind it; 15 tolerates 15 either way. Below 10 a slow network would make the
+     * hello late.
+     */
+    public const CHALLENGE_MIN_S = 10;
+    public const CHALLENGE_MAX_S = 30;
 
     /** Numeric maxima a config may not exceed (section 4.3, 4.4, 4.7, 4.18.10). */
     private const MAX = [
@@ -182,6 +191,7 @@ final class Config
         if (!is_bool($c['call']['enabled'] ?? null)) {
             throw self::bad('call.enabled');
         }
+        self::intIn($c['call']['challenge_s'] ?? null, self::CHALLENGE_MIN_S, self::CHALLENGE_MAX_S, 'call.challenge_s');
         if (!in_array($c['compat']['sse'] ?? null, ['auto', 'on', 'off', 'force'], true)) {
             throw self::bad('compat.sse');
         }
@@ -292,6 +302,12 @@ final class Config
     public function callEnabled(): bool
     {
         return (bool)$this->c['call']['enabled'];
+    }
+
+    /** How long an Aokie endpoint challenge lives, in seconds (call.challenge_s, 10 to 30, default 25). */
+    public function challengeSeconds(): int
+    {
+        return (int)$this->c['call']['challenge_s'];
     }
 
     public function pepper(): ?string
