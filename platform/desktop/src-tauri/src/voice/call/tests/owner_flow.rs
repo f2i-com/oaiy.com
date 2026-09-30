@@ -324,7 +324,7 @@ fn notice(aokie: &Aokie, request: &str, kind: &str) -> Value {
 
 /// Every fixed line the desktop says for a request, in the order said (not the greeting, which has its own clock).
 fn fixed_lines_said(f: &Flow) -> Vec<String> {
-    let all: Vec<&str> = transfer::HOLD_LINES.iter().copied().chain([transfer::CONNECTING_LINE, transfer::OFFER_LINE, transfer::FAILED_LINE]).collect();
+    let all: Vec<&str> = transfer::HOLD_LINES.iter().copied().chain(transfer::STILL_CONNECTING_LINES).chain([transfer::CONNECTING_LINE, transfer::OFFER_LINE, transfer::FAILED_LINE]).collect();
     said_of(f, &all)
 }
 
@@ -345,32 +345,117 @@ async fn with_no_model_and_no_page_a_caller_hears_a_fixed_line_every_so_often_wh
     assert_eq!(f.dialog().await.len(), 1);
 }
 
-#[tokio::test]
-async fn after_an_acceptance_the_one_connecting_line_is_all_that_is_said_until_the_call_is_the_owners_or_the_takeover_fails() {
-    let timing = transfer::Timing { setup_limit: Duration::from_millis(2_500), ..quick() };
+/// The owner has accepted and the takeover is pending, on a call whose model is dead and whose Agent page answers nothing, so that only this
+/// desktop's own clocks can speak. The holding lines come `hold_every` apart (15 s in a real call) and the takeover is given ten seconds.
+async fn accepted_and_pending(hold_every: Duration) -> Flow {
+    let timing = transfer::Timing { hold_every, setup_limit: secs(10), ..quick() };
     let mut f = flow_full(owner_settings(true), None, crate::ring::testing::at_the_pc(), timing).await;
+    f.aokie.hub.set_page_answers(false);
     f.caller_says(ASKED);
     f.ring_through("assist_1", 30).await;
     f.a_device_takes_the_call("assist_1");
     f.aokie.event("call.transfer", secs(3)).await.expect("accepted");
     assert!(spoken_within(&f.aokie, transfer::CONNECTING_LINE, secs(2)).await, "at once: {:?}", f.aokie.speech.spoken());
-    // The takeover takes its time (here 2.5 s, where the hold lines come every 0.4 s) and nobody speaks: the contract has the receptionist
-    // say one short line on the accept and then nothing more, because anything more is spoken over the owner's first words. So nothing
-    // is said until the takeover has failed, and then the offer of a message.
-    let said_before = fixed_lines_said(&f);
-    assert_eq!(said_before.last().map(String::as_str), Some(transfer::CONNECTING_LINE));
-    let told = f.aokie.event("call.transfer", secs(4)).await.expect("the desktop gives up on the takeover");
+    f
+}
+
+fn connecting_lines_said(f: &Flow) -> Vec<String> {
+    said_of(f, &transfer::STILL_CONNECTING_LINES)
+}
+
+fn owner_takes_the_session(f: &Flow) {
+    f.aokie.send(json!({"type": "formlogic.realtime.stop", "callId": f.aokie.call, "generation": 1, "reason": "handoff:takeover"}));
+}
+
+#[tokio::test]
+async fn while_the_takeover_is_pending_the_caller_hears_the_connecting_line_and_two_holding_lines_and_no_more() {
+    // The lines come 0.4 s and 0.8 s after the acceptance here (15 s and 30 s in a real call); the takeover stalls, nobody speaks for the
+    // receptionist (no model, no page), and the caller who says something is not answered with more.
+    let mut f = accepted_and_pending(Duration::from_millis(400)).await;
+    assert!(spoken_within(&f.aokie, transfer::STILL_CONNECTING_LINES[0], secs(3)).await, "{:?}", f.aokie.speech.spoken());
+    assert!(spoken_within(&f.aokie, transfer::STILL_CONNECTING_LINES[1], secs(3)).await, "{:?}", f.aokie.speech.spoken());
+    f.aokie.hub.caller_said(&f.aokie.call, "Hello, is anyone there?", json!({}));
+    tokio::time::sleep(secs(2)).await;
+    assert_eq!(connecting_lines_said(&f), transfer::STILL_CONNECTING_LINES.to_vec(), "the two, in order, and no third: {:?}", f.aokie.speech.spoken());
+    let from_the_accept: Vec<String> = fixed_lines_said(&f).into_iter().skip_while(|l| l != transfer::CONNECTING_LINE).collect();
+    assert_eq!(from_the_accept, [transfer::CONNECTING_LINE, transfer::STILL_CONNECTING_LINES[0], transfer::STILL_CONNECTING_LINES[1]], "nothing else after the accept: {:?}", f.aokie.speech.spoken());
+    let told = f.aokie.events_within(Duration::from_millis(50)).await;
+    assert!(!told.iter().any(|e| e["type"] == "call.ended"), "the call was not ended: {told:?}");
+    assert!(f.aokie.text("formlogic.realtime.tool_call", Duration::from_millis(200)).await.is_none(), "no finish_call went to the phone");
+}
+
+#[tokio::test]
+async fn a_takeover_that_never_comes_ends_with_the_two_lines_and_then_the_offer_of_a_message() {
+    let timing = transfer::Timing { setup_limit: Duration::from_millis(2_500), ..quick() };
+    let mut f = flow_full(owner_settings(true), None, crate::ring::testing::at_the_pc(), timing).await;
+    f.aokie.hub.set_page_answers(false);
+    f.caller_says(ASKED);
+    f.ring_through("assist_1", 30).await;
+    f.a_device_takes_the_call("assist_1");
+    f.aokie.event("call.transfer", secs(3)).await.expect("accepted");
+    let told = f.aokie.event("call.transfer", secs(5)).await.expect("the desktop gives up on the takeover");
     assert_eq!((told["outcome"].clone(), told["source"].clone()), (json!("unavailable"), json!("watchdog")));
-    assert_eq!(fixed_lines_said(&f), said_before, "not a word between the connecting line and the failure: {:?}", f.aokie.speech.spoken());
-    assert!(spoken_within(&f.aokie, transfer::FAILED_LINE, secs(2)).await);
-    assert_eq!(f.aokie.speech.spoken().iter().filter(|l| *l == transfer::CONNECTING_LINE).count(), 1, "said once");
+    assert!(spoken_within(&f.aokie, transfer::FAILED_LINE, secs(3)).await, "{:?}", f.aokie.speech.spoken());
+    let after_hold_lines: Vec<String> = fixed_lines_said(&f).into_iter().skip_while(|l| l != transfer::CONNECTING_LINE).collect();
+    assert_eq!(after_hold_lines, [transfer::CONNECTING_LINE, transfer::STILL_CONNECTING_LINES[0], transfer::STILL_CONNECTING_LINES[1], transfer::FAILED_LINE], "{:?}", f.aokie.speech.spoken());
+}
+
+#[tokio::test]
+async fn a_stop_that_hands_the_call_to_the_owner_cancels_every_holding_line_still_to_come() {
+    let mut f = accepted_and_pending(secs(1)).await;
+    owner_takes_the_session(&f);
+    let handoff = f.aokie.event("call.handoff", secs(3)).await.expect("the app is told the owner has it");
+    assert_eq!(handoff["reason"], "handoff:takeover");
+    // Past where both lines would have been said (1 s and 2 s after the acceptance): nothing, and never a word after the stop.
+    tokio::time::sleep(Duration::from_millis(2_600)).await;
+    assert!(connecting_lines_said(&f).is_empty(), "{:?}", f.aokie.speech.spoken());
+    assert_eq!(fixed_lines_said(&f).last().map(String::as_str), Some(transfer::CONNECTING_LINE));
+}
+
+#[tokio::test]
+async fn a_stop_between_the_two_lines_cancels_the_second() {
+    let mut f = accepted_and_pending(secs(1)).await;
+    assert!(spoken_within(&f.aokie, transfer::STILL_CONNECTING_LINES[0], secs(3)).await, "{:?}", f.aokie.speech.spoken());
+    owner_takes_the_session(&f);
+    f.aokie.event("call.handoff", secs(3)).await.expect("the app is told the owner has it");
+    // The second was due a second after the first.
+    tokio::time::sleep(Duration::from_millis(2_200)).await;
+    assert_eq!(connecting_lines_said(&f), [transfer::STILL_CONNECTING_LINES[0]], "{:?}", f.aokie.speech.spoken());
+}
+
+#[tokio::test]
+async fn a_holding_line_that_falls_due_in_the_very_moment_the_stop_arrives_is_dropped() {
+    let mut f = accepted_and_pending(secs(1)).await;
+    assert!(spoken_within(&f.aokie, transfer::STILL_CONNECTING_LINES[0], secs(3)).await, "{:?}", f.aokie.speech.spoken());
+    // The stop comes in the very moment the second line's clock fires (a second after the first): the loop has not read it, and the clock's
+    // handler can see it. The line is not said; the stop is read next, and the owner has the call.
+    f.aokie.arrives_with_the_next_clock(json!({"type": "formlogic.realtime.stop", "callId": f.aokie.call, "generation": 1, "reason": "handoff:takeover"}));
+    let handoff = f.aokie.event("call.handoff", secs(4)).await.expect("the stop that was seen is read after all: the app is told the owner has it");
+    assert_eq!(handoff["reason"], "handoff:takeover");
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    assert_eq!(connecting_lines_said(&f), [transfer::STILL_CONNECTING_LINES[0]], "{:?}", f.aokie.speech.spoken());
+}
+
+#[tokio::test]
+async fn a_takeover_that_fails_between_the_lines_cancels_the_second_and_the_caller_is_offered_a_message() {
+    let mut f = accepted_and_pending(secs(1)).await;
+    assert!(spoken_within(&f.aokie, transfer::STILL_CONNECTING_LINES[0], secs(3)).await, "{:?}", f.aokie.speech.spoken());
+    f.aokie.send(outcome(&f.aokie, "assist_1", "unavailable", None));
+    let told = f.aokie.event("call.transfer", secs(3)).await.expect("the app is told");
+    assert_eq!((told["outcome"].clone(), told["source"].clone()), (json!("unavailable"), json!("phone")));
+    assert!(spoken_within(&f.aokie, transfer::FAILED_LINE, secs(3)).await, "the message is offered by the desktop itself: {:?}", f.aokie.speech.spoken());
+    tokio::time::sleep(Duration::from_millis(2_200)).await;
+    assert_eq!(connecting_lines_said(&f), [transfer::STILL_CONNECTING_LINES[0]], "{:?}", f.aokie.speech.spoken());
+    // And the receptionist is free to speak again.
+    assert!(f.aokie.say("Would you like to leave a message?").await.is_ok());
 }
 
 #[tokio::test]
 async fn a_caller_who_speaks_while_the_owner_is_rung_with_no_page_to_answer_is_answered_by_the_desktop_and_never_hung_up_on() {
     // No page holds the lease that answers calls (a closed or reloaded Agent page): the caller's next words used to end the call.
-    // The takeover is given time here (the quick clocks give it 0.6 s): what is checked is what is said while it is set up.
-    let timing = transfer::Timing { setup_limit: secs(5), ..quick() };
+    // The takeover is given time here (the quick clocks give it 0.6 s), and the holding lines are put far off: what is checked is that the
+    // caller's words are not what makes the desktop speak once the owner has accepted.
+    let timing = transfer::Timing { setup_limit: secs(5), hold_every: secs(30), ..quick() };
     let mut f = flow_full(owner_settings(true), None, crate::ring::testing::at_the_pc(), timing).await;
     f.aokie.hub.set_page_answers(false);
     f.caller_says(ASKED);
@@ -387,8 +472,8 @@ async fn a_caller_who_speaks_while_the_owner_is_rung_with_no_page_to_answer_is_a
     assert!(said_of(&f, &transfer::HOLD_LINES).len() > hold_lines_before, "{:?}", f.aokie.speech.spoken());
     assert_eq!(f.dialog().await.len(), 1, "and it still rings");
 
-    // The owner accepts: the caller who speaks is not hung up on either, and is not talked over the owner's first words: after the one
-    // connecting line the desktop says nothing, whatever the caller says.
+    // The owner accepts: the caller who speaks is not hung up on either, and is not answered with more lines: the connecting line, and
+    // the two holding lines on their own clock, are all that is said, whatever the caller says.
     f.a_device_takes_the_call("assist_1");
     f.aokie.event("call.transfer", secs(3)).await.expect("accepted");
     assert!(spoken_within(&f.aokie, transfer::CONNECTING_LINE, secs(2)).await, "{:?}", f.aokie.speech.spoken());
@@ -396,7 +481,7 @@ async fn a_caller_who_speaks_while_the_owner_is_rung_with_no_page_to_answer_is_a
     let before = fixed_lines_said(&f);
     f.aokie.hub.caller_said(&f.aokie.call, "Hello, is anyone there?", json!({}));
     tokio::time::sleep(Duration::from_millis(600)).await;
-    assert_eq!(fixed_lines_said(&f), before, "nothing more is said after the connecting line");
+    assert_eq!(fixed_lines_said(&f), before, "their words are not answered with a line");
     let told = f.aokie.events_within(Duration::from_millis(50)).await;
     assert!(!told.iter().any(|e| e["type"] == "call.ended"), "and the call was not ended: {told:?}");
     assert!(f.aokie.text("formlogic.realtime.tool_call", Duration::from_millis(200)).await.is_none(), "no finish_call went to the phone");

@@ -122,14 +122,18 @@ unchanged and checked by `scripts/check-transfer-contract.mjs`; what only OAIY d
 next to it); the code is `voice/transfer.rs`, `voice/call.rs` and
 `ring/`. **Consent is not signed on this computer** (a plugin could flip a scope), so the owner's switch is
 best kept off unless every installed plugin is trusted: the Transfers page and `RECEPTIONIST.md` say so. The rule for
-all of it: **a caller is never left in silence for long, and never told a lie.** There is one deliberate silence: once the
-owner has accepted, the receptionist says "Connecting you now" and then nothing until the owner has the call or the
-takeover has failed (up to 55 seconds), because the contract asks it not to speak over the owner's first words.
+all of it: **a caller is never left in silence for long, and never told a lie.** The longest silence there can be is 25
+seconds. After the owner has accepted, the receptionist says "Connecting you now", then, while the takeover is still set up, at
+most two short holding lines about 15 and 30 seconds later, and nothing at all once the owner has the call (the phone stops the
+session) or the takeover has failed: 15 seconds before the first line, 15 between the two, and 25 from the second to the 55
+seconds at which the takeover is given up on.
 The desktop's own clocks (`Transfer`, not the phone, the app or the model) say fixed lines: a hold line five
 seconds into a ring and every 15 seconds after (three wordings, at most six), "Connecting you now" at once
-on an acceptance and then nothing at all until the call is the owner's or the takeover fails (55 seconds:
-the contract has the receptionist say one line on `accepted` and fall silent, because anything more would
-be spoken over the owner's first words), and the offer of a message 4 seconds after a
+on an acceptance and, while the takeover is set up (55 seconds at most), two holding lines 15 and 30 seconds after it ("Thank you
+for waiting, I'm still connecting you.", "Still working on connecting you, thank you for your patience.": they say only that it is
+being done, and promise no result and no time) and nothing more. The phone's stop (the owner has the caller), a takeover that
+fails, and the caller hanging up each cancel a line not yet said, and a line that falls due in the very moment the stop arrives
+is not said: nothing is said over the owner's first words, and never after the stop. The offer of a message comes 4 seconds after a
 decline, a ring nobody took or a failed takeover, unless the receptionist has already spoken. A line waits
 for a receptionist who has spoken lately. When no page is answering calls (the Agent is closed or reloading),
 a caller's words no longer end the call while a request is going: the call is told `NoAnswerer` and answers
@@ -150,9 +154,10 @@ desktop rings: a native notification and the dialog; the phone offers the call t
         names, and to no others
 agent : "I'll try to reach them, please stay with me."  (it is trying: it does not know anyone will come)
 ...then one of:
-  accepted    → the desktop says "Connecting you now, one moment." itself, cuts what plays, and refuses
-                every further line and the end of the call from the agent; the session stops with
-                handoff:takeover; the call is not over (call.handoff, not call.ended)
+  accepted    → the desktop says "Connecting you now, one moment." itself, cuts what plays, refuses
+                every further line and the end of the call from the agent and, while the takeover is set up, says two
+                holding lines (about 15 and 30 s on); the session stops with handoff:takeover (nothing is said after
+                that); the call is not over (call.handoff, not call.ended)
   declined / expired / unavailable → the agent is told, in a note, what is true and to offer a message
   (nothing heard) → the desktop's own clocks end the ring and say the fixed lines (see the contract)
 ```

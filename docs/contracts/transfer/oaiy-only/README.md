@@ -16,14 +16,15 @@ compared with Aokie's copy. `SHA256SUMS` here lists its three fixtures.
 
 ## OAIY's own words
 
-Reasons OAIY puts in a `transfer_to_owner` tool result itself, for the model, when nothing reaches the plugin.
-All are `status: "unavailable"` (offer a message). They are not in the shared vocabulary table beyond the first two:
+Reasons OAIY puts in a `transfer_to_owner` tool result itself, for the model, when nothing reaches the plugin or the plugin
+does not answer. All are `status: "unavailable"` (offer a message). The shared vocabulary table (`transfer-v1.md`, the reason
+vocabulary) lists all three as OAIY's own words; this is how this desktop uses them:
 
 | `reason` | When |
 |---|---|
 | `not_offered` | transfer is not on for this call: the owner has it off, the phone did not say `allowTransfer`, or it is a call this desktop placed |
 | `tool_limit` | OAIY's own tool budget for the call is spent (the plugin's `tool_limit` is `{"error": ...}` with no `status`) |
-| `no_answer` | the plugin did not answer the request in 25 seconds: the model is answered for it, and what waited behind the request goes |
+| `no_answer` | the plugin did not answer the `transfer_to_owner` request within 25 seconds: the model is answered for it, and what waited behind the request goes. It is not a ring nobody answered: that is the plugin's own `expired` outcome |
 
 The plan reasons OAIY puts in an `oaiy.ring.plan` answer are exactly the plugin's closed set
 (`transfer-v1.tool-result.fixture.json`, `planReasons`). A plan that would ring only this computer's toast is
@@ -31,10 +32,15 @@ The plan reasons OAIY puts in an `oaiy.ring.plan` answer are exactly the plugin'
 
 ## Where OAIY goes beyond the contract, and where it holds to it
 
-* **Silence after `accepted`.** On `accepted` OAIY says one fixed line ("Connecting you now, one moment.") and
-  then nothing until the session stops with `handoff:takeover`, an `unavailable` outcome or a `failback` start,
-  or its own 55 second clock (45 s of setup and 10 s of grace) says the takeover failed. The application's own
-  lines are refused meanwhile.
+* **After `accepted`.** OAIY says one fixed line ("Connecting you now, one moment."). While the takeover is pending (no
+  stop, no `unavailable` outcome, no `failback` start yet) it may say two more, about 15 s and 30 s after the accept,
+  each saying only that the connection is still being made ("Thank you for waiting, I'm still connecting you." and
+  "Still working on connecting you, thank you for your patience."), on its own clock, whether or not the model or
+  the Agent page works. The stop with `handoff:takeover`, an `unavailable` outcome, a `failback` start or the caller
+  hanging up cancels a line not yet said, a line that falls due in the very moment a stop arrives is dropped, and
+  nothing is said after the stop. Its own 55 second clock (45 s of setup and 10 s of grace) ends a takeover that
+  never comes, and the caller is offered a message. With the two lines the longest silence is 25 s. The
+  application's own lines are refused throughout.
 * **While the owner is rung** the desktop says a fixed hold line five seconds in and every 15 seconds after
   (three wordings, at most six) when the receptionist has said nothing, whether or not the model or the Agent
   page is working. None of them says the call is being put through, and a line from the model that does is

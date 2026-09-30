@@ -112,8 +112,8 @@ switches are **off** until you turn them on, and with them off the phone answers
   be put away with **Not now**: your devices go on ringing). The call is taken on your **Companion** (the Companion on this
   computer, or one on a second phone: the phone that carries the calls cannot be the one), which
   needs the Companion's consent for taking calls (the Phone page). Until you take it the caller
-  is never told they are being put through; once you have, they hear "Connecting you now" and the
-  receptionist says nothing more.
+  is never told they are being put through; once you have, they hear "Connecting you now", then, while the
+  connection is being made, at most two short lines saying it is still being made, and nothing once you have the call.
 - **It needs a device.** A notification on this computer is not something a call can be offered
   to: the phone plugin offers a transfer only to the Companions the plan names. So a ring happens
   only when you have set one up: tick **This is the Companion on this computer** (Transfers page)
@@ -131,7 +131,7 @@ What happens, every way it can go:
 
 | The owner... | The caller hears |
 |---|---|
-| accepts on the Companion | "Connecting you now, one moment." then you. If it cannot be connected, "I'm sorry, I couldn't connect you. Would you like to leave a message?" |
+| accepts on the Companion | "Connecting you now, one moment.", then (if the connection takes a while) up to two short "still connecting" lines, then you. If it cannot be connected, "I'm sorry, I couldn't connect you. Would you like to leave a message?" |
 | declines (on the Companion, or **Decline and take a message** here: the phone is asked to withdraw the request and answers within two seconds) | the receptionist, kindly: they cannot come to the phone, and an offer to take a message. If you left words for the caller they are relayed faithfully, with no promise added. If a device of yours took the call just before, the phone says so and nothing is offered |
 | does not answer in time | the same offer of a message |
 | is not to be rung (quiet hours, nobody at the computer and no phone to ring, every phone on do-not-disturb, no Companion set up to take a call, no consent) | the same offer, and nothing rings |
@@ -139,21 +139,25 @@ What happens, every way it can go:
 
 The receptionist never promises a callback time, never says why you are not available, and has no
 number of yours to give. What the caller hears does not depend on the model or the Agent page
-working: the desktop says short fixed lines itself, on its own clocks. The one silence is deliberate: after
-you accept, the receptionist says one line and then nothing until you have the call (see below).
+working: the desktop says short fixed lines itself, on its own clocks. The longest silence a caller can hear
+is 25 seconds, and only while a connection you accepted is being made (see below).
 
 - **While you are rung**, if the receptionist has said nothing, a hold line five seconds in and
   another every 15 seconds after (three wordings in turn, at most six, so a ring of 90 seconds is
   covered): the longest silence is about 15 seconds. None of them says the call is being put through.
-- **After you accept**, "Connecting you now" at once, and then nothing: the receptionist falls silent
-  until the call is yours, so it is never speaking over your first words. The takeover has 55
-  seconds; if it has not come by then the desktop says it could not connect the caller and offers a message.
+- **After you accept**, "Connecting you now" at once. While the connection is being made the caller then hears at
+  most two short lines, about 15 and 30 seconds later ("Thank you for waiting, I'm still connecting you." and
+  "Still working on connecting you, thank you for your patience.": they say only that it is being made, never that you
+  are on the line). Once you have the call nothing more is said, and never a word after your Companion takes it, so
+  the receptionist is never speaking over your first words. The connection has 55 seconds; if it has not come by
+  then the desktop says it could not connect the caller and offers a message. With the two lines the longest silence is
+  25 seconds (15 before the first, 15 between them, 25 from the second to the 55).
 - **After a decline, a ring nobody took or a takeover that failed**, the offer of a message within
   4 seconds of the phone's answer, unless the receptionist has already made it.
 
 - **If the Agent page is closed or reloaded** while you are rung (nothing is answering calls), a
   caller who speaks is not hung up on: they hear the hold line or the offer of
-  a message, whichever fits, straight away (not more than one every 3 seconds); after you accept they hear nothing more. Only a call with no
+  a message, whichever fits, straight away (not more than one every 3 seconds); after you accept their words are not answered with more lines, only the two timed ones above. Only a call with no
   request going is finished for want of a page, as it always was.
 
 What it does not cover: a phone plugin that is not running or has lost its connection to this

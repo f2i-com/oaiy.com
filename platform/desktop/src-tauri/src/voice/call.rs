@@ -46,7 +46,7 @@
 //!
 //! The app is told when things were said, in milliseconds since the call began.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant};
@@ -76,7 +76,7 @@ pub enum CallCommand {
     Hush,
     /// The caller spoke and no page is answering calls. While a request to reach the owner rings, or the owner is taking the
     /// call, the caller is not hung up on: the desktop says the fixed line that fits (a hold line, the offer of a message; after
-    /// an acceptance nothing more). With no request going the call is finished, as it always was.
+    /// an acceptance nothing in answer, the holding lines come on their own clock). With no request going the call is finished, as it always was.
     NoAnswerer,
     /// The owner declined a ring in the dashboard's dialog (or it ran out here): the phone is asked to withdraw the request
     /// (`formlogic.realtime.transfer_cancel`), and its answer decides what the caller hears; if it does not answer in a couple of
@@ -590,6 +590,43 @@ async fn send_waiting(
     }
 }
 
+/// A frame of Aokie's stream, or the end of it: what the loop has been given and not yet read (see [`stop_already_here`]).
+type Frame<E> = Option<Result<Message, E>>;
+
+/// The next frame of the stream: one already taken from it (by [`stop_already_here`]), oldest first, and then the stream's own.
+async fn next_frame<St, E>(backlog: &mut VecDeque<Frame<E>>, stream: &mut St) -> Frame<E>
+where
+    St: Stream<Item = Result<Message, E>> + Unpin,
+{
+    match backlog.pop_front() {
+        Some(frame) => frame,
+        None => stream.next().await,
+    }
+}
+
+/// Whether the phone's stop, or the end of its stream, is already here: among what it has sent and this loop has not yet read. Nothing is
+/// waited for. What is read from the stream to see is kept, in order, for [`next_frame`]. A holding line that falls due in the same
+/// moment as a stop is not said: the stop means the owner has the caller, and nothing is said over their first words.
+fn stop_already_here<St, E>(backlog: &mut VecDeque<Frame<E>>, stream: &mut St) -> bool
+where
+    St: Stream<Item = Result<Message, E>> + Unpin,
+{
+    use futures_util::FutureExt;
+    while let Some(frame) = stream.next().now_or_never() {
+        let over = !matches!(frame, Some(Ok(_)));
+        backlog.push_back(frame);
+        if over {
+            break;
+        }
+    }
+    backlog.iter().any(|frame| match frame {
+        Some(Ok(Message::Text(text))) => serde_json::from_str::<Value>(text).ok().is_some_and(|v| v.get("type").and_then(Value::as_str) == Some("formlogic.realtime.stop")),
+        Some(Ok(_)) => false,
+        // The stream ended or broke: the call is over, and nothing is said into it.
+        _ => true,
+    })
+}
+
 /// One call, over the two halves of Aokie's stream: what goes to Aokie (`sink`) and what comes from it.
 async fn run_on<Si, St, E>(mut sink: Si, mut stream: St, hub: VoiceHub, engines: Engines)
 where
@@ -932,11 +969,13 @@ where
         let _ = speak_tx.send(Speak::Wake);
         ledger.lock().unwrap().take(was)
     };
+    // Frames taken from the stream to see whether a stop is already there (see `stop_already_here`), and not yet read.
+    let mut backlog: VecDeque<Frame<E>> = VecDeque::new();
     let reason: String = loop {
         // The next moment one of the transfer's clocks has something to do: a caller is not left in silence.
         let watch = [transfer.next_deadline(), tools.next_expiry(timing.tool_answer)].into_iter().flatten().min();
         tokio::select! {
-            message = stream.next() => {
+            message = next_frame(&mut backlog, &mut stream) => {
                 let Some(Ok(message)) = message else { break "the stream closed".into() };
                 match message {
                     Message::Text(text) => {
@@ -1371,6 +1410,12 @@ where
                         Due::Say(line) => {
                             speak(line.to_string(), false, None);
                         }
+                        // A holding line while the takeover is set up: not if the phone's stop is already here (the owner has the caller).
+                        Due::Connecting(line) => {
+                            if !stop_already_here(&mut backlog, &mut stream) {
+                                speak(line.to_string(), false, None);
+                            }
+                        }
                         // Nothing was heard of how it came out: it is over, as if the phone had said so, and the phone is asked to
                         // drop the request it may still hold (best effort: nothing waits for the answer).
                         Due::GiveUp(request) => {
@@ -1458,7 +1503,31 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::pin::Pin;
     use std::sync::atomic::AtomicBool;
+    use std::task::{Context, Poll};
+
+    /// The phone's stream as the call reads it, plus one frame that is there only for a look without waiting: what a frame that arrives in the
+    /// very moment a clock fires looks like (the loop's own read, which waits, is not given it; `stop_already_here`, which does not, is). A
+    /// look without waiting is a poll with a waker that wakes nothing.
+    struct PeekFirst<S> {
+        inner: S,
+        peek_only: Arc<Mutex<Option<Message>>>,
+    }
+
+    impl<S: Stream<Item = Result<Message, std::convert::Infallible>> + Unpin> Stream for PeekFirst<S> {
+        type Item = Result<Message, std::convert::Infallible>;
+
+        fn poll_next(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
+            let this = self.get_mut();
+            if cx.waker().will_wake(futures_util::task::noop_waker_ref()) {
+                if let Some(frame) = this.peek_only.lock().unwrap().take() {
+                    return Poll::Ready(Some(Ok(frame)));
+                }
+            }
+            Pin::new(&mut this.inner).poll_next(cx)
+        }
+    }
 
     #[test]
     fn a_line_to_say_is_asked_for_by_the_start() {
@@ -1466,6 +1535,74 @@ mod tests {
         assert!(speaks_only(&start("speak")));
         assert!(!speaks_only(&start("call")));
         assert!(!speaks_only(&json!({"type": "formlogic.realtime.start"})));
+    }
+
+    fn text_frame(v: Value) -> Frame<()> {
+        Some(Ok(Message::Text(v.to_string())))
+    }
+
+    fn stop() -> Frame<()> {
+        text_frame(json!({"type": "formlogic.realtime.stop", "callId": "call_1", "generation": 1, "reason": "handoff:takeover"}))
+    }
+
+    /// A stream that has delivered `frames` and then has nothing more for now (it is not over).
+    fn delivering(frames: Vec<Frame<()>>) -> impl Stream<Item = Result<Message, ()>> + Unpin {
+        futures_util::stream::iter(frames.into_iter().flatten()).chain(futures_util::stream::pending())
+    }
+
+    #[tokio::test]
+    async fn a_stop_that_is_already_here_is_seen_without_waiting_and_nothing_is_lost_or_reordered() {
+        let audio = || Some(Ok(Message::Binary(vec![1, 2, 3])));
+        let chatter = || text_frame(json!({"type": "formlogic.realtime.transfer_outcome", "outcome": "accepted"}));
+        let kinds = |backlog: &VecDeque<Frame<()>>| -> Vec<String> {
+            backlog
+                .iter()
+                .map(|f| match f {
+                    Some(Ok(Message::Binary(_))) => "audio".to_string(),
+                    Some(Ok(Message::Text(t))) => serde_json::from_str::<Value>(t).unwrap()["type"].as_str().unwrap().to_string(),
+                    Some(Ok(_)) => "other".to_string(),
+                    Some(Err(_)) => "error".to_string(),
+                    None => "closed".to_string(),
+                })
+                .collect()
+        };
+        // Nothing has come: no stop, and it did not wait for one.
+        let mut backlog = VecDeque::new();
+        let mut nothing = delivering(vec![]);
+        assert!(!stop_already_here(&mut backlog, &mut nothing));
+        assert!(backlog.is_empty());
+        // Frames that are not a stop: no stop, and they are kept, in order, for the loop.
+        let mut stream = delivering(vec![audio(), chatter(), audio()]);
+        assert!(!stop_already_here(&mut backlog, &mut stream));
+        assert_eq!(kinds(&backlog), ["audio", "formlogic.realtime.transfer_outcome", "audio"]);
+        // A stop behind them is found, and they and it are still there in order.
+        let mut backlog = VecDeque::new();
+        let mut stream = delivering(vec![audio(), chatter(), stop(), audio()]);
+        assert!(stop_already_here(&mut backlog, &mut stream));
+        assert_eq!(kinds(&backlog), ["audio", "formlogic.realtime.transfer_outcome", "formlogic.realtime.stop", "audio"]);
+        // What was taken is read before anything more from the stream, oldest first, and then the stream itself.
+        let mut stream = delivering(vec![text_frame(json!({"type": "later"}))]);
+        let mut read = Vec::new();
+        for _ in 0..5 {
+            // A frame that was lost would leave this waiting for ever: a short wait is the failure.
+            read.push(tokio::time::timeout(Duration::from_millis(500), next_frame(&mut backlog, &mut stream)).await.expect("a frame taken to look was lost"));
+        }
+        assert!(matches!(read[0], Some(Ok(Message::Binary(_)))) && matches!(read[3], Some(Ok(Message::Binary(_)))));
+        assert!(matches!(&read[2], Some(Ok(Message::Text(t))) if t.contains("realtime.stop")));
+        assert!(matches!(&read[4], Some(Ok(Message::Text(t))) if t.contains("later")));
+        assert!(backlog.is_empty());
+        // The stream having ended or broken means the call is over: nothing is said into it either.
+        let mut backlog = VecDeque::new();
+        let mut ended = futures_util::stream::iter(Vec::<Result<Message, ()>>::new());
+        assert!(stop_already_here(&mut backlog, &mut ended));
+        assert_eq!(kinds(&backlog), ["closed"]);
+        let mut backlog = VecDeque::new();
+        let mut broken = futures_util::stream::iter(vec![Err(())]).chain(futures_util::stream::pending());
+        assert!(stop_already_here(&mut backlog, &mut broken));
+        // A text frame that is not JSON, and a stop-like word in another member, are not a stop.
+        let mut backlog = VecDeque::new();
+        let mut stream = delivering(vec![Some(Ok(Message::Text("stop".into()))), text_frame(json!({"type": "formlogic.realtime.begin", "reason": "formlogic.realtime.stop"}))]);
+        assert!(!stop_already_here(&mut backlog, &mut stream));
     }
 
     #[test]
@@ -1763,9 +1900,17 @@ mod tests {
         fence_broken: Arc<AtomicBool>,
         /// The desktop's `ready`.
         ready: Value,
+        /// A frame that is there for a look without waiting and not for the loop's own read (see `PeekFirst`).
+        peek_only: Arc<Mutex<Option<Message>>>,
     }
 
     impl Aokie {
+        /// `frame` arrives in the very moment the desktop's next clock fires: the clock's handler can see it by looking without waiting, and
+        /// the loop's own read does not have it until that look has found it.
+        fn arrives_with_the_next_clock(&self, frame: Value) {
+            *self.peek_only.lock().unwrap() = Some(Message::Text(frame.to_string()));
+        }
+
         /// A call started (with `fields` in its start), up to the desktop's `ready`.
         async fn start(fields: Value) -> Self {
             Self::start_with(fields, |_| {}).await
@@ -1791,6 +1936,8 @@ mod tests {
             let (to_desktop, from_aokie) = mpsc::unbounded_channel::<Message>();
             let (to_aokie, from_desktop) = mpsc::unbounded_channel::<Message>();
             let stream = futures_util::stream::unfold(from_aokie, |mut rx| async move { rx.recv().await.map(|m| (Ok::<_, std::convert::Infallible>(m), rx)) });
+            let peek_only = Arc::new(Mutex::new(None));
+            let stream = PeekFirst { inner: Box::pin(stream), peek_only: peek_only.clone() };
             let sink = futures_util::sink::unfold(to_aokie, |tx, m: Message| async move { tx.send(m).map(|()| tx).map_err(|_| "Aokie hung up") });
             tokio::spawn(run_on(Box::pin(sink), Box::pin(stream), hub.clone(), Engines::at(&at, &at)));
             let fence_broken = Arc::new(AtomicBool::new(false));
@@ -1800,7 +1947,7 @@ mod tests {
                 start[key] = value;
             }
             to_desktop.send(Message::Text(start.to_string())).unwrap();
-            let mut aokie = Self { to_desktop, from_desktop, events, hub, call, begun: Instant::now(), speech, at, fence_broken, ready: Value::Null };
+            let mut aokie = Self { to_desktop, from_desktop, events, hub, call, begun: Instant::now(), speech, at, fence_broken, ready: Value::Null, peek_only };
             let ready = aokie.next(Duration::from_secs(5)).await;
             assert!(matches!(&ready, Some(Message::Text(t)) if t.contains("formlogic.realtime.ready")), "not ready");
             if let Some(Message::Text(t)) = ready {
