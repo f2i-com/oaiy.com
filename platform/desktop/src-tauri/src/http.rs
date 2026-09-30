@@ -1965,6 +1965,42 @@ mod tests {
         assert!(!is_privileged_path(&Method::POST, "/api/ringing"));
     }
 
+    /// The access model's table (`auth/routes.rs`) has a row for each route of the receptionist's transfers and messages, in the scope of its kind
+    /// (reading callers' words, numbers and the owner's settings is `calls.read`, as the call events are; acting on a message, a ring or the settings is
+    /// `calls.write`, as `say` and `finish` are), with `since: 1` (the routes exist, and `legacy` mode keeps the guard they were built with), and the
+    /// scoped CORS answers a paired page's preflight for each method, PATCH and DELETE included, and no page that has not paired.
+    #[test]
+    fn the_receptionists_routes_take_the_scope_of_their_kind_and_the_scoped_cors_lets_a_paired_page_use_them() {
+        use crate::auth::routes::{pattern_existed_before, route_class, Class};
+        let paired: std::collections::BTreeSet<String> = ["https://app.oaiy.com".to_string()].into();
+        let routes = [
+            (Method::GET, "/api/messages", "calls.read"),
+            (Method::GET, "/api/messages/:id", "calls.read"),
+            (Method::PATCH, "/api/messages/:id", "calls.write"),
+            (Method::DELETE, "/api/messages/:id", "calls.write"),
+            (Method::GET, "/api/ring/settings", "calls.read"),
+            (Method::PUT, "/api/ring/settings", "calls.write"),
+            (Method::GET, "/api/ring/preview", "calls.read"),
+            (Method::GET, "/api/ring/active", "calls.read"),
+            (Method::POST, "/api/ring/active/:id/respond", "calls.write"),
+            (Method::POST, "/api/ring/notices/:id/dismiss", "calls.write"),
+            (Method::POST, "/api/voice/calls/:id/message", "calls.write"),
+        ];
+        for (method, pattern, scope) in &routes {
+            assert_eq!(route_class(method, pattern), Class::Scope(scope), "{method} {pattern}");
+            assert!(pattern_existed_before(pattern), "{pattern}: the guard these routes were built with is the one `legacy` mode keeps");
+            let cors = crate::auth::cors::decide(method, Some(pattern), Some("https://app.oaiy.com"), &paired, false);
+            assert_eq!(cors.get("access-control-allow-origin"), Some("https://app.oaiy.com"), "{method} {pattern}: a paired page's preflight is answered");
+            assert!(cors.get("access-control-allow-methods").is_some_and(|m| m.split(", ").any(|m| m == method.as_str())), "{method} {pattern}: {:?}", cors.get("access-control-allow-methods"));
+            assert!(crate::auth::cors::decide(method, Some(pattern), Some("https://evil.example"), &paired, false).is_empty(), "{method} {pattern}: a page that has not paired gets nothing");
+        }
+        // Every route this module's routers register is one of those (a route added to them needs its row and its line here).
+        let scanned = crate::auth::route_coverage::scan_main_router().found;
+        for f in scanned.iter().filter(|f| f.file.starts_with("ring/routes.rs") || f.file.starts_with("messages/routes.rs")) {
+            assert!(routes.iter().any(|(m, p, _)| m.as_str() == f.verb.as_str() && *p == f.pattern), "{} {} ({}:{}) has no line in this test: is its row in `auth/routes.rs` the scope of its kind?", f.verb.as_str(), f.pattern, f.file, f.line);
+        }
+    }
+
     /// Every HTTP method the dashboard's and the Agent's sources send to this API (`method: 'PATCH'`; tests excluded). Read at test time, so a
     /// verb added to a page later is held to the layer with no edit here.
     fn methods_the_pages_send() -> std::collections::BTreeMap<String, Vec<String>> {

@@ -11,11 +11,19 @@
 # without their elevation flag (the appendix says "own rule, 4.7"; the table holds `elevate: false` for all).
 #
 # The differences from the appendix, decided on purpose and the only ones:
-#   + the four routes the code gained since the design counted them (marked "added since the appendix"):
+#   + the eleven routes the code gained since the design counted them (marked "added since the appendix"):
 #       GET /api/update/status (system.read), POST /api/update/check (services.control: it makes OAIY ask
 #       GitHub for a release, so a monitor's token must not do it), POST /api/update/agent-flushed
-#       (agent.serve) (the updater) and POST /api/plugins/:id/trust (plugins.install), each classified on
-#       purpose in src/auth/routes.rs;
+#       (agent.serve) (the updater) and POST /api/plugins/:id/trust (plugins.install), and seven of the
+#       receptionist's transfers and messages: GET /api/messages/:id (calls.read), DELETE /api/messages/:id
+#       (calls.write), GET /api/ring/preview (calls.read), GET /api/ring/active (calls.read),
+#       POST /api/ring/active/:id/respond (calls.write), POST /api/ring/notices/:id/dismiss (calls.write) and
+#       POST /api/voice/calls/:id/message (calls.write), each classified on purpose in src/auth/routes.rs;
+#   ~ four rows the design reserved (since 2, "(rsv)": the routes were not built) and the code built since,
+#       before the access model merged (marked "built since the appendix"): GET /api/messages and
+#       GET /api/ring/settings (calls.read), PATCH /api/messages/:id and PUT /api/ring/settings (calls.write).
+#       Their scope is the design's; their since is 1 now, because the routes exist and `legacy` mode keeps the
+#       guard they were built with;
 #   - GET /api/update, the updater design's reserved row: it was built as GET /api/update/status;
 #   - control.project (the change level of POST /api/mcp) and every other /api/relay/* route the relay design
 #     adds are not rows: no route exists for them yet.
@@ -142,8 +150,8 @@ GET /api/voice/events scope:calls.read 1 all
 GET /api/voice/calls scope:calls.read 1 all
 GET /api/voice/voices scope:calls.read 1 all
 GET /api/voice/settings scope:calls.read 1 all
-GET /api/messages scope:calls.read 2 all
-GET /api/ring/settings scope:calls.read 2 all
+GET /api/messages scope:calls.read 1 all  # built since the appendix
+GET /api/ring/settings scope:calls.read 1 all  # built since the appendix
 POST /api/voice/calls/:id/say scope:calls.write 1 all
 POST /api/voice/calls/:id/tool scope:calls.write 1 all
 POST /api/voice/calls/:id/finish scope:calls.write 1 all
@@ -154,8 +162,8 @@ POST /api/voice/voices scope:calls.write 1 all
 PUT /api/voice/voices/chosen scope:calls.write 1 all
 DELETE /api/voice/voices/:name scope:calls.write 1 all
 POST /api/voice/voices/:name/try scope:calls.write 1 all
-PATCH /api/messages/:id scope:calls.write 2 all
-PUT /api/ring/settings scope:calls.write 2 all
+PATCH /api/messages/:id scope:calls.write 1 all  # built since the appendix
+PUT /api/ring/settings scope:calls.write 1 all  # built since the appendix
 GET /api/calendar scope:calendar.read 1 all
 GET /api/calendar/free scope:calendar.read 1 all
 GET /api/calendar/sync scope:calendar.read 1 all
@@ -285,3 +293,10 @@ GET /api/update/status scope:system.read 1 all  # added since the appendix
 POST /api/update/check scope:services.control 1 all  # added since the appendix
 POST /api/update/agent-flushed scope:agent.serve 1 all  # added since the appendix
 POST /api/plugins/:id/trust scope:plugins.install 1 all  # added since the appendix
+GET /api/messages/:id scope:calls.read 1 all  # added since the appendix
+DELETE /api/messages/:id scope:calls.write 1 all  # added since the appendix
+GET /api/ring/preview scope:calls.read 1 all  # added since the appendix
+GET /api/ring/active scope:calls.read 1 all  # added since the appendix
+POST /api/ring/active/:id/respond scope:calls.write 1 all  # added since the appendix
+POST /api/ring/notices/:id/dismiss scope:calls.write 1 all  # added since the appendix
+POST /api/voice/calls/:id/message scope:calls.write 1 all  # added since the appendix

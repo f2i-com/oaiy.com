@@ -2,10 +2,14 @@
 //!
 //! Copied from `platform/desktop/src-tauri/src/http.rs` at commit 2ea1ee8 (`origin_guard` and everything it
 //! decides with: the path predicates, the origin lists, the bearer comparison, `AuthConfig`), byte for byte
-//! except that `AuthConfig`, its fields and `origin_guard` are `pub(super)` so the test can reach them.
-//! Nothing else is changed. Do not edit it: the differential test in `legacy_neutrality.rs` exists to notice
-//! when the live guard stops answering as this one does, and it can only do that against a copy that does not
-//! move with it.
+//! except that `AuthConfig`, its fields and `origin_guard` are `pub(super)` so the test can reach them, and
+//! for four lines of `is_personal_path` (marked there) that name the routes the receptionist's transfers and
+//! messages add (`/api/ring/*`, `/api/messages/*`). Those routes did not exist at 2ea1ee8 and were given the
+//! guard of every route of their kind (a read is a restricted read, a change is privileged) when they were
+//! built, before the access model merged; the differential compares the live guard with this one on them, and
+//! can only do so fairly if this one knows them. Nothing else is changed. Do not edit it: the differential
+//! test in `legacy_neutrality.rs` exists to notice when the live guard stops answering as this one does, and
+//! it can only do that against a copy that does not move with it.
 
 #![allow(dead_code)]
 
@@ -178,6 +182,12 @@ fn is_personal_path(path: &str) -> bool {
         || path.starts_with("/api/calendar/")
         || path == "/api/contacts"
         || path.starts_with("/api/contacts/")
+        // (Not in the guard of 2ea1ee8: the same four lines as the live `is_personal_path`, for the routes of the
+        // receptionist's transfers and messages, which that guard was given when they were built. See the module docs.)
+        || path == "/api/ring"
+        || path.starts_with("/api/ring/")
+        || path == "/api/messages"
+        || path.starts_with("/api/messages/")
         || path.starts_with("/api/agent/")
 }
 

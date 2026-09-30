@@ -400,8 +400,27 @@ pub static ROUTES: &[Route] = &[
     scope(Verb::Get, "/api/voice/calls", "calls.read"),
     scope(Verb::Get, "/api/voice/voices", "calls.read"),
     scope(Verb::Get, "/api/voice/settings", "calls.read"),
-    scope_rsv(Verb::Get, "/api/messages", "calls.read"),
-    scope_rsv(Verb::Get, "/api/ring/settings", "calls.read"),
+    // The receptionist's transfers and messages (`ring/routes.rs`, `messages/routes.rs`) were built after the
+    // design counted its routes, before the access model merged: four of these rows are the ones the design
+    // reserved (`since: 2`, no route yet) and are now `since: 1`, since the routes exist and the guard that has
+    // always been in front of them (the `is_personal_path` lines in `http.rs`) is what `legacy` mode keeps; seven
+    // are not in the design at all (`routes.golden.txt` marks them "added since the appendix"). What each is:
+    //
+    // - Reading the messages (callers' words and numbers), the rings going now (who is asking for the owner and
+    //   what they said), the owner's transfer settings (their VIP numbers, quiet hours, which Companions ring) and
+    //   what a caller would get now is `calls.read`, the scope of the call events and the calls list: the same
+    //   words and the same numbers, from the same callers.
+    // - A message marked seen or handled, or deleted, a ring declined (or a message offered in its place), a
+    //   notice put away, the settings changed and the receptionist's own `take_message` on its call are
+    //   `calls.write`: they act on what callers said and on what happens to a live call, as `say`, `finish` and the
+    //   voice settings do. Deleting a message is no more dangerous than deleting a contact or an appointment
+    //   (`contacts.write`, `calendar.write`), and none of them takes the call to the owner: only the Companion
+    //   does that, and no route here accepts. Turning transfers on is a `calls.write` too, as the design has it.
+    scope(Verb::Get, "/api/messages", "calls.read"),
+    scope(Verb::Get, "/api/messages/:id", "calls.read"),
+    scope(Verb::Get, "/api/ring/settings", "calls.read"),
+    scope(Verb::Get, "/api/ring/preview", "calls.read"),
+    scope(Verb::Get, "/api/ring/active", "calls.read"),
     // calls.write
     scope(Verb::Post, "/api/voice/calls/:id/say", "calls.write"),
     scope(Verb::Post, "/api/voice/calls/:id/tool", "calls.write"),
@@ -413,8 +432,12 @@ pub static ROUTES: &[Route] = &[
     scope(Verb::Put, "/api/voice/voices/chosen", "calls.write"),
     scope(Verb::Delete, "/api/voice/voices/:name", "calls.write"),
     scope(Verb::Post, "/api/voice/voices/:name/try", "calls.write"),
-    scope_rsv(Verb::Patch, "/api/messages/:id", "calls.write"),
-    scope_rsv(Verb::Put, "/api/ring/settings", "calls.write"),
+    scope(Verb::Post, "/api/voice/calls/:id/message", "calls.write"),
+    scope(Verb::Patch, "/api/messages/:id", "calls.write"),
+    scope(Verb::Delete, "/api/messages/:id", "calls.write"),
+    scope(Verb::Put, "/api/ring/settings", "calls.write"),
+    scope(Verb::Post, "/api/ring/active/:id/respond", "calls.write"),
+    scope(Verb::Post, "/api/ring/notices/:id/dismiss", "calls.write"),
     // calendar.read
     scope(Verb::Get, "/api/calendar", "calendar.read"),
     scope(Verb::Get, "/api/calendar/free", "calendar.read"),
@@ -957,10 +980,11 @@ mod tests {
         )
     }
 
-    /// The rows of the golden file, and how many of them are marked as added since the appendix.
-    fn golden_rows() -> (Vec<String>, usize) {
+    /// The rows of the golden file, how many of them are marked as added since the appendix, and how many as
+    /// reserved by it and built since (`since` 1 here, 2 in the appendix).
+    fn golden_rows() -> (Vec<String>, usize, usize) {
         let mut rows = Vec::new();
-        let mut added = 0;
+        let (mut added, mut built) = (0, 0);
         for line in GOLDEN.lines() {
             let line = line.trim();
             if line.is_empty() || line.starts_with('#') {
@@ -970,9 +994,12 @@ mod tests {
             if note.contains("added since the appendix") {
                 added += 1;
             }
+            if note.contains("built since the appendix") {
+                built += 1;
+            }
             rows.push(row.trim().to_string());
         }
-        (rows, added)
+        (rows, added, built)
     }
 
     #[test]
@@ -980,7 +1007,7 @@ mod tests {
         // The golden file is written from Appendix B of the design, not from `ROUTES`; the two are compared
         // exactly. A scope changed on a route (`POST /api/link/start` from `link.manage` to `link.read`),
         // a method, a `since`, a route added or one dropped fails here until the file says the same.
-        let (mut want, added) = golden_rows();
+        let (mut want, added, built) = golden_rows();
         let mut have: Vec<String> = ROUTES.iter().map(golden_line).collect();
         want.sort();
         have.sort();
@@ -1002,16 +1029,29 @@ mod tests {
         );
         assert_eq!(want, have);
         // 161 existing pairs, 41 new and 60 reserved (Appendix B), less the reserved `GET /api/update` that
-        // was built under another name, plus the four routes the code gained since.
+        // was built under another name, plus the eleven routes the code gained since (four of the updater, and
+        // seven of the receptionist's transfers and messages).
         assert_eq!(
             want.len(),
-            161 + 41 + 60 - 1 + 4,
-            "the rows of the design and its four documented differences"
+            161 + 41 + 60 - 1 + 4 + 7,
+            "the rows of the design and its documented differences"
         );
         assert_eq!(
-            added, 4,
-            "the differences from the appendix are the four the file lists"
+            added, 11,
+            "the routes added since the appendix are the eleven the file lists"
         );
+        // Four rows the appendix reserves were built (the messages and the ring's settings): the scope is the
+        // design's and the `since` is 1, since the routes exist.
+        assert_eq!(built, 4, "the reserved rows that were built are the four the file lists");
+        for key in [
+            "GET /api/messages",
+            "PATCH /api/messages/:id",
+            "GET /api/ring/settings",
+            "PUT /api/ring/settings",
+        ] {
+            let row = ROUTES.iter().find(|r| r.key() == key).unwrap_or_else(|| panic!("{key}"));
+            assert_eq!(row.since, 1, "{key}: built, so no longer reserved");
+        }
         let mut unique = want.clone();
         unique.dedup();
         assert_eq!(unique.len(), want.len(), "no row twice");

@@ -532,7 +532,11 @@ mod tests {
     /// status route (`system.read`), the update check (`services.control`: an action that reaches out to
     /// GitHub, so the `flows`, `flows-host`, `flows-web`, `formlogic` and `run` presets, which hold that
     /// scope, gain a route and `readonly` loses the one it had), the Agent's flush acknowledgement
-    /// (`agent.serve`) and the plugin trust route (`plugins.install`).
+    /// (`agent.serve`) and the plugin trust route (`plugins.install`), and the eleven routes of the
+    /// receptionist's transfers and messages, which are `calls.read` (five: the messages, one message, the
+    /// ring's settings, its preview and the rings going now) or `calls.write` (six): so `owner` and `agent`,
+    /// which hold both, reach eleven more, and `companion` (the interim LAN preset), which holds
+    /// `calls.read` alone, five more. No other preset holds either scope.
     #[test]
     fn what_each_preset_reaches_of_the_routes_that_existed() {
         let reaches: Vec<(&str, usize)> = ALL_PRESETS
@@ -542,8 +546,8 @@ mod tests {
         assert_eq!(
             reaches,
             [
-                ("owner", 165),
-                ("agent", 78),
+                ("owner", 165 + 11),
+                ("agent", 78 + 11),
                 ("flows", 64),
                 ("flows-host", 54),
                 ("flows-web", 38),
@@ -552,7 +556,7 @@ mod tests {
                 ("cli-admin", 86),
                 ("mcp", 7),
                 ("readonly", 28),
-                ("companion", 17),
+                ("companion", 17 + 5),
                 ("run", 32),
                 ("ceremony", 4),
             ]
