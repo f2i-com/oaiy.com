@@ -522,3 +522,29 @@ test('4.18.5 WAL is refused on a network filesystem: the mount type is read from
     eq('truncate', Fs::journalFor($dir, $mi('garbage line')), 'a mountinfo that names no mount: the safe mode');
     eq(null, Fs::type($dir . '/does-not-exist', $mi($line('/', 'ext4'))));
 });
+
+test('4.18.8 Fs::createPrivate makes a missing database file, keeps an existing one\'s content, and (POSIX) leaves it owner-only under the loosest umask, a wider one too', function () {
+    $dir = Tmp::dir('priv');
+    $posix = DIRECTORY_SEPARATOR === '/';
+    $mode = static function (string $f): string {
+        clearstatcache(true, $f);
+        return sprintf('%04o', fileperms($f) & 0777);
+    };
+    $old = umask(0); // a host whose umask lets everything through: a file SQLite made itself would be 0666
+    try {
+        Fs::createPrivate($dir . '/new.sqlite');
+        file_put_contents($dir . '/wide.sqlite', 'data');
+        chmod($dir . '/wide.sqlite', 0666);
+        Fs::createPrivate($dir . '/wide.sqlite');
+        Fs::createPrivate($dir . '/new.sqlite'); // twice is the same
+    } finally {
+        umask($old);
+    }
+    ok(is_file($dir . '/new.sqlite'), 'a missing file is created');
+    eq(0, filesize($dir . '/new.sqlite'), 'empty, for SQLite to initialise');
+    eq('data', (string)file_get_contents($dir . '/wide.sqlite'), 'an existing file keeps its content');
+    if ($posix) {
+        eq('0600', $mode($dir . '/new.sqlite'), 'a new file is owner-only');
+        eq('0600', $mode($dir . '/wide.sqlite'), 'a wider one is narrowed');
+    }
+});

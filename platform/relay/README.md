@@ -448,7 +448,10 @@ design's vectors and against FormLogic's own known answers, the sealed tokens of
   probes are the check to use on your host.
 - No real shared host, cPanel account, VPS, CDN or proxy was tried.
 - File modes (0600 and 0700) and the ownership checks are only asserted on POSIX systems, and this was developed on Windows,
-  where the tests skip them. The `/proc/self/mountinfo` reader is tested with synthetic text, not on an NFS mount.
+  where the tests skip them. The one that needs no database (`Fs::createPrivate`, which makes the SQLite file owner-only: a missing
+  file is created, a wider one narrowed, under the loosest umask) was run under Ubuntu's PHP 8.3 in WSL 2; the install-level ones
+  (the database, its `-wal` and `-shm`, the log and every secret after an install under `umask(0)`) need `pdo_sqlite`, which that
+  PHP lacks, so they have not been run on Linux. The `/proc/self/mountinfo` reader is tested with synthetic text, not on an NFS mount.
 - The doctor's MySQL checks (`max_allowed_packet`, `max_user_connections`) and a MySQL install by the installer were not
   exercised against a MySQL server. The relay itself, with its test suite, was (next item).
 - MySQL and MariaDB were tested on a **local throwaway server only** (MySQL 8.4.7 and MariaDB 11.4.9 on Windows, over loopback,
