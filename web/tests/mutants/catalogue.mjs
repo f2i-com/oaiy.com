@@ -15,6 +15,8 @@ const MEDIA = { dir: 'platform/ui', command: 'node tests/local-media.mjs' };
 const e2e = (file, pattern) => ({ dir: 'web', command: `node --test --test-timeout=300000${pattern ? ` --test-name-pattern="${pattern}"` : ''} tests/e2e/cases/${file}`, slow: true });
 const E5 = (pattern) => e2e('e5-no-probes.test.mjs', pattern);
 const CAPS = e2e('capabilities.test.mjs');
+// The Agent's install test runs against app/dist, which it builds only when there is none: --build makes it build the broken source.
+const PWA = { dir: 'app', command: 'node tests/e2e/pwa.mjs --build', slow: true };
 
 const HOST = 'shared/capabilities/host.ts';
 const DERIVE = 'shared/capabilities/derive.ts';
@@ -32,6 +34,8 @@ export const MUTATIONS = [
   // -------------------------------------------------------------------------------------------------------------------------------
   { id: 'host-any-port', finding: 'F5', what: 'a page at oaiy.localhost on any port counts as OAIY\'s window', file: HOST, find: "  if ((location?.port ?? '') !== '') return null;\n", replace: '', ...WEB },
   { id: 'host-any-port-in-a-browser', finding: 'F5', what: 'the same, seen by a real Agent page at oaiy.localhost:PORT with no desktop given', file: HOST, find: "  if ((location?.port ?? '') !== '') return null;\n", replace: '', ...E5('oaiy.localhost on a port') },
+  { id: 'host-any-port-in-the-install-test', finding: 'F5', what: 'the same, seen by the Agent\'s install test: a page at oaiy.localhost:PORT with no desktop is not offered Install app', file: HOST, find: "  if ((location?.port ?? '') !== '') return null;\n", replace: '', ...PWA },
+  { id: 'host-window-needs-a-name', finding: 'F5', what: 'a desktop given to the page does not make it OAIY\'s window: only the name does', file: HOST, find: "const ownWindow = desktopGiven(env.__OAIY_DESKTOP__) || at === 'oaiy-window';", replace: "const ownWindow = at === 'oaiy-window';", ...PWA },
   { id: 'host-userinfo-allowed', finding: 'F5', what: 'an address with a user name or password still counts as OAIY\'s window', file: HOST, find: "      if (url.username !== '' || url.password !== '') return null;\n", replace: '', ...WEB },
   { id: 'host-protocol-ignored', finding: 'F5', what: 'the scheme is not looked at: any scheme at OAIY\'s host name counts', file: HOST, find: 'return OWN_ORIGINS.find(([p, h]) => p === protocol && h === hostname)?.[2] ?? null;', replace: 'return OWN_ORIGINS.find(([, h]) => h === hostname)?.[2] ?? null;', ...WEB },
   { id: 'host-any-dot-localhost', finding: 'WA-02', what: 'any *.localhost name counts as OAIY\'s window (review M01)', file: HOST, find: 'return OWN_ORIGINS.find(([p, h]) => p === protocol && h === hostname)?.[2] ?? null;', replace: "return hostname.endsWith('.localhost') ? 'oaiy-window' : null;", ...WEB },
