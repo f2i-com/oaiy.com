@@ -1,6 +1,7 @@
 <?php
 declare(strict_types=1);
 
+use Oaiy\Relay\Db;
 use Oaiy\Relay\Kernel;
 use Oaiy\Relay\Request;
 use Oaiy\Relay\Signals;
@@ -385,6 +386,56 @@ test('4.18.6 GC removes signal files stamped more than an hour ahead (a clock th
     eq(2, $s['signals']);
     ok(!is_file($r->data . '/holds/gen/' . Signals::hash('future-principal')) && !is_file($r->data . '/holds/rev/' . Signals::hash('dev-future')));
     ok(is_file($r->data . '/holds/gen/' . Signals::hash('fresh-principal')));
+});
+
+test('4.7.1 the status counters stop at 1000 an hour: a flood of errors from one address costs no database write past that, and the counter says so', function () {
+    $r = Relay::make();
+    $l = $r->ctx()->limiter;
+    $count = fn(): int => (int)$r->ctx()->db->val("SELECT n FROM rl WHERE k LIKE 's:rej:not_found:%'");
+    $r->call(null, 'GET', '/v1/nothing-here');
+    eq(1, $count(), 'an unknown URL is counted once');
+    for ($i = 0; $i < 1100; $i++) {
+        $l->bump('rej:not_found');
+    }
+    eq(Oaiy\Relay\Limiter::COUNTER_CAP, $count(), 'the counter stopped at its cap');
+    eq(1000, Oaiy\Relay\Limiter::COUNTER_CAP);
+    for ($i = 0; $i < 20; $i++) {
+        $r->call(null, 'GET', '/v1/nothing-here-again');
+    }
+    eq(1000, $count(), 'and stays there, whether the errors come through the front door or not');
+    // The next hour counts again from zero, and other codes have counters of their own.
+    Tmp::setClock(Relay::T0 + 3600);
+    $r->call(null, 'GET', '/v1/nothing-here');
+    eq(1, (int)$r->ctx()->db->val("SELECT n FROM rl WHERE k = ?", ['s:rej:not_found:' . intdiv(Relay::T0 + 3600, 3600)]));
+    $r->call(null, 'PUT', '/v1/health');
+    eq(1, (int)$r->ctx()->db->val("SELECT n FROM rl WHERE k LIKE 's:rej:method_not_allowed:%'"));
+    eq(1000 + 1, $r->ctx()->limiter->last24h('rej:not_found'), 'the status page adds the hours');
+});
+
+test('4.18.6 GC keeps the limiter table to 20000 rows whatever the clock says: the oldest go first, and the status counters are not among them', function () {
+    $r = Relay::make();
+    $db = $r->ctx()->db;
+    eq(20000, Oaiy\Relay\Gc::RL_MAX_ROWS);
+    $total = 20300;
+    $db->write(function (Db $db) use ($total): void {
+        for ($from = 0; $from < $total; $from += 1000) {
+            $rows = [];
+            $args = [];
+            for ($i = $from; $i < min($total, $from + 1000); $i++) {
+                $rows[] = '(?, ?, 1)';
+                array_push($args, 'w:addr-' . $i, (Relay::T0 - 1800) * 1000 + $i); // all within the hour, a millisecond apart; the first ones are the oldest
+            }
+            $db->exec('INSERT INTO rl (k, w, n) VALUES ' . implode(', ', $rows), $args);
+        }
+        $db->exec('INSERT INTO rl (k, w, n) VALUES (?, ?, 5), (?, ?, 6)', ['s:rej:x:1', Relay::T0 * 1000, 's:noauth:1', Relay::T0 * 1000]);
+    });
+    $s = $r->ctx()->gc->maybeRun(null, true);
+    ok($s['limits'] >= 300, 'the pass removed the excess: ' . $s['limits']);
+    $db = $r->ctx()->db;
+    eq(20000, (int)$db->val("SELECT COUNT(*) FROM rl WHERE k LIKE 'w:%'"));
+    eq(0, (int)$db->val("SELECT COUNT(*) FROM rl WHERE k IN ('w:addr-0', 'w:addr-299')"), 'the oldest went');
+    eq(1, (int)$db->val("SELECT COUNT(*) FROM rl WHERE k = 'w:addr-300'"), 'the rest stayed');
+    eq(2, (int)$db->val("SELECT COUNT(*) FROM rl WHERE k LIKE 's:%'"), 'the status counters were not touched');
 });
 
 test('4.18.6 GC is idempotent and harmless on an empty relay, and a failed step does not lose the claim', function () {

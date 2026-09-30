@@ -19,6 +19,8 @@ defined('OAIY_RELAY') or exit;
 final class Gc
 {
     public const INTERVAL_S = 60;
+    /** The most rate-limit rows (not counting status counters) a pass leaves: the oldest go first. One row per address and bucket. */
+    public const RL_MAX_ROWS = 20000;
     private const BATCH = 2000;
 
     private Db $db;
@@ -101,6 +103,7 @@ final class Gc
             $out['limits'] = $this->db->write(fn(Db $db): int => $db->exec("DELETE FROM rl WHERE (w < ? OR w > ?) AND k NOT LIKE 's:%'", [$hourAgoMs, ($now + 3600) * 1000]));
             // Status counters are kept for 25 hours.
             $this->db->write(fn(Db $db): int => $db->exec("DELETE FROM rl WHERE k LIKE 's:%' AND w < ?", [($now - 25 * 3600) * 1000]));
+            $out['limits'] += $this->boundLimiterRows();
             $out['locks'] = $this->db->write(fn(Db $db): int => $db->exec('DELETE FROM tokid_fail WHERE (first_at < ? AND (locked_until IS NULL OR locked_until < ?)) OR first_at > ?', [$now - 3600, $now, $now + 3600]));
         }
         // 4. Signal files nobody needs any more.
@@ -121,6 +124,27 @@ final class Gc
             }
         }
         return $out;
+    }
+
+    /**
+     * Keep the limiter table bounded whatever the clock says and however many addresses there are (an IPv6 /48 has 65,536 /64s, each
+     * with rows of its own): past RL_MAX_ROWS the oldest rows go. Status counters (s:...) are not part of this; they are bounded by
+     * their cap and by their 25 hours.
+     */
+    private function boundLimiterRows(): int
+    {
+        $n = (int)$this->db->val("SELECT COUNT(*) FROM rl WHERE k NOT LIKE 's:%'");
+        $excess = $n - self::RL_MAX_ROWS;
+        if ($excess <= 0) {
+            return 0;
+        }
+        $rows = $this->db->all("SELECT k FROM rl WHERE k NOT LIKE 's:%' ORDER BY w ASC LIMIT " . min($excess, 5000));
+        $this->db->write(function (Db $db) use ($rows): void {
+            foreach ($rows as $r) {
+                $db->exec('DELETE FROM rl WHERE k = ?', [$r['k']]);
+            }
+        });
+        return count($rows);
     }
 
     /**

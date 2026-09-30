@@ -15,6 +15,9 @@ defined('OAIY_RELAY') or exit;
  */
 final class Limiter
 {
+    /** A status counter stops at this many in an hour: past it a flood of errors from anywhere costs no more database writes. */
+    public const COUNTER_CAP = 1000;
+
     private Db $db;
 
     public function __construct(Db $db)
@@ -107,6 +110,12 @@ final class Limiter
             $k = 's:' . $name . ':' . $hour;
             $w = $hour * 3600 * 1000;
             if ($this->db->inTransaction()) {
+                return;
+            }
+            // A read first: once this hour's count has reached the cap nothing is written, so an address that floods the relay with
+            // errors (unknown URLs, bad bodies, wrong content types) cannot turn each one into a database write.
+            $have = $this->db->val('SELECT n FROM rl WHERE k = ?', [$k]);
+            if ($have !== null && (int)$have >= self::COUNTER_CAP) {
                 return;
             }
             $this->db->quick(function (Db $db) use ($k, $w): void {
