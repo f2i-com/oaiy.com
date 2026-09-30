@@ -4,12 +4,13 @@ use std::fs::{self, File};
 use std::io;
 use std::os::unix::fs::{DirBuilderExt, MetadataExt};
 use std::path::{Path, PathBuf};
+use std::time::Duration;
 
 use rustix::fs::{fsync, openat, renameat, statat, unlinkat, AtFlags, Dir, FileType, Mode, OFlags, CWD};
 use rustix::io::Errno;
 use zeroize::Zeroizing;
 
-use super::{read_blob, Entry};
+use super::{read_blob, DirLock, Entry, LOCK_FILE, LOCK_WAIT};
 use crate::error::KeyError;
 use crate::perm::{self, Kind};
 
@@ -23,6 +24,8 @@ pub(crate) struct KeyDir {
     uid: u32,
     dev: u64,
     ino: u64,
+    /// How long [`KeyDir::lock`] waits for another holder.
+    pub(crate) lock_wait: Duration,
     #[cfg(test)]
     pub(crate) hooks: super::Hooks,
 }
@@ -60,6 +63,7 @@ impl KeyDir {
             uid,
             dev: meta.dev(),
             ino: meta.ino(),
+            lock_wait: LOCK_WAIT,
             #[cfg(test)]
             hooks: super::Hooks::default(),
         };
@@ -102,6 +106,20 @@ impl KeyDir {
             return Err(KeyError::io("inspect the keys directory", io::Error::other("the keys directory was replaced or moved while it was open")));
         }
         Ok(())
+    }
+
+    /// Takes the advisory lock of the folder (see [`DirLock`]), shared for a read and exclusive for a change.
+    pub(crate) fn lock(&self, exclusive: bool) -> Result<DirLock, KeyError> {
+        let flags = OFlags::RDWR | OFlags::CREATE | OFlags::NOFOLLOW | OFlags::NONBLOCK | OFlags::CLOEXEC;
+        let fd = openat(&self.dir, LOCK_FILE, flags, Mode::RUSR | Mode::WUSR).map_err(|e| match e {
+            Errno::LOOP => KeyError::Permissions(format!("{}: is a symbolic link", self.display(LOCK_FILE))),
+            other => errno("open the lock file", other),
+        })?;
+        let file = File::from(fd);
+        let meta = file.metadata().map_err(|e| KeyError::io("inspect the lock file", e))?;
+        perm::check(Kind::File, &perm::meta_of(&meta), Some(self.uid))
+            .map_err(|why| KeyError::Permissions(format!("{}: {why}", self.display(LOCK_FILE))))?;
+        DirLock::acquire(file, exclusive, self.lock_wait)
     }
 
     /// The contents of one file of the folder, or `None` if the folder has no such entry.

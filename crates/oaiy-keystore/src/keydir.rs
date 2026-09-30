@@ -17,8 +17,10 @@
 //!
 //! The two platform modules implement the same small set of operations; the store above them does not know which it is on.
 
-use std::fs::File;
-use std::io::Read;
+use std::fs::{File, TryLockError};
+use std::io::{self, Read};
+use std::thread;
+use std::time::{Duration, Instant};
 
 use zeroize::Zeroizing;
 
@@ -36,6 +38,52 @@ pub(crate) use sys::KeyDir;
 
 /// A blob is never larger than a value plus a provider's framing; a file larger than this is not one of ours and is not read into memory.
 pub(crate) const MAX_BLOB_LEN: usize = MAX_VALUE_LEN + 4096;
+
+/// The file whose advisory lock orders the operations of every process that uses the folder. It holds nothing; it is never read or written.
+pub(crate) const LOCK_FILE: &str = ".lock";
+
+/// How long an operation waits for another process's lock before it gives up with an error: a lock is held for the length of one rename, so a longer wait
+/// means a process that is stuck, and an error is better than a caller that never returns.
+pub(crate) const LOCK_WAIT: Duration = Duration::from_secs(10);
+
+/// An advisory lock on the folder, held until it is dropped. **Why there is one (review H-1):** replacing a file is not atomic for a reader on Windows
+/// (`MoveFileEx` with `REPLACE_EXISTING` leaves a moment in which the name does not exist), and `Ok(None)` means "never stored", so a reader that happened
+/// to open the name in that moment reported that a key that exists was never stored, and a caller that trusts `None` mints a new identity. Every operation that
+/// can change what a name refers to (the rename of a put, the removal of a delete) now holds the lock exclusively, and every read holds it shared, so a reader
+/// never sees the name between the two states: when it is told the file is not there, it is not there.
+///
+/// Each operation opens the lock file for itself, so the lock excludes other threads of this process as it does other processes (a lock belongs to the open
+/// file, and two threads that shared one would not exclude each other). The operating system drops the lock if the process dies.
+pub(crate) struct DirLock(File);
+
+impl DirLock {
+    /// Takes the lock on `file`, waiting at most `wait`.
+    pub(super) fn acquire(file: File, exclusive: bool, wait: Duration) -> Result<DirLock, KeyError> {
+        let deadline = Instant::now() + wait;
+        let mut pause = Duration::from_micros(200);
+        loop {
+            match if exclusive { file.try_lock() } else { file.try_lock_shared() } {
+                Ok(()) => return Ok(DirLock(file)),
+                Err(TryLockError::WouldBlock) => {
+                    if Instant::now() >= deadline {
+                        let why = io::Error::new(io::ErrorKind::TimedOut, "another process holds the lock on the keys directory");
+                        return Err(KeyError::io("lock the keys directory", why));
+                    }
+                    thread::sleep(pause);
+                    pause = (pause * 2).min(Duration::from_millis(10));
+                }
+                Err(TryLockError::Error(e)) => return Err(KeyError::io("lock the keys directory", e)),
+            }
+        }
+    }
+}
+
+impl Drop for DirLock {
+    fn drop(&mut self) {
+        // Windows releases a lock when the handle closes, but not at once; unlocking by hand is prompt everywhere
+        let _ = self.0.unlock();
+    }
+}
 
 /// One entry of the folder.
 pub(crate) struct Entry {

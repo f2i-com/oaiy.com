@@ -5,10 +5,11 @@ use std::fs::{self, File, Metadata, OpenOptions};
 use std::io;
 use std::os::windows::fs::{MetadataExt, OpenOptionsExt};
 use std::path::{Path, PathBuf};
+use std::time::Duration;
 
 use zeroize::Zeroizing;
 
-use super::{read_blob, Entry};
+use super::{read_blob, DirLock, Entry, LOCK_FILE, LOCK_WAIT};
 use crate::error::KeyError;
 
 const FILE_FLAG_BACKUP_SEMANTICS: u32 = 0x0200_0000;
@@ -22,6 +23,8 @@ const FILE_SHARE_WRITE: u32 = 2;
 pub(crate) struct KeyDir {
     path: PathBuf,
     held: File,
+    /// How long [`KeyDir::lock`] waits for another holder.
+    pub(crate) lock_wait: Duration,
     #[cfg(test)]
     pub(crate) hooks: super::Hooks,
 }
@@ -73,6 +76,7 @@ impl KeyDir {
         Ok(KeyDir {
             path: path.to_path_buf(),
             held,
+            lock_wait: LOCK_WAIT,
             #[cfg(test)]
             hooks: super::Hooks::default(),
         })
@@ -89,6 +93,21 @@ impl KeyDir {
         require_directory(&meta, &what)?;
         let by_path = fs::symlink_metadata(&self.path).map_err(|e| KeyError::io("inspect the keys directory", e))?;
         require_directory(&by_path, &what)
+    }
+
+    /// Takes the advisory lock of the folder (see [`DirLock`]), shared for a read and exclusive for a change (`LockFileEx` on the lock file).
+    pub(crate) fn lock(&self, exclusive: bool) -> Result<DirLock, KeyError> {
+        let path = self.at(LOCK_FILE);
+        let file = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .custom_flags(FILE_FLAG_OPEN_REPARSE_POINT)
+            .open(&path)
+            .map_err(|e| KeyError::io("open the lock file", e))?;
+        let meta = file.metadata().map_err(|e| KeyError::io("inspect the lock file", e))?;
+        require_file(&meta, &path.display().to_string())?;
+        DirLock::acquire(file, exclusive, self.lock_wait)
     }
 
     /// The contents of one file of the folder, or `None` if the folder has no such entry.

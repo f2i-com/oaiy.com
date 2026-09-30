@@ -97,7 +97,12 @@ impl<C: Codec> KeyStore for FileStore<C> {
 
     fn get(&self, name: &Name) -> Result<Option<Zeroizing<Vec<u8>>>, KeyError> {
         self.dir.verify()?;
-        let Some(blob) = self.dir.read(&self.file_name(name))? else { return Ok(None) };
+        // the lock, shared, is what makes `None` mean "not there": a writer that is replacing the name holds it exclusively (review H-1)
+        let blob = {
+            let _lock = self.dir.lock(false)?;
+            self.dir.read(&self.file_name(name))?
+        };
+        let Some(blob) = blob else { return Ok(None) };
         self.codec.open(name, &blob).map(Some)
     }
 
@@ -115,7 +120,10 @@ impl<C: Codec> KeyStore for FileStore<C> {
             let _ = self.dir.remove(&tmp);
             return Err(error);
         }
-        if let Err(error) = self.dir.rename(&tmp, &self.file_name(name)) {
+        self.dir.fire("before_rename");
+        // the exclusive lock is held for the rename only, not for the write and the read-back: readers wait for one rename, never for a disk
+        let renamed = self.dir.lock(true).and_then(|_lock| self.dir.rename(&tmp, &self.file_name(name)));
+        if let Err(error) = renamed {
             let _ = self.dir.remove(&tmp);
             return Err(error);
         }
@@ -124,7 +132,10 @@ impl<C: Codec> KeyStore for FileStore<C> {
 
     fn delete(&self, name: &Name) -> Result<(), KeyError> {
         self.dir.verify()?;
-        self.dir.remove(&self.file_name(name))?;
+        {
+            let _lock = self.dir.lock(true)?;
+            self.dir.remove(&self.file_name(name))?;
+        }
         self.dir.sync()
     }
 
@@ -132,7 +143,11 @@ impl<C: Codec> KeyStore for FileStore<C> {
         self.dir.verify()?;
         let suffix = format!(".{}", self.codec.extension());
         let mut names = Vec::new();
-        for entry in self.dir.list()? {
+        let entries = {
+            let _lock = self.dir.lock(false)?;
+            self.dir.list()?
+        };
+        for entry in entries {
             if !entry.is_file {
                 continue;
             }
@@ -219,7 +234,11 @@ mod tests {
     }
 
     fn files(dir: &Path) -> Vec<String> {
-        let mut out: Vec<String> = fs::read_dir(dir).unwrap().map(|e| e.unwrap().file_name().to_string_lossy().into_owned()).collect();
+        let mut out: Vec<String> = fs::read_dir(dir)
+            .unwrap()
+            .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+            .filter(|f| f != ".lock" && f != ".provider") // the bookkeeping files of the store
+            .collect();
         out.sort();
         out
     }
@@ -344,6 +363,98 @@ mod tests {
         assert_eq!(files(&keys), vec!["archive.writer.kf".to_string()], "no temporary file of the put is in the attacker's folder");
         let reopened = FileStore::open(&moved, KeyfileCodec).unwrap();
         assert_eq!(&**reopened.get(&n).unwrap().unwrap(), b"the new victim value", "the put landed in the real folder");
+    }
+
+    /// H-1, made deterministic. Another process is in the middle of replacing a name: it holds the lock and, for a moment, the name is not there (on Windows a
+    /// `MoveFileEx` over an existing file does leave such a moment; the reviewer's reader was told `None`, "never stored", for a key that existed, and a caller
+    /// that believes `None` mints a new identity). A reader must wait for the writer and then see the new value, never `None`.
+    #[test]
+    fn a_reader_waits_for_a_writer_in_the_middle_of_a_replace_and_is_never_told_that_nothing_is_stored() {
+        use std::sync::Arc;
+        use std::time::Duration;
+        let scratch = Scratch::new("replace");
+        let keys = scratch.keys();
+        let store = Arc::new(FileStore::open(&keys, KeyfileCodec).unwrap());
+        let n = name("archive.writer");
+        store.put(&n, b"the old value").unwrap();
+
+        let writer = KeyDir::open(&keys).unwrap(); // another process's view of the folder
+        let lock = writer.lock(true).unwrap();
+        writer.remove("archive.writer.kf").unwrap(); // the moment in which the name does not exist
+
+        let reader = {
+            let (store, n) = (Arc::clone(&store), n.clone());
+            std::thread::spawn(move || store.get(&n))
+        };
+        std::thread::sleep(Duration::from_millis(400));
+        assert!(!reader.is_finished(), "the reader did not wait: it looked at the name while a writer was replacing it, and would have said `None`");
+
+        // the writer finishes: the new blob is in place, and only then does it let go
+        let blob = KeyfileCodec.seal(&n, b"the new value").unwrap();
+        writer.create_new("archive.writer.kf").unwrap().write_all(&blob).unwrap();
+        drop(lock);
+        let got = reader.join().unwrap().unwrap().expect("the key exists: it is not `None`");
+        assert_eq!(&**got, b"the new value");
+    }
+
+    /// The other half: readers share the lock, so one reader never waits for another, and a holder that never lets go is an error after the wait (naming the
+    /// lock), not a caller that never returns. Nothing changes when the lock cannot be had.
+    #[test]
+    fn readers_share_the_lock_and_a_holder_that_never_lets_go_is_an_error_after_the_wait() {
+        use std::time::{Duration, Instant};
+        let scratch = Scratch::new("lockwait");
+        let keys = scratch.keys();
+        let mut store = FileStore::open(&keys, KeyfileCodec).unwrap();
+        store.dir.lock_wait = Duration::from_millis(300);
+        let n = name("relay.token");
+        store.put(&n, b"first").unwrap();
+        let other = KeyDir::open(&keys).unwrap();
+
+        {
+            let _shared = other.lock(false).unwrap();
+            assert_eq!(&**store.get(&n).unwrap().unwrap(), b"first", "a reader does not wait for another reader");
+            assert_eq!(store.list("").unwrap().len(), 1);
+        }
+        let before = files(&keys);
+        let _exclusive = other.lock(true).unwrap();
+        let started = Instant::now();
+        let is_timeout =
+            |e: KeyError| matches!(e, KeyError::Io { op: "lock the keys directory", source } if source.kind() == std::io::ErrorKind::TimedOut);
+        assert!(is_timeout(store.get(&n).unwrap_err()), "get");
+        assert!(is_timeout(store.put(&n, b"second").unwrap_err()), "put");
+        assert!(is_timeout(store.delete(&n).unwrap_err()), "delete");
+        assert!(is_timeout(store.list("").unwrap_err()), "list");
+        assert!(started.elapsed() >= Duration::from_millis(1000), "each of the four waited the full 300 ms");
+        assert!(started.elapsed() < Duration::from_secs(8), "and none waited much longer");
+        assert_eq!(files(&keys), before, "a put that could not take the lock left no temporary file");
+        drop(_exclusive);
+        assert_eq!(&**store.get(&n).unwrap().unwrap(), b"first", "and the old value is still there");
+    }
+
+    /// The exclusive lock is held for the rename only: a put that is between its write and its rename does not stop a reader, which sees the old value.
+    #[test]
+    fn a_put_does_not_hold_the_lock_while_it_writes() {
+        use std::sync::{mpsc, Arc, Mutex};
+        let scratch = Scratch::new("pausedput");
+        let store = Arc::new(FileStore::open(&scratch.keys(), KeyfileCodec).unwrap());
+        let n = name("vault.pins");
+        store.put(&n, b"old").unwrap();
+        let (entered_tx, entered_rx) = mpsc::channel::<()>();
+        let (go_tx, go_rx) = mpsc::channel::<()>();
+        let go_rx = Mutex::new(go_rx);
+        store.dir.hooks.at("before_rename", move || {
+            entered_tx.send(()).unwrap();
+            go_rx.lock().unwrap().recv().unwrap();
+        });
+        let writer = {
+            let (store, n) = (Arc::clone(&store), n.clone());
+            std::thread::spawn(move || store.put(&n, b"new"))
+        };
+        entered_rx.recv().unwrap(); // the put has written and verified its temporary file, and has not renamed it
+        assert_eq!(&**store.get(&n).unwrap().unwrap(), b"old", "a reader is not held up by a put that is still writing");
+        go_tx.send(()).unwrap();
+        writer.join().unwrap().unwrap();
+        assert_eq!(&**store.get(&n).unwrap().unwrap(), b"new");
     }
 
     /// A put flushes the folder after the rename, and a delete after the removal: the new name, and the absence of the old one, survive a power cut (L-9: on

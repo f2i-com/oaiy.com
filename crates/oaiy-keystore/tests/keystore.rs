@@ -85,6 +85,14 @@ fn all_files(dir: &Path) -> Vec<PathBuf> {
     out
 }
 
+/// The bookkeeping files of the store: they hold no secret and no name, and are not key files.
+const BOOKKEEPING: [&str; 2] = [".lock", ".provider"];
+
+/// The files under `dir` that are key files or their debris (everything but the bookkeeping files).
+fn key_files(dir: &Path) -> Vec<PathBuf> {
+    all_files(dir).into_iter().filter(|p| !BOOKKEEPING.contains(&p.file_name().unwrap().to_str().unwrap())).collect()
+}
+
 fn contains(haystack: &[u8], needle: &[u8]) -> bool {
     needle.len() <= haystack.len() && haystack.windows(needle.len()).any(|w| w == needle)
 }
@@ -214,7 +222,7 @@ fn a_store_that_cannot_read_its_key_is_an_error_and_never_none() {
         fs::create_dir(&path).unwrap();
         assert!(matches!(store.get(&n), Err(KeyError::Io { .. } | KeyError::Permissions(_))), "{ext}: a directory in place of a key file");
         assert!(store.put(&n, b"replacement").is_err());
-        assert!(all_files(&scratch.keys()).is_empty(), "{ext}: the failed put left a file behind");
+        assert!(key_files(&scratch.keys()).is_empty(), "{ext}: the failed put left a file behind");
         fs::remove_dir(&path).unwrap();
         // the store is fine afterwards
         store.put(&n, &value).unwrap();
@@ -274,7 +282,7 @@ fn a_locked_file_is_an_error_and_a_locked_destination_makes_put_fail_and_keep_th
             assert!(store.delete(&n).is_err());
         }
         assert_eq!(get(&*store, &n), Some(b"before".to_vec()), "{ext}: the previous value survived");
-        assert_eq!(all_files(&scratch.keys()).len(), 1, "{ext}: no temporary file of the failed put");
+        assert_eq!(key_files(&scratch.keys()).len(), 1, "{ext}: no temporary file of the failed put");
     }
 }
 
@@ -320,12 +328,12 @@ fn no_plaintext_beside_the_blob() {
             ProviderChoice::Keyfile => assert_eq!(holders, ["archive.writer.kf"]),
             _ => assert!(holders.is_empty(), "{ext}: DPAPI files hold the value in the clear: {holders:?}"),
         }
-        assert_eq!(all_files(&scratch.keys()).len(), 1, "{ext}: exactly one file per secret, no temporary");
+        assert_eq!(key_files(&scratch.keys()).len(), 1, "{ext}: exactly one file per secret, no temporary");
 
         // an overwrite leaves no trace of the old value anywhere
         store.put(&n, &second).unwrap();
         assert!(files_containing(&scratch.keys(), &first).is_empty(), "{ext}: the old value is still in a file");
-        assert_eq!(all_files(&scratch.keys()).len(), 1);
+        assert_eq!(key_files(&scratch.keys()).len(), 1);
 
         // a failed put leaves nothing either (a directory sits where the file would go, so the rename fails after the temporary file was written and verified)
         let blocker = name("blocked.name");
@@ -338,7 +346,7 @@ fn no_plaintext_beside_the_blob() {
 
         // and a delete removes everything
         store.delete(&n).unwrap();
-        assert!(all_files(&scratch.keys()).is_empty(), "{ext}: files remain after the only secret was deleted");
+        assert!(key_files(&scratch.keys()).is_empty(), "{ext}: files remain after the only secret was deleted");
         assert!(files_containing(&scratch.keys(), &second).is_empty());
     }
 }
@@ -501,7 +509,65 @@ fn many_threads_reading_and_writing_never_see_a_torn_value() {
             h.join().unwrap();
         }
         assert_eq!(store.list("thread.").unwrap().len(), 8);
-        assert!(all_files(&scratch.keys()).len() == 9, "no temporary file survives the run");
+        assert!(key_files(&scratch.keys()).len() == 9, "no temporary file survives the run");
+    }
+}
+
+const CHILD_DIR: &str = "OAIY_KS_CHILD_DIR";
+const CHILD_PROVIDER: &str = "OAIY_KS_CHILD_PROVIDER";
+
+fn shared_candidates() -> Vec<Vec<u8>> {
+    (0..4u8).map(|i| canary(60 + i, 100 + usize::from(i) * 37)).collect()
+}
+
+/// The writer of the next test, run by the test binary itself as a second process. It does nothing when the harness runs it on its own.
+#[test]
+fn child_of_the_two_process_test_rewrites_one_name_over_and_over() {
+    let (Some(dir), Some(label)) = (std::env::var_os(CHILD_DIR), std::env::var(CHILD_PROVIDER).ok()) else { return };
+    let choice = if label == "dpapi" { ProviderChoice::DpapiFile } else { ProviderChoice::Keyfile };
+    let store = open_at(dir, choice).unwrap();
+    let candidates = shared_candidates();
+    for i in 0..800usize {
+        store.put(&name("shared.value"), &candidates[i % 4]).unwrap();
+    }
+}
+
+/// H-1 with two real processes. One rewrites a name in a loop (each put is a rename over the existing file); this one reads it in a loop. The reader must see
+/// a whole value every time: never `None` (on Windows a reader that opens a name in the moment of a `MoveFileEx` replace finds it missing, and the reviewer's
+/// reader was told `None` for a key that existed), never an error, never a mix of two values.
+#[test]
+fn a_reader_never_sees_a_name_that_another_process_is_rewriting_as_missing_or_torn() {
+    for (choice, _) in providers() {
+        let label = if choice == ProviderChoice::DpapiFile { "dpapi" } else { "keyfile" };
+        let scratch = Scratch::new("twoproc");
+        let store = store(&scratch, choice);
+        let shared = name("shared.value");
+        let candidates = shared_candidates();
+        store.put(&shared, &candidates[0]).unwrap();
+        let mut child = std::process::Command::new(std::env::current_exe().unwrap())
+            .args(["--exact", "child_of_the_two_process_test_rewrites_one_name_over_and_over", "--test-threads=1"])
+            .env(CHILD_DIR, scratch.keys())
+            .env(CHILD_PROVIDER, label)
+            .stdout(std::process::Stdio::null())
+            .spawn()
+            .unwrap();
+        let mut reads = 0u64;
+        let status = loop {
+            if let Some(status) = child.try_wait().unwrap() {
+                break status;
+            }
+            match store.get(&shared) {
+                Ok(Some(value)) => {
+                    assert!(candidates.iter().any(|c| c.as_slice() == *value), "{label}: a torn or foreign value after {reads} reads")
+                }
+                Ok(None) => panic!("{label}: a key that exists was reported as never stored, after {reads} reads"),
+                Err(error) => panic!("{label}: a read failed while another process was replacing the file, after {reads} reads: {error}"),
+            }
+            reads += 1;
+        };
+        assert!(status.success(), "{label}: the writer process failed: {status}");
+        assert!(reads >= 20, "{label}: the reader only got {reads} reads in while the writer ran");
+        assert_eq!(key_files(&scratch.keys()).len(), 1, "{label}: no temporary file is left");
     }
 }
 
