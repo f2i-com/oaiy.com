@@ -995,8 +995,8 @@ if (!w.__TAURI_INTERNALS__) {
 if (!w.__TAURI__) {
   w.__TAURI__ = { core: { invoke, convertFileSrc } };
 }
-// Marker the rest of the app reads (via lib/platform.isWebBuild) to gate
-// features that need native capabilities the browser can't provide — e.g.
-// unzipping/verifying .oaiy packages or scanning the filesystem for them.
-// A real desktop (Tauri) build never loads this shim, so the flag stays unset.
+// Marker that this build's native commands are the shim's (via lib/platform.isWebBuild): unzipping/verifying .oaiy packages, scanning
+// the filesystem for them and the like are not available. It is NOT a sign of a browser tab: OAIY's own window shows this same build
+// (platform/desktop serves platform/ui/dist to it), so the flag is set there too. Where the editor is, is told by the desktop the window
+// is given, read in shared/capabilities/host.ts, and what follows from it is in lib/caps.ts.
 w.__OAIY_WEB_SHIM__ = true;
