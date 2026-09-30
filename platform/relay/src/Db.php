@@ -185,6 +185,19 @@ final class Db
         return $this->driver === 'mysql' ? ' FOR UPDATE' : '';
     }
 
+    /**
+     * A named lock for a check that has no single row to lock (a count of rows that do not exist yet, such as "no more than
+     * N desktops"): every writer that checks and then inserts takes it first, so on MySQL and MariaDB the second one waits
+     * for the first to commit and then counts what the first made. SQLite needs no gate (BEGIN IMMEDIATE holds the whole
+     * database) and the extra read costs nothing there. Call inside write(); it is released at commit or rollback.
+     */
+    public function gate(string $name): void
+    {
+        $k = 'gate:' . $name;
+        $this->insertIgnore('meta', ['k' => $k, 'v' => 0, 's' => null]);
+        $this->one('SELECT v FROM meta WHERE k = ?' . $this->forUpdate(), [$k]);
+    }
+
     /** INSERT that does nothing when the primary or a unique key exists. @param array<string,mixed> $row */
     public function insertIgnore(string $table, array $row): int
     {

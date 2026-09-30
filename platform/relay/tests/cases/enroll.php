@@ -265,6 +265,36 @@ test('4.11 redeem: many racing requests over four servers still create exactly o
     eq(1, (int)$r->ctx()->db->val("SELECT COUNT(*) FROM devices WHERE role = 'desktop'"));
 });
 
+slow_test('4.11 redeem: two keys redeemed at the same instant on a relay with room for one desktop make one desktop, twenty rounds in a row', function () {
+    $r = Relay::make(['limits' => ['desktops' => 1]]);
+    $r->ctx()->db->exec('DELETE FROM enroll_keys'); // the installer's first key would count as the one desktop
+    $fleet = $r->fleet(2);
+    $bad = [];
+    for ($i = 0; $i < 20; $i++) {
+        // mint() refuses a second desktop key while one is waiting, so the second key is put in the table by hand
+        [, , $d1] = enroll_mint($r);
+        $r->ctx()->db->exec('UPDATE enroll_keys SET role = ? WHERE kid = ?', ['desktop', $d1['kid']]);
+        $second = Enrolment::derive(random_bytes(16));
+        $r->ctx()->db->insert('enroll_keys', ['kid' => $second['kid'], 'role' => 'desktop', 'pub' => bin2hex($second['pub']), 'name' => null, 'exp' => Oaiy\Relay\Clock::now() + 3600, 'used_at' => null, 'fails' => 0, 'created_at' => Oaiy\Relay\Clock::now()]);
+        [$b1, $h1] = enroll_request($d1, 'desktop', 'One');
+        [$b2, $h2] = enroll_request($second, 'desktop', 'Two');
+        $p1 = $fleet[0]->begin('POST', '/v1/enroll', ['Content-Type' => 'application/json'] + $h1, $b1);
+        $p2 = $fleet[1]->begin('POST', '/v1/enroll', ['Content-Type' => 'application/json'] + $h2, $b2);
+        $codes = [$p1->finish(20)['status'], $p2->finish(20)['status']];
+        sort($codes);
+        $made = (int)$r->ctx()->db->val("SELECT COUNT(*) FROM devices WHERE role = 'desktop' AND revoked_at IS NULL");
+        if ($codes !== [201, 401] || $made !== 1) {
+            $bad[] = "round $i: " . implode(',', $codes) . " and $made desktops";
+        }
+        foreach ($r->ctx()->db->all("SELECT id FROM devices WHERE role = 'desktop' AND revoked_at IS NULL") as $row) {
+            Oaiy\Relay\Devices::revoke($r->ctx(), (string)$row['id']);
+        }
+        $r->ctx()->db->exec('DELETE FROM enroll_keys');
+        $r->ctx()->db->exec("UPDATE rl SET n = 0 WHERE k LIKE 'w:ip.enroll:%'");
+    }
+    eq([], $bad);
+});
+
 foreach (['mysql' => 'MySQL', 'mariadb' => 'MariaDB'] as $flavour => $tag) {
     slow_test("4.11 redeem on $tag: racing requests over four servers make exactly one device (the conditional UPDATE decides, on a real server)", function () use ($flavour) {
         if (!\OaiyTest\MysqlServer::available($flavour)) {

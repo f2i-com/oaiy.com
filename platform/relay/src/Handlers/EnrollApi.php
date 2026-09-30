@@ -83,8 +83,11 @@ final class EnrollApi
             if ($db->exec('UPDATE enroll_keys SET used_at = ? WHERE kid = ? AND used_at IS NULL AND exp > ? AND fails < ?', [$now, $kid, $now, self::MAX_FAILS]) !== 1) {
                 return null;
             }
-            if ($role === 'desktop' && (int)$db->val("SELECT COUNT(*) FROM devices WHERE role = 'desktop' AND revoked_at IS NULL") >= $limit) {
-                throw ApiError::make('unauthorized'); // rolls the key back too: it was never spent
+            if ($role === 'desktop') {
+                $db->gate('desktops'); // two redemptions of two keys must not both count the same desktops and both make one
+                if ((int)$db->val("SELECT COUNT(*) FROM devices WHERE role = 'desktop' AND revoked_at IS NULL") >= $limit) {
+                    throw ApiError::make('unauthorized'); // rolls the key back too: it was never spent
+                }
             }
             [$id, $token] = Devices::create($db, $ctx->auth, $role, $displayName, ['ed25519' => $edPub, 'x25519' => $xPub]);
             return [$id, $token];

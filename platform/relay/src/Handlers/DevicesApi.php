@@ -249,6 +249,9 @@ final class DevicesApi
         $grace = $now + 600;
         [$token, $tokenId, $hash] = $ctx->auth->mint();
         $ctx->db->write(function (Db $db) use ($p, $now, $grace, $tokenId, $hash): void {
+            // The check that follows reads what other rotations have committed. Lock the device row first: on MySQL and
+            // MariaDB a plain count answers from a snapshot and two rotations at once both found no rotation in progress.
+            $db->one('SELECT id FROM devices WHERE id = ?' . $db->forUpdate(), [$p->id]);
             $active = (int)$db->val('SELECT COUNT(*) FROM tokens WHERE device_id = ? AND grace_until IS NOT NULL AND grace_until > ? AND revoked_at IS NULL', [$p->id, $now]);
             if ($active > 0) {
                 throw ApiError::make('conflict');

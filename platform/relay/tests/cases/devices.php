@@ -443,6 +443,50 @@ test('4.9.1 rotation: a second rotation during the grace is 409 conflict, from e
     eq(200, $r->call($first, 'GET', '/v1/presence')['status'], 'the middle token is in its own grace');
 });
 
+test('4.9.1 rotation: a rotation that meets another one committed meanwhile is 409, on SQLite, MySQL and MariaDB alike (the device row is locked before the check)', function () {
+    $r = Relay::make();
+    $d = $r->desktop();
+    $server = $r->serve();
+    // Another connection is in the middle of rotating this device: it holds the device row (or, on SQLite, the whole
+    // database). The request arrives, has to wait for it, and must then see the rotation the other one committed.
+    $other = Oaiy\Relay\Db::open(Oaiy\Relay\Config::load($r->data))->pdo();
+    $other->exec(Relay::isMysql() ? 'START TRANSACTION' : 'BEGIN IMMEDIATE');
+    if (Relay::isMysql()) {
+        $other->prepare('SELECT id FROM devices WHERE id = ? FOR UPDATE')->execute([$d->id]);
+    }
+    $pending = $server->begin('POST', '/v1/tokens/rotate', ['Authorization' => 'Bearer ' . $d->token]);
+    usleep(900000);
+    $now = Oaiy\Relay\Clock::now();
+    [, $newId, $newHash] = $r->ctx()->auth->mint();
+    $oldId = explode('.', $d->token)[1];
+    $other->prepare('INSERT INTO tokens (id, device_id, secret_hash, created_at, not_after, revoked_at, last_used_at, grace_until) VALUES (?, ?, ?, ?, NULL, NULL, NULL, NULL)')->execute([$newId, $d->id, $newHash, $now]);
+    $other->prepare('UPDATE tokens SET not_after = ?, grace_until = ? WHERE id = ?')->execute([$now + 600, $now + 600, $oldId]);
+    $other->exec('COMMIT');
+    $res = $pending->finish(20);
+    eq(409, $res['status'], $res['body']);
+    eq(2, (int)$r->ctx()->db->val('SELECT COUNT(*) FROM tokens WHERE device_id = ?', [$d->id]), 'the second rotation made no token');
+});
+
+slow_test('4.9.1 rotation: four servers rotating one device at the same instant, twenty-five devices in a row: exactly one succeeds each time and the rest are 409', function () {
+    $r = Relay::make();
+    $fleet = $r->fleet(4);
+    $bad = [];
+    for ($i = 0; $i < 25; $i++) {
+        $d = $r->desktop('Rot' . $i);
+        $pending = [];
+        foreach ($fleet as $s) {
+            $pending[] = $s->begin('POST', '/v1/tokens/rotate', ['Authorization' => 'Bearer ' . $d->token]);
+        }
+        $codes = array_map(fn($p) => $p->finish(20)['status'], $pending);
+        sort($codes);
+        if ($codes !== [200, 409, 409, 409]) {
+            $bad[] = "round $i: " . implode(',', $codes);
+        }
+        eq(2, (int)$r->ctx()->db->val('SELECT COUNT(*) FROM tokens WHERE device_id = ?', [$d->id]), "round $i made exactly one new token");
+    }
+    eq([], $bad);
+});
+
 test('4.9.1 rotation: only the caller\'s own device is touched; a revoked device cannot rotate; the admin token cannot', function () {
     $r = Relay::make();
     $d = $r->desktop();

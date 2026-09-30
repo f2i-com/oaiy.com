@@ -49,6 +49,7 @@ final class Enrolment
         $limit = (int)$cfg->limit('desktops');
         $db->write(function (Db $db) use ($role, $d, $exp, $now, $name, $limit): void {
             if ($role === 'desktop') {
+                $db->gate('desktops'); // the count below must see every desktop and every key another writer has just made
                 $have = (int)$db->val("SELECT COUNT(*) FROM devices WHERE role = 'desktop' AND revoked_at IS NULL")
                     + (int)$db->val("SELECT COUNT(*) FROM enroll_keys WHERE role = 'desktop' AND used_at IS NULL AND exp > ? AND fails < 5", [$now]);
                 if ($have >= $limit) {

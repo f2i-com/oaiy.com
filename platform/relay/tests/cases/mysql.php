@@ -166,6 +166,59 @@ echo $bad, "\n";
         eq(120, (int)$r->ctx()->db->val('SELECT next_seq FROM mailboxes WHERE id = ?', [$d->inbox()]) - 1);
     });
 
+    slow_test("4.11 $tag: two keys redeemed at the same instant on a relay with room for one desktop make one desktop (the count is taken behind a gate)", function () use ($flavour) {
+        if (!MysqlServer::available($flavour)) {
+            skip("no $flavour server binary here");
+        }
+        $srv = MysqlServer::for($flavour);
+        $dbName = $srv->newDatabase();
+        $r = Relay::make([], ['db' => ['driver' => 'mysql', 'dsn' => $srv->dsn($dbName), 'user' => 'root', 'pass' => '']]);
+        $r->ctx()->db->exec('DELETE FROM enroll_keys'); // the installer's first key would count as one of the two
+        [, , $d1] = enroll_mint($r);
+        [, , $d2] = enroll_mint($r);
+        $r->configure(['limits' => ['desktops' => 1]]); // two keys were made while there was room for two
+        $fleet = $r->fleet(2);
+        // With the devices table locked, both redemptions get as far as counting the desktops and wait there; when the
+        // lock goes, both would count none, unless the second has to wait for the first to finish.
+        $lock = new PDO($srv->dsn($dbName), 'root', '', [PDO::ATTR_ERRMODE => PDO::ERRMODE_EXCEPTION]);
+        $lock->exec('LOCK TABLES devices WRITE');
+        [$b1, $h1] = enroll_request($d1, 'desktop', 'One');
+        [$b2, $h2] = enroll_request($d2, 'desktop', 'Two');
+        $p1 = $fleet[0]->begin('POST', '/v1/enroll', ['Content-Type' => 'application/json'] + $h1, $b1);
+        $p2 = $fleet[1]->begin('POST', '/v1/enroll', ['Content-Type' => 'application/json'] + $h2, $b2);
+        usleep(1500000);
+        $lock->exec('UNLOCK TABLES');
+        $codes = [$p1->finish(20)['status'], $p2->finish(20)['status']];
+        sort($codes);
+        eq([201, 401], $codes);
+        eq(1, (int)$r->ctx()->db->val("SELECT COUNT(*) FROM devices WHERE role = 'desktop'"));
+    });
+
+    slow_test("4.11 $tag: two keys minted at the same instant on a relay with room for one more desktop: one is made and the other refused", function () use ($flavour) {
+        if (!MysqlServer::available($flavour)) {
+            skip("no $flavour server binary here");
+        }
+        $srv = MysqlServer::for($flavour);
+        $dbName = $srv->newDatabase();
+        $r = Relay::make(['limits' => ['desktops' => 1]], ['db' => ['driver' => 'mysql', 'dsn' => $srv->dsn($dbName), 'user' => 'root', 'pass' => '']]);
+        $r->ctx()->db->exec('DELETE FROM enroll_keys'); // the installer's first key would count as the one desktop
+        $code = '
+            $ctx = Oaiy\Relay\Context::open($argv[1]);
+            [$pk] = Oaiy\Relay\Info::loadKeys($argv[1]);
+            try { Oaiy\Relay\Enrolment::mint($ctx->db, $ctx->cfg, Oaiy\Relay\Crypto::thumbprint($pk), "desktop"); echo "made"; } catch (Throwable $e) { echo "refused"; }
+        ';
+        $lock = new PDO($srv->dsn($dbName), 'root', '', [PDO::ATTR_ERRMODE => PDO::ERRMODE_EXCEPTION]);
+        $lock->exec('LOCK TABLES devices WRITE');
+        $a = storage_child($code, [$r->data]);
+        $b = storage_child($code, [$r->data]);
+        usleep(1500000);
+        $lock->exec('UNLOCK TABLES');
+        $out = [storage_wait($a)[0], storage_wait($b)[0]];
+        sort($out);
+        eq(['made', 'refused'], $out);
+        eq(1, (int)$r->ctx()->db->val('SELECT COUNT(*) FROM enroll_keys'));
+    });
+
     slow_test("4.11 $tag: a key another request spent after this one read it is still the uniform 401, because the conditional UPDATE decides and not the earlier read", function () use ($flavour) {
         if (!MysqlServer::available($flavour)) {
             skip("no $flavour server binary here");
