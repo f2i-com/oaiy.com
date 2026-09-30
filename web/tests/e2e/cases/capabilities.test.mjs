@@ -84,7 +84,7 @@ describe('the flow editor in a tab', () => {
     assert.doesNotMatch(await paletteFor(page, 'Ask the'), /Ask the Agent/);
     assert.doesNotMatch(await paletteFor(page, 'Folder'), /Folder Input/);
     await page.locator('.oaiy-nav button[aria-label="Data"]').click();
-    assert.match(await page.locator('[data-testid="data-page"]').textContent(), /Kept for this session only: in a browser tab it lives in memory, and is gone when the tab is closed or reloaded\./);
+    assert.match(await page.locator('[data-testid="data-page"]').textContent(), /Kept for this session only: the editor keeps it in memory, and it is gone when this page is closed or reloaded\./);
     assert.deepEqual(errors, []);
     await context.close();
   });
@@ -112,7 +112,7 @@ describe('the flow editor in a tab', () => {
 });
 
 describe("the flow editor in OAIY's own window", () => {
-  it('has the Packages section, the desktop\'s nodes and no session label on Data, as it always did, and nothing to connect', async () => {
+  it('has the Packages section and the desktop\'s nodes as it always did, nothing to connect, and says Data is kept for the session as a tab does', async () => {
     const { context, page, errors } = await open('flows', { desktop: OAIY_WINDOW });
     await ready('flows', page);
     const tabs = await page.locator('.oaiy-sections-tabs button').evaluateAll((els) => els.map((e) => e.getAttribute('aria-label')));
@@ -125,7 +125,8 @@ describe("the flow editor in OAIY's own window", () => {
     assert.match(await paletteFor(page, 'Folder'), /Folder Input/);
     await page.locator('.oaiy-sections-tabs button[aria-label="Data"]').click();
     const data = await page.locator('[data-testid="data-page"]').textContent();
-    assert.doesNotMatch(data, /Kept for this session only/, "OAIY's window is left as it was");
+    // (The review's F10: the editor's SQLite is in memory in OAIY's window too, and a person losing what a flow stored should be told there.)
+    assert.match(data, /Kept for this session only: the editor keeps it in memory, and it is gone when this page is closed or reloaded\./);
     await page.locator('.oaiy-sections-tabs button[aria-label="Packages"]').click();
     await page.locator('[data-testid="packages-page"]').waitFor({ timeout: 5000 });
     assert.deepEqual(errors, []);
