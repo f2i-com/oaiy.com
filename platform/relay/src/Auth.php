@@ -54,6 +54,13 @@ final class Auth
         return $id === null || $secret === null ? null : [$m[1], $secret];
     }
 
+    /** Zero the raw secret bytes once they have been hashed, in the variable and in the parsed pair it came from. @param array{0:string,1:string} $pair */
+    private static function wipe(string &$secret, array &$pair): void
+    {
+        sodium_memzero($secret);
+        sodium_memzero($pair[1]);
+    }
+
     /** Build a fresh device token; returns [token string, id, secret hash to store]. @return array{0:string,1:string,2:string} */
     public function mint(): array
     {
@@ -128,6 +135,7 @@ final class Auth
         // The same work whether or not the id exists: hash the presented secret, compare it with something, and look
         // up the lock for the (id, address) pair.
         $given = Crypto::secretHash($secret, $this->cfg->pepper());
+        self::wipe($secret, $p); // the secret's job is done: do not leave the raw bytes lying in memory
         $stored = $row !== null ? (string)$row['th'] : self::DUMMY_HASH;
         self::$compares++;
         $match = Crypto::equals($stored, $given);
@@ -168,6 +176,7 @@ final class Auth
         $rec = self::readAdminRecord($this->cfg->dataDir);
         $stored = $rec !== null && hash_equals($rec['id'], $id) ? $rec['hash'] : self::DUMMY_HASH;
         $given = Crypto::secretHash($secret, null); // the admin token is hashed without the pepper: it lives in a file, not the database
+        self::wipe($secret, $p);
         self::$compares++;
         $ok = Crypto::equals($stored, $given) && $rec !== null && hash_equals($rec['id'], $id);
         if (!$ok) {

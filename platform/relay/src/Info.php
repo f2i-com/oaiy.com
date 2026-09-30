@@ -43,7 +43,9 @@ final class Info
         if ($seed === null) {
             throw new \RuntimeException('relay.key is missing or damaged');
         }
-        return Crypto::signKeypairFromSeed($seed);
+        $keys = Crypto::signKeypairFromSeed($seed);
+        sodium_memzero($seed); // the seed is only the secret key in another form
+        return $keys;
     }
 
     public static function softwareVersion(): string
