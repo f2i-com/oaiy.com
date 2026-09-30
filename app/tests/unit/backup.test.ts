@@ -1203,6 +1203,22 @@ describe('a restore never redirects a kept key or changes what OAIY may do witho
       });
     }
 
+    it('keeps the key and what was read from the service when the address goes back to the one it is (the restore did not change it)', () => {
+      const left = settings({
+        media: { ...EMPTY_MEDIA, ...SET.media, apiKey: 'media-key-here', endpoints: { images: 'https://media.set.example/v1/images' }, imageModels: [{ id: 'read-from-this-service' } as never] },
+      });
+      // The copy holds the same address (written with a slash at the end) and other names for the models.
+      const copy = { media: { ...EMPTY.media, baseUrl: 'https://media.set.example/v1/', imageModel: 'img-before' } } as Parameters<typeof mergeSettings>[1];
+      const notes: string[] = [];
+      const back = mergeSettings(left, copy, new Set(), { exact: true, notes });
+      expect(back.media.baseUrl).toBe('https://media.set.example/v1/');
+      expect(back.media.imageModel).toBe('img-before');
+      expect(back.media.apiKey).toBe('media-key-here');
+      expect(back.media.endpoints).toEqual({ images: 'https://media.set.example/v1/images' });
+      expect(back.media.imageModels).toEqual([{ id: 'read-from-this-service' }]);
+      expect(notes.join('\n')).not.toContain('put back');
+    });
+
     it('takes a media address a restore set out again, through the page, with the copy it took (the reviewer’s case)', async () => {
       const target = new FakeStorage();
       target.settings = settings({ media: { ...EMPTY_MEDIA } });
@@ -1590,6 +1606,19 @@ describe('the numbers not to be contacted only grow', () => {
     const outcome = await restore(target, many);
     expect(list(target)).toHaveLength(MAX_DO_NOT_CONTACT_ADDED);
     expect(outcome!.warnings.join('\n')).toContain('3 of the numbers not to be contacted in the backup were left out');
+  });
+
+  it('does not take a number with a control character in it, or one longer than forty characters, and takes the ones beside it', async () => {
+    const target = new FakeStorage();
+    const outcome = await restore(target, [
+      { number: '0400 111\u0007 222', at: 1, why: 'a bell' },
+      { number: '0400\n111 333', at: 1, why: 'a new line' },
+      { number: '\u0000', at: 1, why: 'nothing' },
+      { number: '0'.repeat(41), at: 1, why: 'too long' },
+      { number: '0400 333 444', at: 6, why: 'asked' },
+    ]);
+    expect(outcome!.ok).toBe(true);
+    expect(list(target).map((d) => d.number)).toEqual(['0400 333 444']);
   });
 
   it('writes the numbers of the backup where there is no list, and lists the file as added for an undo', async () => {

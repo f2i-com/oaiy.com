@@ -24,6 +24,8 @@ describe('a set of people found in constant time says what samePerson says', () 
     '+1 415 555 0132', '(415) 555-0132', '415-555-0132', '4155550132', '+64 21 123 4567', '021 123 4567', '211234567', '+27 82 123 4567', '0821234567', '821234567',
     '02 9876 5432', '+61298765432', '298765432', '+33 1 42 68 53 00', '0033 1 42 68 53 00', '142685300', '33142685300', '1300 123 456', '1300123456', '13 11 11', '131111',
     'ACME', 'acme', 'Acme Bank', 'Private', 'Unknown', 'Withheld', '', '  ', '+', 'abc123', '123', '12345678', '123456789', '0123456789', '+1234567890123',
+    // Too short to have a tail (with and without the plus), that differ in the ninth digit from the end, and sender ids that have digits in them.
+    '+1234567', '1234567', '+123456', '123456', '+12345678', '112345678', '212345678', '+112345678', 'ACME 12345678', 'ZED 12345678', 'ACME12345678', 'ACME 1234 5678',
   ];
   it('for every sequence of numbers a list could be built from, in five countries', () => {
     let compared = 0;
@@ -61,6 +63,35 @@ describe('a set of people found in constant time says what samePerson says', () 
     index.add('491570006');
     expect(index.has('+64491570006')).toBe(true);
     expect(index.has('+61491570006')).toBe(true);
+  });
+
+  it('gives no last-nine-digits match to what is too short, to what differs before the last nine, or to a sender id that has digits in it', () => {
+    // Each pair: a member, and someone who is not the same person as it (samePerson says so, and so does the index).
+    for (const [member, probe] of [
+      ['+1234567', '1234567'], // seven digits: too short to match by the end of the number
+      ['+123456', '123456'],
+      ['112345678', '212345678'], // nine digits that differ in the first
+      ['+112345678', '212345678'],
+      ['ACME 12345678', 'ZED 12345678'], // letters and digits are a name, not a number
+      ['ACME12345678', 'ZED 12345678'],
+    ]) {
+      expect(samePerson(member, probe, 'AU'), `${member} / ${probe}`).toBe(false);
+      const index = new PersonIndex('AU');
+      index.add(member);
+      expect(index.has(probe), `${member} / ${probe}`).toBe(false);
+      // and the other way round
+      const other = new PersonIndex('AU');
+      other.add(probe);
+      expect(other.has(member), `${probe} / ${member}`).toBe(false);
+    }
+    // A name is the same as itself, however it is written; a number of eight digits matches by the digits it has.
+    const names = new PersonIndex('AU');
+    names.add('ACME 12345678');
+    expect(names.has('acme 12345678')).toBe(samePerson('ACME 12345678', 'acme 12345678', 'AU'));
+    const eight = new PersonIndex('AU');
+    eight.add('+12345678');
+    expect(eight.has('12345678')).toBe(true);
+    expect(samePerson('+12345678', '12345678', 'AU')).toBe(true);
   });
 });
 

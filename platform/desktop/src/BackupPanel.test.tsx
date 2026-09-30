@@ -639,6 +639,13 @@ describe('restoring: what can run or change settings needs a tick', () => {
     expect(h.stage).toHaveBeenCalledWith('insp-1', PASS, { classes: ['templates', 'flows', 'providers'], keys: false });
   });
 
+  it('“Select all of my own backup” ticks nothing that the backup holds none of', async () => {
+    await check({ classes: [...CLASSES, { id: 'connections', label: 'Connections', description: 'Where OAIY is linked.', count: 0 }] });
+    await click(buttonWith('Select all of my own backup'));
+    await click(buttonWith('Prepare restore'));
+    expect(h.stage).toHaveBeenCalledWith('insp-1', PASS, { classes: ['templates', 'flows', 'providers'], keys: false });
+  });
+
   it('offers the keys only when the file has some, unticked, with the words that they come back only if ticked', async () => {
     await check({ keys: { inBackup: false } });
     expect(keysBox()).toBeNull();
