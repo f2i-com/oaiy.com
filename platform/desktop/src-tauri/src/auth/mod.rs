@@ -43,6 +43,8 @@ pub mod runtime;
 pub mod scopes;
 pub mod scrub;
 #[cfg(feature = "web")]
+pub mod session;
+#[cfg(feature = "web")]
 pub mod setup;
 pub mod store;
 pub mod token;
@@ -61,6 +63,8 @@ pub use runtime::{build_guard, flush_installed, AccessSettings};
 
 #[cfg(test)]
 mod conformance;
+#[cfg(test)]
+mod cookie_guard_tests;
 #[cfg(test)]
 mod guard_tests;
 #[cfg(test)]

@@ -176,6 +176,16 @@ impl Denial {
         .header("www-authenticate", "Bearer realm=\"oaiy\"".into())
     }
 
+    /// No owner login exists yet (design 4.7.1): the answer of an install in setup-only mode.
+    pub fn setup_required() -> Denial {
+        Denial::new(
+            StatusCode::UNAUTHORIZED,
+            "setup_required",
+            "No owner login exists yet: run `oaiy-server auth setup-code` on the server, or `oaiy-server auth init`.",
+        )
+        .header("www-authenticate", "Bearer realm=\"oaiy\"".into())
+    }
+
     /// From a credential that was presented and was not accepted.
     pub fn from_auth_error(e: &AuthError) -> Denial {
         let status = StatusCode::UNAUTHORIZED;
@@ -535,6 +545,9 @@ pub struct Guard {
     /// When a trusted proxy's unusable `X-Forwarded-For` was last logged (once a minute), how many lines.
     fell_back_at: AtomicU64,
     fell_back_lines: AtomicU64,
+    /// The web login, when this server has one: it turns on the session cookie and setup-only mode.
+    #[cfg(feature = "web")]
+    login: std::sync::OnceLock<std::sync::Weak<dyn super::session::LoginFacts>>,
 }
 
 /// The least time between two lines of a kind that anonymous traffic can make.
@@ -590,6 +603,8 @@ impl Guard {
             proxy_misconfigured_noted: AtomicBool::new(false),
             fell_back_at: AtomicU64::new(0),
             fell_back_lines: AtomicU64::new(0),
+            #[cfg(feature = "web")]
+            login: std::sync::OnceLock::new(),
         }
     }
 
@@ -681,6 +696,39 @@ impl Guard {
         log::warn!(
             "auth: the X-Forwarded-For of the trusted proxy {peer} could not be used: its address stands for every client behind it; check the proxy and OAIY_TRUSTED_PROXIES"
         );
+    }
+
+    /// Install the web login: from now on a request with no `Authorization` header is authenticated by the session
+    /// cookie of its host, and an anonymous request to a route that needs a credential is `401 setup_required`
+    /// while there is no owner. Once; a second call is ignored. The guard holds the login weakly: the login holds
+    /// the guard, and the owner of both is whatever serves the routes.
+    #[cfg(feature = "web")]
+    pub fn install_login(&self, login: std::sync::Weak<dyn super::session::LoginFacts>) {
+        let _ = self.login.set(login);
+    }
+
+    /// The installed web login, if there is one and it is still there.
+    #[cfg(feature = "web")]
+    pub fn login(&self) -> Option<Arc<dyn super::session::LoginFacts>> {
+        self.login.get().and_then(std::sync::Weak::upgrade)
+    }
+
+    /// Whether an owner login exists (`GET /api/auth/info`): false on an install with no web login.
+    pub fn login_configured(&self) -> bool {
+        #[cfg(feature = "web")]
+        if let Some(login) = self.login() {
+            return login.owner_configured();
+        }
+        false
+    }
+
+    /// `active`, `expired` or `none` (`GET /api/auth/info`): `none` on an install with no web login.
+    pub fn setup_code_status(&self) -> &'static str {
+        #[cfg(feature = "web")]
+        if let Some(login) = self.login() {
+            return login.setup_code_status();
+        }
+        "none"
     }
 
     pub fn mode(&self) -> AccessMode {
@@ -926,6 +974,7 @@ impl Guard {
         } else {
             self.authenticate(
                 &headers,
+                &method,
                 &info,
                 direct_loopback,
                 self.throttle_applies(peer),
@@ -938,7 +987,7 @@ impl Guard {
             return Err(fail(if principal.is_some() {
                 Denial::not_found()
             } else {
-                Denial::auth_required()
+                self.setup_only(Denial::auth_required())
             }));
         }
 
@@ -956,8 +1005,23 @@ impl Guard {
                     info: Some(info),
                 })
             }
-            Verdict::Deny(d) => Err(fail(d)),
+            Verdict::Deny(d) => Err(fail(if principal.is_none() {
+                self.setup_only(d)
+            } else {
+                d
+            })),
         }
+    }
+
+    /// An install with a web login and no owner is in setup-only mode (design 4.7.1): an anonymous caller of a
+    /// route that needs a credential is told to set up instead of to sign in. Bearer credentials are unaffected
+    /// (they never reach this), and every other refusal stands as it is.
+    fn setup_only(&self, denial: Denial) -> Denial {
+        #[cfg(feature = "web")]
+        if denial.code == "auth_required" && self.login().is_some_and(|l| !l.owner_configured()) {
+            return Denial::setup_required();
+        }
+        denial
     }
 
     /// The failed-bearer throttle does not apply to loopback peers of a local install: a desktop's own
@@ -970,6 +1034,7 @@ impl Guard {
     fn authenticate(
         &self,
         headers: &HeaderMap,
+        method: &Method,
         info: &RequestInfo,
         direct_loopback: bool,
         throttled: bool,
@@ -980,7 +1045,17 @@ impl Guard {
             .map(|v| v.as_bytes())
             .collect();
         let presented = match token::bearer_or_static(&values, self.static_token.as_deref()) {
-            Ok(None) => return Ok(None),
+            // No bearer: the session cookie of the host's app, on an install with a web login. A bearer wins over
+            // a cookie, so this is reached only without an `Authorization` header.
+            Ok(None) => {
+                #[cfg(feature = "web")]
+                return super::session::authenticate_cookie(self, headers, method, info);
+                #[cfg(not(feature = "web"))]
+                {
+                    let _ = (method, info);
+                    return Ok(None);
+                }
+            }
             Ok(Some(t)) => t,
             Err(e) => return Err(Denial::bad_request(e.message())),
         };
