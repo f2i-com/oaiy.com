@@ -188,6 +188,9 @@ pub struct Ring {
     names: RwLock<Arc<dyn Fn() -> Vec<String> + Send + Sync>>,
     /// The rings going now, and the last ones that ended (see `session.rs`).
     pub(super) sessions: Mutex<super::session::Sessions>,
+    /// Held while the owner is told a ring began or ended, so that the two are told in that order: a ring that ended between being pushed and being
+    /// told of is not told of at all (`session.rs`). Nothing else is done under it, and it is never held while `sessions` is.
+    pub(super) announcing: Mutex<()>,
     notifier: RwLock<Option<Arc<dyn super::session::RingNotifier>>>,
     /// How long past its time a ring waits to hear how it came out before it is over.
     pub(super) expiry_grace: RwLock<Duration>,
@@ -216,6 +219,7 @@ impl Ring {
             on_features: RwLock::new(None),
             names: RwLock::new(Arc::new(Vec::new)),
             sessions: Mutex::new(super::session::Sessions::default()),
+            announcing: Mutex::new(()),
             notifier: RwLock::new(None),
             expiry_grace: RwLock::new(super::session::EXPIRY_GRACE),
             offers: Mutex::default(),

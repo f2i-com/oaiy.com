@@ -178,6 +178,11 @@ fn error(status: u16, code: &'static str, message: impl Into<String>) -> RingErr
     RingError { status, code, message: message.into() }
 }
 
+/// What the plugin is answered when the call is over by the time its request is open.
+fn call_ended() -> RingError {
+    error(409, "call_ended", "the call ended while the request was being planned: nothing rings")
+}
+
 impl Ring {
     /// The plugin says the request is out: this desktop rings. Only for a plan this desktop allowed for the
     /// call and the plugin asked for; a request for anything else is refused and rings nothing.
@@ -197,10 +202,10 @@ impl Ring {
         if !self.plan_is_claimed(&params.plan_id, &params.call_id) {
             return Err(error(409, "unknown_plan", "that plan was not allowed for this call, or has run out: nothing rings"));
         }
-        // The caller hung up while the request was being planned and sent: nobody is rung for a call that is over. The plan is left as it is, so
-        // the plugin's refusal of the request (which it must now make) gives the try back.
+        // The caller hung up while the request was being planned and sent: nobody is rung for a call that is over, and the try that was counted for
+        // it is given back here (the plan is used up with it, so the plugin's refusal of the request, which it must now make, has nothing to give back).
         if self.call_is_over(&params.call_id) {
-            return Err(error(409, "call_ended", "the call ended while the request was being planned: nothing rings"));
+            return Err(self.refuse_a_call_that_ended(params));
         }
         // The call began again since the plan was allowed for it (its session was made anew, or the owner handed the caller back): that request
         // was for another beginning, and is refused as the plugin refuses a call that changed. The plan is left as it is, so its refusal gives
@@ -213,13 +218,8 @@ impl Ring {
             return Err(error(409, "unknown_plan", "that plan was not allowed for this call, or has run out: nothing rings"));
         };
         let (plan, judged) = (taken.plan, taken.judged);
-        // A request opened a ring: the plugin's consent is there.
-        self.note_ring_opened();
+        // What the dialog shows is what the caller has said, read now, before the ask is used up below.
         let info = self.call_info(&params.call_id).unwrap_or_default();
-        // The ask that this ring is for is acted on now: the next request needs an ask of its own, said after this. What is used up is what the
-        // request was judged on, and no more: the caller may have said something since, while the request was being planned and sent, and that is
-        // the next request's own. (What the dialog shows is what the caller has said, read just above.)
-        self.use_up_asked_turns(&params.call_id, judged);
         let now = self.now_ms();
         let given = params.expires_at.saturating_mul(1000);
         let longest = now + (u64::from(plan.ring_seconds) + 10) * 1000;
@@ -254,16 +254,50 @@ impl Ring {
             if sessions.live.iter().any(|l| l.ring.id == ring.id) {
                 return Ok(ring);
             }
+            // The call may have ended since it was looked at above, and is looked at again here, under the lock that `call_finished` needs to end what
+            // rings for it: the call is marked over before that runs, so a ring pushed here is seen by it, and one that finds the call over is not
+            // pushed at all. (Checked earlier only, a call that ended between the check and the push left a dialog and a notification for a call
+            // that was over.)
+            if self.call_is_over(&params.call_id) {
+                drop(sessions);
+                self.attempts.lock().unwrap_or_else(|e| e.into_inner()).forget_last(&params.call_id);
+                return Err(call_ended());
+            }
             // The plan moves into the ring it opened: nothing else holds a copy.
             sessions.live.push(Live { ring: ring.clone(), plan, plan_id: params.plan_id.clone() });
         }
+        // A ring is open: the plugin's consent is there, and the ask that it is for is acted on. The next request needs an ask of its own, said after
+        // this. What is used up is what the request was judged on, and no more: the caller may have said something since, while the request was
+        // being planned and sent, and that is the next request's own. (Not before the ring is pushed: a request that stops short of one spends nothing.)
+        self.note_ring_opened();
+        self.use_up_asked_turns(&params.call_id, judged);
         if toast {
-            if let Some(notifier) = self.notifier() {
-                notifier.ringing(&ring);
-            }
+            self.announce_ringing(&ring);
         }
         self.watch_expiry(&ring);
         Ok(ring)
+    }
+
+    /// The call ended while the request was being planned: the plan is used up and the try counted for it given back (only by whoever used the plan
+    /// up, so that a refusal that comes after from the plugin does not give it back twice), and the error the plugin is answered with.
+    fn refuse_a_call_that_ended(&self, params: &OpenedParams) -> RingError {
+        if self.take_plan(&params.plan_id, &params.call_id).is_some() {
+            self.attempts.lock().unwrap_or_else(|e| e.into_inner()).forget_last(&params.call_id);
+        }
+        call_ended()
+    }
+
+    /// Tell the owner a ring began, if it is still going: a ring that ended already (the call was hung up between its being pushed and this) is
+    /// not announced, and one that is announced is told of as ended after it, never before (the two are told under one lock, see `resolve`).
+    fn announce_ringing(&self, ring: &ActiveRing) {
+        let _told_in_order = self.announcing.lock().unwrap_or_else(|e| e.into_inner());
+        let still_going = self.sessions.lock().unwrap_or_else(|e| e.into_inner()).live.iter().any(|l| l.ring.id == ring.id);
+        if !still_going {
+            return;
+        }
+        if let Some(notifier) = self.notifier() {
+            notifier.ringing(ring);
+        }
     }
 
     /// The ring is over when its time and a grace have passed with nobody having said how it came out.
@@ -296,6 +330,7 @@ impl Ring {
             live
         };
         if live.plan.desktop_toast {
+            let _told_in_order = self.announcing.lock().unwrap_or_else(|e| e.into_inner());
             if let Some(notifier) = self.notifier() {
                 notifier.ended(&live.ring.id, outcome.as_str());
             }

@@ -271,8 +271,10 @@ fn a_ring_is_not_opened_for_a_call_that_ended_while_the_request_was_being_planne
     assert_eq!(r.ring.opened(&opened("plan_made_up", "assist_1", CALL, 25, &r.ring)).unwrap_err().code, "unknown_plan");
     assert!(r.ring.active().is_empty() && r.notified.rang.lock().unwrap().is_empty(), "nothing rings, and nobody is told");
     assert!(r.calls.used.lock().unwrap().is_empty(), "the ask of a call that is over is not acted on");
-    // The plugin then refuses the request itself, as it must: nobody was rung, so the try is given back.
-    assert!(r.ring.request_refused(CALL));
+    // Nobody was rung, and the try is given back at once, by the refusal itself: it does not wait for the plugin's.
+    assert_eq!(tries(&r), 0, "the try that was counted for the call is given back");
+    // The plugin then refuses the request itself, as it must: there is nothing left to give back, and nothing is given back twice.
+    assert!(!r.ring.request_refused(CALL), "the plan was used up with the refusal");
     assert_eq!(tries(&r), 0);
     // A call that is over is not planned for either: nothing rings and no try is counted.
     let again = r.ring.plan_for_plugin(CALL, Reason::CallerAsked, CallInfo::default());
@@ -1031,6 +1033,195 @@ fn a_refusal_that_a_ring_has_used_up_is_not_carried_into_the_words_after_it() {
     assert!(alone.rings(), "read alone, it asks: {:?}", alone.plan);
 }
 
+/// A call that ends while its ring opens leaves no ring, no notification the owner cannot dismiss, no try counted and no ask spent. The moment is the
+/// one between the plugin's word that the request is out and the ring being pushed, and between its being pushed and the owner being told. The fake call
+/// says it is over from its `n`th look at it, and what it is asked to consume: so the call ends exactly where each test wants it to.
+mod a_call_that_ends_while_its_ring_opens {
+    use super::*;
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+
+    /// The order in which the owner was told: "ringing <id>" and "ended <id>" (a notification that is slow to show is logged when it has shown).
+    #[derive(Default)]
+    struct Told(Mutex<Vec<String>>, Mutex<Duration>);
+
+    impl RingNotifier for Told {
+        fn ringing(&self, ring: &ActiveRing) {
+            let slow = *self.1.lock().unwrap();
+            std::thread::sleep(slow);
+            self.0.lock().unwrap().push(format!("ringing {}", ring.id));
+        }
+        fn ended(&self, id: &str, _outcome: &str) {
+            self.0.lock().unwrap().push(format!("ended {id}"));
+        }
+    }
+
+    /// A call that is over from the `over_from`th time it is asked (0 for ever, `usize::MAX` never), and that can be made to end the call's rings when the
+    /// ask is used up (which is between the ring being pushed and the owner being told).
+    struct Ending {
+        looks: AtomicUsize,
+        over_from: AtomicUsize,
+        over: AtomicBool,
+        end_rings_on_consume: Mutex<Option<Arc<Ring>>>,
+        spent: Mutex<Vec<u64>>,
+    }
+
+    impl Ending {
+        fn new() -> Arc<Self> {
+            Arc::new(Self { looks: AtomicUsize::new(0), over_from: AtomicUsize::new(usize::MAX), over: AtomicBool::new(false), end_rings_on_consume: Mutex::new(None), spent: Mutex::default() })
+        }
+    }
+
+    impl CallSource for Ending {
+        fn facts(&self, _call: &str) -> Option<CallInfo> {
+            Some(CallInfo { from: "+61491570006".into(), name: "Alex".into(), turns: vec![ASKED.into()], total: 1 })
+        }
+        fn call_ended_by_phone(&self, _call: &str) {}
+        fn consume_turns(&self, call: &str, up_to: u64) {
+            self.spent.lock().unwrap().push(up_to);
+            if let Some(ring) = self.end_rings_on_consume.lock().unwrap().take() {
+                self.over.store(true, Ordering::SeqCst);
+                ring.call_finished(call);
+            }
+        }
+        fn is_over(&self, _call: &str) -> bool {
+            let look = self.looks.fetch_add(1, Ordering::SeqCst);
+            self.over.load(Ordering::SeqCst) || look >= self.over_from.load(Ordering::SeqCst)
+        }
+        fn cancel_transfer(&self, _call: &str, _request: &str, _reason: CancelReason) -> tokio::sync::oneshot::Receiver<Withdrawal> {
+            let (reply, answer) = tokio::sync::oneshot::channel();
+            let _ = reply.send(Withdrawal::NoSession);
+            answer
+        }
+    }
+
+    fn rig() -> (Arc<Ring>, Arc<Ending>, Arc<Told>) {
+        let ring = Ring::in_memory(RingSettings { enabled: true, ..Default::default() });
+        ring.set_presence(Arc::new(Here(Presence::Active)));
+        ring.set_devices(crate::ring::testing::at_the_pc());
+        let calls = Ending::new();
+        ring.set_calls(calls.clone());
+        let told = Arc::new(Told::default());
+        ring.set_notifier(told.clone());
+        (ring, calls, told)
+    }
+
+    fn plan_for(ring: &Arc<Ring>) -> String {
+        planned(ring, CALL)
+    }
+
+    fn tries_of(ring: &Ring) -> u32 {
+        ring.attempts.lock().unwrap().counters(CALL, &crate::ring::host::caller_key("+61491570006"), ring.clock().unix()).attempts_this_call
+    }
+
+    #[test]
+    fn between_the_check_and_the_push_leaves_no_ring_and_gives_the_try_back() {
+        let (ring, calls, told) = rig();
+        let plan = plan_for(&ring);
+        assert_eq!(tries_of(&ring), 1);
+        // The call is looked at twice while the ring opens: once early, and once where the ring is pushed. It is over from the second.
+        calls.looks.store(0, Ordering::SeqCst);
+        calls.over_from.store(1, Ordering::SeqCst);
+        let refused = ring.opened(&opened(&plan, "assist_1", CALL, 25, &ring)).unwrap_err();
+        assert_eq!((refused.status, refused.code), (409, "call_ended"));
+        assert!(ring.active().is_empty(), "no dialog for a call that is over");
+        assert!(told.0.lock().unwrap().is_empty(), "and nobody is told: {:?}", told.0.lock().unwrap());
+        assert!(calls.spent.lock().unwrap().is_empty(), "the ask of a call that is over is not acted on");
+        assert_eq!(tries_of(&ring), 0, "and the try that was counted is given back");
+        assert!(!ring.request_refused(CALL), "the plugin's refusal has nothing left to give back");
+        assert_eq!(tries_of(&ring), 0);
+    }
+
+    #[test]
+    fn between_the_push_and_the_owner_being_told_the_owner_is_not_told_of_a_ring_that_is_over() {
+        let (ring, calls, told) = rig();
+        let plan = plan_for(&ring);
+        // The call ends when the ask is used up, which is after the ring is pushed and before the owner is told of it.
+        *calls.end_rings_on_consume.lock().unwrap() = Some(ring.clone());
+        let opened_ring = ring.opened(&opened(&plan, "assist_1", CALL, 25, &ring));
+        assert!(opened_ring.is_ok(), "the ring was open when the plugin was answered");
+        assert!(ring.active().is_empty(), "and the call's end ended it");
+        assert_eq!(*told.0.lock().unwrap(), vec!["ended assist_1".to_string()], "it was never announced, and is not announced after it ended");
+    }
+
+    #[test]
+    fn a_ring_the_owner_is_told_of_is_told_of_as_ended_after_it_and_never_before() {
+        let (ring, _calls, told) = rig();
+        let plan = plan_for(&ring);
+        ring.opened(&opened(&plan, "assist_1", CALL, 25, &ring)).unwrap();
+        ring.call_finished(CALL);
+        assert_eq!(*told.0.lock().unwrap(), vec!["ringing assist_1".to_string(), "ended assist_1".to_string()]);
+    }
+
+    /// A notification that is slow to show is not overtaken by the end of its ring: the owner is told it began, and then that it ended.
+    #[test]
+    fn a_notification_that_is_slow_to_show_is_not_overtaken_by_the_end_of_its_ring() {
+        let (ring, _calls, told) = rig();
+        *told.1.lock().unwrap() = Duration::from_millis(150);
+        let plan = plan_for(&ring);
+        std::thread::scope(|scope| {
+            scope.spawn(|| ring.opened(&opened(&plan, "assist_1", CALL, 25, &ring)).unwrap());
+            // The call ends while the notification is being shown (the ring is pushed by then).
+            while ring.active().is_empty() {
+                std::thread::yield_now();
+            }
+            std::thread::sleep(Duration::from_millis(30));
+            ring.call_finished(CALL);
+        });
+        assert_eq!(*told.0.lock().unwrap(), vec!["ringing assist_1".to_string(), "ended assist_1".to_string()], "began, then ended");
+    }
+
+    /// The same, with the two threads let go together by a barrier, many times: whichever comes first, the ring is gone, the owner was told in order or
+    /// not at all, and the try is counted only when the ring opened and was not ended by the call's end.
+    #[test]
+    fn however_the_two_are_interleaved_nothing_of_the_ring_is_left_over() {
+        const ROUNDS: usize = 1_500;
+        let (mut refused, mut opened_first) = (0, 0);
+        for round in 0..ROUNDS {
+            let (ring, calls, told) = rig();
+            let plan = plan_for(&ring);
+            let params = opened(&plan, &format!("assist_{round}"), CALL, 25, &ring);
+            let barrier = std::sync::Barrier::new(2);
+            let result = std::thread::scope(|scope| {
+                let opener = scope.spawn(|| {
+                    barrier.wait();
+                    ring.opened(&params)
+                });
+                let ender = scope.spawn(|| {
+                    barrier.wait();
+                    // A little later each round, sweeping across the time the opening takes, so that the call ends before its check, between the check and
+                    // the push, between the push and the owner being told, and after all of it.
+                    for _ in 0..(round * 37) % 6_000 {
+                        std::hint::black_box(0);
+                    }
+                    calls.over.store(true, Ordering::SeqCst);
+                    ring.call_finished(CALL);
+                });
+                ender.join().unwrap();
+                opener.join().unwrap()
+            });
+            assert!(ring.active().is_empty(), "round {round}: a ring was left for a call that is over");
+            let log = told.0.lock().unwrap().clone();
+            let id = format!("assist_{round}");
+            let (up, down) = (format!("ringing {id}"), format!("ended {id}"));
+            let position = |what: &String| log.iter().position(|l| l == what);
+            match (position(&up), position(&down)) {
+                (Some(up), Some(down)) => assert!(up < down, "round {round}: the owner was told it ended before it began: {log:?}"),
+                (None, _) => {}
+                (Some(_), None) => panic!("round {round}: a notification was raised for a call that was over, and was never ended: {log:?}"),
+            }
+            if let Err(e) = &result {
+                assert_eq!(e.code, "call_ended", "round {round}");
+                assert_eq!(tries_of(&ring), 0, "round {round}: a request refused for a call that ended keeps no try");
+                assert!(log.is_empty(), "round {round}: {log:?}");
+                refused += 1;
+            } else {
+                opened_first += 1;
+            }
+        }
+        eprintln!("{refused} refused, {opened_first} opened first, in {ROUNDS} rounds");
+    }
+}
+
 /// The contract's rule for an ask (`transfer-v1.md`, the caller-asked check): it is spent when the request **opens** and when the AI has the caller back,
 /// and by nothing that stops short of that. Each way a request can stop short is a case here, and each leaves what the caller said where it was (the turns
 /// are still the call's, none used up) and the retry judged on the same ask. (What a ring that opens spends, and what the caller says after the tool call
@@ -1116,7 +1307,7 @@ fn a_request_that_stops_short_of_opening_spends_nothing_and_the_ask_stands() {
     r.calls.over.lock().unwrap().push(CALL.to_string());
     assert_eq!(r.ring.opened(&opened(&plan, "assist_1", CALL, 25, &r.ring)).unwrap_err().code, "call_ended");
     unspent(&r, "a call that ended while the host planned");
-    assert!(r.ring.request_refused(CALL));
+    assert_eq!(tries(&r), 0, "and the try was given back by the refusal");
     r.calls.over.lock().unwrap().clear();
     retried(&r, "a call that ended while the host planned");
 
