@@ -3,7 +3,7 @@
  * pressing the button that looks (Connect) makes exactly the one request it says it makes. OAIY's own windows look as they always did.
  *
  * Against the REAL builds of the Agent and the flow editor, served on their own hosts with the headers those hosts send (tests/e2e/app-pages.mjs).
- * Every request the browser makes to this computer or its network, by a page, a worker or a service worker, is recorded and refused
+ * Every request the browser makes to this computer or its network, by a page or a worker, is recorded and refused
  * (tests/e2e/local-ranges.mjs), so a probe is SEEN, and cannot reach the owner's desktop.
  *
  * Two things keep a "zero" from being an empty claim:

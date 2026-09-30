@@ -5,8 +5,9 @@
  * The harness's own recorder (harness.mjs `newContext`) refuses the product's own ports at loopback and stops there: right for
  * keeping a test off the owner's desktop, too narrow for the claim of E5, which is about ANY address a public page has no
  * business with: the loopback range, the private ranges, link-local, the carrier-grade range Tailscale uses, and names that are
- * only ever local. `watchLocal` records every request of a browser context (pages, their workers and their service workers all
- * count) that goes to one of them, and REFUSES it before it leaves, so a test that looks for a probe cannot reach anything.
+ * only ever local. `watchLocal` records every request of a browser context that goes to one of them (E5 shows it sees a page's and a
+ * dedicated worker's; Playwright reports a service worker's on the context in Chromium too, which no case here demonstrates), and
+ * REFUSES it before it leaves, so a test that looks for a probe cannot reach anything.
  *
  * The harness's own hosts (`agent.web.localhost:PORT` ...) resolve to loopback but are the sites under test, not probes: they
  * are excluded by name, and only those.
