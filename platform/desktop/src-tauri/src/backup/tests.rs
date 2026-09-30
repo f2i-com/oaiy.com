@@ -8037,6 +8037,25 @@ fn a_list_says_how_many_more_there_were_only_when_there_were_more() {
     assert_eq!(some_of(&["y".repeat(50)], 3, 40), format!("{} … (cut, 50 characters in all)", "y".repeat(40)));
 }
 
+/// What is cut and counted is what a person reads: the characters they cannot see are made visible first, so a text that fits its budget as it is
+/// written but not as it is read is cut, and says how long it is as it is read.
+#[test]
+fn what_is_cut_and_counted_is_what_a_person_reads() {
+    use super::parts::{cut, quoted, short};
+    let said = "[1 invisible character: U+E0041]";
+    assert_eq!(said.chars().count(), 32);
+    assert_eq!(cut("x\u{E0041}y", 100), (format!("x{said}y"), None));
+    assert_eq!(short("x\u{E0041}y", 100), format!("x{said}y"));
+    assert_eq!(quoted("x\u{E0041}y", 100), format!("\"x{said}y\""));
+    // Thirty characters as written, and sixty-one as read: over a budget of thirty.
+    let written = format!("{}\u{E0041}", "a".repeat(29));
+    assert_eq!(written.chars().count(), 30);
+    let (cut_text, length) = cut(&written, 30);
+    assert_eq!(length, Some(29 + 32));
+    assert_eq!(cut_text, format!("{} … (cut, 61 characters in all)", "a".repeat(29) + "["));
+    assert_eq!(quoted(&written, 30), format!("\"{} …\" (cut, 61 characters in all)", "a".repeat(29) + "["));
+}
+
 /// A kind that is described in full only up to a number names the rest and counts them (a backup of hundreds of them is not a preview of
 /// many megabytes); one of exactly that number is all described. The kinds that are limited are listed here, so that a kind that is given a
 /// limit is tested (the campaigns are in the test of many long campaigns).
