@@ -6520,6 +6520,24 @@ fn a_campaigns_dry_run_names_ten_people_with_notes_and_counts_the_rest() {
     assert!(said.contains("4 more people have notes or details of the same kind"), "{said}");
 }
 
+/// A call campaign's dry run says what the phone says first and what it leaves on a voicemail (the reviewer's campaign is a text one).
+#[test]
+fn a_call_campaigns_dry_run_lists_its_opening_line_and_the_voicemail_it_leaves() {
+    let keys = super::table::table().key_table("agent.campaign").unwrap();
+    let doc = serde_json::json!({
+        "id": "call1", "kind": "call", "name": "Calls", "state": "paused", "objective": "Ask about the bill",
+        "openingLine": "Hello, this is a call about your unpaid bill", "voicemail": "leave_message", "voicemailMessage": "Ring 1900 123 456 today",
+        "people": [{ "id": "p1", "name": "A", "number": "+61491570006", "state": "queued" }],
+    });
+    let kept = super::table::filter_json(keys, &doc, &|_| true);
+    let rebuilt = super::agentzip::rebuild_campaign(&kept.value, None).unwrap();
+    let said = super::agentzip::describe_campaign_for_test(&kept, &rebuilt, None);
+    assert!(said.starts_with("phone calls to 1 person"), "{said}");
+    for word in ["Hello, this is a call about your unpaid bill", "Ring 1900 123 456 today", "leave_message", "Ask about the bill"] {
+        assert!(said.contains(word), "{word} is said: {said}");
+    }
+}
+
 // ---- the kinds of tick, on the desktop and on the dashboard -----------------------------------------------
 
 /// The dashboard knows the kinds the desktop has: the union of ids in api.ts is `RestoreClass::ALL`, in the same order, and the
