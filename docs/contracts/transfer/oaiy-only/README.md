@@ -110,10 +110,11 @@ The plan reasons OAIY puts in an `oaiy.ring.plan` answer are exactly the plugin'
   * `\b(?:he|she|they)(?:'s|'d|'ve)? (?:\w+ )?(?:put|patched|handed|connected|transferred) (?:the |your )?(?:owner|manager|boss|proprietor)\b`
 * **What OAIY reads as the caller's turns.** The plugin drops from the caller's history, by their words alone, every turn that
   is only an acknowledgement ("mm-hmm", "yeah, okay": at most three of a fixed list), because it cannot hear when they were
-  said; that is the `backchannel` group of the shared caller-asked fixture. OAIY hears the audio, and leaves an acknowledgement
-  out of its own record only when it was said over the receptionist while it was still speaking (an "mm-hmm", or short
-  affirmatives said quickly, such as "Yeah, sure." or "Of course, go on."), before the greeting, or as a reply that was cut
-  off was taken up again; it does not read words for this. An acknowledgement said in a pause after the receptionist had
+  said; that is the `backchannel` group of the shared caller-asked fixture. OAIY hears the audio, and leaves out of its own record only an
+  acknowledgement (an "mm-hmm", or short affirmatives said quickly, such as "Yeah, sure." or "Of course, go on.") that was said
+  over the receptionist while it was still speaking or before the greeting, or that took up a reply that was cut off; whatever else
+  is said is a turn, said before the greeting or not ("Hi, can I speak to the owner?" said first is asked for); it does not read
+  words for the rest of this. An acknowledgement said in a pause after the receptionist had
   finished ("Yeah, sure." after "Is that all right?") is a turn in its record and keeps its place among the last three. So the
   plugin can drop more than OAIY does, which only lets its last three reach further back (allowed: its check is a floor), and
   the one way it can be stricter is a turn OAIY drops for its timing that the plugin keeps. The shared `backchannel` cases give
