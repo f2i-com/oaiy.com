@@ -1,5 +1,6 @@
 /**
- * What E5 counts as this computer or its network (tests/e2e/local-ranges.mjs).
+ * What counts as this computer or its network (shared/capabilities/local.ts): what E5 holds a page to (tests/e2e/local-ranges.mjs uses
+ * this function) and what the flow editor's guard on media addresses refuses (platform/ui/src/lib/localMedia.ts).
  *
  *     npm run test:unit
  *
@@ -9,7 +10,9 @@
  */
 import assert from 'node:assert/strict';
 import { describe, it } from 'node:test';
-import { isLocalHostname } from '../e2e/local-ranges.mjs';
+import { loadTs } from '../support/load.mjs';
+
+const { isLocalHostname } = await loadTs('shared/capabilities/local.ts');
 
 describe('the addresses of this computer and its network', () => {
   it('loopback: 127/8, localhost, ::1, and every *.localhost name (a browser resolves them to this computer)', () => {
