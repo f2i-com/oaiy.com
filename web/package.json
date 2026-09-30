@@ -15,10 +15,10 @@
     "test": "npm run typecheck && npm run test:unit"
   },
   "devDependencies": {
-    "@types/node": "^24.10.1",
-    "esbuild": "^0.28.2",
-    "playwright": "^1.60.0",
-    "typescript": "^5.8.3",
-    "vite": "^7.2.4"
+    "@types/node": "24.12.4",
+    "esbuild": "0.28.2",
+    "playwright": "1.60.0",
+    "typescript": "5.9.3",
+    "vite": "7.3.6"
   }
 }

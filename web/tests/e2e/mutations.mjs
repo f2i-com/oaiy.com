@@ -130,6 +130,13 @@ const MUTATIONS = [
     files: { '.gitattributes': [{ find: '/web/** text=auto eol=lf\n/shared/** text=auto eol=lf\n', replace: '' }] },
     caught: ['.gitattributes says eol=lf for web/ and shared/', 'a checkout on a machine that converts line ends'],
   },
+  {
+    name: 'F11 a dependency is a range',
+    what: 'vite is asked for as ^7.3.6, so the registry chooses the day it is installed',
+    tests: ['tests/unit/package.test.mjs'],
+    files: { 'web/package.json': [{ find: '"vite": "7.3.6"', replace: '"vite": "^7.3.6"' }] },
+    caught: ['devDependencies: each is a version, exactly'],
+  },
   // Leaks the scans must find. They put the key where a scan of TEXT does not look (the reviewer's two: a Uint8Array, and reversed).
   {
     name: 'H1 leak: list returns the key as a Uint8Array',
