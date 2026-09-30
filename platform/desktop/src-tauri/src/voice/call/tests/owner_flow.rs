@@ -329,6 +329,50 @@ async fn no_line_that_promises_a_transfer_is_said_before_an_owner_device_accepts
 }
 
 #[tokio::test]
+async fn the_lines_of_an_ordinary_call_reach_the_caller_as_written_with_transfers_on_before_a_request_and_while_it_rings() {
+    // The reviewer's evidence: a take-a-message confirmation, a visit and a menu were swapped for "One moment, please." on a live line.
+    let mut f = flow(owner_settings(true)).await;
+    f.caller_says(ASKED);
+    assert!(spoken_within(&f.aokie, "Hi Alex! Thanks for calling.", secs(6)).await, "{:?}", f.aokie.speech.spoken());
+    let ordinary = ["The owner will be there on Tuesday morning.", "I've taken your message and I'll get the owner to call you back.", "I'll put you through to the menu.", "I'll get someone to call you back."];
+    for line in ordinary {
+        assert!(f.aokie.say(line).await.is_ok(), "{line}");
+        assert!(spoken_within(&f.aokie, line, secs(3)).await, "said as written, before any request: {line}: {:?}", f.aokie.speech.spoken());
+    }
+    f.ring_through("assist_1", 30).await;
+    for line in ordinary {
+        assert!(f.aokie.say(line).await.is_ok(), "{line}");
+        tokio::time::sleep(Duration::from_millis(350)).await;
+    }
+    let spoken = f.aokie.speech.spoken();
+    for line in ordinary {
+        assert!(spoken.iter().filter(|l| *l == line).count() >= 2, "said as written, while it rings too: {line}: {spoken:?}");
+    }
+    assert!(!spoken.iter().any(|l| l == transfer::WAIT_LINE), "no line was swapped for a plain one moment: {spoken:?}");
+}
+
+#[tokio::test]
+async fn with_transfers_off_or_on_a_call_we_placed_nothing_the_receptionist_says_is_read_for_a_promise() {
+    // Off: the receptionist speaks exactly as it did before transfers existed, even a line that would be a promise with them on.
+    let mut f = flow(owner_settings(false)).await;
+    f.caller_says(ASKED);
+    assert!(spoken_within(&f.aokie, "Hi Alex! Thanks for calling.", secs(6)).await, "{:?}", f.aokie.speech.spoken());
+    for line in ["The owner will be there on Tuesday morning.", "I'll transfer you now.", "Let me put you through to the owner."] {
+        assert!(f.aokie.say(line).await.is_ok(), "{line}");
+        assert!(spoken_within(&f.aokie, line, secs(3)).await, "transfers are off: {line} is said as written: {:?}", f.aokie.speech.spoken());
+    }
+    assert!(!f.aokie.speech.spoken().iter().any(|l| l == transfer::WAIT_LINE || transfer::HOLD_LINES.contains(&l.as_str())), "{:?}", f.aokie.speech.spoken());
+    // A call this desktop placed, with transfers on: it is never offered for transfer, and its lines are its own.
+    let mut placed = Aokie::start_with(json!({"direction": "outbound", "from": RANG_FROM, "greeting": "Hi, it's the lawn crew."}), |hub| {
+        hub.set_ring(crate::ring::Ring::in_memory(owner_settings(true)));
+    })
+    .await;
+    placed.begin(json!({}));
+    assert!(placed.say("I'll transfer you now.").await.is_ok());
+    assert!(spoken_within(&placed, "I'll transfer you now.", secs(4)).await, "{:?}", placed.speech.spoken());
+}
+
+#[tokio::test]
 async fn a_decline_before_the_phone_names_the_request_to_the_call_is_kept_and_goes_the_moment_it_does() {
     // The reviewer's case: the owner's likeliest click is right after the popup, before the model's line has drained and the phone's answer
     // to the tool call has said which request rings. Nothing may be lost, and the owner is told only what is true.

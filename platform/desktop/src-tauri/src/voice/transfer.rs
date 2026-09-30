@@ -226,40 +226,81 @@ pub fn parse_arguments(arguments: &Value) -> Result<crate::ring::Reason, &'stati
 }
 
 /// What a line that tells the caller their call is being put through says (see [`promises_transfer`]): the forms a model writes when it
-/// means to hand the caller to a person, in the present ("I'm transferring you", "putting you through"), the future ("I'll transfer you",
+/// means to hand THIS call to a person, in the present ("I'm transferring you", "putting you through"), the future ("I'll transfer you",
 /// "let me put you through", "you'll be connected in a moment"), the passive ("you are being put through", "your call is being
-/// transferred"), the perfect ("I've transferred you") and of the owner ("the owner will take your call", "is coming to the phone"). What
-/// hedges it ("I'll try to", "I'll see if", "I'm trying to") is not one, and neither is what says it cannot be done.
-fn promise_patterns() -> &'static [regex::Regex] {
-    static PATTERNS: std::sync::OnceLock<Vec<regex::Regex>> = std::sync::OnceLock::new();
+/// transferred"), the perfect ("I've transferred you") and of the owner coming to the phone ("the owner will take your call", "is coming to
+/// the phone"). What hedges it ("I'll try to", "I'll see if", "I'm trying to") is not one, and neither is what says it cannot be done. And
+/// neither is a line that only mentions the owner or a transfer of something else: "I'll get the owner to call you back" brings nobody to the
+/// phone, "the owner will be there on Tuesday" is a visit, "I'll put you through to the menu" is not a person. Each family is paired with
+/// whether what follows may say it is for another time ("the owner will speak to you when he calls back").
+fn promise_patterns() -> &'static [(regex::Regex, bool)] {
+    static PATTERNS: std::sync::OnceLock<Vec<(regex::Regex, bool)>> = std::sync::OnceLock::new();
     PATTERNS.get_or_init(|| {
         let obj = "(?:you|your call|the call|this call|the line)";
         let who = "(?:the )?(?:owner|manager|boss|him|her|someone|somebody|a person|a human|a real person)";
+        // Bringing a person to the phone says where they are brought to (or that it is for the caller): "I'll get the owner to call you back",
+        // "I'll get someone to call you back" bring nobody to this call.
+        let to_the_phone = "(?:on the (?:line|phone)|on with you|to the phone|to come to the phone|on now|for you)";
         // The forms of doing it to the caller, after "I'll", "let me", "while I": the base verb and what it is done to.
         let do_it = format!(
-            "(?:(?:transfer|connect|forward) {obj}|put {obj} (?:through|thru|on to|onto|straight through)|patch (?:{obj} )?(?:through|thru)|hand (?:{obj} )?over|pass {obj} (?:over|on|along)|(?:get|fetch|bring|grab) {who}(?: (?:on|for|to the phone|to come|now))?)"
+            "(?:(?:transfer|connect|forward) {obj}|put {obj} (?:through|thru|on to|onto|straight through)|patch {obj} (?:through|thru)|hand {obj} over|pass {obj} (?:over|on|along)|(?:get|fetch|bring|grab) {who} {to_the_phone})"
         );
         let lead = "(?:i ll|i will|we ll|we will|i m going to|i am going to|i m gonna|i m about to|i am about to|going to|about to|let me|lemme|allow me to|i shall|while i|please let me|just let me|i can now|i ll just|i will just)";
         let adv = "(?:(?:just|now|quickly|shortly|right now|go ahead and|first|straight away|immediately) )*";
         // The same in the participle, on its own or after "I'm", "still", "working on".
         let doing = format!(
-            "(?:(?:transferring|connecting|forwarding) {obj}|putting {obj} (?:through|thru|on to|onto|straight through)|patching (?:{obj} )?(?:through|thru)|handing (?:{obj} )?over|passing {obj} (?:over|on|along)|(?:getting|fetching|bringing|grabbing) {who}(?: (?:on|for|to the phone|to come|now))?)"
+            "(?:(?:transferring|connecting|forwarding) {obj}|putting {obj} (?:through|thru|on to|onto|straight through)|patching {obj} (?:through|thru)|handing {obj} over|passing {obj} (?:over|on|along)|(?:getting|fetching|bringing|grabbing) {who} {to_the_phone})"
         );
         let passive = "(?:you|your call|the call|this call) (?:will be|ll be|will now be|are being|re being|is being|are now being|have been|ve been|shall be|are about to be|re about to be|are going to be|re going to be) (?:connected|transferred|put through|patched through|passed|passed on|handed over|forwarded|through)";
-        let now = "you (?:are|re) now (?:connected|through|speaking to|talking to|speaking with|talking with|with)|the call is (?:now )?(?:being )?(?:transferred|connected|put through|forwarded)|you (?:will|ll) (?:be )?(?:speaking|talking|chatting|speak|talk|chat) (?:to|with) (?:the )?(?:owner|manager|boss|him|her)|you (?:will|ll) be on (?:the phone|the line|with) (?:the )?(?:owner|manager|boss|him|her)?";
-        let owner = "(?:the )?(?:owner|manager|boss) (?:(?:will|ll|is going to|is about to|is ready to|is now) (?:take your call|take the call|speak with you|speak to you|talk to you|talk with you|come to the phone|pick up|answer|join|be with you|be right with you|be on the line|be on the phone|be there)|is (?:coming|on the way|on their way|heading) to the (?:phone|line)|is (?:picking up|answering|joining))";
+        let now = "you (?:are|re) now (?:connected|through|speaking to|talking to|speaking with|talking with|with)|the call is (?:now )?(?:being )?(?:transferred|connected|put through|forwarded)|you (?:will|ll) (?:be )?(?:speaking|talking|chatting|speak|talk|chat) (?:to|with) (?:the )?(?:owner|manager|boss|him|her)|you (?:will|ll) be on (?:the (?:phone|line) with|with) (?:the )?(?:owner|manager|boss|him|her)";
+        // The owner coming to the phone, and now: not "will be there", "will join", "will answer" or "will speak to you" (a site visit, a call-back).
+        let soon = "(?:now|shortly|in a moment|in a second|right away|momentarily)";
+        let owner = format!("(?:the )?(?:owner|manager|boss) (?:(?:will|ll|is going to|is about to|is ready to|is now) (?:take your call|take the call|come to the phone|pick up the phone|be on the (?:line|phone)|be right with you|be with you {soon}|(?:speak|talk) (?:with|to) you {soon})|is (?:coming|on the way|on their way|heading) to the (?:phone|line)|is (?:picking up the phone|now speaking with you|now on the (?:line|phone)|joining the (?:call|line)))");
         let perfect = format!("(?:i have|i ve|we have|we ve|i have just|i ve just) (?:transferred|connected|forwarded|patched|passed|handed|put) {obj}(?: through| over| on)?");
-        let mut list = vec![
-            format!("(?:^| ){lead} {adv}{do_it}(?: |$)"),
-            format!("(?:^| ){doing}(?: |$)"),
-            format!("(?:^| ){passive}(?: |$)"),
-            format!("(?:^| )(?:{now})(?: |$)"),
-            format!("(?:^| ){owner}(?: |$)"),
-            format!("(?:^| ){perfect}(?: |$)"),
+        let families = [
+            (format!("(?:^| ){lead} {adv}{do_it}(?: |$)"), false),
+            (format!("(?:^| ){doing}(?: |$)"), false),
+            (format!("(?:^| ){passive}(?: |$)"), false),
+            (format!("(?:^| )(?:{now})(?: |$)"), true),
+            (format!("(?:^| ){owner}(?: |$)"), true),
+            (format!("(?:^| ){perfect}(?: |$)"), false),
+            ("(?:^| )you re through(?: |$)".to_string(), false),
         ];
-        list.push("(?:^| )you re through(?: |$)".to_string());
-        list.into_iter().map(|p| regex::Regex::new(&p).expect("a promise pattern is a valid pattern")).collect()
+        families.into_iter().map(|(p, defers)| (regex::Regex::new(&p).expect("a promise pattern is a valid pattern"), defers)).collect()
     })
+}
+
+/// What a destination is that is a thing on a screen or in a phone system and not a person: "put you through to the menu", "connect you with
+/// our online booking page". (A destination that is in neither list, "accounts", "the front desk", is taken for a person or a place a person
+/// answers, since the receptionist can put a call through to none.)
+const NOT_A_PERSON: [&str; 22] = ["menu", "voicemail", "voice", "mailbox", "website", "webpage", "web", "page", "link", "form", "calendar", "diary", "system", "app", "portal", "recording", "options", "list", "inbox", "email", "text", "sms"];
+const A_PERSON: [&str; 26] = [
+    "owner", "manager", "boss", "person", "human", "someone", "somebody", "him", "her", "them", "staff", "team", "colleague", "specialist", "assistant", "receptionist", "agent", "representative", "supervisor", "director", "proprietor", "technician",
+    "operator", "advisor", "adviser", "consultant",
+];
+/// A noun that makes "your call" a modifier: "forward your call details to the owner" forwards details, not the call.
+const OF_THE_CALL: [&str; 12] = ["details", "history", "record", "records", "log", "notes", "number", "summary", "info", "information", "reference", "id"];
+/// Words that say a thing is for another time, or a call-back: "the owner will speak to you when he calls back".
+const FOR_ANOTHER_TIME: [&str; 19] = ["back", "later", "tomorrow", "tonight", "today", "when", "once", "after", "whenever", "morning", "afternoon", "evening", "monday", "tuesday", "wednesday", "thursday", "friday", "week", "weekend"];
+
+/// Whether what follows the words of a promise (the rest of the clause, made plain) says they were not one: the object was a modifier
+/// ("your call details"), the destination is not a person ("to the menu"), or (for the families that ask) it is for another time.
+fn is_something_else(rest: &str, defers: bool) -> bool {
+    let words: Vec<&str> = rest.split(' ').filter(|w| !w.is_empty()).collect();
+    let Some(first) = words.first() else { return false };
+    if OF_THE_CALL.contains(first) {
+        return true;
+    }
+    let destination: &[&str] = match *first {
+        "to" | "with" | "into" | "onto" => &words[1..],
+        "over" | "through" if words.get(1) == Some(&"to") => &words[2..],
+        _ => &[],
+    };
+    let destination = &destination[..destination.len().min(7)];
+    if destination.iter().any(|w| NOT_A_PERSON.contains(w)) && !destination.iter().any(|w| A_PERSON.contains(w)) {
+        return true;
+    }
+    defers && words.iter().any(|w| FOR_ANOTHER_TIME.contains(w))
 }
 
 /// What says a thing cannot or will not be done, before the words that would promise it ("I can't put you through", "I'm not
@@ -300,7 +341,12 @@ fn plain_clause(clause: &str) -> String {
 pub fn promises_transfer(text: &str) -> bool {
     // A clause at a time: what is denied in one is not a promise, and what is promised in another still is.
     text.split(['.', '!', '?', ';', ':', ',', '\n', '\r', '\u{2026}', '\u{2014}', '\u{2013}']).map(plain_clause).filter(|c| !c.is_empty()).any(|clause| {
-        promise_patterns().iter().any(|p| p.find_iter(&clause).any(|m| !denies_before().is_match(&clause[..m.start()].split(' ').rev().take(6).collect::<Vec<_>>().into_iter().rev().collect::<Vec<_>>().join(" "))))
+        promise_patterns().iter().any(|(p, defers)| {
+            p.find_iter(&clause).any(|m| {
+                let before = clause[..m.start()].split(' ').rev().take(6).collect::<Vec<_>>().into_iter().rev().collect::<Vec<_>>().join(" ");
+                !denies_before().is_match(&before) && !is_something_else(&clause[m.end()..], *defers)
+            })
+        })
     })
 }
 
@@ -1000,6 +1046,7 @@ mod tests {
             "Could I take your name while I try to reach them?",
             "I'm sorry, they can't come to the phone. Would you like to leave a message?",
             "I'll connect the dots for you",
+            "I'll get the owner to call you back.",
             "",
         ] {
             assert!(!promises_transfer(honest), "{honest}");
@@ -1095,6 +1142,139 @@ mod tests {
         assert!(promises_transfer("I can't say when they will be free, but I'm transferring you now."));
         assert!(!promises_transfer("I'm not transferring you, and I'm not connecting you either, sorry."));
         assert!(promises.len() + honest.len() >= 40);
+    }
+
+    #[test]
+    fn what_a_receptionist_says_in_the_ordinary_course_of_a_call_is_never_taken_for_a_promise_to_put_this_call_through() {
+        // The reviewer's lines first (each of them was swapped for "One moment, please." on a live line), then what a receptionist says about
+        // opening hours, bookings, messages, call-backs, links and menus. A line that merely mentions the owner, a person, a connection or a
+        // transfer of something else is not a promise that THIS call goes to a person: the take-a-message confirmation above all must reach
+        // the caller as written.
+        let ordinary = [
+            // The reviewer's.
+            "I'll get the owner to call you back.",
+            "I'll get someone to call you back.",
+            "Let me get the owner to give you a ring.",
+            "I've taken your message and I'll get the owner to call you back.",
+            "I'll connect you with our online booking page.",
+            "I'll put you through to the menu.",
+            "The owner will be there on Tuesday morning.",
+            "I'll get him to call you as soon as he can.",
+            "I'll get somebody to ring you back tomorrow.",
+            "I'll get the manager to get back to you.",
+            "I'll pass your message on to the owner.",
+            "I'll have the owner call you back.",
+            "Let me get you the address.",
+            "I can transfer you to voicemail.",
+            "One moment while I connect to the calendar.",
+            "I will get a person to call you.",
+            // Messages and call-backs, the core fallback.
+            "I've taken your message, and the owner will call you back.",
+            "The owner will call you back when he's free.",
+            "The owner will call you shortly.",
+            "The owner will get back to you today.",
+            "The owner will speak to you tomorrow about the quote.",
+            "The owner will talk to you about pricing when he calls.",
+            "You'll speak to the owner when he rings you back.",
+            "Someone will be in touch tomorrow.",
+            "Someone will call you back within the hour.",
+            "Someone from the team will ring you this afternoon.",
+            "A person will call you within one business day.",
+            "I've saved your message and the owner will see it today.",
+            "Your message has been passed on.",
+            "I'll pass that on.",
+            "I'll make sure the owner gets your message.",
+            "I'll forward your message to the owner.",
+            "I'll forward your call details to the owner.",
+            "I'll take a message for the owner.",
+            "I'll get the owner's number for you.",
+            "I'll get you the price.",
+            "Let me get you a time for Tuesday.",
+            "I'll get someone out to you on Tuesday.",
+            "Let me get someone to check the calendar.",
+            // The owner and the team, on a site and in the diary.
+            "The manager will be in on Thursday.",
+            "The owner will be out this afternoon.",
+            "The owner will join the site visit on Friday.",
+            "The owner will pick up the trailer on Monday.",
+            "The owner will answer your question when he calls back.",
+            "Someone will be there on Tuesday.",
+            "The owner will be there on site.",
+            "The owner will be there for the job.",
+            "The manager will join us on site.",
+            "The owner will speak to you about the quote.",
+            "The owner will talk to you about that.",
+            "The owner is with a customer until four.",
+            "The manager is not available right now.",
+            "The owner is unavailable at the moment.",
+            // Bookings, hours, links and menus.
+            "We're open from eight until five, Monday to Friday.",
+            "I've booked you in for Tuesday at ten.",
+            "I'll book that in for you.",
+            "I'll send you a link to book online.",
+            "You can book on our website.",
+            "I'll text you the booking page.",
+            "I'll transfer the booking to Wednesday.",
+            "I'll transfer your booking to the next free day.",
+            "I'll put you down for Tuesday.",
+            "I'll put you on hold for a moment.",
+            "Let me put that in the calendar.",
+            "I'll connect the dots.",
+            "You will be connected to our online booking page.",
+            "I'll put you through to our automated booking system.",
+            "You're through to the voicemail.",
+            "I'll connect you with the booking form.",
+            "Your call may be recorded.",
+            "Your call is important to us.",
+            "Thanks for calling Dave's Lawn Care, how can I help?",
+            "What's the best number to reach you on?",
+            "Is there anything else I can help with?",
+            "I can't put you through right now, but I can take a message.",
+            "I'm not able to transfer you.",
+            "You'll receive a confirmation text.",
+            "The quote will be emailed today.",
+            "We'll get you sorted.",
+        ];
+        for line in ordinary {
+            assert!(!promises_transfer(line), "an ordinary line, taken for a promise to put this call through: {line:?}");
+        }
+        assert!(ordinary.len() >= 60, "{}", ordinary.len());
+        // And what is still a promise that THIS call goes to a person, however it is put: the destination is a person, or none is named, or it
+        // is a department that is not a thing on a screen.
+        let promises = [
+            "I'll put you through to the owner.",
+            "Let me connect you with the manager.",
+            "I'll transfer you to a person.",
+            "You'll be transferred to the owner shortly.",
+            "I'll get the owner on the phone for you.",
+            "I'll get the owner on the line.",
+            "Getting the owner on the line for you.",
+            "Let me get someone on the phone for you.",
+            "The owner will take your call.",
+            "The owner will be with you shortly.",
+            "The owner will be on the line in a moment.",
+            "The manager is coming to the phone.",
+            "You'll be speaking to the owner shortly.",
+            "You will be on the line with the owner.",
+            "I'll connect you with someone now.",
+            "I'm putting you through to a person.",
+            "Let me put you through to a real person.",
+            "Putting you through to accounts.",
+            "I'll connect you to our booking specialist.",
+            "I'll hand you over to the owner.",
+            "Passing you on to the manager now.",
+            "I'll forward your call to the owner.",
+            "One moment while I transfer you.",
+            "You're through to the owner.",
+            // A thing named beside a person is still a person: only a destination that is a thing alone is not a promise.
+            "I'll put you through to the person who manages the calendar.",
+            // Another time is not a reason when it is when the promise is kept: "once", "after", "when" are for the families that ask.
+            "I'll put you through once I have your name.",
+            "I'll transfer you after I take your number.",
+        ];
+        for line in promises {
+            assert!(promises_transfer(line), "a promise, and not caught: {line:?}");
+        }
     }
 
     #[test]

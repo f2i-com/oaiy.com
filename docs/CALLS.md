@@ -230,6 +230,16 @@ agent : "I'll try to reach them, please stay with me."  (it is trying: it does n
   moment, please." is; and the model's flow goes on as if it had been said. What denies it ("I can't transfer you") or
   only offers it ("would you like me to transfer you?") or hedges it ("I'll try to reach them") is said as written. The
   instructions also name the words. After an acceptance the desktop's own lines say it, and the model says nothing more.
+  **The rule for when it runs** is written in one place, `call.rs`: only on an inbound call, while the owner has transfers
+  on. With transfers off, or on a call this desktop placed or a line to say, the receptionist speaks exactly as it did before
+  transfers existed and no line of it is read for a promise. And what it reads is only a promise that **this call** goes to
+  a person: a line about a call-back or a message ("I'll get the owner to call you back", "the owner will call you", "someone
+  will be in touch"), a visit ("the owner will be there on Tuesday"), a link or a menu ("I'll put you through to the menu",
+  "I'll connect you with our online booking page"), or a transfer of something else ("I'll transfer the booking to
+  Wednesday", "I'll forward your call details to the owner") is never touched: the take-a-message confirmation reaches the
+  caller as written. `transfer.rs` holds the corpus (more than sixty ordinary lines that must pass, and the promises that must
+  still be caught). When a line is swapped the app is told the item that was said, not the text: it does not learn that
+  its words were replaced (a follow-up).
 - **Nothing waits for ever.** A transfer request the phone never answers is answered to the model as
   unavailable (`no_answer`) after 25 seconds, and the tools and the goodbye that waited behind it go. Meanwhile the
   caller hears hold lines from the request (6 and 21 seconds after it), and if the receptionist then says nothing
