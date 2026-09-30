@@ -10,6 +10,7 @@
 //! damaged one fail with `Corrupt`, in that order of precedence: a copy is intact, so it is a wrong name, not damage.
 
 use oaiy_crypto::kdf::sha256;
+#[cfg(any(unix, feature = "unsafe-keyfile", test))]
 use oaiy_crypto::zeroize::ct_eq;
 use zeroize::Zeroizing;
 
@@ -59,13 +60,20 @@ pub(crate) trait Codec: Send + Sync {
 // the keyfile
 // ---------------------------------------------------------------------------------------------------------------------------------------
 
+// The plaintext provider is compiled in only where it can be used: on Unix (modes), in a build with the `unsafe-keyfile` feature, and in this crate's own unit tests. A Windows build
+// without the feature has no code that stores a value in the clear, whatever a setting says.
+#[cfg(any(unix, feature = "unsafe-keyfile", test))]
 const KEYFILE_MAGIC: &[u8; 8] = b"OAIYKF1\x01";
+#[cfg(any(unix, feature = "unsafe-keyfile", test))]
 const HEADER: usize = 8 + 32 + 4;
+#[cfg(any(unix, feature = "unsafe-keyfile", test))]
 const CHECK: usize = 32;
 
 /// The keyfile provider.
+#[cfg(any(unix, feature = "unsafe-keyfile", test))]
 pub(crate) struct KeyfileCodec;
 
+#[cfg(any(unix, feature = "unsafe-keyfile", test))]
 fn check_of(tag: &[u8; 32], value: &[u8]) -> [u8; 32] {
     let mut text = b"oaiy-ks:1:check|".to_vec();
     text.extend_from_slice(tag);
@@ -75,6 +83,7 @@ fn check_of(tag: &[u8; 32], value: &[u8]) -> [u8; 32] {
     digest
 }
 
+#[cfg(any(unix, feature = "unsafe-keyfile", test))]
 impl Codec for KeyfileCodec {
     fn info(&self) -> ProviderInfo {
         ProviderInfo {

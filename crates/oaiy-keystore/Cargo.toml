@@ -6,6 +6,13 @@ license = "Apache-2.0"
 description = "K1, the named-secret keystore of the OAIY desktop: Windows DPAPI files and a strict keyfile, fail closed, the name bound into every blob"
 publish = false
 
+[features]
+# **Never enabled by default, and never by a product.** Adds `ProviderChoice::KeyfileUnsafe` (`keyfile-unsafe-for-tests`): the keyfile provider on Windows, where nothing in this crate
+# makes a file private and the plain `keyfile` is therefore refused. Without the feature the name is refused (`ProviderUnavailable`), the variant does not exist, and on Windows
+# the plaintext codec is not compiled in at all, so no setting, environment variable or configuration can make a Windows build store a value in the clear. The crate's
+# own tests that need a keyfile on Windows are run with `--features unsafe-keyfile`.
+unsafe-keyfile = []
+
 [dependencies]
 oaiy-crypto = { path = "../oaiy-crypto" }
 zeroize = "1.8.2"

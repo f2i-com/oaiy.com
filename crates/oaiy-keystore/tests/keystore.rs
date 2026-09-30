@@ -41,18 +41,29 @@ fn unhex(text: &str) -> Vec<u8> {
     (0..text.len() / 2).map(|i| u8::from_str_radix(&text[2 * i..2 * i + 2], 16).unwrap()).collect()
 }
 
-/// The keyfile provider, by the name this platform allows: on Windows `keyfile` is refused, and only a test may name the unsafe one.
-fn keyfile() -> ProviderChoice {
-    if cfg!(windows) {
-        ProviderChoice::KeyfileUnsafe
-    } else {
-        ProviderChoice::Keyfile
-    }
+/// The keyfile provider, by the name this platform and this build allow. On Unix it is `keyfile`. On Windows `keyfile` is refused, and only a build with the `unsafe-keyfile`
+/// feature (`cargo test --features unsafe-keyfile`) has one, under its unsafe name; a build without it has none, and the tests that need one do not run.
+#[cfg(unix)]
+fn keyfile() -> Option<ProviderChoice> {
+    Some(ProviderChoice::Keyfile)
 }
 
-/// The providers this platform has, with the extension their files carry.
+#[cfg(all(windows, feature = "unsafe-keyfile"))]
+fn keyfile() -> Option<ProviderChoice> {
+    Some(ProviderChoice::KeyfileUnsafe)
+}
+
+#[cfg(all(windows, not(feature = "unsafe-keyfile")))]
+fn keyfile() -> Option<ProviderChoice> {
+    None
+}
+
+/// The providers this platform and this build have, with the extension their files carry.
 fn providers() -> Vec<(ProviderChoice, &'static str)> {
-    let mut list = vec![(keyfile(), "kf")];
+    let mut list = Vec::new();
+    if let Some(choice) = keyfile() {
+        list.push((choice, "kf"));
+    }
     if cfg!(windows) {
         list.push((ProviderChoice::DpapiFile, "ks"));
     }
@@ -129,8 +140,8 @@ fn round_trip_overwrite_delete_and_list_for_every_provider() {
         let scratch = Scratch::new("roundtrip");
         let store = store(&scratch, choice);
         let info = store.provider();
-        match choice {
-            ProviderChoice::Keyfile | ProviderChoice::KeyfileUnsafe => assert_eq!((info.id, info.strength), ("keyfile", Strength::FilePermissions)),
+        match ext {
+            "kf" => assert_eq!((info.id, info.strength), ("keyfile", Strength::FilePermissions)),
             _ => assert_eq!((info.id, info.strength), ("windows-dpapi-file", Strength::OsAccount)),
         }
         let a = name(names::ARCHIVE_WRITER);
@@ -311,8 +322,8 @@ fn a_blob_copied_or_moved_to_another_name_fails_and_never_yields_the_other_secre
         // a copy under a new name
         fs::copy(file_of(&scratch, "archive.writer", ext), file_of(&scratch, "vault.pins", ext)).unwrap();
         let moved = store.get(&name("vault.pins")).expect_err("a blob under another name");
-        match choice {
-            ProviderChoice::Keyfile | ProviderChoice::KeyfileUnsafe => assert!(matches!(moved, KeyError::WrongName), "{moved:?}"),
+        match ext {
+            "kf" => assert!(matches!(moved, KeyError::WrongName), "{moved:?}"),
             _ => assert!(matches!(moved, KeyError::Os(..)), "{moved:?}"),
         }
         // one secret's file over another's
@@ -336,9 +347,9 @@ fn no_plaintext_beside_the_blob() {
         let (first, second) = (canary(21, 96), canary(22, 96));
         store.put(&n, &first).unwrap();
         let holders = files_containing(&scratch.keys(), &first);
-        match choice {
+        match ext {
             // the keyfile is a plaintext provider: the value is in its own file and in no other
-            ProviderChoice::Keyfile | ProviderChoice::KeyfileUnsafe => assert_eq!(holders, ["archive.writer.kf"]),
+            "kf" => assert_eq!(holders, ["archive.writer.kf"]),
             _ => assert!(holders.is_empty(), "{ext}: DPAPI files hold the value in the clear: {holders:?}"),
         }
         assert_eq!(key_files(&scratch.keys()).len(), 1, "{ext}: exactly one file per secret, no temporary");
@@ -370,8 +381,9 @@ fn no_plaintext_beside_the_blob() {
 fn a_keyfile_is_the_pinned_format_on_disk_and_a_pinned_file_is_read() {
     let first = "4f4149594b463101195a64d1c2e3a8d0c197bc2ddf1df260424530839be9fda34c33e23fdde2795c0000001a6f616979206b657973746f7265206b6e6f776e20616e73776572d57f32c601b74541a0f629ddf6506393553028cb8598860d71ade7a85424bc2e";
     let second = "4f4149594b46310171a3542662649453a76dc19689a899f8bbff6f57b7dd580805c66c809a7aa7770000000300ff01748ed4d0507837dfd14a1edb9e7296d0a9638617d76efe6359acb88933fb2a46";
+    let Some(choice) = keyfile() else { return }; // a Windows build without the unsafe-keyfile feature has no keyfile to pin
     let scratch = Scratch::new("kat");
-    let store = store(&scratch, keyfile());
+    let store = store(&scratch, choice);
     store.put(&name("archive.writer"), b"oaiy keystore known answer").unwrap();
     assert_eq!(fs::read(file_of(&scratch, "archive.writer", "kf")).unwrap(), unhex(first));
     // a file of the same format that this store did not write
@@ -463,6 +475,13 @@ fn the_provider_is_chosen_on_purpose_and_a_typo_is_an_error() {
     assert_eq!(ProviderChoice::from_env().unwrap(), ProviderChoice::Keyfile);
     std::env::set_var(ENV_PROVIDER, "keyfil");
     assert!(matches!(ProviderChoice::from_env(), Err(KeyError::InvalidProvider(_))));
+    // the unsafe name, from the environment of a product: refused unless the build has the feature (review low 2: it used to be accepted from OAIY_KEY_PROVIDER in every build,
+    // and on a fresh Windows folder it made a plaintext store)
+    std::env::set_var(ENV_PROVIDER, "keyfile-unsafe-for-tests");
+    #[cfg(feature = "unsafe-keyfile")]
+    assert_eq!(ProviderChoice::from_env().unwrap(), ProviderChoice::KeyfileUnsafe);
+    #[cfg(not(feature = "unsafe-keyfile"))]
+    assert!(matches!(ProviderChoice::from_env(), Err(KeyError::ProviderUnavailable(why)) if why.contains("unsafe-keyfile")));
     std::env::remove_var(ENV_PROVIDER);
 
     // Auto is DPAPI on Windows and nothing anywhere else: no silent fallback to a file
@@ -597,15 +616,38 @@ fn a_folder_remembers_its_provider_and_refuses_to_be_opened_with_another() {
     }
 }
 
+/// Without the `unsafe-keyfile` feature (the build of a product) the unsafe name is not known, whatever the platform: it is refused, and on Windows there is no provider that
+/// stores a value in the clear at all (the plain keyfile is refused, and the unsafe one does not exist), so no setting can make a Windows build write a plaintext store.
+#[cfg(not(feature = "unsafe-keyfile"))]
+#[test]
+fn a_build_without_the_unsafe_keyfile_feature_refuses_the_unsafe_name_and_windows_has_no_plaintext_provider() {
+    let error = ProviderChoice::parse("keyfile-unsafe-for-tests").unwrap_err();
+    assert!(matches!(&error, KeyError::ProviderUnavailable(why) if why.contains("unsafe-keyfile")), "{error:?}");
+    assert_eq!(error.code(), "key_provider_unavailable");
+    for other in ["keyfile-unsafe", "KEYFILE-UNSAFE-FOR-TESTS", "unsafe-keyfile", "keyfile-unsafe-for-tests "] {
+        assert!(matches!(ProviderChoice::parse(other), Err(KeyError::InvalidProvider(_))), "{other:?}");
+    }
+    if cfg!(windows) {
+        let scratch = Scratch::new("noplain");
+        let error = open_at(scratch.keys(), ProviderChoice::Keyfile).err().expect("the keyfile is refused on Windows");
+        assert!(matches!(&error, KeyError::ProviderUnavailable(_)), "{error:?}");
+        assert!(!scratch.keys().exists(), "a refusal creates nothing: no plaintext store on a fresh folder");
+        assert!(open_at(scratch.keys(), ProviderChoice::DpapiFile).is_ok(), "and DPAPI is what there is");
+    } else {
+        assert!(open_at(Scratch::new("unix").keys(), ProviderChoice::Keyfile).is_ok(), "on Unix the keyfile is there without the feature");
+    }
+}
+
 /// On Windows the keyfile has no modes and this crate sets no ACL: it is refused unless a test names it as unsafe, and a DPAPI folder cannot be downgraded to it
 /// by a setting.
+#[cfg(feature = "unsafe-keyfile")]
 #[test]
 fn the_keyfile_is_refused_on_windows_and_the_unsafe_name_is_needed_to_use_it_there() {
     assert_eq!(ProviderChoice::parse("keyfile-unsafe-for-tests").unwrap(), ProviderChoice::KeyfileUnsafe);
     let scratch = Scratch::new("unsafe");
     if cfg!(windows) {
         let error = open_at(scratch.keys(), ProviderChoice::Keyfile).err().expect("the keyfile is refused on Windows");
-        assert!(matches!(&error, KeyError::ProviderUnavailable(why) if why.contains("keyfile-unsafe-for-tests")), "{error:?}");
+        assert!(matches!(&error, KeyError::ProviderUnavailable(why) if why.contains("windows-dpapi-file")), "{error:?}");
         assert!(!scratch.keys().exists(), "a refusal creates nothing");
         // the downgrade the reviewer found: a DPAPI folder, reopened with the keyfile named on purpose, is refused by the folder itself
         let dpapi = open_at(scratch.keys(), ProviderChoice::DpapiFile).unwrap();
@@ -666,7 +708,11 @@ fn shared_candidates() -> Vec<Vec<u8>> {
 #[test]
 fn child_of_the_two_process_test_rewrites_one_name_over_and_over() {
     let (Some(dir), Some(label)) = (std::env::var_os(CHILD_DIR), std::env::var(CHILD_PROVIDER).ok()) else { return };
-    let choice = if label == "dpapi" { ProviderChoice::DpapiFile } else { keyfile() };
+    let choice = if label == "dpapi" {
+        ProviderChoice::DpapiFile
+    } else {
+        keyfile().expect("the parent only starts a keyfile child where there is a keyfile")
+    };
     let store = open_at(dir, choice).unwrap();
     let candidates = shared_candidates();
     for i in 0..150usize {

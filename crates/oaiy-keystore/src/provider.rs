@@ -10,6 +10,7 @@
 use std::env;
 use std::path::Path;
 
+#[cfg(any(unix, feature = "unsafe-keyfile"))]
 use crate::codec::KeyfileCodec;
 use crate::error::KeyError;
 use crate::store::{FileStore, KeyStore};
@@ -30,21 +31,29 @@ pub enum ProviderChoice {
     /// `os-keyring`: the Secret Service. Not built.
     OsKeyring,
     /// `keyfile`: a file per secret, the weakest provider, for headless machines. On Windows it is **refused**: a file there has no POSIX modes and nothing in
-    /// this crate sets an ACL, so the value would be readable by whatever the folder's inherited permissions allow. Use `KeyfileUnsafe` in a test.
+    /// this crate sets an ACL, so the value would be readable by whatever the folder's inherited permissions allow.
     Keyfile,
-    /// `keyfile-unsafe-for-tests`: the keyfile provider where `Keyfile` is refused (Windows), named as what it is. On Unix it is the same as `Keyfile`.
+    /// `keyfile-unsafe-for-tests`: the keyfile provider where `Keyfile` is refused (Windows), named as what it is. On Unix it is the same as `Keyfile`. **Exists only in a
+    /// build with the `unsafe-keyfile` feature**, which is for tests and is never enabled by default or by a product: in any other build the name is `ProviderUnavailable`.
+    #[cfg(feature = "unsafe-keyfile")]
     KeyfileUnsafe,
 }
 
 impl ProviderChoice {
-    /// Reads a provider name: `auto`, `windows-dpapi-file`, `os-keyring`, `keyfile` or `keyfile-unsafe-for-tests` (exactly, in lower case).
+    /// Reads a provider name: `auto`, `windows-dpapi-file`, `os-keyring`, `keyfile` or (in a build with the `unsafe-keyfile` feature only) `keyfile-unsafe-for-tests`
+    /// (exactly, in lower case).
     pub fn parse(text: &str) -> Result<ProviderChoice, KeyError> {
         match text {
             "auto" => Ok(ProviderChoice::Auto),
             "windows-dpapi-file" => Ok(ProviderChoice::DpapiFile),
             "os-keyring" => Ok(ProviderChoice::OsKeyring),
             "keyfile" => Ok(ProviderChoice::Keyfile),
+            #[cfg(feature = "unsafe-keyfile")]
             "keyfile-unsafe-for-tests" => Ok(ProviderChoice::KeyfileUnsafe),
+            #[cfg(not(feature = "unsafe-keyfile"))]
+            "keyfile-unsafe-for-tests" => Err(KeyError::ProviderUnavailable(
+                "keyfile-unsafe-for-tests is not in this build: it needs the unsafe-keyfile feature, which is for tests and is never enabled in a product",
+            )),
             other => Err(KeyError::InvalidProvider(other.chars().take(64).collect())),
         }
     }
@@ -79,10 +88,14 @@ pub fn open(data_dir: &Path, choice: ProviderChoice) -> Result<Box<dyn KeyStore>
 pub fn open_at(keys_dir: impl AsRef<Path>, choice: ProviderChoice) -> Result<Box<dyn KeyStore>, KeyError> {
     let keys_dir = keys_dir.as_ref();
     match choice.resolve()? {
-        ProviderChoice::Keyfile if cfg!(windows) => Err(KeyError::ProviderUnavailable(
-            "the keyfile provider is refused on Windows, where nothing protects a file the way modes do on Unix; use windows-dpapi-file (tests name keyfile-unsafe-for-tests)",
+        #[cfg(windows)]
+        ProviderChoice::Keyfile => Err(KeyError::ProviderUnavailable(
+            "the keyfile provider is refused on Windows, where nothing protects a file the way modes do on Unix; use windows-dpapi-file",
         )),
-        ProviderChoice::Keyfile | ProviderChoice::KeyfileUnsafe => Ok(Box::new(FileStore::open(keys_dir, KeyfileCodec)?)),
+        #[cfg(unix)]
+        ProviderChoice::Keyfile => Ok(Box::new(FileStore::open(keys_dir, KeyfileCodec)?)),
+        #[cfg(feature = "unsafe-keyfile")]
+        ProviderChoice::KeyfileUnsafe => Ok(Box::new(FileStore::open(keys_dir, KeyfileCodec)?)),
         #[cfg(windows)]
         ProviderChoice::DpapiFile => Ok(Box::new(FileStore::open(keys_dir, crate::codec::DpapiCodec)?)),
         #[cfg(not(windows))]
