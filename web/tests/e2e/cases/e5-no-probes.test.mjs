@@ -272,6 +272,12 @@ describe('E5: the flow editor', () => {
     assert.equal(health(attempts).length, 2, `the detection and the service sync each look once: ${attempts.join(', ')}`);
     assert.ok(health(attempts).every((a) => a === `GET ${DESKTOP}/api/health`));
     assert.equal(await page.locator('[data-connect-desktop]').count(), 0, 'nothing to connect in OAIY\'s own window');
+    // Where Connect would be, in Settings (the review's F3): the engine's card is there, and no Connect, no Disconnect and no words about
+    // what a tab sends. (A count of the workspace only would pass whether or not the window is told from a tab.)
+    await page.locator('.oaiy-sections-tabs button[aria-label="Settings"]').click();
+    await page.getByText("OAIY's engine").first().waitFor({ timeout: 10_000 });
+    assert.equal(await page.locator('[data-connect-desktop], [data-disconnect-desktop], .oaiy-connect, [data-connect-words]').count(), 0, 'no Connect anywhere on the page');
+    assert.doesNotMatch(await page.locator('body').textContent(), /sends nothing to your computer or your network|Connect sends one request/);
     await context.close();
   });
 

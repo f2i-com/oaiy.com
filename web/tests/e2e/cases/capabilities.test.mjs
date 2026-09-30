@@ -129,6 +129,11 @@ describe("the flow editor in OAIY's own window", () => {
     assert.match(data, /Kept for this session only: the editor keeps it in memory, and it is gone when this page is closed or reloaded\./);
     await page.locator('.oaiy-sections-tabs button[aria-label="Packages"]').click();
     await page.locator('[data-testid="packages-page"]').waitFor({ timeout: 5000 });
+    // Settings in OAIY's window (the review's F3): the engine's card, and no Connect anywhere on the page.
+    await page.locator('.oaiy-sections-tabs button[aria-label="Settings"]').click();
+    await page.getByText("OAIY's engine").first().waitFor({ timeout: 10_000 });
+    assert.equal(await page.locator('[data-connect-desktop], [data-disconnect-desktop], .oaiy-connect, [data-connect-words]').count(), 0);
+    assert.doesNotMatch(await page.locator('body').textContent(), /sends nothing to your computer or your network|Connect sends one request/);
     assert.deepEqual(errors, []);
     await context.close();
   });
