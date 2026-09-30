@@ -69,8 +69,6 @@ fn env_at_port(
     static_token: Option<&str>,
     port: u16,
 ) -> Env {
-    let dir = TempDir::new("guard-tests");
-    let clock = Arc::new(ManualClock::new(T0));
     let map: std::collections::BTreeMap<String, String> = vars
         .iter()
         .map(|(k, v)| (k.to_string(), v.to_string()))
@@ -78,6 +76,42 @@ fn env_at_port(
     let (config, warnings) =
         GuardConfig::from_env(&move |n| map.get(n).cloned(), bind_all, gui, port);
     assert!(warnings.is_empty(), "{warnings:?}");
+    env_from_config(mode, config, static_token)
+}
+
+/// A guard built the way `oaiy-server` builds one: from a configuration that passed the startup rules
+/// (`auth::exposure`), not from the lenient reader. The bind is an address in the configuration and nothing listens
+/// on it: every request of these tests is made with a fake peer address, so a lan or proxy-only install is exercised
+/// without a socket beyond loopback.
+fn env_validated(vars: &[(&str, &str)], owner_exists: bool) -> Env {
+    let map: std::collections::BTreeMap<String, String> = vars
+        .iter()
+        .map(|(k, v)| (k.to_string(), v.to_string()))
+        .collect();
+    let evaluation = super::exposure::evaluate(
+        &move |n| map.get(n).cloned(),
+        &super::exposure::Facts {
+            owner_exists,
+            web_login: true,
+        },
+    );
+    assert!(
+        evaluation.violations.is_empty(),
+        "{:?}",
+        evaluation.violations
+    );
+    let config = evaluation.config.expect("a configuration");
+    let token = config.static_token.clone();
+    env_from_config(
+        config.mode,
+        GuardConfig::from_config(&config, false),
+        token.as_deref(),
+    )
+}
+
+fn env_from_config(mode: AccessMode, config: GuardConfig, static_token: Option<&str>) -> Env {
+    let dir = TempDir::new("guard-tests");
+    let clock = Arc::new(ManualClock::new(T0));
     let store = Arc::new(AuthStore::memory(clock.clone()));
     let audit = Arc::new(AuditLog::open(&dir.0.join("auth"), clock.clone(), false));
     let guard = Arc::new(Guard::new(
@@ -3740,4 +3774,215 @@ async fn t45_the_desktops_host_allow_list_is_the_loopback_names_on_any_port_and_
             "{host:?}"
         );
     }
+}
+
+// ===== the shapes of 4.5.5 from a validated configuration, with fake peers and no socket beyond loopback =====
+//
+// A default run of the tests opens nothing on a network address (a listener on 0.0.0.0 makes Windows Firewall ask the
+// owner). These build the guard the way `oaiy-server` does, from `exposure::evaluate`, so that the lan and the
+// proxy-only shapes, whose whole point is a bind beyond loopback, are exercised end to end from the environment to the
+// answer without one. The tests that start the real program on a network address are `#[ignore]`d in
+// `tests/access_exposure.rs` (`OAIY_TEST_LAN=1`).
+
+#[tokio::test]
+async fn t45_a_proxy_only_install_built_from_its_environment_answers_its_proxy_and_this_machine_only(
+) {
+    let e = env_validated(
+        &[
+            ("OAIY_SERVER_BIND", "0.0.0.0"),
+            ("OAIY_PUBLIC_URL", "https://dash.example.com"),
+            ("OAIY_TRUSTED_PROXIES", "172.30.0.0/24"),
+            ("OAIY_SERVER_TOKEN", STATIC_TOKEN),
+        ],
+        false,
+    );
+    let cfg = e.guard.config();
+    assert!(cfg.proxy_only && cfg.exposure == super::mode::Exposure::Proxied && cfg.port == 17972);
+    let via = |peer: &str| {
+        send(Method::GET, "/api/config")
+            .bearer(STATIC_TOKEN)
+            .peer(peer)
+            .h("host", "dash.example.com")
+            .add("x-forwarded-for", "203.0.113.9")
+            .add("x-forwarded-proto", "https")
+    };
+    assert_eq!(go(&e, via("172.30.0.3:5000")).await.status, 200);
+    for peer in [
+        "203.0.113.9:5000",
+        "192.168.1.9:5000",
+        "172.31.0.3:5000",
+        "[2001:db8::9]:5000",
+    ] {
+        let r = go(&e, via(peer)).await;
+        assert_eq!(
+            (r.status, r.code().as_deref()),
+            (403, Some("direct_access_refused")),
+            "{peer}"
+        );
+    }
+    // The CLI on the server: this machine, no forwarded header, a loopback name.
+    let cli = send(Method::GET, "/api/config").bearer(STATIC_TOKEN);
+    assert_eq!(go(&e, cli.clone()).await.status, 200);
+    // With one it is a proxy that was never named.
+    let r = go(&e, cli.add("x-forwarded-for", "203.0.113.9")).await;
+    assert_eq!(r.code().as_deref(), Some("direct_access_refused"));
+    // A probe from a pod address.
+    let r = go(
+        &e,
+        send(Method::GET, "/api/health")
+            .peer("10.244.1.7:5000")
+            .h("host", "10.244.1.7:17972"),
+    )
+    .await;
+    assert_eq!(r.status, 200);
+}
+
+#[tokio::test]
+async fn t45_a_lan_install_built_from_its_environment_is_bearer_only_and_takes_a_bearer_from_private_addresses(
+) {
+    // A lan bind needs an owner (the facts say there is one); the port is the configured one, and it is the port a
+    // host is judged by.
+    let e = env_validated(
+        &[
+            ("OAIY_SERVER_BIND", "192.168.1.5"),
+            ("OAIY_SERVER_PORT", "8443"),
+            ("OAIY_SERVER_TOKEN", STATIC_TOKEN),
+        ],
+        true,
+    );
+    let cfg = e.guard.config();
+    assert!(!cfg.proxy_only && cfg.exposure == super::mode::Exposure::Lan && cfg.port == 8443);
+    let ask = |peer: &str, host: &str| {
+        send(Method::GET, "/api/config")
+            .bearer(STATIC_TOKEN)
+            .peer(peer)
+            .h("host", host)
+    };
+    // The bound port is what an address is answered on: the default port is not.
+    assert_eq!(
+        go(&e, ask("192.168.1.9:4000", "192.168.1.5:8443"))
+            .await
+            .status,
+        200
+    );
+    for host in ["192.168.1.5:17972", "192.168.1.5", "nas.local:8443"] {
+        let r = go(&e, ask("192.168.1.9:4000", host)).await;
+        assert_eq!(
+            (r.status, r.code().as_deref()),
+            (421, Some("misdirected_host")),
+            "{host}"
+        );
+    }
+    // A bearer from a public address is refused, and nothing a client forges makes it look private.
+    for peer in [
+        "203.0.113.50:4000",
+        "[2001:db8::9]:4000",
+        "[::ffff:8.8.8.8]:4000",
+    ] {
+        let r = go(&e, ask(peer, "192.168.1.5:8443")).await;
+        assert_eq!(
+            (r.status, r.code().as_deref()),
+            (403, Some("plaintext_from_public_address")),
+            "{peer}"
+        );
+    }
+    let r = go(
+        &e,
+        ask("203.0.113.50:4000", "192.168.1.5:8443").add("x-forwarded-for", "192.168.1.9"),
+    )
+    .await;
+    assert_eq!(r.code().as_deref(), Some("plaintext_from_public_address"));
+    // From a private one it is taken, and no channel there is secure.
+    for peer in [
+        "192.168.1.9:4000",
+        "10.0.0.7:4000",
+        "100.64.1.1:4000",
+        "[fd12::5]:4000",
+    ] {
+        assert_eq!(
+            go(&e, ask(peer, "192.168.1.5:8443")).await.status,
+            200,
+            "{peer}"
+        );
+    }
+    let r = go(
+        &e,
+        send(Method::GET, "/api/auth/info")
+            .peer("192.168.1.9:4000")
+            .h("host", "192.168.1.5:8443"),
+    )
+    .await;
+    assert_eq!(r.json()["secureChannel"], false);
+    // The operator may say otherwise, and the answer follows the setting.
+    let e = env_validated(
+        &[
+            ("OAIY_SERVER_BIND", "lan"),
+            ("OAIY_ALLOW_PUBLIC_PLAINTEXT", "1"),
+            ("OAIY_SERVER_TOKEN", STATIC_TOKEN),
+        ],
+        true,
+    );
+    assert!(e.guard.config().allow_public_plaintext);
+    assert_eq!(
+        go(&e, ask("203.0.113.50:4000", "192.168.1.5:17972"))
+            .await
+            .status,
+        200
+    );
+}
+
+#[tokio::test]
+async fn t45_a_local_install_built_from_its_environment_refuses_every_forwarded_header_and_a_proxied_one_believes_only_its_proxy(
+) {
+    let local = env_validated(&[("OAIY_SERVER_TOKEN", STATIC_TOKEN)], false);
+    assert!(local.guard.config().exposure == super::mode::Exposure::Local);
+    for name in [
+        "x-forwarded-for",
+        "x-forwarded-host",
+        "x-forwarded-proto",
+        "forwarded",
+        "via",
+        "x-real-ip",
+        "cf-connecting-ip",
+        "true-client-ip",
+    ] {
+        let r = go(
+            &local,
+            send(Method::GET, "/api/config")
+                .bearer(STATIC_TOKEN)
+                .add(name, "203.0.113.9"),
+        )
+        .await;
+        assert_eq!(
+            (r.status, r.code().as_deref()),
+            (421, Some("proxy_detected")),
+            "{name}"
+        );
+    }
+    // Behind a proxy on this machine (the default), with the loopback default replaced by the operator's own list.
+    let named = env_validated(
+        &[
+            ("OAIY_PUBLIC_URL", "https://dash.example.com"),
+            ("OAIY_TRUSTED_PROXIES", "192.0.2.7"),
+        ],
+        false,
+    );
+    let info = |peer: &str| {
+        send(Method::GET, "/api/auth/info")
+            .peer(peer)
+            .h("host", "dash.example.com")
+            .add("x-forwarded-for", "203.0.113.9")
+            .add("x-forwarded-proto", "https")
+    };
+    let r = go(&named, info("192.0.2.7:4000")).await;
+    assert_eq!(r.json()["seen"]["clientIp"], "203.0.113.9");
+    assert_eq!(r.json()["secureChannel"], true);
+    for peer in ["127.0.0.1:4000", "192.0.2.8:4000", "[::1]:4000"] {
+        let r = go(&named, info(peer)).await;
+        assert_ne!(r.json()["seen"]["clientIp"], "203.0.113.9", "{peer}");
+        assert_eq!(r.json()["secureChannel"], false, "{peer}");
+    }
+    let default = env_validated(&[("OAIY_PUBLIC_URL", "https://dash.example.com")], false);
+    let r = go(&default, info("127.0.0.1:4000")).await;
+    assert_eq!(r.json()["seen"]["clientIp"], "203.0.113.9");
 }

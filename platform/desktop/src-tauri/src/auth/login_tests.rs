@@ -3189,6 +3189,79 @@ async fn the_login_allow_list_refuses_other_addresses_before_any_hashing() {
     assert_eq!(login_as(&e, PASSWORD, "2001:db8:1::5").await.status, 200);
 }
 
+/// The login built from a configuration that passed the startup rules says what the environment says: the dashboard's
+/// origin, the host names the password estimate treats as guessable, and the address allow-list.
+#[test]
+fn login_options_from_a_validated_configuration_are_what_the_environment_says() {
+    use super::exposure::{evaluate, Facts};
+    let cases: [&[(&str, &str)]; 2] = [
+        &[
+            ("OAIY_PUBLIC_URL", "https://dash.example.com"),
+            ("OAIY_AGENT_URL", "https://agent.example.com:8443"),
+            ("OAIY_FLOWS_URL", "https://flows.example.com"),
+            (
+                "OAIY_LOGIN_ALLOW",
+                "203.0.113.0/24, 2001:db8::/32, 198.51.100.7",
+            ),
+        ],
+        &[],
+    ];
+    for vars in cases {
+        let map: std::collections::BTreeMap<String, String> = vars
+            .iter()
+            .map(|(k, v)| (k.to_string(), v.to_string()))
+            .collect();
+        let env = move |n: &str| map.get(n).cloned();
+        let evaluation = evaluate(
+            &env,
+            &Facts {
+                owner_exists: false,
+                web_login: true,
+            },
+        );
+        let config = evaluation.config.expect("the rules allow it");
+        let built = LoginOptions::from_config(&config, 41000);
+        let read = LoginOptions::production(&env, 41000).expect("the list is one the rules allow");
+        assert_eq!(built.dash_origin, read.dash_origin, "{vars:?}");
+        assert_eq!(built.login_allow, read.login_allow, "{vars:?}");
+        let (mut a, mut b) = (built.hosts.clone(), read.hosts.clone());
+        a.sort();
+        b.sort();
+        assert_eq!(a, b, "{vars:?}");
+    }
+    // The validated form is the normalised one: lowercase, the default port dropped (the environment's own text would
+    // have been `https://Dash.Example.com:443`, which is not what a browser sends as its `Origin`).
+    let env =
+        |n: &str| (n == "OAIY_PUBLIC_URL").then(|| "https://Dash.Example.com:443".to_string());
+    let config = evaluate(
+        &env,
+        &Facts {
+            owner_exists: false,
+            web_login: true,
+        },
+    )
+    .config
+    .unwrap();
+    let built = LoginOptions::from_config(&config, 41000);
+    assert_eq!(built.dash_origin, "https://dash.example.com");
+    assert_eq!(built.hosts, ["dash.example.com"]);
+    // A local install has the loopback dashboard's name, on its port.
+    let built = LoginOptions::from_config(
+        &evaluate(
+            &|_: &str| None,
+            &Facts {
+                owner_exists: false,
+                web_login: true,
+            },
+        )
+        .config
+        .unwrap(),
+        41000,
+    );
+    assert_eq!(built.dash_origin, "http://dash.oaiy.localhost:41000");
+    assert!(built.hosts.is_empty() && built.login_allow.is_empty());
+}
+
 // ==================================== ACC-14: a lan listener has no login ============================
 
 const LAN_TOKEN: &str = "abcdefghijklmnopqrstuvwxyz0123456789ABCD";
