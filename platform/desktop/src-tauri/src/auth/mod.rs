@@ -39,6 +39,8 @@ pub mod token;
 #[cfg(feature = "web")]
 pub mod password;
 #[cfg(feature = "web")]
+pub mod policy;
+#[cfg(feature = "web")]
 pub mod wordlist;
 
 pub use guard::{Guard, GuardConfig, HealthExtras};
