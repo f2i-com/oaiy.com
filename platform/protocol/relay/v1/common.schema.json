@@ -67,7 +67,13 @@
     "itemId": {
       "type": "string",
       "pattern": "^[A-Za-z0-9._-]{1,128}$",
-      "description": "Item id chosen by the sender. Unique per (mailbox, lane) while the relay remembers it."
+      "not": {
+        "enum": [
+          ".",
+          ".."
+        ]
+      },
+      "description": "Item id chosen by the sender. Unique per (mailbox, lane) while the relay remembers it. The ids . and .. match the pattern and are refused (README, Interpretations)."
     },
     "appId": {
       "type": "string",

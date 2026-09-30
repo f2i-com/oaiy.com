@@ -863,7 +863,7 @@ for d, ex_ in {
         "b64u": [TOKEN.split(".")[2]], "b64u8": ["AQIDBAUGBwg"], "b64u16": ["b5YkfMcTvJb0g1GTv3kNNQ"], "key32": [DESK_TH],
         "thumbprint": [DESK_TH, PHONE_TH], "signature": [SIG64], "relayId": [RELAYID], "deviceId": [DEVID, PHONEID],
         "providerId": [PROVID], "principalId": [DEVID, PROVID], "pid": ["b5YkfMcTvJb0g1GTv3kNNQ"], "rid": ["Ry3kq0wEo2nq1c9h5c7Zab"],
-        "itemId": ["cmd-0001", "6b6e21fd-6cd2-41ed-ac1a-a30a91cbad3a", "a.b_c-d", "x" * 128], "appId": ["aokie", "a" * 64, "com.acme:app_1"],
+        "itemId": ["cmd-0001", "6b6e21fd-6cd2-41ed-ac1a-a30a91cbad3a", "a.b_c-d", "x" * 128, "...", ".a", "a..b", "a."], "appId": ["aokie", "a" * 64, "com.acme:app_1"],
         "token": [TOKEN], "adminToken": ["oaiyadm1.AQIDBAUGBwg." + TOKEN.split(".")[2]], "epoch": ["AQIDBAUGBwg"], "kid": ["OJttnmp91Xo"],
         "unixTime": [0, NOW, 2 ** 53 - 1], "uint53": [0, 42], "seq": [1, 42, 2 ** 53 - 1], "lane": list(LANES), "role": ["desktop", "phone", "provider", "web"],
         "ct": ["text", "json", "sealed1", "tunnel1", "noise1"], "errorCode": ["invalid_request", "unavailable"], "grant": ["state_read", "rtc_signal"],
@@ -1338,6 +1338,7 @@ for d, bad, why in [
         ("deviceId", "dev-" + "A" * 21, "short"), ("deviceId", "dev-" + "A" * 23, "long"), ("deviceId", "DEV-" + "A" * 22, "upper-case prefix"),
         ("providerId", "dev-" + "A" * 22, "device prefix"), ("relayId", "rly-" + "A" * 21, "short"),
         ("itemId", "a/b", "slash"), ("itemId", "..\\x", "backslash"), ("itemId", "a\u0000b", "NUL"), ("itemId", "x" * 129, "129 characters"),
+        ("itemId", ".", "a single dot is a path component"), ("itemId", "..", "two dots are a path component"),
         ("appId", "a" * 65, "65 characters"), ("appId", "", "empty"), ("appId", "a b", "space"), ("appId", "a/b", "slash"),
         ("token", TOKEN[:-1], "62 characters"), ("token", TOKEN + "A", "64 characters"), ("token", "oaiyrt2." + TOKEN[8:], "prefix"),
         ("token", TOKEN.replace(".", ":"), "no dots"), ("token", " " + TOKEN, "leading space"),
@@ -1467,7 +1468,7 @@ for t in ex["tokens"]["invalid"]:
     rule(f"token: {t['reason']}", (lambda tt: lambda: raises(lambda: parse_token(tt)))(t["token"]))
 rule("item ids: a path-like id never reaches a file name (ids are matched by pattern)", lambda: validate("common#itemId", "../../data/relay.sqlite") != [])
 rule("item ids: NUL byte", lambda: validate("common#itemId", "a\u0000b") != [])
-
+rule("item ids: . and .. match the character class and are refused all the same", lambda: validate("common#itemId", ".") != [] and validate("common#itemId", "..") != [])
 n_rules = 0
 for label, fn in RULES:
     n_rules += 1
@@ -1510,6 +1511,11 @@ for route in ("/v1/health", "/v1/info", "/v1/poll", "/v1/items", "/v1/slots", "/
               "/v1/admin/hold", "/v1/admin/stream-probe", "/v1/admin/echo", "/v1/admin/capacity", "/v1/aokie-companion/relay/stream"):
     ok(f"README lists the route {route}", route in readme)
 ok("README has an Interpretations section", re.search(r"^## (\d+\. )?Interpretations$", readme, re.M) is not None)
+interp_section = re.split(r"^## (?:\d+\. )?Interpretations$", readme, flags=re.M)[-1]
+interp_numbers = [int(n) for n in re.findall(r"^(\d+)\. \*\*", interp_section, re.M)]
+ok("the Interpretations are numbered 1 to N with no gap and no repeat, and there are at least 23", interp_numbers == list(range(1, len(interp_numbers) + 1)) and len(interp_numbers) >= 23, str(interp_numbers))
+ok("README says the SAS input carries the raw 16 bytes of pid and points at extras.sasNegative", "**raw 16 bytes**" in readme and "extras.sasNegative" in readme and 'not its 22-character b64u text' in readme)
+ok("README says the item ids . and .. and the spelling -0 are refused", "never `.` or `..`" in readme and "the spelling `-0`" in readme and "`-0` is not an integer" in readme)
 ok("README has a Response shapes section", re.search(r"^## (\d+\. )?Response shapes$", readme, re.M) is not None)
 
 # ---------------------------------------------------------------------------
