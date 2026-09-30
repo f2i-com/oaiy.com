@@ -254,7 +254,7 @@ while (a correct token is never refused by the address counter).
   revokes them with `GET/POST /v1/devices…`, and pushes its authoritative roster with `POST /v1/roster`. A phone that the
   roster leaves out is revoked at once. A phone cannot change its own keys.
 - **Revoking** a device is immediate and complete: its token stops working, its inbox and pending items are deleted, what it had
-  already posted to others is not delivered afterwards (for a phone that includes its frames in the plugin's mailbox), and a
+  already posted to others is not delivered afterwards (for a phone that includes its frames in the plugin's mailbox), a post that was in flight at the moment of the revocation does not commit after it and makes no mailbox for a revoked device, and a
   request it is holding open ends with `401 revoked` within a quarter of a second.
 - **Token rotation:** `POST /v1/tokens/rotate` returns a new token; the old one works for ten more minutes, and a second
   rotation inside that time is `409`.

@@ -39,9 +39,12 @@ final class Mailbox
     /**
      * Post one item. Returns ['status' => 'queued'|'duplicate', 'seq' => int].
      * @param array<string,mixed> $hdr already validated
-     * @throws ApiError conflict, quota_exceeded, unavailable
+     * @param null|callable(Db):void $guard run first inside the transaction, before the mailbox row is made or read: what the caller
+     *        checked before the transaction (that the sender and the recipient are still there) is asked again where a revocation
+     *        cannot slip in between (see requireActive), and a refusal thrown by it leaves nothing behind
+     * @throws ApiError conflict, quota_exceeded, unavailable, and what the guard throws
      */
-    public function post(string $mailbox, string $lane, string $id, string $sender, int $ttl, string $hdrJson, ?string $re, ?string $rp, string $body, bool $bypassQuota = false): array
+    public function post(string $mailbox, string $lane, string $id, string $sender, int $ttl, string $hdrJson, ?string $re, ?string $rp, string $body, bool $bypassQuota = false, ?callable $guard = null): array
     {
         $now = Clock::now();
         $size = strlen($body);
@@ -53,7 +56,10 @@ final class Mailbox
         $bulkItems = (int)floor($maxItems * $share);
         $bulkBytes = (int)floor($maxBytes * $share);
 
-        $result = $this->db->write(function (Db $db) use ($mailbox, $lane, $id, $sender, $ttl, $hdrJson, $re, $rp, $body, $bypassQuota, $now, $size, $hash, $bulk, $maxItems, $maxBytes, $bulkItems, $bulkBytes): array {
+        $result = $this->db->write(function (Db $db) use ($mailbox, $lane, $id, $sender, $ttl, $hdrJson, $re, $rp, $body, $bypassQuota, $guard, $now, $size, $hash, $bulk, $maxItems, $maxBytes, $bulkItems, $bulkBytes): array {
+            if ($guard !== null) {
+                $guard($db);
+            }
             $db->insertIgnore('mailboxes', ['id' => $mailbox, 'next_seq' => 1, 'live_items' => 0, 'live_bytes' => 0, 'bulk_items' => 0, 'bulk_bytes' => 0, 'created_at' => $now]);
             $mb = $db->one('SELECT next_seq, live_items, live_bytes, bulk_items, bulk_bytes FROM mailboxes WHERE id = ?' . $db->forUpdate(), [$mailbox]);
             if ($mb === null) {
@@ -96,6 +102,22 @@ final class Mailbox
             $this->signals->wakeWrite($mailbox);
         }
         return $result;
+    }
+
+    /**
+     * Is this device still there and not revoked? Asked inside the transaction of a post, with a shared lock on the device's row
+     * (on MySQL and MariaDB; SQLite's write lock covers the whole file): a revocation takes the same row exclusively before it
+     * retires anything, so a post that is already past this check finishes before the revocation goes on, and one that comes after it
+     * finds the device revoked. Without this a post that was authenticated and authorised before the revocation could commit after it,
+     * and a post to a revoked device could make its mailbox again. Call inside write().
+     * @throws ApiError the given error when the device does not exist or is revoked
+     */
+    public static function requireActive(Db $db, string $deviceId, string $error): void
+    {
+        $row = $db->one('SELECT revoked_at FROM devices WHERE id = ?' . $db->forShare(), [$deviceId]);
+        if ($row === null || $row['revoked_at'] !== null) {
+            throw ApiError::make($error);
+        }
     }
 
     /**

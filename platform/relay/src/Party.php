@@ -37,10 +37,14 @@ final class Party
      * Append frames (already encoded, each checked against the lane's size cap) to a party mailbox, all or none.
      * @param list<string> $frames compact JSON documents
      * @param list<string> $grants the sender's admission scopes
+     * @param null|callable(Db):bool $guard run first inside the transaction, before the mailbox is made or read: the checks the caller made
+     *        before it (the sender and the recipient are still there) asked again where a revocation cannot slip in between. It throws for
+     *        a sender that is gone (401 revoked) and returns false for a recipient that is gone: nothing is stored or made, and the answer
+     *        is the one a delivered post would get (Interpretation 46).
      * @return array{accepted:int,seq:int} seq is the last frame's
-     * @throws ApiError relay_backpressure (429, Retry-After 5) when a limit would be passed
+     * @throws ApiError relay_backpressure (429, Retry-After 5) when a limit would be passed, and what the guard throws
      */
-    public static function append(Context $ctx, string $mailbox, string $sender, string $subjectId, array $grants, array $frames, bool $senderShare): array
+    public static function append(Context $ctx, string $mailbox, string $sender, string $subjectId, array $grants, array $frames, bool $senderShare, ?callable $guard = null): array
     {
         $now = Clock::now();
         $ttl = $ctx->eff->ttl('sig')[0];
@@ -53,7 +57,14 @@ final class Party
         foreach ($frames as $f) {
             $addBytes += strlen($f);
         }
-        $last = $ctx->db->write(function (Db $db) use ($ctx, $mailbox, $sender, $subjectId, $grantsJson, $frames, $senderShare, $now, $ttl, $maxItems, $maxBytes, $share, $add, $addBytes): int {
+        $dropped = false;
+        $last = $ctx->db->write(function (Db $db) use ($ctx, $mailbox, $sender, $subjectId, $grantsJson, $frames, $senderShare, $guard, &$dropped, $now, $ttl, $maxItems, $maxBytes, $share, $add, $addBytes): int {
+            $dropped = false;
+            if ($guard !== null && $guard($db) === false) {
+                $dropped = true;
+                $next = $db->val('SELECT next_seq FROM mailboxes WHERE id = ?', [$mailbox]);
+                return ($next === null ? 0 : (int)$next - 1) + $add;
+            }
             $db->insertIgnore('mailboxes', ['id' => $mailbox, 'next_seq' => 1, 'live_items' => 0, 'live_bytes' => 0, 'bulk_items' => 0, 'bulk_bytes' => 0, 'created_at' => $now]);
             $mb = $db->one('SELECT next_seq, live_items, live_bytes FROM mailboxes WHERE id = ?' . $db->forUpdate(), [$mailbox]);
             if ($mb === null) {
@@ -86,7 +97,9 @@ final class Party
             $db->exec('UPDATE mailboxes SET next_seq = ?, live_items = live_items + ?, live_bytes = live_bytes + ? WHERE id = ?', [$seq, $add, $addBytes, $mailbox]);
             return $seq - 1;
         });
-        $ctx->signals->wakeWrite($mailbox);
+        if (!$dropped) {
+            $ctx->signals->wakeWrite($mailbox);
+        }
         return ['accepted' => $add, 'seq' => $last];
     }
 

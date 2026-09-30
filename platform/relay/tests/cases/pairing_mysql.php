@@ -415,6 +415,77 @@ echo $bad, "\n";
         eq('answered', $r->ctx()->db->val('SELECT state FROM pairings WHERE pid = ?', [$c->pid]), 'and the rendezvous was not changed');
     });
 
+    slow_test("4.5 $tag: a post waits for a revocation that is half done (the sender's row is held) and is then 401 revoked with nothing stored and no mailbox made, for an item and for a frame; a post to a revoked recipient makes no mailbox", function () use ($flavour) {
+        if (!MysqlServer::available($flavour)) {
+            skip("no $flavour server binary here");
+        }
+        $prov = pmy_db($flavour);
+        $db = $prov['db'];
+        $r = Relay::make([], $prov);
+        $d = $r->desktop();
+        $p = $r->provider();
+        [$srv] = $r->fleet(1);
+        $hold = static function (string $deviceId, array $conn) use ($db): \PDO {
+            $conn = $conn ?: $db;
+            $c = new \PDO($conn['dsn'], $conn['user'], $conn['pass'], [\PDO::ATTR_ERRMODE => \PDO::ERRMODE_EXCEPTION]);
+            $c->exec('START TRANSACTION');
+            $c->prepare('UPDATE devices SET revoked_at = ? WHERE id = ?')->execute([Relay::T0, $deviceId]); // the revocation, half done: the row is locked
+            return $c;
+        };
+        // A native post by the provider.
+        $h = ['Content-Type' => 'application/json', 'Authorization' => 'Bearer ' . $p->token];
+        $holder = $hold($p->id, []);
+        $req = $srv->begin('POST', '/v1/items', $h, json_encode(['items' => [['to' => $d->inbox(), 'lane' => 'cmd', 'id' => 'late', 'body' => 'x']]]));
+        $req->pump(0.6);
+        $heard = $req->received();
+        $holder->exec('COMMIT');
+        eq('', $heard, 'the post waited for the revocation');
+        $res = $req->finish(15);
+        eq(401, $res['status'], $res['body']);
+        eq('revoked', json_decode($res['body'], true)['error']['code']);
+        eq(0, (int)$r->ctx()->db->val("SELECT COUNT(*) FROM items WHERE id = 'late'"), 'no item');
+        eq(0, (int)$r->ctx()->db->val('SELECT COUNT(*) FROM mailboxes WHERE id = ?', [$d->inbox()]), 'and no mailbox made for the recipient');
+        // A frame by a phone.
+        $prov2 = pmy_db($flavour);
+        $k = AokieRig::make([], true, true, $prov2);
+        [$srv2] = $k->r->fleet(1);
+        $a = $k->addPhone('A');
+        $k->pushRoster();
+        $ta = $k->mobileToken($a);
+        $holder = $hold($a->id, $prov2['db']);
+        $req = $srv2->begin('POST', AokieRig::BASE . 'frames', ['Content-Type' => 'application/json', 'Authorization' => 'Bearer ' . $ta], '{"to":"plugin","frames":[{"n":1}]}');
+        $req->pump(0.6);
+        $heard = $req->received();
+        $holder->exec('COMMIT');
+        eq('', $heard, 'the frame waited for the revocation');
+        $res = $req->finish(15);
+        eq(401, $res['status'], $res['body']);
+        eq('revoked', json_decode($res['body'], true)['code']);
+        eq(0, (int)$k->r->ctx()->db->val("SELECT COUNT(*) FROM items WHERE lane = 'sig'"));
+        eq(0, (int)$k->r->ctx()->db->val('SELECT COUNT(*) FROM mailboxes WHERE id = ?', [\Oaiy\Relay\Party::mailbox($k->app, $k->desk->id, 'plugin')]), 'and no mailbox for the plugin');
+        // A post to a recipient that is being revoked: the row is held, the recipient's revocation commits, no mailbox is made.
+        $p2 = $r->provider('P2');
+        $d2 = $r->desktop('D2');
+        $holder = $hold($d2->id, []);
+        $req = $srv->begin('POST', '/v1/items', ['Content-Type' => 'application/json', 'Authorization' => 'Bearer ' . $p2->token], json_encode(['items' => [['to' => $d2->inbox(), 'lane' => 'cmd', 'id' => 'later', 'body' => 'x']]]));
+        $req->pump(0.6);
+        $heard = $req->received();
+        $holder->exec('COMMIT');
+        eq('', $heard, 'the post to the recipient waited');
+        $res = $req->finish(15);
+        eq(200, $res['status'], $res['body']);
+        eq(['rejected', 'not_found'], [json_decode($res['body'], true)['results'][0]['status'], json_decode($res['body'], true)['results'][0]['error']['code']]);
+        eq(0, (int)$r->ctx()->db->val('SELECT COUNT(*) FROM mailboxes WHERE id = ?', [$d2->inbox()]), 'no mailbox was made for the revoked recipient');
+    });
+
+    slow_test("4.5 $tag: eight posters racing the revocation of their sender leave nothing of it live, and eight racing the revocation of their recipient leave no mailbox of it", function () use ($flavour) {
+        if (!MysqlServer::available($flavour)) {
+            skip("no $flavour server binary here");
+        }
+        rr_race(Relay::make([], pmy_db($flavour)), 'sender', 6);
+        rr_race(Relay::make([], pmy_db($flavour)), 'recipient', 6);
+    });
+
     slow_test("4.5 $tag: revoking a desktop with its phones lists them only after it holds the desktop's row, so a phone made while it waited (an approval in flight) is revoked with it", function () use ($flavour) {
         if (!MysqlServer::available($flavour)) {
             skip("no $flavour server binary here");

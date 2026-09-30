@@ -210,7 +210,11 @@ final class Pairing
             // The first response carries the pid as its item id; a later one (after a reject) needs an id of its own.
             $itemId = $n === 1 ? $pid : $pid . '.' . $n;
             $ttl = max(1, min(900, (int)$row['exp'] - $now));
-            $ctx->mb->post('dev:' . $row['desktop_dev'], 'pair', $itemId, 'relay', $ttl, '{"ct":"json"}', null, null, $text, true);
+            // The desktop is asked for again inside the post's own transaction: one revoked meanwhile has no inbox to make, and to the
+            // phone the rendezvous is gone (404, as for an unknown pid).
+            $desktopId = (string)$row['desktop_dev'];
+            $ctx->mb->post('dev:' . $row['desktop_dev'], 'pair', $itemId, 'relay', $ttl, '{"ct":"json"}', null, null, $text, true,
+                static fn(Db $tx) => Mailbox::requireActive($tx, $desktopId, 'not_found'));
             return (string)$row['desktop_dev'];
         });
         if ($desktop === '') {

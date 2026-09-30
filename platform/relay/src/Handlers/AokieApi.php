@@ -6,10 +6,12 @@ namespace Oaiy\Relay\Handlers;
 use Oaiy\Relay\ApiError;
 use Oaiy\Relay\Clock;
 use Oaiy\Relay\Context;
+use Oaiy\Relay\Db;
 use Oaiy\Relay\Facade;
 use Oaiy\Relay\Holds;
 use Oaiy\Relay\Json;
 use Oaiy\Relay\Kernel;
+use Oaiy\Relay\Mailbox;
 use Oaiy\Relay\Party;
 use Oaiy\Relay\Principal;
 use Oaiy\Relay\Request;
@@ -155,9 +157,30 @@ final class AokieApi
                 // What a delivered post would answer: the count and the sequence number the last frame would have had.
                 return Response::json(200, ['accepted' => count($encoded), 'seq' => $ctx->mb->highestSeq($mailbox) + count($encoded), 'time' => Clock::now()]);
             }
-            $r = Party::append($ctx, $mailbox, $f->party, $f->subjectId, $f->scopes, $encoded, $to === 'plugin');
+            $r = Party::append($ctx, $mailbox, $f->party, $f->subjectId, $f->scopes, $encoded, $to === 'plugin', self::deliveryGuard($ctx, $f, $to));
             return Response::json(200, ['accepted' => $r['accepted'], 'seq' => $r['seq'], 'time' => Clock::now()]);
         });
+    }
+
+    /**
+     * What is asked again inside the post's own transaction, where a revocation cannot slip in between (Mailbox::requireActive): the
+     * sender is still there (the phone, or the desktop that brokered the plugin; a phone also answers to the desktop that paired it),
+     * else 401 revoked, as at its next request; and the recipient phone of the plugin's post is still an active phone of this desktop
+     * and app that the roster lists, else the post is dropped like any post to a phone that is gone (false) and no mailbox is made.
+     * @return callable(Db):bool
+     */
+    public static function deliveryGuard(Context $ctx, Facade $f, string $to): callable
+    {
+        return static function (Db $db) use ($ctx, $f, $to): bool {
+            Mailbox::requireActive($db, $f->deviceId, 'revoked');
+            if ($f->role === 'mobile') {
+                Mailbox::requireActive($db, $f->dsk, 'revoked');
+                return true;
+            }
+            $thumb = substr($to, 7);
+            $row = $db->one("SELECT id FROM devices WHERE role = 'phone' AND owner_desktop = ? AND app_id = ? AND thumbprint = ? AND revoked_at IS NULL" . $db->forShare(), [$f->dsk, $f->appId, $thumb]);
+            return $row !== null && Facade::rosterLists($ctx, $f->dsk, $f->appId, $thumb);
+        };
     }
 
     // ------------------------------------------------------------------------------------------ GET frames

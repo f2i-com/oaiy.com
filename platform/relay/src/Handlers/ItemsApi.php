@@ -7,9 +7,11 @@ use Oaiy\Relay\Acl;
 use Oaiy\Relay\ApiError;
 use Oaiy\Relay\Clock;
 use Oaiy\Relay\Context;
+use Oaiy\Relay\Db;
 use Oaiy\Relay\Ids;
 use Oaiy\Relay\ItemValidator;
 use Oaiy\Relay\Json;
+use Oaiy\Relay\Mailbox;
 use Oaiy\Relay\Principal;
 use Oaiy\Relay\Request;
 use Oaiy\Relay\Response;
@@ -46,11 +48,19 @@ final class ItemsApi
                 }
                 $v = ItemValidator::validate($raw, $ctx->eff);
                 $rcpt = Acl::checkPost($p, $v['lane'], $v['target'], $v['hdr'], $v['body'], $ctx->db, $ctx->mb, $ctx->cfg);
-                $r = $ctx->mb->post('dev:' . $rcpt['id'], $v['lane'], $v['id'], $p->id, $v['ttl'], $v['hdrJson'], $v['re'], null, $v['body']);
+                // The sender and the recipient were checked before this transaction; they are asked again inside it, where a revocation
+                // cannot come between: a device revoked meanwhile posts nothing (401, as at its next request) and gets nothing made for it.
+                $sender = $p->id;
+                $recipient = (string)$rcpt['id'];
+                $guard = static function (Db $db) use ($sender, $recipient): void {
+                    Mailbox::requireActive($db, $sender, 'revoked');
+                    Mailbox::requireActive($db, $recipient, 'not_found');
+                };
+                $r = $ctx->mb->post('dev:' . $rcpt['id'], $v['lane'], $v['id'], $p->id, $v['ttl'], $v['hdrJson'], $v['re'], null, $v['body'], false, $guard);
                 $results[] = ['id' => $v['id'], 'status' => $r['status'], 'seq' => $r['seq']];
             } catch (ApiError $e) {
-                if ($e->status === 503) {
-                    throw $e; // the database is busy: tell the sender to retry the whole request
+                if ($e->status === 503 || $e->status === 401) {
+                    throw $e; // the database is busy: tell the sender to retry the whole request; or the sender was revoked: it is not one any more
                 }
                 $err = ['code' => $e->errorCode, 'message' => $e->getMessage()];
                 if ($e->retryAfter !== null) {

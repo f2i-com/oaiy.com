@@ -187,6 +187,15 @@ final class Db
     }
 
     /**
+     * Append to a SELECT that must read the row as it is now and keep it from being changed until this transaction ends, without
+     * keeping other readers of it out (MySQL and MariaDB: a shared lock, LOCK IN SHARE MODE, which both accept; SQLite locks the file).
+     */
+    public function forShare(): string
+    {
+        return $this->driver === 'mysql' ? ' LOCK IN SHARE MODE' : '';
+    }
+
+    /**
      * A named lock for a check that has no single row to lock (a count of rows that do not exist yet, such as "no more than
      * N desktops"): every writer that checks and then inserts takes it first, so on MySQL and MariaDB the second one waits
      * for the first to commit and then counts what the first made. SQLite needs no gate (BEGIN IMMEDIATE holds the whole
