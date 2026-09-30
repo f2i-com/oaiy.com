@@ -623,6 +623,33 @@ foreach ([false, true] as $callOn) {
     });
 }
 
+test('4.1 a bare -0 anywhere in a JSON body is 400 invalid_request (Interpretation 23), while the same two characters inside a string, and -0.5, are not', function () {
+    $r = Relay::make();
+    $d = $r->desktop();
+    $v = $r->provider();
+    $item = fn(string $hdr, string $body = 'plain', string $id = 'i1'): string => '{"items":[{"to":"' . $d->inbox() . '","lane":"cmd","id":"' . $id . '","hdr":' . $hdr . ',"body":"' . $body . '"}]}';
+    $post = fn(string $raw): array => $r->call($v, 'POST', '/v1/items', $raw);
+    eq(200, $post($item('{"prio":0}', 'a-0b', 'x-0'))['status'], 'a -0 inside a string and inside an id is just text');
+    eq('queued', $post($item('{"prio":0}', 'text with -0 in it', 'i2'))['json']['results'][0]['status']);
+    foreach (['{"prio":-0}', '{"n":-0}', '{"prio": -0 }', '{"n":-0,"prio":1}', '[-0]'] as $i => $hdr) {
+        $res = $post($item($hdr, 'plain', 'neg' . $i));
+        eq(400, $res['status'], $hdr);
+        eq('invalid_request', $res['json']['error']['code'], $hdr);
+    }
+    foreach (['-0.5', '-0.0', '-0e1', '-0E2'] as $i => $num) {
+        $res = $post($item('{"n":' . $num . '}', 'plain', 'frac' . $i));
+        eq(200, $res['status'], $num . ': a fraction or an exponent is a different mistake, refused per item like any float');
+        eq('invalid_item', $res['json']['results'][0]['error']['code'], $num);
+    }
+    eq(400, $post('{"items":[],"x":-0}')['status'], 'anywhere in the body');
+    eq(400, $post('{"items":[{"to":"' . $d->inbox() . '","lane":"cmd","id":"a\"-0","body":"b"}],"y":[1,-0]}')['status'], 'an escaped quote does not end the string early');
+    eq(200, $post('{"items":[{"to":"' . $d->inbox() . '","lane":"cmd","id":"esc","body":"quote \" then -0 in a string"}]}')['status']);
+    // The same in the roster's revision, where 0 is a real value.
+    $roster = fn(string $rev): array => $r->call($d, 'POST', '/v1/roster', '{"appId":"aokie","revision":' . $rev . ',"thumbprints":[]}');
+    eq(200, $roster('0')['status']);
+    eq(400, $roster('-0')['status']);
+});
+
 test('4.3 idempotency: the key is (mailbox, lane, sender, id): another sender\'s item of the same id is a different item, learns nothing about the first, and cannot claim it ahead of its sender', function () {
     $r = Relay::make();
     $d = $r->desktop();
