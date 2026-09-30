@@ -51,7 +51,9 @@ use super::host::{
 use super::mode::{AccessMode, Exposure};
 use super::presets::App;
 use super::principal::{Principal, PrincipalKind};
-use super::routes::{lookup, pattern_existed_before, route_class, Class, DeskRole, Verb};
+use super::routes::{
+    lookup, pattern_existed_before, pattern_is_public, route_class, Class, DeskRole, Verb,
+};
 use super::scopes::is_dangerous;
 use super::store::{AuthError, AuthStore};
 use super::token;
@@ -275,6 +277,12 @@ impl Denial {
         )
     }
 
+    /// The answer to an `OPTIONS` that is not a CORS preflight: `204`, no body, and nothing that tells one
+    /// path from another.
+    pub fn options_answered() -> Denial {
+        Denial::new(StatusCode::NO_CONTENT, "options", "")
+    }
+
     pub fn proxy_misconfigured() -> Denial {
         Denial::new(
             StatusCode::BAD_REQUEST,
@@ -285,6 +293,20 @@ impl Denial {
     }
 
     pub fn into_response(self) -> Response {
+        if self.status == StatusCode::NO_CONTENT {
+            // A `204` has no body. And an empty `Allow`, on every one: the router adds the `Allow` of the
+            // methods a route has to what a method it has no handler for gets (it keeps one that is there),
+            // which would tell a path that exists from one that does not.
+            let mut response = StatusCode::NO_CONTENT.into_response();
+            let h = response.headers_mut();
+            h.insert(header::ALLOW, HeaderValue::from_static(""));
+            h.insert(header::CACHE_CONTROL, HeaderValue::from_static("no-store"));
+            h.insert(
+                "x-content-type-options",
+                HeaderValue::from_static("nosniff"),
+            );
+            return response;
+        }
         let body = {
             let mut o = serde_json::Map::new();
             o.insert(
@@ -746,12 +768,19 @@ impl Guard {
             })
         };
 
-        // 5. OPTIONS is public: the CORS layer answers preflights, and a bare one reaches the router.
+        // 5. OPTIONS needs no credential, and no route's handler runs for it: the CORS layer answers
+        // preflights, and a bare one (no `Origin`, no `Access-Control-Request-Method`) is answered here with
+        // the same `204` whether the path exists or not (a handler such as the engine gateway's would run
+        // for it, and `405` next to `404` would say which paths exist). Only a route that is public
+        // altogether is passed on, since what its router would say is public already.
         if method == Method::OPTIONS {
-            return Ok(Admitted {
-                principal: None,
-                info: Some(info),
-            });
+            if matched.as_deref().is_some_and(pattern_is_public) {
+                return Ok(Admitted {
+                    principal: None,
+                    info: Some(info),
+                });
+            }
+            return Err(fail(Denial::options_answered()));
         }
 
         // 6. classify by the route axum matched
@@ -959,13 +988,20 @@ pub async fn scoped_cors(
         decision.apply(response.headers_mut());
         return response;
     }
-    let decision = cors::decide(
-        &method,
-        matched.as_deref(),
-        origin.as_deref(),
-        &allowed(&origin),
-        asks_pna,
-    );
+    // A bare `OPTIONS` (one that is not a preflight) gets no CORS headers, whatever the path: what they say
+    // depends on the route, and the answer must not tell a path that exists from one that does not (the guard
+    // answers it `204`, the same for both).
+    let decision = if method == Method::OPTIONS {
+        cors::Cors::default()
+    } else {
+        cors::decide(
+            &method,
+            matched.as_deref(),
+            origin.as_deref(),
+            &allowed(&origin),
+            asks_pna,
+        )
+    };
     let mut response = next.run(req).await;
     decision.apply(response.headers_mut());
     response

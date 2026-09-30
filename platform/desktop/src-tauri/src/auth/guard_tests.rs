@@ -1692,24 +1692,21 @@ async fn t16_cors_answers_a_paired_origin_a_public_route_and_nobody_else() {
     .headers
     .get("access-control-allow-origin")
     .is_none());
-    // A bare OPTIONS (no requested method) is public for every path: `*`, and nothing that says more.
-    let bare = go(
-        &e,
-        send(Method::OPTIONS, "/api/services").h("origin", "https://formlogic.example"),
-    )
-    .await;
-    assert_eq!(
-        bare.headers.get("access-control-allow-origin").unwrap(),
-        "*"
-    );
-    assert!(
-        bare.headers
-            .get("access-control-allow-headers")
-            .unwrap()
-            .to_str()
-            .unwrap()
-            == "content-type"
-    );
+    // A bare OPTIONS (no requested method) is not a preflight: it is answered `204` by the guard, the same for
+    // every path, and gets no CORS headers (what they would say depends on the route: F2).
+    for path in ["/api/services", "/api/health", "/api/no/such/route"] {
+        let bare = go(
+            &e,
+            send(Method::OPTIONS, path).h("origin", "https://formlogic.example"),
+        )
+        .await;
+        assert!(
+            bare.headers.get("access-control-allow-origin").is_none()
+                && bare.headers.get("access-control-allow-headers").is_none(),
+            "{path}: {:?}",
+            bare.headers
+        );
+    }
 }
 
 #[tokio::test]
@@ -2397,6 +2394,161 @@ async fn in_scoped_and_shadow_mode_the_new_guard_claims_every_request() {
             );
         }
     }
+}
+
+// ================================= F2: OPTIONS that is not a preflight ================================
+
+/// A router with a probe on the engine gateway (an `any` route: its handler runs for every method, and
+/// finds the engine), a public route, and the guard and CORS layers the listener puts in front.
+fn options_probe(guard: &Arc<Guard>, hits: &Arc<std::sync::atomic::AtomicUsize>) -> Router {
+    use std::sync::atomic::Ordering;
+    let probe = {
+        let hits = hits.clone();
+        move || {
+            let hits = hits.clone();
+            async move {
+                hits.fetch_add(1, Ordering::SeqCst);
+                (
+                    axum::http::StatusCode::SERVICE_UNAVAILABLE,
+                    "engine_unavailable",
+                )
+            }
+        }
+    };
+    Router::new()
+        .route("/api/ai/engine/gateway/*path", any(probe))
+        // A route with handlers for some methods only: the router adds an `Allow` naming them to what a
+        // method it has no handler for gets, unless the answer already has one.
+        .route(
+            "/api/services",
+            axum::routing::get(|| async { "ok" }).post(|| async { "ok" }),
+        )
+        .route("/api/health", axum::routing::get(|| async { "ok" }))
+        .layer(middleware::from_fn_with_state(guard.clone(), scoped_guard))
+        .layer(middleware::from_fn_with_state(guard.clone(), scoped_cors))
+}
+
+async fn options_answer(
+    app: &Router,
+    path: &str,
+    headers: &[(&str, &str)],
+) -> (u16, Vec<(String, String)>, String) {
+    let mut req = Request::builder()
+        .method(Method::OPTIONS)
+        .uri(path)
+        .header("host", "localhost:17972");
+    for (n, v) in headers {
+        req = req.header(*n, *v);
+    }
+    let mut req = req.body(Body::empty()).unwrap();
+    req.extensions_mut().insert(ConnectInfo(
+        "127.0.0.1:50000".parse::<SocketAddr>().unwrap(),
+    ));
+    let response = app.clone().oneshot(req).await.unwrap();
+    let status = response.status().as_u16();
+    let mut h: Vec<(String, String)> = response
+        .headers()
+        .iter()
+        .filter(|(n, _)| n.as_str() != "date")
+        .map(|(n, v)| (n.as_str().to_owned(), v.to_str().unwrap_or("?").to_owned()))
+        .collect();
+    h.sort();
+    let body = String::from_utf8_lossy(
+        &axum::body::to_bytes(response.into_body(), 1 << 20)
+            .await
+            .unwrap(),
+    )
+    .into_owned();
+    (status, h, body)
+}
+
+#[tokio::test]
+async fn f2_a_bare_options_never_reaches_a_handler_and_says_nothing_about_which_paths_exist() {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    for mode in [AccessMode::Scoped, AccessMode::Shadow] {
+        let e = env(mode);
+        let hits = Arc::new(AtomicUsize::new(0));
+        let app = options_probe(&e.guard, &hits);
+        let token = native_pat(&e, ScopeSet::of(&["ai.use"]), DAY);
+        let bearer = format!("Bearer {token}");
+        for extra in [
+            vec![],
+            vec![("authorization", bearer.as_str())],
+            // An Origin with no requested method is not a preflight either.
+            vec![("origin", "https://formlogic.example")],
+        ] {
+            // A route with a handler for every method, one that has no route at all, and a path no route
+            // is under: the same answer to all three, and the handler is never run.
+            let gateway = options_answer(&app, "/api/ai/engine/gateway/x", &extra).await;
+            let absent = options_answer(&app, "/api/no/such/route", &extra).await;
+            let deep = options_answer(&app, "/api/ai/engine/gateway", &extra).await;
+            let limited = options_answer(&app, "/api/services", &extra).await;
+            assert_eq!(gateway.0, 204, "{mode:?} {extra:?}: {gateway:?}");
+            assert_eq!(gateway.2, "", "a 204 has no body");
+            assert_eq!(
+                gateway, absent,
+                "{mode:?} {extra:?}: a path that exists and one that does not answer alike"
+            );
+            assert_eq!(gateway, deep, "{mode:?} {extra:?}");
+            assert_eq!(
+                gateway, limited,
+                "{mode:?} {extra:?}: the router's own Allow (GET, HEAD, POST) must not show through"
+            );
+            assert!(
+                gateway.1.iter().all(|(n, v)| n != "allow" || v.is_empty()),
+                "no Allow header names the methods of a route: {gateway:?}"
+            );
+            assert_eq!(
+                hits.load(Ordering::SeqCst),
+                0,
+                "{mode:?} {extra:?}: a handler ran for an OPTIONS"
+            );
+        }
+        // A public route is passed on: what its router says is public already (405 and its Allow header).
+        let health = options_answer(&app, "/api/health", &[]).await;
+        assert_eq!(health.0, 405, "{mode:?}: {health:?}");
+        assert!(health.1.iter().any(|(n, _)| n == "allow"), "{health:?}");
+        // The request that is not an OPTIONS still reaches the handler (a credential with the scope).
+        let mut req = Request::builder()
+            .method(Method::POST)
+            .uri("/api/ai/engine/gateway/x")
+            .header("host", "localhost:17972")
+            .header("authorization", &bearer)
+            .body(Body::empty())
+            .unwrap();
+        req.extensions_mut().insert(ConnectInfo(
+            "127.0.0.1:50000".parse::<SocketAddr>().unwrap(),
+        ));
+        let r = app.clone().oneshot(req).await.unwrap();
+        assert_eq!(r.status().as_u16(), 503);
+        assert_eq!(hits.load(Ordering::SeqCst), 1);
+    }
+}
+
+#[tokio::test]
+async fn f2_a_real_preflight_is_still_answered_by_the_cors_layer_with_its_headers() {
+    use std::sync::atomic::AtomicUsize;
+    let e = env(AccessMode::Scoped);
+    let hits = Arc::new(AtomicUsize::new(0));
+    let app = options_probe(&e.guard, &hits);
+    let _pat = browser_pat(&e, "https://formlogic.example", &["ai.use"]);
+    let (status, headers, body) = options_answer(
+        &app,
+        "/api/ai/engine/gateway/x",
+        &[
+            ("origin", "https://formlogic.example"),
+            ("access-control-request-method", "POST"),
+        ],
+    )
+    .await;
+    assert_eq!((status, body.as_str()), (204, ""));
+    assert!(
+        headers
+            .iter()
+            .any(|(n, v)| n == "access-control-allow-origin" && v == "https://formlogic.example"),
+        "{headers:?}"
+    );
+    assert_eq!(hits.load(std::sync::atomic::Ordering::SeqCst), 0);
 }
 
 // ========================================= startup rules ========================================

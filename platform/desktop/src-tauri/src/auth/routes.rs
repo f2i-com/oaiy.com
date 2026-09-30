@@ -648,6 +648,29 @@ pub fn pattern_existed_before(pattern: &str) -> bool {
     .contains(pattern)
 }
 
+/// Whether every row of the route `pattern` is [`Class::Public`] (health, capability discovery, the login
+/// routes): the one kind of route a bare `OPTIONS` (one that is not a CORS preflight) is passed on to, since
+/// what it would learn there is public already. A pattern with any other row, and a pattern with no row, is
+/// not.
+pub fn pattern_is_public(pattern: &str) -> bool {
+    static PUBLIC: OnceLock<std::collections::HashSet<&'static str>> = OnceLock::new();
+    PUBLIC
+        .get_or_init(|| {
+            ROUTES
+                .iter()
+                .filter(|r| r.class == Class::Public)
+                .map(|r| r.pattern)
+                .filter(|p| {
+                    ROUTES
+                        .iter()
+                        .filter(|r| r.pattern == *p)
+                        .all(|r| r.class == Class::Public)
+                })
+                .collect()
+        })
+        .contains(pattern)
+}
+
 /// What a request for `method` on the matched route `matched_path` takes. `OPTIONS` is public for
 /// every path (the CORS layer answers it); a method the API does not serve, and a route with no
 /// row, are [`Class::Unclassified`], which every caller must refuse.
@@ -888,5 +911,53 @@ mod tests {
         assert_eq!(classes["session"].len(), 5);
         assert_eq!(classes["desk"], ["GET /api/local-protection/webview-key"]);
         assert!(!classes.contains_key("unclassified"));
+    }
+
+    #[test]
+    fn a_pattern_is_old_when_any_method_of_it_has_a_row_from_before_the_model() {
+        // `/api/bridge/pairing` has the old `GET` and `POST` and the `DELETE` the table adds: the pattern is old.
+        for old in [
+            "/api/bridge/pairing",
+            "/api/config",
+            "/api/health",
+            "/api/ai/engine/gateway/*path",
+        ] {
+            assert!(pattern_existed_before(old), "{old}");
+        }
+        // Patterns only the model adds (or another design announces), and paths that are not patterns.
+        for new in [
+            "/api/auth/info",
+            "/api/auth/derive",
+            "/api/system/gpus",
+            "/api/services/:id/gpu",
+            "/api/config/x",
+            "",
+        ] {
+            assert!(!pattern_existed_before(new), "{new}");
+        }
+    }
+
+    #[test]
+    fn a_pattern_is_public_only_when_every_row_of_it_is() {
+        for public in [
+            "/api/health",
+            "/api/bridge/capabilities",
+            "/api/bridge/pairing/:id",
+            "/api/auth/info",
+            "/api/auth/login",
+            "/api/auth/callback",
+        ] {
+            assert!(pattern_is_public(public), "{public}");
+        }
+        // Public `POST` next to a scoped `GET` and `DELETE`: not public altogether.
+        for not_public in [
+            "/api/bridge/pairing",
+            "/api/services",
+            "/api/auth/whoami",
+            "/api/no/such/route",
+            "",
+        ] {
+            assert!(!pattern_is_public(not_public), "{not_public}");
+        }
     }
 }

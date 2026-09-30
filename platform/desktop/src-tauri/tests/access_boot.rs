@@ -550,6 +550,53 @@ fn a_scoped_server_sees_the_peer_and_the_host_of_each_request_from_the_socket() 
 }
 
 #[test]
+fn a_bare_options_on_a_scoped_server_runs_no_handler_and_tells_no_path_from_another() {
+    // The engine gateway is an `any` route: its handler runs for every method, and looks for the engine. A bare
+    // `OPTIONS` (no Origin, no requested method) must not get that far, and its answer must be the same for a
+    // path that exists and one that does not.
+    let scratch = Scratch::new("boot-scoped-options");
+    let server = Server::start(&scratch, &[("OAIY_ACCESS_MODE", "scoped")]);
+    let client = reqwest::blocking::Client::new();
+    let options = |path: &str, token: Option<&str>| {
+        let mut request = client.request(
+            reqwest::Method::OPTIONS,
+            format!("http://127.0.0.1:{}{path}", server.port),
+        );
+        if let Some(t) = token {
+            request = request.bearer_auth(t);
+        }
+        let response = request.send().unwrap();
+        let status = response.status().as_u16();
+        let mut headers: Vec<(String, String)> = response
+            .headers()
+            .iter()
+            .filter(|(n, _)| n.as_str() != "date")
+            .map(|(n, v)| (n.as_str().to_owned(), v.to_str().unwrap_or("?").to_owned()))
+            .collect();
+        headers.sort();
+        (status, headers, response.text().unwrap())
+    };
+    for token in [None, Some(TOKEN)] {
+        let gateway = options("/api/ai/engine/gateway/x", token);
+        assert_eq!(gateway.0, 204, "{gateway:?}");
+        assert_eq!(gateway.2, "");
+        for path in [
+            "/api/services",
+            "/api/no/such/route",
+            "/api/ai/engine/gateway",
+        ] {
+            assert_eq!(options(path, token), gateway, "{path}");
+        }
+        assert!(
+            gateway.1.iter().all(|(n, v)| n != "allow" || v.is_empty()),
+            "{gateway:?}"
+        );
+    }
+    // A public route is passed on to its router.
+    assert_eq!(options("/api/health", None).0, 405);
+}
+
+#[test]
 fn a_mode_that_is_not_one_stops_the_server_with_exit_78() {
     let scratch = Scratch::new("boot-badmode");
     let mut server = Server::spawn(&scratch, &[("OAIY_ACCESS_MODE", "scopd")], "server");
