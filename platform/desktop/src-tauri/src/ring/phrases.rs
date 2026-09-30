@@ -665,7 +665,7 @@ mod tests {
         group
     }
 
-    /// The contract's own document says how many cases the fixture holds ("103 positive and 115 negative cases"): the fixture holds what the document says.
+    /// The contract's own document says how many cases the fixture holds ("105 positive and 115 negative cases"): the fixture holds what the document says.
     #[test]
     fn the_contract_document_counts_the_cases_the_fixture_holds() {
         let document = include_str!("../../../../../docs/contracts/transfer/transfer-v1.md");
@@ -937,14 +937,15 @@ mod tests {
         }
     }
 
-    /// transfer-v1.md says what the phone's floor lets through that this desktop, the host, has to refuse: the forms no block names on either end (which no
-    /// case can be shared for until both ends close them), and what only the host reads. Each is refused here, and each is a case of this desktop's own
+    /// transfer-v1.md says what the phone's floor lets through that this desktop, the host, has to refuse: the forms the shared blocks do not name (which no
+    /// case can be shared for until they do), and what only the host reads. Each is refused here, and each is a case of this desktop's own
     /// file, so a change to the contract's list that this desktop has not followed, or a case dropped from the file, is seen.
     #[test]
     fn what_the_contract_says_the_floor_lets_through_is_refused_here_and_kept_as_a_case() {
         let document = include_str!("../../../../../docs/contracts/transfer/transfer-v1.md").split_whitespace().collect::<Vec<_>>().join(" ");
         // (If the contract's sentence is reworded so that this cannot find its list, this test says so: the list is `oaiy-only/README.md`'s to follow.)
-        let from = document.find("no block names on either end (").expect("the contract lists the forms no block names on either end: has its sentence been reworded? see oaiy-only/README.md") + "no block names on either end (".len();
+        const LIST: &str = "forms that the shared blocks do not name (";
+        let from = document.find(LIST).expect("the contract lists the forms the shared blocks do not name: has its sentence been reworded? see oaiy-only/README.md") + LIST.len();
         // (Up to the bracket that closes the list, whatever the sentence goes on to say of them: the contract may say what is let through, or by whom.)
         let to = from + document[from..].find(')').expect("the list of forms is in brackets");
         let forms: Vec<String> = Regex::new(r#""([^"]+)""#).unwrap().captures_iter(&document[from..to]).map(|c| c[1].to_string()).collect();

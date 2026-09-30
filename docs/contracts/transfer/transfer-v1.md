@@ -19,7 +19,7 @@ step with the OAIY repository's copy. The digests are in [SHA256SUMS](SHA256SUMS
 | [transfer-v1.start-ready.fixture.json](transfer-v1.start-ready.fixture.json) | `start.allowTransfer`, `ready.features`, `start.resume`, the `handoff:takeover` stop, and the compatibility matrix. |
 | [transfer-v1.ring-plan.fixture.json](transfer-v1.ring-plan.fixture.json) | The two plugin-to-host requests `oaiy.ring.plan` and `oaiy.ring.opened`. |
 | [transfer-v1.reserved-offer-id.fixture.json](transfer-v1.reserved-offer-id.fixture.json) | The reserved transfer offer id and its generations (vector V2). |
-| [transfer-v1.caller-asked.fixture.json](transfer-v1.caller-asked.fixture.json) | The "caller asked" phrase check: the normaliser, every rule and block, 103 positive and 115 negative cases, the windows, the refusals a pause splits, and the turns that only acknowledge the AI. |
+| [transfer-v1.caller-asked.fixture.json](transfer-v1.caller-asked.fixture.json) | The "caller asked" phrase check: the normaliser, every rule and block, 105 positive and 115 negative cases, the windows, the refusals a pause splits, and the turns that only acknowledge the AI. |
 
 ## How a transfer runs
 
@@ -175,23 +175,37 @@ Checks, in this order; each refusal is an ordinary `ok: false` result:
    neither. The fixture's `unfinished` object and `algorithm` say exactly how;
    the read window is that of the last three turns, so the two sentences are
    read as one only within it. The plugin's check is
-   meant never to be stricter than the host's (what the host counts, the
-   plugin lets through), because it runs first, with two differences that are
-   stated here. It has no names in it: a caller who asks
+   meant to be no stricter than the host's (what the host counts, the
+   plugin lets through), because it runs first; it is stricter than a host
+   reading its own record in the cases stated here, and no other is known. It has
+   no names in it: a caller who asks
    for the owner by first name is recognised only by a host that knows the
    owner's name (OAIY takes it from a business named for its owner), the plugin
    does not, so it answers `caller_did_not_ask` and the caller is offered a
-   message. And it decides what is an acknowledgement by the words alone, where
+   message. It does not remove the invisible joiners and marks (hex 200C to
+   200F, 2060, FEFF) that the host removes: the normaliser here turns them
+   into a space, so a word cut by one in typed text (a speech engine never
+   writes them) is two words to the floor. And it decides what is an
+   acknowledgement by the words alone, where
    the host leaves an acknowledgement out of its record only when it was said
    over the AI while the AI was talking (and leaves out a turn said before the
    greeting, one that resumed a reply that was cut off, and a quick "of course"
    or "go on" said over the AI): an acknowledgement in a pause after the AI
    had finished is a turn to the host and not to the plugin. The audio timing
-   is not the plugin's to see. That runs the allowed way (an
+   is not the plugin's to see. That mostly runs the allowed way (an
    acknowledgement-only turn can never be what asks, so dropping more of them
-   only lets the last three reach further back); the one way it can be
-   stricter is a turn the host drops for its timing that the plugin keeps,
-   which uses one of the plugin's three places. An ask counts for **one
+   only lets the last three reach further back), and it is stricter in this
+   case: a refusal begun in one turn, an acknowledgement, and the words that
+   would finish it. The turns "I don't want to", "mm-hmm", "speak to the
+   owner": the plugin drops the acknowledgement, so the refusal comes directly
+   before the words and they are read joined, and refused
+   (`caller_did_not_ask`); a host that kept the acknowledgement (said in a
+   pause) has it between them, a sentence of its own, which ends what was
+   carried, and counts the words alone. A thinking noise said alone ("um",
+   "uh") and up to three acknowledgements in one turn do the same. It is also
+   stricter, by construction, when the host drops a turn for its timing that
+   the plugin keeps: that turn uses one of the plugin's three places.
+   An ask counts for **one
    request**. The turns this check reads are the turns not yet spent: the turns
    said up to the tool call are spent when the request they asked for **opens**
    (the host's plan authorised the ring and the request is open) and when the AI
@@ -206,17 +220,16 @@ Checks, in this order; each refusal is an ordinary `ok: false` result:
    its own and not on the ask before it. The floor is also looser than
    the host for what only the host reads (an ask taken back, being told to say
    it, a different target such as billing, someone else in the room), which the
-   host refuses after the floor has let it through; and the one difference of
-   writing that runs the other way is that the host also removes the invisible
-   joiners and marks (hex 200C to 200F, 2060, FEFF) that the normaliser here
-   turns into a space, so a word cut by one in typed text (a speech engine
-   never writes them) is two words to the floor. The normaliser keeps the
+   host refuses after the floor has let it through. The normaliser keeps the
    apostrophe inside a word, so "I'm" and "we're" are single words and a block
    that means them names them ("i'm", "we're") as well as "i am" and "we are".
-   A few contracted or misspelled forms that no block names on either end
+   A few contracted or misspelled forms that the shared blocks do not name
    ("we'll speak to the manager tomorrow", "they've put the owner on", "I
-   wouldnt speak to the manager") are let through by both; no case can be
-   shared for them until both ends close them. The same turns, cut the same
+   wouldnt speak to the manager") are let through by the floor and refused by
+   the host, whose own blocks are wider (OAIY names "we'll", "she'll",
+   "they've", "wouldnt", "couldn't" and the like): the allowed direction, the
+   floor answers such an ask as an ask and the host refuses it after. No case
+   can be shared for them until the shared blocks name them. The same turns, cut the same
    way, are the `recentCallerTurns` of the plan request, which the host reads
    only for a call it has no record of;
 7. the host's ring plan (`oaiy.ring.plan`). For `urgent` and `policy_rule` the
@@ -502,7 +515,9 @@ and a responding device id, and no text from the call or the owner.
   (its normaliser, rules, blocks, sentences, the unfinished refusal carried to
   the sentence after it when that begins with the verb it is about, turn blocks and 300-character
   reading; the fixture is the plugin's floor as well, so a request the host
-  counts is never refused first, names aside), run it on the host's own record
+  counts is refused first only in the cases step 6 states: a first name, an
+  invisible mark inside a word, an acknowledgement between a refusal and its
+  words, a turn the host drops for its timing), run it on the host's own record
   of what the caller said, which leaves out an acknowledgement said over the AI
   (the plugin, which cannot see that timing, drops every acknowledgement-only
   turn from the `recentCallerTurns` of a plan request), count an ask for one
