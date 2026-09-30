@@ -1083,7 +1083,8 @@ fn merge_file(name: &str, local: Option<&serde_json::Value>, theirs: &[u8], tick
 
 /// A restore is applied to the files that are here when it is applied. What was merged with a file that is here when the restore was
 /// prepared (the calendar takes bookings, the phone plugin's settings are changed) is merged again with that file if it changed since,
-/// from what the backup held (kept as it came, and held to its size and SHA-256), so that nothing done in the hours between is lost.
+/// from what the backup held (kept as it came, and held to its size and SHA-256), so that what was added in the hours between (a booking, a
+/// setting the backup has no key for) is not lost. What the backup itself carries is put over it, as it would have been at once.
 /// The staged file and the marker are updated (and the marker is written again) before anything is put in place. `Err` says why
 /// nothing may be applied.
 fn merge_again(data_dir: &Path, marker: &mut Marker, limits: &Limits) -> std::result::Result<(), String> {

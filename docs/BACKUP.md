@@ -429,8 +429,9 @@ holds keys only tells the dialog whether to offer the box), and then only for th
 provider list, and for the Agent only where it has no key of its own for a provider at the same
 address (see [The Agent's storage](#the-agents-storage)).
 
-**A key is never written in an address, with the box ticked or not.** An address of the Agent's
-providers or of its image, video and audio service may hold a name and password before the host
+**A key is never written in an address's name and password, query or fragment, with the box ticked
+or not** (and **a key written in an address's path is not covered**: see the end of this paragraph).
+An address of the Agent's providers or of its image, video and audio service may hold a name and password before the host
 (`https://alice:secret@gateway.example`), or a key in its query (`?api_key=...`). The keys box decides
 whether a provider's *key* travels, and cannot decide for a key that is part of an address, so the Agent's page
 writes such an address without it (no name or password, no fragment, and in the query nothing but the
@@ -448,6 +449,10 @@ ticked) has no key table: when it comes back, an address in it is saved without 
 the fragment and the parameters of the query (keeping the version of an API), keys ticked or not, and
 the result says how many. What that file holds when it goes *into* a backup is copied as it is, as its
 keys are: with the box ticked, the file is as sensitive as the keys, an address that holds a key included.
+**A key in the path of an address is not found by any rule**: `https://gateway.example/sk-.../v1` and
+`https://api.telegram.org/bot<token>/` look like any other address, so they are copied as they are, travel in
+a backup whatever the keys box says, and come back with the address. Give such a service's key as its key
+(the field for it), not in its address, if you do not want it in a backup file.
 
 ## Restoring
 
@@ -485,6 +490,12 @@ A restore is never done in place. It has three steps, and the first two change n
    If that file has changed by the time the restore is applied (a booking taken, a setting changed,
    in the hours between), the backup's file is merged with what is there then, before anything is put
    in place, and the result says so. A copy that does not check out stops the restore, with nothing changed.
+   **This protects what the backup does not hold, not what it does.** An appointment booked in the
+   hours between, or a setting the backup has no key for, is kept. A key the backup itself carries
+   and its tick brings back is put over yours when the restore is applied, as it would have been
+   at once: the step between the times offered (`slotMinutes`) and, with the plugins tick, a
+   plugin's greeting are set to the backup's, over a change made in the hours between. Undo puts
+   back what was replaced.
 3. **Restart to finish restoring.** At the next start, before any part of OAIY opens its data,
    each staged file is put in place with an atomic rename. The file it replaces is not copied but
    **moved** into `<data>/restore/undo-<id>/`, so what is saved is exactly what was replaced,

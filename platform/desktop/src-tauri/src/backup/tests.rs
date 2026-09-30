@@ -3415,6 +3415,32 @@ fn a_booking_taken_and_a_setting_changed_after_the_restore_was_prepared_are_kept
     }
 }
 
+/// The limit of the test above, which BACKUP.md says: what is merged again is what the backup does not hold. A key the backup itself
+/// carries and its tick brings is put over a change made in the hours between (the reviewer's x1 and x1e): the step between the times
+/// offered comes back without a tick, and a plugin's greeting with the plugins tick. What the backup has no key for stays as it was changed.
+#[test]
+fn a_key_the_backup_carries_is_put_over_a_change_made_after_the_restore_was_prepared() {
+    let out = TempDir::new("remerge-carried-out");
+    let theirs_settings = serde_json::json!({ "settings": { "greeting": "From the backup" } }).to_string();
+    let files: Vec<(&str, &[u8])> = vec![("calendar/calendar.json", HOSTILE_CALENDAR.as_bytes()), ("plugin-data/aokie/settings.json", theirs_settings.as_bytes())];
+    let file = out.0.join("c.oaiybackup");
+    craft(&file, &manifest_for(&files), &files, true);
+    let dst = TempDir::new("remerge-carried-dst");
+    put(&dst.0, "calendar/calendar.json", calendar_text("mine"));
+    put(&dst.0, "plugin-data/aokie/settings.json", serde_json::json!({ "settings": { "greeting": "Hello", "autoAnswer": false } }).to_string());
+    restore::stage(&dst.0, &file, PASS, &Ticks::all(), &options()).unwrap();
+    // After Prepare: the owner changes the step between times, the greeting, and a switch the backup does not hold.
+    let mut live = json_of(&dst.0, "calendar/calendar.json");
+    live["settings"]["slotMinutes"] = serde_json::json!(45);
+    put(&dst.0, "calendar/calendar.json", live.to_string());
+    put(&dst.0, "plugin-data/aokie/settings.json", serde_json::json!({ "settings": { "greeting": "Changed after Prepare", "autoAnswer": true } }).to_string());
+    assert!(matches!(restore::apply_pending(&dst.0), ApplyOutcome::Applied(_)));
+    assert_eq!(json_of(&dst.0, "calendar/calendar.json")["settings"]["slotMinutes"], 30, "the backup's step between times is put over the change made after Prepare");
+    let plugin = json_of(&dst.0, "plugin-data/aokie/settings.json");
+    assert_eq!(plugin["settings"]["greeting"], "From the backup", "the greeting the backup carries is put over the change");
+    assert_eq!(plugin["settings"]["autoAnswer"], true, "and a setting the backup has no key for stays as it was changed");
+}
+
 /// A restore whose files have not changed since it was prepared is applied as it was prepared, with nothing merged again; and what
 /// it was merged from is held to what it was.
 #[test]

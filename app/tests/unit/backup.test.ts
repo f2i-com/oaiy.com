@@ -428,6 +428,12 @@ describe('exporting the Agent storage', () => {
     expect(rows.some((r) => r.changed) && rows.some((r) => !r.changed)).toBe(true);
   });
 
+  it('does not touch a key written in the path of an address: no rule can tell it from a name, and BACKUP.md says it is not covered', () => {
+    for (const address of ['https://gw.example/sk-ABC123/v1', 'https://api.telegram.org/bot123456:ABC-DEF/getMe', 'https://gw.example/v1;jsessionid=abc']) {
+      expect(addressWithoutCredentials(address), address).toEqual({ address, changed: false });
+    }
+  });
+
   it('keeps the version of an API only when it is written as a version, so there is no room in it for a key', () => {
     for (const value of ['2024-02-15', '2024-02-15-preview', '2023-05-15', '1', '2', '1.0', '2.1.3', '1.2.3.4', '0', '9999']) {
       expect(addressWithoutCredentials(`https://gw.example/v1?api-version=${value}`), value).toEqual({ address: `https://gw.example/v1?api-version=${value}`, changed: false });
