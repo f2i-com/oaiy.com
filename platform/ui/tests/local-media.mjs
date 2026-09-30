@@ -109,6 +109,12 @@ const LOCAL = [
   'http://user:pass@192.168.1.5/x.png',
   'http://[::ffff:192.168.1.5]/x.png',
   'http://[fd12:3456::1]/x.png',
+  'http://printer/x.png', // a name of one label: this network's to resolve
+  'http://nas:8080/a.mp4',
+  'http://[64:ff9b::c0a8:1]/x.png', // NAT64 to 192.168.0.1
+  'http://[2002:c0a8:101::1]/x.png', // 6to4 of 192.168.1.1
+  'http://[2001:0:4136:e378:8000:63bf:3f57:fefe]/x.png', // Teredo, client 192.168.1.1
+  'http://[64:ff9b:1::1]/x.png', // the local-use NAT64 prefix
 ];
 const FINE = [
   'data:image/png;base64,iVBORw0KGgo=',
@@ -127,6 +133,8 @@ const FINE = [
   '',
   'C:\\Users\\me\\a.png',
   'file:///C:/a.png',
+  'http://[64:ff9b::808:808]/x.png', // NAT64 to 8.8.8.8
+  'http://[2002:808:808::1]/x.png', // 6to4 of 8.8.8.8
 ];
 
 // ---------------------------------------------------------------------------
@@ -142,6 +150,14 @@ await check('it loads what is not on this computer or its network, what is data 
   tab(() => {
     for (const url of FINE) assert.equal(M.mediaUrlBlocked(url), false, JSON.stringify(url));
     for (const value of [undefined, null, 7, {}, [], true]) assert.equal(M.mediaUrlBlocked(value), false, String(value));
+  });
+});
+
+await check('what the address alone cannot show is a known limit, said in shared/capabilities/README.md: a public name that resolves to a private address is not seen (the browser\'s own question still gates it)', () => {
+  tab(() => {
+    // Written down so that the day it changes is a decision: a name is not looked up, and a redirect is not followed by a check of the address.
+    assert.equal(M.mediaUrlBlocked('http://192.168.1.5.nip.io/x.png'), false);
+    assert.equal(M.mediaUrlBlocked('https://public.example.org/redirects-to-the-lan.png'), false);
   });
 });
 
