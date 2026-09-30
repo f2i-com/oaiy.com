@@ -284,7 +284,7 @@ the relay only stores and forwards. The steps and their answers are in the proto
 - **Garbage collection** removes a rendezvous ten minutes after the phone read its outcome, and at expiry.
 
 `fixtures/sealed-token.json` holds sealed tokens the real relay produced, with the recipient key and the checks a reader must
-make; `php tests/fixtures.php --check` verifies them and `--write` records them again.
+make; `php tests/fixtures.php --check` verifies them and `--write` records them again (`--write pairing` or `--write aokie` for one set). `fixtures/rust-check/` opens them with the Rust `crypto_box` crate, and `fixtures/selftest_fixtures.py` shows that the readers refuse damaged copies.
 
 ## Call features: admissions, TURN and the Aokie routes
 
@@ -391,7 +391,7 @@ The pairing rendezvous and the sealed token (RL-06), and the admission issuer, t
 own tests: every rule of the design's sections 4.10 and 4.14 is named by one, the two are run against fleets of `php -S` servers
 for the races (two responders to one pid, an approval racing a burn, a newer stream replacing an older one within a step, a
 revocation ending a held stream) and against a fake clock for every lifetime, the bearers and credentials are checked against the
-design's vectors and against FormLogic's own known answers, and mutation testing broke the rules that carry safety one at a time.
+design's vectors and against FormLogic's own known answers, the sealed tokens of a pairing were opened with the Rust `crypto_box` crate 0.9.1 (`fixtures/rust-check`, which also shows that its `unseal` alone does not refuse a small-order ephemeral key), and mutation testing broke the rules that carry safety one at a time (220 changes, 207 caught; the other 13 are equivalent: a second guard makes the first redundant, or the platform's own library refuses the same thing).
 
 **Not run:**
 
