@@ -653,8 +653,9 @@ fn preview_of(data_dir: &Path, verified: &container::Verified, scratch: &Path, f
     if items.len() > review::MAX_REVIEW_ITEMS {
         return Err(BackupError::new(ErrorKind::TooLarge, "This backup holds more things that can run or reconfigure OAIY than can be looked through, so it is refused."));
     }
-    // A kind whose items are each long is described in full up to a number of them, and the rest are named (see `parts::cap_full`).
-    let items = super::parts::cap_full(items);
+    // A kind whose items are each long is described in full up to a number of them, and the rest are named (see `parts::cap_full`); and all
+    // the things together say at most so much (see `parts::cap_total`).
+    let items = super::parts::cap_total(super::parts::cap_full(items));
     let classes: Vec<ClassInfo> = RestoreClass::ALL
         .iter()
         .filter_map(|c| {
@@ -1056,7 +1057,7 @@ pub(crate) fn clean_staged(data_dir: &Path, files_root: &Path, names: &[String],
             Ok((bytes, dropped)) => {
                 secret_file::write(&path, bytes).map_err(|e| BackupError::io("Could not clean a staged file", &e))?;
                 if !dropped.is_empty() {
-                    notes.push(NOTE_SERVICES, format!("These services were not set to start with OAIY, because OAIY has no template for them: {}.", super::parts::some_of(&dropped, 20, 60)));
+                    notes.push(NOTE_SERVICES, format!("These services were not set to start with OAIY, because OAIY has no template for them: {}.", super::parts::some_of(&dropped, MOST_SERVICES_NAMED, 60)));
                 }
             }
             Err(why) => {
@@ -1073,6 +1074,9 @@ pub(crate) fn clean_staged(data_dir: &Path, files_root: &Path, names: &[String],
 /// The most notes a restore keeps in its record and says in its result. It has room for every class at its budget (see [`NoteBook`]) and
 /// the notes that are one line each: nine classes of nine notes and a few dozen more.
 const MOST_NOTES: usize = 150;
+
+/// The most services left out of the autostart list (for want of a template) that a note names; the rest are counted.
+const MOST_SERVICES_NAMED: usize = 20;
 
 /// The classes of the notes said of the staged files.
 const NOTE_MERGED: &str = "merged files";
@@ -1903,7 +1907,7 @@ pub(crate) fn record_agent_result(data_dir: &Path, id: &str, ok: bool, error: Op
         return;
     }
     // What the page left out or could not do goes where the person reads the result, cut to what a panel shows.
-    for warning in super::parts::lines_of(warnings, 20, 300) {
+    for warning in super::parts::lines_of(warnings, super::parts::MOST_PAGE_WARNINGS_NAMED, 300) {
         let line = format!("Agent: {warning}");
         if !last.notes.contains(&line) {
             last.notes.push(line);

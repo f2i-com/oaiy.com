@@ -7947,6 +7947,26 @@ fn every_cap_and_every_literal_cut_of_the_backup_module_is_in_the_audit_of_the_d
                     literal += 1;
                 }
             }
+            // A list that says its first few and how many more takes the number from a name (a cap, with a row), and is not given one written in the call.
+            for call in ["lines_of(", "some_of("] {
+                if line.contains("pub fn ") {
+                    continue;
+                }
+                for at in line.match_indices(call) {
+                    let second = line[at.0 + call.len()..].split(',').nth(1).map(str::trim).unwrap_or("");
+                    if second.starts_with(|c: char| c.is_ascii_digit()) {
+                        missing.push(format!("{file}: {call} is given the number {second}: give it a name (MOST_...) and a row in the audit table of BACKUP.md"));
+                    }
+                }
+            }
+            // The one place that cuts a text by a number of characters is parts.rs (`cut`): nowhere else takes the first characters of a text by a variable.
+            if file != "parts.rs" {
+                for at in line.match_indices(".chars().take(") {
+                    if line[at.0 + ".chars().take(".len()..].starts_with(|c: char| c.is_ascii_lowercase()) {
+                        missing.push(format!("{file}: a text is cut by a variable number of characters outside parts.rs: use `short` or `cut`"));
+                    }
+                }
+            }
         }
     }
     assert!(caps >= 30, "the scan finds the caps of the module: {caps}");
@@ -8078,6 +8098,60 @@ fn a_kind_that_is_described_in_full_only_up_to_a_number_names_and_counts_the_res
     };
     check("connector", "connectors", 100, &|i| serde_json::json!({ "id": format!("c{i}"), "name": format!("C{i}"), "defaultBaseUrl": format!("https://c{i}.example") }).to_string());
     check("template", "templates", 400, &|i| serde_json::json!({ "id": format!("t{i}"), "name": format!("T{i}"), "run": { "command": "c" } }).to_string());
+}
+
+/// The worst preview: a backup of the most things there may be (two thousand), each a flow as long as a flow may be said, is a preview of a few
+/// megabytes and not of tens (the things of a preview say at most `MOST_PREVIEW_BYTES` together, the longest named and not described first),
+/// and a small thing beside them, a trigger, is still described in full: padding cannot crowd it out.
+#[test]
+fn a_backup_of_two_thousand_long_flows_makes_a_preview_of_a_few_megabytes_and_a_small_thing_is_still_described() {
+    use super::parts::MOST_PREVIEW_BYTES;
+    let flow = |i: usize| {
+        serde_json::json!({
+            "name": format!("Flow {i} {}", "n".repeat(300)),
+            "nodes": (0..12)
+                .map(|k| serde_json::json!({ "id": format!("in{k}"), "type": "input_text", "data": { "label": format!("Input {k} {}", "l".repeat(90)) } }))
+                .chain((0..30).map(|k| serde_json::json!({ "type": format!("KIND-{k}-{}", "k".repeat(90)) })))
+                .collect::<Vec<_>>(),
+            "oaiyTool": { "name": "t".repeat(300), "description": "d".repeat(5000) },
+            "oaiyToolHook": { "mode": "before", "tool": "h".repeat(300) },
+        })
+        .to_string()
+    };
+    let mut owned: Vec<(String, String)> = (0..1999).map(|i| (format!("flows/f{i:04}.json"), flow(i))).collect();
+    owned.push(("triggers.json".to_string(), serde_json::json!([{ "id": "t1", "event": "e", "flowId": "f", "mode": "async", "enabled": true }]).to_string()));
+    let refs: Vec<(&str, &[u8])> = owned.iter().map(|(n, text)| (n.as_str(), text.as_bytes())).collect();
+    let out = TempDir::new("two-thousand-flows");
+    let file = out.0.join("f.oaiybackup");
+    craft(&file, &manifest_for(&refs), &refs, true);
+    let preview = restore::inspect(&TempDir::new("two-thousand-flows-dst").0, &file, PASS, &options()).unwrap();
+    let said: usize = preview.items.iter().map(|i| i.what.len()).sum();
+    let json = serde_json::to_string(&preview).unwrap().len();
+    assert!(said <= MOST_PREVIEW_BYTES, "what the things say together is held to the most: {said}");
+    assert!(json < 6 << 20, "the preview is a few megabytes: {json} bytes");
+    let named = preview.items.iter().filter(|i| i.what.starts_with("Named and not described: it says ")).count();
+    assert!(named > 500 && named < 1999, "the longest are named and not described, and some are still described in full: {named} of 1999");
+    assert!(preview.items.iter().filter(|i| i.kind == "flow").count() + named == 1999, "every flow is either described or named");
+    let says: Vec<usize> = preview.items.iter().filter_map(|i| i.what.strip_prefix("Named and not described: it says ")).filter_map(|w| w.split(" characters").next()?.parse().ok()).collect();
+    assert!(says.len() == named && says.iter().all(|n| (1500..6000).contains(n)), "each says how long it was: {:?}", says.iter().take(3).collect::<Vec<_>>());
+    let trigger = preview.items.iter().find(|i| i.kind == "trigger").expect("the small thing is listed");
+    assert!(trigger.what.contains("Runs the flow \"f\""), "a small thing is described in full: {}", trigger.what);
+    println!("two thousand long flows: what they say {said} bytes, the preview {json} bytes, {named} named and not described");
+}
+
+/// An address written `//host/path` is an address to the host, and what is not one says so: the hosts a connector sends to are counted by the
+/// host, whatever way the address is written.
+#[test]
+fn an_address_written_with_two_slashes_is_read_as_the_host_it_goes_to() {
+    let connector = serde_json::json!({
+        "id": "own", "name": "O", "defaultBaseUrl": "https://one.example",
+        "zzplace": { "sendUrl": "//double-slash.example/x" },
+        "zzother": { "sendUrl": "not an address at all" },
+    })
+    .to_string();
+    let said = what_of(&inspect_desktop_files(&[("connectors/own.json", connector)], false), "connectors/own.json");
+    assert!(said.contains("zzplace: 1 address to double-slash.example"), "{said}");
+    assert!(said.contains("zzother: 1 address to (not an address)"), "{said}");
 }
 
 /// The desktop and the dashboard make the same characters visible: the ranges of `is_invisible` (`parts.rs`) are those of `isInvisible`

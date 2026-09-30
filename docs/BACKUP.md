@@ -672,7 +672,10 @@ a thing does:
   is cut.
 - **A kind whose items are each long is described in full up to a number** (campaigns 50, connectors
   100, templates 400): the rest are named, with how many there are, so that a backup of three
-  hundred campaigns as long as one can be does not make a preview of many megabytes.
+  hundred campaigns as long as one can be does not make a preview of many megabytes. **And all the
+  things of a preview say at most 2 MiB together**: past it the longest are named and not described,
+  longest first, each with how long it was, so that a backup of two thousand flows as long as a flow
+  may be is a preview of a few megabytes, and a small thing beside them is still described in full.
 - **The characters you cannot see are made visible**, wherever the dry run prints a value: a run of
   them is said as what it is and how many there are (`[25 invisible characters: U+E0041 ...]`),
   by the desktop before the text is counted and cut, and again by the dashboard on every text of a
@@ -731,16 +734,21 @@ a thing does:
 
 #### Where else the backup cuts
 
-Every cap of the backup module is a named constant, and every cut written as a number in the code
-is listed here (a test reads the source, and fails for a cap or a cut that has no row). A row says
-what is cut and why it cannot hide something that acts: what is refused whole is never shown in
-part, what is counted says how many, and what is inside one part is cut inside that part alone.
+Every cap of the backup module is a named constant (a name that says MAX, MOST or QUOTE), every cut
+written as a number in the code (`.take(6)`) is listed here, and a list that says its first few and
+how many more (`lines_of`, `some_of`) takes its number from a named constant; nothing but `parts.rs`
+cuts a text by a number of characters. A test reads the source and fails for a cap, a cut or a list
+that has no row. The value cuts that remain (`short`, `clip` and `quoted` of one value, in a part, a
+name or a note) are `parts::cut`'s, in the first row: each cuts one value and says how long it was.
+A row says what is cut and why it cannot hide something that acts: what is refused whole is never
+shown in part, what is counted says how many, and what is inside one part is cut inside that part alone.
 
 | Place | What is cut or capped | Why it hides nothing that acts |
 |---|---|---|
 | `parts::cut` (with `short` and `review::clip`) | Every part and every value of the dry run, to a number of characters, after the invisible ones are made visible | It is the one function that cuts; it says how long the text was; a part is cut alone |
 | `KINDS` (the table above) | The budget of each part of each kind | Fixed parts first, each cut alone; the test that builds every kind with everything padded |
 | `MAX_REVIEW_ITEMS` (2,000) | Things of the dry run | Over it the backup is refused whole and is not shown in part |
+| `MOST_PREVIEW_BYTES` (2 MiB) | What all the things of one preview say together | Past it the longest are named and not described, longest first, each with how long it was, so that padding cannot crowd a small thing out; with the kinds' own limits, a preview of two thousand flows as long as may be is a few megabytes |
 | `MAX_REVIEW_BYTES` (2 MiB), `MAX_REVIEW_TOTAL` (128 MiB), `MAX_JSON_BYTES` (16 MiB) | What is read of one file, of all of them, and of one JSON file | A file over it is said to be too large to look at and is not restored; a backup over the total is refused whole |
 | `MOST_WORDS_SCANNED` (1 MiB), `MAX_QUOTE_BYTES` (64 KiB), `BRIEF_QUOTE` (700) | The brief and knowledge files scanned for hidden text; the brief read to be quoted; the quote | A file over the first is not restored; over the second is said "too large to quote" (the size is said); the quote is inside the part `says`, which comes after `reads` |
 | `MAX_NAMED` (300) | Projects, knowledge files and unknown items named | The rest are counted in a thing of their own (kind `more`), and "and N more" |
@@ -748,6 +756,7 @@ part, what is counted says how many, and what is inside one part is cut inside t
 | `MAX_OTHER_PLACES` (12), `MAX_HOSTS_SAMPLED` (4), `MAX_SCOPES_NAMED` (20) | A connector's places the shipped descriptor has not, the hosts said for the addresses of a place that it has not a key for, and the scopes it asks for | Every address key the shipped descriptor has (sign-in, health, heartbeat, events, flows, and the rest) is said by name and host in the part of its own place, sized to hold them all at the most an address is cut to, before any of these; the rest are counted, with a sample of hosts; the scopes are a count and a sample |
 | `MAX_ACCEPTED_NAMED` (10), `MAX_INPUTS_NAMED` (8), `MAX_KINDS_NAMED` (8), `MAX_CALENDAR_LISTED` (40) | The plugins the setup record marks accepted, the inputs a flow asks its model for, the kinds of a flow's steps, the services and appointments of the calendar | Each is a sample after a count, in a part of its own |
 | `MAX_QUESTIONS_LISTED` (8), `MAX_PEOPLE_LISTED` (10), `MAX_VALUE_TEXT` (100), `MAX_ENTRIES_SAID` (3), `MAX_ENTRY_TEXT` (50) | A campaign's questions and people, and the text of a value or of an entry of one | The campaign's own keys are fixed parts said first; a question or a person is a part of its own and a value is cut inside it, with how long it is |
+| `MOST_PAGE_WARNINGS_NAMED` (20), `MOST_SERVICES_NAMED` (20) | The warnings of the Agent's page named (in a backup's record and in the result of a restore), and the services left out of the autostart list named | Each says how many more there were |
 | `MOST_NOTES_PER_CLASS` (8), `MOST_NOTES` (150) | The notes of a restore, by class, and all of them | A class says how many more of it there were; the total is above what the classes make, and says how many more if it is ever reached |
 | `MAX_DO_NOT_CONTACT` (50,000) | The numbers not to be contacted that come back | The first come back; the dry run, the staging and the result say how many do not |
 | `MAX_APPOINTMENTS` (10,000) | The appointments of the calendar after a restore | Those over are not added, and the result says how many |

@@ -424,6 +424,42 @@ pub fn cap_full(items: Vec<ReviewItem>) -> Vec<ReviewItem> {
         .collect()
 }
 
+/// The most bytes of description that all the things of one preview say together: 2 MiB. The things of a real backup say a few kilobytes each
+/// (a few dozen kilobytes in all); a hostile one of two thousand things, each as long as it may be, would make a preview of tens of megabytes.
+/// Past it the longest are named and not described, longest first, until what is said fits (see [`cap_total`]).
+pub const MOST_PREVIEW_BYTES: usize = 2 << 20;
+
+/// The most warnings of the Agent's page that are named, in a backup's record and in the result of a restore (the rest are counted).
+pub const MOST_PAGE_WARNINGS_NAMED: usize = 20;
+
+/// The things of a preview, with the longest named and not described while what they say together is more than [`MOST_PREVIEW_BYTES`]: what
+/// is padded to its length is what is left out, so that padding cannot crowd a small thing out, and a person is told which were not
+/// described and how long each was.
+pub fn cap_total(items: Vec<ReviewItem>) -> Vec<ReviewItem> {
+    let mut total: usize = items.iter().map(|i| i.what.len()).sum();
+    if total <= MOST_PREVIEW_BYTES {
+        return items;
+    }
+    let mut longest_first: Vec<usize> = (0..items.len()).collect();
+    longest_first.sort_by_key(|&i| std::cmp::Reverse(items[i].what.len()));
+    let mut named: std::collections::HashMap<usize, ReviewItem> = std::collections::HashMap::new();
+    for at in longest_first {
+        if total <= MOST_PREVIEW_BYTES {
+            break;
+        }
+        let item = &items[at];
+        let only_named = Parts::new("more")
+            .fixed(
+                "count",
+                format!("Named and not described: it says {} characters, more than a preview holds of the things of one backup together (the longest are left out first). Read it (its own file, or in the Agent) before you use it.", item.what.chars().count()),
+            )
+            .item(item.class, &item.name, &item.title);
+        total = total - item.what.len() + only_named.what.len();
+        named.insert(at, only_named);
+    }
+    items.into_iter().enumerate().map(|(at, item)| named.remove(&at).unwrap_or(item)).collect()
+}
+
 /// Why a text is not one that comes back (a value a person could have typed to be read by a model or a caller), or `None`. The dry run
 /// makes what a person cannot see visible ([`visible`]); this is the other half, for a value that has been made to say one thing to a person
 /// and another to a model. It does not strip anything: a value that holds hidden text is not brought back, and is said not to be. What is
