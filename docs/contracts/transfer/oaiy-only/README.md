@@ -69,51 +69,46 @@ The plan reasons OAIY puts in an `oaiy.ring.plan` answer are exactly the plugin'
 * **Limits** are stricter than the plugin's floor: by default 2 tries a call, a minute apart, 3 an hour for one
   caller, 10 an hour in all, and all callers with a withheld or unusable number share one bucket of 2 an hour.
   A try the plugin refuses itself (`consent`, `call_changed`, `plan_unavailable`, the tool intake errors) is given back.
-* **What is stricter in the phrase check.** A turn is read from its end (the last 300 characters), a sentence at
-  a time, with thinking noises dropped; refusals in any form, the future and the past, questions about what the
-  receptionist is, a caller who is not the caller, and a caller telling the receptionist what to say are not
-  requests; more ways to ask count ("connect me to the owner", "could I be put through", "I'd like to be
-  transferred to the owner", "transfer the call to the manager", "I'd like the owner please", "put the owner on",
-  "hand me over to the owner", "is anyone available to speak with me", "manager please", "I need a real person");
-  a person asked for by name counts when the name is the owner's. The desktop has no setting for the owner's name,
-  so the possessive that begins the business's name ("Dave's Lawn Care" gives "dave") is taken as the person to be
-  asked for. Also not requests: "I'm not asking to", "without" and "instead of" speaking to someone, an ask taken
-  back ("never mind", "forget it", "no thanks", in the same turn or a later one), being told to say or write it
-  ("Please say: ...", "Write '...'"), what someone else said or allowed however long ago in the sentence, a question
-  about how or when or by what number, a question put to the receptionist ("do you want me to speak to the
-  owner"), a different target ("transfer me to billing"), and a caller who says they are talking to someone else ("I'm talking to someone else
-  in the room"; but "can I speak to someone else" is an ask for a person, and counts). Also not asks: what happened to the caller some
-  time ago or what someone else did or said ("I was transferred to the owner yesterday", "he put the owner on", "they said I could be
-  transferred to the manager"), "do you want me to be transferred to the owner", and a question about how ("how to be transferred"). When the gate refuses a
-  caller who did ask, the model is told to offer a message, so the caller has one or the other.
-  `phrases-oaiy.json` holds the cases (42 requests, 52 that are not, and the 10 and 7 named ones), none of them in the
-  shared file as written. The phone's floor runs first: the same algorithm as this desktop's over the rules of the shared file
-  (`transfer-v1.caller-asked.fixture.json`), with no names. This desktop passes that file in full: every positive, negative,
-  window and backchannel case, and its word lists for the acknowledgements, however many the file has. The floor has every way
-  of asking that this desktop counts (the shared file has had them since Aokie's `f34dda2`), so a caller who asks any of those
-  ways passes both checks. It is looser only for what this desktop refuses besides (a caller telling the receptionist what to say,
-  a different target such as billing, an ask taken back, what someone else said however long ago, "do you want me to"), which is
-  allowed. The two normalisers agree on the soft hyphen (U+00AD, removed outright, so a word with one inside it reads as the word);
-  this desktop also does not see zero-width joiners and marks, which the floor turns into spaces. Adding rules to the shared file
-  is Aokie's change.* **Blocks this desktop has that the shared file could adopt.** Each is a block in the fixture's syntax (matched against one
-  sentence made plain), and each has cases in `phrases-oaiy.json`; the floor accepts all of those cases today, and this desktop
-  refuses them. Five asks that both accepted, and are not asks: "I was transferred to the owner yesterday", "he put the owner
-  on", "they said I could be transferred to the manager", "do you want me to be transferred to the owner", "can you tell me how
-  to be transferred to the owner". The blocks:
-  * what was done some time ago, in the shape of an ask, and by someone else:
-    `\b(?:was|were|been|had been|has been|have been) (?:\w+ ){0,2}(?:transferred (?:to|over to|through to)|(?:put|patched) (?:through|thru|thro))\b`
-    and `\b(?:he|she|they) (?:\w+ )?(?:put|patched|handed|connected|transferred) (?:the |your )?(?:owner|manager|boss|proprietor)\b`
-    (not "I was transferred three times, can I speak to the manager" or "they put me on hold, can I speak to the owner", which go on to an ask);
-  * what someone said: the shared `said` block with its verbs read in the past, `(?:speak|talk|transfer(?:red)?|put|patch(?:ed)?|connect(?:ed)?|get)`
-    in place of `(?:speak|talk|transfer|put|patch|connect|get)` (so "connection" is still no verb);
-  * a question put to the receptionist: `\b(?:do|would|shall|should|can|could) (?:you|they) (?:want|like|need|prefer) (?:me|us) to (?:be )?(?:speak|talk|chat|transfer|put)\w*\b`;
-  * a question about how: `\bhow to (?:\w+ ){0,2}(?:speak|talk|chat|reach|contact|get hold of|get through|transfer|put|connect)\w*\b`
-    (a short way on, so "I don't know how to say this but can I speak to the owner" goes on to its ask).
+* **The phrase check.** The same algorithm as the shared caller-asked fixture, over that file's rules and blocks. This desktop
+  passes every case of the shared file, however many it has, and reads the same word lists for the acknowledgements. It goes
+  beyond the shared file in these ways, which the phone's floor does not:
+  * a caller telling the receptionist what to say or write ("Please say: can I speak to the owner", "Write 'transfer me to the
+    owner'") is not asking: the turn is read before it is made plain, since what follows "say" tells it from "Say, can I speak
+    to the owner?";
+  * an ask taken back is not an ask ("never mind", "forget it", "no thanks", "I changed my mind"), in the same turn or a later
+    one, and asked again afterwards it counts;
+  * a different target is not the owner ("transfer me to billing", "put me through to accounts", "transfer me to my husband");
+  * the `said` block reaches further (eight words, and "allowed", "permitted", "approved", "okayed" as well as "said" and
+    "told"), and "do I have to talk to the manager" is a question put to the receptionist;
+  * a person asked for by name counts when the name is the owner's. The desktop has no setting for the owner's name, so the
+    possessive that begins the business's name ("Dave's Lawn Care" gives "dave") is taken as the person to be asked for;
+  * a zero-width joiner or mark is not seen, and a zero-width space is a space (so a word cut by one is not read). The soft
+    hyphen is removed outright, as the shared normaliser removes it.
 
-  Two smaller things in the shared blocks: `(?:i m|i am|we re|we are)` never matches "I'm" or "we're" (the apostrophe stays in a
-  word, so it needs `(?:i m|i'm|i am|we re|we're|we are)`; without it "I'm talking to the owner, right?" is an ask), and
-  "can I speak to someone else" is an ask for a person, which a block for `(?:speak|talk|chat)(?:ing)? (?:to|with) (?:\w+ ){0,2}else`
-  would refuse: this desktop's reads only the participle, `\b(?:speaking|talking|chatting) (?:to|with) (?:\w+ ){0,2}else\b`.* **What OAIY reads as the caller's turns.** The plugin drops from the caller's history, by their words alone, every turn that
+  When the gate refuses a caller who did ask, the model is told to offer a message, so the caller has one or the other.
+* **Where the floor accepts and this desktop refuses.** `phrases-oaiy.json` holds only what the shared file does not have as
+  written: 35 requests, 49 that are not, and the 10 and 7 named ones (a case the shared file has is not repeated here, and a test
+  fails if one is). The phone's floor runs first, so a caller must pass both checks. Every way of asking that this desktop counts
+  is in the shared file (since Aokie's `f34dda2`), so the floor is never the stricter of the two for an ask. It is looser for what
+  this desktop refuses besides: the say and write commands, an ask taken back, a different target, "do I have to talk to", and
+  the contractions below. That is allowed. **The floor accepts these, this desktop refuses**, because they are not asks (each is an
+  OAIY-only non-request, and each was checked to be accepted by the floor):
+  * "we'll speak to the manager tomorrow"
+  * "they've put the owner on"
+  * "he'd put the owner on"
+  * "I wouldnt speak to the manager"
+  * "I couldn't speak to the owner earlier"
+
+  and seven more of the same kind ("we're going to talk to the owner on Friday", "she'll speak to the manager later", "he's put
+  the manager on the phone", "we couldnt talk to the owner", "I didnt speak to the manager", "you shouldnt talk to the boss", "he
+  doesnt put me through to the owner"), with two asks that must stay asks ("We're calling about the fence, can I speak to the
+  owner", "He's not answering, can I speak to the manager"). The apostrophe stays in a word, so a block that reads "I" or
+  "he" or "would not" has to read "we'll", "he'd", "they've", "wouldnt" and "couldn't" too. The blocks, in the fixture's syntax,
+  if the shared file adopts them (the future block and the "someone else did it" block are the shared ones with the subjects and
+  contractions widened; the refusal block has these alternatives added: `doesnt|didnt|could not|couldn't|couldnt|wouldnt|shouldnt`):
+  * `\b(?:(?:i|we|he|she|they)(?:'ll| will| shall)|(?:i(?:'m| am)|we(?:'re| are)|(?:he|she)(?:'s| is)|they(?:'re| are)) (?:going to|gonna)) (?:\w+ ){0,2}(?:speak|talk|chat|call|ring)\b`
+  * `\b(?:he|she|they)(?:'s|'d|'ve)? (?:\w+ )?(?:put|patched|handed|connected|transferred) (?:the |your )?(?:owner|manager|boss|proprietor)\b`
+* **What OAIY reads as the caller's turns.** The plugin drops from the caller's history, by their words alone, every turn that
   is only an acknowledgement ("mm-hmm", "yeah, okay": at most three of a fixed list), because it cannot hear when they were
   said; that is the `backchannel` group of the shared caller-asked fixture. OAIY hears the audio, and leaves an acknowledgement
   out of its own record only when it was said over the receptionist while it was still speaking (an "mm-hmm", or short

@@ -120,7 +120,7 @@ fn rules(names: &[String]) -> Rules {
         r"\btalk to you later\b".to_string(),
         r"\bspeak to you (?:later|soon)\b".to_string(),
         // A refusal, in any of the ways people say it.
-        r"\b(?:do not|don't|dont|does not|doesn't|did not|didn't|cannot|can not|can't|cant|will not|won't|wont|would not|wouldn't|should not|shouldn't|never|no way|not going to|not gonna|refuse to|rather not|no need to|no wish to|not able to|unable to|no longer|not asking|not wanting|not looking|not trying|not needing|not requesting|not after|not here) (?:\w+ ){0,3}(?:speak|talk|chat|transfer|put|patch|connect)\w*\b".to_string(),
+        r"\b(?:do not|don't|dont|does not|doesn't|doesnt|did not|didn't|didnt|cannot|can not|can't|cant|could not|couldn't|couldnt|will not|won't|wont|would not|wouldn't|wouldnt|should not|shouldn't|shouldnt|never|no way|not going to|not gonna|refuse to|rather not|no need to|no wish to|not able to|unable to|no longer|not asking|not wanting|not looking|not trying|not needing|not requesting|not after|not here) (?:\w+ ){0,3}(?:speak|talk|chat|transfer|put|patch|connect)\w*\b".to_string(),
         // Not doing it instead, or without it: "without speaking to the manager", "instead of talking to a person".
         r"\b(?:without|instead of|rather than|as opposed to|in place of) (?:\w+ ){0,2}(?:speak|talk|chat|transfer|put|patch|connect)\w*\b".to_string(),
         // A question about how, or when, or by what number, not a request: "how do I speak to the owner", "what number can I use to talk to them".
@@ -134,14 +134,15 @@ fn rules(names: &[String]) -> Rules {
         // (The apostrophe stays in a word, so "I'm" is one, as "I am" is two.)
         r"\b(?:i m|i'm|i am|we re|we're|we are) (?:\w+ ){0,1}(?:speaking|talking|chatting) (?:to|with)\b".to_string(),
         // About the future or the past, or about themselves: not asking.
-        r"\bi(?:'ll| will| shall|'m going to| am going to|'m gonna| am gonna) (?:\w+ ){0,2}(?:speak|talk|chat|call|ring)\b".to_string(),
+        // (Whoever it is that will: "we'll speak to the manager tomorrow", "she'll talk to the owner later", "we're going to talk to the owner".)
+        r"\b(?:(?:i|we|he|she|they)(?:'ll| will| shall)|(?:i(?:'m| am)|we(?:'re| are)|(?:he|she)(?:'s| is)|they(?:'re| are)) (?:going to|gonna)) (?:\w+ ){0,2}(?:speak|talk|chat|call|ring)\b".to_string(),
         r"\b(?:speak|talk|chat)(?:ing)? (?:to|with) (?:\w+ ){0,3}myself\b".to_string(),
         r"\b(?:was|were|been|had been) (?:\w+ )?(?:speak|talk|chat)(?:ing)?\b".to_string(),
         // What was done to them, some time ago, in the shape of an ask: "I was transferred to the owner yesterday", "I had been put through to
         // the manager". (Not "I was transferred three times, can I speak to the manager", and not "I was put on hold": those go on to an ask.)
         r"\b(?:was|were|been|had been|has been|have been) (?:\w+ ){0,2}(?:transferred (?:to|over to|through to)|(?:put|patched) (?:through|thru|thro))\b".to_string(),
-        // What someone else did: "he put the owner on", "they patched the manager through".
-        r"\b(?:he|she|they) (?:\w+ )?(?:put|patched|handed|connected|transferred) (?:the |your )?(?:owner|manager|boss|proprietor)\b".to_string(),
+        // What someone else did: "he put the owner on", "they've put the owner on", "he'd put the owner on", "they patched the manager through".
+        r"\b(?:he|she|they)(?:'s|'d|'ve)? (?:\w+ )?(?:put|patched|handed|connected|transferred) (?:the |your )?(?:owner|manager|boss|proprietor)\b".to_string(),
         // Asking what the receptionist is, or who they are speaking to.
         r"\b(?:am i|are we) (?:speaking|talking|chatting) (?:to|with)\b".to_string(),
         r"\b(?:are|is|am) (?:you|this|that|it|i) (?:\w+ ){0,2}(?:real|actual|live|human|person|robot|machine|bot|ai|recording|computer)\b".to_string(),
@@ -498,7 +499,7 @@ mod tests {
         let positives = cases(OAIY_EXTRA, "positive");
         let negatives = cases(OAIY_EXTRA, "negative");
         // (What only this desktop counts or refuses: none of it is in the shared fixture, whose cases are not repeated here.)
-        assert!(positives.len() >= 33 && negatives.len() >= 37, "{} {}", positives.len(), negatives.len());
+        assert!(positives.len() >= 35 && negatives.len() >= 49, "{} {}", positives.len(), negatives.len());
         // (Compared as written, lower-cased: a case that differs only in what the shared normaliser reads past, such as a zero width space, is
         // this desktop's own to keep.)
         let shared_turns: std::collections::BTreeSet<String> = ["positive", "negative"].iter().flat_map(|group| cases(SHARED, group)).map(|turns| turns.iter().map(|t| t.to_lowercase()).collect::<Vec<_>>().join(" | ")).collect();
@@ -571,6 +572,42 @@ mod tests {
             "I was put on hold and I want to speak to a person",
             "I don't know how to say this but can I speak to the owner",
         ] {
+            assert!(caller_asked(&[said]), "{said}");
+        }
+    }
+
+    #[test]
+    fn a_contraction_is_the_word_it_is_however_it_is_spelt_so_what_will_be_did_would_have_or_could_not_be_done_is_not_an_ask() {
+        // The five that the shared floor still accepts and this desktop refuses: the apostrophe stays in a word, so a block that reads "i" or
+        // "he" or "would not" must read "we'll", "he'd", "they've", "wouldnt" and "couldn't" too.
+        for said in ["we'll speak to the manager tomorrow", "they've put the owner on", "he'd put the owner on", "I wouldnt speak to the manager", "I couldn't speak to the owner earlier"] {
+            assert!(!caller_asked(&[said]), "{said}");
+        }
+        // The same in its other spellings and with the other people who may say it.
+        for said in [
+            "we\u{2019}ll speak to the manager tomorrow",
+            "she'll talk to the owner later",
+            "they'll talk to the boss",
+            "I'll speak to the manager",
+            "we're going to talk to the owner on Friday",
+            "they are gonna speak to the manager",
+            "he's going to talk to the owner on Friday",
+            "she is gonna speak to the manager",
+            "he's put the manager on the phone",
+            "she'd put the owner on",
+            "they\u{2019}ve put the manager on",
+            "we couldnt talk to the owner",
+            "I could not speak to the owner earlier",
+            "we could not talk to the manager",
+            "I didnt speak to the manager",
+            "he doesnt put me through to the owner",
+            "you shouldnt talk to the boss",
+            "they wouldn't put me through to the owner",
+        ] {
+            assert!(!caller_asked(&[said]), "{said}");
+        }
+        // Asks all the same: a "we're" or a "he's" that is about something else, and a could and a would that are the caller's ask.
+        for said in ["We're calling about the fence, can I speak to the owner", "He's not answering, can I speak to the manager", "Could I speak to the owner", "Would you put me through to the manager", "could you put me through to the owner please"] {
             assert!(caller_asked(&[said]), "{said}");
         }
     }
