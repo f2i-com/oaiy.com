@@ -234,9 +234,10 @@ export default function TransfersPanel() {
           <ol>
             <li>A caller asks for you, or for a person. The receptionist says it will try to reach you: never that they are put through.</li>
             <li>
-              This computer tells you (a notification, and a box on this window with who is calling and what they said), and your Companion rings: the one on this computer while
-              you are at it, and one on a second phone when you are away. You answer on the Companion, and whoever answers first takes the call. The box on this window can only
-              decline and have the receptionist take a message, or be put away with Not now.
+              Your Companions ring: the one on this computer while you are at it, and one on a second phone when you are away. When this computer is one of the devices rung,
+              it also tells you (a notification, and a box on this window with who is calling and what they said). It starts no Companion: one that is not running rings only if
+              you open it while the caller is still being rung. You answer on the Companion, and whoever answers first takes the call. The box on this window can only decline
+              and have the receptionist take a message, or be put away with Not now.
             </li>
             <li>
               Nothing rings unless a Companion is set up to take the call: approve one on the Phone page. A phone rings when you are away, and also when no Companion on this
@@ -248,7 +249,10 @@ export default function TransfersPanel() {
               If nobody answers in time, you decline, it is quiet hours, you are away with no device to ring, or a limit is reached, the receptionist offers to take a message. It
               always ends with the caller being spoken to.
             </li>
-            <li>It only tries when the caller’s own words asked for a person, and no more than the limits below allow, so a caller cannot make it ring over and over.</li>
+            <li>
+              It only tries when the caller’s own words asked for a person (or said one of your own urgent phrases, if you turned that on), as this computer heard them, and an ask
+              counts for one try: what they said is used up once it rings. So a caller cannot make it ring over and over, and the limits below cap what is left.
+            </li>
             <li>What callers leave is kept under Messages, on this computer.</li>
           </ol>
         </details>
@@ -371,7 +375,8 @@ export default function TransfersPanel() {
       <section className="model-section">
         <h3 className="section-title">Devices that may take a call</h3>
         <p className="form-hint">
-          The Companions you approved on the Phone page. The phone that carries your calls is never one of them. Tick “This is the Companion on this computer” only for a
+          The Companions you approved on the Phone page. This computer cannot tell which of them is on the phone that carries your calls, and that phone cannot take its own
+          calls: do not approve a Companion on it, or say never to ring it. Tick “This is the Companion on this computer” only for a
           Companion that is the Windows app on this computer: it rings only while you are at the computer. A phone stays unticked, and rings by the Phones setting above. Say
           which never to ring.
         </p>

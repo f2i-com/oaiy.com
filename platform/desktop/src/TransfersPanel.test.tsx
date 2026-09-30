@@ -126,6 +126,15 @@ describe('Transfers', () => {
     expect(said).not.toContain('Accept');
     expect(said).toContain('always ends with the caller being spoken to');
     expect(said).toContain('caller’s own words asked for a person');
+    // What it says is what the desktop does: it starts no Companion, an urgent phrase of the owner's own also rings, and an ask counts for one try.
+    expect(said).toContain('It starts no Companion');
+    expect(said).toContain('When this computer is one of the devices rung');
+    expect(said).toContain('one of your own urgent phrases');
+    expect(said).toContain('an ask counts for one try');
+    // ...and the phone that carries the calls is not said to be kept out of the list: this computer cannot tell which it is.
+    const devices = text();
+    expect(devices).toContain('cannot tell which of them is on the phone that carries your calls');
+    expect(devices).not.toContain('is never one of them');
     // Reading it changes nothing.
     expect(saveButton().disabled).toBe(true);
   });
