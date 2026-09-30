@@ -62,7 +62,7 @@ pub fn calendar_merge(local: Option<&Value>, staged: &Value, ticks: &super::revi
     let found = filter_json(keys, staged, &|row| row.class == Class::Data || row.tick.is_some_and(|t| ticks.has(t)));
     let left = found.left.iter().map(|l| l.path.as_str()).collect::<HashSet<_>>().len() + found.left_more;
     if found.kept.is_empty() {
-        return Err(format!("nothing in it comes back without its tick ({left} setting{} left out)", if left == 1 { "" } else { "s" }));
+        return Err(found.nothing_comes_back());
     }
     let theirs = found.value.as_object().cloned().unwrap_or_default();
     let mut notes = Vec::new();

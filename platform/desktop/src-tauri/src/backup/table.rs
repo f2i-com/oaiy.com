@@ -738,6 +738,22 @@ pub struct Filtered {
     pub left_more: usize,
 }
 
+impl Filtered {
+    /// What to say when nothing of a document may come back: that a tick would bring something, that the document holds nothing the
+    /// table brings back (only what it excludes, does not know or has a bad value for), or that it holds nothing at all.
+    pub fn nothing_comes_back(&self) -> String {
+        let left = self.left.iter().map(|l| l.path.as_str()).collect::<HashSet<_>>().len() + self.left_more;
+        let s = if left == 1 { "" } else { "s" };
+        if left == 0 {
+            "it holds nothing that OAIY brings back".to_string()
+        } else if self.left.iter().any(|l| matches!(l.why, Why::NotTicked(_))) {
+            format!("nothing in it comes back without its tick ({left} setting{s} left out)")
+        } else {
+            format!("nothing in it is something OAIY brings back ({left} setting{s} left out)")
+        }
+    }
+}
+
 const MAX_LEFT: usize = 500;
 const MAX_DEPTH: usize = 8;
 const MAX_NODES: usize = 200_000;

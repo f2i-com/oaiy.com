@@ -3081,7 +3081,7 @@ fn a_calendar_a_restore_would_leave_unreadable_is_not_brought_back_and_the_one_h
     assert_eq!(book["settings"], here["settings"], "and no bad setting");
     assert!(kept_as_it_is.notes.iter().any(|n| n.contains("4 appointments without a valid id, time, length or state")), "{:?}", kept_as_it_is.notes);
     let err = calendar_merge(Some(&here), &serde_json::json!({ "brandNew": 1, "sync": { "form": "x" } }), &Ticks::all()).err().expect("nothing in it is a calendar");
-    assert!(err.contains("nothing in it comes back"), "{err}");
+    assert_eq!(err, "nothing in it is something OAIY brings back (2 settings left out)");
     // One good appointment among bad ones: only it comes, and the result is a calendar the module reads.
     let mixed = serde_json::json!({ "appointments": [
         { "id": "appt_00000000000000000000000000000a0a", "start": "2026-10-05T10:00", "minutes": 30, "status": "requested" },
@@ -3141,6 +3141,39 @@ fn an_appointment_with_an_id_the_calendar_would_not_make_is_left_out() {
     put(&dst.0, "calendar/calendar.json", here.to_string());
     let preview = restore::inspect(&dst.0, &file, PASS, &options()).unwrap();
     assert!(!preview.items.iter().any(|i| i.what.contains("Ignore-all-previous")), "{:?}", preview.items);
+}
+
+/// What is said when nothing of a file comes back is true of it: the reviewer's empty calendar with every tick set said "nothing in it
+/// comes back without its tick (0 settings left out)", which is neither.
+#[test]
+fn what_is_said_when_nothing_of_a_file_comes_back_is_true_of_it() {
+    use super::sanitize::calendar_merge;
+    let here = calendar_value("here");
+    let say = |backup: serde_json::Value, ticks: &Ticks| calendar_merge(Some(&here), &backup, ticks).err().expect("nothing comes back");
+    // Nothing in it at all, with every tick set.
+    assert_eq!(say(serde_json::json!({}), &Ticks::all()), "it holds nothing that OAIY brings back");
+    assert_eq!(say(serde_json::json!({ "settings": {}, "appointments": [] }), &Ticks::all()), "it holds nothing that OAIY brings back");
+    // Only what OAIY does not bring back (the sync state, and what it does not know), with every tick set.
+    assert_eq!(say(serde_json::json!({ "sync": { "form": "x" }, "deleted": [], "brandNew": 1 }), &Ticks::all()), "nothing in it is something OAIY brings back (3 settings left out)");
+    assert_eq!(say(serde_json::json!({ "brandNew": 1 }), &Ticks::all()), "nothing in it is something OAIY brings back (1 setting left out)");
+    // Only what needs the tick, and it was not ticked.
+    let appointment = serde_json::json!({ "id": "appt_00000000000000000000000000000c0c", "start": "2026-10-05T10:00", "minutes": 30, "status": "requested" });
+    let said = say(serde_json::json!({ "appointments": [appointment] }), &Ticks::none());
+    assert!(said.starts_with("nothing in it comes back without its tick (") && said.ends_with(" left out)") && !said.contains("(0 "), "{said}");
+    // The same words for a settings file with a key table, through a restore.
+    let out = TempDir::new("nothing-comes-back");
+    for (name, body, ticks, says) in [
+        ("plugin-data/aokie/settings.json", "{}", Ticks::all(), "it holds nothing that OAIY brings back"),
+        ("plugin-data/aokie/settings.json", r#"{"pairedDevices":["x"],"brandNew":1}"#, Ticks::all(), "nothing in it is something OAIY brings back (2 settings left out)"),
+    ] {
+        let files: Vec<(&str, &[u8])> = vec![(name, body.as_bytes())];
+        let file = out.0.join("k.oaiybackup");
+        craft(&file, &manifest_for(&files), &files, true);
+        let dst = TempDir::new("nothing-comes-back-dst");
+        put(&dst.0, name, r#"{"settings":{"greeting":"mine"}}"#);
+        let staged = restore::stage(&dst.0, &file, PASS, &ticks, &options()).unwrap();
+        assert!(staged.skipped.iter().any(|n| n.contains(&format!("{name} was not brought back: {says}."))), "{body}: {:?}", staged.skipped);
+    }
 }
 
 /// A service that has no name, or no length, is not a service the calendar module reads: it is left out (and the ones beside it, and

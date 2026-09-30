@@ -1065,7 +1065,7 @@ fn merge_file(name: &str, local: Option<&serde_json::Value>, theirs: &[u8], tick
     let left = found.left.iter().map(|l| l.path.as_str()).collect::<HashSet<_>>().len() + found.left_more;
     if found.kept.is_empty() {
         // Nothing in it may come back (as ticked): the file that is here is left exactly as it is.
-        return Err(format!("nothing in it comes back without its tick ({left} setting{} left out)", if left == 1 { "" } else { "s" }));
+        return Err(found.nothing_comes_back());
     }
     let mut notes = Vec::new();
     if left > 0 {
