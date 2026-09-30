@@ -138,7 +138,7 @@ mod tests {
     }
 
     fn ring(name: &str, number: &str) -> ActiveRing {
-        ActiveRing { id: "assist_1".into(), call_id: "call_1".into(), caller_name: name.into(), caller_number: number.into(), said: vec!["Can I speak to the owner?".into()], started_at: 0, expires_at: 30_000, now: 0, devices: vec![], stopping: false, note: String::new() }
+        ActiveRing { id: "assist_1".into(), call_id: "call_1".into(), caller_name: name.into(), caller_number: number.into(), said: vec!["Can I speak to the owner?".into()], started_at: 0, expires_at: 30_000, now: 0, devices: vec![], stopping: false, taken: false, note: String::new() }
     }
 
     fn message(name: &str, from: &str) -> Message {
