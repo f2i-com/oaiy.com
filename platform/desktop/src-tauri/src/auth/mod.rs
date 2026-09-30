@@ -21,13 +21,19 @@ pub mod bearer_throttle;
 pub mod chain;
 pub mod clientip;
 pub mod clock;
+#[cfg(feature = "web")]
+pub mod cookie;
 pub mod cors;
+#[cfg(feature = "web")]
+pub mod device;
 pub mod export;
 pub mod exposure_checks;
 pub mod guard;
 pub mod host;
 pub mod lock;
 pub mod mode;
+#[cfg(feature = "web")]
+pub mod owner;
 pub mod presets;
 pub mod principal;
 pub mod routes;
@@ -40,6 +46,8 @@ pub mod token;
 pub mod password;
 #[cfg(feature = "web")]
 pub mod policy;
+#[cfg(feature = "web")]
+pub mod throttle;
 #[cfg(feature = "web")]
 pub mod wordlist;
 
